@@ -3818,7 +3818,18 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
     if "COLI_GPU" not in result and "COLI_GPUS" not in result:
         key = "COLI_GPU" if len(devices) == 1 else "COLI_GPUS"
         result[key] = ",".join(map(str, devices))
-    result.setdefault("CUDA_EXPERT_GB", f"{vram['budget_bytes'] / GB:.3f}")
+    # The qwen36 and qwen38 CUDA tier (qwen36_tier.c) reads CUDA_EXPERT_GB as GiB
+    # for each card, its trunk included; unset, it sizes each card from what is
+    # free there, less its trunk, its reserves and 1 GiB. This budget is GB for
+    # all the cards, with qwen38's trunk already out: every card would get the
+    # total, and the trunk would go twice. So a card of its own gets no number.
+    # A card that shares the host's memory keeps one, in the tier's unit: there
+    # the plan's budget is what keeps the tier off the RAM cache's pages.
+    if plan.get("model", {}).get("family_id") not in ("qwen36", "qwen38"):
+        result.setdefault("CUDA_EXPERT_GB", f"{vram['budget_bytes'] / GB:.3f}")
+    elif any(device.get("unified_memory") for device in vram["devices"] if plans_placement(device)):
+        tier = vram["budget_bytes"] + vram.get("trunk_bytes", 0)
+        result.setdefault("CUDA_EXPERT_GB", f"{tier / (1 << 30):.3f}")
     if result.get("PIN"):
         result.setdefault("PIN_GB", f"{vram['budget_bytes'] / GB:.3f}")
     return result

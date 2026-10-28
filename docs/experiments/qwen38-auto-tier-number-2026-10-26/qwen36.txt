@@ -1,0 +1,141 @@
+# --auto-tier and the qwen CUDA tier: qwen36 on the same VM, a check (2026-10-26)
+# a Colab L4 VM: 12 threads (nproc), 6 physical cores (the plan's OMP_NUM_THREADS), Intel(R) Xeon(R) CPU @ 2.20GHz (lscpu) + NVIDIA L4 (23034 MiB, 22564 MiB free, sm_89);
+#   53.0 GiB, no swap; the GGUF (74 GiB) does not fit it; Colab (Python 3.13.16), driver 580.82.07 (CUDA 13.0), nvcc V13.0.88.
+# Model: Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64 (22G, int4 g64, 39 safetensors files and one for the globals; sha256 not computed on the VM)
+# Engine: origin/dev 77530b49, built once with: cd c && make qwen36 CUDA=1 CUDA_ARCH=sm_89. The change is in resource_plan.py only,
+#   so both sides run the same binary: A with the number dev's planner writes for this card
+#   (CUDA_EXPERT_GB=18.119, plan.txt), B without it (what this change writes).
+# Each run, a new process: env COLI_CUDA=1 COLI_GPU=0 COLI_VULKAN=0 COLI_TEMP=0 USAGE_SAVE=0 OMP_NUM_THREADS=6 SNAP=<model> [CUDA_EXPERT_GB=18.119] N_NEW=64 timeout -k 10 900 ./qwen36 256 4 <prompt>
+# Prompt: the prose of prose.txt (sha256 cd8eba88480c681ec210d697557c5a727fd5e297bfe91c30c3e36dc9b55f5b45), 150 tokens; 64 new tokens.
+# One run of A, then one of B: no warm-up, no rest, the file cache not evicted. A check that qwen36's tier
+#   still runs and what it holds with each setting, not a measurement of speed.
+
+===== 44_q36_A.log (sha256 85f61d9389c40eb5f049ebbd7681764c3f2f32ccad9be9fa48735d922a28b3a0)
+# cd /content/colibri/c && env COLI_CUDA=1 COLI_GPU=0 COLI_VULKAN=0 COLI_TEMP=0 USAGE_SAVE=0 OMP_NUM_THREADS=6 SNAP=/content/q36 CUDA_EXPERT_GB=18.119 N_NEW=64 timeout -k 10 900 /content/qwen36-dev 256 4 /content/prompt120.txt
+# rc=0 elapsed=28.8s
+
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[enc] prompt tokens: 150 | generating 64 new tokens
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 9.3s | RSS after load: 2.94 GB
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[CUDA] device 0: NVIDIA L4, 23.7 GB VRAM, sm_89
+[qtier] dev 0: 21.8 GB free, allowance 18.1 GB
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 16.33 GB left for experts
+[qtier] dev 0: budget 16.33 GB for experts (~9267 experts) after trunk
+[qtier] CUDA VRAM expert tier active: 1 device(s), 1.80 MB/expert
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[gpu] MoE experts -> CUDA VRAM tier
+[place] probe: one [8192 x 2048] int8 GEMV takes 0.111 ms on CUDA dev 0, 0.252 ms on the CPU -> trunk to VRAM
+[lmh] lm_head [248320 x 2048] int8 resident on CUDA dev 0 (0.47 GB)
+[dnp] 30 DeltaNet-Projektionen auf GPU (0.70 GB VRAM)
+[dense] 190 trunk matrices on GPU (30 dnout, 40 attnproj, 120 shexp; 0.61 GB VRAM)
+[chain] qwen36: a decode step's routed experts in the frame (the tier's residents by address, format 4, group 64; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen36: 40 layers on CUDA device 0 (10 attention), lm_head too; 4.4 MiB of parameters, 35.3 MiB of router, b|a and gate rows, 66 MB of DeltaNet state
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[qtier] host pool: 973 experts of the RAM cache page-locked for the device to copy a prompt chunk's experts from (COLI_CUDA_HOST_POOL=0 off)
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 9267 in VRAM -- 15.1 s
+Generated (64 new tokens):
+Text : [qwen36] KV cache: float16, 0.00 GiB at 214 positions (half of float32; Q36_KV=f32 keeps float32)
+[chain] qwen36: 4096 rows per prompt chunk (286 KiB a row, 4.7 GB free on the device; COLI_CUDA_CHAIN_ROWS sets it)
+[chain] qwen36: up to 4 experts a step promoted into the card by this conversation's routes, the coldest residents giving way, none while the last 64 steps hit 75 % or more (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+ "Do you not want to know who has taken it?" cried his wife impatiently. "You want to tell me, and I have no objection to hearing it." This was invitation enough. "Why, my dear, you must know, Mrs. Long says that Netherfield is taken by a young man of
+TTFT: 0.319 s (time to first token)
+[qtier] resident 9267/10240 experts | uploads 9271 | miss(CPU) 6234 | q_skips 0
+[qtier]   dev 0: hits 61926 | 28133 tensors, 17.11 GB VRAM used (1.79 GB trunk + experts, budget 16.33 GB)
+[qtier] VRAM hit rate: 90.9 % | swaps 4 (4 in place)
+[qtier] decode VRAM hit rate: 91.2 % (18396 hits, 1764 misses after the prefill)
+
+PEAK RSS: 19.32 GB
+Expert cache hit rate: 14.7% (hit=1768 miss=10240)
+Speed: 47.19 tok/s (1.4s for 64 tokens)
+[chain] qwen36: 64 forwards, 75 frames (57570 ops, 21184 matmuls), 246.9 ms waiting for the device, 105.7 ms of routed experts on the host, 550.6 MiB on the device; per decode token 2.61 ms waiting, 1.68 ms of experts (63 tokens)
+[chain] qwen36: 2560 layer steps with the routed experts in the frame, 305 of them hybrid (1768 slots on the host in 105.7 ms, 564.5 ms waiting for the device's routes)
+[chain] qwen36: 0 experts promoted into the card by this conversation's routes (0 landed), 63 steps braked; the table read whole 1 times, 8 entries patched; 0.0 ms choosing and staging, 3.9 ms patching
+[chain] qwen36: 4 prompt layer steps staged the host pool's experts (1.60 GB copied over the bus)
+[qtier] host pool: 973 experts (1.60 GB of the RAM cache) page-locked for the device's copies
+
+===== 45_q36_B.log (sha256 d7993250d3d4838cd4e9e7fc246817505bc6f41e799ad1d2daa9e330fd3b815f)
+# cd /content/colibri/c && env COLI_CUDA=1 COLI_GPU=0 COLI_VULKAN=0 COLI_TEMP=0 USAGE_SAVE=0 OMP_NUM_THREADS=6 SNAP=/content/q36  N_NEW=64 timeout -k 10 900 /content/qwen36-dev 256 4 /content/prompt120.txt
+# rc=0 elapsed=29.0s
+
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[enc] prompt tokens: 150 | generating 64 new tokens
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 10.1s | RSS after load: 2.94 GB
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[CUDA] device 0: NVIDIA L4, 23.7 GB VRAM, sm_89
+[qtier] dev 0: 21.8 GB free, allowance 20.8 GB
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 19.02 GB left for experts
+[qtier] dev 0: budget 19.02 GB for experts (~10794 experts) after trunk
+[qtier] CUDA VRAM expert tier active: 1 device(s), 1.80 MB/expert
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[gpu] MoE experts -> CUDA VRAM tier
+[place] probe: one [8192 x 2048] int8 GEMV takes 0.111 ms on CUDA dev 0, 0.225 ms on the CPU -> trunk to VRAM
+[lmh] lm_head [248320 x 2048] int8 resident on CUDA dev 0 (0.47 GB)
+[dnp] 30 DeltaNet-Projektionen auf GPU (0.70 GB VRAM)
+[dense] 190 trunk matrices on GPU (30 dnout, 40 attnproj, 120 shexp; 0.61 GB VRAM)
+[chain] qwen36: a decode step's routed experts in the frame (the tier's residents by address, format 4, group 64; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen36: 40 layers on CUDA device 0 (10 attention), lm_head too; 4.4 MiB of parameters, 35.3 MiB of router, b|a and gate rows, 66 MB of DeltaNet state
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 10240 in VRAM -- 14.8 s
+Generated (64 new tokens):
+Text : [qwen36] KV cache: float16, 0.00 GiB at 214 positions (half of float32; Q36_KV=f32 keeps float32)
+[chain] qwen36: 4096 rows per prompt chunk (286 KiB a row, 3.1 GB free on the device; COLI_CUDA_CHAIN_ROWS sets it)
+[chain] qwen36: up to 4 experts a step promoted into the card by this conversation's routes, the coldest residents giving way, none while the last 64 steps hit 75 % or more (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+ "Do you not want to know who has taken it?" cried his wife impatiently. "You want to tell me, and I have no objection to hearing it." This was invitation enough. "Why, my dear, you must know, Mrs. Long says that Netherfield is taken by a young man of
+TTFT: 0.176 s (time to first token)
+[qwen36 spec gate] run: T(1) 14.8 ms, rows 2:1.40, rho 0.44, acceptance by position 0.25 0.50 0.50 0.50 0.50
+[qwen36 lookup] run: 1.00 tokens/forward (63 forwards per 63 tokens) | acceptance 0.0% (0/2 drafts in 2 verifies) | gate on, 9 declined, 2 probes
+[qtier] resident 10240/10240 experts | uploads 10240 | miss(CPU) 0 | q_skips 0
+[qtier]   dev 0: hits 68800 | 31052 tensors, 18.71 GB VRAM used (1.79 GB trunk + experts, budget 19.02 GB)
+[qtier] VRAM hit rate: 100.0 % | swaps 0 (0 in place)
+[qtier] decode VRAM hit rate: 100.0 % (20800 hits, 0 misses after the prefill)
+
+PEAK RSS: 19.41 GB
+Expert cache hit rate: 0.0% (hit=0 miss=10240)
+Speed: 55.91 tok/s (1.1s for 64 tokens)
+[chain] qwen36: 64 forwards, 66 frames (56638 ops, 21184 matmuls), 855.9 ms waiting for the device, 0.0 ms of routed experts on the host, 180.9 MiB on the device; per decode token 11.58 ms waiting, 0.00 ms of experts (61 tokens)
+[chain] qwen36: 2560 layer steps with the routed experts in the frame, 0 of them hybrid (0 slots on the host in 0.0 ms, 0.0 ms waiting for the device's routes)
+[chain] qwen36: 0 experts promoted into the card by this conversation's routes (0 landed), 63 steps braked; the table read whole 1 times, 0 entries patched; 0.0 ms choosing and staging, 2.8 ms patching
+
+===== summary
+A (with CUDA_EXPERT_GB=18.119, the plan's number: the size of all the experts, 18119393280 bytes):
+  [qtier] dev 0: 21.8 GB free, allowance 18.1 GB
+  [place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 16.33 GB left for experts
+  [qtier] dev 0: budget 16.33 GB for experts (~9267 experts) after trunk
+  [place] probe: one [8192 x 2048] int8 GEMV takes 0.111 ms on CUDA dev 0, 0.252 ms on the CPU -> trunk to VRAM
+  [qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 9267 in VRAM -- 15.1 s
+  [qtier] resident 9267/10240 experts | uploads 9271 | miss(CPU) 6234 | q_skips 0
+  [qtier] VRAM hit rate: 90.9 % | swaps 4 (4 in place)
+  [qtier] decode VRAM hit rate: 91.2 % (18396 hits, 1764 misses after the prefill)
+  TTFT: 0.319 s (time to first token)
+  Speed: 47.19 tok/s (1.4s for 64 tokens)
+  PEAK RSS: 19.32 GB
+  decode tok/s (n - 1) / (n / S - TTFT) = 60.74; the experts taken back to the CPU ("the experts stay on the CPU too"): no
+B (without it):
+  [qtier] dev 0: 21.8 GB free, allowance 20.8 GB
+  [place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 19.02 GB left for experts
+  [qtier] dev 0: budget 19.02 GB for experts (~10794 experts) after trunk
+  [place] probe: one [8192 x 2048] int8 GEMV takes 0.111 ms on CUDA dev 0, 0.225 ms on the CPU -> trunk to VRAM
+  [qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 10240 in VRAM -- 14.8 s
+  [qtier] resident 10240/10240 experts | uploads 10240 | miss(CPU) 0 | q_skips 0
+  [qtier] VRAM hit rate: 100.0 % | swaps 0 (0 in place)
+  [qtier] decode VRAM hit rate: 100.0 % (20800 hits, 0 misses after the prefill)
+  TTFT: 0.176 s (time to first token)
+  Speed: 55.91 tok/s (1.1s for 64 tokens)
+  PEAK RSS: 19.41 GB
+  decode tok/s (n - 1) / (n / S - TTFT) = 65.04; the experts taken back to the CPU ("the experts stay on the CPU too"): no
+text: the same in both runs, the engine's own lines taken out; 49 words; sha256 7f1ae00e0ca998e6afd3c7011e57f46bec0f5eba8c7d6fdd18e986248f6ff6e8

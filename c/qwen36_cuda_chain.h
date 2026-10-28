@@ -82,7 +82,7 @@ typedef struct {
     int *kv_valid, *attn_ord, n_attn;
     int *kv_rows;                              /* per attention layer: its mirror's rows (a sliding layer's ring, else cap) */
     int dn_where, host_zero;
-    CcBuf *x, *nrm, *tmp, *q, *k, *v, *ctx, *qkvz, *ab, *cv, *dny, *h2, *lg, *gs, *us, *hs, *ds, *sgd, *fin;
+    CcBuf *x, *nrm, *tmp, *q, *k, *v, *ctx, *qkvz, *ab, *cv, *dny, *h2, *lg, *gs, *us, *hs, *ds, *sgd, *fin, *out;
     CcBuf *h2d, *lgd, *kvd, *outd, *xd, *lfd, *routed, *cs;
     CcBuf *csd;   /* cs on the device: every RoPE of a step reads it there, not over the bus */
     CcBuf *kg, *vg;   /* a long step's window over a ring: its rows before the step and the step's (q36cc_attention) */
@@ -112,6 +112,7 @@ typedef struct {
      * layer's), the layers with some expert in neither; dm_stage_off: no staging from here on */
     CcExpert *dm_hostb; int *dm_partb, *dm_fro, *dm_frn; CcFetch *dm_fr; CcBuf *dm_tabb, *dm_stage;
     int dm_stage_off; unsigned long long dm_staged, dm_stage_bytes;
+    unsigned long long hp_follows, hp_joined, hp_left; double hp_ms;   /* the pool following the residents */
     int rows_max;   /* a prompt chunk's rows (q36cc_rows_max) */
     CcBuf *dm_tab, *dm_ids, *dm_w, *dm_idsd, *dm_wd, *dm_hid, *dm_y, *dm_hy, *dm_dfl, *dm_hfl;
     float *dm_g, *dm_u, *dm_hh;
@@ -502,7 +503,8 @@ static int q36cc_bufs(Q36CChain *ch, Model *m, int rows) {
              cc_reserve(&ch->ds, r * D * F, CC_DEV) && cc_reserve(&ch->sgd, r * F, CC_DEV) && cc_reserve(&ch->fin, D * F, CC_DEV) &&
              cc_reserve(&ch->h2d, r * D * F, CC_DOWN) && cc_reserve(&ch->lgd, r * E * F, CC_DOWN) &&
              cc_reserve(&ch->kvd, (size_t)(ch->n_attn ? ch->n_attn : 1) * 2 * r * kvo * F, CC_DOWN) &&
-             cc_reserve(&ch->outd, (size_t)c->vocab * F, CC_DOWN) && cc_reserve(&ch->routed, r * RW * F, CC_UP) &&
+             cc_reserve(&ch->out, (size_t)c->vocab * F, CC_DEV) && cc_reserve(&ch->outd, (size_t)c->vocab * F, CC_DOWN) &&
+             cc_reserve(&ch->routed, r * RW * F, CC_UP) &&
              cc_reserve(&ch->cs, r * (c->rotary_dim > 0 ? c->rotary_dim : 2) * F, CC_UP) &&
              cc_reserve(&ch->csd, r * (c->rotary_dim > 0 ? c->rotary_dim : 2) * F, CC_DEV);
     if (ok && c->muse)   /* Muse Spark's alone: the attention gate's rows, the experts' input rows */
@@ -1213,6 +1215,17 @@ static void q36cc_kv_down(Q36CChain *ch, Model *m, int i, int n, int pb) {
  * table points each such expert at its place there (planar, as the RAM holds it). 0: no
  * VRAM for it. */
 #define Q36CC_STAGE_ROWS 32
+/* The host pool follows the residents (qt_chain_host_follow) before a prompt chunk of
+ * Q36CC_FOLLOW_ROWS rows or more: the experts that left the card join it, those that came in
+ * leave it, or a layer holding one that left goes to the host's step whole. A smaller chunk
+ * leaves it behind for the next large one. On the Colab T4 high-RAM VM of the measures
+ * (docs/experiments/qwen36-cuda-host-pool-follow-2026-10-26) a follow costs about 0.3 ms an
+ * expert moved. On another VM of the same shape an earlier version, which followed before
+ * every chunk of more than 32 rows, moved 317 + 317 experts in 193 ms before a 36-row chunk
+ * and saved about 50 ms of it, while a 348-row chunk after 50 + 50 moves saved 1.1 s: through
+ * those two points the follow pays from about 80 rows, and at 128 the copies save about
+ * twice the 193 ms (threshold.txt there). */
+#define Q36CC_FOLLOW_ROWS 128
 /* Promotions (qt_chain_promote): after a decode-sized step, up to this many of its misses move
  * into the buffers of the coldest residents by this conversation's routes. The chain copies
  * each newcomer's RAM bytes into a page-locked staging slot and from there into the victim's
@@ -1225,13 +1238,18 @@ static void q36cc_kv_down(Q36CChain *ch, Model *m, int i, int n, int pb) {
  * COLI_CUDA_CHAIN_PROMOTE_HITS percent (75) of their routes on the card, the step promotes
  * nothing -- a conversation the history fits (80-82 % on an RTX 3070) pays for every swap (a
  * promoted expert displaces a resident the history still routes to) and gains little; at 80 the
- * brake was marginal for it. 0 brakes never. */
+ * brake was marginal for it. It holds only where the warm start's set came from a history
+ * (HEAT_FILE). Without one the set is the experts in index order, no conversation's, and the
+ * brake starts off: on a T4 (64 % of the experts resident) it held a story at 78-79 % hits,
+ * where the promotions reach 86-94 % and a token costs 7-17 % less; on an RTX 3070 about 2 %
+ * either way. The variable, when set, wins; 0 brakes never. */
 #define Q36CC_PROMOTE 4
 #define Q36CC_PROMO_HITS 75
 #define QT_CHG_LIST 512   /* residency changes read at once (the tier's ring holds as many) */
 static int q36cc_promote_rate(void) { const char *e = getenv("COLI_CUDA_CHAIN_PROMOTE"); return e && *e ? atoi(e) : Q36CC_PROMOTE; }
 static int q36cc_promote_hits(void) {
-    const char *e = getenv("COLI_CUDA_CHAIN_PROMOTE_HITS"); int h = e && *e ? atoi(e) : Q36CC_PROMO_HITS;
+    const char *e = getenv("COLI_CUDA_CHAIN_PROMOTE_HITS");
+    int h = e && *e ? atoi(e) : qt_chain_history() ? Q36CC_PROMO_HITS : 0;
     return h < 0 ? 0 : h > 100 ? 100 : h;
 }
 /* entry (i, e) of the host's table from the tier: 1 resident on this device */
@@ -1309,6 +1327,15 @@ static void q36cc_promote_settle(Q36CChain *ch) {
     for (int p = 0; p < ch->pr_npend; p++) { qt_chain_promote_done(ch->pr_pend[p].ci, ch->pr_pend[p].vi, cc_host_up_done(ch->pr_pend[p].tk)); ch->pr_busy[ch->pr_pend[p].slot] = 0; }
     ch->pr_npend = 0;
 }
+/* The staging buffer for a layer's host-pool experts. With the residents spread over the layers hmax (the most
+ * experts one layer has off the card) starts below the layer's 256 and every promotion can raise it; cc_reserve
+ * makes the new buffer before it frees the old one, so each growth wanted both at once. On an 8 GB card the
+ * second allocation failed in the middle of a conversation and the staging stayed off for the process (the
+ * RTX 3070 agent session in docs/experiments). A bigger buffer takes the old one's place: free it first. */
+static int q36cc_stage_reserve(CcBuf **stage, size_t bytes) {
+    if (*stage && cc_bytes(*stage) < bytes) { cc_free(*stage); *stage = NULL; }
+    return cc_reserve(stage, bytes, CC_DEV);
+}
 /* A GGUF layer's expert in the staging: its gate, up and down rows as the file has them, which the
  * device reads in place where a row is whole words (bd_rows_copy pads the others); mg a gate's (or
  * an up's) bytes, md a down's. 0: rows of other widths, the layer's experts the host's. */
@@ -1370,7 +1397,7 @@ static int q36cc_stage_table_gguf(Q36CChain *ch, Model *m) {
     size_t fb = 0, tb = 0, full = q36cc_mirror_bytes(m, qwen36_max_ctx()), held = q36cc_mirror_held(ch, m);
     size_t left = full > held ? full - held : 0, need = (size_t)(hmax ? hmax : 1) * stride;
     if (!ch->dm_stage && coli_cuda_mem_info(ch->dev, &fb, &tb) && fb < need + left + ((size_t)256 << 20)) return 0;
-    if (!stride || !cc_reserve(&ch->dm_stage, (size_t)(hmax ? hmax : 1) * stride, CC_DEV) ||
+    if (!stride || !q36cc_stage_reserve(&ch->dm_stage, (size_t)(hmax ? hmax : 1) * stride) ||
         !cc_reserve(&ch->dm_tabb, ne * sizeof(CcExpert), CC_DEV)) return 0;
     const char *base = (const char *)cc_dev_addr(ch->dm_stage);
     if (!base) return 0;
@@ -1430,7 +1457,7 @@ static int q36cc_stage_table(Q36CChain *ch, Model *m) {
     CcFetch *fr = realloc(ch->dm_fr, (size_t)(2 * tot + 1) * sizeof(CcFetch));
     if (!fr) return 0;
     ch->dm_fr = fr;
-    if (!cc_reserve(&ch->dm_stage, (size_t)(hmax ? hmax : 1) * stride, CC_DEV) || !cc_reserve(&ch->dm_tabb, ne * sizeof(CcExpert), CC_DEV))
+    if (!q36cc_stage_reserve(&ch->dm_stage, (size_t)(hmax ? hmax : 1) * stride) || !cc_reserve(&ch->dm_tabb, ne * sizeof(CcExpert), CC_DEV))
         return 0;
     const char *base = (const char *)cc_dev_addr(ch->dm_stage);
     if (!base) return 0;
@@ -1458,6 +1485,14 @@ static int q36cc_stage_table(Q36CChain *ch, Model *m) {
     }
     return cc_begin() && cc_write(ch->dm_tabb, 0, ch->dm_hostb, ne * sizeof(CcExpert)) && cc_submit(1);
 }
+/* before a prompt chunk of n rows that stages: on one of Q36CC_FOLLOW_ROWS rows or more the
+ * pool follows the residents, and a change stales the staged table */
+static void q36cc_follow(Q36CChain *ch, int n) {
+    if (n < Q36CC_FOLLOW_ROWS) return;
+    double th = tm_now(); int hj, hl;
+    if (qt_chain_host_follow(&hj, &hl)) { ch->hp_follows++; ch->hp_joined += (unsigned)hj; ch->hp_left += (unsigned)hl; ch->dm_stage_dirty = 1; }
+    ch->hp_ms += tm_now() - th;
+}
 /* the step's buffers, and the table when the tier's residents moved (the tier held) */
 static int q36cc_dm_begin(Q36CChain *ch, Model *m, int n) {
     Cfg *c = &m->c; int L = c->n_layers, E = c->n_experts, K = c->topk, D = c->hidden, I = c->inter;
@@ -1468,11 +1503,13 @@ static int q36cc_dm_begin(Q36CChain *ch, Model *m, int n) {
         ch->dm_g = falloc(I); ch->dm_u = falloc(I); ch->dm_hh = falloc(D);
         if (!ch->dm_host || !ch->dm_res || !ch->dm_part || !ch->dm_ran || !ch->dm_nres) return 0;
         ch->promo_rate = q36cc_promote_rate(); ch->promo_hits = q36cc_promote_hits();
-        if (ch->promo_rate > 0 && qt_chain_devices() == 1 && ch->dm_fmt < 100 && cc_host_up_ready())
+        if (ch->promo_rate > 0 && qt_chain_devices() == 1 && ch->dm_fmt < 100 && cc_host_up_ready()) {
+            char brake[96];
+            if (ch->promo_hits > 0) snprintf(brake, sizeof brake, "none while the last %d steps hit %d %% or more", Q36CC_PROMO_WIN, ch->promo_hits);
+            else snprintf(brake, sizeof brake, "no brake%s", qt_chain_history() ? "" : " (no heat file: the warm start's set is no conversation's)");
             fprintf(stderr, "[chain] qwen36: up to %d experts a step promoted into the card by this conversation's routes, "
-                            "the coldest residents giving way, none while the last %d steps hit %d %% or more "
-                            "(COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)\n", ch->promo_rate, Q36CC_PROMO_WIN, ch->promo_hits);
-        else ch->promo_rate = 0;
+                            "the coldest residents giving way, %s (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)\n", ch->promo_rate, brake);
+        } else ch->promo_rate = 0;
     }
     if (!cc_reserve(&ch->dm_ids, (size_t)L * r * K * 4, CC_DEV) || !cc_reserve(&ch->dm_w, (size_t)L * r * K * F, CC_DEV) ||
         !cc_reserve(&ch->dm_idsd, (size_t)L * r * K * 4, CC_DOWN) || !cc_reserve(&ch->dm_wd, (size_t)L * r * K * F, CC_DOWN) ||
@@ -1511,8 +1548,11 @@ static int q36cc_dm_begin(Q36CChain *ch, Model *m, int n) {
         ch->dm_epoch = ep; ch->dm_read = 1; ch->dm_stage_dirty = 1;
         ch->patch_ms += tm_now() - tp;
     }
-    /* the staged table (a prompt chunk's host-pool copies) follows the residents when a chunk needs it */
-    if (ch->dm_stage_dirty && n > Q36CC_STAGE_ROWS && qt_chain_host_count() > 0 && !ch->dm_stage_off && cc_fetch_ready()) {
+    /* the staged table (a prompt chunk's host-pool copies) follows the residents when a chunk needs it,
+     * and on a large chunk the pool first (q36cc_follow) */
+    int stage = n > Q36CC_STAGE_ROWS && qt_chain_host_count() > 0 && !ch->dm_stage_off && cc_fetch_ready();
+    if (stage) q36cc_follow(ch, n);
+    if (stage && ch->dm_stage_dirty) {
         if (!q36cc_stage_table(ch, m)) {
             if (cc_lost()) return 0;
             fprintf(stderr, "[chain] qwen36: no VRAM to stage the host pool's experts in; a prompt chunk's go to the host's step\n");
@@ -1683,6 +1723,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
     if (!mirror_ok || !q36cc_scratch(ch, m, rows) || (lf && !cc_reserve(&ch->lfd, (size_t)L * 3 * D * sizeof(float), CC_DOWN)) ||
         (want_x && !cc_reserve(&ch->xd, (size_t)rows * D * sizeof(float), CC_DOWN)) ||
         (nlogits > 1 && (!cc_reserve(&ch->fin, (size_t)nlogits * D * sizeof(float), CC_DEV) ||
+                         !cc_reserve(&ch->out, (size_t)nlogits * c->vocab * sizeof(float), CC_DEV) ||
                          !cc_reserve(&ch->outd, (size_t)nlogits * c->vocab * sizeof(float), CC_DOWN)))) {
         fprintf(stderr, "[chain] qwen36: device memory for %d rows refused; the per-matrix path\n", rows);
         ch->failed = 1;
@@ -1801,12 +1842,15 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         if (ok && lf) ok = cc_copy(ch->lfd, ((size_t)(L - 1) * 3 + 2) * D, ch->x, (size_t)(n - 1) * D, D);
         if (ok && want_x) ok = cc_copy(ch->xd, 0, ch->x, 0, (size_t)n * D);
         int last = c0 + n == S;
-        /* the final norm and lm_head on this chunk's share of the last nlogits rows */
+        /* the final norm and lm_head on this chunk's share of the last nlogits rows. The head writes its
+         * logits on the card and one copy takes them to outd: written into outd itself, one float per
+         * warp over the bus, the head took 7.4 ms of a 13.5 ms step on an RTX PRO 4000, 0.9 ms this way */
         int lo0 = S - nlogits > c0 ? S - nlogits - c0 : 0, lo_n = nlogits ? n - lo0 : 0;
         if (ok && lo_n > 0) {
             int dst = c0 + lo0 - (S - nlogits);
             ok = q36cc_norm(ch->x, (size_t)lo0 * D, ch->prm, ch->o_final, ch->fin, (size_t)dst * D, lo_n, D, c->eps) &&
-                 cc_matmul(ch->t_lm, ch->fin, (size_t)dst * D, ch->outd, (size_t)dst * c->vocab, lo_n);
+                 cc_matmul(ch->t_lm, ch->fin, (size_t)dst * D, ch->out, (size_t)dst * c->vocab, lo_n) &&
+                 cc_copy(ch->outd, (size_t)dst * c->vocab, ch->out, (size_t)dst * c->vocab, (size_t)lo_n * c->vocab);
         }
         double t0 = tm_now();
         ok = ok && cc_submit(0);
@@ -1904,4 +1948,7 @@ static void q36cc_report(Model *m) {
     if (ch->dm_staged)
         fprintf(stderr, "[chain] qwen36: %llu prompt layer steps staged the host pool's experts (%.2f GB copied over the bus)\n",
                 ch->dm_staged, ch->dm_stage_bytes / 1073741824.0);
+    if (ch->hp_follows)
+        fprintf(stderr, "[chain] qwen36: the host pool followed the residents before %llu prompt chunks: %llu experts joined it, "
+                        "%llu left it, %.1f ms\n", ch->hp_follows, ch->hp_joined, ch->hp_left, ch->hp_ms);
 }

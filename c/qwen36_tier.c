@@ -1461,6 +1461,49 @@ int qt_chain_host(int layer,int eid,const void **w,size_t *wb,const float **sc,s
     return r;
 }
 int qt_chain_host_count(void){ return G.on && G_host_on > 0 ? (int)G_host_n : 0; }
+/* The pool follows the residents. The warm start page-locks the experts it leaves in RAM; the
+ * chain's promotions and the tier's LFRU swaps then trade experts between the card and the RAM, and
+ * the pool kept its first set: an expert that left the card was not in it, so a prompt chunk's
+ * layer holding one went to the host's step whole (q36cc_stage_table), and one that came in kept
+ * its RAM page-locked for nothing. Before a large prompt chunk (Q36CC_FOLLOW_ROWS) the chain calls
+ * this: the non-residents join the pool, the residents leave it; the CUDA calls outside the lock,
+ * as in qt_note_host.
+ * 1 when the pool changed; *joined and *left say how many. */
+int qt_chain_host_follow(int *joined,int *left){
+    *joined=*left=0;
+    if(!G.on || G_host_on <= 0) return 0;
+    size_t n = (size_t)G.nl*G.ne, mb = (size_t)G.D*G.Ih/2, sb = (2*G.sc_gu + G.sc_d)*sizeof(float);
+    int *mv = malloc(n*sizeof(int)), nj = 0, nl = 0;   /* the joins from the front, the leaves from the back */
+    if(!mv) return 0;
+    pthread_mutex_lock(&G.mx);
+    for(size_t i=0; i<n && !G.th_stop; i++){
+        QSlot *s = &G.slot[i];
+        if(!s->resident && !s->hreg && s->g4 && s->gs &&
+           s->u4 == s->g4 + mb && s->d4 == s->g4 + 2*mb && s->us == s->gs + G.sc_gu && s->ds == s->gs + 2*G.sc_gu)
+            mv[nj++] = (int)i;
+        else if(s->resident && s->hreg){   /* out of qt_chain_host now, released below */
+            s->hreg = 0; G_host_n--; G_host_bytes -= 3*mb + sb; mv[n-1-nl++] = (int)i;
+        }
+    }
+    pthread_mutex_unlock(&G.mx);
+    /* the slots' RAM stays where it is: the pool is on only when the RAM holds every expert */
+    for(int k=0; k<nl; k++){ QSlot *s = &G.slot[mv[n-1-k]]; coli_cuda_host_unregister((void *)s->g4); coli_cuda_host_unregister((void *)s->gs); }
+    int in = 0;
+    for(int k=0; k<nj; k++){
+        QSlot *s = &G.slot[mv[k]];
+        if(!coli_cuda_host_register((void *)s->g4, 3*mb)) continue;
+        if(!coli_cuda_host_register((void *)s->gs, sb)){ coli_cuda_host_unregister((void *)s->g4); continue; }
+        pthread_mutex_lock(&G.mx);
+        int still = !s->resident && !s->hreg && !G.th_stop;
+        if(still){ s->hreg = 1; G_host_n++; G_host_bytes += 3*mb + sb; }
+        pthread_mutex_unlock(&G.mx);
+        if(still) in++;
+        else { coli_cuda_host_unregister((void *)s->g4); coli_cuda_host_unregister((void *)s->gs); }
+    }
+    free(mv);
+    *joined = in; *left = nl;
+    return in + nl > 0;
+}
 
 unsigned qt_chain_epoch(void){
     if(!G.on) return 0;
@@ -1470,6 +1513,7 @@ unsigned qt_chain_epoch(void){
     return e;
 }
 int qt_chain_devices(void){ return G.on ? G.ndev : 0; }
+int qt_chain_history(void){ return G.on && G.heat0; }
 int qt_chain_resident(int layer,int eid,int device,ColiCudaTensor **g,ColiCudaTensor **u,ColiCudaTensor **d){
     if(!G.on || G_trunk_only || G_chain_own || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return 0;
     pthread_mutex_lock(&G.mx);
@@ -1792,23 +1836,33 @@ void qt_note_block(int layer,int eid,
     pthread_mutex_unlock(&G.mx);
 }
 
-/* warmstart order -- heat descending (HEAT_FILE) or natural order.
- * Returns 0 once all budgets are full or the list is exhausted. */
+/* warmstart order -- heat descending (HEAT_FILE, or an engine's qt_heat_order), else expert
+ * by expert across the layers: expert 0 of every layer, then expert 1, ... Index order
+ * filled whole layers (a T4: layers 0-24 and part of 25 on the card, 26-39 none), and a
+ * prompt chunk then copied each of those layers' 256 experts over the bus while it waited,
+ * after 25 layers with the bus idle; spread, every layer copies its share beside the work of
+ * the layer before. Under G.mx; 0: no memory. */
 static const uint32_t *g_sort_heat;
 static int cmp_heat_desc(const void *a,const void *b){
     uint32_t ha=g_sort_heat[*(const int*)a], hb=g_sort_heat[*(const int*)b];
     return ha<hb ? 1 : ha>hb ? -1 : 0;
 }
+static int fill_order_make(void){
+    size_t n=(size_t)G.nl*G.ne;
+    G.fill_order=malloc(n*sizeof(int));
+    if(!G.fill_order) return 0;
+    /* no heat: the i-th pick is layer i%nl, expert i/nl; with heat: index order, sorted below */
+    for(size_t i=0;i<n;i++) G.fill_order[i]=G.heat0 ? (int)i : (int)((i%G.nl)*G.ne+i/G.nl);
+    if(G.heat0){ g_sort_heat=G.heat0; qsort(G.fill_order,n,sizeof(int),cmp_heat_desc); }
+    G.fill_cur=0;
+    return 1;
+}
+/* Returns 0 once all budgets are full or the list is exhausted. */
 int qt_fill_next(int *layer,int *eid){
     if(!G.on) return 0;
     size_t n=(size_t)G.nl*G.ne;
     pthread_mutex_lock(&G.mx);
-    if(!G.fill_order){
-        G.fill_order=malloc(n*sizeof(int));
-        for(size_t i=0;i<n;i++) G.fill_order[i]=(int)i;
-        if(G.heat0){ g_sort_heat=G.heat0; qsort(G.fill_order,n,sizeof(int),cmp_heat_desc); }
-        G.fill_cur=0;
-    }
+    if(!G.fill_order && !fill_order_make()){ pthread_mutex_unlock(&G.mx); return 0; }
     while((size_t)G.fill_cur<n){
         int gi=G.fill_order[G.fill_cur];
         int l=gi/G.ne, e=gi%G.ne, hd=home2(l,e);
@@ -1843,12 +1897,7 @@ int qt_plan_fill(int *layers,int *eids,int max){
     size_t n=(size_t)G.nl*G.ne;
     int cnt=0;
     pthread_mutex_lock(&G.mx);
-    if(!G.fill_order){
-        G.fill_order=malloc(n*sizeof(int));
-        for(size_t i=0;i<n;i++) G.fill_order[i]=(int)i;
-        if(G.heat0){ g_sort_heat=G.heat0; qsort(G.fill_order,n,sizeof(int),cmp_heat_desc); }
-        G.fill_cur=0;
-    }
+    if(!G.fill_order && !fill_order_make()){ pthread_mutex_unlock(&G.mx); return 0; }
     while((size_t)G.fill_cur<n && cnt<max){
         int full=1; for(int i=0;i<G.ndev;i++) if(G.used[i]+qt_ebytes_min()<=G.budget[i]) full=0;
         if(full) break;

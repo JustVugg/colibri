@@ -140,7 +140,8 @@ def qwen35moe_config(meta, tensors, overrides=None):
         "hidden_size": int(need("embedding_length")),
         "num_hidden_layers": layers,
         "num_attention_heads": int(need("attention.head_count")),
-        "num_key_value_heads": int(need("attention.head_count_kv")),
+        # Ollama's converter writes head_count_kv per layer (0 on the DeltaNet layers): the attention layers' value
+        "num_key_value_heads": max(int(v) for v in need("attention.head_count_kv")) if isinstance(need("attention.head_count_kv"), list) else int(need("attention.head_count_kv")),
         "head_dim": head_dim,
         "num_experts": int(need("expert_count")),
         "num_experts_per_tok": int(need("expert_used_count")),

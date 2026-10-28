@@ -1335,15 +1335,9 @@ uint64_t coli_v4_os_available_memory(void) {
                (uint64_t)page;
     return 0;
 #else
-    FILE *stream = fopen("/proc/meminfo", "r");
-    if (stream) {
-        char line[256];
-        unsigned long long kib = 0;
-        while (fgets(line, sizeof(line), stream))
-            if (sscanf(line, "MemAvailable: %llu kB", &kib) == 1) break;
-        fclose(stream);
-        if (kib) return (uint64_t)kib * 1024;
-    }
+    /* MemAvailable bounded by a container's cgroup (compat_mem_available_gb) */
+    double gb = compat_mem_available_gb();
+    if (gb > 0.0) return (uint64_t)(gb * 1e9);
     long pages = sysconf(_SC_AVPHYS_PAGES), page_size = sysconf(_SC_PAGESIZE);
     if (pages <= 0 || page_size <= 0) return 0;
     return (uint64_t)pages * (uint64_t)page_size;

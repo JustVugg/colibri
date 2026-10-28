@@ -103,10 +103,6 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
-#ifdef __APPLE__
-#include <sys/sysctl.h>
-#include <mach/mach.h>
-#endif
 #include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
 #include "cli_args.h"
 #define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
@@ -302,26 +298,11 @@ static int k3_cap_for_ram(double budget_gb, double resident_gb, double reserve_g
 }
 
 /* Memory the OS says is still reclaimable without swapping, in GB; 0 if unknown.
- * The same quantity colibri.c's cap_for_ram() budgets against -- Linux
- * MemAvailable, Windows ullAvailPhys bounded by the commit still grantable
- * (compat_meminfo), macOS free+inactive+purgeable. #855. */
-static double k3_mem_avail(void){
-#ifdef _WIN32
-    double total=0, avail=0; compat_meminfo(&total,&avail); return avail;
-#elif defined(__APPLE__)
-    int64_t pgsz=0; size_t sl=sizeof(pgsz);
-    if(sysctlbyname("hw.pagesize",&pgsz,&sl,NULL,0)||pgsz<=0) pgsz=16384;
-    vm_statistics64_data_t vs; mach_msg_type_number_t nc=HOST_VM_INFO64_COUNT;
-    if(host_statistics64(mach_host_self(),HOST_VM_INFO64,(host_info64_t)&vs,&nc)!=KERN_SUCCESS)
-        return 0;
-    return (double)(vs.free_count+vs.inactive_count+vs.purgeable_count)*(double)pgsz/1e9;
-#else
-    FILE *f=fopen("/proc/meminfo","r"); if(!f) return 0;
-    char ln[256]; double kb=0;
-    while(fgets(ln,sizeof(ln),f)) if(sscanf(ln,"MemAvailable: %lf",&kb)==1) break;
-    fclose(f); return kb/1e6;
-#endif
-}
+ * compat_mem_available_gb, the quantity colibri.c's cap_for_ram() budgets
+ * against: Linux MemAvailable bounded by a container's cgroup, Windows
+ * ullAvailPhys bounded by the commit still grantable, macOS
+ * free+inactive+purgeable. #855. */
+static double k3_mem_avail(void){ return compat_mem_available_gb(); }
 static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r);
 #if defined(__APPLE__)
     return r.ru_maxrss/(1024.0*1024.0*1024.0);

@@ -1125,6 +1125,13 @@ uses it.
 
 ## The dense chain (`vk_chain.c`)
 
+The decode GEMVs' int8 path (`chain_gemv.comp`) and the routed experts' rows
+(`chain_moe_gv.comp`) issue four 16-byte steps' loads before the first is summed: a loop
+that loaded one step and summed it waited for every load in turn. The sums go into the same
+accumulators in the same order, so a row's bits are unchanged (tests/test_vk_chain). An RTX
+3070: int8 8192 x 2048 78 -> 66 us a matrix in `COLI_VK_CHAIN_BENCH=1`, Qwen3.6-35B int4 decode
+18.5 -> 17.5 ms a token; the experts' bench (every expert in VRAM) unchanged.
+
 With the dense matrices on the device one `coli_vk_matmul` at a time, each matrix is
 a submit and a host round trip: about 726 of them per Qwen3.8 decode token. On an
 integrated GPU that made the dense part slower on the device than on the CPU (see
@@ -2463,6 +2470,19 @@ the device's roundings (`hy_act_v4`, as `shaders/expert_act_v4.comp`: gate and u
 the clamped SwiGLU, times the route weight and to bf16, E4M3 per 128, then down), the weight
 in the row as in the device's; the tier copies a CPU pair's input row at the issue, since
 that engine frees its rounded rows as the issue returns. Kimi K3's SiTU stays on the device.
+**Whether the hybrid pays is measured, not assumed** (`vk_hyb_gate.h`). On an RTX 3070 at
+PCIe 4.0 x16 with Qwen3.6 int4 (2756 of 10240 experts on the card, about 1.4 host pool pairs
+a decode step) the hybrid steps took a token from 18.5 ms to 33 to 50: the CPU's pair cost
+300 to 500 us at one to twelve threads where the device read the same expert over the bus
+in about 130, and a step's three frames and timeline round trip came on top. So the chain
+times its decode forwards with the device's reads for three forwards, then with the hybrid
+steps for three (the first forward of each warms it), keeps the faster (the hybrid where it
+is not slower by a twentieth) and measures again after 1024 forwards; the run's line says
+what it measured and what it kept. `COLI_VK_HYBRID_GATE=0` keeps the steps on, as before.
+The same card had come up without timeline semaphores at all when the build's headers
+predated the cooperative matrix (the feature was asked for inside that extension's block),
+so the steps never ran there; every device is asked now.
+
 The run's line adds `hybrid: N steps,
 P host pool pairs computed by the CPU in place (T ms, U us a pair)`. Measured on the RTX PRO
 4000 with the i5-13500, each server on a copy of one history, 128 tokens, a warm-up and a run:
@@ -3347,6 +3367,38 @@ host-visible on the largest device-local heap (else that heap's device-local typ
 Lavapipe has one type for everything); the staging type is host-visible and coherent and
 not device-local where one exists, so staging never takes the window. Vendor types
 (AMD's uncached and device-coherent ones) are passed over.
+
+**A window smaller than the card.** A card whose host-visible device-local type is as big as its
+heap can still be given less of it. On a Colab A100 80 GB (NVIDIA's 580 driver) the engine's device is
+given 39.75 GiB of it, mapped or not, and then a block is refused with `VK_ERROR_OUT_OF_DEVICE_MEMORY`,
+while the heap says 80 GiB and `VK_EXT_memory_budget` 79.21; on a Colab L4 (24 GB) it is given 9.75 GiB
+of 22.5.
+On the mapped path the expert tier and the weights add up to about that window, and the allocations
+made after them (the streaming slots, the expert batch's scratch) are refused: with Qwen3.8's int4
+experts, `origin/dev` held 13,784 of 24,576 experts, and a prompt of 512 tokens fell to the CPU and
+took 98 s to the first token. On the L4 the pool asks the type for another block for each tensor
+that does not fit (`pool_suballoc`; read in the code, the stuck runs did not count their refusals), a
+refused block took about 0.6 s in a probe program, and the start-up of Qwen3.6's expert tier (10,240
+experts) had not finished after 15 minutes in four runs, with five threads waiting for the pool's mutex
+and one inside the driver; staged it takes 21 s. So when `COLI_VK_STAGED` is unset and the card is discrete, `coli_vk_init`
+asks once, as soon as the device exists (`vk_window_decide`), by allocating 1 GiB blocks of the type
+up to 9/10 of its heap in whole GiB (less if `VK_EXT_memory_budget` says less is free, so memory
+another process holds is not read as a small window; without the extension it is), and takes the
+staged path when it is refused before that. The blocks go back all together when the loop ends. That took 2.3 to 2.4 s at the engine's start on that A100
+(39 GiB obtained, a refusal, the frees; about 50 ms for each GiB allocated and freed) and 1.0 s on
+the L4, and another process on the card can see allocations refused while they are held. For this
+the device is made with the queue a staged card would ask for, as the rule above would.
+`COLI_VK_STAGED=0` skips the probe. The probe's blocks are counted by the device-memory books like
+any other allocation, so `COLI_VK_DEVICE_CAP_MB` limits them. `COLI_VK_WINDOW_PROBE_MB=N` answers N
+MiB without asking, and `COLI_VK_WINDOW_ASK_MB=N` asks for N MiB at most so that the loop runs for
+real (tests; a device with a host-visible device-local type that is not staged already). The log says which way it went; on that A100:
+
+```
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 81920 MiB heap) copied from host staging memory (type 3) on a transfer queue (the driver gave 39 of the 72 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 2.3 s)
+```
+
+and when the type gives what was asked, the line starts `[VK] memory: mapped weights, the host-visible
+device-local memory gave the N GiB asked`.
 
 **What moves where, staged:**
 

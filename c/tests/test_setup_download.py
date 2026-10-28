@@ -9,6 +9,7 @@ become a file without `.part`, and the token never follows the redirect.
 """
 import hashlib
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -378,6 +379,18 @@ class DownloadTest(unittest.TestCase):
         self.assertEqual(setup_download.parse_curl_speed("3456789.000"), 3456789.0)
         self.assertEqual(setup_download.parse_curl_speed("3456789,500"), 3456789.5)
         self.assertIsNone(setup_download.parse_curl_speed(""))
+
+    def test_windows_probe_rejects_http_error_without_discarding_timeout_sample(self):
+        with mock.patch.object(setup_download.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 22, "455465587", "HTTP 404")
+            self.assertIsNone(setup_download.probe_throughput_windows(
+                "https://example.test/missing", "curl.exe"))
+            self.assertIn("--fail", run.call_args.args[0])
+
+            # A bounded probe may time out after transferring useful sample bytes.
+            run.return_value = subprocess.CompletedProcess([], 28, "3000000", "timeout")
+            self.assertEqual(setup_download.probe_throughput_windows(
+                "https://example.test/model", "curl.exe"), 3000000.0)
 
     def test_verify_file(self):
         name = "model-00001.safetensors"
