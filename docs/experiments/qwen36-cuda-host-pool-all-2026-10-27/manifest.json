@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "hypothesis": "The qwen36 CUDA chain stages a prompt chunk's non-resident experts from the tier's host pool (page-locked RAM), which holds the experts off the card at the warm start. The chain's promotions and the tier's swaps move experts off the card later; #2416's follow page-locks them only before a chunk of 128 rows or more, and a smaller chunk's layer holding one goes to the host's step. Page-locking the residents' RAM copies too, when the card holds fewer than every expert (a Colab T4 holds 6605 of the 10240), keeps every such layer on the card, so a short prompt after an answer is faster.",
+  "commit": "c1c06ac6fcb32157e4da130fd96775a32a757052",
+  "model": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64",
+  "command": "bench.c built against c/ (make CUDA=1 CUDA_ARCH=sm_75, as bench build does); COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close ./qwen36-bench --model <model> --text promessi_sposi.txt --lengths 64,512,64 --gen 32 --teacher",
+  "prompt_hash": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "hardware": {
+    "cpu": "Intel(R) Xeon(R) CPU @ 2.00GHz (4 cores / 8 threads, 38.5 MiB L3) + NVIDIA Tesla T4 (15360 MiB, sm_75, up to PCIe Gen3 x16)",
+    "ram": "51 GiB",
+    "storage": "Google Colab VM disk (the model downloaded to /content before the runs)",
+    "os": "Ubuntu 24.04.4 LTS (Google Colab, T4 high-RAM), CUDA 13.0 (nvcc V13.0.88), driver 580.82.07, gcc 13.3.0"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "heat_file": "none",
+      "scenario": "the third length of the base: a 64-token prompt after a 64-token and a 512-token prompt, each with its 32 decode steps, in one process",
+      "tok_s": "prompt tokens / the prompt's seconds (bench's prefill_tps of the third row)",
+      "engine_build": "the stack of our open PRs: origin/dev c1c06ac6 + #2015, #2016, #2413, #2414, #2415, #2416, #2417, #2418, #2421, #2422, #2423, #2424, #2425 and #2428 at their heads, records-only commits left out (79fe45ac, local)"
+    },
+    "samples": {
+      "tok_s": [
+        100.95,
+        97.61,
+        99.45,
+        99.02
+      ],
+      "prefill_s_64_after_512": [
+        0.634,
+        0.656,
+        0.644,
+        0.646
+      ],
+      "decode_tok_s_64_after_512": [
+        50.892,
+        50.597,
+        51.142,
+        51.028
+      ],
+      "nll_64_after_512": [
+        2.69192,
+        2.69192,
+        2.69192,
+        2.69192
+      ]
+    },
+    "median_tok_s": 99.235,
+    "quality": {
+      "method": "make -C c check (macOS arm64) on this change; make -C c cuda-test on the T4 on it (correctness.txt). Where nothing moved the logits are the same: the stack and the stack + this change at 64, 128 and 256 tokens. After experts left the card a chunk's layer that went to the host's step runs on the card: the stack + this change gives the fingerprint, nll and top1 of the stack with #2416's follow before every staged chunk, in every row of the base (logits.txt). The 64-token prompt after the 512 here: v0 ['ad3b695857d1fcca'], v1 ['162b220baca4184c'].",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-host-pool-all-2026-10-27/base.txt",
+      "sha256": "bd5952753d2a14bc0d8cf79c6e3b6656fbc3691cef0c6e58f2bd55ba3bfdb9ce"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "heat_file": "none",
+      "scenario": "the third length of the base: a 64-token prompt after a 64-token and a 512-token prompt, each with its 32 decode steps, in one process",
+      "tok_s": "prompt tokens / the prompt's seconds (bench's prefill_tps of the third row)",
+      "engine_build": "the stack + this change, its commit cherry-picked (019fdec4, measure only)"
+    },
+    "samples": {
+      "tok_s": [
+        210.91,
+        211.71,
+        212.26,
+        211.71
+      ],
+      "prefill_s_64_after_512": [
+        0.303,
+        0.302,
+        0.302,
+        0.302
+      ],
+      "decode_tok_s_64_after_512": [
+        50.77,
+        50.671,
+        50.405,
+        50.802
+      ],
+      "nll_64_after_512": [
+        2.69417,
+        2.69417,
+        2.69417,
+        2.69417
+      ]
+    },
+    "median_tok_s": 211.71,
+    "quality": {
+      "method": "make -C c check (macOS arm64) on this change; make -C c cuda-test on the T4 on it (correctness.txt). Where nothing moved the logits are the same: the stack and the stack + this change at 64, 128 and 256 tokens. After experts left the card a chunk's layer that went to the host's step runs on the card: the stack + this change gives the fingerprint, nll and top1 of the stack with #2416's follow before every staged chunk, in every row of the base (logits.txt). The 64-token prompt after the 512 here: v0 ['ad3b695857d1fcca'], v1 ['162b220baca4184c'].",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-host-pool-all-2026-10-27/base.txt",
+      "sha256": "bd5952753d2a14bc0d8cf79c6e3b6656fbc3691cef0c6e58f2bd55ba3bfdb9ce"
+    }
+  },
+  "outcome": "improvement"
+}

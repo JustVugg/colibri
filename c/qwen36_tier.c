@@ -1409,13 +1409,14 @@ static void qt_lfru_tick_locked(void);
  * copy over the bus costs per expert: from a few dozen rows up, copying a layer's non-resident
  * experts into VRAM (the chain's staging, one layer at a time, the copy of the next overlapping
  * the layer before) and running them there beats the host's step. The engine's RAM cache serves
- * the copies as it is, page-locked here (a copy at the bus's full rate, no second copy in RAM).
- * A decode step's slots stay the CPU's. On when the RAM holds every expert (no slot is ever
- * recycled), one device, and the RAM copy is a layout the device's GEMMs read: expert_ffn.h's
- * planar int4 per 64 (coli_cuda_planar_rows), or a GGUF's rows as the file has them (gate, up
- * and down back to back, no scales; the engine holds them so when this tier takes a GGUF's
- * experts). COLI_CUDA_HOST_POOL=0 off. */
-static int G_host_on = -1;
+ * the copies as it is, page-locked here (a copy at the bus's full rate, no second copy in RAM):
+ * the non-residents' copies, and the residents' too when the card holds fewer than every expert
+ * and the chain runs (tier_warmstart, qt_chain_host_all). A decode step's slots stay the CPU's.
+ * On when the RAM holds every expert (no slot is ever recycled), one device, and the RAM copy is
+ * a layout the device's GEMMs read: expert_ffn.h's planar int4 per 64 (coli_cuda_planar_rows), or
+ * a GGUF's rows as the file has them (gate, up and down back to back, no scales; the engine holds
+ * them so when this tier takes a GGUF's experts). COLI_CUDA_HOST_POOL=0 off. */
+static int G_host_on = -1, G_host_all;
 static unsigned long long G_host_n, G_host_bytes;
 static int host_pool_on(void){
     if(G_host_on >= 0) return G_host_on;
@@ -1461,6 +1462,54 @@ int qt_chain_host(int layer,int eid,const void **w,size_t *wb,const float **sc,s
     return r;
 }
 int qt_chain_host_count(void){ return G.on && G_host_on > 0 ? (int)G_host_n : 0; }
+/* The warm start page-locks every expert, the residents too (tier_warmstart): the experts the
+ * card lets go are in the pool already, and those that come in stay, for when they leave again.
+ * The follow below then has nothing to do. Said once, before the warm start's threads. */
+void qt_chain_host_all(void){ G_host_all = 1; }
+/* The pool follows the residents. The warm start page-locks the experts it leaves in RAM; the
+ * chain's promotions and the tier's LFRU swaps then trade experts between the card and the RAM, and
+ * the pool kept its first set: an expert that left the card was not in it, so a prompt chunk's
+ * layer holding one went to the host's step whole (q36cc_stage_table), and one that came in kept
+ * its RAM page-locked for nothing. Before a large prompt chunk (Q36CC_FOLLOW_ROWS) the chain calls
+ * this: the non-residents join the pool, the residents leave it; the CUDA calls outside the lock,
+ * as in qt_note_host. Nothing when the pool holds every expert (qt_chain_host_all): an expert
+ * whose page-lock the warm start was refused then stays out.
+ * 1 when the pool changed; *joined and *left say how many. */
+int qt_chain_host_follow(int *joined,int *left){
+    *joined=*left=0;
+    if(!G.on || G_host_on <= 0 || G_host_all) return 0;
+    size_t n = (size_t)G.nl*G.ne, mb = (size_t)G.D*G.Ih/2, sb = (2*G.sc_gu + G.sc_d)*sizeof(float);
+    int *mv = malloc(n*sizeof(int)), nj = 0, nl = 0;   /* the joins from the front, the leaves from the back */
+    if(!mv) return 0;
+    pthread_mutex_lock(&G.mx);
+    for(size_t i=0; i<n && !G.th_stop; i++){
+        QSlot *s = &G.slot[i];
+        if(!s->resident && !s->hreg && s->g4 && s->gs &&
+           s->u4 == s->g4 + mb && s->d4 == s->g4 + 2*mb && s->us == s->gs + G.sc_gu && s->ds == s->gs + 2*G.sc_gu)
+            mv[nj++] = (int)i;
+        else if(s->resident && s->hreg){   /* out of qt_chain_host now, released below */
+            s->hreg = 0; G_host_n--; G_host_bytes -= 3*mb + sb; mv[n-1-nl++] = (int)i;
+        }
+    }
+    pthread_mutex_unlock(&G.mx);
+    /* the slots' RAM stays where it is: the pool is on only when the RAM holds every expert */
+    for(int k=0; k<nl; k++){ QSlot *s = &G.slot[mv[n-1-k]]; coli_cuda_host_unregister((void *)s->g4); coli_cuda_host_unregister((void *)s->gs); }
+    int in = 0;
+    for(int k=0; k<nj; k++){
+        QSlot *s = &G.slot[mv[k]];
+        if(!coli_cuda_host_register((void *)s->g4, 3*mb)) continue;
+        if(!coli_cuda_host_register((void *)s->gs, sb)){ coli_cuda_host_unregister((void *)s->g4); continue; }
+        pthread_mutex_lock(&G.mx);
+        int still = !s->resident && !s->hreg && !G.th_stop;
+        if(still){ s->hreg = 1; G_host_n++; G_host_bytes += 3*mb + sb; }
+        pthread_mutex_unlock(&G.mx);
+        if(still) in++;
+        else { coli_cuda_host_unregister((void *)s->g4); coli_cuda_host_unregister((void *)s->gs); }
+    }
+    free(mv);
+    *joined = in; *left = nl;
+    return in + nl > 0;
+}
 
 unsigned qt_chain_epoch(void){
     if(!G.on) return 0;
@@ -2254,7 +2303,7 @@ void qt_shutdown(void){
     memset(G.is_cnt,0,sizeof G.is_cnt);
     G.on=0;
     G_fp8_stream=0; G_stream=0; G_trunk_only=0; G_src_planar=0;
-    G_host_on=-1; G_host_n=G_host_bytes=0;
+    G_host_on=-1; G_host_all=0; G_host_n=G_host_bytes=0;
     coli_cuda_shutdown();
 }
 

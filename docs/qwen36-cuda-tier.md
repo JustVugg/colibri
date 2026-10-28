@@ -670,6 +670,24 @@ a layer's non-resident experts into VRAM and runs them with the residents:
   weight k low and k + 32 high, both v + 8). No second copy in RAM, no conversion. On when
   the RAM holds every expert (no slot is ever recycled), one card, int4-g64 and the f16
   GEMMs (`coli_cuda_planar_rows`).
+- The pool follows the residents (`qt_chain_host_follow`). The chain's promotions and the
+  tier's LFRU swaps move experts between the card and the RAM after the warm start; before a
+  prompt chunk of 128 rows or more (`Q36CC_FOLLOW_ROWS`), the experts that left the card are
+  page-locked into the pool and those that came in are released, so the pool is the
+  non-residents and nothing else. Without it an expert that left the card was in neither, and
+  a chunk's layer holding one went to the host's step whole. It costs about 0.3 ms for each
+  expert moved on the T4 below, and after a long answer that is more than the copies give
+  back to a chunk of a few dozen rows: a smaller chunk leaves the pool behind for the next
+  large one, its layers holding an expert that left on the host's step as before. An expert
+  whose page-lock is refused stays out until the next follow.
+- The residents' copies go to the pool too when the card holds fewer than every expert and
+  the chain runs (`tier_warmstart`, `qt_chain_host_all`): an expert the promotions or the
+  swaps move off the card is in the pool already, for any prompt chunk that stages, and the
+  follow has nothing to do; an expert whose page-lock the warm start was refused stays out.
+  It costs the residents' page-locks: on a Colab T4, 16.88 GB of the RAM cache page-locked
+  instead of 6.00 (the same pages), the model ready in 22.80 s instead of 19.88. The
+  startup line `host pool` says which. A card that holds every expert pools nothing, as
+  before.
 - The staging (`cc_fetch`, `cc_fetch_wait`, `cc_fetch_done`): one layer's worth of VRAM,
   the most non-resident experts any layer has, filled on a copy stream of its own. The copy
   of the next such layer starts once the layer before has run its experts' GEMMs, so it
@@ -760,6 +778,35 @@ With 7 GiB free, Flint UD-Q3_K_XL: prompt 528 / 1762 -> 540 / 1725 tok/s at 1K /
 decode 46.6 -> 45.6.
 
 `COLI_CUDA_EXACT_SLOTS=0` keeps the largest layer's slot for every expert.
+
+**After a conversation** (the pool following the residents): a Google Colab T4 high-RAM VM
+(15 GiB, 6605 of 10240 experts on the card under `auto`, 3635 in the host pool), the
+record's harness (`bench.c`), a warm-up and 4 runs each in A B B A order, min-max of the runs
+(record: `docs/experiments/qwen36-cuda-host-pool-follow-2026-10-26/`). A 64-token prompt and
+its 32 teacher-forced steps, then a 512-token prompt in the same process:
+
+| | 512-token prompt, after | 64-token prompt | decode after 64 / 512 |
+|---|---|---|---|
+| the pool as the warm start left it (before) | 179.19-180.94 tok/s | 73.78-79.01 | 38.85-40.09 / 46.81-47.73 |
+| the pool following the residents | 436.44-441.96 | 76.09-77.90 | 39.99-40.50 / 47.28-47.56 |
+
+Two conversations replayed through the server's path (`bench.c --session`, each answer
+teacher-forced), the time to the first token of every turn summed, and of the turn after the
+longest answer:
+
+| | agent, 8 turns: all / turn 8 (35 tokens) | chat, 5 turns: all / turn 3 (36 tokens) |
+|---|---|---|
+| before | 46.7-47.1 s / 0.92-0.94 s | 3.4-3.5 s / 0.76-0.77 s |
+| the pool following the residents | 18.7-18.8 s / 0.90-0.92 s | 3.4-3.5 s / 0.76-0.77 s |
+
+The 64-token run, its 32 steps with promotions included, gives the same logits in every run of
+both; after 512 the teacher-forced loss over the next 32 tokens is 2.9578 before and 2.9328
+with the pool following, the layers that held an expert that left the card now in the chain's
+frame on its f16 GEMMs instead of the host's path. No chunk of the chat reads 128 tokens: it
+runs as before, with the same logits. In one run each with a diagnostic line (`diag.txt` in
+the record) the follow took 58 ms of the 512 prompt's 1.14 s (98 experts joining the pool, 98
+leaving it), and 0.08 to 147 ms before the agent's prompts, 365 ms in all. `threshold.txt` has
+the runs behind the 128 rows.
 
 ## The residents follow the prompt (`QT_PREFILL_REPLAN=1`)
 

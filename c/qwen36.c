@@ -8420,6 +8420,19 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
      * ms/token on a single-GPU run). Planned ones also go to VRAM. */
     uint8_t *planned = calloc((size_t)cap_total, 1);
     for (int i = 0; i < wn; i++) planned[wpl[i]*m->c.n_experts + wpe[i]] = 1;
+    /* The chain's host pool takes the residents' RAM copies too when the card holds fewer than
+     * every expert: the chain's promotions and the tier's swaps then move experts off the card,
+     * and each one that leaves is in the pool already, for a prompt chunk of any size, with no
+     * follow to pay for (qt_chain_host_follow: before a large chunk, a cost per expert moved).
+     * Vulkan's tier keeps every expert in its host pool the same way (vk_tier.c). Decided here
+     * once, not by the threads below. */
+    int pool_all = 0;
+#ifdef COLI_CUDA
+    int off = 0;   /* the experts the card does not hold */
+    for (int gi = 0; gi < cap_total; gi++) off += !planned[gi] && !q36_dense_l(&m->c, gi / m->c.n_experts);
+    pool_all = off > 0 && g_cuda_chain;
+    if (pool_all) qt_chain_host_all();   /* the follow keeps them */
+#endif
     int keep8 = getenv("COLI_KEEP_INT8") != NULL;
     #pragma omp parallel for schedule(dynamic, 16)
     for (int gi = 0; gi < cap_total; gi++) {
@@ -8433,6 +8446,8 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
         const uint8_t *wg, *wu, *wd;
         tier_src(m, l, e, expert_is_int4, &wg, &wu, &wd);
         if (planned[gi]) {
+            /* a resident's copy in the host pool (pool_all, above), page-locked before its upload */
+            if (pool_all && wg) qt_note_host(l, eidw, wg, wu, wd, e->gs, e->us, e->ds);
             /* Reported even when wg is NULL: the tier reserved budget for
              * this expert in qt_plan_fill, and a planned expert that is never
              * reported keeps that reservation forever. With no weights the
@@ -8464,7 +8479,8 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
     qt_fill_wait();
     if (qt_chain_host_count())
         fprintf(stderr, "[qtier] host pool: %d experts of the RAM cache page-locked for the device to copy a prompt chunk's "
-                        "experts from (COLI_CUDA_HOST_POOL=0 off)\n", qt_chain_host_count());
+                        "experts from (%s; COLI_CUDA_HOST_POOL=0 off)\n", qt_chain_host_count(),
+                pool_all ? "the residents too, as experts move off the card" : "those off the card");
     free(wpl); free(wpe); free(planned);
     /* The parenthesis used to read "int8 only for non-residents", which was
      * true only while the int8 copy of every resident was freed. Since #1341

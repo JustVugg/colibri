@@ -85,10 +85,19 @@ void coli_cuda_tensor_free(ColiCudaTensor *t) {
     if (t && fake_dense_compute && t->fmt == 1) { free((void *)t->w); free((void *)t->sc); }
     free(t);
 }
-/* no bus to copy host memory over: the tier keeps the host's step for those experts */
-int coli_cuda_host_register(void *p, size_t bytes) { (void)p; (void)bytes; return 0; }
-void coli_cuda_host_unregister(void *p) { (void)p; }
-int coli_cuda_planar_rows(int device, int D, int I) { (void)device; (void)D; (void)I; return 0; }
+/* no bus to copy host memory over: the tier keeps the host's step for those experts. A test of
+ * the host pool sets fake_host_reg_ok and fake_planar_rows, and fake_host_reg_bytes to lock only
+ * ranges of that size; the page-locks taken and the releases are counted. */
+static int fake_host_reg_ok, fake_planar_rows, fake_host_regs, fake_host_unregs;
+static size_t fake_host_reg_bytes;
+int coli_cuda_host_register(void *p, size_t bytes) {
+    (void)p;
+    int ok = fake_host_reg_ok && (!fake_host_reg_bytes || bytes == fake_host_reg_bytes);
+    fake_host_regs += ok;
+    return ok;
+}
+void coli_cuda_host_unregister(void *p) { (void)p; fake_host_unregs++; }
+int coli_cuda_planar_rows(int device, int D, int I) { (void)device; (void)D; (void)I; return fake_planar_rows; }
 /* a GGUF's block formats: fake_block_elems for every fmt >= 100 (0: the backend takes none) */
 static int fake_block_elems;
 int coli_cuda_block_elems(int fmt) { return fmt >= 100 ? fake_block_elems : 0; }

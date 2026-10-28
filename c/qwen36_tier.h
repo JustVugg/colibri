@@ -276,14 +276,19 @@ void qt_chain_promote_stage(void *dst, const QtPromo *p);
 void qt_chain_promote_done(int ci, int vi, int ok);
 int  qt_chain_changes(int *idx, int max, int *overflow);
 uint64_t qt_chain_promoted(void);
-/* The host pool (qwen36_tier.c): qt_note_host page-locks a non-resident expert's RAM copy (its
- * planar blocks and scales, as the engine's slot holds them) for the device to copy a prompt
- * chunk's experts from; qt_chain_host the copy's two blocks, the three matrices and the three
- * scale arrays (1 when registered); qt_chain_host_count how many. */
+/* The host pool (qwen36_tier.c): qt_note_host page-locks an expert's RAM copy (its planar
+ * blocks and scales, as the engine's slot holds them; a non-resident's, and a resident's when
+ * the card holds fewer than every expert) for the device to copy a prompt chunk's experts
+ * from; qt_chain_host the copy's two blocks, the three matrices and the three scale arrays (1
+ * when registered); qt_chain_host_count how many; qt_chain_host_follow makes the pool the
+ * non-residents again after experts moved (1 when it changed); qt_chain_host_all says the
+ * warm start pools every expert, the residents too, and the follow then keeps them. */
 void qt_note_host(int layer, int eid, const uint8_t *g4, const uint8_t *u4, const uint8_t *d4,
                   const float *gs, const float *us, const float *ds);
 int  qt_chain_host(int layer, int eid, const void **w, size_t *wb, const float **sc, size_t *sb);
 int  qt_chain_host_count(void);
+int  qt_chain_host_follow(int *joined, int *left);
+void qt_chain_host_all(void);
 
 #else /* !COLI_CUDA: inline stubs, engine stays CPU-only */
 
@@ -345,6 +350,8 @@ static inline uint64_t qt_chain_promoted(void){return 0;}
 static inline void qt_note_host(int l,int e,const uint8_t*g,const uint8_t*u,const uint8_t*d,const float*a,const float*b,const float*c){(void)l;(void)e;(void)g;(void)u;(void)d;(void)a;(void)b;(void)c;}
 static inline int  qt_chain_host(int l,int e,const void**w,size_t*wb,const float**sc,size_t*sb){(void)l;(void)e;(void)w;(void)wb;(void)sc;(void)sb;return 0;}
 static inline int  qt_chain_host_count(void){return 0;}
+static inline int  qt_chain_host_follow(int*j,int*l){*j=*l=0;return 0;}
+static inline void qt_chain_host_all(void){}
 static inline int  qt_streaming(void){return 0;}
 static inline int  qt_experts_on(void){return 0;}
 static inline void qt_source_planar(int a){(void)a;}

@@ -112,6 +112,7 @@ typedef struct {
      * layer's), the layers with some expert in neither; dm_stage_off: no staging from here on */
     CcExpert *dm_hostb; int *dm_partb, *dm_fro, *dm_frn; CcFetch *dm_fr; CcBuf *dm_tabb, *dm_stage;
     int dm_stage_off; unsigned long long dm_staged, dm_stage_bytes;
+    unsigned long long hp_follows, hp_joined, hp_left; double hp_ms;   /* the pool following the residents */
     int rows_max;   /* a prompt chunk's rows (q36cc_rows_max) */
     CcBuf *dm_tab, *dm_ids, *dm_w, *dm_idsd, *dm_wd, *dm_hid, *dm_y, *dm_hy, *dm_dfl, *dm_hfl;
     float *dm_g, *dm_u, *dm_hh;
@@ -1213,6 +1214,17 @@ static void q36cc_kv_down(Q36CChain *ch, Model *m, int i, int n, int pb) {
  * table points each such expert at its place there (planar, as the RAM holds it). 0: no
  * VRAM for it. */
 #define Q36CC_STAGE_ROWS 32
+/* The host pool follows the residents (qt_chain_host_follow) before a prompt chunk of
+ * Q36CC_FOLLOW_ROWS rows or more: the experts that left the card join it, those that came in
+ * leave it, or a layer holding one that left goes to the host's step whole. A smaller chunk
+ * leaves it behind for the next large one. On the Colab T4 high-RAM VM of the measures
+ * (docs/experiments/qwen36-cuda-host-pool-follow-2026-10-26) a follow costs about 0.3 ms an
+ * expert moved. On another VM of the same shape an earlier version, which followed before
+ * every chunk of more than 32 rows, moved 317 + 317 experts in 193 ms before a 36-row chunk
+ * and saved about 50 ms of it, while a 348-row chunk after 50 + 50 moves saved 1.1 s: through
+ * those two points the follow pays from about 80 rows, and at 128 the copies save about
+ * twice the 193 ms (threshold.txt there). */
+#define Q36CC_FOLLOW_ROWS 128
 /* Promotions (qt_chain_promote): after a decode-sized step, up to this many of its misses move
  * into the buffers of the coldest residents by this conversation's routes. The chain copies
  * each newcomer's RAM bytes into a page-locked staging slot and from there into the victim's
@@ -1458,6 +1470,14 @@ static int q36cc_stage_table(Q36CChain *ch, Model *m) {
     }
     return cc_begin() && cc_write(ch->dm_tabb, 0, ch->dm_hostb, ne * sizeof(CcExpert)) && cc_submit(1);
 }
+/* before a prompt chunk of n rows that stages: on one of Q36CC_FOLLOW_ROWS rows or more the
+ * pool follows the residents, and a change stales the staged table */
+static void q36cc_follow(Q36CChain *ch, int n) {
+    if (n < Q36CC_FOLLOW_ROWS) return;
+    double th = tm_now(); int hj, hl;
+    if (qt_chain_host_follow(&hj, &hl)) { ch->hp_follows++; ch->hp_joined += (unsigned)hj; ch->hp_left += (unsigned)hl; ch->dm_stage_dirty = 1; }
+    ch->hp_ms += tm_now() - th;
+}
 /* the step's buffers, and the table when the tier's residents moved (the tier held) */
 static int q36cc_dm_begin(Q36CChain *ch, Model *m, int n) {
     Cfg *c = &m->c; int L = c->n_layers, E = c->n_experts, K = c->topk, D = c->hidden, I = c->inter;
@@ -1511,8 +1531,11 @@ static int q36cc_dm_begin(Q36CChain *ch, Model *m, int n) {
         ch->dm_epoch = ep; ch->dm_read = 1; ch->dm_stage_dirty = 1;
         ch->patch_ms += tm_now() - tp;
     }
-    /* the staged table (a prompt chunk's host-pool copies) follows the residents when a chunk needs it */
-    if (ch->dm_stage_dirty && n > Q36CC_STAGE_ROWS && qt_chain_host_count() > 0 && !ch->dm_stage_off && cc_fetch_ready()) {
+    /* the staged table (a prompt chunk's host-pool copies) follows the residents when a chunk needs it,
+     * and on a large chunk the pool first (q36cc_follow) */
+    int stage = n > Q36CC_STAGE_ROWS && qt_chain_host_count() > 0 && !ch->dm_stage_off && cc_fetch_ready();
+    if (stage) q36cc_follow(ch, n);
+    if (stage && ch->dm_stage_dirty) {
         if (!q36cc_stage_table(ch, m)) {
             if (cc_lost()) return 0;
             fprintf(stderr, "[chain] qwen36: no VRAM to stage the host pool's experts in; a prompt chunk's go to the host's step\n");
@@ -1904,4 +1927,7 @@ static void q36cc_report(Model *m) {
     if (ch->dm_staged)
         fprintf(stderr, "[chain] qwen36: %llu prompt layer steps staged the host pool's experts (%.2f GB copied over the bus)\n",
                 ch->dm_staged, ch->dm_stage_bytes / 1073741824.0);
+    if (ch->hp_follows)
+        fprintf(stderr, "[chain] qwen36: the host pool followed the residents before %llu prompt chunks: %llu experts joined it, "
+                        "%llu left it, %.1f ms\n", ch->hp_follows, ch->hp_joined, ch->hp_left, ch->hp_ms);
 }

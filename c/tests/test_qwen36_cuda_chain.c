@@ -29,6 +29,8 @@
  *     listed rows of the device's lm_head (cc_matmul_rows), and the device's copy of the list
  *     follows every append and every rebuild, across requests too; a backend without
  *     matmul_rows scores the whole vocabulary.
+ *   - the host pool follows the residents before a prompt chunk of Q36CC_FOLLOW_ROWS rows or
+ *     more, not before a smaller one, and a change stales the staged table (q36cc_follow).
  * Include order as in test_qwen36_tier_int8_engine.c. */
 #define main qwen36_main_unused
 #include "../qwen36.c"
@@ -165,6 +167,24 @@ static int same_logits(const float *a, const float *b, int n, const char *what) 
  * wait (the engine serves it again after the next layer, the same rows) */
 static Q36CChain *serve_ch; static Model *serve_m; static int serve_n;
 static int serve_layer1(unsigned v) { return q36cc_dm_serve(serve_ch, serve_m, 1, serve_n, v); }
+
+/* I's tier: planar int4 per 64 as on a Qwen3.6 container (the host pool wants it), eight experts
+ * a layer, half of them on the card (as test_qwen36_tier_host_pool.c's) */
+enum { HE = 8, HI = 64, HMB = D * HI / 2, HSC = 2 * HI * (D / 64) + D * (HI / 64) };
+static unsigned char hp_w[NL][HE][3 * HMB];
+static float hp_sc[NL][HE][HSC];
+static int hp_pooled(int l, int e) { const void *w; const float *s; size_t a, b; return qt_chain_host(l, e, &w, &a, &s, &b); }
+static void hp_note(int l, int e, int how) {   /* 0: offered to the card, 1: to the pool, 2: a miss */
+    const unsigned char *g = hp_w[l][e]; const float *s = hp_sc[l][e];
+    if (how == 1) qt_note_host(l, e, g, g + HMB, g + 2 * HMB, s, s + HI, s + 2 * HI);
+    else if (how == 2) qt_note(l, e, g, g + HMB, g + 2 * HMB, s, s + HI, s + 2 * HI);
+    else qt_note_block(l, e, g, g + HMB, g + 2 * HMB, s, s + HI, s + 2 * HI);
+}
+static void hp_route(int l, int a, int b) {   /* a row's routes, the misses offered as the engine's miss path does */
+    int ids[2] = {a, b};
+    qt_chain_count(l, ids, 2);
+    for (int k = 0; k < 2; k++) if (!qt_is_resident(l, ids[k])) hp_note(l, ids[k], 2);
+}
 
 int main(void) {
     setenv("Q36_KV", "f32", 1);   /* the host's K/V rows compared below as floats */
@@ -449,7 +469,51 @@ int main(void) {
     fake_chain_table.size = CC_OPS_BASE_SIZE;
 
     qt_shutdown();
+
+    printf(" I. the host pool follows the residents before a large prompt chunk only\n");
+    {
+        setenv("HEAT_FILE", "", 1); setenv("COLI_PLACE", "off", 1); setenv("QT_UPLOAD_SYNC", "", 1);
+        fake_host_reg_ok = 1; fake_planar_rows = 1;
+        int regs0 = fake_host_regs, unregs0 = fake_host_unregs;
+        for (int i = 0; i < NL; i++) for (int e = 0; e < HE; e++) {
+            for (size_t k = 0; k < sizeof hp_w[i][e]; k++) hp_w[i][e][k] = (unsigned char)((k * 37u + (unsigned)i * 13u + (unsigned)e * 7u) & 0xFFu);
+            for (int k = 0; k < HSC; k++) hp_sc[i][e][k] = 0.25f * (float)(k + e + 1);
+        }
+        size_t xb = 3 * dev_alloc_footprint(HMB) + 3 * dev_alloc_footprint((HSC / 3) * sizeof(float));
+        char gb[64]; snprintf(gb, sizeof gb, "%.15f", (double)(HE * xb + xb / 2) / 1073741824.0);
+        setenv("CUDA_EXPERT_GB", gb, 1);
+        qt_source_planar(1);
+        ck(qt_init(NL, HE, D, HI, HE, TOPK, 64, 1), "a planar tier");
+        for (int e = 0; e < HE; e++) for (int i = 0; i < NL; i++) hp_note(i, e, 0);
+        qt_fill_wait();
+        for (int i = 0; i < NL; i++) for (int e = 0; e < HE; e++) if (!qt_is_resident(i, e)) hp_note(i, e, 1);
+        ck(qt_chain_host_count() == HE, "the warm start: half the experts on the card, the other half page-locked in the pool");
+        for (int t = 0; t < 3; t++) { hp_route(0, 4, 5); hp_route(1, 0, 5); }
+        QtPromo pr[8];
+        int np = qt_chain_promote(8, pr);
+        for (int k = 0; k < np; k++) qt_chain_promote_done(pr[k].ci, pr[k].vi, 1);
+        int vl = np > 0 ? pr[0].vi / HE : 0, ve = np > 0 ? pr[0].vi % HE : 0;
+        ck(np == 3 && !qt_is_resident(vl, ve) && !hp_pooled(vl, ve), "three promotions: the victims left the card and are not in the pool");
+
+        Q36CChain fc; memset(&fc, 0, sizeof fc);
+        fc.dm_stage_dirty = 1;   /* q36cc_dm_begin read the residents' moves */
+        int regs = fake_host_regs;
+        q36cc_follow(&fc, Q36CC_STAGE_ROWS + 4);
+        ck(fc.hp_follows == 0 && fake_host_regs == regs && !hp_pooled(vl, ve),
+           "a chunk of 36 rows (a chat's next question) leaves the pool behind: no page-lock");
+        fc.dm_stage_dirty = 0;   /* that chunk's staged table, rebuilt as before (q36cc_stage_table) */
+        q36cc_follow(&fc, Q36CC_FOLLOW_ROWS);
+        ck(fc.hp_follows == 1 && fc.hp_joined == 3 && fc.hp_left == 3 && hp_pooled(vl, ve),
+           "the next chunk of Q36CC_FOLLOW_ROWS rows: the pool follows, though the table was rebuilt since the moves");
+        ck(fc.dm_stage_dirty, "and the staged table is stale again");
+        fc.dm_stage_dirty = 0;
+        q36cc_follow(&fc, 512);
+        ck(fc.hp_follows == 1 && !fc.dm_stage_dirty && fake_host_regs == regs + 6, "nothing moved since: the pool and the table stand");
+        qt_source_planar(0);
+        qt_shutdown();
+        ck(fake_host_regs - regs0 == fake_host_unregs - unregs0, "the exit releases every page-lock the pool took");
+    }
     if (fails) { printf("test_qwen36_cuda_chain: %d failure(s)\n", fails); return 1; }
-    printf("OK test_qwen36_cuda_chain: the CUDA chain gives the CPU path's logits; host and device state agree; a lost device rebuilds\n");
+    printf("OK test_qwen36_cuda_chain: the CUDA chain gives the CPU path's logits; host and device state agree; a lost device rebuilds; the host pool follows before a large prompt chunk only\n");
     return 0;
 }
