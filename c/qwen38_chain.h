@@ -1232,7 +1232,7 @@ static int q38c_forward_lm(Model *m, Q38Chain *ch, const int *ids, int S, int po
     }
     int r = q38c_lm_layers(m, ch, ids, S, pos_base, nlogits, hyper_h, rows, cs_all);
     free(cs_all);
-    if (r <= 0) return r;
+    if (r <= 0 || r == 2) return r;
     memcpy(logit, vkc_ptr(ch->outd), (size_t)nlogits * V * sizeof(float));
     ch->lm_forwards++;
     return 1;
@@ -1248,6 +1248,9 @@ static int q38c_lm_layers(Model *m, Q38Chain *ch, const int *ids, int S, int pos
         if ((g0 && (!vkc_begin() || !vkc_dmoe_upload(&ch->dm))) || !q38c_push_state(ch, m, pos_base + g0, gn) ||
             !vkc_write(ch->hyper_all, 0, hyper_h + (size_t)g0 * W, (size_t)gn * W * 4)) return -1;
         for (int i = lo; i < hi; i++) {
+            /* a served prompt's STOP or CANCEL between two layers (prompt_break.h): 2, the caller
+             * declines the step and q38_serve_prefill puts back the state it copied */
+            if (coli_prompt_break()) { vkc_finish(); return 2; }
             Layer *l = &m->L[i];
             for (int c0 = g0; c0 < g0 + gn; c0 += rows) {
                 int n = g0 + gn - c0 < rows ? g0 + gn - c0 : rows, pb = pos_base + c0;
@@ -1333,9 +1336,11 @@ static int q38c_forward_seg(Model *m, Q38Chain *ch, const int *ids, int S, int p
         m->snap_rows <= 0 && vkt_host_pool_on()) {
         int r = q38c_forward_lm(m, ch, ids, S, pos_base, nlogits, hyper_h, logit, rows);
         if (r < 0) goto lost;
+        if (r == 2) { vkc_gemm_rows(-1); return 0; }   /* stopped: not taken */
         if (r > 0) { ch->snap_valid = 0; vkc_gemm_rows(-1); ch->forwards++; return 1; }
     }
     for (int c0 = 0; c0 < S; c0 += rows) {
+        if (coli_prompt_break()) { vkc_gemm_rows(-1); return 0; }   /* a served prompt's stop, between two chunks */
         int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0;
         int ns = m->snap_rows - c0 < n ? m->snap_rows - c0 : n;   /* the rows of this chunk a verify copies */
         if (ns < 0) ns = 0;

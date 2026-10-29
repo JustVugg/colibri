@@ -1914,10 +1914,11 @@ typedef struct { double started; uint64_t hits, misses; Q38Timers timers; } Q38R
  * wrote are a stale tail. Segment boundaries change no result: the attention rows, the
  * DeltaNet recurrence and the MoE routing are per row and in row order (qwen38_core.h).
  *
- * The chains run their own forward and are not stopped inside it: they take segments of 8192
- * rows, the size of their own layer-by-layer segments, and are polled between them. An echo
- * (logprobs) and a prompt with an image are read in one call, as before. COLI_PROMPT_SEGMENT
- * sets the rows (2048 on the CPU, 8192 for a chain). */
+ * A chain takes segments of 8192 rows, the size of its own layer-by-layer segments, and checks
+ * between two layers (layer by layer) or two chunks inside them; it then declines the step,
+ * the CPU's loop sees the stop before its first layer, and the copy goes back here too. An
+ * echo (logprobs) and a prompt with an image are read in one call, as before.
+ * COLI_PROMPT_SEGMENT sets the rows (2048 on the CPU, 8192 for a chain). */
 static int q38_prompt_poll(ColiPromptBreak *b){   /* control: 1 STOP, 3 CANCEL (serve_read_req) */
     while(!b->control&&!b->eof&&coli_stdin_readable()){
         int r=serve_read_req(stdin,stdout,NULL,b->id);
@@ -1944,7 +1945,9 @@ static float *q38_serve_prefill(Model *m,const int *ids,int from,int np,ColiProm
     for(int at=from;at<np;){
         if(coli_prompt_poll(ctl)){free(lo);lo=NULL;break;}
         int n=np-at<seg?np-at:seg;
-        if(!chain&&q38_pin_state_copy(m,&st,1))g_coli_prompt_break=ctl;
+        /* the state at the segment's start (from the device too, for a chain), so a stop inside
+         * the segment can put it back */
+        if(q38_pin_state_copy(m,&st,1))g_coli_prompt_break=ctl;
         float *next=step(m,ids+at,n,at);
         g_coli_prompt_break=NULL;
         if(!next){q38_pin_state_copy(m,&st,0);free(lo);lo=NULL;break;}
