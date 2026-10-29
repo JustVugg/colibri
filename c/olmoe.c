@@ -159,6 +159,7 @@ typedef struct {
     int gx;
     int *gx_t;
     int64_t *gx_len, gx_part[3];
+    int gx_r16;   /* the CPU alone reads the expert slots: they hold the rows interleaved by 16 */
 #ifdef COLI_VULKAN
     void *vk_lm_head;
     void *vkchain;          /* the dense chain's device state (olmoe_chain.h), NULL until it runs */
@@ -809,6 +810,10 @@ static void olm_gx_geometry(Model *m, int layer_begin, int layer_end) {
                 fprintf(stderr, "%s: not %lld rows of %lld in a ggml type\n", nm, (long long)rows, (long long)cols); exit(1); }
             m->gx_t[3 * i + k] = type; m->gx_len[3 * i + k] = t->nbytes;
             if (t->nbytes > m->gx_part[k]) m->gx_part[k] = t->nbytes;
+            /* a slot holds the file's rows or the rows interleaved by 16 (load_expert_gguf),
+             * whichever is larger */
+            const int64_t held = gq_row_bytes(coli_ggml_held_type(type, rows, cols, "OLM_ILV16"), cols) * rows;
+            if (held > m->gx_part[k]) m->gx_part[k] = held;
         }
     fprintf(stderr, "olmoe: GGUF experts %s gate/up, %s down (layer %d)", gq_type_name(m->gx_t[3 * layer_begin]),
             gq_type_name(m->gx_t[3 * layer_begin + 2]), layer_begin);
@@ -1049,6 +1054,12 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
 #ifdef COLI_CUDA
     occ_start(m);   /* COLI_CUDA=1: every layer and its experts on the card (olmoe_cuda_chain.h) */
 #endif
+    /* the CPU alone reads the expert slots, unless a Vulkan device's tier uploads them in the
+     * file's form (load_expert_gguf); the CUDA chain reads the file */
+    m->gx_r16 = m->gx;
+#ifdef COLI_VULKAN
+    if (g_vk_ready) m->gx_r16 = 0;
+#endif
 }
 
 static void slot_ensure_allocated(Model *m, Slot *s) {
@@ -1082,6 +1093,12 @@ static void slot_ensure_allocated(Model *m, Slot *s) {
 }
 
 /* A GGUF's expert into its slot: the file's blocks (olm_gx_geometry). */
+/* A GGUF expert into its slot. On the CPU alone (m->gx_r16) its rows are interleaved by 16
+ * as the dense matrices are (coli_ggml_held_type, OLM_ILV16=0 keeps the file's rows), so a
+ * prompt's rows of one expert go through gq_r16_rows, one integer product for 16 rows, not
+ * through gq_row_all, which unpacks a row and takes the activation rows one at a time: that
+ * was 37% of a 1,800-token prompt's time on the CPU. The Vulkan expert tier uploads a slot's
+ * bytes in the file's form (olmoe_vk_src), so with a Vulkan device the slots keep them. */
 static void load_expert_gguf(Model *m, int layer, int eid, Slot *s) {
     static const char *const k3[3] = {"gate_proj", "up_proj", "down_proj"};
     int8_t *dst[3] = {s->g, s->u, s->d};
@@ -1090,12 +1107,22 @@ static void load_expert_gguf(Model *m, int layer, int eid, Slot *s) {
         char nm[160];
         snprintf(nm, sizeof nm, "model.layers.%d.mlp.experts.%d.%s.weight", layer, eid, k3[k]);
         st_tensor *t = st_find(&m->S, nm);
-        if (!t || st_ggml_type_any(t->dtype) != m->gx_t[3 * layer + k] || t->nbytes != m->gx_len[3 * layer + k]) {
+        const int type = m->gx_t[3 * layer + k];
+        if (!t || st_ggml_type_any(t->dtype) != type || t->nbytes != m->gx_len[3 * layer + k]) {
             fprintf(stderr, "%s: missing, or not the type and bytes of the layer's expert 0, "
                             "refusing (untrusted container)\n", nm); exit(1); }
-        st_read_raw(&m->S, nm, dst[k], g_expert_drop);
+        const int64_t rows = k == 2 ? m->c.hidden : m->c.inter, cols = k == 2 ? m->c.inter : m->c.hidden;
+        const int held = m->gx_r16 ? coli_ggml_held_type(type, rows, cols, "OLM_ILV16") : type;
+        if (held == type) st_read_raw(&m->S, nm, dst[k], g_expert_drop);
+        else {
+            uint8_t *raw = malloc((size_t)t->nbytes);
+            if (!raw) { fprintf(stderr, "OOM reading %s\n", nm); exit(1); }
+            st_read_raw(&m->S, nm, raw, g_expert_drop);
+            gq_r16_pack(held, (uint8_t *)dst[k], raw, (int)rows, (int)cols);
+            free(raw);
+        }
+        s->gt[k] = held;
     }
-    for (int k = 0; k < 3; k++) s->gt[k] = m->gx_t[3 * layer + k];
     __atomic_fetch_add(&m->disk_ns, (uint64_t)((now_s() - started) * 1e9), __ATOMIC_RELAXED);
 }
 
