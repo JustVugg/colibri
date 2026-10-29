@@ -21,6 +21,9 @@ import time
 import unittest
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from prefix_serve_harness import PromptCancelContract, ServeEngine  # noqa: E402
+
 HERE = Path(__file__).resolve().parent.parent
 ENGINE = HERE / ("inkling.exe" if sys.platform == "win32" else "inkling")
 FIXTURE = Path(os.environ.get("INKLING_TINY", HERE / "tiny_inkling"))
@@ -187,6 +190,26 @@ class InklingPrefixServeTest(unittest.TestCase):
 
         self.assertEqual(diverged, fresh,
                          "a diverging prompt was contaminated by the previous turn")
+
+
+@unittest.skipUnless(ENGINE.exists(), "inkling is not built")
+@unittest.skipUnless((FIXTURE / "config.json").exists(),
+                     "tiny inkling fixture is absent (tools/make_tiny_inkling.py)")
+class InklingPromptCancelTest(PromptCancelContract, unittest.TestCase):
+    # stopped inside a forward, the sliding layers' rings and the convolution banks hold part
+    # of the prompt: the engine starts over (state_reset). A chain stops between two segments
+    # and keeps the prompt read so far.
+    PROMPT_CANCEL_KEEPS_PREFIX = False
+
+    @classmethod
+    def setUpClass(cls):
+        ensure_tokenizer(FIXTURE)
+
+    def spawn(self, log_prefix=True, reuse=True):
+        env = {"SNAP": str(FIXTURE), "SERVE": "1", "NGEN": str(MAXTOK)}
+        if log_prefix:
+            env["INK_PREFIX_LOG"] = "1"
+        return ServeEngine(ENGINE, ["8"], env, log_prefix=log_prefix, reuse=reuse)
 
 
 if __name__ == "__main__":

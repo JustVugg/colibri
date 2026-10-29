@@ -27,9 +27,11 @@ only showed up once there were several tokens to disagree about.
 """
 import json
 import os
+import re
 import subprocess
 import threading
 import time
+from unittest import mock
 
 READY = b"\x01\x01READY\x01\x01\n"
 
@@ -72,7 +74,9 @@ def ensure_byte_tokenizer(fixture, size=256):
 class ServeEngine:
     """An engine in serve mode, speaking the protocol in docs/serve_protocol.md."""
 
-    def __init__(self, engine, argv, env, log_prefix=True, reuse=True):
+    def __init__(self, engine, argv, env, log_prefix=True, reuse=True, header_tail=""):
+        # header_tail: fields after the sampling ones (colibri.c's grammar-bytes field, " 0")
+        self.header_tail = header_tail
         env = dict(os.environ, **env)
         if log_prefix:
             env["COLI_PREFIX_LOG"] = "1"
@@ -106,7 +110,7 @@ class ServeEngine:
         re-encoding yields entirely different bytes.
         """
         assert isinstance(prompt, bytes), "prompts stay bytes end to end"
-        header = f"SUBMIT {rid} 0 {len(prompt)} {max_tok} 0 1\n".encode()
+        header = f"SUBMIT {rid} 0 {len(prompt)} {max_tok} 0 1{self.header_tail}\n".encode()
         self.p.stdin.write(header + prompt + b"\n")
         self.p.stdin.flush()
         chunks = []
@@ -124,6 +128,28 @@ class ServeEngine:
                 return b"".join(chunks)
             elif kind == "ERROR":
                 raise RuntimeError(f"engine error: {text}")
+
+    def ask_cancelled(self, rid, prompt, max_tok=8):
+        """SUBMIT with its CANCEL in the same write: the CANCEL is waiting on stdin before the
+        engine reads the first layer, so a reader that polls while it reads the prompt stops
+        there. Returns the frame that ended the request and the bytes written before it."""
+        assert isinstance(prompt, bytes), "prompts stay bytes end to end"
+        header = f"SUBMIT {rid} 0 {len(prompt)} {max_tok} 0 1{self.header_tail}\n".encode()
+        self.p.stdin.write(header + prompt + b"\n" + f"CANCEL {rid}\n".encode())
+        self.p.stdin.flush()
+        chunks = []
+        while True:
+            line = self.p.stdout.readline()
+            if not line:
+                raise RuntimeError("engine closed mid-request:\n"
+                                   + "".join(self._err)[-2000:])
+            text = line.decode("latin-1").rstrip("\n")
+            kind = text.split(" ", 1)[0]
+            if kind == "DATA":
+                chunks.append(self.p.stdout.read(int(text.split()[2])))
+                self.p.stdout.readline()
+            elif kind in ("DONE", "ERROR"):
+                return text, b"".join(chunks)
 
     def _drain(self):
         for line in iter(self.p.stderr.readline, b""):
@@ -285,3 +311,76 @@ class PrefixReuseContract:
                           "the turn that replays the reply did not reuse: the "
                           "record does not describe the generated positions.\n"
                           "engine said:\n" + (log or "(nothing on stderr)"))
+
+
+class PromptCancelContract:
+    """A CANCEL that arrives while the prompt is read stops the reading (prompt_break.h).
+
+    The gateway sends CANCEL as soon as a client goes away, also while the prompt is still being
+    read. The scenario: a first turn, then a longer prompt that extends it, cancelled, then that
+    longer prompt again. The cancelled turn must stop before its prompt is read (the log line,
+    not only the missing tokens: an engine that read the whole prompt and saw the CANCEL before
+    its first token would also write no token), and the next turn must answer exactly what the
+    same two turns answer with no cancel between them. An engine of attention alone keeps the first turn's prefix through the
+    cancel (PROMPT_CANCEL_KEEPS_PREFIX); one with rings or a state it cannot roll back starts
+    over, and its next turn reads the prompt whole.
+
+    Twice: with the CANCEL seen at the first check, and with COLI_PROMPT_BREAK_AFTER holding it
+    back for CANCEL_AFTER checks, so it lands in the middle of the prompt's forward, where the
+    engine has to leave a layer loop and put its state back.
+
+    Mix into a TestCase that provides spawn(**kwargs), as PrefixReuseContract.
+    """
+
+    PROMPT_CANCEL_KEEPS_PREFIX = True
+    CANCEL_OPENING = b"The capital of France is"
+    CANCEL_MORE = b" a question about geography, and the capital of Spain is"
+    CANCEL_AFTER = 1   # the second check: before layer 1, or a chain's first chunk on a tiny prompt
+    CANCEL_ENV = {}   # for both engines of the scenario (MiMo's block size)
+
+    def reused_after_cancel(self, tail):
+        """Did a turn after the cancel reuse a prefix? The engine's own words."""
+        return "[PREFIX] reusing" in tail
+
+    def _cancel_scenario(self, after):
+        with mock.patch.dict(os.environ, dict(self.CANCEL_ENV, COLI_PROMPT_BREAK_AFTER=str(after))):
+            warm = self.spawn()
+        opening = self.CANCEL_OPENING
+        warm.ask("1", opening)
+        second = opening + self.CANCEL_MORE
+        frame, written = warm.ask_cancelled("2", second)
+        after_turn = warm.ask("3", second, max_tok=8)
+        log = warm.close()
+
+        # the same turns with no cancel: a cancelled prompt must leave no trace (an engine that
+        # reuses exactly also answers what a cold one answers; that is PrefixReuseContract's)
+        with mock.patch.dict(os.environ, self.CANCEL_ENV):
+            plain = self.spawn(log_prefix=False)
+        plain.ask("1", opening)
+        expected = plain.ask("3", second, max_tok=8)
+        plain.close()
+
+        self.assertEqual(frame, "ERROR 2 CANCELLED", log)
+        self.assertEqual(written, b"", "the cancelled turn wrote tokens")
+        self.assertIn("[PREFIX] cancelled while reading the prompt", log,
+                      "the CANCEL did not stop the prompt's reading:\n" + log)
+        self.assertEqual(after_turn, expected,
+                         "the turn after a cancelled prompt answered otherwise than the same "
+                         "turns with no cancel")
+        # what the engine says it kept is what the next turn must find: a prefix, or nothing
+        held = int(re.search(r"cancelled while reading the prompt: (\d+) of", log).group(1))
+        tail = log.split("cancelled while reading the prompt", 1)[1]
+        if self.PROMPT_CANCEL_KEEPS_PREFIX:
+            self.assertGreater(held, 0, "an engine of attention alone dropped its prefix:\n" + log)
+        if held:
+            self.assertTrue(self.reused_after_cancel(tail),
+                            "the engine said it kept %d tokens, and the next turn reused none:\n%s" % (held, log))
+        else:
+            self.assertFalse(self.reused_after_cancel(tail),
+                             "the engine said it started over, yet the next turn reused:\n" + log)
+
+    def test_a_cancel_stops_the_prompt_at_once(self):
+        self._cancel_scenario(0)
+
+    def test_a_cancel_stops_the_prompt_midway(self):
+        self._cancel_scenario(self.CANCEL_AFTER)

@@ -15,6 +15,7 @@
 #ifndef COLI_QWEN38_CORE_H
 #define COLI_QWEN38_CORE_H
 #include "kv_prefix.h"
+#include "prompt_break.h"   /* a served prompt that a STOP or CANCEL stops between two layers */
 #include "spec_draft.h"   /* prompt-lookup drafts and the gate that decides when drafting pays */
 #include "draft_vocab.h"  /* the tokens the MTP head scores for a draft (Q38_MTP_VOCAB) */
 #include "expert_ffn.h"   /* the int4-g64 routed experts (experts-int4g64/ sidecar) run through its f32 kernel */
@@ -5185,8 +5186,18 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
     }
 #endif
     if(!chain_logit){
-    for(int i=first;i<c->layers;i++)
+    for(int i=first;i<c->layers;i++){
+        /* stopped before layer i: kv_len and the kv_prefix record are left as they were,
+         * the K/V rows written so far are a stale tail, and the caller puts the recurrent
+         * state back */
+        if(coli_prompt_break()){   /* prompt_break.h: set by q38_serve_prefill only */
+            free(hyper);free(mixed);free(inject);free(block);
+            free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;
+            if(streams)*streams=NULL;
+            return NULL;
+        }
         q38_layer_forward(m,i,hyper,ids,S,pos_base,mixed,inject,block);
+    }
     q38_gr_read(m,&m->final_gr,hyper,S,mixed,NULL);
     }
     m->kv_len=pos_base+S;
@@ -5583,6 +5594,7 @@ static int q38_mtp_draft_more(Model *m,float *hidden,int tok,int row) {
 static float *step(Model *m,const int *ids,int S,int pos_base) {
     float *streams=NULL;
     float *logit=q38_forward(m,ids,S,pos_base,1,m->mtp?&streams:NULL);
+    if(!logit)return NULL;   /* g_q38_breaker stopped it */
     if(streams){q38_mtp_feed(m,ids,S,pos_base,streams);free(streams);}
     return logit;
 }

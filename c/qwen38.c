@@ -1903,6 +1903,57 @@ typedef struct { double started; uint64_t hits, misses; Q38Timers timers; } Q38R
  * the budget, ACCEPT, the pins and the prefix cache, the prefill and its read-out.
  * 1 with the prompt's ids and the logits after it; 0 when the request ended here,
  * its ERROR frame written. serve_one and serve_mux start every request here. */
+/* A served prompt in segments, so that a STOP or CANCEL arriving while it is read stops the
+ * reading instead of waiting for its end (a 40,000-token prompt took about 17 minutes on an
+ * 8-core CPU, and a client that gave up kept the engine busy all that time).
+ *
+ * Between two segments the state is the prompt read so far, recorded in the kv_prefix as any
+ * step leaves it, so a request that sends the same conversation again reuses all of it. On
+ * the CPU's layers the control is also polled before every layer (g_q38_breaker): a stop
+ * there puts back the recurrent state copied at the segment's start, and the rows the segment
+ * wrote are a stale tail. Segment boundaries change no result: the attention rows, the
+ * DeltaNet recurrence and the MoE routing are per row and in row order (qwen38_core.h).
+ *
+ * The chains run their own forward and are not stopped inside it: they take segments of 8192
+ * rows, the size of their own layer-by-layer segments, and are polled between them. An echo
+ * (logprobs) and a prompt with an image are read in one call, as before. COLI_PROMPT_SEGMENT
+ * sets the rows (2048 on the CPU, 8192 for a chain). */
+static int q38_prompt_poll(ColiPromptBreak *b){   /* control: 1 STOP, 3 CANCEL (serve_read_req) */
+    while(!b->control&&!b->eof&&coli_stdin_readable()){
+        int r=serve_read_req(stdin,stdout,NULL,b->id);
+        if(r<0)b->eof=1;
+        else if(r==1||r==3)b->control=r;
+    }
+    return b->control!=0;
+}
+/* ids[from..np) at position from. NULL when a control stopped it (ctl->control says which). */
+static float *q38_serve_prefill(Model *m,const int *ids,int from,int np,ColiPromptBreak *ctl){
+    int chain=0;
+#ifdef COLI_VULKAN
+    chain|=g_vk_chain!=0;
+#endif
+#ifdef COLI_CUDA
+    chain|=g_cuda_chain!=0;
+#endif
+    if(g_echo_k>0||(m->vis_map&&m->vis_rows_n>0))return step(m,ids+from,np-from,from);
+    /* a chain's segment is the one its own layer-by-layer prompt takes (q38cc_lm_rows), so it
+     * does the same work as when it took the prompt in one call */
+    const int seg=coli_prompt_segment_rows(chain?8192:2048);
+    Q38PinState *st=NULL;
+    float *lo=NULL;
+    for(int at=from;at<np;){
+        if(coli_prompt_poll(ctl)){free(lo);lo=NULL;break;}
+        int n=np-at<seg?np-at:seg;
+        if(!chain&&q38_pin_state_copy(m,&st,1))g_coli_prompt_break=ctl;
+        float *next=step(m,ids+at,n,at);
+        g_coli_prompt_break=NULL;
+        if(!next){q38_pin_state_copy(m,&st,0);free(lo);lo=NULL;break;}
+        free(lo);lo=next;at+=n;
+    }
+    q38_pin_state_free(st);
+    return lo;
+}
+
 static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, float **lo_out,
                            Q38ReqClock *clk){
     int *ids=NULL, np=0;
@@ -2001,24 +2052,38 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     g_echo_pin_logit=(reuse>0&&reuse<np)
                      ? (pin_lo?pin_lo:q38_prefix_cached_logits(m)) : NULL;
     float *lo=NULL;
+    ColiPromptBreak ctl={.poll=q38_prompt_poll,.id=q->id};
     if(reuse==np){
         const float *cached=q38_prefix_cached_logits(m);
         if(!cached){
             q38_prefix_cache_invalidate();reset_recurrent(m);m->kv_len=0;
-            lo=step(m,ids,np,0);reuse=0;
+            lo=q38_serve_prefill(m,ids,0,np,&ctl);reuse=0;
         }else{
             lo=falloc(m->c.vocab);
             memcpy(lo,cached,(size_t)m->c.vocab*sizeof(float));
         }
     }else if(reuse>0){
-        lo=step(m,ids+reuse,np-reuse,reuse);
+        lo=q38_serve_prefill(m,ids,reuse,np,&ctl);
     }else{
         /* A miss invalidates the snapshot before reset so no later request can
          * pair its recurrent state with the old token record. */
         q38_prefix_cache_invalidate();reset_recurrent(m);m->kv_len=0;
-        lo=step(m,ids,np,0);
+        lo=q38_serve_prefill(m,ids,0,np,&ctl);
     }
     g_echo_k=0; g_echo_id=NULL; g_echo_pin_logit=NULL;   /* la lettura e finita col prefill */
+    if(ctl.control){
+        /* stopped while reading: what was read stays the live state; a STOP ends the turn
+         * with no token, a CANCEL with the error the gateway waits for */
+        coli_prompt_break_log(ctl.control==3,m->kvp.len,np);
+        if(ctl.control==3)coli_serve_write_error(stdout,q->id,"CANCELLED");
+        else{
+            ColiServeDone done={0,0.0,0.0,rss_gb(),np,0};
+            coli_serve_write_done(stdout,q->id,&done);
+        }
+        fflush(stdout);
+        free(ids);
+        return 0;
+    }
     /* Una fotografia chiesta esplicitamente sopravvive alle richieste che la
      * estendono; la si lascia andare solo quando non e servita a niente
      * (reuse==0: il prompt nuovo non comincia piu con lei), cosi la chat

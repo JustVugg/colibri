@@ -41,7 +41,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mimo_serve_fixture as fixture  # noqa: E402
-from prefix_serve_harness import PrefixReuseContract, ServeEngine  # noqa: E402
+from prefix_serve_harness import PrefixReuseContract, PromptCancelContract, ServeEngine  # noqa: E402
 
 STATE = "Context: the release is late, the tests are red and the changelog is empty.\n"
 QUESTION = STATE + "Question: should we ship it today?\nAnswer:"
@@ -113,11 +113,14 @@ def resumed(log):
 @unittest.skipUnless(fixture.available(),
                      "mimo is not built or the tiny MiMo fixture is absent "
                      "(make mimo mimo-tiny-generate)")
-class MimoPrefixServeTest(PrefixReuseContract, unittest.TestCase):
+class MimoPrefixServeTest(PrefixReuseContract, PromptCancelContract, unittest.TestCase):
     # The fixture's vocabulary (320) is wider than the byte tokenizer the served
     # copy carries, so a generated reply does not always survive decode and
     # re-encode: the replay scenario may then legitimately not reuse.
     REPLAY_REUSES = False
+    # MiMo checks between prompt blocks: blocks of 8 rows give the cancelled prompt several,
+    # so the cancel can land after some of them are read (and kept)
+    CANCEL_ENV = {"MIMO_CHUNK": "8"}
 
     def spawn(self, log_prefix=True, reuse=True):
         return ServeEngine(fixture.ENGINE, ["8"], fixture.engine_env(),
