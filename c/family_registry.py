@@ -1791,7 +1791,8 @@ FAMILIES = (
         # one-shot `coli run` has nothing to run: a decision needs questions,
         # which come over POST /v1/systemone from `coli serve` / `coli web`
         has_cli_adapter=False,
-        supports_accelerator=False,
+        # COLI_CUDA=1 (--gpu): the forward on a CUDA device (decide_cuda.h); no tier to size
+        supports_accelerator=True,
         modality="decision",
         tokenizer_file="tokenizer/tokenizer.json",
         checkpoint_files=("tokenizer/tokenizer_config.json", "encoder/config.json"),
@@ -1836,7 +1837,8 @@ FAMILIES = (
         capabilities=FamilyCapabilities(False, False, False, False, decision=True),
         has_gateway_adapter=True,
         has_cli_adapter=False,
-        supports_accelerator=False,
+        # COLI_CUDA=1 (--gpu): the forward on a CUDA device (decide_cuda.h); no tier to size
+        supports_accelerator=True,
         modality="decision",
         tokenizer_file="tokenizer.json",
         checkpoint_files=("config.json", "encoder_config/config.json"),
@@ -2000,8 +2002,9 @@ def _resolve_decision_checkpoint(model):
 
 
 # GLiNER2's config.json says model_type "extractor" whatever the architecture
-# and the encoder; the encoder's own config sits in encoder_config/.
-GLINER2_MODEL_TYPE = "extractor"
+# and the encoder ("gliner2" in fastino's repository since its transformers form,
+# the same weights); the encoder's own config sits in encoder_config/.
+GLINER2_MODEL_TYPES = ("extractor", "gliner2")
 GLINER2_ENCODER_CONFIG = "encoder_config/config.json"
 
 
@@ -2063,7 +2066,7 @@ def resolve_model(model_dir):
             "  carries model_index.json instead.") from error
     except json.JSONDecodeError as error:
         raise FamilyConfigError(f"invalid config.json: {error}") from error
-    if isinstance(config, dict) and config.get("model_type") == GLINER2_MODEL_TYPE:
+    if isinstance(config, dict) and config.get("model_type") in GLINER2_MODEL_TYPES:
         return _resolve_gliner2_checkpoint(model, config)
     family = family_for_config(config)
     family_config = config

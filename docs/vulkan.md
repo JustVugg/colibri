@@ -355,7 +355,8 @@ The arithmetic is the CPU path's in f32: the two differ in the order of the sums
 float where the engines sum in double. A device lost in the middle of a forward leaves
 that forward to the CPU, which recomputes it from the ids: a decision has no state to
 rebuild. Each request ends with `[VK] <engine>: N matmuls on the GPU` and
-`[VK] <engine> chain: F forwards on the device ...`.
+`[VK] <engine> chain: F forwards on the device ...`. A CUDA build runs the same forward on a
+CUDA device (`decide_cuda.h`, docs/cuda.md "The decision engines").
 
 **Clef** runs through qwen36's own Vulkan paths, which DECIDE now uses: the backbone's
 prefill over the record matrix by matrix (the default on an integrated GPU, where a

@@ -173,6 +173,42 @@ DeepSeek V4 Flash UD-IQ1_S (82.5 GB) on an RTX PRO 4000 (24 GB, PCIe 4.0 x8) wit
 
 The same models on the CPU, Vulkan and CUDA, one machine and one build: [gpu-parity.md](gpu-parity.md).
 
+## The decision engines
+
+Laya (`laya.c`) and GLiNER2.5-Decide (`gliner_decide.c`) answer a decision with one forward
+over the request's rows and generate no text ([systemone.md](systemone.md#decision-engines)).
+In a CUDA build (`make laya gliner_decide CUDA=1`) with `COLI_CUDA=1` (`coli serve --gpu`),
+`decide_cuda.h` opens the device once the weights are loaded, uploads every matrix of the
+encoder and of Laya's head as f32 (the checkpoint's values), and runs each forward as frames
+of the CUDA chain, one submission a forward: the embedding rows go up, the activations stay on
+the device, and only the rows the scorer reads come back (Laya's markers and each sequence's
+first row, GLiNER2.5-Decide's `[L]` rows). The scorer, the act head and the classifier stay on
+the CPU. It is `decide_vk.h`'s forward, op for op, on the chain's encoder ops (`cc_enc_*` in
+`cuda_chain.h`, the arithmetic of `chain_enc.comp`): the LayerNorm with the residual add, a
+matrix's bias and its GELU or ReLU, ModernBERT's GeGLU and RoPE, a type row per row, the
+bidirectional attention over each row's range of rows with DeBERTa's two relative terms, and
+those terms' products. The LayerNorm sums in double as the engines do, and the GELU is
+`erff`'s.
+
+The device is `COLI_GPUS`' first (device 0 without it); `COLI_CUDA_CHAIN=0` keeps the
+forward on the CPU, and with `COLI_VULKAN=1` as well the Vulkan device takes it. A device lost
+mid-forward (`COLI_CUDA_CHAIN_FAULT=n` fakes it at the n-th frame) leaves that forward and
+every later one to the CPU, which recomputes it from the ids. Each request ends with
+`[CUDA] <engine> chain: F forwards on the device ..., N on the CPU`.
+
+Measured on an RTX PRO 4000 (the CPU an i5-13500, 6 performance-core threads), the release
+checkpoints, requests of 12 questions over a 1,700-character email:
+
+| | CPU, a request | CUDA, a request | the decisions | probabilities |
+|---|---|---|---|---|
+| Laya (ModernBERT-large, 28 layers; 6,144 rows a request) | 11.4-13.0 s | 0.69 s | the CPU's | within 3.3e-6 |
+| GLiNER2.5-Decide (DeBERTa-v3-large, 24 layers; one sequence of about 1,100 rows) | 2.0-2.6 s | 0.16-0.21 s | the CPU's | within 5.4e-7 |
+
+`tests/test_cuda_chain.cu` checks every encoder op against a CPU reference;
+`tests/cuda_decide_compare.py laya|gliner` runs each tiny fixture's cases on the CPU and on
+the device and holds the answers to the CPU's (the decisions, the refusals, every
+probability within 1e-5), with `COLI_CUDA_CHAIN_FAULT=n` a loss in the middle of the run.
+
 ## Notes and limitations
 
 - Text-mode timing reports prefill separately from decode.

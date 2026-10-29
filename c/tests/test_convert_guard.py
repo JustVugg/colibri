@@ -63,6 +63,9 @@ class ConvertGuardTest(unittest.TestCase):
                                "fastino/GLiNER2.5-Decide")
         self.assertIn("NOT converted", str(caught.exception))
         self.assertIn("docs/gliner_decide.md", str(caught.exception))
+        with self.assertRaises(SystemExit) as caught:   # the repository's config since its transformers form
+            check_model_family({"model_type": "gliner2", "architecture": "span"}, "fastino/GLiNER2.5-Decide")
+        self.assertIn("docs/gliner_decide.md", str(caught.exception))
 
     def test_unknown_and_missing_types_are_refused_not_guessed(self):
         for config in ({"model_type": "llama"}, {"model_type": ""}, {}):

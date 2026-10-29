@@ -243,6 +243,81 @@ static std::vector<float> down(CcBuf *b, size_t n) {
 }
 static std::vector<float> rnd(size_t n, unsigned seed, float scale = 1.f) { std::vector<float> v(n); unsigned s = seed; for (auto &x : v) x = frand(&s) * scale; return v; }
 
+/* ---- the decision engines' encoders (chain_enc.comp's modes; the engines' own sums) --- */
+static float enc_act(float x, int k) {
+    if (k == 1) return 0.5f * x * (1.0f + erff(x * 0.70710678118654752f));
+    if (k == 2) return 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+    if (k == 3) return x > 0.f ? x : 0.f;
+    return x;
+}
+static void ref_enc_norm(float *a, const float *b, const float *prm, float *y, const CcEncNorm *p) {
+    std::vector<float> t((size_t)p->D);
+    for (int r = 0; r < p->rows; r++) {
+        double s = 0, q = 0;
+        for (int i = 0; i < p->D; i++) {
+            float v = a[(size_t)p->a_off + (size_t)r * p->a_row + i];
+            if (p->flags & CC_ENC_ADD) v = v + b[(size_t)p->b_off + (size_t)r * p->b_row + i];
+            t[i] = v; s += v;
+        }
+        double mean = s / p->D;
+        for (int i = 0; i < p->D; i++) { double c = t[i] - mean; q += c * c; }
+        float rstd = (float)(1.0 / sqrt(q / p->D + (double)p->eps));
+        for (int i = 0; i < p->D; i++) {
+            if (p->flags & CC_ENC_SUM) a[(size_t)p->a_off + (size_t)r * p->a_row + i] = t[i];
+            float o = (float)(t[i] - mean) * rstd * prm[p->w_off + i];
+            if (p->bias_off >= 0) o += prm[p->bias_off + i];
+            y[(size_t)p->y_off + (size_t)r * p->y_row + i] = o;
+        }
+    }
+}
+static void ref_enc_attn(const float *qkv, const float *c2p, const float *p2c, float *o, const int *rng, const int *ridx,
+                         const int *pos, const CcEncAttn *p) {
+    const int S = p->S, hd = p->hd;
+    for (int h = 0; h < p->H; h++)
+        for (int i = 0; i < S; i++) {
+            float *out = o + (size_t)p->o_off + (size_t)i * p->o_row + (size_t)h * hd;
+            int lo = rng[2 * i], hi = rng[2 * i + 1];
+            for (int d = 0; d < hd; d++) out[d] = 0.f;
+            if (lo > hi) continue;
+            std::vector<double> sc((size_t)(hi - lo + 1));
+            double mx = -1e300, sum = 0;
+            const float *q = qkv + (size_t)p->q_off + (size_t)i * p->kv_row + (size_t)h * hd;
+            for (int j = lo; j <= hi; j++) {
+                const float *k = qkv + (size_t)p->k_off + (size_t)j * p->kv_row + (size_t)h * hd;
+                double s = 0;
+                for (int d = 0; d < hd; d++) s += (double)q[d] * k[d];
+                if (p->flags & (CC_ENC_C2P | CC_ENC_P2C)) {
+                    int rr = ridx[pos[i] - pos[j] + p->rc] - p->r0;
+                    if (p->flags & CC_ENC_C2P) s += c2p[(size_t)p->c_off + ((size_t)h * S + i) * p->nr + rr];
+                    if (p->flags & CC_ENC_P2C) s += p2c[(size_t)p->p_off + ((size_t)h * S + j) * p->nr + rr];
+                }
+                sc[j - lo] = s * p->scale;
+                if (sc[j - lo] > mx) mx = sc[j - lo];
+            }
+            for (auto &v : sc) { v = exp(v - mx); sum += v; }
+            for (int d = 0; d < hd; d++) {
+                double acc = 0;
+                for (int j = lo; j <= hi; j++) acc += sc[j - lo] * qkv[(size_t)p->v_off + (size_t)j * p->kv_row + (size_t)h * hd + d];
+                out[d] = (float)(acc / sum);
+            }
+        }
+}
+static void ref_enc_rel(const float *x, const float *pt, float *y, const CcEncRel *p) {
+    for (int h = 0; h < p->H; h++)
+        for (int i = 0; i < p->S; i++)
+            for (int t = 0; t < p->nr; t++) {
+                double s = 0;
+                for (int d = 0; d < p->hd; d++)
+                    s += (double)x[(size_t)p->x_off + (size_t)i * p->x_row + (size_t)h * p->hd + d] *
+                         pt[(size_t)p->p_off + (size_t)(p->r0 + t) * p->p_row + (size_t)h * p->hd + d];
+                y[(size_t)p->y_off + ((size_t)h * p->S + i) * p->nr + t] = (float)s;
+            }
+}
+static CcBuf *upi(const std::vector<int> &v) {
+    CcBuf *b = T->buf(v.size() * 4, CC_DEV);
+    if (!b || !T->begin() || !T->write(b, 0, v.data(), v.size() * 4) || !T->submit(1)) { printf("  FAIL upload\n"); fails++; }
+    return b;
+}
 /* the router's pick (chain_route.comp's rules: the lower expert on a tie, groups by their two best) */
 static void ref_route(const float *l, const float *bias, int *ids, float *w, const CcRoute *p) {
     std::vector<float> sc(p->E), pk(p->E);
@@ -1199,6 +1274,127 @@ int main(void) {
             if (c == 0) ck(!T->matmul_rows(t, ib, xb, yb, n + 1), "matmul_rows past its buffer refused");
             if (t) coli_cuda_tensor_free(t);
             T->free(ib); T->free(xb); T->free(yb);
+        }
+    }
+    printf("the decision engines' encoders\n");
+    if (!T->enc_rel || T->size < offsetof(ColiCudaChainOps, enc_rel) + sizeof T->enc_rel) ck(0, "the table has the encoder ops");
+    else {
+        {   /* LayerNorm: alone, after an add, the sum written back, into the added rows (an engine's x += h; h = LN(x)) */
+            const int R = 5;
+            for (int D : {1000, 4096}) for (int f = 0; f < 4; f++) {
+                int flags = f == 0 ? 0 : f == 1 ? CC_ENC_ADD : CC_ENC_ADD | CC_ENC_SUM, into_b = f == 3, row = D + 3;
+                std::vector<float> a = rnd((size_t)R * row, 900 + D + f, 3.f), b = rnd((size_t)R * row, 910 + D + f), prm = rnd((size_t)3 * D, 920 + f);
+                for (auto &v : a) v += 0.7f;   /* a mean away from zero */
+                std::vector<float> y((size_t)R * row, 0.f), ra = a, rb = b, ry = y;
+                CcEncNorm np = {0, R, D, 0, row, 0, row, 0, row, 0, f == 2 ? -1 : D, flags, 1e-5f};
+                CcBuf *ab = up(a), *bb = up(b), *pb = up(prm), *yb = into_b ? bb : up(y);
+                int ok = T->begin() && T->enc_norm(ab, flags ? bb : NULL, pb, yb, &np) && T->submit(1);
+                ref_enc_norm(ra.data(), rb.data(), prm.data(), into_b ? rb.data() : ry.data(), &np);
+                std::vector<float> gy = down(yb, (size_t)R * row), ga = down(ab, (size_t)R * row);
+                double dy = maxdiff(gy.data(), (into_b ? rb : ry).data(), gy.size()), da = maxdiff(ga.data(), ra.data(), ga.size());
+                char what[160];
+                snprintf(what, sizeof what, "enc_norm D %d%s%s%s (|dy| %.1e)", D, flags & CC_ENC_ADD ? ", + b" : "", flags & CC_ENC_SUM ? ", the sum kept" : "",
+                         into_b ? ", into b" : f == 2 ? ", no bias" : "", dy);
+                ck(ok && dy < 2e-5 && da == 0, what);
+                T->free(ab); T->free(bb); T->free(pb); if (!into_b) T->free(yb);
+            }
+        }
+        {   /* bias and activation in place, a row wider than its outputs; GeGLU */
+            const int R = 7, O = 300, row = 320;
+            for (int act = 0; act < 4; act++) for (int nb = 0; nb < 2; nb++) {
+                std::vector<float> y = rnd((size_t)R * row, 930 + act, 3.f), prm = rnd(O + 5, 940), want = y;
+                CcEncBias bp = {1, R * O, O, 0, row, nb ? -1 : 5, act};
+                for (int r = 0; r < R; r++) for (int o = 0; o < O; o++) { float &v = want[(size_t)r * row + o]; v = enc_act(nb ? v : v + prm[5 + o], act); }
+                CcBuf *yb = up(y), *pb = up(prm);
+                int ok = T->begin() && T->enc_bias(yb, pb, &bp) && T->submit(1);
+                char what[96]; snprintf(what, sizeof what, "enc_bias act %d%s", act, nb ? ", no bias" : "");
+                ck(ok && maxdiff(down(yb, y.size()).data(), want.data(), y.size()) < 1e-6, what);
+                T->free(yb); T->free(pb);
+            }
+            const int I = 200;
+            for (int act = 1; act < 3; act++) for (int nb = 0; nb < 2; nb++) {
+                std::vector<float> a = rnd((size_t)R * 2 * I, 950 + act, 3.f), prm = rnd(2 * I + 3, 960), y((size_t)R * (I + 8), 0.f), want = y;
+                CcEncGeglu gp = {2, R * I, I, 0, 2 * I, 0, I + 8, nb ? -1 : 3, act};
+                for (int r = 0; r < R; r++) for (int j = 0; j < I; j++) {
+                    float u = a[(size_t)r * 2 * I + j], g = a[(size_t)r * 2 * I + I + j];
+                    if (!nb) { u += prm[3 + j]; g += prm[3 + I + j]; }
+                    want[(size_t)r * (I + 8) + j] = enc_act(u, act) * g;
+                }
+                CcBuf *ab = up(a), *pb = up(prm), *yb = up(y);
+                int ok = T->begin() && T->enc_geglu(ab, pb, yb, &gp) && T->submit(1);
+                char what[96]; snprintf(what, sizeof what, "enc_geglu act %d%s", act, nb ? ", no bias" : "");
+                ck(ok && maxdiff(down(yb, y.size()).data(), want.data(), y.size()) < 1e-6, what);
+                T->free(ab); T->free(pb); T->free(yb);
+            }
+        }
+        {   /* RoPE on the query and key heads of a fused row, a table row per position; a type row per row */
+            const int R = 9, H = 3, hd = 16, half = hd / 2, row = 3 * H * hd, P = 12;
+            std::vector<float> x = rnd((size_t)R * row, 970), tab((size_t)2 * P * half), want = x;
+            std::vector<int> pos((size_t)R);
+            for (int i = 0; i < P * half; i++) { float ang = (float)(i / half) * powf(10000.f, -(float)(i % half) / half); tab[i] = cosf(ang); tab[P * half + i] = sinf(ang); }
+            for (int r = 0; r < R; r++) pos[r] = (r * 5 + 2) % P;
+            for (int r = 0; r < R; r++) for (int part = 0; part < 2; part++) for (int h = 0; h < H; h++) for (int k = 0; k < half; k++) {
+                float *v = &want[(size_t)r * row + part * H * hd + h * hd];
+                float c = tab[pos[r] * half + k], sn = tab[P * half + pos[r] * half + k], x0 = v[k], x1 = v[k + half];
+                v[k] = x0 * c - x1 * sn; v[k + half] = x1 * c + x0 * sn;
+            }
+            CcEncRope rp = {3, R * H * hd, H, hd, 0, row, H * hd, 0, P * half};
+            CcBuf *xb = up(x), *tb = up(tab), *pb = upi(pos);
+            int ok = T->begin() && T->enc_rope(xb, tb, pb, &rp) && T->submit(1);
+            ck(ok && maxdiff(down(xb, x.size()).data(), want.data(), x.size()) < 1e-6, "enc_rope: the query and key heads, the table's rows");   /* a fused multiply-add's rounding */
+            T->free(xb); T->free(tb); T->free(pb);
+            const int D = 40;
+            std::vector<float> y = rnd((size_t)R * D, 975), t2 = rnd(3 * D + 7, 976), want2 = y;
+            std::vector<int> idx((size_t)R);
+            for (int r = 0; r < R; r++) { idx[r] = r % 3; for (int d = 0; d < D; d++) want2[(size_t)r * D + d] += t2[7 + idx[r] * D + d]; }
+            CcEncAddRow ap = {4, R * D, D, 0, D, 7};
+            CcBuf *yb = up(y), *tb2 = up(t2), *ib = upi(idx);
+            ok = T->begin() && T->enc_addrow(yb, tb2, ib, &ap) && T->submit(1);
+            ck(ok && maxdiff(down(yb, y.size()).data(), want2.data(), y.size()) == 0, "enc_addrow: a type row per row");
+            T->free(yb); T->free(tb2); T->free(ib);
+        }
+        {   /* the attention: sequences side by side, each row over its sequence or a window in it,
+             * with DeBERTa's two relative terms and without; head dims under, at and past a warp's tile */
+            const int lens[3] = {37, 1, 50}, S = 88, nr = 21, r0 = 3, maxp = 60;
+            for (int hd : {40, 64, 128}) for (int mode = 0; mode < 3; mode++) {
+                const int H = hd == 128 ? 2 : 3, row = 3 * H * hd;
+                std::vector<float> qkv = rnd((size_t)S * row, 980 + hd + mode, 1.5f), o((size_t)S * H * hd, 0.f), want = o;
+                std::vector<float> c2p = rnd((size_t)H * S * nr + 4, 990 + mode, 2.f), p2c = rnd((size_t)H * S * nr + 6, 995 + mode, 2.f);
+                std::vector<int> rng((size_t)2 * S), pos((size_t)S), ridx((size_t)2 * maxp + 1);
+                for (int s = 0, r = 0; s < 3; s++)
+                    for (int i = 0; i < lens[s]; i++, r++) {
+                        int st = r - i, lo = mode == 1 ? (i - 6 < 0 ? 0 : i - 6) : 0, hi = mode == 1 ? (i + 6 > lens[s] - 1 ? lens[s] - 1 : i + 6) : lens[s] - 1;
+                        rng[2 * r] = st + lo; rng[2 * r + 1] = st + hi; pos[r] = i;
+                    }
+                rng[2 * 40] = 5; rng[2 * 40 + 1] = 4;   /* an empty range: zeros */
+                for (int k = 0; k <= 2 * maxp; k++) ridx[k] = r0 + (k * 7 + 3) % nr;
+                int flags = mode == 2 ? CC_ENC_C2P | CC_ENC_P2C : 0;
+                CcEncAttn ap = {5, S, H, hd, 0, H * hd, 2 * H * hd, row, 0, H * hd, flags, 4, 6, nr, maxp, 1.f / sqrtf((float)hd), r0};
+                ref_enc_attn(qkv.data(), c2p.data(), p2c.data(), want.data(), rng.data(), ridx.data(), pos.data(), &ap);
+                CcBuf *qb = up(qkv), *ob = up(o), *cb = up(c2p), *pb = up(p2c), *rb = upi(rng), *xb = upi(ridx), *sb = upi(pos);
+                int ok = T->begin() && T->enc_attn(qb, flags ? cb : NULL, flags ? pb : NULL, ob, rb, flags ? xb : NULL, flags ? sb : NULL, &ap) && T->submit(1);
+                double d = maxdiff(down(ob, o.size()).data(), want.data(), o.size());
+                char what[128];
+                snprintf(what, sizeof what, "enc_attn hd %d, %s (|d| %.1e)", hd, mode == 0 ? "the sequences" : mode == 1 ? "windows" : "c2p and p2c", d);
+                ck(ok && d < 2e-5, what);
+                T->free(qb); T->free(ob); T->free(cb); T->free(pb); T->free(rb); T->free(xb); T->free(sb);
+            }
+            CcEncAttn bad = {5, S, 2, 129, 0, 0, 0, 3 * 129, 0, 129, 0, 0, 0, 0, 0, 1.f, 0};
+            CcBuf *qb = T->buf(4, CC_DEV);
+            ck(!T->enc_attn(qb, NULL, NULL, qb, qb, NULL, NULL, &bad), "enc_attn past 128 a head refused");
+            T->free(qb);
+        }
+        {   /* the relative products: rows by buckets of every head, buckets past a block's 64 */
+            const int S = 40, H = 3, hd = 48, nr = 70, r0 = 5, xrow = H * hd + 4, prow = H * hd + 2;
+            std::vector<float> x = rnd((size_t)S * xrow, 1001), pt = rnd((size_t)(r0 + nr + 1) * prow, 1002), y((size_t)H * S * nr + 3, 0.f), want = y;
+            CcEncRel rp = {6, S, H, hd, 4, xrow, 2, prow, 3, nr, r0};
+            ref_enc_rel(x.data(), pt.data(), want.data(), &rp);
+            CcBuf *xb = up(x), *pb = up(pt), *yb = up(y);
+            int ok = T->begin() && T->enc_rel(xb, pb, yb, &rp) && T->submit(1);
+            double d = maxdiff(down(yb, y.size()).data(), want.data(), y.size());
+            char what[96]; snprintf(what, sizeof what, "enc_rel (|d| %.1e)", d);
+            ck(ok && d < 2e-5, what);
+            T->free(xb); T->free(pb); T->free(yb);
         }
     }
     printf("lost\n");

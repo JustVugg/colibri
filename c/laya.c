@@ -677,6 +677,9 @@ static void add_rows(float *x, const float *y, size_t n)
 #ifdef COLI_VULKAN
 #include "decide_vk.h"         /* COLI_VULKAN=1: the forward, or its matrices, on a Vulkan device */
 #endif
+#ifdef COLI_CUDA
+#include "decide_cuda.h"       /* COLI_CUDA=1: the forward on a CUDA device */
+#endif
 
 static void gemm(float *Y, const float *X, int M, const QiMat *W, const float *bias)
 {
@@ -1151,6 +1154,222 @@ static int laya_vk_forward(Laya *M, Seq *seqs, int S, SeqOut *outs)
 }
 #endif
 
+#ifdef COLI_CUDA
+/* ------------------------------------------- the forward on a CUDA device */
+
+/* laya_vk_forward on the CUDA chain (decide_cuda.h): the same frames, op for op, the
+ * parameters and tables uploaded once. */
+typedef struct {
+    int ok;
+    CcBuf *prm, *tab;
+    CcBuf *x, *h, *big, *mid, *att, *ipos, *rg, *rl, *tid, *down;
+    int emb_w, emb_b, fin_w, fin_b, type_emb;
+    int *an_w, *an_b, *mn_w, *mn_b, *bqkv, *bo, *bi, *bo2;          /* per encoder layer */
+    int *n1w, *n1b, *n2w, *n2b, *inb, *outb, *l1b, *l2b;            /* per head layer */
+    int cos_g, sin_g, cos_l, sin_l;
+} LayaCc;
+static LayaCc g_lcc;
+
+static void laya_cc_setup(Laya *M)
+{
+    if (!g_dcc.ready) return;
+    int n = 0, want = 0;
+    for (int l = 0; l < M->layers; l++) {
+        EncLayer *E = &M->L[l];
+        const QiMat *w[4] = {&E->wqkv, &E->wo, &E->wi, &E->wo2};
+        for (int k = 0; k < 4; k++, want++) n += dcc_tensor(w[k]) != NULL;
+    }
+    for (int l = 0; l < M->head_layers; l++) {
+        HeadLayer *H = &M->H[l];
+        const QiMat *w[4] = {&H->in_proj, &H->out_proj, &H->lin1, &H->lin2};
+        for (int k = 0; k < 4; k++, want++) n += dcc_tensor(w[k]) != NULL;
+    }
+    fprintf(stderr, "[CUDA] laya: %d of %d matrices on the device (%.1f MiB, f32)\n", n, want, g_dcc.mat_bytes / 1048576.0);
+    if (n != want || M->hd > 128 || M->d / M->head_heads > 128 || M->d > 4096) {
+        fprintf(stderr, "[CUDA] laya: the forward stays on the CPU (%s)\n",
+                n != want ? "a matrix did not reach the device" : "a geometry past the chain's kernels");
+        g_dcc.ready = 0;
+        return;
+    }
+    LayaCc *V = &g_lcc;
+    DccPrm P = {0};
+    int L = M->layers, HL = M->head_layers > 0 ? M->head_layers : 1, d = M->d;
+    int **lv[8] = {&V->an_w, &V->an_b, &V->mn_w, &V->mn_b, &V->bqkv, &V->bo, &V->bi, &V->bo2};
+    int **hv[8] = {&V->n1w, &V->n1b, &V->n2w, &V->n2b, &V->inb, &V->outb, &V->l1b, &V->l2b};
+    for (int k = 0; k < 8; k++) { *lv[k] = (int *)xcalloc((size_t)L, sizeof(int)); *hv[k] = (int *)xcalloc((size_t)HL, sizeof(int)); }
+    V->emb_w = dcc_prm_add(&P, M->emb_norm_w, d);
+    V->emb_b = dcc_prm_add(&P, M->emb_norm_b, d);
+    V->fin_w = dcc_prm_add(&P, M->final_norm_w, d);
+    V->fin_b = dcc_prm_add(&P, M->final_norm_b, d);
+    V->type_emb = dcc_prm_add(&P, M->type_emb, (size_t)3 * d);
+    for (int l = 0; l < L; l++) {
+        EncLayer *E = &M->L[l];
+        V->an_w[l] = dcc_prm_add(&P, E->attn_norm_w, d);
+        V->an_b[l] = dcc_prm_add(&P, E->attn_norm_b, d);
+        V->mn_w[l] = dcc_prm_add(&P, E->mlp_norm_w, d);
+        V->mn_b[l] = dcc_prm_add(&P, E->mlp_norm_b, d);
+        V->bqkv[l] = dcc_prm_add(&P, E->bqkv, (size_t)3 * d);
+        V->bo[l] = dcc_prm_add(&P, E->bo, d);
+        V->bi[l] = dcc_prm_add(&P, E->bi, (size_t)2 * M->inter);
+        V->bo2[l] = dcc_prm_add(&P, E->bo2, d);
+    }
+    for (int l = 0; l < M->head_layers; l++) {
+        HeadLayer *H = &M->H[l];
+        V->n1w[l] = dcc_prm_add(&P, H->n1w, d);
+        V->n1b[l] = dcc_prm_add(&P, H->n1b, d);
+        V->n2w[l] = dcc_prm_add(&P, H->n2w, d);
+        V->n2b[l] = dcc_prm_add(&P, H->n2b, d);
+        V->inb[l] = dcc_prm_add(&P, H->in_proj_b, (size_t)3 * d);
+        V->outb[l] = dcc_prm_add(&P, H->out_proj_b, d);
+        V->l1b[l] = dcc_prm_add(&P, H->lin1_b, (size_t)4 * d);
+        V->l2b[l] = dcc_prm_add(&P, H->lin2_b, d);
+    }
+    V->prm = dcc_prm_upload(&P);
+    free(P.v);
+    DccPrm T = {0};
+    size_t tn = (size_t)M->max_pos * (M->hd / 2);
+    V->cos_g = dcc_prm_add(&T, M->rope_g, tn);
+    V->sin_g = dcc_prm_add(&T, M->rope_g + tn, tn);
+    V->cos_l = dcc_prm_add(&T, M->rope_l, tn);
+    V->sin_l = dcc_prm_add(&T, M->rope_l + tn, tn);
+    V->tab = dcc_prm_upload(&T);
+    free(T.v);
+    if (!V->prm || !V->tab) {
+        fprintf(stderr, "[CUDA] laya: the forward stays on the CPU (no device memory for its parameters)\n");
+        g_dcc.ready = 0;
+        return;
+    }
+    V->ok = 1;
+}
+
+static int lcc_norm(CcBuf *x, CcBuf *h, CcBuf *y, int T, int d, int w, int b, int add, float eps)
+{
+    CcEncNorm p = {0, T, d, 0, d, 0, d, 0, d, w, b, add ? CC_ENC_ADD | CC_ENC_SUM : 0, eps};
+    return cc_enc_norm(x, h, g_lcc.prm, y, &p);
+}
+static int lcc_lin(const QiMat *W, CcBuf *x, CcBuf *y, int T, int bias, int act)
+{
+    ColiCudaTensor *t = dcc_tensor(W);
+    if (!t || !cc_matmul(t, x, 0, y, 0, T)) return 0;
+    if (bias < 0 && act == CC_ENC_ACT_NONE) return 1;
+    CcEncBias p = {1, T * W->N, W->N, 0, W->N, bias, act};
+    return cc_enc_bias(y, g_lcc.prm, &p);
+}
+
+/* forward() for the S sequences on the device; 0 = the caller runs forward(). */
+static int laya_cc_forward(Laya *M, Seq *seqs, int S, SeqOut *outs)
+{
+    LayaCc *V = &g_lcc;
+    if (!g_dcc.ready || !V->ok) return 0;
+    double t0 = dcc_now_ms();
+    int d = M->d, I = M->inter, T = 0, nm = 0;
+    for (int s = 0; s < S; s++) { T += seqs[s].n; nm += seqs[s].n_markers; }
+    if (T < 1 || T > 65535) return 0;
+    int wide = 3 * d;
+    if (2 * I > wide) wide = 2 * I;
+    if (4 * d > wide) wide = 4 * d;
+    int nread = S + nm;
+    size_t fd = sizeof(float), id = sizeof(int);
+    if (!cc_reserve(&V->x, (size_t)T * d * fd, CC_DEV) || !cc_reserve(&V->h, (size_t)T * d * fd, CC_DEV) ||
+        !cc_reserve(&V->att, (size_t)T * d * fd, CC_DEV) || !cc_reserve(&V->big, (size_t)T * wide * fd, CC_DEV) ||
+        !cc_reserve(&V->mid, (size_t)T * (I > d ? I : d) * fd, CC_DEV) ||
+        !cc_reserve(&V->ipos, (size_t)T * id, CC_DEV) || !cc_reserve(&V->rg, (size_t)2 * T * id, CC_DEV) ||
+        !cc_reserve(&V->rl, (size_t)2 * T * id, CC_DEV) || !cc_reserve(&V->tid, (size_t)T * id, CC_DEV) ||
+        !cc_reserve(&V->down, (size_t)nread * d * fd, CC_DOWN)) {
+        if (cc_lost()) dcc_lost();
+        return 0;
+    }
+    /* the host's part, laya_vk_forward's: the embedding rows, and per row its position,
+     * its question type and the rows its attention sees */
+    float *emb = (float *)xmalloc((size_t)T * d * fd);
+    int *pos = (int *)xmalloc((size_t)T * id), *tid = (int *)xmalloc((size_t)T * id);
+    int *rg = (int *)xmalloc((size_t)2 * T * id), *rl = (int *)xmalloc((size_t)2 * T * id);
+    CcRegion *reg = (CcRegion *)xmalloc((size_t)nread * sizeof(CcRegion));
+    for (int s = 0, r = 0, k = S; s < S; s++) {
+        int start = r, L = seqs[s].n;
+        reg[s] = (CcRegion){(size_t)s * d, (size_t)start * d, (size_t)d};
+        for (int i = 0; i < seqs[s].n_markers; i++, k++)
+            reg[k] = (CcRegion){(size_t)k * d, (size_t)(start + seqs[s].markers[i]) * d, (size_t)d};
+        for (int i = 0; i < L; i++, r++) {
+            int id_ = seqs[s].ids[i];
+            if (id_ < 0 || id_ >= M->vocab) id_ = 0;
+            memcpy(emb + (size_t)r * d, M->tok_emb + (size_t)id_ * d, (size_t)d * fd);
+            pos[r] = i; tid[r] = seqs[s].qtype;
+            rg[2 * r] = start; rg[2 * r + 1] = start + L - 1;
+            int lo = i - M->window < 0 ? 0 : i - M->window, hi = i + M->window > L - 1 ? L - 1 : i + M->window;
+            rl[2 * r] = start + lo; rl[2 * r + 1] = start + hi;
+        }
+    }
+    CcBuf *x = V->x, *h = V->h, *big = V->big, *mid = V->mid, *att = V->att;
+    int ok = dcc_begin() && cc_write(h, 0, emb, (size_t)T * d * fd) && cc_write(V->ipos, 0, pos, (size_t)T * id) &&
+             cc_write(V->tid, 0, tid, (size_t)T * id) && cc_write(V->rg, 0, rg, (size_t)2 * T * id) &&
+             cc_write(V->rl, 0, rl, (size_t)2 * T * id);
+    free(emb); free(pos); free(tid); free(rg); free(rl);
+    float eps = M->eps;
+    ok = ok && lcc_norm(h, NULL, x, T, d, V->emb_w, V->emb_b, 0, eps);
+    float scale = 1.0f / sqrtf((float)M->hd);
+    for (int l = 0; ok && l < M->layers; l++) {
+        EncLayer *E = &M->L[l];
+        /* layer 0 has no attention norm; the others' norm joined the previous add below */
+        CcBuf *in = E->attn_norm_w ? h : x;
+        if (l == 0 && E->attn_norm_w) ok = lcc_norm(x, NULL, h, T, d, V->an_w[l], V->an_b[l], 0, eps);
+        ok = ok && lcc_lin(&E->wqkv, in, big, T, V->bqkv[l], CC_ENC_ACT_NONE);
+        CcEncRope rp = {3, T * M->heads * M->hd, M->heads, M->hd, 0, 3 * d, d,
+                        E->global ? V->cos_g : V->cos_l, E->global ? V->sin_g : V->sin_l};
+        ok = ok && cc_enc_rope(big, V->tab, V->ipos, &rp);
+        CcEncAttn ap = {5, T, M->heads, M->hd, 0, d, 2 * d, 3 * d, 0, d, 0, 0, 0, 0, 0, scale, 0};
+        ok = ok && cc_enc_attn(big, NULL, NULL, att, E->global ? V->rg : V->rl, NULL, NULL, &ap);
+        ok = ok && lcc_lin(&E->wo, att, h, T, V->bo[l], CC_ENC_ACT_NONE);
+        ok = ok && lcc_norm(x, h, h, T, d, V->mn_w[l], V->mn_b[l], 1, eps);     /* x += h; h = mlp_norm(x) */
+        ok = ok && lcc_lin(&E->wi, h, big, T, -1, CC_ENC_ACT_NONE);
+        CcEncGeglu gp = {2, T * I, I, 0, 2 * I, 0, I, V->bi[l], M->gelu_tanh ? CC_ENC_ACT_GELU_TANH : CC_ENC_ACT_GELU};
+        ok = ok && cc_enc_geglu(big, V->prm, mid, &gp);
+        ok = ok && lcc_lin(&E->wo2, mid, h, T, V->bo2[l], CC_ENC_ACT_NONE);
+        if (l + 1 < M->layers && M->L[l + 1].attn_norm_w)                        /* x += h; h = attn_norm(x) */
+            ok = ok && lcc_norm(x, h, h, T, d, V->an_w[l + 1], V->an_b[l + 1], 1, eps);
+        else if (l + 1 < M->layers) {
+            CcEw ep = {CC_EW_ADD, T * d, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.f};
+            ok = ok && cc_ew(x, x, h, NULL, NULL, &ep);
+        }
+    }
+    /* x += h; the final norm into h, which carries the stream from here (forward()'s swap) */
+    ok = ok && lcc_norm(x, h, h, T, d, V->fin_w, V->fin_b, 1, eps);
+    { CcBuf *t = x; x = h; h = t; }
+    CcEncAddRow tp = {4, T * d, d, 0, d, V->type_emb};
+    ok = ok && cc_enc_addrow(x, V->prm, V->tid, &tp);
+    int hh = M->head_heads, hhd = d / hh;
+    float hscale = 1.0f / sqrtf((float)hhd);
+    for (int l = 0; ok && l < M->head_layers; l++) {
+        HeadLayer *H = &M->H[l];
+        if (l == 0) ok = lcc_norm(x, NULL, h, T, d, V->n1w[l], V->n1b[l], 0, 1e-5f);
+        ok = ok && lcc_lin(&H->in_proj, h, big, T, V->inb[l], CC_ENC_ACT_NONE);
+        CcEncAttn ap = {5, T, hh, hhd, 0, d, 2 * d, 3 * d, 0, d, 0, 0, 0, 0, 0, hscale, 0};
+        ok = ok && cc_enc_attn(big, NULL, NULL, att, V->rg, NULL, NULL, &ap);
+        ok = ok && lcc_lin(&H->out_proj, att, h, T, V->outb[l], CC_ENC_ACT_NONE);
+        ok = ok && lcc_norm(x, h, h, T, d, V->n2w[l], V->n2b[l], 1, 1e-5f);     /* x += h; h = norm2(x) */
+        ok = ok && lcc_lin(&H->lin1, h, big, T, V->l1b[l], CC_ENC_ACT_RELU);
+        ok = ok && lcc_lin(&H->lin2, big, h, T, V->l2b[l], CC_ENC_ACT_NONE);
+        if (l + 1 < M->head_layers)                                             /* x += h; h = norm1(x) */
+            ok = ok && lcc_norm(x, h, h, T, d, V->n1w[l + 1], V->n1b[l + 1], 1, 1e-5f);
+        else {
+            CcEw ep = {CC_EW_ADD, T * d, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.f};
+            ok = ok && cc_ew(x, x, h, NULL, NULL, &ep);
+        }
+    }
+    ok = ok && cc_copy_regions(V->down, x, reg, nread) && cc_submit(1);
+    free(reg);
+    if (!ok) { dcc_lost(); return 0; }
+    int *first = (int *)xmalloc((size_t)S * id), *mark = (int *)xmalloc((size_t)(nm > 0 ? nm : 1) * id);
+    for (int s = 0; s < S; s++) first[s] = s;
+    for (int k = 0; k < nm; k++) mark[k] = S + k;
+    forward_tail(M, seqs, S, (const float *)cc_ptr(V->down), first, mark, outs);
+    free(first); free(mark);
+    g_dcc.fwd_dev++; g_dcc.rows_dev += (unsigned long long)T;
+    g_dcc.dev_ms += dcc_now_ms() - t0;
+    return 1;
+}
+#endif
+
 /* ------------------------------------------------------------ calibration */
 
 /* common.temp_bucket */
@@ -1208,11 +1427,18 @@ static int laya_decide(void *opaque, const DecideRecord *rec, DecideAnswer *answ
         if (laya_vk_forward(M, seqs + start, end - start, outs + start)) { start = end; continue; }
         if (g_dvk.chain) g_dvk.fwd_cpu++;
 #endif
+#ifdef COLI_CUDA
+        if (laya_cc_forward(M, seqs + start, end - start, outs + start)) { start = end; continue; }
+        if (g_dcc.n_mat) g_dcc.fwd_cpu++;
+#endif
         forward(M, seqs + start, end - start, outs + start);
         start = end;
     }
 #ifdef COLI_VULKAN
     dvk_report();
+#endif
+#ifdef COLI_CUDA
+    dcc_report();
 #endif
     int total = 0;
     for (int q = 0; q < Q; q++) {
@@ -1378,6 +1604,9 @@ int main(int argc, char **argv)
             M->head_layers, M->max_len, M->head_max_len, (now_ms() - t0) / 1e3);
 #ifdef COLI_VULKAN
     if (!tokenize) { dvk_init("laya"); laya_vk_setup(M); }   /* COLI_VULKAN=1: the device */
+#endif
+#ifdef COLI_CUDA
+    if (!tokenize) { dcc_init("laya"); laya_cc_setup(M); }   /* COLI_CUDA=1: the device */
 #endif
     if (tokenize) return run_tokenize(M, tokenize);
     if (records) return run_records(M, records, dump_ids);

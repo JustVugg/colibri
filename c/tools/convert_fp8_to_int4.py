@@ -84,9 +84,9 @@ OTHER_FAMILY_PATHS = {
                                "the release as downloaded; see docs/gliner_decide.md",
 }
 # A config.json whose model_type is not the registry's key for its family: a
-# GLiNER2 checkpoint says "extractor" for every architecture and encoder, and
-# the registry names it by both (family_registry._resolve_gliner2_checkpoint).
-CONFIG_MODEL_TYPE_ALIASES = {"extractor": "gliner2_span_deberta-v2"}
+# GLiNER2 checkpoint says "extractor" (or "gliner2") for every architecture and
+# encoder, and the registry names it by both (family_registry._resolve_gliner2_checkpoint).
+CONFIG_MODEL_TYPE_ALIASES = {"extractor": "gliner2_span_deberta-v2", "gliner2": "gliner2_span_deberta-v2"}
 
 
 def check_model_family(config, where):
