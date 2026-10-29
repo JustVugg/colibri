@@ -180,7 +180,8 @@ long long vkc_attn_slice_budget(void);   /* COLI_VK_ATTN_SLICE below: rows x pos
  * each ending its frame (submitted, not waited for) and the next in a new one: no single
  * submission of a big prompt chunk runs for seconds (a driver resets a job past its
  * timeout: amdgpu 10 s, Windows 2 s). The rows' arithmetic does not change. */
-/* chain_dnconv.comp */
+/* chain_dnconv.comp (order 0, 1: Gated DeltaNet's, the sum's two orders; 2: LFM3's gated
+ * convolution, input rows B | C | x of CD channels, out = C * conv(B * x), no activation) */
 typedef struct { int S, CD, CK, in_off, in_row, out_off, out_row, snap_row, order, w_off, ring_off, snap_off; } VkcDnConv;
 int  vkc_dnconv(VkcBuf *in, VkcBuf *w, VkcBuf *ring, VkcBuf *out, VkcBuf *snap, const VkcDnConv *p);
 /* chain_dnrec.comp (KD a specialization constant, VD <= 128); from VKC_DNREC_ROWS rows
@@ -203,6 +204,7 @@ int  vkc_dnrec(int KD, VkcBuf *cv, VkcBuf *ab, VkcBuf *z, VkcBuf *st, VkcBuf *pr
 #define VKC_EW_SIGMUL   9    /* y = a * sigmoid(b) */
 #define VKC_EW_RESGATE  10   /* y = e[col] * a + c[col] * b (alpha, beta a column) */
 #define VKC_EW_F16      11   /* y = a clamped to +-65504 and rounded to the nearest float16 (kv16.h: a KV cache in float16) */
+#define VKC_EW_HEADGATE 12   /* y = a * sigmoid(b[b_off + i / D]): a gate per head of D values (LFM3) */
 typedef struct { int op, n, D, C, flags, e_row, y_off, a_off, b_off, c_off, e_off; float fc; } VkcEw;
 int  vkc_ew(VkcBuf *y, VkcBuf *a, VkcBuf *b, VkcBuf *c, VkcBuf *e, const VkcEw *p);
 /* chain_qsa.comp (mode 0: nb block keys from b0; mode 1: the selection of S rows, run as two dispatches that write the

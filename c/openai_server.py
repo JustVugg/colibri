@@ -1079,7 +1079,7 @@ def _parse_arch_tool_calls(reply, tools, tool_reply, track_spans):
             _sideband_text, calls = parse_k3_tool_calls(tool_reply, tools)
             return reply.strip(), calls, None, None
         return parse_k3_tool_calls(reply, tools) + (None, None)  # pre-#1147 engines
-    if chat_flavor() in ("qwen36", "qwen38", "qwen3_coder"):
+    if chat_flavor() in ("qwen36", "qwen38", "qwen3_coder", "lfm3"):
         return parse_qwen_tool_calls(reply, tools) + (None, None)
     if chat_flavor() == "muse":
         return parse_muse_tool_calls(reply, tools) + (None, None)
@@ -1166,6 +1166,9 @@ def detect_chat_flavor(family_id, model_dir):
         # Muse Spark: messages to recipients, calls as <atem:function_calls>
         if "render_valid_recipients" in text:
             return "muse"
+        # LFM3 (LiquidAI/LFM3-VL): ChatML after its BOS, <think> always written, tools as JSON
+        if "macro render_tool_response" in text and "<additional_tools>" in text:
+            return "lfm3"
     return None
 
 INK_THINK, INK_TEXT = "<|content_thinking|>", "<|content_text|>"
@@ -2623,6 +2626,136 @@ def parse_muse_tool_calls(reply, tools):
     text = re.sub(re.escape(THINK_OPEN) + ".*?(?:" + re.escape(THINK_CLOSE) + "|$)", "", "".join(content), flags=re.S)
     text = text.replace(THINK_CLOSE, "").replace("<|eot|>", "")
     return text.strip(), calls
+
+
+LFM3_BOS = "<|startoftext|>"
+
+
+def _lfm3_value(value):
+    """The template's render_value: a str as it is, true/false, null, JSON for a mapping or a
+    list, anything else through str()."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _lfm3_tool_calls(calls, index):
+    """The template's render_tool_calls: one <tool_call> block per call, a blank line between."""
+    out = []
+    for position, call in enumerate(calls):
+        where = f"messages.{index}.tool_calls.{position}"
+        fn = call.get("function", call) if isinstance(call, dict) else None
+        if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or not fn["name"]:
+            raise APIError(400, "Each tool call needs a `function.name`.", where)
+        args = fn.get("arguments")
+        if isinstance(args, str):   # the OpenAI shape: the object the template expects, as JSON
+            try:
+                args = json.loads(args) if args.strip() not in ("", "{}", "null") else {}
+            except ValueError:
+                raise APIError(400, "`function.arguments` must be a JSON object.", f"{where}.function.arguments")
+        if args is not None and not isinstance(args, dict):
+            raise APIError(400, "`function.arguments` must be a JSON object.", f"{where}.function.arguments")
+        body = "".join(f"<parameter={key}>\n{_lfm3_value(value)}\n</parameter>\n" for key, value in (args or {}).items())
+        out.append(f"<tool_call>\n<function={fn['name']}>\n{body}</function>\n</tool_call>")
+    return "\n\n".join(out)
+
+
+def render_chat_lfm3(messages, enable_thinking=True, tools=None, tool_choice=None,
+                     add_generation_prompt=True, preserve_thinking=False):
+    """LFM3's chat_template (LiquidAI/LFM3-VL), byte for byte on the OpenAI shapes: its BOS, then
+    ChatML turns with a newline after every <|im_end|>; the tools (their function objects as JSON,
+    one per line) in a <tools> block after the client's system text; an assistant turn after the
+    last user turn keeps its reasoning as <think>...</think> (an empty pair when it has none), an
+    earlier one gets the empty pair and only the text after its </think>; calls as
+    <tool_call><function=...><parameter=...>; a tool result in its own tool turn inside
+    <tool_response>. The generation prompt opens <think> (thinking on, the template's default)
+    or writes the closed pair. add_generation_prompt=False leaves a trailing assistant turn open."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tool_choice == "none":
+        tools = None
+    if tools is not None and not isinstance(tools, list):
+        raise APIError(400, "`tools` must be an array.", "tools")
+    start, system = 0, ""
+    first = messages[0]
+    if isinstance(first, dict) and first.get("role") in ("system", "developer"):
+        raw = first.get("content")
+        system = content_text(raw, "messages.0.content") if raw else ""
+        start = 1
+    if tools:
+        lines = []
+        for position, tool in enumerate(tools):
+            fn = tool.get("function", tool) if isinstance(tool, dict) else None
+            if not isinstance(fn, dict):
+                raise APIError(400, "Each tool must be an object.", f"tools.{position}")
+            if fn.get("defer_loading") or (isinstance(tool, dict) and tool.get("defer_loading")):
+                continue
+            lines.append(json.dumps({k: v for k, v in fn.items() if k != "defer_loading"}, ensure_ascii=False))
+        if lines:
+            system += ("\n\n" if system else "") + "<tools>\n" + "\n".join(lines) + "\n</tools>"
+    parts = [LFM3_BOS]
+    if system:
+        parts.append(f"<|im_start|>system\n{system}<|im_end|>\n")
+    loop = messages[start:]
+    last_user = -1
+    for offset, message in enumerate(loop):
+        if isinstance(message, dict) and message.get("role") == "user":
+            last_user = offset
+    for offset, message in enumerate(loop):
+        index = start + offset
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role == "developer":
+            role = "system"
+        if role not in ("system", "user", "assistant", "tool"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw else ""
+        if role == "tool":
+            if isinstance(raw, list):   # the template's render_tool_response: one item per line
+                text = "\n".join(content_text([part], f"messages.{index}.content") for part in raw)
+            body = text if isinstance(raw, str) and "<tool_response>" in text else \
+                f"<tool_response>\n{text}\n</tool_response>"
+            parts.append(f"<|im_start|>tool\n{body}<|im_end|>\n")
+            continue
+        if role != "assistant":
+            parts.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
+            continue
+        keep = preserve_thinking or offset > last_user
+        thinking = None
+        for key in ("thinking", "reasoning", "reasoning_content"):
+            if key in message:
+                thinking = message[key]
+                break
+        if thinking is not None and not isinstance(thinking, str):
+            raise APIError(400, f"`{key}` must be a string.", f"messages.{index}.{key}")
+        head = ""
+        if any(key in message for key in ("thinking", "reasoning", "reasoning_content")) and keep:
+            head = f"<think>{thinking or ''}</think>"
+        elif keep and "</think>" not in (raw if isinstance(raw, str) else ""):
+            head = "<think></think>"
+        if not keep:
+            if "</think>" in text:
+                text = text.split("</think>")[-1].strip()
+            text = "<think></think>" + text
+        calls = message.get("tool_calls")
+        if calls is not None and not isinstance(calls, list):
+            raise APIError(400, "`tool_calls` must be an array.", f"messages.{index}.tool_calls")
+        rendered = head + text + (_lfm3_tool_calls(calls, index) if calls else "")
+        if not add_generation_prompt and offset == len(loop) - 1:
+            parts.append(f"<|im_start|>assistant\n{rendered}")   # continued, still open
+            continue
+        parts.append(f"<|im_start|>assistant\n{rendered}<|im_end|>\n")
+    if add_generation_prompt:
+        parts.append("<|im_start|>assistant\n" + ("<think>" if enable_thinking else "<think></think>"))
+    return "".join(parts)
 
 
 def render_chat_qwen3_coder(messages, tools=None, tool_choice=None, add_generation_prompt=True):
@@ -4445,6 +4578,9 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
     if chat_flavor() == "muse":
         return render_chat_muse(messages, enable_thinking, reasoning_effort, tools, tool_choice,
                                 add_generation_prompt)
+    if chat_flavor() == "lfm3":
+        return render_chat_lfm3(messages, enable_thinking, tools, tool_choice, add_generation_prompt,
+                                preserve_thinking)
     if ARCH == "qwen36":
         return render_chat_qwen(messages, enable_thinking, reasoning_effort, tools,
                                 tool_choice, add_generation_prompt, preserve_thinking)
@@ -9089,7 +9225,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 sideband = ToolSideband(ARCH == "kimi", stop_sequences,
                                         ignore_leading_stop)
                 qwen_stream = (QwenToolStream(emit, tools) if chat_flavor() in
-                               ("qwen36", "qwen38", "qwen3_coder") else None)
+                               ("qwen36", "qwen38", "qwen3_coder", "lfm3") else None)
 
                 def feed_content(chunk):               # answer text only (post-</think>)
                     raw.append(chunk)
@@ -9246,8 +9382,8 @@ class APIHandler(BaseHTTPRequestHandler):
             # preserve the older opt-in default for the other families.
             if chat_flavor() in ("qwen38", "muse"):   # Muse Spark's template: xhigh unless told
                 reasoning_effort = "xhigh"
-            elif ARCH == "mimo" or os.environ.get("COLI_THINK", "0") == "1":
-                # MiMo-V2.6's template thinks unless told not to (enable_thinking false)
+            elif ARCH == "mimo" or chat_flavor() == "lfm3" or os.environ.get("COLI_THINK", "0") == "1":
+                # MiMo-V2.6's and LFM3's templates think unless told not to (enable_thinking false)
                 reasoning_effort = "high"
         enable_thinking = body.get("enable_thinking", reasoning_effort not in (None, "none"))
         if not isinstance(enable_thinking, bool):
@@ -9520,7 +9656,7 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "`thinking` must be an object.", "thinking")
         enable_thinking = bool(thinking and thinking.get("type") == "enabled")
         if not enable_thinking and thinking is None:
-            if chat_flavor() == "qwen38" or ARCH == "mimo":
+            if chat_flavor() in ("qwen38", "lfm3") or ARCH == "mimo":
                 enable_thinking = True
             elif os.environ.get("COLI_THINK", "0") == "1":
                 enable_thinking = True
@@ -9740,7 +9876,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     state["buf"] = state["buf"][flush:]
 
             qwen_stream = (QwenToolStream(emit_text, tools) if tools and chat_flavor() in
-                           ("qwen36", "qwen38", "qwen3_coder") else None)
+                           ("qwen36", "qwen38", "qwen3_coder", "lfm3") else None)
 
             def emit_thinking(chunk):
                 if not enable_thinking:

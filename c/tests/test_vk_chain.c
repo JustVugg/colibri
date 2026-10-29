@@ -14,7 +14,8 @@
  *            after earlier ones, and a selection list; MiMo's form (vkc_attn_w): a
  *            sliding window, a ring of rows, position-major rows, V's own head dim and
  *            a sink logit per head
- *   dnconv   both orders of the sum, the ring carried across calls, the snapshot row
+ *   dnconv   both orders of the sum, the ring carried across calls, the snapshot row; LFM3's
+ *            gated convolution (order 2)
  *   dnrec    KD 8 and 128, silu and sigmoid gates, the state carried, the snapshot
  *   ew       every element-wise op (SCALE: MiMo's value scale)
  *   qsa      block keys, and the selection with ties broken as the CPU sorts, over 12,000
@@ -516,6 +517,40 @@ static void conv_ref(int S, int CD, int CK, const float *in, const float *w, flo
         if (s == snap_row) memcpy(snap + c * (CK - 1), rg, (CK - 1) * sizeof(float));
     }
 }
+/* LFM3's gated convolution (qwen36.c shortconv): rows B | C | x, the ring keeps B * x */
+static void lfm3conv_ref(int S, int CD, int CK, const float *in, const float *w, float *ring, float *out, int snap_row, float *snap) {
+    for (int s = 0; s < S; s++) for (int c = 0; c < CD; c++) {
+        float *rg = ring + c * (CK - 1); const float *wc = w + c * CK, *r = in + (size_t)s * 3 * CD;
+        const float bx = r[c] * r[2 * CD + c];
+        float a = 0; for (int k = 0; k < CK - 1; k++) a += wc[k] * rg[k];
+        a += wc[CK - 1] * bx;
+        for (int k = 0; k < CK - 2; k++) rg[k] = rg[k + 1];
+        rg[CK - 2] = bx;
+        out[s * CD + c] = r[CD + c] * a;
+        if (s == snap_row) memcpy(snap + c * (CK - 1), rg, (CK - 1) * sizeof(float));
+    }
+}
+static void test_lfm3conv(void) {
+    int CD = 37, CK = 7, S1 = 5, S2 = 1, nh = CK - 1;
+    float *w = fvec((size_t)CD * CK, 0.5f), *in = fvec((size_t)(S1 + S2) * 3 * CD, 1.f);
+    float *ring = calloc((size_t)CD * nh, sizeof *ring), *out = malloc((size_t)(S1 + S2) * CD * sizeof *out);
+    float *snap = calloc((size_t)CD * nh, sizeof *snap);
+    lfm3conv_ref(S1, CD, CK, in, w, ring, out, 2, snap);
+    float *snap_ref = malloc((size_t)CD * nh * sizeof *snap_ref); memcpy(snap_ref, snap, (size_t)CD * nh * sizeof *snap_ref);
+    lfm3conv_ref(S2, CD, CK, in + (size_t)S1 * 3 * CD, w, ring, out + S1 * CD, -1, NULL);
+    VkcBuf *wb = up(w, (size_t)CD * CK), *ib = up(in, (size_t)(S1 + S2) * 3 * CD);
+    VkcBuf *rb = vkc_buf((size_t)CD * nh * 2 * 4 + 64, VKC_DEV), *ob = vkc_buf((size_t)(S1 + S2) * CD * 4, VKC_DEV);
+    int ro = 16, so = 16 + CD * nh;
+    VkcDnConv p1 = {S1, CD, CK, 0, 3 * CD, 0, CD, 2, 2, 0, ro, so};
+    VkcDnConv p2 = {S2, CD, CK, S1 * 3 * CD, 3 * CD, S1 * CD, CD, -1, 2, 0, ro, so};
+    vkc_begin(); int ok = vkc_dnconv(ib, wb, rb, ob, rb, &p1); vkc_submit(0);
+    vkc_begin(); ok &= vkc_dnconv(ib, wb, rb, ob, rb, &p2); vkc_submit(1);
+    float *o = down(ob, 0, (size_t)(S1 + S2) * CD), *r = down(rb, ro, (size_t)CD * nh), *sn = down(rb, so, (size_t)CD * nh);
+    double e1 = relerr(o, out, (size_t)(S1 + S2) * CD, 1e-3), e2 = relerr(r, ring, (size_t)CD * nh, 1e-3), e3 = relerr(sn, snap_ref, (size_t)CD * nh, 1e-3);
+    CHECK(ok && e1 < 1e-6 && e2 == 0 && e3 == 0, "dnconv order 2 (LFM3): out %.2e ring %.2e snap %.2e", e1, e2, e3);
+    vkc_free(wb); vkc_free(ib); vkc_free(rb); vkc_free(ob);
+    free(w); free(in); free(ring); free(out); free(snap); free(snap_ref); free(o); free(r); free(sn);
+}
 static void test_dnconv(int order) {
     int CD = 37, CK = 4, S1 = 5, S2 = 1, nh = CK - 1;
     float *w = fvec((size_t)CD * CK, 0.5f), *in = fvec((size_t)(S1 + S2) * CD, 1.f);
@@ -612,7 +647,7 @@ static void test_ew(void) {
         {VKC_EW_ADD, 0, R * D, "add"}, {VKC_EW_COMBINE, 1 | 2 | 4, R * D, "combine"}, {VKC_EW_COMBINE, 2 | 8, R * D, "combine-noresid"},
         {VKC_EW_COMBINE, 1, R * D, "combine-routed"}, {VKC_EW_SWIGLU, 0, R * D, "swiglu"}, {VKC_EW_HC_LOW, 0, R * D, "hc-low"},
         {VKC_EW_HC_MIX, 0, R * D, "hc-mix"}, {VKC_EW_HC_INJ, 0, R * C, "hc-inj"}, {VKC_EW_HC_APPLY, 0, R * W, "hc-apply"},
-        {VKC_EW_SCALE, 0, R * D, "scale"}};
+        {VKC_EW_SCALE, 0, R * D, "scale"}, {VKC_EW_HEADGATE, 0, R * D, "headgate"}};
     for (size_t k = 0; k < sizeof ops / sizeof *ops; k++) {
         int n = ops[k].n, op = ops[k].op, f = ops[k].flags;
         for (int i = 0; i < n; i++) {
@@ -629,6 +664,7 @@ static void test_ew(void) {
             case VKC_EW_HC_APPLY: { int rr = i / W, rem = i % W, s = rem / D, dd = rem % D;
                 ref[i] = c[i] + a[rr * C + s] * b[rr * D + dd]; break; }
             case VKC_EW_SCALE: ref[i] = a[i] * (float)C; break;
+            case VKC_EW_HEADGATE: ref[i] = a[i] * sigm(b[i / D]); break;
             }
         }
         if (op == VKC_EW_HC_APPLY) { vkc_begin(); vkc_write(yb, 0, c, nw * 4); vkc_submit(1); }
@@ -4216,7 +4252,7 @@ int main(int argc, char **argv) {
         rng = rng_was;
     }
     printf("attn done\n");
-    test_dnconv(0); test_dnconv(1);
+    test_dnconv(0); test_dnconv(1); test_lfm3conv();
     test_dnrec(8, 8, 8, 4, 0); test_dnrec(4, 4, 4, 2, 1); test_dnrec(128, 128, 4, 2, 0); test_dnrec(32, 100, 6, 3, 1);
     /* a prompt chunk's rows (chain_dnrec_rows.comp): blocks past the first and a last one
      * part full, the snapshot inside a block, then a decode's rows from the state it left */

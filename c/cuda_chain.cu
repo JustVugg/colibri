@@ -643,9 +643,10 @@ __global__ static void cc_dnconv_k(const float *__restrict__ xin, const float *_
     int wb = p.w_off + (int)c * p.CK;
     float wl = w[wb + p.CK - 1];
     for (int s = 0; s < p.S; s++) {
-        float cur = xin[p.in_off + s * p.in_row + c];
+        long long ib = p.in_off + (long long)s * p.in_row;   /* order 2 (LFM3): the row is B | C | x */
+        float cur = p.order == 2 ? xin[ib + c] * xin[ib + c + 2LL * p.CD] : xin[ib + c];
         float acc;
-        if (p.order == 0) {
+        if (p.order != 1) {
             acc = 0.f;
             for (int k = 0; k < 8; k++) if (k < nh) acc += w[wb + k] * hist[k];
             acc += wl * cur;
@@ -653,7 +654,7 @@ __global__ static void cc_dnconv_k(const float *__restrict__ xin, const float *_
             acc = wl * cur;
             for (int k = 0; k < 8; k++) if (k < nh) acc += w[wb + k] * hist[k];
         }
-        o[p.out_off + s * p.out_row + c] = acc / (1.f + expf(-acc));
+        o[p.out_off + s * p.out_row + c] = p.order == 2 ? xin[ib + c + p.CD] * acc : acc / (1.f + expf(-acc));
         for (int k = 0; k < 7; k++) if (k + 1 < nh) hist[k] = hist[k + 1];
         for (int k = 0; k < 8; k++) if (k == nh - 1) hist[k] = cur;
         if (s == p.snap_row)
@@ -1028,6 +1029,8 @@ __global__ static void cc_ew_k(float *__restrict__ y, const float *__restrict__ 
         y[p.y_off + i] = e[p.e_off + d] * a[p.a_off + i] + c[p.c_off + d] * b[p.b_off + i];
     } else if (p.op == 11) {   /* kv16.h's kv16_round_bits line for line (cc_f16_round) */
         y[p.y_off + i] = cc_f16_round(a[p.a_off + i]);
+    } else if (p.op == 12) {   /* LFM3's head gate: one logit a head of D values */
+        y[p.y_off + i] = a[p.a_off + i] * cc_sig(b[p.b_off + i / p.D]);
     }
 }
 
@@ -1980,6 +1983,7 @@ static int cc_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *cb, CcBuf *e, const CcEw *
      * back to the host's step (tests/test_cuda_ew_ops_source.py) */
     case CC_EW_SIGMUL: if (!a || !b) return 0; break;
     case CC_EW_RESGATE: if (!a || !b || !cb || !e || p->D < 1) return 0; break;
+    case CC_EW_HEADGATE: if (!a || !b || p->D < 1) return 0; break;   /* LFM3's gate a head (cc_lfm3) */
     default: return 0;
     }
     coli_launch(cc_ew_k, grid1((size_t)p->n, 256), 256, 0, c->stream, fpw(y), fp(a), fp(b), fp(cb), fp(e), *p);
@@ -2205,6 +2209,7 @@ static int cc_attn_w(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
 
 static int cc_muse(void) { return 1; }   /* the norm's PRESCALE, ew's SIGMUL and RESGATE */
 static int cc_kv16(void) { return 1; }   /* ew's F16 */
+static int cc_lfm3(void) { return 1; }   /* dnconv's order 2, ew's HEADGATE */
 static int cc_pick(CcBuf *logits, CcBuf *out, int n) {
     CcCtx *c = live();
     if (!c || !logits || !out || n < 1 || (size_t)n * 4 > logits->bytes || out->bytes < 8) return 0;
@@ -2585,5 +2590,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_attn_wh,
     cc_copy_regions_h,
     cc_enc_norm, cc_enc_bias, cc_enc_geglu, cc_enc_rope, cc_enc_addrow, cc_enc_attn, cc_enc_rel,
+    cc_lfm3,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

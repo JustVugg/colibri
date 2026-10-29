@@ -22,7 +22,7 @@ serve`, `coli web` and the planner treat it like any other.
 Supported architectures: qwen35moe (Qwen3.5 / Qwen3.6 MoE -> qwen36 engine), qwen35 (their
 dense models -> qwen36 engine), qwen3moe (Qwen3 MoE, Qwen3-Coder -> qwen36 engine), qwen3 (the dense
 Qwen3 -> qwen36 engine), flint (Flint -> qwen36 engine), muse-spark (Muse Spark Open -> qwen36
-engine), qwen4exp (Qwen3.8-Flash-Next -> qwen38 engine), deepseek4 (DeepSeek V4
+engine), lfm3 (LFM3-VL's text model -> qwen36 engine), qwen4exp (Qwen3.8-Flash-Next -> qwen38 engine), deepseek4 (DeepSeek V4
 Flash -> deepseek_v4 engine), inkling (Inkling -> inkling engine), glm5-next (GLM-5.3-Flash ->
 glm53 engine), glm-dsa (GLM-5.2 / GLM-5.3 -> colibri engine), mimo2 (MiMo-V2.6 -> mimo engine),
 deepseek41 (DeepSeek V4.1 Flash, files with the config whole and the published K-quant and IQ ones ->
@@ -318,6 +318,49 @@ def muse_config(meta, tensors, overrides=None):
         "layer_rope_theta": [theta if s_ else 0 for s_ in sliding],
         "output_multiplier": float(need("logit_scale")),
         "final_logit_softcapping": float(meta.get(p + "final_logit_softcapping", 0.0)),
+        "tie_word_embeddings": "output.weight" not in tensors,
+        "hidden_act": "silu",
+    }
+    return cfg, layers
+
+
+def lfm3_config(meta, tensors, overrides=None):
+    """LFM3 (the GGUF arch lfm3: LiquidAI/LFM3-VL's text model) as the qwen36 engine's config.json,
+    in the checkpoint's text_config form. The engine reads everything from the GGUF; this is what
+    coli's planner, doctor and gateway read (the layer kinds, the window, the conv's taps)."""
+    p = "lfm3."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    layers = int(need("block_count"))
+    emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
+    kv = need("attention.head_count_kv")
+    kv = list(kv) if isinstance(kv, (list, tuple)) else [int(kv)] * layers
+    sliding = list(need("attention.sliding_window_pattern"))
+    if len(kv) != layers or len(sliding) != layers:
+        sys.exit(f"GGUF {p}attention patterns: {len(kv)} and {len(sliding)} entries for {layers} layers")
+    kinds = ["conv" if not int(kv[i]) else "sliding_attention" if sliding[i] else "full_attention" for i in range(layers)]
+    heads = int(need("attention.head_count"))
+    head_dim = int(meta.get(p + "attention.key_length", int(need("embedding_length")) // heads))
+    cfg = {
+        "model_type": "lfm3",
+        "architectures": ["Lfm3ForCausalLM"],
+        "hidden_size": int(need("embedding_length")),
+        "num_hidden_layers": layers,
+        "num_attention_heads": heads,
+        "num_key_value_heads": max(int(v) for v in kv),
+        "head_dim": head_dim,
+        "intermediate_size": int(need("feed_forward_length")),
+        "vocab_size": int(emb["dims"][1]),
+        "norm_eps": float(meta.get(p + "attention.layer_norm_rms_epsilon", 1e-5)),
+        "rms_norm_eps": float(meta.get(p + "attention.layer_norm_rms_epsilon", 1e-5)),
+        "max_position_embeddings": int(meta.get(p + "context_length", 128000)),
+        "conv_L_cache": int(need("shortconv.l_cache")),
+        "sliding_window": int(need("attention.sliding_window")),
+        "layer_types": kinds,
+        # the full layers' partial rotation is in the file's rope_freqs, which the engine reads
+        "rope_parameters": {
+            "full_attention": {"rope_type": "default", "rope_theta": float(meta.get(p + "rope.freq_base", 1000000.0))},
+            "sliding_attention": {"rope_type": "default", "rope_theta": float(meta.get(p + "rope.freq_base_swa", 10000.0))}},
+        "use_sandwich_norm": True,
         "tie_word_embeddings": "output.weight" not in tensors,
         "hidden_act": "silu",
     }
@@ -984,7 +1027,7 @@ def qwen4exp_config(meta, tensors, overrides=None):
 
 
 COPY_UNREAD = {"qwen4exp"}   # their engine does not read the colibri container (copy mode)
-ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "flint": flint_config, "muse-spark": muse_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "mistral-large4": mistral_large4_config, "mimo2": mimo2_config, "deepseek41": deepseek41_config, "kimi-k3": kimik3_config, "olmoe": olmoe_config, "qwen4exp": qwen4exp_config}
+ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "flint": flint_config, "muse-spark": muse_config, "lfm3": lfm3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "mistral-large4": mistral_large4_config, "mimo2": mimo2_config, "deepseek41": deepseek41_config, "kimi-k3": kimik3_config, "olmoe": olmoe_config, "qwen4exp": qwen4exp_config}
 
 # unsloth ships Qwen3.8-Flash-Next's MTP head apart, in an MTP/ folder of the repository:
 # shared-* borrow token_embd and output from the model (the engine always does), the
@@ -1124,12 +1167,12 @@ FLINT_SPLITS = ["\\p{N}{1,3}", "[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+",
 TEKKEN_NUM3_SPLITS = [r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|"
                       r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|"
                       r"\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))|\p{N}{1,2}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"]
-PRE_SPLITS = {"glm4": CL100K_SPLITS, "tekken-num3": TEKKEN_NUM3_SPLITS, "flint": FLINT_SPLITS, "kimi-k2": KIMI_SPLITS, "deepseek-v3": DEEPSEEK_SPLITS, "joyai-llm": DEEPSEEK_SPLITS,
+PRE_SPLITS = {"glm4": CL100K_SPLITS, "lfm2": CL100K_SPLITS, "tekken-num3": TEKKEN_NUM3_SPLITS, "flint": FLINT_SPLITS, "kimi-k2": KIMI_SPLITS, "deepseek-v3": DEEPSEEK_SPLITS, "joyai-llm": DEEPSEEK_SPLITS,
               "hunyuan-dense": DEEPSEEK_SPLITS, "hy_v4": DEEPSEEK_SPLITS,
               "inkling": O200K_SPLITS, "gpt-4o": O200K_SPLITS}
 # BPE options of the tokenizer.json a family ships (the GGUF does not carry them)
 PRE_MODEL = {"inkling": {"ignore_merges": True}, "gpt-4o": {"ignore_merges": True}, "glm4": {"ignore_merges": True},
-             "tekken-num3": {"ignore_merges": True}}
+             "lfm2": {"ignore_merges": True}, "tekken-num3": {"ignore_merges": True}}
 
 
 def pre_tokenizer(pre):

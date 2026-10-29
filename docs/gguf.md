@@ -24,6 +24,7 @@ colibri runs the GGUF files people already have on disk. The ggml blocks are com
 | `qwen3` | Qwen3 dense | qwen36 |
 | `flint` | Flint (RecursiveSI/flint; [qwen36.md](qwen36.md#flint)) | qwen36 |
 | `muse-spark` | Muse Spark Open, text ([qwen36.md](qwen36.md#muse-spark-open)) | qwen36 |
+| `lfm3` | LFM3-VL, text ([qwen36.md](qwen36.md#lfm3-vl)) | qwen36 |
 | `qwen4exp` | Qwen3.8-Flash-Next (and its MTP head) | qwen38 |
 | `deepseek4` | DeepSeek V4 Flash | deepseek_v4 |
 | `deepseek41` | DeepSeek V4.1 Flash (files with e4m3 engram rows, and the published K-quant and IQ files; `dflash`, its DSpark head, with `--mtp`) | deepseek_v41 |

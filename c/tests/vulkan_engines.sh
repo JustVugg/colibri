@@ -1875,6 +1875,26 @@ flint_chain_serve() {
   CHAIN_SERVE_TOL=1e-3 CHAIN_SERVE_SLOTS=3 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_EXPECT='decode steps of several conversations in the chain \([0-9]* rows, [1-9]' \
     $PY tests/vulkan_chain_serve.py ./qwen36 muse_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 KV_SLOTS=3
 }
+# LFM3 (short gated convolutions, attention with a gate per head, a sliding window, every
+# branch normalised): its tiny GGUF's float32 tokens on the chain, the chain on a partial
+# fit, and serve mode against the CPU frame for frame (pins, reused prefixes, prompts on
+# the device and decode on the CPU, a ring, the KV cache in float16, two conversations).
+lfm3_chain_serve() {
+  rm -rf lfm3_tiny
+  $PY tools/make_lfm3_tiny.py --out lfm3_tiny --emit-ref lfm3_tiny/ref.json > /dev/null
+  COLI_VULKAN=1 SNAP=lfm3_tiny/model.gguf ./qwen36 16 8 lfm3_tiny/ref.json > vk.log 2>&1
+  grep -qE 'Matching tokens: ([0-9]+)/\1$' vk.log || { cat vk.log; fail "lfm3: oracle on the chain"; }
+  COLI_VULKAN=1 COLI_VK_CHAIN_LAYERS=3 SNAP=lfm3_tiny/model.gguf ./qwen36 16 8 lfm3_tiny/ref.json > vk.log 2>&1
+  grep -qE 'Matching tokens: ([0-9]+)/\1$' vk.log || { cat vk.log; fail "lfm3: oracle on a partial chain"; }
+  $PY -c "import sys; sys.path.insert(0, 'tests'); from prefix_serve_harness import ensure_byte_tokenizer as t; from pathlib import Path; t(Path('lfm3_tiny'))"
+  printf '{"format": "colibri-gguf-v1", "gguf": "%s/lfm3_tiny/model.gguf", "mode": "link", "arch": "lfm3", "parts": 1}\n' "$PWD" > lfm3_tiny/gguf.json
+  CHAIN_SERVE_CONTINUE=1 $PY tests/vulkan_chain_serve.py ./qwen36 lfm3_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0
+  COLI_VK_CHAIN=2 CHAIN_SERVE_CONTINUE=1 $PY tests/vulkan_chain_serve.py ./qwen36 lfm3_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0
+  CHAIN_SERVE_CONTINUE=1 CHAIN_SERVE_EXPECT='keep a ring of 14 rows' $PY tests/vulkan_chain_serve.py ./qwen36 lfm3_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 Q36_KV_RING_SPARE=9
+  CHAIN_SERVE_KV16=1 CHAIN_SERVE_CONTINUE=1 $PY tests/vulkan_chain_serve.py ./qwen36 lfm3_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0
+  CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_EXPECT='decode steps of several conversations in the chain \([0-9]* rows, [1-9]' \
+    $PY tests/vulkan_chain_serve.py ./qwen36 lfm3_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 KV_SLOTS=2
+}
 family_qwen_chain() {
   make qwen36 qwen38 tests/test_vk_chain VK=1
   ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
@@ -1972,6 +1992,7 @@ family_qwen_chain() {
   COLI_VK_CHAIN=2 $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0
   qwen36_gguf_chain_gates
   flint_chain_serve
+  lfm3_chain_serve
 
   # qwen38: every resident format, prefill batching, every expert form, MTP
   $PY tools/make_qwen38_tiny.py --out qwen38_tiny
