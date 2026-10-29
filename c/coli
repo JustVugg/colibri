@@ -2157,16 +2157,21 @@ def chat_attached(a, base, model_id):
         print(f"\n  {C.teal}◆ colibri{C.r}")
         sp=Spinner("thinking…"); sp.start()
         md=MDStream("  "); reply=[]; first=True; t0=time.time(); interrupted=False; think_open=False
-        exact_tokens=None; finish=None
+        exact_tokens=None; finish=None; stream_done=False; stream_error=None
         try:
             with urllib.request.urlopen(req) as r:
                 for raw in r:
                     line=raw.decode("utf-8","replace").strip()
                     if not line.startswith("data: "): continue
                     data=line[6:]
-                    if data=="[DONE]": break
+                    if data=="[DONE]":
+                        stream_done=True; break
                     try: ev=json.loads(data)
                     except ValueError: continue
+                    if ev.get("error"):
+                        error=ev["error"]
+                        stream_error=error.get("message", "generation failed") if isinstance(error,dict) else str(error)
+                        break
                     usage=ev.get("usage")
                     if isinstance(usage,dict) and isinstance(usage.get("completion_tokens"),int):
                         exact_tokens=usage["completion_tokens"]
@@ -2230,6 +2235,10 @@ def chat_attached(a, base, model_id):
             think_open=False                      # risposta solo-reasoning): chiudi il riquadro
             sys.stdout.write(f"{C.r}\n  {C.dgray}\u2514\u2500{C.r}\n")
         md.close(); sp.stop()
+        if stream_error:
+            print(f"  {C.yel}[the server ended the response: {stream_error}]{C.r}")
+        elif not interrupted and not stream_done and finish is None:
+            print(f"  {C.yel}[stream closed before the response finished]{C.r}")
         if reply: msgs.append({"role":"assistant","content":"".join(reply)})
         else: msgs.pop()                              # turno vuoto: non sporcare la history
         el=time.time()-t0
