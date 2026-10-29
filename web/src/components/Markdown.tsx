@@ -27,12 +27,19 @@ type Segment = { kind: "code"; lang: string; body: string } | { kind: "text"; bo
 /** Split on fenced blocks first: everything inside a fence is literal. */
 function segments(source: string): Segment[] {
   const out: Segment[] = []
-  const fence = /```([^\n`]*)\n?([\s\S]*?)(?:```|$)/g
+  // Fences start on a line. A closing run must be at least as long as the
+  // opener and have nothing but whitespace after it; shorter runs are code.
+  const fence = /^ {0,3}(`{3,})([^`\n]*)\n/gm
   let last = 0
   for (let match = fence.exec(source); match; match = fence.exec(source)) {
     if (match.index > last) out.push({ kind: "text", body: source.slice(last, match.index) })
-    out.push({ kind: "code", lang: match[1].trim(), body: match[2].replace(/\n$/, "") })
-    last = fence.lastIndex
+    const close = new RegExp("^ {0,3}`{" + match[1].length + ",}[ \\t]*(?:\\n|$)", "gm")
+    close.lastIndex = fence.lastIndex
+    const end = close.exec(source)
+    const body = source.slice(fence.lastIndex, end?.index ?? source.length).replace(/\n$/, "")
+    out.push({ kind: "code", lang: match[2].trim(), body })
+    last = end ? close.lastIndex : source.length
+    fence.lastIndex = last
   }
   if (last < source.length) out.push({ kind: "text", body: source.slice(last) })
   return out
