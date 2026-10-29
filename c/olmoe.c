@@ -3146,16 +3146,18 @@ static void serve_loop(Model *m, Tok *T, int ctx_cap) {
 static int *read_int_array(jval *o, const char *key, int *n_out) {
     jval *a = json_get(o, key);
     if (!a || a->t != J_ARR) { fprintf(stderr, "ref.json: missing array \"%s\"\n", key); exit(1); }
-    if (a->len < 1 || (uint64_t)a->len > SIZE_MAX / sizeof(int)) {
+    if ((uint64_t)a->len > SIZE_MAX / sizeof(int)) {
         fprintf(stderr, "ref.json: invalid array length for \"%s\"\n", key); exit(1);
     }
-    int *r = malloc((size_t)a->len * sizeof(int));
+    /* lengths and id ranges are ref_fits()'s, once the vocabulary is known: here only
+     * what the cast to int needs */
+    int *r = malloc((size_t)(a->len ? a->len : 1) * sizeof(int));
     if (!r) { fprintf(stderr, "ref.json: OOM reading \"%s\"\n", key); exit(1); }
     for (int i = 0; i < a->len; i++) {
         jval *v = a->kids[i];
-        if (!v || v->t != J_NUM || !isfinite(v->num) || v->num < 0 ||
+        if (!v || v->t != J_NUM || !isfinite(v->num) || v->num < INT_MIN ||
             v->num > INT_MAX || floor(v->num) != v->num) {
-            fprintf(stderr, "ref.json: %s[%d] must be a non-negative integer\n", key, i);
+            fprintf(stderr, "ref.json: %s[%d] is not an integer\n", key, i);
             exit(1);
         }
         r[i] = (int)v->num;
