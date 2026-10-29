@@ -30,6 +30,7 @@ colibri runs the GGUF files people already have on disk. The ggml blocks are com
 | `inkling` | Inkling | inkling |
 | `glm5-next` | GLM-5.3-Flash | glm53 |
 | `glm-dsa` | GLM-5.2, GLM-5.3 | colibri |
+| `mistral-large4` | Mistral-Large-4 ([mistral-large4.md](mistral-large4.md)) | colibri |
 | `mimo2` | MiMo-V2.6 | mimo |
 | `olmoe` | OLMoE | olmoe |
 | `kimi-k3` | Kimi K3 | kimi_k3 |
