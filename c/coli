@@ -2183,9 +2183,7 @@ def chat_attached(a, base, model_id):
                         if ch.get("finish_reason"): finish=ch["finish_reason"]
                         d=ch.get("delta",{})
                         rtxt=d.get("reasoning_content")
-                        if rtxt and os.environ.get("COLI_SHOW_THINK","1")=="0":
-                            continue              # thinking nascosto: lo spinner resta a girare
-                        if rtxt:
+                        if rtxt and os.environ.get("COLI_SHOW_THINK","1")!="0":
                             # Thinking arrives as its own delta field, and this loop
                             # used to drop it on the floor: `coli run` streamed the
                             # model's reasoning while `coli chat` silently hid it
@@ -2199,7 +2197,7 @@ def chat_attached(a, base, model_id):
                                 think_open=True
                                 sys.stdout.write(f"  {C.dgray}┌ thinking{C.r}\n  {C.dgray}│{C.r} ")
                             sys.stdout.write(C.dim+rtxt.replace("\n","\n  "+C.dgray+"│"+C.r+" "+C.dim)+C.r)
-                            sys.stdout.flush(); continue
+                            sys.stdout.flush()
                         txt=d.get("content")
                         if not txt: continue          # ping/ruolo: non è testo
                         if think_open:
