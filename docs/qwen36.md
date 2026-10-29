@@ -712,7 +712,7 @@ text model, from the published GGUFs ([LiquidAI/LFM3-VL-2B-GGUF](https://hugging
 BF16, F16, Q8_0, Q6_K, Q5_K_M, Q4_K_M, QAD-Q4_0) or from the checkpoint converted to
 this engine's container (`tools/convert_qwen36.py`, the dense trunk then in int8, or
 in int4 per 64 with `COLI_DENSE_BITS=4`). Its license is the LFM Open License v1.0
-(LICENSE in the repositories). The vision tower is not run yet: a picture gets a 400.
+(LICENSE in the repositories). Pictures too: see [LFM3-VL's vision tower](#lfm3-vls-vision-tower).
 
 24 layers, hidden 2048, a SwiGLU MLP of 7680 in every one. 13 are short gated
 convolutions, 11 attention (16 query heads of 128 over 4 KV heads), 5 of them over
@@ -777,6 +777,38 @@ frame the CPU's, with pins, reused prefixes, prompts on the device and decode on
 CPU, and two conversations at once (`tests/vulkan_engines.sh`). With Q8_0 matrices
 `--act f32` writes the GPUs' reference (they read the matrices' inputs as floats,
 the CPU as int8); the CUDA chain takes a GGUF's blocks, not F32 matrices.
+
+### LFM3-VL's vision tower
+
+The engine runs LFM3-VL's tower and projector (`lfm3_vision.h`, transcribed from the
+release's `modeling_lfm3_vl.py`): 14 layers of width 1024, 8 of them gated 2D
+convolutions (in_proj to B, C and x, C times a depthwise 3 x 3 convolution of B * x
+over the patch grid, out_proj) and 6 bidirectional attention layers (16 query heads
+over 8 KV heads, an RMSNorm on every q and k head, an axial RoPE: half the
+frequencies on the row, half on the column), a SwiGLU MLP of 2560 in each; then the
+projector puts the four tokens of every 2 x 2 block side by side (a LayerNorm first),
+4096 to 4096 with GELU, to the model's 2048. The gateway cuts a picture as the
+release's processor does (patches of 16, two frames of a still picture, merge 2,
+mean and std 0.5) and writes `<|vision_start|>`, one `<|image|>` a merged block,
+`<|vision_end|>`; the text keeps its own positions around them.
+
+The tower comes from the GGUF's `mmproj-LFM3-VL-2B-BF16.gguf` (`coli import` links one
+it finds next to the model, `--mmproj` names one, `--no-mmproj` leaves it out;
+`Q36_MMPROJ` over gguf.json's) or from the converted checkpoint (`tools/convert_qwen36.py`
+copies it in bf16, `qwen36_meta.json` gets its shape). It runs on the CPU in float32,
+whichever device runs the text model: on an RTX PRO 4000 machine's 14 cores a 512 x 384
+picture (192 tokens) takes 0.67 s, a 1024 x 1024 one (1024 tokens) 5.9 s. A picture is
+held to 1024 tokens (`LFM3_MAX_IMAGE_TOKENS`; the processor's own window reaches 16384):
+the attention is quadratic in its patches, and a picture past the ceiling is shrunk,
+not cropped.
+
+Checked against a float32 transcription of the release's code on a real picture: the
+rows within 1.4e-4 of their RMS from the mmproj and from the converted checkpoint
+(5.6e-4 at 1024 tokens, the softmax summed in another order), and LFM3-VL-2B Q4_K_M
+describes a test picture of a red circle, a blue square and a green triangle by their
+colours and places on the CPU, the CUDA chain and the Vulkan chain alike.
+`tools/make_lfm3_tiny.py --vision` writes a tiny tower as an mmproj and the rows it gives
+for a picture; CI checks the engine's rows within 1e-4 and the continuation they lead to.
 
 ### The converter's tensor contract
 

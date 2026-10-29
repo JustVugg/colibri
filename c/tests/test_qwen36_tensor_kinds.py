@@ -212,17 +212,16 @@ class TensorKindsTest(unittest.TestCase):
 
     def test_lfm3_names_are_placed(self):
         # LiquidAI/LFM3-VL-2B's index: the text model under language_model, its final norm named
-        # embedding_norm, the vision tower and projector skipped by name
+        # embedding_norm, the vision tower and projector kept under their own names
         p = "model.language_model."
         self.assertEqual(resolve_prefix([p + "layers.0.conv.conv.weight"]), p)
         for kind in LFM3_KINDS:
             self.assertEqual(classify(f"{p}layers.3.{kind}", p), ("layer", 3, kind))
         self.assertEqual(classify(p + "embedding_norm.weight", p), ("global", "embedding_norm.weight"))
         self.assertEqual(classify(p + "embed_tokens.weight", p), ("global", "embed_tokens.weight"))
-        for name, group in (("model.vision_tower.layers.0.conv.in_proj.weight", "lfm3_vision"),
-                            ("model.multi_modal_projector.linear_1.weight", "lfm3_projector")):
-            self.assertEqual(classify(name, p), ("skip", group))
-            self.assertTrue(skip_reason(group))
+        for name in ("model.vision_tower.layers.0.conv.in_proj.weight", "model.vision_tower.patchifier.weight",
+                     "model.multi_modal_projector.linear_1.weight"):
+            self.assertEqual(classify(name, p), ("lfm3_vision", name))
 
     def test_every_2p4t_tensor_is_placed(self):
         prefix, placed = self._classify_all(_concrete(QWEN38_2P4T))
