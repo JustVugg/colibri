@@ -13,7 +13,7 @@
  *     post-attention RMSNorm and the router logits. Then the frame is waited for.
  *   host: the router's softmax and top-k, the routed experts (the expert tier's device
  *     batch and the CPU's share, joined in rank order: moe_routed, the code moe()
- *     runs), the K/V rows copied into the host cache; with PILOT, the prefetch of the
+ *     runs), the K/V rows copied into the host cache (not with dev_kv, below); with PILOT, the prefetch of the
  *     next layers' experts from the residual rows, as the CPU path does it (S <= 8:
  *     the rows after attention come down with the frame, the rows after the MoE are
  *     those plus the routed sum, the same float add the device makes).
@@ -22,21 +22,28 @@
  * logits (E a row) and the K/V rows down, the routed sum (D a row) up. The last frame
  * normalizes the last row and runs lm_head; its logits come back.
  *
- * State: OLMoE is attention only. The host's KV cache stays canonical (every chain
- * step copies its new rows back); the device holds a mirror per layer with a watermark,
- * kv_valid: rows [0, kv_valid) equal the host's. A step from pos_base uploads the rows
- * [kv_valid, pos_base) first; a CPU step lowers the watermark to its pos_base; a host
- * cache allocated anew (generate, a larger max_t) is mirrored again. Prompt-cache and
+ * State: OLMoE is attention only. The device holds a mirror of the host's cache per layer
+ * with a watermark, kv_valid: rows [0, kv_valid) are the step's own. Where the mirror holds
+ * the whole context, the device's cache is the one that counts (dev_kv): a step's K/V rows
+ * stay on the device, and the host's cache holds the device's rows only up to host_kv. The
+ * host's catches up when the CPU needs it: a step the chain declines first reads the rows
+ * [host_kv, pos_base) down (olc_sync), and a device lost mid-step rebuilds them on the CPU
+ * from the token ids every step recorded (olc_recover). COLI_VK_CHAIN_DEVKV=0 keeps the host's
+ * cache canonical instead, every step's rows copied back. A step from pos_base uploads the
+ * host's rows [kv_valid, pos_base) first; a CPU step lowers the watermark to its pos_base; a
+ * host cache allocated anew (generate, a larger max_t) is mirrored again. Prompt-cache and
  * prefix reuse need nothing more: a reused prefix is rows below the watermark.
  * Past the device's budget (vk_kvsplit.h) each layer keeps a window of the newest
  * blocks on the device; the attention runs there and on the CPU over the older
- * positions (the host's cache) at once, merged through the softmax statistics.
+ * positions (the host's cache) at once, merged through the softmax statistics. There the
+ * host's cache stays canonical.
  *
  * The chain declines (the per-matrix path runs, the watermark lowered) for a geometry
- * outside chain_attn.comp (head dim above 256 or odd). A device lost mid-step costs
- * nothing to rebuild: the KV rows below pos_base are the host's, so the CPU redoes the
- * step from the embedding rows (which the chain never overwrites) and runs from there.
- * COLI_VK_CHAIN_FAULT=n (vk_chain.c) fakes the loss at the n-th frame, for tests.
+ * outside chain_attn.comp (head dim above 256 or odd). A device lost mid-step: the KV
+ * rows below pos_base are the host's (rebuilt first where only the device held them), so
+ * the CPU redoes the step from the embedding rows (which the chain never overwrites) and
+ * runs from there. COLI_VK_CHAIN_FAULT=n (vk_chain.c) fakes the loss at the n-th frame,
+ * for tests.
  *
  * A partial chain (vk_chain.h, vkc_fit; docs/vulkan.md, "A partial chain"): when the
  * layers do not all fit the device, the chain takes layers 0..N-1 and the CPU the rest
@@ -51,7 +58,7 @@
  * after layer N-1 back, and the caller runs layers N..L-1 and the head on the CPU over
  * all the rows. The device's layers mirror their K/V rows behind their watermarks, the
  * CPU's keep theirs on the host only; a lost device redoes the step on the CPU as
- * before (nothing to rebuild, and the CPU's layers have not run that step yet). */
+ * before (the device's rows rebuilt first, and the CPU's layers have not run that step yet). */
 #include "vk_chain.h"
 #include "vk_kvsplit.h"
 #include "vk_dmoe.h"
@@ -86,6 +93,10 @@ typedef struct {
     VkcBuf *kvl;                               /* their layers' K/V rows, down at the frame's end */
     int kvl_rows;                              /* kvl's rows a layer: a decode step's, or a prompt chunk's */
     int kvh, kvh_set;                          /* the mirrors in float16 (olc_kvh_want), decided at the first */
+    int dev_kv;                                /* the device's KV counts: no step brings its rows down (olc_sync) */
+    int host_kv;                               /* with dev_kv: the host's cache holds the device's rows below this */
+    int *fed;                                  /* [cap]: the token id each position was built from (olc_recover) */
+    int dk_said;                               /* the dev_kv line printed */
 } OlmChain;
 
 
@@ -375,7 +386,7 @@ static int olc_chunk_rows(OlmChain *ch, Model *m) {
     g_olc_count = -1;
     size_t row = (size_t)(b2 - b1) + (size_t)(2 * m->c.topk + 2) * m->c.hidden * sizeof(float);
     if (ch->ks.on) row += (long long)m->c.n_heads * (4 * m->c.head_dim + 6) * sizeof(float);
-    if (!ch->d) row += (size_t)ch->n * 2 * m->c.hidden * sizeof(float);
+    if (!ch->d && !ch->dev_kv) row += (size_t)ch->n * 2 * m->c.hidden * sizeof(float);   /* kvl */
     return vkc_chunk_rows(olc_name(ch), row);
 }
 /* the scratch buffers for `rows` rows */
@@ -386,7 +397,8 @@ static int olc_bufs(OlmChain *ch, Model *m, int rows) {
              olc_res(&ch->q, r * D, VKC_DEV) && olc_res(&ch->k, r * D, VKC_DEV) && olc_res(&ch->v, r * D, VKC_DEV) &&
              olc_res(&ch->ctx, r * D, VKC_DEV) && olc_res(&ch->h2, r * D, VKC_DEV) && olc_res(&ch->lg, r * E, VKC_DEV) &&
              olc_res(&ch->fin, D, VKC_DEV) &&
-             olc_res(&ch->h2d, r * D, VKC_DOWN) && olc_res(&ch->lgd, r * E, VKC_DOWN) && olc_res(&ch->kvd, 2 * r * D, VKC_DOWN) &&
+             olc_res(&ch->h2d, r * D, VKC_DOWN) && olc_res(&ch->lgd, r * E, VKC_DOWN) &&
+             (ch->dev_kv || olc_res(&ch->kvd, 2 * r * D, VKC_DOWN)) &&
              olc_res(&ch->outd, c->vocab, VKC_DOWN) && olc_res(&ch->routed, r * D, VKC_UP) && olc_res(&ch->cs, r * hd, VKC_UP);
 }
 /* The mirrors in float16 where the host's cache holds float16's values (olm_kv16) and the
@@ -416,6 +428,12 @@ static inline void olc_kv_row(const OlmChain *ch, float *dst, const float *src, 
     memcpy(dst, src, hd * sizeof(float));
     if (ch->kvh) kv16_round(dst, hd);
 }
+/* COLI_VK_CHAIN_DEVKV=0: the host's cache stays canonical, every step's K/V rows copied back */
+static int olc_devkv_want(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_CHAIN_DEVKV"); on = !(e && *e == '0'); }
+    return on;
+}
 /* Plan and allocate the KV mirror before sizing a prompt chunk. */
 static int olc_mirror(OlmChain *ch, Model *m) {
     Cfg *c = &m->c; int H = c->n_heads, hd = c->head_dim;
@@ -434,6 +452,13 @@ static int olc_mirror(OlmChain *ch, Model *m) {
         }
         if (!plan) { ch->cap = 0; ch->hostK = NULL; return 0; }
         ch->dev_rows = ch->ks.on ? ch->ks.rows : m->max_t;
+        /* the device's cache counts where it holds the whole context; the split's CPU part reads
+         * the host's older rows, so there the host's stays canonical */
+        int dk = !ch->ks.on && olc_devkv_want();
+        int *fd = dk ? realloc(ch->fed, (size_t)m->max_t * sizeof(int)) : NULL;
+        if (fd) ch->fed = fd;
+        if (dk && !fd) dk = 0;
+        ch->dev_kv = 0; ch->host_kv = 0;   /* set below once the mirror is whole */
         for (int i = ch->lo; i < ch->lo + ch->n; i++) {
             vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); ch->kc[i] = ch->vc[i] = NULL;
             ch->kv_valid[i] = 0;
@@ -442,6 +467,12 @@ static int olc_mirror(OlmChain *ch, Model *m) {
             if (!ch->kc[i] || !ch->vc[i]) { ch->cap = 0; ch->hostK = NULL; return 0; }
         }
         ch->cap = m->max_t; ch->hostK = m->K;
+        if (dk && !ch->dk_said) {
+            fprintf(stderr, "[VK] %s chain: the device's KV cache counts: no step brings its rows down, the host's "
+                            "catches up when the CPU needs it (COLI_VK_CHAIN_DEVKV=0 copies them back)\n", olc_name(ch));
+            ch->dk_said = 1;
+        }
+        ch->dev_kv = dk;
     }
     return 1;
 }
@@ -472,6 +503,84 @@ static void olc_cpu_one(OlmChain *ch, int pos_base) {
 static void olc_cpu_step(Model *m, int pos_base) {
     for (int d = 0; d < 2; d++) olc_cpu_one(olc_of(m, d), pos_base);
 }
+/* Every step's token ids, whoever runs it: olc_recover rebuilds the host's rows from them */
+static void olc_fed(Model *m, const int *ids, int pos_base, int S) {
+    for (int d = 0; d < 2; d++) {
+        OlmChain *ch = olc_of(m, d);
+        if (ch && ch->dev_kv && ch->fed && pos_base >= 0 && pos_base + S <= ch->cap) memcpy(ch->fed + pos_base, ids, (size_t)S * sizeof(int));
+    }
+}
+/* The host's cache up to pos_base from the device's rows, for the CPU (a step the chain
+ * declines, the device alive): the chain's layers' rows [host_kv, pos_base) read down, a
+ * frame a layer and up to 32 MiB of rows. 1: the host's cache holds them (or nothing was
+ * missing); 0: they could not be read. */
+static int olc_sync(OlmChain *ch, Model *m, int pos_base) {
+    if (!ch || !ch->dev_kv || !ch->cap) return 1;
+    Cfg *c = &m->c; int H = c->n_heads, hd = c->head_dim;
+    int t1 = pos_base;
+    for (int i = ch->lo; i < ch->lo + ch->n; i++) if (ch->kv_valid[i] < t1) t1 = ch->kv_valid[i];
+    if (ch->host_kv >= t1) return 1;
+    size_t es = ch->kvh ? sizeof(uint16_t) : sizeof(float), per = (size_t)32 << 20;
+    int P = (int)(per / (2 * (size_t)H * hd * es)); if (P < 1) P = 1;
+    int was = vkc_device(ch->d), ok = vkc_ready();
+    VkcBuf *dn = NULL;
+    for (int t0 = ch->host_kv; t0 < t1 && ok; t0 += P) {
+        int rn = t1 - t0 < P ? t1 - t0 : P;
+        size_t cnt = (size_t)rn * hd, f = ch->kvh ? cnt / 2 : cnt;   /* a head's rows, in floats of the buffers */
+        ok = olc_res(&dn, 2 * (size_t)H * f, VKC_DOWN);
+        for (int i = ch->lo; i < ch->lo + ch->n && ok; i++) {
+            ok = vkc_begin();
+            for (int h = 0; h < H && ok; h++) {
+                size_t off = ((size_t)h * ch->dev_rows + t0) * hd, at = ch->kvh ? off / 2 : off;
+                ok = vkc_copy(dn, (size_t)h * f, ch->kc[i], at, f) && vkc_copy(dn, ((size_t)H + h) * f, ch->vc[i], at, f);
+            }
+            ok = ok && vkc_submit(1);
+            for (int h = 0; h < H && ok; h++) {
+                size_t hoff = ((size_t)h * m->max_t + t0) * hd;
+                const char *k = (const char *)vkc_ptr(dn) + (size_t)h * f * 4, *v = (const char *)vkc_ptr(dn) + ((size_t)H + h) * f * 4;
+                if (ch->kvh) { kv16_unpack(m->K[i] + hoff, (const uint16_t *)k, (int64_t)cnt); kv16_unpack(m->V[i] + hoff, (const uint16_t *)v, (int64_t)cnt); }
+                else { memcpy(m->K[i] + hoff, k, cnt * sizeof(float)); memcpy(m->V[i] + hoff, v, cnt * sizeof(float)); }
+            }
+        }
+        if (ok) ch->host_kv = t0 + rn;
+    }
+    vkc_free(dn);
+    vkc_device(was);
+    return ok;
+}
+/* The host's cache below pos_base rebuilt on the CPU (a device lost with its rows): the token
+ * ids of the positions from the lowest host_kv run through every layer again (the rows below
+ * it are the host's already). */
+static void olc_recover(Model *m, int pos_base) {
+    OlmChain *ch = NULL; int t0 = pos_base;
+    for (int d = 0; d < 2; d++) {
+        OlmChain *c2 = olc_of(m, d);
+        if (c2 && c2->dev_kv && c2->fed && c2->host_kv < t0) { t0 = c2->host_kv; ch = c2; }
+    }
+    if (!ch) return;
+    Cfg *c = &m->c; int D = c->hidden, n = pos_base - t0;
+    fprintf(stderr, "[VK] olmoe chain: rebuilding the KV of positions %d..%d on the CPU\n", t0, pos_base - 1);
+    float *x = falloc((int64_t)n * D);
+    for (int s = 0; s < n; s++) olm_embed_row(m, ch->fed[t0 + s], x + (int64_t)s * D);
+    layers_forward_range(m, x, n, t0, 0, c->n_layers, 0);
+    free(x);
+    for (int d = 0; d < 2; d++) { OlmChain *c2 = olc_of(m, d); if (c2 && c2->dev_kv && c2->host_kv < pos_base) c2->host_kv = pos_base; }
+}
+/* Before the CPU runs a step of S rows from pos_base (the chain declined it, or its device was
+ * lost): the host's cache below pos_base, read down from a live device, else rebuilt on the
+ * CPU; the step then writes the host's rows up to pos_base + S. */
+static void olc_host_kv(Model *m, int pos_base, int S) {
+    int need = 0;
+    for (int d = 0; d < 2; d++) {
+        OlmChain *ch = olc_of(m, d);
+        if (!ch || !ch->dev_kv) continue;
+        int was = vkc_device(ch->d), live = vkc_ready();
+        vkc_device(was);
+        if (!live || !olc_sync(ch, m, pos_base)) need = 1;
+    }
+    if (need) olc_recover(m, pos_base);
+    for (int d = 0; d < 2; d++) { OlmChain *ch = olc_of(m, d); if (ch && ch->dev_kv) ch->host_kv = pos_base + S; }
+}
 /* Record the uploads that make the device cache the host's below pos_base, for a step
  * of n rows (the split places its window). */
 static int olc_push_kv(OlmChain *ch, Model *m, int pos_base, int n_rows) {
@@ -498,7 +607,7 @@ static int olc_push_kv(OlmChain *ch, Model *m, int pos_base, int n_rows) {
 }
 
 /* One layer's attention for n rows from pb: nrm in, the o_proj rows in tmp; the new K
- * rows down into kv at ko, the V rows at ko + kvs. */
+ * rows down into kv at ko, the V rows at ko + kvs (kv NULL: they stay on the device). */
 static int olc_attention(OlmChain *ch, Model *m, Layer *l, int i, int n, int pb, VkcBuf *kv, size_t ko, size_t kvs) {
     Cfg *c = &m->c;
     int D = c->hidden, H = c->n_heads, hd = c->head_dim, half = hd / 2;
@@ -533,7 +642,7 @@ static int olc_attention(OlmChain *ch, Model *m, Layer *l, int i, int n, int pb,
         rg[s * H + h] = (VkcRegion){((size_t)h * ch->dev_rows + pb + s) * hd, (size_t)s * D + (size_t)h * hd, (size_t)hd};
     ok = (ch->kvh ? vkc_copy_regions_h(ch->kc[i], ch->k, rg, n * H) && vkc_copy_regions_h(ch->vc[i], ch->v, rg, n * H)
                   : vkc_copy_regions(ch->kc[i], ch->k, rg, n * H) && vkc_copy_regions(ch->vc[i], ch->v, rg, n * H)) &&
-         vkc_copy(kv, ko, ch->k, 0, (size_t)n * D) && vkc_copy(kv, ko + kvs, ch->v, 0, (size_t)n * D);
+         (!kv || (vkc_copy(kv, ko, ch->k, 0, (size_t)n * D) && vkc_copy(kv, ko + kvs, ch->v, 0, (size_t)n * D)));
     free(rg);
     VkcAttn a = {n, H, H, hd, pb, ch->dev_rows, 0, D, hd, 0, 0, 0, 0, 0, D, 0, 0, 1.f / sqrtf((float)hd), 0, 0};
     return ok && (ch->kvh ? vkc_attn_h(ch->q, ch->kc[i], ch->vc[i], ch->ctx, NULL, NULL, &a)
@@ -558,7 +667,7 @@ static int olc_dmoe(OlmChain *ch, Model *m, int rows) {
     if (ch->d || g_pilot >= 1 || rt_fp ||
         !vkc_dmoe_prepare(&ch->dm, ch->lo, ch->n, c->n_experts, c->topk, c->hidden, c->inter, rows)) return 0;
     int r = rows > VKC_DMOE_ROWS ? rows : VKC_DMOE_ROWS;   /* a prompt chunk's rows through the grouped GEMMs too */
-    if (!vkc_reserve(&ch->kvl, (size_t)ch->n * 2 * r * c->hidden * sizeof(float), VKC_DOWN)) return 0;
+    if (!ch->dev_kv && !vkc_reserve(&ch->kvl, (size_t)ch->n * 2 * r * c->hidden * sizeof(float), VKC_DOWN)) return 0;
     ch->kvl_rows = r;
     return 1;
 }
@@ -569,17 +678,19 @@ static void olc_dmoe_done(OlmChain *ch, Model *m, int from, int to, int n, int p
     /* the K/V rows into the host's cache, every layer's and head's at once: a 3.5K-token
      * prompt's 900 MB went in one thread after the frame while the device waited (the first
      * 3K-token prompt on an RTX PRO 4000: 0.75 -> 0.63 s) */
-    #pragma omp parallel for collapse(2) schedule(static) if ((size_t)n * (to - from) >= 64)
-    for (int i = from; i < to; i++)
-        for (int h = 0; h < H; h++) {
-            if (!vkc_dmoe_on(&ch->dm, i)) continue;
-            const float *kv = (const float *)vkc_ptr(ch->kvl) + (size_t)(i - ch->lo) * 2 * r * D;
-            for (int s = 0; s < n; s++) {
-                size_t dst = ((size_t)h * m->max_t + pb + s) * hd, src = (size_t)s * D + (size_t)h * hd;
-                olc_kv_row(ch, m->K[i] + dst, kv + src, hd);
-                olc_kv_row(ch, m->V[i] + dst, kv + (size_t)r * D + src, hd);
+    if (!ch->dev_kv) {   /* with dev_kv the rows stay on the device */
+        #pragma omp parallel for collapse(2) schedule(static) if ((size_t)n * (to - from) >= 64)
+        for (int i = from; i < to; i++)
+            for (int h = 0; h < H; h++) {
+                if (!vkc_dmoe_on(&ch->dm, i)) continue;
+                const float *kv = (const float *)vkc_ptr(ch->kvl) + (size_t)(i - ch->lo) * 2 * r * D;
+                for (int s = 0; s < n; s++) {
+                    size_t dst = ((size_t)h * m->max_t + pb + s) * hd, src = (size_t)s * D + (size_t)h * hd;
+                    olc_kv_row(ch, m->K[i] + dst, kv + src, hd);
+                    olc_kv_row(ch, m->V[i] + dst, kv + (size_t)r * D + src, hd);
+                }
             }
-        }
+    }
     for (int i = from; i < to; i++) {
         if (!vkc_dmoe_on(&ch->dm, i)) continue;
         const int *ids = vkc_dmoe_ids(&ch->dm, i);
@@ -596,7 +707,7 @@ static void olc_lost(Model *m, int pos_base) {
     g_vk_chain = 0;
     for (int d = 0; d < 2; d++) { OlmChain *ch = olc_of(m, d); if (ch) ch->failed = 1; }   /* both chains off */
     fprintf(stderr, "[VK] olmoe chain: the device was lost; the CPU redoes the step from position %d "
-                    "(the KV rows below it are the host's) and runs from here on\n", pos_base);
+                    "(the KV rows below it the host's, rebuilt where only the device held them) and runs from here on\n", pos_base);
 }
 
 /* Every layer for S rows from host rows xh, the last row's logits into `logit`; xh gets
@@ -607,7 +718,7 @@ static void olc_lost(Model *m, int pos_base) {
 /* One chain's layers (lo..lo+n-1 on its device) from the residual rows in xh. 0: not
  * taken, *lost = 1 when a frame failed (the chains off, the CPU redoes the step), else
  * nothing changed. */
-static int olc_forward_seg(Model *m, OlmChain *ch, float *xh, int S, int pos_base, int want_x, float *logit,
+static int olc_forward_seg(Model *m, OlmChain *ch, const int *ids, float *xh, int S, int pos_base, int want_x, float *logit,
                            int *rows_only, int *lost) {
     *rows_only = 0; *lost = 0;
     Cfg *c = &m->c; int D = c->hidden, L = ch->n, lo = ch->lo, hi = lo + L, E = c->n_experts, H = c->n_heads, hd = c->head_dim;
@@ -626,6 +737,10 @@ static int olc_forward_seg(Model *m, OlmChain *ch, float *xh, int S, int pos_bas
     }
     float *xfin = want_x ? malloc((size_t)S * D * sizeof(float)) : NULL;
     if (want_x && !xfin) return 0;
+    if (ch->dev_kv) {   /* the step rewrites its rows from pos_base on the device only */
+        memcpy(ch->fed + pos_base, ids, (size_t)S * sizeof(int));
+        if (ch->host_kv > pos_base) ch->host_kv = pos_base;
+    }
     int dmoe = olc_dmoe(ch, m, rows);
     vkc_gemm_rows(-1);
     for (int c0 = 0; c0 < S; c0 += rows) {
@@ -651,7 +766,7 @@ static int olc_forward_seg(Model *m, OlmChain *ch, float *xh, int S, int pos_bas
             }
             size_t r2 = dl ? (size_t)ch->kvl_rows : (size_t)ch->rows;   /* a device layer's K/V rows stay until the frame ends */
             ok = ok && olc_norm(ch->x, 0, ch->prm, ch->o_in[i], ch->nrm, 0, n, D, c->eps) &&
-                 olc_attention(ch, m, l, i, n, pb, dl ? ch->kvl : ch->kvd, dl ? (size_t)(i - lo) * 2 * r2 * D : 0, r2 * D) &&
+                 olc_attention(ch, m, l, i, n, pb, ch->dev_kv ? NULL : dl ? ch->kvl : ch->kvd, dl ? (size_t)(i - lo) * 2 * r2 * D : 0, r2 * D) &&
                  vkc_ew(ch->x, ch->x, ch->tmp, NULL, NULL, &add);
             if (ok && pilot && !dl) ok = vkc_copy(ch->xpd, 0, ch->x, 0, (size_t)n * D);
             ok = ok && olc_norm(ch->x, 0, ch->prm, ch->o_post[i], ch->h2, 0, n, D, c->eps) &&
@@ -675,14 +790,16 @@ static int olc_forward_seg(Model *m, OlmChain *ch, float *xh, int S, int pos_bas
             if (!ok) break;
             if (dmoe) olc_dmoe_done(ch, m, from, i, n, pb);
             from = i + 1; prev_dev = 0;
-            const float *kv = (const float *)vkc_ptr(ch->kvd);   /* the rows into the host's cache */
-            #pragma omp parallel for schedule(static) if (n >= 64)
-            for (int h = 0; h < H; h++)
-                for (int s = 0; s < n; s++) {
-                    size_t dst = ((size_t)h * m->max_t + pb + s) * hd, src = (size_t)s * D + (size_t)h * hd;
-                    olc_kv_row(ch, m->K[i] + dst, kv + src, hd);
-                    olc_kv_row(ch, m->V[i] + dst, kv + (size_t)ch->rows * D + src, hd);
-                }
+            if (!ch->dev_kv) {   /* the rows into the host's cache (with dev_kv they stay on the device) */
+                const float *kv = (const float *)vkc_ptr(ch->kvd);
+                #pragma omp parallel for schedule(static) if (n >= 64)
+                for (int h = 0; h < H; h++)
+                    for (int s = 0; s < n; s++) {
+                        size_t dst = ((size_t)h * m->max_t + pb + s) * hd, src = (size_t)s * D + (size_t)h * hd;
+                        olc_kv_row(ch, m->K[i] + dst, kv + src, hd);
+                        olc_kv_row(ch, m->V[i] + dst, kv + (size_t)ch->rows * D + src, hd);
+                    }
+            }
             const float *xa = pilot ? (const float *)vkc_ptr(ch->xpd) : NULL;
             if (pilot && i + 1 < c->n_layers) pilot_prefetch(m, i + 1, xa, n);   /* the model's next layers, wherever they run */
             double t1 = now_s();
@@ -735,7 +852,7 @@ lost:   /* a frame failed: the device is gone (or would not take a command); the
  * layers they ran from layer 0 (the primary's, then the second device's): with layers
  * left, or the head on the CPU, *rows_only is 1, xh holds every row's residual after
  * them, and the caller runs the rest and the head. */
-static int olc_forward(Model *m, float *xh, int S, int pos_base, int want_x, float *logit, int *rows_only) {
+static int olc_forward(Model *m, const int *ids, float *xh, int S, int pos_base, int want_x, float *logit, int *rows_only) {
     *rows_only = 0;
     if (!g_vk_chain) return 0;
     if (g_vk_chain == COLI_VK_CHAIN_PREFILL && S <= 2) return 0;   /* prompts only: decode on the CPU */
@@ -743,13 +860,17 @@ static int olc_forward(Model *m, float *xh, int S, int pos_base, int want_x, flo
     if (!ch || ch->failed) return 0;
     if (ch2 && (!ch2->ok || ch2->failed || ch2->lo != ch->lo + ch->n || ch->head)) ch2 = NULL;
     int lost = 0, ro = 0;
-    int n = olc_forward_seg(m, ch, xh, S, pos_base, ch2 ? 1 : want_x, logit, &ro, &lost);
+    int n = olc_forward_seg(m, ch, ids, xh, S, pos_base, ch2 ? 1 : want_x, logit, &ro, &lost);
     if (!n || !ch2) { *rows_only = ro; return n; }
     vkc_device(1);
-    int n2 = olc_forward_seg(m, ch2, xh, S, pos_base, want_x, logit, &ro, &lost);
+    int n2 = olc_forward_seg(m, ch2, ids, xh, S, pos_base, want_x, logit, &ro, &lost);
     vkc_device(0);
     if (lost) return 0;
-    if (!n2) { olc_cpu_one(ch2, pos_base); *rows_only = 1; return n; }   /* declined: the CPU runs its layers this step */
+    if (!n2) {   /* declined: the CPU runs its layers this step, from the host's cache */
+        if (!olc_sync(ch2, m, pos_base)) { olc_lost(m, pos_base); return 0; }
+        if (ch2->dev_kv) ch2->host_kv = pos_base + S;   /* the CPU writes these rows of its layers */
+        olc_cpu_one(ch2, pos_base); *rows_only = 1; return n;
+    }
     *rows_only = ro;
     return n + n2;
 }

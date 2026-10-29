@@ -2370,6 +2370,7 @@ family_inkling_olmoe_chain() {
   chain_gate olmoe "chain olmoe trunk shared with the per-matrix path" 1 COLI_VK_DENSE=1 SNAP=olmoe_tiny_c -- 8 8 $OR
   chain_gate olmoe "chain olmoe a budget of three experts" 1 COLI_VK_TIER_GB=0.000025 SNAP=olmoe_tiny_c -- 8 8 $OR
   chain_gate olmoe "chain olmoe prefill in chunks of 3" 1 COLI_VK_CHAIN_ROWS=3 SNAP=olmoe_tiny_c -- 8 8 $OR
+  grep -q "the device's KV cache counts" vk.log || { cat vk.log; fail "chain olmoe: the device's KV does not count"; }
   chain_gate olmoe "chain olmoe tiled GEMM" 1 COLI_VK_GEMM_MIN_S=2 SNAP=olmoe_tiny_c -- 8 8 $OR
   chain_gate olmoe "chain olmoe the per-row GEMV" 1 COLI_VK_CHAIN_GEMV=0 SNAP=olmoe_tiny_c -- 8 8 $OR
   chain_gate olmoe "chain olmoe float16 K/V (the mirror in float16)" 1 KV16=1 SNAP=olmoe_tiny_c -- 8 8 $OR
@@ -2378,6 +2379,12 @@ family_inkling_olmoe_chain() {
   dmoe_gate olmoe "chain olmoe the routed experts in the frame" all SNAP=olmoe_tiny_c -- 8 8 $OR
   dmoe_gate olmoe "chain olmoe the host's routing (COLI_VK_CHAIN_MOE=0)" none COLI_VK_CHAIN_MOE=0 SNAP=olmoe_tiny_c -- 8 8 $OR
   lost_late olmoe "chain olmoe device lost mid-decode" 7 redo SNAP=olmoe_tiny_c -- 8 8 $OR
+  # the device's KV counts (dev_kv): the rows only it held rebuilt on the CPU from the ids
+  grep -q "rebuilding the KV of positions 0\.\.[1-9]" vk.log || { cat vk.log; fail "chain olmoe device lost mid-decode: the device's rows were not rebuilt"; }
+  echo "OK chain olmoe device lost mid-decode: $(grep -o 'rebuilding the KV of positions [0-9.]*' vk.log)"
+  chain_gate olmoe "chain olmoe the host's KV canonical (COLI_VK_CHAIN_DEVKV=0)" 1 COLI_VK_CHAIN_DEVKV=0 SNAP=olmoe_tiny_c -- 8 8 $OR
+  if grep -q "the device's KV cache counts" vk.log; then cat vk.log; fail "chain olmoe COLI_VK_CHAIN_DEVKV=0: the device's KV still counts"; fi
+  lost_late olmoe "chain olmoe device lost mid-decode, the host's KV canonical" 7 redo COLI_VK_CHAIN_DEVKV=0 SNAP=olmoe_tiny_c -- 8 8 $OR
   DMOE=1 lost_late olmoe "chain olmoe device lost mid-decode, the routed experts in the frame" 3 redo SNAP=olmoe_tiny_c -- 8 8 $OR
   # a bf16 or f16 checkpoint's dense matrices go up as bf16 (fmt 11) or f16 (fmt 14): the
   # CPU's tokens in about half the device bytes of the f32 snapshot's, with the host

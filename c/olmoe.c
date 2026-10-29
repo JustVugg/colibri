@@ -2141,9 +2141,11 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     if (g_vk_chain) {
         int rows_only = 0;
         chain_logit = falloc(c->vocab);
-        chain_n = olc_forward(m, x, S, pos_base, g_echo_k > 0 && g_echo_id && S > 1, chain_logit, &rows_only);
+        chain_n = olc_forward(m, ids, x, S, pos_base, g_echo_k > 0 && g_echo_id && S > 1, chain_logit, &rows_only);
+        olc_fed(m, ids, pos_base, S);   /* every step's ids, whoever runs it (olc_recover) */
         if (!chain_n) {
             free(chain_logit); chain_logit = NULL;
+            olc_host_kv(m, pos_base, S);   /* the device's rows below pos_base into the host's cache, for the CPU */
             olc_cpu_step(m, pos_base);
             /* the primary's layers may have run before the second device's were lost: their
              * residual is in x, and the CPU redoes the whole step from the embedding */
