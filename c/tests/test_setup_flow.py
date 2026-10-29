@@ -1138,6 +1138,9 @@ class WholeSetup(HomeTestCase):
                 mock.patch.object(setup_hw, "detect",
                                   return_value=hw_report(vulkan=IGPU, icd="/home/u/dzn.json")),
                 mock.patch.object(setup_hw, "is_wsl", return_value=False),
+                # Recommendation and the real download preflight describe this
+                # same fixture machine, independently of the test host's disk.
+                mock.patch.object(setup_hw, "disk_free", return_value=10 * 10**9),
                 mock.patch.object(setup_flow, "toolchain", return_value=TC_ALL),
                 mock.patch.object(setup_flow, "plan_summary",
                                   return_value=("dense part 0.0 GB in RAM", [])),
@@ -1657,10 +1660,7 @@ class WholeSetup(HomeTestCase):
 
     def test_list_json(self):
         out = io.StringIO()
-        # RAM and catalog are fixtures; disk capacity must describe that same
-        # machine, rather than the filesystem the test happens to run on.
-        with mock.patch.object(setup_hw, "disk_free", return_value=10 * 10**9), \
-             contextlib.redirect_stdout(out):
+        with contextlib.redirect_stdout(out):
             code = setup_flow.run(setup_flow.cmd_setup, setup_args(list=True, json=True))
         self.assertEqual(code, 0)
         rows = json.loads(out.getvalue()[out.getvalue().index("["):])
@@ -1678,6 +1678,16 @@ class WholeSetup(HomeTestCase):
         self.assertFalse(rows[0]["recommended"])
         self.assertFalse(rows[0]["fits"])
         self.assertEqual(rows[0]["status"], "needs-disk")
+
+    def test_download_without_disk_stops_before_transfer(self):
+        # Override the fixture capacity explicitly to keep the production guard
+        # tested at the download boundary, after the real local hub listing.
+        ui = setup_flow.UI(False, stream=io.StringIO())
+        with mock.patch.object(setup_hw, "disk_free", return_value=0), \
+                mock.patch.object(setup_download, "download_repo") as transfer:
+            with self.assertRaisesRegex(setup_flow.SetupError, "Free some space"):
+                setup_flow.download_model(ui, setup_catalog.by_id("tiny"), self.models)
+        transfer.assert_not_called()
 
 
 FAKE_SERVER = r'''
