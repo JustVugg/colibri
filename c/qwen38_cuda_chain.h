@@ -1571,6 +1571,9 @@ static int q38cc_forward_lm(Model *m, Q38CChain *ch, const int *ids, int S, int 
         if (!q38cc_frame_begin(ch) || !cc_write(ch->hyper_all, 0, hyper_h + (size_t)g0 * W, (size_t)gn * W * 4) ||
             !q38cc_push_state(ch, m, pos_base + g0) || !q38cc_stage_from(ch, m, 0)) { free(cs_all); return -1; }
         for (int i = 0; i < L; i++) {
+            /* a served prompt's STOP or CANCEL between two layers (prompt_break.h): 2, the caller
+             * declines the step and q38_serve_prefill puts back the state it copied */
+            if (coli_prompt_break()) { cc_finish(); free(cs_all); return 2; }
             Layer *l = &m->L[i];
             for (int c0 = g0; c0 < g0 + gn; c0 += rows) {
                 int n = g0 + gn - c0 < rows ? g0 + gn - c0 : rows, pb = pos_base + c0;
@@ -1644,9 +1647,11 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
         m->snap_rows <= 0) {
         int r = q38cc_forward_lm(m, ch, ids, S, pos_base, nlogits, hyper_h, logit, rows);
         if (r < 0) goto lost;
+        if (r == 2) { q38cc_dm_end(ch); return 0; }   /* stopped: not taken */
         if (r > 0) { q38cc_dm_end(ch); ch->snap_valid = 0; ch->forwards++; return 1; }
     }
     for (int c0 = 0; c0 < S; c0 += rows) {
+        if (coli_prompt_break()) { q38cc_dm_end(ch); return 0; }   /* a served prompt's stop, between two chunks */
         int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0;
         int ns = m->snap_rows - c0 < n ? m->snap_rows - c0 : n;   /* the rows of this chunk a verify copies */
         if (ns < 0) ns = 0;

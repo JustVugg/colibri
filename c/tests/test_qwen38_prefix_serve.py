@@ -22,9 +22,10 @@ import re
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from prefix_serve_harness import ServeEngine  # noqa: E402
+from prefix_serve_harness import PromptCancelContract, ServeEngine  # noqa: E402
 
 HERE = Path(__file__).resolve().parent.parent
 ENGINE = Path(os.environ.get("QWEN38_BINARY", HERE / ("qwen38.exe" if sys.platform == "win32" else "qwen38")))
@@ -36,9 +37,14 @@ REUSED = re.compile(r"\[PREFIX\] reusing (\d+) of (\d+) prompt tokens \(\d+%\) f
 @unittest.skipUnless((FIXTURE / "tokenizer.json").exists(),
                      "tiny qwen38 fixture or its tokenizer is absent "
                      "(tools/make_qwen38_tiny.py, tools/make_edge_tiny_tokenizer.py)")
-class Qwen38PrefixServeTest(unittest.TestCase):
+class Qwen38PrefixServeTest(PromptCancelContract, unittest.TestCase):
     OPENING = b"12+34=46; 7*8=56; 9-3="
     QUESTION = b"; 81/9="
+    # the fixture's ids are the bytes below 64; checks: before the segment, then before each
+    # layer, so the midway cancel stops before layer 1 and puts the recurrent state back
+    CANCEL_OPENING = OPENING
+    CANCEL_MORE = b"6; 81/9=9; 5+5=10; 6*6="
+    CANCEL_AFTER = 2
 
     def spawn(self, log_prefix=True, reuse=True):
         return ServeEngine(ENGINE, ["1", "8"],
@@ -75,6 +81,19 @@ class Qwen38PrefixServeTest(unittest.TestCase):
         self.assertGreater(n, len(self.OPENING),
                            "the reuse stopped at the first prompt: the answer was read again\n" + log)
         self.assertEqual(source, "the live state")
+
+    def test_a_prompt_read_in_segments_answers_as_one(self):
+        """A served prompt is read in segments of COLI_PROMPT_SEGMENT rows so that a CANCEL
+        can stop it between them: the attention rows, the recurrence and the routing are per
+        row and in row order, so three-row segments answer what one call answers."""
+        prompt = self.OPENING + self.CANCEL_MORE
+        with mock.patch.dict(os.environ, {"COLI_PROMPT_SEGMENT": "3"}):
+            engine = self.spawn(log_prefix=False)
+        try:
+            got = engine.ask("1", prompt, max_tok=8)
+        finally:
+            engine.close()
+        self.assertEqual(got, self.cold(prompt))
 
     def test_three_turns_keep_reusing(self):
         warm = self.spawn()
