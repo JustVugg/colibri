@@ -2987,8 +2987,16 @@ static void gq_matmul_act(float *y, const gq_act *a, const uint8_t *W, int t, in
 #ifdef GQ_R16_ON
     if (gq_r16_base(t) >= 0) {
         const int G = O / 16, tail = O % 16;
-        #pragma omp parallel for schedule(static)
-        for (int g = 0; g < G; g++) gq_r16_rows(t, y + 16 * g, O, W + (int64_t)16 * g * rb, a, I);
+        /* a prompt's rows: groups handed out one at a time, so the fast cores of a hybrid CPU
+         * (an i5-13500's P and E cores) do not wait on the slow ones; a group is still one
+         * thread's, so the bits do not change. Decode keeps the static split. */
+        if (a->S > GQ_FUSED_ROWS) {
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (int g = 0; g < G; g++) gq_r16_rows(t, y + 16 * g, O, W + (int64_t)16 * g * rb, a, I);
+        } else {
+            #pragma omp parallel for schedule(static)
+            for (int g = 0; g < G; g++) gq_r16_rows(t, y + 16 * g, O, W + (int64_t)16 * g * rb, a, I);
+        }
         if (tail) {
             float *y16 = (float *)malloc((size_t)a->S * 16 * sizeof(float));
             if (!y16) abort();
@@ -3008,7 +3016,7 @@ static void gq_matmul_act(float *y, const gq_act *a, const uint8_t *W, int t, in
             int8_t *w8 = (int8_t *)malloc((size_t)I);
             float *sw = (float *)malloc((size_t)(I / 16) * 2 * sizeof(float)), *mw = sw ? sw + I / 16 : NULL;
             if (!tile || !w8 || !sw) abort();
-            #pragma omp for schedule(static)
+            #pragma omp for schedule(dynamic, 1)
             for (int g = 0; g < G; g++) {
                 gq_tile16_pack(tile, W + (int64_t)16 * g * rb, rb, t, I, w8, sw, mw);
                 gq_tile16_rows(y + 16 * g, O, tile, a, I);
@@ -3027,7 +3035,7 @@ static void gq_matmul_act(float *y, const gq_act *a, const uint8_t *W, int t, in
      * kernels. */
     if (a->S > GQ_FUSED_ROWS && gq_f8_ok(t, I)) {
         const int G8 = O / 8;
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(dynamic, 1)
         for (int g = 0; g < G8; g++) gq_rows_f8(y + 8 * g, O, a, W + (int64_t)8 * g * rb, rb, t, I, 8);
         for (int o = 8 * G8; o < O; o++) gq_row_all(y + o, O, a, W + (int64_t)o * rb, t, I);
         return;
