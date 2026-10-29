@@ -845,6 +845,7 @@ __host__ __device__ inline size_t bd_gemv_i8_smem(int T, int I, int nr) { return
 template <int T, int NR>
 __global__ static void __launch_bounds__(256) bd_gemv_i8_k(float *__restrict__ y, const float *__restrict__ x, const bd_u32 *__restrict__ W,
         const bd_u32 *__restrict__ tab, int I, int O, int rowWords, int S, int nr, int lpr) {
+    COLI_PDL_WAIT();
     extern __shared__ uint4 bd_sm4[];
     constexpr int TW = bd_tab_words(T);
     BdTabs tb = bd_tables_fill<T>(reinterpret_cast<bd_u32 *>(bd_sm4), tab);
@@ -883,6 +884,7 @@ __host__ __device__ inline size_t bd_gemv_f_smem(int I, int nr) { return (size_t
 template <int NR>
 __global__ static void __launch_bounds__(256) bd_gemv_f_k(float *__restrict__ y, const float *__restrict__ x, const bd_u32 *__restrict__ W,
         const bd_u32 *__restrict__ tab, int fmt, int I, int O, int rowWords, int S, int nr) {
+    COLI_PDL_WAIT();
     extern __shared__ float4 bd_smf[];
     int s0 = (int)blockIdx.y * nr, nrow = min(nr, S - s0);
     int I4 = I / 4, XR = bd_x4(I4) + 1;
@@ -946,11 +948,11 @@ static int bd_gemv_i8_launch(float *y, const float *x, const bd_u32 *W, const bd
     if (nr > 1) {
         static unsigned raised;   /* past 48 KiB a kernel asks for it, once a device */
         bd_smem_raise((const void *)bd_gemv_i8_k<T, BD_GEMV_NR>, sm, smem_max, &raised);
-        bd_gemv_i8_k<T, BD_GEMV_NR><<<g, 256, sm, st>>>(y, x, W, tab, I, O, rowWords, S, nr, lpr);
+        coli_launch(bd_gemv_i8_k<T, BD_GEMV_NR>, g, 256, sm, st, y, x, W, tab, I, O, rowWords, S, nr, lpr);
     } else {
         static unsigned raised;
         bd_smem_raise((const void *)bd_gemv_i8_k<T, 1>, sm, smem_max, &raised);
-        bd_gemv_i8_k<T, 1><<<g, 256, sm, st>>>(y, x, W, tab, I, O, rowWords, S, 1, lpr);
+        coli_launch(bd_gemv_i8_k<T, 1>, g, 256, sm, st, y, x, W, tab, I, O, rowWords, S, 1, lpr);
     }
     return 1;
 }
@@ -966,11 +968,11 @@ static int bd_gemv_f_launch(float *y, const float *x, const bd_u32 *W, const bd_
     if (nr > 1) {
         static unsigned raised;   /* past 48 KiB a kernel asks for it, once a device */
         bd_smem_raise((const void *)bd_gemv_f_k<BD_GEMV_NR>, sm, smem_max, &raised);
-        bd_gemv_f_k<BD_GEMV_NR><<<g, 256, sm, st>>>(y, x, W, tab, fmt, I, O, rowWords, S, nr);
+        coli_launch(bd_gemv_f_k<BD_GEMV_NR>, g, 256, sm, st, y, x, W, tab, fmt, I, O, rowWords, S, nr);
     } else {
         static unsigned raised;
         bd_smem_raise((const void *)bd_gemv_f_k<1>, sm, smem_max, &raised);
-        bd_gemv_f_k<1><<<g, 256, sm, st>>>(y, x, W, tab, fmt, I, O, rowWords, S, 1);
+        coli_launch(bd_gemv_f_k<1>, g, 256, sm, st, y, x, W, tab, fmt, I, O, rowWords, S, 1);
     }
     return 1;
 }

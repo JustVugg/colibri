@@ -20,7 +20,7 @@ class CudaEwOpsSource(unittest.TestCase):
         self.assertGreater(len(codes), 5)
         source = (ROOT / "cuda_chain.cu").read_text(encoding="utf-8")
         start = source.index("static int cc_ew(")
-        body = source[start:source.index("cc_ew_k<<<", start)]
+        body = source[start:source.index("coli_launch(cc_ew_k", start)]   # the kernel launch after the switch
         accepted = set(re.findall(r"case\s+(CC_EW_[A-Z0-9_]+)\s*:", body))
         missing = [c for c in codes if c not in accepted]
         self.assertEqual(missing, [], "CC_EW codes cc_ew refuses: " + ", ".join(missing))

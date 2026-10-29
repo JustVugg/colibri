@@ -247,6 +247,36 @@ checkpoints, requests of 12 questions over a 1,700-character email:
 the device and holds the answers to the CPU's (the decisions, the refusals, every
 probability within 1e-5), with `COLI_CUDA_CHAIN_FAULT=n` a loss in the middle of the run.
 
+## Kernels that start while the one before ends (`COLI_CUDA_PDL`)
+
+A decode step runs its kernels one after another on one stream: about 800 a token on
+Qwen3.6-35B, 300 on OLMoE. With a plain launch the device sits idle between two of them while
+the next grid is set up and the last blocks of the one before drain. On sm_90 and later the
+chain's kernels start through programmatic dependent launch (`coli_launch`,
+`backend_gpu_compat.h`): the next kernel is set up while the one before ends, and its first
+statement waits on the device (`griddepcontrol.wait`) until the grids before it have completed
+and their writes are visible. Each kernel reads and writes what it did after a plain launch, so
+every result keeps its bits.
+
+It covers the CUDA chain's ops, the GGUF block GEMVs, and the backend kernels the chain reaches:
+the dense GEMVs and GEMMs of every format, the routed experts' kernels, their sort and their
+sum. HIP, cards before sm_90, a build whose code for the card was compiled below sm_90, and the
+legacy default stream launch plainly. `COLI_CUDA_PDL=0` does so everywhere.
+
+Measured on an RTX PRO 4000 (sm_120), alternating server starts, `dev` against this, tok/s:
+
+| | decode after 1K | decode after a long prompt | prompt |
+|---|---|---|---|
+| Qwen3.6-35B UD-Q4_K_M, every expert on the card | 101.1-102.3 -> 103.8-104.1 | 18K: 90.1-90.9 -> 92.4-92.7 | the same |
+| Qwen3.6-35B, colibri's int8 trunk and int4 experts | 105.0-105.5 -> 109.8-110.0 | 18K: 93.8-94.0 -> 97.2-97.4 | the same |
+| OLMoE-1B-7B Q4_K_M | 312.5-313.4 -> 322.4-322.8 | 3.8K: 239.8-240.6 -> 246.4-247.0 | the same |
+| Qwen3.8-Flash-Next IQ2_XS with the host pool | 40.8-41.1 -> 40.8-42.2 | 4.8K: 29.3-29.4 -> 28.7-30.0 | the same |
+
+The prompt column compares `COLI_CUDA_PDL=0` and `1` on one build, three alternated starts
+each (OLMoE: prompts of 1K and 3.4K tokens; Qwen3.6: 1K and 4.4K). Letting each kernel release
+the next one at its start (`griddepcontrol.launch_dependents`) measured slower: Qwen3.6
+103.3 / 102.7 tok/s after 1K against 104.8 / 103.9 with the wait alone.
+
 ## Notes and limitations
 
 - Text-mode timing reports prefill separately from decode.
