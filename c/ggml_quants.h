@@ -2239,6 +2239,29 @@ static void gq_r16_rows(int t, float *y, int ystride, const uint8_t *grp, const 
         }
     }
 }
+/* A tile (gq_tile16_pack): 16 rows of any integer type unpacked once, per 32 elements the 16
+ * rows' codes w + 128 by quad (64 bytes each), then their scales for elements 0-15 and 16-31
+ * (16 floats each): 640 bytes. */
+GQ_R16_FN gq_r16_tile(GQ_R16_ARGS) {
+    GQ_R16_ZERO
+    for (int b = 0; b < I / 32; b++) {
+        const uint8_t *o = grp + (int64_t)b * 640; const int g32 = b;
+        __m512i c[8];
+        for (int j = 0; j < 8; j++) c[j] = _mm512_loadu_si512(o + 64 * j);
+        const __m512 sv0 = _mm512_loadu_ps((const float *)(o + 512)), sv1 = _mm512_loadu_ps((const float *)(o + 576));
+        GQ_R16_ACC16(c, sv0, sv1, 128)
+    }
+    GQ_R16_STORE
+}
+static void gq_tile16_rows(float *y, int ystride, const uint8_t *grp, const gq_act *a, int I) {
+    for (int s0 = 0; s0 < a->S; s0 += 8) {
+        const int n = a->S - s0 < 8 ? a->S - s0 : 8;
+        float *ys = y + (int64_t)s0 * ystride; const int8_t *xq = a->q + (int64_t)s0 * I;
+        const float *dx = a->d + (int64_t)s0 * (I / 32); const int32_t *xs = a->s + (int64_t)s0 * (I / 16);
+        GQ_R16_N(gq_r16_tile);
+    }
+}
+#define GQ_TILE16_BIAS 128
 #endif
 #if !defined(GQ_VNNI512) && defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
 /* The same forms on AVX2 (x86-64-v3, AVX-VNNI laptops): a group's 16 rows as two halves of
@@ -2463,6 +2486,37 @@ GQ_R16H_FN gq_r16h_iq4_nl(GQ_R16H_ARGS) {
 #define GQ_R16H_N(FN) do { switch (n) { \
         case 1: FN(ys, ystride, grp, xq, dx, xs, I, 1, h); break; case 2: FN(ys, ystride, grp, xq, dx, xs, I, 2, h); break; \
         case 3: FN(ys, ystride, grp, xq, dx, xs, I, 3, h); break; default: FN(ys, ystride, grp, xq, dx, xs, I, 4, h); break; } } while (0)
+/* GQ_R16H_ACC16 for codes past 63 (a tile's): the dot of Q8_0 and the IQ4 lookups */
+#define GQ_R16H_ACC16B(c, sv0, sv1, BIAS) \
+    for (int s = 0; s < S; s++) { \
+        const int8_t *xb_ = xq + (int64_t)s * I + 32 * (int64_t)g32; \
+        __m256i p0_, p1_; GQ_R16H_DOTB(p0_, c, xb_, 0, 4) GQ_R16H_DOTB(p1_, c, xb_, 4, 4) \
+        const int32_t *x16_ = xs + (int64_t)s * (I / 16) + 2 * (int64_t)g32; \
+        p0_ = _mm256_sub_epi32(p0_, _mm256_set1_epi32((BIAS) * x16_[0])); p1_ = _mm256_sub_epi32(p1_, _mm256_set1_epi32((BIAS) * x16_[1])); \
+        const __m256 t_ = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p1_), (sv1), _mm256_mul_ps(_mm256_cvtepi32_ps(p0_), (sv0))); \
+        acc[s] = _mm256_fmadd_ps(t_, _mm256_set1_ps(dx[(int64_t)s * (I / 32) + g32]), acc[s]); \
+    }
+/* a tile (gq_tile16_pack), half h: its codes are w + GQ_R16_BIGBIAS (w itself without VNNI) */
+GQ_R16H_FN gq_r16h_tile(GQ_R16H_ARGS) {
+    GQ_R16H_ZERO
+    for (int b = 0; b < I / 32; b++) {
+        const uint8_t *o = grp + (int64_t)b * 640; const int g32 = b;
+        __m256i c[8];
+        for (int j = 0; j < 8; j++) c[j] = GQ_R16H_LD(o + 64 * j + 32 * h);
+        const __m256 sv0 = _mm256_loadu_ps((const float *)(o + 512) + 8 * h), sv1 = _mm256_loadu_ps((const float *)(o + 576) + 8 * h);
+        GQ_R16H_ACC16B(c, sv0, sv1, GQ_R16_BIGBIAS)
+    }
+    GQ_R16H_STORE
+}
+static void gq_tile16_rows(float *y, int ystride, const uint8_t *grp, const gq_act *a, int I) {
+    for (int s0 = 0; s0 < a->S; s0 += 4) {
+        const int n = a->S - s0 < 4 ? a->S - s0 : 4;
+        float *ys = y + (int64_t)s0 * ystride; const int8_t *xq = a->q + (int64_t)s0 * I;
+        const float *dx = a->d + (int64_t)s0 * (I / 32); const int32_t *xs = a->s + (int64_t)s0 * (I / 16);
+        for (int h = 0; h < 2; h++) GQ_R16H_N(gq_r16h_tile);
+    }
+}
+#define GQ_TILE16_BIAS GQ_R16_BIGBIAS
 static void gq_r16_rows(int t, float *y, int ystride, const uint8_t *grp, const gq_act *a, int I) {
     for (int s0 = 0; s0 < a->S; s0 += 4) {
         const int n = a->S - s0 < 4 ? a->S - s0 : 4;
@@ -2897,6 +2951,33 @@ static inline int gq_int_ok(int t, int I) {
     return !gq_exact_mode() && gq_has_int(t) && I % 32 == 0;
 }
 
+#ifdef GQ_TILE16_BIAS
+/* ---- A prompt's rows of a type with no R16 form, 16 file rows unpacked at a time ----
+ * gq_rows_f8 decodes its eight rows again for every four activation rows, so on a prompt the
+ * grid types (IQ2, IQ3) spent their time decoding: 46% of Flint's prompt on the CPU. A tile
+ * takes 16 rows through gq_unpack_row once (its int8 values and scale per 16, the min zero
+ * for these types), lays them out as the R16 kernels read, and every activation row goes
+ * through gq_r16_tile: per row and per 16 elements the exact integer dot, then its scale,
+ * the R16 kernels' float steps (a TF-NLL check, not their bits). */
+#define GQ_TILE16_MIN_S 8   /* activation rows from which one unpack for all pays */
+static inline int gq_tile16_ok(int t, int I) {
+    return !gq_exact_mode() && gq_r16_of(t) < 0 && gq_has_int(t) && !gq_has_min(t) && I % 32 == 0 && I % GQ_TYPES[t].blck == 0;
+}
+static inline size_t gq_tile16_bytes(int I) { return (size_t)(I / 32) * 640; }
+/* rows r .. r + 15 of W (row bytes rb) into tile; w8, sw, mw: scratch of I, I/16, I/16 */
+static void gq_tile16_pack(uint8_t *tile, const uint8_t *W, int64_t rb, int t, int I, int8_t *w8, float *sw, float *mw) {
+    for (int r = 0; r < 16; r++) {
+        gq_unpack_row(t, W + (int64_t)r * rb, I, w8, sw, mw);
+        for (int b = 0; b < I / 32; b++) {
+            uint8_t *o = tile + (size_t)b * 640;
+            for (int j = 0; j < 8; j++)
+                for (int k = 0; k < 4; k++) o[64 * j + 4 * r + k] = (uint8_t)(w8[32 * b + 4 * j + k] + GQ_TILE16_BIAS);
+            ((float *)(o + 512))[r] = sw[2 * b];
+            ((float *)(o + 576))[r] = sw[2 * b + 1];
+        }
+    }
+}
+#endif
 /* y = W x on an already quantized activation block (types with an integer form). An
  * interleaved W holds whole groups of 16 rows; O may stop inside the last one (a caller
  * reading the first O rows of a matrix packed whole, an unpadded vocabulary): that group
@@ -2906,8 +2987,16 @@ static void gq_matmul_act(float *y, const gq_act *a, const uint8_t *W, int t, in
 #ifdef GQ_R16_ON
     if (gq_r16_base(t) >= 0) {
         const int G = O / 16, tail = O % 16;
-        #pragma omp parallel for schedule(static)
-        for (int g = 0; g < G; g++) gq_r16_rows(t, y + 16 * g, O, W + (int64_t)16 * g * rb, a, I);
+        /* a prompt's rows: groups handed out one at a time, so the fast cores of a hybrid CPU
+         * (an i5-13500's P and E cores) do not wait on the slow ones; a group is still one
+         * thread's, so the bits do not change. Decode keeps the static split. */
+        if (a->S > GQ_FUSED_ROWS) {
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (int g = 0; g < G; g++) gq_r16_rows(t, y + 16 * g, O, W + (int64_t)16 * g * rb, a, I);
+        } else {
+            #pragma omp parallel for schedule(static)
+            for (int g = 0; g < G; g++) gq_r16_rows(t, y + 16 * g, O, W + (int64_t)16 * g * rb, a, I);
+        }
         if (tail) {
             float *y16 = (float *)malloc((size_t)a->S * 16 * sizeof(float));
             if (!y16) abort();
@@ -2915,6 +3004,40 @@ static void gq_matmul_act(float *y, const gq_act *a, const uint8_t *W, int t, in
             for (int r = 0; r < a->S; r++) memcpy(y + (int64_t)r * O + 16 * G, y16 + 16 * r, (size_t)tail * sizeof(float));
             free(y16);
         }
+        return;
+    }
+#endif
+#ifdef GQ_TILE16_BIAS
+    if (a->S >= GQ_TILE16_MIN_S && O >= 16 && gq_tile16_ok(t, I)) {   /* a prompt's rows: 16 file rows unpacked once */
+        const int G = O / 16;
+        #pragma omp parallel
+        {
+            uint8_t *tile = (uint8_t *)malloc(gq_tile16_bytes(I));
+            int8_t *w8 = (int8_t *)malloc((size_t)I);
+            float *sw = (float *)malloc((size_t)(I / 16) * 2 * sizeof(float)), *mw = sw ? sw + I / 16 : NULL;
+            if (!tile || !w8 || !sw) abort();
+            #pragma omp for schedule(dynamic, 1)
+            for (int g = 0; g < G; g++) {
+                gq_tile16_pack(tile, W + (int64_t)16 * g * rb, rb, t, I, w8, sw, mw);
+                gq_tile16_rows(y + 16 * g, O, tile, a, I);
+            }
+            free(tile); free(w8); free(sw);
+        }
+        for (int o = 16 * G; o < O; o++) gq_row_all(y + o, O, a, W + (int64_t)o * rb, t, I);
+        return;
+    }
+#endif
+#ifdef GQ_F8_ON
+    /* a prompt's rows (more than a fused kernel takes): the file's rows by eight, gq_rows_f8,
+     * where the type has that kernel. gq_row_all unpacks a row once and then pays a convert
+     * and an fma per 32 elements for every row and activation row: on a prompt of Flint
+     * (UD-Q3_K_XL, IQ2_S experts) that was 29% of the CPU's time. Decode keeps the fused row
+     * kernels. */
+    if (a->S > GQ_FUSED_ROWS && gq_f8_ok(t, I)) {
+        const int G8 = O / 8;
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int g = 0; g < G8; g++) gq_rows_f8(y + 8 * g, O, a, W + (int64_t)8 * g * rb, rb, t, I, 8);
+        for (int o = 8 * G8; o < O; o++) gq_row_all(y + o, O, a, W + (int64_t)o * rb, t, I);
         return;
     }
 #endif
@@ -2926,6 +3049,9 @@ static void gq_matmul2_act(float *y1, const uint8_t *W1, int t1, float *y2, cons
     const int I = a->I; const int64_t rb1 = gq_row_bytes(t1, I), rb2 = gq_row_bytes(t2, I);
 #ifdef GQ_R16_ON
     if (gq_r16_base(t1) >= 0 || gq_r16_base(t2) >= 0) { gq_matmul_act(y1, a, W1, t1, O); gq_matmul_act(y2, a, W2, t2, O); return; }
+#endif
+#ifdef GQ_F8_ON
+    if (a->S > GQ_FUSED_ROWS && (gq_f8_ok(t1, I) || gq_f8_ok(t2, I))) { gq_matmul_act(y1, a, W1, t1, O); gq_matmul_act(y2, a, W2, t2, O); return; }
 #endif
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < 2 * O; r++) {

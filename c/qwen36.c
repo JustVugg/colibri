@@ -5749,6 +5749,72 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
         matmul(bb, xb, l->dn_b, rows, H, vh);
         matmul(ab, xb, l->dn_a, rows, H, vh);
         if (tm_on() && S==1){ double t=tm_now(); g_dn_sub[0]+=t-_d0; _d0=t; }
+        /* A prompt's block (not a multiplexed step, a verify or DN_DBG): the conv by channel with
+         * every row in order, then each value head with every row in turn while its state is in
+         * one core's cache, two passes over it a row (the decay with k^T S, the update with q^T S
+         * on the updated row) and its gated norm, in one parallel region for the block. The
+         * per-row loop below forked a region per row for four passes. Every value is computed
+         * from the same values with the same operations in the same order: the same bits. */
+        if (rows > 1 && !m->mux_rows && !dbg && m->snap_rows <= 0) {
+            float *conv_all = falloc((int64_t)rows * conv_dim);
+            #pragma omp parallel for schedule(static)
+            for (int cc = 0; cc < conv_dim; cc++) {
+                const float *w = l->dn_conv + (int64_t)cc * convk;
+                float *rg = ring + (int64_t)cc * (convk - 1);
+                for (int r = 0; r < rows; r++) {
+                    const float *qkv = gpu_block ? qkvz + (int64_t)r * proj_dim : qkvb + (int64_t)r * conv_dim;
+                    float acc = 0.f;
+                    for (int kk = 0; kk < convk - 1; kk++) acc += w[kk] * rg[kk];
+                    acc += w[convk - 1] * qkv[cc];
+                    conv_all[(int64_t)r * conv_dim + cc] = acc / (1.f + expf(-acc));   /* silu */
+                    for (int kk = 0; kk < convk - 2; kk++) rg[kk] = rg[kk + 1];
+                    rg[convk - 2] = qkv[cc];
+                }
+            }
+            #pragma omp parallel for schedule(static)
+            for (int h = 0; h < vh; h++) {
+                float qh[512], kh[512], kvl[512], dl[512], ov[512];   /* kdim, vdim <= 512 */
+                float *Sh = rec + (int64_t)h * kdim * vdim;
+                const int vk_idx = g_dn_tiled ? h % vk : h / rep;
+                for (int r = 0; r < rows; r++) {
+                    const float *cv = conv_all + (int64_t)r * conv_dim;
+                    const float *b = bb + (int64_t)r * vh, *a = ab + (int64_t)r * vh;
+                    const float bet = 1.f / (1.f + expf(-b[h]));
+                    const float g = (g_ssm_a_direct ? l->dn_alog[h] : -expf(l->dn_alog[h])) * softplus_f(a[h] + l->dn_dtbias[h]);
+                    memcpy(qh, cv + (int64_t)vk_idx * kdim, kdim * sizeof(float));
+                    memcpy(kh, cv + key_dim_tot + (int64_t)vk_idx * kdim, kdim * sizeof(float));
+                    double sq = 1e-6; for (int d = 0; d < kdim; d++) sq += (double)qh[d] * qh[d];
+                    double nq = sqrt(sq);
+                    for (int d = 0; d < kdim; d++) qh[d] = (float)((double)qh[d] / nq * scale);
+                    double sk = 1e-6; for (int d = 0; d < kdim; d++) sk += (double)kh[d] * kh[d];
+                    double nk = sqrt(sk);
+                    for (int d = 0; d < kdim; d++) kh[d] = (float)((double)kh[d] / nk);
+                    const float egh = expf(g);
+                    const float *vd = cv + 2 * key_dim_tot + (int64_t)h * vdim;
+                    for (int vv = 0; vv < vdim; vv++) kvl[vv] = 0.f;
+                    for (int kk = 0; kk < kdim; kk++) {
+                        float kkd = kh[kk]; float *Sr = Sh + (int64_t)kk * vdim;
+                        for (int vv = 0; vv < vdim; vv++) { Sr[vv] *= egh; kvl[vv] += kkd * Sr[vv]; }
+                    }
+                    for (int vv = 0; vv < vdim; vv++) dl[vv] = (vd[vv] - kvl[vv]) * bet;
+                    for (int vv = 0; vv < vdim; vv++) ov[vv] = 0.f;
+                    for (int kk = 0; kk < kdim; kk++) {
+                        float kkd = kh[kk], qkd = qh[kk]; float *Sr = Sh + (int64_t)kk * vdim;
+                        for (int vv = 0; vv < vdim; vv++) { Sr[vv] += kkd * dl[vv]; ov[vv] += qkd * Sr[vv]; }
+                    }
+                    const float *zr = (gpu_block ? qkvz + (int64_t)r * proj_dim + conv_dim : zb + (int64_t)r * value_dim) + (int64_t)h * vdim;
+                    const float *w = l->dn_norm;
+                    double ms = 0; for (int d = 0; d < vdim; d++) ms += (double)ov[d] * ov[d];
+                    float rr = 1.f / sqrtf((float)(ms / vdim) + c->eps);
+                    float *outr = outrb + (int64_t)r * value_dim + (int64_t)h * vdim;
+                    for (int d = 0; d < vdim; d++) {
+                        float val = ov[d] * rr * w[d];
+                        outr[d] = val * zr[d] / (1.f + expf(-zr[d]));
+                    }
+                }
+            }
+            free(conv_all);
+        } else
         for (int r = 0; r < rows; r++) {
         if (m->mux_rows) { rec = m->mux_rows[base + r].seq->DN_rec[layer]; ring = m->mux_rows[base + r].seq->DN_conv[layer]; }
         const float *qkv = gpu_block ? qkvz + (int64_t)r * proj_dim : qkvb + (int64_t)r * conv_dim;
