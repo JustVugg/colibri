@@ -73,9 +73,18 @@ layer as it has them, and the reference reads what those blocks decode to. All e
 CI runs six of the eleven, which hold all fourteen types.
 
 The real files: `tools/gguf_header.py` fetched the eleven headers, the importer wrote their configs
-and the engine maps every tensor of them. UD-IQ1_S, its headers stretched to the files' sizes with
-the data left as holes, loads (17.9 GB of dense part resident) and reads a prompt through all 72
-layers. No run on the real weights yet, so no speed or quality figures here.
+and the engine maps every tensor of them. UD-IQ1_S (233 GB) runs: on an RTX PRO 4000 (24 GB) with
+62 GB of RAM and two NVMe drives, the 17.9 GB dense part resident, the experts from the disk,
+
+| | decode, the first 16 tokens | decode, 48 tokens | prompt, 12 tokens |
+|---|---|---|---|
+| the CPU | | 0.52 tok/s | 17.6 s |
+| Vulkan (the experts' tier on the card) | 1.17 tok/s | 0.88 tok/s | 18.4 s |
+
+and "The capital of France is Paris. The capital of Italy is" goes on with " Rome. The capital of
+Germany is Berlin. The capital of Spain is Madrid. The capital of Portugal is Lisbon." on both.
+Through the gateway the chat template, the `[THINK]` reasoning (as `reasoning_content`) and the
+answer come back as the release writes them.
 
 On an NVIDIA card a GGUF of this model runs on Vulkan, as GLM-5.2's does (a build with both
 backends switches to it; the CUDA backend has no ggml block types).
