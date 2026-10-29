@@ -1674,7 +1674,7 @@ void coli_vk_mem_info(size_t *used, size_t *count) {
  * lock covers its books only: the uploader thread of the tier allocates while the
  * engine thread uploads dense matrices. A free while async work is in flight on the
  * tensor's device waits for that work (coli_vk_tensor_free). */
-typedef struct { VkDeviceMemory mem; uint8_t *base; } VkBlk;
+typedef struct { VkDeviceMemory mem; uint8_t *base; void *imp; } VkBlk;   /* imp: the host pool block's own pages (pool_import) */
 struct VkWPool {
     VkaPool p;
     pthread_mutex_t mx;
@@ -1921,6 +1921,60 @@ static void up_zero(int dev, VkDeviceMemory mem, uint64_t cap) {
 /* The primary device's pools are addressable when bufferDeviceAddress is on (the
  * expert batch's grouped GEMM reads expert weights through an address table). */
 static int pool_bda(const VkWPool *P) { return P->dev == 0 && G.has_bda; }
+/* The host pool's blocks from the process's own pages (VK_EXT_external_memory_host), where
+ * the driver has them: the memory vkAllocateMemory gives for a host-visible type without
+ * HOST_CACHED is write-combined for the CPU (NVIDIA's Linux driver offers no cached type),
+ * and the hybrid steps' CPU pairs read it at about 12 GB/s on twelve cores -- 133 us a
+ * pair of Qwen3.6 int4 (1.57 MB) against 44 from cached memory (an RTX 3070 and a
+ * Threadripper 3945WX). The device reads imported pages over PCIe at the same speed as its
+ * own allocation (bench_hostmem). COLI_VK_HOST_POOL_IMPORT=0 keeps the driver's memory. */
+static int pool_import_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_HOST_POOL_IMPORT"); on = !(e && *e == '0'); }
+    return on && G.has_hostmem;
+}
+static int pool_import(VkWPool *P, VkBlk *bk, uint64_t cap, const VkMemoryAllocateFlagsInfo *afl) {
+#ifdef VK_EXT_external_memory_host
+    if (!P->host || P->dev || !pool_import_on()) return 0;
+    static size_t al;
+    static PFN_vkGetMemoryHostPointerPropertiesEXT gp;
+    if (!al) {
+        VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &hp};
+        vkGetPhysicalDeviceProperties2(G.phys, &p2);
+        al = hp.minImportedHostPointerAlignment ? (size_t)hp.minImportedHostPointerAlignment : 4096;
+        gp = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(G.dev, "vkGetMemoryHostPointerPropertiesEXT");
+    }
+    if (!gp || cap % al) return 0;
+    void *host = NULL;
+    if (posix_memalign(&host, al, (size_t)cap)) return 0;
+    VkMemoryHostPointerPropertiesEXT mp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    if (gp(G.dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host, &mp) != VK_SUCCESS ||
+        !(mp.memoryTypeBits & (1u << pool_memtype(P)))) { free(host); return 0; }
+    VkImportMemoryHostPointerInfoEXT imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, .pNext = (void *)afl,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, .pHostPointer = host};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp, .allocationSize = cap,
+        .memoryTypeIndex = pool_memtype(P)};
+    if (vkAllocateMemory(G.dev, &ai, NULL, &bk->mem) != VK_SUCCESS) { free(host); bk->mem = VK_NULL_HANDLE; return 0; }
+    bk->base = host; bk->imp = host;
+    static int said;
+    if (!said++) fprintf(stderr, "[VK] host pool: its blocks are the process's own pages, imported (cached for the CPU; COLI_VK_HOST_POOL_IMPORT=0 takes the driver's)\n");
+    return 1;
+#else
+    (void)P; (void)bk; (void)cap; (void)afl;
+    return 0;
+#endif
+}
+/* a block's memory and pages back (lock held) */
+static void blk_free(VkDevice dev, VkBlk *bk) {
+    if (!bk) return;
+    if (dev) {
+        if (bk->base && !bk->imp) vkUnmapMemory(dev, bk->mem);
+        if (bk->mem) vkFreeMemory(dev, bk->mem, NULL);
+    }
+    free(bk->imp);
+    free(bk);
+}
 /* Block memory for a pool (lock held). */
 static VkBlk *pool_new_block(VkWPool *P, uint64_t cap) {
     VkBlk *bk = calloc(1, sizeof(*bk));
@@ -1936,6 +1990,7 @@ static VkBlk *pool_new_block(VkWPool *P, uint64_t cap) {
         .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
     if (pool_bda(P)) { afl.pNext = ai.pNext; ai.pNext = &afl; }
     VkDevice dev = pool_device(P);
+    if (pool_import(P, bk, cap, pool_bda(P) ? &afl : NULL)) return bk;   /* the host pool: the process's pages */
     int staged = pool_staged(P);   /* device-local, never mapped: the uploader fills it */
     if (staged && up_fault("block")) { free(bk); return NULL; }
     if (vkAllocateMemory(dev, &ai, NULL, &bk->mem) != VK_SUCCESS ||
@@ -1947,9 +2002,7 @@ static VkBlk *pool_new_block(VkWPool *P, uint64_t cap) {
     return bk;
 }
 static void pool_release_block(VkWPool *P, int k) {   /* lock held, block empty */
-    VkBlk *bk = P->p.b[k].user;
-    VkDevice dev = pool_device(P);
-    if (bk) { if (bk->base) vkUnmapMemory(dev, bk->mem); vkFreeMemory(dev, bk->mem, NULL); free(bk); }
+    blk_free(pool_device(P), P->p.b[k].user);
     vka_pool_drop_block(&P->p, k);
 }
 
@@ -1964,6 +2017,12 @@ static int pool_suballoc(VkWPool *P, size_t bytes, VkBuffer *buf, void **ptr, Vk
     /* the host pool's: the source of a copy to the device (coli_vk_tensor_copy), on the uploader's queue */
     else if (P->host) { bi.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT; up_sharing(&g_up[P->dev], &bi); }
     if (pool_bda(P)) bi.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+#ifdef VK_EXT_external_memory_host
+    /* the host pool's buffers may land in an imported block (pool_import): declared at creation */
+    VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, .pNext = (void *)bi.pNext,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
+    if (P->host && !P->dev && pool_import_on()) bi.pNext = &eb;
+#endif
     VKCHECK(vkCreateBuffer(dev, &bi, NULL, buf), "vkCreateBuffer");
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(dev, *buf, &req);
@@ -1980,10 +2039,8 @@ static int pool_suballoc(VkWPool *P, size_t bytes, VkBuffer *buf, void **ptr, Vk
             cap = (P->p.limit - P->p.total) & ~(uint64_t)4095;
         VkBlk *bk = vka_pool_can_grow(&P->p, cap) && cap >= req.size ? pool_new_block(P, cap) : NULL;
         if (bk) {
-            if (vka_pool_add_block(&P->p, cap, bk) < 0) {
-                if (bk->base) vkUnmapMemory(dev, bk->mem);
-                vkFreeMemory(dev, bk->mem, NULL); free(bk);
-            } else ok = vka_alloc(&P->p, req.size, align, r);
+            if (vka_pool_add_block(&P->p, cap, bk) < 0) blk_free(dev, bk);
+            else ok = vka_alloc(&P->p, req.size, align, r);
         } else P->p.refusals++;
     }
     VkBlk *blk = ok ? P->p.b[r->block].user : NULL;
@@ -2010,8 +2067,7 @@ static void pool_destroy(VkWPool *P) {
     VkDevice dev = pool_device(P);
     for (int k = 0; k < P->p.nb; k++) {
         if (!P->p.b[k].present) continue;
-        VkBlk *bk = P->p.b[k].user;
-        if (bk) { if (dev) { if (bk->base) vkUnmapMemory(dev, bk->mem); vkFreeMemory(dev, bk->mem, NULL); } free(bk); }
+        blk_free(dev, P->p.b[k].user);
     }
     uint64_t bb = P->p.block_bytes, lim = P->p.limit;
     vka_pool_destroy(&P->p);
