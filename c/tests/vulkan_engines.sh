@@ -1826,7 +1826,7 @@ qwen36_gguf_chain_gates() {
   # that room and the cache's allocation failed at start)
   grep -q "host pool on, [1-9].* of RAM left for the KV and state the engine allocates later" vk.log ||
     { cat vk.log; fail "chain qwen36 GGUF hybrid: the host pool left no room for the KV cache"; }
-  grep -q "hybrid layer steps, [1-9][0-9]* host pool pairs on the CPU" vk.log || { cat vk.log; fail "chain qwen36 GGUF hybrid: no pair on the CPU"; }
+  grep -q "hybrid layer steps\( ([^)]*)\)\{0,1\}, [1-9][0-9]* host pool pairs on the CPU" vk.log || { cat vk.log; fail "chain qwen36 GGUF hybrid: no pair on the CPU"; }
   # the host pool within the driver's heap for it (#2314: Windows leaves about half the RAM,
   # and the blocks past it were refused): a heap whose room past the 2 GiB the staging keeps
   # holds a few experts, the pool takes those, the engine's cache keeps the rest (and so the
@@ -1931,7 +1931,7 @@ family_qwen_chain() {
   dmoe_gate qwen36 "chain qwen36 the host pool" all COLI_VK_TIER_GB=0.00077 COLI_VK_TIER_HOST=1 GQ_EXACT=1 COLI_DENSE_I8=0 \
     SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
   grep -q "host pool on, [1-9]" vk.log || { cat vk.log; fail "chain qwen36 the host pool: no expert in the host pool"; }
-  grep -q "hybrid layer steps, [1-9][0-9]* host pool pairs on the CPU" vk.log || { cat vk.log; fail "chain qwen36 the host pool: no int4 pair on the CPU"; }
+  grep -q "hybrid layer steps\( ([^)]*)\)\{0,1\}, [1-9][0-9]* host pool pairs on the CPU" vk.log || { cat vk.log; fail "chain qwen36 the host pool: no int4 pair on the CPU"; }
   # the device lost mid-decode: the state rebuilt on the CPU, the run finishes there; in a
   # step's frames on the host's routing, and in a step that is one frame
   lost_late qwen36 "chain qwen36 device lost" 20 rebuild COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
