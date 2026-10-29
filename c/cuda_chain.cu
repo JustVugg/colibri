@@ -2256,6 +2256,284 @@ static int cc_attn_h(CcBuf *, CcBuf *, CcBuf *, CcBuf *, CcBuf *, CcBuf *, const
 static int cc_attn_wh(CcBuf *, CcBuf *, CcBuf *, CcBuf *, CcBuf *, CcBuf *, const CcAttnW *, int) { return 0; }
 static int cc_kvh(void) { return 0; }
 #endif
+/* ---- the decision engines' encoders: shaders/chain_enc.comp ------------------------
+ * Its six modes as kernels, the shader's arithmetic but for two choices that keep a row
+ * nearer the engines' own: the LayerNorm's mean and variance are summed in double, as
+ * laya.c and gliner_decide.c sum them, and the GELU is erff's (the shader fits its own
+ * erfc, GLSL having none). */
+__device__ static inline float cc_enc_act(float x, int k) {
+    if (k == 1) return 0.5f * x * (1.0f + erff(x * 0.70710678118654752f));
+    if (k == 2) return 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+    if (k == 3) return fmaxf(x, 0.0f);
+    return x;
+}
+__device__ static inline double cc_enc_sum256(double v, double *red, int tid) {
+    red[tid] = v;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        __syncthreads();
+    }
+    double s = red[0];
+    __syncthreads();
+    return s;
+}
+/* mode 0: a block a row, its values in registers before any write (y may be a or b) */
+__global__ static void cc_enc_norm_k(float *a, const float *b, const float *prm, float *y, CcEncNorm p) {
+    __shared__ double red[256];
+    int r = blockIdx.x, tid = threadIdx.x;
+    if (r >= p.rows) return;
+    const size_t ab = (size_t)p.a_off + (size_t)r * p.a_row, bb = (size_t)p.b_off + (size_t)r * p.b_row;
+    float t[16];
+    double s = 0.0;
+    for (int k = 0; k < 16; k++) {
+        int i = tid + 256 * k;
+        t[k] = 0.0f;
+        if (i < p.D) {
+            float v = a[ab + i];
+            if (p.flags & CC_ENC_ADD) v = v + b[bb + i];
+            t[k] = v;
+            s += v;
+        }
+    }
+    double mean = cc_enc_sum256(s, red, tid) / p.D, q = 0.0;
+    for (int k = 0; k < 16; k++) { int i = tid + 256 * k; if (i < p.D) { double c = (double)t[k] - mean; q += c * c; } }
+    double var = cc_enc_sum256(q, red, tid) / p.D;
+    float rstd = (float)(1.0 / sqrt(var + (double)p.eps));
+    const size_t yb = (size_t)p.y_off + (size_t)r * p.y_row;
+    for (int k = 0; k < 16; k++) {
+        int i = tid + 256 * k;
+        if (i >= p.D) continue;
+        if (p.flags & CC_ENC_SUM) a[ab + i] = t[k];
+        float o = (float)((double)t[k] - mean) * rstd * prm[p.w_off + i];
+        if (p.bias_off >= 0) o = o + prm[p.bias_off + i];
+        y[yb + i] = o;
+    }
+}
+/* mode 1 */
+__global__ static void cc_enc_bias_k(float *y, const float *prm, CcEncBias p) {
+    long long i = (long long)blockIdx.x * 256 + threadIdx.x;
+    if (i >= p.n) return;
+    int r = (int)(i / p.O), o = (int)(i - (long long)r * p.O);
+    size_t at = (size_t)p.y_off + (size_t)r * p.y_row + o;
+    float v = y[at];
+    if (p.b_off >= 0) v = v + prm[p.b_off + o];
+    y[at] = cc_enc_act(v, p.act);
+}
+/* mode 2 */
+__global__ static void cc_enc_geglu_k(const float *a, const float *prm, float *y, CcEncGeglu p) {
+    long long i = (long long)blockIdx.x * 256 + threadIdx.x;
+    if (i >= p.n) return;
+    int r = (int)(i / p.I), j = (int)(i - (long long)r * p.I);
+    size_t ab = (size_t)p.a_off + (size_t)r * p.a_row;
+    float u = a[ab + j], g = a[ab + p.I + j];
+    if (p.b_off >= 0) { u = u + prm[p.b_off + j]; g = g + prm[p.b_off + p.I + j]; }
+    y[(size_t)p.y_off + (size_t)r * p.y_row + j] = cc_enc_act(u, p.act) * g;
+}
+/* mode 3: a thread a (row, query or key, head, pair) */
+__global__ static void cc_enc_rope_k(float *x, const float *tab, const int *pos, CcEncRope p) {
+    long long i = (long long)blockIdx.x * 256 + threadIdx.x;
+    if (i >= p.n) return;
+    int half = p.hd / 2, per_row = 2 * p.H * half;
+    int r = (int)(i / per_row), rem = (int)(i - (long long)r * per_row);
+    int part = rem / (p.H * half), rem2 = rem - part * p.H * half, hh = rem2 / half, k = rem2 - hh * half;
+    size_t vb = (size_t)p.x_off + (size_t)r * p.x_row + (size_t)part * p.part_off + (size_t)hh * p.hd;
+    size_t ps = (size_t)pos[r] * half + k;
+    float c = tab[p.cos_off + ps], sn = tab[p.sin_off + ps];
+    float x0 = x[vb + k], x1 = x[vb + k + half];
+    x[vb + k] = x0 * c - x1 * sn;
+    x[vb + k + half] = x1 * c + x0 * sn;
+}
+/* mode 4 */
+__global__ static void cc_enc_addrow_k(float *y, const float *tab, const int *idx, CcEncAddRow p) {
+    long long i = (long long)blockIdx.x * 256 + threadIdx.x;
+    if (i >= p.n) return;
+    int r = (int)(i / p.D), d = (int)(i - (long long)r * p.D);
+    y[(size_t)p.y_off + (size_t)r * p.y_row + d] += tab[(size_t)p.t_off + (size_t)idx[r] * p.D + d];
+}
+/* mode 5: a block a (head, 16 rows), the union of their ranges in tiles of 32 rows, the
+ * softmax online (a running max and sum a row) */
+#define CC_EBQ 16
+#define CC_EBK 32
+#define CC_EHD 128
+__global__ static void __launch_bounds__(256) cc_enc_attn_k(const float *qkv, const float *c2p, const float *p2c, float *o,
+                                                            const int *rng, const int *ridx, const int *pos, CcEncAttn p) {
+    __shared__ float qs[CC_EBQ * CC_EHD];
+    __shared__ float kv[CC_EBK * (CC_EHD + 1)];
+    __shared__ float sc[CC_EBQ * CC_EBK];
+    __shared__ float mrow[CC_EBQ], lrow[CC_EBQ], crow[CC_EBQ];
+    __shared__ int rlo[CC_EBQ], rhi[CC_EBQ], rpos[CC_EBQ];
+    __shared__ int klo, khi;
+    const int S = p.S, hd = p.hd, HDP = CC_EHD + 1, rel = p.flags & (CC_ENC_C2P | CC_ENC_P2C);
+    int h = blockIdx.x, b0 = blockIdx.y * CC_EBQ, tid = threadIdx.x;
+    int nrow = S - b0 < CC_EBQ ? S - b0 : CC_EBQ;
+    for (int e = tid; e < nrow * hd; e += 256) {
+        int i = e / hd, d = e - i * hd;
+        qs[i * CC_EHD + d] = qkv[(size_t)p.q_off + (size_t)(b0 + i) * p.kv_row + (size_t)h * hd + d];
+    }
+    if (tid < CC_EBQ) {
+        if (tid < nrow) {
+            rlo[tid] = rng[2 * (b0 + tid)]; rhi[tid] = rng[2 * (b0 + tid) + 1];
+            rpos[tid] = rel ? pos[b0 + tid] : 0;
+        } else { rlo[tid] = 1; rhi[tid] = 0; rpos[tid] = 0; }
+        mrow[tid] = -3.0e38f; lrow[tid] = 0.0f;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int lo = 0x7fffffff, hi = -1;
+        for (int i = 0; i < nrow; i++) if (rlo[i] <= rhi[i]) { lo = min(lo, rlo[i]); hi = max(hi, rhi[i]); }
+        klo = lo; khi = hi;
+    }
+    __syncthreads();
+    int pi = tid >> 4, pd = tid & 15;   /* the PV step: row pi, dims pd + 16k */
+    float acc[8];
+    for (int k = 0; k < 8; k++) acc[k] = 0.0f;
+    for (int j0 = klo; j0 <= khi; j0 += CC_EBK) {
+        int nk = khi - j0 + 1 < CC_EBK ? khi - j0 + 1 : CC_EBK;
+        for (int e = tid; e < nk * hd; e += 256) {
+            int jj = e / hd, d = e - jj * hd;
+            kv[jj * HDP + d] = qkv[(size_t)p.k_off + (size_t)(j0 + jj) * p.kv_row + (size_t)h * hd + d];
+        }
+        __syncthreads();
+        for (int u = 0; u < 2; u++) {
+            int pr = tid + 256 * u, i = pr / CC_EBK, jj = pr - i * CC_EBK, j = j0 + jj;
+            float sv = 0.0f;
+            if (i < nrow && jj < nk && j >= rlo[i] && j <= rhi[i]) {
+                float sum = 0.0f;
+                for (int d = 0; d < hd; d++) sum += qs[i * CC_EHD + d] * kv[jj * HDP + d];
+                if (rel) {
+                    int rr = ridx[rpos[i] - pos[j] + p.rc] - p.r0;
+                    if (p.flags & CC_ENC_C2P) sum += c2p[(size_t)p.c_off + ((size_t)h * S + b0 + i) * p.nr + rr];
+                    if (p.flags & CC_ENC_P2C) sum += p2c[(size_t)p.p_off + ((size_t)h * S + j) * p.nr + rr];
+                }
+                sv = sum * p.scale;
+            }
+            sc[i * CC_EBK + jj] = sv;
+        }
+        __syncthreads();
+        if (tid < CC_EBQ) {
+            int i = tid;
+            float m = mrow[i], mn = m;
+            int jlo = rlo[i] - j0 > 0 ? rlo[i] - j0 : 0, jhi = rhi[i] - j0 < nk - 1 ? rhi[i] - j0 : nk - 1;
+            for (int jj = jlo; jj <= jhi; jj++) mn = fmaxf(mn, sc[i * CC_EBK + jj]);
+            float l = 0.0f;
+            for (int jj = 0; jj < CC_EBK; jj++) {
+                float e = jj >= jlo && jj <= jhi ? expf(sc[i * CC_EBK + jj] - mn) : 0.0f;
+                sc[i * CC_EBK + jj] = e;
+                l += e;
+            }
+            float cr = expf(m - mn);
+            crow[i] = cr;
+            lrow[i] = lrow[i] * cr + l;
+            mrow[i] = mn;
+        }
+        __syncthreads();
+        for (int e = tid; e < nk * hd; e += 256) {
+            int jj = e / hd, d = e - jj * hd;
+            kv[jj * HDP + d] = qkv[(size_t)p.v_off + (size_t)(j0 + jj) * p.kv_row + (size_t)h * hd + d];
+        }
+        __syncthreads();
+        if (pi < nrow) {
+            float cr = crow[pi];
+            for (int k = 0; k < 8; k++) {
+                int d = pd + 16 * k;
+                if (d >= hd) break;
+                float t = acc[k] * cr;
+                for (int jj = 0; jj < nk; jj++) t += sc[pi * CC_EBK + jj] * kv[jj * HDP + d];
+                acc[k] = t;
+            }
+        }
+        __syncthreads();
+    }
+    if (pi < nrow) {
+        float l = lrow[pi], inv = l > 0.0f ? 1.0f / l : 0.0f;
+        for (int k = 0; k < 8; k++) {
+            int d = pd + 16 * k;
+            if (d >= hd) break;
+            o[(size_t)p.o_off + (size_t)(b0 + pi) * p.o_row + (size_t)h * hd + d] = acc[k] * inv;
+        }
+    }
+}
+/* mode 6: a block 16 rows by 64 buckets of one head, the inputs 32 at a time */
+#define CC_EBR 64
+#define CC_EDC 32
+__global__ static void __launch_bounds__(256) cc_enc_rel_k(const float *x, const float *pt, float *y, CcEncRel p) {
+    __shared__ float xs[CC_EBQ * (CC_EDC + 1)];
+    __shared__ float ps[CC_EBR * (CC_EDC + 1)];
+    int t0 = blockIdx.x * CC_EBR, i0 = blockIdx.y * CC_EBQ, h = blockIdx.z;
+    int tid = threadIdx.x, tt = tid & 63, iq = tid >> 6;   /* bucket tt, rows 4iq .. 4iq+3 */
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int d0 = 0; d0 < p.hd; d0 += CC_EDC) {
+        int dn = p.hd - d0 < CC_EDC ? p.hd - d0 : CC_EDC;
+        for (int e = tid; e < CC_EBQ * CC_EDC; e += 256) {
+            int i = e / CC_EDC, d = e - i * CC_EDC;
+            xs[i * (CC_EDC + 1) + d] = i0 + i < p.S && d < dn ? x[(size_t)p.x_off + (size_t)(i0 + i) * p.x_row + (size_t)h * p.hd + d0 + d] : 0.0f;
+        }
+        for (int e = tid; e < CC_EBR * CC_EDC; e += 256) {
+            int t = e / CC_EDC, d = e - t * CC_EDC;
+            ps[t * (CC_EDC + 1) + d] = t0 + t < p.nr && d < dn ? pt[(size_t)p.p_off + (size_t)(p.r0 + t0 + t) * p.p_row + (size_t)h * p.hd + d0 + d] : 0.0f;
+        }
+        __syncthreads();
+        for (int d = 0; d < dn; d++) {
+            float pv = ps[tt * (CC_EDC + 1) + d];
+            for (int k = 0; k < 4; k++) acc[k] += xs[(4 * iq + k) * (CC_EDC + 1) + d] * pv;
+        }
+        __syncthreads();
+    }
+    if (t0 + tt < p.nr)
+        for (int k = 0; k < 4; k++) {
+            int i = i0 + 4 * iq + k;
+            if (i < p.S) y[(size_t)p.y_off + ((size_t)h * p.S + i) * p.nr + t0 + tt] = acc[k];
+        }
+}
+static int cc_enc_norm(CcBuf *a, CcBuf *b, CcBuf *prm, CcBuf *y, const CcEncNorm *p) {
+    CcCtx *c = live();
+    if (!c || !a || !prm || !y || !p || p->rows < 1 || p->D < 1 || p->D > 4096 || ((p->flags & CC_ENC_ADD) && !b)) return 0;
+    cc_enc_norm_k<<<(unsigned)p->rows, 256, 0, c->stream>>>(fpw(a), fp(b), fp(prm), fpw(y), *p);
+    return launched(c, "encoder norm");
+}
+static int cc_enc_bias(CcBuf *y, CcBuf *prm, const CcEncBias *p) {
+    CcCtx *c = live();
+    if (!c || !y || !p || p->n < 1 || p->O < 1 || (p->b_off >= 0 && !prm)) return 0;
+    cc_enc_bias_k<<<grid1((size_t)p->n, 256), 256, 0, c->stream>>>(fpw(y), fp(prm), *p);
+    return launched(c, "encoder bias");
+}
+static int cc_enc_geglu(CcBuf *a, CcBuf *prm, CcBuf *y, const CcEncGeglu *p) {
+    CcCtx *c = live();
+    if (!c || !a || !y || !p || p->n < 1 || p->I < 1 || (p->b_off >= 0 && !prm)) return 0;
+    cc_enc_geglu_k<<<grid1((size_t)p->n, 256), 256, 0, c->stream>>>(fp(a), fp(prm), fpw(y), *p);
+    return launched(c, "encoder geglu");
+}
+static int cc_enc_rope(CcBuf *x, CcBuf *tab, CcBuf *pos, const CcEncRope *p) {
+    CcCtx *c = live();
+    if (!c || !x || !tab || !pos || !p || p->n < 1 || p->H < 1 || p->hd < 2) return 0;
+    cc_enc_rope_k<<<grid1((size_t)p->n, 256), 256, 0, c->stream>>>(fpw(x), fp(tab), (const int *)pos->d, *p);
+    return launched(c, "encoder rope");
+}
+static int cc_enc_addrow(CcBuf *y, CcBuf *tab, CcBuf *idx, const CcEncAddRow *p) {
+    CcCtx *c = live();
+    if (!c || !y || !tab || !idx || !p || p->n < 1 || p->D < 1) return 0;
+    cc_enc_addrow_k<<<grid1((size_t)p->n, 256), 256, 0, c->stream>>>(fpw(y), fp(tab), (const int *)idx->d, *p);
+    return launched(c, "encoder add row");
+}
+static int cc_enc_attn(CcBuf *qkv, CcBuf *c2p, CcBuf *p2c, CcBuf *o, CcBuf *rng, CcBuf *ridx, CcBuf *pos, const CcEncAttn *p) {
+    CcCtx *c = live();
+    int rel = p ? p->flags & (CC_ENC_C2P | CC_ENC_P2C) : 0;
+    if (!c || !qkv || !o || !rng || !p || p->S < 1 || p->H < 1 || p->hd < 1 || p->hd > CC_EHD || (p->S + CC_EBQ - 1) / CC_EBQ > 65535 ||
+        (rel && (!ridx || !pos)) || ((p->flags & CC_ENC_C2P) && !c2p) || ((p->flags & CC_ENC_P2C) && !p2c)) return 0;
+    dim3 g((unsigned)p->H, (unsigned)((p->S + CC_EBQ - 1) / CC_EBQ));
+    cc_enc_attn_k<<<g, 256, 0, c->stream>>>(fp(qkv), fp(c2p), fp(p2c), fpw(o), (const int *)rng->d,
+                                           ridx ? (const int *)ridx->d : nullptr, pos ? (const int *)pos->d : nullptr, *p);
+    return launched(c, "encoder attention");
+}
+static int cc_enc_rel(CcBuf *x, CcBuf *pt, CcBuf *y, const CcEncRel *p) {
+    CcCtx *c = live();
+    if (!c || !x || !pt || !y || !p || p->S < 1 || p->H < 1 || p->hd < 1 || p->nr < 1 || p->H > 65535 ||
+        (p->S + CC_EBQ - 1) / CC_EBQ > 65535) return 0;
+    dim3 g((unsigned)((p->nr + CC_EBR - 1) / CC_EBR), (unsigned)((p->S + CC_EBQ - 1) / CC_EBQ), (unsigned)p->H);
+    cc_enc_rel_k<<<g, 256, 0, c->stream>>>(fp(x), fp(pt), fpw(y), *p);
+    return launched(c, "encoder relative products");
+}
 static const ColiCudaChainOps g_cc_ops = {
     sizeof(ColiCudaChainOps),
     cc_init, cc_ready, cc_lost_, cc_shutdown, cc_device, cc_device_now,
@@ -2279,5 +2557,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_attn_h,
     cc_attn_wh,
     cc_copy_regions_h,
+    cc_enc_norm, cc_enc_bias, cc_enc_geglu, cc_enc_rope, cc_enc_addrow, cc_enc_attn, cc_enc_rel,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

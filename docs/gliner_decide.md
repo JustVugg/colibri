@@ -179,6 +179,12 @@ it.
 RAM: 1.81 GB resident for the engine serving the release (peak 1.88 GB):
 the f32 encoder and classifier, 436M parameters of the 486M in the file.
 
+**On a CUDA device** (a `CUDA=1` build, `coli serve --gpu` or `COLI_CUDA=1`): the encoder runs
+on the card, the matrices in f32 (docs/cuda.md "The decision engines"). An RTX PRO 4000
+against its host's CPU (an i5-13500, 6 threads), requests of 12 questions over a
+1,700-character email (one sequence of about 1,100 tokens): 0.16-0.21 s a request against
+2.0-2.6 s, the CPU's decisions, every probability within 5.4e-7 of the CPU's.
+
 ## Knobs
 
 | variable | default | meaning |

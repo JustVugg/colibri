@@ -1450,12 +1450,15 @@ qwenimage$(EXE): qwenimage.c $(VK_OBJ) $(VK_SPV) .build-config
 # Laya (Convai Innovations), a decision model: ModernBERT encoder + decision
 # head, served on POST /v1/systemone through the DECIDE command (docs/laya.md).
 # One file; qi_gemm.h is its matrix kernel, decide_serve.h its serve loop.
+# A CUDA build gives both decision engines the forward on the device (decide_cuda.h):
+# the backend and its chain, or the DLL's loader on Windows.
+DECIDE_CUDA_OBJ = $(filter backend_loader.o backend_cuda.o cuda_chain.o,$(CUDA_OBJ))
 ifneq ($(EXE),)
 .PHONY: laya
 laya: laya$(EXE)
 endif
-laya$(EXE): laya.c $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(CFLAGS) laya.c $(VK_OBJ) -o laya$(EXE) $(LDFLAGS)
+laya$(EXE): laya.c $(DECIDE_CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) laya.c $(DECIDE_CUDA_OBJ) $(VK_OBJ) -o laya$(EXE) $(LDFLAGS)
 
 # GLiNER2.5-Decide (fastino), a decision model: DeBERTa-v3 encoder + GLiNER2's
 # classification head, served on POST /v1/systemone through the DECIDE command
@@ -1465,8 +1468,8 @@ ifneq ($(EXE),)
 .PHONY: gliner_decide
 gliner_decide: gliner_decide$(EXE)
 endif
-gliner_decide$(EXE): gliner_decide.c $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(CFLAGS) gliner_decide.c $(VK_OBJ) -o gliner_decide$(EXE) $(LDFLAGS)
+gliner_decide$(EXE): gliner_decide.c $(DECIDE_CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) gliner_decide.c $(DECIDE_CUDA_OBJ) $(VK_OBJ) -o gliner_decide$(EXE) $(LDFLAGS)
 
 # Tiny Laya checkpoint + the laya package's own answers on it. The generator is
 # numpy and deterministic; laya_tiny/ref.json is committed and comes from the

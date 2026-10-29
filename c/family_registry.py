@@ -1791,7 +1791,8 @@ FAMILIES = (
         # one-shot `coli run` has nothing to run: a decision needs questions,
         # which come over POST /v1/systemone from `coli serve` / `coli web`
         has_cli_adapter=False,
-        supports_accelerator=False,
+        # COLI_CUDA=1 (--gpu): the forward on a CUDA device (decide_cuda.h); no tier to size
+        supports_accelerator=True,
         modality="decision",
         tokenizer_file="tokenizer/tokenizer.json",
         checkpoint_files=("tokenizer/tokenizer_config.json", "encoder/config.json"),
@@ -1836,7 +1837,8 @@ FAMILIES = (
         capabilities=FamilyCapabilities(False, False, False, False, decision=True),
         has_gateway_adapter=True,
         has_cli_adapter=False,
-        supports_accelerator=False,
+        # COLI_CUDA=1 (--gpu): the forward on a CUDA device (decide_cuda.h); no tier to size
+        supports_accelerator=True,
         modality="decision",
         tokenizer_file="tokenizer.json",
         checkpoint_files=("config.json", "encoder_config/config.json"),
