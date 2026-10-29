@@ -3141,10 +3141,25 @@ static void serve_loop(Model *m, Tok *T, int ctx_cap) {
 }
 
 /* ---------- lettura ref.json ---------- */
+/* qwen38.c's: a file that is not an oracle's (no such array, a value that is no token id)
+ * is refused with a line, where it read through a null pointer */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
     jval *a = json_get(o, key);
-    int *r = malloc(a->len * sizeof(int));
-    for (int i = 0; i < a->len; i++) r[i] = (int)a->kids[i]->num;
+    if (!a || a->t != J_ARR) { fprintf(stderr, "ref.json: missing array \"%s\"\n", key); exit(1); }
+    if (a->len < 1 || (uint64_t)a->len > SIZE_MAX / sizeof(int)) {
+        fprintf(stderr, "ref.json: invalid array length for \"%s\"\n", key); exit(1);
+    }
+    int *r = malloc((size_t)a->len * sizeof(int));
+    if (!r) { fprintf(stderr, "ref.json: OOM reading \"%s\"\n", key); exit(1); }
+    for (int i = 0; i < a->len; i++) {
+        jval *v = a->kids[i];
+        if (!v || v->t != J_NUM || !isfinite(v->num) || v->num < 0 ||
+            v->num > INT_MAX || floor(v->num) != v->num) {
+            fprintf(stderr, "ref.json: %s[%d] must be a non-negative integer\n", key, i);
+            exit(1);
+        }
+        r[i] = (int)v->num;
+    }
     *n_out = a->len; return r;
 }
 
