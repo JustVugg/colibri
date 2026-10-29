@@ -1068,7 +1068,7 @@ backend_cuda_ink.o: backend_cuda_ink.cu backend_cuda_ink.h .build-config
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_ink.cu -o $@
 
-backend_cuda.o: backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h .build-config
+backend_cuda.o: backend_cuda.cu backend_cuda.h cuda_bd.cuh cuda_chain.h fp8_format.h backend_gpu_compat.h .build-config
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) -c backend_cuda.cu -o $@
 
@@ -1370,18 +1370,16 @@ fp8-bench: fp8_bench$(EXE)
 tests/bench_cuda_resident_batch$(EXE): tests/bench_cuda_resident_batch.cu backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/bench_cuda_resident_batch.cu -o $@ $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 
-# NOCUDA_*: olmoe.c has no COLI_CUDA code at all, so CUDA=1 would otherwise
-# hand it a define matching nothing and link a runtime it never calls -- a
-# build whose compile line, libraries and exit status all claim "CUDA" while
-# the GPU sits idle. Same guard #783 put on kimi_k3, which since gaining an
-# MXFP4 expert path no longer needs it. tests/test_makefile_cuda_scope.py
-# asserts this shape.
+# An engine whose CUDA path is the chain alone (olmoe_cuda_chain.h, the decision engines'
+# decide_cuda.h) links the backend and its chain, or the DLL's loader on Windows.
+# tests/test_makefile_cuda_scope.py asserts olmoe gets CUDA=1's flags.
+CHAIN_CUDA_OBJ = $(filter backend_loader.o backend_cuda.o cuda_chain.o,$(CUDA_OBJ))
 ifneq ($(EXE),)
 .PHONY: olmoe
 olmoe: olmoe$(EXE)
 endif
-olmoe$(EXE): olmoe.c $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(NOCUDA_CFLAGS) olmoe.c $(VK_OBJ) -o olmoe$(EXE) $(NOCUDA_LDFLAGS)
+olmoe$(EXE): olmoe.c $(CHAIN_CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) olmoe.c $(CHAIN_CUDA_OBJ) $(VK_OBJ) -o olmoe$(EXE) $(LDFLAGS)
 
 # Qwen3.6-35B-A3B engine (hybrid Gated Attention + Gated DeltaNet + streaming
 # MoE). With CUDA=1 the optional VRAM expert tier (qwen36_tier.c) is compiled
@@ -1450,9 +1448,6 @@ qwenimage$(EXE): qwenimage.c $(VK_OBJ) $(VK_SPV) .build-config
 # Laya (Convai Innovations), a decision model: ModernBERT encoder + decision
 # head, served on POST /v1/systemone through the DECIDE command (docs/laya.md).
 # One file; qi_gemm.h is its matrix kernel, decide_serve.h its serve loop.
-# An engine whose CUDA path is the chain alone (the decision engines: decide_cuda.h) links
-# the backend and its chain, or the DLL's loader on Windows.
-CHAIN_CUDA_OBJ = $(filter backend_loader.o backend_cuda.o cuda_chain.o,$(CUDA_OBJ))
 ifneq ($(EXE),)
 .PHONY: laya
 laya: laya$(EXE)
@@ -2309,8 +2304,8 @@ tests/test_k3_chat_tools$(EXE): tests/test_k3_chat_tools.c kimi_k3.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 # olmoe's matmul_q, not colibri's: compares the IDOT path against FP32
-# ACTIVATIONS rather than an integer reference. NOCUDA_* for the same reason
-# the olmoe target uses it -- olmoe.c contains no COLI_CUDA code.
+# ACTIVATIONS rather than an integer reference. NOCUDA_*: these tests read the
+# CPU paths, so olmoe.c compiles without its CUDA chain (olmoe_cuda_chain.h).
 tests/test_olmoe_matmul_q$(EXE): tests/test_olmoe_matmul_q.c olmoe.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
