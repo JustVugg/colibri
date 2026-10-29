@@ -2221,6 +2221,10 @@ tests/test_gq_r16$(EXE): tests/test_gq_r16.c
 # forms' kernels, to the bit; a no-op on a build without AVX2. `tests/test_rows_f8 bench` times them.
 tests/test_rows_f8$(EXE): tests/test_rows_f8.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# A prompt's rows of the types with no R16 form, 16 file rows unpacked once (gq_tile16_rows),
+# against their scalar reference to the bit and the row kernels; `tests/test_tile16 bench` times them.
+tests/test_tile16$(EXE): tests/test_tile16.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # The trunk's int8 rows interleaved by 16 (idot.h) against matmul_q_idot, to the bit.
 tests/test_idot_r16$(EXE): tests/test_idot_r16.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
