@@ -2047,6 +2047,21 @@ def server_arch(base, api_key=None, timeout=1.5):
     except Exception:
         return None
 
+def sse_data(lines):
+    """Join an SSE event's data fields before decoding its JSON payload."""
+    data=[]
+    for raw in lines:
+        line=raw.decode("utf-8","replace").rstrip("\r\n")
+        if not line:
+            if data:
+                yield "\n".join(data)
+                data=[]
+            continue
+        field, _, value=line.partition(":")
+        if field=="data":
+            data.append(value[1:] if value.startswith(" ") else value)
+
+
 def chat_attached(a, base, model_id):
     """The chat REPL over HTTP against a running `coli serve`.
 
@@ -2160,10 +2175,7 @@ def chat_attached(a, base, model_id):
         exact_tokens=None; finish=None
         try:
             with urllib.request.urlopen(req) as r:
-                for raw in r:
-                    line=raw.decode("utf-8","replace").strip()
-                    if not line.startswith("data: "): continue
-                    data=line[6:]
+                for data in sse_data(r):
                     if data=="[DONE]": break
                     try: ev=json.loads(data)
                     except ValueError: continue
