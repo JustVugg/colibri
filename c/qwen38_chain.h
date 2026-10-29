@@ -169,6 +169,15 @@ static int q38c_bufs(Q38Chain *ch, Model *m, int rows) {
 /* Prompt rows per chunk (vkc_chunk_rows): the chain's scratch a row, counted from the
  * reservations themselves (at the cache's capacity: QSA's scores grow with it), and the
  * routed experts' outputs (the tier's rows and the host's sum) for it. */
+/* COLI_VK_CHAIN_LAYERWISE (q38c_forward_lm): 0 off, 1 forced (tests: no staging needed), 2 where a layer stages */
+static int q38c_layer_major(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_CHAIN_LAYERWISE"); on = e && *e == '0' ? 0 : e && *e == '1' ? 1 : 2; }
+    return on;
+}
+/* a prompt run layer by layer goes in segments of this many chunks: a segment's streams on
+ * the device (hyper_all) stay bounded whatever the prompt's length */
+#define Q38C_LM_CHUNKS 4
 static int q38c_chunk_rows(Q38Chain *ch, Model *m) {
     int keep = ch->rows;
     ch->rows = 1; g_q38c_count = 0; q38c_bufs(ch, m, 1); long long b1 = g_q38c_count;
@@ -183,6 +192,7 @@ static int q38c_chunk_rows(Q38Chain *ch, Model *m) {
                       + sizeof(Q38RouteAssignment) + 4 * sizeof(int) + sizeof(uint8_t) + sizeof(float *);
     row += (size_t)c->topk * assignment
          + ((size_t)c->experts + 3 * (size_t)c->shared_inter + c->hidden + 1) * sizeof(float);
+    if (q38c_layer_major()) row += (size_t)Q38C_LM_CHUNKS * c->hc_width * sizeof(float);   /* a segment's streams (q38c_forward_lm) */
     return vkc_chunk_rows(q38c_name(ch), row);
 }
 /* What the chain allocates at its first forward, after the tier has filled the device:
@@ -1198,11 +1208,6 @@ static void q38c_dmoe_done(Q38Chain *ch, Model *m, int from, int to, int n, int 
  * Taken where the host pool's experts stage (a GGUF's block types: vk_dmoe.h); without
  * staging a chunk reads them over the bus either way. COLI_VK_CHAIN_LAYERWISE=0 keeps
  * the chunks, =1 takes it without staging too (tests). */
-static int q38c_layer_major(void) {   /* 0 off, 1 forced (tests: no staging needed), 2 where a layer stages */
-    static int on = -1;
-    if (on < 0) { const char *e = getenv("COLI_VK_CHAIN_LAYERWISE"); on = e && *e == '0' ? 0 : e && *e == '1' ? 1 : 2; }
-    return on;
-}
 static int q38c_lm_layers(Model *m, Q38Chain *ch, const int *ids, int S, int pos_base, int nlogits,
                           const float *hyper_h, int rows, const float *cs_all);
 /* 1 done, 0 declined before any layer ran (the chunks then, in the frame begun here), -1 lost */
@@ -1213,7 +1218,7 @@ static int q38c_forward_lm(Model *m, Q38Chain *ch, const int *ids, int S, int po
     if (!vkc_begin() || !vkc_dmoe_upload(&ch->dm)) return -1;
     if (q38c_layer_major() == 2 && !vkc_dmoe_staging(&ch->dm)) return 0;
     for (int i = lo; i < hi; i++) if (!vkc_dmoe_on(&ch->dm, i)) return 0;
-    if (!q38c_res(&ch->hyper_all, (size_t)S * W, VKC_DEV)) return 0;
+    if (!q38c_res(&ch->hyper_all, (size_t)(S < Q38C_LM_CHUNKS * rows ? S : Q38C_LM_CHUNKS * rows) * W, VKC_DEV)) return 0;
     float *cs_all = half ? malloc((size_t)S * half * 2 * sizeof(float)) : NULL;   /* every row's angles, once */
     if (half && !cs_all) return 0;
     for (int r = 0; half && r < S; r++) for (int j = 0; j < half; j++) {
@@ -1232,50 +1237,55 @@ static int q38c_lm_layers(Model *m, Q38Chain *ch, const int *ids, int S, int pos
                           const float *hyper_h, int rows, const float *cs_all) {
     Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, lo = ch->lo, hi = lo + ch->nl, V = c->vocab, E = c->experts;
     int half = c->rotary_dim / 2;
-    if (!q38c_push_state(ch, m, pos_base, S) || !vkc_write(ch->hyper_all, 0, hyper_h, (size_t)S * W * 4)) return -1;
-    for (int i = lo; i < hi; i++) {
-        Layer *l = &m->L[i];
-        for (int c0 = 0; c0 < S; c0 += rows) {
-            int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0;
-            if (!vkc_begin() || !vkc_dmoe_upload(&ch->dm)) return -1;
-            if (half) memcpy(vkc_ptr(ch->cs), cs_all + (size_t)c0 * half * 2, (size_t)n * half * 2 * sizeof(float));
-            int ok = vkc_copy(ch->hyper, 0, ch->hyper_all, (size_t)c0 * W, (size_t)n * W);
-            if (ok && i == c->ple_layer) { q38c_ple_rows(m, ids, c0, n, ch->host_emb); ok = q38c_ple(ch, m, n, c0, 0); }
-            ok = ok && q38c_gr_read(ch, m, &l->attn_gr, ch->o_an[i], n, ch->inj_a);
-            ok = ok && (c->is_attn[i] ? q38c_attention(ch, m, l, i, n, pb) : q38c_deltanet(ch, m, l, i, n, c0, 0));
-            ok = ok && q38c_gr_apply(ch, m, ch->inj_a, n);
-            ok = ok && q38c_gr_read(ch, m, &l->mlp_gr, ch->o_mn[i], n, ch->inj_m);
-            int dl = vkc_dmoe_on(&ch->dm, i);
-            if (dl) {
-                VkcRoute rp = {.kind = 0, .n_group = 1, .topk_group = 1, .norm = c->norm_topk ? 1 : 0, .temp = 1.f, .scale = 1.f};
-                VkcMoe mp = {.D = H, .I = c->inter, .act = 0, .blocks = g_q38_gguf};
-                ok = ok && vkc_matmul(q38c_t(&l->router), ch->mixed, 0, ch->lg, 0, n) && q38c_shared(ch, m, l, i, n) &&
-                     vkc_dmoe_layer(&ch->dm, i, n, ch->lg, NULL, ch->mixed, &rp, &mp) && q38c_moe_apply(ch, m, n, ch->dm.y);
-            } else {   /* the tier moved this layer's experts out mid-prompt: the host's step, as chunk by chunk */
-                ok = ok && vkc_matmul(q38c_t(&l->router), ch->mixed, 0, ch->lg, 0, n) &&
-                     vkc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && vkc_copy(ch->mixd, 0, ch->mixed, 0, (size_t)n * H) &&
-                     q38c_shared(ch, m, l, i, n) && vkc_submit(1);
+    const int SEG = Q38C_LM_CHUNKS * rows;
+    for (int g0 = 0; g0 < S; g0 += SEG) {   /* a segment: its rows' streams up */
+        int gn = S - g0 < SEG ? S - g0 : SEG;
+        if ((g0 && (!vkc_begin() || !vkc_dmoe_upload(&ch->dm))) || !q38c_push_state(ch, m, pos_base + g0, gn) ||
+            !vkc_write(ch->hyper_all, 0, hyper_h + (size_t)g0 * W, (size_t)gn * W * 4)) return -1;
+        for (int i = lo; i < hi; i++) {
+            Layer *l = &m->L[i];
+            for (int c0 = g0; c0 < g0 + gn; c0 += rows) {
+                int n = g0 + gn - c0 < rows ? g0 + gn - c0 : rows, pb = pos_base + c0;
+                if (!vkc_begin() || !vkc_dmoe_upload(&ch->dm)) return -1;
+                if (half) memcpy(vkc_ptr(ch->cs), cs_all + (size_t)c0 * half * 2, (size_t)n * half * 2 * sizeof(float));
+                int ok = vkc_copy(ch->hyper, 0, ch->hyper_all, (size_t)(c0 - g0) * W, (size_t)n * W);
+                if (ok && i == c->ple_layer) { q38c_ple_rows(m, ids, c0, n, ch->host_emb); ok = q38c_ple(ch, m, n, c0, 0); }
+                ok = ok && q38c_gr_read(ch, m, &l->attn_gr, ch->o_an[i], n, ch->inj_a);
+                ok = ok && (c->is_attn[i] ? q38c_attention(ch, m, l, i, n, pb) : q38c_deltanet(ch, m, l, i, n, c0, 0));
+                ok = ok && q38c_gr_apply(ch, m, ch->inj_a, n);
+                ok = ok && q38c_gr_read(ch, m, &l->mlp_gr, ch->o_mn[i], n, ch->inj_m);
+                int dl = vkc_dmoe_on(&ch->dm, i);
+                if (dl) {
+                    VkcRoute rp = {.kind = 0, .n_group = 1, .topk_group = 1, .norm = c->norm_topk ? 1 : 0, .temp = 1.f, .scale = 1.f};
+                    VkcMoe mp = {.D = H, .I = c->inter, .act = 0, .blocks = g_q38_gguf};
+                    ok = ok && vkc_matmul(q38c_t(&l->router), ch->mixed, 0, ch->lg, 0, n) && q38c_shared(ch, m, l, i, n) &&
+                         vkc_dmoe_layer(&ch->dm, i, n, ch->lg, NULL, ch->mixed, &rp, &mp) && q38c_moe_apply(ch, m, n, ch->dm.y);
+                } else {   /* the tier moved this layer's experts out mid-prompt: the host's step, as chunk by chunk */
+                    ok = ok && vkc_matmul(q38c_t(&l->router), ch->mixed, 0, ch->lg, 0, n) &&
+                         vkc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && vkc_copy(ch->mixd, 0, ch->mixed, 0, (size_t)n * H) &&
+                         q38c_shared(ch, m, l, i, n) && vkc_submit(1);
+                    if (!ok) return -1;
+                    q38c_kv_down(ch, m, i, n, pb);
+                    q38_moe_ex(m, l, i, (const float *)vkc_ptr(ch->mixd), n, ch->host_routed, (const float *)vkc_ptr(ch->lgd), 1);
+                    memcpy(vkc_ptr(ch->routed), ch->host_routed, (size_t)n * H * sizeof(float));
+                    ok = vkc_begin() && vkc_dmoe_upload(&ch->dm) && q38c_moe_apply(ch, m, n, ch->routed);
+                }
+                ok = ok && vkc_copy(ch->hyper_all, (size_t)(c0 - g0) * W, ch->hyper, 0, (size_t)n * W);
+                /* after the last layer, the head on this chunk's share of the last nlogits rows */
+                int lo0 = S - nlogits > c0 ? S - nlogits - c0 : 0, lo_n = n - lo0;
+                if (ok && i == hi - 1 && lo0 < n && c0 + n > S - nlogits) {
+                    int dst = c0 + lo0 - (S - nlogits);
+                    ok = q38c_gr_read(ch, m, &m->final_gr, ch->o_fn, n, NULL) &&
+                         vkc_matmul(q38c_t(&m->lm_head), ch->mixed, (size_t)lo0 * H, ch->outd, (size_t)dst * V, lo_n);
+                }
+                double t0 = now_s();
+                ok = ok && vkc_submit(1);
+                m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0;
                 if (!ok) return -1;
-                q38c_kv_down(ch, m, i, n, pb);
-                q38_moe_ex(m, l, i, (const float *)vkc_ptr(ch->mixd), n, ch->host_routed, (const float *)vkc_ptr(ch->lgd), 1);
-                memcpy(vkc_ptr(ch->routed), ch->host_routed, (size_t)n * H * sizeof(float));
-                ok = vkc_begin() && vkc_dmoe_upload(&ch->dm) && q38c_moe_apply(ch, m, n, ch->routed);
+                if (dl) q38c_dmoe_done(ch, m, i, i + 1, n, pb);
+                if (c->is_attn[i]) { ch->kv_valid[i] = pb + n; vkc_kv_done(&ch->ks, ch->attn_ord[i], pb + n); }
+                ch->dn_where = Q38C_DEV; ch->host_zero = 0;
             }
-            ok = ok && vkc_copy(ch->hyper_all, (size_t)c0 * W, ch->hyper, 0, (size_t)n * W);
-            /* after the last layer, the head on this chunk's share of the last nlogits rows */
-            int lo0 = S - nlogits > c0 ? S - nlogits - c0 : 0, lo_n = n - lo0;
-            if (ok && i == hi - 1 && lo0 < n && c0 + n > S - nlogits) {
-                int dst = c0 + lo0 - (S - nlogits);
-                ok = q38c_gr_read(ch, m, &m->final_gr, ch->o_fn, n, NULL) &&
-                     vkc_matmul(q38c_t(&m->lm_head), ch->mixed, (size_t)lo0 * H, ch->outd, (size_t)dst * V, lo_n);
-            }
-            double t0 = now_s();
-            ok = ok && vkc_submit(1);
-            m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0;
-            if (!ok) return -1;
-            if (dl) q38c_dmoe_done(ch, m, i, i + 1, n, pb);
-            if (c->is_attn[i]) { ch->kv_valid[i] = pb + n; vkc_kv_done(&ch->ks, ch->attn_ord[i], pb + n); }
-            ch->dn_where = Q38C_DEV; ch->host_zero = 0;
         }
     }
     return 1;

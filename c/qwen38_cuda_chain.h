@@ -121,6 +121,15 @@ static int q38cc_rows_env(void) {
     int r = e && *e ? atoi(e) : 2048;
     return r < 1 ? 1 : r > 8192 ? 8192 : r;
 }
+/* COLI_CUDA_CHAIN_LAYERWISE (q38cc_forward_lm): 0 chunk by chunk */
+static int q38cc_layer_major(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_CHAIN_LAYERWISE"); on = !(e && *e == '0'); }
+    return on;
+}
+/* a prompt run layer by layer goes in segments of this many chunks: every row's streams of
+ * a segment on the device (hyper_all) stay bounded whatever the prompt's length */
+#define Q38CC_LM_CHUNKS 4
 static void q38cc_fatal(const char *what) {
     fprintf(stderr, "[chain] qwen38: %s -- stopping (COLI_CUDA_CHAIN=0 keeps the state on the CPU)\n", what);
     exit(1);
@@ -249,6 +258,18 @@ static size_t q38cc_reserve_bytes(Model *m) {
     size_t row = 7 * W + c->hc_rank + 6 * H + 2 * (size_t)c->hc_count + 3 * QH * D + 2 * kvo + ipw + 2 * nb + (size_t)q38cc_selrow(c) +
                  2 * (size_t)c->dn_conv_dim + 2 * V + 2 * (size_t)c->dn_vheads + 2 * E + 3 * SI + Ep + (size_t)(c->rotary_dim > 0 ? c->rotary_dim : 2);
     b += (size_t)q38cc_rows_env() * row * F + 2 * (size_t)c->vocab * F;
+    /* a verify's copies of the DeltaNet state and rings (q38cc_spec_slots), the routed experts'
+     * scratch for a prompt chunk (q38cc_dm_begin: their hidden rows, the sum, the routes), and a
+     * segment's streams of a prompt run layer by layer: past the estimate, 2048-row chunks left
+     * the chain short of the copies, and every verify went to the CPU (Qwen3.8-Flash-Next IQ2_XS,
+     * RTX PRO 4000: 3.21 GiB kept, 3.34-3.51 used, decode 43.6 -> 20.4 tok/s) */
+    {
+        size_t R = (size_t)q38cc_rows_env(), K = (size_t)c->topk;
+        b += (size_t)Q38_SPEC_SNAPS * (L - n_attn) *
+             ((size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim + (size_t)c->dn_conv_dim * (c->dn_convk - 1)) * F;
+        if (E > 0) b += (cc_moe_hid_floats((int)R, (int)K, (int)H, c->inter, (int)E) + R * H + 2 * (size_t)L * R * K) * F;
+        if (q38cc_layer_major()) b += (size_t)Q38CC_LM_CHUNKS * R * W * F;
+    }
     for (int i = 0; i < L; i++) {   /* the matrices the trunk's table does not offer: the chain's own copies */
         Q38Weight *w[Q38CC_MATS]; const char *nm[Q38CC_MATS]; int n = q38cc_mats(m, i, w, nm);
         for (int k = 0; k < n; k++) {
@@ -1505,11 +1526,6 @@ static int q38cc_frame_begin(Q38CChain *ch) {
  * (the host's tables it writes and its K/V rows down are a chunk's, each chunk the bits it
  * gets chunk by chunk). The promotions' books wait for the decode. COLI_CUDA_CHAIN_LAYERWISE:
  * 0 chunk by chunk. */
-static int q38cc_layer_major(void) {
-    static int on = -1;
-    if (on < 0) { const char *e = getenv("COLI_CUDA_CHAIN_LAYERWISE"); on = !(e && *e == '0'); }
-    return on;
-}
 /* layer i's routed experts for one chunk of a prompt run layer by layer: wait for the layer's
  * copy at its first chunk (first), start the next staged layer's after its last (last) */
 static int q38cc_dm_layer_lm(Q38CChain *ch, Model *m, Layer *l, int i, int n, int first, int last) {
@@ -1537,50 +1553,54 @@ static int q38cc_forward_lm(Model *m, Q38CChain *ch, const int *ids, int S, int 
     if (!q38cc_dm_begin(ch, m, rows)) return cc_lost() ? -1 : 0;
     if (q38cc_dm_tab(ch, rows) != ch->dm_tabb) return 0;   /* nothing stages: the chunks read it either way */
     for (int i = 0; i < L; i++) if (ch->dm_part[i]) return 0;   /* a hybrid layer: the chunks' host steps */
-    if (!cc_reserve(&ch->hyper_all, (size_t)S * W * 4, CC_DEV)) return 0;
+    const int SEG = Q38CC_LM_CHUNKS * rows, seg = S < SEG ? S : SEG;
+    if (!cc_reserve(&ch->hyper_all, (size_t)seg * W * 4, CC_DEV)) return 0;
     float *cs_all = half ? malloc((size_t)S * half * 2 * sizeof(float)) : NULL;   /* every row's angles, once */
     if (half && !cs_all) return 0;
     for (int r = 0; half && r < S; r++) for (int j = 0; j < half; j++) {
         float ang = (float)(pos_base + r) / powf(c->theta, (float)(2 * j) / c->rotary_dim);
         cs_all[((size_t)r * half + j) * 2] = cosf(ang); cs_all[((size_t)r * half + j) * 2 + 1] = sinf(ang);
     }
-    if (!q38cc_frame_begin(ch) || !cc_write(ch->hyper_all, 0, hyper_h, (size_t)S * W * 4) ||
-        !q38cc_push_state(ch, m, pos_base) || !q38cc_stage_from(ch, m, 0)) { free(cs_all); return -1; }
-    for (int i = 0; i < L; i++) {
-        Layer *l = &m->L[i];
-        for (int c0 = 0; c0 < S; c0 += rows) {
-            int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0;
-            if (!q38cc_frame_begin(ch)) { free(cs_all); return -1; }
-            if (half) memcpy(cc_ptr(ch->cs), cs_all + (size_t)c0 * half * 2, (size_t)n * half * 2 * sizeof(float));
-            int ok = cc_copy(ch->hyper, 0, ch->hyper_all, (size_t)c0 * W, (size_t)n * W);
-            if (ok && i == c->ple_layer) { q38cc_ple_rows(m, ids, c0, n, ch->host_emb); ok = q38cc_ple(ch, m, n, c0, 0); }
-            ok = ok && q38cc_gr_read(ch, m, &l->attn_gr, ch->o_an[i], n, ch->inj_a);
-            ok = ok && (c->is_attn[i] ? q38cc_attention(ch, m, l, i, n, pb) : q38cc_deltanet(ch, m, l, i, n, c0, 0));
-            ok = ok && q38cc_gr_apply(ch, m, ch->inj_a, n);
-            ok = ok && q38cc_gr_read(ch, m, &l->mlp_gr, ch->o_mn[i], n, ch->inj_m);
-            ok = ok && q38cc_dm_layer_lm(ch, m, l, i, n, c0 == 0, c0 + n >= S) && q38cc_moe_apply(ch, m, n, ch->dm_y);
-            ok = ok && cc_copy(ch->hyper_all, (size_t)c0 * W, ch->hyper, 0, (size_t)n * W);
-            int lo0 = S - nlogits > c0 ? S - nlogits - c0 : 0, lo_n = n - lo0;
-            if (ok && i == L - 1 && lo0 < n && c0 + n > S - nlogits) {
-                int dst = c0 + lo0 - (S - nlogits);
-                ok = q38cc_gr_read(ch, m, &m->final_gr, ch->o_fn, n, NULL) &&
-                     cc_matmul(q38cc_t(ch, &m->lm_head), ch->mixed, (size_t)lo0 * H, ch->outd, (size_t)dst * V, lo_n);
+    for (int g0 = 0; g0 < S; g0 += SEG) {   /* a segment: its rows' streams up, the first staged layer's copy */
+        int gn = S - g0 < SEG ? S - g0 : SEG;
+        if (!q38cc_frame_begin(ch) || !cc_write(ch->hyper_all, 0, hyper_h + (size_t)g0 * W, (size_t)gn * W * 4) ||
+            !q38cc_push_state(ch, m, pos_base + g0) || !q38cc_stage_from(ch, m, 0)) { free(cs_all); return -1; }
+        for (int i = 0; i < L; i++) {
+            Layer *l = &m->L[i];
+            for (int c0 = g0; c0 < g0 + gn; c0 += rows) {
+                int n = g0 + gn - c0 < rows ? g0 + gn - c0 : rows, pb = pos_base + c0;
+                if (!q38cc_frame_begin(ch)) { free(cs_all); return -1; }
+                if (half) memcpy(cc_ptr(ch->cs), cs_all + (size_t)c0 * half * 2, (size_t)n * half * 2 * sizeof(float));
+                int ok = cc_copy(ch->hyper, 0, ch->hyper_all, (size_t)(c0 - g0) * W, (size_t)n * W);
+                if (ok && i == c->ple_layer) { q38cc_ple_rows(m, ids, c0, n, ch->host_emb); ok = q38cc_ple(ch, m, n, c0, 0); }
+                ok = ok && q38cc_gr_read(ch, m, &l->attn_gr, ch->o_an[i], n, ch->inj_a);
+                ok = ok && (c->is_attn[i] ? q38cc_attention(ch, m, l, i, n, pb) : q38cc_deltanet(ch, m, l, i, n, c0, 0));
+                ok = ok && q38cc_gr_apply(ch, m, ch->inj_a, n);
+                ok = ok && q38cc_gr_read(ch, m, &l->mlp_gr, ch->o_mn[i], n, ch->inj_m);
+                ok = ok && q38cc_dm_layer_lm(ch, m, l, i, n, c0 == g0, c0 + n >= g0 + gn) && q38cc_moe_apply(ch, m, n, ch->dm_y);
+                ok = ok && cc_copy(ch->hyper_all, (size_t)(c0 - g0) * W, ch->hyper, 0, (size_t)n * W);
+                int lo0 = S - nlogits > c0 ? S - nlogits - c0 : 0, lo_n = n - lo0;
+                if (ok && i == L - 1 && lo0 < n && c0 + n > S - nlogits) {
+                    int dst = c0 + lo0 - (S - nlogits);
+                    ok = q38cc_gr_read(ch, m, &m->final_gr, ch->o_fn, n, NULL) &&
+                         cc_matmul(q38cc_t(ch, &m->lm_head), ch->mixed, (size_t)lo0 * H, ch->outd, (size_t)dst * V, lo_n);
+                }
+                double t0 = now_s();
+                ok = ok && cc_submit(1);   /* the frame's stream: the next staged layer's copy goes on beside the next frames */
+                m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0; ch->wait_ms += (now_s() - t0) * 1e3;
+                if (!ok) { free(cs_all); return -1; }
+                /* layer i's books for these rows (q38cc_dm_books' for one layer) */
+                q38cc_kv_down(ch, m, i, n, pb);
+                const int *idv = (const int *)cc_ptr(ch->dm_idsd) + (size_t)i * ch->rows * K;
+                for (int s = 0; s < n; s++) { rt_count(i, idv + s * K, K); if (!ch->own) qt_chain_count(i, idv + s * K, K); }
+                for (int j = 0; j < n * K; j++) if (idv[j] >= 0) {
+                    q38_ehit_mark(m, i, idv[j]);
+                    ch->routes++;
+                    if (ch->dm_res[(size_t)i * E + idv[j]] >= 2) ch->pool_reads++;
+                }
+                if (c->is_attn[i]) ch->kv_valid[i] = pb + n;
+                ch->dn_where = Q38CC_DEV; ch->host_zero = 0;
             }
-            double t0 = now_s();
-            ok = ok && cc_submit(1);   /* the frame's stream: the next staged layer's copy goes on beside the next frames */
-            m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0; ch->wait_ms += (now_s() - t0) * 1e3;
-            if (!ok) { free(cs_all); return -1; }
-            /* layer i's books for these rows (q38cc_dm_books' for one layer) */
-            q38cc_kv_down(ch, m, i, n, pb);
-            const int *idv = (const int *)cc_ptr(ch->dm_idsd) + (size_t)i * ch->rows * K;
-            for (int s = 0; s < n; s++) { rt_count(i, idv + s * K, K); if (!ch->own) qt_chain_count(i, idv + s * K, K); }
-            for (int j = 0; j < n * K; j++) if (idv[j] >= 0) {
-                q38_ehit_mark(m, i, idv[j]);
-                ch->routes++;
-                if (ch->dm_res[(size_t)i * E + idv[j]] >= 2) ch->pool_reads++;
-            }
-            if (c->is_attn[i]) ch->kv_valid[i] = pb + n;
-            ch->dn_where = Q38CC_DEV; ch->host_zero = 0;
         }
     }
     free(cs_all);
