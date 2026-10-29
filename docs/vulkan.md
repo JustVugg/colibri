@@ -2437,10 +2437,46 @@ computes the ones it holds:
   timeline;
 - frame B runs the device's experts from a table where the host pool's are zero;
 - frame C waits for the host's timeline and adds the CPU's sum;
-- a worker thread takes the steps in order: it waits for frame A, computes the pairs as
+- the engine's own thread computes the pairs one layer behind its recording: once the
+  next layer's step is recorded (or a table is read again, or any frame is waited for, or
+  at the end) it waits for the device to reach the route, computes the pairs as
   `ggml_quants.h` does a GGUF's matmuls (int8 activations, integer dots; the float
   reference with `GQ_EXACT=1`), from the host pool's rows as the file has them, writes
-  their weighted sum and signals.
+  their weighted sum and signals; the device's experts run meanwhile. A worker thread with
+  an OpenMP team of its own took the steps before, and beside the engine's spinning team
+  (`OMP_WAIT_POLICY=ACTIVE`) it lost its cores: on a Threadripper 3945WX with Qwen3.6 int4
+  (1.4 pool pairs a step) a step took 789 us with 12 threads and 328 with 2, the same
+  pairs alone 50 us.
+
+Where the device has events (every device), a step stays inside its frame, as the CUDA
+chain's does with its host flags: `vkCmdSetEvent` once the route and the rows are down
+(the host polls `vkGetEventStatus`), the device's experts, `vkCmdWaitEvents` on the event
+the host sets after writing its sum, the add; one frame a layer instead of three, and no
+timeline round trip. A shader polling a word in host memory, as CUDA does, does not work
+on NVIDIA: the loads and the atomics are served from the device's L2 and see the host's
+write only at the frame's end. `COLI_VK_HYBRID_EVENTS=0` takes frames A/B/C and the
+timelines instead. On the RTX 3070 (Qwen3.6 int4, 1.3 pool pairs a step, 200 tokens) the
+three frames cost 33.7 against 48.4 tok/s with the device's own reads; on events 45.8
+against 48.3, and with every pool pair on the CPU (`COLI_VK_HYBRID_PCIE=0`) 46.6; with
+unsloth's UD-Q4_K_M GGUF 37.3 against 34.8. The device waits 15 us a step for the host
+and its experts take 2.7 ms a token less, but the card's clocks follow its utilisation:
+780 MHz with the steps against 900 to 960 without, and every other op pays for it. With
+the SM clock locked (`nvidia-smi -lgc 1755,1755`, root) the same runs give 12.9 ms a token
+with the steps against 13.7 without (67.5 against 64 tok/s), the GGUF 16.9 against 21.4;
+the CUDA chain on the same card and clock 14.1 (its GGUF 13.3). The gate keeps whichever
+is faster; its probe is two warm forwards and four measured ones a phase
+(`COLI_VK_HYB_GATE_DEBUG=1` prints each).
+
+**The card's clocks.** Under the chain's decode an RTX 3070 ran at 780 to 960 MHz (its
+boost is about 1900) while the CUDA chain held 1755 on the same card: the driver's clocks
+follow the utilisation, and a decode of hundreds of short dispatches with waits between
+them reads as a light load. Locking the clock took the decode from 48 to 65 tok/s before
+any hybrid step, which had been most of the gap to CUDA: at the same clock the chain's int8
+GEMVs take what the CUDA chain's take (6.8 against 6.65 ms a token for the trunk and the
+head), and the small ops 1.1 to 1.3 times as long (they took 1.6 to 2.3 times as long at the
+driver's clocks). Measure with `nvidia-smi
+--query-gpu=clocks.sm,clocks.mem --format=csv -lms 250` beside the run; `nvidia-smi -lgc`
+needs root and `-rgc` undoes it.
 
 A round trip of the two timelines measured 7 us on the card. The host pool is cached
 system RAM (it was write-combined, which made the CPU's reads 25 times slower; the
@@ -2451,21 +2487,30 @@ the CPU's kernels for them in `vk_tier.c` (int8 activations per 32 and integer d
 `ggml_quants.h`'s; FP8, and MXFP4 past 2048 groups a row, against the float row; the
 float reference of every one with `GQ_EXACT=1`). The low-bit formats (fmt 200 to 203)
 keep the device's reads. `COLI_VK_HYBRID=0` turns it off, `COLI_VK_HYBRID_THREADS` sizes the
-worker's team (OpenMP's by default). The chain's line says how many steps and pairs it
-took and the CPU's time. A share of the host pool's experts (`COLI_VK_HYBRID_PCIE`, by a
-hash of layer and expert) can stay with the device over PCIe; it is 0 by default, every
-one on the CPU. The CPU reads a GGUF's rows eight at a time (`ggml_quants.h`
-`gq_rows_f8`: the rows' bytes transposed in registers into the R16 forms' codes, or the
-grid types' rows with their signs on the activation, the R16 kernels' numerics) at its
-memory's speed, faster than the device reads them over PCIe, and a step's few pairs split by
-a hash leave the device the slower side on the steps that drew two. Warm 400-token
-answers, the share at 0.3 against 0: Flint UD-Q3_K_XL with 7.4 GB of the card 44.6
-against 49.4 tok/s (0.15 47.5, 0.45 40.8), with 12 GB 51.6 against 56.2; Qwen3.6-35B-A3B
-Q4_K_M 47.7 against 55.5 and 71.3 against 74.4; Qwen3.8 IQ2_XS on the whole card 49.1
-against 49.0. The worker sums the pairs in its own memory and copies the sum to the
-device's buffer once: that buffer is written by the host and read by the device, memory
-the CPU does not cache, and reading it back as the sum grew cost about 70 us a step of
-Flint's three pairs (decode 39.6 against 44.6 tok/s at 7.4 GB).
+pairs' team (the engine thread's, OpenMP's, by default), `COLI_VK_HOST_POOL_IMPORT=0` keeps
+the host pool in the driver's memory (its blocks are the process's own pages, imported,
+where VK_EXT_external_memory_host is there: the driver's host-visible memory without
+HOST_CACHED is write-combined for the CPU), `COLI_VK_HYBRID_SCHED=dynamic`
+hands the rows out in chunks instead of equal shares (for cores that do not run at one
+speed; libgomp's dynamic handing cost a third of a step on 12 equal cores). colibri's int4
+pairs and int8 rows take kernels without the unpack and with four sums in flight
+(`hy_dot4`, `hy_dot8` in `vk_tier.c`): a Qwen3.6 int4 pair (1.57 MB) on one core of the
+3945WX 249 to 129 us, on 12 cores 53 to 34-43 (46 GB/s of its 59);
+`tests/bench_host_pairs` measures them without a device. The chain's line says how many
+steps and pairs it took, the CPU's time and the time spent waiting for the device. A share
+of the host pool's experts (`COLI_VK_HYBRID_PCIE`, by a hash of layer and expert) can stay
+with the device over PCIe; it is 0 by default, every one on the CPU. The CPU reads a GGUF's
+rows eight at a time (`ggml_quants.h` `gq_rows_f8`: the rows' bytes transposed in registers
+into the R16 forms' codes, or the grid types' rows with their signs on the activation, the
+R16 kernels' numerics) at its memory's speed, faster than the device reads them over PCIe,
+and a step's few pairs split by a hash leave the device the slower side on the steps that
+drew two. Warm 400-token answers, the share at 0.3 against 0: Flint UD-Q3_K_XL with 7.4 GB
+of the card 44.6 against 49.4 tok/s (0.15 47.5, 0.45 40.8), with 12 GB 51.6 against 56.2;
+Qwen3.6-35B-A3B Q4_K_M 47.7 against 55.5 and 71.3 against 74.4; Qwen3.8 IQ2_XS on the
+whole card 49.1 against 49.0. The sum of the pairs is formed in the host's own memory and
+copied to the device's buffer once: that buffer is written by the host and read by the
+device, memory the CPU does not cache, and reading it back as the sum grew cost about 70 us
+a step of Flint's three pairs (decode 39.6 against 44.6 tok/s at 7.4 GB).
 
 Measured on the RTX PRO 4000 with an i5-13500 (Qwen3.8 IQ2_XS, the defaults, on and off
 started one after the other): decode 42.2/42.5 against 40.4/41.0 tok/s with the team on
@@ -2478,7 +2523,7 @@ Q2_0 down 28 us): the device's own experts take less, so a step waits for the CP
 frame, and the device read the host pool's experts of that batch over the bus: 8 GB/s for GLM-5.3's (7.5 ms a layer of 8 against 0.25 ms from
 VRAM, `COLI_VK_CHAIN_BENCH=xb` with `COLI_VK_BENCH_HOST=1`). In a step of up to 8 rows the
 tier now leaves those of a GGUF's block types or of colibri's formats above out of the device's batch and the CPU computes
-them in place at the join (`vkt_host_pairs`, the same code as the chain's worker), while the
+them in place at the join (`vkt_host_pairs`, the same code as the chain's steps), while the
 device computes the ones it holds; the join hands their rows back as the device's, so no
 engine changes. The same share stays with the device over PCIe, a prompt step keeps them
 all on the device, and `COLI_VK_HYBRID=0` turns it off. DeepSeek V4's expert takes it with
