@@ -4397,6 +4397,21 @@ static void q38_rows(float *y,int ys,const Q38Weight *w,int I,int r0,int r1,
         }
 #endif
         int o=r0;
+#ifdef GQ_TILE16_BIAS
+        if(n>=GQ_TILE16_MIN_S&&gq_tile16_ok(w->gq_type,I)){   /* a prompt's rows: 16 file rows unpacked once (gq_tile16_pack) */
+            static __thread uint8_t *tile;static __thread int8_t *w8;static __thread float *sw;static __thread int cap;
+            if(cap<I){
+                free(tile);free(w8);free(sw);
+                tile=(uint8_t*)malloc(gq_tile16_bytes(I));w8=(int8_t*)malloc((size_t)I);sw=(float*)malloc((size_t)(I/16)*2*sizeof(float));
+                if(!tile||!w8||!sw){fprintf(stderr,"OOM prompt tile\n");exit(1);}
+                cap=I;
+            }
+            for(;o+16<=r1;o+=16){
+                gq_tile16_pack(tile,(const uint8_t*)w->data+(int64_t)o*rb,rb,w->gq_type,I,w8,sw,sw+I/16);
+                gq_tile16_rows(y+o,ys,tile,ga,I);
+            }
+        }
+#endif
         if(gq_f8_ok(w->gq_type,I))   /* the file's rows by eight (ggml_quants.h gq_rows_f8) */
             for(;o+8<=r1;o+=8)gq_rows_f8(y+o,ys,ga,(const uint8_t*)w->data+(int64_t)o*rb,rb,w->gq_type,I,8);
         for(;o<r1;o++)gq_row_all(y+o,ys,ga,(const uint8_t*)w->data+(int64_t)o*rb,w->gq_type,I);

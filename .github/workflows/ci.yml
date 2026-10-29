@@ -1727,6 +1727,11 @@ jobs:
           /tmp/trf8
           gcc -O3 -march=x86-64-v3 -fopenmp -I. tests/test_rows_f8.c -o /tmp/trf8v3 -lm
           /tmp/trf8v3
+          # a prompt's rows of the grid types, 16 file rows unpacked once: the same two ISAs
+          gcc -O3 -march=native -fopenmp -I. tests/test_tile16.c -o /tmp/tt16 -lm
+          /tmp/tt16
+          gcc -O3 -march=x86-64-v3 -fopenmp -I. tests/test_tile16.c -o /tmp/tt16v3 -lm
+          /tmp/tt16v3
       - name: Generate the glm_tiny fixture
         run: cd c && python3 tools/make_glm_oracle.py
       - name: Oracle (30–32/32 teacher forcing + exact greedy)
