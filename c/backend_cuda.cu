@@ -3826,7 +3826,7 @@ static int hcm_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float
      * each weight decoded half as often. Its K split in two while that still makes one wave
      * (7680 x 2048: 229 us against 250; three splits, past a wave, 283) */
     int tile = ftile >= 1 && ftile <= 4 ? ftile : S <= 64 ? 4 : S > 128 ? 3 : 1;
-    if (tile > 1 && ctx->smem_optin < (size_t)(tile == 2 ? HcmTile<128, 256>::SMEM : HcmTile<256, 128>::SMEM)) tile = 1;
+    if ((tile == 2 || tile == 3) && ctx->smem_optin < (size_t)(tile == 2 ? HcmTile<128, 256>::SMEM : HcmTile<256, 128>::SMEM)) tile = 1;
     const int BMt = tile == 3 ? 256 : tile == 4 ? 64 : 128, BNt = tile == 2 ? 256 : 128;
     /* fewer blocks than the multiprocessors' slots: K split up to a wave, 512 inputs a split at
      * least (a 2048 x 40 heads' gate was one block down 64 steps, 44 us whatever the rows) */
