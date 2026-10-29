@@ -2796,6 +2796,8 @@ static const gguf_tensor *gg_tensor(const char *hf) {
     char nm[256]; const char *g = gg_name(hf, nm, sizeof nm);
     /* tied embeddings (the small dense models): no output.weight, the head reads token_embd */
     if (g && !strcmp(g, "output.weight") && !gguf_find(&g_gg, g)) g = "token_embd.weight";
+    /* Ollama's converter names the DeltaNet's dt bias blk.N.ssm_dt (the same values) */
+    if (g && !gguf_find(&g_gg, g)) { size_t L = strlen(g); if (L > 12 && !strcmp(g + L - 12, ".ssm_dt.bias")) { nm[L - 5] = 0; g = nm; } }
     return g ? gguf_mark(&g_gg, g) : NULL;
 }
 static int64_t gg_numel(const gguf_tensor *t) { return t->ne[0] * t->ne[1] * t->ne[2] * t->ne[3]; }
@@ -3351,6 +3353,11 @@ static void gguf_load_cfg(Cfg *c) {
     c->hidden   = (int)gguf_get_int(g, GK("embedding_length"), 0);
     c->q_heads  = (int)gguf_get_int(g, GK("attention.head_count"), 0);
     c->kv_heads = (int)gguf_get_int(g, GK("attention.head_count_kv"), 0);
+    {   /* Ollama's converter writes it per layer (0 on the DeltaNet layers): the attention layers' value */
+        const gguf_kv *kvh = gguf_get(g, GK("attention.head_count_kv"));
+        if (kvh && kvh->type == GGUF_T_ARRAY && kvh->arr && (kvh->atype == GGUF_T_U32 || kvh->atype == GGUF_T_I32))
+            for (uint64_t j = 0; j < kvh->n; j++) { int v = (int)((const int32_t *)kvh->arr)[j]; if (v > c->kv_heads) c->kv_heads = v; }
+    }
     c->head_dim = (int)gguf_get_int(g, GK("attention.key_length"), c->q_heads > 0 ? c->hidden / c->q_heads : 0);
     c->k_head_dim = c->head_dim;
     c->v_head_dim = (int)gguf_get_int(g, GK("attention.value_length"), c->head_dim);
@@ -3527,6 +3534,18 @@ static void gguf_expert_held(Model *m, GqExp *x) {
     if (tot > m->gqe_max) m->gqe_max = tot;
 }
 static int gguf_expert_ilv(const GqExp *x) { return x->hg != x->tg || x->hu != x->tu || x->hd != x->td; }
+/* The CUDA expert tier takes a GGUF's experts as the file has them: the RAM slots then hold the
+ * file's rows too, not the rows interleaved by 16. The tier reads them in place (an interleaved
+ * slot unpacked each into a second buffer of its own: Flint UD-Q3_K_XL, an 18.5 GB file, took
+ * 30.6 GB of RSS), the host pool copies a prompt chunk's experts from them to the device, and
+ * the CPU computes its experts eight rows at a time (gq_rows_f8). Before any slot is filled. */
+static void gguf_hold_file_rows(Model *m) {
+    for (int i = 0; i < m->c.n_layers; i++) {
+        GqExp *x = &m->gqx[i];
+        x->hg = x->tg; x->hu = x->tu; x->hd = x->td;
+        x->hb_g = x->eb_g; x->hb_u = x->eb_u; x->hb_d = x->eb_d;
+    }
+}
 
 /* GGUF mode: locate every layer's fused expert tensors and size the slot. */
 static void gguf_map_experts(Model *m) {
@@ -3615,6 +3634,8 @@ static int gguf_report_unused(const Cfg *c) {
         if (L > 12 && !strcmp(t->name + L - 12, ".input_scale")) continue;
         int layer = -1;
         if (sscanf(t->name, "blk.%d.", &layer) == 1 && layer >= c->n_layers) continue;   /* MTP / nextn */
+        /* Ollama's files carry the MTP head (mtp.*) and the vision tower and projector (v.*, mm.*) in the model's file */
+        if (!strncmp(t->name, "mtp.", 4) || !strncmp(t->name, "v.", 2) || !strncmp(t->name, "mm.", 3)) continue;
         n++;
         char pat[96]; const char *d = t->name; int o = 0;   /* blk.N. -> blk.*. for a short summary */
         while (*d && o < 90) { if (d[0] == '.' && d[1] >= '0' && d[1] <= '9') { pat[o++] = '.'; pat[o++] = '*'; d++; while (*d >= '0' && *d <= '9') d++; } else pat[o++] = *d++; }
@@ -5159,21 +5180,23 @@ static void moe_vk_run(Model *m, Layer *l, int layer, const float *x, int S, flo
 /* Decode (one token, cache can hold all K at once): every routed expert's
  * gate and up rows in ONE parallel region, then every down row in another,
  * instead of two regions per expert. Returns 0, or -1 to take the general path. */
-/* u rows of W from its first (a group of 16 when t is a GQ_*_R16 form) against the
- * one-row activation a */
+/* u rows of W from its first (a group of 16 when t is a GQ_*_R16 form, eight file rows
+ * through gq_rows_f8) against the one-row activation a */
 static inline void gq_rows_u(float *y, int u, const gq_act *a, const uint8_t *W, int t, int I) {
 #ifdef GQ_R16_ON
     if (gq_r16_base(t) >= 0) { gq_r16_rows(t, y, 16, W, a, I); return; }
 #endif
     const int64_t rb = gq_row_bytes(t, I);
+    if (u == 8 && gq_f8_ok(t, I)) { gq_rows_f8(y, 8, a, W, rb, t, I, 8); return; }
     for (int j = 0; j < u; j++) gq_row_all(y + j, 1, a, W + (int64_t)j * rb, t, I);
 }
 static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const int *idx, const float *val) {
     Cfg *c = &m->c; const int D = q36_eh(c), K = c->topk, I = c->inter;
     const GqExp *gx = &m->gqx[layer];
     if (m->cache[layer].cap < K || K > 64 || !gq_int_ok(gx->hg, D) || !gq_int_ok(gx->hu, D) || !gq_int_ok(gx->hd, I)) return -1;
-    /* rows interleaved by 16 (q36_gq_held) go a group at a time, and then every matrix's rows by 16 */
-    const int u = gguf_expert_ilv(gx) ? 16 : 1;
+    /* rows interleaved by 16 (q36_gq_held) go a group at a time, and then every matrix's rows by 16;
+     * the file's rows by eight where all three types have gq_rows_f8 */
+    const int u = gguf_expert_ilv(gx) ? 16 : I % 8 == 0 && D % 8 == 0 && gq_f8_ok(gx->hg, D) && gq_f8_ok(gx->hu, D) && gq_f8_ok(gx->hd, I) ? 8 : 1;
     if (u == 16 && (I % 16 || D % 16)) return -1;
     Slot *sl[64]; int ids[64]; float w[64]; int n = 0;
     for (int k = 0; k < K; k++) if (idx[k] >= 0) { ids[n] = idx[k]; w[n] = val[k]; n++; }
@@ -6180,6 +6203,16 @@ static void q36_embed_row(Model *m, int id, int pos, float *row) {
 
 #ifdef COLI_CUDA
 #include "qwen36_cuda_chain.h"  /* COLI_CUDA_CHAIN: every layer's dense chain on the CUDA device */
+/* The CUDA chain's prompt staging (q36cc_gguf_stage_bytes), out of the tier's expert budget when
+ * the card holds fewer than every routed expert of a GGUF (qt_reserve_short): taken from the
+ * mirrors' room instead, a 16K prompt on Flint (RTX PRO 4000) found no memory for the routed
+ * experts' buffers and took the host's step from then on. COLI_CUDA_HOST_POOL=0: none. */
+static void q36_gguf_stage_reserve(Model *m) {
+    const char *e = getenv("COLI_CUDA_HOST_POOL");
+    size_t st = g_gguf && !(e && *e == '0') ? q36cc_gguf_stage_bytes(m) : 0, routed = 0;
+    for (int i = 0; i < m->c.n_layers; i++) routed += !q36_dense_l(&m->c, i);
+    if (st) qt_reserve_short(st, routed * (size_t)m->c.n_experts);
+}
 #endif
 
 /* The CUDA tier with every routed expert on the device, run by the CUDA chain: what a step
@@ -8637,7 +8670,7 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
                     .ram_floor = slot * (size_t)c->topk * (size_t)c->n_layers, .ram_given = vk_ram_given,
                     .ram_later = q36_kv_later(m),
                     .dense_bytes = vk_dense_bytes(m), .stage = g_vk_chain,
-                    .chain_bytes = g_vk_chain ? q36c_late_bytes(m, qwen36_max_ctx()) : 0,
+                    .chain_bytes = g_vk_chain ? q36c_late_bytes(m, qwen36_max_ctx() < Q36C_KV_START ? qwen36_max_ctx() : Q36C_KV_START) : 0,
                     .in_ram = vk_in_ram, .ram_ctx = m,
                     .load = vk_load, .release = vk_release, .load_ctx = m,
                     .layer_gate_up = lgu, .layer_down = ldn};
@@ -9049,8 +9082,10 @@ int main(int argc, char **argv) {
     /* the CUDA chain uploads its own router, DeltaNet b|a and gate rows after the tier sized
      * its budget: out of the tier's allowance, or the tier fills the card and the chain's
      * prompt scratch and KV mirror find no room (Muse Spark's f32 router: 496 MiB) */
-    if (q36cc_env_on() && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1')
+    if (q36cc_env_on() && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1') {
         qt_reserve(q36cc_own_bytes(&m) + q36cc_mirror_bytes(&m, qwen36_max_ctx()));   /* and the KV mirrors of a model whose chain needs them whole */
+        q36_gguf_stage_reserve(&m);   /* and a GGUF's prompt staging, where the card holds fewer than all its experts */
+    }
 #endif
 #ifdef COLI_CUDA
     if (g_gguf && !qq_active() && m.c.n_experts > 0 && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1') {
@@ -9065,7 +9100,12 @@ int main(int argc, char **argv) {
                  q36_eh(&m.c) % coli_cuda_block_elems(100 + x->tg) == 0 && m.c.inter % coli_cuda_block_elems(100 + x->td) == 0;
             if (ok) { tg[l] = x->tg; td[l] = x->td; bg[l] = (size_t)x->eb_g; bdn[l] = (size_t)x->eb_d; }
         }
-        if (ok && qt_init_gguf(L, m.c.n_experts, q36_eh(&m.c), m.c.inter, cap, m.c.topk, tg, td, bg, bdn, 0)) gguf_tier = 1;   /* the slots' rows stay */
+        /* each expert in a slot of its own layer's size (COLI_CUDA_EXACT_SLOTS=0: the largest layer's) */
+        { const char *xs = getenv("COLI_CUDA_EXACT_SLOTS"); qt_gguf_exact_slots(!(xs && *xs == '0')); }
+        if (ok && qt_init_gguf(L, m.c.n_experts, q36_eh(&m.c), m.c.inter, cap, m.c.topk, tg, td, bg, bdn, 0)) {
+            gguf_tier = 1;   /* the slots' rows stay */
+            gguf_hold_file_rows(&m);
+        }
         else fprintf(stderr, "[qwen36] COLI_CUDA=1: %s; the routed experts stay on the CPU\n",
                      ok ? "the CUDA expert tier did not start" : "the GGUF's expert types are not all ones the CUDA chain's experts take");
         free(tg); free(td); free(bg); free(bdn);
@@ -9184,8 +9224,8 @@ int main(int argc, char **argv) {
             else fprintf(stderr, "[dn] Q36_DN_GPU=1 but no layer has both projections on one card; the CPU path stands\n");
         }
         /* Warmstart: fill the VRAM budget BEFORE the first token (heat order
-         * when HEAT_FILE exists, natural order otherwise), loading all RAM
-         * slots along the way. */
+         * when HEAT_FILE exists, otherwise every layer's expert 0, then 1, ...),
+         * loading all RAM slots along the way. */
         const char *nws = getenv("QT_NO_WARMSTART");
         if (!(nws && *nws=='1') && qt_experts_on()) tier_warmstart(&m, expert_is_int4);
     }

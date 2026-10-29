@@ -1989,6 +1989,21 @@ family_qwen_chain() {
   done
   chain_gate qwen38 "chain qwen38 tier off" 1 OMP_NUM_THREADS=2 COLI_VK_TIER=0 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
   chain_gate qwen38 "chain qwen38 prefill in chunks of 3" 1 OMP_NUM_THREADS=2 COLI_VK_CHAIN_ROWS=3 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
+  # a prompt layer by layer (q38c_forward_lm; forced here, where no expert stages): the
+  # CPU's tokens, and bit for bit the logits of the same chunks run chunk by chunk
+  V38LW="OMP_NUM_THREADS=2 COLI_VK_TIER_HOST=1 COLI_VK_TIER_GB=0.00005 COLI_VK_CHAIN_ROWS=3 SNAP=qwen38_tiny"
+  chain_gate qwen38 "chain qwen38 a prompt layer by layer" 1 $V38LW COLI_VK_CHAIN_LAYERWISE=1 -- 4 8 qwen38_tiny/ref.json
+  grep -q "prompts layer by layer" vk.log || { cat vk.log; fail "chain qwen38 a prompt layer by layer: it ran chunk by chunk"; }
+  cp vk.f32 lw.f32
+  chain_gate qwen38 "chain qwen38 the same prompt chunk by chunk" 1 $V38LW COLI_VK_CHAIN_LAYERWISE=0 -- 4 8 qwen38_tiny/ref.json
+  cmp -s lw.f32 vk.f32 || fail "chain qwen38 a prompt layer by layer: other logits than chunk by chunk"
+  # one row a chunk, four a segment: the 5-token prompt in two segments, the same logits again
+  V38LW1="OMP_NUM_THREADS=2 COLI_VK_TIER_HOST=1 COLI_VK_TIER_GB=0.00005 COLI_VK_CHAIN_ROWS=1 COLI_VK_CHAIN_LAYERWISE_ROWS=4 SNAP=qwen38_tiny"
+  chain_gate qwen38 "chain qwen38 a prompt layer by layer in two segments" 1 $V38LW1 COLI_VK_CHAIN_LAYERWISE=1 -- 4 8 qwen38_tiny/ref.json
+  grep -q "prompts layer by layer" vk.log || { cat vk.log; fail "chain qwen38 a prompt layer by layer in two segments: it ran chunk by chunk"; }
+  cp vk.f32 lw.f32
+  chain_gate qwen38 "chain qwen38 the same prompt a row a chunk" 1 $V38LW1 COLI_VK_CHAIN_LAYERWISE=0 -- 4 8 qwen38_tiny/ref.json
+  cmp -s lw.f32 vk.f32 || fail "chain qwen38 a prompt layer by layer in two segments: other logits than chunk by chunk"
   $PY tools/make_qwen38_tiny.py --out qwen38_tiny_mtp --mtp
   $PY tools/make_edge_tiny_tokenizer.py --vocab-size 64 ./qwen38_tiny_mtp   # serve speaks text
   $PY tools/make_qwen38_tiny.py --out qwen38_tiny_fp8_mtp --fp8-experts --mtp
@@ -2357,6 +2372,8 @@ family_inkling_olmoe_chain() {
   chain_gate olmoe "chain olmoe prefill in chunks of 3" 1 COLI_VK_CHAIN_ROWS=3 SNAP=olmoe_tiny_c -- 8 8 $OR
   chain_gate olmoe "chain olmoe tiled GEMM" 1 COLI_VK_GEMM_MIN_S=2 SNAP=olmoe_tiny_c -- 8 8 $OR
   chain_gate olmoe "chain olmoe the per-row GEMV" 1 COLI_VK_CHAIN_GEMV=0 SNAP=olmoe_tiny_c -- 8 8 $OR
+  chain_gate olmoe "chain olmoe float16 K/V (the mirror in float16)" 1 KV16=1 SNAP=olmoe_tiny_c -- 8 8 $OR
+  grep -q 'KV mirror in float16' vk.log || { cat vk.log; fail "chain olmoe float16 K/V: the mirror stayed float32"; }
   CHAINMODE=2 chain_gate olmoe "chain olmoe prompts only" 1 SNAP=olmoe_tiny_c -- 8 8 $OR
   dmoe_gate olmoe "chain olmoe the routed experts in the frame" all SNAP=olmoe_tiny_c -- 8 8 $OR
   dmoe_gate olmoe "chain olmoe the host's routing (COLI_VK_CHAIN_MOE=0)" none COLI_VK_CHAIN_MOE=0 SNAP=olmoe_tiny_c -- 8 8 $OR
@@ -2386,6 +2403,7 @@ family_inkling_olmoe_chain() {
   $PY tests/vulkan_chain_serve.py ./olmoe olmoe_tiny_c
   $PY tests/vulkan_chain_serve.py ./olmoe olmoe_tiny_c PILOT=1 WIDE=2
   COLI_VK_CHAIN=2 $PY tests/vulkan_chain_serve.py ./olmoe olmoe_tiny_c
+  CHAIN_SERVE_KV16=1 CHAIN_SERVE_EXPECT='KV mirror in float16' $PY tests/vulkan_chain_serve.py ./olmoe olmoe_tiny_c
   # (these compare a warm session's logprobs with a cold one's to the last printed
   # digit: no history file and COLI_VK_TIER_BALANCE=0, so both sessions split their
   # experts between the device and the CPU alike. Use per-row attention on both:

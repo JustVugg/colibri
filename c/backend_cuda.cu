@@ -3273,7 +3273,7 @@ __device__ __forceinline__ void hcg_store_x(__half (*Xs)[HCG_LDH], const float4 
 /* WF 100: a GGUF's blocks (cuda_bd.cuh's float form, bdf_decode), the format in gs, the
  * decoders' table in sc: the thread's 16 weights are half of a 32-weight unit, decoded with
  * its scales and mins (weight = s * w - m) and rounded to f16, the scales in the weights */
-template<> struct HcgW<100> { float f[16]; };
+template<> struct HcgW<100> { bd_u32 h[8]; };   /* the 16 weights in f16, two a word */
 template<>
 __device__ __forceinline__ void hcg_fetch_w<100>(HcgW<100> &r, const uint8_t *__restrict__ W, const float *__restrict__ sc,
                                                  int gs, int ng, int n, int N, int k0, int K, int planar) {
@@ -3281,7 +3281,7 @@ __device__ __forceinline__ void hcg_fetch_w<100>(HcgW<100> &r, const uint8_t *__
     int kq = (threadIdx.x & 3) * 16;
     if (n >= N) {
         #pragma unroll
-        for (int j = 0; j < 16; j++) r.f[j] = 0.f;
+        for (int j = 0; j < 8; j++) r.h[j] = 0u;
         return;
     }
     const bd_u32 *tab = reinterpret_cast<const bd_u32 *>(sc);
@@ -3289,28 +3289,94 @@ __device__ __forceinline__ void hcg_fetch_w<100>(HcgW<100> &r, const uint8_t *__
     bd_u32 B = __ldg(tab + BDT_BLK + t), T = __ldg(tab + BDT_BYTES + t);
     size_t rw = ((size_t)K / B * T + 3) / 4;
     const bd_u32 *Wr = reinterpret_cast<const bd_u32 *>(W) + (size_t)n * rw;
-    if (bd_dec16(t, Wr, (bd_u32)(k0 + kq), tab, r.f)) return;   /* the common types: their 16, word loads */
-    int wv[32]; float sA, mA, sB, mB;
-    bdf_decode(gs, Wr, (bd_u32)((k0 + kq) >> 5), tab, wv, sA, mA, sB, mB);
-    if ((kq >> 4) & 1) {
-        #pragma unroll
-        for (int j = 0; j < 16; j++) r.f[j] = sB * (float)wv[16 + j] - mB;
-    } else {
-        #pragma unroll
-        for (int j = 0; j < 16; j++) r.f[j] = sA * (float)wv[j] - mA;
+    if (bd_dec16h(t, Wr, (bd_u32)(k0 + kq), r.h)) return;   /* Q8_0 and the K-quants: their codes to f16 by their bits */
+    float f[16];
+    if (!bd_dec16(t, Wr, (bd_u32)(k0 + kq), tab, f)) {   /* the other common types: their 16, word loads */
+        int wv[32]; float sA, mA, sB, mB;
+        bdf_decode(gs, Wr, (bd_u32)((k0 + kq) >> 5), tab, wv, sA, mA, sB, mB);
+        if ((kq >> 4) & 1) {
+            #pragma unroll
+            for (int j = 0; j < 16; j++) f[j] = sB * (float)wv[16 + j] - mB;
+        } else {
+            #pragma unroll
+            for (int j = 0; j < 16; j++) f[j] = sA * (float)wv[j] - mA;
+        }
     }
+    #pragma unroll
+    for (int j = 0; j < 8; j++) r.h[j] = bd_h2u(__halves2half2(hcg_h(f[2 * j]), hcg_h(f[2 * j + 1])));
 }
 template<>
 __device__ __forceinline__ void hcg_store_w<100>(__half (*Ws)[HCG_LDH], const HcgW<100> &r, int planar) {
     (void)planar;
     int t = threadIdx.x, row = t >> 2, kq = (t & 3) * 16;
-    __align__(16) __half v[16];
-    #pragma unroll
-    for (int j = 0; j < 16; j++) v[j] = hcg_h(r.f[j]);
     uint4 *dst = reinterpret_cast<uint4 *>(&Ws[row][kq]);
-    dst[0] = *reinterpret_cast<const uint4 *>(&v[0]); dst[1] = *reinterpret_cast<const uint4 *>(&v[8]);
+    dst[0] = make_uint4(r.h[0], r.h[1], r.h[2], r.h[3]); dst[1] = make_uint4(r.h[4], r.h[5], r.h[6], r.h[7]);
 }
+/* A GGUF's rows of a type known when the kernel is built (WF 200 + t; here Q8_0, Q4_K, Q5_K, Q6_K):
+ * WF 100's steps for that type alone. The runtime type's kernel holds every decoder: Qwen3.6's
+ * gate and up took 255 registers a thread, one block a multiprocessor, 115 ms at 1K tokens on
+ * an RTX PRO 4000 (93 at 128 registers and two blocks) */
+template<int T> struct HcgBt { static constexpr bd_u32 B = T == 8 ? 32u : 256u, BYTES = T == 8 ? 34u : T == 12 ? 144u : T == 13 ? 176u : 210u; };
+#define HCG_BT(WF) \
+template<> struct HcgW<WF> { bd_u32 h[8]; }; \
+template<> __device__ __forceinline__ void hcg_fetch_w<WF>(HcgW<WF> &r, const uint8_t *__restrict__ W, const float *__restrict__ sc, \
+                                                        int gs, int ng, int n, int N, int k0, int K, int planar) { \
+    (void)sc; (void)gs; (void)ng; (void)planar; \
+    if (n >= N) { for (int j = 0; j < 8; j++) r.h[j] = 0u; return; } \
+    constexpr int t = WF - 200; \
+    size_t rw = ((size_t)K / HcgBt<t>::B * HcgBt<t>::BYTES + 3) / 4; \
+    bd_dec16h(t, reinterpret_cast<const bd_u32 *>(W) + (size_t)n * rw, (bd_u32)(k0 + (threadIdx.x & 3) * 16), r.h); \
+} \
+template<> __device__ __forceinline__ void hcg_store_w<WF>(__half (*Ws)[HCG_LDH], const HcgW<WF> &r, int planar) { \
+    (void)planar; \
+    int t = threadIdx.x, row = t >> 2, kq = (t & 3) * 16; \
+    uint4 *dst = reinterpret_cast<uint4 *>(&Ws[row][kq]); \
+    dst[0] = make_uint4(r.h[0], r.h[1], r.h[2], r.h[3]); dst[1] = make_uint4(r.h[4], r.h[5], r.h[6], r.h[7]); \
+}
+HCG_BT(208) HCG_BT(212) HCG_BT(213) HCG_BT(214)
+#undef HCG_BT
+/* the other types bd_dec16 decodes (Q2_K, Q3_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S,
+ * IQ4_XS), in floats rounded to f16 as WF 100 does them, the type known: Flint UD-Q3_K_XL's IQ3_S
+ * and IQ4_XS experts */
+#define HCG_BTF(WF) \
+template<> struct HcgW<WF> { bd_u32 h[8]; }; \
+template<> __device__ __forceinline__ void hcg_fetch_w<WF>(HcgW<WF> &r, const uint8_t *__restrict__ W, const float *__restrict__ sc, \
+                                                        int gs, int ng, int n, int N, int k0, int K, int planar) { \
+    (void)gs; (void)ng; (void)planar; \
+    if (n >= N) { for (int j = 0; j < 8; j++) r.h[j] = 0u; return; } \
+    constexpr int t = WF - 200; \
+    const bd_u32 *tab = reinterpret_cast<const bd_u32 *>(sc); \
+    size_t rw = ((size_t)K / __ldg(tab + BDT_BLK + t) * __ldg(tab + BDT_BYTES + t) + 3) / 4; \
+    float f[16]; \
+    bd_dec16(t, reinterpret_cast<const bd_u32 *>(W) + (size_t)n * rw, (bd_u32)(k0 + (threadIdx.x & 3) * 16), tab, f); \
+    for (int j = 0; j < 8; j++) r.h[j] = bd_h2u(__halves2half2(hcg_h(f[2 * j]), hcg_h(f[2 * j + 1]))); \
+} \
+template<> __device__ __forceinline__ void hcg_store_w<WF>(__half (*Ws)[HCG_LDH], const HcgW<WF> &r, int planar) { \
+    (void)planar; \
+    int t = threadIdx.x, row = t >> 2, kq = (t & 3) * 16; \
+    uint4 *dst = reinterpret_cast<uint4 *>(&Ws[row][kq]); \
+    dst[0] = make_uint4(r.h[0], r.h[1], r.h[2], r.h[3]); dst[1] = make_uint4(r.h[4], r.h[5], r.h[6], r.h[7]); \
+}
+HCG_BTF(210) HCG_BTF(211) HCG_BTF(216) HCG_BTF(217) HCG_BTF(218) HCG_BTF(220) HCG_BTF(221) HCG_BTF(222) HCG_BTF(223)
+#undef HCG_BTF
 #endif
+/* the tiles' WF for a GGUF type fmt (100 + t): its own where one is built, else the runtime type's */
+static inline int hcg_bt_wf(int fmt) {
+    int t = fmt - 100;
+    return t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 18 || t == 20 || t == 21 ||
+           t == 22 || t == 23 ? fmt + 100 : 100;
+}
+/* a launch of kernel K<WF> for a GGUF type fmt: its own tiles where built (hcg_bt_wf), else WF 100's */
+#define HCG_BT_LAUNCH(K, fmt, grid, st, ...) do { \
+    switch (hcg_bt_wf(fmt)) { \
+    case 208: K<208><<<grid, 256, 0, st>>>(__VA_ARGS__); break; case 210: K<210><<<grid, 256, 0, st>>>(__VA_ARGS__); break; \
+    case 211: K<211><<<grid, 256, 0, st>>>(__VA_ARGS__); break; case 212: K<212><<<grid, 256, 0, st>>>(__VA_ARGS__); break; \
+    case 213: K<213><<<grid, 256, 0, st>>>(__VA_ARGS__); break; case 214: K<214><<<grid, 256, 0, st>>>(__VA_ARGS__); break; \
+    case 216: K<216><<<grid, 256, 0, st>>>(__VA_ARGS__); break; case 217: K<217><<<grid, 256, 0, st>>>(__VA_ARGS__); break; \
+    case 218: K<218><<<grid, 256, 0, st>>>(__VA_ARGS__); break; case 220: K<220><<<grid, 256, 0, st>>>(__VA_ARGS__); break; \
+    case 221: K<221><<<grid, 256, 0, st>>>(__VA_ARGS__); break; case 222: K<222><<<grid, 256, 0, st>>>(__VA_ARGS__); break; \
+    case 223: K<223><<<grid, 256, 0, st>>>(__VA_ARGS__); break; default: K<100><<<grid, 256, 0, st>>>(__VA_ARGS__); break; \
+    } } while (0)
 template<int WF, int NW>
 __device__ __forceinline__ void hcg_tile(float *__restrict__ Y, int yld, const int *yr, const float *__restrict__ X, int xld, const int *xr,
                                          int M, const uint8_t *const *W, const float *const *sc, int gs, int N, int K, int n0,
@@ -3373,10 +3439,10 @@ __device__ __forceinline__ void hcg_tile(float *__restrict__ Y, int yld, const i
         int r = e / TCG_BN, c = e - r * TCG_BN, nn = n0 + c;
         if (r >= M || nn >= N) continue;
         float g = Cs[r * CL + c];
-        if (WF != 4 && WF != 100) g *= sc[0][nn];   /* int8 and int4 rows: the codes went in exact, the row's scale here */
+        if (WF != 4 && WF < 100) g *= sc[0][nn];   /* int8 and int4 rows: the codes went in exact, the row's scale here */
         if (NW == 2) {
             float u = Cs[TCG_BM * CL + r * CL + c];
-            if (WF != 4 && WF != 100) u *= sc[NW - 1][nn];
+            if (WF != 4 && WF < 100) u *= sc[NW - 1][nn];
             g = (g / (1.f + expf(-g))) * u;
         }
         Y[(size_t)yr[r] * yld + nn] = g;
@@ -3404,7 +3470,9 @@ static int bd_tensor_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const
     if (tiles < 0) { const char *e = getenv("COLI_CUDA_BD_TILES"); tiles = !(e && *e == '0'); }   /* 0: a prompt's rows on the GEMV too */
     if (!tiles || !tab || !hcg_ok(ctx) || t->I % HCG_BK || ((uintptr_t)x & 15)) return 0;
     dim3 g((unsigned)((t->O + TCG_BN - 1) / TCG_BN), (unsigned)((S + TCG_BM - 1) / TCG_BM));
-    hcg_dense_k<100><<<g, 256, 0, st>>>(y, x, (const uint8_t *)t->weights, reinterpret_cast<const float *>(tab), t->fmt, S, t->I, t->O);
+    const float *bt = reinterpret_cast<const float *>(tab);
+    const uint8_t *w = (const uint8_t *)t->weights;
+    HCG_BT_LAUNCH(hcg_dense_k, t->fmt, g, st, y, x, w, bt, t->fmt, S, t->I, t->O);   /* a type's own tiles where one is built */
     return cuda_ok(cudaGetLastError(), "block gemm launch");
 }
 extern "C" int coli_cuda_host_register(void *p, size_t bytes) {
@@ -3656,7 +3724,7 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, cons
     }
     if (t->fmt == 0 && S > GEMV_I8_MAX_S && t->O >= 16)   /* a decode step's rows keep quant_matmul's bits, as a single gate row does */
         return f32_gemm_launch(ctx, y_dev, x_dev, (const float *)t->weights, S, t->I, t->O, st);
-    if (t->fmt == 0 && S <= GEMV_I8_MAX_S && t->O <= 256 && t->I >= 1024) {   /* few outputs, long rows: quant_matmul's bits */
+    if (t->fmt == 0 && S <= GEMV_I8_MAX_S && t->O <= 512 && t->I >= 1024) {   /* few outputs, long rows: quant_matmul's bits */
         f32_gemv_k<<<dim3((unsigned)t->O, (unsigned)S), 256, 0, st>>>(y_dev, x_dev, (const float *)t->weights, t->I, t->O);
         return cuda_ok(cudaGetLastError(), "chain f32 gemv launch");
     }
@@ -3913,7 +3981,9 @@ __global__ static void __launch_bounds__(256) hcg_moe_dn_k(const CcExpert *__res
     size_t A = (size_t)p.S * p.K;
     hcg_tile<WF, 1>(hid + A * p.I, p.D, pr, hid, p.I, xr, M, W, Sc, p.gs, p.D, p.I, blockIdx.x * TCG_BN, WF == 4 && ex.planar);
 }
-/* a GGUF's experts (WF 100): gate and up of type fmt, down of fmt_d, the decoders' table btab */
+/* a GGUF's experts (WF 100, or a type's own, hcg_bt_wf): gate and up of type fmt, down of fmt_d, the
+ * decoders' table btab */
+template<int WF>
 __global__ static void __launch_bounds__(256) hcg_moe_gu_bd_k(const CcExpert *__restrict__ tab, const float *__restrict__ x, float *__restrict__ hid,
                                                               MoeSort m, CcMoe p, const bd_u32 *__restrict__ btab) {
     __shared__ int xr[64], pr[64];
@@ -3923,8 +3993,9 @@ __global__ static void __launch_bounds__(256) hcg_moe_gu_bd_k(const CcExpert *__
     CcExpert ex = tab[p.t_off + e];
     const uint8_t *W[2] = {(const uint8_t *)ex.g, (const uint8_t *)ex.u};
     const float *Sc[2] = {reinterpret_cast<const float *>(btab), reinterpret_cast<const float *>(btab)};
-    hcg_tile<100, 2>(hid, p.I, pr, x + p.x_off, p.x_row, xr, M, W, Sc, p.fmt, p.I, p.D, blockIdx.x * TCG_BN);
+    hcg_tile<WF, 2>(hid, p.I, pr, x + p.x_off, p.x_row, xr, M, W, Sc, p.fmt, p.I, p.D, blockIdx.x * TCG_BN);
 }
+template<int WF>
 __global__ static void __launch_bounds__(256) hcg_moe_dn_bd_k(const CcExpert *__restrict__ tab, float *__restrict__ hid, MoeSort m, CcMoe p,
                                                               const bd_u32 *__restrict__ btab) {
     __shared__ int xr[64], pr[64];
@@ -3935,7 +4006,7 @@ __global__ static void __launch_bounds__(256) hcg_moe_dn_bd_k(const CcExpert *__
     const uint8_t *W[1] = {(const uint8_t *)ex.d};
     const float *Sc[1] = {reinterpret_cast<const float *>(btab)};
     size_t A = (size_t)p.S * p.K;
-    hcg_tile<100, 1>(hid + A * p.I, p.D, pr, hid, p.I, xr, M, W, Sc, p.fmt_d ? p.fmt_d : p.fmt, p.D, p.I, blockIdx.x * TCG_BN);
+    hcg_tile<WF, 1>(hid + A * p.I, p.D, pr, hid, p.I, xr, M, W, Sc, p.fmt_d ? p.fmt_d : p.fmt, p.D, p.I, blockIdx.x * TCG_BN);
 }
 static int moe_rows_bd_launch(const CcExpert *tab, const float *x, const int *ids, float *hid, MoeSort m, const CcMoe *p, const bd_u32 *btab,
                               cudaStream_t st) {
@@ -3946,8 +4017,8 @@ static int moe_rows_bd_launch(const CcExpert *tab, const float *x, const int *id
     moe_sort_scan_k<<<1, 32, 0, st>>>(m, *p);
     moe_sort_place_k<<<ga, 256, 0, st>>>(tab, ids, m, *p);
     dim3 gg((unsigned)((p->I + TCG_BN - 1) / TCG_BN), (unsigned)m.T), gd((unsigned)((p->D + TCG_BN - 1) / TCG_BN), (unsigned)m.T);
-    hcg_moe_gu_bd_k<<<gg, 256, 0, st>>>(tab, x, hid, m, *p, btab);
-    hcg_moe_dn_bd_k<<<gd, 256, 0, st>>>(tab, hid, m, *p, btab);
+    HCG_BT_LAUNCH(hcg_moe_gu_bd_k, p->fmt, gg, st, tab, x, hid, m, *p, btab);
+    HCG_BT_LAUNCH(hcg_moe_dn_bd_k, p->fmt_d ? p->fmt_d : p->fmt, gd, st, tab, hid, m, *p, btab);
     return cuda_ok(cudaGetLastError(), "chain moe block rows launch");
 }
 template<int WF>

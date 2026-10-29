@@ -75,6 +75,11 @@ typedef struct {
     size_t *o_ra, *o_rf, *o_pre, *o_pf;        /* Muse Spark: residual gates (alpha | beta), pre_en, post_fn */
     ColiCudaTensor **t_ag, **t_ld, **t_lu;     /* Muse Spark: the attention gate and the latent projections (the tier's) */
     ColiCudaTensor **t_ab, **t_sg, **t_gate;   /* the chain's own: DeltaNet b|a rows, shared gate row, router */
+    uint8_t *rgf;                              /* t_gate holds the shared gate's row after the router's (lg: E + 1 a row) */
+/* the rows up to which a step reads the shared gate from the router's GEMV (rgf): the backend's
+ * GEMV (GEMV_I8_MAX_S), where each output row has the separate row's bits; a prompt chunk's GEMM
+ * sums in another order, so a chunk keeps the separate row (t_sg) and the prompt its bits */
+#define Q36CC_RG_ROWS 8
     ColiCudaTensor **t_q, **t_k, **t_v, **t_o, **t_dnp, **t_dno, **t_shg, **t_shu, **t_shd, *t_lm;   /* the tier's */
     CcBuf **rec, **ring, **kc, **vc;           /* per layer state */
     CcBuf **rec_snap[Q36_SPEC_SNAPS], **ring_snap[Q36_SPEC_SNAPS];   /* a verify's copies, slot r after row r */
@@ -82,7 +87,7 @@ typedef struct {
     int *kv_valid, *attn_ord, n_attn;
     int *kv_rows;                              /* per attention layer: its mirror's rows (a sliding layer's ring, else cap) */
     int dn_where, host_zero;
-    CcBuf *x, *nrm, *tmp, *q, *k, *v, *ctx, *qkvz, *ab, *cv, *dny, *h2, *lg, *gs, *us, *hs, *ds, *sgd, *fin;
+    CcBuf *x, *nrm, *tmp, *q, *k, *v, *ctx, *qkvz, *ab, *cv, *dny, *h2, *lg, *gs, *us, *hs, *ds, *sgd, *fin, *out;
     CcBuf *h2d, *lgd, *kvd, *outd, *xd, *lfd, *routed, *cs;
     CcBuf *csd;   /* cs on the device: every RoPE of a step reads it there, not over the bus */
     CcBuf *kg, *vg;   /* a long step's window over a ring: its rows before the step and the step's (q36cc_attention) */
@@ -112,6 +117,7 @@ typedef struct {
      * layer's), the layers with some expert in neither; dm_stage_off: no staging from here on */
     CcExpert *dm_hostb; int *dm_partb, *dm_fro, *dm_frn; CcFetch *dm_fr; CcBuf *dm_tabb, *dm_stage;
     int dm_stage_off; unsigned long long dm_staged, dm_stage_bytes;
+    unsigned long long hp_follows, hp_joined, hp_left; double hp_ms;   /* the pool following the residents */
     int rows_max;   /* a prompt chunk's rows (q36cc_rows_max) */
     CcBuf *dm_tab, *dm_ids, *dm_w, *dm_idsd, *dm_wd, *dm_hid, *dm_y, *dm_hy, *dm_dfl, *dm_hfl;
     float *dm_g, *dm_u, *dm_hh;
@@ -231,15 +237,70 @@ static size_t q36cc_own_bytes(Model *m) {
  * (q36c_late_bytes). A sliding layer's ring where the backend's attention reads one, the full
  * layers' rows at ctx; at most half of the device's memory. Before, Flint int4 at 32K filled
  * the card with experts and the chain's prompt scratch found no room ("CPU from here on"). */
+static int q36cc_gguf_dims(Model *m, int i, size_t *mg, size_t *md);
+/* The mirrors in float16 where the host's cache is (q36_kv16) and the backend reads one
+ * (cc_kvh_ready): the host's numbers, in half the memory and half of a decode step's reads.
+ * COLI_CUDA_KV16=0 keeps float32. */
+static int q36cc_kvh(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_KV16"); on = !(e && *e == '0'); }
+    return on && q36_kv16() && cc_kvh_ready();
+}
+static size_t q36cc_kves(void) { return q36cc_kvh() ? 2 : sizeof(float); }   /* a mirror's element */
+/* a step's float32 K or V rows into a mirror */
+static int q36cc_kv_put(CcBuf *dst, CcBuf *src, const CcRegion *r, int n) {
+    return q36cc_kvh() ? cc_copy_regions_h(dst, src, r, n) : cc_copy_regions(dst, src, r, n);
+}
+/* a mirror's rows into another of its type (r's offsets and lengths in its elements; a float16
+ * mirror's are even, copied as floats two halves each) */
+static int q36cc_kv_copy(CcBuf *dst, CcBuf *src, CcRegion *r, int n) {
+    if (q36cc_kvh()) for (int k = 0; k < n; k++) { r[k].dst /= 2; r[k].src /= 2; r[k].n /= 2; }
+    return cc_copy_regions(dst, src, r, n);
+}
+/* the attention over mirrors of either type: plain, or a window and sinks (ring: its rows) */
+static int q36cc_attn_c(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, const CcAttn *a) {
+    return q36cc_kvh() ? cc_attn_h(q, kc, vc, o, gate, NULL, a) : cc_attn(q, kc, vc, o, gate, NULL, a);
+}
+static int q36cc_attn_wc(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *w, int ring) {
+    if (q36cc_kvh()) return cc_attn_wh(q, kc, vc, o, gate, snk, w, ring);
+    return ring ? cc_attn_wr(q, kc, vc, o, gate, snk, w, ring) : cc_attn_w(q, kc, vc, o, gate, snk, w);
+}
+/* the mirrors at ctx positions, any model's (a sliding layer's ring where the backend reads one),
+ * as float32: the tier's room for them. A float16 mirror takes half, and the half it leaves goes
+ * to the prompt's chunk rows: with the tier's room halved, Flint UD-Q3_K_XL with 7 GiB free on
+ * an RTX PRO 4000 took 2048 rows a chunk instead of 4096, its 4K-token prompt 1768 -> 1190 tok/s */
+static size_t q36cc_mirror_at(Model *m, int ctx) {
+    Cfg *c = &m->c;
+    if (ctx < 1) return 0;
+    int R = c->win_layer && cc_attn_wr_ready() ? q36_ring_for(c, ctx) : 0;
+    size_t row = (size_t)c->kv_heads * c->k_head_dim * 2 * sizeof(float), kv = 0;
+    for (int i = 0; i < c->n_layers; i++)
+        if (c->is_attn[i]) kv += row * (size_t)(R && c->win_layer[i] ? R : ctx);
+    return kv;
+}
 static size_t q36cc_mirror_bytes(Model *m, int ctx) {
     Cfg *c = &m->c;
     if (ctx < 1 || !(c->win_layer || c->attn_sinks)) return 0;
-    int R = cc_attn_wr_ready() ? q36_ring_for(c, ctx) : 0;
-    size_t row = (size_t)c->kv_heads * c->k_head_dim * 2 * sizeof(float), kv = 0, fr = 0, tot = 0;
-    for (int i = 0; i < c->n_layers; i++)
-        if (c->is_attn[i]) kv += row * (size_t)(R && c->win_layer && c->win_layer[i] ? R : ctx);
+    size_t kv = q36cc_mirror_at(m, ctx), fr = 0, tot = 0;
     if (coli_cuda_mem_info(0, &fr, &tot) && tot && kv > tot / 2) kv = tot / 2;
     return kv;
+}
+/* A GGUF's prompt staging (q36cc_stage_table_gguf): its most experts of a layer, every one where
+ * the card holds fewer than all of them, at the largest layer's slot. The tier keeps it out of
+ * its expert budget when not every expert fits (qwen36's main, qt_reserve_short): taken from the
+ * mirrors' room, a 16K prompt on Flint (RTX PRO 4000) found no memory for the routed experts'
+ * buffers and took the host's step from then on (309.7 tok/s against 1032). */
+static size_t q36cc_gguf_stage_bytes(Model *m) {
+    Cfg *c = &m->c; size_t st = 0;
+    if (c->n_experts <= 0) return 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        size_t mg, md;
+        if (!q36_dense_l(c, i) && q36cc_gguf_dims(m, i, &mg, &md)) {
+            size_t b = (size_t)c->n_experts * (2 * ((mg + 255) / 256 * 256) + (md + 255) / 256 * 256);
+            if (b > st) st = b;
+        }
+    }
+    return st;
 }
 static void q36cc_promote_settle(Q36CChain *ch);
 static void q36cc_free_own(Q36CChain *ch, Model *m) {
@@ -305,13 +366,14 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
     ch->o_pre = calloc(L, sizeof(size_t)); ch->o_pf = calloc(L, sizeof(size_t));
     ch->t_ag = calloc(L, sizeof(void *)); ch->t_ld = calloc(L, sizeof(void *)); ch->t_lu = calloc(L, sizeof(void *));
     ch->t_ab = calloc(L, sizeof(void *)); ch->t_sg = calloc(L, sizeof(void *)); ch->t_gate = calloc(L, sizeof(void *));
+    ch->rgf = calloc(L, 1);
     ch->t_q = calloc(L, sizeof(void *)); ch->t_k = calloc(L, sizeof(void *)); ch->t_v = calloc(L, sizeof(void *));
     ch->t_o = calloc(L, sizeof(void *)); ch->t_dnp = calloc(L, sizeof(void *)); ch->t_dno = calloc(L, sizeof(void *));
     ch->t_shg = calloc(L, sizeof(void *)); ch->t_shu = calloc(L, sizeof(void *)); ch->t_shd = calloc(L, sizeof(void *));
     ch->rec = calloc(L, sizeof(void *)); ch->ring = calloc(L, sizeof(void *));
     ch->kc = calloc(L, sizeof(void *)); ch->vc = calloc(L, sizeof(void *));
     ch->kv_valid = calloc(L, sizeof(int)); ch->attn_ord = calloc(L, sizeof(int)); ch->kv_rows = calloc(L, sizeof(int));
-    if (!ch->o_in || !ch->o_post || !ch->o_qn || !ch->o_kn || !ch->o_conv || !ch->o_dn || !ch->o_snk || !ch->t_ab || !ch->t_sg || !ch->t_gate ||
+    if (!ch->o_in || !ch->o_post || !ch->o_qn || !ch->o_kn || !ch->o_conv || !ch->o_dn || !ch->o_snk || !ch->t_ab || !ch->t_sg || !ch->t_gate || !ch->rgf ||
         !ch->o_ra || !ch->o_rf || !ch->o_pre || !ch->o_pf || !ch->t_ag || !ch->t_ld || !ch->t_lu ||
         !ch->t_q || !ch->t_k || !ch->t_v || !ch->t_o || !ch->t_dnp || !ch->t_dno || !ch->t_shg || !ch->t_shu || !ch->t_shd ||
         !ch->rec || !ch->ring || !ch->kc || !ch->vc || !ch->kv_valid || !ch->attn_ord || !ch->kv_rows) return NULL;
@@ -406,7 +468,25 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
             ch->ring[i] = ch->rec[i] ? cc_buf((size_t)conv_dim * (convk - 1) * sizeof(float), CC_DEV) : NULL;
             ok = ch->t_ab[i] && ch->rec[i] && ch->ring[i];
         } else ch->attn_ord[i] = ch->n_attn++;
-        if (ok && c->n_experts > 0 && !q36_dense_l(c, i)) { ch->t_gate[i] = q36cc_qw_tensor(ch->dev, &l->gate); ok = ch->t_gate[i] != NULL; own += (size_t)l->gate.I * l->gate.O * (l->gate.q ? 1 : 4); }
+        if (ok && c->n_experts > 0 && !q36_dense_l(c, i)) {
+            /* the router and the shared expert's gate row read the same rows: where both are f32, one
+             * matrix of E + 1 rows and one GEMV a layer (Qwen3.6-35B UD-Q4_K_M: 40 launches of about
+             * 3 us a decode token fewer); COLI_CUDA_CHAIN_ROUTER_GATE=0 keeps two */
+            const char *rge = getenv("COLI_CUDA_CHAIN_ROUTER_GATE");
+            if (!(rge && *rge == '0') && !c->muse && l->sh_gate && l->sh_I > 0 && !l->gate.q && l->gate.w &&
+                l->gate.I == D && l->gate.O == c->n_experts) {
+                float *rg = malloc((size_t)(l->gate.O + 1) * D * sizeof(float));
+                if (rg) {
+                    memcpy(rg, l->gate.w, (size_t)l->gate.O * D * sizeof(float));
+                    memcpy(rg + (size_t)l->gate.O * D, l->sh_gate, (size_t)D * sizeof(float));
+                    ch->t_gate[i] = q36cc_f32_tensor(ch->dev, rg, D, l->gate.O + 1);
+                    free(rg);
+                    ch->rgf[i] = ch->t_gate[i] != NULL;
+                }
+            }
+            if (!ch->t_gate[i]) ch->t_gate[i] = q36cc_qw_tensor(ch->dev, &l->gate);
+            ok = ch->t_gate[i] != NULL; own += (size_t)l->gate.I * (l->gate.O + ch->rgf[i]) * (l->gate.q ? 1 : 4);
+        }
         if (ok && l->sh_gate && l->sh_I > 0) { ch->t_sg[i] = q36cc_f32_tensor(ch->dev, l->sh_gate, D, 1); ok = ch->t_sg[i] != NULL; own += (size_t)D * 4; }
     }
     if (!ok) {
@@ -442,23 +522,26 @@ static int q36cc_bufs(Q36CChain *ch, Model *m, int rows) {
              cc_reserve(&ch->q, r * qo * F, CC_DEV) && cc_reserve(&ch->k, r * kvo * F, CC_DEV) && cc_reserve(&ch->v, r * kvo * F, CC_DEV) &&
              cc_reserve(&ch->ctx, r * H * hd * F, CC_DEV) && cc_reserve(&ch->qkvz, r * (c->dn_conv_dim + vd) * F, CC_DEV) &&
              cc_reserve(&ch->ab, r * 2 * c->dn_vheads * F, CC_DEV) && cc_reserve(&ch->cv, r * c->dn_conv_dim * F, CC_DEV) &&
-             cc_reserve(&ch->dny, r * vd * F, CC_DEV) && cc_reserve(&ch->h2, r * D * F, CC_DEV) && cc_reserve(&ch->lg, r * E * F, CC_DEV) &&
+             cc_reserve(&ch->dny, r * vd * F, CC_DEV) && cc_reserve(&ch->h2, r * D * F, CC_DEV) && cc_reserve(&ch->lg, r * (E + 1) * F, CC_DEV) &&
              cc_reserve(&ch->gs, r * SI * F, CC_DEV) && cc_reserve(&ch->us, r * SI * F, CC_DEV) && cc_reserve(&ch->hs, r * SI * F, CC_DEV) &&
              cc_reserve(&ch->ds, r * D * F, CC_DEV) && cc_reserve(&ch->sgd, r * F, CC_DEV) && cc_reserve(&ch->fin, D * F, CC_DEV) &&
              cc_reserve(&ch->h2d, r * D * F, CC_DOWN) && cc_reserve(&ch->lgd, r * E * F, CC_DOWN) &&
              cc_reserve(&ch->kvd, (size_t)(ch->n_attn ? ch->n_attn : 1) * 2 * r * kvo * F, CC_DOWN) &&
-             cc_reserve(&ch->outd, (size_t)c->vocab * F, CC_DOWN) && cc_reserve(&ch->routed, r * RW * F, CC_UP) &&
+             cc_reserve(&ch->out, (size_t)c->vocab * F, CC_DEV) && cc_reserve(&ch->outd, (size_t)c->vocab * F, CC_DOWN) &&
+             cc_reserve(&ch->routed, r * RW * F, CC_UP) &&
              cc_reserve(&ch->cs, r * (c->rotary_dim > 0 ? c->rotary_dim : 2) * F, CC_UP) &&
              cc_reserve(&ch->csd, r * (c->rotary_dim > 0 ? c->rotary_dim : 2) * F, CC_DEV);
     if (ok && c->muse)   /* Muse Spark's alone: the attention gate's rows, the experts' input rows */
         ok = cc_reserve(&ch->agb, r * AG * F, CC_DEV) && cc_reserve(&ch->lat, r * LT * F, CC_DEV) && cc_reserve(&ch->latd, r * LT * F, CC_DOWN);
     if (ok && m->kv_ring && cc_attn_wr_ready())   /* the device's rings: a long step's window, linear */
-        ok = cc_reserve(&ch->kg, (r + c->window) * kvo * F, CC_DEV) && cc_reserve(&ch->vg, (r + c->window) * kvo * F, CC_DEV);
+        ok = cc_reserve(&ch->kg, (r + c->window) * kvo * q36cc_kves(), CC_DEV) && cc_reserve(&ch->vg, (r + c->window) * kvo * q36cc_kves(), CC_DEV);
     return ok;
 }
-/* n of the host's K or V elements from idx (q36_kv_es() bytes each, q36_kv16) into a float32
- * mirror at float offset at: float16 widens to the floats it holds, which are the device's */
+/* n of the host's K or V elements from idx (q36_kv_es() bytes each, q36_kv16) into a mirror at
+ * element offset at: a float16 mirror takes the host's halves as they are (at and n even), a
+ * float32 one the floats they hold */
 static int q36cc_kv_up(CcBuf *dst, size_t at, const void *base, int64_t idx, size_t n) {
+    if (q36cc_kvh()) return cc_write(dst, at / 2, (const uint16_t *)base + idx, n * 2);
     if (!q36_kv16()) return cc_write(dst, at, (const float *)base + idx, n * sizeof(float));
     float *f = malloc(n * sizeof(float));
     if (!f) return 0;
@@ -481,7 +564,7 @@ static int q36cc_mirror(Q36CChain *ch, Model *m) {
             ch->kv_valid[i] = 0;
             int R = q36cc_ring(m, i);
             ch->kv_rows[i] = R ? R : m->kv_cap;
-            size_t bytes = (size_t)KV * ch->kv_rows[i] * c->k_head_dim * sizeof(float);
+            size_t bytes = (size_t)KV * ch->kv_rows[i] * c->k_head_dim * q36cc_kves();
             ch->kc[i] = cc_buf(bytes, CC_DEV);
             ch->vc[i] = cc_buf(bytes, CC_DEV);
             if (!ch->kc[i] || !ch->vc[i]) { ch->cap = 0; return 0; }
@@ -580,7 +663,7 @@ static void q36cc_conv_free(Model *m, Q36ccConv *v) {
 static size_t q36cc_conv_kv_bytes(Model *m, int cap) {
     Cfg *c = &m->c; size_t b = 0;
     for (int i = 0; i < c->n_layers; i++)
-        if (c->is_attn[i]) b += 2 * (size_t)c->kv_heads * (q36cc_ring(m, i) ? m->kv_ring : cap) * c->k_head_dim * sizeof(float);
+        if (c->is_attn[i]) b += 2 * (size_t)c->kv_heads * (q36cc_ring(m, i) ? m->kv_ring : cap) * c->k_head_dim * q36cc_kves();
     return b;
 }
 static size_t q36cc_free_bytes(Q36CChain *ch) { size_t fr = 0, tot = 0; coli_cuda_mem_info(ch->dev, &fr, &tot); return fr; }
@@ -618,7 +701,7 @@ static int q36cc_conv_grow(Q36CChain *ch, Model *m, int k, int need) {
         int R = q36cc_ring(m, i);
         if (R && v->kc[i]) continue;   /* a ring keeps its rows */
         int rows = R ? R : cap;
-        size_t bytes = (size_t)KV * rows * kvd * sizeof(float);
+        size_t bytes = (size_t)KV * rows * kvd * q36cc_kves();
         cc_free(v->kc[i]); cc_free(v->vc[i]);
         v->kc[i] = cc_buf(bytes, CC_DEV); v->vc[i] = cc_buf(bytes, CC_DEV);
         v->kv_valid[i] = 0; v->kv_rows[i] = rows;
@@ -900,37 +983,42 @@ static int q36cc_attention(Q36CChain *ch, Model *m, Layer *l, int i, int n, int 
                 g[ng++] = (CcRegion){((size_t)h * tot + (t - b0)) * kvd, ((size_t)h * R + r) * kvd, (size_t)run * kvd};
                 t += run;
             }
-        ok = !ng || (cc_copy_regions(ch->kg, ch->kc[i], g, ng) && cc_copy_regions(ch->vg, ch->vc[i], g, ng));
+        if (ng) {   /* q36cc_kv_copy halves a float16 mirror's offsets: V's copy from the same rows */
+            CcRegion *gv = malloc(sizeof *gv * (size_t)ng);
+            ok = gv != NULL;
+            if (ok) memcpy(gv, g, sizeof *gv * (size_t)ng);
+            ok = ok && q36cc_kv_copy(ch->kg, ch->kc[i], g, ng) && q36cc_kv_copy(ch->vg, ch->vc[i], gv, ng);
+            free(gv);
+        }
         ng = 0;
         for (int s = 0; s < n; s++) for (int h = 0; h < KV; h++)
             g[ng++] = (CcRegion){((size_t)h * tot + nh + s) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
-        ok = ok && cc_copy_regions(ch->kg, ch->k, g, ng) && cc_copy_regions(ch->vg, ch->v, g, ng);
+        ok = ok && q36cc_kv_put(ch->kg, ch->k, g, ng) && q36cc_kv_put(ch->vg, ch->v, g, ng);
         CcAttn a = {n, H, KV, hd, nh, tot, 0, qo, qdim, hd, qo, qdim, gate_dim > 0, 0, H * hd, 0, 0,
                     1.f / sqrtf((float)hd), 0, 0};
         CcAttnW w = {a, win, l->sinks != NULL, (int)ch->o_snk[i]};
-        ok = ok && cc_attn_w(ch->q, ch->kg, ch->vg, ch->ctx, ch->q, l->sinks ? ch->prm : NULL, &w);
+        ok = ok && q36cc_attn_wc(ch->q, ch->kg, ch->vg, ch->ctx, ch->q, l->sinks ? ch->prm : NULL, &w, 0);
         ng = 0;   /* after the attention read the ring's rows: the step's last R into it */
         for (int s = n > R ? n - R : 0; s < n; s++) for (int h = 0; h < KV; h++)
             g[ng++] = (CcRegion){((size_t)h * R + (pb + s) % R) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
-        ok = ok && cc_copy_regions(ch->kc[i], ch->k, g, ng) && cc_copy_regions(ch->vc[i], ch->v, g, ng) &&
+        ok = ok && q36cc_kv_put(ch->kc[i], ch->k, g, ng) && q36cc_kv_put(ch->vc[i], ch->v, g, ng) &&
              cc_copy(ch->kvd, ko, ch->k, 0, (size_t)n * kvo) && cc_copy(ch->kvd, ko + (size_t)ch->rows * kvo, ch->v, 0, (size_t)n * kvo);
         free(g);
         return ok && q36cc_attn_out(ch, m, i, n);
     }
     for (int s = 0; s < n; s++) for (int h = 0; h < KV; h++)
         rg[s * KV + h] = (CcRegion){((size_t)h * rows + (R ? (pb + s) % R : pb + s)) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
-    ok = cc_copy_regions(ch->kc[i], ch->k, rg, n * KV) && cc_copy_regions(ch->vc[i], ch->v, rg, n * KV) &&
+    ok = q36cc_kv_put(ch->kc[i], ch->k, rg, n * KV) && q36cc_kv_put(ch->vc[i], ch->v, rg, n * KV) &&
          cc_copy(ch->kvd, ko, ch->k, 0, (size_t)n * kvo) && cc_copy(ch->kvd, ko + (size_t)ch->rows * kvo, ch->v, 0, (size_t)n * kvo);
     free(rg);
     CcAttn a = {n, H, KV, hd, pb, rows, 0, qo, qdim, hd, qo, qdim, gate_dim > 0, 0, H * hd, 0, 0,
                 1.f / sqrtf((float)hd), 0, 0};
     if (win || l->sinks) {   /* Flint: a sliding window and a sink per head */
         CcAttnW w = {a, win, l->sinks != NULL, (int)ch->o_snk[i]};
-        return ok && (R ? cc_attn_wr(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, l->sinks ? ch->prm : NULL, &w, R)
-                        : cc_attn_w(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, l->sinks ? ch->prm : NULL, &w)) &&
+        return ok && q36cc_attn_wc(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, l->sinks ? ch->prm : NULL, &w, R) &&
                q36cc_attn_out(ch, m, i, n);
     }
-    return ok && cc_attn(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, NULL, &a) && q36cc_attn_out(ch, m, i, n);
+    return ok && q36cc_attn_c(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, &a) && q36cc_attn_out(ch, m, i, n);
 }
 /* ns: the chunk's rows a verify copies the state after (rows 0..ns-1, slots c0..): the
  * convolution and the recurrence split into one dispatch per copy, each ending on its
@@ -971,14 +1059,13 @@ static int q36cc_attention_mx(Q36CChain *ch, Model *m, Layer *l, int i, int n, i
         int pos = ch->mx_rows[c0 + s].pos, rows = v->kv_rows[i];
         for (int h = 0; h < KV; h++)
             rg[h] = (CcRegion){((size_t)h * rows + (R ? pos % R : pos)) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
-        ok = cc_copy_regions(v->kc[i], ch->k, rg, KV) && cc_copy_regions(v->vc[i], ch->v, rg, KV);
+        ok = q36cc_kv_put(v->kc[i], ch->k, rg, KV) && q36cc_kv_put(v->vc[i], ch->v, rg, KV);
         CcAttn a = {1, H, KV, hd, pos, rows, s * qo, qo, qdim, s * qo + hd, qo, qdim, gate_dim > 0, s * H * hd, H * hd, 0, 0,
                     1.f / sqrtf((float)hd), 0, 0};
         if (win || l->sinks) {
             CcAttnW w = {a, win, l->sinks != NULL, (int)ch->o_snk[i]};
-            ok = ok && (R ? cc_attn_wr(ch->q, v->kc[i], v->vc[i], ch->ctx, ch->q, l->sinks ? ch->prm : NULL, &w, R)
-                          : cc_attn_w(ch->q, v->kc[i], v->vc[i], ch->ctx, ch->q, l->sinks ? ch->prm : NULL, &w));
-        } else ok = ok && cc_attn(ch->q, v->kc[i], v->vc[i], ch->ctx, ch->q, NULL, &a);
+            ok = ok && q36cc_attn_wc(ch->q, v->kc[i], v->vc[i], ch->ctx, ch->q, l->sinks ? ch->prm : NULL, &w, R);
+        } else ok = ok && q36cc_attn_c(ch->q, v->kc[i], v->vc[i], ch->ctx, ch->q, &a);
     }
     free(rg);
     return ok && q36cc_attn_out(ch, m, i, n);
@@ -1055,7 +1142,7 @@ static int q36cc_shared(Q36CChain *ch, Model *m, Layer *l, int i, int n) {
              cc_ew(ch->hs, ch->gs, ch->us, NULL, NULL, &p) &&
              cc_matmul(ch->t_shd[i], ch->hs, 0, ch->ds, 0, n);
     }
-    if (ok && ch->t_sg[i]) ok = cc_matmul(ch->t_sg[i], ch->h2, 0, ch->sgd, 0, n);
+    if (ok && ch->t_sg[i] && !(ch->rgf[i] && n <= Q36CC_RG_ROWS)) ok = cc_matmul(ch->t_sg[i], ch->h2, 0, ch->sgd, 0, n);
     return ok;
 }
 /* x += routed + gate * shared, as moe() leaves `out` and layers_forward_range adds it */
@@ -1070,8 +1157,9 @@ static int q36cc_combine(Q36CChain *ch, Model *m, int i, int n, CcBuf *routed) {
     }
     const int routed_l = c->n_experts > 0 && !q36_dense_l(c, i), SI = m->L[i].sh_I;   /* a Flint dense layer routes nothing */
     int flags = (routed_l ? 1 : 0) | (SI > 0 ? 2 : 0) | (m->L[i].sh_gate && SI > 0 ? 4 : 0);
-    CcEw p = {CC_EW_COMBINE, n * c->hidden, c->hidden, 1, flags, 1, 0, 0, 0, 0, 0, 1.f};
-    return cc_ew(ch->x, ch->x, routed, ch->ds, ch->sgd, &p);
+    const int rg = ch->rgf[i] && n <= Q36CC_RG_ROWS, E1 = c->n_experts + 1;   /* the gate after the router's logits in lg */
+    CcEw p = {CC_EW_COMBINE, n * c->hidden, c->hidden, 1, flags, rg ? E1 : 1, 0, 0, 0, 0, rg ? c->n_experts : 0, 1.f};
+    return cc_ew(ch->x, ch->x, routed, ch->ds, rg ? ch->lg : ch->sgd, &p);
 }
 /* COLI_CUDA_CHAIN_FAULT=n: the n-th frame fails (for the tests) */
 static int q36cc_frame_begin(Q36CChain *ch) {
@@ -1152,6 +1240,17 @@ static void q36cc_kv_down(Q36CChain *ch, Model *m, int i, int n, int pb) {
  * table points each such expert at its place there (planar, as the RAM holds it). 0: no
  * VRAM for it. */
 #define Q36CC_STAGE_ROWS 32
+/* The host pool follows the residents (qt_chain_host_follow) before a prompt chunk of
+ * Q36CC_FOLLOW_ROWS rows or more: the experts that left the card join it, those that came in
+ * leave it, or a layer holding one that left goes to the host's step whole. A smaller chunk
+ * leaves it behind for the next large one. On the Colab T4 high-RAM VM of the measures
+ * (docs/experiments/qwen36-cuda-host-pool-follow-2026-10-26) a follow costs about 0.3 ms an
+ * expert moved. On another VM of the same shape an earlier version, which followed before
+ * every chunk of more than 32 rows, moved 317 + 317 experts in 193 ms before a 36-row chunk
+ * and saved about 50 ms of it, while a 348-row chunk after 50 + 50 moves saved 1.1 s: through
+ * those two points the follow pays from about 80 rows, and at 128 the copies save about
+ * twice the 193 ms (threshold.txt there). */
+#define Q36CC_FOLLOW_ROWS 128
 /* Promotions (qt_chain_promote): after a decode-sized step, up to this many of its misses move
  * into the buffers of the coldest residents by this conversation's routes. The chain copies
  * each newcomer's RAM bytes into a page-locked staging slot and from there into the victim's
@@ -1164,13 +1263,18 @@ static void q36cc_kv_down(Q36CChain *ch, Model *m, int i, int n, int pb) {
  * COLI_CUDA_CHAIN_PROMOTE_HITS percent (75) of their routes on the card, the step promotes
  * nothing -- a conversation the history fits (80-82 % on an RTX 3070) pays for every swap (a
  * promoted expert displaces a resident the history still routes to) and gains little; at 80 the
- * brake was marginal for it. 0 brakes never. */
+ * brake was marginal for it. It holds only where the warm start's set came from a history
+ * (HEAT_FILE). Without one the set is the experts in index order, no conversation's, and the
+ * brake starts off: on a T4 (64 % of the experts resident) it held a story at 78-79 % hits,
+ * where the promotions reach 86-94 % and a token costs 7-17 % less; on an RTX 3070 about 2 %
+ * either way. The variable, when set, wins; 0 brakes never. */
 #define Q36CC_PROMOTE 4
 #define Q36CC_PROMO_HITS 75
 #define QT_CHG_LIST 512   /* residency changes read at once (the tier's ring holds as many) */
 static int q36cc_promote_rate(void) { const char *e = getenv("COLI_CUDA_CHAIN_PROMOTE"); return e && *e ? atoi(e) : Q36CC_PROMOTE; }
 static int q36cc_promote_hits(void) {
-    const char *e = getenv("COLI_CUDA_CHAIN_PROMOTE_HITS"); int h = e && *e ? atoi(e) : Q36CC_PROMO_HITS;
+    const char *e = getenv("COLI_CUDA_CHAIN_PROMOTE_HITS");
+    int h = e && *e ? atoi(e) : qt_chain_history() ? Q36CC_PROMO_HITS : 0;
     return h < 0 ? 0 : h > 100 ? 100 : h;
 }
 /* entry (i, e) of the host's table from the tier: 1 resident on this device */
@@ -1248,7 +1352,113 @@ static void q36cc_promote_settle(Q36CChain *ch) {
     for (int p = 0; p < ch->pr_npend; p++) { qt_chain_promote_done(ch->pr_pend[p].ci, ch->pr_pend[p].vi, cc_host_up_done(ch->pr_pend[p].tk)); ch->pr_busy[ch->pr_pend[p].slot] = 0; }
     ch->pr_npend = 0;
 }
+/* The staging buffer for a layer's host-pool experts. With the residents spread over the layers hmax (the most
+ * experts one layer has off the card) starts below the layer's 256 and every promotion can raise it; cc_reserve
+ * makes the new buffer before it frees the old one, so each growth wanted both at once. On an 8 GB card the
+ * second allocation failed in the middle of a conversation and the staging stayed off for the process (the
+ * RTX 3070 agent session in docs/experiments). A bigger buffer takes the old one's place: free it first. */
+static int q36cc_stage_reserve(CcBuf **stage, size_t bytes) {
+    if (*stage && cc_bytes(*stage) < bytes) { cc_free(*stage); *stage = NULL; }
+    return cc_reserve(stage, bytes, CC_DEV);
+}
+/* A GGUF layer's expert in the staging: its gate, up and down rows as the file has them, which the
+ * device reads in place where a row is whole words (bd_rows_copy pads the others); mg a gate's (or
+ * an up's) bytes, md a down's. 0: rows of other widths, the layer's experts the host's. */
+static int q36cc_gguf_dims(Model *m, int i, size_t *mg, size_t *md) {
+    if (!m->gqx || i < 0 || i >= m->c.n_layers) return 0;
+    const int D = q36_eh(&m->c), I = m->c.inter;   /* the file's types, the tier's (qt_init_gguf) */
+    int64_t rg = gq_row_bytes(m->gqx[i].tg, D), rd = gq_row_bytes(m->gqx[i].td, I);
+    if (rg <= 0 || rd <= 0 || rg % 4 || rd % 4) return 0;
+    *mg = (size_t)rg * I; *md = (size_t)rd * D;
+    return 1;
+}
+/* the staging's VRAM back (the mirrors or the step's buffers need it): a prompt chunk's experts in
+ * the host pool go to the host's step from here on; 1 when there was one */
+static int q36cc_stage_drop(Q36CChain *ch) {
+    if (!ch->dm_stage) return 0;
+    cc_free(ch->dm_stage); ch->dm_stage = NULL; ch->dm_stage_off = 1;
+    fprintf(stderr, "[chain] qwen36: the staging of the host pool's experts gives its device memory back; a prompt chunk's go "
+                    "to the host's step from here on\n");
+    return 1;
+}
+/* the mirrors' bytes on the device now */
+static size_t q36cc_mirror_held(Q36CChain *ch, Model *m) {
+    size_t b = 0;
+    for (int i = 0; i < m->c.n_layers; i++) if (m->c.is_attn[i]) b += cc_bytes(ch->kc[i]) + cc_bytes(ch->vc[i]);
+    return b;
+}
+/* The staged table of a GGUF's experts (q36cc_stage_table): each layer's experts in the host pool
+ * at slots of the largest layer's three matrices, 256-byte aligned each; one copy an expert where
+ * its gate and up end on 256 bytes (its rows back to back as the RAM holds them), else three. */
+static int q36cc_stage_table_gguf(Q36CChain *ch, Model *m) {
+    Cfg *c = &m->c; int L = c->n_layers, E = c->n_experts;
+    size_t ne = (size_t)L * E, stride = 0;
+    int hmax = 0, tot = 0;
+    for (int i = 0; i < L; i++) {
+        size_t mg, md;
+        if (q36_dense_l(c, i) || !q36cc_gguf_dims(m, i, &mg, &md)) continue;
+        size_t st = 2 * ((mg + 255) / 256 * 256) + (md + 255) / 256 * 256;
+        if (st > stride) stride = st;
+        int h = 0;
+        for (int e = 0; e < E; e++) {
+            const void *w; const float *sc; size_t a, b;
+            if (!ch->dm_res[(size_t)i * E + e] && qt_chain_host(i, e, &w, &a, &sc, &b) && a == 2 * mg + md) h++;
+        }
+        if (h > hmax) hmax = h;
+        tot += h;
+    }
+    if (!ch->dm_hostb) {
+        ch->dm_hostb = malloc(ne * sizeof(CcExpert));
+        ch->dm_partb = calloc(L, sizeof(int)); ch->dm_fro = calloc(L, sizeof(int)); ch->dm_frn = calloc(L, sizeof(int));
+        if (!ch->dm_hostb || !ch->dm_partb || !ch->dm_fro || !ch->dm_frn) return 0;
+    }
+    CcFetch *fr = realloc(ch->dm_fr, (size_t)(3 * tot + 1) * sizeof(CcFetch));
+    if (!fr) return 0;
+    ch->dm_fr = fr;
+    /* the room the tier left the mirrors at the context's length stays free (a window's or sinks'
+     * model's, q36cc_mirror_bytes): another model's mirrors take the staging's memory back when
+     * they grow (q36cc_stage_drop). Kept for every model, Qwen3.6 UD-Q4_K_M with 7 GiB free kept
+     * 1.3 GB that no one had set aside and found none to stage in: 97 tok/s for any prompt. */
+    size_t fb = 0, tb = 0, full = q36cc_mirror_bytes(m, qwen36_max_ctx()), held = q36cc_mirror_held(ch, m);
+    size_t left = full > held ? full - held : 0, need = (size_t)(hmax ? hmax : 1) * stride;
+    if (!ch->dm_stage && coli_cuda_mem_info(ch->dev, &fb, &tb) && fb < need + left + ((size_t)256 << 20)) return 0;
+    if (!stride || !q36cc_stage_reserve(&ch->dm_stage, (size_t)(hmax ? hmax : 1) * stride) ||
+        !cc_reserve(&ch->dm_tabb, ne * sizeof(CcExpert), CC_DEV)) return 0;
+    const char *base = (const char *)cc_dev_addr(ch->dm_stage);
+    if (!base) return 0;
+    int k = 0;
+    for (int i = 0; i < L; i++) {
+        size_t mg = 0, md = 0;
+        const int dims = !q36_dense_l(c, i) && q36cc_gguf_dims(m, i, &mg, &md);
+        const size_t ag = (mg + 255) / 256 * 256;
+        const int one = mg % 256 == 0;   /* gate and up end on 256 bytes: the rows as they are, one copy */
+        int h = 0, miss = 0;
+        ch->dm_fro[i] = k;
+        for (int e = 0; e < E; e++) {
+            size_t j = (size_t)i * E + e;
+            CcExpert *x = &ch->dm_hostb[j];
+            const void *w; const float *sc; size_t a, b;
+            *x = ch->dm_host[j];
+            if (ch->dm_res[j]) continue;
+            memset(x, 0, sizeof *x);
+            if (!dims || h >= hmax || k + 3 > 3 * tot || !qt_chain_host(i, e, &w, &a, &sc, &b) || a != 2 * mg + md) { miss = 1; continue; }
+            const size_t at = (size_t)h * stride;
+            const char *g = base + at;
+            x->g = g; x->u = g + ag; x->d = g + 2 * ag;
+            if (one) fr[k++] = (CcFetch){w, at, 2 * mg + md};
+            else {
+                fr[k++] = (CcFetch){w, at, mg};
+                fr[k++] = (CcFetch){(const char *)w + mg, at + ag, mg};
+                fr[k++] = (CcFetch){(const char *)w + 2 * mg, at + 2 * ag, md};
+            }
+            h++;
+        }
+        ch->dm_frn[i] = k - ch->dm_fro[i]; ch->dm_partb[i] = miss;
+    }
+    return cc_begin() && cc_write(ch->dm_tabb, 0, ch->dm_hostb, ne * sizeof(CcExpert)) && cc_submit(1);
+}
 static int q36cc_stage_table(Q36CChain *ch, Model *m) {
+    if (ch->dm_fmt >= 100) return q36cc_stage_table_gguf(ch, m);
     Cfg *c = &m->c; int L = c->n_layers, E = c->n_experts, D = c->hidden, I = c->inter;
     size_t ne = (size_t)L * E, mb = (size_t)D * I / 2, nsc = (size_t)I * (D / ch->dm_gs), wb = 3 * mb, sb = 3 * nsc * sizeof(float);
     size_t wa = (wb + 255) / 256 * 256, stride = wa + (sb + 255) / 256 * 256;
@@ -1272,7 +1482,7 @@ static int q36cc_stage_table(Q36CChain *ch, Model *m) {
     CcFetch *fr = realloc(ch->dm_fr, (size_t)(2 * tot + 1) * sizeof(CcFetch));
     if (!fr) return 0;
     ch->dm_fr = fr;
-    if (!cc_reserve(&ch->dm_stage, (size_t)(hmax ? hmax : 1) * stride, CC_DEV) || !cc_reserve(&ch->dm_tabb, ne * sizeof(CcExpert), CC_DEV))
+    if (!q36cc_stage_reserve(&ch->dm_stage, (size_t)(hmax ? hmax : 1) * stride) || !cc_reserve(&ch->dm_tabb, ne * sizeof(CcExpert), CC_DEV))
         return 0;
     const char *base = (const char *)cc_dev_addr(ch->dm_stage);
     if (!base) return 0;
@@ -1300,6 +1510,14 @@ static int q36cc_stage_table(Q36CChain *ch, Model *m) {
     }
     return cc_begin() && cc_write(ch->dm_tabb, 0, ch->dm_hostb, ne * sizeof(CcExpert)) && cc_submit(1);
 }
+/* before a prompt chunk of n rows that stages: on one of Q36CC_FOLLOW_ROWS rows or more the
+ * pool follows the residents, and a change stales the staged table */
+static void q36cc_follow(Q36CChain *ch, int n) {
+    if (n < Q36CC_FOLLOW_ROWS) return;
+    double th = tm_now(); int hj, hl;
+    if (qt_chain_host_follow(&hj, &hl)) { ch->hp_follows++; ch->hp_joined += (unsigned)hj; ch->hp_left += (unsigned)hl; ch->dm_stage_dirty = 1; }
+    ch->hp_ms += tm_now() - th;
+}
 /* the step's buffers, and the table when the tier's residents moved (the tier held) */
 static int q36cc_dm_begin(Q36CChain *ch, Model *m, int n) {
     Cfg *c = &m->c; int L = c->n_layers, E = c->n_experts, K = c->topk, D = c->hidden, I = c->inter;
@@ -1310,11 +1528,13 @@ static int q36cc_dm_begin(Q36CChain *ch, Model *m, int n) {
         ch->dm_g = falloc(I); ch->dm_u = falloc(I); ch->dm_hh = falloc(D);
         if (!ch->dm_host || !ch->dm_res || !ch->dm_part || !ch->dm_ran || !ch->dm_nres) return 0;
         ch->promo_rate = q36cc_promote_rate(); ch->promo_hits = q36cc_promote_hits();
-        if (ch->promo_rate > 0 && qt_chain_devices() == 1 && ch->dm_fmt < 100 && cc_host_up_ready())
+        if (ch->promo_rate > 0 && qt_chain_devices() == 1 && ch->dm_fmt < 100 && cc_host_up_ready()) {
+            char brake[96];
+            if (ch->promo_hits > 0) snprintf(brake, sizeof brake, "none while the last %d steps hit %d %% or more", Q36CC_PROMO_WIN, ch->promo_hits);
+            else snprintf(brake, sizeof brake, "no brake%s", qt_chain_history() ? "" : " (no heat file: the warm start's set is no conversation's)");
             fprintf(stderr, "[chain] qwen36: up to %d experts a step promoted into the card by this conversation's routes, "
-                            "the coldest residents giving way, none while the last %d steps hit %d %% or more "
-                            "(COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)\n", ch->promo_rate, Q36CC_PROMO_WIN, ch->promo_hits);
-        else ch->promo_rate = 0;
+                            "the coldest residents giving way, %s (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)\n", ch->promo_rate, brake);
+        } else ch->promo_rate = 0;
     }
     if (!cc_reserve(&ch->dm_ids, (size_t)L * r * K * 4, CC_DEV) || !cc_reserve(&ch->dm_w, (size_t)L * r * K * F, CC_DEV) ||
         !cc_reserve(&ch->dm_idsd, (size_t)L * r * K * 4, CC_DOWN) || !cc_reserve(&ch->dm_wd, (size_t)L * r * K * F, CC_DOWN) ||
@@ -1353,8 +1573,11 @@ static int q36cc_dm_begin(Q36CChain *ch, Model *m, int n) {
         ch->dm_epoch = ep; ch->dm_read = 1; ch->dm_stage_dirty = 1;
         ch->patch_ms += tm_now() - tp;
     }
-    /* the staged table (a prompt chunk's host-pool copies) follows the residents when a chunk needs it */
-    if (ch->dm_stage_dirty && n > Q36CC_STAGE_ROWS && qt_chain_host_count() > 0 && !ch->dm_stage_off && cc_fetch_ready()) {
+    /* the staged table (a prompt chunk's host-pool copies) follows the residents when a chunk needs it,
+     * and on a large chunk the pool first (q36cc_follow) */
+    int stage = n > Q36CC_STAGE_ROWS && qt_chain_host_count() > 0 && !ch->dm_stage_off && cc_fetch_ready();
+    if (stage) q36cc_follow(ch, n);
+    if (stage && ch->dm_stage_dirty) {
         if (!q36cc_stage_table(ch, m)) {
             if (cc_lost()) return 0;
             fprintf(stderr, "[chain] qwen36: no VRAM to stage the host pool's experts in; a prompt chunk's go to the host's step\n");
@@ -1389,10 +1612,10 @@ static void q36cc_dm_end(Q36CChain *ch) { if (ch->dm_held) { qt_chain_hold(0); c
 static int q36cc_dm_layer(Q36CChain *ch, Model *m, Layer *l, int i, int n, unsigned *v) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
     int ng = c->n_group > 1 && c->n_group <= E ? c->n_group : 1, io = i * n * K;
-    CcRoute rp = {n, E, K, c->router_sigmoid ? 1 : 0, 0, E, 0, 0, io, K, io, K, ng, ng > 1 ? c->topk_group : 1, 1, 1.f, 1.f, 0.f};
+    CcRoute rp = {n, E, K, c->router_sigmoid ? 1 : 0, 0, E + ch->rgf[i], 0, 0, io, K, io, K, ng, ng > 1 ? c->topk_group : 1, 1, 1.f, 1.f, 0.f};
     int part;
     CcBuf *tab = q36cc_dm_tab(ch, i, n, &part);
-    CcMoe mp = {n, K, D, I, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, D, io, K, io, K, 0, D, -1, E, tab == ch->dm_tabb, 0};
+    CcMoe mp = {n, K, D, I, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, D, io, K, io, K, 0, D, -1, E, tab == ch->dm_tabb && ch->dm_fmt < 100, 0};
     if (ch->dm_fmt >= 100) qt_chain_layer_format(i, &mp.fmt, &mp.fmt_d);   /* a GGUF's types change from layer to layer */
     int stg = q36cc_stages(ch, tab, i);
     int ok = cc_matmul(ch->t_gate[i], ch->h2, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->dm_ids, ch->dm_w, &rp);
@@ -1478,7 +1701,8 @@ static int q36cc_rows_max(Q36CChain *ch, Model *m) {
     size_t row = ((size_t)6 * D + qo + 2 * kvo + (size_t)c->q_heads * c->head_dim + 2 * (size_t)c->dn_conv_dim + 2 * vd +
                   2 * c->dn_vheads + E + 3 * SI + 1 + (size_t)K * (I + D) + 2 * (size_t)L * K + 4 * K) * sizeof(float);
     size_t fr = 0, tot = 0, stage = 0;
-    if (c->n_experts > 0 && qt_chain_host_count() > 0 && ch->dm_gs > 0)
+    if (c->n_experts > 0 && qt_chain_host_count() > 0 && ch->dm_fmt >= 100) stage = q36cc_gguf_stage_bytes(m);
+    else if (c->n_experts > 0 && qt_chain_host_count() > 0 && ch->dm_gs > 0)
         stage = (size_t)c->n_experts * (3 * ((size_t)D * I / 2) + 3 * ((size_t)D * I / ch->dm_gs) * sizeof(float) + 512);
     coli_cuda_mem_info(ch->dev, &fr, &tot);
     size_t room = fr > stage ? (fr - stage) / 2 : 0;
@@ -1511,11 +1735,20 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         q36cc_conv_save(ch);
         mirror_ok = q36cc_conv_grow(ch, m, ch->conv_cur, pos_base + S);
         q36cc_conv_load(ch, ch->conv_cur);
+        if (!mirror_ok && q36cc_stage_drop(ch)) {
+            q36cc_conv_save(ch);
+            mirror_ok = q36cc_conv_grow(ch, m, ch->conv_cur, pos_base + S);
+            q36cc_conv_load(ch, ch->conv_cur);
+        }
         if (!mirror_ok) { q36cc_pool_off(ch, m); mirror_ok = q36cc_mirror(ch, m); }
-    } else if (!ch->mx_rows) mirror_ok = q36cc_mirror(ch, m);
+    } else if (!ch->mx_rows) {
+        mirror_ok = q36cc_mirror(ch, m);
+        if (!mirror_ok && q36cc_stage_drop(ch)) mirror_ok = q36cc_mirror(ch, m);   /* the staging's memory to the mirrors */
+    }
     if (!mirror_ok || !q36cc_scratch(ch, m, rows) || (lf && !cc_reserve(&ch->lfd, (size_t)L * 3 * D * sizeof(float), CC_DOWN)) ||
         (want_x && !cc_reserve(&ch->xd, (size_t)rows * D * sizeof(float), CC_DOWN)) ||
         (nlogits > 1 && (!cc_reserve(&ch->fin, (size_t)nlogits * D * sizeof(float), CC_DEV) ||
+                         !cc_reserve(&ch->out, (size_t)nlogits * c->vocab * sizeof(float), CC_DEV) ||
                          !cc_reserve(&ch->outd, (size_t)nlogits * c->vocab * sizeof(float), CC_DOWN)))) {
         fprintf(stderr, "[chain] qwen36: device memory for %d rows refused; the per-matrix path\n", rows);
         ch->failed = 1;
@@ -1553,7 +1786,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
          * every layer; a prompt chunk's layers whose experts are all in the table (a layer
          * with some elsewhere, or the prompt's re-plan of the residents, keeps the host's step) */
         int dm = E > 0 && ch->dm_on && (n <= Q36CC_DM_ROWS || !prefill_replan_on());
-        if (dm && !q36cc_dm_begin(ch, m, n)) {
+        if (dm && !q36cc_dm_begin(ch, m, n) && !(!cc_lost() && q36cc_stage_drop(ch) && q36cc_dm_begin(ch, m, n))) {
             if (cc_lost()) goto lost;
             fprintf(stderr, "[chain] qwen36: the routed experts' buffers or table refused; the host's step from here on\n");
             q36cc_dm_end(ch); ch->dm_on = dm = 0;
@@ -1601,7 +1834,14 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
                 continue;
             }
             if (ok && routed_l) {
-                ok = cc_matmul(ch->t_gate[i], ch->h2, 0, ch->lg, 0, n) && cc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E);
+                ok = cc_matmul(ch->t_gate[i], ch->h2, 0, ch->lg, 0, n);
+                if (ok && ch->rgf[i]) {   /* the router's rows down without the gate after each */
+                    CcRegion *rgn = malloc((size_t)n * sizeof *rgn);
+                    ok = rgn != NULL;
+                    for (int s = 0; ok && s < n; s++) rgn[s] = (CcRegion){(size_t)s * E, (size_t)s * (E + 1), (size_t)E};
+                    ok = ok && cc_copy_regions(ch->lgd, ch->lg, rgn, n);
+                    free(rgn);
+                } else ok = ok && cc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E);
                 if (c->muse) {   /* Muse Spark: the experts read the rows at their width, normalised */
                     CcNorm pn = {n, q36_eh(c), 1, 0, q36_eh(c), q36_eh(c), 0, q36_eh(c), q36_eh(c), (int)ch->o_pre[i], 0, CC_NORM_ADD1, c->eps, 1.f};
                     ok = ok && cc_matmul(ch->t_ld[i], ch->h2, 0, ch->lat, 0, n) && cc_norm(ch->lat, ch->prm, ch->lat, &pn) &&
@@ -1634,12 +1874,15 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         if (ok && lf) ok = cc_copy(ch->lfd, ((size_t)(L - 1) * 3 + 2) * D, ch->x, (size_t)(n - 1) * D, D);
         if (ok && want_x) ok = cc_copy(ch->xd, 0, ch->x, 0, (size_t)n * D);
         int last = c0 + n == S;
-        /* the final norm and lm_head on this chunk's share of the last nlogits rows */
+        /* the final norm and lm_head on this chunk's share of the last nlogits rows. The head writes its
+         * logits on the card and one copy takes them to outd: written into outd itself, one float per
+         * warp over the bus, the head took 7.4 ms of a 13.5 ms step on an RTX PRO 4000, 0.9 ms this way */
         int lo0 = S - nlogits > c0 ? S - nlogits - c0 : 0, lo_n = nlogits ? n - lo0 : 0;
         if (ok && lo_n > 0) {
             int dst = c0 + lo0 - (S - nlogits);
             ok = q36cc_norm(ch->x, (size_t)lo0 * D, ch->prm, ch->o_final, ch->fin, (size_t)dst * D, lo_n, D, c->eps) &&
-                 cc_matmul(ch->t_lm, ch->fin, (size_t)dst * D, ch->outd, (size_t)dst * c->vocab, lo_n);
+                 cc_matmul(ch->t_lm, ch->fin, (size_t)dst * D, ch->out, (size_t)dst * c->vocab, lo_n) &&
+                 cc_copy(ch->outd, (size_t)dst * c->vocab, ch->out, (size_t)dst * c->vocab, (size_t)lo_n * c->vocab);
         }
         double t0 = tm_now();
         ok = ok && cc_submit(0);
@@ -1737,4 +1980,7 @@ static void q36cc_report(Model *m) {
     if (ch->dm_staged)
         fprintf(stderr, "[chain] qwen36: %llu prompt layer steps staged the host pool's experts (%.2f GB copied over the bus)\n",
                 ch->dm_staged, ch->dm_stage_bytes / 1073741824.0);
+    if (ch->hp_follows)
+        fprintf(stderr, "[chain] qwen36: the host pool followed the residents before %llu prompt chunks: %llu experts joined it, "
+                        "%llu left it, %.1f ms\n", ch->hp_follows, ch->hp_joined, ch->hp_left, ch->hp_ms);
 }

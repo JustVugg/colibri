@@ -368,6 +368,20 @@ static float g_nuc  = 0.95f;  /* NUCLEUS env overrides */
 
 #include "matmul_f32.h"   /* y[S,O] = x[S,I] @ W^T, W [O,I] f32 row-major */
 #include "matmul_f16.h"   /* the same product with W kept as half (FP16 needs F16C, BF16 runs anywhere): bit-identical, half the bytes */
+#include "kv16.h"
+
+/* ---- the KV cache's numbers (kv16.h) ------------------------------------------------
+ * Each K and V value is clamped to +-65504 and rounded to the nearest float16 as a step
+ * computes it, before anything reads it (attention(), and the Vulkan chain's rows alike).
+ * The cache stays float32 arrays holding float16's values, so the chain's mirror keeps
+ * them in float16 (olc_kvh) with the same numbers: half a decode step's reads. KV16=0:
+ * float32's. An argv run against a .json reference (the tiny oracle) keeps float32
+ * unless KV16 is set. */
+static int g_olm_kv16 = -1;
+static inline int olm_kv16(void) {
+    if (g_olm_kv16 < 0) { const char *e = getenv("KV16"); g_olm_kv16 = !(e && *e == '0'); }
+    return g_olm_kv16;
+}
 
 /* matmul for a RESIDENT f32 matrix W [O,I], with *vk caching its device copy:
  * on Vulkan when the device is up, the CPU's matmul otherwise. The backend has one
@@ -1003,6 +1017,9 @@ static void olc_place(Model *m);
 static void olm_dho_start(Model *m);
 static void olm_dho_finish(Model *m);
 #endif
+#ifdef COLI_CUDA
+static void occ_start(Model *m);   /* olmoe_cuda_chain.h */
+#endif
 static void model_init(Model *m, const char *snap, int cap, int bits) {
     model_init_range(m, snap, cap, bits, 0, 0, 1, 1);
 #ifdef COLI_VULKAN
@@ -1028,6 +1045,9 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
                 vkt_ready() ? "routed experts go to the expert tier, the embedding lookup stays on the CPU"
                             : "routed experts and the embedding lookup stay on the CPU");
     olc_start(m);   /* COLI_VK_CHAIN: every layer's dense part as one frame on the device */
+#endif
+#ifdef COLI_CUDA
+    occ_start(m);   /* COLI_CUDA=1: every layer and its experts on the card (olmoe_cuda_chain.h) */
 #endif
 }
 
@@ -1562,6 +1582,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         int pos = m->mux_rows ? m->mux_rows[s].pos : pos_base + s;
         for (int hh = 0; hh < H; hh++) { rope_head(q + (int64_t)s*D + hh*hd, pos, c); rope_head(k + (int64_t)s*D + hh*hd, pos, c); }
     }
+    if (olm_kv16()) { kv16_round(k, (int64_t)S*D); kv16_round(vv, (int64_t)S*D); }   /* the cache's numbers, before anything reads them */
     /* scrive k,v nella kv-cache alle posizioni pos_base..pos_base+S-1 (in un passo
      * multiplexato: ogni riga alla sua, nella cache della sua conversazione) */
     const OlmRow *mr = m->mux_rows;
@@ -2091,6 +2112,10 @@ static void olm_dho_finish(Model *m) {
 }
 #endif
 
+#ifdef COLI_CUDA
+#include "olmoe_cuda_chain.h"   /* COLI_CUDA=1: every layer, its experts too, as one chain on the card */
+#endif
+
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
     kv_room_fit(m, pos_base + S);   /* before the positions' pages are written */
@@ -2108,11 +2133,11 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     }
     float *x = falloc((int64_t)S*D);
     for (int s = 0; s < S; s++) olm_embed_row(m, ids[s], x + (int64_t)s*D);
-#ifdef COLI_VULKAN
-    /* COLI_VK_CHAIN: the layers, the final norm and lm_head on the device; x comes
-     * back only when the prefill read-out below needs every row */
+    /* a chain (COLI_VK_CHAIN, or the CUDA one): the layers, the final norm and lm_head on the
+     * device; x comes back only when the prefill read-out below needs every row */
     float *chain_logit = NULL;
     int chain_n = 0;   /* layers the chain ran (a partial chain: the CPU runs the rest and the head) */
+#ifdef COLI_VULKAN
     if (g_vk_chain) {
         int rows_only = 0;
         chain_logit = falloc(c->vocab);
@@ -2125,10 +2150,19 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
             for (int s = 0; s < S; s++) olm_embed_row(m, ids[s], x + (int64_t)s*D);
         } else if (rows_only) { free(chain_logit); chain_logit = NULL; }
     }
-    if (!chain_logit) layers_forward_range(m, x, S, pos_base, chain_n, c->n_layers, 1);
-#else
-    layers_forward_range(m, x, S, pos_base, 0, c->n_layers, 1);
 #endif
+#ifdef COLI_CUDA
+    if (!chain_n && g_occ && g_occ->ok && !g_occ->failed) {
+        chain_logit = falloc(c->vocab);
+        chain_n = occ_forward(m, ids, x, S, pos_base, g_echo_k > 0 && g_echo_id && S > 1, chain_logit);
+        if (!chain_n) {   /* declined or lost: the CPU runs the step from the embedding rows */
+            free(chain_logit); chain_logit = NULL;
+            occ_cpu_step(m, pos_base);
+            for (int s = 0; s < S; s++) olm_embed_row(m, ids[s], x + (int64_t)s*D);
+        }
+    }
+#endif
+    if (!chain_logit) layers_forward_range(m, x, S, pos_base, chain_n, c->n_layers, 1);
     /* count actual tokens processed (S>1 during prefill) */
     m->token_count += S; m->freq_token_count += S;
     if (!m->hot_pinned && m->hot_n > 0 && m->freq_token_count >= m->warmup_tokens)
@@ -2153,13 +2187,11 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         }
         free(erow); free(elog);
     }
-#ifdef COLI_VULKAN
     if (chain_logit) {   /* the chain's last frame ran the final norm and lm_head */
         g_prof_forwards += 1;
         free(x);
         return chain_logit;
     }
-#endif
     float *last = falloc(D);
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     float *logit = falloc(c->vocab);
@@ -2580,6 +2612,9 @@ static void run_chat(Model *m, Tok *T, int ctx_cap) {
 #ifdef COLI_VULKAN
         olmoe_vk_report(); vkt_report("turn", m->hits, m->miss); olc_report(m);
 #endif
+#ifdef COLI_CUDA
+        occ_report();
+#endif
     }
     free(line); free(turn); free(newids); free(gen); free(outbuf); free(hist);
 }
@@ -2837,6 +2872,9 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     fflush(stdout);
 #ifdef COLI_VULKAN
     olmoe_vk_report(); vkt_report("turn", m->hits, m->miss); olc_report(m);
+#endif
+#ifdef COLI_CUDA
+    occ_report();
 #endif
     serve_hits(m);
     free(ids);
@@ -3254,6 +3292,7 @@ int main(int argc, char **argv) {
     }
 
     const char *refpath = argc > 3 ? argv[3] : "ref.json";
+    if (!(getenv("KV16") && *getenv("KV16"))) g_olm_kv16 = 0;   /* the oracle's reference: float32 unless asked */
 
     float smooth = getenv("SMOOTH") ? (float)atof(getenv("SMOOTH")) : 0.3f;
     float conf   = getenv("CONF_LIMIT") ? (float)atof(getenv("CONF_LIMIT")) : 0.92f;
@@ -3289,6 +3328,9 @@ int main(int argc, char **argv) {
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
 #ifdef COLI_VULKAN
         fflush(stdout); olmoe_vk_report(); vkt_report("run", m.hits, m.miss); olc_report(&m);
+#endif
+#ifdef COLI_CUDA
+        occ_report();
 #endif
         free(buf); free(arena);
         return 0;      /* PPL is a measurement run: no rt_save on purpose, so a loss
@@ -3342,6 +3384,9 @@ int main(int argc, char **argv) {
     printf("TUNE decode: %d tokens in %.3fs\n", n_new, dt);
 #ifdef COLI_VULKAN
     fflush(stdout); olmoe_vk_report(); vkt_report("run", m.hits, m.miss); olc_report(&m);
+#endif
+#ifdef COLI_CUDA
+    occ_report();
 #endif
     free(buf); free(arena);
     return 0;

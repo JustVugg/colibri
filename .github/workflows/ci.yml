@@ -730,7 +730,9 @@ jobs:
 
   engine-cuda-syntax:
     name: CUDA syntax check
-    runs-on: ubuntu-latest
+    # 24.04, not ubuntu-latest: on 26.04 the toolkit action's network method finds no
+    # cuda-nvcc-12-6 package in NVIDIA's ubuntu2604 repository (2026-10-28)
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install CUDA toolkit (compiler only)
@@ -1720,6 +1722,11 @@ jobs:
           cd c
           gcc -O3 -march=native -fopenmp -I. tests/test_int_kernel_exact.c -o /tmp/tike -lm
           /tmp/tike
+          # GGUF rows eight at a time: the runner's own ISA, and the release builds' (no VNNI)
+          gcc -O3 -march=native -fopenmp -I. tests/test_rows_f8.c -o /tmp/trf8 -lm
+          /tmp/trf8
+          gcc -O3 -march=x86-64-v3 -fopenmp -I. tests/test_rows_f8.c -o /tmp/trf8v3 -lm
+          /tmp/trf8v3
       - name: Generate the glm_tiny fixture
         run: cd c && python3 tools/make_glm_oracle.py
       - name: Oracle (30–32/32 teacher forcing + exact greedy)

@@ -64,15 +64,41 @@ static inline float kv16_to(uint16_t b) {
 }
 #endif
 
+/* gcc does not vectorize the _Float16 casts: with F16C the three loops below convert eight
+ * values at a time by the instructions those casts compile to (round to nearest even), the
+ * clamp's operands ordered so a NaN passes through as kv16_clamp lets it: the same bits.
+ * Before, kv16_round took about 0.2 ms of an OLMoE decode token (16 layers' K and V rows
+ * down from the Vulkan chain) and about 20 ms of a 3K-token prompt. */
+#if defined(__F16C__) && defined(__AVX__) && defined(__FLT16_MAX__) && !defined(KV16_INTEGER)
+#include <immintrin.h>
+#define KV16_CVT8 1
+static inline __m256 kv16_clamp8(__m256 v) {
+    return _mm256_max_ps(_mm256_set1_ps(-KV16_MAX), _mm256_min_ps(_mm256_set1_ps(KV16_MAX), v));
+}
+#endif
 /* x rounded in place to the floats its float16 holds */
 static inline void kv16_round(float *x, int64_t n) {
-    for (int64_t i = 0; i < n; i++) x[i] = kv16_to(kv16_from(x[i]));
+    int64_t i = 0;
+#ifdef KV16_CVT8
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(x + i, _mm256_cvtph_ps(_mm256_cvtps_ph(kv16_clamp8(_mm256_loadu_ps(x + i)), _MM_FROUND_TO_NEAREST_INT)));
+#endif
+    for (; i < n; i++) x[i] = kv16_to(kv16_from(x[i]));
 }
 static inline void kv16_pack(uint16_t *d, const float *s, int64_t n) {
-    for (int64_t i = 0; i < n; i++) d[i] = kv16_from(s[i]);
+    int64_t i = 0;
+#ifdef KV16_CVT8
+    for (; i + 8 <= n; i += 8)
+        _mm_storeu_si128((__m128i *)(d + i), _mm256_cvtps_ph(kv16_clamp8(_mm256_loadu_ps(s + i)), _MM_FROUND_TO_NEAREST_INT));
+#endif
+    for (; i < n; i++) d[i] = kv16_from(s[i]);
 }
 static inline void kv16_unpack(float *d, const uint16_t *s, int64_t n) {
-    for (int64_t i = 0; i < n; i++) d[i] = kv16_to(s[i]);
+    int64_t i = 0;
+#ifdef KV16_CVT8
+    for (; i + 8 <= n; i += 8) _mm256_storeu_ps(d + i, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(s + i))));
+#endif
+    for (; i < n; i++) d[i] = kv16_to(s[i]);
 }
 
 /* gcc does not vectorize a float16 -> float conversion without AVX512-FP16: the two loops

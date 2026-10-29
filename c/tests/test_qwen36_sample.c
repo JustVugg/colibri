@@ -75,6 +75,21 @@ int main(void) {
     int arg = 0;
     for (int i = 1; i < V; i++) if (lo[i] > lo[arg]) arg = i;
     if (serve_sample(lo, V, 0.f, 0.9f) != arg) { failures++; printf("FAIL temperature 0 is not the argmax\n"); }
+    /* argmax_first against that scan: ties, NaNs (at 0 too), infinities, zeros of both signs, short vectors */
+    unsigned rs = 7;
+    for (int t = 0; t < 600; t++) {
+        int n = t % 50 == 0 ? 1 + t % 37 : V;
+        for (int i = 0; i < n; i++) { rs = rs * 1103515245u + 12345u; lo[i] = (float)((int)(rs >> 8) % 2000 - 1000) / 10.f; }
+        int at = (int)((unsigned)t * 7919u % (unsigned)n);
+        if (t % 6 == 1) lo[at] = NAN;
+        if (t % 6 == 2) lo[0] = NAN;
+        if (t % 6 == 3) lo[at] = INFINITY;
+        if (t % 6 == 4) { lo[at] = 500.f; lo[(at + 17) % n] = 500.f; }
+        if (t % 6 == 5) for (int i = 0; i < n; i++) lo[i] = i % 3 ? -0.0f : (i % 5 ? 0.0f : -1.0f);
+        int want = 0;
+        for (int i = 1; i < n; i++) if (lo[i] > lo[want]) want = i;
+        if (argmax_first(lo, n) != want) { failures++; if (failures <= 5) printf("FAIL argmax_first case %d: %d instead of %d\n", t, argmax_first(lo, n), want); }
+    }
     printf("serve sampler: %d of %d draws as the full sort%s\n", cases - (failures > 0 ? failures : 0), cases,
            failures ? "" : ", argmax at temperature 0");
     printf("%s\n", failures ? "FAILED" : "PASSED");

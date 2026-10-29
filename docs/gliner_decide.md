@@ -24,7 +24,8 @@ make -C c gliner_decide
 ```
 
 `coli` recognises the checkpoint by its `config.json` (`model_type`
-`extractor`, GLiNER2's) and the encoder's `encoder_config/config.json`; the
+`extractor`, GLiNER2's, or `gliner2` as the repository's config says since its
+transformers form, the same weights) and the encoder's `encoder_config/config.json`; the
 registry keys it `gliner2_span_deberta-v2`. `coli info` shows the encoder and
 the token budget, `coli plan` the RAM, `coli doctor` what is missing.
 
@@ -177,6 +178,12 @@ it.
 
 RAM: 1.81 GB resident for the engine serving the release (peak 1.88 GB):
 the f32 encoder and classifier, 436M parameters of the 486M in the file.
+
+**On a CUDA device** (a `CUDA=1` build, `coli serve --gpu` or `COLI_CUDA=1`): the encoder runs
+on the card, the matrices in f32 (docs/cuda.md "The decision engines"). An RTX PRO 4000
+against its host's CPU (an i5-13500, 6 threads), requests of 12 questions over a
+1,700-character email (one sequence of about 1,100 tokens): 0.16-0.21 s a request against
+2.0-2.6 s, the CPU's decisions, every probability within 5.4e-7 of the CPU's.
 
 ## Knobs
 

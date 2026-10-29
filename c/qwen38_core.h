@@ -3833,9 +3833,9 @@ static void q38_trunk_place_all(Model *m) {
  * tier reads that itself); it needs every layer's experts in native FP8 with
  * the block-scale bank resident, because the GPU kernels consume exactly the
  * checkpoint layout (e4m3 bytes + [ceil(O/128), ceil(I/128)] scales). */
-/* The CUDA tier's warm start for a GGUF's experts: the history's most used first
- * (.coli_usage, qt_heat_order), each read as the file has it (the three matrices' rows)
- * in parallel and handed over (the tier copies them), until the budget is full. Before,
+/* The CUDA tier's warm start for a GGUF's experts: the history's most used (.coli_usage,
+ * qt_heat_order) until the budget is full, read by layer and expert as the file has them
+ * (the three matrices' rows) in parallel and handed over (the tier copies them). Before,
  * the tier started empty and filled as the CPU's experts passed, converting each. */
 static void q38_tier_warm(Model *m,int hist) {
     Cfg *c=&m->c; const int L=c->layers,E=c->experts,all=L*E;
@@ -3847,6 +3847,16 @@ static void q38_tier_warm(Model *m,int hist) {
     int *pl=(int*)malloc((size_t)all*sizeof(int)),*pe=(int*)malloc((size_t)all*sizeof(int));
     if(!pl||!pe){free(pl);free(pe);return;}
     int n=qt_plan_fill(pl,pe,all);
+    /* the plan read by layer, then expert: a layer's experts lie in that order in its three
+     * tensors, and in the history's order the reads jump across the file, each one on its own
+     * on a disk whose pages are not cached. The set is the plan's; the tier takes its arena's
+     * slots, which are all alike, in this order. */
+    uint8_t *in=(uint8_t*)calloc((size_t)all,1);
+    if(in){
+        for(int i=0;i<n;i++)in[pl[i]*E+pe[i]]=1;
+        for(int g=0,k=0;g<all;g++)if(in[g]){pl[k]=g/E;pe[k]=g%E;k++;}
+        free(in);
+    }
     double t0=now_s();
     #pragma omp parallel
     {
@@ -3864,7 +3874,7 @@ static void q38_tier_warm(Model *m,int hist) {
     }
     qt_fill_wait();
     fprintf(stderr,"[qtier] qwen38: warm start, %d of the GGUF's experts in VRAM, the history's most used first (%s) -- %.1f s\n",
-            n,hist?".coli_usage":"no history: in order",now_s()-t0);
+            n,hist?".coli_usage":"no history: expert by expert across the layers",now_s()-t0);
     free(pl);free(pe);
 }
 #ifdef COLI_CUDA
@@ -4321,7 +4331,10 @@ static void q38_rows(float *y,int ys,const Q38Weight *w,int I,int r0,int r1,
             return;
         }
 #endif
-        for(int o=r0;o<r1;o++)gq_row_all(y+o,ys,ga,(const uint8_t*)w->data+(int64_t)o*rb,w->gq_type,I);
+        int o=r0;
+        if(gq_f8_ok(w->gq_type,I))   /* the file's rows by eight (ggml_quants.h gq_rows_f8) */
+            for(;o+8<=r1;o+=8)gq_rows_f8(y+o,ys,ga,(const uint8_t*)w->data+(int64_t)o*rb,rb,w->gq_type,I,8);
+        for(;o<r1;o++)gq_row_all(y+o,ys,ga,(const uint8_t*)w->data+(int64_t)o*rb,w->gq_type,I);
         return;
     }
     if(w->kind==Q38_WEIGHT_INT4G64){

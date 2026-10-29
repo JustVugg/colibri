@@ -1,0 +1,87 @@
+{
+  "version": 1,
+  "hypothesis": "Prompt chunks of 2048 rows instead of 512 in qwen38's CUDA chain, which copy the host pool's experts over the bus once a chunk, cost the decode some tok/s on a 16 GB card's allowance, where the chain's reserve takes 0.9 GiB more of it; this case measures how many.",
+  "commit": "77530b49ddd2f4e6ad1b3bb52500491e0c8ed9bb",
+  "model": "unsloth/Qwen3.8-Flash-Next-GGUF UD-Q2_K_XL",
+  "command": "cd c && make -j qwen38 CUDA=1 CUDA_ARCH=native && env COLI_CUDA=1 COLI_VULKAN=0 COLI_TEMP=0 COLI_TIMERS=1 USAGE_SAVE=0 OMP_NUM_THREADS=29 OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close SNAP=<model> COLI_USAGE=<history.usage> N_NEW=256 CUDA_EXPERT_GB=14.7 ./qwen38 128 8 <prompt>",
+  "prompt_hash": "cd8eba88480c681ec210d697557c5a727fd5e297bfe91c30c3e36dc9b55f5b45",
+  "hardware": {
+    "cpu": "AMD EPYC 7763 64-Core Processor (64 cores / 128 threads, 256 MiB L3; the container's quota 30.72 CPUs, OMP_NUM_THREADS=29) + NVIDIA RTX PRO 4000 Blackwell (24467 MiB, sm_120, PCIe 4 x16: 28.3 GB/s (28.2-28.4, the median of 5 measurements) to the card and 558 GB/s (557-560, the median of 5 measurements) on it)",
+    "ram": "503.5 GiB on the host, the container's memory limit 241.7 GiB",
+    "storage": "the instance's disk; every routed expert in the chain's host pool (49.80 GiB of page-locked RAM) in every run",
+    "os": "Ubuntu 24.04.1 LTS (container nvidia/cuda:12.8.1-devel-ubuntu24.04) on Linux 5.15.0-174-generic x86_64, Vast.ai, driver 595.58.03"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "unsloth/Qwen3.8-Flash-Next-GGUF UD-Q2_K_XL",
+      "case": "prose, the history's own prompt, CUDA_EXPERT_GB=14.7",
+      "history": "history.usage.gz",
+      "new_tokens": 256,
+      "prompt_tokens": 150,
+      "engine_build": "origin/dev 77530b49 (512 rows a prompt chunk)",
+      "metric": "decode tok/s"
+    },
+    "samples": {
+      "tok_s": [
+        37.19,
+        37.22,
+        37.11,
+        37.11
+      ],
+      "prompt_tok_s": [
+        76.9,
+        76.1,
+        76.9,
+        76.5
+      ]
+    },
+    "median_tok_s": 37.15,
+    "quality": {
+      "method": "the generated text (256 tokens, greedy: COLI_TEMP=0) is the same in the warm-up and in all 8 runs of both versions (stdout sha256 28c6c02f8cfd9e4ea0035a5be36eb5ba9dc106fa9c019a1985cbeec794e000c0); the logits after the prompt compared in logits.txt; make -C c check and tests/test_qwen38_cuda_chain pass on macOS arm64; make -C c cuda-test CUDA=1 CUDA_ARCH=native passes on this machine",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen38-chain-prompt-rows-2026-10-26/prose-16gb.txt",
+      "sha256": "ac8d8f4187e45218db78ad3671ef7822a6232984eefbeabcb776307df95be354"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "unsloth/Qwen3.8-Flash-Next-GGUF UD-Q2_K_XL",
+      "case": "prose, the history's own prompt, CUDA_EXPERT_GB=14.7",
+      "history": "history.usage.gz",
+      "new_tokens": 256,
+      "prompt_tokens": 150,
+      "engine_build": "77530b49 + this change (2048 rows a prompt chunk)",
+      "metric": "decode tok/s"
+    },
+    "samples": {
+      "tok_s": [
+        36.0,
+        36.04,
+        35.99,
+        35.92
+      ],
+      "prompt_tok_s": [
+        72.1,
+        72.5,
+        72.1,
+        72.5
+      ]
+    },
+    "median_tok_s": 35.995,
+    "quality": {
+      "method": "the generated text (256 tokens, greedy: COLI_TEMP=0) is the same in the warm-up and in all 8 runs of both versions (stdout sha256 28c6c02f8cfd9e4ea0035a5be36eb5ba9dc106fa9c019a1985cbeec794e000c0); the logits after the prompt compared in logits.txt; make -C c check and tests/test_qwen38_cuda_chain pass on macOS arm64; make -C c cuda-test CUDA=1 CUDA_ARCH=native passes on this machine",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen38-chain-prompt-rows-2026-10-26/prose-16gb.txt",
+      "sha256": "ac8d8f4187e45218db78ad3671ef7822a6232984eefbeabcb776307df95be354"
+    }
+  },
+  "outcome": "regression"
+}

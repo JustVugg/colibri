@@ -14,12 +14,23 @@
 //            (Muse Spark's norms on every expert's output and on the feed-forward branch)
 // x and y may be the same buffer and the same places (in place): every element is read
 // for the sum before the barrier and written after it by the thread that reads it.
-// The sum is a float tree; the CPU sums in double. The two differ by rounding only.
+// The sum is a float tree, as it has been: thread t adds elements t, t + 256, ... in turn,
+// then the 256 partials pairwise (red[t] += red[t + off], off 128 down to 1). The CPU sums
+// in double; the two differ by rounding only, and on the rows the serve tests score they
+// agree (tests/test_brio_serve.py compares a device head's logits with the CPU's: a sum in
+// another order flipped the last digit there). A segment of up to 4096 floats is read at
+// once, its values kept for the second pass, x read only and y written only: a float a load,
+// each waited on the one before, took 5.5 us a row of 2048 on an RTX PRO 4000, now 4.5 (four
+// floats a thread, a vec4 a load, took 2.5 but summed in another order).
+#extension GL_EXT_control_flow_attributes : require
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) buffer X { float x[]; };
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 0) readonly buffer X4 { vec4 x4[]; };
 layout(std430, binding = 1) readonly buffer W { float w[]; };
-layout(std430, binding = 2) buffer Y { float y[]; };
+layout(std430, binding = 1) readonly buffer W4 { vec4 w4[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+layout(std430, binding = 2) writeonly buffer Y4 { vec4 y4[]; };
 
 layout(push_constant) uniform P {
     int nseg, D, per_row;
@@ -30,6 +41,7 @@ layout(push_constant) uniform P {
 } p;
 
 shared float red[256];
+shared float sq[4096];   // a vec4 segment's values (times w with flags 8), for the tree's order
 
 void main() {
     int g = int(gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x);
@@ -41,7 +53,34 @@ void main() {
     int tid = int(gl_LocalInvocationID.x);
     float acc = 0.0;
     bool pre = (p.flags & 8) != 0;
-    for (int i = tid; i < p.D; i += 256) { float v = pre ? x[xb + i] * w[wb + i] : x[xb + i]; acc += v * v; }
+    float v[16];
+    vec4 v4[4];
+    // a segment of whole vec4s at vec4 offsets: four consecutive values a thread, a vec4 a load,
+    // into shared memory, then each thread's elements t, t + 256, ... squared and added from
+    // there as before (the same expression in the same order: the same sum)
+    bool quad = p.D <= 4096 && (p.D & 3) == 0 && (xb & 3) == 0 && (yb & 3) == 0 && (wb & 3) == 0;
+    bool held = !quad && p.D <= 4096;
+    int D4 = p.D >> 2;
+    if (quad) {
+        [[unroll]] for (int k = 0; k < 4; k++) {
+            int i = tid + 256 * k;
+            if (i < D4) {
+                vec4 a = x4[(xb >> 2) + i];
+                v4[k] = a;
+                if (pre) a *= w4[(wb >> 2) + i];
+                sq[4 * i] = a.x; sq[4 * i + 1] = a.y; sq[4 * i + 2] = a.z; sq[4 * i + 3] = a.w;
+            }
+        }
+        barrier();
+        [[unroll]] for (int k = 0; k < 16; k++) { int i = tid + 256 * k; if (i < p.D) { float a = sq[i]; acc += a * a; } }
+    } else if (held) {
+        [[unroll]] for (int k = 0; k < 16; k++) { int i = tid + 256 * k; v[k] = i < p.D ? x[xb + i] : 0.0; }
+        [[unroll]] for (int k = 0; k < 16; k++) {
+            int i = tid + 256 * k;
+            if (i < p.D) { float a = pre ? v[k] * w[wb + i] : v[k]; acc += a * a; }
+        }
+    } else
+        for (int i = tid; i < p.D; i += 256) { float a = pre ? x[xb + i] * w[wb + i] : x[xb + i]; acc += a * a; }
     red[tid] = acc;
     barrier();
     for (int off = 128; off > 0; off >>= 1) {
@@ -50,6 +89,25 @@ void main() {
     }
     float r = (p.flags & 4) != 0 ? 1.0 / sqrt(red[0] + p.eps)
                                  : 1.0 / sqrt(red[0] / float(p.D) + p.eps);
+    if (quad) {
+        [[unroll]] for (int k = 0; k < 4; k++) {
+            int i = tid + 256 * k;
+            if (i >= D4) break;
+            vec4 q = (p.flags & 2) != 0 && !pre ? vec4(1.0) : w4[(wb >> 2) + i];
+            vec4 m = pre ? q : ((p.flags & 2) != 0 ? vec4(1.0) : ((p.flags & 1) != 0 ? 1.0 + q : q));
+            y4[(yb >> 2) + i] = v4[k] * m * r * p.post;
+        }
+        return;
+    }
+    if (held) {
+        [[unroll]] for (int k = 0; k < 16; k++) {
+            int i = tid + 256 * k;
+            if (i >= p.D) break;
+            float wv = (p.flags & 2) != 0 ? 1.0 : ((p.flags & 1) != 0 ? 1.0 + w[wb + i] : w[wb + i]);
+            y[yb + i] = v[k] * (pre ? w[wb + i] : wv) * r * p.post;
+        }
+        return;
+    }
     for (int i = tid; i < p.D; i += 256) {
         float wv = (p.flags & 2) != 0 ? 1.0 : ((p.flags & 1) != 0 ? 1.0 + w[wb + i] : w[wb + i]);
         y[yb + i] = x[xb + i] * (pre ? w[wb + i] : wv) * r * p.post;

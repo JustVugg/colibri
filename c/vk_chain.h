@@ -143,6 +143,15 @@ int  vkc_attn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf
 typedef struct { VkcAttn a; int win, ring, vd, kv_pm, sink, sink_off; } VkcAttnW;
 int  vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, VkcBuf *snk,
                 const VkcAttnW *p);
+/* A float16 KV cache: vkc_attn and vkc_attn_w over caches of halves (kc, vc and their offsets
+ * in halves; flash's offsets multiples of eight), every path the bits of a float32 cache of the
+ * same values; vkc_copy_regions_h copies float32 regions of src (offsets in floats) into such
+ * a cache (offsets and lengths in halves, even), each value rounded to the nearest float16.
+ * vkc_kvh_ready: 1 when the device takes them. */
+int  vkc_attn_h(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, const VkcAttn *p);
+int  vkc_attn_wh(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, VkcBuf *snk, const VkcAttnW *p);
+int  vkc_copy_regions_h(VkcBuf *dst, VkcBuf *src, const VkcRegion *r, int n);
+int  vkc_kvh_ready(void);
 /* From this many rows (COLI_VK_ATTN_BLOCK, 16; 0 = never) vkc_attn and vkc_attn_w take
  * chain_attnb.comp: a workgroup per KV head and block of rows, each K and V row read once
  * per block instead of once per (head, row); below it chain_attn as before. */
@@ -424,6 +433,7 @@ typedef struct {
     int i_off, i_row, w_off, w_row;
     int n_group, topk_group, norm;
     float temp, scale, norm_eps;
+    int wg;                                    /* 1: the workgroup's path where one subgroup would take the row (tests) */
 } VkcRoute;
 int vkc_route_ready(void);
 int vkc_route(VkcBuf *logits, VkcBuf *bias, VkcBuf *ids, VkcBuf *w, const VkcRoute *p);
@@ -857,7 +867,10 @@ typedef struct {
     unsigned long long grp_coop;       /* grouped expert GEMMs on the matrix units (qmatmul_grp_qc, qmatmul_grp*_bdc) */
     unsigned long long gemv_xg;        /* decode GEMVs whose row is past the staging: x from its buffer (chain_gemv.comp XG) */
     unsigned long long attn_dec;       /* decode attentions split over their positions' blocks (chain_attn_dec.comp) */
+    unsigned long long attn_dec_gqa;   /* of them, a KV head's query heads a workgroup (its grouped mode) */
     unsigned long long moe_gv;         /* routed-expert decode steps in our formats on chain_moe_gv.comp */
+    unsigned long long tile_wide;      /* of the tile GEMMs, a GGUF's on 128 x 128 tiles (qmatmul_gemm_bdcw.comp) */
+    unsigned long long grp_wide;       /* of the grouped expert GEMMs, those at the wider item (qmatmul_grp*_bdcw.comp) */
 } VkcStats;
 void vkc_stats(VkcStats *st);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */

@@ -223,10 +223,10 @@ static inline int compat_posix_memalign(void **memptr, size_t alignment, size_t 
  * ullAvailPhys ~ MemAvailable di Linux (include standby/free/zero pages —
  * pagine recuperabili senza swap), MA limitata da ullAvailPageFile, il commit
  * ancora concedibile: e' quello che decide se il prossimo malloc riesce, come
- * in compat_meminfo_gb (#1375). Guida il cap automatico della cache expert di
- * kimi_k3 e la telemetria: con la sola RAM fisica una macchina il cui commit
- * e' quasi esaurito (un pagefile piccolo, una VM che ha prenotato la sua RAM)
- * dimensionava una cache che Windows poi rifiutava. */
+ * in compat_meminfo_gb (#1375), che ha la stessa formula. Guida la telemetria
+ * (telemetry.h); i budget passano da compat_meminfo_gb. Con la sola RAM fisica
+ * una macchina il cui commit e' quasi esaurito (un pagefile piccolo, una VM che
+ * ha prenotato la sua RAM) dimensionava una cache che Windows poi rifiutava. */
 static inline void compat_meminfo(double *total_gb, double *avail_gb){
     MEMORYSTATUSEX msx = {0};
     msx.dwLength = sizeof(msx);

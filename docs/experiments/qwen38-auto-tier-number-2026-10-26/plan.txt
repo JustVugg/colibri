@@ -1,0 +1,224 @@
+# --auto-tier and the qwen CUDA tier: the plans on this VM (2026-10-26)
+# a Colab L4 VM: 12 threads (nproc), 6 physical cores (the plan's OMP_NUM_THREADS), Intel(R) Xeon(R) CPU @ 2.20GHz (lscpu) + NVIDIA L4 (23034 MiB, 22564 MiB free, sm_89);
+#   53.0 GiB, no swap; the GGUF (74 GiB) does not fit it; Colab (Python 3.13.16), driver 580.82.07 (CUDA 13.0), nvcc V13.0.88.
+# Model: unsloth/Qwen3.8-Flash-Next-GGUF, UD-Q2_K_XL (its three files, sha256 not computed on the VM), imported with
+#   python3 tools/gguf_import.py <the first file> <model> --no-mtp.
+# Engine: origin/dev 77530b49, built once with: cd c && make qwen38 CUDA=1 CUDA_ARCH=sm_89. The change is in resource_plan.py only,
+#   so both sides run the same binary: A with the number dev's planner writes for this card
+#   (CUDA_EXPERT_GB=21.660, plan.txt), B without it (what this change writes).
+# History: history.usage.gz beside this file (gunzip to <history.usage>, sha256 8dc23b015a8080b48b2e7ef7878f51516ac64f481bd104bba56f96a021341459),
+#   written by a run of the prose prompt on another machine (134880 selections); USAGE_SAVE=0.
+# coli's planner refuses on Colab (the cgroup path /../../jupyter-children), so each plan was built as coli
+# builds it, with the host's MemAvailable passed in: build_plan(<model>, 0, 8192, None, 0,
+#   available_memory=<MemAvailable>), then environment_for_plan(plan, {}, True). Two trees on the VM:
+#   /content/colibri is dev (10_plan_dev), /content/colibri-pr is dev with this change's patch applied
+#   (11_plan_pr; 01_git.log: the patch's sha256 and the tree's git status). The script, run as
+#   cd <tree> && python3 plan.py <model>:
+#   | import json, re, sys
+#   | sys.path.insert(0, 'c')
+#   | import resource_plan as rp
+#   | avail = int(re.search(r'^MemAvailable:\s+(\d+) kB', open('/proc/meminfo').read(), re.M).group(1)) * 1024
+#   | plan = rp.build_plan(sys.argv[1], 0, 8192, None, 0, available_memory=avail)
+#   | print(json.dumps({"family": plan.get("model", {}).get("family_id"), "available_memory": avail,
+#   |                   "vram": plan["tiers"]["vram"], "env": rp.environment_for_plan(plan, {}, True)}, indent=2))
+
+===== 01_git.log (sha256 d9de1ffe1bf54280dc721225b0343e51e6df6feb8500cf5d4428c9fc179278a0)
+# set -e; rm -rf /content/colibri /content/colibri-pr; git clone -q https://github.com/JustVugg/colibri.git /content/colibri; cd /content/colibri; git checkout -q 77530b49ddd2f4e6ad1b3bb52500491e0c8ed9bb; git log -1 --format='%H %ci %s'; git clone -q /content/colibri /content/colibri-pr; cd /content/colibri-pr; git checkout -q 77530b49ddd2f4e6ad1b3bb52500491e0c8ed9bb; git apply /content/fix6.patch; git status --short; sha256sum /content/fix6.patch /content/storia /content/prompt120.txt /content/prompt-lungo.txt
+# rc=0 elapsed=10.4s
+
+77530b49ddd2f4e6ad1b3bb52500491e0c8ed9bb 2026-10-25 20:22:16 +0100 Merge pull request #2386 from JustVugg/batch/external-2026-10-25
+Note: switching to '77530b49ddd2f4e6ad1b3bb52500491e0c8ed9bb'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+ M c/resource_plan.py
+ M c/tests/test_resource_plan.py
+a21ec52612b3b3dcfe459c9ee9a66a4dfd7b9c66fcb3f9a8bd0ffa4a1bb1776e  /content/fix6.patch
+8dc23b015a8080b48b2e7ef7878f51516ac64f481bd104bba56f96a021341459  /content/storia
+cd8eba88480c681ec210d697557c5a727fd5e297bfe91c30c3e36dc9b55f5b45  /content/prompt120.txt
+f3306e5f57ab2527735662aafb31c14e76d3b1a73cc86508b6ff020e43f4e4aa  /content/prompt-lungo.txt
+
+===== 10_plan_dev.log (sha256 838af4029365caba77b3414b7e57299dd55b3174107a496e2887042bd4c1cd0b)
+# cd /content/colibri && python3 /content/plan.py /content/q38
+# rc=0 elapsed=1.6s
+
+{
+  "family": "qwen38",
+  "available_memory": 54913826816,
+  "vram": {
+    "role": "hot-experts",
+    "devices": [
+      {
+        "index": 0,
+        "name": "NVIDIA L4",
+        "total_bytes": 24152899584,
+        "free_bytes": 23660068864,
+        "unified_memory": false,
+        "compute_cap": [
+          8,
+          9
+        ],
+        "reserve_bytes": 2000000000,
+        "usable_bytes": 21660068864
+      }
+    ],
+    "budget_bytes": 21660068864,
+    "hot_expert_bytes": 21659392000,
+    "trunk_bytes": 0,
+    "expert_capacity": 11590,
+    "requires_host_backing": false
+  },
+  "env": {
+    "COLI_POLICY": "quality",
+    "OMP_NUM_THREADS": "6",
+    "RAM_GB": "48.324",
+    "COLI_PLAN_CAP": "429",
+    "COLI_CUDA": "1",
+    "COLI_GPU": "0",
+    "CUDA_EXPERT_GB": "21.660"
+  }
+}
+
+===== 11_plan_pr.log (sha256 28838521b32c09c6bd3b6033f91960d6ea00cb640150b866fe125c1f09273b96)
+# cd /content/colibri-pr && python3 /content/plan.py /content/q38
+# rc=0 elapsed=0.2s
+
+{
+  "family": "qwen38",
+  "available_memory": 54927425536,
+  "vram": {
+    "role": "hot-experts",
+    "devices": [
+      {
+        "index": 0,
+        "name": "NVIDIA L4",
+        "total_bytes": 24152899584,
+        "free_bytes": 23660068864,
+        "unified_memory": false,
+        "compute_cap": [
+          8,
+          9
+        ],
+        "reserve_bytes": 2000000000,
+        "usable_bytes": 21660068864
+      }
+    ],
+    "budget_bytes": 21660068864,
+    "hot_expert_bytes": 21659392000,
+    "trunk_bytes": 0,
+    "expert_capacity": 11590,
+    "requires_host_backing": false
+  },
+  "env": {
+    "COLI_POLICY": "quality",
+    "OMP_NUM_THREADS": "6",
+    "RAM_GB": "48.336",
+    "COLI_PLAN_CAP": "429",
+    "COLI_CUDA": "1",
+    "COLI_GPU": "0"
+  }
+}
+
+# The same two trees on the qwen36 checkpoint Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64 (42_plan36_dev, 43_plan36_pr):
+
+===== 42_plan36_dev.log (sha256 b6261fff4af61319db5a727de69301d0ead90a69528704229771fffecec05f89)
+# cd /content/colibri && python3 /content/plan.py /content/q36
+# rc=0 elapsed=0.3s
+
+{
+  "family": "qwen36",
+  "available_memory": 54816772096,
+  "vram": {
+    "role": "hot-experts",
+    "devices": [
+      {
+        "index": 0,
+        "name": "NVIDIA L4",
+        "total_bytes": 24152899584,
+        "free_bytes": 23660068864,
+        "unified_memory": false,
+        "compute_cap": [
+          8,
+          9
+        ],
+        "reserve_bytes": 2000000000,
+        "usable_bytes": 21660068864
+      }
+    ],
+    "budget_bytes": 18119393280,
+    "hot_expert_bytes": 18119393280,
+    "trunk_bytes": 0,
+    "expert_capacity": 10240,
+    "requires_host_backing": false
+  },
+  "env": {
+    "COLI_POLICY": "quality",
+    "OMP_NUM_THREADS": "6",
+    "RAM_GB": "48.239",
+    "COLI_PLAN_CAP": "256",
+    "COLI_CUDA": "1",
+    "COLI_GPU": "0",
+    "CUDA_EXPERT_GB": "18.119"
+  }
+}
+
+===== 43_plan36_pr.log (sha256 0a4e3cd617d18089ecf11ab35b47179353e7d8d807819d306c897524cf578500)
+# cd /content/colibri-pr && python3 /content/plan.py /content/q36
+# rc=0 elapsed=0.1s
+
+{
+  "family": "qwen36",
+  "available_memory": 54821154816,
+  "vram": {
+    "role": "hot-experts",
+    "devices": [
+      {
+        "index": 0,
+        "name": "NVIDIA L4",
+        "total_bytes": 24152899584,
+        "free_bytes": 23660068864,
+        "unified_memory": false,
+        "compute_cap": [
+          8,
+          9
+        ],
+        "reserve_bytes": 2000000000,
+        "usable_bytes": 21660068864
+      }
+    ],
+    "budget_bytes": 18119393280,
+    "hot_expert_bytes": 18119393280,
+    "trunk_bytes": 0,
+    "expert_capacity": 10240,
+    "requires_host_backing": false
+  },
+  "env": {
+    "COLI_POLICY": "quality",
+    "OMP_NUM_THREADS": "6",
+    "RAM_GB": "48.243",
+    "COLI_PLAN_CAP": "256",
+    "COLI_CUDA": "1",
+    "COLI_GPU": "0"
+  }
+}
+
+===== summary
+qwen38: dev writes CUDA_EXPERT_GB=21.660 (budget 21660068864 bytes); this change writes no CUDA_EXPERT_GB (the same budget and the rest of the environment the same, RAM_GB apart: each plan read MemAvailable on its own, 54913826816 and 54927425536 bytes).
+  dev: COLI_POLICY=quality, OMP_NUM_THREADS=6, RAM_GB=48.324, COLI_PLAN_CAP=429, COLI_CUDA=1, COLI_GPU=0, CUDA_EXPERT_GB=21.660
+  this change: COLI_POLICY=quality, OMP_NUM_THREADS=6, RAM_GB=48.336, COLI_PLAN_CAP=429, COLI_CUDA=1, COLI_GPU=0
+qwen36: dev writes CUDA_EXPERT_GB=18.119 (budget 18119393280 bytes, the size of all the experts: hot_expert_bytes is the same, expert_capacity 10240, trunk_bytes 0); this change writes no CUDA_EXPERT_GB (the same budget and the rest of the environment the same, RAM_GB apart: 54816772096 and 54821154816 bytes of MemAvailable).
+  dev: COLI_POLICY=quality, OMP_NUM_THREADS=6, RAM_GB=48.239, COLI_PLAN_CAP=256, COLI_CUDA=1, COLI_GPU=0, CUDA_EXPERT_GB=18.119
+  this change: COLI_POLICY=quality, OMP_NUM_THREADS=6, RAM_GB=48.243, COLI_PLAN_CAP=256, COLI_CUDA=1, COLI_GPU=0

@@ -85,6 +85,7 @@ typedef struct {
     VkcDmoe dm;                                /* the routed experts in the frame (vk_dmoe.h) */
     VkcBuf *kvl;                               /* their layers' K/V rows, down at the frame's end */
     int kvl_rows;                              /* kvl's rows a layer: a decode step's, or a prompt chunk's */
+    int kvh, kvh_set;                          /* the mirrors in float16 (olc_kvh_want), decided at the first */
 } OlmChain;
 
 
@@ -388,19 +389,56 @@ static int olc_bufs(OlmChain *ch, Model *m, int rows) {
              olc_res(&ch->h2d, r * D, VKC_DOWN) && olc_res(&ch->lgd, r * E, VKC_DOWN) && olc_res(&ch->kvd, 2 * r * D, VKC_DOWN) &&
              olc_res(&ch->outd, c->vocab, VKC_DOWN) && olc_res(&ch->routed, r * D, VKC_UP) && olc_res(&ch->cs, r * hd, VKC_UP);
 }
+/* The mirrors in float16 where the host's cache holds float16's values (olm_kv16) and the
+ * device reads such a cache (vkc_kvh_ready): half a decode step's reads, every attention path
+ * giving a float32 mirror's bits. While the mirror does not split (the split's attention
+ * reads float32: olc_mirror goes back to it). RTX PRO 4000, one layer's attention after 1280
+ * positions: 61.5 -> 35.4 us. COLI_VK_KV16=0 keeps float32. */
+static int olc_kvh_want(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_KV16"); on = !(e && *e == '0'); }
+    return on && olm_kv16() && vkc_kvh_ready();
+}
+/* n of the host's K or V values from src into a mirror at element at: a float16 mirror takes
+ * them as halves (float16's values: exact; at and n even) */
+static int olc_kv_up(const OlmChain *ch, VkcBuf *dst, size_t at, const float *src, size_t n) {
+    if (!ch->kvh) return vkc_write(dst, at, src, n * sizeof(float));
+    uint16_t *h = malloc(n * sizeof(uint16_t));
+    if (!h) return 0;
+    kv16_pack(h, src, (int64_t)n);
+    int ok = vkc_write(dst, at / 2, h, n * sizeof(uint16_t));   /* copied into the frame's staging here */
+    free(h);
+    return ok;
+}
+/* a K or V row down from the device into the host's cache: a float16 mirror's step rounded
+ * its rows on the way into the mirror only, so the host's copy rounds them alike */
+static inline void olc_kv_row(const OlmChain *ch, float *dst, const float *src, int hd) {
+    memcpy(dst, src, hd * sizeof(float));
+    if (ch->kvh) kv16_round(dst, hd);
+}
 /* Plan and allocate the KV mirror before sizing a prompt chunk. */
 static int olc_mirror(OlmChain *ch, Model *m) {
     Cfg *c = &m->c; int H = c->n_heads, hd = c->head_dim;
     if (ch->cap != m->max_t || ch->hostK != m->K) {   /* the host cache is new: mirror it again (whole, or split) */
-        size_t row = (size_t)H * hd * 2 * sizeof(float);
-        int plan = vkc_kv_plan(&ch->ks, olc_name(ch), ch->n, row, m->max_t, 1, 0, (size_t)ch->n * ch->dev_rows * row);
+        if (!ch->kvh_set) {
+            ch->kvh = !ch->d && olc_kvh_want(); ch->kvh_set = 1;
+            if (ch->kvh) fprintf(stderr, "[VK] %s chain: KV mirror in float16 (the host's values; COLI_VK_KV16=0 keeps float32)\n", olc_name(ch));
+        }
+        size_t es = ch->kvh ? sizeof(uint16_t) : sizeof(float), row = (size_t)H * hd * 2 * es, held = 0;
+        for (int i = ch->lo; i < ch->lo + ch->n; i++) if (ch->kc[i]) held += vkc_bytes(ch->kc[i]) + vkc_bytes(ch->vc[i]);
+        int plan = vkc_kv_plan(&ch->ks, olc_name(ch), ch->n, row, m->max_t, 1, 0, held);
+        if (plan && ch->ks.on && ch->kvh) {   /* the split reads float32: the mirrors go back to it, planned again */
+            fprintf(stderr, "[VK] %s chain: the KV mirror splits past the device's budget: float32 from here on\n", olc_name(ch));
+            vkc_kv_free(&ch->ks); ch->kvh = 0; es = sizeof(float); row *= 2;
+            plan = vkc_kv_plan(&ch->ks, olc_name(ch), ch->n, row, m->max_t, 1, 0, held);
+        }
         if (!plan) { ch->cap = 0; ch->hostK = NULL; return 0; }
         ch->dev_rows = ch->ks.on ? ch->ks.rows : m->max_t;
         for (int i = ch->lo; i < ch->lo + ch->n; i++) {
             vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); ch->kc[i] = ch->vc[i] = NULL;
             ch->kv_valid[i] = 0;
-            ch->kc[i] = vkc_buf((size_t)H * ch->dev_rows * hd * sizeof(float), VKC_DEV);
-            ch->vc[i] = vkc_buf((size_t)H * ch->dev_rows * hd * sizeof(float), VKC_DEV);
+            ch->kc[i] = vkc_buf((size_t)H * ch->dev_rows * hd * es, VKC_DEV);
+            ch->vc[i] = vkc_buf((size_t)H * ch->dev_rows * hd * es, VKC_DEV);
             if (!ch->kc[i] || !ch->vc[i]) { ch->cap = 0; ch->hostK = NULL; return 0; }
         }
         ch->cap = m->max_t; ch->hostK = m->K;
@@ -451,8 +489,8 @@ static int olc_push_kv(OlmChain *ch, Model *m, int pos_base, int n_rows) {
         int t0 = ch->kv_valid[i], n = pos_base - t0;
         for (int h = 0; h < c->n_heads && ok; h++) {
             size_t off = ((size_t)h * m->max_t + t0) * hd;
-            ok = vkc_write(ch->kc[i], off, m->K[i] + off, (size_t)n * hd * sizeof(float)) &&
-                 vkc_write(ch->vc[i], off, m->V[i] + off, (size_t)n * hd * sizeof(float));
+            ok = olc_kv_up(ch, ch->kc[i], off, m->K[i] + off, (size_t)n * hd) &&
+                 olc_kv_up(ch, ch->vc[i], off, m->V[i] + off, (size_t)n * hd);
         }
         ch->kv_valid[i] = pos_base;
     }
@@ -473,6 +511,10 @@ static int olc_attention(OlmChain *ch, Model *m, Layer *l, int i, int n, int pb,
     VkcRope rp = {n * H, H, 0, D, hd, half, 0, 2 * half};
     ok = ok && vkc_norm(ch->q, ch->prm, ch->q, &qn) && vkc_norm(ch->k, ch->prm, ch->k, &kn) &&
          vkc_rope(ch->q, ch->cs, &rp) && vkc_rope(ch->k, ch->cs, &rp);
+    if (ok && olm_kv16() && !ch->kvh) {   /* a float32 mirror: K and V as the host's cache keeps them, before anything reads them */
+        VkcEw r = {VKC_EW_F16, n * D, D, 0, 0, 0, 0, 0, 0, 0, 0, 1.f};
+        ok = vkc_ew(ch->k, ch->k, NULL, NULL, NULL, &r) && vkc_ew(ch->v, ch->v, NULL, NULL, NULL, &r);
+    }
     if (!ok) return 0;
     if (ch->ks.on) {   /* the split: the rows into their window slots, the attention in two parts */
         VkcKvPart pk = {H, hd, m->K[i], (size_t)m->max_t * hd, ch->kc[i], 0, 0}, pv = {H, hd, m->V[i], (size_t)m->max_t * hd, ch->vc[i], 0, 0};
@@ -484,16 +526,18 @@ static int olc_attention(OlmChain *ch, Model *m, Layer *l, int i, int n, int pb,
                vkc_copy(kv, ko, ch->k, 0, (size_t)n * D) && vkc_copy(kv, ko + kvs, ch->v, 0, (size_t)n * D) &&
                vkc_kv_gqa(&a) && vkc_matmul((ColiVkTensor *)l->vk_o, ch->ctx, 0, ch->tmp, 0, n);
     }
-    /* the new rows into the device cache, and down for the host's */
+    /* the new rows into the device cache (a float16 mirror's rounded on the way), and down for the host's */
     VkcRegion *rg = malloc(sizeof *rg * (size_t)n * H);
     if (!rg) return 0;
     for (int s = 0; s < n; s++) for (int h = 0; h < H; h++)
         rg[s * H + h] = (VkcRegion){((size_t)h * ch->dev_rows + pb + s) * hd, (size_t)s * D + (size_t)h * hd, (size_t)hd};
-    ok = vkc_copy_regions(ch->kc[i], ch->k, rg, n * H) && vkc_copy_regions(ch->vc[i], ch->v, rg, n * H) &&
+    ok = (ch->kvh ? vkc_copy_regions_h(ch->kc[i], ch->k, rg, n * H) && vkc_copy_regions_h(ch->vc[i], ch->v, rg, n * H)
+                  : vkc_copy_regions(ch->kc[i], ch->k, rg, n * H) && vkc_copy_regions(ch->vc[i], ch->v, rg, n * H)) &&
          vkc_copy(kv, ko, ch->k, 0, (size_t)n * D) && vkc_copy(kv, ko + kvs, ch->v, 0, (size_t)n * D);
     free(rg);
     VkcAttn a = {n, H, H, hd, pb, ch->dev_rows, 0, D, hd, 0, 0, 0, 0, 0, D, 0, 0, 1.f / sqrtf((float)hd), 0, 0};
-    return ok && vkc_attn(ch->q, ch->kc[i], ch->vc[i], ch->ctx, NULL, NULL, &a) &&
+    return ok && (ch->kvh ? vkc_attn_h(ch->q, ch->kc[i], ch->vc[i], ch->ctx, NULL, NULL, &a)
+                          : vkc_attn(ch->q, ch->kc[i], ch->vc[i], ch->ctx, NULL, NULL, &a)) &&
            vkc_matmul((ColiVkTensor *)l->vk_o, ch->ctx, 0, ch->tmp, 0, n);
 }
 static int olc_norm(VkcBuf *x, size_t xo, VkcBuf *w, size_t wo, VkcBuf *y, size_t yo, int rows, int D, float eps) {
@@ -522,14 +566,22 @@ static int olc_dmoe(OlmChain *ch, Model *m, int rows) {
  * that ran their experts in it into the host's cache, and their books. */
 static void olc_dmoe_done(OlmChain *ch, Model *m, int from, int to, int n, int pb) {
     Cfg *c = &m->c; int D = c->hidden, H = c->n_heads, hd = c->head_dim, K = c->topk, r = ch->kvl_rows;
+    /* the K/V rows into the host's cache, every layer's and head's at once: a 3.5K-token
+     * prompt's 900 MB went in one thread after the frame while the device waited (the first
+     * 3K-token prompt on an RTX PRO 4000: 0.75 -> 0.63 s) */
+    #pragma omp parallel for collapse(2) schedule(static) if ((size_t)n * (to - from) >= 64)
+    for (int i = from; i < to; i++)
+        for (int h = 0; h < H; h++) {
+            if (!vkc_dmoe_on(&ch->dm, i)) continue;
+            const float *kv = (const float *)vkc_ptr(ch->kvl) + (size_t)(i - ch->lo) * 2 * r * D;
+            for (int s = 0; s < n; s++) {
+                size_t dst = ((size_t)h * m->max_t + pb + s) * hd, src = (size_t)s * D + (size_t)h * hd;
+                olc_kv_row(ch, m->K[i] + dst, kv + src, hd);
+                olc_kv_row(ch, m->V[i] + dst, kv + (size_t)r * D + src, hd);
+            }
+        }
     for (int i = from; i < to; i++) {
         if (!vkc_dmoe_on(&ch->dm, i)) continue;
-        const float *kv = (const float *)vkc_ptr(ch->kvl) + (size_t)(i - ch->lo) * 2 * r * D;
-        for (int s = 0; s < n; s++) for (int h = 0; h < H; h++) {
-            size_t dst = ((size_t)h * m->max_t + pb + s) * hd, src = (size_t)s * D + (size_t)h * hd;
-            memcpy(m->K[i] + dst, kv + src, hd * sizeof(float));
-            memcpy(m->V[i] + dst, kv + (size_t)r * D + src, hd * sizeof(float));
-        }
         const int *ids = vkc_dmoe_ids(&ch->dm, i);
         if (!m->hot_pinned) for (int s = 0; s < n; s++) rt_count(i, ids + s * K, K);
         pthread_mutex_lock(&g_pilot_mx);
@@ -624,11 +676,13 @@ static int olc_forward_seg(Model *m, OlmChain *ch, float *xh, int S, int pos_bas
             if (dmoe) olc_dmoe_done(ch, m, from, i, n, pb);
             from = i + 1; prev_dev = 0;
             const float *kv = (const float *)vkc_ptr(ch->kvd);   /* the rows into the host's cache */
-            for (int s = 0; s < n; s++) for (int h = 0; h < H; h++) {
-                size_t dst = ((size_t)h * m->max_t + pb + s) * hd, src = (size_t)s * D + (size_t)h * hd;
-                memcpy(m->K[i] + dst, kv + src, hd * sizeof(float));
-                memcpy(m->V[i] + dst, kv + (size_t)ch->rows * D + src, hd * sizeof(float));
-            }
+            #pragma omp parallel for schedule(static) if (n >= 64)
+            for (int h = 0; h < H; h++)
+                for (int s = 0; s < n; s++) {
+                    size_t dst = ((size_t)h * m->max_t + pb + s) * hd, src = (size_t)s * D + (size_t)h * hd;
+                    olc_kv_row(ch, m->K[i] + dst, kv + src, hd);
+                    olc_kv_row(ch, m->V[i] + dst, kv + (size_t)ch->rows * D + src, hd);
+                }
             const float *xa = pilot ? (const float *)vkc_ptr(ch->xpd) : NULL;
             if (pilot && i + 1 < c->n_layers) pilot_prefetch(m, i + 1, xa, n);   /* the model's next layers, wherever they run */
             double t1 = now_s();

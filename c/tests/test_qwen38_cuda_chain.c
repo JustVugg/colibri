@@ -47,6 +47,17 @@ int main(void) {
     fake_dense_compute = 1;
     char *argv[] = { (char *)"qwen38", (char *)"1", (char *)"8", (char *)"./qwen38_tiny_fp8/ref.json" };
 
+    printf(" a prompt chunk's rows\n");
+    unsetenv("COLI_CUDA_CHAIN_ROWS");
+    tk(q38cc_rows_env() == 2048, "2048 rows a chunk unset: a 1628-token prompt's pooled experts over the bus once");
+    setenv("COLI_CUDA_CHAIN_ROWS", "512", 1);
+    tk(q38cc_rows_env() == 512, "COLI_CUDA_CHAIN_ROWS=512 the rows before");
+    setenv("COLI_CUDA_CHAIN_ROWS", "0", 1);
+    int lo = q38cc_rows_env();
+    setenv("COLI_CUDA_CHAIN_ROWS", "99999", 1);
+    tk(lo == 1 && q38cc_rows_env() == 8192, "within 1..8192");
+    unsetenv("COLI_CUDA_CHAIN_ROWS");
+
     printf(" the chain on the fake card\n");
     setenv("COLI_CUDA_CHAIN", "1", 1);
     fake_chain_frames = 0; fake_chain_fail_at = 0;

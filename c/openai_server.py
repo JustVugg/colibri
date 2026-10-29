@@ -8067,6 +8067,7 @@ class APIHandler(BaseHTTPRequestHandler):
     # theirs are, with this server's error envelope. docs/systemone.md has the
     # mapping table.
     _SYSTEMONE_MAX_QUESTIONS = 64
+    _SYSTEMONE_MAX_ID = 256
 
     @staticmethod
     def _systemone_text(value, where):
@@ -8094,6 +8095,35 @@ class APIHandler(BaseHTTPRequestHandler):
         caller sent (text, object or array), or `level <n>` for one sent as null."""
         return value if isinstance(value, (str, dict, list)) else f"level {index}"
 
+    @staticmethod
+    def _systemone_loc(param):
+        """Jev's `loc` for an error's param: "questions.q.criteria[1]" is ["body",
+        "questions", "q", "criteria", 1]. A dot separates two names unless the next bracket
+        after it closes one (a dot inside [...]), and each name's trailing [n] groups are
+        its indices, a name without them kept whole. One pass each way over the text."""
+        s = param or ""
+        closes = [False] * (len(s) + 1)   # the first bracket at or after i is "]"
+        for i in range(len(s) - 1, -1, -1):
+            closes[i] = s[i] == "]" or (s[i] != "[" and closes[i + 1])
+        parts, start = [], 0
+        for i, ch in enumerate(s):
+            if ch == "." and not closes[i + 1]:
+                parts.append(s[start:i]); start = i + 1
+        parts.append(s[start:])
+        loc = ["body"]
+        for part in parts:
+            end, idx = len(part), []
+            while end and part[end - 1] == "]":
+                at = part.rfind("[", 0, end - 1)
+                digits = part[at + 1:end - 1] if at >= 0 else ""
+                if not digits.isdecimal() or len(digits) > 18:
+                    break
+                idx.append(int(digits)); end = at
+            if end:
+                loc.append(part[:end])
+            loc.extend(reversed(idx))
+        return loc
+
     def systemone(self, body, request_id):
         if body.get("state") is None:
             raise APIError(422, "`state` is required: the content the questions are about.", "state")
@@ -8108,9 +8138,11 @@ class APIHandler(BaseHTTPRequestHandler):
                            "questions")
         plan = []                                   # (id, kind, text, options, levels)
         for qid, question in raw.items():
-            where = f"questions.{qid}"
             if not isinstance(qid, str) or not qid.strip():
                 raise APIError(422, "Every question id must be a non-empty string.", "questions")
+            if len(qid) > self._SYSTEMONE_MAX_ID:
+                raise APIError(422, f"A question id has at most {self._SYSTEMONE_MAX_ID} characters.", "questions")
+            where = f"questions.{qid}"
             if not isinstance(question, dict):
                 raise APIError(422, f"`{where}` must be an object.", where)
             kind = question.get("type")
@@ -8508,13 +8540,7 @@ class APIHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/v1/systemone" and error.status == 422:
             body = error_object(error)
-            loc = ["body"]
-            for part in re.split(r"\.(?![^\[]*\])", error.param or ""):
-                match = re.fullmatch(r"(.*?)((?:\[\d+\])*)", part)
-                if match.group(1):
-                    loc.append(match.group(1))
-                loc.extend(int(i) for i in re.findall(r"\[(\d+)\]", match.group(2)))
-            body["detail"] = [{"loc": loc, "msg": error.message, "type": "value_error"}]
+            body["detail"] = [{"loc": self._systemone_loc(error.param), "msg": error.message, "type": "value_error"}]
             return body
         if path != "/v1/messages":
             return error_object(error)

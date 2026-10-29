@@ -81,6 +81,7 @@ static int qwen38_max_ctx(void) {
 #include "route_trace.h"             /* shared ROUTE_TRACE + .coli_usage contract */
 #include "serve_codec.h"             /* shared SUBMIT/STOP/CANCEL framing */
 #include "pin_pool.h"                /* piu scatti annidati dello stato */
+#include "argmax_first.h"            /* serve_sample's greedy pick */
 /* ---------- tokenizer (optional, for human-readable output) ---------- */
 static char **g_tok = NULL;   /* id -> piece string (strdup'd) */
 static int    g_tok_n = 0;
@@ -1442,7 +1443,7 @@ static int sample_prob_desc(const void *a, const void *b){
     return (x->id>y->id)-(x->id<y->id);
 }
 static int serve_sample(const float *lo, int V, float temp, float top_p){
-    if(temp<=0.f){ int b=0; for(int i=1;i<V;i++) if(lo[i]>lo[b]) b=i; return b; }
+    if(temp<=0.f) return argmax_first(lo, V);
     float *p=malloc((size_t)V*sizeof(float)); SampleProb *head=malloc((size_t)V*sizeof(SampleProb)); float mx=lo[0];
     if(!p||!head){ fprintf(stderr,"OOM sampling\n"); exit(1); }
     for(int i=1;i<V;i++) if(lo[i]>mx) mx=lo[i];

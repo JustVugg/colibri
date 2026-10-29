@@ -1456,12 +1456,11 @@ FAMILIES = (
         planner_id="olmoe_gqa",
         planner_geometry=_olmoe_geometry,
         planner_unsupported_reason="",
-        # No VRAM tier to plan: olmoe.c has no CUDA/Metal backend ("CPU-only (no
-        # CUDA/Metal backend), so the GPU fields are always empty") and its build
-        # rule links NOCUDA_LDFLAGS. Since #1830 a VK=1 build can put its resident
-        # matrices on a Vulkan device (COLI_VULKAN=1), opt-in and outside the
-        # planner. Left at the default this advertised a VRAM tier.
-        supports_accelerator=False,
+        # A CUDA build runs every layer and every routed expert as one chain on
+        # the card with COLI_CUDA=1 (olmoe_cuda_chain.h: the whole model in VRAM,
+        # or the CPU when it does not fit). Since #1830 a VK=1 build can put it on
+        # a Vulkan device too (COLI_VULKAN=1), opt-in and outside the planner.
+        supports_accelerator=True,
         expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
         # coli convert routes to convert_olmoe_merged.py (d4d11ef dispatch);
         # the converter takes no precision flags (--ebits / --group-size etc.).
@@ -1791,7 +1790,8 @@ FAMILIES = (
         # one-shot `coli run` has nothing to run: a decision needs questions,
         # which come over POST /v1/systemone from `coli serve` / `coli web`
         has_cli_adapter=False,
-        supports_accelerator=False,
+        # COLI_CUDA=1 (--gpu): the forward on a CUDA device (decide_cuda.h); no tier to size
+        supports_accelerator=True,
         modality="decision",
         tokenizer_file="tokenizer/tokenizer.json",
         checkpoint_files=("tokenizer/tokenizer_config.json", "encoder/config.json"),
@@ -1836,7 +1836,8 @@ FAMILIES = (
         capabilities=FamilyCapabilities(False, False, False, False, decision=True),
         has_gateway_adapter=True,
         has_cli_adapter=False,
-        supports_accelerator=False,
+        # COLI_CUDA=1 (--gpu): the forward on a CUDA device (decide_cuda.h); no tier to size
+        supports_accelerator=True,
         modality="decision",
         tokenizer_file="tokenizer.json",
         checkpoint_files=("config.json", "encoder_config/config.json"),
@@ -2000,8 +2001,9 @@ def _resolve_decision_checkpoint(model):
 
 
 # GLiNER2's config.json says model_type "extractor" whatever the architecture
-# and the encoder; the encoder's own config sits in encoder_config/.
-GLINER2_MODEL_TYPE = "extractor"
+# and the encoder ("gliner2" in fastino's repository since its transformers form,
+# the same weights); the encoder's own config sits in encoder_config/.
+GLINER2_MODEL_TYPES = ("extractor", "gliner2")
 GLINER2_ENCODER_CONFIG = "encoder_config/config.json"
 
 
@@ -2063,7 +2065,7 @@ def resolve_model(model_dir):
             "  carries model_index.json instead.") from error
     except json.JSONDecodeError as error:
         raise FamilyConfigError(f"invalid config.json: {error}") from error
-    if isinstance(config, dict) and config.get("model_type") == GLINER2_MODEL_TYPE:
+    if isinstance(config, dict) and config.get("model_type") in GLINER2_MODEL_TYPES:
         return _resolve_gliner2_checkpoint(model, config)
     family = family_for_config(config)
     family_config = config

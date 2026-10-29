@@ -210,9 +210,12 @@ typedef struct {
      * This is an in-memory execution layout only; checkpoint bytes and scales
      * remain unchanged. */
     int packed_rows8;
-    /* A GGUF index holds the tensor as another dtype the loader converts back, losslessly
-     * (coli_v4_layer_plan_index): 1 = F32 values of a BF16 tensor, 2 = I32 of an I64. */
+    /* A GGUF index holds the tensor as another dtype the loader converts back
+     * (coli_v4_layer_plan_index): 1 = F32 values of a BF16 tensor, 2 = I32 of an I64,
+     * 3 = BF16 values written as F16, 4 = F16 of an F32 tensor, 5 = ggml blocks of an F32
+     * tensor (stored: their dtype), dequantized to F32. */
     unsigned char convert;
+    int stored;
 } ColiDeepSeekV4TensorSpec;
 
 /* The view of a resident GGUF matrix (a ggml-typed spec, st_gguf.h): its blocks as the file

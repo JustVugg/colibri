@@ -1,0 +1,112 @@
+#version 450
+// qmatmul_gemm_bdc.comp at twice the tile (vk_chain.c, matmul_bd: a GGUF's dense matrices for a
+// prompt's rows, the types with no grid in shared memory): 128 outputs (rows of W) for 128 rows
+// of x a workgroup through I in steps of 64. Every thread decodes one of the 128 rows' two
+// 32-weight steps (bdstep.glsl) to f16 and rounds 32 of the x rows' values; each W step serves
+// 128 rows of x and each x step 128 outputs, twice the 64 tile's. The 64 accumulator tiles go
+// to the subgroups in turn. The tables keep four words for the types that read none of them
+// (bdstep.glsl's IQ grids and ksigns): a shared array of a size that is not whole 16 bytes
+// misaligned the matrix loads after it. Needs I a multiple of 64.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const int T = 12;
+layout(constant_id = 1) const uint SGS = 32u;   // the subgroup size the pipeline requires (64 or 32)
+
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer W1 { uint w1[]; };
+layout(std430, binding = 1) readonly buffer W4 { uvec4 w4[]; };
+layout(std430, binding = 2) readonly buffer G { uint gt[]; };   // blockdec_table.h's table
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    int fmt, S, I, O, rowWords, gs;
+} p;
+
+#define TM 128u
+#define TK 64u
+#define NT (TM / 16u)   // 16 x 16 tiles a side
+const uint NC = NT * NT * SGS / 256u;   // accumulator tiles a subgroup: 8 at subgroups of 32, 16 at 64
+// tile (a, kt) of 16 x 16 halves, element (row, k) at row * 16 + k:
+//   W: output tile a, at (a * 4 + kt) * 64 uvec2s (4 halves each)
+//   x: row tile a, at (a * 4 + kt) * 32 uvec4s (8 halves each)
+shared uvec2 sw2[NT * 4u * 64u];
+shared uvec4 sx[NT * 4u * 32u];
+shared float spatch[8u * 256u];    // a subgroup's partial tile (up to 8 subgroups)
+shared float bs_kvt[16];
+shared uint bs_grid[4];
+shared uint bs_ks[4];
+
+uint pk(float a, float b) { return packFloat2x16(f16vec2(float16_t(a), float16_t(b))); }
+// an activation operand: held to +-65504 (a value past it would round to inf and the tile's
+// sums with it; the CUDA f16 GEMMs hold x the same way), a NaN kept a NaN. The weights, a
+// format's codes times its scales, stay well inside f16 and skip it (the hold on them cost
+// Qwen3.6's prompt 4%)
+float h16(float a) { return isnan(a) ? a : clamp(a, -65504.0, 65504.0); }
+uint pkx(float a, float b) { return pk(h16(a), h16(b)); }
+uint g_row, g_k0;   // the row a decoding thread writes, and the step's first vec4 of the row
+void bs_put(vec4 w, uint i) {
+    uint k = (i - g_k0) * 4u;
+    sw2[(((g_row >> 4u) * 4u + (k >> 4u)) * 16u + (g_row & 15u)) * 4u + ((k & 15u) >> 2u)] = uvec2(pk(w.x, w.y), pk(w.z, w.w));
+}
+#define BS_W1(i) w1[i]
+#define BS_W4(i) w4[i]
+#define BS_ACC(w, i) bs_put((w), (i))
+#define BS_G(i) gt[i]
+#include "bdstep.glsl"
+
+void main() {
+    uint tid = gl_LocalInvocationID.x, nsg = gl_NumSubgroups, sgi = gl_SubgroupID;
+    uint o0 = gl_WorkGroupID.x * TM, s0 = gl_WorkGroupID.y * TM;
+    uint S = uint(p.S), K = uint(p.I), O = uint(p.O);
+    bs_tables_fill(T, int(tid));
+    // accumulator tile c = sgi + j * nsg: x rows tile c % NT, outputs tile c / NT
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[NC];
+    [[unroll]] for (uint j = 0u; j < NC; j++) acc[j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
+    for (uint k0 = 0u; k0 < K; k0 += TK) {
+        barrier();   // the last step is read (and, the first time, the tables are in)
+        {   // row tid / 2, step k0 / 32 + tid % 2
+            uint r = tid >> 1, o = min(o0 + r, O - 1u);
+            g_row = r; g_k0 = k0 / 4u;
+            bs_step(T, o * uint(p.rowWords) * 4u, k0 / 32u + (tid & 1u));
+        }
+        // x rows: 128 x 64 values, 8 a uvec4, four a thread
+        [[unroll]] for (uint e = tid; e < TM * TK / 8u; e += 256u) {
+            uint r = e / (TK / 8u), k = (e - r * (TK / 8u)) * 8u, s = min(s0 + r, S - 1u);
+            uint b = s * K + k0 + k;
+            sx[((r >> 4u) * 4u + (k >> 4u)) * 32u + (r & 15u) * 2u + ((k & 15u) >> 3u)] =
+                uvec4(pkx(x[b], x[b + 1u]), pkx(x[b + 2u], x[b + 3u]), pkx(x[b + 4u], x[b + 5u]), pkx(x[b + 6u], x[b + 7u]));
+        }
+        barrier();
+        [[unroll]] for (uint j = 0u; j < NC; j++) {
+            uint c = sgi + j * nsg, t = c % NT, q = c / NT;
+            [[unroll]] for (uint kt = 0u; kt < 4u; kt++) {
+                coopMatLoad(A, sx, (t * 4u + kt) * 32u, 2u, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(B, sw2, (q * 4u + kt) * 64u, 4u, gl_CooperativeMatrixLayoutColumnMajor);
+                acc[j] = coopMatMulAdd(A, B, acc[j]);
+            }
+        }
+    }
+    uint lane = gl_SubgroupInvocationID, sgsz = gl_SubgroupSize;
+    [[unroll]] for (uint j = 0u; j < NC; j++) {
+        uint c = sgi + j * nsg, r0 = s0 + (c % NT) * 16u, n0 = o0 + (c / NT) * 16u;
+        if (r0 >= S || n0 >= O) continue;   // subgroup-uniform
+        if (r0 + 16u <= S && n0 + 16u <= O) {
+            coopMatStore(acc[j], y, r0 * O + n0, O, gl_CooperativeMatrixLayoutRowMajor);
+        } else {
+            coopMatStore(acc[j], spatch, sgi * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            subgroupMemoryBarrierShared(); subgroupBarrier();
+            for (uint e = lane; e < 256u; e += sgsz) {
+                uint rr = e / 16u, n = e % 16u;
+                if (r0 + rr < S && n0 + n < O) y[(r0 + rr) * O + n0 + n] = spatch[sgi * 256u + e];
+            }
+            subgroupMemoryBarrierShared(); subgroupBarrier();
+        }
+    }
+}

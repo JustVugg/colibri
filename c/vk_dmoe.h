@@ -62,6 +62,7 @@
  * A worker thread takes the steps in order: it waits for A, computes the host pool's
  * pairs as the CPU computes a GGUF's matmuls (ggml_quants.h: int8 activations, integer
  * dots), writes their weighted sum and signals. A prompt chunk keeps the full table. */
+#include "vk_hyb_gate.h"
 #define VKC_HYB_Q 256
 struct VkcDmoe_;
 typedef struct {
@@ -74,7 +75,9 @@ typedef struct {
     VkcHybJob q[VKC_HYB_Q]; int qh, qt, busy;
     unsigned long long steps, pairs;   /* steps done, host pool pairs computed */
     double cpu_ms;                     /* the worker's compute time */
+    double wait_ms;                    /* its time waiting for the device's routes (the layer's dense part on the device) */
     float *gu, *hh, *dn; int cap;      /* its scratch: gate and up, the hidden rows, down, for cap pairs */
+    float *ys; int ycap;               /* the weighted sum, n rows, before it goes to the device's buffer */
 } VkcHyb;
 /* one worker for every engine's steps on the device: the host's timeline rises in its order */
 static VkcHyb g_vkc_hyb;
@@ -104,6 +107,12 @@ typedef struct VkcDmoe_ {
     int *hx_n;                     /* per layer: its experts the CPU computes (0: the full table's step) */
     int D, I;
     unsigned long long hyb_steps;
+    /* the hybrid steps measured against the device's own reads of the host pool
+     * (vkc_dmoe_hyb_gate): the decode forwards timed with the steps on and then off, the
+     * faster kept, measured again after a while. On an RTX 3070 at PCIe 4.0 x16 with an
+     * int4 Qwen3.6 the device read a pool expert faster than the CPU computed one (18.5 ms a
+     * token against 33 to 50 with the hybrid), on an RTX PRO 4000 at x8 the hybrid won. */
+    VkcHybGate gate;
     /* a prompt chunk's staging of the host pool (vkc_dmoe_stage_read): the table with its
      * host pool entries pointing into stg (tabs; tabsh the host's copy), the copies a layer
      * makes (fr: uvec4s, fro / frn / frmax a layer's first, count and widest), whether a
@@ -111,6 +120,10 @@ typedef struct VkcDmoe_ {
     int stg_off, stg_on, stg_big, stg_said; VkcBuf *stg, *tabs, *fr; uint64_t stg_addr; size_t stg_cap, stg_peak;
     uint32_t *tabsh, *frh; int *fro, *frn; uint32_t *frmax; uint8_t *full, *hostm; int nfr;
     unsigned long long stg_steps; double stg_bytes;
+    /* the layer whose host pool experts stg holds (-1 none): a prompt run layer by layer
+     * stages each layer once for all its chunks (qwen38_chain.h, q38c_forward_lm); a table
+     * read again or the kept experts' fill drop it */
+    int stg_layer; unsigned long long stg_reused;
     /* between prompt chunks: stg holds the host pool's hottest experts of block types
      * (vkc_dmoe_keep): koff [L][E] their places in it (-1 none), frk the copies, nkr of
      * them, kmax the widest, keep_valid whether stg has them, keep_fetch: copy them */
@@ -125,6 +138,11 @@ typedef struct VkcDmoe_ {
 static int vkc_dmoe_wanted(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_VK_CHAIN_MOE"); on = !(e && *e == '0'); }
+    return on;
+}
+static int vkc_dmoe_hyb_gated(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_HYBRID_GATE"); on = !(e && *e == '0'); }
     return on;
 }
 static int vkc_hybrid_wanted(void) {
@@ -148,14 +166,23 @@ static void vkc_hyb_compute(VkcDmoe *d, const VkcHybJob *j) {
     int E = d->E, K = d->K, D = d->D, I = d->I, n = j->n;
     const int *ids = (const int *)vkc_ptr(d->rid) + (size_t)j->i * d->cap * K;
     const float *wt = (const float *)vkc_ptr(d->rwt), *x = (const float *)vkc_ptr(d->hxx);
+    /* the sum goes to the device's buffer (written by the host, read by the device: memory the
+     * CPU does not cache, on a discrete card often its BAR) in one copy at the end; reading
+     * it back as the sum grew cost about 70 us a step of Flint's three pairs */
     float *y = (float *)vkc_ptr(d->cy);
-    memset(y, 0, (size_t)n * D * sizeof(float));
     int ps[VKC_DMOE_ROWS * VKC_ROUTE_KMAX], pk[VKC_DMOE_ROWS * VKC_ROUTE_KMAX], np = 0;
     const VktHostExpert *hx = d->hx + (size_t)j->i * E;
     for (int s = 0; s < n; s++)
         for (int k = 0; k < K; k++) { int e = ids[s * K + k]; if (e >= 0 && e < E && hx[e].g) { ps[np] = s; pk[np] = k; np++; } }
-    if (!np) return;
     VkcHyb *w = &g_vkc_hyb;
+    if (!np) { memset(y, 0, (size_t)n * D * sizeof(float)); return; }
+    if (w->ycap < n * D) {
+        free(w->ys); w->ys = malloc((size_t)n * D * sizeof(float));
+        w->ycap = w->ys ? n * D : 0;
+        if (!w->ycap) { memset(y, 0, (size_t)n * D * sizeof(float)); w->err = 1; return; }
+    }
+    float *yl = w->ys;
+    memset(yl, 0, (size_t)n * D * sizeof(float));
     w->pairs += (unsigned long long)np;
     if (w->cap < np) {
         free(w->gu); free(w->hh); free(w->dn);
@@ -168,9 +195,10 @@ static void vkc_hyb_compute(VkcDmoe *d, const VkcHybJob *j) {
     for (int p = 0; p < np; p++) { hp[p] = &hx[ids[ps[p] * K + pk[p]]]; xp[p] = x + (size_t)ps[p] * D; }
     if (!vkt_host_pairs(hp, xp, np, D, I, j->limit, vkc_hyb_threads(), w->gu, w->hh, dn)) w->err = 1;
     for (int p = 0; p < np; p++) {   /* in rank order within a row */
-        float wv = wt[ps[p] * K + pk[p]]; float *ys = y + (size_t)ps[p] * D; const float *o = dn + (size_t)p * D;
+        float wv = wt[ps[p] * K + pk[p]]; float *ys = yl + (size_t)ps[p] * D; const float *o = dn + (size_t)p * D;
         for (int c = 0; c < D; c++) ys[c] += wv * o[c];
     }
+    memcpy(y, yl, (size_t)n * D * sizeof(float));
 }
 static void *vkc_hyb_main(void *arg) {
     (void)arg;
@@ -181,7 +209,10 @@ static void *vkc_hyb_main(void *arg) {
         if (w->qh == w->qt && w->quit) { w->busy = 0; pthread_cond_broadcast(&w->cv_idle); pthread_mutex_unlock(&w->mx); break; }
         VkcHybJob j = w->q[w->qh % VKC_HYB_Q]; w->busy = 1;
         pthread_mutex_unlock(&w->mx);
-        if (!vkc_hybrid_host_wait(j.g)) w->err = 1;
+        const double tw = vkc_hyb_now_ms();
+        const int got = vkc_hybrid_host_wait(j.g);
+        w->wait_ms += vkc_hyb_now_ms() - tw;
+        if (!got) w->err = 1;
         else {
             double t0 = vkc_hyb_now_ms();
             vkc_hyb_compute(j.d, &j);
@@ -201,6 +232,19 @@ static int vkc_hyb_start(void) {
     if (pthread_create(&w->th, NULL, vkc_hyb_main, NULL)) return 0;
     w->th_on = 1;
     return 1;
+}
+/* the worker ended (the gate decided against the hybrid steps): its OpenMP team goes with
+ * it. Left waiting, the team's threads kept spinning (OMP_WAIT_POLICY=ACTIVE) beside the
+ * engine's own: 2 ms a token on an RTX 3070 box with 12 cores. vkc_hyb_start brings it
+ * back for the next measurement. */
+static void vkc_hyb_drain(void);
+static void vkc_hyb_stop(void) {
+    VkcHyb *w = &g_vkc_hyb;
+    if (!w->th_on) return;
+    vkc_hyb_drain();
+    pthread_mutex_lock(&w->mx); w->quit = 1; pthread_cond_broadcast(&w->cv); pthread_mutex_unlock(&w->mx);
+    pthread_join(w->th, NULL);
+    w->th_on = 0; w->quit = 0;
 }
 /* every step posted so far done (the table is about to change, or the end) */
 static void vkc_hyb_drain(void) {
@@ -286,6 +330,7 @@ static int vkc_dmoe_read(VkcDmoe *d) {
         }
     }
     d->stg_on = d->big && d->big_step && vkc_dmoe_stage_read(d);
+    d->stg_layer = -1;   /* the staged regions may have moved */
     if (!d->big_step) vkc_dmoe_keep(d);
     d->stg_big = d->big_step;
     d->epoch = vkt_epoch(); d->read = 1; d->dirty = 1;
@@ -513,6 +558,7 @@ static int vkc_dmoe_prepare(VkcDmoe *d, int lo, int L, int E, int K, int D, int 
     if (!vkc_dmoe_wanted() || d->off || (big && !d->big) || L < 1 || vkc_device_now() != 0 || !vkt_ready() ||
         !vkc_moe_ready() || !vkc_route_ready() || K < 1 || K > VKC_ROUTE_KMAX || E < K || E > VKC_ROUTE_EMAX) return 0;
     if (d->on && (d->lo != lo || d->L != L || d->E != E || d->K != K)) { d->off = 1; return 0; }
+    if (!d->on) d->stg_layer = -1;   /* before the first read: no layer staged */
     d->lo = lo; d->L = L; d->E = E; d->K = K;
     if (d->D != D || d->I != I) d->read = 0;   /* the staging's sizes follow D and I */
     d->D = D; d->I = I;
@@ -540,7 +586,7 @@ static int vkc_dmoe_prepare(VkcDmoe *d, int lo, int L, int E, int K, int D, int 
     size_t r = VKC_DMOE_ROWS, rc = big ? (size_t)rows : r;
     /* the hybrid steps' table and rows (the weights where the worker reads them) */
     if (!d->tab && !d->hybrid && vkc_hybrid_wanted()) {
-        d->hybrid = 1;
+        d->hybrid = 1; vkc_hyb_gate_init(&d->gate, vkc_dmoe_hyb_gated());
         if (!vkc_hyb_start() || !(d->tabhyb = vkc_buf((size_t)L * E * COLI_VK_XB_ENTRY * sizeof(uint32_t), VKC_DEV)) ||
             !vkc_reserve(&d->hxx, r * (size_t)D * sizeof(float), VKC_DOWN) || !vkc_reserve(&d->cy, r * (size_t)D * sizeof(float), VKC_UP))
             d->hybrid = 0;
@@ -581,7 +627,7 @@ static int vkc_dmoe_upload(VkcDmoe *d) {
     if (d->keep_fetch && d->nkr) {
         if (!vkc_write(d->fr, 0, d->frk, (size_t)d->nkr * 4 * sizeof(uint32_t)) || !vkc_barrier() ||
             !vkc_fetch(d->fr, 0, d->nkr, d->kmax, d->stg) || !vkc_barrier()) return 0;
-        d->keep_fills++;
+        d->keep_fills++; d->stg_layer = -1;
     }
     d->keep_fetch = 0;
     d->dirty = 0;
@@ -589,6 +635,8 @@ static int vkc_dmoe_upload(VkcDmoe *d) {
 }
 /* Whether layer `layer` runs its experts in the frame: all of them on the device, in the
  * table the frame has (the tier's residents unchanged since it was read). */
+/* 1 when a prompt step's host pool experts stage into VRAM (the tables read for big steps) */
+static int vkc_dmoe_staging(const VkcDmoe *d) { return d->on && !d->off && d->stg_on; }
 static int vkc_dmoe_on(const VkcDmoe *d, int layer) {
     return d->on && !d->off && d->epoch == vkt_epoch() && layer >= d->lo && layer < d->lo + d->L && d->on[layer - d->lo] &&
            !(d->big_step && d->rows_off && d->rows_off[layer - d->lo]);
@@ -613,23 +661,26 @@ static int vkc_dmoe_layer(VkcDmoe *d, int layer, int n, VkcBuf *lg, VkcBuf *bias
          * there: Qwen3.8 Next IQ2_XS on an RTX PRO 4000 (19 GiB of experts in the host pool), a
          * 507-token prompt, 115-116 tok/s against 93-94 on the matrix units; without the pool the
          * two were even (104-114 against 109-120). */
-        int stg = d->stg_on && d->frn[i] > 0;
+        int stg = d->stg_on && d->frn[i] > 0, have = stg && d->stg_layer == layer;
         m.floats = vkt_host_pool_on() && !(d->stg_on && d->full[i]);   /* staged: VRAM, the matrix units' GEMMs */
         if (!vkc_route(lg, bias, d->rid, d->rwt, &r)) return 0;
         /* the layer's host pool experts into stg: after the layer before is done reading it,
          * before this one's GEMMs read it (both by address, so the barriers are ours) */
-        if (stg && !(vkc_barrier() && vkc_fetch(d->fr, d->fro[i], d->frn[i], d->frmax[i], d->stg) && vkc_barrier())) return 0;
+        if (stg && !have && !(vkc_barrier() && vkc_fetch(d->fr, d->fro[i], d->frn[i], d->frmax[i], d->stg) && vkc_barrier())) return 0;
         if (!vkc_moe_rows(x, d->rid, d->rwt, d->stg_on ? d->tabs : d->tab, &d->rows, d->y, &m)) return 0;
-        if (stg) { d->keep_valid = 0; d->stg_steps++; for (int k = 0; k < d->frn[i]; k++) d->stg_bytes += 4.0 * d->frh[4 * (d->fro[i] + k) + 3]; }
+        if (stg && have) d->stg_reused++;
+        else if (stg) { d->keep_valid = 0; d->stg_steps++; for (int k = 0; k < d->frn[i]; k++) d->stg_bytes += 4.0 * d->frh[4 * (d->fro[i] + k) + 3]; }
+        d->stg_layer = stg ? layer : -1;
         d->steps++; d->big_steps++;
         return 1;
     }
-    if (d->hybrid && d->hx_n && d->hx_n[i] > 0 && m.act == 0) {
+    if (d->hybrid && d->gate.use && d->hx_n && d->hx_n[i] > 0 && m.act == 0) {
         /* frame A: the route and the input rows down, then the device's timeline; frame B:
          * the device's experts; frame C, after the host's: the CPU's sum added */
         uint64_t g = ++g_vkc_hyb_seq;
         if (!vkc_route(lg, bias, d->rid, d->rwt, &r) || !vkc_copy(d->hxx, 0, x, 0, (size_t)n * d->D)) return 0;
         VkcHybJob j = {d, i, n, g, m.act, m.limit};
+        if (!vkc_hyb_start()) return 0;   /* the worker again after a stop (the gate's) */
         vkc_hyb_post(&j);
         if (!vkc_hybrid_submit(g) || !vkc_begin() || !vkc_moe(x, d->rid, d->rwt, d->tabhyb, d->hid, d->y, &m) || !vkc_submit(0)) return 0;
         vkc_hybrid_wait_next(g);
@@ -657,6 +708,11 @@ static void vkc_dmoe_free(VkcDmoe *d) {
     free(d->chg); free(d->wr);
     memset(d, 0, sizeof *d);
 }
+/* the gate on the hybrid steps (vk_hyb_gate.h; COLI_VK_HYBRID_GATE=0: always on) */
+static void vkc_dmoe_forward_done(VkcDmoe *d, int rows, double ms) {
+    if (!d || !d->hybrid || rows < 1 || rows > VKC_DMOE_ROWS) return;
+    if (vkc_hyb_gate_forward(&d->gate, ms) && !d->gate.use) vkc_hyb_stop();
+}
 /* the hybrid steps' line: steps, pairs the CPU computed, its time */
 static void vkc_dmoe_hyb_report(const char *engine, const VkcDmoe *d) {
     const VkcHyb *w = &g_vkc_hyb;
@@ -664,15 +720,25 @@ static void vkc_dmoe_hyb_report(const char *engine, const VkcDmoe *d) {
         fprintf(stderr, "[VK] %s chain: %llu prompt layer steps staged the host pool's experts (%.2f GiB copied over PCIe, "
                         "%.0f MiB of staging, the tier's room %.0f MiB)\n",
                 engine, d->stg_steps, d->stg_bytes / 1073741824.0, d->stg_peak / 1048576.0, vkt_stage_room() / 1048576.0);
+    if (d->stg_reused)
+        fprintf(stderr, "[VK] %s chain: %llu prompt layer steps read the experts their layer had staged already\n",
+                engine, d->stg_reused);
     if (d->keep_fills)
         fprintf(stderr, "[VK] %s chain: between prompt chunks the staging held the host pool's hottest %d experts (%llu fills)\n",
                 engine, d->nkeep, d->keep_fills);
     if (d->patches)
         fprintf(stderr, "[VK] %s chain: the experts' table read whole %llu times, patched %llu times (%llu entries the tier changed)\n",
                 engine, d->reads, d->patches, d->patched);
-    if (!d->hyb_steps) return;
-    fprintf(stderr, "[VK] %s chain: %llu hybrid layer steps, %llu host pool pairs on the CPU in %.1f ms (%.1f us a step)%s\n",
-            engine, d->hyb_steps, w->pairs, w->cpu_ms, w->steps ? w->cpu_ms * 1e3 / (double)w->steps : 0.0,
+    if (!d->hyb_steps && !d->gate.probes) return;
+    if (d->hyb_steps)
+    fprintf(stderr, "[VK] %s chain: %llu hybrid layer steps, %llu host pool pairs on the CPU in %.1f ms (%.1f us a step; "
+                    "%.1f ms waiting for the device's routes)%s\n",
+            engine, d->hyb_steps, w->pairs, w->cpu_ms, w->steps ? w->cpu_ms * 1e3 / (double)w->steps : 0.0, w->wait_ms,
             w->err ? ", errors seen" : "");
+    if (d->gate.probes)
+        fprintf(stderr, "[VK] %s chain: the hybrid steps measured %d time(s): a decode forward %.1f ms with them, %.1f ms with the "
+                        "device reading the host pool itself; %s (COLI_VK_HYBRID_GATE=0 keeps them on)\n",
+                engine, d->gate.probes, d->gate.kept[0], d->gate.kept[1],
+                d->gate.use ? "kept" : "the device's reads kept");
 }
 #endif

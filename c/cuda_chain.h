@@ -165,6 +165,29 @@ static inline size_t cc_moe_hid_floats(int S, int K, int D, int I, int E) {
 typedef struct { size_t dst, src, n; } CcRegion;
 /* a fetch's region: bytes of page-locked host memory at src into a DEV buffer at byte dst */
 typedef struct { const void *src; size_t dst, bytes; } CcFetch;
+/* chain_enc.comp: the decision engines' encoders (decide_cuda.h), every row of a request at
+ * once with no cache and no state. Field for field vk_chain.h's VkcEnc* (its comment has each
+ * op's arithmetic): enc_norm a LayerNorm (+ b with CC_ENC_ADD, the sum written back to a with
+ * CC_ENC_SUM; D <= 4096), enc_bias y = act(y + bias) in place, enc_geglu act(u + bu) * (g + bg),
+ * enc_rope rotate-half RoPE on the query and key heads from a table row pos[r], enc_addrow a
+ * table row per row, enc_attn each row over its range of rows with DeBERTa's two relative
+ * terms (hd <= 128), enc_rel those terms' products. rng, ridx, pos and idx: int32 buffers. */
+#define CC_ENC_ADD 1
+#define CC_ENC_SUM 2
+#define CC_ENC_ACT_NONE      0
+#define CC_ENC_ACT_GELU      1   /* erf */
+#define CC_ENC_ACT_GELU_TANH 2
+#define CC_ENC_ACT_RELU      3
+#define CC_ENC_C2P 1
+#define CC_ENC_P2C 2
+typedef struct { int mode, rows, D, a_off, a_row, b_off, b_row, y_off, y_row, w_off, bias_off, flags; float eps; } CcEncNorm;
+typedef struct { int mode, n, O, y_off, y_row, b_off, act; } CcEncBias;
+typedef struct { int mode, n, I, a_off, a_row, y_off, y_row, b_off, act; } CcEncGeglu;
+typedef struct { int mode, n, H, hd, x_off, x_row, part_off, cos_off, sin_off; } CcEncRope;
+typedef struct { int mode, n, D, y_off, y_row, t_off; } CcEncAddRow;
+typedef struct { int mode, S, H, hd, q_off, k_off, v_off, kv_row, o_off, o_row, flags, c_off, p_off, nr, rc;
+                 float scale; int r0; } CcEncAttn;
+typedef struct { int mode, S, H, hd, x_off, x_row, p_off, p_row, y_off, nr, r0; } CcEncRel;
 /* counters, for the engines' [chain] lines */
 typedef struct {
     unsigned long long frames, waits, ops, matmuls, bytes_up, bytes_down;
@@ -268,6 +291,23 @@ typedef struct ColiCudaChainOps {
     /* matmul_rows: y[0..n) = the rows ids[0..n) of a resident tensor (fmt 0 or 1, one input
      * row x[I]); an MTP head's adaptive draft vocabulary scored from the model's lm_head */
     int  (*matmul_rows)(ColiCudaTensor *t, CcBuf *ids, CcBuf *x, CcBuf *y, int n);
+    /* A float16 KV cache (half the memory and half the reads of a float32 one): kvh 1 when
+     * the next three take one (0 on HIP); attn_h and attn_wh are attn and attn_wr over caches
+     * of halves (kc, vc and their offsets in halves); copy_regions_h copies float32 regions of
+     * src (offsets in floats) into such a cache (offsets in halves), each value rounded to the
+     * nearest float16 */
+    int  (*kvh)(void);
+    int  (*attn_h)(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *sel, const CcAttn *p);
+    int  (*attn_wh)(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *p, int ring);
+    int  (*copy_regions_h)(CcBuf *dst, CcBuf *src, const CcRegion *r, int n);
+    /* the decision engines' encoders (CcEnc* above) */
+    int  (*enc_norm)(CcBuf *a, CcBuf *b, CcBuf *prm, CcBuf *y, const CcEncNorm *p);
+    int  (*enc_bias)(CcBuf *y, CcBuf *prm, const CcEncBias *p);
+    int  (*enc_geglu)(CcBuf *a, CcBuf *prm, CcBuf *y, const CcEncGeglu *p);
+    int  (*enc_rope)(CcBuf *x, CcBuf *tab, CcBuf *pos, const CcEncRope *p);
+    int  (*enc_addrow)(CcBuf *y, CcBuf *tab, CcBuf *idx, const CcEncAddRow *p);
+    int  (*enc_attn)(CcBuf *qkv, CcBuf *c2p, CcBuf *p2c, CcBuf *o, CcBuf *rng, CcBuf *ridx, CcBuf *pos, const CcEncAttn *p);
+    int  (*enc_rel)(CcBuf *x, CcBuf *pt, CcBuf *y, const CcEncRel *p);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -338,6 +378,20 @@ static inline int cc_attn_wr_ready(void) { const ColiCudaChainOps *t = cc_ops();
 static inline int cc_attn_wr(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *p, int ring) {
     return cc_attn_wr_ready() ? cc_ops()->attn_wr(q, kc, vc, o, gate, snk, p, ring) : 0;
 }
+/* a float16 KV cache's ops (kvh): 0 from an older backend or HIP */
+static inline int cc_kvh_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, copy_regions_h) + sizeof t->copy_regions_h && t->kvh();
+}
+static inline int cc_attn_h(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *sel, const CcAttn *p) {
+    return cc_kvh_ready() ? cc_ops()->attn_h(q, kc, vc, o, gate, sel, p) : 0;
+}
+static inline int cc_attn_wh(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *p, int ring) {
+    return cc_kvh_ready() ? cc_ops()->attn_wh(q, kc, vc, o, gate, snk, p, ring) : 0;
+}
+static inline int cc_copy_regions_h(CcBuf *dst, CcBuf *src, const CcRegion *r, int n) {
+    return cc_kvh_ready() ? cc_ops()->copy_regions_h(dst, src, r, n) : 0;
+}
 static inline int cc_kv16_ready(void) {
     const ColiCudaChainOps *t = cc_ops();
     return t && t->size >= offsetof(ColiCudaChainOps, kv16) + sizeof t->kv16 && t->kv16 && t->kv16();
@@ -367,6 +421,27 @@ static inline int cc_matmul_rows_ready(void) {
 static inline int cc_matmul_rows(ColiCudaTensor *w, CcBuf *ids, CcBuf *x, CcBuf *y, int n) {
     return cc_matmul_rows_ready() ? cc_ops()->matmul_rows(w, ids, x, y, n) : 0;
 }
+static inline int cc_enc_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, enc_rel) + sizeof t->enc_rel && t->enc_rel;
+}
+static inline int cc_enc_norm(CcBuf *a, CcBuf *b, CcBuf *prm, CcBuf *y, const CcEncNorm *p) {
+    return cc_enc_ready() ? cc_ops()->enc_norm(a, b, prm, y, p) : 0;
+}
+static inline int cc_enc_bias(CcBuf *y, CcBuf *prm, const CcEncBias *p) { return cc_enc_ready() ? cc_ops()->enc_bias(y, prm, p) : 0; }
+static inline int cc_enc_geglu(CcBuf *a, CcBuf *prm, CcBuf *y, const CcEncGeglu *p) {
+    return cc_enc_ready() ? cc_ops()->enc_geglu(a, prm, y, p) : 0;
+}
+static inline int cc_enc_rope(CcBuf *x, CcBuf *tab, CcBuf *pos, const CcEncRope *p) {
+    return cc_enc_ready() ? cc_ops()->enc_rope(x, tab, pos, p) : 0;
+}
+static inline int cc_enc_addrow(CcBuf *y, CcBuf *tab, CcBuf *idx, const CcEncAddRow *p) {
+    return cc_enc_ready() ? cc_ops()->enc_addrow(y, tab, idx, p) : 0;
+}
+static inline int cc_enc_attn(CcBuf *qkv, CcBuf *c2p, CcBuf *p2c, CcBuf *o, CcBuf *rng, CcBuf *ridx, CcBuf *pos, const CcEncAttn *p) {
+    return cc_enc_ready() ? cc_ops()->enc_attn(qkv, c2p, p2c, o, rng, ridx, pos, p) : 0;
+}
+static inline int cc_enc_rel(CcBuf *x, CcBuf *pt, CcBuf *y, const CcEncRel *p) { return cc_enc_ready() ? cc_ops()->enc_rel(x, pt, y, p) : 0; }
 #endif
 
 #ifdef __cplusplus

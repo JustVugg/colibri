@@ -8,6 +8,25 @@ layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer Src { float s[]; };
 layout(std430, binding = 1) writeonly buffer Dst { float d[]; };
+// H16 (vkc_copy_regions_h): dst a float16 cache, two halves a word (its offsets, lengths and
+// strides in halves, even), each value clamped to +-65504 and rounded to the nearest float16,
+// ties to even, by kv16.h's integer arithmetic (chain_ew.comp's op 11), then packed: the
+// value is a float16's, so packHalf2x16's own rounding (toward zero on RADV) leaves it be;
+// an invocation a pair
+layout(constant_id = 0) const bool H16 = false;
+layout(std430, binding = 1) writeonly buffer DstH { uint dh[]; };
+
+// kv16.h's kv16_clamp and kv16_round_bits, as chain_ew.comp's op 11
+float kv16r(float x) {
+    if (x > 65504.0) x = 65504.0; else if (x < -65504.0) x = -65504.0;   // a NaN passes both
+    uint u = floatBitsToUint(x), sg = u & 0x80000000u, m = u & 0x7fffffffu;
+    if (m > 0x7f800000u) return uintBitsToFloat(u | 0x400000u);           // a NaN stays one
+    if (m >= 0x38800000u) return uintBitsToFloat(sg | ((m + 0xfffu + ((m >> 13) & 1u)) & 0xffffe000u));
+    uint e = m >> 23, mm = (m & 0x7fffffu) | 0x800000u;                  // float16's subnormals: n * 2^-24
+    if (e < 102u) return uintBitsToFloat(sg);
+    uint sh = 126u - e, n = (mm + (1u << (sh - 1u)) - 1u + ((mm >> sh) & 1u)) >> sh;
+    return uintBitsToFloat(sg | floatBitsToUint(float(n) * 5.9604644775390625e-8));
+}
 
 layout(push_constant) uniform Pc {
     uint d0, s0;
@@ -17,6 +36,15 @@ layout(push_constant) uniform Pc {
 
 void main() {
     uint gid = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u;
+    if (H16) {
+        uint l2 = p.len / 2u;
+        if (gid >= p.n * l2) return;
+        uint i = gid / l2, j = 2u * (gid - i * l2);
+        int q = int(i / p.per), h = int(i - uint(q) * p.per);
+        uint so = p.s0 + uint(q * p.sq + h * p.sh) + j;
+        dh[(p.d0 + uint(q * p.dq + h * p.dh) + j) >> 1u] = packHalf2x16(vec2(kv16r(s[so]), kv16r(s[so + 1u])));
+        return;
+    }
     if (gid >= p.n * p.len) return;
     uint i = gid / p.len, j = gid - i * p.len;
     int q = int(i / p.per), h = int(i - uint(q) * p.per);

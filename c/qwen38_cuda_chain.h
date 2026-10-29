@@ -62,6 +62,7 @@ typedef struct {
     int *kv_valid, *pk_valid, *attn_ord, n_attn;
     int dn_where, host_zero, snap_valid;
     CcBuf *hyper, *hn, *low, *mix, *mixed, *inj_a, *inj_m, *blk, *q, *k, *v, *ip, *ctx, *qsc, *sel;
+    CcBuf *hyper_all;                          /* every row's streams through a prompt run layer by layer (q38cc_forward_lm) */
     CcBuf *qkv, *z, *ab, *cv, *dny, *lg, *gs, *us, *hs, *ds, *sgd;
     CcBuf *emb, *keys, *val, *gated, *normv;
     CcBuf *mixd, *lgd, *kvd, *outd, *hypd, *find, *routed, *cs, *pcs;
@@ -74,6 +75,10 @@ typedef struct {
     unsigned dm_epoch, dm_seq;
     CcExpert *dm_host; uint8_t *dm_res, *dm_ran, *dm_dev; int *dm_part;   /* dm_ran: the step's layers that ran so */
     CcBuf *dm_ids, *dm_w, *dm_idsd, *dm_wd, *dm_hid, *dm_y, *dm_hy, *dm_dfl, *dm_hfl, *dm_tab;
+    /* pool_cpu: a decode step's pooled experts on the CPU (q38cc_dm_serve), from the decode table
+     * dm_tabd that lacks them (dm_partd: a layer with any such slot); pc_*: the CPU's scratch */
+    CcBuf *dm_tabd; int *dm_partd, pool_cpu, pc_cap; float *pc_gu, *pc_hh, *pc_dn;
+    unsigned long long pc_pairs; double pc_ms;
     unsigned long long dm_steps, dm_hyb, dm_pairs;   /* layer steps in the frame, the hybrid ones, slots the host computed */
     double dm_host_ms, dm_spin_ms;
     /* the host pool (q38cc_pool_init): pool_n experts in pool_nb buffers of pool_per, pool_of[l*E+e] its slot or -1 */
@@ -82,6 +87,7 @@ typedef struct {
     /* a prompt chunk's: a layer's pooled experts copied to dm_stage (cc_fetch) while the layers before it run */
     CcBuf *dm_stage, *dm_tabb; CcExpert *dm_hostb; CcFetch *dm_fr; int *dm_fro, *dm_frn, dm_stage_cap;
     unsigned long long dm_staged; double dm_stage_bytes;
+    unsigned long long lm_forwards;            /* prompts run layer by layer */
     /* adaptive promotion (q38cc_promote_*): the tier's arena is the chain's (own) */
     int own, promo_rate, stage_dirty;
     char *ar_base; size_t ar_slot, ar_off_u, ar_off_d; int ar_n;
@@ -109,8 +115,25 @@ static int g_cuda_chain = 0;     /* COLI_CUDA_CHAIN asked for it and the chain i
 static int q38cc_env_on(void) { const char *e = getenv("COLI_CUDA_CHAIN"); return e && *e ? *e == '1' : g_q38_gguf; }
 static int q38cc_rows_env(void) {
     const char *e = getenv("COLI_CUDA_CHAIN_ROWS");
-    int r = e && *e ? atoi(e) : 512;   /* a chunk reads every pooled expert over the bus once: 256 rows read a 507-token prompt's twice */
+    /* a chunk reads every pooled expert over the bus once: at 512 rows a 1628-token prompt read them four times
+     * (90.8 GB on an RTX 4090), at 2048 once (22.8 GB), 148.7 -> 352.4 tok/s. Each row keeps ~0.6 MiB of the
+     * card for the chain (q38cc_reserve_bytes): 2048 rows hold 0.9 GiB more than 512, fewer experts there */
+    int r = e && *e ? atoi(e) : 2048;
     return r < 1 ? 1 : r > 8192 ? 8192 : r;
+}
+/* COLI_CUDA_CHAIN_LAYERWISE (q38cc_forward_lm): 0 chunk by chunk */
+static int q38cc_layer_major(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_CHAIN_LAYERWISE"); on = !(e && *e == '0'); }
+    return on;
+}
+/* a prompt run layer by layer goes in segments of this many rows (whole chunks, at least one):
+ * a segment's streams on the device (hyper_all) stay bounded whatever the prompt's length.
+ * COLI_CUDA_CHAIN_LAYERWISE_ROWS sets it (tests: two segments of a short prompt) */
+static int q38cc_lm_rows(void) {
+    static int r = -1;
+    if (r < 0) { const char *e = getenv("COLI_CUDA_CHAIN_LAYERWISE_ROWS"); r = e && atoi(e) > 0 ? atoi(e) : 8192; }
+    return r;
 }
 static void q38cc_fatal(const char *what) {
     fprintf(stderr, "[chain] qwen38: %s -- stopping (COLI_CUDA_CHAIN=0 keeps the state on the CPU)\n", what);
@@ -240,6 +263,18 @@ static size_t q38cc_reserve_bytes(Model *m) {
     size_t row = 7 * W + c->hc_rank + 6 * H + 2 * (size_t)c->hc_count + 3 * QH * D + 2 * kvo + ipw + 2 * nb + (size_t)q38cc_selrow(c) +
                  2 * (size_t)c->dn_conv_dim + 2 * V + 2 * (size_t)c->dn_vheads + 2 * E + 3 * SI + Ep + (size_t)(c->rotary_dim > 0 ? c->rotary_dim : 2);
     b += (size_t)q38cc_rows_env() * row * F + 2 * (size_t)c->vocab * F;
+    /* a verify's copies of the DeltaNet state and rings (q38cc_spec_slots), the routed experts'
+     * scratch for a prompt chunk (q38cc_dm_begin: their hidden rows, the sum, the routes), and a
+     * segment's streams of a prompt run layer by layer: past the estimate, 2048-row chunks left
+     * the chain short of the copies, and every verify went to the CPU (Qwen3.8-Flash-Next IQ2_XS,
+     * RTX PRO 4000: 3.21 GiB kept, 3.34-3.51 used, decode 43.6 -> 20.4 tok/s) */
+    {
+        size_t R = (size_t)q38cc_rows_env(), K = (size_t)c->topk;
+        b += (size_t)Q38_SPEC_SNAPS * (L - n_attn) *
+             ((size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim + (size_t)c->dn_conv_dim * (c->dn_convk - 1)) * F;
+        if (E > 0) b += (cc_moe_hid_floats((int)R, (int)K, (int)H, c->inter, (int)E) + R * H + 2 * (size_t)L * R * K) * F;
+        if (q38cc_layer_major()) b += (size_t)(q38cc_lm_rows() > (int)R ? q38cc_lm_rows() : (int)R) * W * F;
+    }
     for (int i = 0; i < L; i++) {   /* the matrices the trunk's table does not offer: the chain's own copies */
         Q38Weight *w[Q38CC_MATS]; const char *nm[Q38CC_MATS]; int n = q38cc_mats(m, i, w, nm);
         for (int k = 0; k < n; k++) {
@@ -444,6 +479,10 @@ static int q38cc_bufs(Q38CChain *ch, Model *m, int rows) {
              cc_reserve(&ch->outd, 2 * (size_t)c->vocab * F, CC_DOWN) && cc_reserve(&ch->routed, r * H * F, CC_UP) &&
              cc_reserve(&ch->emb, r * Ep * F, CC_UP) && cc_reserve(&ch->cs, r * (c->rotary_dim > 0 ? c->rotary_dim : 2) * F, CC_UP) &&
              cc_reserve(&ch->pcs, (size_t)nbmax * (c->rotary_dim > 0 ? c->rotary_dim : 2) * F, CC_UP);
+    /* a verify's PLE segments (q38cc_ple) here, not in the frame: growing a buffer there waits
+     * for the stream, which a hybrid layer before it holds until the host serves it */
+    if (ok && c->ple_layer >= 0)
+        ok = cc_reserve(&ch->gseg, r * W * F, CC_DEV) && cc_reserve(&ch->nseg, r * W * F, CC_DEV);
     return ok;
 }
 /* the K/V, index-key and pooled-key mirrors at the host's capacity */
@@ -830,11 +869,14 @@ static void q38cc_kv_down(Q38CChain *ch, Model *m, int i, int n, int pb) {
 #define Q38CC_DM_ROWS 8
 /* ---- the host pool -----------------------------------------------------------------------
  * The Vulkan tier's host pool, for this chain: the experts the card does not hold, in
- * page-locked RAM the device reads by address over the bus (cc_buf CC_UP: mapped and
- * write-combined, nothing on the host reads it back), as the file has them (a GGUF's rows,
- * whole words). A step's table points at them where the tier has no resident, so a layer
- * whose experts are all on the card or here has no host step: the GEMV reads a pooled
- * expert's matrices over PCIe once. Filled once after the tier's warm start, the history's
+ * page-locked RAM mapped into the device (cc_buf CC_DOWN: cached, the CPU reads it at its
+ * memory's speed), as the file has them (a GGUF's rows, whole words). A decode step's
+ * pooled experts are the CPU's (pool_cpu): their rows eight at a time where they are
+ * (q38cc_pool_pairs, as vk_tier.c's hybrid steps), the device computing its residents meanwhile,
+ * from a decode table without them (dm_tabd). A prompt chunk's table points at them, so a
+ * layer whose experts are all on the card or here has no host step: the GEMV reads a pooled
+ * expert's matrices over PCIe once. COLI_CUDA_CHAIN_POOL_READ=1 has the device read a decode
+ * step's too, as before. Filled once after the tier's warm start, the history's
  * most used first. Its size: the RAM free less 4 GiB and less what the RAM cache may still
  * grow by (the experts the card leaves, the CPU's step computing nothing else), at most the
  * experts the card leaves. COLI_CUDA_CHAIN_POOL=0 turns it off,
@@ -958,11 +1000,22 @@ static int q38cc_promote_settle(Q38CChain *ch, Model *m) {
     ch->npend = w;
     if (!ch->nchg) return 1;
     int ok = cc_begin();
-    for (int j = 0; j < ch->nchg && ok; j++)
-        ok = cc_write(ch->dm_tab, (size_t)ch->chg[j] * (sizeof(CcExpert) / 4), &ch->dm_host[ch->chg[j]], sizeof(CcExpert));   /* offsets in floats */
+    static const CcExpert none;
+    for (int j = 0; j < ch->nchg && ok; j++) {
+        const int k = ch->chg[j];
+        ok = cc_write(ch->dm_tab, (size_t)k * (sizeof(CcExpert) / 4), &ch->dm_host[k], sizeof(CcExpert));   /* offsets in floats */
+        /* the decode table: a slot back in the pool is the CPU's (pool_cpu) */
+        if (ok && ch->pool_cpu && ch->dm_tabd)
+            ok = cc_write(ch->dm_tabd, (size_t)k * (sizeof(CcExpert) / 4), ch->dm_res[k] >= 2 ? &none : &ch->dm_host[k], sizeof(CcExpert));
+    }
     ok = ok && cc_submit(1);
+    if (ch->pool_cpu && ch->dm_tabd)   /* the changed layers' CPU slots */
+        for (int j = 0; j < ch->nchg; j++) {
+            const int i = ch->chg[j] / E; int any = 0;
+            for (int e = 0; e < E && !any; e++) any = ch->dm_res[(size_t)i * E + e] != 1;
+            ch->dm_partd[i] = any;
+        }
     ch->nchg = 0; ch->stage_dirty = 1;
-    (void)E;
     return ok;
 }
 /* after a frame: this conversation's routes, and the promotions they earn */
@@ -1109,7 +1162,7 @@ static void q38cc_pool_init(Model *m) {
     int got = 0;
     for (; got < nb; got++) {
         size_t bytes = (size_t)(fit - (long long)got * per < per ? fit - (long long)got * per : per) * stride;
-        if (!(ch->pool_buf[got] = cc_buf(bytes, CC_UP)) || !cc_dev_addr(ch->pool_buf[got])) { cc_free(ch->pool_buf[got]); ch->pool_buf[got] = NULL; break; }
+        if (!(ch->pool_buf[got] = cc_buf(bytes, CC_DOWN)) || !cc_dev_addr(ch->pool_buf[got])) { cc_free(ch->pool_buf[got]); ch->pool_buf[got] = NULL; break; }
     }
     if ((long long)got * per < fit) fit = (long long)got * per;
     ch->pool_nb = got; ch->pool_per = per; ch->pool_stride = stride; ch->pool_n = (int)fit;
@@ -1123,6 +1176,8 @@ static void q38cc_pool_init(Model *m) {
         for (int q = 0; q < 3; q++) q38_gg_read(t[q], dst + off[q], (int64_t)hot[k].e * eb[q], eb[q]);
     }
     for (int k = 0; k < (int)fit; k++) ch->pool_of[(size_t)hot[k].i * E + hot[k].e] = k;
+    const char *pr = getenv("COLI_CUDA_CHAIN_POOL_READ");
+    ch->pool_cpu = !(pr && *pr == '1');
     ch->dm_read = 0;   /* the table again, with the pool */
     /* a prompt chunk's staging: the most pooled experts any layer has, within Q38CC_PROMPT_STAGE
      * (the chain's reserve counted it); a layer's past it are read where they are */
@@ -1183,14 +1238,15 @@ static int q38cc_dm_begin(Q38CChain *ch, Model *m, int n) {
     size_t r = (size_t)ch->rows, ne = (size_t)L * E, F = sizeof(float);
     if (!ch->dm_host) {
         ch->dm_host = malloc(ne * sizeof(CcExpert)); ch->dm_res = calloc(ne, 1); ch->dm_part = calloc(L, sizeof(int));
-        ch->dm_ran = calloc(L, 1); ch->dm_dev = malloc((size_t)Q38CC_DM_ROWS * K);
-        if (!ch->dm_host || !ch->dm_res || !ch->dm_part || !ch->dm_ran || !ch->dm_dev) return 0;
+        ch->dm_ran = calloc(L, 1); ch->dm_dev = malloc((size_t)Q38CC_DM_ROWS * K); ch->dm_partd = calloc(L, sizeof(int));
+        if (!ch->dm_host || !ch->dm_res || !ch->dm_part || !ch->dm_ran || !ch->dm_dev || !ch->dm_partd) return 0;
     }
     if (!cc_reserve(&ch->dm_ids, (size_t)L * r * K * 4, CC_DEV) || !cc_reserve(&ch->dm_w, (size_t)L * r * K * F, CC_DEV) ||
         !cc_reserve(&ch->dm_idsd, (size_t)L * r * K * 4, CC_DOWN) || !cc_reserve(&ch->dm_wd, (size_t)L * r * K * F, CC_DOWN) ||
         !cc_reserve(&ch->dm_hid, cc_moe_hid_floats((int)r, K, D, I, E) * F, CC_DEV) || !cc_reserve(&ch->dm_y, r * D * F, CC_DEV) ||
         !cc_reserve(&ch->dm_hy, r * D * F, CC_UP) || !cc_reserve(&ch->dm_dfl, 64, CC_DOWN) || !cc_reserve(&ch->dm_hfl, 64, CC_UP) ||
         !cc_reserve(&ch->dm_tab, ne * sizeof(CcExpert), CC_DEV)) return 0;
+    if (ch->pool_cpu && ch->pool_of && !cc_reserve(&ch->dm_tabd, ne * sizeof(CcExpert), CC_DEV)) ch->pool_cpu = 0;
     if (!ch->dm_held) { qt_chain_hold(1); ch->dm_held = 1; }
     if (ch->own && ch->dm_read) {   /* the chain's slots: the newcomers landed, the entries rewritten, then the frame */
         if (!q38cc_promote_settle(ch, m)) return 0;
@@ -1219,7 +1275,21 @@ static int q38cc_dm_begin(Q38CChain *ch, Model *m, int n) {
         }
         ch->dm_part[i] = miss;
     }
-    if (!cc_begin() || !cc_write(ch->dm_tab, 0, ch->dm_host, ne * sizeof(CcExpert)) || !cc_submit(1)) return 0;
+    CcExpert *td = NULL;   /* the decode table: the pool's entries left to the CPU */
+    if (ch->pool_cpu && ch->dm_tabd) {
+        if (!(td = malloc(ne * sizeof(CcExpert)))) ch->pool_cpu = 0;
+        else {
+            memcpy(td, ch->dm_host, ne * sizeof(CcExpert));
+            for (int i = 0; i < L; i++) {
+                int any = 0;
+                for (int e = 0; e < E; e++) { size_t j = (size_t)i * E + e; if (ch->dm_res[j] != 1) { any = 1; if (ch->dm_res[j] >= 2) memset(&td[j], 0, sizeof *td); } }
+                ch->dm_partd[i] = any;
+            }
+        }
+    }
+    int wok = cc_begin() && cc_write(ch->dm_tab, 0, ch->dm_host, ne * sizeof(CcExpert)) && (!td || cc_write(ch->dm_tabd, 0, td, ne * sizeof(CcExpert))) && cc_submit(1);
+    free(td);
+    if (!wok) return 0;
     if (ch->dm_stage && cc_fetch_ready() && !q38cc_stage_table(ch, m)) {
         if (cc_lost()) return 0;
         fprintf(stderr, "[chain] qwen38: no room for a prompt chunk's staging table; its pooled experts are read where they are\n");
@@ -1281,7 +1351,12 @@ static void q38cc_dm_end(Q38CChain *ch) { if (ch->dm_held) { qt_chain_hold(0); c
 /* layer i's router, routing, shared expert and the device's experts; *v: the host's word
  * a hybrid layer waits for (0: none) */
 /* a step's table: a prompt chunk's stages its layers' pooled experts */
-static CcBuf *q38cc_dm_tab(Q38CChain *ch, int n) { return n > Q38CC_DM_ROWS && ch->dm_stage && ch->dm_tabb ? ch->dm_tabb : ch->dm_tab; }
+static CcBuf *q38cc_dm_tab(Q38CChain *ch, int n) {
+    if (n <= Q38CC_DM_ROWS && ch->pool_cpu && ch->dm_tabd) return ch->dm_tabd;   /* the pool's experts on the CPU */
+    return n > Q38CC_DM_ROWS && ch->dm_stage && ch->dm_tabb ? ch->dm_tabb : ch->dm_tab;
+}
+/* layer i has slots the host computes in a step of n rows */
+static int q38cc_dm_hosted(Q38CChain *ch, int i, int n) { return n <= Q38CC_DM_ROWS && ch->pool_cpu && ch->dm_tabd ? ch->dm_partd[i] : ch->dm_part[i]; }
 static int q38cc_dm_layer(Q38CChain *ch, Model *m, Layer *l, int i, int n, unsigned *v) {
     Cfg *c = &m->c; int H = c->hidden, E = c->experts, K = c->topk, io = i * ch->rows * K;
     CcBuf *tab = q38cc_dm_tab(ch, n);
@@ -1292,7 +1367,7 @@ static int q38cc_dm_layer(Q38CChain *ch, Model *m, Layer *l, int i, int n, unsig
     int ok = cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->dm_ids, ch->dm_w, &rp) &&
              cc_copy(ch->dm_idsd, io, ch->dm_ids, io, (size_t)n * K) && cc_copy(ch->dm_wd, io, ch->dm_w, io, (size_t)n * K);
     *v = 0;
-    if (ok && ch->dm_part[i]) { *v = ++ch->dm_seq; ok = cc_copy(ch->mixd, 0, ch->mixed, 0, (size_t)n * H) && cc_signal(ch->dm_dfl, 0, *v); }
+    if (ok && q38cc_dm_hosted(ch, i, n)) { *v = ++ch->dm_seq; ok = cc_copy(ch->mixd, 0, ch->mixed, 0, (size_t)n * H) && cc_signal(ch->dm_dfl, 0, *v); }
     ok = ok && q38cc_shared(ch, m, l, i, n) && (!stg || cc_fetch_wait()) &&
          cc_moe(tab, ch->mixed, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, NULL, &mp);
     if (ok && stg) ok = cc_fetch_done() && q38cc_stage_from(ch, m, i + 1);   /* the sum below reads no weights */
@@ -1301,6 +1376,58 @@ static int q38cc_dm_layer(Q38CChain *ch, Model *m, Layer *l, int i, int n, unsig
     ok = ok && cc_moe(tab, NULL, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, ch->dm_hy, &ms);
     ch->dm_steps++;
     return ok;
+}
+/* np pooled slots on the CPU, their rows where the pool holds them (g[p]: gate, up and down at
+ * 0, Q38CC_PAD(gate bytes), twice that), x[p] each slot's input row: gate and up, SwiGLU, down
+ * into dn[p * H]. A matrix's rows by eight (ggml_quants.h gq_rows_f8, whose bits do not
+ * depend on the other rows of a call) where its type has the kernel, the row kernels where
+ * not: vk_tier.c's host_pairs computes the same, in one parallel region. */
+static int q38cc_pool_pairs(const uint8_t *const *g, const float *const *x, int np, int H, int I, int tg, int td,
+                            float *gu, float *hh, float *dn) {
+    const int64_t rg = gq_row_bytes(tg, H), rd = gq_row_bytes(td, I);
+    const size_t pg = Q38CC_PAD(rg * I);
+    gq_act *ax = calloc((size_t)np, sizeof *ax), *ah = calloc((size_t)np, sizeof *ah);
+    int err = !ax || !ah;
+    for (int p = 0; p < np && !err; p++) err = gq_act_set(&ax[p], x[p], 1, H) != 0;
+    const int cgu = (2 * I + 7) / 8, cdn = (H + 7) / 8, f8g = gq_f8_ok(tg, H), f8d = gq_f8_ok(td, I);
+    if (!err) {
+        #pragma omp parallel
+        {
+            #pragma omp for schedule(dynamic, 4)
+            for (int c = 0; c < np * cgu; c++) {
+                const int p = c / cgu, o0 = (c % cgu) * 8, o1 = o0 + 8 < 2 * I ? o0 + 8 : 2 * I;
+                if (o1 - o0 == 8 && (o1 <= I || o0 >= I) && f8g) {
+                    const uint8_t *m = o0 < I ? g[p] : g[p] + pg; const int oo = o0 < I ? o0 : o0 - I;
+                    gq_rows_f8(gu + (size_t)p * 2 * I + o0, 1, &ax[p], m + (int64_t)oo * rg, rg, tg, H, 8);
+                    continue;
+                }
+                for (int o = o0; o < o1; o++) {
+                    const uint8_t *m = o < I ? g[p] : g[p] + pg; const int oo = o < I ? o : o - I;
+                    gq_row_all(gu + (size_t)p * 2 * I + o, 1, &ax[p], m + (int64_t)oo * rg, tg, H);
+                }
+            }
+            #pragma omp for schedule(static)
+            for (int p = 0; p < np; p++) {
+                const float *gg = gu + (size_t)p * 2 * I, *uu = gg + I; float *h = hh + (size_t)p * I;
+                for (int o = 0; o < I; o++) h[o] = gg[o] / (1.f + expf(-gg[o])) * uu[o];
+                if (gq_act_set(&ah[p], h, 1, I)) {
+                    #pragma omp atomic write
+                    err = 1;
+                }
+            }
+            #pragma omp for schedule(dynamic, 8)
+            for (int c = 0; c < np * cdn; c++) {
+                const int p = c / cdn, o0 = (c % cdn) * 8, o1 = o0 + 8 < H ? o0 + 8 : H;
+                if (!ah[p].q) continue;
+                const uint8_t *m = g[p] + 2 * pg;
+                if (o1 - o0 == 8 && f8d) { gq_rows_f8(dn + (size_t)p * H + o0, 1, &ah[p], m + (int64_t)o0 * rd, rd, td, I, 8); continue; }
+                for (int o = o0; o < o1; o++) gq_row_all(dn + (size_t)p * H + o, 1, &ah[p], m + (int64_t)o * rd, td, I);
+            }
+        }
+    }
+    for (int p = 0; ax && ah && p < np; p++) { gq_act_free(&ax[p]); gq_act_free(&ah[p]); }
+    free(ax); free(ah);
+    return !err;
 }
 /* the host's share of hybrid layer i: once the device's word says its routes and rows are
  * down, the slots the table lacks, its rows up, its word */
@@ -1316,14 +1443,54 @@ static int q38cc_dm_serve(Q38CChain *ch, Model *m, int i, int n, unsigned v) {
     double t1 = now_s();
     const int *ids = (const int *)cc_ptr(ch->dm_idsd) + (size_t)i * ch->rows * K;
     const float *w = (const float *)cc_ptr(ch->dm_wd) + (size_t)i * ch->rows * K;
+    const float *x = (const float *)cc_ptr(ch->mixd);
+    /* the slots the table lacks: the pool's (pool_cpu: their rows in the pool's cached RAM,
+     * computed in place as vk_tier.c's hybrid steps do) and the true misses (the RAM cache) */
+    const int pc = ch->pool_cpu && ch->dm_tabd && n <= Q38CC_DM_ROWS;
+    int npc = 0, nmiss = 0, pa[Q38CC_DM_ROWS * 32];
     for (int a = 0; a < n * K; a++) {
-        int e = ids[a];
-        ch->dm_dev[a] = (uint8_t)(e < 0 || e >= E || ch->dm_res[(size_t)i * E + e]);
-        if (!ch->dm_dev[a]) ch->dm_pairs++;
+        int e = ids[a]; const uint8_t r = e < 0 || e >= E ? 1 : ch->dm_res[(size_t)i * E + e];
+        const int pool = pc && r >= 2 && npc < Q38CC_DM_ROWS * 32;
+        ch->dm_dev[a] = (uint8_t)(r && !(pc && r >= 2 && !pool) ? 1 : 0);   /* the grouped path's: a miss, or a pooled slot past pa */
+        if (pool) pa[npc++] = a;
+        if (!ch->dm_dev[a]) nmiss++;
+        if (!ch->dm_dev[a] || pool) ch->dm_pairs++;
     }
-    if (!q38_moe_decode_grouped(m, &m->L[i], i, (const float *)cc_ptr(ch->mixd), n, ch->host_routed, NULL, 1, 0, ids, w, ch->dm_dev)) {
+    if (nmiss && !q38_moe_decode_grouped(m, &m->L[i], i, x, n, ch->host_routed, NULL, 1, 0, ids, w, ch->dm_dev)) {
         fprintf(stderr, "[chain] qwen38: the host's step refused layer %d's experts\n", i);
         return 0;
+    }
+    if (!nmiss) memset(ch->host_routed, 0, (size_t)n * H * sizeof(float));
+    if (npc) {
+        double tp = now_s();
+        int fg, fd;
+        if (!qt_chain_layer_format(i, &fg, &fd) || fg < 100 || fd < 100) {
+            fprintf(stderr, "[chain] qwen38: layer %d's pooled experts have no block types for the CPU\n", i);
+            return 0;
+        }
+        const int I = c->inter, tg = fg - 100, td = fd - 100;
+        if (ch->pc_cap < npc) {
+            free(ch->pc_gu); free(ch->pc_hh); free(ch->pc_dn);
+            ch->pc_gu = malloc((size_t)npc * 2 * I * sizeof(float)); ch->pc_hh = malloc((size_t)npc * I * sizeof(float));
+            ch->pc_dn = malloc((size_t)npc * H * sizeof(float));
+            ch->pc_cap = ch->pc_gu && ch->pc_hh && ch->pc_dn ? npc : 0;
+            if (!ch->pc_cap) { fprintf(stderr, "[chain] qwen38: no memory for the CPU's pool slots\n"); return 0; }
+        }
+        const uint8_t *gp[Q38CC_DM_ROWS * 32]; const float *xp[Q38CC_DM_ROWS * 32];
+        for (int p = 0; p < npc; p++) {
+            const int a = pa[p]; const char *g = q38cc_pool_host(ch, i * E + ids[a]);
+            if (!g) { fprintf(stderr, "[chain] qwen38: layer %d's expert %d has no place in the host pool\n", i, ids[a]); return 0; }
+            gp[p] = (const uint8_t *)g; xp[p] = x + (size_t)(a / K) * H;
+        }
+        if (!q38cc_pool_pairs(gp, xp, npc, H, I, tg, td, ch->pc_gu, ch->pc_hh, ch->pc_dn)) {
+            fprintf(stderr, "[chain] qwen38: the CPU's pool slots of layer %d failed\n", i);
+            return 0;
+        }
+        for (int p = 0; p < npc; p++) {   /* after the misses, in rank order within a row */
+            const int a = pa[p]; float *ys = ch->host_routed + (size_t)(a / K) * H; const float *o = ch->pc_dn + (size_t)p * H, wv = w[a];
+            for (int d = 0; d < H; d++) ys[d] += wv * o[d];
+        }
+        ch->pc_pairs += (unsigned long long)npc; ch->pc_ms += (now_s() - tp) * 1e3;
     }
     memcpy(cc_ptr(ch->dm_hy), ch->host_routed, (size_t)n * H * sizeof(float));
     __sync_synchronize();   /* the rows (write-combined memory) before the word */
@@ -1355,6 +1522,99 @@ static int q38cc_frame_begin(Q38CChain *ch) {
     return cc_begin();
 }
 
+/* ---- a long prompt layer by layer (qwen38_chain.h's q38c_forward_lm, on CUDA) ----------
+ * A prompt of more chunks than one staged every layer's host pool experts once a chunk.
+ * Where every layer runs its experts in the frame (no hybrid layer) and a chunk stages them,
+ * the prompt runs layer by layer: each layer's chunks in order, its experts' copy waited for
+ * at its first chunk and the next staged layer's copy started after its last, every row's
+ * streams on the device between layers (hyper_all), each layer's chunk a frame waited for
+ * (the host's tables it writes and its K/V rows down are a chunk's, each chunk the bits it
+ * gets chunk by chunk). The promotions' books wait for the decode. COLI_CUDA_CHAIN_LAYERWISE:
+ * 0 chunk by chunk. */
+/* layer i's routed experts for one chunk of a prompt run layer by layer: wait for the layer's
+ * copy at its first chunk (first), start the next staged layer's after its last (last) */
+static int q38cc_dm_layer_lm(Q38CChain *ch, Model *m, Layer *l, int i, int n, int first, int last) {
+    Cfg *c = &m->c; int H = c->hidden, E = c->experts, K = c->topk, io = i * ch->rows * K;
+    CcBuf *tab = ch->dm_tabb;
+    int stg = ch->dm_frn[i] > 0;
+    CcRoute rp = {n, E, K, 0, 0, E, 0, 0, io, K, io, K, 1, 1, c->norm_topk ? 1 : 0, 1.f, 1.f, 0.f};
+    CcMoe mp = {n, K, H, c->inter, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, H, io, K, io, K, 0, H, -1, E, 0, 0};
+    if (ch->dm_fmt >= 100) qt_chain_layer_format(i, &mp.fmt, &mp.fmt_d);
+    int ok = cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->dm_ids, ch->dm_w, &rp) &&
+             cc_copy(ch->dm_idsd, io, ch->dm_ids, io, (size_t)n * K) && cc_copy(ch->dm_wd, io, ch->dm_w, io, (size_t)n * K);
+    ok = ok && q38cc_shared(ch, m, l, i, n) && (!stg || !first || cc_fetch_wait()) &&
+         cc_moe(tab, ch->mixed, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, NULL, &mp);
+    if (ok && stg && last) ok = cc_fetch_done() && q38cc_stage_from(ch, m, i + 1);
+    CcMoe ms = mp; ms.parts = 2; ms.h_off = -1;
+    ok = ok && cc_moe(tab, NULL, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, ch->dm_hy, &ms);
+    ch->dm_steps++;
+    return ok;
+}
+/* 1 done, 0 declined before any layer ran, -1 lost */
+static int q38cc_forward_lm(Model *m, Q38CChain *ch, const int *ids, int S, int pos_base, int nlogits,
+                            const float *hyper_h, float *logit, int rows) {
+    Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, L = c->layers, E = c->experts, V = c->vocab, K = c->topk;
+    int half = c->rotary_dim / 2;
+    if (!q38cc_dm_begin(ch, m, rows)) return cc_lost() ? -1 : 0;
+    if (q38cc_dm_tab(ch, rows) != ch->dm_tabb) return 0;   /* nothing stages: the chunks read it either way */
+    for (int i = 0; i < L; i++) if (ch->dm_part[i]) return 0;   /* a hybrid layer: the chunks' host steps */
+    const int SEG = (q38cc_lm_rows() / rows > 0 ? q38cc_lm_rows() / rows : 1) * rows, seg = S < SEG ? S : SEG;
+    if (!cc_reserve(&ch->hyper_all, (size_t)seg * W * 4, CC_DEV)) return 0;
+    float *cs_all = half ? malloc((size_t)S * half * 2 * sizeof(float)) : NULL;   /* every row's angles, once */
+    if (half && !cs_all) return 0;
+    for (int r = 0; half && r < S; r++) for (int j = 0; j < half; j++) {
+        float ang = (float)(pos_base + r) / powf(c->theta, (float)(2 * j) / c->rotary_dim);
+        cs_all[((size_t)r * half + j) * 2] = cosf(ang); cs_all[((size_t)r * half + j) * 2 + 1] = sinf(ang);
+    }
+    for (int g0 = 0; g0 < S; g0 += SEG) {   /* a segment: its rows' streams up, the first staged layer's copy */
+        int gn = S - g0 < SEG ? S - g0 : SEG;
+        if (!q38cc_frame_begin(ch) || !cc_write(ch->hyper_all, 0, hyper_h + (size_t)g0 * W, (size_t)gn * W * 4) ||
+            !q38cc_push_state(ch, m, pos_base + g0) || !q38cc_stage_from(ch, m, 0)) { free(cs_all); return -1; }
+        for (int i = 0; i < L; i++) {
+            Layer *l = &m->L[i];
+            for (int c0 = g0; c0 < g0 + gn; c0 += rows) {
+                int n = g0 + gn - c0 < rows ? g0 + gn - c0 : rows, pb = pos_base + c0;
+                if (!q38cc_frame_begin(ch)) { free(cs_all); return -1; }
+                if (half) memcpy(cc_ptr(ch->cs), cs_all + (size_t)c0 * half * 2, (size_t)n * half * 2 * sizeof(float));
+                int ok = cc_copy(ch->hyper, 0, ch->hyper_all, (size_t)(c0 - g0) * W, (size_t)n * W);
+                if (ok && i == c->ple_layer) { q38cc_ple_rows(m, ids, c0, n, ch->host_emb); ok = q38cc_ple(ch, m, n, c0, 0); }
+                ok = ok && q38cc_gr_read(ch, m, &l->attn_gr, ch->o_an[i], n, ch->inj_a);
+                ok = ok && (c->is_attn[i] ? q38cc_attention(ch, m, l, i, n, pb) : q38cc_deltanet(ch, m, l, i, n, c0, 0));
+                ok = ok && q38cc_gr_apply(ch, m, ch->inj_a, n);
+                ok = ok && q38cc_gr_read(ch, m, &l->mlp_gr, ch->o_mn[i], n, ch->inj_m);
+                ok = ok && q38cc_dm_layer_lm(ch, m, l, i, n, c0 == g0, c0 + n >= g0 + gn) && q38cc_moe_apply(ch, m, n, ch->dm_y);
+                ok = ok && cc_copy(ch->hyper_all, (size_t)(c0 - g0) * W, ch->hyper, 0, (size_t)n * W);
+                int lo0 = S - nlogits > c0 ? S - nlogits - c0 : 0, lo_n = n - lo0;
+                if (ok && i == L - 1 && lo0 < n && c0 + n > S - nlogits) {
+                    int dst = c0 + lo0 - (S - nlogits);
+                    ok = q38cc_gr_read(ch, m, &m->final_gr, ch->o_fn, n, NULL) &&
+                         cc_matmul(q38cc_t(ch, &m->lm_head), ch->mixed, (size_t)lo0 * H, ch->outd, (size_t)dst * V, lo_n);
+                }
+                double t0 = now_s();
+                ok = ok && cc_submit(1);   /* the frame's stream: the next staged layer's copy goes on beside the next frames */
+                m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0; ch->wait_ms += (now_s() - t0) * 1e3;
+                if (!ok) { free(cs_all); return -1; }
+                /* layer i's books for these rows (q38cc_dm_books' for one layer) */
+                q38cc_kv_down(ch, m, i, n, pb);
+                const int *idv = (const int *)cc_ptr(ch->dm_idsd) + (size_t)i * ch->rows * K;
+                for (int s = 0; s < n; s++) { rt_count(i, idv + s * K, K); if (!ch->own) qt_chain_count(i, idv + s * K, K); }
+                for (int j = 0; j < n * K; j++) if (idv[j] >= 0) {
+                    q38_ehit_mark(m, i, idv[j]);
+                    ch->routes++;
+                    if (ch->dm_res[(size_t)i * E + idv[j]] >= 2) ch->pool_reads++;
+                }
+                if (c->is_attn[i]) ch->kv_valid[i] = pb + n;
+                ch->dn_where = Q38CC_DEV; ch->host_zero = 0;
+            }
+        }
+    }
+    free(cs_all);
+    if (!cc_finish()) return -1;
+    memcpy(logit, cc_ptr(ch->outd), (size_t)nlogits * V * sizeof(float));
+    ch->lm_forwards++;
+    return 1;
+}
+
 /* Every layer for S rows. hyper_h: the rows' streams in, the final ones out when
  * want_streams; mixed_h (or NULL): every row's final mixed row, for the prefill
  * read-out; logit: the last nlogits rows' logits. 0 = not taken (nothing changed, or
@@ -1380,6 +1640,12 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
     int half = c->rotary_dim / 2;
     int snapped = 0;
     double w0 = ch->wait_ms, h0 = ch->host_ms;
+    if (S > rows && rows > Q38CC_DM_ROWS && E > 0 && ch->dm_on && q38cc_layer_major() && !want_streams && !mixed_h &&
+        m->snap_rows <= 0) {
+        int r = q38cc_forward_lm(m, ch, ids, S, pos_base, nlogits, hyper_h, logit, rows);
+        if (r < 0) goto lost;
+        if (r > 0) { q38cc_dm_end(ch); ch->snap_valid = 0; ch->forwards++; return 1; }
+    }
     for (int c0 = 0; c0 < S; c0 += rows) {
         int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0;
         int ns = m->snap_rows - c0 < n ? m->snap_rows - c0 : n;   /* the rows of this chunk a verify copies */
@@ -1488,9 +1754,16 @@ static void q38cc_report(Model *m) {
         fprintf(stderr, "[chain] qwen38: %llu layer steps with the routed experts in the frame, %llu of them hybrid "
                         "(%llu slots on the host in %.1f ms, %.1f ms waiting for the device's routes), %llu slots from the host pool\n",
                 ch->dm_steps, ch->dm_hyb, ch->dm_pairs, ch->dm_host_ms, ch->dm_spin_ms, ch->pool_reads);
+    if (ch->pc_pairs)
+        fprintf(stderr, "[chain] qwen38: %llu of a decode step's slots from the host pool on the CPU in %.1f ms (%.1f us a slot; "
+                        "COLI_CUDA_CHAIN_POOL_READ=1: the device reads them over the bus)\n",
+                ch->pc_pairs, ch->pc_ms, ch->pc_ms * 1e3 / (double)ch->pc_pairs);
     if (ch->dm_staged)
         fprintf(stderr, "[chain] qwen38: %llu prompt layer steps staged the host pool's experts (%.2f GB copied over the bus)\n",
                 ch->dm_staged, ch->dm_stage_bytes / 1073741824.0);
+    if (ch->lm_forwards)
+        fprintf(stderr, "[chain] qwen38: %llu prompts layer by layer, each layer's host pool experts staged once "
+                        "(COLI_CUDA_CHAIN_LAYERWISE=0: chunk by chunk)\n", ch->lm_forwards);
     if (ch->own)
         fprintf(stderr, "[chain] qwen38: %llu experts promoted to the card (%llu residents back to the pool), %d on their way; "
                         "%llu frames braked, %.1f %% of the routes on the card\n",

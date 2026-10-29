@@ -90,6 +90,7 @@ static struct {
     int nform, per_layer;
     uint8_t lform[VKT_MAX_LAYERS], lcls[VKT_MAX_LAYERS];
     size_t pad_w[2][2], pad_s[2][2];
+    int h_exact; size_t h_bytes, h_max;   /* the host pool's experts at their own forms' sizes (host_init): the average, the largest */
     /* the extra layers' experts: on the primary device, in a pool of their own (another
      * size than the main ones', so neither leaves holes the other cannot use), at most
      * xmax of x_bytes each in x_budget */
@@ -380,8 +381,8 @@ static int upload(int dev, int layer, const uint8_t *g, const uint8_t *u, const 
         int I = k < 2 ? H : F, O = k < 2 ? F : H;
         uint8_t *rows; size_t stride; float *scales;
         if (!(kind ? coli_vk_tier_tensor_extra(&t[k], fmt, I, O, fgs, &rows, &stride, &scales)   /* its own pool */
-                   : coli_vk_tier_tensor_pad(dev, &t[k], fmt, I, O, fgs, pad_w_of(layer, k == 2), pad_s_of(layer, k == 2),
-                                             &rows, &stride, &scales))) {
+                   : coli_vk_tier_tensor_pad(dev, &t[k], fmt, I, O, fgs, dev == 2 && T.h_exact ? 0 : pad_w_of(layer, k == 2),
+                                             dev == 2 && T.h_exact ? 0 : pad_s_of(layer, k == 2), &rows, &stride, &scales))) {
             for (int j = 0; j < k; j++) { coli_vk_tensor_free(t[j]); t[j] = NULL; }
             return 0;
         }
@@ -1644,14 +1645,17 @@ int vkt_stream_prefetch(int layer, int S) {
 }
 
 /* the share of the host pool's experts the device keeps reading over PCIe in a hybrid
- * step (COLI_VK_HYBRID_PCIE, 0..1): a step with several such pairs splits them, so the two
- * sides finish closer together. A pair costs the CPU about 140 us and the device about 150
- * over PCIe (an RTX PRO 4000 and an i5-13500, Qwen3.8 IQ2_XS); decode with the share at 0,
- * 0.3, 0.5, 0.7: 45.3, 46.3, 46.1, 46.0 tok/s, with the MTP head's 3-row verifies 43.8,
- * 45.9, 45.0, 43.9. */
+ * step (COLI_VK_HYBRID_PCIE, 0..1; 0: the CPU computes every one). The CPU's rows by eight
+ * (ggml_quants.h gq_rows_f8) read the pool at its memory's speed, faster than the device
+ * reads it over PCIe, and a step's few pairs split by a hash leave the device the slower
+ * side on the steps that drew two of them. An RTX PRO 4000 (PCIe 4.0 x8) and an i5-13500,
+ * warm 400-token answers, the share at 0.3 against 0: Flint UD-Q3_K_XL with 7.4 GB of the
+ * card 44.6 against 49.4 tok/s (0.15 47.5, 0.45 40.8), with 12 GB 51.6 against 56.2;
+ * Qwen3.6-35B-A3B Q4_K_M 47.7 against 55.5 and 71.3 against 74.4; Qwen3.8 IQ2_XS on the
+ * whole card 49.1 against 49.0 (0.15 48.8). */
 static double hybrid_pcie_share(void) {
     static double f = -1;
-    if (f < 0) { const char *e = getenv("COLI_VK_HYBRID_PCIE"); f = e && *e ? atof(e) : 0.3; if (f < 0) f = 0; if (f > 1) f = 1; }
+    if (f < 0) { const char *e = getenv("COLI_VK_HYBRID_PCIE"); f = e && *e ? atof(e) : 0; if (f < 0) f = 0; if (f > 1) f = 1; }
     return f;
 }
 /* The device formats the CPU computes from the host pool's rows: a GGUF's block types, and
@@ -1938,14 +1942,25 @@ static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, in
             #pragma omp atomic write
             err = 2;
         }
-        #pragma omp for schedule(dynamic, 32)
-        for (int64_t r = 0; r < (int64_t)ng * 2 * I; r++) {
+        /* a group's rows by eight (gq_rows_f8) where the type has the kernel, one by one where
+         * not or where eight would cross gate into up; 32 rows a grab as before */
+        const int cgu = (2 * I + 7) / 8, cd = (D + 7) / 8;
+        #pragma omp for schedule(dynamic, 4)
+        for (int64_t c = 0; c < (int64_t)ng * cgu; c++) {
             if (!tmp) continue;
-            const int g = (int)(r / (2 * I)), o = (int)(r % (2 * I)), q0 = gs[g]; const VktHostExpert *h = hx[ord[q0]];
-            const int oo = o < I ? o : o - I;
-            const uint8_t *row = (o < I ? h->g : h->u) + (size_t)oo * h->rgu;
-            const float *rs = h->tg < 0 ? (o < I ? h->sg : h->su) + (size_t)oo * (h->gsgu ? (D + h->gsgu - 1) / h->gsgu : 1) : NULL;
-            host_rows(gu + (size_t)q0 * 2 * I + o, 2 * I, &ag[g], xo + q0, row, h->tg, D, tmp, rs, h->gsgu);
+            const int g = (int)(c / cgu), o0 = (int)(c % cgu) * 8, o1 = o0 + 8 < 2 * I ? o0 + 8 : 2 * I, q0 = gs[g];
+            const VktHostExpert *h = hx[ord[q0]];
+            if (o1 - o0 == 8 && (o1 <= I || o0 >= I) && h->tg >= 0 && gq_f8_ok(h->tg, D)) {
+                const int oo = o0 < I ? o0 : o0 - I;
+                gq_rows_f8(gu + (size_t)q0 * 2 * I + o0, 2 * I, &ag[g], (o0 < I ? h->g : h->u) + (size_t)oo * h->rgu, (int64_t)h->rgu, h->tg, D, 8);
+                continue;
+            }
+            for (int o = o0; o < o1; o++) {
+                const int oo = o < I ? o : o - I;
+                const uint8_t *row = (o < I ? h->g : h->u) + (size_t)oo * h->rgu;
+                const float *rs = h->tg < 0 ? (o < I ? h->sg : h->su) + (size_t)oo * (h->gsgu ? (D + h->gsgu - 1) / h->gsgu : 1) : NULL;
+                host_rows(gu + (size_t)q0 * 2 * I + o, 2 * I, &ag[g], xo + q0, row, h->tg, D, tmp, rs, h->gsgu);
+            }
         }
         #pragma omp for schedule(static)
         for (int q = 0; q < np; q++) {
@@ -1963,12 +1978,19 @@ static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, in
                 #pragma omp atomic write
                 err = 1;
             }
-        #pragma omp for schedule(dynamic, 64)
-        for (int64_t r = 0; r < (int64_t)ng * D; r++) {
+        #pragma omp for schedule(dynamic, 8)
+        for (int64_t c = 0; c < (int64_t)ng * cd; c++) {
             if (!tmp) continue;
-            const int g = (int)(r / D), o = (int)(r % D), q0 = gs[g]; const VktHostExpert *h = hx[ord[q0]];
-            const float *rs = h->td < 0 ? h->sd + (size_t)o * (h->gsd ? (I + h->gsd - 1) / h->gsd : 1) : NULL;
-            host_rows(dy + (size_t)q0 * D + o, D, &ah[g], ho + q0, h->d + (size_t)o * h->rd, h->td, I, tmp, rs, h->gsd);
+            const int g = (int)(c / cd), o0 = (int)(c % cd) * 8, o1 = o0 + 8 < D ? o0 + 8 : D, q0 = gs[g];
+            const VktHostExpert *h = hx[ord[q0]];
+            if (o1 - o0 == 8 && h->td >= 0 && gq_f8_ok(h->td, I)) {
+                gq_rows_f8(dy + (size_t)q0 * D + o0, D, &ah[g], h->d + (size_t)o0 * h->rd, (int64_t)h->rd, h->td, I, 8);
+                continue;
+            }
+            for (int o = o0; o < o1; o++) {
+                const float *rs = h->td < 0 ? h->sd + (size_t)o * (h->gsd ? (I + h->gsd - 1) / h->gsd : 1) : NULL;
+                host_rows(dy + (size_t)q0 * D + o, D, &ah[g], ho + q0, h->d + (size_t)o * h->rd, h->td, I, tmp, rs, h->gsd);
+            }
         }
         free(tmp);
     }
@@ -2367,6 +2389,22 @@ static size_t tier_expert_bytes_at(size_t a) {
                                   (unsigned long long)(n[0] + n[1])) : room[0];
 }
 
+/* One main expert's bytes at its own layer's form (no room of a bigger one), on average over
+ * the layers, and the largest (*mx): a host pool that holds every expert and so frees none
+ * (host_init) keeps them at these sizes. */
+static size_t tier_expert_bytes_own(size_t a, size_t *mx) {
+    const int H = T.c.hidden, F = T.c.inter;
+    unsigned long long sum = 0; size_t big = 0;
+    for (int l = 0; l < T.main_layers; l++) {
+        const __typeof__(T.form[0]) *fm = &T.form[form_of(l)];
+        size_t sg, sd, wg = coli_vk_tensor_alloc_bytes(fm->gu_fmt, H, F, fm->gu_gs, &sg), wd = coli_vk_tensor_alloc_bytes(fm->dn_fmt, F, H, fm->dn_gs, &sd);
+        const size_t b = 2 * ((wg + a - 1) / a * a + (sg + a - 1) / a * a) + (wd + a - 1) / a * a + (sd + a - 1) / a * a;
+        sum += b; if (b > big) big = b;
+    }
+    *mx = big;
+    return T.main_layers ? (size_t)((sum + (unsigned long long)T.main_layers - 1) / (unsigned long long)T.main_layers) : 0;
+}
+
 /* COLI_VK_DEV2: the second device's share. Its budget is what it has free less
  * COLI_VK_RESERVE2_GB (0.5 GiB: its batch's scratch, the driver), an integrated GPU's a
  * quarter of what the RAM leaves (as the primary's), capped by COLI_VK_EXPERTS2 experts
@@ -2469,7 +2507,7 @@ static void host_init(long long all) {
         snprintf(hl, sizeof hl, "; %s of RAM left for the KV and state the engine allocates later",
                  human((double)T.c.ram_later, x, sizeof x));
     }
-    size_t blk = coli_vk_block_bytes((size_t)256 << 20);
+    size_t blk = (size_t)256 << 20;   /* the host pool's blocks (system RAM: no device cap shrinks them) */
     if (want < (double)T.exp_bytes || blk < T.exp_bytes) {
         if (hh[0]) fprintf(stderr, VKT_TAG " tier %s: host pool off: the driver leaves %s of system RAM for the device\n", T.engine, hh);
         else if (hl[0]) fprintf(stderr, VKT_TAG " tier %s: host pool off: no room past the RAM it leaves (%s)\n", T.engine, hl + 2);
@@ -2484,7 +2522,17 @@ static void host_init(long long all) {
      * experts over the bus. COLI_VK_TIER_PROMOTE=0 keeps that set, =n sets the rate. */
     const char *pe = getenv("COLI_VK_TIER_PROMOTE");
     int rate = pe && *pe ? atoi(pe) : 32;
+    /* A pool that holds every expert frees none (promote moves the device's copies), so its
+     * experts need not the room of a bigger form's: with forms by layer it keeps each at its
+     * own (h_exact), a block's end losing at most the largest. Flint UD-Q3_K_XL: 24.50 GiB in
+     * rooms, 18.5 GB of experts. */
+    size_t hmax = T.exp_bytes, hx = T.per_layer ? tier_expert_bytes_own(coli_vk_buffer_alignment(), &hmax) : T.exp_bytes;
+    if (rate > 0 && !T.d2 && T.per_layer && hx && hx < T.exp_bytes && blk >= hmax) {
+        const long long fx = (long long)(full * ((blk - hmax) / hx + 1) + rest / hx);
+        if (fx >= all) { T.h_exact = 1; T.h_bytes = hx; T.h_max = hmax; fit = fx; }
+    }
     T.full = rate > 0 && !T.d2 && fit >= all;
+    if (!T.full) T.h_exact = 0;
     /* Short of every expert the device leaves: the CPU computes the rest from the engine's
      * RAM caches, which were sized from the same free RAM. Their least (ram_floor) comes out of
      * the pool's room and the pool's bytes out of them (ram_given); an engine that cannot lower
@@ -2503,10 +2551,11 @@ static void host_init(long long all) {
     long long held = T.full ? all : fit < left ? fit : left;
     if (held < 1) { T.full = 0; return; }
     if (fit > left) fit = left;
-    /* the blocks those experts take: whole blocks of blk / exp_bytes, the last one partly */
-    long long per = (long long)(blk / T.exp_bytes), nb = (held + per - 1) / per;
+    /* the blocks those experts take: whole blocks of blk / exp_bytes, the last one partly
+     * (h_exact: of (blk - the largest) / the average and one, every one at its own size) */
+    long long per = T.h_exact ? (long long)((blk - T.h_max) / T.h_bytes + 1) : (long long)(blk / T.exp_bytes), nb = (held + per - 1) / per;
     size_t lim = (size_t)nb * blk;
-    if (held < per) lim = (size_t)held * T.exp_bytes + 4096;
+    if (held < per) lim = (size_t)held * (T.h_exact ? T.h_bytes : T.exp_bytes) + (T.h_exact ? T.h_max : 0) + 4096;
     coli_vk_tier_pool_limit_dev(2, lim);
     T.dmax[2] = (int)fit; T.max_resident += (int)fit; T.h_budget = lim;
     T.promote_rate = T.full ? rate : 0;
@@ -2526,6 +2575,94 @@ static void host_init(long long all) {
 
 int vkt_host_pool_on(void) { return T.on && T.dmax[2] > 0; }
 size_t vkt_stage_room(void) { return vkt_host_pool_on() ? T.stage_room : 0; }
+
+/* vkt_give_back: whole blocks of the tier's pool on the primary device, the coldest first (the
+ * scores of the residents with a range in each; an empty one first of all), until they hold
+ * `bytes`. Their residents go back to their host pool copies (T.full: the hybrid steps compute
+ * them on the CPU, as promote's victims) or out of the tier; then dmax and the pool's limit
+ * drop by what left, which releases the emptied blocks to the driver. The uploader is let
+ * finish first, so no copy is landing in a block being emptied. */
+#ifndef VKT_NO_GIVE_BACK
+static int gb_cmp_heat(const void *a, const void *b) {
+    const double *h = (const double *)a, *k = (const double *)b;   /* {heat, index} pairs */
+    return h[0] < k[0] ? -1 : h[0] > k[0] ? 1 : (h[1] < k[1] ? -1 : h[1] > k[1]);
+}
+#endif
+size_t vkt_give_back(size_t bytes) {
+#ifdef VKT_NO_GIVE_BACK
+    (void)bytes; return 0;
+#else
+    if (!T.on || !bytes || T.inflight) return 0;
+    pthread_mutex_lock(&T.mx);
+    while ((T.qn || T.busy) && T.th_on && !T.stop) pthread_cond_wait(&T.cv_done, &T.mx);
+    pthread_mutex_unlock(&T.mx);
+    quiesce();
+    if (T.inflight || T.nevict || T.ndfree) return 0;
+    const int nb = coli_vk_tier_pool_blocks(NULL, 0);
+    if (nb <= 0) return 0;
+    uint64_t *bb = calloc((size_t)nb, sizeof *bb); double *hp = calloc((size_t)nb, 2 * sizeof *hp); uint8_t *pick = calloc((size_t)nb, 1);
+    if (!bb || !hp || !pick) { free(bb); free(hp); free(pick); return 0; }
+    coli_vk_tier_pool_blocks(bb, nb);
+    const size_t n = (size_t)T.c.layers * T.c.experts;
+    for (int k = 0; k < nb; k++) { hp[2 * k] = 0; hp[2 * k + 1] = k; }
+    for (size_t i = 0; i < n; i++) {
+        VSlot *v = &T.s[i];
+        if (v->state != VS_RESIDENT || v->dev != 0 || !v->ex || v->host || kind_of((int)(i / T.c.experts))) continue;
+        int blk[6], m = coli_vk_xb_expert_blocks(v->ex, blk, 6);
+        for (int j = 0; j < m; j++) if (blk[j] >= 0 && blk[j] < nb) hp[2 * blk[j]] += 1.0 + (double)score(v);
+    }
+    qsort(hp, (size_t)nb, 2 * sizeof *hp, gb_cmp_heat);
+    uint64_t got = 0;
+    for (int q = 0; q < nb && got < bytes; q++) { const int k = (int)hp[2 * q + 1]; if (bb[k]) { pick[k] = 1; got += bb[k]; } }
+    int moved = 0, out = 0;
+    for (size_t i = 0; i < n && got; i++) {
+        VSlot *v = &T.s[i];
+        if (v->state != VS_RESIDENT || v->dev != 0 || !v->ex || v->host || kind_of((int)(i / T.c.experts))) continue;
+        int blk[6], m = coli_vk_xb_expert_blocks(v->ex, blk, 6), hit = 0;
+        for (int j = 0; j < m; j++) hit |= blk[j] >= 0 && blk[j] < nb && pick[blk[j]];
+        if (!hit) continue;
+        if (T.full && v->hex && v->hex != v->ex) {   /* to its host pool copy, as promote's victim */
+            if (T.ndfree == T.cdfree) {
+                int nc = T.cdfree ? 2 * T.cdfree : 64;
+                ColiVkExpert **g = realloc(T.dfree, (size_t)nc * sizeof(*g));
+                if (!g) continue;
+                T.dfree = g; T.cdfree = nc;
+            }
+            T.dfree[T.ndfree++] = v->ex;
+            v->ex = v->hex; v->host = 1; T.dres[0]--; T.dres[2]++; moved++;
+        } else {   /* out of the tier: the engine's CPU path has it */
+            if (T.nevict == T.cevict) {
+                int nc = T.cevict ? 2 * T.cevict : 64;
+                int *g = realloc(T.evict, (size_t)nc * sizeof(int));
+                if (!g) continue;
+                T.evict = g; T.cevict = nc;
+            }
+            v->state = VS_EVICT; T.resident--; T.dres[0]--;
+            T.evict[T.nevict++] = (int)i; out++;
+        }
+        T.evictions++;
+        note_change((int)i);
+    }
+    free(hp);
+    const int drop = T.dmax[0] - (T.dres[0] + T.dque[0]);
+    if (drop > 0) { T.dmax[0] -= drop; T.max_resident -= drop; }
+    pthread_mutex_lock(&T.mx); T.evict_pending = T.nevict + T.ndfree; pthread_mutex_unlock(&T.mx);
+    quiesce();   /* nothing in flight: the device copies freed, the changes published */
+    ColiVkPoolStats st; coli_vk_pool_stats(1, &st);
+    const uint64_t base = st.limit ? st.limit : st.total;
+    coli_vk_tier_pool_limit(base > got + 4096 ? (size_t)(base - got) : 4096);   /* releases the emptied blocks */
+    uint64_t *now = calloc((size_t)nb, sizeof *now), gave = 0;
+    if (now) { coli_vk_tier_pool_blocks(now, nb); for (int k = 0; k < nb; k++) if (pick[k] && !now[k]) gave += bb[k]; }
+    free(now); free(pick); free(bb);
+    T.budget = T.budget > gave ? T.budget - (size_t)gave : 0;
+    coli_vk_pool_stats(1, &st);
+    char hb[32], hc[32];
+    fprintf(stderr, VKT_TAG " tier %s: %s of device memory back for the dense chain (%d experts to the host pool, %d out of the tier; "
+            "the tier's pool now %s in %d blocks)\n", T.engine, human((double)gave, hb, sizeof hb), moved, out,
+            human((double)st.total, hc, sizeof hc), st.blocks);
+    return (size_t)gave;
+#endif
+}
 
 int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (T.on || !cfg) return 0;

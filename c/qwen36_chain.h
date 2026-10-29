@@ -97,8 +97,11 @@ typedef struct {
     int lo, d;                                 /* its layers start at lo, on device d (vkc_device) */
     int n, head;                               /* layers lo..lo+n-1 on the device; lm_head there too */
     int rows;                                  /* scratch capacity in rows */
-    int cap;                                   /* the host's kv_cap the mirrors follow */
+    int cap;                                   /* positions the mirrors hold (q36c_mirror: grown with the context, at most kv_cap) */
+    int host_cap;                              /* the host's kv_cap when they were planned (its sliding layers' form) */
+    size_t keep;                               /* the device memory a mirror of Q36C_KV_START positions leaves free (q36c_mirror) */
     int dev_rows;                              /* device KV rows a layer: cap, or the split's */
+    int kvh, kvh_set;                          /* the mirrors in float16 (q36c_kvh_want), decided at the first */
     VkcKvSplit ks;                             /* the split past the device's budget (ks.on) */
     VkcBuf *prm;                               /* every norm / conv / DeltaNet parameter */
     size_t *o_in, *o_post, *o_qn, *o_kn, *o_conv, *o_dn, o_final;
@@ -590,14 +593,15 @@ static void q36c_place(Model *m) {
 /* Prompt rows per chunk (vkc_chunk_rows): the chain's scratch a row, counted from the
  * reservations themselves, and the routed experts' outputs (the tier's rows, the
  * CPU's contributions, and the host's sum) for it. */
-static int q36c_chunk_rows(Q36Chain *ch, Model *m) {
+static size_t q36c_chunk_row_bytes(Q36Chain *ch, Model *m) {
     g_q36c_count = 0; q36c_bufs(ch, m, 1); long long b1 = g_q36c_count;
     g_q36c_count = 0; q36c_bufs(ch, m, 2); long long b2 = g_q36c_count;
     g_q36c_count = -1;
     size_t row = (size_t)(b2 - b1) + (size_t)(m->c.n_experts > 0 ? 2 * m->c.topk + 1 : 0) * m->c.hidden * sizeof(float);
     if (ch->ks.on) row += (long long)m->c.q_heads * (3 * (m->c.head_dim + 2) + m->c.q_head_dim) * sizeof(float);
-    return vkc_chunk_rows("qwen36", row);
+    return row;
 }
+static int q36c_chunk_rows(Q36Chain *ch, Model *m) { return vkc_chunk_rows("qwen36", q36c_chunk_row_bytes(ch, m)); }
 
 /* the scratch buffers for `rows` rows */
 static int q36c_bufs(Q36Chain *ch, Model *m, int rows) {
@@ -625,15 +629,44 @@ static int q36c_bufs(Q36Chain *ch, Model *m, int rows) {
     if (ok && c->muse)
         ok = q36c_res(&ch->agb, r * AG, VKC_DEV) && q36c_res(&ch->lat, r * LT, VKC_DEV) && q36c_res(&ch->latd, r * LT, VKC_DOWN);
     if (ok && m->kv_ring)   /* the sliding layers' rings: a long step's window, linear (the window's rows before it and its own) */
-        ok = q36c_res(&ch->kg, (r + c->window) * kvo, VKC_DEV) && q36c_res(&ch->vg, (r + c->window) * kvo, VKC_DEV);
+        ok = q36c_res(&ch->kg, (r + c->window) * kvo, VKC_DEV) && q36c_res(&ch->vg, (r + c->window) * kvo, VKC_DEV);   /* floats: a float16 mirror's fit */
     return ok;
+}
+/* The mirrors in float16 where the host's cache is (q36_kv16) and the device reads one
+ * (vkc_kvh_ready): the host's numbers in half the memory and half a decode step's reads after
+ * a long prompt. One conversation's chain only (the places of KV_SLOTS share buffers with it),
+ * and while its mirror does not split (chain_kvs reads float32: q36c_mirror goes back to
+ * float32 when a plan splits). COLI_VK_KV16=0 keeps float32. */
+static int q36c_kvh_want(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_KV16"); on = !(e && *e == '0'); }
+    return on && q36_kv16() && g_q36_mux_slots <= 1 && !getenv("COLI_VK_CHAIN_MUX") && vkc_kvh_ready();
+}
+static size_t q36c_kves(const Q36Chain *ch) { return ch && ch->kvh ? 2 : sizeof(float); }
+/* a step's float32 K or V rows into a mirror */
+static int q36c_kv_put(const Q36Chain *ch, VkcBuf *dst, VkcBuf *src, const VkcRegion *r, int n) {
+    return ch->kvh ? vkc_copy_regions_h(dst, src, r, n) : vkc_copy_regions(dst, src, r, n);
+}
+/* a mirror's rows into another of its type (r in its elements; a float16 mirror's even, copied as
+ * floats two halves each: r is changed) */
+static int q36c_kv_copy(const Q36Chain *ch, VkcBuf *dst, VkcBuf *src, VkcRegion *r, int n) {
+    if (ch->kvh) for (int k = 0; k < n; k++) { r[k].dst /= 2; r[k].src /= 2; r[k].n /= 2; }
+    return vkc_copy_regions(dst, src, r, n);
+}
+static int q36c_attn_c(const Q36Chain *ch, VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, const VkcAttn *a) {
+    return ch->kvh ? vkc_attn_h(q, kc, vc, o, gate, NULL, a) : vkc_attn(q, kc, vc, o, gate, NULL, a);
+}
+static int q36c_attn_wc(const Q36Chain *ch, VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *snk, const VkcAttnW *w) {
+    return ch->kvh ? vkc_attn_wh(q, kc, vc, o, gate, NULL, snk, w) : vkc_attn_w(q, kc, vc, o, gate, NULL, snk, w);
 }
 /* A sliding layer's mirror is a ring of the host's rows (q36_kv_rows), position t in row
  * t % ring on both sides; 0 for a full layer. */
 static int q36c_ring(Model *m, int i) { return q36_kv_rows(m, i) != m->max_t ? m->kv_ring : 0; }
-/* n of the host's K or V elements from idx (q36_kv_es() bytes each, q36_kv16) into a float32
- * mirror at float offset at: float16 widens to the floats it holds, which are the device's */
-static int q36c_kv_up(VkcBuf *dst, size_t at, const void *base, int64_t idx, size_t n) {
+/* n of the host's K or V elements from idx (q36_kv_es() bytes each, q36_kv16) into a mirror at
+ * element offset at: a float16 mirror (h16) takes the host's halves as they are (at and n even),
+ * a float32 one the floats they hold */
+static int q36c_kv_up(int h16, VkcBuf *dst, size_t at, const void *base, int64_t idx, size_t n) {
+    if (h16) return vkc_write(dst, at / 2, (const uint16_t *)base + idx, n * 2);
     if (!q36_kv16()) return vkc_write(dst, at, (const float *)base + idx, n * sizeof(float));
     float *f = malloc(n * sizeof(float));
     if (!f) return 0;
@@ -649,45 +682,115 @@ static int q36c_kv_up(VkcBuf *dst, size_t at, const void *base, int64_t idx, siz
  * leaves it free (VktConfig.chain_bytes). Before, Flint int4 at 32K of context mirrored
  * 6.6 GB beside a tier that had left 1 GiB, and its chain ran only with
  * COLI_VK_TIER_RESERVE_GB=12. */
+#define Q36C_CONV_ROWS 2048
+#define Q36C_KV_START 8192   /* the positions the tier leaves the mirror at the start (q36c_mirror grows past them) */
 static size_t q36c_late_bytes(Model *m, int ctx) {
     Cfg *c = &m->c;
     if (ctx < 1 || !(c->win_layer || c->attn_sinks)) return 0;
     int R = q36_ring_for(c, ctx), hi = g_q36c_fit_on ? g_q36c_fit.n : c->n_layers;
-    size_t row = (size_t)c->kv_heads * c->k_head_dim * 2 * sizeof(float), kv = 0, half = vkc_dev_avail() / 2;
+    size_t row = (size_t)c->kv_heads * c->k_head_dim * 2 * sizeof(float), kv = 0, half = vkc_dev_avail() / 2;   /* as float32 (q36cc_mirror_at) */
     for (int i = 0; i < hi && i < c->n_layers; i++)
         if (c->is_attn[i]) kv += row * (size_t)(R && c->win_layer && c->win_layer[i] ? R : ctx);
     return kv > half ? half : kv;
 }
-/* Plan and allocate the KV mirror before sizing a prompt chunk. */
-static int q36c_mirror(Q36Chain *ch, Model *m) {
+/* Plan and allocate the KV mirror before sizing a prompt chunk: positions [0, need) of the one
+ * conversation the chain holds. The mirror grows with the context to what the step needs and
+ * an eighth more (1024 at least), rounded to 1024, at most the context, its rows again from
+ * the host. Doubling gave the tier's experts back for positions no step reached: to 32768
+ * positions for a 17.6K-token prompt (1.2 GiB of Qwen3.6's), and to 32768 at the first token
+ * after an 18K prompt (256 MiB of them; decode 55.5 tok/s against 75.5 after 1K tokens on an
+ * RTX PRO 4000). A growth uploads the rows again: 0.8 GB at 20K positions, once every few
+ * thousand tokens. A device without the room takes it from the expert tier (vkt_give_back),
+ * which reserved only the start (q36c_late_bytes at Q36C_KV_START). Before, the mirror took
+ * the host's whole capacity at the first forward: 2.79 GiB of an 8 GB card for Flint at 64K
+ * of context, whose tier then held 1.41 GiB of experts against 3.67 at 8K (decode 43.1
+ * against 49.4 tok/s on an RTX PRO 4000 at 7.4 GB). */
+#define Q36C_KV_MARGIN ((size_t)256 << 20)
+static int q36c_mirror(Q36Chain *ch, Model *m, int need) {
     Cfg *c = &m->c; int KV = c->kv_heads;
-    if (ch->cap != m->kv_cap) {        /* the host cache grew: mirror it again (whole, or split past the budget) */
-        size_t row = (size_t)KV * c->k_head_dim * 2 * sizeof(float);
-        /* the rings counted at their rows, as that many layers of the cache's length */
-        int nf = 0, nr = 0;
-        for (int i = ch->lo; i < ch->lo + ch->n; i++) if (c->is_attn[i]) { if (q36c_ring(m, i)) nr++; else nf++; }
-        int leq = nf + (nr ? (int)(((size_t)nr * m->kv_ring + m->kv_cap - 1) / m->kv_cap) : 0);
-        size_t held = 0;
-        for (int i = ch->lo; i < ch->lo + ch->n; i++) if (c->is_attn[i] && ch->kc[i]) held += (size_t)ch->kv_rows[i] * row;
-        int plan = ch->n_attn ? vkc_kv_plan(&ch->ks, q36c_name(ch), leq, row, m->kv_cap, 1, 0, held) : 1;
-        if (!plan) { ch->cap = 0; return 0; }
-        if (ch->ks.on && (c->attn_sinks || c->win_layer)) {   /* the split's attention knows no window or sinks */
-            fprintf(stderr, "[VK] qwen36 chain: the KV cache does not fit the device, and its split has no "
-                            "sliding window or sinks (Flint); the chain stops\n");
-            vkc_kv_free(&ch->ks); ch->cap = 0; return 0;
-        }
-        ch->dev_rows = ch->ks.on ? ch->ks.rows : m->kv_cap;
-        for (int i = ch->lo; i < ch->lo + ch->n; i++) {
-            if (!c->is_attn[i]) continue;
-            vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); ch->kc[i] = ch->vc[i] = NULL;
-            ch->kv_valid[i] = 0;
-            ch->kv_rows[i] = q36c_ring(m, i) ? m->kv_ring : ch->dev_rows;
-            ch->kc[i] = vkc_buf((size_t)KV * ch->kv_rows[i] * c->k_head_dim * sizeof(float), VKC_DEV);
-            ch->vc[i] = vkc_buf((size_t)KV * ch->kv_rows[i] * c->k_head_dim * sizeof(float), VKC_DEV);
-            if (!ch->kc[i] || !ch->vc[i]) { ch->cap = 0; return 0; }
-        }
-        ch->cap = m->kv_cap;
+    if (need < 1) need = 1;
+    /* the positions a step can reach: the mirror's rows follow them, not the host's capacity,
+     * which grows request by request (its rows keep their positions when it does) */
+    const int top = qwen36_max_ctx() > m->kv_cap ? qwen36_max_ctx() : m->kv_cap;
+    int cap = ch->cap;
+    if (cap >= need) {
+        if (ch->host_cap == m->kv_cap) return 1;
+        /* the host's capacity moved: a sliding layer may have turned from its first rows into a
+         * ring (q36c_ring), the rest keep theirs */
+    } else {
+        cap = need + (need / 8 > 1024 ? need / 8 : 1024);
+        if (cap < Q36C_CONV_ROWS) cap = Q36C_CONV_ROWS;
+        cap = (cap + 1023) / 1024 * 1024;
+        if (cap > top) cap = top;
+        if (cap < need) { ch->cap = 0; return 0; }
     }
+    if (!ch->kvh_set) { ch->kvh = !ch->d && q36c_kvh_want(); ch->kvh_set = 1; }
+    size_t row = (size_t)KV * c->k_head_dim * 2 * q36c_kves(ch);
+    /* the rings counted at their rows, as that many layers of the mirror's length */
+    int nf = 0, nr = 0;
+    for (int i = ch->lo; i < ch->lo + ch->n; i++) if (c->is_attn[i]) { if (q36c_ring(m, i)) nr++; else nf++; }
+    int leq = nf + (nr ? (int)(((size_t)nr * m->kv_ring + cap - 1) / cap) : 0);
+    size_t held = 0;
+    for (int i = ch->lo; i < ch->lo + ch->n; i++) if (c->is_attn[i] && ch->kc[i]) held += vkc_bytes(ch->kc[i]) + vkc_bytes(ch->vc[i]);
+    /* the full layers' rows past Q36C_KV_START come out of the tier where the device lacks
+     * them, so a long conversation's prompt chunks are the size a short one's are: once the
+     * prompt scratch exists, what it lacks for a chunk of the most rows stays free (and a
+     * margin); before that, the memory free beside a mirror of that start (keep, measured at
+     * the first). Keeping all of it took 512 MiB of Qwen3.6's experts for 240 MiB of mirror at
+     * 4K on an RTX PRO 4000 whose budget left 2.36 GiB unused (1805 against 773 tok/s) */
+    size_t want = (size_t)nf * cap * row, more = want > held ? want - held : 0;
+    if (!ch->keep) {
+        const size_t start = (size_t)nf * (top < Q36C_KV_START ? top : Q36C_KV_START) * row, av = vkc_dev_avail() + held;
+        ch->keep = av > start + Q36C_KV_MARGIN ? av - start : Q36C_KV_MARGIN;
+    }
+    size_t keep = ch->keep;
+    if (ch->rows > 0) {
+        const int rmax = q36c_chunk_rows(ch, m);
+        keep = (rmax > ch->rows ? (size_t)(rmax - ch->rows) * q36c_chunk_row_bytes(ch, m) : 0) + Q36C_KV_MARGIN;
+    }
+    /* a mirror that cannot split (a sliding window, sinks: Flint) must fit the plan's room
+     * whole (vkc_kv_plan_need: four fifths of the free memory and what the mirror holds):
+     * past it the chain stops, and the prompt's rest takes the per-matrix path (Flint with
+     * 7 GiB free, a 17K-token prompt: 16256 of 17408 positions fit, 32.8 tok/s) */
+    size_t target = more + keep;
+    if (c->attn_sinks || c->win_layer) {
+        const size_t whole = (size_t)leq * cap * row / 8 * 10 + ((size_t)1 << 20);
+        if (whole > held && whole - held > target) target = whole - held;
+    }
+    size_t took = 0;
+    const size_t av0 = vkc_dev_avail();
+    if (more && av0 < target) took = vkt_give_back(target - av0);
+    if (ch->cap && cap != ch->cap)
+        fprintf(stderr, "[VK] qwen36 chain: the KV mirror grows from %d to %d positions (%.1f MiB more, %.1f MiB of them from the "
+                        "expert tier)\n", ch->cap, cap, more / 1048576.0, took / 1048576.0);
+    int plan = ch->n_attn ? vkc_kv_plan(&ch->ks, q36c_name(ch), leq, row, cap, 1, 0, held) : 1;
+    if (plan && ch->ks.on && ch->kvh) {   /* the split reads float32: the mirrors go back to it, planned again */
+        fprintf(stderr, "[VK] qwen36 chain: the KV mirror splits past the device's budget: float32 from here on\n");
+        vkc_kv_free(&ch->ks); ch->kvh = 0; row *= 2;
+        for (int i = ch->lo; i < ch->lo + ch->n; i++) ch->kv_rows[i] = -1;   /* every mirror again, as floats */
+        plan = vkc_kv_plan(&ch->ks, q36c_name(ch), leq, row, cap, 1, 0, held);
+    }
+    if (!plan) { ch->cap = 0; return 0; }
+    if (ch->ks.on && (c->attn_sinks || c->win_layer)) {   /* the split's attention knows no window or sinks */
+        fprintf(stderr, "[VK] qwen36 chain: the KV cache does not fit the device, and its split has no "
+                        "sliding window or sinks (Flint); the chain stops\n");
+        vkc_kv_free(&ch->ks); ch->cap = 0; return 0;
+    }
+    ch->dev_rows = ch->ks.on ? ch->ks.rows : cap;
+    for (int i = ch->lo; i < ch->lo + ch->n; i++) {
+        if (!c->is_attn[i]) continue;
+        const int rows = q36c_ring(m, i) ? m->kv_ring : ch->dev_rows;
+        /* a mirror whose rows stay keeps them (a ring's, a full layer's at the same length);
+         * a split's go again, as its window moves */
+        if (ch->kc[i] && ch->kv_rows[i] == rows && !ch->ks.on) continue;
+        vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); ch->kc[i] = ch->vc[i] = NULL;
+        ch->kv_valid[i] = 0;
+        ch->kv_rows[i] = rows;
+        ch->kc[i] = vkc_buf((size_t)KV * ch->kv_rows[i] * c->k_head_dim * q36c_kves(ch), VKC_DEV);
+        ch->vc[i] = vkc_buf((size_t)KV * ch->kv_rows[i] * c->k_head_dim * q36c_kves(ch), VKC_DEV);
+        if (!ch->kc[i] || !ch->vc[i]) { ch->cap = 0; return 0; }
+    }
+    ch->cap = cap; ch->host_cap = m->kv_cap;
     return 1;
 }
 
@@ -802,7 +905,6 @@ static void q36c_conv_free(Model *m, Q36cConv *v) {
 /* A place's mirrors start at Q36C_CONV_ROWS rows and double as its conversation grows
  * (q36c_conv_grow): a conversation takes the device memory its length needs, not the
  * context's. A sliding layer's ring keeps its rows. */
-#define Q36C_CONV_ROWS 2048
 static size_t q36c_conv_kv_bytes(Model *m, Q36Chain *ch, int cap) {
     Cfg *c = &m->c; size_t b = 0;
     for (int i = ch->lo; i < ch->lo + ch->n; i++)
@@ -1087,8 +1189,8 @@ static int q36c_push_state(Q36Chain *ch, Model *m, int pos_base, int n_rows) {
                 int r = t % R, run = pos_base - t < R - r ? pos_base - t : R - r;
                 for (int h = 0; h < KV && ok; h++) {
                     size_t at = ((size_t)h * R + r) * kvd;
-                    ok = q36c_kv_up(ch->kc[i], at, m->K[i], (int64_t)at, (size_t)run * kvd) &&
-                         q36c_kv_up(ch->vc[i], at, m->V[i], (int64_t)at, (size_t)run * kvd);
+                    ok = q36c_kv_up(ch->kvh, ch->kc[i], at, m->K[i], (int64_t)at, (size_t)run * kvd) &&
+                         q36c_kv_up(ch->kvh, ch->vc[i], at, m->V[i], (int64_t)at, (size_t)run * kvd);
                 }
                 t += run;
             }
@@ -1097,8 +1199,8 @@ static int q36c_push_state(Q36Chain *ch, Model *m, int pos_base, int n_rows) {
         }
         for (int h = 0; h < KV && ok; h++) {
             size_t src = ((size_t)h * m->max_t + t0) * kvd, dst = ((size_t)h * ch->dev_rows + t0) * kvd;
-            ok = q36c_kv_up(ch->kc[i], dst, m->K[i], (int64_t)src, (size_t)n * kvd) &&
-                 q36c_kv_up(ch->vc[i], dst, m->V[i], (int64_t)src, (size_t)n * kvd);
+            ok = q36c_kv_up(ch->kvh, ch->kc[i], dst, m->K[i], (int64_t)src, (size_t)n * kvd) &&
+                 q36c_kv_up(ch->kvh, ch->vc[i], dst, m->V[i], (int64_t)src, (size_t)n * kvd);
         }
         ch->kv_valid[i] = pos_base;
     }
@@ -1180,19 +1282,25 @@ static int q36c_attention(Q36Chain *ch, Model *m, Layer *l, int i, int n, int pb
                 g[ng++] = (VkcRegion){((size_t)h * tot + (t - b0)) * kvd, ((size_t)h * R + r) * kvd, (size_t)run * kvd};
                 t += run;
             }
-        ok = (!ng || (vkc_copy_regions(ch->kg, ch->kc[i], g, ng) && vkc_copy_regions(ch->vg, ch->vc[i], g, ng)));
+        if (ng) {   /* q36c_kv_copy halves a float16 mirror's offsets: V's copy from the same rows */
+            VkcRegion *gv = malloc(sizeof *gv * (size_t)ng);
+            ok = gv != NULL;
+            if (ok) memcpy(gv, g, sizeof *gv * (size_t)ng);
+            ok = ok && q36c_kv_copy(ch, ch->kg, ch->kc[i], g, ng) && q36c_kv_copy(ch, ch->vg, ch->vc[i], gv, ng);
+            free(gv);
+        }
         ng = 0;
         for (int s = 0; s < n; s++) for (int h = 0; h < KV; h++)
             g[ng++] = (VkcRegion){((size_t)h * tot + nh + s) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
-        ok = ok && vkc_copy_regions(ch->kg, ch->k, g, ng) && vkc_copy_regions(ch->vg, ch->v, g, ng);
+        ok = ok && q36c_kv_put(ch, ch->kg, ch->k, g, ng) && q36c_kv_put(ch, ch->vg, ch->v, g, ng);
         VkcAttn a = {n, H, KV, hd, nh, tot, 0, qo, qdim, hd, qo, qdim, gate_dim > 0, 0, H * hd, 0, 0,
                      1.f / sqrtf((float)hd), 0, 0};
         VkcAttnW w = {a, win, 0, 0, 0, l->sinks != NULL, (int)ch->o_snk[i]};
-        ok = ok && vkc_attn_w(ch->q, ch->kg, ch->vg, ch->ctx, ch->q, NULL, l->sinks ? ch->prm : NULL, &w);
+        ok = ok && q36c_attn_wc(ch, ch->q, ch->kg, ch->vg, ch->ctx, ch->q, l->sinks ? ch->prm : NULL, &w);
         ng = 0;   /* after the attention read the ring's rows: the step's last R into it */
         for (int s = n > R ? n - R : 0; s < n; s++) for (int h = 0; h < KV; h++)
             g[ng++] = (VkcRegion){((size_t)h * R + (pb + s) % R) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
-        ok = ok && vkc_copy_regions(ch->kc[i], ch->k, g, ng) && vkc_copy_regions(ch->vc[i], ch->v, g, ng) &&
+        ok = ok && q36c_kv_put(ch, ch->kc[i], ch->k, g, ng) && q36c_kv_put(ch, ch->vc[i], ch->v, g, ng) &&
              vkc_copy(ch->kvd, ko, ch->k, 0, (size_t)n * kvo) && vkc_copy(ch->kvd, ko + (size_t)ch->rows * kvo, ch->v, 0, (size_t)n * kvo);
         free(g);
         return ok && q36c_attn_out(ch, m, l, n);
@@ -1201,17 +1309,17 @@ static int q36c_attention(Q36Chain *ch, Model *m, Layer *l, int i, int n, int pb
     if (!rg) return 0;
     for (int s = 0; s < n; s++) for (int h = 0; h < KV; h++)
         rg[s * KV + h] = (VkcRegion){((size_t)h * rows + (R ? (pb + s) % R : pb + s)) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
-    ok = vkc_copy_regions(ch->kc[i], ch->k, rg, n * KV) && vkc_copy_regions(ch->vc[i], ch->v, rg, n * KV) &&
+    ok = q36c_kv_put(ch, ch->kc[i], ch->k, rg, n * KV) && q36c_kv_put(ch, ch->vc[i], ch->v, rg, n * KV) &&
          vkc_copy(ch->kvd, ko, ch->k, 0, (size_t)n * kvo) && vkc_copy(ch->kvd, ko + (size_t)ch->rows * kvo, ch->v, 0, (size_t)n * kvo);
     free(rg);
     VkcAttn a = {n, H, KV, hd, pb, rows, 0, qo, qdim, hd, qo, qdim, gate_dim > 0, 0, H * hd, 0, 0,
                  1.f / sqrtf((float)hd), 0, 0};
     if (win || l->sinks) {   /* Flint: a sliding window and a sink per head (vkc_attn_w, as MiMo's) */
         VkcAttnW w = {a, win, R, 0, 0, l->sinks != NULL, (int)ch->o_snk[i]};
-        return ok && vkc_attn_w(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, NULL, l->sinks ? ch->prm : NULL, &w) &&
+        return ok && q36c_attn_wc(ch, ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, l->sinks ? ch->prm : NULL, &w) &&
                q36c_attn_out(ch, m, l, n);
     }
-    return ok && vkc_attn(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, NULL, &a) && q36c_attn_out(ch, m, l, n);
+    return ok && q36c_attn_c(ch, ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, &a) && q36c_attn_out(ch, m, l, n);
 }
 /* ns: the chunk's rows a verify copies the state after (rows 0..ns-1, slots c0..). One
  * copy rides on the one dispatch as the shaders pass its row; more split the
@@ -1315,16 +1423,16 @@ static int q36c_mux_push(Q36Chain *ch, Model *m, int c0, int n) {
                     int r = t % R, run = pos - t < R - r ? pos - t : R - r;
                     for (int h = 0; h < KV && ok; h++) {
                         size_t at = ((size_t)h * R + r) * kvd;
-                        ok = q36c_kv_up(v->kc[i], at, q->K[i], (int64_t)at, (size_t)run * kvd) &&
-                             q36c_kv_up(v->vc[i], at, q->V[i], (int64_t)at, (size_t)run * kvd);
+                        ok = q36c_kv_up(0, v->kc[i], at, q->K[i], (int64_t)at, (size_t)run * kvd) &&
+                             q36c_kv_up(0, v->vc[i], at, q->V[i], (int64_t)at, (size_t)run * kvd);
                     }
                     t += run;
                 }
             } else
                 for (int h = 0; h < KV && ok; h++) {
                     size_t src = ((size_t)h * m->max_t + t0) * kvd, dst = ((size_t)h * v->kv_rows[i] + t0) * kvd;
-                    ok = q36c_kv_up(v->kc[i], dst, q->K[i], (int64_t)src, (size_t)(pos - t0) * kvd) &&
-                         q36c_kv_up(v->vc[i], dst, q->V[i], (int64_t)src, (size_t)(pos - t0) * kvd);
+                    ok = q36c_kv_up(0, v->kc[i], dst, q->K[i], (int64_t)src, (size_t)(pos - t0) * kvd) &&
+                         q36c_kv_up(0, v->vc[i], dst, q->V[i], (int64_t)src, (size_t)(pos - t0) * kvd);
                 }
             v->kv_valid[i] = pos;
         }
@@ -1437,6 +1545,7 @@ static void q36c_dmoe_done(Q36Chain *ch, Model *m, int from, int to, int n, int 
  * layers after it run elsewhere (the second device's chain, the CPU). */
 static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_base, FILE *lf, int want_x, int nlogits,
                             float *logit, int *rows_only, int *lost) {
+    double t_fwd = tm_now();   /* the hybrid steps' gate times the forward (vkc_dmoe_forward_done) */
     *rows_only = 0; *lost = 0;
     Cfg *c = &m->c; int D = c->hidden, L = ch->n, lo = ch->lo, hi = lo + L, E = c->n_experts;   /* L: the layers on the device */
     int part = hi < c->n_layers || !ch->head;
@@ -1449,8 +1558,8 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
         q36c_conv_save(ch);
         mirror_ok = q36c_conv_grow(ch, m, ch->conv_cur, pos_base + S);
         q36c_conv_load(ch, ch->conv_cur);
-        if (!mirror_ok) { q36c_pool_off(ch, m); mirror_ok = q36c_mirror(ch, m); }
-    } else mirror_ok = q36c_mirror(ch, m);
+        if (!mirror_ok) { q36c_pool_off(ch, m); mirror_ok = q36c_mirror(ch, m, pos_base + S); }
+    } else mirror_ok = q36c_mirror(ch, m, pos_base + S);
     int CH = mirror_ok ? q36c_chunk_rows(ch, m) : 1, rows = S < CH ? S : CH;
     if (ch->ks.on && rows > ch->ks.chunk) rows = ch->ks.chunk;   /* a step's rows fit the split's window */
     int half = c->rotary_dim / 2;
@@ -1613,6 +1722,7 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
     ch->snap_valid = snapped;
     vkc_gemm_rows(-1);
     ch->forwards++;
+    if (dmoe) vkc_dmoe_forward_done(&ch->dm, S, tm_now() - t_fwd);
     *rows_only = part;
     return L;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */

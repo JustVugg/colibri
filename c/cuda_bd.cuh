@@ -621,6 +621,63 @@ __device__ __forceinline__ void bd_bytes16(const bd_u32 *__restrict__ W, bd_u32 
     b[0] = bd_ldu(W, off); b[1] = bd_ldu(W, off + 4u); b[2] = bd_ldu(W, off + 8u); b[3] = bd_ldu(W, off + 12u);
 }
 __device__ __forceinline__ bd_u32 bd_byte_of(const bd_u32 *b, int j) { return (b[j >> 2] >> (8 * (j & 3))) & 0xffu; }
+/* bd_dec16's 16 weights for the types whose codes come to f16 exactly by their bits (Q8_0,
+ * Q4_K, Q5_K, Q6_K), as eight half2: four codes of a word, each a byte, go to two half2 of
+ * 1024 + code (0x64 above the byte: f16's integers from 1024 are exact), 1024 (and a code's
+ * offset) less, then times the scale less the min in half2: about two instructions a weight
+ * where bd_dec16 and the f16 rounding after it took six (Qwen3.6 UD-Q4_K_M, a 1K-token
+ * prompt on an RTX PRO 4000: the experts' gate and up 133 ms, 24 with no decode at all). The
+ * same codes; the scale and the min rounded to f16 before the product, not after it. */
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+__device__ __forceinline__ bd_u32 bd_h2u(__half2 h) { return *reinterpret_cast<bd_u32 *>(&h); }
+__device__ __forceinline__ __half2 bd_u2h(bd_u32 u) { return *reinterpret_cast<__half2 *>(&u); }
+__device__ __forceinline__ void bd_codes_h(bd_u32 c4, __half2 off, __half2 s, __half2 m, bd_u32 *o) {
+    /* four byte codes: bytes 0, 1 and 2, 3 with 0x64 above each, then (1024 + c - off) * s - m */
+    __half2 a = __hsub2(bd_u2h(__byte_perm(c4, 0x64646464u, 0x5140u)), off);
+    __half2 b = __hsub2(bd_u2h(__byte_perm(c4, 0x64646464u, 0x5342u)), off);
+    o[0] = bd_h2u(__hfma2(a, s, m)); o[1] = bd_h2u(__hfma2(b, s, m));
+}
+__device__ __forceinline__ bool bd_dec16h(int t, const bd_u32 *__restrict__ W, bd_u32 e0, bd_u32 *out) {
+    if (t == 12 || t == 13) {   /* Q4_K, Q5_K: groups of 32, a 6-bit scale and min each */
+        bd_u32 b = e0 >> 8, e = e0 & 255u, c = e >> 6, pos = e & 63u, hi = pos >= 32u, g = 2u * c + hi, p = pos & 31u;
+        bd_u32 base = b * (t == 12 ? 144u : 176u);
+        uint4 hd = bd_w4(W, base >> 4);
+        uint2 sm = bdi_k4sm(hd, g);
+        float d = bd_h2f(hd.x) * (float)sm.x, m = bd_h2f(hd.x >> 16) * (float)sm.y;
+        uint4 q = bd_w4(W, (base + (t == 12 ? 16u : 48u) + 32u * c + p) >> 4);
+        uint4 h = t == 13 ? bd_w4(W, (base + 16u + p) >> 4) : make_uint4(0u, 0u, 0u, 0u);
+        bd_u32 qw[4] = {q.x, q.y, q.z, q.w}, hw[4] = {h.x, h.y, h.z, h.w}, sh = hi ? 4u : 0u;
+        __half2 off = __float2half2_rn(1024.f), s2 = __float2half2_rn(d), m2 = __float2half2_rn(-m);
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            bd_u32 v = (qw[k] >> sh) & 0x0F0F0F0Fu;
+            if (t == 13) v |= ((hw[k] >> g) & 0x01010101u) << 4;
+            bd_codes_h(v, off, s2, m2, out + 2 * k);
+        }
+        return true;
+    }
+    if (t == 14) {   /* Q6_K: (6-bit code - 32), a signed scale per 16 */
+        bd_u32 b = e0 >> 8, e = e0 & 255u, n = e >> 7, r = e & 127u, base = b * 210u;
+        bd_u32 ql[4], qh[4];
+        bd_bytes16(W, base + 64u * n + (r & 63u), ql); bd_bytes16(W, base + 128u + 32u * n + (r & 31u), qh);
+        bd_u32 ns = 4u * (r >> 6), hs = 2u * (r >> 5);
+        float d = bd_f16at(W, base + 208u) * (float)(int)(signed char)bd_u8at(W, base + 192u + (e >> 4));
+        __half2 off = __float2half2_rn(1056.f), s2 = __float2half2_rn(d), z2 = __float2half2_rn(0.f);
+        #pragma unroll
+        for (int k = 0; k < 4; k++) bd_codes_h(((ql[k] >> ns) & 0x0F0F0F0Fu) | (((qh[k] >> hs) & 0x03030303u) << 4), off, s2, z2, out + 2 * k);
+        return true;
+    }
+    if (t == 8) {   /* Q8_0: blocks of 32, signed codes (their top bit flipped: code + 128) */
+        bd_u32 b = e0 >> 5, base = b * 34u, w[4];
+        bd_bytes16(W, base + 2u + 16u * ((e0 >> 4) & 1u), w);
+        __half2 off = __float2half2_rn(1152.f), s2 = __float2half2_rn(bd_f16at(W, base)), z2 = __float2half2_rn(0.f);
+        #pragma unroll
+        for (int k = 0; k < 4; k++) bd_codes_h(w[k] ^ 0x80808080u, off, s2, z2, out + 2 * k);
+        return true;
+    }
+    return false;
+}
+#endif
 __device__ __forceinline__ bool bd_dec16(int t, const bd_u32 *__restrict__ W, bd_u32 e0, const bd_u32 *__restrict__ tab, float *out) {
     if (t == 12 || t == 13) {   /* Q4_K, Q5_K: groups of 32, a 6-bit scale and min each */
         bd_u32 b = e0 >> 8, e = e0 & 255u, c = e >> 6, pos = e & 63u, hi = pos >= 32u, g = 2u * c + hi, p = pos & 31u;

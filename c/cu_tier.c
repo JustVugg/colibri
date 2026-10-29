@@ -52,6 +52,7 @@ static const CuTierOps *cut_ops(void) {
 /* the CUDA tier's host pool is page-locked memory of its own (cudaHostAlloc), not a Vulkan
  * heap the driver sizes: no room reported, the pool sized from the RAM as before */
 #define coli_vk_tier_host_heap_room() ((size_t)0)
+#define VKT_NO_GIVE_BACK 1   /* vkt_give_back: the dense chain that asks is Vulkan's */
 #define coli_vk_block_elems(...) (cut_ops()->block_elems(__VA_ARGS__))
 #define coli_vk_tensor_row_bytes(...) (cut_ops()->tensor_row_bytes(__VA_ARGS__))
 #define coli_vk_tensor_scale_count(...) (cut_ops()->tensor_scale_count(__VA_ARGS__))
@@ -106,6 +107,7 @@ static const CuTierOps *cut_ops(void) {
 #define vkt_devices cut_devices
 #define vkt_epoch cut_epoch
 #define vkt_expert_bytes cut_expert_bytes
+#define vkt_give_back cut_give_back
 #define vkt_host_pairs cut_host_pairs
 #define vkt_host_pairs_w cut_host_pairs_w
 #define vkt_host_pool_on cut_host_pool_on

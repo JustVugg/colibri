@@ -41,7 +41,9 @@ namespace {
 #define CC_UP_MARKS 1024   /* host_up's marks in flight (three a promoted expert) */
 struct CcCtx {
     int device, up, lost, in_frame;
-    int major;   /* the device's compute capability: cc_attn_fk's tensor cores from 7 */
+    int major;   /* the device's compute capability: cc_attn_fk's tensor cores from 7, cc_attn_f2's from 8 */
+    int f2_big;  /* cc_attn_f2's head dim 256 (66 KiB of shared memory): 1 allowed, -1 refused, 0 not asked */
+    int f2_big_h;   /* the same for its float16 cache's kernel */
     cudaStream_t stream;
     cudaEvent_t ev; int ev_ok, ev_pending;
     /* staging (cc_fetch): the copy stream, its copies' event and the buffer's last reader's */
@@ -165,13 +167,28 @@ __global__ static void cc_rope_f16_k(float *__restrict__ x, float *__restrict__ 
     } else if (j >= 2 * p.half_) x[base + j] = cc_f16_round(x[base + j]);
     v[base + j] = cc_f16_round(v[base + j]);
 }
+/* A cache's elements as floats: float32, or float16 (attn_h: a float16 KV cache holds the
+ * numbers a float16 host cache holds, so the attention reads the same values). cc_kv4: four
+ * of them at an offset that is a multiple of four. */
+__device__ __forceinline__ float cc_kvf(const float *p, size_t i) { return p[i]; }
+__device__ __forceinline__ float4 cc_kv4(const float *p, size_t i) { return *reinterpret_cast<const float4 *>(p + i); }
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+__device__ __forceinline__ float cc_kvf(const __half *p, size_t i) { return __half2float(p[i]); }
+__device__ __forceinline__ float4 cc_kv4(const __half *p, size_t i) {
+    uint2 u = *reinterpret_cast<const uint2 *>(p + i);
+    float2 a = __half22float2(*reinterpret_cast<const __half2 *>(&u.x)), b = __half22float2(*reinterpret_cast<const __half2 *>(&u.y));
+    return make_float4(a.x, a.y, b.x, b.y);
+}
+#endif
+template <typename KT> static const KT *kvp(CcBuf *b) { return b ? reinterpret_cast<const KT *>(b->d) : nullptr; }
 /* one block of 128 per (head, row); K and V rows read once per tile of 128 positions;
  * hd <= 256: two dims per thread */
 /* win > 0: a sliding window, the row's last win positions; snk: a sink logit per head at
  * snk[sink_off + h], in the denominator only (CcAttnW); ring > 0: the cache a ring of that
  * many rows, position t in row t % ring (a sliding layer's, cc_attn_wr) */
-__global__ static void __launch_bounds__(128) cc_attn_k(const float *__restrict__ q, const float *__restrict__ kc,
-        const float *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, const int *__restrict__ sel, CcAttn p,
+template <typename KT = float>
+__global__ static void __launch_bounds__(128) cc_attn_k(const float *__restrict__ q, const KT *__restrict__ kc,
+        const KT *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, const int *__restrict__ sel, CcAttn p,
         int win = 0, const float *__restrict__ snk = nullptr, int sink_off = 0, int ring = 0) {
     __shared__ float qs[256];
     __shared__ float pe[128];
@@ -202,7 +219,7 @@ __global__ static void __launch_bounds__(128) cc_attn_k(const float *__restrict_
             pt[tid] = t;
             int kb = p.k_off + (kbase + t) * p.hd;
             float a = 0.f;
-            for (int d = 0; d < p.hd; d++) a += qs[d] * kc[kb + d];
+            for (int d = 0; d < p.hd; d++) a += qs[d] * cc_kvf(kc, kb + d);
             sv = a * p.scale;
         }
         red[tid] = sv;
@@ -229,8 +246,8 @@ __global__ static void __launch_bounds__(128) cc_attn_k(const float *__restrict_
         for (int j = 0; j < cnt; j++) {
             int vb = p.v_off + (kbase + pt[j]) * p.hd;
             float w = pe[j];
-            if (d0 < p.hd) acc0 += w * vc[vb + d0];
-            if (d1 < p.hd) acc1 += w * vc[vb + d1];
+            if (d0 < p.hd) acc0 += w * cc_kvf(vc, vb + d0);
+            if (d1 < p.hd) acc1 += w * cc_kvf(vc, vb + d1);
         }
         m = mn;
         __syncthreads();
@@ -267,9 +284,9 @@ __global__ static void __launch_bounds__(128) cc_attn_k(const float *__restrict_
 #else
 #define CC_FA_BODY 0
 #endif
-template<int HD>
-__global__ static void __launch_bounds__(128) cc_attn_fk(const float *__restrict__ q, const float *__restrict__ kc,
-        const float *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, CcAttn p, int GQ,
+template<int HD, typename KT = float>
+__global__ static void __launch_bounds__(128) cc_attn_fk(const float *__restrict__ q, const KT *__restrict__ kc,
+        const KT *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, CcAttn p, int GQ,
         int win = 0, const float *__restrict__ snk = nullptr, int sink_off = 0, int ring = 0) {   /* CcAttnW's window and sinks, a ring */
 #if CC_FA_BODY
     using namespace nvcuda;
@@ -319,7 +336,7 @@ __global__ static void __launch_bounds__(128) cc_attn_fk(const float *__restrict
             int k0 = kb * CC_FA_BC;
             for (int e = tid; e < CC_FA_BC * HD; e += 128) {   /* K of keys k0 .. k0 + 63, zero past nt */
                 int kl = e / HD, d = e - kl * HD, key = k0 + kl;
-                float v = key < nt ? kc[p.k_off + (g * p.cap + (ring ? key % ring : key)) * HD + d] : 0.f;
+                float v = key < nt ? cc_kvf(kc, p.k_off + (size_t)(g * p.cap + (ring ? key % ring : key)) * HD + d) : 0.f;
                 skv[kl * LD + d] = __float2half(v);
             }
             __syncthreads();
@@ -358,7 +375,7 @@ __global__ static void __launch_bounds__(128) cc_attn_fk(const float *__restrict
             __syncthreads();   /* P complete, K consumed */
             for (int e = tid; e < CC_FA_BC * HD; e += 128) {   /* V of the same keys */
                 int kl = e / HD, d = e - kl * HD, key = k0 + kl;
-                float v = key < nt ? vc[p.v_off + (g * p.cap + (ring ? key % ring : key)) * HD + d] : 0.f;
+                float v = key < nt ? cc_kvf(vc, p.v_off + (size_t)(g * p.cap + (ring ? key % ring : key)) * HD + d) : 0.f;
                 skv[kl * LD + d] = __float2half(v);
             }
             __syncthreads();
@@ -389,6 +406,223 @@ __global__ static void __launch_bounds__(128) cc_attn_fk(const float *__restrict
             o[p.o_off + tk * p.o_row + h * HD + d] = v;
         }
     }
+#endif
+}
+/* A prompt chunk's causal attention in one pass on the tensor cores' m16n8k16 f16 MMA (sm_80
+ * and later), FlashAttention-2's online softmax. A block of NW warps takes 16 * NW query rows:
+ * 16 * NW / GQ tokens x the GQ query heads of one kv head, warp w rows 16w .. 16w + 15, so each
+ * key block of BC keys is staged once for all of them (K and V rounded to f16 as they are
+ * staged, rows of HD + 8 halves). A warp's scores stay in its registers: per row the running
+ * max m and sum l rescale its output fragments as the blocks go by, and P = exp(s - m) goes
+ * from the score fragments straight into the A operand of P V (the accumulator's layout is
+ * the A operand's, two key tiles a k-step). Q is scaled before its f16 rounding and held in
+ * registers (QREG), or read from shared memory each block (HD 256: the registers hold O).
+ * Keys: t <= pos_base + token(r), with a window t > pos_base + token(r) - win, none past nt;
+ * a warp skips the blocks none of its rows sees. A sink joins the denominator from the start
+ * (m = sink, l = 1); key t of the cache at row t % ring with a ring. cc_attn_fk took 9.6 s of
+ * a 16K prompt on Flint (RTX PRO 4000): 16 rows a block re-read K and V from L2 for every 16
+ * rows, twice. Not bit-identical to cc_attn_fk (one pass, the sums in another order).
+ * Grid: x = ceil(S / (16 * NW / GQ)) token groups, y = kv heads; dynamic shared memory
+ * cc_f2_smem_bytes. */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+#define CC_F2_BODY 1
+__device__ __forceinline__ void cc_f2_mma(float *c, const uint32_t *a, uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void cc_f2_ldm(uint32_t *r, const __half *p) {
+    unsigned s = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
+}
+__device__ __forceinline__ void cc_f2_ldmt(uint32_t *r, const __half *p) {
+    unsigned s = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
+}
+__device__ __forceinline__ uint32_t cc_f2_pack(float a, float b) {
+    __half2 h = __floats2half2_rn(a, b);
+    return *reinterpret_cast<uint32_t *>(&h);
+}
+/* four floats as four halves at d (8-byte aligned) */
+__device__ __forceinline__ void cc_f2_put(__half *d, float4 v, float s) {
+    uint2 u = make_uint2(cc_f2_pack(v.x * s, v.y * s), cc_f2_pack(v.z * s, v.w * s));
+    *reinterpret_cast<uint2 *>(d) = u;
+}
+#else
+#define CC_F2_BODY 0
+#endif
+template<int HD, int NW, int BC, bool QREG>
+static constexpr size_t cc_f2_smem_bytes() { return ((size_t)2 * BC * (HD + 8) + (QREG ? 0 : (size_t)16 * NW * (HD + 8))) * 2; }
+template<int HD, int NW, int BC, bool QREG, typename KT = float>
+__global__ static void __launch_bounds__(32 * NW) cc_attn_f2(const float *__restrict__ q, const KT *__restrict__ kc,
+        const KT *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, CcAttn p, int GQ,
+        int win, const float *__restrict__ snk, int sink_off, int ring) {
+#if CC_F2_BODY
+    constexpr int LD = HD + 8, BR = 16 * NW, NT = 32 * NW, NKT = BC / 8, NDT = HD / 8, KS = HD / 16;
+    static_assert(!QREG || BR <= 2 * BC, "Q is staged where K and V go");
+    extern __shared__ __align__(16) unsigned char cc_f2_sm[];
+    __half *sK = reinterpret_cast<__half *>(cc_f2_sm), *sV = sK + BC * LD, *sQ = QREG ? sK : sV + BC * LD;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, tig = lane & 3;
+    const int TPB = BR / GQ, g = blockIdx.y, t0 = blockIdx.x * TPB, S = p.S, pb = p.pos_base, nt = pb + S;
+    const int tlast = min(t0 + TPB, S) - 1;
+    for (int e = tid; e < BR * HD / 4; e += NT) {   /* Q, scaled, row r = (token t0 + r / GQ, head g * GQ + r % GQ) */
+        int r = e / (HD / 4), d = (e - r * (HD / 4)) * 4, tk = t0 + r / GQ, h = g * GQ + r % GQ;
+        float4 v = tk < S ? *reinterpret_cast<const float4 *>(q + p.q_off + (size_t)tk * p.q_row + (size_t)h * p.q_seg + d)
+                          : make_float4(0.f, 0.f, 0.f, 0.f);
+        cc_f2_put(sQ + r * LD + d, v, p.scale);
+    }
+    __syncthreads();
+    const int ar = (lane & 7) + ((lane >> 3) & 1) * 8, ac = (lane >> 4) * 8;   /* an A operand's ldmatrix row and column */
+    const int br = (lane & 7) + ((lane >> 4) << 3), bc = ((lane >> 3) & 1) * 8;  /* K's: two key tiles, two halves of a k-step */
+    const int vr = (lane & 7) + (((lane >> 3) & 1) << 3), vcol = (lane >> 4) << 3; /* V's (transposed): two halves of 16 keys, two dim tiles */
+    uint32_t qa[QREG ? KS : 1][4];
+    if (QREG) {
+        #pragma unroll
+        for (int ks = 0; ks < KS; ks++) cc_f2_ldm(qa[ks], sQ + (warp * 16 + ar) * LD + ks * 16 + ac);
+        __syncthreads();   /* sQ is where the first K block goes */
+    }
+    const int r0 = warp * 16 + gid, r1 = r0 + 8;
+    const int qp0 = pb + min(t0 + r0 / GQ, S - 1), qp1 = pb + min(t0 + r1 / GQ, S - 1);
+    const int wlo = pb + min(t0 + (warp * 16) / GQ, S - 1), whi = pb + min(t0 + (warp * 16 + 15) / GQ, S - 1);
+    float m0 = -1e30f, m1 = -1e30f, l0 = 0.f, l1 = 0.f;
+    if (snk) {   /* the sink: m = its logit, and one term of l (on one lane of the four that share a row) */
+        m0 = snk[sink_off + g * GQ + r0 % GQ]; m1 = snk[sink_off + g * GQ + r1 % GQ];
+        if (tig == 0) { l0 = 1.f; l1 = 1.f; }
+    }
+    float oa[NDT][4];
+    #pragma unroll
+    for (int dt = 0; dt < NDT; dt++) oa[dt][0] = oa[dt][1] = oa[dt][2] = oa[dt][3] = 0.f;
+    const int kb_lo = win > 0 && pb + t0 - win + 1 > 0 ? (pb + t0 - win + 1) / BC : 0, kb_hi = (pb + tlast) / BC;
+    for (int kb = kb_lo; kb <= kb_hi; kb++) {
+        const int k0 = kb * BC;
+        for (int e = tid; e < BC * HD / 4; e += NT) {   /* K and V of keys k0 .. k0 + BC - 1, zero past nt */
+            int kl = e / (HD / 4), d = (e - kl * (HD / 4)) * 4, key = k0 + kl;
+            float4 kv = make_float4(0.f, 0.f, 0.f, 0.f), vv = kv;
+            if (key < nt) {
+                size_t at = (size_t)(g * p.cap + (ring ? key % ring : key)) * HD + d;
+                kv = cc_kv4(kc, p.k_off + at);
+                vv = cc_kv4(vc, p.v_off + at);
+            }
+            cc_f2_put(sK + kl * LD + d, kv, 1.f);
+            cc_f2_put(sV + kl * LD + d, vv, 1.f);
+        }
+        __syncthreads();
+        /* none of this warp's rows sees a key of the block: past its last row, or before its
+         * first row's window */
+        if (k0 <= whi && (win <= 0 || k0 + BC - 1 + win > wlo)) {
+            float sc[NKT][4];
+            #pragma unroll
+            for (int j = 0; j < NKT; j++) sc[j][0] = sc[j][1] = sc[j][2] = sc[j][3] = 0.f;
+            #pragma unroll
+            for (int ks = 0; ks < KS; ks++) {
+                uint32_t a[4];
+                if (QREG) { a[0] = qa[ks][0]; a[1] = qa[ks][1]; a[2] = qa[ks][2]; a[3] = qa[ks][3]; }
+                else cc_f2_ldm(a, sQ + (warp * 16 + ar) * LD + ks * 16 + ac);
+                #pragma unroll
+                for (int j = 0; j < NKT; j += 2) {
+                    uint32_t b[4];
+                    cc_f2_ldm(b, sK + (j * 8 + br) * LD + ks * 16 + bc);
+                    cc_f2_mma(sc[j], a, b[0], b[1]);
+                    cc_f2_mma(sc[j + 1], a, b[2], b[3]);
+                }
+            }
+            /* the masks only where a row's position or window cuts the block */
+            const bool edge = !(k0 + BC - 1 <= wlo && (win <= 0 || k0 + win > whi));
+            float x0 = -1e30f, x1 = -1e30f;
+            #pragma unroll
+            for (int j = 0; j < NKT; j++)
+                #pragma unroll
+                for (int u = 0; u < 2; u++) {
+                    if (edge) {
+                        int key = k0 + j * 8 + tig * 2 + u;
+                        if (key > qp0 || (win > 0 && key + win <= qp0)) sc[j][u] = -1e30f;
+                        if (key > qp1 || (win > 0 && key + win <= qp1)) sc[j][2 + u] = -1e30f;
+                    }
+                    x0 = fmaxf(x0, sc[j][u]); x1 = fmaxf(x1, sc[j][2 + u]);
+                }
+            x0 = fmaxf(x0, __shfl_xor_sync(0xffffffffu, x0, 1)); x0 = fmaxf(x0, __shfl_xor_sync(0xffffffffu, x0, 2));
+            x1 = fmaxf(x1, __shfl_xor_sync(0xffffffffu, x1, 1)); x1 = fmaxf(x1, __shfl_xor_sync(0xffffffffu, x1, 2));
+            const float n0 = fmaxf(m0, x0), n1 = fmaxf(m1, x1), c0 = __expf(m0 - n0), c1 = __expf(m1 - n1);
+            m0 = n0; m1 = n1; l0 *= c0; l1 *= c1;
+            #pragma unroll
+            for (int dt = 0; dt < NDT; dt++) { oa[dt][0] *= c0; oa[dt][1] *= c0; oa[dt][2] *= c1; oa[dt][3] *= c1; }
+            uint32_t pa[BC / 16][4];
+            #pragma unroll
+            for (int j = 0; j < NKT; j++) {
+                float p0 = sc[j][0] > -1e29f ? __expf(sc[j][0] - m0) : 0.f, p1 = sc[j][1] > -1e29f ? __expf(sc[j][1] - m0) : 0.f;
+                float p2 = sc[j][2] > -1e29f ? __expf(sc[j][2] - m1) : 0.f, p3 = sc[j][3] > -1e29f ? __expf(sc[j][3] - m1) : 0.f;
+                l0 += p0 + p1; l1 += p2 + p3;
+                pa[j >> 1][(j & 1) * 2] = cc_f2_pack(p0, p1);
+                pa[j >> 1][(j & 1) * 2 + 1] = cc_f2_pack(p2, p3);
+            }
+            #pragma unroll
+            for (int kk = 0; kk < BC / 16; kk++)
+                #pragma unroll
+                for (int dt = 0; dt < NDT; dt += 2) {
+                    uint32_t b[4];
+                    cc_f2_ldmt(b, sV + (kk * 16 + vr) * LD + dt * 8 + vcol);
+                    cc_f2_mma(oa[dt], pa[kk], b[0], b[1]);
+                    cc_f2_mma(oa[dt + 1], pa[kk], b[2], b[3]);
+                }
+        }
+        __syncthreads();   /* sK and sV are rewritten next block */
+    }
+    l0 += __shfl_xor_sync(0xffffffffu, l0, 1); l0 += __shfl_xor_sync(0xffffffffu, l0, 2);
+    l1 += __shfl_xor_sync(0xffffffffu, l1, 1); l1 += __shfl_xor_sync(0xffffffffu, l1, 2);
+    const float i0 = l0 > 0.f ? 1.f / l0 : 0.f, i1 = l1 > 0.f ? 1.f / l1 : 0.f;
+    #pragma unroll
+    for (int half = 0; half < 2; half++) {
+        const int r = half ? r1 : r0, tk = t0 + r / GQ, h = g * GQ + r % GQ;
+        if (tk >= S) continue;
+        const float inv = half ? i1 : i0;
+        float *orow = o + p.o_off + (size_t)tk * p.o_row + (size_t)h * HD;
+        const float *grow = gt + p.g_off + (size_t)tk * p.g_row + (size_t)h * p.g_seg;
+        #pragma unroll
+        for (int dt = 0; dt < NDT; dt++) {
+            const int d = dt * 8 + tig * 2;
+            float v0 = oa[dt][half * 2] * inv, v1 = oa[dt][half * 2 + 1] * inv;
+            if (p.has_gate) { v0 *= 1.f / (1.f + __expf(-grow[d])); v1 *= 1.f / (1.f + __expf(-grow[d + 1])); }
+            orow[d] = v0; orow[d + 1] = v1;
+        }
+    }
+#endif
+}
+/* cc_attn_f2 for a prompt chunk where it applies (1: launched): sm_80 and later, head dim 64,
+ * 128 or 256, the query heads of a kv head dividing 64, rows and caches at float4 offsets;
+ * COLI_CUDA_CHAIN_FLASH2=0 keeps cc_attn_fk */
+template <typename KT>
+static int cc_attn_f2_go(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, const CcAttn *p, int G,
+                         int win, const float *sk, int so, int ring) {
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_CHAIN_FLASH2"); on = !(e && *e == '0'); }
+    if (!on || c->major < 8 || 64 % G || (p->hd != 64 && p->hd != 128 && p->hd != 256) ||
+        (p->q_off | p->q_row | p->q_seg | p->k_off | p->v_off) % 4) return 0;
+    dim3 fg((unsigned)((p->S + 64 / G - 1) / (64 / G)), (unsigned)p->KVH);
+    if (p->hd == 64) {
+        cc_attn_f2<64, 4, 64, true, KT><<<fg, 128, cc_f2_smem_bytes<64, 4, 64, true>(), c->stream>>>(
+            fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
+    } else if (p->hd == 128) {
+        cc_attn_f2<128, 4, 64, true, KT><<<fg, 128, cc_f2_smem_bytes<128, 4, 64, true>(), c->stream>>>(
+            fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
+    } else {
+        const size_t sm = cc_f2_smem_bytes<256, 4, 32, false>();
+        int &big = sizeof(KT) == 2 ? c->f2_big_h : c->f2_big;   /* a float16 cache's kernel is another function */
+        if (!big) {
+            int optin = 0;
+            big = cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, c->device) == cudaSuccess &&
+                  (size_t)optin >= sm &&
+                  cudaFuncSetAttribute(cc_attn_f2<256, 4, 32, false, KT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm) == cudaSuccess
+                  ? 1 : -1;
+            (void)cudaGetLastError();
+        }
+        if (big < 0) return 0;
+        cc_attn_f2<256, 4, 32, false, KT><<<fg, 128, sm, c->stream>>>(fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
+    }
+    return 1;
+#else
+    (void)c; (void)q; (void)kc; (void)vc; (void)o; (void)gate; (void)p; (void)G; (void)win; (void)sk; (void)so; (void)ring;
+    return 0;
 #endif
 }
 /* one thread per channel, the rows in order, the channel's ring in registers */
@@ -1174,21 +1408,50 @@ static int cc_grid_of(const CcRegion *r, int n, CcGrid *g) {
     *g = CcGrid{d0, s0, dh, sh, dq, sq, (int)L, per, n};
     return 1;
 }
+/* How many of the regions from r[0] make one grid, in whole rows of it. A list that is not one
+ * grid is often a few: the rows a step writes into a ring break where the ring wraps (on Flint
+ * each sliding layer's prompt step wrote 2 x 1538 regions a cudaMemcpyAsync each, 862400 calls
+ * and about 15 s of host time in a 16K prompt on an RTX PRO 4000), and each side is a grid. */
+static int cc_grid_run(const CcRegion *r, int n) {
+    if (n < 2) return n;
+    long long L = (long long)r[0].n, d0 = (long long)r[0].dst, s0 = (long long)r[0].src;
+    long long dh = (long long)r[1].dst - d0, sh = (long long)r[1].src - s0;
+    int per = 1;
+    while (per < n && (long long)r[per].n == L && (long long)r[per].dst - (long long)r[per - 1].dst == dh &&
+           (long long)r[per].src - (long long)r[per - 1].src == sh) per++;
+    if (per == n) return n;
+    long long dq = (long long)r[per].dst - d0, sq = (long long)r[per].src - s0;
+    int Q = 1;
+    for (; (Q + 1) * per <= n; Q++) {
+        int ok = 1;
+        for (int h = 0; h < per && ok; h++) {
+            const CcRegion *x = &r[Q * per + h];
+            ok = (long long)x->n == L && (long long)x->dst == d0 + Q * dq + h * dh && (long long)x->src == s0 + Q * sq + h * sh;
+        }
+        if (!ok) break;
+    }
+    return Q * per;
+}
 static int cc_copy_regions(CcBuf *dst, CcBuf *src, const CcRegion *r, int n) {
     CcCtx *c = live();
     if (!c || !dst || !src || (n > 0 && !r)) return 0;
     for (int i = 0; i < n; i++)
         if ((r[i].dst + r[i].n) * 4 > dst->bytes || (r[i].src + r[i].n) * 4 > src->bytes) return 0;
     CcGrid g;
-    if (dst != src && dst->d && src->d && cc_grid_of(r, n, &g)) {   /* one kernel for the grid */
-        long long tot = (long long)g.n * g.len;
-        cc_copy_grid_k<<<grid1((size_t)tot, 256), 256, 0, c->stream>>>(dst->d, src->d, g);
-        return launched(c, "copy regions (grid)");
-    }
-    for (int i = 0; i < n; i++) {
-        if (!r[i].n) continue;
-        if (!cc_ok(c, cudaMemcpyAsync(dst->d + r[i].dst, src->d + r[i].src, r[i].n * 4, cudaMemcpyDefault, c->stream), "copy regions"))
+    const int grids = dst != src && dst->d && src->d;
+    for (int i = 0; i < n; ) {
+        int k = grids ? cc_grid_run(r + i, n - i) : 1;
+        if (k >= 2 && cc_grid_of(r + i, k, &g)) {   /* one kernel for each grid */
+            long long tot = (long long)g.n * g.len;
+            cc_copy_grid_k<<<grid1((size_t)tot, 256), 256, 0, c->stream>>>(dst->d, src->d, g);
+            if (!launched(c, "copy regions (grid)")) return 0;
+            i += k;
+            continue;
+        }
+        if (r[i].n && !cc_ok(c, cudaMemcpyAsync(dst->d + r[i].dst, src->d + r[i].src, r[i].n * 4, cudaMemcpyDefault, c->stream),
+                             "copy regions"))
             return 0;
+        i++;
     }
     g_st.ops++;
     return 1;
@@ -1263,17 +1526,20 @@ __host__ __device__ static inline int cc_attn_dec_len(int n, int H) {
     return L;
 }
 #define CC_ATTN_DEC_ROWS 8   /* a decode step's or a verify's rows (every engine's verify) */
-__global__ static void __launch_bounds__(256) cc_attn_dec_k(const float *__restrict__ q, const float *__restrict__ kc,
-        const float *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, float *__restrict__ xs,
-        CcAttn p, int mode, int nb, int win = 0, const float *__restrict__ snk = nullptr, int sink_off = 0, int ring = 0) {
+template <typename KT = float>
+__global__ static void __launch_bounds__(256) cc_attn_dec_k(const float *__restrict__ q, const KT *__restrict__ kc,
+        const KT *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, float *__restrict__ xs,
+        CcAttn p, int mode, int nb, int win = 0, const float *__restrict__ snk = nullptr, int sink_off = 0, int ring = 0,
+        int hc = 0) {   /* hc: the blocks' rule's heads (cc_attn_dec_len), 0 = H */
     __shared__ float qs[256];
     __shared__ float sc[256];
     __shared__ float red[8];
     int tid = threadIdx.x, wp = tid >> 5, lane = tid & 31, h = blockIdx.x, hd = p.hd, stride = hd + 2;
+    if (hc < 1) hc = p.H;
     if (mode == 0) {
         int b = blockIdx.y, s = blockIdx.z, kvh = h / (p.H / p.KVH);
         int n = p.pos_base + s + 1, first = win > 0 && n > win ? n - win : 0;   /* a window: its last win positions */
-        int L = cc_attn_dec_len(n - first, p.H), t0 = first + b * L, cnt = min(L, n - t0);
+        int L = cc_attn_dec_len(n - first, hc), t0 = first + b * L, cnt = min(L, n - t0);
         size_t xo = ((size_t)(s * p.H + h) * nb + b) * stride;
         if (cnt <= 0) {   /* past the row's positions: an empty block */
             if (tid == 0) { xs[xo] = -3.0e38f; xs[xo + 1] = 0.f; }
@@ -1285,9 +1551,9 @@ __global__ static void __launch_bounds__(256) cc_attn_dec_k(const float *__restr
         __syncthreads();
         int kbase = kvh * p.cap;
         for (int j = wp; j < cnt; j += 8) {
-            const float *kr = kc + p.k_off + (size_t)(kbase + (ring ? (t0 + j) % ring : t0 + j)) * hd;
+            const KT *kr = kc + p.k_off + (size_t)(kbase + (ring ? (t0 + j) % ring : t0 + j)) * hd;
             float a = 0.f;
-            for (int d = lane; d < hd; d += 32) a += qs[d] * kr[d];
+            for (int d = lane; d < hd; d += 32) a += qs[d] * cc_kvf(kr, d);
             for (int m = 16; m > 0; m >>= 1) a += cc_shfl_xor(a, m);
             if (lane == 0) sc[j] = a * p.scale;
         }
@@ -1309,30 +1575,259 @@ __global__ static void __launch_bounds__(256) cc_attn_dec_k(const float *__restr
         for (int g = 0; g < 8; g++) l += red[g];
         for (int d = tid; d < hd; d += 256) {
             float acc = 0.f;
-            for (int j = 0; j < cnt; j++) acc += sc[j] * vc[p.v_off + (size_t)(kbase + (ring ? (t0 + j) % ring : t0 + j)) * hd + d];
+            for (int j = 0; j < cnt; j++) acc += sc[j] * cc_kvf(vc, p.v_off + (size_t)(kbase + (ring ? (t0 + j) % ring : t0 + j)) * hd + d);
             xs[xo + 2 + d] = acc;
         }
         if (tid == 0) { xs[xo] = M; xs[xo + 1] = l; }
         return;
     }
+    /* the row's blocks joined: their max M (in any order: the same bits) with the sink's
+     * logit; each block's weight w = exp(m_b - M) once and l_b * w, 128 blocks at a time in
+     * sc (not a weight a value, each thread's loads one after the other); the sums over the
+     * blocks in block order, l's by thread 0 from sc, the values' loads four at a time, so the
+     * bits are a weight a value's (chain_attn_dec.comp's mode 1). hd <= 256 (qs) */
     int s = blockIdx.y, n = p.pos_base + s + 1, first = win > 0 && n > win ? n - win : 0;
-    int L = cc_attn_dec_len(n - first, p.H), nbr = (n - first + L - 1) / L;
+    int L = cc_attn_dec_len(n - first, hc), nbr = (n - first + L - 1) / L;
     size_t xo = (size_t)(s * p.H + h) * nb * stride;
+    float mm = -3.0e38f;
+    for (int b = tid; b < nbr; b += 256) mm = fmaxf(mm, xs[xo + (size_t)b * stride]);
+    for (int m = 16; m > 0; m >>= 1) mm = fmaxf(mm, cc_shfl_xor(mm, m));
+    if (lane == 0) red[wp] = mm;
+    __syncthreads();
     float M = snk ? snk[sink_off + h] : -3.0e38f;   /* the sink joins the max and the sum, with no value */
-    for (int b = 0; b < nbr; b++) M = fmaxf(M, xs[xo + (size_t)b * stride]);
-    float Lt = snk ? expf(snk[sink_off + h] - M) : 0.f;
-    for (int b = 0; b < nbr; b++) Lt += xs[xo + (size_t)b * stride + 1] * expf(xs[xo + (size_t)b * stride] - M);
+    for (int g = 0; g < 8; g++) M = fmaxf(M, red[g]);
+    float Lt = snk ? expf(snk[sink_off + h] - M) : 0.f, v = 0.f;
+    for (int b0 = 0; b0 < nbr; b0 += 128) {
+        int nc = min(128, nbr - b0);
+        __syncthreads();   /* red, then the last chunk's weights, read */
+        if (tid < nc) { size_t xb = xo + (size_t)(b0 + tid) * stride; float w = expf(xs[xb] - M); sc[tid] = w; sc[128 + tid] = xs[xb + 1] * w; }
+        __syncthreads();
+        if (tid == 0) for (int b = 0; b < nc; b++) Lt += sc[128 + b];
+        if (tid < hd) {
+            const float *xv = xs + xo + (size_t)b0 * stride + 2 + tid;
+            int b = 0;
+            for (; b + 4 <= nc; b += 4) {
+                float x0 = xv[(size_t)b * stride], x1 = xv[(size_t)(b + 1) * stride], x2 = xv[(size_t)(b + 2) * stride], x3 = xv[(size_t)(b + 3) * stride];
+                v += x0 * sc[b]; v += x1 * sc[b + 1]; v += x2 * sc[b + 2]; v += x3 * sc[b + 3];
+            }
+            for (; b < nc; b++) v += xv[(size_t)b * stride] * sc[b];
+        }
+    }
+    if (tid == 0) red[0] = Lt;
+    __syncthreads();
+    Lt = red[0];
     float inv = Lt > 0.f ? 1.f / Lt : 0.f;
     int ob = p.o_off + s * p.o_row + h * hd, gb = p.g_off + s * p.g_row + h * p.g_seg;
-    for (int d = tid; d < hd; d += 256) {
-        float v = 0.f;
-        for (int b = 0; b < nbr; b++) v += xs[xo + (size_t)b * stride + 2 + d] * expf(xs[xo + (size_t)b * stride] - M);
+    if (tid < hd) {
         v *= inv;
-        if (p.has_gate) v *= 1.f / (1.f + expf(-gt[gb + d]));
-        o[ob + d] = v;
+        if (p.has_gate) v *= 1.f / (1.f + expf(-gt[gb + tid]));
+        o[ob + tid] = v;
     }
 }
-static int cc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *sel, const CcAttn *p) {
+/* cc_attn_dec_k's mode 0 for the G query heads of a KV head at once: a block a (KV head, block
+ * of positions, row), each K and V row read once for the G heads instead of once a head, four
+ * floats a load (chain_attn_dec.comp's mode 2). Qwen3.6's eight heads a KV head after an 18K
+ * prompt read 74 MB of rows a layer eight times. The scores a thread or two a position; V a float4
+ * column a thread, the positions over 256 / (hd / 4) groups of threads, their sums added group by group.
+ * The blocks' rule counts four blocks a KV head (hc); the join is cc_attn_dec_k's mode 1 with
+ * that rule. Dynamic shared memory: the heads' q rows and scores, G * (hd + 256) floats. */
+template <int G, typename KT = float>
+__global__ static void __launch_bounds__(256) cc_attn_decg_k(const float *__restrict__ q, const KT *__restrict__ kc,
+        const KT *__restrict__ vc, float *__restrict__ xs, CcAttn p, int nb, int win, int ring, int hc, int tpp) {
+    extern __shared__ float4 cc_decg_sm[];
+    __shared__ float red[G * 8];
+    const int hd = p.hd, stride = hd + 2, NV = hd / 4, NG = 256 / NV;
+    float4 *qv = cc_decg_sm;                       /* G * NV: the heads' q rows, then the groups' V sums */
+    float *sc = (float *)(cc_decg_sm + G * NV);    /* G * 256 */
+    int tid = threadIdx.x, wp = tid >> 5, lane = tid & 31, kvh = blockIdx.x, b = blockIdx.y, s = blockIdx.z;
+    int n = p.pos_base + s + 1, first = win > 0 && n > win ? n - win : 0;
+    int L = cc_attn_dec_len(n - first, hc), t0 = first + b * L, cnt = min(L, n - t0);
+    size_t xo0 = ((size_t)(s * p.H + kvh * G) * nb + b) * stride, xg = (size_t)nb * stride;   /* head kvh * G + g at xo0 + g * xg */
+    if (cnt <= 0) {
+        if (tid < G) { xs[xo0 + tid * xg] = -3.0e38f; xs[xo0 + tid * xg + 1] = 0.f; }
+        for (int i = tid; i < G * hd; i += 256) xs[xo0 + (i / hd) * xg + 2 + i % hd] = 0.f;
+        return;
+    }
+    int qb = p.q_off + s * p.q_row + kvh * G * p.q_seg;
+    for (int i = tid; i < G * NV; i += 256) {
+        int g = i / NV, c = i - g * NV;
+        const float *x = q + qb + g * p.q_seg + 4 * c;
+        qv[i] = make_float4(x[0], x[1], x[2], x[3]);
+    }
+    __syncthreads();
+    int kbase = kvh * p.cap;
+    /* the scores. tpp 0: a K row over a warp's lanes, two float4s a lane, the heads' sums by
+     * shuffles; tpp 1, 2 or 4: that many threads a position (adjacent lanes, a float4 each in
+     * turn along the K row) against the G q rows, their sums joined across the tpp lanes, the max
+     * on the way (chain_attn_dec.comp's mode 2), the loop's trips the block's so every lane meets
+     * the shuffle. cc_decg_tpp chooses */
+    float M[G], e[G];
+#pragma unroll
+    for (int g = 0; g < G; g++) M[g] = -3.0e38f;
+    if (tpp == 0) {
+        for (int j = wp; j < cnt; j += 8) {
+            size_t kr = p.k_off + (size_t)(kbase + (ring ? (t0 + j) % ring : t0 + j)) * hd;
+            float4 kk[2];
+#pragma unroll
+            for (int i = 0; i < 2; i++) { int c = lane + 32 * i; kk[i] = c < NV ? cc_kv4(kc, kr + 4 * c) : make_float4(0.f, 0.f, 0.f, 0.f); }
+            float a[G];
+#pragma unroll
+            for (int g = 0; g < G; g++) a[g] = 0.f;
+#pragma unroll
+            for (int i = 0; i < 2; i++) {
+                int c = lane + 32 * i;
+                if (c < NV)
+#pragma unroll
+                    for (int g = 0; g < G; g++) {
+                        float4 x = qv[g * NV + c];
+                        a[g] += x.x * kk[i].x + x.y * kk[i].y + x.z * kk[i].z + x.w * kk[i].w;
+                    }
+            }
+#pragma unroll
+            for (int g = 0; g < G; g++) {
+                float x = a[g];
+                for (int m = 16; m > 0; m >>= 1) x += cc_shfl_xor(x, m);
+                if (lane == 0) sc[g * 256 + j] = x * p.scale;
+            }
+        }
+        __syncthreads();
+        for (int j = tid; j < cnt; j += 256)
+#pragma unroll
+            for (int g = 0; g < G; g++) M[g] = fmaxf(M[g], sc[g * 256 + j]);
+    } else {
+        int part = tid % tpp;
+        for (int j0 = 0; j0 < cnt; j0 += 256 / tpp) {
+            int j = j0 + tid / tpp;
+            float a[G];
+#pragma unroll
+            for (int g = 0; g < G; g++) a[g] = 0.f;
+            if (j < cnt) {
+                size_t kr = p.k_off + (size_t)(kbase + (ring ? (t0 + j) % ring : t0 + j)) * hd;
+#pragma unroll 4
+                for (int c = part; c < NV; c += tpp) {
+                    float4 kk = cc_kv4(kc, kr + 4 * c);
+#pragma unroll
+                    for (int g = 0; g < G; g++) {
+                        float4 x = qv[g * NV + c];
+                        a[g] += x.x * kk.x + x.y * kk.y + x.z * kk.z + x.w * kk.w;
+                    }
+                }
+            }
+            for (int m = 1; m < tpp; m <<= 1)
+#pragma unroll
+                for (int g = 0; g < G; g++) a[g] += cc_shfl_xor(a[g], m);
+            if (j < cnt)
+#pragma unroll
+                for (int g = 0; g < G; g++) {
+                    float x = a[g] * p.scale;
+                    if (part == 0) sc[g * 256 + j] = x;
+                    M[g] = fmaxf(M[g], x);
+                }
+        }
+    }
+#pragma unroll
+    for (int g = 0; g < G; g++) {
+        float x = M[g];
+        for (int m = 16; m > 0; m >>= 1) x = fmaxf(x, cc_shfl_xor(x, m));
+        if (lane == 0) red[g * 8 + wp] = x;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int g = 0; g < G; g++) { M[g] = red[g * 8]; for (int k = 1; k < 8; k++) M[g] = fmaxf(M[g], red[g * 8 + k]); }
+    __syncthreads();
+#pragma unroll
+    for (int g = 0; g < G; g++) e[g] = 0.f;
+    for (int j = tid; j < cnt; j += 256)
+#pragma unroll
+        for (int g = 0; g < G; g++) { float w = expf(sc[g * 256 + j] - M[g]); sc[g * 256 + j] = w; e[g] += w; }
+#pragma unroll
+    for (int g = 0; g < G; g++) {
+        float x = e[g];
+        for (int m = 16; m > 0; m >>= 1) x += cc_shfl_xor(x, m);
+        if (lane == 0) red[g * 8 + wp] = x;
+    }
+    __syncthreads();
+    int c = tid % NV, grp = tid / NV;
+    float4 acc[G];
+#pragma unroll
+    for (int g = 0; g < G; g++) acc[g] = make_float4(0.f, 0.f, 0.f, 0.f);
+    /* four positions' loads in flight, then their sums in position order (the bits of one at a time) */
+    int j = grp;
+    for (; j + 3 * NG < cnt; j += 4 * NG) {
+        float4 v[4];
+#pragma unroll
+        for (int u = 0; u < 4; u++) { int t = t0 + j + u * NG; v[u] = cc_kv4(vc, p.v_off + (size_t)(kbase + (ring ? t % ring : t)) * hd + 4 * c); }
+#pragma unroll
+        for (int u = 0; u < 4; u++)
+#pragma unroll
+            for (int g = 0; g < G; g++) {
+                float w = sc[g * 256 + j + u * NG];
+                acc[g].x += w * v[u].x; acc[g].y += w * v[u].y; acc[g].z += w * v[u].z; acc[g].w += w * v[u].w;
+            }
+    }
+    for (; j < cnt; j += NG) {
+        float4 v = cc_kv4(vc, p.v_off + (size_t)(kbase + (ring ? (t0 + j) % ring : t0 + j)) * hd + 4 * c);
+#pragma unroll
+        for (int g = 0; g < G; g++) {
+            float w = sc[g * 256 + j];
+            acc[g].x += w * v.x; acc[g].y += w * v.y; acc[g].z += w * v.z; acc[g].w += w * v.w;
+        }
+    }
+    for (int k = NG - 1; k >= 1; k--) {   /* the groups' sums into group 0's, the last group first */
+        if (grp == k)
+#pragma unroll
+            for (int g = 0; g < G; g++) {
+                float4 x = qv[g * NV + c];
+                qv[g * NV + c] = k == NG - 1 ? acc[g] : make_float4(x.x + acc[g].x, x.y + acc[g].y, x.z + acc[g].z, x.w + acc[g].w);
+            }
+        __syncthreads();
+    }
+    if (grp == 0)
+#pragma unroll
+        for (int g = 0; g < G; g++) {
+            float4 v = acc[g];
+            if (NG > 1) { float4 x = qv[g * NV + c]; v = make_float4(v.x + x.x, v.y + x.y, v.z + x.z, v.w + x.w); }
+            float *o = xs + xo0 + g * xg + 2 + 4 * c;
+            o[0] = v.x; o[1] = v.y; o[2] = v.z; o[3] = v.w;
+        }
+    if (tid < G) {
+        float l = 0.f;
+        for (int k = 0; k < 8; k++) l += red[tid * 8 + k];
+#pragma unroll
+        for (int g = 0; g < G; g++) if (g == tid) { xs[xo0 + g * xg] = M[g]; xs[xo0 + g * xg + 1] = l; }   /* M[] by a constant index */
+    }
+}
+/* the query heads a KV head cc_attn_decg_k takes (0: none, cc_attn_dec_k a head a block);
+ * COLI_CUDA_ATTN_DEC_GQA=0 never */
+static int cc_decg_heads(int G, int hd) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_ATTN_DEC_GQA"); on = !(e && *e == '0'); }
+    return on && hd >= 4 && hd <= 256 && hd % 4 == 0 && (G == 2 || G == 4 || G == 8 || G == 16) ? G : 0;
+}
+/* cc_attn_decg_k's scores: two threads a position, COLI_CUDA_ATTN_DEC_TPP (0, 1, 2 or 4) sets it.
+ * One layer after 18K positions in float16 on an RTX PRO 4000 (tests/test_cuda_chain.cu's
+ * COLI_CUDA_CHAIN_BENCH=adec), at 0 / 1 / 2 / 4: Qwen3.6's 16/2 heads of 256 115.0 / 128.1 /
+ * 108.6 / 108.5 us, Flint's 32/4 of 128 140.5 / 146.2 / 122.1 / 121.9 */
+static int cc_decg_tpp(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("COLI_CUDA_ATTN_DEC_TPP"); v = e && (*e == '0' || *e == '1' || *e == '2' || *e == '4') ? *e - '0' : 2; }
+    return v;
+}
+template <typename KT>
+static void cc_decg_launch(CcCtx *c, int G, const float *q, const KT *kc, const KT *vc, float *xs, const CcAttn &p, int nb,
+                           int win, int ring, int hc) {
+    dim3 g((unsigned)p.KVH, (unsigned)nb, (unsigned)p.S);
+    size_t sm = (size_t)G * (p.hd + 256) * sizeof(float);
+    int tpp = cc_decg_tpp();
+    switch (G) {
+    case 2: cc_attn_decg_k<2><<<g, 256, sm, c->stream>>>(q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
+    case 4: cc_attn_decg_k<4><<<g, 256, sm, c->stream>>>(q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
+    case 8: cc_attn_decg_k<8><<<g, 256, sm, c->stream>>>(q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
+    default: cc_attn_decg_k<16><<<g, 256, sm, c->stream>>>(q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
+    }
+}
+template <typename KT>
+static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *sel, const CcAttn *p) {
     CcCtx *c = live();
     if (!c || !q || !kc || !vc || !o || !p || p->S < 1 || p->H < 1 || p->KVH < 1 || p->H % p->KVH || p->hd < 1 || p->hd > 256) return 0;
     if (p->has_gate && !gate) return 0;
@@ -1344,11 +1839,13 @@ static int cc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf 
     if (fl < 0) { const char *e = getenv("COLI_CUDA_CHAIN_FLASH"); fl = e && *e ? atoi(e) : 16; if (fl < 0) fl = 0; }
     int G = p->H / p->KVH;
 #if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+    if (fl > 0 && p->S >= fl && p->sel_row <= 0 && cc_attn_f2_go<KT>(c, q, kc, vc, o, gate, p, G, 0, nullptr, 0, 0))
+        return launched(c, "attn (tensor cores, one pass)");
     if (fl > 0 && p->S >= fl && c->major >= 7 && p->sel_row <= 0 && 16 % G == 0 && (p->hd == 64 || p->hd == 128 || p->hd == 256)) {
         dim3 fg((unsigned)((p->S + 16 / G - 1) / (16 / G)), (unsigned)p->KVH);
-        if (p->hd == 64) cc_attn_fk<64><<<fg, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G);
-        else if (p->hd == 128) cc_attn_fk<128><<<fg, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G);
-        else cc_attn_fk<256><<<fg, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G);
+        if (p->hd == 64) cc_attn_fk<64><<<fg, 128, 0, c->stream>>>(fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G);
+        else if (p->hd == 128) cc_attn_fk<128><<<fg, 128, 0, c->stream>>>(fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G);
+        else cc_attn_fk<256><<<fg, 128, 0, c->stream>>>(fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G);
         return launched(c, "attn (tensor cores)");
     }
 #endif
@@ -1370,14 +1867,16 @@ static int cc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf 
         int k = CC_ATTN_DEC_MIN - (p->pos_base + 1);
         if (k > 0) {
             CcAttn a = *p; a.S = k;
-            cc_attn_k<<<dim3((unsigned)p->H, (unsigned)k), 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), nullptr, a);
+            cc_attn_k<<<dim3((unsigned)p->H, (unsigned)k), 128, 0, c->stream>>>(fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), nullptr, a);
             if (!launched(c, "attn")) return 0;
             CcAttn b = *p; b.S -= k; b.pos_base += k; b.q_off += k * p->q_row; b.o_off += k * p->o_row; b.g_off += k * p->g_row;
-            return cc_attn(q, kc, vc, o, gate, sel, &b);
+            return cc_attn_t<KT>(q, kc, vc, o, gate, sel, &b);
         }
-        int nb = 1;
+        /* a KV head's query heads a block where cc_attn_decg_k takes them (offsets of whole float4s):
+         * its rule counts four blocks a KV head */
+        int gq = p->k_off % 4 == 0 && p->v_off % 4 == 0 ? cc_decg_heads(G, p->hd) : 0, hc = gq ? 4 * p->KVH : p->H, nb = 1;
         for (int r = 0; r < p->S; r++) {
-            int n = p->pos_base + r + 1, L = cc_attn_dec_len(n, p->H), m = (n + L - 1) / L;
+            int n = p->pos_base + r + 1, L = cc_attn_dec_len(n, hc), m = (n + L - 1) / L;
             if (m > nb) nb = m;
         }
         size_t need = (size_t)p->S * p->H * nb * (p->hd + 2) * sizeof(float);
@@ -1392,16 +1891,20 @@ static int cc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf 
             else { c->adec = nullptr; (void)cudaGetLastError(); }
         }
         if (c->adec) {
-            cc_attn_dec_k<<<dim3((unsigned)p->H, (unsigned)nb, (unsigned)p->S), 256, 0, c->stream>>>(
-                fp(q), fp(kc), fp(vc), fpw(o), fp(gate), c->adec, *p, 0, nb);
+            if (gq) cc_decg_launch(c, gq, fp(q), kvp<KT>(kc), kvp<KT>(vc), c->adec, *p, nb, 0, 0, hc);
+            else cc_attn_dec_k<<<dim3((unsigned)p->H, (unsigned)nb, (unsigned)p->S), 256, 0, c->stream>>>(
+                fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), c->adec, *p, 0, nb);
             cc_attn_dec_k<<<dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream>>>(
-                fp(q), fp(kc), fp(vc), fpw(o), fp(gate), c->adec, *p, 1, nb);
+                fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), c->adec, *p, 1, nb, 0, nullptr, 0, 0, hc);
             return launched(c, "attn (positions in blocks)");
         }
     }
     dim3 grid((unsigned)p->H, (unsigned)p->S);
-    cc_attn_k<<<grid, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), sel ? (const int *)sel->d : nullptr, *p);
+    cc_attn_k<<<grid, 128, 0, c->stream>>>(fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), sel ? (const int *)sel->d : nullptr, *p);
     return launched(c, "attn");
+}
+static int cc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *sel, const CcAttn *p) {
+    return cc_attn_t<float>(q, kc, vc, o, gate, sel, p);
 }
 static int cc_dnconv(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf *snap, const CcDnConv *p) {
     CcCtx *c = live();
@@ -1604,14 +2107,15 @@ static const void *cc_dev_addr(const CcBuf *b) { return b ? (const void *)b->d :
  * on the tensor cores (cc_attn_fk), a decode's or a verify's rows split over their positions
  * (cc_attn_dec_k, only where a prompt takes cc_attn_fk, as in cc_attn), else cc_attn_k; each
  * row's positions the window's, the sink in each softmax's denominator. */
-static int cc_attn_w2(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *w, int ring) {
+template <typename KT>
+static int cc_attn_w2_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *w, int ring) {
     CcCtx *c = live();
     if (!w) return 0;
     const CcAttn *p = &w->a;
     if (!c || !q || !kc || !vc || !o || p->S < 1 || p->H < 1 || p->KVH < 1 || p->H % p->KVH || p->hd < 1 || p->hd > 256 ||
         p->sel_row > 0 || w->win < 0 || (w->sink && !snk) || (p->has_gate && !gate) || ring < 0 ||
         (ring && (ring != p->cap || w->win < 1 || ring < w->win + p->S - 1))) return 0;   /* a ring holds the step's rows and their windows */
-    if (!w->win && !w->sink) return cc_attn(q, kc, vc, o, gate, nullptr, p);
+    if (!w->win && !w->sink) return cc_attn_t<KT>(q, kc, vc, o, gate, nullptr, p);
     const float *sk = w->sink ? fp(snk) : nullptr;
     const int win = w->win, so = w->sink_off;
     static int fl = -1, dec = -1;
@@ -1620,11 +2124,13 @@ static int cc_attn_w2(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcB
     int G = p->H / p->KVH, fk = 0;
 #if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
     fk = fl > 0 && c->major >= 7 && 16 % G == 0 && (p->hd == 64 || p->hd == 128 || p->hd == 256);
+    if (fl > 0 && p->S >= fl && cc_attn_f2_go<KT>(c, q, kc, vc, o, gate, p, G, win, sk, so, ring))
+        return launched(c, "attn (tensor cores, one pass, window, sinks)");
     if (fk && p->S >= fl) {
         dim3 fg((unsigned)((p->S + 16 / G - 1) / (16 / G)), (unsigned)p->KVH);
-        if (p->hd == 64) cc_attn_fk<64><<<fg, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
-        else if (p->hd == 128) cc_attn_fk<128><<<fg, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
-        else cc_attn_fk<256><<<fg, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
+        if (p->hd == 64) cc_attn_fk<64><<<fg, 128, 0, c->stream>>>(fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
+        else if (p->hd == 128) cc_attn_fk<128><<<fg, 128, 0, c->stream>>>(fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
+        else cc_attn_fk<256><<<fg, 128, 0, c->stream>>>(fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
         return launched(c, "attn (tensor cores, window, sinks)");
     }
 #endif
@@ -1635,15 +2141,15 @@ static int cc_attn_w2(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcB
         while (k < p->S && CC_WPOS(k) < CC_ATTN_DEC_MIN) k++;
         if (k > 0) {
             CcAttn a = *p; a.S = k;
-            cc_attn_k<<<dim3((unsigned)p->H, (unsigned)k), 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), nullptr, a,
+            cc_attn_k<<<dim3((unsigned)p->H, (unsigned)k), 128, 0, c->stream>>>(fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), nullptr, a,
                                                                                 win, sk, so, ring);
             if (!launched(c, "attn (window, sinks)")) return 0;
             CcAttnW b = *w; b.a.S -= k; b.a.pos_base += k; b.a.q_off += k * p->q_row; b.a.o_off += k * p->o_row; b.a.g_off += k * p->g_row;
-            return cc_attn_w2(q, kc, vc, o, gate, snk, &b, ring);
+            return cc_attn_w2_t<KT>(q, kc, vc, o, gate, snk, &b, ring);
         }
-        int nb = 1;
+        int gq = p->k_off % 4 == 0 && p->v_off % 4 == 0 ? cc_decg_heads(G, p->hd) : 0, hc = gq ? 4 * p->KVH : p->H, nb = 1;   /* as in cc_attn */
         for (int r = 0; r < p->S; r++) {
-            int n = CC_WPOS(r), L = cc_attn_dec_len(n, p->H), m = (n + L - 1) / L;
+            int n = CC_WPOS(r), L = cc_attn_dec_len(n, hc), m = (n + L - 1) / L;
             if (m > nb) nb = m;
         }
         size_t need = (size_t)p->S * p->H * nb * (p->hd + 2) * sizeof(float);
@@ -1658,17 +2164,21 @@ static int cc_attn_w2(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcB
             else { c->adec = nullptr; (void)cudaGetLastError(); }
         }
         if (c->adec) {
-            cc_attn_dec_k<<<dim3((unsigned)p->H, (unsigned)nb, (unsigned)p->S), 256, 0, c->stream>>>(
-                fp(q), fp(kc), fp(vc), fpw(o), fp(gate), c->adec, *p, 0, nb, win, sk, so, ring);
+            if (gq) cc_decg_launch(c, gq, fp(q), kvp<KT>(kc), kvp<KT>(vc), c->adec, *p, nb, win, ring, hc);
+            else cc_attn_dec_k<<<dim3((unsigned)p->H, (unsigned)nb, (unsigned)p->S), 256, 0, c->stream>>>(
+                fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), c->adec, *p, 0, nb, win, sk, so, ring);
             cc_attn_dec_k<<<dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream>>>(
-                fp(q), fp(kc), fp(vc), fpw(o), fp(gate), c->adec, *p, 1, nb, win, sk, so, ring);
+                fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), c->adec, *p, 1, nb, win, sk, so, ring, hc);
             return launched(c, "attn (positions in blocks, window, sinks)");
         }
     }
     #undef CC_WPOS
-    cc_attn_k<<<dim3((unsigned)p->H, (unsigned)p->S), 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), nullptr, *p,
+    cc_attn_k<<<dim3((unsigned)p->H, (unsigned)p->S), 128, 0, c->stream>>>(fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), nullptr, *p,
                                                                          win, sk, so, ring);
     return launched(c, "attn (window, sinks)");
+}
+static int cc_attn_w2(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *w, int ring) {
+    return cc_attn_w2_t<float>(q, kc, vc, o, gate, snk, w, ring);
 }
 static int cc_attn_w(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *w) {
     return cc_attn_w2(q, kc, vc, o, gate, snk, w, 0);
@@ -1702,6 +2212,328 @@ static int cc_matmul_rows(ColiCudaTensor *t, CcBuf *ids, CcBuf *x, CcBuf *y, int
     }
     return launched(c, "matmul_rows");
 }
+/* copy_regions_h: float32 regions of src (offsets and lengths in floats) into a float16 cache
+ * (in halves), each value rounded to the nearest float16: a step's K and V rows into the
+ * mirrors of a float16 KV cache, whose values rope_f16 has already rounded */
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+__global__ static void cc_copy_grid_h_k(__half *__restrict__ d, const float *__restrict__ s, CcGrid g) {
+    long long gid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= (long long)g.n * g.len) return;
+    long long i = gid / g.len, j = gid - i * g.len, q = i / g.per, h = i - q * g.per;
+    d[g.d0 + q * g.dq + h * g.dh + j] = __float2half_rn(s[g.s0 + q * g.sq + h * g.sh + j]);
+}
+static int cc_copy_regions_h(CcBuf *dst, CcBuf *src, const CcRegion *r, int n) {
+    CcCtx *c = live();
+    if (!c || !dst || !src || !dst->d || !src->d || dst == src || (n > 0 && !r)) return 0;
+    for (int i = 0; i < n; i++)
+        if ((r[i].dst + r[i].n) * 2 > dst->bytes || (r[i].src + r[i].n) * 4 > src->bytes) return 0;
+    __half *d = reinterpret_cast<__half *>(dst->d);
+    for (int i = 0; i < n; ) {
+        int k = cc_grid_run(r + i, n - i);
+        CcGrid g;
+        if (!(k >= 2 && cc_grid_of(r + i, k, &g))) { k = 1; g = CcGrid{(long long)r[i].dst, (long long)r[i].src, 0, 0, 0, 0, (int)r[i].n, 1, 1}; }
+        long long tot = (long long)g.n * g.len;
+        if (tot > 0) {
+            cc_copy_grid_h_k<<<grid1((size_t)tot, 256), 256, 0, c->stream>>>(d, src->d, g);
+            if (!launched(c, "copy regions (float16)")) return 0;
+        }
+        i += k;
+    }
+    g_st.ops++;
+    return 1;
+}
+/* attn_h, attn_wh: attn and attn_wr over a float16 cache (its offsets in halves) */
+static int cc_attn_h(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *sel, const CcAttn *p) {
+    return cc_attn_t<__half>(q, kc, vc, o, gate, sel, p);
+}
+static int cc_attn_wh(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *w, int ring) {
+    return cc_attn_w2_t<__half>(q, kc, vc, o, gate, snk, w, ring);
+}
+static int cc_kvh(void) { return 1; }
+#else
+static int cc_copy_regions_h(CcBuf *, CcBuf *, const CcRegion *, int) { return 0; }
+static int cc_attn_h(CcBuf *, CcBuf *, CcBuf *, CcBuf *, CcBuf *, CcBuf *, const CcAttn *) { return 0; }
+static int cc_attn_wh(CcBuf *, CcBuf *, CcBuf *, CcBuf *, CcBuf *, CcBuf *, const CcAttnW *, int) { return 0; }
+static int cc_kvh(void) { return 0; }
+#endif
+/* ---- the decision engines' encoders: shaders/chain_enc.comp ------------------------
+ * Its six modes as kernels, the shader's arithmetic but for two choices that keep a row
+ * nearer the engines' own: the LayerNorm's mean and variance are summed in double, as
+ * laya.c and gliner_decide.c sum them, and the GELU is erff's (the shader fits its own
+ * erfc, GLSL having none). */
+__device__ static inline float cc_enc_act(float x, int k) {
+    if (k == 1) return 0.5f * x * (1.0f + erff(x * 0.70710678118654752f));
+    if (k == 2) return 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+    if (k == 3) return fmaxf(x, 0.0f);
+    return x;
+}
+__device__ static inline double cc_enc_sum256(double v, double *red, int tid) {
+    red[tid] = v;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        __syncthreads();
+    }
+    double s = red[0];
+    __syncthreads();
+    return s;
+}
+/* mode 0: a block a row, its values in registers before any write (y may be a or b) */
+__global__ static void cc_enc_norm_k(float *a, const float *b, const float *prm, float *y, CcEncNorm p) {
+    __shared__ double red[256];
+    int r = blockIdx.x, tid = threadIdx.x;
+    if (r >= p.rows) return;
+    const size_t ab = (size_t)p.a_off + (size_t)r * p.a_row, bb = (size_t)p.b_off + (size_t)r * p.b_row;
+    float t[16];
+    double s = 0.0;
+    for (int k = 0; k < 16; k++) {
+        int i = tid + 256 * k;
+        t[k] = 0.0f;
+        if (i < p.D) {
+            float v = a[ab + i];
+            if (p.flags & CC_ENC_ADD) v = v + b[bb + i];
+            t[k] = v;
+            s += v;
+        }
+    }
+    double mean = cc_enc_sum256(s, red, tid) / p.D, q = 0.0;
+    for (int k = 0; k < 16; k++) { int i = tid + 256 * k; if (i < p.D) { double c = (double)t[k] - mean; q += c * c; } }
+    double var = cc_enc_sum256(q, red, tid) / p.D;
+    float rstd = (float)(1.0 / sqrt(var + (double)p.eps));
+    const size_t yb = (size_t)p.y_off + (size_t)r * p.y_row;
+    for (int k = 0; k < 16; k++) {
+        int i = tid + 256 * k;
+        if (i >= p.D) continue;
+        if (p.flags & CC_ENC_SUM) a[ab + i] = t[k];
+        float o = (float)((double)t[k] - mean) * rstd * prm[p.w_off + i];
+        if (p.bias_off >= 0) o = o + prm[p.bias_off + i];
+        y[yb + i] = o;
+    }
+}
+/* mode 1 */
+__global__ static void cc_enc_bias_k(float *y, const float *prm, CcEncBias p) {
+    long long i = (long long)blockIdx.x * 256 + threadIdx.x;
+    if (i >= p.n) return;
+    int r = (int)(i / p.O), o = (int)(i - (long long)r * p.O);
+    size_t at = (size_t)p.y_off + (size_t)r * p.y_row + o;
+    float v = y[at];
+    if (p.b_off >= 0) v = v + prm[p.b_off + o];
+    y[at] = cc_enc_act(v, p.act);
+}
+/* mode 2 */
+__global__ static void cc_enc_geglu_k(const float *a, const float *prm, float *y, CcEncGeglu p) {
+    long long i = (long long)blockIdx.x * 256 + threadIdx.x;
+    if (i >= p.n) return;
+    int r = (int)(i / p.I), j = (int)(i - (long long)r * p.I);
+    size_t ab = (size_t)p.a_off + (size_t)r * p.a_row;
+    float u = a[ab + j], g = a[ab + p.I + j];
+    if (p.b_off >= 0) { u = u + prm[p.b_off + j]; g = g + prm[p.b_off + p.I + j]; }
+    y[(size_t)p.y_off + (size_t)r * p.y_row + j] = cc_enc_act(u, p.act) * g;
+}
+/* mode 3: a thread a (row, query or key, head, pair) */
+__global__ static void cc_enc_rope_k(float *x, const float *tab, const int *pos, CcEncRope p) {
+    long long i = (long long)blockIdx.x * 256 + threadIdx.x;
+    if (i >= p.n) return;
+    int half = p.hd / 2, per_row = 2 * p.H * half;
+    int r = (int)(i / per_row), rem = (int)(i - (long long)r * per_row);
+    int part = rem / (p.H * half), rem2 = rem - part * p.H * half, hh = rem2 / half, k = rem2 - hh * half;
+    size_t vb = (size_t)p.x_off + (size_t)r * p.x_row + (size_t)part * p.part_off + (size_t)hh * p.hd;
+    size_t ps = (size_t)pos[r] * half + k;
+    float c = tab[p.cos_off + ps], sn = tab[p.sin_off + ps];
+    float x0 = x[vb + k], x1 = x[vb + k + half];
+    x[vb + k] = x0 * c - x1 * sn;
+    x[vb + k + half] = x1 * c + x0 * sn;
+}
+/* mode 4 */
+__global__ static void cc_enc_addrow_k(float *y, const float *tab, const int *idx, CcEncAddRow p) {
+    long long i = (long long)blockIdx.x * 256 + threadIdx.x;
+    if (i >= p.n) return;
+    int r = (int)(i / p.D), d = (int)(i - (long long)r * p.D);
+    y[(size_t)p.y_off + (size_t)r * p.y_row + d] += tab[(size_t)p.t_off + (size_t)idx[r] * p.D + d];
+}
+/* mode 5: a block a (head, 16 rows), the union of their ranges in tiles of 32 rows, the
+ * softmax online (a running max and sum a row) */
+#define CC_EBQ 16
+#define CC_EBK 32
+#define CC_EHD 128
+__global__ static void __launch_bounds__(256) cc_enc_attn_k(const float *qkv, const float *c2p, const float *p2c, float *o,
+                                                            const int *rng, const int *ridx, const int *pos, CcEncAttn p) {
+    __shared__ float qs[CC_EBQ * CC_EHD];
+    __shared__ float kv[CC_EBK * (CC_EHD + 1)];
+    __shared__ float sc[CC_EBQ * CC_EBK];
+    __shared__ float mrow[CC_EBQ], lrow[CC_EBQ], crow[CC_EBQ];
+    __shared__ int rlo[CC_EBQ], rhi[CC_EBQ], rpos[CC_EBQ];
+    __shared__ int klo, khi;
+    const int S = p.S, hd = p.hd, HDP = CC_EHD + 1, rel = p.flags & (CC_ENC_C2P | CC_ENC_P2C);
+    int h = blockIdx.x, b0 = blockIdx.y * CC_EBQ, tid = threadIdx.x;
+    int nrow = S - b0 < CC_EBQ ? S - b0 : CC_EBQ;
+    for (int e = tid; e < nrow * hd; e += 256) {
+        int i = e / hd, d = e - i * hd;
+        qs[i * CC_EHD + d] = qkv[(size_t)p.q_off + (size_t)(b0 + i) * p.kv_row + (size_t)h * hd + d];
+    }
+    if (tid < CC_EBQ) {
+        if (tid < nrow) {
+            rlo[tid] = rng[2 * (b0 + tid)]; rhi[tid] = rng[2 * (b0 + tid) + 1];
+            rpos[tid] = rel ? pos[b0 + tid] : 0;
+        } else { rlo[tid] = 1; rhi[tid] = 0; rpos[tid] = 0; }
+        mrow[tid] = -3.0e38f; lrow[tid] = 0.0f;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int lo = 0x7fffffff, hi = -1;
+        for (int i = 0; i < nrow; i++) if (rlo[i] <= rhi[i]) { lo = min(lo, rlo[i]); hi = max(hi, rhi[i]); }
+        klo = lo; khi = hi;
+    }
+    __syncthreads();
+    int pi = tid >> 4, pd = tid & 15;   /* the PV step: row pi, dims pd + 16k */
+    float acc[8];
+    for (int k = 0; k < 8; k++) acc[k] = 0.0f;
+    for (int j0 = klo; j0 <= khi; j0 += CC_EBK) {
+        int nk = khi - j0 + 1 < CC_EBK ? khi - j0 + 1 : CC_EBK;
+        for (int e = tid; e < nk * hd; e += 256) {
+            int jj = e / hd, d = e - jj * hd;
+            kv[jj * HDP + d] = qkv[(size_t)p.k_off + (size_t)(j0 + jj) * p.kv_row + (size_t)h * hd + d];
+        }
+        __syncthreads();
+        for (int u = 0; u < 2; u++) {
+            int pr = tid + 256 * u, i = pr / CC_EBK, jj = pr - i * CC_EBK, j = j0 + jj;
+            float sv = 0.0f;
+            if (i < nrow && jj < nk && j >= rlo[i] && j <= rhi[i]) {
+                float sum = 0.0f;
+                for (int d = 0; d < hd; d++) sum += qs[i * CC_EHD + d] * kv[jj * HDP + d];
+                if (rel) {
+                    int rr = ridx[rpos[i] - pos[j] + p.rc] - p.r0;
+                    if (p.flags & CC_ENC_C2P) sum += c2p[(size_t)p.c_off + ((size_t)h * S + b0 + i) * p.nr + rr];
+                    if (p.flags & CC_ENC_P2C) sum += p2c[(size_t)p.p_off + ((size_t)h * S + j) * p.nr + rr];
+                }
+                sv = sum * p.scale;
+            }
+            sc[i * CC_EBK + jj] = sv;
+        }
+        __syncthreads();
+        if (tid < CC_EBQ) {
+            int i = tid;
+            float m = mrow[i], mn = m;
+            int jlo = rlo[i] - j0 > 0 ? rlo[i] - j0 : 0, jhi = rhi[i] - j0 < nk - 1 ? rhi[i] - j0 : nk - 1;
+            for (int jj = jlo; jj <= jhi; jj++) mn = fmaxf(mn, sc[i * CC_EBK + jj]);
+            float l = 0.0f;
+            for (int jj = 0; jj < CC_EBK; jj++) {
+                float e = jj >= jlo && jj <= jhi ? expf(sc[i * CC_EBK + jj] - mn) : 0.0f;
+                sc[i * CC_EBK + jj] = e;
+                l += e;
+            }
+            float cr = expf(m - mn);
+            crow[i] = cr;
+            lrow[i] = lrow[i] * cr + l;
+            mrow[i] = mn;
+        }
+        __syncthreads();
+        for (int e = tid; e < nk * hd; e += 256) {
+            int jj = e / hd, d = e - jj * hd;
+            kv[jj * HDP + d] = qkv[(size_t)p.v_off + (size_t)(j0 + jj) * p.kv_row + (size_t)h * hd + d];
+        }
+        __syncthreads();
+        if (pi < nrow) {
+            float cr = crow[pi];
+            for (int k = 0; k < 8; k++) {
+                int d = pd + 16 * k;
+                if (d >= hd) break;
+                float t = acc[k] * cr;
+                for (int jj = 0; jj < nk; jj++) t += sc[pi * CC_EBK + jj] * kv[jj * HDP + d];
+                acc[k] = t;
+            }
+        }
+        __syncthreads();
+    }
+    if (pi < nrow) {
+        float l = lrow[pi], inv = l > 0.0f ? 1.0f / l : 0.0f;
+        for (int k = 0; k < 8; k++) {
+            int d = pd + 16 * k;
+            if (d >= hd) break;
+            o[(size_t)p.o_off + (size_t)(b0 + pi) * p.o_row + (size_t)h * hd + d] = acc[k] * inv;
+        }
+    }
+}
+/* mode 6: a block 16 rows by 64 buckets of one head, the inputs 32 at a time */
+#define CC_EBR 64
+#define CC_EDC 32
+__global__ static void __launch_bounds__(256) cc_enc_rel_k(const float *x, const float *pt, float *y, CcEncRel p) {
+    __shared__ float xs[CC_EBQ * (CC_EDC + 1)];
+    __shared__ float ps[CC_EBR * (CC_EDC + 1)];
+    int t0 = blockIdx.x * CC_EBR, i0 = blockIdx.y * CC_EBQ, h = blockIdx.z;
+    int tid = threadIdx.x, tt = tid & 63, iq = tid >> 6;   /* bucket tt, rows 4iq .. 4iq+3 */
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int d0 = 0; d0 < p.hd; d0 += CC_EDC) {
+        int dn = p.hd - d0 < CC_EDC ? p.hd - d0 : CC_EDC;
+        for (int e = tid; e < CC_EBQ * CC_EDC; e += 256) {
+            int i = e / CC_EDC, d = e - i * CC_EDC;
+            xs[i * (CC_EDC + 1) + d] = i0 + i < p.S && d < dn ? x[(size_t)p.x_off + (size_t)(i0 + i) * p.x_row + (size_t)h * p.hd + d0 + d] : 0.0f;
+        }
+        for (int e = tid; e < CC_EBR * CC_EDC; e += 256) {
+            int t = e / CC_EDC, d = e - t * CC_EDC;
+            ps[t * (CC_EDC + 1) + d] = t0 + t < p.nr && d < dn ? pt[(size_t)p.p_off + (size_t)(p.r0 + t0 + t) * p.p_row + (size_t)h * p.hd + d0 + d] : 0.0f;
+        }
+        __syncthreads();
+        for (int d = 0; d < dn; d++) {
+            float pv = ps[tt * (CC_EDC + 1) + d];
+            for (int k = 0; k < 4; k++) acc[k] += xs[(4 * iq + k) * (CC_EDC + 1) + d] * pv;
+        }
+        __syncthreads();
+    }
+    if (t0 + tt < p.nr)
+        for (int k = 0; k < 4; k++) {
+            int i = i0 + 4 * iq + k;
+            if (i < p.S) y[(size_t)p.y_off + ((size_t)h * p.S + i) * p.nr + t0 + tt] = acc[k];
+        }
+}
+static int cc_enc_norm(CcBuf *a, CcBuf *b, CcBuf *prm, CcBuf *y, const CcEncNorm *p) {
+    CcCtx *c = live();
+    if (!c || !a || !prm || !y || !p || p->rows < 1 || p->D < 1 || p->D > 4096 || ((p->flags & CC_ENC_ADD) && !b)) return 0;
+    cc_enc_norm_k<<<(unsigned)p->rows, 256, 0, c->stream>>>(fpw(a), fp(b), fp(prm), fpw(y), *p);
+    return launched(c, "encoder norm");
+}
+static int cc_enc_bias(CcBuf *y, CcBuf *prm, const CcEncBias *p) {
+    CcCtx *c = live();
+    if (!c || !y || !p || p->n < 1 || p->O < 1 || (p->b_off >= 0 && !prm)) return 0;
+    cc_enc_bias_k<<<grid1((size_t)p->n, 256), 256, 0, c->stream>>>(fpw(y), fp(prm), *p);
+    return launched(c, "encoder bias");
+}
+static int cc_enc_geglu(CcBuf *a, CcBuf *prm, CcBuf *y, const CcEncGeglu *p) {
+    CcCtx *c = live();
+    if (!c || !a || !y || !p || p->n < 1 || p->I < 1 || (p->b_off >= 0 && !prm)) return 0;
+    cc_enc_geglu_k<<<grid1((size_t)p->n, 256), 256, 0, c->stream>>>(fp(a), fp(prm), fpw(y), *p);
+    return launched(c, "encoder geglu");
+}
+static int cc_enc_rope(CcBuf *x, CcBuf *tab, CcBuf *pos, const CcEncRope *p) {
+    CcCtx *c = live();
+    if (!c || !x || !tab || !pos || !p || p->n < 1 || p->H < 1 || p->hd < 2) return 0;
+    cc_enc_rope_k<<<grid1((size_t)p->n, 256), 256, 0, c->stream>>>(fpw(x), fp(tab), (const int *)pos->d, *p);
+    return launched(c, "encoder rope");
+}
+static int cc_enc_addrow(CcBuf *y, CcBuf *tab, CcBuf *idx, const CcEncAddRow *p) {
+    CcCtx *c = live();
+    if (!c || !y || !tab || !idx || !p || p->n < 1 || p->D < 1) return 0;
+    cc_enc_addrow_k<<<grid1((size_t)p->n, 256), 256, 0, c->stream>>>(fpw(y), fp(tab), (const int *)idx->d, *p);
+    return launched(c, "encoder add row");
+}
+static int cc_enc_attn(CcBuf *qkv, CcBuf *c2p, CcBuf *p2c, CcBuf *o, CcBuf *rng, CcBuf *ridx, CcBuf *pos, const CcEncAttn *p) {
+    CcCtx *c = live();
+    int rel = p ? p->flags & (CC_ENC_C2P | CC_ENC_P2C) : 0;
+    if (!c || !qkv || !o || !rng || !p || p->S < 1 || p->H < 1 || p->hd < 1 || p->hd > CC_EHD || (p->S + CC_EBQ - 1) / CC_EBQ > 65535 ||
+        (rel && (!ridx || !pos)) || ((p->flags & CC_ENC_C2P) && !c2p) || ((p->flags & CC_ENC_P2C) && !p2c)) return 0;
+    dim3 g((unsigned)p->H, (unsigned)((p->S + CC_EBQ - 1) / CC_EBQ));
+    cc_enc_attn_k<<<g, 256, 0, c->stream>>>(fp(qkv), fp(c2p), fp(p2c), fpw(o), (const int *)rng->d,
+                                           ridx ? (const int *)ridx->d : nullptr, pos ? (const int *)pos->d : nullptr, *p);
+    return launched(c, "encoder attention");
+}
+static int cc_enc_rel(CcBuf *x, CcBuf *pt, CcBuf *y, const CcEncRel *p) {
+    CcCtx *c = live();
+    if (!c || !x || !pt || !y || !p || p->S < 1 || p->H < 1 || p->hd < 1 || p->nr < 1 || p->H > 65535 ||
+        (p->S + CC_EBQ - 1) / CC_EBQ > 65535) return 0;
+    dim3 g((unsigned)((p->nr + CC_EBR - 1) / CC_EBR), (unsigned)((p->S + CC_EBQ - 1) / CC_EBQ), (unsigned)p->H);
+    cc_enc_rel_k<<<g, 256, 0, c->stream>>>(fp(x), fp(pt), fpw(y), *p);
+    return launched(c, "encoder relative products");
+}
 static const ColiCudaChainOps g_cc_ops = {
     sizeof(ColiCudaChainOps),
     cc_init, cc_ready, cc_lost_, cc_shutdown, cc_device, cc_device_now,
@@ -1721,5 +2553,10 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_rope_f16,
     cc_pick,
     cc_matmul_rows,
+    cc_kvh,
+    cc_attn_h,
+    cc_attn_wh,
+    cc_copy_regions_h,
+    cc_enc_norm, cc_enc_bias, cc_enc_geglu, cc_enc_rope, cc_enc_addrow, cc_enc_attn, cc_enc_rel,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }
