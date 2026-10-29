@@ -18,6 +18,7 @@
     X(vkAllocateCommandBuffers) X(vkAllocateDescriptorSets) X(vkAllocateMemory) \
     X(vkBeginCommandBuffer) X(vkBindBufferMemory) X(vkCmdBindDescriptorSets) \
     X(vkCmdBindPipeline) X(vkCmdCopyBuffer) X(vkCmdDispatch) X(vkCmdDispatchIndirect) X(vkCmdFillBuffer) \
+    X(vkCmdSetEvent) X(vkCmdWaitEvents) X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkSetEvent) X(vkGetEventStatus) \
     X(vkCmdPipelineBarrier) X(vkCmdPushConstants) X(vkCmdResetQueryPool) \
     X(vkCmdWriteTimestamp) X(vkCreateBuffer) X(vkCreateCommandPool) \
     X(vkCreateComputePipelines) X(vkCreateDescriptorPool) X(vkCreateDescriptorSetLayout) \
@@ -67,6 +68,13 @@ int coli_vk_load(void);
 #define vkCreateDescriptorSetLayout coli_vkCreateDescriptorSetLayout
 #define vkCreateDevice coli_vkCreateDevice
 #define vkCreateFence coli_vkCreateFence
+#define vkCmdSetEvent coli_vkCmdSetEvent
+#define vkCmdWaitEvents coli_vkCmdWaitEvents
+#define vkCreateEvent coli_vkCreateEvent
+#define vkDestroyEvent coli_vkDestroyEvent
+#define vkResetEvent coli_vkResetEvent
+#define vkSetEvent coli_vkSetEvent
+#define vkGetEventStatus coli_vkGetEventStatus
 #define vkCreateInstance coli_vkCreateInstance
 #define vkCreatePipelineLayout coli_vkCreatePipelineLayout
 #define vkCreateQueryPool coli_vkCreateQueryPool
