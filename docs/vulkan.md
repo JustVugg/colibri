@@ -1561,7 +1561,7 @@ of RAM) decode 6.9-7.1 -> 9.4-10.4 tok/s and a 173-token prompt 22.2-22.7 -> 17.
 | | olmoe | inkling |
 |---|---|---|
 | device, frame A1 | the layer before's routed sum joining the residual; the input norm; q/k/v; OLMoE's q and k norms over the whole projection; RoPE from the CPU's table; the K/V rows into the device mirror; attention; o_proj; the residual add; the post-attention norm; the router logits | the layer before's MoE output joining the residual (the routed sum, then each shared expert times its combine weight, `moe()`'s order, then the MLP's short convolution and the add); the input norm; q/k/v and the bias projection r; the short convolutions on K and V with their rings; the per-head q/k norms; the attention (`chain_relattn.comp`); the K/V rows into the device ring; o_proj; the attention's short convolution; the residual add; the post-attention norm; the router logits (routed and shared). A dense-MLP layer runs its MLP, global scale, short convolution and add in the same frame |
-| host | softmax, top-k, the routed experts (the tier's batch and the CPU's share in rank order: the code `moe()` runs); the K/V rows into the host's cache; `PILOT`'s prefetch (below) | the sigmoid router with its bias, top-k, the joint combine weights, `TOPP`; the routed experts (`moe_ex`: `moe()`'s code, the device's logits handed in, the shared experts left out); the K/V rows into the host's cache |
+| host | softmax, top-k, the routed experts (the tier's batch and the CPU's share in rank order: the code `moe()` runs); the K/V rows into the host's cache where it stays canonical (below); `PILOT`'s prefetch (below) | the sigmoid router with its bias, top-k, the joint combine weights, `TOPP`; the routed experts (`moe_ex`: `moe()`'s code, the device's logits handed in, the shared experts left out); the K/V rows into the host's cache |
 | device, frame A2 (not waited for) | none: OLMoE has no shared expert | the shared experts, unweighted |
 | last frame | the final norm and lm_head on the last row | the final norm, the division by the width multiplier, lm_head; the per-position heads (logprobs, teacher forcing) read the final rows on the host |
 
@@ -1583,8 +1583,22 @@ in shared memory past what the device allows: Inkling's hidden size (6144) and i
 GEMV reading from the buffer; `tools/make_tiny_inkling.py --wide` makes a two-layer
 model at D = 6144 for the tests.
 
-**State.** Both keep the host's K/V cache canonical and copy each step's rows back.
-olmoe mirrors it behind qwen36's watermark. Its K and V values are float16's (`KV16`, the
+**State.** Inkling keeps the host's K/V cache canonical and copies each step's rows back.
+olmoe mirrors the host's cache behind qwen36's watermark, and where the mirror holds the
+whole context the device's cache is the one that counts: a step's K/V rows stay on the
+device, and the host's cache holds them only up to a second watermark (`host_kv`). It
+catches up when the CPU needs it: a step the chain declines (prompts only, a memory
+refusal) first reads the rows below its position down (`olc_sync`), a declined second
+device its own layers' rows, and a device lost mid-step rebuilds them on the CPU from the
+token ids every step recorded (`olc_recover`; `COLI_VK_CHAIN_FAULT=n` fakes it). Bringing
+every step's rows down cost OLMoE-1B-7B Q4_K_M on an RTX PRO 4000 a host-visible buffer of
+the prompt's size (about 1 GB at 3.8K tokens, allocated again for every longer prompt:
+145-208 ms), its copy over the bus and the host's copies after the frame. Without
+it, alternating server starts, prompts of 1.1K / 3.8K tokens 4809-4826 / 5205-5269 ->
+7274-7307 / 8062-8108 tok/s, decode after them 271.7-272.2 / 215.7-216.5 -> 280.2-280.9 /
+222.1-222.9 (the reference GGUF engine's Vulkan: 5655-5671 / 6126-6166, decode 273.1-273.9
+/ 209.8-216.9). The split below keeps the host's cache canonical (its CPU part reads the
+older rows there), and so does `COLI_VK_CHAIN_DEVKV=0`. Its K and V values are float16's (`KV16`, the
 default): the CPU rounds a step's rows before anything reads them and keeps them in its
 float32 arrays, and the chain's mirror holds them in float16 (`COLI_VK_KV16`), its rows
 rounded on the way in (`vkc_copy_regions_h`) and again by the host as they come down, so

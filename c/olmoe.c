@@ -2141,9 +2141,11 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     if (g_vk_chain) {
         int rows_only = 0;
         chain_logit = falloc(c->vocab);
-        chain_n = olc_forward(m, x, S, pos_base, g_echo_k > 0 && g_echo_id && S > 1, chain_logit, &rows_only);
+        chain_n = olc_forward(m, ids, x, S, pos_base, g_echo_k > 0 && g_echo_id && S > 1, chain_logit, &rows_only);
+        olc_fed(m, ids, pos_base, S);   /* every step's ids, whoever runs it (olc_recover) */
         if (!chain_n) {
             free(chain_logit); chain_logit = NULL;
+            olc_host_kv(m, pos_base, S);   /* the device's rows below pos_base into the host's cache, for the CPU */
             olc_cpu_step(m, pos_base);
             /* the primary's layers may have run before the second device's were lost: their
              * residual is in x, and the CPU redoes the whole step from the embedding */
@@ -3139,10 +3141,27 @@ static void serve_loop(Model *m, Tok *T, int ctx_cap) {
 }
 
 /* ---------- lettura ref.json ---------- */
+/* qwen38.c's: a file that is not an oracle's (no such array, a value that is no token id)
+ * is refused with a line, where it read through a null pointer */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
     jval *a = json_get(o, key);
-    int *r = malloc(a->len * sizeof(int));
-    for (int i = 0; i < a->len; i++) r[i] = (int)a->kids[i]->num;
+    if (!a || a->t != J_ARR) { fprintf(stderr, "ref.json: missing array \"%s\"\n", key); exit(1); }
+    if ((uint64_t)a->len > SIZE_MAX / sizeof(int)) {
+        fprintf(stderr, "ref.json: invalid array length for \"%s\"\n", key); exit(1);
+    }
+    /* lengths and id ranges are ref_fits()'s, once the vocabulary is known: here only
+     * what the cast to int needs */
+    int *r = malloc((size_t)(a->len ? a->len : 1) * sizeof(int));
+    if (!r) { fprintf(stderr, "ref.json: OOM reading \"%s\"\n", key); exit(1); }
+    for (int i = 0; i < a->len; i++) {
+        jval *v = a->kids[i];
+        if (!v || v->t != J_NUM || !isfinite(v->num) || v->num < INT_MIN ||
+            v->num > INT_MAX || floor(v->num) != v->num) {
+            fprintf(stderr, "ref.json: %s[%d] is not an integer\n", key, i);
+            exit(1);
+        }
+        r[i] = (int)v->num;
+    }
     *n_out = a->len; return r;
 }
 
