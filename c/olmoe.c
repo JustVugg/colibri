@@ -50,6 +50,7 @@
 #include "omp_tune.h"
 #include "route_trace.h"                    /* shared routing telemetry (#700) */
 #include "kv_prefix.h"
+#include "prompt_break.h"   /* a served prompt that a CANCEL stops between two layers */
 #include "pin_pool.h"                       /* piu scatti annidati */   /* riuso del prefisso tra turni (shared) */
 #include "serve_codec.h"
 #include "serve_budget.h"
@@ -1934,6 +1935,7 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
     int D = c->hidden;
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
     for (int i = layer_begin; i < layer_end; i++) {
+        if (coli_prompt_break()) break;   /* a served prompt's CANCEL: step() leaves without the rest */
         Layer *l = &m->L[i];
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
         double t_attn = now_s();
@@ -2165,6 +2167,11 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     }
 #endif
     if (!chain_logit) layers_forward_range(m, x, S, pos_base, chain_n, c->n_layers, 1);
+    /* A CANCEL stopped a served prompt between two layers (olm_serve_start): kv_len and the
+     * kv_prefix record stay where they were. This is a model of attention alone, so the rows
+     * the stopped layers wrote are past kv_len, a stale tail the next step overwrites, and the
+     * prefix held before the prompt is still whole. */
+    if (!chain_logit && coli_prompt_broken()) { free(x); return NULL; }
     /* count actual tokens processed (S>1 during prefill) */
     m->token_count += S; m->freq_token_count += S;
     if (!m->hot_pinned && m->hot_n > 0 && m->freq_token_count >= m->warmup_tokens)
@@ -2723,8 +2730,19 @@ typedef struct { double t0, attn0, moe0, head0; uint64_t h0, m0, disk0; long lon
  * prefix reuse and the pins, the prefill and its read-out. 1 with the prompt's ids
  * and the logits after it; 0 when the request ended here, its ERROR written.
  * serve_one and serve_mux start every request here. */
+/* A lone request's prompt polls for its CANCEL between two layers of the CPU's path
+ * (prompt_break.h). The multiplexed loop owns its command stream and reads it between steps. */
+static int olm_prompt_poll(ColiPromptBreak *b) {
+    while (!b->control && !b->eof && coli_stdin_readable()) {
+        int r = serve_read_cmd(stdin, stdout, b->id);
+        if (r < 0) b->eof = 1;   /* as the decode loop: it stops at its next read */
+        else if (r > 0) b->control = 1;
+    }
+    return b->control;
+}
+
 static int olm_serve_start(Model *m, Tok *T, SReq *q, int ctx_cap, int **ids_out, int *np_out,
-                           float **logit_out, OlmReqClock *clk) {
+                           float **logit_out, OlmReqClock *clk, int lone) {
     Cfg *c = &m->c;
     int cap = q->plen + 16;
     int *ids = malloc((size_t)cap * sizeof(int));
@@ -2803,7 +2821,37 @@ static int olm_serve_start(Model *m, Tok *T, SReq *q, int ctx_cap, int **ids_out
     /* `reuse` is the ABSOLUTE position of the first fresh token: attention
      * and the KV rows are position-indexed, so this has to be the real
      * offset, not a count of what is left to do. */
-    float *logit = step(m, ids + reuse, np - reuse, reuse);
+    ColiPromptBreak brk = {.poll = olm_prompt_poll, .id = q->id};
+    int chain = 0;   /* a chain runs its own layers on the device and is not stopped inside */
+#ifdef COLI_VULKAN
+    chain |= g_vk_chain != 0;
+#endif
+#ifdef COLI_CUDA
+    chain |= g_occ && g_occ->ok && !g_occ->failed;
+#endif
+    float *logit = NULL;
+    if (lone && chain && q->logprobs == 0) {
+        /* a chain is not stopped inside its forward: the prompt goes in segments, checked
+         * between them, each a whole step (kv_len and the record follow it) */
+        int seg = coli_prompt_segment_rows(2048);
+        for (int at = reuse; at < np; ) {
+            if (coli_prompt_poll(&brk)) { free(logit); logit = NULL; break; }
+            int n = np - at < seg ? np - at : seg;
+            float *next = step(m, ids + at, n, at);
+            free(logit); logit = next; at += n;
+        }
+    } else {
+        if (lone && q->logprobs == 0) g_coli_prompt_break = &brk;
+        logit = step(m, ids + reuse, np - reuse, reuse);
+        g_coli_prompt_break = NULL;
+    }
+    if (!logit) {
+        coli_prompt_break_log(1, m->kvp.len, np);
+        g_echo_k = 0; g_echo_id = NULL;
+        coli_serve_write_error(stdout, q->id, "CANCELLED");
+        free(ids);
+        return 0;
+    }
     if (q->pin && logit) {
         coli_pin_pool_init(&g_pins, c->vocab);
         if (coli_pin_store(&g_pins, ids, np, logit)) {
@@ -2818,7 +2866,7 @@ static int olm_serve_start(Model *m, Tok *T, SReq *q, int ctx_cap, int **ids_out
 static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     Cfg *c = &m->c;
     int *ids = NULL, np = 0; float *logit = NULL; OlmReqClock clk;
-    if (!olm_serve_start(m, T, q, ctx_cap, &ids, &np, &logit, &clk)) return 0;
+    if (!olm_serve_start(m, T, q, ctx_cap, &ids, &np, &logit, &clk, 1)) return 0;
     double t0 = clk.t0;
     uint64_t h0 = clk.h0, m0 = clk.m0;
     uint64_t disk0 = clk.disk0;
@@ -3072,7 +3120,7 @@ static void serve_mux(Model *m, Tok *T, int ctx_cap) {
                         t->q.payload = (char *)coli_serve_command_take_payload(&command);
                         t->q.plen = (int)command.payload_bytes;
                         olm_mux_bind(m, command.slot);
-                        int ok = olm_serve_start(m, T, &t->q, ctx_cap, &t->ids, &t->np, &t->lo, &t->clk);
+                        int ok = olm_serve_start(m, T, &t->q, ctx_cap, &t->ids, &t->np, &t->lo, &t->clk, 0);
                         free(t->q.payload); t->q.payload = NULL;
                         if (ok) {
                             t->active = 1; t->limited = 1;

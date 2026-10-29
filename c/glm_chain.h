@@ -688,6 +688,10 @@ static int glmc_forward_seg(Model *m, GlmChain *ch, float *xh, int S, int pos_ba
     float *inv = R ? malloc((size_t)(R / 2) * sizeof(float)) : NULL;
     for (int j = 0; j < R / 2; j++) inv[j] = powf(c->theta, -2.0f * j / R);   /* rope_interleave's frequencies */
     for (int c0 = 0, ci = 0; c0 < S; c0 += rows, ci++) {
+        /* a served prompt's STOP or CANCEL between two chunks (prompt_break.h): not taken, and
+         * the CPU's loop sees the stop before its first layer; the chunks before it are in the
+         * KV (pulled), past the slot's length, which mux_submit leaves where it was */
+        if (coli_prompt_break()) { free(inv); free(outs); return 0; }
         int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0;
         for (int s = 0; s < n && R; s++)    /* the CPU's own angles, cosines and sines */
             for (int j = 0; j < R / 2; j++) {

@@ -82,6 +82,7 @@
 #include "sparse_attn.h"
 #include "omp_tune.h"
 #include "kv_prefix.h"
+#include "prompt_break.h"   /* a served prompt that a STOP or CANCEL stops between two layers */
 #include "pin_pool.h"   /* riuso del prefisso tra turni (shared) */
 #include "spec_draft.h" /* the verify depth from DSpark's confidence (SpecGate) */
 #include <pthread.h>   /* ehit_mark publishes the lazy HITS table under a lock */
@@ -4561,13 +4562,18 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int spe
     /* the dense chain runs its layers on the device (every layer, or a partial chain's
      * first N, the streams of every row then back here); 0: the CPU runs them all */
     int chained = v41c_forward(m, h, pre_mix, n, start_pos, spec_batch, rows_out);
-    if (!chained) v41c_cpu_step(m, start_pos);
+    if (!chained && !coli_prompt_broken()) v41c_cpu_step(m, start_pos);   /* stopped: no CPU redo */
 #else
     int chained = 0;
 #endif
     if (tail > 0 && tail < n && chained > tail_after)   /* the chain took the tail past the source: its rows from here on */
         v41_take_tail(m, h, pre_mix, &n, &start_pos, tail, targets, &trace_row);
+    int stopped = 0;
     for (int layer = chained; layer < c->n_layers; layer++) {
+        /* a served prompt's STOP or CANCEL (prompt_break.h, v41_serve_start): m->pos and the
+         * kv_prefix record stay as they were, and the caller resets the state the layers
+         * before this one wrote into (the window rings, the compressor, the index keys) */
+        if (coli_prompt_break()) { stopped = 1; break; }
         Layer *l = &m->L[layer];
         if (l->engram_index >= 0) engram_run(m, layer, h, n, start_pos);
         for (int k = 0; k < targets; k++) {
@@ -4641,6 +4647,11 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int spe
             v41_take_tail(m, h, pre_mix, &n, &start_pos, tail, targets, &trace_row);
     }
 
+    if (stopped) {
+        free(collapsed); free(comb); free(post); free(pre);
+        free(residual); free(branch_out); free(branch_in); free(pre_mix); free(h);
+        return;
+    }
     /* the last block's FFN mix collapses the stream one final time */
     for (int t = rows_out ? 0 : n - 1; t < n; t++) {
         const float *mix = pre_mix + (size_t)t * hc;
@@ -5177,8 +5188,24 @@ typedef struct {
  * the prefix reuse and the photos, ACCEPT, the prefill and its read-out. 1 with the
  * logits after the prompt; 0 when the request ended here, its ERROR written and its
  * command disposed. serve_loop and serve_mux start every request here. */
+/* A lone request's prompt reads its STOP or CANCEL between two layers, the way its decode
+ * loop does between two tokens: control 1 CANCEL, 2 STOP. The multiplexed loop owns its
+ * command stream and reads it between steps. */
+static int v41_prompt_poll(ColiPromptBreak *b) {
+    while (!b->control && !b->eof && coli_serve_stdin_ready()) {
+        ColiServeCommand control;
+        ColiServeReadResult inner = coli_serve_read_command(stdin, &v41_wire, &control);
+        if (inner == COLI_SERVE_READ_EOF) { b->eof = 1; break; }
+        if (control.kind == COLI_SERVE_COMMAND_CANCEL && !strcmp(control.id, b->id)) b->control = 1;
+        else if (control.kind == COLI_SERVE_COMMAND_STOP && !strcmp(control.id, b->id)) b->control = 2;
+        else if (control.kind == COLI_SERVE_COMMAND_SUBMIT) coli_serve_write_error(stdout, control.id, "SLOT_BUSY");
+        coli_serve_command_dispose(&control);
+    }
+    return b->control;
+}
+
 static int v41_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int *ids, float *logits,
-                           float **pending_image, int *pending_h, int *pending_w, V41Req *rq) {
+                           float **pending_image, int *pending_h, int *pending_w, V41Req *rq, int lone) {
     Cfg *c = &m->c;
     double turn_started = now_s();
     double disk0 = m->t_disk, expert0 = m->t_expert, attn0 = m->t_attn, engram0 = m->t_engram;
@@ -5309,10 +5336,29 @@ static int v41_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int 
             echoed = 1;
         }
     }
-    if (!echoed)
-    forward_with_image(m, ids + reuse, n_prompt - reuse, logits, aligned,
-                       image_at, image_h, image_w, image_mask);
+    ColiPromptBreak brk = { .poll = v41_prompt_poll, .id = cmd->id };
+    if (!echoed) {
+        if (lone) g_coli_prompt_break = &brk;
+        forward_with_image(m, ids + reuse, n_prompt - reuse, logits, aligned,
+                           image_at, image_h, image_w, image_mask);
+        g_coli_prompt_break = NULL;
+    }
     free(aligned); free(image_mask);
+    if (brk.control) {
+        /* The layers before the stop wrote this prompt's rows into the window rings, the
+         * compressor's groups and the index keys, which a later position would read as its
+         * past: the state starts over, and the next request reads its prompt whole. */
+        model_reset(m);
+        coli_prompt_break_log(brk.control == 1, 0, n_prompt);
+        if (brk.control == 1) coli_serve_write_error(stdout, cmd->id, "CANCELLED");
+        else {
+            ColiServeDone done = { 0, 0.0, 0.0, rss_gb(), n_prompt, 0 };
+            coli_serve_write_done(stdout, cmd->id, &done);
+        }
+        fflush(stdout);
+        coli_serve_command_dispose(cmd);
+        return 0;
+    }
     if (cmd->pin) {
         coli_pin_pool_init(&g_pins, c->vocab);
         if (coli_pin_store(&g_pins, ids, n_prompt, logits)) {
@@ -5441,7 +5487,7 @@ static void serve_mux(Model *m, Tok *tokenizer, const char *snap) {
                 snprintf(t->id, sizeof t->id, "%s", command.id);
                 t->temperature = command.temperature; t->top_p = command.top_p; t->logprobs = command.logprobs;
                 v41_mux_bind(m, command.slot);
-                if (v41_serve_start(m, tokenizer, &command, ids, t->logits, &pending_image, &pending_h, &pending_w, &t->rq)) {
+                if (v41_serve_start(m, tokenizer, &command, ids, t->logits, &pending_image, &pending_h, &pending_w, &t->rq, 0)) {
                     t->active = 1; t->limited = 1;
                     coli_serve_command_dispose(&command);
                 }
@@ -5530,7 +5576,7 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
             continue;
         }
         V41Req rq;
-        if (!v41_serve_start(m, tokenizer, &command, ids, logits, &pending_image, &pending_h, &pending_w, &rq)) continue;
+        if (!v41_serve_start(m, tokenizer, &command, ids, logits, &pending_image, &pending_h, &pending_w, &rq, 1)) continue;
         double turn_started = rq.turn_started;
         double disk0 = rq.disk0, expert0 = rq.expert0, attn0 = rq.attn0, engram0 = rq.engram0;
         uint64_t forwards0 = rq.forwards0, hits0 = rq.hits0, miss0 = rq.miss0;

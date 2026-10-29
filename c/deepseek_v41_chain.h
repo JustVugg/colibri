@@ -1104,6 +1104,12 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
     }
     vkc_gemm_rows(spec ? 0 : -1);                          /* a verify's rows get a decode step's bits */
     for (int c0 = 0; c0 < n; c0 += rows) {
+        /* a served prompt's STOP or CANCEL between two chunks (prompt_break.h): the caller
+         * starts the state over, on the host and on the device (model_reset, v41c_reset) */
+        if (coli_prompt_break()) {
+            free(f.keyl); free(f.praw); free(need); free(outs); free(pres); free(wl); free(cs_); free(er); free(pc);
+            return 0;
+        }
         int nr = n - c0 < rows ? n - c0 : rows, pb = start + c0, last = c0 + nr == n;
         f.pb = pb; f.nr = nr;
         /* this chunk's RoPE rows (the CPU's own tables): window ones at 0, compress ones at

@@ -80,6 +80,7 @@
 #include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
 #include "decode_batch.h"
 #include "pin_pool.h"   /* piu scatti annidati dello stato */
+#include "prompt_break.h"   /* a served prompt that a STOP or CANCEL stops between two layers */
 #include "route_trace.h"                           /* ROUTE_TRACE + .coli_usage, engine-agnostic (#700) */
 #include "kv_fp8.h"                               /* KV8=1: cache latente in fp8 e4m3 + scala per-riga */
 #include "kv_tq.h"                                /* KV_TQ=3|4: cache latente PolarQuant (rot+polare) */
@@ -8274,6 +8275,7 @@ static void layers_forward_rows_range(Model *m, float *x, int S, int pos_base,
 #endif
     double tl0=now_s();
     for(int i=layer_begin;i<layer_end;i++){
+        if(coli_prompt_break()) break;   /* a served prompt's STOP or CANCEL (mux_submit): step() leaves */
         /* progresso su stderr per i batch grossi (prefill): il primo byte di risposta
          * puo' arrivare dopo MINUTI di streaming — al buio sembra un blocco. */
         if(S>=8 && (i%4==0 || i==layer_end-1))
@@ -8462,6 +8464,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
             for(int s=0;s<chunk;s++) embed_row(m, ids[done+s], cx+(int64_t)s*D);
             layers_forward(m,cx,chunk,pos_base+done);
             free(cx);
+            if(coli_prompt_broken()) return NULL;
             done+=chunk;
         }
         ids+=done; S-=done; pos_base+=done;
@@ -8469,6 +8472,10 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
     layers_forward(m,x,S,pos_base);
+    /* a served prompt stopped between two layers (mux_submit): the slot's length stays where it
+     * was, and the rows the stopped layers wrote are past it, a stale tail the next step writes
+     * over; the attention here is attention alone, so the prefix before them is still whole */
+    if(coli_prompt_broken()){ free(x); return NULL; }
     if(m->hlast) memcpy(m->hlast, x+(int64_t)(S-1)*D, D*sizeof(float));
     if(m->has_mtp && S>=2 && g_draft>0) mtp_absorb(m, ids+1, x, S-1, pos_base);
     float *last=falloc(D); rmsnorm(last, x+(int64_t)(S-1)*D, m->final_norm, D, c->eps);
@@ -11009,6 +11016,15 @@ static void coli_kv_share_adopt_rows(Cfg *cc, KVState *sc, KVState *dn,
 /* Read and prefill one request. Returns -1 on EOF, 0 for a rejected frame and
  * 1 for an accepted request. Prefill deliberately remains serial: continuous
  * batching starts at decode, where every active slot contributes one row. */
+/* A lone slot's prompt reads its STOP or CANCEL between two layers (prompt_break.h) through
+ * mux_ctl_poll, the reader its speculative turn uses between tokens: control 1 CANCEL, 2 STOP.
+ * With several slots the loop reads stdin between steps, for every slot. */
+static int glm_prompt_poll(ColiPromptBreak *b){
+    mux_ctl_poll(*(const unsigned long long *)b->ctx);
+    if(g_mux_cancel) b->control=1; else if(g_mux_stop) b->control=2;
+    return b->control;
+}
+
 static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *grd,
                       int nctx, int maxctx, int eos){
     char *line=NULL; size_t cap=0; ssize_t nr=getline(&line,&cap,stdin);
@@ -11195,11 +11211,28 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     if(add>0) memcpy(sc->hist+sc->len,tmp+sc->len,(size_t)add*sizeof(int));
     fprintf(stderr,"[API] KV slot %d prefix %d/%d token, prefill %d\n",sub.slot,sc->len,nt,add);
     free(tmp);
+    unsigned long long brk_id=sub.id;
+    ColiPromptBreak brk={.poll=glm_prompt_poll,.ctx=&brk_id};
+    int breakable=!echo && nctx==1 && add>0;
+    if(breakable){ g_mux_stop=0; g_mux_cancel=0; g_coli_prompt_break=&brk; }
     float *logit = echo ? mux_prefill_echo(m,T,sub.id,sc->hist,nt,sub.logprobs,
                                           echo_pin?prefix:0,
                                           echo_pin?pin_lo:NULL)
                         : add>0 ? step(m,sc->hist+sc->len,add,sc->len)
                                 : step(m,sc->hist+sc->len-1,1,sc->len-1);
+    g_coli_prompt_break=NULL;
+    if(brk.control){
+        /* stopped while reading: the slot keeps the conversation it held before this prompt */
+        g_mux_stop=0; g_mux_cancel=0;
+        free(logit);
+        coli_prompt_break_log(brk.control==1,sc->len,nt);
+        if(brk.control==1){ printf("ERROR %llu CANCELLED\n",sub.id); fflush(stdout); return 0; }
+        ServeReq *r=&req[sub.slot]; memset(r,0,sizeof(*r));
+        r->id=sub.id; r->prompt_tokens=nt; r->started=now_s(); r->hits0=m->hits; r->miss0=m->miss;
+        prof_base(m,&r->pb);
+        mux_done(m,sc,r);
+        return 1;
+    }
     sc->len+=add; sc->first=0;
     if(sub.pin && logit){
         coli_pin_pool_init(&sc->pins,m->c.vocab);
