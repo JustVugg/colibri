@@ -156,6 +156,10 @@ QWEN38_27B = (
 
 DENSE_MLP_KINDS = {"mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"}
 FLINT_KINDS = {"self_attn.softmax_offset"}   # Flint's sinks: no Qwen checkpoint has them
+# LFM3's layers (the converter renames its norms and MLP): no Qwen checkpoint has them
+LFM3_KINDS = {"operator_norm.weight", "post_operator_norm.weight", "ffn_norm.weight", "post_ffn_norm.weight",
+              "feed_forward.w1.weight", "feed_forward.w2.weight", "feed_forward.w3.weight", "conv.in_proj.weight",
+              "conv.conv.weight", "conv.out_proj.weight", "self_attn.gate_proj.weight"}
 
 
 def _concrete(names):
@@ -206,6 +210,20 @@ class TensorKindsTest(unittest.TestCase):
         prefix = resolve_prefix(names)
         return prefix, [classify(n, prefix) for n in names]
 
+    def test_lfm3_names_are_placed(self):
+        # LiquidAI/LFM3-VL-2B's index: the text model under language_model, its final norm named
+        # embedding_norm, the vision tower and projector skipped by name
+        p = "model.language_model."
+        self.assertEqual(resolve_prefix([p + "layers.0.conv.conv.weight"]), p)
+        for kind in LFM3_KINDS:
+            self.assertEqual(classify(f"{p}layers.3.{kind}", p), ("layer", 3, kind))
+        self.assertEqual(classify(p + "embedding_norm.weight", p), ("global", "embedding_norm.weight"))
+        self.assertEqual(classify(p + "embed_tokens.weight", p), ("global", "embed_tokens.weight"))
+        for name, group in (("model.vision_tower.layers.0.conv.in_proj.weight", "lfm3_vision"),
+                            ("model.multi_modal_projector.linear_1.weight", "lfm3_projector")):
+            self.assertEqual(classify(name, p), ("skip", group))
+            self.assertTrue(skip_reason(group))
+
     def test_every_2p4t_tensor_is_placed(self):
         prefix, placed = self._classify_all(_concrete(QWEN38_2P4T))
         self.assertEqual(prefix, "model.")
@@ -214,7 +232,7 @@ class TensorKindsTest(unittest.TestCase):
         self.assertTrue(any(p[0] == "mtp" for p in placed))
         self.assertEqual({p[1] for p in placed if p[0] == "global"}, set(GLOBAL_KINDS))
         self.assertEqual({p[2] for p in placed if p[0] == "layer"},
-                         set(LAYER_KINDS) - DENSE_MLP_KINDS - FLINT_KINDS)
+                         set(LAYER_KINDS) - DENSE_MLP_KINDS - FLINT_KINDS - LFM3_KINDS)
 
     def test_every_27b_tensor_is_placed(self):
         """The dense checkpoint: the MoE kinds are absent, the dense MLP is placed, the

@@ -266,6 +266,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from qwen36_tensor_kinds import classify, resolve_prefix, skip_reason, UnknownTensor  # noqa: E402
 
 
+# LFM3's names that have a name the engine already reads (the rest keep theirs: post_operator_norm,
+# conv.*, self_attn.gate_proj)
+LFM3_RENAMES = {
+    "operator_norm.weight": "input_layernorm.weight",
+    "ffn_norm.weight": "post_attention_layernorm.weight",
+    "post_ffn_norm.weight": "post_feedforward_layernorm.weight",
+    "feed_forward.w1.weight": "mlp.gate_proj.weight",
+    "feed_forward.w3.weight": "mlp.up_proj.weight",
+    "feed_forward.w2.weight": "mlp.down_proj.weight",
+}
+
+
 def convert_block(lk, get_tensor, source, target, args):
     """One decoder block, trunk or MTP, using exactly the same container formats."""
     tens = {}
@@ -310,6 +322,9 @@ def convert_block(lk, get_tensor, source, target, args):
         newk = k.replace(source + ".", f"{target}.")
         if "mlp.experts." in newk:
             continue  # already handled above
+        # LFM3: its pre-branch norms and MLP under the names the engine reads for every model
+        kind = newk[len(target) + 1:]
+        newk = f"{target}.{LFM3_RENAMES.get(kind, kind)}"
         # everything else stays f16
         tens[newk] = get_tensor(k).half()
     return tens
@@ -456,6 +471,11 @@ def main():
     # checkpoints (written by 4.x) say num_experts. Read either.
     if "num_experts" not in mcfg and "num_local_experts" in mcfg:
         mcfg = dict(mcfg, num_experts=mcfg["num_local_experts"])
+    # LFM3 (LiquidAI/LFM3-VL): short conv layers beside the attention ones, every branch
+    # normalised before its residual; its config says norm_eps where the engine reads rms_norm_eps
+    lfm3 = mcfg.get("model_type") == "lfm3"
+    if lfm3 and "rms_norm_eps" not in mcfg:
+        mcfg = dict(mcfg, rms_norm_eps=mcfg.get("norm_eps", 1e-5))
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     import shutil
@@ -613,6 +633,8 @@ def main():
     if missing_layers:
         sys.exit(f"ERROR: config declares {len(all_idx)} layers but the checkpoint has no "
                  f"tensors for layer(s) {missing_layers[:8]}")
+    if "embedding_norm.weight" in global_map and "norm.weight" not in global_map:   # LFM3's final norm
+        global_map["norm.weight"] = global_map.pop("embedding_norm.weight")
     globals_keys = [global_map[kind] for kind in ("embed_tokens.weight", "lm_head.weight",
                                                   "norm.weight") if kind in global_map]
     # tied embeddings (the small dense Qwen3.5 checkpoints): no lm_head, the head is embed_tokens
@@ -699,6 +721,8 @@ def main():
         for k in globals_keys:
             arr = get_tensor(k).half()
             newk = k.replace("model.language_model.", "model.")
+            if newk == "model.embedding_norm.weight":   # LFM3's final norm
+                newk = "model.norm.weight"
             g_out[newk] = arr
         if tied:   # written out: the engine reads lm_head.weight
             g_out["lm_head.weight"] = g_out["model.embed_tokens.weight"].clone()
@@ -788,6 +812,18 @@ def main():
     }
     if plain_qwen3 or flint:
         meta["zero_centered_norms"] = False
+    if lfm3:
+        # full layers rotate the first rot_full frequencies of the head at rope_theta (HF's
+        # zero-tailed partial_rotary_factor), sliding ones all of them at rope_theta_swa
+        rp = mcfg.get("rope_parameters") or {}
+        full_rp, swa_rp = rp.get("full_attention") or {}, rp.get("sliding_attention") or {}
+        hd = int(mcfg.get("head_dim") or int(mcfg["hidden_size"]) // int(mcfg["num_attention_heads"]))
+        meta.update({"lfm3": True, "zero_centered_norms": False, "attn_output_gate": False,
+                     "partial_rotary_factor": 1.0,
+                     "rope_theta": float(full_rp.get("rope_theta", 1000000.0)),
+                     "rope_theta_swa": float(swa_rp.get("rope_theta", 10000.0)),
+                     "rot_full": int(float(full_rp.get("partial_rotary_factor", 1.0)) * hd) // 2,
+                     "sliding_window": int(mcfg.get("sliding_window") or 0)})
     if flint:
         # the layers config.layer_types calls sliding_attention see sliding_window rows,
         # their own included; the layers listed in no_rope_layer_indices take no RoPE;
@@ -846,6 +882,9 @@ def main():
     meta["dn_vdim"] = int(mcfg.get("linear_value_head_dim", mcfg.get("value_head_dim", 0)))
     meta["dn_convk"] = int(mcfg.get("linear_conv_kernel_dim", mcfg.get("conv_kernel_size", 0)))
     meta["dn_conv_dim"] = meta["dn_kheads"] * meta["dn_kdim"] * 2 + meta["dn_vheads"] * meta["dn_vdim"]
+    if lfm3:   # the conv's window: the hidden channels over conv_L_cache taps, no recurrence
+        meta["dn_convk"] = int(mcfg["conv_L_cache"])
+        meta["dn_conv_dim"] = int(mcfg["hidden_size"])
     # close remaining source handles now that we've finished reading for meta
     for h in shard_handles.values():
         try:

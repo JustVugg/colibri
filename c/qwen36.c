@@ -144,7 +144,7 @@ static void q36_wfree(void *p){
 static gguf_ctx g_gg;
 static int   g_gguf = 0;
 static int   g_gguf_dry = 0;       /* GGUF_CHECK=1: validate every tensor the loader wants, read none */
-static int   g_gguf_plain = 0;     /* qwen3moe, qwen3: llama.cpp's names for a Qwen3 layer (ffn_norm after attention) */
+static int   g_gguf_plain = 0;     /* qwen3moe, qwen3, lfm3: llama.cpp's names for a Qwen3 layer (ffn_norm after attention) */
 static int   g_ssm_a_direct = 0, g_dn_tiled = 0;
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
@@ -312,7 +312,10 @@ static int try_special(const char *s,int i,int n,int *id_out){
 /* Pre-tokenize splitter, mirrors the HF/Qwen regex alternation:
  *   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+ | \p{N}
  *   | ?[^\s\p{L}\p{M}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+ * g_pretok_d3: the same regex with \p{N}{1,3}, digits by three (LFM3's, a GGUF's
+ * tokenizer.ggml.pre "lfm2").
  * Returns the byte index just past the piece starting at i. */
+static int g_pretok_d3 = 0;
 static int pretok_end(const char *s,int i,int n){
     if (s[i]=='\''){
         const char *cands[]={"ll","ve","re","s","t","m","d"}; int clen[]={2,2,2,1,1,1,1};
@@ -332,7 +335,12 @@ static int pretok_end(const char *s,int i,int n){
             return k;
         }
     }
-    if(uclass(c0)==U_N) return i+adv;
+    if(uclass(c0)==U_N){
+        if(!g_pretok_d3) return i+adv;
+        int k=i+adv;
+        for(int d=1;d<3&&k<n;d++){ int a; unsigned cc=utf8_decode(s,k,n,&a); if(uclass(cc)!=U_N) break; k+=a; }
+        return k;
+    }
     { /* rule4: optional space + punctuation run (+ trailing newlines) */
         int k=i;
         if(s[i]==' '&&i+1<n){ int a1; unsigned c1=utf8_decode(s,i+1,n,&a1); if(uclass(c1)!=U_W&&uclass(c1)!=U_L&&uclass(c1)!=U_N&&c1!='\r'&&c1!='\n'){ k=i+1; while(k<n){int a;unsigned cc=utf8_decode(s,k,n,&a); if(uclass(cc)!=U_W&&uclass(cc)!=U_L&&uclass(cc)!=U_N&&cc!='\r'&&cc!='\n')k+=a; else break;} while(k<n&&(s[k]=='\r'||s[k]=='\n'))k++; return k; } }
@@ -595,6 +603,12 @@ static void load_tokenizer(const char *path){
             jval *pat = json_get(seq->kids[k], "pattern"), *rx = pat ? json_get(pat, "Regex") : NULL;
             if (rx && rx->t == J_STR && strstr(rx->str, "\\p{Lu}") && strstr(rx->str, "[\\r\\n/]*")) g_pretok_o200k = 1;
         }
+        /* the Qwen regex with \p{N}{1,3} (LFM3's): digits by three */
+        for (int k = 0; !g_pretok_flint && !g_pretok_o200k && seq && seq->t == J_ARR && k < seq->len; k++) {
+            jval *pat = json_get(seq->kids[k], "pattern"), *rx = pat ? json_get(pat, "Regex") : NULL;
+            if (rx && rx->t == J_STR && strstr(rx->str, "|\\p{N}{1,3}|") && strstr(rx->str, "[^\\r\\n\\p{L}\\p{N}]?\\p{L}+")) g_pretok_d3 = 1;
+        }
+        if (g_pretok_d3) fprintf(stderr, "[tok] digits by three\n");
         jval *im = json_get(model, "ignore_merges");
         g_ignore_merges = im && im->t == J_BOOL && im->boolean;
         if (g_pretok_o200k) fprintf(stderr, "[tok] o200k's pre-tokenizer%s\n", g_ignore_merges ? ", whole pieces first" : "");
@@ -709,6 +723,7 @@ static int load_tokenizer_gguf(const gguf_ctx *g){
     const char *pre = gguf_get_str(g, "tokenizer.ggml.pre");
     g_pretok_flint = pre && !strcmp(pre, "flint");
     g_pretok_o200k = g_ignore_merges = pre && (!strcmp(pre, "gpt-4o") || !strcmp(pre, "llama4"));   /* tiktoken's split and rule */
+    if (pre && !strcmp(pre, "lfm2")) g_pretok_d3 = g_ignore_merges = 1;   /* LFM3: digits by three, whole pieces first */
     int n = (int)tk->n;
     const int32_t *types = (ty && ty->type == GGUF_T_ARRAY && (ty->atype == GGUF_T_I32 || ty->atype == GGUF_T_U32) && ty->n == tk->n)
                            ? (const int32_t *)ty->arr : NULL;
@@ -1054,7 +1069,20 @@ typedef struct {
      * experts' width for every model: hidden but on Muse. */
     int muse, ehid;
     float post_eps, logit_scale, softcap;
+    /* LFM3 (LiquidAI/LFM3-VL, the lfm3 GGUF): a dense model whose layers are short gated
+     * convolutions (is_attn 0: in_proj to B, C, x; C * conv(B * x) over the last dn_convk
+     * rows, channel by channel; out_proj) or attention with q/k norms and one sigmoid gate
+     * per head (attn_gate, D -> H, on the attention's input), the sliding layers (win_layer)
+     * at theta_swa with every frequency, the full ones at theta with only the first
+     * rot_full of head_dim/2 (the rest unrotated); every branch normalised before its
+     * residual (post_op, post_ffn: sandwich norms). The conv's window is DN_conv
+     * (dn_conv_dim = hidden channels, dn_convk taps), the layers carry no DN_rec. */
+    int lfm3, rot_full;
+    float theta_swa;
 } Cfg;
+/* a recurrent layer's state cells: DeltaNet's [vh, kdim, vdim] recurrence; an LFM3 conv layer has
+ * none and keeps one cell, so DN_rec[i] marks every layer with a state (its ring in DN_conv) */
+static inline size_t q36_rec_cells(const Cfg *c) { size_t n = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim; return n ? n : 1; }
 /* the experts' width: ehid, or hidden for a Cfg built without it (the tests' hand-made ones) */
 static inline int q36_eh(const Cfg *c) { return c->ehid > 0 ? c->ehid : c->hidden; }
 
@@ -1109,6 +1137,9 @@ typedef struct {
      * expert's output (post_en) and the branch (post_fn). */
     QW ag, lat_d, lat_u;
     float *ra_a, *ra_b, *rf_a, *rf_b, *pre_en, *post_en, *post_fn;
+    /* LFM3: the short conv's projections and taps [hidden, convk], and the norms after
+     * each branch (post_op after the conv or attention, post_ffn after the MLP) */
+    QW sc_in, sc_out; float *sc_conv, *post_op, *post_ffn;
     /* Gated DeltaNet (linear_attention) dense weights (f16->f32 via st_read_f32). */
     QW dn_qkv, dn_z; float *dn_b, *dn_a;   /* in_proj_qkv/z (int8-during-load), b/a (not dense-matmul'd) */
     float *dn_conv;                        /* conv1d.weight [conv_dim, convk] (groups=conv_dim) */
@@ -1121,6 +1152,7 @@ typedef struct {
      * see trunk_offer_dense / trunk_place_dense. */
     int qth_dnout, qth_q, qth_k, qth_v, qth_o, qth_shg, qth_shu, qth_shd;
     int qth_ag, qth_ld, qth_lu;   /* Muse Spark's attention gate (with "attnproj") and latent projections ("shexp") */
+    int qth_scin, qth_scout;      /* LFM3's conv projections (with "dnout") */
 } Layer;
 
 /* ---------- LRU expert cache (int8 weights + per-row float scales) ---------- */
@@ -2484,8 +2516,12 @@ static void validate_cfg(const Cfg *c, int n_layers_from_config) {
              c->q_heads, c->kv_heads);
     CFG_NEED(c->k_head_dim > 0 && c->v_head_dim > 0 && c->q_head_dim > 0,
              "per-head dims must be positive");
+    /* LFM3's conv layers: the ring of hidden channels, convk - 1 rows, and nothing else */
+    if (c->lfm3 && c->n_active < c->n_layers)
+        CFG_NEED(c->dn_convk >= 2 && c->dn_conv_dim == c->hidden && c->dn_vheads == 0,
+                 "lfm3 conv layers: %d taps over %d channels (hidden %d)", c->dn_convk, c->dn_conv_dim, c->hidden);
     /* DeltaNet: every one of these indexes a buffer or divides. */
-    if (c->n_active < c->n_layers) {          /* at least one DeltaNet layer */
+    else if (c->n_active < c->n_layers) {          /* at least one DeltaNet layer */
         CFG_NEED(c->dn_vheads > 0 && c->dn_kheads > 0,
                  "dn_vheads %d / dn_kheads %d must be positive (rep = vh / vk)",
                  c->dn_vheads, c->dn_kheads);
@@ -2549,6 +2585,10 @@ static void load_meta(Cfg *c, const char *snap) {
         if((v=json_get(r,"zero_centered_norms"))&&v->t==J_BOOL) c->zero_centered_norms=v->boolean;
         if((v=json_get(r,"has_bias"))&&v->t==J_BOOL) c->has_bias=v->boolean;
         if((v=json_get(r,"has_qk_norm"))&&v->t==J_BOOL) c->has_qk_norm=v->boolean;
+        /* LFM3 (the Cfg comment): layer_types "conv" are its short convolutions */
+        if((v=json_get(r,"lfm3"))&&v->t==J_BOOL) c->lfm3=v->boolean;
+        if((v=json_get(r,"rope_theta_swa"))&&v->t==J_NUM) c->theta_swa=(float)v->num;
+        if((v=json_get(r,"rot_full"))&&v->t==J_NUM) c->rot_full=(int)v->num;
         if((v=json_get(r,"image_token_id"))&&v->t==J_NUM) c->image_token=(int)v->num;
         if((v=json_get(r,"mrope_section"))&&v->t==J_ARR&&v->len==3)
             for(int k=0;k<3;k++) if(v->kids[k]->t==J_NUM) c->mrope_section[k]=(int)v->kids[k]->num;
@@ -2610,6 +2650,8 @@ static void load_meta(Cfg *c, const char *snap) {
             }
         }
         CFG_NEED(!c->win_layer || c->window > 0, "sliding_attention layers need sliding_window > 0 (got %d)", c->window);
+        CFG_NEED(!c->lfm3 || (c->rot_full >= 0 && c->rot_full <= c->head_dim / 2 && c->theta_swa > 0.f),
+                 "lfm3: rot_full %d (0..%d) and rope_theta_swa %g", c->rot_full, c->head_dim / 2, c->theta_swa);
         CFG_NEED(!c->dense_layer || c->dense_inter > 0, "mlp_only_layers need dense_inter > 0 (got %d)", c->dense_inter);
     }
     free(buf); free(arena);
@@ -2784,6 +2826,11 @@ static const char *gg_name(const char *hf, char *out, size_t cap) {
         { "linear_attn.A_log", "ssm_a" },
         { "linear_attn.norm.weight", "ssm_norm.weight" },
         { "linear_attn.out_proj.weight", "ssm_out.weight" },
+        /* lfm3: the short conv and the norm after the conv or attention branch */
+        { "conv.in_proj.weight", "shortconv.in_proj.weight" },
+        { "conv.conv.weight", "shortconv.conv.weight" },
+        { "conv.out_proj.weight", "shortconv.out_proj.weight" },
+        { "post_operator_norm.weight", "post_attention_norm.weight" },
     };
     int L = -1, off = 0;
     if (sscanf(hf, "model.layers.%d.%n", &L, &off) != 1 || L < 0 || !off) return NULL;
@@ -2904,6 +2951,10 @@ static int qwen_dense_list(const Cfg *c, QwenDenseList *l) {
             QDL_ADD(c->hidden, kr, "model.layers.%d.self_attn.k_proj.weight", i);
             QDL_ADD(c->hidden, vr, "model.layers.%d.self_attn.v_proj.weight", i);
             QDL_ADD(c->o_in, c->hidden, "model.layers.%d.self_attn.o_proj.weight", i);
+            if (c->lfm3) QDL_ADD(c->hidden, c->q_heads, "model.layers.%d.self_attn.gate_proj.weight", i);
+        } else if (c->lfm3) {   /* LFM3's short conv */
+            QDL_ADD(c->hidden, 3 * c->hidden, "model.layers.%d.conv.in_proj.weight", i);
+            QDL_ADD(c->hidden, c->hidden, "model.layers.%d.conv.out_proj.weight", i);
         } else {
             QDL_ADD(c->hidden, c->dn_conv_dim, "model.layers.%d.linear_attn.in_proj_qkv.weight", i);
             QDL_ADD(c->hidden, vd, "model.layers.%d.linear_attn.in_proj_z.weight", i);
@@ -3336,15 +3387,17 @@ static void gguf_load_cfg(Cfg *c) {
      * layers, layers without RoPE, dense layers in front and sigmoid routing */
     /* muse-spark: Muse Spark (meta-models/Muse-Spark-Open), every layer attention, the
      * layer of the Cfg comment */
-    const int dense = arch && (!strcmp(arch, "qwen35") || !strcmp(arch, "qwen3"));
+    /* lfm3: LFM3 (LiquidAI/LFM3-VL), dense, short convolutions and attention (the Cfg comment) */
+    const int lfm3 = arch && !strcmp(arch, "lfm3");
+    const int dense = arch && (!strcmp(arch, "qwen35") || !strcmp(arch, "qwen3") || lfm3);
     const int flint = arch && !strcmp(arch, "flint");
     const int muse = arch && !strcmp(arch, "muse-spark");
     const int plain = arch && (!strcmp(arch, "qwen3moe") || !strcmp(arch, "qwen3") || flint || muse);
     if (!arch || (strcmp(arch, "qwen35moe") && !dense && !plain)) {
         fprintf(stderr, "GGUF architecture '%s' is not one of qwen35moe (Qwen3.5 / 3.6 MoE), qwen35 (their dense models), "
-                        "qwen3moe (Qwen3 MoE), qwen3 (dense Qwen3), flint or muse-spark: this engine cannot run it\n", arch ? arch : "?"); exit(1);
+                        "qwen3moe (Qwen3 MoE), qwen3 (dense Qwen3), flint, muse-spark or lfm3: this engine cannot run it\n", arch ? arch : "?"); exit(1);
     }
-    g_gguf_plain = plain;
+    g_gguf_plain = plain || lfm3;
     char key[128];
     #define GK(k) (snprintf(key, sizeof key, "%s.%s", arch, k), key)
     memset(c, 0, sizeof *c);
@@ -3414,22 +3467,34 @@ static void gguf_load_cfg(Cfg *c) {
                  "GGUF muse-spark: moe_latent_size %d, sliding_window %d, post_norm_epsilon %g, logit_scale %g, softcapping %g",
                  q36_eh(c), c->window, c->post_eps, c->logit_scale, c->softcap);
     }
+    if (lfm3) {
+        /* the conv's window rides on the DeltaNet layers' ring: hidden channels, l_cache taps */
+        c->lfm3 = 1;
+        c->dn_convk = (int)gguf_get_int(g, GK("shortconv.l_cache"), 0);
+        c->dn_conv_dim = c->hidden; c->dn_vheads = c->dn_kheads = c->dn_kdim = c->dn_vdim = 0;
+        c->window = (int)gguf_get_int(g, GK("attention.sliding_window"), 0);
+        c->theta_swa = (float)gguf_get_float(g, GK("rope.freq_base_swa"), c->theta);
+        CFG_NEED(c->dn_convk >= 2 && c->dn_convk <= 64 && c->window > 0,
+                 "GGUF lfm3: shortconv.l_cache %d, sliding_window %d", c->dn_convk, c->window);
+    }
     #undef GK
     CFG_NEED(c->n_layers > 0 && c->n_layers <= 512 && c->hidden > 0 && c->q_heads > 0 && c->head_dim > 0 && interval > 0,
              "GGUF metadata: layers %d hidden %d heads %d head_dim %d interval %d", c->n_layers, c->hidden, c->q_heads, c->head_dim, interval);
     if (plain) {   /* no DeltaNet: every layer attends; the rotary spans the head */
         if (!rope_given) rope_n = c->head_dim;
         interval = 1;
+    } else if (lfm3) {   /* the layers' kinds come from their tensors, below */
+        if (!rope_given) rope_n = c->head_dim;
     } else {
         CFG_NEED(c->dn_vheads > 0 && inner % c->dn_vheads == 0, "GGUF ssm.inner_size %d / time_step_rank %d", inner, c->dn_vheads);
         c->dn_vdim = inner / c->dn_vheads;
         c->dn_conv_dim = 2 * c->dn_kheads * c->dn_kdim + c->dn_vheads * c->dn_vdim;
     }
-    c->n_group = 1; c->topk_group = 1; c->norm_topk = 1; c->attn_output_gate = !plain;
+    c->n_group = 1; c->topk_group = 1; c->norm_topk = 1; c->attn_output_gate = !plain && !lfm3;
     c->partial_rotary_factor = (float)rope_n / (float)c->head_dim;
     c->rotary_dim = rope_n; c->rope_dim = rope_n;
     c->o_in = c->q_heads * c->head_dim;
-    c->q_head_dim = plain ? c->head_dim : c->head_dim * 2;
+    c->q_head_dim = plain || lfm3 ? c->head_dim : c->head_dim * 2;
     c->expert_gs = 0;
     const gguf_tensor *emb = gguf_find(g, "token_embd.weight");
     CFG_NEED(emb && emb->ne[0] == c->hidden, "GGUF token_embd.weight missing or not [hidden x vocab]");
@@ -3441,6 +3506,12 @@ static void gguf_load_cfg(Cfg *c) {
         snprintf(nm, sizeof nm, "blk.%d.attn_q.weight", i);
         const gguf_tensor *q = gguf_find(g, nm);
         c->is_attn[i] = q != NULL;
+        if (lfm3) {   /* head_count_kv per layer: 0 on a conv layer */
+            const gguf_kv *kvh = gguf_get(g, "lfm3.attention.head_count_kv");
+            const long kv_i = kvh && kvh->type == GGUF_T_ARRAY && kvh->arr && (uint64_t)i < kvh->n ? q36_kv_arr_int(kvh, (uint64_t)i) : c->kv_heads;
+            CFG_NEED((kv_i > 0) == c->is_attn[i] && (!kv_i || kv_i == c->kv_heads),
+                     "GGUF lfm3 layer %d: head_count_kv %ld and its attention tensors disagree", i, kv_i);
+        } else
         CFG_NEED(c->is_attn[i] == ((i + 1) % interval == 0), "GGUF layer %d: attention tensors disagree with full_attention_interval %d", i, interval);
         if (q) {
             c->n_active++;
@@ -3450,6 +3521,10 @@ static void gguf_load_cfg(Cfg *c) {
     }
     snprintf(nm, sizeof nm, "blk.%d.attn_q_norm.weight", c->n_layers - 1);
     c->has_qk_norm = gguf_find(g, nm) != NULL;
+    for (int i = 0; lfm3 && !c->has_qk_norm && i < c->n_layers; i++) {   /* its last layer is a conv */
+        snprintf(nm, sizeof nm, "blk.%d.attn_q_norm.weight", i);
+        c->has_qk_norm = c->is_attn[i] && gguf_find(g, nm) != NULL;
+    }
     if (flint) {
         c->attn_sinks = gguf_find(g, "blk.0.attn_sinks.weight") != NULL;
         c->win_layer = calloc((size_t)c->n_layers, 1); c->nope_layer = calloc((size_t)c->n_layers, 1);
@@ -3494,9 +3569,45 @@ static void gguf_load_cfg(Cfg *c) {
                         "between two projections, logits x %g capped at %g\n",
                 nwin, c->window, c->n_layers - nwin, q36_eh(c), c->logit_scale, c->softcap);
     }
+    if (lfm3) {
+        /* sliding_window_pattern: 1 on a sliding layer (theta_swa, every frequency). The full
+         * layers rotate the frequencies rope_freqs leaves at 1, a prefix; the others carry a
+         * factor that divides them to nothing (1e30): HF's partial_rotary_factor, zero-tailed */
+        c->win_layer = calloc((size_t)c->n_layers, 1);
+        if (!c->win_layer) { fprintf(stderr, "OOM lfm3 layers\n"); exit(1); }
+        const gguf_kv *a = gguf_get(g, "lfm3.attention.sliding_window_pattern");
+        CFG_NEED(a && a->type == GGUF_T_ARRAY && a->atype == GGUF_T_BOOL && a->n == (uint64_t)c->n_layers,
+                 "GGUF lfm3.attention.sliding_window_pattern: a bool per layer (%d)", c->n_layers);
+        int nwin = 0;
+        for (int i = 0; i < c->n_layers; i++) {
+            c->win_layer[i] = ((const uint8_t *)a->arr)[i] != 0;
+            CFG_NEED(!c->win_layer[i] || c->is_attn[i], "GGUF lfm3 layer %d: a sliding window on a conv layer", i);
+            nwin += c->win_layer[i];
+        }
+        const int half = c->head_dim / 2;
+        CFG_NEED(rope_n == c->head_dim, "GGUF lfm3.rope.dimension_count %d: the rotary spans the head (%d)", rope_n, c->head_dim);
+        c->rot_full = half;
+        const gguf_tensor *rf = gguf_mark(g, "rope_freqs.weight");
+        if (rf) {
+            CFG_NEED(gg_numel(rf) == half, "GGUF rope_freqs.weight: %lld factors for %d frequencies", (long long)gg_numel(rf), half);
+            float *f = g_gguf_dry ? NULL : falloc(half);
+            if (f) {
+                if (gguf_read_f32(g, rf, f)) { fprintf(stderr, "GGUF rope_freqs.weight: read failed\n"); exit(1); }
+                int k = 0; while (k < half && f[k] == 1.f) k++;
+                for (int j = k; j < half; j++)
+                    CFG_NEED(f[j] >= 1e20f, "GGUF rope_freqs.weight[%d] = %g: only a prefix of 1 and the rest unrotated", j, f[j]);
+                c->rot_full = k; free(f);
+            }
+        }
+        fprintf(stderr, "[gguf] lfm3: %d layers (%d attention, %d of them sliding over %d rows), hidden %d, MLP %d, vocab %d, "
+                        "conv %d taps, full layers rotate %d of %d frequencies (theta %g), sliding all (theta %g)\n",
+                c->n_layers, c->n_active, nwin, c->window, c->hidden, c->shared_inter, c->vocab, c->dn_convk,
+                c->rot_full, half, c->theta, c->theta_swa);
+    }
     snprintf(nm, sizeof nm, "blk.0.exp_probs_b.bias");
     c->has_bias = gguf_find(g, nm) != NULL;
-    if (plain && dense)
+    if (lfm3) {}
+    else if (plain && dense)
         fprintf(stderr, "[gguf] qwen3 (dense): %d layers (all attention), hidden %d, MLP %d, vocab %d\n",
                 c->n_layers, c->hidden, c->shared_inter, c->vocab);
     else if (plain)
@@ -3810,6 +3921,16 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.pre_expert_norm.weight", ai);
             l->pre_en = load_norm_n(m, nm, q36_eh(c));
         }
+        if (c->lfm3) {   /* LFM3 (the Cfg comment): the norms after each branch, the heads' gate */
+            snprintf(nm,sizeof(nm),"model.layers.%d.post_operator_norm.weight", ai);
+            l->post_op = load_norm_n(m, nm, c->hidden);
+            snprintf(nm,sizeof(nm),"model.layers.%d.post_feedforward_layernorm.weight", ai);
+            l->post_ffn = load_norm_n(m, nm, c->hidden);
+            if (c->is_attn[i]) {
+                snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.gate_proj.weight", ai);
+                load_tq_noted(m, nm, c->hidden, c->q_heads, quantize_dense, "attn", &l->ag); QCOUNT(l->ag);
+            }
+        }
         if (c->is_attn[i]) {
             /* Gated Attention (full_attention) layer, dense projections int8-during-load */
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.q_proj.weight", ai);
@@ -3822,6 +3943,15 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
             load_tq_noted(m, nm, c->o_in, c->hidden, quantize_dense, "attn", &l->o); QCOUNT(l->o);
             l->dn_qkv=l->dn_z=(QW){0}; l->dn_b=l->dn_a=l->dn_conv=NULL;
             l->dn_dtbias=l->dn_alog=l->dn_norm=NULL; l->dn_out=(QW){0};
+        } else if (c->lfm3) {
+            /* LFM3's short conv: in_proj to B, C and x, the taps by channel, out_proj */
+            l->q=l->k=l->v=l->o=(QW){0};
+            snprintf(nm,sizeof(nm),"model.layers.%d.conv.in_proj.weight", ai);
+            load_tq_noted(m, nm, c->hidden, 3 * c->hidden, quantize_dense, "scproj", &l->sc_in); QCOUNT(l->sc_in);
+            snprintf(nm,sizeof(nm),"model.layers.%d.conv.conv.weight", ai);
+            l->sc_conv = load_t_n(m, nm, (int64_t)c->hidden * c->dn_convk);
+            snprintf(nm,sizeof(nm),"model.layers.%d.conv.out_proj.weight", ai);
+            load_tq_noted(m, nm, c->hidden, c->hidden, quantize_dense, "scproj", &l->sc_out); QCOUNT(l->sc_out);
         } else {
             /* Gated DeltaNet (linear_attention) layer */
             l->q=l->k=l->v=l->o=(QW){0};
@@ -3902,8 +4032,8 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     m->dn_dev_fresh = calloc((size_t)c->n_layers, 1); m->dn_host_stale = calloc((size_t)c->n_layers, 1); m->dn_dev = 0;
     for (int i = layer_begin; allocate_state && i < layer_end; i++) {
         if (c->is_attn[i]) { m->DN_rec[i] = NULL; m->DN_conv[i] = NULL; continue; }
-        if (c->dn_vheads <= 0) { fprintf(stderr, "layer %d is DeltaNet but dn dims missing from meta\n", i); exit(1); }
-        m->DN_rec[i]  = calloc((size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, sizeof(float));
+        if (c->dn_vheads <= 0 && !c->lfm3) { fprintf(stderr, "layer %d is DeltaNet but dn dims missing from meta\n", i); exit(1); }
+        m->DN_rec[i]  = calloc(q36_rec_cells(c), sizeof(float));
         m->DN_conv[i] = calloc((size_t)c->dn_conv_dim * (c->dn_convk - 1), sizeof(float));
     }
     m->freq = calloc((size_t)c->n_layers * c->n_experts, sizeof(uint32_t));
@@ -4495,6 +4625,20 @@ static void rope_head_partial(float *x, int pos, int rope_dim, int head_dim, flo
     }
 }
 
+/* LFM3's rotation (HF Lfm3RotaryEmbedding, zero-tailed): the pairs (j, j + hd/2) of the first
+ * nrot frequencies of the whole head, theta^(-2j/hd); the others stay as they are. With
+ * nrot = hd/2 it is rope_head_partial over the head, operation for operation. */
+static void rope_head_zt(float *x, int pos, int hd, int nrot, float theta) {
+    int h = hd / 2;
+    for (int j = 0; j < nrot && j < h; j++) {
+        float inv = powf(theta, -2.0f * j / hd);
+        float ang = pos * inv, cs = cosf(ang), sn = sinf(ang);
+        float a = x[j], b = x[j+h];
+        x[j]   = a*cs - b*sn;
+        x[j+h] = b*cs + a*sn;
+    }
+}
+
 /* The same rotation with a position per axis (interleaved M-RoPE, see Cfg).
  * With the three positions equal it is rope_head_partial, operation for
  * operation. */
@@ -4554,6 +4698,10 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     }
     const Q36Row *mr = m->mux_rows;   /* a multiplexed step: each row's own conversation and position */
     const int nope = c->nope_layer && c->nope_layer[layer];   /* Flint: a layer without RoPE */
+    /* LFM3: a sliding layer rotates every frequency at theta_swa, a full one the first rot_full at theta */
+    const int lswa = c->lfm3 && c->win_layer && c->win_layer[layer];
+    const int lrot = c->lfm3 ? (lswa ? hd / 2 : c->rot_full) : 0;
+    const float ltheta = lswa ? c->theta_swa : c->theta;
     for (int s = 0; s < S; s++) {
         int pos = mr ? mr[s].pos : pos_base + s;
         /* the rope of the row's conversation: an image turn's decode rows sit at
@@ -4565,14 +4713,16 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             float *qh = query + ((int64_t)s*H + hh)*hd;
             if (l->qn) rmsnorm_row(qh, qh, l->qn, hd, c->eps);
             if (nope) continue;
-            if (mrope) rope_head_mrope(qh, p3, c->mrope_section, rotary, c->theta);
+            if (c->lfm3) rope_head_zt(qh, pos, hd, lrot, ltheta);
+            else if (mrope) rope_head_mrope(qh, p3, c->mrope_section, rotary, c->theta);
             else rope_head_partial(qh, pos, rotary, hd, c->theta);
         }
         for (int kvh = 0; kvh < KV; kvh++) {
             float *kh = k + (int64_t)s*KV*kvd + kvh*kvd;
             if (l->kn) rmsnorm_row(kh, kh, l->kn, kvd, c->eps);
             if (nope) continue;
-            if (mrope) rope_head_mrope(kh, p3, c->mrope_section, rotary, c->theta);
+            if (c->lfm3) rope_head_zt(kh, pos, kvd, lrot, ltheta);
+            else if (mrope) rope_head_mrope(kh, p3, c->mrope_section, rotary, c->theta);
             else rope_head_partial(kh, pos, rotary, kvd, c->theta);
         }
     }
@@ -4662,6 +4812,15 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             gate = falloc((int64_t)S*H*hd); gate_dim = hd;
             if (!qtd_batch(l->qth_ag, gate, x, S, D, H*hd)) matmul_d(gate, x, &l->ag, S, D, H*hd);
         }
+    }
+    /* LFM3: one gate per head, its own projection of the attention's input (attn_gate, D -> H),
+     * spread over the head's hd outputs */
+    if (c->lfm3 && l->ag.O) {
+        float *hg = falloc((int64_t)S*H);
+        if (!qtd_batch(l->qth_ag, hg, x, S, D, H)) matmul_d(hg, x, &l->ag, S, D, H);
+        gate = falloc((int64_t)S*H*hd); gate_dim = hd;
+        for (int64_t r = 0; r < (int64_t)S*H; r++) for (int dd = 0; dd < hd; dd++) gate[r*hd + dd] = hg[r];
+        free(hg);
     }
     /* apply attn_output_gate: attn_out *= sigmoid(gate). Without a gate (Qwen3 MoE)
      * the output passes as it is: a missing gate is not sigmoid(0) = 0.5. */
@@ -5663,6 +5822,41 @@ static int dn_gpu_env_on(void) {
     return on;
 }
 
+/* LFM3's short gated convolution (HF Lfm3ShortConv): B, C, x = in_proj(x) in three, then
+ * out_proj(C * conv(B * x)). The conv is causal and by channel over dn_convk taps,
+ * conv[t] = sum_k w[k] * bx[t + k - (K-1)]; the K-1 rows before the step come from the ring
+ * (DN_conv[layer], [hidden, K-1], oldest first, deltanet's layout) and the step's rows go in
+ * after them, each conversation's own in a multiplexed step, and a verify keeps the ring after
+ * each row as deltanet does. A prompt runs channel by channel, every row in order: the same
+ * sums in the same order as one row at a time. */
+static void shortconv(Model *m, Layer *l, int layer, const float *x, int S, float *out) {
+    Cfg *c = &m->c;
+    const int D = c->hidden, K = c->dn_convk, W = K - 1;
+    float *bcx = falloc((int64_t)S * 3 * D), *y = falloc((int64_t)S * D);
+    if (!qtd_batch(l->qth_scin, bcx, x, S, D, 3 * D)) matmul_d(bcx, x, &l->sc_in, S, D, 3 * D);
+    const Q36Row *mr = m->mux_rows;
+    float *ring = m->DN_conv ? m->DN_conv[layer] : NULL;
+    #pragma omp parallel for schedule(static) if ((int64_t)S * D >= 65536)
+    for (int ch = 0; ch < D; ch++) {
+        const float *w = l->sc_conv + (int64_t)ch * K;
+        for (int s = 0; s < S; s++) {
+            float *rg = (mr ? mr[s].seq->DN_conv[layer] : ring) + (int64_t)ch * W;
+            const float *r = bcx + (int64_t)s * 3 * D;
+            const float bx = r[ch] * r[2 * D + ch];
+            float acc = 0.f;
+            for (int k = 0; k < W; k++) acc += w[k] * rg[k];
+            acc += w[W] * bx;
+            for (int k = 0; k + 1 < W; k++) rg[k] = rg[k + 1];
+            rg[W - 1] = bx;
+            y[(int64_t)s * D + ch] = r[D + ch] * acc;
+            /* a verify: the ring after each of its first snap_rows rows (q36_spec_rollback) */
+            if (s < m->snap_rows) memcpy(m->snap_conv[s][layer] + (int64_t)ch * W, rg, (size_t)W * sizeof(float));
+        }
+    }
+    if (!qtd_batch(l->qth_scout, out, y, S, D, D)) matmul_d(out, y, &l->sc_out, S, D, D);
+    free(bcx); free(y);
+}
+
 static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     (void)pos_base;
     Cfg *c = &m->c;
@@ -5967,7 +6161,8 @@ static void trunk_offer_dense(Model *m){
     Cfg *c = &m->c;
     for (int i = 0; i < c->n_layers; i++) {
         if (c->is_attn[i]) continue;
-        size_t b = qdw_bytes(&m->L[i].dn_out);
+        /* LFM3: a conv layer's two projections, its non-attention work */
+        size_t b = c->lfm3 ? qdw_bytes(&m->L[i].sc_in) + qdw_bytes(&m->L[i].sc_out) : qdw_bytes(&m->L[i].dn_out);
         if (b) qt_trunk_offer("dnout", i, b);
     }
     for (int i = 0; i < c->n_layers; i++) {
@@ -6006,7 +6201,12 @@ static int trunk_place_dense(Model *m, double *vram_bytes, int kinds[3]){
     kinds[0] = kinds[1] = kinds[2] = 0;   /* dnout, attnproj, shexp: the line says which went up */
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
-        if (!c->is_attn[i]) {
+        if (!c->is_attn[i] && c->lfm3) {
+            int dev = qt_place_of("dnout", i);
+            l->qth_scin = qdw_place(&l->sc_in, dev); l->qth_scout = qdw_place(&l->sc_out, dev);
+            if (l->qth_scin) { placed++; kinds[0]++; vram += (double)qdw_bytes(&l->sc_in); }
+            if (l->qth_scout) { placed++; kinds[0]++; vram += (double)qdw_bytes(&l->sc_out); }
+        } else if (!c->is_attn[i]) {
             l->qth_dnout = qdw_place(&l->dn_out, qt_place_of("dnout", i));
             if (l->qth_dnout) { placed++; kinds[0]++; vram += (double)qdw_bytes(&l->dn_out); }
         } else {
@@ -6120,12 +6320,16 @@ static int layers_forward_control(Model *m, float *x, int S, int pos_base,
         if (c->is_attn[i]) {
             attention(m, l, i, nrm, S, pos_base, tmp);
             tm_add(S, 1, tm_now()-_t0);
+        } else if (c->lfm3) {
+            shortconv(m, l, i, nrm, S, tmp);
+            tm_add(S, 0, tm_now()-_t0);
         } else {
             deltanet(m, l, i, nrm, S, pos_base, tmp);
             tm_add(S, 0, tm_now()-_t0);
         }
         if (lf) fwrite(tmp + (int64_t)(S-1)*D, sizeof(float), D, lf);   /* sublayer output */
         if (c->muse) for (int s = 0; s < S; s++) rmsnorm_plain(tmp + (int64_t)s*D, tmp + (int64_t)s*D, D, c->post_eps);
+        if (c->lfm3) for (int s = 0; s < S; s++) rmsnorm_row(tmp + (int64_t)s*D, tmp + (int64_t)s*D, l->post_op, D, c->eps);
         q36_residual(x, tmp, l->ra_a, l->ra_b, S, D);
         if (lf) fwrite(x + (int64_t)(S-1)*D, sizeof(float), D, lf);   /* post-deltanet residual */
         if (allow_prefetch && g_pilot >= 1 && S <= 8 && i + 1 < c->n_layers)
@@ -6135,6 +6339,7 @@ static int layers_forward_control(Model *m, float *x, int S, int pos_base,
         moe(m, l, i, nrm, S, tmp);
         tm_add(S, 2, tm_now()-_t0);
         if (c->muse) for (int s = 0; s < S; s++) rmsnorm_scaled(tmp + (int64_t)s*D, tmp + (int64_t)s*D, l->post_fn, D, c->post_eps);
+        if (c->lfm3) for (int s = 0; s < S; s++) rmsnorm_row(tmp + (int64_t)s*D, tmp + (int64_t)s*D, l->post_ffn, D, c->eps);
         q36_residual(x, tmp, l->rf_a, l->rf_b, S, D);
         if (lf) fwrite(x + (int64_t)(S-1)*D, sizeof(float), D, lf);
         if (allow_prefetch && g_pilot >= 2 && S <= 8 && i + 2 < c->n_layers)
@@ -6524,7 +6729,7 @@ static int q36_seq_alloc(Model *m, Q36Seq *q) {
             q->K[i] = malloc(kv * q36_kv_es()); q->V[i] = malloc(kv * q36_kv_es());
             ok = q->K[i] && q->V[i];
         } else if (m->DN_rec[i]) {
-            q->DN_rec[i] = calloc((size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, sizeof(float));
+            q->DN_rec[i] = calloc(q36_rec_cells(c), sizeof(float));
             q->DN_conv[i] = calloc((size_t)c->dn_conv_dim * (c->dn_convk - 1), sizeof(float));
             ok = q->DN_rec[i] && q->DN_conv[i];
         }
@@ -6747,7 +6952,7 @@ static Q36PinState *q36_pin_state_save(Model *m, Q36PinState *reuse){
 #ifdef COLI_CUDA
     q36cc_sync_host(m);
 #endif
-    size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim;
+    size_t nr = q36_rec_cells(c);
     size_t nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
     Q36PinState *st = reuse;
     if (st && st->n_layers != c->n_layers) { q36_pin_state_free(st); st = NULL; }
@@ -6796,7 +7001,7 @@ static void pin_save(Model *m, const int *ids, int n, const float *logit){
  * da li. Restituisce quanti token sono gia fatti, 0 se non si applica. */
 static int pin_restore(Model *m, const int *ids, int n){
     Cfg *c = &m->c;
-    size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim;
+    size_t nr = q36_rec_cells(c);
     size_t nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
     g_pin_logit = NULL;
     /* Il piu profondo degli scatti che sia un prefisso stretto di questo
@@ -6853,7 +7058,7 @@ static void reset_recurrent(Model *m){
     if (m->ring_pos) for (int r = 0; r < m->kv_ring; r++) m->ring_pos[r] = -1;
     for (int i = 0; i < c->n_layers; i++){
         if (c->is_attn[i]) continue;
-        if (m->DN_rec[i])  memset(m->DN_rec[i],  0, (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim * sizeof(float));
+        if (m->DN_rec[i])  memset(m->DN_rec[i],  0, q36_rec_cells(c) * sizeof(float));
         if (m->DN_conv[i]) memset(m->DN_conv[i], 0, (size_t)c->dn_conv_dim * (c->dn_convk - 1) * sizeof(float));
     }
 #ifdef COLI_VULKAN
@@ -7092,7 +7297,7 @@ static void q36_spec_free(Q36Spec *sp) { free(sp->hist); sp->hist = NULL; sp->hi
 static int q36_spec_alloc(Model *m, int rows) {
     Cfg *c = &m->c;
     if (rows > Q36_SPEC_SNAPS) rows = Q36_SPEC_SNAPS;
-    size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
+    size_t nr = q36_rec_cells(c), nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
     for (int sl = m->snap_slots; sl < rows; sl++) {
         if (!m->snap_rec[sl] && !(m->snap_rec[sl] = (float **)calloc((size_t)c->n_layers, sizeof(float *)))) return 0;
         if (!m->snap_conv[sl] && !(m->snap_conv[sl] = (float **)calloc((size_t)c->n_layers, sizeof(float *)))) return 0;
@@ -9182,9 +9387,12 @@ int main(int argc, char **argv) {
      * them so, and no experts of the mixed layout (one format per expert): the
      * dense trunk goes to the devices all the same (-1). Not a GGUF. */
     if (m.c.n_experts > 0 && !g_gguf) qt_source_planar(xf_mode(&m));
+    /* a dense model (no routed experts: LFM3, the dense Qwen3.5 and Qwen3) starts the tier for
+     * its trunk alone (-1), which the CUDA chain runs whole */
     if (gguf_tier || (!qq_active() && !g_gguf && m.c.n_experts > 0 &&
         qt_init(m.c.n_layers, m.c.n_experts, q36_eh(&m.c), m.c.inter, cap, m.c.topk,
-                m.c.expert_gs, expert_mixed ? -1 : expert_is_int4))) {
+                m.c.expert_gs, expert_mixed ? -1 : expert_is_int4)) ||
+        (!qq_active() && m.c.n_experts == 0 && qt_init(m.c.n_layers, 0, m.c.hidden, 0, 1, 1, 0, -1))) {
         fprintf(stderr, qt_experts_on() ? "[gpu] MoE experts -> CUDA VRAM tier\n"
                                         : "[gpu] dense trunk -> CUDA (the routed experts stay on the CPU)\n");
         atexit(qt_shutdown);

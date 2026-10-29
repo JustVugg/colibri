@@ -1002,7 +1002,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         fprintf(stderr,"[qtier] dev %d: %.1f GB free, allowance %.1f GB\n",
                 G.dev[i], freeb/1073741824.0, capacity[i]/1073741824.0);
     }
-    G.slot=calloc((size_t)nl*ne,sizeof(QSlot));
+    G.slot=calloc((size_t)nl*(ne>0?ne:1),sizeof(QSlot));   /* a dense model's tier (ne 0): its trunk alone */
     if(!G.slot) return 0;
     const char *hf=getenv("HEAT_FILE");
     if(hf){

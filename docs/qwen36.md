@@ -705,6 +705,79 @@ differs from one CPU to the next. The Vulkan tier holds F32 experts as int8 per
 32 (blocks it cannot read as the file has them), so Vulkan gives an F32
 oracle's tokens with `COLI_VK_TIER=0`.
 
+### LFM3-VL
+
+[LiquidAI/LFM3-VL-2B](https://huggingface.co/LiquidAI/LFM3-VL-2B) runs as its
+text model, from the published GGUFs ([LiquidAI/LFM3-VL-2B-GGUF](https://huggingface.co/LiquidAI/LFM3-VL-2B-GGUF):
+BF16, F16, Q8_0, Q6_K, Q5_K_M, Q4_K_M, QAD-Q4_0) or from the checkpoint converted to
+this engine's container (`tools/convert_qwen36.py`, the dense trunk then in int8, or
+in int4 per 64 with `COLI_DENSE_BITS=4`). Its license is the LFM Open License v1.0
+(LICENSE in the repositories). The vision tower is not run yet: a picture gets a 400.
+
+24 layers, hidden 2048, a SwiGLU MLP of 7680 in every one. 13 are short gated
+convolutions, 11 attention (16 query heads of 128 over 4 KV heads), 5 of them over
+a window of 256 positions. What the engine adds for it (`model_type: lfm3`, the
+GGUF's `lfm3`):
+
+- a conv layer: in_proj to B, C and x, then C * conv(B * x), a causal convolution
+  of 7 taps by channel whose last 6 inputs are the layer's state (the DeltaNet
+  layers' ring, so snapshots, prefix reuse and several conversations keep it as
+  they keep theirs), then out_proj;
+- attention with an RMSNorm on every q and k head and one sigmoid gate per head,
+  its own projection of the attention's input; RoPE at 1e6 on the full layers for
+  the first 32 of a head's 64 frequencies (the published files say so in
+  `rope_freqs`), at 1e4 on every frequency on the sliding ones;
+- every branch normalised before its residual (the norms after the conv or the
+  attention and after the MLP).
+
+The tokenizer is Llama 3's split (digits by three) with whole pieces first; the
+engine gives HF's ids on texts in six scripts, from the GGUF and from
+`tokenizer.json`. The gateway renders the release's chat template byte for byte
+(`tests/test_lfm3_chat.py`; the template is not in the repository, its license
+travels with every copy: `COLI_LFM3_TEMPLATE=path/to/chat_template.jinja` runs the
+check). Reasoning is on by default, as in the template (`<think>` opens every
+answer; `enable_thinking: false` writes the closed pair); tool calls are the
+`<tool_call><function=...>` blocks Qwen3.6 writes. A `developer` turn is the
+system turn.
+
+```bash
+coli import LFM3-VL-2B-Q4_K_M.gguf
+coli serve --model LFM3-VL-2B-Q4_K_M.colibri
+```
+
+Teacher-forced NLL (nats per token) over 1280 tokens after 256, two texts (the
+model card, this repository's docs/qwen36.md and docs/gguf.md); the float32
+reference is LiquidAI's own code:
+
+| weights | model card | docs |
+|---|---|---|
+| float32, LiquidAI's code | 1.528173 | 4.065100 |
+| F16 / BF16 GGUF, our container in f16 | 1.528213 | 4.065153 |
+| Q8_0 | 1.533722 | 4.065982 |
+| our container, int8 trunk | 1.543601 | 4.076783 |
+| Q6_K | 1.606276 | 4.089019 |
+| Q5_K_M | 1.537449 | 4.095028 |
+| QAD-Q4_0 | 1.518271 | 4.070037 |
+| Q4_K_M | 1.518874 | 4.154267 |
+| our container, int4 per 64 (`COLI_DENSE_BITS=4`) | 1.302078 | 4.138606 |
+
+The F16 file and the f16 container give the float32 answer token for token (32 of
+32 greedy tokens, cache-free); the quantized ones part where its top two logits are
+0.012 apart. On the model card int4 changes the model more than its NLL says: its
+conv projections in int4 alone (the rest int8) take the NLL to 1.29, a float
+simulation of the same rounding to 1.26, and on the docs keeping them int8 is
+worse (4.29), so the number is the rounding's, not a reading error.
+
+`tools/make_lfm3_tiny.py` writes a tiny LFM3 GGUF in the published files' layout
+and its float32 greedy continuation (checked once against LiquidAI's code on the
+same weights). The CPU, the CUDA chain and the Vulkan chain give its tokens with the
+KV cache in float16 too, in a ring of the window's rows and with drafts; the Vulkan
+chain on a partial chain too (`COLI_VK_CHAIN_LAYERS`), and in serve mode frame for
+frame the CPU's, with pins, reused prefixes, prompts on the device and decode on the
+CPU, and two conversations at once (`tests/vulkan_engines.sh`). With Q8_0 matrices
+`--act f32` writes the GPUs' reference (they read the matrices' inputs as floats,
+the CPU as int8); the CUDA chain takes a GGUF's blocks, not F32 matrices.
+
 ### The converter's tensor contract
 
 Both checkpoints ship experts **fused** per layer (`mlp.experts.gate_up_proj`,

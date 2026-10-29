@@ -72,6 +72,8 @@ typedef struct { int S, H, KVH, hd, pos_base, cap, q_off, q_row, q_seg, g_off, g
  * at snk[sink_off + h] that joins the softmax's denominator only. No selection list. */
 typedef struct { CcAttn a; int win, sink, sink_off; } CcAttnW;
 /* chain_dnconv.comp */
+/* order 0, 1: Gated DeltaNet's (the sum's two orders); 2: LFM3's gated convolution, input rows B | C | x
+ * of CD channels, out = C * conv(B * x), no activation (cc_lfm3_ready) */
 typedef struct { int S, CD, CK, in_off, in_row, out_off, out_row, snap_row, order, w_off, ring_off, snap_off; } CcDnConv;
 /* chain_dnrec.comp (KD a template parameter: 4, 8, 16, 32, 64, 128 or 256; VD <= 128). flags: 1 the gated
  * norm's gate a sigmoid (Qwen3.8), 2 the parameter A itself (a GGUF's, -exp(A_log)), 4 the value
@@ -91,6 +93,7 @@ typedef struct { int S, VH, KH, VD, Ktot, cv_off, cv_row, b_off, b_row, a_off, a
 #define CC_EW_SIGMUL   9    /* y = a * sigmoid(b) (cc_muse_ready) */
 #define CC_EW_RESGATE  10   /* y = e[col] * a + c[col] * b (cc_muse_ready) */
 #define CC_EW_F16      11   /* y = a clamped to +-65504, rounded to the nearest float16, as kv16.h (cc_kv16_ready) */
+#define CC_EW_HEADGATE 12   /* y = a * sigmoid(b[b_off + i / D]): a gate per head of D values, LFM3's (cc_lfm3_ready) */
 typedef struct { int op, n, D, C, flags, e_row, y_off, a_off, b_off, c_off, e_off; float fc; } CcEw;
 /* chain_qsa.comp (mode 0: nb block keys from b0; mode 1: S rows' selections) */
 typedef struct { int mode, ID, R, b0, half_, S, pos_base, budget, IQ, q_off, q_row, nbmax, sel_row; float eps;
@@ -308,6 +311,9 @@ typedef struct ColiCudaChainOps {
     int  (*enc_addrow)(CcBuf *y, CcBuf *tab, CcBuf *idx, const CcEncAddRow *p);
     int  (*enc_attn)(CcBuf *qkv, CcBuf *c2p, CcBuf *p2c, CcBuf *o, CcBuf *rng, CcBuf *ridx, CcBuf *pos, const CcEncAttn *p);
     int  (*enc_rel)(CcBuf *x, CcBuf *pt, CcBuf *y, const CcEncRel *p);
+    /* lfm3: 1 when dnconv takes order 2 and ew CC_EW_HEADGATE (LFM3's convolution and head gate:
+     * an older backend's kernels would skip them without a word) */
+    int  (*lfm3)(void);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -442,6 +448,10 @@ static inline int cc_enc_attn(CcBuf *qkv, CcBuf *c2p, CcBuf *p2c, CcBuf *o, CcBu
     return cc_enc_ready() ? cc_ops()->enc_attn(qkv, c2p, p2c, o, rng, ridx, pos, p) : 0;
 }
 static inline int cc_enc_rel(CcBuf *x, CcBuf *pt, CcBuf *y, const CcEncRel *p) { return cc_enc_ready() ? cc_ops()->enc_rel(x, pt, y, p) : 0; }
+static inline int cc_lfm3_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, lfm3) + sizeof t->lfm3 && t->lfm3 && t->lfm3();
+}
 #endif
 
 #ifdef __cplusplus
