@@ -2467,16 +2467,22 @@ the CUDA chain on the same card and clock 14.1 (its GGUF 13.3). The gate keeps w
 is faster; its probe is two warm forwards and four measured ones a phase
 (`COLI_VK_HYB_GATE_DEBUG=1` prints each).
 
-**The card's clocks.** Under the chain's decode an RTX 3070 ran at 780 to 960 MHz (its
-boost is about 1900) while the CUDA chain held 1755 on the same card: the driver's clocks
-follow the utilisation, and a decode of hundreds of short dispatches with waits between
-them reads as a light load. Locking the clock took the decode from 48 to 65 tok/s before
-any hybrid step, which had been most of the gap to CUDA: at the same clock the chain's int8
-GEMVs take what the CUDA chain's take (6.8 against 6.65 ms a token for the trunk and the
-head), and the small ops 1.1 to 1.3 times as long (they took 1.6 to 2.3 times as long at the
-driver's clocks). Measure with `nvidia-smi
---query-gpu=clocks.sm,clocks.mem --format=csv -lms 250` beside the run; `nvidia-smi -lgc`
-needs root and `-rgc` undoes it.
+**The card's clocks.** Under the chain's decode an RTX 3070 ran at 780 to 960 MHz over a
+200-token answer while the CUDA chain held 1755 on the same card from its first
+millisecond. The driver's governor ramps the clock up slowly, about 100 MHz every quarter
+second, and drops it to 780 the moment the card idles; a CUDA context with a stream that
+never runs dry (its wait for the host is a kernel) gets 1755 at once. A 200-token decode
+(4 s) is spent mostly on the ramp: over 600 tokens the same card reaches its full 2025 MHz
+by itself, and the chain decodes at 63 tok/s against the CUDA chain's 60 (with the hybrid
+steps 67.7). Locking the clock (`nvidia-smi -lgc 1755,1755`, root; `-rgc` undoes it) takes
+the ramp away: 48 to 65 tok/s over 200 tokens, nothing over long answers. At the same clock
+the chain's int8 GEMVs take what the CUDA chain's take (6.8 against 6.65 ms a token for the
+trunk and the head), and the small ops 1.1 to 1.3 times as long. So: compare the chains
+over 600 tokens or more, or with the clocks logged beside the run (`nvidia-smi
+--query-gpu=clocks.sm,clocks.mem --format=csv -lms 250`); the 200-token figures above the
+lock were the ramp, not the shaders. An idle CUDA context beside the Vulkan process does
+not lift the clock, nor does the frame structure (one frame a forward is worse: the host
+records 5 ms before the device starts).
 
 A round trip of the two timelines measured 7 us on the card. The host pool is cached
 system RAM (it was write-combined, which made the CPU's reads 25 times slower; the
