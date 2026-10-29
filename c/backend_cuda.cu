@@ -3669,9 +3669,13 @@ template<int BM, int BN> struct HcmTile {   /* 40, 64 and 80 KB of shared memory
     static constexpr int XB = BM * HCM_BK * 2, WB = BN * HCM_BK * 2, SMEM = XS * XB + 2 * WB;
     static constexpr int MINB = (BM == 128 && BN == 128) || BM == 64 ? 2 : 1;
 };
-template<int T, int BM, int BN>
+/* GLU: w the gate and wu the up projection, O their outputs; the block's weight rows alternate
+ * eight of the gate's and the same eight of the up's, so a warp's n8 tiles j and j + 1 hold the
+ * gate and the up of the same outputs, and y gets silu(gate) * up (cc_ew's CC_EW_SWIGLU). */
+template<int T, int BM, int BN, bool GLU>
 __global__ static void __launch_bounds__(256, (HcmTile<BM, BN>::MINB)) hcm_dense_k(float *__restrict__ y, const __half *__restrict__ xh,
-                                                                             const bd_u32 *__restrict__ w, int rw, int S, int I, int O, int kc) {
+                                                                             const bd_u32 *__restrict__ w, const bd_u32 *__restrict__ wu,
+                                                                             int rw, int S, int I, int O, int kc) {
     COLI_PDL_WAIT();
 #if HCM_BODY
     using TL = HcmTile<BM, BN>;
@@ -3686,7 +3690,14 @@ __global__ static void __launch_bounds__(256, (HcmTile<BM, BN>::MINB)) hcm_dense
     const int lr = t >> 1, lh = t & 1;   /* the thread's weights: outputs lr + 128 q, inputs 16 lh .. of a step */
     bool live_w[NW]; const bd_u32 *Wr[NW];
     #pragma unroll
-    for (int q = 0; q < NW; q++) { live_w[q] = n0 + lr + 128 * q < O; Wr[q] = w + (size_t)(live_w[q] ? n0 + lr + 128 * q : 0) * rw; }
+    for (int q = 0; q < NW; q++) {
+        const int c = lr + 128 * q;
+        if (GLU) {   /* block row c: tile c >> 3, the gate's on even tiles, the up's on odd */
+            const int orow = (n0 >> 1) + ((c >> 4) << 3) + (c & 7);
+            live_w[q] = orow < O;
+            Wr[q] = ((c >> 3) & 1 ? wu : w) + (size_t)(live_w[q] ? orow : 0) * rw;
+        } else { live_w[q] = n0 + c < O; Wr[q] = w + (size_t)(live_w[q] ? n0 + c : 0) * rw; }
+    }
     /* the thread's NX of a step's 4 BM input chunks: rows (t >> 2) + 64 q, chunk t & 3 */
     const int xr = t >> 2, xc = t & 3;
     const __half *Xp[NX]; unsigned xd[NX]; bool xl[NX];
@@ -3761,6 +3772,23 @@ __global__ static void __launch_bounds__(256, (HcmTile<BM, BN>::MINB)) hcm_dense
     #undef HCM_LDX
     #undef HCM_STW
     #undef HCM_FETCH
+    if (GLU) {
+        #pragma unroll
+        for (int i = 0; i < 4; i++)
+            #pragma unroll
+            for (int j = 0; j < NJ; j += 2)
+                #pragma unroll
+                for (int e = 0; e < 4; e += 2) {
+                    int r = wr * 64 + i * 16 + g + (e < 2 ? 0 : 8), c = (n0 >> 1) + (((wc * WN + j * 8) >> 4) << 3) + tig * 2;
+                    if (r >= M) continue;
+                    float *yr = y + (size_t)(m0 + r) * O + c;
+                    float g0 = acc[i][j][e], g1 = acc[i][j][e + 1];
+                    float v0 = (g0 / (1.f + expf(-g0))) * acc[i][j + 1][e], v1 = (g1 / (1.f + expf(-g1))) * acc[i][j + 1][e + 1];
+                    if (c + 1 < O && !(O & 1)) *reinterpret_cast<float2 *>(yr) = make_float2(v0, v1);
+                    else { if (c < O) yr[0] = v0; if (c + 1 < O) yr[1] = v1; }
+                }
+        return;
+    }
     #pragma unroll
     for (int i = 0; i < 4; i++)
         #pragma unroll
@@ -3774,7 +3802,7 @@ __global__ static void __launch_bounds__(256, (HcmTile<BM, BN>::MINB)) hcm_dense
                 else { if (c < O) yr[0] = acc[i][j][e]; if (c + 1 < O) yr[1] = acc[i][j][e + 1]; }
             }
 #else
-    (void)y; (void)xh; (void)w; (void)rw; (void)S; (void)I; (void)O; (void)kc;
+    (void)y; (void)xh; (void)w; (void)wu; (void)rw; (void)S; (void)I; (void)O; (void)kc;
 #endif
 }
 /* a split K's partial sums, in the order of the splits */
@@ -3787,28 +3815,30 @@ __global__ static void hcm_sum_k(float *__restrict__ y, const float *__restrict_
     y[i] = v;
 }
 #if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))   /* HIP has no carveout attribute; hcm_gemm is off there */
-template<int T, int BM, int BN>
-static void hcm_launch(dim3 g, cudaStream_t st, float *y, const __half *xh, const bd_u32 *w, int rw, int S, int I, int O, int kc) {
+template<int T, int BM, int BN, bool GLU = false>
+static void hcm_launch(dim3 g, cudaStream_t st, float *y, const __half *xh, const bd_u32 *w, int rw, int S, int I, int O, int kc,
+                       const bd_u32 *wu = nullptr) {
     constexpr int smem = HcmTile<BM, BN>::SMEM;
     static unsigned set = 0;   /* the devices this kernel's attributes are on */
     int dev = 0;
     (void)cudaGetDevice(&dev);
     if (dev < 32 && !(set & (1u << dev))) {   /* past 48 KB; 128 x 128's two blocks a multiprocessor */
-        cudaFuncSetAttribute(hcm_dense_k<T, BM, BN>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        cudaFuncSetAttribute(hcm_dense_k<T, BM, BN>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        cudaFuncSetAttribute(hcm_dense_k<T, BM, BN, GLU>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        cudaFuncSetAttribute(hcm_dense_k<T, BM, BN, GLU>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
         (void)cudaGetLastError();
         set |= 1u << dev;
     }
-    hcm_dense_k<T, BM, BN><<<g, 256, smem, st>>>(y, xh, w, rw, S, I, O, kc);
+    hcm_dense_k<T, BM, BN, GLU><<<g, 256, smem, st>>>(y, xh, w, wu, rw, S, I, O, kc);
 }
 #endif
 /* hcm_dense_k for a block tensor's S rows: the inputs in f16 (and a split K's partial sums) in
  * scratch the stream allocates and frees in its own order. COLI_CUDA_HCM_TILE and
  * COLI_CUDA_HCM_SPLIT (2 ..) force a tile and a split K. 0: not taken. COLI_CUDA_BD_HCM=0 keeps
  * the other tiles. */
-static int hcm_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st) {
+static int hcm_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st,
+                    ColiCudaTensor *tu = nullptr) {
 #if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
-    (void)ctx; (void)t; (void)y; (void)x; (void)S; (void)st; return 0;
+    (void)ctx; (void)t; (void)y; (void)x; (void)S; (void)st; (void)tu; return 0;
 #else
     static int on = -1, ftile = 0, fsplit = 0;
     if (on < 0) {
@@ -3818,7 +3848,8 @@ static int hcm_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float
     }
     int tt = hcm_type(t->fmt, t->I);
     if (!on || !tt || ctx->compute_major < 8 || S <= BD_GEMV_MAX_S) return 0;
-    const int I = t->I, O = t->O;
+    const int I = t->I, O = t->O, glu = tu != nullptr, OB = glu ? 2 * O : O;   /* OB: the blocks' weight rows */
+    if (glu && (tu->fmt != t->fmt || tu->I != I || tu->O != O || tu->row_words != t->row_words || tu->device != t->device)) return 0;
     /* the tile: COLI_CUDA_HCM_TILE 1 (128 x 128), 2 (128 x 256), 3 (256 x 128), 4 (64 x 128, up to 64
      * rows: hcg_dense_k's 64 x 64 without a split took 1.5-1.7 times as long). Past 128 rows 256 x
      * 128: on an RTX PRO 4000 (70 W, its clock down to 1.4 GHz under these products) a 2048 x 7680
@@ -3830,9 +3861,10 @@ static int hcm_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float
     const int BMt = tile == 3 ? 256 : tile == 4 ? 64 : 128, BNt = tile == 2 ? 256 : 128;
     /* fewer blocks than the multiprocessors' slots: K split up to a wave, 512 inputs a split at
      * least (a 2048 x 40 heads' gate was one block down 64 steps, 44 us whatever the rows) */
-    const long long blocks = (long long)((O + BNt - 1) / BNt) * ((S + BMt - 1) / BMt), slots = (long long)ctx->sms * (tile == 1 || tile == 4 ? 2 : 1);
+    const long long blocks = (long long)((OB + BNt - 1) / BNt) * ((S + BMt - 1) / BMt), slots = (long long)ctx->sms * (tile == 1 || tile == 4 ? 2 : 1);
     int ns = 1;
-    if (fsplit > 0) ns = fsplit;
+    if (glu) ns = 1;   /* the epilogue's silu needs the whole sums */
+    else if (fsplit > 0) ns = fsplit;
     else if (blocks < slots) {
         long long f = slots / blocks;
         ns = (int)(f < I / 512 ? f : I / 512);
@@ -3848,16 +3880,18 @@ static int hcm_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float
     long long n4 = (long long)(n / 4);
     hcm_half_k<<<(unsigned)((n4 + 255) / 256), 256, 0, st>>>(reinterpret_cast<const float4 *>(x), reinterpret_cast<uint2 *>(scr), n4);
     float *yp = ns > 1 ? reinterpret_cast<float *>((char *)scr + ((n * 2 + 255) / 256) * 256) : y;
-    dim3 gq((unsigned)((O + BNt - 1) / BNt), (unsigned)((S + BMt - 1) / BMt), (unsigned)ns);
-    const bd_u32 *wv = (const bd_u32 *)t->weights;
+    dim3 gq((unsigned)((OB + BNt - 1) / BNt), (unsigned)((S + BMt - 1) / BMt), (unsigned)ns);
+    const bd_u32 *wv = (const bd_u32 *)t->weights, *wuv = glu ? (const bd_u32 *)tu->weights : nullptr;
     const __half *xh = (const __half *)scr;
-    #define HCM_GO(BM_, BN_) do { switch (tt) { \
-        case 8: hcm_launch<8, BM_, BN_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc); break; \
-        case 12: hcm_launch<12, BM_, BN_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc); break; \
-        case 13: hcm_launch<13, BM_, BN_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc); break; \
-        default: hcm_launch<14, BM_, BN_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc); break; } } while (0)
+    #define HCM_GO2(BM_, BN_, G_) do { switch (tt) { \
+        case 8: hcm_launch<8, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv); break; \
+        case 12: hcm_launch<12, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv); break; \
+        case 13: hcm_launch<13, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv); break; \
+        default: hcm_launch<14, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv); break; } } while (0)
+    #define HCM_GO(BM_, BN_) do { if (glu) HCM_GO2(BM_, BN_, true); else HCM_GO2(BM_, BN_, false); } while (0)
     if (tile == 3) HCM_GO(256, 128); else if (tile == 2) HCM_GO(128, 256); else if (tile == 4) HCM_GO(64, 128); else HCM_GO(128, 128);
     #undef HCM_GO
+    #undef HCM_GO2
     if (ns > 1) {
         long long ny = (long long)S * O;
         hcm_sum_k<<<(unsigned)((ny + 255) / 256), 256, 0, st>>>(y, yp, ny, ns);
@@ -4239,6 +4273,21 @@ static int f32_gemm_launch(DeviceContext *ctx, float *y, const float *x, const f
     if ((long)gx * big >= 2L * (ctx->sms > 0 ? ctx->sms : 1)) coli_launch(f32_gemm_k<64>, dim3(gx, big), 256, 0, st, y, x, w, S, I, O);
     else coli_launch(f32_gemm_k<16>, dim3(gx, (unsigned)((S + 15) / 16)), 256, 0, st, y, x, w, S, I, O);
     return cuda_ok(cudaGetLastError(), "chain f32 gemm launch");
+}
+/* y[S, O] = silu(x Wg^T) * (x Wu^T) for two GGUF block tensors of one type and shape, in one
+ * hcm_dense_k pass (a prompt chunk's rows of a SwiGLU MLP: the gate's and the up's outputs never
+ * leave the multiprocessor). 0: not taken here (another type, a decode step's rows, GQ_EXACT),
+ * the caller's two GEMMs and its CC_EW_SWIGLU do it. COLI_CUDA_GLU=0 never. */
+extern "C" int coli_cuda_tensor_glu_async(ColiCudaTensor *tg, ColiCudaTensor *tu, float *y_dev, const float *x_dev, int S, void *stream) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("COLI_CUDA_GLU"), *f = getenv("COLI_CUDA_BD_FLOAT"), *q = getenv("GQ_EXACT"), *b = getenv("COLI_CUDA_BD_TILES");
+        on = !(e && *e == '0') && !(f && *f == '1') && !(q && *q == '1') && !(b && *b == '0');
+    }
+    if (!on || fault_injected() || !tg || !tu || !y_dev || !x_dev || S <= BD_GEMV_MAX_S || tg->fmt < 100 || ((uintptr_t)x_dev & 15)) return 0;
+    DeviceContext *ctx = find_ctx(tg->device);
+    if (!select_ctx(ctx) || !bd_table(ctx)) return 0;
+    return hcm_gemm(ctx, tg, y_dev, x_dev, S, (cudaStream_t)stream, tu);
 }
 extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream) {
     if (fault_injected()) return 0;

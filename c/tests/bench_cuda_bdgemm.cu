@@ -200,6 +200,54 @@ int main(int argc, char **argv) {
         }
         coli_cuda_tensor_free(tn); cudaFree(dx); cudaFree(dy);
     }
+    /* coli_cuda_tensor_glu_async: a SwiGLU MLP's gate and up (2048 -> 7680 and 6144) of every type
+     * in one pass, silu(gate) * up against the reference's, and timed against the two GEMMs */
+    if (S > BD_GEMV_MAX_S)
+    for (int ti = 0; ti < 4; ti++)
+        for (int si = 0; si < 3; si += 2) {
+            int t = types[ti], I = shapes[si][0], O = shapes[si][1], rb = bench_row_bytes(t, I);
+            std::vector<uint8_t> wg((size_t)rb * O), wu((size_t)rb * O);
+            for (int o = 0; o < O; o++) { fill_row(t, wg.data() + (size_t)rb * o, I); fill_row(t, wu.data() + (size_t)rb * o, I); }
+            std::vector<float> x((size_t)S * I), y((size_t)S * O);
+            for (auto &v : x) v = ((int)(rnd() % 2001) - 1000) * 1e-3f;
+            ColiCudaTensor *tg = NULL, *tu = NULL;
+            if (!coli_cuda_tensor_upload(&tg, wg.data(), NULL, 100 + t, I, O, 0) || !coli_cuda_tensor_upload(&tu, wu.data(), NULL, 100 + t, I, O, 0)) {
+                fprintf(stderr, "upload failed\n"); return 1;
+            }
+            float *dx, *dy, *dg, *du;
+            cudaMalloc(&dx, x.size() * 4); cudaMalloc(&dy, y.size() * 4); cudaMalloc(&dg, y.size() * 4); cudaMalloc(&du, y.size() * 4);
+            cudaMemcpyAsync(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice, ctx->stream);
+            cudaStreamSynchronize(ctx->stream);
+            if (!coli_cuda_tensor_glu_async(tg, tu, dy, dx, S, ctx->stream)) { fprintf(stderr, "glu not taken\n"); return 1; }
+            cudaStreamSynchronize(ctx->stream);
+            cudaMemcpy(y.data(), dy, y.size() * 4, cudaMemcpyDeviceToHost);
+            std::vector<float> fg(I), fu(I);
+            double worst = 0, rms = 0; int n = 0;
+            for (int o = 0; o < O; o += O / 61 + 1) {
+                decode_row(t, wg.data() + (size_t)rb * o, I, fg.data()); decode_row(t, wu.data() + (size_t)rb * o, I, fu.data());
+                for (int s = 0; s < S; s += S / 23 + 1) {
+                    double g = 0, u = 0;
+                    for (int k = 0; k < I; k++) { g += (double)x[(size_t)s * I + k] * fg[k]; u += (double)x[(size_t)s * I + k] * fu[k]; }
+                    double ref = g / (1 + exp(-g)) * u, e = fabs(y[(size_t)s * O + o] - ref);
+                    rms += ref * ref; n++; if (e > worst) worst = e;
+                }
+            }
+            rms = sqrt(rms / n);
+            const int R = getenv("BENCH_R") ? atoi(getenv("BENCH_R")) : 20;
+            cudaEvent_t a, b, c2; cudaEventCreate(&a); cudaEventCreate(&b); cudaEventCreate(&c2);
+            for (int r = 0; r < 3; r++) coli_cuda_tensor_glu_async(tg, tu, dy, dx, S, ctx->stream);
+            cudaEventRecord(a, ctx->stream);
+            for (int r = 0; r < R; r++) coli_cuda_tensor_glu_async(tg, tu, dy, dx, S, ctx->stream);
+            cudaEventRecord(b, ctx->stream);
+            for (int r = 0; r < R; r++) { bd_tensor_gemv(ctx, tg, dg, dx, S, ctx->stream); bd_tensor_gemv(ctx, tu, du, dx, S, ctx->stream); }
+            cudaEventRecord(c2, ctx->stream); cudaEventSynchronize(c2);
+            float ms, ms2; cudaEventElapsedTime(&ms, a, b); cudaEventElapsedTime(&ms2, b, c2); ms /= R; ms2 /= R;
+            int bad = worst / rms > 2e-2;
+            fails += bad;
+            printf("glu %-5s I %5d O %5d S %4d: %8.1f us (the two GEMMs %8.1f)   worst error %.2e of the rms%s\n",
+                   t == 8 ? "Q8_0" : t == 12 ? "Q4_K" : t == 13 ? "Q5_K" : "Q6_K", I, O, S, ms * 1e3, ms2 * 1e3, worst / rms, bad ? "  BAD" : "");
+            coli_cuda_tensor_free(tg); coli_cuda_tensor_free(tu); cudaFree(dx); cudaFree(dy); cudaFree(dg); cudaFree(du);
+        }
     printf("bench_cuda_bdgemm: %s\n", fails ? "FAILED" : "ok");
     return fails != 0;
 }
