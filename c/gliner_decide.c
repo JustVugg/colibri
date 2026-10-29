@@ -792,10 +792,12 @@ static int pos_att_has(jval *types, const char *name)
 static void load_model(Gl *M, const char *dir)
 {
     memset(M, 0, sizeof(*M));
-    /* config.json: the GLiNER2 extractor */
+    /* config.json: the GLiNER2 extractor (model_type "extractor"; "gliner2" in the repository's
+     * config since its transformers form, the same weights) */
     jval *cfg = read_json(dir, "config.json");
-    if (strcmp(str_or(cfg, "model_type", ""), "extractor"))
-        die("config.json: model_type must be extractor (a GLiNER2 checkpoint)");
+    const char *mt = str_or(cfg, "model_type", "");
+    if (strcmp(mt, "extractor") && strcmp(mt, "gliner2"))
+        die("config.json: model_type must be extractor or gliner2 (a GLiNER2 checkpoint)");
     const char *arch = str_or(cfg, "architecture", "span");
     if (strcmp(arch, "span"))
         die("config.json: architecture %s is not supported (only GLiNER2's span architecture)", arch);

@@ -2000,8 +2000,9 @@ def _resolve_decision_checkpoint(model):
 
 
 # GLiNER2's config.json says model_type "extractor" whatever the architecture
-# and the encoder; the encoder's own config sits in encoder_config/.
-GLINER2_MODEL_TYPE = "extractor"
+# and the encoder ("gliner2" in fastino's repository since its transformers form,
+# the same weights); the encoder's own config sits in encoder_config/.
+GLINER2_MODEL_TYPES = ("extractor", "gliner2")
 GLINER2_ENCODER_CONFIG = "encoder_config/config.json"
 
 
@@ -2063,7 +2064,7 @@ def resolve_model(model_dir):
             "  carries model_index.json instead.") from error
     except json.JSONDecodeError as error:
         raise FamilyConfigError(f"invalid config.json: {error}") from error
-    if isinstance(config, dict) and config.get("model_type") == GLINER2_MODEL_TYPE:
+    if isinstance(config, dict) and config.get("model_type") in GLINER2_MODEL_TYPES:
         return _resolve_gliner2_checkpoint(model, config)
     family = family_for_config(config)
     family_config = config

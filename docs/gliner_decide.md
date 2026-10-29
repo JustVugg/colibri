@@ -24,7 +24,8 @@ make -C c gliner_decide
 ```
 
 `coli` recognises the checkpoint by its `config.json` (`model_type`
-`extractor`, GLiNER2's) and the encoder's `encoder_config/config.json`; the
+`extractor`, GLiNER2's, or `gliner2` as the repository's config says since its
+transformers form, the same weights) and the encoder's `encoder_config/config.json`; the
 registry keys it `gliner2_span_deberta-v2`. `coli info` shows the encoder and
 the token budget, `coli plan` the RAM, `coli doctor` what is missing.
 
