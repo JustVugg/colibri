@@ -73,6 +73,12 @@ describe("the rest of the subset still renders", () => {
     expect(render("````text\nfirst\n```\nstill code")).toContain("<pre><code>first\n```\nstill code</code></pre>")
   })
 
+  it("keeps an empty unclosed fence at the end of a streamed answer", () => {
+    for (const opener of ["```", "```python", "````text"]) {
+      expect(render(opener)).toContain("<pre><code></code></pre>")
+    }
+  })
+
   it("keeps ordinary text with a single pipe as a paragraph", () => {
     const html = render("choose a | b at the prompt")
     expect(html).toContain("<p>")

@@ -29,7 +29,7 @@ function segments(source: string): Segment[] {
   const out: Segment[] = []
   // Fences start on a line. A closing run must be at least as long as the
   // opener and have nothing but whitespace after it; shorter runs are code.
-  const fence = /^ {0,3}(`{3,})([^`\n]*)\n/gm
+  const fence = /^ {0,3}(`{3,})([^`\n]*)(?:\n|$)/gm
   let last = 0
   for (let match = fence.exec(source); match; match = fence.exec(source)) {
     if (match.index > last) out.push({ kind: "text", body: source.slice(last, match.index) })
