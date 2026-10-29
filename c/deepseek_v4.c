@@ -5575,6 +5575,28 @@ static void v4_vk_token_free(V4VkToken *vk) {
 }
 #endif
 
+/* EP-N decode state: the engine-open probe publishes the validated device
+ * table here (v4_ep_devices[0..ndev-1]: primary first, extras after; the
+ * routed-expert bands follow from the device count) and each extra device's
+ * mirror cache, so the per-token decode path can direct attachments without
+ * an engine handle. An engine that opened without EP-N leaves ndev at 0
+ * (or 1... the decode gate requires > 1) and the mirrors NULL. The state
+ * spans units (engine-open writes from UNIT_GPU, decode reads from
+ * UNIT_BLOCK_HYBRID), so these are cross-unit globals, one definition
+ * here, extern-declared in the GPU unit — the same pattern as
+ * coli_v4_vk_tier. */
+int v4_ep_devices[16];
+int v4_ep_ndev;
+void *v4_ep_extra_mirrors[15];
+#ifdef COLI_V4_GPU_TIER
+/* Forward declares: the mirror-cache machinery and the backend probe are
+ * defined further down the amalgamation (and in the CUDA tier header). */
+typedef struct V4GpuExpertMirrorCache V4GpuExpertMirrorCache;
+extern int v4_gpu_ep_peer_attach(void *cache, ColiExpertView *view,
+                                 int sync);
+extern int dsv4_cuda_device_active(int device);
+#endif
+
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
 /* Finish every lane still reading and give back what it leased. Every exit of
  * a fetch pass runs this, errors included: a lane left running would write
@@ -5754,6 +5776,27 @@ static int moe_token_pipeline(float *output,
         moe_fail("layer %d: the shared expert failed", weights->plan.layer);
     if (!result) memset(output, 0, (size_t)d * sizeof(*output));
 
+#ifdef COLI_V4_GPU_TIER
+    /* EP decode: routed experts attach to the device that owns their band
+     * (published by engine-open): primary-band experts go through the
+     * store's primary cache, band-d experts through extra cache d-1. See
+     * the partitioned branch further down. */
+    int ep2_decode = !result && store->gpu && v4_ep_ndev > 1 &&
+                     selected > 0 && selected <= 16;
+    for (int k = 0; ep2_decode && k < v4_ep_ndev - 1; k++)
+        if (!v4_ep_extra_mirrors[k] ||
+            !dsv4_cuda_device_active(v4_ep_devices[1 + k]))
+            ep2_decode = 0;
+    unsigned char *vdev = NULL;
+    if (ep2_decode) {
+        vdev = malloc((size_t)selected);
+        if (!vdev) {
+            ep2_decode = 0;
+        } else {
+            memset(vdev, 0, (size_t)selected);
+        }
+    }
+#endif
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
     /* Zeroed up front: every exit releases the views below, and one that
      * fails before the fetch pass fills them must find no lease there. */
@@ -5784,7 +5827,26 @@ static int moe_token_pipeline(float *output,
             views[current] = jobs[slot].view;
 #ifdef COLI_V4_GPU_TIER
             if (store->gpu) {
-                if (coli_v4_hybrid_enabled())
+                int band = 0;
+                if (ep2_decode) {
+                    int id = expert_ids[current];
+                    for (band = 0; band < v4_ep_ndev; band++) {
+                        int lo = band * 256 / v4_ep_ndev;
+                        int hi = (band + 1) * 256 / v4_ep_ndev;
+                        if (id >= lo && id < hi) break;
+                    }
+                    if (band >= v4_ep_ndev) band = 0;
+                }
+                if (ep2_decode && band > 0 && v4_ep_extra_mirrors[band - 1]) {
+                    /* EP: band experts attach to that device's own mirror
+                     * cache; a refusal (VRAM reserve, capacity) leaves the
+                     * view CPU-side, where the ordinary fallbacks compute it. */
+                    if (v4_gpu_ep_peer_attach(v4_ep_extra_mirrors[band - 1],
+                                              &views[current], 1) == 0 &&
+                        views[current].gate.gpu && views[current].up.gpu &&
+                        views[current].down.gpu)
+                        vdev[current] = (unsigned char)(band + 1);
+                } else if (coli_v4_hybrid_enabled())
                     /* peek only: uploads are decided once the token's full
                      * miss count is known, by the q* pass below */
                     coli_v4_gpu_expert_peek(store, &views[current]);
@@ -5793,8 +5855,12 @@ static int moe_token_pipeline(float *output,
             }
 #endif
 #ifdef COLI_V4_GPU_TIER
-            if (!views[current].gate.gpu || !views[current].up.gpu ||
-                !views[current].down.gpu)
+            if (ep2_decode && vdev[current] > 1)
+                /* The fused MoE is single-device: a peer-resident expert
+                 * forces the partitioned EP branch below. */
+                gpu_compute = 0;
+            else if (!views[current].gate.gpu || !views[current].up.gpu ||
+                     !views[current].down.gpu)
                 gpu_compute = 0;
 #endif
 
@@ -5874,6 +5940,125 @@ static int moe_token_pipeline(float *output,
         if (selected > 0 && hybrid_gpu_count == selected)
             gpu_compute = 1;    /* every expert made it: use the fused path */
     }
+#ifdef COLI_V4_GPU_TIER
+    int ep2_use = 0;
+    if (!result && ep2_decode && store->gpu) {
+        int peers_n = 0;
+        for (int i = 0; i < selected; i++)
+            if (vdev[i] > 1 && views[i].gate.gpu && views[i].up.gpu &&
+                views[i].down.gpu)
+                peers_n++;
+        /* Peer-resident experts are exactly why EP exists in decode; with
+         * none attached peer-side, the plain fused path takes the token. */
+        ep2_use = peers_n > 0;
+    }
+    if (!result && ep2_use) {
+        /* idx[dv] collects the all-resident views that compute on device
+         * slot dv (0 = primary; slots 1.. use the extra devices). Views
+         * still host-side stay CPU-first below. */
+        int idx[16][16];
+        int gn[16] = {0};
+        for (int i = 0; i < selected; i++) {
+            if (!(views[i].gate.gpu && views[i].up.gpu &&
+                  views[i].down.gpu))
+                continue;
+            int dv = vdev[i];
+            if (dv > 1 && dv <= v4_ep_ndev)
+                idx[dv - 1][gn[dv - 1]++] = i;
+            else
+                idx[0][gn[0]++] = i;
+        }
+        int gcap = 0;
+        for (int dv = 0; dv < v4_ep_ndev; dv++)
+            if (gn[dv] > gcap) gcap = gn[dv];
+        size_t cap = (size_t)(gcap ? gcap : 1);
+        void **gates = malloc(cap * sizeof(*gates));
+        void **ups = malloc(cap * sizeof(*ups));
+        void **downs = malloc(cap * sizeof(*downs));
+        float *gw = malloc(cap * sizeof(*gw));
+        float *sums[16] = {0};
+        int built = gates && ups && downs && gw;
+        for (int dv = 0; built && dv < v4_ep_ndev; dv++) {
+            if (!gn[dv]) continue;
+            sums[dv] = malloc((size_t)d * sizeof(*sums[dv]));
+            if (!sums[dv]) built = 0;
+        }
+        if (built) {
+            /* CPU-side experts first; the per-device groups follow. The
+             * partial sums merge by addition — the same order-of-addition
+             * class the hybrid split already relies on. */
+            for (int i = 0; !result && i < selected; i++) {
+                if (views[i].gate.gpu && views[i].up.gpu &&
+                    views[i].down.gpu)
+                    continue;
+                result = coli_v4_expert_forward_ref(
+                    expert_output, &views[i], input,
+                    expert_weights[i], config->swiglu_limit);
+                if (!result)
+                    for (int j = 0; j < d; j++)
+                        output[j] += expert_output[j];
+            }
+            extern int dsv4_cuda_expert_group(
+                void *const *gate, void *const *up, void *const *down,
+                const float *weights, int count, float limit,
+                float *y, const float *x);
+            int ok[16];
+            for (int dv = 0; dv < 16; dv++) ok[dv] = 1;
+            for (int dv = 0; !result && dv < v4_ep_ndev; dv++) {
+                if (!gn[dv]) continue;
+                int k = 0;
+                for (int i = 0; i < gn[dv]; i++) {
+                    gates[k] = views[idx[dv][i]].gate.gpu;
+                    ups[k] = views[idx[dv][i]].up.gpu;
+                    downs[k] = views[idx[dv][i]].down.gpu;
+                    gw[k] = expert_weights[idx[dv][i]];
+                    k++;
+                }
+                ok[dv] = dsv4_cuda_expert_group(gates, ups, downs, gw, gn[dv],
+                                                config->swiglu_limit, sums[dv],
+                                                input);
+            }
+            /* A refused group degrades to the CPU reference instead of
+             * failing the token; its partial sum is then already folded in. */
+            for (int dv = 0; !result && dv < v4_ep_ndev; dv++) {
+                if (!gn[dv] || ok[dv]) continue;
+                for (int i = 0; !result && i < gn[dv]; i++) {
+                    result = coli_v4_expert_forward_ref(
+                        expert_output, &views[idx[dv][i]], input,
+                        expert_weights[idx[dv][i]], config->swiglu_limit);
+                    if (!result)
+                        for (int j = 0; j < d; j++)
+                            output[j] += expert_output[j];
+                }
+            }
+            if (!result) {
+                for (int j = 0; j < d; j++) {
+                    float total = output[j] + shared_output[j];
+                    for (int dv = 0; dv < v4_ep_ndev; dv++)
+                        if (gn[dv] && ok[dv]) total += sums[dv][j];
+                    output[j] = coli_bf16_round(total);
+                }
+            }
+        } else {
+            /* Scratch short: the whole token computes through the CPU
+             * reference rather than failing. */
+            for (int i = 0; !result && i < selected; i++) {
+                result = coli_v4_expert_forward_ref(
+                    expert_output, &views[i], input,
+                    expert_weights[i], config->swiglu_limit);
+                if (!result)
+                    for (int j = 0; j < d; j++)
+                        output[j] += expert_output[j];
+            }
+            if (!result)
+                for (int j = 0; j < d; j++)
+                    output[j] =
+                        coli_bf16_round(output[j] + shared_output[j]);
+        }
+        free(gates); free(ups); free(downs); free(gw);
+        for (int dv = 0; dv < v4_ep_ndev; dv++) free(sums[dv]);
+    } else
+#endif
     if (!result && gpu_compute && store->gpu) {
         void *sg = coli_v4_layer_gpu(weights, "ffn.shared_experts.w1");
         void *su = coli_v4_layer_gpu(weights, "ffn.shared_experts.w3");
@@ -6062,6 +6247,9 @@ static int moe_token_pipeline(float *output,
     for (int current = 0; views && current < selected; current++)
         coli_expert_release(store, &views[current]);
     free(views);
+#ifdef COLI_V4_GPU_TIER
+    free(vdev);
+#endif
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
     v4_vk_token_free(&vk_step);
 #endif
@@ -11512,8 +11700,17 @@ static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create(int device,
                                                             int suggested);
 static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache);
+/* Mirror-cache attach — pinned static by the mirror-guard source tests;
+ * cross-unit decode access flows through v4_gpu_ep_peer_attach (defined
+ * after this function's body). */
 static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                                           ColiExpertView *view, int sync);
+
+/* EP-N device table published by this unit (declaration lives with the
+ * definition in the block-hybrid unit). */
+extern int v4_ep_devices[16], v4_ep_ndev;
+extern void *v4_ep_extra_mirrors[15];
+
 static void v4_gpu_mirror_reserve_size(const ColiDeepSeekV4Config *config,
                                        int bank_possible);
 static long long v4_gpu_mirror_reserve_mb(int live);
@@ -11545,7 +11742,45 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
 #endif
     const char *device_setting = getenv("DSV4_CUDA_DEVICE");
     int device = device_setting ? atoi(device_setting) : 0;
-    if (!dsv4_cuda_init(&device, 1)) {
+    /* Optional extra devices for routed-expert parallelism (EP-N): the
+     * 256-expert bank is split band-wise across the CUDA devices (each of
+     * the N devices gets 256/N consecutive expert ids, the primary
+     * included), and every token's per-device partial sums are combined on
+     * the host. DSV4_CUDA_EP_DEVICES is a comma list of extra device
+     * indices ("1,2,3"); the legacy two-GPU variables (DSV4_CUDA_EP2=1
+     * with DSV4_CUDA_EP2_PEER, default 1) remain for a single peer.
+     * Everything degrades to the plain single-device path when a peer is
+     * absent, under-provisioned, or unsupported. */
+    int npeers = 0;
+    int peers[15] = {0};
+    const char *ep_list = getenv("DSV4_CUDA_EP_DEVICES");
+    if (ep_list && *ep_list) {
+        while (npeers < 15 && *ep_list) {
+            char *end;
+            long v = strtol(ep_list, &end, 10);
+            if (end == ep_list) break;
+            if (v >= 0 && v <= 15) peers[npeers++] = (int)v;
+            ep_list = *end ? end + 1 : end;
+        }
+    } else if (getenv("DSV4_CUDA_EP2") &&
+               atoi(getenv("DSV4_CUDA_EP2")) == 1) {
+        const char *peer_setting = getenv("DSV4_CUDA_EP2_PEER");
+        peers[npeers++] = peer_setting ? atoi(peer_setting) : 1;
+    }
+    {   /* drop entries equal to the primary or duplicated */
+        int keep = 0;
+        for (int k = 0; k < npeers; k++) {
+            int dup = peers[k] == device;
+            for (int j = 0; !dup && j < keep; j++)
+                dup = peers[j] == peers[k];
+            if (!dup) peers[keep++] = peers[k];
+        }
+        npeers = keep;
+    }
+    int devices[16];
+    devices[0] = device;
+    for (int k = 0; k < npeers; k++) devices[1 + k] = peers[k];
+    if (!dsv4_cuda_init(devices, 1 + npeers)) {
         fprintf(stderr, "v4_gpu warning=backend-unavailable; continuing-CPU\n");
         return 0;
     }
@@ -11558,6 +11793,23 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
                 dsv4_cuda_backend_name(), device);
         dsv4_cuda_shutdown();
         return 0;
+    }
+    /* Each peer carries a band of the bank (~3.4 GiB at full count plus
+     * its own mirror cache); refuse a peer rather than starve later. A
+     * dropped peer shrinks the device count — the bands follow. */
+    for (int k = 0; k < npeers;) {
+        int pd = peers[k];
+        if (dsv4_cuda_backend_arch_ok(pd) &&
+            dsv4_cuda_mem_free_mb(pd) >= 4500) {
+            k++;
+            continue;
+        }
+        fprintf(stderr, "v4_gpu warning=ep-peer device %d %s; dropping it\n",
+                pd, dsv4_cuda_backend_arch_ok(pd)
+                        ? "free VRAM below 4500 MiB"
+                        : "unsupported");
+        for (int j = k; j < npeers - 1; j++) peers[j] = peers[j + 1];
+        npeers--;
     }
     engine->gpu.enabled = 1;
     engine->gpu.device = device;
@@ -11581,7 +11833,41 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     if (engine->experts && !engine->experts->gpu)
         engine->experts->gpu =
             v4_gpu_expert_mirrors_create(device, mirror_suggested);
-    fprintf(stderr, "v4_gpu tier=dense-matvec device=%d\n", device);
+    if (npeers > 0) {
+        engine->gpu.npeers = npeers;
+        for (int k = 0; k < 15; k++)
+            engine->gpu.peers[k] = k < npeers ? peers[k] : -1;
+        for (int k = 0; k < npeers; k++) {
+            /* Decode keeps its own mirror cache per peer device: that
+             * band's routed ids attach here instead of the primary cache.
+             * Same per-attach VRAM reserve guard applies on each peer. */
+            engine->gpu.peer_mirrors[k] =
+                v4_gpu_expert_mirrors_create(peers[k], mirror_suggested);
+            /* Publish for the decode path (no engine handle there). */
+            v4_ep_extra_mirrors[k] = engine->gpu.peer_mirrors[k];
+        }
+        v4_ep_devices[0] = device;
+        for (int k = 0; k < npeers; k++) v4_ep_devices[1 + k] = peers[k];
+        v4_ep_ndev = 1 + npeers;
+        fprintf(stderr, "v4_gpu tier=expert-parallel devices=%d", device);
+        for (int k = 0; k < v4_ep_ndev; k++) {
+            if (k) fprintf(stderr, ",%d", v4_ep_devices[k]);
+        }
+        fprintf(stderr, " bands=");
+        for (int d = 0; d < v4_ep_ndev; d++)
+            fprintf(stderr, "%s%d", d ? "/" : "",
+                    (d + 1) * 256 / v4_ep_ndev - d * 256 / v4_ep_ndev);
+        fprintf(stderr, "\n");
+    } else {
+        for (int k = 0; k < 15; k++) {
+            engine->gpu.peers[k] = -1;
+            engine->gpu.peer_mirrors[k] = NULL;
+            v4_ep_extra_mirrors[k] = NULL;
+        }
+        engine->gpu.npeers = 0;
+        v4_ep_ndev = 0;
+        fprintf(stderr, "v4_gpu tier=dense-matvec device=%d\n", device);
+    }
     return 0;
 }
 
@@ -11615,6 +11901,17 @@ void coli_v4_gpu_engine_close(ColiV4Engine *engine) {
             (V4GpuExpertMirrorCache *)engine->gpu.dspark_mirrors);
         engine->gpu.dspark_mirrors = NULL;
     }
+    for (int k = 0; k < 15; k++) {
+        if (engine->gpu.peer_mirrors[k]) {
+            v4_gpu_expert_mirrors_free(
+                (V4GpuExpertMirrorCache *)engine->gpu.peer_mirrors[k]);
+            engine->gpu.peer_mirrors[k] = NULL;
+        }
+        engine->gpu.peers[k] = -1;
+        v4_ep_extra_mirrors[k] = NULL;
+    }
+    engine->gpu.npeers = 0;
+    v4_ep_ndev = 0;
     dsv4_cuda_shutdown();
     engine->gpu.enabled = 0;
     engine->gpu.uploaded_bytes = 0;
@@ -12142,29 +12439,46 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
          * a handful of entries on a 130 GB box (#1538). There is no separate
          * card to keep headroom on, so the guard does not apply; the
          * capacity (DSV4_CUDA_EXPERT_MIRRORS) bounds the cache instead. */
-        static int unified = -1;
-        if (unified < 0) {
-            unified = dsv4_cuda_device_unified(cache->device) ? 1 : 0;
-            if (unified)
+        /* Unified-memory probes are per device too: a mixed unified /
+         * discrete setup must not share one verdict across cards. */
+        static int unified[16] = {-1, -1, -1, -1, -1, -1, -1, -1,
+                                  -1, -1, -1, -1, -1, -1, -1, -1};
+        int dev = cache->device >= 0 && cache->device <= 15 ? cache->device
+                                                            : 0;
+        if (unified[dev] < 0) {
+            unified[dev] = dsv4_cuda_device_unified(cache->device) ? 1 : 0;
+            if (unified[dev])
                 fprintf(stderr, "v4_gpu mirror-cache: unified memory, VRAM reserve "
                                 "guard off (free memory is the system's, not a "
                                 "card's); capacity %d bounds the cache\n",
                         cache->capacity);
         }
-        /* After a failed upload (upload_failed) last_free_mb is 0 until the
-         * next probe: the card counts as full, also for an empty cache. */
-        static long long last_free_mb = -1;
-        static long long grown_bytes;   /* mirrors appended since the last probe */
-        static unsigned probes;
-        static int upload_failed;
-        if (grow && !unified && (cache->count > 0 || upload_failed)) {
+        /* Free-VRAM probes are per device: one shared probe across the
+         * primary and peer caches let an idle peer's high free value
+         * authorize uploads past the primary's reserve (EP-N attaches to
+         * both caches interleaved within one token). The guard state is
+         * stored per device; the singular names below are the guard's
+         * documented vocabulary (the mirror-guard source tests pin them),
+         * mapped onto the arrays here. After a failed upload
+         * (upload_failed) last_free_mb is 0 until the next probe: the card
+         * counts as full, also for an empty cache. */
+        static long long v4_mirrors_last_free[16];
+        static long long v4_mirrors_grown[16];
+        static unsigned v4_mirrors_probes[16];
+        static int v4_mirrors_upload_failed[16];
+#define last_free_mb (v4_mirrors_last_free[dev])
+#define grown_bytes (v4_mirrors_grown[dev])
+#define probes (v4_mirrors_probes[dev])
+#define upload_failed (v4_mirrors_upload_failed[dev])
+        if (grow && !unified[dev] && (cache->count > 0 || upload_failed)) {
             if (last_free_mb < 0 ||
                 (probes++ % COLI_V4_MIRROR_PROBE_EVERY) == 0) {
                 last_free_mb = dsv4_cuda_mem_free_mb(cache->device);
                 upload_failed = 0;
                 grown_bytes = 0;
             }
-            long long grown_mb = (grown_bytes + mirror_bytes + (1LL << 20) - 1) >> 20;
+            long long grown_mb = (grown_bytes + mirror_bytes +
+                                  (1LL << 20) - 1) >> 20;
             if (last_free_mb >= 0 &&
                 (last_free_mb < reserve_mb ||
                  (cache->count >= 8 && last_free_mb - grown_mb < reserve_mb - margin_mb)))
@@ -12302,6 +12616,18 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
     view->down.gpu = cache->entries[found].down;
     pthread_mutex_unlock(&cache->mutex);
     return 0;
+}
+#undef last_free_mb
+#undef grown_bytes
+#undef probes
+#undef upload_failed
+
+/* Cross-unit shim: the decode unit (UNIT_BLOCK_HYBRID) attaches peer-side
+ * experts through this wrapper rather than the unit-static attach above. */
+int v4_gpu_ep_peer_attach(void *cache, ColiExpertView *view, int sync) {
+    if (!cache || !view) return -1;
+    return v4_gpu_expert_attach_cached_ex((V4GpuExpertMirrorCache *)cache,
+                                          view, sync);
 }
 
 int coli_v4_gpu_expert_attach(ColiExpertStore *store, ColiExpertView *view) {
@@ -12478,6 +12804,94 @@ static int v4_bank_double_on(void) {
     return on;
 }
 
+/* ---- expert parallelism over N devices (DSV4_CUDA_EP_DEVICES) ----
+ * The prefill union keeps its primary bank for its band of experts on the
+ * primary device; one bank per peer holds only that peer's band, uploaded by
+ * the same route-aware refill. Each side computes its partial routes through
+ * the masked backend entry (zero-row routes for other bands), and the per-
+ * device partial outputs are summed on the host — the same partial-add order
+ * class the hybrid decode path already uses. The masked entries require a
+ * shared expert on every device; peers get a dummy all-zero shared (created
+ * once, never rebound per layer: zeros of any layer are zeros), so the real
+ * shared expert is included exactly once, on the primary side. Double-
+ * buffering (COLI_CUDA_MOE_DOUBLE) is unrelated to the peers' layer caches
+ * and stays off while EP runs. Every peer failure degrades this chunk to
+ * the plain single-device path. */
+static Dsv4CudaExpertSet *v4_moe_banks[15];    /* band bank per extra device */
+static int v4_moe_ep_failed;
+static Dsv4CudaTensor *v4_moe_peer_shared[15][3];   /* zero w1 w3 w2 each */
+static Dsv4CudaActivation *v4_moe_peer_in[15], *v4_moe_peer_out[15];
+
+/* Band [lo,hi) of expert ids carried by device slot d of the published
+ * EP-N table (v4_ep_devices: primary at slot 0, extras after): the 256
+ * routed experts divide evenly by the device count, boundaries at
+ * d*256/N. */
+static int v4_moe_ep_lo(int d) { return d * 256 / v4_ep_ndev; }
+static int v4_moe_ep_hi(int d) { return (d + 1) * 256 / v4_ep_ndev; }
+
+static int v4_moe_ep_active(void) {
+    if (v4_ep_ndev < 2 || v4_moe_ep_failed) return 0;
+    for (int d = 1; d < v4_ep_ndev; d++)
+        if (!dsv4_cuda_device_active(v4_ep_devices[d])) return 0;
+    return 1;
+}
+
+/* The bank an expert id uploads into: the primary bank for its own band,
+ * otherwise the owning extra device's band bank. */
+static Dsv4CudaExpertSet *v4_moe_ep_bank_for(int id,
+                                             Dsv4CudaExpertSet *primary) {
+    int d = 0;
+    while (d < v4_ep_ndev && !(id >= v4_moe_ep_lo(d) && id < v4_moe_ep_hi(d)))
+        d++;
+    return d <= 0 ? primary : v4_moe_banks[d - 1];
+}
+
+/* The shared-expert geometry the backend hardwires (2048x4096 w1/w3,
+ * 4096x2048 w2). All-zero fp8 bytes: the shared tail reads zero weights and
+ * adds zero rows, so a dummy bound as the peer bank's shared expert keeps
+ * the masked entries happy without repeating the primary's shared expert.
+ * Idempotent per slot; a failed upload leaves the slot NULL for retry. */
+static int v4_moe_ep_zero_shared(int slot, int peer) {
+    static const int shapes[3][2] = {{2048, 4096}, {2048, 4096}, {4096, 2048}};
+    for (int i = 0; i < 3; i++) {
+        if (v4_moe_peer_shared[slot][i]) continue;
+        size_t bytes = (size_t)shapes[i][0] * shapes[i][1];
+        size_t scales = (size_t)((shapes[i][0] + 127) / 128) *
+                        ((shapes[i][1] + 127) / 128);
+        uint8_t *w = calloc(1, bytes);
+        uint8_t *s = calloc(1, scales);
+        int made = w && s &&
+                   dsv4_cuda_upload_fp8(&v4_moe_peer_shared[slot][i], w, s,
+                                        shapes[i][0], shapes[i][1], peer);
+        free(w);
+        free(s);
+        if (!made) return 0;
+    }
+    return 1;
+}
+
+static void v4_moe_ep_release(void) {
+    for (int k = 0; k < 15; k++) {
+        if (v4_moe_banks[k]) {
+            dsv4_cuda_expert_set_free(v4_moe_banks[k]);
+            v4_moe_banks[k] = NULL;
+        }
+        for (int i = 0; i < 3; i++)
+            if (v4_moe_peer_shared[k][i]) {
+                dsv4_cuda_tensor_free(v4_moe_peer_shared[k][i]);
+                v4_moe_peer_shared[k][i] = NULL;
+            }
+        if (v4_moe_peer_in[k]) {
+            dsv4_cuda_activation_free(v4_moe_peer_in[k]);
+            v4_moe_peer_in[k] = NULL;
+        }
+        if (v4_moe_peer_out[k]) {
+            dsv4_cuda_activation_free(v4_moe_peer_out[k]);
+            v4_moe_peer_out[k] = NULL;
+        }
+    }
+    v4_moe_ep_failed = 0;
+}
 /* COLI_CUDA_MOE_DOUBLE is on and the second bank is not off for good: the
  * next prefill will try to allocate it, so this (not v4_bank_double_on) is
  * whether VRAM should be kept free for it. */
@@ -12633,6 +13047,7 @@ void coli_v4_gpu_moe_batch_release(void) {
         dsv4_cuda_expert_set_free(v4_moe_bank2);
         v4_moe_bank2 = NULL;
     }
+    v4_moe_ep_release();
     if (!v4_moe_bank) return;
     dsv4_cuda_expert_set_free(v4_moe_bank);
     v4_moe_bank = NULL;
@@ -12715,6 +13130,38 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
         fprintf(stderr, "v4_gpu moe-batch=on bank=%d-experts\n",
                 dsv4_cuda_expert_bank_slots(config->n_routed_experts));
     }
+    /* EP-N: extra-device banks are created once, next to the primary bank,
+     * with the all-zero dummy shared bound. Peer activations are carved here
+     * too so the final split never allocates mid-chunk. */
+    int ep2 = v4_moe_ep_active();
+    if (ep2 && !v4_moe_banks[0]) {
+        for (int k = 0; ep2 && k < v4_ep_ndev - 1; k++) {
+            int peer = v4_ep_devices[1 + k];
+            if (!v4_moe_ep_zero_shared(k, peer))
+                fprintf(stderr, "v4_gpu moe-ep=off device %d (zero-shared "
+                                "allocation failed)\n", peer);
+            else if (!(v4_moe_banks[k] = dsv4_cuda_expert_bank_create(
+                           256, 4096, 2048, peer,
+                           v4_moe_peer_shared[k][0],
+                           v4_moe_peer_shared[k][1],
+                           v4_moe_peer_shared[k][2])))
+                fprintf(stderr, "v4_gpu moe-ep=off device %d (bank "
+                                "allocation failed)\n", peer);
+            else if (!(v4_moe_peer_in[k] = dsv4_cuda_activation_create(
+                           peer, 128LL * 4096)) ||
+                     !(v4_moe_peer_out[k] = dsv4_cuda_activation_create(
+                           peer, 128LL * 4096)))
+                fprintf(stderr, "v4_gpu moe-ep=off device %d (activation "
+                                "allocation failed)\n", peer);
+            else
+                continue;
+            v4_moe_ep_release();
+            v4_moe_ep_failed = 1;
+            ep2 = 0;
+        }
+        if (ep2)
+            fprintf(stderr, "v4_gpu moe-ep=on devices=%d\n", v4_ep_ndev);
+    }
     /* V4_MOE_BATCH_PROF=1: one `moebprof` line per chunk-layer splitting the
      * batched MoE into switch (the layer change below: waiting for the
      * prefetch worker, swapping banks, launching the next prefetch; 0 on a
@@ -12738,7 +13185,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
         struct timespec moeb_switch0 = {0, 0};
         if (moeb_prof) clock_gettime(CLOCK_MONOTONIC, &moeb_switch0);
         v4_bank2_join();
-        int double_on = v4_bank_double_usable() && !v4_bank2_alloc_failed;
+        int double_on = v4_bank_double_usable() && !v4_bank2_alloc_failed &&
+                        !v4_moe_ep_active();
         if (coli_v4_bank_pair_decide(double_on, v4_bank2_layer,
                                      weights->plan.layer) == V4_BANK_SWAP) {
             /* The prefetched bank becomes the active one; its valid map
@@ -13030,7 +13478,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
                             view.up.rows == 2048 && view.up.columns == 4096 &&
                             view.down.rows == 4096 && view.down.columns == 2048 &&
                             dsv4_cuda_expert_bank_upload(
-                                bank, missing[base + i],
+                                v4_moe_ep_bank_for(missing[base + i], bank),
+                                missing[base + i],
                                 (const uint8_t *)view.gate.data,
                                 (const uint8_t *)view.gate.scales,
                                 (const uint8_t *)view.up.data,
@@ -13087,7 +13536,7 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
                 view.up.rows == 2048 && view.up.columns == 4096 &&
                 view.down.rows == 4096 && view.down.columns == 2048 &&
                 dsv4_cuda_expert_bank_upload(
-                    bank, retry[r],
+                    v4_moe_ep_bank_for(retry[r], bank), retry[r],
                     (const uint8_t *)view.gate.data, (const uint8_t *)view.gate.scales,
                     (const uint8_t *)view.up.data, (const uint8_t *)view.up.scales,
                     (const uint8_t *)view.down.data, (const uint8_t *)view.down.scales,
@@ -13120,6 +13569,57 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
         moeb_missing = missing_count;
         clock_gettime(CLOCK_MONOTONIC, &moeb_t2);
     }
+    ep2 = v4_moe_banks[0] && !v4_moe_ep_failed;
+    if (ep2 && v4_ep_ndev < 2) ep2 = 0;
+    if (ep2) {
+        /* EP-N: every device's masked pass computes only the experts of
+         * its own band (the primary's real shared expert lands exactly
+         * once; every other band side carries the zero dummy shared), and
+         * the per-device partial sums are added on the host. Any failure
+         * falls back to the CPU union for this chunk — the same recovery
+         * the refill uses. */
+        static float *ep_part[16];
+        static size_t ep_cap;
+        size_t bytes = (size_t)elements * sizeof(float);
+        if (ep_cap < bytes) {
+            for (int d = 0; d < v4_ep_ndev; d++) {
+                float *part = realloc(ep_part[d], bytes);
+                if (!part) return -1;   /* grown slots keep their buffers */
+                ep_part[d] = part;
+            }
+            ep_cap = bytes;
+        }
+        if (!dsv4_cuda_route_moe_ids_batch_masked(
+                in_mirror, ids, route_weights, batch, bank,
+                config->swiglu_limit, out_mirror,
+                v4_moe_ep_lo(0), v4_moe_ep_hi(0)) ||
+            !dsv4_cuda_activation_download(ep_part[0], out_mirror,
+                                           elements) ||
+            !dsv4_cuda_activation_sync(out_mirror))
+            return -1;
+        for (int k = 0; k < v4_ep_ndev - 1; k++) {
+            if (!dsv4_cuda_activation_upload(v4_moe_peer_in[k], inputs,
+                                             elements) ||
+                !dsv4_cuda_route_moe_ids_batch_masked(
+                    v4_moe_peer_in[k], ids, route_weights, batch,
+                    v4_moe_banks[k], config->swiglu_limit,
+                    v4_moe_peer_out[k],
+                    v4_moe_ep_lo(1 + k), v4_moe_ep_hi(1 + k)) ||
+                !dsv4_cuda_activation_download(ep_part[1 + k],
+                                               v4_moe_peer_out[k],
+                                               elements) ||
+                !dsv4_cuda_activation_sync(v4_moe_peer_out[k]))
+                return -1;
+        }
+        for (long long i = 0; i < elements; i++) {
+            float total = ep_part[0][i];
+            for (int d = 1; d < v4_ep_ndev; d++) total += ep_part[d][i];
+            outputs[i] = total;
+        }
+        /* Fall through to the shared success tail below: both tails book
+         * the chunk's routed lookups (note_union). */
+    }
+    if (!ep2) {
     if (!dsv4_cuda_route_moe_ids_batch(in_mirror, ids, route_weights, batch,
                                        bank, config->swiglu_limit,
                                        out_mirror) ||
@@ -13132,6 +13632,7 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
                 "refill=%.1f compute=%.1f ms\n", weights->plan.layer, batch,
                 moeb_missing, moeb_switch, MOEB_MS(moeb_t0, moeb_t1),
                 MOEB_MS(moeb_t1, moeb_t2), MOEB_MS(moeb_t2, moeb_t3));
+    }
     }
 #undef MOEB_MS
     /* Counted only once nothing can fail: a refused chunk runs on the CPU
