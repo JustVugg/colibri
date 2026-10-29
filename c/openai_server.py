@@ -211,6 +211,12 @@ class GenerationScheduler:
 
     @contextlib.contextmanager
     def admit(self, cancelled=None, slot=None):
+        # Compaction admits summary work before normal generation validation.
+        # An impossible target must never occupy the queue or alias an integer slot.
+        if slot is not None and (isinstance(slot, bool) or not isinstance(slot, int)
+                                 or not 0 <= slot < self.capacity):
+            raise APIError(400, f"`cache_slot` must be an integer between 0 and {self.capacity - 1}.",
+                           "cache_slot")
         ticket = object()
         entry = (ticket, slot)          # (#B2) remember each waiter's target slot for fair, per-slot admission
         queued_at = time.monotonic()
