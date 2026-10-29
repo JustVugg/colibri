@@ -92,6 +92,7 @@ float *fpw(CcBuf *b) { return b ? b->d : nullptr; }
 
 /* ---- kernels: shaders/chain_*.comp, line for line --------------------------- */
 __global__ static void cc_norm_k(const float *__restrict__ x, const float *__restrict__ w, float *__restrict__ y, CcNorm p) {
+    COLI_PDL_WAIT();
     __shared__ float red[256];
     int g = blockIdx.x;
     if (g >= p.nseg) return;
@@ -140,6 +141,7 @@ __device__ static inline void cc_rope_pair(float a, float b, float c, float s, f
     *rb = __fmaf_rn(a, s, __fmul_rn(b, c));
 }
 __global__ static void cc_rope_k(float *__restrict__ x, const float *__restrict__ cs, CcRope p) {
+    COLI_PDL_WAIT();
     long long gid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= (long long)p.nseg * p.half_) return;
     int seg = (int)(gid / p.half_), j = (int)(gid - (long long)seg * p.half_);
@@ -153,6 +155,7 @@ __global__ static void cc_rope_k(float *__restrict__ x, const float *__restrict_
  * where the rope and two ew took three. A thread a value: below half_ its pair, from 2 * half_
  * the values past the rotation. */
 __global__ static void cc_rope_f16_k(float *__restrict__ x, float *__restrict__ v, const float *__restrict__ cs, CcRope p, int seg) {
+    COLI_PDL_WAIT();
     long long gid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= (long long)p.nseg * seg) return;
     int sg = (int)(gid / seg), j = (int)(gid - (long long)sg * seg);
@@ -190,6 +193,7 @@ template <typename KT = float>
 __global__ static void __launch_bounds__(128) cc_attn_k(const float *__restrict__ q, const KT *__restrict__ kc,
         const KT *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, const int *__restrict__ sel, CcAttn p,
         int win = 0, const float *__restrict__ snk = nullptr, int sink_off = 0, int ring = 0) {
+    COLI_PDL_WAIT();
     __shared__ float qs[256];
     __shared__ float pe[128];
     __shared__ int   pt[128];
@@ -288,6 +292,7 @@ template<int HD, typename KT = float>
 __global__ static void __launch_bounds__(128) cc_attn_fk(const float *__restrict__ q, const KT *__restrict__ kc,
         const KT *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, CcAttn p, int GQ,
         int win = 0, const float *__restrict__ snk = nullptr, int sink_off = 0, int ring = 0) {   /* CcAttnW's window and sinks, a ring */
+    COLI_PDL_WAIT();
 #if CC_FA_BODY
     using namespace nvcuda;
     constexpr int LD = HD + 8, NDT = HD / 16, NDS = NDT / 4, LS = CC_FA_BC + 4, LP = CC_FA_BC + 8;
@@ -457,6 +462,7 @@ template<int HD, int NW, int BC, bool QREG, typename KT = float>
 __global__ static void __launch_bounds__(32 * NW) cc_attn_f2(const float *__restrict__ q, const KT *__restrict__ kc,
         const KT *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, CcAttn p, int GQ,
         int win, const float *__restrict__ snk, int sink_off, int ring) {
+    COLI_PDL_WAIT();
 #if CC_F2_BODY
     constexpr int LD = HD + 8, BR = 16 * NW, NT = 32 * NW, NKT = BC / 8, NDT = HD / 8, KS = HD / 16;
     static_assert(!QREG || BR <= 2 * BC, "Q is staged where K and V go");
@@ -600,10 +606,10 @@ static int cc_attn_f2_go(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcB
         (p->q_off | p->q_row | p->q_seg | p->k_off | p->v_off) % 4) return 0;
     dim3 fg((unsigned)((p->S + 64 / G - 1) / (64 / G)), (unsigned)p->KVH);
     if (p->hd == 64) {
-        cc_attn_f2<64, 4, 64, true, KT><<<fg, 128, cc_f2_smem_bytes<64, 4, 64, true>(), c->stream>>>(
+        coli_launch(cc_attn_f2<64, 4, 64, true, KT>, fg, 128, cc_f2_smem_bytes<64, 4, 64, true>(), c->stream, 
             fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
     } else if (p->hd == 128) {
-        cc_attn_f2<128, 4, 64, true, KT><<<fg, 128, cc_f2_smem_bytes<128, 4, 64, true>(), c->stream>>>(
+        coli_launch(cc_attn_f2<128, 4, 64, true, KT>, fg, 128, cc_f2_smem_bytes<128, 4, 64, true>(), c->stream, 
             fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
     } else {
         const size_t sm = cc_f2_smem_bytes<256, 4, 32, false>();
@@ -617,7 +623,7 @@ static int cc_attn_f2_go(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcB
             (void)cudaGetLastError();
         }
         if (big < 0) return 0;
-        cc_attn_f2<256, 4, 32, false, KT><<<fg, 128, sm, c->stream>>>(fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
+        coli_launch(cc_attn_f2<256, 4, 32, false, KT>, fg, 128, sm, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
     }
     return 1;
 #else
@@ -628,6 +634,7 @@ static int cc_attn_f2_go(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcB
 /* one thread per channel, the rows in order, the channel's ring in registers */
 __global__ static void cc_dnconv_k(const float *__restrict__ xin, const float *__restrict__ w, float *__restrict__ ring,
                                    float *__restrict__ o, float *__restrict__ snap, CcDnConv p) {
+    COLI_PDL_WAIT();
     long long c = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= p.CD) return;
     int nh = p.CK - 1;
@@ -664,6 +671,7 @@ template <int KD>
 __global__ static void __launch_bounds__(128) cc_dnrec_k(const float *__restrict__ cv, const float *__restrict__ ab,
         const float *__restrict__ z, float *__restrict__ st, const float *__restrict__ prm, float *__restrict__ y,
         float *__restrict__ snap, CcDnRec p) {
+    COLI_PDL_WAIT();
     __shared__ float qn[KD];
     __shared__ float kn[KD];
     __shared__ float red[128];
@@ -750,6 +758,7 @@ template <int KD, int R>
 __global__ static void __launch_bounds__(128) cc_dnrec_rows_k(const float *__restrict__ cv, const float *__restrict__ ab,
         const float *__restrict__ z, float *__restrict__ st, const float *__restrict__ prm, float *__restrict__ y,
         float *__restrict__ snap, CcDnRec p) {
+    COLI_PDL_WAIT();
     __shared__ float qs[R][KD];
     __shared__ float ks[R][KD];
     __shared__ float vs[R][128];
@@ -826,6 +835,7 @@ __device__ static float cc_sig(float x) { return 1.f / (1.f + expf(-x)); }
 /* chain_qsa.comp: mode 0 one block of 128 per block key; mode 1 one block per query row */
 __global__ static void __launch_bounds__(128) cc_qsa_k(const float *__restrict__ src, const float *__restrict__ w,
         float *__restrict__ pk, const float *__restrict__ cs, float *__restrict__ sc, int *__restrict__ sel, CcQsa p) {
+    COLI_PDL_WAIT();
     __shared__ float pool[256];
     __shared__ float red[128];
     int tid = threadIdx.x;
@@ -915,6 +925,7 @@ __device__ static void cc_ple_reduce2(float *r1, float *r2, int tid) {
 __global__ static void __launch_bounds__(256) cc_ple_k(const float *__restrict__ keys, float *__restrict__ hyp,
         const float *__restrict__ val, const float *__restrict__ prm, float *__restrict__ gated, float *__restrict__ normv,
         const float *__restrict__ conv, float *__restrict__ ring, CcPle p) {
+    COLI_PDL_WAIT();
     __shared__ float r1[256];
     __shared__ float r2[256];
     int W = p.C * p.H, tid = threadIdx.x;
@@ -973,6 +984,7 @@ __global__ static void __launch_bounds__(256) cc_ple_k(const float *__restrict__
 }
 __global__ static void cc_ew_k(float *__restrict__ y, const float *__restrict__ a, const float *__restrict__ b,
                                const float *__restrict__ c, const float *__restrict__ e, CcEw p) {
+    COLI_PDL_WAIT();
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= p.n) return;
     if (p.op == 0) {
@@ -1026,6 +1038,7 @@ __device__ __forceinline__ float cc_wsum(float v) { for (int o = 16; o > 0; o >>
 __device__ __forceinline__ int cc_wmin(int v) { for (int o = 16; o > 0; o >>= 1) v = min(v, cc_shfl_xor(v, o)); return v; }
 __global__ static void __launch_bounds__(256) cc_route_k(const float *__restrict__ l, const float *__restrict__ bias,
                                                          int *__restrict__ ids, float *__restrict__ w, CcRoute p) {
+    COLI_PDL_WAIT();
     const float NEG = -3.402823466e38f;
     __shared__ float sc[1024], pk[1024], rv[256], gv[64], wv[32];
     __shared__ int keepg[64], chosen[32], keepi[256];
@@ -1131,6 +1144,7 @@ __global__ static void cc_wait_k(volatile unsigned *f, unsigned v) { while (*f <
 /* one block of 256, two passes: the argmax of n logits (lowest index on a tie) into word 0
  * of out and its softmax probability (terms within 20 of the maximum) into word 1 */
 __global__ static void __launch_bounds__(256) cc_pick_k(const float *__restrict__ lg, void *__restrict__ out, int n) {
+    COLI_PDL_WAIT();
     __shared__ float rv[8];
     __shared__ int ri[8];
     int tid = threadIdx.x, lane = tid & 31, sg = tid >> 5;
@@ -1170,6 +1184,7 @@ __device__ static inline int cc_gx4(int k) { return k + (k >> 3); }
 template <int PAD>
 __global__ static void __launch_bounds__(256) cc_matmul_rows_i8_k(float *__restrict__ y, const float *__restrict__ x,
         const int8_t *__restrict__ w, const float *__restrict__ sc, const int *__restrict__ ids, int I, int O, int n) {
+    COLI_PDL_WAIT();
     extern __shared__ float4 sx[];
     int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, I4 = I >> 2, I16 = I >> 4;
     const float4 *x4 = reinterpret_cast<const float4 *>(x);
@@ -1197,6 +1212,7 @@ __global__ static void __launch_bounds__(256) cc_matmul_rows_i8_k(float *__restr
 }
 __global__ static void __launch_bounds__(256) cc_matmul_rows_k(float *__restrict__ y, const float *__restrict__ x,
         const void *__restrict__ w, const float *__restrict__ sc, const int *__restrict__ ids, int fmt, int I, int O, int n) {
+    COLI_PDL_WAIT();
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, j = (int)blockIdx.x * 8 + warp;
     if (j >= n) return;
     int o = ids[j];
@@ -1388,6 +1404,7 @@ static int cc_zero(CcBuf *dst, size_t off, size_t n) {
  * takes one kernel launch. */
 struct CcGrid { long long d0, s0, dh, sh, dq, sq; int len, per, n; };
 __global__ static void cc_copy_grid_k(float *__restrict__ d, const float *__restrict__ s, CcGrid g) {
+    COLI_PDL_WAIT();
     long long gid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= (long long)g.n * g.len) return;
     long long i = gid / g.len, j = gid - i * g.len, q = i / g.per, h = i - q * g.per;
@@ -1443,7 +1460,7 @@ static int cc_copy_regions(CcBuf *dst, CcBuf *src, const CcRegion *r, int n) {
         int k = grids ? cc_grid_run(r + i, n - i) : 1;
         if (k >= 2 && cc_grid_of(r + i, k, &g)) {   /* one kernel for each grid */
             long long tot = (long long)g.n * g.len;
-            cc_copy_grid_k<<<grid1((size_t)tot, 256), 256, 0, c->stream>>>(dst->d, src->d, g);
+            coli_launch(cc_copy_grid_k, grid1((size_t)tot, 256), 256, 0, c->stream, dst->d, src->d, g);
             if (!launched(c, "copy regions (grid)")) return 0;
             i += k;
             continue;
@@ -1494,19 +1511,19 @@ static int cc_norm(CcBuf *x, CcBuf *w, CcBuf *y, const CcNorm *p) {
     CcCtx *c = live();
     if (!c || !x || !y || !p || p->nseg < 1 || p->D < 1 || p->per_row < 1) return 0;
     if (!(p->flags & CC_NORM_NOW) && !w) return 0;
-    cc_norm_k<<<grid1((size_t)p->nseg, 1), 256, 0, c->stream>>>(fp(x), fp(w), fpw(y), *p);
+    coli_launch(cc_norm_k, grid1((size_t)p->nseg, 1), 256, 0, c->stream, fp(x), fp(w), fpw(y), *p);
     return launched(c, "norm");
 }
 static int cc_rope(CcBuf *x, CcBuf *cs, const CcRope *p) {
     CcCtx *c = live();
     if (!c || !x || !cs || !p || p->nseg < 1 || p->half_ < 1 || p->per_row < 1) return 0;
-    cc_rope_k<<<grid1((size_t)p->nseg * p->half_, 64), 64, 0, c->stream>>>(fpw(x), fp(cs), *p);
+    coli_launch(cc_rope_k, grid1((size_t)p->nseg * p->half_, 64), 64, 0, c->stream, fpw(x), fp(cs), *p);
     return launched(c, "rope");
 }
 static int cc_rope_f16(CcBuf *x, CcBuf *v, CcBuf *cs, const CcRope *p, int seg) {
     CcCtx *c = live();
     if (!c || !x || !v || !cs || !p || p->nseg < 1 || p->half_ < 1 || p->per_row < 1 || seg < 2 * p->half_) return 0;
-    cc_rope_f16_k<<<grid1((size_t)p->nseg * seg, 128), 128, 0, c->stream>>>(fpw(x), fpw(v), fp(cs), *p, seg);
+    coli_launch(cc_rope_f16_k, grid1((size_t)p->nseg * seg, 128), 128, 0, c->stream, fpw(x), fpw(v), fp(cs), *p, seg);
     return launched(c, "rope_f16");
 }
 /* A decode's attention split over its positions (cc_attn: up to 4 rows, no selection
@@ -1531,6 +1548,7 @@ __global__ static void __launch_bounds__(256) cc_attn_dec_k(const float *__restr
         const KT *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, float *__restrict__ xs,
         CcAttn p, int mode, int nb, int win = 0, const float *__restrict__ snk = nullptr, int sink_off = 0, int ring = 0,
         int hc = 0) {   /* hc: the blocks' rule's heads (cc_attn_dec_len), 0 = H */
+    COLI_PDL_WAIT();
     __shared__ float qs[256];
     __shared__ float sc[256];
     __shared__ float red[8];
@@ -1634,6 +1652,7 @@ __global__ static void __launch_bounds__(256) cc_attn_dec_k(const float *__restr
 template <int G, typename KT = float>
 __global__ static void __launch_bounds__(256) cc_attn_decg_k(const float *__restrict__ q, const KT *__restrict__ kc,
         const KT *__restrict__ vc, float *__restrict__ xs, CcAttn p, int nb, int win, int ring, int hc, int tpp) {
+    COLI_PDL_WAIT();
     extern __shared__ float4 cc_decg_sm[];
     __shared__ float red[G * 8];
     const int hd = p.hd, stride = hd + 2, NV = hd / 4, NG = 256 / NV;
@@ -1820,10 +1839,10 @@ static void cc_decg_launch(CcCtx *c, int G, const float *q, const KT *kc, const 
     size_t sm = (size_t)G * (p.hd + 256) * sizeof(float);
     int tpp = cc_decg_tpp();
     switch (G) {
-    case 2: cc_attn_decg_k<2><<<g, 256, sm, c->stream>>>(q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
-    case 4: cc_attn_decg_k<4><<<g, 256, sm, c->stream>>>(q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
-    case 8: cc_attn_decg_k<8><<<g, 256, sm, c->stream>>>(q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
-    default: cc_attn_decg_k<16><<<g, 256, sm, c->stream>>>(q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
+    case 2: coli_launch(cc_attn_decg_k<2, KT>, g, 256, sm, c->stream, q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
+    case 4: coli_launch(cc_attn_decg_k<4, KT>, g, 256, sm, c->stream, q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
+    case 8: coli_launch(cc_attn_decg_k<8, KT>, g, 256, sm, c->stream, q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
+    default: coli_launch(cc_attn_decg_k<16, KT>, g, 256, sm, c->stream, q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
     }
 }
 template <typename KT>
@@ -1843,9 +1862,9 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
         return launched(c, "attn (tensor cores, one pass)");
     if (fl > 0 && p->S >= fl && c->major >= 7 && p->sel_row <= 0 && 16 % G == 0 && (p->hd == 64 || p->hd == 128 || p->hd == 256)) {
         dim3 fg((unsigned)((p->S + 16 / G - 1) / (16 / G)), (unsigned)p->KVH);
-        if (p->hd == 64) cc_attn_fk<64><<<fg, 128, 0, c->stream>>>(fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G);
-        else if (p->hd == 128) cc_attn_fk<128><<<fg, 128, 0, c->stream>>>(fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G);
-        else cc_attn_fk<256><<<fg, 128, 0, c->stream>>>(fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G);
+        if (p->hd == 64) coli_launch(cc_attn_fk<64, KT>, fg, 128, 0, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, 0, nullptr, 0, 0);
+        else if (p->hd == 128) coli_launch(cc_attn_fk<128, KT>, fg, 128, 0, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, 0, nullptr, 0, 0);
+        else coli_launch(cc_attn_fk<256, KT>, fg, 128, 0, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, 0, nullptr, 0, 0);
         return launched(c, "attn (tensor cores)");
     }
 #endif
@@ -1867,7 +1886,7 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
         int k = CC_ATTN_DEC_MIN - (p->pos_base + 1);
         if (k > 0) {
             CcAttn a = *p; a.S = k;
-            cc_attn_k<<<dim3((unsigned)p->H, (unsigned)k), 128, 0, c->stream>>>(fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), nullptr, a);
+            coli_launch(cc_attn_k<KT>, dim3((unsigned)p->H, (unsigned)k), 128, 0, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), nullptr, a, 0, nullptr, 0, 0);
             if (!launched(c, "attn")) return 0;
             CcAttn b = *p; b.S -= k; b.pos_base += k; b.q_off += k * p->q_row; b.o_off += k * p->o_row; b.g_off += k * p->g_row;
             return cc_attn_t<KT>(q, kc, vc, o, gate, sel, &b);
@@ -1892,15 +1911,15 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
         }
         if (c->adec) {
             if (gq) cc_decg_launch(c, gq, fp(q), kvp<KT>(kc), kvp<KT>(vc), c->adec, *p, nb, 0, 0, hc);
-            else cc_attn_dec_k<<<dim3((unsigned)p->H, (unsigned)nb, (unsigned)p->S), 256, 0, c->stream>>>(
-                fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), c->adec, *p, 0, nb);
-            cc_attn_dec_k<<<dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream>>>(
+            else coli_launch(cc_attn_dec_k<KT>, dim3((unsigned)p->H, (unsigned)nb, (unsigned)p->S), 256, 0, c->stream, 
+                fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), c->adec, *p, 0, nb, 0, nullptr, 0, 0, 0);
+            coli_launch(cc_attn_dec_k<KT>, dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream, 
                 fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), c->adec, *p, 1, nb, 0, nullptr, 0, 0, hc);
             return launched(c, "attn (positions in blocks)");
         }
     }
     dim3 grid((unsigned)p->H, (unsigned)p->S);
-    cc_attn_k<<<grid, 128, 0, c->stream>>>(fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), sel ? (const int *)sel->d : nullptr, *p);
+    coli_launch(cc_attn_k<KT>, grid, 128, 0, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), sel ? (const int *)sel->d : nullptr, *p, 0, nullptr, 0, 0);
     return launched(c, "attn");
 }
 static int cc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *sel, const CcAttn *p) {
@@ -1910,7 +1929,7 @@ static int cc_dnconv(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf *snap, 
     CcCtx *c = live();
     if (!c || !in || !w || !ring || !out || !p || p->S < 1 || p->CD < 1 || p->CK < 2 || p->CK > 9) return 0;
     if (p->snap_row >= 0 && !snap) return 0;
-    cc_dnconv_k<<<grid1((size_t)p->CD, 64), 64, 0, c->stream>>>(fp(in), fp(w), fpw(ring), fpw(out), fpw(snap), *p);
+    coli_launch(cc_dnconv_k, grid1((size_t)p->CD, 64), 64, 0, c->stream, fp(in), fp(w), fpw(ring), fpw(out), fpw(snap), *p);
     return launched(c, "dnconv");
 }
 static int cc_dnrec(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *prm, CcBuf *y, CcBuf *snap, const CcDnRec *p) {
@@ -1924,24 +1943,24 @@ static int cc_dnrec(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *pr
     if (rows_on < 0) { const char *e = getenv("COLI_CUDA_DNREC_ROWS"); rows_on = !(e && *e == '0'); }
     if (rows_on && p->S >= CC_DNREC_ROWS) {   /* a prompt chunk's rows, a block at a time */
         switch (KD) {
-        case 4:   cc_dnrec_rows_k<4, 16><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); return launched(c, "dnrec rows");
-        case 8:   cc_dnrec_rows_k<8, 16><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); return launched(c, "dnrec rows");
-        case 16:  cc_dnrec_rows_k<16, 16><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); return launched(c, "dnrec rows");
-        case 32:  cc_dnrec_rows_k<32, 16><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); return launched(c, "dnrec rows");
-        case 64:  cc_dnrec_rows_k<64, 16><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); return launched(c, "dnrec rows");
-        case 128: cc_dnrec_rows_k<128, 16><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); return launched(c, "dnrec rows");
-        case 256: cc_dnrec_rows_k<256, 8><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); return launched(c, "dnrec rows");
+        case 4:   coli_launch(cc_dnrec_rows_k<4, 16>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); return launched(c, "dnrec rows");
+        case 8:   coli_launch(cc_dnrec_rows_k<8, 16>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); return launched(c, "dnrec rows");
+        case 16:  coli_launch(cc_dnrec_rows_k<16, 16>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); return launched(c, "dnrec rows");
+        case 32:  coli_launch(cc_dnrec_rows_k<32, 16>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); return launched(c, "dnrec rows");
+        case 64:  coli_launch(cc_dnrec_rows_k<64, 16>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); return launched(c, "dnrec rows");
+        case 128: coli_launch(cc_dnrec_rows_k<128, 16>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); return launched(c, "dnrec rows");
+        case 256: coli_launch(cc_dnrec_rows_k<256, 8>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); return launched(c, "dnrec rows");
         default: return 0;
         }
     }
     switch (KD) {
-    case 4:   cc_dnrec_k<4><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); break;
-    case 8:   cc_dnrec_k<8><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); break;
-    case 16:  cc_dnrec_k<16><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); break;
-    case 32:  cc_dnrec_k<32><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); break;
-    case 64:  cc_dnrec_k<64><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); break;
-    case 128: cc_dnrec_k<128><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); break;
-    case 256: cc_dnrec_k<256><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); break;
+    case 4:   coli_launch(cc_dnrec_k<4>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); break;
+    case 8:   coli_launch(cc_dnrec_k<8>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); break;
+    case 16:  coli_launch(cc_dnrec_k<16>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); break;
+    case 32:  coli_launch(cc_dnrec_k<32>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); break;
+    case 64:  coli_launch(cc_dnrec_k<64>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); break;
+    case 128: coli_launch(cc_dnrec_k<128>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); break;
+    case 256: coli_launch(cc_dnrec_k<256>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); break;
     default: return 0;
     }
     return launched(c, "dnrec");
@@ -1963,7 +1982,7 @@ static int cc_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *cb, CcBuf *e, const CcEw *
     case CC_EW_RESGATE: if (!a || !b || !cb || !e || p->D < 1) return 0; break;
     default: return 0;
     }
-    cc_ew_k<<<grid1((size_t)p->n, 256), 256, 0, c->stream>>>(fpw(y), fp(a), fp(b), fp(cb), fp(e), *p);
+    coli_launch(cc_ew_k, grid1((size_t)p->n, 256), 256, 0, c->stream, fpw(y), fp(a), fp(b), fp(cb), fp(e), *p);
     return launched(c, "ew");
 }
 static int cc_qsa(CcBuf *src, CcBuf *w, CcBuf *pk, CcBuf *cs, CcBuf *sc, CcBuf *sel, const CcQsa *p) {
@@ -1971,10 +1990,10 @@ static int cc_qsa(CcBuf *src, CcBuf *w, CcBuf *pk, CcBuf *cs, CcBuf *sc, CcBuf *
     if (!c || !src || !pk || !p || p->ID < 1 || p->ID > 256 || p->R < 1) return 0;
     if (p->mode == 0) {
         if (!w || !cs || p->nb < 1 || 2 * p->half_ > p->ID) return 0;
-        cc_qsa_k<<<(unsigned)p->nb, 128, 0, c->stream>>>(fp(src), fp(w), fpw(pk), fp(cs), nullptr, nullptr, *p);
+        coli_launch(cc_qsa_k, (unsigned)p->nb, 128, 0, c->stream, fp(src), fp(w), fpw(pk), fp(cs), nullptr, nullptr, *p);
     } else if (p->mode == 1) {
         if (!sc || !sel || p->S < 1 || p->IQ < 1 || p->nbmax < 1 || p->sel_row < 1) return 0;
-        cc_qsa_k<<<(unsigned)p->S, 128, 0, c->stream>>>(fp(src), nullptr, fpw(pk), nullptr, fpw(sc), (int *)sel->d, *p);
+        coli_launch(cc_qsa_k, (unsigned)p->S, 128, 0, c->stream, fp(src), nullptr, fpw(pk), nullptr, fpw(sc), (int *)sel->d, *p);
     } else return 0;
     return launched(c, "qsa");
 }
@@ -1983,10 +2002,10 @@ static int cc_ple(CcBuf *keys, CcBuf *hyp, CcBuf *val, CcBuf *prm, CcBuf *gated,
     if (!c || !hyp || !gated || !normv || !p || p->S < 1 || p->C < 1 || p->H < 1) return 0;
     if (p->mode == 0) {
         if (!keys || !val || !prm) return 0;
-        cc_ple_k<<<(unsigned)(p->S * p->C), 256, 0, c->stream>>>(fp(keys), fpw(hyp), fp(val), fp(prm), fpw(gated), fpw(normv), nullptr, nullptr, *p);
+        coli_launch(cc_ple_k, (unsigned)(p->S * p->C), 256, 0, c->stream, fp(keys), fpw(hyp), fp(val), fp(prm), fpw(gated), fpw(normv), nullptr, nullptr, *p);
     } else if (p->mode == 1) {
         if (!conv || !ring || p->CK < 2 || (p->CK - 1) * p->NG > 32) return 0;
-        cc_ple_k<<<grid1((size_t)p->C * p->H, 256), 256, 0, c->stream>>>(nullptr, fpw(hyp), nullptr, nullptr, fpw(gated), fpw(normv), fp(conv), fpw(ring), *p);
+        coli_launch(cc_ple_k, grid1((size_t)p->C * p->H, 256), 256, 0, c->stream, nullptr, fpw(hyp), nullptr, nullptr, fpw(gated), fpw(normv), fp(conv), fpw(ring), *p);
     } else return 0;
     return launched(c, "ple");
 }
@@ -1997,7 +2016,7 @@ static int cc_route(CcBuf *l, CcBuf *bias, CcBuf *ids, CcBuf *w, const CcRoute *
         (p->n_group > 1 && (p->n_group > 64 || p->E % p->n_group || p->topk_group < 1 || p->topk_group > p->n_group))) return 0;
     if ((size_t)(p->l_off + (p->S - 1) * p->l_row + p->E) * 4 > l->bytes || (size_t)(p->i_off + (p->S - 1) * p->i_row + p->K) * 4 > ids->bytes ||
         (size_t)(p->w_off + (p->S - 1) * p->w_row + p->K) * 4 > w->bytes) return 0;
-    cc_route_k<<<(unsigned)p->S, 256, 0, c->stream>>>(fp(l), fp(bias), (int *)ids->d, fpw(w), *p);
+    coli_launch(cc_route_k, (unsigned)p->S, 256, 0, c->stream, fp(l), fp(bias), (int *)ids->d, fpw(w), *p);
     return launched(c, "route");
 }
 static int cc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *y, CcBuf *hy, const CcMoe *p) {
@@ -2128,9 +2147,9 @@ static int cc_attn_w2_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, C
         return launched(c, "attn (tensor cores, one pass, window, sinks)");
     if (fk && p->S >= fl) {
         dim3 fg((unsigned)((p->S + 16 / G - 1) / (16 / G)), (unsigned)p->KVH);
-        if (p->hd == 64) cc_attn_fk<64><<<fg, 128, 0, c->stream>>>(fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
-        else if (p->hd == 128) cc_attn_fk<128><<<fg, 128, 0, c->stream>>>(fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
-        else cc_attn_fk<256><<<fg, 128, 0, c->stream>>>(fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
+        if (p->hd == 64) coli_launch(cc_attn_fk<64, KT>, fg, 128, 0, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
+        else if (p->hd == 128) coli_launch(cc_attn_fk<128, KT>, fg, 128, 0, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
+        else coli_launch(cc_attn_fk<256, KT>, fg, 128, 0, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
         return launched(c, "attn (tensor cores, window, sinks)");
     }
 #endif
@@ -2141,7 +2160,7 @@ static int cc_attn_w2_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, C
         while (k < p->S && CC_WPOS(k) < CC_ATTN_DEC_MIN) k++;
         if (k > 0) {
             CcAttn a = *p; a.S = k;
-            cc_attn_k<<<dim3((unsigned)p->H, (unsigned)k), 128, 0, c->stream>>>(fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), nullptr, a,
+            coli_launch(cc_attn_k<KT>, dim3((unsigned)p->H, (unsigned)k), 128, 0, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), nullptr, a,
                                                                                 win, sk, so, ring);
             if (!launched(c, "attn (window, sinks)")) return 0;
             CcAttnW b = *w; b.a.S -= k; b.a.pos_base += k; b.a.q_off += k * p->q_row; b.a.o_off += k * p->o_row; b.a.g_off += k * p->g_row;
@@ -2165,15 +2184,15 @@ static int cc_attn_w2_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, C
         }
         if (c->adec) {
             if (gq) cc_decg_launch(c, gq, fp(q), kvp<KT>(kc), kvp<KT>(vc), c->adec, *p, nb, win, ring, hc);
-            else cc_attn_dec_k<<<dim3((unsigned)p->H, (unsigned)nb, (unsigned)p->S), 256, 0, c->stream>>>(
-                fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), c->adec, *p, 0, nb, win, sk, so, ring);
-            cc_attn_dec_k<<<dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream>>>(
+            else coli_launch(cc_attn_dec_k<KT>, dim3((unsigned)p->H, (unsigned)nb, (unsigned)p->S), 256, 0, c->stream, 
+                fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), c->adec, *p, 0, nb, win, sk, so, ring, 0);
+            coli_launch(cc_attn_dec_k<KT>, dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream, 
                 fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), c->adec, *p, 1, nb, win, sk, so, ring, hc);
             return launched(c, "attn (positions in blocks, window, sinks)");
         }
     }
     #undef CC_WPOS
-    cc_attn_k<<<dim3((unsigned)p->H, (unsigned)p->S), 128, 0, c->stream>>>(fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), nullptr, *p,
+    coli_launch(cc_attn_k<KT>, dim3((unsigned)p->H, (unsigned)p->S), 128, 0, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), nullptr, *p,
                                                                          win, sk, so, ring);
     return launched(c, "attn (window, sinks)");
 }
@@ -2189,7 +2208,7 @@ static int cc_kv16(void) { return 1; }   /* ew's F16 */
 static int cc_pick(CcBuf *logits, CcBuf *out, int n) {
     CcCtx *c = live();
     if (!c || !logits || !out || n < 1 || (size_t)n * 4 > logits->bytes || out->bytes < 8) return 0;
-    cc_pick_k<<<1, 256, 0, c->stream>>>(fp(logits), out->d, n);
+    coli_launch(cc_pick_k, 1, 256, 0, c->stream, fp(logits), out->d, n);
     return launched(c, "pick");
 }
 static int cc_matmul_rows(ColiCudaTensor *t, CcBuf *ids, CcBuf *x, CcBuf *y, int n) {
@@ -2204,11 +2223,11 @@ static int cc_matmul_rows(ColiCudaTensor *t, CcBuf *ids, CcBuf *x, CcBuf *y, int
     if (fmt == 1 && I % 16 == 0 && I <= 12288) {
         size_t smem = (size_t)(I / 4 + I / 32 + 1) * sizeof(float4);
         if (smem <= 48 * 1024)
-            cc_matmul_rows_i8_k<1><<<grid, 256, smem, c->stream>>>(fpw(y), fp(x), (const int8_t *)w, sc, (const int *)ids->d, I, O, n);
+            coli_launch(cc_matmul_rows_i8_k<1>, grid, 256, smem, c->stream, fpw(y), fp(x), (const int8_t *)w, sc, (const int *)ids->d, I, O, n);
         else
-            cc_matmul_rows_i8_k<0><<<grid, 256, (size_t)I * sizeof(float), c->stream>>>(fpw(y), fp(x), (const int8_t *)w, sc, (const int *)ids->d, I, O, n);
+            coli_launch(cc_matmul_rows_i8_k<0>, grid, 256, (size_t)I * sizeof(float), c->stream, fpw(y), fp(x), (const int8_t *)w, sc, (const int *)ids->d, I, O, n);
     } else {
-        cc_matmul_rows_k<<<grid, 256, 0, c->stream>>>(fpw(y), fp(x), w, sc, (const int *)ids->d, fmt, I, O, n);
+        coli_launch(cc_matmul_rows_k, grid, 256, 0, c->stream, fpw(y), fp(x), w, sc, (const int *)ids->d, fmt, I, O, n);
     }
     return launched(c, "matmul_rows");
 }
@@ -2217,6 +2236,7 @@ static int cc_matmul_rows(ColiCudaTensor *t, CcBuf *ids, CcBuf *x, CcBuf *y, int
  * mirrors of a float16 KV cache, whose values rope_f16 has already rounded */
 #if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
 __global__ static void cc_copy_grid_h_k(__half *__restrict__ d, const float *__restrict__ s, CcGrid g) {
+    COLI_PDL_WAIT();
     long long gid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= (long long)g.n * g.len) return;
     long long i = gid / g.len, j = gid - i * g.len, q = i / g.per, h = i - q * g.per;
@@ -2234,7 +2254,7 @@ static int cc_copy_regions_h(CcBuf *dst, CcBuf *src, const CcRegion *r, int n) {
         if (!(k >= 2 && cc_grid_of(r + i, k, &g))) { k = 1; g = CcGrid{(long long)r[i].dst, (long long)r[i].src, 0, 0, 0, 0, (int)r[i].n, 1, 1}; }
         long long tot = (long long)g.n * g.len;
         if (tot > 0) {
-            cc_copy_grid_h_k<<<grid1((size_t)tot, 256), 256, 0, c->stream>>>(d, src->d, g);
+            coli_launch(cc_copy_grid_h_k, grid1((size_t)tot, 256), 256, 0, c->stream, d, src->d, g);
             if (!launched(c, "copy regions (float16)")) return 0;
         }
         i += k;
@@ -2280,6 +2300,7 @@ __device__ static inline double cc_enc_sum256(double v, double *red, int tid) {
 }
 /* mode 0: a block a row, its values in registers before any write (y may be a or b) */
 __global__ static void cc_enc_norm_k(float *a, const float *b, const float *prm, float *y, CcEncNorm p) {
+    COLI_PDL_WAIT();
     __shared__ double red[256];
     int r = blockIdx.x, tid = threadIdx.x;
     if (r >= p.rows) return;
@@ -2312,6 +2333,7 @@ __global__ static void cc_enc_norm_k(float *a, const float *b, const float *prm,
 }
 /* mode 1 */
 __global__ static void cc_enc_bias_k(float *y, const float *prm, CcEncBias p) {
+    COLI_PDL_WAIT();
     long long i = (long long)blockIdx.x * 256 + threadIdx.x;
     if (i >= p.n) return;
     int r = (int)(i / p.O), o = (int)(i - (long long)r * p.O);
@@ -2322,6 +2344,7 @@ __global__ static void cc_enc_bias_k(float *y, const float *prm, CcEncBias p) {
 }
 /* mode 2 */
 __global__ static void cc_enc_geglu_k(const float *a, const float *prm, float *y, CcEncGeglu p) {
+    COLI_PDL_WAIT();
     long long i = (long long)blockIdx.x * 256 + threadIdx.x;
     if (i >= p.n) return;
     int r = (int)(i / p.I), j = (int)(i - (long long)r * p.I);
@@ -2332,6 +2355,7 @@ __global__ static void cc_enc_geglu_k(const float *a, const float *prm, float *y
 }
 /* mode 3: a thread a (row, query or key, head, pair) */
 __global__ static void cc_enc_rope_k(float *x, const float *tab, const int *pos, CcEncRope p) {
+    COLI_PDL_WAIT();
     long long i = (long long)blockIdx.x * 256 + threadIdx.x;
     if (i >= p.n) return;
     int half = p.hd / 2, per_row = 2 * p.H * half;
@@ -2346,6 +2370,7 @@ __global__ static void cc_enc_rope_k(float *x, const float *tab, const int *pos,
 }
 /* mode 4 */
 __global__ static void cc_enc_addrow_k(float *y, const float *tab, const int *idx, CcEncAddRow p) {
+    COLI_PDL_WAIT();
     long long i = (long long)blockIdx.x * 256 + threadIdx.x;
     if (i >= p.n) return;
     int r = (int)(i / p.D), d = (int)(i - (long long)r * p.D);
@@ -2358,6 +2383,7 @@ __global__ static void cc_enc_addrow_k(float *y, const float *tab, const int *id
 #define CC_EHD 128
 __global__ static void __launch_bounds__(256) cc_enc_attn_k(const float *qkv, const float *c2p, const float *p2c, float *o,
                                                             const int *rng, const int *ridx, const int *pos, CcEncAttn p) {
+    COLI_PDL_WAIT();
     __shared__ float qs[CC_EBQ * CC_EHD];
     __shared__ float kv[CC_EBK * (CC_EHD + 1)];
     __shared__ float sc[CC_EBQ * CC_EBK];
@@ -2458,6 +2484,7 @@ __global__ static void __launch_bounds__(256) cc_enc_attn_k(const float *qkv, co
 #define CC_EBR 64
 #define CC_EDC 32
 __global__ static void __launch_bounds__(256) cc_enc_rel_k(const float *x, const float *pt, float *y, CcEncRel p) {
+    COLI_PDL_WAIT();
     __shared__ float xs[CC_EBQ * (CC_EDC + 1)];
     __shared__ float ps[CC_EBR * (CC_EDC + 1)];
     int t0 = blockIdx.x * CC_EBR, i0 = blockIdx.y * CC_EBQ, h = blockIdx.z;
@@ -2489,31 +2516,31 @@ __global__ static void __launch_bounds__(256) cc_enc_rel_k(const float *x, const
 static int cc_enc_norm(CcBuf *a, CcBuf *b, CcBuf *prm, CcBuf *y, const CcEncNorm *p) {
     CcCtx *c = live();
     if (!c || !a || !prm || !y || !p || p->rows < 1 || p->D < 1 || p->D > 4096 || ((p->flags & CC_ENC_ADD) && !b)) return 0;
-    cc_enc_norm_k<<<(unsigned)p->rows, 256, 0, c->stream>>>(fpw(a), fp(b), fp(prm), fpw(y), *p);
+    coli_launch(cc_enc_norm_k, (unsigned)p->rows, 256, 0, c->stream, fpw(a), fp(b), fp(prm), fpw(y), *p);
     return launched(c, "encoder norm");
 }
 static int cc_enc_bias(CcBuf *y, CcBuf *prm, const CcEncBias *p) {
     CcCtx *c = live();
     if (!c || !y || !p || p->n < 1 || p->O < 1 || (p->b_off >= 0 && !prm)) return 0;
-    cc_enc_bias_k<<<grid1((size_t)p->n, 256), 256, 0, c->stream>>>(fpw(y), fp(prm), *p);
+    coli_launch(cc_enc_bias_k, grid1((size_t)p->n, 256), 256, 0, c->stream, fpw(y), fp(prm), *p);
     return launched(c, "encoder bias");
 }
 static int cc_enc_geglu(CcBuf *a, CcBuf *prm, CcBuf *y, const CcEncGeglu *p) {
     CcCtx *c = live();
     if (!c || !a || !y || !p || p->n < 1 || p->I < 1 || (p->b_off >= 0 && !prm)) return 0;
-    cc_enc_geglu_k<<<grid1((size_t)p->n, 256), 256, 0, c->stream>>>(fp(a), fp(prm), fpw(y), *p);
+    coli_launch(cc_enc_geglu_k, grid1((size_t)p->n, 256), 256, 0, c->stream, fp(a), fp(prm), fpw(y), *p);
     return launched(c, "encoder geglu");
 }
 static int cc_enc_rope(CcBuf *x, CcBuf *tab, CcBuf *pos, const CcEncRope *p) {
     CcCtx *c = live();
     if (!c || !x || !tab || !pos || !p || p->n < 1 || p->H < 1 || p->hd < 2) return 0;
-    cc_enc_rope_k<<<grid1((size_t)p->n, 256), 256, 0, c->stream>>>(fpw(x), fp(tab), (const int *)pos->d, *p);
+    coli_launch(cc_enc_rope_k, grid1((size_t)p->n, 256), 256, 0, c->stream, fpw(x), fp(tab), (const int *)pos->d, *p);
     return launched(c, "encoder rope");
 }
 static int cc_enc_addrow(CcBuf *y, CcBuf *tab, CcBuf *idx, const CcEncAddRow *p) {
     CcCtx *c = live();
     if (!c || !y || !tab || !idx || !p || p->n < 1 || p->D < 1) return 0;
-    cc_enc_addrow_k<<<grid1((size_t)p->n, 256), 256, 0, c->stream>>>(fpw(y), fp(tab), (const int *)idx->d, *p);
+    coli_launch(cc_enc_addrow_k, grid1((size_t)p->n, 256), 256, 0, c->stream, fpw(y), fp(tab), (const int *)idx->d, *p);
     return launched(c, "encoder add row");
 }
 static int cc_enc_attn(CcBuf *qkv, CcBuf *c2p, CcBuf *p2c, CcBuf *o, CcBuf *rng, CcBuf *ridx, CcBuf *pos, const CcEncAttn *p) {
@@ -2522,7 +2549,7 @@ static int cc_enc_attn(CcBuf *qkv, CcBuf *c2p, CcBuf *p2c, CcBuf *o, CcBuf *rng,
     if (!c || !qkv || !o || !rng || !p || p->S < 1 || p->H < 1 || p->hd < 1 || p->hd > CC_EHD || (p->S + CC_EBQ - 1) / CC_EBQ > 65535 ||
         (rel && (!ridx || !pos)) || ((p->flags & CC_ENC_C2P) && !c2p) || ((p->flags & CC_ENC_P2C) && !p2c)) return 0;
     dim3 g((unsigned)p->H, (unsigned)((p->S + CC_EBQ - 1) / CC_EBQ));
-    cc_enc_attn_k<<<g, 256, 0, c->stream>>>(fp(qkv), fp(c2p), fp(p2c), fpw(o), (const int *)rng->d,
+    coli_launch(cc_enc_attn_k, g, 256, 0, c->stream, fp(qkv), fp(c2p), fp(p2c), fpw(o), (const int *)rng->d,
                                            ridx ? (const int *)ridx->d : nullptr, pos ? (const int *)pos->d : nullptr, *p);
     return launched(c, "encoder attention");
 }
@@ -2531,7 +2558,7 @@ static int cc_enc_rel(CcBuf *x, CcBuf *pt, CcBuf *y, const CcEncRel *p) {
     if (!c || !x || !pt || !y || !p || p->S < 1 || p->H < 1 || p->hd < 1 || p->nr < 1 || p->H > 65535 ||
         (p->S + CC_EBQ - 1) / CC_EBQ > 65535) return 0;
     dim3 g((unsigned)((p->nr + CC_EBR - 1) / CC_EBR), (unsigned)((p->S + CC_EBQ - 1) / CC_EBQ), (unsigned)p->H);
-    cc_enc_rel_k<<<g, 256, 0, c->stream>>>(fp(x), fp(pt), fpw(y), *p);
+    coli_launch(cc_enc_rel_k, g, 256, 0, c->stream, fp(x), fp(pt), fpw(y), *p);
     return launched(c, "encoder relative products");
 }
 static const ColiCudaChainOps g_cc_ops = {
