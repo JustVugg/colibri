@@ -117,6 +117,59 @@ __global__ static void cc_norm_k(const float *__restrict__ x, const float *__res
         y[yb + i] = x[xb + i] * (pre ? w[wb + i] : wv) * r * p.post;
     }
 }
+/* cc_addnorm: a block a row, a thread elements tid + 256 k as cc_norm_k's loops take them and its
+ * tree, so each sum, scale and product is cc_norm_k's and the add cc_ew_k's (the products and the
+ * add spelled out: an fma would round once where the kernels apart round twice). NV: D <= 256 NV */
+template<int NV>
+__global__ static void cc_addnorm_k(float *__restrict__ x, const float *__restrict__ t, const float *__restrict__ w,
+                                    float *__restrict__ y, CcAddNorm p) {
+    COLI_PDL_WAIT();
+    __shared__ float red[256];
+    const int row = blockIdx.x, tid = threadIdx.x, D = p.D;
+    float *xr = x + p.x_off + (size_t)row * D, *yr = y + p.y_off + (size_t)row * D;
+    const float *tr = t + p.t_off + (size_t)row * D;
+    float v[NV];
+    float acc = 0.f;
+    #pragma unroll
+    for (int k = 0; k < NV; k++) {
+        const int i = tid + 256 * k;
+        v[k] = i < D ? tr[i] : 0.f;
+        if ((p.flags & 1) && i < D) acc += v[k] * v[k];
+    }
+    if (p.flags & 1) {
+        red[tid] = acc;
+        __syncthreads();
+        for (int off = 128; off > 0; off >>= 1) {
+            if (tid < off) red[tid] += red[tid + off];
+            __syncthreads();
+        }
+        const float r = 1.f / sqrtf(red[0] / (float)D + p.eps);
+        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < NV; k++) {
+            const int i = tid + 256 * k;
+            if (i < D) v[k] = __fmul_rn(__fmul_rn(__fmul_rn(v[k], 1.f + w[p.wp_off + i]), r), 1.f);
+        }
+    }
+    acc = 0.f;
+    #pragma unroll
+    for (int k = 0; k < NV; k++) {
+        const int i = tid + 256 * k;
+        if (i < D) { v[k] = __fadd_rn(xr[i], v[k]); xr[i] = v[k]; acc += v[k] * v[k]; }
+    }
+    red[tid] = acc;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        __syncthreads();
+    }
+    const float r = 1.f / sqrtf(red[0] / (float)D + p.eps);
+    #pragma unroll
+    for (int k = 0; k < NV; k++) {
+        const int i = tid + 256 * k;
+        if (i < D) yr[i] = __fmul_rn(__fmul_rn(__fmul_rn(v[k], 1.f + w[p.w_off + i]), r), 1.f);
+    }
+}
 /* kv16.h's kv16_round_bits line for line: clamped, the nearest float16 (ew's CC_EW_F16) */
 __device__ static inline float cc_f16_round(float x) {
     if (x > 65504.f) x = 65504.f; else if (x < -65504.f) x = -65504.f;
@@ -1550,6 +1603,20 @@ static int cc_matmul(ColiCudaTensor *t, CcBuf *x, size_t xo, CcBuf *y, size_t yo
     if (!coli_cuda_tensor_gemm_async(t, y->d + yo, x->d + xo, S, (void *)c->stream)) { c->lost = 1; return 0; }
     return 1;
 }
+static int cc_addnorm(CcBuf *x, CcBuf *t, CcBuf *w, CcBuf *y, const CcAddNorm *p) {
+    CcCtx *c = live();
+    if (!c || !x || !t || !w || !y || !p || p->rows < 1 || p->D < 1) return 0;
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_ADDNORM"); on = !(e && *e == '0'); }
+    if (!on || p->D > 256 * 32) return -1;
+    if ((size_t)(p->x_off + (size_t)p->rows * p->D) * 4 > x->bytes || (size_t)(p->t_off + (size_t)p->rows * p->D) * 4 > t->bytes ||
+        (size_t)(p->y_off + (size_t)p->rows * p->D) * 4 > y->bytes) return 0;
+    const int nv = (p->D + 255) / 256;
+    #define CC_AN(NV_) coli_launch(cc_addnorm_k<NV_>, dim3((unsigned)p->rows), 256, 0, c->stream, fpw(x), fp(t), fp(w), fpw(y), *p)
+    if (nv <= 8) CC_AN(8); else if (nv <= 16) CC_AN(16); else if (nv <= 24) CC_AN(24); else CC_AN(32);
+    #undef CC_AN
+    return launched(c, "addnorm");
+}
 static int cc_matmul_glu(ColiCudaTensor *wg, ColiCudaTensor *wu, CcBuf *x, CcBuf *y, int S) {
     CcCtx *c = live();
     if (!c || !wg || !wu || !x || !y || S < 1) return 0;
@@ -2650,5 +2717,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_enc_norm, cc_enc_bias, cc_enc_geglu, cc_enc_rope, cc_enc_addrow, cc_enc_attn, cc_enc_rel,
     cc_lfm3,
     cc_matmul_glu,
+    cc_addnorm,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }
