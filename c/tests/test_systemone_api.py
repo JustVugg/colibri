@@ -400,6 +400,27 @@ class SystemOneApi(unittest.TestCase):
         self.assertEqual(body["detail"], [{"loc": ["body", "questions", "q", "criteria", 1],
                                            "msg": body["error"]["message"], "type": "value_error"}])
 
+    def test_detail_locations(self):
+        loc = openai_server.APIHandler._systemone_loc
+        self.assertEqual(loc("questions.q.criteria[1]"), ["body", "questions", "q", "criteria", 1])
+        self.assertEqual(loc("x[1][2].y[3]"), ["body", "x", 1, 2, "y", 3])
+        self.assertEqual(loc("questions.a.b]"), ["body", "questions.a.b]"])   # each dot is before a "]"
+        self.assertEqual(loc("a[[1]]"), ["body", "a[[1]]"])
+        self.assertEqual(loc(None), ["body"])
+        started = time.monotonic()
+        loc("." * 300000); loc("[1]" * 100000 + "x")
+        self.assertLess(time.monotonic() - started, 2.0, "a location is one pass over its text")
+
+    def test_question_ids_have_a_length(self):
+        self.serve({})
+        long_id = "q" * (openai_server.APIHandler._SYSTEMONE_MAX_ID + 1)
+        code, body = self.post_error({"model": "jev-latest", "state": STATE,
+                                      "questions": {long_id: {"type": "noul"}}})
+        self.assertEqual(code, 422)
+        self.assertIn(f"at most {openai_server.APIHandler._SYSTEMONE_MAX_ID} characters", body["error"]["message"])
+        self.assertNotIn(long_id, json.dumps(body))
+        self.assertEqual(body["detail"][0]["loc"], ["body", "questions"])
+
     def test_models_lists_the_jev_card_beside_the_openai_one(self):
         self.serve({})
         with urlopen(self.base + "/v1/models", timeout=10) as response:
