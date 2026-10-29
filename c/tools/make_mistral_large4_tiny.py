@@ -27,6 +27,9 @@ The text model, from the release's modeling_mistral_large4.py:
    attention reads. A "shared" layer reads the last full layer's selection.
 
     python3 tools/make_mistral_large4_tiny.py --out ml4_tiny --emit-ref ml4_tiny/ref.json
+
+--quant UD-IQ1_S (or any of MIXES) writes the GGUF in that published file's types, layer by layer,
+the reference reading what those blocks decode to.
 """
 import argparse
 import json
@@ -80,7 +83,7 @@ def random_weights(c, seed):
     g = torch.Generator().manual_seed(seed)
 
     def r(*shape, std=0.15):
-        return (torch.randn(*shape, generator=g) * std).float()
+        return (torch.randn(*shape, generator=g) * std * c.get("init_scale", 1.0)).float()
 
     def norm(n, around=1.0):
         return (around + 0.2 * torch.randn(n, generator=g)).float()
@@ -125,12 +128,28 @@ def random_weights(c, seed):
     return w
 
 
-class Ref:
-    """The text forward over a whole sequence, float32, no cache."""
+def _act_q8(x):
+    """Activation rows as the engine's integer kernels take them (ggml_quants.h gq_quant_act):
+    blocks of 32, a float scale max|x| / 127, codes rounded to nearest even and clamped."""
+    b = x.reshape(-1, 32)
+    amax = b.abs().max(-1, keepdim=True).values
+    inv = torch.where(amax > 0, 127.0 / torch.where(amax > 0, amax, torch.ones_like(amax)), torch.zeros_like(amax))
+    return (torch.clamp(torch.round(b * inv), -127, 127) * (amax / 127.0)).reshape(x.shape)
 
-    def __init__(self, c, w):
-        self.c, self.w = c, w
+
+class Ref:
+    """The text forward over a whole sequence, float32, no cache. act_q8: the names of the
+    matrices whose inputs round to int8 first, as the engine's integer kernels read a GGUF's
+    blocks (every block type; BF16 and F32 stay float)."""
+
+    def __init__(self, c, w, act_q8=()):
+        self.c, self.w, self.act_q8 = c, w, set(act_q8)
         self.inv = yarn_inv_freq(c) * torch.exp(w["alpha"])
+
+    def mm(self, x, name, e=None):
+        """x @ W^T (W the expert e's for a fused expert tensor), x rounded where the engine does"""
+        W = self.w[name] if e is None else self.w[name][e]
+        return (_act_q8(x) if name in self.act_q8 else x) @ W.T
 
     def rms(self, x, weight):
         return weight * (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.c["eps"]))
@@ -151,9 +170,9 @@ class Ref:
     def indexer(self, i, x, T):
         c, w, p = self.c, self.w, f"blk.{i}.indexer."
         NI, IH, R = c["index_heads"], c["index_head_dim"], c["rope"]
-        q = (self.ln(x, w[p + "q_norm.weight"], w[p + "q_norm.bias"]) @ w[p + "attn_q_b.weight"].T).view(T, NI, IH)
+        q = self.mm(self.ln(x, w[p + "q_norm.weight"], w[p + "q_norm.bias"]), p + "attn_q_b.weight").view(T, NI, IH)
         q = self.ssmax(q, w[p + "ssmax.weight"], w[p + "ssmax.bias"])
-        k = self.ln(x @ w[p + "attn_k.weight"].T, w[p + "k_norm.weight"], w[p + "k_norm.bias"]).view(T, 1, IH)
+        k = self.ln(self.mm(x, p + "attn_k.weight"), w[p + "k_norm.weight"], w[p + "k_norm.bias"]).view(T, 1, IH)
         if c["rope_pattern"][i]:
             q = torch.cat([self.rot(q[..., :R], T), q[..., R:]], -1)
             k = torch.cat([self.rot(k[..., :R], T), k[..., R:]], -1)
@@ -171,9 +190,9 @@ class Ref:
         T, H, R, L, V = x.shape[0], c["heads"], c["rope"], c["kv_lora"], c["v_head"]
         rope = c["rope_pattern"][i]
         nope = c["nope"] + (0 if rope else R)
-        q = (x @ w[p + "attn_q.weight"].T).view(T, H, c["nope"] + R)
+        q = self.mm(x, p + "attn_q.weight").view(T, H, c["nope"] + R)
         if c["kv_source"][i] == i:
-            kv = x @ w[p + "attn_kv_a_mqa.weight"].T
+            kv = self.mm(x, p + "attn_kv_a_mqa.weight")
             lat = self.rms(kv[:, :L], w[p + "attn_kv_a_norm.weight"])
             kr = self.rot(kv[:, L:].view(T, 1, R), T) if rope else None
             latents[i] = (lat, kr)
@@ -194,13 +213,13 @@ class Ref:
         s = torch.einsum("thd,shd->hts", q, k) / math.sqrt(c["nope"] + R)
         s = s.masked_fill(~allowed[None], float("-inf"))
         o = torch.einsum("hts,shv->thv", torch.softmax(s, -1), v).reshape(T, H * V)
-        return o @ w[p + "attn_output.weight"].T, sel
+        return self.mm(o, p + "attn_output.weight"), sel
 
     def mlp(self, i, x):
         c, w, p = self.c, self.w, f"blk.{i}."
         silu = torch.nn.functional.silu
         if i < c["dense_layers"]:
-            return (silu(x @ w[p + "ffn_gate.weight"].T) * (x @ w[p + "ffn_up.weight"].T)) @ w[p + "ffn_down.weight"].T
+            return self.mm(silu(self.mm(x, p + "ffn_gate.weight")) * self.mm(x, p + "ffn_up.weight"), p + "ffn_down.weight")
         probs = torch.softmax(x @ w[p + "ffn_gate_inp.weight"].T, -1)
         top = probs.topk(c["topk"], -1)
         wts = top.values / (top.values.sum(-1, keepdim=True) + 1e-20) * c["routed_scale"]
@@ -208,9 +227,9 @@ class Ref:
         for t in range(x.shape[0]):
             for j in range(c["topk"]):
                 e = int(top.indices[t, j])
-                h = silu(w[p + "ffn_gate_exps.weight"][e] @ x[t]) * (w[p + "ffn_up_exps.weight"][e] @ x[t])
-                out[t] += wts[t, j] * (w[p + "ffn_down_exps.weight"][e] @ h)
-        sh = (silu(x @ w[p + "ffn_gate_shexp.weight"].T) * (x @ w[p + "ffn_up_shexp.weight"].T)) @ w[p + "ffn_down_shexp.weight"].T
+                h = silu(self.mm(x[t], p + "ffn_gate_exps.weight", e)) * self.mm(x[t], p + "ffn_up_exps.weight", e)
+                out[t] += wts[t, j] * self.mm(h, p + "ffn_down_exps.weight", e)
+        sh = self.mm(silu(self.mm(x, p + "ffn_gate_shexp.weight")) * self.mm(x, p + "ffn_up_shexp.weight"), p + "ffn_down_shexp.weight")
         return out + sh
 
     def logits(self, ids):
@@ -221,7 +240,7 @@ class Ref:
             a, sel = self.attention(i, self.rms(x, w[f"blk.{i}.attn_norm.weight"]), latents, sel)
             x = x + a
             x = x + self.mlp(i, self.rms(x, w[f"blk.{i}.ffn_norm.weight"]))
-        z = self.rms(x, w["output_norm.weight"]) @ w["output.weight"].T
+        z = self.mm(self.rms(x, w["output_norm.weight"]), "output.weight")
         return c["softcap"] * torch.tanh(z / c["softcap"])
 
     def generate(self, prompt, n):
@@ -233,9 +252,10 @@ class Ref:
         return ids, gap
 
 
-def write_gguf(path, c, w, dense_type="F32"):
+def write_gguf(path, c, w, blocks=None):
     """The weights as unsloth's mistral-large4 GGUFs have them: the names, the keys (the rotary
-    pattern, the KV sources and the indexer types by layer), the rope's exp(-alpha)."""
+    pattern, the KV sources and the indexer types by layer), the rope's exp(-alpha). blocks maps a
+    name to (ggml type, bytes) where the file holds it quantized (quantize_mix)."""
     import numpy as np
     U32, I32, F32, BOOL, STR, ARR = 4, 5, 6, 7, 8, 9
     p, n = "mistral-large4.", len(c["rope_pattern"])
@@ -272,14 +292,127 @@ def write_gguf(path, c, w, dense_type="F32"):
     for name, t in w.items():
         if name in ("alpha",) or name.endswith("kv_b"):
             continue
-        a = t.float().contiguous().numpy().astype(np.float32)
-        dims = list(reversed(a.shape))
-        if dense_type == "Q8_0" and a.ndim >= 2 and a.shape[-1] % 32 == 0 and "norm" not in name and "ssmax" not in name \
-                and "gate_inp" not in name and "indexer.proj" not in name:
-            tensors.append((name, 8, dims, _q8_0(a)))
+        dims = list(reversed(t.shape))
+        if blocks and name in blocks:
+            tensors.append((name, blocks[name][0], dims, blocks[name][1]))
         else:
-            tensors.append((name, 0, dims, a.tobytes()))
+            tensors.append((name, 0, dims, t.float().contiguous().numpy().astype(np.float32).tobytes()))
     Path(path).write_bytes(_gguf_bytes(kv, tensors))
+
+
+# Each published GGUF's types, read from the headers of unsloth/Mistral-Large-4-1T-A52B-GGUF
+# (tools/gguf_header.py): "a" the attention's q and output, the indexer's q_b and the head, "e"
+# the embeddings, "x" the routed experts' gate and up, "d" their down, each list one type per
+# MoE layer in turn (the files mix them by layer); every other matrix (kv_a, k_b, v_b, the
+# indexer's k, the dense and shared MLPs) is "base". Norms, SSMax, the router, the indexer's
+# weights_proj and rope_freqs stay F32 in all of them.
+MIXES = {
+    "BF16": {"base": "BF16", "a": "BF16", "e": "BF16", "x": ["BF16"], "d": ["BF16"]},
+    "Q8_0": {"base": "Q8_0", "a": "Q8_0", "e": "Q8_0", "x": ["Q8_0"], "d": ["Q8_0"]},
+    "UD-IQ1_S": {"base": "Q8_0", "a": "Q6_K", "e": "Q6_K", "x": ["IQ1_S", "IQ2_XXS"], "d": ["IQ2_XXS", "IQ1_S"]},
+    "UD-IQ1_M": {"base": "Q8_0", "a": "Q6_K", "e": "Q6_K", "x": ["IQ1_S", "IQ2_XXS"], "d": ["IQ2_XS", "IQ3_XXS"]},
+    "UD-IQ2_XXS": {"base": "Q8_0", "a": "Q6_K", "e": "Q6_K", "x": ["IQ2_XXS", "IQ2_S"], "d": ["IQ2_XS", "IQ3_XXS"]},
+    "UD-IQ3_XXS": {"base": "Q8_0", "a": "Q8_0", "e": "Q6_K", "x": ["IQ3_XXS", "IQ3_S"], "d": ["IQ3_XXS", "IQ4_XS"]},
+    "UD-Q2_K_XL": {"base": "Q8_0", "a": "Q8_0", "e": "Q6_K", "x": ["IQ2_S", "IQ3_XXS"], "d": ["IQ3_XXS", "IQ3_S"]},
+    "UD-Q3_K_XL": {"base": "Q8_0", "a": "Q8_0", "e": "Q6_K", "x": ["Q3_K", "Q4_K"], "d": ["IQ4_XS", "Q3_K", "Q4_K"]},
+    "UD-Q4_K_XL": {"base": "Q8_0", "a": "Q8_0", "e": "Q8_0", "x": ["Q4_K"], "d": ["Q4_K", "Q5_K"]},
+    "UD-Q5_K_XL": {"base": "Q8_0", "a": "Q8_0", "e": "Q8_0", "x": ["Q5_K", "Q6_K"], "d": ["Q6_K"]},
+    "UD-Q6_K_XL": {"base": "Q8_0", "a": "Q8_0", "e": "Q8_0", "x": ["Q6_K", "Q8_0"], "d": ["Q6_K", "Q8_0"]},
+}
+# ggml type -> (id, block elements, block bytes, offsets of the fp16 scale fields)
+GGML = {"Q8_0": (8, 32, 34, [0]), "Q3_K": (11, 256, 110, [108]), "Q4_K": (12, 256, 144, [0, 2]),
+        "Q5_K": (13, 256, 176, [0, 2]), "Q6_K": (14, 256, 210, [208]), "IQ2_XXS": (16, 256, 66, [0]),
+        "IQ2_XS": (17, 256, 74, [0]), "IQ3_XXS": (18, 256, 98, [0]), "IQ1_S": (19, 256, 50, [0]),
+        "IQ3_S": (21, 256, 110, [0]), "IQ2_S": (22, 256, 82, [0]), "IQ4_XS": (23, 256, 136, [0])}
+# a geometry whose rows are whole 256-element blocks, as every matrix of the real model's is
+# (the weights half as spread: four times the inputs would make the model chaotic, and the
+# engine's int8 activations then decide its tokens)
+GEOMETRY_256 = {"hidden": 256, "heads": 4, "kv_lora": 64, "nope": 32, "rope": 32, "v_head": 64,
+                "dense_inter": 256, "moe_inter": 256, "index_head_dim": 64, "init_scale": 0.5}
+
+
+def mix_type(mix, name, moe_index):
+    k = name.split(".", 2)[2] if name.startswith("blk.") else name
+    if k in ("attn_q.weight", "attn_output.weight", "indexer.attn_q_b.weight") or name == "output.weight":
+        return mix["a"]
+    if name == "token_embd.weight":
+        return mix["e"]
+    if k in ("ffn_gate_exps.weight", "ffn_up_exps.weight"):
+        return mix["x"][moe_index % len(mix["x"])]
+    if k == "ffn_down_exps.weight":
+        return mix["d"][moe_index % len(mix["d"])]
+    if k in ("attn_kv_a_mqa.weight", "attn_k_b.weight", "attn_v_b.weight", "indexer.attn_k.weight",
+             "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+             "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"):
+        return mix["base"]
+    return None
+
+
+def decode(dequant_bin, type_id, raw):
+    """raw blocks to float32 by ggml_quants.h (tests/test_ggml_quants, the decoder
+    tests/test_ggml_quants.py holds bit for bit to the format's reference)"""
+    import struct
+    import subprocess
+    import numpy as np
+    n = raw.shape[0] * GGML[[k for k, v in GGML.items() if v[0] == type_id][0]][1]
+    out = subprocess.run([str(dequant_bin)], input=struct.pack("<iq", type_id, n) + raw.tobytes(),
+                         stdout=subprocess.PIPE, check=True).stdout
+    return np.frombuffer(out, dtype=np.float32)
+
+
+def synth_blocks(dequant_bin, kind, t, rng):
+    """Random blocks of `kind` for tensor t (its last dimension the rows' length), the scale fields
+    chosen so the decoded weights have t's spread and no mean: (bytes, the decoded tensor)."""
+    import numpy as np
+    tid, blck, size, f16 = GGML[kind]
+    target = float(t.std())
+    nb = t.numel() // blck
+    raw = rng.integers(0, 256, (nb, size), dtype=np.uint8)
+
+    def setf(r, off, v):
+        r[:, off:off + 2] = np.array([v], dtype=np.float16).view(np.uint8)
+    if len(f16) == 2:   # d times the codes minus dmin times the minima: centre them
+        def deq(d, m):
+            probe = raw.copy(); setf(probe, f16[0], d); setf(probe, f16[1], m)
+            return decode(dequant_bin, tid, probe).astype(np.float64)
+        pos, neg = deq(1.0, 0.0), deq(0.0, 1.0)
+        d = target / float(np.std(pos))
+        setf(raw, f16[0], d); setf(raw, f16[1], d * float(np.mean(pos)) / max(1e-9, -float(np.mean(neg))))
+    else:
+        probe = raw.copy(); setf(probe, f16[0], 1.0)
+        s = float(np.std(decode(dequant_bin, tid, probe)))
+        setf(raw, f16[0], target / s if s > 0 else target)
+    vals = decode(dequant_bin, tid, raw)
+    return raw.tobytes(), torch.from_numpy(vals.copy()).reshape(t.shape)
+
+
+def quantize_mix(c, w, mix, dequant_bin, seed):
+    """The weights as the GGUF of that mix holds them: Q8_0 and BF16 rounded from w, the other
+    types as random blocks of w's spread. Returns (the weights the file gives back, blocks)."""
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    out, blocks = dict(w), {}
+    for name, t in w.items():
+        layer = int(name.split(".")[1]) if name.startswith("blk.") else -1
+        kind = mix_type(mix, name, layer - c["dense_layers"])
+        if kind is None:
+            continue
+        if kind == "BF16":
+            u = t.float().contiguous().numpy().view(np.uint32).astype(np.uint64)
+            h = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)   # round to nearest even
+            blocks[name] = (30, h.tobytes())
+            out[name] = torch.from_numpy((h.astype(np.uint32) << 16).view(np.float32).copy()).reshape(t.shape)
+        elif kind == "Q8_0":
+            raw = _q8_0(t.float().contiguous().numpy())
+            blocks[name] = (8, raw)
+            out[name] = torch.from_numpy(decode(dequant_bin, 8, np.frombuffer(raw, np.uint8).reshape(-1, 34)).copy()).reshape(t.shape)
+        else:
+            data, out[name] = synth_blocks(dequant_bin, kind, t, rng)
+            blocks[name] = (GGML[kind][0], data)
+    for i in range(len(c["rope_pattern"])):   # the reference's kv_b from the file's k_b and v_b
+        p = f"blk.{i}."
+        out[p + "kv_b"] = torch.cat([out[p + "attn_k_b.weight"].transpose(1, 2), out[p + "attn_v_b.weight"]], 1).contiguous()
+    return out, blocks
 
 
 # the tensors the release ships in FP8 (128 x 128 blocks, qscale_weight multiplied); the rest
@@ -393,10 +526,20 @@ def main():
                          "config.json) to this directory; the reference is then the FP8 weights'")
     ap.add_argument("--override", default=None,
                     help="JSON object over the tiny config's keys (a feature off, to find where two forwards part)")
+    ap.add_argument("--quant", choices=sorted(MIXES), default=None,
+                    help="write the GGUF in the types of that published file (MIXES), the reference on the "
+                         "weights its blocks decode to; the rows then 256 wide (GEOMETRY_256)")
+    ap.add_argument("--act-q8", action="store_true",
+                    help="with --quant: the reference rounds the inputs of the block matrices to int8 as the "
+                         "engine's integer kernels do (without it, the reference of GQ_EXACT=1's float path)")
+    ap.add_argument("--dequant-bin", default=str(Path(__file__).resolve().parent.parent / "tests" / "test_ggml_quants"),
+                    help="ggml_quants.h's decoder (make tests/test_ggml_quants), for --quant")
     ap.add_argument("--min-gap", type=float, default=0.1,
                     help="draw seeds from --seed on until every greedy step's first logit beats the second by this much")
     args = ap.parse_args()
     c = tiny_config()
+    if args.quant:
+        c.update(GEOMETRY_256)
     if args.override:
         c.update(json.loads(args.override))
     prompt = [int(t) for t in args.prompt_ids.split(",") if t.strip()]
@@ -409,17 +552,22 @@ def main():
                 nope = c["nope"] + (0 if c["rope_pattern"][i] else c["rope"])
                 w[p + "attn_k_b.weight"] = w[p + "kv_b"][:, :nope, :].transpose(1, 2).contiguous()
                 w[p + "attn_v_b.weight"] = w[p + "kv_b"][:, nope:, :].contiguous()
+        blocks, act = None, ()
+        if args.quant:
+            w, blocks = quantize_mix(c, w, MIXES[args.quant], args.dequant_bin, seed)
+            if args.act_q8:
+                act = [n for n, (t, _) in blocks.items() if t != 30]
         if not args.emit_ref:
             break
         with torch.no_grad():
-            full, gap = Ref(c, w).generate(prompt, args.max_new)
+            full, gap = Ref(c, w, act).generate(prompt, args.max_new)
         if gap >= args.min_gap:
             break
     else:
         sys.exit(f"no seed in {args.seed}..{args.seed + 199} gives a margin of {args.min_gap}")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    write_gguf(out / "model.gguf", c, w)
+    write_gguf(out / "model.gguf", c, w, blocks)
     print(f"tiny Mistral-Large-4 -> {out / 'model.gguf'}")
     if args.fp8_checkpoint:
         write_fp8_checkpoint(args.fp8_checkpoint, c, w)
@@ -429,7 +577,7 @@ def main():
         # teacher forcing: one forward over the whole sequence, the argmax at every position
         # (TF=1 checks the engine's prompt reading apart from its decode)
         with torch.no_grad():
-            tf_pred = Ref(c, w).logits(full).argmax(-1).tolist()
+            tf_pred = Ref(c, w, act).logits(full).argmax(-1).tolist()
         Path(args.emit_ref).write_text(json.dumps({"prompt_ids": prompt, "full_ids": full, "tf_pred": tf_pred,
                                                    "mode": "full", "model": "mistral_large4_tiny"}, indent=2))
         print(f"ref.json -> {args.emit_ref} (seed {seed}, smallest margin {gap:.3f})\n"
