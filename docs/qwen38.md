@@ -650,6 +650,19 @@ behind a 4 GiB trunk on 8 GB) and 290 ms of routed experts, which no chain touch
 chain uploads 174 MiB itself (the matrices the placer never sees) and holds 381 MiB of
 state (the K/V, index-key and pooled-key mirrors, the DeltaNet state, the PLE ring).
 
+**A long prompt layer by layer** (`q38cc_forward_lm`, `COLI_CUDA_CHAIN_LAYERWISE`). A
+prompt chunk copies every layer's host pool experts into VRAM before that layer's experts
+run (`q38cc_stage_from`), so a 4K-token prompt in 2048-row chunks copied each layer's pool
+experts twice. Where every layer runs its experts in the frame and a chunk stages them, a
+prompt of more chunks than one now runs layer by layer: each layer's chunks in order, its
+copy waited for at its first chunk and the next staged layer's started after its last (on
+the copy stream, beside the next frames), every row's streams kept on the device between
+layers. Each layer's chunk is a frame waited for, so the K/V rows and the routes' books
+come down a chunk at a time as before, and a chunk runs the same ops on the same rows.
+RTX PRO 4000 (PCIe gen 4 x8), Qwen3.8-Flash-Next IQ2_XS with the host pool, prompts of
+1K / 4K tokens: 321.3 / 309.0 -> 321.2 / 343.0 tok/s, the decode the same (43.6 tok/s).
+The Vulkan chain does the same (`q38c_forward_lm`, `COLI_VK_CHAIN_LAYERWISE`).
+
 `tests/test_qwen38_cuda_chain.c` (`make qwen38-cuda-chain-check`, in CI beside
 `qwen38-dn-gpu-check`) runs the tiny FP8 fixture's oracle on the fake tier with the
 chain's ops from the fake's host-side table: the chain on (8/8 tokens, cosine 0.99998), a

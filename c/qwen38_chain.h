@@ -1203,28 +1203,42 @@ static int q38c_layer_major(void) {   /* 0 off, 1 forced (tests: no staging need
     if (on < 0) { const char *e = getenv("COLI_VK_CHAIN_LAYERWISE"); on = e && *e == '0' ? 0 : e && *e == '1' ? 1 : 2; }
     return on;
 }
+static int q38c_lm_layers(Model *m, Q38Chain *ch, const int *ids, int S, int pos_base, int nlogits,
+                          const float *hyper_h, int rows, const float *cs_all);
 /* 1 done, 0 declined before any layer ran (the chunks then, in the frame begun here), -1 lost */
 static int q38c_forward_lm(Model *m, Q38Chain *ch, const int *ids, int S, int pos_base, int nlogits,
                            const float *hyper_h, float *logit, int rows) {
-    Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, lo = ch->lo, hi = lo + ch->nl, V = c->vocab, E = c->experts;
+    Cfg *c = &m->c; int W = c->hc_width, lo = ch->lo, hi = lo + ch->nl, V = c->vocab;
     int half = c->rotary_dim / 2;
     if (!vkc_begin() || !vkc_dmoe_upload(&ch->dm)) return -1;
     if (q38c_layer_major() == 2 && !vkc_dmoe_staging(&ch->dm)) return 0;
     for (int i = lo; i < hi; i++) if (!vkc_dmoe_on(&ch->dm, i)) return 0;
     if (!q38c_res(&ch->hyper_all, (size_t)S * W, VKC_DEV)) return 0;
+    float *cs_all = half ? malloc((size_t)S * half * 2 * sizeof(float)) : NULL;   /* every row's angles, once */
+    if (half && !cs_all) return 0;
+    for (int r = 0; half && r < S; r++) for (int j = 0; j < half; j++) {
+        float ang = (float)(pos_base + r) / powf(c->theta, (float)(2 * j) / c->rotary_dim);
+        cs_all[((size_t)r * half + j) * 2] = cosf(ang); cs_all[((size_t)r * half + j) * 2 + 1] = sinf(ang);
+    }
+    int r = q38c_lm_layers(m, ch, ids, S, pos_base, nlogits, hyper_h, rows, cs_all);
+    free(cs_all);
+    if (r <= 0) return r;
+    memcpy(logit, vkc_ptr(ch->outd), (size_t)nlogits * V * sizeof(float));
+    ch->lm_forwards++;
+    return 1;
+}
+/* q38c_forward_lm's layers: 1 done, -1 lost */
+static int q38c_lm_layers(Model *m, Q38Chain *ch, const int *ids, int S, int pos_base, int nlogits,
+                          const float *hyper_h, int rows, const float *cs_all) {
+    Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, lo = ch->lo, hi = lo + ch->nl, V = c->vocab, E = c->experts;
+    int half = c->rotary_dim / 2;
     if (!q38c_push_state(ch, m, pos_base, S) || !vkc_write(ch->hyper_all, 0, hyper_h, (size_t)S * W * 4)) return -1;
     for (int i = lo; i < hi; i++) {
         Layer *l = &m->L[i];
         for (int c0 = 0; c0 < S; c0 += rows) {
             int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0;
             if (!vkc_begin() || !vkc_dmoe_upload(&ch->dm)) return -1;
-            if (half) {
-                float *cs = (float *)vkc_ptr(ch->cs);
-                for (int r = 0; r < n; r++) for (int j = 0; j < half; j++) {
-                    float ang = (float)(pb + r) / powf(c->theta, (float)(2 * j) / c->rotary_dim);
-                    cs[(r * half + j) * 2] = cosf(ang); cs[(r * half + j) * 2 + 1] = sinf(ang);
-                }
-            }
+            if (half) memcpy(vkc_ptr(ch->cs), cs_all + (size_t)c0 * half * 2, (size_t)n * half * 2 * sizeof(float));
             int ok = vkc_copy(ch->hyper, 0, ch->hyper_all, (size_t)c0 * W, (size_t)n * W);
             if (ok && i == c->ple_layer) { q38c_ple_rows(m, ids, c0, n, ch->host_emb); ok = q38c_ple(ch, m, n, c0, 0); }
             ok = ok && q38c_gr_read(ch, m, &l->attn_gr, ch->o_an[i], n, ch->inj_a);
@@ -1264,8 +1278,6 @@ static int q38c_forward_lm(Model *m, Q38Chain *ch, const int *ids, int S, int po
             ch->dn_where = Q38C_DEV; ch->host_zero = 0;
         }
     }
-    memcpy(logit, vkc_ptr(ch->outd), (size_t)nlogits * V * sizeof(float));
-    ch->lm_forwards++;
     return 1;
 }
 
