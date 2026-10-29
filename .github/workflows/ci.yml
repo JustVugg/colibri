@@ -1745,6 +1745,17 @@ jobs:
           KV16=1 SNAP=./glm_tiny TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=2 ./colibri 64 16 16 > kv16.log 2>&1 || { cat kv16.log; exit 1; }
           cat kv16.log
           grep -q "latent KV cache in float16" kv16.log && ! grep -q "oracle run keeps" kv16.log
+      - name: Mistral-Large-4 tiny oracle (tools/make_mistral_large4_tiny.py)
+        # NoPE and shared-KV layers, full and shared indexers with the selection active, YaRN
+        # over the learned alpha, SSMax, the softmax router and the softcap, through the GGUF
+        # import, against a float32 transcription of the release's code; the KV in float16 too
+        run: |
+          cd c
+          python3 tools/make_mistral_large4_tiny.py --out /tmp/ml4 --emit-ref /tmp/ml4/ref.json
+          python3 tools/gguf_import.py /tmp/ml4/model.gguf /tmp/ml4/coli
+          SNAP=/tmp/ml4/coli REF=/tmp/ml4/ref.json COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 8 16 16
+          SNAP=/tmp/ml4/coli REF=/tmp/ml4/ref.json TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 8 16 16
+          KV16=1 SNAP=/tmp/ml4/coli REF=/tmp/ml4/ref.json TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 8 16 16
       - name: Oracle allowance and failure regressions
         run: |
           cd c

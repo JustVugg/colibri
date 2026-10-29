@@ -261,6 +261,35 @@ static const st_gg_name st_gg_gdsa_layer[] = {
     {"nextn.shared_head_norm.weight", "shared_head.norm.weight"},
     {NULL, NULL}};
 
+/* Mistral-Large-4 (mistral-large4): GLM-5.2's names where the tensor is the same (MLA's k_b and
+ * v_b split, the indexer, the experts), the query straight from the input (no LoRA), the
+ * softmax scalings (SSMax: attn_ssmax, indexer.ssmax), the indexer's input LayerNorm and the
+ * rope's frequency factors (exp(-alpha), the learned LeRoPE alpha) under names of their own. A
+ * layer reading another's KV latent has no kv_a. */
+static const st_gg_name st_gg_ml4_glob[] = {
+    {"token_embd.weight", "model.embed_tokens.weight"}, {"output_norm.weight", "model.norm.weight"},
+    {"output.weight", "lm_head.weight"}, {"rope_freqs.weight", "model.rotary_emb.freq_factors"},
+    {NULL, NULL}};
+static const st_gg_name st_gg_ml4_layer[] = {
+    {"attn_norm.weight", "input_layernorm.weight"}, {"ffn_norm.weight", "post_attention_layernorm.weight"},
+    {"attn_q.weight", "self_attn.q_proj.weight"}, {"attn_kv_a_mqa.weight", "self_attn.kv_a_proj_with_mqa.weight"},
+    {"attn_kv_a_norm.weight", "self_attn.kv_a_layernorm.weight"},
+    {"attn_k_b.weight", "self_attn.k_b_proj.weight"}, {"attn_v_b.weight", "self_attn.v_b_proj.weight"},
+    {"attn_output.weight", "self_attn.o_proj.weight"},
+    {"attn_ssmax.weight", "self_attn.softmax_scaling.scale"}, {"attn_ssmax.bias", "self_attn.softmax_scaling.bias"},
+    {"indexer.attn_q_b.weight", "self_attn.indexer.wq_b.weight"}, {"indexer.attn_k.weight", "self_attn.indexer.wk.weight"},
+    {"indexer.proj.weight", "self_attn.indexer.weights_proj.weight"},
+    {"indexer.k_norm.weight", "self_attn.indexer.k_norm.weight"}, {"indexer.k_norm.bias", "self_attn.indexer.k_norm.bias"},
+    {"indexer.q_norm.weight", "self_attn.indexer.q_input_norm.weight"}, {"indexer.q_norm.bias", "self_attn.indexer.q_input_norm.bias"},
+    {"indexer.ssmax.weight", "self_attn.indexer.softmax_scaling.scale"}, {"indexer.ssmax.bias", "self_attn.indexer.softmax_scaling.bias"},
+    {"ffn_gate.weight", "mlp.gate_proj.weight"}, {"ffn_up.weight", "mlp.up_proj.weight"}, {"ffn_down.weight", "mlp.down_proj.weight"},
+    {"ffn_gate_inp.weight", "mlp.gate.weight"},
+    {"ffn_gate_shexp.weight", "mlp.shared_experts.gate_proj.weight"}, {"ffn_up_shexp.weight", "mlp.shared_experts.up_proj.weight"},
+    {"ffn_down_shexp.weight", "mlp.shared_experts.down_proj.weight"},
+    {"ffn_gate_exps.weight", "mlp.experts.%d.gate_proj.weight"}, {"ffn_up_exps.weight", "mlp.experts.%d.up_proj.weight"},
+    {"ffn_down_exps.weight", "mlp.experts.%d.down_proj.weight"},
+    {NULL, NULL}};
+
 /* MiMo-V2 (mimo2): conversion/mimo.py MimoV2Model. qkv_proj comes as one [Q|K|V] (the release
  * pre-shards it; the converter regroups it), the dense matrices dequantized; the NextN blocks
  * past the model's layers keep their GGUF names (mimo.c does not read them). */
@@ -298,6 +327,7 @@ static const st_gg_map st_gguf_maps[] = {
     {"olmoe", "model.layers.%d.", st_gg_olmoe_glob, st_gg_olmoe_layer},
     {"mimo2", "model.layers.%d.", st_gg_mimo_glob, st_gg_mimo_layer},
     {"glm-dsa", "model.layers.%d.", st_gg_gdsa_glob, st_gg_gdsa_layer},
+    {"mistral-large4", "model.layers.%d.", st_gg_ml4_glob, st_gg_ml4_layer},
     {"glm5-next", "model.language_model.layers.%d.", st_gg_g5n_glob, st_gg_g5n_layer},
     {"deepseek4", "layers.%d.", st_gg_dsv4_glob, st_gg_dsv4_layer},
     {"deepseek41", "layers.%d.", st_gg_dsv41_glob, st_gg_dsv41_layer},

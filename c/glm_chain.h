@@ -1182,6 +1182,7 @@ static void glmc_start(Model *m) {
     if (on && g_cuda_enabled) no = "the CUDA backend is on and keeps the trunk";
 #endif
     if (on && !no && (g_kv8 || g_tq)) no = "a quantized KV cache (KV8, KV_TQ) stays on the CPU";
+    if (on && !no && m->c.ml4) no = "Mistral-Large-4's attention (no query LoRA, NoPE and shared-KV layers, SSMax) runs on the CPU";
     if (on && !no && g_pilot) no = "PILOT prefetch reads the residual on the host";
     const char *why = on && !no ? glmc_check(m) : NULL;
     if (why) fprintf(stderr, "[VK] colibri chain: %s; per-matrix path\n", why);

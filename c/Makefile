@@ -2016,6 +2016,8 @@ tests/test_tok_gpt2$(EXE): tests/test_tok_gpt2.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_tok_deepseek$(EXE): tests/test_tok_deepseek.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_tok_tekken$(EXE): tests/test_tok_tekken.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_k3_ram_budget$(EXE): tests/test_k3_ram_budget.c kimi_k3.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
