@@ -8830,7 +8830,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 # Suppress tool-call markers from the streamed content and parse the authoritative
                 # calls from the FULL reply after generation. Hold back a marker-length tail so a
                 # tool-call marker split across engine chunks is still caught.
-                sp = {"buf": "", "tool": False}
+                sp = {"buf": "", "tool": False, "emitted": 0}
                 hold = _tool_hold()
                 raw = []
                 sideband = ToolSideband(ARCH == "kimi", stop_sequences,
@@ -8853,12 +8853,14 @@ class APIHandler(BaseHTTPRequestHandler):
                     if cut >= 0:
                         if cut:
                             emit(sp["buf"][:cut])
+                            sp["emitted"] += cut
                         sp["buf"] = ""
                         sp["tool"] = True
                         return
                     flush = max(0, len(sp["buf"]) - hold)
                     if flush:
                         emit(sp["buf"][:flush])
+                        sp["emitted"] += flush
                         sp["buf"] = sp["buf"][flush:]
                 # #597: keep GLM reasoning out of the tool-call buffer — a think splitter sends it
                 # to reasoning_content and passes only the answer text on to feed_content/parser.
@@ -8894,8 +8896,18 @@ class APIHandler(BaseHTTPRequestHandler):
                 else:
                     if not sp["tool"] and sp["buf"]:
                         emit(sp["buf"])                 # no tool call happened: flush held tail
-                    _content, calls = parse_arch_tool_calls("".join(raw), tools,
-                                                            sideband.reply())
+                    if sp["tool"] and ARCH in ("glm", "glm53"):
+                        content, calls, _boxes, spans = parse_tool_calls_spans("".join(raw), tools)
+                        # The streamed prefix is already visible. Release surviving prose
+                        # after the first call using the parser's exact retained ranges;
+                        # markers/arguments stay hidden and the prefix is never repeated.
+                        for begin, end, target in spans:
+                            first = max(begin, sp["emitted"])
+                            if first < end:
+                                emit(content[target + first - begin:target + end - begin])
+                    else:
+                        _content, calls = parse_arch_tool_calls("".join(raw), tools,
+                                                                sideband.reply())
                 for i, tc in enumerate(calls):
                     event([{"index": 0, "delta": {"tool_calls": [{"index": i, "id": tc["id"],
                              "type": "function", "function": {"name": tc["function"]["name"],
