@@ -75,6 +75,11 @@ typedef struct {
     size_t *o_ra, *o_rf, *o_pre, *o_pf;        /* Muse Spark: residual gates (alpha | beta), pre_en, post_fn */
     ColiCudaTensor **t_ag, **t_ld, **t_lu;     /* Muse Spark: the attention gate and the latent projections (the tier's) */
     ColiCudaTensor **t_ab, **t_sg, **t_gate;   /* the chain's own: DeltaNet b|a rows, shared gate row, router */
+    uint8_t *rgf;                              /* t_gate holds the shared gate's row after the router's (lg: E + 1 a row) */
+/* the rows up to which a step reads the shared gate from the router's GEMV (rgf): the backend's
+ * GEMV (GEMV_I8_MAX_S), where each output row has the separate row's bits; a prompt chunk's GEMM
+ * sums in another order, so a chunk keeps the separate row (t_sg) and the prompt its bits */
+#define Q36CC_RG_ROWS 8
     ColiCudaTensor **t_q, **t_k, **t_v, **t_o, **t_dnp, **t_dno, **t_shg, **t_shu, **t_shd, *t_lm;   /* the tier's */
     CcBuf **rec, **ring, **kc, **vc;           /* per layer state */
     CcBuf **rec_snap[Q36_SPEC_SNAPS], **ring_snap[Q36_SPEC_SNAPS];   /* a verify's copies, slot r after row r */
@@ -361,13 +366,14 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
     ch->o_pre = calloc(L, sizeof(size_t)); ch->o_pf = calloc(L, sizeof(size_t));
     ch->t_ag = calloc(L, sizeof(void *)); ch->t_ld = calloc(L, sizeof(void *)); ch->t_lu = calloc(L, sizeof(void *));
     ch->t_ab = calloc(L, sizeof(void *)); ch->t_sg = calloc(L, sizeof(void *)); ch->t_gate = calloc(L, sizeof(void *));
+    ch->rgf = calloc(L, 1);
     ch->t_q = calloc(L, sizeof(void *)); ch->t_k = calloc(L, sizeof(void *)); ch->t_v = calloc(L, sizeof(void *));
     ch->t_o = calloc(L, sizeof(void *)); ch->t_dnp = calloc(L, sizeof(void *)); ch->t_dno = calloc(L, sizeof(void *));
     ch->t_shg = calloc(L, sizeof(void *)); ch->t_shu = calloc(L, sizeof(void *)); ch->t_shd = calloc(L, sizeof(void *));
     ch->rec = calloc(L, sizeof(void *)); ch->ring = calloc(L, sizeof(void *));
     ch->kc = calloc(L, sizeof(void *)); ch->vc = calloc(L, sizeof(void *));
     ch->kv_valid = calloc(L, sizeof(int)); ch->attn_ord = calloc(L, sizeof(int)); ch->kv_rows = calloc(L, sizeof(int));
-    if (!ch->o_in || !ch->o_post || !ch->o_qn || !ch->o_kn || !ch->o_conv || !ch->o_dn || !ch->o_snk || !ch->t_ab || !ch->t_sg || !ch->t_gate ||
+    if (!ch->o_in || !ch->o_post || !ch->o_qn || !ch->o_kn || !ch->o_conv || !ch->o_dn || !ch->o_snk || !ch->t_ab || !ch->t_sg || !ch->t_gate || !ch->rgf ||
         !ch->o_ra || !ch->o_rf || !ch->o_pre || !ch->o_pf || !ch->t_ag || !ch->t_ld || !ch->t_lu ||
         !ch->t_q || !ch->t_k || !ch->t_v || !ch->t_o || !ch->t_dnp || !ch->t_dno || !ch->t_shg || !ch->t_shu || !ch->t_shd ||
         !ch->rec || !ch->ring || !ch->kc || !ch->vc || !ch->kv_valid || !ch->attn_ord || !ch->kv_rows) return NULL;
@@ -462,7 +468,25 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
             ch->ring[i] = ch->rec[i] ? cc_buf((size_t)conv_dim * (convk - 1) * sizeof(float), CC_DEV) : NULL;
             ok = ch->t_ab[i] && ch->rec[i] && ch->ring[i];
         } else ch->attn_ord[i] = ch->n_attn++;
-        if (ok && c->n_experts > 0 && !q36_dense_l(c, i)) { ch->t_gate[i] = q36cc_qw_tensor(ch->dev, &l->gate); ok = ch->t_gate[i] != NULL; own += (size_t)l->gate.I * l->gate.O * (l->gate.q ? 1 : 4); }
+        if (ok && c->n_experts > 0 && !q36_dense_l(c, i)) {
+            /* the router and the shared expert's gate row read the same rows: where both are f32, one
+             * matrix of E + 1 rows and one GEMV a layer (Qwen3.6-35B UD-Q4_K_M: 40 launches of about
+             * 3 us a decode token fewer); COLI_CUDA_CHAIN_ROUTER_GATE=0 keeps two */
+            const char *rge = getenv("COLI_CUDA_CHAIN_ROUTER_GATE");
+            if (!(rge && *rge == '0') && !c->muse && l->sh_gate && l->sh_I > 0 && !l->gate.q && l->gate.w &&
+                l->gate.I == D && l->gate.O == c->n_experts) {
+                float *rg = malloc((size_t)(l->gate.O + 1) * D * sizeof(float));
+                if (rg) {
+                    memcpy(rg, l->gate.w, (size_t)l->gate.O * D * sizeof(float));
+                    memcpy(rg + (size_t)l->gate.O * D, l->sh_gate, (size_t)D * sizeof(float));
+                    ch->t_gate[i] = q36cc_f32_tensor(ch->dev, rg, D, l->gate.O + 1);
+                    free(rg);
+                    ch->rgf[i] = ch->t_gate[i] != NULL;
+                }
+            }
+            if (!ch->t_gate[i]) ch->t_gate[i] = q36cc_qw_tensor(ch->dev, &l->gate);
+            ok = ch->t_gate[i] != NULL; own += (size_t)l->gate.I * (l->gate.O + ch->rgf[i]) * (l->gate.q ? 1 : 4);
+        }
         if (ok && l->sh_gate && l->sh_I > 0) { ch->t_sg[i] = q36cc_f32_tensor(ch->dev, l->sh_gate, D, 1); ok = ch->t_sg[i] != NULL; own += (size_t)D * 4; }
     }
     if (!ok) {
@@ -498,7 +522,7 @@ static int q36cc_bufs(Q36CChain *ch, Model *m, int rows) {
              cc_reserve(&ch->q, r * qo * F, CC_DEV) && cc_reserve(&ch->k, r * kvo * F, CC_DEV) && cc_reserve(&ch->v, r * kvo * F, CC_DEV) &&
              cc_reserve(&ch->ctx, r * H * hd * F, CC_DEV) && cc_reserve(&ch->qkvz, r * (c->dn_conv_dim + vd) * F, CC_DEV) &&
              cc_reserve(&ch->ab, r * 2 * c->dn_vheads * F, CC_DEV) && cc_reserve(&ch->cv, r * c->dn_conv_dim * F, CC_DEV) &&
-             cc_reserve(&ch->dny, r * vd * F, CC_DEV) && cc_reserve(&ch->h2, r * D * F, CC_DEV) && cc_reserve(&ch->lg, r * E * F, CC_DEV) &&
+             cc_reserve(&ch->dny, r * vd * F, CC_DEV) && cc_reserve(&ch->h2, r * D * F, CC_DEV) && cc_reserve(&ch->lg, r * (E + 1) * F, CC_DEV) &&
              cc_reserve(&ch->gs, r * SI * F, CC_DEV) && cc_reserve(&ch->us, r * SI * F, CC_DEV) && cc_reserve(&ch->hs, r * SI * F, CC_DEV) &&
              cc_reserve(&ch->ds, r * D * F, CC_DEV) && cc_reserve(&ch->sgd, r * F, CC_DEV) && cc_reserve(&ch->fin, D * F, CC_DEV) &&
              cc_reserve(&ch->h2d, r * D * F, CC_DOWN) && cc_reserve(&ch->lgd, r * E * F, CC_DOWN) &&
@@ -1118,7 +1142,7 @@ static int q36cc_shared(Q36CChain *ch, Model *m, Layer *l, int i, int n) {
              cc_ew(ch->hs, ch->gs, ch->us, NULL, NULL, &p) &&
              cc_matmul(ch->t_shd[i], ch->hs, 0, ch->ds, 0, n);
     }
-    if (ok && ch->t_sg[i]) ok = cc_matmul(ch->t_sg[i], ch->h2, 0, ch->sgd, 0, n);
+    if (ok && ch->t_sg[i] && !(ch->rgf[i] && n <= Q36CC_RG_ROWS)) ok = cc_matmul(ch->t_sg[i], ch->h2, 0, ch->sgd, 0, n);
     return ok;
 }
 /* x += routed + gate * shared, as moe() leaves `out` and layers_forward_range adds it */
@@ -1133,8 +1157,9 @@ static int q36cc_combine(Q36CChain *ch, Model *m, int i, int n, CcBuf *routed) {
     }
     const int routed_l = c->n_experts > 0 && !q36_dense_l(c, i), SI = m->L[i].sh_I;   /* a Flint dense layer routes nothing */
     int flags = (routed_l ? 1 : 0) | (SI > 0 ? 2 : 0) | (m->L[i].sh_gate && SI > 0 ? 4 : 0);
-    CcEw p = {CC_EW_COMBINE, n * c->hidden, c->hidden, 1, flags, 1, 0, 0, 0, 0, 0, 1.f};
-    return cc_ew(ch->x, ch->x, routed, ch->ds, ch->sgd, &p);
+    const int rg = ch->rgf[i] && n <= Q36CC_RG_ROWS, E1 = c->n_experts + 1;   /* the gate after the router's logits in lg */
+    CcEw p = {CC_EW_COMBINE, n * c->hidden, c->hidden, 1, flags, rg ? E1 : 1, 0, 0, 0, 0, rg ? c->n_experts : 0, 1.f};
+    return cc_ew(ch->x, ch->x, routed, ch->ds, rg ? ch->lg : ch->sgd, &p);
 }
 /* COLI_CUDA_CHAIN_FAULT=n: the n-th frame fails (for the tests) */
 static int q36cc_frame_begin(Q36CChain *ch) {
@@ -1587,7 +1612,7 @@ static void q36cc_dm_end(Q36CChain *ch) { if (ch->dm_held) { qt_chain_hold(0); c
 static int q36cc_dm_layer(Q36CChain *ch, Model *m, Layer *l, int i, int n, unsigned *v) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
     int ng = c->n_group > 1 && c->n_group <= E ? c->n_group : 1, io = i * n * K;
-    CcRoute rp = {n, E, K, c->router_sigmoid ? 1 : 0, 0, E, 0, 0, io, K, io, K, ng, ng > 1 ? c->topk_group : 1, 1, 1.f, 1.f, 0.f};
+    CcRoute rp = {n, E, K, c->router_sigmoid ? 1 : 0, 0, E + ch->rgf[i], 0, 0, io, K, io, K, ng, ng > 1 ? c->topk_group : 1, 1, 1.f, 1.f, 0.f};
     int part;
     CcBuf *tab = q36cc_dm_tab(ch, i, n, &part);
     CcMoe mp = {n, K, D, I, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, D, io, K, io, K, 0, D, -1, E, tab == ch->dm_tabb && ch->dm_fmt < 100, 0};
@@ -1809,7 +1834,14 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
                 continue;
             }
             if (ok && routed_l) {
-                ok = cc_matmul(ch->t_gate[i], ch->h2, 0, ch->lg, 0, n) && cc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E);
+                ok = cc_matmul(ch->t_gate[i], ch->h2, 0, ch->lg, 0, n);
+                if (ok && ch->rgf[i]) {   /* the router's rows down without the gate after each */
+                    CcRegion *rgn = malloc((size_t)n * sizeof *rgn);
+                    ok = rgn != NULL;
+                    for (int s = 0; ok && s < n; s++) rgn[s] = (CcRegion){(size_t)s * E, (size_t)s * (E + 1), (size_t)E};
+                    ok = ok && cc_copy_regions(ch->lgd, ch->lg, rgn, n);
+                    free(rgn);
+                } else ok = ok && cc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E);
                 if (c->muse) {   /* Muse Spark: the experts read the rows at their width, normalised */
                     CcNorm pn = {n, q36_eh(c), 1, 0, q36_eh(c), q36_eh(c), 0, q36_eh(c), q36_eh(c), (int)ch->o_pre[i], 0, CC_NORM_ADD1, c->eps, 1.f};
                     ok = ok && cc_matmul(ch->t_ld[i], ch->h2, 0, ch->lat, 0, n) && cc_norm(ch->lat, ch->prm, ch->lat, &pn) &&

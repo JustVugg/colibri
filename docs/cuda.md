@@ -173,6 +173,44 @@ DeepSeek V4 Flash UD-IQ1_S (82.5 GB) on an RTX PRO 4000 (24 GB, PCIe 4.0 x8) wit
 
 The same models on the CPU, Vulkan and CUDA, one machine and one build: [gpu-parity.md](gpu-parity.md).
 
+## OLMoE on the card (`olmoe_cuda_chain.h`)
+
+OLMoE-1B-7B is small enough to hold whole on a card (Q4_K_M: 3.9 GiB of experts and 0.6 GiB of
+the rest), so a CUDA build (`make olmoe CUDA=1`) with `COLI_CUDA=1` (`coli serve --gpu`) puts
+every layer, every routed expert and lm_head on the device and runs a step of any rows as one
+frame: the norms, q/k/v (one matrix where their forms agree), OLMoE's q and k norms over the
+whole projection, RoPE, the new K/V rows into a float16 mirror, the attention, o_proj, the router,
+its softmax and top-k, the experts and the residual adds, then the final norm and lm_head. The
+dense matrices stay in their GGUF blocks (or f32), the experts in their blocks or the merged
+checkpoint's int8 rows. It needs the whole model, a prompt chunk's scratch and the KV mirror in
+the card's free memory, and declines otherwise (the CPU runs it), as with `KV_SLOTS` > 1.
+
+While it runs, the device's KV cache is the one that counts: the host's catches up only when the
+CPU needs it (a step the chain declines reads the missing rows down), and a device lost mid-step
+rebuilds them on the CPU from the token ids the chain recorded, the CPU running from then on
+(`COLI_CUDA_CHAIN_FAULT=n` fakes the loss at the n-th frame).
+
+Measured on an RTX PRO 4000 (PCIe gen 4 x8), OLMoE-1B-7B-0125-Instruct Q4_K_M, `coli serve`,
+tok/s:
+
+| | prompt 1K / 3K tokens | decode after 1K |
+|---|---|---|
+| the CPU (before: no CUDA path) | 101 / 79 | 32.5 |
+| this chain | 9798-10107 / 8584-8599 | 316.5-316.6 |
+| our Vulkan chain, the same build | 4634 / 5140 | 275.0 |
+| the reference GGUF engine, CUDA | 10690 / 8403 | 325.9 |
+
+Where the time went, and what changed it (decode, a token): a RoPE reading its cos/sin table from
+host memory over the bus took 22.5 us a call (0.7 ms of 3.9), now copied to the device a frame;
+bringing every step's K/V rows down into the host's cache cost a 1K-token prompt more than its
+kernels, now they stay on the device; q, k and v in one matrix (and the q and k norms and RoPE
+in one launch each) took the decode from 293.6 to 315.0. `COLI_CUDA_CHAIN_QKV=0` keeps the three
+matrices apart.
+
+`tests/cuda_olmoe_compare.py` runs the tiny fixture's oracle on the CPU and on the device
+(`KV16=1`, `COLI_CUDA_CHAIN_ROWS=3`, `COLI_CUDA_CHAIN_QKV=0`, `COLI_CUDA_CHAIN_FAULT=n`): the
+reference's tokens and the last logits within 1e-5 of the CPU's.
+
 ## The decision engines
 
 Laya (`laya.c`) and GLiNER2.5-Decide (`gliner_decide.c`) answer a decision with one forward
