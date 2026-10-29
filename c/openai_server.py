@@ -9120,9 +9120,10 @@ class APIHandler(BaseHTTPRequestHandler):
         start = compaction_tail_start(conversation, done, ratio, int(limit * COMPACT_KEEP_SHARE))
         if start is None:
             return None
-        users = [i for i in range(done, len(conversation))
-                 if isinstance(conversation[i], dict) and conversation[i].get("role") == "user"]
-        end = users[-1]                   # the summary covers everything before the new request
+        # This summary is cached under keys[start] and replaces only that prefix.
+        # Including the retained tail would duplicate it in this turn and leak its
+        # branch-specific facts into any conversation sharing the shorter prefix.
+        end = start
         if end <= done:
             return None
         words = max(80, min(400, limit // 24))
