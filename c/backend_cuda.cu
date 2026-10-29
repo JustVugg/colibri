@@ -3670,7 +3670,7 @@ template<int BM, int BN> struct HcmTile {   /* 40, 64 and 80 KB of shared memory
     static constexpr int MINB = BM == 128 && BN == 128 ? 2 : 1;
 };
 template<int T, int BM, int BN>
-__global__ static void __launch_bounds__(256, HcmTile<BM, BN>::MINB) hcm_dense_k(float *__restrict__ y, const __half *__restrict__ xh,
+__global__ static void __launch_bounds__(256, (HcmTile<BM, BN>::MINB)) hcm_dense_k(float *__restrict__ y, const __half *__restrict__ xh,
                                                                              const bd_u32 *__restrict__ w, int rw, int S, int I, int O, int kc) {
     COLI_PDL_WAIT();
 #if HCM_BODY
@@ -3786,6 +3786,7 @@ __global__ static void hcm_sum_k(float *__restrict__ y, const float *__restrict_
     for (int z = 1; z < ns; z++) v += p[(size_t)z * n + i];
     y[i] = v;
 }
+#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))   /* HIP has no carveout attribute; hcm_gemm is off there */
 template<int T, int BM, int BN>
 static void hcm_launch(dim3 g, cudaStream_t st, float *y, const __half *xh, const bd_u32 *w, int rw, int S, int I, int O, int kc) {
     constexpr int smem = HcmTile<BM, BN>::SMEM;
@@ -3800,6 +3801,7 @@ static void hcm_launch(dim3 g, cudaStream_t st, float *y, const __half *xh, cons
     }
     hcm_dense_k<T, BM, BN><<<g, 256, smem, st>>>(y, xh, w, rw, S, I, O, kc);
 }
+#endif
 /* hcm_dense_k for a block tensor's S rows: the inputs in f16 (and a split K's partial sums) in
  * scratch the stream allocates and frees in its own order. COLI_CUDA_HCM_TILE and
  * COLI_CUDA_HCM_SPLIT (2 ..) force a tile and a split K. 0: not taken. COLI_CUDA_BD_HCM=0 keeps
