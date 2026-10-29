@@ -8552,19 +8552,8 @@ class APIHandler(BaseHTTPRequestHandler):
             return error_object(error)
         return {"type": "error", "error": {"type": error.error_type, "message": error.message}}
 
-    def generation(self, body, prompt, request_id, chat, tools=None, tool_choice=None,
-                   enable_thinking=False, audio=None, image=None,
-                   add_generation_prompt=True, compaction=None):
-        # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
-        # 2 = both sides (rendered prompt + output). render_chat already folds prior turns and
-        # tool results into `prompt`, so level 2 is the full conversation the engine saw.
-        try:
-            dbg = int(os.environ.get("COLI_DEBUG", "0"))
-        except ValueError:
-            dbg = 0
-        if dbg >= 2:
-            sys.stderr.write(f"\n===== PROMPT [{request_id}] =====\n{prompt}\n===== OUTPUT [{request_id}] =====\n")
-            sys.stderr.flush()
+    def _generation_request_options(self, body, chat):
+        """Validate generation options without admitting work or invoking the engine."""
         maximum, temperature, top_p, grammar, _requested_stop_sequences = generation_options(
             body, self.server.max_tokens)
         family = family_by_id(ARCH)
@@ -8576,9 +8565,6 @@ class APIHandler(BaseHTTPRequestHandler):
         engine_k, echo, display_k = logprobs_options(
             body, chat, getattr(self.server.engine, "supports_logprobs_echo", False))
         stop_sequences, ignore_leading_stop = stop_policy(body, chat)
-        # tools and tool_choice come from chat_completion() already processed/filtered
-        if chat and tool_choice == "none":
-            tools = None          # client forbade tools: never surface tool_calls
         cache_slot = body.get("cache_slot")
         if (cache_slot is not None and
                 (isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or
@@ -8609,6 +8595,28 @@ class APIHandler(BaseHTTPRequestHandler):
             # bool("false") is True: a string, number or object would have turned the usage frame on
             raise APIError(400, "`stream_options.include_usage` must be a boolean.", "stream_options.include_usage")
         include_usage = bool(include_usage)
+        return (maximum, temperature, top_p, grammar, engine_k, echo, display_k,
+                stop_sequences, ignore_leading_stop, cache_slot, stream, include_usage)
+
+    def generation(self, body, prompt, request_id, chat, tools=None, tool_choice=None,
+                   enable_thinking=False, audio=None, image=None,
+                   add_generation_prompt=True, compaction=None):
+        # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
+        # 2 = both sides (rendered prompt + output). render_chat already folds prior turns and
+        # tool results into `prompt`, so level 2 is the full conversation the engine saw.
+        try:
+            dbg = int(os.environ.get("COLI_DEBUG", "0"))
+        except ValueError:
+            dbg = 0
+        if dbg >= 2:
+            sys.stderr.write(f"\n===== PROMPT [{request_id}] =====\n{prompt}\n===== OUTPUT [{request_id}] =====\n")
+            sys.stderr.flush()
+        (maximum, temperature, top_p, grammar, engine_k, echo, display_k,
+         stop_sequences, ignore_leading_stop, cache_slot, stream, include_usage) = (
+            self._generation_request_options(body, chat))
+        # tools and tool_choice come from chat_completion() already processed/filtered
+        if chat and tool_choice == "none":
+            tools = None          # client forbade tools: never surface tool_calls
         object_name = "chat.completion" if chat else "text_completion"
         id_prefix = "chatcmpl-" if chat else "cmpl-"
         completion_id = id_prefix + uuid.uuid4().hex
@@ -9048,6 +9056,10 @@ class APIHandler(BaseHTTPRequestHandler):
         if not isinstance(messages, list) or not messages:
             raise APIError(400, "`messages` must be a non-empty array.", "messages")
         compact = compaction_requested(body)
+        if compact:
+            # A summary is inference too: reject invalid request options before
+            # context pressure can send earlier messages through the engine.
+            self._generation_request_options(body, True)
         render = dict(enable_thinking=enable_thinking, reasoning_effort=reasoning_effort,
                       tools=tools, tool_choice=tool_choice, preserve_thinking=preserve_thinking)
         lead, conversation = split_lead(messages)
