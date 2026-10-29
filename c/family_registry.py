@@ -344,6 +344,13 @@ def _qwen36_geometry(config, context, _model_dir):
     full = sum(kind in ("full_attention", "sliding_attention") for kind in kinds)
     kv = (full * context * _required_int(config, "num_key_value_heads", "qwen36") *
           _required_int(config, "head_dim", "qwen36") * 2 * 4)
+    if any(kind == "conv" for kind in kinds):
+        # LFM3: a conv layer keeps its last conv_L_cache - 1 rows of every channel, whatever
+        # the context; the MLP is dense, nothing routed
+        taps = _required_int(config, "conv_L_cache", "qwen36", 2)
+        conv = sum(kind == "conv" for kind in kinds)
+        fixed = conv * _required_int(config, "hidden_size", "qwen36") * (taps - 1) * 4
+        return PlannerGeometry(kv, fixed, 0, 0, dense=True)
     if full == layers:
         # all attention (qwen3_moe): no recurrent state, and no linear_* keys to read
         if "num_experts" not in config:
@@ -1492,8 +1499,10 @@ FAMILIES = (
         # sliding-window layers, dense layers in front and sigmoid routing.
         # muse_spark: Muse Spark Open (its GGUFs, tools/gguf_import.py), Flint's window and
         # layers without RoPE, residual gates and the experts at their own width.
+        # lfm3: LFM3 (LiquidAI/LFM3-VL, its text model; lfm3_vl the checkpoint's own type),
+        # dense, short gated convolutions beside attention layers.
         model_types=("qwen3_5_moe", "qwen3_5_moe_text", "qwen3_5", "qwen3_5_text", "qwen3_moe", "qwen3", "flint",
-                     "muse_spark"),
+                     "muse_spark", "lfm3", "lfm3_vl"),
         display_name="Qwen3.6-35B-A3B",
         display_scale="35B",
         # Both checkpoints declare qwen3_5_moe_text. Keyed on the three
@@ -1522,6 +1531,9 @@ FAMILIES = (
             DisplayVariant((("num_hidden_layers", 62),
                             ("num_experts", 256), ("hidden_size", 8192)),
                            "Muse-Spark-Open-816B-A42B", "816B", model_id="muse-spark-open-colibri"),
+            DisplayVariant((("num_hidden_layers", 24), ("hidden_size", 2048),
+                            ("intermediate_size", 7680)),
+                           "LFM3-VL-2B", "2B", model_id="lfm3-vl-2b-colibri"),
         ),
         engine_artifact="qwen36",
         engine_aliases=(),

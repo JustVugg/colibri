@@ -8,7 +8,7 @@
  *   rope      rotate-half from a host table, heads at a stride
  *   attn      causal GQA with the output gate over a cache at an offset, a prefill of
  *             several rows after earlier ones, a selection list
- *   dnconv    both orders, the ring carried across calls, the snapshot row
+ *   dnconv    both orders, the ring carried across calls, the snapshot row; LFM3's (order 2)
  *   dnrec     KD 8 and 128, silu and sigmoid gates, the state carried, the snapshot
  *   ew        every element-wise op
  *   lost      a failed launch (COLI_GPU_FAIL_AFTER) marks the device lost to the chain
@@ -111,10 +111,11 @@ static void ref_dnconv(const float *in, const float *w, float *ring, float *out,
         float hist[8] = {0}; for (int k = 0; k < nh; k++) hist[k] = ring[p->ring_off + c * nh + k];
         const float *wb = w + p->w_off + c * p->CK; float wl = wb[p->CK - 1];
         for (int s = 0; s < p->S; s++) {
-            float cur = in[p->in_off + s * p->in_row + c], acc;
-            if (p->order == 0) { acc = 0.f; for (int k = 0; k < nh; k++) acc += wb[k] * hist[k]; acc += wl * cur; }
+            const float *r = in + p->in_off + s * p->in_row;   /* order 2 (LFM3): B | C | x */
+            float cur = p->order == 2 ? r[c] * r[c + 2 * p->CD] : r[c], acc;
+            if (p->order != 1) { acc = 0.f; for (int k = 0; k < nh; k++) acc += wb[k] * hist[k]; acc += wl * cur; }
             else { acc = wl * cur; for (int k = 0; k < nh; k++) acc += wb[k] * hist[k]; }
-            out[p->out_off + s * p->out_row + c] = acc / (1.f + expf(-acc));
+            out[p->out_off + s * p->out_row + c] = p->order == 2 ? r[c + p->CD] * acc : acc / (1.f + expf(-acc));
             for (int k = 0; k + 1 < nh; k++) hist[k] = hist[k + 1];
             if (nh > 0) hist[nh - 1] = cur;
             if (s == p->snap_row) for (int k = 0; k < nh; k++) snap[p->snap_off + c * nh + k] = hist[k];
@@ -163,6 +164,7 @@ static void ref_ew(float *Y, const float *A, const float *B, const float *Cc, co
         else if (p->op == 6) { int W = p->C * p->D, r = i / W, rem = i - r * W, k = rem / p->D, d = rem - k * p->D; Y[p->y_off + i] += A[p->a_off + r * p->C + k] * B[p->b_off + r * p->D + d]; }
         else if (p->op == 7) Y[p->y_off + i] = A[p->a_off + i] * p->fc;
         else if (p->op == 8) Y[p->y_off + i] = A[p->a_off + i] + E[p->e_off + i % p->D] * B[p->b_off + i];
+        else if (p->op == 12) Y[p->y_off + i] = A[p->a_off + i] * sig(B[p->b_off + i / p->D]);
     }
 }
 
@@ -913,6 +915,18 @@ int main(void) {
         ck(T->begin() && T->dnconv(ib, wb, rb, ob, NULL, &p1) && T->submit(1) && maxdiff(down(ob, out.size()).data(), ro.data(), out.size()) < 1e-5 && maxdiff(down(rb, ring.size()).data(), rr.data(), ring.size()) == 0, "the other order, from the carried ring");
         T->free(ib); T->free(wb); T->free(rb); T->free(ob); T->free(sb);
     }
+    if (T->size >= offsetof(ColiCudaChainOps, lfm3) + sizeof T->lfm3 && T->lfm3 && T->lfm3()) {   /* LFM3's gated convolution */
+        const int CD = 200, CK = 7, S = 5;
+        std::vector<float> in = rnd((size_t)S * 3 * CD, 54), w = rnd((size_t)CD * CK, 55), ring = rnd((size_t)CD * (CK - 1), 56), out((size_t)S * CD), snap((size_t)CD * (CK - 1));
+        std::vector<float> rr = ring, ro = out, rs = snap;
+        CcDnConv p = {S, CD, CK, 0, 3 * CD, 0, CD, 1, 2, 0, 0, 0};
+        ref_dnconv(in.data(), w.data(), rr.data(), ro.data(), rs.data(), &p);
+        CcBuf *ib = up(in), *wb = up(w), *rb = up(ring), *ob = T->buf(out.size() * 4, CC_DEV), *sb = T->buf(snap.size() * 4, CC_DEV);
+        ck(T->begin() && T->dnconv(ib, wb, rb, ob, sb, &p) && T->submit(1) &&
+           maxdiff(down(ob, out.size()).data(), ro.data(), out.size()) < 1e-5 && maxdiff(down(rb, ring.size()).data(), rr.data(), ring.size()) == 0 &&
+           maxdiff(down(sb, snap.size()).data(), rs.data(), snap.size()) == 0, "LFM3's order 2: C * conv(B * x), the ring of B * x, the snapshot after row 1");
+        T->free(ib); T->free(wb); T->free(rb); T->free(ob); T->free(sb);
+    }
     printf("dnrec\n");
     /* four rows (cc_dnrec_k) and 37 (cc_dnrec_rows_k: blocks past the first, the last part
      * full, the snapshot inside one) */
@@ -943,7 +957,8 @@ int main(void) {
             {CC_EW_ADD, n, 1, 0, 1, 1.f, "ADD"}, {CC_EW_COMBINE, n, 1, 7, 1, 1.f, "COMBINE: routed, gated shared, residual"},
             {CC_EW_COMBINE, n, 1, 10, 1, 1.f, "COMBINE: the shared expert alone, no residual"}, {CC_EW_SWIGLU, n, 1, 0, 1, 1.f, "SWIGLU"},
             {CC_EW_HC_LOW, n, 1, 0, 1, 4.f, "HC_LOW"}, {CC_EW_HC_MIX, n, C, 0, 1, 4.f, "HC_MIX"}, {CC_EW_HC_INJ, n, 1, 0, 1, 4.f, "HC_INJ"},
-            {CC_EW_HC_APPLY, R * C * D, C, 0, 1, 1.f, "HC_APPLY"}, {CC_EW_SCALE, n, 1, 0, 1, 0.25f, "SCALE"}, {CC_EW_GATE_ADD, n, 1, 0, 1, 1.f, "GATE_ADD"} };
+            {CC_EW_HC_APPLY, R * C * D, C, 0, 1, 1.f, "HC_APPLY"}, {CC_EW_SCALE, n, 1, 0, 1, 0.25f, "SCALE"}, {CC_EW_GATE_ADD, n, 1, 0, 1, 1.f, "GATE_ADD"},
+            {CC_EW_HEADGATE, n, 1, 0, 1, 1.f, "HEADGATE (LFM3)"} };
         for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
             CcEw p = {cases[k].op, cases[k].n, D, cases[k].C, cases[k].flags, cases[k].e_row, 0, 0, 0, 0, 0, cases[k].fc};
             std::vector<float> ref = y0;

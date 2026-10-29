@@ -414,10 +414,11 @@ static int fcc_dnconv(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf *snap,
         for (int k = 0; k < nh; k++) hist[k] = ring->d[p->ring_off + c * nh + k];
         const float *wb = w->d + p->w_off + c * p->CK; float wl = wb[p->CK - 1];
         for (int s = 0; s < p->S; s++) {
-            float cur = in->d[p->in_off + s * p->in_row + c], acc;
-            if (p->order == 0) { acc = 0.f; for (int k = 0; k < nh; k++) acc += wb[k] * hist[k]; acc += wl * cur; }
+            const float *r = in->d + p->in_off + s * p->in_row;   /* order 2 (LFM3): B | C | x */
+            float cur = p->order == 2 ? r[c] * r[c + 2 * p->CD] : r[c], acc;
+            if (p->order != 1) { acc = 0.f; for (int k = 0; k < nh; k++) acc += wb[k] * hist[k]; acc += wl * cur; }
             else { acc = wl * cur; for (int k = 0; k < nh; k++) acc += wb[k] * hist[k]; }
-            out->d[p->out_off + s * p->out_row + c] = acc / (1.f + expf(-acc));
+            out->d[p->out_off + s * p->out_row + c] = p->order == 2 ? r[c + p->CD] * acc : acc / (1.f + expf(-acc));
             for (int k = 0; k + 1 < nh; k++) hist[k] = hist[k + 1];
             if (nh > 0) hist[nh - 1] = cur;
             if (s == p->snap_row) for (int k = 0; k < nh; k++) snap->d[p->snap_off + c * nh + k] = hist[k];
@@ -486,6 +487,7 @@ static int fcc_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *c, CcBuf *e, const CcEw *
             Y[p->y_off + i] += A[p->a_off + r * p->C + k] * B[p->b_off + r * p->D + d]; }
         else if (p->op == 7) Y[p->y_off + i] = A[p->a_off + i] * p->fc;
         else if (p->op == 8) Y[p->y_off + i] = A[p->a_off + i] + E[p->e_off + i % p->D] * B[p->b_off + i];
+        else if (p->op == 12) Y[p->y_off + i] = A[p->a_off + i] * fcc_sig(B[p->b_off + i / p->D]);
         else return 0;
     }
     return 1;

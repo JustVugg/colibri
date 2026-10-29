@@ -223,6 +223,19 @@ jobs:
           # this one is shorter and wider apart
           python tools/make_muse_tiny.py --out /tmp/muse_Q8_0 --emit-ref /tmp/muse_Q8_0/ref.json --experts Q8_0 --max-new 8 --min-gap 0.2
           COLI_CUDA=0 COLI_VULKAN=0 SNAP=/tmp/muse_Q8_0/model.gguf ./qwen36 16 8 /tmp/muse_Q8_0/ref.json
+      # LFM3's layers (short gated convolutions beside attention with a gate per head, the
+      # full layers' partial rotation, every branch normalised) against
+      # tools/make_lfm3_tiny.py's float32 reference, F32 matrices and Q8_0 ones.
+      - name: Run the LFM3 tiny oracles
+        run: |
+          cd c
+          python tools/make_lfm3_tiny.py --out /tmp/lfm3_F32 --emit-ref /tmp/lfm3_F32/ref.json
+          COLI_CUDA=0 COLI_VULKAN=0 SNAP=/tmp/lfm3_F32/model.gguf ./qwen36 16 8 /tmp/lfm3_F32/ref.json
+          COLI_CUDA=0 COLI_VULKAN=0 Q36_KV=f16 COLI_LOOKUP=0 SNAP=/tmp/lfm3_F32/model.gguf ./qwen36 16 8 /tmp/lfm3_F32/ref.json
+          COLI_CUDA=0 COLI_VULKAN=0 Q36_KV_RING_SPARE=9 SNAP=/tmp/lfm3_F32/model.gguf ./qwen36 16 8 /tmp/lfm3_F32/ref.json 2> ring.log
+          grep -q 'sliding-window layers keep a ring of 14 rows' ring.log || { cat ring.log; exit 1; }
+          python tools/make_lfm3_tiny.py --out /tmp/lfm3_Q8_0 --emit-ref /tmp/lfm3_Q8_0/ref.json --dense Q8_0 --max-new 8 --min-gap 0.2
+          COLI_CUDA=0 COLI_VULKAN=0 SNAP=/tmp/lfm3_Q8_0/model.gguf ./qwen36 16 8 /tmp/lfm3_Q8_0/ref.json
 
   macos:
     # clang; libomp for the threaded path (Makefile falls back to

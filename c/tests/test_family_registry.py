@@ -1685,7 +1685,7 @@ class DisplayVariantTest(unittest.TestCase):
         self.assertEqual([v["display_name"] for v in meta["display_variants"]],
                          ["Qwen3.6-35B-A3B", "Qwen3.8-2.4T-A95B", "Qwen3.8-27B",
                           "Qwen3-Coder-30B-A3B", "Qwen3-Coder-REAP-25B-A3B", "Flint",
-                          "Muse-Spark-Open-816B-A42B"])
+                          "Muse-Spark-Open-816B-A42B", "LFM3-VL-2B"])
         self.assertEqual(meta["display_variants"][3]["geometry"],
                          {"num_hidden_layers": 48, "num_experts": 128, "hidden_size": 2048})
         self.assertEqual(meta["display_variants"][2]["geometry"],

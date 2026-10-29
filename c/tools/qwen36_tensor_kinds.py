@@ -55,6 +55,20 @@ LAYER_KINDS = frozenset((
     # routed experts, fused layout (real checkpoints): one tensor per layer
     "mlp.experts.gate_up_proj",
     "mlp.experts.down_proj",
+    # LFM3 (LiquidAI/LFM3-VL): the norms before and after each branch, the MLP, the short
+    # conv layers and the attention's gate per head (the converter renames the first two
+    # norms and the MLP to the names above)
+    "operator_norm.weight",
+    "post_operator_norm.weight",
+    "ffn_norm.weight",
+    "post_ffn_norm.weight",
+    "feed_forward.w1.weight",
+    "feed_forward.w2.weight",
+    "feed_forward.w3.weight",
+    "conv.in_proj.weight",
+    "conv.conv.weight",
+    "conv.out_proj.weight",
+    "self_attn.gate_proj.weight",
 ))
 
 # routed experts, per-expert layout (transformers save_pretrained on the
@@ -62,10 +76,15 @@ LAYER_KINDS = frozenset((
 _EXPERT_SEPARATE = re.compile(r"^mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
 
 GLOBAL_KINDS = frozenset(("embed_tokens.weight", "norm.weight", "lm_head.weight"))
+# LFM3's final norm, under its own name (the converter writes it as norm.weight)
+LFM3_GLOBAL_KINDS = frozenset(("embedding_norm.weight",))
 
 # Whole subtrees the engine does not implement. Skipped deliberately,
 # counted, and reported -- never silently.
-SKIP_PREFIXES = ()
+SKIP_PREFIXES = (
+    ("model.vision_tower.", "lfm3_vision", "LFM3's vision tower, which the engine does not run yet: a text-only container"),
+    ("model.multi_modal_projector.", "lfm3_projector", "LFM3's image projector, with its tower"),
+)
 
 # The vision tower, converted since #1757: the same ViT in Qwen3.5/3.6/3.8, run by
 # the engine through qwen38_vision.h. Placed as ("vision", <name after visual.>).
@@ -119,7 +138,7 @@ def classify(name, prefix):
         return ("global", "lm_head.weight")
     if name.startswith(prefix):
         rest = name[len(prefix):]
-        if rest in GLOBAL_KINDS:
+        if rest in GLOBAL_KINDS or rest in LFM3_GLOBAL_KINDS:
             return ("global", rest)
         m = _LAYER.match(rest)
         if m:
