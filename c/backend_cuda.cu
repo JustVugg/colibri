@@ -3667,7 +3667,7 @@ template<int BM, int BN> struct HcmTile {   /* 40, 64 and 80 KB of shared memory
     static constexpr int WR = BM / 64, WC = 8 / WR, WN = BN / WC, NJ = WN / 8, NW = BN / 128, NX = BM / 64;
     static constexpr int XS = BM == 128 && BN == 128 ? 3 : 4;                    /* the inputs' stages */
     static constexpr int XB = BM * HCM_BK * 2, WB = BN * HCM_BK * 2, SMEM = XS * XB + 2 * WB;
-    static constexpr int MINB = BM == 128 && BN == 128 ? 2 : 1;
+    static constexpr int MINB = (BM == 128 && BN == 128) || BM == 64 ? 2 : 1;
 };
 template<int T, int BM, int BN>
 __global__ static void __launch_bounds__(256, (HcmTile<BM, BN>::MINB)) hcm_dense_k(float *__restrict__ y, const __half *__restrict__ xh,
@@ -3817,19 +3817,19 @@ static int hcm_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float
         e = getenv("COLI_CUDA_HCM_SPLIT"); fsplit = e ? atoi(e) : 0;    /* this split always */
     }
     int tt = hcm_type(t->fmt, t->I);
-    if (!on || !tt || ctx->compute_major < 8 || S <= 64) return 0;
+    if (!on || !tt || ctx->compute_major < 8 || S <= BD_GEMV_MAX_S) return 0;
     const int I = t->I, O = t->O;
     /* the tile: COLI_CUDA_HCM_TILE 1 (128 x 128), 2 (128 x 256), 3 (256 x 128). Past 128 rows 256 x
      * 128: on an RTX PRO 4000 (70 W, its clock down to 1.4 GHz under these products) a 2048 x 7680
      * Q4_K at 512 rows 71 TFLOP/s against 61 for 128 x 128 and 67 for 128 x 256, Q6_K 61 against 44:
      * each weight decoded half as often. Its K split in two while that still makes one wave
      * (7680 x 2048: 229 us against 250; three splits, past a wave, 283) */
-    int tile = ftile >= 1 && ftile <= 3 ? ftile : S > 128 ? 3 : 1;
+    int tile = ftile >= 1 && ftile <= 4 ? ftile : S <= 64 ? 4 : S > 128 ? 3 : 1;
     if (tile > 1 && ctx->smem_optin < (size_t)(tile == 2 ? HcmTile<128, 256>::SMEM : HcmTile<256, 128>::SMEM)) tile = 1;
-    const int BMt = tile == 3 ? 256 : 128, BNt = tile == 2 ? 256 : 128;
+    const int BMt = tile == 3 ? 256 : tile == 4 ? 64 : 128, BNt = tile == 2 ? 256 : 128;
     /* fewer blocks than the multiprocessors' slots: K split up to a wave, 512 inputs a split at
      * least (a 2048 x 40 heads' gate was one block down 64 steps, 44 us whatever the rows) */
-    const long long blocks = (long long)((O + BNt - 1) / BNt) * ((S + BMt - 1) / BMt), slots = (long long)ctx->sms * (tile == 1 ? 2 : 1);
+    const long long blocks = (long long)((O + BNt - 1) / BNt) * ((S + BMt - 1) / BMt), slots = (long long)ctx->sms * (tile == 1 || tile == 4 ? 2 : 1);
     int ns = 1;
     if (fsplit > 0) ns = fsplit;
     else if (blocks < slots) {
@@ -3855,7 +3855,7 @@ static int hcm_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float
         case 12: hcm_launch<12, BM_, BN_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc); break; \
         case 13: hcm_launch<13, BM_, BN_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc); break; \
         default: hcm_launch<14, BM_, BN_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc); break; } } while (0)
-    if (tile == 3) HCM_GO(256, 128); else if (tile == 2) HCM_GO(128, 256); else HCM_GO(128, 128);
+    if (tile == 3) HCM_GO(256, 128); else if (tile == 2) HCM_GO(128, 256); else if (tile == 4) HCM_GO(64, 128); else HCM_GO(128, 128);
     #undef HCM_GO
     if (ns > 1) {
         long long ny = (long long)S * O;
