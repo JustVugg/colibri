@@ -127,9 +127,14 @@ static int q38cc_layer_major(void) {
     if (on < 0) { const char *e = getenv("COLI_CUDA_CHAIN_LAYERWISE"); on = !(e && *e == '0'); }
     return on;
 }
-/* a prompt run layer by layer goes in segments of this many chunks: every row's streams of
- * a segment on the device (hyper_all) stay bounded whatever the prompt's length */
-#define Q38CC_LM_CHUNKS 4
+/* a prompt run layer by layer goes in segments of this many rows (whole chunks, at least one):
+ * a segment's streams on the device (hyper_all) stay bounded whatever the prompt's length.
+ * COLI_CUDA_CHAIN_LAYERWISE_ROWS sets it (tests: two segments of a short prompt) */
+static int q38cc_lm_rows(void) {
+    static int r = -1;
+    if (r < 0) { const char *e = getenv("COLI_CUDA_CHAIN_LAYERWISE_ROWS"); r = e && atoi(e) > 0 ? atoi(e) : 8192; }
+    return r;
+}
 static void q38cc_fatal(const char *what) {
     fprintf(stderr, "[chain] qwen38: %s -- stopping (COLI_CUDA_CHAIN=0 keeps the state on the CPU)\n", what);
     exit(1);
@@ -268,7 +273,7 @@ static size_t q38cc_reserve_bytes(Model *m) {
         b += (size_t)Q38_SPEC_SNAPS * (L - n_attn) *
              ((size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim + (size_t)c->dn_conv_dim * (c->dn_convk - 1)) * F;
         if (E > 0) b += (cc_moe_hid_floats((int)R, (int)K, (int)H, c->inter, (int)E) + R * H + 2 * (size_t)L * R * K) * F;
-        if (q38cc_layer_major()) b += (size_t)Q38CC_LM_CHUNKS * R * W * F;
+        if (q38cc_layer_major()) b += (size_t)(q38cc_lm_rows() > (int)R ? q38cc_lm_rows() : (int)R) * W * F;
     }
     for (int i = 0; i < L; i++) {   /* the matrices the trunk's table does not offer: the chain's own copies */
         Q38Weight *w[Q38CC_MATS]; const char *nm[Q38CC_MATS]; int n = q38cc_mats(m, i, w, nm);
@@ -1553,7 +1558,7 @@ static int q38cc_forward_lm(Model *m, Q38CChain *ch, const int *ids, int S, int 
     if (!q38cc_dm_begin(ch, m, rows)) return cc_lost() ? -1 : 0;
     if (q38cc_dm_tab(ch, rows) != ch->dm_tabb) return 0;   /* nothing stages: the chunks read it either way */
     for (int i = 0; i < L; i++) if (ch->dm_part[i]) return 0;   /* a hybrid layer: the chunks' host steps */
-    const int SEG = Q38CC_LM_CHUNKS * rows, seg = S < SEG ? S : SEG;
+    const int SEG = (q38cc_lm_rows() / rows > 0 ? q38cc_lm_rows() / rows : 1) * rows, seg = S < SEG ? S : SEG;
     if (!cc_reserve(&ch->hyper_all, (size_t)seg * W * 4, CC_DEV)) return 0;
     float *cs_all = half ? malloc((size_t)S * half * 2 * sizeof(float)) : NULL;   /* every row's angles, once */
     if (half && !cs_all) return 0;

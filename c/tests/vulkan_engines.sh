@@ -1997,8 +1997,8 @@ family_qwen_chain() {
   cp vk.f32 lw.f32
   chain_gate qwen38 "chain qwen38 the same prompt chunk by chunk" 1 $V38LW COLI_VK_CHAIN_LAYERWISE=0 -- 4 8 qwen38_tiny/ref.json
   cmp -s lw.f32 vk.f32 || fail "chain qwen38 a prompt layer by layer: other logits than chunk by chunk"
-  # one row a chunk: the 5-token prompt in two segments (Q38C_LM_CHUNKS chunks, then one), the same logits again
-  V38LW1="OMP_NUM_THREADS=2 COLI_VK_TIER_HOST=1 COLI_VK_TIER_GB=0.00005 COLI_VK_CHAIN_ROWS=1 SNAP=qwen38_tiny"
+  # one row a chunk, four a segment: the 5-token prompt in two segments, the same logits again
+  V38LW1="OMP_NUM_THREADS=2 COLI_VK_TIER_HOST=1 COLI_VK_TIER_GB=0.00005 COLI_VK_CHAIN_ROWS=1 COLI_VK_CHAIN_LAYERWISE_ROWS=4 SNAP=qwen38_tiny"
   chain_gate qwen38 "chain qwen38 a prompt layer by layer in two segments" 1 $V38LW1 COLI_VK_CHAIN_LAYERWISE=1 -- 4 8 qwen38_tiny/ref.json
   grep -q "prompts layer by layer" vk.log || { cat vk.log; fail "chain qwen38 a prompt layer by layer in two segments: it ran chunk by chunk"; }
   cp vk.f32 lw.f32

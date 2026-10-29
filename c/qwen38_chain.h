@@ -175,9 +175,14 @@ static int q38c_layer_major(void) {
     if (on < 0) { const char *e = getenv("COLI_VK_CHAIN_LAYERWISE"); on = e && *e == '0' ? 0 : e && *e == '1' ? 1 : 2; }
     return on;
 }
-/* a prompt run layer by layer goes in segments of this many chunks: a segment's streams on
- * the device (hyper_all) stay bounded whatever the prompt's length */
-#define Q38C_LM_CHUNKS 4
+/* a prompt run layer by layer goes in segments of this many rows (whole chunks, at least one):
+ * a segment's streams on the device (hyper_all) stay bounded whatever the prompt's length.
+ * COLI_VK_CHAIN_LAYERWISE_ROWS sets it (tests: two segments of a short prompt) */
+static int q38c_lm_rows(void) {
+    static int r = -1;
+    if (r < 0) { const char *e = getenv("COLI_VK_CHAIN_LAYERWISE_ROWS"); r = e && atoi(e) > 0 ? atoi(e) : 8192; }
+    return r;
+}
 static int q38c_chunk_rows(Q38Chain *ch, Model *m) {
     int keep = ch->rows;
     ch->rows = 1; g_q38c_count = 0; q38c_bufs(ch, m, 1); long long b1 = g_q38c_count;
@@ -192,7 +197,6 @@ static int q38c_chunk_rows(Q38Chain *ch, Model *m) {
                       + sizeof(Q38RouteAssignment) + 4 * sizeof(int) + sizeof(uint8_t) + sizeof(float *);
     row += (size_t)c->topk * assignment
          + ((size_t)c->experts + 3 * (size_t)c->shared_inter + c->hidden + 1) * sizeof(float);
-    if (q38c_layer_major()) row += (size_t)Q38C_LM_CHUNKS * c->hc_width * sizeof(float);   /* a segment's streams (q38c_forward_lm) */
     return vkc_chunk_rows(q38c_name(ch), row);
 }
 /* What the chain allocates at its first forward, after the tier has filled the device:
@@ -1218,7 +1222,8 @@ static int q38c_forward_lm(Model *m, Q38Chain *ch, const int *ids, int S, int po
     if (!vkc_begin() || !vkc_dmoe_upload(&ch->dm)) return -1;
     if (q38c_layer_major() == 2 && !vkc_dmoe_staging(&ch->dm)) return 0;
     for (int i = lo; i < hi; i++) if (!vkc_dmoe_on(&ch->dm, i)) return 0;
-    if (!q38c_res(&ch->hyper_all, (size_t)(S < Q38C_LM_CHUNKS * rows ? S : Q38C_LM_CHUNKS * rows) * W, VKC_DEV)) return 0;
+    const int seg = (q38c_lm_rows() / rows > 0 ? q38c_lm_rows() / rows : 1) * rows;
+    if (!q38c_res(&ch->hyper_all, (size_t)(S < seg ? S : seg) * W, VKC_DEV)) return 0;   /* no room: the chunks */
     float *cs_all = half ? malloc((size_t)S * half * 2 * sizeof(float)) : NULL;   /* every row's angles, once */
     if (half && !cs_all) return 0;
     for (int r = 0; half && r < S; r++) for (int j = 0; j < half; j++) {
@@ -1237,7 +1242,7 @@ static int q38c_lm_layers(Model *m, Q38Chain *ch, const int *ids, int S, int pos
                           const float *hyper_h, int rows, const float *cs_all) {
     Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, lo = ch->lo, hi = lo + ch->nl, V = c->vocab, E = c->experts;
     int half = c->rotary_dim / 2;
-    const int SEG = Q38C_LM_CHUNKS * rows;
+    const int SEG = (q38c_lm_rows() / rows > 0 ? q38c_lm_rows() / rows : 1) * rows;
     for (int g0 = 0; g0 < S; g0 += SEG) {   /* a segment: its rows' streams up */
         int gn = S - g0 < SEG ? S - g0 : SEG;
         if ((g0 && (!vkc_begin() || !vkc_dmoe_upload(&ch->dm))) || !q38c_push_state(ch, m, pos_base + g0, gn) ||
