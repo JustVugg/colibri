@@ -120,6 +120,10 @@ typedef struct VkcDmoe_ {
     int stg_off, stg_on, stg_big, stg_said; VkcBuf *stg, *tabs, *fr; uint64_t stg_addr; size_t stg_cap, stg_peak;
     uint32_t *tabsh, *frh; int *fro, *frn; uint32_t *frmax; uint8_t *full, *hostm; int nfr;
     unsigned long long stg_steps; double stg_bytes;
+    /* the layer whose host pool experts stg holds (-1 none): a prompt run layer by layer
+     * stages each layer once for all its chunks (qwen38_chain.h, q38c_forward_lm); a table
+     * read again or the kept experts' fill drop it */
+    int stg_layer; unsigned long long stg_reused;
     /* between prompt chunks: stg holds the host pool's hottest experts of block types
      * (vkc_dmoe_keep): koff [L][E] their places in it (-1 none), frk the copies, nkr of
      * them, kmax the widest, keep_valid whether stg has them, keep_fetch: copy them */
@@ -326,6 +330,7 @@ static int vkc_dmoe_read(VkcDmoe *d) {
         }
     }
     d->stg_on = d->big && d->big_step && vkc_dmoe_stage_read(d);
+    d->stg_layer = -1;   /* the staged regions may have moved */
     if (!d->big_step) vkc_dmoe_keep(d);
     d->stg_big = d->big_step;
     d->epoch = vkt_epoch(); d->read = 1; d->dirty = 1;
@@ -553,6 +558,7 @@ static int vkc_dmoe_prepare(VkcDmoe *d, int lo, int L, int E, int K, int D, int 
     if (!vkc_dmoe_wanted() || d->off || (big && !d->big) || L < 1 || vkc_device_now() != 0 || !vkt_ready() ||
         !vkc_moe_ready() || !vkc_route_ready() || K < 1 || K > VKC_ROUTE_KMAX || E < K || E > VKC_ROUTE_EMAX) return 0;
     if (d->on && (d->lo != lo || d->L != L || d->E != E || d->K != K)) { d->off = 1; return 0; }
+    if (!d->on) d->stg_layer = -1;   /* before the first read: no layer staged */
     d->lo = lo; d->L = L; d->E = E; d->K = K;
     if (d->D != D || d->I != I) d->read = 0;   /* the staging's sizes follow D and I */
     d->D = D; d->I = I;
@@ -621,7 +627,7 @@ static int vkc_dmoe_upload(VkcDmoe *d) {
     if (d->keep_fetch && d->nkr) {
         if (!vkc_write(d->fr, 0, d->frk, (size_t)d->nkr * 4 * sizeof(uint32_t)) || !vkc_barrier() ||
             !vkc_fetch(d->fr, 0, d->nkr, d->kmax, d->stg) || !vkc_barrier()) return 0;
-        d->keep_fills++;
+        d->keep_fills++; d->stg_layer = -1;
     }
     d->keep_fetch = 0;
     d->dirty = 0;
@@ -629,6 +635,8 @@ static int vkc_dmoe_upload(VkcDmoe *d) {
 }
 /* Whether layer `layer` runs its experts in the frame: all of them on the device, in the
  * table the frame has (the tier's residents unchanged since it was read). */
+/* 1 when a prompt step's host pool experts stage into VRAM (the tables read for big steps) */
+static int vkc_dmoe_staging(const VkcDmoe *d) { return d->on && !d->off && d->stg_on; }
 static int vkc_dmoe_on(const VkcDmoe *d, int layer) {
     return d->on && !d->off && d->epoch == vkt_epoch() && layer >= d->lo && layer < d->lo + d->L && d->on[layer - d->lo] &&
            !(d->big_step && d->rows_off && d->rows_off[layer - d->lo]);
@@ -653,14 +661,16 @@ static int vkc_dmoe_layer(VkcDmoe *d, int layer, int n, VkcBuf *lg, VkcBuf *bias
          * there: Qwen3.8 Next IQ2_XS on an RTX PRO 4000 (19 GiB of experts in the host pool), a
          * 507-token prompt, 115-116 tok/s against 93-94 on the matrix units; without the pool the
          * two were even (104-114 against 109-120). */
-        int stg = d->stg_on && d->frn[i] > 0;
+        int stg = d->stg_on && d->frn[i] > 0, have = stg && d->stg_layer == layer;
         m.floats = vkt_host_pool_on() && !(d->stg_on && d->full[i]);   /* staged: VRAM, the matrix units' GEMMs */
         if (!vkc_route(lg, bias, d->rid, d->rwt, &r)) return 0;
         /* the layer's host pool experts into stg: after the layer before is done reading it,
          * before this one's GEMMs read it (both by address, so the barriers are ours) */
-        if (stg && !(vkc_barrier() && vkc_fetch(d->fr, d->fro[i], d->frn[i], d->frmax[i], d->stg) && vkc_barrier())) return 0;
+        if (stg && !have && !(vkc_barrier() && vkc_fetch(d->fr, d->fro[i], d->frn[i], d->frmax[i], d->stg) && vkc_barrier())) return 0;
         if (!vkc_moe_rows(x, d->rid, d->rwt, d->stg_on ? d->tabs : d->tab, &d->rows, d->y, &m)) return 0;
-        if (stg) { d->keep_valid = 0; d->stg_steps++; for (int k = 0; k < d->frn[i]; k++) d->stg_bytes += 4.0 * d->frh[4 * (d->fro[i] + k) + 3]; }
+        if (stg && have) d->stg_reused++;
+        else if (stg) { d->keep_valid = 0; d->stg_steps++; for (int k = 0; k < d->frn[i]; k++) d->stg_bytes += 4.0 * d->frh[4 * (d->fro[i] + k) + 3]; }
+        d->stg_layer = stg ? layer : -1;
         d->steps++; d->big_steps++;
         return 1;
     }
@@ -710,6 +720,9 @@ static void vkc_dmoe_hyb_report(const char *engine, const VkcDmoe *d) {
         fprintf(stderr, "[VK] %s chain: %llu prompt layer steps staged the host pool's experts (%.2f GiB copied over PCIe, "
                         "%.0f MiB of staging, the tier's room %.0f MiB)\n",
                 engine, d->stg_steps, d->stg_bytes / 1073741824.0, d->stg_peak / 1048576.0, vkt_stage_room() / 1048576.0);
+    if (d->stg_reused)
+        fprintf(stderr, "[VK] %s chain: %llu prompt layer steps read the experts their layer had staged already\n",
+                engine, d->stg_reused);
     if (d->keep_fills)
         fprintf(stderr, "[VK] %s chain: between prompt chunks the staging held the host pool's hottest %d experts (%llu fills)\n",
                 engine, d->nkeep, d->keep_fills);
