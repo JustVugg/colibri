@@ -282,6 +282,105 @@ def write_gguf(path, c, w, dense_type="F32"):
     Path(path).write_bytes(_gguf_bytes(kv, tensors))
 
 
+# the tensors the release ships in FP8 (128 x 128 blocks, qscale_weight multiplied); the rest
+# (kv_a, kv_b, the indexer's wk and weights_proj, the embeddings, the head) as the release
+# keeps them, here in float32
+FP8_KINDS = ("attn_q.weight", "attn_output.weight", "indexer.attn_q_b.weight", "ffn_gate.weight", "ffn_up.weight",
+             "ffn_down.weight", "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight",
+             "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight")
+
+
+def fp8_roundtrip(t):
+    """t as its FP8 e4m3 codes times a scale per 128 x 128 block (amax / 448): (codes, scales, values)"""
+    O, I = t.shape[-2], t.shape[-1]
+    bo, bi = (O + 127) // 128, (I + 127) // 128
+    flat = t.reshape(-1, O, I)
+    codes, scales, vals = [], [], []
+    for m in flat:
+        sc = torch.zeros(bo, bi)
+        for a in range(bo):
+            for b in range(bi):
+                blk = m[a * 128:(a + 1) * 128, b * 128:(b + 1) * 128]
+                sc[a, b] = max(float(blk.abs().max()), 1e-12) / 448.0
+        S = sc.repeat_interleave(128, 0).repeat_interleave(128, 1)[:O, :I]
+        q = (m / S).to(torch.float8_e4m3fn)
+        codes.append(q); scales.append(sc); vals.append(q.to(torch.float32) * S)
+    shape = t.shape
+    return torch.stack(codes).reshape(shape), torch.stack(scales).reshape(*shape[:-2], bo, bi), torch.stack(vals).reshape(shape)
+
+
+def as_fp8(w):
+    """The weights the FP8 release would give back: those tensors through their FP8 round trip"""
+    out = dict(w)
+    for name, t in w.items():
+        if any(name.endswith(k) for k in FP8_KINDS):
+            out[name] = fp8_roundtrip(t)[2]
+    return out
+
+
+def write_fp8_checkpoint(path, c, w):
+    """The model as Mistral's FP8 release has it: consolidated.safetensors in Mistral's names
+    (layers.N.attention.wq.weight + .qscale_weight, experts.E.w1/w2/w3, ...), config.json with a
+    text_config. tools/convert_fp8_to_int4.py reads it into a container."""
+    from safetensors.torch import save_file
+    path = Path(path); path.mkdir(parents=True, exist_ok=True)
+    t, n = {}, len(c["rope_pattern"])
+
+    def put(name, tensor, fp8=False):
+        if fp8:
+            q, sc, _ = fp8_roundtrip(tensor)
+            t[name] = q.contiguous()
+            t[name[:-len("weight")] + "qscale_weight"] = sc.contiguous().float()
+        else:
+            t[name] = tensor.contiguous().float()
+    put("tok_embeddings.weight", w["token_embd.weight"]); put("norm.weight", w["output_norm.weight"])
+    put("output.weight", w["output.weight"]); put("lerope.alpha", w["alpha"])
+    for i in range(n):
+        g, m = f"blk.{i}.", f"layers.{i}."
+        put(m + "attention_norm.weight", w[g + "attn_norm.weight"]); put(m + "ffn_norm.weight", w[g + "ffn_norm.weight"])
+        put(m + "attention.wq.weight", w[g + "attn_q.weight"], True)
+        if g + "attn_kv_a_mqa.weight" in w:
+            put(m + "attention.wkv_a_with_mqa.weight", w[g + "attn_kv_a_mqa.weight"])
+            put(m + "attention.kv_a_norm.weight", w[g + "attn_kv_a_norm.weight"])
+        kvb = w[g + "kv_b"]
+        put(m + "attention.wkv_b.weight", kvb.reshape(-1, kvb.shape[-1]))
+        put(m + "attention.wo.weight", w[g + "attn_output.weight"], True)
+        put(m + "attention.ssmax_scaling.s", w[g + "attn_ssmax.weight"]); put(m + "attention.ssmax_scaling.b", w[g + "attn_ssmax.bias"])
+        if g + "indexer.attn_q_b.weight" in w:
+            x = m + "attention.indexer."
+            put(x + "q_input_norm.weight", w[g + "indexer.q_norm.weight"]); put(x + "q_input_norm.bias", w[g + "indexer.q_norm.bias"])
+            put(x + "wq_b.weight", w[g + "indexer.attn_q_b.weight"], True)
+            put(x + "wk.weight", w[g + "indexer.attn_k.weight"])
+            put(x + "k_norm.weight", w[g + "indexer.k_norm.weight"]); put(x + "k_norm.bias", w[g + "indexer.k_norm.bias"])
+            put(x + "weights_proj.weight", w[g + "indexer.proj.weight"])
+            put(x + "ssmax_scaling.s", w[g + "indexer.ssmax.weight"]); put(x + "ssmax_scaling.b", w[g + "indexer.ssmax.bias"])
+        if g + "ffn_gate.weight" in w:
+            for ours, theirs in (("ffn_gate", "w1"), ("ffn_down", "w2"), ("ffn_up", "w3")):
+                put(m + f"feed_forward.{theirs}.weight", w[g + ours + ".weight"], True)
+        else:
+            put(m + "gate.weight", w[g + "ffn_gate_inp.weight"])
+            for ours, theirs in (("ffn_gate", "w1"), ("ffn_down", "w2"), ("ffn_up", "w3")):
+                for e in range(c["experts"]):
+                    put(m + f"experts.{e}.{theirs}.weight", w[g + ours + "_exps.weight"][e], True)
+                put(m + f"shared_experts.{theirs}.weight", w[g + ours + "_shexp.weight"], True)
+    save_file(t, str(path / "consolidated-00001-of-00001.safetensors"))
+    text = {"model_type": "mistral_large4_text", "num_hidden_layers": n, "vocab_size": c["vocab"], "hidden_size": c["hidden"],
+            "intermediate_size": c["dense_inter"], "moe_intermediate_size": c["moe_inter"], "num_attention_heads": c["heads"],
+            "num_key_value_heads": c["heads"], "n_routed_experts": c["experts"], "num_experts_per_tok": c["topk"],
+            "n_shared_experts": c["shared"], "first_k_dense_replace": c["dense_layers"], "kv_lora_rank": c["kv_lora"],
+            "qk_nope_head_dim": c["nope"], "qk_rope_head_dim": c["rope"], "v_head_dim": c["v_head"], "head_dim": c["rope"],
+            "index_topk": c["index_topk"], "index_n_heads": c["index_heads"], "index_head_dim": c["index_head_dim"],
+            "indexer_types": ["full" if f else "shared" for f in c["indexer_full"]],
+            "no_rope_layers": [1 if r else 0 for r in c["rope_pattern"]], "kv_source_layers": list(c["kv_source"]),
+            "final_logit_softcapping": c["softcap"], "rms_norm_eps": c["eps"], "routed_scaling_factor": c["routed_scale"],
+            "rope_parameters": {"rope_type": "yarn", "rope_theta": c["theta"], "factor": c["yarn_factor"],
+                                "original_max_position_embeddings": c["yarn_orig"], "beta_fast": c["beta_fast"],
+                                "beta_slow": c["beta_slow"], "attention_factor": 1.0},
+            "bos_token_id": c["bos"], "eos_token_id": c["eos"], "n_group": 1, "topk_group": 1}
+    (path / "config.json").write_text(json.dumps({"model_type": "mistral_large4", "text_config": text,
+                                                  "tie_word_embeddings": False}, indent=1))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--out", required=True, help="a directory: model.gguf goes here")
@@ -289,6 +388,9 @@ def main():
     ap.add_argument("--seed", type=int, default=20261030)
     ap.add_argument("--max-new", type=int, default=16)
     ap.add_argument("--prompt-ids", default="1,7,12,30,44,5,9,61,18,22,3,40")
+    ap.add_argument("--fp8-checkpoint", default=None,
+                    help="also write the model as Mistral's FP8 release (consolidated safetensors in its names, "
+                         "config.json) to this directory; the reference is then the FP8 weights'")
     ap.add_argument("--override", default=None,
                     help="JSON object over the tiny config's keys (a feature off, to find where two forwards part)")
     ap.add_argument("--min-gap", type=float, default=0.1,
@@ -300,6 +402,13 @@ def main():
     prompt = [int(t) for t in args.prompt_ids.split(",") if t.strip()]
     for seed in range(args.seed, args.seed + 200):
         w = random_weights(c, seed)
+        if args.fp8_checkpoint:   # the reference reads what the FP8 release gives back
+            w = as_fp8(w)
+            for i in range(len(c["rope_pattern"])):   # kv_b's split halves stay the FP8-free kv_b's
+                p = f"blk.{i}."
+                nope = c["nope"] + (0 if c["rope_pattern"][i] else c["rope"])
+                w[p + "attn_k_b.weight"] = w[p + "kv_b"][:, :nope, :].transpose(1, 2).contiguous()
+                w[p + "attn_v_b.weight"] = w[p + "kv_b"][:, nope:, :].contiguous()
         if not args.emit_ref:
             break
         with torch.no_grad():
@@ -312,6 +421,9 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     write_gguf(out / "model.gguf", c, w)
     print(f"tiny Mistral-Large-4 -> {out / 'model.gguf'}")
+    if args.fp8_checkpoint:
+        write_fp8_checkpoint(args.fp8_checkpoint, c, w)
+        print(f"tiny Mistral-Large-4, FP8 release layout -> {args.fp8_checkpoint}")
     if args.emit_ref:
         Path(args.emit_ref).parent.mkdir(parents=True, exist_ok=True)
         # teacher forcing: one forward over the whole sequence, the argmax at every position

@@ -1756,6 +1756,14 @@ jobs:
           SNAP=/tmp/ml4/coli REF=/tmp/ml4/ref.json COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 8 16 16
           SNAP=/tmp/ml4/coli REF=/tmp/ml4/ref.json TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 8 16 16
           KV16=1 SNAP=/tmp/ml4/coli REF=/tmp/ml4/ref.json TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 8 16 16
+          # Mistral's FP8 release (its own names, qscale_weight per 128 x 128 block) through
+          # convert_fp8_to_int4.py at 8 bits: teacher forcing within the oracle's allowance (int8
+          # per row is coarser than the reference's float32; the attention dense here, where the
+          # tiny model's tied index scores would turn that noise into another selection)
+          python3 tools/make_mistral_large4_tiny.py --out /tmp/ml4f --emit-ref /tmp/ml4f/ref.json \
+            --fp8-checkpoint /tmp/ml4f/fp8 --min-gap 0.15 --max-new 8 --override '{"index_topk": 64}'
+          python3 tools/convert_fp8_to_int4.py --indir /tmp/ml4f/fp8 --outdir /tmp/ml4f/coli --ebits 8 --xbits 8 --io-bits 8 --n-layers 8
+          SNAP=/tmp/ml4f/coli REF=/tmp/ml4f/ref.json TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=2 ./colibri 8 16 16
       - name: Oracle allowance and failure regressions
         run: |
           cd c
