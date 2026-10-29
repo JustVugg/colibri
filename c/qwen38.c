@@ -1927,7 +1927,8 @@ static int q38_prompt_poll(ColiPromptBreak *b){   /* control: 1 STOP, 3 CANCEL (
     }
     return b->control!=0;
 }
-/* ids[from..np) at position from. NULL when a control stopped it (ctl->control says which). */
+/* ids[from..np) at position from. NULL when a control stopped it (ctl->control says which).
+ * ctl NULL (the multiplexed loop, which owns its command stream): one call, as before. */
 static float *q38_serve_prefill(Model *m,const int *ids,int from,int np,ColiPromptBreak *ctl){
     int chain=0;
 #ifdef COLI_VULKAN
@@ -1936,7 +1937,7 @@ static float *q38_serve_prefill(Model *m,const int *ids,int from,int np,ColiProm
 #ifdef COLI_CUDA
     chain|=g_cuda_chain!=0;
 #endif
-    if(g_echo_k>0||(m->vis_map&&m->vis_rows_n>0))return step(m,ids+from,np-from,from);
+    if(!ctl||g_echo_k>0||(m->vis_map&&m->vis_rows_n>0))return step(m,ids+from,np-from,from);
     /* a chain's segment is the one its own layer-by-layer prompt takes (q38cc_lm_rows), so it
      * does the same work as when it took the prompt in one call */
     const int seg=coli_prompt_segment_rows(chain?8192:2048);
@@ -1957,8 +1958,10 @@ static float *q38_serve_prefill(Model *m,const int *ids,int from,int np,ColiProm
     return lo;
 }
 
+/* lone: one conversation, whose prompt reads its STOP or CANCEL while it is read
+ * (q38_serve_prefill); the multiplexed loop owns its command stream and passes 0. */
 static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, float **lo_out,
-                           Q38ReqClock *clk){
+                           Q38ReqClock *clk, int lone){
     int *ids=NULL, np=0;
     encode_text_n(q->payload,(size_t)q->plen,&ids,&np); /* byte-counted prompt; qwen38 adds no BOS */
     if(g_pending_image.present){
@@ -2055,23 +2058,23 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     g_echo_pin_logit=(reuse>0&&reuse<np)
                      ? (pin_lo?pin_lo:q38_prefix_cached_logits(m)) : NULL;
     float *lo=NULL;
-    ColiPromptBreak ctl={.poll=q38_prompt_poll,.id=q->id};
+    ColiPromptBreak ctl={.poll=q38_prompt_poll,.id=q->id},*pc=lone?&ctl:NULL;
     if(reuse==np){
         const float *cached=q38_prefix_cached_logits(m);
         if(!cached){
             q38_prefix_cache_invalidate();reset_recurrent(m);m->kv_len=0;
-            lo=q38_serve_prefill(m,ids,0,np,&ctl);reuse=0;
+            lo=q38_serve_prefill(m,ids,0,np,pc);reuse=0;
         }else{
             lo=falloc(m->c.vocab);
             memcpy(lo,cached,(size_t)m->c.vocab*sizeof(float));
         }
     }else if(reuse>0){
-        lo=q38_serve_prefill(m,ids,reuse,np,&ctl);
+        lo=q38_serve_prefill(m,ids,reuse,np,pc);
     }else{
         /* A miss invalidates the snapshot before reset so no later request can
          * pair its recurrent state with the old token record. */
         q38_prefix_cache_invalidate();reset_recurrent(m);m->kv_len=0;
-        lo=q38_serve_prefill(m,ids,0,np,&ctl);
+        lo=q38_serve_prefill(m,ids,0,np,pc);
     }
     g_echo_k=0; g_echo_id=NULL; g_echo_pin_logit=NULL;   /* la lettura e finita col prefill */
     if(ctl.control){
@@ -2114,7 +2117,7 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
 
 static int serve_one(Model *m, ServeReq *q){
     int *ids=NULL, np=0; float *lo=NULL; Q38ReqClock clk;
-    if(!q38_serve_start(m,q,&ids,&np,&lo,&clk)) return 0;
+    if(!q38_serve_start(m,q,&ids,&np,&lo,&clk,1)) return 0;
     double request_started=clk.started;
     uint64_t hits_before=clk.hits, misses_before=clk.misses;
     Q38Timers timers_before=clk.timers;
@@ -2370,7 +2373,7 @@ static int q38_mux_read(Model *m,Q38MuxReq *rq,int n){
     r->q.logprobs=command.logprobs;r->q.pin=command.pin;
     coli_serve_command_dispose(&command);
     q38_mux_bind(m,r->q.slot);
-    int ok=q38_serve_start(m,&r->q,&r->ids,&r->np,&r->lo,&r->clk);
+    int ok=q38_serve_start(m,&r->q,&r->ids,&r->np,&r->lo,&r->clk,0);
     free(r->q.payload);r->q.payload=NULL;
     if(!ok)return 0;
     q38_vision_detach(m);   /* the image's rows are the prompt's: no decode row reads them */
