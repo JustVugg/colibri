@@ -3464,6 +3464,406 @@ __global__ static void __launch_bounds__(256) hcg_dense_k(float *__restrict__ y,
     const uint8_t *W[1] = {w}; const float *Sc[1] = {sc};
     hcg_tile<WF, 1>(y, O, rows, x, I, rows, M, W, Sc, gs, O, I, blockIdx.x * TCG_BN);
 }
+/* A prompt chunk's rows of a block-format tensor through tiles four times hcg_tile's: 128 rows
+ * x 128 outputs a block of 256 threads, K in steps of 64. Warp w: rows 64 (w & 1) .. + 63,
+ * outputs 32 (w >> 1) .. + 31, 4 x 2 fragments: 32 products a step where hcg_tile's 64 x 64
+ * does 8, so the weights' decoding, the inputs' rounding and the barriers weigh a quarter as
+ * much, and every decoded weight serves 128 rows instead of 64. A thread decodes and rounds
+ * two of hcg_tile's shares a step (rows t >> 2 and 64 + t >> 2, inputs 16 (t & 3) ..): the
+ * same f16 values, each output's sums in fp32 over the same 16-wide steps. */
+#define HCG2_BM 128
+#define HCG2_BN 128
+template<int WF>
+__global__ static void __launch_bounds__(256) hcg2_dense_k(float *__restrict__ y, const float *__restrict__ x, const uint8_t *__restrict__ w,
+                                                           const float *__restrict__ sc, int gs, int S, int I, int O) {
+    COLI_PDL_WAIT();
+#if HCG_BODY
+    using namespace nvcuda;
+    __shared__ __align__(32) unsigned char sm[2 * HCG2_BM * HCG_LDH * 2];
+    __shared__ int rows[HCG2_BM];
+    __half (*Xs)[HCG_LDH] = reinterpret_cast<__half (*)[HCG_LDH]>(sm);
+    __half (*Ws)[HCG_LDH] = reinterpret_cast<__half (*)[HCG_LDH]>(sm + HCG2_BM * HCG_LDH * 2);
+    const int m0 = blockIdx.y * HCG2_BM, M = S - m0 < HCG2_BM ? S - m0 : HCG2_BM, n0 = blockIdx.x * HCG2_BN;
+    if (threadIdx.x < HCG2_BM) rows[threadIdx.x] = m0 + ((int)threadIdx.x < M ? (int)threadIdx.x : 0);
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, wr = warp & 1, wc = warp >> 1, nt = n0 + (threadIdx.x >> 2);
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4][2];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 2; j++) wmma::fill_fragment(acc[i][j], 0.f);
+    HcgW<WF> rw0, rw1; float4 rx0[4], rx1[4];
+    const int M1 = M - 64;   /* the rows of the second half (<= 0: none) */
+    hcg_fetch_x(rx0, x, I, rows, M, 0); hcg_fetch_x(rx1, x, I, rows + 64, M1, 0);
+    hcg_fetch_w<WF>(rw0, w, sc, gs, 1, nt, O, 0, I, 0); hcg_fetch_w<WF>(rw1, w, sc, gs, 1, nt + 64, O, 0, I, 0);
+    hcg_store_x(Xs, rx0); hcg_store_x(Xs + 64, rx1);
+    hcg_store_w<WF>(Ws, rw0, 0); hcg_store_w<WF>(Ws + 64, rw1, 0);
+    __syncthreads();
+    for (int k0 = 0; k0 < I; k0 += HCG_BK) {
+        bool next = k0 + HCG_BK < I;   /* block-uniform */
+        if (next) {   /* in flight while the tensor cores work on this step */
+            hcg_fetch_x(rx0, x, I, rows, M, k0 + HCG_BK); hcg_fetch_x(rx1, x, I, rows + 64, M1, k0 + HCG_BK);
+            hcg_fetch_w<WF>(rw0, w, sc, gs, 1, nt, O, k0 + HCG_BK, I, 0); hcg_fetch_w<WF>(rw1, w, sc, gs, 1, nt + 64, O, k0 + HCG_BK, I, 0);
+        }
+        #pragma unroll
+        for (int kk = 0; kk < HCG_BK / 16; kk++) {
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b[2];
+            #pragma unroll
+            for (int j = 0; j < 2; j++) wmma::load_matrix_sync(b[j], &Ws[wc * 32 + j * 16][kk * 16], HCG_LDH);
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a;
+                wmma::load_matrix_sync(a, &Xs[wr * 64 + i * 16][kk * 16], HCG_LDH);
+                #pragma unroll
+                for (int j = 0; j < 2; j++) wmma::mma_sync(acc[i][j], a, b[j], acc[i][j]);
+            }
+        }
+        __syncthreads();
+        if (next) {
+            hcg_store_x(Xs, rx0); hcg_store_x(Xs + 64, rx1);
+            hcg_store_w<WF>(Ws, rw0, 0); hcg_store_w<WF>(Ws + 64, rw1, 0);
+            __syncthreads();
+        }
+    }
+    /* each fragment through the warp's own 16 x 20 floats of the staging (free after the last
+     * barrier) to its rows, inside the matrix */
+    float *P = reinterpret_cast<float *>(sm) + warp * 16 * 20;
+    const int lane = threadIdx.x & 31;
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            wmma::store_matrix_sync(P, acc[i][j], 20, wmma::mem_row_major);
+            __syncwarp();
+            for (int e = lane; e < 256; e += 32) {
+                int r = wr * 64 + i * 16 + (e >> 4), c = n0 + wc * 32 + j * 16 + (e & 15);
+                if (r < M && c < O) y[(size_t)(m0 + r) * O + c] = P[(e >> 4) * 20 + (e & 15)];
+            }
+            __syncwarp();
+        }
+#else
+    (void)y; (void)x; (void)w; (void)sc; (void)gs; (void)S; (void)I; (void)O;
+#endif
+}
+/* the types hcm_dense_k takes, I a multiple of their block; 0 elsewhere (the other tiles) */
+static int hcm_type(int fmt, int I) {
+    int tt = fmt - 100;
+    if (tt == 8) return I % 32 ? 0 : 8;
+    if (tt == 12 || tt == 13 || tt == 14) return I % 256 ? 0 : tt;
+    return 0;
+}
+/* A prompt chunk's rows of a Q8_0, Q4_K, Q5_K or Q6_K tensor through f16 mma.sync, the weights'
+ * loads apart from their decoding. hcg2_dense_k decoded a step's weights as their words came
+ * in, so a warp sat on its loads before it reached the step's products, at one block a
+ * multiprocessor (158 registers, 37 KB): an RTX PRO 4000 issued a slot in five, 39 TFLOP/s.
+ * Here the inputs go to f16 once a call (hcm_half_k, hcg_h's rounding) and into shared memory
+ * by cp.async, three or four steps deep; a thread's raw weight words for step k + 1 load while
+ * the tensor cores work on step k and turn into f16 after them (bd_dec16h's arithmetic, the
+ * same values, the same sums as hcg2's), into the stage nobody reads. K in steps of 32; a
+ * warp's 64 rows and WN outputs are 4 x WN / 8 products of 16 x 8 a k16, the fragments by
+ * ldmatrix from rows of 64 bytes whose 16-byte chunks are swizzled by row. Integer tensor
+ * cores (the inputs to int8 a block of 32, every product scaled per block after it) measured
+ * no faster on that card and ten times the error: the scales are per element there, here per
+ * weight once a tile. */
+#define HCM_BK 32
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+#define HCM_BODY 1
+#else
+#define HCM_BODY 0
+#endif
+__global__ static void hcm_half_k(const float4 *__restrict__ x, uint2 *__restrict__ xh, long long n4) {
+    COLI_PDL_WAIT();
+#if HCM_BODY
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n4) return;
+    float4 v = x[i];
+    xh[i] = make_uint2(bd_h2u(__halves2half2(hcg_h(v.x), hcg_h(v.y))), bd_h2u(__halves2half2(hcg_h(v.z), hcg_h(v.w))));
+#else
+    (void)x; (void)xh; (void)n4;
+#endif
+}
+#if HCM_BODY
+/* the byte offset of row r's 16-byte chunk c in a 128 x 32 f16 tile: the chunks of rows 2j and
+ * 2j + 1 xor j & 3, so an ldmatrix's eight rows of one chunk fall on all 32 banks */
+__device__ __forceinline__ unsigned hcm_swz(int r, int c) { return (unsigned)(r * 64 + ((c ^ ((r >> 1) & 3)) << 4)); }
+__device__ __forceinline__ void hcm_cp16(unsigned dst, const void *src, bool ok) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(dst), "l"(src), "r"(ok ? 16 : 0));
+}
+__device__ __forceinline__ void hcm_ldm4(bd_u32 (&r)[4], unsigned a) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+__device__ __forceinline__ void hcm_mma(float (&c)[4], const bd_u32 (&a)[4], bd_u32 b0, bd_u32 b1) {
+    /* not volatile: the scheduler may put the weights' decoding between the products */
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+/* a thread's raw words for 16 weights e0 .. e0 + 15 of a row: loaded here, used by hcm_dec a
+ * step later. A field at an even byte offset comes as the aligned words around it, the word
+ * past its end only when it runs into it (bd_ldu's rule: a read never leaves the row) */
+struct HcmRaw { bd_u32 r[12]; };
+__device__ __forceinline__ void hcm_ld5(const bd_u32 *__restrict__ W, bd_u32 off, bd_u32 *o) {
+    bd_u32 a = off >> 2;
+    #pragma unroll
+    for (int k = 0; k < 4; k++) o[k] = __ldg(W + a + k);
+    o[4] = (off & 2u) ? __ldg(W + a + 4) : 0u;
+}
+template<int T>
+__device__ __forceinline__ void hcm_fetch(HcmRaw &w, const bd_u32 *__restrict__ W, bd_u32 e0) {
+    if (T == 12 || T == 13) {
+        bd_u32 b = e0 >> 8, e = e0 & 255u, c = e >> 6, p = e & 31u, base = b * (T == 12 ? 144u : 176u);
+        uint4 hd = bd_w4(W, base >> 4), q = bd_w4(W, (base + (T == 12 ? 16u : 48u) + 32u * c + p) >> 4);
+        w.r[0] = hd.x; w.r[1] = hd.y; w.r[2] = hd.z; w.r[3] = hd.w; w.r[4] = q.x; w.r[5] = q.y; w.r[6] = q.z; w.r[7] = q.w;
+        if (T == 13) { uint4 h = bd_w4(W, (base + 16u + p) >> 4); w.r[8] = h.x; w.r[9] = h.y; w.r[10] = h.z; w.r[11] = h.w; }
+    } else if (T == 14) {
+        bd_u32 b = e0 >> 8, e = e0 & 255u, n = e >> 7, r = e & 127u, base = b * 210u;
+        hcm_ld5(W, base + 64u * n + (r & 63u), w.r);
+        hcm_ld5(W, base + 128u + 32u * n + (r & 31u), w.r + 5);
+        w.r[10] = __ldg(W + ((base + 192u + (e >> 4)) >> 2)); w.r[11] = __ldg(W + ((base + 208u) >> 2));
+    } else {   /* Q8_0 */
+        bd_u32 b = e0 >> 5, base = b * 34u;
+        hcm_ld5(W, base + 2u + 16u * ((e0 >> 4) & 1u), w.r);
+        w.r[5] = __ldg(W + (base >> 2));
+    }
+}
+/* hcm_fetch's words as bd_dec16h's eight half2 */
+template<int T>
+__device__ __forceinline__ void hcm_dec(const HcmRaw &w, bd_u32 e0, bd_u32 *out) {
+    if (T == 12 || T == 13) {
+        bd_u32 e = e0 & 255u, c = e >> 6, pos = e & 63u, hi = pos >= 32u, g = 2u * c + hi, sh = hi ? 4u : 0u;
+        uint4 hd = make_uint4(w.r[0], w.r[1], w.r[2], w.r[3]);
+        uint2 sm = bdi_k4sm(hd, g);
+        float d = bd_h2f(hd.x) * (float)sm.x, m = bd_h2f(hd.x >> 16) * (float)sm.y;
+        __half2 off = __float2half2_rn(1024.f), s2 = __float2half2_rn(d), m2 = __float2half2_rn(-m);
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            bd_u32 v = (w.r[4 + k] >> sh) & 0x0F0F0F0Fu;
+            if (T == 13) v |= ((w.r[8 + k] >> g) & 0x01010101u) << 4;
+            bd_codes_h(v, off, s2, m2, out + 2 * k);
+        }
+    } else if (T == 14) {
+        bd_u32 b = e0 >> 8, e = e0 & 255u, n = e >> 7, r = e & 127u, base = b * 210u;
+        bd_u32 o1 = base + 64u * n + (r & 63u), o2 = base + 128u + 32u * n + (r & 31u), os = base + 192u + (e >> 4), od = base + 208u;
+        bd_u32 ns = 4u * (r >> 6), hs = 2u * (r >> 5);
+        float d = bd_h2f(w.r[11] >> ((od & 2u) * 8u)) * (float)(int)(signed char)((w.r[10] >> ((os & 3u) * 8u)) & 0xffu);
+        __half2 off = __float2half2_rn(1056.f), s2 = __float2half2_rn(d), z2 = __float2half2_rn(0.f);
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            bd_u32 ql = __funnelshift_r(w.r[k], w.r[k + 1], (o1 & 2u) * 8u), qh = __funnelshift_r(w.r[5 + k], w.r[6 + k], (o2 & 2u) * 8u);
+            bd_codes_h(((ql >> ns) & 0x0F0F0F0Fu) | (((qh >> hs) & 0x03030303u) << 4), off, s2, z2, out + 2 * k);
+        }
+    } else {
+        bd_u32 b = e0 >> 5, base = b * 34u, o1 = base + 2u + 16u * ((e0 >> 4) & 1u);
+        __half2 off = __float2half2_rn(1152.f), s2 = __float2half2_rn(bd_h2f(w.r[5] >> ((base & 2u) * 8u))), z2 = __float2half2_rn(0.f);
+        #pragma unroll
+        for (int k = 0; k < 4; k++) bd_codes_h(__funnelshift_r(w.r[k], w.r[k + 1], (o1 & 2u) * 8u) ^ 0x80808080u, off, s2, z2, out + 2 * k);
+    }
+}
+#endif
+/* The tiles, BM x BN a block of eight warps of 64 rows x WN outputs: 128 x 128 (WN 32, two blocks
+ * a multiprocessor, 40 KB), 128 x 256 and 256 x 128 (WN 64, one, 64 and 80 KB): a taller tile
+ * decodes each weight fewer times (S / BM), a wider one loads each input fewer times (O / BN),
+ * and a 64-wide warp takes twice the products a fragment load. A step's fragments load one
+ * group of products ahead of the products that take them. blockIdx.z: the inputs kc * z .. of
+ * a split K, its partial sums into its own S x O of y. */
+template<int BM, int BN> struct HcmTile {   /* 40, 64 and 80 KB of shared memory */
+    static constexpr int WR = BM / 64, WC = 8 / WR, WN = BN / WC, NJ = WN / 8, NW = BN / 128, NX = BM / 64;
+    static constexpr int XS = BM == 128 && BN == 128 ? 3 : 4;                    /* the inputs' stages */
+    static constexpr int XB = BM * HCM_BK * 2, WB = BN * HCM_BK * 2, SMEM = XS * XB + 2 * WB;
+    static constexpr int MINB = BM == 128 && BN == 128 ? 2 : 1;
+};
+template<int T, int BM, int BN>
+__global__ static void __launch_bounds__(256, HcmTile<BM, BN>::MINB) hcm_dense_k(float *__restrict__ y, const __half *__restrict__ xh,
+                                                                             const bd_u32 *__restrict__ w, int rw, int S, int I, int O, int kc) {
+    COLI_PDL_WAIT();
+#if HCM_BODY
+    using TL = HcmTile<BM, BN>;
+    constexpr int XS = TL::XS, XB = TL::XB, WB = TL::WB, NJ = TL::NJ, NW = TL::NW, NX = TL::NX, WN = TL::WN, WR = TL::WR;
+    extern __shared__ __align__(128) unsigned char hcm_sm[];
+    unsigned char *Wsm = hcm_sm + XS * XB;
+    const unsigned xs0 = (unsigned)__cvta_generic_to_shared(hcm_sm), ws0 = xs0 + XS * XB;
+    const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN, M = S - m0 < BM ? S - m0 : BM;
+    const int kb0 = blockIdx.z * kc, nk = ((I - kb0 < kc ? I - kb0 : kc)) / HCM_BK;
+    y += (size_t)blockIdx.z * S * O;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5, g = lane >> 2, tig = lane & 3, wr = warp % WR, wc = warp / WR;
+    const int lr = t >> 1, lh = t & 1;   /* the thread's weights: outputs lr + 128 q, inputs 16 lh .. of a step */
+    bool live_w[NW]; const bd_u32 *Wr[NW];
+    #pragma unroll
+    for (int q = 0; q < NW; q++) { live_w[q] = n0 + lr + 128 * q < O; Wr[q] = w + (size_t)(live_w[q] ? n0 + lr + 128 * q : 0) * rw; }
+    /* the thread's NX of a step's 4 BM input chunks: rows (t >> 2) + 64 q, chunk t & 3 */
+    const int xr = t >> 2, xc = t & 3;
+    const __half *Xp[NX]; unsigned xd[NX]; bool xl[NX];
+    #pragma unroll
+    for (int q = 0; q < NX; q++) {
+        xl[q] = xr + 64 * q < M;
+        Xp[q] = xh + (size_t)(m0 + (xl[q] ? xr + 64 * q : 0)) * I + kb0 + xc * 8;
+        xd[q] = hcm_swz(xr + 64 * q, xc);
+    }
+    #define HCM_LDX(st_, kb_) do { \
+        _Pragma("unroll") for (int q = 0; q < NX; q++) hcm_cp16(xs0 + (st_) * XB + xd[q], Xp[q] + (size_t)(kb_) * HCM_BK, xl[q]); \
+    } while (0)
+    float acc[4][NJ][4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) for (int j = 0; j < NJ; j++) for (int e = 0; e < 4; e++) acc[i][j][e] = 0.f;
+    #pragma unroll
+    for (int s = 0; s < XS - 1; s++) {
+        if (s < nk) HCM_LDX(s, s);
+        asm volatile("cp.async.commit_group;\n");
+    }
+    HcmRaw raw[NW];
+    #pragma unroll
+    for (int q = 0; q < NW; q++) for (int k = 0; k < 12; k++) raw[q].r[k] = 0u;
+    #define HCM_FETCH(kb_) do { \
+        _Pragma("unroll") for (int q = 0; q < NW; q++) \
+            if (live_w[q]) hcm_fetch<T>(raw[q], Wr[q], (bd_u32)(kb0 + (kb_) * HCM_BK + lh * 16)); \
+    } while (0)
+    #define HCM_STW(st_, kb_) do { \
+        _Pragma("unroll") for (int q = 0; q < NW; q++) { \
+            bd_u32 h_[8]; hcm_dec<T>(raw[q], (bd_u32)(kb0 + (kb_) * HCM_BK + lh * 16), h_); \
+            unsigned char *d_ = Wsm + (st_) * WB; \
+            *reinterpret_cast<uint4 *>(d_ + hcm_swz(lr + 128 * q, 2 * lh)) = make_uint4(h_[0], h_[1], h_[2], h_[3]); \
+            *reinterpret_cast<uint4 *>(d_ + hcm_swz(lr + 128 * q, 2 * lh + 1)) = make_uint4(h_[4], h_[5], h_[6], h_[7]); \
+        } \
+    } while (0)
+    HCM_FETCH(0);
+    HCM_STW(0, 0);
+    if (nk > 1) HCM_FETCH(1);
+    /* the lanes' ldmatrix rows: A's 16 rows and two chunks, B's 8 outputs of two tiles and two chunks */
+    const int ar = lane & 15, ac = lane >> 4, bn = (lane & 7) + ((lane >> 4) << 3), bc = (lane >> 3) & 1;
+    for (int kb = 0; kb < nk; kb++) {
+        asm volatile("cp.async.wait_group %0;\n" :: "n"(XS - 2));
+        __syncthreads();   /* step kb's inputs and weights are in; step kb - 1's stages are free */
+        {
+            int nx = kb + XS - 1;
+            if (nx < nk) HCM_LDX(nx % XS, nx);
+            asm volatile("cp.async.commit_group;\n");
+        }
+        const unsigned xb = xs0 + (kb % XS) * XB, wb = ws0 + (kb & 1) * WB;
+        bd_u32 a[2][4], b[2][NJ / 2][4];
+        #pragma unroll
+        for (int jp = 0; jp < NJ / 2; jp++) hcm_ldm4(b[0][jp], wb + hcm_swz(wc * WN + jp * 16 + bn, bc));
+        hcm_ldm4(a[0], xb + hcm_swz(wr * 64 + ar, ac));
+        #pragma unroll
+        for (int q = 0; q < 8; q++) {   /* group q: k16 kk = q >> 2, rows i = q & 3 */
+            const int kk = q >> 2, i = q & 3;
+            if (q < 7) hcm_ldm4(a[(q + 1) & 1], xb + hcm_swz(wr * 64 + ((q + 1) & 3) * 16 + ar, 2 * ((q + 1) >> 2) + ac));
+            if (q == 0) {
+                #pragma unroll
+                for (int jp = 0; jp < NJ / 2; jp++) hcm_ldm4(b[1][jp], wb + hcm_swz(wc * WN + jp * 16 + bn, 2 + bc));
+            }
+            #pragma unroll
+            for (int j = 0; j < NJ; j++) hcm_mma(acc[i][j], a[q & 1], b[kk][j >> 1][2 * (j & 1)], b[kk][j >> 1][2 * (j & 1) + 1]);
+            if (q == 2) {
+                /* step kb + 1's words (loaded during step kb - 1) into the other stage, among the
+                 * products; past the last step a stage nobody reads, the words still the last */
+                HCM_STW((kb + 1) & 1, kb + 1);
+                if (kb + 2 < nk) HCM_FETCH(kb + 2);
+            }
+        }
+    }
+    #undef HCM_LDX
+    #undef HCM_STW
+    #undef HCM_FETCH
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int j = 0; j < NJ; j++)
+            #pragma unroll
+            for (int e = 0; e < 4; e += 2) {
+                int r = wr * 64 + i * 16 + g + (e < 2 ? 0 : 8), c = n0 + wc * WN + j * 8 + tig * 2;
+                if (r >= M) continue;
+                float *yr = y + (size_t)(m0 + r) * O + c;
+                if (c + 1 < O && !(O & 1)) *reinterpret_cast<float2 *>(yr) = make_float2(acc[i][j][e], acc[i][j][e + 1]);
+                else { if (c < O) yr[0] = acc[i][j][e]; if (c + 1 < O) yr[1] = acc[i][j][e + 1]; }
+            }
+#else
+    (void)y; (void)xh; (void)w; (void)rw; (void)S; (void)I; (void)O; (void)kc;
+#endif
+}
+/* a split K's partial sums, in the order of the splits */
+__global__ static void hcm_sum_k(float *__restrict__ y, const float *__restrict__ p, long long n, int ns) {
+    COLI_PDL_WAIT();
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = p[i];
+    for (int z = 1; z < ns; z++) v += p[(size_t)z * n + i];
+    y[i] = v;
+}
+template<int T, int BM, int BN>
+static void hcm_launch(dim3 g, cudaStream_t st, float *y, const __half *xh, const bd_u32 *w, int rw, int S, int I, int O, int kc) {
+    constexpr int smem = HcmTile<BM, BN>::SMEM;
+    static unsigned set = 0;   /* the devices this kernel's attributes are on */
+    int dev = 0;
+    (void)cudaGetDevice(&dev);
+    if (dev < 32 && !(set & (1u << dev))) {   /* past 48 KB; 128 x 128's two blocks a multiprocessor */
+        cudaFuncSetAttribute(hcm_dense_k<T, BM, BN>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        cudaFuncSetAttribute(hcm_dense_k<T, BM, BN>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        (void)cudaGetLastError();
+        set |= 1u << dev;
+    }
+    hcm_dense_k<T, BM, BN><<<g, 256, smem, st>>>(y, xh, w, rw, S, I, O, kc);
+}
+/* hcm_dense_k for a block tensor's S rows: the inputs in f16 (and a split K's partial sums) in
+ * scratch the stream allocates and frees in its own order. COLI_CUDA_HCM_TILE and
+ * COLI_CUDA_HCM_SPLIT (2 ..) force a tile and a split K. 0: not taken. COLI_CUDA_BD_HCM=0 keeps
+ * the other tiles. */
+static int hcm_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st) {
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+    (void)ctx; (void)t; (void)y; (void)x; (void)S; (void)st; return 0;
+#else
+    static int on = -1, ftile = 0, fsplit = 0;
+    if (on < 0) {
+        const char *e = getenv("COLI_CUDA_BD_HCM"); on = !(e && *e == '0');
+        e = getenv("COLI_CUDA_HCM_TILE"); ftile = e ? atoi(e) : 0;      /* 1, 2, 3: this tile always */
+        e = getenv("COLI_CUDA_HCM_SPLIT"); fsplit = e ? atoi(e) : 0;    /* this split always */
+    }
+    int tt = hcm_type(t->fmt, t->I);
+    if (!on || !tt || ctx->compute_major < 8 || S <= 64) return 0;
+    const int I = t->I, O = t->O;
+    /* the tile: COLI_CUDA_HCM_TILE 1 (128 x 128), 2 (128 x 256), 3 (256 x 128). Past 128 rows 256 x
+     * 128: on an RTX PRO 4000 (70 W, its clock down to 1.4 GHz under these products) a 2048 x 7680
+     * Q4_K at 512 rows 71 TFLOP/s against 61 for 128 x 128 and 67 for 128 x 256, Q6_K 61 against 44:
+     * each weight decoded half as often. Its K split in two while that still makes one wave
+     * (7680 x 2048: 229 us against 250; three splits, past a wave, 283) */
+    int tile = ftile >= 1 && ftile <= 3 ? ftile : S > 128 ? 3 : 1;
+    if (tile > 1 && ctx->smem_optin < (size_t)(tile == 2 ? HcmTile<128, 256>::SMEM : HcmTile<256, 128>::SMEM)) tile = 1;
+    const int BMt = tile == 3 ? 256 : 128, BNt = tile == 2 ? 256 : 128;
+    /* fewer blocks than the multiprocessors' slots: K split up to a wave, 512 inputs a split at
+     * least (a 2048 x 40 heads' gate was one block down 64 steps, 44 us whatever the rows) */
+    const long long blocks = (long long)((O + BNt - 1) / BNt) * ((S + BMt - 1) / BMt), slots = (long long)ctx->sms * (tile == 1 ? 2 : 1);
+    int ns = 1;
+    if (fsplit > 0) ns = fsplit;
+    else if (blocks < slots) {
+        long long f = slots / blocks;
+        ns = (int)(f < I / 512 ? f : I / 512);
+        if (ns > 8) ns = 8;
+        if (ns < 1) ns = 1;
+    }
+    int kc = ((I + ns - 1) / ns + 255) / 256 * 256;   /* a split: whole blocks of 256 */
+    if (kc > I) kc = I;
+    ns = (I + kc - 1) / kc;
+    size_t n = (size_t)S * I, part = ns > 1 ? (size_t)ns * S * O * sizeof(float) : 0;
+    void *scr = NULL;
+    if (cudaMallocAsync(&scr, n * 2 + part + 256, st) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    long long n4 = (long long)(n / 4);
+    hcm_half_k<<<(unsigned)((n4 + 255) / 256), 256, 0, st>>>(reinterpret_cast<const float4 *>(x), reinterpret_cast<uint2 *>(scr), n4);
+    float *yp = ns > 1 ? reinterpret_cast<float *>((char *)scr + ((n * 2 + 255) / 256) * 256) : y;
+    dim3 gq((unsigned)((O + BNt - 1) / BNt), (unsigned)((S + BMt - 1) / BMt), (unsigned)ns);
+    const bd_u32 *wv = (const bd_u32 *)t->weights;
+    const __half *xh = (const __half *)scr;
+    #define HCM_GO(BM_, BN_) do { switch (tt) { \
+        case 8: hcm_launch<8, BM_, BN_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc); break; \
+        case 12: hcm_launch<12, BM_, BN_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc); break; \
+        case 13: hcm_launch<13, BM_, BN_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc); break; \
+        default: hcm_launch<14, BM_, BN_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc); break; } } while (0)
+    if (tile == 3) HCM_GO(256, 128); else if (tile == 2) HCM_GO(128, 256); else HCM_GO(128, 128);
+    #undef HCM_GO
+    if (ns > 1) {
+        long long ny = (long long)S * O;
+        hcm_sum_k<<<(unsigned)((ny + 255) / 256), 256, 0, st>>>(y, yp, ny, ns);
+    }
+    cudaError_t le = cudaGetLastError();
+    (void)cudaFreeAsync(scr, st);
+    return cuda_ok(le, "f16 block gemm launch");
+#endif
+}
 static int hcg_ok(const DeviceContext *ctx);
 /* a prompt chunk's rows of a block-format tensor: the f16 tiles (hcg_tile WF 100), I a
  * multiple of 64; 0 where the device has no f16 fragments (the GEMV takes them) */
@@ -3471,10 +3871,20 @@ static int bd_tensor_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const
     const bd_u32 *tab = bd_table(ctx);
     static int tiles = -1;
     if (tiles < 0) { const char *e = getenv("COLI_CUDA_BD_TILES"); tiles = !(e && *e == '0'); }   /* 0: a prompt's rows on the GEMV too */
-    if (!tiles || !tab || !hcg_ok(ctx) || t->I % HCG_BK || ((uintptr_t)x & 15)) return 0;
+    if (!tiles || !tab || ((uintptr_t)x & 15)) return 0;
+    if (hcm_gemm(ctx, t, y, x, S, st)) return 1;   /* Q8_0 and the K-quants: f16 mma.sync, loads apart from decoding */
+    if (!hcg_ok(ctx) || t->I % HCG_BK) return 0;
     dim3 g((unsigned)((t->O + TCG_BN - 1) / TCG_BN), (unsigned)((S + TCG_BM - 1) / TCG_BM));
     const float *bt = reinterpret_cast<const float *>(tab);
     const uint8_t *w = (const uint8_t *)t->weights;
+    /* more rows than one of hcg_tile's: the 128 x 128 tiles (COLI_CUDA_BD_TILE2=0 keeps hcg_tile's) */
+    static int big = -1;
+    if (big < 0) { const char *e = getenv("COLI_CUDA_BD_TILE2"); big = !(e && *e == '0'); }
+    if (big && S > TCG_BM) {
+        dim3 g2((unsigned)((t->O + HCG2_BN - 1) / HCG2_BN), (unsigned)((S + HCG2_BM - 1) / HCG2_BM));
+        HCG_BT_LAUNCH(hcg2_dense_k, t->fmt, g2, st, y, x, w, bt, t->fmt, S, t->I, t->O);
+        return cuda_ok(cudaGetLastError(), "block gemm launch");
+    }
     HCG_BT_LAUNCH(hcg_dense_k, t->fmt, g, st, y, x, w, bt, t->fmt, S, t->I, t->O);   /* a type's own tiles where one is built */
     return cuda_ok(cudaGetLastError(), "block gemm launch");
 }
@@ -3677,7 +4087,151 @@ __global__ static void __launch_bounds__(256) f32_gemv_k(float *__restrict__ y, 
     }
     if (!threadIdx.x) y[(size_t)s * O + o] = partial[0];
 }
+/* f32_gemm_k's products on the tensor cores in three TF32 parts (sm_80 and later): x = xh + xl,
+ * w = wh + wl, each part rounded to TF32, xh wh and the corrections xh wl + xl wh summed apart in
+ * fp32 (xl wl, below f32's last bits, dropped): f32's precision within a few units, as a
+ * router's top-k needs (one TF32 product, 10 bits, moves an expert's place in a near tie).
+ * A block of 128 threads takes 64 rows x 64 outputs, K in steps of 16 through shared memory
+ * (cp.async, three stages, rows of 64 bytes swizzled as hcm_dense_k's); warp w rows 32 (w & 1),
+ * outputs 32 (w >> 1): 2 x 4 products of 16 x 8 a k8, the fragments by ldmatrix. blockIdx.z: a
+ * split K's part, its partial sums into its own S x O of y. Qwen3.6's router (2048 x 257) at
+ * 512 rows took f32_gemm_k 251 us, its DeltaNet b and a rows (2048 x 64, 32 blocks) 173. */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+#define F32T_BODY 1
+#else
+#define F32T_BODY 0
+#endif
+#if F32T_BODY
+__device__ __forceinline__ bd_u32 f32t_tf32(float f) { bd_u32 r; asm("cvt.rna.tf32.f32 %0, %1;\n" : "=r"(r) : "f"(f)); return r; }
+__device__ __forceinline__ void f32t_mma(float (&c)[4], const bd_u32 (&a)[4], bd_u32 b0, bd_u32 b1) {
+    asm("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+#endif
+__global__ static void __launch_bounds__(128) f32t_gemm_k(float *__restrict__ y, const float *__restrict__ x,
+                                                           const float *__restrict__ w, int S, int I, int O, int kc) {
+    COLI_PDL_WAIT();
+#if F32T_BODY
+    constexpr int XS = 3, TB = 64 * 64;   /* stages; bytes a 64 x 16 tile */
+    __shared__ __align__(128) unsigned char sm[XS * 2 * TB];
+    const unsigned s0 = (unsigned)__cvta_generic_to_shared(sm);
+    const int m0 = blockIdx.y * 64, n0 = blockIdx.x * 64, kb0 = blockIdx.z * kc, K = I - kb0 < kc ? I - kb0 : kc, nk = (K + 15) / 16;
+    y += (size_t)blockIdx.z * S * O;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5, g = lane >> 2, tig = lane & 3, wr = warp & 1, wc = warp >> 1;
+    /* a stage's 256 chunks of x and 256 of w: the thread's rows (t >> 2) + 32 q, chunk t & 3 */
+    const int cr = t >> 2, cc = t & 3;
+    #define F32T_LD(st_, kb_) do { \
+        _Pragma("unroll") for (int q = 0; q < 2; q++) { \
+            int r_ = cr + 32 * q, k_ = kb0 + (kb_) * 16 + cc * 4; bool kin_ = k_ < kb0 + K; \
+            bool xo_ = m0 + r_ < S && kin_, wo_ = n0 + r_ < O && kin_; \
+            hcm_cp16(s0 + (st_) * 2 * TB + hcm_swz(r_, cc), xo_ ? (const void *)(x + (size_t)(m0 + r_) * I + k_) : (const void *)x, xo_); \
+            hcm_cp16(s0 + (st_) * 2 * TB + TB + hcm_swz(r_, cc), wo_ ? (const void *)(w + (size_t)(n0 + r_) * I + k_) : (const void *)w, wo_); \
+        } \
+    } while (0)
+    /* tot: xh wh, a step's products (acc) added in fp32 after each step: the tensor cores' own
+     * sum truncates, 2.7e-5 of the rms down 2048 inputs against 2.7e-6 so; cor: the corrections
+     * xh wl + xl wh, apart (added to the large sum, they lost bits) */
+    float tot[2][4][4], cor[2][4][4];
+    #pragma unroll
+    for (int i = 0; i < 2; i++) for (int j = 0; j < 4; j++) for (int e = 0; e < 4; e++) tot[i][j][e] = cor[i][j][e] = 0.f;
+    #pragma unroll
+    for (int s = 0; s < XS - 1; s++) {
+        if (s < nk) F32T_LD(s, s);
+        asm volatile("cp.async.commit_group;\n");
+    }
+    const int ar = lane & 15, ac = lane >> 4, bn = (lane & 7) + ((lane >> 4) << 3), bc = (lane >> 3) & 1;
+    for (int kb = 0; kb < nk; kb++) {
+        asm volatile("cp.async.wait_group %0;\n" :: "n"(XS - 2));
+        __syncthreads();
+        {
+            int nx = kb + XS - 1;
+            if (nx < nk) F32T_LD(nx % XS, nx);
+            asm volatile("cp.async.commit_group;\n");
+        }
+        const unsigned xb = s0 + (kb % XS) * 2 * TB, wb = xb + TB;
+        float acc[2][4][4];
+        #pragma unroll
+        for (int i = 0; i < 2; i++) for (int j = 0; j < 4; j++) for (int e = 0; e < 4; e++) acc[i][j][e] = 0.f;
+        #pragma unroll
+        for (int kk = 0; kk < 2; kk++) {
+            bd_u32 ah[2][4], al[2][4], bh[2][4], bl[2][4];
+            #pragma unroll
+            for (int i = 0; i < 2; i++) {
+                bd_u32 r[4];
+                hcm_ldm4(r, xb + hcm_swz(wr * 32 + i * 16 + ar, 2 * kk + ac));
+                #pragma unroll
+                for (int e = 0; e < 4; e++) { float f = __uint_as_float(r[e]); ah[i][e] = f32t_tf32(f); al[i][e] = f32t_tf32(f - __uint_as_float(ah[i][e])); }
+            }
+            #pragma unroll
+            for (int jp = 0; jp < 2; jp++) {
+                bd_u32 r[4];
+                hcm_ldm4(r, wb + hcm_swz(wc * 32 + jp * 16 + bn, 2 * kk + bc));
+                #pragma unroll
+                for (int e = 0; e < 4; e++) { float f = __uint_as_float(r[e]); bh[jp][e] = f32t_tf32(f); bl[jp][e] = f32t_tf32(f - __uint_as_float(bh[jp][e])); }
+            }
+            #pragma unroll
+            for (int i = 0; i < 2; i++)
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    const int jp = j >> 1, o = 2 * (j & 1);
+                    f32t_mma(cor[i][j], ah[i], bl[jp][o], bl[jp][o + 1]);
+                    f32t_mma(cor[i][j], al[i], bh[jp][o], bh[jp][o + 1]);
+                    f32t_mma(acc[i][j], ah[i], bh[jp][o], bh[jp][o + 1]);
+                }
+        }
+        #pragma unroll
+        for (int i = 0; i < 2; i++) for (int j = 0; j < 4; j++) for (int e = 0; e < 4; e++) tot[i][j][e] += acc[i][j][e];
+    }
+    #undef F32T_LD
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            #pragma unroll
+            for (int e = 0; e < 4; e += 2) {
+                int r = m0 + wr * 32 + i * 16 + g + (e < 2 ? 0 : 8), c = n0 + wc * 32 + j * 8 + tig * 2;
+                if (r >= S) continue;
+                float *yr = y + (size_t)r * O + c;
+                if (c < O) yr[0] = tot[i][j][e] + cor[i][j][e];
+                if (c + 1 < O) yr[1] = tot[i][j][e + 1] + cor[i][j][e + 1];
+            }
+#else
+    (void)y; (void)x; (void)w; (void)S; (void)I; (void)O; (void)kc;
+#endif
+}
+/* f32t_gemm_k where it runs (sm_80 and later, rows of 16-byte multiples, aligned): K split while
+ * the blocks fill less than a wave, 256 inputs a split at least. 0: not taken. COLI_CUDA_F32T=0
+ * keeps f32_gemm_k. */
+static int f32t_gemm(DeviceContext *ctx, float *y, const float *x, const float *w, int S, int I, int O, cudaStream_t st) {
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+    (void)ctx; (void)y; (void)x; (void)w; (void)S; (void)I; (void)O; (void)st; return 0;
+#else
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_F32T"); on = !(e && *e == '0'); }
+    if (!on || ctx->compute_major < 8 || I % 4 || ((uintptr_t)x & 15) || ((uintptr_t)w & 15)) return 0;
+    long long blocks = (long long)((O + 63) / 64) * ((S + 63) / 64), slots = 4LL * (ctx->sms > 0 ? ctx->sms : 1);
+    int ns = 1;
+    if (blocks < slots) { long long f = slots / blocks; ns = (int)(f < I / 256 ? f : I / 256); if (ns > 8) ns = 8; if (ns < 1) ns = 1; }
+    int kc = ((I + ns - 1) / ns + 15) / 16 * 16;
+    ns = (I + kc - 1) / kc;
+    float *yp = y;
+    void *scr = NULL;
+    if (ns > 1) {
+        if (cudaMallocAsync(&scr, (size_t)ns * S * O * sizeof(float), st) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+        yp = (float *)scr;
+    }
+    coli_launch(f32t_gemm_k, dim3((unsigned)((O + 63) / 64), (unsigned)((S + 63) / 64), (unsigned)ns), 128, 0, st, yp, x, w, S, I, O, kc);
+    if (ns > 1) {
+        long long ny = (long long)S * O;
+        coli_launch(hcm_sum_k, dim3((unsigned)((ny + 255) / 256)), 256, 0, st, y, (const float *)yp, ny, ns);
+    }
+    cudaError_t le = cudaGetLastError();
+    if (scr) (void)cudaFreeAsync(scr, st);
+    return cuda_ok(le, "f32 tensor-core gemm launch");
+#endif
+}
 static int f32_gemm_launch(DeviceContext *ctx, float *y, const float *x, const float *w, int S, int I, int O, cudaStream_t st) {
+    if (f32t_gemm(ctx, y, x, w, S, I, O, st)) return 1;
     unsigned gx = (unsigned)((O + F32G_N - 1) / F32G_N), big = (unsigned)((S + 63) / 64);
     if ((long)gx * big >= 2L * (ctx->sms > 0 ? ctx->sms : 1)) coli_launch(f32_gemm_k<64>, dim3(gx, big), 256, 0, st, y, x, w, S, I, O);
     else coli_launch(f32_gemm_k<16>, dim3(gx, (unsigned)((S + 15) / 16)), 256, 0, st, y, x, w, S, I, O);
