@@ -925,6 +925,166 @@ __global__ static void __launch_bounds__(128) cc_dnrec_rows_k(const float *__res
         for (int k = 0; k < KD; k++) st[sb + k * p.VD + v] = col[k];
     }
 }
+/* cc_dnrec_split_k's inputs for every row at once, the device full: each row's q and k of every key
+ * head l2-normalised (q times qscale) into qk[row][q, k][KH][KD], a warp a vector (cc_dnrec_rows_k's
+ * sums), and each (row, head)'s beta and decay into bd[row][VH][2] */
+__global__ static void __launch_bounds__(128) cc_dnprep_k(const float *__restrict__ cv, const float *__restrict__ ab,
+        const float *__restrict__ prm, float *__restrict__ qk, float *__restrict__ bd, int KD, int nvb, CcDnRec p) {
+    COLI_PDL_WAIT();
+    const int lane = threadIdx.x & 31;
+    if ((int)blockIdx.x < nvb) {
+        const int g = blockIdx.x * 4 + (threadIdx.x >> 5);
+        if (g >= p.S * 2 * p.KH) return;
+        const int s = g / (2 * p.KH), rem = g - s * 2 * p.KH, isk = rem / p.KH, kh = rem - isk * p.KH;
+        const int cb = p.cv_off + s * p.cv_row + isk * p.Ktot + kh * KD;
+        float a = 0.f;
+        for (int k = lane; k < KD; k += 32) { float x = cv[cb + k]; a += x * x; }
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) a += cc_shfl_xor(a, m);
+        const float sc = 1.f / sqrtf(a + 1e-6f) * (isk ? 1.f : p.qscale);
+        float *o = qk + (size_t)g * KD;
+        for (int k = lane; k < KD; k += 32) o[k] = cv[cb + k] * sc;
+        return;
+    }
+    const int i = ((int)blockIdx.x - nvb) * 128 + threadIdx.x;
+    if (i >= p.S * p.VH) return;
+    const int s = i / p.VH, h = i - s * p.VH;
+    const float alog = prm[p.prm_off + h], dtb = prm[p.prm_off + p.VH + h];
+    const float bv = ab[p.b_off + s * p.b_row + h], av = ab[p.a_off + s * p.a_row + h];
+    bd[2 * i] = 1.f / (1.f + expf(-bv));
+    bd[2 * i + 1] = expf(((p.flags & 2) ? alog : -expf(alog)) * cc_softplus(av + dtb));
+}
+/* A prompt chunk's rows with the state spread over the device and in registers: cc_dnrec_rows_k gives
+ * a value head one block of 128 (a column of the state a thread, every row's KD products in turn
+ * against q and k in shared memory, and one block on each of 32 multiprocessors). Here P threads
+ * share C columns, each the KD / P products k = P i + part of the C columns: one read of k[i] (or
+ * q[i]) serves C products, and the parts join by shuffles that leave every lane the same sum. A block
+ * of 128 threads takes 128 / P x C of a head's columns: VH x VD / (128 / P x C) blocks. The rows'
+ * q, k, beta and decay come from cc_dnprep_k, R rows at a time, the next R loaded into registers
+ * while these R run. The rows' outputs go to y as they are; cc_dnnorm_k takes each head's gated
+ * RMSNorm after (it needs the head's every column). */
+template <int KD, int R, int P, int C>
+__global__ static void __launch_bounds__(128) cc_dnrec_split_k(const float *__restrict__ cv, const float *__restrict__ qk,
+        const float *__restrict__ bd, float *__restrict__ st, float *__restrict__ y, float *__restrict__ snap, CcDnRec p) {
+    COLI_PDL_WAIT();
+    constexpr int KQ = KD / P, CB = 128 / P * C, QF = 2 * R * KD / 4 / 128, VF = R * CB / 4 / 128 > 0 ? R * CB / 4 / 128 : 1;
+    static_assert(2 * R * KD % 512 == 0, "q and k: whole float4s a thread");
+    __shared__ __align__(16) float qk_s[2][R][2][KD];   /* [buffer][row][q, k][KD] */
+    __shared__ __align__(16) float vs[2][R][CB];
+    __shared__ float bs[2][R], ds[2][R];
+    const int h = blockIdx.x, c0 = blockIdx.y * CB, t = threadIdx.x;
+    const int grp = t / P, qt = t % P, v0 = c0 + grp * C;   /* the thread's columns v0 .. v0 + C - 1 and part */
+    const int kh = (p.flags & 4) ? h % p.KH : h / (p.VH / p.KH);
+    const int sb = p.st_off + h * KD * p.VD, nb = p.snap_off + h * KD * p.VD;
+    float4 rq[QF], rv[VF]; float rb = 0.f, rd = 0.f;
+    /* the R rows from s0 into registers (rows past S as zeros) */
+    auto fetch = [&](int s0) {
+        #pragma unroll
+        for (int j = 0; j < QF; j++) {
+            const int f = t + 128 * j, r = f / (KD / 2), w = f % (KD / 2), isk = w / (KD / 4), k4 = w % (KD / 4);
+            rq[j] = s0 + r < p.S ? reinterpret_cast<const float4 *>(qk + (((size_t)(s0 + r) * 2 + isk) * p.KH + kh) * KD)[k4]
+                                 : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+        #pragma unroll
+        for (int j = 0; j < VF; j++) {
+            const int f = t + 128 * j, r = f / (CB / 4), c4 = f % (CB / 4);
+            float4 z = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (f < R * CB / 4 && s0 + r < p.S) {
+                const float *src = cv + p.cv_off + (size_t)(s0 + r) * p.cv_row + 2 * p.Ktot + h * p.VD + c0 + 4 * c4;
+                if (c0 + 4 * c4 + 3 < p.VD) z = make_float4(src[0], src[1], src[2], src[3]);
+                else { float e[4] = {0.f, 0.f, 0.f, 0.f}; for (int u = 0; u < 4; u++) if (c0 + 4 * c4 + u < p.VD) e[u] = src[u]; z = make_float4(e[0], e[1], e[2], e[3]); }
+            }
+            rv[j] = z;
+        }
+        if (t < R && s0 + t < p.S) { rb = bd[2 * ((size_t)(s0 + t) * p.VH + h)]; rd = bd[2 * ((size_t)(s0 + t) * p.VH + h) + 1]; }
+    };
+    auto store = [&](int b) {
+        #pragma unroll
+        for (int j = 0; j < QF; j++) {
+            const int f = t + 128 * j, r = f / (KD / 2), w = f % (KD / 2), isk = w / (KD / 4), k4 = w % (KD / 4);
+            reinterpret_cast<float4 *>(qk_s[b][r][isk])[k4] = rq[j];
+        }
+        #pragma unroll
+        for (int j = 0; j < VF; j++) {
+            const int f = t + 128 * j, r = f / (CB / 4), c4 = f % (CB / 4);
+            if (f < R * CB / 4) reinterpret_cast<float4 *>(vs[b][r])[c4] = rv[j];
+        }
+        if (t < R) { bs[b][t] = rb; ds[b][t] = rd; }
+    };
+    float col[C][KQ];
+    #pragma unroll
+    for (int c = 0; c < C; c++)
+        #pragma unroll
+        for (int i = 0; i < KQ; i++) col[c][i] = v0 + c < p.VD ? st[sb + (P * i + qt) * p.VD + v0 + c] : 0.f;
+    fetch(0); store(0);
+    __syncthreads();
+    for (int s0 = 0, b = 0; s0 < p.S; s0 += R, b ^= 1) {
+        const int nr = min(R, p.S - s0);
+        if (s0 + R < p.S) fetch(s0 + R);   /* in flight while these rows run */
+        for (int r = 0; r < nr; r++) {
+            const float decay = ds[b][r], beta = bs[b][r];
+            const float *qs = qk_s[b][r][0], *ks = qk_s[b][r][1];
+            float kv[C], o[C];
+            #pragma unroll
+            for (int c = 0; c < C; c++) kv[c] = 0.f;
+            #pragma unroll
+            for (int i = 0; i < KQ; i++) {
+                const float kk = ks[P * i + qt];
+                #pragma unroll
+                for (int c = 0; c < C; c++) { col[c][i] *= decay; kv[c] += kk * col[c][i]; }
+            }
+            #pragma unroll
+            for (int c = 0; c < C; c++) {
+                #pragma unroll
+                for (int m = 1; m < P; m <<= 1) kv[c] += cc_shfl_xor(kv[c], m);
+                kv[c] = (vs[b][r][grp * C + c] - kv[c]) * beta;   /* the column's delta */
+                o[c] = 0.f;
+            }
+            #pragma unroll
+            for (int i = 0; i < KQ; i++) {
+                const float kk = ks[P * i + qt], qq = qs[P * i + qt];
+                #pragma unroll
+                for (int c = 0; c < C; c++) { col[c][i] += kk * kv[c]; o[c] += qq * col[c][i]; }
+            }
+            #pragma unroll
+            for (int c = 0; c < C; c++) {
+                #pragma unroll
+                for (int m = 1; m < P; m <<= 1) o[c] += cc_shfl_xor(o[c], m);
+                if (qt == 0 && v0 + c < p.VD) y[p.y_off + (s0 + r) * p.y_row + h * p.VD + v0 + c] = o[c];
+            }
+            if (s0 + r == p.snap_row)
+                #pragma unroll
+                for (int c = 0; c < C; c++)
+                    #pragma unroll
+                    for (int i = 0; i < KQ; i++) if (v0 + c < p.VD) snap[nb + (P * i + qt) * p.VD + v0 + c] = col[c][i];
+        }
+        if (s0 + R < p.S) store(b ^ 1);   /* the other buffer: nobody reads it this round */
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int c = 0; c < C; c++)
+        #pragma unroll
+        for (int i = 0; i < KQ; i++) if (v0 + c < p.VD) st[sb + (P * i + qt) * p.VD + v0 + c] = col[c][i];
+}
+/* cc_dnrec_split_k's rows: each (row, head)'s gated RMSNorm in place, a warp each, cc_dnrec_rows_k's sums */
+__global__ static void __launch_bounds__(128) cc_dnnorm_k(const float *__restrict__ z, const float *__restrict__ prm,
+                                                           float *__restrict__ y, CcDnRec p) {
+    COLI_PDL_WAIT();
+    const int g = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (g >= p.S * p.VH) return;
+    const int s = g / p.VH, h = g - s * p.VH;
+    float *yr = y + p.y_off + s * p.y_row + h * p.VD;
+    float oo = 0.f;
+    for (int c = lane; c < p.VD; c += 32) oo += yr[c] * yr[c];
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) oo += cc_shfl_xor(oo, m);
+    const float rr = 1.f / sqrtf(oo / (float)p.VD + p.eps);
+    for (int c = lane; c < p.VD; c += 32) {
+        float zv = z[p.z_off + s * p.z_row + h * p.VD + c];
+        float gt = (p.flags & 1) ? 1.f / (1.f + expf(-zv)) : zv / (1.f + expf(-zv));
+        yr[c] = yr[c] * rr * prm[p.prm_off + 2 * p.VH + c] * gt;
+    }
+}
 __device__ static float cc_sig(float x) { return 1.f / (1.f + expf(-x)); }
 /* chain_qsa.comp: mode 0 one block of 128 per block key; mode 1 one block per query row */
 __global__ static void __launch_bounds__(128) cc_qsa_k(const float *__restrict__ src, const float *__restrict__ w,
@@ -2069,6 +2229,38 @@ static int cc_dnrec(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *pr
     float *s = fpw(st), *yy = fpw(y), *sn = fpw(snap);
     static int rows_on = -1;
     if (rows_on < 0) { const char *e = getenv("COLI_CUDA_DNREC_ROWS"); rows_on = !(e && *e == '0'); }
+#if !(defined(__HIP_PLATFORM_AMD__) || defined(__HIP__))   /* HIP keeps cc_dnrec_rows_k */
+    static int split_on = -1;
+    if (split_on < 0) { const char *e = getenv("COLI_CUDA_DNREC_SPLIT"); split_on = !(e && *e == '0'); }
+    /* COLI_CUDA_DNREC_SPLIT=0: cc_dnrec_rows_k. COLI_CUDA_DNREC_CFG=PC (tests): P threads over C columns */
+    static int cfg = -1;
+    if (cfg < 0) { const char *e = getenv("COLI_CUDA_DNREC_CFG"); cfg = e ? atoi(e) : 84; }
+    if (rows_on && split_on && p->S >= CC_DNREC_ROWS && (KD == 64 || KD == 128) && p->VD % 4 == 0 &&
+        p->cv_row % 4 == 0 && p->cv_off % 4 == 0 && p->Ktot % 4 == 0) {
+        const int P = cfg / 10, C = cfg % 10, cb = 128 / (P ? P : 1) * C;   /* a block's columns */
+        float *qk = NULL;
+        const size_t nq = (size_t)p->S * 2 * p->KH * KD, nbd = (size_t)p->S * p->VH * 2;
+        if (cudaMallocAsync((void **)&qk, (nq + nbd) * sizeof(float), c->stream) != cudaSuccess) { (void)cudaGetLastError(); goto rows; }
+        {
+            const int nvb = (p->S * 2 * p->KH + 3) / 4, nbb = (p->S * p->VH + 127) / 128;
+            coli_launch(cc_dnprep_k, (unsigned)(nvb + nbb), 128, 0, c->stream, a, b, pr, qk, qk + nq, KD, nvb, *p);
+            dim3 g((unsigned)p->VH, (unsigned)((p->VD + cb - 1) / cb));
+            #define CC_DS(P_, C_) do { if (KD == 64) coli_launch(cc_dnrec_split_k<64, 16, P_, C_>, g, 128, 0, c->stream, a, qk, qk + nq, s, yy, sn, *p); \
+                                        else coli_launch(cc_dnrec_split_k<128, 16, P_, C_>, g, 128, 0, c->stream, a, qk, qk + nq, s, yy, sn, *p); } while (0)
+            switch (cfg) {
+            case 81: CC_DS(8, 1); break;   case 82: CC_DS(8, 2); break;   case 84: CC_DS(8, 4); break;
+            case 162: CC_DS(16, 2); break; case 41: CC_DS(4, 1); break;
+            case 42: CC_DS(4, 2); break;   default: CC_DS(8, 4); break;
+            }
+            #undef CC_DS
+            (void)cudaFreeAsync(qk, c->stream);
+        }
+        if (!launched(c, "dnrec split")) return 0;
+        coli_launch(cc_dnnorm_k, (unsigned)((p->S * p->VH + 3) / 4), 128, 0, c->stream, zz, pr, yy, *p);
+        return launched(c, "dnrec norm");
+    }
+rows:
+#endif
     if (rows_on && p->S >= CC_DNREC_ROWS) {   /* a prompt chunk's rows, a block at a time */
         switch (KD) {
         case 4:   coli_launch(cc_dnrec_rows_k<4, 16>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); return launched(c, "dnrec rows");

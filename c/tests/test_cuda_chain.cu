@@ -928,10 +928,10 @@ int main(void) {
         T->free(ib); T->free(wb); T->free(rb); T->free(ob); T->free(sb);
     }
     printf("dnrec\n");
-    /* four rows (cc_dnrec_k) and 37 (cc_dnrec_rows_k: blocks past the first, the last part
-     * full, the snapshot inside one) */
-    for (int it = 0; it < 4; it++) {
-        const int KD = it & 1 ? 128 : 8, S = it < 2 ? 4 : 37, snap_at = S == 4 ? 1 : 20;
+    /* four rows (cc_dnrec_k) and 37 (the prompt's kernels: cc_dnrec_rows_k for KD 8, cc_dnrec_split_k
+     * for 64 and 128; blocks of rows past the first, the last part full, the snapshot inside one) */
+    for (int it = 0; it < 6; it++) {
+        const int KD = it % 3 == 1 ? 128 : it % 3 == 2 ? 64 : 8, S = it < 3 ? 4 : 37, snap_at = S == 4 ? 1 : 20;
         const int VH = 4, KH = 2, VD = KD == 8 ? 16 : 128, Ktot = KH * KD, CD = 2 * Ktot + VH * VD, vd = VH * VD;
         std::vector<float> cv = rnd((size_t)S * CD, 61), ab = rnd((size_t)S * 2 * VH, 62), z = rnd((size_t)S * (CD + vd), 63), st = rnd((size_t)VH * KD * VD, 64, 0.1f);
         std::vector<float> prm(2 * VH + VD); unsigned s = 65; for (int h = 0; h < VH; h++) { prm[h] = -1.f + 0.5f * frand(&s); prm[VH + h] = 0.2f * frand(&s); } for (int v = 0; v < VD; v++) prm[2 * VH + v] = 1.f + 0.2f * frand(&s);
