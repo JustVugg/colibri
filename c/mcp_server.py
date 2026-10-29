@@ -290,6 +290,9 @@ def tool_start(args, notify):
     cfg = setup_flow.load_config()
     if not cfg or not setup_flow.config_ready(cfg):
         raise ToolError("nothing is installed yet (or the install has not finished): call install")
+    # Match coli start: a source checkout pulled since the last build must not
+    # keep starting the old engine. The helper leaves running/release engines alone.
+    setup_flow.refresh_configured(cfg, out=_stderr_out)
     status = setup_flow.start_server(cfg, background=True,
                                      open_browser=bool(args.get("open_browser")), out=_stderr_out)
     wait = int(args.get("wait_seconds") or 0)
