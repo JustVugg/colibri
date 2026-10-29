@@ -1083,6 +1083,8 @@ def _parse_arch_tool_calls(reply, tools, tool_reply, track_spans):
         return parse_qwen_tool_calls(reply, tools) + (None, None)
     if chat_flavor() == "muse":
         return parse_muse_tool_calls(reply, tools) + (None, None)
+    if chat_flavor() == "mistral_large4":
+        return parse_mistral_tool_calls(reply, tools) + (None, None)
     if ARCH == "mimo":
         return _parse_mimo_tool_calls(reply, tools, track_spans)
     return _parse_tool_calls(reply, tools, track_spans)
@@ -1100,6 +1102,8 @@ def _tool_stream_markers():
         return (K3_TOOLS_OPEN,)
     if chat_flavor() == "muse":
         return (MUSE_ATEM_OPEN,)
+    if chat_flavor() == "mistral_large4":
+        return (ML4_CALLS,)
     return (BOX_START,)
 
 
@@ -1135,6 +1139,14 @@ def chat_flavor():
 
 def detect_chat_flavor(family_id, model_dir):
     """The template a checkpoint ships, when it differs from its family's (see CHAT_FLAVOR)."""
+    if family_id == "glm" and model_dir:   # the colibri engine: Mistral-Large-4's own chat format
+        try:
+            config = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            config = {}
+        if isinstance(config, dict) and config.get("model_type") == "mistral_large4":
+            return "mistral_large4"
+        return None
     if family_id != "qwen36" or not model_dir:
         return None
     for name in ("chat_template.jinja", "tokenizer_config.json"):
@@ -3981,6 +3993,237 @@ def _dsv41_merge_turns(messages):
     return turns
 
 
+# ---- Mistral-Large-4 (mistralai/Mistral-Large-4-1T-A52B, the colibri engine) -------------------
+# The release's chat_template.jinja, byte for byte (tests/test_mistral_large4_chat.py, against the
+# template when COLI_ML4_TEMPLATE names it): <s>, consecutive turns of one role (but system and
+# tool) merged with blank lines between them, [AVAILABLE_TOOLS] and [MODEL_SETTINGS] (the
+# reasoning effort, low to high; a response format's JSON schema) before the first user turn,
+# [INST]...[/INST], an assistant turn's reasoning in [THINK]...[/THINK] and its calls as
+# [TOOL_CALLS]name[ARGS]{json}, then </s>; [TOOL_RESULTS]...[/TOOL_RESULTS]; system turns in
+# [SYSTEM_PROMPT]. The answer opens its own [THINK]: the gateway reads it as <think>.
+ML4_BOS, ML4_EOS = "<s>", "</s>"
+ML4_THINK_OPEN, ML4_THINK_CLOSE = "[THINK]", "[/THINK]"
+ML4_CALLS, ML4_ARGS = "[TOOL_CALLS]", "[ARGS]"
+
+
+def _ml4_json(value):
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _ml4_render_content(content, where, kinds, thinking, images):
+    if isinstance(content, str):
+        return content
+    if content:
+        out = []
+        for block in content:
+            kind = block.get("type") if isinstance(block, dict) else None
+            if kind == "text":
+                out.append(block.get("text", ""))
+            elif thinking and kind == "thinking":
+                out.append(ML4_THINK_OPEN + block.get("thinking", ""))
+                if block.get("closed", True):
+                    out.append(ML4_THINK_CLOSE)
+            elif images and kind in ("image", "image_url"):
+                raise APIError(400, "Mistral-Large-4's pictures are not served yet: send text.", "messages",
+                               "unsupported_content_type")
+            else:
+                raise APIError(400, f"Only {kinds} chunks are supported in {where}.", "messages")
+        return "".join(out)
+    raise APIError(400, f"{where} must have non-empty content.", "messages")
+
+
+def _ml4_merge(messages):
+    """Consecutive turns of one role, but system and tool, as one: their texts with a blank
+    line between, a reasoning field as a leading thinking chunk, their calls in order."""
+    merged, group, role = [], [], None
+
+    def flush():
+        if role == "tool":
+            merged.extend(group)
+            return
+        if role is None:
+            return
+        text_parts, chunks, non_text, calls = [], [], False, []
+        for msg in group:
+            reasoning = msg.get("reasoning_content", msg.get("reasoning"))
+            content = msg.get("content")
+            if reasoning is not None and reasoning != "":
+                if content is not None and not isinstance(content, str):
+                    if any(isinstance(b, dict) and b.get("type") == "thinking" for b in content):
+                        raise APIError(400, "Message cannot have both thinking chunks in content and a "
+                                            "top-level `reasoning` or `reasoning_content` field.", "messages")
+                think = {"type": "thinking", "thinking": reasoning}
+                if isinstance(content, str) and content != "":
+                    content = [think, {"type": "text", "text": content}]
+                elif content is not None and not isinstance(content, str) and len(content) > 0:
+                    content = [think] + list(content)
+                else:
+                    content = [think]
+            if isinstance(content, str):
+                text_parts.append(content)
+            elif content is not None:
+                parts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        parts.append(block.get("text", ""))
+                    else:
+                        if parts:
+                            text_parts.append("".join(parts))
+                            parts = []
+                        if text_parts:
+                            chunks.append({"type": "text", "text": "\n\n".join(text_parts)})
+                            text_parts = []
+                        chunks.append(block)
+                        non_text = True
+                if parts:
+                    text_parts.append("".join(parts))
+            if msg.get("tool_calls") is not None:
+                calls.extend(msg["tool_calls"])
+        if non_text:
+            if text_parts:
+                chunks.append({"type": "text", "text": "\n\n".join(text_parts)})
+            body = chunks
+        else:
+            body = "\n\n".join(text_parts)
+        out = {"role": role, "content": body}
+        if calls:
+            out["tool_calls"] = calls
+        merged.append(out)
+
+    for message in list(messages) + [{"role": "__sentinel__"}]:
+        r = message.get("role")
+        if r != role or r in ("system", "tool"):
+            flush()
+            if r != "__sentinel__":
+                group, role = [message], r
+        else:
+            group.append(message)
+    return merged
+
+
+ML4_NEXT = {"system": ("user", "assistant", "system"), "user": ("assistant", "system", "user"),
+            "assistant": ("assistant", "user", "tool"), "tool": ("assistant", "tool", "user")}
+
+
+def render_chat_mistral_large4(messages, enable_thinking=True, reasoning_effort=None, tools=None,
+                               tool_choice=None, add_generation_prompt=True, response_format=None):
+    """Mistral-Large-4's prompt (its chat template). enable_thinking False asks for the lowest
+    effort the template knows ("low"): it has no switch that turns the reasoning off."""
+    effort = reasoning_effort or ("high" if enable_thinking else "low")
+    if effort not in ("low", "medium", "high"):
+        raise APIError(400, 'reasoning_effort must be one of "low", "medium", "high"', "reasoning_effort")
+    schema = None
+    if response_format is not None:
+        kind = response_format.get("type", "text")
+        if kind not in ("text", "json_object", "json_schema"):
+            raise APIError(400, f"Response format type must be one of text, json_object or json_schema, got {kind}.",
+                           "response_format")
+        if kind == "json_schema":
+            js = response_format.get("json_schema")
+            if js is None or js.get("schema") is None:
+                raise APIError(400, "Response format `json_schema` must define the schema", "response_format")
+            schema = js["schema"]
+        elif kind == "json_object":
+            schema = {"anyOf": [{"type": "object"}, {"type": "array"}]}
+    settings = ([f'"json_schema": {_ml4_json(schema)}'] if schema is not None else []) + [f'"reasoning_effort": "{effort}"']
+    preamble = (f"[AVAILABLE_TOOLS]{_ml4_json(tools)}[/AVAILABLE_TOOLS]" if tools else "") + \
+        "[MODEL_SETTINGS]{" + ", ".join(settings) + "}[/MODEL_SETTINGS]"
+    turns = _ml4_merge(messages)
+    if turns and turns[0]["role"] not in ("user", "system"):
+        raise APIError(400, f"Conversation must start with a user or system message, got {turns[0]['role']}.", "messages")
+    for prev, cur in zip(turns, turns[1:]):
+        if prev["role"] in ML4_NEXT and cur["role"] not in ML4_NEXT[prev["role"]]:
+            raise APIError(400, f"Unexpected role '{cur['role']}' after role '{prev['role']}'", "messages")
+    out, emitted = [ML4_BOS], False
+    for msg in turns:
+        role, content = msg["role"], msg.get("content")
+        if role == "user":
+            if not emitted:
+                out.append(preamble)
+                emitted = True
+            if (not isinstance(content, str) and content and len(content) == 2 and content[0].get("type") == "text"
+                    and content[1].get("type") in ("image", "image_url")):
+                content = [content[1], content[0]]
+            out.append("[INST]" + _ml4_render_content(content, "user message content", "text, image and image_url",
+                                                      False, True) + "[/INST]")
+        elif role == "assistant":
+            calls = msg.get("tool_calls") or []
+            if (content is None or content == "" or len(content) == 0) and not calls:
+                raise APIError(400, "Assistant message must have a string or a list of chunks in content or a list "
+                                    "of tool calls.", "messages")
+            if content:
+                out.append(_ml4_render_content(content, "assistant message contents", "text and thinking", True, False))
+            for call in calls:
+                fn = call.get("function") or {}
+                args = fn.get("arguments")
+                if not isinstance(args, str):
+                    args = _ml4_json(args)
+                elif args == "":
+                    args = "{}"
+                out.append(ML4_CALLS + fn.get("name", "") + ML4_ARGS + args)
+            out.append(ML4_EOS)
+        elif role == "tool":
+            out.append("[TOOL_RESULTS]" + _ml4_render_content(content, "tool message contents", "text and image",
+                                                              False, True) + "[/TOOL_RESULTS]")
+        elif role == "system":
+            out.append("[SYSTEM_PROMPT]" + _ml4_render_content(content, "system message contents", "text", False, False)
+                       + "[/SYSTEM_PROMPT]")
+        else:
+            raise APIError(400, f"Only user, assistant, system and tool roles are supported, got {role}.", "messages")
+    return "".join(out)
+
+
+def ml4_think_filter(on_text):
+    """Mistral-Large-4's [THINK] / [/THINK] in the engine's text as <think> / </think>, the
+    markers the reasoning splitters read; a tail that may be the start of one waits for the
+    next piece. feed(text, final) returns nothing; on_text gets the translated text."""
+    held = [""]
+    marks = ((ML4_THINK_OPEN, THINK_OPEN), (ML4_THINK_CLOSE, THINK_CLOSE))
+
+    def feed(text, final=False):
+        buf = held[0] + text
+        for theirs, ours in marks:
+            buf = buf.replace(theirs, ours)
+        hold = 0
+        if not final:
+            for theirs, _ in marks:
+                for k in range(min(len(theirs) - 1, len(buf)), 0, -1):
+                    if buf.endswith(theirs[:k]):
+                        hold = max(hold, k)
+                        break
+        held[0] = buf[len(buf) - hold:] if hold else ""
+        out = buf[:len(buf) - hold] if hold else buf
+        if out:
+            on_text(out)
+    return feed
+
+
+def parse_mistral_tool_calls(reply, tools=None):
+    """[TOOL_CALLS]name[ARGS]{json} blocks back into OpenAI tool_calls: the text before the
+    first block is the content; a call whose arguments are not one JSON object, or whose name
+    the request did not declare, stays text."""
+    reply = reply or ""
+    first = reply.find(ML4_CALLS)
+    if first < 0:
+        return reply.strip(), []
+    names = {(t.get("function") or t).get("name") for t in (tools or []) if isinstance(t, dict)}
+    calls, decoder = [], json.JSONDecoder()
+    for block in reply[first:].split(ML4_CALLS)[1:]:
+        name, sep, rest = block.partition(ML4_ARGS)
+        name = name.strip()
+        if not sep or not name or (tools and name not in names):
+            return reply.strip(), []
+        try:
+            args, end = decoder.raw_decode(rest.lstrip())
+        except ValueError:
+            return reply.strip(), []
+        if not isinstance(args, dict) or rest.lstrip()[end:].strip().replace(ML4_EOS, ""):
+            return reply.strip(), []
+        calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
+                      "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+    return reply[:first].strip(), calls
+
+
 def render_chat_dsv41(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                       tool_choice=None, add_generation_prompt=True):
     """encoding.py _encode_messages_text for one turn.
@@ -4205,6 +4448,9 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
     if ARCH == "qwen36":
         return render_chat_qwen(messages, enable_thinking, reasoning_effort, tools,
                                 tool_choice, add_generation_prompt, preserve_thinking)
+    if chat_flavor() == "mistral_large4":
+        return render_chat_mistral_large4(messages, enable_thinking, reasoning_effort, tools,
+                                          tool_choice, add_generation_prompt)
     if ARCH == "glm":
         return render_chat(messages, enable_thinking, reasoning_effort, tools,
                            tool_choice, add_generation_prompt)
@@ -4263,6 +4509,8 @@ def starts_in_reasoning(enable_thinking, add_generation_prompt=True):
     proseguito non ne apre nessuno."""
     if chat_flavor() in ("flint", "muse"):   # a turn starts as text, and <think> opens reasoning
         return False
+    if chat_flavor() == "mistral_large4":   # its answer opens [THINK] itself (read as <think>)
+        return False
     return (enable_thinking or ARCH == "glm53") and add_generation_prompt
 
 
@@ -4288,7 +4536,7 @@ class ThinkingStreamSplit:
         self.thinking = initial_thinking
         # Flint writes <think> itself when it decides to reason: the opening marker switches
         # to reasoning there (every other family's prompt opened or closed the block already)
-        self.opens = chat_flavor() in ("flint", "muse")   # Muse Spark's through MuseChannels
+        self.opens = chat_flavor() in ("flint", "muse", "mistral_large4")   # Muse Spark's through MuseChannels
         self.buf = ""
         self.track_spans = track_spans
         self.thinking_spans = []
@@ -6805,6 +7053,9 @@ class Engine:
             raise APIError(400, "Grammar and audio cannot be combined.", "response_format")
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         tool_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        if chat_flavor() == "mistral_large4":   # [THINK] as <think> before every splitter
+            ml4_feed = ml4_think_filter(on_text)
+            on_text = lambda text, _feed=ml4_feed: _feed(text)
 
         def decode(data):
             text = decoder.decode(data)
@@ -7017,6 +7268,8 @@ class Engine:
                 tail = decoder.decode(b"", final=True)
                 if tail:
                     on_text(tail)
+                if chat_flavor() == "mistral_large4":
+                    ml4_feed("", True)   # what waited as a possible marker's start
                 tool_tail = tool_decoder.decode(b"", final=True)
                 if tool_tail and on_tool is not None:
                     on_tool(tool_tail)

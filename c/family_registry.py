@@ -1326,7 +1326,7 @@ FAMILIES = (
     ),
     FamilyDescriptor(
         id="glm",
-        model_types=("glm_moe_dsa", "glm5_moe", "glm"),
+        model_types=("glm_moe_dsa", "glm5_moe", "glm", "mistral_large4"),
         # Two model names, one family, and that is not a shortcut. Z.ai state
         # it on GLM-5.3's own card: "GLM-5.3 uses the same base model as
         # GLM-5.2 -- every gain comes from post-training." The checkpoints
@@ -1344,6 +1344,15 @@ FAMILIES = (
         # family loads. If a future release ever adds a real discriminator,
         # split this then, on evidence.
         display_name="GLM-5.2/5.3",
+        # Mistral-Large-4 (mistralai/Mistral-Large-4-1T-A52B): GLM-5.2's DSA attention without the
+        # query LoRA, the same engine (colibri.c's attention_rows_ml4), its own chat format (the
+        # gateway's mistral_large4 flavor) and name
+        display_variants=(
+            DisplayVariant((("num_hidden_layers", 78), ("n_routed_experts", 256), ("hidden_size", 6144)),
+                           "GLM-5.2/5.3", "744B"),
+            DisplayVariant((("num_hidden_layers", 72), ("n_routed_experts", 128), ("hidden_size", 6144)),
+                           "Mistral-Large-4-1T-A52B", "1T", model_id="mistral-large-4-colibri"),
+        ),
         converter="convert_fp8_to_int4.py",
         converter_accepts=("ebits", "io_bits", "xbits", "group_size"),
         converter_mtp_pass=True,
