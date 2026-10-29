@@ -664,6 +664,24 @@ int main(void) {
         ck(T->begin() && T->write(yb, 0, refh.data(), refh.size() * 4) && T->norm(xb, NULL, yb, &pn) && T->submit(1) && maxdiff(down(yb, x.size()).data(), refn.data(), x.size()) < 1e-5, "L2, no weight, post scale");
         T->free(xb); T->free(wb); T->free(yb);
     }
+    printf("addnorm\n");
+    /* the branch (normalised first or not) into x and x's norm in one pass: the same bits as the
+     * norm, the add and the norm apart, on this device */
+    for (int it = 0; it < 6; it++) {
+        const int pre = it & 1, D = it < 2 ? 64 : it < 4 ? 2048 : 2560, rows = 5;
+        std::vector<float> x = rnd((size_t)rows * D, 81, 2.f), t = rnd((size_t)rows * D, 82), w = rnd(2 * (size_t)D, 83, 0.3f);
+        CcBuf *xa = up(x), *xb = up(x), *ta = up(t), *tb = up(t), *wb = up(w), *ya = up(x), *yb = up(x);
+        CcNorm np1 = {rows, D, 1, 0, D, D, 0, D, D, 0, 0, CC_NORM_ADD1, 1e-6f, 1.f}, np2 = {rows, D, 1, 0, D, D, 0, D, D, D, 0, CC_NORM_ADD1, 1e-6f, 1.f};
+        CcEw add = {CC_EW_ADD, rows * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
+        CcAddNorm an = {rows, D, 0, 0, 0, 0, D, pre, 1e-6f};
+        int ok = T->begin() && (!pre || T->norm(ta, wb, ta, &np1)) && T->ew(xa, xa, ta, NULL, NULL, &add) && T->norm(xa, wb, ya, &np2) &&
+                 T->addnorm(xb, tb, wb, yb, &an) == 1 && T->submit(1);
+        char what[96];
+        snprintf(what, sizeof what, "D %d, %s: x and its norm bit for bit", D, pre ? "the branch normalised" : "the branch as it is");
+        ck(ok && maxdiff(down(xa, x.size()).data(), down(xb, x.size()).data(), x.size()) == 0 &&
+           maxdiff(down(ya, x.size()).data(), down(yb, x.size()).data(), x.size()) == 0, what);
+        T->free(xa); T->free(xb); T->free(ta); T->free(tb); T->free(wb); T->free(ya); T->free(yb);
+    }
     printf("rope\n");
     {
         const int rows = 3, H = 4, qdim = 40, half = 8;
