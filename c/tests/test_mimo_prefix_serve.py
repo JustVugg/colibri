@@ -120,7 +120,7 @@ class MimoPrefixServeTest(PrefixReuseContract, PromptCancelContract, unittest.Te
     REPLAY_REUSES = False
     # MiMo checks between prompt blocks: blocks of 8 rows give the cancelled prompt several,
     # so the cancel can land after some of them are read (and kept)
-    CANCEL_ENV = {"MIMO_CHUNK": "8"}
+    CANCEL_ENV = dict(PromptCancelContract.CANCEL_ENV, MIMO_CHUNK="8")
 
     def spawn(self, log_prefix=True, reuse=True):
         return ServeEngine(fixture.ENGINE, ["8"], fixture.engine_env(),

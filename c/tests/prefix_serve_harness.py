@@ -336,7 +336,11 @@ class PromptCancelContract:
     CANCEL_OPENING = b"The capital of France is"
     CANCEL_MORE = b" a question about geography, and the capital of Spain is"
     CANCEL_AFTER = 1   # the second check: before layer 1, or a chain's first chunk on a tiny prompt
-    CANCEL_ENV = {}   # for both engines of the scenario (MiMo's block size)
+    # For both engines of the scenario. A chain on the device checks between its chunks or the
+    # serve's segments only, and a tiny prompt is one of each at the default sizes: the CANCEL
+    # held back for a check would then find none left (OLMoE's chain under Lavapipe did). Eight
+    # rows give a tiny prompt several; on the CPU they change nothing but the segment.
+    CANCEL_ENV = {"COLI_PROMPT_SEGMENT": "8", "COLI_VK_CHAIN_ROWS": "8"}
 
     def reused_after_cancel(self, tail):
         """Did a turn after the cancel reuse a prefix? The engine's own words."""
