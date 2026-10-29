@@ -232,6 +232,34 @@ static void head_logits_on_the_card(Weights *w, const Model *shared, const int *
     g_cuda_chain = 0;
 }
 
+/* a short prompt chunk's copies for one layer (q36cc_routed_fetches): the experts its rows route
+ * to that have regions in the staged table, two regions each, in the table's order. The fake
+ * backend has no host pool, so the staging itself runs only on a card (cuda-test, the T4). */
+static void test_routed_fetches(void) {
+    enum { RE = 8 };
+    CcFetch fr[8], out[2 * RE]; uint8_t used[RE];
+    memset(used, 1, sizeof used);   /* the scratch as the layer before left it */
+    for (int k = 0; k < 8; k++) fr[k] = (CcFetch){(const void *)(uintptr_t)(0x1000 + k), (size_t)k, (size_t)(100 + k)};
+    const int frx[RE] = {-1, 0, -1, 2, 4, -1, 6, -1};   /* 1, 3, 4 and 6 in the pool; the rest resident */
+    const int ids[6] = {6, 0, 1, 6, -1, 9};              /* two rows of three: 6 twice, a resident, an empty slot, an id past E */
+    int k = q36cc_routed_fetches(ids, 6, RE, frx, fr, used, out);
+    ck(k == 4 && out[0].src == fr[0].src && out[1].src == fr[1].src && out[2].src == fr[6].src && out[3].src == fr[7].src,
+       "the routed experts in the pool, each once, in the table's order: weights, then scales");
+    const int res[3] = {0, 2, 5};
+    ck(q36cc_routed_fetches(res, 3, RE, frx, fr, used, out) == 0, "routes only to residents: nothing to copy (the scratch starts clean)");
+    const int all[RE] = {7, 6, 5, 4, 3, 2, 1, 0};
+    k = q36cc_routed_fetches(all, RE, RE, frx, fr, used, out);
+    int whole = k == 8;
+    for (int j = 0; j < 8 && whole; j++) whole = out[j].src == fr[j].src && out[j].dst == fr[j].dst && out[j].bytes == fr[j].bytes;
+    ck(whole, "routes to every expert: the layer's whole copy, as a longer chunk makes it");
+    ck(Q36CC_ROUTED_ROWS > Q36CC_STAGE_ROWS, "a chunk the staging takes can be short enough to copy only its routes");
+    ck(q36cc_routes_only(Q36CC_STAGE_ROWS + 1, 4) && q36cc_routes_only(Q36CC_ROUTED_ROWS, 4) &&
+       !q36cc_routes_only(Q36CC_ROUTED_ROWS + 1, 4), "a planar chunk copies only its routes up to Q36CC_ROUTED_ROWS rows");
+    ck(!q36cc_routes_only(Q36CC_STAGE_ROWS + 1, 100), "a GGUF's chunk copies whole layers: no list of its experts' regions");
+    ck(Q36CC_DM_ROWS <= Q36CC_STAGE_ROWS,
+       "no staged chunk has a layer the host serves inside the frame: the wait for the routes cannot block");
+}
+
 int main(void) {
     setenv("Q36_KV", "f32", 1);   /* the host's K/V rows compared below as floats */
     setenv("COLI_CUDA", "1", 1); setenv("COLI_GPUS", "0", 1); setenv("QT_NO_WARMSTART", "1", 1);
@@ -601,6 +629,9 @@ int main(void) {
         qt_shutdown();
     }
     remove(heat);
+
+    printf(" M. a short prompt chunk copies only the experts its rows route to\n");
+    test_routed_fetches();
     if (fails) { printf("test_qwen36_cuda_chain: %d failure(s)\n", fails); return 1; }
     printf("OK test_qwen36_cuda_chain: the CUDA chain gives the CPU path's logits; host and device state agree; a lost device rebuilds; the host pool follows before a large prompt chunk only; the promotions' brake only with a history\n");
     return 0;

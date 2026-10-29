@@ -1,0 +1,292 @@
+# qwen36 CUDA chain, a short prompt chunk copies only its routed experts: why up to 256 rows (2026-10-27)
+# Another Google Colab T4 high-RAM VM of the same shape (Intel(R) Xeon(R) CPU @ 2.00GHz, Tesla T4, as setup.txt says).
+# Model: Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64 (int4, 64-input groups; 40 layers of 256 experts); CUDA_EXPERT_GB=auto: 6605 of the 10240 experts on the card, 3635 in the page-locked host pool, no heat file.
+# v1 is a prototype of this change, measured before it: measure-only, not published (7c6e34fd, c/ tree 724da69045d608bdbb7a6d87e977988dba57bd96).
+#   On the same base as base.txt (d3791f81), each staged layer of a chunk of 33 to 512 rows copied only the
+#   experts its rows route to, after its router (no 256-row limit); a chunk with a layer the staging does not
+#   take kept the whole copy. Its line on stderr: "[proto] qwen36: up to 512 rows".
+# Two measures, each run one process reading the lengths in turn (a length after the one before and its 32 steps):
+#   64, 128, 192, 256, 384, 512 (lunghezze), then 512, 384, 256, 192, 128, 64 (discesa).
+# Text: promessi_sposi.txt (sha256 f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f), speed-bench/promessi_sposi.txt of antirez's ds4.
+# Harness: bench.c beside this file (sha256 8bfbeab882467558e8647dd03543ded67696e64917c4a4c2b137d146de2db458), built against each version's c/ by bench's driver (make CUDA=1 CUDA_ARCH=sm_75).
+# Below, for each: setup.txt, summary.md, and sha256.txt (every raw file of the folder, as bench wrote it; the files stay out).
+
+## measure folder lunghezze
+# setup.txt:
+#   bench 74a093a7e7d8; engine qwen36; Linux (Intel(R) Xeon(R) CPU @ 2.00GHz, Tesla T4); 2026-10-27 12:09
+#   model /content/q36; text promessi_sposi.txt (sha256 f53e0d80cb2d4492); lengths 64,128,192,256,384,512; gen 32; teacher-forced
+#   runs: a warm-up of v0 (does not count), then 4 per version, the order turning at every round (ABBA); before every run: wait until cool (at most 900 s), then 60 s of rest
+#   v0 base: /content/soglia/bin-base/qwen36-bench (commit d3791f819452b22b32ea93936430e11c09eeb5a7; harness qwen36_bench.c 8bfbeab88246; CUDA); env: COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close
+#      command: env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/lib64-nvidia COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close /content/soglia/bin-base/qwen36-bench --model /content/q36 --text /content/bench/promessi_sposi.txt --lengths 64,128,192,256,384,512 --gen 32 --teacher --steps /content/soglia/lunghezze/v0-runN.steps
+#   v1 proto: /content/soglia/bin-proto/qwen36-bench (commit 7c6e34fdd5deaac21504dacd0ac53cb3b37545b2; harness qwen36_bench.c 8bfbeab88246; CUDA); env: COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close
+#      command: env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/lib64-nvidia COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close /content/soglia/bin-proto/qwen36-bench --model /content/q36 --text /content/bench/promessi_sposi.txt --lengths 64,128,192,256,384,512 --gen 32 --teacher --steps /content/soglia/lunghezze/v1-runN.steps
+
+=== summary.md ===
+# bench: lunghezze
+
+- bench 74a093a7e7d8; engine qwen36; Linux (Intel(R) Xeon(R) CPU @ 2.00GHz, Tesla T4); 2026-10-27 12:09
+- model q36; text promessi_sposi.txt (sha256 f53e0d80cb2d4492); lengths 64,128,192,256,384,512; gen 32; teacher-forced
+- runs: a warm-up of v0 (does not count), then 4 per version, the order turning at every round (ABBA); before every run: wait until cool (at most 900 s), then 60 s of rest
+
+## v0 base: 4 runs (median, min–max)
+
+| tokens | new | prompt tok/s | first step ms | decode tok/s | experts read | reads' s | nll | top1 | fingerprint |
+|---|---|---|---|---|---|---|---|---|---|
+| 64 | 64 | 97.65 (97.61–97.65) | 62 (61–64) | 42.648 (42.435–42.696) | 0 | 0.00 | 2.7015 | 0.469 | 64a23af119655c1b |
+| 128 | 128 | 177.41 (177.06–178.29) | 23 (23–23) | 48.632 (48.500–48.728) | 0 | 0.00 | 3.1124 | 0.500 | d5330abd04b80740 |
+| 192 | 192 | 260.98 (260.03–262.50) | 21 (20–22) | 50.710 (50.516–50.818) | 0 | 0.00 | 3.1309 | 0.469 | 9af60532d8e6d9bd |
+| 256 | 256 | 343.08 (342.16–343.86) | 21 (21–21) | 53.082 (52.961–53.147) | 0 | 0.00 | 3.1178 | 0.406 | cdc72e0cd1759e38 |
+| 384 | 384 | 502.17 (501.07–503.38) | 20 (19–20) | 52.479 (52.292–52.526) | 0 | 0.00 | 2.6584 | 0.406 | cf75a562353d8059 |
+| 512 | 512 | 661.63 (659.44–665.14) | 20 (20–20) | 53.799 (53.792–53.969) | 0 | 0.00 | 2.9453 | 0.469 | f0ab506f31cdf74f |
+
+peak memory 19973 MiB, model ready in 19.57 s (medians)
+
+decode by steps (step 1 gives the second new word; medians of 4 runs):
+
+| tokens | steps | experts read | decode tok/s | reads' s |
+|---|---|---|---|---|
+| 64 | 2 to 32 | 0 | 42.648 | 0.000 |
+| 128 | 2 to 32 | 0 | 48.632 | 0.000 |
+| 192 | 2 to 32 | 0 | 50.710 | 0.000 |
+| 256 | 2 to 32 | 0 | 53.081 | 0.000 |
+| 384 | 2 to 32 | 0 | 52.479 | 0.000 |
+| 512 | 2 to 32 | 0 | 53.799 | 0.000 |
+
+## v1 proto: 4 runs (median, min–max)
+
+| tokens | new | prompt tok/s | first step ms | decode tok/s | experts read | reads' s | nll | top1 | fingerprint |
+|---|---|---|---|---|---|---|---|---|---|
+| 64 | 64 | 150.75 (149.95–152.53) | 61 (59–61) | 42.591 (42.304–42.894) | 0 | 0.00 | 2.7015 | 0.469 | 64a23af119655c1b |
+| 128 | 128 | 245.22 (243.83–245.60) | 23 (22–23) | 48.638 (48.354–49.020) | 0 | 0.00 | 3.1124 | 0.500 | d5330abd04b80740 |
+| 192 | 192 | 320.58 (319.89–321.67) | 21 (21–22) | 50.745 (50.579–50.967) | 0 | 0.00 | 3.1309 | 0.469 | 9af60532d8e6d9bd |
+| 256 | 256 | 393.88 (392.80–395.64) | 20 (20–21) | 52.928 (52.852–53.024) | 0 | 0.00 | 3.1178 | 0.406 | cdc72e0cd1759e38 |
+| 384 | 384 | 503.52 (499.72–506.85) | 20 (19–20) | 52.368 (52.302–52.558) | 0 | 0.00 | 2.6584 | 0.406 | cf75a562353d8059 |
+| 512 | 512 | 587.76 (580.41–589.24) | 20 (20–20) | 53.894 (53.565–54.019) | 0 | 0.00 | 2.9453 | 0.469 | f0ab506f31cdf74f |
+
+peak memory 19973 MiB, model ready in 19.55 s (medians)
+
+decode by steps (step 1 gives the second new word; medians of 4 runs):
+
+| tokens | steps | experts read | decode tok/s | reads' s |
+|---|---|---|---|---|
+| 64 | 2 to 32 | 0 | 42.591 | 0.000 |
+| 128 | 2 to 32 | 0 | 48.638 | 0.000 |
+| 192 | 2 to 32 | 0 | 50.744 | 0.000 |
+| 256 | 2 to 32 | 0 | 52.928 | 0.000 |
+| 384 | 2 to 32 | 0 | 52.368 | 0.000 |
+| 512 | 2 to 32 | 0 | 53.894 | 0.000 |
+
+## v1 proto against v0 base (medians; positive = faster)
+
+| tokens | prompt | first step | decode | results |
+|---|---|---|---|---|
+| 64 | +54.4%, every run faster | +1.5%, ranges overlap | -0.1%, ranges overlap | same results; nll 2.7015 → 2.7015, top1 0.469 → 0.469 |
+| 128 | +38.2%, every run faster | +0.4%, ranges overlap | +0.0%, ranges overlap | same results; nll 3.1124 → 3.1124, top1 0.500 → 0.500 |
+| 192 | +22.8%, every run faster | -2.8%, ranges overlap | +0.1%, ranges overlap | same results; nll 3.1309 → 3.1309, top1 0.469 → 0.469 |
+| 256 | +14.8%, every run faster | +1.0%, ranges overlap | -0.3%, ranges overlap | same results; nll 3.1178 → 3.1178, top1 0.406 → 0.406 |
+| 384 | +0.3%, ranges overlap | -0.5%, ranges overlap | -0.2%, ranges overlap | same results; nll 2.6584 → 2.6584, top1 0.406 → 0.406 |
+| 512 | -11.2%, every run slower | +0.7%, ranges overlap | +0.2%, ranges overlap | same results; nll 2.9453 → 2.9453, top1 0.469 → 0.469 |
+
+| tokens | steps | experts read | decode | reads' s |
+|---|---|---|---|---|
+| 64 | 2 to 32 | 0 → 0 | -0.1%, ranges overlap | 0.000 → 0.000 s |
+| 128 | 2 to 32 | 0 → 0 | +0.0%, ranges overlap | 0.000 → 0.000 s |
+| 192 | 2 to 32 | 0 → 0 | +0.1%, ranges overlap | 0.000 → 0.000 s |
+| 256 | 2 to 32 | 0 → 0 | -0.3%, ranges overlap | 0.000 → 0.000 s |
+| 384 | 2 to 32 | 0 → 0 | -0.2%, ranges overlap | 0.000 → 0.000 s |
+| 512 | 2 to 32 | 0 → 0 | +0.2%, ranges overlap | 0.000 → 0.000 s |
+
+warm-up (does not count): 64 tokens: prompt 98.02 tok/s, decode 42.536 tok/s; 128 tokens: prompt 179.13 tok/s, decode 48.759 tok/s; 192 tokens: prompt 261.23 tok/s, decode 50.568 tok/s; 256 tokens: prompt 343.56 tok/s, decode 53.023 tok/s; 384 tokens: prompt 501.26 tok/s, decode 52.314 tok/s; 512 tokens: prompt 663.52 tok/s, decode 53.945 tok/s
+runs not cool: none
+pages written to swap during the measurement: 0, 0 of them in the runs that count
+
+=== sha256.txt ===
+aa1eb1e9efce0123dd925cab44624a52525c9c9620a56662804173b149b1a9c9  host-after.txt
+1f9c535246ebd5e646ad5462dfd91b34bd8964c066ef9b2f38c0bbd1212fa88e  host-before.txt
+0ee9d4d04b13cb08fa9f6571f4e60077c8e9382f94671073d5c8478379217eb0  setup.txt
+b00b2c938811c4f69d3746ffd36e666bc1724b6bcc7bfb3911ebc3bd69c2e0d6  summary.md
+0bd614f45450317121257ab11eb4737aba826abde5c59142c27d45d0b1e0de78  v0-run1.csv
+610be682e5d13d91e80a65703965ceee51805342306e7bd5e706f49052c8f493  v0-run1.err
+61a8e196c5e3623fa651f0a18187505867903a88438123bab2729c1ce9628889  v0-run1.steps
+79c5b419843398b8d9db81077ce4797b0a48a19c50ba0de9f75499544eb239e3  v0-run1.thermal-after.txt
+9744093c0b677c1a6ab0f4baeee46b78374b8088b91896f937dc4eabc4480ac6  v0-run1.thermal-before.txt
+fb83d8bf3c72824fbf1c2af234174c9f3184ef631c4a17f767401e34ffed0628  v0-run2.csv
+3af0569e5a568f9c2e267f178919244b1598f985bfab4b7c7dcee3beaaa1470c  v0-run2.err
+a13d00c12dd7241356bba5e0d17f3c2f3d04600492b30fed439bb4e48194d5a7  v0-run2.steps
+8ae96d7bae22a3ed0b4657af8dbd9a68090eeef7a969c44aeeadc577b764ed43  v0-run2.thermal-after.txt
+4691d5c5f1a1d4834040fc5e74e4b6b027d07f85888383c5492a2b8b259d0af2  v0-run2.thermal-before.txt
+904e100eadb7ef0e73faf6edf32ff7068dec340a812140c0c6516e7df95d9205  v0-run3.csv
+c9b0710c3152f4fa756de573fb557eb0de791aa748a4f9228cff9f2ccfed0d88  v0-run3.err
+9d5797911dbaf6242dc9cfc2b2f8d65c2402bc8c088a510161c987ac3ab9f747  v0-run3.steps
+427ece19b0872f66d9ad21690596db419a1ee37acba523a21f27a56c5ab921d7  v0-run3.thermal-after.txt
+4d0bc4f6c7497ecfd5c594ea3a468435aca1598760f3f552601cc4e556e3cb18  v0-run3.thermal-before.txt
+a31f12e3cd5224e28726db48b1dd3531614d5d43b580346d2f04e538832eaa14  v0-run4.csv
+ead9195fc5395dc7a995f6b9c43b7a216af4ddcf891002bbcdfb2483db2d05ff  v0-run4.err
+044f55787c9edecfa8c236ddcfe337c154fe0469fd6969138a500eef24261131  v0-run4.steps
+3941b2e8420f849f3d6dc8b48c109708dd71c1291d7b3e2ada074697c6eaf147  v0-run4.thermal-after.txt
+0d82f02e01b34bb75bcdcbde99a44644069688f13f63ff626385e1708fa34944  v0-run4.thermal-before.txt
+f801c76b0a87aba62a6b53e8a2775ef5da91fc08ea4cf71ff9d59f2fde8a273b  v1-run1.csv
+4a60cf0cba4e2a837c9266b322fe17d673827fdc0b883920a44cb1fde5d5f002  v1-run1.err
+f25be49d91e8914795c6ff342a5997ecb3784de25dbfaf05ff9fc87d49578e71  v1-run1.steps
+b37d315eb02a671ef888868bcafc7d673a427a3c1510b871280b89ef2a35200f  v1-run1.thermal-after.txt
+7e13e8fb128fc3969b6cb46e9a38d4681f4ee5ddd389555a847f9704a544839d  v1-run1.thermal-before.txt
+28194d81ea3da6efafc634eb89c1ed1c329da85dbb60cb7510b1355652c9fdd5  v1-run2.csv
+6c9c435d281f763a12cb3268b4d80bb42781974fc314d26395848f43e0748d64  v1-run2.err
+57d17a111d86c0621fa8bafe255bc246949b2fdeba4470035eccadd05cff631f  v1-run2.steps
+bf7016e08bbaee5c3ef6f8393871798737d5a4fdd8e1804807b8a0770563d94e  v1-run2.thermal-after.txt
+4a33b0e70bcb1d91c3e71f01fd683bd6e3425b473d2d170cceabe0a3f6d3b00d  v1-run2.thermal-before.txt
+13cd5954493557f4860e0c7b7423deffd696f895dedb702be7b83e7dc4e1e79b  v1-run3.csv
+3d98c9861b9b6bd534ea083a452e441df349931862f36b36c773572bc8e73178  v1-run3.err
+55e1c8337dff9ac70d9af57158b70f980281e3d9949e6cb8e00995325ca1de3b  v1-run3.steps
+a36b6a3c5ac0e646737948f918f78ece7699049490810dbc31e77d90995f7c67  v1-run3.thermal-after.txt
+bba1788c3be009833693e9e0c6ef842e83f48ceaddfb5090a1b8ae1fce6969c9  v1-run3.thermal-before.txt
+181c7f4d8599ebedd52f6aa5599183190c3f1823c13366b3896a50cf898d24e1  v1-run4.csv
+333d49ee64431ffe2e982eeda49007110fef94494579ce59db8b5e6959fa1e38  v1-run4.err
+4ad4d370fc2b819926ceb128f6b6cb6f9a59568e727209b9351505264d7c3912  v1-run4.steps
+d864dc3f30a1ceb518c5b1f0574dc79a0f4ca157acb2b6799a8939c89a202426  v1-run4.thermal-after.txt
+add098bd857c4cb285fb20a4afff5d19883bea7eca1726b6b6825323738fd76a  v1-run4.thermal-before.txt
+c56b4d601e5a0520642843c96c263f5947f54c08a1657a688d51f1952a70711f  warmup.csv
+b4d89376c02932b6a0816e0e6aaa149630bdf028a8f93e4b4ff85b6774dbea51  warmup.err
+916110192aa0e816bdac0742154887fd8d22af1d317caa9076ce623098b62f87  warmup.steps
+87e5ab4801e09c5a835401832fa8ab02e5dbed4f544673d66f72a573b97d8c8c  warmup.thermal-after.txt
+534e78788a46eec687f15434cf4086c24ef5d62d506a93c49bfb4037d1ee54ae  warmup.thermal-before.txt
+
+## measure folder discesa
+# setup.txt:
+#   bench 74a093a7e7d8; engine qwen36; Linux (Intel(R) Xeon(R) CPU @ 2.00GHz, Tesla T4); 2026-10-27 12:24
+#   model /content/q36; text promessi_sposi.txt (sha256 f53e0d80cb2d4492); lengths 512,384,256,192,128,64; gen 32; teacher-forced
+#   runs: a warm-up of v0 (does not count), then 4 per version, the order turning at every round (ABBA); before every run: wait until cool (at most 900 s), then 60 s of rest
+#   v0 base: /content/soglia/bin-base/qwen36-bench (commit d3791f819452b22b32ea93936430e11c09eeb5a7; harness qwen36_bench.c 8bfbeab88246; CUDA); env: COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close
+#      command: env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/lib64-nvidia COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close /content/soglia/bin-base/qwen36-bench --model /content/q36 --text /content/bench/promessi_sposi.txt --lengths 512,384,256,192,128,64 --gen 32 --teacher --steps /content/soglia/discesa/v0-runN.steps
+#   v1 proto: /content/soglia/bin-proto/qwen36-bench (commit 7c6e34fdd5deaac21504dacd0ac53cb3b37545b2; harness qwen36_bench.c 8bfbeab88246; CUDA); env: COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close
+#      command: env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/lib64-nvidia COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close /content/soglia/bin-proto/qwen36-bench --model /content/q36 --text /content/bench/promessi_sposi.txt --lengths 512,384,256,192,128,64 --gen 32 --teacher --steps /content/soglia/discesa/v1-runN.steps
+
+=== summary.md ===
+# bench: discesa
+
+- bench 74a093a7e7d8; engine qwen36; Linux (Intel(R) Xeon(R) CPU @ 2.00GHz, Tesla T4); 2026-10-27 12:24
+- model q36; text promessi_sposi.txt (sha256 f53e0d80cb2d4492); lengths 512,384,256,192,128,64; gen 32; teacher-forced
+- runs: a warm-up of v0 (does not count), then 4 per version, the order turning at every round (ABBA); before every run: wait until cool (at most 900 s), then 60 s of rest
+
+## v0 base: 4 runs (median, min–max)
+
+| tokens | new | prompt tok/s | first step ms | decode tok/s | experts read | reads' s | nll | top1 | fingerprint |
+|---|---|---|---|---|---|---|---|---|---|
+| 512 | 512 | 647.45 (634.77–669.01) | 62 (61–62) | 42.085 (41.713–42.351) | 0 | 0.00 | 2.9633 | 0.469 | a4be7d10e61cb80c |
+| 384 | 384 | 511.86 (510.72–515.30) | 21 (21–22) | 48.742 (48.663–48.788) | 0 | 0.00 | 2.6491 | 0.375 | c465def9edb0f4bd |
+| 256 | 256 | 348.91 (348.02–349.45) | 20 (20–20) | 51.808 (51.764–52.013) | 0 | 0.00 | 3.1182 | 0.438 | d70e7c0bda692c7e |
+| 192 | 192 | 270.00 (268.58–270.34) | 20 (19–20) | 53.776 (53.576–53.843) | 0 | 0.00 | 3.1396 | 0.469 | 6fb480c146f4776d |
+| 128 | 128 | 180.84 (180.41–181.38) | 20 (20–20) | 53.597 (53.402–53.820) | 0 | 0.00 | 3.1033 | 0.500 | 574dbb56e0cb4bb8 |
+| 64 | 64 | 114.83 (114.39–116.74) | 19 (18–19) | 53.624 (53.535–53.668) | 0 | 0.00 | 2.6697 | 0.469 | DIFFERENT between runs: ['ad3cae6c5a1a4c49', 'd50eee457d328d0c'] |
+
+peak memory 19968 MiB, model ready in 19.88 s (medians)
+
+decode by steps (step 1 gives the second new word; medians of 4 runs):
+
+| tokens | steps | experts read | decode tok/s | reads' s |
+|---|---|---|---|---|
+| 512 | 2 to 32 | 0 | 42.086 | 0.000 |
+| 384 | 2 to 32 | 0 | 48.742 | 0.000 |
+| 256 | 2 to 32 | 0 | 51.808 | 0.000 |
+| 192 | 2 to 32 | 0 | 53.775 | 0.000 |
+| 128 | 2 to 32 | 0 | 53.597 | 0.000 |
+| 64 | 2 to 32 | 0 | 53.624 | 0.000 |
+
+## v1 proto: 4 runs (median, min–max)
+
+| tokens | new | prompt tok/s | first step ms | decode tok/s | experts read | reads' s | nll | top1 | fingerprint |
+|---|---|---|---|---|---|---|---|---|---|
+| 512 | 512 | 539.05 (533.80–541.66) | 61 (61–61) | 42.205 (41.957–42.595) | 0 | 0.00 | 2.9633 | 0.469 | a4be7d10e61cb80c |
+| 384 | 384 | 483.54 (478.79–487.64) | 22 (21–22) | 48.766 (48.680–48.988) | 0 | 0.00 | 2.6491 | 0.375 | c465def9edb0f4bd |
+| 256 | 256 | 397.95 (396.27–398.19) | 20 (20–20) | 51.954 (51.762–52.133) | 0 | 0.00 | 3.1182 | 0.438 | d70e7c0bda692c7e |
+| 192 | 192 | 350.05 (349.90–351.51) | 20 (19–20) | 53.703 (53.360–53.770) | 0 | 0.00 | 3.1396 | 0.469 | 6fb480c146f4776d |
+| 128 | 128 | 285.46 (283.91–286.50) | 20 (20–20) | 53.508 (53.413–53.586) | 0 | 0.00 | 3.1033 | 0.500 | 574dbb56e0cb4bb8 |
+| 64 | 64 | 115.42 (114.80–115.48) | 19 (19–19) | 53.555 (53.447–53.611) | 0 | 0.00 | 2.6697 | 0.469 | d50eee457d328d0c |
+
+peak memory 19963 MiB, model ready in 19.86 s (medians)
+
+decode by steps (step 1 gives the second new word; medians of 4 runs):
+
+| tokens | steps | experts read | decode tok/s | reads' s |
+|---|---|---|---|---|
+| 512 | 2 to 32 | 0 | 42.205 | 0.000 |
+| 384 | 2 to 32 | 0 | 48.766 | 0.000 |
+| 256 | 2 to 32 | 0 | 51.954 | 0.000 |
+| 192 | 2 to 32 | 0 | 53.703 | 0.000 |
+| 128 | 2 to 32 | 0 | 53.509 | 0.000 |
+| 64 | 2 to 32 | 0 | 53.555 | 0.000 |
+
+## v1 proto against v0 base (medians; positive = faster)
+
+| tokens | prompt | first step | decode | results |
+|---|---|---|---|---|
+| 512 | -16.7%, every run slower | +0.4%, ranges overlap | +0.3%, ranges overlap | same results; nll 2.9633 → 2.9633, top1 0.469 → 0.469 |
+| 384 | -5.5%, every run slower | -1.4%, ranges overlap | +0.0%, ranges overlap | same results; nll 2.6491 → 2.6491, top1 0.375 → 0.375 |
+| 256 | +14.1%, every run faster | +0.2%, ranges overlap | +0.3%, ranges overlap | same results; nll 3.1182 → 3.1182, top1 0.438 → 0.438 |
+| 192 | +29.6%, every run faster | -0.8%, ranges overlap | -0.1%, ranges overlap | same results; nll 3.1396 → 3.1396, top1 0.469 → 0.469 |
+| 128 | +57.8%, every run faster | -1.5%, every run slower | -0.2%, ranges overlap | same results; nll 3.1033 → 3.1033, top1 0.500 → 0.500 |
+| 64 | +0.5%, ranges overlap | -0.8%, ranges overlap | -0.1%, ranges overlap | same words, logits differ; nll 2.6697 → 2.6697, top1 0.469 → 0.469 |
+
+| tokens | steps | experts read | decode | reads' s |
+|---|---|---|---|---|
+| 512 | 2 to 32 | 0 → 0 | +0.3%, ranges overlap | 0.000 → 0.000 s |
+| 384 | 2 to 32 | 0 → 0 | +0.0%, ranges overlap | 0.000 → 0.000 s |
+| 256 | 2 to 32 | 0 → 0 | +0.3%, ranges overlap | 0.000 → 0.000 s |
+| 192 | 2 to 32 | 0 → 0 | -0.1%, ranges overlap | 0.000 → 0.000 s |
+| 128 | 2 to 32 | 0 → 0 | -0.2%, ranges overlap | 0.000 → 0.000 s |
+| 64 | 2 to 32 | 0 → 0 | -0.1%, ranges overlap | 0.000 → 0.000 s |
+
+warm-up (does not count): 512 tokens: prompt 647.53 tok/s, decode 42.497 tok/s; 384 tokens: prompt 512.26 tok/s, decode 48.581 tok/s; 256 tokens: prompt 350.07 tok/s, decode 52.291 tok/s; 192 tokens: prompt 271.54 tok/s, decode 53.926 tok/s; 128 tokens: prompt 181.57 tok/s, decode 53.439 tok/s; 64 tokens: prompt 116.57 tok/s, decode 53.754 tok/s
+runs not cool: none
+pages written to swap during the measurement: 0, 0 of them in the runs that count
+
+=== sha256.txt ===
+f25b979544f5212794be0ba11ecc477457d48d22690fa904e3e8d0bf79da0b99  host-after.txt
+528b2353293043c9a41a2dc3efd164cca726cdebc99439c819064e7514973572  host-before.txt
+3a1071af3e98bda724434da63a63f6fc38d249c14415abd346c4e771ced62049  setup.txt
+608c509fe810e8ac3ba616e646c1ee909963df2e8b3494641fba0f543c2f2160  summary.md
+9a0b9a01b0bbd0260424c4b0c1cd275af9991f4ad4f7de9dbc6456a0de1bb287  v0-run1.csv
+a540c2f587ee7074a23cfe20df58f99fdf827575a49fc8da982ea48ef6f854ca  v0-run1.err
+4bf5f5f497e2385c6c69d84b43954d5cda2481d82d2bac2b952de44727329313  v0-run1.steps
+1c59fb202435a4d2c7c81b73dbfbf3b3812d90dddac109d09138b5986568517d  v0-run1.thermal-after.txt
+235afc353fa505f7bdc9366e5483a3206dba82362cf095fcd379ea573b4d4e94  v0-run1.thermal-before.txt
+d33b2db0ba801657287c2f5f19b7569ed9d71474166f373c1f74462682a4d52e  v0-run2.csv
+f9a638cb046fa937008b4e91784ca1db5262048d3d909db0cf5ba1f16283570a  v0-run2.err
+9feaa9e0ee4bda23eca19345db3be88a14bb1d638caae4e2092a696bbc85b7a4  v0-run2.steps
+eb59ab7fc593934384b1e6947e14363591674dcaa094163465c719f072d7df63  v0-run2.thermal-after.txt
+122b5011c9913f50cc81637f5bad583fe8c25e79b1532a06a50df46c79385c65  v0-run2.thermal-before.txt
+84fe0005adac8631aa335b4bd61d3d818babbe82f456035170c136fedddca5ed  v0-run3.csv
+53742c9cd10e1da68958f464988cbb937c84b68780920a211243d5ddca1d9ef6  v0-run3.err
+6b85e38f3137afd925fb205eac5ad1648ef6cc51f8326eb5e715cbfa3ba69120  v0-run3.steps
+e5a29e0d5a6162e069554391b2976fbd52b94b13bedbfa0a3d94201393342b5f  v0-run3.thermal-after.txt
+db98334216c4b1d9af181741707b54806c2d9f4053cb4d9baa26197507043e4e  v0-run3.thermal-before.txt
+2bacee586eb13af781347c21fe4544f9f6d1d4c448a85d2fbdf034962579eeef  v0-run4.csv
+2711d7c07e7afb768531bc4a29a14acabac65ea43d4b8e703b33806b19eed6db  v0-run4.err
+015e7d19fb6cb0cefde4110e89ad75248bd93338767ebbd2167e4d675a627766  v0-run4.steps
+05bb7a49e739e3fc2d4240faf8dd9de50d7dd4641d914242088ba3d1adb6b722  v0-run4.thermal-after.txt
+5fc45376010e3439569f44a2f8dfee24c89e95bb5240a72b9a52048d143e7bab  v0-run4.thermal-before.txt
+776e9bc8caaaa5f7d14f029f6b6e7665fe0830bfffeab521f3d000b1ef678be1  v1-run1.csv
+eb615c2d381108513ff1a3a26805a23cdeedc1c2332f470ae925645f7b753d91  v1-run1.err
+7d15cc61df36274a45266c16d6e69d24215dfc47962428cf101cadafc6dfdcee  v1-run1.steps
+71a13e16ba1e80bdcd507f0db39f5b159a8e6d54146ec1b5e40a8664e73c9e20  v1-run1.thermal-after.txt
+c6527f8415f4435dbd3494d558c1461e66d9a9db0c9a5ff5a188f5eee34a6e0f  v1-run1.thermal-before.txt
+551ff44572fa8dd263e8c77ce7b0d46d5a9d5f55a1f74105845db0b175a0163e  v1-run2.csv
+763e4f3f952862b5bcb4e3991488293f3ed311dca708160509c74f53d198d355  v1-run2.err
+30bc9194920db66aff5807587c364d1a0f12064f4ed43d18d365ec2ed6847bf3  v1-run2.steps
+c6b60007c7746d08ad8ab023722d0dffa6d5efbbc2ea2e7979c80ec1667658ad  v1-run2.thermal-after.txt
+2596a35c9a8a76720739578d85cc44cdbb4a923edd27c9f1a804bcf52125498e  v1-run2.thermal-before.txt
+4d87680d96294855887f22c7b0927bb1d65e17ac5b3780ac7b7fa354b05f9199  v1-run3.csv
+e305fc7e374e44deb7c65997b245cf0ebd59e3cebe37979fd375cccec7053013  v1-run3.err
+fe3f5ad2265fabf4e7f735741dc2c6b4d3c569c84552bc13da854c9a824a56b7  v1-run3.steps
+f23e3a19364aabb1d3f2256740d9882755d54e1705aba07f2207b39de0fe6aa0  v1-run3.thermal-after.txt
+562dba10d5a6e038cb0efa8312fe99b90d90233e9f6ab666647c615a4b5015ef  v1-run3.thermal-before.txt
+9995a030ca00ed274bc30f678eaa946699c118d70dde880b93d68ee70783ac19  v1-run4.csv
+2053c85dfd5b3779ca05793152ca6dae131854171c0eabf715e219fa81d99904  v1-run4.err
+fad633625be6f33307df70ba720910acb3dd6ef796a517b4df2e3ef1c31e5bfe  v1-run4.steps
+42665f2d8cb78315ad6e6bab1059250574073f1b74d91cb6b752b203a4cd9c3d  v1-run4.thermal-after.txt
+58f8ed0dcbbbb9f9617f21b2faca651839fd9f3f1a6f752eacf3755b8de96373  v1-run4.thermal-before.txt
+ba1ec32f5189ce6c720d44b921d1c23f8c4db6a5122891419414b9f6d2bb470c  warmup.csv
+54f93d53e948f154da9b89821b8228f453a289150649fe58fb2c7496c656c012  warmup.err
+d1f9fdc117af0bc5207178b58f29a08142bea733c3cc16623714fd86d078f4cc  warmup.steps
+866c85fdfbd157dedae2684cfd1a92ba227a0cc0396cc01f3b77e6dcac0ae611  warmup.thermal-after.txt
+ec3392d0f73d880a706476477ed6534c7cfce22e61c0e1ccb87ac934f328308b  warmup.thermal-before.txt

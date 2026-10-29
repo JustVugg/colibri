@@ -713,6 +713,14 @@ a layer's non-resident experts into VRAM and runs them with the residents:
   of the next such layer starts once the layer before has run its experts' GEMMs, so it
   overlaps that layer's sum and the next layer's attention; one buffer, because the copy
   is the longer of the two and a second one would buy little.
+- A chunk of up to 256 rows (`Q36CC_ROUTED_ROWS`) routes to only a part of a layer's
+  experts: each staged layer copies just those, right after its router (the host reads the
+  routes down, then queues the copies). That copy no longer overlaps the layer before, so a
+  longer chunk, which routes to nearly every expert, keeps the whole copy. The chain says
+  the rule at its first staging; its report counts the layer steps that copied only their
+  routes. A GGUF's chunk copies whole layers: its staged experts take one or three regions,
+  which the routed copy's list of an expert's two regions cannot describe
+  (`q36cc_routes_only`).
 - The prompt chunk's table points each staged expert at its place in the staging; a
   decode step keeps the table of the residents and the CPU's share (a row at a time,
   the CPU's kernel is faster than a copy).

@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "hypothesis": "A qwen36 CUDA chain prompt chunk of more than 32 rows copies each layer's experts from the tier's host pool over the bus into a staging buffer, then runs them with the residents. A chunk of up to 256 rows routes to only a part of them (a Colab T4 holds 6605 of the 10240 experts on the card and 3635 in the host pool), so copying just the experts its rows route to, after each such layer's router, makes a short prompt faster, with the same logits.",
+  "commit": "c1c06ac6fcb32157e4da130fd96775a32a757052",
+  "model": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64",
+  "command": "bench.c built against c/ (make CUDA=1 CUDA_ARCH=sm_75, as bench build does); COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close ./qwen36-bench --model <model> --text promessi_sposi.txt --lengths 64,512,64 --gen 32 --teacher",
+  "prompt_hash": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "hardware": {
+    "cpu": "Intel(R) Xeon(R) CPU @ 2.00GHz (4 cores / 8 threads, 38.5 MiB L3) + NVIDIA Tesla T4 (15360 MiB, sm_75, up to PCIe Gen3 x16)",
+    "ram": "51 GiB",
+    "storage": "Google Colab VM disk (the model downloaded to /content before the runs)",
+    "os": "Ubuntu 24.04.4 LTS (Google Colab, T4 high-RAM), CUDA 13.0 (nvcc V13.0.88), driver 580.82.07, gcc 13.3.0"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "heat_file": "none",
+      "scenario": "the 64-token prompt that opens a process (then its 32 decode steps, a 512-token prompt and its steps, a 64-token prompt)",
+      "tok_s": "prompt tokens / the prompt's seconds (bench's prefill_tps of the first row)",
+      "engine_build": "dev c1c06ac6 + #2416 + #2417 + #2423 + #2424 (d3791f81, measure-only commits)"
+    },
+    "samples": {
+      "tok_s": [
+        92.42,
+        92.35,
+        92.57,
+        92.48
+      ],
+      "prefill_s_64": [
+        0.692,
+        0.693,
+        0.691,
+        0.692
+      ],
+      "decode_tok_s_64": [
+        41.607,
+        41.543,
+        41.371,
+        41.287
+      ],
+      "nll_64": [
+        2.70149,
+        2.70149,
+        2.70149,
+        2.70149
+      ]
+    },
+    "median_tok_s": 92.45,
+    "quality": {
+      "method": "make -C c check (macOS arm64), 2763 tests; on the T4 with the PR's c/, tests/test_qwen36_cuda_chain, make -C c cuda-chain-check and make -C c cuda-test pass (correctness.txt). origin/dev + this change gives dev's fingerprint, nll and top1 at 64, 128 and 256 tokens, and the measured builds give each other's (correctness.txt); every run of both versions here has the same 64-token fingerprint (64a23af119655c1b)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-routed-copy-2026-10-27/base.txt",
+      "sha256": "0cec93dff7f593baaa885c90aea8f466bd03d4205092aafc212a514bd2787037"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "heat_file": "none",
+      "scenario": "the 64-token prompt that opens a process (then its 32 decode steps, a 512-token prompt and its steps, a 64-token prompt)",
+      "tok_s": "prompt tokens / the prompt's seconds (bench's prefill_tps of the first row)",
+      "engine_build": "d3791f81 + this change, each staged layer's routed copy going to that layer's staging place (04024fc5, measure-only)"
+    },
+    "samples": {
+      "tok_s": [
+        145.12,
+        147.77,
+        144.53,
+        149.29
+      ],
+      "prefill_s_64": [
+        0.441,
+        0.433,
+        0.443,
+        0.429
+      ],
+      "decode_tok_s_64": [
+        41.533,
+        41.518,
+        41.003,
+        41.323
+      ],
+      "nll_64": [
+        2.70149,
+        2.70149,
+        2.70149,
+        2.70149
+      ]
+    },
+    "median_tok_s": 146.445,
+    "quality": {
+      "method": "make -C c check (macOS arm64), 2763 tests; on the T4 with the PR's c/, tests/test_qwen36_cuda_chain, make -C c cuda-chain-check and make -C c cuda-test pass (correctness.txt). origin/dev + this change gives dev's fingerprint, nll and top1 at 64, 128 and 256 tokens, and the measured builds give each other's (correctness.txt); every run of both versions here has the same 64-token fingerprint (64a23af119655c1b)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-routed-copy-2026-10-27/base.txt",
+      "sha256": "0cec93dff7f593baaa885c90aea8f466bd03d4205092aafc212a514bd2787037"
+    }
+  },
+  "outcome": "improvement"
+}
