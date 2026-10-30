@@ -318,8 +318,11 @@ class PrefixReuseContract:
         self.assertEqual(aside, answers[0], "the short request answered otherwise beside a parked conversation")
         self.assertEqual(got, answers[1], "the conversation answered otherwise after it was parked")
         reused = [int(n) for n in re.findall(r"\[PREFIX\] reusing (\d+) of", log)]
-        first = re.search(r"\[PREFIX\] no reuse: held=0 cap=\d+ prompt=(\d+)", log)
-        self.assertTrue(reused and first and reused[-1] >= int(first.group(1)),
+        # the opening's tokens, from the first request's line ("no reuse: held=0 cap=C prompt=N" or
+        # "no reuse, 0 of N prompt tokens", as the engines say it)
+        first = re.search(r"\[PREFIX\] no reuse(?:: held=\d+ cap=\d+ prompt=(\d+)|, \d+ of (\d+) prompt tokens)", log)
+        held = int(first.group(1) or first.group(2)) if first else None
+        self.assertTrue(reused and held and reused[-1] >= held,
                         "the next turn read the parked conversation again:\n" + log)
 
     # An engine whose state is attention alone resumes where a prompt leaves what it holds

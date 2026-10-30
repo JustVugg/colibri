@@ -242,6 +242,17 @@ static void k3c_host_wrote(Model *m, int zero) {
         if (zero) { for (int i = 0; i < m->c.n_layers; i++) ch->kv_valid[i] = 0; vkc_kv_reset(&ch->ks); }
     }
 }
+/* The host's state rewritten from position 0 (a parked conversation back, park.h): the
+ * recurrent state goes up from the host, and every MLA mirror again. */
+static void k3c_host_rewrote(Model *m) {
+    for (int d = 0; d < 2; d++) {
+        K3Chain *ch = k3c_of(d);
+        if (!ch || !ch->ok || ch->m != m) continue;
+        ch->where = K3C_HOST; ch->host_zero = 0;
+        for (int i = 0; i < m->c.n_layers; i++) ch->kv_valid[i] = 0;
+        vkc_kv_reset(&ch->ks);
+    }
+}
 /* The CPU runs one chain's layers from pos0: the device's state stale after (and its MLA
  * rows from pos0 on). */
 static void k3c_cpu_one(Model *m, K3Chain *ch, int pos0) {

@@ -35,9 +35,11 @@
 #define COLI_PARK_GEN 4096   /* a request's tokens whose rows are kept apart: past them it is not a short one */
 
 /* One piece of state: `heads` blocks `head_stride` bytes apart, each `rows` rows of `row`
- * bytes. A cache by position (row t at t, or at t % rows for a ring) keeps its rows [0, n)
- * apart, all of them when it has fewer; a block saved whole is one row of its size. */
-typedef struct { void *base; size_t row; int rows, heads; size_t head_stride; } ColiParkPart;
+ * bytes, a row for `per` positions. A cache by position (row t at t, or at t % rows for a
+ * ring) keeps its rows [0, n) apart, all of them when it has fewer; a compressed one (a row
+ * for `per` positions) the rows of positions [0, n); a block saved whole is one row of its
+ * size. */
+typedef struct { void *base; size_t row; int rows, heads; size_t head_stride; int per; } ColiParkPart;
 
 typedef struct {
     int on, len, kv_len, n, nparts;
@@ -47,13 +49,16 @@ typedef struct {
 } ColiPark;
 
 static inline ColiParkPart coli_park_rows(void *base, size_t row, int rows) {
-    ColiParkPart p = {base, row, rows, 1, 0}; return p;
+    ColiParkPart p = {base, row, rows, 1, 0, 1}; return p;
 }
 static inline ColiParkPart coli_park_heads(void *base, size_t row, int rows, int heads, size_t head_stride) {
-    ColiParkPart p = {base, row, rows, heads, head_stride}; return p;
+    ColiParkPart p = {base, row, rows, heads, head_stride, 1}; return p;
+}
+static inline ColiParkPart coli_park_per(void *base, size_t row, int rows, int per) {
+    ColiParkPart p = {base, row, rows, 1, 0, per > 1 ? per : 1}; return p;
 }
 static inline ColiParkPart coli_park_whole(void *base, size_t bytes) {
-    ColiParkPart p = {base, bytes, 1, 1, 0}; return p;
+    ColiParkPart p = {base, bytes, 1, 1, 0, 1}; return p;
 }
 
 static inline void coli_park_free(ColiPark *p) {
@@ -74,7 +79,8 @@ static inline int coli_park_rows_for(const ColiPark *p, const kv_prefix *kvp, in
 }
 
 static inline size_t coli_park_part_bytes(const ColiParkPart *q, int n) {
-    return (size_t)(n < q->rows ? n : q->rows) * q->row;
+    int r = q->per > 1 ? (n + q->per - 1) / q->per : n;
+    return (size_t)(r < q->rows ? r : q->rows) * q->row;
 }
 static inline void coli_park_copy(const ColiParkPart *q, void *copy, int n, int out) {
     const size_t b = coli_park_part_bytes(q, n);
@@ -117,7 +123,8 @@ static inline int coli_park_restore(ColiPark *p, kv_prefix *kvp, int *kv_len, in
     int ok = written + spec <= p->n && nparts == p->nparts && kvp->cap >= p->len;
     for (int i = 0; ok && i < nparts; i++)
         ok = parts[i].base == p->part[i].base && parts[i].row == p->part[i].row && parts[i].rows == p->part[i].rows &&
-             parts[i].heads == p->part[i].heads && parts[i].head_stride == p->part[i].head_stride;
+             parts[i].heads == p->part[i].heads && parts[i].head_stride == p->part[i].head_stride &&
+             parts[i].per == p->part[i].per;
     if (!ok) {
         if (getenv("COLI_PREFIX_LOG"))
             fprintf(stderr, "[PREFIX] the request wrote past the rows kept apart: the conversation will be read again\n");

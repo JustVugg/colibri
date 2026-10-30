@@ -16172,6 +16172,48 @@ static void v4_ckpt_store(ColiV4Session *session, int len, int kind) {
     }
 }
 
+/* A short request between two turns of the session's conversation (park.h's conditions):
+ * every layer's whole attention state, the snapshots a speculative verify already
+ * round-trips (the window, the compressed rows, the compressor, the indexer), with the
+ * conversation's ids; back when the session's next prompt arrives. One conversation at a
+ * time (KV_SLOTS=1); COLI_PARK=0 never parks. */
+static struct { ColiV4Session *session; ColiV4AttentionSnapshot **snap; int layers, len; int *ids; } g_v4_park;
+static void v4_park(ColiV4Session *session, int prompt_count, int max_new) {
+    ColiPark none = {0};
+    int layers = session->config.num_hidden_layers;
+    if (g_v4_mux_slots != 1 || g_v4_park.snap ||
+        !coli_park_rows_for(&none, &session->fed, session->fed.len, prompt_count, max_new, 16)) return;
+    int *ids = malloc((size_t)session->fed.len * sizeof(int));
+    ColiV4AttentionSnapshot **snap = ids ? spec_attention_save(session->attention, layers) : NULL;
+    if (!snap) { free(ids); return; }
+    memcpy(ids, session->fed.fed, (size_t)session->fed.len * sizeof(int));
+    g_v4_park.session = session; g_v4_park.snap = snap; g_v4_park.layers = layers;
+    g_v4_park.len = session->fed.len; g_v4_park.ids = ids;
+    if (getenv("COLI_PREFIX_LOG"))
+        fprintf(stderr, "[PREFIX] the %d-token conversation parked for a %d-token request\n", g_v4_park.len, prompt_count);
+}
+static void v4_unpark(ColiV4Session *session) {
+    if (!g_v4_park.snap || g_v4_park.session != session) return;
+    if (!spec_attention_restore(session->attention, g_v4_park.snap, g_v4_park.layers)) {
+#ifdef COLI_VULKAN
+        v4c_reset();   /* the host's state is the conversation's again: the chain's copies go */
+#endif
+        kv_prefix_clear(&session->fed);
+        kv_prefix_record(&session->fed, g_v4_park.ids, 0, g_v4_park.len);
+        if (getenv("COLI_PREFIX_LOG")) fprintf(stderr, "[PREFIX] the %d-token conversation is back\n", g_v4_park.len);
+    } else {
+        /* a layer refused its snapshot: the state is part one, part the other's, so none of it */
+        for (int layer = 0; layer < g_v4_park.layers; layer++) coli_v4_window_attention_reset(session->attention[layer]);
+#ifdef COLI_VULKAN
+        v4c_reset();
+#endif
+        kv_prefix_clear(&session->fed);
+    }
+    spec_attention_free(g_v4_park.snap, g_v4_park.layers);
+    free(g_v4_park.ids);
+    memset(&g_v4_park, 0, sizeof g_v4_park);
+}
+
 static int session_generate_impl(ColiV4Session *session,
                                  const char *prompt, size_t prompt_length,
                                  const ColiV4SessionGenerateOptions *options,
@@ -16240,6 +16282,7 @@ static int session_generate_impl(ColiV4Session *session,
      * tail is prefilled at start=reuse, so the logits are the ones a cold run
      * would have produced.
      * ------------------------------------------------------------------- */
+    v4_unpark(session);   /* a conversation the last request parked: back first */
     int reuse = kv_prefix_reuse(&session->fed, session->prompt_ids, prompt_count);
     int ckpt_at = 0;
     if (!reuse) {
@@ -16256,6 +16299,7 @@ static int session_generate_impl(ColiV4Session *session,
         }
     }
     if (!reuse) {
+        v4_park(session, prompt_count, max_new);   /* a short request keeps the conversation (v4_unpark) */
 #ifdef COLI_V4_GPU_TIER
         coli_v4_gpu_kv_cache_invalidate_all();
 #endif
