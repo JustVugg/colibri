@@ -202,6 +202,14 @@ Qwen3.8-Flash-Next IQ2_XS on the CUDA chain, Hermes's second turn (14,810 tokens
 4.9 s after (14,783 tokens reused, 27 read). `COLI_PREFIX_LOG=1` says, for a prompt that reuses
 nothing, how far it follows the live state and the snapshot and the text where it stops.
 
+The other engines that serve one conversation park it the same way (`park.h`): qwen36 (Qwen3.6,
+Flint, Muse Spark, Qwen3-Coder, LFM3), olmoe, colibri.c (GLM-5.2, Mistral-Large-4), deepseek_v4,
+deepseek_v41, kimi_k3, mimo and inkling. With the same agent's requests (its tools, a title request
+after the first turn), the second turn after the title: Qwen3.6-35B on the CPU 51.6 s before,
+3.3 s after; OLMoE-1B-7B on the CPU 39.9 s before, 6.5 s after, every answer identical to the same
+conversation without the title. OLMoE, attention alone, also resumes where a prompt leaves the
+held state (an answer sent back without its reasoning, a changed turn) instead of reading it all.
+
 ## Routed experts as int4-g64
 
 Optional. Decode waits on routed experts: a miss is a disk read, and how many
