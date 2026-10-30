@@ -76,9 +76,11 @@ class DisplayVariant:
     of very different size: Qwen3.6-35B-A3B and Qwen3.8-2.4T-A95B both say
     ``qwen3_5_moe_text``. A single display_name would announce the 2.4T as a
     35B, which is the kind of banner that costs someone a day (#1045). The
-    ``geometry`` pairs are config keys the family config must match exactly;
-    the first matching variant names the model. No match: the model keeps its
-    own model_type as its name rather than borrowing a sibling's.
+    ``geometry`` pairs are config keys the family config must match exactly
+    (positive integers, or the model_type itself as a string, where one family
+    serves two models: GLM-5.2's engine runs Mistral-Large-4 too); the first
+    matching variant names the model. No match: the model keeps its own
+    model_type as its name rather than borrowing a sibling's.
     """
     geometry: tuple
     display_name: str
@@ -1333,7 +1335,7 @@ FAMILIES = (
     ),
     FamilyDescriptor(
         id="glm",
-        model_types=("glm_moe_dsa", "glm5_moe", "glm"),
+        model_types=("glm_moe_dsa", "glm5_moe", "glm", "mistral_large4"),
         # Two model names, one family, and that is not a shortcut. Z.ai state
         # it on GLM-5.3's own card: "GLM-5.3 uses the same base model as
         # GLM-5.2 -- every gain comes from post-training." The checkpoints
@@ -1351,6 +1353,16 @@ FAMILIES = (
         # family loads. If a future release ever adds a real discriminator,
         # split this then, on evidence.
         display_name="GLM-5.2/5.3",
+        # Mistral-Large-4 (mistralai/Mistral-Large-4-1T-A52B): GLM-5.2's DSA attention without the
+        # query LoRA, the same engine (colibri.c's attention_rows_ml4), its own chat format (the
+        # gateway's mistral_large4 flavor) and name. The model_type tells them apart, at any size.
+        display_variants=(
+            DisplayVariant((("model_type", "glm_moe_dsa"),), "GLM-5.2/5.3", "744B"),
+            DisplayVariant((("model_type", "glm5_moe"),), "GLM-5.2/5.3", "744B"),
+            DisplayVariant((("model_type", "glm"),), "GLM-5.2/5.3", "744B"),
+            DisplayVariant((("model_type", "mistral_large4"),), "Mistral-Large-4-1T-A52B", "1T",
+                           model_id="mistral-large-4-colibri"),
+        ),
         converter="convert_fp8_to_int4.py",
         converter_accepts=("ebits", "io_bits", "xbits", "group_size"),
         converter_mtp_pass=True,
@@ -1892,7 +1904,8 @@ def _build_registry(families):
                     not isinstance(variant.display_name, str) or not variant.display_name or
                     not isinstance(variant.display_scale, str) or
                     any(not isinstance(key, str) or not key or isinstance(value, bool) or
-                        not isinstance(value, int) or value < 1
+                        not ((isinstance(value, int) and value >= 1) or
+                             (key == "model_type" and isinstance(value, str) and value))
                         for key, value in variant.geometry)):
                 raise RegistryError(f"invalid display variant: {family.id}")
         # The static display_name is what the READMEs are held to mention, so

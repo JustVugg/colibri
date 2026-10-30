@@ -2608,6 +2608,17 @@ family_glm_chain() {
   grep -q "tier colibri: the GGUF experts' blocks go to the device" vk.log && [ "$(tier_count colibri vk.log)" -gt 0 ] ||
     { cat vk.log; fail "chain colibri GGUF: the tier took no expert as the file has it"; }
   mla_gate colibri "chain colibri GGUF, DSA top-4" 1 "${gg[@]}" DSA_TOPK=4 -- 64 16 16
+  # Mistral-Large-4 (tools/make_mistral_large4_tiny.py): no query latent, NoPE and shared-KV layers,
+  # SSMax on the attention's and the indexer's queries, the indexer's LayerNorm on its input, YaRN
+  # over the learned factors; the selection active past 6 positions
+  $PY tools/make_mistral_large4_tiny.py --out ml4_tiny --emit-ref ml4_tiny/ref.json > /dev/null
+  $PY tools/gguf_import.py ml4_tiny/model.gguf ml4_tiny/coli > /dev/null
+  local ml=(SNAP=ml4_tiny/coli REF=ml4_tiny/ref.json)
+  mla_gate colibri "chain colibri Mistral-Large-4" 1 "${ml[@]}" -- 8 16 16
+  mla_gate colibri "chain colibri Mistral-Large-4, prefill" 1 "${ml[@]}" TF=1 -- 8 16 16
+  mla_gate colibri "chain colibri Mistral-Large-4, prefill in chunks of 5" 1 "${ml[@]}" TF=1 COLI_VK_CHAIN_ROWS=5 -- 8 16 16
+  mla_gate colibri "chain colibri Mistral-Large-4, KV16" 1 "${ml[@]}" KV16=1 -- 8 16 16
+  mla_gate colibri "chain colibri Mistral-Large-4, DSA_FORCE" 1 "${ml[@]}" DSA_FORCE=1 -- 8 16 16
   mla_gate colibri "chain colibri MTP with DSA top-4" 1 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DSA_TOPK=4 -- 64 16 16
   mla_gate colibri "chain colibri MTP, 4-bit" 1 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json IDOT=0 DRAFT=2 -- 2 4 4
   # around the chain: the tier off, the per-matrix trunk and core, the GEMM and GEMV choices

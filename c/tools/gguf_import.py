@@ -593,6 +593,62 @@ def glmdsa_config(meta, tensors, overrides=None):
     return cfg, layers
 
 
+def mistral_large4_config(meta, tensors, overrides=None):
+    """Mistral-Large-4 (mistral-large4) as the colibri engine's config.json, the shape of
+    Mistral's (MistralLarge4ForConditionalGeneration's text_config): GLM-5.2's DSA attention
+    without the query LoRA, the layers' rotary pattern, KV sources and indexer types by layer,
+    YaRN, a softmax router, the final logit softcap."""
+    p = "mistral-large4."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    layers = int(need("block_count"))
+    rope = int(need("rope.dimension_count"))
+    emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
+    if int(meta.get(p + "expert_group_count", 1)) != 1:
+        sys.exit("mistral-large4: expert groups other than 1 are not this model")
+    if int(meta.get(p + "expert_gating_func", 1)) != 1:
+        sys.exit("mistral-large4: a router other than softmax (expert_gating_func 1) is not this model")
+    flags = lambda k: [bool(x) for x in need(k)][:layers]
+    rope_on, full = flags("attention.rope_pattern"), flags("attention.indexer.types")
+    source = [int(x) for x in need("attention.kv_source_map")][:layers]
+    cfg = {
+        "architectures": ["MistralLarge4ForCausalLM"], "model_type": "mistral_large4",
+        "vocab_size": int(meta.get(p + "vocab_size", emb["dims"][1])),
+        "hidden_size": int(need("embedding_length")),
+        "intermediate_size": int(need("feed_forward_length")),
+        "moe_intermediate_size": int(need("expert_feed_forward_length")),
+        "num_hidden_layers": layers, "num_attention_heads": int(need("attention.head_count")),
+        "num_key_value_heads": int(need("attention.head_count")),
+        "n_routed_experts": int(need("expert_count")), "num_experts_per_tok": int(need("expert_used_count")),
+        "n_shared_experts": int(meta.get(p + "expert_shared_count", 1)),
+        "first_k_dense_replace": int(meta.get(p + "leading_dense_block_count", 0)),
+        "q_lora_rank": 0, "kv_lora_rank": int(need("attention.kv_lora_rank")),
+        "qk_rope_head_dim": rope, "qk_nope_head_dim": int(need("attention.key_length_mla")) - rope,
+        "v_head_dim": int(need("attention.value_length_mla")),
+        "n_group": 1, "topk_group": 1, "scoring_func": "softmax", "norm_topk_prob": True,
+        "routed_scaling_factor": float(meta.get(p + "expert_weights_scale", 1.0)),
+        "rms_norm_eps": float(meta.get(p + "attention.layer_norm_rms_epsilon", 1e-5)),
+        "indexer_norm_eps": float(meta.get(p + "attention.layer_norm_epsilon", 1e-6)),
+        "rope_parameters": {
+            "rope_type": str(meta.get(p + "rope.scaling.type", "default")),
+            "rope_theta": float(meta.get(p + "rope.freq_base", 10000.0)),
+            "factor": float(meta.get(p + "rope.scaling.factor", 1.0)),
+            "original_max_position_embeddings": int(meta.get(p + "rope.scaling.original_context_length", 0)),
+            "beta_fast": float(meta.get(p + "rope.scaling.yarn_beta_fast", 32.0)),
+            "beta_slow": float(meta.get(p + "rope.scaling.yarn_beta_slow", 1.0)),
+            "attention_factor": 1.0},
+        "max_position_embeddings": int(meta.get(p + "context_length", 1048576)),
+        "index_topk": int(need("attention.indexer.top_k")), "index_n_heads": int(need("attention.indexer.head_count")),
+        "index_head_dim": int(need("attention.indexer.key_length")),
+        "indexer_types": ["full" if f else "shared" for f in full],
+        "no_rope_layers": [1 if r else 0 for r in rope_on],
+        "kv_source_layers": source,
+        "final_logit_softcapping": float(meta.get(p + "final_logit_softcapping", 0.0)),
+        "tie_word_embeddings": "output.weight" not in tensors,
+        "bos_token_id": meta.get("tokenizer.ggml.bos_token_id"), "eos_token_id": meta.get("tokenizer.ggml.eos_token_id"),
+    }
+    return cfg, layers
+
+
 def mimo2_config(meta, tensors, overrides=None):
     """MiMo-V2 (llama.cpp's mimo2) as the mimo engine's config.json, the shape of Xiaomi's
     (MiMoV2FlashForCausalLM): the layer kinds from the sliding-window pattern, the MoE layers
@@ -971,7 +1027,7 @@ def qwen4exp_config(meta, tensors, overrides=None):
 
 
 COPY_UNREAD = {"qwen4exp"}   # their engine does not read the colibri container (copy mode)
-ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "flint": flint_config, "muse-spark": muse_config, "lfm3": lfm3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "mimo2": mimo2_config, "deepseek41": deepseek41_config, "kimi-k3": kimik3_config, "olmoe": olmoe_config, "qwen4exp": qwen4exp_config}
+ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "flint": flint_config, "muse-spark": muse_config, "lfm3": lfm3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "mistral-large4": mistral_large4_config, "mimo2": mimo2_config, "deepseek41": deepseek41_config, "kimi-k3": kimik3_config, "olmoe": olmoe_config, "qwen4exp": qwen4exp_config}
 
 # unsloth ships Qwen3.8-Flash-Next's MTP head apart, in an MTP/ folder of the repository:
 # shared-* borrow token_embd and output from the model (the engine always does), the
@@ -1135,12 +1191,17 @@ FLINT_SPLITS = ["\\p{N}{1,3}", "[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+",
                 "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
                 "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
                 " ?[\\p{P}\\p{S}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"]
-PRE_SPLITS = {"glm4": CL100K_SPLITS, "lfm2": CL100K_SPLITS, "flint": FLINT_SPLITS, "kimi-k2": KIMI_SPLITS, "deepseek-v3": DEEPSEEK_SPLITS, "joyai-llm": DEEPSEEK_SPLITS,
+# Mistral's Tekken (tekken-num3, Mistral-Large-4's tokenizer.json): o200k's letter runs without the
+# contractions, numbers in groups of three counted from their end
+TEKKEN_NUM3_SPLITS = [r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|"
+                      r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|"
+                      r"\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))|\p{N}{1,2}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"]
+PRE_SPLITS = {"glm4": CL100K_SPLITS, "lfm2": CL100K_SPLITS, "tekken-num3": TEKKEN_NUM3_SPLITS, "flint": FLINT_SPLITS, "kimi-k2": KIMI_SPLITS, "deepseek-v3": DEEPSEEK_SPLITS, "joyai-llm": DEEPSEEK_SPLITS,
               "hunyuan-dense": DEEPSEEK_SPLITS, "hy_v4": DEEPSEEK_SPLITS,
               "inkling": O200K_SPLITS, "gpt-4o": O200K_SPLITS}
 # BPE options of the tokenizer.json a family ships (the GGUF does not carry them)
 PRE_MODEL = {"inkling": {"ignore_merges": True}, "gpt-4o": {"ignore_merges": True}, "glm4": {"ignore_merges": True},
-             "lfm2": {"ignore_merges": True}}
+             "lfm2": {"ignore_merges": True}, "tekken-num3": {"ignore_merges": True}}
 
 
 def pre_tokenizer(pre):

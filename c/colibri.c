@@ -192,6 +192,15 @@ typedef struct {
     int index_topk, index_nh, index_hd;          /* DSA lightning indexer */
     int8_t idx_type[128];                        /* per layer: 1=full (calcola), 0=shared (riusa) */
     float eps, theta, attn_scale, routed_scale;
+    /* Mistral-Large-4 (model_type mistral_large4): no query LoRA (q_lora 0, q_proj straight from
+     * the input), per layer a rotary part or none (rope_on: a NoPE layer's key and query are
+     * qk_head wide unrotated) and a KV source (kv_src: a layer reading another's latent has no
+     * kv_a), SSMax on the queries, the indexer from the input's LayerNorm, a softmax router, YaRN
+     * frequencies times the learned exp(alpha) (rope_inv), a final logit softcap */
+    int ml4, softmax_router, rope_inv_on;
+    int8_t rope_on[128]; int16_t kv_src[128];
+    float softcap, ix_eps, rope_inv[128];
+    float yarn_factor, yarn_beta_fast, yarn_beta_slow; int yarn_orig;
     char config_sha256[65];                      /* digest of the loaded config.json bytes */
 } Cfg;
 
@@ -449,6 +458,10 @@ typedef struct {
     int router_cuda_bad;                         /* upload failed once: stay on the CPU router */
 #endif
     QT sh_gate, sh_up, sh_down;                  /* shared expert */
+    /* the layer's key: nope unrotated dims then rope rotated ones (GLM: the config's; Mistral-
+     * Large-4's NoPE layers: qk_head and 0), SSMax's scale and bias per head (Mistral) */
+    int nope, rope;
+    float *ssm_s, *ssm_b;
 } Layer;
 
 /* slot di un expert: pesi quantizzati + scale. Nel container pre-quantizzato g/u/d sono
@@ -566,6 +579,7 @@ typedef struct {
     int has_dsa;
     QT *ix_wq, *ix_wk, *ix_wp;                   /* per layer FULL: wq_b, wk, weights_proj */
     float **ix_knw, **ix_knb;                    /* k_norm (LayerNorm, eps 1e-6) */
+    float **ix_qnw, **ix_qnb, **ix_ssm_s, **ix_ssm_b;   /* Mistral-Large-4: q_input_norm, SSMax */
     float **Ic;                                  /* alias KVState: cache indexer [max_t*hd] */
     int *dsa_sel, *dsa_nsel; int dsa_scap;       /* selezione per posizione del batch corrente */
     /* testa MTP (layer n_layers, stile DeepSeek-V3): draft nativi ad alta acceptance */
@@ -1856,7 +1870,8 @@ static void rope_interleave(float *v, int pos, const Cfg *c){
     static _Thread_local RopeCache cache;
     float in[256]; memcpy(in,v,c->qk_rope*sizeof(float));
     if(!cache.inv_valid||cache.qk!=c->qk_rope||cache.inv_theta!=c->theta){
-        for(int j=0;j<half;j++) cache.inv[j]=powf(c->theta,-2.0f*j/c->qk_rope);
+        /* Mistral-Large-4: YaRN's frequencies over the learned exp(alpha), set at load */
+        for(int j=0;j<half;j++) cache.inv[j]=c->rope_inv_on ? c->rope_inv[j] : powf(c->theta,-2.0f*j/c->qk_rope);
         cache.qk=c->qk_rope; cache.inv_theta=c->theta; cache.inv_valid=1;
         cache.valid=0;   /* inv[] changed -> force cs/sn refresh below */
     }
@@ -1974,6 +1989,31 @@ static void load_cfg(Cfg *c, const char *snap){
               c->idx_type[i] = !strcmp(it->kids[i]->str,"full");
           else { int v=i-off+1; if(v<0) v=0; c->idx_type[i] = (v%freq)==0; }
       } }
+    {   /* Mistral-Large-4's per-layer shape, router, rope scaling and softcap */
+        jval *mt=json_get(r,"model_type");
+        c->ml4 = mt && mt->t==J_STR && mt->str && !strcmp(mt->str,"mistral_large4");
+        jval *sf=json_get(r,"scoring_func");
+        c->softmax_router = sf && sf->t==J_STR && sf->str && !strcmp(sf->str,"softmax");
+        jval *fc=json_get(r,"final_logit_softcapping"); c->softcap = fc&&fc->t==J_NUM ? (float)fc->num : 0.f;
+        jval *ie=json_get(r,"indexer_norm_eps"); c->ix_eps = ie&&ie->t==J_NUM ? (float)ie->num : 1e-6f;
+        jval *nr=json_get(r,"no_rope_layers"), *ks=json_get(r,"kv_source_layers");
+        for(int i=0;i<c->n_layers && i<128;i++){
+            c->rope_on[i] = !(nr && nr->t==J_ARR && i<nr->len && nr->kids[i]->t==J_NUM && nr->kids[i]->num==0);
+            c->kv_src[i] = ks && ks->t==J_ARR && i<ks->len && ks->kids[i]->t==J_NUM ? (int16_t)ks->kids[i]->num : (int16_t)i;
+            if(c->kv_src[i]<0 || c->kv_src[i]>i){ fprintf(stderr,"config: kv_source_layers[%d]=%d is not an earlier layer\n",i,c->kv_src[i]); exit(1); }
+            if(c->kv_src[i]!=i && c->rope_on[i]!=c->rope_on[c->kv_src[i]]){
+                fprintf(stderr,"config: layer %d reads layer %d's KV but one rotates and the other not\n",i,c->kv_src[i]); exit(1); }
+        }
+        jval *rt=rp?json_get(rp,"rope_type"):NULL;
+        if(rt && rt->t==J_STR && rt->str && !strcmp(rt->str,"yarn")){
+            jval *f=json_get(rp,"factor"), *o=json_get(rp,"original_max_position_embeddings");
+            jval *bf=json_get(rp,"beta_fast"), *bs=json_get(rp,"beta_slow");
+            c->yarn_factor = f&&f->t==J_NUM ? (float)f->num : 1.f;
+            c->yarn_orig = o&&o->t==J_NUM ? (int)o->num : 0;
+            c->yarn_beta_fast = bf&&bf->t==J_NUM ? (float)bf->num : 32.f;
+            c->yarn_beta_slow = bs&&bs->t==J_NUM ? (float)bs->num : 1.f;
+        }
+    }
     c->qk_head=c->qk_nope+c->qk_rope;
     c->attn_scale = 1.f / sqrtf((float)c->qk_head);
     if(c->n_group!=1){ fprintf(stderr,"this engine requires n_group=1 (GLM-5.2)\n"); exit(1); }
@@ -2715,6 +2755,45 @@ static void metal_fmt_gate_notice(Model *m){
         k>=5?"sparse ":"", nbad[k]==1?"":"s");
 }
 
+/* the head's logits for S rows (lm_head), under the final softcap where the model has one
+ * (Mistral-Large-4: cap * tanh(logit / cap)) */
+static void lm_logits(Model *m, float *y, const float *x, int S){
+    matmul_qt(y, x, &m->lm_head, S);
+    const float cap=m->c.softcap;
+    if(cap>0.f) for(int64_t i=0;i<(int64_t)S*m->c.vocab;i++) y[i]=cap*tanhf(y[i]/cap);
+}
+/* Mistral-Large-4's rotary frequencies (transformers' _compute_yarn_parameters, truncate on):
+ * YaRN's blend of the interpolated and extrapolated frequencies, then over the GGUF's
+ * freq_factors (exp(-alpha), the learned LeRoPE alpha: checked against the checkpoint's
+ * lerope.alpha), into rope_inv for rope_interleave */
+static void ml4_rope_table(Model *m){
+    Cfg *c=&m->c; const int dim=c->qk_rope, half=dim/2;
+    if(half<1 || half>128) return;
+    const double base=c->theta, factor=c->yarn_factor>0 ? c->yarn_factor : 1.0;
+    double low=0, high=0;
+    if(factor>1.0 && c->yarn_orig>0){
+        double lo=(dim*log(c->yarn_orig/(c->yarn_beta_fast*2*3.14159265358979323846)))/(2*log(base));
+        double hi=(dim*log(c->yarn_orig/(c->yarn_beta_slow*2*3.14159265358979323846)))/(2*log(base));
+        low=floor(lo); high=ceil(hi);
+        if(low<0) low=0;
+        if(high>dim-1) high=dim-1;
+        if(low==high) high+=0.001;
+    }
+    float ff[128]; int has_ff=0;
+    if(st_has(&m->S,"model.rotary_emb.freq_factors") && st_numel(&m->S,"model.rotary_emb.freq_factors")==half){
+        float *f=ld(m,"model.rotary_emb.freq_factors"); memcpy(ff,f,half*sizeof(float)); has_ff=1; }
+    for(int j=0;j<half;j++){
+        float pos=powf((float)base,(float)(2*j)/(float)dim);
+        double inv=1.0/pos;
+        if(factor>1.0 && c->yarn_orig>0){
+            double ramp=(j-low)/(high-low); ramp=ramp<0?0:ramp>1?1:ramp;
+            inv=(1.0/(factor*pos))*ramp + (1.0/pos)*(1.0-ramp);
+        }
+        if(has_ff) inv/=ff[j];
+        c->rope_inv[j]=(float)inv;
+    }
+    c->rope_inv_on=1;
+}
 static void model_init_range(Model *m, const char *snap, int cap,
                              int ebits, int dbits, int layer_begin,
                              int layer_end, int load_boundaries, int load_mtp,
@@ -2724,6 +2803,7 @@ static void model_init_range(Model *m, const char *snap, int cap,
     { const char *xd=getenv("COLI_MODEL_DIRS");        /* SPLIT: model shards spread across N drives */
       st_init_multi(&m->S,snap,(xd&&*xd)?xd:NULL); }
     Cfg *c=&m->c; char nm[256]; int H=c->n_heads, D=c->hidden;
+    if(c->ml4) ml4_rope_table(m);
     if(layer_end==0) layer_end=c->n_layers;
     if(layer_begin<0||layer_begin>=layer_end||layer_end>c->n_layers){
         fprintf(stderr,"invalid GLM layer range [%d,%d) for %d layers\n",
@@ -2786,15 +2866,27 @@ static void model_init_range(Model *m, const char *snap, int cap,
         #define P(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
         l->in_ln=ld(m,P("input_layernorm.weight"));
         l->post_ln=ld(m,P("post_attention_layernorm.weight"));
+        l->rope = c->ml4 && !c->rope_on[i] ? 0 : c->qk_rope;   /* a NoPE layer: its whole key unrotated */
+        l->nope = c->qk_head - l->rope;
+        if(c->ml4){   /* Mistral-Large-4: the query straight from the input (in q_b), kv_a on a KV source only */
+            l->q_b = qt_load_ex(m,P("self_attn.q_proj.weight"), H*c->qk_head, D, dbits,mmap_ok);
+            if(c->kv_src[i]==i){
+                l->kv_a  = qt_load_ex(m,P("self_attn.kv_a_proj_with_mqa.weight"), c->kv_lora+l->rope, D, dbits,mmap_ok);
+                l->kv_a_ln= ld(m,P("self_attn.kv_a_layernorm.weight"));
+            }
+            l->ssm_s = ld(m,P("self_attn.softmax_scaling.scale"));
+            l->ssm_b = ld(m,P("self_attn.softmax_scaling.bias"));
+        } else {
         l->q_a   = qt_load_ex(m,P("self_attn.q_a_proj.weight"), c->q_lora, D, dbits,mmap_ok);
         l->q_a_ln= ld(m,P("self_attn.q_a_layernorm.weight"));
         l->q_b   = qt_load_ex(m,P("self_attn.q_b_proj.weight"), H*c->qk_head, c->q_lora, dbits,mmap_ok);
         l->kv_a  = qt_load_ex(m,P("self_attn.kv_a_proj_with_mqa.weight"), c->kv_lora+c->qk_rope, D, dbits,mmap_ok);
         l->kv_a_ln= ld(m,P("self_attn.kv_a_layernorm.weight"));
+        }
         if(st_has(&m->S,P("self_attn.kv_b_proj.weight")))
-            l->kv_b  = qt_load_ex(m,P("self_attn.kv_b_proj.weight"), H*(c->qk_nope+c->v_head), c->kv_lora, dbits,mmap_ok);
+            l->kv_b  = qt_load_ex(m,P("self_attn.kv_b_proj.weight"), H*(l->nope+c->v_head), c->kv_lora, dbits,mmap_ok);
         else { char pre[64]; snprintf(pre,sizeof pre,"model.layers.%d.",i);   /* a GGUF's k_b / v_b */
-            l->kv_b = qt_kvb_gguf(m,pre,H,c->qk_nope,c->v_head,c->kv_lora); }
+            l->kv_b = qt_kvb_gguf(m,pre,H,l->nope,c->v_head,c->kv_lora); }
         l->o     = qt_load_ex(m,P("self_attn.o_proj.weight"), D, H*c->v_head, dbits,mmap_ok);
 #ifdef COLI_CUDA
         qt_cuda_colocate(&l->o,&l->kv_b);
@@ -2814,7 +2906,7 @@ static void model_init_range(Model *m, const char *snap, int cap,
             if(!l->down_proj.mmap_view) qt_planarize(&l->down_proj);
         } else {
             l->router=ld(m,P("mlp.gate.weight"));
-            l->router_bias=ld(m,P("mlp.gate.e_score_correction_bias"));
+            l->router_bias=c->softmax_router ? NULL : ld(m,P("mlp.gate.e_score_correction_bias"));   /* softmax: no bias */
             int sI=c->moe_inter*c->n_shared;
             l->sh_gate = qt_load_ex(m,P("mlp.shared_experts.gate_proj.weight"), sI, D, dbits,mmap_ok);
             l->sh_up   = qt_load_ex(m,P("mlp.shared_experts.up_proj.weight"),   sI, D, dbits,mmap_ok);
@@ -2910,10 +3002,18 @@ static void model_init_range(Model *m, const char *snap, int cap,
             m->ix_wq=calloc(c->n_layers,sizeof(QT)); m->ix_wk=calloc(c->n_layers,sizeof(QT));
             m->ix_wp=calloc(c->n_layers,sizeof(QT));
             m->ix_knw=calloc(c->n_layers,sizeof(float*)); m->ix_knb=calloc(c->n_layers,sizeof(float*));
+            if(c->ml4){
+                m->ix_qnw=calloc(c->n_layers,sizeof(float*)); m->ix_qnb=calloc(c->n_layers,sizeof(float*));
+                m->ix_ssm_s=calloc(c->n_layers,sizeof(float*)); m->ix_ssm_b=calloc(c->n_layers,sizeof(float*));
+            }
             for(int i=layer_begin;i<layer_end;i++){
                 if(!c->idx_type[i]) continue;
                 #define PI(s) (snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.indexer." s,i),nm)
-                m->ix_wq[i]=qt_load(m,PI("wq_b.weight"), c->index_nh*c->index_hd, c->q_lora, dbits);
+                if(c->ml4){   /* Mistral-Large-4: the indexer's query from the input's LayerNorm, its own SSMax */
+                    m->ix_qnw[i]=ld(m,PI("q_input_norm.weight")); m->ix_qnb[i]=ld(m,PI("q_input_norm.bias"));
+                    m->ix_ssm_s[i]=ld(m,PI("softmax_scaling.scale")); m->ix_ssm_b[i]=ld(m,PI("softmax_scaling.bias"));
+                }
+                m->ix_wq[i]=qt_load(m,PI("wq_b.weight"), c->index_nh*c->index_hd, c->ml4 ? D : c->q_lora, dbits);
                 m->ix_wk[i]=qt_load(m,PI("wk.weight"), c->index_hd, D, dbits);
                 m->ix_wp[i]=qt_load(m,PI("weights_proj.weight"), c->index_nh, D, dbits);
                 m->ix_knw[i]=ld(m,PI("k_norm.weight")); m->ix_knb[i]=ld(m,PI("k_norm.bias"));
@@ -5119,9 +5219,159 @@ static void kv_lc_rows_f32(Model *m, int layer, int64_t t0, int64_t n, float *ds
 #ifdef COLI_VULKAN
 static void glmc_cpu_rows(Model *m, int layer, KVState *const *kvs, const int *positions, int pos_base, int S);
 #endif
+/* Mistral-Large-4's attention (model_type mistral_large4), on the CPU: GLM-5.2's MLA without the
+ * query LoRA (q_proj straight from the input), the layer's own key width (a NoPE layer's whole
+ * key unrotated, no rotary cache row), the queries times SSMax (s * log(pos + 1) + b per head)
+ * after their rotation, a layer reading another's KV latent copying that layer's rows into its
+ * own (the source runs first in the same forward), the indexer from the input's LayerNorm with
+ * its own SSMax (rotated on RoPE layers only), the "shared" layers reading the last full one's
+ * selection. The scores over the latent as in the absorbed path below (q_nope through k_b,
+ * the context back through v_b); the KV rows float32 or float16 (KV16). */
+static inline const float *ml4_row(KVState *ks, int layer, int t, int n, int rope, float *buf){
+    if(g_kv16){ kv16_unpack(buf,(const uint16_t *)coli_kv_row8(rope ? ks->Rc8[layer] : ks->Lc8[layer],t,2*n),n); return buf; }
+    return coli_kv_row(rope ? ks->Rc[layer] : ks->Lc[layer],t,n);
+}
+static inline void ml4_put(KVState *ks, int layer, int t, int n, int rope, const float *v){
+    if(g_kv16) kv16_pack((uint16_t *)coli_kv_row8(rope ? ks->Rc8[layer] : ks->Lc8[layer],t,2*n),v,n);
+    else memcpy(coli_kv_row(rope ? ks->Rc[layer] : ks->Lc[layer],t,n),v,(size_t)n*sizeof(float));
+}
+static void attention_rows_ml4(Model *m, Layer *l, int layer, float *x, int S, int pos_base,
+                               KVState *const *kvs, const int *positions, float *out){
+    Cfg *c=&m->c; const int H=c->n_heads, D=c->hidden, qh=c->qk_head, vh=c->v_head, kvl=c->kv_lora;
+    const int R=l->rope, nope=l->nope, src=c->kv_src[layer], RQ=c->qk_rope;
+    double ta0=now_s();
+    float *Q=falloc((int64_t)S*H*qh), *ctx=falloc((int64_t)S*H*vh), *comp=NULL;
+    matmul_qt_ex(Q, x, &l->q_b, S, 0);
+    if(src==layer){ comp=falloc((int64_t)S*(kvl+R)); matmul_qt_ex(comp, x, &l->kv_a, S, 0); }
+    for(int s=0;s<S;s++){
+        KVState *ks=kvs?kvs[s]:m->kv;
+        int pos=positions?positions[s]:pos_base+s;
+        float *qs=Q+(int64_t)s*H*qh, lp=logf((float)pos+1.f);
+        for(int h=0;h<H;h++){
+            float *qp=qs+(int64_t)h*qh;
+            if(R) rope_interleave(qp+nope, pos, c);
+            float f=l->ssm_s[h]*lp+l->ssm_b[h];
+            for(int d=0;d<qh;d++) qp[d]*=f;
+        }
+        if(src==layer){
+            float *Ls=comp+(int64_t)s*(kvl+R);
+            rmsnorm(Ls, Ls, l->kv_a_ln, kvl, c->eps);
+            ml4_put(ks,layer,pos,kvl,0,Ls);
+            if(R){ rope_interleave(Ls+kvl, pos, c); ml4_put(ks,layer,pos,RQ,1,Ls+kvl); }
+        } else {   /* the source layer's rows, written earlier in this forward */
+            float b1[512], b2[256];
+            ml4_put(ks,layer,pos,kvl,0,ml4_row(ks,src,pos,kvl,0,b1));
+            if(R) ml4_put(ks,layer,pos,RQ,1,ml4_row(ks,src,pos,RQ,1,b2));
+        }
+    }
+    /* the indexer: a full layer's keys into Ic and every row's top index_topk keys, which the
+     * shared layers after it read */
+    const int *dsel=NULL, *dnsel=NULL; int dtopk=0;
+    if(m->has_dsa){
+        const int nh=c->index_nh, hd=c->index_hd; dtopk=c->index_topk;
+        if(c->idx_type[layer]){
+            float *KD=falloc((int64_t)S*hd);
+            matmul_qt_ex(KD, x, &m->ix_wk[layer], S, 0);
+            for(int s=0;s<S;s++){
+                KVState *ks=kvs?kvs[s]:m->kv;
+                int pos=positions?positions[s]:pos_base+s;
+                float *kd=coli_kv_row(ks->Ic[layer],pos,hd);
+                memcpy(kd, KD+(int64_t)s*hd, (size_t)hd*sizeof(float));
+                layernorm(kd, m->ix_knw[layer], m->ix_knb[layer], hd, c->ix_eps);
+                if(R) rope_interleave(kd, pos, c);
+            }
+            free(KD);
+            if((int64_t)S*dtopk > m->dsa_scap){
+                free(m->dsa_sel); free(m->dsa_nsel);
+                m->dsa_scap=(int64_t)S*dtopk;
+                m->dsa_sel=malloc((size_t)m->dsa_scap*sizeof(int));
+                m->dsa_nsel=malloc((size_t)S*sizeof(int));
+            }
+            #pragma omp parallel for schedule(dynamic,1) if(S > 1)
+            for(int s=0;s<S;s++){
+                KVState *ks=kvs?kvs[s]:m->kv;
+                int pos=positions?positions[s]:pos_base+s, nk=pos+1;
+                if(ks->kv_start[layer]!=0 || (nk<=dtopk && !g_dsa_force)){ m->dsa_nsel[s]=0; continue; }
+                int keep = nk<dtopk ? nk : dtopk;
+                float *xn=falloc(D), *qi=falloc((int64_t)nh*hd), *w32=falloc(nh), *isc=falloc(nk), *tmp=falloc(nk);
+                memcpy(xn, x+(int64_t)s*D, (size_t)D*sizeof(float));
+                layernorm(xn, m->ix_qnw[layer], m->ix_qnb[layer], D, c->ix_eps);
+                matmul_qt(qi, xn, &m->ix_wq[layer], 1);
+                float lp=logf((float)pos+1.f);
+                for(int h=0;h<nh;h++){
+                    float f=m->ix_ssm_s[layer][h]*lp+m->ix_ssm_b[layer][h];
+                    for(int i=0;i<hd;i++) qi[(int64_t)h*hd+i]*=f;
+                    if(R) rope_interleave(qi+(int64_t)h*hd, pos, c);
+                }
+                matmul_qt(w32, x+(int64_t)s*D, &m->ix_wp[layer], 1);
+                float wsc=1.f/sqrtf((float)nh), rs=1.f/sqrtf((float)hd);
+                for(int t=0;t<nk;t++){
+                    const float *kt=coli_kv_row(ks->Ic[layer],t,hd);
+                    float a=0;
+                    for(int h=0;h<nh;h++){ const float *qhp=qi+(int64_t)h*hd;
+                        float d0=0; for(int i=0;i<hd;i++) d0+=qhp[i]*kt[i];
+                        d0*=rs; if(d0>0) a+=w32[h]*d0;
+                    }
+                    isc[t]=a*wsc;
+                }
+                memcpy(tmp,isc,nk*sizeof(float));
+                partial_select_desc(tmp,nk,keep);
+                float thr=tmp[0]; for(int t=1;t<keep;t++) if(tmp[t]<thr) thr=tmp[t];
+                int *dst=m->dsa_sel+(int64_t)s*dtopk, nd=0;
+                for(int t=0;t<nk && nd<keep;t++) if(isc[t]>thr) dst[nd++]=t;
+                for(int t=0;t<nk && nd<keep;t++) if(isc[t]==thr) dst[nd++]=t;
+                m->dsa_nsel[s]=nd;
+                free(xn); free(qi); free(w32); free(isc); free(tmp);
+            }
+        }
+        if(m->dsa_nsel){ dsel=m->dsa_sel; dnsel=m->dsa_nsel; }
+    }
+    int64_t sc_cap=1;
+    for(int s=0;s<S;s++){
+        KVState *ks=kvs?kvs[s]:m->kv;
+        int pos=positions?positions[s]:pos_base+s;
+        int64_t nt=(dnsel && dnsel[s]>0) ? dnsel[s] : pos+1-ks->kv_start[layer];
+        if(nt>sc_cap) sc_cap=nt;
+    }
+    float *sc_all=falloc((int64_t)omp_get_max_threads()*sc_cap);
+    #pragma omp parallel for collapse(2) schedule(static,1)
+    for(int s=0;s<S;s++) for(int h=0;h<H;h++){
+        KVState *ks=kvs?kvs[s]:m->kv;
+        int pos=positions?positions[s]:pos_base+s, st0=ks->kv_start[layer];
+        const float *qp=Q+((int64_t)s*H+h)*qh, *qr=qp+nope;
+        const int rbase=h*(nope+vh);
+        float qabs[512]; memset(qabs,0,kvl*sizeof(float));
+        if(l->kv_b.fmt==QT_KVB) qt_kvb_absorb(&l->kv_b,h,qp,qabs);
+        else for(int d=0;d<nope;d++) qt_addrow(&l->kv_b, rbase+d, qp[d], qabs);
+        float *sc=sc_all+(int64_t)omp_get_thread_num()*sc_cap;
+        int ns=(dnsel && dnsel[s]>0) ? dnsel[s] : 0;
+        const int *tl=ns ? dsel+(int64_t)s*dtopk : NULL;
+        int nt=ns ? ns : pos+1-st0;
+        float lb[512], rb[256];
+        for(int jj=0;jj<nt;jj++){ int t=tl ? tl[jj] : st0+jj;
+            const float *Lt=ml4_row(ks,layer,t,kvl,0,lb);
+            float a=0;
+            for(int i=0;i<kvl;i++) a+=qabs[i]*Lt[i];
+            if(R){ const float *kr=ml4_row(ks,layer,t,RQ,1,rb); for(int d=0;d<R;d++) a+=qr[d]*kr[d]; }
+            sc[jj]=a*c->attn_scale;
+        }
+        softmax(sc,nt);
+        float clat[512]; memset(clat,0,kvl*sizeof(float));
+        for(int jj=0;jj<nt;jj++){ int t=tl ? tl[jj] : st0+jj;
+            const float *Lt=ml4_row(ks,layer,t,kvl,0,lb);
+            for(int i=0;i<kvl;i++) clat[i]+=sc[jj]*Lt[i];
+        }
+        qt_matvec_rows(&l->kv_b, rbase+nope, vh, clat, ctx+((int64_t)s*H+h)*vh);
+    }
+    free(sc_all);
+    matmul_qt(out, ctx, &l->o, S);
+    free(Q); free(ctx); free(comp);
+    m->t_attn += now_s()-ta0;
+}
 static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int pos_base,
                            KVState *const *kvs, const int *positions, float *out){
     Cfg *c=&m->c; int H=c->n_heads, D=c->hidden, qh=c->qk_head, vh=c->v_head;
+    if(c->ml4){ attention_rows_ml4(m,l,layer,x,S,pos_base,kvs,positions,out); return; }
     int kvb_dim=H*(c->qk_nope+vh), Tk=pos_base+S;
     double ta0=now_s();
 #ifdef COLI_VULKAN
@@ -6517,6 +6767,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     if(!pre_routed)
     for(int s=0;s<S;s++){
         float *logit=logits_all+(int64_t)s*E;
+        if(c->softmax_router){   /* Mistral-Large-4: a softmax over the experts, no bias in the choice */
+            float mx=logit[0]; for(int e=1;e<E;e++) if(logit[e]>mx) mx=logit[e];
+            float tot=0; for(int e=0;e<E;e++){ logit[e]=expf(logit[e]-mx); tot+=logit[e]; }
+            for(int e=0;e<E;e++){ logit[e]/=tot; choice[e]=logit[e]; }
+        } else
         for(int e=0;e<E;e++){ logit[e]=sigmoidf(logit[e]); choice[e]=logit[e]+l->router_bias[e]; }
         int *idx=idxs+(int64_t)s*K; float *w=ws+(int64_t)s*K;
         int Ksel = g_topk>0 ? (g_topk<K?g_topk:K) : K;
@@ -7583,7 +7838,7 @@ static void la_predict(Model *m, int target, const float *h, int kind){
         rmsnorm(nrm, hc, l->post_ln, D, c->eps);
         free(snrm); free(sg); free(su); free(sout); free(hc);
         matmul(ch, nrm, l->router, 1, D, E);
-        for(int e=0;e<E;e++) ch[e] = sigmoidf(ch[e]) + l->router_bias[e];
+        if(!c->softmax_router) for(int e=0;e<E;e++) ch[e] = sigmoidf(ch[e]) + l->router_bias[e];   /* softmax: the logits rank alike */
         int *pred = la_pred[2][target];
         for(int kk=0;kk<K;kk++){ int best=-1; float bv=-1e30f;
             for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(pred[j]==e){tk=1;break;}
@@ -7597,7 +7852,7 @@ static void la_predict(Model *m, int target, const float *h, int kind){
     /* Baseline kinds 0 and 1: pure router on the given state */
     rmsnorm(nrm,h,l->post_ln,D,c->eps);
     matmul(ch,nrm,l->router,1,D,E);
-    for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
+    if(!c->softmax_router) for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
     int *pred=la_pred[kind][target];
     for(int kk=0;kk<K;kk++){ int best=-1; float bv=-1e30f;
         for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(pred[j]==e){tk=1;break;}
@@ -7933,7 +8188,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
             rmsnorm(nrm, xs, l->post_ln, D, c->eps);
         }
         matmul(ch, nrm, l->router, 1, D, E);
-        for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
+        if(!c->softmax_router) for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
         for(int kk=0;kk<K;kk++){
             int best=0; for(int e=1;e<E;e++) if(ch[e]>ch[best]) best=e;
             ch[best]=-2e30f;
@@ -8480,7 +8735,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
     if(m->has_mtp && S>=2 && g_draft>0) mtp_absorb(m, ids+1, x, S-1, pos_base);
     float *last=falloc(D); rmsnorm(last, x+(int64_t)(S-1)*D, m->final_norm, D, c->eps);
     double th0=now_s();
-    float *logit=falloc(c->vocab); matmul_qt(logit,last,&m->lm_head,1);
+    float *logit=falloc(c->vocab); lm_logits(m,logit,last,1);
     m->t_head += now_s()-th0;
     DUMP_LOGITS(logit,c->vocab);
     free(x); free(last); return logit;
@@ -8496,7 +8751,7 @@ static float *step_all(Model *m, const int *ids, int S, int pos_base){
     if(m->hlast) memcpy(m->hlast, x+(int64_t)(S-1)*D, D*sizeof(float));
     float *lo=falloc((int64_t)S*c->vocab), *row=falloc(D);
     for(int s=0;s<S;s++){ rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);
-        matmul_qt(lo+(int64_t)s*c->vocab, row, &m->lm_head, 1); }
+        lm_logits(m,lo+(int64_t)s*c->vocab, row,1); }
     DUMP_LOGITS(lo,(int64_t)S*c->vocab);
     free(x); free(row); return lo;
 }
@@ -8534,7 +8789,7 @@ static float *step_decode_batch(Model *m, const DecodeRow *rows, int S){
         rmsnorm(norm+(int64_t)s*D,x+(int64_t)s*D,m->final_norm,D,c->eps);
     double th0=now_s();
     float *logit=falloc((int64_t)S*c->vocab);
-    matmul_qt(logit,norm,&m->lm_head,S);
+    lm_logits(m,logit,norm,S);
     m->t_head+=now_s()-th0;
     free(x); free(norm);
     return logit;
@@ -8632,12 +8887,12 @@ static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft, float *p
         double n_eh=0; for(int d=0;d<D;d++) n_eh+=hx[d]*hx[d];
         int dbg = getenv("MTP_DEBUG") && atoi(getenv("MTP_DEBUG"))>=2;
         int t_pre=-1;
-        if(dbg){ rmsnorm(row, hx, m->mtp_norm, D, c->eps); matmul_qt(logit, row, &m->lm_head, 1);
+        if(dbg){ rmsnorm(row, hx, m->mtp_norm, D, c->eps); lm_logits(m,logit, row,1);
                  t_pre=mtp_argmax(logit, c->vocab); }
         layer_forward(m, &m->mtpL, li, hx, 1, pos, nrm, tmp);
         double n_post=0; for(int d=0;d<D;d++) n_post+=hx[d]*hx[d];
         rmsnorm(row, hx, m->mtp_norm, D, c->eps);
-        matmul_qt(logit, row, &m->lm_head, 1);
+        lm_logits(m,logit, row,1);
         int t2=mtp_argmax(logit, c->vocab);
         if(dbg) fprintf(stderr,"[mtp2] pos=%d in_tok=%d ||eh||=%.1f ||post||=%.1f pre_blk=%d post_blk=%d\n",
                         pos, tok, sqrt(n_eh), sqrt(n_post), t_pre, t2);
@@ -9068,7 +9323,7 @@ static int forward_all(Model *m, const int *ids, int S, int *pred, const int *re
     float *row=falloc(D);
     for(int s=0;s<S;s++){
         rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);   /* heap row (#183) */
-        matmul_qt(lo, row, &m->lm_head, 1);
+        lm_logits(m,lo, row,1);
         DUMP_LOGITS(lo,c->vocab);
         if(!oracle_logits_finite(lo,c->vocab)){
             fprintf(stderr,"[ORACLE] non-finite logits at teacher-forcing position %d\n",s);
@@ -9171,7 +9426,7 @@ static void run_score(Model *m, const char *snap, const char *path){
         double lp=0; int greedy=1;
         for(int pos=ctxlen-1; pos<T-1; pos++){
             rmsnorm(row, x+(int64_t)pos*D, m->final_norm, D, c->eps);
-            matmul_qt(lo,row,&m->lm_head,1);
+            lm_logits(m,lo,row,1);
             int am; lp += logprob_target(lo,c->vocab,ids[pos+1],&am); if(!am) greedy=0;
         }
         printf("%.6f %d %d\n", lp, contlen, greedy); fflush(stdout);
@@ -9902,7 +10157,7 @@ static int ablate_model_row_output(void *ctx, FILE *of, int64_t pos){
     if(ABLATE_MODEL_COMPUTE_ENABLED){
         rmsnorm(rows->row, rows->x+(int64_t)pos*rows->D,
                 m->final_norm, rows->D, c->eps);
-        matmul_qt(rows->lo, rows->row, &m->lm_head, 1);
+        lm_logits(m,rows->lo, rows->row,1);
     }
     return ablate_logit_record(of,rows->item,pos,rows->ids[pos+1],
                                rows->lo,rows->V);
@@ -10836,11 +11091,11 @@ static float *mux_prefill_echo(Model *m, Tok *T, unsigned long long id,
     double th0=now_s();
     for(int pos=from+1; pos<nt; pos++){
         rmsnorm(row, x+(int64_t)(pos-1-from)*D, m->final_norm, D, c->eps);
-        matmul_qt(lo, row, &m->lm_head, 1);
+        lm_logits(m,lo, row,1);
         mux_echo(T,id,pos,ids[pos],lo,V,topk);
     }
     rmsnorm(row, x+(int64_t)(add-1)*D, m->final_norm, D, c->eps);
-    matmul_qt(lo, row, &m->lm_head, 1);
+    lm_logits(m,lo, row,1);
     m->t_head += now_s()-th0;
     free(x); free(row);
     return lo;                           /* last position: the generation continuation */
@@ -13411,7 +13666,7 @@ static void glm_dho_start(Model *m){
 #ifdef COLI_CUDA
     cuda = g_cuda_enabled;
 #endif
-    if(cuda || g_kv8 || g_tq || g_pilot) chain = COLI_VK_CHAIN_OFF;   /* glmc_start keeps it off */
+    if(cuda || g_kv8 || g_tq || g_pilot || m->c.ml4) chain = COLI_VK_CHAIN_OFF;   /* glmc_start keeps it off */
     int slots = getenv("KV_SLOTS") ? atoi(getenv("KV_SLOTS")) : 1;
     DhoPass p = {0};
     const char *xv = getenv("COLI_EXACT_VERIFY");   /* exact_verify_on() prints its line later, where it always did */
@@ -14163,6 +14418,12 @@ int main(int argc, char **argv){
      * with the run's tokens already correct (#1262). Static storage outlives
      * every thread, so the pointer the worker holds stays valid. */
     static Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
+    if(m.c.ml4){   /* Mistral-Large-4: its attention is the CPU's (attention_rows_ml4), its KV float32 or float16 */
+        if(g_kv8||g_tq){ fprintf(stderr,"[ML4] KV8 and KV_TQ are not this model's yet: the KV cache in float16\n"); g_kv8=g_tq=0; g_kv16=1; }
+#ifdef COLI_CUDA
+        if(g_cuda_pipe){ fprintf(stderr,"[ML4] COLI_CUDA_PIPE runs GLM-5.2's attention: off for this model\n"); g_cuda_pipe=0; }
+#endif
+    }
     /* KV_TQ requires power-of-two row widths: both codecs rotate through a
      * radix-2 FWHT, and coli_kvq_quant_row returns an inert radius 0 for any
      * other width. On a model whose kv_lora/qk_rope are not powers of two that
