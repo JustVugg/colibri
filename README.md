@@ -146,6 +146,43 @@ API, совместимый с OpenAI и Anthropic: `http://127.0.0.1:18080/v1`,
 
 </details>
 
+## This fork: Kimi K3 on the same machine
+
+**moonshotai/Kimi-K3** (2.8T parameters, 104B active, 1.561 TB of MXFP4 experts and BF16
+weights) on the same Ryzen 9 7950X3D, 192 GB, RTX 4090 and two NVMe drives. No runtime
+holds K3 in this machine's memory, so every token reads its experts from disk: 25.8 GB a
+token before any cache hit, at 16.9 GB/s with both drives reading at once
+([the plan, the other K3 engines and what was taken from them](docs/kimi_k3-4090.md)).
+Not yet measured on the real model; the steps so far, each checked on the tiny model:
+
+- `c\tools\download_kimi_k3_4090.ps1` fetches the checkpoint and cuts every MoE layer's
+  shard between `C:` (61.4% of its experts) and `D:` (38.6%), in proportion to their
+  read speeds, so a layer's reads go to both drives; SHA-256 checked, resumable,
+  reversible (`-Join`).
+- the engine reads with two readers per drive, each with its own unbuffered handles,
+  and reads the next layer's predicted experts ahead; the logits are the old loader's
+  byte for byte.
+- the largest dense matrices (20 GiB) on the GPU, a tiled kernel for prompt steps.
+- `c\tools\start_kimi_k3_4090.ps1` serves the OpenAI/Anthropic API on port 18080 (model
+  `kimi-k3`), with photos of every turn so agent clients that drop the reasoning resume
+  instead of recomputing the conversation.
+
+<details>
+<summary>По-русски</summary>
+
+**Kimi K3** (2,8 трлн параметров, 104 млрд активных, 1,561 ТБ) на том же ПК. Ни один
+движок не помещает K3 в 192 ГБ ОЗУ + 24 ГБ VRAM, поэтому эксперты читаются с дисков:
+25,8 ГБ на токен без попаданий в кэш, 16,9 ГБ/с с двух дисков сразу. Скрипт
+`c\tools\download_kimi_k3_4090.ps1` скачивает модель и делит шард каждого MoE-слоя между
+`C:` (61,4% экспертов) и `D:` (38,6%) по скорости чтения дисков — каждый слой читается с
+обоих дисков одновременно (SHA-256 проверяется, докачка, `-Join` собирает исходные
+шарды обратно). В движке: по два потока чтения на диск со своими дескрипторами,
+упреждающее чтение экспертов следующего слоя, крупнейшие плотные матрицы (20 ГиБ) на
+GPU, «снимки» состояния на каждом ходе для агентов. Запуск: `c\tools\start_kimi_k3_4090.ps1`.
+Замеры на настоящей модели — после скачивания. Подробно: [docs/kimi_k3-4090.md](docs/kimi_k3-4090.md).
+
+</details>
+
 <a id="get-started"></a>
 <a id="the-one-step-way"></a>
 
