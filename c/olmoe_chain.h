@@ -728,7 +728,18 @@ static int olc_forward_seg(Model *m, OlmChain *ch, const int *ids, float *xh, in
     int CH = mirror_ok ? olc_chunk_rows(ch, m) : 1, rows = S < CH ? S : CH, half = hd / 2;
     if (ch->ks.on && rows > ch->ks.chunk) rows = ch->ks.chunk;   /* a step's rows fit the split's window */
     int pilot = g_pilot >= 1 && S <= 8;          /* layers_forward_range's PILOT condition */
-    if (!mirror_ok || pos_base + S > m->max_t || !olc_scratch(ch, m, rows) ||
+    /* the scratch for a power of two of rows (from 64, at most a chunk's or the split's window):
+     * sized to the rows exactly, a prompt longer than any before regrew it (OLMoE on Vulkan:
+     * 77.8 ms a prompt of 471 tokens, 71-72 one of 470) */
+    int srows = rows;
+    if (srows > ch->rows) {
+        int top = CH;
+        if (ch->ks.on && top > ch->ks.chunk) top = ch->ks.chunk;
+        srows = 64; while (srows < rows) srows *= 2;
+        if (srows > top) srows = top;
+        if (srows < rows) srows = rows;
+    }
+    if (!mirror_ok || pos_base + S > m->max_t || !olc_scratch(ch, m, srows) ||
         (want_x && !olc_res(&ch->xd, (size_t)rows * D, VKC_DOWN)) ||
         (pilot && !olc_res(&ch->xpd, (size_t)rows * D, VKC_DOWN))) {
         fprintf(stderr, "[VK] olmoe chain: device memory for %d rows refused; per-matrix path\n", rows);
