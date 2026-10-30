@@ -422,6 +422,17 @@ full, the scoring rules and where it does not help:
 `coli web` opens it, and so does the one-step setup: the chat, the System One
 page, the Brain and the Profiling page, in a light or a dark theme.
 
+### The chat UI
+
+`coli ui` opens the new chat next to a running `coli serve`: reasoning in its own block,
+pictures for models with a vision tower, web search, the expert map, a live monitor, and
+coding agents opened already pointed at colibri. Seven languages. See [ui/README.md](ui/README.md).
+
+<p align="center">
+  <img src="docs/media/ui/ui-chat.png" width="900" alt="the chat UI: a question, the reasoning folded, the answer, and its speed">
+</p>
+<p align="center"><em>LFM3-VL-2B on an i5-13500's CPU, 32 tok/s.</em></p>
+
 <p align="center">
   <img src="docs/media/colibri-dashboard.png" width="900" alt="the colibri web dashboard: chat, live metrics, hardware panel, expert tiers">
 </p>
