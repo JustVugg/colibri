@@ -6873,7 +6873,7 @@ class Engine:
         self.hwinfo = None
         self.emap = None
         self.hits = None
-        self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
+        self.hits_seq = 0                      # HITS generation, not EMAP freshness
         self.hits_live = collections.deque(maxlen=256)   # HITL frames: experts routed per decode step
         self.hits_live_seq = 0
         self.profile = collections.deque(maxlen=PROFILE_TURNS)  # per-turn phase timings
@@ -7216,7 +7216,12 @@ class Engine:
                                    "cpu": parts[0].strip() if len(parts)>0 else "",
                                    "gpu": parts[1].strip() if len(parts)>1 else ""}
                 elif kind == "EMAP" and len(fields) == 4:
-                    self.emap = {"rows": int(fields[1]), "cols": int(fields[2]), "map": fields[3]}
+                    # EMAP may arrive after DONE. Publish a fresh immutable map
+                    # snapshot, correlated with the HITS generation seen here.
+                    map_seq = (self.emap or {}).get("map_seq", 0) + 1
+                    self.emap = {"rows": int(fields[1]), "cols": int(fields[2]),
+                                 "map": fields[3], "map_seq": map_seq,
+                                 "map_hits_seq": self.hits_seq}
                 elif kind == "HITS" and len(fields) == 4:
                     self.hits = fields[3]
                     self.hits_seq += 1
@@ -8376,7 +8381,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_json(200, payload, request_id)
                 return
             if path == "/experts":
-                payload = {"rows": 0, "cols": 0, "map": "", "hits": "", "seq": 0}
+                payload = {"rows": 0, "cols": 0, "map": "", "hits": "", "seq": 0,
+                           "map_seq": 0, "map_hits_seq": 0}
                 eng = self.server.engine
                 since = parse_qs(urlsplit(self.path).query).get("since")
                 if self._is_authed() and eng and getattr(eng, "emap", None):   # (#SEC-8) hide routing telemetry unless authed
