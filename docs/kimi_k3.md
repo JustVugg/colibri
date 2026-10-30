@@ -64,16 +64,43 @@ per-row / int4-g64), or read pre-quantized from a repacked container.
 Experts are streamed straight from the safetensors shards through a per-layer
 LRU (`K3_EXPERT_GB`). Measured layout facts the engine exploits: the six
 tensors of an expert are stored back-to-back (one expert = one `pread`), and
-experts are *not* id-ordered inside a shard, so loads are issued in disk-offset
-order. A token's misses are read **in parallel** (OMP over working-set slots)
-and by default with **O_DIRECT** (`K3_DIRECT=0` for buffered): the resident
+experts are *not* id-ordered inside a shard but by their ids as text
+("0", "1", "10", "100", ...: safetensors sorts tensor names), so loads run in
+disk-offset order, and a step adds its experts in that order wherever the experts
+are (one shard, or a shard cut over drives by `tools/k3_download.py`). Reads are
+by default **O_DIRECT** (`K3_DIRECT=0` for buffered): the resident
 weights leave little page-cache headroom, and flat routing means cached reads
 mostly cannot be reused anyway — measured on the 93-layer model this took
 expert reads from ~1.8 to ~6.3 GB/s (drive ceiling 7.1) and decode from ~21
 to ~9.4 s/token. The LRU slot floor is 1 (experts are consumed one at a time),
-so `K3_EXPERT_GB` is honored even at tiny budgets. On top of that, `K3_PIPE`
-(default on) runs the reads on loader threads so expert j's matmuls overlap
-expert j+1's pread, `K3_IDOT` (default on) computes the expert matmuls with
+so `K3_EXPERT_GB` is honored even at tiny budgets.
+
+**Readers per drive** (`K3_PIPE`, default on): the reads run on reader threads,
+so expert j's matmuls overlap the reads of the experts after it. The shards'
+storage devices are told apart, each gets `K3_IO_PER_DRIVE` readers (2) and two
+queues, a step's demands before the next layer's prefetches; on Windows each
+reader opens its own unbuffered handle per shard, because reads through one
+synchronous handle are serialized (the four loader threads this replaced read one
+expert of a layer's shard at a time there). With the checkpoint cut over two
+drives every layer's reads go to both at once: on the RTX 4090 machine
+(docs/kimi_k3-4090.md) 17.5 MB reads at three readers give 10.3 GB/s on `C:`
+and 6.6 on `D:` together, 16.9 GB/s.
+
+**Next-layer prefetch** (`K3_PREFETCH`, default on in decode steps of up to
+`K3_PREFETCH_ROWS`, 4, rows): after a step's attention in layer i, layer i+1's
+router applied to layer i's MLP input (normed by i+1's own post-attention norm)
+predicts the experts i+1 will ask for, and those its cache lacks are read ahead,
+queued behind layer i's own reads; when i+1's routing comes, the predicted experts
+it did not choose leave the queue unread. A wrong prediction costs a read and a
+slot that is reused first, never a number. The run's last line says how many were
+read ahead and used and what share of the routed experts the predictions held
+(on the tiny fixture about half; the real model's is to be measured).
+`K3_IO_DELAY_US` slows every read for the tests that exercise the queues. None of
+this moves a bit: the logits are those of the old loader in every configuration
+tested (cache sizes, chunk sizes, one or two folders on two drives, buffered,
+slow disks).
+
+`K3_IDOT` (default on) computes the expert matmuls with
 per-32-group int8-quantized activations via integer dots (the e2m1 doubled
 values are exact int8 — same trick as `dot_i4i8`), and `K3_TOPP` optionally
 drops the low-weight tail of the top-16 (renormalized; quality-gate any
@@ -177,12 +204,17 @@ Judge quantization choices on real-text logits, not synthetic-vector norms.
 | `K3_VK_UP` | unset | old switch, a number read as `COLI_VK_TIER_RATE` when that is unset; `auto` does nothing |
 | `K3_DIRECT` | 1 | O_DIRECT expert reads (0 = buffered + WILLNEED) |
 | `K3_IDOT` | 1 | int8-activation expert matmuls (0 = exact-float kernel) |
-| `K3_PIPE` | 1 | overlap expert loads with compute (loader threads) |
-| `K3_LOAD_THREADS` | 4 | loader threads for `K3_PIPE` |
+| `K3_PIPE` | 1 | expert reads on reader threads, beside the compute |
+| `K3_IO_PER_DRIVE` | 2 | readers per storage device the shards are on |
+| `K3_IO_THREADS` | — | that many readers on one queue instead (`K3_LOAD_THREADS`, the old loader's size, is read as this); 0 = reads on the caller |
+| `K3_PREFETCH` | 1 | read the next MoE layer's predicted experts ahead (decode steps) |
+| `K3_PREFETCH_ROWS` | 4 | the most rows a step may have for its prediction |
+| `K3_PREFETCH_LIMIT` | 64 | prefetches queued at once |
+| `K3_IO_DELAY_US` | 0 | tests: every read waits this long first |
 | `K3_TOPP` | 0 | keep routed experts to cumulative weight p (0 = off) |
 | `K3_CHUNK` | 32 | prefill chunk size (1 = token-at-a-time; forced 1 under `K3_TRACE`) |
 | `K3_THINK` | 1 | chat mode: open the structural think channel (0 = response-only) |
-| `K3_DIRS` | — | extra shard directories (multi-drive split, no duplication) |
+| `K3_DIRS` | — | extra shard directories (multi-drive split, no duplication; `tools/k3_download.py` cuts every layer over them) |
 | `K3_MAXT` | prompt+ngen | context capacity |
 | `K3_LAYERS` | all | truncate the stack (validation) |
 | `K3_TRACE` | — | dump f32 hidden state after every layer (validation) |

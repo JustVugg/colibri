@@ -61,8 +61,12 @@
  *                        IMPLEMENTED; all ops fall through to CPU).
  *   K3_DIRECT=0|1        O_DIRECT expert reads (default 1; buffered fallback)
  *   K3_IDOT=0|1          int8-activation expert matmuls (default 1; 0 = float)
- *   K3_PIPE=0|1          overlap expert loads with compute (default 1)
- *   K3_LOAD_THREADS=N    loader threads for K3_PIPE (default 4)
+ *   K3_PIPE=0|1          expert reads on reader threads, beside the compute (default 1)
+ *   K3_IO_PER_DRIVE=N    readers per storage device the shards are on (default 2)
+ *   K3_IO_THREADS=N      that many readers on one queue instead (K3_LOAD_THREADS
+ *                        alike); 0 = reads on the caller
+ *   K3_PREFETCH=0|1      read the next MoE layer's predicted experts ahead in decode
+ *                        steps of up to K3_PREFETCH_ROWS (4) rows (default 1)
  *   K3_TOPP=F            keep routed experts to cumulative weight F (0 = off)
  *   K3_CHUNK=N           prefill chunk size (default 32; 1 = token-at-a-time)
  *   K3_THINK=0|1         chat mode: open the think channel (default 1)
@@ -199,11 +203,15 @@ typedef struct {
 } Layer;
 
 /* ---------- routed-expert streaming (native MXFP4 from the HF shards) ---- */
-typedef struct { int fd[6]; int64_t off[6]; int contig; } ERef;  /* w1p w1s w2p w2s w3p w3s */
+typedef struct { int fd[6], fi[6]; int64_t off[6]; int contig; } ERef;  /* w1p w1s w2p w2s w3p w3s; fi: the shard's index */
 #ifndef KIMI_K3_NO_MAIN
 static char g_k3_usage[2100];   /* <snap>/.coli_usage, or COLI_USAGE */
 #endif
-typedef struct { int eid; uint8_t *buf, *base; uint64_t used; int pinned; } Slot;
+typedef struct { int eid; uint8_t *buf, *base; uint64_t used; int pinned;
+                 _Atomic int state;   /* K3S_LOADING while a reader fills it (K3_PIPE), else K3S_READY */
+                 int pref;            /* read ahead by the prefetcher, not asked for yet */
+                 int qd; unsigned qp; /* a queued read: its drive and its place in that drive's queue */
+               } Slot;
 /* pinned: seeded from .coli_usage at startup and never evicted. The LRU adapts to
  * THIS session; the pin knows the history of every session before it. Capped at
  * half the layer budget so the adaptive half always survives — an all-pinned cache
@@ -258,8 +266,15 @@ typedef struct {
     LCache *ecache;
     uint8_t **ehit;                       /* experts routed this turn, for HITS (dashboard Brain) */
     int64_t e_w1p, e_w1s, e_w2p, e_w2s, e_slot;
+    int *elex;                            /* [n_experts] an expert's place among the ids sorted as text */
     uint64_t clock, hits, miss, ebytes;
     double t_attn, t_moe, t_eload, t_head;
+    /* K3_PREFETCH: the next MoE layer's experts predicted after a decode step's attention
+     * (k3_prefetch): the rows a prediction waits for, the layer it is for, what it marked */
+    float *pf_x; int pf_n, pf_li;
+    uint8_t *pf_mark;                     /* [layer][expert] predicted for the layer's next step */
+    uint64_t pf_issued, pf_used, pf_wasted, pf_cancelled, pf_pred, pf_pred_hit;
+    double t_pred;
     FILE *trace;
     /* A multiplexed decode step (k3_step_rows): row t is the token at
      * mux_rows[t].pos of mux_rows[t].seq; NULL in every other forward. */
@@ -975,10 +990,10 @@ static void expert_table_init(Model *m){
                 snprintf(nm,sizeof(nm),"%smodel.layers.%d.block_sparse_moe.experts.%d.%s.weight_%s",
                          m->pfx,li,e2,mat[k/2],(k&1)?"scale":"packed");
                 st_tensor *t=st_find(&m->S,nm);
-                if(!t){ missing++; er->fd[k]=-1; continue; }
+                if(!t){ missing++; er->fd[k]=-1; er->fi[k]=-1; continue; }
                 if(t->nbytes!=want[k]){ fprintf(stderr,"%s: %lld bytes, expected %lld — refusing (untrusted container)\n",
                         nm,(long long)t->nbytes,(long long)want[k]); exit(1); }
-                er->fd[k]=t->fd; er->off[k]=t->off;
+                er->fd[k]=t->fd; er->off[k]=t->off; er->fi[k]=st_fidx(&m->S,t->fd);
             }
             /* HF shards store the six tensors back-to-back (measured: 0 gaps
              * across a whole layer) — collapse the load to ONE pread when so */
@@ -988,6 +1003,21 @@ static void expert_table_init(Model *m){
         }
     }
     if(missing) fprintf(stderr,"[K3] WARNING: %d expert tensors missing (incomplete download?) — touching one aborts\n",missing);
+    /* The order a step adds its experts in: their ids sorted as text ("0" < "1" < "10" <
+     * "100" < ... < "2"). That is the order the published shards store a layer's experts
+     * in (safetensors sorts tensor names), so it is the disk-offset order the sum has
+     * always followed on them, and it stays the same wherever the experts are: one shard,
+     * a shard cut over drives by tools/k3_download.py, or the folders in any order. */
+    m->elex=malloc((size_t)c->n_experts*sizeof(int));
+    char (*txt)[12]=malloc((size_t)c->n_experts*sizeof *txt);
+    if(!m->elex||!txt){fprintf(stderr,"OOM expert order\n");exit(1);}
+    for(int e=0;e<c->n_experts;e++) snprintf(txt[e],sizeof *txt,"%d",e);
+    for(int e=0;e<c->n_experts;e++){
+        int r=0;
+        for(int f=0;f<c->n_experts;f++) r+=strcmp(txt[f],txt[e])<0;
+        m->elex[e]=r;
+    }
+    free(txt);
 }
 
 static void model_init_range(Model *m, const char *snap, int layer_begin,
@@ -1735,13 +1765,22 @@ static void ehit_mark(Model *m, int li, int eid){
     }
     if(li>=0&&li<c->n_layers&&eid>=0&&eid<c->n_experts) ehit[li][eid]=1;
 }
-static Slot *slot_indexed(Model *m, int li, int eid){
+enum { K3S_READY=0, K3S_LOADING=1 };
+static inline int slot_ready(Slot *s){ return atomic_load_explicit(&s->state,memory_order_acquire)==K3S_READY; }
+/* The slot that holds expert eid of layer li, its bytes complete or still on their way
+ * (a prefetch: K3S_LOADING). */
+static Slot *slot_lookup(Model *m, int li, int eid){
     LCache *lc=&m->ecache[li];
     if(eid<0||eid>=m->c.n_experts||!lc->slot_by_expert) return NULL;
     SLOT_INDEX_PROBE();
     int i=lc->slot_by_expert[eid];
     if(i<0||i>=lc->n||lc->s[i].eid!=eid) return NULL;
     return &lc->s[i];
+}
+/* ... only once its bytes are complete */
+static Slot *slot_indexed(Model *m, int li, int eid){
+    Slot *s=slot_lookup(m,li,eid);
+    return s&&slot_ready(s)?s:NULL;
 }
 static Slot *slot_find(Model *m, int li, int eid){
     Slot *s=slot_indexed(m,li,eid);
@@ -1765,7 +1804,27 @@ static void cache_promote(Model *m,int li,Slot *dst,Slot *loaded){
     dst->used=++m->clock;
     cache_index(m,li,dst);
 }
-static void expert_read(Model *m, int li, int eid, Slot *s){
+/* A shard's handle for a reader: with `own` (a reader thread's table, Windows) one the
+ * reader opened itself, on first use -- reads through one synchronous Windows handle are
+ * serialized by its file object's lock, so readers sharing the engine's handle read one
+ * expert of a shard at a time; elsewhere pread on the shared descriptor runs concurrently.
+ * direct: the unbuffered twin (-1 when there is none). */
+static int k3_io_fd(Model *m, int *own, int fi, int direct){
+    if(fi<0) return -1;
+#ifdef _WIN32
+    if(own){
+        int *h=&own[(direct?0:ST_MAX_SHARDS)+fi];
+        if(*h==-2) *h=direct?compat_open_direct(m->S.paths[fi]):open(m->S.paths[fi],COMPAT_O_RDONLY);
+        return *h;
+    }
+#else
+    (void)own;
+#endif
+    return direct?m->S.dfds[fi]:m->S.fds[fi];
+}
+/* The bytes of expert eid of layer li into slot s (s->buf: where they start). Called by
+ * the readers with their handles, and on the caller's thread (own NULL). */
+static void expert_read_h(Model *m, int li, int eid, Slot *s, int *own){
     if(!s->base){
         if(posix_memalign((void**)&s->base,4096,(size_t)m->e_slot+8192)){
             fprintf(stderr,"OOM expert slot\n"); exit(1); }
@@ -1774,33 +1833,38 @@ static void expert_read(Model *m, int li, int eid, Slot *s){
     int64_t sizes[6]={m->e_w1p,m->e_w1s,m->e_w2p,m->e_w2s,m->e_w1p,m->e_w1s};
     if(er->fd[0]<0){ fprintf(stderr,"[K3] expert L%d E%d missing on disk\n",li,eid); exit(1); }
     if(er->contig){
-        int dfd = g_k3_direct ? st_direct_fd(&m->S,er->fd[0]) : -1;
+        int dfd = g_k3_direct ? k3_io_fd(m,own,er->fi[0],1) : -1;
+        int bfd = k3_io_fd(m,own,er->fi[0],0);
+        if(bfd<0) bfd=er->fd[0];
         if(dfd>=0){
             /* aligned window read; sub-4K head/tail slack handled explicitly.
              * The tail past the last aligned block (or past EOF) is fetched
              * with a tiny buffered pread — O_DIRECT wants aligned lengths. */
             int64_t a0=er->off[0]&~4095LL, pad=er->off[0]-a0;
-            int64_t want=pad+m->e_slot;
-            struct stat sb;
+            int64_t want=pad+m->e_slot, size=m->S.sizes[er->fi[0]];
             int64_t dlen=(want+4095)&~4095LL;
-            if(fstat(dfd,&sb)==0 && a0+dlen>sb.st_size) dlen=(sb.st_size-a0)&~4095LL;
+            if(a0+dlen>size) dlen=(size-a0)&~4095LL;
             if(dlen>0) st_pread_full(dfd,s->base,dlen,a0,"pread expert direct");
             if(dlen<want)
-                st_pread_full(er->fd[0],s->base+dlen,want-dlen,a0+dlen,"pread expert tail");
+                st_pread_full(bfd,s->base+dlen,want-dlen,a0+dlen,"pread expert tail");
             s->buf=s->base+pad;
         } else {
-            st_pread_full(er->fd[0],s->base,m->e_slot,er->off[0],"pread expert");
+            st_pread_full(bfd,s->base,m->e_slot,er->off[0],"pread expert");
             s->buf=s->base;
         }
     } else {
         uint8_t *dst=s->base;
         for(int k=0;k<6;k++){
             if(er->fd[k]<0){ fprintf(stderr,"[K3] expert L%d E%d tensor %d missing on disk\n",li,eid,k); exit(1); }
-            st_pread_full(er->fd[k],dst,sizes[k],er->off[k],"pread expert");
+            int fd=k3_io_fd(m,own,er->fi[k],0);
+            st_pread_full(fd>=0?fd:er->fd[k],dst,sizes[k],er->off[k],"pread expert");
             dst+=sizes[k];
         }
         s->buf=s->base;
     }
+}
+static void expert_read(Model *m, int li, int eid, Slot *s){
+    expert_read_h(m,li,eid,s,NULL);
     s->eid=eid;
 }
 
@@ -1874,58 +1938,309 @@ static VktExpertSrc k3_vk_src(const Model *m, const uint8_t *b){
 }
 #endif
 
-/* ---------- async loader pool (K3_PIPE): expert preads overlap compute ----
- * A batch of jobs is submitted per token+layer; the compute loop below waits
- * per-expert on its ready flag, so expert j's math runs while j+1.. load.
- * One batch in flight at a time (the submitter consumes every job before the
- * next submit), so the flags need no generation counter. */
+/* ---------- expert readers (K3_PIPE): a pool per drive, demands before prefetches ----
+ * Every expert a step lacks is read on a reader thread, so the experts in RAM are
+ * computed while the missing ones arrive, each as soon as it is complete. The shards'
+ * devices are told apart (a RAID volume is one device; a model cut over C: and D: by
+ * tools/k3_download.py is two), each gets K3_IO_PER_DRIVE readers (2: enough for the
+ * NVMe drives measured with 17.5 MB reads) and its own two queues. A reader takes a
+ * demand (an expert the step being computed needs) before a prefetch (one the next MoE
+ * layer is predicted to need, k3_prefetch), and a demand for an expert whose prefetch
+ * still waits moves it to the front. On Windows each reader opens its own unbuffered
+ * handle per shard (k3_io_fd): the pool this replaced, four threads over the engine's
+ * handles, read one expert of a layer's shard at a time.
+ *
+ * None of this changes a number: an expert is computed once its slot is K3S_READY, from
+ * the same bytes, and a step adds its experts in the union's order as before. What
+ * changes is when the bytes arrive and which experts stay cached. */
 #define LP_MAX 64
-typedef struct { int li, eid; Slot *s; } LJob;
+#define K3_IOQ 4096
+#define K3_IO_DRIVES 8
+typedef struct { Slot *s; int li, eid; } K3IoJob;
 static struct {
-    pthread_t th[16]; int nth, started;
-    pthread_mutex_t mx; pthread_cond_t cv;
+    pthread_t th[64];
+    int nth, started, quit, ndrive;
+    pthread_mutex_t mx;
+    pthread_cond_t job, done;
+    int drive_of[ST_MAX_SHARDS];                  /* a shard's device: its queue pair */
+    K3IoJob q[K3_IO_DRIVES][2][K3_IOQ];           /* [drive][0: demands, 1: prefetches], rings head..tail */
+    unsigned head[K3_IO_DRIVES][2], tail[K3_IO_DRIVES][2];
+    unsigned long long finished;                  /* reads completed */
     Model *m;
-    LJob job[LP_MAX];
-    _Atomic int ready[LP_MAX];
-    _Atomic int next; int count;
-} g_lp = { .mx=PTHREAD_MUTEX_INITIALIZER, .cv=PTHREAD_COND_INITIALIZER };
+} g_io;                                           /* zeroed (1 MB of queues in .bss): k3_io_start makes its locks */
 
-static void *lp_main(void *arg){
-    (void)arg;
+typedef struct { Model *m; int drive; } K3IoArg;
+static int g_k3_io_delay_us;                      /* K3_IO_DELAY_US (tests): a slow disk, so the queues fill */
+static void *k3_io_main(void *arg){
+    K3IoArg a=*(K3IoArg*)arg;
+    free(arg);
+    int d=a.drive, nh=2*ST_MAX_SHARDS;
+    int *own=malloc((size_t)nh*sizeof(int));
+    if(!own){ fprintf(stderr,"OOM reader handles\n"); exit(1); }
+    for(int i=0;i<nh;i++) own[i]=-2;
+    pthread_mutex_lock(&g_io.mx);
     for(;;){
-        pthread_mutex_lock(&g_lp.mx);
-        while(atomic_load_explicit(&g_lp.next,memory_order_relaxed)>=g_lp.count)
-            pthread_cond_wait(&g_lp.cv,&g_lp.mx);
-        int idx=atomic_fetch_add_explicit(&g_lp.next,1,memory_order_relaxed);
-        pthread_mutex_unlock(&g_lp.mx);
-        if(idx>=g_lp.count) continue;
-        LJob *j=&g_lp.job[idx];
-        expert_read(g_lp.m,j->li,j->eid,j->s);
-        atomic_store_explicit(&g_lp.ready[idx],1,memory_order_release);
+        while(!g_io.quit && g_io.head[d][0]==g_io.tail[d][0] && g_io.head[d][1]==g_io.tail[d][1])
+            pthread_cond_wait(&g_io.job,&g_io.mx);
+        if(g_io.quit) break;
+        int p=g_io.head[d][0]!=g_io.tail[d][0]?0:1;
+        K3IoJob j=g_io.q[d][p][g_io.head[d][p]++%K3_IOQ];
+        if(!j.s) continue;                        /* moved to the demands, or cancelled */
+        pthread_mutex_unlock(&g_io.mx);
+        if(g_k3_io_delay_us) usleep(g_k3_io_delay_us);
+        expert_read_h(a.m,j.li,j.eid,j.s,own);
+        pthread_mutex_lock(&g_io.mx);
+        atomic_store_explicit(&j.s->state,K3S_READY,memory_order_release);
+        g_io.finished++;
+        pthread_cond_broadcast(&g_io.done);
     }
+    pthread_mutex_unlock(&g_io.mx);
+    for(int i=0;i<nh;i++) if(own[i]>=0) close(own[i]);
+    free(own);
     return NULL;
 }
-static void lp_start(void){
-    if(g_lp.started) return;
-    g_lp.nth = getenv("K3_LOAD_THREADS")?atoi(getenv("K3_LOAD_THREADS")):4;
-    if(g_lp.nth<1) g_lp.nth=1;
-    if(g_lp.nth>16) g_lp.nth=16;
-    g_lp.count=0; atomic_store(&g_lp.next,0);
-    for(int i=0;i<g_lp.nth;i++)
-        if(pthread_create(&g_lp.th[i],NULL,lp_main,NULL)){
-            fprintf(stderr,"[K3] K3_PIPE: pthread_create failed, falling back\n");
-            g_k3_pipe=0; g_lp.nth=i; break;
-        }
-    g_lp.started=1;
+static void k3_io_stop(void){
+    if(!g_io.started) return;
+    pthread_mutex_lock(&g_io.mx);
+    g_io.quit=1;
+    pthread_cond_broadcast(&g_io.job);
+    pthread_mutex_unlock(&g_io.mx);
+    for(int i=0;i<g_io.nth;i++) pthread_join(g_io.th[i],NULL);
+    g_io.started=0; g_io.nth=0;
 }
-static void lp_submit(Model *m, int n){
-    pthread_mutex_lock(&g_lp.mx);
-    g_lp.m=m;
-    for(int q=0;q<n;q++) atomic_store_explicit(&g_lp.ready[q],0,memory_order_relaxed);
-    atomic_store_explicit(&g_lp.next,0,memory_order_relaxed);
-    g_lp.count=n;
-    pthread_cond_broadcast(&g_lp.cv);
-    pthread_mutex_unlock(&g_lp.mx);
+/* K3_IO_PER_DRIVE readers (2) on each device the shards are on, or K3_IO_THREADS in
+ * all on one queue (K3_LOAD_THREADS, the old pool's size, is read as that when set);
+ * K3_PIPE=0 or K3_IO_THREADS=0: every read on the caller, as before the pool. */
+static void k3_io_start(Model *m){
+    if(g_io.started) return;
+    g_io.started=1;
+    pthread_mutex_init(&g_io.mx,NULL);
+    pthread_cond_init(&g_io.job,NULL);
+    pthread_cond_init(&g_io.done,NULL);
+    if(!g_k3_pipe) return;
+    const char *pe=getenv("K3_IO_PER_DRIVE"), *te=getenv("K3_IO_THREADS");
+    if(!te) te=getenv("K3_LOAD_THREADS");
+    int per=pe?atoi(pe):2, total=te?atoi(te):-1;
+    g_k3_io_delay_us=getenv("K3_IO_DELAY_US")?atoi(getenv("K3_IO_DELAY_US")):0;
+    if(g_k3_io_delay_us<0) g_k3_io_delay_us=0;
+    long long dev[K3_IO_DRIVES];
+    g_io.ndrive=0;
+    for(int i=0;i<m->S.nfd&&i<ST_MAX_SHARDS;i++){
+        struct stat sb;
+        long long id=stat(m->S.paths[i],&sb)==0?(long long)sb.st_dev:-1;
+        int k=0;
+        while(k<g_io.ndrive&&dev[k]!=id) k++;
+        if(k==g_io.ndrive){
+            if(g_io.ndrive<K3_IO_DRIVES&&total<0) dev[g_io.ndrive++]=id;
+            else k=0;
+        }
+        g_io.drive_of[i]=k;
+    }
+    if(!g_io.ndrive) g_io.ndrive=1;
+    int n=total>=0?total:per*g_io.ndrive;
+    if(n<0) n=0;
+    if(n>64) n=64;
+    g_io.m=m; g_io.quit=0;
+    for(int i=0;i<n;i++){
+        K3IoArg *a=malloc(sizeof *a);
+        if(!a){ fprintf(stderr,"OOM reader\n"); exit(1); }
+        a->m=m; a->drive=i%g_io.ndrive;
+        if(pthread_create(&g_io.th[i],NULL,k3_io_main,a)){
+            free(a);
+            fprintf(stderr,"[K3] reader thread %d did not start; %d readers\n",i,i);
+            break;
+        }
+        g_io.nth++;
+    }
+    if(g_io.nth&&g_io.nth<g_io.ndrive){   /* too few to give each drive one: one shared queue */
+        for(int i=0;i<ST_MAX_SHARDS;i++) g_io.drive_of[i]=0;
+        g_io.ndrive=1;
+    }
+    atexit(k3_io_stop);
+    fprintf(stderr,"[K3] expert readers: %d on %d device(s)\n",g_io.nth,g_io.ndrive);
+}
+/* Slot s gets expert eid of layer li: queued for a reader (K3S_LOADING until it is
+ * complete), or read now when there is no reader. The caller owns s->eid. */
+static void k3_io_submit(Model *m, Slot *s, int li, int eid, int prefetch){
+    if(!g_io.started) k3_io_start(m);
+    if(!g_io.nth){
+        expert_read_h(m,li,eid,s,NULL);
+        atomic_store_explicit(&s->state,K3S_READY,memory_order_release);
+        return;
+    }
+    int fi=m->eref[(int64_t)li*m->c.n_experts+eid].fi[0];
+    int d=fi>=0?g_io.drive_of[fi]:0, p=prefetch?1:0;
+    atomic_store_explicit(&s->state,K3S_LOADING,memory_order_relaxed);
+    pthread_mutex_lock(&g_io.mx);
+    if(g_io.tail[d][p]-g_io.head[d][p]>=K3_IOQ){ fprintf(stderr,"[K3] reader queue overflow\n"); exit(1); }
+    s->qd=d; s->qp=g_io.tail[d][p];
+    g_io.q[d][p][g_io.tail[d][p]++%K3_IOQ]=(K3IoJob){s,li,eid};
+    pthread_cond_broadcast(&g_io.job);
+    pthread_mutex_unlock(&g_io.mx);
+}
+/* is s's prefetch still in its queue (no reader has taken it)? under g_io.mx */
+static int k3_io_queued(Slot *s){
+    int d=s->qd;
+    return s->qp-g_io.head[d][1]<g_io.tail[d][1]-g_io.head[d][1] && g_io.q[d][1][s->qp%K3_IOQ].s==s;
+}
+/* A prefetch the step asks for, still queued: it moves to the demands. */
+static void k3_io_promote(Slot *s){
+    if(!g_io.nth) return;
+    pthread_mutex_lock(&g_io.mx);
+    if(k3_io_queued(s)){
+        int d=s->qd;
+        g_io.q[d][0][g_io.tail[d][0]++%K3_IOQ]=g_io.q[d][1][s->qp%K3_IOQ];
+        g_io.q[d][1][s->qp%K3_IOQ].s=NULL;
+        pthread_cond_broadcast(&g_io.job);
+    }
+    pthread_mutex_unlock(&g_io.mx);
+}
+/* A prefetch its layer's step did not ask for, still queued: it leaves the queue and its
+ * slot is free (1). 0 when a reader holds it already (the read finishes, the slot goes
+ * first). Left queued it would be read before the next layer's prefetches. */
+static int k3_io_cancel(Model *m, int li, Slot *s){
+    if(!g_io.nth) return 0;
+    pthread_mutex_lock(&g_io.mx);
+    int queued=k3_io_queued(s);
+    if(queued) g_io.q[s->qd][1][s->qp%K3_IOQ].s=NULL;
+    pthread_mutex_unlock(&g_io.mx);
+    if(!queued) return 0;
+    cache_unindex(m,li,s);
+    s->eid=-1; s->used=0;
+    atomic_store_explicit(&s->state,K3S_READY,memory_order_release);
+    m->ebytes-=(uint64_t)m->e_slot;
+    return 1;
+}
+/* until slot s is complete; the time waited is t_eload, the I/O the computation did not hide */
+static void k3_io_wait_slot(Model *m, Slot *s){
+    if(slot_ready(s)) return;
+    double t0=now_s();
+    pthread_mutex_lock(&g_io.mx);
+    while(!slot_ready(s)) pthread_cond_wait(&g_io.done,&g_io.mx);
+    pthread_mutex_unlock(&g_io.mx);
+    m->t_eload+=now_s()-t0;
+}
+
+/* ---------- the prefetcher (K3_PREFETCH, decode steps) ----------------------------
+ * After a decode step's attention in layer li, layer li+1's router applied to li's MLP
+ * input -- normed by li+1's own post-attention norm -- predicts the experts li+1 will
+ * ask for, and those its cache lacks are read ahead, queued behind the step's own
+ * demands (k3_prefetch_pending). The hidden state changes little from one layer to the
+ * next, so a prediction mostly comes true and li+1's reads start a layer early, on both
+ * drives while li computes; a wrong one costs a read and a slot that is the first to be
+ * reused, never a number: the routing that counts is li+1's own, on its own input.
+ * K3_PREFETCH_ROWS (4) bounds the rows a step may have (a prompt chunk's union is most
+ * of the layer); a prediction takes at most half the layer's cache and K3_PREFETCH_LIMIT
+ * (64) reads queued at once. Off with the Vulkan tier, which holds experts of its own. */
+static int g_k3_pf=-1, g_k3_pf_rows=4, g_k3_pf_limit=64;
+static int k3_prefetch_on(void){
+    if(g_k3_pf<0){
+        const char *e=getenv("K3_PREFETCH");
+        g_k3_pf=e?atoi(e)!=0:1;
+        if(getenv("K3_PREFETCH_ROWS")) g_k3_pf_rows=atoi(getenv("K3_PREFETCH_ROWS"));
+        if(getenv("K3_PREFETCH_LIMIT")) g_k3_pf_limit=atoi(getenv("K3_PREFETCH_LIMIT"));
+    }
+#ifdef COLI_VULKAN
+    if(g_k3_vk) return 0;
+#endif
+    return g_k3_pf&&g_k3_pipe;
+}
+/* A free slot of layer li for a prefetch: a new one while the layer has room, else the
+ * least recently used that is neither pinned, loading nor itself a waiting prefetch. */
+static Slot *k3_prefetch_slot(Model *m, int li){
+    LCache *lc=&m->ecache[li];
+    if(lc->n<lc->cap) return &lc->s[lc->n++];
+    int lru=-1;
+    for(int i=0;i<lc->n;i++){
+        Slot *s=&lc->s[i];
+        if(s->pinned||s->pref||!slot_ready(s)) continue;
+        if(lru<0||s->used<lc->s[lru].used) lru=i;
+    }
+    return lru>=0?&lc->s[lru]:NULL;
+}
+/* the prediction itself, from the rows k3_layers_forward_range left in pf_x */
+static void k3_prefetch_pending(Model *m){
+    int n=m->pf_n, li=m->pf_li;
+    m->pf_n=0;
+    if(n<1||li<0||li>=m->c.n_layers||!m->L[li].sparse) return;
+    Cfg *c=&m->c; Moe *o=&m->L[li].moe;
+    int D=c->hidden, E=c->n_experts, K=c->topk;
+    double t0=now_s();
+    float *xn=falloc((int64_t)n*D), *sco=falloc((int64_t)n*E);
+    for(int t=0;t<n;t++) rmsnorm_(xn+(int64_t)t*D,m->pf_x+(int64_t)t*D,m->L[li].post_ln,D,c->eps);
+    matmul(sco,xn,o->router,n,D,E);
+    uint8_t *mark=m->pf_mark+(int64_t)li*E;
+    int *order=malloc((size_t)n*K*sizeof(int)), *votes=calloc((size_t)E,sizeof(int)), no=0;
+    if(!order||!votes){ fprintf(stderr,"OOM prefetch\n"); exit(1); }
+    for(int t=0;t<n;t++){
+        float *v=sco+(int64_t)t*E;
+        for(int e=0;e<E;e++) v[e]=sigmoidf_(v[e])+o->rbias[e];
+        for(int j=0;j<K;j++){
+            int best=-1; float bv=-INFINITY;
+            for(int e=0;e<E;e++) if(v[e]>bv){ bv=v[e]; best=e; }
+            if(best<0) break;
+            v[best]=-INFINITY;
+            if(!mark[best]){ mark[best]=1; order[no++]=best; }
+            votes[best]+=K+2-j;
+        }
+    }
+    /* the likeliest first: a row's choice weighs K + 2 - its rank */
+    for(int a=1;a<no;a++){
+        int e=order[a], b=a;
+        while(b>0&&votes[order[b-1]]<votes[e]){ order[b]=order[b-1]; b--; }
+        order[b]=e;
+    }
+    unsigned waiting=0;
+    k3_io_start(m);
+    pthread_mutex_lock(&g_io.mx);
+    for(int d=0;d<g_io.ndrive;d++) waiting+=g_io.tail[d][1]-g_io.head[d][1];
+    pthread_mutex_unlock(&g_io.mx);
+    int room=m->ecache[li].cap/2;
+    for(int k=0;k<no&&room>0&&waiting<(unsigned)g_k3_pf_limit;k++){
+        int e=order[k];
+        if(slot_lookup(m,li,e)) continue;
+        Slot *s=k3_prefetch_slot(m,li);
+        if(!s) break;
+        if(s->eid>=0) cache_unindex(m,li,s);
+        s->eid=e; s->used=0; s->pref=1;
+        cache_index(m,li,s);
+        m->ebytes+=(uint64_t)m->e_slot; m->pf_issued++;
+        k3_io_submit(m,s,li,e,1);
+        waiting++; room--;
+    }
+    free(order); free(votes); free(xn); free(sco);
+    m->t_pred+=now_s()-t0;
+}
+/* Layer li's step has looked its experts up: the prefetches it did not ask for go first,
+ * the queued ones leave the queue. */
+static void k3_prefetch_spent(Model *m, int li){
+    LCache *lc=&m->ecache[li];
+    for(int i=0;i<lc->n;i++){
+        Slot *s=&lc->s[i];
+        if(!s->pref) continue;
+        s->pref=0; s->used=0; m->pf_wasted++;
+        if(!slot_ready(s)&&k3_io_cancel(m,li,s)) m->pf_cancelled++;
+    }
+}
+/* The readers' and the prefetcher's line (stderr), totals so far. */
+static void k3_io_report(const Model *m, const char *scope){
+    if(!m->pf_issued&&!m->pf_pred) return;
+    fprintf(stderr,"[K3] prefetch (%s): %llu experts read ahead, %llu used, %llu not (%llu of them cancelled "
+            "unread); %.1f%% of the routed experts were predicted; predicting took %.1fs\n",
+            scope,(unsigned long long)m->pf_issued,(unsigned long long)m->pf_used,
+            (unsigned long long)m->pf_wasted,(unsigned long long)m->pf_cancelled,
+            m->pf_pred?100.0*m->pf_pred_hit/m->pf_pred:0.0,m->t_pred);
+}
+/* A step's routing against the prediction that stood for it, which is then spent. */
+static void k3_prefetch_score(Model *m, int li, const int *idxs, const int *keff, int C){
+    if(!m->pf_mark) return;
+    int E=m->c.n_experts, K=m->c.topk;
+    uint8_t *mark=m->pf_mark+(int64_t)li*E;
+    int any=0;
+    for(int e=0;e<E&&!any;e++) any=mark[e];
+    if(!any) return;
+    for(int t=0;t<C;t++) for(int kk=0;kk<keff[t];kk++){ m->pf_pred++; m->pf_pred_hit+=mark[idxs[(int64_t)t*K+kk]]!=0; }
+    memset(mark,0,(size_t)E);
 }
 
 /* the general expert pass for one layer over a CHUNK of positions: nu unique
@@ -1966,19 +2281,25 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
     }
     for(int base=0;base<nu;base+=LP_MAX){
         int nb=nu-base<LP_MAX?nu-base:LP_MAX;
-        Slot *use[LP_MAX]; int missk[LP_MAX]; int qof[LP_MAX]; int nmiss=0;
+        Slot *use[LP_MAX]; int missk[LP_MAX]; int nmiss=0;
+        uint64_t stamp=++m->clock;
         for(int j=0;j<nb;j++){
             ehit_mark(m,li,uids[base+j]);
-            use[j]=slot_find(m,li,uids[base+j]); qof[j]=-1;
-            if(!use[j]){ m->miss++; use[j]=&m->ws[nmiss]; qof[j]=nmiss; missk[nmiss++]=j; }
+            Slot *s=slot_lookup(m,li,uids[base+j]);   /* resident, or a prefetch on its way */
+            if(s){
+                m->hits++; s->used=stamp;
+                if(s->pref){ s->pref=0; m->pf_used++; }
+                if(!slot_ready(s)) k3_io_promote(s);
+                use[j]=s;
+            } else { m->miss++; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; }
         }
+        if(base==0) k3_prefetch_spent(m,li);
         if(nmiss){
-            if(g_k3_pipe && !g_lp.started) lp_start();
-            if(g_k3_pipe){
+            if(g_k3_pipe){   /* each to its drive's readers, the union's order within a drive */
                 for(int q=0;q<nmiss;q++){
-                    g_lp.job[q].li=li; g_lp.job[q].eid=uids[base+missk[q]]; g_lp.job[q].s=&m->ws[q];
+                    m->ws[q].eid=uids[base+missk[q]];
+                    k3_io_submit(m,&m->ws[q],li,m->ws[q].eid,0);
                 }
-                lp_submit(m,nmiss);
             } else {
                 double t0=now_s();
                 #pragma omp parallel for schedule(dynamic,1)
@@ -1987,14 +2308,9 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
             }
             m->ebytes+=(uint64_t)nmiss*(uint64_t)m->e_slot;
         }
+        if(m->pf_n) k3_prefetch_pending(m);   /* the next MoE layer's reads, behind these */
         for(int j=0;j<nb;j++){
-            if(g_k3_pipe && qof[j]>=0 &&
-               !atomic_load_explicit(&g_lp.ready[qof[j]],memory_order_acquire)){
-                double t0=now_s();      /* t_eload = UN-hidden I/O (wait) time */
-                while(!atomic_load_explicit(&g_lp.ready[qof[j]],memory_order_acquire))
-                    usleep(50);
-                m->t_eload+=now_s()-t0;
-            }
+            k3_io_wait_slot(m,use[j]);       /* t_eload = the I/O the computation did not hide */
 #ifdef COLI_VULKAN
             /* #848: offer EVERY expert used this layer, not only the ones that just
              * came off disk. qof[j]>=0 means "this was a RAM-cache miss", which is the
@@ -2030,7 +2346,7 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
                  * against a future caller pinning everything and deadlocking here. */
                 int lru=-1, dev=-1;   /* an expert the Vulkan tier holds goes first (vkt_ram_first) */
                 for(int i=0;i<lc->n;i++){
-                    if(lc->s[i].pinned) continue;
+                    if(lc->s[i].pinned||lc->s[i].pref||!slot_ready(&lc->s[i])) continue;   /* nor a read in flight */
                     if(lc->s[i].eid>=0 && vkt_ram_first(li,lc->s[i].eid)){ if(dev<0 || lc->s[i].used<lc->s[dev].used) dev=i; continue; }
                     if(lru<0 || lc->s[i].used<lc->s[lru].used) lru=i;
                 }
@@ -2313,7 +2629,7 @@ static void k3_vk_promote(Model *m){
         else {
             int lru=-1;
             for(int i=0;i<lc->n;i++){
-                if(lc->s[i].pinned) continue;
+                if(lc->s[i].pinned||lc->s[i].pref||!slot_ready(&lc->s[i])) continue;
                 if(lru<0 || lc->s[i].used<lc->s[lru].used) lru=i;
             }
             if(lru<0) break;
@@ -2528,12 +2844,13 @@ static float *k3_moe_experts(Model *m, Moe *o, int li, const float *x, const flo
             int j=map[idxs[(int64_t)t*K+kk]];
             poslist[cur[j]]=t; wlist[cur[j]]=wsels[(int64_t)t*K+kk]; cur[j]++;
         }
-        /* keep loads in DISK-OFFSET order (experts are NOT id-ordered inside
-         * the HF shards — measured 169/895); permute the list heads with the
-         * ids. WILLNEED prefetch only for the buffered path. */
+        /* the union in the order of the experts' ids as text (m->elex): the published
+         * shards' disk-offset order (safetensors sorts names: "0" "1" "10" "100" ...),
+         * so the loads run along the disk and the sum keeps the order it always had,
+         * on one shard or cut over drives alike; permute the list heads with the ids.
+         * WILLNEED prefetch only for the buffered path. */
         for(int a2=0;a2<nu-1;a2++) for(int b2=a2+1;b2<nu;b2++){
-            ERef *ea=&m->eref[(int64_t)li*E+uid[a2]], *eb=&m->eref[(int64_t)li*E+uid[b2]];
-            if(eb->fd[0]<ea->fd[0]||(eb->fd[0]==ea->fd[0]&&eb->off[0]<ea->off[0])){
+            if(m->elex[uid[b2]]<m->elex[uid[a2]]){
                 int tt=uid[a2];uid[a2]=uid[b2];uid[b2]=tt;
                 tt=pcnt[a2];pcnt[a2]=pcnt[b2];pcnt[b2]=tt;
                 tt=pfirst[a2];pfirst[a2]=pfirst[b2];pfirst[b2]=tt; }
@@ -2571,6 +2888,7 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
     int *keff=malloc((size_t)C*sizeof(int));
     if(!idxs||!keff){fprintf(stderr,"OOM moe sel\n");exit(1);}
     k3_moe_route(m,o,li,sco,C,idxs,wsels,keff);
+    k3_prefetch_score(m,li,idxs,keff,C);
     float *z=falloc((int64_t)C*LT), *u=falloc((int64_t)C*LT);
     w_matmul(z,x,&o->lat_down,C);
     memset(u,0,(size_t)C*LT*sizeof(float));
@@ -2646,15 +2964,28 @@ static int k3_layers_forward_range(Model *m, float *hidden, float *bres,
          m->t_attn+=now_s()-t0;
          /* Phase 9: capture attn output (att) for target token */
          if(g_k3_val_layer==i && g_k3_val_token<C) val_dump("att",att+(int64_t)g_k3_val_token*D,D);
+        /* K3_PREFETCH: a decode step's MLP input also predicts the next MoE layer's
+         * experts (k3_prefetch_pending, issued behind this layer's own reads) */
+        int pf=k3_prefetch_on()&&C<=g_k3_pf_rows&&i+1<layer_end&&m->L[i+1].sparse;
+        if(pf&&!m->pf_x){
+            m->pf_x=falloc((int64_t)g_k3_pf_rows*D);
+            m->pf_mark=calloc((size_t)c->n_layers*c->n_experts,1);
+            if(!m->pf_mark){ fprintf(stderr,"OOM prefetch marks\n"); exit(1); }
+        }
         for(int t=0;t<C;t++){
             float *p=prefix+(int64_t)t*D, *a=att+(int64_t)t*D;
              if(have_prefix){ for(int d=0;d<D;d++) p[d]+=a[d]; }
              else           { memcpy(p,a,D*sizeof(float)); }
              res_mix(mix,p,bres+(int64_t)t*nbmax*D,nb,D,l->mlp_sw,c->eps);
+             if(pf) memcpy(m->pf_x+(int64_t)t*D,mix,D*sizeof(float));
              rmsnorm_(nrm+(int64_t)t*D,mix,l->post_ln,D,c->eps);
             /* Phase 9: capture MLP-input (post-attention nrm) */
             if(g_k3_val_layer==i && t==g_k3_val_token){
               val_dump("nrm_mlp",nrm+(int64_t)t*D,D); }
+        }
+        if(pf){
+            m->pf_n=C; m->pf_li=i+1;
+            if(!l->sparse) k3_prefetch_pending(m);   /* no reads of this layer's to go first */
         }
         t0=now_s();
         if(l->sparse) moe_forward(m,l,i,nrm,C,mlp);
@@ -3861,6 +4192,7 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
     printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n",
            dt,np,gen,disk,0.0,moe>disk?moe-disk:moe,m->t_attn-a0,m->t_head-h0,forwards);
     fflush(stdout);
+    k3_io_report(m,"turn");
     serve_hits(m);
 #ifdef COLI_VULKAN
     k3_vk_report(m,"turn");
@@ -4282,6 +4614,7 @@ int main(int argc, char **argv){
             (unsigned long long)m.hits,(unsigned long long)(m.hits+m.miss),m.ebytes/1e9);
     fprintf(stderr,"[K3] time: attn %.1fs moe %.1fs (eload %.1fs) head %.1fs | RSS %.1f GB\n",
             m.t_attn,m.t_moe,m.t_eload,m.t_head,rss_gb());
+    k3_io_report(&m,"run");
 #ifdef COLI_VULKAN
     k3_vk_report(&m,"run");
 #endif
