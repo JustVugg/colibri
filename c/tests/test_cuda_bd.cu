@@ -45,6 +45,9 @@ static void bd_fix(int t, uint8_t *b) {
     case 10: F16AT(80); F16AT(82); break;          /* Q2_K */
     case 11: F16AT(108); break;                    /* Q3_K */
     case 14: F16AT(208); break;                    /* Q6_K */
+    /* F16, BF16: b is one value here, of either sign, magnitudes 2^-9 .. 2^-1 */
+    case 1: b[1] = (uint8_t)((rnd() & 0x80) | (0x18 + rnd() % 20)); break;
+    case 30: { int e = 118 + (int)(rnd() % 8); b[1] = (uint8_t)((rnd() & 0x80) | (e >> 1)); b[0] = (uint8_t)(((e & 1) << 7) | (b[0] & 0x7f)); break; }
     case 34: F16AT(52); break;                     /* TQ1_0 */
     case 35: F16AT(64); break;                     /* TQ2_0 */
     case 39: b[0] = (uint8_t)(122 + rnd() % 4); break;   /* MXFP4: e8m0 */
@@ -128,7 +131,8 @@ static void check(int t, int I, int O, int bench) {
         uint8_t *packed = (uint8_t *)malloc((size_t)O * rb);
         for (int o = 0; o < O; o++) memcpy(packed + (size_t)o * rb, w + (size_t)o * rw * 4, (size_t)rb);
         ColiCudaTensor *ct = NULL;
-        int okb = coli_cuda_tensor_upload(&ct, packed, NULL, fmt, I, O, 0) && coli_cuda_block_elems(fmt) == be;
+        /* the backend's block: ggml's, or 32 values for F16 and BF16 (blockdec_host.h) */
+        int okb = coli_cuda_tensor_upload(&ct, packed, NULL, fmt, I, O, 0) && coli_cuda_block_elems(fmt) == (t == 1 || t == 30 ? 32 : be);
         cudaMemset(yd, 0, (size_t)SM * O * 4);
         for (int s = 0; s < SM && okb; s++) okb = coli_cuda_tensor_gemm_async(ct, yd + (size_t)s * O, xd + (size_t)s * I, 1, NULL);
         okb = okb && cudaDeviceSynchronize() == cudaSuccess;
@@ -383,7 +387,7 @@ int main(void) {
     cudaMalloc(&g_tab, (size_t)BDT_WORDS * 4);
     cudaMemcpy(g_tab, tab, (size_t)BDT_WORDS * 4, cudaMemcpyHostToDevice);
     free(tab);
-    const int types[] = {8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 42, 2, 3, 6, 7, 34, 35, 39, 40, 41};
+    const int types[] = {8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 42, 2, 3, 6, 7, 34, 35, 39, 40, 41, 1, 30};
     const int shapes[][2] = {{2048, 300}, {4096, 70}, {768, 1000}, {12288, 40}, {2816, 33}};
     for (size_t i = 0; i < sizeof types / sizeof *types; i++)
         for (size_t k = 0; k < sizeof shapes / sizeof *shapes; k++) check(types[i], shapes[k][0], shapes[k][1], 0);

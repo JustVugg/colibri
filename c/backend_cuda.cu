@@ -3546,11 +3546,11 @@ __global__ static void __launch_bounds__(256) hcg2_dense_k(float *__restrict__ y
 /* the types hcm_dense_k takes, I a multiple of their block; 0 elsewhere (the other tiles) */
 static int hcm_type(int fmt, int I) {
     int tt = fmt - 100;
-    if (tt == 8) return I % 32 ? 0 : 8;
+    if (tt == 8 || tt == 1 || tt == 30) return I % 32 ? 0 : tt;   /* Q8_0, F16, BF16 */
     if (tt == 12 || tt == 13 || tt == 14) return I % 256 ? 0 : tt;
     return 0;
 }
-/* A prompt chunk's rows of a Q8_0, Q4_K, Q5_K or Q6_K tensor through f16 mma.sync, the weights'
+/* A prompt chunk's rows of a Q8_0, Q4_K, Q5_K, Q6_K, F16 or BF16 tensor through f16 mma.sync, the weights'
  * loads apart from their decoding. hcg2_dense_k decoded a step's weights as their words came
  * in, so a warp sat on its loads before it reached the step's products, at one block a
  * multiprocessor (158 registers, 37 KB): an RTX PRO 4000 issued a slot in five, 39 TFLOP/s.
@@ -3607,7 +3607,10 @@ __device__ __forceinline__ void hcm_ld5(const bd_u32 *__restrict__ W, bd_u32 off
 }
 template<int T>
 __device__ __forceinline__ void hcm_fetch(HcmRaw &w, const bd_u32 *__restrict__ W, bd_u32 e0) {
-    if (T == 12 || T == 13) {
+    if (T == 1 || T == 30) {   /* F16, BF16: the 16 values, bytes 2 e0 .. 2 e0 + 31 */
+        uint4 a = bd_w4(W, e0 >> 3), b = bd_w4(W, (e0 >> 3) + 1u);
+        w.r[0] = a.x; w.r[1] = a.y; w.r[2] = a.z; w.r[3] = a.w; w.r[4] = b.x; w.r[5] = b.y; w.r[6] = b.z; w.r[7] = b.w;
+    } else if (T == 12 || T == 13) {
         bd_u32 b = e0 >> 8, e = e0 & 255u, c = e >> 6, p = e & 31u, base = b * (T == 12 ? 144u : 176u);
         uint4 hd = bd_w4(W, base >> 4), q = bd_w4(W, (base + (T == 12 ? 16u : 48u) + 32u * c + p) >> 4);
         w.r[0] = hd.x; w.r[1] = hd.y; w.r[2] = hd.z; w.r[3] = hd.w; w.r[4] = q.x; w.r[5] = q.y; w.r[6] = q.z; w.r[7] = q.w;
@@ -3626,7 +3629,13 @@ __device__ __forceinline__ void hcm_fetch(HcmRaw &w, const bd_u32 *__restrict__ 
 /* hcm_fetch's words as bd_dec16h's eight half2 */
 template<int T>
 __device__ __forceinline__ void hcm_dec(const HcmRaw &w, bd_u32 e0, bd_u32 *out) {
-    if (T == 12 || T == 13) {
+    if (T == 1) {
+        #pragma unroll
+        for (int k = 0; k < 8; k++) out[k] = w.r[k];
+    } else if (T == 30) {
+        #pragma unroll
+        for (int k = 0; k < 8; k++) out[k] = bd_bf2h2(w.r[k]);
+    } else if (T == 12 || T == 13) {
         bd_u32 e = e0 & 255u, c = e >> 6, pos = e & 63u, hi = pos >= 32u, g = 2u * c + hi, sh = hi ? 4u : 0u;
         uint4 hd = make_uint4(w.r[0], w.r[1], w.r[2], w.r[3]);
         uint2 sm = bdi_k4sm(hd, g);
@@ -3900,6 +3909,8 @@ static int hcm_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float
     const bd_u32 *wv = (const bd_u32 *)t->weights, *wuv = glu ? (const bd_u32 *)tu->weights : nullptr;
     const __half *xh = (const __half *)scr;
     #define HCM_GO2(BM_, BN_, G_) do { switch (tt) { \
+        case 1: hcm_launch<1, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv); break; \
+        case 30: hcm_launch<30, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv); break; \
         case 8: hcm_launch<8, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv); break; \
         case 12: hcm_launch<12, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv); break; \
         case 13: hcm_launch<13, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv); break; \
@@ -4715,6 +4726,7 @@ static int hcm_moe(DeviceContext *ctx, const CcExpert *tab, const float *x, floa
     if (on < 0) { const char *e = getenv("COLI_CUDA_MOE_HCM"); on = !(e && *e == '0'); }
     const int fd = p->fmt_d ? p->fmt_d : p->fmt, tg = hcm_type(p->fmt, p->D), td = hcm_type(fd, p->I);
     if (!on || !ctx || ctx->compute_major < 8 || !tg || !td || p->D % 4 || p->I % 4 || p->x_row % 4) return 0;
+    if (tg == 1 || tg == 30 || td == 1 || td == 30) return 0;   /* 16-bit experts: hcg's tiles (HCM_MOE's types below) */
     const size_t rbg = bd_file_row_bytes(p->fmt, p->D), rbd = bd_file_row_bytes(fd, p->I);
     if (!rbg || !rbd || rbg % 4 || rbd % 4) return 0;
     const size_t A = (size_t)p->S * p->K, nx = (size_t)p->S * p->D, nh = A * p->I;

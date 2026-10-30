@@ -13,6 +13,8 @@
  *   - bdf_decode: shaders/blockdec.glsl's general path, every block type, a 32-weight unit
  *     as int weights with a scale and a min per 16, in floats (the other types: Q4_0, Q4_1,
  *     Q5_0, Q5_1, TQ1_0, TQ2_0, MXFP4, NVFP4, Q1_0).
+ *   - F16 (101) and BF16 (130): units of 32 values (64 bytes) read as floats by the float
+ *     GEMV, bd_dec16h and bd_dec16 (blockdec_host.h's blocks of 32).
  * A row's words: W (32-bit, 16-byte aligned rows for Q4_K and Q5_K, whose 144- and 176-byte
  * blocks keep it); a field at any even byte comes from one word or two (bd_ldu). */
 #ifndef CUDA_BD_CUH
@@ -637,7 +639,20 @@ __device__ __forceinline__ void bd_codes_h(bd_u32 c4, __half2 off, __half2 s, __
     __half2 b = __hsub2(bd_u2h(__byte_perm(c4, 0x64646464u, 0x5342u)), off);
     o[0] = bd_h2u(__hfma2(a, s, m)); o[1] = bd_h2u(__hfma2(b, s, m));
 }
+/* two BF16 values as a half2, held to +-65504 as the f16 GEMMs hold their inputs (a NaN stays one) */
+__device__ __forceinline__ float bd_hold(float f) { return f != f ? f : fminf(fmaxf(f, -65504.f), 65504.f); }
+__device__ __forceinline__ bd_u32 bd_bf2h2(bd_u32 v) {
+    return bd_h2u(__floats2half2_rn(bd_hold(__uint_as_float(v << 16)), bd_hold(__uint_as_float(v & 0xffff0000u))));
+}
 __device__ __forceinline__ bool bd_dec16h(int t, const bd_u32 *__restrict__ W, bd_u32 e0, bd_u32 *out) {
+    if (t == 1 || t == 30) {   /* F16, BF16: the 16 values are bytes 2 e0 .. 2 e0 + 31 (16-byte aligned) */
+        uint4 a = bd_w4(W, e0 >> 3), b = bd_w4(W, (e0 >> 3) + 1u);
+        bd_u32 v[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+        #pragma unroll
+        for (int k = 0; k < 8; k++)
+            out[k] = t == 1 ? v[k] : bd_bf2h2(v[k]);
+        return true;
+    }
     if (t == 12 || t == 13) {   /* Q4_K, Q5_K: groups of 32, a 6-bit scale and min each */
         bd_u32 b = e0 >> 8, e = e0 & 255u, c = e >> 6, pos = e & 63u, hi = pos >= 32u, g = 2u * c + hi, p = pos & 31u;
         bd_u32 base = b * (t == 12 ? 144u : 176u);
@@ -679,6 +694,15 @@ __device__ __forceinline__ bool bd_dec16h(int t, const bd_u32 *__restrict__ W, b
 }
 #endif
 __device__ __forceinline__ bool bd_dec16(int t, const bd_u32 *__restrict__ W, bd_u32 e0, const bd_u32 *__restrict__ tab, float *out) {
+    if (t == 1 || t == 30) {   /* F16, BF16: the values themselves */
+        #pragma unroll
+        for (int j = 0; j < 16; j += 2) {
+            bd_u32 v = bd_w(W, (e0 + (bd_u32)j) >> 1);
+            out[j] = t == 1 ? bd_h2f(v) : __uint_as_float(v << 16);
+            out[j + 1] = t == 1 ? bd_h2f(v >> 16) : __uint_as_float(v & 0xffff0000u);
+        }
+        return true;
+    }
     if (t == 12 || t == 13) {   /* Q4_K, Q5_K: groups of 32, a 6-bit scale and min each */
         bd_u32 b = e0 >> 8, e = e0 & 255u, c = e >> 6, pos = e & 63u, hi = pos >= 32u, g = 2u * c + hi, p = pos & 31u;
         bd_u32 base = b * (t == 12 ? 144u : 176u);
@@ -898,6 +922,31 @@ __global__ static void __launch_bounds__(256) bd_gemv_f_k(float *__restrict__ y,
         #pragma unroll
         for (int r = 0; r < NR; r++) acc[r] = 0.f;
         for (int u = lane; u < units; u += 32) {
+            if (fmt == 101 || fmt == 130) {   /* F16, BF16: the unit's 32 values (64 bytes), no scale */
+                float wf[32];
+                #pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    uint4 v = bd_w4(Wr, 4u * (bd_u32)u + (bd_u32)k);
+                    bd_u32 ww[4] = {v.x, v.y, v.z, v.w};
+                    #pragma unroll
+                    for (int h = 0; h < 4; h++) {
+                        wf[8 * k + 2 * h] = fmt == 101 ? bd_h2f(ww[h]) : __uint_as_float(ww[h] << 16);
+                        wf[8 * k + 2 * h + 1] = fmt == 101 ? bd_h2f(ww[h] >> 16) : __uint_as_float(ww[h] & 0xffff0000u);
+                    }
+                }
+                #pragma unroll
+                for (int r = 0; r < NR; r++) if (r < nrow) {
+                    const float4 *xr = bd_smf + r * XR;
+                    float a = 0.f;
+                    #pragma unroll
+                    for (int j4 = 0; j4 < 8; j4++) {
+                        float4 p = xr[bd_x4(8 * u + j4)];
+                        a += wf[4 * j4] * p.x + wf[4 * j4 + 1] * p.y + wf[4 * j4 + 2] * p.z + wf[4 * j4 + 3] * p.w;
+                    }
+                    acc[r] += a;
+                }
+                continue;
+            }
             int wv[32]; float sA, mA, sB, mB;
             bdf_decode(fmt, Wr, (bd_u32)u, tab, wv, sA, mA, sB, mB);
             #pragma unroll
@@ -978,7 +1027,7 @@ static int bd_gemv_f_launch(float *y, const float *x, const bd_u32 *W, const bd_
 }
 /* 1 = fmt is a block format this file decodes (I a multiple of its block, checked by the caller) */
 static inline int bd_fmt_ok(int fmt) {
-    if (fmt < 102 || fmt >= 143) return 0;
+    if (fmt < 101 || fmt >= 143) return 0;
     int t = fmt - 100;
     return BD_BLK[t] >= 32;
 }

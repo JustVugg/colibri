@@ -1302,10 +1302,10 @@ static int codes_of(int I) {
  * on first use; NULL for a type it does not decode (Q4_K and Q5_K also want rows of whole
  * 16-byte steps) */
 static VkPipeline bdv_pipe(int t, int nr, int rowWords, int I) {
-    static const int types[] = {8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 42};
+    static const int types[] = {8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 42, 1, 30};   /* 1, 30: F16, BF16 */
     int on = 0;
     for (size_t k = 0; k < sizeof types / sizeof *types; k++) on |= types[k] == t;
-    if (!on || !KC.mod_bdv || nr < 1 || nr > 4 || ((t == 12 || t == 13) && rowWords % 4)) return VK_NULL_HANDLE;
+    if (!on || !KC.mod_bdv || nr < 1 || nr > 4 || ((t == 12 || t == 13 || t == 1 || t == 30) && rowWords % 4)) return VK_NULL_HANDLE;
     /* the smallest staging only for one row of IQ2_XXS, IQ2_XS, IQ3_XXS or IQ2_S, whose decoders wait on
      * their grid reads: twice the workgroups an SM hide them, 10240 x 2560 at 61.2 -> 48.4
      * and 66.4 -> 52.0 us. The others read at the memory's rate, and more workgroups cost
@@ -1369,7 +1369,8 @@ static VkPipeline bdgw_pipe(int t) {
 /* qmatmul_gemm_bd.comp's pipeline for ggml type t, made on first use */
 static VkPipeline bdg_pipe(int t, int rowWords) {
     if (t < 0 || t >= 64 || !(t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 18 || t == 19 ||
-        t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42) || ((t == 12 || t == 13) && rowWords % 4)) return VK_NULL_HANDLE;
+        t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 1 || t == 30) ||
+        ((t == 12 || t == 13 || t == 1 || t == 30) && rowWords % 4)) return VK_NULL_HANDLE;
     /* on the matrix units where the device has them (qmatmul_gemm_bdc.comp; COLI_VK_CHAIN_GEMM=0 off) */
     if (!KC.bdgc_tried[t]) {
         KC.bdgc_tried[t] = 1;

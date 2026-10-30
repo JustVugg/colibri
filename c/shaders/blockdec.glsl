@@ -2,7 +2,8 @@
 // GEMV shaders (qmatmul.comp, qmatmul_gate_up.comp). Formats (the push constant fmt):
 //   100 + t   a ggml block type t, the row as the GGUF file stores it (ggml_quants.h's
 //             numbering and block layouts; every decoder below is gq_ublk's, so a weight
-//             is sw[g] * w - mw[g] over groups of 16 as the CPU's integer form has it)
+//             is sw[g] * w - mw[g] over groups of 16 as the CPU's integer form has it);
+//             101 F16 and 130 BF16 as units of 32 values, read as floats (fast_dot)
 //   200 int2-g32, 201 int2-g16, 202 int3-g16: colibri's low-bit experts (int2_g32.h,
 //             lowbit_g16.h) laid out on the device as codes | group scales | f32 row scale
 //   203 vq2 (vq2_g32.h): codes (two index bytes per 8 weights) | 4-bit scales per 32 |
@@ -59,6 +60,17 @@ uvec2 BDN(g2)(uint base, uint i) { return uvec2(BD_G(base + 2u * i), BD_G(base +
 // codes. 0 when the format has no such path (then the general one runs).
 bool BDN(fast_dot)(int fmt, uint rb, uint u, out float r) {
     uint xb = u * 32u;
+    if (fmt == 101 || fmt == 130) {   // F16, BF16: the unit is 32 values (64 bytes), no scale
+        uint off = rb + u * 64u;
+        float a = 0.0;
+        for (uint q = 0u; q < 16u; q++) {
+            uint wd = BDN(u32)(off + 4u * q), i = xb + 2u * q;
+            vec2 v = fmt == 101 ? unpackHalf2x16(wd) : uintBitsToFloat(uvec2(wd << 16, wd & 0xffff0000u));
+            a += v.x * BD_X(i) + v.y * BD_X(i + 1u);
+        }
+        r = a;
+        return true;
+    }
     if (fmt == 108) {   // Q8_0: the unit is the block (34 bytes)
         uint off = rb + u * 34u;
         float a = 0.0;
