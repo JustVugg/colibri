@@ -81,10 +81,11 @@ LFM3_GLOBAL_KINDS = frozenset(("embedding_norm.weight",))
 
 # Whole subtrees the engine does not implement. Skipped deliberately,
 # counted, and reported -- never silently.
-SKIP_PREFIXES = (
-    ("model.vision_tower.", "lfm3_vision", "LFM3's vision tower, which the engine does not run yet: a text-only container"),
-    ("model.multi_modal_projector.", "lfm3_projector", "LFM3's image projector, with its tower"),
-)
+SKIP_PREFIXES = ()
+
+# LFM3-VL's tower and projector, run by the engine through lfm3_vision.h: copied under
+# their own names, placed as ("lfm3_vision", <the whole name>).
+LFM3_VISION_PREFIXES = ("model.vision_tower.", "model.multi_modal_projector.")
 
 # The vision tower, converted since #1757: the same ViT in Qwen3.5/3.6/3.8, run by
 # the engine through qwen38_vision.h. Placed as ("vision", <name after visual.>).
@@ -112,6 +113,7 @@ def classify(name, prefix):
          ("global", kind)            embed / final norm / lm_head
          ("layer", index, kind)      a tensor of transformer layer <index>
          ("vision", name)            the vision tower, name after "visual."
+         ("lfm3_vision", name)       LFM3-VL's tower or projector, the whole name
          ("mtp", name)               checkpoint MTP tensor
        or raise UnknownTensor.
 
@@ -131,6 +133,9 @@ def classify(name, prefix):
     for skip_prefix, group, _why in SKIP_PREFIXES:
         if name.startswith(skip_prefix):
             return ("skip", group)
+    for lfm3_prefix in LFM3_VISION_PREFIXES:
+        if name.startswith(lfm3_prefix):
+            return ("lfm3_vision", name)
     for vision_prefix in VISION_PREFIXES:
         if name.startswith(vision_prefix):
             return ("vision", name[len(vision_prefix):])

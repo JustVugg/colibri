@@ -29,6 +29,7 @@
  * device's default) with device pointers, no transfer, no synchronization. */
 extern "C" int coli_cuda_tensor_shape(const ColiCudaTensor *t, int *fmt, int *I, int *O);
 extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream);
+extern "C" int coli_cuda_tensor_glu_async(ColiCudaTensor *tg, ColiCudaTensor *tu, float *y_dev, const float *x_dev, int S, void *stream);
 /* and the routed experts' kernels (cc_moe), on the same terms, and a resident tensor's device copy */
 extern "C" int coli_cuda_tensor_dev(const ColiCudaTensor *t, const void **w, const float **sc, int *gs);
 extern "C" int coli_cuda_moe_stage(int device, void *stage, size_t slot_bytes, int slots);
@@ -661,6 +662,45 @@ __global__ static void cc_dnconv_k(const float *__restrict__ xin, const float *_
             for (int k = 0; k < 8; k++) if (k < nh) snap[p.snap_off + c * nh + k] = hist[k];
     }
     for (int k = 0; k < 8; k++) if (k < nh) ring[p.ring_off + c * nh + k] = hist[k];
+}
+/* a prompt's rows apart: one thread per row and channel, the channel's rows before the chunk from
+ * its ring (the same sums in the same order as cc_dnconv_k's); cc_dnconv_ring_k then moves the
+ * ring and the snapshot past the chunk. One thread per channel took the chunk's rows one after
+ * another: LFM3's 2048 channels were 32 blocks, 0.23 ms a 512-row layer on an RTX PRO 4000. */
+__device__ static float cc_dnconv_val(const float *__restrict__ xin, const float *__restrict__ ring, long long c, int r, int nh, const CcDnConv &p) {
+    if (r < 0) return ring[p.ring_off + c * nh + nh + r];   /* the ring's last nh, the newest last */
+    long long ib = p.in_off + (long long)r * p.in_row;
+    return p.order == 2 ? xin[ib + c] * xin[ib + c + 2LL * p.CD] : xin[ib + c];
+}
+__global__ static void cc_dnconv_rows_k(const float *__restrict__ xin, const float *__restrict__ w, const float *__restrict__ ring,
+                                        float *__restrict__ o, CcDnConv p) {
+    COLI_PDL_WAIT();
+    long long c = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    int s = blockIdx.y;
+    if (c >= p.CD) return;
+    int nh = p.CK - 1, wb = p.w_off + (int)c * p.CK;
+    float cur = cc_dnconv_val(xin, ring, c, s, nh, p), wl = w[wb + p.CK - 1], acc;
+    if (p.order != 1) {
+        acc = 0.f;
+        for (int k = 0; k < 8; k++) if (k < nh) acc += w[wb + k] * cc_dnconv_val(xin, ring, c, s - nh + k, nh, p);
+        acc += wl * cur;
+    } else {
+        acc = wl * cur;
+        for (int k = 0; k < 8; k++) if (k < nh) acc += w[wb + k] * cc_dnconv_val(xin, ring, c, s - nh + k, nh, p);
+    }
+    long long ib = p.in_off + (long long)s * p.in_row;
+    o[p.out_off + (long long)s * p.out_row + c] = p.order == 2 ? xin[ib + c + p.CD] * acc : acc / (1.f + expf(-acc));
+}
+__global__ static void cc_dnconv_ring_k(const float *__restrict__ xin, float *__restrict__ ring, float *__restrict__ snap, CcDnConv p) {
+    COLI_PDL_WAIT();
+    long long c = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= p.CD) return;
+    int nh = p.CK - 1;
+    float h[8];
+    if (p.snap_row >= 0 && p.snap_row < p.S)   /* the ring after row snap_row */
+        for (int k = 0; k < 8; k++) if (k < nh) snap[p.snap_off + c * nh + k] = cc_dnconv_val(xin, ring, c, p.snap_row + 1 - nh + k, nh, p);
+    for (int k = 0; k < 8; k++) if (k < nh) h[k] = cc_dnconv_val(xin, ring, c, p.S - nh + k, nh, p);
+    for (int k = 0; k < 8; k++) if (k < nh) ring[p.ring_off + c * nh + k] = h[k];
 }
 __device__ static float cc_softplus(float x) {
     if (x > 20.f) return x;
@@ -1510,6 +1550,18 @@ static int cc_matmul(ColiCudaTensor *t, CcBuf *x, size_t xo, CcBuf *y, size_t yo
     if (!coli_cuda_tensor_gemm_async(t, y->d + yo, x->d + xo, S, (void *)c->stream)) { c->lost = 1; return 0; }
     return 1;
 }
+static int cc_matmul_glu(ColiCudaTensor *wg, ColiCudaTensor *wu, CcBuf *x, CcBuf *y, int S) {
+    CcCtx *c = live();
+    if (!c || !wg || !wu || !x || !y || S < 1) return 0;
+    int fmt, I, O, fu, Iu, Ou;
+    if (!coli_cuda_tensor_shape(wg, &fmt, &I, &O) || !coli_cuda_tensor_shape(wu, &fu, &Iu, &Ou) ||
+        coli_cuda_tensor_device(wg) != c->device || coli_cuda_tensor_device(wu) != c->device) return 0;
+    if (fu != fmt || Iu != I || Ou != O) return -1;
+    if ((size_t)S * I * 4 > x->bytes || (size_t)S * O * 4 > y->bytes) return 0;
+    if (!coli_cuda_tensor_glu_async(wg, wu, y->d, x->d, S, (void *)c->stream)) return -1;   /* the two matmuls then */
+    g_st.matmuls += 2; g_st.ops++;
+    return 1;
+}
 static int cc_norm(CcBuf *x, CcBuf *w, CcBuf *y, const CcNorm *p) {
     CcCtx *c = live();
     if (!c || !x || !y || !p || p->nseg < 1 || p->D < 1 || p->per_row < 1) return 0;
@@ -1932,6 +1984,12 @@ static int cc_dnconv(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf *snap, 
     CcCtx *c = live();
     if (!c || !in || !w || !ring || !out || !p || p->S < 1 || p->CD < 1 || p->CK < 2 || p->CK > 9) return 0;
     if (p->snap_row >= 0 && !snap) return 0;
+    if (p->S > 1 && p->S < 65536) {   /* a prompt's rows apart, then the ring past them */
+        dim3 g((unsigned)((p->CD + 127) / 128), (unsigned)p->S);
+        coli_launch(cc_dnconv_rows_k, g, 128, 0, c->stream, fp(in), fp(w), fp(ring), fpw(out), *p);
+        coli_launch(cc_dnconv_ring_k, grid1((size_t)p->CD, 128), 128, 0, c->stream, fp(in), fpw(ring), fpw(snap), *p);
+        return launched(c, "dnconv");
+    }
     coli_launch(cc_dnconv_k, grid1((size_t)p->CD, 64), 64, 0, c->stream, fp(in), fp(w), fpw(ring), fpw(out), fpw(snap), *p);
     return launched(c, "dnconv");
 }
@@ -2591,5 +2649,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_copy_regions_h,
     cc_enc_norm, cc_enc_bias, cc_enc_geglu, cc_enc_rope, cc_enc_addrow, cc_enc_attn, cc_enc_rel,
     cc_lfm3,
+    cc_matmul_glu,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

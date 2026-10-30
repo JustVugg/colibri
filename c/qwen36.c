@@ -87,6 +87,7 @@ static int qwen36_max_ctx(void) {
 #include "expert_ffn.h"    /* routed experts: planar int4 kernel + layer runner */
 #include "idot.h"          /* integer dot kernels for the dense trunk (COLI_DENSE_IDOT, COLI_DENSE_BITS) */
 #include "qwen38_vision.h" /* the ViT: the same tower in Qwen3.5/3.6/3.8 (#1757) */
+#include "lfm3_vision.h"   /* LFM3-VL's tower and projector */
 #include "qwen36_qpack.h"  /* optional MLX-affine qpack routed-expert path */
 #include "affine_quant.h"  /* MLX affine dense triples in model.safetensors */
 #ifdef COLI_METAL
@@ -142,6 +143,7 @@ static void q36_wfree(void *p){
  * Undoing the last one would mean permuting columns inside quantized blocks,
  * which is not lossless; reading in the file's order is. */
 static gguf_ctx g_gg;
+static gguf_ctx g_mmproj; static int g_mmproj_open;   /* a GGUF's vision tower, its own file (gguf.json "mmproj") */
 static int   g_gguf = 0;
 static int   g_gguf_dry = 0;       /* GGUF_CHECK=1: validate every tensor the loader wants, read none */
 static int   g_gguf_plain = 0;     /* qwen3moe, qwen3, lfm3: llama.cpp's names for a Qwen3 layer (ffn_norm after attention) */
@@ -1045,6 +1047,9 @@ typedef struct {
      * = text only (a container converted without it, or a text-only checkpoint). */
     int vis_depth, vis_hidden, vis_heads, vis_inter, vis_patch, vis_merge;
     int vis_temporal, vis_in_ch, vis_out_hidden, vis_num_pos;
+    /* LFM3-VL's tower (lfm3_vision.h): grouped-query heads, a projector of its own width,
+     * the layers that attend (the others convolve), its norms' epsilon and rope base */
+    int vis_lfm3, vis_kv_heads, vis_proj_hidden; float vis_eps, vis_theta; uint64_t vis_attn;
     int image_token;
     /* Interleaved M-RoPE: frequency j rotates by the height position when
      * j % 3 == 1 and j < 3*sec[1], by the width one when j % 3 == 2 and
@@ -1264,6 +1269,7 @@ typedef struct {
      * positions of the prompt, and past it every axis is pos + rope_delta
      * (HF's mrope_position_deltas). All of it is dropped after the turn. */
     Q38Vision vis; int vis_ready;
+    Lfm3Vision lvis;
     float *vis_rows; int vis_rows_n;
     int *vis_map, vis_map_len;
     int *mpos, mpos_len, rope_delta;
@@ -2498,11 +2504,18 @@ static void validate_cfg(const Cfg *c, int n_layers_from_config) {
                  c->vis_temporal > 0 && c->vis_temporal <= 8 && c->vis_in_ch > 0 && c->vis_in_ch <= 8,
                  "vision patch %d merge %d temporal %d channels %d", c->vis_patch, c->vis_merge,
                  c->vis_temporal, c->vis_in_ch);
-        CFG_NEED(c->vis_num_pos > 0 && c->vis_num_pos <= 65536, "vision positions %d", c->vis_num_pos);
+        if (c->vis_lfm3)
+            CFG_NEED(c->vis_kv_heads > 0 && c->vis_heads % c->vis_kv_heads == 0 && (c->vis_hidden / c->vis_heads) % 4 == 0 &&
+                     c->vis_proj_hidden > 0 && c->vis_proj_hidden <= 65536 && c->vis_eps > 0.f && c->vis_theta > 0.f,
+                     "LFM3 vision: %d heads over %d key heads, projector %d, eps %g, theta %g", c->vis_heads,
+                     c->vis_kv_heads, c->vis_proj_hidden, c->vis_eps, c->vis_theta);
+        else
+            CFG_NEED(c->vis_num_pos > 0 && c->vis_num_pos <= 65536, "vision positions %d", c->vis_num_pos);
         CFG_NEED(c->vis_out_hidden == c->hidden, "vision tower writes %d wide rows into a %d-wide model",
                  c->vis_out_hidden, c->hidden);
         CFG_NEED(c->image_token >= 0 && c->image_token < c->vocab, "image_token_id %d outside the vocabulary",
                  c->image_token);
+        if (!c->vis_lfm3)   /* LFM3 keeps its text positions across a picture: no M-RoPE */
         CFG_NEED(c->mrope_section[0] >= 0 && c->mrope_section[1] >= 0 && c->mrope_section[2] >= 0 &&
                  2 * (c->mrope_section[0] + c->mrope_section[1] + c->mrope_section[2]) == c->rotary_dim,
                  "mrope_section %d+%d+%d does not cover rotary_dim %d", c->mrope_section[0],
@@ -2601,7 +2614,13 @@ static void load_meta(Cfg *c, const char *snap) {
                 GV("inter",vis_inter); GV("patch",vis_patch); GV("merge",vis_merge);
                 GV("temporal",vis_temporal); GV("in_ch",vis_in_ch);
                 GV("out_hidden",vis_out_hidden); GV("num_pos",vis_num_pos);
+                GV("kv_heads",vis_kv_heads); GV("proj_hidden",vis_proj_hidden);
                 #undef GV
+                if((w=json_get(vv,"kind"))&&w->t==J_STR&&!strcmp(w->str,"lfm3")) c->vis_lfm3=1;
+                if((w=json_get(vv,"eps"))&&w->t==J_NUM) c->vis_eps=(float)w->num;
+                if((w=json_get(vv,"theta"))&&w->t==J_NUM) c->vis_theta=(float)w->num;
+                if((w=json_get(vv,"attn_layers"))&&w->t==J_ARR)
+                    for(int k=0;k<w->len&&k<64;k++) if(w->kids[k]->t==J_NUM&&w->kids[k]->num!=0) c->vis_attn|=1ull<<k;
             }
         }
         /* derive rotary_dim from head_dim * partial_rotary_factor (HF formula) */
@@ -3232,9 +3251,18 @@ static void q36_vis_norm(Model *m, Q38Norm *n, const char *stem, int width) {
     snprintf(nm, sizeof nm, "model.visual.%s.weight", stem); n->w = load_t_n(m, nm, width);
     snprintf(nm, sizeof nm, "model.visual.%s.bias", stem);   n->b = load_t_n(m, nm, width);
 }
+static void q36_load_lfm3_vision(Model *m);
 static void q36_load_vision(Model *m) {
     Cfg *c = &m->c;
     if (!c->vis_depth) return;
+    if (c->vis_lfm3) {
+        if (!g_mmproj_open && !st_has(&m->S, "model.vision_tower.patchifier.weight")) {
+            fprintf(stderr, "[qwen36] qwen36_meta.json describes a vision tower but the container has none; text only\n");
+            c->vis_depth = 0; return;
+        }
+        q36_load_lfm3_vision(m);
+        return;
+    }
     if (!st_has(&m->S, "model.visual.pos_embed.weight")) {
         fprintf(stderr, "[qwen36] qwen36_meta.json describes a vision tower but the container has none; text only\n");
         c->vis_depth = 0; return;
@@ -3273,6 +3301,110 @@ static void q36_load_vision(Model *m) {
             v->depth, v->hidden, v->heads, v->patch, v->merge);
 }
 
+/* LFM3-VL's tower (lfm3_vision.h): from the container (model.vision_tower.*, the converter's
+ * copy) or from a GGUF's mmproj file (v.*, mm.*: the patch embedding as one conv kernel per
+ * frame, interleaved back into the patchifier's C x T x P x P inputs) */
+static float *l3v_load(Model *m, const char *hf, const char *gg, int64_t want) {
+    if (!g_mmproj_open) return load_t_n(m, hf, want);
+    const gguf_tensor *t = gguf_mark(&g_mmproj, gg);
+    if (!t) { fprintf(stderr, "mmproj: missing %s\n", gg); exit(1); }
+    if (gg_numel(t) != want) { fprintf(stderr, "mmproj %s: %lld values, %lld expected\n", gg, (long long)gg_numel(t), (long long)want); exit(1); }
+    float *p = falloc(want);
+    if (gguf_read_f32(&g_mmproj, t, p)) { fprintf(stderr, "mmproj %s: read failed (type %s)\n", gg, gq_type_name(t->type)); exit(1); }
+    return p;
+}
+static void q36_load_lfm3_vision(Model *m) {
+    Cfg *c = &m->c;
+    Lfm3Vision *v = &m->lvis;
+    memset(v, 0, sizeof *v);
+    v->depth = c->vis_depth; v->hidden = c->vis_hidden; v->heads = c->vis_heads; v->kv_heads = c->vis_kv_heads;
+    v->head_dim = c->vis_hidden / c->vis_heads; v->inter = c->vis_inter; v->patch = c->vis_patch;
+    v->merge = c->vis_merge; v->temporal = c->vis_temporal; v->in_ch = c->vis_in_ch;
+    v->out_hidden = c->vis_out_hidden; v->proj_hidden = c->vis_proj_hidden;
+    v->eps = c->vis_eps; v->proj_eps = 1e-6f; v->theta = c->vis_theta;
+    const int D = v->hidden, F = v->inter, hd = v->head_dim, PP = v->patch * v->patch, PD = v->in_ch * v->temporal * PP;
+    if (g_mmproj_open) {   /* one [D, C, P, P] kernel a frame: patchifier[o][c][t][p] = frame t's [o][c][p] */
+        float *pw = falloc((int64_t)D * PD);
+        for (int t = 0; t < v->temporal; t++) {
+            char nm[64];
+            if (t) snprintf(nm, sizeof nm, "v.patch_embd.weight.%d", t); else snprintf(nm, sizeof nm, "v.patch_embd.weight");
+            float *f = l3v_load(m, NULL, nm, (int64_t)D * v->in_ch * PP);
+            for (int o = 0; o < D; o++)
+                for (int ch = 0; ch < v->in_ch; ch++)
+                    memcpy(pw + (size_t)o * PD + ((size_t)ch * v->temporal + t) * PP, f + ((size_t)o * v->in_ch + ch) * PP, PP * sizeof(float));
+            free(f);
+        }
+        v->patchifier = pw;
+    } else v->patchifier = l3v_load(m, "model.vision_tower.patchifier.weight", NULL, (int64_t)D * PD);
+    v->emb_norm = l3v_load(m, "model.vision_tower.embedding_norm.weight", "v.embedding_norm.weight", D);
+    v->layers = calloc((size_t)v->depth, sizeof(L3VLayer));
+    if (!v->layers) { fprintf(stderr, "OOM vision layers\n"); exit(1); }
+    for (int i = 0; i < v->depth; i++) {
+        L3VLayer *L = &v->layers[i];
+        char h[160], g[96];
+        #define L3V(dst, hfs, ggs, n) do { snprintf(h, sizeof h, "model.vision_tower.layers.%d.%s.weight", i, hfs); \
+                                           snprintf(g, sizeof g, "v.blk.%d.%s.weight", i, ggs); dst = l3v_load(m, h, g, n); } while (0)
+        L->attn = (int)((c->vis_attn >> i) & 1);
+        L3V(L->op_norm, "operator_norm", "ln1", D);
+        L3V(L->ffn_norm, "ffn_norm", "ln2", D);
+        if (L->attn) {
+            L3V(L->q, "self_attn.q_proj", "attn_q", (int64_t)v->heads * hd * D);
+            L3V(L->k, "self_attn.k_proj", "attn_k", (int64_t)v->kv_heads * hd * D);
+            L3V(L->v, "self_attn.v_proj", "attn_v", (int64_t)v->kv_heads * hd * D);
+            L3V(L->o, "self_attn.out_proj", "attn_out", (int64_t)D * v->heads * hd);
+            L3V(L->qn, "self_attn.q_layernorm", "attn_q_norm", hd);
+            L3V(L->kn, "self_attn.k_layernorm", "attn_k_norm", hd);
+        } else {
+            L3V(L->in_proj, "conv.in_proj", "conv2d_in_proj", (int64_t)3 * D * D);
+            L3V(L->spatial, "conv.spatial_conv", "conv2d_spatial", (int64_t)D * 9);
+            L3V(L->out_proj, "conv.out_proj", "conv2d_out_proj", (int64_t)D * D);
+        }
+        L3V(L->w1, "feed_forward.w1", "ffn_gate", (int64_t)F * D);
+        L3V(L->w3, "feed_forward.w3", "ffn_up", (int64_t)F * D);
+        L3V(L->w2, "feed_forward.w2", "ffn_down", (int64_t)D * F);
+        #undef L3V
+    }
+    const int W4 = D * v->merge * v->merge, P = v->proj_hidden;
+    v->ln_w = l3v_load(m, "model.multi_modal_projector.layer_norm.weight", "mm.input_norm.weight", D);
+    v->ln_b = l3v_load(m, "model.multi_modal_projector.layer_norm.bias", "mm.input_norm.bias", D);
+    v->l1_w = l3v_load(m, "model.multi_modal_projector.linear_1.weight", "mm.0.weight", (int64_t)P * W4);
+    v->l1_b = l3v_load(m, "model.multi_modal_projector.linear_1.bias", "mm.0.bias", P);
+    v->l2_w = l3v_load(m, "model.multi_modal_projector.linear_2.weight", "mm.2.weight", (int64_t)v->out_hidden * P);
+    v->l2_b = l3v_load(m, "model.multi_modal_projector.linear_2.bias", "mm.2.bias", v->out_hidden);
+    m->vis_ready = 1;
+    int na = 0; for (int i = 0; i < v->depth; i++) na += v->layers[i].attn;
+    fprintf(stderr, "[qwen36] LFM3 vision tower%s: %d layers (%d attention, %d convolution), hidden %d, %d heads over %d, patch %d, merge %d\n",
+            g_mmproj_open ? " (mmproj)" : "", v->depth, na, v->depth - na, D, v->heads, v->kv_heads, v->patch, v->merge);
+}
+/* an mmproj's shape (clip.vision.*) into the config: LFM3's tower, the layers with attention
+ * those that carry attn_q. 0 when the file is not one. */
+static int q36_mmproj_cfg(Cfg *c) {
+    const gguf_ctx *g = &g_mmproj;
+    const char *pt = gguf_get_str(g, "clip.vision.projector_type");
+    if (!pt || strcmp(pt, "lfm3vl")) { fprintf(stderr, "[qwen36] mmproj projector %s: not LFM3's, text only\n", pt ? pt : "(none)"); return 0; }
+    c->vis_lfm3 = 1;
+    c->vis_depth = (int)gguf_get_int(g, "clip.vision.block_count", 0);
+    c->vis_hidden = (int)gguf_get_int(g, "clip.vision.embedding_length", 0);
+    c->vis_inter = (int)gguf_get_int(g, "clip.vision.feed_forward_length", 0);
+    c->vis_heads = (int)gguf_get_int(g, "clip.vision.attention.head_count", 0);
+    c->vis_kv_heads = (int)gguf_get_int(g, "clip.vision.attention.head_count_kv", c->vis_heads);
+    c->vis_patch = (int)gguf_get_int(g, "clip.vision.patch_size", 16);
+    c->vis_merge = (int)gguf_get_int(g, "clip.vision.spatial_merge_size", 2);
+    c->vis_out_hidden = (int)gguf_get_int(g, "clip.vision.projection_dim", 0);
+    c->vis_eps = (float)gguf_get_float(g, "clip.vision.attention.layer_norm_epsilon", 1e-5);
+    c->vis_theta = 1e6f;   /* the checkpoint's rope_theta; the mmproj does not carry it */
+    c->vis_in_ch = 3;
+    c->vis_temporal = gguf_find(g, "v.patch_embd.weight.1") ? 2 : 1;
+    const gguf_tensor *l1 = gguf_find(g, "mm.0.bias");
+    c->vis_proj_hidden = l1 ? (int)l1->ne[0] : 0;
+    c->vis_attn = 0;
+    for (int i = 0; i < c->vis_depth && i < 64; i++) {
+        char nm[64]; snprintf(nm, sizeof nm, "v.blk.%d.attn_q.weight", i);
+        if (gguf_find(g, nm)) c->vis_attn |= 1ull << i;
+    }
+    return c->vis_depth > 0;
+}
+
 static void q36_vision_detach(Model *m) {
     free(m->vis_rows); free(m->vis_map); free(m->mpos);
     m->vis_rows = NULL; m->vis_map = NULL; m->mpos = NULL;
@@ -3304,6 +3436,19 @@ static int q36_vision_attach(Model *m, const float *patches, int grid_h, int gri
             return -1;
         }
     q36_vision_detach(m);
+    if (c->vis_lfm3) {   /* LFM3: the picture's rows over its tokens, the text's positions unchanged */
+        m->vis_rows = calloc((size_t)tokens * c->hidden, sizeof(float));
+        m->vis_map = malloc((size_t)n * sizeof(int));
+        if (!m->vis_rows || !m->vis_map) { q36_vision_detach(m); return -1; }
+        double t0 = now_s();
+        if (lfm3_vision_forward(&m->lvis, patches, grid_h, grid_w, m->vis_rows) != tokens) { q36_vision_detach(m); return -1; }
+        fprintf(stderr, "[qwen36] picture: %d x %d patches, %d rows, the tower %.2f s\n", grid_h, grid_w, tokens, now_s() - t0);
+        const char *dump = getenv("Q36_VIS_DUMP");   /* the picture's rows, raw f32, for a check against a reference */
+        if (dump && *dump) { FILE *f = fopen(dump, "wb"); if (f) { fwrite(m->vis_rows, sizeof(float), (size_t)tokens * c->hidden, f); fclose(f); } }
+        for (int i = 0; i < n; i++) m->vis_map[i] = i >= first && i < first + tokens ? i - first : -1;
+        m->vis_rows_n = tokens; m->vis_map_len = n;
+        return tokens;
+    }
     m->vis_rows = calloc((size_t)tokens * c->hidden, sizeof(float));
     m->vis_map = malloc((size_t)n * sizeof(int));
     m->mpos = malloc((size_t)n * 3 * sizeof(int));
@@ -3606,7 +3751,14 @@ static void gguf_load_cfg(Cfg *c) {
     }
     snprintf(nm, sizeof nm, "blk.0.exp_probs_b.bias");
     c->has_bias = gguf_find(g, nm) != NULL;
-    if (lfm3) {}
+    if (lfm3) {
+        if (g_mmproj_open && q36_mmproj_cfg(c)) {   /* the picture's placeholder, by its piece */
+            const gguf_kv *tk = gguf_get(g, "tokenizer.ggml.tokens");
+            for (uint64_t i = 0; tk && tk->type == GGUF_T_ARRAY && tk->atype == GGUF_T_STRING && i < tk->n; i++)
+                if (tk->strs[i] && !strcmp(tk->strs[i], "<|image|>")) { c->image_token = (int)i; break; }
+            if (c->image_token < 0) { fprintf(stderr, "[gguf] lfm3: an mmproj but no <|image|> token; text only\n"); c->vis_depth = 0; }
+        }
+    }
     else if (plain && dense)
         fprintf(stderr, "[gguf] qwen3 (dense): %d layers (all attention), hidden %d, MLP %d, vocab %d\n",
                 c->n_layers, c->hidden, c->shared_inter, c->vocab);
@@ -8992,7 +9144,7 @@ int main(int argc, char **argv) {
     coli_omp_tune_threads("qwen36");
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("Qwen3.6", "SNAP=<model directory> ./qwen36 ..."); return 1; }
-    static char gguf_path[4096]; int gguf_dir = 0;
+    static char gguf_path[4096], mmproj_path[4096]; int gguf_dir = 0;
     {   /* a model directory made by tools/gguf_import.py: gguf.json names the file */
         char gj[4096]; snprintf(gj, sizeof gj, "%s/gguf.json", snap);
         FILE *f = fopen(gj, "rb");
@@ -9002,11 +9154,21 @@ int main(int argc, char **argv) {
             const char *g = r ? jstr(r, "gguf") : NULL;
             if (!g || !*g) { fprintf(stderr, "%s: no \"gguf\" path\n", gj); return 1; }
             gguf_path_join(gguf_path, sizeof gguf_path, snap, g);
+            const char *mp = jstr(r, "mmproj");   /* a vision tower's file (LFM3-VL's) */
+            if (mp && *mp) gguf_path_join(mmproj_path, sizeof mmproj_path, snap, mp);
             free(arena); gguf_dir = 1;
         }
     }
     if (gguf_dir || gguf_is_file(snap)) {
         const char *gp = gguf_dir ? gguf_path : snap;
+        {   /* the vision tower's own GGUF: gguf.json's mmproj, Q36_MMPROJ over it (0: none) */
+            const char *e = getenv("Q36_MMPROJ");
+            const char *mp = e ? (strcmp(e, "0") ? e : NULL) : (mmproj_path[0] ? mmproj_path : NULL);
+            if (mp && *mp) {
+                if (gguf_open(&g_mmproj, mp)) fprintf(stderr, "[qwen36] mmproj %s: %s; text only\n", mp, g_mmproj.err);
+                else g_mmproj_open = 1;
+            }
+        }
         if (getenv("GGUF_CHECK")) gguf_header_only = 1;
         if (gguf_open(&g_gg, gp)) { fprintf(stderr, "GGUF: %s\n", g_gg.err); return 1; }
         if (getenv("GGUF_CHECK")) {

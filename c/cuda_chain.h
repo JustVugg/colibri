@@ -314,6 +314,10 @@ typedef struct ColiCudaChainOps {
     /* lfm3: 1 when dnconv takes order 2 and ew CC_EW_HEADGATE (LFM3's convolution and head gate:
      * an older backend's kernels would skip them without a word) */
     int  (*lfm3)(void);
+    /* matmul_glu: y[S, O] = silu(x Wg^T) * (x Wu^T) in one pass for two tensors of one GGUF block
+     * type and shape (a prompt chunk's rows of a SwiGLU MLP); 1 done, -1 not taken (another type,
+     * few rows: the caller's two matmuls and CC_EW_SWIGLU), 0 a failure */
+    int  (*matmul_glu)(ColiCudaTensor *wg, ColiCudaTensor *wu, CcBuf *x, CcBuf *y, int S);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -451,6 +455,11 @@ static inline int cc_enc_rel(CcBuf *x, CcBuf *pt, CcBuf *y, const CcEncRel *p) {
 static inline int cc_lfm3_ready(void) {
     const ColiCudaChainOps *t = cc_ops();
     return t && t->size >= offsetof(ColiCudaChainOps, lfm3) + sizeof t->lfm3 && t->lfm3 && t->lfm3();
+}
+static inline int cc_matmul_glu(ColiCudaTensor *wg, ColiCudaTensor *wu, CcBuf *x, CcBuf *y, int S) {
+    const ColiCudaChainOps *t = cc_ops();
+    if (!(t && t->size >= offsetof(ColiCudaChainOps, matmul_glu) + sizeof t->matmul_glu && t->matmul_glu)) return -1;
+    return t->matmul_glu(wg, wu, x, y, S);
 }
 #endif
 

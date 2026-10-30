@@ -1196,10 +1196,11 @@ static int q36cc_shared(Q36CChain *ch, Model *m, Layer *l, int i, int n) {
     int ok = 1, SI = l->sh_I; (void)m;   /* shared_inter, or a Flint dense layer's MLP width */
     if (SI > 0) {
         CcEw p = {CC_EW_SWIGLU, n * SI, SI, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
-        ok = cc_matmul(ch->t_shg[i], ch->h2, 0, ch->gs, 0, n) &&
-             cc_matmul(ch->t_shu[i], ch->h2, 0, ch->us, 0, n) &&
-             cc_ew(ch->hs, ch->gs, ch->us, NULL, NULL, &p) &&
-             cc_matmul(ch->t_shd[i], ch->hs, 0, ch->ds, 0, n);
+        int glu = cc_matmul_glu(ch->t_shg[i], ch->t_shu[i], ch->h2, ch->hs, n);   /* the gate's and up's sums in one pass */
+        ok = glu > 0 || (glu < 0 && cc_matmul(ch->t_shg[i], ch->h2, 0, ch->gs, 0, n) &&
+                                    cc_matmul(ch->t_shu[i], ch->h2, 0, ch->us, 0, n) &&
+                                    cc_ew(ch->hs, ch->gs, ch->us, NULL, NULL, &p));
+        ok = ok && cc_matmul(ch->t_shd[i], ch->hs, 0, ch->ds, 0, n);
     }
     if (ok && ch->t_sg[i] && !(ch->rgf[i] && n <= Q36CC_RG_ROWS)) ok = cc_matmul(ch->t_sg[i], ch->h2, 0, ch->sgd, 0, n);
     return ok;

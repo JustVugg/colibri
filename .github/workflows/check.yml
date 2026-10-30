@@ -236,6 +236,11 @@ jobs:
           grep -q 'sliding-window layers keep a ring of 14 rows' ring.log || { cat ring.log; exit 1; }
           python tools/make_lfm3_tiny.py --out /tmp/lfm3_Q8_0 --emit-ref /tmp/lfm3_Q8_0/ref.json --dense Q8_0 --max-new 8 --min-gap 0.2
           COLI_CUDA=0 COLI_VULKAN=0 SNAP=/tmp/lfm3_Q8_0/model.gguf ./qwen36 16 8 /tmp/lfm3_Q8_0/ref.json
+          # LFM3-VL's tower (lfm3_vision.h) from an mmproj: a picture's rows within 1e-4 of the
+          # reference's, and the continuation they lead to
+          python tools/make_lfm3_tiny.py --out /tmp/lfm3_V --emit-ref /tmp/lfm3_V/ref.json --vision
+          COLI_CUDA=0 COLI_VULKAN=0 Q36_MMPROJ=/tmp/lfm3_V/mmproj.gguf Q36_VIS_DUMP=/tmp/lfm3_V/rows.bin SNAP=/tmp/lfm3_V/model.gguf ./qwen36 16 8 /tmp/lfm3_V/ref.json
+          python -c "import numpy as n; a=n.fromfile('/tmp/lfm3_V/rows.bin','f4'); b=n.fromfile('/tmp/lfm3_V/image_rows.f32','f4'); e=abs(a-b).max()/n.sqrt((b*b).mean()); print('LFM3 vision rows, worst error of the rms', e); assert a.shape==b.shape and e<1e-4"
 
   macos:
     # clang; libomp for the threaded path (Makefile falls back to
