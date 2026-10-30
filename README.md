@@ -558,6 +558,19 @@ the experts live. GLM-5.2 decode, from [the full tables](docs/benchmarks.md):
 - **the 25 GB laptop where this started:** 0.05-0.1 tok/s cold, the honest
   floor.
 
+### Three backends on one machine
+
+An i5-13500 with 62 GB of RAM and an RTX PRO 4000 Blackwell SFF (24 GB, 70 W),
+each model served by `coli serve`: a fresh 450-token prompt, then a 128-token
+streamed answer, the request's HTTP included; the better of two runs, tok/s.
+
+| GGUF | CUDA prompt | CUDA decode | Vulkan prompt | Vulkan decode | CPU prompt | CPU decode |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen3.6-35B-A3B UD-Q4_K_M | 3,491 | 104.8 | 2,076 | 92.9 | 122.6 | 13.9 |
+| LFM3-VL-2B Q4_K_M | 12,317 | 235.1 | 8,174 | 214.1 | 286.5 | 34.5 |
+| OLMoE-1B-7B-0125-Instruct Q4_K_M | 10,418 | 354.6 | 6,867 | 299.4 | 279.9 | 47.4 |
+| LFM3-VL-2B F16 | 11,524 | 103.4 | 7,767 | 99.3 | 49.7 | 6.4 |
+
 Quality is measured, not assumed: the int4 container's cost and the
 quantization ablations are in
 [benchmarks.md](docs/benchmarks.md#quality-benchmark). To add your machine,
