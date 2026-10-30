@@ -47,6 +47,7 @@
 #include <errno.h>
 #include <time.h>
 #include <stdarg.h>
+#include "v41_topk.h"
 /* Windows has no <sys/resource.h>; compat.h supplies getrusage over
  * GetProcessMemoryInfo, and every other engine guards the include the same way. */
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
@@ -2687,6 +2688,7 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
     float *qblk = xmalloc((size_t)block * nh * ihd * sizeof(float), "indexer queries");
     float *wblk = xmalloc((size_t)block * nh * sizeof(float), "indexer weights");
     float *score = xmalloc((size_t)compress_len * sizeof(float), "indexer scores");
+    uint8_t *selected = xmalloc((size_t)compress_len, "indexer top-k mask");
     float scale = (1.0f / sqrtf((float)ihd)) * (1.0f / sqrtf((float)nh));
 
     for (int t = 0; t < n; t++) {
@@ -2741,31 +2743,17 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
             for (int j = 0; j < compress_len && j < m->candidate_width; j++)
                 if (!keep[j]) score[j] = -INFINITY;
         }
-        /* top-k, then back into position order: the attention kernel treats every slot
+        /* Bounded heap top-k, then position order: the attention kernel treats every slot
          * independently, but keeping them sorted makes the concatenated index list
-         * readable and matches the reference's `.sort()`. */
+         * readable and matches the reference's `.sort()`. The old repeated full scan
+         * rechecked every already-selected candidate per item, quadratic in `index_topk`
+         * for every query row. */
         int *row = out + (size_t)t * stride;   /* the compressed half of this query's list */
-        for (int k = 0; k < topk; k++) row[k] = -1;
-        int taken = 0;
-        for (int k = 0; k < topk; k++) {
-            int best = -1;
-            for (int j = 0; j < compress_len; j++) {
-                if (score[j] == -INFINITY) continue;
-                int already = 0;
-                for (int u = 0; u < taken; u++) if (row[u] == j) { already = 1; break; }
-                if (already) continue;
-                if (best < 0 || score[j] > score[best]) best = j;
-            }
-            if (best < 0) break;
-            row[taken++] = best;
-        }
-        for (int a = 0; a < taken; a++)          /* insertion sort: taken <= index_topk */
-            for (int b = a + 1; b < taken; b++)
-                if (row[b] < row[a]) { int swap = row[a]; row[a] = row[b]; row[b] = swap; }
+        int taken = v41_topk_positions(score, compress_len, topk, row, selected);
         for (int k = 0; k < topk; k++)
             row[k] = (k < taken && row[k] < lens) ? row[k] + offset : -1;
     }
-    free(qblk); free(wblk); free(score);
+    free(qblk); free(wblk); free(score); free(selected);
 }
 
 /* wo_a is block diagonal over o_groups: each group projects only its own heads, and

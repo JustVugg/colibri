@@ -2051,6 +2051,9 @@ tests/test_qwen38_tokenizer$(EXE): tests/test_qwen38_tokenizer.c qwen38.c tests/
 tests/edge_runtime_nocuda.o: edge_runtime.c .build-config
 	$(CC) $(NOCUDA_CFLAGS) -c edge_runtime.c -o $@
 
+tests/test_v41_topk$(EXE): tests/test_v41_topk.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_qwen38_config$(EXE): tests/test_qwen38_config.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
