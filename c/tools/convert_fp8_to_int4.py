@@ -45,6 +45,7 @@ _positioned_write_lock = threading.Lock()
 # tests/test_convert_guard.py li confronta col registry e fallisce alla prima
 # famiglia aggiunta o rinominata.
 GLM52_MODEL_TYPES = {"glm_moe_dsa", "glm5_moe", "glm"}
+ML4_MODEL_TYPES = {"mistral_large4"}   # the registry's glm family too: the same engine
 # Mistral-Large-4 (mistralai/Mistral-Large-4-1T-A52B): its FP8 release in Mistral's own names
 # (consolidated-*.safetensors), read through ml4_name into the names colibri.c reads; set from
 # the checkpoint's config.json (model_type mistral_large4)
@@ -136,6 +137,8 @@ OTHER_FAMILY_PATHS = {
     "qwen3_5_text":    "Qwen3.8-27B (dense): use tools/convert_qwen36.py, see docs/qwen36.md",
     "qwen3_moe":       "Qwen3-Coder-30B-A3B: use tools/convert_qwen36.py, see docs/qwen36.md",
     "flint":           "Flint: use tools/convert_qwen36.py, or run one of its GGUFs (coli import), see docs/gguf.md",
+    "lfm3":            "LFM3-VL: use tools/convert_qwen36.py, or run one of its GGUFs (coli import), see docs/qwen36.md",
+    "lfm3_vl":         "LFM3-VL: use tools/convert_qwen36.py, or run one of its GGUFs (coli import), see docs/qwen36.md",
     "muse_spark":      "Muse Spark Open is NOT converted by this tool: run one of its GGUFs (coli import), see docs/gguf.md",
     "qwen3":           "Qwen3 (dense) is NOT converted by this tool: the qwen36 engine runs its "
                        "GGUF as the file has it (coli import), see docs/gguf.md",
@@ -177,7 +180,7 @@ def check_model_family(config, where):
                          "refusing to guess. This converter is for GLM-5.2 only.")
     if model_type in GLM52_MODEL_TYPES:
         return
-    if model_type == "mistral_large4":   # its FP8 release, in Mistral's own names
+    if model_type in ML4_MODEL_TYPES:   # its FP8 release, in Mistral's own names
         ML4 = True
         return
     hint = OTHER_FAMILY_PATHS.get(CONFIG_MODEL_TYPE_ALIASES.get(model_type, model_type))
