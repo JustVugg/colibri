@@ -812,22 +812,28 @@ static int json_escape(const unsigned char *s, int n, char *out, int outsz){
 
 /* Append b[0..n) into buf (*bn), extract as many LEADING complete UTF-8
  * codepoints as possible into out[0..*outn) (max 255). Trailing partial
- * sequence stays in buf. Returns bytes written to out. */
+ * sequence stays in buf. Returns bytes written to out. The codepoints are
+ * taken after every byte, so buf only ever holds a partial one (at most
+ * three bytes): appending the whole token first cut every byte past the
+ * 16th, and a Cyrillic word is often a token longer than that (" экскурсии"
+ * 19 bytes, " удовольствием" 27), #2492. */
 static int utf8_drain(unsigned char *buf, int *bn, const unsigned char *b, int n, unsigned char *out, int *outn){
     *outn = 0;
-    for (int k=0;k<n;k++){ if (*bn < 16) buf[(*bn)++] = b[k]; }
-    int j = 0;
-    while (j < *bn){
-        unsigned char lead = buf[j]; int need;
-        if (lead < 0x80) need = 1;
-        else if ((lead & 0xE0) == 0xC0) need = 2;
-        else if ((lead & 0xF0) == 0xE0) need = 3;
-        else if ((lead & 0xF8) == 0xF0) need = 4;
-        else { memmove(buf+j, buf+j+1, *bn-j-1); (*bn)--; continue; }
-        if (j+need > *bn) break;
-        if (*outn + need <= 255){ for (int x=0;x<need;x++) out[(*outn)++] = buf[j+x]; }
-        memmove(buf+j, buf+j+need, *bn-j-need);
-        *bn -= need;
+    for (int k=0;k<n;k++){
+        if (*bn < 16) buf[(*bn)++] = b[k];
+        int j = 0;
+        while (j < *bn){
+            unsigned char lead = buf[j]; int need;
+            if (lead < 0x80) need = 1;
+            else if ((lead & 0xE0) == 0xC0) need = 2;
+            else if ((lead & 0xF0) == 0xE0) need = 3;
+            else if ((lead & 0xF8) == 0xF0) need = 4;
+            else { memmove(buf+j, buf+j+1, *bn-j-1); (*bn)--; continue; }
+            if (j+need > *bn) break;
+            if (*outn + need <= 255){ for (int x=0;x<need;x++) out[(*outn)++] = buf[j+x]; }
+            memmove(buf+j, buf+j+need, *bn-j-need);
+            *bn -= need;
+        }
     }
     return *outn;
 }

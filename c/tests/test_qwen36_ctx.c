@@ -143,9 +143,31 @@ static void case_budget(void) {
     ck(qwen36_serve_budget(8193, 0, 8192, 1) == -1, "read-only: past the context is still refused");
 }
 
+/* #2492: a token's bytes past the 16th were cut before its codepoints were taken, and a
+ * Cyrillic word is often a longer token than that */
+static void case_utf8(void) {
+    printf("utf-8 of long tokens\n");
+    const char *tok = " удовольствием";   /* 27 bytes, one token of Qwen3.6's vocabulary */
+    unsigned char buf[16], out[256]; int bn = 0, on = 0;
+    int got = utf8_drain(buf, &bn, (const unsigned char *)tok, (int)strlen(tok), out, &on);
+    ck(got == (int)strlen(tok) && on == got && memcmp(out, tok, (size_t)got) == 0 && bn == 0,
+       "a 27-byte token comes out whole");
+    /* a codepoint split across two tokens still waits for its last byte */
+    const unsigned char a[] = {0xD1, 0x8D, 0xD0}, b2[] = {0xBA, 'x'};   /* "э" then "к" across the boundary */
+    bn = 0; utf8_drain(buf, &bn, a, 3, out, &on);
+    ck(on == 2 && bn == 1, "a codepoint's first byte waits for the next token");
+    utf8_drain(buf, &bn, b2, 2, out, &on);
+    ck(on == 3 && out[0] == 0xD0 && out[1] == 0xBA && out[2] == 'x' && bn == 0, "and comes out with it");
+    /* 40 bytes of two-byte codepoints: none lost */
+    unsigned char lng[40]; for (int i = 0; i < 40; i += 2) { lng[i] = 0xD0; lng[i + 1] = 0xB0; }
+    bn = 0; utf8_drain(buf, &bn, lng, 40, out, &on);
+    ck(on == 40 && memcmp(out, lng, 40) == 0, "a 40-byte token loses nothing");
+}
+
 int main(void) {
     case_layout();
     case_growth();
+    case_utf8();
     case_ceiling();
     case_budget();
     if (fails) { printf("FAILED %d\n", fails); return 1; }
