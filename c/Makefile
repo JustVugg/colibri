@@ -3035,6 +3035,12 @@ tests/test_kimi_request_state$(EXE): tests/test_kimi_request_state.c kimi_k3.c $
 tests/test_kimi_cuda_expert$(EXE): tests/test_kimi_cuda_expert.c kimi_k3.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+# Kimi K3's dense matrices on the GPU (K3_CUDA_DENSE): coli_cuda.dll's resident matmuls
+# timed at the model's shapes against the CPU kernels. Needs a CUDA build (CUDA=1, or
+# CUDA_DLL=1 with coli_cuda.dll beside the binary); not part of test-c.
+tests/bench_k3_cuda_dense$(EXE): tests/bench_k3_cuda_dense.c quant.h backend_cuda.h $(CUDA_OBJ)
+	$(CC) $(CFLAGS) tests/bench_k3_cuda_dense.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
+
 # ---------------------------------------------------------------------------
 # Generated header prerequisites (#1741)
 #

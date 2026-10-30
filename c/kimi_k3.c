@@ -67,6 +67,9 @@
  *                        alike); 0 = reads on the caller
  *   K3_PREFETCH=0|1      read the next MoE layer's predicted experts ahead in decode
  *                        steps of up to K3_PREFETCH_ROWS (4) rows (default 1)
+ *   K3_CUDA_DENSE=1      (a CUDA build) the largest dense matrices on the GPU, up to
+ *                        K3_CUDA_DENSE_GB (20) beside K3_CUDA_RESERVE_GB (2) free;
+ *                        K3_CUDA_RELEASE_HOST=1 frees their host copies
  *   K3_TOPP=F            keep routed experts to cumulative weight F (0 = off)
  *   K3_CHUNK=N           prefill chunk size (default 32; 1 = token-at-a-time)
  *   K3_THINK=0|1         chat mode: open the think channel (default 1)
@@ -163,11 +166,13 @@ typedef struct {
 typedef struct { int fmt; float *f; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;
                  void *vk;    /* ColiVkTensor* once uploaded (K3_VK); NULL = CPU only */
                  void *metal; /* ColiMetalTensor* once registered (K3_METAL); NULL = CPU only */
+                 void *cuda;  /* ColiCudaTensor* once placed (K3_CUDA_DENSE); NULL = CPU only */
                  st_mapped_raw data_map, scale_map;
                  int mapped;
-                 /* COLI_VULKAN: how to read it back from disk (k3_w_reload), and 1 while the
-                  * device holds it alone (COLI_VK_DENSE_HOST, the host copy dropped) */
-                 char *vk_name; int vk_bits, vk_gone; } W;
+                 /* COLI_VULKAN / COLI_CUDA: how to read it back from disk (k3_w_reload,
+                  * k3_cuda_restore), and 1 while a device holds it alone (COLI_VK_DENSE_HOST,
+                  * K3_CUDA_RELEASE_HOST: the host copy dropped) */
+                 char *vk_name; int vk_bits, vk_gone, cuda_gone; } W;
 
 typedef struct {                          /* KDA layer */
     W q, k, v, o, g;
@@ -531,7 +536,36 @@ static int kimima_forward_metal(Model *m, Layer *l, int li, const float *x, int 
     return 0; /* 0 = NOT IMPLEMENTED — fall through to CPU */
 }
 #endif
+#ifdef COLI_CUDA
+/* K3_CUDA_DENSE (k3_cuda_dense_place, after w_load): the placed matrices' state */
+static int g_k3_cuda_dense=0, g_k3_cuda_dev=0;
+static uint64_t g_k3_cuda_calls;
+static double g_k3_cuda_ms;
+static void k3_cuda_restore(W *w);
+static int k3_cuda_fmt(const W *w){ return w->fmt==1?1 : w->fmt==4?4 : w->fmt==0?0 : -1; }
+static int k3_omp_in_par(void){
+#ifdef _OPENMP
+    return omp_in_parallel();
+#else
+    return 0;
+#endif
+}
+#endif
 static void w_matmul(float *y, const float *x, const W *w, int S){
+#ifdef COLI_CUDA
+    if(w->cuda&&g_k3_cuda_dense&&!k3_omp_in_par()){
+        const void *src=w->fmt==1?(const void*)w->q8 : w->fmt==4?(const void*)w->q4 : (const void*)w->f;
+        double t0=now_s();
+        if(coli_cuda_matmul((ColiCudaTensor**)&((W*)w)->cuda,y,x,src,w->s,k3_cuda_fmt(w),S,w->I,w->O,
+                            g_k3_cuda_dev,w->fmt==4?w->gs:0)){
+            g_k3_cuda_calls++; g_k3_cuda_ms+=(now_s()-t0)*1e3;
+            return;
+        }
+        fprintf(stderr,"[K3-CUDA] a dense matmul failed on the GPU; the CPU computes every one from here\n");
+        g_k3_cuda_dense=0;
+    }
+    if(w->cuda_gone) k3_cuda_restore((W*)w);   /* the CPU needs a matrix the GPU held alone */
+#endif
 #ifdef COLI_METAL
     if(g_k3_metal && coli_metal_available()){
         if(w->fmt==0){
@@ -655,8 +689,11 @@ static void w_release_host(W *w){
     if(!w) return;
     if(w->mapped){ st_unmap_raw(&w->scale_map); st_unmap_raw(&w->data_map); }
     else { free(w->f); free(w->q8); free(w->q4); free(w->s); }
-#ifdef COLI_VULKAN
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
     free(w->vk_name);
+#endif
+#ifdef COLI_CUDA
+    if(w->cuda) coli_cuda_tensor_free((ColiCudaTensor*)w->cuda);
 #endif
     memset(w,0,sizeof(*w));
 }
@@ -666,8 +703,8 @@ static void w_load(Model *m, W *w, const char *name, int O, int I, int bits){
     st_tensor *t=st_find(&m->S,nm);
     if(!t) st_die_missing(&m->S,nm);
     memset(w,0,sizeof(*w)); w->O=O; w->I=I;
-#ifdef COLI_VULKAN
-    w->vk_name=strdup(name); w->vk_bits=bits;   /* to read it back as it is read now (k3_w_reload) */
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+    w->vk_name=strdup(name); w->vk_bits=bits;   /* to read it back as it is read now (k3_w_reload, k3_cuda_restore) */
     if(!w->vk_name){fprintf(stderr,"OOM weight name\n");exit(1);}
 #endif
     if(t->dtype==3){
@@ -776,6 +813,114 @@ static float *f32_load(Model *m, const char *name, int64_t want){
     if(want>0 && t->numel!=want){ fprintf(stderr,"%s: numel %lld != %lld\n",nm,(long long)t->numel,(long long)want); exit(1); }
     float *p=falloc(t->numel); st_read_f32(&m->S,nm,p,0); return p;
 }
+
+#ifdef COLI_CUDA
+/* ---------- the dense matrices on the GPU (K3_CUDA_DENSE=1, a CUDA build) ----------
+ * Every token reads all the matrices that are not routed experts: about 35 GiB at the
+ * default bits, streamed from RAM each step beside the experts' own traffic (the drives
+ * writing them in, the CPU reading them back). K3_CUDA_DENSE puts the largest of them on
+ * the card, in their int8 rows and int4 groups, until K3_CUDA_DENSE_GB (20) or the
+ * card's free memory less K3_CUDA_RESERVE_GB (2) is used: the head, the gated MLA's
+ * o_proj and gate, KDA's projections, then the smaller ones. w_matmul runs a placed
+ * matrix there for every row count, a decode step's and a prompt chunk's, from the layer
+ * loop's thread (the one CUDA context). kv_b stays (the MLA absorb reads its rows) and
+ * so do the f32 routers and KDA's small f32 projections (the routing stays the CPU's
+ * arithmetic on its input). The products are the CPU's, summed in f32 in another order
+ * by coli_cuda.dll's quant_matmul: not the CPU's bytes, as with every GPU backend.
+ * K3_CUDA_RELEASE_HOST=1 frees a placed matrix's host copy, before the expert cache is
+ * sized, so the cache gets that RAM; if a GPU call fails, the CPU computes every matrix
+ * from then on, reading a released one back from the checkpoint as it needs it. */
+static Model *g_k3_cuda_model;
+static size_t k3_w_nbytes(const W *w){
+    if(w->fmt==0) return (size_t)w->O*w->I*4;
+    if(w->fmt==1) return (size_t)w->O*w->I+(size_t)w->O*4;
+    if(w->fmt==4) return (size_t)w->O*((w->I+1)/2)+(size_t)w->O*((w->I+w->gs-1)/w->gs)*4;
+    return 0;
+}
+static void k3_cuda_restore(W *w){
+    if(!w->cuda_gone) return;
+    Model *m=g_k3_cuda_model;
+    if(!m||!w->vk_name){fprintf(stderr,"[K3-CUDA] a dense matrix the GPU held alone cannot be read back\n");exit(1);}
+    W t; w_load(m,&t,w->vk_name,w->O,w->I,w->vk_bits);
+    if(t.fmt!=w->fmt||t.gs!=w->gs){fprintf(stderr,"[K3-CUDA] %s came back in another form\n",w->vk_name);exit(1);}
+    w->f=t.f; w->q8=t.q8; w->q4=t.q4; w->s=t.s;
+    free(t.vk_name);
+    w->cuda_gone=0;
+}
+/* Every W the GPU may take, into list[] (kv_b excepted: its rows are read on the CPU). */
+static int k3_cuda_list(Model *m, W **list){
+    int n=0;
+    for(int i=0;i<m->c.n_layers;i++){
+        Layer *l=&m->L[i];
+        if(l->kda){ Kda *a=&l->a; W *ws[]={&a->q,&a->k,&a->v,&a->g,&a->o}; for(size_t k=0;k<5;k++) list[n++]=ws[k]; }
+        else { Mla *a=&l->m; W *ws[]={&a->qa,&a->qb,&a->kva,&a->o,&a->g,&a->wk,&a->wq,&a->wp}; for(size_t k=0;k<8;k++) list[n++]=ws[k]; }
+        if(l->sparse){ Moe *o=&l->moe; W *ws[]={&o->lat_down,&o->lat_up,&o->sh_gate,&o->sh_up,&o->sh_down}; for(size_t k=0;k<5;k++) list[n++]=ws[k]; }
+        else { W *ws[]={&l->d_gate,&l->d_up,&l->d_down}; for(size_t k=0;k<3;k++) list[n++]=ws[k]; }
+    }
+    if(m->has_head) list[n++]=&m->lm_head;
+    return n;
+}
+static int k3_cuda_bigger(const void *a, const void *b){
+    size_t x=k3_w_nbytes(*(W *const *)a), y=k3_w_nbytes(*(W *const *)b);
+    return x<y?1:x>y?-1:0;
+}
+static void k3_cuda_dense_place(Model *m){
+    const char *e=getenv("K3_CUDA_DENSE");
+    if(!e||!atoi(e)||g_k3_mmap) return;
+    g_k3_cuda_dev=getenv("COLI_GPU")?atoi(getenv("COLI_GPU")):0;
+    if(!coli_cuda_init(&g_k3_cuda_dev,1)){
+        fprintf(stderr,"[K3-CUDA] no CUDA device (coli_cuda.dll beside the engine?): the dense matrices stay on the CPU\n");
+        return;
+    }
+    double want=getenv("K3_CUDA_DENSE_GB")?atof(getenv("K3_CUDA_DENSE_GB")):20.0;
+    double reserve=getenv("K3_CUDA_RESERVE_GB")?atof(getenv("K3_CUDA_RESERVE_GB")):2.0;
+    int release=getenv("K3_CUDA_RELEASE_HOST")&&atoi(getenv("K3_CUDA_RELEASE_HOST"));
+    size_t fr=0, tot=0;
+    coli_cuda_mem_info(g_k3_cuda_dev,&fr,&tot);
+    double budget=want*1073741824.0, room=(double)fr-reserve*1073741824.0;
+    if(room<budget) budget=room;
+    int cap=m->c.n_layers*13+1;
+    W **list=malloc((size_t)cap*sizeof(W*));
+    if(!list){fprintf(stderr,"OOM dense list\n");exit(1);}
+    int n=k3_cuda_list(m,list), placed=0, tried=0;
+    qsort(list,(size_t)n,sizeof(W*),k3_cuda_bigger);
+    double used=0, freed=0, all=0;
+    for(int i=0;i<n;i++){
+        W *w=list[i];
+        size_t b=k3_w_nbytes(w);
+        int fmt=k3_cuda_fmt(w);
+        if(!b||fmt<0||w->mapped||(!w->f&&!w->q8&&!w->q4)) continue;
+        tried++; all+=b;
+        if(used+b>budget) continue;              /* a smaller one may still fit */
+        const void *src=fmt==1?(const void*)w->q8 : fmt==4?(const void*)w->q4 : (const void*)w->f;
+        if(!coli_cuda_tensor_upload_g((ColiCudaTensor**)&w->cuda,src,w->s,fmt,w->I,w->O,g_k3_cuda_dev,fmt==4?w->gs:0)){
+            w->cuda=NULL;
+            continue;
+        }
+        used+=b; placed++;
+        if(release){
+            free(w->f); free(w->q8); free(w->q4); free(w->s);
+            w->f=NULL; w->q8=NULL; w->q4=NULL; w->s=NULL;
+            w->cuda_gone=1; freed+=b;
+        }
+    }
+    free(list);
+    if(!placed){
+        fprintf(stderr,"[K3-CUDA] no dense matrix fit on the GPU (%.2f GiB free): they stay on the CPU\n",fr/1073741824.0);
+        return;
+    }
+    g_k3_cuda_dense=1; g_k3_cuda_model=m;
+    fprintf(stderr,"[K3-CUDA] dense: %d of %d matrices on GPU %d, %.2f of %.2f GiB (budget %.2f GiB, %.2f free)%s\n",
+            placed,tried,g_k3_cuda_dev,used/1073741824.0,all/1073741824.0,budget/1073741824.0,fr/1073741824.0,
+            release?"; their host copies released":"");
+    (void)freed;
+}
+static void k3_cuda_report(const char *scope){
+    if(!g_k3_cuda_calls) return;
+    fprintf(stderr,"[K3-CUDA] dense (%s): %llu matmuls on the GPU, %.1fs\n",scope,
+            (unsigned long long)g_k3_cuda_calls,g_k3_cuda_ms/1e3);
+}
+#endif
 
 #ifdef COLI_VULKAN
 /* ---- the dense matrices on the device only (COLI_VK_DENSE_HOST) -----------------
@@ -1047,7 +1192,8 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
         vk_requested=k3_vk_requested();
 #endif
 #ifdef COLI_CUDA
-        cuda_requested=getenv("K3_CUDA")&&atoi(getenv("K3_CUDA"));
+        cuda_requested=(getenv("K3_CUDA")&&atoi(getenv("K3_CUDA")))||
+                       (getenv("K3_CUDA_DENSE")&&atoi(getenv("K3_CUDA_DENSE")));
 #endif
         if(!k3_mmap_backend_allowed(1,vk_requested,cuda_requested)){
             fprintf(stderr,"K3_MMAP=1 is CPU-only; unset COLI_VULKAN (or set K3_VK=0) and K3_CUDA=0 -- refusing before model load\n");
@@ -1196,6 +1342,10 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
     if(g_k3_mmap)
         fprintf(stderr,"[K3-MMAP] %llu views, %.1f GB prepared weights/scales file-backed\n",
                 (unsigned long long)g_k3_mmap_views,g_k3_mmap_bytes/1e9);
+#ifdef COLI_CUDA
+    /* K3_CUDA_DENSE: before the expert cache is sized, so released host copies count */
+    if(!segment_mode&&load_boundaries) k3_cuda_dense_place(m);
+#endif
 #ifdef COLI_VULKAN
     /* COLI_VULKAN=1 (K3_VK=1 alike): the device opens once the weights are in RAM,
      * a missing one costing a line and nothing else. Whether the routed-expert tier
@@ -1207,7 +1357,7 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
         int any_sparse=0, cuda_on=0;
         for(int i=0;i<c->n_layers;i++) any_sparse|=m->L[i].sparse;
 #ifdef COLI_CUDA
-        cuda_on=g_k3_cuda;
+        cuda_on=g_k3_cuda||g_k3_cuda_dense;
 #endif
         g_k3_vk=coli_vk_init_env_tier("kimi_k3",vkt_wanted()&&any_sparse&&!cuda_on);
         k3_dho_decide(m,vkt_wanted()&&any_sparse&&!cuda_on,cuda_on);   /* COLI_VK_DENSE_HOST, before the cache is sized */
@@ -4193,6 +4343,9 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
            dt,np,gen,disk,0.0,moe>disk?moe-disk:moe,m->t_attn-a0,m->t_head-h0,forwards);
     fflush(stdout);
     k3_io_report(m,"turn");
+#ifdef COLI_CUDA
+    k3_cuda_report("turn");
+#endif
     serve_hits(m);
 #ifdef COLI_VULKAN
     k3_vk_report(m,"turn");
@@ -4615,6 +4768,9 @@ int main(int argc, char **argv){
     fprintf(stderr,"[K3] time: attn %.1fs moe %.1fs (eload %.1fs) head %.1fs | RSS %.1f GB\n",
             m.t_attn,m.t_moe,m.t_eload,m.t_head,rss_gb());
     k3_io_report(&m,"run");
+#ifdef COLI_CUDA
+    k3_cuda_report("run");
+#endif
 #ifdef COLI_VULKAN
     k3_vk_report(&m,"run");
 #endif

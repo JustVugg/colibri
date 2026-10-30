@@ -331,12 +331,50 @@ K3's Quantile-Balancing-flat routing caps what any cache tier can do — the
 tier's value scales with how long the server lives and with the measured
 short-term reuse (temporal locality), not with marginal expert heat.
 
+## CUDA: the dense matrices on the GPU (`K3_CUDA_DENSE=1`)
+
+A CUDA build (`make kimi_k3 CUDA=1`, or on Windows `mingw32-make kimi_k3 CUDA_DLL=1`
+with `coli_cuda.dll` from `build_cuda.bat` beside the engine) puts the largest of the
+matrices that are not routed experts on the card with `K3_CUDA_DENSE=1`: the head,
+the gated MLA's `o_proj` and gate, KDA's projections, then smaller ones, in the int8
+rows and int4 groups `K3_BITS` made, until `K3_CUDA_DENSE_GB` (20) or the card's free
+memory less `K3_CUDA_RESERVE_GB` (2) is used. `w_matmul` runs a placed matrix there
+for every row count. Every token reads all of these matrices (about 35 GiB at the
+default bits), so on a machine whose RAM bandwidth is shared with the experts' reads
+this takes the largest part of the dense work off it: on an RTX 4090 a 12288 x 7168
+int4 projection takes 0.19 ms a decode row against 0.90 ms on 16 Zen 4 cores, the
+163840 x 7168 int8 head 2.2 ms against 18.4 (`tests/bench_k3_cuda_dense.c`).
+`kv_b` stays on the CPU (the MLA absorb reads its rows), and so do the f32 routers
+and KDA's small f32 projections, so the routing is the CPU's arithmetic on its input.
+
+The products are the CPU's, summed in f32 in another order: not the CPU's bytes, as
+with every GPU backend. On the tiny fixture the argmax is the CPU's at all 70 prompt
+positions and 24 generated tokens are the same, max KL 4e-12 at the default bits and
+8e-7 at `K3_BITS=32`. `K3_CUDA_RELEASE_HOST=1` frees the placed matrices' host
+copies before the expert cache is sized, so the cache gets that RAM; if a GPU call
+fails, the CPU computes every matrix from then on, reading a released one back from
+the checkpoint (`COLI_GPU_FAIL_AFTER=N` tests it: the same tokens).
+
+`K3_CUDA=1` is another thing: it uploads each routed expert to the card for every
+decode row, 17.5 MB over PCIe an expert, which costs more than computing it where it
+was read; keep it off when the experts stream from disk.
+
+| var | default | meaning |
+|---|---|---|
+| `K3_CUDA_DENSE` | 0 | the dense matrices on the GPU (a CUDA build) |
+| `K3_CUDA_DENSE_GB` | 20 | their budget, GiB |
+| `K3_CUDA_RESERVE_GB` | 2 | VRAM left free beside them |
+| `K3_CUDA_RELEASE_HOST` | 0 | free the placed matrices' host copies (reread from disk if the GPU fails) |
+| `COLI_GPU` | 0 | the CUDA device |
+
 ## Current limitations
 
 - Decode is single-token (no speculative decoding — K3 has no MTP head).
 - Tool declarations/calls and image content are not exposed through the shared
   gateway yet; unsupported requests fail explicitly.
-- CPU + optional Vulkan (the shared expert tier; no CUDA/Metal).
+- CPU + optional Vulkan (the shared expert tier) or CUDA for the dense matrices
+  (`K3_CUDA_DENSE`, below); no Metal. A prompt's routed experts and attention stay
+  on the CPU.
 - The protocol, tokenizer, gateway, TUI, and Web client paths are locally
   testable without the 1.5 TB checkpoint. A release claim still requires one
   full-model multi-turn TUI/Web run on a host that owns the complete snapshot.
