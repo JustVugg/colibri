@@ -5051,6 +5051,9 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
                                                           g_pending.grid_h, g_pending.grid_w))
                              : KV_IMAGE_KEY_NONE);
 
+    /* Validation is complete. Let the gateway commit streaming headers and
+     * send keepalives before prefix restoration or a potentially long prefill. */
+    serve_line("ACCEPT %llu %d\n", q->id, prompt_tokens);
     const double started = now_s();
     const double s_attn = m->t_attn, s_ffn = m->t_ffn, s_disk = m->t_disk, s_head = m->t_head;
     const uint64_t s_fw = m->forwards;
