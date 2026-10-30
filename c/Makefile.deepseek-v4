@@ -247,7 +247,7 @@ V4_VK_SPV = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv \
 # the dense chain (vk_chain.c, deepseek_v4_chain.h: COLI_VK_CHAIN) and its shaders
 V4_VK_OBJ += vk_chain_v4.o
 V4_VK_SPV += shaders/chain_norm.spv shaders/chain_rope.spv shaders/chain_attn.spv \
-	shaders/chain_dnconv.spv shaders/chain_dnrec.spv shaders/chain_ew.spv \
+	shaders/chain_dnconv.spv shaders/chain_dnconv_rows.spv shaders/chain_dnrec.spv shaders/chain_ew.spv \
 	shaders/chain_qsa.spv shaders/chain_ple.spv shaders/chain_gemv.spv \
 	shaders/chain_mla.spv shaders/chain_hgemv.spv shaders/chain_dsa.spv \
 	shaders/chain_kda.spv shaders/chain_mhc.spv shaders/chain_dsv4.spv

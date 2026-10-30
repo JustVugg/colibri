@@ -145,6 +145,7 @@ typedef struct {
     VkShaderModule mod_dnrr; int dnrr_tried;   /* chain_dnrec_rows.spv: a prompt chunk's rows, made on first use */
     VkPipeline dnrr[VKC_DNREC_MAX]; int dnrr_kd[VKC_DNREC_MAX], ndnrr;
     VkShaderModule mod_gemv4; VkPipeline gemv4; int gemv4_xs;   /* chain_gemv.comp: the vectorized decode GEMV */
+    VkShaderModule mod_dncr; VkPipeline dncr;   /* chain_dnconv_rows.comp: a prompt's convolution rows at once */
     VkPipeline gemv4x;                /* chain_gemv.comp with x read from its buffer (a row past the staging) */
     VkPipeline gemv4n, gemv4xn;       /* the same taking up to 4 rows of x a workgroup (a verify's), NR 4 */
     VkShaderModule mod_adec; VkPipeline adec; int adec_tried; VkcBuf *adec_x;   /* chain_attn_dec.comp and its scratch */
@@ -540,6 +541,11 @@ int vkc_init(void) {
         VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
         int xs = (int)((pp.limits.maxComputeSharedMemorySize - 512) / 16);   /* past the subgroups' 32 vec4 sums */
         if (xs > 4096) xs = 4096;
+        {   /* a prompt's convolution, every row at once (COLI_VK_DNCONV_ROWS=0: one thread a channel) */
+            const char *dr = getenv("COLI_VK_DNCONV_ROWS");
+            if (!(dr && *dr == '0') && (KC.mod_dncr = load_module(KC.core.spv_path, "chain_dnconv_rows.spv")))
+                KC.dncr = make_pipe(KC.mod_dncr, NULL);
+        }
         if (!(e && *e == '0') && xs >= 256 && (KC.mod_gemv4 = load_module(KC.core.spv_path, "chain_gemv.spv"))) {
             /* and its variant for a row past the staging, x read from its buffer */
             VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
@@ -1891,9 +1897,24 @@ int vkc_attn_part_chunks(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, const Vkc
                          int ch, int nz, int o_z, int st_z) {
     return ch > 0 && attn_part_rec(q, kc, vc, o, p, blk, anchor, st_off, ch, nz, o_z, st_z);
 }
+/* From this many rows a prompt's convolution takes chain_dnconv_rows.comp: every output at
+ * once, then the ring (the same sums in the same order: the same bits). One thread a channel
+ * walking 979 rows of LFM3 took 442 us a layer on an RTX PRO 4000. */
+#define VKC_DNCONV_ROWS 8
 int vkc_dnconv(VkcBuf *in, VkcBuf *w, VkcBuf *ring, VkcBuf *out, VkcBuf *snap, const VkcDnConv *p) {
     KC.kind = PK_DNCONV;
     if (p->CK < 1 || p->CK > 9) return 0;
+    if (KC.dncr && p->S >= VKC_DNCONV_ROWS) {
+        struct { VkcDnConv c; int phase; } pc = {*p, 0};
+        VkcBind b0[5] = {B(in, 0), B(w, 0), B(ring, 0), B(out, 1), B(NULL, 0)};
+        uint32_t gx, gy; grid(((uint64_t)p->S * (uint64_t)p->CD + 255) / 256, &gx, &gy);
+        if (!record(KC.dncr, b0, 5, &pc, sizeof pc, gx, gy, 1)) return 0;
+        pc.phase = 1;   /* the ring after the last row (and snap after snap_row), once every output read it */
+        VkcBind b1[5] = {B(in, 0), B(w, 0), B(ring, 1), B(NULL, 0), B(snap, snap != NULL && snap != ring)};
+        if (snap == ring) b1[4].written = 0;
+        grid(((uint64_t)p->CD + 255) / 256, &gx, &gy);
+        return record(KC.dncr, b1, 5, &pc, sizeof pc, gx, gy, 1);
+    }
     VkcBind bd[5] = {B(in, 0), B(w, 0), B(ring, 1), B(out, 1), B(snap, snap != NULL && snap != ring)};
     if (snap == ring) bd[4].written = 0;   /* the same buffer: tracked once, as written */
     uint32_t gx, gy; grid(((uint64_t)p->CD + 63) / 64, &gx, &gy);
@@ -3432,6 +3453,7 @@ void vkc_shutdown(void) {
     for (int i = 0; i < KC.ndnrec; i++) vkDestroyPipeline(KC.dev, KC.dnrec[i], NULL);
     for (int i = 0; i < KC.ndnrr; i++) if (KC.dnrr[i]) vkDestroyPipeline(KC.dev, KC.dnrr[i], NULL);
     if (KC.mod_dnrr) vkDestroyShaderModule(KC.dev, KC.mod_dnrr, NULL);
+    if (KC.dncr) vkDestroyPipeline(KC.dev, KC.dncr, NULL);
     if (KC.gemv4) vkDestroyPipeline(KC.dev, KC.gemv4, NULL);
     if (KC.gemv4x) vkDestroyPipeline(KC.dev, KC.gemv4x, NULL);
     if (KC.gemv4n) vkDestroyPipeline(KC.dev, KC.gemv4n, NULL);
@@ -3441,6 +3463,7 @@ void vkc_shutdown(void) {
     if (KC.mod_mdec) vkDestroyShaderModule(KC.dev, KC.mod_mdec, NULL);
     if (KC.mod_adec) vkDestroyShaderModule(KC.dev, KC.mod_adec, NULL);
     if (KC.mod_gemv4) vkDestroyShaderModule(KC.dev, KC.mod_gemv4, NULL);
+    if (KC.mod_dncr) vkDestroyShaderModule(KC.dev, KC.mod_dncr, NULL);
     if (KC.gv2) vkDestroyPipeline(KC.dev, KC.gv2, NULL);
     if (KC.mod_gv2) vkDestroyShaderModule(KC.dev, KC.mod_gv2, NULL);
     if (KC.bd) vkDestroyPipeline(KC.dev, KC.bd, NULL);
