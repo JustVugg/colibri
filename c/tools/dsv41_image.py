@@ -85,7 +85,7 @@ def preprocess(source, model_dir=None, max_tokens=None):
         import numpy
         from PIL import Image, ImageOps
     except ImportError as exc:                                  # pragma: no cover
-        raise SystemExit(f"image input needs Pillow and numpy: {exc}")
+        raise ImportError(f"image input needs Pillow and numpy: {exc}") from exc   # not SystemExit: the gateway answers 400
     settings = load_config(model_dir)
     patch = int(settings["patch_size"])
     data = source if isinstance(source, (bytes, bytearray)) else Path(source).read_bytes()

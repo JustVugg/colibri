@@ -3651,10 +3651,11 @@ def _preprocess_qwen38_image(data, model_dir, max_tokens=None):
         from pathlib import Path as _Path
         _sys.path.insert(0, str(_Path(__file__).resolve().parent / "tools"))
         from qwen38_image import preprocess
+        return preprocess(data, model_dir, max_tokens)   # Pillow and numpy are imported when it runs
     except ImportError as problem:
-        raise APIError(400, f"image support needs Pillow and numpy ({problem}).",
+        raise APIError(400, f"image support needs Pillow and numpy ({problem}); "
+                                 "pip install pillow numpy",
                        "messages")
-    return preprocess(data, model_dir, max_tokens)
 
 
 def _text_part(part, index, position):
@@ -3814,10 +3815,11 @@ def _preprocess_dsv41_image(data, model_dir, max_tokens=None):
         from pathlib import Path as _Path
         _sys.path.insert(0, str(_Path(__file__).resolve().parent / "tools"))
         from dsv41_image import preprocess
+        return preprocess(data, model_dir, max_tokens)   # Pillow and numpy are imported when it runs
     except ImportError as problem:
-        raise APIError(400, f"image support needs Pillow and numpy ({problem}).",
+        raise APIError(400, f"image support needs Pillow and numpy ({problem}); "
+                                 "pip install pillow numpy",
                        "messages")
-    return preprocess(data, model_dir, max_tokens)
 
 
 def _preprocess_image(data, model_dir):
@@ -3828,10 +3830,11 @@ def _preprocess_image(data, model_dir):
         from pathlib import Path as _Path
         _sys.path.insert(0, str(_Path(__file__).resolve().parent / "tools"))
         from glm53_image import preprocess
+        return preprocess(data, model_dir)   # Pillow and numpy are imported when it runs
     except ImportError as problem:
-        raise APIError(400, f"image support needs Pillow and numpy ({problem}).",
+        raise APIError(400, f"image support needs Pillow and numpy ({problem}); "
+                                 "pip install pillow numpy",
                        "messages")
-    return preprocess(data, model_dir)
 
 
 GLM53_TOOL_PREAMBLE = (
