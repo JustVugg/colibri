@@ -118,8 +118,11 @@ def load_config(model_dir):
         return settings
     root = Path(model_dir)
     processor = root / "preprocessor_config.json"
-    if processor.exists():
-        raw = json.loads(processor.read_text())
+    raw = json.loads(processor.read_text()) if processor.exists() else None
+    if raw is None and (root / "processor_config.json").exists():
+        # LFM3-VL's processor_config.json: the image processor's settings under its own key
+        raw = json.loads((root / "processor_config.json").read_text()).get("image_processor")
+    if isinstance(raw, dict):
         for key in ("patch_size", "merge_size", "temporal_patch_size",
                     "image_mean", "image_std"):
             if key in raw:

@@ -557,6 +557,7 @@ def main():
     layer_map = {}      # layer index -> [keys]
     global_map = {}     # kind -> key
     vision_map = {}     # name after "visual." -> key
+    lfm3_vision_keys = []   # LFM3-VL's tower and projector, copied under their own names
     mtp_keys = []
     skipped = {}        # group -> count
     unknown = []
@@ -574,6 +575,8 @@ def main():
             mtp_keys.append(k)
         elif placed[0] == "vision":
             vision_map[placed[1]] = k
+        elif placed[0] == "lfm3_vision":
+            lfm3_vision_keys.append(k)
         else:
             skipped[placed[1]] = skipped.get(placed[1], 0) + 1
     if unknown:
@@ -733,6 +736,19 @@ def main():
             upload_local(gpath)
             gpath.unlink()
 
+    # ---- LFM3-VL's tower and projector, in their own dtype (bf16: f16 would flush its smallest
+    # weights), under their own names; the engine runs them through lfm3_vision.h ----
+    if lfm3_vision_keys:
+        if "model-vision.safetensors" in done_files:
+            print("[vision] already on HF, skip")
+        else:
+            v_out = {k: get_tensor(k).contiguous() for k in lfm3_vision_keys}
+            vpath = out / "model-vision.safetensors"
+            save_file(v_out, str(vpath))
+            print(f"[vision] {vpath.name} ({len(v_out)} tensors, LFM3-VL)")
+            if args.stream_upload:
+                upload_local(vpath)
+                vpath.unlink()
     # ---- vision tower as f16, under model.visual.* (#1757) ----
     # The same ViT in Qwen3.5/3.6/3.8; the engine runs it through qwen38_vision.h.
     vcfg = cfg_full.get("vision_config") or {}
@@ -900,6 +916,19 @@ def main():
             "temporal": int(vcfg["temporal_patch_size"]), "in_ch": int(vcfg["in_channels"]),
             "out_hidden": int(vcfg["out_hidden_size"]),
             "num_pos": int(vcfg["num_position_embeddings"]),
+        }
+    if lfm3_vision_keys and vcfg:   # LFM3-VL: its tower's shape, the layers that attend
+        lt = list(vcfg.get("layer_types") or [])
+        meta["image_token_id"] = int(cfg_full["image_token_id"])
+        meta["vision"] = {
+            "kind": "lfm3", "depth": int(vcfg["num_hidden_layers"]), "hidden": int(vcfg["hidden_size"]),
+            "heads": int(vcfg["num_attention_heads"]), "kv_heads": int(vcfg["num_key_value_heads"]),
+            "inter": int(vcfg["intermediate_size"]), "patch": int(vcfg["patch_size"]),
+            "merge": int(vcfg["spatial_merge_size"]), "temporal": int(vcfg["temporal_patch_size"]),
+            "in_ch": int(vcfg.get("in_channels", 3)), "out_hidden": int(mcfg["hidden_size"]),
+            "proj_hidden": int(cfg_full["projector_hidden_size"]), "eps": float(vcfg["norm_eps"]),
+            "theta": float((vcfg.get("rope_parameters") or {}).get("rope_theta", 1e6)),
+            "attn_layers": [1 if t == "full_attention" else 0 for t in lt],
         }
     (out / "qwen36_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(f"[meta] {out / 'qwen36_meta.json'}")

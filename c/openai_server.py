@@ -3668,7 +3668,7 @@ def _text_part(part, index, position):
     return text
 
 
-def expand_qwen38_images(messages, model_dir, max_tokens=None):
+def expand_qwen38_images(messages, model_dir, max_tokens=None, pad=QWEN38_IMAGE_PAD):
     """Replace image parts with their placeholders and pull out the patches.
 
     Returns (rewritten messages, images). The messages come back as plain text,
@@ -3694,20 +3694,32 @@ def expand_qwen38_images(messages, model_dir, max_tokens=None):
                     data, model_dir, max_tokens)
                 tokens = (grid_h // 2) * (grid_w // 2)
                 images.append((patches, grid_h, grid_w))
-                pieces.append(QWEN38_VISION_START + QWEN38_IMAGE_PAD * tokens
-                              + QWEN38_VISION_END)
+                pieces.append(QWEN38_VISION_START + pad * tokens + QWEN38_VISION_END)
             else:
                 raise APIError(400, f"unsupported content part {kind!r}.", "messages")
         rewritten.append({**message, "content": "".join(pieces)})
     return rewritten, images
 
 
+# LFM3-VL's placeholder (its processor's image_token), and a ceiling on a picture's tokens: its
+# window reaches 16M pixels, 16384 tokens, and the tower attends over all of a picture's patches
+LFM3_IMAGE_PAD = "<|image|>"
+LFM3_MAX_IMAGE_TOKENS = 1024
+
+
 def qwen36_has_vision(model_dir):
     """Whether a qwen36 container carries its vision tower (#1757). The converter
     writes the tower's shape into qwen36_meta.json only when it copied the weights;
-    older containers, and text-only checkpoints, have none."""
+    older containers, and text-only checkpoints, have none. A GGUF folder links one
+    by its gguf.json's mmproj (LFM3-VL)."""
     if not model_dir:
         return False
+    try:
+        link = json.loads((Path(model_dir) / "gguf.json").read_text(encoding="utf-8"))
+        if isinstance(link, dict) and link.get("mmproj"):
+            return True
+    except (OSError, ValueError):
+        pass
     try:
         meta = json.loads((Path(model_dir) / "qwen36_meta.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -9626,6 +9638,12 @@ class APIHandler(BaseHTTPRequestHandler):
             ceiling = os.environ.get("MIMO_MAX_IMAGE_TOKENS")
             messages, images = expand_qwen38_images(messages, model_dir,
                                                     int(ceiling) if ceiling else None)
+        elif ARCH == "qwen36" and CHAT_FLAVOR == "lfm3" and qwen36_has_vision(model_dir):
+            # LFM3-VL: the Qwen processor's patches (16, merge 2, two frames), its own placeholder
+            ceiling = os.environ.get("LFM3_MAX_IMAGE_TOKENS")
+            messages, images = expand_qwen38_images(messages, model_dir,
+                                                    int(ceiling) if ceiling else LFM3_MAX_IMAGE_TOKENS,
+                                                    pad=LFM3_IMAGE_PAD)
         elif ARCH == "qwen38" or (ARCH == "qwen36" and qwen36_has_vision(model_dir)):
             # Qwen3.5/3.6/3.8 share the tower and the preprocessor, so qwen36
             # checkpoints converted with their tower take the same path (#1757).

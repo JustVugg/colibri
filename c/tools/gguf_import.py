@@ -1073,6 +1073,35 @@ def mtp_head_ok(path, meta, layers):
 DSPARK_PREFERENCE = ("Q8_0", "BF16")
 
 
+# LFM3-VL's vision tower and projector ship as their own GGUF (mmproj-*.gguf, arch clip, projector
+# lfm3vl): one next to the model is linked, the engine runs it through lfm3_vision.h.
+MMPROJ_PROJECTORS = {"lfm3": "lfm3vl"}
+
+
+def mmproj_of(path, arch):
+    """Whether path is an mmproj this arch's engine reads: (True, '') or (False, why)."""
+    try:
+        with GGUFReader(path) as r:
+            meta = r.metadata
+    except (OSError, GGUFError) as problem:
+        return False, f"unreadable ({problem})"
+    if meta.get("general.architecture") != "clip":
+        return False, f"architecture {meta.get('general.architecture')!r}, not clip"
+    want, got = MMPROJ_PROJECTORS.get(arch), meta.get("clip.vision.projector_type")
+    if got != want:
+        return False, f"projector {got!r}, {arch} reads {want!r}"
+    return True, ""
+
+
+def mmproj_candidates(src):
+    """mmproj-*.gguf next to the model: its folder, then the parent; BF16 and F16 first."""
+    found = []
+    for d in (src.parent, src.parent.parent):
+        found += sorted(d.glob("mmproj*.gguf")) if d.is_dir() else []
+    rank = lambda f: 0 if re.search(r"(?i)[-_.](bf16|f16|f32)\.gguf$", f.name) else 1
+    return sorted(found, key=rank)
+
+
 def dspark_candidates(src):
     """dspark-*.gguf next to the model, to name (main links one only with --mtp): its folder, the
     parent, a dspark/ folder in either; Q8_0 first."""
@@ -1367,6 +1396,10 @@ def main():
                          "the parent, an MTP/ folder in either; shared-Q8_0 first); deepseek41: the DSpark head's "
                          "(dspark-*.gguf, arch dflash), which drafts only when named")
     ap.add_argument("--no-mtp", action="store_true", help="qwen4exp, deepseek41: no draft head, plain decoding")
+    ap.add_argument("--mmproj", type=Path, default=None,
+                    help="lfm3: the vision tower's GGUF (mmproj-*.gguf), unset one next to the model (its folder, "
+                         "then the parent; BF16 and F16 first)")
+    ap.add_argument("--no-mmproj", action="store_true", help="lfm3: text only, no vision tower linked")
     ap.add_argument("--indexer-compress-ratio", type=int, default=0,
                     help="qwen4exp: when the GGUF's attention.compress_ratios are all 0 (a converter "
                          "that read the layers as qwen_sparse_attention)")
@@ -1433,6 +1466,17 @@ def main():
         link["mtp"] = str(mtp_file)
     if dspark_file:
         link["dspark"] = str(dspark_file)
+    if arch in MMPROJ_PROJECTORS and not args.no_mmproj:   # a vision tower of its own file
+        if args.mmproj:
+            ok, why = mmproj_of(args.mmproj, arch)
+            if not ok:
+                sys.exit(f"--mmproj {args.mmproj}: {why}")
+            link["mmproj"] = str(args.mmproj.resolve())
+        else:
+            link_to = next((c for c in mmproj_candidates(src) if mmproj_of(c, arch)[0]), None)
+            if link_to:
+                link["mmproj"] = str(link_to.resolve())
+        print(f"  vision tower: {link.get('mmproj', 'none found next to the model (--mmproj names one): text only')}")
     (args.out / "gguf.json").write_text(json.dumps(link, indent=1), encoding="utf-8")
     for r in readers:
         r.close()

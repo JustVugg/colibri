@@ -188,5 +188,61 @@ class Lfm3GatewayTest(unittest.TestCase):
         self.assertEqual(openai_server._tool_stream_markers(), ("<tool_call>",))
 
 
+class Lfm3ImageTest(unittest.TestCase):
+    """A picture for LFM3-VL: the Qwen processor's patches (the stub below stands in for it),
+    <|vision_start|> + one <|image|> a merged token + <|vision_end|>, a ceiling on the tokens, and
+    the tower found in a GGUF folder's mmproj link as in a container's meta."""
+
+    def setUp(self):
+        self.saved = (openai_server.ARCH, openai_server.CHAT_FLAVOR, openai_server._preprocess_qwen38_image)
+        openai_server.ARCH, openai_server.CHAT_FLAVOR = "qwen36", "lfm3"
+        self.ceilings = []
+
+        def fake(data, model_dir, max_tokens=None):
+            self.ceilings.append(max_tokens)
+            return [0.0] * (4 * 6 * 1536), 4, 6   # 4 x 6 patches: 2 x 3 merged tokens
+        openai_server._preprocess_qwen38_image = fake
+
+    def tearDown(self):
+        openai_server.ARCH, openai_server.CHAT_FLAVOR, openai_server._preprocess_qwen38_image = self.saved
+        os.environ.pop("LFM3_MAX_IMAGE_TOKENS", None)
+
+    def expand(self, folder):
+        class Engine:
+            model_dir = folder
+            vision = True
+
+        class Server:
+            engine = Engine()
+
+        class Handler:
+            server = Server()
+        url = "data:image/png;base64,iVBORw0KGgo="
+        messages = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}},
+                                                 {"type": "text", "text": "What is it?"}]}]
+        return openai_server.APIHandler.expand_images(Handler(), messages)
+
+    def test_a_gguf_folder_with_its_mmproj(self):
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / "gguf.json").write_text(json.dumps({"gguf": "x.gguf", "mmproj": "mmproj-x.gguf"}))
+            messages, image = self.expand(folder)
+        self.assertEqual(messages[0]["content"], "<|vision_start|>" + "<|image|>" * 6 + "<|vision_end|>What is it?")
+        self.assertEqual((image[1], image[2]), (4, 6))
+        self.assertEqual(self.ceilings, [openai_server.LFM3_MAX_IMAGE_TOKENS])
+
+    def test_the_ceiling_comes_from_the_environment(self):
+        os.environ["LFM3_MAX_IMAGE_TOKENS"] = "300"
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / "qwen36_meta.json").write_text(json.dumps({"vision": {"kind": "lfm3", "depth": 14}}))
+            self.expand(folder)
+        self.assertEqual(self.ceilings, [300])
+
+    def test_no_tower_no_expansion(self):
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / "gguf.json").write_text(json.dumps({"gguf": "x.gguf"}))
+            messages, image = self.expand(folder)
+        self.assertIsNone(image)
+
+
 if __name__ == "__main__":
     unittest.main()
