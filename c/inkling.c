@@ -3971,6 +3971,7 @@ int main(int argc, char **argv) {
         setenv("OMP_WAIT_POLICY","active",0);
         setenv("GOMP_SPINCOUNT","200000",0);
         setenv("OMP_PROC_BIND","close",0);
+        setenv("OMP_PLACES","cores",0);        /* a place per core, not per SMT thread (see colibri.c) */
         setenv("OMP_DYNAMIC","FALSE",0);
         setenv("COLI_OMP_TUNED","1",1);
 #ifdef __linux__
