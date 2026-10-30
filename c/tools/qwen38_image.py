@@ -159,7 +159,7 @@ def preprocess(source, model_dir=None, max_tokens=None):
         import numpy
         from PIL import Image
     except ImportError as exc:                    # pragma: no cover
-        raise SystemExit(f"serve Pillow e numpy: {exc}")
+        raise ImportError(f"serve Pillow e numpy: {exc}") from exc   # not SystemExit: the gateway answers 400
 
     settings = load_config(model_dir)
     patch = int(settings.get("patch_size", PATCH))
@@ -207,8 +207,12 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="solo la griglia, su stdout")
     arguments = parser.parse_args()
 
-    patches, grid_h, grid_w = preprocess(arguments.image, arguments.model,
-                                         arguments.max_tokens)
+    try:
+        patches, grid_h, grid_w = preprocess(arguments.image, arguments.model,
+                                             arguments.max_tokens)
+    except ImportError as missing:
+        print(missing, file=sys.stderr)
+        return 1
     if arguments.json:
         print(json.dumps({"grid_h": grid_h, "grid_w": grid_w,
                           "patches": int(patches.shape[0]),

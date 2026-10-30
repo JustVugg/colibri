@@ -792,6 +792,9 @@ release's processor does (patches of 16, two frames of a still picture, merge 2,
 mean and std 0.5) and writes `<|vision_start|>`, one `<|image|>` a merged block,
 `<|vision_end|>`; the text keeps its own positions around them.
 
+The gateway's preprocessor needs Pillow and numpy (`pip install pillow numpy`); without them a
+picture is answered with a 400 that says so.
+
 The tower comes from the GGUF's `mmproj-LFM3-VL-2B-BF16.gguf` (`coli import` links one
 it finds next to the model, `--mmproj` names one, `--no-mmproj` leaves it out;
 `Q36_MMPROJ` over gguf.json's) or from the converted checkpoint (`tools/convert_qwen36.py`
