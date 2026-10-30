@@ -26,6 +26,11 @@ param(
     # Prompt tokens a prefill step takes at once: each expert a step needs is read once for
     # all of them, so larger steps read the disks less per prompt token
     [ValidateRange(1,512)][int]$Chunk = 512,
+    # Photos of the recurrent state at every prompt's and reply's end (COLI_K3_CKPT, about
+    # 434 MB each): a turn whose client sends the history back without its reasoning, or
+    # edits a tool result, resumes from the deepest photo its prompt still matches and
+    # prefills only the rest, instead of the whole conversation again; 0 = off
+    [ValidateRange(0,8)][int]$Photos = 4,
     [ValidateRange(1,65535)][int]$Port = 18080,
     # No GPU: the dense matrices stay on the CPU (a CPU build, or to compare)
     [switch]$Cpu
@@ -68,18 +73,20 @@ $env:K3_DIRECT = '1'
 $env:K3_PIPE = '1'
 $env:K3_IO_PER_DRIVE = [string]$IoPerDrive
 $env:K3_PREFETCH = [string]$Prefetch
+$env:COLI_K3_CKPT = [string]$Photos
 $env:OMP_NUM_THREADS = [string]$Threads
 $env:COLI_NO_OMP_TUNE = '1'
 $env:COLI_VULKAN = '0'
 $env:COLI_CUDA = '0'                   # the launcher's own GPU tier is for other engines
 $env:COLI_GPU = '0'
 foreach ($key in @('K3_LAYERS', 'K3_TRACE', 'K3_LOGITS', 'K3_X0', 'K3_MMAP', 'K3_IO_THREADS', 'K3_LOAD_THREADS',
-                   'K3_IO_DELAY_US', 'K3_VK', 'COLI_GPU_FAIL_AFTER', 'K3_VAL_LOGITS', 'K3_VALIDATE_LAYER')) {
+                   'K3_IO_DELAY_US', 'K3_VK', 'COLI_GPU_FAIL_AFTER', 'K3_VAL_LOGITS', 'K3_VALIDATE_LAYER',
+                   'COLI_K3_CKPT_DIR')) {
     Remove-Item -LiteralPath "Env:$key" -ErrorAction SilentlyContinue
 }
 Write-Host "Kimi K3: $ModelDir$(if ($shardDirs.Count) { '; experts also from ' + ($shardDirs -join '; ') })"
 Write-Host "RAM $RamGB GB, CPU $Threads, readers $IoPerDrive per drive, prefetch $Prefetch, $(if ($env:K3_CUDA_DENSE -eq '1') { "dense matrices on the GPU up to $DenseGB GiB" } else { 'dense matrices on the CPU' })"
-Write-Host "Context $Context tokens, replies up to $MaxOutput tokens, prompt steps of $Chunk"
+Write-Host "Context $Context tokens, replies up to $MaxOutput tokens, prompt steps of $Chunk, $Photos turn photos"
 Write-Host "API: http://127.0.0.1:$Port/v1, model $ModelId"
 & python (Join-Path $EngineDir 'coli') serve --model $ModelDir --ram $RamGB --ctx $Context `
     --ngen $MaxOutput --host 127.0.0.1 --port $Port --model-id $ModelId --kv-slots 1 `
