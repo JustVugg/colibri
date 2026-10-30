@@ -131,6 +131,28 @@ class Qwen38PrefixServeTest(PromptCancelContract, unittest.TestCase):
         self.assertEqual(self.reuses(log), [(len(self.OPENING), len(self.OPENING), "the prompt-end snapshot")],
                          log)
 
+    def test_a_short_request_between_two_turns_keeps_the_conversation(self):
+        """A client's short request between two turns of a conversation (Hermes asks for its
+        title after the first) took the only state there is, and the next turn read the whole
+        conversation again (14,785 tokens, 86 s on Qwen3.8 IQ2_XS). The conversation is parked
+        for it and comes back: the next turn continues from the live state and answers as a
+        cold engine does, and the short request answers as it would alone."""
+        side_prompt = b"5*5="
+        with mock.patch.dict(os.environ, {"COLI_PARK_MIN": "16"}):
+            warm = self.spawn()
+        reply = warm.ask("1", self.OPENING, max_tok=8)
+        side = warm.ask("2", side_prompt, max_tok=8)
+        second = self.OPENING + reply + self.QUESTION
+        got = warm.ask("3", second, max_tok=8)
+        log = warm.close()
+        self.assertIn("conversation parked for a %d-token request" % len(side_prompt), log)
+        self.assertIn("conversation is back", log)
+        self.assertEqual(side, self.cold(side_prompt), "the short request answered otherwise beside a parked conversation")
+        self.assertEqual(got, self.cold(second), "the conversation answered otherwise after it was parked")
+        n, total, source = self.reuses(log)[-1]
+        self.assertEqual((total, source), (len(second), "the live state"), log)
+        self.assertGreater(n, len(self.OPENING), "the parked conversation's answer was read again\n" + log)
+
     def test_a_diverging_prompt_starts_over(self):
         warm = self.spawn()
         warm.ask("1", self.OPENING, max_tok=8)
