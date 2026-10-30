@@ -170,18 +170,28 @@ static void check(int t, int I, int O, int bench) {
         if (!okl || memcmp(got, one, (size_t)S * O * 4)) { printf("FAIL %s [%d x %d]: %d rows differ from the rows alone\n", ref_name(t), O, I, S); fails++; }
     }
     if (bench) {
-        printf("  %-8s [%6d x %5d] %6.1f MB:", ref_name(t), O, I, (double)O * rw * 4 / 1e6);
-        for (int S = 1; S <= 4; S++) {
+        /* copies of the matrix past the card's L2 (BENCH_MB, default 256), read in turn: a
+         * decode step reads every matrix once, nothing of it is in L2 the next time */
+        size_t mb = (size_t)O * rw * 4, want = (size_t)(getenv("BENCH_MB") ? atoi(getenv("BENCH_MB")) : 256) << 20;
+        int ncopy = mb >= want ? 1 : (int)(want / mb);
+        bd_u32 *wb = NULL;
+        if (cudaMalloc(&wb, mb * ncopy) != cudaSuccess) { ncopy = 1; wb = wd; }
+        else for (int c = 0; c < ncopy; c++) cudaMemcpy((uint8_t *)wb + mb * c, wd, mb, cudaMemcpyDeviceToDevice);
+        int smax = getenv("BENCH_ROWS") ? atoi(getenv("BENCH_ROWS")) : 4;
+        printf("  %-8s [%6d x %5d] %6.1f MB:", ref_name(t), O, I, (double)mb / 1e6);
+        for (int S = 1; S <= smax; S++) {
             double best = 1e9;
             for (int k = 0; k < 5; k++) {
                 cudaDeviceSynchronize(); double t0 = now();
-                for (int j = 0; j < 20; j++) bd_gemv_launch(yd, xd, wd, g_tab, fmt, I, O, rw, S, g_smem, 0, 0);
-                cudaDeviceSynchronize(); double dt = (now() - t0) / 20;
+                for (int j = 0; j < 40; j++)
+                    bd_gemv_launch(yd, xd, (const bd_u32 *)((uint8_t *)wb + mb * (j % ncopy)), g_tab, fmt, I, O, rw, S, g_smem, 0, 0);
+                cudaDeviceSynchronize(); double dt = (now() - t0) / 40;
                 if (dt < best) best = dt;
             }
-            printf(" %d: %.1f us (%.0f GB/s)", S, best * 1e6, (double)O * rw * 4 / best / 1e9);
+            printf(" %d: %.1f us (%.0f GB/s)", S, best * 1e6, (double)mb / best / 1e9);
         }
         printf("\n");
+        if (wb != wd) cudaFree(wb);
     }
 out:
     cudaFree(wd); cudaFree(xd); cudaFree(yd);
@@ -385,6 +395,18 @@ int main(void) {
     free(tab);
     const int types[] = {8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 42, 2, 3, 6, 7, 34, 35, 39, 40, 41};
     const int shapes[][2] = {{2048, 300}, {4096, 70}, {768, 1000}, {12288, 40}, {2816, 33}};
+    /* BENCH_ONLY="t:I:O,...": time those (and check them) only, e.g. LFM3's decode matrices */
+    if (getenv("BENCH_ONLY")) {
+        char *spec = strdup(getenv("BENCH_ONLY")), *save = NULL;
+        printf("BENCH (rows of x: 1 to BENCH_ROWS)\n");
+        for (char *tok = strtok_r(spec, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+            int t = 0, I = 0, O = 0;
+            if (sscanf(tok, "%d:%d:%d", &t, &I, &O) == 3) check(t, I, O, 1);
+        }
+        free(spec); cudaFree(g_tab);
+        printf(fails ? "FAILED: %d\n" : "OK\n", fails);
+        return fails != 0;
+    }
     for (size_t i = 0; i < sizeof types / sizeof *types; i++)
         for (size_t k = 0; k < sizeof shapes / sizeof *shapes; k++) check(types[i], shapes[k][0], shapes[k][1], 0);
     /* the routed experts: the commonest pairs of the published files, one row and a verify's */

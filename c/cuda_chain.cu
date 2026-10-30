@@ -103,8 +103,24 @@ __global__ static void cc_norm_k(const float *__restrict__ x, const float *__res
     int wb = p.w_off + (p.w_mod > 0 ? (j % p.w_mod) * p.D : 0);
     int tid = threadIdx.x;
     float acc = 0.f;
-    const bool pre = (p.flags & 8) != 0;
-    for (int i = tid; i < p.D; i += 256) { float v = pre ? x[xb + i] * w[wb + i] : x[xb + i]; acc += v * v; }
+    const bool pre = (p.flags & 8) != 0, wt = pre || !(p.flags & 2);
+    /* up to 2048 a row: x and the weights in registers, loaded together before the sum (the
+     * weights used to be read after it, a second trip to memory on the step's path); the same
+     * values in the same order, so the same bits */
+    const bool fit = p.D <= 8 * 256;
+    float xv[8], wv8[8];
+    if (fit) {
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const int i = tid + 256 * k;
+            xv[k] = i < p.D ? x[xb + i] : 0.f;
+            wv8[k] = wt && i < p.D ? w[wb + i] : 0.f;
+        }
+        #pragma unroll
+        for (int k = 0; k < 8; k++)
+            if (tid + 256 * k < p.D) { float v = pre ? xv[k] * wv8[k] : xv[k]; acc += v * v; }
+    } else
+        for (int i = tid; i < p.D; i += 256) { float v = pre ? x[xb + i] * w[wb + i] : x[xb + i]; acc += v * v; }
     red[tid] = acc;
     __syncthreads();
     for (int off = 128; off > 0; off >>= 1) {
@@ -112,10 +128,19 @@ __global__ static void cc_norm_k(const float *__restrict__ x, const float *__res
         __syncthreads();
     }
     float r = (p.flags & 4) ? 1.f / sqrtf(red[0] + p.eps) : 1.f / sqrtf(red[0] / (float)p.D + p.eps);
-    for (int i = tid; i < p.D; i += 256) {
-        float wv = (p.flags & 2) ? 1.f : ((p.flags & 1) ? 1.f + w[wb + i] : w[wb + i]);
-        y[yb + i] = x[xb + i] * (pre ? w[wb + i] : wv) * r * p.post;
-    }
+    if (fit) {
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const int i = tid + 256 * k;
+            if (i >= p.D) continue;
+            float wv = (p.flags & 2) ? 1.f : ((p.flags & 1) ? 1.f + wv8[k] : wv8[k]);
+            y[yb + i] = xv[k] * (pre ? wv8[k] : wv) * r * p.post;
+        }
+    } else
+        for (int i = tid; i < p.D; i += 256) {
+            float wv = (p.flags & 2) ? 1.f : ((p.flags & 1) ? 1.f + w[wb + i] : w[wb + i]);
+            y[yb + i] = x[xb + i] * (pre ? w[wb + i] : wv) * r * p.post;
+        }
 }
 /* cc_addnorm: a block a row, a thread elements tid + 256 k as cc_norm_k's loops take them and its
  * tree, so each sum, scale and product is cc_norm_k's and the add cc_ew_k's (the products and the
@@ -128,12 +153,21 @@ __global__ static void cc_addnorm_k(float *__restrict__ x, const float *__restri
     const int row = blockIdx.x, tid = threadIdx.x, D = p.D;
     float *xr = x + p.x_off + (size_t)row * D, *yr = y + p.y_off + (size_t)row * D;
     const float *tr = t + p.t_off + (size_t)row * D;
-    float v[NV];
-    float acc = 0.f;
+    /* every load first: t, x and both weights in one round trip to memory, not four in a row
+     * (a decode step's 2048 values a block: the trips were most of the kernel's time) */
+    float v[NV], xv[NV], wp[NV], wn[NV];
     #pragma unroll
     for (int k = 0; k < NV; k++) {
         const int i = tid + 256 * k;
         v[k] = i < D ? tr[i] : 0.f;
+        xv[k] = i < D ? xr[i] : 0.f;
+        wp[k] = (p.flags & 1) && i < D ? w[p.wp_off + i] : 0.f;
+        wn[k] = i < D ? w[p.w_off + i] : 0.f;
+    }
+    float acc = 0.f;
+    #pragma unroll
+    for (int k = 0; k < NV; k++) {
+        const int i = tid + 256 * k;
         if ((p.flags & 1) && i < D) acc += v[k] * v[k];
     }
     if (p.flags & 1) {
@@ -148,14 +182,14 @@ __global__ static void cc_addnorm_k(float *__restrict__ x, const float *__restri
         #pragma unroll
         for (int k = 0; k < NV; k++) {
             const int i = tid + 256 * k;
-            if (i < D) v[k] = __fmul_rn(__fmul_rn(__fmul_rn(v[k], 1.f + w[p.wp_off + i]), r), 1.f);
+            if (i < D) v[k] = __fmul_rn(__fmul_rn(__fmul_rn(v[k], 1.f + wp[k]), r), 1.f);
         }
     }
     acc = 0.f;
     #pragma unroll
     for (int k = 0; k < NV; k++) {
         const int i = tid + 256 * k;
-        if (i < D) { v[k] = __fadd_rn(xr[i], v[k]); xr[i] = v[k]; acc += v[k] * v[k]; }
+        if (i < D) { v[k] = __fadd_rn(xv[k], v[k]); xr[i] = v[k]; acc += v[k] * v[k]; }
     }
     red[tid] = acc;
     __syncthreads();
@@ -167,7 +201,7 @@ __global__ static void cc_addnorm_k(float *__restrict__ x, const float *__restri
     #pragma unroll
     for (int k = 0; k < NV; k++) {
         const int i = tid + 256 * k;
-        if (i < D) yr[i] = __fmul_rn(__fmul_rn(__fmul_rn(v[k], 1.f + w[p.w_off + i]), r), 1.f);
+        if (i < D) yr[i] = __fmul_rn(__fmul_rn(__fmul_rn(v[k], 1.f + wn[k]), r), 1.f);
     }
 }
 /* kv16.h's kv16_round_bits line for line: clamped, the nearest float16 (ew's CC_EW_F16) */
