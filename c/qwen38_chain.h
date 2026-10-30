@@ -1010,6 +1010,10 @@ static int q38c_attention(Q38Chain *ch, Model *m, Layer *l, int i, int n, int pb
         VkcRope ri = {n * IQ, IQ, 0, ipw, ID, half, 0, 2 * half};
         ok = vkc_rope(ch->k, ch->cs, &rk) && vkc_rope(ch->q, ch->cs, &rq) && vkc_rope(ch->ip, ch->cs, &ri);
     }
+    if (ok && q38_kv16()) {   /* K and V as every backend keeps them (float16), before anything reads them */
+        VkcEw r = {VKC_EW_F16, n * kvo, kvo, 0, 0, 0, 0, 0, 0, 0, 0, 1.f};
+        ok = vkc_ew(ch->k, ch->k, NULL, NULL, NULL, &r) && vkc_ew(ch->v, ch->v, NULL, NULL, NULL, &r);
+    }
     if (!ok) return 0;
     /* the rows into the device caches and the host's */
     VkcRegion *rg = malloc(sizeof *rg * (size_t)n * (KVH > 1 ? KVH : 1));

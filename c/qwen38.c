@@ -1928,7 +1928,9 @@ static int q38_prompt_poll(ColiPromptBreak *b){   /* control: 1 STOP, 3 CANCEL (
     return b->control!=0;
 }
 /* ids[from..np) at position from. NULL when a control stopped it (ctl->control says which).
- * ctl NULL (the multiplexed loop, which owns its command stream): one call, as before. */
+ * ctl NULL (the multiplexed loop, which owns its command stream): the same segments, no poll.
+ * One forward holds a segment's rows, never the context's: the planner prices that
+ * (family_registry.py, _qwen38_prompt_rows). */
 static float *q38_serve_prefill(Model *m,const int *ids,int from,int np,ColiPromptBreak *ctl){
     int chain=0;
 #ifdef COLI_VULKAN
@@ -1937,10 +1939,21 @@ static float *q38_serve_prefill(Model *m,const int *ids,int from,int np,ColiProm
 #ifdef COLI_CUDA
     chain|=g_cuda_chain!=0;
 #endif
-    if(!ctl||g_echo_k>0||(m->vis_map&&m->vis_rows_n>0))return step(m,ids+from,np-from,from);
+    if(g_echo_k>0||(m->vis_map&&m->vis_rows_n>0))return step(m,ids+from,np-from,from);
     /* a chain's segment is the one its own layer-by-layer prompt takes (q38cc_lm_rows), so it
      * does the same work as when it took the prompt in one call */
     const int seg=coli_prompt_segment_rows(chain?8192:2048);
+    if(!ctl){
+        float *lo=NULL;
+        for(int at=from;at<np;){
+            int n=np-at<seg?np-at:seg;
+            float *next=step(m,ids+at,n,at);
+            free(lo);lo=next;
+            if(!next)break;
+            at+=n;
+        }
+        return lo;
+    }
     Q38PinState *st=NULL;
     float *lo=NULL;
     for(int at=from;at<np;){

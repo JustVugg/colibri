@@ -158,6 +158,31 @@ when nothing is cached and roughly half that at the cap-32 hit rate, so at this
 cache size the engine spends about two thirds of every request waiting on the
 disk, and the planner labels cold expert reads as the expected bottleneck.
 
+## A long context
+
+The model reads up to 262,144 positions (`--ctx 262144`). Twelve of its 48 layers keep K and V
+(two heads of 256) and an index key of 128 per position: about 55 KB a position in float32, 14.5 GB
+at the full context. What a long context costs is what it takes from the experts' caches, so:
+
+- **K and V in float16** (`Q38_KV`, on when serving): the CUDA chain's mirrors take 2 bytes a value
+  instead of 4. At 262,144 positions the chain keeps 12.86 GiB instead of 19.23, and the card's
+  expert budget goes from 0.65 GB to 7.03 GB.
+- **The RAM plan prices one prompt segment, not the context**: serve reads a prompt in segments
+  (8,192 rows with a dense chain, 2,048 without; `COLI_PROMPT_SEGMENT`), so a forward's row buffers
+  hold one segment. The plan used to price the whole context as one forward: 38 GB at 262,144
+  positions, and no expert cache in RAM (`coli serve` started at 10 slots a layer).
+
+Qwen3.8-Flash-Next IQ2_XS on an RTX PRO 4000 (24 GB) with 62 GB of RAM, served on the CUDA chain, a
+452-token prompt and 128 tokens:
+
+| context | prompt | decode | RAM cache, slots a layer | card's expert budget |
+|---|---:|---:|---:|---:|
+| 65,536, before | 188 tok/s | 48.4 tok/s | 512 | 12.5 GB |
+| 131,072, before | 132 tok/s | 43.6 tok/s | 337 | 8.6 GB |
+| 262,144, before | 15.6 tok/s | 9.6 tok/s | 10 | 0.65 GB |
+| 262,144, the plan's segment | 84 tok/s | 21.9 tok/s | 490 | 0.65 GB |
+| 262,144, and K/V in float16 | 149 tok/s | 45.7 tok/s | 490 | 7.03 GB |
+
 ## Routed experts as int4-g64
 
 Optional. Decode waits on routed experts: a miss is a disk read, and how many
