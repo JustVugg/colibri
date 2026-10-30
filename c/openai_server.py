@@ -29,7 +29,7 @@ from family_registry import (FamilyConfigError, UnknownFamilyError, family_by_id
 from family_registry import default_model_id as registry_default_model_id
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 
 HERE = Path(__file__).resolve().parent
@@ -1936,6 +1936,9 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
             if not isinstance(reasoning, str):
                 raise APIError(400, "`reasoning_content` must be a string.",
                                f"messages.{index}.reasoning_content")
+            if add_generation_prompt is CONTINUE_IN_THINK:
+                parts.append(f"<|im_start|>assistant\n<think>\n{reasoning.strip()}")
+                continue
             parts.append(f"<|im_start|>assistant\n<think>\n{reasoning.strip()}\n</think>\n\n"
                          f"{text}")
             continue
@@ -3302,6 +3305,9 @@ def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, to
             if not isinstance(reasoning, str):
                 raise APIError(400, "`reasoning_content` must be a string.",
                                f"messages.{index}.reasoning_content")
+            if add_generation_prompt is CONTINUE_IN_THINK and index == len(messages) - 1:
+                parts.append(f"<|im_start|>assistant\n<think>\n{reasoning.strip()}")
+                continue
             calls = message.get("tool_calls")
             rendered = f"<think>\n{reasoning.strip()}\n</think>\n\n{text}"
             if calls:
@@ -4486,6 +4492,70 @@ CONTINUATION_FAMILIES = {"glm53", "qwen38", "qwen36", "glm", "olmoe", "deepseek_
                          "kimi", "deepseek_v41", "mimo"}
 
 
+_CPU_LAST = {}
+
+
+def _system_stats(engine):
+    """RAM of the box and of the engine process, and the engine's CPU since the last call
+    (100 = one core busy). Read from /proc, so empty fields off Linux."""
+    out = {}
+    try:
+        mi = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":", 1)
+                mi[k] = int(v.split()[0])
+        out["ram_total_gb"] = round(mi["MemTotal"] / 1048576, 2)
+        out["ram_avail_gb"] = round(mi["MemAvailable"] / 1048576, 2)
+        out["load1"] = round(os.getloadavg()[0], 2)
+        out["cores"] = os.cpu_count() or 0
+    except (OSError, KeyError, ValueError):
+        pass
+    pid = getattr(getattr(engine, "process", None), "pid", None)
+    if pid:
+        try:
+            with open(f"/proc/{pid}/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        out["engine_rss_gb"] = round(int(line.split()[1]) / 1048576, 2)
+                    elif line.startswith("Threads:"):
+                        out["engine_threads"] = int(line.split()[1])
+            with open(f"/proc/{pid}/stat") as f:
+                st = f.read().rsplit(")", 1)[1].split()
+            ticks = int(st[11]) + int(st[12])          # utime + stime
+            now = time.monotonic()
+            last = _CPU_LAST.get(pid)
+            if last is None or now - last[0] > 0.5:
+                _CPU_LAST[pid] = (now, ticks)
+            if last and now - last[0] > 0.5:
+                out["engine_cpu_pct"] = round(100.0 * (ticks - last[1]) / os.sysconf("SC_CLK_TCK") / (now - last[0]), 1)
+            elif last and "pct" in _CPU_LAST:
+                out["engine_cpu_pct"] = _CPU_LAST["pct"]
+            if "engine_cpu_pct" in out:
+                _CPU_LAST["pct"] = out["engine_cpu_pct"]
+        except (OSError, ValueError, IndexError):
+            pass
+    return out
+
+
+class _ContinueInThink(int):
+    """The third answer of resolve_generation_prompt: continue a turn that stopped while
+    it was still reasoning (no answer text yet, its `reasoning_content` set). It is 0, so
+    every renderer and caller reads it as add_generation_prompt=False -- no cue, the last
+    turn left open -- and only the places that must tell it apart check for it by identity:
+    the renderer leaves <think> OPEN after the reasoning instead of closing it (a closed,
+    empty block is the out-of-distribution position #1327 removed), and starts_in_reasoning
+    starts the output inside the block, so what the model writes next is reasoning until it
+    closes the block itself."""
+    def __repr__(self):
+        return "CONTINUE_IN_THINK"
+
+
+CONTINUE_IN_THINK = _ContinueInThink(0)
+# Families whose renderer leaves a continued turn's <think> open (CONTINUE_IN_THINK).
+REASONING_CONTINUATION_FAMILIES = {"qwen38", "qwen36"}
+
+
 def resolve_generation_prompt(messages, body):
     """Does this prompt end on a generation cue, or on an assistant turn to continue?
 
@@ -4547,6 +4617,9 @@ def resolve_generation_prompt(messages, body):
         raise APIError(400, "Message content must be a string or an array of blocks.",
                        f"{where}.content")
     if not text.strip():
+        reasoning = last.get("reasoning_content")
+        if ARCH in REASONING_CONTINUATION_FAMILIES and isinstance(reasoning, str) and reasoning.strip():
+            return CONTINUE_IN_THINK   # stopped while reasoning: go on inside the open block
         raise APIError(400, "A continued `assistant` turn needs text to continue. An empty "
                        "one ends the prompt on a closed, empty <think></think> block, which "
                        "is the out-of-distribution position #1327 removed -- the model "
@@ -4655,6 +4728,8 @@ def starts_in_reasoning(enable_thinking, add_generation_prompt=True):
     zero di risposta, col prompt corretto sul filo. Vale anche per glm53: la
     regola di famiglia sopra dice dove comincia un turno NUOVO, e il turno
     proseguito non ne apre nessuno."""
+    if add_generation_prompt is CONTINUE_IN_THINK:   # the prompt ends inside an open <think>
+        return True
     if chat_flavor() in ("flint", "muse"):   # a turn starts as text, and <think> opens reasoning
         return False
     if chat_flavor() == "mistral_large4":   # its answer opens [THINK] itself (read as <think>)
@@ -6733,8 +6808,15 @@ class Engine:
         self.emap = None
         self.hits = None
         self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
+        self.hits_live = collections.deque(maxlen=256)   # HITL frames: experts routed per decode step
+        self.hits_live_seq = 0
         self.profile = collections.deque(maxlen=PROFILE_TURNS)  # per-turn phase timings
         self.profile_seq = 0
+        # The turns the engine is on right now, for a live monitor: the prompt size from
+        # ACCEPT, then one DATA frame per token it writes (a token that does not close a
+        # UTF-8 character sends none). Gone at DONE or ERROR.
+        self.live = {}
+        self.live_lock = threading.Lock()
         self.caps = {}                         # the engine's CAPS handshake line, key=value
         # What the engine wrote before READY, the last 4 KiB of it: an engine that
         # exits instead of saying READY leaves its LOAD_FAIL line there.
@@ -6936,6 +7018,15 @@ class Engine:
                         except APIError as error:
                             self._record_fault(entry, error)
                             continue
+                    with self.live_lock:
+                        lv = self.live.get(request_id)
+                        if lv is not None:
+                            t = time.time()
+                            lv["tokens"] += 1
+                            lv["last"] = t
+                            lv["recent"].append(t)
+                            if lv["first"] is None:
+                                lv["first"] = t
                     entry.events.put(("data", data if record is None else (data, record)))
                 elif kind == "TOOL" and len(fields) == 3:
                     # Opaque, request-scoped structured output. K3 emits an
@@ -7032,10 +7123,17 @@ class Engine:
                     with self.pending_lock:
                         entry = self.pending.get(request_id)
                     if entry is not None and entry.failed is None:
+                        with self.live_lock:
+                            self.live[request_id] = {"started": time.time(), "prompt_tokens": int(fields[2]),
+                                                     "tokens": 0, "first": None, "last": None,
+                                                     "recent": collections.deque(maxlen=32),
+                                                     "forwards0": self.hits_live_seq}
                         entry.events.put(("accept", {"prompt_tokens": int(fields[2])}))
                 elif kind == "DONE" and len(fields) >= 7:
                     request_id = fields[1]
                     stats = self._stats(fields[2:])
+                    with self.live_lock:
+                        self.live.pop(request_id, None)
                     with self.pending_lock:
                         entry = self.pending.pop(request_id, None)
                     if entry is not None:
@@ -7056,6 +7154,9 @@ class Engine:
                 elif kind == "HITS" and len(fields) == 4:
                     self.hits = fields[3]
                     self.hits_seq += 1
+                elif kind == "HITL" and len(fields) == 2:
+                    self.hits_live_seq += 1
+                    self.hits_live.append((self.hits_live_seq, fields[1]))
                 elif kind == "PROF" and len(fields) >= 10:
                     # per-turn phase timings: where the engine spent this turn's wall time
                     turn = {
@@ -7083,6 +7184,8 @@ class Engine:
                 elif kind == "ERROR" and len(fields) >= 2:
                     request_id = fields[1]
                     message = " ".join(fields[2:]) or "engine request failed"
+                    with self.live_lock:
+                        self.live.pop(request_id, None)
                     with self.pending_lock:
                         entry = self.pending.pop(request_id, None)
                     if entry is not None:
@@ -7104,6 +7207,27 @@ class Engine:
                 self.dispatcher_error = error
                 print(f"colibri: the engine dispatcher stopped: {error}", file=sys.stderr)
                 self._fail_pending(error)
+
+    def live_snapshot(self):
+        """The turns in flight: reading the prompt until the first token, then writing,
+        with the average decode rate and the rate over the last 32 tokens."""
+        now = time.time()
+        out = []
+        with self.live_lock:
+            for lv in self.live.values():
+                first, last, n, r = lv["first"], lv["last"], lv["tokens"], list(lv["recent"])
+                avg = (n - 1) / (last - first) if first and n > 1 and last > first else 0.0
+                span = (r[-1] - r[0]) if len(r) > 1 else 0.0
+                if r and now - r[-1] > 1.0:
+                    span = now - r[0]              # stalled: the recent rate falls
+                cur = (len(r) - 1) / span if len(r) > 1 and span > 0 else 0.0
+                out.append({"state": "writing" if first else "reading",
+                            "elapsed_s": round(now - lv["started"], 3),
+                            "read_s": round((first or now) - lv["started"], 3),
+                            "prompt_tokens": lv["prompt_tokens"], "tokens": n,
+                            "forwards": max(0, self.hits_live_seq - lv["forwards0"]),
+                            "tok_s": round(avg, 3), "tok_s_now": round(cur, 3)})
+        return out
 
     def _dispatcher_cause(self, error):
         """The dispatcher's error, with the engine's exit status when the engine is gone:
@@ -8178,6 +8302,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
                     if hwinfo: payload["hwinfo"] = hwinfo
                     payload["capabilities"] = self.server.capabilities()
+                    eng = self.server.engine
+                    payload["live"] = eng.live_snapshot() if hasattr(eng, "live_snapshot") else []
+                    payload["system"] = _system_stats(eng)
                     if is_image_engine(self.server.engine):
                         payload["image"] = dict(getattr(self.server.engine, "info", None) or {})
                 self.send_json(200, payload, request_id)
@@ -8185,10 +8312,23 @@ class APIHandler(BaseHTTPRequestHandler):
             if path == "/experts":
                 payload = {"rows": 0, "cols": 0, "map": "", "hits": "", "seq": 0}
                 eng = self.server.engine
+                since = parse_qs(urlsplit(self.path).query).get("since")
                 if self._is_authed() and eng and getattr(eng, "emap", None):   # (#SEC-8) hide routing telemetry unless authed
+                    live_seq = getattr(eng, "hits_live_seq", 0)
+                    if since:
+                        # Live map: the decode steps after `since`, each one the experts
+                        # it routed as 4-hex-digit indices (layer*cols+expert). No map,
+                        # so a page polling a few times a second stays a few KB.
+                        try: start = int(since[0])
+                        except ValueError: start = 0
+                        frames = [f for s, f in list(getattr(eng, "hits_live", ())) if s > start][-64:]
+                        payload = {"rows": eng.emap["rows"], "cols": eng.emap["cols"], "live_seq": live_seq, "steps": frames}
+                        self.send_json(200, payload, request_id)
+                        return
                     payload.update(eng.emap)
                     payload["hits"] = eng.hits or ""
                     payload["seq"] = eng.hits_seq
+                    payload["live_seq"] = live_seq
                 self.send_json(200, payload, request_id)
                 return
             if path == "/profile":
