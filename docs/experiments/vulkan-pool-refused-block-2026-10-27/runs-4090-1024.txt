@@ -1,0 +1,823 @@
+# Qwen3.6 on a rented RTX 4090, mapped path, 1024 scored tokens: origin/dev against the change that remembers a refused block (2026-10-27)
+#
+# Question (written before the runs): the 256-token runs of runs-4090.txt decoded slower with the change (the medians are in the
+#   head of that file): the device wait and the host experts of the chain line were longer too, and the card's clock sat under 1000 MHz in
+#   some of the samples taken in the 8 s before the decode and at its start (the start-up takes 6 to 16 s with the change, against 92 s of
+#   uploads with origin/dev), in every run with the change and in none with origin/dev. Is the gap a cost at the start of the decode (then it is about the same in
+#   seconds when the decode is four times longer, and a fourth of it in percent) or a cost per token (then it stays near the same percent)?
+#   The same runs with 1024 scored tokens: A B B A A B B A, 60 s of rest, the same history, the clocks every second.
+# Hardware: a Vast.ai container (nvidia/cuda:12.8.1-devel-ubuntu24.04, Ubuntu 24.04) on a host with an AMD Ryzen 5 7600 (12 threads
+#   visible, a container CPU quota of 5.76, so OMP_NUM_THREADS=4), 187 GiB of RAM (container limit 127.5 GiB), one NVIDIA GeForce RTX 4090
+#   (24564 MiB, BAR1 32768 MiB, PCIe gen 4 x8 in use), driver 595.91.07. Vulkan through an ICD json on libEGL_nvidia.so.0 of the same
+#   driver version (the container has no graphics libraries: they were extracted from NVIDIA's runfile, not installed).
+# Model: Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64 (Hugging Face), Qwen3.6 35B-A3B, experts int4-g64.
+# Engines, cloned and built on the instance with make -C c -j6 qwen36 VK=1 (no CUDA); "dev2" is the origin/dev tree (not COLI_VK_DEV2):
+#   A (dev2)  origin/dev c1c06ac6fcb32157e4da130fd96775a32a757052, qwen36 sha256 a2dd32658477bffa91c5b68d1fcfac4307141f4f603732d2c2cdba423855614b
+#   B (lat)   the same tree with lat.patch (sha256 fd852f317a40e990eea47a072a995beb41ba301139245fe7ad724cd2707f687c; its engine code is the committed diff's but for two comments; checks.txt has lat.patch itself), qwen36 sha256 82a87ae3edc08b7225d01593ed8791b84d30df19be14b803ee4899874946299b
+# Input: ref1k.json (sha256 8ea0fca9f1e3fca0f6f7235dcf0398b87ad4a5e0179d92ee7b494bffafb926c6): 64 prompt tokens, then 1024 scored tokens (the first 1088 ids of the same 20000 characters; the
+#   first 320 are ref.json's, checked by the script; d0-ref.log below).
+# Each run, a new process from the tree's root:
+#   cp /workspace/storia.coli <model>/.coli_usage          (sha256 a0961fd74ed32995ab22641dee7e827c0e29e8698adb6c44f696b59de6d6fbc4; written by an earlier warm-up of the session; not kept here)
+#   env PPL=1 COLI_VULKAN=1 COLI_NO_OMP_TUNE=1 OMP_NUM_THREADS=4 SNAP=<model> N_NEW=32 /usr/bin/time -v ./c/qwen36 256 4 ref1k.json
+#   with nvidia-smi every 1 s beside it (the last 32 samples of each run are kept below). The path is the default of origin/dev on this card
+#   (mapped: no COLI_VK_STAGED). The mapped path's nll is not the same from run to run (which experts are on the card depends on thread
+#   timing), so the nll is read as a range. "device wait" and "host experts" are the totals of the "qwen36 chain:" line of each log.
+# Runs, in order (each a new process):
+# n1-dev2  dev2  warm start  91.4 s  resident  3792 refused  6448  nll 2.947700   47.04 tok/s ( 21.8 s)  device wait  7025.3 ms, host experts 11067.4 ms  wall 2:03.59  peak RSS 13.95 GB
+# n2-lat   lat   warm start   7.0 s  resident  3792 refused  6448  nll 2.948169   44.25 tok/s ( 23.1 s)  device wait  7364.7 ms, host experts 11672.2 ms  wall 0:40.46  peak RSS 13.92 GB
+# n3-lat   lat   warm start   5.8 s  resident  3792 refused  6448  nll 2.948329   45.80 tok/s ( 22.4 s)  device wait  7357.8 ms, host experts 11283.2 ms  wall 0:38.37  peak RSS 13.93 GB
+# n4-dev2  dev2  warm start  91.8 s  resident  3792 refused  6448  nll 2.948155   46.00 tok/s ( 22.3 s)  device wait  7037.1 ms, host experts 11271.5 ms  wall 2:04.40  peak RSS 13.90 GB
+# n5-dev2  dev2  warm start  93.3 s  resident  3791 refused  6448  nll 2.949521   48.62 tok/s ( 21.1 s)  device wait  7002.5 ms, host experts 10711.2 ms  wall 2:04.65  peak RSS 13.95 GB
+# n6-lat   lat   warm start   6.6 s  resident  3792 refused  6448  nll 2.949546   45.15 tok/s ( 22.7 s)  device wait  7127.6 ms, host experts 11461.1 ms  wall 0:39.58  peak RSS 13.94 GB
+# n7-lat   lat   warm start  11.6 s  resident  3792 refused  6448  nll 2.947934   44.99 tok/s ( 22.8 s)  device wait  7109.8 ms, host experts 11541.8 ms  wall 0:44.67  peak RSS 13.97 GB
+# n8-dev2  dev2  warm start  93.0 s  resident  3791 refused  6448  nll 2.949096   45.56 tok/s ( 22.5 s)  device wait  7041.6 ms, host experts 11395.5 ms  wall 2:05.84  peak RSS 13.91 GB
+# Medians of the four runs of each side (tok/s over the 1024 scored tokens, ranges in brackets): origin/dev 46.52 [45.56 to 48.62], the change 45.07 [44.25 to 45.8]: -3.1 %. The decode takes 22.05 s against 22.75 s (+0.70 s). Totals of the chain line, medians: waiting for the device 7031 against 7243 ms, routed experts on the host 11169 against 11501 ms. In the 4 back-to-back pairs (runs 1-2, 3-4, ...) the run with the change is the slower one in 4.
+# Clocks: nvidia-smi samples over the decode and the 8 s before it (computed from the *-smi.csv below, which keep that window; the engine logs
+#   carry no time stamps, so the window is placed by counting the decode's seconds back from the end of the run, and the low samples can fall in
+#   the last seconds of the start-up, when the card has no work):
+#   n1-dev2  dev2  30 samples, 0 under 1000 MHz; lowest 2670
+#   n2-lat   lat   31 samples, 6 under 1000 MHz (525, 330, 210, 210, 345, 735); lowest 210
+#   n3-lat   lat   30 samples, 3 under 1000 MHz (375, 210, 525); lowest 210
+#   n4-dev2  dev2  30 samples, 0 under 1000 MHz; lowest 2670
+#   n5-dev2  dev2  29 samples, 0 under 1000 MHz; lowest 2670
+#   n6-lat   lat   31 samples, 4 under 1000 MHz (435, 360, 210, 210); lowest 210
+#   n7-lat   lat   31 samples, 8 under 1000 MHz (345, 240, 210, 210, 210, 210, 210, 210); lowest 210
+#   n8-dev2  dev2  30 samples, 0 under 1000 MHz; lowest 2670
+# Against the 256 scored tokens of runs-4090.txt: the decode with the change is +0.50 s longer there and +0.70 s here, with four times the tokens (a cost per token would have grown with them, to about +2.00 s). So most of the gap fits a cost at the start of the decode; a small cost per token cannot be excluded (four runs a side, the ranges touch). What causes it was not tested (the clocks were not held, nothing else was varied).
+
+===== d0-ref.log (sha256 037d7bcc1fa3152c43c3dd473d5625ab144e9209c44a90eab16fcb7faaa1d737): the input of this record: the script that cut ref1k.json from the same text (whole log)
+prompt 64, full 1088 (of 5776 in 20000 characters); the first 320 are ref.json's
+366b41db5e1801932a1b7d82ffdd47967b7f730ed8bc83556be6a3c818dd63ae  /workspace/ref.json
+8ea0fca9f1e3fca0f6f7235dcf0398b87ad4a5e0179d92ee7b494bffafb926c6  /workspace/ref1k.json
+
+===== n1-dev2.log (sha256 61356830a8e047359311b659b1dcaa88c7babbcfcdf50cd606dad8944dcaf477): dev2 (whole log)
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /workspace/q36/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 8.4s | RSS after load: 4.83 GB
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] ready: NVIDIA GeForce RTX 4090, compute qfam 0, memtype 4, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix)
+[VK] qwen36: device ready, dense matrices on the device (default)
+[VK] qwen36: dense chain on (a discrete GPU, beside the expert tier)
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[VK] qwen36 chain fit: free 25183125504 B, reserve 1073741824 B, fixed 555838720 B (the engine's 69299456 B, the pools' 486539264 B), tail 509552640 B, layers 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 B, matrices 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 B
+[VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 23.45 GiB, reserve 1.00 GiB)
+[VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+[VK] qwen36: dense weights on the device only (a discrete GPU with room for them: 1.81 of 22.39 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1811939328 B
+[VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+[VK] chain: 20 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+[VK] qwen36: 291 dense matrices on the device only, 1.81 GiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the DeltaNet's a/b rows and the shared expert's gate vector, norms, the vision tower, any imported pages; RSS now 2.823 GiB
+[USAGE] expert history: 204160 selections (/workspace/q36/.coli_usage)
+[VK] tier qwen36: on, NVIDIA GeForce RTX 4090, budget 20.27 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[qwen36] int4 packed weights detected — kept int4, rows interleaved by 16 for expert_ffn.h (Q36_ILV16=0 keeps the rows)
+[VK] tier qwen36: warm start, 10240 experts in 91.4s (5324 from the history, 4916 more to fill the device: every expert of the model)
+[qwen36] KV cache: float32, 0.04 GiB at 1088 positions
+[VK] qwen36 chain: prompt chunks of up to 8192 rows (389 KiB a row; 15.02 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[VK] tier qwen36: no device memory for the streaming slots, cold experts stay on the CPU
+[VK] qwen36: 0 matmuls on the GPU (362 matrices resident, 1863.9 MiB; placed int8 291, int4 0, f32 0)
+[VK] qwen36 chain: 1024 forwards, 83055 frames (697768 ops, 369664 matmuls, 320 tiled GEMM), 7025.3 ms waiting for the device, 11067.4 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 0 in the integer form), 149.9 MiB on the device
+[VK] tier qwen36 run: device 330177 of 347840 routed experts (94.9%; this run 330177 of 347840) | CPU RAM hits 14151, disk loads 3512 | resident 3792 (budget 3792, 6.25 GiB of 20.27 GiB, 25 blocks, frag 0.44) | uploads 4236 (6.21 GiB, 3792 warm), evictions 444, skipped 0 queue + 0 rate, failed 6448 | device 1146.9 ms, CPU share 6070.3 ms, waited 3639.9 ms (0% of device time hidden) | failed: 6448 refused by the pool, 0 copies to the device, 0 not taken by the batch | balance: device share 0.09, 4931 rows handed to the CPU | exclusive: 0 RAM copies of device experts given up first
+TF-NLL: 2.947700 nats/token over 1024 tokens | ppl = 19.0621
+Expert cache hit rate: 80.1% (hit=14151 miss=3512)
+Speed: 47.04 tok/s (21.8s for 1024 tokens) | PEAK RSS: 13.95 GB
+[VK] qwen36: dense weights at exit: 291 matrices on the device only (1.81 GiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 13.797 GiB
+	Command being timed: "./c/qwen36 256 4 /workspace/ref1k.json"
+	User time (seconds): 129.35
+	System time (seconds): 34.95
+	Percent of CPU this job got: 132%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 2:03.59
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 14622520
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 6464172
+	Voluntary context switches: 62050
+	Involuntary context switches: 3039
+	Swaps: 0
+	File system inputs: 493360
+	File system outputs: 168
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+===== n2-lat.log (sha256 98873e31154203a6987d9557560fbc89c80c5c4534f3e9ddbba9e02bbe5c2437): lat (whole log)
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /workspace/q36/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 8.3s | RSS after load: 4.83 GB
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] ready: NVIDIA GeForce RTX 4090, compute qfam 0, memtype 4, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix)
+[VK] qwen36: device ready, dense matrices on the device (default)
+[VK] qwen36: dense chain on (a discrete GPU, beside the expert tier)
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[VK] qwen36 chain fit: free 25183125504 B, reserve 1073741824 B, fixed 555838720 B (the engine's 69299456 B, the pools' 486539264 B), tail 509552640 B, layers 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 B, matrices 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 B
+[VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 23.45 GiB, reserve 1.00 GiB)
+[VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+[VK] qwen36: dense weights on the device only (a discrete GPU with room for them: 1.81 of 22.39 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1811939328 B
+[VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+[VK] chain: 20 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+[VK] qwen36: 291 dense matrices on the device only, 1.81 GiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the DeltaNet's a/b rows and the shared expert's gate vector, norms, the vision tower, any imported pages; RSS now 2.823 GiB
+[USAGE] expert history: 204160 selections (/workspace/q36/.coli_usage)
+[VK] tier qwen36: on, NVIDIA GeForce RTX 4090, budget 20.27 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[qwen36] int4 packed weights detected — kept int4, rows interleaved by 16 for expert_ffn.h (Q36_ILV16=0 keeps the rows)
+[VK] tier qwen36: warm start, 10240 experts in 7.0s (5324 from the history, 4916 more to fill the device: every expert of the model)
+[qwen36] KV cache: float32, 0.04 GiB at 1088 positions
+[VK] qwen36 chain: prompt chunks of up to 8192 rows (389 KiB a row; 15.02 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[VK] tier qwen36: no device memory for the streaming slots, cold experts stay on the CPU
+[VK] qwen36: 0 matmuls on the GPU (362 matrices resident, 1863.9 MiB; placed int8 291, int4 0, f32 0)
+[VK] qwen36 chain: 1024 forwards, 83055 frames (697768 ops, 369664 matmuls, 320 tiled GEMM), 7364.7 ms waiting for the device, 11672.2 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 0 in the integer form), 149.9 MiB on the device
+[VK] tier qwen36 run: device 330127 of 347840 routed experts (94.9%; this run 330127 of 347840) | CPU RAM hits 14207, disk loads 3506 | resident 3792 (budget 3792, 6.25 GiB of 20.27 GiB, 25 blocks, frag 0.38) | uploads 4238 (6.21 GiB, 3792 warm), evictions 446, skipped 0 queue + 0 rate, failed 6448 | device 1446.0 ms, CPU share 6144.9 ms, waited 4053.8 ms (0% of device time hidden) | failed: 6448 refused by the pool, 0 copies to the device, 0 not taken by the batch | balance: device share 0.05, 5043 rows handed to the CPU | exclusive: 0 RAM copies of device experts given up first
+TF-NLL: 2.948169 nats/token over 1024 tokens | ppl = 19.0710
+Expert cache hit rate: 80.2% (hit=14207 miss=3506)
+Speed: 44.25 tok/s (23.1s for 1024 tokens) | PEAK RSS: 13.92 GB
+[VK] qwen36: dense weights at exit: 291 matrices on the device only (1.81 GiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 13.776 GiB
+	Command being timed: "./c/qwen36 256 4 /workspace/ref1k.json"
+	User time (seconds): 118.01
+	System time (seconds): 13.62
+	Percent of CPU this job got: 325%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:40.46
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 14600488
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 6458779
+	Voluntary context switches: 11841
+	Involuntary context switches: 891
+	Swaps: 0
+	File system inputs: 493360
+	File system outputs: 168
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+===== n3-lat.log (sha256 e03397d8161986021e3824e16116f86edd10199fb3b98fac28dfa64996c68cd5): lat (whole log)
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /workspace/q36/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 8.2s | RSS after load: 4.83 GB
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] ready: NVIDIA GeForce RTX 4090, compute qfam 0, memtype 4, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix)
+[VK] qwen36: device ready, dense matrices on the device (default)
+[VK] qwen36: dense chain on (a discrete GPU, beside the expert tier)
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[VK] qwen36 chain fit: free 25183125504 B, reserve 1073741824 B, fixed 555838720 B (the engine's 69299456 B, the pools' 486539264 B), tail 509552640 B, layers 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 B, matrices 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 B
+[VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 23.45 GiB, reserve 1.00 GiB)
+[VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+[VK] qwen36: dense weights on the device only (a discrete GPU with room for them: 1.81 of 22.39 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1811939328 B
+[VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+[VK] chain: 20 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+[VK] qwen36: 291 dense matrices on the device only, 1.81 GiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the DeltaNet's a/b rows and the shared expert's gate vector, norms, the vision tower, any imported pages; RSS now 2.823 GiB
+[USAGE] expert history: 204160 selections (/workspace/q36/.coli_usage)
+[VK] tier qwen36: on, NVIDIA GeForce RTX 4090, budget 20.27 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[qwen36] int4 packed weights detected — kept int4, rows interleaved by 16 for expert_ffn.h (Q36_ILV16=0 keeps the rows)
+[VK] tier qwen36: warm start, 10240 experts in 5.8s (5324 from the history, 4916 more to fill the device: every expert of the model)
+[qwen36] KV cache: float32, 0.04 GiB at 1088 positions
+[VK] qwen36 chain: prompt chunks of up to 8192 rows (389 KiB a row; 15.02 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[VK] tier qwen36: no device memory for the streaming slots, cold experts stay on the CPU
+[VK] qwen36: 0 matmuls on the GPU (362 matrices resident, 1863.9 MiB; placed int8 291, int4 0, f32 0)
+[VK] qwen36 chain: 1024 forwards, 83055 frames (697768 ops, 369664 matmuls, 320 tiled GEMM), 7357.8 ms waiting for the device, 11283.2 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 0 in the integer form), 149.9 MiB on the device
+[VK] tier qwen36 run: device 330201 of 347840 routed experts (94.9%; this run 330201 of 347840) | CPU RAM hits 14133, disk loads 3506 | resident 3792 (budget 3792, 6.25 GiB of 20.27 GiB, 25 blocks, frag 0.38) | uploads 4239 (6.21 GiB, 3792 warm), evictions 447, skipped 0 queue + 0 rate, failed 6448 | device 1450.2 ms, CPU share 6065.7 ms, waited 3787.5 ms (0% of device time hidden) | failed: 6448 refused by the pool, 0 copies to the device, 0 not taken by the batch | balance: device share 0.09, 4943 rows handed to the CPU | exclusive: 0 RAM copies of device experts given up first
+TF-NLL: 2.948329 nats/token over 1024 tokens | ppl = 19.0741
+Expert cache hit rate: 80.1% (hit=14133 miss=3506)
+Speed: 45.80 tok/s (22.4s for 1024 tokens) | PEAK RSS: 13.93 GB
+[VK] qwen36: dense weights at exit: 291 matrices on the device only (1.81 GiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 13.780 GiB
+	Command being timed: "./c/qwen36 256 4 /workspace/ref1k.json"
+	User time (seconds): 110.85
+	System time (seconds): 13.10
+	Percent of CPU this job got: 323%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:38.37
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 14604824
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 6459755
+	Voluntary context switches: 11264
+	Involuntary context switches: 769
+	Swaps: 0
+	File system inputs: 493360
+	File system outputs: 168
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+===== n4-dev2.log (sha256 9c39a60eb2b5f2abe91ef33b8b3664c30c53d87c2dd9b386218fe721364a5abf): dev2 (whole log)
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /workspace/q36/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 8.3s | RSS after load: 4.83 GB
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] ready: NVIDIA GeForce RTX 4090, compute qfam 0, memtype 4, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix)
+[VK] qwen36: device ready, dense matrices on the device (default)
+[VK] qwen36: dense chain on (a discrete GPU, beside the expert tier)
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[VK] qwen36 chain fit: free 25183125504 B, reserve 1073741824 B, fixed 555838720 B (the engine's 69299456 B, the pools' 486539264 B), tail 509552640 B, layers 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 B, matrices 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 B
+[VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 23.45 GiB, reserve 1.00 GiB)
+[VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+[VK] qwen36: dense weights on the device only (a discrete GPU with room for them: 1.81 of 22.39 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1811939328 B
+[VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+[VK] chain: 20 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+[VK] qwen36: 291 dense matrices on the device only, 1.81 GiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the DeltaNet's a/b rows and the shared expert's gate vector, norms, the vision tower, any imported pages; RSS now 2.823 GiB
+[USAGE] expert history: 204160 selections (/workspace/q36/.coli_usage)
+[VK] tier qwen36: on, NVIDIA GeForce RTX 4090, budget 20.27 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[qwen36] int4 packed weights detected — kept int4, rows interleaved by 16 for expert_ffn.h (Q36_ILV16=0 keeps the rows)
+[VK] tier qwen36: warm start, 10240 experts in 91.8s (5324 from the history, 4916 more to fill the device: every expert of the model)
+[qwen36] KV cache: float32, 0.04 GiB at 1088 positions
+[VK] qwen36 chain: prompt chunks of up to 8192 rows (389 KiB a row; 15.02 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[VK] tier qwen36: no device memory for the streaming slots, cold experts stay on the CPU
+[VK] qwen36: 0 matmuls on the GPU (362 matrices resident, 1863.9 MiB; placed int8 291, int4 0, f32 0)
+[VK] qwen36 chain: 1024 forwards, 83055 frames (697768 ops, 369664 matmuls, 320 tiled GEMM), 7037.1 ms waiting for the device, 11271.5 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 0 in the integer form), 149.9 MiB on the device
+[VK] tier qwen36 run: device 330163 of 347840 routed experts (94.9%; this run 330163 of 347840) | CPU RAM hits 14178, disk loads 3499 | resident 3792 (budget 3792, 6.25 GiB of 20.27 GiB, 25 blocks, frag 0.38) | uploads 4236 (6.21 GiB, 3792 warm), evictions 444, skipped 0 queue + 0 rate, failed 6448 | device 1144.9 ms, CPU share 6074.7 ms, waited 3731.6 ms (0% of device time hidden) | failed: 6448 refused by the pool, 0 copies to the device, 0 not taken by the batch | balance: device share 0.05, 5015 rows handed to the CPU | exclusive: 0 RAM copies of device experts given up first
+TF-NLL: 2.948155 nats/token over 1024 tokens | ppl = 19.0707
+Expert cache hit rate: 80.2% (hit=14178 miss=3499)
+Speed: 46.00 tok/s (22.3s for 1024 tokens) | PEAK RSS: 13.90 GB
+[VK] qwen36: dense weights at exit: 291 matrices on the device only (1.81 GiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 13.753 GiB
+	Command being timed: "./c/qwen36 256 4 /workspace/ref1k.json"
+	User time (seconds): 132.12
+	System time (seconds): 34.84
+	Percent of CPU this job got: 134%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 2:04.40
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 14576904
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 6452752
+	Voluntary context switches: 62481
+	Involuntary context switches: 3024
+	Swaps: 0
+	File system inputs: 493360
+	File system outputs: 168
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+===== n5-dev2.log (sha256 710bd9878d24b97b039c7d19874444d1957b0d0b6c131e1489fc5f9981518793): dev2 (whole log)
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /workspace/q36/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 8.3s | RSS after load: 4.83 GB
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] ready: NVIDIA GeForce RTX 4090, compute qfam 0, memtype 4, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix)
+[VK] qwen36: device ready, dense matrices on the device (default)
+[VK] qwen36: dense chain on (a discrete GPU, beside the expert tier)
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[VK] qwen36 chain fit: free 25183125504 B, reserve 1073741824 B, fixed 555838720 B (the engine's 69299456 B, the pools' 486539264 B), tail 509552640 B, layers 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 B, matrices 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 B
+[VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 23.45 GiB, reserve 1.00 GiB)
+[VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+[VK] qwen36: dense weights on the device only (a discrete GPU with room for them: 1.81 of 22.39 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1811939328 B
+[VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+[VK] chain: 20 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+[VK] qwen36: 291 dense matrices on the device only, 1.81 GiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the DeltaNet's a/b rows and the shared expert's gate vector, norms, the vision tower, any imported pages; RSS now 2.823 GiB
+[USAGE] expert history: 204160 selections (/workspace/q36/.coli_usage)
+[VK] tier qwen36: on, NVIDIA GeForce RTX 4090, budget 20.27 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[qwen36] int4 packed weights detected — kept int4, rows interleaved by 16 for expert_ffn.h (Q36_ILV16=0 keeps the rows)
+[VK] tier qwen36: warm start, 10240 experts in 93.3s (5324 from the history, 4916 more to fill the device: every expert of the model)
+[qwen36] KV cache: float32, 0.04 GiB at 1088 positions
+[VK] qwen36 chain: prompt chunks of up to 8192 rows (389 KiB a row; 15.02 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[VK] tier qwen36: no device memory for the streaming slots, cold experts stay on the CPU
+[VK] qwen36: 0 matmuls on the GPU (362 matrices resident, 1863.9 MiB; placed int8 291, int4 0, f32 0)
+[VK] qwen36 chain: 1024 forwards, 83055 frames (697768 ops, 369664 matmuls, 320 tiled GEMM), 7002.5 ms waiting for the device, 10711.2 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 0 in the integer form), 149.9 MiB on the device
+[VK] tier qwen36 run: device 330082 of 347840 routed experts (94.9%; this run 330082 of 347840) | CPU RAM hits 14244, disk loads 3514 | resident 3791 (budget 3792, 6.25 GiB of 20.27 GiB, 25 blocks, frag 0.38) | uploads 4245 (6.22 GiB, 3792 warm), evictions 454, skipped 0 queue + 0 rate, failed 6448 | device 1146.6 ms, CPU share 6005.6 ms, waited 3421.2 ms (0% of device time hidden) | failed: 6448 refused by the pool, 0 copies to the device, 0 not taken by the batch | balance: device share 0.10, 5052 rows handed to the CPU | exclusive: 0 RAM copies of device experts given up first
+TF-NLL: 2.949521 nats/token over 1024 tokens | ppl = 19.0968
+Expert cache hit rate: 80.2% (hit=14244 miss=3514)
+Speed: 48.62 tok/s (21.1s for 1024 tokens) | PEAK RSS: 13.95 GB
+[VK] qwen36: dense weights at exit: 291 matrices on the device only (1.81 GiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 13.805 GiB
+	Command being timed: "./c/qwen36 256 4 /workspace/ref1k.json"
+	User time (seconds): 134.59
+	System time (seconds): 35.09
+	Percent of CPU this job got: 136%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 2:04.65
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 14631368
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 6466415
+	Voluntary context switches: 62025
+	Involuntary context switches: 3161
+	Swaps: 0
+	File system inputs: 491168
+	File system outputs: 184
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+===== n6-lat.log (sha256 39ef835bed5fdb0ce4f28a0c2e9713cbb96ec55cd95c6de9e9db1611c77be76b): lat (whole log)
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /workspace/q36/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 8.3s | RSS after load: 4.83 GB
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] ready: NVIDIA GeForce RTX 4090, compute qfam 0, memtype 4, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix)
+[VK] qwen36: device ready, dense matrices on the device (default)
+[VK] qwen36: dense chain on (a discrete GPU, beside the expert tier)
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[VK] qwen36 chain fit: free 25183125504 B, reserve 1073741824 B, fixed 555838720 B (the engine's 69299456 B, the pools' 486539264 B), tail 509552640 B, layers 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 B, matrices 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 B
+[VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 23.45 GiB, reserve 1.00 GiB)
+[VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+[VK] qwen36: dense weights on the device only (a discrete GPU with room for them: 1.81 of 22.39 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1811939328 B
+[VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+[VK] chain: 20 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+[VK] qwen36: 291 dense matrices on the device only, 1.81 GiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the DeltaNet's a/b rows and the shared expert's gate vector, norms, the vision tower, any imported pages; RSS now 2.823 GiB
+[USAGE] expert history: 204160 selections (/workspace/q36/.coli_usage)
+[VK] tier qwen36: on, NVIDIA GeForce RTX 4090, budget 20.27 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[qwen36] int4 packed weights detected — kept int4, rows interleaved by 16 for expert_ffn.h (Q36_ILV16=0 keeps the rows)
+[VK] tier qwen36: warm start, 10240 experts in 6.6s (5324 from the history, 4916 more to fill the device: every expert of the model)
+[qwen36] KV cache: float32, 0.04 GiB at 1088 positions
+[VK] qwen36 chain: prompt chunks of up to 8192 rows (389 KiB a row; 15.02 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[VK] tier qwen36: no device memory for the streaming slots, cold experts stay on the CPU
+[VK] qwen36: 0 matmuls on the GPU (362 matrices resident, 1863.9 MiB; placed int8 291, int4 0, f32 0)
+[VK] qwen36 chain: 1024 forwards, 83055 frames (697768 ops, 369664 matmuls, 320 tiled GEMM), 7127.6 ms waiting for the device, 11461.1 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 0 in the integer form), 149.9 MiB on the device
+[VK] tier qwen36 run: device 330094 of 347840 routed experts (94.9%; this run 330094 of 347840) | CPU RAM hits 14235, disk loads 3511 | resident 3792 (budget 3792, 6.25 GiB of 20.27 GiB, 25 blocks, frag 0.38) | uploads 4243 (6.22 GiB, 3792 warm), evictions 451, skipped 0 queue + 0 rate, failed 6448 | device 1257.3 ms, CPU share 6063.3 ms, waited 4003.0 ms (0% of device time hidden) | failed: 6448 refused by the pool, 0 copies to the device, 0 not taken by the batch | balance: device share 0.05, 5053 rows handed to the CPU | exclusive: 0 RAM copies of device experts given up first
+TF-NLL: 2.949546 nats/token over 1024 tokens | ppl = 19.0973
+Expert cache hit rate: 80.2% (hit=14235 miss=3511)
+Speed: 45.15 tok/s (22.7s for 1024 tokens) | PEAK RSS: 13.94 GB
+[VK] qwen36: dense weights at exit: 291 matrices on the device only (1.81 GiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 13.792 GiB
+	Command being timed: "./c/qwen36 256 4 /workspace/ref1k.json"
+	User time (seconds): 115.43
+	System time (seconds): 13.53
+	Percent of CPU this job got: 325%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:39.58
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 14617872
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 6463024
+	Voluntary context switches: 11496
+	Involuntary context switches: 765
+	Swaps: 0
+	File system inputs: 491168
+	File system outputs: 168
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+===== n7-lat.log (sha256 27b7318f584daf3007c64457034b242a73dc8a3b4d9387fdd959fb83c9c54945): lat (whole log)
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /workspace/q36/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 8.3s | RSS after load: 4.83 GB
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] ready: NVIDIA GeForce RTX 4090, compute qfam 0, memtype 4, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix)
+[VK] qwen36: device ready, dense matrices on the device (default)
+[VK] qwen36: dense chain on (a discrete GPU, beside the expert tier)
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[VK] qwen36 chain fit: free 25183125504 B, reserve 1073741824 B, fixed 555838720 B (the engine's 69299456 B, the pools' 486539264 B), tail 509552640 B, layers 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 B, matrices 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 B
+[VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 23.45 GiB, reserve 1.00 GiB)
+[VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+[VK] qwen36: dense weights on the device only (a discrete GPU with room for them: 1.81 of 22.39 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1811939328 B
+[VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+[VK] chain: 20 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+[VK] qwen36: 291 dense matrices on the device only, 1.81 GiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the DeltaNet's a/b rows and the shared expert's gate vector, norms, the vision tower, any imported pages; RSS now 2.823 GiB
+[USAGE] expert history: 204160 selections (/workspace/q36/.coli_usage)
+[VK] tier qwen36: on, NVIDIA GeForce RTX 4090, budget 20.27 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[qwen36] int4 packed weights detected — kept int4, rows interleaved by 16 for expert_ffn.h (Q36_ILV16=0 keeps the rows)
+[VK] tier qwen36: warm start, 10240 experts in 11.6s (5324 from the history, 4916 more to fill the device: every expert of the model)
+[qwen36] KV cache: float32, 0.04 GiB at 1088 positions
+[VK] qwen36 chain: prompt chunks of up to 8192 rows (389 KiB a row; 15.02 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[VK] tier qwen36: no device memory for the streaming slots, cold experts stay on the CPU
+[VK] qwen36: 0 matmuls on the GPU (362 matrices resident, 1863.9 MiB; placed int8 291, int4 0, f32 0)
+[VK] qwen36 chain: 1024 forwards, 83055 frames (697768 ops, 369664 matmuls, 320 tiled GEMM), 7109.8 ms waiting for the device, 11541.8 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 0 in the integer form), 149.9 MiB on the device
+[VK] tier qwen36 run: device 330015 of 347840 routed experts (94.9%; this run 330015 of 347840) | CPU RAM hits 14306, disk loads 3519 | resident 3792 (budget 3792, 6.25 GiB of 20.27 GiB, 25 blocks, frag 0.38) | uploads 4243 (6.22 GiB, 3792 warm), evictions 451, skipped 0 queue + 0 rate, failed 6448 | device 1248.2 ms, CPU share 6163.2 ms, waited 4007.1 ms (0% of device time hidden) | failed: 6448 refused by the pool, 0 copies to the device, 0 not taken by the batch | balance: device share 0.06, 5097 rows handed to the CPU | exclusive: 0 RAM copies of device experts given up first
+TF-NLL: 2.947934 nats/token over 1024 tokens | ppl = 19.0665
+Expert cache hit rate: 80.3% (hit=14306 miss=3519)
+Speed: 44.99 tok/s (22.8s for 1024 tokens) | PEAK RSS: 13.97 GB
+[VK] qwen36: dense weights at exit: 291 matrices on the device only (1.81 GiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 13.820 GiB
+	Command being timed: "./c/qwen36 256 4 /workspace/ref1k.json"
+	User time (seconds): 134.97
+	System time (seconds): 14.14
+	Percent of CPU this job got: 333%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:44.67
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 14646772
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 6470318
+	Voluntary context switches: 12092
+	Involuntary context switches: 809
+	Swaps: 0
+	File system inputs: 493360
+	File system outputs: 168
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+===== n8-dev2.log (sha256 5c66f6f771473ce10cd1ac7fe0096ce37df788f5bd430a92e0764179954af36d): dev2 (whole log)
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /workspace/q36/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 8.4s | RSS after load: 4.83 GB
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] ready: NVIDIA GeForce RTX 4090, compute qfam 0, memtype 4, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix)
+[VK] qwen36: device ready, dense matrices on the device (default)
+[VK] qwen36: dense chain on (a discrete GPU, beside the expert tier)
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[VK] qwen36 chain fit: free 25183125504 B, reserve 1073741824 B, fixed 555838720 B (the engine's 69299456 B, the pools' 486539264 B), tail 509552640 B, layers 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 B, matrices 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 B
+[VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 23.45 GiB, reserve 1.00 GiB)
+[VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+[VK] qwen36: dense weights on the device only (a discrete GPU with room for them: 1.81 of 22.39 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1811939328 B
+[VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+[VK] chain: 20 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+[VK] qwen36: 291 dense matrices on the device only, 1.81 GiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the DeltaNet's a/b rows and the shared expert's gate vector, norms, the vision tower, any imported pages; RSS now 2.822 GiB
+[USAGE] expert history: 204160 selections (/workspace/q36/.coli_usage)
+[VK] tier qwen36: on, NVIDIA GeForce RTX 4090, budget 20.27 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[qwen36] int4 packed weights detected — kept int4, rows interleaved by 16 for expert_ffn.h (Q36_ILV16=0 keeps the rows)
+[VK] tier qwen36: warm start, 10240 experts in 93.0s (5324 from the history, 4916 more to fill the device: every expert of the model)
+[qwen36] KV cache: float32, 0.04 GiB at 1088 positions
+[VK] qwen36 chain: prompt chunks of up to 8192 rows (389 KiB a row; 15.02 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[VK] tier qwen36: no device memory for the streaming slots, cold experts stay on the CPU
+[VK] qwen36: 0 matmuls on the GPU (362 matrices resident, 1863.9 MiB; placed int8 291, int4 0, f32 0)
+[VK] qwen36 chain: 1024 forwards, 83055 frames (697768 ops, 369664 matmuls, 320 tiled GEMM), 7041.6 ms waiting for the device, 11395.5 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 0 in the integer form), 149.9 MiB on the device
+[VK] tier qwen36 run: device 330120 of 347840 routed experts (94.9%; this run 330120 of 347840) | CPU RAM hits 14220, disk loads 3500 | resident 3791 (budget 3792, 6.25 GiB of 20.27 GiB, 25 blocks, frag 0.38) | uploads 4237 (6.21 GiB, 3792 warm), evictions 446, skipped 0 queue + 0 rate, failed 6448 | device 1146.3 ms, CPU share 6111.2 ms, waited 3834.7 ms (0% of device time hidden) | failed: 6448 refused by the pool, 0 copies to the device, 0 not taken by the batch | balance: device share 0.05, 5061 rows handed to the CPU | exclusive: 0 RAM copies of device experts given up first
+TF-NLL: 2.949096 nats/token over 1024 tokens | ppl = 19.0887
+Expert cache hit rate: 80.2% (hit=14220 miss=3500)
+Speed: 45.56 tok/s (22.5s for 1024 tokens) | PEAK RSS: 13.91 GB
+[VK] qwen36: dense weights at exit: 291 matrices on the device only (1.81 GiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 13.759 GiB
+	Command being timed: "./c/qwen36 256 4 /workspace/ref1k.json"
+	User time (seconds): 137.67
+	System time (seconds): 34.89
+	Percent of CPU this job got: 137%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 2:05.84
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 14581784
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 6454186
+	Voluntary context switches: 62565
+	Involuntary context switches: 2728
+	Swaps: 0
+	File system inputs: 493360
+	File system outputs: 168
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+===== n1-dev2-smi.csv (sha256 20847aa60846299db9063fa0736bb787ea3f90fd874cf93baab6999a7be28217 of the whole file, not kept): excerpt, the header and the last 32 samples of nvidia-smi, every 1 s, the decode being the last seconds of the run
+timestamp, memory.used [MiB], utilization.gpu [%], temperature.gpu, clocks.current.sm [MHz], pcie.link.gen.current, pcie.link.width.current, power.draw [W]
+2026/10/27 10:32:09.736, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 60.62 W
+2026/10/27 10:32:10.740, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 60.54 W
+2026/10/27 10:32:11.743, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 60.14 W
+2026/10/27 10:32:12.747, 8700 MiB, 100 %, 40, 2670 MHz, 4, 8, 60.44 W
+2026/10/27 10:32:13.751, 8700 MiB, 100 %, 40, 2670 MHz, 4, 8, 60.49 W
+2026/10/27 10:32:14.755, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 60.70 W
+2026/10/27 10:32:15.761, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 60.85 W
+2026/10/27 10:32:16.763, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 60.72 W
+2026/10/27 10:32:17.767, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 60.83 W
+2026/10/27 10:32:18.771, 8708 MiB, 66 %, 40, 2670 MHz, 4, 8, 64.41 W
+2026/10/27 10:32:19.772, 8708 MiB, 45 %, 41, 2670 MHz, 4, 8, 72.95 W
+2026/10/27 10:32:20.772, 8708 MiB, 49 %, 41, 2670 MHz, 4, 8, 95.74 W
+2026/10/27 10:32:21.772, 8708 MiB, 38 %, 41, 2670 MHz, 4, 8, 92.08 W
+2026/10/27 10:32:22.772, 8708 MiB, 61 %, 42, 2670 MHz, 4, 8, 97.70 W
+2026/10/27 10:32:23.772, 8708 MiB, 55 %, 42, 2670 MHz, 4, 8, 98.67 W
+2026/10/27 10:32:24.773, 8708 MiB, 48 %, 41, 2670 MHz, 4, 8, 96.85 W
+2026/10/27 10:32:25.773, 8708 MiB, 54 %, 42, 2670 MHz, 4, 8, 97.86 W
+2026/10/27 10:32:26.773, 8704 MiB, 42 %, 41, 2670 MHz, 4, 8, 94.81 W
+2026/10/27 10:32:27.773, 8704 MiB, 52 %, 41, 2670 MHz, 4, 8, 95.42 W
+2026/10/27 10:32:28.774, 8704 MiB, 61 %, 42, 2670 MHz, 4, 8, 99.79 W
+2026/10/27 10:32:29.774, 8704 MiB, 70 %, 42, 2670 MHz, 4, 8, 102.59 W
+2026/10/27 10:32:30.774, 8704 MiB, 65 %, 42, 2670 MHz, 4, 8, 102.07 W
+2026/10/27 10:32:31.774, 8704 MiB, 54 %, 42, 2670 MHz, 4, 8, 102.92 W
+2026/10/27 10:32:32.775, 8704 MiB, 60 %, 42, 2670 MHz, 4, 8, 102.10 W
+2026/10/27 10:32:33.775, 8704 MiB, 59 %, 42, 2670 MHz, 4, 8, 98.18 W
+2026/10/27 10:32:34.775, 8704 MiB, 65 %, 42, 2670 MHz, 4, 8, 104.44 W
+2026/10/27 10:32:35.775, 8704 MiB, 55 %, 42, 2670 MHz, 4, 8, 102.55 W
+2026/10/27 10:32:36.775, 8704 MiB, 71 %, 42, 2670 MHz, 4, 8, 102.01 W
+2026/10/27 10:32:37.776, 8704 MiB, 49 %, 42, 2670 MHz, 4, 8, 99.19 W
+2026/10/27 10:32:38.776, 8704 MiB, 67 %, 42, 2670 MHz, 4, 8, 101.12 W
+2026/10/27 10:32:39.776, 8704 MiB, 64 %, 42, 2670 MHz, 4, 8, 103.76 W
+2026/10/27 10:32:40.776, 1 MiB, 0 %, 41, 2670 MHz, 4, 8, 80.48 W
+
+===== n2-lat-smi.csv (sha256 6c32482fea74f8588571a69ad8985e2084e9ad944f714b5f9c37220371c06c68 of the whole file, not kept): excerpt, the header and the last 32 samples of nvidia-smi, every 1 s, the decode being the last seconds of the run
+timestamp, memory.used [MiB], utilization.gpu [%], temperature.gpu, clocks.current.sm [MHz], pcie.link.gen.current, pcie.link.width.current, power.draw [W]
+2026/10/27 10:33:50.090, 1476 MiB, 0 %, 35, 2565 MHz, 4, 8, 2.50 W
+2026/10/27 10:33:51.091, 5116 MiB, 0 %, 36, 2565 MHz, 4, 8, 42.67 W
+2026/10/27 10:33:52.091, 8700 MiB, 0 %, 36, 2565 MHz, 4, 8, 42.89 W
+2026/10/27 10:33:53.091, 8700 MiB, 0 %, 36, 2565 MHz, 4, 8, 42.38 W
+2026/10/27 10:33:54.091, 8700 MiB, 0 %, 36, 525 MHz, 2, 8, 34.01 W
+2026/10/27 10:33:55.092, 8700 MiB, 0 %, 35, 330 MHz, 1, 8, 22.13 W
+2026/10/27 10:33:56.092, 8700 MiB, 0 %, 35, 210 MHz, 1, 8, 4.02 W
+2026/10/27 10:33:57.093, 8700 MiB, 0 %, 35, 210 MHz, 1, 8, 2.73 W
+2026/10/27 10:33:58.093, 8714 MiB, 83 %, 35, 345 MHz, 1, 8, 3.41 W
+2026/10/27 10:33:59.093, 8714 MiB, 80 %, 35, 735 MHz, 2, 8, 7.23 W
+2026/10/27 10:34:00.093, 8714 MiB, 57 %, 38, 2670 MHz, 4, 8, 70.80 W
+2026/10/27 10:34:01.093, 8714 MiB, 48 %, 38, 2670 MHz, 4, 8, 96.12 W
+2026/10/27 10:34:02.094, 8714 MiB, 48 %, 39, 2670 MHz, 4, 8, 92.84 W
+2026/10/27 10:34:03.094, 8714 MiB, 55 %, 39, 2670 MHz, 4, 8, 97.88 W
+2026/10/27 10:34:04.094, 8714 MiB, 57 %, 39, 2670 MHz, 4, 8, 98.95 W
+2026/10/27 10:34:05.094, 8714 MiB, 59 %, 39, 2670 MHz, 4, 8, 95.51 W
+2026/10/27 10:34:06.094, 8714 MiB, 50 %, 39, 2670 MHz, 4, 8, 96.62 W
+2026/10/27 10:34:07.095, 8714 MiB, 50 %, 40, 2670 MHz, 4, 8, 91.70 W
+2026/10/27 10:34:08.095, 8714 MiB, 48 %, 40, 2670 MHz, 4, 8, 92.11 W
+2026/10/27 10:34:09.095, 8714 MiB, 61 %, 40, 2670 MHz, 4, 8, 97.19 W
+2026/10/27 10:34:10.095, 8714 MiB, 46 %, 40, 2670 MHz, 4, 8, 97.74 W
+2026/10/27 10:34:11.096, 8714 MiB, 56 %, 40, 2670 MHz, 4, 8, 98.11 W
+2026/10/27 10:34:12.096, 8714 MiB, 47 %, 40, 2670 MHz, 4, 8, 98.50 W
+2026/10/27 10:34:13.096, 8714 MiB, 56 %, 40, 2670 MHz, 4, 8, 99.62 W
+2026/10/27 10:34:14.096, 8714 MiB, 61 %, 40, 2670 MHz, 4, 8, 96.44 W
+2026/10/27 10:34:15.097, 8714 MiB, 62 %, 40, 2670 MHz, 4, 8, 101.79 W
+2026/10/27 10:34:16.097, 8714 MiB, 58 %, 40, 2670 MHz, 4, 8, 101.22 W
+2026/10/27 10:34:17.097, 8714 MiB, 45 %, 40, 2670 MHz, 4, 8, 96.13 W
+2026/10/27 10:34:18.097, 8714 MiB, 55 %, 40, 2670 MHz, 4, 8, 100.04 W
+2026/10/27 10:34:19.097, 8714 MiB, 56 %, 40, 2670 MHz, 4, 8, 97.80 W
+2026/10/27 10:34:20.098, 8714 MiB, 62 %, 41, 2670 MHz, 4, 8, 101.19 W
+2026/10/27 10:34:21.098, 1 MiB, 58 %, 40, 2670 MHz, 4, 8, 99.43 W
+
+===== n3-lat-smi.csv (sha256 d30250385ffe0f011119688eec049c4d883bced2c1a850882b1aa910a8a53180 of the whole file, not kept): excerpt, the header and the last 32 samples of nvidia-smi, every 1 s, the decode being the last seconds of the run
+timestamp, memory.used [MiB], utilization.gpu [%], temperature.gpu, clocks.current.sm [MHz], pcie.link.gen.current, pcie.link.width.current, power.draw [W]
+2026/10/27 10:35:28.565, 1 MiB, 0 %, 35, 210 MHz, 1, 8, 2.54 W
+2026/10/27 10:35:29.565, 1 MiB, 0 %, 35, 210 MHz, 1, 8, 2.57 W
+2026/10/27 10:35:30.565, 2281 MiB, 1 %, 35, 2565 MHz, 4, 8, 7.91 W
+2026/10/27 10:35:31.565, 5372 MiB, 0 %, 36, 2565 MHz, 4, 8, 45.23 W
+2026/10/27 10:35:32.566, 8700 MiB, 0 %, 36, 2565 MHz, 4, 8, 43.06 W
+2026/10/27 10:35:33.566, 8700 MiB, 0 %, 36, 2565 MHz, 4, 8, 42.56 W
+2026/10/27 10:35:34.566, 8700 MiB, 0 %, 36, 2565 MHz, 2, 8, 42.26 W
+2026/10/27 10:35:35.566, 8700 MiB, 0 %, 35, 375 MHz, 2, 8, 18.98 W
+2026/10/27 10:35:36.567, 8714 MiB, 0 %, 35, 210 MHz, 1, 8, 4.76 W
+2026/10/27 10:35:37.567, 8714 MiB, 42 %, 35, 525 MHz, 1, 8, 5.41 W
+2026/10/27 10:35:38.568, 8714 MiB, 50 %, 36, 2670 MHz, 4, 8, 23.12 W
+2026/10/27 10:35:39.568, 8714 MiB, 60 %, 38, 2670 MHz, 4, 8, 93.63 W
+2026/10/27 10:35:40.568, 8714 MiB, 54 %, 39, 2670 MHz, 4, 8, 93.61 W
+2026/10/27 10:35:41.568, 8714 MiB, 53 %, 39, 2670 MHz, 4, 8, 94.28 W
+2026/10/27 10:35:42.568, 8714 MiB, 55 %, 39, 2670 MHz, 4, 8, 98.50 W
+2026/10/27 10:35:43.569, 8714 MiB, 63 %, 39, 2670 MHz, 4, 8, 98.68 W
+2026/10/27 10:35:44.569, 8714 MiB, 56 %, 39, 2670 MHz, 4, 8, 98.86 W
+2026/10/27 10:35:45.569, 8714 MiB, 58 %, 39, 2670 MHz, 4, 8, 96.50 W
+2026/10/27 10:35:46.569, 8714 MiB, 38 %, 40, 2670 MHz, 4, 8, 95.50 W
+2026/10/27 10:35:47.570, 8714 MiB, 58 %, 40, 2670 MHz, 4, 8, 97.40 W
+2026/10/27 10:35:48.570, 8714 MiB, 64 %, 40, 2670 MHz, 4, 8, 101.24 W
+2026/10/27 10:35:49.570, 8714 MiB, 54 %, 40, 2670 MHz, 4, 8, 99.02 W
+2026/10/27 10:35:50.570, 8714 MiB, 51 %, 40, 2670 MHz, 4, 8, 101.13 W
+2026/10/27 10:35:51.570, 8714 MiB, 60 %, 40, 2670 MHz, 4, 8, 99.39 W
+2026/10/27 10:35:52.571, 8714 MiB, 49 %, 40, 2670 MHz, 4, 8, 95.91 W
+2026/10/27 10:35:53.571, 8714 MiB, 51 %, 41, 2670 MHz, 4, 8, 99.73 W
+2026/10/27 10:35:54.571, 8714 MiB, 66 %, 41, 2670 MHz, 4, 8, 104.12 W
+2026/10/27 10:35:55.571, 8714 MiB, 55 %, 41, 2670 MHz, 4, 8, 101.77 W
+2026/10/27 10:35:56.572, 8714 MiB, 63 %, 41, 2670 MHz, 4, 8, 102.21 W
+2026/10/27 10:35:57.572, 8714 MiB, 49 %, 41, 2670 MHz, 4, 8, 99.53 W
+2026/10/27 10:35:58.572, 8714 MiB, 60 %, 41, 2670 MHz, 4, 8, 104.77 W
+2026/10/27 10:35:59.572, 1 MiB, 29 %, 40, 2670 MHz, 4, 8, 94.37 W
+
+===== n4-dev2-smi.csv (sha256 8389f24a3a2bc9f7c5c63cb9251bdf54c79f479861f26b6b0812b92c91cc903e of the whole file, not kept): excerpt, the header and the last 32 samples of nvidia-smi, every 1 s, the decode being the last seconds of the run
+timestamp, memory.used [MiB], utilization.gpu [%], temperature.gpu, clocks.current.sm [MHz], pcie.link.gen.current, pcie.link.width.current, power.draw [W]
+2026/10/27 10:38:33.189, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 61.79 W
+2026/10/27 10:38:34.193, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 62.12 W
+2026/10/27 10:38:35.196, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 61.97 W
+2026/10/27 10:38:36.201, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 61.68 W
+2026/10/27 10:38:37.204, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 61.76 W
+2026/10/27 10:38:38.208, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 61.67 W
+2026/10/27 10:38:39.211, 8700 MiB, 100 %, 40, 2670 MHz, 4, 8, 61.67 W
+2026/10/27 10:38:40.215, 8700 MiB, 100 %, 40, 2670 MHz, 4, 8, 62.00 W
+2026/10/27 10:38:41.219, 8708 MiB, 100 %, 41, 2670 MHz, 4, 8, 61.35 W
+2026/10/27 10:38:42.220, 8708 MiB, 56 %, 41, 2670 MHz, 4, 8, 68.99 W
+2026/10/27 10:38:43.220, 8708 MiB, 58 %, 42, 2670 MHz, 4, 8, 97.73 W
+2026/10/27 10:38:44.220, 8708 MiB, 56 %, 42, 2670 MHz, 4, 8, 96.68 W
+2026/10/27 10:38:45.220, 8708 MiB, 60 %, 42, 2670 MHz, 4, 8, 96.92 W
+2026/10/27 10:38:46.220, 8708 MiB, 56 %, 42, 2670 MHz, 4, 8, 99.31 W
+2026/10/27 10:38:47.221, 8708 MiB, 42 %, 42, 2670 MHz, 4, 8, 97.80 W
+2026/10/27 10:38:48.221, 8708 MiB, 48 %, 42, 2670 MHz, 4, 8, 97.15 W
+2026/10/27 10:38:49.221, 8704 MiB, 49 %, 42, 2670 MHz, 4, 8, 95.43 W
+2026/10/27 10:38:50.221, 8704 MiB, 51 %, 42, 2670 MHz, 4, 8, 95.25 W
+2026/10/27 10:38:51.222, 8704 MiB, 52 %, 42, 2670 MHz, 4, 8, 95.58 W
+2026/10/27 10:38:52.222, 8704 MiB, 50 %, 42, 2670 MHz, 4, 8, 100.14 W
+2026/10/27 10:38:53.222, 8704 MiB, 59 %, 43, 2670 MHz, 4, 8, 98.81 W
+2026/10/27 10:38:54.222, 8704 MiB, 49 %, 42, 2670 MHz, 4, 8, 101.68 W
+2026/10/27 10:38:55.222, 8704 MiB, 59 %, 43, 2670 MHz, 4, 8, 100.06 W
+2026/10/27 10:38:56.223, 8704 MiB, 46 %, 42, 2670 MHz, 4, 8, 100.42 W
+2026/10/27 10:38:57.223, 8704 MiB, 64 %, 43, 2670 MHz, 4, 8, 101.76 W
+2026/10/27 10:38:58.223, 8704 MiB, 61 %, 43, 2670 MHz, 4, 8, 105.01 W
+2026/10/27 10:38:59.223, 8704 MiB, 63 %, 43, 2670 MHz, 4, 8, 103.24 W
+2026/10/27 10:39:00.224, 8704 MiB, 52 %, 43, 2670 MHz, 4, 8, 102.78 W
+2026/10/27 10:39:01.224, 8704 MiB, 59 %, 43, 2670 MHz, 4, 8, 97.99 W
+2026/10/27 10:39:02.224, 8704 MiB, 62 %, 43, 2670 MHz, 4, 8, 101.18 W
+2026/10/27 10:39:03.224, 8704 MiB, 57 %, 43, 2670 MHz, 4, 8, 103.50 W
+2026/10/27 10:39:04.225, 1 MiB, 0 %, 41, 2670 MHz, 4, 8, 66.25 W
+
+===== n5-dev2-smi.csv (sha256 0867a61439242f2514d4541a73469f522401b4e0460b35bc050ba197c0f06b19 of the whole file, not kept): excerpt, the header and the last 32 samples of nvidia-smi, every 1 s, the decode being the last seconds of the run
+timestamp, memory.used [MiB], utilization.gpu [%], temperature.gpu, clocks.current.sm [MHz], pcie.link.gen.current, pcie.link.width.current, power.draw [W]
+2026/10/27 10:41:37.580, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 60.91 W
+2026/10/27 10:41:38.581, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 61.14 W
+2026/10/27 10:41:39.585, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 61.52 W
+2026/10/27 10:41:40.589, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 61.18 W
+2026/10/27 10:41:41.593, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 60.74 W
+2026/10/27 10:41:42.597, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 60.95 W
+2026/10/27 10:41:43.600, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 61.17 W
+2026/10/27 10:41:44.604, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 61.37 W
+2026/10/27 10:41:45.608, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 61.52 W
+2026/10/27 10:41:46.611, 8700 MiB, 100 %, 40, 2670 MHz, 4, 8, 61.27 W
+2026/10/27 10:41:47.616, 8708 MiB, 100 %, 41, 2670 MHz, 4, 8, 64.21 W
+2026/10/27 10:41:48.616, 8708 MiB, 53 %, 42, 2670 MHz, 4, 8, 71.94 W
+2026/10/27 10:41:49.616, 8708 MiB, 55 %, 42, 2670 MHz, 4, 8, 98.07 W
+2026/10/27 10:41:50.616, 8708 MiB, 50 %, 42, 2670 MHz, 4, 8, 94.79 W
+2026/10/27 10:41:51.616, 8708 MiB, 61 %, 42, 2670 MHz, 4, 8, 102.77 W
+2026/10/27 10:41:52.617, 8708 MiB, 62 %, 42, 2670 MHz, 4, 8, 102.65 W
+2026/10/27 10:41:53.617, 8708 MiB, 59 %, 42, 2670 MHz, 4, 8, 100.63 W
+2026/10/27 10:41:54.617, 8704 MiB, 58 %, 42, 2670 MHz, 4, 8, 101.50 W
+2026/10/27 10:41:55.617, 8704 MiB, 45 %, 42, 2670 MHz, 4, 8, 95.61 W
+2026/10/27 10:41:56.618, 8704 MiB, 58 %, 43, 2670 MHz, 4, 8, 97.69 W
+2026/10/27 10:41:57.618, 8704 MiB, 60 %, 43, 2670 MHz, 4, 8, 102.45 W
+2026/10/27 10:41:58.618, 8704 MiB, 60 %, 43, 2670 MHz, 4, 8, 100.92 W
+2026/10/27 10:41:59.618, 8704 MiB, 52 %, 43, 2670 MHz, 4, 8, 104.01 W
+2026/10/27 10:42:00.618, 8704 MiB, 60 %, 43, 2670 MHz, 4, 8, 102.56 W
+2026/10/27 10:42:01.619, 8704 MiB, 45 %, 42, 2670 MHz, 4, 8, 100.51 W
+2026/10/27 10:42:02.619, 8704 MiB, 56 %, 43, 2670 MHz, 4, 8, 104.10 W
+2026/10/27 10:42:03.619, 8704 MiB, 67 %, 43, 2670 MHz, 4, 8, 105.60 W
+2026/10/27 10:42:04.619, 8704 MiB, 56 %, 43, 2670 MHz, 4, 8, 103.12 W
+2026/10/27 10:42:05.620, 8704 MiB, 64 %, 43, 2670 MHz, 4, 8, 104.87 W
+2026/10/27 10:42:06.620, 8704 MiB, 51 %, 43, 2670 MHz, 4, 8, 101.92 W
+2026/10/27 10:42:07.620, 8704 MiB, 53 %, 43, 2670 MHz, 4, 8, 105.42 W
+2026/10/27 10:42:08.620, 1 MiB, 25 %, 42, 2670 MHz, 4, 8, 94.36 W
+
+===== n6-lat-smi.csv (sha256 fb3c433195ed3441f6bb70db982c2b692525d056c88a327f84c6dc05739001c9 of the whole file, not kept): excerpt, the header and the last 32 samples of nvidia-smi, every 1 s, the decode being the last seconds of the run
+timestamp, memory.used [MiB], utilization.gpu [%], temperature.gpu, clocks.current.sm [MHz], pcie.link.gen.current, pcie.link.width.current, power.draw [W]
+2026/10/27 10:43:17.023, 1 MiB, 0 %, 33, 210 MHz, 1, 8, 2.50 W
+2026/10/27 10:43:18.024, 2281 MiB, 3 %, 34, 2565 MHz, 4, 8, 8.22 W
+2026/10/27 10:43:19.024, 5372 MiB, 0 %, 34, 2565 MHz, 4, 8, 43.74 W
+2026/10/27 10:43:20.024, 8700 MiB, 0 %, 35, 2565 MHz, 4, 8, 42.42 W
+2026/10/27 10:43:21.024, 8700 MiB, 0 %, 35, 2565 MHz, 4, 8, 42.08 W
+2026/10/27 10:43:22.025, 8700 MiB, 0 %, 34, 435 MHz, 2, 8, 30.24 W
+2026/10/27 10:43:23.025, 8700 MiB, 0 %, 33, 360 MHz, 1, 8, 26.01 W
+2026/10/27 10:43:24.025, 8700 MiB, 0 %, 33, 210 MHz, 1, 8, 4.95 W
+2026/10/27 10:43:25.025, 8714 MiB, 0 %, 33, 210 MHz, 1, 8, 4.81 W
+2026/10/27 10:43:26.026, 8714 MiB, 5 %, 34, 2565 MHz, 4, 8, 14.75 W
+2026/10/27 10:43:27.026, 8714 MiB, 55 %, 36, 2670 MHz, 4, 8, 80.17 W
+2026/10/27 10:43:28.026, 8714 MiB, 55 %, 36, 2670 MHz, 4, 8, 93.55 W
+2026/10/27 10:43:29.026, 8714 MiB, 50 %, 37, 2670 MHz, 4, 8, 91.94 W
+2026/10/27 10:43:30.027, 8714 MiB, 58 %, 37, 2670 MHz, 4, 8, 97.26 W
+2026/10/27 10:43:31.027, 8714 MiB, 58 %, 37, 2670 MHz, 4, 8, 97.24 W
+2026/10/27 10:43:32.027, 8714 MiB, 62 %, 37, 2670 MHz, 4, 8, 95.41 W
+2026/10/27 10:43:33.027, 8714 MiB, 49 %, 37, 2670 MHz, 4, 8, 95.61 W
+2026/10/27 10:43:34.027, 8714 MiB, 54 %, 37, 2670 MHz, 4, 8, 90.23 W
+2026/10/27 10:43:35.028, 8714 MiB, 55 %, 37, 2670 MHz, 4, 8, 90.66 W
+2026/10/27 10:43:36.028, 8714 MiB, 59 %, 37, 2670 MHz, 4, 8, 95.72 W
+2026/10/27 10:43:37.028, 8714 MiB, 41 %, 37, 2670 MHz, 4, 8, 94.04 W
+2026/10/27 10:43:38.028, 8714 MiB, 54 %, 37, 2670 MHz, 4, 8, 95.95 W
+2026/10/27 10:43:39.029, 8714 MiB, 56 %, 37, 2670 MHz, 4, 8, 95.75 W
+2026/10/27 10:43:40.029, 8714 MiB, 52 %, 37, 2670 MHz, 4, 8, 96.66 W
+2026/10/27 10:43:41.029, 8714 MiB, 65 %, 37, 2670 MHz, 4, 8, 93.02 W
+2026/10/27 10:43:42.029, 8714 MiB, 61 %, 38, 2670 MHz, 4, 8, 99.06 W
+2026/10/27 10:43:43.029, 8714 MiB, 52 %, 37, 2670 MHz, 4, 8, 99.07 W
+2026/10/27 10:43:44.030, 8714 MiB, 53 %, 38, 2670 MHz, 4, 8, 94.10 W
+2026/10/27 10:43:45.030, 8714 MiB, 36 %, 37, 2670 MHz, 4, 8, 96.85 W
+2026/10/27 10:43:46.030, 8714 MiB, 45 %, 38, 2670 MHz, 4, 8, 94.65 W
+2026/10/27 10:43:47.030, 8714 MiB, 54 %, 38, 2670 MHz, 4, 8, 98.53 W
+2026/10/27 10:43:48.031, 1 MiB, 100 %, 37, 2670 MHz, 4, 8, 93.75 W
+
+===== n7-lat-smi.csv (sha256 1b97910893bdb0ecbc237a7efdd40cbc7771344047fc5ec94c04643e5afe80db of the whole file, not kept): excerpt, the header and the last 32 samples of nvidia-smi, every 1 s, the decode being the last seconds of the run
+timestamp, memory.used [MiB], utilization.gpu [%], temperature.gpu, clocks.current.sm [MHz], pcie.link.gen.current, pcie.link.width.current, power.draw [W]
+2026/10/27 10:45:01.621, 8700 MiB, 0 %, 35, 2565 MHz, 2, 8, 41.97 W
+2026/10/27 10:45:02.621, 8700 MiB, 0 %, 34, 345 MHz, 2, 8, 18.81 W
+2026/10/27 10:45:03.621, 8700 MiB, 0 %, 33, 240 MHz, 1, 8, 8.71 W
+2026/10/27 10:45:04.622, 8700 MiB, 0 %, 33, 210 MHz, 1, 8, 2.51 W
+2026/10/27 10:45:05.623, 8700 MiB, 0 %, 33, 210 MHz, 1, 8, 2.50 W
+2026/10/27 10:45:06.623, 8700 MiB, 0 %, 33, 210 MHz, 1, 8, 2.49 W
+2026/10/27 10:45:07.623, 8700 MiB, 0 %, 33, 210 MHz, 1, 8, 2.50 W
+2026/10/27 10:45:08.624, 8700 MiB, 0 %, 33, 210 MHz, 1, 8, 2.50 W
+2026/10/27 10:45:09.624, 8714 MiB, 0 %, 33, 210 MHz, 1, 8, 2.49 W
+2026/10/27 10:45:10.624, 8714 MiB, 5 %, 34, 2565 MHz, 4, 8, 19.44 W
+2026/10/27 10:45:11.625, 8714 MiB, 52 %, 37, 2670 MHz, 4, 8, 73.53 W
+2026/10/27 10:45:12.625, 8714 MiB, 51 %, 36, 2670 MHz, 4, 8, 93.59 W
+2026/10/27 10:45:13.625, 8714 MiB, 52 %, 37, 2670 MHz, 4, 8, 90.32 W
+2026/10/27 10:45:14.626, 8714 MiB, 55 %, 37, 2670 MHz, 4, 8, 96.10 W
+2026/10/27 10:45:15.626, 8714 MiB, 55 %, 38, 2670 MHz, 4, 8, 96.43 W
+2026/10/27 10:45:16.626, 8714 MiB, 58 %, 38, 2670 MHz, 4, 8, 94.34 W
+2026/10/27 10:45:17.626, 8714 MiB, 52 %, 38, 2670 MHz, 4, 8, 95.35 W
+2026/10/27 10:45:18.626, 8714 MiB, 57 %, 38, 2670 MHz, 4, 8, 91.71 W
+2026/10/27 10:45:19.627, 8714 MiB, 52 %, 38, 2670 MHz, 4, 8, 93.32 W
+2026/10/27 10:45:20.627, 8714 MiB, 53 %, 38, 2670 MHz, 4, 8, 95.83 W
+2026/10/27 10:45:21.627, 8714 MiB, 65 %, 39, 2670 MHz, 4, 8, 97.22 W
+2026/10/27 10:45:22.627, 8714 MiB, 63 %, 39, 2670 MHz, 4, 8, 96.59 W
+2026/10/27 10:45:23.628, 8714 MiB, 55 %, 39, 2670 MHz, 4, 8, 97.20 W
+2026/10/27 10:45:24.628, 8714 MiB, 50 %, 39, 2670 MHz, 4, 8, 97.37 W
+2026/10/27 10:45:25.628, 8714 MiB, 47 %, 39, 2670 MHz, 4, 8, 93.03 W
+2026/10/27 10:45:26.628, 8714 MiB, 50 %, 39, 2670 MHz, 4, 8, 97.91 W
+2026/10/27 10:45:27.629, 8714 MiB, 58 %, 39, 2670 MHz, 4, 8, 100.26 W
+2026/10/27 10:45:28.629, 8714 MiB, 53 %, 39, 2670 MHz, 4, 8, 96.45 W
+2026/10/27 10:45:29.629, 8714 MiB, 53 %, 39, 2670 MHz, 4, 8, 98.93 W
+2026/10/27 10:45:30.629, 8714 MiB, 54 %, 40, 2670 MHz, 4, 8, 96.34 W
+2026/10/27 10:45:31.629, 8714 MiB, 66 %, 40, 2670 MHz, 4, 8, 98.67 W
+2026/10/27 10:45:32.630, 1 MiB, 54 %, 40, 2670 MHz, 4, 8, 98.94 W
+
+===== n8-dev2-smi.csv (sha256 19fa37f15884f9a183e862ffd2557655ac0f9be341a1592fc8a8ab37151a8b26 of the whole file, not kept): excerpt, the header and the last 32 samples of nvidia-smi, every 1 s, the decode being the last seconds of the run
+timestamp, memory.used [MiB], utilization.gpu [%], temperature.gpu, clocks.current.sm [MHz], pcie.link.gen.current, pcie.link.width.current, power.draw [W]
+2026/10/27 10:48:07.518, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 60.94 W
+2026/10/27 10:48:08.522, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 60.81 W
+2026/10/27 10:48:09.526, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 60.73 W
+2026/10/27 10:48:10.530, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 60.92 W
+2026/10/27 10:48:11.533, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 61.44 W
+2026/10/27 10:48:12.537, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 61.22 W
+2026/10/27 10:48:13.542, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 61.50 W
+2026/10/27 10:48:14.544, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 61.37 W
+2026/10/27 10:48:15.544, 8956 MiB, 100 %, 40, 2670 MHz, 4, 8, 61.38 W
+2026/10/27 10:48:16.548, 8708 MiB, 4 %, 40, 2670 MHz, 4, 8, 62.89 W
+2026/10/27 10:48:17.548, 8708 MiB, 53 %, 42, 2670 MHz, 4, 8, 83.01 W
+2026/10/27 10:48:18.548, 8708 MiB, 46 %, 41, 2670 MHz, 4, 8, 97.24 W
+2026/10/27 10:48:19.548, 8708 MiB, 51 %, 42, 2670 MHz, 4, 8, 93.90 W
+2026/10/27 10:48:20.548, 8708 MiB, 54 %, 42, 2670 MHz, 4, 8, 99.44 W
+2026/10/27 10:48:21.549, 8708 MiB, 57 %, 42, 2670 MHz, 4, 8, 99.51 W
+2026/10/27 10:48:22.549, 8708 MiB, 60 %, 42, 2670 MHz, 4, 8, 98.33 W
+2026/10/27 10:48:23.549, 8704 MiB, 57 %, 42, 2670 MHz, 4, 8, 99.64 W
+2026/10/27 10:48:24.549, 8704 MiB, 56 %, 42, 2670 MHz, 4, 8, 94.79 W
+2026/10/27 10:48:25.550, 8704 MiB, 54 %, 42, 2670 MHz, 4, 8, 95.29 W
+2026/10/27 10:48:26.550, 8704 MiB, 65 %, 43, 2670 MHz, 4, 8, 101.20 W
+2026/10/27 10:48:27.550, 8704 MiB, 49 %, 42, 2670 MHz, 4, 8, 102.32 W
+2026/10/27 10:48:28.550, 8704 MiB, 63 %, 43, 2670 MHz, 4, 8, 101.37 W
+2026/10/27 10:48:29.550, 8704 MiB, 57 %, 43, 2670 MHz, 4, 8, 101.32 W
+2026/10/27 10:48:30.551, 8704 MiB, 58 %, 43, 2670 MHz, 4, 8, 102.44 W
+2026/10/27 10:48:31.551, 8704 MiB, 64 %, 43, 2670 MHz, 4, 8, 97.64 W
+2026/10/27 10:48:32.551, 8704 MiB, 60 %, 43, 2670 MHz, 4, 8, 103.38 W
+2026/10/27 10:48:33.551, 8704 MiB, 51 %, 43, 2670 MHz, 4, 8, 103.28 W
+2026/10/27 10:48:34.552, 8704 MiB, 53 %, 43, 2670 MHz, 4, 8, 98.11 W
+2026/10/27 10:48:35.552, 8704 MiB, 44 %, 42, 2670 MHz, 4, 8, 100.13 W
+2026/10/27 10:48:36.552, 8704 MiB, 43 %, 43, 2670 MHz, 4, 8, 97.91 W
+2026/10/27 10:48:37.552, 8704 MiB, 56 %, 43, 2670 MHz, 4, 8, 102.10 W
+2026/10/27 10:48:38.553, 1 MiB, 74 %, 42, 2670 MHz, 4, 8, 98.89 W
+
+===== sommario-dec.txt (sha256 0bebef1eebc8d68cc95f8b791d447663b8b51df1ecd8269bee97a5cb73a23d98): excerpt, the lines matching /^\[[0-9:]+\] (d0|n[0-9])/. the chain: the steps of the runs above with their time and exit code
+[10:29:37] d0-ref rc=0 0 s
+[10:32:41] n1-dev2 rc=0 124 s
+[10:34:21] n2-lat rc=0 40 s
+[10:35:59] n3-lat rc=0 38 s
+[10:39:04] n4-dev2 rc=0 125 s
+[10:42:08] n5-dev2 rc=0 124 s
+[10:43:48] n6-lat rc=0 40 s
+[10:45:33] n7-lat rc=0 45 s
+[10:48:39] n8-dev2 rc=0 126 s
+

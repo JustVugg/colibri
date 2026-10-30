@@ -3343,6 +3343,14 @@ launch VBIOS the backend warned "only 246 of 8192 MB VRAM is host-visible", plac
 matrix, every tier upload failed and the chain stopped at its first matrix. RADV places
 them in system RAM instead, where every access crosses PCIe.
 
+**A refused block.** The pool that is refused a block remembers its size (`VkWPool.refused`) and does not
+ask for one that large again until a block of its own goes back to the driver, its budget is set again
+or it is destroyed; what does not fit stays on the CPU, as for any full card. Before, every tensor
+that did not fit asked again with the pool's lock held across `vkAllocateMemory`. On a Colab L4
+(NVIDIA's 580 driver), where the host-visible device-local type gives 9.75 GiB of 22.5, a refusal took
+about 0.6 s, and the start-up of Qwen3.6's expert tier (10,240 experts, more than half of them without
+room) had not finished after 5 minutes.
+
 **Memory types by use.** The backend chooses the memory type of a buffer by what the buffer
 is used for: only the GPU uses it, the CPU writes it, or the CPU reads it back. A discrete
 GPU and Lavapipe get device-local memory where the use allows it, and a host-cached type

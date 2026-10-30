@@ -1,0 +1,135 @@
+{
+  "version": 1,
+  "hypothesis": "On an RTX 4090 (driver 595.91.07, 24 GB) the host-visible device-local Vulkan type gives 8 GiB, so on the mapped path the pool is refused a block for each of the 6448 experts that find no room, and asks again each time with its mutex held. Remembering the size of the refused block should cut the tier's warm start (92.0 s) with the same experts on the card, the same nll range and the same speed.",
+  "commit": "c1c06ac6fcb32157e4da130fd96775a32a757052",
+  "model": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64 (Qwen3.6 35B-A3B, routed experts int4-g64)",
+  "command": "make -C c -j6 qwen36 VK=1; cp <history> <model>/.coli_usage; env PPL=1 COLI_VULKAN=1 COLI_NO_OMP_TUNE=1 OMP_NUM_THREADS=4 SNAP=<model> N_NEW=32 /usr/bin/time -v ./c/qwen36 256 4 ref.json",
+  "prompt_hash": "366b41db5e1801932a1b7d82ffdd47967b7f730ed8bc83556be6a3c818dd63ae",
+  "hardware": {
+    "cpu": "AMD Ryzen 5 7600 (12 threads visible, container CPU quota 5.76) + NVIDIA GeForce RTX 4090 (24564 MiB, BAR1 32768 MiB, PCIe gen 4 x8)",
+    "ram": "187 GiB on the host, container limit 127.5 GiB",
+    "storage": "the container's disk (/workspace)",
+    "os": "Ubuntu 24.04 container on Vast.ai, NVIDIA driver 595.91.07, Vulkan through an ICD json on libEGL_nvidia.so.0 (userspace of the same driver version from NVIDIA's runfile)"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64 (Qwen3.6 35B-A3B, routed experts int4-g64)",
+      "input": "ref.json: 64 prompt tokens, then 256 teacher-forced (PPL=1; the 256 are full_ids minus prompt_ids, N_NEW does not set them)",
+      "new_tokens": 256,
+      "history": "the session warm-up's, put back before each run (sha256 a0961fd74ed32995ab22641dee7e827c0e29e8698adb6c44f696b59de6d6fbc4)",
+      "OMP_NUM_THREADS": 4,
+      "path": "mapped (the default of origin/dev on this card)",
+      "engine_build": "origin/dev c1c06ac6"
+    },
+    "samples": {
+      "tok_s": [
+        40.75,
+        42.34,
+        40.49,
+        43.28
+      ],
+      "decode_s": [
+        6.3,
+        6.0,
+        6.3,
+        5.9
+      ],
+      "nll": [
+        3.056221,
+        3.052103,
+        3.057082,
+        3.052919
+      ],
+      "warm_start_s": [
+        91.9,
+        91.5,
+        92.0,
+        93.0
+      ],
+      "experts_on_the_card": [
+        3792,
+        3792,
+        3792,
+        3792
+      ],
+      "experts_refused": [
+        6448,
+        6448,
+        6448,
+        6448
+      ]
+    },
+    "median_tok_s": 41.545,
+    "quality": {
+      "method": "teacher-forced nll over the same 256 tokens: 3.052103 to 3.057082 in the 4 runs of this side; the two sides are compared as ranges (the mapped path's nll moves from run to run on origin/dev itself)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/vulkan-pool-refused-block-2026-10-27/runs-4090.txt",
+      "sha256": "e7c25bccf4689863f7b7be3fb5354cb01bf41e1d9bb0fa733a397fb5133c84c1"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64 (Qwen3.6 35B-A3B, routed experts int4-g64)",
+      "input": "ref.json: 64 prompt tokens, then 256 teacher-forced (PPL=1; the 256 are full_ids minus prompt_ids, N_NEW does not set them)",
+      "new_tokens": 256,
+      "history": "the session warm-up's, put back before each run (sha256 a0961fd74ed32995ab22641dee7e827c0e29e8698adb6c44f696b59de6d6fbc4)",
+      "OMP_NUM_THREADS": 4,
+      "path": "mapped (the default of origin/dev on this card)",
+      "engine_build": "origin/dev c1c06ac6 + lat.patch (sha256 fd852f317a40e990eea47a072a995beb41ba301139245fe7ad724cd2707f687c); its engine code is the committed diff's but for two comments (checks.txt has lat.patch itself)"
+    },
+    "samples": {
+      "tok_s": [
+        37.61,
+        37.25,
+        41.46,
+        39.65
+      ],
+      "decode_s": [
+        6.8,
+        6.9,
+        6.2,
+        6.5
+      ],
+      "nll": [
+        3.055612,
+        3.055319,
+        3.055193,
+        3.055184
+      ],
+      "warm_start_s": [
+        7.0,
+        6.1,
+        16.5,
+        13.1
+      ],
+      "experts_on_the_card": [
+        3792,
+        3792,
+        3792,
+        3792
+      ],
+      "experts_refused": [
+        6448,
+        6448,
+        6448,
+        6448
+      ]
+    },
+    "median_tok_s": 38.63,
+    "quality": {
+      "method": "teacher-forced nll over the same 256 tokens: 3.055184 to 3.055612 in the 4 runs of this side; the two sides are compared as ranges (the mapped path's nll moves from run to run on origin/dev itself)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/vulkan-pool-refused-block-2026-10-27/runs-4090.txt",
+      "sha256": "e7c25bccf4689863f7b7be3fb5354cb01bf41e1d9bb0fa733a397fb5133c84c1"
+    }
+  },
+  "outcome": "regression"
+}

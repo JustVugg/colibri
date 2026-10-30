@@ -1683,6 +1683,7 @@ struct VkWPool {
     float prio;              /* eviction priority of its blocks; < 0 = G.prio at creation */
     int counted;             /* 1 = its tensors are coli_vk_mem_info's (the resident weights) */
     size_t bytes, tensors;   /* payload of its live tensors (rows + scales) */
+    uint64_t refused;        /* the least block the driver refused (0: none yet), see pool_suballoc */
 };
 #define VK_WBLOCK ((size_t)256 << 20)
 static VkWPool g_wpool  = {.p = {.block_bytes = VK_WBLOCK}, .mx = PTHREAD_MUTEX_INITIALIZER, .dev = 0, .prio = -1.f, .counted = 1};
@@ -1921,7 +1922,9 @@ static void up_zero(int dev, VkDeviceMemory mem, uint64_t cap) {
 /* The primary device's pools are addressable when bufferDeviceAddress is on (the
  * expert batch's grouped GEMM reads expert weights through an address table). */
 static int pool_bda(const VkWPool *P) { return P->dev == 0 && G.has_bda; }
-/* Block memory for a pool (lock held). */
+/* Block memory for a pool (lock held). A block the driver refuses (vkAllocateMemory or
+ * vkMapMemory) marks its size in P->refused, see pool_suballoc; a failure of calloc or of
+ * COLI_VK_STAGED_FAULT=block, a test's one-off failure, does not. */
 static VkBlk *pool_new_block(VkWPool *P, uint64_t cap) {
     VkBlk *bk = calloc(1, sizeof(*bk));
     if (!bk) return NULL;
@@ -1941,7 +1944,7 @@ static VkBlk *pool_new_block(VkWPool *P, uint64_t cap) {
     if (vkAllocateMemory(dev, &ai, NULL, &bk->mem) != VK_SUCCESS ||
         (!staged && vkMapMemory(dev, bk->mem, 0, cap, 0, (void **)&bk->base) != VK_SUCCESS)) {
         if (bk->mem) vkFreeMemory(dev, bk->mem, NULL);
-        free(bk); return NULL;
+        free(bk); P->refused = cap; return NULL;   /* the driver's no: not asked again (pool_suballoc) */
     }
     if (staged) up_zero(P->dev, bk->mem, cap);
     return bk;
@@ -1949,12 +1952,16 @@ static VkBlk *pool_new_block(VkWPool *P, uint64_t cap) {
 static void pool_release_block(VkWPool *P, int k) {   /* lock held, block empty */
     VkBlk *bk = P->p.b[k].user;
     VkDevice dev = pool_device(P);
+    P->refused = 0;   /* memory goes back to the driver */
     if (bk) { if (bk->base) vkUnmapMemory(dev, bk->mem); vkFreeMemory(dev, bk->mem, NULL); free(bk); }
     vka_pool_drop_block(&P->p, k);
 }
 
 /* A buffer of `bytes` bound inside one of the pool's blocks; *ptr is its mapping.
- * 0 when the device has no room or the pool is at its limit. */
+ * 0 when the device has no room or the pool is at its limit. A block the driver refuses is
+ * not asked for again, nor a larger one (P->refused), until a block goes back to the driver,
+ * the limit is set again or the pool is destroyed: the lock is held across vkAllocateMemory,
+ * and on an L4 a refusal took 0.6 s, once per tensor. */
 static int pool_suballoc(VkWPool *P, size_t bytes, VkBuffer *buf, void **ptr, VkaRange *r) {
     VkDevice dev = pool_device(P);
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -1978,7 +1985,8 @@ static int pool_suballoc(VkWPool *P, size_t bytes, VkBuffer *buf, void **ptr, Vk
         if (P->p.limit && P->p.total + cap > P->p.limit && P->p.limit > P->p.total &&
             P->p.limit - P->p.total >= req.size + align)
             cap = (P->p.limit - P->p.total) & ~(uint64_t)4095;
-        VkBlk *bk = vka_pool_can_grow(&P->p, cap) && cap >= req.size ? pool_new_block(P, cap) : NULL;
+        int ask = vka_pool_can_grow(&P->p, cap) && cap >= req.size && !(P->refused && cap >= P->refused);
+        VkBlk *bk = ask ? pool_new_block(P, cap) : NULL;
         if (bk) {
             if (vka_pool_add_block(&P->p, cap, bk) < 0) {
                 if (bk->base) vkUnmapMemory(dev, bk->mem);
@@ -2016,7 +2024,7 @@ static void pool_destroy(VkWPool *P) {
     uint64_t bb = P->p.block_bytes, lim = P->p.limit;
     vka_pool_destroy(&P->p);
     P->p.block_bytes = bb ? bb : VK_WBLOCK; P->p.limit = lim;
-    P->bytes = P->tensors = 0;
+    P->bytes = P->tensors = 0; P->refused = 0;
     pthread_mutex_unlock(&P->mx);
 }
 
@@ -3981,7 +3989,7 @@ void coli_vk_pool_stats(int which, ColiVkPoolStats *st) {
 }
 static void tier_pool_limit(VkWPool *P, size_t bytes) {
     pthread_mutex_lock(&P->mx);
-    P->p.limit = bytes;
+    P->p.limit = bytes; P->refused = 0;
     /* blocks no larger than the budget, so a small budget is not one refused block; the host
      * pool's are system RAM, which COLI_VK_DEVICE_CAP_MB does not shrink (under the cap its
      * 2 MiB blocks held one expert each: Flint's 18.5 GB took 24.5 GiB) */
@@ -7292,6 +7300,77 @@ static int run_tier_pool(void) {
     return bad;
 }
 
+/* An empty pool whose driver refuses every block, as a full card does (the device memory books
+ * refuse a block past COLI_VK_DEVICE_CAP_MB): n tensors ask for room. Gives how many got it and,
+ * in *asked, how many times the driver was asked; the room is back when it returns. */
+static int pool_refused_round(int n, unsigned long long *asked) {
+    int D = g_xb[0].D, I = g_xb[0].I, got = 0;
+    void *w, *sc;
+    coli_vk_tier_pool_limit(0);
+    pool_destroy(&g_tpool);
+    uint64_t cap = g_mem.cap[0];
+    g_mem.cap[0] = g_mem.used[0] + 1;   /* no room for any block */
+    unsigned long long r0 = g_mem.refused[0];
+    for (int k = 0; k < n; k++) {
+        ColiVkTensor *t = tensor_alloc(&g_tpool, 4, D, I, 64, &w, &sc);
+        if (t) { got++; coli_vk_tensor_free(t); }
+    }
+    *asked = g_mem.refused[0] - r0;
+    g_mem.cap[0] = cap;
+    return got;
+}
+static int pool_tensor_fits(void) {   /* the tensor is freed again */
+    void *w, *sc;
+    ColiVkTensor *t = tensor_alloc(&g_tpool, 4, g_xb[0].D, g_xb[0].I, 64, &w, &sc);
+    if (t) coli_vk_tensor_free(t);
+    return t != NULL;
+}
+
+/* A block the driver refuses is asked for once, not once per tensor. The mark goes when the pool's
+ * limit is set again or the pool is destroyed: the room is back before either and the pool holds
+ * no block to release, so the same block size gets through only if that reset clears the mark. */
+static int run_pool_refused(void) {
+    enum { N = 8 };
+    unsigned long long asked, asked2;
+    int got = pool_refused_round(N, &asked);
+    int held = pool_tensor_fits();   /* the room is back, the mark holds */
+    coli_vk_tier_pool_limit(0);
+    int by_limit = pool_tensor_fits();
+    pool_refused_round(N, &asked2);
+    pool_destroy(&g_tpool);
+    int by_destroy = pool_tensor_fits();
+    pool_destroy(&g_tpool);
+    printf("tier pool: %d tensors with no room for a block: the driver was asked %llu time(s); with the room back a tensor fits %s while the mark holds, %s after a new limit, %s after the pool is destroyed\n",
+           N, asked, held ? "yes" : "no", by_limit ? "yes" : "no", by_destroy ? "yes" : "no");
+    if (got || asked != 1 || asked2 != 1 || held || !by_limit || !by_destroy) {
+        printf("  ^ a refused block was asked for again, or its mark was not cleared by a new limit or by the pool being destroyed\n");
+        return 1;
+    }
+    return 0;
+}
+
+/* A block that goes back to the driver clears the mark: room for two blocks, a refusal for the
+ * third, every tensor freed (the second empty block is released); the pool takes as many again. */
+static int run_pool_released(void) {
+    int bad = 0, D = g_xb[0].D, I = g_xb[0].I;
+    coli_vk_tier_pool_limit(0);
+    pool_destroy(&g_tpool);
+    uint64_t cap = g_mem.cap[0];
+    g_tpool.p.block_bytes = 1 << 20;
+    g_mem.cap[0] = g_mem.used[0] + 2 * g_tpool.p.block_bytes;
+    ColiVkTensor *t[256]; void *w, *sc; int n = 0, m = 0;
+    while (n < 256 && (t[n] = tensor_alloc(&g_tpool, 4, D, I, 64, &w, &sc))) n++;
+    for (int k = 0; k < n; k++) coli_vk_tensor_free(t[k]);
+    while (m < n && (t[m] = tensor_alloc(&g_tpool, 4, D, I, 64, &w, &sc))) m++;
+    for (int k = 0; k < m; k++) coli_vk_tensor_free(t[k]);
+    g_mem.cap[0] = cap;
+    coli_vk_tier_pool_limit(0);   /* the default block size again */
+    pool_destroy(&g_tpool);
+    printf("tier pool: two blocks hold %d tensors; after both are freed the pool takes %d again\n", n, m);
+    if (n < 2 || m != n) { printf("  ^ a block that went back to the driver did not clear the refused mark\n"); bad = 1; }
+    return bad;
+}
+
 /* COLI_VK_ACT_SWIGLU_V4 bit for bit. Experts whose sums are exact in f32 (f32 weights,
  * one input that is a power of two, the others zero) and whose gate is at least 24, so
  * that its sigmoid is exactly 1 on both sides: the device and the reference below then
@@ -7419,6 +7498,8 @@ static int run_xbatch_all(void) {
     printf("xbatch: tier queue %s, GEMM route from %d rows, timestamps %s\n",
            G.tq_shared ? "shared with the main queue" : "of its own", g_xb[0].gemm_rows, g_xb[0].has_ts ? "on" : "off");
     bad |= run_tier_pool();   /* first: the tier pool is still empty, its budget is exact */
+    bad |= run_pool_refused();
+    bad |= run_pool_released();
     static const int fm[9] = {1, 2, 4, 5, 7, 10, 11, 12, 13};
     for (int f = 0; f < 9; f++) {
         int gs = fm[f] == 7 ? 32 : 64;
