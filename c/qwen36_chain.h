@@ -1623,7 +1623,18 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
                 m->snap_rows);
         return 0;
     }
-    if (!mirror_ok || !q36c_scratch(ch, m, rows) || (lf && !q36c_res(&ch->lfd, (size_t)L * 3 * D, VKC_DOWN)) ||
+    /* the scratch for a power of two of rows (from 64, at most a chunk's or the split's
+     * window): sized to the rows exactly, a prompt longer than any before regrew it (LFM3-VL-2B
+     * on Vulkan: 73-76 ms a prompt of 484 tokens, 65 one of 483 after) */
+    int srows = rows;
+    if (srows > ch->rows) {
+        int top = CH;
+        if (ch->ks.on && top > ch->ks.chunk) top = ch->ks.chunk;
+        srows = 64; while (srows < rows) srows *= 2;
+        if (srows > top) srows = top;
+        if (srows < rows) srows = rows;
+    }
+    if (!mirror_ok || !q36c_scratch(ch, m, srows) || (lf && !q36c_res(&ch->lfd, (size_t)L * 3 * D, VKC_DOWN)) ||
         (want_x && !q36c_res(&ch->xd, (size_t)rows * D, VKC_DOWN)) ||
         (nlogits > 1 && (!q36c_res(&ch->fin, (size_t)nlogits * D, VKC_DEV) ||
                          !q36c_res(&ch->outd, (size_t)nlogits * c->vocab, VKC_DOWN)))) {

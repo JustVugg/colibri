@@ -6695,8 +6695,11 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
                     ids[s], c->vocab - 1);
             exit(1);
         }
-        q36_embed_row(m, ids[s], pos_base + s, x + (int64_t)s*D);
     }
+    /* a prompt's rows over the team: each decoded from the file's blocks on its own (LFM3's
+     * Q6_K table, 2048 a row: on one thread the prompt waited for them before the device) */
+    #pragma omp parallel for schedule(static) if (S >= 16)
+    for (int s = 0; s < S; s++) q36_embed_row(m, ids[s], pos_base + s, x + (int64_t)s*D);
     tier_rebuild_evicted(m);
     int chain_n = 0;   /* layers the chain ran (a partial chain: the CPU runs the rest) */
     float *chain_logit = NULL;   /* the Vulkan or the CUDA chain ran the final norm and lm_head */
@@ -7262,6 +7265,20 @@ static void ensure_kv(Model *m){
      * per head -- one flat memcpy would land every head but the first at the
      * wrong offset, and that reads as a plausible answer from another
      * conversation rather than as a crash. */
+    /* Growth by half again at least, from 1024 rows, in steps of 256, up to the context the
+     * engine holds: a chat resends a longer transcript every turn, and growing to exactly the
+     * new length paid the reallocation, the rows' copy and (a GPU chain) its KV mirrors' again
+     * on every turn (LFM3-VL-2B on CUDA: a prompt of a new length 48 ms instead of 35). The
+     * RAM plan reserves the whole context's cache already. */
+    {
+        const int top = qwen36_max_ctx();
+        int want = m->max_t;
+        if (m->K && m->kv_cap + m->kv_cap / 2 > want) want = m->kv_cap + m->kv_cap / 2;
+        if (want < 1024) want = 1024;
+        want = (want + 255) / 256 * 256;
+        if (want > top) want = top;
+        if (want > m->max_t) m->max_t = want;
+    }
     void **oldK = m->K, **oldV = m->V;
     int old_stride = m->kv_cap, keep = m->K ? m->kvp.len : 0;
     if (keep > old_stride) keep = old_stride;

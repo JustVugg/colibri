@@ -1805,7 +1805,12 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         mirror_ok = q36cc_mirror(ch, m);
         if (!mirror_ok && q36cc_stage_drop(ch)) mirror_ok = q36cc_mirror(ch, m);   /* the staging's memory to the mirrors */
     }
-    if (!mirror_ok || !q36cc_scratch(ch, m, rows) || (lf && !cc_reserve(&ch->lfd, (size_t)L * 3 * D * sizeof(float), CC_DOWN)) ||
+    /* the scratch for a power of two of rows (from 64, at most a chunk's): sized to the rows
+     * exactly, every prompt longer than any before regrew some thirty device and page-locked
+     * buffers (LFM3-VL-2B on CUDA: 48 ms such a prompt of 484 tokens, 34 one of 483 after) */
+    int srows = rows;
+    if (srows > ch->rows) { srows = 64; while (srows < rows) srows *= 2; if (srows > CH) srows = CH; if (srows < rows) srows = rows; }
+    if (!mirror_ok || !q36cc_scratch(ch, m, srows) || (lf && !cc_reserve(&ch->lfd, (size_t)L * 3 * D * sizeof(float), CC_DOWN)) ||
         (want_x && !cc_reserve(&ch->xd, (size_t)rows * D * sizeof(float), CC_DOWN)) ||
         (nlogits > 1 && (!cc_reserve(&ch->fin, (size_t)nlogits * D * sizeof(float), CC_DEV) ||
                          !cc_reserve(&ch->out, (size_t)nlogits * c->vocab * sizeof(float), CC_DEV) ||

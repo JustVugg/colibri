@@ -86,12 +86,18 @@ static void case_growth(void) {
 
     m.max_t = 512;  ensure_kv(&m);
     void *first = m.K[3];
+    const int cap = m.kv_cap;
+    ck(cap >= 512 && cap % 256 == 0, "the first request's cache holds it, with room for a longer next turn");
     m.max_t = 256;  ensure_kv(&m);
-    ck(m.K[3] == first && m.kv_cap == 512,
+    ck(m.K[3] == first && m.kv_cap == cap,
        "a shorter request leaves the cache alone (never shrinks)");
+    m.max_t = cap;  ensure_kv(&m);
+    ck(m.K[3] == first && m.kv_cap == cap, "a request up to the capacity reallocates nothing");
+    m.max_t = cap + 1; ensure_kv(&m);
+    ck(m.kv_cap >= cap + cap / 2, "growth is by half again at least, not to the request (a chat grows every turn)");
 
     m.max_t = 2048; ensure_kv(&m);
-    ck(m.kv_cap == 2048, "a longer request grows the cache");
+    ck(m.kv_cap >= 2048, "a longer request grows the cache");
     int64_t last = (int64_t)m.c.kv_heads * m.max_t * m.c.k_head_dim - 1;
     ((unsigned char *)m.K[3])[(size_t)(last + 1) * q36_kv_es() - 1] = 1;   /* the re-allocation must be sized to the NEW max_t */
     ck(1, "the grown cache is writable to its last element");
