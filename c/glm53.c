@@ -4438,6 +4438,17 @@ static float g_temp = 0.0f, g_topp = 1.0f;
 
 /* Confronto per qsort. Una funzione annidata sarebbe piu' comoda ma e'
  * un'estensione GCC, e questo file deve compilare anche con MSVC. */
+#include "glm53_exact_nucleus.h"
+/* Opt-in until target-platform full-model qualification is available.
+ * The fallback retains the original qsort input, including its tie behavior. */
+static int g_glm53_nucleus = -1;
+static int glm53_nucleus_enabled(void) {
+    if (g_glm53_nucleus < 0) {
+        const char *value = getenv("GLM53_NUCLEUS");
+        g_glm53_nucleus = value && !strcmp(value, "1");
+    }
+    return g_glm53_nucleus;
+}
 static const float *g_sort_key = NULL;
 static int compare_by_probability(const void *a, const void *b) {
     const int x = *(const int *)a, y = *(const int *)b;
@@ -4473,12 +4484,17 @@ static int sample_token(const float *logits, int vocab) {
      * top_p. Con vocab 154880 l'ordinamento pieno costa, ma succede una volta
      * per token e il token costa incomparabilmente di piu'. */
     g_sort_key = probability;
-    qsort(order, (size_t)vocab, sizeof(int), compare_by_probability);
     double cumulative = 0.0;
     int keep = vocab;
-    for (int i = 0; i < vocab; i++) {
-        cumulative += probability[order[i]];
-        if (cumulative >= g_topp) { keep = i + 1; break; }
+    if (glm53_nucleus_enabled()) {
+        g53_nucleus_order(probability, vocab, g_topp, order,
+                          &keep, &cumulative, compare_by_probability);
+    } else {
+        qsort(order, (size_t)vocab, sizeof(int), compare_by_probability);
+        for (int i = 0; i < vocab; i++) {
+            cumulative += probability[order[i]];
+            if (cumulative >= g_topp) { keep = i + 1; break; }
+        }
     }
     double pick = ((double)rand() / ((double)RAND_MAX + 1.0)) * cumulative;
     double walk = 0.0;

@@ -2617,6 +2617,12 @@ tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 tests/test_glm53_live_prefix$(EXE): tests/test_glm53_live_prefix.c glm53.c
 	$(CC) $(NOCUDA_CFLAGS) -UCOLI_METAL -UCOLI_VULKAN $< -o $@ $(NOCUDA_LDFLAGS)
 
+# Exact sampler order, cumulative mass, selected token and RNG-use regression.
+tests/glm53_nucleus_reference.o: tests/glm53_nucleus_reference.c
+	$(CC) $(NOCUDA_CFLAGS) -c $< -o $@
+tests/test_glm53_nucleus$(EXE): tests/test_glm53_nucleus.c tests/glm53_nucleus_reference.o $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< tests/glm53_nucleus_reference.o $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_compat_direct$(EXE): tests/test_compat_direct.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
