@@ -3040,6 +3040,9 @@ tests/test_kimi_cuda_expert$(EXE): tests/test_kimi_cuda_expert.c kimi_k3.c $(VK_
 # CUDA_DLL=1 with coli_cuda.dll beside the binary); not part of test-c.
 tests/bench_k3_cuda_dense$(EXE): tests/bench_k3_cuda_dense.c quant.h backend_cuda.h $(CUDA_OBJ)
 	$(CC) $(CFLAGS) tests/bench_k3_cuda_dense.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
+# coli_cuda_matmul_tiled against coli_cuda_matmul, byte for byte (a CUDA build and a device)
+tests/test_cuda_matmul_tiled$(EXE): tests/test_cuda_matmul_tiled.c backend_cuda.h $(CUDA_OBJ)
+	$(CC) $(CFLAGS) tests/test_cuda_matmul_tiled.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
 # ---------------------------------------------------------------------------
 # Generated header prerequisites (#1741)

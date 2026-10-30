@@ -556,8 +556,11 @@ static void w_matmul(float *y, const float *x, const W *w, int S){
     if(w->cuda&&g_k3_cuda_dense&&!k3_omp_in_par()){
         const void *src=w->fmt==1?(const void*)w->q8 : w->fmt==4?(const void*)w->q4 : (const void*)w->f;
         double t0=now_s();
-        if(coli_cuda_matmul((ColiCudaTensor**)&((W*)w)->cuda,y,x,src,w->s,k3_cuda_fmt(w),S,w->I,w->O,
-                            g_k3_cuda_dev,w->fmt==4?w->gs:0)){
+        /* several rows (a prompt step): the tiled kernel, the same bytes about 4x sooner */
+        int (*mm)(ColiCudaTensor**,float*,const float*,const void*,const float*,int,int,int,int,int,int)
+            = S>1?coli_cuda_matmul_tiled:coli_cuda_matmul;
+        if(mm((ColiCudaTensor**)&((W*)w)->cuda,y,x,src,w->s,k3_cuda_fmt(w),S,w->I,w->O,
+              g_k3_cuda_dev,w->fmt==4?w->gs:0)){
             g_k3_cuda_calls++; g_k3_cuda_ms+=(now_s()-t0)*1e3;
             return;
         }

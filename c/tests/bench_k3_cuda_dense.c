@@ -48,6 +48,10 @@ int main(int argc, char **argv){
             double t0=now_s();
             for(int i=0;i<reps;i++) coli_cuda_matmul(&t,y,x,wq,sc,fmt,S,I,O,dev,fmt==4?gs:0);
             double g=(now_s()-t0)/reps;
+            coli_cuda_matmul_tiled(&t,y,x,wq,sc,fmt,S,I,O,dev,fmt==4?gs:0);
+            t0=now_s();
+            for(int i=0;i<reps;i++) coli_cuda_matmul_tiled(&t,y,x,wq,sc,fmt,S,I,O,dev,fmt==4?gs:0);
+            double gt=(now_s()-t0)/reps;
             double c=0;
             if(S<=32){
                 t0=now_s();
@@ -58,8 +62,8 @@ int main(int argc, char **argv){
                 }
                 c=(now_s()-t0)/cr;
             }
-            printf("%-36s S=%4d: GPU %8.3f ms (%6.1f GB/s of weights)  CPU %8.3f ms\n",sh[k].name,S,g*1e3,
-                   (wb+sn*4)/g/1e9,c*1e3);
+            printf("%-36s S=%4d: GPU %8.3f ms, tiled %8.3f ms  CPU %8.3f ms\n",sh[k].name,S,g*1e3,
+                   gt*1e3,c*1e3);
             free(x); free(y);
         }
         coli_cuda_tensor_free(t);

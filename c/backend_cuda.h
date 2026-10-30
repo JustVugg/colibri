@@ -212,6 +212,17 @@ COLI_CUDA_DLLEXPORT int coli_cuda_matmul(ColiCudaTensor **tensor,
                      const void *weights, const float *scales,
                      int fmt, int S, int I, int O, int device, int gs);
 
+/* coli_cuda_matmul's result, byte for byte, for int8 rows (fmt=1) and grouped int4
+ * (fmt=4) in tiles of 8 outputs by 8 rows: each decoded weight serves 8 rows instead
+ * of being read again for every row, the sums and their tree exactly quant_matmul's,
+ * so a row's bytes do not depend on the rows called with it (tests/test_cuda_matmul_tiled.c).
+ * Other formats go to coli_cuda_matmul. Kimi K3's prompt steps; an older DLL without
+ * it: the loader calls coli_cuda_matmul instead. */
+COLI_CUDA_DLLEXPORT int coli_cuda_matmul_tiled(ColiCudaTensor **tensor,
+                     float *y, const float *x,
+                     const void *weights, const float *scales,
+                     int fmt, int S, int I, int O, int device, int gs);
+
 /* Fused expert pipeline: y = down(silu(gate(x)) * up(x)).  All three tensors
  * must already be resident on one device.  Activations cross PCIe once in
  * each direction instead of once per matrix. */

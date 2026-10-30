@@ -339,7 +339,8 @@ matrices that are not routed experts on the card with `K3_CUDA_DENSE=1`: the hea
 the gated MLA's `o_proj` and gate, KDA's projections, then smaller ones, in the int8
 rows and int4 groups `K3_BITS` made, until `K3_CUDA_DENSE_GB` (20) or the card's free
 memory less `K3_CUDA_RESERVE_GB` (2) is used. `w_matmul` runs a placed matrix there
-for every row count. Every token reads all of these matrices (about 35 GiB at the
+for every row count: one row through `coli_cuda_matmul`, a prompt step's rows through
+`coli_cuda_matmul_tiled` (the same bytes, about 4x sooner at 32 or 512 rows). Every token reads all of these matrices (about 35 GiB at the
 default bits), so on a machine whose RAM bandwidth is shared with the experts' reads
 this takes the largest part of the dense work off it: on an RTX 4090 a 12288 x 7168
 int4 projection takes 0.19 ms a decode row against 0.90 ms on 16 Zen 4 cores, the

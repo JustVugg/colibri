@@ -1786,6 +1786,70 @@ static int f8_warp_mode(void) {
 /* One launch site for the dense matvec so fmt=8 honors the same toggle as
  * f8_group_launch: mode 0 runs the original quant_matmul branch (fully
  * original behavior), anything else the warp/shared-LUT rework. */
+/* quant_matmul's arithmetic for int8 rows (fmt 1) and grouped int4 (fmt 4), TO outputs
+ * by TS rows a block: the same bytes as quant_matmul for every (row, output), so a row's
+ * result never depends on the rows called with it. Thread t sums the columns i = t,
+ * t + 256, ... exactly as quant_matmul's thread t does (the same product, then the same
+ * fused add), each decoded weight serving TS rows and each input TO outputs, and every
+ * (row, output) pair then goes through quant_matmul's tree over the 256 partial sums.
+ * quant_matmul reads every weight once per row; this reads it once per TS rows. */
+#define QMT_TO 8
+#define QMT_TS 8
+__global__ static void __launch_bounds__(256) quant_matmul_tiled(float *y, const float *x,
+        const void *weights, const float *scales, int fmt, int S, int I, int O,
+        size_t rb, int gs, int ng) {
+    __shared__ float red[QMT_TS][256];
+    const int t = threadIdx.x, o0 = blockIdx.x * QMT_TO, s0 = blockIdx.y * QMT_TS;
+    const uint8_t *wb = static_cast<const uint8_t *>(weights);
+    float acc[QMT_TO][QMT_TS];
+#pragma unroll
+    for (int a = 0; a < QMT_TO; a++)
+#pragma unroll
+        for (int b = 0; b < QMT_TS; b++) acc[a][b] = 0.0f;
+    const int no = O - o0 < QMT_TO ? O - o0 : QMT_TO, ns = S - s0 < QMT_TS ? S - s0 : QMT_TS;
+    for (int i = t; i < I; i += 256) {
+        float xv[QMT_TS];
+#pragma unroll
+        for (int b = 0; b < QMT_TS; b++) xv[b] = b < ns ? x[(size_t)(s0 + b) * I + i] : 0.0f;
+        int g = 0;
+        if (fmt == 4) { g = i / gs; if (g >= ng) g = ng - 1; }
+#pragma unroll
+        for (int a = 0; a < QMT_TO; a++) {
+            if (a >= no) break;
+            const uint8_t *row = wb + (size_t)(o0 + a) * rb;
+            float w;
+            if (fmt == 4) {
+                uint8_t v = row[i >> 1];
+                int n = (i & 1) ? (v >> 4) : (v & 15);
+                w = static_cast<float>(n & 8 ? n - 16 : n);
+                float sc = scales[(size_t)(o0 + a) * ng + g];
+#pragma unroll
+                for (int b = 0; b < QMT_TS; b++) acc[a][b] = __fmaf_rn(__fmul_rn(xv[b], w), sc, acc[a][b]);
+            } else {
+                w = static_cast<float>(reinterpret_cast<const int8_t *>(row)[i]);
+#pragma unroll
+                for (int b = 0; b < QMT_TS; b++) acc[a][b] = __fmaf_rn(xv[b], w, acc[a][b]);
+            }
+        }
+    }
+    for (int a = 0; a < no; a++) {
+#pragma unroll
+        for (int b = 0; b < QMT_TS; b++) red[b][t] = acc[a][b];
+        __syncthreads();
+        for (int n = 128; n; n >>= 1) {
+            if (t < n)
+#pragma unroll
+                for (int b = 0; b < QMT_TS; b++) red[b][t] += red[b][t + n];
+            __syncthreads();
+        }
+        if (t < ns) {
+            int o = o0 + a;
+            y[(size_t)(s0 + t) * O + o] = fmt == 1 ? red[t][0] * scales[o] : red[t][0];
+        }
+        __syncthreads();
+    }
+}
+
 static void quant_matmul_launch(float *y, const float *x, const void *w,
         const float *sc, int fmt, int S, int I, int O, size_t rb, int gs, int ng) {
     dim3 grid((unsigned)O, (unsigned)S);
@@ -1817,6 +1881,34 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     if (!cuda_ok(cudaMemcpy(ctx->dx, x, xb, cudaMemcpyHostToDevice), "input upload")) return 0;
     quant_matmul_launch(ctx->dy, ctx->dx, t->weights, t->scales, fmt, S, I, O, rb, t->gs, t->ng);
     if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
+        !cuda_ok(cudaMemcpy(y, ctx->dy, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
+    return 1;
+}
+
+/* coli_cuda_matmul's result, byte for byte, for int8 rows and grouped int4 through
+ * quant_matmul_tiled (see backend_cuda.h); other formats go to coli_cuda_matmul. */
+extern "C" int coli_cuda_matmul_tiled(ColiCudaTensor **tensor,
+                                       float *y, const float *x,
+                                       const void *weights, const float *scales,
+                                       int fmt, int S, int I, int O, int device, int gs) {
+    if (fmt != 1 && fmt != 4)
+        return coli_cuda_matmul(tensor, y, x, weights, scales, fmt, S, I, O, device, gs);
+    if (fault_injected()) return 0;
+    if (fmt == 4 && gs <= 0) return 0;
+    if (S < 1) return 0;
+    if (gs > 0) { if (!coli_cuda_tensor_upload_g(tensor, weights, scales, fmt, I, O, device, gs)) return 0; }
+    else        { if (!coli_cuda_tensor_upload(tensor, weights, scales, fmt, I, O, device)) return 0; }
+    ColiCudaTensor *t = *tensor;
+    DeviceContext *ctx = find_ctx(t->device);
+    if (!select_ctx(ctx)) return 0;
+    size_t rb = row_bytes(fmt, I);
+    size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
+    if (!reserve(&ctx->dx, &ctx->dx_cap, xb) || !reserve(&ctx->dy, &ctx->dy_cap, yb)) return 0;
+    if (!cuda_ok(cudaMemcpy(ctx->dx, x, xb, cudaMemcpyHostToDevice), "input upload")) return 0;
+    dim3 grid((unsigned)((O + QMT_TO - 1) / QMT_TO), (unsigned)((S + QMT_TS - 1) / QMT_TS));
+    quant_matmul_tiled<<<grid, 256>>>(static_cast<float *>(ctx->dy), static_cast<const float *>(ctx->dx),
+                                      t->weights, t->scales, fmt, S, I, O, rb, t->gs, t->ng);
+    if (!cuda_ok(cudaGetLastError(), "tiled matmul launch") ||
         !cuda_ok(cudaMemcpy(y, ctx->dy, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
     return 1;
 }

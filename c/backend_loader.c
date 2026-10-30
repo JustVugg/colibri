@@ -191,6 +191,7 @@ static struct {
     fn_e8_set_grid     e8_set_grid;
     fn_fp8_set_lut     fp8_set_lut;
     fn_matmul          matmul;
+    fn_matmul          matmul_tiled;    /* optional: DLLs before it leave it NULL */
     fn_matmul_mxfp4    matmul_mxfp4;
     fn_expert_mxfp4    expert_mxfp4;
     fn_tensor_free     tensor_free;
@@ -1449,6 +1450,7 @@ static int coli_cuda_load(void){
     RESOLVE_OPT(e8_set_grid, fn_e8_set_grid)
     RESOLVE_OPT(fp8_set_lut, fn_fp8_set_lut)
     RESOLVE(matmul,         fn_matmul)
+    RESOLVE_OPT(matmul_tiled,   fn_matmul)   /* Kimi K3's prompt rows; an older DLL: the plain matmul */
     /* Kimi K3's MXFP4 expert matmul. Optional: a DLL built before it exports
      * nothing by this name, and the wrapper's 0 is the engine's own "fall back
      * to CPU" result, so an older DLL still serves GLM and Qwen3.6 (#1405). */
@@ -1687,6 +1689,15 @@ int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x,
                      int fmt, int S, int I, int O, int device, int gs){
     if(!g_cuda.available) return 0;
     return g_cuda.matmul(tensor, y, x, weights, scales, fmt, S, I, O, device, gs);
+}
+
+int coli_cuda_matmul_tiled(ColiCudaTensor **tensor, float *y, const float *x,
+                           const void *weights, const float *scales,
+                           int fmt, int S, int I, int O, int device, int gs){
+    if(!g_cuda.available) return 0;
+    if(!g_cuda.matmul_tiled)   /* a DLL from before it: the same numbers, the plain kernel */
+        return g_cuda.matmul(tensor, y, x, weights, scales, fmt, S, I, O, device, gs);
+    return g_cuda.matmul_tiled(tensor, y, x, weights, scales, fmt, S, I, O, device, gs);
 }
 
 int coli_cuda_matmul_mxfp4(float *y, const float *x, const unsigned char *q4,
