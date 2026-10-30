@@ -23,6 +23,9 @@
 //                                                                     and beta a column, a the residual)
 //  12 HEADGATE  y[i] = a[i] * sigmoid(b[b_off + i / D])               (LFM3's attention gate: one per
 //                                                                     head of D values)
+//  13 SSMAX     y[i] = a[i] * fma(e[e_off + h], c[c_off + r], e[e_off + C + h]), h = (i / D) % C, r = i / (D * C):
+//               Mistral-Large-4's SSMax, a head h of D values of row r times s[h] * log(pos + 1) + b[h]
+//               (c the rows' log(pos + 1), e the heads' s then b; the CPU's fma)
 //  11 F16       y[i] = a[i] clamped to +-65504 and rounded to the nearest float16, ties to even:
 //                 kv16.h's kv16_round_bits line for line (integer arithmetic), the IEEE rounding
 //                 the CPU's and CUDA's conversions do (a KV cache kept in float16)
@@ -103,5 +106,8 @@ void main() {
         y[p.y_off + i] = uintBitsToFloat(u);
     } else if (p.op == 12) {
         y[p.y_off + i] = a[p.a_off + i] * sig(b[p.b_off + i / p.D]);
+    } else if (p.op == 13) {
+        int hr = i / p.D, r = hr / p.C, h = hr - r * p.C;
+        y[p.y_off + i] = a[p.a_off + i] * fma(e[p.e_off + h], c[p.c_off + r], e[p.e_off + p.C + h]);
     }
 }
