@@ -1115,14 +1115,16 @@ static inline int q36_eh(const Cfg *c) { return c->ehid > 0 ? c->ehid : c->hidde
  * vk/vk_off: the Vulkan device copy (COLI_VULKAN=1) of whichever of q4, q or w
  * matmul_d reads, uploaded at the first matmul_d and kept; vk_off = the upload
  * failed once, this matrix stays on the CPU. Both stay zero without VK=1. */
-/* h: the matrix as f16 (COLI_DENSE_BITS=16), the only copy then. */
+/* h: the matrix as f16 (COLI_DENSE_BITS=16), the only copy then.
+ * wf16: a GGUF's F16 (1) or BF16 (30) matrix: w holds it in f32 for the CPU, and the GPUs
+ * get the file's 16-bit rows back from w (q36_wf16_rows, exact) as block format 100 + wf16. */
 /* vk_name, vk_tag, vk_quant: what load_tq read it with, to read it back from disk
  * (q36_dho_reload); vk_fmt, vk_gone: with the dense weights on the device only
  * (COLI_VK_DENSE_HOST), the device copy's format and 1 while no host copy is kept. */
 typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; float *sg; int ng;
                  void *vk; int vk_off; uint16_t *h;
                  char *vk_name; const char *vk_tag; int vk_quant, vk_fmt, vk_gone, vk_imported;
-                 uint8_t *gq; int gq_type; float gs;
+                 uint8_t *gq; int gq_type; float gs; int wf16;
                  int q8r16; } QW;   /* q8r16: q's rows interleaved by 16 (idot.h i8r16_*, q36_trunk_q8_interleave) */
 static void qw_free(QW *w) {
 #ifdef COLI_VULKAN
@@ -1941,6 +1943,7 @@ static void vk_q4_planar_to_fmt4(const QW *w, uint8_t *dst) {
             }
     }
 }
+static uint16_t *q36_wf16_rows(const QW *w);
 static unsigned g_vk_placed[4];   /* uploads by format: int8 rows, int4, f32, f16 */
 static int g_q36_vk_dev;          /* the device vk_qw_tensor uploads a new matrix to: 1 for the
                                    * chain's layers on COLI_VK_DEV2's (qwen36_chain.h) */
@@ -1956,7 +1959,10 @@ static int vk_qw_fmt(const QW *w, const void **wq, const float **sc) {
     if (w->q4) { *wq = w->q4; *sc = w->sg; return 4; }
     if (w->q) { *wq = w->q; *sc = w->sc; return 1; }
     if (w->h) { *wq = w->h; *sc = NULL; return 14; }
-    *wq = w->w; *sc = NULL;   /* fmt 10: no scales */
+    *wq = w->w; *sc = NULL;
+    /* a GGUF's F16 or BF16: the block format of its 16 bits (vk_qw_tensor rebuilds them from w),
+     * the block formats' GEMVs and tiled GEMMs; fmt 10 (f32, no scales) where the device lacks it */
+    if (w->wf16 && w->I % 32 == 0 && coli_vk_block_elems(100 + w->wf16)) return 100 + w->wf16;
     return 10;
 }
 static void q36_dho_reload(QW *w);
@@ -1977,12 +1983,14 @@ static ColiVkTensor *vk_qw_tensor(const QW *w) {
     int fmt = vk_qw_fmt(w, &wq, &sc), gs = fmt == 4 ? 64 : 0;
     if (!wq) return NULL;
     int ok;
-    if (w->gq) {   /* a GGUF's blocks for the dense chain (blockdec.glsl), as the file has them */
+    if (w->gq || fmt >= 100) {   /* a GGUF's blocks for the dense chain (blockdec.glsl), as the file has them */
         const int be = coli_vk_block_elems(fmt);
-        if (w->gs != 1.f || !be || I % be) { mw->vk_off = 1; return NULL; }   /* no device form, or a scale the shader lacks */
+        if ((w->gq && w->gs != 1.f) || !be || I % be) { mw->vk_off = 1; return NULL; }   /* no device form, or a scale the shader lacks */
         uint8_t *rows = NULL;
-        if (gq_r16_base(w->gq_type) >= 0 && !(rows = malloc((size_t)gq_row_bytes(fmt - 100, I) * O))) { mw->vk_off = 1; return NULL; }
-        if (rows) gq_r16_unpack(w->gq_type, rows, w->gq, O, I);
+        if (!w->gq) {   /* F16, BF16: their 16 bits again */
+            if (!(rows = (uint8_t *)q36_wf16_rows(w))) { mw->vk_off = 1; return NULL; }
+        } else if (gq_r16_base(w->gq_type) >= 0 && !(rows = malloc((size_t)gq_row_bytes(fmt - 100, I) * O))) { mw->vk_off = 1; return NULL; }
+        else if (rows) gq_r16_unpack(w->gq_type, rows, w->gq, O, I);
         const void *src = rows ? (const void *)rows : (const void *)w->gq;
         ok = g_q36_vk_dev ? coli_vk_tensor_ensure2(t, src, NULL, fmt, I, O, 0) : coli_vk_tensor_ensure(t, src, NULL, fmt, I, O, 0);
         free(rows);
@@ -2063,7 +2071,7 @@ static void vk_report(void) {
 }
 #endif
 /* f32 -> f16, round to nearest even: exact for a value that came from f16 (the
- * container), which is the only use (COLI_DENSE_BITS=16). */
+ * container, a GGUF's F16), which is the only use (COLI_DENSE_BITS=16, q36_wf16_rows). */
 static uint16_t f32_to_f16_bits(float f){
     uint32_t x; memcpy(&x, &f, 4);
     uint32_t sign = (x >> 16) & 0x8000u, mant = x & 0x7fffffu;
@@ -2081,6 +2089,20 @@ static uint16_t f32_to_f16_bits(float f){
     uint32_t v = ((uint32_t)exp << 10) | (mant >> 13), rest = mant & 0x1fffu;
     if (rest > 0x1000u || (rest == 0x1000u && (v & 1))) v++;
     return (uint16_t)(sign | v);
+}
+/* A GGUF's F16 or BF16 matrix for a GPU: its rows in the file's 16 bits again, from the f32
+ * copy the CPU reads (exact: every value came from them, rotary rows already in their order);
+ * malloc'd, NULL when out of memory. */
+static uint16_t *q36_wf16_rows(const QW *w) {
+    const int64_t n = (int64_t)w->I * w->O;
+    uint16_t *r = w->w ? malloc((size_t)n * 2) : NULL;
+    if (!r) return NULL;
+    #pragma omp parallel for schedule(static) if (n > (1 << 20))
+    for (int64_t k = 0; k < n; k++) {
+        uint32_t b; memcpy(&b, &w->w[k], 4);
+        r[k] = w->wf16 == GQ_F16 ? f32_to_f16_bits(w->w[k]) : (uint16_t)(b >> 16);
+    }
+    return r;
 }
 
 /* y[S,O] = x[S,I] @ W^T with W in f16 (COLI_DENSE_BITS=16). A thread converts
@@ -2244,6 +2266,10 @@ int coli_cuda_block_elems(int fmt);
 #endif
 static int qdw_gq_fmt(const QW *w) {
 #ifdef COLI_CUDA
+    if (g_gguf && !w->gq && w->wf16 && w->w) {   /* F16, BF16: blocks of 32 of their 16 bits (q36_wf16_rows) */
+        const int be = coli_cuda_block_elems(100 + w->wf16);
+        return be > 0 && w->I % be == 0 && w->I % 32 == 0 ? 100 + w->wf16 : 0;
+    }
     if (!g_gguf || !w->gq || w->gs != 1.f) return 0;
     const int r = gq_r16_base(w->gq_type), t = r >= 0 ? r : w->gq_type, be = coli_cuda_block_elems(100 + t);
     return be > 0 && w->I % be == 0 && w->I % 32 == 0 ? 100 + t : 0;
@@ -2259,6 +2285,7 @@ static size_t qdw_gq_bytes(const QW *w) {
  * *rows (free it after the upload); NULL when out of memory */
 static const void *qdw_gq_rows(const QW *w, int fmt, uint8_t **rows) {
     *rows = NULL;
+    if (!w->gq) return *rows = (uint8_t *)q36_wf16_rows(w);   /* F16, BF16 */
     if (gq_r16_base(w->gq_type) < 0) return w->gq;
     if (!(*rows = malloc((size_t)gq_row_bytes(fmt - 100, w->I) * w->O))) return NULL;
     gq_r16_unpack(w->gq_type, *rows, w->gq, w->O, w->I);
@@ -3133,6 +3160,7 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
         if (t->type == GQ_F32 || t->type == GQ_F16 || t->type == GQ_BF16) {
             out->w = load_t_n(m, name, (int64_t)I * O);
             if (rheads && out->w) q36_rope_unpermute((void *)out->w, (size_t)I * sizeof(float), rheads, O / rheads);
+            out->wf16 = t->type == GQ_F32 ? 0 : t->type;
             return;
         }
         if (!gq_blk_decoder(t->type)) { fprintf(stderr, "GGUF %s: type %s is not supported\n", t->name, gq_type_name(t->type)); exit(1); }

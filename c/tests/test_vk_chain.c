@@ -3072,6 +3072,9 @@ static void bd_fix(int t, uint8_t *b) {
     case GQ_Q2_K: F16AT(80); F16AT(82); break;
     case GQ_Q3_K: F16AT(108); break;
     case GQ_Q6_K: F16AT(208); break;
+    /* F16, BF16: a value of either sign, magnitudes 2^-9 .. 2^-1 (b is one value here) */
+    case GQ_F16: b[1] = (uint8_t)((rnd() & 0x80) | (0x18 + rnd() % 20)); break;
+    case GQ_BF16: { int e = 118 + (int)(rnd() % 8); b[1] = (uint8_t)((rnd() & 0x80) | (e >> 1)); b[0] = (uint8_t)(((e & 1) << 7) | (b[0] & 0x7f)); break; }
     case GQ_IQ1_M: {   /* d is the scales' four top nibbles: 0x24n0, n of 0..2 */
         int n1 = (int)(rnd() % 3);
         b[49] = (uint8_t)(b[49] & 0x0F); b[51] = (uint8_t)((b[51] & 0x0F) | (n1 << 4));
@@ -3407,8 +3410,10 @@ static void test_matmul_bd_i8(int t, int S, int I, int O) {
 }
 static void test_bd(void) {
     const int types[] = {GQ_Q8_0, GQ_Q4_K, GQ_Q5_K, GQ_Q6_K, GQ_IQ2_XXS, GQ_IQ4_NL, GQ_IQ3_S, GQ_IQ2_S, GQ_IQ4_XS,
-                         GQ_Q2_0, GQ_IQ2_XS, GQ_Q2_K, GQ_Q3_K, GQ_IQ3_XXS, GQ_IQ1_S, GQ_IQ1_M, GQ_Q4_0};
-    const int nstep = 16;   /* the step decoders' (bdstep.glsl), their integer form too; then a type of qmatmul_bd.comp's own */
+                         GQ_Q2_0, GQ_IQ2_XS, GQ_Q2_K, GQ_Q3_K, GQ_IQ3_XXS, GQ_IQ1_S, GQ_IQ1_M, GQ_Q4_0, GQ_F16, GQ_BF16};
+    /* the step decoders' (bdstep.glsl), their integer form too; then a type of qmatmul_bd.comp's own,
+     * and the 16-bit floats (bdstep.glsl's and blockdec.glsl's, no integer form) */
+    const int nstep = 16;
     for (size_t k = 0; k < sizeof types / sizeof *types; k++) {
         int t = types[k];
         test_matmul_bd(t, 1, 256, 70);      /* one block a row, short rows, lanes past the row */
