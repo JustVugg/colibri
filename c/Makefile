@@ -2594,6 +2594,10 @@ tests/test_router_nan$(EXE): tests/test_router_nan.c colibri.c $(VK_OBJ)
 tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# CPU-only state-policy regression; independent of model files and GPU flags.
+tests/test_glm53_live_prefix$(EXE): tests/test_glm53_live_prefix.c glm53.c
+	$(CC) $(NOCUDA_CFLAGS) -UCOLI_METAL -UCOLI_VULKAN $< -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_compat_direct$(EXE): tests/test_compat_direct.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
