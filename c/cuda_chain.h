@@ -57,6 +57,10 @@ typedef struct CcBuf CcBuf;
 
 /* chain_norm.comp */
 typedef struct { int nseg, D, per_row, x_off, x_row, x_seg, y_off, y_row, y_seg, w_off, w_mod, flags; float eps, post; } CcNorm;
+/* addnorm: per row of D, x += (flags & 1 ? norm(t) with the weights at wp_off : t), then y = norm(x) with
+ * the weights at w_off; RMSNorms with (1 + w) weights (CC_NORM_ADD1), cc_norm's arithmetic, so the same
+ * bits as the norm, the add and the norm apart (cc_addnorm_ready) */
+typedef struct { int rows, D, x_off, t_off, y_off, wp_off, w_off, flags; float eps; } CcAddNorm;
 #define CC_NORM_ADD1 1
 #define CC_NORM_NOW  2
 #define CC_NORM_L2   4
@@ -318,6 +322,7 @@ typedef struct ColiCudaChainOps {
      * type and shape (a prompt chunk's rows of a SwiGLU MLP); 1 done, -1 not taken (another type,
      * few rows: the caller's two matmuls and CC_EW_SWIGLU), 0 a failure */
     int  (*matmul_glu)(ColiCudaTensor *wg, ColiCudaTensor *wu, CcBuf *x, CcBuf *y, int S);
+    int  (*addnorm)(CcBuf *x, CcBuf *t, CcBuf *w, CcBuf *y, const CcAddNorm *p);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -455,6 +460,12 @@ static inline int cc_enc_rel(CcBuf *x, CcBuf *pt, CcBuf *y, const CcEncRel *p) {
 static inline int cc_lfm3_ready(void) {
     const ColiCudaChainOps *t = cc_ops();
     return t && t->size >= offsetof(ColiCudaChainOps, lfm3) + sizeof t->lfm3 && t->lfm3 && t->lfm3();
+}
+/* 1 done, -1 not in this backend (the caller's norm, add and norm), 0 a failure */
+static inline int cc_addnorm(CcBuf *x, CcBuf *t, CcBuf *w, CcBuf *y, const CcAddNorm *p) {
+    const ColiCudaChainOps *o = cc_ops();
+    if (!(o && o->size >= offsetof(ColiCudaChainOps, addnorm) + sizeof o->addnorm && o->addnorm)) return -1;
+    return o->addnorm(x, t, w, y, p);
 }
 static inline int cc_matmul_glu(ColiCudaTensor *wg, ColiCudaTensor *wu, CcBuf *x, CcBuf *y, int S) {
     const ColiCudaChainOps *t = cc_ops();

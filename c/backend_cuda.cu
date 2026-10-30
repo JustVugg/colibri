@@ -3672,20 +3672,25 @@ template<int BM, int BN> struct HcmTile {   /* 40, 64 and 80 KB of shared memory
 /* GLU: w the gate and wu the up projection, O their outputs; the block's weight rows alternate
  * eight of the gate's and the same eight of the up's, so a warp's n8 tiles j and j + 1 hold the
  * gate and the up of the same outputs, and y gets silu(gate) * up (cc_ew's CC_EW_SWIGLU). */
+/* hcm_dense_k's body: rows m0 .. m0 + M - 1 of xh (or xrows[0 .. M), A.ldx halves apart) against the
+ * weight rows from n0 (A.rw words a row), inputs kb0 .. + nk steps, into y's rows m0 .. (or yrows[]),
+ * A.ldy floats apart */
+struct HcmArgs {
+    float *y; int ldy; const int *yrows;
+    const __half *xh; int ldx; const int *xrows;
+    int m0, M, n0, kb0, nk;
+    const bd_u32 *w, *wu; int rw, O;
+};
 template<int T, int BM, int BN, bool GLU>
-__global__ static void __launch_bounds__(256, (HcmTile<BM, BN>::MINB)) hcm_dense_k(float *__restrict__ y, const __half *__restrict__ xh,
-                                                                             const bd_u32 *__restrict__ w, const bd_u32 *__restrict__ wu,
-                                                                             int rw, int S, int I, int O, int kc) {
-    COLI_PDL_WAIT();
+__device__ __forceinline__ void hcm_body(const HcmArgs &A) {
 #if HCM_BODY
     using TL = HcmTile<BM, BN>;
     constexpr int XS = TL::XS, XB = TL::XB, WB = TL::WB, NJ = TL::NJ, NW = TL::NW, NX = TL::NX, WN = TL::WN, WR = TL::WR;
     extern __shared__ __align__(128) unsigned char hcm_sm[];
     unsigned char *Wsm = hcm_sm + XS * XB;
     const unsigned xs0 = (unsigned)__cvta_generic_to_shared(hcm_sm), ws0 = xs0 + XS * XB;
-    const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN, M = S - m0 < BM ? S - m0 : BM;
-    const int kb0 = blockIdx.z * kc, nk = ((I - kb0 < kc ? I - kb0 : kc)) / HCM_BK;
-    y += (size_t)blockIdx.z * S * O;
+    const int m0 = A.m0, n0 = A.n0, M = A.M, kb0 = A.kb0, nk = A.nk, rw = A.rw, O = A.O;
+    const bd_u32 *__restrict__ w = A.w, *__restrict__ wu = A.wu;
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5, g = lane >> 2, tig = lane & 3, wr = warp % WR, wc = warp / WR;
     const int lr = t >> 1, lh = t & 1;   /* the thread's weights: outputs lr + 128 q, inputs 16 lh .. of a step */
     bool live_w[NW]; const bd_u32 *Wr[NW];
@@ -3704,7 +3709,8 @@ __global__ static void __launch_bounds__(256, (HcmTile<BM, BN>::MINB)) hcm_dense
     #pragma unroll
     for (int q = 0; q < NX; q++) {
         xl[q] = xr + 64 * q < M;
-        Xp[q] = xh + (size_t)(m0 + (xl[q] ? xr + 64 * q : 0)) * I + kb0 + xc * 8;
+        const int rr = xl[q] ? xr + 64 * q : 0;
+        Xp[q] = A.xh + (size_t)(A.xrows ? A.xrows[rr] : m0 + rr) * A.ldx + kb0 + xc * 8;
         xd[q] = hcm_swz(xr + 64 * q, xc);
     }
     #define HCM_LDX(st_, kb_) do { \
@@ -3781,7 +3787,7 @@ __global__ static void __launch_bounds__(256, (HcmTile<BM, BN>::MINB)) hcm_dense
                 for (int e = 0; e < 4; e += 2) {
                     int r = wr * 64 + i * 16 + g + (e < 2 ? 0 : 8), c = (n0 >> 1) + (((wc * WN + j * 8) >> 4) << 3) + tig * 2;
                     if (r >= M) continue;
-                    float *yr = y + (size_t)(m0 + r) * O + c;
+                    float *yr = A.y + (size_t)(A.yrows ? A.yrows[r] : m0 + r) * A.ldy + c;
                     float g0 = acc[i][j][e], g1 = acc[i][j][e + 1];
                     float v0 = (g0 / (1.f + expf(-g0))) * acc[i][j + 1][e], v1 = (g1 / (1.f + expf(-g1))) * acc[i][j + 1][e + 1];
                     if (c + 1 < O && !(O & 1)) *reinterpret_cast<float2 *>(yr) = make_float2(v0, v1);
@@ -3797,13 +3803,23 @@ __global__ static void __launch_bounds__(256, (HcmTile<BM, BN>::MINB)) hcm_dense
             for (int e = 0; e < 4; e += 2) {
                 int r = wr * 64 + i * 16 + g + (e < 2 ? 0 : 8), c = n0 + wc * WN + j * 8 + tig * 2;
                 if (r >= M) continue;
-                float *yr = y + (size_t)(m0 + r) * O + c;
+                float *yr = A.y + (size_t)(A.yrows ? A.yrows[r] : m0 + r) * A.ldy + c;
                 if (c + 1 < O && !(O & 1)) *reinterpret_cast<float2 *>(yr) = make_float2(acc[i][j][e], acc[i][j][e + 1]);
                 else { if (c < O) yr[0] = acc[i][j][e]; if (c + 1 < O) yr[1] = acc[i][j][e + 1]; }
             }
 #else
-    (void)y; (void)xh; (void)w; (void)wu; (void)rw; (void)S; (void)I; (void)O; (void)kc;
+    (void)A;
 #endif
+}
+template<int T, int BM, int BN, bool GLU>
+__global__ static void __launch_bounds__(256, (HcmTile<BM, BN>::MINB)) hcm_dense_k(float *__restrict__ y, const __half *__restrict__ xh,
+                                                                             const bd_u32 *__restrict__ w, const bd_u32 *__restrict__ wu,
+                                                                             int rw, int S, int I, int O, int kc) {
+    COLI_PDL_WAIT();
+    const int m0 = blockIdx.y * BM, kb0 = blockIdx.z * kc;
+    HcmArgs A = {y + (size_t)blockIdx.z * S * O, O, nullptr, xh, I, nullptr, m0, S - m0 < BM ? S - m0 : BM, (int)blockIdx.x * BN, kb0,
+                 (I - kb0 < kc ? I - kb0 : kc) / HCM_BK, w, wu, rw, O};
+    hcm_body<T, BM, BN, GLU>(A);
 }
 /* a split K's partial sums, in the order of the splits */
 __global__ static void hcm_sum_k(float *__restrict__ y, const float *__restrict__ p, long long n, int ns) {
@@ -4646,14 +4662,91 @@ __global__ static void __launch_bounds__(256) hcg_moe_dn_bd_k(const CcExpert *__
     size_t A = (size_t)p.S * p.K;
     hcg_tile<WF, 1>(hid + A * p.I, p.D, pr, hid, p.I, xr, M, W, Sc, p.fmt_d ? p.fmt_d : p.fmt, p.D, p.I, blockIdx.x * TCG_BN);
 }
-static int moe_rows_bd_launch(const CcExpert *tab, const float *x, const int *ids, float *hid, MoeSort m, const CcMoe *p, const bd_u32 *btab,
-                              cudaStream_t st) {
+/* A prompt chunk's GGUF experts of Q8_0, Q4_K, Q5_K or Q6_K through hcm_body (hcm_dense_k's
+ * products: the weights' loads apart from their decoding) instead of hcg_tile's: a tile's up to 64
+ * rows of one expert (moe_tile_rows), the gate and up in one pass (GLU) into hid's places, then the
+ * down of the places' rows into hid's second part. The inputs in f16 (hcg_h's rounding): xh the
+ * tokens' rows, hh hid's. */
+template<int T>
+__global__ static void __launch_bounds__(256, (HcmTile<64, 128>::MINB)) hcm_moe_gu_k(const CcExpert *__restrict__ tab,
+        const __half *__restrict__ xh, float *__restrict__ hid, MoeSort m, CcMoe p, int rw) {
+    COLI_PDL_WAIT();
+    __shared__ int xr[64], pr[64];
+    if ((int)blockIdx.y >= *m.ntile) return;
+    int e, M = moe_tile_rows(m, p, blockIdx.y, xr, pr, &e, 0);
+    __syncthreads();
+    const CcExpert ex = tab[p.t_off + e];
+    HcmArgs A = {hid, p.I, pr, xh, p.D, xr, 0, M, (int)blockIdx.x * 128, 0, p.D / HCM_BK,
+                 (const bd_u32 *)ex.g, (const bd_u32 *)ex.u, rw, p.I};
+    hcm_body<T, 64, 128, true>(A);
+}
+template<int T>
+__global__ static void __launch_bounds__(256, (HcmTile<64, 128>::MINB)) hcm_moe_dn_k(const CcExpert *__restrict__ tab,
+        const __half *__restrict__ hh, float *__restrict__ hid, MoeSort m, CcMoe p, int rw) {
+    COLI_PDL_WAIT();
+    __shared__ int xr[64], pr[64];
+    if ((int)blockIdx.y >= *m.ntile) return;
+    int e, M = moe_tile_rows(m, p, blockIdx.y, xr, pr, &e, 1);
+    __syncthreads();
+    const CcExpert ex = tab[p.t_off + e];
+    HcmArgs A = {hid + (size_t)p.S * p.K * p.I, p.D, pr, hh, p.I, xr, 0, M, (int)blockIdx.x * 128, 0, p.I / HCM_BK,
+                 (const bd_u32 *)ex.d, nullptr, rw, p.D};
+    hcm_body<T, 64, 128, false>(A);
+}
+/* rows of x (x_row floats apart) into f16, hcm_half_k's rounding */
+__global__ static void hcm_half_rows_k(const float *__restrict__ x, int x_row, uint2 *__restrict__ xh, int S, int D) {
+    COLI_PDL_WAIT();
+#if HCM_BODY
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x, n4 = (long long)S * (D / 4);
+    if (i >= n4) return;
+    const int s = (int)(i / (D / 4)), d4 = (int)(i % (D / 4));
+    float4 v = reinterpret_cast<const float4 *>(x + (size_t)s * x_row)[d4];
+    xh[i] = make_uint2(bd_h2u(__halves2half2(hcg_h(v.x), hcg_h(v.y))), bd_h2u(__halves2half2(hcg_h(v.z), hcg_h(v.w))));
+#else
+    (void)x; (void)x_row; (void)xh; (void)S; (void)D;
+#endif
+}
+/* the experts through hcm_moe_*_k where their types and rows let them; 0: not taken (hcg_tile's) */
+static int hcm_moe(DeviceContext *ctx, const CcExpert *tab, const float *x, float *hid, MoeSort m, const CcMoe *p, cudaStream_t st) {
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+    (void)ctx; (void)tab; (void)x; (void)hid; (void)m; (void)p; (void)st; return 0;
+#else
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_MOE_HCM"); on = !(e && *e == '0'); }
+    const int fd = p->fmt_d ? p->fmt_d : p->fmt, tg = hcm_type(p->fmt, p->D), td = hcm_type(fd, p->I);
+    if (!on || !ctx || ctx->compute_major < 8 || !tg || !td || p->D % 4 || p->I % 4 || p->x_row % 4) return 0;
+    const size_t rbg = bd_file_row_bytes(p->fmt, p->D), rbd = bd_file_row_bytes(fd, p->I);
+    if (!rbg || !rbd || rbg % 4 || rbd % 4) return 0;
+    const size_t A = (size_t)p->S * p->K, nx = (size_t)p->S * p->D, nh = A * p->I;
+    void *scr = NULL;
+    if (cudaMallocAsync(&scr, (nx + nh) * sizeof(__half) + 256, st) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    __half *xh = (__half *)scr, *hh = xh + (nx + 63) / 64 * 64;
+    long long n4 = (long long)(nx / 4);
+    coli_launch(hcm_half_rows_k, (unsigned)((n4 + 255) / 256), 256, 0, st, x + p->x_off, p->x_row, reinterpret_cast<uint2 *>(xh), p->S, p->D);
+    dim3 gg((unsigned)((2 * p->I + 127) / 128), (unsigned)m.T), gd((unsigned)((p->D + 127) / 128), (unsigned)m.T);
+    const int rwg = (int)(rbg / 4), rwd = (int)(rbd / 4);
+    #define HCM_MOE(K_, T_, ...) do { switch (T_) { \
+        case 8: coli_launch(K_<8>, __VA_ARGS__); break;   case 12: coli_launch(K_<12>, __VA_ARGS__); break; \
+        case 13: coli_launch(K_<13>, __VA_ARGS__); break; default: coli_launch(K_<14>, __VA_ARGS__); break; } } while (0)
+    HCM_MOE(hcm_moe_gu_k, tg, gg, 256, HcmTile<64, 128>::SMEM, st, tab, (const __half *)xh, hid, m, *p, rwg);
+    long long h4 = (long long)(nh / 4);
+    coli_launch(hcm_half_k, (unsigned)((h4 + 255) / 256), 256, 0, st, reinterpret_cast<const float4 *>(hid), reinterpret_cast<uint2 *>(hh), h4);
+    HCM_MOE(hcm_moe_dn_k, td, gd, 256, HcmTile<64, 128>::SMEM, st, tab, (const __half *)hh, hid, m, *p, rwd);
+    #undef HCM_MOE
+    cudaError_t le = cudaGetLastError();
+    (void)cudaFreeAsync(scr, st);
+    return cuda_ok(le, "f16 moe block rows launch");
+#endif
+}
+static int moe_rows_bd_launch(DeviceContext *ctx, const CcExpert *tab, const float *x, const int *ids, float *hid, MoeSort m, const CcMoe *p,
+                              const bd_u32 *btab, cudaStream_t st) {
     size_t A = (size_t)p->S * p->K;
     unsigned ga = (unsigned)((A + 255) / 256);
     if (!cuda_ok(cudaMemsetAsync(m.cnt, 0, (size_t)p->E * sizeof(int), st), "chain moe sort")) return 0;
     coli_launch(moe_sort_count_k, ga, 256, 0, st, tab, ids, m, *p);
     coli_launch(moe_sort_scan_k, 1, 32, 0, st, m, *p);
     coli_launch(moe_sort_place_k, ga, 256, 0, st, tab, ids, m, *p);
+    if (hcm_moe(ctx, tab, x, hid, m, p, st)) return 1;
     dim3 gg((unsigned)((p->I + TCG_BN - 1) / TCG_BN), (unsigned)m.T), gd((unsigned)((p->D + TCG_BN - 1) / TCG_BN), (unsigned)m.T);
     HCG_BT_LAUNCH(hcg_moe_gu_bd_k, p->fmt, gg, st, tab, x, hid, m, *p, btab);
     HCG_BT_LAUNCH(hcg_moe_dn_bd_k, p->fmt_d ? p->fmt_d : p->fmt, gd, st, tab, hid, m, *p, btab);
@@ -5072,7 +5165,7 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
         int brows = tiles && btab && p->S > CC_MOE_FRAME_ROWS && p->E > 0 && p->E <= 4096 && hcg_ok(bc) && p->D % HCG_BK == 0 && p->I % HCG_BK == 0 &&
                     (!x || ((uintptr_t)(x + p->x_off) & 15) == 0) && p->x_row % 4 == 0;
         MoeSort bm = moe_sort_of(hid, p);
-        if ((p->parts & 1) && (!x || !(brows ? moe_rows_bd_launch(tab, x, ids, hid, bm, p, btab, bst) : moe_bd_launch(bc, tab, x, ids, hid, p, bst))))
+        if ((p->parts & 1) && (!x || !(brows ? moe_rows_bd_launch(bc, tab, x, ids, hid, bm, p, btab, bst) : moe_bd_launch(bc, tab, x, ids, hid, p, bst))))
             return 0;
         if (p->parts & 2) {
             if (!w || !y || (p->h_off >= 0 && !hy)) return 0;

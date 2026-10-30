@@ -1874,30 +1874,48 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         int ok = 1, pending = 0, pend_i = -1, dm_ids_defer = 0;   /* pend_i: the hybrid layer the host serves after recording the next */
         unsigned pend_v = 0;
         CcBuf *routed = ch->routed;              /* where the layer before left its routed sum */
+        int pend_fuse = 0;   /* the layer before was dense: its MLP's output (LFM3: not normalised yet) into x
+                              * and x's norm in one pass (cc_addnorm) */
         for (int i = 0; i < L && ok; i++) {
             Layer *l = &m->L[i];
+            int normed = 0;
+            if (pending && pend_fuse) {
+                CcAddNorm an = {n, D, 0, 0, 0, c->lfm3 ? (int)ch->o_pff[i - 1] : 0, (int)ch->o_in[i], c->lfm3 ? 1 : 0, c->eps};
+                int r = cc_addnorm(ch->x, ch->ds, ch->prm, ch->nrm, &an);
+                if (r >= 0) { ok = r; normed = 1; pending = 0; }
+                else if (c->lfm3) ok = q36cc_norm(ch->ds, 0, ch->prm, ch->o_pff[i - 1], ch->ds, 0, n, D, c->eps);
+                pend_fuse = 0;
+            }
             if (pending) {
-                ok = q36cc_combine(ch, m, i - 1, n, routed);
+                ok = ok && q36cc_combine(ch, m, i - 1, n, routed);
                 if (ok && lf) ok = cc_copy(ch->lfd, ((size_t)(i - 1) * 3 + 2) * D, ch->x, (size_t)(n - 1) * D, D);
             }
-            ok = ok && q36cc_norm(ch->x, 0, ch->prm, ch->o_in[i], ch->nrm, 0, n, D, c->eps);
+            if (!normed) ok = ok && q36cc_norm(ch->x, 0, ch->prm, ch->o_in[i], ch->nrm, 0, n, D, c->eps);
             if (ch->mx_rows) ok = ok && (c->is_attn[i] ? q36cc_attention_mx(ch, m, l, i, n, c0) :
                                          c->lfm3 ? q36cc_shortconv_mx(ch, m, i, n, c0) : q36cc_deltanet_mx(ch, m, l, i, n, c0));
             else ok = ok && (c->is_attn[i] ? q36cc_attention(ch, m, l, i, n, pb) :
                              c->lfm3 ? q36cc_shortconv(ch, m, i, n, c0, ns) : q36cc_deltanet(ch, m, l, i, n, c0, ns));
             if (ok && lf) ok = cc_copy(ch->lfd, (size_t)i * 3 * D, ch->tmp, (size_t)(n - 1) * D, D);
             CcEw add = {CC_EW_ADD, n * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
+            int fused = -1;   /* the branch into x and x's norm in one pass (cc_addnorm): -1 not taken */
             if (c->muse) {   /* Muse Spark: the branch normalised, then the residual gate */
                 CcNorm pn = {n, D, 1, 0, D, D, 0, D, D, 0, 0, CC_NORM_NOW, c->post_eps, 1.f};
                 CcEw g = {CC_EW_RESGATE, n * D, D, 1, 0, 1, 0, 0, 0, (int)ch->o_ra[i] + D, (int)ch->o_ra[i], 1.f};
                 ok = ok && cc_norm(ch->tmp, ch->prm, ch->tmp, &pn) && cc_ew(ch->x, ch->x, ch->tmp, ch->prm, ch->prm, &g);
             } else {
                 /* LFM3: the branch normalised (post_operator_norm) before it joins */
-                if (c->lfm3) ok = ok && q36cc_norm(ch->tmp, 0, ch->prm, ch->o_po[i], ch->tmp, 0, n, D, c->eps);
-                ok = ok && cc_ew(ch->x, ch->x, ch->tmp, NULL, NULL, &add);
+                CcAddNorm an = {n, D, 0, 0, 0, c->lfm3 ? (int)ch->o_po[i] : 0, (int)ch->o_post[i], c->lfm3 ? 1 : 0, c->eps};
+                if (ok && !lf) fused = cc_addnorm(ch->x, ch->tmp, ch->prm, ch->h2, &an);
+                if (fused >= 0) ok = fused;
+                else {
+                    if (c->lfm3) ok = ok && q36cc_norm(ch->tmp, 0, ch->prm, ch->o_po[i], ch->tmp, 0, n, D, c->eps);
+                    ok = ok && cc_ew(ch->x, ch->x, ch->tmp, NULL, NULL, &add);
+                }
             }
-            if (ok && lf) ok = cc_copy(ch->lfd, ((size_t)i * 3 + 1) * D, ch->x, (size_t)(n - 1) * D, D);
-            ok = ok && q36cc_norm(ch->x, 0, ch->prm, ch->o_post[i], ch->h2, 0, n, D, c->eps);
+            if (fused < 0) {
+                if (ok && lf) ok = cc_copy(ch->lfd, ((size_t)i * 3 + 1) * D, ch->x, (size_t)(n - 1) * D, D);
+                ok = ok && q36cc_norm(ch->x, 0, ch->prm, ch->o_post[i], ch->h2, 0, n, D, c->eps);
+            }
             const int routed_l = E > 0 && !q36_dense_l(c, i);   /* a Flint dense layer: its MLP only */
             int dpart = 0;
             if (dm && routed_l) (void)q36cc_dm_tab(ch, i, n, &dpart);
@@ -1943,8 +1961,10 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
                 routed = ch->routed;
             } else if (ok) {
                 ok = q36cc_shared(ch, m, l, i, n);
+                /* the next layer adds it and takes its norm in one pass where the combine is x += ds */
+                pend_fuse = ok && i + 1 < L && !lf && !c->muse && l->sh_I > 0 && !l->sh_gate;
                 /* LFM3: the MLP's output normalised (post_ffn_norm) before the combine adds it */
-                if (ok && c->lfm3) ok = q36cc_norm(ch->ds, 0, ch->prm, ch->o_pff[i], ch->ds, 0, n, D, c->eps);
+                if (ok && c->lfm3 && !pend_fuse) ok = q36cc_norm(ch->ds, 0, ch->prm, ch->o_pff[i], ch->ds, 0, n, D, c->eps);
                 if (ok && i + 1 < L) ok = cc_submit(0) && q36cc_frame_begin(ch);
             }
             pending = 1;
