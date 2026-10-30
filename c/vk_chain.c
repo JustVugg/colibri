@@ -424,7 +424,15 @@ static VkShaderModule load_module(const char *dir_spv, const char *file) {
  * the compiler picks: an Intel Iris Xe (subgroups of 8 to 32) compiled chain_gemv and
  * chain_gemv2 at another width than the shader saw, and every decode GEMV came out
  * wrong. 0 (no subgroup size control, COLI_VK_SUBGROUP=0): the driver's choice. */
+/* vkc_hybrid_set_flush: the host's part of a hybrid step still to come. Run before the host
+ * waits for a frame (frame_wait) and before it makes a pipeline: a frame that waits for the
+ * host's event inside it (vkc_ev_wait) may be executing, and a driver that executes on a
+ * thread of its own and builds pipelines under its lock (Lavapipe) would wait for that frame
+ * -- which waits for the host. */
+static void (*g_hyb_flush)(void);
+static void host_first(void) { if (g_hyb_flush) g_hyb_flush(); }
 static VkPipeline make_pipe(VkShaderModule m, const VkSpecializationInfo *si) {
+    host_first();
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
         .requiredSubgroupSize = (uint32_t)KC.core.pin_sg};
@@ -440,6 +448,7 @@ static VkPipeline make_pipe(VkShaderModule m, const VkSpecializationInfo *si) {
 /* A pipeline of the matrix units' shaders: at the device's cooperative-matrix subgroup
  * size (64 or 32), required, in full subgroups; NULL elsewhere or when it fails. */
 static VkPipeline coop_pipe(VkShaderModule m, const VkSpecializationInfo *si) {
+    host_first();
     int sg = KC.core.coop_sg;
     if (!m || (sg != 64 && sg != 32)) return VK_NULL_HANDLE;
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
@@ -655,6 +664,7 @@ int vkc_init(void) {
                           .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT,
                           .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = KC.mod_tg, .pName = "main",
                           .pSpecializationInfo = &si}, .layout = KC.pl};
+            host_first();
             if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &KC.tg) != VK_SUCCESS) KC.tg = VK_NULL_HANDLE;
         }
     }
@@ -742,7 +752,6 @@ static long chain_spin_us(void) {
     }
     return v;
 }
-static void (*g_hyb_flush)(void);   /* vkc_hybrid_set_flush */
 static int frame_wait(VkcFrame *f) {
     if (!f->inflight) return 1;
     if (g_hyb_flush) g_hyb_flush();   /* a hybrid step's host part the frame may wait for */
@@ -1675,6 +1684,7 @@ static VkPipeline fa_pipe(int hd, int gq) {
                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = KC.mod_fa, .pName = "main",
                   .pSpecializationInfo = &si}, .layout = KC.pl};
     VkPipeline p = VK_NULL_HANDLE;
+    host_first();
     if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &p) != VK_SUCCESS) {
         vkDestroyShaderModule(KC.dev, KC.mod_fa, NULL); KC.mod_fa = VK_NULL_HANDLE;   /* not again */
         return VK_NULL_HANDLE;
@@ -2024,7 +2034,10 @@ int vkc_ev_host_done(uint64_t g) {
     return r == VK_EVENT_SET ? 1 : r == VK_EVENT_RESET ? 0 : -1;
 }
 int vkc_ev_host_set(uint64_t g) {
-    if (!g_ev.on || KC.lost) return 0;
+    /* set even once the chain counts the device lost: a frame submitted before (a software
+     * device's, or a fault injected at a later submission) may still be waiting for it, and
+     * a truly lost device just returns an error */
+    if (!g_ev.on || !KC.dev) return 0;
     return vkSetEvent(KC.dev, g_ev.h[g % VKC_EV_RING]) == VK_SUCCESS;
 }
 enum { QSA_SCORES = 1, QSA_SELECT };   /* the modes of chain_qsa.comp that VkcQsa mode 1 runs in turn */
@@ -3119,6 +3132,7 @@ static VkPipeline kf_coop_pipe(int hd) {
                   .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT,
                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = KF.cmod, .pName = "main",
                   .pSpecializationInfo = &si}, .layout = KC.pl};
+    host_first();
     if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &KF.cpipe[k]) != VK_SUCCESS) KF.cpipe[k] = VK_NULL_HANDLE;
     return KF.cpipe[k];
 }
