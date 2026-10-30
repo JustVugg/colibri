@@ -1762,8 +1762,14 @@ jobs:
           # tiny model's tied index scores would turn that noise into another selection)
           python3 tools/make_mistral_large4_tiny.py --out /tmp/ml4f --emit-ref /tmp/ml4f/ref.json \
             --fp8-checkpoint /tmp/ml4f/fp8 --min-gap 0.15 --max-new 8 --override '{"index_topk": 64}'
+          # its vision tower in the release's names (a shard of its own here): the converter writes
+          # it as the container's mmproj.gguf, the published file's tensors, which serve mode loads
+          python3 tools/make_mistral_vision_tiny.py --out /tmp/ml4fv --out-hidden 64 --release /tmp/ml4f/fp8
           python3 tools/convert_fp8_to_int4.py --indir /tmp/ml4f/fp8 --outdir /tmp/ml4f/coli --ebits 8 --xbits 8 --io-bits 8 --n-layers 8
           SNAP=/tmp/ml4f/coli REF=/tmp/ml4f/ref.json TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=2 ./colibri 8 16 16
+          python3 tools/make_mistral_vision_tiny.py --out /tmp/ml4fv --same-as /tmp/ml4f/coli/mmproj.gguf
+          served=$(SERVE=1 SNAP=/tmp/ml4f/coli ./colibri 8 < /dev/null 2>&1 || true)
+          echo "$served" | grep "vision tower (mmproj): 2 layers"
           # The published GGUFs' types, layer by layer as their headers have them (MIXES): these
           # six hold all fourteen (BF16, Q8_0, Q3_K-Q6_K, IQ1_S, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_XS
           # beside F32). The float path (GQ_EXACT=1) against the reference on the blocks' own
@@ -1780,6 +1786,13 @@ jobs:
           python3 tools/make_mistral_large4_tiny.py --out /tmp/ml4a --emit-ref /tmp/ml4a/ref.json --quant UD-IQ1_S --act-q8
           python3 tools/gguf_import.py /tmp/ml4a/model.gguf /tmp/ml4a/coli
           SNAP=/tmp/ml4a/coli REF=/tmp/ml4a/ref.json TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=3 ./colibri 8 16 16
+      - name: Mistral-Large-4 vision tower (mistral_vision.h against tools/mistral_vision_ref.py)
+        run: |
+          cd c
+          # a tiny mmproj in the published layout (BF16, q and k permuted for an interleaved
+          # rotation): the engine's rows within 1e-4 of the numpy reference's; the same tower in
+          # the release's names through tools/ml4_mmproj.py gives that file tensor for tensor
+          make mistral-vision-check
       - name: Oracle allowance and failure regressions
         run: |
           cd c

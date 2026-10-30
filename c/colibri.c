@@ -71,6 +71,7 @@
 #include "uring.h"
 #endif
 #include "tok.h"
+#include "mistral_vision.h"   /* Mistral-Large-4's vision tower (Pixtral), from a linked mmproj */
 #include "tier.h"
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
 #include "spec_draft.h"                           /* COLI_LOOKUP=1: the n-gram drafts from spec_draft.h, gated */
@@ -8698,6 +8699,71 @@ static void dump_logits(const float *lo, int64_t n){
 }
 #define DUMP_LOGITS(lo,n) dump_logits((lo),(n))
 static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int pos_base);
+/* ---- Mistral-Large-4's pictures (mistral_vision.h) ---------------------------------------
+ * A SUBMIT that follows an IMAGE frame runs the tower on its patches; the rows replace the
+ * embeddings at the prompt's [IMG] positions while that prompt's prefill runs (g_vis_map: an
+ * absolute position to its row, -1 none), then they go. */
+static MistralVision g_mlv;
+#ifdef COLI_VULKAN
+static int g_mlv_vk_keep; static size_t g_mlv_bytes;
+/* The tower's products on the Vulkan device, its matrices as the mmproj has them (bf16, f16,
+ * f32). ML4_VISION_GPU: unset or 1 = each matrix up for its products and freed after (the
+ * tier keeps the device's memory), keep = resident after a first picture (the tier leaves
+ * room for it, g_mlv_bytes), 0 = the CPU. Mistral-Large-4 UD-IQ1_S on an RTX PRO 4000, a
+ * picture of 384 patches: the CPU 5.07 s, up and freed 3.61, kept 1.07 after a first 4.44
+ * (the 210 uploads and allocations are the cost: 3.4 GB at 1.1 GB/s). */
+static int mlv_vk_mm(MvMat *w, float *y, const float *x, int S){
+    if(!g_vulkan) return 0;
+    const int fmt = w->type==GQ_BF16 ? 11 : w->type==GQ_F16 ? 14 : w->type==GQ_F32 ? 10 : 0;
+    if(!fmt) return 0;
+    int ok=coli_vk_matmul((ColiVkTensor **)&w->dev,y,x,w->data,NULL,fmt,S,w->I,w->O,0);
+    if(!g_mlv_vk_keep && w->dev){ coli_vk_tensor_free((ColiVkTensor *)w->dev); w->dev=NULL; }
+    return ok;
+}
+#endif
+static struct { float *patches; unsigned long long bytes; int gh, gw, present; } g_mlv_pending;
+static float *g_vis_rows; static int *g_vis_map, g_vis_map_len;
+static void vis_apply(Model *m, float *x, int S, int pos_base){
+    if(!g_vis_map) return;
+    const int D=m->c.hidden;
+    for(int s=0;s<S;s++){
+        int p=pos_base+s;
+        if(p>=0 && p<g_vis_map_len && g_vis_map[p]>=0)
+            memcpy(x+(int64_t)s*D, g_vis_rows+(int64_t)g_vis_map[p]*D, (size_t)D*sizeof(float));
+    }
+}
+static void vis_clear(void){ free(g_vis_rows); free(g_vis_map); g_vis_rows=NULL; g_vis_map=NULL; g_vis_map_len=0; }
+static void mlv_pending_clear(void){ free(g_mlv_pending.patches); memset(&g_mlv_pending,0,sizeof g_mlv_pending); }
+/* The pending picture over prompt ids[0, n): its [IMG] tokens take the tower's rows in order
+ * (rows of [IMG]s, each closed by [IMG_BREAK], the last by [IMG_END]). *first: the first [IMG]
+ * position. 0, or -1 with the reason on stderr. */
+static int mlv_attach(Model *m, Tok *T, const int *ids, int n, int *first){
+    *first=-1;
+    if(!g_mlv.ready){ fprintf(stderr,"[ml4] a picture, but no vision tower is loaded (an mmproj linked, ML4_VISION unset)\n"); return -1; }
+    const int gh=g_mlv_pending.gh, gw=g_mlv_pending.gw, mg=g_mlv.merge, pd=g_mlv.in_ch*g_mlv.patch*g_mlv.patch;
+    if(gh%mg || gw%mg || g_mlv_pending.bytes!=(unsigned long long)gh*gw*pd*sizeof(float)){
+        fprintf(stderr,"[ml4] picture of %d x %d patches: %llu bytes, %llu expected\n",gh,gw,g_mlv_pending.bytes,
+                (unsigned long long)gh*gw*pd*sizeof(float));
+        return -1;
+    }
+    const int img=tok_id_of(T,"[IMG]"), rows=(gh/mg)*(gw/mg);
+    int slots=0;
+    for(int i=0;i<n;i++) if(ids[i]==img){ if(*first<0) *first=i; slots++; }
+    if(img<0 || slots!=rows){
+        fprintf(stderr,"[ml4] the prompt has %d [IMG] tokens, the picture %d rows\n",slots,rows); return -1; }
+    vis_clear();
+    g_vis_rows=malloc((size_t)rows*m->c.hidden*sizeof(float)); g_vis_map=malloc((size_t)n*sizeof(int));
+    if(!g_vis_rows || !g_vis_map){ vis_clear(); return -1; }
+    double t0=now_s();
+    if(mistral_vision_forward(&g_mlv,g_mlv_pending.patches,gh,gw,g_vis_rows)!=rows){ vis_clear(); return -1; }
+    fprintf(stderr,"[ml4] picture: %d x %d patches, %d rows, the tower %.2f s\n",gh,gw,rows,now_s()-t0);
+    const char *dump=getenv("ML4_VIS_DUMP");   /* the rows, raw f32, for a check against tools/mistral_vision_ref.py */
+    if(dump && *dump){ FILE *f=fopen(dump,"wb"); if(f){ fwrite(g_vis_rows,sizeof(float),(size_t)rows*m->c.hidden,f); fclose(f); } }
+    for(int i=0,k=0;i<n;i++) g_vis_map[i]=ids[i]==img ? k++ : -1;
+    g_vis_map_len=n;
+    return 0;
+}
+
 static float *step(Model *m, const int *ids, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
     /* Chunked prefill (COLI_PREFILL_CHUNK=N): run a long prompt through the
@@ -8717,6 +8783,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
         while(S-done>chunk){
             float *cx=falloc((int64_t)chunk*D);
             for(int s=0;s<chunk;s++) embed_row(m, ids[done+s], cx+(int64_t)s*D);
+            vis_apply(m,cx,chunk,pos_base+done);
             layers_forward(m,cx,chunk,pos_base+done);
             free(cx);
             if(coli_prompt_broken()) return NULL;
@@ -8726,6 +8793,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
     }
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
+    vis_apply(m,x,S,pos_base);
     layers_forward(m,x,S,pos_base);
     /* a served prompt stopped between two layers (mux_submit): the slot's length stays where it
      * was, and the rows the stopped layers wrote are past it, a stale tail the next step writes
@@ -8746,6 +8814,7 @@ static float *step_all(Model *m, const int *ids, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
+    vis_apply(m,x,S,pos_base);
     layers_forward(m,x,S,pos_base);
     if(m->h_all) memcpy(m->h_all, x, (int64_t)S*D*sizeof(float));   /* hidden di TUTTE le pos (S<=512) */
     if(m->hlast) memcpy(m->hlast, x+(int64_t)(S-1)*D, D*sizeof(float));
@@ -10957,7 +11026,10 @@ static void repin_pass_limit(Model *m,int limit){
  * alternative di una sola. Con uno scatto solo si e costretti a scegliere, e
  * l'altro livello lo si ripaga ogni volta. Vedi pin_pool.h. */
 typedef struct { KVState kv; int *hist, len, first;
-                 ColiPinPool pins; } ServeCtx;
+                 ColiPinPool pins;
+                 int vis_end;     /* the first position of a picture this slot's KV holds, plus one (0: none):
+                                   * no later prompt reuses the rows from there on */
+                 } ServeCtx;
 static double kv_pool_bytes(Model *m, int max_ctx);
 static double kvb_transient_bytes(Model *m, int max_ctx);
 
@@ -11080,6 +11152,7 @@ static float *mux_prefill_echo(Model *m, Tok *T, unsigned long long id,
     int add=nt-from;
     float *x=falloc((int64_t)add*D);
     for(int s=0;s<add;s++) embed_row(m, ids[from+s], x+(int64_t)s*D);
+    vis_apply(m,x,add,from);
     layers_forward(m,x,add,from);
     if(m->hlast) memcpy(m->hlast, x+(int64_t)(add-1)*D, D*sizeof(float));
     if(m->has_mtp && add>=2 && g_draft>0) mtp_absorb(m, ids+from+1, x, add-1, from);  /* same as step() */
@@ -11285,6 +11358,24 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     char *line=NULL; size_t cap=0; ssize_t nr=getline(&line,&cap,stdin);
     if(nr<0){ free(line); return -1; }
     if(nr && line[nr-1]=='\n') line[--nr]=0;
+    if(!strncmp(line,"IMAGE ",6)){
+        /* IMAGE <id> <bytes> <grid_h> <grid_w>, the patches and a newline: kept for the SUBMIT
+         * that follows. The payload is read whatever happens next (left in the stream it would
+         * be the next frame's header); a header that does not say how long it is ends the session. */
+        unsigned long long iid=0, bytes=0; int gh=0, gw=0;
+        if(sscanf(line+6,"%llu %llu %d %d",&iid,&bytes,&gh,&gw)!=4 || bytes>(1ull<<30) || gh<1 || gw<1){
+            printf("ERROR %llu BAD_IMAGE\n",iid); fflush(stdout); free(line); return -1; }
+        unsigned char *buf=malloc((size_t)bytes+1);
+        if(!buf){ printf("ERROR %llu BAD_IMAGE\n",iid); fflush(stdout); free(line); return -1; }
+        if(bytes && fread(buf,1,(size_t)bytes,stdin)!=(size_t)bytes){ free(buf); free(line); return -1; }
+        int t=fgetc(stdin); if(t=='\r') t=fgetc(stdin);
+        if(t!='\n'){ free(buf); free(line); return -1; }
+        if(g_mlv_pending.present) fprintf(stderr,"[ml4] a second picture came before its SUBMIT; the first is dropped\n");
+        mlv_pending_clear();
+        g_mlv_pending.patches=(float*)buf; g_mlv_pending.bytes=bytes;
+        g_mlv_pending.gh=gh; g_mlv_pending.gw=gw; g_mlv_pending.present=1;
+        free(line); return 0;
+    }
     if(!strncmp(line,"STOP ",5)){
         unsigned long long id=0; char tail;
         if(sscanf(line+5,"%llu %c",&id,&tail)!=1 || id==0){
@@ -11390,6 +11481,12 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
         printf("ERROR %llu CONTEXT_EXCEEDED %d %d\n",sub.id,nt,maxctx-2);
         fflush(stdout); return 0;
     }
+    int vis_first=-1;   /* the prompt's first [IMG], when an IMAGE frame came before it */
+    if(g_mlv_pending.present){
+        int bad=mlv_attach(m,T,tmp,nt,&vis_first);
+        mlv_pending_clear();
+        if(bad<0){ free(tmp); printf("ERROR %llu BAD_IMAGE\n",sub.id); fflush(stdout); return 0; }
+    }
     /* #597: the submission is valid (encoded, non-empty, fits the context). Announce it before
      * prefill so the gateway commits the streaming 200 only now. Every failure above returned
      * first with an ERROR, so a request yields exactly one of ACCEPT or an early ERROR -- which
@@ -11431,6 +11528,10 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
         if(pin_len>0 && pin_len<=prefix){ prefix=pin_len; coli_pin_touch(&sc->pins,pin_slot); }
         else prefix=0;
     }
+    /* a picture's rows are never reused: not this prompt's, not one the slot's KV still holds
+     * (the same [IMG] tokens may stand for another picture) */
+    if(vis_first>=0 && prefix>vis_first) prefix=vis_first;
+    if(sc->vis_end>0 && prefix>sc->vis_end-1) prefix=sc->vis_end-1;
     if(prefix<sc->len){ sc->len=prefix; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
         kv_disk_truncate(m,sc->len); }
     /* Cross-slot prefix adoption (COLI_KV_SHARE=1): if another slot's history
@@ -11444,6 +11545,8 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
             if(i==sub.slot) continue;
             ServeCtx *dc2=&ctx[i];
             int lim=dc2->len<nt?dc2->len:nt, p=0;
+            if(dc2->vis_end>0 && lim>dc2->vis_end-1) lim=dc2->vis_end-1;   /* a picture's rows stay its slot's */
+            if(vis_first>=0 && lim>vis_first) lim=vis_first;
             while(p<lim && dc2->hist[p]==tmp[p]) p++;
             if(p>blen){ blen=p; best=i; }
         }
@@ -11476,6 +11579,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
                         : add>0 ? step(m,sc->hist+sc->len,add,sc->len)
                                 : step(m,sc->hist+sc->len-1,1,sc->len-1);
     g_coli_prompt_break=NULL;
+    if(g_vis_map){ vis_clear(); sc->vis_end=vis_first+1; }   /* the picture is in the KV now, from vis_first */
     if(brk.control){
         /* stopped while reading: the slot keeps the conversation it held before this prompt */
         g_mux_stop=0; g_mux_cancel=0;
@@ -11559,7 +11663,8 @@ static void run_serve_mux(Model *m, const char *snap){
 #endif
     setvbuf(stdin,NULL,_IONBF,0);
     intr_install();                      /* Ctrl-C = chiudi i turni in volo, non il processo */
-    printf("\x01\x01READY\x01\x01\nSTAT 0 0.00 0.0 %.2f\n",rss_gb()); fflush(stdout);
+    /* CAPS vision=: Mistral-Large-4's tower loaded (a linked mmproj), the gateway's word for image input */
+    printf("\x01\x01READY\x01\x01\nCAPS vision=%d\nSTAT 0 0.00 0.0 %.2f\n",g_mlv.ready?1:0,rss_gb()); fflush(stdout);
     hwinfo_emit(m);
     tiers_emit(m);
     emap_emit(m);
@@ -12187,6 +12292,7 @@ static void vk_tier_start(Model *m){
     /* a partial chain: nothing more of the trunk goes up, but the chain's first forward
      * allocates its scratch and the N layers' KV mirrors */
     if(g_glmc_partial) dense+=(double)g_glmc_lazy;
+    if(g_mlv_vk_keep) dense+=(double)g_mlv_bytes;   /* Mistral-Large-4's vision tower, kept on the device */
     { const char *r=getenv("COLI_VK_RESERVE_GB"), *tr=getenv("COLI_VK_TIER_RESERVE_GB");
       if(r && *r){ double extra=atof(r)-(tr&&*tr?atof(tr):1.0); if(extra>0) dense+=extra*1073741824.0; } }
     /* The MTP head's layer (index NL): its experts as the container keeps them (int8
@@ -14528,6 +14634,46 @@ int main(int argc, char **argv){
                            "         Keep it on a native Linux fs (ext4/xfs/zfs) for memory efficiency and speed.\n", snap);
     }
 #endif
+    /* Mistral-Large-4's vision tower (gguf.json "mmproj", else the mmproj.gguf a container converted
+     * from the FP8 release carries, tools/ml4_mmproj.py; ML4_MMPROJ names one, ML4_VISION=0 skips
+     * it), in serve mode, where the gateway sends pictures: before the pins and cap_for_ram, which
+     * then count its bytes as resident. */
+    if(m.c.ml4 && getenv("SERVE") && !(getenv("ML4_VISION") && getenv("ML4_VISION")[0]=='0')){
+        char mp[4096]=""; const char *me=getenv("ML4_MMPROJ");
+        if(me && *me) snprintf(mp,sizeof mp,"%s",me);
+        else {
+            char gj[4096]; snprintf(gj,sizeof gj,"%s/gguf.json",snap);
+            FILE *gf=fopen(gj,"rb");
+            if(gf){
+                char buf[16384]; size_t nb=fread(buf,1,sizeof buf-1,gf); fclose(gf); buf[nb]=0;
+                char *arena=NULL; jval *root=json_parse(buf,&arena);
+                jval *mv=root?json_get(root,"mmproj"):NULL;
+                if(mv && mv->t==J_STR && mv->str[0]) gguf_path_join(mp,sizeof mp,snap,mv->str);
+                free(arena);
+            }
+            if(!mp[0]){
+                char own[4096]; snprintf(own,sizeof own,"%s/mmproj.gguf",snap);
+                FILE *of=fopen(own,"rb");
+                if(of){ fclose(of); snprintf(mp,sizeof mp,"%s",own); }
+            }
+        }
+        if(mp[0]){
+            double tv=now_s();
+            if(mistral_vision_load(&g_mlv,mp,m.c.hidden,m.c.eps)==0){
+                size_t vb=0;
+                for(int l=0;l<g_mlv.depth;l++){ MvLayer *L=&g_mlv.layers[l];
+                    vb+=(size_t)(L->q.rb*L->q.O+L->k.rb*L->k.O+L->v.rb*L->v.O+L->o.rb*L->o.O+L->gate.rb*L->gate.O+L->up.rb*L->up.O+L->down.rb*L->down.O); }
+                vb+=(size_t)(g_mlv.merger.rb*g_mlv.merger.O+g_mlv.l1.rb*g_mlv.l1.O+g_mlv.l2.rb*g_mlv.l2.O);
+                m.resident_bytes+=vb;
+                fprintf(stderr,"[ml4] vision tower (mmproj): %d layers of %d, %d heads, patch %d, merge %d, %.2f GB in %.1f s\n",
+                        g_mlv.depth,g_mlv.hidden,g_mlv.heads,g_mlv.patch,g_mlv.merge,vb/1e9,now_s()-tv);
+#ifdef COLI_VULKAN
+                { const char *vg=getenv("ML4_VISION_GPU");
+                  if(g_vulkan && !(vg && vg[0]=='0')){ mv_device_mm=mlv_vk_mm; g_mlv_vk_keep=vg && !strcmp(vg,"keep"); g_mlv_bytes=vb; } }
+#endif
+            } else fprintf(stderr,"[ml4] %s: the vision tower did not load; pictures are refused\n",mp);
+        }
+    }
     /* DUAL-SSD: register the mirror copy BEFORE any pin/autopin load, so the
      * OMP-parallel pin warmup already streams from both drives. */
     mirror_setup(&m);

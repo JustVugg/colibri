@@ -545,6 +545,35 @@ class TemplateTest(unittest.TestCase):
         self.assertEqual(patches.shape[0], grid_h * grid_w)
         self.assertIn("what is this?", messages[0]["content"])
 
+    def test_a_picture_without_pillow_or_numpy_is_a_client_error(self):
+        """The preprocessors import Pillow and numpy when they run. qwen38_image and
+        dsv41_image raised SystemExit without them, which ended the request's thread with no
+        answer at all (the client saw the connection close: LFM3-VL on a server without
+        Pillow), and glm53_image's ImportError came after the wrappers' try. Every expander
+        answers 400 and says what to install."""
+        import base64, builtins, tempfile
+        from unittest import mock
+        import image_engine
+        from openai_server import expand_dsv41_images, expand_glm53_images, expand_qwen38_images
+        png = image_engine.encode_png(32, 32, bytes(32 * 32 * 3), channels=3)
+        uri = "data:image/png;base64," + base64.b64encode(png).decode()
+        real_import = builtins.__import__
+        def no_pictures(name, *args, **kwargs):
+            if name == "numpy" or name == "PIL" or name.startswith("PIL."):
+                raise ImportError(f"No module named {name!r}")
+            return real_import(name, *args, **kwargs)
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "preprocessor_config.json").write_text(json.dumps(
+                {"patch_size": 16, "merge_size": 2, "temporal_patch_size": 2}), encoding="utf-8")
+            for expand in (expand_qwen38_images, expand_dsv41_images, expand_glm53_images):
+                with self.subTest(expand=expand.__name__), mock.patch("builtins.__import__", no_pictures):
+                    with self.assertRaises(APIError) as caught:
+                        expand([{"role": "user", "content": [
+                            {"type": "text", "text": "what is this?"},
+                            {"type": "image_url", "image_url": {"url": uri}}]}], d)
+                    self.assertEqual(caught.exception.status, 400)
+                    self.assertIn("pip install pillow numpy", str(caught.exception))
+
     def test_an_image_url_that_is_not_an_object_is_a_client_error(self):
         """{"type": "image_url", "image_url": "data:..."} (or a number) made the image
         expanders call .get("url") on a string, an AttributeError that do_POST answered
@@ -8460,8 +8489,9 @@ class ServedModalityTest(unittest.TestCase):
 
     def test_a_family_without_an_image_path_never_claims_images(self):
         # Even an engine that announces a tower is text-only to its clients when
-        # the gateway has no placeholder expansion for the family.
-        with patch("openai_server.ARCH", "glm"):
+        # the gateway has no placeholder expansion for the family (OLMoE's; the glm family has
+        # one since Mistral-Large-4's pictures).
+        with patch("openai_server.ARCH", "olmoe"):
             _engine, base = self.serve(True)
             with self.request(base, "/v1/models") as response:
                 self.assertEqual(json.load(response)["data"][0]["input_modalities"], ["text"])

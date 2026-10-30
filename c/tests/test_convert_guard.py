@@ -22,8 +22,10 @@ except ImportError:
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import convert_fp8_to_int4  # noqa: E402
 from convert_fp8_to_int4 import (  # noqa: E402
     GLM52_MODEL_TYPES,
+    ML4_MODEL_TYPES,
     OTHER_FAMILY_PATHS,
     check_model_family,
 )
@@ -34,6 +36,13 @@ class ConvertGuardTest(unittest.TestCase):
     def test_glm52_passes(self):
         for model_type in sorted(GLM52_MODEL_TYPES):
             check_model_family({"model_type": model_type}, "x")  # nessuna eccezione
+
+    def test_mistral_large4_passes_in_its_own_names(self):
+        try:
+            check_model_family({"model_type": "mistral_large4"}, "mistralai/Mistral-Large-4-1T-A52B")
+            self.assertTrue(convert_fp8_to_int4.ML4)
+        finally:
+            convert_fp8_to_int4.ML4 = False
 
     def test_every_other_family_is_refused_with_its_own_pointer(self):
         for family in FAMILIES:
@@ -81,7 +90,7 @@ class ConvertGuardTest(unittest.TestCase):
         rifiuterebbe il modello che esiste per servire, e questo E' un
         disastro."""
         glm = next(f for f in FAMILIES if f.id == "glm")
-        self.assertEqual(GLM52_MODEL_TYPES, set(glm.model_types),
+        self.assertEqual(GLM52_MODEL_TYPES | ML4_MODEL_TYPES, set(glm.model_types),
                          "la guardia e family_registry non concordano su cosa "
                          "sia GLM-5.2: il convertitore rifiuterebbe il suo "
                          "stesso modello")

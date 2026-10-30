@@ -28,6 +28,9 @@ USO:
 import os, sys, glob, json, re, shutil, argparse, threading
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ml4_mmproj  # noqa: E402  (Mistral-Large-4's vision tower)
+
 
 _positioned_write_lock = threading.Lock()
 
@@ -45,10 +48,14 @@ _positioned_write_lock = threading.Lock()
 # tests/test_convert_guard.py li confronta col registry e fallisce alla prima
 # famiglia aggiunta o rinominata.
 GLM52_MODEL_TYPES = {"glm_moe_dsa", "glm5_moe", "glm"}
+ML4_MODEL_TYPES = {"mistral_large4"}   # the registry's glm family too: the same engine
 # Mistral-Large-4 (mistralai/Mistral-Large-4-1T-A52B): its FP8 release in Mistral's own names
 # (consolidated-*.safetensors), read through ml4_name into the names colibri.c reads; set from
 # the checkpoint's config.json (model_type mistral_large4)
 ML4 = False
+# its vision tower: each shard's tower tensors kept here (tools/ml4_mmproj.py stash) and written
+# as mmproj.gguf at the end of the main pass; None in the --mtp/--indexer passes
+ML4_STASH = None
 ML4_LAYER = (   # the part after layers.N., Mistral's -> the engine's (the first that fits)
     ("attention_norm.weight", "input_layernorm.weight"), ("ffn_norm.weight", "post_attention_layernorm.weight"),
     ("attention.indexer.ssmax_scaling.s", "self_attn.indexer.softmax_scaling.scale"),
@@ -70,8 +77,8 @@ ML4_EXPERT = re.compile(r"^experts\.(\d+)\.w([123])\.(.+)$")
 
 
 def ml4_name(name):
-    """A Mistral-Large-4 tensor's name in the engine's, or None (the DSpark draft head, the
-    vision tower and its projector: not converted here). w1 is the gate, w3 the up and w2 the
+    """A Mistral-Large-4 tensor's name in the engine's, or None (the DSpark draft head; the
+    vision tower and its projector go to mmproj.gguf, tools/ml4_mmproj.py). w1 is the gate, w3 the up and w2 the
     down projection: checked against the published Q8_0 GGUF's ffn_gate_exps on layer 1's
     expert 0 (correlation 0.99998 for w1 as gate, 0.004 as up)."""
     if name in ML4_GLOBAL:
@@ -136,6 +143,8 @@ OTHER_FAMILY_PATHS = {
     "qwen3_5_text":    "Qwen3.8-27B (dense): use tools/convert_qwen36.py, see docs/qwen36.md",
     "qwen3_moe":       "Qwen3-Coder-30B-A3B: use tools/convert_qwen36.py, see docs/qwen36.md",
     "flint":           "Flint: use tools/convert_qwen36.py, or run one of its GGUFs (coli import), see docs/gguf.md",
+    "lfm3":            "LFM3-VL: use tools/convert_qwen36.py, or run one of its GGUFs (coli import), see docs/qwen36.md",
+    "lfm3_vl":         "LFM3-VL: use tools/convert_qwen36.py, or run one of its GGUFs (coli import), see docs/qwen36.md",
     "muse_spark":      "Muse Spark Open is NOT converted by this tool: run one of its GGUFs (coli import), see docs/gguf.md",
     "qwen3":           "Qwen3 (dense) is NOT converted by this tool: the qwen36 engine runs its "
                        "GGUF as the file has it (coli import), see docs/gguf.md",
@@ -177,7 +186,7 @@ def check_model_family(config, where):
                          "refusing to guess. This converter is for GLM-5.2 only.")
     if model_type in GLM52_MODEL_TYPES:
         return
-    if model_type == "mistral_large4":   # its FP8 release, in Mistral's own names
+    if model_type in ML4_MODEL_TYPES:   # its FP8 release, in Mistral's own names
         ML4 = True
         return
     hint = OTHER_FAMILY_PATHS.get(CONFIG_MODEL_TYPE_ALIASES.get(model_type, model_type))
@@ -504,11 +513,15 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
                   keep_mtp=False, keep_idx=False, group_size=0, bits_map=None):
     from safetensors import safe_open
     e8_jobs = []                                # deferred: encoded in a pool after the scan
+    vision = {}                                 # Mistral-Large-4's tower tensors, as they are
     with safe_open(path, framework="pt") as f:
         keys = set(f.keys())
         for src in f.keys():
             name = src
-            if ML4:   # Mistral's names -> the engine's; the draft head and the vision tower not here
+            if ML4 and ml4_mmproj.is_vision(src):
+                if ML4_STASH: vision[src] = ml4_mmproj.raw(f, src)
+                continue
+            if ML4:   # Mistral's names -> the engine's; the draft head not here
                 name = ml4_name(src)
                 if name is None or src.endswith(".qscale_weight"): continue
             kind = classify(name, n_layers, keep_mtp, keep_idx)
@@ -551,6 +564,8 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
                                     quant_int4 if bits <= 4 else quant_int8, w, bits)
                 out_dict[name] = q
                 out_dict[name + ".qs"] = s
+    if vision:
+        ml4_mmproj.stash(ML4_STASH, os.path.splitext(os.path.basename(path))[0], vision)
     if e8_jobs:
         if E8_JOBS > 1:
             from multiprocessing import get_context
@@ -585,11 +600,12 @@ def _shard_already_done(done, key, outdir):
     prev = done.get(key)
     return prev is not None and (prev == "" or os.path.exists(os.path.join(outdir, prev)))
 
-def _init_worker(proj_bits):
+def _init_worker(proj_bits, ml4=False, ml4_stash=None):
     # Restore per-projection expert-bit overrides in each worker: the "spawn" start method
-    # (macOS default) re-imports this module fresh, losing the PROJ_BITS main() populated.
-    global PROJ_BITS
-    PROJ_BITS = proj_bits
+    # (macOS default) re-imports this module fresh, losing the PROJ_BITS main() populated
+    # (and the Mistral-Large-4 switches check_model_family set).
+    global PROJ_BITS, ML4, ML4_STASH
+    PROJ_BITS = proj_bits; ML4 = ml4; ML4_STASH = ml4_stash
 
 def _convert_one(args):
     # Convert one shard in a worker; the main process writes the result, so shard numbering
@@ -700,7 +716,7 @@ def main():
              "repository (~756 GB of traffic) to retain only a few GB. Resumable per shard. "
              "Recommended: --ebits 8.")
     a = ap.parse_args()
-    global E8_JOBS
+    global E8_JOBS, ML4_STASH
     E8_JOBS = max(1, a.jobs)
     if a.ebits is None:
         # testa MTP a int4 = acceptance ~0-4% (misurato, issue #8): il draft sbaglia sempre
@@ -890,6 +906,7 @@ def main():
                       f"{prefix}*.safetensors shards to redo).")
                 return
         done = prog.setdefault("shards", {}); prog["params"] = params
+        if ML4 and not a.mtp and not a.indexer: ML4_STASH = os.path.join(a.outdir, "_mmproj")
         n = 0; fresh = 0; skipped = 0
         import time as _t
         t_start = _t.time()
@@ -903,7 +920,7 @@ def main():
                          a.mtp, a.indexer, a.group_size, bits_map)
                         for i, sp in enumerate(shards)
                         if not _shard_already_done(done, os.path.basename(sp), a.outdir)]
-            _pool = Pool(a.workers, initializer=_init_worker, initargs=(dict(PROJ_BITS),))
+            _pool = Pool(a.workers, initializer=_init_worker, initargs=(dict(PROJ_BITS), ML4, ML4_STASH))
             _result_it = iter(_pool.imap(_convert_one, _pending))
         for i, sp in enumerate(shards):
             key = os.path.basename(sp)
@@ -947,11 +964,12 @@ def main():
         # EN: an outdir whose container already has its metadata.
         if not a.mtp and not a.indexer:
             copied, missing = [], []
-            for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"]:
+            for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"] + \
+                      (["processor_config.json"] if ML4 else []):
                 src = os.path.join(a.indir, fn)
                 if os.path.exists(src): shutil.copy(src, a.outdir); copied.append(fn)
                 else: missing.append(fn)
-            if ML4: ml4_write_config(a.outdir)
+            if ML4: ml4_write_config(a.outdir); ml4_mmproj.finish(a.outdir, a.indir)
             print(f"[META] copied from {a.indir}: {', '.join(copied) if copied else 'nothing'}")
             if missing:
                 print(f"[META] WARNING: not found in {a.indir}: {', '.join(missing)}"
@@ -1194,7 +1212,8 @@ def main():
     if not shards:
         print("ERROR: no .safetensors shards found in this repository.", flush=True)
         return
-    for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"]:
+    for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"] + \
+              (["processor_config.json"] if ML4 else []):
         try: shutil.copy(hf_hub_download(a.repo, fn, local_dir=a.outdir+"/_meta"), a.outdir)
         except Exception: pass
     if ML4: ml4_write_config(a.outdir)
@@ -1250,6 +1269,7 @@ def main():
               "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map,
               "proj_bits": dict(PROJ_BITS)}
     if not check_or_record_params(a.outdir, "out-", params): return
+    if ML4: ML4_STASH = os.path.join(a.outdir, "_mmproj")
     for i, sh in enumerate(shards):
         if free_gb(a.outdir) < a.min_free_gb:
             print(f"STOP: free space is below {a.min_free_gb} GB. Free space and rerun to resume."); break
@@ -1265,6 +1285,8 @@ def main():
         print(f"    -> {os.path.basename(outp)} ({os.path.getsize(outp)/1e9:.2f} GB)", flush=True)
     shutil.rmtree(tmp, ignore_errors=True)
     print("DONE." if i == len(shards)-1 else "INTERRUPTED (rerun to resume).")
+    if ML4 and all(os.path.exists(os.path.join(a.outdir, f"out-{j:05d}.safetensors")) for j in range(len(shards))):
+        ml4_mmproj.finish(a.outdir, a.repo)
 
 if __name__ == "__main__":
     main()

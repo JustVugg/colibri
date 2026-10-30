@@ -1075,7 +1075,21 @@ DSPARK_PREFERENCE = ("Q8_0", "BF16")
 
 # LFM3-VL's vision tower and projector ship as their own GGUF (mmproj-*.gguf, arch clip, projector
 # lfm3vl): one next to the model is linked, the engine runs it through lfm3_vision.h.
-MMPROJ_PROJECTORS = {"lfm3": "lfm3vl"}
+# Mistral-Large-4's Pixtral tower too (projector pixtral): mistral_vision.h, its geometry for the
+# gateway's tools/mistral_image.py in preprocessor_config.json beside the link.
+MMPROJ_PROJECTORS = {"lfm3": "lfm3vl", "mistral-large4": "pixtral"}
+
+
+def write_pixtral_preprocessor(out_dir, mmproj):
+    """preprocessor_config.json for tools/mistral_image.py, from the mmproj's own numbers."""
+    with GGUFReader(mmproj) as r:
+        meta = r.metadata
+    conf = {"patch_size": int(meta["clip.vision.patch_size"]),
+            "spatial_merge_size": int(meta.get("clip.vision.spatial_merge_size", 2)),
+            "longest_edge": int(meta["clip.vision.image_size"]),
+            "image_mean": [float(v) for v in meta["clip.vision.image_mean"]],
+            "image_std": [float(v) for v in meta["clip.vision.image_std"]]}
+    (Path(out_dir) / "preprocessor_config.json").write_text(json.dumps(conf, indent=1), encoding="utf-8")
 
 
 def mmproj_of(path, arch):
@@ -1087,7 +1101,8 @@ def mmproj_of(path, arch):
         return False, f"unreadable ({problem})"
     if meta.get("general.architecture") != "clip":
         return False, f"architecture {meta.get('general.architecture')!r}, not clip"
-    want, got = MMPROJ_PROJECTORS.get(arch), meta.get("clip.vision.projector_type")
+    # LFM3's file names it clip.vision.projector_type, Mistral's (Pixtral) clip.projector_type
+    want, got = MMPROJ_PROJECTORS.get(arch), meta.get("clip.vision.projector_type") or meta.get("clip.projector_type")
     if got != want:
         return False, f"projector {got!r}, {arch} reads {want!r}"
     return True, ""
@@ -1397,9 +1412,9 @@ def main():
                          "(dspark-*.gguf, arch dflash), which drafts only when named")
     ap.add_argument("--no-mtp", action="store_true", help="qwen4exp, deepseek41: no draft head, plain decoding")
     ap.add_argument("--mmproj", type=Path, default=None,
-                    help="lfm3: the vision tower's GGUF (mmproj-*.gguf), unset one next to the model (its folder, "
+                    help="lfm3, mistral-large4: the vision tower's GGUF (mmproj-*.gguf), unset one next to the model (its folder, "
                          "then the parent; BF16 and F16 first)")
-    ap.add_argument("--no-mmproj", action="store_true", help="lfm3: text only, no vision tower linked")
+    ap.add_argument("--no-mmproj", action="store_true", help="lfm3, mistral-large4: text only, no vision tower linked")
     ap.add_argument("--indexer-compress-ratio", type=int, default=0,
                     help="qwen4exp: when the GGUF's attention.compress_ratios are all 0 (a converter "
                          "that read the layers as qwen_sparse_attention)")
@@ -1477,6 +1492,8 @@ def main():
             if link_to:
                 link["mmproj"] = str(link_to.resolve())
         print(f"  vision tower: {link.get('mmproj', 'none found next to the model (--mmproj names one): text only')}")
+        if link.get("mmproj") and MMPROJ_PROJECTORS[arch] == "pixtral":
+            write_pixtral_preprocessor(args.out, link["mmproj"])
     (args.out / "gguf.json").write_text(json.dumps(link, indent=1), encoding="utf-8")
     for r in readers:
         r.close()

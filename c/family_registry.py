@@ -1383,7 +1383,9 @@ FAMILIES = (
         expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
         config_section="root",
         limits=FamilyLimits(4096, 1048576, 1024, 16384, 16, 0, "CTX"),
-        capabilities=FamilyCapabilities(True, True, False, True,
+        # image: Mistral-Large-4's pictures (expand_ml4_images); the engine says whether it loaded
+        # the tower (CAPS vision=), GLM-5.2 has none
+        capabilities=FamilyCapabilities(True, True, False, True, image=True,
                                         logprobs_echo=True, submit_gbytes=True),
         has_gateway_adapter=True,
         has_cli_adapter=True,

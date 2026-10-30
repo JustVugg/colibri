@@ -3651,10 +3651,11 @@ def _preprocess_qwen38_image(data, model_dir, max_tokens=None):
         from pathlib import Path as _Path
         _sys.path.insert(0, str(_Path(__file__).resolve().parent / "tools"))
         from qwen38_image import preprocess
+        return preprocess(data, model_dir, max_tokens)   # Pillow and numpy are imported when it runs
     except ImportError as problem:
-        raise APIError(400, f"image support needs Pillow and numpy ({problem}).",
+        raise APIError(400, f"image support needs Pillow and numpy ({problem}); "
+                                 "pip install pillow numpy",
                        "messages")
-    return preprocess(data, model_dir, max_tokens)
 
 
 def _text_part(part, index, position):
@@ -3705,6 +3706,66 @@ def expand_qwen38_images(messages, model_dir, max_tokens=None, pad=QWEN38_IMAGE_
 # window reaches 16M pixels, 16384 tokens, and the tower attends over all of a picture's patches
 LFM3_IMAGE_PAD = "<|image|>"
 LFM3_MAX_IMAGE_TOKENS = 1024
+
+
+def _preprocess_ml4_image(data, model_dir, max_tokens=None):
+    try:
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(__file__).resolve().parent / "tools"))
+        from mistral_image import preprocess
+        return preprocess(data, model_dir, max_tokens)   # Pillow and numpy are imported when it runs
+    except ImportError as problem:
+        raise APIError(400, f"image support needs Pillow and numpy ({problem}); "
+                                 "pip install pillow numpy",
+                       "messages")
+
+
+ML4_MAX_IMAGE_TOKENS = 256   # merged tokens a picture at most (ML4_MAX_IMAGE_TOKENS): the tower runs on the CPU
+
+
+def expand_ml4_images(messages, model_dir, max_tokens=None):
+    """Mistral-Large-4: each picture becomes its [IMG] rows (a row of merged tokens closed by
+    [IMG_BREAK], the last by [IMG_END], tools/mistral_image.py's placeholder) and its patches.
+    The other parts stay as they are (an assistant turn's thinking chunks among them), for
+    render_chat_mistral_large4. Returns (messages, images); images are (patches, patch rows,
+    patch columns), as the engine's IMAGE frame takes them."""
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
+    from mistral_image import MERGE, placeholder
+    images, rewritten = [], []
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list) or not any(isinstance(p, dict) and p.get("type") in ("image_url", "input_image")
+                                                    for p in content):
+            rewritten.append(message)
+            continue
+        parts = []
+        for part in content:
+            kind = part.get("type") if isinstance(part, dict) else None
+            if kind in ("image_url", "input_image"):
+                url = _image_part_url(part, kind)
+                patches, grid_h, grid_w = _preprocess_ml4_image(_image_bytes_from_url(url), model_dir, max_tokens)
+                images.append((patches, grid_h * MERGE, grid_w * MERGE))
+                parts.append({"type": "text", "text": placeholder(grid_h, grid_w)})
+            else:
+                parts.append(part)
+        rewritten.append({**message, "content": parts})
+    return rewritten, images
+
+
+def ml4_has_vision(model_dir):
+    """Whether a Mistral-Large-4 folder has its vision tower: a GGUF folder's linked mmproj
+    (gguf.json), or the mmproj.gguf a container converted from the FP8 release carries."""
+    if not model_dir:
+        return False
+    if (Path(model_dir) / "mmproj.gguf").is_file():
+        return True
+    try:
+        link = json.loads((Path(model_dir) / "gguf.json").read_text(encoding="utf-8"))
+        return isinstance(link, dict) and bool(link.get("mmproj"))
+    except (OSError, ValueError):
+        return False
 
 
 def qwen36_has_vision(model_dir):
@@ -3814,10 +3875,11 @@ def _preprocess_dsv41_image(data, model_dir, max_tokens=None):
         from pathlib import Path as _Path
         _sys.path.insert(0, str(_Path(__file__).resolve().parent / "tools"))
         from dsv41_image import preprocess
+        return preprocess(data, model_dir, max_tokens)   # Pillow and numpy are imported when it runs
     except ImportError as problem:
-        raise APIError(400, f"image support needs Pillow and numpy ({problem}).",
+        raise APIError(400, f"image support needs Pillow and numpy ({problem}); "
+                                 "pip install pillow numpy",
                        "messages")
-    return preprocess(data, model_dir, max_tokens)
 
 
 def _preprocess_image(data, model_dir):
@@ -3828,10 +3890,11 @@ def _preprocess_image(data, model_dir):
         from pathlib import Path as _Path
         _sys.path.insert(0, str(_Path(__file__).resolve().parent / "tools"))
         from glm53_image import preprocess
+        return preprocess(data, model_dir)   # Pillow and numpy are imported when it runs
     except ImportError as problem:
-        raise APIError(400, f"image support needs Pillow and numpy ({problem}).",
+        raise APIError(400, f"image support needs Pillow and numpy ({problem}); "
+                                 "pip install pillow numpy",
                        "messages")
-    return preprocess(data, model_dir)
 
 
 GLM53_TOOL_PREAMBLE = (
@@ -4168,8 +4231,11 @@ def _ml4_render_content(content, where, kinds, thinking, images):
                 out.append(ML4_THINK_OPEN + block.get("thinking", ""))
                 if block.get("closed", True):
                     out.append(ML4_THINK_CLOSE)
-            elif images and kind in ("image", "image_url"):
-                raise APIError(400, "Mistral-Large-4's pictures are not served yet: send text.", "messages",
+            elif images and kind in ("image", "image_url", "input_image"):
+                # expand_ml4_images turned every picture into its [IMG] rows before this; one left
+                # here is one the engine cannot read
+                raise APIError(400, "Mistral-Large-4's pictures need its vision tower: link the GGUF's "
+                                    "mmproj-*.gguf (coli import) and serve again.", "messages",
                                "unsupported_content_type")
             else:
                 raise APIError(400, f"Only {kinds} chunks are supported in {where}.", "messages")
@@ -9638,6 +9704,11 @@ class APIHandler(BaseHTTPRequestHandler):
             ceiling = os.environ.get("MIMO_MAX_IMAGE_TOKENS")
             messages, images = expand_qwen38_images(messages, model_dir,
                                                     int(ceiling) if ceiling else None)
+        elif CHAT_FLAVOR == "mistral_large4" and ml4_has_vision(model_dir):
+            # Mistral-Large-4: Pixtral's patches (14, merge 2), [IMG] rows closed by [IMG_BREAK] / [IMG_END]
+            ceiling = os.environ.get("ML4_MAX_IMAGE_TOKENS")
+            messages, images = expand_ml4_images(messages, model_dir,
+                                                 int(ceiling) if ceiling else ML4_MAX_IMAGE_TOKENS)
         elif ARCH == "qwen36" and CHAT_FLAVOR == "lfm3" and qwen36_has_vision(model_dir):
             # LFM3-VL: the Qwen processor's patches (16, merge 2, two frames), its own placeholder
             ceiling = os.environ.get("LFM3_MAX_IMAGE_TOKENS")
