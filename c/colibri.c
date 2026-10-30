@@ -112,15 +112,20 @@ static inline void omp_set_num_threads(int n){ (void)n; }
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
 #endif
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+#define COLI_XT 1   /* the routed-expert tier on a device: Vulkan's or CUDA's (xtier.h) */
+#endif
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h"
+#endif
+#ifdef COLI_XT
 #include "xtier.h"   /* the routed-expert tier the MoE engines share, on Vulkan or (COLI_VULKAN=0 COLI_CUDA=1,
                       * a GGUF) on CUDA: XT(f) is vkt_f or cut_f, the same tier compiled over either backend */
 #endif
 #ifdef COLI_CUDA
 #include "cu_dense.h"   /* a GGUF's dense matrices on the CUDA tier's device (cud_mm) */
 #endif
-#ifndef COLI_VULKAN   /* exclusive RAM/VRAM (vk_tier.h) is the Vulkan build's: no device holds an expert */
+#ifndef COLI_XT   /* exclusive RAM/VRAM (vk_tier.h) is a device build's: no device holds an expert */
 static inline int  vkt_ram_first(int layer, int eid) { (void)layer; (void)eid; return 0; }
 static inline void vkt_ram_gave(void) {}
 #define XT(f) vkt_##f   /* no tier device: the stubs above (xtier.h's choice in a Vulkan build) */
@@ -690,11 +695,13 @@ static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S)
 
 static int g_repin;
 static uint64_t g_last_repin;
-#ifdef COLI_VULKAN
+#ifdef COLI_XT
 static int g_vulkan;          /* COLI_VULKAN=1: the device is open */
 static int g_vk_experts=-1;   /* COLI_VK_EXPERTS (deprecated): -1 unset; 0 = no expert tier;
                                * N = the shared tier (vk_tier.c) holds at most N experts */
+#ifdef COLI_VULKAN
 static int g_vk_resident;     /* how many experts currently VK-resident */
+#endif
 /* The routed experts on the device live in the shared tier (vk_tier.c: adaptive, with
  * eviction and a budget). The registry below is the second device's only
  * (COLI_VK_DEV2): its top heat-ranked experts, uploaded ONCE at startup, keyed by
@@ -721,14 +728,20 @@ static struct {
 } g_vkt;
 static int vk_tier_resident_count(Model *m);
 static void vk_tier_turn(Model *m);   /* "[VK] tier colibri turn: ..." after a serve turn */
+#ifdef COLI_VULKAN
 static int g_vk_dense;        /* COLI_VK_DENSE=1: run the resident dense matmuls (attention
                                * projections + shared expert) on Vulkan too */
+#endif
 /* A partial chain (glm_chain.h, vkc_fit): the device holds the first N layers only, or not
  * the head and the MTP layer. The per-matrix path then multiplies on the device only what
  * is there already: a matrix without a device copy stays on the CPU (VK_MAY). */
+#ifdef COLI_VULKAN
 static int g_glmc_partial;
 #define VK_MAY(t) (!g_glmc_partial || (t)->vk != NULL)
+#endif
+#ifdef COLI_VULKAN
 static int g_vk_budget2;      /* COLI_VK_EXPERTS2: dev2 expert-tier cap (with COLI_VK_DEV2) */
+#endif
 static int g_vk_reg_n2;       /* experts resident on the dev2 tier */
 /* Resolve the main shader path (#523): COLI_VK_SHADERS may be the qmatmul.spv file itself
  * OR a directory containing it; unset, look alongside the binary (<exedir>/shaders/, the
@@ -736,13 +749,21 @@ static int g_vk_reg_n2;       /* experts resident on the dev2 tier */
  * launching from outside c/ works. The other shaders load as siblings of the returned path
  * (backend derive_*). The backend's coli_vk_shader_path, which every other engine uses:
  * this copy of it looked beside the binary on Linux only. */
+#ifdef COLI_VULKAN
 static const char *vk_resolve_spv(char *buf, size_t n){ return coli_vk_shader_path(buf, n); }
+#endif
 /* PROF anatomy of the VK expert block (master-thread accumulated in moe(), printed by
  * profile_print): where a decode block's wall goes besides t_ecpu/t_ewait/t_egpu. */
-static double g_vkb_cls, g_vkb_issue, g_vkb_acc, g_vkb_wrk, g_vkb_join;
-static int64_t g_vkb_blocks, g_vkb_nvk, g_vkb_nvk2, g_vkb_ncpu;
+static double g_vkb_issue, g_vkb_acc;
+static int64_t g_vkb_blocks, g_vkb_nvk, g_vkb_ncpu;
+#ifdef COLI_VULKAN   /* the second device's and the chain's (PROF) */
+static double g_vkb_cls, g_vkb_wrk, g_vkb_join;
+static int64_t g_vkb_nvk2;
+#endif
+#ifdef COLI_VULKAN
 static int g_vk_attn;         /* COLI_VK_ATTN=1: run the MLA absorb attention core on Vulkan
                                * (mirrors COLI_CUDA_ATTN; KV latent cache mirrored on-device) */
+#endif
 #endif
 #ifdef COLI_CUDA
 static int g_cuda_enabled;
@@ -6434,7 +6455,7 @@ static void ecache_promote_ws(Model *m,int layer,int nmiss){
 /* pin ∪ LRU residency probe (used by CACHE_ROUTE max-rank fill), plus the Vulkan expert
  * tier's residents: no disk read either (vkt_resident is 0 without COLI_VULKAN=1). */
 static int expert_is_resident(Model *m, int layer, int eid){
-#ifdef COLI_VULKAN
+#ifdef COLI_XT
     if(XT(resident)(layer,eid)) return 1;
 #endif
     return pin_indexed(m,layer,eid)!=NULL || ecache_indexed(m,layer,eid,0)!=NULL;
@@ -6494,8 +6515,8 @@ static int mb_gs_compat(int est_fmt, int est_gs, int fmt, int gs){
     return !(est_fmt==4 && fmt==4 && gs!=est_gs);
 }
 
-#ifdef COLI_VULKAN
-/* ---- the routed experts on the Vulkan device (COLI_VULKAN=1) -----------------------
+#ifdef COLI_XT
+/* ---- the routed experts on the Vulkan device (COLI_VULKAN=1), or CUDA's (a GGUF, COLI_VULKAN=0) ----
  * The shared tier (vk_tier.c) holds a cache of routed experts on the device: warm from
  * .coli_usage at startup, then adapting while you chat (an expert the CPU computes is
  * offered to it and promoted when there is room or when it is hotter than the coldest
@@ -6647,8 +6668,10 @@ static void moe_vk(Model *m,int layer,const float *x,int S,float *out,const int 
         for(int i=0;i<n;i++) if(taken[i] && !seen[ib[i]]){ seen[ib[i]]=1; m->hits++; m->hit_vk++; if(g_prof) g_vkb_nvk++; }
         /* the second device: the pairs the tier did not take whose expert is in its
          * registry, one group (64 experts at most), issued on a worker thread */
+        int iss2_on=0;
+#ifdef COLI_VULKAN
         ColiVkTensor *g2[64],*u2[64],*d2[64]; int n2rows[64], ne2=0, tot2=0;
-        Vk2Iss iss2={0}; pthread_t iss2_th; int iss2_threaded=0, iss2_on=0;
+        Vk2Iss iss2={0}; pthread_t iss2_th; int iss2_threaded=0;
         if(dev2){
             int eo[64];
             for(int i=0;i<n && ne2<64;i++){ int e=ib[i];
@@ -6667,6 +6690,7 @@ static void moe_vk(Model *m,int layer,const float *x,int S,float *out,const int 
                 else iss2.rc=coli_vk_expert_group_issue2(g2,u2,d2,n2rows,ne2,x2);
             }
         }
+#endif
         for(int i=0;i<n;i++) want[i] = ib[i]>=0 && !taken[i] && !on2[i];
         if(g_prof) for(int i=0;i<n;i++) if(want[i]) g_vkb_ncpu++;
         vk_cpu_pairs(m,layer,xb,rows,K,ib,want,ctb,xg,gg,uu,hh,1);   /* while the batches run */
@@ -6676,6 +6700,7 @@ static void moe_vk(Model *m,int layer,const float *x,int S,float *out,const int 
             memset(taken,0,(size_t)n);
         }
         if(g_prof) m->t_egpu+=now_s()-tj;
+#ifdef COLI_VULKAN
         if(iss2_on){
             if(iss2_threaded){ double t_j0=now_s(); pthread_join(iss2_th,NULL);
                 if(g_prof){ g_vkb_join+=now_s()-t_j0; g_vkb_wrk+=iss2.dt; } }
@@ -6684,6 +6709,8 @@ static void moe_vk(Model *m,int layer,const float *x,int S,float *out,const int 
                 memset(on2,0,(size_t)n);
             }
         }
+#endif
+        (void)iss2_on;
         /* every rank of every row in routing order, wherever it was computed */
         for(int s=0;s<rows;s++){
             float *os=out+(int64_t)(s0+s)*D;
@@ -7155,8 +7182,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     float *group_weight=group_enabled?xalloc((size_t)64*S*sizeof(float),"moe group_weight"):NULL;
 #endif
     int vk_active = 0; (void)vk_active;
-#ifdef COLI_VULKAN
-    /* COLI_VULKAN=1 with an expert tier (vk_tier.c, or COLI_VK_DEV2's registry):
+#ifdef COLI_XT
+    /* COLI_VULKAN=1 with an expert tier (vk_tier.c, or COLI_VK_DEV2's registry), or a GGUF's on CUDA:
      * moe_vk() takes this call's routed experts, by blocks of rows, in place of the
      * loop below; the shared expert stays in FASE E. Off, nothing here runs. */
     vk_active = moe_vk_on(m,layer);
@@ -12107,6 +12134,8 @@ static void vk_dense_preload(Model *m){
     if(nt) fprintf(stderr,"[VK] dense preloaded: %d tensors, %.2f GB VRAM in %.1fs\n",
                    nt,bytes/1e9,now_s()-t0);
 }
+#endif
+#ifdef COLI_XT   /* the tier's experts on Vulkan or CUDA */
 
 /* ---- COLI_VULKAN=1: the routed experts' places on the device, at startup ----------
  * vk_tier_start describes the routed experts to the shared tier (vk_tier.c) and warms
@@ -12262,7 +12291,18 @@ static int xt_block_elems(int fmt){
 #ifdef COLI_CUDA
     if(xt_cuda()) return coli_cuda_block_elems(fmt);
 #endif
+#ifdef COLI_VULKAN
     return coli_vk_block_elems(fmt);
+#else
+    return 0;
+#endif
+}
+/* the tier's device shares the RAM (an iGPU): CUDA's never does here */
+static int xt_shares_ram(void){
+#ifdef COLI_VULKAN
+    if(!xt_cuda()) return coli_vk_device_shares_ram();
+#endif
+    return 0;
 }
 static void vk_tier_start(Model *m){
     Cfg *c=&m->c; int E=c->n_experts, NL=c->n_layers;
@@ -12337,6 +12377,7 @@ static void vk_tier_start(Model *m){
 #ifdef COLI_CUDA
     if(xt_cuda()) dense+=(double)g_cl_cud;   /* cu_dense.h's budget, taken before the tier's */
 #endif
+#ifdef COLI_VULKAN   /* the absorb core's KV mirror, and a partial dense chain: Vulkan's */
     if(g_vk_attn){ int ctx=getenv("CTX")?atoi(getenv("CTX")):4096; if(ctx<1) ctx=4096;
         double mir=(double)(g_glmc_partial ? g_glmc_fit.n : NL)*ctx*(c->kv_lora+c->qk_rope)*4.0;
         const char *tr=getenv("COLI_VK_TIER_RESERVE_GB");
@@ -12352,6 +12393,7 @@ static void vk_tier_start(Model *m){
      * allocates its scratch and the N layers' KV mirrors */
     if(g_glmc_partial) dense+=(double)g_glmc_lazy;
     if(g_mlv_vk_keep) dense+=(double)g_mlv_bytes;   /* Mistral-Large-4's vision tower, kept on the device */
+#endif
     { const char *r=getenv("COLI_VK_RESERVE_GB"), *tr=getenv("COLI_VK_TIER_RESERVE_GB");
       if(r && *r){ double extra=atof(r)-(tr&&*tr?atof(tr):1.0); if(extra>0) dense+=extra*1073741824.0; } }
     /* The MTP head's layer (index NL): its experts as the container keeps them (int8
@@ -12360,7 +12402,7 @@ static void vk_tier_start(Model *m){
      * MTP head's layer on the tier"); COLI_VK_TIER_MTP=1 or 0 decides. */
     VktFmt xgu={VKT_SRC_NONE,0}, xdn={VKT_SRC_NONE,0}; int xf[3]={0,0,0}, xgs[3]={0,0,0};
     { const char *tm=getenv("COLI_VK_TIER_MTP");
-      int want = tm&&*tm ? *tm!='0' : xt_cuda() || !coli_vk_device_shares_ram();
+      int want = tm&&*tm ? *tm!='0' : !xt_shares_ram();
       if(m->has_mtp && want && gguf){
           if(g_vkt.gt[2*NL]>0){
               xgu=(VktFmt){(VktSrc)(VKT_SRC_GGML+g_vkt.gt[2*NL]),0}; xdn=(VktFmt){(VktSrc)(VKT_SRC_GGML+g_vkt.gt[2*NL+1]),0};
@@ -12392,7 +12434,10 @@ static void vk_tier_start(Model *m){
                   .max_experts=g_vk_experts>0 ? g_vk_experts : 0,
                   .load=vk_load, .release=vk_unhold, .load_ctx=m, .load_batch=vk_load_batch,
                   .layer_gate_up=lgu, .layer_down=ldn};
-    if(!xt_cuda()) atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
+    /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
+#ifdef COLI_VULKAN
+    if(!xt_cuda()) atexit(coli_vk_shutdown);
+#endif
     const int tier_on=XT(init)(&vc,m->eusage);
     free(lgu); free(ldn);   /* read during vkt_init only */
     if(!tier_on) return;
@@ -12429,6 +12474,8 @@ static void vk_tier_start(Model *m){
     free(ql); free(qe);
 }
 
+#endif
+#ifdef COLI_VULKAN
 /* COLI_VK_DEV2: the second device's registry takes the hottest experts of the history
  * that the tier does not hold, up to COLI_VK_EXPERTS2 and COLI_VK_RESERVE2_GB, uploaded
  * once (int4 per row, int4-gs and int3-g64 experts). Only when the shared tier did not
@@ -14848,9 +14895,9 @@ int main(int argc, char **argv){
     vk_tier_start(&m);      /* the shared expert tier: needs the usage history and the cap above */
     vk_dev2_fill(&m);       /* COLI_VK_DEV2: the hottest experts the tier does not hold */
     glmc_atexit(&m);        /* after the tier's: the chain goes before the device */
+#endif
 #ifdef COLI_CUDA
     colibri_cu_tier_start(&m);   /* COLI_CUDA=1 with no Vulkan device and a GGUF: the same tier on CUDA */
-#endif
 #endif
     const char *stats=getenv("STATS");   /* STATS=<file> -> istogramma uso expert a fine run */
 
