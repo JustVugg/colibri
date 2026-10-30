@@ -206,6 +206,9 @@ jobs:
           # probe that layout as well as the source checkout's one-level-up form.
           mkdir -p dist/web
           cp -r web/dist dist/web/dist
+          # the chat UI (coli ui) sits next to coli as well: its page and its server
+          mkdir -p dist/ui
+          cp ui/index.html ui/server.py ui/agents.py ui/responses_shim.py ui/web.py ui/models.py ui/README.md dist/ui/
           cd dist
           if [ "${{ matrix.ext }}" = ".exe" ]; then
             7z a colibri-${TAG}-${{ matrix.name }}.zip *
@@ -331,6 +334,10 @@ jobs:
           # path is exactly the failure this whole step exists to catch.
           test -f web/dist/index.html   || { echo "FAIL: dashboard missing from archive"; exit 1; }
           test -f web/dist/experts.json || { echo "FAIL: expert atlas missing from archive"; exit 1; }
+          test -f ui/index.html && test -f ui/server.py || { echo "FAIL: chat UI missing from archive"; exit 1; }
+          # the Models page imports colibri's setup modules from next to coli: packaged too
+          python3 -c "import sys; sys.path.insert(0, 'ui'); import models, os; assert os.path.samefile(models.COLI_DIR, '.'); print('OK: ui/models.py imports from', models.COLI_DIR)" \
+            || { echo "FAIL: packaged ui/models.py does not import"; exit 1; }
           python3 -c "import sys; sys.path.insert(0, '.'); from openai_server import APIHandler as A; d = A.WEB_DIST; assert (d / 'index.html').is_file(), 'server resolved WEB_DIST to %s, which has no index.html' % d; assert (d / 'experts.json').is_file(), 'no expert atlas under %s' % d; print('OK: the packaged server resolves the dashboard at', d)"
 
       # The GPU backends in the archive, by behaviour as above. Vulkan (Linux, Windows):
