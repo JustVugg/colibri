@@ -125,9 +125,10 @@ last by `[IMG_END]`. The engine's rows replace those tokens' embeddings; the tex
 picture keeps its cached prefix, the picture's rows are never reused. The tower is 3.4 GB beside the
 model, counted in the RAM plan; it is loaded in serve mode only (`ML4_VISION=0` skips it).
 
-An mmproj stores the q and k rows of each head in interleaved rotary order (its converter's
-permutation): the engine rotates pairs (2j, 2j + 1). Rotating halves, as the release's code does on
-its own weights, kept a test picture's colours and lost its shapes. Checked:
+The mmproj, like the release's own files, stores the q and k rows of each head in interleaved rotary
+order: the engine rotates pairs (2j, 2j + 1). transformers' `modeling_pixtral.py` rotates halves,
+on weights its own conversion reorders; on these files that kept a test picture's colours and lost
+its shapes. Checked:
 
 - `tools/mistral_vision_ref.py`, a numpy transcription that undoes the permutation and rotates
   halves: the engine's rows within 1.0e-5 of their RMS on the real mmproj (`ML4_VIS_DUMP` writes
@@ -155,6 +156,18 @@ whole. The default is int4 with a scale per 64 for every matrix, int8 for the em
 head (`--ebits`, `--xbits`, `--io-bits` change them). Checked on the release's own bytes against
 the Q8_0 GGUF: `qscale_weight` multiplies (dividing is off by 1e7), `w1` is the gate and `w3` the up.
 The converter writes the engine's flat `config.json` (the release's kept as `config.hf.json`).
+
+The release carries the vision tower too (`vision_encoder.*`, `vision_language_adapter.*`,
+`patch_merger.*`, `pre_mm_projector_norm.*`, BF16): the converter keeps it as it is and writes the
+container's `mmproj.gguf` and `preprocessor_config.json`, which serve mode and the gateway read as a
+GGUF folder's linked mmproj. Built from the release this way, the file is the GGUF repository's
+`mmproj-BF16.gguf` tensor for tensor (276 tensors, the same bytes, checked on the real files). A
+container converted before this, or any other folder, gets it from the release alone (only the
+tower's 3.4 GB is fetched):
+
+```
+python3 tools/ml4_mmproj.py --release mistralai/Mistral-Large-4-1T-A52B --out ~/models/mistral-large4-colibri
+```
 
 A container runs on CUDA too (the experts and the dense matrices on the card, `CUDA_DENSE=1`). The
 tiny model's int4 container gives the same tokens on the CPU, CUDA and Vulkan, the logits within

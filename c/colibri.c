@@ -14616,7 +14616,8 @@ int main(int argc, char **argv){
                            "         Keep it on a native Linux fs (ext4/xfs/zfs) for memory efficiency and speed.\n", snap);
     }
 #endif
-    /* Mistral-Large-4's vision tower (gguf.json "mmproj", ML4_MMPROJ names one, ML4_VISION=0 skips
+    /* Mistral-Large-4's vision tower (gguf.json "mmproj", else the mmproj.gguf a container converted
+     * from the FP8 release carries, tools/ml4_mmproj.py; ML4_MMPROJ names one, ML4_VISION=0 skips
      * it), in serve mode, where the gateway sends pictures: before the pins and cap_for_ram, which
      * then count its bytes as resident. */
     if(m.c.ml4 && getenv("SERVE") && !(getenv("ML4_VISION") && getenv("ML4_VISION")[0]=='0')){
@@ -14631,6 +14632,11 @@ int main(int argc, char **argv){
                 jval *mv=root?json_get(root,"mmproj"):NULL;
                 if(mv && mv->t==J_STR && mv->str[0]) gguf_path_join(mp,sizeof mp,snap,mv->str);
                 free(arena);
+            }
+            if(!mp[0]){
+                char own[4096]; snprintf(own,sizeof own,"%s/mmproj.gguf",snap);
+                FILE *of=fopen(own,"rb");
+                if(of){ fclose(of); snprintf(mp,sizeof mp,"%s",own); }
             }
         }
         if(mp[0]){

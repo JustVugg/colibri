@@ -236,6 +236,14 @@ class Ml4ImageTest(unittest.TestCase):
         self.assertEqual(out[2]["content"][0], {"type": "text", "text": "Look:"})
         self.assertTrue(out[2]["content"][1]["text"].endswith("[IMG_END]"))
 
+    def test_a_converted_container_carries_its_own_tower(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:   # tools/convert_fp8_to_int4.py: no gguf.json
+            (Path(folder) / "mmproj.gguf").write_bytes(b"GGUF")
+            messages, image = self.expand(folder)
+        self.assertTrue(messages[0]["content"][0]["text"].endswith("[IMG_END]"))
+        self.assertEqual((image[1], image[2]), (4, 6))
+
     def test_no_tower_no_expansion_and_a_clear_refusal(self):
         import tempfile
         with tempfile.TemporaryDirectory() as folder:
@@ -320,6 +328,98 @@ class Ml4MmprojImportTest(unittest.TestCase):
             conf = json.loads((Path(folder) / "preprocessor_config.json").read_text())
         self.assertEqual(conf, {"patch_size": 14, "spatial_merge_size": 2, "longest_edge": 1540,
                                 "image_mean": [0.5, 0.25, 0.125], "image_std": [0.25, 0.5, 0.75]})
+
+
+class Ml4MmprojFromReleaseTest(unittest.TestCase):
+    """tools/ml4_mmproj.py: the release's tower tensors (Mistral's names, BF16) as the published
+    mmproj has them (the matrices BF16 as they are, the norms, the patch kernel and the merger
+    widened to F32, dims in ggml order, the clip keys from the release's configs), and the
+    converter's stash written at the end, or kept with the command when a tensor is missing."""
+
+    def setUp(self):
+        try:
+            import numpy as np
+        except ImportError:
+            self.skipTest("needs numpy")
+        sys.path.insert(0, str(HERE.parent / "tools"))
+        import ml4_mmproj
+        self.np, self.mp = np, ml4_mmproj
+        rng = np.random.default_rng(3)
+        D, F, P, OH = 8, 12, 2, 16
+        shapes = {"vision_encoder.patch_conv.weight": [D, 3, P, P], "vision_encoder.ln_pre.weight": [D],
+                  "pre_mm_projector_norm.weight": [D], "patch_merger.merging_layer.weight": [D, D * 4],
+                  "vision_language_adapter.w_in.weight": [OH, D], "vision_language_adapter.w_out.weight": [OH, OH]}
+        for k, shape in (("attention.wq", [D, D]), ("attention.wk", [D, D]), ("attention.wv", [D, D]),
+                         ("attention.wo", [D, D]), ("attention_norm", [D]), ("ffn_norm", [D]),
+                         ("feed_forward.w1", [F, D]), ("feed_forward.w3", [F, D]), ("feed_forward.w2", [D, F])):
+            shapes[f"vision_encoder.transformer.layers.0.{k}.weight"] = shape
+        self.tensors = {n: ("BF16", sh, rng.integers(0x3000, 0x4000, int(np.prod(sh)), dtype=np.uint16).tobytes())
+                        for n, sh in shapes.items()}
+        self.config = {"model_type": "mistral_large4", "spatial_merge_size": 2,
+                       "vision_config": {"hidden_size": D, "intermediate_size": F, "num_hidden_layers": 1,
+                                         "num_attention_heads": 2, "patch_size": P, "image_size": 1540,
+                                         "rope_parameters": {"rope_theta": 10000.0}}}
+        self.processor = {"image_processor": {"image_mean": [0.5, 0.25, 0.125], "image_std": [0.25, 0.5, 0.75],
+                                              "size": {"longest_edge": 1540}}}
+
+    def read(self, path):
+        from gguf_reader import GGUFReader
+        with GGUFReader(str(path)) as r:
+            return r.metadata, {t["name"]: (t["type_name"], list(t["dims"]), r.read_tensor(t)) for t in r.tensors}
+
+    def test_the_published_layout(self):
+        import tempfile
+        np = self.np
+        with tempfile.TemporaryDirectory() as folder:
+            self.mp.write(Path(folder) / "mmproj.gguf", self.tensors, self.config, self.processor)
+            meta, got = self.read(Path(folder) / "mmproj.gguf")
+        self.assertEqual(len(got), 15)
+        q = self.tensors["vision_encoder.transformer.layers.0.attention.wq.weight"][2]
+        self.assertEqual(got["v.blk.0.attn_q.weight"], ("BF16", [8, 8], q))   # q's rows as they are
+        self.assertEqual(got["v.blk.0.ffn_down.weight"][:2], ("BF16", [12, 8]))
+        self.assertEqual(got["v.blk.0.ffn_gate.weight"][2],
+                         self.tensors["vision_encoder.transformer.layers.0.feed_forward.w1.weight"][2])
+        for name in ("v.patch_embd.weight", "v.pre_ln.weight", "v.blk.0.ln1.weight", "v.blk.0.ln2.weight",
+                     "mm.input_norm.weight", "mm.patch_merger.weight"):
+            self.assertEqual(got[name][0], "F32", name)
+        wide = np.frombuffer(got["mm.patch_merger.weight"][2], dtype=np.float32)
+        bits = np.frombuffer(self.tensors["patch_merger.merging_layer.weight"][2], dtype=np.uint16)
+        self.assertTrue(np.array_equal(wide.view(np.uint32), bits.astype(np.uint32) << 16))
+        self.assertEqual(got["v.patch_embd.weight"][1], [2, 2, 3, 8])
+        self.assertEqual((meta["clip.projector_type"], meta["clip.vision.projection_dim"], meta["clip.vision.block_count"],
+                          meta["clip.vision.attention.head_count"], meta["clip.vision.spatial_merge_size"]),
+                         ("pixtral", 16, 1, 2, 2))
+        self.assertEqual([round(x, 6) for x in meta["clip.vision.image_mean"]], [0.5, 0.25, 0.125])
+
+    def test_the_converters_stash(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        names = sorted(self.tensors)
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / "config.hf.json").write_text(json.dumps(self.config))
+            (Path(folder) / "processor_config.json").write_text(json.dumps(self.processor))
+            self.mp.stash(Path(folder) / "_mmproj", "a", {n: self.tensors[n] for n in names[:7]})
+            with redirect_stdout(io.StringIO()) as said:
+                self.assertFalse(self.mp.finish(folder, "mistralai/X"))   # a shard of the tower missing
+            self.assertIn("tools/ml4_mmproj.py --release mistralai/X", said.getvalue())
+            self.assertTrue((Path(folder) / "_mmproj").is_dir())
+            self.mp.stash(Path(folder) / "_mmproj", "b", {n: self.tensors[n] for n in names[7:]})
+            with redirect_stdout(io.StringIO()):
+                self.assertTrue(self.mp.finish(folder))
+            self.assertFalse((Path(folder) / "_mmproj").exists())
+            _meta, got = self.read(Path(folder) / "mmproj.gguf")
+            conf = json.loads((Path(folder) / "preprocessor_config.json").read_text())
+        self.assertEqual(len(got), 15)
+        self.assertEqual(conf, {"patch_size": 2, "spatial_merge_size": 2, "longest_edge": 1540,
+                                "image_mean": [0.5, 0.25, 0.125], "image_std": [0.25, 0.5, 0.75]})
+
+    def test_names(self):
+        self.assertTrue(self.mp.is_vision("vision_language_adapter.w_in.weight"))
+        self.assertFalse(self.mp.is_vision("layers.0.attention.wq.weight"))
+        self.assertEqual(self.mp.gguf_name("vision_encoder.transformer.layers.29.feed_forward.w3.weight"),
+                         "v.blk.29.ffn_up.weight")
+        self.assertIsNone(self.mp.gguf_name("vision_encoder.transformer.layers.0.attention.wq.bias"))
 
 
 if __name__ == "__main__":

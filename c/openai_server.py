@@ -3755,9 +3755,12 @@ def expand_ml4_images(messages, model_dir, max_tokens=None):
 
 
 def ml4_has_vision(model_dir):
-    """Whether a Mistral-Large-4 folder links its vision tower (gguf.json's mmproj)."""
+    """Whether a Mistral-Large-4 folder has its vision tower: a GGUF folder's linked mmproj
+    (gguf.json), or the mmproj.gguf a container converted from the FP8 release carries."""
     if not model_dir:
         return False
+    if (Path(model_dir) / "mmproj.gguf").is_file():
+        return True
     try:
         link = json.loads((Path(model_dir) / "gguf.json").read_text(encoding="utf-8"))
         return isinstance(link, dict) and bool(link.get("mmproj"))
