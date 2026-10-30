@@ -299,8 +299,9 @@ class Ml4MmprojImportTest(unittest.TestCase):
     LFM3's file says clip.vision.projector_type) and writes its geometry for the gateway."""
 
     def mmproj(self, folder, projector, key="clip.projector_type"):
+        import struct
         sys.path.insert(0, str(HERE.parent / "tools"))
-        from make_flint_tiny import _gguf_bytes
+        from ml4_mmproj import _kv_bytes   # no torch: CI's Python job has none
         U32, F32, STR, ARR = 4, 6, 8, 9
         kv = [("general.architecture", STR, "clip"), (key, STR, projector),
               ("clip.vision.patch_size", U32, 14), ("clip.vision.spatial_merge_size", U32, 2),
@@ -308,7 +309,7 @@ class Ml4MmprojImportTest(unittest.TestCase):
               ("clip.vision.image_mean", ARR, (F32, [0.5, 0.25, 0.125])),
               ("clip.vision.image_std", ARR, (F32, [0.25, 0.5, 0.75]))]
         path = Path(folder) / "mmproj-BF16.gguf"
-        path.write_bytes(_gguf_bytes(kv, []))
+        path.write_bytes(b"GGUF" + struct.pack("<IQQ", 3, 0, len(kv)) + _kv_bytes(kv)[0])
         return path
 
     def test_pixtral_is_mistrals_and_lfm3vl_is_not(self):

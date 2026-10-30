@@ -2019,7 +2019,7 @@ tests/test_tok_deepseek$(EXE): tests/test_tok_deepseek.c
 tests/test_tok_tekken$(EXE): tests/test_tok_tekken.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # Mistral-Large-4's vision tower (mistral_vision.h) against tools/mistral_vision_ref.py on a tiny mmproj
-tests/mistral_vision_check$(EXE): tests/mistral_vision_check.c mistral_vision.h gguf.h ggml_quants.h
+tests/mistral_vision_check$(EXE): tests/mistral_vision_check.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 .PHONY: mistral-vision-check
 mistral-vision-check: tests/mistral_vision_check$(EXE)
