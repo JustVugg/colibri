@@ -137,25 +137,12 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
             y[(int64_t)s*O+o]=a*sc; } }
 }
 
-/* ---- y[S,O] = x[S,I] @ W^T, W int4 packed + per-GROUP scales (fmt=4) ----- */
-static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
-                              int S, int I, int O, int gs){
-    int rb=(I+1)/2; int ng=(I+gs-1)/gs;
-    int o0=0;
-#if defined(__SSE4_1__) && !defined(__AVX2__)
-    /* Even group sizes keep every group start on a low-nibble boundary. */
-    if(!(gs&1)){
-        o0=O&~3;
-        if(o0) matmul_i4_grouped_sse41_rows4(y,x,q4,scale,S,I,O,gs,rb,ng,o0);
-        if(o0==O) return;
-    }
-#endif
-    #pragma omp parallel for schedule(static)
-    for(int o=o0;o<O;o++){
-        const uint8_t *w=q4+(int64_t)o*rb;
-        const float *scl=scale+(int64_t)o*ng;
-        for(int s=0;s<S;s++){
-            const float *xs=x+(int64_t)s*I; float a=0;
+/* One output row of the fmt=4 matmul for one input row: the loop matmul_i4_grouped runs per (o, s), pulled out
+ * so a caller already inside a parallel region (the fused host-expert path) can use it without a fork/join.
+ * Same operations and order as its ordinary per-row branch. The separate
+ * four-row SSE4.1 branch has its own reduction order and remains unchanged. */
+static inline float i4g_dot(const uint8_t *w, const float *scl, const float *xs, int I, int gs){
+    float a=0;
             for(int g=0; g*gs<I; g++){
                 int base=g*gs; int glen=gs; if(base+glen>I) glen=I-base;
                 float sc=scl[g];
@@ -185,7 +172,28 @@ static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const
                     else { uint8_t byte=w[i>>1]; a+=xs[i]*(float)((int)(byte&0xF)-8)*sc; }
                 }
             }
-            y[(int64_t)s*O+o]=a;
+    return a;
+}
+
+/* ---- y[S,O] = x[S,I] @ W^T, W int4 packed + per-GROUP scales (fmt=4) ----- */
+static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
+                              int S, int I, int O, int gs){
+    int rb=(I+1)/2; int ng=(I+gs-1)/gs;
+    int o0=0;
+#if defined(__SSE4_1__) && !defined(__AVX2__)
+    /* Even group sizes keep every group start on a low-nibble boundary. */
+    if(!(gs&1)){
+        o0=O&~3;
+        if(o0) matmul_i4_grouped_sse41_rows4(y,x,q4,scale,S,I,O,gs,rb,ng,o0);
+        if(o0==O) return;
+    }
+#endif
+    #pragma omp parallel for schedule(static)
+    for(int o=o0;o<O;o++){
+        const uint8_t *w=q4+(int64_t)o*rb;
+        const float *scl=scale+(int64_t)o*ng;
+        for(int s=0;s<S;s++){
+            y[(int64_t)s*O+o]=i4g_dot(w,scl,x+(int64_t)s*I,I,gs);
         }
     }
 }

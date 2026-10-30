@@ -1908,6 +1908,13 @@ endif
 glm53$(EXE): glm53.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(CFLAGS) glm53.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
 
+# CPU-only exact host kernel/original grouped-matmul parity; no model required.
+.PHONY: glm53-host-check
+glm53-host-check: tests/test_glm53_host$(EXE)
+	./tests/test_glm53_host$(EXE)
+tests/test_glm53_host$(EXE): tests/test_glm53_host.c .build-config
+	$(CC) $(NOCUDA_CFLAGS) tests/test_glm53_host.c -o $@ $(NOCUDA_LDFLAGS)
+
 ifneq ($(EXE),)
 .PHONY: kimi_k3
 kimi_k3: kimi_k3$(EXE)

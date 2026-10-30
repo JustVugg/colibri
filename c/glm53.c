@@ -74,6 +74,7 @@
 #include "st.h"
 #include "ggml_view.h"
 #include "quant.h"
+#include "glm53_host.h"
 #include "tok.h"
 #include "omp_tune.h"
 #ifdef COLI_METAL
@@ -2318,6 +2319,27 @@ static int glm53_vk_load(void *ctx, int index, int e, VktExpertSrc *src, void **
     return glm53_vk_load_batch(ctx, index, &e, 1, src, h) == 1;
 }
 static void glm53_vk_unhold(void *ctx, void *h) { (void)ctx; glm53_drop_rows((Slot *)h); }
+/* Decode with the host experts in one parallel region for gate/up, SwiGLU and
+ * down, avoiding the per-expert fork/join overhead of mlp3_rows. The grouped
+ * dot arithmetic is unchanged; SSE4.1-only builds decline fusion to preserve
+ * their four-row kernel's reduction order. GLM53_FUSED_HOST=0 turns fusion off.
+ * dst[e] is expert e's output row (hidden floats). */
+static int host_experts_fused(int n, const Mat *g, const Mat *u, const Mat *d, const float *x,
+                              float limit, float *const *dst) {
+    static int kernel = -1;
+    if (kernel < 0) {
+        const char *e = getenv("GLM53_HOST_KERNEL");
+        kernel = e ? atoi(e) : 1;
+        if (kernel < 0 || kernel > 1) kernel = 0;
+        fprintf(stderr, "glm53: host kernel %d (0=original, 1=exact-g64)\n", kernel);
+    }
+    G53HostMat hg[32], hu[32], hd[32];
+    for (int e = 0; e < n; e++) {
+        hg[e] = (G53HostMat){g[e].q4, g[e].s}; hu[e] = (G53HostMat){u[e].q4, u[e].s}; hd[e] = (G53HostMat){d[e].q4, d[e].s};
+    }
+    return g53h_compute(n, g[0].rows, g[0].columns, d[0].rows, g[0].gs, hg, hu, hd, x, limit, dst, kernel);
+}
+
 /* Pairs i of one block that want[i] marks, on the CPU: their experts in first-seen
  * order, in blocks of the layer's cache slots as ffn_layer reads them, each computed
  * once for all its rows into ctb[i]. note: offer each to the tier. */
@@ -2340,6 +2362,37 @@ static void ffn_vk_cpu(GModel *m, int index, const float *x, int rows, int K, co
     for (int base = 0; base < nu; base += block) {
         const int here = base + block <= nu ? block : nu - base;
         expert_block_read(m, index, uq + base, here, slot_of, to_read);
+        if (rows == 1 && here >= 2 && here <= 32) {   /* decode: every expert of the block in one parallel region */
+            static int fused_on = -1;
+            if (fused_on < 0) { const char *e = getenv("GLM53_FUSED_HOST"); fused_on = !e || atoi(e); }
+            Mat fg[32], fu[32], fd[32]; float *dst[32]; int pos[32], ok = fused_on;
+            for (int u = 0; u < here && ok; u++) {
+                const int eid = uq[base + u];
+                Slot *slot = &cache->s[slot_of[u]];
+                slot->used = ++m->clock;
+                expert_mats(m, index, slot, &fg[u], &fu[u], &fd[u]);
+                ok = fg[u].fmt == 4 && fu[u].fmt == 4 && fd[u].fmt == 4 && fg[u].q4 && fu[u].q4 && fd[u].q4 &&
+                     !fg[u].resident && fg[u].gs == fg[0].gs && fg[u].rows == fg[0].rows && fg[u].columns == fg[0].columns &&
+                     fu[u].gs == fg[0].gs && fu[u].rows == fg[0].rows && fu[u].columns == fg[0].columns &&
+                     fd[u].gs == fg[0].gs && fd[u].rows == D && fd[u].columns == fg[0].rows;
+                pos[u] = -1;
+                for (int i = 0; i < n; i++) if (want[i] && ib[i] == eid) { pos[u] = i; break; }
+                ok = ok && pos[u] >= 0;
+                dst[u] = pos[u] >= 0 ? ctb + (size_t)pos[u] * D : NULL;
+            }
+            if (ok && host_experts_fused(here, fg, fu, fd, x, c->swiglu_limit, dst)) {
+                for (int u = 0; u < here; u++) {
+                    const int eid = uq[base + u];
+                    Slot *slot = &cache->s[slot_of[u]];
+                    if (note && (!g53_gx_ilv(m, index) || XT(wants)(index, eid))) {
+                        VktExpertSrc src = glm53_slot_src(m, index, slot);
+                        XT(note)(index, eid, &src);
+                        glm53_drop_rows(slot);
+                    }
+                }
+                continue;
+            }
+        }
         for (int u = 0; u < here; u++) {
             const int eid = uq[base + u];
             Slot *slot = &cache->s[slot_of[u]];
