@@ -138,8 +138,22 @@ its shapes. Checked:
 - UD-IQ1_S, a red disc, a blue square and a green triangle: "The picture contains a red circle, a
   blue square, and a green triangle."
 
-The tower runs on the CPU: 8.0 s for a picture of 256 tokens on an i5-13500 (6 P + 8 E cores), 96 s for 1024 (its
-attention is quadratic), so the gateway holds a picture to 256 tokens (`ML4_MAX_IMAGE_TOKENS`).
+On the CPU the tower takes 8.0 s for a picture of 256 tokens on an i5-13500 (6 P + 8 E cores), 96 s
+for 1024 (its attention is quadratic), so the gateway holds a picture to 256 tokens
+(`ML4_MAX_IMAGE_TOKENS`). With Vulkan its matrices run on the device as the mmproj has them (BF16),
+the attention and the norms on the CPU. By default each matrix goes up for its products and is freed
+after, so the expert tier keeps the card; `ML4_VISION_GPU=keep` keeps them on the device after a first
+picture (the tier leaves the 3.4 GB for them), `ML4_VISION_GPU=0` keeps the tower on the CPU.
+UD-IQ1_S on an RTX PRO 4000, a picture of 96 tokens (384 patches):
+
+| tower | time |
+|---|---|
+| CPU | 5.07 s |
+| Vulkan, up and freed (default) | 3.61 s |
+| Vulkan, kept | 4.44 s the first picture, then 1.07 s |
+
+The rows the device gives are within 6e-5 of the CPU's (RMS, relative) and the answer is the same;
+moving the 3.4 GB is most of the default's time (210 uploads and allocations a picture).
 
 ## From the FP8 release
 
@@ -179,5 +193,6 @@ about 1% of each other.
   layers, SSMax, the indexer) but not yet the KV split past the card's memory, a second device or
   several conversations' rows at once: those run on the CPU. On CUDA (our container) the attention
   runs on the CPU.
-- The vision tower runs on the CPU only.
+- The vision tower's matrices run on Vulkan, not yet on CUDA (no BF16 matrices in its kernels),
+  and its attention runs on the CPU.
 - The DSpark draft head (`dspark-*.gguf`) is not read.

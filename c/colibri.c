@@ -8704,6 +8704,23 @@ static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int
  * embeddings at the prompt's [IMG] positions while that prompt's prefill runs (g_vis_map: an
  * absolute position to its row, -1 none), then they go. */
 static MistralVision g_mlv;
+#ifdef COLI_VULKAN
+static int g_mlv_vk_keep; static size_t g_mlv_bytes;
+/* The tower's products on the Vulkan device, its matrices as the mmproj has them (bf16, f16,
+ * f32). ML4_VISION_GPU: unset or 1 = each matrix up for its products and freed after (the
+ * tier keeps the device's memory), keep = resident after a first picture (the tier leaves
+ * room for it, g_mlv_bytes), 0 = the CPU. Mistral-Large-4 UD-IQ1_S on an RTX PRO 4000, a
+ * picture of 384 patches: the CPU 5.07 s, up and freed 3.61, kept 1.07 after a first 4.44
+ * (the 210 uploads and allocations are the cost: 3.4 GB at 1.1 GB/s). */
+static int mlv_vk_mm(MvMat *w, float *y, const float *x, int S){
+    if(!g_vulkan) return 0;
+    const int fmt = w->type==GQ_BF16 ? 11 : w->type==GQ_F16 ? 14 : w->type==GQ_F32 ? 10 : 0;
+    if(!fmt) return 0;
+    int ok=coli_vk_matmul((ColiVkTensor **)&w->dev,y,x,w->data,NULL,fmt,S,w->I,w->O,0);
+    if(!g_mlv_vk_keep && w->dev){ coli_vk_tensor_free((ColiVkTensor *)w->dev); w->dev=NULL; }
+    return ok;
+}
+#endif
 static struct { float *patches; unsigned long long bytes; int gh, gw, present; } g_mlv_pending;
 static float *g_vis_rows; static int *g_vis_map, g_vis_map_len;
 static void vis_apply(Model *m, float *x, int S, int pos_base){
@@ -12275,6 +12292,7 @@ static void vk_tier_start(Model *m){
     /* a partial chain: nothing more of the trunk goes up, but the chain's first forward
      * allocates its scratch and the N layers' KV mirrors */
     if(g_glmc_partial) dense+=(double)g_glmc_lazy;
+    if(g_mlv_vk_keep) dense+=(double)g_mlv_bytes;   /* Mistral-Large-4's vision tower, kept on the device */
     { const char *r=getenv("COLI_VK_RESERVE_GB"), *tr=getenv("COLI_VK_TIER_RESERVE_GB");
       if(r && *r){ double extra=atof(r)-(tr&&*tr?atof(tr):1.0); if(extra>0) dense+=extra*1073741824.0; } }
     /* The MTP head's layer (index NL): its experts as the container keeps them (int8
@@ -14649,6 +14667,10 @@ int main(int argc, char **argv){
                 m.resident_bytes+=vb;
                 fprintf(stderr,"[ml4] vision tower (mmproj): %d layers of %d, %d heads, patch %d, merge %d, %.2f GB in %.1f s\n",
                         g_mlv.depth,g_mlv.hidden,g_mlv.heads,g_mlv.patch,g_mlv.merge,vb/1e9,now_s()-tv);
+#ifdef COLI_VULKAN
+                { const char *vg=getenv("ML4_VISION_GPU");
+                  if(g_vulkan && !(vg && vg[0]=='0')){ mv_device_mm=mlv_vk_mm; g_mlv_vk_keep=vg && !strcmp(vg,"keep"); g_mlv_bytes=vb; } }
+#endif
             } else fprintf(stderr,"[ml4] %s: the vision tower did not load; pictures are refused\n",mp);
         }
     }

@@ -23,6 +23,9 @@
  * rows is turned to f32 where it is used, so the 1.7B tower holds 3.4 GB beside a model that
  * needs every gigabyte, not 6.8. The attention is quadratic in the patches: the gateway's
  * token ceiling (ML4_MAX_IMAGE_TOKENS) keeps a picture's cost bounded.
+ *
+ * mv_device_mm, when an engine sets it, takes a matrix's products first (a GPU's, the matrix
+ * resident there after its first use, in w->dev); 0 back, or none set, and the CPU does them.
  */
 #ifndef MISTRAL_VISION_H
 #define MISTRAL_VISION_H
@@ -33,7 +36,7 @@
 #include <string.h>
 #include "gguf.h"
 
-typedef struct { int type, O, I; int64_t rb; uint8_t *data; } MvMat;   /* rows O of I, the file's blocks */
+typedef struct { int type, O, I; int64_t rb; uint8_t *data; void *dev; } MvMat;   /* rows O of I, the file's blocks; dev: a device's copy */
 typedef struct { float *ln1, *ln2; MvMat q, k, v, o, gate, up, down; } MvLayer;
 typedef struct {
     int depth, hidden, heads, head_dim, inter, patch, merge, in_ch, out_hidden;
@@ -42,6 +45,7 @@ typedef struct {
                        * them (row 2j is the release's row j, 2j + 1 its row j + head_dim / 2): the
                        * rotation takes the pairs (2j, 2j + 1). 0: the release's order, rotate-half */
     float *patch_w;                      /* [D, in_ch * patch * patch] */
+    MvMat patch_mat;                     /* the same, as a matrix (its device copy) */
     float *pre_ln, *mm_norm;             /* [D] */
     MvLayer *layers;
     MvMat merger, l1, l2;                /* [D, 4D], [out, D], [out, out] */
@@ -51,9 +55,14 @@ typedef struct {
 typedef float mv_v8 __attribute__((vector_size(32)));
 static inline float mv_hsum(mv_v8 v) { float a = 0.f; for (int i = 0; i < 8; i++) a += v[i]; return a; }
 
+/* y[S, O] = x[S, I] . w^T, both rows contiguous: 1 done on the device, 0 left to the CPU */
+typedef int (*mv_device_mm_fn)(MvMat *w, float *y, const float *x, int S);
+static mv_device_mm_fn mv_device_mm;
+
 /* y[s, o] = x[s, :] . w[o, :]: each thread turns 32 rows of w to f32 once and runs every row
  * of x against them, 4 rows x 4 outputs a step in 16 vector sums */
-static void mv_gemm(float *y, int ldy, const float *x, int ldx, const MvMat *w, int S) {
+static void mv_gemm(float *y, int ldy, const float *x, int ldx, MvMat *w, int S) {
+    if (mv_device_mm && ldy == w->O && ldx == w->I && mv_device_mm(w, y, x, S)) return;
     const int OB = 32, O = w->O, I = w->I, nob = (O + OB - 1) / OB;
     #pragma omp parallel
     {
@@ -114,7 +123,7 @@ static inline float mv_angle(const MistralVision *v, int row, int col, int j) {
 
 /* N patches of grid gh x gw (patch rows, columns) in, (gh / merge) x (gw / merge) rows of
  * out_hidden out. Returns the rows written, -1 on a bad grid or no memory. */
-static int mistral_vision_forward(const MistralVision *v, const float *patches, int gh, int gw, float *out) {
+static int mistral_vision_forward(MistralVision *v, const float *patches, int gh, int gw, float *out) {
     const int D = v->hidden, H = v->heads, hd = v->head_dim, F = v->inter, m = v->merge;
     const int N = gh * gw, PD = v->in_ch * v->patch * v->patch;
     if (!v->ready || gh < 1 || gw < 1 || gh % m || gw % m || H * hd != D) return -1;
@@ -128,8 +137,7 @@ static int mistral_vision_forward(const MistralVision *v, const float *patches, 
         free(x); free(h); free(q); free(k); free(vv); free(att); free(g); free(u); free(cs); return -1;
     }
     /* patch_conv: a [D, PD] matrix over the patches, then ln_pre */
-    MvMat pw = {GQ_F32, D, PD, (int64_t)PD * 4, (uint8_t *)v->patch_w};
-    mv_gemm(h, D, patches, PD, &pw, N);
+    mv_gemm(h, D, patches, PD, &v->patch_mat, N);
     mv_rms(x, h, v->pre_ln, N, D, v->eps);
     for (int p = 0; p < N; p++)   /* cos | sin of every angle at every patch */
         for (int j = 0; j < hd / 2; j++) {
@@ -138,7 +146,7 @@ static int mistral_vision_forward(const MistralVision *v, const float *patches, 
         }
     const float scale = 1.f / sqrtf((float)hd);
     for (int l = 0; l < v->depth; l++) {
-        const MvLayer *L = &v->layers[l];
+        MvLayer *L = &v->layers[l];
         mv_rms(h, x, L->ln1, N, D, v->eps);
         mv_gemm(q, D, h, D, &L->q, N); mv_gemm(k, D, h, D, &L->k, N); mv_gemm(vv, D, h, D, &L->v, N);
         #pragma omp parallel for schedule(static)
@@ -278,6 +286,7 @@ static int mistral_vision_load(MistralVision *v, const char *path, int out_hidde
     }
     gguf_close(&g);
     if (bad || !v->layers) return -1;
+    v->patch_mat = (MvMat){GQ_F32, D, PD, (int64_t)PD * 4, (uint8_t *)v->patch_w, NULL};
     v->ready = 1;
     return 0;
 }
