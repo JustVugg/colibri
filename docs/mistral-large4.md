@@ -85,6 +85,17 @@ and the engine maps every tensor of them. UD-IQ1_S (233 GB) runs: on an RTX PRO 
 Decode stays where the disk puts it: 0.73-0.81 tok/s whether the chain holds 0, 24, 48 or 72
 layers (`COLI_VK_CHAIN_LAYERS`; the experts' tier gets what the chain leaves, 22.3 GiB to 5.5).
 
+The CPU half of the expert work was slower than it had to be on this box's i5-13500: the engine's
+OpenMP team of six P-core threads sat on CPUs 0-5, three cores, until the re-exec set
+`OMP_PLACES=cores` (see [tuning](tuning.md)). With the chain, 24 tokens of decode and a 240-token
+prompt, before and after alternated:
+
+| | before | after |
+|---|---|---|
+| decode, the default team of six | 0.59, 0.61 tok/s | 0.76, 0.80 tok/s |
+| decode, `OMP_NUM_THREADS=14` (every physical core) | | 0.89, 0.91 tok/s |
+| prompt, 240 tokens | 47.6, 48.3 s | 35.6, 36.0 s |
+
 and "The capital of France is Paris. The capital of Italy is" goes on with " Rome. The capital of
 Germany is Berlin. The capital of Spain is Madrid. The capital of Portugal is Lisbon." on both.
 Through the gateway the chat template, the `[THINK]` reasoning (as `reasoning_content`) and the

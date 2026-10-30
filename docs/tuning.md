@@ -64,6 +64,13 @@ cap when launched directly; explicit `OMP_NUM_THREADS` and the
 > right before the re-exec, so explicit `OMP_*` pinning works as documented.
 > `COLI_OMP_TUNED=1` remains the escape hatch that skips the re-exec entirely.
 
+The re-exec binds the team with `OMP_PROC_BIND=close` and `OMP_PLACES=cores`, one place
+per core. Without the places libgomp makes one per hardware thread, and on a CPU that
+numbers a core's SMT siblings side by side (Intel's hybrid CPUs on Linux: CPUs 0 and 1 are
+P-core 0) the team of six P-core threads sat on CPUs 0-5, three cores. On an i5-13500 that
+cost Mistral-Large-4 UD-IQ1_S a quarter of its decode (0.59-0.61 tok/s against 0.76-0.80
+with the places). Both are defaults only: your own `OMP_PROC_BIND`/`OMP_PLACES` win.
+
 ### Hybrid CUDA/CPU OpenMP override
 
 The main GLM engine intentionally skips its active-wait OpenMP tuning when

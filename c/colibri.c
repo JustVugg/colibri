@@ -13826,6 +13826,11 @@ int main(int argc, char **argv){
                        "measured slower on Apple Silicon (COLI_NO_OMP_TUNE=1 to skip)\n");
 #endif
         setenv("OMP_PROC_BIND","close",0);     /* pack the team onto adjacent cores for cache locality */
+        /* places = cores: without it libgomp makes one place per hardware thread, and where
+         * a core's SMT siblings are numbered side by side (Intel's hybrid CPUs on Linux: CPUs
+         * 0,1 are P-core 0) a team of the physical-core count landed on half the cores, both
+         * threads of each. i5-13500, Mistral-Large-4 decode: the 6-thread team on CPUs 0-5. */
+        setenv("OMP_PLACES","cores",0);
         setenv("OMP_DYNAMIC","FALSE",0);       /* fixed team size: no per-region thread-count churn */
         setenv("COLI_OMP_TUNED","1",1);
 #ifdef __linux__

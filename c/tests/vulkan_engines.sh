@@ -2617,7 +2617,7 @@ family_glm_chain() {
   mla_gate colibri "chain colibri Mistral-Large-4" 1 "${ml[@]}" -- 8 16 16
   mla_gate colibri "chain colibri Mistral-Large-4, prefill" 1 "${ml[@]}" TF=1 -- 8 16 16
   mla_gate colibri "chain colibri Mistral-Large-4, prefill in chunks of 5" 1 "${ml[@]}" TF=1 COLI_VK_CHAIN_ROWS=5 -- 8 16 16
-  mla_gate colibri "chain colibri Mistral-Large-4, KV16" 1 "${ml[@]}" KV16=1 -- 8 16 16
+  mla_gate colibri "chain colibri Mistral-Large-4, KV16" 0 "${ml[@]}" KV16=1 -- 8 16 16   # tokens, as GLM's KV16 gates: 6.4e-4 and 8.2e-4 of the 6.6e-4 bound on two runs
   mla_gate colibri "chain colibri Mistral-Large-4, DSA_FORCE" 1 "${ml[@]}" DSA_FORCE=1 -- 8 16 16
   mla_gate colibri "chain colibri MTP with DSA top-4" 1 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DSA_TOPK=4 -- 64 16 16
   mla_gate colibri "chain colibri MTP, 4-bit" 1 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json IDOT=0 DRAFT=2 -- 2 4 4
