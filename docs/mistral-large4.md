@@ -76,10 +76,14 @@ The real files: `tools/gguf_header.py` fetched the eleven headers, the importer 
 and the engine maps every tensor of them. UD-IQ1_S (233 GB) runs: on an RTX PRO 4000 (24 GB) with
 62 GB of RAM and two NVMe drives, the 17.9 GB dense part resident, the experts from the disk,
 
-| | decode, the first 16 tokens | decode, 48 tokens | prompt, 12 tokens |
-|---|---|---|---|
-| the CPU | | 0.52 tok/s | 17.6 s |
-| Vulkan (the experts' tier on the card) | 1.17 tok/s | 0.88 tok/s | 18.4 s |
+| | decode, 48 tokens | prompt, 240 tokens |
+|---|---|---|
+| the CPU | 0.52 tok/s | |
+| Vulkan, the experts' tier on the card, the attention on the CPU | 0.76-0.88 tok/s | 79.8 s |
+| Vulkan, the dense chain too (all 72 layers, 16.9 GiB) | 0.81 tok/s | 52.7 s |
+
+Decode stays where the disk puts it: 0.73-0.81 tok/s whether the chain holds 0, 24, 48 or 72
+layers (`COLI_VK_CHAIN_LAYERS`; the experts' tier gets what the chain leaves, 22.3 GiB to 5.5).
 
 and "The capital of France is Paris. The capital of Italy is" goes on with " Rome. The capital of
 Germany is Berlin. The capital of Spain is Madrid. The capital of Portugal is Lisbon." on both.
@@ -111,7 +115,9 @@ about 1% of each other.
 
 ## Not done yet
 
-- The attention runs on the CPU on every backend: the Vulkan dense chain and the CUDA attention
-  pipe are off for this model.
+- On Vulkan the dense chain takes the attention (the query without a latent, NoPE and shared-KV
+  layers, SSMax, the indexer) but not yet the KV split past the card's memory, a second device or
+  several conversations' rows at once: those run on the CPU. On CUDA (our container) the attention
+  runs on the CPU.
 - The vision tower (`mmproj-*.gguf`) and the DSpark draft head (`dspark-*.gguf`) are not
   read.
