@@ -286,6 +286,65 @@ class PrefixReuseContract:
         self.assertEqual(after, fresh,
                          "a stale record survived a shorter prompt and was reused")
 
+    # An engine that parks the conversation it holds for a short request between two of its
+    # turns (COLI_PARK in docs/ENVIRONMENT.md) sets this, and the scenario below holds it to it.
+    PARKS = False
+
+    def test_a_short_request_between_two_turns_keeps_the_conversation(self):
+        """A client's short request between two turns of a conversation (Hermes asks for its
+        title after the first) took the only state there is, and the next turn read the whole
+        conversation again. The conversation is parked for it and comes back: the next turn
+        continues from it and answers as a cold engine does, and the short request answers
+        as it would alone."""
+        if not self.PARKS:
+            self.skipTest("this engine does not park a conversation")
+        opening = b"The capital of France is Paris, the capital of Italy is Rome, and the capital of"
+        side = b"Five times five is"
+        second = opening + b" Spain is Madrid. The capital of Germany is"
+        with mock.patch.dict(os.environ, {"COLI_PARK_MIN": "16"}):
+            warm = self.spawn()
+        warm.ask("1", opening)
+        aside = warm.ask("2", side, max_tok=8)
+        got = warm.ask("3", second, max_tok=8)
+        log = warm.close()
+        answers = []
+        for prompt in (side, second):
+            cold = self.spawn(log_prefix=False)
+            answers.append(cold.ask("1", prompt, max_tok=8))
+            cold.close()
+
+        self.assertIn("conversation parked for a", log, "the short request did not park:\n" + log)
+        self.assertIn("conversation is back", log, "the parked conversation did not come back:\n" + log)
+        self.assertEqual(aside, answers[0], "the short request answered otherwise beside a parked conversation")
+        self.assertEqual(got, answers[1], "the conversation answered otherwise after it was parked")
+        reused = [int(n) for n in re.findall(r"\[PREFIX\] reusing (\d+) of", log)]
+        first = re.search(r"\[PREFIX\] no reuse: held=0 cap=\d+ prompt=(\d+)", log)
+        self.assertTrue(reused and first and reused[-1] >= int(first.group(1)),
+                        "the next turn read the parked conversation again:\n" + log)
+
+    # An engine whose state is attention alone resumes where a prompt leaves what it holds
+    # (kv_prefix_common); it sets this, and the scenario below holds it to it.
+    RESUMES_MIDWAY = False
+
+    def test_a_changed_turn_reuses_up_to_where_it_changes(self):
+        """A client that sends an answer back without its reasoning, or changes a turn, leaves
+        the held state in the middle. Attention alone resumes there: the shared positions are
+        not read again, and the answer is a cold engine's."""
+        if not self.RESUMES_MIDWAY:
+            self.skipTest("this engine resumes only from the end of what it holds")
+        shared = b"The capital of France is Paris, and the capital of Italy is"
+        warm = self.spawn()
+        warm.ask("1", shared + b" Rome, said the first answer")
+        changed = shared + b" Rome. The capital of Spain is"
+        got = warm.ask("2", changed, max_tok=8)
+        log = warm.close()
+        cold = self.spawn(log_prefix=False)
+        fresh = cold.ask("1", changed, max_tok=8)
+        cold.close()
+
+        self.assertIn("up to where it leaves the held state", log, "the shared positions were read again:\n" + log)
+        self.assertEqual(got, fresh, "resuming in the middle changed the answer")
+
     def test_a_turn_that_replays_the_reply_is_never_wrong(self):
         """The real chat shape: the client appends the assistant's reply and a
         new question. Whether the reply survives this fixture's decode-encode
