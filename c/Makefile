@@ -2018,6 +2018,12 @@ tests/test_tok_deepseek$(EXE): tests/test_tok_deepseek.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_tok_tekken$(EXE): tests/test_tok_tekken.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# Mistral-Large-4's vision tower (mistral_vision.h) against tools/mistral_vision_ref.py on a tiny mmproj
+tests/mistral_vision_check$(EXE): tests/mistral_vision_check.c mistral_vision.h gguf.h ggml_quants.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+.PHONY: mistral-vision-check
+mistral-vision-check: tests/mistral_vision_check$(EXE)
+	$(PYTHON) tools/make_mistral_vision_tiny.py --out $${TMPDIR:-/tmp}/coli_mistral_vision_tiny --check ./tests/mistral_vision_check$(EXE)
 
 tests/test_k3_ram_budget$(EXE): tests/test_k3_ram_budget.c kimi_k3.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)

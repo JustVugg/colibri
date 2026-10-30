@@ -151,7 +151,9 @@ class FamilyRegistryTest(unittest.TestCase):
         # vision_config and no model.visual.* tensors.
         by_id, _ = _build_registry(FAMILIES)
         for family_id, expected in (("glm53", True), ("qwen38", True), ("qwen36", True),
-                                    ("deepseek_v41", True), ("mimo", True), ("glm", False), ("kimi", False),
+                                    ("deepseek_v41", True), ("mimo", True),
+                                    ("glm", True),   # Mistral-Large-4's pictures (expand_ml4_images); GLM-5.2's engine says vision=0
+                                    ("kimi", False),
                                     ("inkling", False), ("olmoe", False),
                                     ("deepseek_v4", False), ("qwen_image", False)):
             with self.subTest(family=family_id):

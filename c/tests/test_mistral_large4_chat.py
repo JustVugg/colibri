@@ -162,5 +162,165 @@ class MistralLarge4ChatTest(unittest.TestCase):
                                                       {"role": "tool", "content": "y"}], True)
 
 
+
+class Ml4ImageTest(unittest.TestCase):
+    """A picture for Mistral-Large-4: tools/mistral_image.py's patches (the stub below stands in for
+    it), a row of [IMG] a merged token closed by [IMG_BREAK], the last by [IMG_END], the patch grid
+    in the IMAGE frame, a ceiling on the tokens, the other parts untouched, and no expansion
+    without a linked mmproj (the renderer then says what is missing)."""
+
+    def setUp(self):
+        self.saved = (openai_server.ARCH, openai_server.CHAT_FLAVOR, openai_server._preprocess_ml4_image)
+        openai_server.ARCH, openai_server.CHAT_FLAVOR = "glm", "mistral_large4"
+        self.ceilings = []
+
+        def fake(data, model_dir, max_tokens=None):
+            self.ceilings.append(max_tokens)
+            return [0.0] * (4 * 6 * 588), 2, 3   # 2 x 3 merged tokens: 4 x 6 patches
+        openai_server._preprocess_ml4_image = fake
+
+    def tearDown(self):
+        openai_server.ARCH, openai_server.CHAT_FLAVOR, openai_server._preprocess_ml4_image = self.saved
+        os.environ.pop("ML4_MAX_IMAGE_TOKENS", None)
+
+    def expand(self, folder, messages=None):
+        class Engine:
+            model_dir = folder
+            vision = True
+
+        class Server:
+            engine = Engine()
+
+        class Handler:
+            server = Server()
+        url = "data:image/png;base64,iVBORw0KGgo="
+        messages = messages or [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}},
+                                                             {"type": "text", "text": "What is it?"}]}]
+        return openai_server.APIHandler.expand_images(Handler(), messages)
+
+    def linked(self, folder):
+        (Path(folder) / "gguf.json").write_text(json.dumps({"gguf": "x.gguf", "mmproj": "mmproj-BF16.gguf"}))
+
+    def test_the_rows_of_a_picture(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            self.linked(folder)
+            messages, image = self.expand(folder)
+        parts = messages[0]["content"]
+        self.assertEqual(parts[0], {"type": "text", "text": "[IMG][IMG][IMG][IMG_BREAK][IMG][IMG][IMG][IMG_END]"})
+        self.assertEqual(parts[1], {"type": "text", "text": "What is it?"})
+        self.assertEqual((image[1], image[2]), (4, 6))   # the patch grid, as the engine's IMAGE frame takes it
+        self.assertEqual(self.ceilings, [openai_server.ML4_MAX_IMAGE_TOKENS])
+        prompt = openai_server.render_chat_mistral_large4(messages)
+        self.assertIn("[INST][IMG][IMG][IMG][IMG_BREAK][IMG][IMG][IMG][IMG_END]What is it?[/INST]", prompt)
+
+    def test_the_ceiling_comes_from_the_environment(self):
+        import tempfile
+        os.environ["ML4_MAX_IMAGE_TOKENS"] = "100"
+        with tempfile.TemporaryDirectory() as folder:
+            self.linked(folder)
+            self.expand(folder)
+        self.assertEqual(self.ceilings, [100])
+
+    def test_other_turns_keep_their_parts(self):
+        import tempfile
+        url = "data:image/png;base64,iVBORw0KGgo="
+        messages = [{"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": [{"type": "thinking", "thinking": "hm"}, {"type": "text", "text": "Hi"}]},
+                    {"role": "user", "content": [{"type": "text", "text": "Look:"},
+                                                 {"type": "image_url", "image_url": {"url": url}}]}]
+        with tempfile.TemporaryDirectory() as folder:
+            self.linked(folder)
+            out, image = self.expand(folder, messages)
+        self.assertEqual(out[:2], messages[:2])
+        self.assertEqual(out[2]["content"][0], {"type": "text", "text": "Look:"})
+        self.assertTrue(out[2]["content"][1]["text"].endswith("[IMG_END]"))
+
+    def test_no_tower_no_expansion_and_a_clear_refusal(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / "gguf.json").write_text(json.dumps({"gguf": "x.gguf"}))
+            messages, image = self.expand(folder)
+        self.assertIsNone(image)
+        with self.assertRaises(openai_server.APIError) as caught:
+            openai_server.render_chat_mistral_large4(messages)
+        self.assertEqual(caught.exception.status, 400)
+        self.assertIn("mmproj", str(caught.exception))
+
+
+class Ml4ImageGeometryTest(unittest.TestCase):
+    """tools/mistral_image.py's canvas and placeholder: the reference's resize (floor under the
+    longest edge, then whole merged tokens) and our token ceiling, without Pillow."""
+
+    def setUp(self):
+        sys.path.insert(0, str(HERE.parent / "tools"))
+        import mistral_image
+        self.mi = mistral_image
+
+    def test_whole_tokens_stay(self):
+        self.assertEqual(self.mi.canvas(224, 336), (224, 336, 8, 12))
+
+    def test_the_longest_edge_then_whole_tokens(self):
+        # 3000 x 2000: ratio 3000 / 1540, floor to 1540 x 1026, then up to 28: 1540 x 1036
+        self.assertEqual(self.mi.canvas(3000, 2000), (1540, 1036, 55, 37))
+
+    def test_the_token_ceiling_shrinks_never_crops(self):
+        h, w, gh, gw = self.mi.canvas(3000, 2000, max_tokens=256)
+        self.assertLessEqual(gh * gw, 256)
+        self.assertAlmostEqual(gh / gw, 55 / 37, delta=0.1)
+
+    def test_the_placeholder(self):
+        self.assertEqual(self.mi.placeholder(2, 3), "[IMG][IMG][IMG][IMG_BREAK][IMG][IMG][IMG][IMG_END]")
+        self.assertEqual(self.mi.placeholder(1, 1), "[IMG][IMG_END]")
+
+    def test_patches_in_the_tower_kernel_order(self):
+        try:
+            import numpy as np
+        except ImportError:
+            self.skipTest("needs numpy")
+        px = np.arange(3 * 28 * 28, dtype=np.float32).reshape(3, 28, 28)
+        p = self.mi.patchify(px, np)
+        self.assertEqual(p.shape, (4, 3 * 14 * 14))
+        # patch 1 is row 0, column 1: channel, row, column of its 14 x 14 pixels
+        self.assertTrue(np.array_equal(p[1], px[:, 0:14, 14:28].reshape(-1)))
+        self.assertTrue(np.array_equal(p[2], px[:, 14:28, 0:14].reshape(-1)))
+
+
+class Ml4MmprojImportTest(unittest.TestCase):
+    """coli import links Mistral's mmproj (projector pixtral, under clip.projector_type, where
+    LFM3's file says clip.vision.projector_type) and writes its geometry for the gateway."""
+
+    def mmproj(self, folder, projector, key="clip.projector_type"):
+        sys.path.insert(0, str(HERE.parent / "tools"))
+        from make_flint_tiny import _gguf_bytes
+        U32, F32, STR, ARR = 4, 6, 8, 9
+        kv = [("general.architecture", STR, "clip"), (key, STR, projector),
+              ("clip.vision.patch_size", U32, 14), ("clip.vision.spatial_merge_size", U32, 2),
+              ("clip.vision.image_size", U32, 1540),
+              ("clip.vision.image_mean", ARR, (F32, [0.5, 0.25, 0.125])),
+              ("clip.vision.image_std", ARR, (F32, [0.25, 0.5, 0.75]))]
+        path = Path(folder) / "mmproj-BF16.gguf"
+        path.write_bytes(_gguf_bytes(kv, []))
+        return path
+
+    def test_pixtral_is_mistrals_and_lfm3vl_is_not(self):
+        import tempfile
+        import gguf_import
+        with tempfile.TemporaryDirectory() as folder:
+            self.assertEqual(gguf_import.mmproj_of(self.mmproj(folder, "pixtral"), "mistral-large4"), (True, ""))
+            ok, why = gguf_import.mmproj_of(self.mmproj(folder, "lfm3vl", "clip.vision.projector_type"), "mistral-large4")
+            self.assertFalse(ok)
+            self.assertIn("pixtral", why)
+
+    def test_the_geometry_beside_the_link(self):
+        import tempfile
+        import gguf_import
+        with tempfile.TemporaryDirectory() as folder:
+            gguf_import.write_pixtral_preprocessor(folder, self.mmproj(folder, "pixtral"))
+            conf = json.loads((Path(folder) / "preprocessor_config.json").read_text())
+        self.assertEqual(conf, {"patch_size": 14, "spatial_merge_size": 2, "longest_edge": 1540,
+                                "image_mean": [0.5, 0.25, 0.125], "image_std": [0.25, 0.5, 0.75]})
+
+
 if __name__ == "__main__":
     unittest.main()

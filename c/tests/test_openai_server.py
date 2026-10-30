@@ -8460,8 +8460,9 @@ class ServedModalityTest(unittest.TestCase):
 
     def test_a_family_without_an_image_path_never_claims_images(self):
         # Even an engine that announces a tower is text-only to its clients when
-        # the gateway has no placeholder expansion for the family.
-        with patch("openai_server.ARCH", "glm"):
+        # the gateway has no placeholder expansion for the family (OLMoE's; the glm family has
+        # one since Mistral-Large-4's pictures).
+        with patch("openai_server.ARCH", "olmoe"):
             _engine, base = self.serve(True)
             with self.request(base, "/v1/models") as response:
                 self.assertEqual(json.load(response)["data"][0]["input_modalities"], ["text"])

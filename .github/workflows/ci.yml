@@ -1780,6 +1780,12 @@ jobs:
           python3 tools/make_mistral_large4_tiny.py --out /tmp/ml4a --emit-ref /tmp/ml4a/ref.json --quant UD-IQ1_S --act-q8
           python3 tools/gguf_import.py /tmp/ml4a/model.gguf /tmp/ml4a/coli
           SNAP=/tmp/ml4a/coli REF=/tmp/ml4a/ref.json TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=3 ./colibri 8 16 16
+      - name: Mistral-Large-4 vision tower (mistral_vision.h against tools/mistral_vision_ref.py)
+        run: |
+          cd c
+          # a tiny mmproj in the published layout (BF16, q and k permuted for an interleaved
+          # rotation): the engine's rows within 1e-4 of the numpy reference's
+          make mistral-vision-check
       - name: Oracle allowance and failure regressions
         run: |
           cd c

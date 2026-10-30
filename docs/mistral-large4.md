@@ -104,6 +104,42 @@ answer come back as the release writes them.
 On an NVIDIA card a GGUF of this model runs on Vulkan, as GLM-5.2's does (a build with both
 backends switches to it; the CUDA backend has no ggml block types).
 
+## Pictures
+
+The vision tower is the GGUF repository's `mmproj-BF16.gguf` (or `mmproj-F16.gguf`): Pixtral, 30
+layers of width 2048, 16 heads, patches of 14 with an axial RoPE, a SiLU-gated MLP; the projector
+puts each 2 x 2 block of patches side by side (8192 to 2048), then 2048 to 6144, GELU, 6144 to
+6144 (`mistral_vision.h`, transcribed from transformers' `modeling_pixtral.py` and
+`modeling_mistral3.py`). `coli import` links one it finds next to the model (`--mmproj` names one,
+`--no-mmproj` leaves it out) and writes its geometry to `preprocessor_config.json`.
+
+```
+coli import Mistral-Large-4-1T-A52B-UD-IQ1_S-00001-of-00006.gguf --mmproj mmproj-BF16.gguf
+coli serve --model Mistral-Large-4-1T-A52B-UD-IQ1_S.colibri
+```
+
+The gateway cuts a picture as the release's processor does (`tools/mistral_image.py`: scaled down
+under 1540 pixels a side, then to whole tokens of 28 x 28 pixels, bicubic, the CLIP mean and std;
+Pillow and numpy needed) and writes a row of `[IMG]` a token, each row closed by `[IMG_BREAK]`, the
+last by `[IMG_END]`. The engine's rows replace those tokens' embeddings; the text before the
+picture keeps its cached prefix, the picture's rows are never reused. The tower is 3.4 GB beside the
+model, counted in the RAM plan; it is loaded in serve mode only (`ML4_VISION=0` skips it).
+
+An mmproj stores the q and k rows of each head in interleaved rotary order (its converter's
+permutation): the engine rotates pairs (2j, 2j + 1). Rotating halves, as the release's code does on
+its own weights, kept a test picture's colours and lost its shapes. Checked:
+
+- `tools/mistral_vision_ref.py`, a numpy transcription that undoes the permutation and rotates
+  halves: the engine's rows within 1.0e-5 of their RMS on the real mmproj (`ML4_VIS_DUMP` writes
+  them from a served picture);
+- `make mistral-vision-check` (CI): a tiny tower in the published layout, within 1e-4, and failing
+  with the halves;
+- UD-IQ1_S, a red disc, a blue square and a green triangle: "The picture contains a red circle, a
+  blue square, and a green triangle."
+
+The tower runs on the CPU: 8.0 s for a picture of 256 tokens on an i5-13500 (6 P + 8 E cores), 96 s for 1024 (its
+attention is quadratic), so the gateway holds a picture to 256 tokens (`ML4_MAX_IMAGE_TOKENS`).
+
 ## From the FP8 release
 
 `tools/convert_fp8_to_int4.py` reads Mistral's own release: `consolidated-*.safetensors` in
@@ -130,5 +166,5 @@ about 1% of each other.
   layers, SSMax, the indexer) but not yet the KV split past the card's memory, a second device or
   several conversations' rows at once: those run on the CPU. On CUDA (our container) the attention
   runs on the CPU.
-- The vision tower (`mmproj-*.gguf`) and the DSpark draft head (`dspark-*.gguf`) are not
-  read.
+- The vision tower runs on the CPU only.
+- The DSpark draft head (`dspark-*.gguf`) is not read.
