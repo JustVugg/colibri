@@ -3719,6 +3719,38 @@ def cmd_stop(a):
     except OSError: pass
     print(f"  {C.grn}✓ stopped{C.r} — RAM released")
 
+def cmd_ui(a):
+    """the chat UI (ui/server.py) against a running gateway (`coli serve`), the browser
+    opened on it once it answers"""
+    cands = [os.path.join(HERE, "ui", "server.py"),
+             os.path.join(os.path.dirname(os.path.abspath(HERE)), "ui", "server.py")]
+    server = next((c for c in cands if os.path.exists(c)), None)
+    if server is None:
+        sys.exit(f"{C.yel}the chat UI is not in this tree{C.r} (ui/server.py next to coli or one level up)")
+    shown = "127.0.0.1" if a.host in ("0.0.0.0", "") else a.host
+    url = f"http://{shown}:{a.port}/"
+    print(f"  {C.dim}the chat UI on {url}, the gateway at {a.backend} "
+          f"(start it with  coli serve --model DIR  if it is not running){C.r}")
+    if not a.no_browser:
+        import threading, urllib.request, webbrowser
+        def opener():
+            for _ in range(150):
+                time.sleep(0.2)
+                try:
+                    urllib.request.urlopen(url, timeout=2); break
+                except OSError:
+                    continue
+            webbrowser.open(url)
+        threading.Thread(target=opener, daemon=True).start()
+    cmd = [sys.executable, server, "--host", a.host, "--port", str(a.port), "--backend", a.backend]
+    if a.models_backend: cmd += ["--models-backend", a.models_backend]
+    for d in a.models_dir or []: cmd += ["--models-dir", d]
+    if a.searx: cmd += ["--searx", a.searx]
+    try:
+        sys.exit(subprocess.call(cmd))
+    except KeyboardInterrupt:
+        sys.exit(0)
+
 def cmd_web(a):
     """serve + open the dashboard in the browser once the API answers."""
     need_model(a.model)
@@ -4146,6 +4178,19 @@ def main():
                        help="additional Host header accepted by the DNS-rebinding guard; repeat as needed"))):
         pw.add_argument(arg,**kw)
     pw.add_argument("--no-browser",action="store_true",help="don't auto-open the browser")
+    pui=sub.add_parser("ui",help="the chat UI (ui/server.py) against a running coli serve")
+    pui.add_argument("--host",default="127.0.0.1"); pui.add_argument("--port",type=int,default=8790)
+    pui.add_argument("--backend",default=os.environ.get("COLIBRI_BACKEND","http://127.0.0.1:8000"),
+                     help="the gateway's address (coli serve's default)")
+    pui.add_argument("--models-backend",default=os.environ.get("COLIBRI_MODELS_BACKEND",""),
+                     help="the Models page's service on the engine's machine (python3 ui/models.py "
+                     "there), when the gateway is elsewhere; with a gateway on this machine it runs here")
+    pui.add_argument("--models-dir",action="append",default=[],metavar="DIR",
+                     help="where models are, for the Models page (default: the folder coli setup "
+                     "uses, ~/colibri-models)")
+    pui.add_argument("--searx",default=os.environ.get("COLIBRI_SEARX",""),
+                     help="a SearXNG instance for the chat's web search (default: DuckDuckGo's HTML results)")
+    pui.add_argument("--no-browser",action="store_true",help="don't open the browser")
     # One-step setup (setup_flow.py). No `common` parent: --model here names a
     # catalog entry, not a model directory, and nothing below loads an engine.
     pset=sub.add_parser("setup",help="one step: detect hardware, pick a model, build or fetch "
@@ -4226,7 +4271,7 @@ def main():
     handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"mirror":cmd_mirror,
              "doctor":cmd_doctor,"tune":cmd_tune,
              "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
-             "convert":cmd_convert,"import":cmd_import,"web":cmd_web}.get(a.cmd)
+             "convert":cmd_convert,"import":cmd_import,"web":cmd_web,"ui":cmd_ui}.get(a.cmd)
     if a.cmd in ("setup","start","status","logs"):
         import setup_flow
         flow={"setup":setup_flow.cmd_setup,"start":setup_flow.cmd_start,

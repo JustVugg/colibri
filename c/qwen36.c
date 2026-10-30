@@ -812,22 +812,28 @@ static int json_escape(const unsigned char *s, int n, char *out, int outsz){
 
 /* Append b[0..n) into buf (*bn), extract as many LEADING complete UTF-8
  * codepoints as possible into out[0..*outn) (max 255). Trailing partial
- * sequence stays in buf. Returns bytes written to out. */
+ * sequence stays in buf. Returns bytes written to out. The codepoints are
+ * taken after every byte, so buf only ever holds a partial one (at most
+ * three bytes): appending the whole token first cut every byte past the
+ * 16th, and a Cyrillic word is often a token longer than that (" экскурсии"
+ * 19 bytes, " удовольствием" 27), #2492. */
 static int utf8_drain(unsigned char *buf, int *bn, const unsigned char *b, int n, unsigned char *out, int *outn){
     *outn = 0;
-    for (int k=0;k<n;k++){ if (*bn < 16) buf[(*bn)++] = b[k]; }
-    int j = 0;
-    while (j < *bn){
-        unsigned char lead = buf[j]; int need;
-        if (lead < 0x80) need = 1;
-        else if ((lead & 0xE0) == 0xC0) need = 2;
-        else if ((lead & 0xF0) == 0xE0) need = 3;
-        else if ((lead & 0xF8) == 0xF0) need = 4;
-        else { memmove(buf+j, buf+j+1, *bn-j-1); (*bn)--; continue; }
-        if (j+need > *bn) break;
-        if (*outn + need <= 255){ for (int x=0;x<need;x++) out[(*outn)++] = buf[j+x]; }
-        memmove(buf+j, buf+j+need, *bn-j-need);
-        *bn -= need;
+    for (int k=0;k<n;k++){
+        if (*bn < 16) buf[(*bn)++] = b[k];
+        int j = 0;
+        while (j < *bn){
+            unsigned char lead = buf[j]; int need;
+            if (lead < 0x80) need = 1;
+            else if ((lead & 0xE0) == 0xC0) need = 2;
+            else if ((lead & 0xF0) == 0xE0) need = 3;
+            else if ((lead & 0xF8) == 0xF0) need = 4;
+            else { memmove(buf+j, buf+j+1, *bn-j-1); (*bn)--; continue; }
+            if (j+need > *bn) break;
+            if (*outn + need <= 255){ for (int x=0;x<need;x++) out[(*outn)++] = buf[j+x]; }
+            memmove(buf+j, buf+j+need, *bn-j-need);
+            *bn -= need;
+        }
     }
     return *outn;
 }
@@ -1109,14 +1115,16 @@ static inline int q36_eh(const Cfg *c) { return c->ehid > 0 ? c->ehid : c->hidde
  * vk/vk_off: the Vulkan device copy (COLI_VULKAN=1) of whichever of q4, q or w
  * matmul_d reads, uploaded at the first matmul_d and kept; vk_off = the upload
  * failed once, this matrix stays on the CPU. Both stay zero without VK=1. */
-/* h: the matrix as f16 (COLI_DENSE_BITS=16), the only copy then. */
+/* h: the matrix as f16 (COLI_DENSE_BITS=16), the only copy then.
+ * wf16: a GGUF's F16 (1) or BF16 (30) matrix: w holds it in f32 for the CPU, and the GPUs
+ * get the file's 16-bit rows back from w (q36_wf16_rows, exact) as block format 100 + wf16. */
 /* vk_name, vk_tag, vk_quant: what load_tq read it with, to read it back from disk
  * (q36_dho_reload); vk_fmt, vk_gone: with the dense weights on the device only
  * (COLI_VK_DENSE_HOST), the device copy's format and 1 while no host copy is kept. */
 typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; float *sg; int ng;
                  void *vk; int vk_off; uint16_t *h;
                  char *vk_name; const char *vk_tag; int vk_quant, vk_fmt, vk_gone, vk_imported;
-                 uint8_t *gq; int gq_type; float gs;
+                 uint8_t *gq; int gq_type; float gs; int wf16;
                  int q8r16; } QW;   /* q8r16: q's rows interleaved by 16 (idot.h i8r16_*, q36_trunk_q8_interleave) */
 static void qw_free(QW *w) {
 #ifdef COLI_VULKAN
@@ -1935,6 +1943,7 @@ static void vk_q4_planar_to_fmt4(const QW *w, uint8_t *dst) {
             }
     }
 }
+static uint16_t *q36_wf16_rows(const QW *w);
 static unsigned g_vk_placed[4];   /* uploads by format: int8 rows, int4, f32, f16 */
 static int g_q36_vk_dev;          /* the device vk_qw_tensor uploads a new matrix to: 1 for the
                                    * chain's layers on COLI_VK_DEV2's (qwen36_chain.h) */
@@ -1950,7 +1959,10 @@ static int vk_qw_fmt(const QW *w, const void **wq, const float **sc) {
     if (w->q4) { *wq = w->q4; *sc = w->sg; return 4; }
     if (w->q) { *wq = w->q; *sc = w->sc; return 1; }
     if (w->h) { *wq = w->h; *sc = NULL; return 14; }
-    *wq = w->w; *sc = NULL;   /* fmt 10: no scales */
+    *wq = w->w; *sc = NULL;
+    /* a GGUF's F16 or BF16: the block format of its 16 bits (vk_qw_tensor rebuilds them from w),
+     * the block formats' GEMVs and tiled GEMMs; fmt 10 (f32, no scales) where the device lacks it */
+    if (w->wf16 && w->I % 32 == 0 && coli_vk_block_elems(100 + w->wf16)) return 100 + w->wf16;
     return 10;
 }
 static void q36_dho_reload(QW *w);
@@ -1971,12 +1983,14 @@ static ColiVkTensor *vk_qw_tensor(const QW *w) {
     int fmt = vk_qw_fmt(w, &wq, &sc), gs = fmt == 4 ? 64 : 0;
     if (!wq) return NULL;
     int ok;
-    if (w->gq) {   /* a GGUF's blocks for the dense chain (blockdec.glsl), as the file has them */
+    if (w->gq || fmt >= 100) {   /* a GGUF's blocks for the dense chain (blockdec.glsl), as the file has them */
         const int be = coli_vk_block_elems(fmt);
-        if (w->gs != 1.f || !be || I % be) { mw->vk_off = 1; return NULL; }   /* no device form, or a scale the shader lacks */
+        if ((w->gq && w->gs != 1.f) || !be || I % be) { mw->vk_off = 1; return NULL; }   /* no device form, or a scale the shader lacks */
         uint8_t *rows = NULL;
-        if (gq_r16_base(w->gq_type) >= 0 && !(rows = malloc((size_t)gq_row_bytes(fmt - 100, I) * O))) { mw->vk_off = 1; return NULL; }
-        if (rows) gq_r16_unpack(w->gq_type, rows, w->gq, O, I);
+        if (!w->gq) {   /* F16, BF16: their 16 bits again */
+            if (!(rows = (uint8_t *)q36_wf16_rows(w))) { mw->vk_off = 1; return NULL; }
+        } else if (gq_r16_base(w->gq_type) >= 0 && !(rows = malloc((size_t)gq_row_bytes(fmt - 100, I) * O))) { mw->vk_off = 1; return NULL; }
+        else if (rows) gq_r16_unpack(w->gq_type, rows, w->gq, O, I);
         const void *src = rows ? (const void *)rows : (const void *)w->gq;
         ok = g_q36_vk_dev ? coli_vk_tensor_ensure2(t, src, NULL, fmt, I, O, 0) : coli_vk_tensor_ensure(t, src, NULL, fmt, I, O, 0);
         free(rows);
@@ -2057,7 +2071,7 @@ static void vk_report(void) {
 }
 #endif
 /* f32 -> f16, round to nearest even: exact for a value that came from f16 (the
- * container), which is the only use (COLI_DENSE_BITS=16). */
+ * container, a GGUF's F16), which is the only use (COLI_DENSE_BITS=16, q36_wf16_rows). */
 static uint16_t f32_to_f16_bits(float f){
     uint32_t x; memcpy(&x, &f, 4);
     uint32_t sign = (x >> 16) & 0x8000u, mant = x & 0x7fffffu;
@@ -2075,6 +2089,20 @@ static uint16_t f32_to_f16_bits(float f){
     uint32_t v = ((uint32_t)exp << 10) | (mant >> 13), rest = mant & 0x1fffu;
     if (rest > 0x1000u || (rest == 0x1000u && (v & 1))) v++;
     return (uint16_t)(sign | v);
+}
+/* A GGUF's F16 or BF16 matrix for a GPU: its rows in the file's 16 bits again, from the f32
+ * copy the CPU reads (exact: every value came from them, rotary rows already in their order);
+ * malloc'd, NULL when out of memory. */
+static uint16_t *q36_wf16_rows(const QW *w) {
+    const int64_t n = (int64_t)w->I * w->O;
+    uint16_t *r = w->w ? malloc((size_t)n * 2) : NULL;
+    if (!r) return NULL;
+    #pragma omp parallel for schedule(static) if (n > (1 << 20))
+    for (int64_t k = 0; k < n; k++) {
+        uint32_t b; memcpy(&b, &w->w[k], 4);
+        r[k] = w->wf16 == GQ_F16 ? f32_to_f16_bits(w->w[k]) : (uint16_t)(b >> 16);
+    }
+    return r;
 }
 
 /* y[S,O] = x[S,I] @ W^T with W in f16 (COLI_DENSE_BITS=16). A thread converts
@@ -2238,6 +2266,10 @@ int coli_cuda_block_elems(int fmt);
 #endif
 static int qdw_gq_fmt(const QW *w) {
 #ifdef COLI_CUDA
+    if (g_gguf && !w->gq && w->wf16 && w->w) {   /* F16, BF16: blocks of 32 of their 16 bits (q36_wf16_rows) */
+        const int be = coli_cuda_block_elems(100 + w->wf16);
+        return be > 0 && w->I % be == 0 && w->I % 32 == 0 ? 100 + w->wf16 : 0;
+    }
     if (!g_gguf || !w->gq || w->gs != 1.f) return 0;
     const int r = gq_r16_base(w->gq_type), t = r >= 0 ? r : w->gq_type, be = coli_cuda_block_elems(100 + t);
     return be > 0 && w->I % be == 0 && w->I % 32 == 0 ? 100 + t : 0;
@@ -2253,6 +2285,7 @@ static size_t qdw_gq_bytes(const QW *w) {
  * *rows (free it after the upload); NULL when out of memory */
 static const void *qdw_gq_rows(const QW *w, int fmt, uint8_t **rows) {
     *rows = NULL;
+    if (!w->gq) return *rows = (uint8_t *)q36_wf16_rows(w);   /* F16, BF16 */
     if (gq_r16_base(w->gq_type) < 0) return w->gq;
     if (!(*rows = malloc((size_t)gq_row_bytes(fmt - 100, w->I) * w->O))) return NULL;
     gq_r16_unpack(w->gq_type, *rows, w->gq, w->O, w->I);
@@ -3127,6 +3160,7 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
         if (t->type == GQ_F32 || t->type == GQ_F16 || t->type == GQ_BF16) {
             out->w = load_t_n(m, name, (int64_t)I * O);
             if (rheads && out->w) q36_rope_unpermute((void *)out->w, (size_t)I * sizeof(float), rheads, O / rheads);
+            out->wf16 = t->type == GQ_F32 ? 0 : t->type;
             return;
         }
         if (!gq_blk_decoder(t->type)) { fprintf(stderr, "GGUF %s: type %s is not supported\n", t->name, gq_type_name(t->type)); exit(1); }
@@ -6689,8 +6723,11 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
                     ids[s], c->vocab - 1);
             exit(1);
         }
-        q36_embed_row(m, ids[s], pos_base + s, x + (int64_t)s*D);
     }
+    /* a prompt's rows over the team: each decoded from the file's blocks on its own (LFM3's
+     * Q6_K table, 2048 a row: on one thread the prompt waited for them before the device) */
+    #pragma omp parallel for schedule(static) if (S >= 16)
+    for (int s = 0; s < S; s++) q36_embed_row(m, ids[s], pos_base + s, x + (int64_t)s*D);
     tier_rebuild_evicted(m);
     int chain_n = 0;   /* layers the chain ran (a partial chain: the CPU runs the rest) */
     float *chain_logit = NULL;   /* the Vulkan or the CUDA chain ran the final norm and lm_head */
@@ -7256,6 +7293,20 @@ static void ensure_kv(Model *m){
      * per head -- one flat memcpy would land every head but the first at the
      * wrong offset, and that reads as a plausible answer from another
      * conversation rather than as a crash. */
+    /* Growth by half again at least, from 1024 rows, in steps of 256, up to the context the
+     * engine holds: a chat resends a longer transcript every turn, and growing to exactly the
+     * new length paid the reallocation, the rows' copy and (a GPU chain) its KV mirrors' again
+     * on every turn (LFM3-VL-2B on CUDA: a prompt of a new length 48 ms instead of 35). The
+     * RAM plan reserves the whole context's cache already. */
+    {
+        const int top = qwen36_max_ctx();
+        int want = m->max_t;
+        if (m->K && m->kv_cap + m->kv_cap / 2 > want) want = m->kv_cap + m->kv_cap / 2;
+        if (want < 1024) want = 1024;
+        want = (want + 255) / 256 * 256;
+        if (want > top) want = top;
+        if (want > m->max_t) m->max_t = want;
+    }
     void **oldK = m->K, **oldV = m->V;
     int old_stride = m->kv_cap, keep = m->K ? m->kvp.len : 0;
     if (keep > old_stride) keep = old_stride;
@@ -9140,7 +9191,9 @@ int main(int argc, char **argv) {
      * do. Without it this engine takes one thread per logical CPU, which on an
      * SMT host doubles the team for no arithmetic and pays a barrier per tiny
      * per-expert region (#718 measured +2.3x from the sizing alone on a
-     * 16C/32T part). OMP_NUM_THREADS wins, COLI_NO_OMP_TUNE=1 disables. */
+     * 16C/32T part). OMP_NUM_THREADS wins, COLI_NO_OMP_TUNE=1 disables. Before it,
+     * the hot team (omp_tune.h), which re-runs the engine once with libgomp's settings. */
+    coli_omp_hot_team(argv, "qwen36", coli_omp_env_on("COLI_CUDA") || coli_omp_env_on("COLI_METAL"));
     coli_omp_tune_threads("qwen36");
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("Qwen3.6", "SNAP=<model directory> ./qwen36 ..."); return 1; }

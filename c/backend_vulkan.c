@@ -912,7 +912,7 @@ static int scratch_reserve(Scratch *s, size_t bytes) { return scratch_reserve_mt
  * (203 vq2: codes | 4-bit scales per 32 | f32 row scale, its codebooks in the table buffer)
  * as codes | group scales (I/32 bytes) | f32 row scale. The scales live in the rows: the
  * scale array is bound but unused. Elements and bytes per block: blockdec_host.h. */
-static int bd_fmt(int fmt) { return (fmt >= 102 && fmt < 143 && BD_BLK[fmt - 100] >= 32) || (fmt >= 200 && fmt <= 203); }
+static int bd_fmt(int fmt) { return (fmt >= 101 && fmt < 143 && BD_BLK[fmt - 100] >= 32) || (fmt >= 200 && fmt <= 203); }
 static size_t bd_row_bytes(int fmt, int I) {
     if (fmt == 203) return (size_t)I / 4 + (size_t)I / 64 + 4;
     if (fmt >= 200) return (size_t)I / 128 * (fmt == 202 ? 48 : 32) + (size_t)I / 32 + 4;

@@ -71,6 +71,25 @@ P-core 0) the team of six P-core threads sat on CPUs 0-5, three cores. On an i5-
 cost Mistral-Large-4 UD-IQ1_S a quarter of its decode (0.59-0.61 tok/s against 0.76-0.80
 with the places). Both are defaults only: your own `OMP_PROC_BIND`/`OMP_PLACES` win.
 
+The OLMoE, qwen36 (Qwen3.6, LFM3, Flint and the other models it runs) and qwen38 engines take
+the same hot team on Linux and FreeBSD (`coli_omp_hot_team` in `omp_tune.h`): active waiting
+with `GOMP_SPINCOUNT=200000` (a moment of spinning between a token's many small matmul
+regions, then sleep, so a disk wait does not burn a core), `KMP_BLOCKTIME=200`, the team on
+whole cores and of fixed size, set and the engine run again once, keeping its own process
+name. Not on macOS (#707), not with CUDA or Metal on, not under `COLI_NO_OMP_TUNE`. Served on
+an i5-13500, Q4_K_M, alternated with dev:
+
+| on the CPU | decode before | decode after | prompt before | prompt after |
+|---|---|---|---|---|
+| OLMoE | 43.3, 42.7 tok/s | 47.9, 47.6 | 267, 268 | 279, 279 |
+| LFM3-VL-2B | 33.7, 33.8 | 34.5, 34.5 | 282, 280 | 287, 287 |
+| Qwen3.6-35B-A3B (4 rounds) | 13.5-13.6 | 13.9 | 115.7 average | 115.4 average |
+| Qwen3.8-Flash-Next IQ2_XS, 68 GB on 62 GB of RAM (3 rounds) | 7.9-8.1 | 9.0-9.1 | 38.2 average | 36.7 average |
+
+Qwen3.8 reads its experts from the disk there: decode gains, the prompt (212 tokens) loses 4%,
+the cost colibri.c's spin count is the compromise for. On Vulkan decode is unchanged; the prompt is faster for LFM3 (6636 and 6593 to 6961 and 6879
+tok/s), the same for OLMoE, 2% slower for Qwen3.6 (2003 to 1965 on average over 4 rounds).
+
 ### Hybrid CUDA/CPU OpenMP override
 
 The main GLM engine intentionally skips its active-wait OpenMP tuning when

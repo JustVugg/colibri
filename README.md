@@ -422,6 +422,17 @@ full, the scoring rules and where it does not help:
 `coli web` opens it, and so does the one-step setup: the chat, the System One
 page, the Brain and the Profiling page, in a light or a dark theme.
 
+### The chat UI
+
+`coli ui` opens the new chat next to a running `coli serve`: reasoning in its own block,
+pictures for models with a vision tower, web search, the expert map, a live monitor, and
+coding agents opened already pointed at colibri. Seven languages. See [ui/README.md](ui/README.md).
+
+<p align="center">
+  <img src="docs/media/ui/ui-chat.png" width="900" alt="the chat UI: a question, the reasoning folded, the answer, and its speed">
+</p>
+<p align="center"><em>LFM3-VL-2B on an i5-13500's CPU, 32 tok/s.</em></p>
+
 <p align="center">
   <img src="docs/media/colibri-dashboard.png" width="900" alt="the colibri web dashboard: chat, live metrics, hardware panel, expert tiers">
 </p>
@@ -546,6 +557,19 @@ the experts live. GLM-5.2 decode, from [the full tables](docs/benchmarks.md):
   ([#273](https://github.com/JustVugg/colibri/issues/273));
 - **the 25 GB laptop where this started:** 0.05-0.1 tok/s cold, the honest
   floor.
+
+### Three backends on one machine
+
+An i5-13500 with 62 GB of RAM and an RTX PRO 4000 Blackwell SFF (24 GB, 70 W),
+each model served by `coli serve`: a fresh 450-token prompt, then a 128-token
+streamed answer, the request's HTTP included; the better of two runs, tok/s.
+
+| GGUF | CUDA prompt | CUDA decode | Vulkan prompt | Vulkan decode | CPU prompt | CPU decode |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen3.6-35B-A3B UD-Q4_K_M | 3,491 | 104.8 | 2,076 | 92.9 | 122.6 | 13.9 |
+| LFM3-VL-2B Q4_K_M | 12,317 | 235.1 | 8,174 | 214.1 | 286.5 | 34.5 |
+| OLMoE-1B-7B-0125-Instruct Q4_K_M | 10,418 | 354.6 | 6,867 | 299.4 | 279.9 | 47.4 |
+| LFM3-VL-2B F16 | 11,524 | 103.4 | 7,767 | 99.3 | 49.7 | 6.4 |
 
 Quality is measured, not assumed: the int4 container's cost and the
 quantization ablations are in

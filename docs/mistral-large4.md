@@ -101,8 +101,14 @@ Germany is Berlin. The capital of Spain is Madrid. The capital of Portugal is Li
 Through the gateway the chat template, the `[THINK]` reasoning (as `reasoning_content`) and the
 answer come back as the release writes them.
 
-On an NVIDIA card a GGUF of this model runs on Vulkan, as GLM-5.2's does (a build with both
-backends switches to it; the CUDA backend has no ggml block types).
+On an NVIDIA card a build with both backends runs a GGUF of this model on Vulkan, whose dense
+chain takes the attention. `COLI_VULKAN=0` (or a build without Vulkan) runs it on CUDA: the routed
+experts on the shared tier over the CUDA backend, the resident dense matrices on the card as far as
+half of its free memory goes, the attention on the CPU. On the RTX PRO 4000 the dense part (17 GiB)
+is past that half, so the card holds 888 experts (the Vulkan tier beside the chain, 156). The two
+alternated on one build: a 240-token prompt in 66-82 s on CUDA and 36.5-36.9 s on Vulkan, then
+1.34-1.36 against 1.16-1.17 tok/s of decode. With the dense part on the card
+(`COLI_CUDA_DENSE_GB=17`, 209 experts) 89 s and 0.65 tok/s. The same text.
 
 ## Pictures
 
