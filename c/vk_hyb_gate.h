@@ -2,8 +2,8 @@
  * experts are computed by the CPU beside the device's (the hybrid steps) or read by the
  * device over the bus is measured, not assumed. The decode forwards are timed with the
  * device's reads for VKC_HYB_PROBE forwards, then with the hybrid steps for as many, and
- * the faster is kept (the hybrid where it is not slower by a twentieth); the first forward
- * of a phase warms it and is not counted; after VKC_HYB_REPROBE forwards both are measured
+ * the faster is kept (the hybrid where it is not slower by a twentieth); the first forwards
+ * of a phase (VKC_HYB_WARM) warm it and are not counted; after VKC_HYB_REPROBE forwards both are measured
  * again. Whether the CPU's pair beats the device's read depends on the bus, the CPU, the
  * format and how many pairs a step has: on an RTX 3070 at PCIe 4.0 x16 with Qwen3.6
  * int4 (1.4 pool pairs a step) the device's reads won, 18.5 ms a token against 33 to 50
@@ -16,7 +16,8 @@
  * Pure state, no device: tests/test_vk_chain.c runs it. */
 #ifndef VK_HYB_GATE_H
 #define VK_HYB_GATE_H
-#define VKC_HYB_PROBE 2
+#define VKC_HYB_PROBE 4    /* forwards measured a phase */
+#define VKC_HYB_WARM 2     /* forwards of a phase before them: the first steps of the hybrid build its events and scratch */
 #define VKC_HYB_REPROBE 1024
 typedef struct {
     int use;                 /* this forward's steps take the hybrid */
@@ -38,9 +39,9 @@ static inline int vkc_hyb_gate_forward(VkcHybGate *g, double ms) {
         g->fwd = 0; g->phase = 0; g->n = 0; g->ms[0] = g->ms[1] = 0; g->use = 0;
         return 0;
     }
-    if (g->n++ == 0) return 0;                     /* the phase's first forward warms it */
+    if (g->n++ < VKC_HYB_WARM) return 0;           /* the phase's first forwards warm it */
     g->ms[g->phase] += ms;
-    if (g->n <= VKC_HYB_PROBE) return 0;
+    if (g->n < VKC_HYB_WARM + VKC_HYB_PROBE) return 0;   /* n counts the phase's forwards so far, this one included */
     if (g->phase == 0) { g->phase = 1; g->n = 0; g->use = 1; return 0; }
     g->use = g->ms[1] <= g->ms[0] * 1.05;
     g->kept[0] = g->ms[1] / VKC_HYB_PROBE; g->kept[1] = g->ms[0] / VKC_HYB_PROBE;

@@ -2498,6 +2498,10 @@ tests/test_cu_tier$(EXE): tests/test_cu_tier.c $(CUDA_OBJ)
 tests/test_vk_tier$(EXE): tests/test_vk_tier.c $(VK_OBJ) $(VK_SPV)
 	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_tier needs VK=1" >&2; exit 1; }
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+# the hybrid steps' CPU pairs alone (vkt_host_pairs), no device: ./tests/bench_host_pairs [fmt: 2 int4 rows, 4 int4-g64, 1 int8]
+tests/bench_host_pairs$(EXE): tests/bench_host_pairs.c $(VK_OBJ)
+	@[ "$(VK)" = 1 ] || { echo "tests/bench_host_pairs needs VK=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 .PHONY: vk-tier-check
 vk-tier-check: tests/test_vk_tier$(EXE)
 	./tests/test_vk_tier$(EXE) shaders/qmatmul.spv

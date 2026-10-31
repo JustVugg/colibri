@@ -523,6 +523,22 @@ int  vkc_hybrid_submit(uint64_t g);
 void vkc_hybrid_wait_next(uint64_t h);
 int  vkc_hybrid_host_wait(uint64_t g);
 int  vkc_hybrid_host_signal(uint64_t h);
+/* fn runs before the host waits for any frame (vk_dmoe.h's vkc_hyb_flush: the host's part
+ * of a hybrid step still to come, which the frames from C on wait for); NULL none */
+void vkc_hybrid_set_flush(void (*fn)(void));
+/* The hybrid steps inside one frame (vk_dmoe.h, as the CUDA chain's cc_signal and
+ * cc_wait_host), on Vulkan events: step g's pair of events (a ring; the step 256 before
+ * reused them, its frame waited for first). vkc_ev_signal sets the device's once everything
+ * recorded before it is done and visible to the host; vkc_ev_wait holds the queue until
+ * the host sets its (vkc_ev_host_set, after writing what the step reads), and makes the
+ * host's writes visible to what follows; vkc_ev_host_done asks whether the device's is set.
+ * A shader polling a word in host memory did not work here: an RTX 3070 served the loads
+ * (and the atomics) from its L2 and saw the host's write only at the frame's end. */
+int  vkc_ev_ready(void);
+int  vkc_ev_signal(uint64_t g);
+int  vkc_ev_wait(uint64_t g);
+int  vkc_ev_host_done(uint64_t g);
+int  vkc_ev_host_set(uint64_t g);
 
 /* ---- attention residuals and SiTU-GLU (chain_ares.comp) ----------------------------
  * Kimi K3's residual stream (AttnRes) and its activation, for S rows:
