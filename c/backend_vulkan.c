@@ -1921,6 +1921,23 @@ static void up_zero(int dev, VkDeviceMemory mem, uint64_t cap) {
 /* The primary device's pools are addressable when bufferDeviceAddress is on (the
  * expert batch's grouped GEMM reads expert weights through an address table). */
 static int pool_bda(const VkWPool *P) { return P->dev == 0 && G.has_bda; }
+/* An imported block's pages: MinGW has no posix_memalign, and what _aligned_malloc returns
+ * goes back through _aligned_free. */
+static void *pool_host_alloc(size_t al, size_t bytes) {
+#ifdef _WIN32
+    return _aligned_malloc(bytes, al);
+#else
+    void *p = NULL;
+    return posix_memalign(&p, al, bytes) ? NULL : p;
+#endif
+}
+static void pool_host_free(void *p) {
+#ifdef _WIN32
+    _aligned_free(p);
+#else
+    free(p);
+#endif
+}
 /* The host pool's blocks from the process's own pages (VK_EXT_external_memory_host), where
  * the driver has them: the memory vkAllocateMemory gives for a host-visible type without
  * HOST_CACHED is write-combined for the CPU (NVIDIA's Linux driver offers no cached type),
@@ -1946,16 +1963,16 @@ static int pool_import(VkWPool *P, VkBlk *bk, uint64_t cap, const VkMemoryAlloca
         gp = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(G.dev, "vkGetMemoryHostPointerPropertiesEXT");
     }
     if (!gp || cap % al) return 0;
-    void *host = NULL;
-    if (posix_memalign(&host, al, (size_t)cap)) return 0;
+    void *host = pool_host_alloc(al, (size_t)cap);
+    if (!host) return 0;
     VkMemoryHostPointerPropertiesEXT mp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
     if (gp(G.dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host, &mp) != VK_SUCCESS ||
-        !(mp.memoryTypeBits & (1u << pool_memtype(P)))) { free(host); return 0; }
+        !(mp.memoryTypeBits & (1u << pool_memtype(P)))) { pool_host_free(host); return 0; }
     VkImportMemoryHostPointerInfoEXT imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, .pNext = (void *)afl,
         .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, .pHostPointer = host};
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp, .allocationSize = cap,
         .memoryTypeIndex = pool_memtype(P)};
-    if (vkAllocateMemory(G.dev, &ai, NULL, &bk->mem) != VK_SUCCESS) { free(host); bk->mem = VK_NULL_HANDLE; return 0; }
+    if (vkAllocateMemory(G.dev, &ai, NULL, &bk->mem) != VK_SUCCESS) { pool_host_free(host); bk->mem = VK_NULL_HANDLE; return 0; }
     bk->base = host; bk->imp = host;
     static int said;
     if (!said++) fprintf(stderr, "[VK] host pool: its blocks are the process's own pages, imported (cached for the CPU; COLI_VK_HOST_POOL_IMPORT=0 takes the driver's)\n");
@@ -1972,7 +1989,7 @@ static void blk_free(VkDevice dev, VkBlk *bk) {
         if (bk->base && !bk->imp) vkUnmapMemory(dev, bk->mem);
         if (bk->mem) vkFreeMemory(dev, bk->mem, NULL);
     }
-    free(bk->imp);
+    if (bk->imp) pool_host_free(bk->imp);
     free(bk);
 }
 /* Block memory for a pool (lock held). */
