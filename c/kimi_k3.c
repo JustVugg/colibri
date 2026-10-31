@@ -236,6 +236,7 @@ typedef struct { int eid; uint8_t *buf, *base; uint64_t used; int pinned;
                  int li;              /* the layer it was read for */
                  int pin_ok, pin_mem; /* a cache or working-set slot, whose bytes may be pinned
                                        * memory (K3_GPU_PIN_GB); base is that, not posix_memalign's */
+                 int ra;              /* a read-ahead slot holding (li, eid), or reading it */
                } Slot;
 /* pinned: seeded from .coli_usage at startup and never evicted. The LRU adapts to
  * THIS session; the pin knows the history of every session before it. Capped at
@@ -682,6 +683,23 @@ static uint8_t *k3_pin_bytes(size_t b){
     return p;
 }
 #endif
+/* K3_READAHEAD_GB: the read-ahead pool of a large prompt step (20 GB when the GPU takes a
+ * prompt's experts, 0 else), counted against the RAM budget before the expert cache:
+ * measured, a 2,637-token prompt 170 -> 130 s, decode 0.83 -> 0.81 tok/s (82 slots a layer
+ * instead of 94); 10 GB held two thirds of a layer's reads and hid little */
+static double g_k3ra_gb=-1;
+static double k3_ra_gb(void){
+    if(g_k3ra_gb<0){
+        const char *e=getenv("K3_READAHEAD_GB");
+#ifdef COLI_K3_CUDA
+        g_k3ra_gb=e?atof(e):g_k3g_on?20.0:0.0;
+#else
+        g_k3ra_gb=e?atof(e):0.0;
+#endif
+        if(g_k3ra_gb<0) g_k3ra_gb=0;
+    }
+    return g_k3ra_gb;
+}
 static void w_matmul(float *y, const float *x, const W *w, int S){
 #ifdef COLI_CUDA
     if(w->cuda&&g_k3_cuda_dense&&!k3_omp_in_par()){
@@ -1774,8 +1792,8 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
          * Checkpoints allocate lazily after this plan, so reserve all enabled
          * slots now: RAM_GB is a whole-process ceiling even for opt-in memory. */
         double ckpt_gb = k3_ckpt_reserve_gb(m,g_k3_ckpt_slots);
-        double act_gb = k3_act_gb();
-        double reserve = 2.5 + act_gb + kv_gb + ckpt_gb;
+        double act_gb = k3_act_gb(), ra_gb = k3_ra_gb();
+        double reserve = 2.5 + act_gb + ra_gb + kv_gb + ckpt_gb;
         g_k3_ram_later = (kv_gb + ckpt_gb) * 1e9;   /* allocated once it serves: the tier's host pool leaves it (#2314) */
         double for_experts = 0.0;
 
@@ -1797,10 +1815,10 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
             /* Name every term. The user's number is not being ignored, it is
              * being clamped, and they cannot check the clamp without the parts. */
             fprintf(stderr,"[K3][RAM_GB=%.1f%s] resident %.1f GB + reserve %.1f GB "
-                "(page cache 2.5, activations %.1f, KV %dx%d %.1f, checkpoints %d %.1f) "
+                "(page cache 2.5, activations %.1f, read-ahead %.1f, KV %dx%d %.1f, checkpoints %d %.1f) "
                 "-> %.1f GB for experts; "
                 "cache %d->%d/layer (%.1f MB/slot, %d layers; projected peak %.1f GB)\n",
-                budget, ram_env>0?"":" auto", resident, reserve, act_gb, nkv, max_t, kv_gb,
+                budget, ram_env>0?"":" auto", resident, reserve, act_gb, ra_gb, nkv, max_t, kv_gb,
                 g_k3_ckpt_slots,ckpt_gb,
                 for_experts>0?for_experts:0.0, cap, cap_fit>0?cap_fit:1,
                 slot_gb*1000.0, nmoe,
@@ -3413,6 +3431,84 @@ static void k3_waves_take(Model *m, int li, K3Waves *w){
         k3_io_submit(m,s,li,w->uids[jj],0);
     }
 }
+/* ---------- a large prompt step's read-ahead (K3_READAHEAD_GB) ----------------------------
+ * A step of many rows needs nearly every expert of every MoE layer, one read each, and the
+ * per-layer cache holds a tenth of them: without this the drives read a layer's experts only
+ * while that layer's MoE step runs, and idle through the attention before it. A pool of its
+ * own slots reads the next MoE layer's experts the cache lacks, behind the step's own reads
+ * (the readers' prefetch queue), while the rest of the layer and the next one's attention
+ * compute; that layer's step takes them as it takes cached ones, and frees them after. The
+ * same bytes, read sooner. */
+static Slot *g_k3ra; static int g_k3ra_n=-1;
+static int *g_k3ra_of;                    /* [layer][expert]: its pool slot, -1 */
+static int *g_k3ra_free, g_k3ra_nfree;    /* the pool's free slots (a stack) */
+static int g_k3ra_ln=-1, g_k3ra_next;     /* the layer it reads for, the next expert to look at */
+static uint64_t g_k3ra_issued, g_k3ra_used;
+static pthread_mutex_t g_k3ra_mx=PTHREAD_MUTEX_INITIALIZER;   /* the pool's state: steps' threads (the GPU feeder) */
+static Slot *k3_ra_find(int li, int eid, int E){
+    int i=g_k3ra_of?g_k3ra_of[(int64_t)li*E+eid]:-1;
+    return i>=0?&g_k3ra[i]:NULL;
+}
+/* pool slot i holds nothing again */
+static void k3_ra_drop(Slot *s, int E){
+    int i=(int)(s-g_k3ra);
+    if(s->ra&&s->li>=0&&s->eid>=0) g_k3ra_of[(int64_t)s->li*E+s->eid]=-1;
+    s->ra=0; s->li=-1; s->eid=-1;
+    g_k3ra_free[g_k3ra_nfree++]=i;
+}
+/* more of the target layer's experts its cache and the pool lack, into free pool slots, as far
+ * as they go (under g_k3ra_mx) */
+static void k3_ra_fill_locked(Model *m){
+    const int E=m->c.n_experts, ln=g_k3ra_ln;
+    if(ln<0) return;
+    while(g_k3ra_nfree&&g_k3ra_next<E){
+        const int e=g_k3ra_next++;
+        if(g_k3ra_of[(int64_t)ln*E+e]>=0||slot_lookup(m,ln,e)) continue;
+        const int i=g_k3ra_free[--g_k3ra_nfree];
+        Slot *s=&g_k3ra[i];
+        s->ra=1; s->li=ln; s->eid=e; s->used=0;
+        g_k3ra_of[(int64_t)ln*E+e]=i;
+        m->ebytes+=(uint64_t)m->e_slot;
+        k3_io_submit(m,s,ln,e,1);
+        g_k3ra_issued++;
+    }
+}
+/* a step of layer li (a large one) reads the next MoE layer's experts ahead from here on */
+static void k3_ra_start(Model *m, int li){
+    const int E=m->c.n_experts;
+    if(g_k3ra_n<0){
+        g_k3ra_n=(int)(k3_ra_gb()*1e9/(double)m->e_slot);
+        if(g_k3ra_n>0){
+            g_k3ra=calloc((size_t)g_k3ra_n,sizeof(Slot));
+            g_k3ra_free=malloc((size_t)g_k3ra_n*sizeof(int));
+            g_k3ra_of=malloc((size_t)m->c.n_layers*E*sizeof(int));
+            if(!g_k3ra||!g_k3ra_free||!g_k3ra_of){ fprintf(stderr,"OOM read-ahead slots\n"); exit(1); }
+            for(int64_t k=0;k<(int64_t)m->c.n_layers*E;k++) g_k3ra_of[k]=-1;
+            for(int i=g_k3ra_n-1;i>=0;i--){ g_k3ra[i].eid=-1; g_k3ra[i].li=-1; g_k3ra[i].pin_ok=1; g_k3ra_free[g_k3ra_nfree++]=i; }
+        }
+    }
+    if(g_k3ra_n<=0||!g_k3_pipe) return;
+    int ln=-1;
+    for(int i=li+1;i<m->c.n_layers;i++) if(m->L[i].sparse){ ln=i; break; }
+    pthread_mutex_lock(&g_k3ra_mx);
+    if(ln!=g_k3ra_ln){
+        /* the slots of every other layer that no step uses and no read fills go back */
+        for(int i=0;i<g_k3ra_n;i++){
+            Slot *s=&g_k3ra[i];
+            if(s->ra&&s->li!=ln&&s->li!=li&&!s->busy&&slot_ready(s)) k3_ra_drop(s,E);
+        }
+        g_k3ra_ln=ln; g_k3ra_next=0;
+    }
+    k3_ra_fill_locked(m);
+    pthread_mutex_unlock(&g_k3ra_mx);
+}
+/* a step is done with slot s: a pool slot goes back, and the next layer's reads take it */
+static void k3_ra_done(Model *m, Slot *s){
+    if(!s->ra) return;
+    pthread_mutex_lock(&g_k3ra_mx);
+    if(!s->busy){ k3_ra_drop(s,m->c.n_experts); k3_ra_fill_locked(m); }
+    pthread_mutex_unlock(&g_k3ra_mx);
+}
 static void k3_waves_issue(Model *m, int li, int nu, const int *uids,
                            const int *pfirst, const int *pcnt,
                            const int *poslist, const float *wlist, K3Waves *w){
@@ -3428,6 +3524,12 @@ static void k3_waves_issue(Model *m, int li, int nu, const int *uids,
     for(int j=0;j<nu;j++){
         ehit_mark(m,li,uids[j]);
         Slot *s=slot_lookup(m,li,uids[j]);   /* resident, or a prefetch on its way */
+        if(!s&&g_k3ra_n>0&&(s=k3_ra_find(li,uids[j],c->n_experts))){   /* read ahead: a read, made or on its way */
+            m->miss++; g_k3ra_used++; s->busy++;
+            if(!slot_ready(s)) k3_io_promote(s);
+            w->sl[j]=s;
+            continue;
+        }
         if(s){
             m->hits++; s->used=w->stamp; s->busy++;
             if(s->pref){ s->pref=0; m->pf_used++; }
@@ -3460,6 +3562,7 @@ static void k3_waves_issue(Model *m, int li, int nu, const int *uids,
     }
     k3_waves_take(m,li,w);
     if(m->pf_n) k3_prefetch_pending(m);   /* the next MoE layer's reads, behind these */
+    if(w->tot>=4*c->n_experts) k3_ra_start(m,li);   /* a large step: the next layer's, behind all of them */
 }
 #ifdef COLI_K3_CUDA
 /* ---------- a prompt step's routed experts on the GPU (coli_cuda_k3.dll) -----------------
@@ -3502,7 +3605,10 @@ static void k3g_publish(K3Waves *w){
         if(w->sl[j]&&!atomic_load_explicit(&g_k3g_avail[j],memory_order_relaxed))
             atomic_store_explicit(&g_k3g_avail[j],1,memory_order_release);
 }
-static void k3g_done_locked(K3Waves *w, int j){ w->done[j]=1; w->sl[j]->busy--; g_k3g.left--; }
+static void k3g_done_locked(Model *m, K3Waves *w, int j){
+    w->done[j]=1; w->sl[j]->busy--; g_k3g.left--;
+    k3_ra_done(m,w->sl[j]);   /* a read-ahead slot: the next layer's next read */
+}
 /* until a read completes or about a millisecond has gone */
 static void k3g_nap(void){
     struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts);
@@ -3523,7 +3629,7 @@ static void k3g_feed(void){
         if(n<0){ atomic_store(&g_k3g.fail,1); break; }
         if(n){
             pthread_mutex_lock(&g_k3g.mx);
-            for(int i=0;i<n;i++) k3g_done_locked(w,tags[i]);
+            for(int i=0;i<n;i++) k3g_done_locked(m,w,tags[i]);
             k3_waves_take(m,li,w); k3g_publish(w);
             pthread_cond_broadcast(&g_k3g.ev);
             pthread_mutex_unlock(&g_k3g.mx);
@@ -3632,7 +3738,7 @@ static void k3g_run(Model *m, int li, K3Waves *w, const int8_t *zq, const float 
             k3_wave(m,w->wave,nw,w->sl,w->pfirst,w->pcnt,XQ,XS,NULL,G,GQ,GS,Y);
             m->t_wave+=now_s()-t0; m->n_wave++;
             pthread_mutex_lock(&g_k3g.mx);
-            for(int a=0;a<nw;a++) k3g_done_locked(w,w->wave[a]);
+            for(int a=0;a<nw;a++) k3g_done_locked(m,w,w->wave[a]);
             k3_waves_take(m,li,w); k3g_publish(w);
             pthread_mutex_unlock(&g_k3g.mx);
             g_k3g.cpu+=(unsigned long long)nw;
@@ -3728,6 +3834,7 @@ static void k3_waves_run(Model *m, int li, K3Waves *w, const float *Z, int strid
             if(XT(ready)()){ VktExpertSrc vs=k3_vk_src(m,li,w->sl[j]->buf); XT(note)(li,w->uids[j],&vs); }
 #endif
             w->done[j]=1; w->sl[j]->busy--; left--;
+            k3_ra_done(m,w->sl[j]);
         }
         k3_waves_take(m,li,w);   /* a step larger than the cache: the slots its computed experts freed */
     }
@@ -3746,6 +3853,8 @@ static void k3_waves_run(Model *m, int li, K3Waves *w, const float *Z, int strid
     if(Y!=g_k3g_Y)
 #endif
     k3_bfree(Y);
+    /* (the pool's slots went back one by one as the step's experts were done, and the next
+     * layer's reads may already fill them: nothing to give back here) */
     free(w->sl); free(w->wave); free(w->miss); free(w->done);
 }
 static void k3_moe_waves(Model *m, int li, int nu, const int *uids,
@@ -6281,6 +6390,8 @@ int main(int argc, char **argv){
                           "%.0f GiB of the cache's slots pinned\n",g_k3g.gpu,g_k3g.cpu,g_k3p_used);
     k3cu_report();
 #endif
+    if(g_k3ra_issued) fprintf(stderr,"[K3] read ahead: %llu experts in a pool of %d slots, %llu taken by their steps\n",
+                              (unsigned long long)g_k3ra_issued,g_k3ra_n,(unsigned long long)g_k3ra_used);
     /* the decode's own share of every timer: what they hold after the prompt */
     double d0_attn=m.t_attn, d0_moe=m.t_moe, d0_eload=m.t_eload, d0_route=m.t_route, d0_lat=m.t_lat,
            d0_shared=m.t_shared, d0_wave=m.t_wave, d0_head=m.t_head;

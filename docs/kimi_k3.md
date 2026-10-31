@@ -254,8 +254,10 @@ teacher-forced logit streams at C=32 vs C=1 match exactly). Measured prefill:
 (scalar fallback for head dims not divisible by 8).
 
 **A long prompt's CPU work** (the RTX 4090 machine, docs/experiments/kimi-k3-4090-2026-10-31:
-a 2,637-token prompt took 1,401 s in 512-token steps, **549 s** now in steps of 2,048,
-the logits the same bytes). Each rewrite below keeps every row's and position's arithmetic:
+a 2,637-token prompt took 1,401 s in 512-token steps, 549 s on the CPU in steps of 2,048,
+and **137 s** in one step of 4,096 with its experts, MLA attention and routers on the GPU
+(below: the CPU's bytes there too), the logits the same bytes). Each rewrite below keeps
+every row's and position's arithmetic:
 - the gated MLA's scores were one chain of 576 adds a position (GCC -O3 multiplies 16 at
   a time, then adds the products in order); `k3_mla_scores_g` keeps that arithmetic (an
   opaque product, then the add, as mimo.c's `mul_apart`) with 16 positions in the lanes,
@@ -428,14 +430,76 @@ was read; keep it off when the experts stream from disk.
 | `K3_CUDA_RELEASE_HOST` | 0 | free the placed matrices' host copies (reread from disk if the GPU fails) |
 | `COLI_GPU` | 0 | the CUDA device |
 
+## CUDA: a prompt step on the GPU, the CPU's bytes (`coli_cuda_k3.dll`)
+
+A Windows CUDA build (`mingw32-make kimi_k3 CUDA_DLL=1`) also loads `coli_cuda_k3.dll`
+(`c\build_k3_cuda.bat`, `backend_cuda_k3.cu`) when it sits beside the engine, and then
+computes a prompt step's heavy parts on the card in the CPU's own arithmetic, to the bit:
+every kernel there reproduces the loop it replaces, so the logits are the CPU build's bytes
+whatever the step, and a step may split its experts between the card and the CPU in any
+way.
+
+- **The routed experts.** `matmul_mxfp4_i8_pre`'s output is 8 lanes, each the integer sum
+  of four products of the doubled e2m1 values and the int8 inputs (dp4a gives it), times
+  the group's scale (e8m0 times 0.5, times the row's: two float multiplies), fused into the
+  lane group after group, then hsum256's pairs (three xor shuffles). SiTU calls exp_f and
+  MinGW's tanhf through `k3_exact.h`: e^x and tanh in double within about 2^-50, rounded
+  to float from 2^-44 below and from 2^-44 above; where the two roundings agree every
+  number between them rounds the same way, and the 731 and 415 floats where they differ
+  carry MinGW's bits in `k3_exact_tables.h` (`tools/k3_exact_tables.c` writes it and checks
+  every one of the 2^32 floats; `tests/test_k3_cuda_experts.c --all-floats` runs the
+  device's code on all of them). Then `mxfp4_qx`'s quantization and down, written straight
+  into one pinned buffer. A feeder thread hands the card every expert whose bytes are in
+  RAM as the reads bring them, frees its slot and queues the step's next read into it; the
+  CPU computes the shared experts meanwhile, then waves of `K3_GPU_CPU_WAVE` experts
+  itself; the weighted sums run as before, in the union's order.
+- **The dense matrices the GPU does not hold** (`k3cu_matmul`): `matmul_i4_grouped`'s
+  lanes, group sums and fused scales, `matmul_q`'s lanes and scale; the shared experts as
+  one call (gate, up, SiTU, down: `k3cu_shared`).
+- **The gated MLA's attention core** (`k3cu_mla`): mla_forward's loop -- the absorbed
+  query (fused, w_addrow's), the scores (products rounded, added in order from zero,
+  then scaled), `softmax_` (its sum in order), the values (fused over the positions in
+  order), kv_b's rows (`k3_rowdot8_i8`) and the sigmoid gate -- as tiled kernels whose
+  every output adds its terms in order. It grows with the square of the context.
+- **The routers** (`k3cu_router`): the bf16 router's 32 lanes and halving tree, a warp an
+  output.
+
+The rest of a prompt step stays on the CPU, faster too: KDA's gates, output gate and the
+conv's SiLU 8 at a time through `exp_f8` (exp_f's bits), and the routing's rows over every
+worker (the same picks). `tests/test_k3_cuda_experts.c` checks every kernel against the
+code it replaces, byte for byte; the tiny model's logits at steps of 1 to 2,048 (with
+`K3_GPU_MIN_ROWS=1`, every step on the card) and the real model's are the CPU build's.
+
+**Read-ahead.** A step of many rows needs nearly every expert of every MoE layer, one read
+each, and the per-layer cache holds a tenth of them: the drives read a layer's experts
+only while that layer's MoE step runs. A pool of its own slots (`K3_READAHEAD_GB`, 20 GB
+when the card takes a prompt's experts) reads the next MoE layer's experts the cache lacks
+behind the step's own reads, while the rest of the layer and the next one's attention
+compute; that layer's step takes them as cached ones and frees each as it is done, the
+next layer's reads taking its place. The same bytes, read sooner: the pool's RAM comes out
+of the expert cache (on the 4090 machine 94 -> 82 slots a layer, decode 0.83 -> 0.81
+tokens a second; a 2,637-token prompt 170 -> 137 s). The cache's slots come from pinned
+memory up to `K3_GPU_PIN_GB` (64: Windows takes VRAM for pinned memory past about half
+the RAM).
+
+| var | default | meaning |
+|---|---|---|
+| `K3_GPU_EXPERTS` | 1 | a prompt step's experts and dense parts on the card too (0: the CPU's alone) |
+| `K3_GPU_MIN_ROWS` | 32 | the rows a step needs for it (1 in tests: every step) |
+| `K3_GPU_CPU_WAVE` | 4 | the experts the CPU takes at a time beside the card |
+| `K3_GPU_PIN_GB` | 64 | the expert slots' pinned memory, GiB |
+| `K3_READAHEAD_GB` | 20 with the card, else 0 | the read-ahead pool, counted in the RAM budget |
+
 ## Current limitations
 
 - Decode is single-token (no speculative decoding — K3 has no MTP head).
 - Tool declarations/calls and image content are not exposed through the shared
   gateway yet; unsupported requests fail explicitly.
 - CPU + optional Vulkan (the shared expert tier) or CUDA for the dense matrices
-  (`K3_CUDA_DENSE`, below); no Metal. A prompt's routed experts and attention stay
-  on the CPU.
+  (`K3_CUDA_DENSE`, above) and a prompt step's experts, MLA attention and routers
+  (`coli_cuda_k3.dll`, Windows builds: its tables hold MinGW's exp_f and tanhf bits); no
+  Metal. KDA's recurrence and convolution stay on the CPU, and so does a decode step's
+  every expert.
 - The protocol, tokenizer, gateway, TUI, and Web client paths are locally
   testable without the 1.5 TB checkpoint. A release claim still requires one
   full-model multi-turn TUI/Web run on a host that owns the complete snapshot.

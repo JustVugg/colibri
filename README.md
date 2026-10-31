@@ -157,10 +157,11 @@ holds K3 in this machine's memory, so every token reads its experts from disk: 2
 token before any cache hit, at 16.9 GB/s with both drives reading at once
 ([the plan, the other K3 engines and what was taken from them](docs/kimi_k3-4090.md)).
 Measured on the real model ([docs/experiments/kimi-k3-4090-2026-10-31](docs/experiments/kimi-k3-4090-2026-10-31/README.md)):
-**0.78 tokens a second** (0.81 with `-DenseGB 21.5 -ReserveGB 1`; the first engine here
-0.56), a 53 s start (161), a 35-token prompt in 35 s (57), a 2,637-token prompt in 549 s
-(1,401 before this commit's CPU kernels); 61.5% of the experts a token asks for are found in
-RAM. Every step gives the logits of the one before it, byte for byte:
+**0.81 tokens a second** (the first engine here 0.56), a 44 s start (161), a 35-token prompt
+in 33 s (57), a **2,637-token prompt in 137 s** (1,401 s with the first CPU kernels, 549 s
+with the faster ones: its experts, MLA attention and routers now run on the GPU in the CPU's
+arithmetic, to the bit); 60.5% of the experts a token asks for are found in RAM. Every step
+gives the logits of the one before it, byte for byte:
 
 - `c\tools\download_kimi_k3_4090.ps1` fetches the checkpoint and cuts every MoE layer's
   shard between `C:` (61.4% of its experts) and `D:` (38.6%), in proportion to their
@@ -171,6 +172,11 @@ RAM. Every step gives the logits of the one before it, byte for byte:
   blocks, its 12 best experts); a step's experts are computed in waves as their reads
   arrive, the shared experts while none has; the routers stay BF16.
 - the largest dense matrices (20 GiB) on the GPU, a tiled kernel for prompt steps.
+- a prompt step on the GPU (`coli_cuda_k3.dll`): its routed experts as their reads arrive
+  (dp4a, the CPU's lanes and sums; exp and tanh to MinGW's bits, checked on all 2^32
+  floats), its other dense matrices, the gated MLA's attention, the shared experts and the
+  routers; a 20 GB pool reads the next layer's experts while this one computes, and the
+  whole prompt goes in one 4,096-token step.
 - `c\tools\start_kimi_k3_4090.ps1` serves the OpenAI/Anthropic API on port 18080 (model
   `kimi-k3`), with photos of every turn so agent clients that drop the reasoning resume
   instead of recomputing the conversation.
@@ -187,10 +193,14 @@ RAM. Every step gives the logits of the one before it, byte for byte:
 шарды обратно). В движке: по два потока чтения на диск со своими дескрипторами,
 упреждающее чтение экспертов следующего слоя, эксперты шага считаются волнами по мере
 прихода данных, роутеры в BF16, крупнейшие плотные матрицы (20 ГиБ) на GPU, «снимки»
-состояния на каждом ходе для агентов. Запуск: `c\tools\start_kimi_k3_4090.ps1`.
-Замеры на настоящей модели: **0,78 токена/с** (0,81 с `-DenseGB 21.5 -ReserveGB 1`; первая
-версия — 0,56), запуск 53 с (было 161), промпт из 35 токенов за 37 с (57); 61,5% экспертов
-находятся в ОЗУ, промпт из 2637 токенов — 549 с (было 1401), текст тот же байт в байт. Подробно: [docs/kimi_k3-4090.md](docs/kimi_k3-4090.md).
+состояния на каждом ходе для агентов. Промпт считается на GPU (`coli_cuda_k3.dll`) в той же
+арифметике, что и на CPU, до бита: эксперты по мере чтения (dp4a; exp и tanh дают биты MinGW,
+проверено на всех 2^32 float), остальные плотные матрицы, внимание MLA, общие эксперты и
+роутеры; пул 20 ГБ читает эксперты следующего слоя, пока считается текущий, весь промпт идёт
+одним шагом до 4096 токенов. Запуск: `c\tools\start_kimi_k3_4090.ps1`.
+Замеры на настоящей модели: **0,81 токена/с** (первая версия — 0,56), запуск 44 с (было 161),
+промпт из 35 токенов за 33 с (57); 60,5% экспертов находятся в ОЗУ, **промпт из 2637 токенов —
+137 с** (было 1401, затем 549 на CPU), логиты те же байт в байт. Подробно: [docs/kimi_k3-4090.md](docs/kimi_k3-4090.md).
 
 </details>
 <p align="center">

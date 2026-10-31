@@ -32,6 +32,10 @@ param(
     # the GPU, a 2,637-token prompt 352 s in steps of 2048, 268 s in one of 4096); past 512 a
     # step's token holds 1.4 MB of RAM, taken from the expert cache (3 of 97 slots a layer)
     [ValidateRange(1,4096)][int]$Chunk = 4096,
+    # A long prompt's read-ahead pool, GB: the next MoE layer's experts read while this one
+    # computes (2,637 tokens 170 -> 137 s at 20); its RAM comes out of the expert cache
+    # (decode 0.83 -> 0.81 tok/s), 0 gives decode all of it
+    [ValidateRange(0,64)][double]$ReadAheadGB = 20,
     # Photos of the recurrent state at every prompt's and reply's end (COLI_K3_CKPT, about
     # 434 MB each): a turn whose client sends the history back without its reasoning, or
     # edits a tool result, resumes from the deepest photo its prompt still matches and
@@ -74,6 +78,7 @@ if (Test-Path -LiteralPath $layout -PathType Leaf) {
 $env:K3_DIRS = $shardDirs -join ';'
 $env:K3_CUDA = '0'                     # no VRAM tier: a decode step's experts on the CPU, read in place
 $env:K3_GPU_EXPERTS = $(if ($Cpu -or $CpuExperts) { '0' } else { '1' })
+$env:K3_READAHEAD_GB = $(if ($Cpu -or $CpuExperts) { '0' } else { [string]$ReadAheadGB })
 $env:K3_CUDA_DENSE = $(if ($Cpu -or $DenseGB -le 0) { '0' } else { '1' })
 $env:K3_CUDA_DENSE_GB = [string]$DenseGB
 $env:K3_CUDA_RESERVE_GB = [string]$ReserveGB
@@ -98,7 +103,7 @@ foreach ($key in @('K3_LAYERS', 'K3_TRACE', 'K3_LOGITS', 'K3_X0', 'K3_MMAP', 'K3
 }
 Write-Host "Kimi K3: $ModelDir$(if ($shardDirs.Count) { '; experts also from ' + ($shardDirs -join '; ') })"
 Write-Host "RAM $RamGB GB, CPU $Threads, readers $IoPerDrive per drive, prefetch $Prefetch, $(if ($env:K3_CUDA_DENSE -eq '1') { "dense matrices on the GPU up to $DenseGB GiB" } else { 'dense matrices on the CPU' })$(if ($env:K3_GPU_EXPERTS -eq '1') { ', a prompt step''s experts on the GPU too' })"
-Write-Host "Context $Context tokens, replies up to $MaxOutput tokens, prompt steps of $Chunk, $Photos turn photos"
+Write-Host "Context $Context tokens, replies up to $MaxOutput tokens, prompt steps of $Chunk (read-ahead $($env:K3_READAHEAD_GB) GB), $Photos turn photos"
 Write-Host "API: http://127.0.0.1:$Port/v1, model $ModelId"
 & python (Join-Path $EngineDir 'coli') serve --model $ModelDir --ram $RamGB --ctx $Context `
     --ngen $MaxOutput --host 127.0.0.1 --port $Port --model-id $ModelId --kv-slots 1 `

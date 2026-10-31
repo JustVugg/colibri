@@ -170,3 +170,40 @@ commit before, and `tests/mimo_tiny_harness.py` passes.
 | run46-48 | `matmul_mxfp4_i8_pre`: an output's weights decoded once for 8 rows, their group scales one vector multiply (1.47x a thread at 16-37 rows) | the logits the same bytes; the same text; 546.7 s (the routed experts 255.3 -> 215.5) |
 | run49-51 | + `matmul_i4_grouped`: a group's 8 rows' hsum256 and fmaf at once (`hsum256_x8`, the same pairs; 1.13-1.3x in `bench_i4`) | the same bytes and text; **549 s** (4.81 tok/s), the same as run48 within the runs' noise (the shared experts 88.8 -> 88.0 s) |
 
+## The upstream merge and a prompt on the GPU (`raw/s2_*`, 2026-10-31 to 11-01)
+
+Upstream (JustVugg/colibri) had 1,409 commits since this fork's base (9e47a82a merges them).
+Checked before and after on this machine: the tiny model's logits at steps of 1, 32, 300 and
+2,048 and a 40-token decode the bytes of the build before (`k3tiny.sh`), its tiny, checkpoint,
+dashboard and upstream's new park checks pass; the real model's 35-token prompt the same logits
+(`s2_mrg_logits`), the same expert cache (97 slots a layer) and prompt time; MiMo's tiny model
+the same logits at steps of 1 and 40 (`mimotiny.sh`; the real MiMo shards are no longer on the
+drives). Every C test both trees build passed in both (191; 47 of upstream's 50 new ones, the
+other 3 take arguments from test-python: `run_ctests.py`); test-python 2,520 -> 3,200 tests, the
+only new failures 3 Qwen3.8 converter tests whose temporary files Windows still holds open
+(their older siblings fail the same way run alone). Fixed on the way: AVX-512 builds on Windows
+(a `grp2` that windows.h defines), upstream's new `tmpfile()` calls, inkling's strings, K3's
+Vulkan build, omp_spin.o only without Vulkan.
+
+| run | what | the 2,637-token prompt |
+|---|---|---:|
+| `s2_gpu_logits` | the routed experts on the GPU (coli_cuda_k3.dll, the CPU's bytes), 35 tokens | the logits the same bytes |
+| `s2_gpu_long2048` | the same, steps of 2,048 | 548.7 -> 407.6 s (130,528 experts on the GPU, 17,068 on the CPU) |
+| `s2_gpu2_long2048` | + the dense matrices the GPU does not hold (`k3cu_matmul`) | 352.3 s (shared 115 -> 20 s, latent 35 -> 6) |
+| `s2_gpu2_long4096` | one step of 4,096 | 268.5 s (1,390 GB read instead of 2,455) |
+| `s2_gpu3_long4096` | + the gated MLA's attention core (`k3cu_mla`) | 213.7 s (MLA 67 -> 11 s) |
+| `s2_gpu4_long4096` | + 64 GiB of the cache's slots pinned | 212.2 s |
+| `s2_gpu5_long4096` | + the routers (`k3cu_router`), KDA's gates and conv through exp_f8 | 184.7 s (conv 11.1 -> 1.9, heads 17.6 -> 4.6) |
+| `s2_gpu6_long4096`, `_short` | + the shared experts fused (`k3cu_shared`), the routing over every worker | 170.0 s; decode 0.79 -> 0.84 tok/s, the same text |
+| `s2_ra_long4096` | + a 10 GB read-ahead pool | 165.0 s |
+| `s2_ra2_long4096` | the pool refilled as each expert is done: **a bug** (a refilled slot given back at the step's end, its read still on its way: non-finite router logits at layer 6, another first token) | discarded |
+| `s2_long_ref`, `s2_long_ra3` | fixed; the logits of all 2,637 positions (1.73 GB) with the pool and without it | the same bytes |
+| `s2_ra20_long`, `s2_ra20b_long` | a 20 GB pool (the default) | **130.3, 136.8 s**; waiting for reads 54 -> 0.9 s |
+| `s2_long_ra20` | the 20 GB pool's logits at all 2,637 positions | the same bytes |
+| `s2_ra20_short`, `s2_ra0_short` | decode with the pool's RAM taken from the cache (82 slots a layer) and without (94) | 0.81 and 0.83 tok/s, the same text |
+| `s2_d32_long`, `bench_shared.c` | the exact dense kernel over 32 rows a block | 341 against 328 ms a 4,096-row shared expert step: dropped |
+| `s2_a2b_long`, `s2_ab_*` (`series_b2b.sh`) | the experts' uploads back to back (no wait a copy), A/B twice | the same bytes; 141.8, 145.8 s against 145.1, 143.6 s (the shared experts lose what the routed experts gain on PCIe): dropped |
+
+The GPU's timing on this machine varies by up to a quarter for minutes at a time
+(`s2_d32_long`: coli_cuda.dll's unchanged dense calls 35.3 -> 44.6 s), so a change is kept
+on an alternating series or a bench of its own, never on one run.

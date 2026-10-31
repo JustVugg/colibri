@@ -266,6 +266,7 @@ int main(int argc, char **argv){
     bad += check_dense(4, 37, 7168, 200, 64);
     bad += check_dense(4, 1100, 1024, 96, 32);
     bad += check_dense(4, 9, 3584, 71, 128);
+    bad += check_dense(4, 100, 7168, 64, 64);   /* 12 blocks of 8 rows and one of 4 */
     bad += check_dense(1, 33, 7168, 100, 0);
     bad += check_dense(1, 1030, 512, 40, 0);
     bad += check_mla(96, 128, 64, 128, 512, 100, 40);
