@@ -446,7 +446,7 @@ def _fallback_tool_calls(tool_calls, index):
         if isinstance(args, str):
             try:
                 args = json.loads(args) if args else {}
-            except (json.JSONDecodeError, TypeError, ValueError):
+            except (TypeError, ValueError, RecursionError):
                 raise APIError(400, "`function.arguments` must be a JSON object.",
                                f"messages.{index}.tool_calls.{position}.function.arguments")
         if args and not isinstance(args, dict):
@@ -2036,7 +2036,7 @@ def _qwen_tool_calls(tool_calls, has_content, index):
         if isinstance(args, str) and args:
             try:
                 args = json.loads(args)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, RecursionError):
                 raise APIError(400, "`function.arguments` must be a JSON object.",
                                f"messages.{index}.tool_calls.{position}.function.arguments")
         if isinstance(args, dict):
@@ -2824,7 +2824,7 @@ def render_chat_qwen3_coder(messages, tools=None, tool_choice=None, add_generati
                 if isinstance(args, str):
                     try:
                         args = json.loads(args) if args.strip() else {}
-                    except ValueError:
+                    except (ValueError, RecursionError):
                         raise APIError(400, "`function.arguments` must be a JSON object.",
                                        f"{where}.function.arguments")
                 if not isinstance(args, dict):
@@ -3062,7 +3062,7 @@ def _mimo_tool_calls(calls, index):
             if isinstance(args, str) and args.strip():
                 try:
                     args = json.loads(args)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, RecursionError):
                     raise APIError(400, "`function.arguments` must be a JSON object.",
                                    f"{where}.function.arguments")
             if isinstance(args, dict):
@@ -3518,7 +3518,7 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
                 if isinstance(args, str):
                     try:
                         args = json.loads(args)
-                    except (json.JSONDecodeError, TypeError):
+                    except (TypeError, ValueError, RecursionError):
                         args = {}
                 if not isinstance(args, dict):
                     # `arguments` that is valid JSON but not an object ("[1,2]",
@@ -3958,7 +3958,7 @@ def _glm53_tool_calls(calls):
         if isinstance(arguments, str):
             try:
                 arguments = json.loads(arguments)
-            except ValueError:
+            except (ValueError, RecursionError):
                 arguments = {}
         if not isinstance(arguments, dict):
             arguments = {}                        # same gap as render_chat above
