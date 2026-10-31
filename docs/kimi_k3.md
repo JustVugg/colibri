@@ -254,7 +254,7 @@ teacher-forced logit streams at C=32 vs C=1 match exactly). Measured prefill:
 (scalar fallback for head dims not divisible by 8).
 
 **A long prompt's CPU work** (the RTX 4090 machine, docs/experiments/kimi-k3-4090-2026-10-31:
-a 2,637-token prompt took 1,401 s in 512-token steps, **613 s** now in steps of 2,048,
+a 2,637-token prompt took 1,401 s in 512-token steps, **582 s** now in steps of 2,048,
 the logits the same bytes). Each rewrite below keeps every row's and position's arithmetic:
 - the gated MLA's scores were one chain of 576 adds a position (GCC -O3 multiplies 16 at
   a time, then adds the products in order); `k3_mla_scores_g` keeps that arithmetic (an
@@ -278,7 +278,11 @@ the logits the same bytes). Each rewrite below keeps every row's and position's 
   in L2, each weight loaded once for 8 (4) rows, every row's lanes and tree its own;
 - coli_cuda.dll's `quant_matmul_tiled` (a step's rows on the GPU) ends quant_matmul's tree
   with five levels of warp shuffles, two outputs a round: 20 block barriers where there
-  were 80, the same pairs added (10-20% sooner).
+  were 80, the same pairs added (10-20% sooner);
+- the routers' BF16 rows take a step's rows the same way (the routing 31 -> 23 s);
+- a step's big buffers stay allocated from one layer to the next (`k3_balloc`, given back at
+  the step's end): a 2,048-row step's 2 GB a layer had cost a page fault every 4 KiB every
+  layer (94 -> 41 million faults for that prompt; the rest is the expert cache's first fill).
 
 ## Chat, API, and Web
 

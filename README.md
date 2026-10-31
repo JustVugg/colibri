@@ -155,7 +155,7 @@ token before any cache hit, at 16.9 GB/s with both drives reading at once
 ([the plan, the other K3 engines and what was taken from them](docs/kimi_k3-4090.md)).
 Measured on the real model ([docs/experiments/kimi-k3-4090-2026-10-31](docs/experiments/kimi-k3-4090-2026-10-31/README.md)):
 **0.78 tokens a second** (0.81 with `-DenseGB 21.5 -ReserveGB 1`; the first engine here
-0.56), a 53 s start (161), a 35-token prompt in 35 s (57), a 2,637-token prompt in 613 s
+0.56), a 53 s start (161), a 35-token prompt in 35 s (57), a 2,637-token prompt in 582 s
 (1,401 before this commit's CPU kernels); 61.5% of the experts a token asks for are found in
 RAM. Every step gives the logits of the one before it, byte for byte:
 
@@ -187,7 +187,7 @@ RAM. Every step gives the logits of the one before it, byte for byte:
 состояния на каждом ходе для агентов. Запуск: `c\tools\start_kimi_k3_4090.ps1`.
 Замеры на настоящей модели: **0,78 токена/с** (0,81 с `-DenseGB 21.5 -ReserveGB 1`; первая
 версия — 0,56), запуск 53 с (было 161), промпт из 35 токенов за 37 с (57); 61,5% экспертов
-находятся в ОЗУ, промпт из 2637 токенов — 613 с (было 1401), текст тот же байт в байт. Подробно: [docs/kimi_k3-4090.md](docs/kimi_k3-4090.md).
+находятся в ОЗУ, промпт из 2637 токенов — 582 с (было 1401), текст тот же байт в байт. Подробно: [docs/kimi_k3-4090.md](docs/kimi_k3-4090.md).
 
 </details>
 

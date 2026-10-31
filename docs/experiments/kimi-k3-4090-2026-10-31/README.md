@@ -157,4 +157,10 @@ long prompt reads its experts a quarter as often.
 `matmul_f32.h` and `quant.h` serve other engines too: MiMo's tiny model (`tools/make_mimo_tiny.py`,
 `MIMO_LOGITS`, steps of 1 and 40 rows) gives the same logits with these headers as with the
 commit before, and `tests/mimo_tiny_harness.py` passes.
+## Runs 41-45: the routers' rows, a step's buffers kept
+
+| run | what | result |
+|---|---|---|
+| run41-42 | + the routers' BF16 rows over a step's rows; the prompt line counts page faults | the logits the same bytes; 603.4 s (the routing 31.3 -> 23.1 s); **93.7 million page faults** in the prompt |
+| run43-45 | + a step's big buffers kept from one layer to the next (`k3_balloc`), layer 0's SiTU over every worker | the same bytes and text; decode 0.79 tok/s; **581.8 s** (4.53 tok/s), 40.9 million page faults (the expert cache's 158 GB filled for the first time: 38.4 million in the 35-token prompt too) |
 

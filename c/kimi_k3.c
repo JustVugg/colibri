@@ -355,6 +355,15 @@ static double k3_mem_avail(void){
     fclose(f); return kb/1e6;
 #endif
 }
+/* the process's page faults so far (Windows: soft and hard; elsewhere minor and major) */
+static double k3_page_faults(void){
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS pmc; pmc.cb=sizeof pmc;
+    return GetProcessMemoryInfo(GetCurrentProcess(),&pmc,sizeof pmc)?(double)pmc.PageFaultCount:0.0;
+#else
+    struct rusage r; getrusage(RUSAGE_SELF,&r); return (double)r.ru_minflt+(double)r.ru_majflt;
+#endif
+}
 static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r);
 #if defined(__APPLE__)
     return r.ru_maxrss/(1024.0*1024.0*1024.0);
@@ -368,6 +377,55 @@ static float *falloc(int64_t n){
 static float *fcalloc(int64_t n){
     if(n<0 || (uint64_t)n > SIZE_MAX/sizeof(float)){ fprintf(stderr,"alloc size overflow: %lld floats\n",(long long)n); exit(1); }
     float *p=calloc((size_t)n,sizeof(float)); if(!p){fprintf(stderr,"OOM %lld floats\n",(long long)n);exit(1);} return p; }
+/* ---------- a step's big buffers, kept from one layer to the next ----------
+ * malloc gives a block of a MB or more fresh pages from the OS and free returns them, so
+ * a 2,048-row step's buffers (about 2 GB a layer: KDA's projections, the waves' inputs and
+ * outputs, ...) cost a page fault for every 4 KiB every layer: 94 million for a 2,637-token
+ * prompt. k3_bfree keeps such blocks for the next layer, which asks for the same sizes
+ * (k3_balloc: the smallest kept block that holds the request, at most twice it), and a
+ * step's end gives them back (k3_bcache_drop). As with malloc, every user writes a
+ * buffer before it reads it. */
+#define K3_BC_MAX 64
+#define K3_BC_MIN ((size_t)1<<20)
+static struct { char *base; size_t cap; } g_k3_bc[K3_BC_MAX];
+static int g_k3_bc_n;
+static pthread_mutex_t g_k3_bc_mx=PTHREAD_MUTEX_INITIALIZER;
+static void *k3_balloc_bytes(size_t b){
+    if(b>=K3_BC_MIN){
+        char *base=NULL;
+        pthread_mutex_lock(&g_k3_bc_mx);
+        int best=-1;
+        for(int i=0;i<g_k3_bc_n;i++)
+            if(g_k3_bc[i].cap>=b&&g_k3_bc[i].cap/2<=b&&(best<0||g_k3_bc[i].cap<g_k3_bc[best].cap)) best=i;
+        if(best>=0){ base=g_k3_bc[best].base; g_k3_bc[best]=g_k3_bc[--g_k3_bc_n]; }
+        pthread_mutex_unlock(&g_k3_bc_mx);
+        if(base) return base+64;
+    }
+    char *base=malloc(b+64);
+    if(!base){ fprintf(stderr,"OOM %zu bytes\n",b); exit(1); }
+    *(size_t*)base=b;
+    return base+64;
+}
+static float *k3_balloc(int64_t n){
+    if(n<0 || (uint64_t)n > (SIZE_MAX-64)/sizeof(float)){ fprintf(stderr,"alloc size overflow: %lld floats\n",(long long)n); exit(1); }
+    return k3_balloc_bytes((size_t)n*sizeof(float));
+}
+static void k3_bfree(void *p){
+    if(!p) return;
+    char *base=(char*)p-64;
+    if(*(size_t*)base>=K3_BC_MIN){
+        pthread_mutex_lock(&g_k3_bc_mx);
+        if(g_k3_bc_n<K3_BC_MAX){ g_k3_bc[g_k3_bc_n].base=base; g_k3_bc[g_k3_bc_n].cap=*(size_t*)base; g_k3_bc_n++; base=NULL; }
+        pthread_mutex_unlock(&g_k3_bc_mx);
+    }
+    free(base);
+}
+static void k3_bcache_drop(void){
+    pthread_mutex_lock(&g_k3_bc_mx);
+    for(int i=0;i<g_k3_bc_n;i++) free(g_k3_bc[i].base);
+    g_k3_bc_n=0;
+    pthread_mutex_unlock(&g_k3_bc_mx);
+}
 /* Aligned + zeroed alloc. Metal's wrap() only takes the zero-copy (newBufferWithBytesNoCopy)
  * path when the pointer AND size are 16384-aligned; otherwise it makes a private GPU copy
  * that is never synced back. Buffers the GPU WRITES and must persist across tokens (KDA
@@ -1751,9 +1809,9 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
     int P=c->kda_proj, H=c->kda_heads, hd=c->kda_hd, K=c->conv_k;
     { static int once=0; if(li==0 && !once){ once=1;
         fprintf(stderr,"[KDA] L%d metal=%d P=%d H=%d hd=%d K=%d\n", li, g_k3_metal, P, H, hd, K); } }
-    float *q=falloc((int64_t)C*P), *k=falloc((int64_t)C*P), *v=falloc((int64_t)C*P);
-    float *gp=falloc((int64_t)C*P), *on=falloc((int64_t)C*P);
-    float *t1=falloc((int64_t)C*c->kda_hd), *graw=falloc((int64_t)C*P), *braw=falloc((int64_t)C*H);
+    float *q=k3_balloc((int64_t)C*P), *k=k3_balloc((int64_t)C*P), *v=k3_balloc((int64_t)C*P);
+    float *gp=k3_balloc((int64_t)C*P), *on=k3_balloc((int64_t)C*P);
+    float *t1=k3_balloc((int64_t)C*c->kda_hd), *graw=k3_balloc((int64_t)C*P), *braw=k3_balloc((int64_t)C*H);
 #ifdef COLI_METAL
     float *meta_oh = NULL, *meta_alpha = NULL, *meta_beta = NULL;
     if(g_k3_metal){
@@ -1893,7 +1951,7 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
             k3_kda_head(m,a,li,t,h,qt,kt,tv,rgt,bt,gpt,ont,qscale);
     }
     w_matmul(out,on,&a->o,C);
-    free(q);free(k);free(v);free(gp);free(on);free(t1);free(graw);free(braw);
+    k3_bfree(q);k3_bfree(k);k3_bfree(v);k3_bfree(gp);k3_bfree(on);k3_bfree(t1);k3_bfree(graw);k3_bfree(braw);
 #ifdef COLI_METAL
     if(g_k3_metal || meta_oh){
         free(meta_oh); free(meta_alpha); free(meta_beta);
@@ -2050,9 +2108,9 @@ static void k3_mla_scores_g(float *sc, const float *qab, const float *const *qrp
     static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, int C, float *out){
     Cfg *c=&m->c; Mla *a=&l->m;
     int H=c->n_heads, qh=c->qk_head, vh=c->v_head, kvl=c->kv_lora, qr=c->qk_rope;
-    float *qa=falloc((int64_t)C*c->q_lora), *qv=falloc((int64_t)C*H*qh);
-    float *ckv=falloc((int64_t)C*(kvl+qr));
-    float *gv=falloc((int64_t)C*H*vh), *ctx=falloc((int64_t)C*H*vh);
+    float *qa=k3_balloc((int64_t)C*c->q_lora), *qv=k3_balloc((int64_t)C*H*qh);
+    float *ckv=k3_balloc((int64_t)C*(kvl+qr));
+    float *gv=k3_balloc((int64_t)C*H*vh), *ctx=k3_balloc((int64_t)C*H*vh);
     { static int once=0; if(!once){ once=1;
         fprintf(stderr,"[K3-FMT] L%d MLA: qa.fmt=%d gs=%d qb.fmt=%d gs=%d kva.fmt=%d gs=%d\n",
                 li, a->qa.fmt, a->qa.gs, a->qb.fmt, a->qb.gs, a->kva.fmt, a->kva.gs);
@@ -2144,7 +2202,7 @@ static void k3_mla_scores_g(float *sc, const float *qab, const float *const *qrp
         }
     }
     w_matmul(out,ctx,&a->o,C);
-    free(qa);free(qv);free(ckv);free(gv);free(ctx);
+    k3_bfree(qa);k3_bfree(qv);k3_bfree(ckv);k3_bfree(gv);k3_bfree(ctx);
 }
 
 /* ---------- routed experts: LRU + pread from the shards ----------
@@ -2585,6 +2643,48 @@ static inline float k3_dot_bf16w(const float *x, const uint16_t *w, int I){
 }
 /* sco[C][E] = x[C][hidden] the router's rows, bf16 or f32 */
 static void k3_router_scores(Moe *o, float *sco, const float *x, int C, int D, int E){
+#if defined(__AVX2__) && defined(__FMA__)
+    if(o->router16&&C>=2&&D%MATMUL_F32_LANES==0&&MATMUL_F32_LANES==32){
+        /* a prompt step: matmul's tiling over rows (matmul_f32.h), the weights widened as
+         * k3_dot_bf16w widens them -- each row's 32 lanes and halving tree its own */
+        const int nob=(E+15)/16;
+        #pragma omp parallel for schedule(static)
+        for(int ob=0;ob<nob;ob++){
+            const int oe=ob*16+16<E?ob*16+16:E;
+            for(int s0=0;s0<C;s0+=16){
+                const int se=s0+16<C?s0+16:C;
+                for(int e=ob*16;e<oe;e++){
+                    const uint16_t *w=o->router16+(int64_t)e*D;
+                    for(int s1=s0;s1<se;s1+=4){
+                        const int ns=se-s1<4?se-s1:4;
+                        const float *xr[4];
+                        for(int r=0;r<4;r++) xr[r]=x+(int64_t)(s1+(r<ns?r:ns-1))*D;
+                        __m256 a[4][4];
+                        for(int r=0;r<4;r++) for(int q=0;q<4;q++) a[r][q]=_mm256_setzero_ps();
+                        for(int i=0;i<D;i+=32){
+                            __m256 wq[4];
+                            for(int q=0;q<4;q++)
+                                wq[q]=_mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(
+                                          _mm_loadu_si128((const __m128i*)(w+i+8*q))),16));
+                            for(int r=0;r<4;r++)
+                                for(int q=0;q<4;q++)
+                                    a[r][q]=_mm256_fmadd_ps(_mm256_loadu_ps(xr[r]+i+8*q),wq[q],a[r][q]);
+                        }
+                        for(int r=0;r<ns;r++){
+                            __m256 h0=_mm256_add_ps(a[r][0],a[r][2]), h1=_mm256_add_ps(a[r][1],a[r][3]);
+                            h0=_mm256_add_ps(h0,h1);
+                            __m128 l=_mm_add_ps(_mm256_castps256_ps128(h0),_mm256_extractf128_ps(h0,1));
+                            l=_mm_add_ps(l,_mm_movehl_ps(l,l));
+                            l=_mm_add_ss(l,_mm_shuffle_ps(l,l,1));
+                            sco[(int64_t)(s1+r)*E+e]=_mm_cvtss_f32(l);
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+#endif
     if(o->router16){
         #pragma omp parallel for schedule(static)
         for(int e=0;e<E;e++){
@@ -3069,21 +3169,21 @@ static void k3_waves_run(Model *m, int li, K3Waves *w, const float *Z, int strid
     if(idot){
         int maxt=0;
         for(int e=0;e<tot;e++) if(poslist[e]>maxt) maxt=poslist[e];
-        int8_t *zq=malloc((size_t)(maxt+1)*LT); float *zs=malloc((size_t)(maxt+1)*gb1*sizeof(float));
-        XQ=malloc((size_t)tot*LT); XS=malloc((size_t)tot*gb1*sizeof(float));
-        GQ=malloc((size_t)tot*MI); GS=malloc((size_t)tot*gb2*sizeof(float));
+        int8_t *zq=k3_balloc_bytes((size_t)(maxt+1)*LT); float *zs=k3_balloc_bytes((size_t)(maxt+1)*gb1*sizeof(float));
+        XQ=k3_balloc_bytes((size_t)tot*LT); XS=k3_balloc_bytes((size_t)tot*gb1*sizeof(float));
+        GQ=k3_balloc_bytes((size_t)tot*MI); GS=k3_balloc_bytes((size_t)tot*gb2*sizeof(float));
         if(!zq||!zs||!XQ||!XS||!GQ||!GS){ fprintf(stderr,"OOM expert inputs\n"); exit(1); }
         mxfp4_qx(Z,maxt+1,LT,zq,zs);
         for(int e=0;e<tot;e++){
             memcpy(XQ+(size_t)e*LT,zq+(size_t)poslist[e]*LT,(size_t)LT);
             memcpy(XS+(size_t)e*gb1,zs+(size_t)poslist[e]*gb1,(size_t)gb1*sizeof(float));
         }
-        free(zq); free(zs);
+        k3_bfree(zq); k3_bfree(zs);
     } else {
-        XF=falloc((int64_t)tot*LT);
+        XF=k3_balloc((int64_t)tot*LT);
         for(int e=0;e<tot;e++) memcpy(XF+(size_t)e*LT,Z+(size_t)poslist[e]*LT,(size_t)LT*sizeof(float));
     }
-    float *G=falloc((int64_t)tot*MI), *Y=falloc((int64_t)tot*LT);
+    float *G=k3_balloc((int64_t)tot*MI), *Y=k3_balloc((int64_t)tot*LT);
     for(int left=nu;left>0;){
         unsigned long long seen_io=k3_io_seen();
         int nw=0;
@@ -3116,7 +3216,7 @@ static void k3_waves_run(Model *m, int li, K3Waves *w, const float *Z, int strid
             const float *yr=Y+(size_t)e*LT;
             for(int i=0;i<LT;i++) ut[i]+=wk*yr[i];
         }
-    free(XQ); free(XS); free(XF); free(GQ); free(GS); free(G); free(Y);
+    k3_bfree(XQ); k3_bfree(XS); k3_bfree(XF); k3_bfree(GQ); k3_bfree(GS); k3_bfree(G); k3_bfree(Y);
     free(w->sl); free(w->wave); free(w->miss); free(w->done);
 }
 static void k3_moe_waves(Model *m, int li, int nu, const int *uids,
@@ -3370,13 +3470,13 @@ static void k3_vk_report(const Model *m, const char *scope){
 static float *k3_shared(Model *m, Moe *o, const float *x, int C){
     Cfg *c=&m->c;
     int shi=c->moe_inter*c->n_shared;
-    float *sg=falloc((int64_t)C*shi), *su=falloc((int64_t)C*shi), *sd=falloc((int64_t)C*c->hidden);
+    float *sg=k3_balloc((int64_t)C*shi), *su=k3_balloc((int64_t)C*shi), *sd=falloc((int64_t)C*c->hidden);
     w_matmul(sg,x,&o->sh_gate,C); w_matmul(su,x,&o->sh_up,C);
     /* element by element over every worker (a 512-row step: 3.1M of them a layer) */
     #pragma omp parallel for schedule(static)
     for(int64_t i=0;i<(int64_t)C*shi;i++) sg[i]=situf_(sg[i],su[i],c->situ_b1,c->situ_b2);
     w_matmul(sd,sg,&o->sh_down,C);
-    free(sg); free(su);
+    k3_bfree(sg); k3_bfree(su);
     return sd;
 }
 
@@ -3684,14 +3784,14 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
     Cfg *c=&m->c; Moe *o=&l->moe;
     int E=c->n_experts, K=c->topk, LT=c->latent;
     double t0=now_s();
-    float *sco=falloc((int64_t)C*E);
+    float *sco=k3_balloc((int64_t)C*E);
     if(!K3_F32_DEV(o->vk_router,sco,x,C,c->hidden,E)) k3_router_scores(o,sco,x,C,c->hidden,E);
     int *idxs=malloc((size_t)C*K*sizeof(int)); float *wsels=falloc((int64_t)C*K);
     int *keff=malloc((size_t)C*sizeof(int));
     if(!idxs||!keff){fprintf(stderr,"OOM moe sel\n");exit(1);}
     k3_moe_route(m,o,li,sco,C,idxs,wsels,keff);
     k3_prefetch_score(m,li,idxs,keff,C);
-    float *z=falloc((int64_t)C*LT), *u=falloc((int64_t)C*LT), *sd=NULL;
+    float *z=k3_balloc((int64_t)C*LT), *u=k3_balloc((int64_t)C*LT), *sd=NULL;
     memset(u,0,(size_t)C*LT*sizeof(float));
     if(k3_waves_on()){
         /* the routed experts' reads first; the latent projection and the shared experts,
@@ -3720,14 +3820,15 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
     /* shared experts at full width (a tier step computed them while its batch ran) */
     if(!sd){ double t4=now_s(); sd=k3_shared(m,o,x,C); m->t_shared+=now_s()-t4; }
     for(int64_t d=0;d<(int64_t)C*c->hidden;d++) out[d]+=sd[d];
-    free(sco);free(idxs);free(wsels);free(keff);
-    free(z);free(u);free(sd);
+    k3_bfree(sco);free(idxs);free(wsels);free(keff);
+    k3_bfree(z);k3_bfree(u);free(sd);
 }
 
 static void dense_forward(Model *m, Layer *l, const float *x, int C, float *out){
     Cfg *c=&m->c; int DI=c->dense_inter;
     float *g=falloc((int64_t)C*DI), *u=falloc((int64_t)C*DI);
     w_matmul(g,x,&l->d_gate,C); w_matmul(u,x,&l->d_up,C);
+    #pragma omp parallel for schedule(static)   /* element by element: a step's 69M over every worker */
     for(int64_t i=0;i<(int64_t)C*DI;i++) g[i]=situf_(g[i],u[i],c->situ_b1,c->situ_b2);
     w_matmul(out,g,&l->d_down,C);
     free(g);free(u);
@@ -3955,6 +4056,7 @@ static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
     /* record what was just fed, at the positions it went to (kv_prefix.h) */
     if(!cancelled||!*cancelled) kv_prefix_record(&m->kvp,ids,pos0,C);
     free(hidden);free(bres);free(mix);
+    k3_bcache_drop();   /* the step's kept buffers back to the OS */
 #ifdef COLI_VULKAN
     free(fin);free(dev_last);
 #endif
@@ -5374,7 +5476,7 @@ int main(int argc, char **argv){
         chunk=1;                       /* trace rows are token-major by contract */
         fprintf(stderr,"[K3] K3_TRACE set: prefill chunk forced to 1\n");
     }
-    double t0=now_s(); float *lo=NULL;
+    double t0=now_s(), pf0=k3_page_faults(); float *lo=NULL;
     for(int i=0;i<np;i+=chunk){
         int Cc=np-i<chunk?np-i:chunk;
         if(lo) free(lo);
@@ -5386,8 +5488,8 @@ int main(int argc, char **argv){
     fprintf(stderr,"[K3] the prompt: attention %.1fs (KDA %.1f, MLA %.1f), MoE %.1fs (router and reads issued %.1f, "
             "latent %.1f, shared %.1f, routed experts computed %.1f, waiting for reads %.1f); %.0f GB read\n",
             m.t_attn,m.t_attn-m.t_mla,m.t_mla,m.t_moe,m.t_route,m.t_lat,m.t_shared,m.t_wave,m.t_eload,m.ebytes/1e9);
-    fprintf(stderr,"[K3] the prompt's KDA on the CPU: f32 projections %.1fs, conv %.1fs, heads %.1fs\n",
-            m.t_kda_f32,m.t_kda_conv,m.t_kda_heads);
+    fprintf(stderr,"[K3] the prompt's KDA on the CPU: f32 projections %.1fs, conv %.1fs, heads %.1fs; "
+            "%.0f page faults\n",m.t_kda_f32,m.t_kda_conv,m.t_kda_heads,k3_page_faults()-pf0);
 #ifdef COLI_CUDA
     k3_cuda_report("prompt");
 #endif
