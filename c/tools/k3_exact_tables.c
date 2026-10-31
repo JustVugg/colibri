@@ -107,7 +107,13 @@ int main(int argc, char **argv){
         FILE *a=fopen(path,"rb"), *b=fopen(tmp,"rb");
         if(a&&b){
             same=1;
-            for(;;){ int x=fgetc(a), y=fgetc(b); if(x!=y){ same=0; break; } if(x==EOF) break; }
+            for(;;){   /* a checkout's CRLF lines are the same tables */
+                int x, y;
+                do x=fgetc(a); while(x=='\r');
+                do y=fgetc(b); while(y=='\r');
+                if(x!=y){ same=0; break; }
+                if(x==EOF) break;
+            }
         }
         if(a) fclose(a);
         if(b) fclose(b);
