@@ -142,6 +142,53 @@ static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const
                               int S, int I, int O, int gs){
     int rb=(I+1)/2; int ng=(I+gs-1)/gs;
     int o0=0;
+#ifdef __AVX2__
+    if(S>=2&&gs>0&&gs%16==0&&I%gs==0){
+        /* Several rows (a prompt step): 16 outputs a task, their rows 16 at a time (the
+         * tile's inputs stay in L2 where the loop below reread all of them for every
+         * output), each 16 weights decoded once for 8 rows. A row's arithmetic is the
+         * one-row loop's below: the same fused adds into 8 lanes a group, the same
+         * hsum256, the same fmaf into its total -- so the same bytes. */
+        const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
+        const int nob=(O+15)/16;
+        #pragma omp parallel for schedule(static)
+        for(int ob=0;ob<nob;ob++){
+            const int oe=ob*16+16<O?ob*16+16:O;
+            for(int s0=0;s0<S;s0+=16){
+                const int se=s0+16<S?s0+16:S;
+                for(int o=ob*16;o<oe;o++){
+                    const uint8_t *w=q4+(int64_t)o*rb;
+                    const float *scl=scale+(int64_t)o*ng;
+                    for(int s1=s0;s1<se;s1+=8){
+                        const int ns=se-s1<8?se-s1:8;
+                        const float *xr[8];
+                        for(int r=0;r<8;r++) xr[r]=x+(int64_t)(s1+(r<ns?r:ns-1))*I;   /* spare: the last row again */
+                        float a[8]={0,0,0,0,0,0,0,0};
+                        for(int g=0;g<ng;g++){
+                            const int base=g*gs;
+                            __m256 acc[8];
+                            for(int r=0;r<8;r++) acc[r]=_mm256_setzero_ps();
+                            for(int i=base;i<base+gs;i+=16){
+                                __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));
+                                __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+                                __m128i nib=_mm_unpacklo_epi8(lo,hi);
+                                __m256 w0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nib),b8));
+                                __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8));
+                                for(int r=0;r<8;r++){
+                                    acc[r]=_mm256_fmadd_ps(_mm256_loadu_ps(xr[r]+i),  w0,acc[r]);
+                                    acc[r]=_mm256_fmadd_ps(_mm256_loadu_ps(xr[r]+i+8),w1,acc[r]);
+                                }
+                            }
+                            for(int r=0;r<8;r++) a[r]=fmaf(hsum256(acc[r]),scl[g],a[r]);
+                        }
+                        for(int r=0;r<ns;r++) y[(int64_t)(s1+r)*O+o]=a[r];
+                    }
+                }
+            }
+        }
+        return;
+    }
+#endif
 #if defined(__SSE4_1__) && !defined(__AVX2__)
     /* Even group sizes keep every group start on a low-nibble boundary. */
     if(!(gs&1)){

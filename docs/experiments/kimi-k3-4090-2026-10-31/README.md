@@ -126,3 +126,24 @@ was stopped). Where the CPU goes, found after it:
 - `matmul_mxfp4_i8_pre` now decodes an output's weights once for 4 rows (the same bytes,
   `tests/test_mxfp4_i8_rows.c`): 1.2-1.6x a thread for an expert's 4-37 rows.
 
+## Runs 21-25: a long prompt's CPU work, the same bytes
+
+The CPU kernels that run19 found slow, rewritten so that every row and position keeps its
+arithmetic: the gated MLA's scores 16 positions at a time (`k3_mla_scores`), kv_b's rows
+8 at a time (`k3_rowdot8_i8`, from run 25), `matmul_i4_grouped` over 8 rows and a tile of
+16, `matmul_mxfp4_i8_pre` over 4 rows, the shared experts' SiTU over every worker.
+
+| run | what | result |
+|---|---|---|
+| run21_short | the usual 35-token prompt and 45 tokens | the same text; prompt 36.2 s; decode 0.78 tok/s (1,288 ms: shared experts 175 -> 159 ms, the reads' wait 353 -> 366) |
+| run22_logits_new / run23_logits_head | `K3_LOGITS` of that prompt (`--ngen 0`), this engine and the commit before it | **the same 22,937,600 bytes** |
+| run24_long512 | run19's 2,637-token prompt, 512-token steps | **844.5 s** (1,401.3): attention 200.4 s (388.3), MoE 621.9 s (993.0; routed experts 321.6, shared 97.2, latent 39.1, router 25.0, waiting for reads 119.1); 5,784 GB read |
+| run25_long2048 | run24's engine, 2,048-token steps | **697.0 s**: attention 200.9 s, MoE 474.4 s (routed experts 268.8, waiting for reads 17.7); 2,455 GB read; the working set 160.3 GB at most |
+| run26_logits / run27_short | + kv_b's rows 8 at a time, `res_mix`'s chains side by side, the step's rows over every worker | the logits the same bytes as run23's; the same text; decode 0.79 tok/s (1,268 ms, attention 129) |
+| run28_long2048 | the same engine | **653.1 s**: attention 189.7 s, MoE 460.3 s, the rest 3.1 s (21.7) |
+| run29-31 | + the MLA's scores six heads at a time | the logits the same bytes; the same text; the long prompt **639 s** (4.13 tok/s): attention 174.7 s (KDA 90.3, MLA 84.4), MoE 461.1 s |
+
+The launcher now takes 2,048-token prompt steps (`-Chunk`, at most 4,096): the RAM budget
+reserves 1.4 MB a row past 512 (2.1 GB at 2,048, one expert slot a layer less), and a
+long prompt reads its experts a quarter as often.
+

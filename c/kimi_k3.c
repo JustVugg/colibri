@@ -74,7 +74,7 @@
  *                        K3_CUDA_DENSE_GB (20) beside K3_CUDA_RESERVE_GB (2) free;
  *                        K3_CUDA_RELEASE_HOST=1 frees their host copies
  *   K3_TOPP=F            keep routed experts to cumulative weight F (0 = off)
- *   K3_CHUNK=N           prefill chunk size (default 32; 1 = token-at-a-time)
+ *   K3_CHUNK=N           prefill chunk size (default 32, at most 4096; 1 = token-at-a-time)
  *   K3_THINK=0|1         chat mode: open the think channel (default 1)
  *   K3_LAYERS=N          truncate to first N layers (validation; skips head)
  *   K3_TRACE=path        dump f32 hidden state after every layer (validation)
@@ -284,6 +284,7 @@ typedef struct {
     /* t_moe's parts: the router and the step's issue, the latent projections, the shared
      * experts, the routed experts' waves (t_eload is its waits) */
     double t_route, t_lat, t_shared, t_wave; uint64_t n_wave;
+    double t_mla;                         /* t_attn's gated MLA layers (the rest: KDA's) */
     double *t_wait_li; uint64_t *n_dem_li;  /* K3_WAIT_LAYERS: a decode's waits and demand reads, by layer */
     /* K3_PREFETCH: the next MoE layer's experts predicted after a decode step's attention
      * (k3_prefetch): the rows a prediction waits for, the layer it is for, what it marked */
@@ -307,6 +308,20 @@ static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
  * reserve = page cache + activations + KV + optional recurrent checkpoints,
  * all in GB. `cap_requested` is what K3_EXPERT_GB asked for: this only ever
  * LOWERS it, never raises it, so an explicit small cache stays small. */
+/* K3_CHUNK: the most prompt rows a step takes (default 32), 1..4096. A step reads each
+ * expert it needs once, from the drives and then from RAM, for all its rows: larger
+ * steps read less a prompt token and hold more activations (k3_act_gb). */
+static int k3_chunk_rows(void){
+    int c=getenv("K3_CHUNK")?atoi(getenv("K3_CHUNK")):32;
+    return c<1?1:c>4096?4096:c;
+}
+/* The activations and logits a step of k3_chunk_rows() rows holds at once, GB: 1.2 up to
+ * 512 rows, then about 1.4 MB a row (the hidden rows and AttnRes blocks, a layer's
+ * buffers, and the waves' inputs and outputs of 16 experts a row). */
+static double k3_act_gb(void){
+    int c=k3_chunk_rows();
+    return 1.2+(c>512?(c-512)*1.4e-3:0.0);
+}
 static int k3_cap_for_ram(double budget_gb, double resident_gb, double reserve_gb,
                           double slot_gb, int nmoe, int cap_requested,
                           int n_experts, double *for_experts_out){
@@ -1487,11 +1502,12 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
         double kv_gb = (double)nkv*(double)max_t*(double)(c->kv_lora+c->qk_rope)*4.0/1e9;
         /* 2.5 GB page cache -- measured on Linux 2026-07-06: strangling it drops
          * buffered pread from ~800 to ~180 MB/s and the last GB of LRU costs
-         * more in lost bandwidth than it returns. 1.2 GB activations/logits.
+         * more in lost bandwidth than it returns. k3_act_gb(): the activations and logits.
          * Checkpoints allocate lazily after this plan, so reserve all enabled
          * slots now: RAM_GB is a whole-process ceiling even for opt-in memory. */
         double ckpt_gb = k3_ckpt_reserve_gb(m,g_k3_ckpt_slots);
-        double reserve = 2.5 + 1.2 + kv_gb + ckpt_gb;
+        double act_gb = k3_act_gb();
+        double reserve = 2.5 + act_gb + kv_gb + ckpt_gb;
         double for_experts = 0.0;
 
         double slot_gb = (double)m->e_slot/1e9;
@@ -1512,10 +1528,10 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
             /* Name every term. The user's number is not being ignored, it is
              * being clamped, and they cannot check the clamp without the parts. */
             fprintf(stderr,"[K3][RAM_GB=%.1f%s] resident %.1f GB + reserve %.1f GB "
-                "(page cache 2.5, activations 1.2, KV %dx%d %.1f, checkpoints %d %.1f) "
+                "(page cache 2.5, activations %.1f, KV %dx%d %.1f, checkpoints %d %.1f) "
                 "-> %.1f GB for experts; "
                 "cache %d->%d/layer (%.1f MB/slot, %d layers; projected peak %.1f GB)\n",
-                budget, ram_env>0?"":" auto", resident, reserve, nkv, max_t, kv_gb,
+                budget, ram_env>0?"":" auto", resident, reserve, act_gb, nkv, max_t, kv_gb,
                 g_k3_ckpt_slots,ckpt_gb,
                 for_experts>0?for_experts:0.0, cap, cap_fit>0?cap_fit:1,
                 slot_gb*1000.0, nmoe,
@@ -1620,11 +1636,16 @@ static void res_mix(float *out, const float *prefix, const float *bres, int nb, 
     const float *v[16]; float sc[16];
     for(int e=0;e<nb;e++) v[e]=bres+(int64_t)e*D;
     v[nb]=prefix;
-    for(int e=0;e<=nb;e++){
-        double ms=0,dot=0;
-        for(int d=0;d<D;d++){ double x=v[e][d]; ms+=x*x; dot+=x*(double)sw[d]; }
-        sc[e]=(float)(dot/sqrt(ms/D+eps));
+    /* every entry's two sums in d's order, each one chain of fused adds in double as GCC
+     * compiled `ms+=x*x; dot+=x*(double)sw[d]` entry by entry; the entries' chains side
+     * by side here, so that their latencies overlap (the same bytes, 3-4x sooner) */
+    double ms[16], dot[16];
+    for(int e=0;e<=nb;e++){ ms[e]=0; dot[e]=0; }
+    for(int d=0;d<D;d++){
+        double s=(double)sw[d];
+        for(int e=0;e<=nb;e++){ double x=v[e][d]; ms[e]=fma(x,x,ms[e]); dot[e]=fma(x,s,dot[e]); }
     }
+    for(int e=0;e<=nb;e++) sc[e]=(float)(dot[e]/sqrt(ms[e]/D+eps));
     softmax_(sc,nb+1);
     for(int d=0;d<D;d++){ float a=0; for(int e=0;e<=nb;e++) a+=sc[e]*v[e][d]; out[d]=a; }
 }
@@ -1835,6 +1856,150 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
 
 /* ---------- gated MLA layer (chunk of C tokens, NoPE, absorb; projections
  * batched, per-token causal attention — token t attends to 0..pos0+t) ------ */
+#if defined(__AVX2__)
+/* A product the compiler may not fuse into the add that follows (mimo.c's mul_apart):
+ * the scores' sum below is the one GCC -O3 makes of `s2 += qabs[i] * Lt[i]` -- the
+ * products rounded, 16 or 8 at a time, then added one after the other in i's order --
+ * and only an opaque product keeps -ffp-contract from changing that. */
+static inline __m256 k3_mul_apart(__m256 a, __m256 b){
+    __m256 r=_mm256_mul_ps(a,b);
+    __asm__("" : "+x"(r));
+    return r;
+}
+static inline void k3_tr8(__m256 r[8]){   /* 8 rows of 8 into 8 columns */
+    __m256 t0=_mm256_unpacklo_ps(r[0],r[1]), t1=_mm256_unpackhi_ps(r[0],r[1]);
+    __m256 t2=_mm256_unpacklo_ps(r[2],r[3]), t3=_mm256_unpackhi_ps(r[2],r[3]);
+    __m256 t4=_mm256_unpacklo_ps(r[4],r[5]), t5=_mm256_unpackhi_ps(r[4],r[5]);
+    __m256 t6=_mm256_unpacklo_ps(r[6],r[7]), t7=_mm256_unpackhi_ps(r[6],r[7]);
+    __m256 u0=_mm256_shuffle_ps(t0,t2,0x44), u1=_mm256_shuffle_ps(t0,t2,0xEE);
+    __m256 u2=_mm256_shuffle_ps(t1,t3,0x44), u3=_mm256_shuffle_ps(t1,t3,0xEE);
+    __m256 u4=_mm256_shuffle_ps(t4,t6,0x44), u5=_mm256_shuffle_ps(t4,t6,0xEE);
+    __m256 u6=_mm256_shuffle_ps(t5,t7,0x44), u7=_mm256_shuffle_ps(t5,t7,0xEE);
+    r[0]=_mm256_permute2f128_ps(u0,u4,0x20); r[1]=_mm256_permute2f128_ps(u1,u5,0x20);
+    r[2]=_mm256_permute2f128_ps(u2,u6,0x20); r[3]=_mm256_permute2f128_ps(u3,u7,0x20);
+    r[4]=_mm256_permute2f128_ps(u0,u4,0x31); r[5]=_mm256_permute2f128_ps(u1,u5,0x31);
+    r[6]=_mm256_permute2f128_ps(u2,u6,0x31); r[7]=_mm256_permute2f128_ps(u3,u7,0x31);
+}
+/* a += q[i] * row_j[i] for i < n in i's order, lane j of a the row's position:
+ * rows a[0..7] and b[0..7] of two blocks of 8 positions, n a multiple of 8 */
+static inline void k3_mla_dot16(__m256 *a, __m256 *b, const float *q, const float *const *ra,
+                                const float *const *rb, int n){
+    for(int i0=0;i0<n;i0+=8){
+        __m256 x[8], y[8];
+        for(int j=0;j<8;j++){ x[j]=_mm256_loadu_ps(ra[j]+i0); y[j]=_mm256_loadu_ps(rb[j]+i0); }
+        k3_tr8(x); k3_tr8(y);
+        for(int k=0;k<8;k++){
+            __m256 qq=_mm256_set1_ps(q[i0+k]);
+            *a=_mm256_add_ps(*a,k3_mul_apart(qq,x[k]));
+            *b=_mm256_add_ps(*b,k3_mul_apart(qq,y[k]));
+        }
+    }
+}
+/* y[j] = w_rowdot(w, r0+j, x) for j < 8, an int8 matrix (fmt 1) with I a multiple of 8:
+ * GCC -O3 left that loop scalar -- each weight widened, times x[i], then added, in i's
+ * order, never fused -- and lane j here does exactly that for row r0+j, 8 columns of
+ * the 8 rows transposed at a time; then the row's scale, as w_rowdot. */
+static void k3_rowdot8_i8(const W *w, int r0, const float *x, float *y){
+    const int I=w->I;
+    const int8_t *p=w->q8+(int64_t)r0*I;
+    __m256 a=_mm256_setzero_ps();
+    for(int i0=0;i0<I;i0+=8){
+        __m256 c[8];
+        for(int j=0;j<8;j++)
+            c[j]=_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)(p+(int64_t)j*I+i0))));
+        k3_tr8(c);
+        for(int k=0;k<8;k++) a=_mm256_add_ps(a,k3_mul_apart(c[k],_mm256_set1_ps(x[i0+k])));
+    }
+    _mm256_storeu_ps(y,_mm256_mul_ps(a,_mm256_loadu_ps(w->s+r0)));
+}
+#endif
+/* One head's MLA scores over positions 0..nt-1: sc[t] = (qabs . L[t] then + qr . R[t])
+ * * scale, each position's products added in order from zero. 16 positions at a time,
+ * one a lane, when both widths are multiples of 8 (every product of the old loop then
+ * went through GCC's vector multiply, none through its scalar fma tail); the last block's
+ * spare lanes repeat the last position and are not stored. Otherwise the old loop. */
+static void k3_mla_scores(float *sc, const float *qabs, const float *qrp, const float *Lc_,
+                          const float *Rc_, int nt, int kvl, int qr, float scale){
+    int t=0;
+#if defined(__AVX2__)
+    if(kvl>=8&&!(kvl&7)&&(qr==0||(qr>=8&&!(qr&7)))){
+        const __m256 vs=_mm256_set1_ps(scale);
+        for(;t<nt;t+=16){
+            const float *la[8], *lb[8], *pa[8], *pb[8];
+            for(int j=0;j<8;j++){
+                int ta=t+j<nt?t+j:nt-1, tb=t+8+j<nt?t+8+j:nt-1;
+                la[j]=Lc_+(int64_t)ta*kvl; lb[j]=Lc_+(int64_t)tb*kvl;
+                pa[j]=Rc_+(int64_t)ta*qr;  pb[j]=Rc_+(int64_t)tb*qr;
+            }
+            __m256 a=_mm256_setzero_ps(), b=_mm256_setzero_ps();
+            k3_mla_dot16(&a,&b,qabs,la,lb,kvl);
+            if(qr) k3_mla_dot16(&a,&b,qrp,pa,pb,qr);
+            float va[8], vb[8];
+            _mm256_storeu_ps(va,_mm256_mul_ps(a,vs)); _mm256_storeu_ps(vb,_mm256_mul_ps(b,vs));
+            for(int j=0;j<8&&t+j<nt;j++) sc[t+j]=va[j];
+            for(int j=0;j<8&&t+8+j<nt;j++) sc[t+8+j]=vb[j];
+        }
+        return;
+    }
+#endif
+    for(;t<nt;t++){
+        const float *Lt=Lc_+(int64_t)t*kvl, *Rt=Rc_+(int64_t)t*qr;
+        float s2=0; for(int i=0;i<kvl;i++) s2+=qabs[i]*Lt[i];
+        for(int i=0;i<qr;i++) s2+=qrp[i]*Rt[i];
+        sc[t]=s2*scale;
+    }
+}
+/* The scores of nh <= K3_MLA_G heads at once (sc: [nh][nt], qab: [nh][kvl]): every 8x8
+ * block of cached rows transposed once for all of them. A head's lanes do what
+ * k3_mla_scores' do, so its scores are the same bytes; heads past nh repeat the last. */
+#define K3_MLA_G 6
+#if defined(__AVX2__)
+static inline void k3_mla_dot16g(__m256 *a, __m256 *b, const float *const *q, const float *const *ra,
+                                 const float *const *rb, int n){
+    for(int i0=0;i0<n;i0+=8){
+        __m256 x[8], y[8];
+        for(int j=0;j<8;j++){ x[j]=_mm256_loadu_ps(ra[j]+i0); y[j]=_mm256_loadu_ps(rb[j]+i0); }
+        k3_tr8(x); k3_tr8(y);
+        for(int g=0;g<K3_MLA_G;g++)
+            for(int k=0;k<8;k++){
+                __m256 qq=_mm256_set1_ps(q[g][i0+k]);
+                a[g]=_mm256_add_ps(a[g],k3_mul_apart(qq,x[k]));
+                b[g]=_mm256_add_ps(b[g],k3_mul_apart(qq,y[k]));
+            }
+    }
+}
+#endif
+static void k3_mla_scores_g(float *sc, const float *qab, const float *const *qrps, int nh,
+                            const float *Lc_, const float *Rc_, int nt, int kvl, int qr, float scale){
+#if defined(__AVX2__)
+    if(kvl>=8&&!(kvl&7)&&(qr==0||(qr>=8&&!(qr&7)))){
+        const float *ql[K3_MLA_G], *qp[K3_MLA_G];
+        for(int g=0;g<K3_MLA_G;g++){ int h=g<nh?g:nh-1; ql[g]=qab+(int64_t)h*kvl; qp[g]=qrps[h]; }
+        const __m256 vs=_mm256_set1_ps(scale);
+        for(int t=0;t<nt;t+=16){
+            const float *la[8], *lb[8], *pa[8], *pb[8];
+            for(int j=0;j<8;j++){
+                int ta=t+j<nt?t+j:nt-1, tb=t+8+j<nt?t+8+j:nt-1;
+                la[j]=Lc_+(int64_t)ta*kvl; lb[j]=Lc_+(int64_t)tb*kvl;
+                pa[j]=Rc_+(int64_t)ta*qr;  pb[j]=Rc_+(int64_t)tb*qr;
+            }
+            __m256 a[K3_MLA_G], b[K3_MLA_G];
+            for(int g=0;g<K3_MLA_G;g++){ a[g]=_mm256_setzero_ps(); b[g]=_mm256_setzero_ps(); }
+            k3_mla_dot16g(a,b,ql,la,lb,kvl);
+            if(qr) k3_mla_dot16g(a,b,qp,pa,pb,qr);
+            for(int g=0;g<nh;g++){
+                float va[8], vb[8], *sg=sc+(int64_t)g*nt;
+                _mm256_storeu_ps(va,_mm256_mul_ps(a[g],vs)); _mm256_storeu_ps(vb,_mm256_mul_ps(b[g],vs));
+                for(int j=0;j<8&&t+j<nt;j++) sg[t+j]=va[j];
+                for(int j=0;j<8&&t+8+j<nt;j++) sg[t+8+j]=vb[j];
+            }
+        }
+        return;
+    }
+#endif
+    for(int g=0;g<nh;g++)
+        k3_mla_scores(sc+(int64_t)g*nt,qab+(int64_t)g*kvl,qrps[g],Lc_,Rc_,nt,kvl,qr,scale);
+}
     static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, int C, float *out){
     Cfg *c=&m->c; Mla *a=&l->m;
     int H=c->n_heads, qh=c->qk_head, vh=c->v_head, kvl=c->kv_lora, qr=c->qk_rope;
@@ -1890,29 +2055,45 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
         const float *Lc_=mr?mr[tt].seq->Lc[li]:m->Lc[li], *Rc_=mr?mr[tt].seq->Rc[li]:m->Rc[li];
         const float *qvt=qv+(int64_t)tt*H*qh, *gvt=gv+(int64_t)tt*H*vh;
         float *ctxt=ctx+(int64_t)tt*H*vh;
+        /* the heads K3_MLA_G a task: a group's scores read the cache once for all of
+         * them (k3_mla_scores_g); each head's arithmetic is its own as before */
+        const int ngr=(H+K3_MLA_G-1)/K3_MLA_G;
         #pragma omp parallel for schedule(static)
-        for(int h=0;h<H;h++){
-            const float *qp=qvt+(int64_t)h*qh, *qrp=qp+c->qk_nope;
-            int rbase=h*(c->qk_nope+vh);
-            float qabs[4096]; memset(qabs,0,kvl*sizeof(float));
+        for(int hg=0;hg<ngr;hg++){
+          const int h0=hg*K3_MLA_G, nh=H-h0<K3_MLA_G?H-h0:K3_MLA_G;
+          float *qab=falloc((int64_t)K3_MLA_G*kvl), *scs=falloc((int64_t)K3_MLA_G*nt);
+          const float *qrps[K3_MLA_G];
+          for(int g=0;g<nh;g++){
+            const float *qp=qvt+(int64_t)(h0+g)*qh;
+            int rbase=(h0+g)*(c->qk_nope+vh);
+            float *qabs=qab+(int64_t)g*kvl; memset(qabs,0,kvl*sizeof(float));
             for(int d=0;d<c->qk_nope;d++) w_addrow(&a->kvb,rbase+d,qp[d],qabs);
-            float *sc=falloc(nt);
-            for(int t=0;t<nt;t++){
-                const float *Lt=Lc_+(int64_t)t*kvl, *Rt=Rc_+(int64_t)t*qr;
-                float s2=0; for(int i=0;i<kvl;i++) s2+=qabs[i]*Lt[i];
-                for(int i=0;i<qr;i++) s2+=qrp[i]*Rt[i];
-                sc[t]=s2*c->attn_scale;
-            }
+            qrps[g]=qp+c->qk_nope;
+          }
+          k3_mla_scores_g(scs,qab,qrps,nh,Lc_,Rc_,nt,kvl,qr,c->attn_scale);
+          for(int g=0;g<nh;g++){
+            const int h=h0+g, rbase=h*(c->qk_nope+vh);
+            float *sc=scs+(int64_t)g*nt;
             softmax_(sc,nt);
             float clat[4096]; memset(clat,0,kvl*sizeof(float));
             for(int t=0;t<nt;t++){
                 const float *Lt=Lc_+(int64_t)t*kvl; float s2=sc[t];
                 for(int i=0;i<kvl;i++) clat[i]+=s2*Lt[i];
             }
-            free(sc);
             float *cx=ctxt+(int64_t)h*vh;
-            for(int d=0;d<vh;d++)
+            int d=0;
+#if defined(__AVX2__)
+            if(a->kvb.fmt==1&&a->kvb.q8&&!(a->kvb.I&7))   /* int8 rows 8 at a time, the same bytes */
+                for(;d+8<=vh;d+=8){
+                    float rd[8];
+                    k3_rowdot8_i8(&a->kvb,rbase+c->qk_nope+d,clat,rd);
+                    for(int j=0;j<8;j++) cx[d+j]=rd[j]*sigmoidf_(gvt[(int64_t)h*vh+d+j]);
+                }
+#endif
+            for(;d<vh;d++)
                 cx[d]=w_rowdot(&a->kvb,rbase+c->qk_nope+d,clat)*sigmoidf_(gvt[(int64_t)h*vh+d]);
+          }
+          free(qab); free(scs);
         }
     }
     w_matmul(out,ctx,&a->o,C);
@@ -3528,7 +3709,7 @@ static int k3_layers_forward_range(Model *m, float *hidden, float *bres,
     int nbmax=(c->n_layers+c->res_bs-1)/c->res_bs;
     int nb=*nb_io;
     float *prefix=falloc((int64_t)C*D), *nrm=falloc((int64_t)C*D);
-    float *att=falloc((int64_t)C*D), *mix=falloc(D), *mlp=falloc((int64_t)C*D);
+    float *att=falloc((int64_t)C*D), *mix=falloc((int64_t)C*D), *mlp=falloc((int64_t)C*D);
     if(cancelled) *cancelled=0;
     for(int i=layer_begin;i<layer_end;i++){
         Layer *l=&m->L[i];
@@ -3537,6 +3718,8 @@ static int k3_layers_forward_range(Model *m, float *hidden, float *bres,
             if(cancelled) *cancelled=1;
             break;
         }
+        /* a prompt step's rows over every worker: each row's own arithmetic */
+        #pragma omp parallel for schedule(static) if(C>1)
         for(int t=0;t<C;t++){
             float *h=hidden+(int64_t)t*D, *p=prefix+(int64_t)t*D;
             memcpy(p,h,D*sizeof(float));              /* prefix_sum at entry */
@@ -3555,6 +3738,7 @@ static int k3_layers_forward_range(Model *m, float *hidden, float *bres,
         { static int once=0; if(i==0 && !once){ once=1;
             fprintf(stderr,"[K3-PATH] L0 attn=%s metal=%d\n", l->kda?"KDA":"MLA", g_k3_metal); fflush(stderr); } }
          m->t_attn+=now_s()-t0;
+         if(!l->kda) m->t_mla+=now_s()-t0;
          /* Phase 9: capture attn output (att) for target token */
          if(g_k3_val_layer==i && g_k3_val_token<C) val_dump("att",att+(int64_t)g_k3_val_token*D,D);
         /* K3_PREFETCH: a decode step's MLP input also predicts the next MoE layer's
@@ -3565,15 +3749,16 @@ static int k3_layers_forward_range(Model *m, float *hidden, float *bres,
             m->pf_mark=calloc((size_t)c->n_layers*c->n_experts,1);
             if(!m->pf_mark){ fprintf(stderr,"OOM prefetch marks\n"); exit(1); }
         }
+        #pragma omp parallel for schedule(static) if(C>1)
         for(int t=0;t<C;t++){
-            float *p=prefix+(int64_t)t*D, *a=att+(int64_t)t*D;
+            float *p=prefix+(int64_t)t*D, *a=att+(int64_t)t*D, *mx=mix+(int64_t)t*D;
              if(have_prefix){ for(int d=0;d<D;d++) p[d]+=a[d]; }
              else           { memcpy(p,a,D*sizeof(float)); }
-             res_mix(mix,p,bres+(int64_t)t*nbmax*D,nb,D,l->mlp_sw,c->eps);
+             res_mix(mx,p,bres+(int64_t)t*nbmax*D,nb,D,l->mlp_sw,c->eps);
              /* K3_PREFETCH_MIX=1: the blocks mixed with the next layer's weights instead */
              if(pf&&g_k3_pf_mix) res_mix(m->pf_x+(int64_t)t*D,p,bres+(int64_t)t*nbmax*D,nb,D,m->L[i+1].mlp_sw,c->eps);
-             else if(pf) memcpy(m->pf_x+(int64_t)t*D,mix,D*sizeof(float));
-             rmsnorm_(nrm+(int64_t)t*D,mix,l->post_ln,D,c->eps);
+             else if(pf) memcpy(m->pf_x+(int64_t)t*D,mx,D*sizeof(float));
+             rmsnorm_(nrm+(int64_t)t*D,mx,l->post_ln,D,c->eps);
             /* Phase 9: capture MLP-input (post-attention nrm) */
             if(g_k3_val_layer==i && t==g_k3_val_token){
               val_dump("nrm_mlp",nrm+(int64_t)t*D,D); }
@@ -3588,6 +3773,7 @@ static int k3_layers_forward_range(Model *m, float *hidden, float *bres,
          m->t_moe+=now_s()-t0;
          /* Phase 9: capture mlp output for target token */
          if(g_k3_val_layer==i && g_k3_val_token<C) val_dump("mlp",mlp+(int64_t)g_k3_val_token*D,D);
+        #pragma omp parallel for schedule(static) if(C>1&&!m->trace)
         for(int t=0;t<C;t++){
             float *p=prefix+(int64_t)t*D;
             for(int d=0;d<D;d++) p[d]+=mlp[(int64_t)t*D+d];
@@ -4675,8 +4861,7 @@ static int k3_serve_start(Model *m, Tok *T, ServeReq *q, int **ids_out, int *np_
                     (m->kvp.len>0 && m->kvp.len<np) ? " (diverged)" : "");
         fflush(stderr);
     }
-    int chunk=getenv("K3_CHUNK")?atoi(getenv("K3_CHUNK")):32;
-    if(chunk<1) chunk=1; if(chunk>512) chunk=512;
+    int chunk=k3_chunk_rows();
 #ifdef COLI_VULKAN
     { int r=k3c_prefill_rows(m); if(r>0 && !g_lfp) chunk=r; }   /* the chain's chunk from the budget: big MoE steps */
 #endif
@@ -5134,9 +5319,7 @@ int main(int argc, char **argv){
         g_lfp=fopen(getenv("K3_LOGITS"),"wb");
         if(!g_lfp){ perror(getenv("K3_LOGITS")); return 1; }
     }
-    int chunk=getenv("K3_CHUNK")?atoi(getenv("K3_CHUNK")):32;
-    if(chunk<1) chunk=1;
-    if(chunk>512) chunk=512;
+    int chunk=k3_chunk_rows();
 #ifdef COLI_VULKAN
     { int r=k3c_prefill_rows(&m); if(r>0 && !g_lfp) chunk=r; }   /* the chain's chunk from the budget: big MoE steps */
 #endif
@@ -5153,9 +5336,9 @@ int main(int argc, char **argv){
     }
     if(g_lfp){ fclose(g_lfp); g_lfp=NULL; }
     fprintf(stderr,"\n[K3] prefill done in %.1fs (%.2f tok/s)\n",now_s()-t0,np/(now_s()-t0));
-    fprintf(stderr,"[K3] the prompt: attention %.1fs, MoE %.1fs (router and reads issued %.1f, latent %.1f, "
-            "shared %.1f, routed experts computed %.1f, waiting for reads %.1f); %.0f GB read\n",
-            m.t_attn,m.t_moe,m.t_route,m.t_lat,m.t_shared,m.t_wave,m.t_eload,m.ebytes/1e9);
+    fprintf(stderr,"[K3] the prompt: attention %.1fs (KDA %.1f, MLA %.1f), MoE %.1fs (router and reads issued %.1f, "
+            "latent %.1f, shared %.1f, routed experts computed %.1f, waiting for reads %.1f); %.0f GB read\n",
+            m.t_attn,m.t_attn-m.t_mla,m.t_mla,m.t_moe,m.t_route,m.t_lat,m.t_shared,m.t_wave,m.t_eload,m.ebytes/1e9);
 #ifdef COLI_CUDA
     k3_cuda_report("prompt");
 #endif

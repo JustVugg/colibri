@@ -26,8 +26,10 @@ param(
     # The most tokens a reply may have when a request does not ask for fewer (reasoning included)
     [ValidateRange(256,1048576)][int]$MaxOutput = 32768,
     # Prompt tokens a prefill step takes at once: each expert a step needs is read once for
-    # all of them, so larger steps read the disks less per prompt token
-    [ValidateRange(1,512)][int]$Chunk = 512,
+    # all of them, so larger steps read the disks less per prompt token (2048 against 512:
+    # a 2,637-token prompt 845 -> 697 s); past 512 a step's token holds 1.4 MB of RAM,
+    # taken from the expert cache
+    [ValidateRange(1,4096)][int]$Chunk = 2048,
     # Photos of the recurrent state at every prompt's and reply's end (COLI_K3_CKPT, about
     # 434 MB each): a turn whose client sends the history back without its reasoning, or
     # edits a tool result, resumes from the deepest photo its prompt still matches and

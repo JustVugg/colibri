@@ -1,0 +1,151 @@
+Summarize the following document in five bullet points.
+
+# Kimi K3 engine (`c/kimi_k3.c`)
+
+A sibling engine for [Kimi K3](https://huggingface.co/moonshotai/Kimi-K3)
+(2.8T parameters, 104B active, 93 layers), following the one-engine-per-family
+pattern (`colibri.c` = GLM-5.2, `olmoe.c`, `inkling.c`). It shares `st.h`,
+`json.h`, `tok.h`, `quant.h` and touches nothing in the GLM engine.
+
+```
+make kimi_k3
+./kimi_k3 <model_dir> "prompt" --ngen 64
+```
+
+`<model_dir>` is either the plain HF snapshot (config.json +
+`model-*-of-000096.safetensors`) or a repacked container (below). Text-only:
+the vision tower (shards 95–96) is never read.
+
+## Architecture notes
+
+K3 is not a DeepSeek-shaped model; four pieces are new relative to everything
+else in this repo:
+
+- **Hybrid attention, NoPE.** 69 KDA (Kimi Delta Attention) layers + 24 gated
+  MLA layers (every 4th, plus the final layer). There is no positional
+  encoding anywhere — position lives in KDA's convolution and decay. The MLA
+  block has DeepSeek dims (q_lora 1536, kv_lora 512, nope 128 + 64 uncached
+  extra dims, v 128, 96 heads) and both attention types multiply their output
+  by a full-rank sigmoid gate `σ(W_g x)` before `o_proj`.
+- **KDA** per head (dim 128, 96 heads): `q,k,v = SiLU(causal-conv4(W x))`,
+  q/k L2-normalized (ε=1e-6 inside the sqrt), q scaled by 128^-1/2; per-channel
+  decay `gk = -5·σ(exp(A_log[h])·(W_fb W_fa x + dt_bias))`; the delta-rule
+  state update `S = (I − βkkᵀ)·Diag(e^gk)·S + βkvᵀ`; output
+  `W_o[σ(W_g x) ⊙ RMSNorm_head(Sᵀq)]`. The checkpoint stores `A_log` as
+  `[128]`: that is the per-head `[96]` parameter zero-padded (verified —
+  entries 96..127 are exactly 0). Decode state: 96×128×128 f32 per layer.
+- **AttnRes replaces the residual stream.** Each layer keeps a running
+  `prefix_sum`; at layers 0, 12, 24, …, 84 it is snapshotted into a block
+  list. Twice per layer (before attention, before the MLP) and once at the
+  end, the hidden state is REPLACED by a softmax mix over
+  `[snapshots…, prefix_sum]`, scored by `(v · (res_norm.w ⊙ res_proj.w)) /
+  rms(v)` and mixing the raw (un-normalized) entries in fp32.
+- **Stable LatentMoE.** Sigmoid router `[896, 7168]` + score-correction bias,
+  top-16 selected on biased scores, weights are the raw scores renormalized.
+  The token is projected 7168→3584, the 16 experts run in that latent space
+  (GLU, inter 3072), the aggregate is RMSNorm-ed and projected back
+  3584→7168; two fused full-width shared experts (inter 6144) are added.
+  Activation is **SiTU-GLU**: `4·tanh(g/4)·σ(g) · 25·tanh(u/25)`.
+
+### Weights
+
+Only the routed experts (`experts.N.w{1,2,3}`) are quantized in the
+checkpoint — **MXFP4** (compressed-tensors `mxfp4-pack-quantized`,
+quantization-aware trained): e2m1 nibbles packed two per byte (low nibble =
+even column, bit 3 = sign) with a ue8m0 power-of-two scale per 32 columns,
+`w = v · 2^(scale-127)`. 17.55 MB per expert, 82,432 experts ≈ 1.45 TB.
+`quant.h` gained `matmul_mxfp4` (scalar + AVX2) that computes on this layout
+directly — expert bytes are **never converted**; QAT weights are exactly the
+trained values and any re-encode only adds error.
+
+Everything else is BF16 and is quantized into RAM **at load time** (int8
+per-row / int4-g64), or read pre-quantized from a repacked container.
+
+## Streaming design
+
+Experts are streamed straight from the safetensors shards through a per-layer
+LRU (`K3_EXPERT_GB`). Measured layout facts the engine exploits: the six
+tensors of an expert are stored back-to-back (one expert = one `pread`), and
+experts are *not* id-ordered inside a shard but by their ids as text
+("0", "1", "10", "100", ...: safetensors sorts tensor names), so loads run in
+disk-offset order, and a step adds its experts in that order wherever the experts
+are (one shard, or a shard cut over drives by `tools/k3_download.py`). Reads are
+by default **O_DIRECT** (`K3_DIRECT=0` for buffered): the resident
+weights leave little page-cache headroom, and flat routing means cached reads
+mostly cannot be reused anyway — measured on the 93-layer model this took
+expert reads from ~1.8 to ~6.3 GB/s (drive ceiling 7.1) and decode from ~21
+to ~9.4 s/token. The LRU slot floor is 1 (experts are consumed one at a time),
+so `K3_EXPERT_GB` is honored even at tiny budgets.
+
+**Readers per drive** (`K3_PIPE`, default on): the reads run on reader threads,
+so expert j's matmuls overlap the reads of the experts after it. The shards'
+storage devices are told apart, each gets `K3_IO_PER_DRIVE` readers (2) and two
+queues, a step's demands before the next layer's prefetches; on Windows each
+reader opens its own unbuffered handle per shard, because reads through one
+synchronous handle are serialized (the four loader threads this replaced read one
+expert of a layer's shard at a time there). With the checkpoint cut over two
+drives every layer's reads go to both at once: on the RTX 4090 machine
+(docs/kimi_k3-4090.md) 17.5 MB reads at three readers give 10.3 GB/s on `C:`
+and 6.6 on `D:` together, 16.9 GB/s.
+
+**Next-layer prefetch** (`K3_PREFETCH`, default on in decode steps of up to
+`K3_PREFETCH_ROWS`, 4, rows): after a step's attention in layer i, layer i+1's
+router applied to the blocks mixed with i+1's own AttnRes weights (`K3_PREFETCH_MIX=1`;
+0: layer i's MLP input), normed by i+1's post-attention norm, predicts the experts i+1
+will ask for, and the `K3_PREFETCH_TOP` (12) best of them that its cache lacks are read
+ahead, queued behind layer i's own reads; when i+1's routing comes, the predicted experts
+it did not choose leave the queue unread. A wrong prediction costs a read and a
+slot that is reused first, never a number. The run's last line says how many were
+read ahead and used and what share of the routed experts the predictions held. On the
+real model (docs/experiments/kimi-k3-4090-2026-10-31) the next layer's mix predicts
+66.9% of the routed experts against 63.2% from layer i's input, and 12 a row instead of
+the routing's 16 read 12.2 instead of 13.8 GB a decode token for the same speed.
+
+**Waves** (`K3_WAVES`, default on): a MoE step gives every expert its cache lacks a slot
+at once and queues the reads on their drives, interleaved, right after the routing; the
+latent projection runs while they arrive, then whatever has arrived is computed as one
+wave (gate and up of every arrived expert over all workers, then down), and the shared
+experts run while no read is in. Each (row, choice) pair writes its own row and the
+weighted sum runs at the end in the union's order, so the bytes are the one-expert-at-a-
+time loop's (`K3_WAVES=0`); a decode token on the 4090 machine went from 1.62 to 1.50 s,
+the 35-token prompt from 57.0 to 41.3 s (its reads had gone to one drive at a time).
+`K3_IO_DELAY_US` slows every read for the tests that exercise the queues. None of
+this moves a bit: the logits are those of the old loader in every configuration
+tested (cache sizes, chunk sizes, one or two folders on two drives, buffered,
+slow disks).
+
+`K3_IDOT` (default on) computes the expert matmuls with
+per-32-group int8-quantized activations via integer dots (the e2m1 doubled
+values are exact int8 — same trick as `dot_i4i8`), and `K3_TOPP` optionally
+drops the low-weight tail of the top-16 (renormalized; quality-gate any
+setting with a `K3_LOGITS` A/B first). Note that K3's router was trained with Quantile Balancing (deliberately
+flat expert usage), so LRU hit rates are structurally lower than on models
+with skewed routing — expect the expert tier to be bandwidth-bound.
+
+## Repacked container (`tools/k3_repack.py`)
+
+```
+python3 tools/k3_repack.py <hf_src> <dst> --bits 8 [--mla-bits 8] [--head-bits 8]
+```
+
+One streaming read of the source (so a disk-to-disk copy can *be* the
+conversion): experts pass through byte-identical (id-ordered, single-pread
+layout), the big BF16 matrices are quantized with exactly the engine's
+load-time algorithm and stored as `U8` + `<name>.qs` f32 scales, the small /
+sensitive tensors (norms, router, conv taps, `dt_bias`, `A_log`, `f_a/f_b`,
+`b_proj`, embeddings) pass through, vision is dropped. Output is spec-valid
+safetensors (`model-XXXXX-of-000094.safetensors`) plus a regenerated index;
+interrupted runs resume per shard. On every run, including disjoint `--shards`
+passes, the index is rebuilt atomically from all completed output shards in the
+destination; its `total_size` therefore includes both new and previously
+converted data. Duplicate tensor names abort the index update instead of
+publishing an ambiguous artifact. `--verify-full` re-reads every expert byte
+and compares against the source.
+
+The engine auto-detects container tensors (dtype U8 + `.qs` sidecar) and skips
+load-time quantization. Setting `K3_BITS=4` **explicitly** on an int8 container
+downcasts the int8 matrices to int4-g64 at load (~35 vs ~57 GiB resident on
+the 93-layer model — fits next to a desktop session; the int8 grid is 16x
+finer than int4, so the double-quant noise ~ direct int4). Unset `K3_BITS`
+keeps the container's own bits. Startup: measured on two layers, init drops **30.4 s → 0.6 s**;
+on the f

@@ -229,7 +229,7 @@ Judge quantization choices on real-text logits, not synthetic-vector norms.
 | `K3_WAIT_LAYERS` | 0 | measurement: a decode token's wait for reads and its demand reads, by layer (last lines) |
 | `K3_REUSE` | -- | measurement: every MoE layer's LRU stack distances and predicted share, written to this file at exit |
 | `K3_TOPP` | 0 | keep routed experts to cumulative weight p (0 = off) |
-| `K3_CHUNK` | 32 | prefill chunk size (1 = token-at-a-time; forced 1 under `K3_TRACE`) |
+| `K3_CHUNK` | 32 | prefill chunk size, at most 4096 (1 = token-at-a-time; forced 1 under `K3_TRACE`); past 512 rows the RAM budget reserves 1.4 MB of activations a row |
 | `K3_THINK` | 1 | chat mode: open the structural think channel (0 = response-only) |
 | `K3_DIRS` | — | extra shard directories (multi-drive split, no duplication; `tools/k3_download.py` cuts every layer over them) |
 | `K3_MAXT` | prompt+ngen | context capacity |
@@ -252,6 +252,24 @@ results are **bit-identical** to token-at-a-time (verified: 125-position
 teacher-forced logit streams at C=32 vs C=1 match exactly). Measured prefill:
 ~5.3 -> **2.0 s/token** at C=32. The KDA state-update sweeps are AVX2
 (scalar fallback for head dims not divisible by 8).
+
+**A long prompt's CPU work** (the RTX 4090 machine, docs/experiments/kimi-k3-4090-2026-10-31:
+a 2,637-token prompt took 1,401 s in 512-token steps, **639 s** now in steps of 2,048,
+the logits the same bytes). Each rewrite below keeps every row's and position's arithmetic:
+- the gated MLA's scores were one chain of 576 adds a position (GCC -O3 multiplies 16 at
+  a time, then adds the products in order); `k3_mla_scores_g` keeps that arithmetic (an
+  opaque product, then the add, as mimo.c's `mul_apart`) with 16 positions in the lanes,
+  the cache's rows transposed in 8x8 blocks once for six heads;
+- kv_b's rows times the attention's latent (`w_rowdot`, which GCC left scalar) 8 rows at
+  a time (`k3_rowdot8_i8`); AttnRes' `res_mix` its entries' double chains side by side, a
+  prompt step's rows over every worker;
+- `matmul_i4_grouped` (the shared experts and the latent projections on the CPU) decodes
+  16 weights once for 8 rows and keeps 16 rows of input in L2 (1.8x at 512 rows),
+  `matmul_mxfp4_i8_pre` (the routed experts) an output's weights once for 4 rows, the
+  shared experts' SiTU runs over every worker;
+- `K3_CHUNK` may be up to 4096: a step reads every expert it needs once from the drives and
+  once from RAM for all its rows (2,048 against 512: 5,784 -> 2,455 GB read for that
+  prompt, 845 -> 697 s).
 
 ## Chat, API, and Web
 
