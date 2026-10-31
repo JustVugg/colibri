@@ -1428,6 +1428,53 @@ static void matmul_mxfp4_i8_pre(float *y, const int8_t *xq, const float *xsc,
                                 const uint8_t *q4, const uint8_t *e8s,
                                 int S, int I, int O){
     int rb=I/2, ng=I/32;
+#ifdef __AVX2__
+    if(S>=2){
+        /* Several rows (a prompt step's expert): an output's group of weights decoded once
+         * for 4 rows, each row's arithmetic the one-row loop's below -- the same integer
+         * sums of four products in 8 lanes (vpdpbusd's where AVX512-VNNI is there: the
+         * pairs maddubs adds stay far from int16's limit, |w| <= 12 and |x| <= 127), the
+         * same scale and fused add a group, the same hsum256 -- so the same bytes. */
+        const __m128i lut2=_mm_setr_epi8(0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12);
+        const __m128i m4=_mm_set1_epi8(0x0F);
+#if !(defined(__AVX512VNNI__)&&defined(__AVX512VL__))
+        const __m256i ones=_mm256_set1_epi16(1);
+#endif
+        #pragma omp parallel for schedule(static)
+        for(int o=0;o<O;o++){
+            const uint8_t *w=q4+(int64_t)o*rb;
+            const uint8_t *scl=e8s+(int64_t)o*ng;
+            for(int s0=0;s0<S;s0+=4){
+                const int ns=S-s0<4?S-s0:4;
+                const int8_t *xr[4]; const float *xsr[4];
+                for(int r=0;r<4;r++){
+                    int s=s0+(r<ns?r:ns-1);   /* past S: the last row again, not stored */
+                    xr[r]=xq+(int64_t)s*I; xsr[r]=xsc+(int64_t)s*ng;
+                }
+                __m256 acc[4]={_mm256_setzero_ps(),_mm256_setzero_ps(),_mm256_setzero_ps(),_mm256_setzero_ps()};
+                for(int g=0;g<ng;g++){
+                    __m128i by=_mm_loadu_si128((const __m128i*)(w+g*16));
+                    __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+                    __m128i n0=_mm_shuffle_epi8(lut2,_mm_unpacklo_epi8(lo,hi));
+                    __m128i n1=_mm_shuffle_epi8(lut2,_mm_unpackhi_epi8(lo,hi));
+                    __m256i wv=_mm256_set_m128i(n1,n0), wa=_mm256_sign_epi8(wv,wv);
+                    float ms=mx4_scale(scl[g])*0.5f;
+                    for(int r=0;r<4;r++){
+                        __m256i xs=_mm256_sign_epi8(_mm256_loadu_si256((const __m256i*)(xr[r]+g*32)),wv);
+#if defined(__AVX512VNNI__)&&defined(__AVX512VL__)
+                        __m256i d=_mm256_dpbusd_epi32(_mm256_setzero_si256(),wa,xs);
+#else
+                        __m256i d=_mm256_madd_epi16(_mm256_maddubs_epi16(wa,xs),ones);
+#endif
+                        acc[r]=_mm256_fmadd_ps(_mm256_cvtepi32_ps(d),_mm256_set1_ps(ms*xsr[r][g]),acc[r]);
+                    }
+                }
+                for(int r=0;r<ns;r++) y[(int64_t)(s0+r)*O+o]=hsum256(acc[r]);
+            }
+        }
+        return;
+    }
+#endif
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){
         const uint8_t *w=q4+(int64_t)o*rb;

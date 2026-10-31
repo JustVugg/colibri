@@ -1,0 +1,19 @@
+[think] The user is asking for a detailed technical explanation of how a modern out-of-order CPU core executes instructions. This is a computer architecture topic that I know well. Let me think about what to cover:
+
+1. **The Pipeline** - fetch, decode, rename, dispatch, issue, execute, complete/retire
+2. **Register Renaming** - eliminating false dependencies (WAR, WAW), register alias table, reorder buffer, physical register file
+3. **Branch Prediction** - static vs dynamic, BTB, TAGE predictors, return address stack, speculative execution
+4. **Cache Hierarchy** - L1/L2/L3, associativity, MESI protocol, TLBs, prefetching
+
+Let me structure this comprehensively. The user asked for "detailed technical" so I should go deep. This deserves a long, thorough response with good structure. Markdown formatting is appropriate here since it's a technical explanation that will likely be rendered.
+
+Let me think through the actual technical content carefully:
+
+## The Pipeline
+
+Modern x86 cores (Intel Golden Cove, AMD Zen 4/5, Apple Firestorm, ARM Neoverse) are wide superscalar out-of-order machines. Typical widths: 6-8 wide decode/rename, 8-12 execution ports.
+
+**Front End:**
+- Instruction fetch: fetch 16-32 bytes per cycle from L1I
+- Branch prediction happens at fetch time
+- x86: decode complex CISC into micro-ops (μops). Decoders: e.g., 4 simple +TUNE decode: 320 tokens in 403.937s

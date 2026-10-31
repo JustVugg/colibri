@@ -1850,8 +1850,134 @@ __global__ static void __launch_bounds__(256) quant_matmul_tiled(float *y, const
     }
 }
 
+/* quant_matmul's bytes for ONE row of int8 rows (fmt 1) or grouped int4 (fmt 4), QMR_R
+ * outputs a block (a decode step's matvec). Thread t sums the columns t, t + 256, ... of
+ * each of its block's outputs with quant_matmul's product and fused add, an input read
+ * once for QMR_R outputs; each output then goes through quant_matmul's tree over its 256
+ * partial sums: the levels of 128, 64 and 32 in shared memory, those of 16 to 1 within
+ * one warp, the same pairs added in the same order. quant_matmul gives every output a
+ * block of its own and divides by the group size at every weight: at Kimi K3's trunk
+ * shapes it moves about 0.3 TB/s of the 4090's 1. COLI_CUDA_QMR=0: quant_matmul again. */
+#define QMR_R 8
+static_assert(QMR_R == 256 / 32, "warp a of the block reduces output a");
+template <int FMT, int GS>
+__global__ static void __launch_bounds__(256) quant_matvec_rows(float *y, const float *x,
+        const void *weights, const float *scales, int I, int O, size_t rb, int gs, int ng) {
+    __shared__ float red[QMR_R][256];
+    const int t = threadIdx.x, o0 = blockIdx.x * QMR_R;
+    const int no = O - o0 < QMR_R ? O - o0 : QMR_R;
+    const uint8_t *wr[QMR_R];
+    const float *sr[QMR_R];
+    float acc[QMR_R];
+#pragma unroll
+    for (int a = 0; a < QMR_R; a++) {
+        const int o = o0 + (a < no ? a : no - 1);   /* past O: the last row again, never written */
+        wr[a] = static_cast<const uint8_t *>(weights) + (size_t)o * rb;
+        sr[a] = scales + (size_t)o * ng;
+        acc[a] = 0.0f;
+    }
+    const int sh = (t & 1) * 4;                     /* a thread's columns all have t's parity */
+    for (int i = t; i < I; i += 256) {
+        const float xv = x[i];
+        if (FMT == 4) {
+            int g = GS ? i / GS : i / gs;
+            if (g >= ng) g = ng - 1;
+#pragma unroll
+            for (int a = 0; a < QMR_R; a++) {
+                const int n = (wr[a][i >> 1] >> sh) & 15;
+                acc[a] = __fmaf_rn(__fmul_rn(xv, static_cast<float>(n & 8 ? n - 16 : n)), sr[a][g], acc[a]);
+            }
+        } else {
+#pragma unroll
+            for (int a = 0; a < QMR_R; a++)
+                acc[a] = __fmaf_rn(xv, static_cast<float>(reinterpret_cast<const int8_t *>(wr[a])[i]), acc[a]);
+        }
+    }
+#pragma unroll
+    for (int a = 0; a < QMR_R; a++) red[a][t] = acc[a];
+    __syncthreads();
+#pragma unroll
+    for (int n = 128; n >= 32; n >>= 1) {
+        for (int k = t; k < QMR_R * n; k += 256) red[k / n][k % n] += red[k / n][k % n + n];
+        __syncthreads();
+    }
+    const int a = t >> 5, lane = t & 31;
+    if (a < no) {
+        float v = red[a][lane];
+        v += __shfl_down_sync(0xffffffffu, v, 16);
+        v += __shfl_down_sync(0xffffffffu, v, 8);
+        v += __shfl_down_sync(0xffffffffu, v, 4);
+        v += __shfl_down_sync(0xffffffffu, v, 2);
+        v += __shfl_down_sync(0xffffffffu, v, 1);
+        if (!lane) y[o0 + a] = FMT == 1 ? v * scales[o0 + a] : v;
+    }
+}
+/* The same bytes a warp an output, for rows of whole 256-column chunks (K3's trunk): lane
+ * l takes quant_matmul's threads 8l .. 8l + 7, whose columns in chunk k are 256k + 8l ..
+ * 256k + 8l + 7 -- one 32-bit word of int4 (8 bytes of int8), two float4 of the input, one
+ * group scale (gs a multiple of 8) -- each thread its own chain of fused adds in its
+ * column order. quant_matmul's tree follows: its levels of 128 down to 8 between lanes 16,
+ * 8, 4, 2 and 1 apart, those of 4, 2 and 1 within lane 0. */
+template <int FMT, int GS>
+__global__ static void __launch_bounds__(256) quant_matvec_warp(float *y, const float *x,
+        const void *weights, const float *scales, int I, int O, size_t rb, int gs, int ng) {
+    const int lane = threadIdx.x & 31, o = blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (o >= O) return;                             /* the whole warp */
+    const uint8_t *row = static_cast<const uint8_t *>(weights) + (size_t)o * rb;
+    float acc[8];
+#pragma unroll
+    for (int m = 0; m < 8; m++) acc[m] = 0.0f;
+    for (int c = lane << 3; c < I; c += 256) {      /* the lane's first column of each chunk */
+        const float4 xa = *reinterpret_cast<const float4 *>(x + c);
+        const float4 xb = *reinterpret_cast<const float4 *>(x + c + 4);
+        const float xv[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+        if (FMT == 4) {
+            const uint32_t q = *reinterpret_cast<const uint32_t *>(row + (c >> 1));
+            const float s = scales[(size_t)o * ng + (GS ? c / GS : c / gs)];
+#pragma unroll
+            for (int m = 0; m < 8; m++) {
+                const int n = (q >> (4 * m)) & 15;
+                acc[m] = __fmaf_rn(__fmul_rn(xv[m], static_cast<float>(n & 8 ? n - 16 : n)), s, acc[m]);
+            }
+        } else {
+            const uint2 q = *reinterpret_cast<const uint2 *>(row + c);
+#pragma unroll
+            for (int m = 0; m < 8; m++) {
+                const int8_t b = static_cast<int8_t>(((m < 4 ? q.x : q.y) >> (8 * (m & 3))) & 255u);
+                acc[m] = __fmaf_rn(xv[m], static_cast<float>(b), acc[m]);
+            }
+        }
+    }
+#pragma unroll
+    for (int d = 16; d; d >>= 1)
+#pragma unroll
+        for (int m = 0; m < 8; m++) acc[m] += __shfl_down_sync(0xffffffffu, acc[m], d);
+    if (!lane) {
+        acc[0] += acc[4]; acc[1] += acc[5]; acc[2] += acc[6]; acc[3] += acc[7];
+        acc[0] += acc[2]; acc[1] += acc[3];
+        acc[0] += acc[1];
+        y[o] = FMT == 1 ? acc[0] * scales[o] : acc[0];
+    }
+}
+static int qmr_mode(void) {
+    const char *e = std::getenv("COLI_CUDA_QMR");
+    return !e || !*e || std::atoi(e) != 0;
+}
+
 static void quant_matmul_launch(float *y, const float *x, const void *w,
         const float *sc, int fmt, int S, int I, int O, size_t rb, int gs, int ng) {
+    if (S == 1 && (fmt == 1 || (fmt == 4 && gs > 0)) && qmr_mode()) {
+        dim3 rows((unsigned)((O + QMR_R - 1) / QMR_R));
+        const bool whole = !(I & 255) && !(reinterpret_cast<uintptr_t>(x) & 15) &&
+                           !(reinterpret_cast<uintptr_t>(w) & 15) && (fmt == 1 || !(gs & 7));
+        if (whole && fmt == 1) quant_matvec_warp<1, 0><<<rows, 256>>>(y, x, w, sc, I, O, rb, gs, ng);
+        else if (whole && gs == 64) quant_matvec_warp<4, 64><<<rows, 256>>>(y, x, w, sc, I, O, rb, gs, ng);
+        else if (whole) quant_matvec_warp<4, 0><<<rows, 256>>>(y, x, w, sc, I, O, rb, gs, ng);
+        else if (fmt == 1) quant_matvec_rows<1, 0><<<rows, 256>>>(y, x, w, sc, I, O, rb, gs, ng);
+        else if (gs == 64) quant_matvec_rows<4, 64><<<rows, 256>>>(y, x, w, sc, I, O, rb, gs, ng);
+        else quant_matvec_rows<4, 0><<<rows, 256>>>(y, x, w, sc, I, O, rb, gs, ng);
+        return;
+    }
     dim3 grid((unsigned)O, (unsigned)S);
     if (fmt == 8 && f8_warp_mode())
         quant_matmul_f8w<<<grid, 256>>>(y, x, w, sc, S, I, O);

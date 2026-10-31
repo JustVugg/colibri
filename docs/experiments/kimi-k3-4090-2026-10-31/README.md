@@ -68,3 +68,61 @@ routed experts' compute is 497 ms (25.8 GB of weights read from RAM, about 52 GB
 the drives' 12.1 GB written into it; `membw.c` here read 66 GB/s with 16 threads) and the
 wait for reads 286 ms; the start's 53-62 s are the BF16 weights read from `C:` at about 2
 GB/s by the loader (`raw/run13_bf16r_gpu215.csv` is the whole run, every 2 s).
+
+## Runs 14-18: the GPU's one-row kernel, reads in parts, where the waits are
+
+| run | engine / settings | prompt | decode | waiting for reads | note |
+|---|---|---:|---:|---:|---|
+| run14_qmr | + `quant_matvec_warp` for one row on the GPU | 38.5 s | 0.78 tok/s (57.8 s) | 353 ms | attention 178 -> 136 ms; the GPU's 16,605 calls 4.7 -> 2.8 s |
+| run15_parts4 | run14, every unbuffered read cut in 4 parts | 43.7 s | 0.70 tok/s (64.1 s) | 498 ms | slower reads; not kept |
+| run16_parts2 | the same, 2 parts | 38.8 s | 0.78 tok/s (57.8 s) | 360 ms | no gain; not kept |
+| run17_wait | run14, `K3_WAIT_LAYERS=1` | 38.4 s | 0.78 tok/s (57.7 s) | 349 ms | the waits and demand reads by layer |
+| run18_long | run17 and `K3_REUSE` on another prompt, 320 tokens | 47.7 s (52 tokens) | 0.79 tok/s (403.9 s) | 309 ms | LRU hit curves by layer |
+
+The one-row kernel ([docs/kimi_k3-4090.md](../../kimi_k3-4090.md)) gives the GPU's bytes of
+before and the same text, and takes 42 ms off a token's attention, but not off the token:
+the wait for the drives grew by as much (299 -> 353 ms). A decode token here is as fast as
+the experts that are neither in RAM nor predicted arrive.
+
+Cutting each 17.5 MB read in parts so that a drive's two readers share an expert and a
+demand waits for a part of a prefetch, not a whole one (runs 15, 16), made the reads
+slower: the 35-token prompt, which only reads, took 43.7 instead of 38.5 s with 4.4 MB
+parts. These drives want large requests; the parts were taken out again.
+
+`K3_WAIT_LAYERS=1` (run17, and run18 below) splits the wait by layer: about 1.3 ms of it
+for every expert a layer reads on demand (one the cache lacks and the prediction did not
+name). Layers 1-8 read 4-7 that way a token and wait 6-12 ms each, layers 49-59 about one
+and under a millisecond; layer 1, whose prediction has only layer 0 to hide behind and
+whose cache holds 26% of what it is asked, alone waits 12 ms a token.
+
+`K3_REUSE` (run18) records every routed expert's LRU stack distance. The decode's hit
+rate over all layers that an LRU cache of each size would have had, every layer the same:
+
+| slots a layer | 48 | 64 | 80 | **97** (here) | 120 | 160 | 200 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| LRU hit rate, decode | 53.7% | 58.4% | 61.8% | **64.7%** | 68.0% | 72.9% | 76.6% |
+
+Given to the layers where they hold most, the same 8,924 slots hit 64.9% (0.6% fewer
+misses): the layers' curves have the same shape, and a split of the cache by layer is
+not worth its code. The prediction holds least at the start of an AttnRes block (layer 12:
+10% of its experts, 24: 28%, 36: 30%; 58% on average): there the MLP's input is mostly
+the layer's own attention, which the layer before cannot know.
+
+## Run 19: a 2,637-token prompt
+
+`raw/run19_long512.*`: the first 9,000 characters of docs/kimi_k3.md to summarize, in
+512-token steps: **1,401 s (1.88 tokens a second)**, 265 s a step, of which attention
+388 s and the MoE 993 s, only 29.6 s of it waiting for reads: a long prompt here is bound
+by the CPU, not the drives (steps of 2,048 would read less and compute as much; the run
+was stopped). Where the CPU goes, found after it:
+- the gated MLA's scores: `s2+=qabs[i]*Lt[i]` is one sequential chain of 576 adds a
+  position (GCC -O3 multiplies 16 at a time, then adds them in order), about 86 ms a token
+  at 1,300 positions over 24 layers, and growing with the context in decode too; the same
+  bytes 8 positions at a time (rounded products, added in i's order) is the next step;
+- `matmul_i4_grouped` (the shared experts and latent projections on the CPU): 155 GMAC/s on
+  16 threads at 512 rows, about 55 s a step; it decodes the weights again for every row;
+- the shared experts' SiTU: one thread for 3.1M elements a layer, about 17 s a step
+  (now over every worker, element by element, so the same bytes);
+- `matmul_mxfp4_i8_pre` now decodes an output's weights once for 4 rows (the same bytes,
+  `tests/test_mxfp4_i8_rows.c`): 1.2-1.6x a thread for an expert's 4-37 rows.
+

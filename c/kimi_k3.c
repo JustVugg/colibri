@@ -284,6 +284,7 @@ typedef struct {
     /* t_moe's parts: the router and the step's issue, the latent projections, the shared
      * experts, the routed experts' waves (t_eload is its waits) */
     double t_route, t_lat, t_shared, t_wave; uint64_t n_wave;
+    double *t_wait_li; uint64_t *n_dem_li;  /* K3_WAIT_LAYERS: a decode's waits and demand reads, by layer */
     /* K3_PREFETCH: the next MoE layer's experts predicted after a decode step's attention
      * (k3_prefetch): the rows a prediction waits for, the layer it is for, what it marked */
     float *pf_x; int pf_n, pf_li;
@@ -2473,7 +2474,54 @@ static void k3_io_report(const Model *m, const char *scope){
             m->pf_pred?100.0*m->pf_pred_hit/m->pf_pred:0.0,m->t_pred);
 }
 /* A step's routing against the prediction that stood for it, which is then spent. */
+/* K3_REUSE=path (a measurement): every MoE layer's experts in the order of their last use,
+ * and for each expert a decode step routes, how many others were used since (its LRU stack
+ * distance: a cache of that layer holding d+1 experts or more would have held it) and
+ * whether the prediction named it; written at exit, a line a layer. */
+static const char *g_k3_reuse;
+static int *g_k3_rstack, *g_k3_rn;
+static uint64_t *g_k3_rhist, *g_k3_rpred, *g_k3_rphit;
+static void k3_reuse_note(Model *m, int li, const int *idxs, const int *keff, int C){
+    static int init;
+    if(!init){ init=1; g_k3_reuse=getenv("K3_REUSE"); if(g_k3_reuse&&!*g_k3_reuse) g_k3_reuse=NULL; }
+    if(!g_k3_reuse) return;
+    int E=m->c.n_experts, K=m->c.topk, L=m->c.n_layers;
+    if(!g_k3_rstack){
+        g_k3_rstack=malloc((size_t)L*E*sizeof(int)); g_k3_rn=calloc((size_t)L,sizeof(int));
+        g_k3_rhist=calloc((size_t)L*(E+1),sizeof(uint64_t));
+        g_k3_rpred=calloc((size_t)L,sizeof(uint64_t)); g_k3_rphit=calloc((size_t)L,sizeof(uint64_t));
+        if(!g_k3_rstack||!g_k3_rn||!g_k3_rhist||!g_k3_rpred||!g_k3_rphit){ fprintf(stderr,"OOM reuse\n"); exit(1); }
+    }
+    int *st=g_k3_rstack+(int64_t)li*E, *n=&g_k3_rn[li];
+    const uint8_t *mark=m->pf_mark?m->pf_mark+(int64_t)li*E:NULL;
+    for(int t=0;t<C;t++) for(int kk=0;kk<keff[t];kk++){
+        int e=idxs[(int64_t)t*K+kk], d=0;
+        while(d<*n&&st[d]!=e) d++;
+        if(C==1){
+            g_k3_rhist[(int64_t)li*(E+1)+(d<*n?d:E)]++;
+            if(mark){ g_k3_rpred[li]++; g_k3_rphit[li]+=mark[e]!=0; }
+        }
+        if(d==*n) (*n)++;
+        memmove(st+1,st,(size_t)(d<*n-1?d:*n-1)*sizeof(int));
+        st[0]=e;
+    }
+}
+static void k3_reuse_save(Model *m){
+    if(!g_k3_reuse||!g_k3_rstack) return;
+    FILE *f=fopen(g_k3_reuse,"w");
+    if(!f){ fprintf(stderr,"[K3] K3_REUSE: cannot write %s\n",g_k3_reuse); return; }
+    int E=m->c.n_experts;
+    for(int li=0;li<m->c.n_layers;li++){
+        if(!m->L[li].sparse) continue;
+        fprintf(f,"%d %llu %llu",li,(unsigned long long)g_k3_rpred[li],(unsigned long long)g_k3_rphit[li]);
+        for(int d=0;d<=E;d++) fprintf(f," %llu",(unsigned long long)g_k3_rhist[(int64_t)li*(E+1)+d]);
+        fprintf(f,"\n");
+    }
+    fclose(f);
+    fprintf(stderr,"[K3] reuse distances written to %s\n",g_k3_reuse);
+}
 static void k3_prefetch_score(Model *m, int li, const int *idxs, const int *keff, int C){
+    k3_reuse_note(m,li,idxs,keff,C);
     if(!m->pf_mark) return;
     int E=m->c.n_experts, K=m->c.topk;
     uint8_t *mark=m->pf_mark+(int64_t)li*E;
@@ -2727,6 +2775,7 @@ static void k3_waves_take(Model *m, int li, K3Waves *w){
         s->eid=w->uids[jj]; s->used=w->stamp; s->busy=1; s->pref=0;
         cache_index(m,li,s); w->sl[jj]=s;
         m->ebytes+=(uint64_t)m->e_slot;
+        if(m->n_dem_li) m->n_dem_li[li]++;
         k3_io_submit(m,s,li,w->uids[jj],0);
     }
 }
@@ -2812,7 +2861,12 @@ static void k3_waves_run(Model *m, int li, K3Waves *w, const float *Z, int strid
         int nw=0;
         for(int j=0;j<nu;j++) if(!w->done[j]&&w->sl[j]&&slot_ready(w->sl[j])) w->wave[nw++]=j;
         if(!nw&&idle){ idle(ctx); idle=NULL; continue; }   /* the work that needs no expert, while they arrive */
-        if(!nw){ k3_io_wait_any(m,seen_io); continue; }
+        if(!nw){
+            double tw=now_s();
+            k3_io_wait_any(m,seen_io);
+            if(m->t_wait_li) m->t_wait_li[li]+=now_s()-tw;
+            continue;
+        }
         double t0=now_s();
         k3_wave(m,w->wave,nw,w->sl,pfirst,pcnt,XQ,XS,XF,G,GQ,GS,Y);
         m->t_wave+=now_s()-t0; m->n_wave++;
@@ -3090,6 +3144,8 @@ static float *k3_shared(Model *m, Moe *o, const float *x, int C){
     int shi=c->moe_inter*c->n_shared;
     float *sg=falloc((int64_t)C*shi), *su=falloc((int64_t)C*shi), *sd=falloc((int64_t)C*c->hidden);
     w_matmul(sg,x,&o->sh_gate,C); w_matmul(su,x,&o->sh_up,C);
+    /* element by element over every worker (a 512-row step: 3.1M of them a layer) */
+    #pragma omp parallel for schedule(static)
     for(int64_t i=0;i<(int64_t)C*shi;i++) sg[i]=situf_(sg[i],su[i],c->situ_b1,c->situ_b2);
     w_matmul(sd,sg,&o->sh_down,C);
     free(sg); free(su);
@@ -5097,10 +5153,20 @@ int main(int argc, char **argv){
     }
     if(g_lfp){ fclose(g_lfp); g_lfp=NULL; }
     fprintf(stderr,"\n[K3] prefill done in %.1fs (%.2f tok/s)\n",now_s()-t0,np/(now_s()-t0));
+    fprintf(stderr,"[K3] the prompt: attention %.1fs, MoE %.1fs (router and reads issued %.1f, latent %.1f, "
+            "shared %.1f, routed experts computed %.1f, waiting for reads %.1f); %.0f GB read\n",
+            m.t_attn,m.t_moe,m.t_route,m.t_lat,m.t_shared,m.t_wave,m.t_eload,m.ebytes/1e9);
+#ifdef COLI_CUDA
+    k3_cuda_report("prompt");
+#endif
     /* the decode's own share of every timer: what they hold after the prompt */
     double d0_attn=m.t_attn, d0_moe=m.t_moe, d0_eload=m.t_eload, d0_route=m.t_route, d0_lat=m.t_lat,
            d0_shared=m.t_shared, d0_wave=m.t_wave, d0_head=m.t_head;
     uint64_t d0_bytes=m.ebytes;
+    if(getenv("K3_WAIT_LAYERS")&&atoi(getenv("K3_WAIT_LAYERS"))){
+        m.t_wait_li=calloc((size_t)m.c.n_layers,sizeof(double));
+        m.n_dem_li=calloc((size_t)m.c.n_layers,sizeof(uint64_t));
+    }
     if(!m.has_head||!lo){
         fprintf(stderr,"[K3] no head — trace written, stopping after prefill\n");
     if(m.trace) fclose(m.trace);
@@ -5167,8 +5233,15 @@ int main(int argc, char **argv){
                 dt*k,(m.t_attn-d0_attn)*k,(m.t_moe-d0_moe)*k,(m.t_route-d0_route)*k,(m.t_lat-d0_lat)*k,
                 (m.t_shared-d0_shared)*k,(m.t_wave-d0_wave)*k,(m.t_eload-d0_eload)*k,(m.t_head-d0_head)*k,
                 (m.ebytes-d0_bytes)/1e9/ntok);
+        if(m.t_wait_li&&m.n_dem_li){
+            fprintf(stderr,"[K3] by layer, a decode token: waiting ms / demand reads:");
+            for(int i=0;i<m.c.n_layers;i++)
+                if(m.L[i].sparse) fprintf(stderr," L%d %.1f/%.1f",i,m.t_wait_li[i]*k,(double)m.n_dem_li[i]/ntok);
+            fprintf(stderr,"\n");
+        }
     }
     k3_io_report(&m,"run");
+    k3_reuse_save(&m);
 #ifdef COLI_CUDA
     k3_cuda_report("run");
 #endif

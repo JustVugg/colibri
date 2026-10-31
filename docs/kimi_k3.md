@@ -226,6 +226,8 @@ Judge quantization choices on real-text logits, not synthetic-vector norms.
 | `K3_PREFETCH_MIX` | 1 | predict from the next layer's own mix of the blocks (0: this layer's MLP input) |
 | `K3_WAVES` | 1 | a MoE step's experts computed in waves as their reads arrive (0: one at a time) |
 | `K3_IO_DELAY_US` | 0 | tests: every read waits this long first |
+| `K3_WAIT_LAYERS` | 0 | measurement: a decode token's wait for reads and its demand reads, by layer (last lines) |
+| `K3_REUSE` | -- | measurement: every MoE layer's LRU stack distances and predicted share, written to this file at exit |
 | `K3_TOPP` | 0 | keep routed experts to cumulative weight p (0 = off) |
 | `K3_CHUNK` | 32 | prefill chunk size (1 = token-at-a-time; forced 1 under `K3_TRACE`) |
 | `K3_THINK` | 1 | chat mode: open the structural think channel (0 = response-only) |
@@ -358,8 +360,9 @@ for every row count: one row through `coli_cuda_matmul`, a prompt step's rows th
 `coli_cuda_matmul_tiled` (the same bytes, about 4x sooner at 32 or 512 rows). Every token reads all of these matrices (about 35 GiB at the
 default bits), so on a machine whose RAM bandwidth is shared with the experts' reads
 this takes the largest part of the dense work off it: on an RTX 4090 a 12288 x 7168
-int4 projection takes 0.19 ms a decode row against 0.90 ms on 16 Zen 4 cores, the
-163840 x 7168 int8 head 2.2 ms against 18.4 (`tests/bench_k3_cuda_dense.c`).
+int4 projection takes 0.06 ms a decode row against 0.90 ms on 16 Zen 4 cores, the
+163840 x 7168 int8 head 1.2 ms against 18.4 (`tests/bench_k3_cuda_dense.c`; one row runs
+`quant_matvec_warp`, quant_matmul's sums and tree a warp an output, so its bytes).
 `kv_b` stays on the CPU (the MLA absorb reads its rows), and so do the routers and
 KDA's small f32 projections, so the routing is the CPU's arithmetic on its input. The
 routers stay in the checkpoint's BF16 (`Moe.router16`): `k3_dot_bf16w` widens each weight
