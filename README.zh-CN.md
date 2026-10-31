@@ -309,6 +309,15 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 
 **性能剖析**（Profiling）页面按阶段显示每一轮的时间花在了哪里，并以最近 30 轮作为趋势。
 
+### 终端界面
+
+`coli tui` 是在终端里的同一个聊天，只有一个 C 文件，不依赖任何库：对话列表、流式输出的回答（推理折叠起来）、监视器（`F2`，包括引擎的 CPU 和内存、GPU 及其显存、每一轮的剖析）、专家地图（`ctrl+e`），以及聊天页面上的那只蜂鸟，在支持 sixel 的终端里（Windows Terminal、foot、WezTerm）画成图片。它会连接正在运行的 `coli serve`，或者用 `--model` 自己启动一个。参见 [docs/tui.md](docs/tui.md)。
+
+<p align="center">
+  <img src="docs/media/tui/tui-chat.png" width="900" alt="终端界面：对话列表、一个问题、折叠的推理、回答及其速度，以及停在输入框上的蜂鸟">
+</p>
+<p align="center"><em>Qwen3.8-Flash-Next 在 RTX PRO 4000 上通过 <code>coli serve</code> 运行，上下文 256K。</em></p>
+
 ## 在其他应用中使用
 
 `coli serve`（安装程序会替你启动它）是一个同时提供多种 API 的服务器：
@@ -396,7 +405,7 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 
 ### 长上下文和智能体
 
-- **以 64k 的速度运行 256k 上下文。** 机器 D 的 CUDA 链上运行 Qwen3.8-Flash-Next IQ2_XS，上下文 262,144 token：提示词 15.6 -> 149 tok/s，解码 9.6 -> 45.7（内存规划按一个提示词分段，K/V 在显卡上用 float16；在 65,536 时读取 188，解码 48.4）（[qwen38.md](docs/qwen38.md)）。
+- **以 64k 的速度运行 256k 上下文。** 机器 D 的 CUDA 链上运行 Qwen3.8-Flash-Next IQ2_XS，上下文 262,144 token：提示词 15.6 -> 151 tok/s，解码 9.6 -> 42.9（内存规划按一个提示词分段，K/V 在显卡上用 float16；在 65,536 时读取 208，解码 52.2，在 131,072 时 190 和 51.9）（[qwen38.md](docs/qwen38.md)）。
 - **智能体的每一轮只读取新内容。** 两轮之间的短请求（智能体询问会话标题）会把会话暂存起来，而不是占用它的状态，所有引擎都如此（`COLI_PARK`）。Qwen3.8-Flash-Next 上 Hermes Agent 的第二轮，14,810 个 token：86 秒 -> 4.9 秒（[qwen38.md](docs/qwen38.md#an-agents-turns)）。
 - **float16 的 KV 缓存**：GLM-5.3 在 131,072 个 token 时占用 11.9 GB，而不是 23.9 GB（[CHANGELOG](CHANGELOG.md)）。
 
@@ -433,6 +442,7 @@ make qwen36 VK=1                          # one engine, here with Vulkan (CUDA=1
 ./coli tune  --model /nvme/qwen36          # measure and save this machine's fastest safe settings
 ./coli import /nvme/Flint-UD-Q4_K_XL.gguf  # a GGUF: writes Flint-UD-Q4_K_XL.colibri next to it
 ./coli ui                                  # the chat UI, next to a running coli serve
+./coli tui                                 # the chat in the terminal, on a running coli serve (or --model)
 ```
 
 在 Windows 上，发布包附带 `coli.cmd`（`coli.cmd chat --model D:\qwen36`）；在源码 checkout 中请使用 `py -3 c\coli`。`.exe` 文件是引擎，而不是启动器。所有选项和变量：[SETTINGS.md](docs/SETTINGS.md)、[ENVIRONMENT.md](docs/ENVIRONMENT.md)。
@@ -463,6 +473,7 @@ colibri 希望前沿模型更少依赖稀缺硬件，运行成本更低。这意
 | GGUF 文件：支持的架构、两种模式、各引擎如何处理这些块 | [gguf.md](docs/gguf.md) |
 | Qwen3.6 引擎上的模型（Flint、Muse Spark Open、LFM3-VL）和 Mistral-Large-4 | [qwen36.md](docs/qwen36.md)、[mistral-large4.md](docs/mistral-large4.md) |
 | 聊天界面（`coli ui`） | [ui/README.md](ui/README.md) |
+| 终端界面（`coli tui`） | [tui.md](docs/tui.md) |
 | Vulkan：专家层级、稠密链、没有 Resizable BAR 的显卡 | [vulkan.md](docs/vulkan.md) |
 | CUDA，以及 Qwen3.6 的 CUDA 层级 | [cuda.md](docs/cuda.md)、[qwen36-cuda-tier.md](docs/qwen36-cuda-tier.md) |
 | Apple Silicon、Windows | [metal.md](docs/metal.md)、[windows.md](docs/windows.md) |
@@ -493,6 +504,7 @@ c/
 ├── qwenimage.c           Qwen-Image-2.1  (make qwenimage)
 ├── laya.c                Laya  (make laya)
 ├── gliner_decide.c       GLiNER2.5-Decide  (make gliner_decide)
+├── tui.c                 the terminal UI, a client of coli serve  (make colibri-tui)
 │
 ├── st.h, quant.h, idot.h        safetensors reads, container decoders, integer kernels
 ├── expert_ffn.h, expert_store.h routed-expert kernel and streaming expert cache

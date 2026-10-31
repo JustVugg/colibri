@@ -5,6 +5,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### New
+
+- **The terminal UI, `coli tui`** (`c/tui.c`, `make colibri-tui`): the chat in a terminal, one
+  C file with no libraries, a client of `coli serve`. The conversations, the answer streamed
+  with its reasoning folded, the monitor (Overview and Profiling, as on the chat page, plus the
+  GPU), the expert map, and the chat page's hummingbird with its moves, drawn as a sixel picture
+  where the terminal can. It attaches to a running server or starts one for `--model`; the
+  release archives carry it next to `coli` ([docs/tui.md](docs/tui.md)).
+- **`/health` reports the NVIDIA cards** (`system.gpus`: use, memory, temperature, power, from
+  `nvidia-smi` at most once a second), for the monitors.
+
+### Docs
+
+- Qwen3.8-Flash-Next's long-context table measured again on 2.1.0: 65,536 tokens 208 / 52.2
+  tok/s, 131,072 190 / 51.9, 262,144 151 / 42.9 (prompt / decode).
+
 ## [2.1.0] - 2026-10-31
 
 387 pull requests since v2.0.0, 208 of them from 35 contributors. GGUF files run

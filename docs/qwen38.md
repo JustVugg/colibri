@@ -182,6 +182,13 @@ Qwen3.8-Flash-Next IQ2_XS on an RTX PRO 4000 (24 GB) with 62 GB of RAM, served o
 | 262,144, before | 15.6 tok/s | 9.6 tok/s | 10 | 0.65 GB |
 | 262,144, the plan's segment | 84 tok/s | 21.9 tok/s | 490 | 0.65 GB |
 | 262,144, and K/V in float16 | 149 tok/s | 45.7 tok/s | 490 | 7.03 GB |
+| 65,536, 2.1.0 | 208 tok/s | 52.2 tok/s | 512 | 14.1 GB |
+| 131,072, 2.1.0 | 190 tok/s | 51.9 tok/s | 512 | 11.7 GB |
+| 262,144, 2.1.0 | 151 tok/s | 42.9 tok/s | 489 | 7.03 GB |
+
+The last three rows are v2.1.0 (`main` at 0a5504a1) measured again the same way, the better
+of two runs (`bench_serve.py`, a fresh 452-token prompt, then 128 streamed tokens; the
+request's HTTP included).
 
 ## An agent's turns
 

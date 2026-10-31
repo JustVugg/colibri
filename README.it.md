@@ -517,6 +517,20 @@ legge una pull request che rompe il limite di una cache: <strong>request changes
 La pagina **Profiling** mostra dove ogni turno spende il suo tempo, fase per
 fase, con gli ultimi 30 turni come tendenza.
 
+### L'interfaccia nel terminale
+
+`coli tui` è la stessa chat in un terminale, un solo file C senza librerie: le
+conversazioni, la risposta in streaming con il ragionamento chiuso, il monitor (`F2`)
+con CPU e RAM del motore, la GPU e la sua VRAM e il profilo di ogni turno, la mappa
+degli expert (`ctrl+e`) e il colibrì della pagina chat, disegnato come immagine dove
+il terminale disegna sixel (Terminale di Windows, foot, WezTerm). Si collega a un
+`coli serve` acceso, o ne avvia uno con `--model`. Vedi [docs/tui.md](docs/tui.md).
+
+<p align="center">
+  <img src="docs/media/tui/tui-chat.png" width="900" alt="l'interfaccia nel terminale: le conversazioni, una domanda, il ragionamento chiuso, la risposta, la sua velocità e il colibrì sulla casella di testo">
+</p>
+<p align="center"><em>Qwen3.8-Flash-Next su una RTX PRO 4000 attraverso <code>coli serve</code>, con un contesto da 256K.</em></p>
+
 ## Usarlo da altre app
 
 `coli serve` (che l'installazione avvia per te) è un unico server con diverse
@@ -671,8 +685,8 @@ pagina di ogni modello:
 
 - **Un contesto da 256k alla velocità di 64k.** Qwen3.8-Flash-Next IQ2_XS sulla
   catena CUDA della macchina D, con un contesto di 262144 token: prompt da 15.6 a
-  149 tok/s, decode da 9.6 a 45.7 (il piano della RAM a un segmento del prompt,
-  K/V in float16 sulla scheda; a 65536 legge a 188 e fa 48.4 in decode)
+  151 tok/s, decode da 9.6 a 42.9 (il piano della RAM a un segmento del prompt,
+  K/V in float16 sulla scheda; a 65536 legge a 208 e fa 52.2 in decode, a 131072 190 e 51.9)
   ([qwen38.md](docs/qwen38.md)).
 - **I turni di un agente leggono solo ciò che è nuovo.** Una richiesta breve tra
   due turni (un agente che chiede il titolo della conversazione) parcheggia la
@@ -740,6 +754,7 @@ template, quindi i comandi sono gli stessi per ogni modello:
 ./coli tune  --model /nvme/qwen36          # measure and save this machine's fastest safe settings
 ./coli import /nvme/Flint-UD-Q4_K_XL.gguf  # a GGUF: writes Flint-UD-Q4_K_XL.colibri next to it
 ./coli ui                                  # the chat UI, next to a running coli serve
+./coli tui                                 # the chat in the terminal, on a running coli serve (or --model)
 ```
 
 Su Windows un archivio di release include `coli.cmd` (`coli.cmd chat --model
@@ -785,6 +800,7 @@ fallimento ben controllato vale più di un numero veloce senza spiegazione.
 | I file GGUF: le architetture, i due modi, cosa fa ogni motore con i blocchi | [gguf.md](docs/gguf.md) |
 | I modelli sul motore Qwen3.6 (Flint, Muse Spark Open, LFM3-VL) e Mistral-Large-4 | [qwen36.md](docs/qwen36.md), [mistral-large4.md](docs/mistral-large4.md) |
 | La chat (`coli ui`) | [ui/README.md](ui/README.md) |
+| L'interfaccia nel terminale (`coli tui`) | [tui.md](docs/tui.md) |
 | Vulkan: il livello degli expert, la catena densa, le schede senza Resizable BAR | [vulkan.md](docs/vulkan.md) |
 | CUDA, e il livello CUDA di Qwen3.6 | [cuda.md](docs/cuda.md), [qwen36-cuda-tier.md](docs/qwen36-cuda-tier.md) |
 | Apple Silicon, Windows | [metal.md](docs/metal.md), [windows.md](docs/windows.md) |
@@ -815,6 +831,7 @@ c/
 ├── qwenimage.c           Qwen-Image-2.1  (make qwenimage)
 ├── laya.c                Laya  (make laya)
 ├── gliner_decide.c       GLiNER2.5-Decide  (make gliner_decide)
+├── tui.c                 the terminal UI, a client of coli serve  (make colibri-tui)
 │
 ├── st.h, quant.h, idot.h        safetensors reads, container decoders, integer kernels
 ├── expert_ffn.h, expert_store.h routed-expert kernel and streaming expert cache
