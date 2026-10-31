@@ -434,23 +434,21 @@ coding agents opened already pointed at colibri. Seven languages. See [ui/README
 <p align="center"><em>LFM3-VL-2B on an i5-13500's CPU, 32 tok/s.</em></p>
 
 <p align="center">
-  <img src="docs/media/colibri-dashboard.png" width="900" alt="the colibri web dashboard: chat, live metrics, hardware panel, expert tiers">
+  <img src="docs/media/ui/ui-monitor.png" width="900" alt="the monitor: the model's state, its speed, the tokens written, the prompt, the engine's CPU and RAM">
 </p>
-<p align="center"><em>Qwen3.6 answering on a CPU box, experts streamed from disk.</em></p>
+<p align="center"><em>The <strong>monitor</strong> while LFM3-VL-2B writes: 31.6 tok/s, the prompt read in 0.1 s, 2.1 GB of RAM.</em></p>
 
 <p align="center">
-  <img src="docs/media/colibri-brio.png" width="900" alt="the System One page: a document read once, a probability for every allowed answer, and an entropy">
+  <img src="docs/media/ui/ui-experts.png" width="900" alt="the chat with the expert map open: a cell per expert in each of OLMoE's 16 blocks">
 </p>
-<p align="center"><em><strong>System One</strong>: give the model a document and the only answers it may pick. Here:
-<strong>request changes at 99.9%</strong>, entropy 0.005, 4 tokens read, 0 generated.</em></p>
+<p align="center"><em>OLMoE with the <strong>expert map</strong> open beside the chat: a cell per expert in each block, white when chosen in this step,
+amber when used in this answer.</em></p>
 
 <p align="center">
-  <img src="docs/media/colibri-brain.png" width="900" alt="the Brain page: the measured expert atlas of GLM-5.2 drawn as a cortex, ten regions to enter">
+  <img src="docs/media/ui/ui-systemone.png" width="900" alt="the System One page: a pull request read once, a probability for every allowed answer, and how sure the model is">
 </p>
-<p align="center"><em>The <strong>Brain</strong>: the <a href="https://github.com/JustVugg/colibri/issues/175">measured expert atlas</a> of GLM-5.2,
-13,260 characterised experts in ten regions (Python, SQL, mathematics, poetry, law, Chinese...), placed by measured
-routing affinity. <strong>Live routing</strong> shows the model that is running: one cell per expert, coloured by
-storage tier, and every expert routed in a turn flashes.</em></p>
+<p align="center"><em><strong>System One</strong>: give the model a document and the only answers it may pick. Here Qwen3.6-35B on an RTX PRO 4000
+reads a pull request that breaks a cache's size limit: <strong>request changes at 81%</strong>, entropy 0.56 (unsure), 98 tokens read, 0 generated.</em></p>
 
 The **Profiling** page shows where each turn spends its time, phase by phase,
 with the last 30 turns as a trend.

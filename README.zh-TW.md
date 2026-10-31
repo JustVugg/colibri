@@ -412,24 +412,30 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 `coli web` 會開啟它，一步安裝也會：包含聊天、System One 頁面、
 大腦（Brain）與效能剖析（Profiling）頁面，提供淺色與深色主題。
 
-<p align="center">
-  <img src="docs/media/colibri-dashboard.png" width="900" alt="colibri 網頁儀表板：聊天、即時指標、硬體面板、專家層級">
-</p>
-<p align="center"><em>Qwen3.6 在 CPU 機器上作答，專家從硬碟串流讀取。</em></p>
+### 新的聊天介面
+
+`coli ui` 會在執行中的 `coli serve` 旁開啟新的聊天介面：推理有自己的區塊，具備視覺塔的模型可以看圖片，還有網頁搜尋、專家地圖、即時監視器，以及已指向 colibri 的程式設計代理。支援七種語言。請見 [ui/README.md](ui/README.md)。
 
 <p align="center">
-  <img src="docs/media/colibri-brio.png" width="900" alt="System One 頁面：文件只讀取一次，每個允許的答案各有一個機率，並附上一個熵值">
+  <img src="docs/media/ui/ui-chat.png" width="900" alt="新的聊天介面：一個問題、收合的推理、回答及其速度">
 </p>
-<p align="center"><em><strong>System One</strong>：給模型一份文件，以及它唯一可以選擇的幾個答案。圖中：
-<strong>request changes 為 99.9%</strong>，熵 0.005，讀取 4 個 token，生成 0 個。</em></p>
+<p align="center"><em>LFM3-VL-2B 在 i5-13500 的 CPU 上，32 tok/s。</em></p>
 
 <p align="center">
-  <img src="docs/media/colibri-brain.png" width="900" alt="大腦頁面：GLM-5.2 的實測專家圖譜繪成一塊皮質，有十個可進入的區域">
+  <img src="docs/media/ui/ui-monitor.png" width="900" alt="監視器：模型狀態、速度、已寫出的 token、提示詞、引擎的 CPU 與記憶體">
 </p>
-<p align="center"><em><strong>大腦（Brain）</strong>：GLM-5.2 的<a href="https://github.com/JustVugg/colibri/issues/175">實測專家圖譜</a>，
-13,260 個已分析的專家分布在十個區域（Python、SQL、數學、詩歌、法律、中文……），位置依實測的路由親和度決定。
-<strong>Live routing</strong> 顯示正在執行的模型：每個專家一格，顏色代表儲存層級，
-每一輪中被路由到的專家都會閃爍。</em></p>
+<p align="center"><em>LFM3-VL-2B 寫作時的<strong>監視器</strong>：31.6 tok/s，提示詞 0.1 秒讀完，記憶體 2.1 GB。</em></p>
+
+<p align="center">
+  <img src="docs/media/ui/ui-experts.png" width="900" alt="開啟專家地圖的聊天：OLMoE 16 個區塊中每個專家一格">
+</p>
+<p align="center"><em>OLMoE 在聊天旁開啟<strong>專家地圖</strong>：每個區塊中每個專家一格，本步選中的為白色，本次回答用到的為琥珀色。</em></p>
+
+<p align="center">
+  <img src="docs/media/ui/ui-systemone.png" width="900" alt="System One 頁面：一個拉取請求只讀取一次，每個允許的答案各有一個機率，以及模型有多確定">
+</p>
+<p align="center"><em><strong>System One</strong>：給模型一份文件，以及它唯一可以選擇的幾個答案。圖中 RTX PRO 4000 上的 Qwen3.6-35B 讀取一個破壞快取大小上限的拉取請求：
+<strong>request changes 為 81%</strong>，熵 0.56（不確定），讀取 98 個 token，生成 0 個。</em></p>
 
 **效能剖析**（Profiling）頁面顯示每一輪的時間花在哪裡，逐階段劃分，
 並以最近 30 輪呈現趨勢。

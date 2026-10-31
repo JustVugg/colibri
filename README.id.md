@@ -463,24 +463,33 @@ mode ini tidak membantu dijelaskan di
 `coli web` membukanya, begitu juga proses penyiapan satu langkah: chat, halaman
 System One, Brain, dan halaman Profiling, dalam tema terang atau gelap.
 
-<p align="center">
-  <img src="docs/media/colibri-dashboard.png" width="900" alt="dashboard web colibri: chat, metrik langsung, panel hardware, tier pakar">
-</p>
-<p align="center"><em>Qwen3.6 menjawab pada mesin CPU, dengan pakar yang di-streaming dari disk.</em></p>
+### UI chat baru
+
+`coli ui` membuka chat baru di samping `coli serve` yang sedang berjalan: penalaran di bloknya sendiri,
+gambar untuk model dengan menara visi, pencarian web, peta pakar, monitor langsung, dan agen pemrograman
+yang sudah diarahkan ke colibri. Tujuh bahasa. Lihat [ui/README.md](ui/README.md).
 
 <p align="center">
-  <img src="docs/media/colibri-brio.png" width="900" alt="halaman System One: sebuah dokumen dibaca sekali, probabilitas untuk setiap jawaban yang diizinkan, dan entropy">
+  <img src="docs/media/ui/ui-chat.png" width="900" alt="UI chat baru: sebuah pertanyaan, penalaran yang dilipat, jawaban, dan kecepatannya">
 </p>
-<p align="center"><em><strong>System One</strong>: berikan model sebuah dokumen dan hanya jawaban yang boleh dipilihnya. Di sini:
-<strong>request changes pada 99.9%</strong>, entropy 0.005, 4 token dibaca, 0 dihasilkan.</em></p>
+<p align="center"><em>LFM3-VL-2B pada CPU i5-13500, 32 tok/s.</em></p>
 
 <p align="center">
-  <img src="docs/media/colibri-brain.png" width="900" alt="halaman Brain: atlas pakar GLM-5.2 yang terukur digambar sebagai korteks, sepuluh wilayah yang dapat dimasuki">
+  <img src="docs/media/ui/ui-monitor.png" width="900" alt="monitor: status model, kecepatannya, token yang ditulis, prompt, CPU dan RAM engine">
 </p>
-<p align="center"><em><strong>Brain</strong>: <a href="https://github.com/JustVugg/colibri/issues/175">atlas pakar yang terukur</a> dari GLM-5.2,
-13,260 pakar yang telah dikarakterisasi dalam sepuluh wilayah (Python, SQL, matematika, puisi, hukum, bahasa Tionghoa...), ditempatkan berdasarkan
-afinitas routing yang terukur. <strong>Live routing</strong> menampilkan model yang sedang berjalan: satu sel per pakar, diberi warna berdasarkan
-storage tier, dan setiap pakar yang dirutekan dalam satu turn akan berkedip.</em></p>
+<p align="center"><em><strong>Monitor</strong> saat LFM3-VL-2B menulis: 31.6 tok/s, prompt dibaca dalam 0.1 s, RAM 2.1 GB.</em></p>
+
+<p align="center">
+  <img src="docs/media/ui/ui-experts.png" width="900" alt="chat dengan peta pakar terbuka: satu sel per pakar di setiap 16 blok OLMoE">
+</p>
+<p align="center"><em>OLMoE dengan <strong>peta pakar</strong> terbuka di samping chat: satu sel per pakar di setiap blok, putih saat dipilih pada langkah ini,
+amber saat dipakai dalam jawaban ini.</em></p>
+
+<p align="center">
+  <img src="docs/media/ui/ui-systemone.png" width="900" alt="halaman System One: sebuah pull request dibaca sekali, probabilitas untuk setiap jawaban yang diizinkan, dan seberapa yakin modelnya">
+</p>
+<p align="center"><em><strong>System One</strong>: berikan model sebuah dokumen dan hanya jawaban yang boleh dipilihnya. Di sini Qwen3.6-35B pada RTX PRO 4000
+membaca pull request yang merusak batas ukuran cache: <strong>request changes pada 81%</strong>, entropy 0.56 (ragu), 98 token dibaca, 0 dihasilkan.</em></p>
 
 Halaman **Profiling** menunjukkan di mana waktu setiap turn digunakan, fase demi
 fase, dengan 30 turn terakhir sebagai tren.
