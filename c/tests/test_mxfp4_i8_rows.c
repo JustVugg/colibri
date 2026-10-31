@@ -1,6 +1,6 @@
-/* matmul_mxfp4_i8_pre and matmul_i4_grouped give several rows the bytes they give each
+/* matmul_mxfp4_i8_pre, matmul_i4_grouped, matmul_q and matmul (f32) give several rows the bytes they give each
  * of them alone: their multi-row paths (an output's weights decoded once for 4 or 8 rows,
- * matmul_i4_grouped's rows 16 at a time) against one call a row, for 1 to 37 rows (whole
+ * the others' rows 16 at a time) against one call a row, for 1 to 37 rows (whole
  * and partial blocks), Kimi K3's shapes (experts 3584 -> 3072 and back, the shared experts'
  * and latent projections' 7168 columns in groups of 64) and small ones.
  *   make tests/test_mxfp4_i8_rows.exe && tests/test_mxfp4_i8_rows.exe */
@@ -63,6 +63,53 @@ int main(void){
             free(x); free(all); free(one);
         }
         free(q4); free(sc);
+    }
+    struct { int I, O; } q8[] = { {7168, 33}, {1536, 17}, {8, 5}, {24, 9}, {12, 3} };
+    for(size_t k = 0; k < sizeof q8 / sizeof q8[0]; k++){
+        int I = q8[k].I, O = q8[k].O;
+        int8_t *w = malloc((size_t)O * I); float *sc = malloc((size_t)O * sizeof(float));
+        for(size_t i = 0; i < (size_t)O * I; i++) w[i] = (int8_t)next();
+        for(int o = 0; o < O; o++) sc[o] = (float)(next() % 1000 + 1) * 1e-4f;
+        for(int S = 1; S <= 37; S += S < 10 ? 1 : 9){
+            float *x = malloc((size_t)S * I * sizeof(float));
+            float *all = malloc((size_t)S * O * sizeof(float)), *one = malloc((size_t)O * sizeof(float));
+            for(size_t i = 0; i < (size_t)S * I; i++) x[i] = ((float)(next() % 20001) - 10000.f) * 3.1e-4f;
+            matmul_q(all, x, w, sc, S, I, O);
+            for(int r = 0; r < S; r++){
+                matmul_q(one, x + (size_t)r * I, w, sc, 1, I, O);
+                if(memcmp(one, all + (size_t)r * O, (size_t)O * sizeof(float))){
+                    fprintf(stderr, "q8 I=%d O=%d S=%d: row %d differs from its call alone\n", I, O, S, r);
+                    bad++;
+                    break;
+                }
+            }
+            checked++;
+            free(x); free(all); free(one);
+        }
+        free(w); free(sc);
+    }
+    struct { int I, O; } f32[] = { {7168, 33}, {128, 17}, {32, 5}, {64, 9}, {48, 3} };
+    for(size_t k = 0; k < sizeof f32 / sizeof f32[0]; k++){
+        int I = f32[k].I, O = f32[k].O;
+        float *w = malloc((size_t)O * I * sizeof(float));
+        for(size_t i = 0; i < (size_t)O * I; i++) w[i] = ((float)(next() % 20001) - 10000.f) * 1.3e-4f;
+        for(int S = 1; S <= 37; S += S < 10 ? 1 : 9){
+            float *x = malloc((size_t)S * I * sizeof(float));
+            float *all = malloc((size_t)S * O * sizeof(float)), *one = malloc((size_t)O * sizeof(float));
+            for(size_t i = 0; i < (size_t)S * I; i++) x[i] = ((float)(next() % 20001) - 10000.f) * 3.1e-4f;
+            matmul(all, x, w, S, I, O);
+            for(int r = 0; r < S; r++){
+                matmul(one, x + (size_t)r * I, w, 1, I, O);
+                if(memcmp(one, all + (size_t)r * O, (size_t)O * sizeof(float))){
+                    fprintf(stderr, "f32 I=%d O=%d S=%d: row %d differs from its call alone\n", I, O, S, r);
+                    bad++;
+                    break;
+                }
+            }
+            checked++;
+            free(x); free(all); free(one);
+        }
+        free(w);
     }
     printf("%s: %d shape/row-count combinations, %d differ\n", bad ? "FAIL" : "ok", checked, bad);
     return bad ? 1 : 0;

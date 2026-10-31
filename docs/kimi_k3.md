@@ -254,7 +254,7 @@ teacher-forced logit streams at C=32 vs C=1 match exactly). Measured prefill:
 (scalar fallback for head dims not divisible by 8).
 
 **A long prompt's CPU work** (the RTX 4090 machine, docs/experiments/kimi-k3-4090-2026-10-31:
-a 2,637-token prompt took 1,401 s in 512-token steps, **639 s** now in steps of 2,048,
+a 2,637-token prompt took 1,401 s in 512-token steps, **613 s** now in steps of 2,048,
 the logits the same bytes). Each rewrite below keeps every row's and position's arithmetic:
 - the gated MLA's scores were one chain of 576 adds a position (GCC -O3 multiplies 16 at
   a time, then adds the products in order); `k3_mla_scores_g` keeps that arithmetic (an
@@ -269,7 +269,16 @@ the logits the same bytes). Each rewrite below keeps every row's and position's 
   shared experts' SiTU runs over every worker;
 - `K3_CHUNK` may be up to 4096: a step reads every expert it needs once from the drives and
   once from RAM for all its rows (2,048 against 512: 5,784 -> 2,455 GB read for that
-  prompt, 845 -> 697 s).
+  prompt, 845 -> 697 s);
+- KDA's short convolutions and heads go over a step's tokens channel by channel and head
+  by head (one parallel region each where there were four a token; `k3_kda_head` is the
+  one head step both orders call, the conv's taps fused adds in order as compiled before);
+- `matmul_q` (int8: the MLA projections the GPU does not hold) and `matmul` (f32, every
+  engine's, matmul_f32.h) take a step's rows like `matmul_i4_grouped`: 16 rows of input
+  in L2, each weight loaded once for 8 (4) rows, every row's lanes and tree its own;
+- coli_cuda.dll's `quant_matmul_tiled` (a step's rows on the GPU) ends quant_matmul's tree
+  with five levels of warp shuffles, two outputs a round: 20 block barriers where there
+  were 80, the same pairs added (10-20% sooner).
 
 ## Chat, API, and Web
 

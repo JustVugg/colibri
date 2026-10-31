@@ -76,6 +76,39 @@ static int i4_acc512_selftest(void){
 
 /* ---- y[S,O] = x[S,I] @ W^T, W int8 per-row + scale[O] ------------------- */
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int S, int I, int O){
+#ifdef __AVX2__
+    if(S>=2&&!(I&7)){
+        /* Several rows (a prompt step): 16 outputs a task, their rows 16 at a time (the
+         * tile's inputs stay in L2 where the loop below rereads all of them for every
+         * output), each 8 weights widened once for 8 rows. A row's arithmetic is the
+         * one-row loop's below: the same fused adds into 8 lanes, the same hsum256, the
+         * same scale -- so the same bytes. */
+        const int nob=(O+15)/16;
+        #pragma omp parallel for schedule(static)
+        for(int ob=0;ob<nob;ob++){
+            const int oe=ob*16+16<O?ob*16+16:O;
+            for(int s0=0;s0<S;s0+=16){
+                const int se=s0+16<S?s0+16:S;
+                for(int o=ob*16;o<oe;o++){
+                    const int8_t *w=q+(int64_t)o*I; const float sc=scale[o];
+                    for(int s1=s0;s1<se;s1+=8){
+                        const int ns=se-s1<8?se-s1:8;
+                        const float *xr[8];
+                        for(int r=0;r<8;r++) xr[r]=x+(int64_t)(s1+(r<ns?r:ns-1))*I;   /* spare: the last row again */
+                        __m256 acc[8];
+                        for(int r=0;r<8;r++) acc[r]=_mm256_setzero_ps();
+                        for(int i=0;i<I;i+=8){
+                            __m256 wv=_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)(w+i))));
+                            for(int r=0;r<8;r++) acc[r]=_mm256_fmadd_ps(_mm256_loadu_ps(xr[r]+i),wv,acc[r]);
+                        }
+                        for(int r=0;r<ns;r++) y[(int64_t)(s1+r)*O+o]=hsum256(acc[r])*sc;
+                    }
+                }
+            }
+        }
+        return;
+    }
+#endif
     #pragma omp parallel for schedule(static)
     for (int o=0;o<O;o++){ const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
         for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; int i=0;

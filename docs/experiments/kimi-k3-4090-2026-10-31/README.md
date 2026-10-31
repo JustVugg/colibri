@@ -146,4 +146,15 @@ arithmetic: the gated MLA's scores 16 positions at a time (`k3_mla_scores`), kv_
 The launcher now takes 2,048-token prompt steps (`-Chunk`, at most 4,096): the RAM budget
 reserves 1.4 MB a row past 512 (2.1 GB at 2,048, one expert slot a layer less), and a
 long prompt reads its experts a quarter as often.
+## Runs 32-40: KDA by step, int8 and f32 rows, the GPU's tree
+
+| run | what | result |
+|---|---|---|
+| run32-34 | KDA's conv channel by channel and heads head by head over a step's tokens | the logits the same bytes; the same text; decode 0.79 tok/s; the long prompt 626.0 s (KDA 90.3 -> 86.0) |
+| run35-37 | + `matmul_q`'s rows 16 at a time; coli_cuda.dll's tiled kernel ending its tree in warp shuffles | the same bytes and text; 616.5 s (the gated MLA 83.6 -> 72.1, the GPU's calls 40.4 -> 36.4 s) |
+| run38-40 | + matmul_f32.h's `matmul` over rows the same way | the same bytes and text; **613 s** (4.30 tok/s): attention 151.9 (KDA 79.8: on the CPU f32 projections 3.8, conv 11.2, heads 17.4; MLA 72.1), MoE 458.0, the GPU's calls 36.3 s |
+
+`matmul_f32.h` and `quant.h` serve other engines too: MiMo's tiny model (`tools/make_mimo_tiny.py`,
+`MIMO_LOGITS`, steps of 1 and 40 rows) gives the same logits with these headers as with the
+commit before, and `tests/mimo_tiny_harness.py` passes.
 

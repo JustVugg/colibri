@@ -285,6 +285,7 @@ typedef struct {
      * experts, the routed experts' waves (t_eload is its waits) */
     double t_route, t_lat, t_shared, t_wave; uint64_t n_wave;
     double t_mla;                         /* t_attn's gated MLA layers (the rest: KDA's) */
+    double t_kda_f32, t_kda_conv, t_kda_heads;   /* KDA's f32 projections, a step's conv and heads passes */
     double *t_wait_li; uint64_t *n_dem_li;  /* K3_WAIT_LAYERS: a decode's waits and demand reads, by layer */
     /* K3_PREFETCH: the next MoE layer's experts predicted after a decode step's attention
      * (k3_prefetch): the rows a prediction waits for, the layer it is for, what it marked */
@@ -1659,6 +1660,92 @@ static void val_dump(const char *name, const float *v, int n){
 
 /* ---------- KDA layer (chunk of C tokens; projections batched, recurrence
  * sequential per token, AVX2 on the state sweeps) ---------- */
+/* One KDA head's step for token t of a step (its state, then its normed and gated output):
+ * one function for both loop orders below, so both run the same machine code. */
+static __attribute__((noinline)) void k3_kda_head(Model *m, const Kda *a, int li, int t, int h,
+        const float *qt, const float *kt, const float *tv, const float *rgt, const float *bt,
+        const float *gpt, float *ont, float qscale){
+    const Cfg *c=&m->c;
+    const int P=c->kda_proj, H=c->kda_heads, hd=c->kda_hd, K=c->conv_k;
+    (void)P; (void)H; (void)K;
+    const float *qh=qt+(int64_t)h*hd, *kh=kt+(int64_t)h*hd, *vh=tv+(int64_t)h*hd;
+    float qn[512], kn[512], alpha[512], kS[512], vt[512], oh[512];
+    {
+    float sq=0,sk=0;
+    for(int i=0;i<hd;i++){ sq+=qh[i]*qh[i]; sk+=kh[i]*kh[i]; }
+    sq=1.f/sqrtf(sq+1e-6f); sk=1.f/sqrtf(sk+1e-6f);
+    for(int i=0;i<hd;i++){ qn[i]=qh[i]*sq*qscale; kn[i]=kh[i]*sk; }
+    }
+    for(int i=0;i<hd;i++){
+        float z=rgt[(int64_t)h*hd+i]+a->dt[(int64_t)h*hd+i];
+        alpha[i]=exp_f(c->gate_lb*sigmoidf_(a->A[h]*z));
+    }
+    float beta=sigmoidf_(bt[h]);
+    float *S=(m->mux_rows?m->mux_rows[t].seq->kstate[li]:m->kstate[li])+(int64_t)h*hd*hd;
+    memset(kS,0,sizeof(kS));
+#ifdef __AVX2__
+    if(!(hd&7)){
+        for(int kk=0;kk<hd;kk++){
+            float *row=S+(int64_t)kk*hd;
+            __m256 al8=_mm256_set1_ps(alpha[kk]), kv8=_mm256_set1_ps(kn[kk]);
+            for(int vv=0;vv<hd;vv+=8){
+                __m256 r=_mm256_mul_ps(_mm256_loadu_ps(row+vv),al8);
+                _mm256_storeu_ps(row+vv,r);
+                _mm256_storeu_ps(kS+vv,_mm256_fmadd_ps(kv8,r,_mm256_loadu_ps(kS+vv)));
+            }
+        }
+        for(int vv=0;vv<hd;vv++) vt[vv]=(vh[vv]-kS[vv])*beta;
+        memset(oh,0,sizeof(oh));
+        for(int kk=0;kk<hd;kk++){
+            float *row=S+(int64_t)kk*hd;
+            __m256 kv8=_mm256_set1_ps(kn[kk]), qq8=_mm256_set1_ps(qn[kk]);
+            for(int vv=0;vv<hd;vv+=8){
+                __m256 r=_mm256_fmadd_ps(kv8,_mm256_loadu_ps(vt+vv),_mm256_loadu_ps(row+vv));
+                _mm256_storeu_ps(row+vv,r);
+                _mm256_storeu_ps(oh+vv,_mm256_fmadd_ps(qq8,r,_mm256_loadu_ps(oh+vv)));
+            }
+        }
+    } else {
+#endif
+    for(int kk=0;kk<hd;kk++){
+        float *row=S+(int64_t)kk*hd; float al=alpha[kk], kv=kn[kk];
+        for(int vv=0;vv<hd;vv++){ row[vv]*=al; kS[vv]+=kv*row[vv]; }
+    }
+    for(int vv=0;vv<hd;vv++) vt[vv]=(vh[vv]-kS[vv])*beta;
+    memset(oh,0,sizeof(oh));
+    for(int kk=0;kk<hd;kk++){
+        float *row=S+(int64_t)kk*hd; float kv=kn[kk], qq=qn[kk];
+        for(int vv=0;vv<hd;vv++){ row[vv]+=kv*vt[vv]; oh[vv]+=qq*row[vv]; }
+    }
+#ifdef __AVX2__
+    }
+#endif
+    if(g_k3_dfp && li==0 && t==0 && h==0){
+      fprintf(g_k3_dfp,"[CPU_DIMS] P=%d H=%d hd=%d K=%d\n",P,H,hd,K);
+      fprintf(g_k3_dfp,"[CPU_QTRAW] h0 d0-%d (conv_silu out):\n",hd-1);
+      for(int i=0;i<hd;i++) fprintf(g_k3_dfp,"  %d %.12g\n",i,qh[i]);
+      fprintf(g_k3_dfp,"[CPU_VTRAW] h0 d0-%d (conv_silu out):\n",hd-1);
+      for(int i=0;i<hd;i++) fprintf(g_k3_dfp,"  %d %.12g\n",i,vh[i]);
+      fprintf(g_k3_dfp,"[CPU_QN] h0 d0-%d (l2_norm q):\n",hd-1);
+      for(int i=0;i<hd;i++) fprintf(g_k3_dfp,"  %d %.12g\n",i,qn[i]);
+      fprintf(g_k3_dfp,"[CPU_KN] h0 d0-%d (l2_norm k):\n",hd-1);
+      for(int i=0;i<hd;i++) fprintf(g_k3_dfp,"  %d %.12g\n",i,kn[i]);
+      fprintf(g_k3_dfp,"[CPU_OH] h0 d0-%d (state out):\n",hd-1);
+      for(int i=0;i<hd;i++) fprintf(g_k3_dfp,"  %d %.12g\n",i,oh[i]);
+      // Compute ratio oh[i]/(vh[i]*beta)
+      fprintf(g_k3_dfp,"\n[CPU_DOT_RATIO] oh[i] / (vh[i] * beta):\n");
+      for(int i=0;i<hd;i++){
+        float r = oh[i] / (vh[i] * beta);
+        fprintf(g_k3_dfp,"  %d %.12g\n",i,r);
+      }
+      fflush(g_k3_dfp);
+    }
+    /* per-head RMSNorm * sigmoid(full-rank gate) */
+    double ms=0; for(int vv=0;vv<hd;vv++) ms+=(double)oh[vv]*oh[vv];
+    float r=1.f/sqrtf((float)(ms/hd)+c->eps);
+    float *dst=ont+(int64_t)h*hd;
+    for(int vv=0;vv<hd;vv++) dst[vv]=oh[vv]*r*a->onw[vv]*sigmoidf_(gpt[(int64_t)h*hd+vv]);
+}
 static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float *out){
     Cfg *c=&m->c; Kda *a=&l->a;
     int P=c->kda_proj, H=c->kda_heads, hd=c->kda_hd, K=c->conv_k;
@@ -1681,14 +1768,51 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
         fflush(stderr); } }
     w_matmul(q,x,&a->q,C); w_matmul(k,x,&a->k,C); w_matmul(v,x,&a->v,C);
     w_matmul(gp,x,&a->g,C);
+    double tf=now_s();
     if(!K3_F32_DEV(a->vk_fa,t1,x,C,c->hidden,c->kda_hd)){
         K3_F32_NEED(a->fa); k3_matmul_f32((void*)&a->metal_fa, t1, x, a->fa, C, c->hidden, c->kda_hd); }
     if(!K3_F32_DEV(a->vk_fb,graw,t1,C,c->kda_hd,P)){
         K3_F32_NEED(a->fb); k3_matmul_f32((void*)&a->metal_fb, graw, t1, a->fb, C, c->kda_hd, P); }
     if(!K3_F32_DEV(a->vk_bp,braw,x,C,c->hidden,H)){
         K3_F32_NEED(a->bp); k3_matmul_f32((void*)&a->metal_bp, braw, x, a->bp, C, c->hidden, H); }
+    m->t_kda_f32+=now_s()-tf;
     float qscale=1.f/sqrtf((float)hd);
-    for(int t=0;t<C;t++){
+    /* A prompt step of one sequence: every conv channel over the step's tokens, then
+     * every head over them -- one parallel region each where the loop below has four
+     * a token, a head's state staying in its worker's cache. Each channel and head
+     * does what it did, in token order: the conv's taps as fused adds in order (what
+     * the loop below compiles to for up to 7 taps), the head's step k3_kda_head. */
+    int by_step=C>1&&!m->mux_rows&&K<=7;
+#ifdef COLI_METAL
+    if(g_k3_metal) by_step=0;
+#endif
+    if(by_step){
+        double tc=now_s();
+        float *wins[3]={m->cwq[li],m->cwk[li],m->cwv[li]}, *vecs[3]={q,k,v};
+        const float *taps[3]={a->conv_q,a->conv_k,a->conv_v};
+        #pragma omp parallel for schedule(static)
+        for(int d=0;d<P;d++)
+            for(int w2=0;w2<3;w2++){
+                float *wd=wins[w2]+(int64_t)d*K; const float *cd=taps[w2]+(int64_t)d*K;
+                for(int t=0;t<C;t++){
+                    float *val=vecs[w2]+(int64_t)t*P+d;
+                    for(int j=0;j<K-1;j++) wd[j]=wd[j+1];
+                    wd[K-1]=*val;
+                    float acc=0;
+                    for(int j=0;j<K;j++) acc=fmaf(cd[j],wd[j],acc);
+                    *val=siluf_(acc);
+                }
+            }
+        m->t_kda_conv+=now_s()-tc;
+        tc=now_s();
+        #pragma omp parallel for schedule(static)
+        for(int h=0;h<H;h++)
+            for(int t=0;t<C;t++)
+                k3_kda_head(m,a,li,t,h,q+(int64_t)t*P,k+(int64_t)t*P,v+(int64_t)t*P,graw+(int64_t)t*P,
+                            braw+(int64_t)t*H,gp+(int64_t)t*P,on+(int64_t)t*P,qscale);
+        m->t_kda_heads+=now_s()-tc;
+    }
+    else for(int t=0;t<C;t++){
         float *qt=q+(int64_t)t*P, *kt=k+(int64_t)t*P, *tv=v+(int64_t)t*P;
         float *gpt=gp+(int64_t)t*P, *ont=on+(int64_t)t*P;
         const float *rgt=graw+(int64_t)t*P, *bt=braw+(int64_t)t*H;
@@ -1765,85 +1889,8 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
             }
         }
         #pragma omp parallel for schedule(static)
-        for(int h=0;h<H;h++){
-            const float *qh=qt+(int64_t)h*hd, *kh=kt+(int64_t)h*hd, *vh=tv+(int64_t)h*hd;
-            float qn[512], kn[512], alpha[512], kS[512], vt[512], oh[512];
-            {
-            float sq=0,sk=0;
-            for(int i=0;i<hd;i++){ sq+=qh[i]*qh[i]; sk+=kh[i]*kh[i]; }
-            sq=1.f/sqrtf(sq+1e-6f); sk=1.f/sqrtf(sk+1e-6f);
-            for(int i=0;i<hd;i++){ qn[i]=qh[i]*sq*qscale; kn[i]=kh[i]*sk; }
-            }
-            for(int i=0;i<hd;i++){
-                float z=rgt[(int64_t)h*hd+i]+a->dt[(int64_t)h*hd+i];
-                alpha[i]=exp_f(c->gate_lb*sigmoidf_(a->A[h]*z));
-            }
-            float beta=sigmoidf_(bt[h]);
-            float *S=(m->mux_rows?m->mux_rows[t].seq->kstate[li]:m->kstate[li])+(int64_t)h*hd*hd;
-            memset(kS,0,sizeof(kS));
-#ifdef __AVX2__
-            if(!(hd&7)){
-                for(int kk=0;kk<hd;kk++){
-                    float *row=S+(int64_t)kk*hd;
-                    __m256 al8=_mm256_set1_ps(alpha[kk]), kv8=_mm256_set1_ps(kn[kk]);
-                    for(int vv=0;vv<hd;vv+=8){
-                        __m256 r=_mm256_mul_ps(_mm256_loadu_ps(row+vv),al8);
-                        _mm256_storeu_ps(row+vv,r);
-                        _mm256_storeu_ps(kS+vv,_mm256_fmadd_ps(kv8,r,_mm256_loadu_ps(kS+vv)));
-                    }
-                }
-                for(int vv=0;vv<hd;vv++) vt[vv]=(vh[vv]-kS[vv])*beta;
-                memset(oh,0,sizeof(oh));
-                for(int kk=0;kk<hd;kk++){
-                    float *row=S+(int64_t)kk*hd;
-                    __m256 kv8=_mm256_set1_ps(kn[kk]), qq8=_mm256_set1_ps(qn[kk]);
-                    for(int vv=0;vv<hd;vv+=8){
-                        __m256 r=_mm256_fmadd_ps(kv8,_mm256_loadu_ps(vt+vv),_mm256_loadu_ps(row+vv));
-                        _mm256_storeu_ps(row+vv,r);
-                        _mm256_storeu_ps(oh+vv,_mm256_fmadd_ps(qq8,r,_mm256_loadu_ps(oh+vv)));
-                    }
-                }
-            } else {
-#endif
-            for(int kk=0;kk<hd;kk++){
-                float *row=S+(int64_t)kk*hd; float al=alpha[kk], kv=kn[kk];
-                for(int vv=0;vv<hd;vv++){ row[vv]*=al; kS[vv]+=kv*row[vv]; }
-            }
-            for(int vv=0;vv<hd;vv++) vt[vv]=(vh[vv]-kS[vv])*beta;
-            memset(oh,0,sizeof(oh));
-            for(int kk=0;kk<hd;kk++){
-                float *row=S+(int64_t)kk*hd; float kv=kn[kk], qq=qn[kk];
-                for(int vv=0;vv<hd;vv++){ row[vv]+=kv*vt[vv]; oh[vv]+=qq*row[vv]; }
-            }
-#ifdef __AVX2__
-            }
-#endif
-            if(g_k3_dfp && li==0 && t==0 && h==0){
-              fprintf(g_k3_dfp,"[CPU_DIMS] P=%d H=%d hd=%d K=%d\n",P,H,hd,K);
-              fprintf(g_k3_dfp,"[CPU_QTRAW] h0 d0-%d (conv_silu out):\n",hd-1);
-              for(int i=0;i<hd;i++) fprintf(g_k3_dfp,"  %d %.12g\n",i,qh[i]);
-              fprintf(g_k3_dfp,"[CPU_VTRAW] h0 d0-%d (conv_silu out):\n",hd-1);
-              for(int i=0;i<hd;i++) fprintf(g_k3_dfp,"  %d %.12g\n",i,vh[i]);
-              fprintf(g_k3_dfp,"[CPU_QN] h0 d0-%d (l2_norm q):\n",hd-1);
-              for(int i=0;i<hd;i++) fprintf(g_k3_dfp,"  %d %.12g\n",i,qn[i]);
-              fprintf(g_k3_dfp,"[CPU_KN] h0 d0-%d (l2_norm k):\n",hd-1);
-              for(int i=0;i<hd;i++) fprintf(g_k3_dfp,"  %d %.12g\n",i,kn[i]);
-              fprintf(g_k3_dfp,"[CPU_OH] h0 d0-%d (state out):\n",hd-1);
-              for(int i=0;i<hd;i++) fprintf(g_k3_dfp,"  %d %.12g\n",i,oh[i]);
-              // Compute ratio oh[i]/(vh[i]*beta)
-              fprintf(g_k3_dfp,"\n[CPU_DOT_RATIO] oh[i] / (vh[i] * beta):\n");
-              for(int i=0;i<hd;i++){
-                float r = oh[i] / (vh[i] * beta);
-                fprintf(g_k3_dfp,"  %d %.12g\n",i,r);
-              }
-              fflush(g_k3_dfp);
-            }
-            /* per-head RMSNorm * sigmoid(full-rank gate) */
-            double ms=0; for(int vv=0;vv<hd;vv++) ms+=(double)oh[vv]*oh[vv];
-            float r=1.f/sqrtf((float)(ms/hd)+c->eps);
-            float *dst=ont+(int64_t)h*hd;
-            for(int vv=0;vv<hd;vv++) dst[vv]=oh[vv]*r*a->onw[vv]*sigmoidf_(gpt[(int64_t)h*hd+vv]);
-        }
+        for(int h=0;h<H;h++)
+            k3_kda_head(m,a,li,t,h,qt,kt,tv,rgt,bt,gpt,ont,qscale);
     }
     w_matmul(out,on,&a->o,C);
     free(q);free(k);free(v);free(gp);free(on);free(t1);free(graw);free(braw);
@@ -5339,6 +5386,8 @@ int main(int argc, char **argv){
     fprintf(stderr,"[K3] the prompt: attention %.1fs (KDA %.1f, MLA %.1f), MoE %.1fs (router and reads issued %.1f, "
             "latent %.1f, shared %.1f, routed experts computed %.1f, waiting for reads %.1f); %.0f GB read\n",
             m.t_attn,m.t_attn-m.t_mla,m.t_mla,m.t_moe,m.t_route,m.t_lat,m.t_shared,m.t_wave,m.t_eload,m.ebytes/1e9);
+    fprintf(stderr,"[K3] the prompt's KDA on the CPU: f32 projections %.1fs, conv %.1fs, heads %.1fs\n",
+            m.t_kda_f32,m.t_kda_conv,m.t_kda_heads);
 #ifdef COLI_CUDA
     k3_cuda_report("prompt");
 #endif

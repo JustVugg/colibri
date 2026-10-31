@@ -1795,10 +1795,11 @@ static int f8_warp_mode(void) {
  * quant_matmul reads every weight once per row; this reads it once per TS rows. */
 #define QMT_TO 8
 #define QMT_TS 8
+static_assert(QMT_TS == 256 / 32 && QMT_TO % 2 == 0, "warp b reduces row b, two outputs a round");
 __global__ static void __launch_bounds__(256) quant_matmul_tiled(float *y, const float *x,
         const void *weights, const float *scales, int fmt, int S, int I, int O,
         size_t rb, int gs, int ng) {
-    __shared__ float red[QMT_TS][256];
+    __shared__ float red[2][QMT_TS][256];   /* two outputs' partial sums a round */
     const int t = threadIdx.x, o0 = blockIdx.x * QMT_TO, s0 = blockIdx.y * QMT_TS;
     const uint8_t *wb = static_cast<const uint8_t *>(weights);
     float acc[QMT_TO][QMT_TS];
@@ -1832,19 +1833,38 @@ __global__ static void __launch_bounds__(256) quant_matmul_tiled(float *y, const
             }
         }
     }
-    for (int a = 0; a < no; a++) {
+    /* quant_matmul's tree, two outputs a round: the levels of 128, 64 and 32 in shared
+     * memory, those of 16 to 1 within warp b for row b (the same pairs added) */
+    const int w = t >> 5, lane = t & 31;
 #pragma unroll
-        for (int b = 0; b < QMT_TS; b++) red[b][t] = acc[a][b];
+    for (int a0 = 0; a0 < QMT_TO; a0 += 2) {
+        if (a0 >= no) break;
+#pragma unroll
+        for (int q = 0; q < 2; q++)
+#pragma unroll
+            for (int b = 0; b < QMT_TS; b++) red[q][b][t] = acc[a0 + q][b];
         __syncthreads();
-        for (int n = 128; n; n >>= 1) {
+#pragma unroll
+        for (int n = 128; n >= 32; n >>= 1) {
             if (t < n)
 #pragma unroll
-                for (int b = 0; b < QMT_TS; b++) red[b][t] += red[b][t + n];
+                for (int q = 0; q < 2; q++)
+#pragma unroll
+                    for (int b = 0; b < QMT_TS; b++) red[q][b][t] += red[q][b][t + n];
             __syncthreads();
         }
-        if (t < ns) {
-            int o = o0 + a;
-            y[(size_t)(s0 + t) * O + o] = fmt == 1 ? red[t][0] * scales[o] : red[t][0];
+#pragma unroll
+        for (int q = 0; q < 2; q++) {
+            float v = red[q][w][lane];
+            v += __shfl_down_sync(0xffffffffu, v, 16);
+            v += __shfl_down_sync(0xffffffffu, v, 8);
+            v += __shfl_down_sync(0xffffffffu, v, 4);
+            v += __shfl_down_sync(0xffffffffu, v, 2);
+            v += __shfl_down_sync(0xffffffffu, v, 1);
+            if (!lane && w < ns && a0 + q < no) {
+                int o = o0 + a0 + q;
+                y[(size_t)(s0 + w) * O + o] = fmt == 1 ? v * scales[o] : v;
+            }
         }
         __syncthreads();
     }
