@@ -375,6 +375,19 @@ def _qwen36_geometry(config, context, _model_dir):
 
 _QWEN38_PREFILL_BATCH_ROWS = 32
 _QWEN38_PREFILL_WORKSPACE_BYTES = 64 << 20
+# serve reads a prompt in segments of this many rows at most (q38_serve_prefill:
+# coli_prompt_segment_rows, 8192 with a dense chain, 2048 without), so a forward's
+# row buffers hold one segment, not the context. COLI_PROMPT_SEGMENT sets both.
+_QWEN38_PROMPT_SEGMENT_ROWS = 8192
+
+
+def _qwen38_prompt_rows(context):
+    """The most rows one forward holds: the context, or serve's prompt segment."""
+    try:
+        segment = int(os.environ.get("COLI_PROMPT_SEGMENT", "") or 0)
+    except ValueError:
+        segment = 0
+    return min(context, segment if segment > 0 else _QWEN38_PROMPT_SEGMENT_ROWS)
 
 
 def _qwen38_bounded_prefill(rows, fixed_bytes, row_bytes):
@@ -511,7 +524,10 @@ def _qwen38_geometry(config, context, _model_dir):
     qsa_fixed = (index_q * index_dim + index_dim + index_budget + index_ratio - 1 +
                  max(2 * (context // index_ratio),
                      head_dim + index_budget + index_ratio - 1))
-    workspace = (context * max(gated_residual_row, qsa_row, ple_row) +
+    # The outer rows of one forward: serve's prompt segment, not the whole context (a
+    # 262144-token context priced as one forward held 38 GB that serve never takes).
+    rows = _qwen38_prompt_rows(context)
+    workspace = (rows * max(gated_residual_row, qsa_row, ple_row) +
                  max(moe_fixed, gdn_fixed, ple_fixed, qsa_fixed)) * 4
 
     # q38_moe_prefill() and q38_deltanet() batch only a bounded row chunk.
@@ -523,7 +539,7 @@ def _qwen38_geometry(config, context, _model_dir):
         topk * moe_assignment_bytes
     moe_fixed_bytes = experts * (4 * 4 + 8) + 4
     moe_rows = _qwen38_bounded_prefill(
-        context, moe_fixed_bytes, moe_row_bytes)
+        rows, moe_fixed_bytes, moe_row_bytes)
     moe_chunk_bytes = moe_fixed_bytes + moe_rows * moe_row_bytes
 
     delta_row_bytes = (gdn_conv_width + 2 * value_heads * value_dim +
@@ -532,9 +548,9 @@ def _qwen38_geometry(config, context, _model_dir):
                          2 * value_heads * key_dim +
                          value_heads * value_dim) * 4
     delta_rows = _qwen38_bounded_prefill(
-        context, delta_fixed_bytes, delta_row_bytes)
+        rows, delta_fixed_bytes, delta_row_bytes)
     delta_chunk_bytes = delta_fixed_bytes + delta_rows * delta_row_bytes
-    prefill_workspace = context * base_row * 4 + max(
+    prefill_workspace = rows * base_row * 4 + max(
         moe_chunk_bytes, delta_chunk_bytes)
     workspace = max(workspace, prefill_workspace)
     return PlannerGeometry(context_state, fixed, workspace,

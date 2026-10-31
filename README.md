@@ -570,6 +570,7 @@ streamed answer, the request's HTTP included; the better of two runs, tok/s.
 | LFM3-VL-2B Q4_K_M | 12,317 | 235.1 | 8,174 | 214.1 | 286.5 | 34.5 |
 | OLMoE-1B-7B-0125-Instruct Q4_K_M | 10,418 | 354.6 | 6,867 | 299.4 | 279.9 | 47.4 |
 | LFM3-VL-2B F16 | 11,524 | 103.4 | 7,767 | 99.3 | 49.7 | 6.4 |
+| Qwen3.8-Flash-Next IQ2_XS (68 GB: the experts the card cannot hold stay in RAM) | 217.1 | 51.4 | 214.3 | 50.6 | 38.3 | 9.3 |
 
 Quality is measured, not assumed: the int4 container's cost and the
 quantization ablations are in

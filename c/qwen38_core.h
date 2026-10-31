@@ -15,6 +15,7 @@
 #ifndef COLI_QWEN38_CORE_H
 #define COLI_QWEN38_CORE_H
 #include "kv_prefix.h"
+#include "kv16.h"         /* Q38_KV=f16: K and V rounded to float16 (q38_kv16) */
 #include "prompt_break.h"   /* a served prompt that a STOP or CANCEL stops between two layers */
 #include "spec_draft.h"   /* prompt-lookup drafts and the gate that decides when drafting pays */
 #include "draft_vocab.h"  /* the tokens the MTP head scores for a draft (Q38_MTP_VOCAB) */
@@ -3224,6 +3225,21 @@ static int q38_block_desc(const void *aa,const void *bb){
     if(a->score>b->score)return -1;if(a->score<b->score)return 1;return a->block-b->block;
 }
 
+/* K and V rounded to float16 where they are made (kv16.h): the CPU's rows here, the CUDA and
+ * Vulkan chains' (CC_EW_F16, VKC_EW_F16), so every backend holds the same values; the host's
+ * caches keep them as floats and the CUDA chain's mirrors as halves (cc_attn_h: half the device
+ * memory a context takes, the rest for the experts). Q38_KV=f32 keeps float32, f16 rounds;
+ * unset, a served model rounds and an argv run (its .json references are float32) does not.
+ * The index keys stay float32: they choose the positions. */
+static int g_q38_kv16=-1;
+static inline int q38_kv16(void){
+    if(g_q38_kv16<0){
+        const char *e=getenv("Q38_KV"),*s=getenv("SERVE");
+        g_q38_kv16=e&&*e?strcmp(e,"f32")!=0:(s&&s[0]=='1');
+    }
+    return g_q38_kv16;
+}
+
 static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int pos_base,float *out) {
     Cfg *c=&m->c;int H=c->hidden,QH=c->q_heads,KVH=c->kv_heads,D=c->head_dim;
     float theta=layer<c->layers?c->theta:c->mtp_theta;   /* the MTP head has its own RoPE base */
@@ -3243,9 +3259,11 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
         float *Kl=mr?mr[s].seq->K[layer]:m->K[layer],*Vl=mr?mr[s].seq->V[layer]:m->V[layer];
         float *IKl=mr?mr[s].seq->IK[layer]:m->IK[layer];
         for(int h=0;h<KVH;h++){
-            float *kh=kp+(int64_t)s*KVH*D+(int64_t)h*D;q38_rms0(kh,kh,l->kn,D,c->eps);q38_rope(kh,D,c->rotary_dim,pos,theta);
+            float *kh=kp+(int64_t)s*KVH*D+(int64_t)h*D,*vh=vp+(int64_t)s*KVH*D+(int64_t)h*D;
+            q38_rms0(kh,kh,l->kn,D,c->eps);q38_rope(kh,D,c->rotary_dim,pos,theta);
+            if(q38_kv16()){kv16_round(kh,D);kv16_round(vh,D);}
             memcpy(Kl+((int64_t)h*m->kv_cap+pos)*D,kh,(size_t)D*sizeof(float));
-            memcpy(Vl+((int64_t)h*m->kv_cap+pos)*D,vp+(int64_t)s*KVH*D+(int64_t)h*D,(size_t)D*sizeof(float));
+            memcpy(Vl+((int64_t)h*m->kv_cap+pos)*D,vh,(size_t)D*sizeof(float));
         }
         memcpy(IKl+(int64_t)pos*ID,ip+(int64_t)s*(IQ+1)*ID+(int64_t)IQ*ID,(size_t)ID*sizeof(float));
     }

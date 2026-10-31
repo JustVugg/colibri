@@ -33,7 +33,7 @@ of them: a turn then reuses its own conversation's prompt after the device held 
 that continues the one before it exactly (its prompt, what it wrote, two bytes more) and
 asks for enough tokens to grow the cache: the state is reused while the KV mirrors are
 made again from the host's rows, which then have to hold what the device wrote.
-The KV cache stays float32 here (Q36_KV=f32, KV16=0): the engines' default float16 rounds a
+The KV cache stays float32 here (Q36_KV=f32, Q38_KV=f32, KV16=0): the engines' default float16 rounds a
 value the CPU and the device computed a few bits apart into two halves an ulp apart, about
 1e-3 in a logprob. CHAIN_SERVE_KV16=1 keeps the float16 cache (the device rounds its rows as
 the host does) and compares the logprobs within 5e-3; token ids and texts stay exact.
@@ -48,7 +48,7 @@ READY = b"\x01\x01READY\x01\x01"
 
 
 def session(engine, snap, extra, chain):
-    kv = {} if KV16 else {"Q36_KV": "f32", "KV16": "0"}   # float16 only when asked (the docstring says why)
+    kv = {} if KV16 else {"Q36_KV": "f32", "Q38_KV": "f32", "KV16": "0"}   # float16 only when asked (the docstring says why)
     env = dict(os.environ, SNAP=snap, SERVE="1", COLI_PREFIX_LOG="1", Q38_PREFIX_LOG="1", **kv, **extra)
     if chain and os.environ.get("CHAIN_SERVE_BACKEND") == "cuda":   # the CUDA chain (a CUDA=1 build)
         env.update(COLI_VULKAN="0", COLI_CUDA="1", COLI_USAGE=os.path.abspath("chain-serve.usage"))

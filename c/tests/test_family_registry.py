@@ -296,6 +296,18 @@ class FamilyRegistryTest(unittest.TestCase):
         expected_workspace = max(legacy_workspace, batched_workspace)
         self.assertEqual(geometry.workspace_bytes, expected_workspace)
 
+        # serve reads a prompt in segments (q38_serve_prefill): past one segment's rows the
+        # forward's buffers stop growing with the context; the K/V and index rows do not
+        segment = planner_geometry(resolved, 8192)
+        full = planner_geometry(resolved, 262144)
+        self.assertEqual(full.context_state_bytes,
+                         12 * 262144 * (2 * 2 * 256 + 128) * 4 + 262144 * 4)
+        pooled = 4 * (2 * (262144 // 4) - 2 * (8192 // 4))   # the selection's pooled scores
+        self.assertLessEqual(full.workspace_bytes, segment.workspace_bytes + pooled)
+        self.assertLess(full.workspace_bytes, 1_500_000_000)
+        with mock.patch.dict("os.environ", {"COLI_PROMPT_SEGMENT": "2048"}):
+            self.assertLess(planner_geometry(resolved, 262144).workspace_bytes, full.workspace_bytes)
+
         family = resolved.descriptor
         invalid = {
             "ngram_size": 2,

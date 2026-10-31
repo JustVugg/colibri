@@ -48,6 +48,7 @@
 
 typedef struct {
     int ok, failed, rows, cap, dev;
+    int kvh;                          /* the K/V mirrors in float16 (q38cc_kvh) */
     int nl, head;                     /* every layer, and the final mixer and lm_head */
     size_t prm_floats;
     CcBuf *prm;
@@ -249,6 +250,9 @@ static size_t q38cc_prompt_stage_bytes(Model *m) {
     if (n > (size_t)m->c.experts) n = (size_t)m->c.experts;
     return n * st;
 }
+/* the K/V mirrors in float16: the rows rounded to it (q38_kv16) and a backend that reads such a
+ * cache (cc_attn_h); a mirror holds their values exactly, in half the device memory */
+static int q38cc_kvh(void) { return q38_kv16() && cc_kvh_ready(); }
 static size_t q38cc_reserve_bytes(Model *m) {
     Cfg *c = &m->c; int L = c->layers, n_attn = 0;
     for (int i = 0; i < L; i++) n_attn += c->is_attn[i] != 0;
@@ -256,7 +260,7 @@ static size_t q38cc_reserve_bytes(Model *m) {
     if (c->max_positions > 0 && ctx > c->max_positions) ctx = c->max_positions;
     size_t F = 4, cap = (size_t)(ctx > 0 ? ctx : 1), kvo = (size_t)c->kv_heads * c->head_dim, idx = (size_t)c->idx_dim;
     size_t nb = cap / (c->idx_ratio > 0 ? c->idx_ratio : 1) + 1, b = 0;
-    b += (size_t)n_attn * ((2 * kvo + idx) * cap + idx * nb) * F;
+    b += (size_t)n_attn * (2 * kvo * cap * (q38cc_kvh() ? 2 : F) + (idx * cap + idx * nb) * F);
     b += (size_t)(L - n_attn) * 2 * ((size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim + (size_t)c->dn_conv_dim * (c->dn_convk - 1)) * F;
     size_t W = c->hc_width, H = c->hidden, QH = c->q_heads, D = c->head_dim, V = (size_t)c->dn_vheads * c->dn_vdim, E = c->experts;
     size_t SI = c->shared_inter, ipw = (size_t)(c->idx_qheads + 1) * c->idx_dim, Ep = (size_t)c->ngram_heads * c->ngram_head_dim;
@@ -396,6 +400,11 @@ static Q38CChain *q38cc_setup(Model *m, int mux_slots) {
     if (ch->dev < 0 && m->lm_head.gpu) { int d = -1; if (qt_dense_tensor(m->lm_head.gpu - 1, &d)) ch->dev = d; }
     if (ch->dev < 0) { fprintf(stderr, "[chain] qwen38: the tier placed no trunk matrix (Q38_TRUNK_GPU); the chain stays off\n"); return NULL; }
     if (!cc_init(ch->dev)) { fprintf(stderr, "[chain] qwen38: the chain's context on device %d did not come up\n", ch->dev); return NULL; }
+    ch->kvh = q38cc_kvh();
+    if (q38_kv16() && !ch->kvh && !cc_kv16_ready()) {
+        fprintf(stderr, "[chain] qwen38: the CUDA backend neither holds a float16 cache nor rounds to one (Q38_KV=f16); the chain stays off\n");
+        return NULL;
+    }
     size_t own = 0, tier = 0;
     for (int i = 0; i < L; i++) {
         Q38Weight *w[Q38CC_MATS]; const char *nm[Q38CC_MATS]; int n = q38cc_mats(m, i, w, nm);
@@ -485,6 +494,17 @@ static int q38cc_bufs(Q38CChain *ch, Model *m, int rows) {
         ok = cc_reserve(&ch->gseg, r * W * F, CC_DEV) && cc_reserve(&ch->nseg, r * W * F, CC_DEV);
     return ok;
 }
+/* n of the host's K or V values from src into a mirror at element at (a float16 mirror takes
+ * them as halves: the values the rounding left, exact) */
+static int q38cc_kv_up(const Q38CChain *ch, CcBuf *dst, size_t at, const float *src, size_t n) {
+    if (!ch->kvh) return cc_write(dst, at, src, n * sizeof(float));
+    uint16_t *h = (uint16_t *)malloc(n * sizeof(uint16_t));
+    if (!h) return 0;
+    kv16_pack(h, src, (int64_t)n);
+    int ok = cc_write(dst, at / 2, h, n * sizeof(uint16_t));   /* at even: a head's rows start on whole floats */
+    free(h);
+    return ok;
+}
 /* the K/V, index-key and pooled-key mirrors at the host's capacity */
 static int q38cc_mirror(Q38CChain *ch, Model *m) {
     Cfg *c = &m->c; int kvo = c->kv_heads * c->head_dim;
@@ -494,8 +514,8 @@ static int q38cc_mirror(Q38CChain *ch, Model *m) {
             if (!c->is_attn[i]) continue;
             cc_free(ch->kc[i]); cc_free(ch->vc[i]); cc_free(ch->ik[i]); cc_free(ch->pk[i]);
             ch->kv_valid[i] = ch->pk_valid[i] = 0;
-            ch->kc[i] = cc_buf((size_t)kvo * m->kv_cap * 4, CC_DEV);
-            ch->vc[i] = cc_buf((size_t)kvo * m->kv_cap * 4, CC_DEV);
+            ch->kc[i] = cc_buf((size_t)kvo * m->kv_cap * (ch->kvh ? 2 : 4), CC_DEV);
+            ch->vc[i] = cc_buf((size_t)kvo * m->kv_cap * (ch->kvh ? 2 : 4), CC_DEV);
             ch->ik[i] = cc_buf((size_t)c->idx_dim * m->kv_cap * 4, CC_DEV);
             ch->pk[i] = cc_buf((size_t)c->idx_dim * nbmax * 4, CC_DEV);
             if (!ch->kc[i] || !ch->vc[i] || !ch->ik[i] || !ch->pk[i]) { ch->cap = 0; return 0; }
@@ -664,7 +684,7 @@ static int q38cc_push_state(Q38CChain *ch, Model *m, int pos_base) {
         int t0 = ch->kv_valid[i], n = pos_base - t0;
         for (int h = 0; h < KVH && ok; h++) {
             size_t src = ((size_t)h * m->kv_cap + t0) * D, dst = ((size_t)h * ch->cap + t0) * D;
-            ok = cc_write(ch->kc[i], dst, m->K[i] + src, (size_t)n * D * 4) && cc_write(ch->vc[i], dst, m->V[i] + src, (size_t)n * D * 4);
+            ok = q38cc_kv_up(ch, ch->kc[i], dst, m->K[i] + src, (size_t)n * D) && q38cc_kv_up(ch, ch->vc[i], dst, m->V[i] + src, (size_t)n * D);
         }
         ok = ok && cc_write(ch->ik[i], (size_t)t0 * ID, m->IK[i] + (size_t)t0 * ID, (size_t)n * ID * 4);
         ch->kv_valid[i] = pos_base;
@@ -708,6 +728,10 @@ static int q38cc_attention(Q38CChain *ch, Model *m, Layer *l, int i, int n, int 
         CcRope ri = {n * IQ, IQ, 0, ipw, ID, half, 0, 2 * half};
         ok = cc_rope(ch->k, ch->cs, &rk) && cc_rope(ch->q, ch->cs, &rq) && cc_rope(ch->ip, ch->cs, &ri);
     }
+    if (ok && q38_kv16()) {   /* K and V as every backend keeps them (float16), before anything reads them */
+        CcEw r = {CC_EW_F16, n * kvo, kvo, 0, 0, 0, 0, 0, 0, 0, 0, 1.f};
+        ok = cc_ew(ch->k, ch->k, NULL, NULL, NULL, &r) && cc_ew(ch->v, ch->v, NULL, NULL, NULL, &r);
+    }
     if (!ok) return 0;
     /* the rows into the device caches and the host's */
     CcRegion *rg = malloc(sizeof *rg * (size_t)n * (KVH > 1 ? KVH : 1));
@@ -719,7 +743,8 @@ static int q38cc_attention(Q38CChain *ch, Model *m, Layer *l, int i, int n, int 
         ri[s] = (CcRegion){(size_t)(pb + s) * ID, (size_t)s * ipw + (size_t)IQ * ID, (size_t)ID};
     }
     size_t ko = (size_t)ch->attn_ord[i] * q38cc_kv_stride(ch, c);
-    ok = cc_copy_regions(ch->kc[i], ch->k, rg, n * KVH) && cc_copy_regions(ch->vc[i], ch->v, rg, n * KVH) &&
+    ok = (ch->kvh ? cc_copy_regions_h(ch->kc[i], ch->k, rg, n * KVH) && cc_copy_regions_h(ch->vc[i], ch->v, rg, n * KVH)
+                  : cc_copy_regions(ch->kc[i], ch->k, rg, n * KVH) && cc_copy_regions(ch->vc[i], ch->v, rg, n * KVH)) &&
          cc_copy_regions(ch->ik[i], ch->ip, ri, n) &&
          cc_copy(ch->kvd, ko, ch->k, 0, (size_t)n * kvo) &&
          cc_copy(ch->kvd, ko + (size_t)ch->rows * kvo, ch->v, 0, (size_t)n * kvo);
@@ -743,7 +768,8 @@ static int q38cc_attention(Q38CChain *ch, Model *m, Layer *l, int i, int n, int 
     CcAttn at = {n, QH, KVH, D, pb, ch->cap, 0, qo, 2 * D, D, qo, 2 * D, 1, 0, QH * D, 0, q38cc_selrow(c),
                  1.f / sqrtf((float)D), 0, 0};
     return ok && cc_qsa(ch->ip, NULL, ch->pk[i], NULL, ch->qsc, ch->sel, &ps) &&
-           cc_attn(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, ch->sel, &at) &&
+           (ch->kvh ? cc_attn_h(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, ch->sel, &at)
+                    : cc_attn(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, ch->sel, &at)) &&
            cc_matmul(q38cc_t(ch, &l->o), ch->ctx, 0, ch->blk, 0, n);
 }
 /* ns: the chunk's rows whose state a verify copies (rows 0..ns-1, into slots c0..): the
