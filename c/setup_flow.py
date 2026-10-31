@@ -2033,6 +2033,9 @@ def config_ready(cfg):
 
 
 def cmd_setup(a, ui=None):
+    if a.port is not None and not 1 <= a.port <= 65535:
+        raise SetupError("port must be from 1 to 65535; "
+                         "rerun `coli setup --port PORT`")
     interactive = sys.stdin.isatty() and not a.yes and not a.json
     ui = ui or UI(interactive, quiet=a.json)
     ui.say("colibri setup\n")
