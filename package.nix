@@ -56,7 +56,13 @@ in
 stdenv.mkDerivation {
   pname = "colibri";
   version = colibriVersion;
-  src = ./.;
+
+  # `make install` only reads c/, and doCheck is off, so docs, the frontends and
+  # the test suite stay out of the store and their edits don't trigger rebuilds.
+  src = lib.fileset.toSource {
+    root = ./.;
+    fileset = lib.fileset.difference ./c ./c/tests;
+  };
 
   nativeBuildInputs = [ makeWrapper ];
 
