@@ -1170,6 +1170,7 @@ void coli_v4_engine_detach_session(ColiV4Engine *engine);
 
 #include "tok.h"
 #include "kv_prefix.h"
+#include "park.h"   /* the conditions a short request parks a conversation on (COLI_PARK) */
 
 struct ColiV4Session {
     ColiV4Engine *engine;

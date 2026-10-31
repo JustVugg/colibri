@@ -7186,12 +7186,39 @@ static void pin_save(Model *m, const int *ids, int n, const float *logit){
     fprintf(stderr, "[PIN] scatto a %d token\n", n); fflush(stderr);
 }
 
+/* A saved state back into the Model: the DeltaNet layers' recurrences and conv windows,
+ * the MTP head's pending row. The chains and the card's DeltaNet copy read it from the
+ * host before their next step. */
+static void q36_pin_state_put(Model *m, const Q36PinState *st){
+    Cfg *c = &m->c;
+    size_t nr = q36_rec_cells(c);
+    size_t nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
+    for (int i = 0; i < c->n_layers; i++){
+        if (c->is_attn[i]) continue;
+        if (m->DN_rec[i]  && st->rec[i])  memcpy(m->DN_rec[i],  st->rec[i],  nr * sizeof(float));
+        if (m->DN_conv[i] && st->conv[i]) memcpy(m->DN_conv[i], st->conv[i], nc * sizeof(float));
+    }
+#ifdef COLI_VULKAN
+    q36c_host_wrote(m, 0);   /* the device's copy goes up again before the next chain step */
+#endif
+#ifdef COLI_CUDA
+    q36cc_host_wrote(m, 0);
+#endif
+    dn_gpu_invalidate(m);   /* restored on the host: the card's copy is from another prompt */
+    if (g_q36_mtp.on) {
+        g_q36_mtp.has_pend = st->mtp_valid;
+        if (st->mtp_valid) {
+            memcpy(g_q36_mtp.pend, st->mtp_pend, (size_t)c->hidden * sizeof(float));
+            g_q36_mtp.len = st->mtp_len;
+        }
+        g_q36_mtp.last_n = 0; g_q36_mtp.done_pos = -1;
+    }
+}
+
 /* Se la fotografia e un prefisso del nuovo prompt, la si rimette e si riparte
  * da li. Restituisce quanti token sono gia fatti, 0 se non si applica. */
 static int pin_restore(Model *m, const int *ids, int n){
     Cfg *c = &m->c;
-    size_t nr = q36_rec_cells(c);
-    size_t nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
     g_pin_logit = NULL;
     /* Il piu profondo degli scatti che sia un prefisso stretto di questo
      * prompt. Gli strati di attenzione non stanno nella fotografia: le loro
@@ -7205,26 +7232,7 @@ static int pin_restore(Model *m, const int *ids, int n){
         Q36PinState *st = (Q36PinState *)k->state;
         if (st && kv_prefix_holds(&m->kvp, k->ids, k->len) &&
             q36_ring_holds(m->ring_pos, m->kv_ring, k->len - c->window + 1, k->len)) {   /* and the window's rows in the rings */
-            for (int i = 0; i < c->n_layers; i++){
-                if (c->is_attn[i]) continue;
-                if (m->DN_rec[i]  && st->rec[i])  memcpy(m->DN_rec[i],  st->rec[i],  nr * sizeof(float));
-                if (m->DN_conv[i] && st->conv[i]) memcpy(m->DN_conv[i], st->conv[i], nc * sizeof(float));
-            }
-#ifdef COLI_VULKAN
-            q36c_host_wrote(m, 0);   /* the device's copy goes up again before the next chain step */
-#endif
-#ifdef COLI_CUDA
-            q36cc_host_wrote(m, 0);
-#endif
-            dn_gpu_invalidate(m);   /* restored on the host: the card's copy is from another prompt */
-            if (g_q36_mtp.on) {
-                g_q36_mtp.has_pend = st->mtp_valid;
-                if (st->mtp_valid) {
-                    memcpy(g_q36_mtp.pend, st->mtp_pend, (size_t)c->hidden * sizeof(float));
-                    g_q36_mtp.len = st->mtp_len;
-                }
-                g_q36_mtp.last_n = 0; g_q36_mtp.done_pos = -1;
-            }
+            q36_pin_state_put(m, st);
             m->kv_len = k->len;
             kv_prefix_clear(&m->kvp);
             kv_prefix_record(&m->kvp, k->ids, 0, k->len);
@@ -7266,6 +7274,143 @@ static void q36_prefill_abort(Model *m) {
     m->resident_collecting = 0;
     m->first_step = 1;
     if (m->seen) memset(m->seen, 0, (size_t)m->c.n_layers * m->c.n_experts);
+}
+
+/* A client's short request between two turns of a conversation (Hermes asks for its title
+ * after the first) leaves the conversation after a few tokens and would take the only state
+ * there is: the conversation's next turn then reads every token again (Qwen3.6-35B on the
+ * CPU: 4,325 tokens, 32.1 s, where the turn after it read 25 in 6.6 s). The conversation is
+ * parked instead: its tokens, its DeltaNet state (a pin's copy, the MTP head's pending row)
+ * and the K/V rows the request may write over (a full layer's first rows, a sliding layer's
+ * ring rows, the MTP head's on the host and on the device); the request runs from the start;
+ * when its turn ends the conversation is back as it was, and its next turn reads only what
+ * is new. One conversation at a time (serve_one), a held one of at least Q36_PARK_MIN tokens
+ * (COLI_PARK_MIN sets another), a request shorter than it with what it may write;
+ * COLI_PARK=0 never parks. qwen38.c parks the same way. */
+#define Q36_PARK_MIN 1024
+#define Q36_PARK_GEN 4096                     /* the request's tokens whose rows are kept apart: past them it is not a short one */
+#define Q36_PARK_SPEC Q36_SPEC_ROWS          /* the rows a verify writes past the tokens that stand, and one more */
+static struct { int on, len, kv_len, rows, kv_cap, kv_ring, mtp_rows, mtp_stride; int *fed, *ring_pos;
+                Q36PinState *st; void **K, **V, *mk, *mv; } g_q36_park;
+
+static void q36_park_free(Model *m) {
+    for (int i = 0; i < m->c.n_layers; i++) {
+        if (g_q36_park.K) free(g_q36_park.K[i]);
+        if (g_q36_park.V) free(g_q36_park.V[i]);
+    }
+    free(g_q36_park.K); free(g_q36_park.V); free(g_q36_park.mk); free(g_q36_park.mv);
+    free(g_q36_park.fed); free(g_q36_park.ring_pos);
+    q36_pin_state_free(g_q36_park.st);
+#ifdef COLI_VULKAN
+    q36_mg_park(m, 0, -1);
+#endif
+#ifdef COLI_CUDA
+    q36_mc_park(m, 0, -1);
+#endif
+    memset(&g_q36_park, 0, sizeof g_q36_park);
+}
+/* rows [0, r) of a K or V cache of `rows` rows a head, head by head, between it and a copy */
+static void q36_park_copy(const Cfg *c, void *kv, int rows, void *copy, int r, int out) {
+    const size_t es = q36_kv_es(), D = (size_t)c->k_head_dim, b = (size_t)r * D * es;
+    for (int h = 0; h < c->kv_heads; h++) {
+        char *a = (char *)kv + (size_t)h * rows * D * es, *p = (char *)copy + (size_t)h * b;
+        if (out) memcpy(p, a, b); else memcpy(a, p, b);
+    }
+}
+static int q36_park_rows(const Model *m, int i, int n) { int R = q36_kv_rows(m, i); return n < R ? n : R; }
+static void q36_park(Model *m, int np, int max_tok) {
+    const char *e = getenv("COLI_PARK"), *mn = getenv("COLI_PARK_MIN");
+    const int H = m->kvp.len, gen = max_tok < Q36_PARK_GEN ? max_tok : Q36_PARK_GEN,
+              least = mn && atoi(mn) > 0 ? atoi(mn) : Q36_PARK_MIN, n = np + gen + Q36_PARK_SPEC;
+    if ((e && *e == '0') || g_q36_park.on || g_q36_mux_slots != 1 || !m->kvp.fed || m->kvp.tainted ||
+        H < least || m->kv_len != H || m->vis_rows || n >= H || !m->K || !m->V) return;
+    const Cfg *c = &m->c; const size_t es = q36_kv_es(), D = (size_t)c->k_head_dim;
+    int ok = (g_q36_park.K = calloc((size_t)c->n_layers, sizeof(void *))) != NULL &&
+             (g_q36_park.V = calloc((size_t)c->n_layers, sizeof(void *))) != NULL &&
+             (g_q36_park.fed = malloc((size_t)H * sizeof(int))) != NULL;
+    for (int i = 0; ok && i < c->n_layers; i++) {
+        if (!c->is_attn[i] || !m->K[i] || !m->V[i]) continue;
+        int r = q36_park_rows(m, i, n);
+        size_t b = (size_t)c->kv_heads * r * D * es;
+        ok = (g_q36_park.K[i] = malloc(b)) != NULL && (g_q36_park.V[i] = malloc(b)) != NULL;
+        if (ok) {
+            q36_park_copy(c, m->K[i], q36_kv_rows(m, i), g_q36_park.K[i], r, 1);
+            q36_park_copy(c, m->V[i], q36_kv_rows(m, i), g_q36_park.V[i], r, 1);
+        }
+    }
+    if (ok && m->kv_ring && m->ring_pos) {
+        ok = (g_q36_park.ring_pos = malloc((size_t)m->kv_ring * sizeof(int))) != NULL;
+        if (ok) memcpy(g_q36_park.ring_pos, m->ring_pos, (size_t)m->kv_ring * sizeof(int));
+    }
+    const Q36Mtp *p = &g_q36_mtp;
+    if (ok && p->on && p->Kc && p->Vc) {   /* the CPU head's rows (with the device's head: rows it never wrote) */
+        int r = n < p->stride ? n : p->stride;
+        size_t b = (size_t)c->kv_heads * r * D * es;
+        ok = (g_q36_park.mk = malloc(b)) != NULL && (g_q36_park.mv = malloc(b)) != NULL;
+        if (ok) {
+            q36_park_copy(c, p->Kc, p->stride, g_q36_park.mk, r, 1);
+            q36_park_copy(c, p->Vc, p->stride, g_q36_park.mv, r, 1);
+            g_q36_park.mtp_rows = r; g_q36_park.mtp_stride = p->stride;
+        }
+    }
+#ifdef COLI_VULKAN
+    ok = ok && q36_mg_park(m, n, 1);
+#endif
+#ifdef COLI_CUDA
+    ok = ok && q36_mc_park(m, n, 1);
+#endif
+    /* the DeltaNet state from the device too, before anything of the request runs */
+    ok = ok && (g_q36_park.st = q36_pin_state_save(m, NULL)) != NULL;
+    if (!ok) { q36_park_free(m); return; }
+    memcpy(g_q36_park.fed, m->kvp.fed, (size_t)H * sizeof(int));
+    g_q36_park.len = H; g_q36_park.kv_len = m->kv_len; g_q36_park.rows = n;
+    g_q36_park.kv_cap = m->kv_cap; g_q36_park.kv_ring = m->kv_ring; g_q36_park.on = 1;
+    if (getenv("COLI_PREFIX_LOG"))
+        fprintf(stderr, "[PREFIX] the %d-token conversation parked for a %d-token request (%d rows kept apart)\n", H, np, n);
+}
+/* the end of the request's turn: the conversation back, its tokens, state and rows; the
+ * chains read its rows and its DeltaNet state from the host again */
+static void q36_unpark(Model *m) {
+    if (!g_q36_park.on) return;
+    const Cfg *c = &m->c;
+    Q36Mtp *p = &g_q36_mtp;
+    if (m->kv_len + Q36_PARK_SPEC > g_q36_park.rows || m->kv_cap != g_q36_park.kv_cap ||
+        m->kv_ring != g_q36_park.kv_ring || (g_q36_park.mk && p->stride != g_q36_park.mtp_stride)) {
+        if (getenv("COLI_PREFIX_LOG"))
+            fprintf(stderr, "[PREFIX] the request wrote past the rows kept apart: the conversation will be read again\n");
+        q36_park_free(m); return;
+    }
+    for (int i = 0; i < c->n_layers; i++) {
+        if (!g_q36_park.K[i] || !m->K[i] || !m->V[i]) continue;
+        int r = q36_park_rows(m, i, g_q36_park.rows);
+        q36_park_copy(c, m->K[i], q36_kv_rows(m, i), g_q36_park.K[i], r, 0);
+        q36_park_copy(c, m->V[i], q36_kv_rows(m, i), g_q36_park.V[i], r, 0);
+    }
+    if (g_q36_park.ring_pos && m->ring_pos) memcpy(m->ring_pos, g_q36_park.ring_pos, (size_t)m->kv_ring * sizeof(int));
+    if (g_q36_park.mk && p->Kc && p->Vc) {
+        q36_park_copy(c, p->Kc, p->stride, g_q36_park.mk, g_q36_park.mtp_rows, 0);
+        q36_park_copy(c, p->Vc, p->stride, g_q36_park.mv, g_q36_park.mtp_rows, 0);
+    }
+    int head = 1;
+#ifdef COLI_VULKAN
+    head = q36_mg_park(m, 0, 0) && head;
+#endif
+#ifdef COLI_CUDA
+    head = q36_mc_park(m, 0, 0) && head;
+#endif
+    q36_pin_state_put(m, g_q36_park.st);
+    if (!head && p->on) { p->has_pend = 0; p->len = -1; }   /* the head's device rows are the request's: it rests until a prompt from 0 */
+    kv_prefix_clear(&m->kvp);
+    kv_prefix_record(&m->kvp, g_q36_park.fed, 0, g_q36_park.len);
+    m->kv_len = g_q36_park.kv_len;
+#ifdef COLI_VULKAN
+    q36c_rollback(m, -1, 0);   /* every mirror's watermark to 0: the rows go up again from the host */
+#endif
+#ifdef COLI_CUDA
+    q36cc_rollback(m, -1, 0);
+#endif
+    if (getenv("COLI_PREFIX_LOG")) fprintf(stderr, "[PREFIX] the %d-token conversation is back\n", g_q36_park.len);
+    q36_park_free(m);
 }
 
 /* Allocate (once) or reuse the KV cache across requests. Grows only when a
@@ -8147,6 +8292,7 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
             fprintf(stderr, "[PREFIX] no reuse: held=%d cap=%d prompt=%d%s%s\n",
                     m->kvp.len, m->kvp.cap, np, m->kvp.tainted ? " tainted" : "",
                     (m->kvp.len > 0 && m->kvp.len < np) ? " (diverged)" : "");
+        if (!reuse) kv_prefix_miss_log(&m->kvp, ids, np, decode_id_to_bytes);
         fflush(stderr);
     }
     /* Con la lettura accesa il riuso arretra di un token: il predittore del
@@ -8172,7 +8318,10 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
      * The pin path above is untouched -- a photograph carries the logits for the position
      * that follows it, so it still resumes. */
     if (g_echo_k > 0 && !g_pin_use_logit) reuse = 0;
-    if (!reuse) { reset_recurrent(m); m->kv_len = 0; }
+    if (!reuse) {
+        q36_park(m, np, q->max_tok);   /* a short request keeps the conversation (q36_unpark) */
+        reset_recurrent(m); m->kv_len = 0;
+    }
     /* Per-REQUEST state, not per-process: without this the server keeps the
      * first request's prefill flag and expert-collection set forever, so
      * COLIBRI_RESIDENT=1 collects on request #1 and never again, and the
@@ -8225,7 +8374,7 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     return 1;
 }
 
-static void serve_one(Model *m, ServeReq *q){
+static void serve_one_turn(Model *m, ServeReq *q){
     int *ids=NULL, np=0; float *lo=NULL; Q36ReqClock clk;
     if(!q36_serve_start(m,q,&ids,&np,&lo,&clk)) return;
     int gen=0, limited=1, forwards=1;   /* il prefill e' il primo forward */
@@ -8298,6 +8447,11 @@ static void serve_one(Model *m, ServeReq *q){
     q36c_report(m);
     vk_tier_turn(m, "turn");
 #endif
+}
+/* one request on its own; a conversation it parked comes back when its turn ends */
+static void serve_one(Model *m, ServeReq *q){
+    serve_one_turn(m, q);
+    q36_unpark(m);
 }
 
 /* ======================= Clef: DECIDE on the same engine ======================= *

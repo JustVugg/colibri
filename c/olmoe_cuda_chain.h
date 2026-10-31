@@ -441,6 +441,19 @@ static void occ_recover(Model *m, int pos_base) {
     free(x);
     ch->host_kv = pos_base;
 }
+/* A parked conversation (park.h): olmoe_chain.h's olc_host_all and olc_host_wrote on the card */
+static void occ_host_all(Model *m, int len) {
+    OccChain *ch = g_occ;
+    if (!ch || !ch->ok || ch->failed) return;
+    if (cc_lost() || !occ_sync(ch, m, len)) occ_recover(m, len);
+}
+static void occ_host_wrote(Model *m, const int *ids, int len) {
+    OccChain *ch = g_occ;
+    if (!ch || !ch->ok) return;
+    for (int i = 0; i < m->c.n_layers; i++) ch->kv_valid[i] = 0;
+    ch->host_kv = len;
+    if (ch->fed && len <= ch->cap) memcpy(ch->fed, ids, (size_t)len * sizeof(int));
+}
 static int occ_norm(CcBuf *x, size_t xo, CcBuf *w, size_t wo, CcBuf *y, size_t yo, int rows, int D, float eps) {
     CcNorm p = {rows, D, 1, (int)xo, D, D, (int)yo, D, D, (int)wo, 0, 0, eps, 1.f};
     return cc_norm(x, w, y, &p);

@@ -22,7 +22,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from prefix_serve_harness import PromptCancelContract, ServeEngine  # noqa: E402
+from prefix_serve_harness import PrefixReuseContract, PromptCancelContract, ServeEngine  # noqa: E402
 
 HERE = Path(__file__).resolve().parent.parent
 ENGINE = HERE / ("inkling.exe" if sys.platform == "win32" else "inkling")
@@ -210,6 +210,19 @@ class InklingPromptCancelTest(PromptCancelContract, unittest.TestCase):
         if log_prefix:
             env["INK_PREFIX_LOG"] = "1"
         return ServeEngine(ENGINE, ["8"], env, log_prefix=log_prefix, reuse=reuse)
+
+
+@unittest.skipUnless(ENGINE.exists(), "inkling is not built")
+@unittest.skipUnless((FIXTURE / "config.json").exists(),
+                     "tiny inkling fixture is absent (tools/make_tiny_inkling.py)")
+class InklingParkTest(unittest.TestCase):
+    """A short request between two turns parks the conversation (park.h): the shared
+    contract's scenario, on this engine's spawn."""
+    PARKS = True
+    setUpClass = InklingPromptCancelTest.setUpClass
+    spawn = InklingPromptCancelTest.spawn
+    test_a_short_request_between_two_turns_keeps_the_conversation = \
+        PrefixReuseContract.test_a_short_request_between_two_turns_keeps_the_conversation
 
 
 if __name__ == "__main__":

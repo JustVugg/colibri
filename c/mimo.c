@@ -60,6 +60,7 @@
 #include "quant.h"
 #include "omp_tune.h"
 #include "kv_prefix.h"
+#include "park.h"   /* a short request keeps the conversation aside (COLI_PARK) */
 #include "prompt_break.h"   /* a served prompt that a STOP or CANCEL stops between two blocks */
 #include "pin_pool.h"
 #include "tok.h"
@@ -974,13 +975,19 @@ static void kv_alloc(Model *m, int ctx) {
     kv_prefix_alloc(&m->kvp, ctx);
 }
 
-static void model_reset(Model *m) {
+/* The state from nothing. n >= 0: only the rows positions [0, n) reach (a short request beside
+ * a parked conversation, park.h): a query reads the rows of its own positions, a window's by
+ * the position its slot holds, so the conversation's further rows wait untouched. */
+static void model_reset_rows(Model *m, int n) {
     Cfg *c = &m->c;
-    for (int li = 0; li < c->n_layers; li++)
-        for (int r = 0; r < m->L[li].rows; r++) m->L[li].ring_pos[r] = -1;
+    for (int li = 0; li < c->n_layers; li++) {
+        int r0 = n >= 0 && n < m->L[li].rows ? n : m->L[li].rows;
+        for (int r = 0; r < r0; r++) m->L[li].ring_pos[r] = -1;
+    }
     m->pos = 0;
     kv_prefix_clear(&m->kvp);
 }
+static void model_reset(Model *m) { model_reset_rows(m, -1); }
 
 static void model_load(Model *m, const char *dir, int cap) {
     Cfg *c = &m->c;
@@ -2506,6 +2513,43 @@ static int mimo_prompt_poll(ColiPromptBreak *b) {
     return b->control;
 }
 
+/* A short request between two turns of the conversation the lone serve holds (park.h): every
+ * layer's first K and V rows (a sliding layer's ring rows) and their positions, back when the
+ * next request arrives; the host's caches stay canonical, the chains' watermarks come down. */
+static ColiPark g_mimo_park;
+static ColiParkPart *mimo_park_parts(Model *m, int *n_out) {
+    Cfg *c = &m->c; int n = 0;
+    ColiParkPart *p = malloc(sizeof *p * ((size_t)c->n_layers * 3));
+    if (!p) { *n_out = 0; return NULL; }
+    for (int li = 0; li < c->n_layers; li++) {
+        Layer *l = &m->L[li]; int k = c->swa[li];
+        p[n++] = coli_park_rows(l->K, (size_t)c->kv_heads[k] * c->head_dim[k] * sizeof(float), l->rows);
+        p[n++] = coli_park_rows(l->V, (size_t)c->kv_heads[k] * c->v_dim[k] * sizeof(float), l->rows);
+        p[n++] = coli_park_rows(l->ring_pos, sizeof(int), l->rows);
+    }
+    *n_out = n;
+    return p;
+}
+static int mimo_park(Model *m, int np, int max_tok) {   /* the rows kept apart, 0: not parked */
+    int n = g_mimo_mux_slots == 1 ? coli_park_rows_for(&g_mimo_park, &m->kvp, m->pos, np, max_tok, 16) : 0, k = 0;
+    if (!n) return 0;
+    ColiParkPart *p = mimo_park_parts(m, &k);
+    int ok = p && coli_park_save(&g_mimo_park, &m->kvp, m->pos, p, k, n);
+    free(p);
+    return ok ? n : 0;
+}
+static void mimo_unpark(Model *m) {
+    if (!g_mimo_park.on) return;
+    int k = 0;
+    ColiParkPart *p = mimo_park_parts(m, &k);
+    if (p && coli_park_restore(&g_mimo_park, &m->kvp, &m->pos, m->pos, 16, p, k)) {
+#ifdef COLI_VULKAN
+        mc_cpu_step(m, 0);   /* the host's rows from 0 are the conversation's again: the mirrors go up again */
+#endif
+    } else coli_park_free(&g_mimo_park);
+    free(p);
+}
+
 static int mimo_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int *ids, float *logits,
                             float **pending, int *pending_h, int *pending_w, MimoReq *rq, int lone) {
     Cfg *c = &m->c;
@@ -2575,7 +2619,11 @@ static int mimo_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int
         fprintf(stderr, "[PIN] resumed from the photo of %d tokens, %d to prefill\n", reuse, n_prompt - reuse);
         fflush(stderr);
     }
-    if (!reuse) model_reset(m);
+    if (!reuse) {
+        /* a short request keeps the conversation (mimo_unpark): only the rows it reaches start over */
+        int parked = lone && !(*pending) ? mimo_park(m, n_prompt, cmd->max_tokens) : 0;
+        model_reset_rows(m, parked ? parked : -1);
+    }
     coli_serve_write_accept(stdout, cmd->id, n_prompt);
     if ((*pending)) {
         image = vision_run(m, (*pending), (*pending_h), (*pending_w), &image_rows);
@@ -2820,6 +2868,7 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *dir) {
             continue;
         }
         MimoReq rq;
+        mimo_unpark(m);   /* a conversation the last request parked: back first */
         if (!mimo_serve_start(m, tokenizer, &command, ids, logits, &pending, &pending_h, &pending_w, &rq, 1)) continue;
         double started = rq.started;
         double disk0 = rq.disk0, expert0 = rq.expert0, attn0 = rq.attn0;

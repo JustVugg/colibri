@@ -82,6 +82,7 @@
 #include "sparse_attn.h"
 #include "omp_tune.h"
 #include "kv_prefix.h"
+#include "park.h"   /* a short request keeps the conversation aside (COLI_PARK) */
 #include "prompt_break.h"   /* a served prompt that a STOP or CANCEL stops between two layers */
 #include "pin_pool.h"   /* riuso del prefisso tra turni (shared) */
 #include "spec_draft.h" /* the verify depth from DSpark's confidence (SpecGate) */
@@ -4871,15 +4872,20 @@ static void forward_rows(Model *m, const int *slots, const int *ids, int n, floa
  * compressor's partial group and the engram history all describe one sequence. Prefix
  * reuse across turns is a later step (the KV here is four caches and a ring, not one
  * tensor), and getting it wrong would be silent, so it is refused rather than faked. */
-static void model_reset(Model *m) {
+/* The state from nothing. n >= 0: only the rows positions [0, n) reach (a short request
+ * beside a parked conversation, park.h): the rest stays the conversation's, which no query of
+ * the request reads (window_slot_ok, and a query reaches only the groups closed before it). */
+static void model_reset_rows(Model *m, int n) {
     Cfg *c = &m->c;
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
-        memset(l->window, 0, (size_t)c->window * c->head_dim * sizeof(float));
-        for (int k = 0; k < c->window; k++) l->window_pos[k] = -1;
+        int w = n >= 0 && n < c->window ? n : c->window;
+        memset(l->window, 0, (size_t)w * c->head_dim * sizeof(float));
+        for (int k = 0; k < w; k++) l->window_pos[k] = -1;
         int ratio = c->compress_ratio[i];
         if (c->kv_source[i]) {
             int slots = c->max_positions / (ratio > 0 ? ratio : 1);
+            if (n >= 0) { int reach = (n + (ratio > 0 ? ratio : 1) - 1) / (ratio > 0 ? ratio : 1); if (reach < slots) slots = reach; }
             memset(l->ckv, 0, (size_t)slots * c->head_dim * sizeof(float));
             memset(l->ikey, 0, (size_t)slots * c->index_head_dim * sizeof(float));
             if (ratio > 1) {
@@ -4900,6 +4906,7 @@ static void model_reset(Model *m) {
      * can check. */
     kv_prefix_clear(&m->kvp);
 }
+static void model_reset(Model *m) { model_reset_rows(m, -1); }
 
 static const ColiServeWireProfile v41_wire = {
     .max_header_bytes = 511,
@@ -5204,6 +5211,84 @@ static int v41_prompt_poll(ColiPromptBreak *b) {
     return b->control;
 }
 
+/* A short request between two turns of the conversation the lone serve holds (park.h): every
+ * layer's window ring rows and their positions, the compressed rows and index keys of the
+ * positions the request may write (a row for `ratio` of them), the compressor's partial
+ * group, the engram history's first entries, and what crosses forwards (the index keys
+ * published last, the shared top-k list, the candidate mask); back when the next request
+ * arrives. The host's state stays canonical: the chains' watermarks come down to 0. The draft
+ * head's windows are not kept: no prompt resets them either, and a draft is only verified. */
+#define V41_PARK_SPEC 16   /* the rows a verify writes past the tokens that stand */
+static ColiPark g_v41_park;
+static struct { int history_len, published_layer, topk_rows, topk_width, cand_width, cand_rows;
+                const float *published; int *topk; uint8_t *cand; } g_v41_park_x;
+static Tok *g_v41_log_tok;   /* the request's tokenizer, for COLI_PREFIX_LOG */
+static void v41_decode_one(int id, unsigned char *out, int *n) {
+    *n = g_v41_log_tok ? tok_decode(g_v41_log_tok, &id, 1, (char *)out, 255) : 0;
+    if (*n < 0) *n = 0;
+}
+static ColiParkPart *v41_park_parts(Model *m, int *n_out) {
+    Cfg *c = &m->c; int L = c->n_layers, n = 0;
+    ColiParkPart *p = malloc(sizeof *p * ((size_t)L * 6 + 1));
+    if (!p) { *n_out = 0; return NULL; }
+    for (int i = 0; i < L; i++) {
+        Layer *l = &m->L[i]; int r = c->compress_ratio[i];
+        p[n++] = coli_park_rows(l->window, (size_t)c->head_dim * sizeof(float), c->window);
+        p[n++] = coli_park_rows(l->window_pos, sizeof(int), c->window);
+        if (c->kv_source[i]) {
+            int slots = c->max_positions / (r > 0 ? r : 1);
+            p[n++] = coli_park_per(l->ckv, (size_t)c->head_dim * sizeof(float), slots, r);
+            p[n++] = coli_park_per(l->ikey, (size_t)c->index_head_dim * sizeof(float), slots, r);
+            if (r > 1) {
+                p[n++] = coli_park_whole(l->cstate_kv, (size_t)r * c->head_dim * sizeof(float));
+                p[n++] = coli_park_whole(l->cstate_score, (size_t)r * c->head_dim * sizeof(float));
+            }
+        }
+    }
+    p[n++] = coli_park_rows(m->engram.history, sizeof(int32_t), m->engram.history_cap);
+    *n_out = n;
+    return p;
+}
+static void *v41_dup(const void *src, size_t bytes) {
+    void *d = src && bytes ? malloc(bytes) : NULL;
+    if (d) memcpy(d, src, bytes);
+    return d;
+}
+static int v41_park(Model *m, int np, int max_tok) {   /* the rows kept apart, 0: not parked */
+    int n = g_v41_mux_slots == 1 ? coli_park_rows_for(&g_v41_park, &m->kvp, m->pos, np, max_tok, V41_PARK_SPEC) : 0, k = 0;
+    if (!n) return 0;
+    ColiParkPart *p = v41_park_parts(m, &k);
+    if (p && coli_park_save(&g_v41_park, &m->kvp, m->pos, p, k, n)) {
+        g_v41_park_x.history_len = m->engram.history_len;
+        g_v41_park_x.published = m->published_index_k; g_v41_park_x.published_layer = m->published_index_layer;
+        g_v41_park_x.topk_rows = m->shared_topk_rows; g_v41_park_x.topk_width = m->shared_topk_width;
+        g_v41_park_x.topk = v41_dup(m->shared_topk, (size_t)m->shared_topk_rows * (m->shared_topk_width > 0 ? m->shared_topk_width : 1) * sizeof(int));
+        g_v41_park_x.cand_width = m->candidate_width; g_v41_park_x.cand_rows = m->candidate_rows;
+        g_v41_park_x.cand = v41_dup(m->candidates, (size_t)m->candidate_rows * m->candidate_width);
+    }
+    free(p);
+    return g_v41_park.on ? n : 0;
+}
+static void v41_unpark(Model *m) {
+    if (!g_v41_park.on) return;
+    int k = 0;
+    ColiParkPart *p = v41_park_parts(m, &k);
+    if (p && coli_park_restore(&g_v41_park, &m->kvp, &m->pos, m->pos, V41_PARK_SPEC, p, k)) {
+        m->engram.history_len = g_v41_park_x.history_len;
+        m->published_index_k = g_v41_park_x.published; m->published_index_layer = g_v41_park_x.published_layer;
+        free(m->shared_topk); m->shared_topk = g_v41_park_x.topk; g_v41_park_x.topk = NULL;
+        m->shared_topk_rows = m->shared_topk ? g_v41_park_x.topk_rows : 0; m->shared_topk_width = m->shared_topk ? g_v41_park_x.topk_width : 0;
+        free(m->candidates); m->candidates = g_v41_park_x.cand; g_v41_park_x.cand = NULL;
+        m->candidate_width = m->candidates ? g_v41_park_x.cand_width : 0; m->candidate_rows = m->candidates ? g_v41_park_x.cand_rows : 0;
+#ifdef COLI_VULKAN
+        v41c_reset(m);   /* the host's rows from 0 are the conversation's again: the mirrors go up again */
+#endif
+    } else coli_park_free(&g_v41_park);
+    free(g_v41_park_x.topk); free(g_v41_park_x.cand);
+    memset(&g_v41_park_x, 0, sizeof g_v41_park_x);
+    free(p);
+}
+
 static int v41_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int *ids, float *logits,
                            float **pending_image, int *pending_h, int *pending_w, V41Req *rq, int lone) {
     Cfg *c = &m->c;
@@ -5279,7 +5364,12 @@ static int v41_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int 
                     kv_prefix_on() ? "" : " (off: set COLI_KV_PREFIX=1)");
         fflush(stderr);
     }
-    if (!reuse) model_reset(m);
+    if (!reuse && getenv("COLI_PREFIX_LOG")) { g_v41_log_tok = tokenizer; kv_prefix_miss_log(&m->kvp, ids, n_prompt, v41_decode_one); }
+    if (!reuse) {
+        /* a short request keeps the conversation (v41_unpark): only the rows it reaches start over */
+        int parked = lone && !(*pending_image) ? v41_park(m, n_prompt, cmd->max_tokens) : 0;
+        model_reset_rows(m, parked ? parked : -1);
+    }
     coli_serve_write_accept(stdout, cmd->id, n_prompt);
     float *aligned = NULL;
     uint8_t *image_mask = NULL;
@@ -5576,6 +5666,7 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
             continue;
         }
         V41Req rq;
+        v41_unpark(m);   /* a conversation the last request parked: back first */
         if (!v41_serve_start(m, tokenizer, &command, ids, logits, &pending_image, &pending_h, &pending_w, &rq, 1)) continue;
         double turn_started = rq.turn_started;
         double disk0 = rq.disk0, expert0 = rq.expert0, attn0 = rq.attn0, engram0 = rq.engram0;

@@ -581,6 +581,22 @@ static void olc_host_kv(Model *m, int pos_base, int S) {
     if (need) olc_recover(m, pos_base);
     for (int d = 0; d < 2; d++) { OlmChain *ch = olc_of(m, d); if (ch && ch->dev_kv) ch->host_kv = pos_base + S; }
 }
+/* A parked conversation (park.h): before it is kept apart, every row of the len it holds in
+ * the host's cache; after it is back, the host's rows are the canonical ones below len (its
+ * first rows came back there), every mirror goes up again from the host, and the record of
+ * the steps' ids is the conversation's. */
+static void olc_host_all(Model *m, int len) { olc_host_kv(m, len, 0); }
+static void olc_host_wrote(Model *m, const int *ids, int len) {
+    for (int d = 0; d < 2; d++) {
+        OlmChain *ch = olc_of(m, d);
+        if (!ch || !ch->ok) continue;
+        olc_cpu_one(ch, 0);
+        if (ch->dev_kv) {
+            ch->host_kv = len;
+            if (ch->fed && len <= ch->cap) memcpy(ch->fed, ids, (size_t)len * sizeof(int));
+        }
+    }
+}
 /* Record the uploads that make the device cache the host's below pos_base, for a step
  * of n rows (the split places its window). */
 static int olc_push_kv(OlmChain *ch, Model *m, int pos_base, int n_rows) {
