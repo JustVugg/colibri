@@ -95,12 +95,20 @@ jobs:
       - name: Build engines
         run: |
           cd c
-          for t in colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41 mimo qwenimage laya gliner_decide colibri-tui; do
+          for t in colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41 mimo qwenimage laya gliner_decide; do
             extra=""
             case " ${{ matrix.metal }} " in *" $t "*) extra="METAL=1" ;; esac
             make $t ${{ matrix.make_args }} $extra
           done
-          ls -lh colibri${{ matrix.ext }} glm53${{ matrix.ext }} inkling${{ matrix.ext }} kimi_k3${{ matrix.ext }} olmoe${{ matrix.ext }} qwen36${{ matrix.ext }} qwen38${{ matrix.ext }} deepseek_v41${{ matrix.ext }} mimo${{ matrix.ext }} colibri-tui${{ matrix.ext }}
+          ls -lh colibri${{ matrix.ext }} glm53${{ matrix.ext }} inkling${{ matrix.ext }} kimi_k3${{ matrix.ext }} olmoe${{ matrix.ext }} qwen36${{ matrix.ext }} qwen38${{ matrix.ext }} deepseek_v41${{ matrix.ext }} mimo${{ matrix.ext }}
+
+      # The terminal UI is a client of coli serve, not an engine: none of the engines' ARCH or
+      # GPU flags apply, so it builds on its own, and runs once to prove it did.
+      - name: Build the terminal UI
+        run: |
+          cd c
+          make colibri-tui
+          ./colibri-tui${{ matrix.ext }} --version
 
       # DeepSeek V4 has its own Makefile and its own target name (`deepseek-v4`,
       # producing `deepseek_v4`), so it never joined the loop above -- and #858 is
