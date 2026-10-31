@@ -1,0 +1,41 @@
+[CUDA] device 0: NVIDIA GeForce RTX 4090, 25.8 GB VRAM, sm_89
+[SPLIT] +D:\AI\Models\Kimi-K3 -> 92 shard(s)
+[SPLIT] model across 2 dir(s): 188 shard(s) total (primary C:\AI\Kimi-K3 -> 96 shard(s)), no duplication
+[K3] loaded layer 1/93 (3.3s, RSS 0.9 GB)
+[K3] loaded layer 9/93 (16.5s, RSS 3.6 GB)
+[K3] loaded layer 17/93 (29.7s, RSS 6.5 GB)
+[K3] loaded layer 25/93 (42.8s, RSS 9.3 GB)
+[K3] loaded layer 33/93 (56.0s, RSS 12.2 GB)
+[K3] loaded layer 41/93 (69.2s, RSS 15.1 GB)
+[K3] loaded layer 49/93 (82.2s, RSS 17.9 GB)
+[K3] loaded layer 57/93 (95.2s, RSS 20.8 GB)
+[K3] loaded layer 65/93 (109.0s, RSS 23.6 GB)
+[K3] loaded layer 73/93 (123.0s, RSS 26.5 GB)
+[K3] loaded layer 81/93 (136.0s, RSS 29.3 GB)
+[K3] loaded layer 89/93 (149.1s, RSS 32.2 GB)
+[K3-CUDA] dense: 369 of 929 matrices on GPU 0, 20.00 of 31.15 GiB (budget 20.00 GiB, 22.50 free); their host copies released
+[K3][RAM_GB=174.0] resident 34.8 GB + reserve 3.9 GB (page cache 2.5, activations 1.2, KV 24x4096 0.2, checkpoints 0 0.0) -> 135.3 GB for experts; cache 619->83/layer (17.5 MB/slot, 92 layers; projected peak 172.7 GB)
+[K3] K3_EXPERT_GB=1000 does not fit alongside the 34.8 GB already resident. It is a request, not a reservation.
+[K3] init done in 161.4s | 93 layers | expert cache 83/layer (17.5 MB/slot) | RSS 34.8 GB
+[K3] tokenizer.json loaded (family=kimi)
+[K3] prompt: 35 tokens | ngen 48 | temp 0.00
+[KDA] L0 metal=0 P=12288 H=96 hd=128 K=4
+[K3-FMT] L0 KDA: q.fmt=4 gs=64 k.fmt=4 gs=64 v.fmt=4 gs=64 g.fmt=4 gs=64
+[K3-PATH] L0 attn=KDA metal=0
+[K3] expert readers: 4 on 2 device(s)
+[K3-FMT] L3 MLA: qa.fmt=1 gs=0 qb.fmt=1 gs=0 kva.fmt=1 gs=0
+[K3] prefill 35/35 (57.0s)
+[K3] prefill done in 57.0s (0.61 tok/s)
+  [tok 8: 1.8s/tok, hit 32%, 461.7 GB read]
+  [tok 16: 1.8s/tok, hit 45%, 596.1 GB read]
+  [tok 24: 1.8s/tok, hit 53%, 728.0 GB read]
+  [tok 32: 1.8s/tok, hit 58%, 865.2 GB read]
+  [tok 40: 1.8s/tok, hit 61%, 1003.5 GB read]
+
+[K3] eos
+
+[K3] decode 45 tokens in 80.7s (0.56 tok/s) | expert hit 62.4% (52002/83295) | 1073.7 GB streamed
+[K3] time: attn 12.7s moe 124.2s (eload 30.0s) head 0.1s | RSS 141.2 GB
+[K3] prefetch (run): 30851 experts read ahead, 14617 used, 16234 not (953 of them cancelled unread); 63.2% of the routed experts were predicted; predicting took 2.1s
+[K3-CUDA] dense (run): 16605 matmuls on the GPU, 4.8s
+[STATS] 116288 selections across 28667 distinct experts -> C:\AI\Kimi-K3/.coli_usage

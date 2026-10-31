@@ -74,6 +74,7 @@ class OmpSpin(unittest.TestCase):
         # (backend_vulkan.c and vk_chain.c need the Vulkan headers to compile)
         vk = ["-DCOLI_VULKAN"]
         objects = [("mimo.c", []), ("mimo.c", ["-DCOLI_MIMO_CUDA"]), ("mimo.c", vk),
+                   ("kimi_k3.c", []), ("kimi_k3.c", ["-DCOLI_CUDA"]), ("kimi_k3.c", vk),
                    ("vk_tier.c", vk), ("backend_vulkan.c", vk), ("vk_chain.c", vk)]
         with tempfile.TemporaryDirectory() as tmp:
             obj = Path(tmp) / "object.o"
@@ -88,7 +89,7 @@ class OmpSpin(unittest.TestCase):
                     calls = {line.split()[-1].lstrip("_") for line in undefined.splitlines()
                              if re.search(r"\b_?(GOMP_|omp_)", line)}
                     calls = {c for c in calls if c.startswith(("GOMP_", "omp_"))}
-                    if src == "mimo.c":
+                    if src in ("mimo.c", "kimi_k3.c"):
                         self.assertIn("GOMP_parallel", calls)
                     self.assertEqual(calls - served, set(), f"{src} {defs} calls libgomp entry points omp_spin.c does not serve")
 

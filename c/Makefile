@@ -1793,8 +1793,10 @@ ifneq ($(EXE),)
 .PHONY: kimi_k3
 kimi_k3: kimi_k3$(EXE)
 endif
-kimi_k3$(EXE): kimi_k3.c $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ) .build-config
-	$(CC) $(CFLAGS) kimi_k3.c $(CUDA_OBJ) $(VK_OBJ) $(METAL_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)
+# Windows: the OpenMP regions on omp_spin.c's spinning team, as mimo's (a decode token runs
+# thousands of them; MinGW libgomp's fork and join cost ~80 us each at 16 threads)
+kimi_k3$(EXE): kimi_k3.c $(CUDA_OBJ) $(MIMO_OMP_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ) .build-config
+	$(CC) $(CFLAGS) kimi_k3.c $(CUDA_OBJ) $(MIMO_OMP_OBJ) $(VK_OBJ) $(METAL_OBJ) -o kimi_k3$(EXE) $(LDFLAGS) $(MIMO_OMP_LDFLAGS)
 
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks
