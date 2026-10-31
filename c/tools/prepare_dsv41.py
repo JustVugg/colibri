@@ -24,6 +24,7 @@ converting, because its dense weights already ship as fp8 and its experts as fp4
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 from pathlib import Path
 
@@ -111,6 +112,14 @@ def main() -> int:
     if not cfg.get("engram_layer_ids"):
         print("this checkpoint declares no engram layers: nothing to prepare")
         return 0
+
+    packages = ("transformers", "tokenizers", "numpy", "sympy")
+    missing = [name for name in packages if importlib.util.find_spec(name) is None]
+    if missing:
+        raise SystemExit(
+            f"missing optional packages: {', '.join(missing)}\n"
+            "Install them in the Python environment running this script, for example:\n"
+            "  python -m pip install transformers tokenizers numpy sympy")
 
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(str(args.model), trust_remote_code=True)

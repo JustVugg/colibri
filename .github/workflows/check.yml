@@ -23,13 +23,14 @@ jobs:
   linux:
     name: Linux
     runs-on: ubuntu-latest
-    # make check takes about 14 minutes here now (14.9 at worst this week);
-    # at 15 the job was cut off with nothing failed.
-    timeout-minutes: 25
+    # make check built serially and took 23 minutes on 2026-10-17, then past 25 with two
+    # more engines' GGUF code: the builds now use every core (make test runs the C and
+    # Python suites one after the other, so only the compiling is parallel).
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - name: make check
-        run: make -C c check
+        run: make -C c -j"$(nproc)" check
 
   windows:
     # The job that would have caught #68/#137 pre-merge: native MinGW-w64
@@ -47,7 +48,10 @@ jobs:
     # at 35 three times with every test passed so far (#1907, #1911 and a dev
     # run), after #1901 added its suites. 60 leaves room for the suites still
     # coming; a real hang still ends the job.
-    timeout-minutes: 60
+    # 2026-10-20: reached again. The job took 45 to 57 minutes when it passed
+    # (#2265 twice, #2266), and was cancelled at 60 twice, once 5 seconds after
+    # its 2695 tests had passed (#2267). 90.
+    timeout-minutes: 90
     defaults:
       run:
         shell: msys2 {0}
@@ -164,6 +168,7 @@ jobs:
           COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_context_exceeded
           COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_hostile_weights
           COLI_GLM53_FIXTURE=/tmp/glm53_mm python -m unittest -v tests.test_glm53_hostile_weights.Glm53MatrixShapeTest
+          COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_cluster
       # The two stdlib-only oracles used to be argparse scripts that `make
       # test-python` collected as zero tests (#1700). They run here, on the
       # fixtures generated above, token-exact against transformers in f32.
@@ -171,6 +176,72 @@ jobs:
         run: |
           cd c && GLM53_TINY=/tmp/glm53_tiny GLM53_MM_TINY=/tmp/glm53_mm python -m unittest -v tests.test_glm53_oracles
           GLM53_TINY=/tmp/glm53_tiny COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_prefill_batch
+          COLI_GLM53_FIXTURE=/tmp/glm53_mm python -m unittest -v tests.test_glm53_accept
+
+  qwen36-oracle:
+    name: Linux (generated qwen36 oracles)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: c/tools/requirements-glm53-tiny.txt
+      - name: Install pinned oracle dependencies
+        run: python -m pip install -r c/tools/requirements-glm53-tiny.txt
+      # Flint's layer (a sink per head, sliding-window layers, layers without RoPE, dense
+      # layers in front, sigmoid routing) token for token against tools/make_flint_tiny.py's
+      # float32 reference, the GGUF read in place with F32 and with Q8_0 experts.
+      - name: Build qwen36 and run the Flint tiny oracles
+        run: |
+          make -C c qwen36
+          cd c
+          for experts in F32 Q8_0; do
+            python tools/make_flint_tiny.py --out /tmp/flint_$experts --emit-ref /tmp/flint_$experts/ref.json \
+              --gguf /tmp/flint_$experts/model.gguf --gguf-experts $experts
+            COLI_CUDA=0 COLI_VULKAN=0 SNAP=/tmp/flint_$experts/model.gguf ./qwen36 16 8 /tmp/flint_$experts/ref.json
+            # the KV cache in float16, as a serve keeps it (a .json reference keeps float32 unless Q36_KV says)
+            COLI_CUDA=0 COLI_VULKAN=0 Q36_KV=f16 SNAP=/tmp/flint_$experts/model.gguf ./qwen36 16 8 /tmp/flint_$experts/ref.json
+            # the sliding layers' KV in a ring of window + 9 rows (the least spare), shorter than the run
+            COLI_CUDA=0 COLI_VULKAN=0 Q36_KV_RING_SPARE=9 SNAP=/tmp/flint_$experts/model.gguf ./qwen36 16 8 /tmp/flint_$experts/ref.json 2> ring.log
+            grep -q 'sliding-window layers keep a ring of 14 rows' ring.log || { cat ring.log; exit 1; }
+          done
+      # Muse Spark's layer (residual gates, the experts at their own width between two
+      # projections, a norm on every expert's output, capped logits) against
+      # tools/make_muse_tiny.py's reference, F32 experts and Q8_0 ones (the reference then
+      # quantizes the experts' inputs as the CPU's integer kernels do).
+      - name: Run the Muse Spark tiny oracles
+        run: |
+          cd c
+          python tools/make_muse_tiny.py --out /tmp/muse_F32 --emit-ref /tmp/muse_F32/ref.json --experts F32
+          COLI_CUDA=0 COLI_VULKAN=0 SNAP=/tmp/muse_F32/model.gguf ./qwen36 16 8 /tmp/muse_F32/ref.json
+          COLI_CUDA=0 COLI_VULKAN=0 Q36_KV_RING_SPARE=9 SNAP=/tmp/muse_F32/model.gguf ./qwen36 16 8 /tmp/muse_F32/ref.json 2> ring.log
+          grep -q 'sliding-window layers keep a ring of 14 rows' ring.log || { cat ring.log; exit 1; }
+          # Q8_0: the experts' inputs round to int8 from sums whose order differs from one CPU
+          # to the next (a code apart moved a 0.106 margin at the 16th token on AVX-VNNI), so
+          # this one is shorter and wider apart
+          python tools/make_muse_tiny.py --out /tmp/muse_Q8_0 --emit-ref /tmp/muse_Q8_0/ref.json --experts Q8_0 --max-new 8 --min-gap 0.2
+          COLI_CUDA=0 COLI_VULKAN=0 SNAP=/tmp/muse_Q8_0/model.gguf ./qwen36 16 8 /tmp/muse_Q8_0/ref.json
+      # LFM3's layers (short gated convolutions beside attention with a gate per head, the
+      # full layers' partial rotation, every branch normalised) against
+      # tools/make_lfm3_tiny.py's float32 reference, F32 matrices and Q8_0 ones.
+      - name: Run the LFM3 tiny oracles
+        run: |
+          cd c
+          python tools/make_lfm3_tiny.py --out /tmp/lfm3_F32 --emit-ref /tmp/lfm3_F32/ref.json
+          COLI_CUDA=0 COLI_VULKAN=0 SNAP=/tmp/lfm3_F32/model.gguf ./qwen36 16 8 /tmp/lfm3_F32/ref.json
+          COLI_CUDA=0 COLI_VULKAN=0 Q36_KV=f16 COLI_LOOKUP=0 SNAP=/tmp/lfm3_F32/model.gguf ./qwen36 16 8 /tmp/lfm3_F32/ref.json
+          COLI_CUDA=0 COLI_VULKAN=0 Q36_KV_RING_SPARE=9 SNAP=/tmp/lfm3_F32/model.gguf ./qwen36 16 8 /tmp/lfm3_F32/ref.json 2> ring.log
+          grep -q 'sliding-window layers keep a ring of 14 rows' ring.log || { cat ring.log; exit 1; }
+          python tools/make_lfm3_tiny.py --out /tmp/lfm3_Q8_0 --emit-ref /tmp/lfm3_Q8_0/ref.json --dense Q8_0 --max-new 8 --min-gap 0.2
+          COLI_CUDA=0 COLI_VULKAN=0 SNAP=/tmp/lfm3_Q8_0/model.gguf ./qwen36 16 8 /tmp/lfm3_Q8_0/ref.json
+          # LFM3-VL's tower (lfm3_vision.h) from an mmproj: a picture's rows within 1e-4 of the
+          # reference's, and the continuation they lead to
+          python tools/make_lfm3_tiny.py --out /tmp/lfm3_V --emit-ref /tmp/lfm3_V/ref.json --vision
+          COLI_CUDA=0 COLI_VULKAN=0 Q36_MMPROJ=/tmp/lfm3_V/mmproj.gguf Q36_VIS_DUMP=/tmp/lfm3_V/rows.bin SNAP=/tmp/lfm3_V/model.gguf ./qwen36 16 8 /tmp/lfm3_V/ref.json
+          python -c "import numpy as n; a=n.fromfile('/tmp/lfm3_V/rows.bin','f4'); b=n.fromfile('/tmp/lfm3_V/image_rows.f32','f4'); e=abs(a-b).max()/n.sqrt((b*b).mean()); print('LFM3 vision rows, worst error of the rms', e); assert a.shape==b.shape and e<1e-4"
 
   macos:
     # clang; libomp for the threaded path (Makefile falls back to
@@ -179,7 +250,9 @@ jobs:
     runs-on: macos-latest
     # `make check` here now takes about 14.5 minutes; at 15 the job was cut
     # off inside the Python suite with no test failed, and showed as red.
-    timeout-minutes: 25
+    # 2026-10-24 it took 24 minutes, and on the next run the suite printed
+    # OK at 25:00, the moment the job was cut off: 35 leaves the room again.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - name: install libomp

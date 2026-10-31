@@ -12,19 +12,35 @@
 #ifndef COLI_STOP_IDS_H
 #define COLI_STOP_IDS_H
 
+#include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "json.h"
 
+/* Invalid numeric entries are ignored like nonnumeric entries: a stop id must
+ * fit the integer the generation loop compares, without truncation or overflow.
+ * Signed integral values already accepted by the loader are retained. */
+static int coli_stop_id_from(jval *value, int *out) {
+    if (!value || value->t != J_NUM || !isfinite(value->num) ||
+        value->num < INT_MIN || value->num > INT_MAX) return 0;
+    int id = (int)value->num;
+    if ((double)id != value->num) return 0;
+    *out = id;
+    return 1;
+}
+
 static int coli_stop_ids_from(jval *obj, int *out, int max) {
     if (!obj || obj->t != J_OBJ) return 0;
     jval *eos = json_get(obj, "eos_token_id");
     int found = 0;
-    if (eos && eos->t == J_NUM && found < max) out[found++] = (int)eos->num;
+    if (eos && eos->t == J_NUM && found < max) {
+        if (coli_stop_id_from(eos, &out[found])) found++;
+    }
     else if (eos && eos->t == J_ARR)
         for (int i = 0; i < eos->len && found < max; i++)
-            if (eos->kids[i]->t == J_NUM) out[found++] = (int)eos->kids[i]->num;
+            if (coli_stop_id_from(eos->kids[i], &out[found])) found++;
     return found;
 }
 

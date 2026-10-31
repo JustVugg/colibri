@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "hypothesis": "Adding an SSSE3 (128-bit) integer-dot tier to c/idot.h lets pre-AVX2 x86-64 CPUs run the dense trunk's integer path (COLI_DENSE_IDOT=1) vectorised via _mm_maddubs_epi16/_mm_madd_epi16 instead of a scalar fallback, raising decode throughput with no change to the generated tokens.",
+  "commit": "4734cb6dfb9c62baffb7facc7ac8702b159abe08",
+  "model": "Qwen3.6-35B-A3B (qwen36_i4_gs64), 256 routed experts topk=8 (int4 grouped-64) + int8 dense trunk; colibri 2.0.0-cuda11.8",
+  "command": "COLI_DENSE_IDOT=0 vs 1 (single changed variable, everything else held constant). Engine (per arm): numactl --interleave=all ./coli serve --model /models/qwen36_i4_gs64 --host 0.0.0.0 --port 8000 --gpu 0 --ctx 131072 --cap 256, OMP_NUM_THREADS=24, COLI_PLACE=lmhead=0,dnproj=0, dense trunk prefill on a Tesla P40. Benchmark: benchmarks/colibri/run.sh PROMPT_TOKENS=128 MAX_TOKENS=32 REPEAT=3, warmup 1; decode_tok_s = (completion_tokens-1)/(duration - first_output), prefill_tok_s = prompt_tokens/first_output.",
+  "prompt_hash": "eae18ee9f98648522148bd4f8339f3476f92248d1723826969f73db59ecbdac6",
+  "hardware": {
+    "cpu": "2x Intel Xeon E5-2697 v2 (Ivy Bridge, 12c/24t per socket, 2 NUMA nodes), flags avx f16c sse4_2 ssse3 (no avx2/fma/vnni/bmi2); 48 logical CPUs",
+    "ram": "128 GB",
+    "storage": "model on /mnt/LLM1/models/colibri (NVMe, ext4)",
+    "os": "Ubuntu (host), gcc 13.3.0 -O3 -march=native, CUDA 11.8; engine banner 'idot: ssse3'"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "COLI_DENSE_IDOT"
+  ],
+  "baseline": {
+    "config": {
+      "COLI_DENSE_IDOT": "0"
+    },
+    "samples": {
+      "tok_s": [
+        11.61,
+        11.64,
+        11.56
+      ]
+    },
+    "median_tok_s": 11.61,
+    "quality": {
+      "method": "token-exact vs the transformers oracle: TF 32/32 and greedy 20/20 under ORACLE_STRICT=1, with the native build banner reporting 'idot: ssse3'; the SSSE3 kernels are additionally bit-exact vs scalar via tests/test_idot_ssse3 (-mssse3 -mno-avx2 -mno-fma). tok_s is decode throughput (completion tokens over the decode span, prefill excluded); prefill medians were baseline 15.53 -> trial 16.99 tok/s (+9.4%).",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/ssse3-idot-baseline-2026-10-12-raw.txt",
+      "sha256": "5068ef5876362904957e27e4d3228316b405fc19a95d0cd2798bd50185fbddc9"
+    }
+  },
+  "trial": {
+    "config": {
+      "COLI_DENSE_IDOT": "1"
+    },
+    "samples": {
+      "tok_s": [
+        12.56,
+        12.57,
+        12.55
+      ]
+    },
+    "median_tok_s": 12.56,
+    "quality": {
+      "method": "token-exact vs the transformers oracle: TF 32/32 and greedy 20/20 under ORACLE_STRICT=1, with the native build banner reporting 'idot: ssse3'; the SSSE3 kernels are additionally bit-exact vs scalar via tests/test_idot_ssse3 (-mssse3 -mno-avx2 -mno-fma). tok_s is decode throughput (completion tokens over the decode span, prefill excluded); prefill medians were baseline 15.53 -> trial 16.99 tok/s (+9.4%).",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/ssse3-idot-trial-2026-10-12-raw.txt",
+      "sha256": "5d45383d8d11475365acf9e27158024ac53439a872f6a116d0d70d66924f9741"
+    }
+  },
+  "outcome": "improvement"
+}

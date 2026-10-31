@@ -11,7 +11,8 @@
  *   - promotion happens when the bytes pass by: a non-resident expert noted
  *     on a full device evicts the coldest resident there if it is hotter, a
  *     colder one is refused, and the swap is budget-neutral;
- *   - the e4m3 decode table is published to the backend before any upload.
+ *   - the e4m3 decode table is published to the backend before any upload;
+ *   - the int4 mode takes cap < n_experts in the same copy mode (#2090).
  *
  * No GPU, no toolkit; the fake backend records what the tier sends. */
 #include <stdio.h>
@@ -150,8 +151,12 @@ int main(void) {
     fake_lut_published = 0;
     check(!qt_init_fp8(NL, NE, D, IH, CAP, TOPK, NULL), "without a decode table the fp8 tier stays off");
     check(!G_fp8_stream, "a refused init does not leave the flag set");
-    /* and the classic modes still insist on cap == n_experts */
-    check(!qt_init(NL, NE, D, IH, CAP, TOPK, 0, 1), "int4 mode still refuses cap < n_experts");
+    /* the int4 mode takes cap < n_experts too now, in the same copy mode (#2090;
+     * tests/test_qwen36_tier_stream.c has the rest) */
+    check(qt_init(NL, NE, D, IH, CAP, TOPK, 0, 1) && qt_streaming(), "int4 mode starts in copy mode with cap < n_experts");
+    check(!G_fp8_stream && G.wfmt == 4, "and stays int4, not fp8");
+    qt_shutdown();
+    check(!qt_streaming(), "shutdown leaves copy mode");
 
     if (fails) { printf("test_qwen36_tier_fp8: %d failure(s)\n", fails); return 1; }
     printf("test_qwen36_tier_fp8: ok\n");

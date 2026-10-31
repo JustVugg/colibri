@@ -4,12 +4,15 @@
 // workgroup one (expert, row, RPW outputs) item with the expert's weights read through
 // qmatmul_grp.comp's address table. The same bindings (but binding 4) and expert entries.
 //   y[r,o]   = sum_i x[r,i] * dequant(W[o,i])                              (default)
-//   hid[r,o] = silu(gate[r,o]) * up[r,o], clamped as expert_act.comp's act 0  (-DGATE_UP)
+//   hid[r,o] = act(gate[r,o], up[r,o]), act 0 (SwiGLU, clamped by limit) or 1 (SiTU),
+//              as qmatmul_gate_up.comp computes them                          (-DGATE_UP)
 // x is staged in shared memory once per workgroup; each row's 16-byte weight words are
 // spread over lpr lanes (a power of two up to 64), RPS rows in flight per lane group,
 // partial sums joined with clustered subgroup adds. A row's arithmetic does not depend
 // on the batch around it.
-// Host: I % 32 == 0, I <= 8192, rowWords % 4 == 0; fmt 4: gs % 32 == 0.
+// Formats: 1 int8 and 2 int4 with a scale per row, 4 int4 and 7 MXFP4 (e2m1 nibbles in
+// int4's order, qmatmul.comp's mx4) with a scale per gs inputs.
+// Host: I % 32 == 0, I <= 8192, rowWords % 4 == 0; fmt 4 and 7: gs % 32 == 0.
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_clustered : require
@@ -28,7 +31,7 @@ layout(std430, binding = 3) writeonly buffer Y { float y[]; };
 #ifdef GATE_UP
 layout(std430, binding = 4) readonly buffer AM { int amap[]; };   // kgat > 0: as qmatmul_grp.comp's
 #endif
-layout(push_constant) uniform P { int I, O; float limit; int ibase; int kgat; int rpw; } p;
+layout(push_constant) uniform P { int I, O; float limit; int ibase; int kgat; int rpw; int act; float a, b; } p;
 
 #ifndef RPW
 #define RPW 64u
@@ -53,6 +56,17 @@ float d4(uint w, vec4 a, vec4 b) {
            b.z * float(int((w >> 24u) & 15u) - 8) + b.w * float(int(w >> 28u) - 8);
 }
 
+// MXFP4: e2m1 code n (bit 3 the sign) is (0, 0.5, 1, 1.5, 2, 3, 4, 6)[n & 7], twice those
+// packed as nibbles in one constant
+float e2(uint n) {
+    float v = float((0xC8643210u >> ((n & 7u) * 4u)) & 15u) * 0.5;
+    return (n & 8u) != 0u ? -v : v;
+}
+float dmx(uint w, vec4 a, vec4 b) {
+    return a.x * e2(w & 15u) + a.y * e2((w >> 4u) & 15u) + a.z * e2((w >> 8u) & 15u) + a.w * e2((w >> 12u) & 15u) +
+           b.x * e2((w >> 16u) & 15u) + b.y * e2((w >> 20u) & 15u) + b.z * e2((w >> 24u) & 15u) + b.w * e2(w >> 28u);
+}
+
 float red(float v, uint lpr) {
     if (lpr == gl_SubgroupSize) return subgroupAdd(v);
     if (lpr == 64u) return subgroupClusteredAdd(v, 64u);
@@ -63,6 +77,8 @@ float red(float v, uint lpr) {
     if (lpr == 2u) return subgroupClusteredAdd(v, 2u);
     return v;
 }
+
+float situ_tanh(float x) { return abs(x) < 0.000244140625 ? x : tanh(x); }   // qmatmul_gate_up.comp's
 
 // Called by each lane in the current word iteration, including padding rows.
 // Pair sharing is enabled only
@@ -94,7 +110,7 @@ void matrix_block(WRef4 w, SRef sc, int fmt, uint rowWords, uint gs, uint ng,
             uint q = qbase + t * rg, o = o0 + q;
             bool ok = t * rg < remaining && q < RW && o < uint(p.O);
             s[t] = 1.0;
-            if (fmt == 4) s[t] = group_scale(sc, o, ng, j, gs, ok, pair_scale);
+            if (fmt == 4 || fmt == 7) s[t] = group_scale(sc, o, ng, j, gs, ok, pair_scale);
         }
         [[unroll]] for (uint k = 0u; k < MAXNR; k++) if (k < nr) {
             float d[RPS];
@@ -105,6 +121,15 @@ void matrix_block(WRef4 w, SRef sc, int fmt, uint rowWords, uint gs, uint ng,
                     vec4 a = xsh[x0 + h];
                     [[unroll]] for (uint t = 0u; t < RPS; t++) {
                         float z = d8(v[t][h], a);
+                        d[t] = h == 0u ? z : d[t] + z;
+                    }
+                }
+            } else if (fmt == 7) {
+                uint x0 = k * I4 + j * 8u;
+                [[unroll]] for (uint h = 0u; h < 4u; h++) {
+                    vec4 a = xsh[x0 + h * 2u], b = xsh[x0 + h * 2u + 1u];
+                    [[unroll]] for (uint t = 0u; t < RPS; t++) {
+                        float z = dmx(v[t][h], a, b);
                         d[t] = h == 0u ? z : d[t] + z;
                     }
                 }
@@ -126,7 +151,7 @@ void matrix_block(WRef4 w, SRef sc, int fmt, uint rowWords, uint gs, uint ng,
         bool writer = jj == 0u && t * rg < remaining && q < RW && o < uint(p.O);
         // One per-row scale load, only in the lane which writes the result.
         float s = 1.0;
-        if (writer && fmt != 4) s = sc.v[o];
+        if (writer && fmt != 4 && fmt != 7) s = sc.v[o];
         [[unroll]] for (uint k = 0u; k < MAXNR; k++) if (k < nr)
             acc[t * MAXNR + k] = red(acc[t * MAXNR + k], lpr) * s;
     }
@@ -184,9 +209,14 @@ void main() {
                 [[unroll]] for (uint k = 0u; k < MAXNR; k++) if (k < nr) {
                     float g = ag[t * MAXNR + k];
 #ifdef GATE_UP
-                    float u = au[t * MAXNR + k];
-                    if (p.limit > 0.0) { g = min(g, p.limit); u = clamp(u, -p.limit, p.limit); }
-                    y[(xoff + it.y + k) * uint(p.O) + o] = (g / (1.0 + exp(-g))) * u;
+                    float u = au[t * MAXNR + k], h;
+                    if (p.act == 1) {
+                        h = p.a * situ_tanh(g / p.a) * (1.0 / (1.0 + exp(-g))) * (p.b * situ_tanh(u / p.b));
+                    } else {
+                        if (p.limit > 0.0) { g = min(g, p.limit); u = clamp(u, -p.limit, p.limit); }
+                        h = (g / (1.0 + exp(-g))) * u;
+                    }
+                    y[(xoff + it.y + k) * uint(p.O) + o] = h;
 #else
                     y[(xoff + it.y + k) * uint(p.O) + o] = g;
 #endif

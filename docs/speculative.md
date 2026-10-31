@@ -13,7 +13,7 @@ What runs where:
 |---|---|---|
 | `qwen38` (Qwen3.8 Flash Next) | the checkpoint's MTP head, up to 3 drafts (on by default when the checkpoint has it; `Q38_MTP=0` off, `Q38_MTP_DRAFTS`); prompt lookup, up to 5 (on by default; `COLI_LOOKUP=0` off) | up to 6 rows, on the CPU or in the Vulkan dense chain |
 | `qwen36` (Qwen3.6, Qwen3-Coder, Qwen3.8-27B) | prompt lookup, up to 5 (on by default; `COLI_LOOKUP=0` off) | up to 6 rows, on the CPU or in the Vulkan dense chain |
-| `colibri` (GLM-5.2) | its MTP head as before; without a head, the n-gram drafts come from the prompt lookup below and its gate by default (`COLI_LOOKUP=0`: its own n-gram drafts as before) | as before |
+| `colibri` (GLM-5.2) | its MTP head (`DRAFT`), carried by the gate below (`COLI_SPEC_GATE=0`: the acceptance guard of `COLI_MTP_GUARD_PCT` instead); without a head, the n-gram drafts come from the prompt lookup below and its gate by default (`COLI_LOOKUP=0`: its own n-gram drafts as before) | as before |
 
 ## How a verify works
 
@@ -59,9 +59,14 @@ pass its row. More copies split the convolution and the recurrence into one disp
 per copy, each ending on its row. The state crosses between them through memory in f32,
 so the rows get the bits of the single dispatch.
 
-Drafting stays off where a row's result depends on what is resident: qwen36 under the
-CUDA expert tier, `CACHE_ROUTE` or a qpack container (with `COLI_LOOKUP=1` asked for, a
-`[qwen36] COLI_LOOKUP=1: no drafts under ...` line says so; the default stays quiet). One case stays inside the gate but changes the last bits: with the
+Drafting stays off where a row's result depends on what is resident: qwen36 under a
+CUDA expert tier holding part of the experts, `CACHE_ROUTE` or a qpack container (with
+`COLI_LOOKUP=1` asked for, a `[qwen36] COLI_LOOKUP=1: no drafts under ...` line says so;
+the default stays quiet). A tier holding every routed expert, run by the CUDA chain, drafts:
+nothing there depends on residency, and the chain's verify rows get a decode step's bits.
+On an RTX PRO 4000 (Qwen3.6-35B-A3B int4-g64) a code edit of 400 tokens took 3.25 s
+against 4.40 s without lookup, 2.91 tokens per forward, the same text; on a chat answer
+the gate declined almost every proposal (98.2-98.8 against 97.8-98.3 tok/s). One case stays inside the gate but changes the last bits: with the
 Vulkan expert tier on, a verify's rows, the rejected drafts' included, feed the tier's
 history, so which experts are on the device follows what was drafted. An expert on the
 device sums in a different order than on the CPU, so the logits of a run with drafts and
@@ -80,6 +85,26 @@ not a recommendation to freeze the tier for normal use.
 The engine loads the head by default when the checkpoint has one and the whole model is
 loaded, and says so when it cannot; `Q38_MTP=0` leaves it unread, and `Q38_MTP=1` refuses a
 checkpoint without one (see [qwen38.md](qwen38.md#speculative-decoding-with-the-mtp-head)).
+With the Vulkan dense chain running every layer and the lm_head on the device, the head
+stays off unless `Q38_MTP=1` asks for it. With it, the head's layer runs on the device
+too (`q38c_mtp_rows`): its input (the embedding's norm and `fc_embedding` added to each
+stream's norm and `fc_hidden`), its attention over its own K/V mirror (the KV split's last
+attention ordinal, its own RoPE base), its routed experts in the frame once the tier holds
+all of them (the tier keeps an MTP head's experts whole there, `VktConfig.extra_whole`),
+its mixer and the lm_head. `Q38_MTP_CHAIN=0` runs the head's layer on the CPU instead,
+once per draft and once per accepted row.
+
+The head still does not pay for itself beside the full chain: a verify of three rows costs
+about two and a half plain steps there (each row routes its own experts), and the head
+reads every prompt row. An RTX PRO 4000 with Qwen3.8-Flash-Next IQ2_XS, a 507-token
+prompt, two drafts, 2.89 tokens a forward (95% of the drafts accepted), the three settings
+started in turn twice (prefill / decode, tok/s):
+
+| | first | second |
+|---|---|---|
+| the head off (the default) | 88.8 / 33.8 to 35.3 | 94.2 / 37.1 to 38.0 |
+| the head's layer on the CPU (`Q38_MTP_CHAIN=0`) | 76.8 to 80.2 / 26.7 to 30.5 | 72.0 to 76.4 / 24.8 to 27.9 |
+| the head's layer on the device | 71.7 / 29.0 to 32.4 | 77.7 / 35.6 to 40.1 |
 Its first draft reads the model's four streams at the last fed position with the picked
 token. Each next draft reads the head's own streams from the row before, in place of the
 model's (only the verify computes those), with the draft just proposed. Those deeper
@@ -89,7 +114,59 @@ standing rows' streams, each with the token that followed it.
 
 `Q38_MTP_DRAFTS` sets the drafts per verify: `1`, `2` or `3` drafts every time, or `0` /
 `auto` to let the gate pick 0 to 3 per verify. The default is 2, the depth measured
-fastest (below). `Q38_MTP_DRAFTS=1` is the one-draft verify that came before.
+fastest (below), and 1 on an integrated GPU with 32 or more compute units, the expert tier
+and the dense chain on ([vulkan.md](vulkan.md#the-chain-on-a-radeon-780m)). `Q38_MTP_DRAFTS=1` is the
+one-draft verify that came before.
+
+### The draft vocabulary
+
+For a draft the head scores a list of tokens instead of the 248,320 of the vocabulary. The list
+has the `Q38_MTP_VOCAB` tokens with the highest counts (`16000` by default), every token with a
+count of at least 3/4 of the count of the last of those, and every token of the current
+conversation. Every token read as part of a prompt (past the part restored from the prefix cache)
+and every token picked adds 1 to the count of that token. All counts halve every 1024 counted
+tokens. The list is rebuilt when a request starts and at every halving. A picked token missing from
+it joins it at once.
+
+The counts are written to a file in the model directory when a run ends or serve receives SIGTERM,
+and the next run starts from them. `COLI_VOCAB_USAGE` sets another file and `USAGE_SAVE=0` skips the
+write. A file that cannot be read as counts, has counts for another vocabulary size or ends on a
+damaged record is not replaced. The list is off when `COLI_VOCAB_USAGE` and `COLI_USAGE` are the
+same file.
+
+The output does not change: the verify step checks every token, and a token missing from the list
+can only turn an accepted draft into a rejected one. The CPU scores the listed rows from the int8
+rows of the `lm_head`, so `COLI_VK_DENSE_HOST=0` does not release those rows from host RAM. The
+head scores the whole vocabulary with `Q38_MTP_VOCAB=0`, with `Q38_MTP_DUMP`, with
+`Q38_DRAFT_HEAD=int4`, without int8 rows on the host (for example with `Q38_TRUNK_CPU_INT8=0`), and
+while the dense chain is on, where the device scores it. Each run and served turn prints the
+average size of the list, the share of picks inside it, and the ids appended and rebuilds.
+
+Qwen3.6's head uses the same list with `Q36_MTP_VOCAB`, on by default where it drafts on the CUDA
+chain ([qwen36.md](qwen36.md#the-mtp-head-q36_mtp)); its engine writes the counts at exit, not on
+SIGTERM.
+
+## The MTP head's drafts (qwen36)
+
+`Q36_MTP=1` reads the release's `mtp.*` block from the converted container
+([conversion and settings](qwen36.md#the-mtp-head-q36_mtp)). Its input pairs
+the backbone's output **after its final norm** with the next token's embedding.
+The head has its own causal KV cache; every completed pair contributes its K/V,
+and only a draft row runs the full attention/MoE/output computation.
+
+`Q36_MTP_DRAFTS=1..7` bounds the depth, `auto` lets the measured gate choose,
+`Q36_MTP_PMIN` stops uncertain deeper drafts, and `Q36_MTP_VOCAB` (the most
+used tokens, on by default on the CUDA chain) or `Q36_MTP_VOCAB_IDS` limits
+only the draft's output scoring. When lookup also proposes tokens the gate
+chooses a source by its measured value. Both sources share verification and
+rollback; `[qwen36 mtp]` reports the head's acceptance separately. A rejected
+row or an unconsumed tail never commits to the backbone state. Pins preserve
+the pending residual as well as the backbone recurrence.
+
+`make -C c qwen36-tiny-mtp-check` checks reference logits, exact output and final
+logits at every depth, forced rejection/acceptance/mixed rows, and multi-turn
+serve including prefix reuse, pin restore and sampling. The reference uses
+Qwen's Transformers decoder with the converted int8 or int4-g64 weights.
 
 ## Prompt lookup
 
@@ -119,11 +196,77 @@ cost(k)  = (T(k+1) + (k-1) d) / T(1)                    in plain decode steps
 
 and it drafts only when that beats a plain step (`value(k) > 1`). A row count not
 measured yet costs `T(1) (1 + (n-1) rho)`, with `rho` fitted from the multi-row forwards
-that ran (0.5 until one has). Every 16 picks it tries one draft deeper than its best,
-so an estimate it stopped feeding can recover. After 64 forwards without a plain step it
-takes one, so `T(1)` stays measured. Prompt lookup is always gated. The MTP head is
-gated under `Q38_MTP_DRAFTS=0`. `COLI_SPEC_GATE=0` drafts every proposal in full
-(the tests use it).
+that ran once `T(1)` is measured (0.5 until then). Every 16 picks it tries one draft
+deeper than its best, so an estimate it stopped feeding can recover. After 64 forwards
+without a plain step it takes one, so `T(1)` stays measured. A fixed depth of 2 or more
+whose drafts are trimmed (below) takes one too, because the trim prices rows with `T(1)`
+and `rho`. Prompt lookup is always gated. The MTP head is
+gated under `Q38_MTP_DRAFTS=0`. colibri's MTP head (GLM-5.2) is always gated: its head
+runs a layer of its own for each draft and absorbs the drafts that stood, so a verify's
+`T(n)` counts the forward, the head's drafts and that absorb. `COLI_SPEC_GATE=0` drafts
+every proposal in full (the tests use it), and on colibri brings back the acceptance
+guard that pauses the head for 256 tokens under 70% (`COLI_MTP_GUARD_PCT`,
+`COLI_MTP_GUARD_WINDOW`).
+
+**Each step's own drafts.** The averages above give every step the same depth whatever
+its drafts look like. A source that can say how likely each of this step's drafts is
+passes that estimate `p_j` to `spec_gate_pick_p`, and `a_j` in `E(k)` becomes the
+acceptance the gate measured for drafts given that estimate (ten bins of `p`, each
+starting at the bin's own `p` and worth two verifies, then fed by every verify). Those
+`k` drafts are already written, so `spec_gate_pick_p` prices only their verify
+(`T(k+1) / T(1)`), not the time spent writing them. Before the head writes draft `n + 1`,
+`spec_gate_deeper_p` lets it write that draft only when no shorter verify is already
+worth more than `n` drafts and `n + 1` drafts, the new one as likely as the gate's best
+bin, would beat both a plain step and `n`. The time of that draft is not counted there:
+it stops only drafts that could not pay for their verify row. A step whose drafts are
+sure verifies deeper, a doubtful one stops early. This is DeepSeek's
+confidence-scheduled verification, and the estimate is:
+
+- for the MTP heads, the head's probability of its own token (the softmax over the scores
+  it computed, those within 20 of the best): Qwen3.6, Qwen3.8 and colibri's GLM-5.2;
+- for DeepSeek V4.1's DSpark, the sigmoid of its confidence head
+  ([deepseek-v41.md](deepseek-v41.md#dspark-drafting-and-why-accepting-a-draft-is-safe)).
+
+Qwen3.6 and Qwen3.8 keep the first draft (the head pass that wrote it is one a plain step
+makes too), trim the deeper ones within a fixed depth (`Q36_MTP_DRAFTS`, `Q38_MTP_DRAFTS`
+from 2), and stop writing drafts when no next one could be worth its verify row
+(`spec_gate_deeper_p`). Under `auto` the averages pick the
+depth alone: fed by the verifies the estimates trimmed, which kept the sure drafts, they
+learned a higher acceptance than the head has and picked deeper. GLM-5.2's head runs a
+layer of its own per draft, so there the probability can also turn the verify into a
+plain step: on a model read from the disk the verify's second row brings experts of its
+own.
+
+It is on by default for Qwen3.6 (`Q36_MTP_PSTEP=0` turns it off) and opt-in for Qwen3.8
+(`Q38_MTP_PSTEP=1`) and GLM-5.2 (`MTP_PSTEP=1`). Measured on an RTX PRO 4000 (24 GB),
+`coli serve`, 128 tokens, two rounds of three prompts, each setting in turn (decode
+tok/s; every Qwen3.6 run printed the text of the run without the head, prompt by prompt):
+
+| Qwen3.6-35B-A3B int4-g64, its head | CUDA chain | Vulkan chain |
+|---|---|---|
+| no head | 99.7-104.5 | 83.2-83.8 |
+| 1 draft (the default; nothing to trim) | 115.8-120.1 | 99.9-109.3 |
+| 2 drafts, `Q36_MTP_PSTEP=0` | 94.6-108.6 | 100.4-103.7 |
+| 2 drafts, per step | 104.2-111.9 | 101.5-107.2 |
+| 3 drafts, `Q36_MTP_PSTEP=0` | 88.6-95.2 | |
+| 3 drafts, per step | 104.9-110.2 | |
+| `auto` | 114.7-118.8 | |
+| `auto` with the per-step depth (not what ships) | 106.0-120.6 | |
+
+So one draft stays the fastest depth on that card, and the per-step depth takes most of
+the loss out of a deeper one. Those runs predate the plain step every 64 forwards at a
+fixed depth and the check before each draft: on an L4 with every expert in VRAM, that
+change made two drafts 9-15% faster
+([qwen36-mtp-fixed-depth-2026-10-25](experiments/qwen36-mtp-fixed-depth-2026-10-25/)).
+On Qwen3.8 Flash Next IQ2_XS with its Q8_0 head, Vulkan chain, two drafts, it measured
+1 to 5% slower (33.9-38.0 against 34.1-39.0 tok/s; the head itself is off by default
+beside that chain, 35.8-49.6 without it), hence opt-in there (measured before that
+change, not since). GLM-5.2 has not been measured on a real checkpoint with it.
+
+A step that does not run colibri's head (a plain step, or another source's verify)
+leaves the head's KV row for that position unwritten. The head's window then restarts
+at its next draft, or at the next rows it absorbs, instead of attending a row that
+holds nothing of this text.
 
 When the gate decided anything, a run prints what it measured on a `[qwen38 spec gate]`
 or `[qwen36 spec gate]` line: `T(1)`, the cost of each row count it saw in units of
@@ -147,11 +290,15 @@ state is the one plain decoding leaves.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `Q38_MTP` | on when the checkpoint has the head | `0`: plain decoding, the head unread; `1`: the head, and a checkpoint without one is refused. The RAM plan (`coli plan`) prices the head when it is on: its dense tensors and its own expert cache (`Q38_MTP_CAP`, the layers' cap by default, at the head's FP8 record). |
-| `Q38_MTP_DRAFTS` | `2` | qwen38 with the MTP head on: the MTP head's drafts per verify, `1` to `3`, or `0` / `auto` for the gate's pick. |
+| `Q38_MTP_CHAIN` | on | qwen38 with the MTP head on beside a dense chain that holds every layer: the head's layer runs on the device (`q38c_mtp_rows`); `0`: on the CPU. |
+| `Q38_MTP` | on when the checkpoint has the head, off beside a dense chain that holds every layer | `0`: plain decoding, the head unread; `1`: the head, and a checkpoint without one is refused. The RAM plan (`coli plan`) prices the head when it is on: its dense tensors and its own expert cache (`Q38_MTP_CAP`, the layers' cap by default and every expert of the head where the engine sets that, at the head's FP8 record). |
+| `Q38_MTP_DRAFTS` | `2`; `1` on an integrated GPU with 32 or more compute units, the expert tier and the dense chain on | qwen38 with the MTP head on: the MTP head's drafts per verify, `1` to `3`, or `0` / `auto` for the gate's pick. |
+| `Q38_MTP_VOCAB` | `16000` | qwen38 with the MTP head on: how many of the most used tokens the head scores for a draft. `0`: the whole vocabulary. |
 | `COLI_LOOKUP` | `1` | Prompt-lookup drafts (qwen38, qwen36), and colibri's n-gram drafts from the same lookup and gate when it has no MTP head; always gated. `0` turns them off. |
 | `COLI_LOOKUP_DRAFTS` | `5` | Lookup drafts per verify at most, `1` to `5`. |
 | `COLI_SPEC_GATE` | `1` | `0`: every proposal drafted in full, the gate's estimates ignored (tests). |
+| `Q36_MTP_PSTEP` | `1` | qwen36: within a fixed `Q36_MTP_DRAFTS` of 2 or more, the verify's depth from each step's drafts' probabilities under the head (see the gate). `0`: the fixed depth. |
+| `Q38_MTP_PSTEP`, `MTP_PSTEP` | `0` | qwen38 (within a fixed `Q38_MTP_DRAFTS` of 2 or more) and colibri (GLM-5.2's head): `1` takes the verify's depth from each step's drafts' probabilities under the head too. |
 | `Q38_MTP_FORCE`, `COLI_LOOKUP_FORCE` | unset | Tests: in `ref.json` mode, `accept` drafts the reference's tokens, `mixed` makes every other verify's first draft wrong, `cycle` moves the wrong draft over the rows verify by verify, `rowN` makes draft `N` wrong; `Q38_MTP_FORCE=reject` also refuses every draft. |
 
 ## Measured
@@ -183,7 +330,7 @@ but the speed peaks at two. A verify of `k` drafts reads the trunk once, but eve
 routes its own 10 experts per layer (the cache hit rate falls from 81% without MTP to
 76% at two drafts), and a rejected row's expert reads are spent all the same. At three
 drafts the third row stands 65% of the time and costs more than it returns. The
-default is therefore 2 (`Q38_MTP_DRAFTS=2`) on the CPU and in the chain alike.
+default is therefore 2 (`Q38_MTP_DRAFTS=2`) on the CPU and in the chain alike, measured on a Radeon 780M.
 
 **Prompt lookup on a code edit.** The prompt asks to rename a variable in 23 lines of C
 and print the code again (`enable_thinking: false`). 160 tokens; Qwen3.8 at cap 170 on
@@ -256,6 +403,20 @@ does not include that layer. This is not a fully device-resident drafter.
 
 Not measured: a long context with speculation, a model whose routed experts all fit
 in RAM, and any discrete GPU (none was available).
+
+**GLM-5.2's MTP head under the gate.** GLM-5.2 UD-IQ1_S (202 GB) on an RTX PRO 4000
+(24 GB) with 62 GB of RAM, the Vulkan chain and tier, most experts from the disk, a
+96-token answer, servers alternated:
+
+| | decode tok/s | |
+|---|---|---|
+| the gate | 0.681, 0.704 | drafting all along: 75-81% accepted, a verify of 2 rows 1.50-1.65 plain steps |
+| `MTP=0` | 0.678, 0.712 | |
+| the acceptance guard (before) | 0.638, 0.646 | 67% over the first 24 proposals, then paused |
+
+On this machine a verify's second row brings experts of its own from the disk, so a draft
+returns about what it costs: the head comes out even with plain decoding, where the
+guard's first window lost 4%.
 
 ## Another engine with a verify path
 

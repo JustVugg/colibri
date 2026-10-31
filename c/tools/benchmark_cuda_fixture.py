@@ -8,6 +8,11 @@ import statistics
 import subprocess
 from pathlib import Path
 
+try:
+    from tools.engine_environment import engine_environment
+except ModuleNotFoundError:              # direct execution from c/tools
+    from engine_environment import engine_environment
+
 
 SPEED_RE = re.compile(r"REPLAY decode:.*\| ([0-9.]+) tok/s")
 # accetta sia il formato storico "expert-disk 0.123s |" sia quello attuale
@@ -65,7 +70,7 @@ def main() -> None:
 
     model = Path(args.model).resolve()
     stats = model / "bench_stats.txt"
-    base = os.environ.copy()
+    base = engine_environment()
     for key in (
         "COLI_CUDA", "COLI_GPU", "COLI_GPUS", "CUDA_EXPERT_GB",
         "PIN", "PIN_GB", "STATS", "TF", "REPLAY", "CUDA_DENSE",

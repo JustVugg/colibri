@@ -1,0 +1,12 @@
+diff --git a/c/qwen36_tier.c b/c/qwen36_tier.c
+index e94be8c2..3819f98b 100644
+--- a/c/qwen36_tier.c
++++ b/c/qwen36_tier.c
+@@ -1873,6 +1873,7 @@ void qt_stats_mark(void){
+
+ static void qt_lfru_tick_locked(void){
+     if(G_chain_own) return;   /* the chain's to move */
++    if(getenv("QT_DIAG_NOSWAP")) return;   /* diagnostic only */
+     size_t n=(size_t)G.nl*G.ne;
+     G.tick++;
+     if(G_stream){   /* copy mode: qt_note_wanted's bar */

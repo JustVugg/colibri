@@ -34,6 +34,7 @@
 #ifndef KV_PREFIX_H
 #define KV_PREFIX_H
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -144,6 +145,48 @@ static inline int kv_prefix_holds(const kv_prefix *p, const int *pin, int pin_le
     if (!p || !p->fed || !pin || pin_len <= 0) return 0;
     if (p->tainted || p->len < pin_len || pin_len > p->cap) return 0;
     return memcmp(p->fed, pin, (size_t)pin_len * sizeof(int)) == 0;
+}
+
+/* How many leading tokens of this prompt the state holds, whatever follows them: at most n - 1,
+ * since a step reads one token at least. An engine whose state is attention alone resumes from
+ * there (a row depends on its prefix and nothing later); one with a recurrence cannot. */
+static inline int kv_prefix_common(const kv_prefix *p, const int *ids, int n) {
+    if (!p || !p->fed || !ids || p->tainted) return 0;
+    int i = 0, top = p->len < n - 1 ? p->len : n - 1;
+    while (i < top && p->fed[i] == ids[i]) i++;
+    return i;
+}
+
+/* COLI_PREFIX_LOG, a prompt that reused nothing: how far it follows what the state holds,
+ * and the text where it stops (decode: a token's bytes, at most 256). An engine that can
+ * only resume from the state it holds re-reads a whole conversation whenever a client
+ * changes the history before its end (a system prompt with the time in it, an answer sent
+ * back without its reasoning, a short request of its own in between): this says where. */
+static inline void kv_prefix_log_text(const char *what, const int *ids, int from, int to,
+                                      void (*decode)(int, unsigned char *, int *)) {
+    if (from < 0) from = 0;
+    fprintf(stderr, "%s \"", what);
+    for (int i = from; i < to; i++) {
+        unsigned char t[256]; int n = 0;
+        decode(ids[i], t, &n);
+        for (int j = 0; j < n; j++) {
+            if (t[j] == '\n') fputs("\\n", stderr);
+            else if (t[j] < 32) fprintf(stderr, "\\x%02x", t[j]);
+            else fputc(t[j], stderr);
+        }
+    }
+    fputs("\"\n", stderr);
+}
+static inline void kv_prefix_miss_log(const kv_prefix *p, const int *ids, int n,
+                                      void (*decode)(int, unsigned char *, int *)) {
+    int held = p && p->fed ? p->len : 0, at = 0;
+    if (!ids || held <= 0) return;
+    while (at < held && at < n && p->fed[at] == ids[at]) at++;
+    fprintf(stderr, "[PREFIX] the prompt follows the held state for %d of its %d tokens\n", at, held);
+    if (at >= held || !decode) return;   /* it follows all of it: what stopped the reuse was not the text */
+    kv_prefix_log_text("[PREFIX]   before:", ids, at - 16, at, decode);
+    kv_prefix_log_text("[PREFIX]   prompt:", ids, at, at + 16 < n ? at + 16 : n, decode);
+    kv_prefix_log_text("[PREFIX]   held:  ", p->fed, at, at + 16 < held ? at + 16 : held, decode);
 }
 
 #endif /* KV_PREFIX_H */

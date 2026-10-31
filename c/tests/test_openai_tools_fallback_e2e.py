@@ -195,6 +195,57 @@ class _TwoTurnLoop(_FallbackBase):
 class OlmoeToolFallbackE2E(_TwoTurnLoop):
     arch = "olmoe"
 
+    def _history_body(self, arguments):
+        return {
+            "model": self.model_id(),
+            "messages": [
+                {"role": "user", "content": "weather in Rome?"},
+                {"role": "assistant", "content": None,
+                 "tool_calls": [{"id": "call_owned", "type": "function",
+                                 "function": {"name": "get_weather",
+                                              "arguments": arguments}}]},
+                {"role": "tool", "tool_call_id": "call_owned",
+                 "content": '{"temp_c":25}'},
+            ],
+            "tools": TOOLS, "temperature": 0, "max_tokens": 128,
+        }
+
+    def test_nonobject_history_arguments_are_client_errors(self):
+        self.assertEqual(self.fallback, "1")
+        for arguments in ('[1]', '"x"', 'true', '1', 'not JSON'):
+            with self.subTest(arguments=arguments):
+                if arguments != 'not JSON':
+                    self.assertNotIsInstance(json.loads(arguments), dict)
+                prompts_before = self.mock_log.read_bytes()
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    self.post(self._history_body(arguments))
+                self.addCleanup(caught.exception.close)
+                self.assertEqual(caught.exception.code, 400)
+                error = json.loads(caught.exception.read())["error"]
+                self.assertEqual(error["type"], "invalid_request_error")
+                self.assertEqual(error["param"],
+                                 "messages.1.tool_calls.0.function.arguments")
+                self.assertEqual(self.mock_log.read_bytes(), prompts_before)
+
+    def test_object_history_arguments_reach_opted_in_engine(self):
+        self.assertEqual(self.fallback, "1")
+        cases = (
+            ('{"location":"Rome"}',
+             '<tool_call>get_weather<arg_key>location</arg_key>'
+             '<arg_value>Rome</arg_value></tool_call>'),
+            ('{}', '<tool_call>get_weather</tool_call>'),
+        )
+        for arguments, expected_call in cases:
+            with self.subTest(arguments=arguments):
+                self.assertIsInstance(json.loads(arguments), dict)
+                prompts_before = self.mock_log.read_bytes()
+                out = self.post(self._history_body(arguments))
+                self.assertIn("25", out["choices"][0]["message"]["content"])
+                added_prompt = self.mock_log.read_bytes()[len(prompts_before):].decode()
+                self.assertIn("<tools>", added_prompt)
+                self.assertIn(expected_call, added_prompt)
+                self.assertIn("<tool_response>", added_prompt)
+
 
 class Qwen36NativeToolsE2E(_TwoTurnLoop):
     """Native Qwen3.6 tool calling works without the fallback flag."""

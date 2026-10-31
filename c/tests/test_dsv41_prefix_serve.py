@@ -23,7 +23,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from prefix_serve_harness import PrefixReuseContract, ServeEngine  # noqa: E402
+from prefix_serve_harness import PrefixReuseContract, PromptCancelContract, ServeEngine  # noqa: E402
 
 HERE = Path(__file__).resolve().parent.parent
 ENGINE = HERE / ("deepseek_v41.exe" if sys.platform == "win32" else "deepseek_v41")
@@ -82,7 +82,14 @@ class Dsv41ContextTest(unittest.TestCase):
 @unittest.skipUnless(ENGINE.exists(), "deepseek_v41 is not built")
 @unittest.skipUnless((FIXTURE / "model.safetensors").exists(),
                      "tiny dsv41 fixture is absent (tools/make_dsv41_tiny.py)")
-class Dsv41PrefixServeTest(PrefixReuseContract, unittest.TestCase):
+class Dsv41PrefixServeTest(PrefixReuseContract, PromptCancelContract, unittest.TestCase):
+    # a cancelled prompt's rows are in the window rings and the compressor's groups: the
+    # engine starts over (model_reset, 0 tokens held), and the next turn reads its prompt whole
+    PROMPT_CANCEL_KEEPS_PREFIX = False
+
+    # a short request between two turns parks the conversation (park.h)
+    PARKS = True
+
     # This fixture's vocabulary is the byte range, so a reply survives the round
     # trip and the replay scenario can require reuse to fire. It is also the
     # scenario that covers the speculative rollback: DSpark drafts through that

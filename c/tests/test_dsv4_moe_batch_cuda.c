@@ -9,6 +9,11 @@ static Dsv4CudaTensor*fp8_zero(int O,int I){size_t wn=(size_t)O*I,sn=(size_t)((O
 
 int main(void){
     enum { T=2,H=4096,I=2048,E=256 };
+    /* dsv4_cuda_route_moe_batch (GPU top-6 + MoE in one call) is DeepGEMM-only:
+     * generic builds compile it as a `return 0` stub. The engine's batched
+     * prefill routes first and calls route_moe_ids_batch, whose generic path
+     * test_dsv4_generic_bitwise_cuda.c covers. Skip before the 3.2 GiB bank. */
+    if(!strcmp(dsv4_cuda_backend_name(),"generic")){puts("dsv4 MoE batch: SKIP (generic build: dsv4_cuda_route_moe_batch needs DeepGEMM)");return 0;}
     int dev=0;if(!dsv4_cuda_init(&dev,1))return 1;
     Dsv4CudaTensor*sg=fp8_zero(I,H),*su=fp8_zero(I,H),*sd=fp8_zero(H,I),*gate=NULL;
     float*gw_router=calloc((size_t)E*H,sizeof(float));if(!sg||!su||!sd||!gw_router||!dsv4_cuda_upload_f32(&gate,gw_router,E,H,dev))return 2;free(gw_router);

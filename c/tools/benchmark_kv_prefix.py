@@ -9,6 +9,11 @@ import sys
 import threading
 import time
 
+try:
+    from tools.benchmark_process import close_engine
+except ModuleNotFoundError:              # direct execution from c/tools
+    from benchmark_process import close_engine
+
 
 def stderr_drain(pipe, lines):
     for raw in iter(pipe.readline, b""):
@@ -129,8 +134,7 @@ def main():
                 }
             )
     finally:
-        proc.stdin.close()
-        proc.wait(timeout=30)
+        close_engine(proc)
         thread.join(timeout=1)
 
     prefix_lines = [line for line in stderr_lines if "[API] KV " in line]

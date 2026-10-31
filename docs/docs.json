@@ -15,7 +15,7 @@
         "groups": [
           {
             "group": "Get started",
-            "pages": ["index", "quickstart", "AI_SETUP", "MCP_SERVER"]
+            "pages": ["index", "quickstart", "gguf", "AI_SETUP", "MCP_SERVER"]
           },
           {
             "group": "Serve models",
@@ -23,7 +23,7 @@
           },
           {
             "group": "Model engines",
-            "pages": ["deepseek-v4", "kimi_k3", "qwen38", "qwen36", "inkling", "mimo", "qwen-image", "laya", "gliner_decide", "clef"]
+            "pages": ["deepseek-v4", "kimi_k3", "mistral-large4", "qwen38", "qwen36", "inkling", "mimo", "qwen-image", "laya", "gliner_decide", "clef"]
           },
           {
             "group": "Configure and tune",
@@ -31,7 +31,7 @@
           },
           {
             "group": "Hardware backends",
-            "pages": ["cuda", "metal", "vulkan", "windows"]
+            "pages": ["cuda", "metal", "vulkan", "gpu-parity", "windows"]
           },
           {
             "group": "Contribute",

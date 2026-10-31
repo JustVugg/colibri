@@ -23,19 +23,45 @@ more GPUs and computed there through the existing shared CUDA backend
   so a long-lived process can replace experts from an old workload instead of
   permanently freezing its initial hot set. A parallel **warmstart** fills the per-device
   budget before the first token — ordered by a persisted heat table
-  (`HEAT_FILE`) when present, so a second run starts fully placed.
+  (`HEAT_FILE`) when present, so a second run starts fully placed. Without one
+  it takes expert 0 of every layer, then expert 1, and so on, so each layer
+  holds its share: in index order the card held whole layers (on a Colab T4,
+  layers 0-24 and part of 25), and a prompt chunk copied the other layers'
+  experts over the bus one layer after another, after 25 layers with the bus
+  idle (a Colab T4's 512-token prompt, after a 64-token one and its decode,
+  reads 14 % faster: `docs/experiments/qwen36-tier-spread-2026-10-27`).
 - **Decode:** per (token, layer) the resident experts are issued as async
   groups on all devices (`coli_cuda_expert_group_issue/take`); VRAM misses
-  fall back to the CPU int8 path and overlap with the in-flight groups, as
-  does the shared expert. Placement never changes routing or precision.
-- **Memory:** on an **int4 container** the warmstart frees the RAM int8 copies
-  of VRAM-resident experts (rematerialized from the packed int4 copy on LFRU
-  eviction; no container access). Peak RSS for the 35B int4 container: ~29 GB
-  with two 8 GB GPUs. The RSS saving is a property of packed containers only:
-  on an **int8 container** there is no second copy to rematerialize from, so
-  since #1341 nothing is freed and every resident keeps its full RAM weights —
-  such a run gets the tier's VRAM speed at full residency cost, and the 29 GB
-  figure below does not apply to it.
+  fall back to the CPU and overlap with the in-flight groups, as does the
+  shared expert. Placement never changes routing. With planar int4 in RAM it
+  decides which kernel computes an expert, and so its last digits (see "The
+  residents follow the conversation").
+- **Memory:** on an **int4 gs64 container** the experts stay planar int4 in
+  RAM (`expert_ffn.h`, the CPU's kernel for the misses), one copy at the size
+  on disk; the tier converts the planar bytes to its pairs when it stages an
+  upload. Before #2090 the CUDA build unpacked every expert to int8 and kept
+  the packed int4 beside it for the uploads, three times the bytes on disk,
+  while the planner (`--auto-tier`) priced the bytes on disk.
+  `QWEN_EXPERT_KERNEL=0` keeps that historical layout (int8 for the CPU, the
+  int8 copy of VRAM residents dropped at the warmstart). On an **int8
+  container** every expert keeps its int8 weights in RAM (#1341).
+- **Any RAM size:** with every expert of a layer in RAM (`cap` >= `n_experts`)
+  the tier keeps pointers into the slots and swaps residents on its own
+  (LFRU ticks, `QT_PREFILL_REPLAN`). With fewer, it copies an expert while the
+  engine holds it for the CPU and decides then whether it earns a place in
+  VRAM (the coldest resident of its device makes way when the newcomer is
+  hotter); VRAM residents are never read into RAM, so the two caches add up.
+  The warmstart then loads only the experts it places in VRAM, and the RAM
+  cache fills as the CPU's experts are routed. Before #2090 a `cap` below
+  `n_experts` switched the tier off, trunk included.
+- **Heat:** every routed expert counts once per token, a hit in `qt_issue`,
+  a miss when the engine hands its bytes over (`qt_note`). Hits used to count
+  only through that note, which in copy mode (and on Qwen3.8) never comes for
+  a resident: residents stayed at the heat they arrived with, and any
+  newcomer warmer than that evicted them.
+- **No experts, still the trunk:** the mixed layout (int4 gate/up, int8
+  down), int8 experts with grouped scales and `COLI_PLACE` `experts=cpu` keep
+  the experts on the CPU, and the devices take the dense trunk below.
 
 ## Usage
 
@@ -68,9 +94,10 @@ the CUDA toolkit's `bin` directory on `PATH` for `cudart`. A startup line
 `[gpu] MoE experts -> CUDA VRAM tier` confirms the tier is active; without it
 the run is CPU-only.
 
-`cap` (argv[1]) must equal `n_experts` (full RAM residency). int4 containers
-only (the int8 container keeps the CPU path). `COLI_TIMERS=1` prints
-per-phase timings and tier telemetry.
+`cap` (argv[1]) is the RAM cache per layer as for the CPU build, any size
+(see "Any RAM size" above; before #2090 any `cap` but `n_experts` switched the
+tier off, a larger one included); `--auto-tier` sizes it from the RAM. `COLI_TIMERS=1`
+prints per-phase timings and tier telemetry.
 
 ## Placement: where the dense trunk goes (`COLI_PLACE`)
 
@@ -122,7 +149,17 @@ a byte of trunk: one DeltaNet input projection is timed both ways on the
 device that would host it (ten GEMVs, best of three rounds, after a warm-up),
 one `[place] probe:` line reports both times, and if the GPU loses the whole
 automatic placement is withdrawn (`[place] trunk stays on the CPU`) and its
-bytes go back to the expert budget before the warmstart. Only the automatic
+bytes go back to the expert budget before the warmstart. On the CPU the ten
+GEMVs read the projections of ten layers, as decode reads each once a step:
+one 16 MiB projection read ten times stays in a big L3, and beside an RTX PRO
+6000 an EPYC 9B45 (three 32 MiB L3s) came within about 10% of the card that way
+and tied it under nsys. The experts follow
+(`[qtier] the experts stay on the CPU too`) when their allowance is automatic:
+the tier computes a resident expert with the same int8 GEMV and a round trip
+over PCIe, and a layer waits for its share. On a GTX 1650 Max-Q (#2211; 0.900
+ms on the card against 0.306 on the CPU) the tier with a tenth of the experts
+resident lost decode (9.2 against 10.9 tok/s) and prefill (14 against 46).
+`CUDA_EXPERT_GB=<GB>` keeps them on the device. Only the automatic
 placement is questioned: a hand-written `COLI_PLACE` stands, and
 `COLI_TRUNK_PROBE=0` skips the probe. The pricing rule:
 
@@ -303,6 +340,496 @@ cards would keep the MoE gain without that price. Cold, two cards win either
 way (45.3 against 52.3 ms), since more experts are resident at once. For the
 record, Ollama 0.34.4 on the same pair shows the same shape: 38.1 tok/s on the
 3070 alone, 36.6-37.5 on both cards, 33.0 on the Quadro alone.
+## The dense chain on the card (`COLI_CUDA_CHAIN`, on by default)
+
+With the trunk in VRAM and `Q36_DN_GPU=1`, a decode token still crossed the bus about
+seventy times: every attention projection (`qt_dense_matmul`: the input up, the kernel,
+the output down, a synchronization), every DeltaNet step, lm_head, and between them the
+CPU ran the attention core, the norms, the router and the shared expert. The Vulkan
+backend solved the same problem with its dense chain (`vk_chain.h`, docs/vulkan.md "The
+dense chain"): a whole layer recorded as one submission, the residual stream on the
+device from layer to layer, only the routed experts' rows crossing. `COLI_CUDA_CHAIN=1`
+is the CUDA twin, and it is shaped like the Vulkan one on purpose, so the engine wires
+both the same way:
+
+- `c/cuda_chain.h` / `c/cuda_chain.cu` (the backend): buffers (`CC_DEV` on the device,
+  `CC_UP` and `CC_DOWN` page-locked host memory the device reads or writes in place),
+  frames (`cc_begin` / `cc_submit(wait)` on one non-blocking stream per device, an event
+  per frame), and the ops `cc_matmul` (the backend's own GEMV / GEMM kernel over the
+  tier's resident tensors, on the chain's stream), `cc_norm`, `cc_rope`, `cc_attn`,
+  `cc_dnconv`, `cc_dnrec`, `cc_ew`, each the arithmetic of the shader of the same name
+  in `shaders/chain_*.comp`, ported line for line, with the Vkc parameter structs field
+  for field. The backend exports them as one table (`coli_cuda_chain_ops`), one symbol
+  for the Windows loader, versioned by its size: a DLL that predates the chain has none
+  and the engine stays on the per-matrix path.
+- `c/qwen36_cuda_chain.h` (the engine): `qwen36_chain.h`'s frames and state contract.
+  Per layer, frame A1: the previous layer's MoE output joins the residual (routed in
+  rank order, then the gated shared expert, then the add: the CPU's order), the input
+  norm, the gated attention (q/k/v, q/k norms, RoPE from the CPU's own cos/sin table,
+  the new K/V rows into the device cache and down to the host's, the attention with the
+  output gate, o_proj) or the Gated DeltaNet (the tier's fused qkv ++ z projection, b|a,
+  the convolution with its ring, the recurrence with its state, the gated norm,
+  out_proj), the residual add, the post-attention norm, the router logits; waited for.
+  The host routes, runs the routed experts through the tier (`moe_ex` routed only) and
+  hands the sum up. Frame A2, not waited for: the shared expert and its gate, on the
+  chain's stream while the tier's groups run on the backend's. The last frame runs the
+  final norm and lm_head on the last row, or on every row of a speculative verify; the
+  logits are written in device memory and one copy brings them to the host's buffer.
+  (Written into it directly, one float per warp over the bus, the head took 7.4 ms of a
+  13.5 ms step on an RTX PRO 4000. On an L4 the step does not get faster and the extra
+  copy costs 0.1 ms.)
+
+**What it needs.** Every projection of every layer, the shared expert's three matrices
+and lm_head on one card: `COLI_CUDA_CHAIN=1` offers the shared expert to the placer
+(what `Q36_OFFER_SHEXP=1` does) and `COLI_PLACE=auto` takes the whole 35B trunk on an
+8 GB card. The chain uploads itself the router's matrix, the DeltaNet b|a rows and the
+shared expert's gate row, and the parameter arena. It declines, naming the first matrix
+on the CPU, when the placement left anything behind, and under a qpack container or PILOT
+prefetch (which reads the residual on the host). With `KV_SLOTS` > 1 it runs each
+conversation's prompts, the held conversation's state handed over through the host when
+the conversation changes, and the decode steps run every conversation's row on the tier
+and the host. `Q36_DN_GPU`'s per-layer step is not set up beside it: the chain owns the
+DeltaNet state.
+
+**State, and who owns it.** The residual stream lives on the device for a forward. The
+host's KV cache stays canonical: every step copies its new rows back, the device holds
+a mirror per attention layer with a watermark (`kv_valid`), a step from `pos_base`
+uploads the rows between the watermark and `pos_base` first, a CPU step lowers the
+watermark, a cache that grows is mirrored again. The DeltaNet state and conv rings stay
+on the device while the chain runs: the host copy is brought back before anything reads
+it there (a pinned snapshot, a CPU step: `q36cc_sync_host`) and pushed up after anything
+writes it there (a reset: zeros filled on the device; a restored snapshot: an upload). A
+speculative verify copies the state after each of its rows but the last into a device
+slot, the convolution and the recurrence split into one dispatch per copy (the same bits),
+and a rejected draft swaps slot r's buffers in (`q36cc_rollback`) as the CPU swaps its own.
+A CUDA error inside a frame loses the device to the chain: the engine zeroes the
+recurrent state, rebuilds it on the CPU from the prefix record (a prefill's worth of CPU
+work; the KV rows are the host's already) and runs on the CPU from there, as the Vulkan
+chain does. `COLI_CUDA_CHAIN_FAULT=n` fakes the loss at the n-th frame.
+
+**Tests.** `tests/test_qwen36_cuda_chain.c` drives an in-memory two-layer model (a
+DeltaNet layer, a gated-attention layer, four routed experts and a gated shared expert
+per layer, lm_head) through `step_ex` on the fake CUDA tier, the chain's ops answered by
+the fake's host-side table (`tests/qwen36_fake_cuda.h`, the same arithmetic as the
+kernels): a prompt and decode tokens give the CPU path's logits (max diff 2e-5 of 20),
+the host state is untouched while the chain runs and reads back as the CPU path's, the
+K/V rows reach the host cache, a reset and a CPU step in between continue from the right
+state, a verify's three rows and the rollback of a rejected draft, the head's logits
+computed on the card and copied down (a prompt and a verify read in chunks of three and
+two rows), a frame that fails (the state rebuilt, the step and the rest on the CPU, the
+same logits), and a backend without the table. `tests/test_cuda_chain.cu`
+(`make cuda-chain-check CUDA=1`, needs a device; `gpu-compile` builds it) checks every op
+on a real card against the same CPU references: buffers and frames, int8 and f32 matmuls
+at offsets, the four norms, RoPE, causal GQA with the gate and a selection list, the
+convolution in both orders with its ring and snapshot, the recurrence at KD 8 and 128 with
+both gates, every element-wise op, and a failed launch marking the device lost.
+
+**Measured** (RTX 3070 alone, Qwen3.6-35B-A3B int4, the trunk in VRAM by `COLI_PLACE=auto`,
+expert tier at 81-82 % hits, the usual 49-token prompt, 200 new tokens, two runs each):
+
+| | TTFT | tok/s, the run | ms per decode token | decode tok/s | device wait per token |
+|---|---|---|---|---|---|
+| `Q36_DN_GPU=1` (the per-layer step) | 1.22-1.26 s | 26.2-27.6 | 30-32 | 32-33 | |
+| `COLI_CUDA_CHAIN=1` | 0.98 s | 42.7-42.8 | 18.7 | 53 | 5.7 ms |
+| Ollama 0.34.4 on the same card | | | 26.2 | 38.1 | |
+
+The chain alone, with the backend's block GEMV, gave 27.6 ms a token: the CPU's parts
+went (the attention core 3.9 ms, the shared expert 4.1 ms, about seventy bus round trips)
+and the token was the device's time, 14.7 ms, which was the trunk's 1.9 GB of int8 rows
+read at 120 GB/s. `gemv_i8_rows` (backend_cuda.cu: a warp per output row, 16 bytes a
+lane, the activation in shared memory) reads them at 330-418 GB/s, and the device's part
+of a token is 5.7 ms. What is left is the routed experts on the host (9.9 ms: the tier's
+groups and the CPU's share) and the routing, launches and forty waits (about 3 ms).
+
+### Decode after a long prompt
+
+A decode step reads every position's K and V once a layer, and after a long prompt that is
+most of the step's attention. On an RTX PRO 4000 it was the widest gap to the reference
+GGUF engine (decode tok/s after a prompt of 1K / 18K tokens):
+
+| | before | a KV head's heads a block | and float16 mirrors | reference |
+|---|---|---|---|---|
+| Qwen3.6 UD-Q4_K_M | 101.3 / 74.5 | 101.4 / 84.8 | 101.4 / 89.8 | 103.8 / 94.7 |
+| Flint UD-Q3_K_XL | 100.8 / 65.4 | 102.5 / 79.2 | 102.7 / 86.2 | 100.6 / 90.0 |
+
+- `cc_attn_decg_k` (`COLI_CUDA_ATTN_DEC_GQA`): the decode's blocks of positions take the
+  query heads of a KV head at once, each K and V row read once for them (eight times
+  before, at Qwen3.6's and Flint's grouping), four floats a load.
+  Its scores take two threads a position (`COLI_CUDA_ATTN_DEC_TPP`), adjacent lanes reading
+  a K row's float4s in turn against the q rows in shared memory, where a warp's lanes over
+  one row summed each head with five shuffles a position; the join takes each block's weight
+  once into shared memory instead of once a value. One layer after 18K positions in float16
+  (`COLI_CUDA_CHAIN_BENCH=adec` in `tests/test_cuda_chain.cu`): Qwen3.6's 119.5 -> 108.6 us,
+  Flint's 144.5 -> 122.1; after 60K, Qwen3.6's 391 -> 379.
+- Float16 mirrors (`COLI_CUDA_KV16`): the host's cache is float16, and the mirrors held its
+  values as float32. They now hold them as float16, and every attention kernel reads a cache
+  of either type. The numbers are the same, so the greedy answers are the same, in half the
+  VRAM: a window's or sinks' model's tier keeps half the room for them out of its budget.
+
+### The routed experts in the frame (`COLI_CUDA_CHAIN_MOE`, on by default)
+
+The chain above still ended its frame at every MoE layer: the router's logits down, the
+host's routing, the tier's groups and the CPU's share, the sum back up. For a step of up
+to 8 rows (decode, a verify) the frame now routes and computes the experts itself, as
+the Vulkan chain does (docs/vulkan.md, "The routed experts in the frame"):
+
+- `cc_route` (`cuda_chain.cu`, the port of `chain_route.comp`): softmax, group-limited
+  top-k, renormalization, the lower expert on a tie, one block per row.
+- `cc_moe` (`backend_cuda.cu`: `moe_gu_k`, `moe_dn_k`, `moe_sum_k`): every (row, slot)
+  pair whose expert the table holds, gate and up, then down, a warp per output row, in
+  the tier's formats (1 int8 rows, 2 int4 rows, 4 int4 with a scale per 64, 8 fp8 with
+  its 128 x 128 block scales); then each row's sum in the tier's order (the host's
+  misses, then the device's slots in rank order).
+- The table: one `CcExpert` per expert of every layer, the device addresses of a
+  resident's weights and scales (`qt_chain_resident`, the table's `tensor_dev`), built
+  again when the tier's residency changed (`qt_chain_epoch`). The tier is held for the
+  forward (`qt_chain_hold`): an eviction clears the flag at once and moves the epoch, but
+  no swap writes into a resident's buffers until the forward is done.
+- A layer whose experts are all in the table has no host step, and its route ids and
+  weights stay on the device during the frame: the ids of every layer come down in one
+  copy at its end, for the books below. A layer with some
+  elsewhere (VRAM was short) signals the host once its routes and rows are down
+  (`cc_signal`: a one-thread kernel writes a word of host memory after a system fence).
+  The host computes the slots the table lacks as the tier's misses always were
+  (`qt_cpu_misses`: the RAM cache, the disk) while the device computes its own, writes
+  its rows into an UP buffer and its word; the device waits for the word (`cc_wait_host`)
+  before the sum. The host serves a layer after recording the next one, so the device
+  has that layer queued when the answer lands. A round trip costs about 8 us a layer.
+- The books the host's step kept (the tier's heat, hits and LFRU tick: `qt_chain_count`;
+  the resident collection; the hot-pin counts) follow from the ids after the frame, with
+  the K/V rows into the host's cache.
+
+A prompt chunk (more than 8 rows) runs its routed experts in the frame too, layer by
+layer, where the table holds all of that layer's experts: `cc_moe` sorts the chunk's
+slots by expert (a count, the offsets and 64-row tiles, each slot's place) and runs each
+expert's rows through the tensor cores (`tcg_moe_k`: gate and up into silu(g) * u, then
+down), then each row's sum in rank order. A layer with experts elsewhere, or a prompt
+that re-plans the residents (`QT_PREFILL_REPLAN=1`), keeps the host's step in that chunk.
+
+The dense matrices of a prompt chunk go through the same tensor-core GEMM
+(`tcg_dense_k`, from `coli_cuda_tensor_gemm_async` for more than 8 rows), where the block
+kernel spent 256 threads on each output: TF32 fragments on sm_80 and later, the inputs
+rounded to TF32 (a 10-bit mantissa, the fp32 range), int8 and int4 codes staged exact
+with the row's scale after the sum, int4 per 64 times its group's scale as staged, sums
+in fp32. Against an fp64 reference the outputs are within 2e-4 to 4e-4 (relative to the
+largest); the CPU's own experts quantize their inputs to int8. `COLI_CUDA_TC_GEMM=0`
+keeps the block kernel.
+
+A prompt chunk's attention (16 rows or more, `COLI_CUDA_CHAIN_FLASH`; no selection list)
+runs on the tensor cores too (`cc_attn_fk`, sm_70 and later, head dim 64, 128 or 256): a
+block takes 16 query rows, the query heads of one kv head times 16 / GQ tokens, so each
+block of 64 keys is staged once for all of them as f16; two passes (each row's max and
+sum, then exp(s - m) * V into the fragments, divided by the sum at the end). The kernel
+it replaces gave each (head, row) a block that read every K and V row again. On the
+35B, a 1024-token prompt: 226 ms of attention -> 23 ms; a 467-token prompt 819-837 ->
+890-903 tok/s; the loss above 3.2223 -> 3.2271.
+
+From sm_75 (a T4) `cc_attn_f2` takes it instead (one pass, FlashAttention-2's running max
+and sum): a block of four warps takes 64 query rows (the query heads of a kv head dividing
+64), so a block of keys is staged once for four times the rows, and its scores never leave
+the registers. The m16n8k16 accumulator is the A operand's layout, so exp(s - m) goes from
+a score tile straight into P V, and each row's output fragments are rescaled as its max
+moves. Windows, rings and sinks as `cc_attn_fk` takes them; head dim 256 reads Q from
+shared memory each block (the registers hold O). Flint at 16K tokens (RTX PRO 4000): the
+attention 9.6 s -> 1.09 s, the prompt 671 -> 1032 tok/s before the host pool's GGUF
+staging; Qwen3.6 UD-Q4_K_M 796 -> 1956 tok/s at 16K with both. sm_75 has no m16n8k16:
+each is two m16n8k8, the same fragments (k 0-7, then 8-15). Where a card gives less than
+the 66 KiB of shared memory head dim 256 wants (a T4 gives 64), it stages blocks of 16
+keys, 49.5 KiB. `COLI_CUDA_CHAIN_FLASH2=0` keeps `cc_attn_fk`.
+
+On sm_70 and later the same GEMMs run in f16 (`hcg_tile`: `hcg_dense_k`, `hcg_moe_gu_k`,
+`hcg_moe_dn_k`), at twice the TF32 fragments' rate and with a tile that keeps more of the
+card busy: 256 threads (eight warps) for 64 rows x 64 outputs, K in steps of 64, the next
+step's words and inputs fetched into registers while the tensor cores work. int8 and int4
+codes are exact in f16 (the row's scale after the sum), int4 per group goes in times its
+scale, x is rounded to f16 and held to +-65504 (a NaN stays one), sums in fp32. On the 35B,
+a 1024-token prompt: the experts' GEMMs 513 -> 236 ms, the dense ones 234 -> 97 ms; a
+467-token prompt 889-910 -> 1561-1609 tok/s; the loss above 3.2271 (TF32) -> 3.2262.
+`COLI_CUDA_TC_F16=0` keeps TF32 where it runs.
+
+It is off with cache routing or the agreement meter (their state crosses tokens on the
+host), a gate bias, more groups than the kernel keeps, or a tier on more than one card.
+`COLI_CUDA_CHAIN_MOE=0` keeps the host's step. A decode step's text is the same either
+way; a prompt's rows sum in another order and with TF32 inputs, and the greedy text may
+part where two tokens are that close. The teacher-forced loss after a 600-token prompt
+(125 tokens scored, `PPL=1`) is 3.2223 nats a token with the experts in the frame,
+3.2326 with the host's step, 3.2181 with no tensor cores at all and 3.2340 on the CPU.
+
+**Measured** (RTX PRO 4000 Blackwell 24 GB, i5-13500, Qwen3.6-35B-A3B int4-g64, two runs
+of `bench_stream.py` each, two rounds):
+
+| | decode tok/s | prefill tok/s |
+|---|---|---|
+| per matrix (`COLI_CUDA_CHAIN=0`) | 33.6-34.2 | 60 |
+| the chain, the host's step, the block kernel (`COLI_CUDA_CHAIN_MOE=0 COLI_CUDA_TC_GEMM=0`) | 58.9-59.5 | 71 |
+| a decode step's experts in the frame, a prompt's on the host, the block kernel | 85.3-86.0 | 71 |
+| the same with the tensor cores' dense GEMM | 86.0 | 120 |
+| every step's experts in the frame, the tensor cores (the default) | 85.9-86.1 | 809-834 |
+| the default at `CUDA_EXPERT_GB=8` (a third of the experts in VRAM) | 49.1-50.2 | 114-116 |
+| the host's step at `CUDA_EXPERT_GB=8`, the block kernel | 45.1-45.7 | 63 |
+
+With every expert in VRAM a decode token is the device's 10 ms, and a 467-token prompt
+0.57 s instead of 6.6. With a third of them (every layer then has some on the host, so a
+prompt keeps the host's step for its experts),
+the CPU computes two thirds of the slots (about 10 ms a token) and the layer after waits
+for them: the hybrid step overlaps the device's experts with the host's, not the layers.
+The host pool below takes a prompt's share off the CPU.
+
+### The residents follow the conversation (`COLI_CUDA_CHAIN_PROMOTE`, on by default)
+
+The warm start fills the card from the heat file: the history's routes. A conversation on
+another topic misses it -- on the RTX 3070 (2748 of Qwen3.6-35B's 10240 experts resident)
+a story prompt found 44.5 % of its decode routes in a set trained on a question about MoE
+routing, against 82 % for that question itself -- and every miss is a row the CPU computes
+while the device waits (`qt_cpu_misses`, about 0.1 ms each).
+
+After a decode-sized step the chain asks the tier for promotions (`qt_chain_promote`): up to
+`COLI_CUDA_CHAIN_PROMOTE` (4) of the step's misses routed at least `COLI_CUDA_CHAIN_PROMOTE_MIN`
+(2) times in this conversation, the worth the most first. An expert's worth is its heat --
+the history's routes, decayed, plus this conversation's (`qt_chain_count` for the residents,
+`qt_note` for the misses) -- plus this conversation's routes once more, so that a conversation
+away from the history overtakes within tens of tokens. Each takes the device buffers of the
+coldest of 64 residents drawn at random on its device, where it clears the tier's admission
+margin (`tier_should_promote`: a quarter and four over the victim; the same rule as the LFRU
+tick, which keeps running once in 16 tokens). The chain stages the newcomer's RAM bytes
+into a page-locked slot (`qt_chain_promote_stage`: as the RAM holds them for int8 and
+pair-ordered int4 rows, or converted from planar int4 blocks into the device's signed pairs)
+and from there into the victim's buffers on its copy stream (`cc_host_up`, six copies an
+expert), while the next steps run. The tier's uploader thread does not take part:
+its synchronous copies take the driver's lock from another thread while the chain's frame
+waits for the host (`cc_wait_host`), and that deadlocked inside the driver on the 3070.
+Once the copies landed (`cc_host_up_done`, checked after the next steps) the tier hands the
+buffers to the newcomer (`qt_chain_promote_done`) and it is resident; the victim computes on
+the CPU from the step after its eviction on (its int8 copy rebuilt by `tier_rebuild_evicted`
+before that forward, in parallel, where `QWEN_EXPERT_KERNEL=0` needs one; planar int4 keeps
+its RAM blocks). The chain's table takes the changes entry by entry
+(`qt_chain_changes`: the tier records every change of residency; the whole table is read
+again only where the tier lost count), and the staged table of a prompt chunk follows when
+a chunk needs it.
+
+The brake: where the last 64 decode steps found `COLI_CUDA_CHAIN_PROMOTE_HITS` percent (75)
+or more of their routes on the card, the step promotes nothing and its misses are dropped. A
+conversation the history fits pays for every swap -- a promoted expert displaces a resident
+the history still routes to -- and gains little; one away from it, at 40-65 % hits, does not
+reach the brake for hundreds of tokens. `0` brakes never.
+
+The brake holds only where the warm start's set came from a history: a heat file with this
+model's shape, its layers and experts (`qt_chain_history`). Without one the set is the experts
+in index order, no conversation's, and the brake starts off (the chain's startup line says so).
+On a Google Colab T4 (6605 of 10240 experts in VRAM, OMP 4 threads, no heat file) the 41-token
+story at 75 held at 78-79 % hits, 24.4 / 23.9 ms a token over 200 / 600 tokens; without the
+brake it reached 86 / 94 %, 22.6 / 19.7 ms. Through the server's path on another such T4 a chat
+of 5 turns (1458 answer tokens, no heat file) took 29.4 s instead of 36.7. On a rented RTX 3070
+(EPYC 7B13, 2654 experts in VRAM, OMP 12 threads) the same runs differ by 0.6 and 2.0 % (17.5 /
+14.8 ms at 75 against 17.6 / 14.5), and the chat's session by less than 1 %.
+`COLI_CUDA_CHAIN_PROMOTE_HITS`, when set, wins either way.
+
+**Measured** (RTX 3070 alone, Qwen3.6-35B-A3B int4 per row, `COLI_PLACE=auto
+COLI_TRUNK_PROBE=0 CUDA_EXPERT_GB=auto`, OMP 12 threads, the heat file frozen; decode ms a
+token = (N / speed - TTFT) / (N - 1)):
+
+| prompt, heat file | tokens | `COLI_CUDA_CHAIN_PROMOTE=0` | the default (4 a step, the brake at 75 %) | the brake at 80 % |
+|---|---|---|---|---|
+| a story; the heat file from the MoE question | 200 | 44.5 % hits, 24.3 / 24.8 ms | 64.6 % hits, 20.8 ms (548 promoted, no step braked) | 64.3 %, 23.1 / 23.2 / 22.6 ms (543 promoted) |
+| the same | 600 | 38.2 % hits, 26.4 ms | 63.0 % hits, 22.9 ms (1062 promoted, 70 steps braked) | 63.4-67.0 %, 20.8 / 21.6 ms (1008-1075 promoted, 0-21 braked) |
+| the MoE question; its own heat file | 200 | 81.5-82.4 % hits, 14.9 / 15.0 ms | 82.2-82.4 % hits, 15.3 / 14.9 ms (12 / 4 promoted, 196 / 198 of 200 steps braked) | 79.6-81.7 %, 15.5-17.9 ms (79-158 promoted, 56-155 braked); without the brake 16.7 ms (166 promoted) |
+
+Away from the history a token gets 10-15 % cheaper over 200 tokens and 13 % over 600, where
+the set keeps adapting until the brake takes over near the end; on the very prompt the
+history was trained on (80-82 % hits here) the brake holds from the first steps and nothing is
+lost, where at 80 % it was marginal and let 79-158 swaps through. Eight a step instead of four
+moved the same experts in 200 tokens (the margin limits, not the rate) and measured the same
+within noise; `0` keeps the warm start's set. With rows in RAM (an int8 container, or
+`QWEN_EXPERT_KERNEL=0`) the greedy text with and without is the same. A promotion costs the
+engine thread about 0.15 ms (the staging memcpy) and the victim's int8 rebuild about 0.85 ms
+of one CPU thread before the next forward.
+
+With planar int4 in RAM (`QWEN_EXPERT_KERNEL=1`, an int4 container's default) the staging
+converts the newcomer's blocks into the card's signed pairs (`planar_to_pairs_signed`, an AVX2
+path or a scalar loop). A promoted expert then runs `cc_moe` on the card instead of
+`expert_ffn.h` on the CPU, which rounds its input to int8 (`QWEN_EXPERT_ACT`): its result moves
+in the last digits, and the greedy text can part where two tokens are close. Measured on a
+Google Colab L4 (Xeon, 6 cores / 12 threads, 52 GiB) with the int4-g64 container at
+`CUDA_EXPERT_GB=5` (1823 of 10240 experts in VRAM after the warm start), OMP 6 threads, 200
+tokens and the heat file of one origin/dev run at `auto` on a 652-token question about MoE
+offloading, frozen (every run starts from a copy): origin/dev 561966ec (planar int4 refused)
+against the promotion, after one warm-up run, in A B B A order on one VM; the last two rows on
+another, both engines built without AVX2 (`ARCH=x86-64-v2`). tok/s is the engine's `Speed`
+line, ms a token the `COLI_TIMERS` step() total
+([raw](experiments/qwen36-cuda-promote-planar-2026-10-25-raw.txt)):
+
+| prompt, engine | decode VRAM hits | promoted | ms a token | tok/s |
+|---|---|---|---|---|
+| 41 tokens, origin/dev (4 runs) | 20.8 % | 0 | 33.0-33.1 | 24.99-25.05 |
+| 41 tokens, the promotion (4 runs) | 52.6 % | 591 | 26.3-26.4 | 29.96-30.05 |
+| 664 tokens, origin/dev (2 runs) | 19.6 % | 0 | 33.2-33.3 | 24.42-24.46 |
+| 664 tokens, the promotion (2 runs) | 53.9 % | 715 | 26.0 | 29.62-29.65 |
+| 41 tokens, no AVX2, origin/dev (4 runs) | 19.7 % | 0 | 305.1-305.6 | 3.21-3.22 |
+| 41 tokens, no AVX2, the promotion (4 runs) | 50.9 % | 598 | 202.5-203.0 | 4.78-4.79 |
+
+Choosing and staging take the engine thread 0.46-0.58 ms a promotion with AVX2 (332-342 ms for
+591, 332-333 ms for 715), about what rows take on the same L4 (0.50-0.51 ms: 354-359 ms for
+709, origin/dev with `QWEN_EXPERT_KERNEL=0`), and 0.59-0.60 ms without AVX2 (355-359 ms for
+598: GCC vectorizes the loop with SSE2). Without AVX2 the CPU's kernel for the misses is far
+slower, so both engines are. RSS is 19.2 GB on both sides (`QWEN_EXPERT_KERNEL=0` keeps int8
+copies: 44.0 GB, 46.1 GB with its promotions). With every expert in VRAM (`auto`, the L4's
+default) nothing is promoted, the text is origin/dev's and the speed the same within 0.5 %; the
+warm start converts with the same AVX2 block (`planar_to_pairs`): 14.4 to 8.8 s there, 7.6-7.7
+to 6.4-6.5 s at `CUDA_EXPERT_GB=5` (warm runs; origin/dev's first runs on those VMs took 15.7
+and 10.9 s).
+
+The greedy text parted from origin/dev's on both story prompts (at character 204 of 864 and 350
+of 863); with `COLI_CUDA_CHAIN_PROMOTE=0` it is origin/dev's (checked on the 41-token one). The
+teacher-forced loss does not get worse (`PPL=1`, `CUDA_EXPERT_GB=5`, the heat file of one
+32-token run on the story prompt, frozen): 3.0719 nats a token with promotions (508) against
+3.0774 without, 3.0725 with every expert in VRAM (`auto`) and 3.0728 with
+`QWEN_EXPERT_KERNEL=0`, on 250 tokens of prose after 600; 0.2984 (462) against 0.2998, 0.2960
+and 0.2953 on 200 tokens of the story after its 41-token prompt.
+
+### A prompt's experts past VRAM: the host pool (`COLI_CUDA_HOST_POOL`, on by default)
+
+A prompt chunk routes nearly every expert of a layer (467 rows, 8 slots each, over 256
+experts: 15 rows an expert), and the CPU's step costs per row where a copy over the bus
+costs per expert: 1.65 MB of int4-g64 per expert of the 35B is 0.13 ms at the 12.8 GB/s of
+a PCIe 4.0 x8 link, the CPU's 15 rows about 0.7 ms. So a chunk of more than 32 rows copies
+a layer's non-resident experts into VRAM and runs them with the residents:
+
+- The source is the engine's RAM cache as it is, page-locked at the warm start
+  (`qt_note_host`, `coli_cuda_host_register`): expert_ffn.h's planar int4 blocks, which the
+  f16 GEMMs read directly (`CcExpert.planar`: in each 64 weights' 32 bytes, byte k holds
+  weight k low and k + 32 high, both v + 8). No second copy in RAM, no conversion. On when
+  the RAM holds every expert (no slot is ever recycled), one card, int4-g64 and the f16
+  GEMMs (`coli_cuda_planar_rows`).
+- The pool follows the residents (`qt_chain_host_follow`). The chain's promotions and the
+  tier's LFRU swaps move experts between the card and the RAM after the warm start; before a
+  prompt chunk of 128 rows or more (`Q36CC_FOLLOW_ROWS`), the experts that left the card are
+  page-locked into the pool and those that came in are released, so the pool is the
+  non-residents and nothing else. Without it an expert that left the card was in neither, and
+  a chunk's layer holding one went to the host's step whole. It costs about 0.3 ms for each
+  expert moved on the T4 below, and after a long answer that is more than the copies give
+  back to a chunk of a few dozen rows: a smaller chunk leaves the pool behind for the next
+  large one, its layers holding an expert that left on the host's step as before. An expert
+  whose page-lock is refused stays out until the next follow.
+- The staging (`cc_fetch`, `cc_fetch_wait`, `cc_fetch_done`): one layer's worth of VRAM,
+  the most non-resident experts any layer has, filled on a copy stream of its own. The copy
+  of the next such layer starts once the layer before has run its experts' GEMMs, so it
+  overlaps that layer's sum and the next layer's attention; one buffer, because the copy
+  is the longer of the two and a second one would buy little.
+- The prompt chunk's table points each staged expert at its place in the staging; a
+  decode step keeps the table of the residents and the CPU's share (a row at a time,
+  the CPU's kernel is faster than a copy).
+
+The chunk's rows matter as much: every chunk copies the layer's experts again, so the chain
+now sizes a chunk from the card's free memory (`COLI_CUDA_CHAIN_ROWS`, unset: the most of
+256, 512, ... 4096 rows whose scratch takes half the free memory less the staging; the
+line `rows per prompt chunk` says which). With every expert in VRAM larger chunks help
+too: fewer, fuller tiles per expert.
+
+**Measured** (the same box, two runs each, `bench_stream.py`):
+
+| | 467-token prompt | 1727-token prompt | decode after each |
+|---|---|---|---|
+| `CUDA_EXPERT_GB=8`, the host's step, 256 rows (before) | 127-128 tok/s | 122-125 | 52 / 43 |
+| `CUDA_EXPERT_GB=8`, the host pool, 4096 rows | 365-385 | 997-1037 | 52-54 / 45-46 |
+| every expert in VRAM, 256 rows (before) | 1626-1686 | 1705-1732 | 86 / 65 |
+| every expert in VRAM, 4096 rows | 1922-2137 | 2321-2516 | 86 / 65 |
+
+At `CUDA_EXPERT_GB=8` the 1727-token prompt copies 11 GB once (6714 experts staged in 27
+layers) in about 0.9 s; the host pool at 256 rows copied them seven times (215-225 tok/s). The teacher-forced loss
+after a 2000-token prompt (200 tokens scored): 1.7567 nats every expert in VRAM, 1.7590 the
+host pool, 1.7555 the host's step. The staging takes about 450 MB of VRAM here;
+without room for it the chain says so once and the chunk keeps the host's step.
+`COLI_CUDA_HOST_POOL=0` keeps the host's step for a prompt's non-resident experts.
+
+**After a conversation** (the pool following the residents): a Google Colab T4 high-RAM VM
+(15 GiB, 6605 of 10240 experts on the card under `auto`, 3635 in the host pool), the
+record's harness (`bench.c`), a warm-up and 4 runs each in A B B A order, min-max of the runs
+(record: `docs/experiments/qwen36-cuda-host-pool-follow-2026-10-26/`). A 64-token prompt and
+its 32 teacher-forced steps, then a 512-token prompt in the same process:
+
+| | 512-token prompt, after | 64-token prompt | decode after 64 / 512 |
+|---|---|---|---|
+| the pool as the warm start left it (before) | 179.19-180.94 tok/s | 73.78-79.01 | 38.85-40.09 / 46.81-47.73 |
+| the pool following the residents | 436.44-441.96 | 76.09-77.90 | 39.99-40.50 / 47.28-47.56 |
+
+Two conversations replayed through the server's path (`bench.c --session`, each answer
+teacher-forced), the time to the first token of every turn summed, and of the turn after the
+longest answer:
+
+| | agent, 8 turns: all / turn 8 (35 tokens) | chat, 5 turns: all / turn 3 (36 tokens) |
+|---|---|---|
+| before | 46.7-47.1 s / 0.92-0.94 s | 3.4-3.5 s / 0.76-0.77 s |
+| the pool following the residents | 18.7-18.8 s / 0.90-0.92 s | 3.4-3.5 s / 0.76-0.77 s |
+
+The 64-token run, its 32 steps with promotions included, gives the same logits in every run of
+both; after 512 the teacher-forced loss over the next 32 tokens is 2.9578 before and 2.9328
+with the pool following, the layers that held an expert that left the card now in the chain's
+frame on its f16 GEMMs instead of the host's path. No chunk of the chat reads 128 tokens: it
+runs as before, with the same logits. In one run each with a diagnostic line (`diag.txt` in
+the record) the follow took 58 ms of the 512 prompt's 1.14 s (98 experts joining the pool, 98
+leaving it), and 0.08 to 147 ms before the agent's prompts, 365 ms in all. `threshold.txt` has
+the runs behind the 128 rows.
+
+**A GGUF's experts** take the same road. When the tier takes them (`qt_init_gguf`), the
+engine holds the file's rows in RAM instead of the rows interleaved by 16, so the tier and
+the host pool read them in place and the CPU computes its share eight rows at a time
+(`gq_rows_f8`). An interleaved slot had unpacked each expert into a second buffer of its
+own: Flint UD-Q3_K_XL (an 18.5 GB file) took 30.6 GB of RSS, 19.1 GB now. The staging holds
+a layer's experts at the largest layer's three matrices, 256-byte aligned: one copy an
+expert where its gate and up end on 256 bytes, three otherwise. A layer whose rows are not
+whole words keeps the host's step. The tier keeps the staging out of its expert budget
+when not every routed expert fits (`qt_reserve_short`). Taken from the mirrors' room
+instead, a 16K prompt found no memory for the routed experts' buffers and the chain took
+the host's step from then on. Where the mirrors or a step's buffers still lack memory, the
+staging gives its VRAM back. The room it leaves free for the mirrors to grow into is the
+room the tier left them: a window's or sinks' model's (Flint, Muse Spark), whose chain needs
+its mirrors whole. Another model's mirrors take the staging's memory back when they grow.
+Before, the staging left the mirrors' room at the full context free for every model:
+Qwen3.6 UD-Q4_K_M with 7 GiB free kept 1.3 GB that no one had set aside, found none to stage
+in, and read every prompt at 97 tok/s; 570 / 656 now at 1K / 4K tokens. At 16K its float32
+mirrors take the staging's memory and the prompt keeps the host's step (96 tok/s).
+
+Before, a GGUF's prompt computed its non-resident experts on the CPU while the device
+waited: 1.8 s a 4096-row chunk for the last two layers of Flint on a whole RTX PRO 4000,
+and 58 tok/s with 7 GiB free. Measured on the RTX PRO 4000 (tok/s; the reference GGUF
+engine on the same card in the last column):
+
+| Flint UD-Q3_K_XL | before | the host pool and `cc_attn_f2` | reference |
+|---|---|---|---|
+| 7 GiB free, 1K tokens | 60 | 512 | 317 |
+| 7 GiB free, 4K tokens | 58 | 1696 | 378 |
+| whole card, 1K tokens | 758 | 1577 | 1852 |
+| whole card, 4K tokens | 1011 | 2344 | 2060 |
+| whole card, 16K tokens | 715 | 2276 | 1988 |
+
+Decode is the same: 111.5 against 111.3 tok/s on the whole card, and 50.9 against 53.3
+with 7 GiB free.
+
+### A GGUF's experts at their own size (`COLI_CUDA_EXACT_SLOTS`, on by default)
+
+A GGUF's layers mix block types (Flint UD-Q4_K_XL: IQ3_S, Q4_K, Q5_K and Q6_K among its
+experts), and the arena gave every expert the room of the largest layer's three matrices.
+On an RTX PRO 4000 that slot was 2.45 MB for an average expert of 1.91 MB: the card held 8140
+of the model's 12032 experts. With qwen36's GGUFs on one card each expert now takes a slot of
+its own layer's matrices, carved from one allocation of the budget as the warm start fills it;
+a freed slot waits for the next expert of its size, and a swap pairs slots of one size. The
+budget counts each expert at its slot. The qwen38 chain reads the arena as slots of one size
+(`qt_chain_arena`) and does not ask for this. Measured on the RTX PRO 4000 (tok/s; prompts of
+1K, 4K and 16K tokens):
+
+| | on the card, 32K context | prompt | on the card, 8K context | decode |
+|---|---|---|---|---|
+| Flint UD-Q4_K_XL, the largest layer's slot | 7591 | 782 / 1925 / 1871 | 8140 | 66.5-73.7 |
+| the layer's own slot | 9861 | 1078 / 2096 / 2066 | 10700 | 89.9 |
+| Flint UD-Q3_K_XL, the largest layer's slot | 11520 | 1567 / 2246 / 2232 | | 105.4 |
+| the layer's own slot | 12032 | 1637 / 2295 / 2239 | | 105.2 |
+
+With 7 GiB free, Flint UD-Q3_K_XL: prompt 528 / 1762 -> 540 / 1725 tok/s at 1K / 4K, decode
+53.3 -> 54.5. Qwen3.6 UD-Q4_K_M (2 sizes, 1.82 to 1.95 MB): 1791 -> 1921 experts on the card,
+decode 46.6 -> 45.6.
+
+`COLI_CUDA_EXACT_SLOTS=0` keeps the largest layer's slot for every expert.
+
 ## The residents follow the prompt (`QT_PREFILL_REPLAN=1`)
 
 The warmstart fills VRAM from the heat file, i.e. from what earlier prompts

@@ -1,0 +1,157 @@
+#version 450
+// qmatmul_grp_bd.comp on the matrix units (vk_chain.c, vkc_moe_rows: a prompt chunk's routed
+// experts of a GGUF on the dense chain): the same items, expert table, bindings and push
+// constants, the weights the file's blocks (100 + ggml type T, a specialization constant)
+// decoded by bdstep.glsl; KHR cooperative matrix f16 x f16 -> f32 at subgroups of 64 or 32
+// (the device's, required, 256 invocations).
+//   y[s,o]   = sum_i x[s,i] * w[o,i]                                       (default)
+//   hid[s,o] = silu(gate[s,o]) * up[s,o], clamped as expert_act.comp's act 0  (-DGATE_UP)
+// An item: 32 rows of one expert and BO outputs (32 with GATE_UP, its two matrices, else
+// 64), through the input in steps of 64. Half the threads decode the step's weights (two
+// 32-weight steps a row) to f16, the other half round the rows' inputs to f16; every 16 x 16
+// operand tile is contiguous in shared memory. The item's 8 accumulator tiles (2 of rows x 4
+// of outputs: gate 2 and up 2 with GATE_UP) go to the subgroups in turn (qmatmul_grp_qc.comp's
+// way). Not bit-identical to qmatmul_grp_bd.comp (f16 operands). Host gates: I % 64 == 0 and
+// every expert of the batch in the batch's types.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const int T = 12;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer WRef { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer WRef4 { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer TRef { uint v[]; };   // blockdec_table.h's table
+layout(std430, binding = 0) readonly buffer X  { vec4 x4[]; };     // packed rows of all experts
+layout(std430, binding = 1) readonly buffer IT { uvec4 items[]; };  // (expert, first row, output block, -)
+layout(std430, binding = 2) readonly buffer ET { uint etab[]; };    // 16 uints per expert (qmatmul_grp.comp's; [14..15] the table)
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };      // packed output rows
+layout(std430, binding = 4) readonly buffer AM { int amap[]; };     // kgat > 0: qmatmul_grp.comp's
+layout(push_constant) uniform P { int I, O; float limit; int ibase; int kgat; int rpw; } p;
+
+#define TM 32u
+#ifdef GATE_UP
+#define BO 32u
+#else
+#define BO 64u
+#endif
+#define TK 64u
+// tile (a, kt) of 16 x 16 halves, element (row, k) at row * 16 + k:
+//   weights: output tile a (gate 0-1, up 2-3 with GATE_UP), at (a * 4 + kt) * 64 uvec2s
+//   inputs: row tile a, at (a * 4 + kt) * 32 uvec4s
+shared uvec2 sw2[4u * 4u * 64u];
+shared uvec4 sx[2u * 4u * 32u];
+shared float sacc[8u * 256u];      // the accumulators, tile by tile, for the epilogue
+shared float bs_kvt[16];
+shared uint bs_grid[2048];
+shared uint bs_ks[128];
+
+uint pk(float a, float b) { return packFloat2x16(f16vec2(float16_t(a), float16_t(b))); }
+// an activation operand: held to +-65504 (a value past it would round to inf and the tile's
+// sums with it; the CUDA f16 GEMMs hold x the same way), a NaN kept a NaN. The weights, a
+// format's codes times its scales, stay well inside f16 and skip it (the hold on them cost
+// Qwen3.6's prompt 4%)
+float h16(float a) { return isnan(a) ? a : clamp(a, -65504.0, 65504.0); }
+uint pkx(float a, float b) { return pk(h16(a), h16(b)); }
+WRef g_bw; WRef4 g_bw4; bool g_b16; TRef g_tab;
+uint g_row, g_q, g_k0;   // the decoding thread's row in its tile, its output tile, the step's first vec4
+void bs_put(vec4 w, uint i) {
+    uint k = (i - g_k0) * 4u;
+    sw2[((g_q * 4u + (k >> 4u)) * 16u + g_row) * 4u + ((k & 15u) >> 2u)] = uvec2(pk(w.x, w.y), pk(w.z, w.w));
+}
+#define BS_W1(i) g_bw.v[i]
+#define BS_W4(i) (g_b16 ? g_bw4.v[i] : uvec4(g_bw.v[4u * (i)], g_bw.v[4u * (i) + 1u], g_bw.v[4u * (i) + 2u], g_bw.v[4u * (i) + 3u]))
+#define BS_ACC(w, i) bs_put((w), (i))
+#define BS_G(i) g_tab.v[i]
+#include "bdstep.glsl"
+
+void main() {
+    uint tid = gl_LocalInvocationID.x, nsg = gl_NumSubgroups, sgi = gl_SubgroupID;
+    uvec4 it = items[uint(p.ibase) + gl_WorkGroupID.x];
+    uint eb = it.x * 16u;
+    uvec2 ga = uvec2(etab[eb + 0u], etab[eb + 1u]);
+#ifdef GATE_UP
+    uvec2 ua = uvec2(etab[eb + 4u], etab[eb + 5u]);
+#endif
+    uint S = etab[eb + 8u], xoff = etab[eb + 9u], rowWords = etab[eb + 11u];
+    uint s0 = it.y, o0 = it.z * BO, K = uint(p.I), O = uint(p.O);
+    g_tab = TRef(uvec2(etab[eb + 14u], etab[eb + 15u]));
+    bs_tables_fill(T, int(tid));
+
+    // accumulator tile c = sgi + j * nsg: rows tile c & 1, outputs tile c >> 1
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[2];
+    [[unroll]] for (uint j = 0u; j < 2u; j++) acc[j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
+    uint nc = 8u / nsg;   // tiles per subgroup: 1 (eight of 32) or 2 (four of 64)
+
+    for (uint k0 = 0u; k0 < K; k0 += TK) {
+        barrier();   // the last step is read (and, the first time, the tables are in)
+        if (tid < 128u) {   // decode: (matrix,) row, which of the step's two 32-weight halves
+#ifdef GATE_UP
+            bool up = (tid >> 6) != 0u; uint r = (tid >> 1) & 31u;
+            uvec2 a = up ? ua : ga;
+            g_q = (up ? 2u : 0u) + (r >> 4u);
+#else
+            uint r = tid >> 1;
+            uvec2 a = ga;
+            g_q = r >> 4u;
+#endif
+            g_bw = WRef(a); g_bw4 = WRef4(a); g_b16 = (a.x & 15u) == 0u;
+            uint o = min(o0 + r, O - 1u);
+            g_row = r & 15u; g_k0 = k0 / 4u;
+            bs_step(T, o * rowWords * 4u, k0 / 32u + (tid & 1u));
+        } else {            // the rows' inputs: 32 x 64 values, 8 a uvec4, two a thread
+            [[unroll]] for (uint e = tid - 128u; e < TM * TK / 8u; e += 128u) {
+                uint r = e / (TK / 8u), k = (e - r * (TK / 8u)) * 8u;
+                bool ok = s0 + r < S;
+                uint xr = xoff + s0 + min(r, S - 1u - s0);
+#ifdef GATE_UP
+                if (p.kgat > 0) xr = uint(amap[xr]) / uint(p.kgat);
+#endif
+                vec4 a = vec4(0.0), b = vec4(0.0);
+                if (ok) { uint i4 = (xr * K + k0 + k) / 4u; a = x4[i4]; b = x4[i4 + 1u]; }
+                sx[((r >> 4u) * 4u + (k >> 4u)) * 32u + (r & 15u) * 2u + ((k & 15u) >> 3u)] =
+                    uvec4(pkx(a.x, a.y), pkx(a.z, a.w), pkx(b.x, b.y), pkx(b.z, b.w));
+            }
+        }
+        barrier();
+        [[unroll]] for (uint j = 0u; j < 2u; j++) {
+            if (j >= nc) break;   // subgroup-uniform
+            uint c = sgi + j * nsg, t = c & 1u, q = c >> 1u;
+            [[unroll]] for (uint kt = 0u; kt < 4u; kt++) {
+                coopMatLoad(A, sx, (t * 4u + kt) * 32u, 2u, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(B, sw2, (q * 4u + kt) * 64u, 4u, gl_CooperativeMatrixLayoutColumnMajor);
+                acc[j] = coopMatMulAdd(A, B, acc[j]);
+            }
+        }
+    }
+    [[unroll]] for (uint j = 0u; j < 2u; j++) {
+        if (j >= nc) break;
+        coopMatStore(acc[j], sacc, (sgi + j * nsg) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    }
+    barrier();
+#ifdef GATE_UP
+    for (uint e = tid; e < TM * BO; e += 256u) {
+        uint r = e / BO, n = e - r * BO, s = s0 + r, o = o0 + n;
+        if (s >= S || o >= O) continue;
+        uint t = r >> 4u, at = (r & 15u) * 16u + (n & 15u);
+        float g = sacc[((n >> 4u) * 2u + t) * 256u + at], u = sacc[((2u + (n >> 4u)) * 2u + t) * 256u + at];
+        if (p.limit > 0.0) { if (g > p.limit) g = p.limit; if (u > p.limit) u = p.limit; if (u < -p.limit) u = -p.limit; }
+        y[(xoff + s) * O + o] = (g / (1.0 + exp(-g))) * u;
+    }
+#else
+    for (uint e = tid; e < TM * BO; e += 256u) {
+        uint r = e / BO, n = e - r * BO, s = s0 + r, o = o0 + n;
+        if (s >= S || o >= O) continue;
+        uint yr = xoff + s;
+        if (p.kgat > 0) yr = uint(amap[yr]);
+        y[yr * O + o] = sacc[((n >> 4u) * 2u + (r >> 4u)) * 256u + (r & 15u) * 16u + (n & 15u)];
+    }
+#endif
+}

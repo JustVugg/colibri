@@ -231,7 +231,7 @@ dho_family_deepseek_sanitize() {
     local tag=$1 lost=$2; shift 2
     rm -f chain.usage
     env COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_DENSE_HOST=0 "$@" > san.log 2>&1 || true
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
     dho_v41_check "$tag" san.log "$lost" > /dev/null
     echo "OK $tag: sanitizers clean, $(dho_dropped san.log) matrices on the device only, $(dho_reloaded san.log) read back"
   }

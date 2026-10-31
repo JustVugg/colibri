@@ -1,0 +1,34 @@
+=== colibri benchmark (2026-10-12T15:20:28+03:00) ===
+url:    http://127.0.0.1:8000/v1
+model:  qwen3.6-colibri
+prompt: ~128 tokens | max_tokens=32 | repeat=3
+
+[
+  {
+    "duration_s": 8.879,
+    "first_output_s": 6.208,
+    "prompt_tokens": 97,
+    "completion_tokens": 32,
+    "finish_reason": "length",
+    "prefill_tok_s": 15.62,
+    "decode_tok_s": 11.61
+  },
+  {
+    "duration_s": 8.911,
+    "first_output_s": 6.247,
+    "prompt_tokens": 97,
+    "completion_tokens": 32,
+    "finish_reason": "length",
+    "prefill_tok_s": 15.53,
+    "decode_tok_s": 11.64
+  },
+  {
+    "duration_s": 8.964,
+    "first_output_s": 6.283,
+    "prompt_tokens": 97,
+    "completion_tokens": 32,
+    "finish_reason": "length",
+    "prefill_tok_s": 15.44,
+    "decode_tok_s": 11.56
+  }
+]

@@ -288,6 +288,12 @@ def serve(args):
         if "__stub_error__" in prompt:
             wire.line("ERROR", {"id": rid, "message": "stub failure requested by the prompt"})
             continue
+        if "__stub_bool_dims__" in prompt:
+            # JSON true is a bool, and bool is a subclass of int. A client that
+            # only asks isinstance(..., int) accepts this 1x1 frame.
+            wire.line("IMAGE", {"id": rid, "width": True, "height": True, "channels": 4,
+                                "bytes": 4, "seed": seed, "steps": steps}, b"\0\0\0\0")
+            continue
         t0 = time.monotonic()
         wire.line("PROGRESS", {"id": rid, "stage": "encode", "step": 0, "steps": steps,
                                "elapsed": 0.0})

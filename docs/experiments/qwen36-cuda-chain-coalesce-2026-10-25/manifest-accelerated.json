@@ -1,0 +1,113 @@
+{
+  "version": 1,
+  "hypothesis": "One kernel launch for a grid copy of two or more regions (a decode step's K and V rows, 40 cudaMemcpyAsync calls a token on Qwen3.6) and one route-ids download a frame instead of two copies a layer (80 a forward) turn 120 small copies on the CUDA chain's stream into 21 operations and raise Qwen3.6's decode on an L4 with every expert in VRAM, with the same logits, also with the MTP head's drafts.",
+  "commit": "7bbea341bb4bf9c812fed9d80501cf5fc1615042",
+  "model": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64",
+  "command": "cd c && make qwen36_tier.o backend_cuda.o cuda_chain.o cu_xb.o cu_tier.o CUDA=1 CUDA_ARCH=sm_89 && gcc -O3 -march=native -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_CUDA -I. ../docs/experiments/qwen36-cuda-chain-coalesce-2026-10-25/bench.c qwen36_tier.o backend_cuda.o cuda_chain.o cu_xb.o cu_tier.o -o qwen36-bench -lm -fopenmp -pthread -L/usr/local/cuda/lib64 -Wl,-rpath,/usr/local/cuda/lib64 -lcudart -lcublasLt -lcublas -lstdc++; env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/lib64-nvidia COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close Q36_MTP=1 Q36_MTP_DRAFTS=1 ./qwen36-bench --model <model> --text <dir>/promessi_sposi.txt --lengths 64,512 --gen 32 --teacher --steps <steps file>",
+  "prompt_hash": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "hardware": {
+    "cpu": "Intel(R) Xeon(R) CPU @ 2.20GHz (6 cores / 12 threads, 38.5 MiB L3) + NVIDIA L4 (23034 MiB, sm_89)",
+    "ram": "52 GiB",
+    "storage": "Google Colab VM disk (the model downloaded to /content before the runs, then read once into the page cache)",
+    "os": "Ubuntu 24.04.4 LTS, Linux 6.6.122+ x86_64 (Google Colab), CUDA 13.0 (nvcc V13.0.88), driver 580.82.07, gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "Q36_MTP": 1,
+      "Q36_MTP_DRAFTS": 1,
+      "mtp_head": "convert_qwen36.py --mtp-only",
+      "prompt_tokens": 64,
+      "decode_steps": 32,
+      "engine_build": "origin/dev 7bbea341"
+    },
+    "samples": {
+      "tok_s": [
+        60.829,
+        60.827,
+        60.788,
+        61.171
+      ],
+      "decode_tok_s_after_512": [
+        62.332,
+        62.434,
+        62.438,
+        62.686
+      ],
+      "prompt_tok_s_64": [
+        105.46,
+        105.43,
+        105.42,
+        105.69
+      ],
+      "prompt_tok_s_512": [
+        1627.14,
+        1627.17,
+        1627.58,
+        1620.67
+      ]
+    },
+    "median_tok_s": 60.828,
+    "quality": {
+      "method": "make -C c check (macOS arm64) and make -C c cuda-chain-check cuda-test CUDA=1 CUDA_ARCH=sm_89 (L4) pass; every run of both versions gives the same fingerprint of every logit and token (FNV-1a: 1837d0374f5820c3 at 64 tokens, 9a9da81aa38cc006 at 512) and the same teacher-forced nll",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-chain-coalesce-2026-10-25/accelerated.txt",
+      "sha256": "f5f70d41fe8269cd4126e67ad32fa684db12fd0d7e2bed9a8b01b678ab6ef937"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "Q36_MTP": 1,
+      "Q36_MTP_DRAFTS": 1,
+      "mtp_head": "convert_qwen36.py --mtp-only",
+      "prompt_tokens": 64,
+      "decode_steps": 32,
+      "engine_build": "7bbea341 + this change"
+    },
+    "samples": {
+      "tok_s": [
+        62.273,
+        62.345,
+        62.093,
+        61.908
+      ],
+      "decode_tok_s_after_512": [
+        63.546,
+        63.625,
+        63.518,
+        63.354
+      ],
+      "prompt_tok_s_64": [
+        106.06,
+        105.02,
+        104.5,
+        103.71
+      ],
+      "prompt_tok_s_512": [
+        1657.67,
+        1625.66,
+        1627.61,
+        1613.96
+      ]
+    },
+    "median_tok_s": 62.183,
+    "quality": {
+      "method": "make -C c check (macOS arm64) and make -C c cuda-chain-check cuda-test CUDA=1 CUDA_ARCH=sm_89 (L4) pass; every run of both versions gives the same fingerprint of every logit and token (FNV-1a: 1837d0374f5820c3 at 64 tokens, 9a9da81aa38cc006 at 512) and the same teacher-forced nll",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-chain-coalesce-2026-10-25/accelerated.txt",
+      "sha256": "f5f70d41fe8269cd4126e67ad32fa684db12fd0d7e2bed9a8b01b678ab6ef937"
+    }
+  },
+  "outcome": "improvement"
+}

@@ -4,7 +4,8 @@
  * back on the CPU, lm_head included, and return the bytes the trunk had taken
  * to the expert budget, so the warmstart that follows fills that VRAM with
  * experts instead. A hand-written COLI_PLACE is the user's word: not auto, not
- * withdrawn. Fake CUDA backend, no GPU, no toolkit. */
+ * withdrawn. The experts follow (qt_experts_withdraw, #2211) unless CUDA_EXPERT_GB is a
+ * number. Fake CUDA backend, no GPU, no toolkit. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -60,8 +61,19 @@ int main(void) {
     qt_trunk_withdraw("test again");
     check(G.budget[0] == held, "withdrawing an explicit placement is a no-op");
 
+    /* the experts follow (#2211), unless the allowance is the user's number */
+    check(qt_experts_on(), "the experts are on the device before their withdrawal");
+    qt_experts_withdraw("test");
+    check(qt_experts_on() && G.budget[0] == held, "CUDA_EXPERT_GB as a number: the experts stay");
+    setenv("CUDA_EXPERT_GB", "auto", 1);
+    qt_experts_withdraw("test");
+    check(!qt_experts_on() && G.budget[0] == 0, "an automatic allowance: the experts stay on the CPU, budget 0");
+    static uint8_t w4[D * IH / 2]; static float sc[2 * IH + D];
+    qt_note(0, 0, w4, w4, w4, sc, sc, sc);
+    check(fake_uploads == 0, "a routed expert is not uploaded after the withdrawal");
+
     qt_shutdown();
     if (fails) { printf("test_qwen36_tier_withdraw: %d failure(s)\n", fails); return 1; }
-    printf("OK test_qwen36_tier_withdraw: the automatic trunk placement can be withdrawn, budget restored\n");
+    printf("OK test_qwen36_tier_withdraw: the automatic trunk placement and expert allowance can be withdrawn\n");
     return 0;
 }

@@ -17,7 +17,8 @@
 # of the CPU's largest (logits_close).
 dho_mla_gate() {
   local eng=$1 tag=$2 tol=$3; shift 3
-  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  # COLI_SPEC_GATE=0 first, as in mla_gate (vulkan_engines.sh): the same verify steps in every run
+  local envs=(COLI_SPEC_GATE=0); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   local mode=${CHAINMODE:-1}
   local vk=(USAGE_SAVE=0 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VULKAN=1 COLI_VK_CHAIN=$mode)
   [ "$mode" = 0 ] && vk+=(COLI_VK_DENSE=1)
@@ -105,6 +106,12 @@ dho_family_glm() {
   # activations), the expert containers, prefill, the DSA selection, drafts
   for cap in 1 64; do dho_mla_gate colibri "dense-only colibri f32 cap=$cap" 1 SNAP=glm_tiny REF=ref_glm.json -- $cap 16 16; done
   dho_mla_gate colibri "dense-only colibri f32 prefill, chunks of 3" 1 SNAP=glm_tiny REF=ref_glm.json TF=1 COLI_VK_CHAIN_ROWS=3 -- 64 16 16
+  # KV16: the latent cache in float16 on the CPU and in the chain (which rounds its new rows
+  # alike before its attention reads them), and beside the COLI_VK_ATTN mirror. Tokens only:
+  # a value the CPU and the device compute a few bits apart can round to two halves an ulp
+  # apart (about 1e-3 in a logit, measured 8.7e-4 on the RTX), past the float32 gates' 1e-4
+  dho_mla_gate colibri "dense-only colibri KV16" 0 SNAP=glm_tiny REF=ref_glm.json KV16=1 -- 64 16 16
+  dho_mla_gate colibri "dense-only colibri KV16 prefill, chunks of 3" 0 SNAP=glm_tiny REF=ref_glm.json KV16=1 TF=1 COLI_VK_CHAIN_ROWS=3 -- 64 16 16
   for b in 8 4 3; do
     dho_mla_gate colibri "dense-only colibri ${b}-bit trunk and experts" 1 SNAP=glm_tiny REF=ref_glm.json IDOT=0 -- 2 $b $b
   done
@@ -117,22 +124,23 @@ dho_family_glm() {
   dho_mla_gate colibri "dense-only colibri DSA top-4, prefill in chunks of 5" 1 SNAP=glm_tiny REF=ref_glm.json DSA_TOPK=4 TF=1 COLI_VK_CHAIN_ROWS=5 -- 64 16 16
   dho_mla_gate colibri "dense-only colibri n-gram drafts" 1 SNAP=glm_tiny REF=ref_glm.json DRAFT=3 -- 64 16 16
   # the MTP head runs per matrix: its layer, eh_proj and lm_head take the device here
-  for d in 1 3; do dho_mla_gate colibri "dense-only colibri MTP depth $d" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=$d -- 64 16 16; done
-  dho_mla_gate colibri "dense-only colibri MTP, 4-bit" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json IDOT=0 DRAFT=2 -- 2 4 4
+  for d in 1 3; do dho_mla_gate colibri "dense-only colibri MTP depth $d" 1 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=$d -- 64 16 16; done
+  dho_mla_gate colibri "dense-only colibri MTP, 4-bit" 1 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json IDOT=0 DRAFT=2 -- 2 4 4
   dho_mla_gate colibri "dense-only colibri tier off" 1 SNAP=glm_tiny REF=ref_glm.json COLI_VK_TIER=0 -- 64 16 16
   dho_mla_gate colibri "dense-only colibri beside COLI_VK_ATTN=1" 1 SNAP=glm_tiny_i4 REF=glm_tiny_i4/ref_glm.json IDOT=0 COLI_VK_ATTN=1 -- 2 4 4
+  dho_mla_gate colibri "dense-only colibri KV16 beside COLI_VK_ATTN=1" 0 SNAP=glm_tiny_i4 REF=glm_tiny_i4/ref_glm.json IDOT=0 COLI_VK_ATTN=1 KV16=1 -- 2 4 4
   # prompts only: decode runs per matrix on the device; kv_b and the indexer stay on the
   # host (the CPU's attention reads them by row)
   CHAINMODE=2 dho_mla_gate colibri "dense-only colibri prompts only, drafts" 1 SNAP=glm_tiny REF=ref_glm.json DRAFT=3 -- 64 16 16
   CHAINMODE=0 dho_mla_gate colibri "dense-only colibri per-matrix path, absorb core" 1 SNAP=glm_tiny_i4 REF=glm_tiny_i4/ref_glm.json IDOT=0 COLI_VK_ATTN=1 -- 2 4 4
-  CHAINMODE=0 dho_mla_gate colibri "dense-only colibri per-matrix path, MTP" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 -- 64 16 16
+  CHAINMODE=0 dho_mla_gate colibri "dense-only colibri per-matrix path, MTP" 1 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 -- 64 16 16
   # staged uploads (a card without Resizable BAR): the drop happens after the copy returned
   COLI_VK_STAGED=1 dho_mla_gate colibri "dense-only colibri staged" 1 SNAP=glm_tiny REF=ref_glm.json DSA_TOPK=4 -- 64 16 16
   grep -q '^\[VK\] memory: staged uploads' vk.log || { grep '^\[VK\]' vk.log; fail "dense-only colibri staged: not staged"; }
   # the device lost: mid-decode, in the prompt (one teacher-forced forward), with MTP drafts
   dho_mla_lost colibri "dense-only colibri device lost mid-decode" 12 SNAP=glm_tiny REF=ref_glm.json -- 64 16 16
   dho_mla_lost colibri "dense-only colibri device lost in the prompt" 3 SNAP=glm_tiny REF=ref_glm.json TF=1 -- 64 16 16
-  dho_mla_lost colibri "dense-only colibri device lost with MTP" 12 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json -- 64 16 16
+  dho_mla_lost colibri "dense-only colibri device lost with MTP" 12 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json -- 64 16 16
   COLI_VK_STAGED=1 dho_mla_lost colibri "dense-only colibri device lost, staged" 12 SNAP=glm_tiny REF=ref_glm.json -- 64 16 16
   # serve sessions: pins, the prompt cache, the prefill read-out, drafts, two KV slots,
   # several conversations at once
@@ -141,6 +149,9 @@ dho_family_glm() {
   CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 DSA_TOPK=4 DRAFT=3
   CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 KV_SLOTS=2
   COLI_VK_CHAIN=2 CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 DSA_TOPK=4
+  # the latent cache in float16, as a serve keeps it (two KV slots: the adoption of float16 rows)
+  CHAIN_SERVE_KV16=1 CHAIN_SERVE_EXPECT='latent KV cache in float16' CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0
+  CHAIN_SERVE_KV16=1 CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 KV_SLOTS=2
   CHAIN_MUX_EXPECT="$CHAIN_SERVE_EXPECT" $PY tests/vulkan_chain_mux.py ./colibri glm_tiny_serve 3 SERVE_BATCH=1 IDOT=0 DSA_TOPK=4
   # the steps the chain does not take (MUX=0): per matrix on the device, kv_b on the host
   CHAIN_MUX_EXPECT="$CHAIN_SERVE_EXPECT" CHAIN_MUX_STEPS=0 $PY tests/vulkan_chain_mux.py ./colibri glm_tiny_serve 3 SERVE_BATCH=1 IDOT=0 COLI_VK_CHAIN_MUX=0
@@ -232,7 +243,7 @@ dho_family_glm_sanitize() {
     rm -f chain.usage
     env COLI_USAGE=chain.usage USAGE_SAVE=0 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=${CHAINMODE:-1} COLI_VK_DENSE_HOST=0 "$@" > san.log 2>&1 || true
     rm -f chain.usage
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
     [ "$(dho_dropped san.log)" -gt 0 ] || { cat san.log; fail "$tag: nothing on the device only"; }
     if [ "$lost" = 1 ]; then [ "$(dho_reloaded san.log)" -gt 0 ] || { cat san.log; fail "$tag: nothing read back"; }; fi
     echo "OK $tag: sanitizers clean, $(dho_dropped san.log) matrices on the device only, $(dho_reloaded san.log) read back"
@@ -241,7 +252,7 @@ dho_family_glm_sanitize() {
   ids=$($PY -c "print(','.join(str((i*37+5)%120+2) for i in range(100)))")
   dsan colibri "asan dense-only colibri f32, DSA top-4 prefill" 0 SNAP=glm_tiny REF=ref_glm.json TF=1 DSA_TOPK=4 COLI_VK_CHAIN_ROWS=3 ./colibri 64 16 16
   dsan colibri "asan dense-only colibri i4 container" 0 SNAP=glm_tiny_i4 REF=glm_tiny_i4/ref_glm.json IDOT=0 ./colibri 2 4 4
-  dsan colibri "asan dense-only colibri MTP depth 2" 0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 ./colibri 64 16 16
+  dsan colibri "asan dense-only colibri MTP depth 2" 0 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 ./colibri 64 16 16
   CHAINMODE=2 dsan colibri "asan dense-only colibri prompts only" 0 SNAP=glm_tiny REF=ref_glm.json DRAFT=3 ./colibri 64 16 16
   dsan colibri "asan dense-only colibri device lost" 1 SNAP=glm_tiny REF=ref_glm.json COLI_VK_CHAIN_FAULT=30 ./colibri 64 16 16
   dsan glm53 "asan dense-only glm53 int4 trunk, chain chunks of 3" 0 GLM53_BITS=4 COLI_VK_CHAIN_ROWS=3 ./glm53 --model glm53_stream-i4 --ids $ids --greedy 4
@@ -254,7 +265,7 @@ dho_family_glm_sanitize() {
     # shellcheck disable=SC2086
     COLI_VK_DENSE_HOST=0 CHAIN_SERVE_EXPECT='dense matrices on the device only' CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=$dialect \
       $PY tests/vulkan_chain_serve.py $args > san.log 2>&1 || { cat san.log; fail "asan dense-only serve ${args%% *}"; }
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan dense-only serve ${args%% *}: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "asan dense-only serve ${args%% *}: sanitizer diagnostic"; fi
     echo "OK asan dense-only serve ${args%% *}: $(tail -1 san.log)"
   done
   unset OMP_NUM_THREADS CAP_RAISE

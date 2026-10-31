@@ -249,6 +249,10 @@ Measured on a server with 8 Zen 4 cores (AVX-512, 8 OpenMP threads), 768x512,
   on a loaded server, and nothing at all when the same prompt comes back with
   a new seed: they are computed once per prompt and kept.
 - The VAE decodes 512x512 in 7 s, 768x512 in 10 to 12 s, 1024x1024 in 29 s.
+- Without VNNI the transformer takes the f32 activations. An i5-10500H (6 cores, AVX2 and FMA,
+  32 GB) drew 512x512 at 8 steps in 7.7 min with `coli run` (load included) and at 12 steps in
+  10.9 min, peak RSS about 15.5 GB
+  ([#2221](https://github.com/JustVugg/colibri/issues/2221)).
 - For reference, the diffusers pipeline in PyTorch runs the same step in
   17.2 s in bf16 on the same machine, and its f32 run peaked at 31.8 GB of
   RAM; colibri stays within 9 GB and needs neither Python nor torch to

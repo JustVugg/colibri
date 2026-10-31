@@ -159,15 +159,17 @@ dho_family_qwen36_olmoe_sanitize() {
       "qwen36 int8") args=(SNAP=qwen36_tiny_c ./qwen36 8 8 $R) ;;
       "qwen36 int4-g64 dense") args=(COLI_DENSE_BITS=4 SNAP=qwen36_tiny64_c ./qwen36 8 4 qwen36_tiny64/ref_full.json) ;;
       "qwen36 PILOT") args=(PILOT=1 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c ./qwen36 8 8 $R) ;;
-      "qwen36 device lost") args=(COLI_VK_CHAIN_FAULT=60 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c ./qwen36 8 8 $R) ;;
+      # the lost gates count the frames of the host's routing (COLI_VK_CHAIN_MOE=0): with the
+      # routed experts in the frame a forward is one frame, and frame 60 or 30 never comes
+      "qwen36 device lost") args=(COLI_VK_CHAIN_MOE=0 COLI_VK_CHAIN_FAULT=60 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c ./qwen36 8 8 $R) ;;
       "olmoe cap 1") args=(SNAP=olmoe_tiny_c ./olmoe 1 8 $OR) ;;
       "olmoe PILOT") args=(PILOT=1 WIDE=2 SNAP=olmoe_tiny_c ./olmoe 1 8 $OR) ;;
-      "olmoe device lost") args=(COLI_VK_CHAIN_FAULT=30 SNAP=olmoe_tiny_c ./olmoe 8 8 $OR) ;;
+      "olmoe device lost") args=(COLI_VK_CHAIN_MOE=0 COLI_VK_CHAIN_FAULT=30 SNAP=olmoe_tiny_c ./olmoe 8 8 $OR) ;;
       "olmoe automatic cache") args=(RAM_GB=0.7 SNAP=olmoe_tiny_c ./olmoe 0 8 $OR) ;;
     esac
     rm -f chain.usage
     env COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_DENSE_HOST=0 "${args[@]}" > san.log 2>&1 || true
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan dense-only $tag: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "asan dense-only $tag: sanitizer diagnostic"; fi
     [ "$(dho_dropped san.log)" -gt 0 ] || { cat san.log; fail "asan dense-only $tag: nothing on the device only"; }
     case $tag in *lost) [ "$(dho_reloaded san.log)" -gt 0 ] || { cat san.log; fail "asan dense-only $tag: nothing read back"; } ;; esac
     echo "OK asan dense-only $tag: sanitizers clean, $(dho_dropped san.log) matrices on the device only, $(dho_reloaded san.log) read back"
@@ -176,7 +178,7 @@ dho_family_qwen36_olmoe_sanitize() {
     local snap=qwen36_tiny_c; [ $eng = olmoe ] && snap=olmoe_tiny_c
     CHAIN_SERVE_EXPECT='dense matrices on the device only' COLI_VK_DENSE_HOST=0 \
       $PY tests/vulkan_chain_serve.py ./$eng $snap COLI_DENSE_I8=0 > san.log 2>&1 || { cat san.log; fail "asan dense-only $eng serve"; }
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan dense-only $eng serve: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "asan dense-only $eng serve: sanitizer diagnostic"; fi
     echo "OK asan dense-only $eng serve: $(tail -1 san.log)"
   done
   rm -f chain.usage chain-serve.usage

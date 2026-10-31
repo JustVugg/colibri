@@ -51,9 +51,9 @@ class ScoringEngine:
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
                  cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None,
-                 on_tool=None, image=None, logprobs=0, pin=False, on_echo=None):
+                 on_tool=None, image=None, logprobs=0, pin=False, on_echo=None, gbytes_before_ext=False):
         self.calls.append({"prompt": prompt, "max_tokens": max_tokens, "pin": bool(pin),
-                           "logprobs": logprobs})
+                           "logprobs": logprobs, "gbytes": gbytes_before_ext})
         words = prompt.split()
         if on_accept:
             on_accept({"prompt_tokens": len(words)})
@@ -260,6 +260,18 @@ class SystemOneApi(unittest.TestCase):
         self.assertGreater(out["usage"]["input_tokens"], 0)
         self.assertEqual(out["usage"]["output_tokens"], 6)  # two one-token options x three
 
+    def test_the_read_out_header_follows_the_family(self):
+        """colibri.c's header carries the grammar's byte count before its key=value tokens
+        (submit_gbytes): System One's read-outs ask for it there, as the chat's do, and
+        nowhere else. Without it colibri.c refused the header and the request waited."""
+        for arch, want in (("glm", True), ("qwen36", False)):
+            with self.subTest(arch=arch), patch("openai_server.ARCH", arch):
+                self.serve({"yes": -0.1, "no": -2.0})
+                self.post({"model": "jev-latest", "state": STATE,
+                           "questions": {"q": {"type": "noul", "instructions": "q?"}}})
+                self.assertTrue(self.engine.calls)
+                self.assertTrue(all(c["gbytes"] is want for c in self.engine.calls), self.engine.calls)
+
     def test_mean_with_unequal_option_token_counts_warns(self):
         import contextlib
         import io
@@ -399,6 +411,27 @@ class SystemOneApi(unittest.TestCase):
         self.assertEqual(body["error"]["param"], "questions.q.criteria[1]")
         self.assertEqual(body["detail"], [{"loc": ["body", "questions", "q", "criteria", 1],
                                            "msg": body["error"]["message"], "type": "value_error"}])
+
+    def test_detail_locations(self):
+        loc = openai_server.APIHandler._systemone_loc
+        self.assertEqual(loc("questions.q.criteria[1]"), ["body", "questions", "q", "criteria", 1])
+        self.assertEqual(loc("x[1][2].y[3]"), ["body", "x", 1, 2, "y", 3])
+        self.assertEqual(loc("questions.a.b]"), ["body", "questions.a.b]"])   # each dot is before a "]"
+        self.assertEqual(loc("a[[1]]"), ["body", "a[[1]]"])
+        self.assertEqual(loc(None), ["body"])
+        started = time.monotonic()
+        loc("." * 300000); loc("[1]" * 100000 + "x")
+        self.assertLess(time.monotonic() - started, 2.0, "a location is one pass over its text")
+
+    def test_question_ids_have_a_length(self):
+        self.serve({})
+        long_id = "q" * (openai_server.APIHandler._SYSTEMONE_MAX_ID + 1)
+        code, body = self.post_error({"model": "jev-latest", "state": STATE,
+                                      "questions": {long_id: {"type": "noul"}}})
+        self.assertEqual(code, 422)
+        self.assertIn(f"at most {openai_server.APIHandler._SYSTEMONE_MAX_ID} characters", body["error"]["message"])
+        self.assertNotIn(long_id, json.dumps(body))
+        self.assertEqual(body["detail"][0]["loc"], ["body", "questions"])
 
     def test_models_lists_the_jev_card_beside_the_openai_one(self):
         self.serve({})
@@ -608,6 +641,56 @@ class MimoSystemOneEndToEnd(unittest.TestCase):
         for entry in entries:
             self.assertLessEqual(entry["logprob"], 0.0)
             self.assertEqual(len(entry["top_logprobs"]), 2)
+
+
+
+class MissingOptionScores(unittest.TestCase):
+    """A missing option score must not become a log-probability of zero."""
+    serve = SystemOneApi.serve
+    post = SystemOneApi.post
+    post_error = SystemOneApi.post_error
+    pins = SystemOneApi.pins
+    test_healthy_choice = SystemOneApi.test_choice_labels_probabilities_and_confidence
+    test_healthy_noul = SystemOneApi.test_noul_is_the_probability_of_yes
+
+    def test_missing_option_scores_are_a_gateway_error(self):
+        self.serve({"billing": -2.0, "technical": -3.0})
+        generate = self.engine.generate
+
+        def incomplete(*args, **kwargs):
+            on_echo = kwargs.get("on_echo")
+            if args[0].endswith(" technical") and on_echo is not None:
+                # The prefix still has valid scores. Only the option's ECHO
+                # records are absent, as after a truncated scoring response.
+                limit = len(args[0].split()) - 1
+                kwargs["on_echo"] = lambda row: on_echo(row) if row["pos"] < limit else None
+            return generate(*args, **kwargs)
+
+        self.engine.generate = incomplete
+        status, error = self.post_error({"state": STATE, "questions": {
+            "department": {"type": "choice", "criteria": {
+                "billing": "payments", "technical": "bugs"}}}})
+        self.assertEqual(status, 502)
+        self.assertEqual(error["error"]["code"], "engine_error")
+        self.assertIn("log probabilities", error["error"]["message"])
+
+    def test_null_option_scores_are_a_gateway_error(self):
+        self.serve({"yes": -2.0, "no": -3.0})
+        generate = self.engine.generate
+
+        def incomplete(*args, **kwargs):
+            on_echo = kwargs.get("on_echo")
+            if args[0].endswith(" no") and on_echo is not None:
+                limit = len(args[0].split()) - 1
+                kwargs["on_echo"] = lambda row: on_echo(
+                    dict(row, logprob=None) if row["pos"] >= limit else row)
+            return generate(*args, **kwargs)
+
+        self.engine.generate = incomplete
+        status, error = self.post_error({"state": STATE, "questions": {
+            "urgency": {"type": "noul", "instructions": "Urgent?"}}})
+        self.assertEqual(status, 502)
+        self.assertEqual(error["error"]["code"], "engine_error")
 
 
 if __name__ == "__main__":

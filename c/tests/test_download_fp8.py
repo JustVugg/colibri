@@ -62,6 +62,31 @@ class DownloadExitStatusTests(unittest.TestCase):
                 with mock.patch.object(download_fp8, "download_file_curl", side_effect=fallback):
                     self.assertEqual(self.run_main(dest, "--source", source), 0)
 
+    def test_wrong_size_sdk_shard_reaches_curl_fallback(self):
+        name = "model-00001.safetensors"
+        for source in ("hf", "ms"):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as dest:
+                for metadata in self.META_FILES:
+                    open(os.path.join(dest, metadata), "wb").close()
+                def sdk_download(fn):
+                    with open(os.path.join(dest, fn), "wb") as out:
+                        out.write(b"x")
+                def fallback(fn, base, expected):
+                    self.assertEqual(expected, 4)
+                    with open(os.path.join(dest, fn), "wb") as out:
+                        out.write(b"data")
+                    return True
+                with mock.patch.object(download_fp8, f"get_shard_list_{source}",
+                                       return_value=([name], {name: 4})), \
+                     mock.patch.object(download_fp8, f"download_file_{source}",
+                                       side_effect=sdk_download), \
+                     mock.patch.object(download_fp8, "download_file_curl",
+                                       side_effect=fallback) as curl:
+                    self.assertEqual(self.run_main(dest, "--source", source, "--parallel", "1"), 0)
+                    curl.assert_called_once()
+                with open(os.path.join(dest, name), "rb") as shard:
+                    self.assertEqual(shard.read(), b"data")
+
     def test_failed_shard_returns_nonzero(self):
         manifest = (["model-00001.safetensors"],
                     {"model-00001.safetensors": 4})

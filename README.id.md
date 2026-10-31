@@ -10,7 +10,7 @@
 <p align="center">
   <a href="https://justvugg.github.io/colibri"><b>Situs Web</b></a> ·
   <a href="https://discord.gg/RXV83nSZdk"><b>Discord</b></a> ·
-  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a> · <a href="README.ja.md">日本語</a> · Bahasa Indonesia
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a> · <a href="README.ja.md">日本語</a> · Bahasa Indonesia · <a href="README.pt-BR.md">Português (Brasil)</a>
 </p>
 
 **Engine mungil, model raksasa.** colibri menjalankan model terbuka yang sangat
@@ -20,18 +20,20 @@ sehingga colibri menyimpan bagian itu di RAM dan membaca sisanya, yaitu para
 pakar, dari disk ketika model membutuhkannya. C murni, satu file per keluarga
 model, tanpa memerlukan GPU.
 
-Saat ini ada tiga belas engine yang dapat dijalankan. Sepuluh di antaranya untuk
-model bahasa: **GLM-5.2/5.3**, **GLM-5.3-Flash**, **Inkling**, **Kimi K3**,
-**DeepSeek V4 Flash**, **DeepSeek V4.1 Flash**, **MiMo-V2.6 Flash** (dan Pro),
-**Qwen3.8-Flash-Next**, **Qwen3.6** (yang juga menjalankan Qwen3-Coder dan model
-dense Qwen3.8-27B), serta **OLMoE**. Satu menghasilkan gambar:
-**Qwen-Image-2.1**. Dua digunakan untuk menjawab pertanyaan pengambilan keputusan:
-**Laya** dan **GLiNER2.5-Decide**, dengan model keputusan ketiga, **Clef**, pada
-engine Qwen3.6. [Mana yang cocok untuk mesin saya](#which-model-for-my-machine)
+Saat ini ada tiga belas engine yang berjalan. Sepuluh untuk model bahasa:
+**GLM-5.2/5.3** (yang juga menjalankan **Mistral-Large-4**), **GLM-5.3-Flash**,
+**Inkling**, **Kimi K3**, **DeepSeek V4 Flash**, **DeepSeek V4.1 Flash**,
+**MiMo-V2.6 Flash** (dan Pro), **Qwen3.8-Flash-Next**, **Qwen3.6** (yang juga
+menjalankan Qwen3-Coder, Qwen3.8-27B dense, **Flint**, **Muse Spark Open**, dan
+**LFM3-VL**), dan **OLMoE**. Satu menggambar: **Qwen-Image-2.1**. Dua menjawab
+keputusan: **Laya** dan **GLiNER2.5-Decide**, dengan model keputusan ketiga,
+**Clef**, pada engine Qwen3.6. Model bahasa juga berjalan dari file GGUF yang
+sudah dipublikasikan, dibaca apa adanya ([GGUF](docs/gguf.md)), di CPU, di GPU
+apa pun lewat Vulkan, dan di kartu NVIDIA lewat CUDA. [Mana yang cocok untuk mesin saya](#which-model-for-my-machine)
 
 ```
 $ ./coli chat
-  colibri v2.0.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU
+  colibri v2.1.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! Come posso aiutarti oggi?
@@ -251,12 +253,32 @@ kecepatan: drive NVMe yang cepat paling membantu)
 | **GLM-5.3-Flash** (321B): vision dan tools | 328 GB, dikonversi shard demi shard menjadi 195 GB | 25 GB | CUDA, Vulkan | sekitar 20 s per token saat warm, 44 s saat cold (6 core, 25 GB, disk biasa) |
 | **DeepSeek V4.1 Flash** (552B): vision dan tools, tanpa konversi tetapi memerlukan persiapan satu kali | 510 GB | sekitar 18 GB ditambah cache pakar (peak 24.8 GB dengan 8 per layer) | Vulkan | 0.21-0.24 tok/s (server CPU 16-thread yang menyimpan 68% pakar) |
 
+<a id="from-a-gguf"></a>
+
+**Dari GGUF: file yang sudah dipublikasikan, dibaca apa adanya**
+
+`./coli import` menerima file pertama dari sebuah GGUF (bagian lainnya di sebelahnya) dan
+menulis direktori model di sampingnya; lalu direktori itu dipakai untuk `--model`, seperti model
+lain ([gguf.md](docs/gguf.md)). Tidak ada yang dikonversi atau dikuantisasi ulang: blok berjalan
+seperti yang disimpan file, dari IQ1_S sampai Q8_0, F16, BF16, dan MXFP4. Engine semua model chat
+di atas juga membaca GGUF ([arsitekturnya](docs/gguf.md#supported-architectures)); empat model
+ini datang sebagai GGUF:
+
+| Model | GGUF | GPU | Terukur |
+|---|---|---|---|
+| **Mistral-Large-4** (1T, 52B aktif): teks, gambar, penalaran, dan tool | unsloth, UD-IQ1_S 233 GB | CUDA, Vulkan | 1.34-1.36 tok/s dengan CUDA, 1.16-1.17 dengan Vulkan (D) |
+| **Muse Spark Open** (816B, 42B aktif): teks dan tool, di bawah perjanjian lisensi Meta | unsloth, dari UD-IQ1_S 176 GB sampai UD-Q4_K_XL 505 GB | CUDA, Vulkan | 1.55-1.58 tok/s dengan Vulkan, 1.34-1.40 dengan CUDA, 0.83-0.89 di CPU (D) |
+| **Flint** (40B, 2.5B aktif): teks dan tool, Apache 2.0 | unsloth, dari UD-IQ1_M 11.4 GB sampai BF16 79.6 GB | CUDA, Vulkan | UD-Q4_K_XL: 77.4 tok/s dengan CUDA, 77.7 dengan Vulkan, 15.8 di CPU (D) |
+| **LFM3-VL-2B**: teks, gambar, dan tool, LFM Open License | LiquidAI, dari QAD-Q4_0 sampai BF16 (atau checkpoint yang dikonversi) | CUDA, Vulkan | Q4_K_M: 235.1 tok/s dengan CUDA, 214.1 dengan Vulkan, 34.5 di CPU (D) |
+
+Model yang lebih besar dari tabel di atas, dari GGUF-nya, di mesin yang sama: [Benchmark](#large-models-on-the-same-machine).
+
 **Model keputusan** (menjawab pertanyaan [System One](#system-one-a-decision-with-a-probability), bukan untuk chat)
 
 | Model | Unduhan, lalu di disk | RAM | GPU | Hasil pengukuran |
 |---|---|---|---|---|
-| **Laya** (Convai Innovations), bahasa Inggris | 0.85 GB | 1.7 GB | CPU | 219 ms untuk satu pertanyaan, 882 ms untuk tiga (B) |
-| **GLiNER2.5-Decide** (fastino), bahasa Inggris | 1.95 GB | 1.9 GB | CPU | 294 ms untuk satu pertanyaan, 897 ms untuk tiga (B, under load) |
+| **Laya** (Convai Innovations), bahasa Inggris | 0.85 GB | 1.7 GB | CPU, CUDA | 219 ms untuk satu pertanyaan, 882 ms untuk tiga (B); dua belas dalam 0.69 s dengan CUDA, 11.4-13.0 s di CPU (D) |
+| **GLiNER2.5-Decide** (fastino), bahasa Inggris | 1.95 GB | 1.9 GB | CPU, CUDA | 294 ms untuk satu pertanyaan, 897 ms untuk tiga (B, under load); dua belas dalam 0.16-0.21 s dengan CUDA, 2.0-2.6 s di CPU (D) |
 | **Clef** (Cloudflare): Qwen3.8-27B dengan decision head, juga dapat chat | 55 GB, 52 GB setelah konversi | 19 GB dalam int4 hingga 55 GB dalam f16 | CPU | 20.4 s per request dalam int8 (A) |
 
 Mesin yang digunakan:
@@ -264,12 +286,14 @@ Mesin yang digunakan:
 terintegrasi);
 **B** laptop i7-1355U;
 **C** RTX 3070 8 GB dalam mesin Threadripper 3945WX, dengan layer dense dan
-layer DeltaNet pada kartu (container int4 per-row).
+layer DeltaNet pada kartu (container int4 per-row);
+**D** i5-13500 dengan RAM 62 GB, RTX PRO 4000 Blackwell SFF (24 GB), dan dua NVMe
+dalam array md: mesin untuk [tabel benchmark](#benchmarks).
 Setiap angka berasal dari halaman model masing-masing di [docs/](docs/) atau
 dari [tabel benchmark](docs/benchmarks.md), beserta pengaturan yang tepat.
 
 Setiap keluarga memiliki halamannya sendiri: [qwen36.md](docs/qwen36.md)
-(Qwen3.6, Qwen3-Coder, Qwen3.8-27B), [qwen38.md](docs/qwen38.md),
+(Qwen3.6, Qwen3-Coder, Qwen3.8-27B, Flint, Muse Spark Open, LFM3-VL), [mistral-large4.md](docs/mistral-large4.md), [gguf.md](docs/gguf.md), [qwen38.md](docs/qwen38.md),
 [deepseek-v4.md](docs/deepseek-v4.md), [deepseek-v41.md](docs/deepseek-v41.md),
 [mimo.md](docs/mimo.md), [glm53-flash.md](docs/glm53-flash.md),
 [inkling.md](docs/inkling.md), [kimi_k3.md](docs/kimi_k3.md),
@@ -332,15 +356,18 @@ di CPU. Pada GPU terintegrasi, coba keduanya: pada laptop dengan Intel Iris Xe
 (Core i7-1355U), Qwen3.6 mendekode 2,1 tok/s di CPU, 1,7 sampai 1,9 dengan Vulkan,
 dan 2,1 dengan dense chain dimatikan.
 
-Pada GPU diskret, proses penyiapan membuat build Vulkan untuk setiap engine
-(CUDA terlebih dahulu jika engine memilikinya dan toolkit sudah terinstal),
-dengan layer dense berada di kartu. Inilah skenario yang menjadi sasaran desain
-tersebut. **Kami belum mengukur GPU diskret sendiri.** Angka pertama berasal
-dari seorang pengguna: Qwen3.6 pada Tesla V100 16 GB mencapai 17 hingga 19
-tok/s, dengan expert tier dan dense chain
-([#1852](https://github.com/JustVugg/colibri/issues/1852)). (Sebelumnya, jalur
-Vulkan lama milik GLM-5.2 menghasilkan 1.7-1.8 tok/s pada RX 9070 diskret.)
-Kami menyambut hasil pengukuran dari kartu Anda.
+Pada GPU diskret, setup membangun Vulkan untuk setiap engine (CUDA lebih dulu,
+jika engine memilikinya dan toolkit terpasang), dengan layer dense di kartu.
+Itulah kasus yang menjadi tujuan desainnya. Pada RTX PRO 4000 (24 GB, mesin D),
+Qwen3.6-35B-A3B melakukan decode 92.9 tok/s dan membaca prompt pada 2076, OLMoE
+pada 299.4 dan 6867 ([tabelnya](#three-backends-on-one-machine)). Model yang lebih
+besar dari kartu menyimpan pakar yang tidak muat di kartu dalam pool di RAM, dan
+pada setiap langkah CPU menghitung pakar itu sementara kartu menghitung miliknya,
+dalam frame yang sama: Qwen3.8-Flash-Next IQ2_XS (68 GB) melakukan decode 50.6
+tok/s ([vulkan.md](docs/vulkan.md#the-routed-experts-in-the-frame-vk_dmoeh)).
+Seorang pengguna mengukur Qwen3.6 pada 17 sampai 19 tok/s di Tesla V100 16 GB
+([#1852](https://github.com/JustVugg/colibri/issues/1852)). Angka dari kartu Anda
+sangat diharapkan.
 
 **Kartu tanpa Resizable BAR** kini dapat digunakan. Kartu seperti itu (semua
 kartu Turing, kartu Ampere dengan firmware peluncurannya, kartu AMD lama dengan
@@ -359,16 +386,27 @@ menyimpang satu kata dari hasil CPU
 
 ### CUDA: kartu NVIDIA
 
-Proses penyiapan membuat build CUDA di Linux ketika CUDA toolkit terinstal,
-untuk engine yang memiliki jalur CUDA: GLM-5.2/5.3, GLM-5.3-Flash, Inkling,
-Kimi K3, DeepSeek V4 Flash, Qwen3.8-Flash-Next, dan Qwen3.6 dengan Qwen3-Coder.
-Di Windows, engine CUDA merupakan DLL terpisah
-([windows.md](docs/windows.md)), dan setiap rilis menyertakannya dalam keadaan
-sudah di-build: `colibri-<versi>-windows-x86_64-cuda.zip` berisi `coli_cuda.dll`
-(kartu dengan compute capability 8.0 ke atas) serta engine colibri, qwen36 dan
-kimi_k3 yang memuatnya. Ekstrak di atas archive utama, dan proses penyiapan
-memilih CUDA.
+Setup membangun CUDA di Linux saat CUDA toolkit terpasang, untuk engine yang
+memiliki jalur CUDA: GLM-5.2/5.3 dan Mistral-Large-4, GLM-5.3-Flash, Inkling,
+Kimi K3, DeepSeek V4 Flash, DeepSeek V4.1 Flash, MiMo-V2.6, Qwen3.8-Flash-Next,
+dan Qwen3.6 dengan model yang dijalankannya; OLMoE dan engine keputusan dibangun
+dengan `make <engine> CUDA=1`. Di Windows, engine CUDA adalah DLL terpisah
+([windows.md](docs/windows.md)), dan setiap rilis menyertakannya dalam bentuk
+siap pakai: `colibri-<versi>-windows-x86_64-cuda.zip` berisi `coli_cuda.dll`
+(kartu dengan compute capability 8.0 ke atas) dan engine colibri, qwen36, dan
+kimi_k3 yang memuatnya, beserta DLL CUDA milik DeepSeek V4. Ekstrak di atas arsip
+utama, dan setup akan memilih CUDA.
 
+- **Setiap layer di kartu** untuk Qwen3.6, Qwen3.8, dan OLMoE: layer dense,
+  attention, dan pakar yang dipegang kartu berjalan sebagai satu chain, dan pakar
+  yang tidak dipegangnya berjalan di CPU. Pada RTX PRO 4000, Qwen3.6-35B-A3B
+  UD-Q4_K_M melakukan decode 104.8 tok/s dan membaca prompt pada 3491, OLMoE pada
+  354.6 dan 10418 ([tabelnya](#three-backends-on-one-machine)).
+- **Tier pakar di kartu untuk setiap engine** (`cu_tier.h`), dan matriks dense di
+  kartu untuk DeepSeek V4, V4.1, Kimi K3, GLM-5.3, dan MiMo (`cu_dense.h`).
+- **Blok GGUF di kartu** (`cuda_bd.cuh`): setiap tipe blok ggml dengan 32 bobot
+  atau lebih, setiap baris seperti yang disimpan file; prompt melewati tensor core
+  ([gguf.md](docs/gguf.md)).
 - **VRAM expert tier** menyimpan pakar yang paling sering digunakan di kartu,
   dipilih berdasarkan routing yang terukur; cache miss dihitung di CPU pada saat
   yang sama. Qwen3.6 pada dua kartu 8 GB (RTX 3070 dan Quadro RTX 4000)
@@ -463,24 +501,33 @@ mode ini tidak membantu dijelaskan di
 `coli web` membukanya, begitu juga proses penyiapan satu langkah: chat, halaman
 System One, Brain, dan halaman Profiling, dalam tema terang atau gelap.
 
-<p align="center">
-  <img src="docs/media/colibri-dashboard.png" width="900" alt="dashboard web colibri: chat, metrik langsung, panel hardware, tier pakar">
-</p>
-<p align="center"><em>Qwen3.6 menjawab pada mesin CPU, dengan pakar yang di-streaming dari disk.</em></p>
+### UI chat baru
+
+`coli ui` membuka chat baru di samping `coli serve` yang sedang berjalan: penalaran di bloknya sendiri,
+gambar untuk model dengan menara visi, pencarian web, peta pakar, monitor langsung, dan agen pemrograman
+yang sudah diarahkan ke colibri. Tujuh bahasa. Lihat [ui/README.md](ui/README.md).
 
 <p align="center">
-  <img src="docs/media/colibri-brio.png" width="900" alt="halaman System One: sebuah dokumen dibaca sekali, probabilitas untuk setiap jawaban yang diizinkan, dan entropy">
+  <img src="docs/media/ui/ui-chat.png" width="900" alt="UI chat baru: sebuah pertanyaan, penalaran yang dilipat, jawaban, dan kecepatannya">
 </p>
-<p align="center"><em><strong>System One</strong>: berikan model sebuah dokumen dan hanya jawaban yang boleh dipilihnya. Di sini:
-<strong>request changes pada 99.9%</strong>, entropy 0.005, 4 token dibaca, 0 dihasilkan.</em></p>
+<p align="center"><em>LFM3-VL-2B pada CPU i5-13500, 32 tok/s.</em></p>
 
 <p align="center">
-  <img src="docs/media/colibri-brain.png" width="900" alt="halaman Brain: atlas pakar GLM-5.2 yang terukur digambar sebagai korteks, sepuluh wilayah yang dapat dimasuki">
+  <img src="docs/media/ui/ui-monitor.png" width="900" alt="monitor: status model, kecepatannya, token yang ditulis, prompt, CPU dan RAM engine">
 </p>
-<p align="center"><em><strong>Brain</strong>: <a href="https://github.com/JustVugg/colibri/issues/175">atlas pakar yang terukur</a> dari GLM-5.2,
-13,260 pakar yang telah dikarakterisasi dalam sepuluh wilayah (Python, SQL, matematika, puisi, hukum, bahasa Tionghoa...), ditempatkan berdasarkan
-afinitas routing yang terukur. <strong>Live routing</strong> menampilkan model yang sedang berjalan: satu sel per pakar, diberi warna berdasarkan
-storage tier, dan setiap pakar yang dirutekan dalam satu turn akan berkedip.</em></p>
+<p align="center"><em><strong>Monitor</strong> saat LFM3-VL-2B menulis: 31.6 tok/s, prompt dibaca dalam 0.1 s, RAM 2.1 GB.</em></p>
+
+<p align="center">
+  <img src="docs/media/ui/ui-experts.png" width="900" alt="chat dengan peta pakar terbuka: satu sel per pakar di setiap 16 blok OLMoE">
+</p>
+<p align="center"><em>OLMoE dengan <strong>peta pakar</strong> terbuka di samping chat: satu sel per pakar di setiap blok, putih saat dipilih pada langkah ini,
+amber saat dipakai dalam jawaban ini.</em></p>
+
+<p align="center">
+  <img src="docs/media/ui/ui-systemone.png" width="900" alt="halaman System One: sebuah pull request dibaca sekali, probabilitas untuk setiap jawaban yang diizinkan, dan seberapa yakin modelnya">
+</p>
+<p align="center"><em><strong>System One</strong>: berikan model sebuah dokumen dan hanya jawaban yang boleh dipilihnya. Di sini Qwen3.6-35B pada RTX PRO 4000
+membaca pull request yang merusak batas ukuran cache: <strong>request changes pada 81%</strong>, entropy 0.56 (ragu), 98 token dibaca, 0 dihasilkan.</em></p>
 
 Halaman **Profiling** menunjukkan di mana waktu setiap turn digunakan, fase demi
 fase, dengan 30 turn terakhir sebagai tren.
@@ -498,8 +545,9 @@ dengan beberapa API:
   dalam format native modelnya
   ([tabel per-engine](docs/api.md#tool-calling-support));
 - **input gambar** pada GLM-5.3-Flash, DeepSeek V4.1 Flash, MiMo-V2.6,
-  Qwen3.8-Flash-Next, dan Qwen3.8-27B: sebuah path dalam pesan `coli chat`,
-  attachment di `coli web`, atau bagian `image_url`;
+  Qwen3.8-Flash-Next, Qwen3.8-27B, LFM3-VL, dan Mistral-Large-4 (dari GGUF, dengan
+  file `mmproj` di sebelahnya): sebuah path dalam pesan `coli chat`, attachment di
+  `coli web` atau `coli ui`, atau bagian `image_url`;
 - **output gambar** dengan Qwen-Image-2.1 pada `POST /v1/images/generations`,
   dan digambar langsung di terminal oleh `coli chat`
   ([qwen-image.md](docs/qwen-image.md));
@@ -564,15 +612,22 @@ dari VRAM, RAM, maupun disk.
   dibuka kembali tanpa membaca ulang prompt.
 - **Spekulasi yang sepadan dengan biayanya.** Int8 MTP head GLM-5.2 membuat draft
   2.2-2.8 token per forward ketika menguntungkan; MTP head Qwen3.8-Flash-Next,
-  opt-in, menambah 12-14% dengan output yang sama. Jika drafting membutuhkan
-  biaya lebih besar daripada penghematannya (DeepSeek V4), fitur tersebut tetap
-  dimatikan ([tuning.md](docs/tuning.md#speculation-and-reproducibility)).
+  aktif secara default, menambah 16-20% dengan output yang sama, dan prompt
+  lookup 6-7% pada edit kode. Head Qwen3.6, aktif secara default, menaikkan
+  decode dari 99.7-104.5 ke 115.8-120.1 tok/s dengan CUDA dan dari 83.2-83.8 ke
+  99.9-109.3 dengan Vulkan (sebuah RTX PRO 4000). Head DSpark DeepSeek V4.1
+  membuat draft sedalam yang dikatakan keyakinannya, dan sebuah gate melewati
+  draft yang tidak bisa balik modal. Jika drafting membutuhkan biaya lebih besar
+  daripada penghematannya (DeepSeek V4), fitur tersebut tetap dimatikan
+  ([speculative.md](docs/speculative.md),
+  [tuning.md](docs/tuning.md#speculation-and-reproducibility)).
 
 Engine menggunakan satu file C per keluarga model (`c/colibri.c` untuk GLM-5.2)
 di atas header bersama, tanpa BLAS dan tanpa Python saat runtime: Python hanya
 menjalankan proses penyiapan, launcher, converter, dan API gateway.
 
 <a id="what-it-achieves"></a>
+<a id="benchmarks"></a>
 
 ## Benchmark
 
@@ -592,6 +647,57 @@ pakar berada. Decode GLM-5.2, dari [tabel lengkap](docs/benchmarks.md):
   ([#273](https://github.com/JustVugg/colibri/issues/273));
 - **laptop 25 GB tempat proyek ini bermula:** 0.05-0.1 tok/s cold, batas bawah
   yang realistis.
+
+<a id="three-backends-on-one-machine"></a>
+
+### Tiga backend di satu mesin
+
+Sebuah i5-13500 dengan RAM 62 GB dan RTX PRO 4000 Blackwell SFF (24 GB, 70 W),
+setiap model dilayani oleh `coli serve`: prompt baru 450 token, lalu jawaban 128
+token yang di-stream, termasuk HTTP permintaannya; yang terbaik dari dua run,
+tok/s.
+
+| GGUF | CUDA prompt | CUDA decode | Vulkan prompt | Vulkan decode | CPU prompt | CPU decode |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen3.6-35B-A3B UD-Q4_K_M | 3491 | 104.8 | 2076 | 92.9 | 122.6 | 13.9 |
+| LFM3-VL-2B Q4_K_M | 12317 | 235.1 | 8174 | 214.1 | 286.5 | 34.5 |
+| OLMoE-1B-7B-0125-Instruct Q4_K_M | 10418 | 354.6 | 6867 | 299.4 | 279.9 | 47.4 |
+| LFM3-VL-2B F16 | 11524 | 103.4 | 7767 | 99.3 | 49.7 | 6.4 |
+| Qwen3.8-Flash-Next IQ2_XS (68 GB: pakar yang tidak muat di kartu tetap di RAM) | 217.1 | 51.4 | 214.3 | 50.6 | 38.3 | 9.3 |
+
+<a id="large-models-on-the-same-machine"></a>
+
+### Model besar di mesin yang sama
+
+Mesin D lagi, setiap model dari GGUF yang dipublikasikan lewat `coli serve`: apa
+yang tidak dipegang kartu maupun RAM datang dari dua NVMe. Token per detik, dari
+halaman setiap model:
+
+| GGUF | ukuran | backend | prompt | decode |
+|---|---:|---|---:|---:|
+| Inkling-Small UD-IQ2_XXS | 77 GB | Vulkan | 15.1-33.1 | 10.92-11.53 ([vulkan.md](docs/vulkan.md)) |
+| MiMo-V2.6-Flash Q2_K_S | 106 GB | Vulkan | 8.2 | 7.8 ([gguf.md](docs/gguf.md)) |
+| DeepSeek V4 Flash 0731 UD-IQ2_XXS | 85 GB | Vulkan | 19.7-20.4 | 6.18-6.25 ([vulkan.md](docs/vulkan.md)) |
+| DeepSeek V4.1 Flash UD-IQ1_S |  | Vulkan | 31.8 atas 3403 token | 5.01-5.29 ([deepseek-v41.md](docs/deepseek-v41.md)) |
+| GLM-5.3-Flash UD-IQ2_XXS | 95 GB | Vulkan | 9.3 | 2.92-3.40 ([vulkan.md](docs/vulkan.md)) |
+| Muse Spark Open UD-IQ1_S | 176 GB | Vulkan | 5.0-5.3 | 1.55-1.58 ([qwen36.md](docs/qwen36.md#muse-spark-open)) |
+| Mistral-Large-4 UD-IQ1_S | 233 GB | CUDA | 240 token dalam 66-82 s | 1.34-1.36 ([mistral-large4.md](docs/mistral-large4.md)) |
+| GLM-5.2 UD-IQ1_S | 202 GB | Vulkan |  | 0.633-0.658 ([gguf.md](docs/gguf.md)) |
+| Kimi K3 UD-IQ1_S | 594 GB | Vulkan | 31 token dalam 46.5 s | 0.349 ([gguf.md](docs/gguf.md)) |
+
+### Konteks panjang dan agen
+
+- **Konteks 256k dengan kecepatan 64k.** Qwen3.8-Flash-Next IQ2_XS pada chain CUDA
+  mesin D, dengan konteks 262144 token: prompt dari 15.6 ke 149 tok/s, decode dari
+  9.6 ke 45.7 (rencana RAM pada satu segmen prompt, K/V dalam float16 di kartu;
+  pada 65536 membaca 188 dan decode 48.4) ([qwen38.md](docs/qwen38.md)).
+- **Giliran agen hanya membaca yang baru.** Permintaan singkat di antara dua
+  giliran (agen yang meminta judul percakapan) memarkir percakapan alih-alih
+  mengambil state-nya, di setiap engine (`COLI_PARK`). Giliran kedua Hermes Agent
+  pada Qwen3.8-Flash-Next, 14810 token: dari 86 s ke 4.9 s
+  ([qwen38.md](docs/qwen38.md#an-agents-turns)).
+- **KV cache dalam float16**: GLM-5.3 pada 131072 token memakai 11.9 GB, bukan
+  23.9 ([CHANGELOG](CHANGELOG.md)).
 
 Kualitas diukur, bukan diasumsikan: biaya container int4 dan ablation
 quantization tersedia di
@@ -635,7 +741,8 @@ menyebabkan jawaban berulang pada
 /nvme/glm52_i4` membuat container yang sama dari rilis FP8, shard demi shard,
 tanpa pernah memerlukan seluruh 756 GB berada di disk sekaligus. Cara memeriksa
 MTP head dan bagian lainnya:
-[quickstart.md](docs/quickstart.md#3-get-the-model).
+[quickstart.md](docs/quickstart.md#3-get-the-model). GGUF yang sudah Anda miliki tidak perlu dikonversi: `./coli import` pada file
+pertamanya ([di atas](#from-a-gguf)).
 
 <a id="3-run-it"></a>
 
@@ -650,6 +757,8 @@ chat template-nya, sehingga perintahnya sama untuk setiap model:
 ./coli plan  --model /nvme/qwen36          # where the model will live: VRAM, RAM, disk
 ./coli doctor --model /nvme/qwen36         # read-only check: is everything ready?
 ./coli tune  --model /nvme/qwen36          # measure and save this machine's fastest safe settings
+./coli import /nvme/Flint-UD-Q4_K_XL.gguf  # a GGUF: writes Flint-UD-Q4_K_XL.colibri next to it
+./coli ui                                  # the chat UI, next to a running coli serve
 ```
 
 Di Windows, archive rilis menyertakan `coli.cmd` (`coli.cmd chat --model
@@ -675,7 +784,7 @@ kualitas diukur bersama kecepatan. Pertanyaan terbukanya:
 | Planner yang memahami hardware dapat mendekati konfigurasi terbaik setiap mesin secara otomatis | budget RAM/VRAM dan beberapa backend sudah terdeteksi saat ini, dan proses penyiapan memilih build | bandingkan plan yang dihasilkan dengan controlled parameter sweep pada laptop, workstation, host NUMA, dan sistem multi-GPU |
 | Representasi lossless atau dengan batas kualitas dapat mengurangi perpindahan bobot sampai cukup berarti | ablation format dan quantization sudah tersedia, dengan gate correctness/kualitas | reproduksi kualitas, byte yang dipindahkan, latency, dan biaya per token berguna secara bersamaan, bukan hanya compression ratio |
 | Spekulasi yang mempertimbangkan routing dapat menguntungkan sebelum residensi hampir penuh | MTP dan grammar drafts bekerja, tetapi MTP juga pernah terukur mengalami penurunan 32% di sekitar expert hit 85% | petakan permukaan break-even terhadap acceptance, expert hit rate, batch union, dan draft depth |
-| Overlap CPU/GPU dapat menyembunyikan transfer dan sinkronisasi alih-alih sekadar memindahkan bottleneck | peningkatan dari CUDA, Metal, dan Vulkan sudah ada, tetapi CPU cepat, GPU terintegrasi, dan residensi rendah dapat menghapusnya | profil per-stage dan A/B satu variabel pada PCIe, unified-memory, dan mesin full-resident, serta angka discrete-GPU pertama untuk Vulkan tier dan chain |
+| Overlap CPU/GPU dapat menyembunyikan transfer dan sinkronisasi alih-alih sekadar memindahkan bottleneck | peningkatan dari CUDA, Metal, dan Vulkan sudah ada, tetapi CPU cepat, GPU terintegrasi, dan residensi rendah dapat menghapusnya | profil per-stage dan A/B satu variabel pada PCIe, unified-memory, dan mesin full-resident, serta lebih banyak kartu diskret untuk Vulkan tier dan chain daripada yang sudah diukur (sebuah RTX PRO 4000) |
 
 Ingin membantu? Pilih satu baris dan publikasikan juga hasil negatif. Catat
 hardware, commit, model, perintah persis, prompt, state cache, throughput, time
@@ -695,10 +804,14 @@ penjelasan.
 | Penyiapan melalui asisten AI, dan server MCP | [AI_SETUP.md](docs/AI_SETUP.md), [MCP_SERVER.md](docs/MCP_SERVER.md) |
 | API: OpenAI, Anthropic, tools, KV slots, dashboard | [api.md](docs/api.md) |
 | System One dan model keputusan | [systemone.md](docs/systemone.md), [laya.md](docs/laya.md), [gliner_decide.md](docs/gliner_decide.md), [clef.md](docs/clef.md) |
+| File GGUF: arsitektur, dua mode, apa yang dilakukan setiap engine dengan bloknya | [gguf.md](docs/gguf.md) |
+| Model pada engine Qwen3.6 (Flint, Muse Spark Open, LFM3-VL) dan Mistral-Large-4 | [qwen36.md](docs/qwen36.md), [mistral-large4.md](docs/mistral-large4.md) |
+| UI chat (`coli ui`) | [ui/README.md](ui/README.md) |
 | Vulkan: expert tier, dense chain, kartu tanpa Resizable BAR | [vulkan.md](docs/vulkan.md) |
 | CUDA, dan CUDA tier Qwen3.6 | [cuda.md](docs/cuda.md), [qwen36-cuda-tier.md](docs/qwen36-cuda-tier.md) |
 | Apple Silicon, Windows | [metal.md](docs/metal.md), [windows.md](docs/windows.md) |
 | Tuning, learning cache, prefetch, speculation | [tuning.md](docs/tuning.md) |
+| Decoding spekulatif: MTP head, prompt lookup, gate | [speculative.md](docs/speculative.md) |
 | Beberapa SSD, beberapa mesin | [multidisk.md](docs/multidisk.md), [cluster.md](docs/cluster.md) |
 | Benchmark dan cara melakukan pengukuran | [benchmarks.md](docs/benchmarks.md), [benchmarking.md](docs/benchmarking.md) |
 | Setiap opsi dan environment variable | [SETTINGS.md](docs/SETTINGS.md), [ENVIRONMENT.md](docs/ENVIRONMENT.md) |
@@ -710,7 +823,7 @@ penjelasan.
 start-here.sh, START-HERE.bat   the one-step setup (Linux and macOS, Windows)
 Makefile                        root build/check entry point
 c/
-├── colibri.c             GLM-5.2/5.3 engine  (make glm)
+├── colibri.c             GLM-5.2/5.3, Mistral-Large-4  (make glm)
 ├── glm53.c               GLM-5.3-Flash  (make glm53)
 ├── inkling.c             Inkling  (make inkling)
 ├── kimi_k3.c             Kimi K3  (make kimi_k3)
@@ -718,7 +831,8 @@ c/
 ├── deepseek_v41.c        DeepSeek V4.1 Flash  (make deepseek_v41)
 ├── mimo.c                MiMo-V2.6 Flash and Pro  (make mimo)
 ├── qwen38.c              Qwen3.8-Flash-Next  (make qwen38)
-├── qwen36.c              Qwen3.6, Qwen3-Coder, Qwen3.8-27B, Clef  (make qwen36)
+├── qwen36.c              Qwen3.6, Qwen3-Coder, Qwen3.8-27B, Flint, Muse Spark,
+│                         LFM3-VL, Clef  (make qwen36)
 ├── olmoe.c               OLMoE  (make olmoe)
 ├── qwenimage.c           Qwen-Image-2.1  (make qwenimage)
 ├── laya.c                Laya  (make laya)
@@ -728,9 +842,10 @@ c/
 ├── expert_ffn.h, expert_store.h routed-expert kernel and streaming expert cache
 ├── tok.h, json.h, compat.h      tokenizer, JSON, Windows/macOS shims
 ├── route_trace.h, kv_prefix.h   routing telemetry (.coli_usage), KV prefix reuse
+├── gguf.h, park.h               GGUF reader, a conversation parked between an agent's turns
 ├── decide_serve.h               the decision engines' side of System One
 │
-├── backend_cuda.*        optional CUDA tier   (CUDA=1)
+├── backend_cuda.*, cu_tier.h, cuda_chain.cu   optional CUDA tier and chains (CUDA=1)
 ├── backend_metal.*       optional Metal tier  (METAL=1)
 ├── backend_vulkan.*, vk_tier.c, vk_chain.c   optional Vulkan tier and dense chain (VK=1)
 │
@@ -741,6 +856,7 @@ c/
 ├── resource_plan.py      RAM/VRAM planner behind coli plan and coli doctor
 ├── tools/                conversion, fixtures and benchmarks
 └── tests/                dependency-free C and Python tests
+ui/                       the chat UI (coli ui)
 web/                      the dashboard (a pure API client)
 desktop/                  Tauri desktop shell around the dashboard
 docker/                   container images

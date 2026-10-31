@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "hypothesis": "Promoting up to 128 experts a forward instead of 32, none while the last 64 frames found 90% or more of their routes on the card, raises Qwen3.8-Flash-Next's decode where the history does not fit the conversation, with the same text.",
+  "commit": "7bbea341bb4bf9c812fed9d80501cf5fc1615042",
+  "model": "unsloth/Qwen3.8-Flash-Next-GGUF UD-Q2_K_XL",
+  "command": "cd c && make -j qwen38 CUDA=1 CUDA_ARCH=native && env COLI_CUDA=1 COLI_VULKAN=0 COLI_TEMP=0 COLI_TIMERS=1 N_NEW=128 USAGE_SAVE=0 OMP_NUM_THREADS=10 OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close SNAP=<model> COLI_USAGE=<history.usage> ./qwen38 128 8 <prompt>",
+  "prompt_hash": "8f267bf589d808d1eb0e07b7a3a73d6c92aaf71b32efb64404d50d3553b669a0",
+  "hardware": {
+    "cpu": "AMD EPYC 7443P 24-Core Processor (24 cores / 48 threads, 128 MiB L3; the container's quota 11.52 CPUs, OMP_NUM_THREADS=10) + NVIDIA RTX PRO 4000 Blackwell (24467 MiB, sm_120, PCIe 4 x16: 28.0 GB/s to the card and 558 GB/s on it, measured)",
+    "ram": "251.6 GiB on the host, the container's memory.max 120.7 GiB",
+    "storage": "the instance's disk (160 GB); every routed expert in the chain's host pool (49.80 GiB of page-locked RAM) in every run",
+    "os": "Ubuntu 24.04.1 LTS (container nvidia/cuda:12.8.1-devel-ubuntu24.04) on Linux 6.8.0-110-generic x86_64, Vast.ai machine 59339, driver 580.142"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "unsloth/Qwen3.8-Flash-Next-GGUF UD-Q2_K_XL",
+      "case": "code, the prose's history",
+      "history": "history.usage.gz",
+      "mtp_head": false,
+      "new_tokens": 128,
+      "engine_build": "origin/dev 7bbea341"
+    },
+    "samples": {
+      "tok_s": [
+        31.0,
+        30.84,
+        30.25,
+        29.74
+      ],
+      "prompt_tok_s": [
+        79.1,
+        78.7,
+        79.6,
+        79.6
+      ]
+    },
+    "median_tok_s": 30.545,
+    "quality": {
+      "method": "the generated text (128 tokens, greedy: COLI_TEMP=0) is the same in all 8 runs of both versions (stdout sha256 317c50d3cfbc5c83fd359621c1c9a21a65100f500c509fff84a00ffa147ec91d); make -C c check and tests/test_qwen38_cuda_chain (the brake on frames written by hand) pass on macOS arm64; make -C c cuda-test CUDA=1 CUDA_ARCH=native passes on this machine",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen38-cuda-chain-promote-2026-10-25/code.txt",
+      "sha256": "6d12948588ec84996fdec8ea9aabfd680d33307cc955c712b6d591aa1b98bb40"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "unsloth/Qwen3.8-Flash-Next-GGUF UD-Q2_K_XL",
+      "case": "code, the prose's history",
+      "history": "history.usage.gz",
+      "mtp_head": false,
+      "new_tokens": 128,
+      "engine_build": "7bbea341 + this change"
+    },
+    "samples": {
+      "tok_s": [
+        41.37,
+        42.19,
+        42.78,
+        42.21
+      ],
+      "prompt_tok_s": [
+        79.1,
+        79.1,
+        79.6,
+        79.6
+      ]
+    },
+    "median_tok_s": 42.2,
+    "quality": {
+      "method": "the generated text (128 tokens, greedy: COLI_TEMP=0) is the same in all 8 runs of both versions (stdout sha256 317c50d3cfbc5c83fd359621c1c9a21a65100f500c509fff84a00ffa147ec91d); make -C c check and tests/test_qwen38_cuda_chain (the brake on frames written by hand) pass on macOS arm64; make -C c cuda-test CUDA=1 CUDA_ARCH=native passes on this machine",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen38-cuda-chain-promote-2026-10-25/code.txt",
+      "sha256": "6d12948588ec84996fdec8ea9aabfd680d33307cc955c712b6d591aa1b98bb40"
+    }
+  },
+  "outcome": "improvement"
+}

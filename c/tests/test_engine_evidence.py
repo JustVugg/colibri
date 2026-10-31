@@ -166,20 +166,21 @@ class IdotKernelRosterTest(unittest.TestCase):
     below, or the roster itself down to fewer entries, must fail this
     test -- proof-of-bite for each is in the worker report.
 
-    Source of the 7 entries, cited by file:line: c/quant.h:582-594's
+    Source of the 8 entries, cited by file:line: c/idot.h's
     #if/#elif ladder defines IDOT_KERNEL to each of these string
     literals in turn, and c/colibri.c:11243 prints it unmodified inside
     the exact banner format this fixture reproduces character-for-
     character (cache=%d experts/layer | compute experts@%d-bit
     dense@%d-bit | idot: <IDOT_KERNEL>).
 
-      c/quant.h:582  "avx512-vnni"  (__AVX512VNNI__ && __AVX512BW__)
-      c/quant.h:584  "avx-vnni"     (__AVXVNNI__ && __AVX2__)
-      c/quant.h:586  "avx2"         (__AVX2__)
-      c/quant.h:588  "neon-i8mm"    (__ARM_NEON && __ARM_FEATURE_MATMUL_INT8)
-      c/quant.h:590  "neon"         (__ARM_NEON, no i8mm)               -- RAN
-      c/quant.h:592  "vsx"          (__VSX__)
-      c/quant.h:594  "scalar"       (else)
+      c/idot.h:56    "avx512-vnni"  (__AVX512VNNI__ && __AVX512BW__)
+      c/idot.h:58    "avx-vnni"     (__AVXVNNI__ && __AVX2__)
+      c/idot.h:60    "avx2"         (__AVX2__)
+      c/idot.h:62    "ssse3"        (__SSSE3__)
+      c/idot.h:64    "neon-i8mm"    (__ARM_NEON && __ARM_FEATURE_MATMUL_INT8)
+      c/idot.h:66    "neon"         (__ARM_NEON, no i8mm)               -- RAN
+      c/idot.h:68    "vsx"          (__VSX__)
+      c/idot.h:70    "scalar"       (else)
 
     "neon" is marked RAN: this development host is arm64 Darwin, and
     `echo | cc -dM -E -` (no -mcpu, matching this project's own Makefile
@@ -191,8 +192,8 @@ class IdotKernelRosterTest(unittest.TestCase):
     compiler-preprocessor probe of the flags the default build actually
     uses, not a captured engine stdout banner: no engine binary was
     built or run for this (no model runs, per the dispatch's hard
-    bound). The other six entries are taken from the C source only
-    (INFERRED from c/quant.h's literals, not independently reproduced on
+    bound). The other seven entries are taken from the C source only
+    (INFERRED from c/idot.h's literals, not independently reproduced on
     real hardware for each ISA).
 
     VACUOUS-GATE NOTE: test_every_roster_entry_parses_from_real_banner_text
@@ -203,7 +204,7 @@ class IdotKernelRosterTest(unittest.TestCase):
     matches: the assertion compares the mutation against itself and can
     pass having checked nothing about the entry's real spelling. Only
     test_roster_matches_frozen_expectation below, which compares against
-    an independent literal transcribed from c/quant.h rather than against
+    an independent literal transcribed from c/idot.h rather than against
     IDOT_KERNELS itself, actually defends the CONTENT of each entry; the
     per-entry parse loop is kept because it still defends something real
     (that parse_engine_banner's kernel-dispatch group and IDOT_KERNELS
@@ -218,7 +219,7 @@ class IdotKernelRosterTest(unittest.TestCase):
                 self.assertEqual(fields["kernel"], kernel)
 
     def test_roster_matches_frozen_expectation(self):
-        # Frozen from c/quant.h:582-594's #if/#elif ladder. If the
+        # Frozen from c/idot.h's #if/#elif ladder. If the
         # engine's ladder changes, this literal and the roster both
         # change, deliberately and together. Unlike the per-entry parse
         # loop above, this does NOT derive its expectation from
@@ -226,7 +227,7 @@ class IdotKernelRosterTest(unittest.TestCase):
         # IDOT_KERNELS) -- it is the independent source transcription
         # that makes a same-length rename of any entry (which the parse
         # loop and the count/uniqueness check below both miss) fail.
-        EXPECTED_IDOT_KERNELS = ("avx512-vnni", "avx-vnni", "avx2",
+        EXPECTED_IDOT_KERNELS = ("avx512-vnni", "avx-vnni", "avx2", "ssse3",
                                  "neon-i8mm", "neon", "vsx", "scalar")
         self.assertEqual(IDOT_KERNELS, EXPECTED_IDOT_KERNELS)
 
@@ -236,8 +237,8 @@ class IdotKernelRosterTest(unittest.TestCase):
         # literal test for a length change, but kept because it is a
         # different, cheaper check that would survive even if the
         # literal above ever needed updating for a real ladder change.
-        self.assertEqual(len(IDOT_KERNELS), 7)
-        self.assertEqual(len(set(IDOT_KERNELS)), 7)
+        self.assertEqual(len(IDOT_KERNELS), 8)
+        self.assertEqual(len(set(IDOT_KERNELS)), 8)
 
 
 class ParseEngineLoadedTest(unittest.TestCase):

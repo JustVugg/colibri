@@ -32,7 +32,15 @@ def check():
     info = HfApi().repo_info(REPO, revision=REVISION, files_metadata=True)
     tot = sum((s.size or 0) for s in info.siblings)
     sts = [s for s in info.siblings if s.rfilename.endswith(".safetensors")]
-    free = shutil.disk_usage(os.path.dirname(DEST) or "/").free
+    # A check must not create the destination. Probe its filesystem, or the
+    # nearest existing ancestor when download() will create nested directories.
+    disk_path = os.path.abspath(DEST)
+    while not os.path.exists(disk_path):
+        parent = os.path.dirname(disk_path)
+        if parent == disk_path:
+            break
+        disk_path = parent
+    free = shutil.disk_usage(disk_path).free
     print(f"repo: {REPO}")
     print(f"  total files: {len(info.siblings)} ({len(sts)} safetensors shards)")
     print(f"  total size: {human(tot)}")

@@ -29,8 +29,7 @@ Design notes (must stay in sync with c/qwen36.c):
   * The fused expert tensors `mlp.experts.gate_up_proj` / `down_proj` are split per expert
     into the merged_weight layout (gate_up = [gate; up] along dim 0).
   * Every tensor name is classified against tools/qwen36_tensor_kinds.py before the first
-    shard is read. The `mtp.*` head and the `visual.*` tower are skipped ON PURPOSE and
-    reported with a count; a name the contract does not know stops the conversion. A
+    shard is read. The `mtp.*` head and the `visual.*` tower are carried into their own shards; a name the contract does not know stops the conversion. A
     converter that silently drops what it does not recognise produces a container that
     loads and is quietly missing a tensor (GLM-5.3 precedent, #1045).
   * Head dims are derived from the actual weight shapes (authoritative), not from config
@@ -48,7 +47,7 @@ Usage (mixed: int4 gs64 gate/up, int8 down -- the #1370 experiment):
   python tools/convert_qwen36.py --model <hf> --out ./qwen36_i4_gs64_d8 --ebits 4 --gs 64 --down-bits 8
 """
 
-import argparse, json, math, os, struct, sys, tempfile
+import argparse, json, math, os, re, struct, sys, tempfile
 from pathlib import Path
 
 # Windows: force UTF-8 output
@@ -66,6 +65,38 @@ try:
     from safetensors.torch import save_file, load_file
 except ImportError as exc:
     sys.exit(f"Missing dependencies: {exc}. Install: pip install torch safetensors")
+
+
+class _MMapShard:
+    """One .safetensors file read through a numpy memmap: only the bytes of the
+    tensor asked for are paged in, and each tensor comes back as an owned torch copy."""
+    _DT = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32, "F64": torch.float64,
+           "I64": torch.int64, "I32": torch.int32, "I16": torch.int16, "I8": torch.int8, "U8": torch.uint8,
+           "BOOL": torch.bool, "F8_E4M3": torch.float8_e4m3fn, "F8_E5M2": torch.float8_e5m2}
+
+    def __init__(self, path):
+        import numpy as np
+        with open(path, "rb") as f:
+            hlen = struct.unpack("<Q", f.read(8))[0]
+            self.header = json.loads(f.read(hlen))
+        self.header.pop("__metadata__", None)
+        self.base = 8 + hlen
+        self.mm = np.memmap(path, dtype=np.uint8, mode="r")
+
+    def keys(self):
+        return list(self.header)
+
+    def get_tensor(self, name):
+        e = self.header[name]
+        a, b = e["data_offsets"]
+        raw = self.mm[self.base + a:self.base + b]
+        t = torch.frombuffer(bytearray(raw), dtype=self._DT[e["dtype"]])
+        return t.reshape(e["shape"])
+
+    def __exit__(self, *exc):
+        mm, self.mm = self.mm, None
+        if mm is not None and getattr(mm, "_mmap", None) is not None:
+            mm._mmap.close()
 
 
 def quantize_row(w: torch.Tensor, bits: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -235,12 +266,133 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from qwen36_tensor_kinds import classify, resolve_prefix, skip_reason, UnknownTensor  # noqa: E402
 
 
+# LFM3's names that have a name the engine already reads (the rest keep theirs: post_operator_norm,
+# conv.*, self_attn.gate_proj)
+LFM3_RENAMES = {
+    "operator_norm.weight": "input_layernorm.weight",
+    "ffn_norm.weight": "post_attention_layernorm.weight",
+    "post_ffn_norm.weight": "post_feedforward_layernorm.weight",
+    "feed_forward.w1.weight": "mlp.gate_proj.weight",
+    "feed_forward.w3.weight": "mlp.up_proj.weight",
+    "feed_forward.w2.weight": "mlp.down_proj.weight",
+}
+
+
+def convert_block(lk, get_tensor, source, target, args):
+    """One decoder block, trunk or MTP, using exactly the same container formats."""
+    tens = {}
+    # ---- MoE experts: handle BOTH layouts the source may use ----
+    #  (a) FUSED:  model.layers.i.mlp.experts.gate_up_proj [E,2*inter,H]
+    #              + model.layers.i.mlp.experts.down_proj    [E,H,inter]
+    #  (b) SEPARATE (transformers save_pretrained on the text model, e.g. the tiny fixture;
+    #      the real 35B and 2.4T checkpoints both ship the FUSED layout):
+    #              model.layers.i.mlp.experts.{e}.gate_proj [inter,H]
+    #              model.layers.i.mlp.experts.{e}.up_proj   [inter,H]
+    #              model.layers.i.mlp.experts.{e}.down_proj [H,inter]
+    sep = {}  # e -> {'gate':Tensor,'up':Tensor,'down':Tensor}
+    for k in lk:
+        if re.search(r"\.experts\.gate_up_proj(?:\.weight)?$", k):
+            gu = get_tensor(k)                    # [E, 2*inter, H]
+            E, twoI, H = gu.shape
+            inter = twoI // 2
+            gate = gu[:, :inter, :]
+            up = gu[:, inter:, :]
+            dk = k.replace("gate_up_proj", "down_proj")
+            down = get_tensor(dk)                # [E, H, inter]
+            for e in range(E):
+                mw, qs = make_merged(gate[e], up[e], down[e], args.ebits, gs=args.gs, down_bits=args.down_bits, down_gs=args.down_gs)
+                tens[f"{target}.mlp.experts.{e}.merged_weight"] = mw
+                tens[f"{target}.mlp.experts.{e}.qs"] = qs
+            continue
+        ms = re.search(r"\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)(?:\.weight)?$", k)
+        if ms:
+            e = int(ms.group(1)); proj = ms.group(2)
+            sep.setdefault(e, {})[proj] = get_tensor(k).float()
+            continue
+    for e in sorted(sep):
+        d = sep[e]
+        if "gate_proj" in d and "up_proj" in d and "down_proj" in d:
+            mw, qs = make_merged(d["gate_proj"], d["up_proj"], d["down_proj"], args.ebits, gs=args.gs, down_bits=args.down_bits, down_gs=args.down_gs)
+            tens[f"{target}.mlp.experts.{e}.merged_weight"] = mw
+            tens[f"{target}.mlp.experts.{e}.qs"] = qs
+        else:
+            print(f"[{source}] WARN expert {e} missing some proj "
+                  f"(have {sorted(d.keys())}) — skipped")
+    for k in lk:
+        newk = k.replace(source + ".", f"{target}.")
+        if "mlp.experts." in newk:
+            continue  # already handled above
+        # LFM3: its pre-branch norms and MLP under the names the engine reads for every model
+        kind = newk[len(target) + 1:]
+        newk = f"{target}.{LFM3_RENAMES.get(kind, kind)}"
+        # everything else stays f16
+        tens[newk] = get_tensor(k).half()
+    return tens
+
+
+def convert_mtp(keys, get_tensor, args):
+    layers = [k for k in keys if k.startswith("mtp.layers.0.")]
+    if any(k.startswith("mtp.layers.") and k not in layers for k in keys):
+        raise ValueError("only one MTP decoder layer is supported")
+    tensors = convert_block(layers, get_tensor, "mtp.layers.0", "mtp.layers.0", args)
+    for k in keys:
+        if not k.startswith("mtp.layers."):
+            tensors[k] = get_tensor(k).half()
+    return tensors
+
+
+def append_mtp(args):
+    """Read only the head's shards; build a new container with immutable base links."""
+    if not args.model or args.repo or args.upload_repo or args.stream_upload:
+        raise ValueError("--mtp-only requires local --model and --base-container")
+    src, base, out = Path(args.model).resolve(), Path(args.base_container).resolve(), Path(args.out).resolve()
+    if out == base or out == src or (out.exists() and any(out.iterdir())):
+        raise ValueError("--mtp-only --out must be a new or empty directory, distinct from source/base")
+    meta = json.loads((base / "qwen36_meta.json").read_text())
+    cfg = json.loads((src / "config.json").read_text())
+    cfg = cfg.get("text_config", cfg)
+    for key, field in (("hidden_size", "hidden"), ("num_hidden_layers", "n_layers"),
+                       ("num_experts", "num_experts"), ("moe_intermediate_size", "moe_inter"),
+                       ("num_attention_heads", "q_heads"), ("num_key_value_heads", "kv_heads")):
+        if cfg.get(key) != meta.get(field):
+            raise ValueError(f"source/base geometry differs: {key}")
+    args.ebits, args.gs = meta["ebits"], meta.get("expert_gs", 0)
+    args.down_bits, args.down_gs = meta.get("expert_down_bits", 0), meta.get("expert_down_gs", 0)
+    index = src / "model.safetensors.index.json"
+    wm = json.loads(index.read_text())["weight_map"] if index.exists() else {}
+    if not wm:
+        for shard in src.glob("*.safetensors"):
+            with safe_open_pt(str(shard), framework="pt") as f:
+                wm.update({k: shard.name for k in f.keys()})
+    keys = [k for k in wm if k.startswith("mtp.")]
+    if not keys:
+        raise ValueError("source has no mtp.* tensors")
+    for k in keys:
+        classify(k, "model.")
+    from contextlib import ExitStack
+    with ExitStack() as stack:
+        handles = {name: stack.enter_context(safe_open_pt(str(src / name), framework="pt"))
+                   for name in {wm[k] for k in keys}}
+        tensors = convert_mtp(keys, lambda k: handles[wm[k]].get_tensor(k), args)
+    out.mkdir(parents=True, exist_ok=True)
+    # Publish weights before the links; never open a base file for writing.
+    save_file(tensors, str(out / "model-mtp.safetensors"))
+    meta["mtp_num_hidden_layers"] = 1
+    (out / "qwen36_meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+    for path in base.iterdir():
+        if path.is_file() and path.name not in ("qwen36_meta.json", "model-mtp.safetensors"):
+            (out / path.name).symlink_to(path.resolve())
+    print(f"[mtp] {len(keys)} source tensors -> {out / 'model-mtp.safetensors'}; base files linked")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Convert Qwen3.6 MoE HF checkpoint -> colibri container")
     src = ap.add_mutually_exclusive_group(required=False)
     src.add_argument("--repo", help="HuggingFace repo ID (will be downloaded)")
     src.add_argument("--model", help="Local HF checkpoint directory")
     ap.add_argument("--out", required=False, help="Output container directory")
+    ap.add_argument("--mtp-only", action="store_true", help="append only MTP into a new linked container")
+    ap.add_argument("--base-container", help="existing converted container (never modified)")
     ap.add_argument("--ebits", type=int, default=4, help="Expert quant bits (2..8, default 4)")
     ap.add_argument("--down-bits", type=int, default=0,
                     help="bits for down_proj only (5..8; needs --ebits <= 4): the mixed layout, "
@@ -271,6 +423,15 @@ def main():
         sys.exit("error: need --repo or --model (or --selftest)")
     if not args.out:
         sys.exit("error: --out is required")
+    if args.model and not args.repo and os.path.realpath(args.model) == os.path.realpath(args.out):
+        ap.error("--model and --out must differ (in-place conversion would overwrite the source checkpoint)")
+
+    if args.mtp_only:
+        if not args.base_container:
+            ap.error("--mtp-only requires --base-container")
+        return append_mtp(args)
+    if args.base_container:
+        ap.error("--base-container requires --mtp-only")
 
     if not 2 <= args.ebits <= 8:
         sys.exit(f"--ebits must be 2..8 (got {args.ebits})")
@@ -310,6 +471,11 @@ def main():
     # checkpoints (written by 4.x) say num_experts. Read either.
     if "num_experts" not in mcfg and "num_local_experts" in mcfg:
         mcfg = dict(mcfg, num_experts=mcfg["num_local_experts"])
+    # LFM3 (LiquidAI/LFM3-VL): short conv layers beside the attention ones, every branch
+    # normalised before its residual; its config says norm_eps where the engine reads rms_norm_eps
+    lfm3 = mcfg.get("model_type") == "lfm3"
+    if lfm3 and "rms_norm_eps" not in mcfg:
+        mcfg = dict(mcfg, rms_norm_eps=mcfg.get("norm_eps", 1e-5))
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     import shutil
@@ -391,6 +557,8 @@ def main():
     layer_map = {}      # layer index -> [keys]
     global_map = {}     # kind -> key
     vision_map = {}     # name after "visual." -> key
+    lfm3_vision_keys = []   # LFM3-VL's tower and projector, copied under their own names
+    mtp_keys = []
     skipped = {}        # group -> count
     unknown = []
     for k in wm:
@@ -403,8 +571,12 @@ def main():
             layer_map.setdefault(placed[1], []).append(k)
         elif placed[0] == "global":
             global_map[placed[1]] = k
+        elif placed[0] == "mtp":
+            mtp_keys.append(k)
         elif placed[0] == "vision":
             vision_map[placed[1]] = k
+        elif placed[0] == "lfm3_vision":
+            lfm3_vision_keys.append(k)
         else:
             skipped[placed[1]] = skipped.get(placed[1], 0) + 1
     if unknown:
@@ -419,7 +591,7 @@ def main():
         if group == "mtp":
             declared = f", config mtp_num_hidden_layers={mcfg.get('mtp_num_hidden_layers')!r}"
         print(f"skipping {count} `{group}.*` tensor(s): {skip_reason(group)}{declared}")
-    if mcfg.get("mtp_num_hidden_layers") and "mtp" not in skipped:
+    if mcfg.get("mtp_num_hidden_layers") and not mtp_keys:
         print(f"note: config declares mtp_num_hidden_layers={mcfg['mtp_num_hidden_layers']} "
               "but the checkpoint carries no mtp.* tensors")
     layer_ids = set(layer_map)
@@ -429,8 +601,13 @@ def main():
 
     # Qwen3 MoE (qwen3_moe, e.g. Qwen3-Coder-30B-A3B): every layer is plain attention,
     # full rotary, ordinary RMSNorm weights and no shared expert. Qwen3.5/3.6 differ on
-    # each of those, so the defaults below branch on it.
-    plain_qwen3 = cfg_full.get("model_type") == "qwen3_moe"
+    # each of those, so the defaults below branch on it. The dense Qwen3 (qwen3) is the
+    # same layer with one MLP, loaded like the dense Qwen3.5's.
+    plain_qwen3 = cfg_full.get("model_type") in ("qwen3_moe", "qwen3")
+    # Flint (RecursiveSI/flint): the Qwen3 MoE layer with a sink per attention head,
+    # sliding-window layers, layers without RoPE, dense layers in front (mlp_only_layers)
+    # and sigmoid routing beside an ungated shared expert (tools/make_flint_tiny.py).
+    flint = cfg_full.get("model_type") == "flint"
     layer_types = mcfg.get("layer_types")
     if layer_types is None:
         n = mcfg.get("num_hidden_layers", n_layers_weight)
@@ -459,10 +636,17 @@ def main():
     if missing_layers:
         sys.exit(f"ERROR: config declares {len(all_idx)} layers but the checkpoint has no "
                  f"tensors for layer(s) {missing_layers[:8]}")
+    if "embedding_norm.weight" in global_map and "norm.weight" not in global_map:   # LFM3's final norm
+        global_map["norm.weight"] = global_map.pop("embedding_norm.weight")
     globals_keys = [global_map[kind] for kind in ("embed_tokens.weight", "lm_head.weight",
                                                   "norm.weight") if kind in global_map]
-    if len(globals_keys) != 3:
+    # tied embeddings (the small dense Qwen3.5 checkpoints): no lm_head, the head is embed_tokens
+    tied = bool(cfg_full.get("tie_word_embeddings", mcfg.get("tie_word_embeddings", False))) and \
+        "lm_head.weight" not in global_map
+    if len(globals_keys) != 3 - tied:
         sys.exit(f"ERROR: expected embed_tokens, lm_head and final norm, found {sorted(global_map)}")
+    for k in mtp_keys:
+        shard_layers.setdefault(wm[k], set()).add(-2)
     for k in globals_keys:
         shard_layers.setdefault(wm[k], set()).add(-1)
 
@@ -481,9 +665,9 @@ def main():
         shard = wm[name]
         ensure_shard(shard)
         if shard not in shard_handles:
-            # torch backend returns a native torch tensor (bf16 works natively);
-            # numpy backend returns a bf16 numpy array that torch.from_numpy rejects.
-            shard_handles[shard] = safe_open_pt(local_shards[shard], framework="pt")
+            # A numpy memmap instead of safe_open(framework="pt"), whose torch storage hit an access violation
+            # on Windows for a 49.7 GB shard with 34 GB RAM (torch 2.7 and 2.14, safetensors 0.6 and 0.8).
+            shard_handles[shard] = _MMapShard(local_shards[shard])
         return shard_handles[shard].get_tensor(name).contiguous()
 
     def evict_layer(i):
@@ -540,7 +724,11 @@ def main():
         for k in globals_keys:
             arr = get_tensor(k).half()
             newk = k.replace("model.language_model.", "model.")
+            if newk == "model.embedding_norm.weight":   # LFM3's final norm
+                newk = "model.norm.weight"
             g_out[newk] = arr
+        if tied:   # written out: the engine reads lm_head.weight
+            g_out["lm_head.weight"] = g_out["model.embed_tokens.weight"].clone()
         gpath = out / "model-globals.safetensors"
         save_file(g_out, str(gpath))
         print(f"[globals] {gpath.name} ({len(g_out)} tensors)")
@@ -548,6 +736,19 @@ def main():
             upload_local(gpath)
             gpath.unlink()
 
+    # ---- LFM3-VL's tower and projector, in their own dtype (bf16: f16 would flush its smallest
+    # weights), under their own names; the engine runs them through lfm3_vision.h ----
+    if lfm3_vision_keys:
+        if "model-vision.safetensors" in done_files:
+            print("[vision] already on HF, skip")
+        else:
+            v_out = {k: get_tensor(k).contiguous() for k in lfm3_vision_keys}
+            vpath = out / "model-vision.safetensors"
+            save_file(v_out, str(vpath))
+            print(f"[vision] {vpath.name} ({len(v_out)} tensors, LFM3-VL)")
+            if args.stream_upload:
+                upload_local(vpath)
+                vpath.unlink()
     # ---- vision tower as f16, under model.visual.* (#1757) ----
     # The same ViT in Qwen3.5/3.6/3.8; the engine runs it through qwen38_vision.h.
     vcfg = cfg_full.get("vision_config") or {}
@@ -577,51 +778,7 @@ def main():
             print(f"[layer {i} -> active {a}] {out_name} already on HF, skip")
             evict_layer(i)
             continue
-        tens = {}
-        lk = layer_keys(i)
-        # ---- MoE experts: handle BOTH layouts the source may use ----
-        #  (a) FUSED:  model.layers.i.mlp.experts.gate_up_proj [E,2*inter,H]
-        #              + model.layers.i.mlp.experts.down_proj    [E,H,inter]
-        #  (b) SEPARATE (transformers save_pretrained on the text model, e.g. the tiny fixture;
-        #      the real 35B and 2.4T checkpoints both ship the FUSED layout):
-        #              model.layers.i.mlp.experts.{e}.gate_proj [inter,H]
-        #              model.layers.i.mlp.experts.{e}.up_proj   [inter,H]
-        #              model.layers.i.mlp.experts.{e}.down_proj [H,inter]
-        sep = {}  # e -> {'gate':Tensor,'up':Tensor,'down':Tensor}
-        for k in lk:
-            if re.search(r"\.experts\.gate_up_proj(?:\.weight)?$", k):
-                gu = get_tensor(k).float()            # [E, 2*inter, H]
-                E, twoI, H = gu.shape
-                inter = twoI // 2
-                gate = gu[:, :inter, :]
-                up = gu[:, inter:, :]
-                dk = k.replace("gate_up_proj", "down_proj")
-                down = get_tensor(dk).float()        # [E, H, inter]
-                for e in range(E):
-                    mw, qs = make_merged(gate[e], up[e], down[e], args.ebits, gs=args.gs, down_bits=args.down_bits, down_gs=args.down_gs)
-                    tens[f"model.layers.{a}.mlp.experts.{e}.merged_weight"] = mw
-                    tens[f"model.layers.{a}.mlp.experts.{e}.qs"] = qs
-                continue
-            ms = re.search(r"\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)(?:\.weight)?$", k)
-            if ms:
-                e = int(ms.group(1)); proj = ms.group(2)
-                sep.setdefault(e, {})[proj] = get_tensor(k).float()
-                continue
-        for e in sorted(sep):
-            d = sep[e]
-            if "gate_proj" in d and "up_proj" in d and "down_proj" in d:
-                mw, qs = make_merged(d["gate_proj"], d["up_proj"], d["down_proj"], args.ebits, gs=args.gs, down_bits=args.down_bits, down_gs=args.down_gs)
-                tens[f"model.layers.{a}.mlp.experts.{e}.merged_weight"] = mw
-                tens[f"model.layers.{a}.mlp.experts.{e}.qs"] = qs
-            else:
-                print(f"[layer {i}] WARN expert {e} missing some proj "
-                      f"(have {sorted(d.keys())}) — skipped")
-        for k in lk:
-            newk = k.replace(f"{prefix}layers.{i}.", f"model.layers.{a}.")
-            if "mlp.experts." in newk:
-                continue  # already handled above
-            # everything else stays f16
-            tens[newk] = get_tensor(k).half()
+        tens = convert_block(layer_keys(i), get_tensor, f"{prefix}layers.{i}", f"model.layers.{a}", args)
         out_path = out / f"model-{a:05d}.safetensors"
         save_file(tens, str(out_path))
         print(f"[layer {i} -> active {a}] {out_path.name} ({len(tens)} tensors)")
@@ -630,8 +787,19 @@ def main():
             out_path.unlink()
         evict_layer(i)
 
+    if mtp_keys and "model-mtp.safetensors" not in done_files:
+        tensors = convert_mtp(mtp_keys, get_tensor, args)
+        path = out / "model-mtp.safetensors"
+        save_file(tensors, str(path))
+        print(f"[mtp] {path.name} ({len(tensors)} tensors)")
+        if args.stream_upload:
+            upload_local(path)
+            path.unlink()
+        evict_layer(-2)
+
     # ---- derive authoritative head dims from a real full-attention layer's weights ----
     meta = {
+        "mtp_num_hidden_layers": 1 if mtp_keys else 0,
         "model_type": cfg_full.get("model_type"),
         "hidden": int(mcfg["hidden_size"]),
         "n_layers": int(mcfg["num_hidden_layers"]),
@@ -643,12 +811,12 @@ def main():
         "topk": int(mcfg.get("num_experts_per_tok", 0)) if mcfg.get("num_experts") else 0,
         "moe_inter": (int(mcfg.get("moe_intermediate_size", mcfg.get("intermediate_size", 0) // 2))
                       if mcfg.get("num_experts") else 0),
-        "shared_inter": (0 if plain_qwen3 else
+        "shared_inter": (0 if plain_qwen3 and mcfg.get("num_experts") else
                          int(mcfg.get("shared_expert_intermediate_size", mcfg.get("moe_intermediate_size", 0)))
                          if mcfg.get("num_experts") else int(mcfg["intermediate_size"])),
         "rms_eps": float(mcfg.get("rms_norm_eps", 1e-6)),
         "ebits": args.ebits,
-        "scoring_func": mcfg.get("scoring_func", "softmax"),
+        "scoring_func": mcfg.get("router_score_function" if flint else "scoring_func", "softmax"),
         "n_group": int(mcfg.get("n_group", 1)),
         "topk_group": int(mcfg.get("topk_group", 1)),
         "norm_topk_prob": bool(mcfg.get("norm_topk_prob", False)),
@@ -656,10 +824,31 @@ def main():
         "rope_theta": float((mcfg.get("rope_parameters") or {}).get(
             "rope_theta", mcfg.get("rope_theta", 10000000.0))),
         "mrope_section": (mcfg.get("rope_parameters") or {}).get("mrope_section", [16, 16, 16]),
-        "partial_rotary_factor": float(mcfg.get("partial_rotary_factor", 1.0 if plain_qwen3 else 0.25)),
+        "partial_rotary_factor": float(mcfg.get("partial_rotary_factor", 1.0 if plain_qwen3 or flint else 0.25)),
     }
-    if plain_qwen3:
+    if plain_qwen3 or flint:
         meta["zero_centered_norms"] = False
+    if lfm3:
+        # full layers rotate the first rot_full frequencies of the head at rope_theta (HF's
+        # zero-tailed partial_rotary_factor), sliding ones all of them at rope_theta_swa
+        rp = mcfg.get("rope_parameters") or {}
+        full_rp, swa_rp = rp.get("full_attention") or {}, rp.get("sliding_attention") or {}
+        hd = int(mcfg.get("head_dim") or int(mcfg["hidden_size"]) // int(mcfg["num_attention_heads"]))
+        meta.update({"lfm3": True, "zero_centered_norms": False, "attn_output_gate": False,
+                     "partial_rotary_factor": 1.0,
+                     "rope_theta": float(full_rp.get("rope_theta", 1000000.0)),
+                     "rope_theta_swa": float(swa_rp.get("rope_theta", 10000.0)),
+                     "rot_full": int(float(full_rp.get("partial_rotary_factor", 1.0)) * hd) // 2,
+                     "sliding_window": int(mcfg.get("sliding_window") or 0)})
+    if flint:
+        # the layers config.layer_types calls sliding_attention see sliding_window rows,
+        # their own included; the layers listed in no_rope_layer_indices take no RoPE;
+        # mlp_only_layers carry one SwiGLU MLP of intermediate_size and no router
+        meta["sliding_window"] = int(mcfg.get("sliding_window") or 0)
+        meta["no_rope_layers"] = sorted(int(i) for i in mcfg.get("no_rope_layer_indices", []))
+        meta["mlp_only_layers"] = sorted(int(i) for i in mcfg.get("mlp_only_layers", []))
+        meta["dense_inter"] = int(mcfg.get("intermediate_size", 0))
+        meta["attn_sinks"] = True
     # derive head dims from first full-attention layer weights (authoritative).
     # Read from SOURCE (not local output) so this works even when layer 0 was
     # skipped during a resume and its local shard was already stream-deleted.
@@ -696,7 +885,7 @@ def main():
             meta["expert_down_gs"] = args.down_gs
         meta["head_dim"] = meta.get("k_head_dim", meta.get("q_head_dim", 256))
         meta["rope_dim"] = meta.get("qk_rope_head_dim", meta["head_dim"] // 4)
-        if plain_qwen3:
+        if plain_qwen3 or flint:
             # One position per token, so M-RoPE over sections that cover the whole
             # rotary half is ordinary 1D RoPE; the engine needs the sections to add up.
             half = int(meta["rope_dim"] * meta["partial_rotary_factor"]) // 2
@@ -709,6 +898,9 @@ def main():
     meta["dn_vdim"] = int(mcfg.get("linear_value_head_dim", mcfg.get("value_head_dim", 0)))
     meta["dn_convk"] = int(mcfg.get("linear_conv_kernel_dim", mcfg.get("conv_kernel_size", 0)))
     meta["dn_conv_dim"] = meta["dn_kheads"] * meta["dn_kdim"] * 2 + meta["dn_vheads"] * meta["dn_vdim"]
+    if lfm3:   # the conv's window: the hidden channels over conv_L_cache taps, no recurrence
+        meta["dn_convk"] = int(mcfg["conv_L_cache"])
+        meta["dn_conv_dim"] = int(mcfg["hidden_size"])
     # close remaining source handles now that we've finished reading for meta
     for h in shard_handles.values():
         try:
@@ -725,17 +917,34 @@ def main():
             "out_hidden": int(vcfg["out_hidden_size"]),
             "num_pos": int(vcfg["num_position_embeddings"]),
         }
+    if lfm3_vision_keys and vcfg:   # LFM3-VL: its tower's shape, the layers that attend
+        lt = list(vcfg.get("layer_types") or [])
+        meta["image_token_id"] = int(cfg_full["image_token_id"])
+        meta["vision"] = {
+            "kind": "lfm3", "depth": int(vcfg["num_hidden_layers"]), "hidden": int(vcfg["hidden_size"]),
+            "heads": int(vcfg["num_attention_heads"]), "kv_heads": int(vcfg["num_key_value_heads"]),
+            "inter": int(vcfg["intermediate_size"]), "patch": int(vcfg["patch_size"]),
+            "merge": int(vcfg["spatial_merge_size"]), "temporal": int(vcfg["temporal_patch_size"]),
+            "in_ch": int(vcfg.get("in_channels", 3)), "out_hidden": int(mcfg["hidden_size"]),
+            "proj_hidden": int(cfg_full["projector_hidden_size"]), "eps": float(vcfg["norm_eps"]),
+            "theta": float((vcfg.get("rope_parameters") or {}).get("rope_theta", 1e6)),
+            "attn_layers": [1 if t == "full_attention" else 0 for t in lt],
+        }
     (out / "qwen36_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(f"[meta] {out / 'qwen36_meta.json'}")
 
     # ---- README ----
     if not args.no_readme and plain_qwen3:
-        lines = ["---", "tags:", "  - colibri", "  - qwen3_moe", "  - moe",
-                 "library_name: colibri", "---", "",
-                 "colibri container for a Qwen3 MoE checkpoint (qwen3_moe, e.g. Qwen3-Coder-30B-A3B):",
+        moe = bool(mcfg.get("num_experts"))
+        what = (["colibri container for a Qwen3 MoE checkpoint (qwen3_moe, e.g. Qwen3-Coder-30B-A3B):",
                  f"{len(all_idx)} attention layers, no DeltaNet and no shared expert, routed experts",
-                 f"at {args.ebits} bits" + (f" with a scale per {args.gs} inputs." if args.gs else " with a scale per row."),
-                 "", "Engine: https://github.com/JustVugg/colibri (c/qwen36.c, docs/qwen36.md)"]
+                 f"at {args.ebits} bits" + (f" with a scale per {args.gs} inputs." if args.gs else " with a scale per row.")]
+                if moe else
+                ["colibri container for a dense Qwen3 checkpoint (qwen3, e.g. Qwen3-8B):",
+                 f"{len(all_idx)} attention layers, one MLP each, no DeltaNet."])
+        lines = ["---", "tags:", "  - colibri", "  - " + cfg_full.get("model_type")] + (["  - moe"] if moe else []) + \
+                ["library_name: colibri", "---", ""] + what + \
+                ["", "Engine: https://github.com/JustVugg/colibri (c/qwen36.c, docs/qwen36.md)"]
         (out / "README.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     elif not args.no_readme:
         lines = ["---", "tags:", "  - colibri", "  - qwen3.6", "  - qwen3.6-35b-a3b", "  - moe",

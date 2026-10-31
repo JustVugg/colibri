@@ -19,6 +19,7 @@ Tools, all thin wrappers over setup_flow.py (the same code `coli setup` runs):
 Run it with `coli mcp`, or `python3 c/mcp_server.py`. docs/MCP_SERVER.md has
 the client configuration.
 """
+import glob
 import json
 import os
 import subprocess
@@ -163,8 +164,36 @@ def tool_recommend_models(args, notify):
             "target_dir": target, "models": models}
 
 
-def _install_running():
+_INSTALL_PROCESS = None
+_CURRENT_INSTALL = object()
+
+
+def _current_install_state(process=_CURRENT_INSTALL, *, allow_external=False):
     state = setup_flow.read_state() or {}
+    current = process is _CURRENT_INSTALL
+    process = _INSTALL_PROCESS if current else process
+    if process is not None and state.get("pid") != process.pid:
+        # Only this child's state belongs to the admitted job, including when
+        # it exits before its first write or another caller starts a new job.
+        code = process.poll()
+        if code is None:
+            return {"phase": "starting", "pid": process.pid}
+        if (current or allow_external) and state != process._coli_previous_state:
+            # A later external CLI job may replace the durable state.
+            return state
+        return {"phase": "error", "pid": process.pid, "exit_code": code,
+                "error": "install process exited without its state available"}
+    return state
+
+
+def _install_running():
+    process = _INSTALL_PROCESS
+    state = _current_install_state(process, allow_external=True)
+    if process is not None:
+        if process.poll() is None:
+            return state
+        if state.get("pid") == process.pid:
+            return None
     if state.get("phase") in ("ready", "error", "interrupted", "done", "started", None):
         return None
     return state if setup_flow._pid_alive(state.get("pid")) else None
@@ -178,6 +207,7 @@ _INSTALL_LOCK = threading.Lock()
 
 
 def _launch_install(args):
+    global _INSTALL_PROCESS
     running = _install_running()
     if running:
         raise ToolError(f"an install is already running (pid {running.get('pid')}, phase "
@@ -210,17 +240,19 @@ def _launch_install(args):
         kwargs["creationflags"] = 0x00000200 | 0x08000000   # new group, hidden console
     else:
         kwargs["start_new_session"] = True   # survives the assistant closing this server
+    previous_state = setup_flow.read_state() or {}
     process = setup_flow.spawn_detached(cmd, **kwargs)
+    process._coli_previous_state = previous_state
     handle.close()
-    # The job's own pid: the child rewrites this file as it goes, with the same pid.
-    setup_flow._write_json(setup_flow.state_path(),
-                           {"phase": "starting", "pid": process.pid, "updated": time.time()})
+    # Keep admission tied to the real child while it publishes its first
+    # state. A parent write here could overwrite a fast child's completion.
+    _INSTALL_PROCESS = process
     return process, log, cmd
 
 
 def tool_install(args, notify):
-    # tools/call runs in independent threads: admission and publishing the
-    # spawned job's state must be one operation, or two calls can both see no
+    # tools/call runs in independent threads: admission and recording the
+    # spawned job's owner must be one operation, or two calls can both see no
     # running install. Waiting/progress is outside the lock so status remains
     # responsive and a second install receives the existing-job error promptly.
     with _INSTALL_LOCK:
@@ -230,7 +262,7 @@ def tool_install(args, notify):
     deadline = time.time() + wait
     while wait and time.time() < deadline:
         code = process.poll()
-        state = setup_flow.read_state() or {}
+        state = _current_install_state(process)
         if state.get("phase") == "download" and state.get("total"):
             notify(state.get("done", 0), state["total"],
                    f"downloading {state.get('model')}: {state.get('done', 0) / 1e9:.1f} of "
@@ -241,8 +273,8 @@ def tool_install(args, notify):
             break
         time.sleep(1.0)
     result["exit_code"] = process.poll()
-    result["install"] = setup_flow.read_state()
-    if result["exit_code"] not in (None, 0):
+    result["install"] = _current_install_state(process)
+    if result["exit_code"] not in (None, 0) or result["install"].get("phase") == "error":
         result["log_tail"] = setup_flow.tail_file(log, 30)
         raise ToolError(json.dumps(result, indent=2))
     result["next"] = ("the install continues in the background: call status to follow it"
@@ -280,12 +312,23 @@ def tool_stop(args, notify):
 
 
 def tool_status(args, notify):
-    return setup_flow.status_report()
+    report = setup_flow.status_report()
+    with _INSTALL_LOCK:
+        state = _current_install_state()
+        running = _install_running() is not None
+    if state:
+        report["install"] = dict(state, running=running)
+    return report
 
 
 def tool_logs(args, notify):
     which = {"server": "serve"}.get(args.get("which", "server"), args.get("which", "server"))
     path = setup_flow.log_path(which)
+    if which == "build":
+        # one log per backend (setup_flow.build_log_name): the latest build's
+        builds = glob.glob(os.path.join(glob.escape(os.path.dirname(path)), "build-*.log"))
+        if builds:
+            path = max(builds, key=os.path.getmtime)
     return {"log": path, "text": setup_flow.tail_file(path, int(args.get("lines") or 100))}
 
 
@@ -322,7 +365,7 @@ class Server:
             return
         try:
             message = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
             self.error(None, PARSE_ERROR, "parse error")
             return
         if isinstance(message, list):

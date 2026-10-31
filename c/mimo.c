@@ -50,22 +50,35 @@
 #include <omp.h>
 #endif
 
+#include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
 #include "cli_args.h"
 #include "compat.h"
 #include "json.h"
+#define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
 #include "st.h"
+#include "ggml_view.h"   /* coli_mxfp4_unblock: a GGUF's MXFP4 experts */
 #include "quant.h"
 #include "omp_tune.h"
 #include "kv_prefix.h"
+#include "park.h"   /* a short request keeps the conversation aside (COLI_PARK) */
+#include "prompt_break.h"   /* a served prompt that a STOP or CANCEL stops between two blocks */
 #include "pin_pool.h"
 #include "tok.h"
 #include "serve_codec.h"
 #include "serve_poll.h"
 #include "stop_ids.h"
+#include "route_trace.h"   /* the routing history (.coli_usage): the tier's warm start, the planner's pins */
 #if defined(__AVX2__)
 #include <immintrin.h>
 #endif
 #include "vk_tier.h"       /* the shared Vulkan routed-expert tier (COLI_VULKAN=1; stubs without VK=1) */
+#include "xtier.h"         /* that tier on the CUDA device too (cu_tier.h): XT(f) */
+#ifdef COLI_CUDA
+#include "backend_cuda.h"
+#include "cu_dense.h"      /* the dense matrices on the tier's CUDA device, a matrix at a time */
+static int g_mimo_cu;    /* COLI_CUDA=1 and the device opened for the tier */
+static size_t g_mimo_cud; /* the room the dense matrices take there (cud_open) */
+#endif
 #ifdef COLI_VULKAN
 /* VK=1 and COLI_VULKAN=1: the routed experts go to the shared expert tier
  * (vk_tier.c) as the release's MXFP4, and the dense matrices of the trunk and of
@@ -209,7 +222,9 @@ static void load_cfg(Cfg *c, const char *dir) {
     c->image_token_id = (int)jnum(root, "image_token_id", -1);
     c->vision_start_id = (int)jnum(root, "vision_start_token_id", -1);
     c->vision_end_id = (int)jnum(root, "vision_end_token_id", -1);
-    c->chunks = c->kv_heads[0];
+    /* the qkv pre-shard count: the release's num_key_value_heads chunks; a GGUF's qkv is one
+     * (llama.cpp's converter writes [Q|K|V], gguf_import says so) */
+    c->chunks = (int)jnum(root, "qkv_shards", c->kv_heads[0]);
     /* MIMO_LAYERS=N: only the first N layers, then the final norm and head. A
      * checking aid (tools/mimo_real_check.py compares it with Xiaomi's code on
      * the real weights), never an answer anyone should read. */
@@ -257,13 +272,14 @@ static void load_cfg(Cfg *c, const char *dir) {
 
 /* ----------------------------------------------------------- dense weights ---- */
 
-/* A dense matrix [O, I] in one of four forms. FP8 keeps the checkpoint bytes and
+/* A dense matrix [O, I] in one of five forms. FP8 keeps the checkpoint bytes and
  * expands the 128x128 block grid to one scale per (row, column block), which is
- * what lets a row move (the qkv de-interleave) without touching its bytes. */
-enum { DW_F32 = 0, DW_BF16 = 1, DW_FP8 = 2, DW_I8 = 3 };
+ * what lets a row move (the qkv de-interleave) without touching its bytes. DW_GQ is
+ * a GGUF's matrix in its ggml blocks (type gqt), rows as the file has them. */
+enum { DW_F32 = 0, DW_BF16 = 1, DW_FP8 = 2, DW_I8 = 3, DW_GQ = 4 };
 typedef struct {
-    int fmt, O, I, nblk;
-    void *w;           /* f32 / bf16 / e4m3 / int8 */
+    int fmt, O, I, nblk, gqt;
+    void *w;           /* f32 / bf16 / e4m3 / int8 / ggml blocks */
     float *s;          /* FP8: [O][nblk]; I8: [O] */
     void *vk;          /* COLI_VULKAN: the device copy, uploaded at start-up */
     int vk_off;        /* its upload failed: this matrix stays on the CPU */
@@ -271,6 +287,8 @@ typedef struct {
      * holds it alone (COLI_VK_DENSE_HOST, the host copy dropped) */
     char *vk_name;
     int vk_kind, vk_bits, vk_li, vk_gone;
+    void *cu; int cu_no;   /* COLI_CUDA: the device's copy (cu_dense.h), NULL before its first use;
+                            * cu_no once the matrix stays the CPU's */
 } DW;
 
 /* 0 (default): the checkpoint's own FP8 and BF16 bytes, exact.
@@ -350,6 +368,10 @@ static int dw_vk_fmt(const DW *d, int *gs, const float **sc) {
     case DW_BF16: return 11;
     case DW_FP8:  *gs = 128; *sc = d->s; return 12;
     case DW_I8:   *sc = d->s; return 1;
+    case DW_GQ: {   /* a GGUF's blocks as the file has them (the chain's block GEMVs and GEMMs) */
+        const int f = 100 + d->gqt, be = coli_vk_block_elems(f);
+        return be > 0 && d->I % be == 0 ? f : -1;
+    }
     }
     return -1;
 }
@@ -367,6 +389,7 @@ static int dw_upload(DW *d) {
 
 static int dw_matmul_vk(float *y, const float *x, int S, const DW *d) {
     if (!g_vk_ready || !(coli_vk_dense() || g_mimo_dho) || d->vk_off || !vk_main_thread()) return 0;
+    if (d->fmt == DW_GQ) return 0;   /* the per-matrix path takes no blocks: the chain does, or the CPU */
     DW *dev = (DW *)d;     /* the device copy is a cache inside a read-only matrix */
     if (!dw_upload(dev) || coli_vk_tensor_dev((ColiVkTensor *)dev->vk)) return 0;   /* the second device's: only its chain */
     int gs; const float *sc;
@@ -376,7 +399,18 @@ static int dw_matmul_vk(float *y, const float *x, int S, const DW *d) {
 static void dw_reload(DW *d);   /* below, beside the loaders it re-runs */
 #endif
 
+#ifdef COLI_CUDA
+/* the format a DW goes to the CUDA device in (cu_dense.h): f32, int8 rows with a scale, a GGUF's
+ * blocks; -1 for bf16 and FP8, which stay on the CPU */
+static int dw_cu_fmt(const DW *d) {
+    return d->fmt == DW_F32 ? 0 : d->fmt == DW_I8 ? 1 : d->fmt == DW_GQ ? 100 + d->gqt : -1;
+}
+#endif
 static void dw_matmul(float *y, const float *x, int S, const DW *d) {
+#ifdef COLI_CUDA
+    if (g_cud.on && dw_cu_fmt(d) >= 0 &&
+        cud_mm(&((DW *)d)->cu, &((DW *)d)->cu_no, y, x, S, dw_cu_fmt(d), d->w, d->s, d->O, d->I, 0)) return;
+#endif
 #ifdef COLI_VULKAN
     if (dw_matmul_vk(y, x, S, d)) return;
     if (d->vk_gone) dw_reload((DW *)d);   /* the CPU needs a matrix the device held alone (a lost device) */
@@ -386,6 +420,11 @@ static void dw_matmul(float *y, const float *x, int S, const DW *d) {
     case DW_BF16: matmul_bf16(y, x, (const uint16_t *)d->w, S, d->I, d->O); break;
     case DW_FP8:  matmul_fp8_rows(y, x, (const uint8_t *)d->w, d->s, d->nblk, S, d->I, d->O); break;
     case DW_I8:   matmul_q(y, x, (const int8_t *)d->w, d->s, S, d->I, d->O); break;
+    case DW_GQ:   /* the CPU's integer form of a GGUF's matmuls (GQ_EXACT=1: the float reference) */
+        if (gq_matmul(y, x, (const uint8_t *)d->w, d->gqt, S, d->I, d->O) < 0) {
+            fprintf(stderr, "[mimo] a %s matrix has no CPU form here\n", gq_type_name(d->gqt)); exit(1);
+        }
+        break;
     }
 }
 
@@ -445,7 +484,34 @@ static void dw_note(DW *d, const char *name, int kind) {
 #define DW_NOTE(d, name, kind) ((void)0)
 #endif
 
+/* A GGUF's matrix in its ggml blocks (st_gguf.h), kept as the file has them: DW_GQ */
+static void dw_load_gq(DW *d, shards *S, const char *name, int O, int I) {
+    st_tensor *t = st_find(S, name);
+    if (!t) st_die_missing(S, name);
+    const int gt = st_ggml_type(t->dtype);
+    const int64_t rb = gq_row_bytes(gt, I);
+    if (rb <= 0 || t->rank != 2 || t->shape[0] != O || t->shape[1] != I || t->nbytes != rb * O) {
+        fprintf(stderr, "[mimo] %s: %s %lld bytes, expected [%d, %d] of %lld bytes a row -- refusing (untrusted container)\n",
+                name, gq_type_name(gt), (long long)t->nbytes, O, I, (long long)rb);
+        exit(1);
+    }
+    DW_NOTE(d, name, DWK_BF16);   /* read back through dw_load_bf16, which comes here */
+    d->fmt = DW_GQ; d->gqt = gt; d->O = O; d->I = I; d->s = NULL; d->nblk = 0;
+    d->w = xmalloc((size_t)t->nbytes, name);
+    st_read_raw_cap(S, name, d->w, t->nbytes, 1);
+}
+
 static void dw_load_bf16(DW *d, shards *S, const char *name, int O, int I) {
+    st_tensor *t0 = st_find(S, name);
+    if (t0 && st_is_ggml(t0->dtype)) { dw_load_gq(d, S, name, O, I); return; }   /* a GGUF's blocks */
+    if (t0 && t0->dtype == 2) {   /* F32 (a GGUF converted at full precision): into the configured form */
+        need(S, name, 2, O, I);
+        DW_NOTE(d, name, DWK_BF16);
+        float *w = xmalloc((size_t)O * I * sizeof(float), name);
+        st_read_f32(S, name, w, 1);
+        dw_from_f32(d, w, O, I);
+        return;
+    }
     st_tensor *t = need(S, name, 0, O, I);
     DW_NOTE(d, name, DWK_BF16);
     if (g_dense_bits == 0) {
@@ -518,6 +584,12 @@ static void load_qkv(DW *d, shards *S, const Cfg *c, int li) {
     int per_chunk = (rpc + 127) / 128, continuous = (O + 127) / 128;
     char name[512], sname[600];
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.qkv_proj.weight", li);
+    st_tensor *qt = st_find(S, name);
+    if (qt && (qt->dtype == 0 || qt->dtype == 2 || st_is_ggml(qt->dtype))) {   /* BF16, or a GGUF's F32 or blocks: one [Q|K|V] chunk */
+        if (T != 1) { fprintf(stderr, "[mimo] %s: BF16 qkv in %d pre-shard chunks -- refusing\n", name, T); exit(1); }
+        dw_load_bf16(d, S, name, O, c->hidden);
+        return;
+    }
     snprintf(sname, sizeof(sname), "%s_scale_inv", name);
     st_tensor *st = st_find(S, sname);
     if (!st) st_die_missing(S, sname);
@@ -580,7 +652,7 @@ static void dw_reload(DW *d) {
 
 typedef struct { int eid; uint64_t used; uint8_t *base, *buf; } Slot;
 typedef struct { Slot *s; int n, cap; int *by_expert; } LCache;
-typedef struct { int fd[6]; int64_t off[6]; int contig; } ERef;
+typedef struct { int fd[6]; int64_t off[6]; int contig; } ERef;   /* a GGUF's: down, gate, up blocks in fd/off[0..2] */
 
 typedef struct {
     float *ln1, *ln2, *sink;
@@ -622,6 +694,12 @@ typedef struct {
     uint64_t clock, hits, miss, bytes_read, forwards;
     double t_disk, t_expert, t_attn;
     int idot, direct;
+    int gx;                      /* the routed experts are a GGUF's MXFP4 blocks (st_gguf.h): laid out
+                                  * as the release's at the read (coli_mxfp4_unblock) */
+    int gxq;                     /* a GGUF's experts of other ggml types (K-quants, IQ ...): read as the
+                                  * file has them, computed with ggml_quants.h; gx_t / gx_len [layer][3]:
+                                  * down, gate, up types and bytes, a slot [down | gate | up] */
+    int *gx_t; int64_t *gx_len;
     uint8_t **ehit;              /* [layer][expert] routed this turn, for HITS */
 #ifdef COLI_VULKAN
     void *vkchain;               /* the dense chain's device state (mimo_chain.h), NULL until it runs */
@@ -631,6 +709,53 @@ typedef struct {
      * of mux_rows[t].seq; NULL in every other forward. */
     const MimoRow *mux_rows;
 } Model;
+
+/* A GGUF's experts of any ggml types (the MXFP4 ones of every layer keep the release's
+ * layout, expert_table_init): each layer its types, as published files mix them, every
+ * expert's three matrices as the file has them, back to back in a slot [down | gate | up] */
+static void gxq_table_init(Model *m) {
+    Cfg *c = &m->c;
+    const int H = c->hidden, MI = c->moe_inter, L = c->n_layers;
+    static const char *mat[3] = {"down_proj", "gate_proj", "up_proj"};
+    m->gxq = 1;
+    m->gx_t = xcalloc((size_t)3 * L, sizeof(int), "expert types");
+    m->gx_len = xcalloc((size_t)3 * L, sizeof(int64_t), "expert sizes");
+    m->e_bytes = 0;
+    for (int li = 0; li < L; li++) {
+        if (!c->moe[li]) continue;
+        int64_t sum = 0; int dt[3];
+        for (int k = 0; k < 3; k++) {
+            char nm[512];
+            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.0.%s.weight", li, mat[k]);
+            st_tensor *t = st_find(&m->S, nm);
+            const int I = k ? H : MI, O = k ? MI : H, ty = t && st_is_ggml(t->dtype) ? st_ggml_type(t->dtype) : -1;
+            const int64_t rb = ty >= 0 ? gq_row_bytes(ty, I) : -1;
+            if (rb <= 0) { fprintf(stderr, "[mimo] %s: not ggml blocks this engine reads -- refusing\n", nm); exit(1); }
+            m->gx_t[3 * li + k] = ty; m->gx_len[3 * li + k] = rb * O; dt[k] = t->dtype; sum += rb * O;
+        }
+        if (sum > m->e_bytes) m->e_bytes = sum;
+        for (int e = 0; e < c->n_experts; e++) {
+            ERef *er = &m->eref[(int64_t)li * c->n_experts + e];
+            for (int k = 0; k < 3; k++) {
+                char nm[512];
+                snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.%s.weight", li, e, mat[k]);
+                st_tensor *t = st_find(&m->S, nm);
+                if (!t || t->dtype != dt[k] || t->nbytes != m->gx_len[3 * li + k]) {
+                    fprintf(stderr, "[mimo] %s: not %lld bytes of %s blocks, as the layer's first expert -- refusing\n",
+                            nm, (long long)m->gx_len[3 * li + k], gq_type_name(m->gx_t[3 * li + k]));
+                    exit(1);
+                }
+                er->fd[k] = t->fd; er->off[k] = t->off;
+                if (e == 0) st_no_readahead(&m->S, t->fd);   /* three slices an expert: no readahead */
+            }
+            er->contig = 0;
+        }
+    }
+    int first = -1;
+    for (int li = 0; li < L && first < 0; li++) if (c->moe[li]) first = li;
+    fprintf(stderr, "[mimo] GGUF experts: %s gate, %s up, %s down from layer %d (each layer its own), read as the file has them\n",
+            gq_type_name(m->gx_t[3 * first + 1]), gq_type_name(m->gx_t[3 * first + 2]), gq_type_name(m->gx_t[3 * first]), first);
+}
 
 static void expert_table_init(Model *m) {
     Cfg *c = &m->c;
@@ -643,6 +768,47 @@ static void expert_table_init(Model *m) {
     m->eref = xcalloc((size_t)c->n_layers * c->n_experts, sizeof(ERef), "expert table");
     static const char *mat[3] = {"down_proj", "gate_proj", "up_proj"};
     int missing = 0, split = 0;
+    for (int li = 0; li < c->n_layers && !m->gx; li++) if (c->moe[li]) {
+        char nm[512]; snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.0.down_proj.weight", li);
+        st_tensor *t = st_find(&m->S, nm);
+        m->gx = t && st_is_ggml(t->dtype);
+        break;
+    }
+    if (m->gx) {   /* a GGUF: MXFP4 in every layer keeps the release's layout, any other types gxq */
+        for (int li = 0; li < c->n_layers && m->gx; li++) {
+            if (!c->moe[li]) continue;
+            for (int k = 0; k < 3; k++) {
+                char nm[512];
+                snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.0.%s.weight", li, mat[k]);
+                st_tensor *t = st_find(&m->S, nm);
+                if (!t || !st_is_ggml(t->dtype) || st_ggml_type(t->dtype) != GQ_MXFP4) { gxq_table_init(m); return; }
+            }
+        }
+    }
+    if (m->gx) {   /* a GGUF: each matrix its MXFP4 blocks, 17 bytes per 32 values */
+        for (int li = 0; li < c->n_layers; li++) {
+            if (!c->moe[li]) continue;
+            for (int e = 0; e < c->n_experts; e++) {
+                ERef *er = &m->eref[(int64_t)li * c->n_experts + e];
+                for (int k = 0; k < 3; k++) {
+                    char nm[512];
+                    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.%s.weight", li, e, mat[k]);
+                    st_tensor *t = st_find(&m->S, nm);
+                    const int64_t want = m->part[2 * k] / 16 * 17;
+                    if (!t || !st_is_ggml(t->dtype) || st_ggml_type(t->dtype) != GQ_MXFP4 || t->nbytes != want) {
+                        fprintf(stderr, "[mimo] %s: not %lld bytes of MXFP4 blocks (a GGUF's routed experts must be MXFP4) "
+                                        "-- refusing\n", nm, (long long)want);
+                        exit(1);
+                    }
+                    er->fd[k] = t->fd; er->off[k] = t->off;
+                    if (e == 0) st_no_readahead(&m->S, t->fd);   /* three slices an expert: no readahead */
+                }
+                er->contig = 0;
+            }
+        }
+        fprintf(stderr, "[mimo] GGUF experts: MXFP4 blocks, laid out as the release's at the read\n");
+        return;
+    }
     for (int li = 0; li < c->n_layers; li++) {
         if (!c->moe[li]) continue;
         for (int e = 0; e < c->n_experts; e++) {
@@ -693,6 +859,33 @@ static void expert_read(Model *m, int li, int eid, Slot *s) {
         fprintf(stderr, "[mimo] out of memory for an expert slot\n"); exit(1);
     }
     ERef *er = &m->eref[(int64_t)li * m->c.n_experts + eid];
+    if (m->gxq) {   /* a GGUF's three matrices as the file has them: [down | gate | up] */
+        uint8_t *dst = s->base;
+        for (int k = 0; k < 3; k++) {
+            const int64_t n = m->gx_len[3 * li + k];
+            st_pread_full(er->fd[k], dst, n, er->off[k], "pread expert");
+            dst += n;
+        }
+        s->buf = s->base;
+        return;
+    }
+    if (m->gx) {   /* a GGUF's three MXFP4 matrices, each into its codes and scales */
+        static __thread uint8_t *raw; static __thread int64_t raw_n;
+        const int64_t need = m->part[0] / 16 * 17;   /* the biggest matrix: all three have H x MI values */
+        if (raw_n < need) {
+            free(raw); raw = malloc((size_t)need); raw_n = raw ? need : 0;
+            if (!raw) { fprintf(stderr, "[mimo] out of memory reading an expert\n"); exit(1); }
+        }
+        uint8_t *dst = s->base;
+        for (int k = 0; k < 3; k++) {
+            const int64_t nb = m->part[2 * k] / 16;
+            st_pread_full(er->fd[k], raw, nb * 17, er->off[k], "pread expert");
+            coli_mxfp4_unblock(dst + m->part[2 * k], dst, raw, nb);
+            dst += m->part[2 * k] + m->part[2 * k + 1];
+        }
+        s->buf = s->base;
+        return;
+    }
     if (er->fd[0] < 0) { fprintf(stderr, "[mimo] expert L%d E%d missing on disk\n", li, eid); exit(1); }
     if (er->contig) {
         int dfd = m->direct ? st_direct_fd(&m->S, er->fd[0]) : -1;
@@ -739,11 +932,11 @@ static void experts_ensure(Model *m, int li, const int *want, int n, Slot **out)
             int dev = -1;
             for (int s = 0; s < lc->n; s++) {
                 if (lc->s[s].used >= stamp) continue;
-                if (lc->s[s].eid >= 0 && vkt_ram_first(li, lc->s[s].eid)) {
+                if (lc->s[s].eid >= 0 && XT(ram_first)(li, lc->s[s].eid)) {
                     if (lc->s[s].used < dev_oldest) { dev_oldest = lc->s[s].used; dev = s; }
                 } else if (lc->s[s].used < oldest) { oldest = lc->s[s].used; best = s; }
             }
-            if (dev >= 0) { best = dev; vkt_ram_gave(); }
+            if (dev >= 0) { best = dev; XT(ram_gave)(); }
         }
         if (best < 0) { fprintf(stderr, "[mimo] expert cache smaller than one routing step\n"); exit(1); }
         Slot *s = &lc->s[best];
@@ -782,13 +975,19 @@ static void kv_alloc(Model *m, int ctx) {
     kv_prefix_alloc(&m->kvp, ctx);
 }
 
-static void model_reset(Model *m) {
+/* The state from nothing. n >= 0: only the rows positions [0, n) reach (a short request beside
+ * a parked conversation, park.h): a query reads the rows of its own positions, a window's by
+ * the position its slot holds, so the conversation's further rows wait untouched. */
+static void model_reset_rows(Model *m, int n) {
     Cfg *c = &m->c;
-    for (int li = 0; li < c->n_layers; li++)
-        for (int r = 0; r < m->L[li].rows; r++) m->L[li].ring_pos[r] = -1;
+    for (int li = 0; li < c->n_layers; li++) {
+        int r0 = n >= 0 && n < m->L[li].rows ? n : m->L[li].rows;
+        for (int r = 0; r < r0; r++) m->L[li].ring_pos[r] = -1;
+    }
     m->pos = 0;
     kv_prefix_clear(&m->kvp);
 }
+static void model_reset(Model *m) { model_reset_rows(m, -1); }
 
 static void model_load(Model *m, const char *dir, int cap) {
     Cfg *c = &m->c;
@@ -801,9 +1000,44 @@ static void model_load(Model *m, const char *dir, int cap) {
     m->idot = env_int("MIMO_IDOT", 0);
     m->direct = env_int("MIMO_DIRECT", 1);
     int H = c->hidden;
-    need(&m->S, "model.embed_tokens.weight", 0, c->vocab, H);
     m->embed = xmalloc((size_t)c->vocab * H * sizeof(uint16_t), "embeddings");
-    st_read_raw_cap(&m->S, "model.embed_tokens.weight", m->embed, (int64_t)c->vocab * H * 2, 1);
+    st_tensor *et = st_find(&m->S, "model.embed_tokens.weight");
+    if (et && st_is_ggml(et->dtype)) {   /* a GGUF's blocks: each row to f32, then bf16, nearest even */
+        DW t = {0};
+        dw_load_gq(&t, &m->S, "model.embed_tokens.weight", c->vocab, H);
+        const int64_t rb = gq_row_bytes(t.gqt, H);
+        #pragma omp parallel
+        {
+            float *row = xmalloc((size_t)H * sizeof(float), "embedding row");
+            #pragma omp for schedule(static)
+            for (int64_t v = 0; v < c->vocab; v++) {
+                gq_dequant_row(t.gqt, (const uint8_t *)t.w + v * rb, row, H);
+                for (int i = 0; i < H; i++) {
+                    uint32_t b; memcpy(&b, &row[i], 4);
+                    b += 0x7fffu + ((b >> 16) & 1u);
+                    m->embed[v * H + i] = (uint16_t)(b >> 16);
+                }
+            }
+            free(row);
+        }
+        free(t.w);
+#ifdef COLI_VULKAN
+        free(t.vk_name);
+#endif
+    } else if (et && et->dtype == 2) {   /* F32 (a GGUF converted at full precision): to bf16, nearest even */
+        need(&m->S, "model.embed_tokens.weight", 2, c->vocab, H);
+        float *all = xmalloc((size_t)c->vocab * H * sizeof(float), "embeddings f32");
+        st_read_f32(&m->S, "model.embed_tokens.weight", all, 1);
+        for (int64_t i = 0; i < (int64_t)c->vocab * H; i++) {
+            uint32_t b; memcpy(&b, &all[i], 4);
+            b += 0x7fffu + ((b >> 16) & 1u);
+            m->embed[i] = (uint16_t)(b >> 16);
+        }
+        free(all);
+    } else {
+        need(&m->S, "model.embed_tokens.weight", 0, c->vocab, H);
+        st_read_raw_cap(&m->S, "model.embed_tokens.weight", m->embed, (int64_t)c->vocab * H * 2, 1);
+    }
     m->norm = load_vec(&m->S, "model.norm.weight", H);
     dw_load_bf16(&m->head, &m->S, "lm_head.weight", c->vocab, H);
     for (int li = 0; li < c->n_layers; li++) {
@@ -821,16 +1055,20 @@ static void model_load(Model *m, const char *dir, int cap) {
             snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.attention_sink_bias", li);
             l->sink = load_vec(&m->S, nm, c->heads[k]);
         }
-        if (!c->moe[li]) {
-            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate_proj.weight", li);
-            dw_load_fp8(&l->gate, &m->S, nm, c->dense_inter, H, NULL, 0, NULL);
-            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.up_proj.weight", li);
-            dw_load_fp8(&l->up, &m->S, nm, c->dense_inter, H, NULL, 0, NULL);
-            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.down_proj.weight", li);
-            dw_load_fp8(&l->down, &m->S, nm, H, c->dense_inter, NULL, 0, NULL);
+        if (!c->moe[li]) {   /* FP8 in the release, BF16 in a GGUF */
+            DW *mlp[3] = {&l->gate, &l->up, &l->down};
+            const char *mn[3] = {"gate_proj", "up_proj", "down_proj"};
+            for (int k = 0; k < 3; k++) {
+                const int O = k < 2 ? c->dense_inter : H, I = k < 2 ? H : c->dense_inter;
+                snprintf(nm, sizeof(nm), "model.layers.%d.mlp.%s.weight", li, mn[k]);
+                st_tensor *t = st_find(&m->S, nm);
+                if (t && (t->dtype == 0 || t->dtype == 2 || st_is_ggml(t->dtype))) dw_load_bf16(mlp[k], &m->S, nm, O, I);
+                else dw_load_fp8(mlp[k], &m->S, nm, O, I, NULL, 0, NULL);
+            }
         } else {
             snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.weight", li);
-            need(&m->S, nm, 0, c->n_experts, H);
+            st_tensor *rt = st_find(&m->S, nm);
+            need(&m->S, nm, rt && rt->dtype == 2 ? 2 : 0, c->n_experts, H);   /* BF16, or a GGUF's F32 */
             l->router = xmalloc((size_t)c->n_experts * H * sizeof(float), nm);
             st_read_f32(&m->S, nm, l->router, 1);
             snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.e_score_correction_bias", li);
@@ -848,6 +1086,23 @@ static void model_load(Model *m, const char *dir, int cap) {
     kv_alloc(m, ctx);
     m->ehit = xmalloc((size_t)c->n_layers * sizeof(uint8_t *), "hits");
     for (int li = 0; li < c->n_layers; li++) m->ehit[li] = xcalloc((size_t)c->n_experts, 1, "hits row");
+}
+
+/* The routing history: every routed choice counted (rt_route in moe), read at start from
+ * COLI_USAGE or <model>/.coli_usage and written back at exit, so the expert tier starts warm
+ * with the experts this machine's use routes most (vk_tier_start) and the planner pins them */
+static char g_mimo_usage[2100];
+static void mimo_telemetry_save(void) { if (g_mimo_usage[0]) rt_save(g_mimo_usage, 0); }
+static void mimo_telemetry_init(const char *snap, const Cfg *c) {
+    rt_init("mimo", c->n_layers, c->n_experts);
+    for (int i = 0; i < c->n_layers; i++) if (!c->moe[i]) rt_drop_row(i);
+    rt_drop_row(c->n_layers);   /* the inclusive extra row: no routed MTP here */
+    const char *up = getenv("COLI_USAGE");
+    if (up && *up) snprintf(g_mimo_usage, sizeof g_mimo_usage, "%s", up);
+    else snprintf(g_mimo_usage, sizeof g_mimo_usage, "%s/.coli_usage", snap);
+    int64_t history = rt_load(g_mimo_usage);
+    if (history > 0) fprintf(stderr, "[USAGE] expert history: %lld selections (%s)\n", (long long)history, g_mimo_usage);
+    atexit(mimo_telemetry_save);
 }
 
 /* ------------------------------------------------------------ the forward ---- */
@@ -1084,7 +1339,11 @@ static void dense_mlp(Model *m, Layer *l, const float *xn, int n, float *out) {
 
 /* An expert's bytes as the shared Vulkan tier reads them (buf: down, its
  * scales, gate, its scales, up, its scales; one e8m0 byte per 32 columns). */
-static VktExpertSrc mimo_vk_src(const Model *m, const uint8_t *buf) {
+static VktExpertSrc mimo_vk_src(const Model *m, int li, const uint8_t *buf) {
+    if (m->gxq) {   /* a GGUF's blocks as the file has them: [down | gate | up], no scales of their own */
+        const int64_t *n = m->gx_len + 3 * li;
+        return (VktExpertSrc){buf + n[0], buf + n[0] + n[1], buf, NULL, NULL, NULL};
+    }
     const uint8_t *dq = buf, *ds = dq + m->part[0], *gq = ds + m->part[1], *gs = gq + m->part[2],
                   *uq = gs + m->part[3], *us = uq + m->part[4];
     return (VktExpertSrc){gq, uq, dq, gs, us, ds};
@@ -1099,7 +1358,7 @@ static int mimo_vk_load_batch(void *ctx, int li, const int *e, int n, VktExpertS
     if (n < 1 || n > 64) return 0;
     Slot *sl[64];
     experts_ensure(m, li, e, n, sl);
-    for (int i = 0; i < n; i++) { srcs[i] = mimo_vk_src(m, sl[i]->buf); h[i] = sl[i]; }
+    for (int i = 0; i < n; i++) { srcs[i] = mimo_vk_src(m, li, sl[i]->buf); h[i] = sl[i]; }
     return n;
 }
 static int mimo_vk_load(void *ctx, int li, int e, VktExpertSrc *src, void **h) {
@@ -1142,6 +1401,8 @@ static int moe_cpu(Model *m, int li, const float *xn, int n, const int *sel,
     void (*mm)(float *, const float *, const uint8_t *, const uint8_t *, int, int, int)
         = m->idot ? matmul_mxfp4_i8 : matmul_mxfp4;
     const int BLOCK_ROWS = 256;
+    const int gxq = m->gxq, *gxt = gxq ? m->gx_t + 3 * li : NULL;   /* a GGUF's types: down, gate, up */
+    const int64_t *gxn = gxq ? m->gx_len + 3 * li : NULL;
     Slot *slots[4096];
     int base = total;                /* y rows before this call are someone else's */
     for (int b = 0; b < nu; b += cap) {
@@ -1171,15 +1432,20 @@ static int moe_cpu(Model *m, int li, const float *xn, int n, const int *sel,
             if (!r) continue;
             int o0 = blk * BLOCK_ROWS, rows = MI - o0 < BLOCK_ROWS ? MI - o0 : BLOCK_ROWS;
             const uint8_t *buf = slots[j]->buf;
-            const uint8_t *q = buf + m->part[0] + m->part[1] + (which ? m->part[2] + m->part[3] : 0);
-            const uint8_t *sc = q + m->part[2];
             float *dst = (which ? u : g) + (size_t)first[j] * MI;
             /* rows [o0, o0+rows) of this expert's gate or up, for its r inputs; the
              * kernel writes [r, rows] contiguously, so it goes through a scratch */
             float tmp[4 * 256];
             float *scratch = r * rows <= (int)(sizeof(tmp) / sizeof(tmp[0])) ? tmp
                            : xmalloc((size_t)r * rows * sizeof(float), "expert scratch");
-            mm(scratch, xg + (size_t)first[j] * H, q + (size_t)o0 * rb_h, sc + (size_t)o0 * gb_h, r, H, rows);
+            if (gxq) {   /* a GGUF's blocks: rows [o0, o0+rows) of its gate or up */
+                const int t = gxt[which ? 2 : 1];
+                gq_matmul(scratch, xg + (size_t)first[j] * H, buf + gxn[0] + (which ? gxn[1] : 0) + (size_t)o0 * gq_row_bytes(t, H),
+                          t, r, H, rows);
+            } else {
+                const uint8_t *q = buf + m->part[0] + m->part[1] + (which ? m->part[2] + m->part[3] : 0);
+                mm(scratch, xg + (size_t)first[j] * H, q + (size_t)o0 * rb_h, q + m->part[2] + (size_t)o0 * gb_h, r, H, rows);
+            }
             for (int i = 0; i < r; i++)
                 memcpy(dst + (size_t)i * MI + o0, scratch + (size_t)i * rows, (size_t)rows * sizeof(float));
             if (scratch != tmp) free(scratch);
@@ -1195,15 +1461,16 @@ static int moe_cpu(Model *m, int li, const float *xn, int n, const int *sel,
             float tmp[4 * 256];
             float *scratch = r * rows <= (int)(sizeof(tmp) / sizeof(tmp[0])) ? tmp
                            : xmalloc((size_t)r * rows * sizeof(float), "expert scratch");
-            mm(scratch, g + (size_t)first[j] * MI, dq + (size_t)o0 * rb_mi, ds + (size_t)o0 * gb_mi, r, MI, rows);
+            if (gxq) gq_matmul(scratch, g + (size_t)first[j] * MI, dq + (size_t)o0 * gq_row_bytes(gxt[0], MI), gxt[0], r, MI, rows);
+            else mm(scratch, g + (size_t)first[j] * MI, dq + (size_t)o0 * rb_mi, ds + (size_t)o0 * gb_mi, r, MI, rows);
             float *dst = y + (size_t)(base + first[j]) * H;
             for (int i = 0; i < r; i++)
                 memcpy(dst + (size_t)i * H + o0, scratch + (size_t)i * rows, (size_t)rows * sizeof(float));
             if (scratch != tmp) free(scratch);
         }
         /* the group's bytes are still in RAM: the tier may promote them */
-        if (note && vkt_ready())
-            for (int j = 0; j < nb; j++) { VktExpertSrc vs = mimo_vk_src(m, slots[j]->buf); vkt_note(li, uni[b + j], &vs); }
+        if (note && XT(ready)())
+            for (int j = 0; j < nb; j++) { VktExpertSrc vs = mimo_vk_src(m, li, slots[j]->buf); XT(note)(li, uni[b + j], &vs); }
         m->t_expert += now_s() - t0;
     }
 #undef MIMO_WANT
@@ -1252,6 +1519,7 @@ static void moe(Model *m, int li, const float *xn, int n, float *out) {
         for (int j = 0; j < K; j++) sum += w[j];
         for (int j = 0; j < K; j++) w[j] = (c->norm_topk && K > 1 ? w[j] / (sum + 1e-20f) : w[j]) * c->route_scale;
         for (int j = 0; j < K; j++) m->ehit[li][s[j]] = 1;
+        rt_route(li, t, s, w, K);
     }
     free(logits);
     memset(out, 0, (size_t)n * H * sizeof(float));
@@ -1260,13 +1528,13 @@ static void moe(Model *m, int li, const float *xn, int n, float *out) {
     uint8_t *taken = NULL;
     const float **dev = NULL;
     int ndev = 0;
-    if (vkt_ready()) {
+    if (XT(ready)()) {
         taken = xmalloc((size_t)n * K, "device pairs");
         dev = xmalloc((size_t)n * K * sizeof(*dev), "device rows");
-        ndev = vkt_issue(li, xn, n, K, sel, taken);
+        ndev = XT(issue)(li, xn, n, K, sel, taken);
     }
     int total = moe_cpu(m, li, xn, n, sel, ndev ? taken : NULL, 0, pair, y, 0, !ndev);
-    if (ndev && !vkt_join(dev)) {    /* the batch failed (the tier stops): those pairs here */
+    if (ndev && !XT(join)(dev)) {    /* the batch failed (the tier stops): those pairs here */
         moe_cpu(m, li, xn, n, sel, taken, 1, pair, y, total, 0);
         ndev = 0;
     } else if (ndev) {               /* the CPU's experts still in RAM, now that nothing is in flight */
@@ -1276,8 +1544,8 @@ static void moe(Model *m, int li, const float *xn, int n, float *out) {
             int e = sel[i];
             if (taken[i] || noted[e] || by[e] < 0) continue;
             noted[e] = 1;
-            VktExpertSrc vs = mimo_vk_src(m, m->cache[li].s[by[e]].buf);
-            vkt_note(li, e, &vs);
+            VktExpertSrc vs = mimo_vk_src(m, li, m->cache[li].s[by[e]].buf);
+            XT(note)(li, e, &vs);
         }
         free(noted);
     }
@@ -1482,9 +1750,11 @@ static void echo_frame(const Echo *e, int pos, int token, const float *lo, int v
 /* A prompt in blocks of MIMO_CHUNK rows (default 64): the last block's last
  * row (or every row, for the teacher-forcing dump) comes back in `logits`.
  * With `echo`, every row of every block goes through the head and is read out
- * as it comes; only one block of logits is ever held, not the prompt's. */
-static void prefill(Model *m, const int *ids, int n, float *logits, float *all_logits,
-                    const ImageRows *img, const Echo *echo) {
+ * as it comes; only one block of logits is ever held, not the prompt's.
+ * 0 when a served prompt's STOP or CANCEL stopped it before a block (prompt_break.h):
+ * the blocks before it are read and recorded, as complete as any step leaves them. */
+static int prefill(Model *m, const int *ids, int n, float *logits, float *all_logits,
+                   const ImageRows *img, const Echo *echo) {
     int chunk = env_int("MIMO_CHUNK", 64);
 #ifdef COLI_VULKAN
     /* the dense chain with a chunk from the budget (vkc_chunk_auto): blocks of its chunk,
@@ -1503,6 +1773,7 @@ static void prefill(Model *m, const int *ids, int n, float *logits, float *all_l
         echo_frame(echo, m->pos, ids[0], echo->first, V);
     }
     for (int b = 0; b < n; b += chunk) {
+        if (coli_prompt_break()) { free(rows); return 0; }
         int nb = n - b < chunk ? n - b : chunk;
         if (all_logits) forward(m, ids + b, nb, all_logits + (size_t)b * V, 1, img, &used);
         else if (rows) {
@@ -1517,6 +1788,7 @@ static void prefill(Model *m, const int *ids, int n, float *logits, float *all_l
     }
     free(rows);
     if (all_logits && logits) memcpy(logits, all_logits + (size_t)(n - 1) * V, (size_t)V * sizeof(float));
+    return 1;
 }
 
 /* ----------------------------------------------------------------- vision ---- */
@@ -1561,6 +1833,7 @@ static size_t dw_bytes(const DW *d) {
     case DW_BF16: return e * 2;
     case DW_FP8:  return e + (size_t)d->O * d->nblk * 4;
     case DW_I8:   return e + (size_t)d->O * 4;
+    case DW_GQ:   return (size_t)d->O * (size_t)gq_row_bytes(d->gqt, d->I);
     }
     return 0;
 }
@@ -1791,10 +2064,72 @@ static void mimo_dho_start(Model *m) {
         : "the embedding (its rows are gathered on the CPU), the routers, norms, the vision tower (on the CPU: COLI_VK_DENSE=1 puts it on the device)");
 }
 
+#endif
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+/* ---- the routed experts' tier on either device (XT: Vulkan's, or CUDA's: cu_tier.h) ---- */
+static int mimo_tier_block_elems(int fmt) {
+#ifdef COLI_CUDA
+    if (xt_cuda()) return coli_cuda_block_elems(fmt);
+#endif
+#ifdef COLI_VULKAN
+    return coli_vk_block_elems(fmt);
+#else
+    (void)fmt; return 0;
+#endif
+}
+#ifdef COLI_CUDA
+/* the dense matrices as the CUDA device would hold them (cu_dense.h): the head and the layers' */
+static size_t mimo_cu_w(const DW *d) { return dw_cu_fmt(d) >= 0 ? cud_bytes(dw_cu_fmt(d), d->O, d->I, 0) : 0; }
+static size_t mimo_cu_dense_bytes(const Model *m) {
+    size_t b = mimo_cu_w(&m->head);
+    for (int i = 0; i < m->c.n_layers; i++) {
+        const Layer *l = &m->L[i];
+        b += mimo_cu_w(&l->qkv) + mimo_cu_w(&l->o) + mimo_cu_w(&l->gate) + mimo_cu_w(&l->up) + mimo_cu_w(&l->down);
+    }
+    return b;
+}
+#endif
+/* what the dense part still puts on the tier's device: on CUDA, cu_dense.h's budget */
+static size_t mimo_tier_dense_bytes(const Model *m) {
+#ifdef COLI_CUDA
+    if (xt_cuda()) return g_mimo_cud;
+#endif
+#ifdef COLI_VULKAN
+    if (!xt_cuda())
+        return (g_mc_fit.L && vkc_fit_partial(&g_mc_fit) ? mc_kv_bytes_n(m, g_mc_fit.n) :   /* a partial chain: placed already, its caches to come */
+                (coli_vk_dense_device_only() ? 0 :   /* placed already (mimo_dho_start) */
+                 coli_vk_dense() ? vk_dense_bytes(m, 1) : g_vk_chain ? vk_dense_bytes(m, 0) : 0)) +
+               (g_vk_chain ? mc_kv_bytes(m) : 0);   /* the chain's KV caches */
+#endif
+    (void)m; return 0;
+}
 /* Is the expert in this layer's RAM cache now (the tier's balance asks)? */
 static int vk_in_ram(void *ctx, int li, int e) {
     const Model *m = ctx;
     return m->cache[li].by_expert && m->cache[li].by_expert[e] >= 0;
+}
+/* The tier's host pool took `bytes` of the RAM the expert cache was sized from (vk_tier.h,
+ * ram_given): fewer slots a layer, top-k at least (COLI_VK_TIER_HOST_GB sizes the pool
+ * instead, and the cache keeps its size). */
+static void vk_ram_given(void *ctx, size_t bytes) {
+    Model *m = ctx;
+    const Cfg *c = &m->c;
+    int L = 0, was = 0, now = 0;
+    for (int i = 0; i < c->n_layers; i++) L += c->moe[i] && m->cache[i].s != NULL;
+    if (L < 1 || !m->e_bytes) return;
+    const size_t per = (size_t)(m->e_bytes + 8192) * (size_t)L;
+    const int cut = (int)((bytes + per - 1) / per);
+    for (int i = 0; i < c->n_layers; i++) {
+        LCache *lc = &m->cache[i];
+        if (!c->moe[i] || !lc->s) continue;
+        int cap = lc->cap - cut;
+        if (cap < c->topk) cap = c->topk;
+        if (cap < lc->n) cap = lc->n;   /* slots filled already stay */
+        if (cap > lc->cap) cap = lc->cap;
+        was = lc->cap; now = cap; lc->cap = cap;
+    }
+    fprintf(stderr, "%s mimo: the tier's host pool took %.1f GiB of the RAM the expert cache was sized from: %d slots a layer, not %d\n", XT_TAG,
+            bytes / 1073741824.0, now, was);
 }
 
 /* The routed experts on the shared tier (vk_tier.c): the release's MXFP4 with its
@@ -1806,31 +2141,107 @@ static int vk_in_ram(void *ctx, int li, int e) {
  * budget applies. */
 static void vk_tier_start(Model *m) {
     Cfg *c = &m->c;
-    VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
+    VktFmt f = {VKT_SRC_MXFP4_E8M0, 32}, fd = f, *lgu = NULL, *ldn = NULL;
+    if (m->gxq) {
+        /* a GGUF's experts go to the device as the file has them (shaders/blockdec.glsl), each
+         * layer its types; the commonest pair is the main form, the layers without experts take it */
+        const int L = c->n_layers;
+        const char *no = NULL;
+        lgu = malloc((size_t)L * sizeof *lgu); ldn = malloc((size_t)L * sizeof *ldn);
+        if (!lgu || !ldn) no = "out of memory";
+        for (int l = 0; !no && l < L; l++) {
+            if (!c->moe[l]) continue;
+            const int *t3 = m->gx_t + 3 * l, bg = mimo_tier_block_elems(100 + t3[1]), bd = mimo_tier_block_elems(100 + t3[0]);
+            if (t3[1] != t3[2]) no = "gate and up differ in type";
+            else if (!bg || !bd || c->hidden % bg || c->moe_inter % bd) no = "a type without a device form";
+            lgu[l] = (VktFmt){(VktSrc)(VKT_SRC_GGML + t3[1]), 0};
+            ldn[l] = (VktFmt){(VktSrc)(VKT_SRC_GGML + t3[0]), 0};
+        }
+        int best = -1, bestn = 0, forms = 0, sparse = 0;
+        for (int l = 0; !no && l < L; l++) {
+            if (!c->moe[l]) continue;
+            int n = 0, seen = 0;
+            sparse++;
+            for (int j = 0; j < L; j++)
+                if (c->moe[j] && lgu[j].kind == lgu[l].kind && ldn[j].kind == ldn[l].kind) { n++; if (j < l) seen = 1; }
+            forms += !seen;
+            if (n > bestn) { bestn = n; best = l; }
+        }
+        if (!no && best < 0) no = "no layer with experts";
+        if (!no && forms > VKT_FORMS - 1) no = "more distinct types than the tier holds";
+        if (no) {
+            fprintf(stderr, "%s tier mimo: the GGUF's experts stay on the CPU (%s)\n", XT_TAG, no);
+            free(lgu); free(ldn);
+            return;
+        }
+        for (int l = 0; l < L; l++) if (!c->moe[l]) { lgu[l] = lgu[best]; ldn[l] = ldn[best]; }
+        f = lgu[best]; fd = ldn[best];
+        fprintf(stderr, "%s tier mimo: the GGUF experts' blocks go to the device as the file has them (%s gate/up, %s down", XT_TAG,
+                gq_type_name(m->gx_t[3 * best + 1]), gq_type_name(m->gx_t[3 * best]));
+        if (forms > 1) fprintf(stderr, " on %d of %d layers, the others their own types", bestn, sparse);
+        fprintf(stderr, ")\n");
+        if (forms == 1) { free(lgu); free(ldn); lgu = ldn = NULL; }
+    }
     const char *mx = getenv("MIMO_VK_EXPERTS"), *gb = getenv("COLI_VK_TIER_GB");
     if (mx && *mx && atoi(mx) > 0 && !(gb && *gb)) {
-        size_t eb = vkt_expert_bytes(c->hidden, c->moe_inter, f, f);
+        size_t eb = XT(expert_bytes)(c->hidden, c->moe_inter, f, fd);
         char buf[64];
         snprintf(buf, sizeof(buf), "%.12g", ((double)atoi(mx) * eb + eb / 2) / 1073741824.0);
         setenv("COLI_VK_TIER_GB", buf, 1);
-        fprintf(stderr, "[VK] mimo: MIMO_VK_EXPERTS=%s read as a tier budget of %s experts (COLI_VK_TIER_GB=%s)\n",
+        fprintf(stderr, "%s mimo: MIMO_VK_EXPERTS=%s read as a tier budget of %s experts (COLI_VK_TIER_GB=%s)\n", XT_TAG,
                 mx, mx, buf);
     }
     int cap = 0, nmoe = 0;
     for (int li = 0; li < c->n_layers; li++) if (c->moe[li]) { nmoe++; if (m->cache[li].cap > cap) cap = m->cache[li].cap; }
+    /* the KV caches kv_alloc made (a sliding layer's ring, a full layer's context), each
+     * conversation's: RAM only once written, so the free RAM the host pool is sized from
+     * does not show them yet (#2314) */
+    size_t later = 0;
+    for (int li = 0; li < c->n_layers; li++) {
+        const int k = c->swa[li];
+        later += (size_t)m->L[li].rows * c->kv_heads[k] * ((size_t)c->head_dim[k] + c->v_dim[k]) * sizeof(float);
+    }
+    later *= (size_t)(g_mimo_mux_slots > 1 ? g_mimo_mux_slots : 1);
     VktConfig vc = {.engine = "mimo", .layers = c->n_layers, .experts = c->n_experts,
                     .hidden = c->hidden, .inter = c->moe_inter, .topk = c->topk,
-                    .gate_up = f, .down = f, .act = VKT_ACT_SWIGLU,
+                    .gate_up = f, .down = fd, .layer_gate_up = lgu, .layer_down = ldn, .act = VKT_ACT_SWIGLU,
                     .max_rows = MIMO_VK_ROWS * c->topk,
                     .ram_reserve = (size_t)(m->e_bytes + 8192) * (size_t)cap * (size_t)nmoe,
-                    .dense_bytes = g_mc_fit.L && vkc_fit_partial(&g_mc_fit) ? mc_kv_bytes_n(m, g_mc_fit.n) :   /* a partial chain: placed already, its caches to come */
-                                   (coli_vk_dense_device_only() ? 0 :   /* placed already (mimo_dho_start) */
-                                    coli_vk_dense() ? vk_dense_bytes(m, 1) : g_vk_chain ? vk_dense_bytes(m, 0) : 0) +
-                                   (g_vk_chain ? mc_kv_bytes(m) : 0),   /* the chain's KV caches */
+                    .ram_floor = (size_t)(m->e_bytes + 8192) * (size_t)c->topk * (size_t)nmoe, .ram_given = vk_ram_given,
+                    .ram_later = later,
+                    .dense_bytes = mimo_tier_dense_bytes(m),
                     .in_ram = vk_in_ram, .ram_ctx = m,
                     .load = mimo_vk_load, .release = mimo_vk_release, .load_ctx = m, .load_batch = mimo_vk_load_batch};
-    atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
-    if (vkt_init(&vc, NULL)) atexit(vkt_shutdown);
+#ifdef COLI_VULKAN
+    if (!xt_cuda()) atexit(coli_vk_shutdown);   /* before the tier's start, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
+#endif
+    const int on = XT(init)(&vc, rt_counts_all());
+    free(lgu); free(ldn);   /* read during XT(init) only */
+    if (!on) return;
+    atexit(XT(shutdown));
+    /* the warm start: the history's experts (and, with COLI_VK_TIER_FILL, more) read and put
+     * before the first prompt, in parallel; COLI_VK_TIER_WARM=0 lets the tier fill as experts
+     * pass by */
+    const int all = c->n_layers * c->n_experts;
+    int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));
+    const char *warm = getenv("COLI_VK_TIER_WARM");
+    const int n = pl && pe && !(warm && *warm == '0') ? XT(plan)(pl, pe, all) : 0;
+    if (n > 0) {
+        const uint64_t hits = m->hits, miss = m->miss, bytes = m->bytes_read;   /* warm reads are not the run's misses */
+        const double t0 = now_s();
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int i = 0; i < n; i++) {
+            Slot tmp; memset(&tmp, 0, sizeof tmp); tmp.eid = -1;
+            expert_read(m, pl[i], pe[i], &tmp);
+            VktExpertSrc src = mimo_vk_src(m, pl[i], tmp.buf);
+            XT(put)(pl[i], pe[i], &src);
+            compat_aligned_free(tmp.base);   /* expert_read's posix_memalign: _aligned_malloc on Windows (compat.h), never free() */
+        }
+        XT(put_done)();
+        m->hits = hits; m->miss = miss; m->bytes_read = bytes;
+        XT(warm_report)("mimo", n, now_s() - t0);
+    }
+    free(pl); free(pe);
 }
 #endif
 
@@ -2037,7 +2448,7 @@ static void serve_emap(Model *m) {
     for (int li = 0; li < c->n_layers; li++) {
         if (!c->moe[li]) continue;
         for (int e = 0; e < cols; e++) {
-            int byte = (vkt_resident(li, e) ? 2 : m->cache[li].by_expert[e] >= 0) << 6;   /* 2 = on the Vulkan device */
+            int byte = (XT(resident)(li, e) ? 2 : m->cache[li].by_expert[e] >= 0) << 6;   /* 2 = on the Vulkan device */
             hex[w++] = "0123456789abcdef"[byte >> 4];
             hex[w++] = "0123456789abcdef"[byte & 15];
         }
@@ -2086,8 +2497,61 @@ typedef struct { double started, disk0, expert0, attn0; uint64_t hits0, miss0, f
  * the image, the prefix reuse and the photos, ACCEPT, the prefill and its read-out.
  * 1 with the logits after the prompt; 0 when the request ended here, its ERROR written
  * and its command disposed. serve_loop and serve_mux start every request here. */
+/* A lone request's prompt reads its STOP or CANCEL between two blocks, the way its decode
+ * loop does between two tokens: control 1 CANCEL, 2 STOP. The multiplexed loop owns its
+ * command stream and reads it between steps. */
+static int mimo_prompt_poll(ColiPromptBreak *b) {
+    while (!b->control && !b->eof && coli_serve_stdin_ready()) {
+        ColiServeCommand control;
+        ColiServeReadResult inner = coli_serve_read_command(stdin, &mimo_wire, &control);
+        if (inner == COLI_SERVE_READ_EOF) { b->eof = 1; break; }
+        if (control.kind == COLI_SERVE_COMMAND_CANCEL && !strcmp(control.id, b->id)) b->control = 1;
+        else if (control.kind == COLI_SERVE_COMMAND_STOP && !strcmp(control.id, b->id)) b->control = 2;
+        else if (control.kind == COLI_SERVE_COMMAND_SUBMIT) coli_serve_write_error(stdout, control.id, "SLOT_BUSY");
+        coli_serve_command_dispose(&control);
+    }
+    return b->control;
+}
+
+/* A short request between two turns of the conversation the lone serve holds (park.h): every
+ * layer's first K and V rows (a sliding layer's ring rows) and their positions, back when the
+ * next request arrives; the host's caches stay canonical, the chains' watermarks come down. */
+static ColiPark g_mimo_park;
+static ColiParkPart *mimo_park_parts(Model *m, int *n_out) {
+    Cfg *c = &m->c; int n = 0;
+    ColiParkPart *p = malloc(sizeof *p * ((size_t)c->n_layers * 3));
+    if (!p) { *n_out = 0; return NULL; }
+    for (int li = 0; li < c->n_layers; li++) {
+        Layer *l = &m->L[li]; int k = c->swa[li];
+        p[n++] = coli_park_rows(l->K, (size_t)c->kv_heads[k] * c->head_dim[k] * sizeof(float), l->rows);
+        p[n++] = coli_park_rows(l->V, (size_t)c->kv_heads[k] * c->v_dim[k] * sizeof(float), l->rows);
+        p[n++] = coli_park_rows(l->ring_pos, sizeof(int), l->rows);
+    }
+    *n_out = n;
+    return p;
+}
+static int mimo_park(Model *m, int np, int max_tok) {   /* the rows kept apart, 0: not parked */
+    int n = g_mimo_mux_slots == 1 ? coli_park_rows_for(&g_mimo_park, &m->kvp, m->pos, np, max_tok, 16) : 0, k = 0;
+    if (!n) return 0;
+    ColiParkPart *p = mimo_park_parts(m, &k);
+    int ok = p && coli_park_save(&g_mimo_park, &m->kvp, m->pos, p, k, n);
+    free(p);
+    return ok ? n : 0;
+}
+static void mimo_unpark(Model *m) {
+    if (!g_mimo_park.on) return;
+    int k = 0;
+    ColiParkPart *p = mimo_park_parts(m, &k);
+    if (p && coli_park_restore(&g_mimo_park, &m->kvp, &m->pos, m->pos, 16, p, k)) {
+#ifdef COLI_VULKAN
+        mc_cpu_step(m, 0);   /* the host's rows from 0 are the conversation's again: the mirrors go up again */
+#endif
+    } else coli_park_free(&g_mimo_park);
+    free(p);
+}
+
 static int mimo_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int *ids, float *logits,
-                            float **pending, int *pending_h, int *pending_w, MimoReq *rq) {
+                            float **pending, int *pending_h, int *pending_w, MimoReq *rq, int lone) {
     Cfg *c = &m->c;
     double started = now_s();
     double disk0 = m->t_disk, expert0 = m->t_expert, attn0 = m->t_attn;
@@ -2155,7 +2619,11 @@ static int mimo_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int
         fprintf(stderr, "[PIN] resumed from the photo of %d tokens, %d to prefill\n", reuse, n_prompt - reuse);
         fflush(stderr);
     }
-    if (!reuse) model_reset(m);
+    if (!reuse) {
+        /* a short request keeps the conversation (mimo_unpark): only the rows it reaches start over */
+        int parked = lone && !(*pending) ? mimo_park(m, n_prompt, cmd->max_tokens) : 0;
+        model_reset_rows(m, parked ? parked : -1);
+    }
     coli_serve_write_accept(stdout, cmd->id, n_prompt);
     if ((*pending)) {
         image = vision_run(m, (*pending), (*pending_h), (*pending_w), &image_rows);
@@ -2163,9 +2631,25 @@ static int mimo_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int
     }
     ImageRows img = { image, image_rows };
     Echo echo = { cmd->id, cmd->logprobs, tokenizer, pin_logit };
-    prefill(m, ids + reuse, n_prompt - reuse, logits, NULL, image ? &img : NULL,
-            cmd->logprobs > 0 ? &echo : NULL);
+    ColiPromptBreak brk = { .poll = mimo_prompt_poll, .id = cmd->id };
+    if (lone && cmd->logprobs == 0) g_coli_prompt_break = &brk;
+    int read = prefill(m, ids + reuse, n_prompt - reuse, logits, NULL, image ? &img : NULL,
+                       cmd->logprobs > 0 ? &echo : NULL);
+    g_coli_prompt_break = NULL;
     if (image) kv_prefix_taint(&m->kvp);
+    if (!read) {
+        /* what was read stays the conversation's state: a request that sends it again reuses it */
+        coli_prompt_break_log(brk.control == 1, m->kvp.len, n_prompt);
+        if (brk.control == 1) coli_serve_write_error(stdout, cmd->id, "CANCELLED");
+        else {
+            ColiServeDone done = { 0, 0.0, 0.0, rss_gb(), n_prompt, 0 };
+            coli_serve_write_done(stdout, cmd->id, &done);
+        }
+        fflush(stdout);
+        free(image);
+        coli_serve_command_dispose(cmd);
+        return 0;
+    }
     if (cmd->pin) {
         /* a photo is described by its ids, and these do not describe the picture */
         if (image) fprintf(stderr, "[PIN] no photo: the prompt carries a picture\n");
@@ -2301,7 +2785,7 @@ static void serve_mux(Model *m, Tok *tokenizer, const char *dir) {
                 snprintf(t->id, sizeof t->id, "%s", command.id);
                 t->temperature = command.temperature; t->top_p = command.top_p; t->logprobs = command.logprobs;
                 mimo_mux_bind(m, command.slot);
-                if (mimo_serve_start(m, tokenizer, &command, ids, t->logits, &pending, &pending_h, &pending_w, &t->rq)) {
+                if (mimo_serve_start(m, tokenizer, &command, ids, t->logits, &pending, &pending_h, &pending_w, &t->rq, 0)) {
                     t->active = 1; t->limited = 1;
                     coli_serve_command_dispose(&command);
                 }
@@ -2325,7 +2809,7 @@ static void serve_mux(Model *m, Tok *tokenizer, const char *dir) {
         }
         if (ended) {
             serve_emap(m);
-            vkt_report("turn", m->hits, m->miss);
+            XT(report)("turn", m->hits, m->miss);
         }
     }
     fprintf(stderr, "[mimo] KV_SLOTS=%d: %llu decode steps, %llu rows (%.2f a step)\n", n, steps, nrows,
@@ -2384,7 +2868,8 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *dir) {
             continue;
         }
         MimoReq rq;
-        if (!mimo_serve_start(m, tokenizer, &command, ids, logits, &pending, &pending_h, &pending_w, &rq)) continue;
+        mimo_unpark(m);   /* a conversation the last request parked: back first */
+        if (!mimo_serve_start(m, tokenizer, &command, ids, logits, &pending, &pending_h, &pending_w, &rq, 1)) continue;
         double started = rq.started;
         double disk0 = rq.disk0, expert0 = rq.expert0, attn0 = rq.attn0;
         uint64_t hits0 = rq.hits0, miss0 = rq.miss0, fw0 = rq.fw0;
@@ -2433,7 +2918,7 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *dir) {
                    (unsigned long long)(m->forwards - fw0));
         serve_hits(m);
         serve_emap(m);
-        vkt_report("turn", m->hits, m->miss);   /* the Vulkan tier's line, when it runs */
+        XT(report)("turn", m->hits, m->miss);   /* the Vulkan tier's line, when it runs */
 #ifdef COLI_VULKAN
         mc_report(m, "turn");
 #endif
@@ -2447,10 +2932,13 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *dir) {
 /* Once, at the end: how many products the GPU actually took, so a run that
  * asked for Vulkan and quietly stayed on the CPU says so. */
 static void vk_report(const Model *m) {
+#ifdef COLI_CUDA
+    if (xt_cuda()) { cut_report("run", m->hits, m->miss); cud_report("mimo"); return; }
+#endif
 #ifdef COLI_VULKAN
     if (!g_vk_ready) return;
     fprintf(stderr, "[VK] mimo: %llu matmuls on the GPU\n", coli_vk_matmul_calls());
-    vkt_report("run", m->hits, m->miss);
+    XT(report)("run", m->hits, m->miss);
     mc_report((Model *)m, "run");
 #else
     (void)m;
@@ -2478,6 +2966,19 @@ static int is_dir(const char *path) {
 }
 
 int main(int argc, char **argv) {
+#if defined(COLI_CUDA) && defined(COLI_VULKAN)
+    {   /* A build with both backends runs on Vulkan, the same card, when CUDA was asked for
+         * (COLI_CUDA=1) and COLI_VULKAN was not set: the dense chain runs a layer's work on the card in one
+         * frame, where the CUDA path (cu_dense.h) takes a matrix at a time. COLI_VULKAN=0 keeps the CUDA
+         * tier; without a Vulkan device the CUDA tier still starts. */
+        const char *cu = getenv("COLI_CUDA"), *vk = getenv("COLI_VULKAN");
+        if (cu && atoi(cu) && !(vk && *vk)) {
+            setenv("COLI_VULKAN", "1", 1);
+            fprintf(stderr, "[CUDA] mimo: a build with Vulkan runs on it, the same card, its dense chain and expert tier "
+                            "(COLI_VULKAN=0 keeps the CUDA tier)\n");
+        }
+    }
+#endif
     coli_omp_tune_threads("mimo");
     /* Two ways in. The gateway: SNAP=<dir> mimo <cap>, SERVE=1. By hand and in
      * the tests: mimo <dir> [--ids "..." | --prompt "..."] [--ngen N] [--cap N]. */
@@ -2514,6 +3015,7 @@ int main(int argc, char **argv) {
     if (cap <= 0) cap = 64;
     model_load(m, dir, cap);
     Cfg *c = &m->c;
+    mimo_telemetry_init(dir, c);
     g_vision = vision_load(m, dir);
 #ifdef COLI_VULKAN
     /* after the weights, so a missing device costs one line and nothing else; the
@@ -2524,7 +3026,7 @@ int main(int argc, char **argv) {
         int any_moe = 0;
         for (int i = 0; i < c->n_layers; i++) any_moe |= c->moe[i];
         const char *mx = getenv("MIMO_VK_EXPERTS");
-        int tier = vkt_wanted() && any_moe && !(mx && *mx && atoi(mx) <= 0);   /* MIMO_VK_EXPERTS=0: experts on the CPU */
+        int tier = XT(wanted)() && any_moe && !(mx && *mx && atoi(mx) <= 0);   /* MIMO_VK_EXPERTS=0: experts on the CPU */
         g_vk_ready = coli_vk_init_env_tier("mimo", tier);
         /* COLI_VK_CHAIN: every layer's dense chain on the device (mimo_chain.h), decided
          * before the tier so the tier's budget leaves the trunk room. Not measured on a
@@ -2550,7 +3052,7 @@ int main(int argc, char **argv) {
         mimo_dho_start(m);   /* COLI_VK_DENSE_HOST: the dense matrices on the device only, before the tier sizes its budget */
         if (g_vk_chain && vkc_fit_partial(&g_mc_fit) && !g_mc_placed) mc_place(m, NULL);   /* before the tier, too */
         if (g_vk_ready && tier) vk_tier_start(m);
-        if (g_vk_ready && !vkt_ready() && !coli_vk_dense()) coli_vk_dense_decide("mimo", 0, 1);   /* no tier after all */
+        if (g_vk_ready && !XT(ready)() && !coli_vk_dense()) coli_vk_dense_decide("mimo", 0, 1);   /* no tier after all */
         if (g_vk_chain) {   /* the chain's teardown before the device's (the tier registered the device's) */
             if (!tier) atexit(coli_vk_shutdown);
             atexit(vkc_shutdown_all);
@@ -2561,6 +3063,25 @@ int main(int argc, char **argv) {
         size_t used = 0, count = 0;
         coli_vk_mem_info(&used, &count);
         fprintf(stderr, "[VK] mimo: %d dense matrices on the GPU (%.2f GB)\n", up, used / 1e9);
+    }
+#endif
+#ifdef COLI_CUDA
+    {   /* COLI_CUDA=1 with no Vulkan tier: the CUDA device opens for the routed experts, the same
+         * tier (cu_tier.h) holds them, and the dense matrices go there too as far as their budget
+         * goes (cu_dense.h), which the tier leaves them */
+        const char *cu = getenv("COLI_CUDA"), *mx = getenv("MIMO_VK_EXPERTS");
+        int any_moe = 0, dev = 0;
+        for (int i = 0; i < c->n_layers; i++) any_moe |= c->moe[i];
+        if (cu && atoi(cu) && !vkt_ready() && any_moe && !(mx && *mx && atoi(mx) <= 0) && cut_wanted()) {
+            if (!coli_cuda_init(&dev, 1)) fprintf(stderr, "[CUDA] mimo: no CUDA device, the routed experts stay on the CPU\n");
+            else {
+                g_mimo_cu = 1;
+                xt_use_cuda(1);
+                g_mimo_cud = cud_open("mimo", coli_cuda_device_at(0), mimo_cu_dense_bytes(m));
+                vk_tier_start(m);
+                if (!cut_ready()) { xt_use_cuda(0); g_mimo_cu = 0; g_cud.on = 0; }
+            }
+        }
     }
 #endif
     int swa = 0, shown_cap = 0;

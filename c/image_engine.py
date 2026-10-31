@@ -103,6 +103,13 @@ def describe_exit(code):
     return f"exit code {code}"
 
 
+def _prompt_byte_length(prompt):
+    try:
+        return len(prompt.encode("utf-8"))
+    except UnicodeEncodeError as error:
+        raise ImageRequestError("`prompt` must contain valid Unicode text.", "prompt") from error
+
+
 class ImageEngine:
     """One engine process and the one request it can work on at a time.
 
@@ -290,7 +297,7 @@ class ImageEngine:
         polled between frames and on every idle tick; with `interruptible` the
         first Ctrl-C sends CANCEL and keeps waiting (the engine is still busy
         until it answers), the second one propagates."""
-        if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+        if _prompt_byte_length(prompt) > MAX_PROMPT_BYTES:
             raise ImageRequestError(f"`prompt` is longer than {MAX_PROMPT_BYTES} bytes.", "prompt")
         with self.lock:
             if self.dead:
@@ -349,7 +356,8 @@ class ImageEngine:
                         finished = True          # the engine is done with this request
                         width_out, height_out = body.get("width"), body.get("height")
                         channels = body.get("channels", 4)
-                        if (not isinstance(width_out, int) or not isinstance(height_out, int) or
+                        if (isinstance(width_out, bool) or isinstance(height_out, bool) or
+                                not isinstance(width_out, int) or not isinstance(height_out, int) or
                                 channels != 4 or len(payload) != width_out * height_out * 4):
                             raise ImageEngineError(
                                 f"IMAGE frame does not describe its payload ({width_out}x{height_out}"
@@ -502,7 +510,7 @@ def image_request(body, info):
     prompt = body.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise ImageRequestError("`prompt` must be a non-empty string.", "prompt")
-    if len(prompt.encode("utf-8", "surrogatepass")) > MAX_PROMPT_BYTES:
+    if _prompt_byte_length(prompt) > MAX_PROMPT_BYTES:
         raise ImageRequestError(f"`prompt` is longer than {MAX_PROMPT_BYTES} bytes.", "prompt")
     n = body.get("n", 1)
     if n is not None and (isinstance(n, bool) or n != 1):
@@ -642,8 +650,13 @@ def decode_png(data):
                          f"interlace {interlace}); 8-bit grey/RGB/RGBA only")
     channels = _CHANNELS[color]
     stride = width * channels
-    raw = zlib.decompress(b"".join(idat))
-    if len(raw) != (stride + 1) * height:
+    expected = (stride + 1) * height
+    decompressor = zlib.decompressobj()
+    try:
+        raw = decompressor.decompress(b"".join(idat), expected + 1)
+    except zlib.error as error:
+        raise ValueError(f"invalid PNG image data: {error}") from error
+    if len(raw) != expected or not decompressor.eof:
         raise ValueError("PNG image data has the wrong length")
     _sub, add = _swar(stride)
     out = bytearray(stride * height)
@@ -701,16 +714,40 @@ def save_png(png, prompt, seed, directory=None, now=None):
     os.makedirs(directory, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
     stem = f"{stamp}-{_slug(prompt)}-s{seed}"
-    path = os.path.join(directory, stem + ".png")
-    counter = 2
-    while os.path.exists(path):
-        path = os.path.join(directory, f"{stem}-{counter}.png")
+    counter = 1
+    while True:
+        suffix = "" if counter == 1 else f"-{counter}"
+        path = os.path.join(directory, f"{stem}{suffix}.png")
         counter += 1
-    temporary = path + f".{os.getpid()}.tmp"
-    with open(temporary, "wb") as handle:
-        handle.write(png)
-    os.replace(temporary, path)
-    return path
+        if os.path.exists(path):
+            continue
+        # Cooperating saves reserve names before publishing complete PNGs.
+        # An abandoned reservation merely skips that name; no stale-file deletion.
+        reservation = path + ".reserve"
+        try:
+            descriptor = os.open(reservation, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            continue
+        temporary = None
+        try:
+            os.close(descriptor)
+            if os.path.exists(path):
+                continue
+            temp_path = path + f".{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(temp_path, "wb") as handle:
+                temporary = temp_path
+                handle.write(png)
+            os.replace(temporary, path)
+            return path
+        finally:
+            try:
+                if temporary is not None:
+                    try:
+                        os.unlink(temporary)
+                    except FileNotFoundError:
+                        pass
+            finally:
+                os.unlink(reservation)
 
 
 # ---------------------------------------------------------------- the model
@@ -739,11 +776,27 @@ def _tensors(path):
         if length < 2 or length > size - 8:
             raise ValueError(f"invalid safetensors header length: {path}")
         header = json.loads(stream.read(length))
+    if not isinstance(header, dict):
+        raise ValueError(f"safetensors header is not an object: {path}")
+    payload_size = size - 8 - length
     for name, meta in header.items():
         if name == "__metadata__":
             continue
-        start, end = meta["data_offsets"]
-        yield name, meta.get("dtype", "?"), tuple(meta.get("shape") or ()), end - start
+        if not isinstance(meta, dict):
+            raise ValueError(f"invalid tensor metadata for {name}: {path}")
+        offsets, shape, dtype = meta.get("data_offsets"), meta.get("shape"), meta.get("dtype")
+        if (not isinstance(offsets, list) or len(offsets) != 2 or
+                any(isinstance(v, bool) or not isinstance(v, int) for v in offsets)):
+            raise ValueError(f"invalid tensor offsets for {name}: {path}")
+        start, end = offsets
+        if not 0 <= start <= end <= payload_size:
+            raise ValueError(f"tensor offsets exceed payload for {name}: {path}")
+        if (not isinstance(shape, list) or
+                any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in shape)):
+            raise ValueError(f"invalid tensor shape for {name}: {path}")
+        if not isinstance(dtype, str):
+            raise ValueError(f"invalid tensor dtype for {name}: {path}")
+        yield name, dtype, tuple(shape), end - start
 
 
 def _quantized_bytes(shape, nbytes, dtype):
@@ -769,7 +822,7 @@ def inspect_image_model(model_dir):
 
     The numbers in RAM follow the engine's contract: the language model of the
     text encoder and the DiT are quantized at load to int8 with a per-row scale;
-    the VAE stays f32 as shipped. The text encoder's vision tower and lm_head
+    the VAE is converted to f32 at load. The text encoder's vision tower and lm_head
     are never loaded (text-to-image only reads the language model's hidden
     states), so they count on disk and not in RAM."""
     root = Path(model_dir).expanduser()
@@ -807,7 +860,7 @@ def inspect_image_model(model_dir):
                 elif name == "transformer":
                     resident += _quantized_bytes(shape, nbytes, dtype)
                 elif name == "vae":
-                    resident += nbytes
+                    resident += elements * 4
         entry.update(params=params, dtypes=sorted(dtypes), resident_bytes=resident)
         if name == "text_encoder":
             entry["precision"] = "int8"
@@ -815,7 +868,7 @@ def inspect_image_model(model_dir):
         elif name == "transformer":
             entry["precision"] = "int8"
         elif name == "vae":
-            entry["precision"] = "/".join(d.lower() for d in sorted(dtypes)) or None
+            entry["precision"] = "f32" if dtypes else None
         components[name] = entry
     tokenizer = root / TOKENIZER_FILE
     license_text = ""

@@ -39,6 +39,11 @@ layout(constant_id = 0) const int BC = 8;
 layout(std430, binding = 0) readonly buffer QB { float q[]; };
 layout(std430, binding = 1) readonly buffer KB { float kc[]; };
 layout(std430, binding = 2) readonly buffer VB { float vc[]; };
+layout(constant_id = 7) const bool KV16 = false;   // K and V float16, two a word (vk_chain.c's vkc_attn_h)
+layout(std430, binding = 1) readonly buffer KBH { uint kch[]; };
+layout(std430, binding = 2) readonly buffer VBH { uint vch[]; };
+float kf(int i) { return KV16 ? unpackHalf2x16(kch[i >> 1])[i & 1] : kc[i]; }
+float vf(int i) { return KV16 ? unpackHalf2x16(vch[i >> 1])[i & 1] : vc[i]; }
 layout(std430, binding = 3) buffer OB { float o[]; };
 layout(std430, binding = 4) readonly buffer GB { float gt[]; };
 layout(std430, binding = 5) readonly buffer LB { int sel[]; };
@@ -119,7 +124,7 @@ void main() {
             float kv = 0.0;
             if (t >= 0) {
                 int rr = p.ring > 0 ? t % p.ring : t;
-                kv = kc[p.k_off + (p.kv_pm != 0 ? rr * p.KVH + kvh : kbase + rr) * p.hd + d];
+                kv = kf(p.k_off + (p.kv_pm != 0 ? rr * p.KVH + kvh : kbase + rr) * p.hd + d);
             }
             ks[j * 256 + d] = kv;
         }
@@ -128,7 +133,7 @@ void main() {
             float vv = 0.0;
             if (t >= 0) {
                 int rr = p.ring > 0 ? t % p.ring : t;
-                vv = vc[p.v_off + (p.kv_pm != 0 ? rr * p.KVH + kvh : kbase + rr) * p.vd + d];
+                vv = vf(p.v_off + (p.kv_pm != 0 ? rr * p.KVH + kvh : kbase + rr) * p.vd + d);
             }
             vs[j * 256 + d] = vv;
         }

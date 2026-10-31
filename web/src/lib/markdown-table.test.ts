@@ -19,6 +19,17 @@ describe("splitting a row into cells", () => {
   it("does not strip a trailing escaped pipe as a delimiter", () => {
     expect(splitRow("| a | b \\|")).toEqual(["a", "b |"])
   })
+
+  it("splits on a pipe after an even run of backslashes, keeping them", () => {
+    expect(splitRow("| a \\\\| b |")).toEqual(["a \\\\", "b"])
+    expect(splitRow("| a | b \\\\|")).toEqual(["a", "b \\\\"])
+    expect(splitRow("| a \\\\\\| b |")).toEqual(["a \\\\| b"])
+  })
+
+  it("leaves backslashes that escape no pipe as written", () => {
+    expect(splitRow("| `\"\\\\d+\"` | digits |")).toEqual(["`\"\\\\d+\"`", "digits"])
+    expect(splitRow("| C:\\temp | x |")).toEqual(["C:\\temp", "x"])
+  })
 })
 
 describe("recognising the delimiter row", () => {
@@ -66,6 +77,11 @@ describe("parsing a table out of a line array", () => {
 
   it("is null when the second line is not a delimiter", () => {
     expect(parseTableAt(["a | b", "c | d"], 0)).toBeNull()
+  })
+
+  it("is null when the delimiter row has a different number of cells than the header", () => {
+    expect(parseTableAt(["Run `cat log | grep error` to filter.", "---"], 0)).toBeNull()
+    expect(parseTableAt(["| a | b |", "|---|---|---|"], 0)).toBeNull()
   })
 
   it("is null for a line with no pipe, and past the end", () => {

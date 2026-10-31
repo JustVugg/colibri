@@ -222,6 +222,13 @@ endif
 # CUDA=1, whose tier keeps running first when both are built. vk_tier_v4.o is the
 # routed-expert tier (vk_tier.c) under the same rule, and expert_act*.spv are its
 # shaders (expert_act_v4.spv: DeepSeek V4's activation).
+# The routed-expert tier on the CUDA device (cu_tier.h): the parent Makefile's CUDA objects
+# (backend_cuda.o, cuda_chain.o, cu_xb.o, cu_tier.o), passed by its deepseek-v4 target.
+V4_CUT_OBJS ?=
+ifneq ($(strip $(V4_CUT_OBJS)),)
+CFLAGS += -DCOLI_CUDA
+LDFLAGS += -lcublas
+endif
 VK ?= 0
 GLSLC ?= glslc
 V4_VK_OBJ =
@@ -240,7 +247,7 @@ V4_VK_SPV = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv \
 # the dense chain (vk_chain.c, deepseek_v4_chain.h: COLI_VK_CHAIN) and its shaders
 V4_VK_OBJ += vk_chain_v4.o
 V4_VK_SPV += shaders/chain_norm.spv shaders/chain_rope.spv shaders/chain_attn.spv \
-	shaders/chain_dnconv.spv shaders/chain_dnrec.spv shaders/chain_ew.spv \
+	shaders/chain_dnconv.spv shaders/chain_dnconv_rows.spv shaders/chain_dnrec.spv shaders/chain_ew.spv \
 	shaders/chain_qsa.spv shaders/chain_ple.spv shaders/chain_gemv.spv \
 	shaders/chain_mla.spv shaders/chain_hgemv.spv shaders/chain_dsa.spv \
 	shaders/chain_kda.spv shaders/chain_mhc.spv shaders/chain_dsv4.spv
@@ -252,7 +259,7 @@ TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
 TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
 V4_HOT_TEST_OBJ = COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16_TEST.o
 V4_BATCH_TEST_OBJ = COLI_V4_UNIT_NATIVE_QUANT_BATCH_TEST.o
-V4_OBJS = $(TARGET_OBJS) $(V4_WIN_EXTRA_OBJS) $(REGISTRY_OBJ) $(V4_VK_OBJ)
+V4_OBJS = $(TARGET_OBJS) $(V4_WIN_EXTRA_OBJS) $(REGISTRY_OBJ) $(V4_VK_OBJ) $(V4_CUT_OBJS)
 REGISTRY_OBJ = expert_store_registry.o
 V4_SERVE_TEST := tests/test_v4_serve_framing$(if $(IS_WIN),.exe,)
 V4_SERVE_TEST_OBJS := $(filter-out COLI_V4_UNIT_GENERATE_STATS.o,$(V4_OBJS))
@@ -317,13 +324,14 @@ $(V4_BINARY): $(V4_OBJS) $(V4_VK_SPV)
 # VK=1: the Vulkan backend compiled with this engine's flags, and the shaders.
 backend_vulkan_v4.o: backend_vulkan.c backend_vulkan.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
-vk_tier_v4.o: vk_tier.c vk_tier.h backend_vulkan.h tier.h $(V4_FLAGS_STAMP)
+vk_tier_v4.o: vk_tier.c vk_tier.h backend_vulkan.h tier.h ggml_quants.h ggml_grids.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -c vk_tier.c -o $@
-vk_chain_v4.o: vk_chain.c vk_chain.h vk_alloc.h backend_vulkan.h $(V4_FLAGS_STAMP)
+vk_chain_v4.o: vk_chain.c vk_chain.h vk_alloc.h shaders/chain_qsa.h backend_vulkan.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -c vk_chain.c -o $@
 shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@
+shaders/chain_qsa.spv: shaders/chain_qsa.h
 # As in the parent: an older glslc keeps the committed cooperative-matrix .spv.
 shaders/qmatmul_coop.spv: shaders/qmatmul_coop.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }

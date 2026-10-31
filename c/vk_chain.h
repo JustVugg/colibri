@@ -54,6 +54,7 @@ typedef struct VkcBuf VkcBuf;
 #define VKC_UP   1
 #define VKC_DOWN 2
 #define VKC_HOST 3   /* host memory read in place (vkc_host): bound read-only, never written */
+#define VKC_ADDR 4   /* device memory of its own with a device address (vkc_buf_addr) */
 
 int  vkc_init(void);          /* after coli_vk_init; 1 = the chain's pipelines are up */
 int  vkc_ready(void);
@@ -76,16 +77,37 @@ size_t  vkc_bytes(const VkcBuf *b);
  * a device that shares the RAM, without staged uploads); *off: ptr's byte offset in it.
  * NULL when the device cannot. vkc_free releases it after the frames that read it. */
 VkcBuf *vkc_host(const void *ptr, size_t bytes, size_t *off);
+/* Device memory of its own whose device address *addr a shader may read by (a table of
+ * entries pointing into it: vk_dmoe.h's staging), bound like a VKC_DEV buffer; not zeroed.
+ * The primary device's, where it has bufferDeviceAddress; NULL otherwise. */
+VkcBuf *vkc_buf_addr(size_t bytes, uint64_t *addr);
+/* A barrier now, in the open frame: what an op reads by address (not a binding the frame
+ * tracks) waits for every earlier op, and every later op for it. */
+int     vkc_barrier(void);
+/* n regions (uvec4s of reg from region `first`: the source's address low and high, the
+ * first word in dst, the words) copied from those addresses into dst
+ * (shaders/chain_fetch.comp): the tier's host pool into VRAM. 0 where the device cannot. */
+int     vkc_fetch(VkcBuf *reg, int first, int n, uint32_t max_words, VkcBuf *dst);
 
 /* recording */
 int  vkc_begin(void);
 int  vkc_submit(int wait);
 int  vkc_finish(void);        /* wait for every submitted frame */
+/* A forward whose layers all run in the frame (the routed experts there too, vk_dmoe.h)
+ * is one long frame: the device would start only once the host had recorded all of it.
+ * After each such layer an engine calls vkc_layer_recorded(layers): every
+ * vkc_split_layers() of them the frame so far goes to the device and a new one opens
+ * (vkc_begin's barrier orders it after them), so the device runs the first layers while
+ * the host records the next. 1, or 0 on a lost device. COLI_VK_CHAIN_SPLIT=0 keeps one
+ * frame a forward, n sends every n layers. */
+int  vkc_split_layers(void);
+int  vkc_layer_recorded(int *layers);
 
 /* transfers, recorded into the open frame (offsets and counts in floats) */
 int  vkc_copy(VkcBuf *dst, size_t doff, VkcBuf *src, size_t soff, size_t n);
 int  vkc_zero(VkcBuf *dst, size_t off, size_t n);
-/* one copy command over n regions (a KV row per head, say) */
+/* n regions (a KV row per head, say): one dispatch when they lie on a grid (chain_copy2d.comp;
+ * COLI_VK_COPY_GRID=0 never), else one copy command */
 typedef struct { size_t dst, src, n; } VkcRegion;
 int  vkc_copy_regions(VkcBuf *dst, VkcBuf *src, const VkcRegion *r, int n);
 int  vkc_write(VkcBuf *dst, size_t off, const void *src, size_t bytes);   /* through the frame's staging */
@@ -103,6 +125,7 @@ typedef struct { int nseg, D, per_row, x_off, x_row, x_seg, y_off, y_row, y_seg,
 #define VKC_NORM_ADD1 1
 #define VKC_NORM_NOW  2
 #define VKC_NORM_L2   4
+#define VKC_NORM_PRESCALE 8   /* scale by w, then normalise (Muse Spark) */
 int  vkc_norm(VkcBuf *x, VkcBuf *w, VkcBuf *y, const VkcNorm *p);
 /* chain_rope.comp */
 typedef struct { int nseg, per_row, x_off, x_row, x_seg, half_, cs_off, cs_row; } VkcRope;
@@ -120,6 +143,15 @@ int  vkc_attn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf
 typedef struct { VkcAttn a; int win, ring, vd, kv_pm, sink, sink_off; } VkcAttnW;
 int  vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, VkcBuf *snk,
                 const VkcAttnW *p);
+/* A float16 KV cache: vkc_attn and vkc_attn_w over caches of halves (kc, vc and their offsets
+ * in halves; flash's offsets multiples of eight), every path the bits of a float32 cache of the
+ * same values; vkc_copy_regions_h copies float32 regions of src (offsets in floats) into such
+ * a cache (offsets and lengths in halves, even), each value rounded to the nearest float16.
+ * vkc_kvh_ready: 1 when the device takes them. */
+int  vkc_attn_h(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, const VkcAttn *p);
+int  vkc_attn_wh(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, VkcBuf *snk, const VkcAttnW *p);
+int  vkc_copy_regions_h(VkcBuf *dst, VkcBuf *src, const VkcRegion *r, int n);
+int  vkc_kvh_ready(void);
 /* From this many rows (COLI_VK_ATTN_BLOCK, 16; 0 = never) vkc_attn and vkc_attn_w take
  * chain_attnb.comp: a workgroup per KV head and block of rows, each K and V row read once
  * per block instead of once per (head, row); below it chain_attn as before. */
@@ -148,10 +180,14 @@ long long vkc_attn_slice_budget(void);   /* COLI_VK_ATTN_SLICE below: rows x pos
  * each ending its frame (submitted, not waited for) and the next in a new one: no single
  * submission of a big prompt chunk runs for seconds (a driver resets a job past its
  * timeout: amdgpu 10 s, Windows 2 s). The rows' arithmetic does not change. */
-/* chain_dnconv.comp */
+/* chain_dnconv.comp (order 0, 1: Gated DeltaNet's, the sum's two orders; 2: LFM3's gated
+ * convolution, input rows B | C | x of CD channels, out = C * conv(B * x), no activation) */
 typedef struct { int S, CD, CK, in_off, in_row, out_off, out_row, snap_row, order, w_off, ring_off, snap_off; } VkcDnConv;
 int  vkc_dnconv(VkcBuf *in, VkcBuf *w, VkcBuf *ring, VkcBuf *out, VkcBuf *snap, const VkcDnConv *p);
-/* chain_dnrec.comp (KD a specialization constant, VD <= 128) */
+/* chain_dnrec.comp (KD a specialization constant, VD <= 128); from VKC_DNREC_ROWS rows
+ * chain_dnrec_rows.comp, the same arithmetic a block of rows at a time (COLI_VK_DNREC_ROWS=0
+ * keeps chain_dnrec) */
+#define VKC_DNREC_ROWS 8
 typedef struct { int S, VH, KH, VD, Ktot, cv_off, cv_row, b_off, b_row, a_off, a_row, z_off, z_row,
                  y_off, y_row, snap_row, flags; float eps, qscale; int st_off, snap_off, prm_off; } VkcDnRec;
 int  vkc_dnrec(int KD, VkcBuf *cv, VkcBuf *ab, VkcBuf *z, VkcBuf *st, VkcBuf *prm, VkcBuf *y, VkcBuf *snap, const VkcDnRec *p);
@@ -165,9 +201,16 @@ int  vkc_dnrec(int KD, VkcBuf *cv, VkcBuf *ab, VkcBuf *z, VkcBuf *st, VkcBuf *pr
 #define VKC_EW_HC_APPLY 6
 #define VKC_EW_SCALE    7
 #define VKC_EW_GATE_ADD 8
+#define VKC_EW_SIGMUL   9    /* y = a * sigmoid(b) */
+#define VKC_EW_RESGATE  10   /* y = e[col] * a + c[col] * b (alpha, beta a column) */
+#define VKC_EW_F16      11   /* y = a clamped to +-65504 and rounded to the nearest float16 (kv16.h: a KV cache in float16) */
+#define VKC_EW_HEADGATE 12   /* y = a * sigmoid(b[b_off + i / D]): a gate per head of D values (LFM3) */
+#define VKC_EW_SSMAX    13   /* y = a * (e[e_off + h] * c[c_off + r] + e[e_off + C + h]), h = (i / D) % C, r = i / (D * C):
+                              * Mistral-Large-4's SSMax (c the rows' log(pos + 1), e the heads' s, then b) */
 typedef struct { int op, n, D, C, flags, e_row, y_off, a_off, b_off, c_off, e_off; float fc; } VkcEw;
 int  vkc_ew(VkcBuf *y, VkcBuf *a, VkcBuf *b, VkcBuf *c, VkcBuf *e, const VkcEw *p);
-/* chain_qsa.comp (mode 0: nb block keys from b0; mode 1: S rows' selections) */
+/* chain_qsa.comp (mode 0: nb block keys from b0; mode 1: the selection of S rows, run as two dispatches that write the
+ * scores into sc and then the selection into sel) */
 typedef struct { int mode, ID, R, b0, half_, S, pos_base, budget, IQ, q_off, q_row, nbmax, sel_row; float eps;
                  int src_off, w_off, pk_off, nb; } VkcQsa;
 int  vkc_qsa(VkcBuf *src, VkcBuf *w, VkcBuf *pk, VkcBuf *cs, VkcBuf *sc, VkcBuf *sel, const VkcQsa *p);
@@ -278,6 +321,8 @@ typedef struct {
     ColiVkTensor *o;              /* [D x H*V]; NULL: the context stays in s->ctx */
     VkcBuf *prm;                  /* the norm weights: q latent at q_norm (unused with q_lora 0), */
     size_t q_norm, kv_norm;       /*   kv latent at kv_norm (floats) */
+    int kv16;                     /* the new latent and rope rows rounded to float16 as they are written
+                                   * (the host keeps them in float16: colibri's KV16) */
 } VkcMla;
 typedef struct { VkcBuf *qa, *q, *kv, *qabs, *clat, *ctx; int rows; } VkcMlaScratch;
 typedef struct { VkcBuf *lat, *rope; int cap; } VkcMlaCache;   /* [cap][K] and [cap][R] (rope NULL with R 0) */
@@ -326,6 +371,9 @@ int vkc_mla(const VkcMla *m, VkcMlaScratch *s, VkcBuf *x, size_t x_off, int S, i
 int vkc_kda_ready(void);
 typedef struct { int S, C, K, P, in_off, in_row, in_part, out_off, out_row, w_off, win_off; } VkcKdaConv;
 int vkc_kda_conv(VkcBuf *in, VkcBuf *w, VkcBuf *win, VkcBuf *out, const VkcKdaConv *p);
+/* from VKC_KDA_ROWS rows the recurrence runs a block of rows at a time (chain_kda_rows.spv:
+ * the same bits; COLI_VK_KDA_ROWS=0 keeps chain_kda's) */
+#define VKC_KDA_ROWS 8
 #define VKC_KDA_EXP_A 1
 #define VKC_KDA_K3    2
 typedef struct { int S, H, VD, P, m_off, m_row, f_off, f_row, b_off, b_row, g_off, g_row, y_off, y_row, st_off, prm_off;
@@ -369,6 +417,128 @@ typedef struct { int S, H, KVH, hd, pos_base, cap, window, ext, d_rel;
 int  vkc_relattn_ready(void);
 int  vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBuf *r, VkcBuf *relp, VkcBuf *tau,
                  const VkcRelAttn *p);
+
+/* ---- the router's pick (chain_route.comp) -------------------------------------------
+ * Every MoE engine's routing on the device, for S rows of E logits (l_off + s*l_row):
+ * kind 0 softmax, 1 sigmoid, 2 sqrt(softplus), of logit / temp; the bias (b_off) added
+ * for the pick only with has_bias 1 (noaux_tc), to the logit with 2 (qwen36's gate bias,
+ * before the softmax); with n_group > 1 the topk_group best
+ * groups (a group's value: its two best picks) and their experts only; the K best picks,
+ * the lower expert on a tie, in rank order into ids (i_off + s*i_row, -1 for a slot no
+ * finite pick fills); their scores into w (w_off + s*w_row), divided by their sum plus
+ * norm_eps with norm 1 (when that is above 0) or norm 2 (the same from K > 1 only), then
+ * times scale. E <= VKC_ROUTE_EMAX, K <= VKC_ROUTE_KMAX; 0 when the shader is missing or
+ * a parameter is out of range. ids holds ints. */
+#define VKC_ROUTE_EMAX 1024
+#define VKC_ROUTE_KMAX 32
+typedef struct {
+    int S, E, K, kind;
+    int l_off, l_row, b_off, has_bias;
+    int i_off, i_row, w_off, w_row;
+    int n_group, topk_group, norm;
+    float temp, scale, norm_eps;
+    int wg;                                    /* 1: the workgroup's path where one subgroup would take the row (tests) */
+} VkcRoute;
+int vkc_route_ready(void);
+int vkc_route(VkcBuf *logits, VkcBuf *bias, VkcBuf *ids, VkcBuf *w, const VkcRoute *p);
+
+/* ---- the routed experts (chain_moe.comp) --------------------------------------------
+ * A layer's routed experts on the device for S rows: x (x_off + s*x_row, D floats) routed
+ * to ids/w as vkc_route writes them (i_off + s*i_row, w_off + s*w_row, K each); expert e's
+ * weights by address from table (backend_vulkan.h: coli_vk_xb_expert_entry), entry
+ * t_off + e, a zero entry (not resident) skipped. hid holds S*K rows of I floats
+ * (gate and up's output, act 0 SwiGLU clamped by limit > 0, 1 SiTU-GLU with a and b),
+ * then S*K rows of D (down's output per slot): S*K*(I + D) floats at least; y (y_off +
+ * s*y_row) gets each row's sum over its slots in rank order of w * down's output, from 0.
+ * Needs bufferDeviceAddress and clustered subgroup adds (vkc_moe_ready); 0 when a
+ * parameter is out of range. */
+typedef struct {
+    int S, K, D, I, act;
+    float limit, a, b;
+    int t_off, x_off, x_row, i_off, i_row, w_off, w_row, y_off, y_row;
+    int rpw;   /* outputs a workgroup, both passes: 0 = 64, or the block formats' own by pass (vkc_moe) */
+    int blocks;   /* 1: the experts are block formats (a GGUF's): the pipeline with their decoders */
+    int gfmt;     /* the layer's gate/up format (100 + a ggml type), 0 unknown: picks the block path's shape */
+    int dfmt, E;  /* vkc_moe_rows: down's format, and the layer's experts (its table's entries from t_off) */
+    int stage_n;  /* the widest input row its staging is sized for: 0 = D's or I's, < 0 = the device's largest */
+    int floats;   /* vkc_moe_rows: 1 keeps the grouped GEMMs in floats where the matrix units' would run */
+} VkcMoe;
+int vkc_moe_ready(void);
+/* A prompt chunk's routed experts, every row on the device (chain_moe_rows.comp): the
+ * pairs counted and planned by expert there, gate+up and down as the block formats'
+ * grouped GEMMs (qmatmul_grp_gate_up_bd.comp, qmatmul_grp_bd.comp) over the tiles of each
+ * expert's rows, dispatched with the counts the device wrote, then each row's sum over its
+ * experts in rank order. p as vkc_moe's with x_off 0, act 0, E, gfmt and dfmt (the layer's
+ * experts' block formats), D and I multiples of 64; y as vkc_moe's. The tables and the
+ * rows' hidden and down outputs live in *r between calls (vkc_moe_rows_free). 0 when the
+ * device lacks the pipelines (vkc_moe_rows_ready) or a parameter is out of range. */
+typedef struct { VkcBuf *cnt, *amap, *items, *etab, *aux, *hid, *yk; } VkcMoeRows;
+int vkc_moe_rows_ready(int gfmt, int dfmt);
+int vkc_moe_rows(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcMoeRows *r, VkcBuf *y, const VkcMoe *p);
+void vkc_moe_rows_free(VkcMoeRows *r);
+/* The pipelines vk_chain.c otherwise makes at first use, made now, while the device still
+ * has room: the block formats' GEMV and tiled GEMM for the ggml types in `types` (bit t for
+ * format 100 + t), chain_moe's pipeline (moe 1: colibri's formats, 2: the block formats'),
+ * DeltaNet's recurrence for key dimension dn_kd (0: none), and a prompt chunk's grouped
+ * GEMMs (vkc_moe_rows) for the experts' gate/up types ex_gu and down types ex_dn, or for our
+ * own formats (ex_ours), and the attention on the matrix units (attn_hd, attn_gq). An engine
+ * calls it once its dense chain is placed, before its expert tier fills the device. A
+ * discrete card's default (COLI_VK_CHAIN_PREWARM=1 on any device, 0 never); the pipelines
+ * made. */
+typedef struct {
+    uint64_t types; int moe, dn_kd; uint64_t ex_gu, ex_dn;
+    int ex_ours;                /* the experts are our own formats (1, 2, 4): their grouped GEMMs (qmatmul_grp_q.comp) */
+    int gemv_i[16], n_gemv_i;   /* the GEMV's widths of x (a matrix's I) the types meet: its staging sizes */
+    int moe_d, moe_i;           /* the experts' D and I: chain_moe's staging size (0: the device's largest) */
+    int attn_hd, attn_gq;       /* the attention's head dim and query heads per kv head: chain_attn_flash's (0: none) */
+} VkcPrewarm;
+/* a width of x the model's GEMVs meet, once (vkc_prewarm makes the staging size it takes) */
+static inline void vkc_prewarm_width(VkcPrewarm *pw, int I) {
+    for (int k = 0; k < pw->n_gemv_i; k++) if (pw->gemv_i[k] == I) return;
+    if (I > 0 && pw->n_gemv_i < 16) pw->gemv_i[pw->n_gemv_i++] = I;
+}
+int vkc_prewarm(const VkcPrewarm *w);
+/* 1 = a GGUF's block-format matrices take a prompt's rows through the tiled GEMM
+ * (qmatmul_gemm_bd.comp), else only the GEMV's few rows a step suit them */
+int vkc_gemm_bd_ready(void);
+int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBuf *y, const VkcMoe *p);
+/* chain_moe_gv.comp's int4 fast path (each lane's steps loaded ahead, the loop's bits):
+ * 1 on, 0 off, -1 from COLI_VK_MOE_GV_HQ (default on). For tests. */
+void vkc_moe_gv_hq(int on);
+/* A GGUF's experts (blocks, gfmt and dfmt both types bdstep_i8.glsl has) in the CPU's
+ * integer form: the input rows quantized to int8 per 32, packed 4 x 8 integer dot products
+ * (ggml_quants.h's gq_quant_act_ref and gq_dot_i8, the same integers and scales). On by
+ * default where the device accelerates them (vkc_moe_idot: 0 none, 1 supported, 2
+ * accelerated; COLI_VK_IDOT=0 leaves the extension off); vkc_moe_set_idot(1) asks for it
+ * where supported, 0 never, -1 the default (tests). */
+void vkc_moe_set_idot(int on);
+int vkc_moe_idot(void);
+/* Hybrid steps (vk_dmoe.h): a frame that signals the device's timeline at its end, and the
+ * next frame waiting for the host's, so the CPU computes a part of a layer between them
+ * while the device runs the rest; the values rise with every step. The host's side, from
+ * any thread (the primary device's timelines): vkc_hybrid_host_wait until the device has
+ * signalled g, vkc_hybrid_host_signal h. */
+int  vkc_hybrid_ready(void);
+int  vkc_hybrid_submit(uint64_t g);
+void vkc_hybrid_wait_next(uint64_t h);
+int  vkc_hybrid_host_wait(uint64_t g);
+int  vkc_hybrid_host_signal(uint64_t h);
+/* fn runs before the host waits for any frame (vk_dmoe.h's vkc_hyb_flush: the host's part
+ * of a hybrid step still to come, which the frames from C on wait for); NULL none */
+void vkc_hybrid_set_flush(void (*fn)(void));
+/* The hybrid steps inside one frame (vk_dmoe.h, as the CUDA chain's cc_signal and
+ * cc_wait_host), on Vulkan events: step g's pair of events (a ring; the step 256 before
+ * reused them, its frame waited for first). vkc_ev_signal sets the device's once everything
+ * recorded before it is done and visible to the host; vkc_ev_wait holds the queue until
+ * the host sets its (vkc_ev_host_set, after writing what the step reads), and makes the
+ * host's writes visible to what follows; vkc_ev_host_done asks whether the device's is set.
+ * A shader polling a word in host memory did not work here: an RTX 3070 served the loads
+ * (and the atomics) from its L2 and saw the host's write only at the frame's end. */
+int  vkc_ev_ready(void);
+int  vkc_ev_signal(uint64_t g);
+int  vkc_ev_wait(uint64_t g);
+int  vkc_ev_host_done(uint64_t g);
+int  vkc_ev_host_set(uint64_t g);
 
 /* ---- attention residuals and SiTU-GLU (chain_ares.comp) ----------------------------
  * Kimi K3's residual stream (AttnRes) and its activation, for S rows:
@@ -710,7 +880,17 @@ typedef struct {
     unsigned long long attn_blocked;   /* attention calls through chain_attnb (blocks of rows) */
     unsigned long long attn_flash;     /* attention calls through chain_attn_flash (matrix units) */
     unsigned long long attn_slices;    /* extra submissions that cut a long attention (COLI_VK_ATTN_SLICE) */
-    unsigned long long tile_gemms;     /* prompt matmuls through chain_gemm.comp (matrix units) */
+    unsigned long long tile_gemms;     /* prompt matmuls on the matrix units (chain_gemm.comp, qmatmul_gemm_bdc.comp) */
+    unsigned long long moe_i8;         /* routed-expert layer steps in the CPU's integer form (chain_moe_i8) */
+    unsigned long long gemv_i8;        /* a GGUF's dense GEMVs in it (chain_gemv_bd_i8) */
+    unsigned long long copy_grids;     /* region lists copied by one dispatch (chain_copy2d, vkc_copy_regions) */
+    unsigned long long grp_coop;       /* grouped expert GEMMs on the matrix units (qmatmul_grp_qc, qmatmul_grp*_bdc) */
+    unsigned long long gemv_xg;        /* decode GEMVs whose row is past the staging: x from its buffer (chain_gemv.comp XG) */
+    unsigned long long attn_dec;       /* decode attentions split over their positions' blocks (chain_attn_dec.comp) */
+    unsigned long long attn_dec_gqa;   /* of them, a KV head's query heads a workgroup (its grouped mode) */
+    unsigned long long moe_gv;         /* routed-expert decode steps in our formats on chain_moe_gv.comp */
+    unsigned long long tile_wide;      /* of the tile GEMMs, a GGUF's on 128 x 128 tiles (qmatmul_gemm_bdcw.comp) */
+    unsigned long long grp_wide;       /* of the grouped expert GEMMs, those at the wider item (qmatmul_grp*_bdcw.comp) */
 } VkcStats;
 void vkc_stats(VkcStats *st);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */

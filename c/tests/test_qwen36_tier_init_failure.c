@@ -56,8 +56,26 @@ int main(void) {
     setenv("COLI_CUDA","1",1);setenv("COLI_GPUS","0",1);
     setenv("HEAT_FILE",path,1);setenv("CUDA_EXPERT_GB","0.0625",1);
     int failed=0;
-    for(fail_stage=0;fail_stage<=5;fail_stage++) for(int retry=0;retry<2;retry++) {
-        setenv("COLI_PLACE",fail_stage==0?"experts=cpu,lmhead=0":"experts=0,lmhead=0",1);
+    /* experts=cpu used to be a refusal here too; since #2090 it starts the tier
+     * for the dense trunk only (no expert budget), and its shutdown must leave
+     * nothing behind either */
+    fail_stage=0; sync_step=0;
+    setenv("COLI_PLACE","experts=cpu,lmhead=0",1);
+    if(!qt_init(1,2,64,32,2,1,0,1) || qt_experts_on() || G.budget[0]){
+        fputs("experts=cpu: the tier should start for the trunk alone\n",stderr);
+        failed=1;goto done;
+    }
+    qt_shutdown();
+    free(G.slot);G.slot=NULL;free(G.is_x);G.is_x=NULL;
+    free(G.heat0);G.heat0=NULL;free(G.fill_order);G.fill_order=NULL;
+    if(conds){pthread_cond_destroy(&G.cv);pthread_cond_destroy(&G.cv_take);}
+    if(mutexes) pthread_mutex_destroy(&G.mx);
+    if(live || mutexes || conds){
+        fprintf(stderr,"experts=cpu shutdown left allocations=%d mutexes=%d conds=%d\n",live,mutexes,conds);
+        failed=1;goto done;
+    }
+    for(fail_stage=1;fail_stage<=5;fail_stage++) for(int retry=0;retry<2;retry++) {
+        setenv("COLI_PLACE","experts=0,lmhead=0",1);
         sync_step=0;
         int rc=qt_init(1,2,64,32,2,1,0,1);
         if(rc || G.on || G.slot || G.heat0 || G.is_x || G.is_x_floats ||
@@ -95,6 +113,6 @@ int main(void) {
     }
 done:
     remove(path);
-    if(!failed) puts("tier init failure: ok (12 failure cases and active int4/FP8 preservation)");
+    if(!failed) puts("tier init failure: ok (10 failure cases, experts=cpu trunk-only, and active int4/FP8 preservation)");
     return failed;
 }

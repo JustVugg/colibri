@@ -62,6 +62,7 @@ layout(push_constant) uniform P { int v[32]; } p;
 #define SEL_ROW  p.v[14]
 #define QSCALE   intBitsToFloat(p.v[15])
 #define WSCALE   intBitsToFloat(p.v[16])
+#define SCORED   p.v[17]   // modes 0 and 2: 1 = the scores are in sc already (mode 3's, mode 4's)
 // mode 1: ID_ at 4, then
 #define POOL1    p.v[2]
 #define P0       p.v[3]
@@ -90,17 +91,17 @@ uint okey(float f) {
     return (u & 0x80000000u) != 0u ? ~u : (u | 0x80000000u);
 }
 
-// the workgroup's sum of v (every thread passes its own)
+// the workgroup's sum of v (every thread passes its own): counts, so any order of the
+// sums gives the same total; each subgroup's, then theirs (the tree over shared memory
+// took eight barriers, 32 times a selection)
 uint wsum(uint v, int tid) {
-    cnt[tid] = v;
+    uint t = subgroupAdd(v);
+    if (subgroupElect()) cnt[gl_SubgroupID] = t;
     barrier();
-    for (int off = 128; off > 0; off >>= 1) {
-        if (tid < off) cnt[tid] += cnt[tid + off];
-        barrier();
-    }
-    uint t = cnt[0];
+    uint tot = 0u;
+    for (uint g = 0u; g < gl_NumSubgroups; g++) tot += cnt[g];
     barrier();
-    return t;
+    return tot;
 }
 // exclusive prefix sum of v over the workgroup's threads, in thread order
 uint wscan(uint v, int tid) {
@@ -117,30 +118,63 @@ uint wscan(uint v, int tid) {
     return incl - v;
 }
 
+// mode 3, mode 0's scores alone on a grid (vkc_dsa_select past VKC_DSA_GRID positions):
+// workgroup (block x of 256 / IH positions, row y), a thread a (position, head) for the
+// head's dot in mode 0's order, then a thread a position joining the heads in mode 0's
+// order, so the same bits. Mode 0 then selects from them (SCORED): one workgroup a row
+// computing every position's 4096 products was 16 ms a layer at 8000 positions on an RTX
+// PRO 4000 (GLM-5.2's 32 index heads of 128), a thread a position on a grid 0.5 ms.
+float token_score(int s, int t) {
+    int kb = K_OFF + t * K_ROW;
+    float a = 0.0;
+    for (int h = 0; h < IH_; h++) {
+        float d = 0.0;
+        for (int i = 0; i < ID_; i++) d += qs[h * ID_ + i] * kc[kb + i];
+        d *= QSCALE;
+        if (d > 0.0) a += ws[h] * d;
+    }
+    return a * WSCALE;
+}
+shared float dh[256];
+void token_scores() {
+    int s = int(gl_WorkGroupID.y), tid = int(gl_LocalInvocationID.x);
+    int P = max(1, 256 / IH_), nk = POS_BASE + s + 1, t0 = int(gl_WorkGroupID.x) * P;
+    if ((nk <= TOPK && FORCE == 0) || t0 >= nk) return;   // uniform
+    int nq = IH_ * ID_, qb = Q_OFF + s * Q_ROW;
+    for (int i = tid; i < nq; i += 256) qs[i] = iq[qb + i];
+    for (int h = tid; h < IH_; h += 256) ws[h] = hw[W_OFF + s * W_ROW + h];
+    barrier();
+    int j = tid / IH_, h = tid - j * IH_, t = t0 + j;
+    if (j < P && t < nk) {
+        int kb = K_OFF + t * K_ROW;
+        float d = 0.0;
+        for (int i = 0; i < ID_; i++) d += qs[h * ID_ + i] * kc[kb + i];
+        dh[tid] = d * QSCALE;
+    }
+    barrier();
+    if (tid < P && t0 + tid < nk) {
+        float a = 0.0;
+        for (int g = 0; g < IH_; g++) { float d = dh[tid * IH_ + g]; if (d > 0.0) a += ws[g] * d; }
+        sc[s * SC_ROW + t0 + tid] = a * WSCALE;
+    }
+}
+
 void token_select() {
     int s = int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x);
     int nk = POS_BASE + s + 1;
     int lb = s * SEL_ROW;
     if (nk <= TOPK && FORCE == 0) { if (tid == 0) sel[lb] = -1; return; }
     int keep = min(nk, TOPK);
-    int nq = IH_ * ID_, qb = Q_OFF + s * Q_ROW;
-    for (int i = tid; i < nq; i += 256) qs[i] = iq[qb + i];
-    for (int h = tid; h < IH_; h += 256) ws[h] = hw[W_OFF + s * W_ROW + h];
-    barrier();
     int sb = s * SC_ROW;
-    for (int t = tid; t < nk; t += 256) {
-        int kb = K_OFF + t * K_ROW;
-        float a = 0.0;
-        for (int h = 0; h < IH_; h++) {
-            float d = 0.0;
-            for (int i = 0; i < ID_; i++) d += qs[h * ID_ + i] * kc[kb + i];
-            d *= QSCALE;
-            if (d > 0.0) a += ws[h] * d;
-        }
-        sc[sb + t] = a * WSCALE;
+    if (SCORED == 0) {
+        int nq = IH_ * ID_, qb = Q_OFF + s * Q_ROW;
+        for (int i = tid; i < nq; i += 256) qs[i] = iq[qb + i];
+        for (int h = tid; h < IH_; h += 256) ws[h] = hw[W_OFF + s * W_ROW + h];
+        barrier();
+        for (int t = tid; t < nk; t += 256) sc[sb + t] = token_score(s, t);
+        memoryBarrierBuffer();
+        barrier();
     }
-    memoryBarrierBuffer();
-    barrier();
     // the keep-th largest key, bit by bit from the top
     uint K = 0u;
     for (int b = 31; b >= 0; b--) {
@@ -194,6 +228,39 @@ void pool_keys() {
     }
 }
 
+// mode 4, mode 2's pool scores alone on a grid (vkc_dsa_pool_select past VKC_DSA_GRID
+// pools), as mode 3 lays out its positions: a thread a (pool, head), then a thread a pool
+// joining the heads in mode 2's order, so the same bits; mode 2 then selects (SCORED).
+float pool_score(int pp) {
+    float score = 0.0;
+    for (int h = 0; h < IH_; h++) {
+        float dot = 0.0;
+        for (int d = 0; d < ID_; d++) dot += qs[h * ID_ + d] * pk[PK_OFF2 + pp * ID_ + d];
+        if (dot > 0.0) score += ws[h] * dot * PSCALE;
+    }
+    return score;
+}
+void pool_scores() {
+    int s = int(gl_WorkGroupID.y), tid = int(gl_LocalInvocationID.x);
+    int P = max(1, 256 / IH_), nvis = (POS_BASE + s + 1) / POOL2, p0 = int(gl_WorkGroupID.x) * P;
+    if (p0 >= nvis) return;   // uniform
+    int nq = IH_ * ID_, qb = Q_OFF + s * Q_ROW;
+    for (int i = tid; i < nq; i += 256) qs[i] = iq[qb + i];
+    for (int h = tid; h < IH_; h += 256) ws[h] = hw[W_OFF + s * W_ROW + h] / WDIV;
+    barrier();
+    int j = tid / IH_, h = tid - j * IH_, pp = p0 + j;
+    if (j < P && pp < nvis) {
+        float dot = 0.0;
+        for (int d = 0; d < ID_; d++) dot += qs[h * ID_ + d] * pk[PK_OFF2 + pp * ID_ + d];
+        dh[tid] = dot;
+    }
+    barrier();
+    if (tid < P && p0 + tid < nvis) {
+        float score = 0.0;
+        for (int g = 0; g < IH_; g++) { float dot = dh[tid * IH_ + g]; if (dot > 0.0) score += ws[g] * dot * PSCALE; }
+        sc[s * SC_ROW + p0 + tid] = score;
+    }
+}
 void pool_select() {
     int s = int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x);
     int q = POS_BASE + s, pool = POOL2;
@@ -201,22 +268,16 @@ void pool_select() {
     int width = TAIL != 0 ? TOPK + pool - 1 : TOPK;
     int lb = s * SEL_ROW;
     for (int i = tid; i < width; i += 256) sel[lb + 1 + i] = -1;
-    int nq = IH_ * ID_, qb = Q_OFF + s * Q_ROW;
-    for (int i = tid; i < nq; i += 256) qs[i] = iq[qb + i];
-    for (int h = tid; h < IH_; h += 256) ws[h] = hw[W_OFF + s * W_ROW + h] / WDIV;
-    barrier();
     int sb = s * SC_ROW;
-    for (int pp = tid; pp < nvis; pp += 256) {
-        float score = 0.0;
-        for (int h = 0; h < IH_; h++) {
-            float dot = 0.0;
-            for (int d = 0; d < ID_; d++) dot += qs[h * ID_ + d] * pk[PK_OFF2 + pp * ID_ + d];
-            if (dot > 0.0) score += ws[h] * dot * PSCALE;
-        }
-        sc[sb + pp] = score;
+    if (SCORED == 0) {
+        int nq = IH_ * ID_, qb = Q_OFF + s * Q_ROW;
+        for (int i = tid; i < nq; i += 256) qs[i] = iq[qb + i];
+        for (int h = tid; h < IH_; h += 256) ws[h] = hw[W_OFF + s * W_ROW + h] / WDIV;
+        barrier();
+        for (int pp = tid; pp < nvis; pp += 256) sc[sb + pp] = pool_score(pp);
+        memoryBarrierBuffer();
+        barrier();
     }
-    memoryBarrierBuffer();
-    barrier();
     if (keep > 0) {
         uint K = kth_key(sb, nvis, keep, tid);
         int chunk = (nvis + 255) / 256, c0 = tid * chunk, c1 = min(nvis, c0 + chunk);
@@ -245,5 +306,7 @@ void pool_select() {
 void main() {
     if (p.v[0] == 0) token_select();
     else if (p.v[0] == 1) pool_keys();
+    else if (p.v[0] == 3) token_scores();
+    else if (p.v[0] == 4) pool_scores();
     else pool_select();
 }

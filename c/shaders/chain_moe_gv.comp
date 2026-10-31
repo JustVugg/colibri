@@ -1,0 +1,252 @@
+#version 450
+// A decode step's routed experts in our own formats (vk_chain.c, vkc_moe; vk_chain.h): the
+// gate and up pass and the down pass of chain_moe.comp, laid out as chain_gemv.comp lays a
+// dense GEMV. FMT, a specialization constant, is the layer's format: 1 int8 with a scale per
+// row, 2 int4 with a scale per row, 4 int4 with a scale per gs inputs, 7 MXFP4 with a scale
+// per gs inputs, gs a multiple of 32 (the tier's layout: signed bytes, nibbles v + 8 with the
+// low one the even input, or e2m1 nibbles in int4's order). chain_moe.comp spread a
+// row of Qwen3.6's 2048 inputs over 32 lanes, two 16-byte steps each, and a workgroup over
+// 64 outputs: its gate and up pass took 72-80 us a layer on an RTX PRO 4000, where
+// chain_gemv.comp reads a dense 8192 x 2048 int4 matrix, the same bytes, in 28.
+//   mode 0, gate and up: workgroup (wg, s) stages x[s] once (every expert of row s reads
+//           it) and takes units u = k * I + o, a unit lpr lanes: gate's row o and up's row
+//           o of expert ids[s][k], both against the same x loads; hid[s*K + k][o] =
+//           act(gate . x, up . x)
+//   mode 1, down: workgroup (pair j, tile) stages pair j's hidden row (I floats) and takes
+//           rows o of the tile, a row lpr lanes: yk[j][o] = down_e[o] . hid[j], into binding
+//           5 at y_off + j * y_row (the chain: hid itself, past the S * K hidden rows)
+// The expert tier's small experts (backend_vulkan.c, xb_cgv_record) run this shader too, a
+// row a pair (K 1), so a row has the same bits there as in the chain's decode.
+// chain_moe.comp's mode 2 adds the pairs in rank order. A slot whose id is -1 or whose
+// expert the table does not hold (a zero entry: the host computes it) is skipped: its lanes
+// run no step and write nothing, so every lane reaches the shuffles. The host takes this
+// shader for D and I multiples of 32 (the rows whole 16-byte steps, nothing padded) that
+// fit the staging.
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const int XS = 1024;   // staged vec4s
+layout(constant_id = 1) const int FMT = 4;
+// HQ 1 (FMT 4, the host's int4 fast path): a lane's NQ steps of a row, every one of them,
+// loaded with their scales before the first is decoded (a lane of the loop waits for each
+// load in turn: Qwen3.6's layer on a Radeon 8060S, one row, 160 -> 97 us). The same steps,
+// products and adds in the same order as the loop (rowpart4), so a row has the loop's bits;
+// taken where the row is NQ steps a lane exactly and the expert's groups whole steps.
+layout(constant_id = 2) const int HQ = 0;
+layout(constant_id = 3) const int NQ = 8;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer WRef4 { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer SRef { float v[]; };
+
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer ID { int ids[]; };
+layout(std430, binding = 3) readonly buffer T { uint tab[]; };
+layout(std430, binding = 4) buffer H { float hid[]; };
+layout(std430, binding = 5) writeonly buffer YO { float yo[]; };
+
+layout(push_constant) uniform P {
+    int mode, S, K, D, I, act;
+    float limit, a, b;
+    int t_off, x_off, x_row, i_off, i_row;
+    int lpr;     // lanes a unit (a row of down), a power of two up to the subgroup
+    int tiles;   // mode 1: the workgroups a pair's D rows take
+    int y_off, y_row;   // mode 1: where pair j's output row starts in binding 5
+} p;
+
+#define ENT 32u
+#define KMAX 32   // vk_chain.h's VKC_ROUTE_KMAX
+shared vec4 xs[XS];
+// mode 0: row s's K experts as the workgroup's units read them (one lookup a workgroup):
+// gate's and up's rows and scales, their row words, the group size, whether it runs here
+shared uvec2 ke_w[KMAX][4];
+shared uint ke_rws[KMAX], ke_gs[KMAX], ke_live[KMAX];
+// vec4 k of the staged row sits at k + k / 8 (chain_gemv.comp's pad: a lane's step reads
+// consecutive vec4s and the next lane's start that far on)
+int xi(int k) { return k + (k >> 3); }
+
+float sb(uint w, int off) { return float(bitfieldExtract(int(w), off, 8)); }   // signed byte
+float nb(uint w, int off) { return float(bitfieldExtract(w, off, 4)) - 8.0; }  // nibble - 8
+uvec2 addr(uint at) { return uvec2(tab[at], tab[at + 1u]); }
+float situ_tanh(float v) { return abs(v) < 0.000244140625 ? v : tanh(v); }
+float act(float g, float u) {
+    if (p.act == 1) return p.a * situ_tanh(g / p.a) * (1.0 / (1.0 + exp(-g))) * (p.b * situ_tanh(u / p.b));
+    if (p.limit > 0.0) { g = min(g, p.limit); u = clamp(u, -p.limit, p.limit); }
+    return (g / (1.0 + exp(-g))) * u;
+}
+// one 16-byte step of a row against the staged vec4s from xb: 16 int8 or 32 int4 weights
+float dot8(uvec4 w, int xb) {
+    return dot(xs[xi(xb)], vec4(sb(w.x, 0), sb(w.x, 8), sb(w.x, 16), sb(w.x, 24))) +
+           dot(xs[xi(xb + 1)], vec4(sb(w.y, 0), sb(w.y, 8), sb(w.y, 16), sb(w.y, 24))) +
+           dot(xs[xi(xb + 2)], vec4(sb(w.z, 0), sb(w.z, 8), sb(w.z, 16), sb(w.z, 24))) +
+           dot(xs[xi(xb + 3)], vec4(sb(w.w, 0), sb(w.w, 8), sb(w.w, 16), sb(w.w, 24)));
+}
+float dot4(uvec4 w, int xb) {
+    return dot(xs[xi(xb)], vec4(nb(w.x, 0), nb(w.x, 4), nb(w.x, 8), nb(w.x, 12))) +
+           dot(xs[xi(xb + 1)], vec4(nb(w.x, 16), nb(w.x, 20), nb(w.x, 24), nb(w.x, 28))) +
+           dot(xs[xi(xb + 2)], vec4(nb(w.y, 0), nb(w.y, 4), nb(w.y, 8), nb(w.y, 12))) +
+           dot(xs[xi(xb + 3)], vec4(nb(w.y, 16), nb(w.y, 20), nb(w.y, 24), nb(w.y, 28))) +
+           dot(xs[xi(xb + 4)], vec4(nb(w.z, 0), nb(w.z, 4), nb(w.z, 8), nb(w.z, 12))) +
+           dot(xs[xi(xb + 5)], vec4(nb(w.z, 16), nb(w.z, 20), nb(w.z, 24), nb(w.z, 28))) +
+           dot(xs[xi(xb + 6)], vec4(nb(w.w, 0), nb(w.w, 4), nb(w.w, 8), nb(w.w, 12))) +
+           dot(xs[xi(xb + 7)], vec4(nb(w.w, 16), nb(w.w, 20), nb(w.w, 24), nb(w.w, 28)));
+}
+// MXFP4: e2m1 code n (bit 3 the sign) is (0, 0.5, 1, 1.5, 2, 3, 4, 6)[n & 7], twice those
+// packed as nibbles in one constant
+float e2(uint w, int off) {
+    uint n = bitfieldExtract(w, off, 4);
+    float v = float((0xC8643210u >> ((n & 7u) * 4u)) & 15u) * 0.5;
+    return (n & 8u) != 0u ? -v : v;
+}
+float dotmx(uvec4 w, int xb) {
+    return dot(xs[xi(xb)], vec4(e2(w.x, 0), e2(w.x, 4), e2(w.x, 8), e2(w.x, 12))) +
+           dot(xs[xi(xb + 1)], vec4(e2(w.x, 16), e2(w.x, 20), e2(w.x, 24), e2(w.x, 28))) +
+           dot(xs[xi(xb + 2)], vec4(e2(w.y, 0), e2(w.y, 4), e2(w.y, 8), e2(w.y, 12))) +
+           dot(xs[xi(xb + 3)], vec4(e2(w.y, 16), e2(w.y, 20), e2(w.y, 24), e2(w.y, 28))) +
+           dot(xs[xi(xb + 4)], vec4(e2(w.z, 0), e2(w.z, 4), e2(w.z, 8), e2(w.z, 12))) +
+           dot(xs[xi(xb + 5)], vec4(e2(w.z, 16), e2(w.z, 20), e2(w.z, 24), e2(w.z, 28))) +
+           dot(xs[xi(xb + 6)], vec4(e2(w.w, 0), e2(w.w, 4), e2(w.w, 8), e2(w.w, 12))) +
+           dot(xs[xi(xb + 7)], vec4(e2(w.w, 16), e2(w.w, 20), e2(w.w, 24), e2(w.w, 28)));
+}
+// a step of FMT 7 at q of row `row`: its group's scale (gs a multiple of 32)
+float stepmx(uvec4 v, int q, SRef sc, uint row, uint ng, uint gs) {
+    return dotmx(v, q * 8) * sc.v[row * ng + uint(q * 32) / gs];
+}
+// FMT 4 with groups that split a step (gs not a multiple of 32, a multiple of 8): each word's
+// 8 weights times their group's scale
+float dot4w(uint w, int xb, SRef sc, uint sb, uint i, uint gs) {
+    return sc.v[sb + i / gs] * (dot(xs[xi(xb)], vec4(nb(w, 0), nb(w, 4), nb(w, 8), nb(w, 12))) +
+                                dot(xs[xi(xb + 1)], vec4(nb(w, 16), nb(w, 20), nb(w, 24), nb(w, 28))));
+}
+// a step of FMT 4 at q of row `row`: the group scales applied
+float step4(uvec4 v, int q, SRef sc, uint row, uint ng, uint gs) {
+    uint sb = row * ng, i = uint(q * 32);
+    if (gs % 32u == 0u) return dot4(v, q * 8) * sc.v[sb + i / gs];
+    return dot4w(v.x, q * 8, sc, sb, i, gs) + dot4w(v.y, q * 8 + 2, sc, sb, i + 8u, gs) +
+           dot4w(v.z, q * 8 + 4, sc, sb, i + 16u, gs) + dot4w(v.w, q * 8 + 6, sc, sb, i + 24u, gs);
+}
+// the row's 16-byte steps q0, q0 + qs, ... below nq against the staged row
+float rowpart(WRef4 w, SRef sc, uint row, uint rw4, uint ng, uint gs, int nq, int q0, int qs) {
+    float acc = 0.0;
+    for (int q = q0; q < nq; q += qs) {
+        uvec4 v = w.v[row * rw4 + uint(q)];
+        if (FMT == 1) acc += dot8(v, q * 4);
+        else if (FMT == 2) acc += dot4(v, q * 8);
+        else if (FMT == 7) acc += stepmx(v, q, sc, row, ng, gs);
+        else acc += step4(v, q, sc, row, ng, gs);
+    }
+    return acc;
+}
+// FMT 4 with groups of whole steps: a row's steps q0, q0 + qs, ... below nq, each step's
+// product rounded and then added (precise: the compiler fuses neither, so the HQ path
+// below, which unrolls the same sums, keeps their bits)
+float rowpart4(WRef4 w, SRef sc, uint row, uint rw4, uint ng, uint gs, int nq, int q0, int qs) {
+    precise float acc = 0.0;
+    for (int q = q0; q < nq; q += qs) {
+        precise float d = dot4(w.v[row * rw4 + uint(q)], q * 8) * sc.v[row * ng + uint(q * 32) / gs];
+        acc += d;
+    }
+    return acc;
+}
+// HQ: rowpart4 for a row of exactly NQ steps a lane, every load issued before the first sum
+float rowpart_hq(WRef4 w, SRef sc, uint row, uint rw4, uint ng, uint gs, int lane, int lpr) {
+    uvec4 v[NQ]; float c[NQ];
+    [[unroll]] for (int t = 0; t < NQ; t++) {
+        int q = lane + t * lpr;
+        v[t] = w.v[row * rw4 + uint(q)];
+        c[t] = sc.v[row * ng + uint(q * 32) / gs];
+    }
+    precise float acc = 0.0;
+    [[unroll]] for (int t = 0; t < NQ; t++) { precise float d = dot4(v[t], (lane + t * lpr) * 8) * c[t]; acc += d; }
+    return acc;
+}
+bool hq(int nq, int lpr) { return HQ != 0 && nq == NQ * lpr; }
+float lanes_sum(float v, int lpr) {
+    for (int off = lpr / 2; off > 0; off >>= 1) v += subgroupShuffleXor(v, uint(off));
+    return v;
+}
+
+void main() {
+    int tid = int(gl_LocalInvocationID.x), sgs = int(gl_SubgroupSize), sg = int(gl_SubgroupID), nsg = int(gl_NumSubgroups);
+    int lpr = min(p.lpr, sgs), rps = sgs / lpr;
+    int sub = int(gl_SubgroupInvocationID) / lpr, lane = int(gl_SubgroupInvocationID) % lpr;
+    int per = FMT == 1 ? 16 : 32;   // weights a 16-byte step
+    if (p.mode == 0) {
+        int s = int(gl_WorkGroupID.y), n = p.D, nq = n / per;
+        for (int i = tid; i < n / 4; i += 256) {
+            int b = p.x_off + s * p.x_row + 4 * i;
+            xs[xi(i)] = vec4(x[b], x[b + 1], x[b + 2], x[b + 3]);
+        }
+        if (tid < p.K) {
+            int e = ids[p.i_off + s * p.i_row + tid];
+            uint eb = uint(p.t_off + max(e, 0)) * ENT;
+            bool on = e >= 0 && tab[eb + 18u] != 0u;
+            ke_live[tid] = on ? 1u : 0u;
+            ke_rws[tid] = on ? tab[eb + 13u] : 0u; ke_gs[tid] = on ? max(tab[eb + 14u], 1u) : 1u;
+            [[unroll]] for (uint m = 0u; m < 4u; m++) ke_w[tid][m] = on ? addr(eb + 2u * m) : uvec2(0u);
+        }
+        barrier();
+        int NU = p.K * p.I, stride = int(gl_NumWorkGroups.x) * nsg * rps;
+        for (int u0 = (int(gl_WorkGroupID.x) * nsg + sg) * rps; u0 < NU; u0 += stride) {   // uniform in the subgroup
+            int u = min(u0 + sub, NU - 1), k = u / p.I, o = u - k * p.I;
+            bool live = u0 + sub < NU && ke_live[k] != 0u;
+            uint rws = ke_rws[k], gs = ke_gs[k], ng = (uint(n) + gs - 1u) / gs;
+            WRef4 wg = WRef4(ke_w[k][0]), wu = WRef4(ke_w[k][2]);
+            SRef sg_ = SRef(ke_w[k][1]), su = SRef(ke_w[k][3]);
+            float g = 0.0, uu = 0.0;
+            // FMT 4 with whole-step groups: gate's and up's loads ahead together (HQ), or
+            // the loop of the same sums
+            if (live && FMT == 4 && gs % 32u == 0u && hq(nq, lpr)) {
+                g = rowpart_hq(wg, sg_, uint(o), rws / 4u, ng, gs, lane, lpr);
+                uu = rowpart_hq(wu, su, uint(o), rws / 4u, ng, gs, lane, lpr);
+            } else if (live && FMT == 4 && gs % 32u == 0u) {
+                g = rowpart4(wg, sg_, uint(o), rws / 4u, ng, gs, nq, lane, lpr);
+                uu = rowpart4(wu, su, uint(o), rws / 4u, ng, gs, nq, lane, lpr);
+            } else if (live) {
+                for (int q = lane; q < nq; q += lpr) {
+                    uint at = uint(o) * (rws / 4u) + uint(q);
+                    uvec4 vg = wg.v[at], vu = wu.v[at];
+                    if (FMT == 1) { g += dot8(vg, q * 4); uu += dot8(vu, q * 4); }
+                    else if (FMT == 2) { g += dot4(vg, q * 8); uu += dot4(vu, q * 8); }
+                    else if (FMT == 7) { g += stepmx(vg, q, sg_, uint(o), ng, gs); uu += stepmx(vu, q, su, uint(o), ng, gs); }
+                    else { g += step4(vg, q, sg_, uint(o), ng, gs); uu += step4(vu, q, su, uint(o), ng, gs); }
+                }
+            }
+            g = lanes_sum(g, lpr); uu = lanes_sum(uu, lpr);
+            if (lane == 0 && live) {
+                if (FMT != 4 && FMT != 7) { g *= sg_.v[o]; uu *= su.v[o]; }
+                hid[(s * p.K + k) * p.I + o] = act(g, uu);
+            }
+        }
+        return;
+    }
+    /* mode 1: workgroup (pair j, tile): pair j's hidden row against its expert's down rows */
+    int wgi = int(gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x);
+    int j = wgi / p.tiles, tile = wgi - j * p.tiles;
+    if (j >= p.S * p.K) return;   // uniform: the workgroup's pair
+    int s = j / p.K, k = j - s * p.K;
+    int e = ids[p.i_off + s * p.i_row + k];
+    uint eb = uint(p.t_off + max(e, 0)) * ENT;
+    if (e < 0 || tab[eb + 18u] == 0u) return;   // uniform
+    int n = p.I, nq = n / per;
+    for (int i = tid; i < n / 4; i += 256) {
+        int b = j * p.I + 4 * i;
+        xs[xi(i)] = vec4(hid[b], hid[b + 1], hid[b + 2], hid[b + 3]);
+    }
+    barrier();
+    uint rws = tab[eb + 16u], gs = max(tab[eb + 17u], 1u), ng = (uint(n) + gs - 1u) / gs;
+    WRef4 wd = WRef4(addr(eb + 8u)); SRef sd = SRef(addr(eb + 10u));
+    int per_tile = (p.D + p.tiles - 1) / p.tiles, lo = tile * per_tile, hi = min(lo + per_tile, p.D);
+    for (int o0 = lo + sg * rps; o0 < hi; o0 += nsg * rps) {   // uniform in the subgroup
+        int o = o0 + sub;
+        bool live = o < hi;
+        int oc = min(o, p.D - 1);
+        bool w4 = FMT == 4 && gs % 32u == 0u;
+        float d = !live ? 0.0 : w4 && hq(nq, lpr) ? rowpart_hq(wd, sd, uint(oc), rws / 4u, ng, gs, lane, lpr)
+                              : w4 ? rowpart4(wd, sd, uint(oc), rws / 4u, ng, gs, nq, lane, lpr)
+                              : rowpart(wd, sd, uint(oc), rws / 4u, ng, gs, nq, lane, lpr);
+        d = lanes_sum(d, lpr);
+        if (lane == 0 && live) yo[p.y_off + j * p.y_row + o] = FMT != 4 && FMT != 7 ? d * sd.v[oc] : d;
+    }
+}

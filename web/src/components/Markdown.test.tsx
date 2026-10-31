@@ -69,9 +69,35 @@ describe("the rest of the subset still renders", () => {
     expect(html).toContain("make")
   })
 
+  it("keeps balanced parentheses inside a link's URL", () => {
+    const html = render("See [Python](https://en.wikipedia.org/wiki/Python_(programming_language)) here.")
+    expect(html).toContain('href="https://en.wikipedia.org/wiki/Python_(programming_language)"')
+    expect(html).toContain("</a> here.")
+  })
+
+  it("still ends a link at its own parenthesis inside parenthesized prose", () => {
+    const html = render("(see [docs](https://example.com/docs))")
+    expect(html).toContain('href="https://example.com/docs"')
+    expect(html).toContain("</a>)")
+  })
+
+  it("keeps asterisks with spaces around them as text, not emphasis", () => {
+    const html = render("The area is w * h, and the volume is w * h * d.")
+    expect(html).not.toContain("<em>")
+    expect(html).toContain("w * h * d.")
+    expect(render("2 ** 3 ** 2")).not.toContain("<strong>")
+    expect(render("*one* and **two**")).toContain("<em>one</em> and <strong>two</strong>")
+  })
+
   it("escapes model-written markup instead of injecting it", () => {
     const html = render("| x |\n|---|\n| <img src=x onerror=alert(1)> |")
     expect(html).not.toContain("<img")
     expect(html).toContain("&lt;img")
+  })
+
+  it("keeps the step number of a list resumed after a code block", () => {
+    const html = render("1. Install:\n\n```sh\nmake\n```\n\n2. Run it\n3. Done")
+    expect(html).toContain('<ol start="2"><li>Run it</li><li>Done</li></ol>')
+    expect(render("1. a\n2. b")).toContain("<ol><li>a</li>")
   })
 })

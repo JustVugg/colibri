@@ -25,12 +25,37 @@ No conversion. The released checkpoint is already fp8 (dense) and fp4 (experts),
 colibri reads both formats natively -- the fp4 expert layout is byte-identical to the
 mxfp4 it already reads for Kimi K3.
 
+Preparing the engram sidecar needs `transformers`, `tokenizers`, `numpy`, and
+`sympy` in the Python environment used for `prepare_dsv41.py`. For example, on
+Linux or macOS, create a virtual environment and install them once:
+
+```sh
+python3 -m venv ~/.venvs/dsv41
+~/.venvs/dsv41/bin/python -m pip install transformers tokenizers numpy sympy
+```
+
+Use `~/.venvs/dsv41/bin/python` in place of `python3` in the preparation commands
+below. The model engine itself does not require those Python packages.
+
 ```sh
 hf download deepseek-ai/DeepSeek-V4.1-Flash --local-dir ~/Models/DeepSeek-V4.1-Flash
 python3 c/tools/prepare_dsv41.py --model ~/Models/DeepSeek-V4.1-Flash   # ~1 MB sidecar, once
 make -C c deepseek_v41
 coli chat --model ~/Models/DeepSeek-V4.1-Flash
 ```
+
+**DeepSeek-V4.1-Flash-1017** (October 17) is the same model with new weights: the same
+`config.json`, the same 96,085 tensors in the same formats, the same tokenizer and prompt
+encoding, byte for byte. It runs the same way:
+
+```sh
+hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 --local-dir ~/Models/DeepSeek-V4.1-Flash-1017
+python3 c/tools/prepare_dsv41.py --model ~/Models/DeepSeek-V4.1-Flash-1017
+coli chat --model ~/Models/DeepSeek-V4.1-Flash-1017
+```
+
+It ships no `chat_template.jinja`, and nothing here needs one: the gateway writes V4.1's
+prompts itself (`render_chat_dsv41` in `openai_server.py`).
 
 `prepare_dsv41.py` writes the three tables the engine cannot derive at load time and
 that never change for a checkpoint: the compressed-token map (the tokenizer's
@@ -137,6 +162,33 @@ is worth more than any optimization in this file. Cold, or it is not a number.
 `V41_DSPARK=0` turns the head off entirely and it is then not even loaded;
 `V41_DSPARK_MINACC` moves the guard, whose default of 60% is where these runs
 put it.
+
+How many of a round's drafts the verify carries comes from the head itself. Each stage
+has a confidence projection, and the sigmoid of its score is the acceptance the head
+predicts for that draft. `spec_draft.h`'s gate (`spec_gate_pick_p`) maps each prediction
+through the acceptance it measured for drafts given that prediction, and picks the depth
+that yields the most tokens per unit of what a verify of that many rows costs here (the
+gate of [speculative.md](speculative.md#the-gate)); a round whose drafts it does not
+believe in takes a plain step. This is DeepSeek's confidence-scheduled verification. The
+acceptance guard counts every draft the stages wrote, verified or not: the stages read
+their experts for each one, and a draft the gate left unverified bought nothing.
+`V41_DSPARK_GATE=0` verifies every draft, as before.
+
+On the RTX PRO 4000 above with UD-IQ1_S and the Q8_0 head (named next to a GGUF, not
+linked by default: [gguf.md](gguf.md)), the Vulkan chain, 128 tokens, two rounds of
+three prompts:
+
+| | decode tok/s |
+|---|---|
+| no head (`V41_DSPARK=0`) | 4.68-4.99 |
+| every draft verified (`V41_DSPARK_GATE=0`) | 3.64-4.28 |
+| the gate | 4.10-4.41 |
+
+On a 1-bit model the head agrees with the backbone too rarely to pay for its stages
+(1 of 20 drafts accepted in a turn), and the gate takes back most of what verifying them
+costs. Before the guard counted the drafts the gate left unverified, the same gate
+measured 2.81-3.64: the drafts it trusted were accepted, so the guard never paused, and
+every round paid the stages for drafts it then declined.
 
 ## The index-key slot, and why the default is the odd one
 
@@ -324,6 +376,53 @@ Cold, same turn, same prompt, same seed, each step measured on the one before it
 Of that last 25.1 s turn, prefill is 10.7 s (5.9 disk, 2.3 matmul) and decode is
 13.8 s (4.5 disk, 4.7 matmul).
 
+## The prompt's tail: the layers after layer 20 on its last 2414 rows
+
+Layer 20 is the first with `compress_ratio` 1, and it is where the long context lives
+for every layer after it: its compressed KV and index keys are the ones layers 21 to
+39 attend (`kv_source`, `index_owner`), and its candidate blocks are theirs
+(`candidate_source`). What those 19 layers keep of their own is a window of 128 rows.
+So once layer 20 has run on every row of a prompt, a row's output in the layers after
+it depends on the rows before it only through those windows, 127 rows back a layer:
+the last `19 x 127 + 1 = 2414` rows of a prompt give the last row's logits, and every
+window row the next decode step reads, exactly as running all the rows does. The
+engine runs layers 21 to 39 on that tail only (`v41_prefill_tail`, the Vulkan chain's
+chunks included: a chunk wholly before the tail stops after layer 20). A prompt of
+3000 rows saves 19 of 40 layers on 586 of them; one of 8000, on 5586. DeepSeek's
+deployment notes call this a bounded replay of the decoder's sliding windows.
+
+The tiny fixture has the same layout at toy size (layers 4 and 5 after layer 3, a
+window of 8, so a tail of 15): its logits are the same bytes with the tail and without
+it, on the CPU and on the chain, the prompt's forward and every decode step after it,
+and a tail of 14 rows already differs, so 15 is the shortest exact tail
+(`tests/test_dsv41_prefill_tail.py`).
+
+Measured on an RTX PRO 4000 (24 GB) with 62 GB of RAM, UD-IQ1_S, the Vulkan chain and
+tier, DSpark off, one request per server, every row (`V41_PREFILL_TAIL=0`) against the
+tail:
+
+| prompt | every row | the tail | decode, every row / the tail |
+|---|---|---|---|
+| 3403 tokens | 29.3 tok/s | 31.8 tok/s (+8.5%) | 3.91 / 3.92 tok/s |
+| 6777 tokens | 21.5 tok/s | 26.6 tok/s (+24%) | 3.84 / 3.88 tok/s |
+
+With the tier's placement fixed (the same starting history, no promotions, no balance,
+no streaming: `COLI_VK_TIER_GB=4 COLI_VK_TIER_RATE=0 COLI_VK_TIER_BALANCE=0
+COLI_VK_TIER_STREAM=0 COLI_VK_TIER_PROMOTE=0`), four prompts of 3860 to 9145 tokens gave
+the same logits bit for bit with the tail and without it, the prompt's forward and 15
+decode steps each, and the same text; the four took 4589 s against 5172. With the
+adaptive tier the 6777-token prompt's answer was not the same text: which experts sit on
+the device follows what the prompt routed, and an expert on the device sums in a different
+order than on the CPU, so two runs of the same setting with different histories differ
+the same way ([speculative.md](speculative.md#how-a-verify-works)).
+
+DeepSeek serves with a shorter tail, 140 rows (a window and the head's backtracking),
+which is below the exact one and so changes the answer. `V41_PREFILL_TAIL=140` runs it
+for comparison. On three prompts of 3860 to 3990 tokens it took the prompts from 520 to
+352 s (1.48x), and the first token's distribution moved by a KL of 0.004, 0.015 and
+0.047 nats from the exact one, single logits by up to 3.5; the first token was the same
+in all three. It is not the default.
+
 ## Two ways of hiding the reads that did not work
 
 Both are written down because they are the obvious next ideas and both were built,
@@ -360,7 +459,9 @@ and costs the contention. Anything that tries again has to start from that.
 | `V41_TRACE` | unset | print a checksum of the tensors the reference prints too, for locating a divergence by diffing two columns. `2` follows the first row of a speculative step instead of the last, which is the row a sequential decode is comparable to. |
 | `V41_DSPARK` | on when the checkpoint carries the head | `0` disables the draft head and does not load it. Measured at +17% on the real checkpoint, cold; see above. |
 | `V41_DSPARK_MAX` | the checkpoint's `dspark_block_size` | how many of the drafted tokens are put in front of the main model. Fewer means a cheaper rejected round and a lower ceiling on the win. |
-| `V41_DSPARK_MINACC` | 60 | percent of drafts that must be accepted over a window of ten for drafting to continue; below it, drafts pause for 64 tokens. 60 is the measured break-even, not a guess. |
+| `V41_DSPARK_MINACC` | 60 | percent of the drafts written that must be accepted over a window of ten for drafting to continue (a draft the gate left unverified counts as not accepted); below it, drafts pause for 64 tokens. 60 is the measured break-even, not a guess. |
+| `V41_DSPARK_GATE` | on | how many of a round's drafts are verified, from the head's confidence in each (see above). `0` verifies every draft. |
+| `V41_PREFILL_TAIL` | the exact tail (2414 rows on V4.1) | how many of a prompt's last rows the layers after layer 20 run on (see "The prompt's tail"). Unset: the exact tail, the same bits as every row. `0` runs every row; a smaller number (DeepSeek serves with 140) is faster and approximate. |
 | `V41_SPEC_FORCE` | unset | oracle mode only: draft the reference's tokens (`1`), corrupt the last one (`2`), use the head's own (`3`), corrupt the first one (`4`) or a different one each round (`5`), to exercise the verification path on a fixture whose draft head is random. |
 
 ## Vulkan (`VK=1`)

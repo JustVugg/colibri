@@ -22,12 +22,22 @@
 // Each column runs the CPU's products and sums in its order; the two l2 sums and the
 // output norm's sum are made by one thread in order, as on the CPU.
 // Parameters in prm at prm_off: A_log[H], dt[P], norm[VD].
+// -DROWS (chain_kda_rows.spv, a prompt chunk's rows: vkc_kda_rec_flags from
+// VKC_KDA_ROWS rows) runs mode 1 R rows at a time with the same arithmetic in the same
+// order, so the same bits: rec() takes about six workgroup barriers a row and its l2 and
+// output sums by one thread, which the rows wait on in turn. Per block: q, k, alpha and v
+// into shared memory (threads over the block's elements), each row's l2 sums in order by
+// a thread of its own, the rows' recurrence in order with no barrier, each row's output
+// sum in order by its thread, the outputs written; four or five barriers a block.
 // flags (Kimi K3's kda_forward; 0 is the above, GLM-5.3's):
 //   1  prm holds exp(A_log) itself (the engine keeps A = exp(A_log)), used as it is
 //   2  the l2 sums take eps after the squares, q is normalized and then scaled
 //      ((q * rq) * qscale, k * rk), and the update is k * ((v - mem) * beta)
 layout(local_size_x = 128) in;
 layout(constant_id = 0) const int KD = 128;
+#ifdef ROWS
+layout(constant_id = 1) const int R = 8;   // rows a block (the host fits the shared memory)
+#endif
 
 layout(std430, binding = 0) readonly buffer IN { float xin[]; };   // 0: q|k|v projections; 1: conv output
 layout(std430, binding = 1) readonly buffer WB { float w[]; };     // 0: taps; 1: prm
@@ -70,11 +80,20 @@ layout(push_constant) uniform P { int v[32]; } p;
 #define EPS      intBitsToFloat(p.v[19])
 #define FLAGS    p.v[20]
 
+#ifdef ROWS
+shared float bq[R * KD];
+shared float bk[R * KD];
+shared float ba[R * KD];
+shared float bv[R * 128];
+shared float bo[R * 128];
+shared float bqn[R], bkn[R], bbeta[R], bon[R];
+#else
 shared float sq[KD];
 shared float sk[KD];
 shared float al[KD];
 shared float ov[128];
 shared float scal[2];
+#endif
 
 float sig(float x) {   // hyper_connections.h's and glm53.c's two-sided form
     if (x >= 0.0) return 1.0 / (1.0 + exp(-x));
@@ -82,6 +101,7 @@ float sig(float x) {   // hyper_connections.h's and glm53.c's two-sided form
     return e / (1.0 + e);
 }
 
+#ifndef ROWS
 void conv() {
     int c = int(gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 128u);
     if (c >= C_) return;
@@ -167,7 +187,92 @@ void rec() {
     if (own) [[unroll]] for (int k = 0; k < KD; k++) st[sb + k * VD + v] = col[k];
 }
 
+#else
+// rec()'s rows a block at a time (see the top): every value as rec() makes it
+void rec_rows() {
+    int h = int(gl_WorkGroupID.x), v = int(gl_LocalInvocationID.x);
+    int Pw = PW;
+    bool own = v < VD;
+    float col[KD];
+    int sb = ST_OFF + h * KD * VD;
+    [[unroll]] for (int k = 0; k < KD; k++) col[k] = own ? st[sb + k * VD + v] : 0.0;
+    float ea = (FLAGS & 1) != 0 ? w[PRM_OFF + h] : exp(w[PRM_OFF + h]);
+    for (int s0 = 0; s0 < S_; s0 += R) {
+        int nr = min(R, S_ - s0);
+        for (int i = v; i < nr * KD; i += 128) {
+            int r = i / KD, k = i - r * KD, mb = M_OFF + (s0 + r) * M_ROW;
+            bq[i] = xin[mb + h * KD + k];
+            bk[i] = xin[mb + Pw + h * KD + k];
+            float f = fr[F_OFF + (s0 + r) * F_ROW + h * KD + k] + w[PRM_OFF + H_ + h * KD + k];
+            ba[i] = exp(LB * sig(ea * f));
+        }
+        for (int i = v; i < nr * 128; i += 128) {
+            int r = i >> 7, d = i & 127;
+            bv[i] = d < VD ? xin[M_OFF + (s0 + r) * M_ROW + 2 * Pw + h * VD + d] : 0.0;
+        }
+        barrier();
+        if (v < nr) {   // row v's l2 sums, in order, eps first (rec()'s)
+            int r = v;
+            if ((FLAGS & 2) != 0) {
+                float qs = 0.0, ks = 0.0;
+                for (int k = 0; k < KD; k++) { qs += bq[r * KD + k] * bq[r * KD + k]; ks += bk[r * KD + k] * bk[r * KD + k]; }
+                bqn[r] = 1.0 / sqrt(qs + NEPS);
+                bkn[r] = 1.0 / sqrt(ks + NEPS);
+            } else {
+                float qs = NEPS, ks = NEPS;
+                for (int k = 0; k < KD; k++) { qs += bq[r * KD + k] * bq[r * KD + k]; ks += bk[r * KD + k] * bk[r * KD + k]; }
+                bqn[r] = (1.0 / sqrt(float(KD))) / sqrt(qs);
+                bkn[r] = 1.0 / sqrt(ks);
+            }
+            bbeta[r] = sig(br[B_OFF + (s0 + r) * B_ROW + h]);
+        }
+        barrier();
+        if ((FLAGS & 2) != 0) {   // kimi_k3.c: q and k normalized first
+            for (int i = v; i < nr * KD; i += 128) { int r = i / KD; bq[i] = (bq[i] * bqn[r]) * (1.0 / sqrt(float(KD))); bk[i] = bk[i] * bkn[r]; }
+            barrier();
+        }
+        for (int r = 0; r < nr; r++) {   // the rows in order: each column's own registers
+            float qn = bqn[r], kn = bkn[r], beta = bbeta[r];
+            float val = own ? bv[r * 128 + v] : 0.0;
+            float mem = 0.0, res = 0.0;
+            if ((FLAGS & 2) != 0) {
+                [[unroll]] for (int k = 0; k < KD; k++) { col[k] *= ba[r * KD + k]; mem += bk[r * KD + k] * col[k]; }
+                float vt = (val - mem) * beta;
+                [[unroll]] for (int k = 0; k < KD; k++) {
+                    col[k] += bk[r * KD + k] * vt;
+                    res += bq[r * KD + k] * col[k];
+                }
+            } else {
+                [[unroll]] for (int k = 0; k < KD; k++) { col[k] *= ba[r * KD + k]; mem += (bk[r * KD + k] * kn) * col[k]; }
+                [[unroll]] for (int k = 0; k < KD; k++) {
+                    col[k] += (bk[r * KD + k] * kn) * (val - mem) * beta;
+                    res += (bq[r * KD + k] * qn) * col[k];
+                }
+            }
+            bo[r * 128 + v] = own ? res : 0.0;
+        }
+        barrier();
+        if (v < nr) {   // row v's output norm, its sum in order
+            float sum = 0.0;
+            for (int d = 0; d < VD; d++) sum += bo[v * 128 + d] * bo[v * 128 + d];
+            bon[v] = 1.0 / sqrt(sum / float(VD) + EPS);
+        }
+        barrier();
+        for (int i = v; i < nr * 128; i += 128) {
+            int r = i >> 7, d = i & 127, s = s0 + r;
+            if (d < VD) o[Y_OFF + s * Y_ROW + h * VD + d] = bo[i] * bon[r] * w[PRM_OFF + H_ + Pw + d] * sig(gr[G_OFF + s * G_ROW + h * VD + d]);
+        }
+        barrier();
+    }
+    if (own) [[unroll]] for (int k = 0; k < KD; k++) st[sb + k * VD + v] = col[k];
+}
+#endif
+
 void main() {
+#ifdef ROWS
+    rec_rows();
+#else
     if (p.v[0] == 0) conv();
     else rec();
+#endif
 }

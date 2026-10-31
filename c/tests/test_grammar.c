@@ -51,6 +51,20 @@ int main(void){
     CHECK(gr_forced(&S,buf,sizeof buf)==6 && !memcmp(buf,"o_fit\"",6));
     gr_free(&G);
 
+    /* rule names longer than 63 bytes that share a prefix stay distinct rules:
+     * JSON-schema converters write names like these for nested objects */
+    {
+        static char src[1024];
+        const char *pre = "root-properties-shipping-address-properties-street-line-number-kind";
+        snprintf(src, sizeof src,
+                 "root ::= %s-a %s-b\n%s-a ::= \"x\"\n%s-b ::= \"y\"\n", pre, pre, pre, pre);
+        CHECK(gr_parse(&G, src) == 0);
+        gr_state_init(&S, &G);
+        CHECK(feed(&S, "xy") == 2);
+        CHECK(gr_admissible(&S, m, &end) == 0 && end == 1);
+        gr_free(&G);
+    }
+
     /* classi con range, star: niente forcing dove la grammatica dirama */
     CHECK(gr_parse(&G,"root ::= \"a\" [0-9]* \"b\"")==0);
     gr_state_init(&S,&G);
@@ -199,6 +213,23 @@ int main(void){
         gr_state_init(&S, &G);
         CHECK(S.alive && feed(&S, "aaaa") == 4);
         gr_free(&G);
+    }
+
+    /* Alternates that fan out into the same stacks (a_i ::= a_{i+1} | a_{i+1}) walk 2^N paths
+     * to one stack: 40 levels in 716 bytes were hours of the engine's loop. GR_MAX_WORK turns
+     * the walker off at once; 10 levels (1024 paths) stay within it and still read their byte. */
+    {
+        static char chain[2048];
+        for (int levels = 10; levels <= 40; levels += 30) {
+            int n = snprintf(chain, sizeof chain, "root ::= a0\n");
+            for (int i = 0; i < levels; i++) n += snprintf(chain + n, sizeof chain - n, "a%d ::= a%d | a%d\n", i, i + 1, i + 1);
+            snprintf(chain + n, sizeof chain - n, "a%d ::= \"x\"\n", levels);
+            CHECK(gr_parse(&G, chain) == 0);
+            gr_state_init(&S, &G);
+            if (levels == 10) CHECK(S.alive && S.n == 1 && feed(&S, "x") == 1);
+            else CHECK(!S.alive && S.work > GR_MAX_WORK && gr_accept(&S, 'x') == -1);
+            gr_free(&G);
+        }
     }
 
     puts("test_grammar: ok");

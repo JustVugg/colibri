@@ -45,18 +45,26 @@
  * not wrapped to a negative index when it is walked. */
 #define GR_MAX_ALTS   32767
 #define GR_MAX_SYMS   32767
+/* The steps one byte (or the start of the output) may take to bring its stacks to normal
+ * form. Alternates that fan out into the same stacks again and again (a0 ::= a1 | a1,
+ * a1 ::= a2 | a2, ...) walk 2^depth paths that all end in one stack: GR_MAX_STACKS never
+ * fills and GR_MAX_DEPTH is not reached below 64 levels, so a grammar of a few hundred
+ * bytes kept the engine's loop busy for hours. Past this budget the walker switches off,
+ * as it does for left recursion: the request runs without grammar drafts, its output the
+ * same. A JSON schema's grammar, a free JSON grammar and NDJSON take at most 35 steps a byte. */
+#define GR_MAX_WORK   (1u << 16)
 
 typedef struct { uint8_t bits[32]; } GrCls;              /* insieme di byte ammessi */
 enum { GR_CLS = 0, GR_REF = 1 };
 typedef struct { uint8_t t; int16_t ref; GrCls c; } GrSym;
 typedef struct { GrSym *s; int n, cap; } GrAlt;          /* una sequenza di simboli */
-typedef struct { GrAlt *a; int n, cap; char name[64]; } GrRule;
+typedef struct { GrAlt *a; int n, cap; char *name; } GrRule;
 typedef struct { GrRule r[GR_MAX_RULES]; int n; int root; char err[160]; } Grammar;
 
 /* frame = posizione dentro un alternate: (regola, alternate, simbolo) */
 typedef struct { int16_t r, a, s; } GrFrame;
 typedef struct { GrFrame f[GR_MAX_DEPTH]; int16_t n; } GrStack;
-typedef struct { Grammar *G; GrStack st[GR_MAX_STACKS]; int n; int alive; } GrState;
+typedef struct { Grammar *G; GrStack st[GR_MAX_STACKS]; int n; int alive; unsigned work; } GrState;   /* work: GR_MAX_WORK */
 
 /* ---------- costruzione ---------- */
 
@@ -77,19 +85,22 @@ static int gr__push(Grammar *G, int ri, int ai, const GrSym *sy){
         A->s=ns; A->cap=nc; }
     A->s[A->n++]=*sy; return 0;
 }
+/* Names are kept whole: generated grammars (JSON-schema converters) use
+ * long names that share their first 63 bytes and are still different rules. */
 static int gr__rule(Grammar *G, const char *name, int len){
-    if(len>63) len=63;
     for(int i=0;i<G->n;i++)
         if((int)strlen(G->r[i].name)==len && !memcmp(G->r[i].name,name,(size_t)len)) return i;
     if(G->n>=GR_MAX_RULES) return -1;
     GrRule *R=&G->r[G->n]; memset(R,0,sizeof *R);
-    memcpy(R->name,name,(size_t)len);
+    R->name=(char*)malloc((size_t)len+1); if(!R->name) return -1;
+    memcpy(R->name,name,(size_t)len); R->name[len]=0;
     return G->n++;
 }
 static int gr__anon(Grammar *G){                          /* regola sintetica ($n non collide: '$' non e' un identificatore */
     if(G->n>=GR_MAX_RULES) return -1;
     GrRule *R=&G->r[G->n]; memset(R,0,sizeof *R);
-    snprintf(R->name,sizeof R->name,"$%d",G->n);
+    R->name=(char*)malloc(16); if(!R->name) return -1;
+    snprintf(R->name,16,"$%d",G->n);
     return G->n++;
 }
 
@@ -285,6 +296,7 @@ static void gr_free(Grammar *G){
     for(int i=0;i<G->n;i++){
         for(int a=0;a<G->r[i].n;a++) free(G->r[i].a[a].s);
         free(G->r[i].a);
+        free(G->r[i].name);
     }
     G->n=0;
 }
@@ -301,6 +313,7 @@ static int gr__set_add(GrState *S, const GrStack *k){
  * diramando sugli alternate delle regole referenziate. 0 = overflow (fail-safe). */
 static int gr__normalize(Grammar *G, GrStack *k, GrState *out, int depth){
     for(;;){
+        if(++out->work>GR_MAX_WORK) return 0;             /* a fan-out that repeats itself: fail-safe */
         if(k->n==0) return gr__set_add(out,k);
         GrFrame *t=&k->f[k->n-1];
         GrAlt *A=&G->r[t->r].a[t->a];
@@ -326,7 +339,7 @@ static int gr__normalize(Grammar *G, GrStack *k, GrState *out, int depth){
     }
 }
 static void gr_state_init(GrState *S, Grammar *G){
-    S->G=G; S->n=0; S->alive=1;
+    S->G=G; S->n=0; S->alive=1; S->work=0;
     GrRule *R=&G->r[G->root];
     for(int a=0;a<R->n;a++){
         GrStack k; k.n=1;
@@ -339,7 +352,7 @@ static void gr_state_init(GrState *S, Grammar *G){
  * -1 = walker spento (overflow: da qui in poi niente piu' draft). */
 static int gr_accept(GrState *S, unsigned char b){
     if(!S->alive) return -1;
-    GrState out; out.G=S->G; out.n=0; out.alive=1;
+    GrState out; out.G=S->G; out.n=0; out.alive=1; out.work=0;
     for(int i=0;i<S->n;i++){
         GrStack *k=&S->st[i];
         if(k->n==0) continue;                             /* parse gia' completo: non consuma */
@@ -350,7 +363,7 @@ static int gr_accept(GrState *S, unsigned char b){
         if(!gr__normalize(S->G,&cp,&out,0)){ S->alive=0; return -1; }
     }
     if(out.n==0) return 0;
-    S->n=out.n;
+    S->n=out.n; S->work=out.work;                         /* the steps this byte took */
     memcpy(S->st,out.st,(size_t)out.n*sizeof(GrStack));
     return 1;
 }

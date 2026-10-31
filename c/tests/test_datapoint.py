@@ -69,6 +69,32 @@ class MachineInfoWin32Test(unittest.TestCase):
         self.assertEqual(info["ram"], "?")
 
 
+class IOBenchDatapointTest(unittest.TestCase):
+    def test_direct_result_is_reported_as_cold_disk_throughput(self):
+        result = subprocess.CompletedProcess(
+            args=["iobench"], returncode=0,
+            stdout="O_DIRECT x8 threads: 64 reads -> 2.50 GB/s\n", stderr="")
+        with mock.patch.object(datapoint.subprocess, "run", return_value=result):
+            self.assertEqual(datapoint.run_iobench("iobench", "shard", 1), 2.5)
+
+    def test_direct_fallback_is_not_reported_as_cold_disk_throughput(self):
+        result = subprocess.CompletedProcess(
+            args=["iobench"], returncode=0,
+            stdout="buffered x8 threads: 64 reads -> 3.25 GB/s\n",
+            stderr="O_DIRECT is unavailable; using buffered I/O\n")
+        with mock.patch.object(datapoint.subprocess, "run", return_value=result):
+            self.assertIsNone(datapoint.run_iobench("iobench", "shard", 1))
+            self.assertEqual(datapoint.run_iobench("iobench", "shard", 0), 3.25)
+
+    def test_failed_iobench_cannot_supply_a_disk_result(self):
+        result = subprocess.CompletedProcess(
+            args=["iobench"], returncode=1,
+            stdout="O_DIRECT x8 threads: 64 reads -> 3.25 GB/s\n",
+            stderr="pread: Invalid argument\n")
+        with mock.patch.object(datapoint.subprocess, "run", return_value=result):
+            self.assertIsNone(datapoint.run_iobench("iobench", "shard", 1))
+
+
 class PersistentDatapointTest(unittest.TestCase):
     def setUp(self):
         self.family = SimpleNamespace(

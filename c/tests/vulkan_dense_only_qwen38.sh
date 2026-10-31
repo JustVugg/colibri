@@ -23,6 +23,8 @@ dho_family_qwen38() {
   # the MTP head's matrices run per matrix on the device here (on the CPU with the host
   # copies kept on this device): tokens and the CPU's logits
   dho_gate qwen38 "dense-only qwen38 MTP mixed" 1 Q38_MTP=1 Q38_MTP_FORCE=mixed SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
+  # the draft list is scored from the int8 rows of the lm_head, which are left on the host
+  dho_gate qwen38 "dense-only qwen38 MTP draft list" 0 Q38_MTP=1 Q38_MTP_FORCE=mixed Q38_TRUNK_MIN_KB=0 USAGE_SAVE=0 SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
   # prompts on the chain, decode on the per-matrix path: the device's in this mode
   CHAINMODE=2 dho_gate qwen38 "dense-only qwen38 prompts only" 1 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
   CHAINMODE=0 dho_gate qwen38 "dense-only qwen38 per-matrix path" 2 Q38_TRUNK_MIN_KB=0 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
@@ -55,18 +57,20 @@ dho_family_qwen38_sanitize() {
     case $tag in
       "int8 trunk") args=(Q38_TRUNK_MIN_KB=0 SNAP=qwen38_tiny ./qwen38 4 8 qwen38_tiny/ref.json) ;;
       "MTP mixed") args=(Q38_MTP=1 Q38_MTP_FORCE=mixed SNAP=qwen38_tiny_mtp ./qwen38 2 8 qwen38_tiny_mtp/ref.json) ;;
-      "device lost") args=(COLI_VK_CHAIN_FAULT=40 Q38_TRUNK_MIN_KB=0 SNAP=qwen38_tiny ./qwen38 4 8 qwen38_tiny/ref.json) ;;
+      # frame 40 of the host's routing (COLI_VK_CHAIN_MOE=0): with the routed experts in the
+      # frame a forward is one frame, and the run has nine
+      "device lost") args=(COLI_VK_CHAIN_MOE=0 COLI_VK_CHAIN_FAULT=40 Q38_TRUNK_MIN_KB=0 SNAP=qwen38_tiny ./qwen38 4 8 qwen38_tiny/ref.json) ;;
     esac
     rm -f chain.usage
     env COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_DENSE_HOST=0 "${args[@]}" > san.log 2>&1 || true
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan dense-only qwen38 $tag: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "asan dense-only qwen38 $tag: sanitizer diagnostic"; fi
     [ "$(dho_dropped san.log)" -gt 0 ] || { cat san.log; fail "asan dense-only qwen38 $tag: nothing on the device only"; }
     if [ "$tag" = "device lost" ]; then [ "$(dho_reloaded san.log)" -gt 0 ] || { cat san.log; fail "asan dense-only qwen38 $tag: nothing read back"; }; fi
     echo "OK asan dense-only qwen38 $tag: sanitizers clean, $(dho_dropped san.log) matrices on the device only, $(dho_reloaded san.log) read back"
   done
   CHAIN_SERVE_EXPECT='dense matrices on the device only' COLI_VK_DENSE_HOST=0 \
     $PY tests/vulkan_chain_serve.py ./qwen38 qwen38_tiny_mtp Q38_MTP=1 > san.log 2>&1 || { cat san.log; fail "asan dense-only qwen38 serve"; }
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan dense-only qwen38 serve: sanitizer diagnostic"; fi
+  if san_diag san.log; then cat san.log; fail "asan dense-only qwen38 serve: sanitizer diagnostic"; fi
   echo "OK asan dense-only qwen38 serve: $(tail -1 san.log)"
   rm -f chain.usage
   unset OMP_NUM_THREADS

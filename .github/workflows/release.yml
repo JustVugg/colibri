@@ -87,8 +87,8 @@ jobs:
       # Lavapipe, which the verify step runs the packaged engine on.
       - if: matrix.os == 'ubuntu-latest'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libvulkan-dev glslc mesa-vulkan-drivers
+          # hard limits around apt: a stalled mirror held CI jobs for hours (2026-10-07)
+          bash .github/scripts/apt-install.sh libvulkan-dev glslc mesa-vulkan-drivers
 
       # Every portable sibling engine, not just GLM. CI's all-platform engine
       # matrix proves the same list builds before these archives are assembled.
@@ -206,6 +206,9 @@ jobs:
           # probe that layout as well as the source checkout's one-level-up form.
           mkdir -p dist/web
           cp -r web/dist dist/web/dist
+          # the chat UI (coli ui) sits next to coli as well: its page and its server
+          mkdir -p dist/ui
+          cp ui/index.html ui/server.py ui/agents.py ui/responses_shim.py ui/web.py ui/models.py ui/README.md dist/ui/
           cd dist
           if [ "${{ matrix.ext }}" = ".exe" ]; then
             7z a colibri-${TAG}-${{ matrix.name }}.zip *
@@ -331,6 +334,10 @@ jobs:
           # path is exactly the failure this whole step exists to catch.
           test -f web/dist/index.html   || { echo "FAIL: dashboard missing from archive"; exit 1; }
           test -f web/dist/experts.json || { echo "FAIL: expert atlas missing from archive"; exit 1; }
+          test -f ui/index.html && test -f ui/server.py || { echo "FAIL: chat UI missing from archive"; exit 1; }
+          # the Models page imports colibri's setup modules from next to coli: packaged too
+          python3 -c "import sys; sys.path.insert(0, 'ui'); import models, os; assert os.path.samefile(models.COLI_DIR, '.'); print('OK: ui/models.py imports from', models.COLI_DIR)" \
+            || { echo "FAIL: packaged ui/models.py does not import"; exit 1; }
           python3 -c "import sys; sys.path.insert(0, '.'); from openai_server import APIHandler as A; d = A.WEB_DIST; assert (d / 'index.html').is_file(), 'server resolved WEB_DIST to %s, which has no index.html' % d; assert (d / 'experts.json').is_file(), 'no expert atlas under %s' % d; print('OK: the packaged server resolves the dashboard at', d)"
 
       # The GPU backends in the archive, by behaviour as above. Vulkan (Linux, Windows):
@@ -406,7 +413,9 @@ jobs:
   # SASS for sm_80/86/89/90/120 plus compute_120 PTX, so RTX 30, 40 and 50 cards and
   # their datacenter peers), the CUDA runtime it links, and the three engines that load
   # it (colibri, qwen36, kimi_k3; CUDA_DLL=1, with Vulkan and the NPU lane as in the
-  # main archive). Unpacked next to windows-x86_64.zip's engines it replaces those three,
+  # main archive); and DeepSeek V4's own two, coli_cuda_dsv4_dg.dll (DeepGEMM, RTX 50)
+  # and coli_cuda_dsv4.dll (portable), which the main archive's deepseek_v4.exe loads
+  # at run time (#2047; DSV4_TC=0: no cuBLASLt, so cudart64_12.dll is all they need). Unpacked next to windows-x86_64.zip's engines it replaces those three,
   # and coli setup / coli chat turn CUDA on for an NVIDIA card it runs on. A separate
   # archive because the DLL is large and only an NVIDIA card can use it.
   # windows-2022 and CUDA 12.8.1: the pins of ci.yml's windows-cuda-build, which builds
@@ -422,7 +431,8 @@ jobs:
         with:
           cuda: '12.8.1'
           method: network
-          sub-packages: '["nvcc", "cudart"]'
+          # cuda_profiler_api and thrust (CCCL): DeepSeek V4's DLLs (ci.yml, windows-cuda-build)
+          sub-packages: '["nvcc", "cudart", "cuda_profiler_api", "thrust"]'
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: UCRT64
@@ -440,12 +450,14 @@ jobs:
           make cuda-dll CUDA_ARCH=portable
           # .exe names: only colibri has a phony alias (ci.yml, windows-cuda-build)
           for t in colibri.exe qwen36.exe kimi_k3.exe; do make $t CUDA_DLL=1 VK=1 XDNA=1; done
-          ls -l coli_cuda.dll colibri.exe qwen36.exe kimi_k3.exe
+          make cuda-dsv4-dll CUDA_ARCH=portable DSV4_TC=0
+          make cuda-dsv4-dg-dll DSV4_TC=0
+          ls -l coli_cuda.dll coli_cuda_dsv4.dll coli_cuda_dsv4_dg.dll colibri.exe qwen36.exe kimi_k3.exe
       - name: Package
         shell: bash
         run: |
           mkdir -p dist/pkg
-          cp c/coli_cuda.dll c/colibri.exe c/qwen36.exe c/kimi_k3.exe dist/pkg/
+          cp c/coli_cuda.dll c/coli_cuda_dsv4.dll c/coli_cuda_dsv4_dg.dll c/colibri.exe c/qwen36.exe c/kimi_k3.exe dist/pkg/
           cp "$CUDA_PATH"/bin/cudart64_*.dll dist/pkg/
           printf '%s\r\n' \
             "colibri ${TAG}: the CUDA backend for Windows" \
@@ -457,6 +469,10 @@ jobs:
             "coli_cuda.dll runs on compute capability 8.0 and newer (RTX 30, 40, 50 series," \
             "A100, H100 and later) with an NVIDIA driver for CUDA 12. Older cards keep" \
             "Vulkan. cudart64_12.dll is NVIDIA's CUDA runtime, redistributed with it." \
+            "" \
+            "DeepSeek V4 (deepseek_v4.exe, in the main archive) has its own backend:" \
+            "coli_cuda_dsv4_dg.dll for RTX 50 cards and coli_cuda_dsv4.dll for the others;" \
+            "the engine picks the one that fits the card (DSV4_CUDA=0 keeps it on the CPU)." \
             > dist/pkg/README-CUDA.txt
           cd dist/pkg
           7z a ../colibri-${TAG}-windows-x86_64-cuda.zip *
@@ -466,14 +482,20 @@ jobs:
           mkdir -p verify && cd verify
           7z x ../dist/colibri-${TAG}-windows-x86_64-cuda.zip > /dev/null
           ls -l
-          for f in coli_cuda.dll colibri.exe qwen36.exe kimi_k3.exe README-CUDA.txt; do
+          for f in coli_cuda.dll coli_cuda_dsv4.dll coli_cuda_dsv4_dg.dll colibri.exe qwen36.exe kimi_k3.exe README-CUDA.txt; do
             test -f $f || { echo "FAIL: $f missing from the CUDA package"; exit 1; }
           done
           # the DLL links the runtime that is beside it, and the engines neither CUDA
           # nor Vulkan: they load coli_cuda.dll (backend_loader.c) and the Vulkan loader
           # at run time
-          rt=$(objdump -p coli_cuda.dll | sed -n 's/.*DLL Name: \(cudart64_[0-9]*\.dll\).*/\1/p')
-          test -n "$rt" && test -f "$rt" || { echo "FAIL: coli_cuda.dll's runtime ($rt) is not in the package"; exit 1; }
+          for d in coli_cuda.dll coli_cuda_dsv4.dll coli_cuda_dsv4_dg.dll; do
+            rt=$(objdump -p $d | sed -n 's/.*DLL Name: \(cudart64_[0-9]*\.dll\).*/\1/p')
+            test -n "$rt" && test -f "$rt" || { echo "FAIL: $d's runtime ($rt) is not in the package"; exit 1; }
+          done
+          # DeepSeek V4's DLLs leave cuBLASLt out (DSV4_TC=0): the package does not carry it
+          if objdump -p coli_cuda_dsv4.dll coli_cuda_dsv4_dg.dll | grep -qi 'DLL Name: cublas'; then
+            echo "FAIL: a DeepSeek V4 DLL links cuBLAS, which the package does not carry"; exit 1
+          fi
           for e in colibri qwen36 kimi_k3; do
             deps=$(objdump -p $e.exe | grep 'DLL Name')
             if echo "$deps" | grep -qiE 'cudart|vulkan|coli_cuda'; then echo "FAIL: $e.exe links $deps"; exit 1; fi
