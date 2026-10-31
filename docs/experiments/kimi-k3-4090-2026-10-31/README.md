@@ -163,4 +163,10 @@ commit before, and `tests/mimo_tiny_harness.py` passes.
 |---|---|---|
 | run41-42 | + the routers' BF16 rows over a step's rows; the prompt line counts page faults | the logits the same bytes; 603.4 s (the routing 31.3 -> 23.1 s); **93.7 million page faults** in the prompt |
 | run43-45 | + a step's big buffers kept from one layer to the next (`k3_balloc`), layer 0's SiTU over every worker | the same bytes and text; decode 0.79 tok/s; **581.8 s** (4.53 tok/s), 40.9 million page faults (the expert cache's 158 GB filled for the first time: 38.4 million in the 35-token prompt too) |
+## Runs 46-51: the routed experts 8 rows at a time, 8 rows' sums together
+
+| run | what | result |
+|---|---|---|
+| run46-48 | `matmul_mxfp4_i8_pre`: an output's weights decoded once for 8 rows, their group scales one vector multiply (1.47x a thread at 16-37 rows) | the logits the same bytes; the same text; 546.7 s (the routed experts 255.3 -> 215.5) |
+| run49-51 | + `matmul_i4_grouped`: a group's 8 rows' hsum256 and fmaf at once (`hsum256_x8`, the same pairs; 1.13-1.3x in `bench_i4`) | the same bytes and text; **549 s** (4.81 tok/s), the same as run48 within the runs' noise (the shared experts 88.8 -> 88.0 s) |
 

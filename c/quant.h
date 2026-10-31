@@ -171,6 +171,20 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
 }
 
 /* ---- y[S,O] = x[S,I] @ W^T, W int4 packed + per-GROUP scales (fmt=4) ----- */
+#ifdef __AVX2__
+/* hsum256 of 8 vectors at once, the same pairs added in the same order: lanes 0-3 plus
+ * 4-7, then those lanes 0+2 and 1+3, then the two -- into one vector, the rows in the
+ * order 0, 2, 4, 6, 1, 3, 5, 7 */
+static inline __m256 hsum256_x8(const __m256 *v){
+    __m256 p01=_mm256_add_ps(_mm256_permute2f128_ps(v[0],v[1],0x20),_mm256_permute2f128_ps(v[0],v[1],0x31));
+    __m256 p23=_mm256_add_ps(_mm256_permute2f128_ps(v[2],v[3],0x20),_mm256_permute2f128_ps(v[2],v[3],0x31));
+    __m256 p45=_mm256_add_ps(_mm256_permute2f128_ps(v[4],v[5],0x20),_mm256_permute2f128_ps(v[4],v[5],0x31));
+    __m256 p67=_mm256_add_ps(_mm256_permute2f128_ps(v[6],v[7],0x20),_mm256_permute2f128_ps(v[6],v[7],0x31));
+    __m256 t03=_mm256_add_ps(_mm256_shuffle_ps(p01,p23,0x44),_mm256_shuffle_ps(p01,p23,0xEE));
+    __m256 t47=_mm256_add_ps(_mm256_shuffle_ps(p45,p67,0x44),_mm256_shuffle_ps(p45,p67,0xEE));
+    return _mm256_add_ps(_mm256_shuffle_ps(t03,t47,0x88),_mm256_shuffle_ps(t03,t47,0xDD));
+}
+#endif
 static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
                               int S, int I, int O, int gs){
     int rb=(I+1)/2; int ng=(I+gs-1)/gs;
@@ -196,7 +210,7 @@ static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const
                         const int ns=se-s1<8?se-s1:8;
                         const float *xr[8];
                         for(int r=0;r<8;r++) xr[r]=x+(int64_t)(s1+(r<ns?r:ns-1))*I;   /* spare: the last row again */
-                        float a[8]={0,0,0,0,0,0,0,0};
+                        __m256 av=_mm256_setzero_ps();   /* the rows' totals, in hsum256_x8's order */
                         for(int g=0;g<ng;g++){
                             const int base=g*gs;
                             __m256 acc[8];
@@ -212,9 +226,11 @@ static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const
                                     acc[r]=_mm256_fmadd_ps(_mm256_loadu_ps(xr[r]+i+8),w1,acc[r]);
                                 }
                             }
-                            for(int r=0;r<8;r++) a[r]=fmaf(hsum256(acc[r]),scl[g],a[r]);
+                            av=_mm256_fmadd_ps(hsum256_x8(acc),_mm256_set1_ps(scl[g]),av);   /* each row's fmaf */
                         }
-                        for(int r=0;r<ns;r++) y[(int64_t)(s1+r)*O+o]=a[r];
+                        float a[8]; _mm256_storeu_ps(a,av);
+                        static const int at[8]={0,4,1,5,2,6,3,7};   /* row r's lane */
+                        for(int r=0;r<ns;r++) y[(int64_t)(s1+r)*O+o]=a[at[r]];
                     }
                 }
             }
@@ -1509,44 +1525,50 @@ static void matmul_mxfp4_i8_pre(float *y, const int8_t *xq, const float *xsc,
                                 int S, int I, int O){
     int rb=I/2, ng=I/32;
 #ifdef __AVX2__
-    if(S>=2){
-        /* Several rows (a prompt step's expert): an output's group of weights decoded once
-         * for 4 rows, each row's arithmetic the one-row loop's below -- the same integer
-         * sums of four products in 8 lanes (vpdpbusd's where AVX512-VNNI is there: the
-         * pairs maddubs adds stay far from int16's limit, |w| <= 12 and |x| <= 127), the
-         * same scale and fused add a group, the same hsum256 -- so the same bytes. */
+    if(S>=2&&ng<=128){
+        /* Several rows (a prompt step's expert), 8 at a time: an output's group of weights
+         * decoded once for them, and their 8 group scales one vector multiply (the rows'
+         * activation scales transposed first). Each row's arithmetic is the one-row loop's
+         * below -- the same integer sums of four products in 8 lanes (vpdpbusd's where
+         * AVX512-VNNI is there: the pairs maddubs adds stay far from int16's limit, |w| <= 12
+         * and |x| <= 127), the same scale (the group's times 0.5, times the row's) and fused
+         * add a group, the same hsum256 -- so the same bytes. */
         const __m128i lut2=_mm_setr_epi8(0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12);
         const __m128i m4=_mm_set1_epi8(0x0F);
 #if !(defined(__AVX512VNNI__)&&defined(__AVX512VL__))
         const __m256i ones=_mm256_set1_epi16(1);
 #endif
-        #pragma omp parallel for schedule(static)
-        for(int o=0;o<O;o++){
-            const uint8_t *w=q4+(int64_t)o*rb;
-            const uint8_t *scl=e8s+(int64_t)o*ng;
-            for(int s0=0;s0<S;s0+=4){
-                const int ns=S-s0<4?S-s0:4;
-                const int8_t *xr[4]; const float *xsr[4];
-                for(int r=0;r<4;r++){
-                    int s=s0+(r<ns?r:ns-1);   /* past S: the last row again, not stored */
-                    xr[r]=xq+(int64_t)s*I; xsr[r]=xsc+(int64_t)s*ng;
-                }
-                __m256 acc[4]={_mm256_setzero_ps(),_mm256_setzero_ps(),_mm256_setzero_ps(),_mm256_setzero_ps()};
+        float xsT[128*8];   /* [group][row] */
+        for(int s0=0;s0<S;s0+=8){
+            const int ns=S-s0<8?S-s0:8;
+            const int8_t *xr[8];
+            for(int r=0;r<8;r++){
+                int s=s0+(r<ns?r:ns-1);   /* past S: the last row again, not stored */
+                xr[r]=xq+(int64_t)s*I;
+                for(int g=0;g<ng;g++) xsT[g*8+r]=xsc[(int64_t)s*ng+g];
+            }
+            #pragma omp parallel for schedule(static)
+            for(int o=0;o<O;o++){
+                const uint8_t *w=q4+(int64_t)o*rb;
+                const uint8_t *scl=e8s+(int64_t)o*ng;
+                __m256 acc[8];
+                for(int r=0;r<8;r++) acc[r]=_mm256_setzero_ps();
                 for(int g=0;g<ng;g++){
                     __m128i by=_mm_loadu_si128((const __m128i*)(w+g*16));
                     __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
                     __m128i n0=_mm_shuffle_epi8(lut2,_mm_unpacklo_epi8(lo,hi));
                     __m128i n1=_mm_shuffle_epi8(lut2,_mm_unpackhi_epi8(lo,hi));
                     __m256i wv=_mm256_set_m128i(n1,n0), wa=_mm256_sign_epi8(wv,wv);
-                    float ms=mx4_scale(scl[g])*0.5f;
-                    for(int r=0;r<4;r++){
+                    const __m256 sv=_mm256_mul_ps(_mm256_set1_ps(mx4_scale(scl[g])*0.5f),_mm256_loadu_ps(xsT+g*8));
+                    for(int r=0;r<8;r++){
                         __m256i xs=_mm256_sign_epi8(_mm256_loadu_si256((const __m256i*)(xr[r]+g*32)),wv);
 #if defined(__AVX512VNNI__)&&defined(__AVX512VL__)
                         __m256i d=_mm256_dpbusd_epi32(_mm256_setzero_si256(),wa,xs);
 #else
                         __m256i d=_mm256_madd_epi16(_mm256_maddubs_epi16(wa,xs),ones);
 #endif
-                        acc[r]=_mm256_fmadd_ps(_mm256_cvtepi32_ps(d),_mm256_set1_ps(ms*xsr[r][g]),acc[r]);
+                        acc[r]=_mm256_fmadd_ps(_mm256_cvtepi32_ps(d),
+                                               _mm256_permutevar8x32_ps(sv,_mm256_set1_epi32(r)),acc[r]);
                     }
                 }
                 for(int r=0;r<ns;r++) y[(int64_t)(s0+r)*O+o]=hsum256(acc[r]);

@@ -254,7 +254,7 @@ teacher-forced logit streams at C=32 vs C=1 match exactly). Measured prefill:
 (scalar fallback for head dims not divisible by 8).
 
 **A long prompt's CPU work** (the RTX 4090 machine, docs/experiments/kimi-k3-4090-2026-10-31:
-a 2,637-token prompt took 1,401 s in 512-token steps, **582 s** now in steps of 2,048,
+a 2,637-token prompt took 1,401 s in 512-token steps, **549 s** now in steps of 2,048,
 the logits the same bytes). Each rewrite below keeps every row's and position's arithmetic:
 - the gated MLA's scores were one chain of 576 adds a position (GCC -O3 multiplies 16 at
   a time, then adds the products in order); `k3_mla_scores_g` keeps that arithmetic (an
@@ -265,8 +265,10 @@ the logits the same bytes). Each rewrite below keeps every row's and position's 
   prompt step's rows over every worker;
 - `matmul_i4_grouped` (the shared experts and the latent projections on the CPU) decodes
   16 weights once for 8 rows and keeps 16 rows of input in L2 (1.8x at 512 rows),
-  `matmul_mxfp4_i8_pre` (the routed experts) an output's weights once for 4 rows, the
-  shared experts' SiTU runs over every worker;
+  `matmul_mxfp4_i8_pre` (the routed experts) an output's weights once for 8 rows and
+  their 8 group scales in one multiply (the routed experts 255 -> 216 s), and both sum a
+  group's 8 rows' lanes together (`hsum256_x8`, hsum256's pairs); the shared experts'
+  SiTU runs over every worker;
 - `K3_CHUNK` may be up to 4096: a step reads every expert it needs once from the drives and
   once from RAM for all its rows (2,048 against 512: 5,784 -> 2,455 GB read for that
   prompt, 845 -> 697 s);
