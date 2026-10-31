@@ -2790,6 +2790,8 @@ def render_chat_qwen3_coder(messages, tools=None, tool_choice=None, add_generati
         parts.append("<|im_start|>system\n" + QWEN3_CODER_SYSTEM)
     if tools:
         parts.append(_qwen3_coder_tool_block(tools))
+        if tool_choice == "required":
+            parts.append(TOOL_CHOICE_REQUIRED_INSTRUCTION)
     if system is not None or tools:
         parts.append("<|im_end|>\n")
     loop = messages[start:]
