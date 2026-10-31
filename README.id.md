@@ -31,7 +31,7 @@ engine Qwen3.6. [Mana yang cocok untuk mesin saya](#which-model-for-my-machine)
 
 ```
 $ ./coli chat
-  colibri v2.0.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU
+  colibri v2.1.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! Come posso aiutarti oggi?
