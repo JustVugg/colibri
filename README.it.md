@@ -595,8 +595,8 @@ stesse sia che un expert risponda dalla VRAM, dalla RAM o dal disco.
 - **Speculazione che si ripaga.** La testa MTP int8 di GLM-5.2 propone 2.2-2.8
   token per forward quando conviene; la testa MTP di Qwen3.8-Flash-Next,
   accesa di default, aggiunge il 16-20% con lo stesso output, e il lookup sul
-  prompt il 6-7% sulle modifiche al codice. La testa di Qwen3.6, accesa di
-  default, porta il decode da 99.7-104.5 a 115.8-120.1 tok/s con CUDA e da
+  prompt il 6-7% sulle modifiche al codice. La testa di Qwen3.6
+  (`Q36_MTP=1`) porta il decode da 99.7-104.5 a 115.8-120.1 tok/s con CUDA e da
   83.2-83.8 a 99.9-109.3 con Vulkan (una RTX PRO 4000). La testa DSpark di
   DeepSeek V4.1 propone quanto in profondità dice la sua confidenza, e un
   controllo salta le proposte che non possono ripagarsi. Dove il drafting costa

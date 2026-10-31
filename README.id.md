@@ -613,7 +613,7 @@ dari VRAM, RAM, maupun disk.
 - **Spekulasi yang sepadan dengan biayanya.** Int8 MTP head GLM-5.2 membuat draft
   2.2-2.8 token per forward ketika menguntungkan; MTP head Qwen3.8-Flash-Next,
   aktif secara default, menambah 16-20% dengan output yang sama, dan prompt
-  lookup 6-7% pada edit kode. Head Qwen3.6, aktif secara default, menaikkan
+  lookup 6-7% pada edit kode. Head Qwen3.6 (`Q36_MTP=1`) menaikkan
   decode dari 99.7-104.5 ke 115.8-120.1 tok/s dengan CUDA dan dari 83.2-83.8 ke
   99.9-109.3 dengan Vulkan (sebuah RTX PRO 4000). Head DSpark DeepSeek V4.1
   membuat draft sedalam yang dikatakan keyakinannya, dan sebuah gate melewati

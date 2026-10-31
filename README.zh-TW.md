@@ -510,7 +510,7 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 - **值得才啟用的推測解碼**。GLM-5.2 的 int8 MTP head 在划算時，
   每次前向傳遞可起草 2.2-2.8 個 token；Qwen3.8-Flash-Next 的 MTP head 預設開啟，
   在輸出完全相同的情況下提升 16-20%；提示詞查找在程式碼編輯上提升 6-7%。Qwen3.6 的 head
-  預設開啟，把解碼速度在 CUDA 上從 99.7-104.5 提高到 115.8-120.1 tok/s，在 Vulkan 上從
+  （`Q36_MTP=1`）把解碼速度在 CUDA 上從 99.7-104.5 提高到 115.8-120.1 tok/s，在 Vulkan 上從
   83.2-83.8 提高到 99.9-109.3（一張 RTX PRO 4000）。DeepSeek V4.1 的 DSpark head 依其信心
   決定起草深度，並由一道關卡略過無法回本的草稿。在起草的成本高於節省的地方（DeepSeek V4），
   它保持關閉（[speculative.md](docs/speculative.md)、[tuning.md](docs/tuning.md#speculation-and-reproducibility)）。
