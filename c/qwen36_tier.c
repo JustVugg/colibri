@@ -88,6 +88,9 @@ static struct {
     /* the dense chain's routed experts (qt_chain_*): residency changes counted, and its
      * forwards in flight, which no swap may touch the tensors of */
     unsigned epoch; int chain_hold;
+    /* the uploader is inside device calls (an allocation, a copy, a free): a chain that holds
+     * the tier waits for them to end before its forward (qt_chain_hold) */
+    int uploading;
     /* the chain's promotions (qt_chain_promote): this step's misses, their draw, how many moved and
      * landed; the residency changes since the chain last read them (qt_chain_changes; chg_over:
      * more than the ring holds, or a change the ring does not describe) */
@@ -376,6 +379,7 @@ static void *uploader(void *arg){
             }
             ColiCudaTensor *a=v->tg,*b=v->tu,*ct=v->td;
             v->tg=v->tu=v->td=NULL;
+            G.uploading=1;
             pthread_mutex_unlock(&G.mx);
             /* Every expert has the same geometry: write the newcomer into the
              * victim's device buffers instead of cudaFree + cudaMalloc, each
@@ -390,7 +394,17 @@ static void *uploader(void *arg){
             } else {
                 if(a)coli_cuda_tensor_free(a); if(b)coli_cuda_tensor_free(b); if(ct)coli_cuda_tensor_free(ct);
             }
-        } else pthread_mutex_unlock(&G.mx);
+        } else {
+            /* A free slot's upload waits for a chain's forward too, as a victim's swap does.
+             * The forward's frame may hold a kernel that waits for a word the host writes later
+             * in the frame (a hybrid layer, qwen36_cuda_chain.h): a synchronous copy or
+             * allocation here then waits for that kernel, the host's next launch for this
+             * thread's driver lock, and the frame never ends. A cold tier's uploads are all
+             * free slots': a first prompt of a few tokens hung 9 times in 10. */
+            while(G.chain_hold && !G.th_stop) wait_take_locked();
+            G.uploading=1;
+            pthread_mutex_unlock(&G.mx);
+        }
 
         if(!inplace){
             if(G.wfmt==QT_GGUF && G_arena_on){
@@ -446,6 +460,7 @@ static void *uploader(void *arg){
                 G.budget[hd]=G.used[hd];   /* device genuinely full: stop trying */ }
         s->queued=0;
         G.inflight--;
+        G.uploading=0;
         pthread_cond_broadcast(&G.cv_take);          /* this upload is complete */
         pthread_mutex_unlock(&G.mx);
     }
@@ -1526,7 +1541,10 @@ int qt_chain_resident(int layer,int eid,int device,ColiCudaTensor **g,ColiCudaTe
 void qt_chain_hold(int on){
     if(!G.on) return;
     pthread_mutex_lock(&G.mx);
-    if(on) G.chain_hold++;
+    if(on){
+        G.chain_hold++;
+        while(G.uploading && !G.th_stop) wait_take_locked();   /* an upload in flight ends before the forward */
+    }
     else if(G.chain_hold>0 && --G.chain_hold==0) pthread_cond_broadcast(&G.cv_take);
     pthread_mutex_unlock(&G.mx);
 }

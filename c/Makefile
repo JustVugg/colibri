@@ -3006,6 +3006,10 @@ tests/test_qwen36_tier_promote$(EXE): tests/test_qwen36_tier_promote.c qwen36_ti
 tests/test_qwen36_tier_host_pool$(EXE): tests/test_qwen36_tier_host_pool.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+# qt_chain_hold: no upload, a free slot's included, while a chain's forward holds the tier (fake backend).
+tests/test_qwen36_tier_hold$(EXE): tests/test_qwen36_tier_hold.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
 tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c qwen36.c qwen36_tier.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
