@@ -11453,7 +11453,24 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
         printf("ERROR %llu NOT_FOUND\n",id); fflush(stdout); free(line); return 0;
     }
     ColiSubmit sub; int valid=coli_submit_parse(line,&sub);
-    if(!valid){ printf("ERROR 0 BAD_REQUEST\n"); fflush(stdout); free(line); return 0; }
+    if(!valid){
+        /* A header this engine cannot read (an extension key where it reads the grammar's byte
+         * count, a field out of range): when its id and its payload's length are readable the
+         * request is answered by its id and the payload drained, so the gateway ends that
+         * request instead of waiting for it, and the payload is not read as commands. */
+        unsigned long long bid=0, bb=0; int bslot=0;
+        if(sscanf(line,"SUBMIT %llu %d %llu",&bid,&bslot,&bb)==3 && bid && bb<=(1ull<<30)){
+            char tmp[4096];
+            for(unsigned long long left=bb; left; ){
+                size_t k=left<sizeof tmp?(size_t)left:sizeof tmp;
+                if(fread(tmp,1,k,stdin)!=k){ free(line); return -1; }
+                left-=k;
+            }
+            (void)fgetc(stdin);   /* the payload's newline */
+            printf("ERROR %llu BAD_REQUEST\n",bid);
+        } else printf("ERROR 0 BAD_REQUEST\n");
+        fflush(stdout); free(line); return 0;
+    }
     char *raw=malloc((size_t)sub.bytes+1);
     if(!raw){ fprintf(stderr,"OOM multiplex payload\n"); exit(1); }
     if(fread(raw,1,(size_t)sub.bytes,stdin)!=(size_t)sub.bytes){ free(raw); free(line); return -1; }

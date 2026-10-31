@@ -1802,6 +1802,8 @@ jobs:
           COLI_ORACLE_FIXTURE="$PWD/glm_tiny" python3 -m unittest -v tests.test_run_serve_context_exceeded
           # a CANCEL sent while a served prompt is read stops the reading (prompt_break.h)
           COLI_ORACLE_FIXTURE="$PWD/glm_tiny" python3 -m unittest -v tests.test_glm_prompt_cancel
+          # /v1/systemone on colibri.c: answered, and a header it cannot read answered by its id
+          COLI_ORACLE_FIXTURE="$PWD/glm_tiny" python3 -m unittest -v tests.test_glm_systemone
       - name: The MTP head under the draft gate (docs/speculative.md)
         # Greedy stays exact whatever the gate picks (a draft is only ever verified),
         # with the gate deciding from measured times and with every draft carried.
