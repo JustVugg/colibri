@@ -125,6 +125,9 @@
 #include "backend_cuda.h"
 #include "cu_dense.h"      /* the dense matrices on the CUDA tier's device, a matrix at a time */
 #endif
+#ifdef COLI_K3_CUDA
+#include "backend_cuda_k3.h"   /* a prompt step's routed experts on the GPU, the CPU's bytes */
+#endif
 #include "omp_tune.h"
 #include "route_trace.h"
 #include "vk_tier.h"       /* the shared Vulkan routed-expert tier (COLI_VULKAN=1; stubs without VK=1) */
@@ -650,6 +653,11 @@ static int k3_omp_in_par(void){
 #endif
 }
 #endif
+#ifdef COLI_K3_CUDA
+static void k3g_init(Model *m);          /* K3_GPU_EXPERTS: a prompt step's experts on the GPU too */
+static int g_k3g_on;                     /* the device took the experts' and dense kernels (k3g_init) */
+static int g_k3g_min_rows=32, g_k3g_cpu_wave=4;
+#endif
 static void w_matmul(float *y, const float *x, const W *w, int S){
 #ifdef COLI_CUDA
     if(w->cuda&&g_k3_cuda_dense&&!k3_omp_in_par()){
@@ -698,6 +706,11 @@ static void w_matmul(float *y, const float *x, const W *w, int S){
         const void *d=w->fmt==0?(const void*)w->f:w->fmt==1?(const void*)w->q8:w->fmt==4?(const void*)w->q4:(const void*)w->gg;
         if(cud_mm(&((W*)w)->cu,&((W*)w)->cu_no,y,x,S,w->fmt,d,w->s,w->O,w->I,w->gs)) return;
     }
+#endif
+#ifdef COLI_K3_CUDA
+    /* a prompt step's int4 or int8 matrix the GPU does not hold: there too, the CPU's bytes */
+    if(g_k3g_on&&S>=g_k3g_min_rows&&(w->fmt==4||w->fmt==1)&&!k3_omp_in_par()&&
+       k3cu_matmul(w->fmt,y,x,w->fmt==4?(const void*)w->q4:(const void*)w->q8,w->s,S,w->I,w->O,w->gs)) return;
 #endif
     if(w->fmt==0)      matmul(y,x,w->f,S,w->I,w->O);
     else if(w->fmt>=100){   /* a GGUF's blocks */
@@ -1628,6 +1641,9 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
 #ifdef COLI_CUDA
     /* K3_CUDA_DENSE: before the expert cache is sized, so released host copies count */
     if(!segment_mode&&load_boundaries) k3_cuda_dense_place(m);
+#endif
+#ifdef COLI_K3_CUDA
+    if(!segment_mode&&load_boundaries) k3g_init(m);   /* after the dense matrices took their VRAM */
 #endif
 #ifdef COLI_VULKAN
     /* COLI_VULKAN=1 (K3_VK=1 alike): the device opens once the weights are in RAM,
@@ -3350,6 +3366,206 @@ static void k3_waves_issue(Model *m, int li, int nu, const int *uids,
     k3_waves_take(m,li,w);
     if(m->pf_n) k3_prefetch_pending(m);   /* the next MoE layer's reads, behind these */
 }
+#ifdef COLI_K3_CUDA
+/* ---------- a prompt step's routed experts on the GPU (coli_cuda_k3.dll) -----------------
+ * The device computes an expert in k3_wave's arithmetic to the bit (backend_cuda_k3.h: the
+ * same integer sums of four products a lane, scales, fused adds and lane sums, SiTU through
+ * exp_f's and tanhf's own bits, the same quantization for down), so a step's experts may be
+ * split between it and the CPU in any way and the logits stay the same bytes. In a step of
+ * K3_GPU_MIN_ROWS rows or more (32), a feeder thread hands the device every expert whose
+ * bytes are in RAM and that nobody has taken, as the reads bring them; once the device has
+ * computed one, the feeder frees its slot and queues the step's next read into it
+ * (k3_waves_take, under g_k3g.mx, as the main thread does). The main thread computes the
+ * shared experts meanwhile (the waves' idle work), then takes waves of K3_GPU_CPU_WAVE (4)
+ * experts itself. Every pair's output lands in one pinned buffer, and the weighted sums run
+ * as before, in the union's order. K3_GPU_EXPERTS=0 keeps every expert on the CPU. */
+static float *g_k3g_Y; static size_t g_k3g_Ycap;   /* the pairs' outputs, pinned, kept from step to step */
+static _Atomic int *g_k3g_claim, *g_k3g_avail; static int g_k3g_cap;
+static struct {
+    pthread_t th; int started, posted;
+    pthread_mutex_t mx;                    /* the step's slots, done[] and left */
+    pthread_cond_t go, ev;                 /* go: a step for the feeder; ev: it computed some */
+    Model *m; int li; K3Waves *w;
+    int left;                              /* the step's experts not done, under mx */
+    _Atomic int stop, fail, running;
+    unsigned long long gpu, cpu;           /* experts computed by each, every step */
+} g_k3g={ .mx=PTHREAD_MUTEX_INITIALIZER, .go=PTHREAD_COND_INITIALIZER, .ev=PTHREAD_COND_INITIALIZER };
+static void k3g_init(Model *m){
+    const char *e=getenv("K3_GPU_EXPERTS");
+    if((e&&!atoi(e))||m->gx||!g_k3_idot||!EXP_F_X87) return;   /* MXFP4's, int8 inputs, MinGW's exp_f and tanhf */
+    if(getenv("K3_GPU_MIN_ROWS")){ g_k3g_min_rows=atoi(getenv("K3_GPU_MIN_ROWS")); if(g_k3g_min_rows<1) g_k3g_min_rows=1; }
+    if(getenv("K3_GPU_CPU_WAVE")){ g_k3g_cpu_wave=atoi(getenv("K3_GPU_CPU_WAVE")); if(g_k3g_cpu_wave<0) g_k3g_cpu_wave=0; }
+    int dev=getenv("COLI_GPU")?atoi(getenv("COLI_GPU")):0;
+    if(!k3cu_init(dev)) return;
+    g_k3g_on=1;
+    fprintf(stderr,"[K3-CUDA] experts: a prompt step's routed experts (steps of %d rows or more) on GPU %d beside the CPU, "
+            "the CPU's bytes (K3_GPU_EXPERTS=0: the CPU's alone)\n",g_k3g_min_rows,dev);
+}
+/* w->sl[j] set: the feeder may look at it */
+static void k3g_publish(K3Waves *w){
+    for(int j=0;j<w->nu;j++)
+        if(w->sl[j]&&!atomic_load_explicit(&g_k3g_avail[j],memory_order_relaxed))
+            atomic_store_explicit(&g_k3g_avail[j],1,memory_order_release);
+}
+static void k3g_done_locked(K3Waves *w, int j){ w->done[j]=1; w->sl[j]->busy--; g_k3g.left--; }
+/* until a read completes or about a millisecond has gone */
+static void k3g_nap(void){
+    struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts);
+    ts.tv_nsec+=1000000; if(ts.tv_nsec>=1000000000){ ts.tv_sec++; ts.tv_nsec-=1000000000; }
+    if(g_io.nth){
+        pthread_mutex_lock(&g_io.mx);
+        pthread_cond_timedwait(&g_io.done,&g_io.mx,&ts);
+        pthread_mutex_unlock(&g_io.mx);
+    } else {
+        struct timespec d={0,200000}; nanosleep(&d,NULL);
+    }
+}
+static void k3g_feed(void){
+    Model *m=g_k3g.m; K3Waves *w=g_k3g.w; int li=g_k3g.li, nu=w->nu;
+    int inflight=0, scan=0, tags[64];
+    for(;;){
+        int n=k3cu_moe_poll(tags,64);
+        if(n<0){ atomic_store(&g_k3g.fail,1); break; }
+        if(n){
+            pthread_mutex_lock(&g_k3g.mx);
+            for(int i=0;i<n;i++) k3g_done_locked(w,tags[i]);
+            k3_waves_take(m,li,w); k3g_publish(w);
+            pthread_cond_broadcast(&g_k3g.ev);
+            pthread_mutex_unlock(&g_k3g.mx);
+            inflight-=n; g_k3g.gpu+=(unsigned long long)n;
+        }
+        int j=-1;
+        for(int k=0;k<nu&&j<0;k++){
+            int jj=(scan+k)%nu, z=0;
+            if(atomic_load_explicit(&g_k3g_avail[jj],memory_order_acquire)&&
+               atomic_load_explicit(&g_k3g_claim[jj],memory_order_relaxed)==0&&slot_ready(w->sl[jj])&&
+               atomic_compare_exchange_strong(&g_k3g_claim[jj],&z,2)) j=jj;
+        }
+        if(j>=0){
+            scan=j+1;
+            if(!k3cu_moe_expert(w->sl[j]->buf,w->poslist+w->pfirst[j],w->pcnt[j],w->pfirst[j],j)){
+                atomic_store(&g_k3g.fail,1); break;
+            }
+            inflight++;
+            continue;
+        }
+        if(atomic_load(&g_k3g.stop)&&!inflight) break;
+        if(inflight){ if(k3cu_moe_wait()<0){ atomic_store(&g_k3g.fail,1); break; } continue; }
+        k3g_nap();
+    }
+    if(!k3cu_moe_end()) atomic_store(&g_k3g.fail,1);
+}
+static void *k3g_main(void *arg){
+    (void)arg;
+    pthread_mutex_lock(&g_k3g.mx);
+    for(;;){
+        while(!g_k3g.posted) pthread_cond_wait(&g_k3g.go,&g_k3g.mx);
+        g_k3g.posted=0;
+        pthread_mutex_unlock(&g_k3g.mx);
+        k3g_feed();
+        pthread_mutex_lock(&g_k3g.mx);
+        atomic_store(&g_k3g.running,0);
+        pthread_cond_broadcast(&g_k3g.ev);
+    }
+    return NULL;
+}
+/* The step's experts handed to the feeder too: 1, or 0 when the device cannot take them
+ * (the CPU then computes every one). zq/zs: the step's rows, quantized (mxfp4_qx). */
+static int k3g_begin(Model *m, int li, K3Waves *w, const int8_t *zq, const float *zs, int nrows){
+    Cfg *c=&m->c;
+    int LT=c->latent, MI=c->moe_inter, nu=w->nu;
+    size_t need=(size_t)w->tot*LT*sizeof(float);
+    if(need>g_k3g_Ycap){
+        k3cu_host_free(g_k3g_Y); g_k3g_Ycap=0;
+        size_t cap=need+need/4;
+        g_k3g_Y=k3cu_host_alloc(cap);
+        if(!g_k3g_Y){ fprintf(stderr,"[K3-CUDA] experts: no %.2f GB of pinned memory for a step's outputs: the CPU's step\n",cap/1e9); return 0; }
+        g_k3g_Ycap=cap;
+    }
+    if(nu>g_k3g_cap){
+        free(g_k3g_claim); free(g_k3g_avail);
+        g_k3g_claim=malloc((size_t)nu*sizeof(*g_k3g_claim)); g_k3g_avail=malloc((size_t)nu*sizeof(*g_k3g_avail));
+        if(!g_k3g_claim||!g_k3g_avail){ fprintf(stderr,"OOM expert claims\n"); exit(1); }
+        g_k3g_cap=nu;
+    }
+    for(int j=0;j<nu;j++){ atomic_init(&g_k3g_claim[j],0); atomic_init(&g_k3g_avail[j],0); }
+    size_t off[6]={0,(size_t)m->e_w1p,(size_t)(m->e_w1p+m->e_w1s),(size_t)(m->e_w1p+m->e_w1s+m->e_w2p),
+                   (size_t)(m->e_w1p+m->e_w1s+m->e_w2p+m->e_w2s),(size_t)(m->e_w1p+m->e_w1s+m->e_w2p+m->e_w2s+m->e_w1p)};
+    size_t eb=off[5]+(size_t)m->e_w1s;
+    if(!k3cu_moe_begin(zq,zs,nrows,LT,MI,c->situ_b1,c->situ_b2,eb,off,g_k3g_Y,w->tot)) return 0;
+    if(!g_k3g.started){
+        if(pthread_create(&g_k3g.th,NULL,k3g_main,NULL)){ k3cu_moe_end(); return 0; }
+        g_k3g.started=1;
+    }
+    pthread_mutex_lock(&g_k3g.mx);
+    g_k3g.m=m; g_k3g.li=li; g_k3g.w=w; g_k3g.left=nu;
+    atomic_store(&g_k3g.stop,0); atomic_store(&g_k3g.fail,0); atomic_store(&g_k3g.running,1);
+    k3g_publish(w);
+    g_k3g.posted=1;
+    pthread_cond_signal(&g_k3g.go);
+    pthread_mutex_unlock(&g_k3g.mx);
+    return 1;
+}
+/* The main thread's part of a step the feeder shares: the idle work, then waves of up to
+ * g_k3g_cpu_wave experts nobody has taken, until every expert is done; then the feeder's end.
+ * XQ/XS: the CPU's pairs' inputs, gathered here from zq/zs as each wave takes them. */
+static void k3g_run(Model *m, int li, K3Waves *w, const int8_t *zq, const float *zs,
+                    int8_t *XQ, float *XS, float *G, int8_t *GQ, float *GS, float *Y,
+                    void (*idle)(void *), void *ctx){
+    Cfg *c=&m->c;
+    int LT=c->latent, gb1=LT/32, nu=w->nu;
+    if(idle) idle(ctx);   /* the shared experts first: the device and the reads go on meanwhile */
+    for(;;){
+        int nw=0, open=0;
+        for(int j=0;j<nu;j++){
+            if(atomic_load_explicit(&g_k3g_claim[j],memory_order_relaxed)) continue;
+            open++;
+            int z=0;
+            if(nw<g_k3g_cpu_wave&&atomic_load_explicit(&g_k3g_avail[j],memory_order_acquire)&&slot_ready(w->sl[j])&&
+               atomic_compare_exchange_strong(&g_k3g_claim[j],&z,1)){ w->wave[nw++]=j; open--; }
+        }
+        if(nw){
+            double t0=now_s();
+            for(int a=0;a<nw;a++){
+                int j=w->wave[a];
+                for(int q=0;q<w->pcnt[j];q++){
+                    int e=w->pfirst[j]+q, t=w->poslist[e];
+                    memcpy(XQ+(size_t)e*LT,zq+(size_t)t*LT,(size_t)LT);
+                    memcpy(XS+(size_t)e*gb1,zs+(size_t)t*gb1,(size_t)gb1*sizeof(float));
+                }
+            }
+            k3_wave(m,w->wave,nw,w->sl,w->pfirst,w->pcnt,XQ,XS,NULL,G,GQ,GS,Y);
+            m->t_wave+=now_s()-t0; m->n_wave++;
+            pthread_mutex_lock(&g_k3g.mx);
+            for(int a=0;a<nw;a++) k3g_done_locked(w,w->wave[a]);
+            k3_waves_take(m,li,w); k3g_publish(w);
+            pthread_mutex_unlock(&g_k3g.mx);
+            g_k3g.cpu+=(unsigned long long)nw;
+            continue;
+        }
+        double t0=now_s();
+        pthread_mutex_lock(&g_k3g.mx);
+        if(!g_k3g.left){ pthread_mutex_unlock(&g_k3g.mx); break; }
+        if(!atomic_load(&g_k3g.running)&&atomic_load(&g_k3g.fail)){
+            /* the device failed: its experts not done go back to the CPU, their bytes still in their slots */
+            for(int j=0;j<nu;j++) if(!w->done[j]&&atomic_load(&g_k3g_claim[j])==2) atomic_store(&g_k3g_claim[j],0);
+            pthread_mutex_unlock(&g_k3g.mx);
+            continue;
+        }
+        if(!open) atomic_store(&g_k3g.stop,1);   /* every expert taken: the feeder ends once its own are done */
+        struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts);
+        ts.tv_nsec+=1000000; if(ts.tv_nsec>=1000000000){ ts.tv_sec++; ts.tv_nsec-=1000000000; }
+        pthread_cond_timedwait(&g_k3g.ev,&g_k3g.mx,&ts);
+        pthread_mutex_unlock(&g_k3g.mx);
+        m->t_eload+=now_s()-t0;
+    }
+    atomic_store(&g_k3g.stop,1);
+    pthread_mutex_lock(&g_k3g.mx);
+    while(atomic_load(&g_k3g.running)) pthread_cond_wait(&g_k3g.ev,&g_k3g.mx);
+    pthread_mutex_unlock(&g_k3g.mx);
+    if(atomic_load(&g_k3g.fail)){ fprintf(stderr,"[K3-CUDA] experts: the device failed; the CPU computes them from now on\n"); g_k3g_on=0; }
+}
+#endif
 /* idle(ctx), when given, runs once, the first time no expert is ready while reads are still
  * on their way (moe_forward's shared experts: what they cost then hides behind the reads), or
  * after the last wave when that never happens. */
@@ -3361,6 +3577,9 @@ static void k3_waves_run(Model *m, int li, K3Waves *w, const float *Z, int strid
     int idot=g_k3_idot&&LT%32==0&&MI%32==0;
     /* the pairs' inputs, gathered in the pairs' order (an expert's rows contiguous) */
     int8_t *XQ=NULL, *GQ=NULL; float *XS=NULL, *XF=NULL, *GS=NULL;
+#ifdef COLI_K3_CUDA
+    int gpu=0; int8_t *zq_gpu=NULL; float *zs_gpu=NULL;
+#endif
     if(idot){
         int maxt=0;
         for(int e=0;e<tot;e++) if(poslist[e]>maxt) maxt=poslist[e];
@@ -3369,16 +3588,31 @@ static void k3_waves_run(Model *m, int li, K3Waves *w, const float *Z, int strid
         GQ=k3_balloc_bytes((size_t)tot*MI); GS=k3_balloc_bytes((size_t)tot*gb2*sizeof(float));
         if(!zq||!zs||!XQ||!XS||!GQ||!GS){ fprintf(stderr,"OOM expert inputs\n"); exit(1); }
         mxfp4_qx(Z,maxt+1,LT,zq,zs);
-        for(int e=0;e<tot;e++){
-            memcpy(XQ+(size_t)e*LT,zq+(size_t)poslist[e]*LT,(size_t)LT);
-            memcpy(XS+(size_t)e*gb1,zs+(size_t)poslist[e]*gb1,(size_t)gb1*sizeof(float));
+#ifdef COLI_K3_CUDA
+        if(g_k3g_on&&maxt+1>=g_k3g_min_rows&&k3g_begin(m,li,w,zq,zs,maxt+1)){ gpu=1; zq_gpu=zq; zs_gpu=zs; }
+        if(!gpu)
+#endif
+        {
+            for(int e=0;e<tot;e++){
+                memcpy(XQ+(size_t)e*LT,zq+(size_t)poslist[e]*LT,(size_t)LT);
+                memcpy(XS+(size_t)e*gb1,zs+(size_t)poslist[e]*gb1,(size_t)gb1*sizeof(float));
+            }
+            k3_bfree(zq); k3_bfree(zs);
         }
-        k3_bfree(zq); k3_bfree(zs);
     } else {
         XF=k3_balloc((int64_t)tot*LT);
         for(int e=0;e<tot;e++) memcpy(XF+(size_t)e*LT,Z+(size_t)poslist[e]*LT,(size_t)LT*sizeof(float));
     }
-    float *G=k3_balloc((int64_t)tot*MI), *Y=k3_balloc((int64_t)tot*LT);
+    float *G=k3_balloc((int64_t)tot*MI), *Y=NULL;
+#ifdef COLI_K3_CUDA
+    if(gpu){
+        Y=g_k3g_Y;
+        k3g_run(m,li,w,zq_gpu,zs_gpu,XQ,XS,G,GQ,GS,Y,idle,ctx);
+        idle=NULL; nu=0;   /* every expert done: the loop below has none left */
+        k3_bfree(zq_gpu); k3_bfree(zs_gpu);
+    } else
+#endif
+    Y=k3_balloc((int64_t)tot*LT);
     for(int left=nu;left>0;){
         unsigned long long seen_io=k3_io_seen();
         int nw=0;
@@ -3404,6 +3638,7 @@ static void k3_waves_run(Model *m, int li, K3Waves *w, const float *Z, int strid
     }
     if(idle) idle(ctx);   /* every expert was ready at once: nothing to hide it behind */
     /* the weighted sum, in the union's order and each expert's rows in order, as before */
+    nu=w->nu;
     for(int j=0;j<nu;j++)
         for(int q=0;q<pcnt[j];q++){
             int e=pfirst[j]+q;
@@ -3411,7 +3646,11 @@ static void k3_waves_run(Model *m, int li, K3Waves *w, const float *Z, int strid
             const float *yr=Y+(size_t)e*LT;
             for(int i=0;i<LT;i++) ut[i]+=wk*yr[i];
         }
-    k3_bfree(XQ); k3_bfree(XS); k3_bfree(XF); k3_bfree(GQ); k3_bfree(GS); k3_bfree(G); k3_bfree(Y);
+    k3_bfree(XQ); k3_bfree(XS); k3_bfree(XF); k3_bfree(GQ); k3_bfree(GS); k3_bfree(G);
+#ifdef COLI_K3_CUDA
+    if(Y!=g_k3g_Y)
+#endif
+    k3_bfree(Y);
     free(w->sl); free(w->wave); free(w->miss); free(w->done);
 }
 static void k3_moe_waves(Model *m, int li, int nu, const int *uids,
@@ -5908,6 +6147,11 @@ int main(int argc, char **argv){
             "%.0f page faults\n",m.t_kda_f32,m.t_kda_conv,m.t_kda_heads,k3_page_faults()-pf0);
 #ifdef COLI_CUDA
     k3_cuda_report("prompt");
+#endif
+#ifdef COLI_K3_CUDA
+    if(g_k3g.gpu) fprintf(stderr,"[K3-CUDA] experts: %llu of the prompt's routed experts on the GPU, %llu on the CPU\n",
+                          g_k3g.gpu,g_k3g.cpu);
+    k3cu_report();
 #endif
     /* the decode's own share of every timer: what they hold after the prompt */
     double d0_attn=m.t_attn, d0_moe=m.t_moe, d0_eload=m.t_eload, d0_route=m.t_route, d0_lat=m.t_lat,

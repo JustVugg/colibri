@@ -2,7 +2,9 @@
 # The checkpoint as tools/download_kimi_k3_4090.ps1 lays it out: the model folder on C:
 # and every MoE layer's other part on D:, read by two readers per drive. The largest
 # dense matrices go to the GPU (K3_CUDA_DENSE), their host copies released for the
-# expert cache; the routed experts stay on the CPU, which reads them in place.
+# expert cache. A decode step's routed experts run on the CPU, which reads them in place;
+# a prompt step's go to the GPU too as they are read, with its other dense matrices
+# (coli_cuda_k3.dll, the CPU's bytes), unless -CpuExperts.
 param(
     # The engine's model folder (config, tokenizer, 61% of every layer's experts)
     [string]$ModelDir = 'C:\AI\Kimi-K3',
@@ -26,10 +28,10 @@ param(
     # The most tokens a reply may have when a request does not ask for fewer (reasoning included)
     [ValidateRange(256,1048576)][int]$MaxOutput = 32768,
     # Prompt tokens a prefill step takes at once: each expert a step needs is read once for
-    # all of them, so larger steps read the disks less per prompt token (2048 against 512:
-    # a 2,637-token prompt 845 -> 697 s); past 512 a step's token holds 1.4 MB of RAM,
-    # taken from the expert cache
-    [ValidateRange(1,4096)][int]$Chunk = 2048,
+    # all of them, so larger steps read the disks less per prompt token (with the experts on
+    # the GPU, a 2,637-token prompt 352 s in steps of 2048, 268 s in one of 4096); past 512 a
+    # step's token holds 1.4 MB of RAM, taken from the expert cache (3 of 97 slots a layer)
+    [ValidateRange(1,4096)][int]$Chunk = 4096,
     # Photos of the recurrent state at every prompt's and reply's end (COLI_K3_CKPT, about
     # 434 MB each): a turn whose client sends the history back without its reasoning, or
     # edits a tool result, resumes from the deepest photo its prompt still matches and
@@ -37,7 +39,9 @@ param(
     [ValidateRange(0,8)][int]$Photos = 4,
     [ValidateRange(1,65535)][int]$Port = 18080,
     # No GPU: the dense matrices stay on the CPU (a CPU build, or to compare)
-    [switch]$Cpu
+    [switch]$Cpu,
+    # A prompt step's routed experts and other dense matrices on the CPU alone (K3_GPU_EXPERTS=0)
+    [switch]$CpuExperts
 )
 $ErrorActionPreference = 'Stop'
 $EngineDir = Split-Path -Parent $PSScriptRoot
@@ -47,6 +51,9 @@ foreach ($file in $need) {
     if (!(Test-Path -LiteralPath (Join-Path $EngineDir $file) -PathType Leaf)) {
         throw "Missing $file in $EngineDir. See docs/kimi_k3-4090.md for the build commands (or pass -Cpu)."
     }
+}
+if (!$Cpu -and !$CpuExperts -and !(Test-Path -LiteralPath (Join-Path $EngineDir 'coli_cuda_k3.dll') -PathType Leaf)) {
+    Write-Warning "No coli_cuda_k3.dll in $EngineDir (c\build_k3_cuda.bat): a prompt's experts stay on the CPU"
 }
 foreach ($file in @('config.json', 'tokenizer.json')) {
     if (!(Test-Path -LiteralPath (Join-Path $ModelDir $file) -PathType Leaf)) {
@@ -65,7 +72,8 @@ if (Test-Path -LiteralPath $layout -PathType Leaf) {
     }
 }
 $env:K3_DIRS = $shardDirs -join ';'
-$env:K3_CUDA = '0'                     # the routed experts stay on the CPU, read in place
+$env:K3_CUDA = '0'                     # no VRAM tier: a decode step's experts on the CPU, read in place
+$env:K3_GPU_EXPERTS = $(if ($Cpu -or $CpuExperts) { '0' } else { '1' })
 $env:K3_CUDA_DENSE = $(if ($Cpu -or $DenseGB -le 0) { '0' } else { '1' })
 $env:K3_CUDA_DENSE_GB = [string]$DenseGB
 $env:K3_CUDA_RESERVE_GB = [string]$ReserveGB
@@ -89,7 +97,7 @@ foreach ($key in @('K3_LAYERS', 'K3_TRACE', 'K3_LOGITS', 'K3_X0', 'K3_MMAP', 'K3
     Remove-Item -LiteralPath "Env:$key" -ErrorAction SilentlyContinue
 }
 Write-Host "Kimi K3: $ModelDir$(if ($shardDirs.Count) { '; experts also from ' + ($shardDirs -join '; ') })"
-Write-Host "RAM $RamGB GB, CPU $Threads, readers $IoPerDrive per drive, prefetch $Prefetch, $(if ($env:K3_CUDA_DENSE -eq '1') { "dense matrices on the GPU up to $DenseGB GiB" } else { 'dense matrices on the CPU' })"
+Write-Host "RAM $RamGB GB, CPU $Threads, readers $IoPerDrive per drive, prefetch $Prefetch, $(if ($env:K3_CUDA_DENSE -eq '1') { "dense matrices on the GPU up to $DenseGB GiB" } else { 'dense matrices on the CPU' })$(if ($env:K3_GPU_EXPERTS -eq '1') { ', a prompt step''s experts on the GPU too' })"
 Write-Host "Context $Context tokens, replies up to $MaxOutput tokens, prompt steps of $Chunk, $Photos turn photos"
 Write-Host "API: http://127.0.0.1:$Port/v1, model $ModelId"
 & python (Join-Path $EngineDir 'coli') serve --model $ModelDir --ram $RamGB --ctx $Context `

@@ -555,6 +555,10 @@ TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32
 TEST_EXCLUDE += test_cu_tier
 # takes a fixture and the CPU build's logits on its command line (ci.yml, the int4 gs64 A/B step)
 TEST_EXCLUDE += test_qwen36_tier_stream_engine
+# coli_cuda_k3.dll's loader is Windows'; there it passes as skipped without the DLL or a device
+ifeq (,$(IS_WIN))
+TEST_EXCLUDE += test_k3_cuda_experts
+endif
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -1970,8 +1974,28 @@ kimi_k3: kimi_k3$(EXE)
 endif
 # Windows: the OpenMP regions on omp_spin.c's spinning team, as mimo's (a decode token runs
 # thousands of them; MinGW libgomp's fork and join cost ~80 us each at 16 threads)
-kimi_k3$(EXE): kimi_k3.c $(CUDA_OBJ) $(MIMO_OMP_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ) .build-config
-	$(CC) $(CFLAGS) kimi_k3.c $(CUDA_OBJ) $(MIMO_OMP_OBJ) $(VK_OBJ) $(METAL_OBJ) -o kimi_k3$(EXE) $(LDFLAGS) $(MIMO_OMP_LDFLAGS)
+# A prompt step's routed experts on the GPU beside the CPU, the CPU's bytes (coli_cuda_k3.dll,
+# build_k3_cuda.bat): Windows CUDA_DLL=1 builds, whose CPU computes exp_f and tanhf as
+# k3_exact_tables.h holds them (MinGW's).
+K3_CUDA_OBJ =
+K3_CUDA_FLAGS =
+ifneq ($(IS_WIN),)
+ifeq ($(CUDA_DLL),1)
+K3_CUDA_OBJ = backend_cuda_k3_loader.o
+K3_CUDA_FLAGS = -DCOLI_K3_CUDA
+endif
+endif
+backend_cuda_k3_loader.o: backend_cuda_k3_loader.c backend_cuda_k3.h .build-config
+	$(CC) $(CFLAGS) -c $< -o $@
+kimi_k3$(EXE): kimi_k3.c backend_cuda_k3.h $(CUDA_OBJ) $(K3_CUDA_OBJ) $(MIMO_OMP_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ) .build-config
+	$(CC) $(CFLAGS) $(K3_CUDA_FLAGS) kimi_k3.c $(CUDA_OBJ) $(K3_CUDA_OBJ) $(MIMO_OMP_OBJ) $(VK_OBJ) $(METAL_OBJ) -o kimi_k3$(EXE) $(LDFLAGS) $(MIMO_OMP_LDFLAGS)
+# k3_exact_tables.h: the floats whose exp_f or tanhf k3_exact.h's double arithmetic leaves
+# undecided, with MinGW's bits, every other float checked (MinGW only; about 7 s)
+.PHONY: k3-exact-tables
+k3-exact-tables: tools/k3_exact_tables$(EXE)
+	./tools/k3_exact_tables$(EXE) k3_exact_tables.h
+tools/k3_exact_tables$(EXE): tools/k3_exact_tables.c k3_exact.h exp_f.h
+	$(CC) -O2 -march=native -fopenmp -ffp-contract=off tools/k3_exact_tables.c -o $@ -lm
 
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks
@@ -2093,6 +2117,10 @@ tests/test_k3_ram_budget$(EXE): tests/test_k3_ram_budget.c kimi_k3.c $(VK_OBJ)
 
 tests/test_k3_mla_scores$(EXE): tests/test_k3_mla_scores.c kimi_k3.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# coli_cuda_k3.dll against kimi_k3.c, bit for bit (skipped without the DLL or a device)
+tests/test_k3_cuda_experts$(EXE): tests/test_k3_cuda_experts.c kimi_k3.c backend_cuda_k3_loader.c backend_cuda_k3.h $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< backend_cuda_k3_loader.c $(CUDA_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_k3_mmap$(EXE): tests/test_k3_mmap.c kimi_k3.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
