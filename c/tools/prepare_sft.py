@@ -90,6 +90,13 @@ splits = {"valid": [samples[i] for i in order[:nv]],
 os.makedirs(args.output, exist_ok=True)
 for split, ss in splits.items():
     if not ss:
+        # A reused output directory may still contain this split from an older
+        # dataset. The trainer reads the files directly, not metadata.json.
+        for suffix in ("bin", "msk", "idx"):
+            try:
+                os.unlink(os.path.join(args.output, split + "." + suffix))
+            except FileNotFoundError:
+                pass
         continue
     ids = np.concatenate([np.asarray(s[0], dtype=np.uint32) for s in ss])
     msk = np.concatenate([np.asarray(s[1], dtype=np.uint8) for s in ss])
