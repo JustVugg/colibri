@@ -142,6 +142,119 @@ static int check_dense(int fmt, int S, int I, int O, int gs){
     return !ok || diff;
 }
 
+/* 4. A prompt step's gated MLA attention: k3cu_mla against mla_forward's loop, copied here
+ *    with the functions it calls (w_addrow, k3_mla_scores_g, softmax_, k3_rowdot8_i8,
+ *    sigmoidf_): every output the same bytes. */
+static int check_mla(int H, int qn, int qr, int vh, int kvl, int pos0, int C){
+    const int N = pos0 + C, qh = qn + qr, O = H * (qn + vh);
+    float *Lc = malloc((size_t)N * kvl * sizeof(float)), *Rc = malloc((size_t)N * (qr ? qr : 1) * sizeof(float));
+    float *qv = malloc((size_t)C * H * qh * sizeof(float)), *gv = malloc((size_t)C * H * vh * sizeof(float));
+    float *cc = malloc((size_t)C * H * vh * sizeof(float)), *cg = malloc((size_t)C * H * vh * sizeof(float));
+    W kvb; memset(&kvb, 0, sizeof kvb);
+    kvb.fmt = 1; kvb.O = O; kvb.I = kvl;
+    kvb.q8 = malloc((size_t)O * kvl); kvb.s = malloc((size_t)O * sizeof(float));
+    for(size_t i = 0; i < (size_t)N * kvl; i++) Lc[i] = rndf();
+    for(size_t i = 0; i < (size_t)N * qr; i++) Rc[i] = rndf();
+    for(size_t i = 0; i < (size_t)C * H * qh; i++) qv[i] = rndf();
+    for(size_t i = 0; i < (size_t)C * H * vh; i++) gv[i] = rndf();
+    for(size_t i = 0; i < (size_t)O * kvl; i++){ int v = (int)(rnd32() >> 24) - 128; kvb.q8[i] = (int8_t)(v < -127 ? -127 : v); }
+    for(int r = 0; r < O; r++) kvb.s[r] = 0.004f * (1.0f + 0.1f * rndf());
+    const float scale = 1.0f / sqrtf((float)qh);
+    for(int tt = 0; tt < C; tt++){
+        int nt = pos0 + tt + 1;
+        const float *qvt = qv + (int64_t)tt * H * qh, *gvt = gv + (int64_t)tt * H * vh;
+        float *ctxt = cc + (int64_t)tt * H * vh;
+        const int ngr = (H + K3_MLA_G - 1) / K3_MLA_G;
+        for(int hg = 0; hg < ngr; hg++){
+            const int h0 = hg * K3_MLA_G, nh = H - h0 < K3_MLA_G ? H - h0 : K3_MLA_G;
+            float *qab = falloc((int64_t)K3_MLA_G * kvl), *scs = falloc((int64_t)K3_MLA_G * nt);
+            const float *qrps[K3_MLA_G];
+            for(int g = 0; g < nh; g++){
+                const float *qp = qvt + (int64_t)(h0 + g) * qh;
+                int rbase = (h0 + g) * (qn + vh);
+                float *qabs = qab + (int64_t)g * kvl; memset(qabs, 0, kvl * sizeof(float));
+                for(int d = 0; d < qn; d++) w_addrow(&kvb, rbase + d, qp[d], qabs);
+                qrps[g] = qp + qn;
+            }
+            k3_mla_scores_g(scs, qab, qrps, nh, Lc, Rc, nt, kvl, qr, scale);
+            for(int g = 0; g < nh; g++){
+                const int h = h0 + g, rbase = h * (qn + vh);
+                float *sc = scs + (int64_t)g * nt;
+                softmax_(sc, nt);
+                float clat[4096]; memset(clat, 0, kvl * sizeof(float));
+                for(int t = 0; t < nt; t++){
+                    const float *Lt = Lc + (int64_t)t * kvl; float s2 = sc[t];
+                    for(int i = 0; i < kvl; i++) clat[i] += s2 * Lt[i];
+                }
+                float *cx = ctxt + (int64_t)h * vh;
+                int d = 0;
+                for(; d + 8 <= vh; d += 8){
+                    float rd[8];
+                    k3_rowdot8_i8(&kvb, rbase + qn + d, clat, rd);
+                    for(int j = 0; j < 8; j++) cx[d + j] = rd[j] * sigmoidf_(gvt[(int64_t)h * vh + d + j]);
+                }
+                for(; d < vh; d++) cx[d] = w_rowdot(&kvb, rbase + qn + d, clat) * sigmoidf_(gvt[(int64_t)h * vh + d]);
+            }
+            free(qab); free(scs);
+        }
+    }
+    memset(cg, 0xff, (size_t)C * H * vh * sizeof(float));
+    int ok = k3cu_mla(Lc, Rc, N, pos0, C, qv, gv, kvb.q8, kvb.s, H, qn, qr, vh, kvl, scale, cg);
+    size_t diff = 0, first = (size_t)-1;
+    for(size_t i = 0; i < (size_t)C * H * vh; i++) if(memcmp(cc + i, cg + i, 4)){ if(first == (size_t)-1) first = i; diff++; }
+    if(diff) printf("  output %zu: CPU %a, device %a\n", first, cc[first], cg[first]);
+    printf("MLA %d heads (%d+%d, v %d, latent %d), rows %d..%d: %s%zu of %zu differ\n", H, qn, qr, vh, kvl,
+           pos0, N - 1, ok ? "" : "FAILED to run; ", diff, (size_t)C * H * vh);
+    free(Lc); free(Rc); free(qv); free(gv); free(cc); free(cg); free(kvb.q8); free(kvb.s);
+    return !ok || diff;
+}
+
+/* 5. The bf16 router: k3cu_router against k3_router_scores, every score the same bytes. */
+static int check_router(int C, int D, int E){
+    Moe o; memset(&o, 0, sizeof o);
+    o.router16 = malloc((size_t)E * D * sizeof(uint16_t));
+    float *x = malloc((size_t)C * D * sizeof(float)), *sc = malloc((size_t)C * E * sizeof(float)), *sg = malloc((size_t)C * E * sizeof(float));
+    for(size_t i = 0; i < (size_t)E * D; i++){ float v = rndf() * 0.02f; uint32_t b; memcpy(&b, &v, 4); o.router16[i] = (uint16_t)(b >> 16); }
+    for(size_t i = 0; i < (size_t)C * D; i++) x[i] = rndf();
+    k3_router_scores(&o, sc, x, C, D, E);
+    memset(sg, 0xff, (size_t)C * E * sizeof(float));
+    int ok = k3cu_router(sg, x, o.router16, C, D, E);
+    size_t diff = 0;
+    for(size_t i = 0; i < (size_t)C * E; i++) if(memcmp(sc + i, sg + i, 4)) diff++;
+    printf("router %d experts x %d, %d rows: %s%zu of %zu differ\n", E, D, C, ok ? "" : "FAILED to run; ", diff, (size_t)C * E);
+    free(o.router16); free(x); free(sc); free(sg);
+    return !ok || diff;
+}
+
+/* 6. The shared experts: k3cu_shared against k3_shared (three matmul_i4_grouped and situf_). */
+static void rand_i4(W *w, int O, int I, int gs){
+    memset(w, 0, sizeof *w);
+    w->fmt = 4; w->O = O; w->I = I; w->gs = gs;
+    w->q4 = malloc((size_t)O * (I / 2)); w->s = malloc((size_t)O * (I / gs) * sizeof(float));
+    for(size_t i = 0; i < (size_t)O * (I / 2); i++) w->q4[i] = (uint8_t)(rnd32() >> 24);
+    for(size_t i = 0; i < (size_t)O * (I / gs); i++) w->s[i] = 0.01f * (1.0f + 0.2f * rndf());
+}
+static int check_shared(int C, int D, int MI, int ns, int gs){
+    Model *m = calloc(1, sizeof(Model));
+    m->c.hidden = D; m->c.moe_inter = MI; m->c.n_shared = ns; m->c.situ_b1 = 4.0f; m->c.situ_b2 = 25.0f;
+    const int I = MI * ns;
+    Moe o; memset(&o, 0, sizeof o);
+    rand_i4(&o.sh_gate, I, D, gs); rand_i4(&o.sh_up, I, D, gs); rand_i4(&o.sh_down, D, I, gs);
+    float *x = malloc((size_t)C * D * sizeof(float)), *sg = malloc((size_t)C * D * sizeof(float));
+    for(size_t i = 0; i < (size_t)C * D; i++) x[i] = rndf();
+    float *sc = k3_shared(m, &o, x, C);
+    memset(sg, 0xff, (size_t)C * D * sizeof(float));
+    int ok = k3cu_shared(sg, x, C, D, I, o.sh_gate.q4, o.sh_gate.s, o.sh_up.q4, o.sh_up.s, gs, o.sh_down.q4, o.sh_down.s, gs, 4.0f, 25.0f);
+    size_t diff = 0;
+    for(size_t i = 0; i < (size_t)C * D; i++) if(memcmp(sc + i, sg + i, 4)) diff++;
+    printf("shared experts %dx%d (%d of %d), %d rows: %s%zu of %zu differ\n", D, I, ns, MI, C, ok ? "" : "FAILED to run; ", diff, (size_t)C * D);
+    free(sc); free(sg); free(x);
+    W *ws[3] = {&o.sh_gate, &o.sh_up, &o.sh_down};
+    for(int k = 0; k < 3; k++){ free(ws[k]->q4); free(ws[k]->s); }
+    free(m);
+    return !ok || diff;
+}
+
 int main(int argc, char **argv){
     int all = argc > 1 && !strcmp(argv[1], "--all-floats");
     if(!k3cu_init(0)){ printf("no CUDA device or coli_cuda_k3.dll: skipped\n"); return 0; }
@@ -155,6 +268,12 @@ int main(int argc, char **argv){
     bad += check_dense(4, 9, 3584, 71, 128);
     bad += check_dense(1, 33, 7168, 100, 0);
     bad += check_dense(1, 1030, 512, 40, 0);
+    bad += check_mla(96, 128, 64, 128, 512, 100, 40);
+    bad += check_mla(8, 16, 8, 16, 32, 0, 37);
+    bad += check_router(37, 7168, 896);
+    bad += check_router(70, 128, 13);
+    bad += check_shared(40, 1024, 768, 2, 64);
+    bad += check_shared(1030, 256, 128, 1, 32);
     k3cu_report();
     printf(bad ? "FAILED\n" : "ok\n");
     return bad ? 1 : 0;

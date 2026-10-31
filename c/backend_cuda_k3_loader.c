@@ -19,6 +19,11 @@ static int (*p_moe_poll)(int *, int);
 static int (*p_moe_wait)(void);
 static int (*p_moe_end)(void);
 static int (*p_matmul)(int, float *, const float *, const void *, const float *, int, int, int, int);
+static int (*p_mla)(const float *, const float *, int, int, int, const float *, const float *, const int8_t *,
+                    const float *, int, int, int, int, int, float, float *);
+static int (*p_router)(float *, const float *, const uint16_t *, int, int, int);
+static int (*p_shared)(float *, const float *, int, int, int, const uint8_t *, const float *, const uint8_t *,
+                       const float *, int, const uint8_t *, const float *, int, float, float);
 static void (*p_report)(void), (*p_shutdown)(void);
 
 int k3cu_init(int device) {
@@ -41,7 +46,7 @@ int k3cu_init(int device) {
     if (!fn) { fprintf(stderr, "[K3-CUDA] coli_cuda_k3.dll has no k3cu_" #name ": a prompt's experts stay on the CPU\n"); FreeLibrary(h); return 0; } \
     memcpy(&p_##name, &fn, sizeof fn); } while (0)
     BIND(init); BIND(free_bytes); BIND(host_alloc); BIND(host_free); BIND(exact_eval);
-    BIND(moe_begin); BIND(moe_expert); BIND(moe_poll); BIND(moe_wait); BIND(moe_end); BIND(matmul); BIND(report); BIND(shutdown);
+    BIND(moe_begin); BIND(moe_expert); BIND(moe_poll); BIND(moe_wait); BIND(moe_end); BIND(matmul); BIND(mla); BIND(router); BIND(shared); BIND(report); BIND(shutdown);
 #undef BIND
     module = h;
     return p_init(device);
@@ -62,6 +67,17 @@ int k3cu_moe_wait(void) { return module ? p_moe_wait() : -1; }
 int k3cu_moe_end(void) { return module ? p_moe_end() : 0; }
 int k3cu_matmul(int fmt, float *y, const float *x, const void *w, const float *scale, int S, int I, int O, int gs) {
     return module ? p_matmul(fmt, y, x, w, scale, S, I, O, gs) : 0;
+}
+int k3cu_mla(const float *Lc, const float *Rc, int N, int pos0, int C, const float *qv, const float *gv,
+             const int8_t *kvb, const float *kvbs, int H, int qn, int qr, int vh, int kvl, float scale, float *ctx) {
+    return module ? p_mla(Lc, Rc, N, pos0, C, qv, gv, kvb, kvbs, H, qn, qr, vh, kvl, scale, ctx) : 0;
+}
+int k3cu_router(float *sco, const float *x, const uint16_t *w, int C, int D, int E) {
+    return module ? p_router(sco, x, w, C, D, E) : 0;
+}
+int k3cu_shared(float *sd, const float *x, int S, int D, int I, const uint8_t *gq, const float *gs,
+                const uint8_t *uq, const float *us, int ggs, const uint8_t *dq, const float *ds, int dgs, float b1, float b2) {
+    return module ? p_shared(sd, x, S, D, I, gq, gs, uq, us, ggs, dq, ds, dgs, b1, b2) : 0;
 }
 void k3cu_report(void) { if (module) p_report(); }
 void k3cu_shutdown(void) { if (module) p_shutdown(); }

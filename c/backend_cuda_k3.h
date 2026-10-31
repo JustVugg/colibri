@@ -50,6 +50,22 @@ K3CU_API int k3cu_moe_end(void);
  * int8 rows (matmul_q; a scale a row). Host memory in and out; 0 when it cannot (the CPU's). */
 K3CU_API int k3cu_matmul(int fmt, float *y, const float *x, const void *w, const float *scale,
                          int S, int I, int O, int gs);
+/* A prompt step's gated MLA attention core, mla_forward's loop to the bit: rows pos0..pos0+C-1
+ * of a layer whose cache holds N = pos0 + C positions (Lc [N][kvl], Rc [N][qr]); qv [C][H][qn+qr]
+ * (qb's output), gv [C][H][vh] (the gate's, before its sigmoid), kv_b int8 rows
+ * [H*(qn+vh)][kvl] and their scales; ctx [C][H][vh]. 0 when it cannot (the CPU's). */
+K3CU_API int k3cu_mla(const float *Lc, const float *Rc, int N, int pos0, int C, const float *qv, const float *gv,
+                      const int8_t *kvb, const float *kvbs, int H, int qn, int qr, int vh, int kvl, float scale,
+                      float *ctx);
+/* sco [C][E] = x [C][D] against the bf16 router w [E][D], k3_router_scores's bytes (its 32
+ * lanes and halving tree); 0 when it cannot. */
+K3CU_API int k3cu_router(float *sco, const float *x, const uint16_t *w, int C, int D, int E);
+/* A prompt step's shared experts, sd [S][D] = down(situ(gate x, up x)) with x [S][D] and
+ * gate/up [I][D], down [D][I] int4 groups (scales [rows][cols/gs]), k3_shared's bytes (its
+ * matmul_i4_grouped and situf_); 0 when it cannot. */
+K3CU_API int k3cu_shared(float *sd, const float *x, int S, int D, int I, const uint8_t *gq, const float *gs,
+                         const uint8_t *uq, const float *us, int ggs, const uint8_t *dq, const float *ds, int dgs,
+                         float b1, float b2);
 K3CU_API void k3cu_report(void);
 K3CU_API void k3cu_shutdown(void);
 #ifdef __cplusplus

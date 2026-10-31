@@ -234,6 +234,8 @@ typedef struct { int eid; uint8_t *buf, *base; uint64_t used; int pinned;
                  int qd; unsigned qp; /* a queued read: its drive and its place in that drive's queue */
                  int busy;            /* the MoE step being computed still needs it (k3_moe_waves) */
                  int li;              /* the layer it was read for */
+                 int pin_ok, pin_mem; /* a cache or working-set slot, whose bytes may be pinned
+                                       * memory (K3_GPU_PIN_GB); base is that, not posix_memalign's */
                } Slot;
 /* pinned: seeded from .coli_usage at startup and never evicted. The LRU adapts to
  * THIS session; the pin knows the history of every session before it. Capped at
@@ -300,6 +302,7 @@ typedef struct {
      * experts, the routed experts' waves (t_eload is its waits) */
     double t_route, t_lat, t_shared, t_wave; uint64_t n_wave;
     double t_mla;                         /* t_attn's gated MLA layers (the rest: KDA's) */
+    double t_mla_gpu;                     /* t_mla's attention cores on the GPU (k3cu_mla) */
     double t_kda_f32, t_kda_conv, t_kda_heads;   /* KDA's f32 projections, a step's conv and heads passes */
     double *t_wait_li; uint64_t *n_dem_li;  /* K3_WAIT_LAYERS: a decode's waits and demand reads, by layer */
     /* K3_PREFETCH: the next MoE layer's experts predicted after a decode step's attention
@@ -657,6 +660,27 @@ static int k3_omp_in_par(void){
 static void k3g_init(Model *m);          /* K3_GPU_EXPERTS: a prompt step's experts on the GPU too */
 static int g_k3g_on;                     /* the device took the experts' and dense kernels (k3g_init) */
 static int g_k3g_min_rows=32, g_k3g_cpu_wave=4;
+/* The slots' bytes from pinned memory: the device copies an expert from there at about 26
+ * GB/s, from ordinary memory at about 13 (the driver's staging copy through the CPU). In
+ * chunks of 1 GiB up to K3_GPU_PIN_GB (64): Windows takes VRAM for pinned memory past
+ * about half of the RAM (96 GiB here), so the cache's other slots stay ordinary memory. */
+static uint8_t *g_k3p_at; static size_t g_k3p_left; static double g_k3p_used, g_k3p_cap=-1;
+static pthread_mutex_t g_k3p_mx=PTHREAD_MUTEX_INITIALIZER;
+static uint8_t *k3_pin_bytes(size_t b){
+    b=(b+4095)&~(size_t)4095;
+    uint8_t *p=NULL;
+    pthread_mutex_lock(&g_k3p_mx);
+    if(g_k3p_cap<0){ const char *e=getenv("K3_GPU_PIN_GB"); g_k3p_cap=e?atof(e):64.0; }
+    if(b>g_k3p_left&&g_k3p_used+1.0<=g_k3p_cap){
+        size_t chunk=(size_t)1<<30; if(chunk<b) chunk=b;
+        uint8_t *c=k3cu_host_alloc(chunk);
+        if(c){ g_k3p_at=c; g_k3p_left=chunk; g_k3p_used+=chunk/1073741824.0; }
+        else g_k3p_cap=g_k3p_used;   /* no more: the rest from posix_memalign */
+    }
+    if(b<=g_k3p_left){ p=g_k3p_at; g_k3p_at+=b; g_k3p_left-=b; }
+    pthread_mutex_unlock(&g_k3p_mx);
+    return p;
+}
 #endif
 static void w_matmul(float *y, const float *x, const W *w, int S){
 #ifdef COLI_CUDA
@@ -1814,9 +1838,10 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
         m->ecache[i].slot_by_expert=malloc((size_t)c->n_experts*sizeof(int));
         if(!m->ecache[i].s||!m->ecache[i].slot_by_expert){
             fprintf(stderr,"OOM expert cache/index\n"); exit(1); }
-        for(int j2=0;j2<cap;j2++) m->ecache[i].s[j2].eid=-1;
+        for(int j2=0;j2<cap;j2++){ m->ecache[i].s[j2].eid=-1; m->ecache[i].s[j2].pin_ok=1; }
         for(int e=0;e<c->n_experts;e++) m->ecache[i].slot_by_expert[e]=-1;
     }
+    for(size_t j2=0;j2<sizeof(m->ws)/sizeof(m->ws[0]);j2++) m->ws[j2].pin_ok=1;
     fprintf(stderr,"[K3] init done in %.1fs | %d layers | expert cache %d/layer (%.1f MB/slot) | RSS %.1f GB\n",
             now_s()-t0,c->n_layers,cap,m->e_slot/1e6,rss_gb());
     if(g_k3_ckpt_slots>0)
@@ -1920,7 +1945,19 @@ static __attribute__((noinline)) void k3_kda_head(Model *m, const Kda *a, int li
     sq=1.f/sqrtf(sq+1e-6f); sk=1.f/sqrtf(sk+1e-6f);
     for(int i=0;i<hd;i++){ qn[i]=qh[i]*sq*qscale; kn[i]=kh[i]*sk; }
     }
-    for(int i=0;i<hd;i++){
+    int i0=0;
+#ifdef EXP_F8
+    {   /* 8 at a time: the same adds, multiplies, divisions and exp_f's bits (exp_f8) */
+        const __m256 lb=_mm256_set1_ps(c->gate_lb), Ah=_mm256_set1_ps(a->A[h]), one=_mm256_set1_ps(1.f),
+                     sgn=_mm256_set1_ps(-0.f);
+        for(;i0+8<=hd;i0+=8){
+            __m256 z=_mm256_add_ps(_mm256_loadu_ps(rgt+(int64_t)h*hd+i0),_mm256_loadu_ps(a->dt+(int64_t)h*hd+i0));
+            __m256 s=_mm256_div_ps(one,_mm256_add_ps(one,exp_f8(_mm256_xor_ps(_mm256_mul_ps(Ah,z),sgn))));
+            _mm256_storeu_ps(alpha+i0,exp_f8(_mm256_mul_ps(lb,s)));
+        }
+    }
+#endif
+    for(int i=i0;i<hd;i++){
         float z=rgt[(int64_t)h*hd+i]+a->dt[(int64_t)h*hd+i];
         alpha[i]=exp_f(c->gate_lb*sigmoidf_(a->A[h]*z));
     }
@@ -1988,7 +2025,18 @@ static __attribute__((noinline)) void k3_kda_head(Model *m, const Kda *a, int li
     double ms=0; for(int vv=0;vv<hd;vv++) ms+=(double)oh[vv]*oh[vv];
     float r=1.f/sqrtf((float)(ms/hd)+c->eps);
     float *dst=ont+(int64_t)h*hd;
-    for(int vv=0;vv<hd;vv++) dst[vv]=oh[vv]*r*a->onw[vv]*sigmoidf_(gpt[(int64_t)h*hd+vv]);
+    int v0=0;
+#ifdef EXP_F8
+    {
+        const __m256 r8=_mm256_set1_ps(r), one=_mm256_set1_ps(1.f), sgn=_mm256_set1_ps(-0.f);
+        for(;v0+8<=hd;v0+=8){
+            __m256 sg=_mm256_div_ps(one,_mm256_add_ps(one,exp_f8(_mm256_xor_ps(_mm256_loadu_ps(gpt+(int64_t)h*hd+v0),sgn))));
+            _mm256_storeu_ps(dst+v0,_mm256_mul_ps(_mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(oh+v0),r8),
+                                                                _mm256_loadu_ps(a->onw+v0)),sg));
+        }
+    }
+#endif
+    for(int vv=v0;vv<hd;vv++) dst[vv]=oh[vv]*r*a->onw[vv]*sigmoidf_(gpt[(int64_t)h*hd+vv]);
 }
 static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float *out){
     Cfg *c=&m->c; Kda *a=&l->a;
@@ -2035,7 +2083,36 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
         float *wins[3]={m->cwq[li],m->cwk[li],m->cwv[li]}, *vecs[3]={q,k,v};
         const float *taps[3]={a->conv_q,a->conv_k,a->conv_v};
         #pragma omp parallel for schedule(static)
-        for(int d=0;d<P;d++)
+        for(int d0=0;d0<P;d0+=8){
+            int d=d0;
+#ifdef EXP_F8
+            if(d0+8<=P){   /* 8 channels at a time: each its own fused taps, SiLU through exp_f8 */
+                const __m256 one=_mm256_set1_ps(1.f), sgn=_mm256_set1_ps(-0.f);
+                for(int w2=0;w2<3;w2++){
+                    float *wb=wins[w2]; const float *tb=taps[w2];
+                    __m256 win[7], tap[7];
+                    for(int j=0;j<K;j++){
+                        float tw[8], tt[8];
+                        for(int l=0;l<8;l++){ tw[l]=wb[(int64_t)(d0+l)*K+j]; tt[l]=tb[(int64_t)(d0+l)*K+j]; }
+                        win[j]=_mm256_loadu_ps(tw); tap[j]=_mm256_loadu_ps(tt);
+                    }
+                    for(int t=0;t<C;t++){
+                        float *val=vecs[w2]+(int64_t)t*P+d0;
+                        for(int j=0;j<K-1;j++) win[j]=win[j+1];
+                        win[K-1]=_mm256_loadu_ps(val);
+                        __m256 acc=_mm256_setzero_ps();
+                        for(int j=0;j<K;j++) acc=_mm256_fmadd_ps(tap[j],win[j],acc);
+                        _mm256_storeu_ps(val,_mm256_div_ps(acc,_mm256_add_ps(one,exp_f8(_mm256_xor_ps(acc,sgn)))));
+                    }
+                    for(int j=0;j<K;j++){
+                        float tw[8]; _mm256_storeu_ps(tw,win[j]);
+                        for(int l=0;l<8;l++) wb[(int64_t)(d0+l)*K+j]=tw[l];
+                    }
+                }
+                d=d0+8;
+            }
+#endif
+            for(;d<d0+8&&d<P;d++)
             for(int w2=0;w2<3;w2++){
                 float *wd=wins[w2]+(int64_t)d*K; const float *cd=taps[w2]+(int64_t)d*K;
                 for(int t=0;t<C;t++){
@@ -2047,6 +2124,7 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
                     *val=siluf_(acc);
                 }
             }
+        }
         m->t_kda_conv+=now_s()-tc;
         tc=now_s();
         #pragma omp parallel for schedule(static)
@@ -2341,7 +2419,17 @@ static void k3_mla_scores_g(float *sc, const float *qab, const float *const *qrp
 #ifdef COLI_VULKAN
     if(a->kvb.vk_gone) k3_w_reload(&a->kvb);   /* its rows are read on the CPU below */
 #endif
-    for(int tt=0;tt<C;tt++){
+    int on_gpu=0;
+#ifdef COLI_K3_CUDA
+    /* a prompt step's attention core on the GPU, the loop below's bytes (k3cu_mla) */
+    if(!mr&&g_k3g_on&&C>=g_k3g_min_rows&&a->kvb.fmt==1&&a->kvb.q8&&kvl%8==0&&(qr==0||qr%8==0)){
+        double t0=now_s();
+        on_gpu=k3cu_mla(m->Lc[li],m->Rc[li],pos0+C,pos0,C,qv,gv,a->kvb.q8,a->kvb.s,H,c->qk_nope,qr,vh,kvl,
+                        c->attn_scale,ctx);
+        if(on_gpu) m->t_mla_gpu+=now_s()-t0;
+    }
+#endif
+    for(int tt=0;tt<C&&!on_gpu;tt++){
         int nt=(mr?mr[tt].pos:pos0+tt)+1;
         const float *Lc_=mr?mr[tt].seq->Lc[li]:m->Lc[li], *Rc_=mr?mr[tt].seq->Rc[li]:m->Rc[li];
         const float *qvt=qv+(int64_t)tt*H*qh, *gvt=gv+(int64_t)tt*H*vh;
@@ -2491,6 +2579,9 @@ static int k3_io_fd(Model *m, int *own, int fi, int direct){
  * the readers with their handles, and on the caller's thread (own NULL). */
 static void expert_read_h(Model *m, int li, int eid, Slot *s, int *own){
     if(!s->base){
+#ifdef COLI_K3_CUDA
+        if(s->pin_ok&&g_k3g_on&&(s->base=k3_pin_bytes((size_t)m->e_slot+8192))) s->pin_mem=1; else
+#endif
         if(posix_memalign((void**)&s->base,4096,(size_t)m->e_slot+8192)){
             fprintf(stderr,"OOM expert slot\n"); exit(1); }
     }
@@ -2854,6 +2945,10 @@ static inline float k3_dot_bf16w(const float *x, const uint16_t *w, int I){
 }
 /* sco[C][E] = x[C][hidden] the router's rows, bf16 or f32 */
 static void k3_router_scores(Moe *o, float *sco, const float *x, int C, int D, int E){
+#ifdef COLI_K3_CUDA
+    /* a prompt step's: on the GPU, the same lanes and tree (k3cu_router) */
+    if(o->router16&&g_k3g_on&&C>=g_k3g_min_rows&&MATMUL_F32_LANES==32&&D%32==0&&k3cu_router(sco,x,o->router16,C,D,E)) return;
+#endif
 #if defined(__AVX2__) && defined(__FMA__)
     if(o->router16&&C>=2&&D%MATMUL_F32_LANES==0&&MATMUL_F32_LANES==32){
         /* a prompt step: matmul's tiling over rows (matmul_f32.h), the weights widened as
@@ -4042,6 +4137,18 @@ static void k3_vk_report(const Model *m, const char *scope){
 static float *k3_shared(Model *m, Moe *o, const float *x, int C){
     Cfg *c=&m->c;
     int shi=c->moe_inter*c->n_shared;
+#ifdef COLI_K3_CUDA
+    {   /* a prompt step's: gate, up, SiTU and down on the GPU in one call, the CPU's bytes */
+        const W *g=&o->sh_gate, *u=&o->sh_up, *d=&o->sh_down;
+        if(g_k3g_on&&C>=g_k3g_min_rows&&g->fmt==4&&u->fmt==4&&d->fmt==4&&!g->cuda&&!u->cuda&&!d->cuda&&
+           g->q4&&u->q4&&d->q4&&g->gs==u->gs){
+            float *sd=falloc((int64_t)C*c->hidden);
+            if(k3cu_shared(sd,x,C,c->hidden,shi,g->q4,g->s,u->q4,u->s,g->gs,d->q4,d->s,d->gs,c->situ_b1,c->situ_b2))
+                return sd;
+            free(sd);
+        }
+    }
+#endif
     float *sg=k3_balloc((int64_t)C*shi), *su=k3_balloc((int64_t)C*shi), *sd=falloc((int64_t)C*c->hidden);
     w_matmul(sg,x,&o->sh_gate,C); w_matmul(su,x,&o->sh_up,C);
     /* element by element over every worker (a 512-row step: 3.1M of them a layer) */
@@ -4209,21 +4316,41 @@ static float *k3_vk_step(Model *m, Moe *o, int li, int C, const float *x, const 
 static void k3_moe_route(Model *m, Moe *o, int li, float *sco, int C, int *idxs, float *wsels, int *keff){
     Cfg *c=&m->c;
     int E=c->n_experts, K=c->topk;
+    /* the rows over every worker (a prompt step's 4,096 took 0.15 s a layer on one); each row
+     * as before: its sigmoids (exp_f8: exp_f's bits), then its top-K in turn, the first of
+     * equal scores winning, an expert marked once taken where the loop used to look for it
+     * among the picks so far -- the same picks; the route records after, in the rows' order */
+    #pragma omp parallel for schedule(static) if(C>1)
     for(int t=0;t<C;t++){
         float *st=sco+(int64_t)t*E;
-        for(int e=0;e<E;e++) st[e]=sigmoidf_(st[e]);
+        int e0=0;
+#ifdef EXP_F8
+        {
+            const __m256 one=_mm256_set1_ps(1.f), sgn=_mm256_set1_ps(-0.f);
+            for(;e0+8<=E;e0+=8)
+                _mm256_storeu_ps(st+e0,_mm256_div_ps(one,_mm256_add_ps(one,exp_f8(_mm256_xor_ps(_mm256_loadu_ps(st+e0),sgn)))));
+        }
+#endif
+        for(int e=e0;e<E;e++) st[e]=sigmoidf_(st[e]);
         int *idx=idxs+(int64_t)t*K; float *wsel=wsels+(int64_t)t*K;
+        uint8_t taken[4096]; float svs[4096];
+        const int fast=E<=4096;
+        if(fast) for(int e=0;e<E;e++){ taken[e]=0; svs[e]=st[e]+o->rbias[e]; }
         for(int kk=0;kk<K;kk++){
             int best=-1; float bv=-1e30f;
+            if(fast){
+                for(int e=0;e<E;e++) if(!taken[e]&&svs[e]>bv){ bv=svs[e]; best=e; }
+            } else
             for(int e=0;e<E;e++){
-                int taken=0; for(int j=0;j<kk;j++) if(idx[j]==e){taken=1;break;}
+                int tk=0; for(int j=0;j<kk;j++) if(idx[j]==e){tk=1;break;}
                 float sv=st[e]+o->rbias[e];
-                if(!taken&&sv>bv){ bv=sv; best=e; }
+                if(!tk&&sv>bv){ bv=sv; best=e; }
             }
             /* SEC: all-NaN scores leave best at -1, and st[-1] is read on the
              * very next expression. See rt_router_pick in route_trace.h. */
             best = rt_router_pick(best, kk, E, li);
             idx[kk]=best; wsel[kk]=st[best];          /* weight = RAW sigmoid score */
+            if(fast) taken[best]=1;
         }
         { float sm=0; for(int kk=0;kk<K;kk++) sm+=wsel[kk];
           for(int kk=0;kk<K;kk++) wsel[kk]/=(sm+1e-20f); }
@@ -4244,8 +4371,9 @@ static void k3_moe_route(Model *m, Moe *o, int li, float *sco, int C, int *idxs,
             }
         }
         keff[t]=Kt;
-        rt_route(li,t,idx,wsel,Kt);        /* traces and counts, one call */
     }
+    for(int t=0;t<C;t++)
+        rt_route(li,t,idxs+(int64_t)t*K,wsels+(int64_t)t*K,keff[t]);   /* traces and counts, one call a row */
 }
 
 /* The routed experts of C rows in the latent: u[C][LT] (zeroed by the caller) gets
@@ -6149,8 +6277,8 @@ int main(int argc, char **argv){
     k3_cuda_report("prompt");
 #endif
 #ifdef COLI_K3_CUDA
-    if(g_k3g.gpu) fprintf(stderr,"[K3-CUDA] experts: %llu of the prompt's routed experts on the GPU, %llu on the CPU\n",
-                          g_k3g.gpu,g_k3g.cpu);
+    if(g_k3g.gpu) fprintf(stderr,"[K3-CUDA] experts: %llu of the prompt's routed experts on the GPU, %llu on the CPU; "
+                          "%.0f GiB of the cache's slots pinned\n",g_k3g.gpu,g_k3g.cpu,g_k3p_used);
     k3cu_report();
 #endif
     /* the decode's own share of every timer: what they hold after the prompt */
@@ -6325,13 +6453,13 @@ static void kimi_segment_model_destroy(KimiSegmentEngine *engine) {
         if (model->ecache) {
             LCache *cache = &model->ecache[layer];
             for (int slot = 0; slot < cache->cap; slot++)
-                compat_aligned_free(cache->s[slot].base);   /* expert_read's posix_memalign */
+                if(!cache->s[slot].pin_mem) compat_aligned_free(cache->s[slot].base);   /* expert_read's posix_memalign */
             free(cache->slot_by_expert); free(cache->s);
         }
     }
     for (size_t slot = 0; slot < sizeof(model->ws) / sizeof(model->ws[0]);
          slot++)
-        compat_aligned_free(model->ws[slot].base);
+        if(!model->ws[slot].pin_mem) compat_aligned_free(model->ws[slot].base);
     free(model->final_norm); free(model->out_sw);
     w_release_host(&model->lm_head);
     free(model->kstate); free(model->cwq); free(model->cwk); free(model->cwv);
