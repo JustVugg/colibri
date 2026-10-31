@@ -1,0 +1,1225 @@
+# qwen38 CUDA chain, up to 32 experts a forward against 128 with the brake: code after the prose's history (2026-10-25)
+# Vast.ai instance: AMD EPYC 7443P 24-Core Processor (24 cores / 48 threads, 128 MiB L3; the container's quota 11.52 CPUs, OMP_NUM_THREADS=10) + NVIDIA RTX PRO 4000 Blackwell (24467 MiB, sm_120, PCIe 4 x16: 28.0 GB/s to the card and 558 GB/s on it, measured);
+#   251.6 GiB on the host, the container's memory.max 120.7 GiB; Ubuntu 24.04.1 LTS (container nvidia/cuda:12.8.1-devel-ubuntu24.04) on Linux 6.8.0-110-generic x86_64, Vast.ai machine 59339, driver 580.142.
+# Model: unsloth/Qwen3.8-Flash-Next-GGUF, UD-Q2_K_XL (Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf sha256 a4f3b21e77353999829f2f767e9ac21ce9c71d29a74f2cc9eda48c9bf23c8b86, Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00003.gguf sha256 2e3bf1ee7d2a04e261e9f342a2d968f696cce5941d082b0e434deb9b1edc12c6, Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00003.gguf sha256 ec8c106759fdf4f463039c34c0707718d7d8908d53d892bd4f002e71620803f9)
+#   imported with python3 tools/gguf_import.py <the first file> <model> --no-mtp.
+# v0 = origin/dev 7bbea341 (qwen38-dev); v1 = 7bbea341 + this change (qwen38-pr: the measured diff, sha256
+#   391dea7bbd855bc2cc3892c5e60f7cec712a8200551ca4fc9ae5f64e35a4e5f9, differs from this commit only in comments). Both built with:
+#   cd c && make -j qwen38 CUDA=1 CUDA_ARCH=native
+# History: history.usage.gz beside this file (gunzip to <history.usage>, sha256 8dc23b015a8080b48b2e7ef7878f51516ac64f481bd104bba56f96a021341459),
+#   written by a run of the prose prompt on another machine (134880 selections); USAGE_SAVE=0, so no run changes it.
+# Each run, a new process: env COLI_CUDA=1 COLI_VULKAN=0 COLI_TEMP=0 COLI_TIMERS=1 N_NEW=128 USAGE_SAVE=0 OMP_NUM_THREADS=10 OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close SNAP=<model> COLI_USAGE=<history.usage> ./qwen38 128 8 <prompt>
+# Prompt (sha256 8f267bf589d808d1eb0e07b7a3a73d6c92aaf71b32efb64404d50d3553b669a0):
+#   /* Read a text file into memory and split it into lines. */
+#   int read_lines(const char *path, char ***out)
+#   {
+#       FILE *f = fopen(path, "rb");
+#       if (!f)
+#           return -1;
+#       fseek(f, 0, SEEK_END);
+#       long size = ftell(f);
+#       rewind(f);
+#       char *buf = malloc((size_t)size + 1);
+#       size_t got = fread(buf, 1, (size_t)size, f);
+#       fclose(f);
+#       buf[got] = 0;
+#       /* count the lines first, then fill the array */
+#       int n = 0;
+# A warm-up run of v0 (not counted), then v0 v1 v1 v0 v0 v1 v1 v0, 60 s of rest before each. Every run's stderr
+#   and stdout in full, in the order they ran. decode tok/s = (n - 1) / (n / S - TTFT), S and n from the
+#   "Speed" line, TTFT from its line (the server's q38_decode_rate over the same interval).
+
+===== C-w.err (sha256 3648584550cc3a012a1922fdc33f16bba61cbf34cb54c4a3b34643510dd1a55d)
+[gguf] /workspace/models/q38-gguf/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf: 3 file(s), 1224 tensors, read in place (native ggml types, no conversion)
+== Qwen3.8-Flash-Next native text engine | cache=128/layer | CPU ==
+[tok] loaded 248320 base pieces + 33 added tokens (max id 248319) from /workspace/models/q38-colibri/tokenizer.json
+[enc] prompt tokens: 148 | generating 128 new tokens
+[qwen38] native text weights: prefix=model, 48 layers, PLE=1, cache=128/layer, FP8=native, BF16=native (resident matrices 3.73 GiB)
+[qwen38] speculative decoding with the MTP head: off (the GGUF has none; tools/gguf_import.py --mtp names an mtp-*.gguf; Q38_MTP=0 silences this)
+[qtier] qwen38: 1.59 GiB kept for the CUDA chain (its mirrors at 8192 positions, its scratch and own matrices)
+[qtier] RAM holds 128 of 512 experts a layer: the tier copies each expert it takes as it passes
+[qtier] COLI_GPUS unset: selecting 1 visible device(s)
+[CUDA] device 0: NVIDIA RTX PRO 4000 Blackwell, 25.2 GB VRAM, sm_120
+[qtier] dev 0: 23.2 GB free, allowance 22.2 GB
+[place] auto: dev 0 holds 4700.6 MB of trunk (lmhead yes, 0 dnproj layers), 17.61 GB left for experts
+[qtier] dev 0: budget 17.61 GB for experts (~8642 experts) after trunk
+[qtier] dev 0: the GGUF experts' arena, 8642 slots of 2.09 MB (17.61 GB)
+[qtier] CUDA VRAM expert tier active: 1 device(s), 2.09 MB/expert, copied as they pass
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[qtier] qwen38: the GGUF's experts on the CUDA tier as the file has them (RAM LRU 128/layer; experts go to VRAM as they get hot)
+[qtier] qwen38 trunk: 553 of 553 offered matrices resident (int8, a GGUF's blocks as they are; 3.00 GiB) in 1.2s; the rest answers from the CPU
+[qwen38] trunk: 60 matrices int8 on the CPU (0.08 GiB, 0.27 GiB of BF16 released) in 0.0s; Q38_TRUNK_CPU_INT8=0 keeps BF16
+[chain] qwen38: a decode step's routed experts in the frame (the tier's residents by address, format 100 (a GGUF's blocks, by layer), group 0; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen38: 48 layers on CUDA device 0 (12 QSA), the final mixer and lm_head too; 3.37 GiB of the tier's trunk, 174.2 MiB uploaded by the chain, 9.8 MiB of parameters
+[qwen38] routed experts: GGUF IQ2_XS/IQ2_XS/IQ4_NL (layer 0), 1.78 MiB per expert; cache 128/layer
+[USAGE] expert history: 134880 selections (/workspace/prova/storia)
+[qtier] qwen38: warm start, 8642 of the GGUF's experts in VRAM, the history's most used first (.coli_usage) -- 2.8 s
+[chain] qwen38: host pool, every expert (the 15934 the card leaves and its own 8642) in 49.80 GiB of page-locked RAM the device reads over the bus (18.5 s to allocate, 2.0 s to read; COLI_CUDA_CHAIN_POOL=0 off)
+[chain] qwen38: a step's pooled experts copied to the device first (16 places, 33.2 MiB)
+[chain] qwen38: a prompt chunk's layer's pooled experts copied to the device while the layers before it run (246 places, 510.5 MiB; the most a layer has: 512)
+[chain] qwen38: the card's 8642 slots are the chain's to fill (8642 held): up to 32 experts a forward promoted from the pool by this conversation's routes (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+resident weights loaded in 1.4s | RSS after load: 54.28 GB
+Generated (128 new tokens):
+Text : 
+TTFT: 1.90 s (time to first token)
+[qwen38 spec gate] run: T(1) 27.4 ms, rows 2:1.74 3:1.97 4:2.78, rho 0.44, acceptance by position 0.41 0.80 0.67 0.50 0.50
+[qwen38 lookup] run: 1.09 tokens/forward (117 forwards per 127 tokens) | acceptance 38.5% (10/26 drafts in 15 verifies) | gate on, 42 declined, 7 probes
+[qwen38 timers] total: 118 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        3.243 s     27.487 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 timers] prefill: 1 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        0.535 s    534.541 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 timers] decode: 117 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        2.709 s     23.153 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 expert I/O] weight-ranges=0 scale-ranges=0 coalesced-gate-up=0 prefetched=0 parallel-batches=0 resident-scales=0.00 MiB
+
+PEAK RSS: 54.41 GB
+[qtier] resident 8642/24576 experts | uploads 8642 | miss(CPU) 0 | q_skips 0
+[qtier]   dev 0: hits 0 | 773 tensors, 3.09 GB VRAM used (4.59 GB trunk + experts, budget 17.61 GB)
+[qtier] VRAM hit rate: 0.0 % | swaps 0 (0 in place)
+Expert cache hit rate: 0.0% (hit=0 miss=0)
+Speed: 20.98 tok/s (6.1s for 128 tokens)
+[chain] qwen38: 118 forwards, 239 frames (227595 ops, 91214 matmuls), 3243.5 ms waiting for the device, 0.0 ms of routed experts on the host, 1115.6 MiB on the device; per decode step 23.15 ms waiting, 0.00 ms of experts (117 steps)
+[chain] qwen38: 5664 layer steps with the routed experts in the frame, 0 of them hybrid (0 slots on the host in 0.0 ms, 0.0 ms waiting for the device's routes), 74986 slots from the host pool
+[chain] qwen38: 48 prompt layer steps staged the host pool's experts (22.68 GB copied over the bus)
+[chain] qwen38: 3776 experts promoted to the card (3776 residents back to the pool), 55 on their way
+	Command being timed: "/workspace/bin/qwen38-dev 128 8 /workspace/prova/prompt-codice.txt"
+	User time (seconds): 259.57
+	System time (seconds): 48.22
+	Percent of CPU this job got: 777%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:39.59
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 57051656
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 1387639
+	Voluntary context switches: 147635
+	Involuntary context switches: 2033
+	Swaps: 0
+	File system inputs: 3248
+	File system outputs: 56
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+===== C-w.out (sha256 317c50d3cfbc5c83fd359621c1c9a21a65100f500c509fff84a00ffa147ec91d)
+
+    for (char *p = buf; *p; p++)
+        if (*p == '\n')
+            n++;
+    char **lines = malloc((size_t)(n + 1) * sizeof *lines);
+    int i = 0;
+    char *start = buf;
+    for (char *p = buf; *p; p++) {
+        if (*p == '\n') {
+            *p = 0;
+            lines[i++] = start;
+            start = p + 1;
+        }
+    }
+    if (start <
+
+===== C-1-dev.err (sha256 d4c7b72f4713a13f829194b4fdb5b20d9d5a9f7f30d4803a138292657412ebc8)
+[gguf] /workspace/models/q38-gguf/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf: 3 file(s), 1224 tensors, read in place (native ggml types, no conversion)
+== Qwen3.8-Flash-Next native text engine | cache=128/layer | CPU ==
+[tok] loaded 248320 base pieces + 33 added tokens (max id 248319) from /workspace/models/q38-colibri/tokenizer.json
+[enc] prompt tokens: 148 | generating 128 new tokens
+[qwen38] native text weights: prefix=model, 48 layers, PLE=1, cache=128/layer, FP8=native, BF16=native (resident matrices 3.73 GiB)
+[qwen38] speculative decoding with the MTP head: off (the GGUF has none; tools/gguf_import.py --mtp names an mtp-*.gguf; Q38_MTP=0 silences this)
+[qtier] qwen38: 1.59 GiB kept for the CUDA chain (its mirrors at 8192 positions, its scratch and own matrices)
+[qtier] RAM holds 128 of 512 experts a layer: the tier copies each expert it takes as it passes
+[qtier] COLI_GPUS unset: selecting 1 visible device(s)
+[CUDA] device 0: NVIDIA RTX PRO 4000 Blackwell, 25.2 GB VRAM, sm_120
+[qtier] dev 0: 23.2 GB free, allowance 22.2 GB
+[place] auto: dev 0 holds 4700.6 MB of trunk (lmhead yes, 0 dnproj layers), 17.61 GB left for experts
+[qtier] dev 0: budget 17.61 GB for experts (~8642 experts) after trunk
+[qtier] dev 0: the GGUF experts' arena, 8642 slots of 2.09 MB (17.61 GB)
+[qtier] CUDA VRAM expert tier active: 1 device(s), 2.09 MB/expert, copied as they pass
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[qtier] qwen38: the GGUF's experts on the CUDA tier as the file has them (RAM LRU 128/layer; experts go to VRAM as they get hot)
+[qtier] qwen38 trunk: 553 of 553 offered matrices resident (int8, a GGUF's blocks as they are; 3.00 GiB) in 1.1s; the rest answers from the CPU
+[qwen38] trunk: 60 matrices int8 on the CPU (0.08 GiB, 0.27 GiB of BF16 released) in 0.0s; Q38_TRUNK_CPU_INT8=0 keeps BF16
+[chain] qwen38: a decode step's routed experts in the frame (the tier's residents by address, format 100 (a GGUF's blocks, by layer), group 0; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen38: 48 layers on CUDA device 0 (12 QSA), the final mixer and lm_head too; 3.37 GiB of the tier's trunk, 174.2 MiB uploaded by the chain, 9.8 MiB of parameters
+[qwen38] routed experts: GGUF IQ2_XS/IQ2_XS/IQ4_NL (layer 0), 1.78 MiB per expert; cache 128/layer
+[USAGE] expert history: 134880 selections (/workspace/prova/storia)
+[qtier] qwen38: warm start, 8642 of the GGUF's experts in VRAM, the history's most used first (.coli_usage) -- 2.8 s
+[chain] qwen38: host pool, every expert (the 15934 the card leaves and its own 8642) in 49.80 GiB of page-locked RAM the device reads over the bus (18.6 s to allocate, 2.0 s to read; COLI_CUDA_CHAIN_POOL=0 off)
+[chain] qwen38: a step's pooled experts copied to the device first (16 places, 33.2 MiB)
+[chain] qwen38: a prompt chunk's layer's pooled experts copied to the device while the layers before it run (246 places, 510.5 MiB; the most a layer has: 512)
+[chain] qwen38: the card's 8642 slots are the chain's to fill (8642 held): up to 32 experts a forward promoted from the pool by this conversation's routes (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+resident weights loaded in 1.5s | RSS after load: 54.27 GB
+Generated (128 new tokens):
+Text : 
+TTFT: 1.87 s (time to first token)
+[qwen38 spec gate] run: T(1) 26.7 ms, rows 2:1.83 3:2.58 4:2.66, rho 0.45, acceptance by position 0.64 0.67 0.50 0.50 0.50
+[qwen38 lookup] run: 1.06 tokens/forward (120 forwards per 127 tokens) | acceptance 58.3% (7/12 drafts in 9 verifies) | gate on, 51 declined, 6 probes
+[qwen38 timers] total: 121 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        3.165 s     26.158 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 timers] prefill: 1 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        0.534 s    534.141 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 timers] decode: 120 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        2.631 s     21.925 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 expert I/O] weight-ranges=0 scale-ranges=0 coalesced-gate-up=0 prefetched=0 parallel-batches=0 resident-scales=0.00 MiB
+
+PEAK RSS: 54.40 GB
+[qtier] resident 8642/24576 experts | uploads 8642 | miss(CPU) 0 | q_skips 0
+[qtier]   dev 0: hits 0 | 773 tensors, 3.09 GB VRAM used (4.59 GB trunk + experts, budget 17.61 GB)
+[qtier] VRAM hit rate: 0.0 % | swaps 0 (0 in place)
+Expert cache hit rate: 0.0% (hit=0 miss=0)
+Speed: 21.45 tok/s (6.0s for 128 tokens)
+[chain] qwen38: 121 forwards, 245 frames (232515 ops, 93533 matmuls), 3165.2 ms waiting for the device, 0.0 ms of routed experts on the host, 1115.6 MiB on the device; per decode step 21.93 ms waiting, 0.00 ms of experts (120 steps)
+[chain] qwen38: 5808 layer steps with the routed experts in the frame, 0 of them hybrid (0 slots on the host in 0.0 ms, 0.0 ms waiting for the device's routes), 73172 slots from the host pool
+[chain] qwen38: 48 prompt layer steps staged the host pool's experts (22.68 GB copied over the bus)
+[chain] qwen38: 3872 experts promoted to the card (3872 residents back to the pool), 55 on their way
+	Command being timed: "/workspace/bin/qwen38-dev 128 8 /workspace/prova/prompt-codice.txt"
+	User time (seconds): 259.52
+	System time (seconds): 47.78
+	Percent of CPU this job got: 777%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:39.50
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 57044752
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 1386056
+	Voluntary context switches: 145843
+	Involuntary context switches: 1650
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 48
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+===== C-1-dev.out (sha256 317c50d3cfbc5c83fd359621c1c9a21a65100f500c509fff84a00ffa147ec91d)
+
+    for (char *p = buf; *p; p++)
+        if (*p == '\n')
+            n++;
+    char **lines = malloc((size_t)(n + 1) * sizeof *lines);
+    int i = 0;
+    char *start = buf;
+    for (char *p = buf; *p; p++) {
+        if (*p == '\n') {
+            *p = 0;
+            lines[i++] = start;
+            start = p + 1;
+        }
+    }
+    if (start <
+
+===== C-2-pr.err (sha256 68395fb3909beb50e24973d8e24db762ad2ff41d19a0d35f6fad7164a2f3d918)
+[gguf] /workspace/models/q38-gguf/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf: 3 file(s), 1224 tensors, read in place (native ggml types, no conversion)
+== Qwen3.8-Flash-Next native text engine | cache=128/layer | CPU ==
+[tok] loaded 248320 base pieces + 33 added tokens (max id 248319) from /workspace/models/q38-colibri/tokenizer.json
+[enc] prompt tokens: 148 | generating 128 new tokens
+[qwen38] native text weights: prefix=model, 48 layers, PLE=1, cache=128/layer, FP8=native, BF16=native (resident matrices 3.73 GiB)
+[qwen38] speculative decoding with the MTP head: off (the GGUF has none; tools/gguf_import.py --mtp names an mtp-*.gguf; Q38_MTP=0 silences this)
+[qtier] qwen38: 1.59 GiB kept for the CUDA chain (its mirrors at 8192 positions, its scratch and own matrices)
+[qtier] RAM holds 128 of 512 experts a layer: the tier copies each expert it takes as it passes
+[qtier] COLI_GPUS unset: selecting 1 visible device(s)
+[CUDA] device 0: NVIDIA RTX PRO 4000 Blackwell, 25.2 GB VRAM, sm_120
+[qtier] dev 0: 23.2 GB free, allowance 22.2 GB
+[place] auto: dev 0 holds 4700.6 MB of trunk (lmhead yes, 0 dnproj layers), 17.61 GB left for experts
+[qtier] dev 0: budget 17.61 GB for experts (~8642 experts) after trunk
+[qtier] dev 0: the GGUF experts' arena, 8642 slots of 2.09 MB (17.61 GB)
+[qtier] CUDA VRAM expert tier active: 1 device(s), 2.09 MB/expert, copied as they pass
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[qtier] qwen38: the GGUF's experts on the CUDA tier as the file has them (RAM LRU 128/layer; experts go to VRAM as they get hot)
+[qtier] qwen38 trunk: 553 of 553 offered matrices resident (int8, a GGUF's blocks as they are; 3.00 GiB) in 1.0s; the rest answers from the CPU
+[qwen38] trunk: 60 matrices int8 on the CPU (0.08 GiB, 0.27 GiB of BF16 released) in 0.0s; Q38_TRUNK_CPU_INT8=0 keeps BF16
+[chain] qwen38: a decode step's routed experts in the frame (the tier's residents by address, format 100 (a GGUF's blocks, by layer), group 0; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen38: 48 layers on CUDA device 0 (12 QSA), the final mixer and lm_head too; 3.37 GiB of the tier's trunk, 174.2 MiB uploaded by the chain, 9.8 MiB of parameters
+[qwen38] routed experts: GGUF IQ2_XS/IQ2_XS/IQ4_NL (layer 0), 1.78 MiB per expert; cache 128/layer
+[USAGE] expert history: 134880 selections (/workspace/prova/storia)
+[qtier] qwen38: warm start, 8642 of the GGUF's experts in VRAM, the history's most used first (.coli_usage) -- 2.5 s
+[chain] qwen38: host pool, every expert (the 15934 the card leaves and its own 8642) in 49.80 GiB of page-locked RAM the device reads over the bus (18.7 s to allocate, 2.0 s to read; COLI_CUDA_CHAIN_POOL=0 off)
+[chain] qwen38: a step's pooled experts copied to the device first (16 places, 33.2 MiB)
+[chain] qwen38: a prompt chunk's layer's pooled experts copied to the device while the layers before it run (246 places, 510.5 MiB; the most a layer has: 512)
+[chain] qwen38: the card's 8642 slots are the chain's to fill (8642 held): up to 128 experts a forward promoted from the pool by this conversation's routes, none while the last 64 frames found 90 % or more of their routes on the card (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+resident weights loaded in 1.5s | RSS after load: 54.27 GB
+Generated (128 new tokens):
+Text : 
+TTFT: 1.87 s (time to first token)
+[qwen38 spec gate] run: T(1) 22.3 ms, rows 2:1.36 3:1.95, rho 0.39, acceptance by position 0.48 0.50 0.50 0.50 0.50
+[qwen38 lookup] run: 1.13 tokens/forward (112 forwards per 127 tokens) | acceptance 45.5% (15/33 drafts in 29 verifies) | gate on, 23 declined, 8 probes
+[qwen38 timers] total: 113 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        2.179 s     19.283 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 timers] prefill: 1 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        0.536 s    535.886 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 timers] decode: 112 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        1.643 s     14.671 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 expert I/O] weight-ranges=0 scale-ranges=0 coalesced-gate-up=0 prefetched=0 parallel-batches=0 resident-scales=0.00 MiB
+
+PEAK RSS: 54.40 GB
+[qtier] resident 8642/24576 experts | uploads 8642 | miss(CPU) 0 | q_skips 0
+[qtier]   dev 0: hits 0 | 773 tensors, 3.09 GB VRAM used (4.59 GB trunk + experts, budget 17.61 GB)
+[qtier] VRAM hit rate: 0.0 % | swaps 0 (0 in place)
+Expert cache hit rate: 0.0% (hit=0 miss=0)
+Speed: 25.91 tok/s (4.9s for 128 tokens)
+[chain] qwen38: 113 forwards, 202 frames (220873 ops, 87349 matmuls), 2179.0 ms waiting for the device, 0.0 ms of routed experts on the host, 1003.3 MiB on the device; per decode step 14.67 ms waiting, 0.00 ms of experts (112 steps)
+[chain] qwen38: 5424 layer steps with the routed experts in the frame, 0 of them hybrid (0 slots on the host in 0.0 ms, 0.0 ms waiting for the device's routes), 58604 slots from the host pool
+[chain] qwen38: 48 prompt layer steps staged the host pool's experts (22.68 GB copied over the bus)
+[chain] qwen38: 5182 experts promoted to the card (5182 residents back to the pool), 0 on their way; 29 frames braked, 58.3 % of the routes on the card
+	Command being timed: "/workspace/bin/qwen38-pr 128 8 /workspace/prova/prompt-codice.txt"
+	User time (seconds): 248.60
+	System time (seconds): 48.09
+	Percent of CPU this job got: 776%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:38.19
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 57038404
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 1383833
+	Voluntary context switches: 141427
+	Involuntary context switches: 723
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 48
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+===== C-2-pr.out (sha256 317c50d3cfbc5c83fd359621c1c9a21a65100f500c509fff84a00ffa147ec91d)
+
+    for (char *p = buf; *p; p++)
+        if (*p == '\n')
+            n++;
+    char **lines = malloc((size_t)(n + 1) * sizeof *lines);
+    int i = 0;
+    char *start = buf;
+    for (char *p = buf; *p; p++) {
+        if (*p == '\n') {
+            *p = 0;
+            lines[i++] = start;
+            start = p + 1;
+        }
+    }
+    if (start <
+
+===== C-3-pr.err (sha256 e0341f1a0a402a6bf65bb26cae5354eeb7cd752d6def1f63e67f85d50757ce7f)
+[gguf] /workspace/models/q38-gguf/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf: 3 file(s), 1224 tensors, read in place (native ggml types, no conversion)
+== Qwen3.8-Flash-Next native text engine | cache=128/layer | CPU ==
+[tok] loaded 248320 base pieces + 33 added tokens (max id 248319) from /workspace/models/q38-colibri/tokenizer.json
+[enc] prompt tokens: 148 | generating 128 new tokens
+[qwen38] native text weights: prefix=model, 48 layers, PLE=1, cache=128/layer, FP8=native, BF16=native (resident matrices 3.73 GiB)
+[qwen38] speculative decoding with the MTP head: off (the GGUF has none; tools/gguf_import.py --mtp names an mtp-*.gguf; Q38_MTP=0 silences this)
+[qtier] qwen38: 1.59 GiB kept for the CUDA chain (its mirrors at 8192 positions, its scratch and own matrices)
+[qtier] RAM holds 128 of 512 experts a layer: the tier copies each expert it takes as it passes
+[qtier] COLI_GPUS unset: selecting 1 visible device(s)
+[CUDA] device 0: NVIDIA RTX PRO 4000 Blackwell, 25.2 GB VRAM, sm_120
+[qtier] dev 0: 23.2 GB free, allowance 22.2 GB
+[place] auto: dev 0 holds 4700.6 MB of trunk (lmhead yes, 0 dnproj layers), 17.61 GB left for experts
+[qtier] dev 0: budget 17.61 GB for experts (~8642 experts) after trunk
+[qtier] dev 0: the GGUF experts' arena, 8642 slots of 2.09 MB (17.61 GB)
+[qtier] CUDA VRAM expert tier active: 1 device(s), 2.09 MB/expert, copied as they pass
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[qtier] qwen38: the GGUF's experts on the CUDA tier as the file has them (RAM LRU 128/layer; experts go to VRAM as they get hot)
+[qtier] qwen38 trunk: 553 of 553 offered matrices resident (int8, a GGUF's blocks as they are; 3.00 GiB) in 1.1s; the rest answers from the CPU
+[qwen38] trunk: 60 matrices int8 on the CPU (0.08 GiB, 0.27 GiB of BF16 released) in 0.0s; Q38_TRUNK_CPU_INT8=0 keeps BF16
+[chain] qwen38: a decode step's routed experts in the frame (the tier's residents by address, format 100 (a GGUF's blocks, by layer), group 0; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen38: 48 layers on CUDA device 0 (12 QSA), the final mixer and lm_head too; 3.37 GiB of the tier's trunk, 174.2 MiB uploaded by the chain, 9.8 MiB of parameters
+[qwen38] routed experts: GGUF IQ2_XS/IQ2_XS/IQ4_NL (layer 0), 1.78 MiB per expert; cache 128/layer
+[USAGE] expert history: 134880 selections (/workspace/prova/storia)
+[qtier] qwen38: warm start, 8642 of the GGUF's experts in VRAM, the history's most used first (.coli_usage) -- 2.4 s
+[chain] qwen38: host pool, every expert (the 15934 the card leaves and its own 8642) in 49.80 GiB of page-locked RAM the device reads over the bus (18.7 s to allocate, 2.0 s to read; COLI_CUDA_CHAIN_POOL=0 off)
+[chain] qwen38: a step's pooled experts copied to the device first (16 places, 33.2 MiB)
+[chain] qwen38: a prompt chunk's layer's pooled experts copied to the device while the layers before it run (246 places, 510.5 MiB; the most a layer has: 512)
+[chain] qwen38: the card's 8642 slots are the chain's to fill (8642 held): up to 128 experts a forward promoted from the pool by this conversation's routes, none while the last 64 frames found 90 % or more of their routes on the card (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+resident weights loaded in 1.4s | RSS after load: 54.26 GB
+Generated (128 new tokens):
+Text : 
+TTFT: 1.87 s (time to first token)
+[qwen38 spec gate] run: T(1) 22.7 ms, rows 2:1.37 3:1.94, rho 0.38, acceptance by position 0.56 0.33 0.50 0.50 0.50
+[qwen38 lookup] run: 1.21 tokens/forward (105 forwards per 127 tokens) | acceptance 55.0% (22/40 drafts in 36 verifies) | gate on, 9 declined, 6 probes
+[qwen38 timers] total: 106 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        2.124 s     20.038 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 timers] prefill: 1 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        0.534 s    533.639 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 timers] decode: 105 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        1.590 s     15.146 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 expert I/O] weight-ranges=0 scale-ranges=0 coalesced-gate-up=0 prefetched=0 parallel-batches=0 resident-scales=0.00 MiB
+
+PEAK RSS: 54.38 GB
+[qtier] resident 8642/24576 experts | uploads 8642 | miss(CPU) 0 | q_skips 0
+[qtier]   dev 0: hits 0 | 773 tensors, 3.09 GB VRAM used (4.59 GB trunk + experts, budget 17.61 GB)
+[qtier] VRAM hit rate: 0.0 % | swaps 0 (0 in place)
+Expert cache hit rate: 0.0% (hit=0 miss=0)
+Speed: 26.23 tok/s (4.9s for 128 tokens)
+[chain] qwen38: 106 forwards, 194 frames (208745 ops, 81938 matmuls), 2124.0 ms waiting for the device, 0.0 ms of routed experts on the host, 1003.3 MiB on the device; per decode step 15.15 ms waiting, 0.00 ms of experts (105 steps)
+[chain] qwen38: 5088 layer steps with the routed experts in the frame, 0 of them hybrid (0 slots on the host in 0.0 ms, 0.0 ms waiting for the device's routes), 58530 slots from the host pool
+[chain] qwen38: 48 prompt layer steps staged the host pool's experts (22.68 GB copied over the bus)
+[chain] qwen38: 5496 experts promoted to the card (5496 residents back to the pool), 0 on their way; 23 frames braked, 58.4 % of the routes on the card
+	Command being timed: "/workspace/bin/qwen38-pr 128 8 /workspace/prova/prompt-codice.txt"
+	User time (seconds): 247.61
+	System time (seconds): 48.51
+	Percent of CPU this job got: 777%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:38.06
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 57023048
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 1379862
+	Voluntary context switches: 140177
+	Involuntary context switches: 2571
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 56
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+===== C-3-pr.out (sha256 317c50d3cfbc5c83fd359621c1c9a21a65100f500c509fff84a00ffa147ec91d)
+
+    for (char *p = buf; *p; p++)
+        if (*p == '\n')
+            n++;
+    char **lines = malloc((size_t)(n + 1) * sizeof *lines);
+    int i = 0;
+    char *start = buf;
+    for (char *p = buf; *p; p++) {
+        if (*p == '\n') {
+            *p = 0;
+            lines[i++] = start;
+            start = p + 1;
+        }
+    }
+    if (start <
+
+===== C-4-dev.err (sha256 11e4fe17afefbd3475562617f3f1bd255bbf2eb7ae12c63973ee22b5eb3f081c)
+[gguf] /workspace/models/q38-gguf/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf: 3 file(s), 1224 tensors, read in place (native ggml types, no conversion)
+== Qwen3.8-Flash-Next native text engine | cache=128/layer | CPU ==
+[tok] loaded 248320 base pieces + 33 added tokens (max id 248319) from /workspace/models/q38-colibri/tokenizer.json
+[enc] prompt tokens: 148 | generating 128 new tokens
+[qwen38] native text weights: prefix=model, 48 layers, PLE=1, cache=128/layer, FP8=native, BF16=native (resident matrices 3.73 GiB)
+[qwen38] speculative decoding with the MTP head: off (the GGUF has none; tools/gguf_import.py --mtp names an mtp-*.gguf; Q38_MTP=0 silences this)
+[qtier] qwen38: 1.59 GiB kept for the CUDA chain (its mirrors at 8192 positions, its scratch and own matrices)
+[qtier] RAM holds 128 of 512 experts a layer: the tier copies each expert it takes as it passes
+[qtier] COLI_GPUS unset: selecting 1 visible device(s)
+[CUDA] device 0: NVIDIA RTX PRO 4000 Blackwell, 25.2 GB VRAM, sm_120
+[qtier] dev 0: 23.2 GB free, allowance 22.2 GB
+[place] auto: dev 0 holds 4700.6 MB of trunk (lmhead yes, 0 dnproj layers), 17.61 GB left for experts
+[qtier] dev 0: budget 17.61 GB for experts (~8642 experts) after trunk
+[qtier] dev 0: the GGUF experts' arena, 8642 slots of 2.09 MB (17.61 GB)
+[qtier] CUDA VRAM expert tier active: 1 device(s), 2.09 MB/expert, copied as they pass
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[qtier] qwen38: the GGUF's experts on the CUDA tier as the file has them (RAM LRU 128/layer; experts go to VRAM as they get hot)
+[qtier] qwen38 trunk: 553 of 553 offered matrices resident (int8, a GGUF's blocks as they are; 3.00 GiB) in 1.0s; the rest answers from the CPU
+[qwen38] trunk: 60 matrices int8 on the CPU (0.08 GiB, 0.27 GiB of BF16 released) in 0.0s; Q38_TRUNK_CPU_INT8=0 keeps BF16
+[chain] qwen38: a decode step's routed experts in the frame (the tier's residents by address, format 100 (a GGUF's blocks, by layer), group 0; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen38: 48 layers on CUDA device 0 (12 QSA), the final mixer and lm_head too; 3.37 GiB of the tier's trunk, 174.2 MiB uploaded by the chain, 9.8 MiB of parameters
+[qwen38] routed experts: GGUF IQ2_XS/IQ2_XS/IQ4_NL (layer 0), 1.78 MiB per expert; cache 128/layer
+[USAGE] expert history: 134880 selections (/workspace/prova/storia)
+[qtier] qwen38: warm start, 8642 of the GGUF's experts in VRAM, the history's most used first (.coli_usage) -- 2.3 s
+[chain] qwen38: host pool, every expert (the 15934 the card leaves and its own 8642) in 49.80 GiB of page-locked RAM the device reads over the bus (18.6 s to allocate, 2.0 s to read; COLI_CUDA_CHAIN_POOL=0 off)
+[chain] qwen38: a step's pooled experts copied to the device first (16 places, 33.2 MiB)
+[chain] qwen38: a prompt chunk's layer's pooled experts copied to the device while the layers before it run (246 places, 510.5 MiB; the most a layer has: 512)
+[chain] qwen38: the card's 8642 slots are the chain's to fill (8642 held): up to 32 experts a forward promoted from the pool by this conversation's routes (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+resident weights loaded in 1.4s | RSS after load: 54.27 GB
+Generated (128 new tokens):
+Text : 
+TTFT: 1.88 s (time to first token)
+[qwen38 spec gate] run: T(1) 26.6 ms, rows 2:1.86 3:2.73 4:3.21, rho 0.48, acceptance by position 0.64 0.67 0.50 0.50 0.50
+[qwen38 lookup] run: 1.06 tokens/forward (120 forwards per 127 tokens) | acceptance 58.3% (7/12 drafts in 9 verifies) | gate on, 51 declined, 6 probes
+[qwen38 timers] total: 121 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        3.174 s     26.229 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 timers] prefill: 1 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        0.535 s    535.073 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 timers] decode: 120 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        2.639 s     21.989 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 expert I/O] weight-ranges=0 scale-ranges=0 coalesced-gate-up=0 prefetched=0 parallel-batches=0 resident-scales=0.00 MiB
+
+PEAK RSS: 54.40 GB
+[qtier] resident 8642/24576 experts | uploads 8642 | miss(CPU) 0 | q_skips 0
+[qtier]   dev 0: hits 0 | 773 tensors, 3.09 GB VRAM used (4.59 GB trunk + experts, budget 17.61 GB)
+[qtier] VRAM hit rate: 0.0 % | swaps 0 (0 in place)
+Expert cache hit rate: 0.0% (hit=0 miss=0)
+Speed: 21.34 tok/s (6.0s for 128 tokens)
+[chain] qwen38: 121 forwards, 245 frames (232514 ops, 93533 matmuls), 3173.7 ms waiting for the device, 0.0 ms of routed experts on the host, 1115.6 MiB on the device; per decode step 21.99 ms waiting, 0.00 ms of experts (120 steps)
+[chain] qwen38: 5808 layer steps with the routed experts in the frame, 0 of them hybrid (0 slots on the host in 0.0 ms, 0.0 ms waiting for the device's routes), 73100 slots from the host pool
+[chain] qwen38: 48 prompt layer steps staged the host pool's experts (22.68 GB copied over the bus)
+[chain] qwen38: 3872 experts promoted to the card (3872 residents back to the pool), 56 on their way
+	Command being timed: "/workspace/bin/qwen38-dev 128 8 /workspace/prova/prompt-codice.txt"
+	User time (seconds): 257.86
+	System time (seconds): 48.13
+	Percent of CPU this job got: 785%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:38.97
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 57042800
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 1385112
+	Voluntary context switches: 141836
+	Involuntary context switches: 856
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 56
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+===== C-4-dev.out (sha256 317c50d3cfbc5c83fd359621c1c9a21a65100f500c509fff84a00ffa147ec91d)
+
+    for (char *p = buf; *p; p++)
+        if (*p == '\n')
+            n++;
+    char **lines = malloc((size_t)(n + 1) * sizeof *lines);
+    int i = 0;
+    char *start = buf;
+    for (char *p = buf; *p; p++) {
+        if (*p == '\n') {
+            *p = 0;
+            lines[i++] = start;
+            start = p + 1;
+        }
+    }
+    if (start <
+
+===== C-5-dev.err (sha256 36c1b36de9c75231ba4c1dab84efa1b4b4bfc18ef8a0ae60e093775b9bf49d25)
+[gguf] /workspace/models/q38-gguf/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf: 3 file(s), 1224 tensors, read in place (native ggml types, no conversion)
+== Qwen3.8-Flash-Next native text engine | cache=128/layer | CPU ==
+[tok] loaded 248320 base pieces + 33 added tokens (max id 248319) from /workspace/models/q38-colibri/tokenizer.json
+[enc] prompt tokens: 148 | generating 128 new tokens
+[qwen38] native text weights: prefix=model, 48 layers, PLE=1, cache=128/layer, FP8=native, BF16=native (resident matrices 3.73 GiB)
+[qwen38] speculative decoding with the MTP head: off (the GGUF has none; tools/gguf_import.py --mtp names an mtp-*.gguf; Q38_MTP=0 silences this)
+[qtier] qwen38: 1.59 GiB kept for the CUDA chain (its mirrors at 8192 positions, its scratch and own matrices)
+[qtier] RAM holds 128 of 512 experts a layer: the tier copies each expert it takes as it passes
+[qtier] COLI_GPUS unset: selecting 1 visible device(s)
+[CUDA] device 0: NVIDIA RTX PRO 4000 Blackwell, 25.2 GB VRAM, sm_120
+[qtier] dev 0: 23.2 GB free, allowance 22.2 GB
+[place] auto: dev 0 holds 4700.6 MB of trunk (lmhead yes, 0 dnproj layers), 17.61 GB left for experts
+[qtier] dev 0: budget 17.61 GB for experts (~8642 experts) after trunk
+[qtier] dev 0: the GGUF experts' arena, 8642 slots of 2.09 MB (17.61 GB)
+[qtier] CUDA VRAM expert tier active: 1 device(s), 2.09 MB/expert, copied as they pass
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[qtier] qwen38: the GGUF's experts on the CUDA tier as the file has them (RAM LRU 128/layer; experts go to VRAM as they get hot)
+[qtier] qwen38 trunk: 553 of 553 offered matrices resident (int8, a GGUF's blocks as they are; 3.00 GiB) in 1.0s; the rest answers from the CPU
+[qwen38] trunk: 60 matrices int8 on the CPU (0.08 GiB, 0.27 GiB of BF16 released) in 0.0s; Q38_TRUNK_CPU_INT8=0 keeps BF16
+[chain] qwen38: a decode step's routed experts in the frame (the tier's residents by address, format 100 (a GGUF's blocks, by layer), group 0; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen38: 48 layers on CUDA device 0 (12 QSA), the final mixer and lm_head too; 3.37 GiB of the tier's trunk, 174.2 MiB uploaded by the chain, 9.8 MiB of parameters
+[qwen38] routed experts: GGUF IQ2_XS/IQ2_XS/IQ4_NL (layer 0), 1.78 MiB per expert; cache 128/layer
+[USAGE] expert history: 134880 selections (/workspace/prova/storia)
+[qtier] qwen38: warm start, 8642 of the GGUF's experts in VRAM, the history's most used first (.coli_usage) -- 2.9 s
+[chain] qwen38: host pool, every expert (the 15934 the card leaves and its own 8642) in 49.80 GiB of page-locked RAM the device reads over the bus (18.8 s to allocate, 2.0 s to read; COLI_CUDA_CHAIN_POOL=0 off)
+[chain] qwen38: a step's pooled experts copied to the device first (16 places, 33.2 MiB)
+[chain] qwen38: a prompt chunk's layer's pooled experts copied to the device while the layers before it run (246 places, 510.5 MiB; the most a layer has: 512)
+[chain] qwen38: the card's 8642 slots are the chain's to fill (8642 held): up to 32 experts a forward promoted from the pool by this conversation's routes (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+resident weights loaded in 1.4s | RSS after load: 54.27 GB
+Generated (128 new tokens):
+Text : 
+TTFT: 1.86 s (time to first token)
+[qwen38 spec gate] run: T(1) 27.3 ms, rows 2:1.78 3:1.97 4:2.67, rho 0.43, acceptance by position 0.41 0.80 0.67 0.50 0.50
+[qwen38 lookup] run: 1.09 tokens/forward (117 forwards per 127 tokens) | acceptance 38.5% (10/26 drafts in 15 verifies) | gate on, 42 declined, 7 probes
+[qwen38 timers] total: 118 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        3.247 s     27.515 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 timers] prefill: 1 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        0.535 s    535.250 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 timers] decode: 117 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        2.712 s     23.176 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 expert I/O] weight-ranges=0 scale-ranges=0 coalesced-gate-up=0 prefetched=0 parallel-batches=0 resident-scales=0.00 MiB
+
+PEAK RSS: 54.40 GB
+[qtier] resident 8642/24576 experts | uploads 8642 | miss(CPU) 0 | q_skips 0
+[qtier]   dev 0: hits 0 | 773 tensors, 3.09 GB VRAM used (4.59 GB trunk + experts, budget 17.61 GB)
+[qtier] VRAM hit rate: 0.0 % | swaps 0 (0 in place)
+Expert cache hit rate: 0.0% (hit=0 miss=0)
+Speed: 21.13 tok/s (6.1s for 128 tokens)
+[chain] qwen38: 118 forwards, 239 frames (227594 ops, 91214 matmuls), 3246.8 ms waiting for the device, 0.0 ms of routed experts on the host, 1115.6 MiB on the device; per decode step 23.18 ms waiting, 0.00 ms of experts (117 steps)
+[chain] qwen38: 5664 layer steps with the routed experts in the frame, 0 of them hybrid (0 slots on the host in 0.0 ms, 0.0 ms waiting for the device's routes), 75003 slots from the host pool
+[chain] qwen38: 48 prompt layer steps staged the host pool's experts (22.68 GB copied over the bus)
+[chain] qwen38: 3776 experts promoted to the card (3776 residents back to the pool), 56 on their way
+	Command being timed: "/workspace/bin/qwen38-dev 128 8 /workspace/prova/prompt-codice.txt"
+	User time (seconds): 259.97
+	System time (seconds): 48.36
+	Percent of CPU this job got: 777%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:39.63
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 57044108
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 1385588
+	Voluntary context switches: 137758
+	Involuntary context switches: 699
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 48
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+===== C-5-dev.out (sha256 317c50d3cfbc5c83fd359621c1c9a21a65100f500c509fff84a00ffa147ec91d)
+
+    for (char *p = buf; *p; p++)
+        if (*p == '\n')
+            n++;
+    char **lines = malloc((size_t)(n + 1) * sizeof *lines);
+    int i = 0;
+    char *start = buf;
+    for (char *p = buf; *p; p++) {
+        if (*p == '\n') {
+            *p = 0;
+            lines[i++] = start;
+            start = p + 1;
+        }
+    }
+    if (start <
+
+===== C-6-pr.err (sha256 d911bdc810e22fdcb52ff73d37b21a0c4954a21cab64724622c2d402b7a199a3)
+[gguf] /workspace/models/q38-gguf/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf: 3 file(s), 1224 tensors, read in place (native ggml types, no conversion)
+== Qwen3.8-Flash-Next native text engine | cache=128/layer | CPU ==
+[tok] loaded 248320 base pieces + 33 added tokens (max id 248319) from /workspace/models/q38-colibri/tokenizer.json
+[enc] prompt tokens: 148 | generating 128 new tokens
+[qwen38] native text weights: prefix=model, 48 layers, PLE=1, cache=128/layer, FP8=native, BF16=native (resident matrices 3.73 GiB)
+[qwen38] speculative decoding with the MTP head: off (the GGUF has none; tools/gguf_import.py --mtp names an mtp-*.gguf; Q38_MTP=0 silences this)
+[qtier] qwen38: 1.59 GiB kept for the CUDA chain (its mirrors at 8192 positions, its scratch and own matrices)
+[qtier] RAM holds 128 of 512 experts a layer: the tier copies each expert it takes as it passes
+[qtier] COLI_GPUS unset: selecting 1 visible device(s)
+[CUDA] device 0: NVIDIA RTX PRO 4000 Blackwell, 25.2 GB VRAM, sm_120
+[qtier] dev 0: 23.2 GB free, allowance 22.2 GB
+[place] auto: dev 0 holds 4700.6 MB of trunk (lmhead yes, 0 dnproj layers), 17.61 GB left for experts
+[qtier] dev 0: budget 17.61 GB for experts (~8642 experts) after trunk
+[qtier] dev 0: the GGUF experts' arena, 8642 slots of 2.09 MB (17.61 GB)
+[qtier] CUDA VRAM expert tier active: 1 device(s), 2.09 MB/expert, copied as they pass
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[qtier] qwen38: the GGUF's experts on the CUDA tier as the file has them (RAM LRU 128/layer; experts go to VRAM as they get hot)
+[qtier] qwen38 trunk: 553 of 553 offered matrices resident (int8, a GGUF's blocks as they are; 3.00 GiB) in 1.0s; the rest answers from the CPU
+[qwen38] trunk: 60 matrices int8 on the CPU (0.08 GiB, 0.27 GiB of BF16 released) in 0.0s; Q38_TRUNK_CPU_INT8=0 keeps BF16
+[chain] qwen38: a decode step's routed experts in the frame (the tier's residents by address, format 100 (a GGUF's blocks, by layer), group 0; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen38: 48 layers on CUDA device 0 (12 QSA), the final mixer and lm_head too; 3.37 GiB of the tier's trunk, 174.2 MiB uploaded by the chain, 9.8 MiB of parameters
+[qwen38] routed experts: GGUF IQ2_XS/IQ2_XS/IQ4_NL (layer 0), 1.78 MiB per expert; cache 128/layer
+[USAGE] expert history: 134880 selections (/workspace/prova/storia)
+[qtier] qwen38: warm start, 8642 of the GGUF's experts in VRAM, the history's most used first (.coli_usage) -- 2.4 s
+[chain] qwen38: host pool, every expert (the 15934 the card leaves and its own 8642) in 49.80 GiB of page-locked RAM the device reads over the bus (18.7 s to allocate, 2.0 s to read; COLI_CUDA_CHAIN_POOL=0 off)
+[chain] qwen38: a step's pooled experts copied to the device first (16 places, 33.2 MiB)
+[chain] qwen38: a prompt chunk's layer's pooled experts copied to the device while the layers before it run (246 places, 510.5 MiB; the most a layer has: 512)
+[chain] qwen38: the card's 8642 slots are the chain's to fill (8642 held): up to 128 experts a forward promoted from the pool by this conversation's routes, none while the last 64 frames found 90 % or more of their routes on the card (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+resident weights loaded in 1.4s | RSS after load: 54.26 GB
+Generated (128 new tokens):
+Text : 
+TTFT: 1.86 s (time to first token)
+[qwen38 spec gate] run: T(1) 22.2 ms, rows 2:1.36 3:1.88, rho 0.36, acceptance by position 0.56 0.33 0.50 0.50 0.50
+[qwen38 lookup] run: 1.21 tokens/forward (105 forwards per 127 tokens) | acceptance 55.0% (22/40 drafts in 36 verifies) | gate on, 9 declined, 6 probes
+[qwen38 timers] total: 106 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        2.096 s     19.772 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 timers] prefill: 1 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        0.535 s    534.621 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 timers] decode: 105 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        1.561 s     14.869 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 expert I/O] weight-ranges=0 scale-ranges=0 coalesced-gate-up=0 prefetched=0 parallel-batches=0 resident-scales=0.00 MiB
+
+PEAK RSS: 54.38 GB
+[qtier] resident 8642/24576 experts | uploads 8642 | miss(CPU) 0 | q_skips 0
+[qtier]   dev 0: hits 0 | 773 tensors, 3.09 GB VRAM used (4.59 GB trunk + experts, budget 17.61 GB)
+[qtier] VRAM hit rate: 0.0 % | swaps 0 (0 in place)
+Expert cache hit rate: 0.0% (hit=0 miss=0)
+Speed: 26.51 tok/s (4.8s for 128 tokens)
+[chain] qwen38: 106 forwards, 192 frames (208437 ops, 81938 matmuls), 2095.9 ms waiting for the device, 0.0 ms of routed experts on the host, 1003.3 MiB on the device; per decode step 14.87 ms waiting, 0.00 ms of experts (105 steps)
+[chain] qwen38: 5088 layer steps with the routed experts in the frame, 0 of them hybrid (0 slots on the host in 0.0 ms, 0.0 ms waiting for the device's routes), 58531 slots from the host pool
+[chain] qwen38: 48 prompt layer steps staged the host pool's experts (22.68 GB copied over the bus)
+[chain] qwen38: 5342 experts promoted to the card (5342 residents back to the pool), 0 on their way; 25 frames braked, 58.4 % of the routes on the card
+	Command being timed: "/workspace/bin/qwen38-pr 128 8 /workspace/prova/prompt-codice.txt"
+	User time (seconds): 247.34
+	System time (seconds): 48.02
+	Percent of CPU this job got: 778%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:37.93
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 57024652
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 1380089
+	Voluntary context switches: 145551
+	Involuntary context switches: 611
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 48
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+===== C-6-pr.out (sha256 317c50d3cfbc5c83fd359621c1c9a21a65100f500c509fff84a00ffa147ec91d)
+
+    for (char *p = buf; *p; p++)
+        if (*p == '\n')
+            n++;
+    char **lines = malloc((size_t)(n + 1) * sizeof *lines);
+    int i = 0;
+    char *start = buf;
+    for (char *p = buf; *p; p++) {
+        if (*p == '\n') {
+            *p = 0;
+            lines[i++] = start;
+            start = p + 1;
+        }
+    }
+    if (start <
+
+===== C-7-pr.err (sha256 01fcfdf745cd9c1bb02334cc1800fa4222edd8c825275b7dd3071994a6f8739d)
+[gguf] /workspace/models/q38-gguf/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf: 3 file(s), 1224 tensors, read in place (native ggml types, no conversion)
+== Qwen3.8-Flash-Next native text engine | cache=128/layer | CPU ==
+[tok] loaded 248320 base pieces + 33 added tokens (max id 248319) from /workspace/models/q38-colibri/tokenizer.json
+[enc] prompt tokens: 148 | generating 128 new tokens
+[qwen38] native text weights: prefix=model, 48 layers, PLE=1, cache=128/layer, FP8=native, BF16=native (resident matrices 3.73 GiB)
+[qwen38] speculative decoding with the MTP head: off (the GGUF has none; tools/gguf_import.py --mtp names an mtp-*.gguf; Q38_MTP=0 silences this)
+[qtier] qwen38: 1.59 GiB kept for the CUDA chain (its mirrors at 8192 positions, its scratch and own matrices)
+[qtier] RAM holds 128 of 512 experts a layer: the tier copies each expert it takes as it passes
+[qtier] COLI_GPUS unset: selecting 1 visible device(s)
+[CUDA] device 0: NVIDIA RTX PRO 4000 Blackwell, 25.2 GB VRAM, sm_120
+[qtier] dev 0: 23.2 GB free, allowance 22.2 GB
+[place] auto: dev 0 holds 4700.6 MB of trunk (lmhead yes, 0 dnproj layers), 17.61 GB left for experts
+[qtier] dev 0: budget 17.61 GB for experts (~8642 experts) after trunk
+[qtier] dev 0: the GGUF experts' arena, 8642 slots of 2.09 MB (17.61 GB)
+[qtier] CUDA VRAM expert tier active: 1 device(s), 2.09 MB/expert, copied as they pass
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[qtier] qwen38: the GGUF's experts on the CUDA tier as the file has them (RAM LRU 128/layer; experts go to VRAM as they get hot)
+[qtier] qwen38 trunk: 553 of 553 offered matrices resident (int8, a GGUF's blocks as they are; 3.00 GiB) in 1.1s; the rest answers from the CPU
+[qwen38] trunk: 60 matrices int8 on the CPU (0.08 GiB, 0.27 GiB of BF16 released) in 0.0s; Q38_TRUNK_CPU_INT8=0 keeps BF16
+[chain] qwen38: a decode step's routed experts in the frame (the tier's residents by address, format 100 (a GGUF's blocks, by layer), group 0; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen38: 48 layers on CUDA device 0 (12 QSA), the final mixer and lm_head too; 3.37 GiB of the tier's trunk, 174.2 MiB uploaded by the chain, 9.8 MiB of parameters
+[qwen38] routed experts: GGUF IQ2_XS/IQ2_XS/IQ4_NL (layer 0), 1.78 MiB per expert; cache 128/layer
+[USAGE] expert history: 134880 selections (/workspace/prova/storia)
+[qtier] qwen38: warm start, 8642 of the GGUF's experts in VRAM, the history's most used first (.coli_usage) -- 2.8 s
+[chain] qwen38: host pool, every expert (the 15934 the card leaves and its own 8642) in 49.80 GiB of page-locked RAM the device reads over the bus (18.7 s to allocate, 2.0 s to read; COLI_CUDA_CHAIN_POOL=0 off)
+[chain] qwen38: a step's pooled experts copied to the device first (16 places, 33.2 MiB)
+[chain] qwen38: a prompt chunk's layer's pooled experts copied to the device while the layers before it run (246 places, 510.5 MiB; the most a layer has: 512)
+[chain] qwen38: the card's 8642 slots are the chain's to fill (8642 held): up to 128 experts a forward promoted from the pool by this conversation's routes, none while the last 64 frames found 90 % or more of their routes on the card (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+resident weights loaded in 1.4s | RSS after load: 54.28 GB
+Generated (128 new tokens):
+Text : 
+TTFT: 1.86 s (time to first token)
+[qwen38 spec gate] run: T(1) 22.3 ms, rows 2:1.41 3:1.91, rho 0.41, acceptance by position 0.56 0.33 0.50 0.50 0.50
+[qwen38 lookup] run: 1.21 tokens/forward (105 forwards per 127 tokens) | acceptance 55.0% (22/40 drafts in 36 verifies) | gate on, 9 declined, 6 probes
+[qwen38 timers] total: 106 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        2.132 s     20.115 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 timers] prefill: 1 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        0.534 s    533.671 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 timers] decode: 105 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        1.598 s     15.224 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 expert I/O] weight-ranges=0 scale-ranges=0 coalesced-gate-up=0 prefetched=0 parallel-batches=0 resident-scales=0.00 MiB
+
+PEAK RSS: 54.40 GB
+[qtier] resident 8642/24576 experts | uploads 8642 | miss(CPU) 0 | q_skips 0
+[qtier]   dev 0: hits 0 | 773 tensors, 3.09 GB VRAM used (4.59 GB trunk + experts, budget 17.61 GB)
+[qtier] VRAM hit rate: 0.0 % | swaps 0 (0 in place)
+Expert cache hit rate: 0.0% (hit=0 miss=0)
+Speed: 26.29 tok/s (4.9s for 128 tokens)
+[chain] qwen38: 106 forwards, 193 frames (208617 ops, 81938 matmuls), 2132.2 ms waiting for the device, 0.0 ms of routed experts on the host, 1003.3 MiB on the device; per decode step 15.22 ms waiting, 0.00 ms of experts (105 steps)
+[chain] qwen38: 5088 layer steps with the routed experts in the frame, 0 of them hybrid (0 slots on the host in 0.0 ms, 0.0 ms waiting for the device's routes), 58530 slots from the host pool
+[chain] qwen38: 48 prompt layer steps staged the host pool's experts (22.68 GB copied over the bus)
+[chain] qwen38: 5432 experts promoted to the card (5432 residents back to the pool), 0 on their way; 24 frames braked, 58.4 % of the routes on the card
+	Command being timed: "/workspace/bin/qwen38-pr 128 8 /workspace/prova/prompt-codice.txt"
+	User time (seconds): 248.22
+	System time (seconds): 48.23
+	Percent of CPU this job got: 770%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:38.45
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 57043892
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 1385123
+	Voluntary context switches: 137228
+	Involuntary context switches: 1492
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 48
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+===== C-7-pr.out (sha256 317c50d3cfbc5c83fd359621c1c9a21a65100f500c509fff84a00ffa147ec91d)
+
+    for (char *p = buf; *p; p++)
+        if (*p == '\n')
+            n++;
+    char **lines = malloc((size_t)(n + 1) * sizeof *lines);
+    int i = 0;
+    char *start = buf;
+    for (char *p = buf; *p; p++) {
+        if (*p == '\n') {
+            *p = 0;
+            lines[i++] = start;
+            start = p + 1;
+        }
+    }
+    if (start <
+
+===== C-8-dev.err (sha256 5f0d1dbddbd63f04bcfa0e4408ce08706f635218b5fce3dbfd83e74fbca13f4d)
+[gguf] /workspace/models/q38-gguf/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf: 3 file(s), 1224 tensors, read in place (native ggml types, no conversion)
+== Qwen3.8-Flash-Next native text engine | cache=128/layer | CPU ==
+[tok] loaded 248320 base pieces + 33 added tokens (max id 248319) from /workspace/models/q38-colibri/tokenizer.json
+[enc] prompt tokens: 148 | generating 128 new tokens
+[qwen38] native text weights: prefix=model, 48 layers, PLE=1, cache=128/layer, FP8=native, BF16=native (resident matrices 3.73 GiB)
+[qwen38] speculative decoding with the MTP head: off (the GGUF has none; tools/gguf_import.py --mtp names an mtp-*.gguf; Q38_MTP=0 silences this)
+[qtier] qwen38: 1.59 GiB kept for the CUDA chain (its mirrors at 8192 positions, its scratch and own matrices)
+[qtier] RAM holds 128 of 512 experts a layer: the tier copies each expert it takes as it passes
+[qtier] COLI_GPUS unset: selecting 1 visible device(s)
+[CUDA] device 0: NVIDIA RTX PRO 4000 Blackwell, 25.2 GB VRAM, sm_120
+[qtier] dev 0: 23.2 GB free, allowance 22.2 GB
+[place] auto: dev 0 holds 4700.6 MB of trunk (lmhead yes, 0 dnproj layers), 17.61 GB left for experts
+[qtier] dev 0: budget 17.61 GB for experts (~8642 experts) after trunk
+[qtier] dev 0: the GGUF experts' arena, 8642 slots of 2.09 MB (17.61 GB)
+[qtier] CUDA VRAM expert tier active: 1 device(s), 2.09 MB/expert, copied as they pass
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[qtier] qwen38: the GGUF's experts on the CUDA tier as the file has them (RAM LRU 128/layer; experts go to VRAM as they get hot)
+[qtier] qwen38 trunk: 553 of 553 offered matrices resident (int8, a GGUF's blocks as they are; 3.00 GiB) in 1.0s; the rest answers from the CPU
+[qwen38] trunk: 60 matrices int8 on the CPU (0.08 GiB, 0.27 GiB of BF16 released) in 0.0s; Q38_TRUNK_CPU_INT8=0 keeps BF16
+[chain] qwen38: a decode step's routed experts in the frame (the tier's residents by address, format 100 (a GGUF's blocks, by layer), group 0; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen38: 48 layers on CUDA device 0 (12 QSA), the final mixer and lm_head too; 3.37 GiB of the tier's trunk, 174.2 MiB uploaded by the chain, 9.8 MiB of parameters
+[qwen38] routed experts: GGUF IQ2_XS/IQ2_XS/IQ4_NL (layer 0), 1.78 MiB per expert; cache 128/layer
+[USAGE] expert history: 134880 selections (/workspace/prova/storia)
+[qtier] qwen38: warm start, 8642 of the GGUF's experts in VRAM, the history's most used first (.coli_usage) -- 2.7 s
+[chain] qwen38: host pool, every expert (the 15934 the card leaves and its own 8642) in 49.80 GiB of page-locked RAM the device reads over the bus (18.8 s to allocate, 2.0 s to read; COLI_CUDA_CHAIN_POOL=0 off)
+[chain] qwen38: a step's pooled experts copied to the device first (16 places, 33.2 MiB)
+[chain] qwen38: a prompt chunk's layer's pooled experts copied to the device while the layers before it run (246 places, 510.5 MiB; the most a layer has: 512)
+[chain] qwen38: the card's 8642 slots are the chain's to fill (8642 held): up to 32 experts a forward promoted from the pool by this conversation's routes (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+resident weights loaded in 1.4s | RSS after load: 54.26 GB
+Generated (128 new tokens):
+Text : 
+TTFT: 1.86 s (time to first token)
+[qwen38 spec gate] run: T(1) 27.8 ms, rows 2:1.84 3:2.07 4:2.66, rho 0.48, acceptance by position 0.55 0.71 0.50 0.50 0.50
+[qwen38 lookup] run: 1.12 tokens/forward (113 forwards per 127 tokens) | acceptance 45.2% (14/31 drafts in 18 verifies) | gate on, 35 declined, 8 probes
+[qwen38 timers] total: 114 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        3.333 s     29.236 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 timers] prefill: 1 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        0.534 s    534.259 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 timers] decode: 113 forwards
+[qwen38 timers]   expert-read        0.000 s      0.000 ms/forward
+[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward
+[qwen38 timers]   routed-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   shared-expert      0.000 s      0.000 ms/forward
+[qwen38 timers]   resident-mm        2.799 s     24.766 ms/forward
+[qwen38 timers]   deltanet           0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-index          0.000 s      0.000 ms/forward
+[qwen38 timers]   qsa-attn           0.000 s      0.000 ms/forward
+[qwen38 timers]   ple                0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-head            0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-recur           0.000 s      0.000 ms/forward
+[qwen38 timers]   dn-snap            0.000 s      0.000 ms/forward
+[qwen38 timers]   lm-draft           0.000 s      0.000 ms/forward
+[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work
+[qwen38 expert I/O] weight-ranges=0 scale-ranges=0 coalesced-gate-up=0 prefetched=0 parallel-batches=0 resident-scales=0.00 MiB
+
+PEAK RSS: 54.39 GB
+[qtier] resident 8642/24576 experts | uploads 8642 | miss(CPU) 0 | q_skips 0
+[qtier]   dev 0: hits 0 | 773 tensors, 3.09 GB VRAM used (4.59 GB trunk + experts, budget 17.61 GB)
+[qtier] VRAM hit rate: 0.0 % | swaps 0 (0 in place)
+Expert cache hit rate: 0.0% (hit=0 miss=0)
+Speed: 20.88 tok/s (6.1s for 128 tokens)
+[chain] qwen38: 114 forwards, 231 frames (220204 ops, 88122 matmuls), 3332.9 ms waiting for the device, 0.0 ms of routed experts on the host, 1115.6 MiB on the device; per decode step 24.77 ms waiting, 0.00 ms of experts (113 steps)
+[chain] qwen38: 5472 layer steps with the routed experts in the frame, 0 of them hybrid (0 slots on the host in 0.0 ms, 0.0 ms waiting for the device's routes), 76054 slots from the host pool
+[chain] qwen38: 48 prompt layer steps staged the host pool's experts (22.68 GB copied over the bus)
+[chain] qwen38: 3648 experts promoted to the card (3648 residents back to the pool), 56 on their way
+	Command being timed: "/workspace/bin/qwen38-dev 128 8 /workspace/prova/prompt-codice.txt"
+	User time (seconds): 260.86
+	System time (seconds): 48.21
+	Percent of CPU this job got: 780%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:39.59
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 57032444
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 1
+	Minor (reclaiming a frame) page faults: 1382918
+	Voluntary context switches: 137600
+	Involuntary context switches: 660
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 56
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+===== C-8-dev.out (sha256 317c50d3cfbc5c83fd359621c1c9a21a65100f500c509fff84a00ffa147ec91d)
+
+    for (char *p = buf; *p; p++)
+        if (*p == '\n')
+            n++;
+    char **lines = malloc((size_t)(n + 1) * sizeof *lines);
+    int i = 0;
+    char *start = buf;
+    for (char *p = buf; *p; p++) {
+        if (*p == '\n') {
+            *p = 0;
+            lines[i++] = start;
+            start = p + 1;
+        }
+    }
+    if (start <
+
+===== summary
+v0 decode tok/s: 31.00, 30.84, 30.25, 29.74; median 30.545
+v0 prompt tok/s: 79.1, 78.7, 79.6, 79.6
+v1 decode tok/s: 41.37, 42.19, 42.78, 42.21; median 42.200
+v1 prompt tok/s: 79.1, 79.1, 79.6, 79.6
+stdout sha256 in all 8 runs: 317c50d3cfbc5c83fd359621c1c9a21a65100f500c509fff84a00ffa147ec91d

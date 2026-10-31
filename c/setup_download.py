@@ -11,6 +11,8 @@ drop. The rules that make a rerun continue instead of starting over:
   second copy;
 - the hash is computed while the bytes arrive (the prefix already on disk is
   read once when resuming), so the check costs no second pass over the model;
+- completed files reused during a repository download are checked against the
+  supplied digest too, unless verification is disabled;
 - `.colibri-download.json` in the model folder records the repository, the
   revision and the file list, and says when the folder is complete.
 
@@ -180,7 +182,8 @@ def download_file(url, dest, spec, *, token=None, progress=None, opener=None,
     called as bytes land."""
     opener = opener or urllib.request.urlopen
     size = int(spec["size"])
-    if os.path.exists(dest) and os.path.getsize(dest) == size:
+    if (os.path.exists(dest) and os.path.getsize(dest) == size
+            and (not verify or verify_file(dest, spec))):
         return "present"
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
     part = dest + ".part"
@@ -318,16 +321,20 @@ def parse_curl_speed(text):
 
 
 def probe_throughput_windows(url, curl, *, token=None, max_bytes=4 << 20, max_seconds=8):
-    cmd = [curl, "-s", "-L", "-r", f"0-{max_bytes - 1}", "--max-time", str(int(max_seconds)),
+    cmd = [curl, "-s", "-L", "--fail", "-r", f"0-{max_bytes - 1}", "--max-time", str(int(max_seconds)),
            "-o", "NUL", "-w", "%{speed_download}", url]
     if token:
         cmd[1:1] = ["-H", f"Authorization: Bearer {token}"]
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                             timeout=max_seconds + 20).stdout
+        result = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                                timeout=max_seconds + 20)
     except (OSError, subprocess.SubprocessError):
         return None
-    speed = parse_curl_speed(out)
+    # Exit 28 is the expected bound when a slow ranged sample hits --max-time;
+    # other failures (including HTTP errors with --fail) are not throughput.
+    if result.returncode not in (0, 28):
+        return None
+    speed = parse_curl_speed(result.stdout)
     return speed if speed and speed > 0 else None
 
 
@@ -335,12 +342,16 @@ def download_file_windows(url, dest, spec, curl, *, token=None, progress=None, v
     """The same contract as download_file, with Windows' curl.exe doing the transfer
     into the same `.part` file (curl's own `-C -` resumes it)."""
     size = int(spec["size"])
-    if os.path.exists(dest) and os.path.getsize(dest) == size:
+    if (os.path.exists(dest) and os.path.getsize(dest) == size
+            and (not verify or verify_file(dest, spec))):
         return "present"
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
     part = dest + ".part"
     if os.path.exists(part) and os.path.getsize(part) > size:
         os.remove(part)
+    if size == 0:
+        with open(part, "wb"):
+            pass
     if not (os.path.exists(part) and os.path.getsize(part) == size):
         target = wsl_windows_path(part)
         if not target:
@@ -390,24 +401,46 @@ def _write_manifest(model_dir, data):
     os.replace(tmp, path)
 
 
-def is_complete(model_dir):
-    """The folder holds every file the manifest lists, at its size."""
+def split_dirs(value):
+    """The folders a split variable lists (';' or ',' separated, spaces trimmed),
+    as the engines' st_init_multi reads them."""
+    return [part.strip() for part in re.split(r"[;,]", value or "") if part.strip()]
+
+
+def locate(model_dir, spec, extra_dirs=()):
+    """Where the file `spec` describes is, whole: in model_dir at its path, or, for a
+    model split across drives, a shard in one of extra_dirs under its own name (the
+    engine indexes the .safetensors of every extra folder by file name and reads
+    everything else from model_dir only). None when it is in neither."""
+    size = int(spec["size"])
+    path = safe_join(model_dir, spec["path"])
+    if os.path.exists(path) and os.path.getsize(path) == size:
+        return path
+    name = os.path.basename(spec["path"])
+    if name.endswith(".safetensors"):
+        for folder in extra_dirs:
+            other = os.path.join(folder, name)
+            if os.path.isfile(other) and os.path.getsize(other) == size:
+                return other
+    return None
+
+
+def is_complete(model_dir, extra_dirs=()):
+    """The folder holds every file the manifest lists, at its size; a shard may
+    sit in one of extra_dirs instead (locate)."""
     manifest = read_manifest(model_dir)
     if not manifest or not manifest.get("complete"):
         return False
-    for spec in manifest.get("files", []):
-        path = safe_join(model_dir, spec["path"])
-        if not os.path.exists(path) or os.path.getsize(path) != int(spec["size"]):
-            return False
-    return True
+    return all(locate(model_dir, spec, extra_dirs) for spec in manifest.get("files", []))
 
 
-def bytes_present(model_dir, files):
-    """What is already on disk for these files, whole or partial."""
+def bytes_present(model_dir, files, extra_dirs=()):
+    """What is already on disk for these files, whole (in model_dir or, a shard,
+    in one of extra_dirs) or partial."""
     total = 0
     for spec in files:
         path = safe_join(model_dir, spec["path"])
-        if os.path.exists(path) and os.path.getsize(path) == int(spec["size"]):
+        if locate(model_dir, spec, extra_dirs):
             total += int(spec["size"])
         elif os.path.exists(path + ".part"):
             total += min(os.path.getsize(path + ".part"), int(spec["size"]))
@@ -415,10 +448,11 @@ def bytes_present(model_dir, files):
 
 
 def download_repo(repo, revision, model_dir, files, *, token=None, progress=None,
-                  base=None, opener=None, curl=None, retries=5, verify=True):
+                  base=None, opener=None, curl=None, retries=5, verify=True, extra_dirs=()):
     """Every listed file into model_dir, small files first (so config.json and the
     tokenizer are there early), then the shards by size. `progress(event)` gets
-    dicts with file, file_done, file_total, done, total."""
+    dicts with file, file_done, file_total, done, total. A shard already whole in
+    one of extra_dirs (a model split across drives) is not fetched again."""
     os.makedirs(model_dir, exist_ok=True)
     files = sorted(files, key=lambda spec: (spec["size"] > (64 << 20), spec["size"], spec["path"]))
     manifest = {"repo": repo, "revision": revision, "complete": False,
@@ -434,6 +468,14 @@ def download_repo(repo, revision, model_dir, files, *, token=None, progress=None
                 progress({"file": _spec["path"], "file_done": have, "file_total": size,
                           "done": _base + have, "total": total})
 
+        found = locate(model_dir, spec, extra_dirs) if extra_dirs else None
+        if found and found != dest:
+            if verify and not verify_file(found, spec):
+                raise DownloadError(f"{found}: checksum mismatch for the requested revision; "
+                                    "replace the shard on the split drive and rerun")
+            done_before += int(spec["size"])
+            on_bytes(int(spec["size"]), int(spec["size"]))
+            continue
         url = file_url(repo, revision, spec["path"], base)
         if curl:
             download_file_windows(url, dest, spec, curl, token=token, progress=on_bytes, verify=verify)

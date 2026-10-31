@@ -1,0 +1,65 @@
+#version 450
+// chain_dnconv.comp's convolution over a prompt's rows, every (row, channel) at once
+// (vk_chain.c, vkc_dnconv from VKC_DNCONV_ROWS rows). chain_dnconv.comp walks the rows in
+// order, one thread a channel: 2048 threads for 979 rows of LFM3 took 442 us a layer. Row s's
+// taps are the inputs of rows s - nh .. s - 1 (the ring's for the rows before the first), so
+// a thread computes one output with the same products summed in the same order:
+//   phase 0, a thread an output: acc = sum_k w[c][k] * in(s - nh + k) + w[c][ck-1] * in(s)
+//            (order 1: the input first), out[s][c] as chain_dnconv.comp writes it;
+//   phase 1, a thread a channel: the ring takes rows S - nh .. S - 1 and snap the ring as it
+//            stood after snap_row, both read before either is written (they may share a buffer).
+// in(r) is the convolution's input: in[r][c], or B * x for LFM3's (order 2).
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer IN { float xin[]; };
+layout(std430, binding = 1) readonly buffer WB { float w[]; };
+layout(std430, binding = 2) buffer RB { float ring[]; };
+layout(std430, binding = 3) writeonly buffer OB { float o[]; };
+layout(std430, binding = 4) writeonly buffer SB { float snap[]; };
+
+layout(push_constant) uniform P {
+    int S, CD, CK;
+    int in_off, in_row, out_off, out_row;
+    int snap_row, order;
+    int w_off, ring_off, snap_off;
+    int phase;
+} p;
+
+float val(int r, int c, int nh) {
+    if (r < 0) return ring[p.ring_off + c * nh + nh + r];
+    int ib = p.in_off + r * p.in_row;
+    return p.order == 2 ? xin[ib + c] * xin[ib + c + 2 * p.CD] : xin[ib + c];
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u;
+    int nh = p.CK - 1;
+    if (p.phase == 0) {
+        if (id >= uint(p.S) * uint(p.CD)) return;
+        int s = int(id / uint(p.CD)), c = int(id % uint(p.CD));
+        int wb = p.w_off + c * p.CK;
+        float cur = val(s, c, nh), acc;
+        if (p.order != 1) {
+            acc = 0.0;
+            for (int k = 0; k < 8; k++) if (k < nh) acc += w[wb + k] * val(s - nh + k, c, nh);
+            acc += w[wb + p.CK - 1] * cur;
+        } else {
+            acc = w[wb + p.CK - 1] * cur;
+            for (int k = 0; k < 8; k++) if (k < nh) acc += w[wb + k] * val(s - nh + k, c, nh);
+        }
+        int ib = p.in_off + s * p.in_row;
+        o[p.out_off + s * p.out_row + c] = p.order == 2 ? xin[ib + c + p.CD] * acc : acc / (1.0 + exp(-acc));
+        return;
+    }
+    if (id >= uint(p.CD)) return;
+    int c = int(id);
+    float nr[8], ns[8];
+    for (int k = 0; k < 8; k++) {
+        nr[k] = k < nh ? val(p.S - nh + k, c, nh) : 0.0;
+        ns[k] = k < nh && p.snap_row >= 0 ? val(p.snap_row - nh + 1 + k, c, nh) : 0.0;
+    }
+    for (int k = 0; k < 8; k++) if (k < nh) {
+        ring[p.ring_off + c * nh + k] = nr[k];
+        if (p.snap_row >= 0) snap[p.snap_off + c * nh + k] = ns[k];
+    }
+}

@@ -35,6 +35,7 @@ CLI = Path(__file__).resolve().parent.parent / "coli"
 SEEN_MESSAGES = []
 SEEN_BODIES = []
 SERVER_ARCH = {"value": None}   # what the fake /health reports as the family
+SERVER_COMPACTION = {"value": None}   # a compaction chunk the fake stream sends first
 
 # The child is spawned with fork+EXEC, never bare fork: this test process is
 # multi-threaded (the fake SSE server runs in a thread), and pty.fork() from a
@@ -87,6 +88,9 @@ class FakeSSE(BaseHTTPRequestHandler):
             self.wfile.write(b"data: " + json.dumps(payload).encode() + b"\n\n")
 
         event({"role": "assistant"})
+        if SERVER_COMPACTION["value"]:
+            self.wfile.write(b"data: " + json.dumps({"choices": [], "compaction":
+                             SERVER_COMPACTION["value"]}).encode() + b"\n\n")
         event({"reasoning_content": "SCRATCHPAD-ALPHA "})
         event({"reasoning_content": "SCRATCHPAD-BETA"})
         event({"content": "ANSWER-GAMMA"})
@@ -173,6 +177,7 @@ class ChatThinkingTest(unittest.TestCase):
         SEEN_MESSAGES.clear()
         SEEN_BODIES.clear()
         SERVER_ARCH["value"] = None
+        SERVER_COMPACTION["value"] = None
 
     def test_mimo_starts_with_thinking_off(self):
         """MiMo's template thinks by default; at ~1 tok/s that is minutes of
@@ -204,6 +209,15 @@ class ChatThinkingTest(unittest.TestCase):
         self.assertNotIn("SCRATCHPAD-ALPHA", out,
                          "COLI_SHOW_THINK=0 must suppress the scratchpad")
         self.assertIn("ANSWER-GAMMA", out, "the answer must still stream")
+
+    def test_a_compacted_conversation_is_said_once(self):
+        """coli chat asks for compaction, and says when the server summarized the
+        chat's first messages; a later turn on the same summary says nothing more."""
+        SERVER_COMPACTION["value"] = {"summarized_messages": 6, "summary": "S"}
+        out = run_chat(self.base, {"COLI_SHOW_THINK": "1"})
+        self.assertEqual(SEEN_BODIES[0].get("context_compaction"), "auto")
+        self.assertEqual(out.count("the first 6 messages no longer fit"), 1)
+        self.assertIn("ANSWER-GAMMA", out)
 
     def test_history_carries_content_only(self):
         run_chat(self.base, {"COLI_SHOW_THINK": "1"})

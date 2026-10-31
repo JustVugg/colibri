@@ -1,0 +1,7 @@
+<|im_start|>user
+Explain how a CPU cache works, step by step, for a student who knows what RAM is.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+

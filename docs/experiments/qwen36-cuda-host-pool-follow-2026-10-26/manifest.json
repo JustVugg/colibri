@@ -1,0 +1,145 @@
+{
+  "version": 1,
+  "hypothesis": "After the CUDA chain's promotions move experts between the card and the RAM, a prompt chunk's layer holding an expert that left the card is computed by the host, because the host pool the chunk copies from was filled once at the warm start; making the pool the non-residents again before a chunk of 128 rows or more (page-lock the experts that left, release those that came in) makes a 512-token prompt after a short conversation much faster on a T4 holding 6605 of 10240 experts, with the decode and the 64-token prompt before it unchanged.",
+  "commit": "77530b49ddd2f4e6ad1b3bb52500491e0c8ed9bb",
+  "model": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64",
+  "command": "cd c && make qwen36_tier.o backend_cuda.o cuda_chain.o cu_xb.o cu_tier.o CUDA=1 CUDA_ARCH=sm_75 && gcc -O3 -march=native -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_CUDA -I. ../docs/experiments/qwen36-cuda-host-pool-follow-2026-10-26/bench.c qwen36_tier.o backend_cuda.o cuda_chain.o cu_xb.o cu_tier.o -o qwen36-bench -lm -fopenmp -pthread -L/usr/local/cuda/lib64 -Wl,-rpath,/usr/local/cuda/lib64 -lcudart -lcublasLt -lcublas -lstdc++; env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/lib64-nvidia COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close ./qwen36-bench --model <model> --text <dir>/promessi_sposi.txt --lengths 64,512 --gen 32 --teacher --steps <steps file>",
+  "prompt_hash": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "hardware": {
+    "cpu": "Intel(R) Xeon(R) CPU @ 2.00GHz (4 cores / 8 threads, 38.5 MiB L3) + NVIDIA Tesla T4 (15360 MiB, sm_75, up to PCIe Gen3 x16)",
+    "ram": "51 GiB",
+    "storage": "Google Colab VM disk (the model downloaded to /content before the runs)",
+    "os": "Ubuntu 24.04.4 LTS, Linux 6.6.122+ x86_64 (Google Colab, T4 high-RAM), CUDA 13.0 (nvcc V13.0.88), driver 580.82.07, gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "prompt_tokens": 512,
+      "after": "a 64-token prompt and 32 teacher-forced steps in the same process",
+      "decode_steps": 32,
+      "engine_build": "origin/dev 77530b49"
+    },
+    "samples": {
+      "tok_s": [
+        179.19,
+        180.94,
+        180.23,
+        180.12
+      ],
+      "prompt_ms_512": [
+        2857.0,
+        2830.0,
+        2841.0,
+        2843.0
+      ],
+      "prompt_tok_s_64": [
+        73.78,
+        76.02,
+        79.01,
+        75.59
+      ],
+      "decode_tok_s_after_64": [
+        39.606,
+        39.92,
+        40.086,
+        38.85
+      ],
+      "decode_tok_s_after_512": [
+        46.934,
+        46.811,
+        47.729,
+        47.058
+      ],
+      "nll_512": [
+        2.95784,
+        2.95784,
+        2.95785,
+        2.95785
+      ],
+      "top1_512": [
+        0.438,
+        0.438,
+        0.438,
+        0.438
+      ]
+    },
+    "median_tok_s": 180.175,
+    "quality": {
+      "method": "make -C c check (macOS arm64) and, on this T4 with the code measured, make -C c cuda-test cuda-chain-check CUDA=1 CUDA_ARCH=sm_75, tests/test_cu_tier, tests/test_qwen36_cuda_chain and tests/test_qwen36_tier_host_pool pass. The 64-token run (its prompt before any promotion, its 32 steps with them) gives in every run of both versions the same fingerprint of every logit and token (FNV-1a ffb816333a929871) and the same teacher-forced nll. After 512 the fingerprints vary from run to run in both versions (origin/dev 2 values in 4 runs, this change 2, 0 of them origin/dev's): the tier's uploads do not wait, so where an expert runs can change from run to run. The nll over the 32 teacher-forced tokens after the 512-token prompt (one text) is 2.95784-2.95785 on origin/dev and 2.93281-2.93284 with this change, top-1 14 and 15 of the 32. origin/dev ran a layer holding an expert that had left the card whole on the host's path (moe_ex: the residents as the tier's per-token groups, the other experts on the CPU in expert_ffn.h, which rounds its input to int8, QWEN_EXPERT_ACT); this change runs that layer in the chain's frame, every expert on the card's f16 GEMMs, the non-residents from the staged copies. That probably explains the change; no run here isolates it",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-host-pool-follow-2026-10-26/normal.txt",
+      "sha256": "8da7d7c281b4abc27a0ae33d60326afcc3adde739616da270f35773ce1ba0be3"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "prompt_tokens": 512,
+      "after": "a 64-token prompt and 32 teacher-forced steps in the same process",
+      "decode_steps": 32,
+      "engine_build": "77530b49 + this change"
+    },
+    "samples": {
+      "tok_s": [
+        441.96,
+        436.44,
+        440.05,
+        440.17
+      ],
+      "prompt_ms_512": [
+        1158.0,
+        1173.0,
+        1164.0,
+        1163.0
+      ],
+      "prompt_tok_s_64": [
+        77.9,
+        76.2,
+        77.81,
+        76.09
+      ],
+      "decode_tok_s_after_64": [
+        40.498,
+        40.008,
+        39.992,
+        40.144
+      ],
+      "decode_tok_s_after_512": [
+        47.564,
+        47.543,
+        47.277,
+        47.431
+      ],
+      "nll_512": [
+        2.93281,
+        2.93284,
+        2.93284,
+        2.93281
+      ],
+      "top1_512": [
+        0.469,
+        0.469,
+        0.469,
+        0.469
+      ]
+    },
+    "median_tok_s": 440.11,
+    "quality": {
+      "method": "make -C c check (macOS arm64) and, on this T4 with the code measured, make -C c cuda-test cuda-chain-check CUDA=1 CUDA_ARCH=sm_75, tests/test_cu_tier, tests/test_qwen36_cuda_chain and tests/test_qwen36_tier_host_pool pass. The 64-token run (its prompt before any promotion, its 32 steps with them) gives in every run of both versions the same fingerprint of every logit and token (FNV-1a ffb816333a929871) and the same teacher-forced nll. After 512 the fingerprints vary from run to run in both versions (origin/dev 2 values in 4 runs, this change 2, 0 of them origin/dev's): the tier's uploads do not wait, so where an expert runs can change from run to run. The nll over the 32 teacher-forced tokens after the 512-token prompt (one text) is 2.95784-2.95785 on origin/dev and 2.93281-2.93284 with this change, top-1 14 and 15 of the 32. origin/dev ran a layer holding an expert that had left the card whole on the host's path (moe_ex: the residents as the tier's per-token groups, the other experts on the CPU in expert_ffn.h, which rounds its input to int8, QWEN_EXPERT_ACT); this change runs that layer in the chain's frame, every expert on the card's f16 GEMMs, the non-residents from the staged copies. That probably explains the change; no run here isolates it",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-host-pool-follow-2026-10-26/normal.txt",
+      "sha256": "8da7d7c281b4abc27a0ae33d60326afcc3adde739616da270f35773ce1ba0be3"
+    }
+  },
+  "outcome": "improvement"
+}

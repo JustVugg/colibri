@@ -37,6 +37,7 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+#include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
 #include "st.h"
 #include "json.h"
 #include "tok.h"

@@ -128,9 +128,58 @@ static void test_gate(void) {
     CHECK(spec_gate_pick(&g, SPEC_SRC_LOOKUP, 5, NULL) == 5, "gate off drafts the whole proposal");
 }
 
+/* spec_gate_pick_p: the depth from this step's own estimates, through the bins */
+static void test_gate_p(void) {
+    SpecGate g; spec_gate_init(&g, 0);
+    /* a row costs a third of a plain step */
+    spec_gate_forward(&g, 1, 1.0);
+    for (int n = 2; n <= 6; n++) for (int i = 0; i < 4; i++) spec_gate_forward(&g, n, 1.0 + (n - 1) / 3.0);
+    const float sure[5] = {0.97f, 0.96f, 0.95f, 0.95f, 0.94f}, doubt[5] = {0.05f, 0.04f, 0.03f, 0.02f, 0.02f};
+    const float mixed[5] = {0.95f, 0.92f, 0.05f, 0.9f, 0.9f};
+    CHECK(spec_gate_pick_p(&g, SPEC_SRC_MTP, 5, sure, NULL) == 5, "sure drafts: every one verified");
+    CHECK(spec_gate_pick_p(&g, SPEC_SRC_MTP, 5, doubt, NULL) == 0, "doubtful drafts: a plain step");
+    int k = spec_gate_pick_p(&g, SPEC_SRC_MTP, 5, mixed, NULL);
+    CHECK(k == 2, "the third draft is doubtful: the first two only, got %d", k);
+    /* while drafting: the newest draft worth its row or not, and whether a next draft can pass */
+    CHECK(spec_gate_deeper_p(&g, SPEC_SRC_MTP, 1, mixed), "a likely first: write a second");
+    CHECK(!spec_gate_deeper_p(&g, SPEC_SRC_MTP, 1, doubt), "a doubtful first: no second can pass");
+    CHECK(spec_gate_deeper_p(&g, SPEC_SRC_MTP, 2, mixed), "two likely drafts: write a third");
+    CHECK(!spec_gate_deeper_p(&g, SPEC_SRC_MTP, 3, mixed), "a doubtful third: no fourth");
+    /* draft cost is already spent when spec_gate_pick_p judges the drafts in hand */
+    spec_gate_draft_cost(&g, SPEC_SRC_MTP, 0.5);
+    CHECK(spec_gate_pick_p(&g, SPEC_SRC_MTP, 5, mixed, NULL) == 2, "spent draft cost does not shrink pick_p");
+    /* the next draft, as likely as the best bin, must beat both n drafts and a plain step */
+    const float edge[1] = {0.35f}, mid[1] = {0.55f}, low[1] = {0.45f};
+    CHECK(!spec_gate_deeper_p(&g, SPEC_SRC_MTP, 1, edge), "a second draft beats a plain step, not one draft: none");
+    CHECK(spec_gate_deeper_p(&g, SPEC_SRC_MTP, 1, mid), "a middling first: a second from the best bin can pass");
+    SpecGate h; spec_gate_init(&h, 0);   /* two rows cost almost what three do */
+    spec_gate_forward(&h, 1, 1.0);
+    for (int i = 0; i < 4; i++) { spec_gate_forward(&h, 2, 1.9); spec_gate_forward(&h, 3, 2.0); }
+    CHECK(!spec_gate_deeper_p(&h, SPEC_SRC_MTP, 1, low), "a second draft beats one draft, not a plain step: none");
+    const float unknown[3] = {0.9f, -1.0f, 0.9f};
+    CHECK(spec_gate_deeper_p(&g, SPEC_SRC_MTP, 3, unknown), "an estimate missing: keep drafting");
+    /* the bins learn: drafts the source calls sure that fail drag their bin down */
+    int b = spec_gate_pbin(0.95f);
+    double r0 = g.pb[SPEC_SRC_MTP][b];
+    for (int i = 0; i < 40; i++) spec_gate_result_p(&g, SPEC_SRC_MTP, 1, 0, sure);
+    CHECK(g.pb[SPEC_SRC_MTP][b] < 0.2 && g.pb[SPEC_SRC_MTP][b] < r0, "a bin that keeps failing: %g -> %g", r0, g.pb[SPEC_SRC_MTP][b]);
+    CHECK(spec_gate_pick_p(&g, SPEC_SRC_MTP, 5, sure, NULL) == 0 || g.probes[SPEC_SRC_MTP] > 0,
+          "a calibrated bin of failures: no verify (but the probe)");
+    CHECK(g.prop[SPEC_SRC_MTP][0] == 40 && g.hit[SPEC_SRC_MTP][0] == 0, "the position counts follow too");
+    CHECK(spec_gate_pbin(-1.0f) == 0 && spec_gate_pbin(2.0f) == SPEC_PBINS - 1 && spec_gate_pbin(0.0f / 0.0f) == 0,
+          "estimates outside [0, 1] and NaN clamp to the ends");
+    /* off, or no estimates: every draft */
+    spec_gate_init(&g, 1);
+    CHECK(spec_gate_pick_p(&g, SPEC_SRC_MTP, 4, doubt, NULL) == 4, "gate off: every draft");
+    CHECK(spec_gate_deeper_p(&g, SPEC_SRC_MTP, 3, doubt), "gate off: every draft written");
+    spec_gate_init(&g, 0);
+    CHECK(spec_gate_pick_p(&g, SPEC_SRC_MTP, 4, NULL, NULL) == 4, "no estimates: every draft");
+}
+
 int main(void) {
     test_lookup();
     test_gate();
+    test_gate_p();
     if (fails) { printf("test_spec_draft: %d failure(s)\n", fails); return 1; }
     printf("test_spec_draft: prompt lookup and the gate behave as spec_draft.h says\n");
     return 0;

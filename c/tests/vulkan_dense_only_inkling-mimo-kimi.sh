@@ -289,7 +289,7 @@ dho_family_inkling_mimo_kimi_sanitize() {
     local tag=$1 lost=$2; shift 2
     rm -f chain.usage
     env COLI_USAGE=chain.usage USAGE_SAVE=0 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_DENSE_HOST=0 "$@" > san.log 2>&1 || true
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan $tag: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "asan $tag: sanitizer diagnostic"; fi
     [ "$(dho_dropped san.log)" -gt 0 ] || { cat san.log; fail "asan $tag: nothing on the device only"; }
     if [ "$lost" = 1 ]; then
       grep -q 'queue submit (COLI_VK_CHAIN_FAULT)' san.log || { cat san.log; fail "asan $tag: device loss was not injected"; }
@@ -314,7 +314,7 @@ dho_family_inkling_mimo_kimi_sanitize() {
   CHAIN_SERVE_TOL=2e-2 CHAIN_SERVE_EXPECT='dense matrices on the device only' COLI_VK_DENSE_HOST=0 \
     $PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 USAGE_SAVE=0 > san.log 2>&1 ||
     { cat san.log; fail "asan dense-only kimi_k3 serve"; }
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan dense-only kimi_k3 serve: sanitizer diagnostic"; fi
+  if san_diag san.log; then cat san.log; fail "asan dense-only kimi_k3 serve: sanitizer diagnostic"; fi
   echo "OK asan dense-only kimi_k3 serve: $(tail -1 san.log)"
   rm -f chain.usage chain-serve.usage
   unset OMP_NUM_THREADS

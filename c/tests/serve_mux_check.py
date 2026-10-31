@@ -159,8 +159,8 @@ def main():
                                 if not f.startswith((b"DONE", b"ERROR")))
             if not full and body and text(body) == text(a)[:len(text(body))]:
                 body = a[:len(body)]
-            # it ends as the engine ends one alone: DONE or ERROR CANCELLED (qwen36 treats a
-            # STOP as a cancel, OLMoE ends a cancel with DONE)
+            # it ends as the engine ends one alone: DONE or ERROR CANCELLED
+            # (OLMoE also ends a cancel with DONE)
             ends = [[b"DONE"], [b"ERROR CANCELLED"]]
             ok = len(body) >= 1 and body == a[:len(body)] and (full or end in ends)
             if not ok:

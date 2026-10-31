@@ -18,7 +18,9 @@ typedef enum {
     COLI_TENSOR_FP8_E4M3_BLOCK,
     COLI_TENSOR_FP4_NATIVE_BLOCK,
     COLI_TENSOR_INT8_BLOCK,
-    COLI_TENSOR_INT4_BLOCK
+    COLI_TENSOR_INT4_BLOCK,
+    COLI_TENSOR_GGML      /* a GGUF tensor's blocks as the file has them; block_columns
+                           * holds their ggml type (ggml_quants.h GQ_*) */
 } ColiTensorFormat;
 
 typedef enum {

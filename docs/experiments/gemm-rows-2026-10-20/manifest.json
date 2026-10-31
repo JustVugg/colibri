@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "hypothesis": "DeepSeek V4's chain prompt matmuls on the per-row GEMV (chosen so a row's bits never depend on the chunking) leave the tiled GEMM idle on devices without cooperative matrices; letting prompt rows take the backend's tiled GEMM shortens the first token (the samples are prefill tok/s: prompt tokens over the time to the first token) without touching decode or a verify's bits.",
+  "commit": "b032ba91493f19da694ea3f84971b7c38274efc5",
+  "model": "DeepSeek V4 Flash (284B MoE), official FP4/FP8 checkpoint, 48 safetensors shards",
+  "command": "docs/experiments/gemm-rows-2026-10-20/build-vk.sh && docs/experiments/gemm-rows-2026-10-20/campaign.sh  (c/deepseek_v4 MODEL --prompt-file docs/experiments/gemm-rows-2026-10-20/../prompt_2k.txt --max-tokens 32 --memory-gb 28; OMP_NUM_THREADS=16, COLI_TEMP=0, KVSAVE=0, V4_PREFIX_CKPT=0, COLI_VK_TIER_HOST=0; three interleaved runs per arm)",
+  "prompt_hash": "2e06e22974e445d49e623405d10b4f065bcb88369f63aeff8c9cba0aa904cc3d",
+  "hardware": {
+    "cpu": "24-thread x86-64 desktop CPU (8 performance + 8 efficiency cores)",
+    "ram": "38 GiB DDR5",
+    "storage": "NVMe (model drive, ext4), expert shards read O_DIRECT",
+    "os": "Arch Linux, gcc 15, Mesa RADV, Vulkan 1.4"
+  },
+  "warmup_runs": 0,
+  "changed_variables": [
+    "COLI_VK_CHAIN_GEMM_ROWS"
+  ],
+  "baseline": {
+    "config": {
+      "COLI_VK_CHAIN_GEMM_ROWS": "0",
+      "COLI_VK_TIER_HOST": "0",
+      "OMP_NUM_THREADS": "16",
+      "memory_gb": "28"
+    },
+    "samples": {
+      "tok_s": [
+        12.5908,
+        13.2662,
+        13.2758
+      ]
+    },
+    "median_tok_s": 13.2662,
+    "quality": {
+      "method": "tests/test_vk_chain.c's gemv-rows section drives vkc_gemm_rows directly for both values on this device; the chain's exactness suite (make vk-chain-check) is green with the knob at 0 and at -1. Greedy text is not compared across arms: the GEMM is the documented row-canonical class, so texts may differ (they do).",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/gemm-rows-2026-10-20/ (six *-raw.txt run logs, samples.txt, sha256sums.txt; the manifest hash covers the six raw logs in name order)",
+      "sha256": "c1266db1579aeec7dd67426892b90a2674f1573c24b2943cd6df74c0b4f8e7d9"
+    }
+  },
+  "trial": {
+    "config": {
+      "COLI_VK_CHAIN_GEMM_ROWS": "-1",
+      "COLI_VK_TIER_HOST": "0",
+      "OMP_NUM_THREADS": "16",
+      "memory_gb": "28"
+    },
+    "samples": {
+      "tok_s": [
+        16.5318,
+        16.3801,
+        16.7845
+      ]
+    },
+    "median_tok_s": 16.5318,
+    "quality": {
+      "method": "tests/test_vk_chain.c's gemv-rows section drives vkc_gemm_rows directly for both values on this device; the chain's exactness suite (make vk-chain-check) is green with the knob at 0 and at -1. Greedy text is not compared across arms: the GEMM is the documented row-canonical class, so texts may differ (they do).",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/gemm-rows-2026-10-20/ (six *-raw.txt run logs, samples.txt, sha256sums.txt; the manifest hash covers the six raw logs in name order)",
+      "sha256": "c1266db1579aeec7dd67426892b90a2674f1573c24b2943cd6df74c0b4f8e7d9"
+    }
+  },
+  "outcome": "improvement"
+}

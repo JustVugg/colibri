@@ -304,6 +304,7 @@ static void case_moe_wiring(const char *root) {
     l.sh_g = (QW){ .w = sh_zero, .I = FX_HIDDEN, .O = ISH };   /* shared adds 0 */
     l.sh_u = (QW){ .w = sh_zero, .I = FX_HIDDEN, .O = ISH };
     l.sh_d = (QW){ .w = sh_zero, .I = ISH, .O = FX_HIDDEN };
+    l.sh_I = ISH;   /* the layer's shared width, as model_init_range sets it */
 
     float x[S * FX_HIDDEN];
     for (int i = 0; i < S * FX_HIDDEN; i++)

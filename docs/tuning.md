@@ -10,7 +10,7 @@ is safe on any machine. See also [SETTINGS.md](SETTINGS.md) and
 |---|---|
 | `--temp T` | token sampling temperature (default 0.7 + nucleus 0.90 — tuned for int4; 0 = greedy) |
 | `--topp 0.7` | adaptive expert top-p (30–40% less disk; lossy — prints a warning) |
-| `--ngen N` | max tokens per answer (`:more` in chat continues a truncated one) |
+| `--ngen N` | max tokens per answer (`:more` in chat continues a truncated one); without it a chat server lets an answer run to the end of the context |
 | `--repin N` | adapt RAM/VRAM hot experts every N emitted tokens |
 | `RAM_GB=<n>` | claim more RAM for the expert cache than the conservative auto-detect |
 | `PIN=stats PIN_GB=g` | pin the hottest experts from a measured usage profile |
@@ -48,8 +48,13 @@ unmeasured optimization.
 
 Auto-tier plans size OpenMP from physical cores and bind workers across cores.
 Memory-bound quantized kernels can regress sharply when SMT siblings compete for
-limited memory channels. The GLM, Kimi K3, and OLMoE engines also apply that
-physical-core cap when launched directly; explicit `OMP_NUM_THREADS` and the
+limited memory channels. On a hybrid CPU the team is the performance cores only:
+an OpenMP team meets at a barrier after every matmul, so its slowest thread sets the
+pace. That is Apple Silicon's P-cores (`hw.perflevel0`), and on x86 the cores of the
+highest `EfficiencyClass` on Windows or the `cpu_core` PMU's on Linux (Intel's P-cores;
+an i5-13500, 6 P + 8 E cores, decoded Qwen3.8 IQ2_XS on the CPU at 9.40 tok/s on its 6
+P-cores against 9.00 on all 14). The GLM, Kimi K3, and OLMoE engines also apply that
+cap when launched directly; explicit `OMP_NUM_THREADS` and the
 `COLI_NO_OMP_TUNE` kill switch always take precedence.
 
 > Note (#471): exporting `OMP_PROC_BIND`/`OMP_PLACES` used to interact badly with
@@ -58,6 +63,32 @@ physical-core cap when launched directly; explicit `OMP_NUM_THREADS` and the
 > one core (~20× slowdown). The engine now resets its affinity to all online CPUs
 > right before the re-exec, so explicit `OMP_*` pinning works as documented.
 > `COLI_OMP_TUNED=1` remains the escape hatch that skips the re-exec entirely.
+
+The re-exec binds the team with `OMP_PROC_BIND=close` and `OMP_PLACES=cores`, one place
+per core. Without the places libgomp makes one per hardware thread, and on a CPU that
+numbers a core's SMT siblings side by side (Intel's hybrid CPUs on Linux: CPUs 0 and 1 are
+P-core 0) the team of six P-core threads sat on CPUs 0-5, three cores. On an i5-13500 that
+cost Mistral-Large-4 UD-IQ1_S a quarter of its decode (0.59-0.61 tok/s against 0.76-0.80
+with the places). Both are defaults only: your own `OMP_PROC_BIND`/`OMP_PLACES` win.
+
+The OLMoE, qwen36 (Qwen3.6, LFM3, Flint and the other models it runs) and qwen38 engines take
+the same hot team on Linux and FreeBSD (`coli_omp_hot_team` in `omp_tune.h`): active waiting
+with `GOMP_SPINCOUNT=200000` (a moment of spinning between a token's many small matmul
+regions, then sleep, so a disk wait does not burn a core), `KMP_BLOCKTIME=200`, the team on
+whole cores and of fixed size, set and the engine run again once, keeping its own process
+name. Not on macOS (#707), not with CUDA or Metal on, not under `COLI_NO_OMP_TUNE`. Served on
+an i5-13500, Q4_K_M, alternated with dev:
+
+| on the CPU | decode before | decode after | prompt before | prompt after |
+|---|---|---|---|---|
+| OLMoE | 43.3, 42.7 tok/s | 47.9, 47.6 | 267, 268 | 279, 279 |
+| LFM3-VL-2B | 33.7, 33.8 | 34.5, 34.5 | 282, 280 | 287, 287 |
+| Qwen3.6-35B-A3B (4 rounds) | 13.5-13.6 | 13.9 | 115.7 average | 115.4 average |
+| Qwen3.8-Flash-Next IQ2_XS, 68 GB on 62 GB of RAM (3 rounds) | 7.9-8.1 | 9.0-9.1 | 38.2 average | 36.7 average |
+
+Qwen3.8 reads its experts from the disk there: decode gains, the prompt (212 tokens) loses 4%,
+the cost colibri.c's spin count is the compromise for. On Vulkan decode is unchanged; the prompt is faster for LFM3 (6636 and 6593 to 6961 and 6879
+tok/s), the same for OLMoE, 2% slower for Qwen3.6 (2003 to 1965 on average over 4 rounds).
 
 ### Hybrid CUDA/CPU OpenMP override
 
@@ -180,6 +211,46 @@ The history's on-disk format, what happens when one engine is handed another
 engine's history, and how `PIN=<file>` differs from `PIN=auto` in how much it
 trusts a file are documented in
 [routing-telemetry.md](routing-telemetry.md).
+
+### What a pin budget buys (`tools/usage_coverage.py`)
+
+AUTOPIN and the CUDA tier size the pin by how much memory is free. To see what
+that memory buys, read the history's coverage curve: the share of past expert
+selections that the best pinned set of a given size would have served.
+
+```bash
+cd c
+python3 tools/usage_coverage.py <model>/.coli_usage --expert-mb 1.7 --vram-gb 6 --ram-gb 8
+```
+
+It prints how concentrated the routing is (top 1/10/30% of experts, Gini,
+effective number of experts), coverage at a list of budgets, the smallest budget
+for 70/80/90%, the knee where an extra GB starts buying less than average,
+and a VRAM-then-RAM plan in the order `pin_load` fills them (VRAM less
+`--reserve-gb`, default 2 like `CUDA_RESERVE_GB`). `--min-gain G` marks where
+one more GB adds fewer than G points. `--expert-mb` is the size of one routed
+expert; without it budgets are given in percent of experts.
+
+On the shipped Qwen3.6 profile (`profiles/qwen36-35b.coli_usage`, 1.7 MB per
+int4 expert):
+
+| pinned | experts | coverage |
+|---:|---:|---:|
+| 1 GB | 5.7% | 23.4% |
+| 2 GB | 11.5% | 37.4% |
+| 4 GB | 23.0% | 56.6% |
+| 6 GB | 34.5% | 70.2% |
+| 8 GB | 45.9% | 80.5% |
+
+Coverage is measured on the history it was built from, so it overstates what
+the same pin serves on new prompts. `--holdout <files>` scores the ranking on
+other histories: the shipped Qwen3.8 profile covers 70% of its own selections
+with 26% of experts, but the same experts cover 57.7% of a separate Qwen3.8
+session (`docs/experiments/vulkan-qwen38-mtp-2026-10-05/history.usage.gz`).
+Coverage is also a lower bound on the hit rate, since the LRU serves part of
+the rest. Models without hot experts (OLMoE,
+[#864](https://github.com/JustVugg/colibri/issues/864)) show up as a nearly
+straight curve.
 
 ## Router-lookahead prefetch (`PILOT=1`, experimental)
 

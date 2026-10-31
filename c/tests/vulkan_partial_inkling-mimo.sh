@@ -194,12 +194,13 @@ ptl_inkling() {
 
   # ---- an upload failing inside layer k's setup (COLI_VK_STAGED_FAULT, aimed from a probe's
   # counts): the layers before it on the device, nothing of layer k; the full chain's setup
-  # (at the first forward) and the device-only one (at start-up)
+  # (at the first forward) and the device-only one (at start-up). The warm start fills no
+  # device here (COLI_VK_TIER_FILL=0): its uploads would move the counts the probe took
   ink_fault() {  # <tag> <k> <probe log> <env...>
     local tag=$1 k=$2 probe=$3 f; shift 3
     f=$(ptl_calc fault inkling "$probe" "$k") || { cat "$probe"; fail "$tag: no fault count for layer $k"; }
     rm -f chain.usage
-    env "$@" COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:$f COLI_VK_CHAIN_LAYERS=8 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 \
+    env COLI_VK_TIER_FILL=0 "$@" COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:$f COLI_VK_CHAIN_LAYERS=8 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 \
       COLI_VULKAN=1 COLI_VK_CHAIN=1 SNAP=tiny_inkling ./inkling 8 0 $R > vk.log 2>&1 || true
     grep -qa "COLI_VK_STAGED_FAULT: submit #$f fails" vk.log || { cat vk.log; fail "$tag: the fault never fired"; }
     same_tokens cpu.log vk.log "$tag"
@@ -210,13 +211,13 @@ ptl_inkling() {
   local h
   for h in 1 0; do
     rm -f chain.usage
-    env COLI_VK_DENSE_HOST=$h COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:1000000 COLI_VK_CHAIN_LAYERS=8 COLI_USAGE=chain.usage \
+    env COLI_VK_TIER_FILL=0 COLI_VK_DENSE_HOST=$h COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:1000000 COLI_VK_CHAIN_LAYERS=8 COLI_USAGE=chain.usage \
       COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 SNAP=tiny_inkling ./inkling 8 0 $R > ptl-fprobe.log 2>&1 || true
     for k in 0 3 7; do ink_fault "partial inkling upload failing in layer $k (COLI_VK_DENSE_HOST=$h)" $k ptl-fprobe.log COLI_VK_DENSE_HOST=$h; done
     if [ $h = 1 ]; then   # lm_head's upload failing: every layer on the device, the head on the CPU
       f=$(ptl_imk_head_fault inkling ptl-fprobe.log)
       rm -f chain.usage
-      env COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:$f COLI_VK_CHAIN_LAYERS=8 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 \
+      env COLI_VK_TIER_FILL=0 COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:$f COLI_VK_CHAIN_LAYERS=8 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 \
         COLI_VULKAN=1 COLI_VK_CHAIN=1 SNAP=tiny_inkling ./inkling 8 0 $R > vk.log 2>&1 || true
       grep -qa "lm_head did not reach the device; it runs on the CPU" vk.log || { cat vk.log; fail "partial inkling head fault: not the head's"; }
       same_tokens cpu.log vk.log "partial inkling head fault"
@@ -312,6 +313,10 @@ ptl_mimo() {
 ptl_mimo_all() {
   kv_mimo_fixtures
   local k c bits
+  # every run from no expert history and none written (the inkling runs above use the same
+  # file): a probe and the run it counts for take the same warm start, so the same submits
+  rm -f chain.usage
+  local -x COLI_USAGE=chain.usage USAGE_SAVE=0
   # ---- COLI_VK_CHAIN_LAYERS: every N from 0 to L, text and picture; the dense forms at a
   # middle N; one token at a time, blocks of 3, the tower on the per-matrix path (the tail:
   # on the CPU with N < L), the tier off
@@ -347,11 +352,11 @@ ptl_mimo_all() {
   echo "OK partial mimo plan: coli plan's numbers the engine's (MIMO_DENSE_BITS 0 and 8, blocks of 3)"
 
   # ---- an upload failing inside layer k (the full chain's setup, after the tier; the
-  # device-only one, before it)
+  # device-only one, before it), the warm start filling no device (as inkling's above)
   mimo_fault() {  # <tag> <k> <probe log> <env...>
     local tag=$1 k=$2 probe=$3 f; shift 3
     f=$(ptl_calc fault mimo "$probe" "$k") || { cat "$probe"; fail "$tag: no fault count for layer $k"; }
-    env "$@" COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:$f COLI_VK_CHAIN_LAYERS=6 COLI_TEMP=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 \
+    env COLI_VK_TIER_FILL=0 "$@" COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:$f COLI_VK_CHAIN_LAYERS=6 COLI_TEMP=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 \
       COLI_VK_TIER_SYNC=1 MIMO_DENSE_BITS=32 ./mimo mimo_tiny --ids "$P" --ngen 6 > mimo-vk.txt 2> vk.log
     grep -qa "COLI_VK_STAGED_FAULT: submit #$f fails" vk.log || { cat vk.log; fail "$tag: the fault never fired"; }
     [ -s mimo-cpu.txt ] && cmp -s mimo-cpu.txt mimo-vk.txt || { cat mimo-cpu.txt mimo-vk.txt vk.log; fail "$tag: tokens differ from the CPU"; }
@@ -361,12 +366,12 @@ ptl_mimo_all() {
   }
   local h
   for h in 1 0; do
-    env COLI_VK_DENSE_HOST=$h COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:1000000 COLI_VK_CHAIN_LAYERS=6 COLI_TEMP=0 COLI_VULKAN=1 \
+    env COLI_VK_TIER_FILL=0 COLI_VK_DENSE_HOST=$h COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:1000000 COLI_VK_CHAIN_LAYERS=6 COLI_TEMP=0 COLI_VULKAN=1 \
       COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 MIMO_DENSE_BITS=32 ./mimo mimo_tiny --ids "$P" --ngen 6 > /dev/null 2> ptl-fprobe.log
     for k in 0 2 5; do mimo_fault "partial mimo upload failing in layer $k (COLI_VK_DENSE_HOST=$h)" $k ptl-fprobe.log COLI_VK_DENSE_HOST=$h; done
     if [ $h = 1 ]; then   # the head's upload failing: every layer on the device, the head on the CPU
       f=$(ptl_imk_head_fault mimo ptl-fprobe.log)
-      env COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:$f COLI_VK_CHAIN_LAYERS=6 COLI_TEMP=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 \
+      env COLI_VK_TIER_FILL=0 COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:$f COLI_VK_CHAIN_LAYERS=6 COLI_TEMP=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 \
         COLI_VK_TIER_SYNC=1 MIMO_DENSE_BITS=32 ./mimo mimo_tiny --ids "$P" --ngen 6 > mimo-vk.txt 2> vk.log
       grep -qa "the head did not reach the device; it runs on the CPU" vk.log || { cat vk.log; fail "partial mimo head fault: not the head's"; }
       [ -s mimo-cpu.txt ] && cmp -s mimo-cpu.txt mimo-vk.txt || { cat mimo-cpu.txt mimo-vk.txt vk.log; fail "partial mimo head fault: tokens differ from the CPU"; }
@@ -446,7 +451,7 @@ ptl_family_inkling_mimo_sanitize() {
     local eng=$1 tag=$2 k=$3; shift 3
     rm -f chain.usage
     env COLI_USAGE=chain.usage USAGE_SAVE=0 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "$@" > san.log 2>&1 || true
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan $tag: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "asan $tag: sanitizer diagnostic"; fi
     ptl_check_n "$eng" san.log "$k" "asan $tag"
     ptl_check_placed "$eng" san.log "asan $tag"
     echo "OK asan $tag: sanitizers clean, N = $k, $(chain_count "$eng" san.log) chain forwards"
@@ -460,10 +465,10 @@ ptl_family_inkling_mimo_sanitize() {
   cp san.log ptl-probe.log
   local cap; cap=$(PTL_PROBE_CAP_MB=256 ptl_calc cap inkling ptl-probe.log 5)
   psan inkling "partial inkling cap for N=5" 5 COLI_VK_DEVICE_CAP_MB=$cap COLI_VK_TIER_RESERVE_GB=$PTL_RESERVE SNAP=tiny_inkling ./inkling 8 0 $R
-  psan inkling "partial inkling fault probe" 8 COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:1000000 COLI_VK_CHAIN_LAYERS=8 \
+  psan inkling "partial inkling fault probe" 8 COLI_VK_TIER_FILL=0 COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:1000000 COLI_VK_CHAIN_LAYERS=8 \
     SNAP=tiny_inkling ./inkling 8 0 $R
   cp san.log ptl-fprobe.log
-  psan inkling "partial inkling upload failing in layer 4" 4 COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:$(ptl_calc fault inkling ptl-fprobe.log 4) \
+  psan inkling "partial inkling upload failing in layer 4" 4 COLI_VK_TIER_FILL=0 COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:$(ptl_calc fault inkling ptl-fprobe.log 4) \
     COLI_VK_CHAIN_LAYERS=8 SNAP=tiny_inkling ./inkling 8 0 $R
   psan inkling "partial inkling N=4, device lost" 4 COLI_VK_CHAIN_LAYERS=4 COLI_VK_CHAIN_FAULT=40 SNAP=tiny_inkling ./inkling 8 0 $R
   grep -qa "rebuilding the state of [1-9]" san.log || { cat san.log; fail "asan partial inkling device lost: no rebuild"; }
@@ -480,10 +485,10 @@ ptl_family_inkling_mimo_sanitize() {
   cap=$(PTL_PROBE_CAP_MB=256 ptl_calc cap mimo ptl-probe.log 4)
   psan mimo "partial mimo cap for N=4" 4 COLI_VK_DEVICE_CAP_MB=$cap COLI_VK_TIER_RESERVE_GB=$PTL_RESERVE MIMO_DENSE_BITS=32 COLI_TEMP=0 \
     ./mimo mimo_tiny --ids "$P" --ngen 6
-  psan mimo "partial mimo fault probe" 6 COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:1000000 COLI_VK_CHAIN_LAYERS=6 MIMO_DENSE_BITS=32 \
+  psan mimo "partial mimo fault probe" 6 COLI_VK_TIER_FILL=0 COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:1000000 COLI_VK_CHAIN_LAYERS=6 MIMO_DENSE_BITS=32 \
     COLI_TEMP=0 ./mimo mimo_tiny --ids "$P" --ngen 6
   cp san.log ptl-fprobe.log
-  psan mimo "partial mimo upload failing in layer 3" 3 COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:$(ptl_calc fault mimo ptl-fprobe.log 3) \
+  psan mimo "partial mimo upload failing in layer 3" 3 COLI_VK_TIER_FILL=0 COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:$(ptl_calc fault mimo ptl-fprobe.log 3) \
     COLI_VK_CHAIN_LAYERS=6 MIMO_DENSE_BITS=32 COLI_TEMP=0 ./mimo mimo_tiny --ids "$P" --ngen 6
   psan mimo "partial mimo N=3, device lost in a chunked prompt" 3 COLI_VK_CHAIN_LAYERS=3 COLI_VK_CHAIN_ROWS=3 COLI_VK_CHAIN_FAULT=12 \
     MIMO_DENSE_BITS=32 COLI_TEMP=0 ./mimo mimo_tiny --ids "$P" --ngen 6

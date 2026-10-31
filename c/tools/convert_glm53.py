@@ -305,10 +305,21 @@ def fetch_curl(repo, filename, dest_dir, expected_size, token=None,
         command = ["curl", "-sL", "-4", "--retry", "3", "--retry-delay", "5",
                    "--speed-limit", "50000", "--speed-time", "120",
                    "-r", f"{have}-{stop}", "--output", "-", url]
+        auth = None
         if token:
-            command[1:1] = ["-H", f"Authorization: Bearer {token}"]
-        with open(path, "ab") as sink:
-            subprocess.run(command, stdout=sink, check=False)
+            # The header from a file (curl -H @file), not the token in argv: process lists show argv.
+            # Owner-only, and gone again once this request is done.
+            auth = os.path.join(dest_dir, ".hfauth")
+            fd = os.open(auth, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(f"Authorization: Bearer {token}\n")
+            command[1:1] = ["-H", "@" + auth]
+        try:
+            with open(path, "ab") as sink:
+                subprocess.run(command, stdout=sink, check=False)
+        finally:
+            if auth and os.path.exists(auth):
+                os.remove(auth)
         grown = (os.path.getsize(path) if os.path.exists(path) else 0) - have
         if grown <= 0:
             idle += 1
@@ -391,6 +402,9 @@ def main():
     ap.add_argument("--keep-source", action="store_true",
                     help="non cancella lo shard sorgente dopo la conversione")
     a = ap.parse_args()
+
+    if a.indir and os.path.realpath(a.indir) == os.path.realpath(a.outdir):
+        ap.error("--indir and --outdir must differ (in-place conversion would overwrite the source checkpoint)")
 
     os.makedirs(a.outdir, exist_ok=True)
     done_path = os.path.join(a.outdir, ".converted.json")

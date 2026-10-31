@@ -104,23 +104,26 @@ jobs:
   vulkan:
     name: Vulkan (Lavapipe, software)
     runs-on: ubuntu-latest
+    # 3 minutes when it works. Without a limit a stalled package mirror held a runner for
+    # the 6-hour default (#1978's run of 2026-10-07).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install the Vulkan toolchain and a software driver
         run: |
-          sudo apt-get update
           # libvulkan-dev: headers + loader. glslc: compiles the .comp shaders to SPIR-V --
           # neither is present on the runner by default, which is half of why VK=1 was
-          # never built here. mesa-vulkan-drivers carries Lavapipe (lvp).
-          sudo apt-get install -y --no-install-recommends \
-            libvulkan-dev glslc mesa-vulkan-drivers
+          # never built here. mesa-vulkan-drivers carries Lavapipe (lvp). The script puts
+          # hard limits around apt: a stalled mirror held these jobs for hours.
+          bash .github/scripts/apt-install.sh libvulkan-dev glslc mesa-vulkan-drivers
       - name: Build with VK=1
         run: |
           cd c
           make colibri VK=1
           # The shaders are a separate failure mode from the C: glslc can reject a .comp
-          # while backend_vulkan.c compiles perfectly. Assert all four exist.
-          ls -l shaders/qmatmul.spv shaders/qmatmul_gate_up.spv \
+          # while backend_vulkan.c compiles perfectly. Assert they exist, the block formats'
+          # two (qmatmul*_bd, blockdec.glsl) among them.
+          ls -l shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_bd.spv shaders/qmatmul_gate_up_bd.spv \
                 shaders/attention_absorb.spv shaders/rmsnorm.spv
           # Nothing links the loader (vk_load.h): a VK=1 binary starts without one, as
           # the release archives' must. The Vulkan build is the string it opens.
@@ -167,6 +170,10 @@ jobs:
           # choose staging on its own; then the formats, the tier and the chain's ops staged.
           bash tests/vulkan_engines.sh staged
           COLI_VK_STAGED=1 bash tests/vulkan_engines.sh shader
+      - name: Memory types and budgets against tables
+        run: |
+          cd c
+          make vk-memtype-check VK=1
 
   # Every engine with a Vulkan hook, run twice on its tiny fixture: on the CPU and on
   # Lavapipe, with the same snapshot and settings. The gate is the CPU's tokens (and
@@ -190,8 +197,10 @@ jobs:
           # ASan and UBSan
           - family: qwen-chain
             req: c/tools/requirements-qwen38-tiny.txt
+            extra: gguf>=0.19   # the GGUF chain gates write their tiny model with gguf-py
           - family: qwen-chain-sanitize
             req: c/tools/requirements-qwen38-tiny.txt
+            extra: gguf>=0.19
           # speculative decoding with deeper verifies (MTP drafts up to 3, prompt-lookup
           # drafts up to 5) on qwen36 and qwen38: against plain decoding on the CPU and
           # in the dense chain, and the same under ASan and UBSan
@@ -205,6 +214,7 @@ jobs:
             req: c/tools/requirements-qwen38-tiny.txt
           - family: qwen-chain-staged
             req: c/tools/requirements-qwen38-tiny.txt
+            extra: gguf>=0.19
           # staged uploads failing at every point they can (COLI_VK_STAGED_FAULT): qwen36's
           # matrices, tier and chain, colibri's KV mirror; the CPU's tokens, and the same
           # under ASan and UBSan
@@ -242,6 +252,7 @@ jobs:
           # MiMo-V2.6's dense chain (COLI_VK_CHAIN=1), and the same under ASan and UBSan
           - family: mimo-chain
             req: c/tools/requirements-mimo-tiny.txt
+            extra: gguf>=0.19   # the GGUF chain gates write their tiny model with gguf-py
           - family: mimo-chain-sanitize
             req: c/tools/requirements-mimo-tiny.txt
           # GLM-5.2 (colibri) and GLM-5.3 Flash (glm53) on the routed-expert tier, and
@@ -254,13 +265,14 @@ jobs:
           # ops, and the same under ASan and UBSan
           - family: glm-chain
             req: c/tools/requirements-glm53-tiny.txt
+            extra: gguf>=0.19   # the GGUF chain gates write their tiny model with gguf-py
           - family: glm-chain-sanitize
             req: c/tools/requirements-glm53-tiny.txt
           # the dense chain (COLI_VK_CHAIN=1) of deepseek_v41 and deepseek_v4, and the same
           # under ASan and UBSan
           - family: deepseek-chain
             req: c/tools/requirements-deepseek-v4-tiny.txt
-            extra: sympy pillow
+            extra: sympy pillow gguf>=0.19
           - family: deepseek-chain-sanitize
             req: c/tools/requirements-deepseek-v4-tiny.txt
             extra: sympy pillow
@@ -268,6 +280,7 @@ jobs:
           # and gated MLA layers on the device, and the same under ASan and UBSan
           - family: kimi-chain
             req: c/tools/requirements-kimi-k3-tiny.txt
+            extra: gguf>=0.19
           - family: kimi-chain-sanitize
             req: c/tools/requirements-kimi-k3-tiny.txt
           # the dense weights on the device only (COLI_VK_DENSE_HOST=0): the host copies
@@ -461,9 +474,8 @@ jobs:
           cache-dependency-path: ${{ matrix.req }}
       - name: Install the Vulkan toolchain, Lavapipe and the fixture dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libvulkan-dev glslc mesa-vulkan-drivers
+          # hard limits around apt (.github/scripts/apt-install.sh): see the vulkan job
+          bash .github/scripts/apt-install.sh libvulkan-dev glslc mesa-vulkan-drivers
           pip install -r ${{ matrix.req }} ${{ matrix.extra }}
       - name: The pinned TypeScript SDK
         if: ${{ matrix.npm }}
@@ -718,7 +730,9 @@ jobs:
 
   engine-cuda-syntax:
     name: CUDA syntax check
-    runs-on: ubuntu-latest
+    # 24.04, not ubuntu-latest: on 26.04 the toolkit action's network method finds no
+    # cuda-nvcc-12-6 package in NVIDIA's ubuntu2604 repository (2026-10-28)
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install CUDA toolkit (compiler only)
@@ -728,7 +742,9 @@ jobs:
           # step with "Version not available" before nvcc is ever reached.
           cuda: '12.6.2'
           method: network
-          sub-packages: '["nvcc"]'
+          # profiler-api: backend_cuda_dsv4.cu includes cuda_profiler_api.h, which
+          # the nvcc package does not bring
+          sub-packages: '["nvcc", "profiler-api"]'
       - name: Compile backend_cuda.cu (syntax only, no GPU)
         run: |
           cd c
@@ -739,6 +755,28 @@ jobs:
           nvcc -O2 -std=c++17 -arch=sm_80 -c backend_cuda.cu -o /dev/null \
             -Xcompiler=-Wall,-Wextra
           echo "CUDA syntax check passed"
+      - name: Compile cuda_chain.cu (syntax only, no GPU)
+        run: |
+          cd c
+          # the dense chain on a CUDA device (cuda_chain.h), built into the same backend
+          nvcc -O2 -std=c++17 -arch=sm_80 -c cuda_chain.cu -o /dev/null \
+            -Xcompiler=-Wall,-Wextra
+          echo "cuda_chain syntax check passed"
+      - name: Compile the CUDA routed-expert tier (syntax only, no GPU)
+        run: |
+          cd c
+          # cu_xb.cu, the tier's device side, built into the same backend; cu_tier.c, vk_tier.c
+          # compiled again over it; deepseek_v4.c with the tier on CUDA (no Vulkan)
+          nvcc -O2 -std=c++17 -arch=sm_80 -c cu_xb.cu -o /dev/null \
+            -Xcompiler=-Wall,-Wextra
+          gcc -fsyntax-only -DCOLI_CUDA -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-unused-function cu_tier.c
+          gcc -fsyntax-only -D_GNU_SOURCE -DCOLI_CUDA -fopenmp -pthread -include pthread.h -Wall -Wextra \
+            -Wno-unused-parameter -Wno-unused-function -Wno-misleading-indentation deepseek_v4.c
+          for f in kimi_k3.c glm53.c deepseek_v41.c mimo.c; do
+            gcc -fsyntax-only -DCOLI_CUDA -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+              -Wno-misleading-indentation $f
+          done
+          echo "CUDA tier syntax check passed"
       - name: Compile backend_cuda_ink.cu (syntax only, no GPU)
         run: |
           cd c
@@ -747,6 +785,18 @@ jobs:
           nvcc -O2 -std=c++17 -arch=sm_80 -c backend_cuda_ink.cu -o /dev/null \
             -Xcompiler=-Wall,-Wextra
           echo "inkling CUDA syntax check passed"
+      - name: "Compile backend_cuda_dsv4.cu without cuBLASLt (the Windows package's form)"
+        run: |
+          cd c
+          # DeepSeek V4's backend as the Windows CUDA package ships it (cuda-dsv4-dll
+          # DSV4_TC=0): the opt-in cuBLASLt path left out, so the DLL needs no
+          # cublasLt64_12.dll (#2047). No cuBLAS symbol may be left in the object.
+          nvcc -O2 -std=c++20 --expt-relaxed-constexpr --expt-extended-lambda -arch=sm_80 \
+            -DCOLI_DSV4_NO_TC -c backend_cuda_dsv4.cu -o dsv4_notc.o
+          if nm -u dsv4_notc.o | grep -i cublas; then
+            echo "backend_cuda_dsv4.cu built with COLI_DSV4_NO_TC still needs cuBLAS" >&2; exit 1
+          fi
+          echo "DeepSeek V4 CUDA backend without cuBLASLt: compiled, no cuBLAS symbol"
 
   qwen36-tiny-check:
     name: Qwen3.6 tiny oracle (token-exact + ASan/UBSan)
@@ -800,6 +850,8 @@ jobs:
               ./qwen36 "$cap" 8 qwen36_tiny/ref_full.json
             echo "::endgroup::"
           done
+      - name: Qwen3.6 checkpoint MTP (reference logits, exact verifies, multi-turn serve)
+        run: make -C c qwen36-tiny-mtp-check
       - name: Qwen3.8-2.4T geometry, fused experts + mtp head (converter contract + token-exact)
         run: |
           cd c
@@ -808,8 +860,7 @@ jobs:
           # widths: 92 layers / interval 4 / 512 experts top-10 / 16:1 attention
           # heads / 8:1 DeltaNet heads. The shard is rewritten into the layout
           # the real checkpoints ship -- fused expert tensors and an mtp.* head
-          # -- so the converter is seen splitting the one and skipping the other
-          # ON PURPOSE (it must say so), not by never selecting them.
+          # -- so the converter exercises the routed experts and the checkpoint head.
           # --seed 3: the default seed collapses this geometry's reference to a
           # single repeated token, which a shape error could still reproduce.
           python3 tools/make_qwen36_tiny.py --geometry qwen38-2p4t --seed 3 \
@@ -817,15 +868,14 @@ jobs:
                   --emit-ref qwen38_2p4t_tiny/ref_full.json
           python3 tools/convert_qwen36.py --model qwen38_2p4t_tiny \
                   --out qwen38_2p4t_tiny_c --ebits 8 | tee convert_2p4t.log
-          grep -q "skipping 19 \`mtp.\*\` tensor" convert_2p4t.log
+          grep -q "\[mtp\] model-mtp.safetensors" convert_2p4t.log
           grep -q "tensor kinds: 1587 in 92 layers, 3 globals" convert_2p4t.log
-          # the container must not carry the head it skipped
+          # The converted head retains the checkpoint names and expert format.
           python3 - <<'EOF'
-          import glob
           from safetensors import safe_open
-          for path in glob.glob("qwen38_2p4t_tiny_c/*.safetensors"):
-              with safe_open(path, "pt") as f:
-                  assert not [k for k in f.keys() if k.startswith("mtp.")], path
+          with safe_open("qwen38_2p4t_tiny_c/model-mtp.safetensors", "pt") as f:
+              assert "mtp.fc.weight" in f.keys()
+              assert "mtp.layers.0.mlp.experts.0.merged_weight" in f.keys()
           EOF
           for cap in 1 2 512; do
             echo "::group::2.4T geometry cap=$cap"
@@ -855,6 +905,21 @@ jobs:
               ./qwen36 "$cap" 8 qwen3_coder_tiny/ref_full.json
             echo "::endgroup::"
           done
+      - name: "Qwen3-8B geometry: the dense Qwen3"
+        run: |
+          cd c
+          # Qwen/Qwen3-8B is Qwen3ForCausalLM: the Qwen3-Coder layer above (all
+          # attention, plain RMSNorm, full rotary) with one SwiGLU MLP and no router,
+          # run as the dense Qwen3.8-27B's MLP below.
+          python3 tools/make_qwen36_tiny.py --geometry qwen3-8b-dense \
+                  --out qwen3_8b_tiny --ref-mode full \
+                  --emit-ref qwen3_8b_tiny/ref_full.json
+          python3 tools/convert_qwen36.py --model qwen3_8b_tiny \
+                  --out qwen3_8b_tiny_c --ebits 8
+          python3 -c "import json; m = json.load(open('qwen3_8b_tiny_c/qwen36_meta.json')); \
+                      assert (m['num_experts'], m['shared_inter'], m['zero_centered_norms'], \
+                              set(m['layer_types'])) == (0, 128, False, {'full_attention'}), m"
+          COLI_DENSE_I8=0 SNAP=qwen3_8b_tiny_c ./qwen36 8 8 qwen3_8b_tiny/ref_full.json
       - name: "Qwen3.8-27B geometry: a dense checkpoint of the same architecture (#1757)"
         run: |
           cd c
@@ -937,7 +1002,81 @@ jobs:
           # engine, so rebuild the normal one first.
           make clean >/dev/null 2>&1 || true
           make qwen36
-          QWEN36_TINY=qwen36_tiny_c python3 -m unittest -v tests.test_qwen36_prefix_serve
+          QWEN36_TINY=qwen36_tiny_c python3 -m unittest -v tests.test_qwen36_prefix_serve tests.test_qwen36_text_stops
+          make tests/test_qwen36_prefill_control
+          for dense in 0 1; do
+            for cap in 1 8; do
+              COLI_DENSE_I8=$dense QWEN36_TINY=qwen36_tiny_c ./tests/test_qwen36_prefill_control $cap
+            done
+          done
+      - name: The embedding read in place (int8 trunk) matches the f32 table, byte for byte
+        run: |
+          cd c
+          # With the default int8 trunk the engine reads each token's embedding row
+          # from the checkpoint instead of building the f32 table (COLI_EMBED_MMAP);
+          # the oracle runs above set COLI_DENSE_I8=0 and never take that path. Both
+          # ways must give the same layer outputs, logits, ids and exit status. The
+          # ids are not held to the oracle: the int8 trunk drifts from it (see the
+          # fixture step). Then several conversations at once (KV_SLOTS), whose
+          # decode step reads the rows too: every request as it is served alone.
+          # The step above built the normal engine.
+          make qwen36
+          for v in 1 0; do
+            rc=0
+            COLI_EMBED_MMAP=$v SNAP=qwen36_tiny_c DUMP=emb_logits_$v.f32 DUMP_LAYERS=emb_layers_$v.f32 \
+              ./qwen36 2 8 qwen36_tiny/ref_full.json > emb_$v.log 2>&1 || rc=$?
+            { echo "exit $rc"; grep -a -o -E "^C engine : [0-9 ]+" emb_$v.log || true; } > emb_ids_$v.txt
+          done
+          grep -q "embedding: rows read in place" emb_1.log || { echo "FAIL: the rows were not read in place"; cat emb_1.log; exit 1; }
+          grep -q "embedding: rows read in place" emb_0.log && { echo "FAIL: COLI_EMBED_MMAP=0 still read the rows in place"; exit 1; }
+          for f in emb_logits emb_layers; do
+            test -s ${f}_1.f32 || { echo "FAIL: no $f dump"; cat emb_1.log; exit 1; }
+            cmp ${f}_1.f32 ${f}_0.f32 || { echo "FAIL: $f differ"; exit 1; }
+          done
+          grep -q "^C engine" emb_ids_1.txt || { echo "FAIL: no ids"; cat emb_1.log; exit 1; }
+          cmp emb_ids_1.txt emb_ids_0.txt || { cat emb_ids_1.txt emb_ids_0.txt; exit 1; }
+          echo "in place = table: $(tr '\n' ' ' < emb_ids_1.txt)"
+          python3 -c "import sys; sys.path.insert(0, 'tests'); from pathlib import Path; \
+                      from prefix_serve_harness import ensure_byte_tokenizer as t; t(Path('qwen36_tiny_c'))"
+          python3 tests/serve_mux_check.py ./qwen36 qwen36_tiny_c 4
+      - name: canonical.qc gives the bytes of the conversion at start, and a wrong file is not used
+        run: |
+          cd c
+          # qwen36-canonical converts the int8 dense matrices once; the engine reads
+          # them from the file (QWEN_DENSE_CACHE, or canonical.qc beside the model)
+          # instead of converting them at start. With the int8 trunk the layer
+          # outputs, logits, ids and exit status must be those of a start without
+          # the file, byte for byte. A damaged file named by QWEN_DENSE_CACHE stops
+          # the start; the same file beside the model is set aside, and the start
+          # converts the matrices as without it.
+          make qwen36 qwen36-canonical
+          ./qwen36-canonical qwen36_tiny_c canon_tiny.qc
+          rc=0
+          SNAP=qwen36_tiny_c DUMP=qc_logits_0.f32 DUMP_LAYERS=qc_layers_0.f32 \
+            ./qwen36 2 8 qwen36_tiny/ref_full.json > qc_0.log 2>&1 || rc=$?
+          { echo "exit $rc"; grep -a -o -E "^C engine : [0-9 ]+" qc_0.log || true; } > qc_ids_0.txt
+          rc=0
+          QWEN_DENSE_CACHE=canon_tiny.qc SNAP=qwen36_tiny_c DUMP=qc_logits_1.f32 DUMP_LAYERS=qc_layers_1.f32 \
+            ./qwen36 2 8 qwen36_tiny/ref_full.json > qc_1.log 2>&1 || rc=$?
+          { echo "exit $rc"; grep -a -o -E "^C engine : [0-9 ]+" qc_1.log || true; } > qc_ids_1.txt
+          grep -q "read instead of converted" qc_1.log || { echo "FAIL: the file was not read"; cat qc_1.log; exit 1; }
+          for f in qc_logits qc_layers; do
+            test -s ${f}_1.f32 || { echo "FAIL: no $f dump"; cat qc_1.log; exit 1; }
+            cmp ${f}_0.f32 ${f}_1.f32 || { echo "FAIL: $f differ"; exit 1; }
+          done
+          grep -q "^C engine" qc_ids_1.txt || { echo "FAIL: no ids"; cat qc_1.log; exit 1; }
+          cmp qc_ids_0.txt qc_ids_1.txt || { cat qc_ids_0.txt qc_ids_1.txt; exit 1; }
+          echo "canonical.qc = conversion: $(tr '\n' ' ' < qc_ids_1.txt)"
+          cp canon_tiny.qc canon_bad.qc
+          printf 'X' | dd of=canon_bad.qc bs=1 seek=40 conv=notrunc 2>/dev/null   # a name in the table
+          if QWEN_DENSE_CACHE=canon_bad.qc SNAP=qwen36_tiny_c ./qwen36 2 8 qwen36_tiny/ref_full.json > qc_bad.log 2>&1; then
+            echo "FAIL: a damaged file named by QWEN_DENSE_CACHE was accepted"; cat qc_bad.log; exit 1
+          fi
+          grep -q "has a different matrix table" qc_bad.log || { echo "FAIL: refused, but not for the damage"; cat qc_bad.log; exit 1; }
+          cp -r qwen36_tiny_c qwen36_tiny_qc && cp canon_bad.qc qwen36_tiny_qc/canonical.qc
+          SNAP=qwen36_tiny_qc DUMP=qc_logits_2.f32 ./qwen36 2 8 qwen36_tiny/ref_full.json > qc_2.log 2>&1 || true
+          grep -q "converting the matrices at start instead" qc_2.log || { echo "FAIL: the damaged file beside the model was not set aside"; cat qc_2.log; exit 1; }
+          cmp qc_logits_0.f32 qc_logits_2.f32 || { echo "FAIL: logits differ after the file was set aside"; exit 1; }
       - name: Expert kernel A/B on an int4 gs64 fixture (old path vs expert_ffn.h, byte-identical ids)
         run: |
           cd c
@@ -956,6 +1095,12 @@ jobs:
           python3 tools/make_qwen36_tiny.py --out qwen36_tiny64 --ref-mode full --inter 64 \
                   --emit-ref qwen36_tiny64/ref_full.json
           python3 tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_c --ebits 4 --gs 64
+          make tests/test_qwen36_prefill_control
+          for dense in 0 1; do
+            for cap in 1 8; do
+              COLI_DENSE_I8=$dense QWEN36_TINY=qwen36_tiny64_c ./tests/test_qwen36_prefill_control $cap
+            done
+          done
           for cap in 1 2 8 16; do
             for k in 0 1; do
               QWEN_EXPERT_KERNEL=$k COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c DUMP=logits_${cap}_$k.f32 \
@@ -976,6 +1121,13 @@ jobs:
             echo "kernel=$k: identical logits at cap 1/2/8/16"
           done
           make tests/test_expert_ffn && ./tests/test_expert_ffn
+          # The same kernel under the CUDA expert tier (fake backend, #2090): below
+          # (2), at (8) and above (16) the fixture's 8 experts, the last logits
+          # equal the CPU build's above.
+          make tests/test_qwen36_tier_stream_engine
+          for cap in 2 8 16; do
+            ./tests/test_qwen36_tier_stream_engine $cap qwen36_tiny64_c logits_${cap}_1.f32 qwen36_tiny64/ref_full.json
+          done
       - name: Mixed expert layout (int4 gs64 gate/up, int8 down) loads and is cap-independent
         run: |
           cd c
@@ -998,9 +1150,10 @@ jobs:
           done
           cmp mixed_ids_1.txt mixed_ids_8.txt && cmp mixed_ids_2.txt mixed_ids_8.txt || { echo "FAIL: ids differ across caps"; cat mixed_ids_*.txt; exit 1; }
           echo "mixed layout: identical ids at cap 1/2/8 ($(cat mixed_ids_8.txt))"
-          # COLI_CUDA=1 on a mixed container is refused with a line, the CPU path stands
+          # COLI_CUDA=1 on a mixed container says with a line that the routed experts
+          # stay on the CPU (a CUDA build still places the dense trunk, #2090)
           COLI_CUDA=1 COLI_DENSE_I8=0 SNAP=qwen36_tiny64_d8 ./qwen36 8 4 qwen36_tiny64/ref_full.json > mixed_cuda.log 2>&1 || true
-          grep -q "COLI_CUDA=1 ignored: the VRAM expert tier does not take the mixed layout" mixed_cuda.log || { echo "FAIL: tier refusal line missing"; cat mixed_cuda.log; exit 1; }
+          grep -q "COLI_CUDA=1: the VRAM expert tier does not take the mixed layout" mixed_cuda.log || { echo "FAIL: the line for the mixed layout under COLI_CUDA=1 is missing"; cat mixed_cuda.log; exit 1; }
       - name: Pinned experts and PILOT prefetch never change the logits (int4 gs64 fixture)
         run: |
           cd c
@@ -1243,6 +1396,8 @@ jobs:
           # a prefix holding generated positions, which attend differently from
           # prefilled ones by the vendor's own design. The override says so.
           DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_prefix_serve
+          DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_prefill_tail
+          DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_dspark_gate
       - name: "A prompt longer than one block, so the block boundary is crossed"
         run: |
           cd c
@@ -1324,7 +1479,7 @@ jobs:
       - name: Generate the upstream text fixture and run the token-and-logit oracle
         run: make -C c qwen38-tiny-check
       - name: Routed experts as the release ships them (FP8 shards), then the engine on the fake CUDA tier
-        run: make -C c qwen38-tiny-fp8-check qwen38-tier-engine-check qwen38-dn-gpu-check
+        run: make -C c qwen38-tiny-fp8-check qwen38-tier-engine-check qwen38-dn-gpu-check qwen38-cuda-chain-check
       - name: Routed experts as int4-g64 from the converter's sidecar
         run: make -C c qwen38-tiny-int4-check
       - name: MTP speculative decoding against plain decoding (lossless gate)
@@ -1373,9 +1528,10 @@ jobs:
           # the oracle fixture has no tokenizer; serve mode needs one
           python3 tools/make_edge_tiny_tokenizer.py --vocab-size "$(python3 -c 'import json;print(json.load(open("qwen38_tiny/config.json"))["vocab_size"])')" qwen38_tiny
           make qwen38 >/dev/null
-          QWEN38_TINY=qwen38_tiny python3 -m unittest -v tests.test_qwen38_dashboard tests.test_qwen38_brio
+          QWEN38_TINY=qwen38_tiny python3 -m unittest -v tests.test_qwen38_dashboard tests.test_qwen38_brio \
+            tests.test_qwen38_prefix_serve
           python3 tools/make_edge_tiny_tokenizer.py --vocab-size 64 qwen38_tiny_fp8
-          QWEN38_TINY=qwen38_tiny_fp8 python3 -m unittest -v tests.test_qwen38_brio
+          QWEN38_TINY=qwen38_tiny_fp8 python3 -m unittest -v tests.test_qwen38_brio tests.test_qwen38_prefix_serve
 
   laya-tiny-check:
     name: Laya tiny oracle (vs the laya package) and POST /v1/systemone end to end
@@ -1466,6 +1622,10 @@ jobs:
           cd c
           python3 tools/make_qwenimage_vae_tiny.py qwenimage_vae_tiny
           tests/test_qwenimage_vae qwenimage_vae_tiny
+      - name: Single-frame VAE encoder against diffusers, normal and ASan/UBSan
+        run: |
+          make -C c qwenimage-encoder-check
+          python3 c/tools/check_qwenimage_encoder.py --sanitizers
       - name: The shipping defaults (int8 weights) end to end, and the serve protocol
         run: |
           cd c
@@ -1562,6 +1722,16 @@ jobs:
           cd c
           gcc -O3 -march=native -fopenmp -I. tests/test_int_kernel_exact.c -o /tmp/tike -lm
           /tmp/tike
+          # GGUF rows eight at a time: the runner's own ISA, and the release builds' (no VNNI)
+          gcc -O3 -march=native -fopenmp -I. tests/test_rows_f8.c -o /tmp/trf8 -lm
+          /tmp/trf8
+          gcc -O3 -march=x86-64-v3 -fopenmp -I. tests/test_rows_f8.c -o /tmp/trf8v3 -lm
+          /tmp/trf8v3
+          # a prompt's rows of the grid types, 16 file rows unpacked once: the same two ISAs
+          gcc -O3 -march=native -fopenmp -I. tests/test_tile16.c -o /tmp/tt16 -lm
+          /tmp/tt16
+          gcc -O3 -march=x86-64-v3 -fopenmp -I. tests/test_tile16.c -o /tmp/tt16v3 -lm
+          /tmp/tt16v3
       - name: Generate the glm_tiny fixture
         run: cd c && python3 tools/make_glm_oracle.py
       - name: Oracle (30–32/32 teacher forcing + exact greedy)
@@ -1571,8 +1741,84 @@ jobs:
           cd c
           SNAP=./glm_tiny TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=2 ./colibri 64 16 16
           SNAP=./glm_tiny COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 64 16 16
+          # the latent KV cache in float16, as a serve keeps it (an oracle run keeps float32 unless KV16 says)
+          KV16=1 SNAP=./glm_tiny TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=2 ./colibri 64 16 16 > kv16.log 2>&1 || { cat kv16.log; exit 1; }
+          cat kv16.log
+          grep -q "latent KV cache in float16" kv16.log && ! grep -q "oracle run keeps" kv16.log
+      - name: Mistral-Large-4 tiny oracle (tools/make_mistral_large4_tiny.py)
+        # NoPE and shared-KV layers, full and shared indexers with the selection active, YaRN
+        # over the learned alpha, SSMax, the softmax router and the softcap, through the GGUF
+        # import, against a float32 transcription of the release's code; the KV in float16 too
+        run: |
+          cd c
+          python3 tools/make_mistral_large4_tiny.py --out /tmp/ml4 --emit-ref /tmp/ml4/ref.json
+          python3 tools/gguf_import.py /tmp/ml4/model.gguf /tmp/ml4/coli
+          SNAP=/tmp/ml4/coli REF=/tmp/ml4/ref.json COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 8 16 16
+          SNAP=/tmp/ml4/coli REF=/tmp/ml4/ref.json TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 8 16 16
+          KV16=1 SNAP=/tmp/ml4/coli REF=/tmp/ml4/ref.json TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 8 16 16
+          # Mistral's FP8 release (its own names, qscale_weight per 128 x 128 block) through
+          # convert_fp8_to_int4.py at 8 bits: teacher forcing within the oracle's allowance (int8
+          # per row is coarser than the reference's float32; the attention dense here, where the
+          # tiny model's tied index scores would turn that noise into another selection)
+          python3 tools/make_mistral_large4_tiny.py --out /tmp/ml4f --emit-ref /tmp/ml4f/ref.json \
+            --fp8-checkpoint /tmp/ml4f/fp8 --min-gap 0.15 --max-new 8 --override '{"index_topk": 64}'
+          # its vision tower in the release's names (a shard of its own here): the converter writes
+          # it as the container's mmproj.gguf, the published file's tensors, which serve mode loads
+          python3 tools/make_mistral_vision_tiny.py --out /tmp/ml4fv --out-hidden 64 --release /tmp/ml4f/fp8
+          python3 tools/convert_fp8_to_int4.py --indir /tmp/ml4f/fp8 --outdir /tmp/ml4f/coli --ebits 8 --xbits 8 --io-bits 8 --n-layers 8
+          SNAP=/tmp/ml4f/coli REF=/tmp/ml4f/ref.json TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=2 ./colibri 8 16 16
+          python3 tools/make_mistral_vision_tiny.py --out /tmp/ml4fv --same-as /tmp/ml4f/coli/mmproj.gguf
+          served=$(SERVE=1 SNAP=/tmp/ml4f/coli ./colibri 8 < /dev/null 2>&1 || true)
+          echo "$served" | grep "vision tower (mmproj): 2 layers"
+          # The published GGUFs' types, layer by layer as their headers have them (MIXES): these
+          # six hold all fourteen (BF16, Q8_0, Q3_K-Q6_K, IQ1_S, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_XS
+          # beside F32). The float path (GQ_EXACT=1) against the reference on the blocks' own
+          # values; the integer kernels against the reference that rounds their inputs to int8
+          # as they do (teacher forcing, an allowance: a sum in another order can round one
+          # code the other way on another CPU, and this small model amplifies it)
+          make tests/test_ggml_quants
+          for q in BF16 UD-IQ1_M UD-IQ2_XXS UD-IQ3_XXS UD-Q3_K_XL UD-Q5_K_XL; do
+            python3 tools/make_mistral_large4_tiny.py --out /tmp/ml4q/$q --emit-ref /tmp/ml4q/$q/ref.json --quant $q
+            python3 tools/gguf_import.py /tmp/ml4q/$q/model.gguf /tmp/ml4q/$q/coli
+            GQ_EXACT=1 SNAP=/tmp/ml4q/$q/coli REF=/tmp/ml4q/$q/ref.json COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 8 16 16
+            GQ_EXACT=1 SNAP=/tmp/ml4q/$q/coli REF=/tmp/ml4q/$q/ref.json TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 8 16 16
+          done
+          python3 tools/make_mistral_large4_tiny.py --out /tmp/ml4a --emit-ref /tmp/ml4a/ref.json --quant UD-IQ1_S --act-q8
+          python3 tools/gguf_import.py /tmp/ml4a/model.gguf /tmp/ml4a/coli
+          SNAP=/tmp/ml4a/coli REF=/tmp/ml4a/ref.json TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=3 ./colibri 8 16 16
+      - name: Mistral-Large-4 vision tower (mistral_vision.h against tools/mistral_vision_ref.py)
+        run: |
+          cd c
+          # a tiny mmproj in the published layout (BF16, q and k permuted for an interleaved
+          # rotation): the engine's rows within 1e-4 of the numpy reference's; the same tower in
+          # the release's names through tools/ml4_mmproj.py gives that file tensor for tensor
+          make mistral-vision-check
       - name: Oracle allowance and failure regressions
-        run: cd c && python3 tests/test_glm_oracle.py
+        run: |
+          cd c
+          python3 tests/test_glm_oracle.py
+          # Reuse the generated fixture: discovery without this variable skips
+          # every serving context-refusal regression.
+          COLI_ORACLE_FIXTURE="$PWD/glm_tiny" python3 -m unittest -v tests.test_run_serve_context_exceeded
+          # a CANCEL sent while a served prompt is read stops the reading (prompt_break.h)
+          COLI_ORACLE_FIXTURE="$PWD/glm_tiny" python3 -m unittest -v tests.test_glm_prompt_cancel
+          # /v1/systemone on colibri.c: answered, and a header it cannot read answered by its id
+          COLI_ORACLE_FIXTURE="$PWD/glm_tiny" python3 -m unittest -v tests.test_glm_systemone
+          # a short request between two turns keeps the one slot's conversation (park.h)
+          COLI_ORACLE_FIXTURE="$PWD/glm_tiny" python3 -m unittest -v tests.test_glm_park
+      - name: The MTP head under the draft gate (docs/speculative.md)
+        # Greedy stays exact whatever the gate picks (a draft is only ever verified),
+        # with the gate deciding from measured times and with every draft carried.
+        run: |
+          cd c
+          python3 tools/make_glm_mtp_tiny.py --src glm_tiny --out glm_tiny_mtp
+          cp ref_glm.json glm_tiny_mtp/
+          # MTP_PSTEP=1: the depth from each step's drafts' probabilities too, not the averages only
+          for g in COLI_SPEC_GATE=1 COLI_SPEC_GATE=0 "COLI_SPEC_GATE=1 MTP_PSTEP=1"; do
+            for d in 1 2; do
+              env $g SNAP=./glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json COLI_TEMP=0 ORACLE_STRICT=1 DRAFT=$d ./colibri 64 16 16
+            done
+          done
       - name: Structural efficiency tests
         # test_cpu_vs_cpu_tok_s_stability is NOT in this list: it is a tok/s
         # bound (two runs within 25%) over a ~15 ms tiny replay -- it measured
@@ -1643,6 +1889,36 @@ jobs:
         run: cd c && python3 tools/make_glm_oracle.py --fmt6 && python3 tools/make_glm_oracle.py --fmt4
       - name: Cluster parity gate (token-exact)
         run: cd c && python3 -m unittest -v tests.test_cluster_sharding
+
+  # The same gate for deepseek_v41.c (c/tests/test_dsv41_cluster_sharding.py).
+  # The engine carries the COLIEX01 protocol separately, so it is pinned
+  # separately: a dsv41 coordinator against a dsv41 worker, on the tiny
+  # container dsv41-tiny-check builds, at cap=1 and cap=8. The fixture is
+  # gitignored for the same reason as above, so this job regenerates it; the
+  # test skips cleanly without it, which is exactly the dormancy to avoid.
+  # Same socket safety: the worker binds a 127.0.0.1 port from bind-to-0.
+  dsv41-cluster-parity:
+    name: DeepSeek V4.1 cluster parity gate (token-exact)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/oracle-requirements.txt
+      - name: Install torch (CPU) + sympy + Pillow
+        run: |
+          pip install -r c/tools/oracle-requirements.txt
+          pip install sympy pillow
+      - name: Build deepseek_v41 and its wire-contract test
+        run: make -C c deepseek_v41 tests/test_dsv41_cluster_protocol
+      - name: Wire contract (socketpair, no fixture)
+        run: c/tests/test_dsv41_cluster_protocol
+      - name: Tiny V4.1-shaped container and its reference
+        run: cd c && python3 tools/make_dsv41_tiny.py --out dsv41_tiny --emit-ref dsv41_tiny/ref.json
+      - name: Cluster parity gate (token-exact)
+        run: cd c && python3 -m unittest -v tests.test_dsv41_cluster_sharding
 
   engine-hip-syntax:
     name: HIP syntax check
@@ -1724,7 +2000,10 @@ jobs:
           # *compile* backend_cuda.cu), cuda-dll links it, and on Windows the
           # runtime headers/import lib ship as a separate installer component —
           # with '["nvcc"]' alone this fails at `#include <cuda_runtime.h>`.
-          sub-packages: '["nvcc", "cudart"]'
+          # cuda_profiler_api and thrust (CCCL) for DeepSeek V4's DLLs: its
+          # backend includes cuda_profiler_api.h, and the DeepGEMM flavour's
+          # CUTLASS headers the CCCL ones; neither comes with nvcc or cudart.
+          sub-packages: '["nvcc", "cudart", "cuda_profiler_api", "thrust"]'
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: UCRT64
@@ -1738,10 +2017,10 @@ jobs:
             git
             mingw-w64-ucrt-x86_64-gcc
       # The DeepSeek V4 DeepGEMM flavour compiles against a pinned checkout
-      # that tools/fetch_deepgemm.sh makes on first use (nothing vendored).
-      # CI cannot compile it (sm_120a needs CUDA >= 12.8; this job pins 12.6)
-      # but it does exercise the fetch — pin verification + MSVC patch — and
-      # caches the tree keyed on the pin so a bump is the only cache miss.
+      # that tools/fetch_deepgemm.sh makes on first use (nothing vendored):
+      # the fetch -- pin verification + MSVC patch -- is cached on the pin, so
+      # a bump is the only cache miss, and the DLL is built further down
+      # (sm_120a needs CUDA >= 12.8, which this job pins).
       - name: DeepGEMM pin (for the cache key)
         id: deepgemm-pin
         shell: bash
@@ -1791,6 +2070,28 @@ jobs:
           make kimi_k3.exe CUDA_DLL=1
           test -f kimi_k3.exe || { echo "kimi_k3 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
           echo "kimi_k3.exe built against the DLL loader"
+      - name: make cuda-dsv4-dll and cuda-dsv4-dg-dll (DeepSeek V4, as the release ships them)
+        shell: msys2 {0}
+        run: |
+          cd c
+          # deepseek_v4.exe resolves its backend at run time (backend_loader_dsv4.c):
+          # coli_cuda_dsv4_dg.dll (DeepGEMM, sm_120a: RTX 50) first, else
+          # coli_cuda_dsv4.dll (portable: sm_80/86/89/90/120 + PTX). DSV4_TC=0
+          # leaves out the opt-in cuBLASLt path, so neither needs more than the
+          # cudart64_12.dll beside it and the driver (#2047).
+          make cuda-dsv4-dll CUDA_ARCH=portable DSV4_TC=0
+          make cuda-dsv4-dg-dll DSV4_TC=0
+          for d in coli_cuda_dsv4.dll coli_cuda_dsv4_dg.dll; do
+            test -f $d || { echo "$d: the target reported success but produced no DLL" >&2; exit 1; }
+            deps=$(objdump -p $d | sed -n 's/.*DLL Name: //p' | tr 'A-Z' 'a-z' | sort -u | tr '\n' ' ')
+            echo "$d imports: $deps"
+            for x in $deps; do
+              case "$x" in
+                cudart64_12.dll|nvcuda.dll|kernel32.dll|ucrtbase.dll|user32.dll|advapi32.dll|ws2_32.dll|shell32.dll|ole32.dll|vcruntime140*.dll|msvcp140*.dll|api-ms-win-*) ;;
+                *) echo "$d needs $x, which the Windows CUDA package does not carry" >&2; exit 1 ;;
+              esac
+            done
+          done
       - name: Collect the runtime the DLL links (cudart64_12.dll)
         shell: bash
         run: |
@@ -1807,6 +2108,8 @@ jobs:
           retention-days: 30
           path: |
             c/coli_cuda.dll
+            c/coli_cuda_dsv4.dll
+            c/coli_cuda_dsv4_dg.dll
             c/cudart64_*.dll
             c/colibri.exe
             c/qwen36.exe

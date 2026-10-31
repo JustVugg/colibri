@@ -1,0 +1,6 @@
+baseline-1 ttft=199.749 wall=253.658 text=Looking at this code, I can see that the `solve` function an
+trial-1 ttft=152.131 wall=205.069 text=Looking at this code, I can see it's a repeated pattern of t
+baseline-2 ttft=189.580 wall=241.744 text=Looking at this code, I can see that the `solve` function an
+trial-2 ttft=153.540 wall=206.365 text=Looking at this code, I can see it's a repeated pattern of t
+baseline-3 ttft=189.443 wall=242.225 text=Looking at this code, I can see that the `solve` function an
+trial-3 ttft=149.841 wall=202.067 text=Looking at this code, I can see it's a repeated pattern of t

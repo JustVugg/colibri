@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "hypothesis": "Writing the lm_head's 248320 logits in device memory and copying them to the host once, instead of storing a float a warp into mapped host memory, raises Qwen3.6's decode on an RTX PRO 4000 with every expert in VRAM, with the same logits",
+  "commit": "c1c06ac6fcb32157e4da130fd96775a32a757052",
+  "model": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64",
+  "command": "cd c && make qwen36_tier.o backend_cuda.o cuda_chain.o cu_xb.o cu_tier.o CUDA=1 CUDA_ARCH=sm_120 && gcc -O3 -march=native -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_CUDA -I. ../docs/experiments/qwen36-cuda-lmhead-device-2026-10-27/bench.c qwen36_tier.o backend_cuda.o cuda_chain.o cu_xb.o cu_tier.o -o qwen36-bench -lm -fopenmp -pthread -L/usr/local/cuda/lib64 -Wl,-rpath,/usr/local/cuda/lib64 -lcudart -lcublasLt -lcublas -lstdc++; LD_LIBRARY_PATH=/usr/local/cuda/lib64 COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close OMP_NUM_THREADS=10 ./qwen36-bench --model <model> --text <dir>/promessi_sposi.txt --lengths 64,512 --gen 32 --teacher --steps /workspace/m/normale/v1-runN.steps",
+  "prompt_hash": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "hardware": {
+    "cpu": "Intel(R) Core(TM) Ultra 9 285K (24 CPUs, 36 MiB L3) + NVIDIA RTX PRO 4000 Blackwell (24467 MiB, sm_120)",
+    "ram": "125 GiB",
+    "storage": "the model on the machine's local disk before the runs, then read once into the page cache",
+    "os": "Ubuntu 24.04.1 LTS, Linux 6.8.0-146-generic x86_64, CUDA 12.8 (nvcc V12.8.93), driver 615.71.09, gcc (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "prompt_tokens": 64,
+      "decode_steps": 32,
+      "engine_build": "c1c06ac6",
+      "OMP_NUM_THREADS": 10
+    },
+    "samples": {
+      "tok_s": [
+        74.738,
+        74.758,
+        74.661,
+        74.809
+      ],
+      "decode_tok_s_after_512": [
+        72.593,
+        72.783,
+        72.615,
+        72.501
+      ],
+      "prompt_tok_s_64": [
+        961.89,
+        1008.17,
+        1017.74,
+        1018.74
+      ],
+      "prompt_tok_s_512": [
+        2800.49,
+        2827.48,
+        2840.62,
+        2878.82
+      ]
+    },
+    "median_tok_s": 74.748,
+    "quality": {
+      "method": "make -C c check (macOS arm64) and make -C c cuda-chain-check cuda-test CUDA=1 CUDA_ARCH=sm_120 pass; every run of both versions gives the same fingerprint of every logit and token (FNV-1a: 01f80ce3d69b39fd at 64 tokens, 4d9728e495c7aba9 at 512) and the same teacher-forced nll (2.69932 and 2.95291)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-lmhead-device-2026-10-27/pro4000-normal.txt",
+      "sha256": "0864015aabf4ce846ef92a52dc852dcab97454746cb1762f2bad7efcd813b3f9"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "prompt_tokens": 64,
+      "decode_steps": 32,
+      "engine_build": "c1c06ac6 + this change",
+      "OMP_NUM_THREADS": 10
+    },
+    "samples": {
+      "tok_s": [
+        145.091,
+        145.037,
+        144.954,
+        145.226
+      ],
+      "decode_tok_s_after_512": [
+        142.711,
+        142.508,
+        142.649,
+        141.037
+      ],
+      "prompt_tok_s_64": [
+        1116.63,
+        1115.36,
+        1127.68,
+        1134.84
+      ],
+      "prompt_tok_s_512": [
+        2916.53,
+        2942.43,
+        2953.18,
+        2955.53
+      ]
+    },
+    "median_tok_s": 145.064,
+    "quality": {
+      "method": "make -C c check (macOS arm64) and make -C c cuda-chain-check cuda-test CUDA=1 CUDA_ARCH=sm_120 pass; every run of both versions gives the same fingerprint of every logit and token (FNV-1a: 01f80ce3d69b39fd at 64 tokens, 4d9728e495c7aba9 at 512) and the same teacher-forced nll (2.69932 and 2.95291)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-lmhead-device-2026-10-27/pro4000-normal.txt",
+      "sha256": "0864015aabf4ce846ef92a52dc852dcab97454746cb1762f2bad7efcd813b3f9"
+    }
+  },
+  "outcome": "improvement"
+}

@@ -20,7 +20,7 @@ _INT32_MAX = 2**31 - 1
 _UINT_TEXT = r"(?:0|[1-9][0-9]*)"
 _FIXED2_TEXT = r"(?:0|[1-9][0-9]*)\.[0-9]{2}"
 IDOT_KERNELS = (
-    "avx512-vnni", "avx-vnni", "avx2", "neon-i8mm", "neon", "vsx",
+    "avx512-vnni", "avx-vnni", "avx2", "ssse3", "neon-i8mm", "neon", "vsx",
     "scalar",
 )
 

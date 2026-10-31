@@ -56,8 +56,10 @@ def clef_ready():
 
 
 def engine_env(**extra):
+    # Q36_KV=f32: ref.json was computed in float32, and a serve keeps the KV cache in float16
+    # (a few 1e-5 in a logit, past this tolerance on some devices)
     return dict(os.environ, SNAP=str(CONTAINER), COLI_DENSE_I8="0", OMP_NUM_THREADS="2",
-                COLI_NO_OMP_TUNE="1", **extra)
+                COLI_NO_OMP_TUNE="1", Q36_KV="f32", **extra)
 
 
 def run_engine(**extra):

@@ -37,6 +37,10 @@ bench = [
     "tokenizers",
     "datasets",
 ]
+vision = [   # pictures through the gateway (the towers' preprocessors)
+    "numpy",
+    "pillow",
+]
 
 [project.scripts]
 coli = "colibri.cli:main"

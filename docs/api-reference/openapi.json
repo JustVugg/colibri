@@ -156,13 +156,18 @@
       "get": {
         "tags": ["Operations"],
         "summary": "Check server health",
-        "description": "Always returns liveness. Authenticated requests also receive scheduler, KV-slot, tier, and hardware details when available.",
+        "description": "Returns 200 while the engine runs, 503 while it is down. Authenticated requests also receive scheduler, KV-slot, engine-restart, tier, and hardware details when available.",
         "operationId": "getHealth",
         "security": [{}, { "bearerAuth": [] }, { "apiKeyAuth": [] }],
         "responses": {
           "200": {
             "description": "Server health",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Health" } } }
+          },
+          "503": {
+            "description": "The engine stopped. `restarting`: coli serve is starting it again, and requests wait in the queue for it; `engine_down`: nothing is starting it (an embedded server).",
+            "headers": { "Retry-After": { "schema": { "type": "string" } } },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EngineDown" } } }
           }
         }
       }
@@ -252,6 +257,7 @@
           "reasoning_effort": { "type": "string" },
           "enable_thinking": { "type": "boolean", "description": "colibrì extension for model reasoning output." },
           "cache_slot": { "type": "integer", "minimum": 0, "maximum": 15, "description": "colibrì extension selecting an isolated KV context." },
+          "context_compaction": { "type": "string", "enum": ["auto", "off"], "description": "colibrì extension: auto summarizes the conversation's first messages when it outgrows the context, instead of answering context_length_exceeded." },
           "x_colibri_ignore_leading_stop": { "type": "boolean", "description": "Ignore leading stop markers until non-whitespace output begins." }
         }
       },
@@ -306,7 +312,15 @@
           "created": { "type": "integer" },
           "model": { "type": "string" },
           "choices": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
-          "usage": { "$ref": "#/components/schemas/Usage" }
+          "usage": { "$ref": "#/components/schemas/Usage" },
+          "compaction": {
+            "type": "object",
+            "description": "colibrì extension, present when the turn ran on a summary of the conversation's first messages (context_compaction).",
+            "properties": {
+              "summarized_messages": { "type": "integer" },
+              "summary": { "type": "string" }
+            }
+          }
         }
       },
       "Completion": {
@@ -355,8 +369,16 @@
           "status": { "type": "string", "const": "ok" },
           "scheduler": { "type": "object", "additionalProperties": true },
           "kv_slots": { "type": "integer" },
+          "engine_restarts": { "type": "integer" },
           "tiers": { "type": "object", "additionalProperties": true },
           "hwinfo": { "type": "object", "additionalProperties": true }
+        }
+      },
+      "EngineDown": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "type": "string", "enum": ["restarting", "engine_down"] }
         }
       },
       "Experts": {

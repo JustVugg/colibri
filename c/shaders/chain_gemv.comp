@@ -14,15 +14,33 @@
 // too (the backend zeroes it), so the steps carry no bounds checks.
 // A row is spread over lpr lanes (a power of two up to the subgroup, from the host:
 // about eight steps per lane), so a subgroup works on subgroup/lpr rows at once and
-// a short row does not leave most of its steps to the per-row reduction.
+// a short row does not leave most of its steps to the per-row reduction. lpr 0: one row a
+// workgroup, every lane on it, for the few long rows that would leave the device short of
+// workgroups (a decode's router of 512 x 2560 floats, a 4 x 10240 bf16 mixer: 11 -> 4 us
+// on an RTX PRO 4000), the sums joined across the subgroups in shared memory.
 // The host takes this shader only when a row is a whole number of 16-byte steps
-// (rowWords % 4 == 0), I % 4 == 0, and the padded row fits the staging array (XS
-// vec4s, a specialization constant from the device's shared-memory limit).
+// (rowWords % 4 == 0) and I % 4 == 0. The padded row is staged when it fits the staging
+// array (XS vec4s, a specialization constant from the device's shared-memory limit); a
+// longer one (XG 1: a dense FFN's down projection, 17408 inputs on a 27B) reads x from its
+// buffer, where every workgroup's reads of the same row stay in the caches. Such a row used
+// to go to qmatmul.comp's GEMV: on an RTX PRO 4000, int4 5120 x 17408 146 -> 190 GB/s of
+// weights, int8 314 -> 370; with every row of Qwen3.6's decode read so, the token is as fast
+// as staged (67.5 against 67.4 tok/s).
+// NR (constant_id 2) rows of x at most share a workgroup and every weight load, a vec4 of
+// sums with a component a row: the pipeline with NR 4 takes a speculative verify's rows
+// (nr of them, from the host), the one with NR 1 a decode step's, as before (a runtime row
+// count in the decode's pipeline cost a 512 x 2048 int8 matrix 6 -> 9 us). Each row's sums
+// are the same operations in the same order in both, so its bits are a decode step's
+// (tests/test_vk_chain checks it per format): before, a verify's rows were a workgroup
+// each and read every weight once a row (an RTX PRO 4000, int8 8192 x 2048: 46 us for one
+// row, 63 / 81 / 107 for two, three, four).
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_EXT_control_flow_attributes : require
 layout(local_size_x = 256) in;
 layout(constant_id = 0) const int XS = 2048;
+layout(constant_id = 1) const int XG = 0;    // 1: x read from its buffer, not staged
+layout(constant_id = 2) const int NR = 1;    // rows of x a workgroup may take
 
 layout(std430, binding = 0) readonly buffer X4 { vec4 x4[]; };
 layout(std430, binding = 1) readonly buffer W4 { uvec4 w4[]; };
@@ -32,73 +50,131 @@ layout(std430, binding = 3) writeonly buffer Y { float y[]; };
 layout(push_constant) uniform P {
     int fmt, S, I, O, rowWords, gs;
     int lpr;            // lanes per row, a power of two
+    int nr;             // rows of x a workgroup takes (1 to NR), each staged at g_xr vec4s
 } p;
 
 shared vec4 xs[XS];
+// vec4 k of the staged row sits at k + k / 8 (a pad after every 8): a lane's 16-byte step
+// reads 2, 4 or 8 consecutive vec4s and the next lane's start that far on, which without
+// the pad put the lanes of a phase on the same banks of shared memory
+int xi(int k) { return k + (k >> 3); }
+int g_xb, g_i4, g_xr;   // the first row's first vec4 of x, a row's vec4s, a staged row's
+// vec4 k of the workgroup's row r: staged, or (XG) from its buffer, zero past I as the staging is
+vec4 XV(int r, int k) { return XG != 0 ? (k < g_i4 ? x4[g_xb + r * g_i4 + k] : vec4(0.0)) : xs[r * g_xr + xi(k)]; }
+shared vec4 part[32];   // lpr 0: each subgroup's sums
 
 float sb(uint w, int off) { return float(bitfieldExtract(int(w), off, 8)); }      // signed byte
 float nb(uint w, int off) { return float(bitfieldExtract(w, off, 4)) - 8.0; }      // nibble - 8
 vec2 bf(uint w) { return vec2(uintBitsToFloat(w << 16), uintBitsToFloat(w & 0xffff0000u)); }
 
-void main() {
-    int s = int(gl_WorkGroupID.y);
-    int tid = int(gl_LocalInvocationID.x);
-    int nq = p.rowWords / 4;                            // uvec4 steps per row
-    int per = p.fmt == 1 ? 16 : p.fmt == 4 ? 32 : p.fmt == 11 || p.fmt == 14 ? 8 : 4;   // values per step
-    int nx4 = nq * per / 4, i4 = p.I / 4;              // padded x length in vec4s
-    for (int k = tid; k < nx4; k += 256) xs[k] = k < i4 ? x4[s * i4 + k] : vec4(0.0);
-    barrier();
-    int sg = int(gl_SubgroupID), sgs = int(gl_SubgroupSize);
-    int lpr = min(p.lpr, sgs), rps = sgs / lpr;
-    int sub = int(gl_SubgroupInvocationID) / lpr, lane = int(gl_SubgroupInvocationID) % lpr;
-    int nsg = 256 / sgs, stride = int(gl_NumWorkGroups.x) * nsg * rps;
-    int ng = p.gs > 0 ? (p.I + p.gs - 1) / p.gs : 1;
-    for (int o0 = (int(gl_WorkGroupID.x) * nsg + sg) * rps; o0 < p.O; o0 += stride) {
-        int o = o0 + sub;
-        bool live = o < p.O;
-        int rb = o * nq, nql = live ? nq : 0;
-        float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
-        if (p.fmt == 1) {
-            for (int q = lane; q < nql; q += lpr) {
-                uvec4 w = w4[rb + q]; int xb = q * 4;
-                vec4 x0 = xs[xb], x1 = xs[xb + 1], x2 = xs[xb + 2], x3 = xs[xb + 3];
-                a0 += x0.x * sb(w.x, 0) + x0.y * sb(w.x, 8) + x0.z * sb(w.x, 16) + x0.w * sb(w.x, 24);
-                a1 += x1.x * sb(w.y, 0) + x1.y * sb(w.y, 8) + x1.z * sb(w.y, 16) + x1.w * sb(w.y, 24);
-                a2 += x2.x * sb(w.z, 0) + x2.y * sb(w.z, 8) + x2.z * sb(w.z, 16) + x2.w * sb(w.z, 24);
-                a3 += x3.x * sb(w.w, 0) + x3.y * sb(w.w, 8) + x3.z * sb(w.w, 16) + x3.w * sb(w.w, 24);
+// row o's steps q0, q0 + qs, ... below nq: the lane's part of its dot with each of the
+// workgroup's nrow rows of x, component r for row r
+vec4 rowpart(int o, int nq, int q0, int qs, int nrow) {
+    int rb = o * nq, ng = p.gs > 0 ? (p.I + p.gs - 1) / p.gs : 1;
+    vec4 a0 = vec4(0.0), a1 = vec4(0.0), a2 = vec4(0.0), a3 = vec4(0.0);
+    if (p.fmt == 1) {
+        // four steps' loads issued before the first is used: a loop that loads one step and
+        // sums it waits for every load in turn (an RTX 3070, int8 8192 x 2048: 81 -> 48 us a
+        // matrix in the bench); the sums go into the same accumulators in the same order, so
+        // a row's bits are the loop's
+        for (int q = q0; q < nq; q += 4 * qs) {
+            uvec4 wv0 = w4[rb + q];
+            uvec4 wv1 = q + qs < nq ? w4[rb + q + qs] : uvec4(0u);
+            uvec4 wv2 = q + 2 * qs < nq ? w4[rb + q + 2 * qs] : uvec4(0u);
+            uvec4 wv3 = q + 3 * qs < nq ? w4[rb + q + 3 * qs] : uvec4(0u);
+            [[unroll]] for (int t = 0; t < 4; t++) {
+                int qq = q + t * qs;
+                if (qq >= nq) break;
+                uvec4 w = t == 0 ? wv0 : t == 1 ? wv1 : t == 2 ? wv2 : wv3; int xb = qq * 4;
+                [[unroll]] for (int r = 0; r < NR; r++) if (r < nrow) {
+                    vec4 x0 = XV(r, xb), x1 = XV(r, xb + 1), x2 = XV(r, xb + 2), x3 = XV(r, xb + 3);
+                    a0[r] += x0.x * sb(w.x, 0) + x0.y * sb(w.x, 8) + x0.z * sb(w.x, 16) + x0.w * sb(w.x, 24);
+                    a1[r] += x1.x * sb(w.y, 0) + x1.y * sb(w.y, 8) + x1.z * sb(w.y, 16) + x1.w * sb(w.y, 24);
+                    a2[r] += x2.x * sb(w.z, 0) + x2.y * sb(w.z, 8) + x2.z * sb(w.z, 16) + x2.w * sb(w.z, 24);
+                    a3[r] += x3.x * sb(w.w, 0) + x3.y * sb(w.w, 8) + x3.z * sb(w.w, 16) + x3.w * sb(w.w, 24);
+                }
             }
-        } else if (p.fmt == 4) {
-            for (int q = lane; q < nql; q += lpr) {
-                uvec4 w = w4[rb + q]; int xb = q * 8;
-                float sc = scale[o * ng + (q * 32) / p.gs];
+        }
+    } else if (p.fmt == 4) {
+        for (int q = q0; q < nq; q += qs) {
+            uvec4 w = w4[rb + q]; int xb = q * 8;
+            float sc = scale[o * ng + (q * 32) / p.gs];
+            [[unroll]] for (int r = 0; r < NR; r++) if (r < nrow) {
                 float t0 = 0.0, t1 = 0.0, t2 = 0.0, t3 = 0.0;
                 [[unroll]] for (int k = 0; k < 2; k++) {
-                    vec4 xa = xs[xb + k], xc = xs[xb + 2 + k], xe = xs[xb + 4 + k], xg = xs[xb + 6 + k];
+                    vec4 xa = XV(r, xb + k), xc = XV(r, xb + 2 + k), xe = XV(r, xb + 4 + k), xg = XV(r, xb + 6 + k);
                     int sh = k * 16;
                     t0 += xa.x * nb(w.x, sh) + xa.y * nb(w.x, sh + 4) + xa.z * nb(w.x, sh + 8) + xa.w * nb(w.x, sh + 12);
                     t1 += xc.x * nb(w.y, sh) + xc.y * nb(w.y, sh + 4) + xc.z * nb(w.y, sh + 8) + xc.w * nb(w.y, sh + 12);
                     t2 += xe.x * nb(w.z, sh) + xe.y * nb(w.z, sh + 4) + xe.z * nb(w.z, sh + 8) + xe.w * nb(w.z, sh + 12);
                     t3 += xg.x * nb(w.w, sh) + xg.y * nb(w.w, sh + 4) + xg.z * nb(w.w, sh + 8) + xg.w * nb(w.w, sh + 12);
                 }
-                a0 += (t0 + t1 + t2 + t3) * sc;
+                a0[r] += (t0 + t1 + t2 + t3) * sc;
             }
-        } else if (p.fmt == 11 || p.fmt == 14) {
-            for (int q = lane; q < nql; q += lpr) {
-                uvec4 w = w4[rb + q]; int xb = q * 2;
-                vec4 x0 = xs[xb], x1 = xs[xb + 1];
-                vec2 b0, b1, b2, b3;
-                if (p.fmt == 11) { b0 = bf(w.x); b1 = bf(w.y); b2 = bf(w.z); b3 = bf(w.w); }
-                else { b0 = unpackHalf2x16(w.x); b1 = unpackHalf2x16(w.y); b2 = unpackHalf2x16(w.z); b3 = unpackHalf2x16(w.w); }
-                a0 += x0.x * b0.x + x0.y * b0.y;
-                a1 += x0.z * b1.x + x0.w * b1.y;
-                a2 += x1.x * b2.x + x1.y * b2.y;
-                a3 += x1.z * b3.x + x1.w * b3.y;
-            }
-        } else {
-            for (int q = lane; q < nql; q += lpr) a0 += dot(xs[q], uintBitsToFloat(w4[rb + q]));
         }
-        float tot = (a0 + a1) + (a2 + a3);
-        for (int off = lpr / 2; off > 0; off >>= 1) tot += subgroupShuffleXor(tot, uint(off));
-        if (lane == 0 && live) y[s * p.O + o] = p.fmt == 1 ? tot * scale[o] : tot;
+    } else if (p.fmt == 11 || p.fmt == 14) {
+        for (int q = q0; q < nq; q += qs) {
+            uvec4 w = w4[rb + q]; int xb = q * 2;
+            vec2 b0, b1, b2, b3;
+            if (p.fmt == 11) { b0 = bf(w.x); b1 = bf(w.y); b2 = bf(w.z); b3 = bf(w.w); }
+            else { b0 = unpackHalf2x16(w.x); b1 = unpackHalf2x16(w.y); b2 = unpackHalf2x16(w.z); b3 = unpackHalf2x16(w.w); }
+            [[unroll]] for (int r = 0; r < NR; r++) if (r < nrow) {
+                vec4 x0 = XV(r, xb), x1 = XV(r, xb + 1);
+                a0[r] += x0.x * b0.x + x0.y * b0.y;
+                a1[r] += x0.z * b1.x + x0.w * b1.y;
+                a2[r] += x1.x * b2.x + x1.y * b2.y;
+                a3[r] += x1.z * b3.x + x1.w * b3.y;
+            }
+        }
+    } else {
+        for (int q = q0; q < nq; q += qs) {
+            vec4 wf = uintBitsToFloat(w4[rb + q]);
+            [[unroll]] for (int r = 0; r < NR; r++) if (r < nrow) a0[r] += dot(XV(r, q), wf);
+        }
+    }
+    return (a0 + a1) + (a2 + a3);
+}
+
+void main() {
+    /* NR 1 (a decode step): one row of x, every count below a constant, the sums scalar */
+    int nr = NR == 1 ? 1 : clamp(p.nr, 1, NR), s0 = int(gl_WorkGroupID.y) * nr;
+    int nrow = NR == 1 ? 1 : min(nr, p.S - s0);
+    int tid = int(gl_LocalInvocationID.x);
+    int nq = p.rowWords / 4;                            // uvec4 steps per row
+    int per = p.fmt == 1 ? 16 : p.fmt == 4 ? 32 : p.fmt == 11 || p.fmt == 14 ? 8 : 4;   // values per step
+    int nx4 = nq * per / 4, i4 = p.I / 4;              // padded x length in vec4s
+    g_xb = s0 * i4; g_i4 = i4; g_xr = nx4 + nx4 / 8 + 1;
+    if (XG == 0) {
+        for (int r = 0; r < nrow; r++)
+            for (int k = tid; k < nx4; k += 256) xs[r * g_xr + xi(k)] = k < i4 ? x4[(s0 + r) * i4 + k] : vec4(0.0);
+        barrier();
+    }
+    int sg = int(gl_SubgroupID), sgs = int(gl_SubgroupSize);
+    if (p.lpr == 0) {   /* one row a workgroup, every lane on it (the host's pick for a few long rows) */
+        int o = min(int(gl_WorkGroupID.x), p.O - 1);
+        vec4 t = rowpart(o, nq, tid, 256, nrow);
+        if (NR == 1) t.x = subgroupAdd(t.x); else t = subgroupAdd(t);
+        if (subgroupElect()) part[min(sg, 31)] = t;
+        barrier();
+        if (tid == 0 && int(gl_WorkGroupID.x) < p.O) {
+            vec4 tot = vec4(0.0);
+            for (int g = 0; g < int(gl_NumSubgroups) && g < 32; g++) {
+                if (NR == 1) tot.x += part[g].x; else tot += part[g];
+            }
+            for (int r = 0; r < nrow; r++) y[(s0 + r) * p.O + o] = p.fmt == 1 ? tot[r] * scale[o] : tot[r];
+        }
+        return;
+    }
+    int lpr = min(p.lpr, sgs), rps = sgs / lpr;
+    int sub = int(gl_SubgroupInvocationID) / lpr, lane = int(gl_SubgroupInvocationID) % lpr;
+    int nsg = 256 / sgs, stride = int(gl_NumWorkGroups.x) * nsg * rps;
+    for (int o0 = (int(gl_WorkGroupID.x) * nsg + sg) * rps; o0 < p.O; o0 += stride) {
+        int o = o0 + sub;
+        bool live = o < p.O;
+        vec4 tot = rowpart(live ? o : 0, live ? nq : 0, lane, lpr, nrow);
+        if (NR == 1) { for (int off = lpr / 2; off > 0; off >>= 1) tot.x += subgroupShuffleXor(tot.x, uint(off)); }
+        else { for (int off = lpr / 2; off > 0; off >>= 1) tot += subgroupShuffleXor(tot, uint(off)); }
+        if (lane == 0 && live)
+            for (int r = 0; r < nrow; r++) y[(s0 + r) * p.O + o] = p.fmt == 1 ? tot[r] * scale[o] : tot[r];
     }
 }

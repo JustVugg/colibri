@@ -121,10 +121,10 @@ def load_config(model_dir):
     root = Path(model_dir)
     processor = root / "processor_config.json"
     if processor.exists():
-        settings.update(json.loads(processor.read_text()).get("image_processor", {}))
+        settings.update(json.loads(processor.read_text(encoding="utf-8")).get("image_processor", {}))
     config = root / "config.json"
     if config.exists():
-        vision = json.loads(config.read_text()).get("vision_config") or {}
+        vision = json.loads(config.read_text(encoding="utf-8")).get("vision_config") or {}
         for their, ours in (("patch_size", "patch_size"),
                             ("spatial_merge_size", "merge_size"),
                             ("temporal_patch_size", "temporal_patch_size")):

@@ -20,6 +20,47 @@ static int fail(const char *m){ fprintf(stderr,"compat direct test failed: %s\n"
 #define FSZ (1u<<20)
 #define TMPF "test_direct.tmp"
 
+/* Query the actual handle mode: data integrity alone would also pass with
+ * the old synchronous descriptor and miss this regression. */
+static int direct_handle_is_overlapped(int fd) {
+    typedef struct { union { LONG status; void *pointer; } u; ULONG_PTR information; } IoStatus;
+    typedef LONG (NTAPI *QueryInfo)(HANDLE, IoStatus *, void *, ULONG, int);
+    HMODULE module = GetModuleHandleA("ntdll.dll");
+    FARPROC address = module ? GetProcAddress(module, "NtQueryInformationFile") : NULL;
+    QueryInfo query = NULL;
+    if (sizeof query != sizeof address) return 0;
+    memcpy(&query, &address, sizeof query);
+    if (!query) return 0;
+    IoStatus status = {0}; ULONG mode = 0;
+    /* FileModeInformation=16; FILE_SYNCHRONOUS_IO_ALERT/NONALERT=0x10/0x20. */
+    if (query((HANDLE)_get_osfhandle(fd), &status, &mode, sizeof mode, 16) < 0) return 0;
+    return !(mode & (0x10u | 0x20u));
+}
+typedef struct { int fd, lane, failed; const uint8_t *pattern; } ReadLane;
+static DWORD WINAPI read_lane(void *opaque) {
+    ReadLane *a = opaque; void *buffer = NULL;
+    if (posix_memalign(&buffer, 4096, 4096)) { a->failed = 1; return 0; }
+    for (int i=0; i<32; i++) {
+        off_t offset = (off_t)((i*7+a->lane*13)%256)*4096;
+        if (pread(a->fd,buffer,4096,offset)!=4096 ||
+            memcmp(buffer,a->pattern+(size_t)offset,4096)) { a->failed=1; break; }
+    }
+    compat_aligned_free(buffer); return 0;
+}
+static int shared_direct_reads(int fd, const uint8_t *pattern) {
+    HANDLE threads[4]={0};ReadLane lanes[4];int count=0,ok=1;
+    for (int i=0;i<4;i++) {
+        lanes[i]=(ReadLane){fd,i,0,pattern};
+        threads[i]=CreateThread(NULL,0,read_lane,&lanes[i],0,NULL);
+        if (!threads[i]) {ok=0;break;}count++;
+    }
+    for (int i=0;i<count;i++) {
+        if (WaitForSingleObject(threads[i],INFINITE)!=WAIT_OBJECT_0 || lanes[i].failed) ok=0;
+        CloseHandle(threads[i]);
+    }
+    return ok;
+}
+
 int main(void){
     FILE *w=fopen(TMPF,"wb"); if(!w) return fail("create temp");
     uint8_t *pat=malloc(FSZ);
@@ -29,6 +70,8 @@ int main(void){
 
     int dfd = compat_open_direct(TMPF);
     if(dfd<0) return fail("compat_open_direct returned -1");
+    if(!direct_handle_is_overlapped(dfd)) return fail("direct handle is synchronous");
+    if(!shared_direct_reads(dfd,pat)) return fail("concurrent positional reads corrupted data");
 
     /* lettura allineata 4K (offset, len, buffer): deve restituire i byte esatti */
     void *buf=NULL;

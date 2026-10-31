@@ -1,5 +1,8 @@
 import json
+import os
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -161,6 +164,88 @@ class MirrorPlannerTest(unittest.TestCase):
         self.assertFalse(verification["ready"])
         self.assertEqual(verification["failures"], ["hot.safetensors (sha256)"])
 
+    def test_partial_verify_rejects_changed_source_and_preserves_receipt_only_check(self):
+        source = self.write_shard(self.model, "hot.safetensors", [
+            ("model.layers.0.mlp.experts.0.gate_proj.weight", 32),
+        ])
+        self.usage.write_text("0 0 25\n", encoding="utf-8")
+        stage_mirror(self.model, self.mirror, [], self.usage, source.stat().st_size, 0)
+        self.assertTrue(verify_mirror(self.mirror, self.model)["ready"])
+        original = source.read_bytes()
+        source.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+        result = verify_mirror(self.mirror, self.model)
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["failures"], ["hot.safetensors (source sha256)"])
+        self.assertTrue(verify_mirror(self.mirror)["ready"])
+        self.assertEqual((self.mirror / source.name).read_bytes(), original)
+
+    def test_partial_verify_resolves_split_sources_and_primary_precedence(self):
+        source = self.write_shard(self.split, "hot.safetensors", [
+            ("model.layers.0.mlp.experts.0.gate_proj.weight", 32),
+        ])
+        self.usage.write_text("0 0 25\n", encoding="utf-8")
+        stage_mirror(self.model, self.mirror, [self.split], self.usage,
+                     source.stat().st_size, 0)
+        self.assertTrue(verify_mirror(self.mirror, self.model, [self.split])["ready"])
+        # A byte-identical relocation is valid; the receipt path is not identity.
+        primary = self.model / source.name
+        primary.write_bytes(source.read_bytes())
+        self.assertTrue(verify_mirror(self.mirror, self.model, [self.split])["ready"])
+        data = primary.read_bytes()
+        primary.write_bytes(data[:-1] + bytes([data[-1] ^ 1]))
+        self.assertFalse(verify_mirror(self.mirror, self.model, [self.split])["ready"])
+
+    def test_verify_cli_rejects_other_model_with_same_shard_name_and_size(self):
+        source = self.write_shard(self.model, "hot.safetensors", [
+            ("model.layers.0.mlp.experts.0.gate_proj.weight", 32),
+        ])
+        self.usage.write_text("0 0 25\n", encoding="utf-8")
+        stage_mirror(self.model, self.mirror, [], self.usage, source.stat().st_size, 0)
+        other = self.split / source.name
+        data = source.read_bytes()
+        other.write_bytes(data[:-1] + bytes([data[-1] ^ 1]))
+        tool = Path(__file__).resolve().parents[1] / "tools" / "mirror_plan.py"
+        wrapper = tool.parent.parent / "coli"
+        commands = ([sys.executable, str(tool)],
+                    [sys.executable, str(wrapper), "mirror"])
+        environment = dict(os.environ, COLI_ENGINE=str(tool.parent.parent / "colibri"),
+                           COLI_MODEL_DIRS="")
+        for command in commands:
+            for model, expected in ((self.model, 0), (self.split, 4)):
+                with self.subTest(command=command, model=model):
+                    result = subprocess.run(
+                        command + ["verify", "--model", str(model),
+                                   "--mirror", str(self.mirror)],
+                        capture_output=True, text=True, env=environment)
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    self.assertEqual(json.loads(result.stdout)["ready"], expected == 0)
+
+    def test_partial_verify_rejects_missing_source_shard(self):
+        source = self.write_shard(self.model, "hot.safetensors", [
+            ("model.layers.0.mlp.experts.0.gate_proj.weight", 32),
+        ])
+        self.usage.write_text("0 0 25\n", encoding="utf-8")
+        stage_mirror(self.model, self.mirror, [], self.usage, source.stat().st_size, 0)
+        source.rename(self.model / "renamed.safetensors")
+        result = verify_mirror(self.mirror, self.model)
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["failures"], ["hot.safetensors (source missing)"])
+        self.assertTrue(verify_mirror(self.mirror)["ready"])
+
+    def test_partial_verify_reports_source_discovery_errors(self):
+        source = self.write_shard(self.model, "hot.safetensors", [
+            ("model.layers.0.mlp.experts.0.gate_proj.weight", 32),
+        ])
+        self.usage.write_text("0 0 25\n", encoding="utf-8")
+        stage_mirror(self.model, self.mirror, [], self.usage, source.stat().st_size, 0)
+        with self.subTest(source="missing directory"):
+            with self.assertRaisesRegex(MirrorError, "does not exist"):
+                verify_mirror(self.mirror, self.root / "absent")
+        source.write_bytes(struct.pack("<Q", 999) + b"{}")
+        with self.subTest(source="invalid header"):
+            with self.assertRaisesRegex(MirrorError, "header length"):
+                verify_mirror(self.mirror, self.model)
+
     def test_reserve_preflight_writes_no_shard_or_receipt(self):
         source = self.write_shard(self.model, "hot.safetensors", [
             ("model.layers.0.mlp.experts.0.gate_proj.weight", 32),
@@ -199,6 +284,17 @@ class MirrorPlannerTest(unittest.TestCase):
         self.assertEqual(result["verification_mode"], "full_mirror")
         self.assertEqual(result["file_count"], 1)
         self.assertEqual(result["failures"], [])
+
+    def test_full_mirror_rejects_different_tensor_bytes_with_valid_header(self):
+        source = self.write_shard(self.model, "model.safetensors", [
+            ("model.layers.0.mlp.experts.0.gate_proj.weight", 32),
+        ])
+        self.mirror.mkdir()
+        data = source.read_bytes()
+        (self.mirror / source.name).write_bytes(data[:-1] + bytes([data[-1] ^ 1]))
+        result = verify_mirror(self.mirror, self.model)
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["failures"], ["model.safetensors (sha256)"])
 
     def test_verify_rejects_incomplete_full_mirror_without_receipt(self):
         self.write_shard(self.model, "model.safetensors", [

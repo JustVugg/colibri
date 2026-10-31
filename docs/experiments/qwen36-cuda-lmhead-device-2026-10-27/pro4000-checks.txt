@@ -1,0 +1,46 @@
+# qwen36 CUDA chain, the head's logits written on the card then copied to the host: two code paths the change could break (2026-10-27)
+# An RTX PRO 4000 rented on Vast.ai: Intel(R) Core(TM) Ultra 9 285K (24 CPUs, 36 MiB L3) + NVIDIA RTX PRO 4000 Blackwell (24467 MiB, sm_120); Ubuntu 24.04.1 LTS, Linux 6.8.0-146-generic x86_64, CUDA 12.8 (nvcc V12.8.93), driver 615.71.09, gcc (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0.
+# The harness (bench.c beside this file), one run for each of dev (c1c06ac6) and the change (local commit eb455b74, tree
+# b947d7ba0685: the first commit of this PR differs from it only in a comment of c/qwen36_cuda_chain.h, two paragraphs of docs/qwen36-cuda-tier.md and one line of c/tests/test_qwen36_cuda_chain.c), in the
+# environment of the timed runs (COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE
+# OMP_PROC_BIND=close OMP_NUM_THREADS=10), --lengths 64,512 --gen 32 --teacher, after a first pair of runs that warms the machine.
+# These are not measures (one run a side): they compare the fingerprint of every logit and token.
+#  chunks100: COLI_CUDA_CHAIN_ROWS=100, the prompt read in chunks of 100 rows: the 64-token prompt in one chunk, the 512-token one
+#            in 100+100+100+100+100+12 (the head runs on the last chunk's rows only). Setting the variable skips the engine's
+#            '[chain] qwen36: N rows per prompt chunk' line, so that line is absent from these runs' stderr. The 512-token
+#            fingerprint differs from the whole-prompt run's in both versions (the prompt's sums depend on the chunk), but dev and
+#            the change agree.
+#  drafts2:  the model with its MTP head, Q36_MTP=1 Q36_MTP_DRAFTS=2: a verify of three rows, whose three rows of logits are
+#            the head's three rows copied.
+#   chunks100-dev.csv sha256 234b4d4d664b2a626ec0460cd16adbb03132026f5272026b42862b4221010add
+#   chunks100-dev.err sha256 bc9af7bf4d1280de5b343b9f0cb3494a30131b7bffb6ff085a9bf6e862aee743
+#   chunks100-change.csv sha256 a5ad958e5232265d2f68aa712818260299c22636c614f9a3bcdbd9625e45a289
+#   chunks100-change.err sha256 36808b71e7964a805ff7cc2ee9426119dc4d2d8cc628dae351d377fbffac0bf0
+#   drafts2-dev.csv sha256 1603020a49ef28ac1073b03ac8469a8c8f2f981d60076954dbaf79da6afd2182
+#   drafts2-dev.err sha256 4293cb1949e32b4a934d26c1993d6c3e6c68693352451e08b111a70bab634e6b
+#   drafts2-change.csv sha256 9cbfe00fb38d9d2f83e45530dc38b77dd576fdda0adafee8094ca6961b352267
+#   drafts2-change.err sha256 5083b849f2a544090ac9806859ce71bf796e8b9e53f819f318fcc614a5d025fd
+
+===== chunks100-dev (chunks100-dev.csv)
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.064,1007.06,32,13.6,74.770,0,0.00,01f80ce3d69b39fd,5cb23346ab6be1d8,2.69932,0.469
+512,512,0.338,1514.59,32,13.4,72.721,0,0.00,f1a1db4f30308467,7a8848450b863c49,2.95369,0.406
+
+===== chunks100-change (chunks100-change.csv)
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.057,1113.08,32,6.9,144.905,0,0.00,01f80ce3d69b39fd,5cb23346ab6be1d8,2.69932,0.469
+512,512,0.332,1542.87,32,6.9,142.332,0,0.00,f1a1db4f30308467,7a8848450b863c49,2.95369,0.406
+
+===== drafts2-dev (drafts2-dev.csv)
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.192,333.04,32,24.8,61.225,0,0.00,01f80ce3d69b39fd,5cb23346ab6be1d8,2.69932,0.469
+512,512,0.187,2736.91,32,22.1,67.656,0,0.00,4d9728e495c7aba9,7a8848450b863c49,2.95291,0.406
+[qwen36 mtp] 64 tokens: 1.33 tokens/forward (24 forwards per 32 tokens) | acceptance 33.3% (8/24 drafts) | gate T(1) 13.8 ms, rows 2:1.58 3:2.27, rho 0.50, 0.2 ms per extra draft, acceptance by position 0.33 0.73 0.50 0.50 0.50
+[qwen36 mtp] 512 tokens: 1.45 tokens/forward (22 forwards per 32 tokens) | acceptance 45.5% (10/22 drafts) | gate T(1) 13.8 ms, rows 2:1.58 3:2.09, rho 0.50, 0.2 ms per extra draft, acceptance by position 0.50 0.55 0.50 0.50 0.50
+
+===== drafts2-change (drafts2-change.csv)
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.187,342.28,32,11.3,158.924,0,0.00,01f80ce3d69b39fd,5cb23346ab6be1d8,2.69932,0.469
+512,512,0.180,2845.61,32,8.4,176.692,0,0.00,4d9728e495c7aba9,7a8848450b863c49,2.95291,0.406
+[qwen36 mtp] 64 tokens: 1.33 tokens/forward (24 forwards per 32 tokens) | acceptance 33.3% (8/24 drafts) | gate T(1) 7.0 ms, rows 2:1.19 3:1.86, rho 0.50, 0.2 ms per extra draft, acceptance by position 0.33 0.73 0.50 0.50 0.50
+[qwen36 mtp] 512 tokens: 1.45 tokens/forward (22 forwards per 32 tokens) | acceptance 45.5% (10/22 drafts) | gate T(1) 6.9 ms, rows 2:1.18 3:1.47, rho 0.50, 0.2 ms per extra draft, acceptance by position 0.50 0.55 0.50 0.50 0.50

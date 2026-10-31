@@ -210,10 +210,8 @@ def main():
                         if expected == 0 or actual == expected:
                             success = True; break
                         # Size mismatch — might be in cache
-                    # If we got here, file downloaded but not at expected path
-                    # ModelScope puts it in local_dir; check again
-                    if os.path.exists(outpath):
-                        success = True; break
+                    # A present but wrong-sized SDK/cache file is not success:
+                    # let the checked curl fallback repair it too.
                     # Retry with curl fallback
                     if use_ms:
                         revision = quote(os.environ.get("GLM_MS_REVISION", "master"), safe="")

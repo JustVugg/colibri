@@ -1,0 +1,137 @@
+# qwen36 CUDA tier: without a heat file the warm start spreads over the layers: raw evidence (2026-10-27)
+# The PR changes only which experts sit on the card: without a heat file the warm start takes expert 0 of every
+#   layer, then expert 1, ...; with one it takes the hottest first. So the PR without a heat file must give
+#   the bits of dev with a heat file that puts the experts in that same order. The file: header 'QTH1', 40
+#   layers, 256 experts, then heat[l][e] = 10240 - (e * 40 + l) (every value different: no ties).
+#   Each run is one process, the prompt alone (64 or 512 tokens of promessi_sposi.txt), one decode step,
+#   --teacher: env -i COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close
+#   [HEAT_FILE=<file>] qwen36-bench --model <model> --text promessi_sposi.txt --lengths N --gen 1 --teacher.
+#   'pr' = the PR's bench binary, 'dev-ordine' = dev's with the heat file, 'dev' = dev's without. Columns of
+#   the equality check: fingerprint, nll, top1.
+
+===== Google Colab T4 (t4.txt's VM), the PR as first measured 7ef07509
+# heat file sha256 397cac18a72e37ef4d1f1d42cd51389405a6a20b4c6ca118f92403723300ce45
+== pr 64 rc=0 0.804,ec1ec84f6bbf9a5f,0.25632,1.000
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 11.64 GB left for experts
+[qtier] dev 0: budget 11.64 GB for experts (~6605 experts) after trunk
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 51.1 s
+== dev-ordine 64 rc=0 0.777,ec1ec84f6bbf9a5f,0.25632,1.000
+[qtier] HEAT_FILE loaded: /tmp/o.heat
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 11.64 GB left for experts
+[qtier] dev 0: budget 11.64 GB for experts (~6605 experts) after trunk
+== dev 64 rc=0 0.853,ebfeba6d8162a0c3,0.25632,1.000
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 11.64 GB left for experts
+[qtier] dev 0: budget 11.64 GB for experts (~6605 experts) after trunk
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 9.6 s
+EQUAL 64: ec1ec84f6bbf9a5f,0.25632,1.000
+== pr 512 rc=0 1.007,7343202bfc122502,0.89181,1.000
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 11.64 GB left for experts
+[qtier] dev 0: budget 11.64 GB for experts (~6605 experts) after trunk
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 9.5 s
+== dev-ordine 512 rc=0 0.993,7343202bfc122502,0.89181,1.000
+[qtier] HEAT_FILE loaded: /tmp/o.heat
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 11.64 GB left for experts
+[qtier] dev 0: budget 11.64 GB for experts (~6605 experts) after trunk
+== dev 512 rc=0 1.203,322f1d952090904d,0.89181,1.000
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 11.64 GB left for experts
+[qtier] dev 0: budget 11.64 GB for experts (~6605 experts) after trunk
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 9.3 s
+EQUAL 512: 7343202bfc122502,0.89181,1.000
+# dev-512.csv (sha256 0cdd792080776c33e958a194c991d907c9b4b405170caadcb65a698d510fa85d)
+512,512,1.203,425.66,1,66.0,0.000,0,0.00,322f1d952090904d,093124af99b00793,0.89181,1.000
+# dev-64.csv (sha256 5f4f10cedb4559323ab0afc50cc17b17c916bddff6a6cee53e681b1d45ecadc4)
+64,64,0.853,75.00,1,67.1,0.000,0,0.00,ebfeba6d8162a0c3,ecf582caa5b1b50e,0.25632,1.000
+# dev-ordine-512.csv (sha256 9aefb5d90785fa8bf377c6c4148af44a06d5c53048c5a5edacd6c07cb871c202)
+512,512,0.993,515.45,1,72.6,0.000,0,0.00,7343202bfc122502,093124af99b00793,0.89181,1.000
+# dev-ordine-64.csv (sha256 0c4efc10e75cb2ffbc3f18d1668e2b419cb37816c245c693f22258ee10c2342b)
+64,64,0.777,82.34,1,69.8,0.000,0,0.00,ec1ec84f6bbf9a5f,ecf582caa5b1b50e,0.25632,1.000
+# pr-512.csv (sha256 9226e39b0febeee17c12fa641cdc66c75d139f27cd8a22c4e2dd82ba99760a6f)
+512,512,1.007,508.49,1,63.7,0.000,0,0.00,7343202bfc122502,093124af99b00793,0.89181,1.000
+# pr-64.csv (sha256 49b935fd74b21ebd2cd7387ad62607771dd679d90f614a6da31b05164c5366cf)
+64,64,0.804,79.57,1,64.1,0.000,0,0.00,ec1ec84f6bbf9a5f,ecf582caa5b1b50e,0.25632,1.000
+
+===== Google Colab T4 (t4-t1t2.txt's VM), the PR with the fix 1fdb58d9
+# heat file sha256 397cac18a72e37ef4d1f1d42cd51389405a6a20b4c6ca118f92403723300ce45
+== pr 64 rc=0 0.777,ec1ec84f6bbf9a5f,0.25632,1.000
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 11.64 GB left for experts
+[qtier] dev 0: budget 11.64 GB for experts (~6605 experts) after trunk
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 42.5 s
+== dev-ordine 64 rc=0 0.757,ec1ec84f6bbf9a5f,0.25632,1.000
+[qtier] HEAT_FILE loaded: /tmp/o.heat
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 11.64 GB left for experts
+[qtier] dev 0: budget 11.64 GB for experts (~6605 experts) after trunk
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 11.4 s
+== dev 64 rc=0 0.825,ebfeba6d8162a0c3,0.25632,1.000
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 11.64 GB left for experts
+[qtier] dev 0: budget 11.64 GB for experts (~6605 experts) after trunk
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 8.9 s
+EQUAL 64: ec1ec84f6bbf9a5f,0.25632,1.000
+== pr 512 rc=0 0.979,7343202bfc122502,0.89181,1.000
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 11.64 GB left for experts
+[qtier] dev 0: budget 11.64 GB for experts (~6605 experts) after trunk
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 9.2 s
+== dev-ordine 512 rc=0 0.981,7343202bfc122502,0.89181,1.000
+[qtier] HEAT_FILE loaded: /tmp/o.heat
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 11.64 GB left for experts
+[qtier] dev 0: budget 11.64 GB for experts (~6605 experts) after trunk
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 9.3 s
+== dev 512 rc=0 1.162,322f1d952090904d,0.89181,1.000
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 11.64 GB left for experts
+[qtier] dev 0: budget 11.64 GB for experts (~6605 experts) after trunk
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 9.1 s
+EQUAL 512: 7343202bfc122502,0.89181,1.000
+# dev-512.csv (sha256 44a5e91879ea8de4a147e578d48124a4f8e3a3b8120c08b4f15661f25537754d)
+512,512,1.162,440.63,1,64.8,0.000,0,0.00,322f1d952090904d,093124af99b00793,0.89181,1.000
+# dev-64.csv (sha256 7bafb9d0afa8b91c1103303857652fac39f8284193148dea361cbd3fc9b1e0c8)
+64,64,0.825,77.57,1,63.6,0.000,0,0.00,ebfeba6d8162a0c3,ecf582caa5b1b50e,0.25632,1.000
+# dev-ordine-512.csv (sha256 6daf4006f4575d42dd78332b4b21a5da42227b3219eeb1c5550b1fd90d71f3aa)
+512,512,0.981,521.69,1,70.7,0.000,0,0.00,7343202bfc122502,093124af99b00793,0.89181,1.000
+# dev-ordine-64.csv (sha256 ae15d1e9f3a3287f6bc209f8873d7c8ef0e5d242fd74a80bea402ab9268cdef2)
+64,64,0.757,84.57,1,69.3,0.000,0,0.00,ec1ec84f6bbf9a5f,ecf582caa5b1b50e,0.25632,1.000
+# pr-512.csv (sha256 7dc5ddcf18dc85b6c84ea4e6c8178f4667f7efb5e6c3055982c50037e646782f)
+512,512,0.979,522.87,1,63.9,0.000,0,0.00,7343202bfc122502,093124af99b00793,0.89181,1.000
+# pr-64.csv (sha256 0e5bcfd1b2d6daac8a1040fd196cb61468950e8d23d8990755759ecd44c37d0b)
+64,64,0.777,82.41,1,66.4,0.000,0,0.00,ec1ec84f6bbf9a5f,ecf582caa5b1b50e,0.25632,1.000
+
+===== Vast RTX 3070 (rtx3070.txt's instance), the PR as first measured 7ef07509
+# heat file sha256 397cac18a72e37ef4d1f1d42cd51389405a6a20b4c6ca118f92403723300ce45
+== pr 64 rc=0 0.611,0c794a925948117a,0.25632,1.000
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 4.68 GB left for experts
+[qtier] dev 0: budget 4.68 GB for experts (~2654 experts) after trunk
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 2654 in VRAM -- 9.0 s
+== dev-ordine 64 rc=0 0.609,0c794a925948117a,0.25632,1.000
+[qtier] HEAT_FILE loaded: /tmp/o.heat
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 4.68 GB left for experts
+[qtier] dev 0: budget 4.68 GB for experts (~2654 experts) after trunk
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 2654 in VRAM -- 9.1 s
+== dev 64 rc=0 0.620,e5d2cba663cf5c55,0.25632,1.000
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 4.68 GB left for experts
+[qtier] dev 0: budget 4.68 GB for experts (~2654 experts) after trunk
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 2654 in VRAM -- 11.6 s
+EQUAL 64: 0c794a925948117a,0.25632,1.000
+== pr 512 rc=0 0.731,7b124b0bc8ffc7d4,0.89181,1.000
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 4.68 GB left for experts
+[qtier] dev 0: budget 4.68 GB for experts (~2654 experts) after trunk
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 2654 in VRAM -- 8.8 s
+== dev-ordine 512 rc=0 0.737,7b124b0bc8ffc7d4,0.89181,1.000
+[qtier] HEAT_FILE loaded: /tmp/o.heat
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 4.68 GB left for experts
+[qtier] dev 0: budget 4.68 GB for experts (~2654 experts) after trunk
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 2654 in VRAM -- 8.8 s
+== dev 512 rc=0 0.766,afe69ca90bcb07c4,0.89181,1.000
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 4.68 GB left for experts
+[qtier] dev 0: budget 4.68 GB for experts (~2654 experts) after trunk
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 2654 in VRAM -- 12.0 s
+EQUAL 512: 7b124b0bc8ffc7d4,0.89181,1.000
+# dev-512.csv (sha256 7010703517904c40f1ffb0fcf6f133ff9c31a88137f7c0343e8c76322c07d4ea)
+512,512,0.766,668.84,1,60.9,0.000,0,0.00,afe69ca90bcb07c4,093124af99b00793,0.89181,1.000
+# dev-64.csv (sha256 c77ef5098daa159f00edf729d30d6bf4eaa15ce9de6994f7902c59f3ba05ffb5)
+64,64,0.620,103.21,1,64.5,0.000,0,0.00,e5d2cba663cf5c55,ecf582caa5b1b50e,0.25632,1.000
+# dev-ordine-512.csv (sha256 145a21803f575305aacc1cf73de80c3dc6a6a5a947ba2c298b0bc8aa570ec0f4)
+512,512,0.737,694.91,1,74.1,0.000,0,0.00,7b124b0bc8ffc7d4,093124af99b00793,0.89181,1.000
+# dev-ordine-64.csv (sha256 9dc50f150736530c60461575a6bd7978ffcb316077f410de1b8dcc9b5a74e446)
+64,64,0.609,105.03,1,78.3,0.000,0,0.00,0c794a925948117a,ecf582caa5b1b50e,0.25632,1.000
+# pr-512.csv (sha256 409b879aaca231300cce61d4f148652a724c3393a5b4913c64ca9ab0184df15e)
+512,512,0.731,700.13,1,61.1,0.000,0,0.00,7b124b0bc8ffc7d4,093124af99b00793,0.89181,1.000
+# pr-64.csv (sha256 9ca9c47445ff491afab0085b6d8a1c352c732644560fc7d0a924feec2564ef1b)
+64,64,0.611,104.68,1,61.4,0.000,0,0.00,0c794a925948117a,ecf582caa5b1b50e,0.25632,1.000

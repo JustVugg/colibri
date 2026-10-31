@@ -276,7 +276,7 @@ ptl_family_qwen38_sanitize() {
     local tag=$1 want=$2; shift 2
     local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
     ptl_q38_run san.log "${envs[@]}" -- "$@"
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan $tag: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "asan $tag: sanitizer diagnostic"; fi
     ptl_check_n qwen38 san.log "$want" "asan $tag"
     grep -qa '^C engine' san.log || { cat san.log; fail "asan $tag: no tokens"; }
     echo "OK asan $tag: sanitizers clean, $want of $(ptl_L qwen38 san.log) layers on the device"
@@ -293,17 +293,19 @@ ptl_family_qwen38_sanitize() {
   ptl_q38_san "partial qwen38 upload refused in layer 1" 1 COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:"$n" \
     COLI_VK_CHAIN_LAYERS=4 SNAP=qwen38_tiny -- 4 8 $T
   ptl_check_placed qwen38 san.log "asan partial qwen38 upload refused in layer 1"
-  # the device lost 10 frames before the end (a probe counts them), the host copies dropped
-  ptl_q38_run probe.log COLI_VK_DENSE_HOST=0 $P SNAP=qwen38_tiny -- 4 8 $T
+  # the device lost 10 frames before the end (a probe counts them), the host copies dropped;
+  # the frames of the host's routing (COLI_VK_CHAIN_MOE=0): with the routed experts in the
+  # frame a forward is one frame, too few to lose one 10 before the end
+  ptl_q38_run probe.log COLI_VK_CHAIN_MOE=0 COLI_VK_DENSE_HOST=0 $P SNAP=qwen38_tiny -- 4 8 $T
   n=$(sed -n "s/^\[VK\] qwen38 chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p" probe.log | tail -1)
   [ -n "$n" ] && [ "$n" -gt 10 ] || { cat probe.log; fail "asan partial qwen38: the probe reports no frames"; }
-  ptl_q38_san "partial qwen38 device lost, host copies dropped" 2 COLI_VK_CHAIN_FAULT=$((n - 10)) COLI_VK_DENSE_HOST=0 $P \
+  ptl_q38_san "partial qwen38 device lost, host copies dropped" 2 COLI_VK_CHAIN_MOE=0 COLI_VK_CHAIN_FAULT=$((n - 10)) COLI_VK_DENSE_HOST=0 $P \
     SNAP=qwen38_tiny -- 4 8 $T
   grep -q "rebuilding the state of [1-9]" san.log || { cat san.log; fail "asan partial qwen38 device lost: no state rebuilt"; }
   [ "$(dho_reloaded san.log)" -gt 0 ] || { cat san.log; fail "asan partial qwen38 device lost: nothing read back"; }
   CHAIN_SERVE_EXPECT="qwen38 chain: 2 of 4 layers on the device" \
     $PY tests/vulkan_chain_serve.py ./qwen38 qwen38_tiny_mtp Q38_MTP=1 $P > san.log 2>&1 || { cat san.log; fail "asan partial qwen38 serve"; }
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan partial qwen38 serve: sanitizer diagnostic"; fi
+  if san_diag san.log; then cat san.log; fail "asan partial qwen38 serve: sanitizer diagnostic"; fi
   echo "OK asan partial qwen38 serve: $(tail -1 san.log)"
   $PY tests/spec_drafts_harness.py --sanitize --quick --engine ./qwen38 --kind qwen38 --fixture ./qwen38_tiny_mtp --mtp \
     --env COLI_VULKAN=1 --env COLI_VK_CHAIN=1 --env COLI_VK_TIER=0 --env $P

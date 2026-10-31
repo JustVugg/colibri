@@ -34,9 +34,10 @@ def parse_tokens(text: str) -> list[int]:
 class Serve:
     """One persistent `SERVE=1` engine process."""
 
-    def __init__(self, binary: Path, model: Path, ctx: str = "128") -> None:
+    def __init__(self, binary: Path, model: Path, ctx: str = "128",
+                 extra: dict[str, str] | None = None) -> None:
         env = dict(os.environ, SERVE="1", SNAP=str(model), CTX=ctx,
-                   V4_PREFIX_LOG="1")
+                   V4_PREFIX_LOG="1", **(extra or {}))
         self.process = subprocess.Popen(
             [str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, env=env,
@@ -205,6 +206,53 @@ def check_repeated_prompt(binary: Path, model: Path,
     print("PASS prefix repeat: identical prompt re-prefills, answer unchanged")
 
 
+def check_short_request_parks(binary: Path, model: Path,
+                              case: dict[str, object]) -> None:
+    """A short request between two turns keeps the conversation (park.h).
+
+    A client's title or summary request between two turns shares nothing with the
+    conversation and took the only state there is: the next turn re-prefilled everything.
+    The conversation is parked for it and comes back: the next turn reuses the whole of
+    turn 1's prompt, and both answer as a cold engine does."""
+    base = list(case["prompt_ids"])                 # type: ignore[arg-type]
+    first_ids = (base * (48 // len(base) + 1))[:48]
+    side_ids = [token + 1 for token in base[:4]]
+    second_ids = first_ids + base[:2]
+    max_new = 4
+
+    def run(extra: dict[str, str]) -> tuple[list[tuple[str, int]], str]:
+        warm = Serve(binary, model, extra=dict(COLI_PARK_MIN="16", COLI_PREFIX_LOG="1", **extra))
+        try:
+            out = [warm.submit(token_prompt(first_ids), 1),
+                   warm.submit(token_prompt(side_ids), max_new),
+                   warm.submit(token_prompt(second_ids), max_new)]
+        finally:
+            warm.close()
+        assert warm.process.stderr is not None
+        return out, warm.process.stderr.read().decode("utf-8", "replace")
+
+    (_, (side_text, _), (second_text, second_reuse)), log = run({})
+    if "conversation parked for a" not in log or "conversation is back" not in log:
+        raise AssertionError("the short request did not park the conversation:\n" + log)
+    if second_reuse < len(first_ids):
+        raise AssertionError(f"the next turn reused {second_reuse} tokens, not the "
+                             f"{len(first_ids)} of the parked conversation:\n" + log)
+    for name, ids, got in (("short request", side_ids, side_text), ("next turn", second_ids, second_text)):
+        cold = Serve(binary, model)
+        try:
+            cold_text, _ = cold.submit(token_prompt(ids), max_new)
+        finally:
+            cold.close()
+        if got != cold_text:
+            raise AssertionError(f"the {name} answered {got!r} beside a parked conversation, "
+                                 f"{cold_text!r} on a cold engine")
+    (_, _, (off_text, off_reuse)), _ = run({"COLI_PARK": "0"})
+    if off_reuse >= len(first_ids) or off_text != second_text:
+        raise AssertionError(f"COLI_PARK=0: reuse {off_reuse}, answer {off_text!r} (parked: {second_text!r})")
+    print(f"PASS prefix park: the next turn reused {second_reuse} tokens after a short "
+          f"request, answers identical to a cold engine")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True, type=Path)
@@ -217,6 +265,7 @@ def main() -> int:
     check_growing_conversation(arguments.binary, arguments.fixture, case)
     check_repeated_prompt(arguments.binary, arguments.fixture, case)
     check_divergent_prompt_resets(arguments.binary, arguments.fixture, case)
+    check_short_request_parks(arguments.binary, arguments.fixture, case)
     print("PASS DeepSeek V4 KV prefix reuse: all checks completed")
     return 0
 

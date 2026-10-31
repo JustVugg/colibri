@@ -6,7 +6,8 @@ export interface ChatMessage {
   content: string
   /* Reasoning models stream their thinking on a separate delta field before
      the answer. Kept apart from `content` so it can be rendered as its own
-     block and excluded from what is sent back as conversation history. */
+     block, and sent back as reasoning_content only to a colibrì server
+     (StreamChatOptions.keepReasoning). */
   reasoning?: string
   /* Data URIs of the pictures attached to this turn. Kept on the message rather
      than on the draft, because the transcript is resent on every later turn and
@@ -72,6 +73,12 @@ export interface HealthResponse {
   /* Whether a message list ending on an assistant turn is continued rather than
      answered fresh (COLI_CONTINUE_ASSISTANT). Absent on older servers. */
   continue_assistant?: boolean
+  /* the server compacts a chat that outgrows the context when asked (context_compaction) */
+  context_compaction?: boolean
+  context_tokens?: number
+  /* the response ceiling a request is lowered to; without a ceiling of its own a
+     request gets this one: on colibrì the context the engine holds */
+  max_tokens?: number
 }
 
 export interface ProfileTurn {
@@ -97,11 +104,19 @@ export interface TokenUsage {
   total_tokens: number
 }
 
+/* The server ran the turn on a summary of the conversation's first messages, which
+   no longer fitted the model's context (context_compaction). */
+export interface Compaction {
+  summarized_messages: number
+  summary: string
+}
+
 export interface StreamChatResult {
   finishReason: string | null
   usage: TokenUsage | null
   requestId: string | null
   queueWaitMs: number | null
+  compaction: Compaction | null
 }
 
 export function endpoint(baseUrl: string, path: string) {
@@ -211,9 +226,18 @@ export interface StreamChatOptions {
   model: string
   messages: ChatMessage[]
   temperature: number
-  maxTokens: number
+  /* undefined: no max_completion_tokens at all, the server's own ceiling */
+  maxTokens?: number
   enableThinking: boolean
   cacheSlot?: number
+  /* ask the server to summarize a conversation that outgrows the context; only for a
+     colibrì server, since an OpenAI-compatible one may refuse a field it does not know */
+  compact?: boolean
+  /* send each past assistant turn's reasoning back (reasoning_content), colibrì only:
+     where the model's template keeps it (GLM) the prompt is then what the engine holds,
+     so it reuses that state instead of prefilling the turn again, and the model sees
+     what it thought (#382); a template that drops it drops it on the server */
+  keepReasoning?: boolean
   signal: AbortSignal
   onDelta: (text: string) => void
   onReasoning?: (text: string) => void
@@ -229,16 +253,22 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
       /* A turn with pictures goes out in the content-array form the API takes;
          a plain turn stays a string, so a text-only server sees exactly what it
          saw before this existed. */
-      messages: options.messages.map(({ role, content, images }) => images?.length
-        ? { role, content: [
-            ...(content ? [{ type: "text", text: content }] : []),
-            ...images.map(url => ({ type: "image_url", image_url: { url } })),
-          ] }
-        : { role, content }),
+      messages: options.messages.map(({ role, content, images, reasoning }) => ({
+        ...(images?.length
+          ? { role, content: [
+              ...(content ? [{ type: "text", text: content }] : []),
+              ...images.map(url => ({ type: "image_url", image_url: { url } })),
+            ] }
+          : { role, content }),
+        ...(options.keepReasoning && role === "assistant" && reasoning?.trim() ? { reasoning_content: reasoning } : {}),
+      })),
       temperature: options.temperature,
-      max_completion_tokens: options.maxTokens,
+      ...(options.maxTokens === undefined ? {} : { max_completion_tokens: options.maxTokens }),
       enable_thinking: options.enableThinking,
       ...(options.cacheSlot === undefined ? {} : { cache_slot: options.cacheSlot }),
+      /* A conversation longer than the context goes on, on a summary of its
+         first messages, instead of ending in "maximum context length". */
+      ...(options.compact ? { context_compaction: "auto" } : {}),
       stream: true,
       stream_options: { include_usage: true },
     }),
@@ -251,13 +281,16 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
   let buffer = ""
   let finishReason: string | null = null
   let usage: TokenUsage | null = null
+  let compaction: Compaction | null = null
 
   const consume = (data: string) => {
     if (data === "[DONE]") return
     const event = JSON.parse(data) as {
       choices?: Array<{ delta?: { content?: string; reasoning_content?: string }; finish_reason?: string | null }>
       usage?: TokenUsage | null
+      compaction?: Compaction
     }
+    if (event.compaction) compaction = event.compaction
     const choice = event.choices?.[0]
     const text = choice?.delta?.content
     if (text) options.onDelta(text)
@@ -283,6 +316,7 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
     usage,
     requestId: response.headers.get("x-request-id"),
     queueWaitMs: parsedQueueWait !== null && Number.isFinite(parsedQueueWait) ? parsedQueueWait : null,
+    compaction,
   }
 }
 
@@ -314,13 +348,17 @@ export async function askSystemOne(
   state: string,
   question: string,
   options: string[],
+  pinState: boolean,
   signal?: AbortSignal,
 ): Promise<DecisionResponse> {
   const response = await fetch(endpoint(baseUrl, "systemone"), {
     method: "POST",
     headers: headers(apiKey),
     body: JSON.stringify({
-      model, state,
+      /* The page sends one question per request so each result can appear as it
+         arrives. A multi-question run asks the first request to photograph the
+         shared document; a one-question run preserves the server's heuristic. */
+      model, state, ...(pinState ? { pin_state: true } : {}),
       questions: { q: { type: "choice", instructions: question, criteria: Object.fromEntries(options.map((o) => [o, null])) } },
     }),
     signal,

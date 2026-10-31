@@ -1,0 +1,129 @@
+#version 450
+// A prompt chunk's routed experts on the dense chain (vk_chain.c, vkc_moe_rows): S rows
+// routed to K experts each by the device (chain_route.comp), the block formats' grouped
+// GEMMs (qmatmul_grp_gate_up_bd.comp, qmatmul_grp_bd.comp) on tables this shader builds,
+// so no row leaves the device. Pair p = s*K + k is row s's expert of rank k, e = ids[p].
+//   mode 0, count: one thread a pair, cnt[e] += 1 (cnt zeroed before)
+//   mode 1, plan, one workgroup: off[e] = the experts' rows before e's (their packed
+//           rows' order), cur[e] = off[e]; each pass's expert table (16 words an expert,
+//           qmatmul_grp.comp's: the matrices' addresses, rows, first packed row, format,
+//           row words, gs, the block table's address) and its items, (e, first row of e's,
+//           output block, 1): every expert's tiles of tm rows by its output blocks (bo1
+//           outputs gate+up's, bo0 down's), in expert order; the two passes' indirect
+//           dispatches {items, 1, 1}
+//   mode 2, scatter: one thread a pair, amap[cur[e]++] = p (an expert's rows in any
+//           order: each row's output is its own sums, the same in every order)
+//   mode 3, sum: one workgroup a (row, 256 outputs), y[s][o] = the sum over k in rank
+//           order of w[s][k] * yk[s*K + k][o], from 0 (chain_moe.comp's mode 2)
+// The source table (vk_dmoe.h's, coli_vk_xb_expert_entry's 32 words an expert): [0..1]
+// gate, [2..3] its scales, [4..5] up, [6..7], [8..9] down, [10..11]; [12] gate/up format,
+// [13] their row words, [14] gs, [15] down's format, [16], [17]; [18] 1 = resident. An
+// expert not resident (or a slot of -1) takes no row.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer ID { int ids[]; };
+layout(std430, binding = 1) readonly buffer T { uint tab[]; };
+layout(std430, binding = 2) buffer C { uint cnt[]; };          // [E] counts, then [E] off, [E] cur
+layout(std430, binding = 3) buffer M { uint amap[]; };         // packed row -> pair
+layout(std430, binding = 4) writeonly buffer IT { uvec4 items[]; };   // pass 1 (gate+up) from 0, pass 0 (down) from imax
+layout(std430, binding = 5) writeonly buffer ET { uint etab[]; };     // pass 1 from 0, pass 0 from 16 * E
+layout(std430, binding = 6) buffer AUX { uint aux[]; };        // [0..2] pass 1's dispatch, [4..6] pass 0's; mode 3: y
+layout(std430, binding = 6) writeonly buffer Y { float y[]; };
+layout(std430, binding = 5) readonly buffer YK { float yk[]; };       // mode 3: the down pass's rows, pair order
+layout(std430, binding = 4) readonly buffer RW { float rw[]; };       // mode 3: the routing weights
+
+layout(push_constant) uniform P {
+    int mode, S, K, E, D, I;
+    int t_off, imax;               // the layer's first entry in tab; the items room a pass
+    int i_off, i_row, w_off, w_row, y_off, y_row;
+    uint tab_lo, tab_hi;           // blockdec_table.h's table, by address
+    int tm, bo1, bo0;              // mode 1: rows a tile, outputs a block of each pass (32, 32, 64:
+                                   // qmatmul_grp*_bd.comp's; 64, 64, 128: qmatmul_grp*_bdcw.comp's)
+} p;
+
+#define ENT 32u
+shared uint sh_n[256];
+
+bool live(int e) { return e >= 0 && e < p.E && tab[uint(p.t_off + e) * ENT + 18u] != 0u; }
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint E = uint(p.E), n = uint(p.S * p.K);
+    if (p.mode == 0 || p.mode == 2) {
+        uint q = gl_WorkGroupID.x * 256u + tid;
+        if (q >= n) return;
+        uint s = q / uint(p.K), k = q - s * uint(p.K);
+        int e = ids[p.i_off + int(s) * p.i_row + int(k)];
+        if (!live(e)) return;
+        if (p.mode == 0) atomicAdd(cnt[uint(e)], 1u);
+        else amap[atomicAdd(cnt[2u * E + uint(e)], 1u)] = q;
+        return;
+    }
+    if (p.mode == 3) {
+        int nt = (p.D + 255) / 256, wg = int(gl_WorkGroupID.x), s = wg / nt, t = wg - s * nt;
+        if (s >= p.S) return;
+        int o = t * 256 + int(tid), oc = min(o, p.D - 1);
+        float acc = 0.0;
+        for (int k = 0; k < p.K; k++) {
+            int e = ids[p.i_off + s * p.i_row + k];
+            if (!live(e)) continue;
+            acc += rw[p.w_off + s * p.w_row + k] * yk[(s * p.K + k) * p.D + oc];
+        }
+        if (o < p.D) y[p.y_off + s * p.y_row + o] = acc;
+        return;
+    }
+    // mode 1: one workgroup; a thread takes experts tid, tid + 256, ...
+    uint TM = uint(p.tm), nob1 = (uint(p.I) + uint(p.bo1) - 1u) / uint(p.bo1), nob0 = (uint(p.D) + uint(p.bo0) - 1u) / uint(p.bo0);
+    uint rows_mine = 0u, items_mine = 0u;
+    for (uint e = tid; e < E; e += 256u) { uint c = cnt[e]; rows_mine += c; items_mine += (c + TM - 1u) / TM; }
+    // the experts' rows and tiles before this thread's first: a scan over the threads, then
+    // within the thread in expert order
+    sh_n[tid] = rows_mine;
+    barrier();
+    for (uint d = 1u; d < 256u; d <<= 1u) {
+        uint v = tid >= d ? sh_n[tid - d] : 0u;
+        barrier();
+        sh_n[tid] += v;
+        barrier();
+    }
+    uint rbase = sh_n[tid] - rows_mine;
+    barrier();
+    sh_n[tid] = items_mine;
+    barrier();
+    for (uint d = 1u; d < 256u; d <<= 1u) {
+        uint v = tid >= d ? sh_n[tid - d] : 0u;
+        barrier();
+        sh_n[tid] += v;
+        barrier();
+    }
+    uint tbase = sh_n[tid] - items_mine, tiles = sh_n[255];
+    uint tabw = uint(p.t_off) * ENT;
+    for (uint e = tid; e < E; e += 256u) {
+        uint c = cnt[e], nt = (c + TM - 1u) / TM, eb = tabw + e * ENT;
+        cnt[E + e] = rbase; cnt[2u * E + e] = rbase;
+        // the two passes' entries: pass 1 gate (and up), pass 0 down
+        for (uint v = 0u; v < 2u; v++) {
+            uint o = (v == 1u ? 0u : 16u * E) + e * 16u;
+            uint w0 = v == 1u ? 0u : 8u;   // the matrix's first word in tab
+            etab[o + 0u] = tab[eb + w0];      etab[o + 1u] = tab[eb + w0 + 1u];
+            etab[o + 2u] = tab[eb + w0 + 2u]; etab[o + 3u] = tab[eb + w0 + 3u];
+            etab[o + 4u] = v == 1u ? tab[eb + 4u] : 0u; etab[o + 5u] = v == 1u ? tab[eb + 5u] : 0u;
+            etab[o + 6u] = v == 1u ? tab[eb + 6u] : 0u; etab[o + 7u] = v == 1u ? tab[eb + 7u] : 0u;
+            etab[o + 8u] = c; etab[o + 9u] = rbase;
+            etab[o + 10u] = tab[eb + (v == 1u ? 12u : 15u)]; etab[o + 11u] = tab[eb + (v == 1u ? 13u : 16u)];
+            etab[o + 12u] = tab[eb + (v == 1u ? 14u : 17u)]; etab[o + 13u] = 0u;
+            etab[o + 14u] = p.tab_lo; etab[o + 15u] = p.tab_hi;
+        }
+        // its items: pass 1 at tbase * nob1 on, pass 0 at imax + tbase * nob0 on (each
+        // expert's tiles by its output blocks, the tiles of one block adjacent)
+        for (uint ob = 0u; ob < nob1; ob++)
+            for (uint t = 0u; t < nt; t++) items[tbase * nob1 + ob * nt + t] = uvec4(e, t * TM, ob, 1u);
+        for (uint ob = 0u; ob < nob0; ob++)
+            for (uint t = 0u; t < nt; t++) items[uint(p.imax) + tbase * nob0 + ob * nt + t] = uvec4(e, t * TM, ob, 1u);
+        rbase += c; tbase += nt;
+    }
+    if (tid == 0u) {
+        aux[0] = tiles * nob1; aux[1] = 1u; aux[2] = 1u; aux[3] = 0u;
+        aux[4] = tiles * nob0; aux[5] = 1u; aux[6] = 1u; aux[7] = 0u;
+    }
+}

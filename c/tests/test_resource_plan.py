@@ -10,6 +10,7 @@ from unittest import mock
 
 from resource_plan import (
     GB,
+    MANY_COMPUTE_UNITS,
     CgroupFormatError,
     analyze_model,
     build_plan,
@@ -27,14 +28,23 @@ from resource_plan import (
 )
 
 
-def analyze_qwen38_mtp(model, env):
+def analyze_qwen38_mtp(model, env, vulkan=None):
     """The analysis build_plan works from, after the MTP head's pricing."""
     import resource_plan
     info = resource_plan.qwen38_int4_sidecar(resource_plan.analyze_model(model))
-    return resource_plan._q38_mtp_head(info, env)
+    return resource_plan._q38_mtp_head(info, env, vulkan)
 
 
-def write_shard(path, tensors):
+def integrated(compute_units):
+    """The device setup_hw reports for an integrated GPU with that many compute units."""
+    return {"type": "integrated", "compute_units": compute_units}
+
+
+# 1.0000001: an f32 that is not a bf16 widened (its low half is not zero)
+NOT_BF16 = struct.pack("<f", 1.0000001)
+
+
+def write_shard(path, tensors, f32_fill=None):
     offset = 0
     header = {}
     for tensor in tensors:
@@ -45,13 +55,24 @@ def write_shard(path, tensors):
                         "data_offsets": [offset, offset + size]}
         offset += size
     raw = json.dumps(header).encode()
-    # The planner reads headers and file sizes, not tensor values. Extending
-    # the file retains the zero-filled payload without allocating it in Python;
+    # The planner reads headers and file sizes, and the values of one kind of
+    # tensor only: an F32 matrix an engine uploads as bf16 when every value is
+    # one (resource_plan._bf16_exact), which zeros are. Extending the file
+    # retains the zero-filled payload without allocating it in Python;
     # filesystems supporting sparse extension also avoid writing gigabytes.
+    # f32_fill: the F32 tensors' values instead (NOT_BF16, as the engines' tiny
+    # fixtures, whose random values stay f32).
     with path.open("wb") as stream:
         stream.write(struct.pack("<Q", len(raw)))
         stream.write(raw)
-        stream.truncate(stream.tell() + offset)
+        base = stream.tell()
+        if f32_fill:
+            for meta in header.values():
+                if meta["dtype"] == "F32":
+                    start, end = meta["data_offsets"]
+                    stream.seek(base + start)
+                    stream.write(f32_fill * ((end - start) // 4))
+        stream.truncate(base + offset)
 
 
 class ShardFixtureTest(unittest.TestCase):
@@ -996,12 +1017,22 @@ memInfo.free:                     23.50 GB (97%)
         for label, blob in layouts.items():
             with mock.patch("resource_plan.subprocess.run",
                             return_value=lscpu(blob)), \
+                 mock.patch("resource_plan.performance_core_count", return_value=None), \
                  mock.patch.object(sys, "platform", "linux"):
                 plan = build_plan(self.model, available_memory=16 * GB,
                                   available_disk=1, gpus=[])
                 env = environment_for_plan(plan)
             self.assertEqual(plan["cpu"]["physical_cores"], 12, label)
             self.assertEqual(env["OMP_NUM_THREADS"], "12", label)
+        # a hybrid CPU: the team is its performance cores, the physical count stays
+        with mock.patch("resource_plan.subprocess.run", return_value=lscpu(layouts["2-col (-p=core,socket)"])), \
+             mock.patch("resource_plan.performance_core_count", return_value=4), \
+             mock.patch.object(sys, "platform", "linux"):
+            plan = build_plan(self.model, available_memory=16 * GB, available_disk=1, gpus=[])
+            env = environment_for_plan(plan)
+        self.assertEqual((plan["cpu"]["physical_cores"], plan["cpu"]["team_threads"]), (12, 4))
+        self.assertEqual(plan["cpu"]["thread_policy"], "performance-cores")
+        self.assertEqual(env["OMP_NUM_THREADS"], "4")
 
     def test_plan_does_not_set_omp_affinity_vars(self):
         # The real #325 regression: --auto-tier set OMP_PROC_BIND=spread +
@@ -1091,10 +1122,8 @@ memInfo.free:                     23.50 GB (97%)
             ))
         write_shard(self.model / "model.safetensors", tensors)
 
-    def test_qwen38_mtp_head_is_priced_when_the_engine_attaches_it(self):
-        # qwen38_core.h attaches the checkpoint's MTP head by default: its dense
-        # tensors stay resident and its experts get a cache of the layers' cap
-        # (Q38_MTP_CAP), at the head's own record. The plan used to price neither.
+    def write_qwen38_mtp(self):
+        """The qwen38 checkpoint with an MTP head of two experts of 3 x 512 bytes; returns the config."""
         self.write_qwen38()
         config = json.loads((self.model / "config.json").read_text())
         config["text_config"]["mtp_num_hidden_layers"] = 1
@@ -1105,6 +1134,13 @@ memInfo.free:                     23.50 GB (97%)
             for projection in ("gate_proj", "up_proj", "down_proj"):
                 head.append((f"mtp.layers.0.mlp.experts.{e}.{projection}.weight", 512, "F8_E4M3", [16, 32]))
         write_shard(self.model / "model-mtp.safetensors", head)
+        return config
+
+    def test_qwen38_mtp_head_is_priced_when_the_engine_attaches_it(self):
+        # qwen38_core.h attaches the checkpoint's MTP head by default: its dense
+        # tensors stay resident and its experts get a cache of the layers' cap
+        # (Q38_MTP_CAP), at the head's own record. The plan used to price neither.
+        config = self.write_qwen38_mtp()
         kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
         off = build_plan(self.model, env={"Q38_MTP": "0"}, **kwargs)
         on = build_plan(self.model, env={}, **kwargs)
@@ -1124,6 +1160,86 @@ memInfo.free:                     23.50 GB (97%)
         config["text_config"]["mtp_num_hidden_layers"] = 0
         (self.model / "config.json").write_text(json.dumps(config))
         self.assertEqual(analyze_qwen38_mtp(self.model, {})["per_cap_bytes"], info_off["per_cap_bytes"])
+
+    def test_qwen38_mtp_head_cache_is_every_expert_where_the_engine_sets_it(self):
+        # q38_mtp_igpu_defaults: on an integrated GPU with many compute units, the expert tier
+        # wanted and the dense chain on for decode, the cache of the head has a slot for every
+        # expert, a fixed cost. Q38_MTP_CAP still sets it. Elsewhere a slot costs one head expert.
+        self.write_qwen38_mtp()
+        record, experts = 3 * 512, 2
+        base = analyze_qwen38_mtp(self.model, {"Q38_MTP": "0"})
+        on = {"COLI_VULKAN": "1"}
+        many = analyze_qwen38_mtp(self.model, on, integrated(MANY_COMPUTE_UNITS))
+        self.assertEqual(many["expert_fixed_bytes"] - base["expert_fixed_bytes"], experts * record)
+        self.assertEqual(many["per_cap_bytes"], base["per_cap_bytes"])
+        cases = {
+            "one compute unit fewer": (on, integrated(MANY_COMPUTE_UNITS - 1)),
+            "no count": (on, integrated(None)),
+            "no device": (on, None),
+            "a discrete GPU": (on, {"type": "discrete", "compute_units": 2 * MANY_COMPUTE_UNITS}),
+            "no expert tier": (dict(on, COLI_VK_TIER="0"), integrated(MANY_COMPUTE_UNITS)),
+            "the CUDA tier": (dict(on, COLI_CUDA="1"), integrated(MANY_COMPUTE_UNITS)),
+            "Vulkan off": ({}, integrated(MANY_COMPUTE_UNITS)),
+            "dense chain off": (dict(on, COLI_VK_CHAIN="0"), integrated(MANY_COMPUTE_UNITS)),
+            "dense chain for prompts only": (dict(on, COLI_VK_CHAIN="2"), integrated(MANY_COMPUTE_UNITS)),
+            "trunk on the CPU": (dict(on, COLI_VK_DENSE="0"), integrated(MANY_COMPUTE_UNITS)),
+        }
+        for name, (env, device) in cases.items():
+            with self.subTest(name):
+                info = analyze_qwen38_mtp(self.model, env, device)
+                self.assertEqual(info["expert_fixed_bytes"], base["expert_fixed_bytes"])
+                self.assertEqual(info["per_cap_bytes"] - base["per_cap_bytes"], record)
+        fixed = analyze_qwen38_mtp(self.model, dict(on, Q38_MTP_CAP="1"), integrated(MANY_COMPUTE_UNITS))
+        self.assertEqual(fixed["expert_fixed_bytes"] - base["expert_fixed_bytes"], record)
+        # build_plan hands the device it probed to the pricing of the head
+        kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        ram_many = build_plan(self.model, env=on, vulkan=integrated(MANY_COMPUTE_UNITS), **kwargs)["tiers"]["ram"]
+        ram_few = build_plan(self.model, env=on, vulkan=integrated(MANY_COMPUTE_UNITS - 1), **kwargs)["tiers"]["ram"]
+        self.assertEqual(ram_many["expert_fixed_bytes"] - ram_few["expert_fixed_bytes"], experts * record)
+
+    def test_plan_warns_when_an_integrated_gpu_reports_no_compute_units(self):
+        # the vulkaninfo path of setup_hw cannot read them: the plan prices fewer than MANY_COMPUTE_UNITS and says so
+        self.write_qwen38_mtp()
+        kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        cases = {
+            "unknown": ({"COLI_VULKAN": "1"}, integrated(None), True),
+            "known": ({"COLI_VULKAN": "1"}, integrated(MANY_COMPUTE_UNITS), False),
+            "a discrete GPU": ({"COLI_VULKAN": "1"}, {"type": "discrete", "compute_units": None}, False),
+            "Vulkan off": ({}, integrated(None), False),
+        }
+        for name, (env, device, warned) in cases.items():
+            with self.subTest(name):
+                warnings = build_plan(self.model, env=env, vulkan=device, **kwargs)["warnings"]
+                self.assertEqual(any("reports no compute units" in w for w in warnings), warned)
+
+    def test_vk_igpu_threshold_header_is_what_the_generator_writes(self):
+        c_dir = Path(__file__).resolve().parents[1]
+        written = subprocess.run([sys.executable, str(c_dir / "tools" / "gen_vk_igpu.py")],
+                                 check=True, capture_output=True, text=True).stdout
+        self.assertEqual(written, (c_dir / "vk_igpu_threshold.h").read_text())
+
+    def test_vulkan_chain_default_of_qwen38_follows_the_compute_units_of_an_integrated_gpu(self):
+        # qwen38 passes coli_vk_chain_decide ON from MANY_COMPUTE_UNITS compute units, qwen36 and
+        # olmoe on at any count, and an engine not measured on an integrated GPU off
+        from resource_plan import _vk_chain_dense
+        on = {"COLI_VULKAN": "1"}
+        many, few = integrated(MANY_COMPUTE_UNITS), integrated(MANY_COMPUTE_UNITS - 1)
+        cases = [
+            ("qwen38", on, many, True),
+            ("qwen38", on, few, False),
+            ("qwen38", on, integrated(None), False),
+            ("qwen38", dict(on, COLI_VK_TIER="0"), many, False),
+            ("qwen38", dict(on, COLI_VK_CHAIN="0"), many, False),
+            ("qwen38", dict(on, COLI_VK_DENSE="0"), many, False),
+            ("qwen38", dict(on, COLI_VK_DENSE="0", COLI_VK_CHAIN="1"), many, True),
+            ("qwen38", on, {"type": "cpu", "compute_units": MANY_COMPUTE_UNITS}, False),
+            ("qwen36", on, few, True),
+            ("olmoe", on, few, True),
+            ("glm53", on, many, False),
+        ]
+        for family, env, device, chain in cases:
+            with self.subTest(family=family, env=env, device=device):
+                self.assertEqual(_vk_chain_dense(family, env, device)[0], chain)
 
     def test_qwen38_plan_prices_heterogeneous_cache_exports_cap_and_plans_vram(self):
         self.write_qwen38()
@@ -1161,6 +1277,21 @@ memInfo.free:                     23.50 GB (97%)
         environment = environment_for_plan(plan)
         self.assertEqual(environment["COLI_PLAN_CAP"], str(cap))
         self.assertEqual(environment["COLI_CUDA"], "1")
+        # qwen36_tier.c reads CUDA_EXPERT_GB as GiB for the card, trunk included.
+        # This card shares the host's memory: it gets the plan's budget with the
+        # trunk back in, in GiB. A card of its own sizes itself; the user's wins.
+        tier = plan["tiers"]["vram"]["budget_bytes"] + 2 * MiB
+        self.assertEqual(environment["CUDA_EXPERT_GB"], f"{tier / (1 << 30):.3f}")
+        # the units, at a size where GB and GiB differ: 20 GB and a 3 GiB trunk
+        vram = dict(plan["tiers"]["vram"], budget_bytes=20 * GB, trunk_bytes=3 << 30)
+        big = dict(plan, tiers=dict(plan["tiers"], vram=vram))
+        self.assertEqual(environment_for_plan(big)["CUDA_EXPERT_GB"], "21.626")
+        own = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB,
+                         gpus=[dict(gpu, unified_memory=False)])
+        self.assertGreater(own["tiers"]["vram"]["budget_bytes"], 0)
+        self.assertNotIn("CUDA_EXPERT_GB", environment_for_plan(own))
+        self.assertEqual(environment_for_plan(own, {"CUDA_EXPERT_GB": "6"})["CUDA_EXPERT_GB"], "6")
+        self.assertEqual(environment_for_plan(plan, {"CUDA_EXPERT_GB": "6"})["CUDA_EXPERT_GB"], "6")   # and where it shares memory
         self.assertEqual(environment["COLI_GPU"], "0")
         for variable in ("Q38_NATIVE_FP8", "Q38_NATIVE_BF16"):
             with self.subTest(variable=variable), self.assertRaisesRegex(
@@ -1363,10 +1494,12 @@ memInfo.free:                     23.50 GB (97%)
         self.assertFalse(vk_dense_device_only(
             1, "qwen38", dict(forced, COLI_CUDA="1"), device)[0])
         igpu = {"type": "integrated"}
-        # Dense and chain are independent decisions in the runtime. Disabling
-        # the per-matrix path alone still leaves qwen36's default chain on.
-        self.assertTrue(vk_dense_device_only(
+        # COLI_VK_DENSE=0 keeps the default chain off too (coli_vk_chain_decide),
+        # and COLI_VK_CHAIN=1 turns it back on.
+        self.assertFalse(vk_dense_device_only(
             1, "qwen36", dict(on, COLI_VK_DENSE="0"), igpu)[0])
+        self.assertTrue(vk_dense_device_only(
+            1, "qwen36", dict(on, COLI_VK_DENSE="0", COLI_VK_CHAIN="1"), igpu)[0])
         self.assertTrue(vk_dense_device_only(
             1, "qwen38", dict(on, COLI_VK_CHAIN="0", COLI_VK_TIER="0"), igpu)[0])
         for gpu in (device, igpu):
@@ -1437,6 +1570,51 @@ memInfo.free:                     23.50 GB (97%)
             self.assertNotIn("qwen38_int4_experts", partial["model"])
             self.assertEqual(partial["model"]["per_cap_bytes"], 384)
 
+    def test_qwen38_int2_sidecar_is_priced_when_the_engine_takes_it(self):
+        # Q38_EXPERT_INT2=1 makes qwen38 load experts-int2g32/ (int2_g32.h) instead of
+        # the int4 one: its records are what the cache holds, and nothing else
+        self.write_qwen38()
+        geometry = {"version": 1, "complete": True, "layers": 2, "experts": 2,
+                    "hidden_size": 8, "moe_intermediate_size": 4}
+        for name, fmt, record in (("experts-int4g64", "colibri.qwen38.experts-int4g64", 112),
+                                  ("experts-int2g32", "colibri.qwen38.experts-int2g32", 60)):
+            (self.model / name).mkdir()
+            (self.model / name / "index.json").write_text(json.dumps(dict(geometry, format=fmt, record_bytes=record)))
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("Q38_EXPERT_INT4", None)
+            os.environ.pop("Q38_EXPERT_INT2", None)
+            plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+            self.assertEqual(plan["model"]["per_cap_bytes"], 112)
+            os.environ["Q38_EXPERT_INT2"] = "1"
+            plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+            self.assertTrue(plan["model"]["qwen38_int4_experts"])
+            self.assertEqual((plan["model"]["per_cap_bytes"], plan["model"]["expert_bytes"]), (60, 120))
+            os.environ.pop("Q38_EXPERT_INT2")
+            (self.model / "experts-int3g16").mkdir()
+            (self.model / "experts-int3g16" / "index.json").write_text(
+                json.dumps(dict(geometry, format="colibri.qwen38.experts-int3g16", record_bytes=86)))
+            with mock.patch.dict(os.environ, {"Q38_EXPERT_LOWBIT": "int3g16"}):
+                plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+            self.assertEqual(plan["model"]["per_cap_bytes"], 86)
+            # the vector formats, and any name with a complete index of its own: priced by its
+            # record, never by the FP8 bytes (vq2 on the release once got a cap for 4.9 MB experts)
+            for name, record in (("vq2g32", 53), ("vq1g64", 33), ("newfmt7", 41)):
+                (self.model / f"experts-{name}").mkdir()
+                (self.model / f"experts-{name}" / "index.json").write_text(
+                    json.dumps(dict(geometry, format=f"colibri.qwen38.experts-{name}", record_bytes=record)))
+                with mock.patch.dict(os.environ, {"Q38_EXPERT_LOWBIT": name}):
+                    plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+                self.assertEqual((name, plan["model"]["per_cap_bytes"]), (name, record))
+            with mock.patch.dict(os.environ, {"Q38_EXPERT_LOWBIT": "nosidecar"}):   # no index: not priced as one (the engine refuses it)
+                plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+            self.assertNotIn("qwen38_int4_experts", plan["model"])
+            os.environ["Q38_EXPERT_INT2"] = "1"
+            # the int2 index of another format or still being written is not priced
+            (self.model / "experts-int2g32" / "index.json").write_text(
+                json.dumps(dict(geometry, format="colibri.qwen38.experts-int2g32", record_bytes=60, complete=False)))
+            plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+            self.assertEqual(plan["model"]["per_cap_bytes"], 384)
+
     def test_cli_emits_versioned_json(self):
         cli = Path(__file__).parents[1] / "coli"
         run = subprocess.run([
@@ -1459,7 +1637,9 @@ memInfo.free:                     23.50 GB (97%)
         self.assertEqual(env["RAM_GB"], "12")
         self.assertEqual(env["COLI_CUDA"], "1")
         self.assertEqual(env["COLI_GPUS"], "1")
-        self.assertEqual(env["OMP_NUM_THREADS"], str(plan["cpu"]["physical_cores"]))
+        # the plan's team: the physical cores, a hybrid CPU's performance cores
+        self.assertEqual(env["OMP_NUM_THREADS"], str(plan["cpu"]["team_threads"]))
+        self.assertLessEqual(plan["cpu"]["team_threads"], plan["cpu"]["physical_cores"])
         # The plan must NOT set OMP_PROC_BIND / OMP_PLACES on any platform:
         # the engine's own hot-thread tuning owns affinity (it prefers
         # OMP_PROC_BIND=close for the back-to-back per-expert matmuls). Setting
@@ -1468,6 +1648,13 @@ memInfo.free:                     23.50 GB (97%)
         self.assertNotIn("OMP_PROC_BIND", env)
         self.assertNotIn("OMP_PLACES", env)
         self.assertEqual(env["PIN_GB"], env["CUDA_EXPERT_GB"])
+        # GLM's engine reads the plan's budget as it is: GB for all the cards
+        self.assertEqual(env["CUDA_EXPERT_GB"], f"{plan['tiers']['vram']['budget_bytes'] / GB:.3f}")
+        # the unit, at a size where GB and GiB differ; the user's number stays
+        vram = dict(plan["tiers"]["vram"], budget_bytes=20 * GB)
+        big = dict(plan, tiers=dict(plan["tiers"], vram=vram))
+        self.assertEqual(environment_for_plan(big)["CUDA_EXPERT_GB"], "20.000")
+        self.assertEqual(environment_for_plan(plan, {"CUDA_EXPERT_GB": "6"})["CUDA_EXPERT_GB"], "6")
 
         explicit_threads = environment_for_plan(plan, {"OMP_NUM_THREADS": "7",
                                                         "OMP_PROC_BIND": "close"})
@@ -1916,7 +2103,7 @@ class VulkanPartialChainQwenOlmoeTest(unittest.TestCase):
         write_shard(self.model / "model.safetensors", tensors)
         return analyze_model(self.model)
 
-    def write_olmoe(self):
+    def write_olmoe(self, f32_fill=NOT_BF16):
         """tools/make_olmoe_tiny.py's geometry as tools/convert_olmoe_merged.py writes it."""
         c = {"architectures": ["OlmoeForCausalLM"], "model_type": "olmoe", "hidden_size": 64,
              "intermediate_size": 32, "num_attention_heads": 4, "num_key_value_heads": 4, "num_experts": 8,
@@ -1936,8 +2123,61 @@ class VulkanPartialChainQwenOlmoeTest(unittest.TestCase):
             for e in range(8):
                 tensors.append((p + f"mlp.experts.{e}.merged_weight", 3 * 32 * 64, "I8", [3 * 32 * 64]))
                 tensors.append((p + f"mlp.experts.{e}.qs", (2 * 32 + 64) * 4, "F32", [2 * 32 + 64]))
-        write_shard(self.model / "model.safetensors", tensors)
+        write_shard(self.model / "model.safetensors", tensors, f32_fill=f32_fill)
         return analyze_model(self.model)
+
+    def test_cuda_plan_leaves_qwen36_tier_to_size_each_card(self):
+        # qwen36_tier.c reads CUDA_EXPERT_GB as GiB for each card: the plan's GB
+        # for both cards would give each of them the total
+        self.write_qwen36()
+        gpus = [{"index": i, "name": "card", "total_bytes": 24 * GB, "free_bytes": 22 * GB} for i in (0, 1)]
+        plan = build_plan(self.model, context=64, available_memory=16 * GB,
+                          available_disk=16 * GB, gpus=gpus)
+        self.assertGreater(plan["tiers"]["vram"]["budget_bytes"], 0)
+        env = environment_for_plan(plan)
+        self.assertEqual(env["COLI_CUDA"], "1")
+        self.assertEqual(env["COLI_GPUS"], "0,1")
+        self.assertNotIn("CUDA_EXPERT_GB", env)
+
+    def test_olmoe_matrices_that_are_bf16_go_up_as_bf16(self):
+        """backend_vulkan.c coli_vk_f32_fmt: an f32 matrix whose every value is a bf16
+        widened goes up as bf16, fmt 11 (#2040), and the plan counts it so; zeros are,
+        the fixture's 1.0000001 is not. q, k, v, o and the router save half their rows,
+        lm_head is the tail at bf16."""
+        from resource_plan import _VK_CHAIN_LAYOUT, vk_tensor_bytes
+        cpu = {"type": "cpu", "budget_bytes": 64 * GB}
+        on = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1"}
+        info = self.write_olmoe(f32_fill=None)
+        got = _VK_CHAIN_LAYOUT["olmoe"](info, on, cpu)
+        saved = (4 * (vk_tensor_bytes(10, 64, 64) - vk_tensor_bytes(11, 64, 64)) +
+                 vk_tensor_bytes(10, 64, 8) - vk_tensor_bytes(11, 64, 8))
+        self.assertEqual((got.layers, got.tail), ([168192 - saved] * 4, vk_tensor_bytes(11, 64, 128)))
+
+    def test_half_fmt_reads_the_dtype_and_the_values(self):
+        """backend_vulkan.c coli_vk_f32_fmt's rule from the checkpoint: bf16 (11) when every
+        value is a bf16, f16 (14) when every value is an f16, f32 (None) otherwise; a BF16
+        or F16 tensor from its header, an F32 one from its values."""
+        from resource_plan import _half_fmt
+        values = {"bf16": struct.pack("<4f", 1.0, -2.5, 0.0, 3.0),
+                  "f16": struct.pack("<4f", 1.0, 999 / 1024, 2.0 ** -20, -65504.0),
+                  "f32": struct.pack("<4f", 1.0, -2.5, 0.0, 1.0000001),
+                  "big": struct.pack("<4f", 1.0, 999 / 1024, 0.0, 70000.0)}
+        header, blob = {}, b""
+        for name, data in values.items():
+            header[f"{name}.weight"] = {"dtype": "F32", "shape": [4],
+                                        "data_offsets": [len(blob), len(blob) + len(data)]}
+            blob += data
+        for name, dtype in (("half", "BF16"), ("fp16", "F16"), ("fp8", "F8_E4M3")):
+            header[f"{name}.weight"] = {"dtype": dtype, "shape": [4], "data_offsets": [len(blob), len(blob) + 8]}
+            blob += b"\1" * 8
+        raw = json.dumps(header).encode()
+        (self.model / "model.safetensors").write_bytes(struct.pack("<Q", len(raw)) + raw + blob)
+        info = {"path": str(self.model),
+                "dense_tensors": [{"name": n, "dtype": h["dtype"]} for n, h in header.items()]}
+        self.assertEqual([_half_fmt(info, f"{n}.weight") for n in ("bf16", "f16", "f32", "big")],
+                         [11, 14, None, None])
+        self.assertEqual([_half_fmt(info, f"{n}.weight") for n in ("half", "fp16", "fp8", "missing")],
+                         [11, 14, None, None])   # from the header alone
 
     def test_layouts_are_the_engines(self):
         # "[VK] qwen36 chain fit: ... fixed X B (the engine's E B, ...), tail T B, layers ..." and
@@ -2107,7 +2347,8 @@ class Qwen38PartialChainTest(unittest.TestCase):
 
     def test_qwen38_layout_is_the_engines(self):
         # The numbers qwen38 printed for these geometries on Lavapipe ("[VK] qwen38 chain
-        # fit: ... the engine's 1529872 B ..., tail 8960 B, layers 47664 92768 24112 92768 B"):
+        # fit: ... the engine's 1528848 B ..., tail 8960 B, layers 47664 92768 24112 92768 B";
+        # 1529872 before the QSA scores went to one float a block a row, #2116):
         # bf16 by default, the int8 trunk (Q38_TRUNK_MIN_KB=0), f32, the PLE at layer 2, and
         # the MTP head's matrices in the tail.
         from resource_plan import vk_chain_fit, vk_fit_pools
@@ -2124,7 +2365,7 @@ class Qwen38PartialChainTest(unittest.TestCase):
                 info = self.write_q38(ple)
                 fit = vk_chain_fit(info, "qwen38", dict(on, **env), device)
                 self.assertEqual(fit["layers"], layers)
-                self.assertEqual(fit["fixed"] - vk_fit_pools(0), 1529872)
+                self.assertEqual(fit["fixed"] - vk_fit_pools(0), 1528848)
                 self.assertEqual(fit["n"], 4)
                 self.assertTrue(fit["tail"])
         # the MTP head goes with the tail under Q38_MTP=1 (43008 B in bf16, 27392 B as int8 rows)
@@ -2145,6 +2386,22 @@ class Qwen38PartialChainTest(unittest.TestCase):
         self.assertLess(small["fixed"], vk_chain_fit(info, "qwen38", on, device)["fixed"])
         self.assertEqual([a < b for a, b in zip(small["layers"], [47664, 92768, 24112, 92768])],
                          [False, True, False, True])
+
+    def test_qwen38_keeps_the_lm_head_on_the_host_for_the_draft_list(self):
+        from resource_plan import _vk_released_tensor_bytes
+        head = {"name": "lm_head.weight", "dtype": "BF16", "shape": [320, 64], "size": 320 * 64 * 2,
+                "resident": 320 * 64 + 4 * 320}
+        self.assertEqual(_vk_released_tensor_bytes(head, "qwen38", {}), 0)
+        for off in ({"Q38_MTP": "0"}, {"Q38_MTP_VOCAB": "0"}):
+            with self.subTest(env=off):
+                self.assertEqual(_vk_released_tensor_bytes(head, "qwen38", off), head["resident"])
+        # the engine drops the list when its counts file is the expert history, in any spelling
+        for same in ({"COLI_VOCAB_USAGE": "u", "COLI_USAGE": "./u"},
+                     {"COLI_USAGE": "/model/.coli_vocab"},
+                     {"COLI_VOCAB_USAGE": "/model/./.coli_usage"}):
+            with self.subTest(env=same):
+                self.assertEqual(_vk_released_tensor_bytes(head, "qwen38", same, "/model"), head["resident"])
+        self.assertEqual(_vk_released_tensor_bytes(head, "qwen38", {"COLI_USAGE": "/model/.coli_vocab"}, "/other"), 0)
 
     def test_qwen38_device_only_credits_the_layers_on_the_device(self):
         from resource_plan import vk_chain_fit, _vk_released_tensor_bytes
@@ -2268,7 +2525,7 @@ class VulkanPartialChainGlm53Test(unittest.TestCase):
                 for name in ("gate", "up", "down"):
                     add(p + f"mlp.experts.{e}.{name}_proj.weight", 8192, dtype="U8")
                     add(p + f"mlp.experts.{e}.{name}_proj.weight.qs", 256)
-        write_shard(self.model / "model.safetensors", tensors)
+        write_shard(self.model / "model.safetensors", tensors, f32_fill=NOT_BF16)
         self.info = analyze_model(self.model)
 
     def tearDown(self):
@@ -2363,7 +2620,7 @@ class VulkanPartialChainDskTest(unittest.TestCase):
 
     def write(self, config, tensors):
         (self.model / "config.json").write_text(json.dumps(config))
-        write_shard(self.model / "model.safetensors", tensors)
+        write_shard(self.model / "model.safetensors", tensors, f32_fill=NOT_BF16)
         return analyze_model(self.model)
 
     def write_v41(self):
@@ -2587,7 +2844,7 @@ class VulkanPartialChainInklingMimoTest(unittest.TestCase):
                 add(p + "mlp.shared_experts.down_proj", 2, 64, 32)
                 add(p + "mlp.experts.gate_up_proj", 8, 64, 64)
                 add(p + "mlp.experts.down_proj", 8, 64, 32)
-        write_shard(self.model / "model.safetensors", main)
+        write_shard(self.model / "model.safetensors", main, f32_fill=NOT_BF16)
         if container:
             (self.model / "dense-int4g64").mkdir()
             write_shard(self.model / "dense-int4g64" / "dense.safetensors", quant)
@@ -2751,6 +3008,61 @@ class VulkanPartialChainInklingMimoTest(unittest.TestCase):
         self.assertEqual(none["dense_on_device_bytes"], 0)
 
 
+class PerformanceCoreCountTest(unittest.TestCase):
+    """A hybrid x86 CPU's OpenMP team: its performance cores (performance_core_count)."""
+
+    @staticmethod
+    def _windows_records(classes, cache_records=1):
+        # SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX: Relationship, Size, then
+        # PROCESSOR_RELATIONSHIP (Flags, EfficiencyClass, ...); 48 bytes a record
+        out = b""
+        for _ in range(cache_records):   # RelationCache: skipped
+            out += (2).to_bytes(4, "little") + (48).to_bytes(4, "little") + bytes(40)
+        for cls in classes:
+            out += (0).to_bytes(4, "little") + (48).to_bytes(4, "little") + bytes([0, cls]) + bytes(38)
+        return out
+
+    def test_windows_counts_the_highest_efficiency_class(self):
+        from resource_plan import _windows_performance_cores
+        self.assertEqual(_windows_performance_cores(self._windows_records([1] * 6 + [0] * 8)), 6)
+        self.assertEqual(_windows_performance_cores(self._windows_records([1] * 6 + [0] * 8 + [0] * 2)), 6)
+        self.assertIsNone(_windows_performance_cores(self._windows_records([0] * 16)))
+        self.assertIsNone(_windows_performance_cores(b"\0" * 7))
+
+    def _sysfs(self, root, p, e, siblings):
+        (root / "devices/cpu_core").mkdir(parents=True)
+        (root / "devices/cpu_core/cpus").write_text(p + "\n", encoding="ascii")
+        if e is not None:
+            (root / "devices/cpu_atom").mkdir(parents=True)
+            (root / "devices/cpu_atom/cpus").write_text(e + "\n", encoding="ascii")
+        for cpu, sib in siblings.items():
+            d = root / f"devices/system/cpu/cpu{cpu}/topology"
+            d.mkdir(parents=True)
+            (d / "thread_siblings_list").write_text(sib + "\n", encoding="ascii")
+
+    def test_linux_counts_the_p_cores_once_per_sibling_list(self):
+        from resource_plan import _linux_performance_cores
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)   # an i5-13500: P-cores 0-11 (SMT pairs), E-cores 12-19
+            self._sysfs(root, "0-11", "12-19", {c: f"{c - c % 2}-{c - c % 2 + 1}" for c in range(12)})
+            self.assertEqual(_linux_performance_cores(root), 6)
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)   # one kind of core: no cpu_atom PMU
+            self._sysfs(root, "0-7", None, {c: str(c) for c in range(8)})
+            self.assertIsNone(_linux_performance_cores(root))
+        self.assertIsNone(_linux_performance_cores(Path("/nonexistent-sysfs")))
+
+    def test_team_falls_back_to_the_physical_cores(self):
+        import resource_plan
+        with mock.patch("resource_plan.performance_core_count", return_value=None), \
+             mock.patch("resource_plan.physical_cpu_count", return_value=8):
+            self.assertEqual(resource_plan.team_cpu_count(), 8)
+        with mock.patch("resource_plan.performance_core_count", return_value=6), \
+             mock.patch("resource_plan.physical_cpu_count", return_value=14):
+            self.assertEqual(resource_plan.team_cpu_count(), 6)
+
+
 class PhysicalCpuCountTest(unittest.TestCase):
     """Regression for #325: --auto-tier pinned decode to one core because
     physical_cpu_count() silently returned 1.
@@ -2818,14 +3130,38 @@ class PhysicalCpuCountTest(unittest.TestCase):
              mock.patch("sys.stderr"):
             self.assertEqual(physical_cpu_count(), 1)
 
-    def test_apple_silicon_prefers_performance_cores(self):
+    @staticmethod
+    def _darwin(values):
         def sysctl(command, **kwargs):
-            value = "8\n" if command[-1] == "hw.perflevel0.logicalcpu" else "10\n"
+            if command[-1] not in values:
+                raise subprocess.CalledProcessError(1, command)
             return subprocess.CompletedProcess(args=command, returncode=0,
-                                               stdout=value, stderr="")
-        with mock.patch("resource_plan.subprocess.run", side_effect=sysctl), \
+                                               stdout=f"{values[command[-1]]}\n", stderr="")
+        return sysctl
+
+    def test_apple_silicon_prefers_performance_cores(self):
+        # an M1 Max: 8 P-cores and 2 E-cores, hw.physicalcpu 10
+        values = {"hw.nperflevels": 2, "hw.perflevel0.logicalcpu": 8, "hw.perflevel1.logicalcpu": 2,
+                  "hw.physicalcpu": 10}
+        with mock.patch("resource_plan.subprocess.run", side_effect=self._darwin(values)), \
              mock.patch.object(sys, "platform", "darwin"):
             self.assertEqual(physical_cpu_count(), 8)
+
+    def test_apple_silicon_three_tiers_takes_every_tier_but_efficiency(self):
+        # #2194, an M6: 2 Super, 4 Performance, 6 Efficiency; perflevel0 alone gave 2
+        values = {"hw.nperflevels": 3, "hw.perflevel0.logicalcpu": 2, "hw.perflevel1.logicalcpu": 4,
+                  "hw.perflevel2.logicalcpu": 6, "hw.physicalcpu": 12}
+        with mock.patch("resource_plan.subprocess.run", side_effect=self._darwin(values)), \
+             mock.patch.object(sys, "platform", "darwin"):
+            self.assertEqual(physical_cpu_count(), 6)
+
+    def test_apple_one_tier_is_every_core_and_older_macos_reads_perflevel0(self):
+        one = {"hw.nperflevels": 1, "hw.perflevel0.logicalcpu": 8, "hw.physicalcpu": 8}
+        old = {"hw.perflevel0.logicalcpu": 6, "hw.physicalcpu": 8}   # no hw.nperflevels
+        for values, want in ((one, 8), (old, 6)):
+            with mock.patch("resource_plan.subprocess.run", side_effect=self._darwin(values)), \
+                 mock.patch.object(sys, "platform", "darwin"):
+                self.assertEqual(physical_cpu_count(), want)
 
 
 if __name__ == "__main__":

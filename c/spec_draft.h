@@ -27,11 +27,26 @@
  *                 verify's cost has fewer than 3 measurements), and after SPEC_REFRESH
  *                 forwards with no plain step it takes one, so T(1) stays measured.
  *
+ *   per-draft     a source that can say how likely each of THIS step's drafts is to be
+ *   estimates     accepted (DeepSeek V4.1's DSpark confidence head, an MTP head's probability
+ *                 of its own token) passes them to spec_gate_pick_p, which picks the depth
+ *                 from them instead of the running averages: a_j above is then the
+ *                 acceptance the gate measured for drafts given that estimate (SPEC_PBINS
+ *                 bins of p, each starting at the bin's own p, worth two verifies), and
+ *                 cost(k) leaves out d: those drafts are already written. A step
+ *                 whose drafts are sure verifies deeper, a doubtful one stops early or takes
+ *                 a plain step (DeepSeek's "confidence-scheduled verification").
+ *                 spec_gate_deeper_p says, while a source drafts one at a time, whether
+ *                 the drafts written so far leave room for another: not when a shorter
+ *                 verify is already worth more, or when no next draft could pass.
+ *
  * Neither ever changes a token: every proposal goes through the engine's verify, which
  * keeps exactly what plain decoding produces. They change how many forwards that takes.
  *
- * Callers: qwen38_core.h (MTP drafts and prompt lookup, combined) and qwen36.c (prompt
- * lookup). docs/speculative.md describes how another engine with a verify path wires it. */
+ * Callers: qwen38_core.h (MTP drafts and prompt lookup, combined), qwen36.c (prompt lookup
+ * and the MTP head), colibri.c (GLM's MTP head, its n-gram drafts) and deepseek_v41.c
+ * (DSpark's depth). docs/speculative.md describes how another engine with a verify path
+ * wires it. */
 #ifndef COLI_SPEC_DRAFT_H
 #define COLI_SPEC_DRAFT_H
 
@@ -45,6 +60,8 @@
 #define SPEC_RHO0       0.5        /* a row's extra cost, relative to one row, before any is measured */
 #define SPEC_ACC_W      16.0       /* the acceptance's memory, in verifies */
 #define SPEC_T_W        8.0        /* a forward time's memory, in forwards */
+#define SPEC_PBINS      10         /* bins of a per-draft estimate p (spec_gate_pick_p) */
+#define SPEC_P_W        64.0       /* a bin's memory, in judged drafts */
 
 enum { SPEC_SRC_MTP = 0, SPEC_SRC_LOOKUP = 1, SPEC_NSRC = 2 };
 
@@ -58,6 +75,8 @@ typedef struct {
     int picks[SPEC_NSRC];                     /* picks so far (the probe's clock) */
     int since_plain;                          /* forwards since the last plain step */
     int off;                                  /* 1: every proposal drafted in full (tests, fixed depths) */
+    double pb[SPEC_NSRC][SPEC_PBINS];         /* P(accepted | its drafts before it were, estimate in bin b) */
+    double pb_w[SPEC_NSRC][SPEC_PBINS];
     /* the run's counts, for the engines' report lines */
     unsigned long long prop[SPEC_NSRC][SPEC_MAX_DRAFTS], hit[SPEC_NSRC][SPEC_MAX_DRAFTS];
     unsigned long long verifies[SPEC_NSRC], probes[SPEC_NSRC], declined[SPEC_NSRC];
@@ -74,6 +93,8 @@ static inline void spec_gate_init(SpecGate *g, int off) {
         g->acc_w[SPEC_SRC_MTP][j] = g->acc_w[SPEC_SRC_LOOKUP][j] = 2.0;
     }
     g->rho = SPEC_RHO0; g->rho_w = 1.0;
+    for (int src = 0; src < SPEC_NSRC; src++)
+        for (int b = 0; b < SPEC_PBINS; b++) { g->pb[src][b] = (b + 0.5) / SPEC_PBINS; g->pb_w[src][b] = 2.0; }
 }
 
 static inline void spec_ema(double *x, double *w, double v, double memory) {
@@ -116,6 +137,26 @@ static inline void spec_gate_result(SpecGate *g, int src, int judged, int accept
     }
 }
 
+/* The bin of an estimate p in [0, 1] (NaN and the outside clamp to the ends). */
+static inline int spec_gate_pbin(float p) {
+    int b = p >= 0.0f ? (int)(p * SPEC_PBINS) : 0;
+    return b < 0 ? 0 : b >= SPEC_PBINS ? SPEC_PBINS - 1 : b;
+}
+/* What the gate measured for a draft whose source estimated p. */
+static inline double spec_gate_p_rate(const SpecGate *g, int src, float p) {
+    return g->pb[src][spec_gate_pbin(p)];
+}
+/* spec_gate_result with the drafts' estimates: the bins learn from the judged drafts. */
+static inline void spec_gate_result_p(SpecGate *g, int src, int judged, int accepted, const float *p) {
+    spec_gate_result(g, src, judged, accepted);
+    if (src < 0 || src >= SPEC_NSRC || judged < 1 || !p) return;
+    if (judged > SPEC_MAX_DRAFTS) judged = SPEC_MAX_DRAFTS;
+    for (int j = 0; j < judged; j++) {
+        int b = spec_gate_pbin(p[j]);
+        spec_ema(&g->pb[src][b], &g->pb_w[src][b], j < accepted ? 1.0 : 0.0, SPEC_P_W);
+    }
+}
+
 /* T(n) in units of T(1): measured, or the fitted line. */
 static inline double spec_gate_rows_cost(const SpecGate *g, int rows) {
     if (rows <= 1) return 1.0;
@@ -133,6 +174,56 @@ static inline double spec_gate_value(const SpecGate *g, int src, int k, double *
     if (k > 1 && g->d_w[src] > 0.0 && g->t_w[1] > 0.0 && g->t[1] > 0.0) cost += (k - 1) * g->d[src] / g->t[1];
     if (expect) *expect = e;
     return k > 0 ? e / cost : 1.0;
+}
+
+/* The value of a verify of k drafts already made, whose acceptances are a[0..k) (each
+ * given the ones before it stood): their draft cost is already spent. */
+static inline double spec_gate_value_a(const SpecGate *g, int src, int k, const double *a) {
+    (void)src;
+    double e = 1.0, q = 1.0;
+    for (int j = 0; j < k && j < SPEC_MAX_DRAFTS; j++) { q *= a[j]; e += q; }
+    return k > 0 ? e / spec_gate_rows_cost(g, k + 1) : 1.0;
+}
+
+/* spec_gate_pick for drafts already made, with the source's estimate p[j] for each of the
+ * maxk (DSpark's confidence, an MTP head's probability): the depth this step's drafts are
+ * worth. The probe and the plain steps that keep T(1) measured are spec_gate_pick's. */
+static inline int spec_gate_pick_p(SpecGate *g, int src, int maxk, const float *p, double *value) {
+    if (value) *value = 1.0;
+    if (maxk <= 0 || src < 0 || src >= SPEC_NSRC) return 0;
+    if (maxk > SPEC_MAX_DRAFTS) maxk = SPEC_MAX_DRAFTS;
+    if (g->off || !p) return maxk;
+    if (g->since_plain >= SPEC_REFRESH) { g->declined[src]++; return 0; }
+    double a[SPEC_MAX_DRAFTS] = {0};
+    for (int j = 0; j < maxk; j++) a[j] = spec_gate_p_rate(g, src, p[j]);
+    int best = 0; double bv = 1.0;
+    for (int k = 1; k <= maxk; k++) {
+        double v = spec_gate_value_a(g, src, k, a);
+        if (v > bv) { bv = v; best = k; }
+    }
+    int every = best < maxk && g->t_w[best + 2] < 3.0 ? SPEC_PROBE_NEW : SPEC_PROBE;
+    if (++g->picks[src] % every == 0 && best < maxk) {
+        best++; bv = spec_gate_value_a(g, src, best, a); g->probes[src]++;
+    }
+    if (!best) g->declined[src]++;
+    if (value) *value = bv;
+    return best;
+}
+
+/* Whether another draft past the n already written is worth writing, from their
+ * estimates p[0..n): not when a shorter verify is already worth more than n, or when
+ * even a top-bin next draft would not beat n (or a plain step). 1 with the gate off
+ * or no estimates. */
+static inline int spec_gate_deeper_p(const SpecGate *g, int src, int n, const float *p) {
+    if (g->off || !p || n < 1 || src < 0 || src >= SPEC_NSRC) return 1;
+    if (n >= SPEC_MAX_DRAFTS) return 0;
+    double a[SPEC_MAX_DRAFTS] = {0};
+    for (int j = 0; j < n; j++) { if (p[j] < 0.0f) return 1; a[j] = spec_gate_p_rate(g, src, p[j]); }
+    double vn = spec_gate_value_a(g, src, n, a);
+    for (int k = 1; k < n; k++) if (spec_gate_value_a(g, src, k, a) > vn) return 0;
+    for (int b = 0; b < SPEC_PBINS; b++) if (g->pb[src][b] > a[n]) a[n] = g->pb[src][b];
+    double v = spec_gate_value_a(g, src, n + 1, a);
+    return v > 1.0 && v > vn;
 }
 
 /* How many of the up to maxk drafts src can offer the next verify should carry: 0 for a

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import {
   Activity,
+  ArrowDown,
   ArrowUp,
   BrainCircuit,
   CircleStop,
@@ -24,7 +25,7 @@ import {
   SlidersHorizontal,
   Timer,
   Trash2,
-  Zap, ImagePlus, Camera, Grid3x3, Palette} from "lucide-react"
+  Zap, ImagePlus, Camera, Grid3x3, Palette, FileText} from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -38,8 +39,8 @@ import {
   DEFAULT_SIZE, DEFAULT_STEPS, chatTurns, clampSteps, dataUrlBlob, imageFileName, parseSeed, parseSize,
   presetOf, randomSeed, sizeKey, validSide, type ImageSize,
 } from "@/lib/images"
-import { resendFrom } from "@/lib/chat"
-import { activeRequests, supportsCacheSlots, supportsContinuation } from "@/lib/runtime"
+import { chatMarkdown, exportName, resendFrom } from "@/lib/chat"
+import { activeRequests, supportsCacheSlots, supportsCompaction, supportsContinuation } from "@/lib/runtime"
 import Brio from "./Brio"
 import { BrainWorkspace } from "./BrainWorkspace"
 import { Brand } from "./components/Brand"
@@ -75,7 +76,11 @@ export default function App() {
   const [imageModels, setImageModels] = useState<string[]>([])
   const [model, setModel] = useState(() => stored(localStorage, "colibri.model", "glm-5.2-colibri"))
   const [temperature, setTemperature] = useState(0.7)
-  const [maxTokens, setMaxTokens] = useState(4096)
+  /* null: the server's own ceiling (/health max_tokens; on colibrì the context the
+     engine holds), sent as no limit at all. A reasoning model's turn is its reasoning
+     plus its answer, and a fixed 4096 cut most of them short (#382). A number: the
+     user's own, up to that ceiling. */
+  const [maxTokens, setMaxTokens] = useState<number | null>(null)
   const [thinking, setThinking] = useState(false)
   const [cacheSlot, setCacheSlot] = useState(0)
   const [conversations, setConversations] = useState<Record<number, ChatMessage[]>>({ 0: [] })
@@ -116,7 +121,11 @@ export default function App() {
   const autoConnected = useRef(false)
   const abortRef = useRef<AbortController | null>(null)
   const probeRef = useRef<AbortController | null>(null)
-  const bottomRef = useRef<HTMLDivElement>(null)
+  const conversationRef = useRef<HTMLDivElement>(null)
+  const followRef = useRef(true)   // the reader is at the bottom: a streaming answer keeps the view there
+  const exportRef = useRef<HTMLDivElement>(null)
+  const [atBottom, setAtBottom] = useState(true)
+  const [exportOpen, setExportOpen] = useState(false)
   const messages = conversations[cacheSlot] || []
   const kvSlots = Math.max(1, health?.kv_slots || 1)
   const active = activeRequests(health)
@@ -178,7 +187,41 @@ export default function App() {
   useEffect(() => { setLastRun(null) }, [cacheSlot])
 
   // EFFECT #7
-  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }) }, [messages])
+  /* The view follows the conversation. A new turn (a sent message, a restored or switched
+     conversation) brings it to the bottom, and while an answer streams it stays at the
+     bottom as long as the reader is there. Scrolling up stops the following: the reader
+     stays where they are, whatever streams below, until they scroll back down or press
+     the button below the list. */
+  const toBottom = (smooth: boolean) => {
+    const box = conversationRef.current
+    if (!box) return
+    followRef.current = true
+    box.scrollTo({ top: box.scrollHeight, behavior: smooth ? "smooth" : "auto" })
+  }
+  useEffect(() => { toBottom(false) }, [messages.length, cacheSlot])
+  const checkBottom = () => {
+    const box = conversationRef.current
+    const near = !box || box.scrollHeight - box.scrollTop - box.clientHeight < 80
+    followRef.current = near
+    setAtBottom(near)
+  }
+  useEffect(() => {
+    const box = conversationRef.current
+    if (box && followRef.current) box.scrollTop = box.scrollHeight
+    else checkBottom()
+  }, [messages])
+
+  // EFFECT #8
+  useEffect(() => {
+    if (!exportOpen) return
+    const close = (event: Event) => {
+      if (event instanceof KeyboardEvent ? event.key === "Escape" : !exportRef.current?.contains(event.target as Node))
+        setExportOpen(false)
+    }
+    document.addEventListener("mousedown", close)
+    document.addEventListener("keydown", close)
+    return () => { document.removeEventListener("mousedown", close); document.removeEventListener("keydown", close) }
+  }, [exportOpen])
 
   const connect = async () => {
     probeRef.current?.abort()
@@ -264,9 +307,11 @@ export default function App() {
         model,
         messages: chatTurns(payload),
         temperature,
-        maxTokens,
+        maxTokens: maxTokens ?? undefined,
         enableThinking: thinking,
         cacheSlot: supportsCacheSlots(health) ? cacheSlot : undefined,
+        compact: supportsCompaction(health),
+        keepReasoning: supportsCompaction(health),
         signal: controller.signal,
         /* Reasoning tokens are tokens: they count toward the rate, and the
            first one is the real time-to-first-token. The answer's first token
@@ -429,9 +474,14 @@ export default function App() {
     if (messages.length) setArchives(items => [{ id: message("system", "").id, slot: cacheSlot, messages: [...messages] }, ...items])
     clearChat(); setDraft(""); setView("chat"); requestAnimationFrame(() => draftRef.current?.focus())
   }
-  const exportChat = () => {
-    const url = URL.createObjectURL(new Blob([JSON.stringify({ model, messages }, null, 2)], { type: "application/json" }))
-    const anchor = document.createElement("a"); anchor.href = url; anchor.download = "colibri-chat.json"; anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 1000)
+  const exportChat = (format: "md" | "json") => {
+    setExportOpen(false)
+    const when = new Date()
+    const body = format === "md"
+      ? chatMarkdown(messages, model, when, { user: t("chat.you"), assistant: t("chat.colibri"), reasoning: t("sidebar.reasoning"), image: t("chat.image") })
+      : JSON.stringify({ model, exported: when.toISOString(), messages }, null, 2)
+    const url = URL.createObjectURL(new Blob([body], { type: format === "md" ? "text/markdown" : "application/json" }))
+    const anchor = document.createElement("a"); anchor.href = url; anchor.download = exportName(when, format); anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
   const copyMessage = async (item: ChatMessage) => {
     try { await navigator.clipboard.writeText(item.content); setCopied(item.id) } catch { setError(t("ui.copyError")) }
@@ -462,7 +512,7 @@ export default function App() {
             {Array.from({ length: kvSlots }, (_, slot) => <option key={slot} value={slot}>{t("sidebar.sessionLabel", { slot: slot + 1 })}</option>)}
           </select><span className="field-help">{t("sidebar.kvSessionHelp")}</span></label> : null}
           <label><span className="label-line"><span>{t("sidebar.temperature")}</span><code>{temperature.toFixed(1)}</code></span><input id="temperature" className="range" type="range" min="0" max="2" step="0.1" value={temperature} onChange={(event) => setTemperature(Number(event.target.value))} /></label>
-          <label>{t("sidebar.maxTokens")}<Input id="max-tokens" type="number" min={1} max={32768} value={maxTokens} onChange={(event) => { const value = Number(event.target.value); if (Number.isFinite(value)) setMaxTokens(Math.min(32768, Math.max(1, Math.round(value)))) }} /></label>
+          <label>{t("sidebar.maxTokens")}<Input id="max-tokens" type="number" min={1} max={health?.max_tokens} value={maxTokens ?? health?.max_tokens ?? ""} onChange={(event) => { if (event.target.value === "") { setMaxTokens(null); return } const value = Number(event.target.value); if (!Number.isFinite(value)) return; const wanted = Math.max(1, Math.round(value)); setMaxTokens(health?.max_tokens && wanted >= health.max_tokens ? null : wanted) }} /></label>
           <button type="button" className={cn("toggle-row", thinking && "active")} aria-pressed={thinking} onClick={() => setThinking((value) => !value)}>
             <span><BrainCircuit className="size-4" /> {t("sidebar.reasoning")}</span><i><b /></i>
           </button>
@@ -541,7 +591,7 @@ export default function App() {
         <button className="model-button" onClick={() => openSettings("model")}><span>{model}</span><ChevronDown /></button>
         <div className="workspace-actions">
           <button className={cn("connection-state", connected && "connected")} onClick={() => openSettings("connection")}><span />{connected ? t("status.connected") : t("status.notConnected")}</button>
-          {view === "chat" && <><button className="icon-action" aria-label={t("ui.export")} title={t("ui.export")} disabled={empty} onClick={exportChat}><Download /></button><button className="icon-action" aria-label={t("topbar.clear")} title={t("topbar.clear")} disabled={empty || loading} onClick={clearChat}><Trash2 /></button></>}
+          {view === "chat" && <><div className="export-wrap" ref={exportRef}><button className="icon-action" aria-label={t("ui.export")} title={t("ui.export")} aria-haspopup="menu" aria-expanded={exportOpen} disabled={empty} onClick={() => setExportOpen(open => !open)}><Download /></button>{exportOpen && <div className="export-menu" role="menu"><button role="menuitem" onClick={() => exportChat("md")}><FileText />{t("ui.exportMarkdown")}</button><button role="menuitem" onClick={() => exportChat("json")}><Code2 />{t("ui.exportJson")}</button></div>}</div><button className="icon-action" aria-label={t("topbar.clear")} title={t("topbar.clear")} disabled={empty || loading} onClick={clearChat}><Trash2 /></button></>}
         </div>
       </header>}
       {view === "settings" ? <section className="settings-page">
@@ -559,7 +609,7 @@ export default function App() {
       </section> : view === "brain" ? <BrainWorkspace baseUrl={baseUrl} apiKey={apiKey} connected={connected} />
       : view === "profiling" ? <section className="profiling-workspace"><header className="page-heading"><span>COLIBRI / ENGINE</span><h1>Profiling</h1></header>{metrics}<Profiling baseUrl={baseUrl} apiKey={apiKey} connected={connected} /></section>
       : <section className={cn("chat-view", empty && "empty")} hidden={view === "brio"}>
-        {empty ? <div className="welcome-brand"><Brand word /></div> : <div className="conversation" role="log" aria-label={t("nav.chat")}>
+        {empty ? <div className="welcome-brand"><Brand word /></div> : <div className="conversation" role="log" aria-label={t("nav.chat")} ref={conversationRef} onScroll={checkBottom}>
           <div className="message-list">{messages.map((item, index) => <article key={item.id} className={cn("message", item.role)}>
             {item.role !== "user" && <div className="assistant-brand"><Brand /><span>colibrì</span></div>}
             {item.images?.length ? <div className="message-images">{item.images.map((url, at) =>
@@ -571,9 +621,10 @@ export default function App() {
                 </details>
               : null}{item.content ? (item.role === "assistant" ? <Markdown text={item.content} /> : item.content) : <span className="typing" aria-label={t("ui.generating")}><i /><i /><i /></span>}</div>}
             {item.role === "assistant" && item.content && <div className="message-actions"><button className="icon-action" aria-label={t("ui.copy")} title={t("ui.copy")} onClick={() => void copyMessage(item)}><Copy /></button>{copied === item.id && <span role="status">{t("ui.copied")}</span>}{index === messages.length - 1 && !loading && !imageMode && <button className="icon-action" aria-label={t("ui.regenerate")} title={t("ui.regenerate")} onClick={() => { const retry = resendFrom(messages, index); if (retry) void send(retry.text, retry.previous, retry.pictures, false) }}><RefreshCw /></button>}{index === messages.length - 1 && !loading && !imageMode && supportsContinuation(health) && continuable(item) && <button className="icon-action" aria-label={t("ui.continue")} title={t("ui.continue")} onClick={() => void continueTurn()}><StepForward /></button>}</div>}
-          </article>)}<div ref={bottomRef} /></div>
+          </article>)}</div>
         </div>}
         <div className="composer-wrap">
+          {!empty && !atBottom && <button className="scroll-bottom" aria-label={t("chat.toBottom")} title={t("chat.toBottom")} onClick={() => toBottom(true)}><ArrowDown /></button>}
           {error && <div className="error-banner" role="alert">{t(error)}</div>}
           <form className={cn("composer", imageMode && "image-mode")} onSubmit={e => { e.preventDefault(); submit() }}
             onDragOver={e => { if (!imageMode && e.dataTransfer.types.includes("Files")) e.preventDefault() }}
@@ -601,6 +652,7 @@ export default function App() {
           </form>
           {empty && <div className="suggestions">{suggestions.map(({ key, Icon, label }) => <button key={key} onClick={() => { setDraft(t(key)); draftRef.current?.focus() }}><Icon />{t(label)}</button>)}</div>}
           {!empty && !imageMode && lastRun?.finishReason === "length" && <p className="truncation-note">{t("topbar.truncatedHelp")}</p>}
+          {!empty && !imageMode && lastRun?.compaction && <p className="truncation-note" title={lastRun.compaction.summary}>{t("chat.compacted", { n: lastRun.compaction.summarized_messages })}</p>}
         </div>
       </section>}
       <section className="brio-workspace" hidden={view !== "brio"}>

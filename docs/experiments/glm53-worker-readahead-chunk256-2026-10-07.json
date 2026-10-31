@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "hypothesis": "A bigger prefill chunk leaves each worker more compute per request to hide behind the next block's reads, so read-ahead gains more at GLM53_PREFILL_CHUNK=256 than at 128, still without changing any token.",
+  "commit": "44f685c0e6858eab8521209fec04b74e589c62ca",
+  "model": "GLM-5.3-Flash (a community abliterated fine-tune; same architecture and tensor shapes), Colibri int4-gs64 streaming container, 195.8 GB",
+  "command": "make -C c glm53 (coordinator and workers); workers: EXPERT_WORKER=1 CLUSTER_WORKER_PORT=9100 GLM53_EXPERT_GB=<10|6.7> OMP_NUM_THREADS=4 ./glm53 (SNAP=<model>); coordinator: GLM53_PREFILL_CHUNK=256 OMP_NUM_THREADS=5 COLI_CLUSTER_WEIGHTS=52,48 CLUSTER_WORKERS=<worker-a>:9100,<worker-b>:9100 GLM53_VERBOSE=2 ./glm53 --model <model> --prompt \"$(cat prompt.txt)\" --greedy 1; tok_s = 245 / (prefill seconds printed on stderr); arms alternated B,C after one warmup",
+  "prompt_hash": "dbfbf4c85ed8d67d9b15f76b51756af0518c48a3463593182ec9480744489407",
+  "hardware": {
+    "cpu": "coordinator Intel i5-8500 (6C/6T); two expert workers Intel i5-4570 (4C/4T)",
+    "ram": "coordinator 31 GB DDR4; workers 15 GB each",
+    "storage": "model on local SATA SSDs, ext4: coordinator Patriot P3 1 TB (~144 MB/s), workers ADATA SU650 (~371 MiB/s probe) and KingFast (~505 MiB/s probe)",
+    "os": "coordinator Linux 7.1.13-hardened, gcc 16.2.1; workers Linux 7.1.8-arch / Ubuntu 26.04, worker binaries built with gcc 16 -march=native (Haswell); Tailscale TCP between hosts; background miners STOPPED on all hosts for the run, tailscaled at nice -5, engines at nice 0"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "expert_workers"
+  ],
+  "baseline": {
+    "config": {
+      "model": "GLM-5.3-Flash, int4-gs64 Colibri container",
+      "prompt_tokens": 245,
+      "greedy": 1,
+      "coordinator_build": "299b6bfe (dev + cluster workers + deadlines + per-layer timing), OMP_NUM_THREADS=5, GLM53_PREFILL_CHUNK=256, COLI_CLUSTER_WEIGHTS=52,48 (fixed)",
+      "expert_workers": "2 x glm53 EXPERT_WORKER, binary 2b176379 (6d7e6796: cluster workers + deadlines, blocks read then computed in turn)"
+    },
+    "samples": {
+      "tok_s": [
+        0.511269,
+        0.543478,
+        0.530648
+      ],
+      "prefill_s": [
+        479.2,
+        450.8,
+        461.7
+      ]
+    },
+    "median_tok_s": 0.530648,
+    "quality": {
+      "method": "greedy teacher-forcing tokens byte-identical across all 7 runs (md5 36662cee66d0); tiny-fixture byte identity vs local in tests/test_glm53_cluster.py",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/glm53-worker-readahead-chunk256-2026-10-07-raw.txt",
+      "sha256": "4a25454bb825aa01021709d9951ff9f4040b423efc72c26eea6e8dedee4c273b"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "GLM-5.3-Flash, int4-gs64 Colibri container",
+      "prompt_tokens": 245,
+      "greedy": 1,
+      "coordinator_build": "299b6bfe (dev + cluster workers + deadlines + per-layer timing), OMP_NUM_THREADS=5, GLM53_PREFILL_CHUNK=256, COLI_CLUSTER_WEIGHTS=52,48 (fixed)",
+      "expert_workers": "2 x glm53 EXPERT_WORKER, binary 00cc6aa7 (62424e08: the same plus this change, next block read while the current one is computed)"
+    },
+    "samples": {
+      "tok_s": [
+        0.620567,
+        0.652811,
+        0.628044
+      ],
+      "prefill_s": [
+        394.8,
+        375.3,
+        390.1
+      ]
+    },
+    "median_tok_s": 0.628044,
+    "quality": {
+      "method": "greedy teacher-forcing tokens byte-identical across all 7 runs (md5 36662cee66d0); tiny-fixture byte identity vs local in tests/test_glm53_cluster.py",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/glm53-worker-readahead-chunk256-2026-10-07-raw.txt",
+      "sha256": "4a25454bb825aa01021709d9951ff9f4040b423efc72c26eea6e8dedee4c273b"
+    }
+  },
+  "outcome": "improvement"
+}

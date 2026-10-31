@@ -9,7 +9,17 @@
 // matrix (more workgroups to fill the device), more for a long one. nr rows of x (up to
 // 4: a speculative verify's) share a workgroup and every weight load; each row keeps
 // its own sums in the same order, so its bits are a decode step's (nr = 1).
-// Host: I % 32 == 0, nr * I <= 16384, rowWords % 4 == 0; fmt 4: gs % 32 == 0.
+// rpw 0: a matrix of few long rows (Qwen3.8's hyper-connection mixers, 320 x 10240): one
+// output row a workgroup, every lane on it, x read straight from its buffer, the partial
+// sums joined by subgroupAdd and then across the subgroups in shared memory (16 rows a
+// workgroup left 20 workgroups for that matrix: 34 us on an RTX PRO 4000, 15 so).
+// x sits in shared memory with a vec4 of padding after every 8 (xi): lane jj's 16-byte
+// weight step reads 4 consecutive vec4s and lane jj + 1's start 4 further on, which without
+// the pad put the lanes of a phase on the same banks.
+// Host: I % 32 == 0, nr * (I / 4 + I / 32) <= XS, rowWords % 4 == 0; fmt 4: gs % 32 == 0. XS
+// (vec4s of x staged, constant_id 0) is set from the device's maxComputeSharedMemorySize:
+// 4096 (64 KiB) where it allows, 3072 on a 48 KiB GPU (#1998: a fixed 64 KiB lost the
+// device there).
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_clustered : require
@@ -24,7 +34,9 @@ layout(push_constant) uniform P { int fmt, S, I, O, rowWords, gs, rpw, nr; } p;
 #define NRMAX 4
 
 #define RPS 4u
-shared vec4 xsh[4096];
+layout(constant_id = 0) const int XS = 4096;
+shared vec4 xsh[XS];   // rpw 0, which stages no x: the subgroups' sums, float k at xsh[k / 4][k % 4]
+uint xi(uint k) { return k + (k >> 3); }
 
 float i8(uint w, uint k) { return float(int(w << (24u - 8u * k)) >> 24); }
 float d8(uint w, vec4 a) { return a.x * i8(w, 0u) + a.y * i8(w, 1u) + a.z * i8(w, 2u) + a.w * i8(w, 3u); }
@@ -44,14 +56,46 @@ float red(float v, uint lpr) {
     return v;
 }
 
+// rpw 0 reads x straight from the buffer (each input once a workgroup: staging it was
+// four times the row's own bytes); the rows past S read row S - 1, never written
+vec4 xw(uint r, uint i4) { return x4[min(gl_WorkGroupID.y * uint(max(p.nr, 1)) + r, uint(p.S) - 1u) * uint(p.I / 4) + i4]; }
 void main() {
     uint nr = uint(max(p.nr, 1)), s0 = gl_WorkGroupID.y * nr, I = uint(p.I), I4 = I / 4u, O = uint(p.O);
-    for (uint r = 0u; r < nr; r++)
-        for (uint i = gl_LocalInvocationID.x; i < I4; i += 256u) xsh[r * I4 + i] = s0 + r < uint(p.S) ? x4[(s0 + r) * I4 + i] : vec4(0.0);
-    barrier();
+    if (p.rpw != 0) {
+        for (uint r = 0u; r < nr; r++)
+            for (uint i = gl_LocalInvocationID.x; i < I4; i += 256u) xsh[xi(r * I4 + i)] = s0 + r < uint(p.S) ? x4[(s0 + r) * I4 + i] : vec4(0.0);
+        barrier();
+    }
     int fmt = p.fmt;
     uint rowWords = uint(p.rowWords), gs = uint(max(p.gs, 1)), ng = (I + gs - 1u) / gs;
     uint W4 = fmt == 1 ? I / 16u : I / 32u;
+    if (p.rpw == 0) {   /* one row, every lane */
+        uint o = min(gl_WorkGroupID.x, O - 1u), tid = gl_LocalInvocationID.x;
+        float acc[NRMAX];
+        [[unroll]] for (uint r = 0u; r < NRMAX; r++) acc[r] = 0.0;
+        for (uint j = tid; j < W4; j += 256u) {
+            uvec4 v = wv[o * (rowWords / 4u) + j];
+            float sv = fmt == 4 ? sc[o * ng + (j * 32u) / gs] : 1.0;
+            [[unroll]] for (uint r = 0u; r < NRMAX; r++) if (r < nr) {
+                float d = 0.0;
+                if (fmt == 1) { [[unroll]] for (uint h = 0u; h < 4u; h++) d += d8(v[h], xw(r, j * 4u + h)); }
+                else { [[unroll]] for (uint h = 0u; h < 4u; h++) d += d4(v[h], xw(r, j * 8u + h * 2u), xw(r, j * 8u + h * 2u + 1u)); }
+                acc[r] += sv * d;
+            }
+        }
+        [[unroll]] for (uint r = 0u; r < NRMAX; r++) {
+            float t = subgroupAdd(acc[r]);
+            uint k = r * 32u + min(gl_SubgroupID, 31u);
+            if (subgroupElect()) xsh[k >> 2u][k & 3u] = t;
+        }
+        barrier();
+        if (tid < nr && s0 + tid < uint(p.S) && gl_WorkGroupID.x < O) {
+            float v2 = 0.0;
+            for (uint g = 0u; g < gl_NumSubgroups && g < 32u; g++) { uint k = tid * 32u + g; v2 += xsh[k >> 2u][k & 3u]; }
+            y[(s0 + tid) * O + o] = fmt == 4 ? v2 : v2 * sc[o];
+        }
+        return;
+    }
     uint cap = min(min(gl_SubgroupSize, W4), 64u), lpr = 1u;
     while (lpr * 2u <= cap) lpr *= 2u;
     uint rg = gl_SubgroupSize / lpr, rr = gl_SubgroupInvocationID / lpr, jj = gl_SubgroupInvocationID % lpr;
@@ -75,9 +119,9 @@ void main() {
                 [[unroll]] for (uint t = 0u; t < RPS; t++) {
                     float d = 0.0;
                     if (fmt == 1) {
-                        [[unroll]] for (uint h = 0u; h < 4u; h++) d += d8(v[t][h], xsh[xb + j * 4u + h]);
+                        [[unroll]] for (uint h = 0u; h < 4u; h++) d += d8(v[t][h], xsh[xi(xb + j * 4u + h)]);
                     } else {
-                        [[unroll]] for (uint h = 0u; h < 4u; h++) d += d4(v[t][h], xsh[xb + j * 8u + h * 2u], xsh[xb + j * 8u + h * 2u + 1u]);
+                        [[unroll]] for (uint h = 0u; h < 4u; h++) d += d4(v[t][h], xsh[xi(xb + j * 8u + h * 2u)], xsh[xi(xb + j * 8u + h * 2u + 1u)]);
                     }
                     acc[r * RPS + t] += sv[t] * d;
                 }

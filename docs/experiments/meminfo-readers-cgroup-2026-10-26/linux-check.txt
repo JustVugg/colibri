@@ -1,0 +1,449 @@
+# kimi_k3, deepseek_v4: the RAM budget through compat_mem_available_gb, on Linux (2026-10-26)
+# A Colab CPU VM: x86_64, 2 threads, 12.7 GiB (MemTotal), Linux 6.6.122+, gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0; its
+#   cgroup 0::/../../jupyter-children, memory.max = max (no limit).
+# n4 = 313b74b8bc00702e4c85ff9f21b9242a1d01cb98 (compat_meminfo_gb with the cgroup's room, the commit before this one);
+# pr = 313b74b8 + this change (the diff sha256 eec474dc71a912683edbd6d9949dffdd3b01a6d4fdcfc3c83fd3964e3e75665b).
+# In each tree: make tests/test_k3_ram_budget tests/test_deepseek_v4 (deepseek_v4's Linux branch), the two
+#   tests, and probe_k3.c / probe_v4.c beside this file: each includes the engine's file (as
+#   tests/test_k3_ram_budget.c does) and calls the reader 2000 times; three runs a tree.
+# The Python check (tests.test_meminfo_readers) does not import there: Colab's Python has a package named
+#   tests of its own. It runs in make -C c check.
+
+===== 00-macchina.log (sha256 8665a5bffe47e46f247acd76e2f2ecbf71e827f6e6d5c6e5c9981de37f7928db)
+# uname -a; nproc; grep -E '^(MemTotal|MemAvailable):' /proc/meminfo; cat /proc/self/cgroup; cat /sys/fs/cgroup/memory.max; gcc --version | head -1; python3 --version
+# exit 0, 0.0 s
+
+Linux 2d57aa0189bd 6.6.122+ #1 SMP Thu Apr 30 18:17:14 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+2
+MemTotal:       13286944 kB
+MemAvailable:   12282540 kB
+0::/../../jupyter-children
+max
+gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+Python 3.13.16
+
+===== 01-clone.log (sha256 9eb817fb575e124b9f88319b35570df769e364a8ae13b851689684504412ab2f)
+# set -e; rm -rf /content/n4 /content/pr
+git clone -q --branch fix/compat-cgroup-memory https://github.com/CoTi1938/colibri.git /content/n4
+cd /content/n4 && git checkout -q 313b74b8bc00702e4c85ff9f21b9242a1d01cb98 && git log -1 --format='%H %s'
+git clone -q /content/n4 /content/pr && cd /content/pr && git checkout -q 313b74b8bc00702e4c85ff9f21b9242a1d01cb98
+sha256sum /content/fix.patch && git apply /content/fix.patch && git status --short
+# exit 0, 17.1 s
+
+313b74b8bc00702e4c85ff9f21b9242a1d01cb98 compat_meminfo_gb: a container's cgroup limit bounds the RAM it reports
+eec474dc71a912683edbd6d9949dffdd3b01a6d4fdcfc3c83fd3964e3e75665b  /content/fix.patch
+ M c/compat.h
+ M c/deepseek_v4.c
+ M c/kimi_k3.c
+?? c/tests/test_meminfo_readers.py
+
+===== 02-make-n4.log (sha256 cd0af6f19a6e8692573c912f0d834d4c60bf5c8be0f5f82c0d5d7be30a4f9be8)
+# cd /content/n4/c && make -j$(nproc) tests/test_k3_ram_budget tests/test_deepseek_v4 2>&1 | tee /content/make-n4.txt; echo; echo 'warnings in kimi_k3.c / deepseek_v4.c:'; grep -cE '(kimi_k3|deepseek_v4)\.c:[0-9]+:[0-9]+: warning' /content/make-n4.txt || true
+# exit 0, 56.7 s
+
+gcc -O3 -march=native -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function  -MMD -MP tests/test_k3_ram_budget.c  -o tests/test_k3_ram_budget -lm -fopenmp -pthread 
+make -f Makefile.deepseek-v4 ARCH=native deepseek-v4-test-objs \
+	COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
+	COLI_V4_UNIT_ROUTE_BF16.o \
+	COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_NATIVE_QUANT.o \
+	COLI_V4_UNIT_NATIVE_QUANT_DUAL.o COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o \
+	COLI_V4_UNIT_EXPERT_ROWS16.o \
+	COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16_TEST.o \
+	COLI_V4_UNIT_NATIVE_QUANT_BATCH_TEST.o \
+	
+make[1]: Entering directory '/content/n4/c'
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_KV_CACHE -c deepseek_v4.c -o COLI_V4_UNIT_KV_CACHE.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_ATTENTION_CACHE -c deepseek_v4.c -o COLI_V4_UNIT_ATTENTION_CACHE.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_EXPERT -c deepseek_v4.c -o COLI_V4_UNIT_EXPERT.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_EXPERT_STORE -c deepseek_v4.c -o COLI_V4_UNIT_EXPERT_STORE.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_LAYER -c deepseek_v4.c -o COLI_V4_UNIT_LAYER.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_ST -c deepseek_v4.c -o COLI_V4_UNIT_ST.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_CONFIG -c deepseek_v4.c -o COLI_V4_UNIT_CONFIG.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_MATH -c deepseek_v4.c -o COLI_V4_UNIT_MATH.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_SPARSE_ATTENTION -c deepseek_v4.c -o COLI_V4_UNIT_SPARSE_ATTENTION.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_ROUTE_BF16 -c deepseek_v4.c -o COLI_V4_UNIT_ROUTE_BF16.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_RESOURCE_PLAN -c deepseek_v4.c -o COLI_V4_UNIT_RESOURCE_PLAN.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_PROMPT -c deepseek_v4.c -o COLI_V4_UNIT_PROMPT.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_NATIVE_QUANT -c deepseek_v4.c -o COLI_V4_UNIT_NATIVE_QUANT.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_NATIVE_QUANT_DUAL -c deepseek_v4.c -o COLI_V4_UNIT_NATIVE_QUANT_DUAL.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_NATIVE_QUANT_ROWS16 -c deepseek_v4.c -o COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_EXPERT_ROWS16 -c deepseek_v4.c -o COLI_V4_UNIT_EXPERT_ROWS16.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_TEST_HOOKS \
+	-DCOLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16 -c deepseek_v4.c -o COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16_TEST.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_TEST_HOOKS \
+	-DCOLI_V4_UNIT_NATIVE_QUANT_BATCH -c deepseek_v4.c -o COLI_V4_UNIT_NATIVE_QUANT_BATCH_TEST.o
+make[1]: Leaving directory '/content/n4/c'
+gcc -O3 -march=native -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function  -MMD -MP -DCOLI_V4_TEST_HOOKS tests/test_deepseek_v4.c COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_ROUTE_BF16.o COLI_V4_UNIT_SPARSE_ATTENTION.o COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_KV_CACHE.o COLI_V4_UNIT_ATTENTION_CACHE.o COLI_V4_UNIT_LAYER.o COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16_TEST.o COLI_V4_UNIT_NATIVE_QUANT_BATCH_TEST.o COLI_V4_UNIT_EXPERT_ROWS16.o COLI_V4_UNIT_NATIVE_QUANT.o COLI_V4_UNIT_NATIVE_QUANT_DUAL.o COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o \
+	-o tests/test_deepseek_v4 -pthread -lm -fopenmp -pthread 
+lto-wrapper: warning: using serial compilation of 7 LTRANS jobs
+lto-wrapper: note: see the ‘-flto’ option documentation for more information
+
+warnings in kimi_k3.c / deepseek_v4.c:
+0
+
+===== 02-make-pr.log (sha256 6be634e860b29e892ea8eb7608c72d0f1ee749edf29d3e52b30564bfa39d0320)
+# cd /content/pr/c && make -j$(nproc) tests/test_k3_ram_budget tests/test_deepseek_v4 2>&1 | tee /content/make-pr.txt; echo; echo 'warnings in kimi_k3.c / deepseek_v4.c:'; grep -cE '(kimi_k3|deepseek_v4)\.c:[0-9]+:[0-9]+: warning' /content/make-pr.txt || true
+# exit 0, 55.4 s
+
+gcc -O3 -march=native -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function  -MMD -MP tests/test_k3_ram_budget.c  -o tests/test_k3_ram_budget -lm -fopenmp -pthread 
+make -f Makefile.deepseek-v4 ARCH=native deepseek-v4-test-objs \
+	COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
+	COLI_V4_UNIT_ROUTE_BF16.o \
+	COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_NATIVE_QUANT.o \
+	COLI_V4_UNIT_NATIVE_QUANT_DUAL.o COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o \
+	COLI_V4_UNIT_EXPERT_ROWS16.o \
+	COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16_TEST.o \
+	COLI_V4_UNIT_NATIVE_QUANT_BATCH_TEST.o \
+	
+make[1]: Entering directory '/content/pr/c'
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_KV_CACHE -c deepseek_v4.c -o COLI_V4_UNIT_KV_CACHE.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_ATTENTION_CACHE -c deepseek_v4.c -o COLI_V4_UNIT_ATTENTION_CACHE.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_EXPERT -c deepseek_v4.c -o COLI_V4_UNIT_EXPERT.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_EXPERT_STORE -c deepseek_v4.c -o COLI_V4_UNIT_EXPERT_STORE.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_LAYER -c deepseek_v4.c -o COLI_V4_UNIT_LAYER.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_ST -c deepseek_v4.c -o COLI_V4_UNIT_ST.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_CONFIG -c deepseek_v4.c -o COLI_V4_UNIT_CONFIG.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_MATH -c deepseek_v4.c -o COLI_V4_UNIT_MATH.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_SPARSE_ATTENTION -c deepseek_v4.c -o COLI_V4_UNIT_SPARSE_ATTENTION.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_ROUTE_BF16 -c deepseek_v4.c -o COLI_V4_UNIT_ROUTE_BF16.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_RESOURCE_PLAN -c deepseek_v4.c -o COLI_V4_UNIT_RESOURCE_PLAN.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_PROMPT -c deepseek_v4.c -o COLI_V4_UNIT_PROMPT.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_NATIVE_QUANT -c deepseek_v4.c -o COLI_V4_UNIT_NATIVE_QUANT.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_NATIVE_QUANT_DUAL -c deepseek_v4.c -o COLI_V4_UNIT_NATIVE_QUANT_DUAL.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_NATIVE_QUANT_ROWS16 -c deepseek_v4.c -o COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_UNIT_EXPERT_ROWS16 -c deepseek_v4.c -o COLI_V4_UNIT_EXPERT_ROWS16.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_TEST_HOOKS \
+	-DCOLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16 -c deepseek_v4.c -o COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16_TEST.o
+gcc -D_GNU_SOURCE -O3 -march=native -fopenmp -pthread -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER  -flto -DCOLI_V4_TEST_HOOKS \
+	-DCOLI_V4_UNIT_NATIVE_QUANT_BATCH -c deepseek_v4.c -o COLI_V4_UNIT_NATIVE_QUANT_BATCH_TEST.o
+make[1]: Leaving directory '/content/pr/c'
+gcc -O3 -march=native -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function  -MMD -MP -DCOLI_V4_TEST_HOOKS tests/test_deepseek_v4.c COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_ROUTE_BF16.o COLI_V4_UNIT_SPARSE_ATTENTION.o COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_KV_CACHE.o COLI_V4_UNIT_ATTENTION_CACHE.o COLI_V4_UNIT_LAYER.o COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16_TEST.o COLI_V4_UNIT_NATIVE_QUANT_BATCH_TEST.o COLI_V4_UNIT_EXPERT_ROWS16.o COLI_V4_UNIT_NATIVE_QUANT.o COLI_V4_UNIT_NATIVE_QUANT_DUAL.o COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o \
+	-o tests/test_deepseek_v4 -pthread -lm -fopenmp -pthread 
+lto-wrapper: warning: using serial compilation of 7 LTRANS jobs
+lto-wrapper: note: see the ‘-flto’ option documentation for more information
+
+warnings in kimi_k3.c / deepseek_v4.c:
+0
+
+===== 03-test-pr.log (sha256 215b303b1b78c0b7bf4892a8e24c1f08b3dc68ded2599be29f8abb0781bb306d)
+# cd /content/pr/c && ./tests/test_k3_ram_budget; echo exit $?; ./tests/test_deepseek_v4; echo exit $?; python3 -m unittest tests.test_meminfo_readers -v; echo exit $?
+# exit 0, 0.3 s
+
+v1.5.0: K3_EXPERT_GB=220 -> cap 135/layer, projected peak 261.6 GB
+fixed : --ram 242 -> 200.1 GB for experts -> cap 122/layer, peak 240.5 GB
+        COLI_K3_CKPT=1 -> 433.4 MiB; 4 slots -> 1.82 GB reserved
+        --ram 242 + 4 checkpoints -> cap 121/layer, peak 240.6 GB
+        --ram 180 -> cap 84   |   --ram 242 -> cap 122
+        K3_EXPERT_GB small (cap 4) on a 4 TB budget -> cap 4
+        --ram 30 with 35.2 GB resident -> -11.9 GB for experts, cap 0
+test_k3_ram_budget: ok
+exit 0
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=0 repin_interval=6 mode=resident-ram rows16=hot-pins
+v4_rows16 packed_slots=0
+v4_direct reads=8 flock_reads=7 fallbacks=0 payload_bytes=405
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=0 repin_interval=18446744073709551615 mode=resident-ram rows16=hot-pins
+v4_rows16 packed_slots=0
+v4_direct reads=24 flock_reads=21 fallbacks=0 payload_bytes=1215
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=0 repin_interval=18446744073709551615 mode=resident-ram rows16=hot-pins
+v4_rows16 packed_slots=0
+v4_direct reads=40 flock_reads=36 fallbacks=0 payload_bytes=2028
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=16 repin_interval=18446744073709551615 mode=resident-ram rows16=hot-pins
+v4_rows16 packed_slots=0
+v4_direct reads=85 flock_reads=80 fallbacks=0 payload_bytes=4320
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=16 repin_interval=18446744073709551615 mode=resident-ram rows16=hot-pins
+v4_rows16 packed_slots=0
+v4_direct reads=190 flock_reads=184 fallbacks=0 payload_bytes=9672
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=16 repin_interval=18446744073709551615 mode=resident-ram rows16=hot-pins
+v4_rows16 packed_slots=0
+v4_direct reads=399 flock_reads=392 fallbacks=0 payload_bytes=20328
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=0 repin_interval=2 mode=resident-ram rows16=hot-pins
+v4_rows16 packed_slots=0
+v4_direct reads=1 flock_reads=0 fallbacks=0 payload_bytes=51
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=2 repin_interval=6 mode=resident-ram rows16=hot-pins
+[v4] expert cache: reading every expert (16 experts, 0.0 GiB) before the first request; COLI_V4_PREWARM=0 starts with it empty
+[v4] expert cache: 16 experts, 0.0 GiB, read in 0.0 s (0.01 GiB/s)
+v4_rows16 packed_slots=0
+v4_direct reads=17 flock_reads=15 fallbacks=0 payload_bytes=864
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=colibri-v4-prewarm-9kyQuU/.coli_usage selections=288
+v4_hot_policy pin_slots_per_layer=0 repin_interval=6 mode=resident-ram rows16=hot-pins
+[v4] expert cache: reading each layer's most used experts (8 experts, 0.0 GiB) before the first request; COLI_V4_PREWARM=0 starts with it empty
+[v4] expert cache: 8 experts, 0.0 GiB, read in 0.0 s (0.00 GiB/s)
+[STATS] 288 selections across 9 distinct experts -> colibri-v4-prewarm-9kyQuU/.coli_usage
+v4_rows16 packed_slots=0
+v4_direct reads=25 flock_reads=23 fallbacks=0 payload_bytes=1272
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=16 repin_interval=6 mode=resident-ram rows16=hot-pins
+[v4] expert cache: reading every expert (128 experts, 0.0 GiB) before the first request; COLI_V4_PREWARM=0 starts with it empty
+[v4] expert cache: 1 experts, 0.0 GiB, read in 0.0 s (0.00 GiB/s)
+[v4] expert cache: stopped with 127 experts left, free RAM reached the 4294967296.0 GiB the plan keeps for the system; each loads when it is first used
+v4_rows16 packed_slots=0
+v4_direct reads=153 flock_reads=150 fallbacks=0 payload_bytes=7797
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=8 repin_interval=6 mode=resident-ram rows16=hot-pins
+[STATS] 1341 selections across 48 distinct experts -> colibri-v4-books-u-kR9e73/.coli_usage
+v4_rows16 packed_slots=0
+v4_direct reads=967 flock_reads=955 fallbacks=0 payload_bytes=49284
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=8 repin_interval=6 mode=resident-ram rows16=hot-pins
+[STATS] 1341 selections across 48 distinct experts -> colibri-v4-books-b-8UId64/.coli_usage
+v4_rows16 packed_slots=0
+v4_direct reads=1042 flock_reads=1029 fallbacks=0 payload_bytes=53106
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=0 repin_interval=6 mode=resident-ram rows16=hot-pins
+v4_rows16 packed_slots=0
+v4_direct reads=1049 flock_reads=1035 fallbacks=0 payload_bytes=53460
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=8 repin_interval=6 mode=resident-ram rows16=hot-pins
+v4_rows16 packed_slots=0
+v4_direct reads=1064 flock_reads=1049 fallbacks=0 payload_bytes=54222
+DeepSeek-V4 FP8 decode: batch-exact bits
+DeepSeek-V4 attention cache tests: ok
+DeepSeek-V4 config tests: ok
+DeepSeek-V4 expert tests: ok
+DeepSeek-V4 expert batch: ok (3 matrices, scalar-exact bits)
+DeepSeek-V4 rows16 convergence: ok (hot and cold bits identical)
+DeepSeek-V4 ExpertStore tests: ok
+DeepSeek-V4 ExpertStore prefill pool: ok (A/B bytes 816->408, second sweep=0 reads, warm entries + decode reserve retained)
+DeepSeek-V4 ExpertStore miss scaling: ok (44/104/208 slots=1 probe each)
+DeepSeek-V4 ExpertStore per_matrix direct: ok
+DeepSeek-V4 ExpertStore prewarm: ok
+DeepSeek-V4 ExpertStore bank books: ok (96 chunk-layers, 83 of them bank only, 8 pins, 672 requests/layer, reads union=814 bank=75, .coli_usage 388 bytes identical)
+DeepSeek-V4 ExpertStore union touch/note recency: ok (touched member kept over the LRU, notes touch only repinned residents, no reads, base store no-op)
+DeepSeek-V4 KV cache tests: ok
+deepseek_v4_layer tests passed
+DeepSeek-V4 math tests: ok
+DeepSeek V4 prompt tests: ok
+DeepSeek V4 resource plan tests: ok
+DeepSeek-V4 sparse attention tests: ok
+DeepSeek-V4 tests: ok
+exit 0
+test_meminfo_readers (unittest.loader._FailedTest.test_meminfo_readers) ... ERROR
+
+======================================================================
+ERROR: test_meminfo_readers (unittest.loader._FailedTest.test_meminfo_readers)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_meminfo_readers
+Traceback (most recent call last):
+  File "/usr/lib/python3.13/unittest/loader.py", line 141, in loadTestsFromName
+    module = __import__(module_name)
+ModuleNotFoundError: No module named 'tests.test_meminfo_readers'
+
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (errors=1)
+exit 1
+
+===== 04-test-n4.log (sha256 29c35406d62d92660f26c4b30c820991ba1277fe35f09c69a9c0ae2740d7c9a2)
+# cd /content/n4/c && ./tests/test_k3_ram_budget; echo exit $?; ./tests/test_deepseek_v4; echo exit $?; cp /content/pr/c/tests/test_meminfo_readers.py tests/; python3 -m unittest tests.test_meminfo_readers; echo exit $?; rm tests/test_meminfo_readers.py
+# exit 0, 0.3 s
+
+v1.5.0: K3_EXPERT_GB=220 -> cap 135/layer, projected peak 261.6 GB
+fixed : --ram 242 -> 200.1 GB for experts -> cap 122/layer, peak 240.5 GB
+        COLI_K3_CKPT=1 -> 433.4 MiB; 4 slots -> 1.82 GB reserved
+        --ram 242 + 4 checkpoints -> cap 121/layer, peak 240.6 GB
+        --ram 180 -> cap 84   |   --ram 242 -> cap 122
+        K3_EXPERT_GB small (cap 4) on a 4 TB budget -> cap 4
+        --ram 30 with 35.2 GB resident -> -11.9 GB for experts, cap 0
+test_k3_ram_budget: ok
+exit 0
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=0 repin_interval=6 mode=resident-ram rows16=hot-pins
+v4_rows16 packed_slots=0
+v4_direct reads=8 flock_reads=7 fallbacks=0 payload_bytes=405
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=0 repin_interval=18446744073709551615 mode=resident-ram rows16=hot-pins
+v4_rows16 packed_slots=0
+v4_direct reads=24 flock_reads=21 fallbacks=0 payload_bytes=1215
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=0 repin_interval=18446744073709551615 mode=resident-ram rows16=hot-pins
+v4_rows16 packed_slots=0
+v4_direct reads=40 flock_reads=36 fallbacks=0 payload_bytes=2028
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=16 repin_interval=18446744073709551615 mode=resident-ram rows16=hot-pins
+v4_rows16 packed_slots=0
+v4_direct reads=85 flock_reads=80 fallbacks=0 payload_bytes=4320
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=16 repin_interval=18446744073709551615 mode=resident-ram rows16=hot-pins
+v4_rows16 packed_slots=0
+v4_direct reads=190 flock_reads=184 fallbacks=0 payload_bytes=9672
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=16 repin_interval=18446744073709551615 mode=resident-ram rows16=hot-pins
+v4_rows16 packed_slots=0
+v4_direct reads=399 flock_reads=392 fallbacks=0 payload_bytes=20328
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=0 repin_interval=2 mode=resident-ram rows16=hot-pins
+v4_rows16 packed_slots=0
+v4_direct reads=1 flock_reads=0 fallbacks=0 payload_bytes=51
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=2 repin_interval=6 mode=resident-ram rows16=hot-pins
+[v4] expert cache: reading every expert (16 experts, 0.0 GiB) before the first request; COLI_V4_PREWARM=0 starts with it empty
+[v4] expert cache: 16 experts, 0.0 GiB, read in 0.0 s (0.00 GiB/s)
+v4_rows16 packed_slots=0
+v4_direct reads=17 flock_reads=15 fallbacks=0 payload_bytes=864
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=colibri-v4-prewarm-yR79FS/.coli_usage selections=288
+v4_hot_policy pin_slots_per_layer=0 repin_interval=6 mode=resident-ram rows16=hot-pins
+[v4] expert cache: reading each layer's most used experts (8 experts, 0.0 GiB) before the first request; COLI_V4_PREWARM=0 starts with it empty
+[v4] expert cache: 8 experts, 0.0 GiB, read in 0.0 s (0.00 GiB/s)
+[STATS] 288 selections across 9 distinct experts -> colibri-v4-prewarm-yR79FS/.coli_usage
+v4_rows16 packed_slots=0
+v4_direct reads=25 flock_reads=23 fallbacks=0 payload_bytes=1272
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=16 repin_interval=6 mode=resident-ram rows16=hot-pins
+[v4] expert cache: reading every expert (128 experts, 0.0 GiB) before the first request; COLI_V4_PREWARM=0 starts with it empty
+[v4] expert cache: 1 experts, 0.0 GiB, read in 0.0 s (0.00 GiB/s)
+[v4] expert cache: stopped with 127 experts left, free RAM reached the 4294967296.0 GiB the plan keeps for the system; each loads when it is first used
+v4_rows16 packed_slots=0
+v4_direct reads=153 flock_reads=150 fallbacks=0 payload_bytes=7797
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=8 repin_interval=6 mode=resident-ram rows16=hot-pins
+[STATS] 1341 selections across 48 distinct experts -> colibri-v4-books-u-ruGy3k/.coli_usage
+v4_rows16 packed_slots=0
+v4_direct reads=967 flock_reads=955 fallbacks=0 payload_bytes=49284
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=8 repin_interval=6 mode=resident-ram rows16=hot-pins
+[STATS] 1341 selections across 48 distinct experts -> colibri-v4-books-b-1gFa4h/.coli_usage
+v4_rows16 packed_slots=0
+v4_direct reads=1042 flock_reads=1029 fallbacks=0 payload_bytes=53106
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=0 repin_interval=6 mode=resident-ram rows16=hot-pins
+v4_rows16 packed_slots=0
+v4_direct reads=1049 flock_reads=1035 fallbacks=0 payload_bytes=53460
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_hot_policy pin_slots_per_layer=8 repin_interval=6 mode=resident-ram rows16=hot-pins
+v4_rows16 packed_slots=0
+v4_direct reads=1064 flock_reads=1049 fallbacks=0 payload_bytes=54222
+DeepSeek-V4 FP8 decode: batch-exact bits
+DeepSeek-V4 attention cache tests: ok
+DeepSeek-V4 config tests: ok
+DeepSeek-V4 expert tests: ok
+DeepSeek-V4 expert batch: ok (3 matrices, scalar-exact bits)
+DeepSeek-V4 rows16 convergence: ok (hot and cold bits identical)
+DeepSeek-V4 ExpertStore tests: ok
+DeepSeek-V4 ExpertStore prefill pool: ok (A/B bytes 816->408, second sweep=0 reads, warm entries + decode reserve retained)
+DeepSeek-V4 ExpertStore miss scaling: ok (44/104/208 slots=1 probe each)
+DeepSeek-V4 ExpertStore per_matrix direct: ok
+DeepSeek-V4 ExpertStore prewarm: ok
+DeepSeek-V4 ExpertStore bank books: ok (96 chunk-layers, 83 of them bank only, 8 pins, 672 requests/layer, reads union=814 bank=75, .coli_usage 388 bytes identical)
+DeepSeek-V4 ExpertStore union touch/note recency: ok (touched member kept over the LRU, notes touch only repinned residents, no reads, base store no-op)
+DeepSeek-V4 KV cache tests: ok
+deepseek_v4_layer tests passed
+DeepSeek-V4 math tests: ok
+DeepSeek V4 prompt tests: ok
+DeepSeek V4 resource plan tests: ok
+DeepSeek-V4 sparse attention tests: ok
+DeepSeek-V4 tests: ok
+exit 0
+E
+======================================================================
+ERROR: test_meminfo_readers (unittest.loader._FailedTest.test_meminfo_readers)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_meminfo_readers
+Traceback (most recent call last):
+  File "/usr/lib/python3.13/unittest/loader.py", line 141, in loadTestsFromName
+    module = __import__(module_name)
+ModuleNotFoundError: No module named 'tests.test_meminfo_readers'
+
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (errors=1)
+exit 1
+
+===== 05-probe-n4.log (sha256 87e6835a7d7bb924ba1c60e7a08a4d3c8a89524e3302821c0e3c51b5c76f5d6d)
+# cd /content/n4/c && T=n4 && set -e
+cp /content/probe_k3.c tests/zz_probe_k3.c; cp /content/probe_v4.c zz_probe_v4.c
+gcc -O2 -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-unused-function tests/zz_probe_k3.c -o /content/probe_k3-$T -lm
+gcc -O2 -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-unused-function zz_probe_v4.c -o /content/probe_v4-$T -lm     -Wl,--unresolved-symbols=ignore-all
+rm -f tests/zz_probe_k3.c zz_probe_v4.c
+for i in 1 2 3; do /content/probe_k3-$T; /content/probe_v4-$T; done
+# exit 0, 9.5 s
+
+In file included from tests/../kimi_k3.c:116,
+                 from tests/zz_probe_k3.c:4:
+tests/../quant.h: In function ‘matmul_q’:
+tests/../quant.h:94:13: warning: this ‘for’ clause does not guard... [-Wmisleading-indentation]
+   94 |             for(;i<I;i++) a+=xs[i]*(float)w[i]; y[(int64_t)s*O+o]=a*sc; } }
+      |             ^~~
+tests/../quant.h:94:49: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘for’
+   94 |             for(;i<I;i++) a+=xs[i]*(float)w[i]; y[(int64_t)s*O+o]=a*sc; } }
+      |                                                 ^
+tests/../quant.h: In function ‘mxfp4_qx’:
+tests/../quant.h:1350:17: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+ 1350 |                 if(v>127)v=127; if(v<-127)v=-127; qg[i]=(int8_t)v;
+      |                 ^~
+tests/../quant.h:1350:33: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+ 1350 |                 if(v>127)v=127; if(v<-127)v=-127; qg[i]=(int8_t)v;
+      |                                 ^~
+tests/../kimi_k3.c: In function ‘k3_serve_start’:
+tests/../kimi_k3.c:4111:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+ 4111 |     if(chunk<1) chunk=1; if(chunk>512) chunk=512;
+      |     ^~
+tests/../kimi_k3.c:4111:26: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+ 4111 |     if(chunk<1) chunk=1; if(chunk>512) chunk=512;
+      |                          ^~
+k3_mem_avail 12.2666 GB | compat_mem_available_gb 12.5610 GB | MemAvailable kb*1024/1e9 12.5613, kb/1e6 12.2669 | 7.99 us a call (mean 12.2668)
+coli_v4_os_available_memory 12.5611 GB | compat_mem_available_gb 12.5611 GB | 7.97 us a call (mean 12.5610)
+k3_mem_avail 12.2664 GB | compat_mem_available_gb 12.5608 GB | MemAvailable kb*1024/1e9 12.5611, kb/1e6 12.2667 | 8.21 us a call (mean 12.2666)
+coli_v4_os_available_memory 12.5608 GB | compat_mem_available_gb 12.5608 GB | 8.09 us a call (mean 12.5608)
+k3_mem_avail 12.2664 GB | compat_mem_available_gb 12.5608 GB | MemAvailable kb*1024/1e9 12.5608, kb/1e6 12.2664 | 7.86 us a call (mean 12.2664)
+coli_v4_os_available_memory 12.5608 GB | compat_mem_available_gb 12.5608 GB | 7.81 us a call (mean 12.5608)
+
+===== 05-probe-pr.log (sha256 54fa901b32985524ddaee68a0b1d1946e99faaceff3d78879e54a987191d83cb)
+# cd /content/pr/c && T=pr && set -e
+cp /content/probe_k3.c tests/zz_probe_k3.c; cp /content/probe_v4.c zz_probe_v4.c
+gcc -O2 -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-unused-function tests/zz_probe_k3.c -o /content/probe_k3-$T -lm
+gcc -O2 -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-unused-function zz_probe_v4.c -o /content/probe_v4-$T -lm     -Wl,--unresolved-symbols=ignore-all
+rm -f tests/zz_probe_k3.c zz_probe_v4.c
+for i in 1 2 3; do /content/probe_k3-$T; /content/probe_v4-$T; done
+# exit 0, 10.6 s
+
+In file included from tests/../kimi_k3.c:112,
+                 from tests/zz_probe_k3.c:4:
+tests/../quant.h: In function ‘matmul_q’:
+tests/../quant.h:94:13: warning: this ‘for’ clause does not guard... [-Wmisleading-indentation]
+   94 |             for(;i<I;i++) a+=xs[i]*(float)w[i]; y[(int64_t)s*O+o]=a*sc; } }
+      |             ^~~
+tests/../quant.h:94:49: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘for’
+   94 |             for(;i<I;i++) a+=xs[i]*(float)w[i]; y[(int64_t)s*O+o]=a*sc; } }
+      |                                                 ^
+tests/../quant.h: In function ‘mxfp4_qx’:
+tests/../quant.h:1350:17: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+ 1350 |                 if(v>127)v=127; if(v<-127)v=-127; qg[i]=(int8_t)v;
+      |                 ^~
+tests/../quant.h:1350:33: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+ 1350 |                 if(v>127)v=127; if(v<-127)v=-127; qg[i]=(int8_t)v;
+      |                                 ^~
+tests/../kimi_k3.c: In function ‘k3_serve_start’:
+tests/../kimi_k3.c:4092:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+ 4092 |     if(chunk<1) chunk=1; if(chunk>512) chunk=512;
+      |     ^~
+tests/../kimi_k3.c:4092:26: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+ 4092 |     if(chunk<1) chunk=1; if(chunk>512) chunk=512;
+      |                          ^~
+k3_mem_avail 12.5265 GB | compat_mem_available_gb 12.5265 GB | MemAvailable kb*1024/1e9 12.5268, kb/1e6 12.2332 | 13.89 us a call (mean 12.5266)
+coli_v4_os_available_memory 12.5265 GB | compat_mem_available_gb 12.5265 GB | 13.20 us a call (mean 12.5265)
+k3_mem_avail 12.5265 GB | compat_mem_available_gb 12.5265 GB | MemAvailable kb*1024/1e9 12.5265, kb/1e6 12.2329 | 14.50 us a call (mean 12.5265)
+coli_v4_os_available_memory 12.5265 GB | compat_mem_available_gb 12.5265 GB | 13.78 us a call (mean 12.5265)
+k3_mem_avail 12.5265 GB | compat_mem_available_gb 12.5265 GB | MemAvailable kb*1024/1e9 12.5265, kb/1e6 12.2329 | 13.80 us a call (mean 12.5265)
+coli_v4_os_available_memory 12.5265 GB | compat_mem_available_gb 12.5265 GB | 13.30 us a call (mean 12.5265)
+
+===== summary
+n4: 0 warnings in kimi_k3.c and deepseek_v4.c; test_k3_ram_budget and test_deepseek_v4 ok
+n4: k3_mem_avail 12.2666, 12.2664, 12.2664 GB against compat_mem_available_gb 12.5610, 12.5608, 12.5608; 7.99, 8.21, 7.86 us a call (median 7.99)
+n4: coli_v4_os_available_memory 12.5611, 12.5608, 12.5608 GB against compat_mem_available_gb 12.5611, 12.5608, 12.5608; 7.97, 8.09, 7.81 us a call (median 7.97)
+pr: 0 warnings in kimi_k3.c and deepseek_v4.c; test_k3_ram_budget and test_deepseek_v4 ok
+pr: k3_mem_avail 12.5265, 12.5265, 12.5265 GB against compat_mem_available_gb 12.5265, 12.5265, 12.5265; 13.89, 14.50, 13.80 us a call (median 13.89)
+pr: coli_v4_os_available_memory 12.5265, 12.5265, 12.5265 GB against compat_mem_available_gb 12.5265, 12.5265, 12.5265; 13.20, 13.78, 13.30 us a call (median 13.30)

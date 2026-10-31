@@ -1,0 +1,205 @@
+{
+  "version": 1,
+  "hypothesis": "Without a heat file the CUDA chain's warm start holds the experts in index order, no conversation's, and the promotion brake (no promotion while the last 64 decode steps found 75 % or more of their routes on the card) stops a conversation where the promotions were still paying; starting the brake off without a heat file makes a chat faster on a T4 holding 6605 of 10240 experts, and leaves a run with a heat file as it was.",
+  "commit": "77530b49ddd2f4e6ad1b3bb52500491e0c8ed9bb",
+  "model": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64",
+  "command": "bench.c built against c/ (cd c && make <objects> CUDA=1 CUDA_ARCH=sm_75, as the record's setup); COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close ./qwen36-bench --model <model> --session chat.sess",
+  "prompt_hash": "d0badb08659713ad8af6e6f2f452e51e46c0bde577b7391fecc95626e6ad058c",
+  "hardware": {
+    "cpu": "Intel(R) Xeon(R) CPU @ 2.00GHz (4 cores / 8 threads) + NVIDIA Tesla T4 (15360 MiB, sm_75, up to PCIe Gen3 x16)",
+    "ram": "51 GiB",
+    "storage": "Google Colab VM disk",
+    "os": "Ubuntu 24.04.4 LTS (Google Colab, T4 high-RAM), CUDA 13.0, driver 580.82.07"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "heat_file": "none",
+      "session": "chat: 5 turns, 1458 answer tokens teacher-forced, through the server's path",
+      "tok_s": "answer tokens / the session's seconds (prompts, first steps and decode, bench's sum)",
+      "engine_build": "origin/dev 77530b49"
+    },
+    "samples": {
+      "tok_s": [
+        39.3238,
+        39.807,
+        39.5958,
+        39.793
+      ],
+      "session_s": [
+        37.077,
+        36.627,
+        36.822,
+        36.64
+      ],
+      "decode_tok_s_by_turn": [
+        [
+          42.534,
+          42.092,
+          43.002,
+          45.537,
+          45.911
+        ],
+        [
+          42.582,
+          42.933,
+          42.738,
+          46.377,
+          47.005
+        ],
+        [
+          42.71,
+          42.952,
+          42.111,
+          45.95,
+          46.624
+        ],
+        [
+          42.687,
+          42.962,
+          43.585,
+          45.805,
+          46.057
+        ]
+      ],
+      "nll_by_turn": [
+        [
+          1.38253,
+          1.38959,
+          1.27433,
+          1.12367,
+          1.09032
+        ],
+        [
+          1.38253,
+          1.38959,
+          1.27433,
+          1.12367,
+          1.09032
+        ],
+        [
+          1.38253,
+          1.38959,
+          1.27433,
+          1.12367,
+          1.09032
+        ],
+        [
+          1.38253,
+          1.38959,
+          1.27433,
+          1.12367,
+          1.09032
+        ]
+      ]
+    },
+    "median_tok_s": 39.6944,
+    "quality": {
+      "method": "make -C c check (macOS arm64); on the T4 and on the RTX 3070 with the code measured make -C c cuda-test cuda-chain-check, tests/test_qwen36_cuda_chain and tests/test_qwen36_tier_promote pass. The same prompts and teacher-forced answers in every run of both versions; the session's teacher-forced loss is 1.2799 nats a token for both (bench's report). The promoted experts run on the card's kernels instead of the CPU's, so the logits move in the last digits (cli.txt: the same greedy text as dev with the brake at 0)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-promote-brake-history-2026-10-26/sessions.txt",
+      "sha256": "3c636713fac24e06ccf59ba1991866760e6dd4bc99ed1e2809d6a51382222aeb"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "heat_file": "none",
+      "session": "chat: 5 turns, 1458 answer tokens teacher-forced, through the server's path",
+      "tok_s": "answer tokens / the session's seconds (prompts, first steps and decode, bench's sum)",
+      "engine_build": "77530b49 + this change"
+    },
+    "samples": {
+      "tok_s": [
+        49.6378,
+        49.6556,
+        49.5118,
+        49.1871
+      ],
+      "session_s": [
+        29.373,
+        29.362,
+        29.448,
+        29.642
+      ],
+      "decode_tok_s_by_turn": [
+        [
+          45.537,
+          56.184,
+          57.738,
+          57.847,
+          58.174
+        ],
+        [
+          45.789,
+          55.677,
+          57.913,
+          58.043,
+          58.307
+        ],
+        [
+          46.488,
+          56.114,
+          56.617,
+          56.77,
+          56.273
+        ],
+        [
+          45.067,
+          55.946,
+          56.818,
+          56.588,
+          56.433
+        ]
+      ],
+      "nll_by_turn": [
+        [
+          1.3835,
+          1.39098,
+          1.27116,
+          1.12418,
+          1.08827
+        ],
+        [
+          1.3835,
+          1.39098,
+          1.27116,
+          1.12418,
+          1.08827
+        ],
+        [
+          1.3835,
+          1.39098,
+          1.27116,
+          1.12418,
+          1.08827
+        ],
+        [
+          1.3835,
+          1.39098,
+          1.27116,
+          1.12418,
+          1.08827
+        ]
+      ]
+    },
+    "median_tok_s": 49.5748,
+    "quality": {
+      "method": "make -C c check (macOS arm64); on the T4 and on the RTX 3070 with the code measured make -C c cuda-test cuda-chain-check, tests/test_qwen36_cuda_chain and tests/test_qwen36_tier_promote pass. The same prompts and teacher-forced answers in every run of both versions; the session's teacher-forced loss is 1.2799 nats a token for both (bench's report). The promoted experts run on the card's kernels instead of the CPU's, so the logits move in the last digits (cli.txt: the same greedy text as dev with the brake at 0)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-promote-brake-history-2026-10-26/sessions.txt",
+      "sha256": "3c636713fac24e06ccf59ba1991866760e6dd4bc99ed1e2809d6a51382222aeb"
+    }
+  },
+  "outcome": "improvement"
+}

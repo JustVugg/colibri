@@ -1,0 +1,9 @@
+Since you already understand that **RAM** is the computer’s main memory (where programs and data live when they are running), we can use it as our starting point.
+
+Think of your computer’s memory system like a **library**:
+
+- **RAM** is the main library shelves. It has lots of books (data), but it’s far away from your desk.
+- **The CPU** is you, sitting at your desk, trying to read books.
+- **The CPU Cache** is a small stack of books you keep on your desk.
+
+Here’s why this matters: **Walking to the library shelves takes time

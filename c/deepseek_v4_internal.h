@@ -15,7 +15,10 @@
 #include "native_quant_batch.h"
 #include "native_quant_dual.h"
 #include "native_quant_fp4_rows16.h"
+#define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
 #include "st.h"
+
+#include "ggml_view.h"   /* the FP8 and FP4 entries hand a GGUF matrix to coli_ggml_matmul */
 
 /* Worker count for the persistent expert-loader pool in the block pipeline
  * (deepseek_v4_block_pipeline.c). Shared here so the CLI can size the OpenMP
@@ -171,6 +174,10 @@ int coli_v4_route(float *weights, int *indices, const float *hidden,
                   const float *gate, const float *bias,
                   const int *forced_indices, int experts, int dimension,
                   int topk, float route_scale);
+int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
+                       const uint16_t *gate, const float *bias,
+                       const int *forced_indices, int experts, int dimension,
+                       int topk, float route_scale);
 
 int coli_v4_swiglu(float *output, const float *gate, const float *up,
                    int dimension, float limit);
@@ -203,7 +210,44 @@ typedef struct {
      * This is an in-memory execution layout only; checkpoint bytes and scales
      * remain unchanged. */
     int packed_rows8;
+    /* A GGUF index holds the tensor as another dtype the loader converts back
+     * (coli_v4_layer_plan_index): 1 = F32 values of a BF16 tensor, 2 = I32 of an I64,
+     * 3 = BF16 values written as F16, 4 = F16 of an F32 tensor, 5 = ggml blocks of an F32
+     * tensor (stored: their dtype), dequantized to F32. */
+    unsigned char convert;
+    int stored;
 } ColiDeepSeekV4TensorSpec;
+
+/* The view of a resident GGUF matrix (a ggml-typed spec, st_gguf.h): its blocks as the file
+ * has them, no scale tensor beside them. A BF16 / F32 matrix gets the same view (its ggml
+ * type), for code that takes either kind. */
+static inline int coli_v4_ggml_view(ColiTensorView *view, const void *data,
+                                    const ColiDeepSeekV4TensorSpec *spec) {
+    const int type = st_is_ggml(spec->dtype) ? st_ggml_type(spec->dtype)
+                   : spec->dtype == COLI_ST_BF16 ? GQ_BF16 : spec->dtype == COLI_ST_F32 ? GQ_F32 : -1;
+    if (type < 0) return -1;
+    const int64_t row = gq_row_bytes(type, spec->shape[1]);
+    if (!data || spec->rank != 2 || row < 0) return -1;
+    *view = (ColiTensorView){
+        COLI_TENSOR_GGML, COLI_SCALE_NONE, data, NULL, (size_t)(row * spec->shape[0]), 0,
+        spec->shape[0], spec->shape[1], 1, (uint32_t)type, NULL
+    };
+    return 0;
+}
+
+/* The type a GGUF expert matrix is held in for the CPU (coli_ggml_held_type): interleaved by
+ * 16 rows unless COLI_V4_ROWS16=0, as the FP4 experts' rows16. The device tier gets the file's
+ * rows back. */
+static inline int coli_v4_gguf_held_type(int type, int64_t rows, int64_t cols) {
+    return coli_ggml_held_type(type, rows, cols, "COLI_V4_ROWS16");
+}
+
+/* 1 when the index is a GGUF read in place (st_gguf.h): some tensor carries a ggml type. */
+static inline int coli_v4_index_gguf(const ColiSafetensorsIndex *index) {
+    for (int i = 0; index && i < index->n; i++)
+        if (st_is_ggml(index->t[i].dtype)) return 1;
+    return 0;
+}
 
 typedef struct {
     int layer;
@@ -269,6 +313,9 @@ static inline uint64_t coli_v4_dense_tensor_bytes(const ColiDeepSeekV4TensorSpec
 int coli_v4_layer_plan(ColiDeepSeekV4LayerPlan *plan,
                        const ColiDeepSeekV4Config *config, int layer,
                        char *error, size_t error_size);
+/* Fit a plan to what a GGUF index holds (st_gguf.h); a safetensors one comes back as it is. */
+int coli_v4_layer_plan_index(ColiDeepSeekV4LayerPlan *plan,
+                             const ColiSafetensorsIndex *index);
 int coli_v4_layer_validate(const ColiDeepSeekV4LayerPlan *plan,
                            const ColiSafetensorsIndex *index,
                            ColiDeepSeekV4LayerStats *stats,
@@ -662,6 +709,9 @@ typedef struct ColiDeepSeekV4ExpertStoreOptions {
     /* Internal range executors must not benchmark arbitrary bytes from a
      * complete checkpoint while opening one layer slice. */
     int skip_mirror_setup;
+    /* The RAM the plan keeps for the system: filling the cache before the first
+     * request stops short of taking free memory below it (0: no such check). */
+    uint64_t keep_free_bytes;
 } ColiDeepSeekV4ExpertStoreOptions;
 
 int coli_deepseek_v4_expert_store_open(
@@ -669,6 +719,10 @@ int coli_deepseek_v4_expert_store_open(
     ColiExpertStore **store,
     char *error,
     size_t error_size);
+/* Reads into the cache, before the first request, every expert its slots hold, or
+ * with fewer slots each layer's most used ones in the history (#2109). Counts no
+ * use; runs once per store. Returns the experts it could not read. */
+int coli_v4_expert_store_prewarm(ColiExpertStore *store);
 
 /* Plain SSD implementation underneath the optional hot-row/autopin wrapper.
  * Segment adapters use it so opening a layer range never warms experts from
@@ -684,14 +738,31 @@ int coli_deepseek_v4_expert_store_open_base(
  * Alternative registered ExpertStore backends safely ignore the request. */
 void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer);
 
+/* The CUDA expert bank (COLI_CUDA_MOE_BATCH=1 prefill) reads through
+ * lookup_uncounted, a lookup that leaves the routing books alone, and keeps the
+ * books for one chunk's routing on `layer` (`count` expert ids, each token's
+ * top-k as the router returned them): each member of its union once, in
+ * ascending order as the CPU union looks them up. touch_union, before the
+ * bank's reads, gives the members the RAM cache holds the recency touch a hit
+ * gives; note_union, once the chunk is done, counts each member the way a
+ * lookup counts it. Neither leases, reads, inserts nor evicts. Another
+ * ExpertStore backend gets a plain lookup and no books. */
+int coli_v4_expert_store_lookup_uncounted(ColiExpertStore *store,
+                                          ColiExpertKey key,
+                                          ColiExpertView *view);
+void coli_v4_expert_store_touch_union(ColiExpertStore *store, int layer,
+                                      const int *ids, int count);
+void coli_v4_expert_store_note_union(ColiExpertStore *store, int layer,
+                                     const int *ids, int count);
+
 /* Exclusive RAM/VRAM (vk_tier.h's vkt_ram_first): when set, a full RAM cache gives up
  * first a slot whose expert the device holds, and reports it through ram_gave. The
  * store's eviction reads them in every build; only a Vulkan one sets them. */
 extern int (*coli_v4_expert_store_ram_first)(int layer, int expert);
 extern void (*coli_v4_expert_store_ram_gave)(void);
 
-#ifdef COLI_VULKAN
-/* The Vulkan routed-expert tier (vk_tier.c, Makefile.deepseek-v4 VK=1). The MoE
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+/* The routed-expert tier (vk_tier.c, Makefile.deepseek-v4 VK=1; cu_tier.c on a CUDA device). The MoE
  * units reach it through this table, which the engine's own unit fills when
  * COLI_VULKAN=1 started the tier (GENERATE_STATS, the one unit that links the
  * backend); it stays NULL in every other link of the units, the parent's tests
@@ -723,10 +794,16 @@ void coli_v4_expert_store_note_routed(ColiExpertStore *store, ColiExpertKey key)
 uint32_t *const *coli_v4_expert_store_history(ColiExpertStore *store);
 int coli_v4_expert_store_in_ram(ColiExpertStore *store, ColiExpertKey key);
 uint64_t coli_v4_expert_store_record_bytes(ColiExpertStore *store);
+/* A GGUF store's experts at `layer` (st_gguf.h): 1 with the ggml types of gate (w1), up
+ * (w3) and down (w2) as the file has them, *mx = 1 when the store lays them out as the
+ * checkpoint's FP4 (all three MXFP4); 0 for a checkpoint's store, -1 without one. */
+int coli_v4_expert_store_gguf_form(ColiExpertStore *store, int layer, int types[3], int *mx);
 int coli_v4_expert_store_read_private(ColiExpertStore *store, ColiExpertKey key,
                                       unsigned char *buffer, ColiExpertView *view);
 extern int (*coli_v4_expert_store_device_tier)(int layer, int expert);
 
+#endif /* COLI_VULKAN || COLI_CUDA */
+#ifdef COLI_VULKAN
 /* The dense chain (deepseek_v4_chain.h, COLI_VK_CHAIN): a layer's attention state as its
  * units keep it, so the chain can mirror it on the device and write back what a forward
  * changed, as the CPU would have left it. The views point into the live state.
@@ -955,6 +1032,7 @@ int coli_v4_gpu_sparse_attention_batch_cached_idx(
 int coli_v4_gpu_moe_batch_wanted(void);
 void coli_v4_gpu_moe_batch_release(void);
 void coli_v4_gpu_moe_batch_hint(int total_fresh_tokens);
+void coli_v4_gpu_moe_batch_prefill(int prefill);
 int coli_v4_gpu_moe_batch_union(float *outputs,
                                 const ColiDeepSeekV4LayerWeights *weights,
                                 const ColiDeepSeekV4Config *config,
@@ -967,6 +1045,7 @@ int coli_v4_gpu_matvec_grouped(const ColiTensorView *w, float *output,
  * Every entry returns non-zero on any refusal so the caller can fall back to
  * the CPU reference for the whole chunk. */
 int coli_v4_gpu_attn_batch_wanted(void);
+extern int coli_v4_gpu_attn_default;   /* COLI_CUDA_ATTN_BATCH unset: on for a GGUF on the CUDA tier */
 /* Runs both bf16 projection matrices (wkv_key/wgate_key mirrors) over the
  * whole chunk: kv_proj/gate_proj receive [batch][rows-of-mirror]. */
 int coli_v4_gpu_compressor_project_batch(
@@ -1091,6 +1170,7 @@ void coli_v4_engine_detach_session(ColiV4Engine *engine);
 
 #include "tok.h"
 #include "kv_prefix.h"
+#include "park.h"   /* the conditions a short request parks a conversation on (COLI_PARK) */
 
 struct ColiV4Session {
     ColiV4Engine *engine;
@@ -1180,6 +1260,13 @@ extern void (*coli_v4_test_expert_wait_hook)(ColiExpertKey key);
 extern uint64_t coli_v4_test_fp4_batch_calls;
 extern uint64_t coli_v4_test_expert_victim_probes;
 int coli_v4_test_expert_slot_index(ColiExpertStore *store, ColiExpertKey key);
+/* One layer's routing books: usage, HITS and heat per expert, the request
+ * clock and the active pins (-1 past the pin ramp); returns the pin slot count
+ * (-1: not the hot store). */
+int coli_v4_test_expert_books(ColiExpertStore *store, int layer,
+                              uint64_t *usage, unsigned char *hit,
+                              unsigned char *heat, uint64_t *requests,
+                              int *pins);
 void coli_v4_test_reset_direct_io_stats(void);
 uint64_t coli_v4_test_direct_reads(void);
 uint64_t coli_v4_test_direct_fallbacks(void);

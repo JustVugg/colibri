@@ -368,6 +368,23 @@ class DecisionGateway(unittest.TestCase):
         self.assertEqual(status, 422)
         self.assertIn("only 3 of its 30", error["error"]["message"])
 
+    def test_malformed_engine_probabilities_are_a_502(self):
+        engine = FakeDecisionEngine({})
+        engine.answer = None
+        engine.decide = lambda *args, **kwargs: ({"answers": [engine.answer]}, {})
+        self.serve(engine)
+        body = {"state": "x", "questions": {"q": {"type": "noul"}}}
+        malformed = (None,
+                     {"id": "q", "probs": [-0.1, 1.1]},
+                     {"id": "q", "probs": [0.8, 0.8]},
+                     {"id": "q", "probs": [True, False]})
+        for answer in malformed:
+            with self.subTest(answer=answer):
+                engine.answer = answer
+                status, error = self.post_error("/v1/systemone", body)
+                self.assertEqual(status, 502)
+                self.assertEqual(error["error"]["code"], "engine_error")
+
 
 class DecisionRegistryAndLauncher(unittest.TestCase):
     """A Laya checkpoint has no root config.json: the registry knows it by its
@@ -420,6 +437,10 @@ class DecisionRegistryAndLauncher(unittest.TestCase):
         self.assertTrue(decide.descriptor.capabilities.decision)
         self.assertEqual(display_for(decide), ("GLiNER2.5-Decide", "340M"))
         self.assertEqual(default_model_id(decide), "gliner2.5-decide")
+        # the repository's config since its transformers form says "gliner2", the same weights
+        current = resolve_model(self.gliner_checkpoint(
+            {"model_type": "gliner2", "architecture": "span"}, large))
+        self.assertEqual((current.descriptor.id, current.model_type), ("gliner_decide", "gliner2_span_deberta-v2"))
         # a legacy config without an architecture is "span", as AutoExtractor reads it
         legacy = resolve_model(self.gliner_checkpoint({"model_type": "extractor"}, large))
         self.assertEqual(legacy.descriptor.id, "gliner_decide")
@@ -729,7 +750,7 @@ class ClefTinyEndToEnd(unittest.TestCase):
         self.addCleanup(arch.stop)
         engine = Engine(QWEN36, CLEF_CONTAINER, family=family_by_id("qwen36"),
                         env=dict(os.environ, COLI_DENSE_I8="0", OMP_NUM_THREADS="2",
-                                 COLI_NO_OMP_TUNE="1"))
+                                 COLI_NO_OMP_TUNE="1", Q36_KV="f32"))   # ref.json is float32's
         self.engine = engine
         self.addCleanup(engine.process.stdout.close)
         self.addCleanup(engine.close)

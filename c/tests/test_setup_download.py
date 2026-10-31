@@ -9,6 +9,7 @@ become a file without `.part`, and the token never follows the redirect.
 """
 import hashlib
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -68,6 +69,19 @@ class DownloadTest(unittest.TestCase):
         return [r["headers"].get("Range") for r in self.hub.requests
                 if r["path"].endswith("/" + name) and "/cdn/" in r["path"]]
 
+    def test_windows_empty_file_needs_no_transport(self):
+        dest = os.path.join(self.dst, "empty.txt")
+        spec = {"size": 0, "git_oid": hashlib.sha1(b"blob 0\0").hexdigest()}
+        with mock.patch.object(setup_download, "wsl_windows_path", return_value=None) as translate:
+            result = setup_download.download_file_windows(
+                "https://example.test/empty.txt", dest, spec, "unused-curl")
+        self.assertEqual(result, "downloaded")
+        self.assertEqual(Path(dest).read_bytes(), b"")
+        self.assertFalse(Path(dest + ".part").exists())
+        translate.assert_not_called()
+        self.assertEqual(setup_download.download_file_windows(
+            "unused", dest, spec, "unused-curl"), "present")
+
     def test_listing_sizes_hashes_and_filters(self):
         files = {f["path"]: f for f in self.listing()}
         self.assertEqual(set(files), set(self.files))
@@ -105,6 +119,49 @@ class DownloadTest(unittest.TestCase):
         before = len(self.hub.requests)
         setup_download.download_repo(REPO, "main", self.dst, files, base=self.hub.base)
         self.assertEqual(len(self.hub.requests), before)
+
+    def test_same_length_file_from_previous_revision_is_downloaded_again(self):
+        name = "README.md"
+        files = self.listing(include=(name,))
+        setup_download.download_repo(REPO, "previous", self.dst, files, base=self.hub.base)
+        replacement = b"# newer!\n"
+        self.assertEqual(len(replacement), len(self.files[name]))
+        Path(self.src, name).write_bytes(replacement)
+        current = self.listing(include=(name,))
+        self.assertNotEqual(current[0]["git_oid"], files[0]["git_oid"])
+        setup_download.download_repo(REPO, "current", self.dst, current, base=self.hub.base)
+        self.assertEqual(Path(self.dst, name).read_bytes(), replacement)
+        self.assertEqual(setup_download.read_manifest(self.dst)["revision"], "current")
+
+    def test_windows_collector_revalidates_existing_file_before_accepting_it(self):
+        name = "README.md"
+        spec = self.spec(name)
+        dest = os.path.join(self.dst, name)
+        os.makedirs(self.dst)
+        Path(dest).write_bytes(b"x" * spec["size"])
+        # A complete verified .part file can be promoted without invoking WSL or
+        # curl, exercising this collector's real cache and checksum decisions.
+        Path(dest + ".part").write_bytes(self.files[name])
+        self.assertEqual(setup_download.download_file_windows(self.url(name), dest, spec,
+                                                              "unused-curl"), "downloaded")
+        self.assertEqual(Path(dest).read_bytes(), self.files[name])
+        self.assertFalse(Path(dest + ".part").exists())
+
+    def test_existing_file_skip_verification_and_missing_hash_controls(self):
+        name = "README.md"
+        spec = self.spec(name)
+        dest = os.path.join(self.dst, name)
+        os.makedirs(self.dst)
+        cached = b"x" * spec["size"]
+        Path(dest).write_bytes(cached)
+        for collector, extra in ((setup_download.download_file, ()),
+                                 (setup_download.download_file_windows, ("unused-curl",))):
+            with self.subTest(collector=collector.__name__):
+                self.assertEqual(collector(self.url(name), dest, spec, *extra, verify=False),
+                                 "present")
+                unknown = dict(spec, sha256=None, git_oid=None)
+                self.assertEqual(collector(self.url(name), dest, unknown, *extra), "present")
+                self.assertEqual(Path(dest).read_bytes(), cached)
 
     def test_empty_repository_file_is_completed_and_manifest_is_reusable(self):
         Path(self.src, "empty.txt").write_bytes(b"")
@@ -192,6 +249,75 @@ class DownloadTest(unittest.TestCase):
                          len(self.files["config.json"]) + 1000)
         self.assertFalse(setup_download.is_complete(self.dst))
 
+    def test_a_model_split_across_drives(self):
+        # #2091: shards moved to a second drive (the engine reads them through
+        # K3_DIRS / COLI_MODEL_DIRS / MIMO_DIRS) are still the model's: complete,
+        # counted, and never fetched again. Only shards count there: the engine
+        # reads config, tokenizer and the rest from model_dir alone.
+        files = self.listing()
+        setup_download.download_repo(REPO, "main", self.dst, files, base=self.hub.base)
+        other = os.path.join(self.tmp.name, "second drive")
+        os.makedirs(other)
+        os.replace(os.path.join(self.dst, "model-00001.safetensors"), os.path.join(other, "model-00001.safetensors"))
+        self.assertFalse(setup_download.is_complete(self.dst))
+        self.assertEqual(setup_download.split_dirs(f" {other} ;, /nowhere "), [other, "/nowhere"])
+        self.assertTrue(setup_download.is_complete(self.dst, ["/nowhere", other]))
+        self.assertEqual(setup_download.bytes_present(self.dst, files, [other]), sum(map(len, self.files.values())))
+        self.assertEqual(setup_download.locate(self.dst, self.spec("model-00001.safetensors"), [other]),
+                         os.path.join(other, "model-00001.safetensors"))
+        before = len(self.hub.requests)
+        setup_download.download_repo(REPO, "main", self.dst, files, base=self.hub.base, extra_dirs=[other])
+        self.assertEqual(len(self.hub.requests), before, "a shard on the second drive was fetched again")
+        self.assertFalse(Path(self.dst, "model-00001.safetensors").exists())
+        self.assertTrue(setup_download.is_complete(self.dst, [other]))
+        # a shard of another size there is not the one listed
+        Path(other, "model-00001.safetensors").write_bytes(b"short")
+        self.assertFalse(setup_download.is_complete(self.dst, [other]))
+        # and metadata moved away is missing: the engine reads it from model_dir only
+        Path(other, "model-00001.safetensors").write_bytes(self.files["model-00001.safetensors"])
+        os.replace(os.path.join(self.dst, "config.json"), os.path.join(other, "config.json"))
+        self.assertFalse(setup_download.is_complete(self.dst, [other]))
+
+    def test_split_shard_checks_requested_digest_before_completing(self):
+        name = "model-00001.safetensors"
+        previous = self.spec(name)
+        other = Path(self.tmp.name, "second drive")
+        other.mkdir()
+        shard = other / name
+        stale = self.files[name]
+        shard.write_bytes(stale)
+        Path(self.src, name).write_bytes(b"x" * previous["size"])
+        spec = self.spec(name)
+        self.assertEqual(spec["size"], previous["size"])
+        self.assertNotEqual(spec["sha256"], previous["sha256"])
+        with self.assertRaises(setup_download.DownloadError) as caught:
+            setup_download.download_repo(REPO, "current", self.dst, [spec],
+                                         base=self.hub.base, extra_dirs=[str(other)])
+        self.assertIn(str(shard), str(caught.exception))
+        self.assertIn("checksum", str(caught.exception))
+        self.assertFalse(setup_download.read_manifest(self.dst)["complete"])
+        self.assertEqual(shard.read_bytes(), stale)
+        self.assertFalse(Path(self.dst, name).exists())
+
+    def test_split_shard_disabled_verification_and_absent_digest(self):
+        name = "model-00001.safetensors"
+        spec = self.spec(name)
+        other = Path(self.tmp.name, "second drive")
+        other.mkdir()
+        shard = other / name
+        stale = b"x" * spec["size"]
+        shard.write_bytes(stale)
+        for verify, listed in ((False, spec), (True, dict(spec, sha256=None, git_oid=None))):
+            with self.subTest(verify=verify):
+                before = len(self.hub.requests)
+                setup_download.download_repo(REPO, "current", self.dst, [listed],
+                                             base=self.hub.base, extra_dirs=[str(other)],
+                                             verify=verify)
+                self.assertTrue(setup_download.read_manifest(self.dst)["complete"])
+                self.assertEqual(shard.read_bytes(), stale)
+                self.assertEqual(len(self.hub.requests), before)
+                self.assertFalse(Path(self.dst, name).exists())
+
     def test_repository_download_refuses_existing_symlinks_outside_model_dir(self):
         os.makedirs(self.dst)
         for index, (linked_path, name) in enumerate(((Path(self.dst, "sub"), "sub/extra.bin"),
@@ -253,6 +379,18 @@ class DownloadTest(unittest.TestCase):
         self.assertEqual(setup_download.parse_curl_speed("3456789.000"), 3456789.0)
         self.assertEqual(setup_download.parse_curl_speed("3456789,500"), 3456789.5)
         self.assertIsNone(setup_download.parse_curl_speed(""))
+
+    def test_windows_probe_rejects_http_error_without_discarding_timeout_sample(self):
+        with mock.patch.object(setup_download.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 22, "455465587", "HTTP 404")
+            self.assertIsNone(setup_download.probe_throughput_windows(
+                "https://example.test/missing", "curl.exe"))
+            self.assertIn("--fail", run.call_args.args[0])
+
+            # A bounded probe may time out after transferring useful sample bytes.
+            run.return_value = subprocess.CompletedProcess([], 28, "3000000", "timeout")
+            self.assertEqual(setup_download.probe_throughput_windows(
+                "https://example.test/model", "curl.exe"), 3000000.0)
 
     def test_verify_file(self):
         name = "model-00001.safetensors"

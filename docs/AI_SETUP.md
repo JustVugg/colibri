@@ -127,6 +127,7 @@ rerun the same setup command.
 | `--dir DIR` | where models are downloaded (default `~/colibri-models`) |
 | `--backend auto\|cpu\|vulkan\|cuda` | force the engine build (`auto`: see below); `--no-gpu` is `--backend cpu` |
 | `--host H`, `--port N` | where the server listens (default `127.0.0.1:8000`) |
+| `--ctx N` | the context the server starts with, kept for `coli start` (default: automatic, from the memory there is); a rerun with `--ctx` on a finished setup changes it, `--ctx 0` restores automatic, and an interrupted setup keeps the choice |
 | `--no-start` | stop after writing the configuration |
 | `--background` | start the server detached at the end |
 | `--no-browser` | do not open a browser tab |
@@ -135,6 +136,18 @@ rerun the same setup command.
 | `--via-windows auto\|yes\|no` | WSL only: download through Windows' `curl.exe` |
 | `--no-verify` | skip the checksums of downloaded files |
 | `--json` | machine-readable result (implies `--yes` and a background start) |
+
+The configuration starts the server with `--auto-tier`, so the expert cache the
+setup's `Plan:` line prints (and a `coli tune` profile) is the one the engine gets:
+on CUDA for every model, on Vulkan and the CPU for the families with a fixed default
+cache (Qwen3.6, Qwen3.8, Kimi K3, Inkling, DeepSeek V4 and V4.1, MiMo). The GLM
+engines and OLMoE size their cache themselves there. A setup written before this
+started those families' Vulkan or CPU engine on the default (eight slots a layer for
+Qwen3.6), and `coli start` now adds the flag to it.
+
+On a completed setup, explicit `--backend`, `--no-gpu`, `--host` and `--port`
+update the saved configuration for the same model. Options left out keep their
+saved values.
 
 ### How the engine build is chosen
 

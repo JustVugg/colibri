@@ -32,11 +32,16 @@ USO:
   python3 c/tools/convert_fmt4_to_fmt2.py --indir SRC --outdir DST --dry-run
   python3 c/tools/convert_fmt4_to_fmt2.py --indir SRC --outdir DST [--workers 8]
 
-Resume: a re-run skips output shards that already exist with the expected byte size (the exact
-size is computable a priori — safetensors serialization is deterministic, see expected_size()).
+Resume: a re-run skips output shards only when an atomic sidecar binds the current input,
+configuration, converter math and output bytes. Legacy outputs without a matching receipt are
+converted again. Verified digests are reused while size, nanosecond mtime/ctime and file
+identity match; changed metadata triggers a streamed rehash. This is a local resume cache,
+not protection against forged receipts or filesystems that hide file changes. Inputs must remain
+stable during conversion; concurrent writers to the same output directory are unsupported.
+The before/after checks detect changes at those boundaries, not every possible filesystem race.
 Writes go through a .tmp file + os.replace, so an interrupted run never leaves a half shard.
 """
-import os, sys, glob, json, re, shutil, struct, argparse
+import os, sys, glob, json, re, shutil, struct, argparse, hashlib, stat
 import numpy as np
 
 GS = 64                                    # fmt=4 group size of the source container
@@ -227,7 +232,12 @@ def convert_shard(path, C):
 
 def _convert_one(args):
     i, sp, C = args
-    return i, convert_shard(sp, C)
+    try:
+        return i, convert_shard(sp, C)
+    except SystemExit as exc:
+        # multiprocessing workers catch Exception, not SystemExit. Return a
+        # serializable failure so imap cannot wait forever for a dead worker.
+        raise RuntimeError(str(exc)) from None
 
 
 def free_gb(p):
@@ -237,6 +247,116 @@ def free_gb(p):
             break
         p = parent
     return shutil.disk_usage(p).free / 1e9
+
+
+# ---------- resume provenance ----------
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _file_stamp(path):
+    info = os.stat(path)
+    return [info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_dev, info.st_ino]
+
+
+def _cached_sha256(path, cache):
+    name = os.path.basename(path)
+    before = _file_stamp(path)
+    entry = cache.get(name)
+    if isinstance(entry, dict) and entry.get("stamp") == before:
+        digest = entry.get("sha256")
+        if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
+            return digest
+    digest = _sha256(path)
+    if _file_stamp(path) != before:
+        die(f"{name} changed while hashing; rerun from stable files")
+    cache[name] = {"stamp": before, "sha256": digest}
+    return digest
+
+
+def _write_manifest(manifest, path):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as stream:
+        json.dump(manifest, stream, sort_keys=True)
+        stream.write("\n")
+    os.replace(tmp, path)
+
+
+def _resume_manifest(path, config_sha256):
+    context = {"schema": "colibri.fmt4-to-fmt2-resume/v2",
+               "numpy_version": np.__version__,
+               "config_sha256": config_sha256,
+               "converter_sha256": _sha256(__file__),
+               "quantizer_sha256": _sha256(sys.modules[quant_int4.__module__].__file__)}
+    try:
+        with open(path, encoding="utf-8") as stream:
+            previous = json.load(stream)
+        if (isinstance(previous, dict) and previous.get("context") == context
+                and all(isinstance(previous.get(key), dict)
+                        for key in ("shards", "sources", "outputs"))):
+            return previous
+    except (OSError, ValueError):
+        pass
+    return {"context": context, "shards": {}, "sources": {}, "outputs": {}}
+
+
+def _verified_shard(dst, expected_bytes, source_sha256, manifest):
+    entry = manifest["shards"].get(os.path.basename(dst))
+    if not (isinstance(entry, dict) and entry.get("source_sha256") == source_sha256
+            and _shard_done(dst, expected_bytes)):
+        return False
+    return entry.get("output_sha256") == _cached_sha256(dst, manifest["outputs"])
+
+
+def _publish_shard(src, tmp, dst, source_sha256, manifest, manifest_path):
+    # Recheck after conversion/copy: a source edited during the run must not
+    # acquire a receipt for a mixed or obsolete output.
+    if _cached_sha256(src, manifest["sources"]) != source_sha256:
+        os.remove(tmp)
+        die(f"{os.path.basename(src)} changed during conversion; rerun from a stable source")
+    output_stamp = _file_stamp(tmp)
+    output_sha256 = _sha256(tmp)
+    if _file_stamp(tmp) != output_stamp:
+        die(f"{os.path.basename(tmp)} changed while hashing; rerun from stable files")
+    os.replace(tmp, dst)
+    manifest["outputs"][os.path.basename(dst)] = {
+        "stamp": output_stamp, "sha256": output_sha256}
+    manifest["shards"][os.path.basename(dst)] = {
+        "source_sha256": source_sha256, "output_sha256": output_sha256}
+    _write_manifest(manifest, manifest_path)
+
+
+def _replaceable_bytes(path):
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return 0
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        return 0  # replacing a link does not release its target's allocation
+    return min(info.st_size, getattr(info, "st_blocks", 0) * 512)
+
+
+def _replacement_peak(order, plans, completed, outdir):
+    growth = peak = 0
+    for sp in order:
+        bn = os.path.basename(sp)
+        if bn in completed:
+            continue
+        size = plans[bn]["out_bytes"]
+        peak = max(peak, growth + size)
+        growth += max(0, size - _replaceable_bytes(os.path.join(outdir, bn)))
+    return peak
+
+
+def _require_shard_space(outdir, size):
+    # Recheck actual free space at each write; snapshots, links and other
+    # filesystem activity can change how much a prior replacement releases.
+    if free_gb(outdir) * 1e9 < size:
+        die(f"not enough free space for a {size}-byte temporary shard in {outdir}")
 
 
 # ---------- selftest ----------
@@ -314,7 +434,10 @@ def main():
     cfg_path = os.path.join(a.indir, "config.json")
     if not os.path.exists(cfg_path):
         die(f"{cfg_path} not found — the shape table is derived from config.json")
-    C = json.load(open(cfg_path))
+    with open(cfg_path, "rb") as stream:
+        config_payload = stream.read()
+    C = json.loads(config_payload)
+    config_sha256 = hashlib.sha256(config_payload).hexdigest()
 
     shards = sorted(glob.glob(os.path.join(a.indir, "*.safetensors")))   # top level only:
     if not shards:                                                       # _meta/_inflight skipped
@@ -359,25 +482,36 @@ def main():
 
     # ---- preflight ----
     os.makedirs(a.outdir, exist_ok=True)
-    remaining = sum(pl["out_bytes"] for bn, pl in plans.items()
-                    if not _shard_done(os.path.join(a.outdir, bn), pl["out_bytes"]))
+    unexpected = sorted(os.path.basename(p) for p in glob.glob(os.path.join(a.outdir, "*.safetensors"))
+                        if os.path.basename(p) not in plans)
+    if unexpected:
+        die(f"output has shards absent from this source: {', '.join(unexpected)}; use a fresh --outdir")
+    manifest_path = os.path.join(a.outdir, ".fmt4-to-fmt2-resume.json")
+    manifest = _resume_manifest(manifest_path, config_sha256)
+    source_hashes = {os.path.basename(sp): _cached_sha256(sp, manifest["sources"])
+                     for sp in shards}
+    completed = {bn for bn, pl in plans.items()
+                 if _verified_shard(os.path.join(a.outdir, bn), pl["out_bytes"],
+                                    source_hashes[bn], manifest)}
+    remaining = _replacement_peak(mtp_shards + main_shards, plans, completed, a.outdir)
     if free_gb(a.outdir) * 1e9 < remaining:
         die(f"not enough free space on {a.outdir}: {free_gb(a.outdir):.0f} GB free, "
             f"~{remaining/1e9:.0f} GB still needed")
-    print(f"[PLAN] resume check: {remaining/1e9:.1f} GB to write, "
+    print(f"[PLAN] estimated peak shard space: {remaining/1e9:.1f} GB, "
           f"{free_gb(a.outdir):.0f} GB free")
 
     # ---- MTP shard(s): byte copy whole ----
     for sp in mtp_shards:
         bn = os.path.basename(sp)
         dst = os.path.join(a.outdir, bn)
-        if _shard_done(dst, plans[bn]["out_bytes"]):
+        if bn in completed:
             print(f"[RESUME] {bn} already done, skipped")
             continue
         print(f"[MTP] byte-copying {bn} ({os.path.getsize(sp)/1e9:.1f} GB)", flush=True)
+        _require_shard_space(a.outdir, plans[bn]["out_bytes"])
         tmp = dst + ".tmp"
         shutil.copyfile(sp, tmp)
-        os.replace(tmp, dst)
+        _publish_shard(sp, tmp, dst, source_hashes[bn], manifest, manifest_path)
 
     # ---- main shards: workers convert, main process writes in order ----
     from safetensors.numpy import save_file
@@ -385,48 +519,77 @@ def main():
     t_start = _t.time()
     fresh = skipped = 0
     _pool = _result_it = None
-    if a.workers and a.workers > 1:
-        from multiprocessing import Pool
-        _pending = [(i, sp, C) for i, sp in enumerate(main_shards)
-                    if not _shard_done(os.path.join(a.outdir, os.path.basename(sp)),
-                                       plans[os.path.basename(sp)]["out_bytes"])]
-        _pool = Pool(a.workers)
-        _result_it = iter(_pool.imap(_convert_one, _pending))
-    for i, sp in enumerate(main_shards):
-        bn = os.path.basename(sp)
-        dst = os.path.join(a.outdir, bn)
-        pl = plans[bn]
-        if _shard_done(dst, pl["out_bytes"]):
-            skipped += 1
-            continue
-        eta = ""
-        if fresh:
-            per = (_t.time() - t_start) / fresh
-            eta = f", ETA {per * (len(main_shards) - i) / 3600:.1f} h"
-        print(f"[{i + 1}/{len(main_shards)}] {bn}: {len(pl['converts'])} convert / "
-              f"{len(pl['copies'])} copy ({free_gb(a.outdir):.0f} GB free{eta})", flush=True)
-        if _result_it is not None:
-            _ri, out = next(_result_it)                    # converted by a worker, in order
-        else:
-            out = convert_shard(sp, C)
-        tmp = dst + ".tmp"
-        save_file(out, tmp)
-        got = os.path.getsize(tmp)
-        if got != pl["out_bytes"]:                         # predictor bug must not ship
-            os.remove(tmp)
-            die(f"{bn}: wrote {got} bytes, plan expected {pl['out_bytes']} — aborting "
-                "rather than resuming from a mispredicted size")
-        os.replace(tmp, dst)
-        fresh += 1
-    if _pool is not None:
-        _pool.close()
-        _pool.join()
+    workers_completed = False
+    try:
+        if a.workers and a.workers > 1:
+            from multiprocessing import Pool
+            _pending = [(i, sp, C) for i, sp in enumerate(main_shards)
+                        if os.path.basename(sp) not in completed]
+            _pool = Pool(a.workers)
+            _result_it = iter(_pool.imap(_convert_one, _pending))
+        for i, sp in enumerate(main_shards):
+            bn = os.path.basename(sp)
+            dst = os.path.join(a.outdir, bn)
+            pl = plans[bn]
+            if bn in completed:
+                skipped += 1
+                continue
+            eta = ""
+            if fresh:
+                per = (_t.time() - t_start) / fresh
+                eta = f", ETA {per * (len(main_shards) - i) / 3600:.1f} h"
+            print(f"[{i + 1}/{len(main_shards)}] {bn}: {len(pl['converts'])} convert / "
+                  f"{len(pl['copies'])} copy ({free_gb(a.outdir):.0f} GB free{eta})", flush=True)
+            if _result_it is not None:
+                _ri, out = next(_result_it)                    # converted by a worker, in order
+            else:
+                out = convert_shard(sp, C)
+            _require_shard_space(a.outdir, pl["out_bytes"])
+            tmp = dst + ".tmp"
+            save_file(out, tmp)
+            got = os.path.getsize(tmp)
+            if got != pl["out_bytes"]:                         # predictor bug must not ship
+                os.remove(tmp)
+                die(f"{bn}: wrote {got} bytes, plan expected {pl['out_bytes']} — aborting "
+                    "rather than resuming from a mispredicted size")
+            _publish_shard(sp, tmp, dst, source_hashes[bn], manifest, manifest_path)
+            fresh += 1
+        workers_completed = True
+    finally:
+        if _pool is not None:
+            if workers_completed:
+                _pool.close()
+            else:
+                _pool.terminate()
+            _pool.join()
     if skipped:
         print(f"[RESUME] {skipped} shard(s) already done in {a.outdir}, skipped")
 
-    # ---- metadata ----
-    copied, missing = [], []
+    # ---- final snapshot checks and metadata ----
+    if sorted(glob.glob(os.path.join(a.indir, "*.safetensors"))) != shards:
+        die("source shard membership changed during conversion; rerun from a stable source")
+    output_names = sorted(os.path.basename(p) for p in glob.glob(os.path.join(a.outdir, "*.safetensors")))
+    if output_names != sorted(plans):
+        die("output shard membership changed during conversion; use a fresh --outdir")
+    for sp in shards:
+        bn = os.path.basename(sp)
+        if _cached_sha256(sp, manifest["sources"]) != source_hashes[bn]:
+            die(f"{bn} changed during conversion; rerun from a stable source")
+        if not _verified_shard(os.path.join(a.outdir, bn), plans[bn]["out_bytes"],
+                               source_hashes[bn], manifest):
+            die(f"{bn} output changed during conversion; rerun from a stable output directory")
+    if _sha256(cfg_path) != config_sha256:
+        die("config.json changed during conversion; rerun from a stable source")
+    _write_manifest(manifest, manifest_path)
+    config_dst = os.path.join(a.outdir, "config.json")
+    config_tmp = config_dst + ".tmp"
+    with open(config_tmp, "wb") as stream:
+        stream.write(config_payload)
+    os.replace(config_tmp, config_dst)
+    copied, missing = ["config.json"], []
     for fn in META_FILES:
+        if fn == "config.json":
+            continue
         src = os.path.join(a.indir, fn)
         if os.path.exists(src):
             shutil.copy(src, a.outdir)

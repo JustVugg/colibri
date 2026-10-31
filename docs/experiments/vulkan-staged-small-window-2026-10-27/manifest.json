@@ -1,0 +1,97 @@
+{
+  "version": 1,
+  "hypothesis": "On a Colab A100 80 GB the NVIDIA driver (580.82.07) gives only 39.75 GiB of the host-visible device-local Vulkan memory type while its heap says 80 GiB, so the mapped path holds 13784 of Qwen3.8's 24576 int4 experts and the allocations made after them are refused; asking once, when the device exists, whether the type takes 9/10 of its heap and taking the staged path when it does not puts every expert on the card and makes decode faster.",
+  "commit": "c1c06ac6fcb32157e4da130fd96775a32a757052",
+  "model": "Qwen/Qwen3.8-Flash-Next-FP8 at 236dfdf285828023ca3bcd3f37366c58a3469b13, routed experts int4-g64 from CerSov0k/Qwen3.8-Flash-Next-FP8-colibri-experts-int4g64 (experts-int4g64/)",
+  "command": "make -C c qwen38 CUDA=1 VK=1 CUDA_ARCH=sm_80; cp <history> <model>/.coli_usage; env PPL=1 Q38_EXPERT_INT4=1 COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto COLI_TIMERS=1 OMP_NUM_THREADS=5 OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close SNAP=<model> N_NEW=200 ./c/qwen38 512 8 ref.json",
+  "prompt_hash": "366b41db5e1801932a1b7d82ffdd47967b7f730ed8bc83556be6a3c818dd63ae",
+  "hardware": {
+    "cpu": "a Colab A100 high-mem VM: 12 threads (nproc), CPU model not recorded + NVIDIA A100-SXM4-80GB (81920 MiB)",
+    "ram": "167 GiB (free -g), no swap",
+    "storage": "the VM's local NVMe (/mnt/local-scratch)",
+    "os": "Google Colab Linux, NVIDIA driver 580.82.07, Vulkan through the driver's EGL library (an ICD json on libEGL_nvidia.so.0)"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "Qwen/Qwen3.8-Flash-Next-FP8 at 236dfdf285828023ca3bcd3f37366c58a3469b13, routed experts int4-g64 from CerSov0k/Qwen3.8-Flash-Next-FP8-colibri-experts-int4g64 (experts-int4g64/)",
+      "input": "ref.json: 64 prompt tokens, then 256 teacher-forced (PPL=1; the 256 are full_ids minus prompt_ids, N_NEW does not set them)",
+      "new_tokens": 256,
+      "history": "the warm-up's, put back before each run (sha256 b3891e4ff3402d67af3192c11a3d11f4593329364661e67683365f5174f819bc)",
+      "OMP_NUM_THREADS": 5,
+      "engine_build": "origin/dev c1c06ac6"
+    },
+    "samples": {
+      "tok_s": [
+        20.59,
+        20.36,
+        20.4,
+        20.51
+      ],
+      "nll": [
+        2.4113,
+        2.4113,
+        2.4113,
+        2.4113
+      ],
+      "experts_on_the_card": [
+        13784,
+        13784,
+        13784,
+        13784
+      ]
+    },
+    "median_tok_s": 20.455,
+    "quality": {
+      "method": "teacher-forced nll over the same 256 tokens: 2.4113 in all 4 runs; make -C c check passes on macOS arm64",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/vulkan-staged-small-window-2026-10-27/runs.txt",
+      "sha256": "5fcce71eae119844c6dce7e56e694fd4bf630884ca03d8ac4479656bcec9a2a4"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "Qwen/Qwen3.8-Flash-Next-FP8 at 236dfdf285828023ca3bcd3f37366c58a3469b13, routed experts int4-g64 from CerSov0k/Qwen3.8-Flash-Next-FP8-colibri-experts-int4g64 (experts-int4g64/)",
+      "input": "ref.json: 64 prompt tokens, then 256 teacher-forced (PPL=1; the 256 are full_ids minus prompt_ids, N_NEW does not set them)",
+      "new_tokens": 256,
+      "history": "the warm-up's, put back before each run (sha256 b3891e4ff3402d67af3192c11a3d11f4593329364661e67683365f5174f819bc)",
+      "OMP_NUM_THREADS": 5,
+      "engine_build": "origin/dev c1c06ac6 + this change (the version measured: see the head of runs.txt)"
+    },
+    "samples": {
+      "tok_s": [
+        42.98,
+        43.26,
+        43.31,
+        42.92
+      ],
+      "nll": [
+        2.3988,
+        2.3988,
+        2.3988,
+        2.3988
+      ],
+      "experts_on_the_card": [
+        24576,
+        24576,
+        24576,
+        24576
+      ]
+    },
+    "median_tok_s": 43.12,
+    "quality": {
+      "method": "teacher-forced nll 2.3988 in all 4 runs, 0.0125 away from dev's: dev with COLI_VK_STAGED=1 (the same path, without this change) gives 2.3988 too (s1-dev2staged, the same VM), so the gap comes with the staged path, with or without this change's probe; a prompt of 512 tokens stays on the card (p512.txt) where dev's falls to the CPU; vk-tier-check, with its new window case, passes on the A100 (the four rows of the version measured there) and, with the final code and its two added rows, on Lavapipe and on an L4 (checks.txt); make -C c check passes on macOS arm64",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/vulkan-staged-small-window-2026-10-27/runs.txt",
+      "sha256": "5fcce71eae119844c6dce7e56e694fd4bf630884ca03d8ac4479656bcec9a2a4"
+    }
+  },
+  "outcome": "improvement"
+}

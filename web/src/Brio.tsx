@@ -37,6 +37,9 @@ interface Row {
 let nextId = 1
 const blank = (): Row => ({ id: nextId++, text: "", options: "" })
 const first = (): Row => ({ id: nextId++, text: "", options: "yes\nno" })
+const withoutResult = (row: Row): Row => ({
+  ...row, result: undefined, seconds: undefined, error: undefined,
+})
 
 export default function Brio({ baseUrl, apiKey, model, connected }: {
   baseUrl: string; apiKey: string; model: string; connected: boolean
@@ -48,6 +51,8 @@ export default function Brio({ baseUrl, apiKey, model, connected }: {
   const [running, setRunning] = useState<number | null>(null)
   const file = useRef<HTMLInputElement>(null)
   const abort = useRef<AbortController | null>(null)
+  const revision = useRef(0)
+  const serving = useRef({ baseUrl, model })
 
   /* Fermare uno scoring in corso. Su un motore che streamma gli esperti da
    * disco una domanda dura minuti: senza un modo di annullare, chi cambia idea
@@ -55,6 +60,16 @@ export default function Brio({ baseUrl, apiKey, model, connected }: {
    * chiude il fetch, il server vede il client sparito e smette (client
    * disconnesso -> ClientCancelled). Vale anche allo smontaggio della pagina. */
   useEffect(() => () => abort.current?.abort(), [])
+
+  /* A result belongs to the model and endpoint that produced it. The model
+   * selector lives outside this page, so changing it does not remount Brio. */
+  useEffect(() => {
+    if (serving.current.baseUrl === baseUrl && serving.current.model === model) return
+    serving.current = { baseUrl, model }
+    revision.current += 1
+    abort.current?.abort()
+    setRows((all) => all.map(withoutResult))
+  }, [baseUrl, model])
 
   /* Ogni domanda porta le SUE opzioni: "quanto e rischioso" vuole
    * basso/medio/alto, "si firma" vuole si/no, e un insieme unico per tutte
@@ -65,6 +80,18 @@ export default function Brio({ baseUrl, apiKey, model, connected }: {
   const patch = (id: number, change: Partial<Row>) =>
     setRows((all) => all.map((row) => (row.id === id ? { ...row, ...change } : row)))
 
+  const edit = (id: number, change: Partial<Row>) => {
+    revision.current += 1
+    setRows((all) => all.map((row) => (row.id === id ? withoutResult({ ...row, ...change }) : row)))
+  }
+
+  const replaceState = (text: string, label: string) => {
+    revision.current += 1
+    setState(text)
+    setSource(label)
+    setRows((all) => all.map(withoutResult))
+  }
+
   const load = async (chosen: File | undefined) => {
     if (!chosen) return
     /* Solo testo: un PDF o un .docx qui arriverebbe come byte illeggibili e il
@@ -72,21 +99,27 @@ export default function Brio({ baseUrl, apiKey, model, connected }: {
      * dirlo che accettarlo e sbagliare in silenzio. */
     const text = await chosen.text()
     if (text.includes("\u0000")) { setSource(t("brio.fileBinary")); return }
-    setState(text)
-    setSource(`${chosen.name} · ${(chosen.size / 1024).toFixed(1)} kB`)
+    replaceState(text, `${chosen.name} · ${(chosen.size / 1024).toFixed(1)} kB`)
   }
 
   const run = async () => {
     const controller = new AbortController()
     abort.current = controller
     setRows((all) => all.map((row) => ({ ...row, result: undefined, error: undefined, seconds: undefined })))
+    /* Requests are deliberately one question at a time. When more follow, the
+       first one must photograph their shared document; a one-question run can
+       keep System One's cheaper no-photo heuristic. */
+    const pinState = asked.length > 1
+    const runRevision = revision.current
     for (const row of asked) {
       setRunning(row.id)
       const started = performance.now()
       try {
-        const result = await askSystemOne(baseUrl, apiKey, model, state, row.text, lines(row.options), controller.signal)
+        const result = await askSystemOne(baseUrl, apiKey, model, state, row.text, lines(row.options), pinState, controller.signal)
+        if (revision.current !== runRevision) break
         patch(row.id, { result, seconds: (performance.now() - started) / 1000 })
       } catch (cause) {
+        if (revision.current !== runRevision) break
         if (controller.signal.aborted) break   /* fermato apposta: le domande dopo restano intatte */
         patch(row.id, { error: cause instanceof Error ? cause.message : String(cause) })
       }
@@ -100,13 +133,15 @@ export default function Brio({ baseUrl, apiKey, model, connected }: {
       <section className="brio-card brio-doc">
         <div className="brio-doc-head">
           <h2>{t("brio.document")}</h2>
-          <button type="button" onClick={() => file.current?.click()}>
+          <button type="button" disabled={running !== null} onClick={() => file.current?.click()}>
             <FileUp />{t("brio.upload")}
           </button>
-          <input ref={file} type="file" hidden accept=".txt,.md,.markdown,.json,.csv,.tsv,.log,.yml,.yaml,.xml,.html,text/*"
+          <input ref={file} type="file" hidden disabled={running !== null}
+                 accept=".txt,.md,.markdown,.json,.csv,.tsv,.log,.yml,.yaml,.xml,.html,text/*"
                  onChange={(e) => { void load(e.target.files?.[0]); e.target.value = "" }} />
         </div>
-        <textarea rows={8} value={state} onChange={(e) => { setState(e.target.value); setSource("") }}
+        <textarea rows={8} value={state} disabled={running !== null}
+                  onChange={(e) => replaceState(e.target.value, "")}
                   placeholder={t("brio.documentPlaceholder")} />
         <p className="brio-meta">
           {source ? <b>{source} · </b> : null}
@@ -122,21 +157,25 @@ export default function Brio({ baseUrl, apiKey, model, connected }: {
             <section className="brio-card brio-q" key={row.id}>
               <div className="brio-q-head">
                 <span className="brio-num">{index + 1}</span>
-                <input value={row.text} onChange={(e) => patch(row.id, { text: e.target.value })}
+                <input value={row.text} disabled={running !== null}
+                       onChange={(e) => edit(row.id, { text: e.target.value })}
                        placeholder={t("brio.questionPlaceholder")} />
                 {rows.length > 1 ? (
                   <button type="button" className="brio-drop" title={t("brio.removeQuestion")}
+                          disabled={running !== null}
                           onClick={() => setRows((all) => all.filter((r) => r.id !== row.id))}><X /></button>
                 ) : null}
               </div>
               <textarea className="brio-own" rows={own.length > 2 ? own.length : 2} value={row.options}
-                        onChange={(e) => patch(row.id, { options: e.target.value })}
+                        disabled={running !== null}
+                        onChange={(e) => edit(row.id, { options: e.target.value })}
                         placeholder={t("brio.ownOptions")} />
               {own.length ? (
                 <div className="brio-chips">
                   {own.map((option) => (
                     <button type="button" key={option} title={t("brio.removeOption")}
-                            onClick={() => patch(row.id, { options: own.filter((o) => o !== option).join("\n") })}>
+                            disabled={running !== null}
+                            onClick={() => edit(row.id, { options: own.filter((o) => o !== option).join("\n") })}>
                       {option}<X />
                     </button>
                   ))}
@@ -175,7 +214,8 @@ export default function Brio({ baseUrl, apiKey, model, connected }: {
         })}
 
         <div className="brio-actions">
-          <button type="button" className="brio-add" onClick={() => setRows((all) => [...all, blank()])}>
+          <button type="button" className="brio-add" disabled={running !== null}
+                  onClick={() => setRows((all) => [...all, blank()])}>
             <Plus />{t("brio.addQuestion")}
           </button>
           {/* Mentre gira, lo stesso bottone ferma: l'abort chiude il fetch e

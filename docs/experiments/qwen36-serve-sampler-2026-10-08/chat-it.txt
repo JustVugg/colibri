@@ -1,0 +1,7 @@
+<|im_start|>user
+Raccontami in poche righe come cominciano I promessi sposi.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+

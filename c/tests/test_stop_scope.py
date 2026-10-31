@@ -45,6 +45,27 @@ class StopScopeTests(unittest.TestCase):
         self.assertTrue(coli._serve_cmdline_matches_port(raw, 8000))
         self.assertFalse(coli._serve_cmdline_matches_port(raw, 9000))
 
+    def test_web_is_a_server(self):
+        # `coli web` is `coli serve` plus a browser, and what `coli start` runs.
+        raw = self.cmdline("python3", "/opt/colibri/coli", "web", "--model", "/models/a",
+                           "--host", "127.0.0.1", "--port", "9000", "--no-browser")
+        self.assertTrue(coli._serve_cmdline_matches_port(raw, 9000))
+        self.assertFalse(coli._serve_cmdline_matches_port(raw, 8000))
+
+    def test_stop_without_pidfile_drains_a_web_launcher(self):
+        # Without the launcher in the table, its engine was killed as a stray and
+        # the launcher's watchdog started the engine again behind "stopped".
+        table = [(4242, self.cmdline("python3", "/opt/colibri/coli", "web",
+                                     "--port", "9123"), "python3")]
+        args = types.SimpleNamespace(port=9123, dry_run=True)
+        out = io.StringIO()
+        with mock.patch.object(coli, "banner"), \
+             mock.patch.object(coli, "serve_pidfile", return_value="/not/a/pidfile"), \
+             mock.patch.object(coli, "_stop_proc_table", return_value=table), \
+             contextlib.redirect_stdout(out):
+            coli.cmd_stop(args)
+        self.assertIn("would stop 4242: coli serve (cmdline, port 9123)", out.getvalue())
+
     def test_engine_tag_is_port_specific(self):
         raw = b"SNAP=/models/a\0SERVE=1\0COLI_SERVE_PORT=9000\0"
         self.assertTrue(coli._serve_environ_matches_port(raw, 9000))
@@ -62,6 +83,39 @@ class StopScopeTests(unittest.TestCase):
              mock.patch.object(coli, "serve_pidfile", return_value="/not/a/pidfile"), \
              mock.patch.object(coli.os, "listdir", side_effect=OSError):
             coli.cmd_stop(args)
+
+    def test_serve_that_cannot_bind_keeps_the_running_serves_pidfile(self):
+        # A second `coli serve` on a busy port fails to bind; the pidfile must
+        # still name the serve that holds the port, for coli stop and coli status.
+        running = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                pidfile = Path(tmp, "coli-serve-9123.pid")
+                pidfile.write_text(f"{running.pid} /models/a\n")
+                family = types.SimpleNamespace(id="glm", has_gateway_adapter=True,
+                                               limits=types.SimpleNamespace(max_kv_slots=8))
+                args = types.SimpleNamespace(model="/models/a", host="127.0.0.1", port=9123,
+                                             api_key=None, cap=None, cors_origin=None,
+                                             max_queue=8, queue_timeout=300, kv_slots=1,
+                                             allowed_host=[], temp=None,
+                                             cluster_coordinator=None)
+                with mock.patch.object(coli, "need_model"), \
+                     mock.patch.object(coli, "resolve_model",
+                                       return_value=types.SimpleNamespace(descriptor=family)), \
+                     mock.patch.object(coli, "engine_for", return_value="/engines/glm"), \
+                     mock.patch.object(coli, "serve_model_id", return_value="glm"), \
+                     mock.patch.object(coli, "_serve_engine_env", return_value={}), \
+                     mock.patch.object(coli, "serve_pidfile", return_value=str(pidfile)), \
+                     mock.patch.object(coli, "serve_stopfile",
+                                       return_value=os.path.join(tmp, "coli-serve-9123.stop")), \
+                     mock.patch("openai_server.serve",
+                                side_effect=OSError(48, "Address already in use")):
+                    with self.assertRaises(OSError):
+                        coli.cmd_serve(args)
+                self.assertEqual(pidfile.read_text(), f"{running.pid} /models/a\n")
+        finally:
+            running.terminate()
+            running.wait(timeout=5)
 
     @unittest.skipUnless(sys.platform.startswith("linux") and Path("/proc").is_dir(),
                          "process discovery uses Linux /proc")
@@ -85,6 +139,8 @@ class StopScopeTests(unittest.TestCase):
                 with mock.patch.object(coli, "banner"), \
                      mock.patch.object(coli, "serve_pidfile",
                                        return_value=os.path.join(tmp, "missing.pid")), \
+                     mock.patch.object(coli, "serve_stopfile",
+                                       return_value=os.path.join(tmp, "coli-serve-9123.stop")), \
                      mock.patch.object(coli.time, "sleep"), \
                      contextlib.redirect_stdout(io.StringIO()):
                     coli.cmd_stop(args)
