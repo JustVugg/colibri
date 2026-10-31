@@ -1391,6 +1391,8 @@ def decode_wav_mono16k(data, param):
     else:
         raise APIError(400, f"Unsupported WAV encoding (format {audio_format}, {bits}-bit); "
                             "use PCM16 or float32.", param, "invalid_value")
+    if not np.isfinite(samples).all():
+        raise APIError(400, "WAV samples must be finite numbers.", param, "invalid_value")
     if channels > 1:
         samples = samples.reshape(-1, channels).mean(axis=1)
     return samples
