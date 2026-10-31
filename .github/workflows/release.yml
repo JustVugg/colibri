@@ -95,12 +95,12 @@ jobs:
       - name: Build engines
         run: |
           cd c
-          for t in colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41 mimo qwenimage laya gliner_decide; do
+          for t in colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41 mimo qwenimage laya gliner_decide colibri-tui; do
             extra=""
             case " ${{ matrix.metal }} " in *" $t "*) extra="METAL=1" ;; esac
             make $t ${{ matrix.make_args }} $extra
           done
-          ls -lh colibri${{ matrix.ext }} glm53${{ matrix.ext }} inkling${{ matrix.ext }} kimi_k3${{ matrix.ext }} olmoe${{ matrix.ext }} qwen36${{ matrix.ext }} qwen38${{ matrix.ext }} deepseek_v41${{ matrix.ext }} mimo${{ matrix.ext }}
+          ls -lh colibri${{ matrix.ext }} glm53${{ matrix.ext }} inkling${{ matrix.ext }} kimi_k3${{ matrix.ext }} olmoe${{ matrix.ext }} qwen36${{ matrix.ext }} qwen38${{ matrix.ext }} deepseek_v41${{ matrix.ext }} mimo${{ matrix.ext }} colibri-tui${{ matrix.ext }}
 
       # DeepSeek V4 has its own Makefile and its own target name (`deepseek-v4`,
       # producing `deepseek_v4`), so it never joined the loop above -- and #858 is
@@ -165,6 +165,8 @@ jobs:
           cp c/mimo${{ matrix.ext }} dist/mimo${{ matrix.ext }}
           cp c/laya${{ matrix.ext }} dist/laya${{ matrix.ext }}
           cp c/gliner_decide${{ matrix.ext }} dist/gliner_decide${{ matrix.ext }}
+          # the terminal interface, next to coli: `coli tui` looks for it there (tui_binary())
+          cp c/colibri-tui${{ matrix.ext }} dist/colibri-tui${{ matrix.ext }}
           # deepseek_v4 -- underscore, not the hyphen of the make target: engine_for()
           # looks for "deepseek_v4" next to coli. Guarded, not unconditional, because
           # the macos-arm64 archive has no such engine to ship (#858).
@@ -240,6 +242,10 @@ jobs:
           for e in $SIBLINGS; do
             test -x $e${{ matrix.ext }} || { echo "FAIL: $e missing from archive"; ls -la; exit 1; }
           done
+          # the TUI: present, and it runs (--version needs no terminal and no server)
+          test -x colibri-tui${{ matrix.ext }} || { echo "FAIL: colibri-tui missing from archive"; ls -la; exit 1; }
+          ./colibri-tui${{ matrix.ext }} --version | grep -q "^colibri-tui " \
+            || { echo "FAIL: the packaged colibri-tui does not run"; exit 1; }
           # Kimi K3 needs tokenizer.json synthesized from tiktoken.model; without this
           # script in the archive the engine ships but cannot be driven by coli chat.
           test -f tools/k3_tokenizer.py || { echo "FAIL: k3_tokenizer.py missing from archive"; exit 1; }
