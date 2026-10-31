@@ -1,49 +1,47 @@
 {
   description = "colibrì — run large MoE models (GLM-5.2, OLMoE, DeepSeek V4 Flash) on a consumer machine";
 
-  # flake.lock (committed) pins these branch inputs to exact commit SHAs,
-  # so builds are reproducible; refresh with `nix flake update`.
-  inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
-    flake-utils.url = "github:numtide/flake-utils";
-  };
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
-  outputs = {
-    self,
-    nixpkgs,
-    flake-utils,
-  }:
-    flake-utils.lib.eachDefaultSystem (
-      system: let
-        pkgs = import nixpkgs {inherit system;};
+  outputs = inputs: {
+    packages = builtins.mapAttrs (system: pkgs: {
+      colibri = pkgs.callPackage ./package.nix { };
+      default = inputs.self.packages.${system}.colibri;
+    }) inputs.nixpkgs.legacyPackages;
 
-        colibri = pkgs.callPackage ./package.nix {};
-      in {
-        packages = {
-          default = colibri;
-          inherit colibri;
+    apps = builtins.mapAttrs (
+      system: pkgs:
+      let
+        inherit (inputs.self.packages.${system}) colibri;
+      in
+      {
+        default = {
+          type = "app";
+          program = pkgs.lib.getExe colibri;
         };
-
-        apps = {
-          default = {
-            type = "app";
-            program = pkgs.lib.getExe colibri;
-          };
-          # `nix run .#engine` runs the engine binary directly, skipping the
-          # coli launcher. Named "engine", not "colibri", so it doesn't shadow
-          # packages.colibri (whose mainProgram is coli).
-          engine = {
-            type = "app";
-            program = "${colibri}/bin/colibri";
-          };
+        # `nix run .#engine` runs the engine binary directly, skipping the
+        # coli launcher. Named "engine", not "colibri", so it doesn't shadow
+        # packages.colibri (whose mainProgram is coli).
+        engine = {
+          type = "app";
+          program = "${colibri}/bin/colibri";
         };
+      }
+    ) inputs.nixpkgs.legacyPackages;
 
-        formatter = pkgs.alejandra;
+    formatter = builtins.mapAttrs (_: pkgs: pkgs.alejandra) inputs.nixpkgs.legacyPackages;
 
-        devShells.default = pkgs.mkShell {
-          inputsFrom = [colibri];
+    devShells = builtins.mapAttrs (
+      system: pkgs:
+      let
+        inherit (inputs.self.packages.${system}) colibri;
+      in
+      {
+        default = pkgs.mkShell {
+          inputsFrom = [ colibri ];
 
-          packages = with pkgs;
+          packages =
+            with pkgs;
             [
               colibri.pythonEnv
               gcc
@@ -60,7 +58,9 @@
 
           shellHook =
             pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
-              export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [pkgs.vulkan-loader]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+              export LD_LIBRARY_PATH="${
+                pkgs.lib.makeLibraryPath [ pkgs.vulkan-loader ]
+              }''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             ''
             + ''
               echo "🐦 colibrì dev shell"
@@ -73,5 +73,6 @@
             '';
         };
       }
-    );
+    ) inputs.nixpkgs.legacyPackages;
+  };
 }

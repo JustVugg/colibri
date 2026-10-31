@@ -20,7 +20,7 @@ let
     ]
   );
 
-  inherit (stdenv.hostPlatform) isDarwin;
+  inherit (stdenv.hostPlatform) isDarwin isLinux;
 
   # Real version from the engine's single source of truth (c/version.py).
   colibriVersion =
@@ -69,11 +69,11 @@ stdenv.mkDerivation {
   # Compiler comes from stdenv (clang on Darwin, gcc on Linux); these add
   # only the extra build/runtime libs each platform needs.
   buildInputs =
-    lib.optionals stdenv.hostPlatform.isDarwin [
+    lib.optionals isDarwin [
       llvmPackages.openmp # libomp runtime for the OpenMP build
       apple-sdk_15 # SDK 15 headers enable the Metal residency-set path
     ]
-    ++ lib.optionals stdenv.hostPlatform.isLinux [
+    ++ lib.optionals isLinux [
       stdenv.cc.cc.lib # libgomp.so.1 in the runtime closure
     ];
 
