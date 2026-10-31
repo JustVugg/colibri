@@ -590,7 +590,7 @@ as mesmas se um especialista respondeu da VRAM, da RAM ou do disco.
 - **Especulação que se paga.** O cabeçote MTP int8 do GLM-5.2 rascunha 2,2-2,8
   tokens por forward quando compensa; o cabeçote MTP do Qwen3.8-Flash-Next, ligado
   por padrão, acrescenta 16-20% com a mesma saída, e o prompt lookup, 6-7% em
-  edições de código. O cabeçote do Qwen3.6, ligado por padrão, leva o decode de
+  edições de código. O cabeçote do Qwen3.6 (`Q36_MTP=1`) leva o decode de
   99,7-104,5 a 115,8-120,1 tok/s com CUDA e de 83,2-83,8 a 99,9-109,3 com Vulkan
   (uma RTX PRO 4000). O cabeçote DSpark do DeepSeek V4.1 rascunha tão fundo
   quanto a sua confiança diz, e uma verificação pula os rascunhos que não podem
