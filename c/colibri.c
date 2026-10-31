@@ -9079,7 +9079,7 @@ static int grammar_setup_text(GrDraft *g, Tok *T, char *txt, const char *label){
     if(gr_parse(&g->gram,txt)){ fprintf(stderr,"[GRAMMAR] %s: %s\n",label,g->gram.err); free(txt); return -1; }
     free(txt);
     gr_state_init(&g->st,&g->gram);
-    if(!g->st.alive){ fprintf(stderr,"[GRAMMAR] %s: grammar cannot be evaluated (left recursion?)\n",label); return -1; }
+    if(!g->st.alive){ fprintf(stderr,"[GRAMMAR] %s: grammar cannot be evaluated (left recursion, or alternates that fan out past the walker's budget)\n",label); return -1; }
     if(g->max<1) g->max=24;
     if(g->max>48) g->max=48;
     g->T=T; g->on=1; g->armed=0;
