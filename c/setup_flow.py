@@ -444,8 +444,11 @@ VULKAN_IGPU_MEASURED = frozenset({"qwen36", "qwen38"})
 #:     "Linux CUDA tier"); and dsv4_cuda_backend_arch_ok turns the tier on from
 #:     compute 6.0, so an older card would sit idle while the CPU did the work.
 #:
-#:   backend_cuda.o (glm53, deepseek_v41, mimo): the routed-expert tier on a CUDA
-#:     device (cu_tier.h). A build with Vulkan too runs on Vulkan unless
+#:   backend_cuda.o (glm53, deepseek_v41): the routed-expert tier on a CUDA
+#:     device (cu_tier.h).
+#:
+#:   backend_cuda_mimo.o (mimo): this fork's MiMo dense matrices and prompts on the
+#:     card (MIMO_CUDA_OBJ; the Windows build loads coli_cuda_mimo.dll instead). A build with Vulkan too runs on Vulkan unless
 #:     COLI_VULKAN=0 (CUDA_WITH_VULKAN), whose dense chain puts the trunk on the card.
 #:
 #: The remaining engines are CPU-only: none of them is here, so none of them is
@@ -457,7 +460,7 @@ CUDA_ENGINES = {
     "kimi": {"object": "backend_cuda.o"},
     "glm53": {"object": "backend_cuda.o"},
     "deepseek_v41": {"object": "backend_cuda.o"},
-    "mimo": {"object": "backend_cuda.o"},
+    "mimo": {"object": "backend_cuda_mimo.o"},
     "inkling": {"object": "backend_cuda_ink.o"},
     "deepseek_v4": {"object": "backend_cuda_dsv4.o", "min_compute": 60,
                     "min_toolkit": (12, 0), "no_tc_below": (12, 8)},

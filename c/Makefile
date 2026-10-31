@@ -1560,16 +1560,20 @@ endif
 endif
 # MinGW's libgomp parks its team on semaphores (~80 us a region at 16 threads, ~7 us a
 # region met inside one): omp_spin.c runs the engine's regions on a team that spins
-# between them (COLI_OMP_SPIN=0: libgomp's team). --wrap sends GCC's calls there.
+# between them (COLI_OMP_SPIN=0: libgomp's team). --wrap sends GCC's calls there. Not in a
+# VK=1 build: vk_tier.c's loops hand rows out by schedule(runtime) (omp_set_schedule,
+# GOMP_loop_*_runtime_*), entry points the spinning team does not serve.
 MIMO_OMP_OBJ =
 MIMO_OMP_LDFLAGS =
 ifneq ($(IS_WIN),)
+ifneq ($(VK),1)
 OMP_SPIN_WRAP = GOMP_parallel GOMP_barrier GOMP_loop_end_nowait \
 	GOMP_loop_nonmonotonic_dynamic_start GOMP_loop_nonmonotonic_dynamic_next \
 	GOMP_loop_ull_nonmonotonic_dynamic_start GOMP_loop_ull_nonmonotonic_dynamic_next \
 	omp_get_thread_num omp_get_num_threads omp_in_parallel
 MIMO_OMP_OBJ = omp_spin.o
 MIMO_OMP_LDFLAGS = $(foreach s,$(OMP_SPIN_WRAP),-Wl,--wrap=$(s))
+endif
 endif
 omp_spin.o: omp_spin.c .build-config
 	$(CC) $(CFLAGS) -c $< -o $@

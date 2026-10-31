@@ -39,7 +39,7 @@ import family_registry as fr  # noqa: E402
 # for the planner to size and no GPU for it to select. What the flag promises is
 # exactly that tier and that selection, so a Vulkan-only engine stays CPU-only to
 # the planner.
-BACKEND_OBJECTS = ("CUDA_OBJ", "METAL_OBJ", "INK_CUDA_OBJ", "QWEN36_TIER_OBJ")
+BACKEND_OBJECTS = ("CUDA_OBJ", "CHAIN_CUDA_OBJ", "METAL_OBJ", "INK_CUDA_OBJ", "QWEN36_TIER_OBJ")
 
 
 def engine_rule(artifact: str) -> str:

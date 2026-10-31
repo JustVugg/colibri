@@ -577,7 +577,8 @@ class CudaEngineTable(unittest.TestCase):
     """CUDA_ENGINES says what each engine's CUDA build is and needs; this reads
     the same facts from the Makefiles and the sources."""
 
-    OBJECTS = {"CUDA_OBJ": "backend_cuda.o", "INK_CUDA_OBJ": "backend_cuda_ink.o"}
+    OBJECTS = {"CUDA_OBJ": "backend_cuda.o", "INK_CUDA_OBJ": "backend_cuda_ink.o",
+               "MIMO_CUDA_OBJ": "backend_cuda_mimo.o"}
 
     def rule(self, artifact):
         makefile = (C_DIR / "Makefile").read_text(encoding="utf-8")

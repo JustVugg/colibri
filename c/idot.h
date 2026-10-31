@@ -1289,10 +1289,10 @@ static inline __attribute__((always_inline)) void i8r16_group(float *y, int O, c
 static inline __attribute__((always_inline)) void i8r16_group2(float *y, int O, const int8_t *grp, const float *sc,
                                                               const int8_t *xq, const float *sx, const int32_t *xsum,
                                                               int I, const int n){
-    __m512i p[8], q[8]; const int8_t *grp2=grp+(size_t)16*I;
+    __m512i p[8], q[8]; const int8_t *grp_hi=grp+(size_t)16*I;   /* not grp2: dlgs.h (windows.h) defines it */
     for(int s=0;s<n;s++){ p[s]=_mm512_setzero_si512(); q[s]=_mm512_setzero_si512(); }
     for(int j=0;j<I/4;j++){
-        const __m512i c=_mm512_loadu_si512((const void*)(grp+64*(size_t)j)), c2=_mm512_loadu_si512((const void*)(grp2+64*(size_t)j));
+        const __m512i c=_mm512_loadu_si512((const void*)(grp+64*(size_t)j)), c2=_mm512_loadu_si512((const void*)(grp_hi+64*(size_t)j));
         for(int s=0;s<n;s++){
             const __m512i x=_mm512_set1_epi32(i8r16_ld32(xq+(size_t)s*I+4*j));
             p[s]=_mm512_dpbusd_epi32(p[s],c,x); q[s]=_mm512_dpbusd_epi32(q[s],c2,x);

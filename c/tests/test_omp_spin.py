@@ -70,8 +70,10 @@ class OmpSpin(unittest.TestCase):
         if not nm:
             self.skipTest("nm not found beside gcc")
         served = set(wrapped()) | UNWRAPPED_OK
-        # mimo.c in the plain, CUDA and VK=1 builds, and the objects VK=1 links beside it
-        # (backend_vulkan.c and vk_chain.c need the Vulkan headers to compile)
+        # mimo.c and kimi_k3.c in the builds that link omp_spin.o (plain and CUDA). A VK=1
+        # build links libgomp's own team (the Makefile: vk_tier.c's schedule(runtime) loops),
+        # so there the sources only have to compile (backend_vulkan.c and vk_chain.c need the
+        # Vulkan headers to compile).
         vk = ["-DCOLI_VULKAN"]
         objects = [("mimo.c", []), ("mimo.c", ["-DCOLI_MIMO_CUDA"]), ("mimo.c", vk),
                    ("kimi_k3.c", []), ("kimi_k3.c", ["-DCOLI_CUDA"]), ("kimi_k3.c", vk),
@@ -91,6 +93,8 @@ class OmpSpin(unittest.TestCase):
                     calls = {c for c in calls if c.startswith(("GOMP_", "omp_"))}
                     if src in ("mimo.c", "kimi_k3.c"):
                         self.assertIn("GOMP_parallel", calls)
+                    if "-DCOLI_VULKAN" in defs:
+                        continue
                     self.assertEqual(calls - served, set(), f"{src} {defs} calls libgomp entry points omp_spin.c does not serve")
 
 

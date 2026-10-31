@@ -385,7 +385,7 @@ static float *fcalloc(int64_t n){
  * buffer before it reads it. */
 #define K3_BC_MAX 64
 #define K3_BC_MIN ((size_t)1<<20)
-static struct { char *base; size_t cap; } g_k3_bc[K3_BC_MAX];
+static struct { char *blk; size_t cap; } g_k3_bc[K3_BC_MAX];   /* blk: malloc's, not posix_memalign's */
 static int g_k3_bc_n;
 static pthread_mutex_t g_k3_bc_mx=PTHREAD_MUTEX_INITIALIZER;
 static void *k3_balloc_bytes(size_t b){
@@ -395,7 +395,7 @@ static void *k3_balloc_bytes(size_t b){
         int best=-1;
         for(int i=0;i<g_k3_bc_n;i++)
             if(g_k3_bc[i].cap>=b&&g_k3_bc[i].cap/2<=b&&(best<0||g_k3_bc[i].cap<g_k3_bc[best].cap)) best=i;
-        if(best>=0){ base=g_k3_bc[best].base; g_k3_bc[best]=g_k3_bc[--g_k3_bc_n]; }
+        if(best>=0){ base=g_k3_bc[best].blk; g_k3_bc[best]=g_k3_bc[--g_k3_bc_n]; }
         pthread_mutex_unlock(&g_k3_bc_mx);
         if(base) return base+64;
     }
@@ -413,14 +413,14 @@ static void k3_bfree(void *p){
     char *base=(char*)p-64;
     if(*(size_t*)base>=K3_BC_MIN){
         pthread_mutex_lock(&g_k3_bc_mx);
-        if(g_k3_bc_n<K3_BC_MAX){ g_k3_bc[g_k3_bc_n].base=base; g_k3_bc[g_k3_bc_n].cap=*(size_t*)base; g_k3_bc_n++; base=NULL; }
+        if(g_k3_bc_n<K3_BC_MAX){ g_k3_bc[g_k3_bc_n].blk=base; g_k3_bc[g_k3_bc_n].cap=*(size_t*)base; g_k3_bc_n++; base=NULL; }
         pthread_mutex_unlock(&g_k3_bc_mx);
     }
     free(base);
 }
 static void k3_bcache_drop(void){
     pthread_mutex_lock(&g_k3_bc_mx);
-    for(int i=0;i<g_k3_bc_n;i++) free(g_k3_bc[i].base);
+    for(int i=0;i<g_k3_bc_n;i++) free(g_k3_bc[i].blk);
     g_k3_bc_n=0;
     pthread_mutex_unlock(&g_k3_bc_mx);
 }
@@ -3274,10 +3274,10 @@ static Slot *k3_step_slot(Model *m, int li){
     for(int i=0;i<lc->n;i++){
         Slot *s=&lc->s[i];
         if(s->busy||s->pinned||s->pref||!slot_ready(s)) continue;
-        if(s->eid>=0&&vkt_ram_first(li,s->eid)){ if(dev<0||s->used<lc->s[dev].used) dev=i; continue; }
+        if(s->eid>=0&&XT(ram_first)(li,s->eid)){ if(dev<0||s->used<lc->s[dev].used) dev=i; continue; }
         if(lru<0||s->used<lc->s[lru].used) lru=i;
     }
-    if(dev>=0){ lru=dev; vkt_ram_gave(); }
+    if(dev>=0){ lru=dev; XT(ram_gave)(); }
     return lru>=0?&lc->s[lru]:NULL;
 }
 /* A step's waves, in two halves: k3_waves_issue looks the experts up and queues every
@@ -3395,8 +3395,8 @@ static void k3_waves_run(Model *m, int li, K3Waves *w, const float *Z, int strid
         m->t_wave+=now_s()-t0; m->n_wave++;
         for(int a=0;a<nw;a++){
             int j=w->wave[a];
-#ifdef COLI_VULKAN
-            if(vkt_ready()){ VktExpertSrc vs=k3_vk_src(m,w->sl[j]->buf); vkt_note(li,w->uids[j],&vs); }
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+            if(XT(ready)()){ VktExpertSrc vs=k3_vk_src(m,li,w->sl[j]->buf); XT(note)(li,w->uids[j],&vs); }
 #endif
             w->done[j]=1; w->sl[j]->busy--; left--;
         }
@@ -4063,7 +4063,7 @@ static int k3_waves_on(void){
 #ifdef COLI_CUDA
     if(g_k3_cuda) return 0;
 #endif
-    return g_k3_waves&&!vkt_ready();
+    return g_k3_waves&&!XT(ready)();
 }
 
 static float *k3_moe_experts(Model *m, Moe *o, int li, const float *x, const float *z, int C,
