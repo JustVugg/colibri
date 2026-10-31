@@ -52,7 +52,7 @@ static float value(int m, size_t i) {
 
 /* The source matrices in one file, each in its dtype, as a checkpoint holds them. */
 static void make_source(void) {
-    src = tmpfile();
+    src = compat_tmpfile();
     if (!src) exit(2);
     unsigned char prefix[40] = {0};   /* the matrices start at an odd offset */
     if (fwrite(prefix, 1, 37, src) != 37) exit(2);

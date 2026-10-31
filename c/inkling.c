@@ -253,11 +253,9 @@ static void ink_gx_expert(const Model *m, int layer, const Slot *e, const float 
     ColiTensorView vu = vg;
     vu.data = e->p13 + I * gq_row_bytes(t3[0], D); vu.block_columns = (uint32_t)t3[1];
     ColiTensorView vd = { COLI_TENSOR_GGML, COLI_SCALE_NONE, e->p2, NULL, 0, 0, D, I, 1, (uint32_t)t3[2], NULL };
-    if (coli_ggml_matmul2(g, &vg, g + I, &vu, xs, 1)) { fprintf(stderr, "layer %d: GGUF expert gate/up failed
-", layer); exit(1); }
+    if (coli_ggml_matmul2(g, &vg, g + I, &vu, xs, 1)) { fprintf(stderr, "layer %d: GGUF expert gate/up failed\n", layer); exit(1); }
     for (int64_t k = 0; k < I; k++) g[k] = siluf(g[k]) * g[I + k];
-    if (coli_ggml_matmul(hh, &vd, g, 1)) { fprintf(stderr, "layer %d: GGUF expert down failed
-", layer); exit(1); }
+    if (coli_ggml_matmul(hh, &vd, g, 1)) { fprintf(stderr, "layer %d: GGUF expert down failed\n", layer); exit(1); }
 }
 
 /* TOPP=p (0..1): top-p adattivo sui routed — tieni gli esperti fino al peso

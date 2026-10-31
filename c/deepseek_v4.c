@@ -22147,7 +22147,7 @@ static int deepseek_v4_segment_snapshot_file(
     uint64_t *payload_bytes, uint64_t *payload_hash,
     char *error, size_t error_size) {
     *output = NULL; *payload_bytes = 0; *payload_hash = COLI_SEGMENT_HASH_INIT;
-    FILE *stream = tmpfile();
+    FILE *stream = compat_tmpfile();
     if (!stream)
         return coli_segment_adapter_error(
             error, error_size, "cannot create DeepSeek V4 snapshot staging file");
@@ -22272,7 +22272,7 @@ static int deepseek_v4_segment_session_restore(
         return coli_segment_adapter_error(
             error, error_size, "DeepSeek V4 snapshot payload is too large");
 
-    FILE *stream = tmpfile();
+    FILE *stream = compat_tmpfile();
     if (!stream)
         return coli_segment_adapter_error(
             error, error_size, "cannot create DeepSeek V4 restore staging file");

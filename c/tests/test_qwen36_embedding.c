@@ -20,7 +20,7 @@ static void observed_unmap(compat_ro_map *map) {
 }
 typedef struct {FILE *file;st_tensor t;shards s;} Fixture;
 static void fixture(Fixture *f,int dtype,int I,int O,unsigned salt) {
-    memset(f,0,sizeof(*f));f->file=tmpfile();CHECK(f->file!=NULL);
+    memset(f,0,sizeof(*f));f->file=compat_tmpfile();CHECK(f->file!=NULL);
     unsigned char prefix[37]={0};CHECK(fwrite(prefix,1,sizeof prefix,f->file)==sizeof prefix);
     uint32_t rng=0x71379u;
     static const uint32_t special[]={0,0x80000000,1,0x80000001,0x007fffff,0x00800000,0x7f7fffff,0x7f800000,0xff800000,0x7fc12345,0x7f812345};

@@ -80,7 +80,7 @@ static void free_round_model(Model *m) {
 }
 static void check_pinned_rounds(const char *name, int cap, int pin_limit,
                                int pins, int mixed, int topk, int cpu_pairs) {
-    FILE *weights = tmpfile();
+    FILE *weights = compat_tmpfile();
     if (!weights) { perror("tmpfile expert weights"); exit(2); }
     float data[ROUND_E * (2 * ROUND_I * ROUND_D + ROUND_D * ROUND_I)];
     for (size_t i = 0; i < sizeof(data) / sizeof(data[0]); i++)
