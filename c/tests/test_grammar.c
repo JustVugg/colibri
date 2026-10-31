@@ -215,6 +215,23 @@ int main(void){
         gr_free(&G);
     }
 
+    /* Alternates that fan out into the same stacks (a_i ::= a_{i+1} | a_{i+1}) walk 2^N paths
+     * to one stack: 40 levels in 716 bytes were hours of the engine's loop. GR_MAX_WORK turns
+     * the walker off at once; 10 levels (1024 paths) stay within it and still read their byte. */
+    {
+        static char chain[2048];
+        for (int levels = 10; levels <= 40; levels += 30) {
+            int n = snprintf(chain, sizeof chain, "root ::= a0\n");
+            for (int i = 0; i < levels; i++) n += snprintf(chain + n, sizeof chain - n, "a%d ::= a%d | a%d\n", i, i + 1, i + 1);
+            snprintf(chain + n, sizeof chain - n, "a%d ::= \"x\"\n", levels);
+            CHECK(gr_parse(&G, chain) == 0);
+            gr_state_init(&S, &G);
+            if (levels == 10) CHECK(S.alive && S.n == 1 && feed(&S, "x") == 1);
+            else CHECK(!S.alive && S.work > GR_MAX_WORK && gr_accept(&S, 'x') == -1);
+            gr_free(&G);
+        }
+    }
+
     puts("test_grammar: ok");
     return 0;
 }
