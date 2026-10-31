@@ -6175,16 +6175,20 @@ def _engine_extension_args(engine_k):
     takes its keys straight after top_p, so the extra field would land where it wants a
     key and be answered with "bad submit extension".
 
-    That is this helper's decision for THESE endpoints, not a property of the request
-    builder. `gbytes_before_ext` is a per-call-site parameter, and the other caller that
-    sends an extension key -- /v1/systemone's scoring -- does not pass it and keeps the header it has
-    always sent; changing that endpoint's wire is not this change's to make."""
+    /v1/systemone's scoring sends its keys through the same rule (`_engine_gbytes_args`):
+    without the field, colibri.c refused its header and the request waited for an answer
+    that never came."""
     if not engine_k:
         return {}
     args = {"logprobs": engine_k}
-    if family_by_id(ARCH).capabilities.submit_gbytes:
-        args["gbytes_before_ext"] = True
+    args.update(_engine_gbytes_args())
     return args
+
+
+def _engine_gbytes_args():
+    """`gbytes_before_ext` for an engine whose SUBMIT header carries the grammar's byte
+    count before its key=value tokens (`submit_gbytes`), nothing for the others."""
+    return {"gbytes_before_ext": True} if family_by_id(ARCH).capabilities.submit_gbytes else {}
 
 
 # An instruction the processor does not have: SIGILL on POSIX, STATUS_ILLEGAL_INSTRUCTION on
@@ -8559,7 +8563,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.server.generate(
                     text, 0, 0.0, 1.0, lambda _chunk: None, cache_slot,
                     self.client_disconnected, logprobs=1, pin=pin,
-                    on_echo=echoes.append, on_accept=on_accept)
+                    on_echo=echoes.append, on_accept=on_accept, **_engine_gbytes_args())
                 n = accepted.get("prompt_tokens")
                 if n is None:                        # motore senza ACCEPT (olmoe)
                     n = max((e["pos"] for e in echoes), default=-1) + 1
