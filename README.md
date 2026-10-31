@@ -572,7 +572,7 @@ expert answered from VRAM, from RAM or from disk.
 - **Speculation that earns its keep.** GLM-5.2's int8 MTP head drafts 2.2-2.8
   tokens per forward when it pays; Qwen3.8-Flash-Next's MTP head, on by default, adds
   16-20% with the same output, and prompt lookup 6-7% on code edits. Qwen3.6's
-  head, on by default, takes its decode from 99.7-104.5 to 115.8-120.1 tok/s on
+  head (`Q36_MTP=1`) takes its decode from 99.7-104.5 to 115.8-120.1 tok/s on
   CUDA and from 83.2-83.8 to 99.9-109.3 on Vulkan (an RTX PRO 4000). DeepSeek
   V4.1's DSpark head drafts as deep as its confidence says, and a gate skips the
   drafts that cannot pay. Where drafting costs more than it saves (DeepSeek V4)

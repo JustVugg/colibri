@@ -682,11 +682,9 @@ a.cite{display:inline-grid;place-items:center;min-width:17px;height:17px;padding
         <div class="card form">
           <div><h2 class="h2">System One</h2><p class="sub">Il modello non scrive: legge quanto è probabile ogni opzione e lo dice con un numero. Entropia alta vuol dire che non sa, ed è la cosa che una risposta scritta non sa dirti.</p></div>
           <div class="field"><label>Contesto <small>il testo su cui decidere: una PR, un messaggio, una pratica</small></label>
-            <textarea class="area" id="s1ctx" rows="6">PR #2412: lotto di 21 PR esterne su dev. CI 116/116 verde. Qwen3.6 da 99 a 102-113 tok/s su RTX PRO 4000 a testo identico; Qwen3.8 codice +9,4%, prosa -0,5%. REAP-150B: picco di memoria anonima da 41,6-42,7 a 39,5-40,3 GiB.</textarea></div>
-          <div class="field"><label>Domanda</label><input class="input" id="s1q" value="Cosa deve fare il revisore?"></div>
-          <div class="field"><label>Opzioni ammesse <small>una per riga</small></label><textarea class="area" id="s1opts" rows="3">merge
-chiedi modifiche
-chiudi</textarea></div>
+            <textarea class="area" id="s1ctx" rows="6"></textarea></div>
+          <div class="field"><label>Domanda</label><input class="input" id="s1q"></div>
+          <div class="field"><label>Opzioni ammesse <small>una per riga</small></label><textarea class="area" id="s1opts" rows="3"></textarea></div>
           <div class="row"><button class="sbtn sbtn--primary" id="s1go">Assegna le probabilità</button><span class="sub" id="s1err" style="margin:0"></span></div>
         </div>
         <div class="card" id="s1out">
@@ -1577,6 +1575,12 @@ function renderProfiling(){const last=TURNS[TURNS.length-1],R=TURNS.slice(-40);
 $('#monTabs').onclick=e=>{const b=e.target.closest('.tab');if(!b)return;$$('#monTabs .tab').forEach(x=>x.setAttribute('aria-selected',String(x===b)));$('#mon-over').style.display=b.dataset.mt==='over'?'flex':'none';$('#mon-prof').style.display=b.dataset.mt==='prof'?'flex':'none'};
 
 /* ================================================= System One (real: POST /v1/systemone) */
+/* the example the page opens with, in its language: text fields are the user's, I18N leaves them alone */
+{const S1EX={it:{ctx:'Pull request: "cache: elimina la voce più vecchia quando la cache è piena". Il diff toglie il controllo della dimensione prima di insert(), così una cache piena cresce oltre il suo limite. Il nuovo test inserisce solo in una cache vuota. La CI è verde.',
+  q:'Cosa deve fare il revisore con questa pull request?',o:'approvare\nchiedere modifiche\nfare una domanda'},
+ en:{ctx:'Pull request: "cache: evict the oldest entry when the cache is full". The diff removes the size check before insert(), so a full cache now grows past its limit. The new test only inserts into an empty cache. CI is green.',
+  q:'What should the reviewer do with this pull request?',o:'approve\nrequest changes\nask a question'}};
+ const ex=S1EX[LANG==='it'?'it':'en'];$('#s1ctx').value=ex.ctx;$('#s1q').value=ex.q;$('#s1opts').value=ex.o}
 $('#s1go').onclick=async()=>{const opts=$('#s1opts').value.split(/\n|,/).map(s=>s.trim()).filter(Boolean),err=$('#s1err');err.textContent='';
   if(opts.length<2){err.textContent='Serve almeno una seconda opzione, separata da virgola o a capo.';return}
   if(!model){err.textContent='Prima scegli un modello.';return}
