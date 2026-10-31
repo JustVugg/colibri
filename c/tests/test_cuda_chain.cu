@@ -320,6 +320,44 @@ static CcBuf *upi(const std::vector<int> &v) {
     if (!b || !T->begin() || !T->write(b, 0, v.data(), v.size() * 4) || !T->submit(1)) { printf("  FAIL upload\n"); fails++; }
     return b;
 }
+/* A chunk as long as an 8192-token prompt's last, Qwen3.6's attention: 2043 rows after 6144
+ * positions, H 16, KV 2, hd 256, on the tensor cores where the card has them (in one pass from
+ * sm_75; a T4's blocks of 16 keys). 2043 rows leave the last block of 8 tokens 3, the ragged
+ * edge. Four rows within 1e-4 of the reference (the kernel's error is ~4e-6, and half a k16
+ * wrong misses by ~8e-3: the means over 8000 keys are small), and a float16 cache of the same
+ * values (attn_h) gives the float32 cache's bits. */
+static void prompt_rows_one_pass_long(void) {
+    const int H = 16, KV = 2, hd = 256, S = 2043, pos = 6144, cap = 8384, qdim = 2 * hd, k_off = 32;
+    std::vector<float> q = rnd((size_t)S * H * qdim, 61), kc = rnd((size_t)k_off + (size_t)KV * cap * hd, 62),
+                       vc = rnd(kc.size(), 63);
+    kv16_round(kc.data(), (int64_t)kc.size()); kv16_round(vc.data(), (int64_t)vc.size());   /* the same values in both caches */
+    size_t n = (size_t)S * H * hd;
+    CcAttn p = {S, H, KV, hd, pos, cap, 0, H * qdim, qdim, hd, H * qdim, qdim, 1, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), k_off, k_off};
+    CcBuf *qb = up(q), *kb = up(kc), *vb = up(vc), *ob = T->buf(n * 4, CC_DEV);
+    int ran = T->begin() && T->attn(qb, kb, vb, ob, qb, NULL, &p) && T->submit(1);
+    std::vector<float> o = down(ob, n);
+    double d = 0;
+    for (int r : {0, 1, 1024, 2042}) {   /* a row alone: one position more each */
+        CcAttn pr = p; pr.S = 1; pr.pos_base = pos + r; pr.q_off = r * p.q_row; pr.g_off = p.g_off + r * p.g_row; pr.o_off = 0;
+        std::vector<float> ref((size_t)H * hd);
+        ref_attn(q.data(), kc.data(), vc.data(), ref.data(), q.data(), NULL, &pr);
+        d = fmax(d, maxdiff(o.data() + (size_t)r * H * hd, ref.data(), ref.size()));
+    }
+    ck(ran && d < 1e-4, "prompt rows, a long chunk: H 16 KV 2 hd 256, 2043 rows after 6144, rows 0, 1, 1024 and 2042");
+    printf("  the long chunk, rows 0, 1, 1024 and 2042: max |diff| %.2e\n", d);
+    if (T->size < offsetof(ColiCudaChainOps, copy_regions_h) + sizeof T->copy_regions_h || !T->kvh()) printf("  (no float16 cache here)\n");
+    else {
+        std::vector<uint16_t> kh(kc.size()), vh(vc.size());
+        kv16_pack(kh.data(), kc.data(), (int64_t)kc.size()); kv16_pack(vh.data(), vc.data(), (int64_t)vc.size());
+        CcBuf *khb = T->buf(kh.size() * 2, CC_DEV), *vhb = T->buf(vh.size() * 2, CC_DEV), *o16 = T->buf(n * 4, CC_DEV);
+        int ok = ran && khb && vhb && o16 && T->begin() && T->write(khb, 0, kh.data(), kh.size() * 2) &&
+                 T->write(vhb, 0, vh.data(), vh.size() * 2) && T->attn_h(qb, khb, vhb, o16, qb, NULL, &p) && T->submit(1);
+        ck(ok && !memcmp(o.data(), down(o16, n).data(), n * 4), "and from a float16 cache of the same values, the float32 cache's bits");
+        T->free(khb); T->free(vhb); T->free(o16);
+    }
+    T->free(qb); T->free(kb); T->free(vb); T->free(ob);
+}
+
 /* the router's pick (chain_route.comp's rules: the lower expert on a tie, groups by their two best) */
 static void ref_route(const float *l, const float *bias, int *ids, float *w, const CcRoute *p) {
     std::vector<float> sc(p->E), pk(p->E);
@@ -870,6 +908,7 @@ int main(void) {
             T->free(qb); T->free(kb); T->free(vb); T->free(sb); T->free(ob);
         }
     }
+    prompt_rows_one_pass_long();
     {   /* a float16 KV cache (kvh: attn_h, attn_wh, copy_regions_h): K and V of float16 values give
          * attn's bits from a float32 cache of the same values on every path: a decode's blocks by KV
          * head and by head, a prompt chunk on the tensor cores, a window with sinks, linear and in a ring */
