@@ -88,13 +88,25 @@ and 6.6 on `D:` together, 16.9 GB/s.
 
 **Next-layer prefetch** (`K3_PREFETCH`, default on in decode steps of up to
 `K3_PREFETCH_ROWS`, 4, rows): after a step's attention in layer i, layer i+1's
-router applied to layer i's MLP input (normed by i+1's own post-attention norm)
-predicts the experts i+1 will ask for, and those its cache lacks are read ahead,
-queued behind layer i's own reads; when i+1's routing comes, the predicted experts
+router applied to the blocks mixed with i+1's own AttnRes weights (`K3_PREFETCH_MIX=1`;
+0: layer i's MLP input), normed by i+1's post-attention norm, predicts the experts i+1
+will ask for, and the `K3_PREFETCH_TOP` (12) best of them that its cache lacks are read
+ahead, queued behind layer i's own reads; when i+1's routing comes, the predicted experts
 it did not choose leave the queue unread. A wrong prediction costs a read and a
 slot that is reused first, never a number. The run's last line says how many were
-read ahead and used and what share of the routed experts the predictions held
-(on the tiny fixture about half; the real model's is to be measured).
+read ahead and used and what share of the routed experts the predictions held. On the
+real model (docs/experiments/kimi-k3-4090-2026-10-31) the next layer's mix predicts
+66.9% of the routed experts against 63.2% from layer i's input, and 12 a row instead of
+the routing's 16 read 12.2 instead of 13.8 GB a decode token for the same speed.
+
+**Waves** (`K3_WAVES`, default on): a MoE step gives every expert its cache lacks a slot
+at once and queues the reads on their drives, interleaved, right after the routing; the
+latent projection runs while they arrive, then whatever has arrived is computed as one
+wave (gate and up of every arrived expert over all workers, then down), and the shared
+experts run while no read is in. Each (row, choice) pair writes its own row and the
+weighted sum runs at the end in the union's order, so the bytes are the one-expert-at-a-
+time loop's (`K3_WAVES=0`); a decode token on the 4090 machine went from 1.62 to 1.50 s,
+the 35-token prompt from 57.0 to 41.3 s (its reads had gone to one drive at a time).
 `K3_IO_DELAY_US` slows every read for the tests that exercise the queues. None of
 this moves a bit: the logits are those of the old loader in every configuration
 tested (cache sizes, chunk sizes, one or two folders on two drives, buffered,
@@ -210,6 +222,9 @@ Judge quantization choices on real-text logits, not synthetic-vector norms.
 | `K3_PREFETCH` | 1 | read the next MoE layer's predicted experts ahead (decode steps) |
 | `K3_PREFETCH_ROWS` | 4 | the most rows a step may have for its prediction |
 | `K3_PREFETCH_LIMIT` | 64 | prefetches queued at once |
+| `K3_PREFETCH_TOP` | 12 | the experts a row's prediction reads ahead (16: the routing's top-k) |
+| `K3_PREFETCH_MIX` | 1 | predict from the next layer's own mix of the blocks (0: this layer's MLP input) |
+| `K3_WAVES` | 1 | a MoE step's experts computed in waves as their reads arrive (0: one at a time) |
 | `K3_IO_DELAY_US` | 0 | tests: every read waits this long first |
 | `K3_TOPP` | 0 | keep routed experts to cumulative weight p (0 = off) |
 | `K3_CHUNK` | 32 | prefill chunk size (1 = token-at-a-time; forced 1 under `K3_TRACE`) |
@@ -345,8 +360,13 @@ default bits), so on a machine whose RAM bandwidth is shared with the experts' r
 this takes the largest part of the dense work off it: on an RTX 4090 a 12288 x 7168
 int4 projection takes 0.19 ms a decode row against 0.90 ms on 16 Zen 4 cores, the
 163840 x 7168 int8 head 2.2 ms against 18.4 (`tests/bench_k3_cuda_dense.c`).
-`kv_b` stays on the CPU (the MLA absorb reads its rows), and so do the f32 routers
-and KDA's small f32 projections, so the routing is the CPU's arithmetic on its input.
+`kv_b` stays on the CPU (the MLA absorb reads its rows), and so do the routers and
+KDA's small f32 projections, so the routing is the CPU's arithmetic on its input. The
+routers stay in the checkpoint's BF16 (`Moe.router16`): `k3_dot_bf16w` widens each weight
+to its f32 in the f32 kernel's 32 lanes, fused adds and halving tree, so the scores are
+the f32 copy's bits (the tiny model's logits, routers stored as BF16 or as the same values
+in F32: the same bytes) from half the RAM: a decode token reads every router twice (the
+routing and the next layer's prediction), 2.4 GB less a token, 94 -> 58 ms on the 4090.
 
 The products are the CPU's, summed in f32 in another order: not the CPU's bytes, as
 with every GPU backend. On the tiny fixture the argmax is the CPU's at all 70 prompt

@@ -1,0 +1,44 @@
+[CUDA] device 0: NVIDIA GeForce RTX 4090, 25.8 GB VRAM, sm_89
+[SPLIT] +D:\AI\Models\Kimi-K3 -> 92 shard(s)
+[SPLIT] model across 2 dir(s): 188 shard(s) total (primary C:\AI\Kimi-K3 -> 96 shard(s)), no duplication
+[OMP] spinning team: 16 threads spin 2000 us between regions (COLI_OMP_SPIN_US; COLI_OMP_SPIN=0: libgomp's team)
+[K3] loaded layer 1/93 (0.9s, RSS 1.6 GB)
+[K3] loaded layer 9/93 (5.1s, RSS 3.8 GB)
+[K3] loaded layer 17/93 (9.3s, RSS 6.6 GB)
+[K3] loaded layer 25/93 (13.6s, RSS 9.5 GB)
+[K3] loaded layer 33/93 (17.8s, RSS 12.3 GB)
+[K3] loaded layer 41/93 (22.1s, RSS 15.2 GB)
+[K3] loaded layer 49/93 (26.3s, RSS 18.0 GB)
+[K3] loaded layer 57/93 (30.6s, RSS 20.9 GB)
+[K3] loaded layer 65/93 (34.9s, RSS 23.8 GB)
+[K3] loaded layer 73/93 (39.1s, RSS 26.6 GB)
+[K3] loaded layer 81/93 (43.4s, RSS 29.5 GB)
+[K3] loaded layer 89/93 (47.7s, RSS 32.3 GB)
+[K3-CUDA] dense: 369 of 929 matrices on GPU 0, 20.00 of 31.15 GiB (budget 20.00 GiB, 22.50 free); their host copies released
+[K3][RAM_GB=174.0] resident 13.7 GB + reserve 3.9 GB (page cache 2.5, activations 1.2, KV 24x4096 0.2, checkpoints 0 0.0) -> 156.4 GB for experts; cache 619->96/layer (17.5 MB/slot, 92 layers; projected peak 172.6 GB)
+[K3] K3_EXPERT_GB=1000 does not fit alongside the 13.7 GB already resident. It is a request, not a reservation.
+[K3] init done in 53.3s | 93 layers | expert cache 96/layer (17.5 MB/slot) | RSS 35.2 GB
+[USAGE] expert history: 116288 selections (C:\AI\Kimi-K3/.coli_usage)
+[K3] tokenizer.json loaded (family=kimi)
+[K3] prompt: 35 tokens | ngen 48 | temp 0.00
+[KDA] L0 metal=0 P=12288 H=96 hd=128 K=4
+[K3-FMT] L0 KDA: q.fmt=4 gs=64 k.fmt=4 gs=64 v.fmt=4 gs=64 g.fmt=4 gs=64
+[K3-PATH] L0 attn=KDA metal=0
+[K3] expert readers: 4 on 2 device(s)
+[K3-FMT] L3 MLA: qa.fmt=1 gs=0 qb.fmt=1 gs=0 kva.fmt=1 gs=0
+[K3] prefill 35/35 (37.2s)
+[K3] prefill done in 37.2s (0.94 tok/s)
+  [tok 8: 1.4s/tok, hit 28%, 418.6 GB read]
+  [tok 16: 1.4s/tok, hit 41%, 509.6 GB read]
+  [tok 24: 1.4s/tok, hit 48%, 598.2 GB read]
+  [tok 32: 1.4s/tok, hit 53%, 691.8 GB read]
+  [tok 40: 1.4s/tok, hit 56%, 783.3 GB read]
+
+[K3] eos
+
+[K3] decode 45 tokens in 61.2s (0.74 tok/s) | expert hit 56.9% (47360/83295) | 828.1 GB streamed
+[K3] time: attn 10.8s moe 86.8s (eload 32.6s) head 0.1s | RSS 159.7 GB
+[K3] a decode token: 1360 ms -- attention 175, MoE 1173 (router and reads issued 92, latent 59, shared 175, routed experts computed 478, waiting for reads 362), head 2; 11.2 GB read
+[K3] prefetch (run): 11501 experts read ahead, 7743 used, 3758 not (244 of them cancelled unread); 40.9% of the routed experts were predicted; predicting took 2.0s
+[K3-CUDA] dense (run): 16605 matmuls on the GPU, 4.8s
+rc=0 wall=162s

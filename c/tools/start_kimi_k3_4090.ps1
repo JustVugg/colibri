@@ -16,7 +16,9 @@ param(
     [ValidateRange(1,8)][int]$IoPerDrive = 2,
     # Read the next MoE layer's predicted experts ahead (decode)
     [ValidateRange(0,1)][int]$Prefetch = 1,
-    # Dense matrices on the GPU, GiB, and the VRAM left free beside them
+    # Dense matrices on the GPU, GiB, and the VRAM left free beside them; -DenseGB 21.5
+    # -ReserveGB 1 puts 35 more on the GPU (0.78 -> 0.81 tok/s measured) and leaves about
+    # 0.6 GiB free: past the free memory Windows pages the GPU's to RAM and every call slows
     [ValidateRange(0,23)][double]$DenseGB = 20,
     [ValidateRange(0.5,8)][double]$ReserveGB = 2,
     # Context, tokens: the MLA caches take 55 KB a token (7 GB at 128k), counted against RamGB

@@ -67,6 +67,9 @@
  *                        alike); 0 = reads on the caller
  *   K3_PREFETCH=0|1      read the next MoE layer's predicted experts ahead in decode
  *                        steps of up to K3_PREFETCH_ROWS (4) rows (default 1)
+ *   K3_PREFETCH_TOP=N    the experts a row's prediction reads ahead (default 12)
+ *   K3_PREFETCH_MIX=0|1  predict from the next layer's own mix of the blocks (default 1)
+ *   K3_WAVES=0|1         a MoE step's experts computed in waves as they arrive (default 1)
  *   K3_CUDA_DENSE=1      (a CUDA build) the largest dense matrices on the GPU, up to
  *                        K3_CUDA_DENSE_GB (20) beside K3_CUDA_RESERVE_GB (2) free;
  *                        K3_CUDA_RELEASE_HOST=1 frees their host copies
@@ -195,6 +198,9 @@ typedef struct {                          /* gated MLA layer */
 
 typedef struct {                          /* LatentMoE */
     float *router, *rbias, *lat_norm;     /* [E,hidden] f32, [E], [latent] */
+    uint16_t *router16;                   /* the router as the checkpoint stores it (bf16), when set
+                                           * instead of router: k3_router_scores, the same bits from
+                                           * half the bytes */
     void  *vk_router;                     /* COLI_VK_DENSE_HOST: the chain's device copy, for the per-matrix path */
     W lat_down, lat_up, sh_gate, sh_up, sh_down;
 } Moe;
@@ -275,6 +281,9 @@ typedef struct {
     int *elex;                            /* [n_experts] an expert's place among the ids sorted as text */
     uint64_t clock, hits, miss, ebytes;
     double t_attn, t_moe, t_eload, t_head;
+    /* t_moe's parts: the router and the step's issue, the latent projections, the shared
+     * experts, the routed experts' waves (t_eload is its waits) */
+    double t_route, t_lat, t_shared, t_wave; uint64_t n_wave;
     /* K3_PREFETCH: the next MoE layer's experts predicted after a decode step's attention
      * (k3_prefetch): the rows a prediction waits for, the layer it is for, what it marked */
     float *pf_x; int pf_n, pf_li;
@@ -1330,7 +1339,20 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
         }
         if(l->sparse){
             Moe *o=&l->moe;
-            o->router=f32_load(m,NM("model.layers.%d.block_sparse_moe.gate.weight",i),(int64_t)c->n_experts*c->hidden);
+            { /* bf16 in the checkpoint: kept so (k3_router_scores widens it in the f32 kernel's
+               * own order), unless the Vulkan chain wants its f32 copy on the device */
+              char rn[512]; snprintf(rn,sizeof rn,"%smodel.layers.%d.block_sparse_moe.gate.weight",m->pfx,i);
+              st_tensor *rt=st_find(&m->S,rn);
+              int vk_wants=0;
+#ifdef COLI_VULKAN
+              vk_wants=k3_vk_requested();
+#endif
+              if(rt&&rt->dtype==0&&rt->numel==(int64_t)c->n_experts*c->hidden&&!vk_wants){
+                  o->router16=malloc((size_t)rt->nbytes);
+                  if(!o->router16){fprintf(stderr,"OOM router %d\n",i);exit(1);}
+                  st_read_raw(&m->S,rn,o->router16,1);
+              } else
+                  o->router=f32_load(m,NM("model.layers.%d.block_sparse_moe.gate.weight",i),(int64_t)c->n_experts*c->hidden); }
             o->rbias =f32_load(m,NM("model.layers.%d.block_sparse_moe.gate.e_score_correction_bias",i),c->n_experts);
             o->lat_norm=f32_load(m,NM("model.layers.%d.block_sparse_moe.routed_expert_norm.weight",i),c->latent);
             w_load(m,&o->lat_down,NM("model.layers.%d.block_sparse_moe.routed_expert_down_proj.weight",i),c->latent,c->hidden,bits);
@@ -2319,13 +2341,45 @@ static void k3_io_wait_slot(Model *m, Slot *s){
  * K3_PREFETCH_ROWS (4) bounds the rows a step may have (a prompt chunk's union is most
  * of the layer); a prediction takes at most half the layer's cache and K3_PREFETCH_LIMIT
  * (64) reads queued at once. Off with the Vulkan tier, which holds experts of its own. */
-static int g_k3_pf=-1, g_k3_pf_rows=4, g_k3_pf_limit=64;
+/* matmul_f32.h's dot product with the weights as the checkpoint's bf16: each widened
+ * exactly to its f32 in the same 32 lanes, the same fused adds and the same halving tree,
+ * so the router's scores are the f32 copy's bits from half the bytes (router16). */
+static inline float k3_dot_bf16w(const float *x, const uint16_t *w, int I){
+    float a[MATMUL_F32_LANES] = {0};
+    int i = 0;
+    for (; i + MATMUL_F32_LANES <= I; i += MATMUL_F32_LANES)
+        for (int j = 0; j < MATMUL_F32_LANES; j++) a[j] = MATMUL_F32_MADD(a[j], x[i+j], bf16_to_f32(w[i+j]));
+    for (int j = 0; i + j < I; j++) a[j] = MATMUL_F32_MADD(a[j], x[i+j], bf16_to_f32(w[i+j]));
+    for (int h = MATMUL_F32_LANES/2; h > 0; h >>= 1)
+        for (int j = 0; j < h; j++) a[j] += a[j+h];
+    return a[0];
+}
+/* sco[C][E] = x[C][hidden] the router's rows, bf16 or f32 */
+static void k3_router_scores(Moe *o, float *sco, const float *x, int C, int D, int E){
+    if(o->router16){
+        #pragma omp parallel for schedule(static)
+        for(int e=0;e<E;e++){
+            const uint16_t *w=o->router16+(int64_t)e*D;
+            for(int t=0;t<C;t++) sco[(int64_t)t*E+e]=k3_dot_bf16w(x+(int64_t)t*D,w,D);
+        }
+        return;
+    }
+    K3_F32_NEED(o->router);
+    matmul(sco,x,o->router,C,D,E);
+}
+/* defaults measured on the RTX 4090 machine (docs/experiments/kimi-k3-4090-2026-10-31): 12
+ * experts a row and the next layer's mix read fewer unused experts than the routing's 16
+ * from this layer's mix (12.2 against 14.4 GB a token) and wait less (314 against 371 ms) */
+static int g_k3_pf=-1, g_k3_pf_rows=4, g_k3_pf_limit=64, g_k3_pf_top=12, g_k3_pf_mix=1;
 static int k3_prefetch_on(void){
     if(g_k3_pf<0){
         const char *e=getenv("K3_PREFETCH");
         g_k3_pf=e?atoi(e)!=0:1;
         if(getenv("K3_PREFETCH_ROWS")) g_k3_pf_rows=atoi(getenv("K3_PREFETCH_ROWS"));
         if(getenv("K3_PREFETCH_LIMIT")) g_k3_pf_limit=atoi(getenv("K3_PREFETCH_LIMIT"));
+        /* K3_PREFETCH_TOP: the experts a row's prediction names (16: the routing's top-k) */
+        if(getenv("K3_PREFETCH_TOP")) g_k3_pf_top=atoi(getenv("K3_PREFETCH_TOP"));
+        if(getenv("K3_PREFETCH_MIX")) g_k3_pf_mix=atoi(getenv("K3_PREFETCH_MIX"));
     }
 #ifdef COLI_VULKAN
     if(g_k3_vk) return 0;
@@ -2351,11 +2405,11 @@ static void k3_prefetch_pending(Model *m){
     m->pf_n=0;
     if(n<1||li<0||li>=m->c.n_layers||!m->L[li].sparse) return;
     Cfg *c=&m->c; Moe *o=&m->L[li].moe;
-    int D=c->hidden, E=c->n_experts, K=c->topk;
+    int D=c->hidden, E=c->n_experts, K=g_k3_pf_top>0&&g_k3_pf_top<E?g_k3_pf_top:c->topk;
     double t0=now_s();
     float *xn=falloc((int64_t)n*D), *sco=falloc((int64_t)n*E);
     for(int t=0;t<n;t++) rmsnorm_(xn+(int64_t)t*D,m->pf_x+(int64_t)t*D,m->L[li].post_ln,D,c->eps);
-    matmul(sco,xn,o->router,n,D,E);
+    k3_router_scores(o,sco,xn,n,D,E);
     uint8_t *mark=m->pf_mark+(int64_t)li*E;
     int *order=malloc((size_t)n*K*sizeof(int)), *votes=calloc((size_t)E,sizeof(int)), no=0;
     if(!order||!votes){ fprintf(stderr,"OOM prefetch\n"); exit(1); }
@@ -2655,52 +2709,51 @@ static Slot *k3_step_slot(Model *m, int li){
     if(dev>=0){ lru=dev; vkt_ram_gave(); }
     return lru>=0?&lc->s[lru]:NULL;
 }
-static void k3_moe_waves(Model *m, int li, int nu, const int *uids,
-                         const int *pfirst, const int *pcnt,
-                         const int *poslist, const float *wlist,
-                         const float *Z, int stride, float *U){
-    Cfg *c=&m->c;
-    int LT=stride, MI=c->moe_inter, gb1=LT/32, gb2=MI/32;
-    int tot=0;
-    for(int j=0;j<nu;j++) tot+=pcnt[j];
-    int idot=g_k3_idot&&LT%32==0&&MI%32==0;
-    /* the pairs' inputs, gathered in the pairs' order (an expert's rows contiguous) */
-    int8_t *XQ=NULL, *GQ=NULL; float *XS=NULL, *XF=NULL, *GS=NULL;
-    if(idot){
-        int maxt=0;
-        for(int e=0;e<tot;e++) if(poslist[e]>maxt) maxt=poslist[e];
-        int8_t *zq=malloc((size_t)(maxt+1)*LT); float *zs=malloc((size_t)(maxt+1)*gb1*sizeof(float));
-        XQ=malloc((size_t)tot*LT); XS=malloc((size_t)tot*gb1*sizeof(float));
-        GQ=malloc((size_t)tot*MI); GS=malloc((size_t)tot*gb2*sizeof(float));
-        if(!zq||!zs||!XQ||!XS||!GQ||!GS){ fprintf(stderr,"OOM expert inputs\n"); exit(1); }
-        mxfp4_qx(Z,maxt+1,LT,zq,zs);
-        for(int e=0;e<tot;e++){
-            memcpy(XQ+(size_t)e*LT,zq+(size_t)poslist[e]*LT,(size_t)LT);
-            memcpy(XS+(size_t)e*gb1,zs+(size_t)poslist[e]*gb1,(size_t)gb1*sizeof(float));
-        }
-        free(zq); free(zs);
-    } else {
-        XF=falloc((int64_t)tot*LT);
-        for(int e=0;e<tot;e++) memcpy(XF+(size_t)e*LT,Z+(size_t)poslist[e]*LT,(size_t)LT*sizeof(float));
+/* A step's waves, in two halves: k3_waves_issue looks the experts up and queues every
+ * miss it can give a slot (and the next layer's prefetch behind them); k3_waves_run
+ * computes them as they arrive and sums the outputs in the union's order. Whatever runs
+ * between the two -- moe_forward's latent projection and shared experts -- overlaps the
+ * reads. */
+typedef struct {
+    int nu, tot, nm, next;
+    const int *uids, *pfirst, *pcnt, *poslist; const float *wlist;
+    Slot **sl; int *wave, *miss; uint8_t *done; uint64_t stamp;
+} K3Waves;
+static void k3_waves_take(Model *m, int li, K3Waves *w){
+    for(;w->next<w->nm;w->next++){
+        int jj=w->miss[w->next]; Slot *s=k3_step_slot(m,li);
+        if(!s) break;
+        if(s->eid>=0) cache_unindex(m,li,s);
+        s->eid=w->uids[jj]; s->used=w->stamp; s->busy=1; s->pref=0;
+        cache_index(m,li,s); w->sl[jj]=s;
+        m->ebytes+=(uint64_t)m->e_slot;
+        k3_io_submit(m,s,li,w->uids[jj],0);
     }
-    float *G=falloc((int64_t)tot*MI), *Y=falloc((int64_t)tot*LT);
-    Slot **sl=calloc((size_t)(nu?nu:1),sizeof(Slot*));
-    int *wave=malloc((size_t)(nu?nu:1)*sizeof(int)), *miss=malloc((size_t)(nu?nu:1)*sizeof(int));
-    uint8_t *done=calloc((size_t)(nu?nu:1),1);
-    if(!sl||!wave||!miss||!done){ fprintf(stderr,"OOM expert step\n"); exit(1); }
-    uint64_t stamp=++m->clock;
-    int nm=0;
+}
+static void k3_waves_issue(Model *m, int li, int nu, const int *uids,
+                           const int *pfirst, const int *pcnt,
+                           const int *poslist, const float *wlist, K3Waves *w){
+    Cfg *c=&m->c;
+    memset(w,0,sizeof *w);
+    w->nu=nu; w->uids=uids; w->pfirst=pfirst; w->pcnt=pcnt; w->poslist=poslist; w->wlist=wlist;
+    for(int j=0;j<nu;j++) w->tot+=pcnt[j];
+    w->sl=calloc((size_t)(nu?nu:1),sizeof(Slot*));
+    w->wave=malloc((size_t)(nu?nu:1)*sizeof(int)); w->miss=malloc((size_t)(nu?nu:1)*sizeof(int));
+    w->done=calloc((size_t)(nu?nu:1),1);
+    if(!w->sl||!w->wave||!w->miss||!w->done){ fprintf(stderr,"OOM expert step\n"); exit(1); }
+    w->stamp=++m->clock;
     for(int j=0;j<nu;j++){
         ehit_mark(m,li,uids[j]);
         Slot *s=slot_lookup(m,li,uids[j]);   /* resident, or a prefetch on its way */
         if(s){
-            m->hits++; s->used=stamp; s->busy++;
+            m->hits++; s->used=w->stamp; s->busy++;
             if(s->pref){ s->pref=0; m->pf_used++; }
             if(!slot_ready(s)) k3_io_promote(s);
-            sl[j]=s;
-        } else { m->miss++; miss[nm++]=j; }
+            w->sl[j]=s;
+        } else { m->miss++; w->miss[w->nm++]=j; }
     }
     k3_prefetch_spent(m,li);
+    int nm=w->nm, *miss=w->miss;
     if(nm>1&&g_k3_pipe){
         /* the misses' reads interleaved over the drives in proportion to how many each
          * holds (the union's order keeps a cut layer's first drive's experts first) */
@@ -2722,34 +2775,57 @@ static void k3_moe_waves(Model *m, int li, int nu, const int *uids,
             free(dr); free(key);
         }
     }
-    int next=0;
-#define K3_TAKE_SLOTS() \
-    for(;next<nm;next++){ \
-        int jj=miss[next]; Slot *s=k3_step_slot(m,li); \
-        if(!s) break; \
-        if(s->eid>=0) cache_unindex(m,li,s); \
-        s->eid=uids[jj]; s->used=stamp; s->busy=1; s->pref=0; \
-        cache_index(m,li,s); sl[jj]=s; \
-        m->ebytes+=(uint64_t)m->e_slot; \
-        k3_io_submit(m,s,li,uids[jj],0); }
-    K3_TAKE_SLOTS();
+    k3_waves_take(m,li,w);
     if(m->pf_n) k3_prefetch_pending(m);   /* the next MoE layer's reads, behind these */
+}
+/* idle(ctx), when given, runs once, the first time no expert is ready while reads are still
+ * on their way (moe_forward's shared experts: what they cost then hides behind the reads), or
+ * after the last wave when that never happens. */
+static void k3_waves_run(Model *m, int li, K3Waves *w, const float *Z, int stride, float *U,
+                         void (*idle)(void *), void *ctx){
+    Cfg *c=&m->c;
+    int LT=stride, MI=c->moe_inter, gb1=LT/32, gb2=MI/32, nu=w->nu, tot=w->tot;
+    const int *pfirst=w->pfirst, *pcnt=w->pcnt, *poslist=w->poslist; const float *wlist=w->wlist;
+    int idot=g_k3_idot&&LT%32==0&&MI%32==0;
+    /* the pairs' inputs, gathered in the pairs' order (an expert's rows contiguous) */
+    int8_t *XQ=NULL, *GQ=NULL; float *XS=NULL, *XF=NULL, *GS=NULL;
+    if(idot){
+        int maxt=0;
+        for(int e=0;e<tot;e++) if(poslist[e]>maxt) maxt=poslist[e];
+        int8_t *zq=malloc((size_t)(maxt+1)*LT); float *zs=malloc((size_t)(maxt+1)*gb1*sizeof(float));
+        XQ=malloc((size_t)tot*LT); XS=malloc((size_t)tot*gb1*sizeof(float));
+        GQ=malloc((size_t)tot*MI); GS=malloc((size_t)tot*gb2*sizeof(float));
+        if(!zq||!zs||!XQ||!XS||!GQ||!GS){ fprintf(stderr,"OOM expert inputs\n"); exit(1); }
+        mxfp4_qx(Z,maxt+1,LT,zq,zs);
+        for(int e=0;e<tot;e++){
+            memcpy(XQ+(size_t)e*LT,zq+(size_t)poslist[e]*LT,(size_t)LT);
+            memcpy(XS+(size_t)e*gb1,zs+(size_t)poslist[e]*gb1,(size_t)gb1*sizeof(float));
+        }
+        free(zq); free(zs);
+    } else {
+        XF=falloc((int64_t)tot*LT);
+        for(int e=0;e<tot;e++) memcpy(XF+(size_t)e*LT,Z+(size_t)poslist[e]*LT,(size_t)LT*sizeof(float));
+    }
+    float *G=falloc((int64_t)tot*MI), *Y=falloc((int64_t)tot*LT);
     for(int left=nu;left>0;){
         unsigned long long seen_io=k3_io_seen();
         int nw=0;
-        for(int j=0;j<nu;j++) if(!done[j]&&sl[j]&&slot_ready(sl[j])) wave[nw++]=j;
+        for(int j=0;j<nu;j++) if(!w->done[j]&&w->sl[j]&&slot_ready(w->sl[j])) w->wave[nw++]=j;
+        if(!nw&&idle){ idle(ctx); idle=NULL; continue; }   /* the work that needs no expert, while they arrive */
         if(!nw){ k3_io_wait_any(m,seen_io); continue; }
-        k3_wave(m,wave,nw,sl,pfirst,pcnt,XQ,XS,XF,G,GQ,GS,Y);
-        for(int w=0;w<nw;w++){
-            int j=wave[w];
+        double t0=now_s();
+        k3_wave(m,w->wave,nw,w->sl,pfirst,pcnt,XQ,XS,XF,G,GQ,GS,Y);
+        m->t_wave+=now_s()-t0; m->n_wave++;
+        for(int a=0;a<nw;a++){
+            int j=w->wave[a];
 #ifdef COLI_VULKAN
-            if(vkt_ready()){ VktExpertSrc vs=k3_vk_src(m,sl[j]->buf); vkt_note(li,uids[j],&vs); }
+            if(vkt_ready()){ VktExpertSrc vs=k3_vk_src(m,w->sl[j]->buf); vkt_note(li,w->uids[j],&vs); }
 #endif
-            done[j]=1; sl[j]->busy--; left--;
+            w->done[j]=1; w->sl[j]->busy--; left--;
         }
-        K3_TAKE_SLOTS();   /* a step larger than the cache: the slots its computed experts freed */
+        k3_waves_take(m,li,w);   /* a step larger than the cache: the slots its computed experts freed */
     }
-#undef K3_TAKE_SLOTS
+    if(idle) idle(ctx);   /* every expert was ready at once: nothing to hide it behind */
     /* the weighted sum, in the union's order and each expert's rows in order, as before */
     for(int j=0;j<nu;j++)
         for(int q=0;q<pcnt[j];q++){
@@ -2759,7 +2835,15 @@ static void k3_moe_waves(Model *m, int li, int nu, const int *uids,
             for(int i=0;i<LT;i++) ut[i]+=wk*yr[i];
         }
     free(XQ); free(XS); free(XF); free(GQ); free(GS); free(G); free(Y);
-    free(sl); free(wave); free(miss); free(done);
+    free(w->sl); free(w->wave); free(w->miss); free(w->done);
+}
+static void k3_moe_waves(Model *m, int li, int nu, const int *uids,
+                         const int *pfirst, const int *pcnt,
+                         const int *poslist, const float *wlist,
+                         const float *Z, int stride, float *U){
+    K3Waves w;
+    k3_waves_issue(m,li,nu,uids,pfirst,pcnt,poslist,wlist,&w);
+    k3_waves_run(m,li,&w,Z,stride,U,NULL,NULL);
 }
 
 /* ---- AUTOPIN: seed the layer caches from the accumulated history ----------
@@ -3212,52 +3296,74 @@ static void k3_moe_route(Model *m, Moe *o, int li, float *sco, int C, int *idxs,
  * every kept rank's weighted output, in the union's order. x: the rows the shared
  * experts read while a tier batch runs (NULL: the dense chain computes them on the
  * device); their output is returned when this step computed it, else NULL. */
+/* A step's union: each unique expert loads ONCE and applies to every position that
+ * selected it (position lists via counting sort), in the order of the experts' ids as
+ * text (m->elex): the published shards' disk-offset order (safetensors sorts names: "0"
+ * "1" "10" "100" ...), so the loads run along the disk and the sum keeps the order it
+ * always had, on one shard or cut over drives alike. */
+typedef struct { int nu; int *map, *uid, *pcnt, *pfirst, *poslist, *cur; float *wlist; } K3Union;
+static void k3_union_build(Model *m, int C, const int *keff, const int *idxs, const float *wsels, K3Union *un){
+    Cfg *c=&m->c;
+    int E=c->n_experts, K=c->topk;
+    un->map=malloc((size_t)E*sizeof(int));
+    un->uid=malloc((size_t)C*K*sizeof(int));
+    un->pcnt=malloc((size_t)C*K*sizeof(int)); un->pfirst=malloc((size_t)C*K*sizeof(int));
+    un->poslist=malloc((size_t)C*K*sizeof(int)); un->wlist=falloc((int64_t)C*K);
+    un->cur=malloc((size_t)C*K*sizeof(int));
+    int *map=un->map, *uid=un->uid, *pcnt=un->pcnt, *pfirst=un->pfirst, *poslist=un->poslist, *cur=un->cur;
+    float *wlist=un->wlist;
+    if(!map||!uid||!pcnt||!pfirst||!poslist||!cur){fprintf(stderr,"OOM moe union\n");exit(1);}
+    for(int e=0;e<E;e++) map[e]=-1;
+    int nu=0;
+    for(int t=0;t<C;t++) for(int kk=0;kk<keff[t];kk++){
+        int e=idxs[(int64_t)t*K+kk];
+        if(map[e]<0){ map[e]=nu; uid[nu]=e; pcnt[nu]=0; nu++; }
+        pcnt[map[e]]++;
+    }
+    int acc=0;
+    for(int j=0;j<nu;j++){ pfirst[j]=acc; cur[j]=acc; acc+=pcnt[j]; }
+    for(int t=0;t<C;t++) for(int kk=0;kk<keff[t];kk++){
+        int j=map[idxs[(int64_t)t*K+kk]];
+        poslist[cur[j]]=t; wlist[cur[j]]=wsels[(int64_t)t*K+kk]; cur[j]++;
+    }
+    /* permute the list heads with the ids */
+    for(int a2=0;a2<nu-1;a2++) for(int b2=a2+1;b2<nu;b2++){
+        if(m->elex[uid[b2]]<m->elex[uid[a2]]){
+            int tt=uid[a2];uid[a2]=uid[b2];uid[b2]=tt;
+            tt=pcnt[a2];pcnt[a2]=pcnt[b2];pcnt[b2]=tt;
+            tt=pfirst[a2];pfirst[a2]=pfirst[b2];pfirst[b2]=tt; }
+    }
+    un->nu=nu;
+}
+static void k3_union_free(K3Union *un){
+    free(un->map);free(un->uid);free(un->pcnt);free(un->pfirst);free(un->poslist);free(un->wlist);free(un->cur);
+    memset(un,0,sizeof *un);
+}
+/* Does a step's MoE take k3_waves_issue/run (K3_WAVES, default 1)? Not with K3_CUDA=1 (its
+ * experts on the GPU one call each, expert_apply) nor the Vulkan tier's steps. */
+static int k3_waves_on(void){
+    if(g_k3_waves<0) g_k3_waves=getenv("K3_WAVES")?atoi(getenv("K3_WAVES"))!=0:1;
+#ifdef COLI_CUDA
+    if(g_k3_cuda) return 0;
+#endif
+    return g_k3_waves&&!vkt_ready();
+}
+
 static float *k3_moe_experts(Model *m, Moe *o, int li, const float *x, const float *z, int C,
                              const int *keff, const int *idxs, const float *wsels, float *u){
     Cfg *c=&m->c;
-    int E=c->n_experts, K=c->topk, LT=c->latent, MI=c->moe_inter;
+    int E=c->n_experts, LT=c->latent, MI=c->moe_inter;
     float *gate=falloc(MI), *up=falloc(MI), *hz=falloc(LT), *sd=NULL;
+    (void)o; (void)x;             /* the Vulkan tier's step reads them */
 #ifdef COLI_VULKAN
     K3VkStep vst={0};             /* the device's pairs, issued before the union is read */
     if(vkt_ready()) k3_vk_issue(m,li,C,keff,idxs,z,&vst);
 #endif
-    /* union across the chunk: each unique expert loads ONCE and applies to
-     * every position that selected it (position lists via counting sort).
-     * With QB-flat routing the dedup is modest (~15% at C=32), but the loads
-     * arrive as one deep burst for the NVMe and the dense side above/below
-     * batches perfectly. */
     {
-        int *map=malloc((size_t)E*sizeof(int));
-        int *uid=malloc((size_t)C*K*sizeof(int));
-        int *pcnt=malloc((size_t)C*K*sizeof(int)), *pfirst=malloc((size_t)C*K*sizeof(int));
-        int *poslist=malloc((size_t)C*K*sizeof(int)); float *wlist=falloc((int64_t)C*K);
-        int *cur=malloc((size_t)C*K*sizeof(int));
-        if(!map||!uid||!pcnt||!pfirst||!poslist||!cur){fprintf(stderr,"OOM moe union\n");exit(1);}
-        for(int e=0;e<E;e++) map[e]=-1;
-        int nu=0;
-        for(int t=0;t<C;t++) for(int kk=0;kk<keff[t];kk++){
-            int e=idxs[(int64_t)t*K+kk];
-            if(map[e]<0){ map[e]=nu; uid[nu]=e; pcnt[nu]=0; nu++; }
-            pcnt[map[e]]++;
-        }
-        int acc=0;
-        for(int j=0;j<nu;j++){ pfirst[j]=acc; cur[j]=acc; acc+=pcnt[j]; }
-        for(int t=0;t<C;t++) for(int kk=0;kk<keff[t];kk++){
-            int j=map[idxs[(int64_t)t*K+kk]];
-            poslist[cur[j]]=t; wlist[cur[j]]=wsels[(int64_t)t*K+kk]; cur[j]++;
-        }
-        /* the union in the order of the experts' ids as text (m->elex): the published
-         * shards' disk-offset order (safetensors sorts names: "0" "1" "10" "100" ...),
-         * so the loads run along the disk and the sum keeps the order it always had,
-         * on one shard or cut over drives alike; permute the list heads with the ids.
-         * WILLNEED prefetch only for the buffered path. */
-        for(int a2=0;a2<nu-1;a2++) for(int b2=a2+1;b2<nu;b2++){
-            if(m->elex[uid[b2]]<m->elex[uid[a2]]){
-                int tt=uid[a2];uid[a2]=uid[b2];uid[b2]=tt;
-                tt=pcnt[a2];pcnt[a2]=pcnt[b2];pcnt[b2]=tt;
-                tt=pfirst[a2];pfirst[a2]=pfirst[b2];pfirst[b2]=tt; }
-        }
-        if(!g_k3_direct)
+        K3Union un; k3_union_build(m,C,keff,idxs,wsels,&un);
+        int nu=un.nu, *uid=un.uid, *pcnt=un.pcnt, *pfirst=un.pfirst, *poslist=un.poslist;
+        float *wlist=un.wlist;
+        if(!g_k3_direct)   /* WILLNEED prefetch only for the buffered path */
             for(int j=0;j<nu;j++){
 #ifdef COLI_VULKAN
                 if(vst.ndev&&!vst.left[uid[j]]) continue;   /* the device computes it: nothing to read */
@@ -3267,18 +3373,13 @@ static float *k3_moe_experts(Model *m, Moe *o, int li, const float *x, const flo
                 if(er->contig){ if(er->fd[0]>=0) posix_fadvise(er->fd[0],er->off[0],m->e_slot,POSIX_FADV_WILLNEED); }
                 else for(int k2=0;k2<6;k2++) if(er->fd[k2]>=0) posix_fadvise(er->fd[k2],er->off[k2],sizes[k2],POSIX_FADV_WILLNEED);
             }
-        if(g_k3_waves<0) g_k3_waves=getenv("K3_WAVES")?atoi(getenv("K3_WAVES"))!=0:1;
-        int waves=g_k3_waves;
-#ifdef COLI_CUDA
-        if(g_k3_cuda) waves=0;            /* K3_CUDA=1: the experts on the GPU, one call each (expert_apply) */
-#endif
 #ifdef COLI_VULKAN
         if(vst.ndev) sd=k3_vk_step(m,o,li,C,x,z,u,nu,uid,pfirst,pcnt,poslist,wlist,gate,up,hz,&vst);
         else
 #endif
-        if(waves) k3_moe_waves(m,li,nu,uid,pfirst,pcnt,poslist,wlist,z,LT,u);
+        if(k3_waves_on()) k3_moe_waves(m,li,nu,uid,pfirst,pcnt,poslist,wlist,z,LT,u);
         else experts_apply_union(m,li,nu,uid,pfirst,pcnt,poslist,wlist,z,LT,u,gate,up,hz,NULL,NULL);
-        free(map);free(uid);free(pcnt);free(pfirst);free(poslist);free(wlist);free(cur);
+        k3_union_free(&un);
     }
 #ifdef COLI_VULKAN
     k3_vk_step_free(&vst);
@@ -3287,25 +3388,53 @@ static float *k3_moe_experts(Model *m, Moe *o, int li, const float *x, const flo
     return sd;
 }
 
+/* moe_forward's shared experts as k3_waves_run's idle work */
+typedef struct { Model *m; Moe *o; const float *x; int C; float *sd; } K3SharedJob;
+static void k3_shared_job(void *p){
+    K3SharedJob *j=p;
+    double t0=now_s();
+    j->sd=k3_shared(j->m,j->o,j->x,j->C);
+    j->m->t_shared+=now_s()-t0;
+}
 static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float *out){
     Cfg *c=&m->c; Moe *o=&l->moe;
     int E=c->n_experts, K=c->topk, LT=c->latent;
+    double t0=now_s();
     float *sco=falloc((int64_t)C*E);
-    if(!K3_F32_DEV(o->vk_router,sco,x,C,c->hidden,E)){ K3_F32_NEED(o->router); matmul(sco,x,o->router,C,c->hidden,E); }
+    if(!K3_F32_DEV(o->vk_router,sco,x,C,c->hidden,E)) k3_router_scores(o,sco,x,C,c->hidden,E);
     int *idxs=malloc((size_t)C*K*sizeof(int)); float *wsels=falloc((int64_t)C*K);
     int *keff=malloc((size_t)C*sizeof(int));
     if(!idxs||!keff){fprintf(stderr,"OOM moe sel\n");exit(1);}
     k3_moe_route(m,o,li,sco,C,idxs,wsels,keff);
     k3_prefetch_score(m,li,idxs,keff,C);
-    float *z=falloc((int64_t)C*LT), *u=falloc((int64_t)C*LT);
-    w_matmul(z,x,&o->lat_down,C);
+    float *z=falloc((int64_t)C*LT), *u=falloc((int64_t)C*LT), *sd=NULL;
     memset(u,0,(size_t)C*LT*sizeof(float));
-    float *sd=k3_moe_experts(m,o,li,x,z,C,keff,idxs,wsels,u);
+    if(k3_waves_on()){
+        /* the routed experts' reads first; the latent projection and the shared experts,
+         * which need none of them, while they arrive */
+        K3Union un; k3_union_build(m,C,keff,idxs,wsels,&un);
+        K3Waves wv; k3_waves_issue(m,li,un.nu,un.uid,un.pfirst,un.pcnt,un.poslist,un.wlist,&wv);
+        double t1=now_s(); m->t_route+=t1-t0;
+        w_matmul(z,x,&o->lat_down,C);
+        m->t_lat+=now_s()-t1;
+        /* the shared experts while the step would wait for a read (k3_waves_run's idle) */
+        K3SharedJob sj={m,o,x,C,NULL};
+        k3_waves_run(m,li,&wv,z,LT,u,k3_shared_job,&sj);
+        sd=sj.sd;
+        k3_union_free(&un);
+    } else {
+        double t1=now_s(); m->t_route+=t1-t0;
+        w_matmul(z,x,&o->lat_down,C);
+        m->t_lat+=now_s()-t1;
+        sd=k3_moe_experts(m,o,li,x,z,C,keff,idxs,wsels,u);
+    }
+    double t3=now_s();
     for(int t=0;t<C;t++)
         rmsnorm_(u+(int64_t)t*LT,u+(int64_t)t*LT,o->lat_norm,LT,c->eps);
     w_matmul(out,u,&o->lat_up,C);
+    m->t_lat+=now_s()-t3;
     /* shared experts at full width (a tier step computed them while its batch ran) */
-    if(!sd) sd=k3_shared(m,o,x,C);
+    if(!sd){ double t4=now_s(); sd=k3_shared(m,o,x,C); m->t_shared+=now_s()-t4; }
     for(int64_t d=0;d<(int64_t)C*c->hidden;d++) out[d]+=sd[d];
     free(sco);free(idxs);free(wsels);free(keff);
     free(z);free(u);free(sd);
@@ -3385,7 +3514,9 @@ static int k3_layers_forward_range(Model *m, float *hidden, float *bres,
              if(have_prefix){ for(int d=0;d<D;d++) p[d]+=a[d]; }
              else           { memcpy(p,a,D*sizeof(float)); }
              res_mix(mix,p,bres+(int64_t)t*nbmax*D,nb,D,l->mlp_sw,c->eps);
-             if(pf) memcpy(m->pf_x+(int64_t)t*D,mix,D*sizeof(float));
+             /* K3_PREFETCH_MIX=1: the blocks mixed with the next layer's weights instead */
+             if(pf&&g_k3_pf_mix) res_mix(m->pf_x+(int64_t)t*D,p,bres+(int64_t)t*nbmax*D,nb,D,m->L[i+1].mlp_sw,c->eps);
+             else if(pf) memcpy(m->pf_x+(int64_t)t*D,mix,D*sizeof(float));
              rmsnorm_(nrm+(int64_t)t*D,mix,l->post_ln,D,c->eps);
             /* Phase 9: capture MLP-input (post-attention nrm) */
             if(g_k3_val_layer==i && t==g_k3_val_token){
@@ -4966,6 +5097,10 @@ int main(int argc, char **argv){
     }
     if(g_lfp){ fclose(g_lfp); g_lfp=NULL; }
     fprintf(stderr,"\n[K3] prefill done in %.1fs (%.2f tok/s)\n",now_s()-t0,np/(now_s()-t0));
+    /* the decode's own share of every timer: what they hold after the prompt */
+    double d0_attn=m.t_attn, d0_moe=m.t_moe, d0_eload=m.t_eload, d0_route=m.t_route, d0_lat=m.t_lat,
+           d0_shared=m.t_shared, d0_wave=m.t_wave, d0_head=m.t_head;
+    uint64_t d0_bytes=m.ebytes;
     if(!m.has_head||!lo){
         fprintf(stderr,"[K3] no head — trace written, stopping after prefill\n");
     if(m.trace) fclose(m.trace);
@@ -5025,6 +5160,14 @@ int main(int argc, char **argv){
             (unsigned long long)m.hits,(unsigned long long)(m.hits+m.miss),m.ebytes/1e9);
     fprintf(stderr,"[K3] time: attn %.1fs moe %.1fs (eload %.1fs) head %.1fs | RSS %.1f GB\n",
             m.t_attn,m.t_moe,m.t_eload,m.t_head,rss_gb());
+    if(ntok>0){
+        double k=1e3/ntok;
+        fprintf(stderr,"[K3] a decode token: %.0f ms -- attention %.0f, MoE %.0f (router and reads issued %.0f, latent %.0f, "
+                "shared %.0f, routed experts computed %.0f, waiting for reads %.0f), head %.0f; %.1f GB read\n",
+                dt*k,(m.t_attn-d0_attn)*k,(m.t_moe-d0_moe)*k,(m.t_route-d0_route)*k,(m.t_lat-d0_lat)*k,
+                (m.t_shared-d0_shared)*k,(m.t_wave-d0_wave)*k,(m.t_eload-d0_eload)*k,(m.t_head-d0_head)*k,
+                (m.ebytes-d0_bytes)/1e9/ntok);
+    }
     k3_io_report(&m,"run");
 #ifdef COLI_CUDA
     k3_cuda_report("run");
@@ -5093,7 +5236,7 @@ static void kimi_segment_layer_destroy(Layer *layer) {
     }
     if (layer->sparse) {
         Moe *moe = &layer->moe;
-        free(moe->router); free(moe->rbias); free(moe->lat_norm);
+        free(moe->router); free(moe->router16); free(moe->rbias); free(moe->lat_norm);
         w_release_host(&moe->lat_down); w_release_host(&moe->lat_up);
         w_release_host(&moe->sh_gate); w_release_host(&moe->sh_up);
         w_release_host(&moe->sh_down);

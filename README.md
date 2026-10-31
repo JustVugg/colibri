@@ -153,15 +153,19 @@ weights) on the same Ryzen 9 7950X3D, 192 GB, RTX 4090 and two NVMe drives. No r
 holds K3 in this machine's memory, so every token reads its experts from disk: 25.8 GB a
 token before any cache hit, at 16.9 GB/s with both drives reading at once
 ([the plan, the other K3 engines and what was taken from them](docs/kimi_k3-4090.md)).
-Not yet measured on the real model; the steps so far, each checked on the tiny model:
+Measured on the real model ([docs/experiments/kimi-k3-4090-2026-10-31](docs/experiments/kimi-k3-4090-2026-10-31/README.md)):
+**0.78 tokens a second** (0.81 with `-DenseGB 21.5 -ReserveGB 1`; the first engine here
+0.56), a 53 s start (161), a 35-token prompt in 37 s (57); 61.5% of the experts a token asks
+for are found in RAM. Every step gives the logits of the one before it, byte for byte:
 
 - `c\tools\download_kimi_k3_4090.ps1` fetches the checkpoint and cuts every MoE layer's
   shard between `C:` (61.4% of its experts) and `D:` (38.6%), in proportion to their
   read speeds, so a layer's reads go to both drives; SHA-256 checked, resumable,
   reversible (`-Join`).
 - the engine reads with two readers per drive, each with its own unbuffered handles,
-  and reads the next layer's predicted experts ahead; the logits are the old loader's
-  byte for byte.
+  and reads the next layer's predicted experts ahead (from that layer's own mix of the
+  blocks, its 12 best experts); a step's experts are computed in waves as their reads
+  arrive, the shared experts while none has; the routers stay BF16.
 - the largest dense matrices (20 GiB) on the GPU, a tiled kernel for prompt steps.
 - `c\tools\start_kimi_k3_4090.ps1` serves the OpenAI/Anthropic API on port 18080 (model
   `kimi-k3`), with photos of every turn so agent clients that drop the reasoning resume
@@ -177,9 +181,12 @@ Not yet measured on the real model; the steps so far, each checked on the tiny m
 `C:` (61,4% экспертов) и `D:` (38,6%) по скорости чтения дисков — каждый слой читается с
 обоих дисков одновременно (SHA-256 проверяется, докачка, `-Join` собирает исходные
 шарды обратно). В движке: по два потока чтения на диск со своими дескрипторами,
-упреждающее чтение экспертов следующего слоя, крупнейшие плотные матрицы (20 ГиБ) на
-GPU, «снимки» состояния на каждом ходе для агентов. Запуск: `c\tools\start_kimi_k3_4090.ps1`.
-Замеры на настоящей модели — после скачивания. Подробно: [docs/kimi_k3-4090.md](docs/kimi_k3-4090.md).
+упреждающее чтение экспертов следующего слоя, эксперты шага считаются волнами по мере
+прихода данных, роутеры в BF16, крупнейшие плотные матрицы (20 ГиБ) на GPU, «снимки»
+состояния на каждом ходе для агентов. Запуск: `c\tools\start_kimi_k3_4090.ps1`.
+Замеры на настоящей модели: **0,78 токена/с** (0,81 с `-DenseGB 21.5 -ReserveGB 1`; первая
+версия — 0,56), запуск 53 с (было 161), промпт из 35 токенов за 37 с (57); 61,5% экспертов
+находятся в ОЗУ, текст тот же байт в байт. Подробно: [docs/kimi_k3-4090.md](docs/kimi_k3-4090.md).
 
 </details>
 
