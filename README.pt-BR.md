@@ -20,13 +20,16 @@ por isso o colibri mantém essa parte na RAM e lê o resto — os especialistas 
 disco, quando o modelo os pede. C puro, um arquivo por família de modelos, sem
 necessidade de GPU.
 
-Treze motores rodam hoje. Dez são para modelos de linguagem: **GLM-5.2/5.3**,
-**GLM-5.3-Flash**, **Inkling**, **Kimi K3**, **DeepSeek V4 Flash**,
-**DeepSeek V4.1 Flash**, **MiMo-V2.6 Flash** (e Pro), **Qwen3.8-Flash-Next**,
-**Qwen3.6** (que também roda o Qwen3-Coder e o denso Qwen3.8-27B) e
-**OLMoE**. Um desenha figuras: **Qwen-Image-2.1**. Dois respondem a decisões:
-**Laya** e **GLiNER2.5-Decide**, com um terceiro modelo de decisão, o **Clef**, no
-motor Qwen3.6. [Qual deles para a minha máquina](#which-model-for-my-machine)
+Treze motores rodam hoje. Dez são para modelos de linguagem: **GLM-5.2/5.3** (que
+também roda o **Mistral-Large-4**), **GLM-5.3-Flash**, **Inkling**, **Kimi K3**,
+**DeepSeek V4 Flash**, **DeepSeek V4.1 Flash**, **MiMo-V2.6 Flash** (e Pro),
+**Qwen3.8-Flash-Next**, **Qwen3.6** (que também roda o Qwen3-Coder, o denso
+Qwen3.8-27B, o **Flint**, o **Muse Spark Open** e o **LFM3-VL**) e **OLMoE**. Um
+desenha figuras: **Qwen-Image-2.1**. Dois respondem decisões: **Laya** e
+**GLiNER2.5-Decide**, com um terceiro modelo de decisão, **Clef**, no motor
+Qwen3.6. Os modelos de linguagem também rodam a partir dos arquivos GGUF já
+publicados, lidos como são ([GGUF](docs/gguf.md)), na CPU, em qualquer GPU via
+Vulkan e em placas NVIDIA via CUDA. [Qual escolher para a minha máquina](#which-model-for-my-machine)
 
 ```
 $ ./coli chat
@@ -241,13 +244,33 @@ velocidade: um NVMe rápido ajuda mais)
 | **GLM-5.3-Flash** (321B): visão e ferramentas | 328 GB, convertido shard a shard para 195 GB | 25 GB | CUDA, Vulkan | cerca de 20 s por token a quente, 44 s a frio (6 núcleos, 25 GB, disco comum) |
 | **DeepSeek V4.1 Flash** (552B): visão e ferramentas, sem conversão mas com uma preparação única | 510 GB | cerca de 18 GB mais o cache de especialistas (pico de 24,8 GB com 8 por camada) | Vulkan | 0,21-0,24 tok/s (servidor de CPU com 16 threads mantendo 68% dos especialistas) |
 
+<a id="from-a-gguf"></a>
+
+**A partir de um GGUF: os arquivos publicados, lidos como são**
+
+O `./coli import` recebe o primeiro arquivo de um GGUF (as outras partes ao lado) e
+escreve um diretório de modelo ao lado dele; depois esse diretório vai em `--model`, como
+qualquer outro ([gguf.md](docs/gguf.md)). Nada é convertido nem quantizado de novo: os blocos
+rodam como o arquivo os guarda, de IQ1_S a Q8_0, F16, BF16 e MXFP4. Os motores de todos os
+modelos de chat acima também leem GGUFs ([as arquiteturas](docs/gguf.md#supported-architectures));
+estes quatro modelos vêm como GGUF:
+
+| Modelo | GGUF | GPU | Medido |
+|---|---|---|---|
+| **Mistral-Large-4** (1T, 52B ativos): texto, figuras, raciocínio e ferramentas | unsloth, UD-IQ1_S 233 GB | CUDA, Vulkan | 1,34-1,36 tok/s com CUDA, 1,16-1,17 com Vulkan (D) |
+| **Muse Spark Open** (816B, 42B ativos): texto e ferramentas, sob o acordo de licença da Meta | unsloth, de UD-IQ1_S 176 GB a UD-Q4_K_XL 505 GB | CUDA, Vulkan | 1,55-1,58 tok/s com Vulkan, 1,34-1,40 com CUDA, 0,83-0,89 na CPU (D) |
+| **Flint** (40B, 2.5B ativos): texto e ferramentas, Apache 2,0 | unsloth, de UD-IQ1_M 11,4 GB a BF16 79,6 GB | CUDA, Vulkan | UD-Q4_K_XL: 77,4 tok/s com CUDA, 77,7 com Vulkan, 15,8 na CPU (D) |
+| **LFM3-VL-2B**: texto, figuras e ferramentas, LFM Open License | LiquidAI, de QAD-Q4_0 a BF16 (ou o checkpoint, convertido) | CUDA, Vulkan | Q4_K_M: 235,1 tok/s com CUDA, 214,1 com Vulkan, 34,5 na CPU (D) |
+
+Os modelos maiores das tabelas acima a partir dos seus GGUFs, na mesma máquina: [Benchmarks](#large-models-on-the-same-machine).
+
 **Modelos de decisão** (eles respondem a perguntas do
 [System One](#system-one-a-decision-with-a-probability), não conversam)
 
 | Modelo | Download, depois em disco | RAM | GPU | Medido |
 |---|---|---|---|---|
-| **Laya** (Convai Innovations), inglês | 0,85 GB | 1,7 GB | CPU | 219 ms para uma pergunta, 882 ms para três (B) |
-| **GLiNER2.5-Decide** (fastino), inglês | 1,95 GB | 1,9 GB | CPU | 294 ms para uma pergunta, 897 ms para três (B, sob carga) |
+| **Laya** (Convai Innovations), inglês | 0,85 GB | 1,7 GB | CPU, CUDA | 219 ms para uma pergunta, 882 ms para três (B); doze em 0,69 s com CUDA, 11,4-13,0 s na CPU (D) |
+| **GLiNER2.5-Decide** (fastino), inglês | 1,95 GB | 1,9 GB | CPU, CUDA | 294 ms para uma pergunta, 897 ms para três (B, sob carga); doze em 0,16-0,21 s com CUDA, 2,0-2,6 s na CPU (D) |
 | **Clef** (Cloudflare): Qwen3.8-27B com um cabeçote de decisão, também conversa | 55 GB, 52 GB após conversão | de 19 GB em int4 a 55 GB em f16 | CPU | 20,4 s por requisição em int8 (A) |
 
 As máquinas:
@@ -255,12 +278,14 @@ As máquinas:
 integrada);
 **B** um laptop i7-1355U;
 **C** uma RTX 3070 de 8 GB numa máquina Threadripper 3945WX, com as camadas densas
-e as camadas DeltaNet na placa (contêiner int4 por linha).
+e as camadas DeltaNet na placa (contêiner int4 por linha);
+**D** um i5-13500 com 62 GB de RAM, uma RTX PRO 4000 Blackwell SFF (24 GB) e dois
+NVMe num array md: a máquina das [tabelas de benchmark](#benchmarks).
 Cada número vem da página do modelo em [docs/](docs/) ou de
 [the benchmark tables](docs/benchmarks.md), com as configurações exatas.
 
 Cada família tem a sua página: [qwen36.md](docs/qwen36.md) (Qwen3.6, Qwen3-Coder,
-Qwen3.8-27B), [qwen38.md](docs/qwen38.md), [deepseek-v4.md](docs/deepseek-v4.md),
+Qwen3.8-27B, Flint, Muse Spark Open, LFM3-VL), [mistral-large4.md](docs/mistral-large4.md), [gguf.md](docs/gguf.md), [qwen38.md](docs/qwen38.md), [deepseek-v4.md](docs/deepseek-v4.md),
 [deepseek-v41.md](docs/deepseek-v41.md), [mimo.md](docs/mimo.md),
 [glm53-flash.md](docs/glm53-flash.md), [inkling.md](docs/inkling.md),
 [kimi_k3.md](docs/kimi_k3.md), [qwen-image.md](docs/qwen-image.md),
@@ -320,14 +345,18 @@ especialistas e roda as camadas densas na CPU. Numa GPU integrada, experimente o
 dois: num laptop com Intel Iris Xe (Core i7-1355U), o Qwen3.6 decodificou 2,1 tok/s
 na CPU, 1,7 a 1,9 com Vulkan, e 2,1 com a cadeia densa desligada.
 
-Numa GPU dedicada a configuração compila Vulkan para todos os motores (CUDA
-primeiro, onde o motor tem e o kit está instalado), com as camadas densas na
-placa. É para esse caso que o projeto existe. **Ainda não medimos uma GPU dedicada
-nós mesmos.** O primeiro número vem de um usuário: Qwen3.6 a 17-19 tok/s numa Tesla
-V100 de 16 GB, com o tier de especialistas e a cadeia densa
-([#1852](https://github.com/JustVugg/colibri/issues/1852)). (Antes dele, o caminho
-Vulkan anterior do GLM-5.2 decodificou 1,7-1,8 tok/s numa RX 9070 dedicada.)
-Números da sua placa são bem-vindos.
+Numa GPU dedicada o setup compila Vulkan para todo motor (CUDA primeiro, onde o
+motor tem e o toolkit está instalado), com as camadas densas na placa. É o caso
+para o qual o projeto foi pensado. Numa RTX PRO 4000 (24 GB, máquina D) o
+Qwen3.6-35B-A3B decodifica a 92,9 tok/s e lê um prompt a 2076, o OLMoE a 299,4 e
+6867 ([a tabela](#three-backends-on-one-machine)). Um modelo maior que a placa
+guarda os especialistas que a placa não comporta num pool na RAM, e a cada passo
+a CPU calcula esses enquanto a placa calcula os seus, no mesmo frame: o
+Qwen3.8-Flash-Next IQ2_XS (68 GB) decodifica a 50,6 tok/s
+([vulkan.md](docs/vulkan.md#the-routed-experts-in-the-frame-vk_dmoeh)). Um
+usuário mediu o Qwen3.6 a 17-19 tok/s numa Tesla V100 16 GB
+([#1852](https://github.com/JustVugg/colibri/issues/1852)). Números da sua placa
+são bem-vindos.
 
 **Placas sem Resizable BAR** agora funcionam. Uma placa assim (toda placa Turing,
 placas Ampere no firmware de lançamento, placas AMD mais antigas com a opção
@@ -344,15 +373,28 @@ palavra ([vulkan.md](docs/vulkan.md#the-other-engines)).
 
 ### CUDA: placas NVIDIA
 
-A configuração compila CUDA no Linux quando o kit CUDA está instalado, para os
-motores que têm caminho CUDA: GLM-5.2/5.3, GLM-5.3-Flash, Inkling, Kimi K3,
-DeepSeek V4 Flash, Qwen3.8-Flash-Next, e Qwen3.6 com Qwen3-Coder. No Windows o
-motor CUDA é uma DLL separada ([windows.md](docs/windows.md)), e toda versão vem
-com ela compilada: `colibri-<version>-windows-x86_64-cuda.zip` tem
-`coli_cuda.dll` (placas de compute capability 8.0 e mais novas) e os motores
-colibri, qwen36 e kimi_k3 que a carregam. Descompacte sobre o arquivo principal e
-a configuração escolhe CUDA.
+O setup compila CUDA no Linux quando o CUDA toolkit está instalado, para os
+motores que têm um caminho CUDA: GLM-5.2/5.3 e Mistral-Large-4, GLM-5.3-Flash,
+Inkling, Kimi K3, DeepSeek V4 Flash, DeepSeek V4.1 Flash, MiMo-V2.6,
+Qwen3.8-Flash-Next, e Qwen3.6 com os modelos que ele roda; o OLMoE e os motores
+de decisão compilam com `make <motor> CUDA=1`. No Windows o motor CUDA é uma DLL
+separada ([windows.md](docs/windows.md)), e toda release a traz compilada:
+`colibri-<versão>-windows-x86_64-cuda.zip` tem a `coli_cuda.dll` (placas de
+compute capability 8.0 ou mais nova) e os motores colibri, qwen36 e kimi_k3 que
+a carregam, com as DLLs CUDA do DeepSeek V4. Descompacte por cima do arquivo
+principal e o setup escolhe CUDA.
 
+- **Todas as camadas na placa** para Qwen3.6, Qwen3.8 e OLMoE: as camadas
+  densas, a atenção e os especialistas que a placa guarda rodam como uma só
+  cadeia, e os que ela não guarda rodam na CPU. Numa RTX PRO 4000 o
+  Qwen3.6-35B-A3B UD-Q4_K_M decodifica a 104,8 tok/s e lê um prompt a 3491, o
+  OLMoE a 354,6 e 10418 ([a tabela](#three-backends-on-one-machine)).
+- **Um tier de especialistas na placa para todo motor** (`cu_tier.h`), e as
+  matrizes densas nela para DeepSeek V4, V4.1, Kimi K3, GLM-5.3 e MiMo
+  (`cu_dense.h`).
+- **Os blocos de um GGUF na placa** (`cuda_bd.cuh`): todo tipo de bloco ggml de
+  32 pesos ou mais, cada linha como o arquivo a guarda; um prompt passa pelos
+  tensor cores ([gguf.md](docs/gguf.md)).
 - **O tier de especialistas em VRAM** mantém na placa os especialistas mais
   quentes, escolhidos a partir do roteamento medido; os que faltam calculam na CPU
   ao mesmo tempo. O Qwen3.6 em duas placas de 8 GB (RTX 3070 e Quadro RTX 4000)
@@ -482,8 +524,9 @@ O `coli serve` (que a configuração inicia para você) é um servidor com vári
 - **tool calling** em todo motor de chat exceto Inkling e OLMoE, cada um no
   formato nativo do seu modelo ([the per-engine table](docs/api.md#tool-calling-support));
 - **imagens de entrada** no GLM-5.3-Flash, DeepSeek V4.1 Flash, MiMo-V2.6,
-  Qwen3.8-Flash-Next e Qwen3.8-27B: um caminho numa mensagem do `coli chat`, um
-  anexo no `coli web`, ou uma parte `image_url`;
+  Qwen3.8-Flash-Next, Qwen3.8-27B, LFM3-VL e Mistral-Large-4 (de um GGUF, com o
+  arquivo `mmproj` ao lado): um caminho numa mensagem do `coli chat`, um anexo no
+  `coli web` ou no `coli ui`, ou uma parte `image_url`;
 - **figuras de saída** com o Qwen-Image-2.1 em `POST /v1/images/generations`,
   e desenhadas dentro do terminal pelo `coli chat`
   ([qwen-image.md](docs/qwen-image.md));
@@ -547,8 +590,13 @@ as mesmas se um especialista respondeu da VRAM, da RAM ou do disco.
 - **Especulação que se paga.** O cabeçote MTP int8 do GLM-5.2 rascunha 2,2-2,8
   tokens por forward quando compensa; o cabeçote MTP do Qwen3.8-Flash-Next, ligado
   por padrão, acrescenta 16-20% com a mesma saída, e o prompt lookup, 6-7% em
-  edições de código. Onde rascunhar custa mais do que economiza (DeepSeek V4), ele
-  fica desligado ([tuning.md](docs/tuning.md#speculation-and-reproducibility)).
+  edições de código. O cabeçote do Qwen3.6, ligado por padrão, leva o decode de
+  99,7-104,5 a 115,8-120,1 tok/s com CUDA e de 83,2-83,8 a 99,9-109,3 com Vulkan
+  (uma RTX PRO 4000). O cabeçote DSpark do DeepSeek V4.1 rascunha tão fundo
+  quanto a sua confiança diz, e uma verificação pula os rascunhos que não podem
+  compensar. Onde rascunhar custa mais do que economiza (DeepSeek V4), ele fica
+  desligado ([speculative.md](docs/speculative.md),
+  [tuning.md](docs/tuning.md#speculation-and-reproducibility)).
 
 O motor é um arquivo C por família de modelos (`c/colibri.c` para o GLM-5.2) sobre
 cabeçalhos compartilhados, sem BLAS e sem Python em tempo de execução: o Python
@@ -574,6 +622,58 @@ vivem. Decodificação do GLM-5.2, a partir de
 - **uma única máquina classe laptop com RTX 5070 Ti:** 1,07 tok/s
   ([#273](https://github.com/JustVugg/colibri/issues/273));
 - **o laptop de 25 GB onde isto começou:** 0,05-0,1 tok/s a frio, o piso honesto.
+
+<a id="three-backends-on-one-machine"></a>
+
+### Três backends numa máquina
+
+Um i5-13500 com 62 GB de RAM e uma RTX PRO 4000 Blackwell SFF (24 GB, 70 W),
+cada modelo servido pelo `coli serve`: um prompt novo de 450 tokens, depois uma
+resposta de 128 tokens em streaming, o HTTP da requisição incluído; a melhor de
+duas execuções, tok/s.
+
+| GGUF | CUDA prompt | CUDA decode | Vulkan prompt | Vulkan decode | CPU prompt | CPU decode |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen3.6-35B-A3B UD-Q4_K_M | 3491 | 104,8 | 2076 | 92,9 | 122,6 | 13,9 |
+| LFM3-VL-2B Q4_K_M | 12317 | 235,1 | 8174 | 214,1 | 286,5 | 34,5 |
+| OLMoE-1B-7B-0125-Instruct Q4_K_M | 10418 | 354,6 | 6867 | 299,4 | 279,9 | 47,4 |
+| LFM3-VL-2B F16 | 11524 | 103,4 | 7767 | 99,3 | 49,7 | 6,4 |
+| Qwen3.8-Flash-Next IQ2_XS (68 GB: os especialistas que a placa não comporta ficam na RAM) | 217,1 | 51,4 | 214,3 | 50,6 | 38,3 | 9,3 |
+
+<a id="large-models-on-the-same-machine"></a>
+
+### Modelos grandes na mesma máquina
+
+A máquina D de novo, cada modelo a partir do seu GGUF publicado pelo `coli serve`:
+o que nem a placa nem a RAM guardam vem dos dois NVMe. Tokens por segundo, da
+página de cada modelo:
+
+| GGUF | tamanho | backend | prompt | decode |
+|---|---:|---|---:|---:|
+| Inkling-Small UD-IQ2_XXS | 77 GB | Vulkan | 15,1-33,1 | 10,92-11,53 ([vulkan.md](docs/vulkan.md)) |
+| MiMo-V2.6-Flash Q2_K_S | 106 GB | Vulkan | 8,2 | 7,8 ([gguf.md](docs/gguf.md)) |
+| DeepSeek V4 Flash 0731 UD-IQ2_XXS | 85 GB | Vulkan | 19,7-20,4 | 6,18-6,25 ([vulkan.md](docs/vulkan.md)) |
+| DeepSeek V4.1 Flash UD-IQ1_S |  | Vulkan | 31,8 sobre 3403 tokens | 5,01-5,29 ([deepseek-v41.md](docs/deepseek-v41.md)) |
+| GLM-5.3-Flash UD-IQ2_XXS | 95 GB | Vulkan | 9,3 | 2,92-3,40 ([vulkan.md](docs/vulkan.md)) |
+| Muse Spark Open UD-IQ1_S | 176 GB | Vulkan | 5,0-5,3 | 1,55-1,58 ([qwen36.md](docs/qwen36.md#muse-spark-open)) |
+| Mistral-Large-4 UD-IQ1_S | 233 GB | CUDA | 240 tokens em 66-82 s | 1,34-1,36 ([mistral-large4.md](docs/mistral-large4.md)) |
+| GLM-5.2 UD-IQ1_S | 202 GB | Vulkan |  | 0,633-0,658 ([gguf.md](docs/gguf.md)) |
+| Kimi K3 UD-IQ1_S | 594 GB | Vulkan | 31 tokens em 46,5 s | 0,349 ([gguf.md](docs/gguf.md)) |
+
+### Contextos longos e agentes
+
+- **Um contexto de 256k na velocidade de 64k.** Qwen3.8-Flash-Next IQ2_XS na
+  cadeia CUDA da máquina D, com um contexto de 262144 tokens: prompt de 15,6 a
+  149 tok/s, decode de 9,6 a 45,7 (o plano da RAM a um segmento do prompt, K/V
+  em float16 na placa; a 65536 lê a 188 e decodifica a 48,4)
+  ([qwen38.md](docs/qwen38.md)).
+- **Os turnos de um agente leem só o que é novo.** Uma requisição curta entre dois
+  turnos (um agente pedindo o título da conversa) estaciona a conversa em vez de
+  tomar o seu estado, em todo motor (`COLI_PARK`). O segundo turno do Hermes
+  Agent no Qwen3.8-Flash-Next, 14810 tokens: de 86 s a 4,9 s
+  ([qwen38.md](docs/qwen38.md#an-agents-turns)).
+- **Caches KV em float16**: o GLM-5.3 a 131072 tokens ocupa 11,9 GB em vez de
+  23,9 ([CHANGELOG](CHANGELOG.md)).
 
 A qualidade é medida, não presumida: o custo do contêiner int4 e as ablações de
 quantização estão em
@@ -616,7 +716,8 @@ laço da [#455](https://github.com/JustVugg/colibri/issues/455).
 `./coli convert --model /nvme/glm52_i4` monta o mesmo contêiner a partir da versão
 FP8, shard a shard, sem nunca precisar dos seus 756 GB no disco de uma vez. Como
 conferir o cabeçote MTP e o resto:
-[quickstart.md](docs/quickstart.md#3-get-the-model).
+[quickstart.md](docs/quickstart.md#3-get-the-model). Um GGUF que você já tem não precisa de conversão: `./coli import` no seu primeiro
+arquivo ([acima](#from-a-gguf)).
 
 <a id="3-run-it"></a>
 
@@ -631,6 +732,8 @@ template de chat dele, então os comandos são os mesmos para todo modelo:
 ./coli plan  --model /nvme/qwen36          # where the model will live: VRAM, RAM, disk
 ./coli doctor --model /nvme/qwen36         # read-only check: is everything ready?
 ./coli tune  --model /nvme/qwen36          # measure and save this machine's fastest safe settings
+./coli import /nvme/Flint-UD-Q4_K_XL.gguf  # a GGUF: writes Flint-UD-Q4_K_XL.colibri next to it
+./coli ui                                  # the chat UI, next to a running coli serve
 ```
 
 No Windows, o arquivo de uma versão traz `coli.cmd` (`coli.cmd chat --model
@@ -655,7 +758,7 @@ qualidade medida ao lado da velocidade. As questões em aberto:
 | Um planejador ciente do hardware chega automaticamente perto da melhor configuração de cada máquina | os orçamentos de RAM/VRAM e vários backends são detectados hoje, e a configuração escolhe a compilação | comparar o plano gerado com uma varredura controlada de parâmetros em laptops, workstations, hosts NUMA e sistemas multi-GPU |
 | Representações sem perda ou com qualidade limitada reduzem o movimento de pesos o bastante para importar | existem ablações de formato e quantização, com portões de correção e de qualidade | reproduzir qualidade, bytes movidos, latência e custo por token útil em conjunto, não só a taxa de compressão |
 | Especulação ciente do roteamento compensa antes da residência quase total | os rascunhos por MTP e por gramática funcionam, mas o MTP também mediu 32% de perda perto de 85% de acerto de especialistas | mapear a superfície de equilíbrio entre aceitação, taxa de acerto de especialistas, união do lote e profundidade do rascunho |
-| A sobreposição CPU/GPU esconde transferência e sincronização em vez de apenas mover o gargalo | há ganhos com CUDA, Metal e Vulkan, mas CPUs rápidas, GPUs integradas e baixa residência podem anulá-los | perfis por etapa e A/Bs de uma variável em PCIe, memória unificada e máquinas totalmente residentes, e os primeiros números de GPU dedicada para o tier e a cadeia Vulkan |
+| A sobreposição CPU/GPU esconde transferência e sincronização em vez de apenas mover o gargalo | há ganhos com CUDA, Metal e Vulkan, mas CPUs rápidas, GPUs integradas e baixa residência podem anulá-los | perfis por etapa e A/Bs de uma variável em PCIe, memória unificada e máquinas totalmente residentes, e mais placas dedicadas, para o tier e a cadeia Vulkan, do que a medida (uma RTX PRO 4000) |
 
 Quer ajudar? Escolha uma linha e publique também os resultados negativos.
 Registre o hardware, o commit, o modelo, o comando exato, o prompt, o estado do
@@ -674,10 +777,14 @@ controlada vale mais aqui do que um número rápido sem explicação.
 | Configurar por um assistente de IA, e o servidor MCP | [AI_SETUP.md](docs/AI_SETUP.md), [MCP_SERVER.md](docs/MCP_SERVER.md) |
 | A API: OpenAI, Anthropic, ferramentas, slots de KV, painel | [api.md](docs/api.md) |
 | O System One e os modelos de decisão | [systemone.md](docs/systemone.md), [laya.md](docs/laya.md), [gliner_decide.md](docs/gliner_decide.md), [clef.md](docs/clef.md) |
+| Arquivos GGUF: as arquiteturas, os dois modos, o que cada motor faz com os blocos | [gguf.md](docs/gguf.md) |
+| Os modelos no motor Qwen3.6 (Flint, Muse Spark Open, LFM3-VL) e o Mistral-Large-4 | [qwen36.md](docs/qwen36.md), [mistral-large4.md](docs/mistral-large4.md) |
+| A interface de chat (`coli ui`) | [ui/README.md](ui/README.md) |
 | Vulkan: o tier de especialistas, a cadeia densa, placas sem Resizable BAR | [vulkan.md](docs/vulkan.md) |
 | CUDA, e o tier CUDA do Qwen3.6 | [cuda.md](docs/cuda.md), [qwen36-cuda-tier.md](docs/qwen36-cuda-tier.md) |
 | Apple Silicon, Windows | [metal.md](docs/metal.md), [windows.md](docs/windows.md) |
 | Ajuste, o cache que aprende, prefetch, especulação | [tuning.md](docs/tuning.md) |
+| Decodificação especulativa: os cabeçotes MTP, o prompt lookup, a verificação | [speculative.md](docs/speculative.md) |
 | Vários SSDs, várias máquinas | [multidisk.md](docs/multidisk.md), [cluster.md](docs/cluster.md) |
 | Benchmarks e como medir | [benchmarks.md](docs/benchmarks.md), [benchmarking.md](docs/benchmarking.md) |
 | Toda opção e variável de ambiente | [SETTINGS.md](docs/SETTINGS.md), [ENVIRONMENT.md](docs/ENVIRONMENT.md) |
@@ -689,7 +796,7 @@ controlada vale mais aqui do que um número rápido sem explicação.
 start-here.sh, START-HERE.bat   the one-step setup (Linux and macOS, Windows)
 Makefile                        root build/check entry point
 c/
-├── colibri.c             GLM-5.2/5.3 engine  (make glm)
+├── colibri.c             GLM-5.2/5.3, Mistral-Large-4  (make glm)
 ├── glm53.c               GLM-5.3-Flash  (make glm53)
 ├── inkling.c             Inkling  (make inkling)
 ├── kimi_k3.c             Kimi K3  (make kimi_k3)
@@ -697,7 +804,8 @@ c/
 ├── deepseek_v41.c        DeepSeek V4.1 Flash  (make deepseek_v41)
 ├── mimo.c                MiMo-V2.6 Flash and Pro  (make mimo)
 ├── qwen38.c              Qwen3.8-Flash-Next  (make qwen38)
-├── qwen36.c              Qwen3.6, Qwen3-Coder, Qwen3.8-27B, Clef  (make qwen36)
+├── qwen36.c              Qwen3.6, Qwen3-Coder, Qwen3.8-27B, Flint, Muse Spark,
+│                         LFM3-VL, Clef  (make qwen36)
 ├── olmoe.c               OLMoE  (make olmoe)
 ├── qwenimage.c           Qwen-Image-2.1  (make qwenimage)
 ├── laya.c                Laya  (make laya)
@@ -707,9 +815,10 @@ c/
 ├── expert_ffn.h, expert_store.h routed-expert kernel and streaming expert cache
 ├── tok.h, json.h, compat.h      tokenizer, JSON, Windows/macOS shims
 ├── route_trace.h, kv_prefix.h   routing telemetry (.coli_usage), KV prefix reuse
+├── gguf.h, park.h               GGUF reader, a conversation parked between an agent's turns
 ├── decide_serve.h               the decision engines' side of System One
 │
-├── backend_cuda.*        optional CUDA tier   (CUDA=1)
+├── backend_cuda.*, cu_tier.h, cuda_chain.cu   optional CUDA tier and chains (CUDA=1)
 ├── backend_metal.*       optional Metal tier  (METAL=1)
 ├── backend_vulkan.*, vk_tier.c, vk_chain.c   optional Vulkan tier and dense chain (VK=1)
 │
@@ -720,6 +829,7 @@ c/
 ├── resource_plan.py      RAM/VRAM planner behind coli plan and coli doctor
 ├── tools/                conversion, fixtures and benchmarks
 └── tests/                dependency-free C and Python tests
+ui/                       the chat UI (coli ui)
 web/                      the dashboard (a pure API client)
 desktop/                  Tauri desktop shell around the dashboard
 docker/                   container images
