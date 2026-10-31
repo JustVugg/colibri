@@ -1,0 +1,89 @@
+EP-N routed-expert parallelism — DeepSeek V4 Flash, two-arm wall-clock benchmark
+Date: 2026-10-29 (runs between 2026-10-28 21:00 UTC and 2026-10-29 01:15 UTC local)
+Commit under test (trial): b4c8a587c9da194872f6686631471b258c8b60b5 (branch port-ep-n)
+Baseline commit: same tree, DSV4_CUDA_EP_DEVICES unset (single-device tier).
+
+## Setup (identical command for both arms)
+
+Endpoint: POST /v1/chat/completions via the stack's gate, non-streaming.
+Request body (perf.req):
+
+  {"model":"deepseek-v4-colibri","messages":[{"role":"user","content":"Write the numbers 1 through 120, comma separated."}],"max_tokens":800,"temperature":0}
+
+prompt_hash (sha256 of the user message string):
+  1db6cf2f9827e4e9c450b880f4b1736b0fb9a9b7961dcc90b123f1c5582e8119
+
+Method: one warm-up ("Say READY.", max_tokens 4) after the engine was (re)started,
+then 3 sequential timed runs per arm (all runs of an arm on one engine boot).
+tok_s = completion tokens / whole-turn wall clock, prefill included.
+Engine is greedy (top_p echoed but ignored by the engine), temperature 0.
+
+## Baseline run 1 (single device; DSV4_CUDA_EP_DEVICES unset)
+
+wall_s = 947;  completion_tokens = 358;  tok_s = 0.3780
+content sha256 = 0b810df860cc7958... (prefix of 6a0b..? full hash in section F)
+
+## Baseline run 2
+
+wall_s = 935;  completion_tokens = 358;  tok_s = 0.3829
+content sha256 prefix = 0b810df860cc7958
+
+## Baseline run 3
+
+wall_s = 934;  completion_tokens = 358;  tok_s = 0.3833
+content sha256 prefix = 0b810df860cc7958
+
+Baseline median wall = 935 s;  median tok_s = 0.3829
+
+## Trial run 1 (DSV4_CUDA_EP_DEVICES="0,1")
+
+wall_s = 455;  completion_tokens = 358;  tok_s = 0.7868
+content sha256 prefix = 0b810df860cc7958
+
+## Trial run 2
+
+wall_s = 441;  completion_tokens = 358;  tok_s = 0.8118
+content sha256 prefix = 0b810df860cc7958
+
+## Trial run 3
+
+wall_s = 441;  completion_tokens = 358;  tok_s = 0.8118
+content sha256 prefix = 0b810df860cc7958
+
+Trial median wall = 441 s;  median tok_s = 0.8118
+
+Speedup (median wall): 935 / 441 = 2.12x
+
+## Quality
+
+Every run of BOTH arms produced the identical 358-token response
+(token-exact across arms; sha256 prefix 0b810df860cc7958, full hashes below).
+
+## Engine engagement evidence (trial boot log)
+
+  [DSV4 CUDA] device 0: NVIDIA GeForce RTX 5060 Ti 16.6 GB sm_120
+  [DSV4 CUDA] device 1: NVIDIA GeForce RTX 5060 Ti 16.6 GB sm_120
+  v4_gpu tier=expert-parallel devices=0,1 bands=128/128
+
+nvidia-smi after the trial runs: GPU0 13105 MiB; GPU1 13068 MiB — the peer
+device carries the routed-expert mirror cache during decode.
+Baseline boot log: `v4_gpu tier=dense-matvec device=0`; GPU1 idle
+(681 MiB, an unrelated idle Vulkan context of a second local stack).
+
+Prefill-union engagement (measured on the same tree earlier, 924-token
+prompt, fresh engine boot):
+
+  v4_gpu moe-batch=on bank=256-experts
+  v4_gpu moe-ep=on devices=2
+  (split refills: layer=0 missing=48... upload 0.28s; missing=55 upload 0.34s)
+
+## Full response-content sha256 per run
+
+c1 358 0b810df860cc79589824d7b95382cf40b3dcc3a9f5bf9c3d0ee995bc08afa7af
+c2 358 0b810df860cc79589824d7b95382cf40b3dcc3a9f5bf9c3d0ee995bc08afa7af
+c3 358 0b810df860cc79589824d7b95382cf40b3dcc3a9f5bf9c3d0ee995bc08afa7af
+t1 358 0b810df860cc79589824d7b95382cf40b3dcc3a9f5bf9c3d0ee995bc08afa7af
+t2 358 0b810df860cc79589824d7b95382cf40b3dcc3a9f5bf9c3d0ee995bc08afa7af
+t3 358 0b810df860cc79589824d7b95382cf40b3dcc3a9f5bf9c3d0ee995bc08afa7af
+
+(all six runs, both arms, byte-identical)
