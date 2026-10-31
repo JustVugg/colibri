@@ -2970,9 +2970,9 @@ static void test_hyb_gate(void) {
     CHECK(g.use && g.phase == 3, "hyb gate: the hybrid until an engine reports a forward");
     CHECK(!vkc_hyb_gate_forward(&g, 25.0) && !g.use && g.phase == 0, "hyb gate: the first report starts the probe, the device's reads first");
     int decided = 0;
-    for (int i = 0; i < VKC_HYB_PROBE + 1; i++) decided += vkc_hyb_gate_forward(&g, 20.0);   /* warm + 3 at 20 ms */
+    for (int i = 0; i < VKC_HYB_PROBE + VKC_HYB_WARM; i++) decided += vkc_hyb_gate_forward(&g, 20.0);   /* warm + the probe at 20 ms */
     CHECK(!decided && g.use && g.phase == 1, "hyb gate: then the hybrid steps");
-    for (int i = 0; i < VKC_HYB_PROBE + 1; i++) decided += vkc_hyb_gate_forward(&g, 50.0);   /* the hybrid at 50 ms */
+    for (int i = 0; i < VKC_HYB_PROBE + VKC_HYB_WARM; i++) decided += vkc_hyb_gate_forward(&g, 50.0);   /* the hybrid at 50 ms */
     CHECK(decided == 1 && !g.use && g.phase == 2 && g.probes == 1 && g.gate_off == 1, "hyb gate: the slower hybrid dropped");
     CHECK(g.kept[0] == 50.0 && g.kept[1] == 20.0, "hyb gate: the decision's times, a forward each");
     int settled = 1;
@@ -2980,8 +2980,8 @@ static void test_hyb_gate(void) {
     CHECK(settled, "hyb gate: settled");
     vkc_hyb_gate_forward(&g, 20.0);
     CHECK(g.phase == 0 && !g.use, "hyb gate: measured again after a while, the device's reads first");
-    for (int i = 0; i < VKC_HYB_PROBE + 1; i++) vkc_hyb_gate_forward(&g, 30.0);
-    for (int i = 0; i < VKC_HYB_PROBE + 1; i++) vkc_hyb_gate_forward(&g, 29.0);   /* the hybrid a little faster */
+    for (int i = 0; i < VKC_HYB_PROBE + VKC_HYB_WARM; i++) vkc_hyb_gate_forward(&g, 30.0);
+    for (int i = 0; i < VKC_HYB_PROBE + VKC_HYB_WARM; i++) vkc_hyb_gate_forward(&g, 29.0);   /* the hybrid a little faster */
     CHECK(g.use && g.probes == 2 && g.gate_off == 1, "hyb gate: the hybrid kept where it is not slower");
     VkcHybGate u; vkc_hyb_gate_init(&u, 0);
     for (int i = 0; i < 10; i++) vkc_hyb_gate_forward(&u, 99.0);

@@ -524,7 +524,7 @@ it replaces gave each (head, row) a block that read every K and V row again. On 
 35B, a 1024-token prompt: 226 ms of attention -> 23 ms; a 467-token prompt 819-837 ->
 890-903 tok/s; the loss above 3.2223 -> 3.2271.
 
-On sm_80 and later `cc_attn_f2` takes it instead (one pass, FlashAttention-2's running max
+From sm_75 (a T4) `cc_attn_f2` takes it instead (one pass, FlashAttention-2's running max
 and sum): a block of four warps takes 64 query rows (the query heads of a kv head dividing
 64), so a block of keys is staged once for four times the rows, and its scores never leave
 the registers. The m16n8k16 accumulator is the A operand's layout, so exp(s - m) goes from
@@ -532,8 +532,10 @@ a score tile straight into P V, and each row's output fragments are rescaled as 
 moves. Windows, rings and sinks as `cc_attn_fk` takes them; head dim 256 reads Q from
 shared memory each block (the registers hold O). Flint at 16K tokens (RTX PRO 4000): the
 attention 9.6 s -> 1.09 s, the prompt 671 -> 1032 tok/s before the host pool's GGUF
-staging; Qwen3.6 UD-Q4_K_M 796 -> 1956 tok/s at 16K with both.
-`COLI_CUDA_CHAIN_FLASH2=0` keeps `cc_attn_fk`.
+staging; Qwen3.6 UD-Q4_K_M 796 -> 1956 tok/s at 16K with both. sm_75 has no m16n8k16:
+each is two m16n8k8, the same fragments (k 0-7, then 8-15). Where a card gives less than
+the 66 KiB of shared memory head dim 256 wants (a T4 gives 64), it stages blocks of 16
+keys, 49.5 KiB. `COLI_CUDA_CHAIN_FLASH2=0` keeps `cc_attn_fk`.
 
 On sm_70 and later the same GEMMs run in f16 (`hcg_tile`: `hcg_dense_k`, `hcg_moe_gu_k`,
 `hcg_moe_dn_k`), at twice the TF32 fragments' rate and with a tile that keeps more of the

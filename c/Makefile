@@ -818,6 +818,9 @@ kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
 	$(PYTHON) tests/test_kimi_k3_ckpt.py \
 		--binary ./kimi_k3$(EXE) \
 		--fixture ./kimi_k3_tiny
+	$(PYTHON) tests/kimi_k3_park_harness.py \
+		--binary ./kimi_k3$(EXE) \
+		--fixture ./kimi_k3_tiny
 	$(PYTHON) tests/test_kimi_k3_dashboard.py \
 		--binary ./kimi_k3$(EXE) \
 		--fixture ./kimi_k3_tiny
@@ -2498,6 +2501,10 @@ tests/test_cu_tier$(EXE): tests/test_cu_tier.c $(CUDA_OBJ)
 tests/test_vk_tier$(EXE): tests/test_vk_tier.c $(VK_OBJ) $(VK_SPV)
 	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_tier needs VK=1" >&2; exit 1; }
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+# the hybrid steps' CPU pairs alone (vkt_host_pairs), no device: ./tests/bench_host_pairs [fmt: 2 int4 rows, 4 int4-g64, 1 int8]
+tests/bench_host_pairs$(EXE): tests/bench_host_pairs.c $(VK_OBJ)
+	@[ "$(VK)" = 1 ] || { echo "tests/bench_host_pairs needs VK=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 .PHONY: vk-tier-check
 vk-tier-check: tests/test_vk_tier$(EXE)
 	./tests/test_vk_tier$(EXE) shaders/qmatmul.spv
@@ -2593,6 +2600,10 @@ tests/test_router_nan$(EXE): tests/test_router_nan.c colibri.c $(VK_OBJ)
 
 tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# CPU-only state-policy regression; independent of model files and GPU flags.
+tests/test_glm53_live_prefix$(EXE): tests/test_glm53_live_prefix.c glm53.c
+	$(CC) $(NOCUDA_CFLAGS) -UCOLI_METAL -UCOLI_VULKAN $< -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_compat_direct$(EXE): tests/test_compat_direct.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -3004,6 +3015,10 @@ tests/test_qwen36_tier_promote$(EXE): tests/test_qwen36_tier_promote.c qwen36_ti
 
 # qt_chain_host_follow: after the promotions the host pool is the non-residents again (fake backend).
 tests/test_qwen36_tier_host_pool$(EXE): tests/test_qwen36_tier_host_pool.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# qt_chain_hold: no upload, a free slot's included, while a chain's forward holds the tier (fake backend).
+tests/test_qwen36_tier_hold$(EXE): tests/test_qwen36_tier_hold.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
 tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c qwen36.c qwen36_tier.c $(VK_OBJ)

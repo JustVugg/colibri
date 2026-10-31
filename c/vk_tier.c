@@ -1705,6 +1705,19 @@ static int hy_threads(void) {   /* the CPU's team: COLI_VK_HYBRID_THREADS, else 
     return 1;
 #endif
 }
+/* How the rows of a step's pairs are handed out (host_pairs' loops, schedule(runtime)): in
+ * equal shares (static) unless COLI_VK_HYBRID_SCHED=dynamic (chunks of 8 fours of rows, for
+ * cores that do not run at one speed). libgomp's dynamic handing cost a third of the step
+ * here: a pair of Qwen3.6 int4 on 12 cores of a Threadripper 3945WX 47 us against 37 static
+ * (8 pairs a call; one pair 55 against 44), guided 44, the same bits either way. Set on the
+ * calling thread before its team forms; read once. */
+static void hy_sched(void) {
+#ifdef _OPENMP
+    static int kind = -1;
+    if (kind < 0) { const char *e = getenv("COLI_VK_HYBRID_SCHED"); kind = e && !strcmp(e, "dynamic") ? 1 : 0; }
+    if (kind) omp_set_schedule(omp_sched_dynamic, 8); else omp_set_schedule(omp_sched_static, 0);
+#endif
+}
 /* colibri's int8 (fmt 1, 13), int4 (fmt 2, 4), int3-g64 (fmt 5), MXFP4 (fmt 7) and FP8 (fmt 12)
  * rows. dev_codes: an int4 row's codes in element order (the pairs' low nibble first), 0..15
  * (the value + 8), into u (I bytes). */
@@ -1796,11 +1809,128 @@ static void dev_dequant(float *o, const uint8_t *row, int fmt, const float *rs, 
         o[i] = w * (gs ? rs[i / gs] : rs[0]);
     }
 }
+/* The integer form of colibri's rows without the unpack, and with four sums in flight
+ * (hy_dot4, hy_dot8; dev_dot above is the general form, and the one the other formats keep).
+ * dev_dot wrote an int4 row's codes out in element order first and summed every block into
+ * one accumulator (a 4-cycle chain a block): an expert's pair of Qwen3.6 (D 2048, I 512, 1.57
+ * MB) took 249 us on one core of a Threadripper 3945WX, 6 GB/s. The pairs' layout reads as it
+ * is: 32 bytes of a row hold two blocks of 32, their low nibbles the even elements and the
+ * high ones the odd, so the activation row is permuted once to match (hy_act_prep: a block
+ * pair's 64 codes as the even ones of both blocks, then the odd ones) and one and, one shift,
+ * two maddubs and one madd give eight int32 sums of 8 elements each (block b's four, then
+ * b+1's). The nibbles are v + 8: eight times the sum of each 8 codes (c8, from the act's
+ * l4) comes off before the scale; exact. dx8 holds a block pair's two scales four times each. */
+typedef struct { int8_t *xp; int32_t *c8; float *dx8; int S, I, cap; } HyAct;
+static void hy_act_free(HyAct *h) { free(h->xp); free(h->c8); free(h->dx8); memset(h, 0, sizeof *h); }
+/* a's rows in the pair kernels' form; 0, or -1 out of memory (or I not a multiple of 64: unused) */
+static int hy_act_prep(HyAct *h, const gq_act *a) {
+    const int S = a->S, I = a->I;
+    h->S = 0;
+    if (I % 64) return 0;
+    if ((int64_t)S * I > h->cap) {
+        hy_act_free(h);
+        h->xp = malloc((size_t)S * I); h->c8 = malloc((size_t)S * (I / 8) * sizeof(int32_t)); h->dx8 = malloc((size_t)S * (I / 8) * sizeof(float));
+        if (!h->xp || !h->c8 || !h->dx8) { hy_act_free(h); return -1; }
+        h->cap = S * I;
+    }
+    h->S = S; h->I = I;
+    for (int s = 0; s < S; s++) {
+        const int8_t *q = a->q + (size_t)s * I; const int32_t *l4 = a->l4 + (size_t)s * (I / 4); const float *dx = a->d + (size_t)s * (I / 32);
+        int8_t *xp = h->xp + (size_t)s * I; int32_t *c8 = h->c8 + (size_t)s * (I / 8); float *dx8 = h->dx8 + (size_t)s * (I / 8);
+        for (int p = 0; p < I / 64; p++) {
+            const int8_t *b0 = q + p * 64, *b1 = b0 + 32; int8_t *o = xp + p * 64;
+            for (int j = 0; j < 16; j++) { o[j] = b0[2 * j]; o[16 + j] = b1[2 * j]; o[32 + j] = b0[2 * j + 1]; o[48 + j] = b1[2 * j + 1]; }
+            for (int k = 0; k < 8; k++) { c8[p * 8 + k] = 8 * (l4[p * 16 + 2 * k] + l4[p * 16 + 2 * k + 1]); dx8[p * 8 + k] = dx[2 * p + (k >> 2)]; }
+        }
+    }
+    return 0;
+}
+#if defined(__AVX2__) && defined(__FMA__)
+/* block pair p of an int4 row against the prepared activation: eight scaled sums */
+static inline __m256 hy_pair4(const uint8_t *row, const float *rs, int gs, int g, const int8_t *xp, const int32_t *c8, const float *dx8, int p) {
+    const __m256i m4 = _mm256_set1_epi8(0x0f), one16 = _mm256_set1_epi16(1);
+    const __m256i v = _mm256_loadu_si256((const __m256i *)(row + (size_t)p * 32));
+    const __m256i lo = _mm256_and_si256(v, m4), hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), m4);
+    const __m256i s = _mm256_add_epi16(_mm256_maddubs_epi16(lo, _mm256_loadu_si256((const __m256i *)(xp + (size_t)p * 64))),
+                                       _mm256_maddubs_epi16(hi, _mm256_loadu_si256((const __m256i *)(xp + (size_t)p * 64 + 32))));
+    const __m256i q = _mm256_sub_epi32(_mm256_madd_epi16(s, one16), _mm256_loadu_si256((const __m256i *)(c8 + (size_t)p * 8)));
+    __m256 sc = _mm256_loadu_ps(dx8 + (size_t)p * 8);
+    /* g: the pair's group (gs a multiple of 64, counted by the caller); a group of 32 or an odd
+     * multiple of it splits the pair (the divisions: a rare layout) */
+    if (gs) sc = _mm256_mul_ps(sc, gs % 64 ? _mm256_set_m128(_mm_set1_ps(rs[(2 * p + 1) * 32 / gs]), _mm_set1_ps(rs[2 * p * 32 / gs]))
+                                           : _mm256_set1_ps(rs[g]));
+    return _mm256_mul_ps(_mm256_cvtepi32_ps(q), sc);
+}
+static inline float hy_sum8(__m256 a) {
+    __m128 h = _mm_add_ps(_mm256_castps256_ps128(a), _mm256_extractf128_ps(a, 1));
+    h = _mm_add_ps(h, _mm_movehl_ps(h, h)); h = _mm_add_ss(h, _mm_movehdup_ps(h));
+    return _mm_cvtss_f32(h);
+}
+#endif
+/* an int4 pairs row (fmt 2: rs its scale, gs 0; fmt 4: its groups' of gs) against activation row s of h */
+static float hy_dot4(const uint8_t *row, const float *rs, int gs, const HyAct *h, int s) {
+    const int I = h->I, np = I / 64;
+    const int8_t *xp = h->xp + (size_t)s * I; const int32_t *c8 = h->c8 + (size_t)s * (I / 8); const float *dx8 = h->dx8 + (size_t)s * (I / 8);
+    const int pg = gs && gs % 64 == 0 ? gs / 64 : 0;   /* pairs a group, counted down */
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+    int p = 0, g = 0, left = pg;
+#define HY_NEXT_G if (pg && --left == 0) { g++; left = pg; }
+    for (; p + 4 <= np; p += 4) {
+        a0 = _mm256_add_ps(a0, hy_pair4(row, rs, gs, g, xp, c8, dx8, p)); HY_NEXT_G
+        a1 = _mm256_add_ps(a1, hy_pair4(row, rs, gs, g, xp, c8, dx8, p + 1)); HY_NEXT_G
+        a2 = _mm256_add_ps(a2, hy_pair4(row, rs, gs, g, xp, c8, dx8, p + 2)); HY_NEXT_G
+        a3 = _mm256_add_ps(a3, hy_pair4(row, rs, gs, g, xp, c8, dx8, p + 3)); HY_NEXT_G
+    }
+    for (; p < np; p++) { a0 = _mm256_add_ps(a0, hy_pair4(row, rs, gs, g, xp, c8, dx8, p)); HY_NEXT_G }
+#undef HY_NEXT_G
+    float r = hy_sum8(_mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3)));
+#else
+    float r = 0.f;
+    for (int p = 0; p < np; p++) {
+        int32_t q[8] = {0};
+        for (int j = 0; j < 32; j++) {   /* byte j: elements 2j (low), 2j + 1 of block (j < 16 ? 2p : 2p + 1) */
+            const int blk = j >> 4, jj = j & 15, lane = blk * 4 + (jj >> 2);
+            q[lane] += (row[p * 32 + j] & 15) * xp[p * 64 + blk * 16 + jj] + (row[p * 32 + j] >> 4) * xp[p * 64 + 32 + blk * 16 + jj];
+        }
+        for (int k = 0; k < 8; k++) {
+            float sc = dx8[p * 8 + k] * (gs ? rs[(2 * p + (k >> 2)) * 32 / gs] : 1.f);
+            r += (float)(q[k] - c8[p * 8 + k]) * sc;
+        }
+    }
+    (void)pg;
+#endif
+    return gs ? r : r * rs[0];
+}
+/* an int8 row (fmt 1: rs its scale; 13: its groups') against activation row s of a: dev_dot's
+ * integers, four blocks' sums in flight */
+static float hy_dot8(const int8_t *w8, const float *rs, int gs, const gq_act *a, int s) {
+    const int I = a->I, nb = I / 32;
+    const int8_t *q = a->q + (size_t)s * I; const float *dx = a->d + (size_t)s * nb;
+#if defined(__AVX2__) && defined(__FMA__)
+    const __m256i one16 = _mm256_set1_epi16(1);
+    __m256 acc[4] = {_mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps()};
+    for (int b = 0; b < nb; b++) {
+        const __m256i x = _mm256_loadu_si256((const __m256i *)(q + b * 32)), w = _mm256_loadu_si256((const __m256i *)(w8 + b * 32));
+        const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_sign_epi8(w, w), _mm256_sign_epi8(x, w)), one16);
+        acc[b & 3] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(dx[b] * (gs ? rs[b * 32 / gs] : 1.f)), acc[b & 3]);
+    }
+    float r = hy_sum8(_mm256_add_ps(_mm256_add_ps(acc[0], acc[1]), _mm256_add_ps(acc[2], acc[3])));
+#else
+    float r = 0.f;
+    for (int b = 0; b < nb; b++) {
+        int32_t p = 0;
+        for (int i = 0; i < 32; i++) p += (int32_t)w8[b * 32 + i] * q[b * 32 + i];
+        r += (float)p * dx[b] * (gs ? rs[b * 32 / gs] : 1.f);
+    }
+#endif
+    return gs ? r : r * rs[0];
+}
 /* a row of type t (I inputs; rs its scales, gs their group for colibri's formats) against
  * act a's rows (xf[s] their floats): the CPU's integer form, or with GQ_EXACT=1 its float
  * reference, as its own matmuls would take it. Each activation row its own dot, the same
  * bits whatever rows share the call. tmp: I floats, and for an int4 row I bytes after them. */
-static inline void host_rows(float *y, int ys, const gq_act *a, const float *const *xf, const uint8_t *row, int t, int I,
+static inline void host_rows(float *y, int ys, const gq_act *a, const HyAct *hp, const float *const *xf, const uint8_t *row, int t, int I,
                              float *tmp, const float *rs, int gs) {
     if (t < 0 && (-t == 12 || (-t == 7 && I / gs > 2048)) && !gq_exact_mode()) {   /* FP8 has no integer form: its floats against x's */
         dev_dequant(tmp, row, -t, rs, gs, I);
@@ -1814,6 +1944,14 @@ static inline void host_rows(float *y, int ys, const gq_act *a, const float *con
     }
     if (t < 0 && !gq_exact_mode()) {
         const int fmt = -t;
+        if ((fmt == 2 || fmt == 4) && hp && hp->S == a->S) {   /* the pair kernels: no unpack */
+            for (int s = 0; s < a->S; s++) y[(size_t)s * ys] = hy_dot4(row, rs, gs, hp, s);
+            return;
+        }
+        if (fmt == 1 || fmt == 13) {
+            for (int s = 0; s < a->S; s++) y[(size_t)s * ys] = hy_dot8((const int8_t *)row, rs, gs, a, s);
+            return;
+        }
         uint8_t *u = NULL; const int8_t *w8 = (const int8_t *)row; int zero = 0;
         float half[2048], *rsx = (float *)rs;
         if (fmt == 2 || fmt == 4) { u = (uint8_t *)(tmp + I); dev_codes(u, row, I); zero = 8; }
@@ -1836,6 +1974,20 @@ static inline void host_rows(float *y, int ys, const gq_act *a, const float *con
         for (int i = 0; i < I; i++) acc += (double)tmp[i] * x[i];
         y[(size_t)s * ys] = (float)acc;
     }
+}
+/* host_rows for four consecutive rows (rb bytes apart, their scales nsc floats apart), row r
+ * at y + r * ystep: one check for the four. Four rows sharing one pass over the activation
+ * (a sum in flight per row) was tried and lost to hy_dot4's four sums per row: 183 against
+ * 129 us a pair on one core, 36 against 34 on twelve. */
+static inline void host_rows4(float *y, int ys, int ystep, const gq_act *a, const HyAct *hp, const float *const *xf, const uint8_t *row,
+                              size_t rb, int t, int I, float *tmp, const float *rs, size_t nsc, int gs) {
+    if (t < 0 && (-t == 2 || -t == 4) && hp && hp->S == a->S && !gq_exact_mode()) {
+        for (int s = 0; s < a->S; s++) {
+            for (int r = 0; r < 4; r++) y[(size_t)s * ys + (size_t)r * ystep] = hy_dot4(row + (size_t)r * rb, rs ? rs + (size_t)r * nsc : NULL, gs, hp, s);
+        }
+        return;
+    }
+    for (int r = 0; r < 4; r++) host_rows(y + (size_t)r * ystep, ys, a, hp, xf, row + (size_t)r * rb, t, I, tmp, rs ? rs + (size_t)r * nsc : NULL, gs);
 }
 typedef struct { const uint8_t *g; int p; } HyKey;
 static int hy_key_cmp(const void *a, const void *b) {
@@ -1908,8 +2060,9 @@ static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, in
     HyKey *key = malloc((size_t)np * sizeof(HyKey));
     const float **xo = malloc((size_t)np * sizeof(float *)), **ho = malloc((size_t)np * sizeof(float *));
     gq_act ax = {0}, *ag = calloc((size_t)np, sizeof(gq_act)), *ah = calloc((size_t)np, sizeof(gq_act));
+    HyAct *pg = calloc((size_t)np, sizeof(HyAct)), *ph = calloc((size_t)np, sizeof(HyAct));   /* the pair kernels' form of ag, ah */
     float *xb = NULL, *dq = NULL;
-    if (!xa || !ord || !gs || !gx || !key || !xo || !ho || !ag || !ah) { err = 2; goto out; }
+    if (!xa || !ord || !gs || !gx || !key || !xo || !ho || !ag || !ah || !pg || !ph) { err = 2; goto out; }
     for (int p = 0; p < np; p++) key[p] = (HyKey){hx[p]->g, p};
     qsort(key, (size_t)np, sizeof(HyKey), hy_key_cmp);
     for (int q = 0; q < np; q++) {
@@ -1928,12 +2081,13 @@ static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, in
     if (gq_act_set(&ax, xb, nx, D)) { err = 1; goto out; }
     for (int g = 0; g < ng && !err; g++) {   /* each group's rows of ax */
         for (int q = gs[g]; q < gs[g + 1]; q++) gx[q - gs[g]] = xa[ord[q]];
-        if (gq_act_gather(&ag[g], &ax, gx, gs[g + 1] - gs[g])) err = 2;
+        if (gq_act_gather(&ag[g], &ax, gx, gs[g + 1] - gs[g]) || hy_act_prep(&pg[g], &ag[g])) err = 2;
     }
     if (err) goto out;
     float *dy = dq ? dq : dn;
     /* gate and up of every group, the activation, then down: one parallel region, the
      * rows handed out in chunks (the cores of a hybrid CPU do not run at one speed) */
+    hy_sched();
     #pragma omp parallel num_threads(nt > 0 ? nt : hy_threads())
     {
         const int W = D > I ? D : I;   /* the float reference's row, an int4 row's codes after it */
@@ -1942,24 +2096,35 @@ static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, in
             #pragma omp atomic write
             err = 2;
         }
-        /* a group's rows by eight (gq_rows_f8) where the type has the kernel, one by one where
-         * not or where eight would cross gate into up; 32 rows a grab as before */
+        /* a group's rows by eight (gq_rows_f8 where the type has the kernel; colibri's int4 pairs
+         * in fours through host_rows4), one by one where not or where eight would cross gate into
+         * up; the rows handed out as hy_sched says (schedule(runtime)) */
         const int cgu = (2 * I + 7) / 8, cd = (D + 7) / 8;
-        #pragma omp for schedule(dynamic, 4)
+        #pragma omp for schedule(runtime)
         for (int64_t c = 0; c < (int64_t)ng * cgu; c++) {
             if (!tmp) continue;
             const int g = (int)(c / cgu), o0 = (int)(c % cgu) * 8, o1 = o0 + 8 < 2 * I ? o0 + 8 : 2 * I, q0 = gs[g];
             const VktHostExpert *h = hx[ord[q0]];
-            if (o1 - o0 == 8 && (o1 <= I || o0 >= I) && h->tg >= 0 && gq_f8_ok(h->tg, D)) {
+            const int whole = o1 - o0 == 8 && (o1 <= I || o0 >= I);
+            if (whole && h->tg >= 0 && gq_f8_ok(h->tg, D)) {
                 const int oo = o0 < I ? o0 : o0 - I;
                 gq_rows_f8(gu + (size_t)q0 * 2 * I + o0, 2 * I, &ag[g], (o0 < I ? h->g : h->u) + (size_t)oo * h->rgu, (int64_t)h->rgu, h->tg, D, 8);
+                continue;
+            }
+            const size_t nsc = h->gsgu ? (size_t)(D + h->gsgu - 1) / h->gsgu : 1;
+            if (whole && h->tg < 0) {   /* two fours: one check for each */
+                for (int o = o0; o < o1; o += 4) {
+                    const int oo = o < I ? o : o - I;
+                    host_rows4(gu + (size_t)q0 * 2 * I + o, 2 * I, 1, &ag[g], &pg[g], xo + q0, (o < I ? h->g : h->u) + (size_t)oo * h->rgu, h->rgu,
+                               h->tg, D, tmp, (o < I ? h->sg : h->su) + (size_t)oo * nsc, nsc, h->gsgu);
+                }
                 continue;
             }
             for (int o = o0; o < o1; o++) {
                 const int oo = o < I ? o : o - I;
                 const uint8_t *row = (o < I ? h->g : h->u) + (size_t)oo * h->rgu;
-                const float *rs = h->tg < 0 ? (o < I ? h->sg : h->su) + (size_t)oo * (h->gsgu ? (D + h->gsgu - 1) / h->gsgu : 1) : NULL;
-                host_rows(gu + (size_t)q0 * 2 * I + o, 2 * I, &ag[g], xo + q0, row, h->tg, D, tmp, rs, h->gsgu);
+                const float *rs = h->tg < 0 ? (o < I ? h->sg : h->su) + (size_t)oo * nsc : NULL;
+                host_rows(gu + (size_t)q0 * 2 * I + o, 2 * I, &ag[g], &pg[g], xo + q0, row, h->tg, D, tmp, rs, h->gsgu);
             }
         }
         #pragma omp for schedule(static)
@@ -1974,11 +2139,11 @@ static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, in
         }
         #pragma omp for schedule(static)
         for (int g = 0; g < ng; g++)
-            if (gq_act_set(&ah[g], hh + (size_t)gs[g] * I, gs[g + 1] - gs[g], I)) {
+            if (gq_act_set(&ah[g], hh + (size_t)gs[g] * I, gs[g + 1] - gs[g], I) || hy_act_prep(&ph[g], &ah[g])) {
                 #pragma omp atomic write
                 err = 1;
             }
-        #pragma omp for schedule(dynamic, 8)
+        #pragma omp for schedule(runtime)
         for (int64_t c = 0; c < (int64_t)ng * cd; c++) {
             if (!tmp) continue;
             const int g = (int)(c / cd), o0 = (int)(c % cd) * 8, o1 = o0 + 8 < D ? o0 + 8 : D, q0 = gs[g];
@@ -1987,9 +2152,16 @@ static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, in
                 gq_rows_f8(dy + (size_t)q0 * D + o0, D, &ah[g], h->d + (size_t)o0 * h->rd, (int64_t)h->rd, h->td, I, 8);
                 continue;
             }
+            const size_t nsc = h->gsd ? (size_t)(I + h->gsd - 1) / h->gsd : 1;
+            if (o1 - o0 == 8 && h->td < 0) {
+                for (int o = o0; o < o1; o += 4)
+                    host_rows4(dy + (size_t)q0 * D + o, D, 1, &ah[g], &ph[g], ho + q0, h->d + (size_t)o * h->rd, h->rd, h->td, I, tmp,
+                               h->sd + (size_t)o * nsc, nsc, h->gsd);
+                continue;
+            }
             for (int o = o0; o < o1; o++) {
-                const float *rs = h->td < 0 ? h->sd + (size_t)o * (h->gsd ? (I + h->gsd - 1) / h->gsd : 1) : NULL;
-                host_rows(dy + (size_t)q0 * D + o, D, &ah[g], ho + q0, h->d + (size_t)o * h->rd, h->td, I, tmp, rs, h->gsd);
+                const float *rs = h->td < 0 ? h->sd + (size_t)o * nsc : NULL;
+                host_rows(dy + (size_t)q0 * D + o, D, &ah[g], &ph[g], ho + q0, h->d + (size_t)o * h->rd, h->td, I, tmp, rs, h->gsd);
             }
         }
         free(tmp);
@@ -1998,7 +2170,8 @@ static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, in
 out:
     gq_act_free(&ax);
     for (int g = 0; ag && ah && g < np; g++) { gq_act_free(&ag[g]); gq_act_free(&ah[g]); }
-    free(xa); free(ord); free(gs); free(gx); free(key); free(xo); free(ho); free(ag); free(ah); free(xb); free(dq);
+    for (int g = 0; pg && ph && g < np; g++) { hy_act_free(&pg[g]); hy_act_free(&ph[g]); }
+    free(xa); free(ord); free(gs); free(gx); free(key); free(xo); free(ho); free(ag); free(ah); free(pg); free(ph); free(xb); free(dq);
     return !err;
 }
 int vkt_host_pairs(const VktHostExpert *const *hx, const float *const *xr, int np, int D, int I,

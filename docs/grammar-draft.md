@@ -70,6 +70,12 @@ keys, separators, quotes and enum bodies force everything. Two practical levers:
   difference (worst case the last draft of a span is rejected).
 - Adaptive shut-off below 50% acceptance, so a mismatched grammar degrades to
   baseline speed, never below it for long.
+- Bounded work: a grammar the walker cannot follow cheaply switches it off
+  instead of holding up the engine. Past 64 live stacks (`GR_MAX_STACKS`), a stack
+  deeper than 64 frames (`GR_MAX_DEPTH`, left recursion) or 65,536 steps for one
+  byte (`GR_MAX_WORK`: alternates that fan out into the same stacks, a few hundred
+  bytes of grammar that would walk 2^N paths; a JSON schema's grammar takes at most
+  35) the request runs without grammar drafts, its output unchanged.
 - Benchmarking note (learned the hard way, see #146): hold the PIN hot-store and
   page-cache warmth constant across A/B rungs and report the expert hit-rate
   column next to any tok/s claim.

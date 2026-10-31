@@ -81,6 +81,7 @@
 #include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
 #include "decode_batch.h"
 #include "pin_pool.h"   /* piu scatti annidati dello stato */
+#include "park.h"       /* a short request keeps the one slot's conversation aside (COLI_PARK) */
 #include "prompt_break.h"   /* a served prompt that a STOP or CANCEL stops between two layers */
 #include "route_trace.h"                           /* ROUTE_TRACE + .coli_usage, engine-agnostic (#700) */
 #include "kv_fp8.h"                               /* KV8=1: cache latente in fp8 e4m3 + scala per-riga */
@@ -9079,7 +9080,7 @@ static int grammar_setup_text(GrDraft *g, Tok *T, char *txt, const char *label){
     if(gr_parse(&g->gram,txt)){ fprintf(stderr,"[GRAMMAR] %s: %s\n",label,g->gram.err); free(txt); return -1; }
     free(txt);
     gr_state_init(&g->st,&g->gram);
-    if(!g->st.alive){ fprintf(stderr,"[GRAMMAR] %s: grammar cannot be evaluated (left recursion?)\n",label); return -1; }
+    if(!g->st.alive){ fprintf(stderr,"[GRAMMAR] %s: grammar cannot be evaluated (left recursion, or alternates that fan out past the walker's budget)\n",label); return -1; }
     if(g->max<1) g->max=24;
     if(g->max>48) g->max=48;
     g->T=T; g->on=1; g->armed=0;
@@ -11365,7 +11366,7 @@ static void coli_kv_share_adopt_rows(Cfg *cc, KVState *sc, KVState *dn,
             memcpy(coli_kv_row(sc->Rc[l],from,cc->qk_rope),
                    coli_kv_row(dn->Rc[l],from,cc->qk_rope),
                    (size_t)n*cc->qk_rope*sizeof(float));
-        if(sc->Ic&&dn->Ic&&sc->Ic[l]&&dn->Ic[l])
+        if(l<cc->n_layers&&sc->Ic&&dn->Ic&&sc->Ic[l]&&dn->Ic[l])   /* Ic has no MTP row (kv_alloc) */
             memcpy(coli_kv_row(sc->Ic[l],from,cc->index_hd),
                    coli_kv_row(dn->Ic[l],from,cc->index_hd),
                    (size_t)n*cc->index_hd*sizeof(float));
@@ -11391,6 +11392,67 @@ static void coli_kv_share_adopt_rows(Cfg *cc, KVState *sc, KVState *dn,
         }
     }
     memcpy(sc_hist+from,dn_hist+from,(size_t)n*sizeof(int));
+}
+
+/* A short request between two turns of the one slot's conversation (park.h): a client's title
+ * or summary request leaves the conversation after a few tokens, and its rows would take the
+ * slot's from there on; the conversation's next turn then read it all again (minutes on the
+ * largest models). The slot's first rows of every KV array (the latent and rope rows, the DSA
+ * index keys, the coded rows and their scales, the MTP layer's), its tokens and its layers'
+ * first rows go aside before the request reads its prompt; the next request finds them back,
+ * and the devices' copies go up again from the host, whose rows stay the canonical ones. One
+ * slot only (KV_SLOTS=1), never under a cluster (its workers hold their layers' rows), a
+ * picture or a read-out. */
+#define GLM_PARK_SPEC 16   /* the rows a speculative turn writes past the tokens that stand */
+static ColiPark g_glm_park;
+static int g_glm_park_from;   /* the request's shared prefix: the KV file's rows past it are the request's */
+static ColiParkPart *glm_park_parts(Model *m, KVState *k, int *n_out){
+    Cfg *cc=&m->c; int NR=cc->n_layers+1, T=k->max_t, n=0;
+    ColiParkPart *p=malloc(sizeof(ColiParkPart)*((size_t)NR*7+1));
+    if(!p){ *n_out=0; return NULL; }
+    for(int l=0;l<NR;l++){
+        p[n++]=coli_park_rows(k->Lc?k->Lc[l]:NULL,(size_t)cc->kv_lora*sizeof(float),T);
+        p[n++]=coli_park_rows(k->Rc?k->Rc[l]:NULL,(size_t)cc->qk_rope*sizeof(float),T);
+        p[n++]=coli_park_rows(k->Ic&&l<cc->n_layers?k->Ic[l]:NULL,(size_t)cc->index_hd*sizeof(float),T);   /* no MTP row: Ic has n_layers */
+        if(kv_coded()){
+            p[n++]=coli_park_rows(k->Lc8?k->Lc8[l]:NULL,(size_t)kv_lrow_bytes(cc->kv_lora),T);
+            p[n++]=coli_park_rows(k->Rc8?k->Rc8[l]:NULL,(size_t)kv_rrow_bytes(cc->qk_rope),T);
+            if(!g_kv16){
+                int nsl=g_kv8?coli_kv8_nscale(cc->kv_lora,g_kv8_gs):1;
+                p[n++]=coli_park_rows(k->Lsc?k->Lsc[l]:NULL,(size_t)nsl*sizeof(float),T);
+                p[n++]=coli_park_rows(k->Rsc?k->Rsc[l]:NULL,sizeof(float),T);
+            }
+        }
+    }
+    p[n++]=coli_park_whole(k->kv_start,(size_t)NR*sizeof(int));
+    *n_out=n;
+    return p;
+}
+static void glm_park(Model *m, ServeCtx *sc, int nt, int max_tokens, int prefix, int maxctx){
+    kv_prefix v={sc->hist,sc->len,maxctx,0};
+    int n=coli_park_rows_for(&g_glm_park,&v,sc->len,nt,max_tokens,GLM_PARK_SPEC), np=0;
+    if(!n) return;
+    ColiParkPart *p=glm_park_parts(m,&sc->kv,&np);
+    if(p && coli_park_save(&g_glm_park,&v,sc->len,p,np,n)) g_glm_park_from=prefix;
+    free(p);
+}
+static void glm_unpark(Model *m, ServeCtx *sc, int maxctx){
+    if(!g_glm_park.on) return;
+    int np=0, len=sc->len;
+    ColiParkPart *p=glm_park_parts(m,&sc->kv,&np);
+    if(!p){ coli_park_free(&g_glm_park); return; }
+    kv_prefix v={sc->hist,sc->len,maxctx,0};
+    if(coli_park_restore(&g_glm_park,&v,&len,sc->len,GLM_PARK_SPEC,p,np)){
+        sc->len=len; sc->first=0;
+        /* the host's rows from 0 are the conversation's again: every device copy goes up again */
+        if(m->kv==&sc->kv && m->kv_dev_valid) for(int i=0;i<m->c.n_layers+1;i++) m->kv_dev_valid[i]=0;
+#ifdef COLI_VULKAN
+        if(m->kv==&sc->kv && m->vk_kv_valid) for(int i=0;i<m->c.n_layers+1;i++) m->vk_kv_valid[i]=0;
+        glmc_host_rows(m,&sc->kv,0);
+#endif
+        kv_disk_truncate(m,g_glm_park_from);   /* the next append writes the conversation's rows past it */
+    }
+    free(p);
 }
 
 /* Read and prefill one request. Returns -1 on EOF, 0 for a rejected frame and
@@ -11453,7 +11515,24 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
         printf("ERROR %llu NOT_FOUND\n",id); fflush(stdout); free(line); return 0;
     }
     ColiSubmit sub; int valid=coli_submit_parse(line,&sub);
-    if(!valid){ printf("ERROR 0 BAD_REQUEST\n"); fflush(stdout); free(line); return 0; }
+    if(!valid){
+        /* A header this engine cannot read (an extension key where it reads the grammar's byte
+         * count, a field out of range): when its id and its payload's length are readable the
+         * request is answered by its id and the payload drained, so the gateway ends that
+         * request instead of waiting for it, and the payload is not read as commands. */
+        unsigned long long bid=0, bb=0; int bslot=0;
+        if(sscanf(line,"SUBMIT %llu %d %llu",&bid,&bslot,&bb)==3 && bid && bb<=(1ull<<30)){
+            char tmp[4096];
+            for(unsigned long long left=bb; left; ){
+                size_t k=left<sizeof tmp?(size_t)left:sizeof tmp;
+                if(fread(tmp,1,k,stdin)!=k){ free(line); return -1; }
+                left-=k;
+            }
+            (void)fgetc(stdin);   /* the payload's newline */
+            printf("ERROR %llu BAD_REQUEST\n",bid);
+        } else printf("ERROR 0 BAD_REQUEST\n");
+        fflush(stdout); free(line); return 0;
+    }
     char *raw=malloc((size_t)sub.bytes+1);
     if(!raw){ fprintf(stderr,"OOM multiplex payload\n"); exit(1); }
     if(fread(raw,1,(size_t)sub.bytes,stdin)!=(size_t)sub.bytes){ free(raw); free(line); return -1; }
@@ -11499,6 +11578,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
         }
     }
     ServeCtx *sc=&ctx[sub.slot]; kv_bind(m,&sc->kv);
+    if(nctx==1) glm_unpark(m,sc,maxctx);   /* a conversation the last request parked: back first */
     int *tmp=malloc(maxctx*sizeof(int));
     if(!tmp){ fprintf(stderr,"OOM mux_submit tmp\n"); free(raw); free(line); exit(1); }
     /* Encode with one token of headroom (maxctx-1, buffer is maxctx) purely to DETECT overflow:
@@ -11584,6 +11664,8 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
      * (the same [IMG] tokens may stand for another picture) */
     if(vis_first>=0 && prefix>vis_first) prefix=vis_first;
     if(sc->vis_end>0 && prefix>sc->vis_end-1) prefix=sc->vis_end-1;
+    if(nctx==1 && !echo && vis_first<0 && sc->vis_end==0 && !g_cluster_n && prefix<sc->len)
+        glm_park(m,sc,nt,sub.max_tokens,prefix,maxctx);   /* a short request keeps the conversation (glm_unpark) */
     if(prefix<sc->len){ sc->len=prefix; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
         kv_disk_truncate(m,sc->len); }
     /* Cross-slot prefix adoption (COLI_KV_SHARE=1): if another slot's history

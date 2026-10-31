@@ -41,6 +41,7 @@ class Glm53HarnessSkipTest(unittest.TestCase):
                 "tiny": ["--binary", "glm53", "--fixture", missing],
                 "multimodal_tiny": ["--binary", "glm53", "--fixture", missing],
                 "pin_branch": ["--binary", "glm53", "--fixture", missing],
+                "live_prefix": ["--binary", "glm53", "--fixture", missing],
                 "serve": ["--binary", "glm53", "--fixture", missing],
                 "streaming": ["--binary", "glm53", "--quantized", missing,
                               "--dequantized", missing],
@@ -86,6 +87,10 @@ class Glm53TinyOracleTest(unittest.TestCase):
     def test_pin_branch_harness(self):
         """A pin is not restored over rows another branch rewrote (#1750)."""
         self.run_oracle("pin_branch", "GLM53_MM_TINY")
+
+    def test_valid_live_prefix_and_overflow(self):
+        """Keep valid recurrent state, preserve predictor pins, reject overflow safely."""
+        self.run_oracle("live_prefix", "GLM53_MM_TINY")
 
 
 if __name__ == "__main__":

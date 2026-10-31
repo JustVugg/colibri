@@ -41,10 +41,13 @@ static inline float coli_sa_hsum(__m256 v) {
     low = _mm_add_ss(low, _mm_shuffle_ps(low, low, 0x55));
     return _mm_cvtss_f32(low);
 }
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+#define COLI_SPARSE_ATTN_NEON 1
 #endif
 
-/* The reading of the kernel, one multiply at a time. Kept because it is what the
- * vector path is checked against, and because a machine without AVX2 runs it. */
+/* The reading of the kernel, one multiply at a time. Kept as the numerical oracle
+ * and for targets without AVX2 or ARM NEON. */
 static inline void coli_sparse_attend_scalar(float *out, const float *q, const float *kv,
                                              const int *idx, int count, int hd,
                                              float sink, float scale, float *score) {
@@ -72,9 +75,9 @@ static inline void coli_sparse_attend_scalar(float *out, const float *q, const f
 static inline void coli_sparse_attend(float *out, const float *q, const float *kv,
                                       const int *idx, int count, int hd,
                                       float sink, float scale, float *score) {
-#if !defined(__AVX2__)
+#if !defined(__AVX2__) && !defined(COLI_SPARSE_ATTN_NEON)
     coli_sparse_attend_scalar(out, q, kv, idx, count, hd, sink, scale, score);
-#else
+#elif defined(__AVX2__)
     float best = -1e30f;
     for (int j = 0; j < count; j++) {
         if (idx[j] < 0) { score[j] = -INFINITY; continue; }
@@ -115,6 +118,45 @@ static inline void coli_sparse_attend(float *out, const float *q, const float *k
     i = 0;
     for (; i + 8 <= hd; i += 8)
         _mm256_storeu_ps(out + i, _mm256_div_ps(_mm256_loadu_ps(out + i), d));
+    for (; i < hd; i++) out[i] /= denom;
+#else
+    float best = -1e30f;
+    for (int j = 0; j < count; j++) {
+        if (idx[j] < 0) { score[j] = -INFINITY; continue; }
+        const float *k = kv + (size_t)idx[j] * hd;
+        float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+        float32x4_t a2 = vdupq_n_f32(0.0f), a3 = vdupq_n_f32(0.0f);
+        int i = 0;
+        for (; i + 16 <= hd; i += 16) {
+            a0 = vfmaq_f32(a0, vld1q_f32(q + i),      vld1q_f32(k + i));
+            a1 = vfmaq_f32(a1, vld1q_f32(q + i + 4),  vld1q_f32(k + i + 4));
+            a2 = vfmaq_f32(a2, vld1q_f32(q + i + 8),  vld1q_f32(k + i + 8));
+            a3 = vfmaq_f32(a3, vld1q_f32(q + i + 12), vld1q_f32(k + i + 12));
+        }
+        float dot = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+        for (; i < hd; i++) dot += q[i] * k[i];
+        score[j] = dot * scale;
+        if (score[j] > best) best = score[j];
+    }
+    float denom = expf(sink - best);
+    int i = 0;
+    for (; i + 4 <= hd; i += 4) vst1q_f32(out + i, vdupq_n_f32(0.0f));
+    for (; i < hd; i++) out[i] = 0.0f;
+    for (int j = 0; j < count; j++) {
+        if (!(score[j] > -INFINITY)) continue;
+        float weight = expf(score[j] - best);
+        denom += weight;
+        const float *k = kv + (size_t)idx[j] * hd;
+        float32x4_t w = vdupq_n_f32(weight);
+        i = 0;
+        for (; i + 4 <= hd; i += 4)
+            vst1q_f32(out + i, vfmaq_f32(vld1q_f32(out + i), w, vld1q_f32(k + i)));
+        for (; i < hd; i++) out[i] += weight * k[i];
+    }
+    float32x4_t d = vdupq_n_f32(denom);
+    i = 0;
+    for (; i + 4 <= hd; i += 4)
+        vst1q_f32(out + i, vdivq_f32(vld1q_f32(out + i), d));
     for (; i < hd; i++) out[i] /= denom;
 #endif
 }

@@ -50,6 +50,7 @@
 #include "omp_tune.h"
 #include "route_trace.h"                    /* shared routing telemetry (#700) */
 #include "kv_prefix.h"
+#include "park.h"      /* a short request keeps the conversation aside (COLI_PARK) */
 #include "prompt_break.h"   /* a served prompt that a CANCEL stops between two layers */
 #include "pin_pool.h"                       /* piu scatti annidati */   /* riuso del prefisso tra turni (shared) */
 #include "serve_codec.h"
@@ -2753,6 +2754,53 @@ static int kv_prefix_off(void){ const char *e = getenv("COLI_KV_PREFIX"); return
 /* The counters when a request's prefill began: DONE and PROF report its share. */
 typedef struct { double t0, attn0, moe0, head0; uint64_t h0, m0, disk0; long long fwd0; } OlmReqClock;
 
+/* A short request between two turns of the conversation the Model holds (park.h): the
+ * conversation's first rows of every layer's K and V aside with its tokens, back when the
+ * request's turn ends. The chains keep their rows on the device: the host's cache takes them
+ * all first, and after the conversation is back every mirror goes up again from the host. */
+static ColiPark g_olm_park;
+/* a token's bytes for COLI_PREFIX_LOG (kv_prefix_miss_log), through the request's tokenizer */
+static void olm_decode_one(int id, unsigned char *out, int *n) {
+    *n = g_echo_tok ? tok_decode(g_echo_tok, &id, 1, (char *)out, 255) : 0;
+    if (*n < 0) *n = 0;
+}
+static ColiParkPart *olm_park_parts(Model *m) {
+    Cfg *c = &m->c; size_t row = (size_t)c->head_dim * sizeof(float), hs = (size_t)m->max_t * row;
+    ColiParkPart *p = malloc((size_t)2 * c->n_layers * sizeof *p);
+    for (int i = 0; p && i < c->n_layers; i++) {
+        p[2 * i] = coli_park_heads(m->K[i], row, m->max_t, c->n_heads, hs);
+        p[2 * i + 1] = coli_park_heads(m->V[i], row, m->max_t, c->n_heads, hs);
+    }
+    return p;
+}
+static void olm_park(Model *m, int np, int max_tok) {
+    int n = m->K && m->V ? coli_park_rows_for(&g_olm_park, &m->kvp, m->kv_len, np, max_tok, 1) : 0;
+    if (!n) return;
+#ifdef COLI_VULKAN
+    olc_host_all(m, m->kv_len);
+#endif
+#ifdef COLI_CUDA
+    occ_host_all(m, m->kv_len);
+#endif
+    ColiParkPart *p = olm_park_parts(m);
+    if (p) coli_park_save(&g_olm_park, &m->kvp, m->kv_len, p, 2 * m->c.n_layers, n);
+    free(p);
+}
+static void olm_unpark(Model *m) {
+    if (!g_olm_park.on) return;
+    ColiParkPart *p = olm_park_parts(m);
+    if (!p) { coli_park_free(&g_olm_park); return; }
+    if (coli_park_restore(&g_olm_park, &m->kvp, &m->kv_len, m->kv_len, 1, p, 2 * m->c.n_layers)) {
+#ifdef COLI_VULKAN
+        olc_host_wrote(m, m->kvp.fed, m->kv_len);
+#endif
+#ifdef COLI_CUDA
+        occ_host_wrote(m, m->kvp.fed, m->kv_len);
+#endif
+    }
+    free(p);
+}
+
 /* A request's prompt into the KV the Model holds: its tokens, the budget, the
  * prefix reuse and the pins, the prefill and its read-out. 1 with the prompt's ids
  * and the logits after it; 0 when the request ended here, its ERROR written.
@@ -2830,11 +2878,27 @@ static int olm_serve_start(Model *m, Tok *T, SReq *q, int ctx_cap, int **ids_out
         }
     }
     g_echo_k = q->logprobs; g_echo_id = q->id; g_echo_tok = T;
+    int partial = 0;
+    if (!reuse && getenv("COLI_PREFIX_LOG")) kv_prefix_miss_log(&m->kvp, ids, np, olm_decode_one);
+    if (!reuse && lone) olm_park(m, np, q->max_tok);   /* a short request keeps the conversation (olm_unpark) */
+    if (!reuse && !kv_prefix_off() && q->logprobs == 0) {
+        /* Attention alone: the rows of the positions this prompt shares with what the cache
+         * holds are its rows too, whatever followed them (a client that sends an answer back
+         * without its reasoning, or changes a turn, leaves the conversation there). The rows
+         * past them are a stale tail the prompt overwrites. A read-out asks a frame for every
+         * position, so it reads the whole prompt. */
+        int d = kv_prefix_common(&m->kvp, ids, np);
+        if (d > 0) {
+            kv_prefix_clear(&m->kvp);
+            kv_prefix_record(&m->kvp, ids, 0, d);
+            m->kv_len = d; reuse = d; partial = 1;
+        }
+    }
     if (!reuse) kv_prefix_clear(&m->kvp);
     if (getenv("COLI_PREFIX_LOG")) {
         if (reuse)
-            fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens (%.0f%%)\n",
-                    reuse, np, 100.0 * reuse / np);
+            fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens (%.0f%%)%s\n",
+                    reuse, np, 100.0 * reuse / np, partial ? ", up to where it leaves the held state" : "");
         else
             fprintf(stderr, "[PREFIX] no reuse: held=%d cap=%d prompt=%d\n",
                     m->kvp.len, m->kvp.cap, np);
@@ -2890,7 +2954,7 @@ static int olm_serve_start(Model *m, Tok *T, SReq *q, int ctx_cap, int **ids_out
     return 1;
 }
 
-static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
+static int serve_one_turn(Model *m, Tok *T, SReq *q, int ctx_cap) {
     Cfg *c = &m->c;
     int *ids = NULL, np = 0; float *logit = NULL; OlmReqClock clk;
     if (!olm_serve_start(m, T, q, ctx_cap, &ids, &np, &logit, &clk, 1)) return 0;
@@ -2956,6 +3020,12 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     serve_hits(m);
     free(ids);
     return 0;
+}
+/* one request on its own; a conversation it parked comes back when its turn ends */
+static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
+    int r = serve_one_turn(m, T, q, ctx_cap);
+    olm_unpark(m);
+    return r;
 }
 
 /* dashboard HWINFO/TIERS/EMAP: same lines the other serve-capable engines

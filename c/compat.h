@@ -294,10 +294,12 @@ static inline ssize_t compat_getline(char **lineptr, size_t *n, FILE *stream){
  * posix_memalign(4096) e il percorso DIRECT=1 del motore allinea gia' offset
  * e len); richieste non allineate falliscono con -1, mai dati corrotti.
  * Il fd si usa con la normale pread() (compat_pread -> ReadFile+OVERLAPPED). */
+/* compat_pread owns a separate completion event per call. The shared direct
+ * descriptor must be overlapped too, otherwise Windows serializes its reads. */
 static inline int compat_open_direct(const char *path){
     HANDLE h = CreateFileA(path, GENERIC_READ,
                            FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
-                           NULL, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, NULL);
+                           NULL, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, NULL);
     if(h == INVALID_HANDLE_VALUE) return -1;
     int fd = _open_osfhandle((intptr_t)h, _O_RDONLY|_O_BINARY);
     if(fd < 0){ CloseHandle(h); return -1; }

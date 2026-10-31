@@ -19,7 +19,7 @@
 
 ```
 $ ./coli chat
-  colibri v2.0.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU
+  colibri v2.1.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! Come posso aiutarti oggi?
@@ -265,20 +265,29 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 
 `coli web` 会打开它，一步安装程序也会：包括聊天、System One 页面、大脑（Brain）页面和性能剖析（Profiling）页面，支持浅色和深色主题。
 
-<p align="center">
-  <img src="docs/media/colibri-dashboard.png" width="900" alt="colibri 网页仪表盘：聊天、实时指标、硬件面板、专家存储层级">
-</p>
-<p align="center"><em>Qwen3.6 在 CPU 机器上作答，专家从磁盘流式读取。</em></p>
+### 新的聊天界面
+
+`coli ui` 在正在运行的 `coli serve` 旁边打开新的聊天界面：推理有自己的区块，带视觉塔的模型可以看图片，还有网页搜索、专家地图、实时监视器，以及已经指向 colibri 的编程智能体。支持七种语言。参见 [ui/README.md](ui/README.md)。
 
 <p align="center">
-  <img src="docs/media/colibri-brio.png" width="900" alt="System One 页面：文档只读一次，每个允许的答案各有一个概率，并给出一个熵">
+  <img src="docs/media/ui/ui-chat.png" width="900" alt="新的聊天界面：一个问题、折叠的推理、回答及其速度">
 </p>
-<p align="center"><em><strong>System One</strong>：给模型一份文档，以及它唯一可以选择的几个答案。图中：<strong>request changes 的概率为 99.9%</strong>，熵 0.005，读取 4 个 token，生成 0 个。</em></p>
+<p align="center"><em>LFM3-VL-2B 在 i5-13500 的 CPU 上，32 tok/s。</em></p>
 
 <p align="center">
-  <img src="docs/media/colibri-brain.png" width="900" alt="大脑页面：GLM-5.2 的实测专家图谱绘成一块皮层，有十个可进入的区域">
+  <img src="docs/media/ui/ui-monitor.png" width="900" alt="监视器：模型状态、速度、已写出的 token、提示词、引擎的 CPU 和内存">
 </p>
-<p align="center"><em><strong>大脑（Brain）</strong>：GLM-5.2 的<a href="https://github.com/JustVugg/colibri/issues/175">实测专家图谱</a>，13,260 个已分析的专家分布在十个区域（Python、SQL、数学、诗歌、法律、中文……），位置取决于实测的路由亲和度。<strong>Live routing</strong> 显示正在运行的模型：每个专家一格，颜色表示存储层级，一轮中每个被路由到的专家都会闪烁。</em></p>
+<p align="center"><em>LFM3-VL-2B 写作时的<strong>监视器</strong>：31.6 tok/s，提示词 0.1 秒读完，内存 2.1 GB。</em></p>
+
+<p align="center">
+  <img src="docs/media/ui/ui-experts.png" width="900" alt="打开专家地图的聊天：OLMoE 16 个区块中每个专家一格">
+</p>
+<p align="center"><em>OLMoE 在聊天旁打开<strong>专家地图</strong>：每个区块中每个专家一格，本步选中的为白色，本次回答用到的为琥珀色。</em></p>
+
+<p align="center">
+  <img src="docs/media/ui/ui-systemone.png" width="900" alt="System One 页面：一个拉取请求只读一次，每个允许的答案各有一个概率，以及模型有多确定">
+</p>
+<p align="center"><em><strong>System One</strong>：给模型一份文档，以及它唯一可以选择的几个答案。图中 RTX PRO 4000 上的 Qwen3.6-35B 读取一个破坏了缓存大小上限的拉取请求：<strong>request changes 的概率为 81%</strong>，熵 0.56（不确定），读取 98 个 token，生成 0 个。</em></p>
 
 **性能剖析**（Profiling）页面按阶段显示每一轮的时间花在了哪里，并以最近 30 轮作为趋势。
 

@@ -4661,6 +4661,16 @@ static int slot_pin_restore(const GModel *m, KVSlot *slot, const int *tokens, in
     return 0;
 }
 
+/* A valid live extension already owns newer recurrent state than an older
+ * pin. Only restore a pin when live reuse failed or a predictor is needed
+ * for logprobs/images. Keep that distinction at the actual request callsite. */
+static int slot_pin_for_request(const GModel *m, KVSlot *slot, const int *tokens,
+                                int n, int common, int live_shared,
+                                int needs_predictor) {
+    if (live_shared > 0 && !needs_predictor) return 0;
+    return slot_pin_restore(m, slot, tokens, n, common);
+}
+
 /* Lo stato KDA della sessione, dentro o fuori da uno scatto. Il buffer si
  * alloca la prima volta e poi si riusa (~149 MiB), 34 strati lineari da
  * 64x128x128 piu' la finestra della convoluzione. */
@@ -5051,6 +5061,9 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
                                                           g_pending.grid_h, g_pending.grid_w))
                              : KV_IMAGE_KEY_NONE);
 
+    /* Validation is complete. Let the gateway commit streaming headers and
+     * send keepalives before prefix restoration or a potentially long prefill. */
+    serve_line("ACCEPT %llu %d\n", q->id, prompt_tokens);
     const double started = now_s();
     const double s_attn = m->t_attn, s_ffn = m->t_ffn, s_disk = m->t_disk, s_head = m->t_head;
     const uint64_t s_fw = m->forwards;
@@ -5110,11 +5123,10 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     }
     slot->tail_len = 0;
     slot->blank_len = 0;
-    /* La fotografia si prova sempre, non solo quando il riuso in avanti
-     * fallisce: se lo stato vivo e gia il prompt condiviso, il riuso normale
-     * scatterebbe lo stesso ma il primo token fresco resterebbe senza
-     * predittore, e quindi senza logprob, proprio quello che serve. */
-    int pinned = resume ? 0 : slot_pin_restore(m, slot, sequence, total, common);
+    /* Preserve a valid plain-text live extension. Logprob/image requests
+     * retain the pin predictor and key-validation behavior. */
+    int pinned = resume ? 0 : slot_pin_for_request(m, slot, sequence, total,
+                                                  common, shared, !plain);
     if (pinned > 0) { shared = pinned; why = "pin"; }
     if (shared <= 0) {
         slot_reset(m, slot);

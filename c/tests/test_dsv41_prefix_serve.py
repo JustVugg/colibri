@@ -87,6 +87,9 @@ class Dsv41PrefixServeTest(PrefixReuseContract, PromptCancelContract, unittest.T
     # engine starts over (model_reset, 0 tokens held), and the next turn reads its prompt whole
     PROMPT_CANCEL_KEEPS_PREFIX = False
 
+    # a short request between two turns parks the conversation (park.h)
+    PARKS = True
+
     # This fixture's vocabulary is the byte range, so a reply survives the round
     # trip and the replay scenario can require reuse to fire. It is also the
     # scenario that covers the speculative rollback: DSpark drafts through that

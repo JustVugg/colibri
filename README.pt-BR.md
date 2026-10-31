@@ -30,7 +30,7 @@ motor Qwen3.6. [Qual deles para a minha máquina](#which-model-for-my-machine)
 
 ```
 $ ./coli chat
-  colibri v2.0.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU
+  colibri v2.1.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! Come posso aiutarti oggi?
@@ -440,24 +440,33 @@ inteiro, as regras de pontuação e onde isso não ajuda:
 O `coli web` o abre, e a configuração de um passo também: o chat, a página do
 System One, a página do Brain e a página de Profiling, em tema claro ou escuro.
 
-<p align="center">
-  <img src="docs/media/colibri-dashboard.png" width="900" alt="o painel web do colibri: chat, métricas ao vivo, painel de hardware, tiers de especialistas">
-</p>
-<p align="center"><em>O Qwen3.6 respondendo numa máquina só com CPU, especialistas transmitidos do disco.</em></p>
+### O novo chat
+
+O `coli ui` abre o novo chat ao lado de um `coli serve` em execução: o raciocínio no seu próprio bloco,
+imagens para os modelos com torre de visão, busca na web, o mapa de especialistas, um monitor ao vivo e os
+agentes de programação já apontados para o colibri. Sete idiomas. Veja [ui/README.md](ui/README.md).
 
 <p align="center">
-  <img src="docs/media/colibri-brio.png" width="900" alt="a página System One: um documento lido uma vez, uma probabilidade para cada resposta permitida, e uma entropia">
+  <img src="docs/media/ui/ui-chat.png" width="900" alt="o novo chat: uma pergunta, o raciocínio recolhido, a resposta e a sua velocidade">
 </p>
-<p align="center"><em><strong>System One</strong>: dê ao modelo um documento e as únicas respostas que ele pode escolher. Aqui:
-<strong>request changes a 99,9%</strong>, entropia 0,005, 4 tokens lidos, 0 gerados.</em></p>
+<p align="center"><em>LFM3-VL-2B na CPU de um i5-13500, 32 tok/s.</em></p>
 
 <p align="center">
-  <img src="docs/media/colibri-brain.png" width="900" alt="a página Brain: o atlas de especialistas medido do GLM-5.2 desenhado como um córtex, dez regiões para entrar">
+  <img src="docs/media/ui/ui-monitor.png" width="900" alt="o monitor: o estado do modelo, a velocidade, os tokens escritos, o prompt, a CPU e a RAM do motor">
 </p>
-<p align="center"><em>O <strong>Brain</strong>: o <a href="https://github.com/JustVugg/colibri/issues/175">atlas de especialistas medido</a> do GLM-5.2,
-13.260 especialistas caracterizados em dez regiões (Python, SQL, matemática, poesia, direito, chinês...), posicionados pela
-afinidade de roteamento medida. O <strong>roteamento ao vivo</strong> mostra o modelo em execução: uma célula por especialista, colorida pelo
-tier de armazenamento, e todo especialista roteado num turno pisca.</em></p>
+<p align="center"><em>O <strong>monitor</strong> enquanto o LFM3-VL-2B escreve: 31,6 tok/s, o prompt lido em 0,1 s, 2,1 GB de RAM.</em></p>
+
+<p align="center">
+  <img src="docs/media/ui/ui-experts.png" width="900" alt="o chat com o mapa de especialistas aberto: uma célula por especialista em cada um dos 16 blocos do OLMoE">
+</p>
+<p align="center"><em>O OLMoE com o <strong>mapa de especialistas</strong> aberto ao lado do chat: uma célula por especialista em cada bloco, branca quando
+escolhido neste passo, âmbar quando usado nesta resposta.</em></p>
+
+<p align="center">
+  <img src="docs/media/ui/ui-systemone.png" width="900" alt="a página System One: um pull request lido uma vez, uma probabilidade para cada resposta permitida, e o quanto o modelo tem certeza">
+</p>
+<p align="center"><em><strong>System One</strong>: dê ao modelo um documento e as únicas respostas que ele pode escolher. Aqui o Qwen3.6-35B numa RTX PRO 4000
+lê um pull request que quebra o limite de tamanho de um cache: <strong>request changes a 81%</strong>, entropia 0,56 (incerto), 98 tokens lidos, 0 gerados.</em></p>
 
 A página **Profiling** mostra onde cada turno gasta o seu tempo, fase por fase,
 com os últimos 30 turnos como tendência.

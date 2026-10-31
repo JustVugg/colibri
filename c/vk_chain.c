@@ -60,10 +60,11 @@ static const char *const pipe_file[P_NPIPE] = {
 /* COLI_VK_CHAIN_PROF=1: device time per kind of op (timestamps after every op; ops
  * that run side by side between two barriers share the time unevenly) */
 enum { PK_GEMV8, PK_GEMV, PK_GEMM, PK_NORM, PK_ROPE, PK_ATTN, PK_DNCONV, PK_DNREC, PK_EW, PK_QSA, PK_PLE, PK_COPY,
-       PK_MLA, PK_MLAW, PK_DSA, PK_KDA, PK_MHC, PK_ARES, PK_ROUTE, PK_MOE, PK_N };
+       PK_MLA, PK_MLAW, PK_DSA, PK_KDA, PK_MHC, PK_ARES, PK_ROUTE, PK_MOE, PK_WAIT, PK_N };
 static const char *const pk_name[PK_N] = {"GEMV int8", "GEMV other", "tiled GEMM", "norm", "rope", "attention",
                                           "dn conv", "dn recurrence", "element-wise", "qsa", "ple", "copy",
-                                          "mla", "mla weights", "dsa", "kda", "mhc", "attnres", "route", "experts"};
+                                          "mla", "mla weights", "dsa", "kda", "mhc", "attnres", "route", "experts",
+                                          "waiting for the host"};
 /* the MLA, KDA, mHC and AttnRes pipelines: optional (an engine without such layers
  * needs none of them, and a missing one turns off only its own ops) */
 enum { PM_MLA, PM_HGEMV, PM_DSA, PM_KDA, PM_MHC, PM_ARES, PM_ROUTE, PM_N };
@@ -424,7 +425,15 @@ static VkShaderModule load_module(const char *dir_spv, const char *file) {
  * the compiler picks: an Intel Iris Xe (subgroups of 8 to 32) compiled chain_gemv and
  * chain_gemv2 at another width than the shader saw, and every decode GEMV came out
  * wrong. 0 (no subgroup size control, COLI_VK_SUBGROUP=0): the driver's choice. */
+/* vkc_hybrid_set_flush: the host's part of a hybrid step still to come. Run before the host
+ * waits for a frame (frame_wait) and before it makes a pipeline: a frame that waits for the
+ * host's event inside it (vkc_ev_wait) may be executing, and a driver that executes on a
+ * thread of its own and builds pipelines under its lock (Lavapipe) would wait for that frame
+ * -- which waits for the host. */
+static void (*g_hyb_flush)(void);
+static void host_first(void) { if (g_hyb_flush) g_hyb_flush(); }
 static VkPipeline make_pipe(VkShaderModule m, const VkSpecializationInfo *si) {
+    host_first();
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
         .requiredSubgroupSize = (uint32_t)KC.core.pin_sg};
@@ -440,6 +449,7 @@ static VkPipeline make_pipe(VkShaderModule m, const VkSpecializationInfo *si) {
 /* A pipeline of the matrix units' shaders: at the device's cooperative-matrix subgroup
  * size (64 or 32), required, in full subgroups; NULL elsewhere or when it fails. */
 static VkPipeline coop_pipe(VkShaderModule m, const VkSpecializationInfo *si) {
+    host_first();
     int sg = KC.core.coop_sg;
     if (!m || (sg != 64 && sg != 32)) return VK_NULL_HANDLE;
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
@@ -660,6 +670,7 @@ int vkc_init(void) {
                           .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT,
                           .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = KC.mod_tg, .pName = "main",
                           .pSpecializationInfo = &si}, .layout = KC.pl};
+            host_first();
             if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &KC.tg) != VK_SUCCESS) KC.tg = VK_NULL_HANDLE;
         }
     }
@@ -749,6 +760,7 @@ static long chain_spin_us(void) {
 }
 static int frame_wait(VkcFrame *f) {
     if (!f->inflight) return 1;
+    if (g_hyb_flush) g_hyb_flush();   /* a hybrid step's host part the frame may wait for */
     double t0 = vkc_now_ms();
     VkResult r = VK_NOT_READY;
     for (long spin = chain_spin_us(); spin > 0 && r == VK_NOT_READY && (vkc_now_ms() - t0) * 1000.0 < spin; )
@@ -878,6 +890,7 @@ int vkc_hybrid_submit(uint64_t g) {
     return vkc_submit(0);
 }
 void vkc_hybrid_wait_next(uint64_t h) { KC.next_wait_h = h; }
+void vkc_hybrid_set_flush(void (*fn)(void)) { g_hyb_flush = fn; }
 /* the host's side, from any thread: the primary device's two timelines */
 int vkc_hybrid_host_wait(uint64_t g) {
     if (!g_hyb_dev) return 0;
@@ -1678,6 +1691,7 @@ static VkPipeline fa_pipe(int hd, int gq) {
                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = KC.mod_fa, .pName = "main",
                   .pSpecializationInfo = &si}, .layout = KC.pl};
     VkPipeline p = VK_NULL_HANDLE;
+    host_first();
     if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &p) != VK_SUCCESS) {
         vkDestroyShaderModule(KC.dev, KC.mod_fa, NULL); KC.mod_fa = VK_NULL_HANDLE;   /* not again */
         return VK_NULL_HANDLE;
@@ -1983,6 +1997,70 @@ int vkc_ew(VkcBuf *y, VkcBuf *a, VkcBuf *b, VkcBuf *c, VkcBuf *e, const VkcEw *p
     if (e == y) bd[4] = (VkcBind){y->buf, 0, 0, 0};
     uint32_t gx, gy; grid(((uint64_t)p->n + 255) / 256, &gx, &gy);
     return record(KC.pipe[P_EW], bd, 5, p, sizeof *p, gx, gy, 1);
+}
+/* ---- the hybrid steps' events (vk_chain.h) ---------------------------------------- */
+#define VKC_EV_RING 256
+static struct { VkEvent g[VKC_EV_RING], h[VKC_EV_RING]; unsigned long long serial[VKC_EV_RING]; uint64_t step[VKC_EV_RING]; int on, tried; } g_ev;
+static int ev_init(void) {
+    if (g_ev.on) return 1;
+    if (g_ev.tried || !vkc_ready()) return 0;
+    g_ev.tried = 1;
+    VkEventCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+    for (int k = 0; k < VKC_EV_RING; k++)
+        if (vkCreateEvent(KC.dev, &ci, NULL, &g_ev.g[k]) != VK_SUCCESS || vkCreateEvent(KC.dev, &ci, NULL, &g_ev.h[k]) != VK_SUCCESS) return 0;
+    g_ev.on = 1;
+    return 1;
+}
+int vkc_ev_ready(void) { return ev_init(); }
+/* step g's slot, its events reset once the frame that used them last is done */
+static int ev_slot(uint64_t g) {
+    int k = (int)(g % VKC_EV_RING);
+    if (g_ev.step[k] == g) return k;
+    if (g_ev.serial[k] && !vkc_wait_serial(g_ev.serial[k])) return -1;
+    if (vkResetEvent(KC.dev, g_ev.g[k]) != VK_SUCCESS || vkResetEvent(KC.dev, g_ev.h[k]) != VK_SUCCESS) return -1;
+    g_ev.step[k] = g; g_ev.serial[k] = 0;
+    return k;
+}
+int vkc_ev_signal(uint64_t g) {
+    VkcFrame *f = open_frame();
+    if (!f || KC.lost || !ev_init()) return 0;
+    int k = ev_slot(g);
+    if (k < 0) return 0;
+    /* everything before it done and visible to the host, then the event */
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                          .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
+    vkCmdPipelineBarrier(f->cmd, ALL_STAGES, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    vkCmdSetEvent(f->cmd, g_ev.g[k], ALL_STAGES | VK_PIPELINE_STAGE_HOST_BIT);
+    KC.st.barriers++;
+    track_reset();
+    g_ev.serial[k] = KC.serial;
+    return 1;
+}
+int vkc_ev_wait(uint64_t g) {
+    VkcFrame *f = open_frame();
+    if (!f || KC.lost || !ev_init()) return 0;
+    int k = ev_slot(g);
+    if (k < 0) return 0;
+    if (KC.prof) prof_mark(f, PK_EW);   /* the gap to the next mark is the wait: PK_WAIT's */
+    VkMemoryBarrier hb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT, .dstAccessMask = ALL_RW};
+    vkCmdWaitEvents(f->cmd, 1, &g_ev.h[k], VK_PIPELINE_STAGE_HOST_BIT, ALL_STAGES, 1, &hb, 0, NULL, 0, NULL);
+    if (KC.prof) prof_mark(f, PK_WAIT);
+    KC.st.barriers++;
+    track_reset();
+    g_ev.serial[k] = KC.serial;
+    return 1;
+}
+int vkc_ev_host_done(uint64_t g) {
+    if (!g_ev.on || KC.lost) return -1;
+    VkResult r = vkGetEventStatus(KC.dev, g_ev.g[g % VKC_EV_RING]);
+    return r == VK_EVENT_SET ? 1 : r == VK_EVENT_RESET ? 0 : -1;
+}
+int vkc_ev_host_set(uint64_t g) {
+    /* set even once the chain counts the device lost: a frame submitted before (a software
+     * device's, or a fault injected at a later submission) may still be waiting for it, and
+     * a truly lost device just returns an error */
+    if (!g_ev.on || !KC.dev) return 0;
+    return vkSetEvent(KC.dev, g_ev.h[g % VKC_EV_RING]) == VK_SUCCESS;
 }
 enum { QSA_SCORES = 1, QSA_SELECT };   /* the modes of chain_qsa.comp that VkcQsa mode 1 runs in turn */
 int vkc_qsa(VkcBuf *src, VkcBuf *w, VkcBuf *pk, VkcBuf *cs, VkcBuf *sc, VkcBuf *sel, const VkcQsa *p) {
@@ -3076,6 +3154,7 @@ static VkPipeline kf_coop_pipe(int hd) {
                   .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT,
                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = KF.cmod, .pName = "main",
                   .pSpecializationInfo = &si}, .layout = KC.pl};
+    host_first();
     if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &KF.cpipe[k]) != VK_SUCCESS) KF.cpipe[k] = VK_NULL_HANDLE;
     return KF.cpipe[k];
 }
@@ -3440,6 +3519,13 @@ void vkc_shutdown(void) {
     for (int i = 0; i < P_NPIPE; i++) {
         if (KC.pipe[i]) vkDestroyPipeline(KC.dev, KC.pipe[i], NULL);
         if (KC.mod[i]) vkDestroyShaderModule(KC.dev, KC.mod[i], NULL);
+        if (i == 0 && g_ev.tried) {   /* the hybrid steps' events */
+            for (int k = 0; k < VKC_EV_RING; k++) {
+                if (g_ev.g[k]) vkDestroyEvent(KC.dev, g_ev.g[k], NULL);
+                if (g_ev.h[k]) vkDestroyEvent(KC.dev, g_ev.h[k], NULL);
+            }
+            memset(&g_ev, 0, sizeof g_ev);
+        }
     }
     for (int i = 0; i < KC.nkdarec; i++) vkDestroyPipeline(KC.dev, KC.kdarec[i], NULL);
     for (int i = 0; i < KC.nkdar; i++) if (KC.kdar[i]) vkDestroyPipeline(KC.dev, KC.kdar[i], NULL);

@@ -118,6 +118,8 @@ class MimoPrefixServeTest(PrefixReuseContract, PromptCancelContract, unittest.Te
     # copy carries, so a generated reply does not always survive decode and
     # re-encode: the replay scenario may then legitimately not reuse.
     REPLAY_REUSES = False
+    # a short request between two turns parks the conversation (park.h)
+    PARKS = True
     # MiMo checks between prompt blocks: blocks of 8 rows give the cancelled prompt several,
     # so the cancel can land after some of them are read (and kept)
     CANCEL_ENV = dict(PromptCancelContract.CANCEL_ENV, MIMO_CHUNK="8")

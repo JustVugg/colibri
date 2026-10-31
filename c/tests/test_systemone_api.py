@@ -51,9 +51,9 @@ class ScoringEngine:
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
                  cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None,
-                 on_tool=None, image=None, logprobs=0, pin=False, on_echo=None):
+                 on_tool=None, image=None, logprobs=0, pin=False, on_echo=None, gbytes_before_ext=False):
         self.calls.append({"prompt": prompt, "max_tokens": max_tokens, "pin": bool(pin),
-                           "logprobs": logprobs})
+                           "logprobs": logprobs, "gbytes": gbytes_before_ext})
         words = prompt.split()
         if on_accept:
             on_accept({"prompt_tokens": len(words)})
@@ -259,6 +259,18 @@ class SystemOneApi(unittest.TestCase):
         self.assertEqual(set(out["usage"]), {"input_tokens", "output_tokens", "cost"})
         self.assertGreater(out["usage"]["input_tokens"], 0)
         self.assertEqual(out["usage"]["output_tokens"], 6)  # two one-token options x three
+
+    def test_the_read_out_header_follows_the_family(self):
+        """colibri.c's header carries the grammar's byte count before its key=value tokens
+        (submit_gbytes): System One's read-outs ask for it there, as the chat's do, and
+        nowhere else. Without it colibri.c refused the header and the request waited."""
+        for arch, want in (("glm", True), ("qwen36", False)):
+            with self.subTest(arch=arch), patch("openai_server.ARCH", arch):
+                self.serve({"yes": -0.1, "no": -2.0})
+                self.post({"model": "jev-latest", "state": STATE,
+                           "questions": {"q": {"type": "noul", "instructions": "q?"}}})
+                self.assertTrue(self.engine.calls)
+                self.assertTrue(all(c["gbytes"] is want for c in self.engine.calls), self.engine.calls)
 
     def test_mean_with_unequal_option_token_counts_warns(self):
         import contextlib

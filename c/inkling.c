@@ -44,6 +44,7 @@
 #include "omp_tune.h"
 #include "route_trace.h"
 #include "kv_prefix.h"
+#include "park.h"   /* a short request keeps the conversation aside (COLI_PARK) */
 #include "prompt_break.h"   /* a served prompt that a CANCEL stops between two layers */
 #include "pin_pool.h"                          /* KV prefix reuse (shared) */                          /* shared routing telemetry (#700) */
 #include "serve_codec.h"
@@ -3484,6 +3485,48 @@ static int ink_prompt_poll(ColiPromptBreak *b) {
     return b->control;
 }
 
+/* A short request between two turns of the conversation the lone serve holds (park.h): every
+ * layer's first K/V rows (a sliding layer's ring rows) and its four convolution states, back
+ * when the next request arrives. A reset clears only the convolution states, and a query reads
+ * the rows of its own positions, so the conversation's further rows wait untouched. The host's
+ * state stays canonical: the chain uploads the rows that came back, and the states. */
+static ColiPark g_ink_park;
+static ColiParkPart *ink_park_parts(Model *m, int *n_out) {
+    Cfg *c = &m->c; int n = 0;
+    ColiParkPart *p = malloc(sizeof *p * ((size_t)c->n_layers * 6));
+    if (!p) { *n_out = 0; return NULL; }
+    for (int i = 0; i < c->n_layers; i++) {
+        int kv = L_KV(c,i), hd = L_HD(c,i), rows = (int)kv_ring_rows(c, i, m->max_t);
+        size_t row = (size_t)hd * sizeof(float), hs = (size_t)rows * row;
+        p[n++] = coli_park_heads(m->K ? m->K[i] : NULL, row, rows, kv, hs);
+        p[n++] = coli_park_heads(m->V ? m->V[i] : NULL, row, rows, kv, hs);
+        for (int j = 0; j < 4; j++) p[n++] = coli_park_whole(m->cs[j][i], (size_t)ink_cs_cells(c, j, i) * sizeof(float));
+    }
+    *n_out = n;
+    return p;
+}
+static void ink_park(Model *m, int np, int max_tok) {
+    int n = m->K && g_ink_mux_slots == 1 ? coli_park_rows_for(&g_ink_park, &m->kvp, m->kv_len, np, max_tok, 16) : 0, k = 0;
+    if (!n) return;
+    ColiParkPart *p = ink_park_parts(m, &k);
+    if (p) coli_park_save(&g_ink_park, &m->kvp, m->kv_len, p, k, n);
+    free(p);
+}
+static void ink_unpark(Model *m) {
+    if (!g_ink_park.on) return;
+    int k = 0;
+    const int n = g_ink_park.n;   /* the rows that come back: the chain uploads them */
+    (void)n;
+    ColiParkPart *p = ink_park_parts(m, &k);
+    if (p && coli_park_restore(&g_ink_park, &m->kvp, &m->kv_len, m->kv_len, 16, p, k)) {
+#ifdef COLI_VULKAN
+        inkc_host_wrote(m, 0);      /* the convolution states go up again */
+        inkc_cpu_step(m, 0, n);     /* and the rows of positions [0, n), the ones that came back */
+#endif
+    } else coli_park_free(&g_ink_park);
+    free(p);
+}
+
 static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out, float **logit_out,
                            InkReqClock *clk, int lone) {
     Cfg *c = &m->c;
@@ -3575,6 +3618,7 @@ static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out
                     (m->kvp.len > 0 && m->kvp.len < np) ? " (diverged)" : "");
         fflush(stderr);
     }
+    if (!reuse && lone && naud == 0) ink_park(m, np, q->max_tok);   /* a short request keeps the conversation (ink_unpark) */
     if (!reuse) state_reset(m);
     clk->t0 = now_s();
     clk->h0 = m->hits; clk->m0 = m->miss;
@@ -3638,6 +3682,7 @@ static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out
 static int serve_one(Model *m, Tok *T, SReq *q) {
     Cfg *c = &m->c;
     int *ids = NULL, np = 0; float *logit = NULL; InkReqClock clk;
+    ink_unpark(m);   /* a conversation the last request parked: back first */
     if (!ink_serve_start(m, T, q, &ids, &np, &logit, &clk, 1)) return 0;
     double t0 = clk.t0;
     uint64_t h0 = clk.h0, m0 = clk.m0;

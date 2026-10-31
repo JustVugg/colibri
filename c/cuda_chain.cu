@@ -42,9 +42,10 @@ namespace {
 #define CC_UP_MARKS 1024   /* host_up's marks in flight (three a promoted expert) */
 struct CcCtx {
     int device, up, lost, in_frame;
-    int major;   /* the device's compute capability: cc_attn_fk's tensor cores from 7, cc_attn_f2's from 8 */
+    int major, minor;   /* the device's compute capability: cc_attn_fk's tensor cores from 7.0, cc_attn_f2's from 7.5 */
     int f2_big;  /* cc_attn_f2's head dim 256 (66 KiB of shared memory): 1 allowed, -1 refused, 0 not asked */
     int f2_big_h;   /* the same for its float16 cache's kernel */
+    int f2_mid, f2_mid_h;   /* the same for head dim 256's blocks of 16 keys (49.5 KiB: a T4 gives 64) */
     cudaStream_t stream;
     cudaEvent_t ev; int ev_ok, ev_pending;
     /* staging (cc_fetch): the copy stream, its copies' event and the buffer's last reader's */
@@ -502,8 +503,9 @@ __global__ static void __launch_bounds__(128) cc_attn_fk(const float *__restrict
 #endif
 }
 /* A prompt chunk's causal attention in one pass on the tensor cores' m16n8k16 f16 MMA (sm_80
- * and later), FlashAttention-2's online softmax. A block of NW warps takes 16 * NW query rows:
- * 16 * NW / GQ tokens x the GQ query heads of one kv head, warp w rows 16w .. 16w + 15, so each
+ * and later; on sm_75 each is two m16n8k8), FlashAttention-2's online softmax. A block of NW
+ * warps takes 16 * NW query rows: 16 * NW / GQ tokens x the GQ query heads of one kv head,
+ * warp w rows 16w .. 16w + 15, so each
  * key block of BC keys is staged once for all of them (K and V rounded to f16 as they are
  * staged, rows of HD + 8 halves). A warp's scores stay in its registers: per row the running
  * max m and sum l rescale its output fragments as the blocks go by, and P = exp(s - m) goes
@@ -517,12 +519,19 @@ __global__ static void __launch_bounds__(128) cc_attn_fk(const float *__restrict
  * rows, twice. Not bit-identical to cc_attn_fk (one pass, the sums in another order).
  * Grid: x = ceil(S / (16 * NW / GQ)) token groups, y = kv heads; dynamic shared memory
  * cc_f2_smem_bytes. */
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
 #define CC_F2_BODY 1
 __device__ __forceinline__ void cc_f2_mma(float *c, const uint32_t *a, uint32_t b0, uint32_t b1) {
+#if __CUDA_ARCH__ >= 800
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else   /* sm_75 has no k16: an m16n8k8's A is a0 a1 (k 0-7) and its B b0, the k16's a2 a3 and b1 are k 8-15 */
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(b0));
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[2]), "r"(a[3]), "r"(b1));
+#endif
 }
 __device__ __forceinline__ void cc_f2_ldm(uint32_t *r, const __half *p) {
     unsigned s = (unsigned)__cvta_generic_to_shared(p);
@@ -681,7 +690,27 @@ __global__ static void __launch_bounds__(32 * NW) cc_attn_f2(const float *__rest
     }
 #endif
 }
-/* cc_attn_f2 for a prompt chunk where it applies (1: launched): sm_80 and later, head dim 64,
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)   /* the opt-in limit's attribute is CUDA's */
+/* cc_attn_f2 at head dim 256 with blocks of BC keys (1: launched); ok says whether the card gives
+ * its shared memory, asked once: 1 allowed, -1 refused, 0 not asked */
+template <int BC, typename KT>
+static int cc_f2_256(CcCtx *c, int &ok, dim3 fg, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, const CcAttn *p,
+                     int G, int win, const float *sk, int so, int ring) {
+    const size_t sm = cc_f2_smem_bytes<256, 4, BC, false>();
+    if (!ok) {
+        int optin = 0;
+        ok = cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, c->device) == cudaSuccess &&
+             (size_t)optin >= sm &&
+             cudaFuncSetAttribute(cc_attn_f2<256, 4, BC, false, KT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm) == cudaSuccess
+             ? 1 : -1;
+        (void)cudaGetLastError();
+    }
+    if (ok < 0) return 0;
+    coli_launch(cc_attn_f2<256, 4, BC, false, KT>, fg, 128, sm, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
+    return 1;
+}
+#endif
+/* cc_attn_f2 for a prompt chunk where it applies (1: launched): sm_75 and later, head dim 64,
  * 128 or 256, the query heads of a kv head dividing 64, rows and caches at float4 offsets;
  * COLI_CUDA_CHAIN_FLASH2=0 keeps cc_attn_fk */
 template <typename KT>
@@ -690,7 +719,7 @@ static int cc_attn_f2_go(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcB
 #if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_CUDA_CHAIN_FLASH2"); on = !(e && *e == '0'); }
-    if (!on || c->major < 8 || 64 % G || (p->hd != 64 && p->hd != 128 && p->hd != 256) ||
+    if (!on || c->major * 10 + c->minor < 75 || 64 % G || (p->hd != 64 && p->hd != 128 && p->hd != 256) ||
         (p->q_off | p->q_row | p->q_seg | p->k_off | p->v_off) % 4) return 0;
     dim3 fg((unsigned)((p->S + 64 / G - 1) / (64 / G)), (unsigned)p->KVH);
     if (p->hd == 64) {
@@ -699,19 +728,11 @@ static int cc_attn_f2_go(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcB
     } else if (p->hd == 128) {
         coli_launch(cc_attn_f2<128, 4, 64, true, KT>, fg, 128, cc_f2_smem_bytes<128, 4, 64, true>(), c->stream, 
             fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
-    } else {
-        const size_t sm = cc_f2_smem_bytes<256, 4, 32, false>();
-        int &big = sizeof(KT) == 2 ? c->f2_big_h : c->f2_big;   /* a float16 cache's kernel is another function */
-        if (!big) {
-            int optin = 0;
-            big = cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, c->device) == cudaSuccess &&
-                  (size_t)optin >= sm &&
-                  cudaFuncSetAttribute(cc_attn_f2<256, 4, 32, false, KT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm) == cudaSuccess
-                  ? 1 : -1;
-            (void)cudaGetLastError();
-        }
-        if (big < 0) return 0;
-        coli_launch(cc_attn_f2<256, 4, 32, false, KT>, fg, 128, sm, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
+    } else {   /* blocks of 32 keys where the card gives 66 KiB, else of 16 (49.5 KiB: a T4 gives 64) */
+        int &big = sizeof(KT) == 2 ? c->f2_big_h : c->f2_big;   /* a float16 cache's kernels are other functions */
+        int &mid = sizeof(KT) == 2 ? c->f2_mid_h : c->f2_mid;
+        if (!cc_f2_256<32, KT>(c, big, fg, q, kc, vc, o, gate, p, G, win, sk, so, ring) &&
+            !cc_f2_256<16, KT>(c, mid, fg, q, kc, vc, o, gate, p, G, win, sk, so, ring)) return 0;
     }
     return 1;
 #else
@@ -1536,9 +1557,12 @@ static int cc_init(int device) {
     if (!cc_ok(nullptr, cudaEventCreateWithFlags(&c->ev, cudaEventDisableTiming), "event")) { cudaStreamDestroy(c->stream); return 0; }
     c->ev_ok = 1; c->up = 1; c->lost = 0; c->in_frame = 0; c->ev_pending = 0;
 #if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)   /* the flash attention's tensor cores (CUDA only) */
-    if (cudaDeviceGetAttribute(&c->major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess) { c->major = 0; (void)cudaGetLastError(); }
+    if (cudaDeviceGetAttribute(&c->major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&c->minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess) {
+        c->major = c->minor = 0; (void)cudaGetLastError();
+    }
 #else
-    c->major = 0;
+    c->major = c->minor = 0;
 #endif
     if (c == &g_cc[g_ncc]) g_ncc++;
     g_cur = (int)(c - g_cc);

@@ -39,7 +39,6 @@
 #define COLI_VK_DMOE_H
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -59,27 +58,34 @@
  *            timeline (vkc_hybrid_submit)
  *   frame B  the device's experts (a table where the host pool's are zero)
  *   frame C  waits for the host's timeline, adds the CPU's sum, goes on
- * A worker thread takes the steps in order: it waits for A, computes the host pool's
- * pairs as the CPU computes a GGUF's matmuls (ggml_quants.h: int8 activations, integer
- * dots), writes their weighted sum and signals. A prompt chunk keeps the full table. */
+ * The engine's own thread computes the pairs, one layer behind its recording: the step's
+ * job is kept (vkc_hyb_post) and run (vkc_hyb_flush: wait for frame A, the pairs as the
+ * CPU computes a GGUF's matmuls — ggml_quants.h: int8 activations, integer dots — their
+ * weighted sum, the host's signal) when the next layer's step begins, when a table is
+ * read again, before any wait for a frame (vkc_hybrid_set_flush: every frame from C on
+ * waits for the host's value), and at the end. The thread has its OpenMP team warm and
+ * waits for the device otherwise; frame B covers the pairs when they take about as long
+ * as the device's experts. A worker thread with a team of its own took the steps before:
+ * beside the engine's spinning team (OMP_WAIT_POLICY=ACTIVE) it lost its cores — 789 us a
+ * step with 12 threads, 328 with 2, the same pairs alone 50 (a Threadripper 3945WX, Qwen3.6
+ * int4, 1.4 pairs a step) — and the handoff (a condition variable, the driver's semaphore
+ * wake) came on top. A prompt chunk keeps the full table. */
 #include "vk_hyb_gate.h"
-#define VKC_HYB_Q 256
 struct VkcDmoe_;
 typedef struct {
     struct VkcDmoe_ *d; int i, n; uint64_t g;
     int act; float limit;
+    int flags;                         /* the step inside its frame (flags), or frames A/B/C (timelines) */
+    unsigned long long serial;         /* flags: the frame the step is in (the host submits it before it waits) */
 } VkcHybJob;
 typedef struct {
-    pthread_t th; int th_on, quit, err;
-    pthread_mutex_t mx; pthread_cond_t cv, cv_idle;
-    VkcHybJob q[VKC_HYB_Q]; int qh, qt, busy;
+    VkcHybJob job[2]; int nq, err;     /* the steps kept, oldest first: one, or two while the next step is recorded */
     unsigned long long steps, pairs;   /* steps done, host pool pairs computed */
-    double cpu_ms;                     /* the worker's compute time */
-    double wait_ms;                    /* its time waiting for the device's routes (the layer's dense part on the device) */
-    float *gu, *hh, *dn; int cap;      /* its scratch: gate and up, the hidden rows, down, for cap pairs */
-    float *ys; int ycap;               /* the weighted sum, n rows, before it goes to the device's buffer */
+    double cpu_ms, wait_ms;            /* the pairs' compute; waiting for the device's frame A */
+    float *gu, *hh, *dn, *ys; int cap; /* scratch: gate and up, the hidden rows, down, the rows' sums, for cap pairs */
+    int ycap;
 } VkcHyb;
-/* one worker for every engine's steps on the device: the host's timeline rises in its order */
+/* one for every engine's steps on the device: the host's timeline rises in their order */
 static VkcHyb g_vkc_hyb;
 static uint64_t g_vkc_hyb_seq;
 static double vkc_hyb_now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
@@ -104,6 +110,7 @@ typedef struct VkcDmoe_ {
      * CPU's sum (cy), its worker, and the timeline's last value */
     int hybrid;
     uint32_t *tabhh; VktHostExpert *hx; VkcBuf *tabhyb, *hxx, *cy;
+    int ev;                        /* the steps on events, inside their frame (vkc_dmoe_flags at the first read) */
     int *hx_n;                     /* per layer: its experts the CPU computes (0: the full table's step) */
     int D, I;
     unsigned long long hyb_steps;
@@ -150,8 +157,8 @@ static int vkc_hybrid_wanted(void) {
     if (on < 0) { const char *e = getenv("COLI_VK_HYBRID"); on = !(e && *e == '0'); }
     return on && vkc_hybrid_ready();
 }
-/* ---- the hybrid worker ---- */
-/* the worker's team: COLI_VK_HYBRID_THREADS, else OpenMP's */
+/* ---- the hybrid steps' CPU side ---- */
+/* the pairs' team: COLI_VK_HYBRID_THREADS, else the engine thread's (OpenMP's) */
 static int vkc_hyb_threads(void) {
     static int n = -1;
     if (n < 0) { const char *e = getenv("COLI_VK_HYBRID_THREADS"); n = e && atoi(e) > 0 ? atoi(e) : 0; }
@@ -175,14 +182,14 @@ static void vkc_hyb_compute(VkcDmoe *d, const VkcHybJob *j) {
     for (int s = 0; s < n; s++)
         for (int k = 0; k < K; k++) { int e = ids[s * K + k]; if (e >= 0 && e < E && hx[e].g) { ps[np] = s; pk[np] = k; np++; } }
     VkcHyb *w = &g_vkc_hyb;
-    if (!np) { memset(y, 0, (size_t)n * D * sizeof(float)); return; }
+    /* the sum in the host's own memory (cy is the device's: its mapping is uncached for the
+     * CPU, and reading it back line by line through the BAR cost more than the pairs) */
     if (w->ycap < n * D) {
-        free(w->ys); w->ys = malloc((size_t)n * D * sizeof(float));
-        w->ycap = w->ys ? n * D : 0;
-        if (!w->ycap) { memset(y, 0, (size_t)n * D * sizeof(float)); w->err = 1; return; }
+        free(w->ys); w->ys = malloc((size_t)n * D * sizeof(float)); w->ycap = w->ys ? n * D : 0;
+        if (!w->ycap) { w->err = 1; return; }
     }
-    float *yl = w->ys;
-    memset(yl, 0, (size_t)n * D * sizeof(float));
+    memset(w->ys, 0, (size_t)n * D * sizeof(float));
+    if (!np) { memcpy(y, w->ys, (size_t)n * D * sizeof(float)); return; }
     w->pairs += (unsigned long long)np;
     if (w->cap < np) {
         free(w->gu); free(w->hh); free(w->dn);
@@ -195,74 +202,92 @@ static void vkc_hyb_compute(VkcDmoe *d, const VkcHybJob *j) {
     for (int p = 0; p < np; p++) { hp[p] = &hx[ids[ps[p] * K + pk[p]]]; xp[p] = x + (size_t)ps[p] * D; }
     if (!vkt_host_pairs(hp, xp, np, D, I, j->limit, vkc_hyb_threads(), w->gu, w->hh, dn)) w->err = 1;
     for (int p = 0; p < np; p++) {   /* in rank order within a row */
-        float wv = wt[ps[p] * K + pk[p]]; float *ys = yl + (size_t)ps[p] * D; const float *o = dn + (size_t)p * D;
+        float wv = wt[ps[p] * K + pk[p]]; float *ys = w->ys + (size_t)ps[p] * D; const float *o = dn + (size_t)p * D;
         for (int c = 0; c < D; c++) ys[c] += wv * o[c];
     }
-    memcpy(y, yl, (size_t)n * D * sizeof(float));
+    memcpy(y, w->ys, (size_t)n * D * sizeof(float));
 }
-static void *vkc_hyb_main(void *arg) {
-    (void)arg;
-    VkcHyb *w = &g_vkc_hyb;
+/* the hybrid steps inside their frame, on events (vkc_ev_signal / vkc_ev_wait: the device
+ * sets one once the route and the rows are down, waits for the host's after its experts),
+ * as the CUDA chain does them with its flags; COLI_VK_HYBRID_EVENTS=0: frames A/B/C and
+ * the timelines. Measured on an RTX 3070 (Qwen3.6 int4, 1.3 pool pairs a step): the three
+ * frames and two timeline round trips a step left the device idle about 300 us a step,
+ * more than the pairs it spared it (33 ms a token against 18 with the device's own reads). */
+static int vkc_dmoe_flags(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_HYBRID_EVENTS"); on = !(e && *e == '0'); }
+    return on && vkc_ev_ready();
+}
+/* the host's side of an event step: the device's event, then the pairs, then the host's */
+static int vkc_hyb_flag_wait(VkcDmoe *d, uint64_t g) {
+    (void)d;
+    double t0 = vkc_hyb_now_ms();
     for (;;) {
-        pthread_mutex_lock(&w->mx);
-        while (w->qh == w->qt && !w->quit) { w->busy = 0; pthread_cond_broadcast(&w->cv_idle); pthread_cond_wait(&w->cv, &w->mx); }
-        if (w->qh == w->qt && w->quit) { w->busy = 0; pthread_cond_broadcast(&w->cv_idle); pthread_mutex_unlock(&w->mx); break; }
-        VkcHybJob j = w->q[w->qh % VKC_HYB_Q]; w->busy = 1;
-        pthread_mutex_unlock(&w->mx);
-        const double tw = vkc_hyb_now_ms();
-        const int got = vkc_hybrid_host_wait(j.g);
-        w->wait_ms += vkc_hyb_now_ms() - tw;
-        if (!got) w->err = 1;
-        else {
-            double t0 = vkc_hyb_now_ms();
-            vkc_hyb_compute(j.d, &j);
-            w->cpu_ms += vkc_hyb_now_ms() - t0;
-        }
-        vkc_hybrid_host_signal(j.g);   /* always: the device's next frame waits for it */
-        pthread_mutex_lock(&w->mx);
-        w->qh++; w->steps++;
-        pthread_mutex_unlock(&w->mx);
+        int r = vkc_ev_host_done(g);
+        if (r > 0) return 1;
+        if (r < 0 || vkc_hyb_now_ms() - t0 > 20000.0) return 0;   /* lost, or the device never got there */
     }
-    return NULL;
 }
-static int vkc_hyb_start(void) {
+static void vkc_hyb_flag_signal(VkcDmoe *d, uint64_t g) {
+    (void)d;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);   /* cy before the event (the mapping may be write-combined) */
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_sfence();
+#endif
+    if (!vkc_ev_host_set(g)) g_vkc_hyb.err = 1;
+}
+/* the oldest kept step: frame A done (the device's event set), the pairs, the host's signal
+ * (always: frame C, or the wait in the frame, waits for it) */
+static int g_vkc_hyb_in;   /* a flush under way: the frame it submits waits for the ring's oldest frame (vkc_begin),
+                              and that wait's flush (vkc_hybrid_set_flush) must not take the next step before this
+                              one's signal -- the device would wait for this step's event while the host polled the
+                              next step's, which comes after it. The frames the ring waits for are older than any
+                              step kept, so nothing is lost by leaving the queue to the flush under way. */
+static void vkc_hyb_flush_oldest(void) {
     VkcHyb *w = &g_vkc_hyb;
-    if (w->th_on) return 1;
-    pthread_mutex_init(&w->mx, NULL); pthread_cond_init(&w->cv, NULL); pthread_cond_init(&w->cv_idle, NULL);
-    if (pthread_create(&w->th, NULL, vkc_hyb_main, NULL)) return 0;
-    w->th_on = 1;
-    return 1;
+    if (!w->nq || g_vkc_hyb_in) return;
+    g_vkc_hyb_in = 1;
+    VkcHybJob j = w->job[0];
+    w->job[0] = w->job[1]; w->nq--;
+    if (j.flags && j.serial > vkc_serial()) {   /* its frame is still being recorded: off it goes */
+        if (!(vkc_submit(0) && vkc_begin())) { w->err = 1; g_vkc_hyb_in = 0; return; }
+    }
+    double t0 = vkc_hyb_now_ms();
+    int got = j.flags ? vkc_hyb_flag_wait(j.d, j.g) : vkc_hybrid_host_wait(j.g);
+    if (!got) w->err = 1;
+    else {
+        double t1 = vkc_hyb_now_ms();
+        w->wait_ms += t1 - t0;
+        vkc_hyb_compute(j.d, &j);
+        w->cpu_ms += vkc_hyb_now_ms() - t1;
+    }
+    if (j.flags) vkc_hyb_flag_signal(j.d, j.g); else vkc_hybrid_host_signal(j.g);
+    w->steps++;
+    g_vkc_hyb_in = 0;
 }
-/* the worker ended (the gate decided against the hybrid steps): its OpenMP team goes with
- * it. Left waiting, the team's threads kept spinning (OMP_WAIT_POLICY=ACTIVE) beside the
- * engine's own: 2 ms a token on an RTX 3070 box with 12 cores. vkc_hyb_start brings it
- * back for the next measurement. */
-static void vkc_hyb_drain(void);
-static void vkc_hyb_stop(void) {
+/* every step kept so far (before the host waits for a frame, the table changes, the end) */
+static void vkc_hyb_flush(void) { while (g_vkc_hyb.nq && !g_vkc_hyb_in) vkc_hyb_flush_oldest(); }
+/* The steps a layer about to be recorded waits for. An event step is run once the next
+ * layer's step is recorded (vkc_dmoe_layer, after it: its frame then holds both, and goes
+ * off before the host polls), so the device has the next frame while this one's experts
+ * run and the host records while the device computes; run here only when it is two layers
+ * old (a layer between took no step). A timeline step runs here: frame A is a frame of its
+ * own, and the recording since was its frame B and C's start. */
+static void vkc_hyb_flush_before(int layer) {
     VkcHyb *w = &g_vkc_hyb;
-    if (!w->th_on) return;
-    vkc_hyb_drain();
-    pthread_mutex_lock(&w->mx); w->quit = 1; pthread_cond_broadcast(&w->cv); pthread_mutex_unlock(&w->mx);
-    pthread_join(w->th, NULL);
-    w->th_on = 0; w->quit = 0;
+    while (w->nq && !g_vkc_hyb_in && (!w->job[0].flags || w->job[0].i < layer - 1)) vkc_hyb_flush_oldest();
 }
-/* every step posted so far done (the table is about to change, or the end) */
-static void vkc_hyb_drain(void) {
-    VkcHyb *w = &g_vkc_hyb;
-    if (!w->th_on) return;
-    pthread_mutex_lock(&w->mx);
-    while (w->qh != w->qt || w->busy) pthread_cond_wait(&w->cv_idle, &w->mx);
-    pthread_mutex_unlock(&w->mx);
-}
+static void vkc_hyb_drain(void) { vkc_hyb_flush(); }
+static int vkc_hyb_start(void) { vkc_hybrid_set_flush(vkc_hyb_flush); return 1; }
+static void vkc_hyb_stop(void) { vkc_hyb_flush(); }
+/* a step's job, kept until its flush; two at most */
 static int vkc_hyb_post(const VkcHybJob *j) {
     VkcHyb *w = &g_vkc_hyb;
-    pthread_mutex_lock(&w->mx);
-    while (w->qt - w->qh >= VKC_HYB_Q) { pthread_mutex_unlock(&w->mx); vkc_hyb_drain(); pthread_mutex_lock(&w->mx); }
-    w->q[w->qt % VKC_HYB_Q] = *j; w->qt++; w->busy = 1;
-    pthread_cond_signal(&w->cv);
-    pthread_mutex_unlock(&w->mx);
+    if (w->nq == 2) vkc_hyb_flush_oldest();
+    w->job[w->nq++] = *j;
     return 1;
 }
+
 
 /* The tier's table for layers lo..lo+L-1, read again when its residents changed since. */
 static int vkc_dmoe_stage_read(VkcDmoe *d);   /* below: the prompt chunks' staging of the host pool */
@@ -591,6 +616,7 @@ static int vkc_dmoe_prepare(VkcDmoe *d, int lo, int L, int E, int K, int D, int 
             !vkc_reserve(&d->hxx, r * (size_t)D * sizeof(float), VKC_DOWN) || !vkc_reserve(&d->cy, r * (size_t)D * sizeof(float), VKC_UP))
             d->hybrid = 0;
         else { d->read = 0; if (!vkc_dmoe_read(d)) return 0; }
+        d->ev = d->hybrid && vkc_dmoe_flags();
     }
     if ((!d->tab && !(d->tab = vkc_buf((size_t)L * E * COLI_VK_XB_ENTRY * sizeof(uint32_t), VKC_DEV))) ||
         !vkc_reserve(&d->rid, (size_t)L * rc * K * sizeof(int), VKC_DOWN) || !vkc_reserve(&d->rwt, rc * K * sizeof(float), d->hybrid ? VKC_DOWN : VKC_DEV) ||
@@ -648,6 +674,7 @@ static int vkc_dmoe_on(const VkcDmoe *d, int layer) {
 static int vkc_dmoe_layer(VkcDmoe *d, int layer, int n, VkcBuf *lg, VkcBuf *bias, VkcBuf *x,
                           const VkcRoute *rt, const VkcMoe *mp) {
     int i = layer - d->lo, io = i * d->cap * d->K;
+    vkc_hyb_flush_before(i);   /* the steps before this layer's that are due (vkc_hyb_flush_before) */
     VkcRoute r = *rt;
     r.S = n; r.E = d->E; r.K = d->K; r.l_off = 0; r.l_row = d->E; r.i_off = io; r.i_row = d->K; r.w_off = 0; r.w_row = d->K;
     VkcMoe m = *mp;
@@ -678,13 +705,27 @@ static int vkc_dmoe_layer(VkcDmoe *d, int layer, int n, VkcBuf *lg, VkcBuf *bias
         /* frame A: the route and the input rows down, then the device's timeline; frame B:
          * the device's experts; frame C, after the host's: the CPU's sum added */
         uint64_t g = ++g_vkc_hyb_seq;
-        if (!vkc_route(lg, bias, d->rid, d->rwt, &r) || !vkc_copy(d->hxx, 0, x, 0, (size_t)n * d->D)) return 0;
-        VkcHybJob j = {d, i, n, g, m.act, m.limit};
-        if (!vkc_hyb_start()) return 0;   /* the worker again after a stop (the gate's) */
-        vkc_hyb_post(&j);
-        if (!vkc_hybrid_submit(g) || !vkc_begin() || !vkc_moe(x, d->rid, d->rwt, d->tabhyb, d->hid, d->y, &m) || !vkc_submit(0)) return 0;
-        vkc_hybrid_wait_next(g);
         VkcEw add = {VKC_EW_ADD, n * d->D, d->D, 1, 0, 0, 0, 0, 0, 0, 0, 1.f};
+        if (!vkc_route(lg, bias, d->rid, d->rwt, &r) || !vkc_copy(d->hxx, 0, x, 0, (size_t)n * d->D)) return 0;
+        if (!vkc_hyb_start()) return 0;
+        if (d->ev) {
+            /* in the frame: the device's event, its experts, the wait for the host's event, the sum */
+            if (!vkc_ev_signal(g)) return 0;
+            VkcHybJob j = {d, i, n, g, m.act, m.limit, 1, vkc_serial() + 1};
+            vkc_hyb_post(&j);
+            if (!vkc_moe(x, d->rid, d->rwt, d->tabhyb, d->hid, d->y, &m) || !vkc_ev_wait(g) ||
+                !vkc_ew(d->y, d->y, d->cy, NULL, NULL, &add)) return 0;
+            d->steps++; d->hyb_steps++;
+            /* the layer before's step now: the frame with both steps goes off, the device has it
+             * while the host computes the earlier pairs and then records the next layer */
+            while (g_vkc_hyb.nq > 1 && !g_vkc_hyb_in) vkc_hyb_flush_oldest();
+            return 1;
+        }
+        VkcHybJob j = {d, i, n, g, m.act, m.limit, 0, 0};
+        if (!vkc_hybrid_submit(g)) return 0;
+        vkc_hyb_post(&j);   /* frame A is on its way: g will come */
+        if (!vkc_begin() || !vkc_moe(x, d->rid, d->rwt, d->tabhyb, d->hid, d->y, &m) || !vkc_submit(0)) return 0;
+        vkc_hybrid_wait_next(g);
         if (!vkc_begin() || !vkc_ew(d->y, d->y, d->cy, NULL, NULL, &add)) return 0;
         d->steps++; d->hyb_steps++;
         return 1;
@@ -711,6 +752,9 @@ static void vkc_dmoe_free(VkcDmoe *d) {
 /* the gate on the hybrid steps (vk_hyb_gate.h; COLI_VK_HYBRID_GATE=0: always on) */
 static void vkc_dmoe_forward_done(VkcDmoe *d, int rows, double ms) {
     if (!d || !d->hybrid || rows < 1 || rows > VKC_DMOE_ROWS) return;
+    static int dbg = -1;
+    if (dbg < 0) { const char *e = getenv("COLI_VK_HYB_GATE_DEBUG"); dbg = e && *e == '1'; }
+    if (dbg && d->gate.phase != 2) fprintf(stderr, "[VK] hyb gate: phase %d forward %d: %.2f ms%s\n", d->gate.phase, d->gate.n, ms, d->gate.use ? " (hybrid)" : "");
     if (vkc_hyb_gate_forward(&d->gate, ms) && !d->gate.use) vkc_hyb_stop();
 }
 /* the hybrid steps' line: steps, pairs the CPU computed, its time */
@@ -730,11 +774,13 @@ static void vkc_dmoe_hyb_report(const char *engine, const VkcDmoe *d) {
         fprintf(stderr, "[VK] %s chain: the experts' table read whole %llu times, patched %llu times (%llu entries the tier changed)\n",
                 engine, d->reads, d->patches, d->patched);
     if (!d->hyb_steps && !d->gate.probes) return;
-    if (d->hyb_steps)
-    fprintf(stderr, "[VK] %s chain: %llu hybrid layer steps, %llu host pool pairs on the CPU in %.1f ms (%.1f us a step; "
-                    "%.1f ms waiting for the device's routes)%s\n",
-            engine, d->hyb_steps, w->pairs, w->cpu_ms, w->steps ? w->cpu_ms * 1e3 / (double)w->steps : 0.0, w->wait_ms,
-            w->err ? ", errors seen" : "");
+    if (d->hyb_steps) {
+        fprintf(stderr, "[VK] %s chain: %llu hybrid layer steps (%s), %llu host pool pairs on the CPU in %.1f ms (%.1f us a step), "
+                        "%.1f ms waiting for the device%s\n",
+                engine, d->hyb_steps, d->ev ? "in the frame, on events" : "frames A/B/C, by timelines",
+                w->pairs, w->cpu_ms, w->steps ? w->cpu_ms * 1e3 / (double)w->steps : 0.0, w->wait_ms,
+                w->err ? ", errors seen" : "");
+    }
     if (d->gate.probes)
         fprintf(stderr, "[VK] %s chain: the hybrid steps measured %d time(s): a decode forward %.1f ms with them, %.1f ms with the "
                         "device reading the host pool itself; %s (COLI_VK_HYBRID_GATE=0 keeps them on)\n",
