@@ -2493,9 +2493,15 @@ def read_document(path, base=None, note=None):
 
 def is_local_base(base):
     """A server address on this machine (loopback names and addresses)."""
+    import ipaddress
     from urllib.parse import urlparse
     host = (urlparse(base).hostname or "").lower()
-    return host in ("localhost", "::1") or host.startswith("127.")
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def chat_preload(a, base=None):
