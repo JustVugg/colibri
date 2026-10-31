@@ -8,6 +8,9 @@
 // M2 scope: correctness + a standalone GPU-vs-CPU test harness. Synchronous
 // submit/wait per call; async queues and zero-copy import come in M4.
 #include <math.h>
+#ifdef __GLIBC__
+#include <malloc.h>   /* malloc_trim: the exit report's resident set */
+#endif
 #include "backend_vulkan.h"
 #include "blockdec_host.h"           /* the block formats' sizes and table (blockdec_table.h) */
 #include "vk_alloc.h"
@@ -2703,6 +2706,12 @@ static double dho_rss_gib(void) {
 #endif
 }
 static void dho_exit_report(void) {
+#ifdef __GLIBC__
+    /* what this process holds, not what glibc kept of what it freed: without the trim the
+     * same run on Lavapipe read anywhere from 0.547 to 0.594 GiB (LLVM's and the load's
+     * freed blocks), which the gates comparing two runs took for the host copies */
+    malloc_trim(0);
+#endif
     double rss = dho_rss_gib();
     char r[48] = "";
     if (rss >= 0) snprintf(r, sizeof r, "; RSS %.3f GiB", rss);   /* to the MiB: the gates compare tens of MiB */
