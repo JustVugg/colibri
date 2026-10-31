@@ -10,7 +10,7 @@ readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
 authors = [
-    {name = "JustVugg"},
+    { name = "JustVugg" },
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -37,7 +37,7 @@ bench = [
     "tokenizers",
     "datasets",
 ]
-vision = [   # pictures through the gateway (the towers' preprocessors)
+vision = [ # pictures through the gateway (the towers' preprocessors)
     "numpy",
     "pillow",
 ]
@@ -50,7 +50,7 @@ Homepage = "https://github.com/JustVugg/colibri"
 Issues = "https://github.com/JustVugg/colibri/issues"
 
 [tool.setuptools.dynamic]
-version = {attr = "colibri._version.__version__"}
+version = { attr = "colibri._version.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["."]
