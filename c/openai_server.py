@@ -2816,6 +2816,17 @@ def render_chat_qwen3_coder(messages, tools=None, tool_choice=None, add_generati
             parts.append("<|im_start|>assistant")
             if text.strip():
                 parts.append("\n" + text.strip() + "\n")
+            # The template puts a blank line between the text and the first call, but the
+            # model does not always write one: Qwen3-Coder-30B-A3B often ends its text with a
+            # single newline and opens <tool_call> straight after. The reply's content keeps
+            # that newline, so a client that sends it back untrimmed is sending the turn as
+            # generated. Rendering the template's blank line instead makes the history differ
+            # from the engine's state by one token, and prefix reuse -- all or nothing --
+            # misses: the whole conversation is read again, every such turn (measured with
+            # COLI_PREFIX_LOG=1: held ".\n<tool_call>", rendered ".\n\n<tool_call>"; a
+            # 2,400-token agent turn went from ~5 s to ~100 s). A trimmed or blank-line content
+            # renders as the template does.
+            single = text.strip() and text.endswith("\n") and not text.endswith("\n\n")
             for position, call in enumerate(calls):
                 where = f"messages.{index}.tool_calls.{position}"
                 fn = call.get("function", call) if isinstance(call, dict) else None
@@ -2831,7 +2842,8 @@ def render_chat_qwen3_coder(messages, tools=None, tool_choice=None, add_generati
                 if not isinstance(args, dict):
                     raise APIError(400, "`function.arguments` must be a JSON object.",
                                    f"{where}.function.arguments")
-                parts.append(f"\n<tool_call>\n<function={fn['name']}>\n")
+                lead = "" if position == 0 and single else "\n"
+                parts.append(f"{lead}<tool_call>\n<function={fn['name']}>\n")
                 for key, value in args.items():
                     shown = (json.dumps(value, ensure_ascii=False)
                              if isinstance(value, (dict, list, tuple)) else _jinja_string(value))
