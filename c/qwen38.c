@@ -2903,8 +2903,8 @@ int main(int argc, char **argv) {
      * reads every prompt row): unset, Q38_MTP leaves it off as beside the Vulkan chain. */
     if (g_cuda_chain && m.mtp && !(getenv("Q38_MTP") && *getenv("Q38_MTP"))) {
         m.mtp = 0;
-        fprintf(stderr, "[qwen38] speculative decoding with the MTP head: off (the CUDA chain runs every layer on the device, "
-                        "the head would run on the CPU; Q38_MTP=1 drafts)\n");
+        fprintf(stderr, "[qwen38] speculative decoding with the MTP head: off (the CUDA chain runs every layer on the device; "
+                        "Q38_MTP=1 drafts, the head's layer on the device too unless Q38_MTP_CHAIN=0)\n");
     }
 #endif
     if(m.mtp&&getenv("Q38_MTP_DUMP")&&*getenv("Q38_MTP_DUMP")){

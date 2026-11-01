@@ -3785,6 +3785,11 @@ static int q38c_mtp_rows(Model *m,const float *streams,const int *next,int S,int
                          float *hidden,int settle);   /* qwen38_chain.h: the head's layer on the device */
 static void q38c_mtp_host(Model *m,int pos);
 #endif
+#ifdef COLI_CUDA
+static int q38cc_mtp_rows(Model *m,const float *streams,const int *next,int S,int pos_base,float *logit,
+                          float *hidden,int settle);   /* qwen38_cuda_chain.h: the head's layer on the card */
+static void q38cc_mtp_host(Model *m,int pos);
+#endif
 static void q38_draft_logits(Model *m,float *logit,const float *x) {
     const int V=m->lm_head.rows,H=m->lm_head.cols;
 #ifdef COLI_VULKAN
@@ -5601,6 +5606,20 @@ static void q38_mtp_rows(Model *m,const float *streams,const int *next,int S,int
     if(ran)return;
     q38c_mtp_host(m,pos_base);   /* the head's rows from here are the host's: the device's mirror behind them */
 #endif
+#ifdef COLI_CUDA
+    {   /* the CUDA chain runs the head's layer */
+        float *lc=draft?falloc(c->vocab):NULL;
+        int rc=q38cc_mtp_rows(m,streams,next,S,pos_base,lc,hidden,1);
+        if(rc&&draft){
+            *draft=q38_argmax(lc,c->vocab);
+            m->mtp_p=q38_draft_p(lc,c->vocab,*draft);
+            if(g_q38_mtp_dump)q38_mtp_dump_record(m,lc,(Q38MtpDumpRow){pos_base+S-1,next[S-1]});
+        }
+        free(lc);
+        if(rc)return;
+        q38cc_mtp_host(m,pos_base);
+    }
+#endif
     int cap=q38_bounded_prefill_rows(S,0,(uint64_t)(3*W+2*H+C)*sizeof(float));
     float *hyper=falloc((int64_t)cap*W),*mixed=falloc((int64_t)cap*H);
     float *inject=falloc((int64_t)cap*C),*block=falloc((int64_t)cap*H);
@@ -5675,6 +5694,14 @@ static int q38_mtp_draft_more(Model *m,float *hidden,int tok,int row) {
         if(q38c_mtp_rows(m,hidden,&tok,1,row,lo,hidden,0)){int d=q38_argmax(lo,c->vocab);m->mtp_p=q38_draft_p(lo,c->vocab,d);free(lo);return d;}
         free(lo);
         q38c_mtp_host(m,row);
+    }
+#endif
+#ifdef COLI_CUDA
+    {   /* the CUDA chain runs the head's layer: its tail row at `row`, hidden in and out */
+        float *lo=falloc(c->vocab);
+        if(q38cc_mtp_rows(m,hidden,&tok,1,row,lo,hidden,0)){int d=q38_argmax(lo,c->vocab);m->mtp_p=q38_draft_p(lo,c->vocab,d);free(lo);return d;}
+        free(lo);
+        q38cc_mtp_host(m,row);
     }
 #endif
     float *hyper=falloc(W),*mixed=falloc(H),*inject=falloc(C),*block=falloc(H);
