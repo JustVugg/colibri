@@ -264,7 +264,9 @@ def ollama_final(model, usage, started, first_token_at, load_seconds=0.0, finish
     usage = usage or {}
     prompt_n = int(usage.get("prompt_tokens") or 0)
     eval_n = int(usage.get("completion_tokens") or 0)
-    prompt_s = (first_token_at - started) if first_token_at else 0.0
+    # the load is total_duration's and load_duration's, not the prompt's: Ollama's clients
+    # (Open WebUI's token counter) divide eval_count by eval_duration
+    prompt_s = max(0.0, first_token_at - started - load_seconds) if first_token_at else 0.0
     eval_s = (now - first_token_at) if first_token_at else 0.0
     line = {"model": model, "created_at": _now_iso(), "done": True,
             "done_reason": DONE_REASON.get(finish_reason, "stop"),
@@ -406,7 +408,8 @@ def openai_reply_to_ollama(reply, model, started, generate=False, think_in_conte
     if thinking and think_in_content:
         content = f"<think>{thinking}</think>{content}"
         thinking = None
-    first = started if content or thinking else None
+    # no first-token time without a stream: the prompt's and the reply's time are one, as eval_duration
+    first = started + load_seconds if content or thinking else None
     out = ollama_final(model, reply.get("usage"), started, first or time.time(), load_seconds,
                        choice.get("finish_reason"), generate=generate)
     if generate:
@@ -635,7 +638,8 @@ class ModelRegistry:
                              "size": None, "modified_at": self._mtime(path),
                              "digest": "sha256:" + hashlib.sha256(path.encode()).hexdigest(),
                              "args": list(spec.get("args") or []), "env": dict(spec.get("env") or {}),
-                             "context_length": spec.get("ctx"), "license": spec.get("license", "")}
+                             "context_length": spec.get("ctx"), "kv_slots": spec.get("kv_slots"),
+                             "license": spec.get("license", "")}
         self.entries = entries
         self.aliases = {}
         for name, spec in cfg_models.items():
@@ -750,7 +754,8 @@ class EngineManager:
         self.error = None
         started = time.time()
         cmd = [sys.executable, self.coli, "serve", "--model", entry["path"], "--host", "127.0.0.1",
-               "--port", str(self.engine_port), "--model-id", entry["name"], "--kv-slots", str(self.kv_slots)]
+               "--port", str(self.engine_port), "--model-id", entry["name"],
+               "--kv-slots", str(entry.get("kv_slots") or self.kv_slots)]
         if self.api_key:
             cmd += ["--api-key", self.api_key]
         if entry.get("context_length"):
@@ -1303,7 +1308,7 @@ def main(argv=None):
         registry.entries[a.engine_model] = {"name": a.engine_model, "path": "", "family": "", "format": "colibri",
                                             "quant": "", "params": None, "size": 0, "modified_at": _now_iso(),
                                             "digest": "sha256:" + hashlib.sha256(a.engine_model.encode()).hexdigest(),
-                                            "args": [], "env": {}, "context_length": None, "license": "", "pinned": True}
+                                            "args": [], "env": {}, "context_length": None, "kv_slots": None, "license": "", "pinned": True}
     manager = EngineManager(a.coli, a.engine_port, api_key=a.api_key, kv_slots=a.kv_slots, load_timeout=a.load_timeout,
                             engine_url=a.engine_url, engine_model=a.engine_model,
                             log_dir=os.path.join(default_home, "logs"), extra_args=a.serve_arg)

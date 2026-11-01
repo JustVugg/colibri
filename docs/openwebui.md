@@ -54,6 +54,8 @@ go in `~/.local/share/colibri/gateway.json` (`--config` for another path):
       "path": "/nvme/qwen38_flash_fp8",
       "aliases": ["qwen3.8", "qwen38"],
       "params": "125B",
+      "ctx": 16384,
+      "kv_slots": 1,
       "args": ["--cap", "8"],
       "env": {"COLI_VULKAN": "1", "Q38_EXPERT_INT4": "1"}
     }
@@ -62,8 +64,13 @@ go in `~/.local/share/colibri/gateway.json` (`--config` for another path):
 ```
 
 `path` is the model directory, `aliases` the other names a request may use, `ctx` the
-context the serve starts with (`--ctx`), `args` extra `coli serve` arguments, `env` the
-environment of that engine (added to the gateway's own). `default` is the model loaded at
+context the serve starts with (`--ctx`; unset, the serve takes what the RAM allows, which
+on a 94 GB box was 65536 tokens and 7 GB of state taken from Qwen3.8's host pool),
+`kv_slots` the conversations served at once (`--kv-slots`, the gateway's `--kv-slots` when
+unset), `args` extra `coli serve` arguments, `env` the environment of that engine (added
+to the gateway's own). Qwen3.8 wants `"kv_slots": 1`: with two slots the engine keeps its
+Vulkan dense chain off (one conversation's state on the device), and decode fell from 15
+to 6 tok/s on the RTX 3070; Qwen3.6's chain serves two slots. `default` is the model loaded at
 start (`--no-preload` skips that) and the one used when a request names none. Models
 found under `--models-dir` need no entry; an entry adds names and settings to one.
 
