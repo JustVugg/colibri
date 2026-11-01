@@ -1,35 +1,67 @@
 # colibrì desktop
 
-Tauri v2 shell for the shared React interface in `../web`.
+The chat page (`ui/`, the one `coli ui` serves) in a window of its own. The
+window is a Tauri v2 shell with no second frontend: it shows the same page the
+browser does, served by the same `ui/server.py`. The model stays where the user
+put it: the window starts and stops colibri's server, it does not carry one.
 
-This directory intentionally contains no second frontend. During development,
-Tauri starts the Vite server from `web/`; release builds package `web/dist`.
+## What it does when it opens
 
-## Development
+1. It finds `coli`: next to the program (a release archive) or above it (this
+   checkout, from `desktop/src-tauri/target/release`). `COLIBRI_COLI` names it
+   by hand.
+2. It finds Python 3: `py -3`, `python`, `python3`, then the usual install
+   folders on Windows (python.org, Anaconda, Miniconda). `COLI_PYTHON` names it
+   by hand.
+3. It finds the colibri server:
+   - one that runs already, the one `coli setup` configured or one on
+     `127.0.0.1:8000`, is used as it is;
+   - otherwise it runs `coli start`, waits for the model to load and shows how
+     long it has been loading;
+   - with nothing set up it says so, with the command that sets a model up
+     (`coli setup`), and a Retry button.
+4. It serves the chat page with `ui/server.py` on `127.0.0.1:18790` (the next
+   free port up to 18799 when another program holds it) and shows it. The port
+   stays the same from one start to the next because the page keeps its
+   conversations in the browser storage of its address.
 
-The shared web UI landed in PR #23 and is already part of `main`. From the
-repository root, install its dependencies and start the desktop shell:
+Closing the window stops the page's server, and the colibri server too when it
+was the window that started it (`coli stop`). A server that was already
+running keeps running.
+
+Links that leave colibri open in the system's browser.
+
+## Another server
 
 ```sh
-cd web
-npm ci
-cd ../desktop
-cargo install tauri-cli --version "^2.0.0" --locked
-cargo tauri dev
+colibri-desktop --backend http://127.0.0.1:8000
 ```
 
-The application connects to an OpenAI-compatible server configured in the UI.
-Bundling the inference engine or managing its process is intentionally deferred:
-the model is hundreds of gigabytes and must remain an external, user-selected
-resource rather than an opaque application sidecar.
+or `COLIBRI_BACKEND` in the environment: the window then starts nothing and
+stops nothing, and waits for that address when it does not answer yet. An ssh
+tunnel to a server on another machine works the same way.
 
-This first desktop increment only packages the existing UI in a native window.
-It does not change the web application, start the inference engine, download
-models, or add native filesystem and process permissions.
+## Logs
+
+The page's server writes to `colibri-desktop-ui.log` in the system's temporary
+directory. The colibri server it starts writes where `coli start` always does
+(`coli logs`).
+
+## Build
+
+```sh
+cd desktop/src-tauri
+cargo build --release
+```
+
+The program lands in `desktop/src-tauri/target/release/`; run from there, it
+finds `c/coli` and `ui/server.py` of this checkout. Windows needs the WebView2
+runtime (part of Windows 10 and 11); Linux needs WebKitGTK 4.1
+(`libwebkit2gtk-4.1-dev` to build).
 
 ## Validation
 
 ```sh
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
-cargo check --manifest-path src-tauri/Cargo.toml
+cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
 ```

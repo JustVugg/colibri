@@ -1694,8 +1694,12 @@ async function pollJobs(){clearTimeout(mJobTimer);let live=false;
   if(live)mJobTimer=setTimeout(pollJobs,1500);else if(MJOBS.some(j=>j.state==='done'))loadModels()}
 const fmtEta=s=>s>=3600?`${Math.floor(s/3600)} h ${Math.round(s%3600/60)} min`:s>=60?`${Math.round(s/60)} min`:`${Math.round(s)} s`;
 /* the first time this page opens, it says which model to use here (coli setup did this in the terminal) */
+let welcomeWaits=0;
 function maybeWelcome(){let seen=false;try{seen=localStorage.getItem('colibri.local.welcomed')==='1'}catch(e){}
-  if(seen||!MCAT||app.dataset.view==='models')return;openWelcome()}
+  if(seen||!MCAT||app.dataset.view==='models')return;
+  /* the first time, the models service is still measuring this machine: without its RAM no model fits yet */
+  if(!(MCAT.machine||{}).ram_total_gb&&welcomeWaits++<20){setTimeout(loadModels,1500);return}
+  openWelcome()}
 function openWelcome(){const m=MCAT.machine;$('#mWelcomeMach').textContent=`${(m.cpu||'').replace(/ w\/.*$/,'')} · ${gbf(m.ram_total_gb)} GB di RAM · ${(m.gpus||[]).length?m.gpus[0].name.replace(/ \(.*\)$/,''):'nessuna GPU'} · ${gbf(m.disk_free_gb)} GB liberi sul disco`;
   $('#mWelcomeBest').innerHTML=bestCards();$('#mWelcome').classList.add('open')}
 function closeWelcome(){$('#mWelcome').classList.remove('open');try{localStorage.setItem('colibri.local.welcomed','1')}catch(e){}}

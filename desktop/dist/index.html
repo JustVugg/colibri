@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>colibrì</title>
+<style>
+  :root { color-scheme: dark; --bg: #141414; --ink: #ececec; --muted: #8b8b8b; --accent: #38c6c6;
+    --line: #333333; --bad: #ff7a88; --code: #0c0c0c; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 18px; padding: 0 24px; box-sizing: border-box; }
+  h1 { margin: 0; font-size: 28px; font-weight: 700; letter-spacing: .02em; }
+  h1 span { color: var(--accent); }
+  .bar { width: 220px; height: 3px; border-radius: 3px; background: #262626; overflow: hidden; }
+  .bar i { display: block; width: 40%; height: 100%; background: var(--accent); animation: go 1.1s ease-in-out infinite; }
+  @keyframes go { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+  #status { color: var(--muted); min-height: 1.5em; text-align: center; max-width: 620px; }
+  #hint { color: var(--muted); text-align: center; max-width: 620px; font-size: 14px; }
+  #hint code, #detail { font: 13px/1.45 ui-monospace, "Cascadia Mono", Consolas, monospace; }
+  #hint code { background: var(--code); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; color: var(--ink); white-space: nowrap; }
+  #detail { white-space: pre-wrap; background: var(--code); border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px 14px; max-width: 760px; max-height: 40vh; overflow: auto; color: #c8c8c8; margin: 0; }
+  button { font: inherit; color: var(--bg); background: var(--accent); border: 0; border-radius: 8px;
+    padding: 7px 18px; cursor: pointer; font-weight: 600; }
+  button:hover { filter: brightness(1.1); }
+  body.bad #status { color: var(--bad); }
+  body.bad .bar { visibility: hidden; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>colibr<span>ì</span></h1>
+  <div class="bar"><i></i></div>
+  <div id="status"></div>
+  <div id="hint" hidden></div>
+  <pre id="detail" hidden></pre>
+  <button id="retry" hidden></button>
+</main>
+<script src="loader.js"></script>
+</body>
+</html>
