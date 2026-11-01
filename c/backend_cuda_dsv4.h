@@ -194,6 +194,26 @@ Dsv4CudaExpertSet *dsv4_cuda_expert_set_create(Dsv4CudaTensor *const *gate,Dsv4C
 int dsv4_cuda_expert_bank_slots(int experts);
 /* Device bytes one slot of an expert bank of this geometry takes. */
 long long dsv4_cuda_expert_bank_slot_bytes(int hidden,int intermediate);
+int dsv4_cuda_peer_access(int a,int b);
+/* Before dsv4_cuda_init: can `peer` carry `device`'s peer mirror pool (both
+ * visible and distinct, the peer not latched off by dsv4_cuda_peer_healthy,
+ * both of an architecture and with a kernel image this build runs -- the
+ * primary checked first --, peer access both ways)? 1 = yes; 0 = no, the
+ * reason in why (truncated to why_size). A refused peer is left
+ * uninitialised. */
+int dsv4_cuda_peer_probe(int device,int peer,char *why,int why_size);
+/* 1 when the decode MoE on device runs the experts mirrored on peer ON peer
+ * (DSV4_CUDA_PEER_COMPUTE), 0 when device reads them in place over P2P. */
+int dsv4_cuda_peer_compute(int device,int peer);
+/* 0 once a peer-side CUDA failure in the decode MoE has latched this device
+ * off for the rest of the process (after the call that latched it, no kernel
+ * reads its memory from another device again), else 1. */
+int dsv4_cuda_peer_healthy(int device);
+/* 1 once a sticky CUDA error (a kernel fault) has latched CUDA off for the
+ * whole process: with peer access a fault on one GPU takes the others' contexts
+ * with it, and no context recovers in-process. From then on every entry point
+ * refuses without touching CUDA; the engine takes its host paths. */
+int dsv4_cuda_lost(void);
 Dsv4CudaExpertSet *dsv4_cuda_expert_bank_create(int count,int hidden,int intermediate,int device,
                                                  Dsv4CudaTensor *shared_gate,Dsv4CudaTensor *shared_up,
                                                  Dsv4CudaTensor *shared_down);
