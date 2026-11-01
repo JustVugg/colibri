@@ -18,6 +18,12 @@ static int64_t expert_bytes_layer(Model *m, int layer){
     if(st_nbytes(&m->S,nm)<=0) return 0;
     for(int k=0;k<3;k++){
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight",layer,suf[k]);
+        const st_tensor *t=st_find(&m->S,nm);
+        if(t && st_is_ggml(t->dtype) && t->rank==2){   /* a GGUF's: as qt_from_disk holds it */
+            const int held=coli_ggml_held_type(st_ggml_type(t->dtype),t->shape[0],t->shape[1],"GLM_ILV16");
+            eb+=gq_row_bytes(held,t->shape[1])*t->shape[0];
+            continue;
+        }
         eb+=st_nbytes(&m->S,nm);
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight.qs",layer,suf[k]);
         int64_t q=st_nbytes(&m->S,nm); if(q>0) eb+=q;

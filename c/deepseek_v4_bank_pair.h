@@ -1,5 +1,6 @@
 /* deepseek_v4_bank_pair.h — decision logic for the double-buffered prefill
- * expert bank (COLI_CUDA_MOE_DOUBLE=1).
+ * expert bank (COLI_CUDA_MOE_DOUBLE=1), and the VRAM reserve decode keeps
+ * free for the bank(s).
  *
  * While the GPU computes layer L's chunks from the active bank, a worker
  * thread loads layer L+1's COMPLETE expert set into the other bank over the
@@ -47,6 +48,37 @@ static inline int coli_v4_bank_pair_prefetch_target(int double_on,
     if (!double_on || current_layer < 0) return -1;
     if (current_layer + 1 >= num_layers) return -1;
     return current_layer + 1;
+}
+
+/* ---- VRAM the decode mirror cache leaves free for the bank(s) ----
+ * Decode grows its routed-expert mirror cache while free VRAM stays above a
+ * reserve, and the next large prefill allocates its bank(s) from what is
+ * left, so the default reserve is sized from the bank itself: attention/work
+ * headroom (the whole reserve without the bank), plus `banks` x
+ * `bank_bytes` (two with COLI_CUDA_MOE_DOUBLE until its prefetch has
+ * latched off; a second bank that did not fit is retried by the next
+ * prefill, so it stays reserved), plus COLI_V4_MIRROR_PROBE_EVERY mirrors of
+ * `mirror_bytes`: the guard re-reads free VRAM only every that many misses,
+ * so the cache can grow that far past the reserve before it notices. A card
+ * too small for that after the dense mirrors (two 256-slot banks alone are
+ * 6.4 GiB) would freeze the cache below the 8 live entries GPU decode needs
+ * and run every expert on the CPU, so below COLI_V4_MIRROR_MIN_LIVE entries
+ * the default falls back to the headroom: decode keeps a working mirror set,
+ * and a bank that no longer fits falls back to the CPU union.
+ * `bank_bytes` <= 0 = no bank. Returns MiB, rounded up. */
+#define COLI_V4_RESERVE_HEADROOM_MB 600
+#define COLI_V4_MIRROR_PROBE_EVERY 64
+#define COLI_V4_MIRROR_MIN_LIVE 32
+
+static inline long long coli_v4_mirror_reserve_mb(long long bank_bytes,
+                                                  int banks,
+                                                  long long mirror_bytes,
+                                                  int live) {
+    if (bank_bytes <= 0 || banks < 1 || live < COLI_V4_MIRROR_MIN_LIVE)
+        return COLI_V4_RESERVE_HEADROOM_MB;
+    long long bytes = (long long)banks * bank_bytes +
+                      (long long)COLI_V4_MIRROR_PROBE_EVERY * mirror_bytes;
+    return COLI_V4_RESERVE_HEADROOM_MB + ((bytes + (1LL << 20) - 1) >> 20);
 }
 
 #endif /* DEEPSEEK_V4_BANK_PAIR_H */

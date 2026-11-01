@@ -1,9 +1,13 @@
+import importlib.util
 import json
 import sys
 import threading
+import types
 import unittest
 from http.client import HTTPConnection
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -79,6 +83,71 @@ class ClusterRegistryTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+def _start(port=0):
+    server = ClusterServer(("127.0.0.1", port), ClusterRegistry())
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+class ClusterWorkerReRegisterTests(unittest.TestCase):
+    """The registry lives in the coordinator's memory. A worker that keeps
+    running across a coordinator restart must register again, or every
+    heartbeat is refused and `coli serve --cluster-coordinator` finds no
+    live expert workers until the worker itself is restarted."""
+
+    @classmethod
+    def setUpClass(cls):
+        loader = SourceFileLoader("coli_cluster_under_test",
+                                  str(Path(__file__).resolve().parents[1] / "coli"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        cls.coli = importlib.util.module_from_spec(spec)
+        loader.exec_module(cls.coli)
+
+    def test_worker_registers_again_after_a_coordinator_restart(self):
+        coli = self.coli
+        servers = [_start()]
+        host, port = servers[0].server_address
+
+        class Ticks:
+            calls = 0
+
+            def wait(self, _timeout):
+                Ticks.calls += 1
+                if Ticks.calls == 1:            # the coordinator restarts, empty
+                    servers[0].shutdown()
+                    servers[0].server_close()
+                    servers.append(_start(port))
+                return Ticks.calls > 1          # one heartbeat tick, then stop
+
+            def set(self):
+                pass
+
+        class Inline:
+            def __init__(self, target, **_kw):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        a = types.SimpleNamespace(model="/m", cap=24, ebits=8, dbits=8, port=9100,
+                                  layers="all", coordinator=f"http://{host}:{port}",
+                                  advertise_host="10.0.0.2", node_id="mac-a")
+        family = types.SimpleNamespace(descriptor=types.SimpleNamespace(id="glm"))
+        try:
+            with mock.patch.object(coli, "need_worker_model", return_value="/tmp/engine"), \
+                    mock.patch.object(coli, "resolve_model", return_value=family), \
+                    mock.patch.object(coli, "env_for", return_value={}), \
+                    mock.patch.object(coli, "threading",
+                                      types.SimpleNamespace(Event=Ticks, Thread=Inline)), \
+                    mock.patch.object(coli.subprocess, "call", return_value=0), \
+                    mock.patch("builtins.print"):
+                coli.cmd_cluster_worker(a)
+            self.assertEqual(servers[-1].registry.expert_endpoints(), ["10.0.0.2:9100"])
+        finally:
+            servers[-1].shutdown()
+            servers[-1].server_close()
 
 
 if __name__ == "__main__":

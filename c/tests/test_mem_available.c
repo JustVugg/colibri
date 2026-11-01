@@ -53,8 +53,11 @@ int main(void){
     FILE *f = fopen("/proc/meminfo", "r"); double kb = 0;
     if(f){ char ln[256]; while(fgets(ln, sizeof ln, f)) if(sscanf(ln, "MemAvailable: %lf", &kb) == 1) break; fclose(f); }
     if(kb > 0){
-        double ratio = avail / (kb / 1e6);
-        check(ratio > 0.9 && ratio < 1.1, "non coincide con MemAvailable di /proc/meminfo");
+        /* in un container con un tetto, il posto che il cgroup lascia se e' minore */
+        double want = kb / 1e6; uint64_t lim, room;
+        if(compat_cgroup_room("/sys/fs/cgroup", "/proc/self/cgroup", &lim, &room) && room / 1e9 < want) want = room / 1e9;
+        double ratio = avail / want;
+        check(ratio > 0.9 && ratio < 1.1, "non coincide con MemAvailable di /proc/meminfo (o il posto del cgroup)");
     }
 #endif
     if(fails){ printf("test_mem_available: %d fallimenti\n", fails); return 1; }

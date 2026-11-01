@@ -1,0 +1,320 @@
+def solve(nums, target):
+    """Return indices of the two numbers that add up to target."""
+    seen = {}
+    for i, n in enumerate(nums):
+        need = target - n
+        if need in seen:
+            return [seen[need], i]
+        seen[n] = i
+    return []
+
+class SegmentTree:
+    def __init__(self, data):
+        self.n = len(data)
+        self.tree = [0] * (2 * self.n)
+        self.tree[self.n:] = data
+        for i in range(self.n - 1, 0, -1):
+            self.tree[i] = self.tree[2 * i] + self.tree[2 * i + 1]
+
+    def update(self, index, value):
+        pos = index + self.n
+        self.tree[pos] = value
+        while pos > 1:
+            pos //= 2
+            self.tree[pos] = self.tree[2 * pos] + self.tree[2 * pos + 1]
+
+    def query(self, left, right):
+        left += self.n
+        right += self.n
+        total = 0
+        while left < right:
+            if left & 1:
+                total += self.tree[left]
+                left += 1
+            if right & 1:
+                right -= 1
+                total += self.tree[right]
+            left //= 2
+            right //= 2
+        return total
+
+def solve(nums, target):
+    """Return indices of the two numbers that add up to target."""
+    seen = {}
+    for i, n in enumerate(nums):
+        need = target - n
+        if need in seen:
+            return [seen[need], i]
+        seen[n] = i
+    return []
+
+class SegmentTree:
+    def __init__(self, data):
+        self.n = len(data)
+        self.tree = [0] * (2 * self.n)
+        self.tree[self.n:] = data
+        for i in range(self.n - 1, 0, -1):
+            self.tree[i] = self.tree[2 * i] + self.tree[2 * i + 1]
+
+    def update(self, index, value):
+        pos = index + self.n
+        self.tree[pos] = value
+        while pos > 1:
+            pos //= 2
+            self.tree[pos] = self.tree[2 * pos] + self.tree[2 * pos + 1]
+
+    def query(self, left, right):
+        left += self.n
+        right += self.n
+        total = 0
+        while left < right:
+            if left & 1:
+                total += self.tree[left]
+                left += 1
+            if right & 1:
+                right -= 1
+                total += self.tree[right]
+            left //= 2
+            right //= 2
+        return total
+
+def solve(nums, target):
+    """Return indices of the two numbers that add up to target."""
+    seen = {}
+    for i, n in enumerate(nums):
+        need = target - n
+        if need in seen:
+            return [seen[need], i]
+        seen[n] = i
+    return []
+
+class SegmentTree:
+    def __init__(self, data):
+        self.n = len(data)
+        self.tree = [0] * (2 * self.n)
+        self.tree[self.n:] = data
+        for i in range(self.n - 1, 0, -1):
+            self.tree[i] = self.tree[2 * i] + self.tree[2 * i + 1]
+
+    def update(self, index, value):
+        pos = index + self.n
+        self.tree[pos] = value
+        while pos > 1:
+            pos //= 2
+            self.tree[pos] = self.tree[2 * pos] + self.tree[2 * pos + 1]
+
+    def query(self, left, right):
+        left += self.n
+        right += self.n
+        total = 0
+        while left < right:
+            if left & 1:
+                total += self.tree[left]
+                left += 1
+            if right & 1:
+                right -= 1
+                total += self.tree[right]
+            left //= 2
+            right //= 2
+        return total
+
+def solve(nums, target):
+    """Return indices of the two numbers that add up to target."""
+    seen = {}
+    for i, n in enumerate(nums):
+        need = target - n
+        if need in seen:
+            return [seen[need], i]
+        seen[n] = i
+    return []
+
+class SegmentTree:
+    def __init__(self, data):
+        self.n = len(data)
+        self.tree = [0] * (2 * self.n)
+        self.tree[self.n:] = data
+        for i in range(self.n - 1, 0, -1):
+            self.tree[i] = self.tree[2 * i] + self.tree[2 * i + 1]
+
+    def update(self, index, value):
+        pos = index + self.n
+        self.tree[pos] = value
+        while pos > 1:
+            pos //= 2
+            self.tree[pos] = self.tree[2 * pos] + self.tree[2 * pos + 1]
+
+    def query(self, left, right):
+        left += self.n
+        right += self.n
+        total = 0
+        while left < right:
+            if left & 1:
+                total += self.tree[left]
+                left += 1
+            if right & 1:
+                right -= 1
+                total += self.tree[right]
+            left //= 2
+            right //= 2
+        return total
+
+def solve(nums, target):
+    """Return indices of the two numbers that add up to target."""
+    seen = {}
+    for i, n in enumerate(nums):
+        need = target - n
+        if need in seen:
+            return [seen[need], i]
+        seen[n] = i
+    return []
+
+class SegmentTree:
+    def __init__(self, data):
+        self.n = len(data)
+        self.tree = [0] * (2 * self.n)
+        self.tree[self.n:] = data
+        for i in range(self.n - 1, 0, -1):
+            self.tree[i] = self.tree[2 * i] + self.tree[2 * i + 1]
+
+    def update(self, index, value):
+        pos = index + self.n
+        self.tree[pos] = value
+        while pos > 1:
+            pos //= 2
+            self.tree[pos] = self.tree[2 * pos] + self.tree[2 * pos + 1]
+
+    def query(self, left, right):
+        left += self.n
+        right += self.n
+        total = 0
+        while left < right:
+            if left & 1:
+                total += self.tree[left]
+                left += 1
+            if right & 1:
+                right -= 1
+                total += self.tree[right]
+            left //= 2
+            right //= 2
+        return total
+
+def solve(nums, target):
+    """Return indices of the two numbers that add up to target."""
+    seen = {}
+    for i, n in enumerate(nums):
+        need = target - n
+        if need in seen:
+            return [seen[need], i]
+        seen[n] = i
+    return []
+
+class SegmentTree:
+    def __init__(self, data):
+        self.n = len(data)
+        self.tree = [0] * (2 * self.n)
+        self.tree[self.n:] = data
+        for i in range(self.n - 1, 0, -1):
+            self.tree[i] = self.tree[2 * i] + self.tree[2 * i + 1]
+
+    def update(self, index, value):
+        pos = index + self.n
+        self.tree[pos] = value
+        while pos > 1:
+            pos //= 2
+            self.tree[pos] = self.tree[2 * pos] + self.tree[2 * pos + 1]
+
+    def query(self, left, right):
+        left += self.n
+        right += self.n
+        total = 0
+        while left < right:
+            if left & 1:
+                total += self.tree[left]
+                left += 1
+            if right & 1:
+                right -= 1
+                total += self.tree[right]
+            left //= 2
+            right //= 2
+        return total
+
+def solve(nums, target):
+    """Return indices of the two numbers that add up to target."""
+    seen = {}
+    for i, n in enumerate(nums):
+        need = target - n
+        if need in seen:
+            return [seen[need], i]
+        seen[n] = i
+    return []
+
+class SegmentTree:
+    def __init__(self, data):
+        self.n = len(data)
+        self.tree = [0] * (2 * self.n)
+        self.tree[self.n:] = data
+        for i in range(self.n - 1, 0, -1):
+            self.tree[i] = self.tree[2 * i] + self.tree[2 * i + 1]
+
+    def update(self, index, value):
+        pos = index + self.n
+        self.tree[pos] = value
+        while pos > 1:
+            pos //= 2
+            self.tree[pos] = self.tree[2 * pos] + self.tree[2 * pos + 1]
+
+    def query(self, left, right):
+        left += self.n
+        right += self.n
+        total = 0
+        while left < right:
+            if left & 1:
+                total += self.tree[left]
+                left += 1
+            if right & 1:
+                right -= 1
+                total += self.tree[right]
+            left //= 2
+            right //= 2
+        return total
+
+def solve(nums, target):
+    """Return indices of the two numbers that add up to target."""
+    seen = {}
+    for i, n in enumerate(nums):
+        need = target - n
+        if need in seen:
+            return [seen[need], i]
+        seen[n] = i
+    return []
+
+class SegmentTree:
+    def __init__(self, data):
+        self.n = len(data)
+        self.tree = [0] * (2 * self.n)
+        self.tree[self.n:] = data
+        for i in range(self.n - 1, 0, -1):
+            self.tree[i] = self.tree[2 * i] + self.tree[2 * i + 1]
+
+    def update(self, index, value):
+        pos = index + self.n
+        self.tree[pos] = value
+        while pos > 1:
+            pos //= 2
+            self.tree[pos] = self.tree[2 * pos] + self.tree[2 * pos + 1]
+
+    def query(self, left, right):
+        left += self.n
+        right += self.n
+        total = 0
+        while left < right:
+            if left & 1:
+                total += self.tree[left]
+                left += 1
+            if right & 1:
+                right -= 1
+                total += self.tree[right]
+            left //= 2
+            right //= 2
+        return total
+

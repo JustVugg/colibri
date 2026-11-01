@@ -62,6 +62,9 @@ class Protocol(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, {"COLI_SETUP_HOME": self.tmp.name})
         patcher.start()
         self.addCleanup(patcher.stop)
+        owner = mock.patch.object(mcp_server, "_INSTALL_PROCESS", None)
+        owner.start()
+        self.addCleanup(owner.stop)
         self.x = Exchange()
 
     def test_initialize_negotiates_the_version(self):
@@ -92,6 +95,21 @@ class Protocol(unittest.TestCase):
         self.assertEqual(self.x.messages()[-1]["error"]["code"], mcp_server.PARSE_ERROR)
         self.x.send({"id": 5, "method": "ping"})                       # no jsonrpc member
         self.assertEqual(self.x.messages()[-1]["error"]["code"], mcp_server.INVALID_REQUEST)
+
+    def test_deeply_nested_json_does_not_end_stdio_session(self):
+        deep = '[' * (sys.getrecursionlimit() * 10) + '0' + ']' * (sys.getrecursionlimit() * 10)
+        ping = json.dumps(request(91, 'ping'))
+        process = subprocess.run(
+            [sys.executable, str(C_DIR / 'mcp_server.py')],
+            input=deep + '\n' + ping + '\n', text=True, capture_output=True, timeout=10)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        replies = [json.loads(line) for line in process.stdout.splitlines()]
+        # Up to Python 3.13 the decoder stops at the recursion limit (a parse error). From
+        # 3.14 its guard follows the C stack, so this depth parses and the batch holds one
+        # array, an invalid request. Either way the session answers the next line.
+        self.assertIn(replies[0]['error']['code'], (mcp_server.PARSE_ERROR, mcp_server.INVALID_REQUEST))
+        self.assertIsNone(replies[0]['id'])
+        self.assertEqual(replies[1], {'jsonrpc': '2.0', 'id': 91, 'result': {}})
 
     def test_batch(self):
         self.x.server.handle_line(json.dumps([request(1, "ping"), request(2, "ping")]))
@@ -159,7 +177,8 @@ class Protocol(unittest.TestCase):
                       "--background", "--no-browser"):
             self.assertIn(piece, command)
         self.assertEqual(result["structuredContent"]["job"]["pid"], 4242)
-        self.assertEqual(setup_flow.read_state()["pid"], 4242)
+        self.assertEqual(result["structuredContent"]["install"]["pid"], 4242)
+        self.assertIsNone(setup_flow.read_state(), "the fake child has not published durable state")
 
     def test_install_refuses_unknown_models_and_a_second_job(self):
         self.x.send(request(1, "tools/call", {"name": "install", "arguments": {"model": "gpt-9"}}))
@@ -207,6 +226,18 @@ class Protocol(unittest.TestCase):
         self.x.send(request(1, "tools/call", {"name": "logs", "arguments": {"lines": 3}}))
         data = self.x.reply(1)["result"]["structuredContent"]
         self.assertEqual(data["text"], "line 47\nline 48\nline 49")
+
+    def test_build_logs_reads_the_latest_backend_log(self):
+        # The setup writes one build log per backend (setup_flow.build_log_name).
+        cuda, cpu = setup_flow.log_path("build-cuda"), setup_flow.log_path("build-cpu")
+        os.makedirs(os.path.dirname(cuda))
+        Path(cuda).write_text("nvcc fatal: unsupported gpu architecture")
+        Path(cpu).write_text("make: *** [colibri] Error 1")
+        os.utime(cuda, (1, 1))
+        self.x.send(request(1, "tools/call", {"name": "logs", "arguments": {"which": "build"}}))
+        data = self.x.reply(1)["result"]["structuredContent"]
+        self.assertEqual(data["log"], cpu)
+        self.assertEqual(data["text"], "make: *** [colibri] Error 1")
 
     def test_a_crashing_tool_does_not_take_the_server_down(self):
         with mock.patch.dict(mcp_server.HANDLERS, {"status": lambda a, n: 1 / 0}), \

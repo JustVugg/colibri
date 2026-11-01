@@ -14,7 +14,8 @@
  * Phase 2 goes through the public API instead of raw kernels: upload_g plus
  * coli_cuda_expert_group (sync) and coli_cuda_expert_group_issue/take (the
  * async decode path the VRAM expert tiers ride) against the same reference —
- * the async result must be bit-identical to the sync one.
+ * the async result must be bit-identical to the sync one. Phase 3 does the same
+ * with groups of one format, which take the chain's decode kernels.
  *
  * Build: nvcc -O2 -std=c++17 -arch=native tests/test_grouped_g4_cuda.cu -o tests/test_grouped_g4
  */
@@ -170,6 +171,95 @@ int main(void){
         free(x);free(ysync);
         coli_cuda_shutdown();
         if(api_bad){ printf("FAIL\n"); return 1; }
+    }
+
+    /* ---- Phase 3: a decode group whose experts share one format (int4 in groups of 64,
+     * then int4 with a scale a row) takes the chain's decode kernels (group_moe_launch,
+     * widths multiples of 32): sync against the oracle, async against sync bit for bit ---- */
+    for(int fmt=4; fmt>=2; fmt-=2){
+        const int D3=256, I3=128, gs3=fmt==4?64:0, rb3=D3/2, rbi3=I3/2;
+        const int ng3=gs3?D3/gs3:1, ngi3=gs3?I3/gs3:1;
+        int devs[1]={0};
+        if(!coli_cuda_init(devs,1)){ printf("FAIL cuda init\n"); return 1; }
+        int rows[COUNT]={1,2,1}, total=4, bad3=0;
+        /* a prompt chunk's group (more than 8 rows: the tensor cores' sorted GEMMs, f16 or
+         * TF32 operands) from the same experts, against the oracle within those roundings */
+        int rowsb[COUNT]={20,33,15}, totalb=68, bad4=0;
+        ColiCudaTensor *tg[COUNT]={},*tu[COUNT]={},*td[COUNT]={};
+        uint8_t *hg[COUNT],*hu[COUNT],*hd[COUNT]; float *hgs[COUNT],*hus[COUNT],*hds[COUNT];
+        for(int c=0;c<COUNT;c++){
+            hg[c]=(uint8_t*)malloc((size_t)I3*rb3); hu[c]=(uint8_t*)malloc((size_t)I3*rb3); hd[c]=(uint8_t*)malloc((size_t)D3*rbi3);
+            hgs[c]=(float*)malloc((size_t)I3*ng3*4); hus[c]=(float*)malloc((size_t)I3*ng3*4); hds[c]=(float*)malloc((size_t)D3*ngi3*4);
+            for(size_t i=0;i<(size_t)I3*rb3;i++){ hg[c][i]=rand()&255; hu[c][i]=rand()&255; }
+            for(size_t i=0;i<(size_t)D3*rbi3;i++) hd[c][i]=rand()&255;
+            for(size_t i=0;i<(size_t)I3*ng3;i++){ hgs[c][i]=.01f+.05f*(rand()/(float)RAND_MAX); hus[c][i]=.01f+.05f*(rand()/(float)RAND_MAX); }
+            for(size_t i=0;i<(size_t)D3*ngi3;i++) hds[c][i]=.01f+.05f*(rand()/(float)RAND_MAX);
+            if(!coli_cuda_tensor_upload_g(&tg[c],hg[c],hgs[c],fmt,D3,I3,0,gs3)||
+               !coli_cuda_tensor_upload_g(&tu[c],hu[c],hus[c],fmt,D3,I3,0,gs3)||
+               !coli_cuda_tensor_upload_g(&td[c],hd[c],hds[c],fmt,I3,D3,0,gs3)){ printf("FAIL upload_g\n"); return 1; }
+        }
+        float *x=(float*)malloc((size_t)total*D3*4),*ysync=(float*)malloc((size_t)total*D3*4);
+        for(size_t i=0;i<(size_t)total*D3;i++) x[i]=(rand()/(float)RAND_MAX-.5f)*2.f;
+        uint64_t m0=g_group_moe_calls;
+        if(!coli_cuda_expert_group(tg,tu,td,rows,COUNT,ysync,x)){ printf("FAIL sync group\n"); return 1; }
+        if(!coli_cuda_expert_group_issue(tg,tu,td,rows,COUNT,x)){ printf("FAIL async issue\n"); return 1; }
+        const float *yasync=coli_cuda_expert_group_take(0);
+        if(!yasync){ printf("FAIL async take\n"); return 1; }
+        int took=(int)(g_group_moe_calls-m0);
+        for(int c=0,off=0;c<COUNT;off+=rows[c],c++)
+            for(int s=0;s<rows[c];s++){
+                float rg[256],ru[256],rh[256],ry[256];
+                const float *xr=x+(size_t)(off+s)*D3;
+                cpu_gemv_g4(hg[c],hgs[c],D3,I3,gs3,xr,rg); cpu_gemv_g4(hu[c],hus[c],D3,I3,gs3,xr,ru);
+                for(int o=0;o<I3;o++) rh[o]=(rg[o]/(1.f+expf(-rg[o])))*ru[o];
+                cpu_gemv_g4(hd[c],hds[c],I3,D3,gs3,rh,ry);
+                for(int o=0;o<D3;o++){
+                    size_t z=(size_t)(off+s)*D3+o;
+                    if(fabsf(ysync[z]-ry[o])>1e-3f*(fabsf(ry[o])+1e-3f)) bad3++;
+                    if(yasync[z]!=ysync[z]) bad3++;
+                }
+            }
+        printf("decode group fmt %d on the chain's kernels: %d of 2 groups took them, %d mismatches\n",fmt,took,bad3);
+        {
+            float *xb=(float*)malloc((size_t)totalb*D3*4),*yb=(float*)malloc((size_t)totalb*D3*4);
+            for(size_t i=0;i<(size_t)totalb*D3;i++) xb[i]=(rand()/(float)RAND_MAX-.5f)*2.f;
+            uint64_t mb=g_group_moe_calls;
+            if(!coli_cuda_expert_group(tg,tu,td,rowsb,COUNT,yb,xb)){ printf("FAIL prompt group\n"); return 1; }
+            int tookb=(int)(g_group_moe_calls-mb); double worst=0;
+            for(int c=0,off=0;c<COUNT;off+=rowsb[c],c++)
+                for(int s=0;s<rowsb[c];s++){
+                    float rg[256],ru[256],rh[256],ry[256];
+                    const float *xr=xb+(size_t)(off+s)*D3;
+                    cpu_gemv_g4(hg[c],hgs[c],D3,I3,gs3,xr,rg); cpu_gemv_g4(hu[c],hus[c],D3,I3,gs3,xr,ru);
+                    for(int o=0;o<I3;o++) rh[o]=(rg[o]/(1.f+expf(-rg[o])))*ru[o];
+                    cpu_gemv_g4(hd[c],hds[c],I3,D3,gs3,rh,ry);
+                    double sc=0; for(int o=0;o<D3;o++) if(fabs(ry[o])>sc) sc=fabs(ry[o]);
+                    for(int o=0;o<D3;o++){ double e=fabs(yb[(size_t)(off+s)*D3+o]-ry[o])/(sc>0?sc:1); if(!(e<=worst)) worst=e; }
+                }
+            if(!(worst<2e-2)) bad4++;
+            printf("prompt group fmt %d (%d rows) on the chain's kernels: %d of 1 took them, worst %.2e of the row's largest\n",fmt,totalb,tookb,worst);
+            const char *ge4=getenv("COLI_CUDA_GROUP_MOE");
+            if(tookb!=1&&!(ge4&&*ge4=='0')) bad4++;
+            /* a speculation's verify (pinned): every row the bits it has alone, as a decode step */
+            int same=1;
+            if(!coli_cuda_expert_group_pinned(tg,tu,td,rowsb,COUNT,yb,xb,1)){ printf("FAIL pinned group\n"); return 1; }
+            for(int c=0,off=0;c<COUNT&&same;off+=rowsb[c],c++)
+                for(int s=0;s<rowsb[c]&&same;s++){
+                    float y1[256]; int one=1;
+                    ColiCudaTensor *g1[1]={tg[c]},*u1[1]={tu[c]},*d1[1]={td[c]};
+                    if(!coli_cuda_expert_group(g1,u1,d1,&one,1,y1,xb+(size_t)(off+s)*D3)){ same=0; break; }
+                    same=!memcmp(y1,yb+(size_t)(off+s)*D3,(size_t)D3*4);
+                }
+            printf("prompt group fmt %d pinned: every row a decode step's bits: %s\n",fmt,same?"yes":"NO");
+            if(!same) bad4++;
+            free(xb); free(yb);
+        }
+        for(int c=0;c<COUNT;c++){ coli_cuda_tensor_free(tg[c]);coli_cuda_tensor_free(tu[c]);coli_cuda_tensor_free(td[c]);
+            free(hg[c]);free(hu[c]);free(hd[c]);free(hgs[c]);free(hus[c]);free(hds[c]); }
+        free(x);free(ysync);
+        coli_cuda_shutdown();
+        const char *ge=getenv("COLI_CUDA_GROUP_MOE");
+        if(bad3||bad4||(took!=2&&!(ge&&*ge=='0'))){ printf("FAIL\n"); return 1; }
     }
     printf("OK\n"); return 0;
 }

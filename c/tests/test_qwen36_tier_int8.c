@@ -84,11 +84,16 @@ int main(void) {
 
     qt_shutdown();
 
-    /* ---- 2. int8 + scale raggruppate: il kernel non sa esprimerle ---- */
+    /* ---- 2. int8 + scale raggruppate: il kernel non sa esprimerle ----
+     * Il tier parte lo stesso, ma per il solo tronco denso (#2090): nessun
+     * budget per gli esperti, nessun upload, mai numeri sbagliati in VRAM. */
     fake_uploads = 0;
-    check(qt_init(NL, NE, D, IH, NE, TOPK, 64 /* grouped */, 0 /* int8 */) == 0,
-          "int8 con scale raggruppate va rifiutato PRIMA di riservare budget, "
-          "non promosso con numeri sbagliati");
+    check(qt_init(NL, NE, D, IH, NE, TOPK, 64 /* grouped */, 0 /* int8 */) == 1 && !qt_experts_on(),
+          "int8 con scale raggruppate: tier per il solo tronco, esperti rifiutati PRIMA di riservare budget");
+    check(G.budget[0] == 0, "nessun budget per gli esperti");
+    qt_note(0, 0, g, u, d, sc, sc, sc);
+    check(fake_uploads == 0 && !qt_is_resident(0, 0), "nessun esperto promosso con numeri sbagliati");
+    qt_shutdown();
 
     /* ---- 3. int4 non deve cambiare comportamento ---- */
     if (!qt_init(NL, NE, D, IH, NE, TOPK, 64, 1 /* int4 */)) {

@@ -9,10 +9,12 @@
  *     gate/up pair that quantizes the shared input ONCE instead of twice.
  *
  * Numerics: all integer dots are exact (sign-extend + madd, as dot_i8_16);
- * activation quantization is byte-exact vs the scalar path, so v3/pair-v3
- * outputs are bit-identical to the stock matmul_q calls — verified by
- * memcmp in tests/bench_fused3.c. The flag only changes instruction
- * scheduling, never values.
+ * activation quantization is byte-exact vs matmul_q's IDOT branch, so
+ * v3/pair-v3 outputs are bit-identical to matmul_q with IDOT=1 — verified by
+ * memcmp in tests/bench_fused3.c. That branch quantizes the ACTIVATIONS to
+ * Q8_0 and is lossy against the default (non-IDOT) path (#1044), so olmoe.c
+ * only calls these kernels when IDOT=1 is set explicitly. The flag changes
+ * instruction scheduling, never values relative to IDOT=1.
  *
  * Header-only, all static, no dependencies beyond immintrin — mirrors quant.h
  * conventions. Guarded by __AVX2__; callers keep the stock fallback.

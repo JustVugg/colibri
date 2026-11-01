@@ -49,7 +49,7 @@ const zhTW: Record<string, string> = {
   "topbar.tokPerSec": "{{n}} tok/s",
   "topbar.slot": "插槽 {{n}}",
   "topbar.truncated": "已截斷",
-  "topbar.truncatedHelp": "回應達到最大輸出 token 上限而被截斷。請提高「最大輸出 token 數」以查看完整答案。",
+  "topbar.truncatedHelp": "回應達到輸出上限或上下文末端而被截斷。如果你調低過「最大輸出 token 數」，請調高；否則請繼續產生回應。",
   "topbar.clear": "清除",
 
   "hero.title": "COLIBRÌ 引擎",
@@ -61,6 +61,10 @@ const zhTW: Record<string, string> = {
   "prompts.caching": "比較 RAM 與 VRAM 快取",
 
   "chat.you": "你",
+  "chat.toBottom": "跳到最新訊息",
+  "chat.image": "圖片",
+  "ui.exportMarkdown": "Markdown (.md)",
+  "ui.exportJson": "JSON (.json)",
   "chat.colibri": "colibrì",
   "chat.placeholder": "傳送訊息給 colibrì…",
   "chat.inputHint": "Enter 傳送 · Shift+Enter 換行",

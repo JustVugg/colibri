@@ -1,0 +1,117 @@
+{
+  "version": 1,
+  "hypothesis": "Scoring the MTP head's drafts over an adaptive list of the most used tokens (16000 and the conversation's) with the rows of the lm_head already on the card, instead of the whole 248320-token vocabulary, raises Qwen3.6's decode with the head's drafts on an L4 with every expert in VRAM, with the same logits (code, one draft a step, warm counts).",
+  "commit": "16d9f6703aeb716135d5df22092e742be9cc9b5b",
+  "model": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64",
+  "command": "cd c && make qwen36_tier.o backend_cuda.o cuda_chain.o cu_xb.o cu_tier.o CUDA=1 CUDA_ARCH=sm_89 && gcc -O3 -march=native -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_CUDA -I. ../docs/experiments/qwen36-mtp-draft-list-2026-10-26/bench.c qwen36_tier.o backend_cuda.o cuda_chain.o cu_xb.o cu_tier.o -o qwen36-bench -lm -fopenmp -pthread -L/usr/local/cuda/lib64 -Wl,-rpath,/usr/local/cuda/lib64 -lcudart -lcublasLt -lcublas -lstdc++; env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/lib64-nvidia COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close Q36_MTP=1 Q36_MTP_DRAFTS=1 COLI_VOCAB_USAGE=../docs/experiments/qwen36-mtp-draft-list-2026-10-26/coli_vocab USAGE_SAVE=0 ./qwen36-bench --model <model> --text ../docs/experiments/qwen36-mtp-draft-list-2026-10-26/code.txt --lengths 64,512 --gen 32 --teacher --steps <steps file>",
+  "prompt_hash": "ff641dc87569e6e3b56c3e7996fce21627a4b8cea5489d90864d6102232a2e72",
+  "hardware": {
+    "cpu": "Intel(R) Xeon(R) CPU @ 2.20GHz (6 cores / 12 threads, 38.5 MiB L3) + NVIDIA L4 (23034 MiB, sm_89)",
+    "ram": "52 GiB",
+    "storage": "Google Colab VM disk (the model downloaded to /content before the runs, then read once into the page cache)",
+    "os": "Ubuntu 24.04.4 LTS, Linux 6.6.122+ x86_64 (Google Colab), CUDA 13.0 (nvcc V13.0.88), driver 580.82.07, gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "Q36_MTP": 1,
+      "Q36_MTP_DRAFTS": 1,
+      "mtp_head": "convert_qwen36.py --mtp-only",
+      "prompt_tokens": 64,
+      "decode_steps": 32,
+      "teacher_forced": true,
+      "engine_build": "16d9f670",
+      "draft_counts": "coli_vocab, sha256 9f32c38c5b516c41fc61f66c1b4c9cbadb2b86b847a0ce733cb5ade1a93843c1"
+    },
+    "samples": {
+      "tok_s": [
+        68.404,
+        68.425,
+        68.697,
+        68.377
+      ],
+      "decode_tok_s_after_512": [
+        79.272,
+        79.192,
+        79.612,
+        79.408
+      ],
+      "prompt_tok_s_64": [
+        104.93,
+        104.26,
+        104.04,
+        103.36
+      ],
+      "prompt_tok_s_512": [
+        1525.73,
+        1509.52,
+        1529.12,
+        1501.52
+      ]
+    },
+    "median_tok_s": 68.4145,
+    "quality": {
+      "method": "make -C c check (macOS arm64) and the L4 tests of manifest.json pass; every run of both versions gives the same fingerprint of every logit and token (FNV-1a: 30fd2104818e7459 at 64 tokens, d8b791a15a3813b4 at 512) and the same teacher-forced nll; the counts file is the same before and after the runs",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-mtp-draft-list-2026-10-26/warm-code-1-draft.txt",
+      "sha256": "53b7dc4582643144c78f2fc3d26e33afa31018992ef3afe9dc65d119218cd81d"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "Q36_MTP": 1,
+      "Q36_MTP_DRAFTS": 1,
+      "mtp_head": "convert_qwen36.py --mtp-only",
+      "prompt_tokens": 64,
+      "decode_steps": 32,
+      "teacher_forced": true,
+      "engine_build": "16d9f670 + this change",
+      "draft_counts": "coli_vocab, sha256 9f32c38c5b516c41fc61f66c1b4c9cbadb2b86b847a0ce733cb5ade1a93843c1"
+    },
+    "samples": {
+      "tok_s": [
+        75.216,
+        75.461,
+        75.16,
+        75.297
+      ],
+      "decode_tok_s_after_512": [
+        87.316,
+        87.564,
+        87.32,
+        87.308
+      ],
+      "prompt_tok_s_64": [
+        102.65,
+        102.15,
+        102.75,
+        102.59
+      ],
+      "prompt_tok_s_512": [
+        1502.42,
+        1519.44,
+        1507.84,
+        1519.95
+      ]
+    },
+    "median_tok_s": 75.2565,
+    "quality": {
+      "method": "make -C c check (macOS arm64) and the L4 tests of manifest.json pass; every run of both versions gives the same fingerprint of every logit and token (FNV-1a: 30fd2104818e7459 at 64 tokens, d8b791a15a3813b4 at 512) and the same teacher-forced nll; the counts file is the same before and after the runs",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-mtp-draft-list-2026-10-26/warm-code-1-draft.txt",
+      "sha256": "53b7dc4582643144c78f2fc3d26e33afa31018992ef3afe9dc65d119218cd81d"
+    }
+  },
+  "outcome": "improvement"
+}

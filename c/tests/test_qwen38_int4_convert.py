@@ -298,6 +298,24 @@ class ConvertQwen38ExpertsInt4(unittest.TestCase):
         mean = sum(errors) / len(errors)
         self.assertTrue(0.05 < mean < 0.15 and max(errors) < 0.2, (mean, max(errors)))
 
+    def test_without_pread(self):
+        """Windows has no os.pread: the converter reads with a seek and a read
+        there, and writes the same sidecar."""
+        self.convert()
+        side = self.root / "experts-int4g64"
+        reference = {f.name: f.read_bytes() for f in side.iterdir() if f.suffix == ".safetensors"}
+        shutil.rmtree(side)
+        pread = getattr(os, "pread", None)
+        if pread is not None:
+            del os.pread
+        try:
+            self.convert()
+        finally:
+            if pread is not None:
+                os.pread = pread
+        self.assertEqual({f.name: f.read_bytes() for f in side.iterdir() if f.suffix == ".safetensors"},
+                         reference)
+
     def test_matches_the_engine_table(self):
         self.assertTrue(np.array_equal(self.converter.E4M3, engine_e4m3_table(), equal_nan=True))
 

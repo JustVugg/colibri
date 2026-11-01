@@ -1,6 +1,9 @@
 import contextlib
 import copy
 import io
+import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -42,6 +45,26 @@ class ExperimentManifestTest(unittest.TestCase):
         result = validate(manifest())
         self.assertEqual(result["variable"], "PIPE_WORKERS")
 
+    def test_config_diff_distinguishes_missing_null_and_booleans(self):
+        cases = (
+            ({}, {'EXTRA': None}),
+            ({'EXTRA': True}, {'EXTRA': 1}),
+            ({'EXTRA': {'flags': [True]}}, {'EXTRA': {'flags': [1]}}),
+        )
+        for baseline, trial in cases:
+            with self.subTest(baseline=baseline, trial=trial):
+                record = manifest()
+                record['baseline']['config'].update(baseline)
+                record['trial']['config'].update(trial)
+                with self.assertRaisesRegex(ValueError, 'config diff'):
+                    validate(record)
+
+    def test_identical_nested_config_and_numeric_values_are_unchanged(self):
+        record = manifest()
+        record['baseline']['config']['EXTRA'] = {'flags': [True, None], 'scale': 1}
+        record['trial']['config']['EXTRA'] = {'scale': 1.0, 'flags': [True, None]}
+        self.assertEqual(validate(record)['variable'], 'PIPE_WORKERS')
+
     def test_rejects_hidden_second_variable(self):
         record = manifest()
         record["trial"]["config"]["DIRECT"] = "0"
@@ -82,6 +105,41 @@ class ExperimentManifestTest(unittest.TestCase):
                 status = main([str(path)])
         self.assertEqual(status, 1)
         self.assertEqual(out.getvalue(), f"{path}: manifest must be an object\n")
+
+
+    def test_rejects_whitespace_inside_hash_identities(self):
+        for space in (" ", "\t", "\n"):
+            for field in ("commit", "baseline", "trial"):
+                with self.subTest(space=repr(space), field=field):
+                    record = manifest()
+                    if field == "commit":
+                        record[field] = "aa" + space * 38
+                    else:
+                        record[field]["evidence"]["sha256"] = "aa" + space * 62
+                    with self.assertRaisesRegex(ValueError, "hexadecimal"):
+                        validate(record)
+
+    def test_accepts_uppercase_hex_identities(self):
+        record = manifest()
+        record["commit"] = "AB" * 20
+        record["baseline"]["evidence"]["sha256"] = "CD" * 32
+        record["trial"]["evidence"]["sha256"] = "EF" * 32
+        validate(record)
+
+    def test_cli_rejects_malformed_hash_identity(self):
+        for field in ("commit", "baseline", "trial"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                record = manifest()
+                if field == "commit":
+                    record[field] = "aa" + " " * 38
+                else:
+                    record[field]["evidence"]["sha256"] = "aa" + " " * 62
+                path = Path(directory) / "manifest.json"
+                path.write_text(json.dumps(record), encoding="utf-8")
+                result = subprocess.run([sys.executable, "-B", str(Path(__file__).resolve().parent.parent / "experiment_manifest.py"), str(path)], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("hexadecimal", result.stdout)
+                self.assertNotIn("Traceback", result.stderr)
 
 
 if __name__ == "__main__":

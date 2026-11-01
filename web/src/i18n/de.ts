@@ -56,7 +56,7 @@ const de: Record<string, string> = {
   "topbar.tokPerSec": "{{n}} Tok/s",
   "topbar.slot": "Slot {{n}}",
   "topbar.truncated": "Abgeschnitten",
-  "topbar.truncatedHelp": "Die Antwort erreichte die maximale Tokenanzahl und wurde abgeschnitten. Erhöhe \"Maximale Ausgabetokens\", um die vollständige Antwort zu sehen.",
+  "topbar.truncatedHelp": "Die Antwort erreichte das Ausgabelimit oder das Ende des Kontexts und wurde abgeschnitten. Wenn du \"Maximale Ausgabetokens\" gesenkt hast, erhöhe den Wert; sonst setze die Antwort fort.",
   "topbar.clear": "Leeren",
 
   // Startansicht
@@ -70,6 +70,10 @@ const de: Record<string, string> = {
 
   // Chat
   "chat.you": "Du",
+  "chat.toBottom": "Zur neuesten Nachricht",
+  "chat.image": "Bild",
+  "ui.exportMarkdown": "Markdown (.md)",
+  "ui.exportJson": "JSON (.json)",
   "chat.colibri": "colibrì",
   "chat.placeholder": "Nachricht an colibrì…",
   "chat.inputHint": "Eingabetaste zum Senden · Umschalt+Eingabetaste für Zeilenumbruch",

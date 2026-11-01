@@ -1,0 +1,27 @@
+The summary printed at the end of the measurement by the script that ran it (a local script, not in this record: before every run it waits for the nominal thermal state, rests 60 s and reads the swap counters, then runs the manifests' command): every run's raw log is in baseline.txt and trial.txt. Its 'peak memory ... MB' is in MiB (2^20 bytes); 'pages written to swap' is the system-wide counter. Its prompt percentages come from the CSV's two-decimal tok/s; the manifests and the texts use the prompt's tokens over its timed seconds.
+
+model <model>; text promessi_sposi.txt; lengths 64,512; gen 32; runs 4; extra env: none
+cooldown before every run: 60 seconds, after waiting for thermal state 0: yes, at most 900s; thermal states: 0 nominal, 1 fair, 2 serious, 3 critical
+v0: bin-dev/qwen36-bench (commit 94dee9d26fcc375fc7ea885e7c7189124697a3f3 (CPU engine, make qwen36 flags on macOS))
+v1: bin-pr3/qwen36-bench (commit 0d5eae65413392bff48f84daa76ac18ba3d1c124 (CPU engine, make qwen36 flags on macOS))
+order: the binaries' order turns at every round (ABBA)
+
+v0: 4 runs (median, min-max)
+tokens    new            prompt tok/s          first token ms        generation tok/s  experts read  fingerprint
+    64     64        1.82 (1.82-1.84)          847 (774-1051)     1.530 (1.219-1.549)         11275  f1300d8431ba2787
+   512    512        2.24 (2.23-2.24)        1171 (1114-1266)     1.443 (1.418-1.484)         61469  8e0bf69c62deb041
+peak memory 6074 MB, model ready in 5.78 s (medians)
+
+v1: 4 runs (median, min-max)
+tokens    new            prompt tok/s          first token ms        generation tok/s  experts read  fingerprint
+    64     64        1.83 (1.82-1.83)           766 (691-798)     1.583 (1.552-1.591)         11275  f1300d8431ba2787
+   512    512        2.25 (2.24-2.25)        1079 (1014-1124)     1.560 (1.545-1.574)         61469  8e0bf69c62deb041
+peak memory 4742 MB, model ready in 4.35 s (medians)
+
+warm-up (does not count): 64 tokens: prompt 1.81 tok/s, generation 1.547 tok/s; 512 tokens: prompt 2.23 tok/s, generation 1.528 tok/s
+
+v1 against v0 (medians):
+    64 tokens: prompt +0.3%, first token +10.6%, generation +3.5%  (same results)
+   512 tokens: prompt +0.7%, first token +8.5%, generation +8.1%  (same results)
+(positive = faster)
+swap used 368.44M -> 406.00M; pages written to swap during the runs: 564580 (16 KB each)

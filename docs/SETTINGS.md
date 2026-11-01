@@ -44,9 +44,9 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 |---|---|---|---|
 | `--model` | `$COLI_MODEL` or built-in path | `SNAP` | Model snapshot directory. |
 | `--ram` | `0` (auto ≈ 88% free) | `RAM_GB` | RAM budget in GB for the expert working set. |
-| `--ctx` | `0` (auto) | `CTX` | Context length. |
+| `--ctx` | `0` (auto) | `CTX` (the family's context variable) | Context length. Auto, for a chat server (`serve`, `web`, `chat`): the largest of 16384, 32768, 65536, 131072 and 262144 tokens whose conversation state takes at most a quarter of the memory up to 65536 (coding agents need 64k) and a tenth beyond, else the family's default (DeepSeek V4.1 and MiMo count the prompt's workspace with the state: V4.1 prefills a prompt in one forward); `GET /v1/models` reports it as `context_length` (docs/api.md, "Conversations longer than the context"). |
 | `--cap` | `0` (auto) | `<cap>` argv | Expert-cache cap (starting point; see `CAP_RAISE`). `0` lets the engine pick: `8` historically, `1` on Metal + macOS when the model volume measures fast (F_NOCACHE probe ≥ `COLI_SSD_FAST_GBS`, cached in `<model>/.coli_ssd` — #379). An explicit value always wins. |
-| `--ngen` | `1024` | `NGEN` | Max tokens to generate. |
+| `--ngen` | `1024` for `run`; for a chat server (`serve`, `web`, `chat`) none: a response may run to the end of the context | `NGEN` | Max tokens to generate. A reasoning model's turn is its reasoning plus its answer, so a chat server leaves the ceiling to the context (#382); `--ngen` sets one. |
 | `--temp` | none (`0`=greedy; engine default 1.0) | `TEMP` | Sampling temperature. |
 | `--topp` | `0` | `TOPP` | Top-p filter. |
 | `--topk` | `0` | `TOPK` | Top-k filter. |
@@ -144,8 +144,8 @@ Run directly (or via `coli serve`). OpenAI-compatible `/v1/chat/completions`.
 | `--api-key` | `$COLI_API_KEY` | Required bearer token. |
 | `--cors-origin` | none (repeatable) | Allowed CORS origin(s). A plain value replaces the default list; `+ORIGIN` adds to it. |
 | `--allowed-host` | `$COLI_ALLOWED_HOSTS` or none (repeatable) | Additional Host header accepted by the DNS-rebinding guard. |
-| `--cap` | `0` (auto) | Expert-cache cap; `0` = engine default (`8`, or `1` on Metal + macOS + fast model volume — #379). |
-| `--max-tokens` | `1024` | Default max completion tokens. |
+| `--cap` | `0` (auto) | Expert-cache cap; `0` = engine default (`8`, or `1` on Metal + macOS + fast model volume — #379). Without `--cap`, a `coli tune` profile or `--auto-tier`, DeepSeek V4.1, MiMo, Qwen3.6 and Qwen3.8 take the slots the RAM plan fits in the memory available at start (`coli plan` prints them). |
+| `--max-tokens` | `0` (the context) | The response ceiling: a request without `max_tokens` gets it, a larger one is lowered to it. `0`: the context the engine holds. `GET /health` reports it as `max_tokens`, and the web UI starts from it. |
 | `--max-queue` | `$COLI_MAX_QUEUE` or `8` | Max queued requests. |
 | `--queue-timeout` | `$COLI_QUEUE_TIMEOUT` or `300` | Request queue timeout (s). |
 | `--kv-slots` | `$COLI_KV_SLOTS` or `1` | KV conversation slots. |

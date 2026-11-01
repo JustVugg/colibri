@@ -510,7 +510,7 @@ ptl_dsk_san() {  # <engine> <tag> <want N|lost> <env and argv...>
   local eng=$1 tag=$2 want=$3; shift 3
   rm -f chain.usage k3c.usage
   env COLI_USAGE=$PWD/chain.usage USAGE_SAVE=0 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "$@" > san.log 2>&1 || true
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+  if san_diag san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
   if [ "$want" = lost ]; then
     grep -q "$eng chain: the device was lost" san.log || { cat san.log; fail "$tag: no loss was handled"; }
   else
@@ -545,7 +545,7 @@ ptl_family_dsk_sanitize() {
   ptl_dsk_san deepseek_v41 "asan partial deepseek_v41 device lost" lost COLI_VK_CHAIN_LAYERS=3 COLI_VK_CHAIN_FAULT=30 "${V[@]}"
   CHAIN_SERVE_EXPECT='deepseek_v41 chain: 2 of 6 layers on the device' \
     $PY tests/vulkan_chain_serve.py ./deepseek_v41 dsv41_tiny V41_DSPARK=1 COLI_VK_CHAIN_LAYERS=2 > san.log 2>&1 || { cat san.log; fail "asan partial deepseek_v41 serve"; }
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan partial deepseek_v41 serve: sanitizer diagnostic"; fi
+  if san_diag san.log; then cat san.log; fail "asan partial deepseek_v41 serve: sanitizer diagnostic"; fi
   echo "OK asan partial deepseek_v41 serve: $(tail -1 san.log | cut -c1-120)"
   # ---- kimi_k3
   ids=$(k3c_ids long)
@@ -571,7 +571,7 @@ ptl_family_dsk_sanitize() {
   CHAIN_SERVE_TOL=2e-2 CHAIN_SERVE_EXPECT='kimi_k3 chain: 2 of 6 layers on the device' $PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve \
     K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 K3_PREFIX_LOG=1 USAGE_SAVE=0 COLI_K3_CKPT=4 COLI_VK_CHAIN_LAYERS=2 > san.log 2>&1 ||
     { cat san.log; fail "asan partial kimi_k3 serve"; }
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan partial kimi_k3 serve: sanitizer diagnostic"; fi
+  if san_diag san.log; then cat san.log; fail "asan partial kimi_k3 serve: sanitizer diagnostic"; fi
   echo "OK asan partial kimi_k3 serve: $(tail -1 san.log | cut -c1-120)"
   rm -rf dsv41_vlong kimi_k3_serve
   rm -f san.log ptl-probe.log chain.usage k3c.usage chain-serve.usage

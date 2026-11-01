@@ -918,7 +918,7 @@ class LoaderStubFixtureTest(unittest.TestCase):
             cls.fixture = None
 
     def test_abi_is_derived_from_the_loader_source(self):
-        """47 mandatory + 15 optional, parsed from backend_loader.c.
+        """47 mandatory + 22 optional, parsed from backend_loader.c.
 
         The counts are a deliberate tripwire: adding a RESOLVE to the loader
         widens the ABI every Windows DLL must satisfy, and that should be a
@@ -929,12 +929,19 @@ class LoaderStubFixtureTest(unittest.TestCase):
         """
         f = self.fixture
         self.assertEqual(len(f.mandatory), 47)
-        self.assertEqual(len(f.optional), 15)  # +expert_mxfp4: optional Kimi SiTU pipeline; +dn_create/free/set_state/get_state/step; +tensor_overwrite
-        self.assertEqual(len(f.exports), 62)
+        self.assertEqual(len(f.optional), 22)  # +expert_mxfp4: optional Kimi SiTU pipeline; +dn_create/free/set_state/get_state/step; +tensor_overwrite; +chain_ops (the dense chain's table); +host_register/host_unregister/planar_rows (the qwen36 tier's host pool); +block_elems/tensor_upload_at (a GGUF's block formats, the tier's arena); +tier_ops (the routed-expert tier's table, cu_tier_ops.h)
+        self.assertEqual(len(f.exports), 69)
         self.assertEqual(len(f.exports), len(f.mandatory) + len(f.optional))
         self.assertIn("coli_cuda_init", f.mandatory)
         self.assertIn("coli_cuda_e8_set_grid", f.optional)
         self.assertIn("coli_cuda_expert_mxfp4", f.optional)
+        # block_elems / tensor_upload_at: a GGUF's block formats on the device and the
+        # qwen36 tier's arena; a DLL predating them answers 0 (no block format, no arena).
+        self.assertIn("coli_cuda_block_elems", f.optional)
+        # tier_ops: the engines' routed-expert tier on the device (cu_tier.c); a DLL predating
+        # it answers NULL and the tier stays off.
+        self.assertIn("coli_cuda_tier_ops", f.optional)
+        self.assertIn("coli_cuda_tensor_upload_at", f.optional)
         # attention_project_ragged: paged ragged KV runtime (#795).
         self.assertIn("coli_cuda_attention_project_ragged", f.mandatory)
         # fp8_set_lut: fmt=8 e4m3 dense/expert kernels (#817).

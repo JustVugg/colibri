@@ -34,8 +34,19 @@ custom `stop` sequences. `max_tokens` is a ceiling, not a target: when the
 prompt leaves less room than the budget asks for, every engine clamps the
 budget to what the context holds and the reply ends with `finish_reason:
 "length"`; only a prompt that does not fit is refused, with
-`context_length_exceeded` (#260, #1641). Stop sequences are removed from the response and end
-generation early in both JSON and streaming modes.
+`context_length_exceeded` (#260, #1641). A request without a budget gets the server's
+ceiling (`--max-tokens`, reported by `GET /health` as `max_tokens`); a chat server started by
+`coli serve`, `coli web` or `coli chat` without `--ngen` sets none, so a response may run to
+the end of the context: a reasoning model's turn is its reasoning plus its answer (#382).
+Stop sequences are removed from the response and end generation early in both JSON and
+streaming modes.
+
+On the GLM engine, legacy `POST /v1/completions` also accepts a non-empty
+`prompt` array of integer token IDs, for example `[12, 345, 6]`. The IDs go
+directly to the engine's pre-tokenized intake; they must be non-negative and
+within the model's vocabulary. An out-of-vocabulary ID receives a `prompt`
+400. Other engines currently reject token-ID prompts with a named 400, and
+batched prompts (arrays of strings or arrays of arrays) remain unsupported.
 
 A trailing `assistant` message *continues* that turn instead of starting a new
 one: the prompt ends inside it, which is the official template rendered with
@@ -100,6 +111,10 @@ named error, never silently ignored. `seed` is accepted and ignored (see
 below). Audio is accepted only by Inkling checkpoints with audio support. The
 default bind address is localhost; set `COLI_API_KEY` before exposing the
 server beyond the machine.
+
+Request bodies must fit within 4 MiB and the running Python JSON parser's
+limits. An integer or nesting depth the runtime cannot parse receives HTTP
+400 before engine work; the gateway preserves the runtime's limits.
 
 The hosted-platform bookkeeping fields `store`, `metadata`, `service_tier`,
 `user`, `safety_identifier`, `parallel_tool_calls`, `prompt_cache_key`,
@@ -314,6 +329,24 @@ request keeps priority across all slots. A full waiting queue does not reject
 a request that can immediately take an unreserved free slot; the queue limit
 bounds waiting requests, independently of active capacity.
 
+### When the engine stops
+
+`coli serve` starts the engine again when it dies (a crash, the out-of-memory
+killer, a kill). While the new engine loads, `GET /health` answers 503 with
+`{"status": "restarting"}` and `Retry-After: 5`, and nothing is admitted: a
+request waits in the queue for the new engine, within `--queue-timeout`, rather
+than failing on the old one. A request the dead engine was answering fails with
+`engine_error` and frees its slot. A start that fails is tried again after 2 s,
+then twice as long each time, up to 60 s. The authenticated `/health` counts the
+restarts in `engine_restarts`, and the log names the cause:
+
+```
+[gateway] the engine stopped (colibri engine exited unexpectedly (killed by signal 9, SIGKILL, most often the out-of-memory killer)); starting it again
+[gateway] the engine is running again (restart 1)
+```
+
+`coli chat` waits for a restarting server instead of starting a second one.
+
 ## Prometheus metrics
 
 `GET /metrics` returns Prometheus text exposition (version 0.0.4). When an
@@ -522,6 +555,16 @@ KV configuration actually allows. Tool calling in pi works on the engines in
 the [tool-calling matrix](#tool-calling-support) above; on unsupported engines
 pi's tool calls fail the same way any OpenAI `tools` request does.
 
+The same provider entry serves the other engines — swap the model `id` and
+`name` (`qwen3.6-colibri` for Qwen3.6, `deepseek-v4-flash-colibri` for DeepSeek
+V4 Flash; `coli status` prints the id of the running model). Serve with a
+context that fits pi's preamble plus the working set: pi sends its system
+prompt, tool catalog and project instructions — about 5,000 tokens — before the
+first user word, so start the server with e.g. `coli serve --ctx 32768` and set
+`contextWindow` to the same value. Measured with pi 1.4.0 against
+Qwen3.6-35B-A3B resident in RAM (Vulkan, Ryzen 9 9950X): the ~4,900-token
+preamble prefills in about 30 s, and follow-up turns reuse the cached prefix.
+
 **Continue, Cline / Roo, `llm`, the OpenAI SDKs, …** — set the provider's base
 URL to `http://localhost:8000/v1`, the model to `glm-5.2-colibri`, and any dummy
 key (`OPENAI_API_KEY` / `OPENAI_BASE_URL` for env-based tools).
@@ -544,6 +587,112 @@ key (`OPENAI_API_KEY` / `OPENAI_BASE_URL` for env-based tools).
 > agent sessions against a disk-streaming 744B model do not resemble a hosted
 > API and mostly won't be worth the wait. If your client lets you trim or disable
 > its system preamble and tool catalog, do it.
+
+### Agents: Hermes Agent, OpenClaw, Cline
+
+These agents need room: Hermes Agent refuses a window below 64,000 tokens, and
+their first request alone is 5-14k tokens (a system prompt plus a few dozen tool
+schemas). A server whose context nobody set gives a chat model 65536 tokens
+whenever that fits in a quarter of the memory (more where a tenth allows it, see
+[below](#conversations-longer-than-the-context)), and `GET /v1/models` reports
+it as `context_length` and `max_model_len`. Hermes Agent reads it from there; for
+the others, put the same number in their configuration (`coli serve` prints it:
+`[gateway] 65536 tokens of context ...`). An agent that believes in a larger
+window than the server holds compacts too late and ends in
+`context_length_exceeded`.
+
+Measured on 2026-10-11 against Qwen3.6-35B-A3B (int4) on a Ryzen 7 PRO 8700GE,
+each agent asked to count the files in a directory with a tool:
+
+| Agent | First request | Tools sent | Result |
+|---|---|---|---|
+| Hermes Agent 0.19.0 | 13,753 tokens | 27 | `terminal` called, the right count |
+| OpenClaw 2026.10.1 | 10,855 tokens | 11 | `ls` called, the right count and the names |
+| Cline CLI 3.0.70 | 5,566 tokens | 25 | `run_commands` called, the right count, 2 minutes in all |
+
+The first request is the slow one: about 35 tokens a second of prefill on that
+machine, six and a half minutes for Hermes' 13,753 tokens, with a keepalive on
+the stream every 10 seconds so the client does not give up. The next turns
+reuse the prefix and prefill only what is new.
+
+**Hermes Agent** (`~/.hermes/config.yaml`):
+
+```yaml
+model:
+  default: qwen3.6            # the --model-id of coli serve
+  provider: custom
+  base_url: http://localhost:8000/v1
+  api_key: local
+```
+
+**OpenClaw** (`~/.openclaw/openclaw.json`; `contextWindow` is the server's
+`context_length`):
+
+```json
+{
+  "agents": { "defaults": { "model": { "primary": "colibri/qwen3.6" } } },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "colibri": {
+        "baseUrl": "http://localhost:8000/v1",
+        "apiKey": "sk-local",
+        "api": "openai-completions",
+        "timeoutSeconds": 3600,
+        "models": [{ "id": "qwen3.6", "name": "Qwen3.6 (colibri)", "reasoning": false,
+                     "input": ["text"], "contextWindow": 65536, "maxTokens": 8192 }]
+      }
+    }
+  }
+}
+```
+
+**Cline CLI**: `cline auth -p openai -b http://localhost:8000/v1 -k local -m qwen3.6`,
+then `cline "..."`. In the editor extension, choose the *OpenAI Compatible*
+provider with the same base URL and model, and set its context window to the
+server's `context_length`.
+
+## Conversations longer than the context
+
+A chat request may opt into context compaction with the extension field
+`"context_compaction": "auto"` (`"off"` is the default, the standard behavior;
+`COLI_COMPACT=1` on the server makes `auto` the default for every client). The
+dashboard and `coli chat` send it, so a conversation there never ends in
+`context_length_exceeded`:
+
+1. When the conversation does not fit the context, or leaves the answer less
+   room than it asks for (up to a quarter of the context), the server asks the
+   model itself to summarize the conversation before the new message. The
+   request to summarize comes after the history the engine already holds, so
+   only that request is prefilled.
+2. The turn then runs on the system message, with the summary appended to it,
+   and the last messages verbatim (about a quarter of the context, at least the
+   new message).
+3. The server keeps the summary, keyed by the messages it replaces. The client
+   keeps sending its whole history; every later turn finds the same summary and
+   renders the same prompt, so the engine's prefix reuse works as before until
+   the next compaction. A restarted server summarizes once more.
+
+The reply says what happened: a `compaction` object,
+`{"summarized_messages": 8, "summary": "..."}`, in the JSON response and in a
+stream chunk (empty `choices`) before the first token, and the header
+`x-colibri-compacted-messages`. Pictures in the summarized messages become
+`[image]`. A last message longer than the context alone is still refused with
+`context_length_exceeded`.
+
+The context itself: a server whose context variable nobody set (`--ctx`, or the
+family's `CTX`, `Q36_MAXT`, ...) picks the largest of 16384, 32768, 65536, 131072
+and 262144 tokens (up to the family's maximum) whose conversation state, for every
+KV slot, takes at most a quarter of the memory up to 65536 tokens and a tenth
+beyond (`RAM_GB` when set, the available memory otherwise), and the family's own
+default when even 16384 does not fit that. The larger share up to 64k is for
+coding agents, which do not run on less. DeepSeek V4.1 and MiMo, whose expert cache
+the plan sizes and which do not start without a slot a layer, count the prompt's
+workspace beside the state: V4.1 prefills a prompt in one forward (about 200 KB a
+token), so a 64 GB box gets 65536 tokens rather than the 262144 its 6.4 KB a token of
+state allowed, which left the cache nothing. The startup log says which
+(`[gateway] 65536 tokens of context ...`), and `GET /v1/models` reports it as
+`context_length` (and `max_model_len`), where agents read it.
 
 ## Isolated KV contexts
 

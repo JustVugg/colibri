@@ -1,0 +1,950 @@
+# qwen36 CUDA tier: without a heat file the warm start spreads over the layers: raw evidence (2026-10-27)
+# Google Colab T4 high-RAM VM: Intel(R) Xeon(R) CPU @ 2.00GHz (4 cores / 8 threads) + NVIDIA Tesla T4 (15360 MiB, sm_75, up to PCIe Gen3 x16), 51 GiB; Ubuntu 24.04.4 LTS (Google Colab, T4 high-RAM), CUDA 13.0, driver 580.82.07.
+# Model: Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64 (int4, 64-input groups; 40 layers of 256 experts); CUDA_EXPERT_GB=auto: 6605 of the 10240 experts on the card, no heat file.
+# dev = origin/dev c1c06ac6. The code measured with the fix, commit 1fdb58d9 (c/ git tree 96184e25b0c7ea4d583cddb201c405fb92851257), is 7ef07509
+#   (the warm start's order) plus a staging-buffer fix found on the RTX 3070; runs of 7ef07509 say so. The PR's own commit has the same code as 1fdb58d9:
+#   the files of c/ that differ are equal once their comments are stripped (this script checks it), so its c/ tree has another id.
+#   c/ differs between 7ef07509 and 1fdb58d9 by this diff:
+#   | diff --git a/c/qwen36_cuda_chain.h b/c/qwen36_cuda_chain.h
+#   | index 6aed4135..797381b7 100644
+#   | --- a/c/qwen36_cuda_chain.h
+#   | +++ b/c/qwen36_cuda_chain.h
+#   | @@ -1248,6 +1248,14 @@ static void q36cc_promote_settle(Q36CChain *ch) {
+#   |      for (int p = 0; p < ch->pr_npend; p++) { qt_chain_promote_done(ch->pr_pend[p].ci, ch->pr_pend[p].vi, cc_host_up_done(ch->pr_pend[p].tk)); ch->pr_busy[ch->pr_pend[p].slot] = 0; }
+#   |      ch->pr_npend = 0;
+#   |  }
+#   | +/* The staging buffer for a layer's host-pool experts. With the residents spread over the layers hmax starts low
+#   | + * and every promotion can raise it (190 → 206 in one conversation on an RTX 3070); cc_reserve makes the new
+#   | + * buffer before it frees the old one, so each growth wanted both at once, failed on an 8 GB card, and the
+#   | + * staging stayed off for the process. A bigger buffer takes the old one's place: free it first. */
+#   | +static int q36cc_stage_reserve(CcBuf **stage, size_t bytes) {
+#   | +    if (*stage && cc_bytes(*stage) < bytes) { cc_free(*stage); *stage = NULL; }
+#   | +    return cc_reserve(stage, bytes, CC_DEV);
+#   | +}
+#   |  static int q36cc_stage_table(Q36CChain *ch, Model *m) {
+#   |      Cfg *c = &m->c; int L = c->n_layers, E = c->n_experts, D = c->hidden, I = c->inter;
+#   |      size_t ne = (size_t)L * E, mb = (size_t)D * I / 2, nsc = (size_t)I * (D / ch->dm_gs), wb = 3 * mb, sb = 3 * nsc * sizeof(float);
+#   | @@ -1272,7 +1280,7 @@ static int q36cc_stage_table(Q36CChain *ch, Model *m) {
+#   |      CcFetch *fr = realloc(ch->dm_fr, (size_t)(2 * tot + 1) * sizeof(CcFetch));
+#   |      if (!fr) return 0;
+#   |      ch->dm_fr = fr;
+#   | -    if (!cc_reserve(&ch->dm_stage, (size_t)(hmax ? hmax : 1) * stride, CC_DEV) || !cc_reserve(&ch->dm_tabb, ne * sizeof(CcExpert), CC_DEV))
+#   | +    if (!q36cc_stage_reserve(&ch->dm_stage, (size_t)(hmax ? hmax : 1) * stride) || !cc_reserve(&ch->dm_tabb, ne * sizeof(CcExpert), CC_DEV))
+#   |          return 0;
+#   |      const char *base = (const char *)cc_dev_addr(ch->dm_stage);
+#   |      if (!base) return 0;
+#   | diff --git a/c/tests/qwen36_fake_cuda.h b/c/tests/qwen36_fake_cuda.h
+#   | index d69371fe..85ac98cb 100644
+#   | --- a/c/tests/qwen36_fake_cuda.h
+#   | +++ b/c/tests/qwen36_fake_cuda.h
+#   | @@ -254,6 +254,7 @@ int coli_cuda_dn_step(ColiCudaDn *d, ColiCudaTensor *proj, ColiCudaTensor *projz
+#   |  struct CcBuf { int kind; size_t bytes; float *d; };
+#   |  static int fake_chain_up, fake_chain_lost, fake_chain_dev = -1, fake_chain_frames, fake_chain_fail_at, fake_chain_ops, fake_chain_down_copies;
+#   |  static size_t fake_chain_dev_bytes;
+#   | +static size_t fake_chain_dev_cap;   /* 0: no limit; else the most CC_DEV bytes the card holds: cc_buf fails past it */
+#   |  static int fcc_init(int device) { fake_chain_up = 1; fake_chain_lost = 0; fake_chain_dev = device; return 1; }
+#   |  static int fcc_ready(void) { return fake_chain_up && !fake_chain_lost; }
+#   |  static int fcc_lost(void) { return !fake_chain_up || fake_chain_lost; }
+#   | @@ -262,6 +263,7 @@ static int fcc_device(int d) { int was = fake_chain_dev; fake_chain_dev = d; ret
+#   |  static int fcc_device_now(void) { return fake_chain_dev; }
+#   |  static CcBuf *fcc_buf(size_t bytes, int kind) {
+#   |      if (!bytes) bytes = 4;
+#   | +    if (kind == CC_DEV && fake_chain_dev_cap && fake_chain_dev_bytes + bytes > fake_chain_dev_cap) return NULL;
+#   |      CcBuf *b = (CcBuf *)calloc(1, sizeof *b);
+#   |      b->kind = kind; b->bytes = bytes; b->d = (float *)calloc(bytes, 1);
+#   |      if (kind == CC_DEV) fake_chain_dev_bytes += bytes;
+#   | @@ -270,7 +272,9 @@ static CcBuf *fcc_buf(size_t bytes, int kind) {
+#   |  static void fcc_free(CcBuf *b) { if (!b) return; if (b->kind == CC_DEV) fake_chain_dev_bytes -= b->bytes; free(b->d); free(b); }
+#   |  static int fcc_reserve(CcBuf **b, size_t bytes, int kind) {
+#   |      if (*b && (*b)->bytes >= bytes && (*b)->kind == kind) return 1;
+#   | -    CcBuf *n = fcc_buf(bytes, kind); fcc_free(*b); *b = n; return 1;
+#   | +    CcBuf *n = fcc_buf(bytes, kind);
+#   | +    if (!n) return 0;
+#   | +    fcc_free(*b); *b = n; return 1;
+#   |  }
+#   |  static void *fcc_ptr(const CcBuf *b) { return b ? b->d : NULL; }
+#   |  static size_t fcc_bytes(const CcBuf *b) { return b ? b->bytes : 0; }
+#   | diff --git a/c/tests/test_qwen36_cuda_chain.c b/c/tests/test_qwen36_cuda_chain.c
+#   | index 78c9523b..6700f1b0 100644
+#   | --- a/c/tests/test_qwen36_cuda_chain.c
+#   | +++ b/c/tests/test_qwen36_cuda_chain.c
+#   | @@ -29,6 +29,8 @@
+#   |   *     listed rows of the device's lm_head (cc_matmul_rows), and the device's copy of the list
+#   |   *     follows every append and every rebuild, across requests too; a backend without
+#   |   *     matmul_rows scores the whole vocabulary.
+#   | + *   - the staging buffer for a prompt chunk's host-pool experts grows into the old one's place: a small card
+#   | + *     has no room for both (q36cc_stage_reserve).
+#   |   * Include order as in test_qwen36_tier_int8_engine.c. */
+#   |  #define main qwen36_main_unused
+#   |  #include "../qwen36.c"
+#   | @@ -448,6 +450,18 @@ int main(void) {
+#   |      }
+#   |      fake_chain_table.size = CC_OPS_BASE_SIZE;
+#   |
+#   | +    printf(" I. the staging buffer grows without room for a second copy beside it\n");
+#   | +    {   /* residents spread over the layers start the staging small and every promotion raises it (an RTX 3070: 320 to
+#   | +         * 347 MiB with room for 400): the bigger buffer takes the old one's place, it does not wait beside it */
+#   | +        CcBuf *st = NULL;
+#   | +        fake_chain_dev_cap = fake_chain_dev_bytes + 400;
+#   | +        ck(q36cc_stage_reserve(&st, 320) && cc_bytes(st) >= 320, "a staging buffer of 320");
+#   | +        ck(q36cc_stage_reserve(&st, 347) && cc_bytes(st) >= 347, "grown to 347 with room for 400: no second copy beside it");
+#   | +        ck(q36cc_stage_reserve(&st, 300) && cc_bytes(st) >= 347, "a smaller ask keeps the buffer");
+#   | +        ck(!q36cc_stage_reserve(&st, 500), "an ask over the card's room fails");
+#   | +        cc_free(st); fake_chain_dev_cap = 0;
+#   | +    }
+#   | +
+#   |      qt_shutdown();
+#   |      if (fails) { printf("test_qwen36_cuda_chain: %d failure(s)\n", fails); return 1; }
+#   |      printf("OK test_qwen36_cuda_chain: the CUDA chain gives the CPU path's logits; host and device state agree; a lost device rebuilds\n");
+# Harness: bench.c beside this file (sha256 edbe7ddcc146af34d10c3d8a871fb1d3b93404537e374f9bc1504cf2c6886c17), built against each version's c/ by bench's driver.
+# Text: promessi_sposi.txt (sha256 f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f), speed-bench/promessi_sposi.txt of antirez's ds4;
+#   for each length its first N tokens from an empty state, then 32 decode steps (256 in the --gen 256 run)
+#   fed the text's own next tokens (--teacher). One process a run, the two lengths in order: the 512-token
+#   prompt comes after the 64-token one and its decode steps, in which the tier has moved residents.
+#   v0 = dev, v1 = 7ef07509 (the PR alone, without #2416 and #2417: the prompts after a conversation
+#   are slower; t4-t1t2.txt is the same on top of them).
+# A warm-up run of v0 (not counted), then v0 v1 v1 v0 v0 v1 v1 v0, each once the card was under 70 C with no
+#   thermal clock event, then 60 s of rest.
+#   Every run's CSV (the base's stderr in full too), in the order they ran; the steps files by their sha256.
+
+===== base: setup
+bench 482e1711d589; engine qwen36; Linux (Intel(R) Xeon(R) CPU @ 2.00GHz, Tesla T4); 2026-10-26 19:47
+model /content/q36; text promessi_sposi.txt (sha256 f53e0d80cb2d4492); lengths 64,512; gen 32; teacher-forced
+runs: a warm-up of v0 (does not count), then 4 per version, the order turning at every round (ABBA); before every run: wait until cool (at most 900 s), then 60 s of rest
+v0 dev: /content/fase-t4/bin-dev/qwen36-bench (commit c1c06ac6fcb32157e4da130fd96775a32a757052; harness qwen36_bench.c edbe7ddcc146; CUDA); env: COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close
+   command: env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/lib64-nvidia COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close /content/fase-t4/bin-dev/qwen36-bench --model /content/q36 --text /content/bench/promessi_sposi.txt --lengths 64,512 --gen 32 --teacher --steps /content/fase-t4/misura/v0-runN.steps
+v1 pr: /content/fase-t4/bin-pr/qwen36-bench (commit 7ef075096af0552f026e46585df276fb96935b00; harness qwen36_bench.c edbe7ddcc146; CUDA); env: COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close
+   command: env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/lib64-nvidia COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close /content/fase-t4/bin-pr/qwen36-bench --model /content/q36 --text /content/bench/promessi_sposi.txt --lengths 64,512 --gen 32 --teacher --steps /content/fase-t4/misura/v1-runN.steps
+
+===== base: warmup.csv (sha256 fcf3b6a9653d38689fd1309f4bc358b7b75ccdb6a12b19013d1e5a4e4d8cc23b)
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.840,76.20,32,65.9,38.833,0,0.00,ffb816333a929871,5cb23346ab6be1d8,2.69296,0.469
+512,512,2.874,178.13,32,22.4,46.097,0,0.00,a06145f14b7e678d,7a8848450b863c49,2.95784,0.438
+===== base: warmup.err (sha256 b040b2d5603ab1d581c4dade9b4af7b3562f8bf0161c0a008e6cc887c77a053f)
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[OMP] qwen36: 4 physical-core threads instead of 8 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 10.0s | RSS after load: 3.03 GB
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[CUDA] device 0: Tesla T4, 15.6 GB VRAM, sm_75
+[qtier] dev 0: 14.5 GB free, allowance 13.4 GB
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 11.64 GB left for experts
+[qtier] dev 0: budget 11.64 GB for experts (~6605 experts) after trunk
+[qtier] CUDA VRAM expert tier active: 1 device(s), 1.80 MB/expert
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[gpu] MoE experts -> CUDA VRAM tier
+[place] probe: one [8192 x 2048] int8 GEMV takes 0.382 ms on CUDA dev 0, 0.819 ms on the CPU -> trunk to VRAM
+[lmh] lm_head [248320 x 2048] int8 resident on CUDA dev 0 (0.47 GB)
+[dnp] 30 DeltaNet-Projektionen auf GPU (0.70 GB VRAM)
+[dense] 190 trunk matrices on GPU (30 dnout, 40 attnproj, 120 shexp; 0.61 GB VRAM)
+[chain] qwen36: a decode step's routed experts in the frame (the tier's residents by address, format 4, group 64; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen36: 40 layers on CUDA device 0 (10 attention), lm_head too; 4.4 MiB of parameters, 35.3 MiB of router, b|a and gate rows, 66 MB of DeltaNet state
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[qtier] host pool: 3635 experts of the RAM cache page-locked for the device to copy a prompt chunk's experts from (COLI_CUDA_HOST_POOL=0 off)
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 9.3 s
+[bench] CUDA ready in 20.53 s; text 6182 tokens; lengths 64,512; gen 32; each length from an empty state
+[qwen36] KV cache: float16, 0.00 GiB at 96 positions (half of float32; Q36_KV=f32 keeps float32)
+[chain] qwen36: 2048 rows per prompt chunk (286 KiB a row, 1.7 GB free on the device; COLI_CUDA_CHAIN_ROWS sets it)
+[chain] qwen36: up to 4 experts a step promoted into the card by this conversation's routes, the coldest residents giving way, none while the last 64 steps hit 75 % or more (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+[bench] peak RSS 19.48 GB
+[qtier] host pool: 3635 experts (5.99 GB of the RAM cache) page-locked for the device's copies
+----- warmup.steps: sha256 1d823b82568ba8d337015f7eff3ad1f6efe604a16147416be3511dc42d29187c
+
+===== base: v0-run1.csv (sha256 8847e4664316c44ac90c0c4041062b337b1d74fd1687c9c1010d57c62b6b0679)
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.831,77.03,32,67.2,38.455,0,0.00,ffb816333a929871,5cb23346ab6be1d8,2.69296,0.469
+512,512,2.896,176.78,32,22.5,45.608,0,0.00,a06145f14b7e678d,7a8848450b863c49,2.95784,0.438
+===== base: v0-run1.err (sha256 41922807e96be182974a5ef124c218be3fd814a1d17f9e37402afc095f11d126)
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[OMP] qwen36: 4 physical-core threads instead of 8 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 10.2s | RSS after load: 3.03 GB
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[CUDA] device 0: Tesla T4, 15.6 GB VRAM, sm_75
+[qtier] dev 0: 14.5 GB free, allowance 13.4 GB
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 11.64 GB left for experts
+[qtier] dev 0: budget 11.64 GB for experts (~6605 experts) after trunk
+[qtier] CUDA VRAM expert tier active: 1 device(s), 1.80 MB/expert
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[gpu] MoE experts -> CUDA VRAM tier
+[place] probe: one [8192 x 2048] int8 GEMV takes 0.432 ms on CUDA dev 0, 0.827 ms on the CPU -> trunk to VRAM
+[lmh] lm_head [248320 x 2048] int8 resident on CUDA dev 0 (0.47 GB)
+[dnp] 30 DeltaNet-Projektionen auf GPU (0.70 GB VRAM)
+[dense] 190 trunk matrices on GPU (30 dnout, 40 attnproj, 120 shexp; 0.61 GB VRAM)
+[chain] qwen36: a decode step's routed experts in the frame (the tier's residents by address, format 4, group 64; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen36: 40 layers on CUDA device 0 (10 attention), lm_head too; 4.4 MiB of parameters, 35.3 MiB of router, b|a and gate rows, 66 MB of DeltaNet state
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[qtier] host pool: 3635 experts of the RAM cache page-locked for the device to copy a prompt chunk's experts from (COLI_CUDA_HOST_POOL=0 off)
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 9.4 s
+[bench] CUDA ready in 20.86 s; text 6182 tokens; lengths 64,512; gen 32; each length from an empty state
+[qwen36] KV cache: float16, 0.00 GiB at 96 positions (half of float32; Q36_KV=f32 keeps float32)
+[chain] qwen36: 2048 rows per prompt chunk (286 KiB a row, 1.7 GB free on the device; COLI_CUDA_CHAIN_ROWS sets it)
+[chain] qwen36: up to 4 experts a step promoted into the card by this conversation's routes, the coldest residents giving way, none while the last 64 steps hit 75 % or more (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+[bench] peak RSS 19.48 GB
+[qtier] host pool: 3635 experts (5.99 GB of the RAM cache) page-locked for the device's copies
+----- v0-run1.steps: sha256 d7129cc81b6cec71f66ac9750bf9f985633d7ba37af75bd7a038422eaf9c5f5d
+
+===== base: v1-run1.csv (sha256 1a69f28bf4bc45fc089851d3cc5b23933214f9ebb25cfa73fe388f585edf598c)
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.780,82.03,32,64.2,41.619,0,0.00,8a96e3d44e17ca10,5cb23346ab6be1d8,2.70303,0.469
+512,512,5.585,91.67,32,23.2,45.437,0,0.00,79d8410c96af468f,7a8848450b863c49,2.95951,0.406
+===== base: v1-run1.err (sha256 d9d074bb4a671afe0bbc00574b555f685bad5c04b21678cc6a9e8e9cbfa38816)
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[OMP] qwen36: 4 physical-core threads instead of 8 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 10.5s | RSS after load: 3.03 GB
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[CUDA] device 0: Tesla T4, 15.6 GB VRAM, sm_75
+[qtier] dev 0: 14.5 GB free, allowance 13.4 GB
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 11.64 GB left for experts
+[qtier] dev 0: budget 11.64 GB for experts (~6605 experts) after trunk
+[qtier] CUDA VRAM expert tier active: 1 device(s), 1.80 MB/expert
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[gpu] MoE experts -> CUDA VRAM tier
+[place] probe: one [8192 x 2048] int8 GEMV takes 0.393 ms on CUDA dev 0, 0.852 ms on the CPU -> trunk to VRAM
+[lmh] lm_head [248320 x 2048] int8 resident on CUDA dev 0 (0.47 GB)
+[dnp] 30 DeltaNet-Projektionen auf GPU (0.70 GB VRAM)
+[dense] 190 trunk matrices on GPU (30 dnout, 40 attnproj, 120 shexp; 0.61 GB VRAM)
+[chain] qwen36: a decode step's routed experts in the frame (the tier's residents by address, format 4, group 64; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen36: 40 layers on CUDA device 0 (10 attention), lm_head too; 4.4 MiB of parameters, 35.3 MiB of router, b|a and gate rows, 66 MB of DeltaNet state
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[qtier] host pool: 3635 experts of the RAM cache page-locked for the device to copy a prompt chunk's experts from (COLI_CUDA_HOST_POOL=0 off)
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 9.7 s
+[bench] CUDA ready in 21.41 s; text 6182 tokens; lengths 64,512; gen 32; each length from an empty state
+[qwen36] KV cache: float16, 0.00 GiB at 96 positions (half of float32; Q36_KV=f32 keeps float32)
+[chain] qwen36: 2048 rows per prompt chunk (286 KiB a row, 1.7 GB free on the device; COLI_CUDA_CHAIN_ROWS sets it)
+[chain] qwen36: up to 4 experts a step promoted into the card by this conversation's routes, the coldest residents giving way, none while the last 64 steps hit 75 % or more (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+[bench] peak RSS 19.51 GB
+[qtier] host pool: 3635 experts (5.99 GB of the RAM cache) page-locked for the device's copies
+----- v1-run1.steps: sha256 f204b43f04a2cd443454153539d4a593939f0f254dbb088928e70fb667e5384a
+
+===== base: v1-run2.csv (sha256 4d968ae51e754aef0e2be2d8f9c90f448024b796c1cd7ea477cd72f86add8ac7)
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.780,82.07,32,64.5,40.858,0,0.00,8a96e3d44e17ca10,5cb23346ab6be1d8,2.70303,0.469
+512,512,5.633,90.89,32,23.3,46.006,0,0.00,79d8410c96af468f,7a8848450b863c49,2.95951,0.406
+===== base: v1-run2.err (sha256 80f31d9d8474ae759d009974738b37fb193d9a3ebf5572c2dd9c91746f77cd65)
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[OMP] qwen36: 4 physical-core threads instead of 8 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 10.6s | RSS after load: 3.03 GB
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[CUDA] device 0: Tesla T4, 15.6 GB VRAM, sm_75
+[qtier] dev 0: 14.5 GB free, allowance 13.4 GB
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 11.64 GB left for experts
+[qtier] dev 0: budget 11.64 GB for experts (~6605 experts) after trunk
+[qtier] CUDA VRAM expert tier active: 1 device(s), 1.80 MB/expert
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[gpu] MoE experts -> CUDA VRAM tier
+[place] probe: one [8192 x 2048] int8 GEMV takes 0.409 ms on CUDA dev 0, 0.844 ms on the CPU -> trunk to VRAM
+[lmh] lm_head [248320 x 2048] int8 resident on CUDA dev 0 (0.47 GB)
+[dnp] 30 DeltaNet-Projektionen auf GPU (0.70 GB VRAM)
+[dense] 190 trunk matrices on GPU (30 dnout, 40 attnproj, 120 shexp; 0.61 GB VRAM)
+[chain] qwen36: a decode step's routed experts in the frame (the tier's residents by address, format 4, group 64; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen36: 40 layers on CUDA device 0 (10 attention), lm_head too; 4.4 MiB of parameters, 35.3 MiB of router, b|a and gate rows, 66 MB of DeltaNet state
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[qtier] host pool: 3635 experts of the RAM cache page-locked for the device to copy a prompt chunk's experts from (COLI_CUDA_HOST_POOL=0 off)
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 9.6 s
+[bench] CUDA ready in 21.45 s; text 6182 tokens; lengths 64,512; gen 32; each length from an empty state
+[qwen36] KV cache: float16, 0.00 GiB at 96 positions (half of float32; Q36_KV=f32 keeps float32)
+[chain] qwen36: 2048 rows per prompt chunk (286 KiB a row, 1.7 GB free on the device; COLI_CUDA_CHAIN_ROWS sets it)
+[chain] qwen36: up to 4 experts a step promoted into the card by this conversation's routes, the coldest residents giving way, none while the last 64 steps hit 75 % or more (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+[bench] peak RSS 19.52 GB
+[qtier] host pool: 3635 experts (5.99 GB of the RAM cache) page-locked for the device's copies
+----- v1-run2.steps: sha256 c58c51a49bd226aa668e7098d4710785fe62364c721e91f0a7c11d3e3d98fb2d
+
+===== base: v0-run2.csv (sha256 6459bbf3af7aadbe9685734b99a1fa6d5ddd26efa57cbe7b53705585378c3c4e)
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.823,77.74,32,66.9,38.072,0,0.00,ffb816333a929871,5cb23346ab6be1d8,2.69296,0.469
+512,512,2.898,176.70,32,22.2,45.758,0,0.00,a06145f14b7e678d,7a8848450b863c49,2.95784,0.438
+===== base: v0-run2.err (sha256 488d59f51461e95bb96c2939069ef5e619c318d1c63f8a8f692740bb51cd476c)
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[OMP] qwen36: 4 physical-core threads instead of 8 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 10.5s | RSS after load: 3.03 GB
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[CUDA] device 0: Tesla T4, 15.6 GB VRAM, sm_75
+[qtier] dev 0: 14.5 GB free, allowance 13.4 GB
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 11.64 GB left for experts
+[qtier] dev 0: budget 11.64 GB for experts (~6605 experts) after trunk
+[qtier] CUDA VRAM expert tier active: 1 device(s), 1.80 MB/expert
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[gpu] MoE experts -> CUDA VRAM tier
+[place] probe: one [8192 x 2048] int8 GEMV takes 0.539 ms on CUDA dev 0, 0.820 ms on the CPU -> trunk to VRAM
+[lmh] lm_head [248320 x 2048] int8 resident on CUDA dev 0 (0.47 GB)
+[dnp] 30 DeltaNet-Projektionen auf GPU (0.70 GB VRAM)
+[dense] 190 trunk matrices on GPU (30 dnout, 40 attnproj, 120 shexp; 0.61 GB VRAM)
+[chain] qwen36: a decode step's routed experts in the frame (the tier's residents by address, format 4, group 64; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen36: 40 layers on CUDA device 0 (10 attention), lm_head too; 4.4 MiB of parameters, 35.3 MiB of router, b|a and gate rows, 66 MB of DeltaNet state
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[qtier] host pool: 3635 experts of the RAM cache page-locked for the device to copy a prompt chunk's experts from (COLI_CUDA_HOST_POOL=0 off)
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 9.6 s
+[bench] CUDA ready in 21.29 s; text 6182 tokens; lengths 64,512; gen 32; each length from an empty state
+[qwen36] KV cache: float16, 0.00 GiB at 96 positions (half of float32; Q36_KV=f32 keeps float32)
+[chain] qwen36: 2048 rows per prompt chunk (286 KiB a row, 1.7 GB free on the device; COLI_CUDA_CHAIN_ROWS sets it)
+[chain] qwen36: up to 4 experts a step promoted into the card by this conversation's routes, the coldest residents giving way, none while the last 64 steps hit 75 % or more (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+[bench] peak RSS 19.48 GB
+[qtier] host pool: 3635 experts (5.99 GB of the RAM cache) page-locked for the device's copies
+----- v0-run2.steps: sha256 c32a988d854432ad58b2371aeccfa07f5c77541e4245c4d2108d51178aa06bc4
+
+===== base: v0-run3.csv (sha256 4e38277538ca929adc930671c9767810866b5648c132f9b8fd559b3c468d04bb)
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.834,76.71,32,66.7,37.913,0,0.00,ffb816333a929871,5cb23346ab6be1d8,2.69296,0.469
+512,512,2.897,176.71,32,22.7,43.622,0,0.00,a06145f14b7e678d,7a8848450b863c49,2.95784,0.438
+===== base: v0-run3.err (sha256 a370d5762b2431e03b218651c8d317409c3a76235a72490ce35df3f53f931d3e)
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[OMP] qwen36: 4 physical-core threads instead of 8 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 10.6s | RSS after load: 3.03 GB
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[CUDA] device 0: Tesla T4, 15.6 GB VRAM, sm_75
+[qtier] dev 0: 14.5 GB free, allowance 13.4 GB
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 11.64 GB left for experts
+[qtier] dev 0: budget 11.64 GB for experts (~6605 experts) after trunk
+[qtier] CUDA VRAM expert tier active: 1 device(s), 1.80 MB/expert
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[gpu] MoE experts -> CUDA VRAM tier
+[place] probe: one [8192 x 2048] int8 GEMV takes 0.509 ms on CUDA dev 0, 0.835 ms on the CPU -> trunk to VRAM
+[lmh] lm_head [248320 x 2048] int8 resident on CUDA dev 0 (0.47 GB)
+[dnp] 30 DeltaNet-Projektionen auf GPU (0.70 GB VRAM)
+[dense] 190 trunk matrices on GPU (30 dnout, 40 attnproj, 120 shexp; 0.61 GB VRAM)
+[chain] qwen36: a decode step's routed experts in the frame (the tier's residents by address, format 4, group 64; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen36: 40 layers on CUDA device 0 (10 attention), lm_head too; 4.4 MiB of parameters, 35.3 MiB of router, b|a and gate rows, 66 MB of DeltaNet state
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[qtier] host pool: 3635 experts of the RAM cache page-locked for the device to copy a prompt chunk's experts from (COLI_CUDA_HOST_POOL=0 off)
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 9.6 s
+[bench] CUDA ready in 21.38 s; text 6182 tokens; lengths 64,512; gen 32; each length from an empty state
+[qwen36] KV cache: float16, 0.00 GiB at 96 positions (half of float32; Q36_KV=f32 keeps float32)
+[chain] qwen36: 2048 rows per prompt chunk (286 KiB a row, 1.7 GB free on the device; COLI_CUDA_CHAIN_ROWS sets it)
+[chain] qwen36: up to 4 experts a step promoted into the card by this conversation's routes, the coldest residents giving way, none while the last 64 steps hit 75 % or more (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+[bench] peak RSS 19.48 GB
+[qtier] host pool: 3635 experts (5.99 GB of the RAM cache) page-locked for the device's copies
+----- v0-run3.steps: sha256 532360046bef9049a35bb90bad731248a4f15fd8805013f50a4b9b14e6c355ed
+
+===== base: v1-run3.csv (sha256 f6b298b4bdd7fc54f9b1294dfe3813c2224165d21f614190c10ee47ae5cbbf1d)
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.785,81.51,32,66.6,40.210,0,0.00,8a96e3d44e17ca10,5cb23346ab6be1d8,2.70303,0.469
+512,512,5.861,87.35,32,23.8,44.973,0,0.00,79d8410c96af468f,7a8848450b863c49,2.95951,0.406
+===== base: v1-run3.err (sha256 01b9b477cd8b497f7ac4f613a237de7e59c94491af95783dbe9f54ad3c2d3101)
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[OMP] qwen36: 4 physical-core threads instead of 8 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 10.7s | RSS after load: 3.03 GB
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[CUDA] device 0: Tesla T4, 15.6 GB VRAM, sm_75
+[qtier] dev 0: 14.5 GB free, allowance 13.4 GB
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 11.64 GB left for experts
+[qtier] dev 0: budget 11.64 GB for experts (~6605 experts) after trunk
+[qtier] CUDA VRAM expert tier active: 1 device(s), 1.80 MB/expert
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[gpu] MoE experts -> CUDA VRAM tier
+[place] probe: one [8192 x 2048] int8 GEMV takes 0.403 ms on CUDA dev 0, 0.862 ms on the CPU -> trunk to VRAM
+[lmh] lm_head [248320 x 2048] int8 resident on CUDA dev 0 (0.47 GB)
+[dnp] 30 DeltaNet-Projektionen auf GPU (0.70 GB VRAM)
+[dense] 190 trunk matrices on GPU (30 dnout, 40 attnproj, 120 shexp; 0.61 GB VRAM)
+[chain] qwen36: a decode step's routed experts in the frame (the tier's residents by address, format 4, group 64; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen36: 40 layers on CUDA device 0 (10 attention), lm_head too; 4.4 MiB of parameters, 35.3 MiB of router, b|a and gate rows, 66 MB of DeltaNet state
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[qtier] host pool: 3635 experts of the RAM cache page-locked for the device to copy a prompt chunk's experts from (COLI_CUDA_HOST_POOL=0 off)
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 10.0 s
+[bench] CUDA ready in 21.96 s; text 6182 tokens; lengths 64,512; gen 32; each length from an empty state
+[qwen36] KV cache: float16, 0.00 GiB at 96 positions (half of float32; Q36_KV=f32 keeps float32)
+[chain] qwen36: 2048 rows per prompt chunk (286 KiB a row, 1.7 GB free on the device; COLI_CUDA_CHAIN_ROWS sets it)
+[chain] qwen36: up to 4 experts a step promoted into the card by this conversation's routes, the coldest residents giving way, none while the last 64 steps hit 75 % or more (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+[bench] peak RSS 19.52 GB
+[qtier] host pool: 3635 experts (5.99 GB of the RAM cache) page-locked for the device's copies
+----- v1-run3.steps: sha256 359b43530730ee10df38fc8e5b9963e6a63042866749e7277f0065ada10b2818
+
+===== base: v1-run4.csv (sha256 3135f9c0cc31c9e9439b22e017c7ad5819f702e9e3ff1b320c415ee26973f5e1)
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.787,81.35,32,65.7,40.650,0,0.00,8a96e3d44e17ca10,5cb23346ab6be1d8,2.70303,0.469
+512,512,5.746,89.10,32,23.6,45.214,0,0.00,79d8410c96af468f,7a8848450b863c49,2.95951,0.406
+===== base: v1-run4.err (sha256 fd22061bac4d25d1eba08e89e99bf17f303998bf4abb03514c0f562ec7e597af)
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[OMP] qwen36: 4 physical-core threads instead of 8 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 10.6s | RSS after load: 3.03 GB
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[CUDA] device 0: Tesla T4, 15.6 GB VRAM, sm_75
+[qtier] dev 0: 14.5 GB free, allowance 13.4 GB
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 11.64 GB left for experts
+[qtier] dev 0: budget 11.64 GB for experts (~6605 experts) after trunk
+[qtier] CUDA VRAM expert tier active: 1 device(s), 1.80 MB/expert
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[gpu] MoE experts -> CUDA VRAM tier
+[place] probe: one [8192 x 2048] int8 GEMV takes 0.481 ms on CUDA dev 0, 0.855 ms on the CPU -> trunk to VRAM
+[lmh] lm_head [248320 x 2048] int8 resident on CUDA dev 0 (0.47 GB)
+[dnp] 30 DeltaNet-Projektionen auf GPU (0.70 GB VRAM)
+[dense] 190 trunk matrices on GPU (30 dnout, 40 attnproj, 120 shexp; 0.61 GB VRAM)
+[chain] qwen36: a decode step's routed experts in the frame (the tier's residents by address, format 4, group 64; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen36: 40 layers on CUDA device 0 (10 attention), lm_head too; 4.4 MiB of parameters, 35.3 MiB of router, b|a and gate rows, 66 MB of DeltaNet state
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[qtier] host pool: 3635 experts of the RAM cache page-locked for the device to copy a prompt chunk's experts from (COLI_CUDA_HOST_POOL=0 off)
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 9.9 s
+[bench] CUDA ready in 21.71 s; text 6182 tokens; lengths 64,512; gen 32; each length from an empty state
+[qwen36] KV cache: float16, 0.00 GiB at 96 positions (half of float32; Q36_KV=f32 keeps float32)
+[chain] qwen36: 2048 rows per prompt chunk (286 KiB a row, 1.7 GB free on the device; COLI_CUDA_CHAIN_ROWS sets it)
+[chain] qwen36: up to 4 experts a step promoted into the card by this conversation's routes, the coldest residents giving way, none while the last 64 steps hit 75 % or more (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+[bench] peak RSS 19.53 GB
+[qtier] host pool: 3635 experts (5.99 GB of the RAM cache) page-locked for the device's copies
+----- v1-run4.steps: sha256 b898a1f62e9e4123df2eef52a94f43da7874f215542ea148c523ed1beaeaf636
+
+===== base: v0-run4.csv (sha256 56077359e7fe0558198a1d1ed077c7d5b018ce5b755ccb2d2e9c74c1f7f853fc)
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.846,75.67,32,67.2,37.948,0,0.00,ffb816333a929871,5cb23346ab6be1d8,2.69296,0.469
+512,512,2.925,175.02,32,22.7,45.408,0,0.00,a06145f14b7e678d,7a8848450b863c49,2.95784,0.438
+===== base: v0-run4.err (sha256 a70469604ee760f9a4f990c09c5d12fa851e8806f39f970a44a8675317d9b05c)
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[OMP] qwen36: 4 physical-core threads instead of 8 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 10.7s | RSS after load: 3.03 GB
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[CUDA] device 0: Tesla T4, 15.6 GB VRAM, sm_75
+[qtier] dev 0: 14.5 GB free, allowance 13.4 GB
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 11.64 GB left for experts
+[qtier] dev 0: budget 11.64 GB for experts (~6605 experts) after trunk
+[qtier] CUDA VRAM expert tier active: 1 device(s), 1.80 MB/expert
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[gpu] MoE experts -> CUDA VRAM tier
+[place] probe: one [8192 x 2048] int8 GEMV takes 0.401 ms on CUDA dev 0, 0.846 ms on the CPU -> trunk to VRAM
+[lmh] lm_head [248320 x 2048] int8 resident on CUDA dev 0 (0.47 GB)
+[dnp] 30 DeltaNet-Projektionen auf GPU (0.70 GB VRAM)
+[dense] 190 trunk matrices on GPU (30 dnout, 40 attnproj, 120 shexp; 0.61 GB VRAM)
+[chain] qwen36: a decode step's routed experts in the frame (the tier's residents by address, format 4, group 64; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen36: 40 layers on CUDA device 0 (10 attention), lm_head too; 4.4 MiB of parameters, 35.3 MiB of router, b|a and gate rows, 66 MB of DeltaNet state
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[qtier] host pool: 3635 experts of the RAM cache page-locked for the device to copy a prompt chunk's experts from (COLI_CUDA_HOST_POOL=0 off)
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 9.6 s
+[bench] CUDA ready in 21.54 s; text 6182 tokens; lengths 64,512; gen 32; each length from an empty state
+[qwen36] KV cache: float16, 0.00 GiB at 96 positions (half of float32; Q36_KV=f32 keeps float32)
+[chain] qwen36: 2048 rows per prompt chunk (286 KiB a row, 1.7 GB free on the device; COLI_CUDA_CHAIN_ROWS sets it)
+[chain] qwen36: up to 4 experts a step promoted into the card by this conversation's routes, the coldest residents giving way, none while the last 64 steps hit 75 % or more (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+[bench] peak RSS 19.48 GB
+[qtier] host pool: 3635 experts (5.99 GB of the RAM cache) page-locked for the device's copies
+----- v0-run4.steps: sha256 18138d5de4b093b82df1a1b041faf1cd84dc5eee6a5595a731608d6057f7e9c6
+
+
+===== base: summary (bench's report of the runs above)
+# bench: misura
+
+- bench 482e1711d589; engine qwen36; Linux (Intel(R) Xeon(R) CPU @ 2.00GHz, Tesla T4); 2026-10-26 19:47
+- model q36; text promessi_sposi.txt (sha256 f53e0d80cb2d4492); lengths 64,512; gen 32; teacher-forced
+- runs: a warm-up of v0 (does not count), then 4 per version, the order turning at every round (ABBA); before every run: wait until cool (at most 900 s), then 60 s of rest
+
+## v0 dev: 4 runs (median, min–max)
+
+| tokens | new | prompt tok/s | first step ms | decode tok/s | experts read | reads' s | nll | top1 | fingerprint |
+|---|---|---|---|---|---|---|---|---|---|
+| 64 | 64 | 76.87 (75.67–77.74) | 67 (67–67) | 38.010 (37.913–38.455) | 0 | 0.00 | 2.6930 | 0.469 | ffb816333a929871 |
+| 512 | 512 | 176.70 (175.02–176.78) | 23 (22–23) | 45.508 (43.622–45.758) | 0 | 0.00 | 2.9578 | 0.438 | a06145f14b7e678d |
+
+peak memory 19948 MiB, model ready in 21.34 s (medians)
+
+decode by steps (step 1 gives the second new word; medians of 4 runs):
+
+| tokens | steps | experts read | decode tok/s | reads' s |
+|---|---|---|---|---|
+| 64 | 2 to 32 | 0 | 38.010 | 0.000 |
+| 512 | 2 to 32 | 0 | 45.508 | 0.000 |
+
+## v1 pr: 4 runs (median, min–max)
+
+| tokens | new | prompt tok/s | first step ms | decode tok/s | experts read | reads' s | nll | top1 | fingerprint |
+|---|---|---|---|---|---|---|---|---|---|
+| 64 | 64 | 81.77 (81.35–82.07) | 65 (64–67) | 40.754 (40.210–41.619) | 0 | 0.00 | 2.7030 | 0.469 | 8a96e3d44e17ca10 |
+| 512 | 512 | 90.00 (87.35–91.67) | 23 (23–24) | 45.325 (44.973–46.006) | 0 | 0.00 | 2.9595 | 0.406 | 79d8410c96af468f |
+
+peak memory 19988 MiB, model ready in 21.58 s (medians)
+
+decode by steps (step 1 gives the second new word; medians of 4 runs):
+
+| tokens | steps | experts read | decode tok/s | reads' s |
+|---|---|---|---|---|
+| 64 | 2 to 32 | 0 | 40.754 | 0.000 |
+| 512 | 2 to 32 | 0 | 45.325 | 0.000 |
+
+## v1 pr against v0 dev (medians; positive = faster)
+
+| tokens | prompt | first step | decode | results |
+|---|---|---|---|---|
+| 64 | +6.4%, every run faster | +3.0%, every run faster | +7.2%, every run faster | same words, logits differ; nll 2.6930 → 2.7030, top1 0.469 → 0.469 |
+| 512 | -49.1%, every run slower | -3.6%, every run slower | -0.4%, ranges overlap | same words, logits differ; nll 2.9578 → 2.9595, top1 0.438 → 0.406 |
+
+| tokens | steps | experts read | decode | reads' s |
+|---|---|---|---|---|
+| 64 | 2 to 32 | 0 → 0 | +7.2%, every run faster | 0.000 → 0.000 s |
+| 512 | 2 to 32 | 0 → 0 | -0.4%, ranges overlap | 0.000 → 0.000 s |
+
+warm-up (does not count): 64 tokens: prompt 76.20 tok/s, decode 38.833 tok/s; 512 tokens: prompt 178.13 tok/s, decode 46.097 tok/s
+runs not cool: none
+pages written to swap during the measurement: 0, 0 of them in the runs that count
+
+
+===== base, 256 decode steps: setup
+bench 482e1711d589; engine qwen36; Linux (Intel(R) Xeon(R) CPU @ 2.00GHz, Tesla T4); 2026-10-26 20:00
+model /content/q36; text promessi_sposi.txt (sha256 f53e0d80cb2d4492); lengths 64,512; gen 256; teacher-forced
+runs: a warm-up of v0 (does not count), then 4 per version, the order turning at every round (ABBA); before every run: wait until cool (at most 900 s), then 60 s of rest
+v0 dev: /content/fase-t4/bin-dev/qwen36-bench (commit c1c06ac6fcb32157e4da130fd96775a32a757052; harness qwen36_bench.c edbe7ddcc146; CUDA); env: COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close
+   command: env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/lib64-nvidia COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close /content/fase-t4/bin-dev/qwen36-bench --model /content/q36 --text /content/bench/promessi_sposi.txt --lengths 64,512 --gen 256 --teacher --steps /content/fase-t4/gen256/v0-runN.steps
+v1 pr: /content/fase-t4/bin-pr/qwen36-bench (commit 7ef075096af0552f026e46585df276fb96935b00; harness qwen36_bench.c edbe7ddcc146; CUDA); env: COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close
+   command: env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/lib64-nvidia COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close /content/fase-t4/bin-pr/qwen36-bench --model /content/q36 --text /content/bench/promessi_sposi.txt --lengths 64,512 --gen 256 --teacher --steps /content/fase-t4/gen256/v1-runN.steps
+
+===== base, 256 decode steps: warmup.csv (sha256 e62ca080eaa1cddd7872820ad1a6b69dcfcc81aacb272554877926473bebe461); warmup.err sha256 2833101c5780107ccb1cecd875e9e4bab2db5dff2ab96e27d23fa9ae419d6914; warmup.steps sha256 f7235b00cbf24ea64d8cb7203850ff30ba161b350c82561abe70a92ee2246ce9
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.844,75.82,256,66.1,44.166,0,0.00,d0888a5584e54f85,fb850fb209add7b9,3.05615,0.465
+512,512,2.911,175.86,256,22.0,47.963,0,0.00,347ee9fc478c67c3,cb0272d9ec9a9dab,2.95185,0.457
+===== base, 256 decode steps: v0-run1.csv (sha256 d21994a7ab06c830926c4c895b003ca551ca0e0dea03e6183e88996f508a570d); v0-run1.err sha256 0c3eb7a20a411e15f1a20ea7a7405bb9e900e6a9a7f733be72c00898d885a8bb; v0-run1.steps sha256 16e8626b33e3e273b50c7d3eaab45fcf0094d50b44f2de66a57c21947fc4f98b
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.850,75.30,256,67.5,43.928,0,0.00,d0888a5584e54f85,fb850fb209add7b9,3.05615,0.465
+512,512,2.928,174.85,256,22.1,47.578,0,0.00,347ee9fc478c67c3,cb0272d9ec9a9dab,2.95185,0.457
+===== base, 256 decode steps: v1-run1.csv (sha256 2783a9a16b7a0f4e63061e5f5fb81e897ae46ef972cb59a27144d81036c8b94d); v1-run1.err sha256 ff4410b800e46366bcc0e44edf1012c4e4ced0fc7937aa60f1351a540b564784; v1-run1.steps sha256 2a5fb092669ebdd20e4c0ce1d17e4eb0fcb0f590a34e583cd8a82e710cd67b05
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.785,81.54,256,64.4,45.139,0,0.00,df728f24e68e6193,fb850fb209add7b9,3.05692,0.457
+512,512,5.563,92.04,256,23.4,47.123,0,0.00,9f47a2b6acfb9421,cb0272d9ec9a9dab,2.94945,0.461
+===== base, 256 decode steps: v1-run2.csv (sha256 7cb107dd7fd517068516be184f29eca0c112cdafee05e6a7edc703e5af5120b0); v1-run2.err sha256 cfae91553f6b61fad1fa5210434821f16ccb414a76a533098c7221d5d10c3e6f; v1-run2.steps sha256 db2945724d85742f85d53535492b48b805fd435eede97cd4ffda08b8ff49203b
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.784,81.66,256,65.3,45.124,0,0.00,df728f24e68e6193,fb850fb209add7b9,3.05692,0.457
+512,512,5.427,94.35,256,23.2,47.209,0,0.00,9f47a2b6acfb9421,cb0272d9ec9a9dab,2.94945,0.461
+===== base, 256 decode steps: v0-run2.csv (sha256 9bb522b1de48712636798bc454f095d0e58d36d1444906997445343a1634f38a); v0-run2.err sha256 ee021d0b3614acfd380a8cc7c2b7fbdd79a091c01c1bad024cc6c1c4f730adf7; v0-run2.steps sha256 899d8f14738f185753e66d790a67371d1540fe8babc039be3c74f79bc9bbdc9f
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.819,78.19,256,68.0,44.037,0,0.00,d0888a5584e54f85,fb850fb209add7b9,3.05615,0.465
+512,512,2.929,174.78,256,21.9,47.493,0,0.00,347ee9fc478c67c3,cb0272d9ec9a9dab,2.95185,0.457
+===== base, 256 decode steps: v0-run3.csv (sha256 c7483b1a44d86db120c994d3469b7c5439d4c49cac366e0f64ed7d57ede1ff9d); v0-run3.err sha256 3ea829949772d82a4cd71f4b51a6ba42cbd7bc9c5d3c216a12a168714e37a75e; v0-run3.steps sha256 54ce27c377c757c48ce2fb3c866b85582353ad05734b53f27544b3ab3a782d9f
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.828,77.27,256,67.5,44.009,0,0.00,d0888a5584e54f85,fb850fb209add7b9,3.05615,0.465
+512,512,2.918,175.46,256,22.3,47.686,0,0.00,116ff27f72319207,cb0272d9ec9a9dab,2.95186,0.457
+===== base, 256 decode steps: v1-run3.csv (sha256 a1bba805ff32fcd91a29bca24ecde67955b1157ec778ff5a270ed64034363a2a); v1-run3.err sha256 f5a80badd5c1a537bfb8f08fdc088ae16f1c6842aaafed5e4658982945156bc7; v1-run3.steps sha256 78b33384a18bf26372863031f7f398c1bc7835d1f7203f375f2537479c3642b2
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.773,82.74,256,65.0,45.282,0,0.00,df728f24e68e6193,fb850fb209add7b9,3.05692,0.457
+512,512,5.462,93.73,256,23.3,47.152,0,0.00,9f47a2b6acfb9421,cb0272d9ec9a9dab,2.94945,0.461
+===== base, 256 decode steps: v1-run4.csv (sha256 c23a61c1d2360707c9eaabdc5ffd21b59f2361fd36e87fd31eabdbfdf8bc7766); v1-run4.err sha256 139d328447e148d2e9612860158e98f29d8a5a4caf304cb73db8d7d0f3765c9a; v1-run4.steps sha256 dabced5ebdee71ff049f87df62ece100bcab6d298208c1aba9aa2e6b37819b69
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.774,82.66,256,63.8,45.885,0,0.00,df728f24e68e6193,fb850fb209add7b9,3.05692,0.457
+512,512,5.205,98.37,256,22.5,47.796,0,0.00,9f47a2b6acfb9421,cb0272d9ec9a9dab,2.94945,0.461
+===== base, 256 decode steps: v0-run4.csv (sha256 1e4a20a31808da3ccc2d3d5ad35ead4ca4f8ab65023749227f02fe9ac5c1e8b7); v0-run4.err sha256 39dc405a1ddea8d6eab1b05592d100145fe6caa773931136cfcb7af9ea0d2213; v0-run4.steps sha256 44d027308f20cbbb2c16f161539a85900bada66f5f17e0a86adc80922a77fa8f
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.843,75.95,256,65.3,44.944,0,0.00,d0888a5584e54f85,fb850fb209add7b9,3.05615,0.465
+512,512,2.900,176.53,256,21.8,48.138,0,0.00,347ee9fc478c67c3,cb0272d9ec9a9dab,2.95185,0.457
+
+===== base, 256 decode steps: summary (bench's report of the runs above)
+# bench: gen256
+
+- bench 482e1711d589; engine qwen36; Linux (Intel(R) Xeon(R) CPU @ 2.00GHz, Tesla T4); 2026-10-26 20:00
+- model q36; text promessi_sposi.txt (sha256 f53e0d80cb2d4492); lengths 64,512; gen 256; teacher-forced
+- runs: a warm-up of v0 (does not count), then 4 per version, the order turning at every round (ABBA); before every run: wait until cool (at most 900 s), then 60 s of rest
+
+## v0 dev: 4 runs (median, min–max)
+
+| tokens | new | prompt tok/s | first step ms | decode tok/s | experts read | reads' s | nll | top1 | fingerprint |
+|---|---|---|---|---|---|---|---|---|---|
+| 64 | 64 | 76.61 (75.30–78.19) | 68 (65–68) | 44.023 (43.928–44.944) | 0 | 0.00 | 3.0562 | 0.465 | d0888a5584e54f85 |
+| 512 | 512 | 175.16 (174.78–176.53) | 22 (22–22) | 47.632 (47.493–48.138) | 0 | 0.00 | 2.9518 | 0.457 | DIFFERENT between runs: ['116ff27f72319207', '347ee9fc478c67c3'] |
+
+peak memory 19948 MiB, model ready in 21.18 s (medians)
+
+decode by steps (step 1 gives the second new word; medians of 4 runs):
+
+| tokens | steps | experts read | decode tok/s | reads' s |
+|---|---|---|---|---|
+| 64 | 2 to 32 | 0 | 38.028 | 0.000 |
+| 64 | 33 to 64 | 0 | 44.990 | 0.000 |
+| 64 | 65 to 128 | 0 | 44.450 | 0.000 |
+| 64 | 129 to 256 | 0 | 45.292 | 0.000 |
+| 64 | 2 to 256 | 0 | 44.023 | 0.000 |
+| 512 | 2 to 32 | 0 | 48.245 | 0.000 |
+| 512 | 33 to 64 | 0 | 48.416 | 0.000 |
+| 512 | 65 to 128 | 0 | 48.267 | 0.000 |
+| 512 | 129 to 256 | 0 | 47.023 | 0.000 |
+| 512 | 2 to 256 | 0 | 47.632 | 0.000 |
+
+## v1 pr: 4 runs (median, min–max)
+
+| tokens | new | prompt tok/s | first step ms | decode tok/s | experts read | reads' s | nll | top1 | fingerprint |
+|---|---|---|---|---|---|---|---|---|---|
+| 64 | 64 | 82.16 (81.54–82.74) | 65 (64–65) | 45.210 (45.124–45.885) | 0 | 0.00 | 3.0569 | 0.457 | df728f24e68e6193 |
+| 512 | 512 | 94.04 (92.04–98.37) | 23 (22–23) | 47.181 (47.123–47.796) | 0 | 0.00 | 2.9495 | 0.461 | 9f47a2b6acfb9421 |
+
+peak memory 19988 MiB, model ready in 21.45 s (medians)
+
+decode by steps (step 1 gives the second new word; medians of 4 runs):
+
+| tokens | steps | experts read | decode tok/s | reads' s |
+|---|---|---|---|---|
+| 64 | 2 to 32 | 0 | 40.631 | 0.000 |
+| 64 | 33 to 64 | 0 | 45.074 | 0.000 |
+| 64 | 65 to 128 | 0 | 44.643 | 0.000 |
+| 64 | 129 to 256 | 0 | 46.844 | 0.000 |
+| 64 | 2 to 256 | 0 | 45.211 | 0.000 |
+| 512 | 2 to 32 | 0 | 47.448 | 0.000 |
+| 512 | 33 to 64 | 0 | 48.571 | 0.000 |
+| 512 | 65 to 128 | 0 | 47.660 | 0.000 |
+| 512 | 129 to 256 | 0 | 46.602 | 0.000 |
+| 512 | 2 to 256 | 0 | 47.181 | 0.000 |
+
+## v1 pr against v0 dev (medians; positive = faster)
+
+| tokens | prompt | first step | decode | results |
+|---|---|---|---|---|
+| 64 | +7.2%, every run faster | +4.3%, ranges overlap | +2.7%, every run faster | same words, logits differ; nll 3.0562 → 3.0569, top1 0.465 → 0.457 |
+| 512 | -46.3%, every run slower | -5.4%, every run slower | -0.9%, ranges overlap | same words, logits differ; nll 2.9518 → 2.9495, top1 0.457 → 0.461 |
+
+| tokens | steps | experts read | decode | reads' s |
+|---|---|---|---|---|
+| 64 | 2 to 32 | 0 → 0 | +6.8%, every run faster | 0.000 → 0.000 s |
+| 64 | 33 to 64 | 0 → 0 | +0.2%, ranges overlap | 0.000 → 0.000 s |
+| 64 | 65 to 128 | 0 → 0 | +0.4%, ranges overlap | 0.000 → 0.000 s |
+| 64 | 129 to 256 | 0 → 0 | +3.4%, every run faster | 0.000 → 0.000 s |
+| 64 | 2 to 256 | 0 → 0 | +2.7%, every run faster | 0.000 → 0.000 s |
+| 512 | 2 to 32 | 0 → 0 | -1.7%, ranges overlap | 0.000 → 0.000 s |
+| 512 | 33 to 64 | 0 → 0 | +0.3%, ranges overlap | 0.000 → 0.000 s |
+| 512 | 65 to 128 | 0 → 0 | -1.3%, every run slower | 0.000 → 0.000 s |
+| 512 | 129 to 256 | 0 → 0 | -0.9%, ranges overlap | 0.000 → 0.000 s |
+| 512 | 2 to 256 | 0 → 0 | -0.9%, ranges overlap | 0.000 → 0.000 s |
+
+warm-up (does not count): 64 tokens: prompt 75.82 tok/s, decode 44.166 tok/s; 512 tokens: prompt 175.86 tok/s, decode 47.963 tok/s
+runs not cool: none
+pages written to swap during the measurement: 0, 0 of them in the runs that count
+
+
+===== agent session: setup
+bench 482e1711d589; engine qwen36; Linux (Intel(R) Xeon(R) CPU @ 2.00GHz, Tesla T4); 2026-10-26 20:17
+model /content/q36; session agente.sess
+runs: a warm-up of v0 (does not count), then 4 per version, the order turning at every round (ABBA); before every run: wait until cool (at most 900 s), then 60 s of rest
+v0 dev: /content/fase-t4/bin-dev/qwen36-bench (commit c1c06ac6fcb32157e4da130fd96775a32a757052; harness qwen36_bench.c edbe7ddcc146; CUDA); env: COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close
+   command: env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/lib64-nvidia COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close /content/fase-t4/bin-dev/qwen36-bench --model /content/q36 --session /content/bench/sessioni/agente.sess --steps /content/fase-t4/agente/v0-runN.steps
+v1 pr: /content/fase-t4/bin-pr/qwen36-bench (commit 7ef075096af0552f026e46585df276fb96935b00; harness qwen36_bench.c edbe7ddcc146; CUDA); env: COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close
+   command: env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/lib64-nvidia COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close /content/fase-t4/bin-pr/qwen36-bench --model /content/q36 --session /content/bench/sessioni/agente.sess --steps /content/fase-t4/agente/v1-runN.steps
+
+===== agent session: warmup.csv (sha256 21b5317ea2c429107bdcd595d42fa54cfe22a3ec09f19348da078ed21a0b8a1a); warmup.err sha256 e3e47b5bc4178da4e1d8cefed0c1b865869314e4d678d78557f32fc148b77856; warmup.steps sha256 23d8a667ca14377ca305e501f44333cb8accbc76e4d2d4b64dbfedf03f5ac576
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+663,663,1.449,457.46,57,67.2,33.676,0,0.00,be02ae1c335d12d7,a9232a16bd227f2d,1.73837,0.737,0,720,19.43,0,1,0,1
+1954,1234,6.983,176.71,32,28.5,38.292,0,0.00,00afafaf0a592b78,7d6e0f6d44b5cecc,0.02226,1.000,720,1986,19.60,32,1,1,0
+4248,2262,14.170,159.64,87,26.7,38.525,0,0.00,f869c5ec5a918e50,159540b062b93762,1.12362,0.724,1986,4335,19.71,0,1,0,1
+5741,1406,8.577,163.93,44,26.7,37.670,0,0.00,c4fcc1e1b9688f47,23d625e741190180,0.22421,0.932,4335,5785,19.74,0,1,0,1
+7083,1298,7.839,165.58,54,31.1,36.581,0,0.00,3c6ad5a5478ec290,24b73c35bded487b,1.09244,0.796,5785,7137,19.80,1,1,0,1
+8041,904,5.788,156.19,24,26.2,37.840,0,0.00,7749ce5874b5230a,331c8c8593842500,0.29203,0.875,7137,8065,19.86,0,1,0,1
+8413,348,2.666,130.54,467,30.7,37.163,0,0.00,2e00dc67e4c7aeb1,c005de8ea3c4e76e,0.84723,0.762,8065,8880,19.90,0,1,0,1
+8915,35,0.933,37.51,186,24.2,40.334,0,0.00,6a7b71969f167bc7,1ac06551ca8a243e,0.89266,0.731,8880,9101,19.92,0,0,0,1
+===== agent session: v0-run1.csv (sha256 c414ea3a1e06bc4b31c1a80214e1c622d44aff83d55ba7e94e4744866de5857d); v0-run1.err sha256 09799ad47f2798f2a8b87e66a27b70457c9f7095f59f1c01a7c4dd908cfe074c; v0-run1.steps sha256 61c247577fb8d66ce3ed1643835e600ad40374193f405c8d167e4782ac061aef
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+663,663,1.447,458.23,57,67.2,33.489,0,0.00,be02ae1c335d12d7,a9232a16bd227f2d,1.73837,0.737,0,720,19.43,0,1,0,1
+1954,1234,7.022,175.73,32,29.4,38.022,0,0.00,00afafaf0a592b78,7d6e0f6d44b5cecc,0.02226,1.000,720,1986,19.60,32,1,1,0
+4248,2262,14.204,159.25,87,26.5,38.309,0,0.00,131278fe1d688d2d,159540b062b93762,1.11989,0.724,1986,4335,19.71,0,1,0,1
+5741,1406,8.504,165.33,44,28.0,37.836,0,0.00,387face3cb664faf,23d625e741190180,0.22550,0.932,4335,5785,19.74,0,1,0,1
+7083,1298,7.783,166.78,54,31.0,36.713,0,0.00,09a5e6f1f7034003,24b73c35bded487b,1.09308,0.796,5785,7137,19.80,1,1,0,1
+8041,904,5.787,156.22,24,27.4,37.320,0,0.00,6cd11b037eb76ee4,331c8c8593842500,0.29216,0.875,7137,8065,19.86,0,1,0,1
+8413,348,2.687,129.53,467,30.6,36.347,0,0.00,6fa930521192ee98,c005de8ea3c4e76e,0.84273,0.764,8065,8880,19.90,0,1,0,1
+8915,35,0.948,36.92,186,25.0,39.824,0,0.00,43b5ef64e8316b49,1ac06551ca8a243e,0.88898,0.726,8880,9101,19.92,0,0,0,1
+===== agent session: v1-run1.csv (sha256 e29be3ef076d661c557aafa772b40f358044fffb45c2c1af8e3dd86f0d9e5944); v1-run1.err sha256 5da42e95244eafc5c2118882b164f86579bb779da09438abe3be6de769ab23dd; v1-run1.steps sha256 7e987fb2f65567a32a76205d717251f1db4d41f3a52110cbaf4a66c949485cdf
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+663,663,1.193,555.68,57,65.3,36.208,0,0.00,017d369d31e27c63,a9232a16bd227f2d,1.73323,0.737,0,720,19.47,0,1,0,1
+1954,1234,21.777,56.67,32,28.8,39.817,0,0.00,2e297d64cc9a8602,7d6e0f6d44b5cecc,0.02277,1.000,720,1986,19.64,32,1,1,0
+4248,2262,40.128,56.37,87,29.6,40.394,0,0.00,17733bba2eb0e01b,159540b062b93762,1.11746,0.713,1986,4335,19.76,0,1,0,1
+5741,1406,22.093,63.64,44,22.9,38.822,0,0.00,1fd04cb0980572c7,23d625e741190180,0.22290,0.932,4335,5785,19.79,0,1,0,1
+7083,1298,20.801,62.40,54,27.7,38.433,0,0.00,dad0523e5b9a5ebe,24b73c35bded487b,1.08092,0.796,5785,7137,19.84,1,1,0,1
+8041,904,14.794,61.11,24,24.3,40.065,0,0.00,3370dab9f72b45b4,331c8c8593842500,0.28754,0.875,7137,8065,19.90,0,1,0,1
+8413,348,5.055,68.85,467,28.3,39.114,0,0.00,93a5b0ee61211917,c005de8ea3c4e76e,0.83384,0.767,8065,8880,19.93,0,1,0,1
+8915,35,0.822,42.60,186,25.2,40.575,0,0.00,8eb39c0a5edd7efd,1ac06551ca8a243e,0.88337,0.731,8880,9101,19.96,0,0,0,1
+===== agent session: v1-run2.csv (sha256 333ec8967a57f7dad4bdc552c55b71081a4dde96359d9385bfffd8f87475d8c8); v1-run2.err sha256 2eec05dc1b5d9f584b2a5318f6b64740de51c6a7b4e94cb60b5b0b4ea632a0ab; v1-run2.steps sha256 0141f879dcf5fe6fe59b0e54e6708e03f63d01fb9ccff7afb4c613e45ed50caa
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+663,663,1.189,557.81,57,65.7,36.933,0,0.00,017d369d31e27c63,a9232a16bd227f2d,1.73323,0.737,0,720,19.46,0,1,0,1
+1954,1234,21.297,57.94,32,27.6,40.780,0,0.00,2e297d64cc9a8602,7d6e0f6d44b5cecc,0.02277,1.000,720,1986,19.63,32,1,1,0
+4248,2262,39.030,57.96,87,29.7,40.525,0,0.00,17733bba2eb0e01b,159540b062b93762,1.11746,0.713,1986,4335,19.75,0,1,0,1
+5741,1406,21.605,65.08,44,23.1,39.292,0,0.00,1fd04cb0980572c7,23d625e741190180,0.22290,0.932,4335,5785,19.79,0,1,0,1
+7083,1298,20.045,64.76,54,27.5,39.070,0,0.00,dad0523e5b9a5ebe,24b73c35bded487b,1.08092,0.796,5785,7137,19.84,1,1,0,1
+8041,904,14.176,63.77,24,24.2,40.532,0,0.00,3370dab9f72b45b4,331c8c8593842500,0.28754,0.875,7137,8065,19.89,0,1,0,1
+8413,348,4.950,70.31,467,27.5,39.519,0,0.00,93a5b0ee61211917,c005de8ea3c4e76e,0.83384,0.767,8065,8880,19.93,0,1,0,1
+8915,35,0.812,43.12,186,24.9,40.868,0,0.00,8eb39c0a5edd7efd,1ac06551ca8a243e,0.88337,0.731,8880,9101,19.96,0,0,0,1
+===== agent session: v0-run2.csv (sha256 caac695a8d04aec377e215c67d38fd9d6a80d5faed17356f6ebf13bc70bc00ee); v0-run2.err sha256 8005362a72bdd4e595144ff5ab828fa9c2542ad70f7f1b1015f14eb6525d96ae; v0-run2.steps sha256 a3ef3687f77a30ccb349c54c3102c76da5a7104ea62196c3ceee5420a146acbb
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+663,663,1.437,461.50,57,66.4,33.956,0,0.00,be02ae1c335d12d7,a9232a16bd227f2d,1.73837,0.737,0,720,19.43,0,1,0,1
+1954,1234,7.029,175.56,32,29.3,38.333,0,0.00,00afafaf0a592b78,7d6e0f6d44b5cecc,0.02226,1.000,720,1986,19.60,32,1,1,0
+4248,2262,14.214,159.14,87,26.6,38.550,0,0.00,131278fe1d688d2d,159540b062b93762,1.11989,0.724,1986,4335,19.71,0,1,0,1
+5741,1406,8.532,164.79,44,26.8,37.765,0,0.00,387face3cb664faf,23d625e741190180,0.22550,0.932,4335,5785,19.74,0,1,0,1
+7083,1298,7.832,165.73,54,31.2,36.421,0,0.00,09a5e6f1f7034003,24b73c35bded487b,1.09308,0.796,5785,7137,19.80,1,1,0,1
+8041,904,5.831,155.03,24,27.4,37.053,0,0.00,6cd11b037eb76ee4,331c8c8593842500,0.29216,0.875,7137,8065,19.86,0,1,0,1
+8413,348,2.681,129.81,467,30.6,36.409,0,0.00,9b535843c1d00670,c005de8ea3c4e76e,0.84704,0.764,8065,8880,19.90,0,1,0,1
+8915,35,0.949,36.86,186,24.7,39.780,0,0.00,f8c309f31538321c,1ac06551ca8a243e,0.88866,0.731,8880,9101,19.92,0,0,0,1
+===== agent session: v0-run3.csv (sha256 54b43b2605a656e8f8489e602b36f8aa4d1123ef62a6944b4749e5095c0de359); v0-run3.err sha256 1810757bb999c6490bab7e8748727995d4915b8fa8f711b14ec9a6389516db4d; v0-run3.steps sha256 a083c632e6ad10c21bae1665da5305043372f9e5fac780c6adbb9913a46bceee
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+663,663,1.414,469.02,57,66.5,32.949,0,0.00,be02ae1c335d12d7,a9232a16bd227f2d,1.73837,0.737,0,720,19.43,0,1,0,1
+1954,1234,7.126,173.17,32,29.7,37.290,0,0.00,00afafaf0a592b78,7d6e0f6d44b5cecc,0.02226,1.000,720,1986,19.60,32,1,1,0
+4248,2262,14.535,155.62,87,26.9,37.767,0,0.00,131278fe1d688d2d,159540b062b93762,1.11989,0.724,1986,4335,19.71,0,1,0,1
+5741,1406,8.619,163.13,44,27.3,37.374,0,0.00,387face3cb664faf,23d625e741190180,0.22550,0.932,4335,5785,19.74,0,1,0,1
+7083,1298,7.829,165.80,54,31.3,36.774,0,0.00,09a5e6f1f7034003,24b73c35bded487b,1.09308,0.796,5785,7137,19.80,1,1,0,1
+8041,904,5.800,155.85,24,27.3,37.033,0,0.00,6cd11b037eb76ee4,331c8c8593842500,0.29216,0.875,7137,8065,19.86,0,1,0,1
+8413,348,2.690,129.35,467,30.4,36.315,0,0.00,9b535843c1d00670,c005de8ea3c4e76e,0.84704,0.764,8065,8880,19.90,0,1,0,1
+8915,35,0.952,36.77,186,25.3,39.532,0,0.00,f8c309f31538321c,1ac06551ca8a243e,0.88866,0.731,8880,9101,19.92,0,0,0,1
+===== agent session: v1-run3.csv (sha256 86434a9bf33b3b50405db04ba950ea590a20fc8180bdfde7ad5a8086bdcd31b8); v1-run3.err sha256 ca15fb020e0d93a58b8eac0432aa622aa95ee2b00f6a5e134190119179b03d56; v1-run3.steps sha256 4a13b8e5bff9b472122c9010af5fd26801c3979acd482481d97890d1b225f847
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+663,663,1.185,559.70,57,65.3,35.982,0,0.00,017d369d31e27c63,a9232a16bd227f2d,1.73323,0.737,0,720,19.46,0,1,0,1
+1954,1234,21.983,56.13,32,28.8,39.666,0,0.00,2e297d64cc9a8602,7d6e0f6d44b5cecc,0.02277,1.000,720,1986,19.63,32,1,1,0
+4248,2262,40.127,56.37,87,28.7,40.502,0,0.00,17733bba2eb0e01b,159540b062b93762,1.11746,0.713,1986,4335,19.75,0,1,0,1
+5741,1406,21.980,63.97,44,23.3,38.938,0,0.00,1fd04cb0980572c7,23d625e741190180,0.22290,0.932,4335,5785,19.79,0,1,0,1
+7083,1298,20.602,63.00,54,27.6,38.840,0,0.00,dad0523e5b9a5ebe,24b73c35bded487b,1.08092,0.796,5785,7137,19.85,1,1,0,1
+8041,904,14.297,63.23,24,24.1,40.287,0,0.00,3370dab9f72b45b4,331c8c8593842500,0.28754,0.875,7137,8065,19.89,0,1,0,1
+8413,348,4.935,70.52,467,28.3,39.166,0,0.00,93a5b0ee61211917,c005de8ea3c4e76e,0.83384,0.767,8065,8880,19.93,0,1,0,1
+8915,35,0.826,42.36,186,25.1,40.507,0,0.00,8eb39c0a5edd7efd,1ac06551ca8a243e,0.88337,0.731,8880,9101,19.97,0,0,0,1
+===== agent session: v1-run4.csv (sha256 a8ac15d989ec11c7d20568ed9cf8d16cc8ae998096db7cea624c1116130b4c7f); v1-run4.err sha256 2c0d6f4274378444cce8e9b1850266f2d9a170322d8d26dec6a6af01dd8d878b; v1-run4.steps sha256 4f33212237a0500fb2e55591dacbce13adb23184605948b81f5783f1525d6e31
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+663,663,1.192,556.34,57,64.4,36.655,0,0.00,017d369d31e27c63,a9232a16bd227f2d,1.73323,0.737,0,720,19.47,0,1,0,1
+1954,1234,21.312,57.90,32,28.4,40.212,0,0.00,2e297d64cc9a8602,7d6e0f6d44b5cecc,0.02277,1.000,720,1986,19.64,32,1,1,0
+4248,2262,39.434,57.36,87,28.3,40.712,0,0.00,17733bba2eb0e01b,159540b062b93762,1.11746,0.713,1986,4335,19.76,0,1,0,1
+5741,1406,21.764,64.60,44,23.3,38.794,0,0.00,eef7833ac0ef2c58,23d625e741190180,0.22236,0.932,4335,5785,19.79,0,1,0,1
+7083,1298,20.155,64.40,54,26.9,39.224,0,0.00,bcaa729f8fcaf99a,24b73c35bded487b,1.08098,0.796,5785,7137,19.85,1,1,0,1
+8041,904,14.112,64.06,24,23.7,41.028,0,0.00,486d4c92d3cd0159,331c8c8593842500,0.28838,0.875,7137,8065,19.89,0,1,0,1
+8413,348,4.895,71.09,467,27.6,39.493,0,0.00,fd9bdb30bf8f1f9e,c005de8ea3c4e76e,0.83608,0.762,8065,8880,19.94,0,1,0,1
+8915,35,0.814,43.01,186,24.6,40.872,0,0.00,a069d871d2f35691,1ac06551ca8a243e,0.87849,0.731,8880,9101,19.97,0,0,0,1
+===== agent session: v0-run4.csv (sha256 fe236eb4bc94fc54b00c664ebed15bf6400b0651c0193c2df919111f6446bfa4); v0-run4.err sha256 c9380da7ba688e6759a21cbfc0e82ef29f7e4998e77f0364faa2758bd6ec84d6; v0-run4.steps sha256 35bf3a13f6ee0646e88eacd966b1785e8c124e7db339b67ffb558108738ecb23
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+663,663,1.430,463.54,57,64.8,33.696,0,0.00,be02ae1c335d12d7,a9232a16bd227f2d,1.73837,0.737,0,720,19.43,0,1,0,1
+1954,1234,7.043,175.22,32,29.8,38.051,0,0.00,00afafaf0a592b78,7d6e0f6d44b5cecc,0.02226,1.000,720,1986,19.60,32,1,1,0
+4248,2262,14.278,158.42,87,26.6,38.703,0,0.00,131278fe1d688d2d,159540b062b93762,1.11989,0.724,1986,4335,19.71,0,1,0,1
+5741,1406,8.518,165.06,44,27.4,37.985,0,0.00,387face3cb664faf,23d625e741190180,0.22550,0.932,4335,5785,19.74,0,1,0,1
+7083,1298,7.822,165.94,54,31.2,36.399,0,0.00,09a5e6f1f7034003,24b73c35bded487b,1.09308,0.796,5785,7137,19.80,1,1,0,1
+8041,904,5.819,155.35,24,27.2,37.983,0,0.00,6cd11b037eb76ee4,331c8c8593842500,0.29216,0.875,7137,8065,19.86,0,1,0,1
+8413,348,2.645,131.57,467,29.2,37.118,0,0.00,9b535843c1d00670,c005de8ea3c4e76e,0.84704,0.764,8065,8880,19.90,0,1,0,1
+8915,35,0.944,37.06,186,24.1,40.188,0,0.00,f8c309f31538321c,1ac06551ca8a243e,0.88866,0.731,8880,9101,19.92,0,0,0,1
+
+===== agent session: summary (bench's report of the runs above)
+# bench: agente
+
+- bench 482e1711d589; engine qwen36; Linux (Intel(R) Xeon(R) CPU @ 2.00GHz, Tesla T4); 2026-10-26 20:17
+- model q36; session agente.sess
+- runs: a warm-up of v0 (does not count), then 4 per version, the order turning at every round (ABBA); before every run: wait until cool (at most 900 s), then 60 s of rest
+
+## v0 dev: 4 runs (median, min–max)
+
+| turn | prompt | reused | read | to first token s | first step ms | decode tok/s | answer | nll | top1 | greedy same | tool calls exact | stops | RSS GB | experts read |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 663 | 0 | 663 | 1.43 (1.41–1.45) | 66 (65–67) | 33.59 (32.95–33.96) | 57 | 1.7384 | 0.737 | 0/57 | 0/1 | yes | 19.43 | 0 |
+| 2 | 1954 | 720 | 1234 | 7.04 (7.02–7.13) | 30 (29–30) | 38.04 (37.29–38.33) | 32 | 0.0223 | 1.000 | 32/32 | 1/1 | no | 19.60 | 0 |
+| 3 | 4248 | 1986 | 2262 | 14.25 (14.20–14.54) | 27 (26–27) | 38.43 (37.77–38.70) | 87 | 1.1199 | 0.724 | 0/87 | 0/1 | yes | 19.71 | 0 |
+| 4 | 5741 | 4335 | 1406 | 8.53 (8.50–8.62) | 27 (27–28) | 37.80 (37.37–37.98) | 44 | 0.2255 | 0.932 | 0/44 | 0/1 | yes | 19.74 | 0 |
+| 5 | 7083 | 5785 | 1298 | 7.83 (7.78–7.83) | 31 (31–31) | 36.57 (36.40–36.77) | 54 | 1.0931 | 0.796 | 1/54 | 0/1 | yes | 19.80 | 0 |
+| 6 | 8041 | 7137 | 904 | 5.81 (5.79–5.83) | 27 (27–27) | 37.19 (37.03–37.98) | 24 | 0.2922 | 0.875 | 0/24 | 0/1 | yes | 19.86 | 0 |
+| 7 | 8413 | 8065 | 348 | 2.68 (2.65–2.69) | 30 (29–31) | 36.38 (36.31–37.12) | 467 | 0.8470 | 0.764 | 0/467 | 0/1 | yes | 19.90 | 0 |
+| 8 | 8915 | 8880 | 35 | 0.95 (0.94–0.95) | 25 (24–25) | 39.80 (39.53–40.19) | 186 | 0.8887 | 0.731 | 0/186 | 0/0 | yes | 19.92 | 0 |
+
+session: 8 turns; prompts read 8150 tokens, reused 36908; all turns 74.1 (73.8–74.8) s; to first token in all 48.5 (48.4–49.0) s; answers 951 tokens, nll 0.8750, top1 0.772; tool calls exact 1 of 7; turns that stop 7 of 8
+fingerprints equal in every run: NO, turns [7, 8]
+
+## v1 pr: 4 runs (median, min–max)
+
+| turn | prompt | reused | read | to first token s | first step ms | decode tok/s | answer | nll | top1 | greedy same | tool calls exact | stops | RSS GB | experts read |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 663 | 0 | 663 | 1.19 (1.19–1.19) | 65 (64–66) | 36.43 (35.98–36.93) | 57 | 1.7332 | 0.737 | 0/57 | 0/1 | yes | 19.46 | 0 |
+| 2 | 1954 | 720 | 1234 | 21.54 (21.30–21.98) | 29 (28–29) | 40.01 (39.67–40.78) | 32 | 0.0228 | 1.000 | 32/32 | 1/1 | no | 19.63 | 0 |
+| 3 | 4248 | 1986 | 2262 | 39.78 (39.03–40.13) | 29 (28–30) | 40.51 (40.39–40.71) | 87 | 1.1175 | 0.713 | 0/87 | 0/1 | yes | 19.76 | 0 |
+| 4 | 5741 | 4335 | 1406 | 21.87 (21.61–22.09) | 23 (23–23) | 38.88 (38.79–39.29) | 44 | 0.2229 | 0.932 | 0/44 | 0/1 | yes | 19.79 | 0 |
+| 5 | 7083 | 5785 | 1298 | 20.38 (20.05–20.80) | 28 (27–28) | 38.95 (38.43–39.22) | 54 | 1.0809 | 0.796 | 1/54 | 0/1 | yes | 19.84 | 0 |
+| 6 | 8041 | 7137 | 904 | 14.24 (14.11–14.79) | 24 (24–24) | 40.41 (40.06–41.03) | 24 | 0.2875 | 0.875 | 0/24 | 0/1 | yes | 19.89 | 0 |
+| 7 | 8413 | 8065 | 348 | 4.94 (4.89–5.05) | 28 (28–28) | 39.33 (39.11–39.52) | 467 | 0.8338 | 0.767 | 0/467 | 0/1 | yes | 19.93 | 0 |
+| 8 | 8915 | 8880 | 35 | 0.82 (0.81–0.83) | 25 (25–25) | 40.72 (40.51–40.87) | 186 | 0.8834 | 0.731 | 0/186 | 0/0 | yes | 19.96 | 0 |
+
+session: 8 turns; prompts read 8150 tokens, reused 36908; all turns 148.9 (147.1–150.9) s; to first token in all 124.8 (123.1–126.7) s; answers 951 tokens, nll 0.8681, top1 0.773; tool calls exact 1 of 7; turns that stop 7 of 8
+fingerprints equal in every run: NO, turns [4, 5, 6, 7, 8]
+
+## v1 pr against v0 dev (medians; positive = faster)
+
+same prompts and teacher-forced answers: yes
+
+| turn | to first token | first step | decode | nll | experts read |
+|---|---|---|---|---|---|
+| 1 | +20.4%, every run faster | +1.8%, ranges overlap | +8.5%, every run faster | -0.0051 | 0 → 0 |
+| 2 | -67.3%, every run slower | +3.3%, every run faster | +5.2%, every run faster | +0.0005 | 0 → 0 |
+| 3 | -64.2%, every run slower | -8.7%, every run slower | +5.4%, every run faster | -0.0024 | 0 → 0 |
+| 4 | -61.0%, every run slower | +17.9%, every run faster | +2.9%, every run faster | -0.0026 | 0 → 0 |
+| 5 | -61.6%, every run slower | +13.2%, every run faster | +6.5%, every run faster | -0.0122 | 0 → 0 |
+| 6 | -59.2%, every run slower | +13.3%, every run faster | +8.7%, every run faster | -0.0046 | 0 → 0 |
+| 7 | -45.7%, every run slower | +9.1%, every run faster | +8.1%, every run faster | -0.0132 | 0 → 0 |
+| 8 | +16.0%, every run faster | -0.6%, ranges overlap | +2.3%, every run faster | -0.0053 | 0 → 0 |
+
+all turns: -50.3%, every run slower; to first token in all: -61.1%, every run slower
+runs not cool: none
+pages written to swap during the measurement: 0, 0 of them in the runs that count
+
+
+===== chat session: setup
+bench 482e1711d589; engine qwen36; Linux (Intel(R) Xeon(R) CPU @ 2.00GHz, Tesla T4); 2026-10-26 20:48
+model /content/q36; session chat.sess
+runs: a warm-up of v0 (does not count), then 4 per version, the order turning at every round (ABBA); before every run: wait until cool (at most 900 s), then 60 s of rest
+v0 dev: /content/fase-t4/bin-dev/qwen36-bench (commit c1c06ac6fcb32157e4da130fd96775a32a757052; harness qwen36_bench.c edbe7ddcc146; CUDA); env: COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close
+   command: env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/lib64-nvidia COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close /content/fase-t4/bin-dev/qwen36-bench --model /content/q36 --session /content/bench/sessioni/chat.sess --steps /content/fase-t4/chat/v0-runN.steps
+v1 pr: /content/fase-t4/bin-pr/qwen36-bench (commit 7ef075096af0552f026e46585df276fb96935b00; harness qwen36_bench.c edbe7ddcc146; CUDA); env: COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close
+   command: env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/lib64-nvidia COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close /content/fase-t4/bin-pr/qwen36-bench --model /content/q36 --session /content/bench/sessioni/chat.sess --steps /content/fase-t4/chat/v1-runN.steps
+
+===== chat session: warmup.csv (sha256 73eab4afc3ddd17e127a2b8b9532c93906040d5c2d5e7e7a2976478a4dc8ca1d); warmup.err sha256 85ec9e2ee7ee06e24b538ea712a8d23842834daeac6e55750af5e9ab19399099; warmup.steps sha256 27aaa5b032c1a771d381a92176b05832768d0d1317d42db05e611c5189919ad3
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+38,38,0.833,45.64,256,66.0,41.072,0,0.00,a78495b62399806c,22216b578f19b9a6,1.38253,0.672,0,294,19.37,0,0,0,1
+321,27,0.508,53.15,489,26.2,41.354,0,0.00,c271462c3fe32fd6,4d025f2a5d326967,1.38959,0.628,294,810,19.40,2,0,0,0
+846,36,0.793,45.41,243,25.3,41.419,0,0.00,069340eea32b6c42,d016f9d61eb84ab2,1.27433,0.626,810,1089,19.42,0,0,0,1
+1120,31,0.559,55.48,315,21.8,44.353,0,0.00,6719f3fc3726a8a2,2f91aea627876859,1.12367,0.679,1089,1435,19.44,0,0,0,0
+1475,40,0.801,49.93,155,24.0,44.960,0,0.00,a4e546e8f3869e1a,fd3476fff1520e03,1.09032,0.671,1435,1630,19.45,7,0,0,0
+===== chat session: v0-run1.csv (sha256 fa56631687e00540bfc5cf5216777fd0aa0833c9ace58519edd247f86388cf77); v0-run1.err sha256 88b4e2ba5774005ad4157246431d8cf482c3f283674075a855e88b6c185d765f; v0-run1.steps sha256 8782c09f35adc005f03f3a3d2feb51081ffa58e6a09f529db822a3818bed8daa
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+38,38,0.834,45.58,256,67.5,40.884,0,0.00,a78495b62399806c,22216b578f19b9a6,1.38253,0.672,0,294,19.37,0,0,0,1
+321,27,0.513,52.59,489,26.4,41.146,0,0.00,c271462c3fe32fd6,4d025f2a5d326967,1.38959,0.628,294,810,19.40,2,0,0,0
+846,36,0.772,46.65,243,24.4,41.273,0,0.00,069340eea32b6c42,d016f9d61eb84ab2,1.27433,0.626,810,1089,19.42,0,0,0,1
+1120,31,0.576,53.87,315,22.0,43.962,0,0.00,6719f3fc3726a8a2,2f91aea627876859,1.12367,0.679,1089,1435,19.44,0,0,0,0
+1475,40,0.803,49.84,155,24.1,44.371,0,0.00,a4e546e8f3869e1a,fd3476fff1520e03,1.09032,0.671,1435,1630,19.45,7,0,0,0
+===== chat session: v1-run1.csv (sha256 d1e8bc5cbb3c3d9bc623afdca2b673c7ac72238c7def31ce52a402bf446112d2); v1-run1.err sha256 7f907806adf650d7a711189b6d7620d4252558baf7eb7c286123bbd7bb498632; v1-run1.steps sha256 c29249cff124d4d6023e81010026a4550f4f8422e93cde0f8fda656689fc8581
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+38,38,0.798,47.62,256,65.0,43.786,0,0.00,008001a65faa19fa,22216b578f19b9a6,1.38141,0.672,0,294,19.42,0,0,0,1
+321,27,0.468,57.73,489,23.5,43.769,0,0.00,ee8d22aeb2da48a2,4d025f2a5d326967,1.38391,0.634,294,810,19.44,2,0,0,0
+846,36,0.614,58.63,243,22.3,44.073,0,0.00,6e83244182aa8793,d016f9d61eb84ab2,1.27809,0.626,810,1089,19.46,0,0,0,1
+1120,31,0.494,62.72,315,18.8,47.721,0,0.00,29564d4ab1b8a338,2f91aea627876859,1.12280,0.670,1089,1435,19.48,0,0,0,0
+1475,40,0.610,65.53,155,20.7,47.901,0,0.00,94d6956d54335c5b,fd3476fff1520e03,1.08878,0.671,1435,1630,19.50,7,0,0,0
+===== chat session: v1-run2.csv (sha256 8c5a81544bb721e4e1cce1a10c2ad41b330b73c2b67e7a5f88b8cc941e65451d); v1-run2.err sha256 96db02a02de7c008565ab43f37edbfc1c9fa15690eb28d2d8346bdde6cd4af10; v1-run2.steps sha256 ab5842c25a9029c1f7aaa2f62e98cf34ffb5bd0749a96ad4b5d1bcd43d741bfc
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+38,38,0.799,47.56,256,65.0,43.374,0,0.00,008001a65faa19fa,22216b578f19b9a6,1.38141,0.672,0,294,19.41,0,0,0,1
+321,27,0.468,57.63,489,23.7,43.479,0,0.00,ee8d22aeb2da48a2,4d025f2a5d326967,1.38391,0.634,294,810,19.44,2,0,0,0
+846,36,0.607,59.27,243,22.3,44.080,0,0.00,6e83244182aa8793,d016f9d61eb84ab2,1.27809,0.626,810,1089,19.46,0,0,0,1
+1120,31,0.489,63.34,315,18.9,47.654,0,0.00,29564d4ab1b8a338,2f91aea627876859,1.12280,0.670,1089,1435,19.47,0,0,0,0
+1475,40,0.600,66.64,155,20.4,47.802,0,0.00,94d6956d54335c5b,fd3476fff1520e03,1.08878,0.671,1435,1630,19.49,7,0,0,0
+===== chat session: v0-run2.csv (sha256 4a82e8f55c6e588fb21a36b94cd67e12d158bf387e08ef11710219ee2e547c10); v0-run2.err sha256 37bb5820a2906cf28bfe7c096efe0dd13e0746b5f646ef04f5fca048ce81ad83; v0-run2.steps sha256 13a1159ec9410b37bf74bef51cf7918eba20b810e668548daf389349387b592a
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+38,38,0.862,44.06,256,66.0,40.902,0,0.00,a78495b62399806c,22216b578f19b9a6,1.38253,0.672,0,294,19.37,0,0,0,1
+321,27,0.518,52.09,489,27.4,41.191,0,0.00,c271462c3fe32fd6,4d025f2a5d326967,1.38959,0.628,294,810,19.40,2,0,0,0
+846,36,0.767,46.93,243,24.8,41.678,0,0.00,069340eea32b6c42,d016f9d61eb84ab2,1.27433,0.626,810,1089,19.42,0,0,0,1
+1120,31,0.557,55.69,315,21.7,44.186,0,0.00,6719f3fc3726a8a2,2f91aea627876859,1.12367,0.679,1089,1435,19.44,0,0,0,0
+1475,40,0.803,49.81,155,23.3,44.659,0,0.00,a4e546e8f3869e1a,fd3476fff1520e03,1.09032,0.671,1435,1630,19.45,7,0,0,0
+===== chat session: v0-run3.csv (sha256 aee58b319fb8dff53fe8081ea10fe790e6cf557a9c1181141d3574c125e23729); v0-run3.err sha256 bacd879a408f837ff8cd8e6b93b849dd01b0a382afa8b27e8abbee05b72061d0; v0-run3.steps sha256 73ce93050efd5502e49a612b82d192fc1ec5c54cf84213963554b6db9438401c
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+38,38,0.857,44.33,256,68.1,39.947,0,0.00,a78495b62399806c,22216b578f19b9a6,1.38253,0.672,0,294,19.37,0,0,0,1
+321,27,0.537,50.27,489,27.4,40.047,0,0.00,c271462c3fe32fd6,4d025f2a5d326967,1.38959,0.628,294,810,19.40,2,0,0,0
+846,36,0.776,46.37,243,25.2,40.658,0,0.00,069340eea32b6c42,d016f9d61eb84ab2,1.27433,0.626,810,1089,19.42,0,0,0,1
+1120,31,0.573,54.06,315,22.2,43.490,0,0.00,6719f3fc3726a8a2,2f91aea627876859,1.12367,0.679,1089,1435,19.44,0,0,0,0
+1475,40,0.811,49.32,155,24.3,43.751,0,0.00,a4e546e8f3869e1a,fd3476fff1520e03,1.09032,0.671,1435,1630,19.45,7,0,0,0
+===== chat session: v1-run3.csv (sha256 3812a432c6b3808cd7efa34c3f24b8f7e59f5029bedd1dc4471818a2336200f3); v1-run3.err sha256 43788f1059fc23fa099f3b53e6f9616355c9e95467ecb3539f6306d9e49bed65; v1-run3.steps sha256 11096fe1a5360ca13641dd7adcd9f813948c5d0c0b47d3b0e737cf19e09317c9
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+38,38,0.806,47.17,256,65.4,43.084,0,0.00,008001a65faa19fa,22216b578f19b9a6,1.38141,0.672,0,294,19.41,0,0,0,1
+321,27,0.475,56.86,489,23.7,43.222,0,0.00,ee8d22aeb2da48a2,4d025f2a5d326967,1.38391,0.634,294,810,19.44,2,0,0,0
+846,36,0.628,57.30,243,22.9,43.350,0,0.00,6e83244182aa8793,d016f9d61eb84ab2,1.27809,0.626,810,1089,19.46,0,0,0,1
+1120,31,0.494,62.80,315,19.3,47.178,0,0.00,29564d4ab1b8a338,2f91aea627876859,1.12280,0.670,1089,1435,19.48,0,0,0,0
+1475,40,0.635,63.01,155,21.2,46.806,0,0.00,94d6956d54335c5b,fd3476fff1520e03,1.08878,0.671,1435,1630,19.49,7,0,0,0
+===== chat session: v1-run4.csv (sha256 c71055dc0e67f46f44e0ea078b52669803ae0f2e8d07bbc44afaeb779605abaa); v1-run4.err sha256 f2d5170ad001bb62bd3512afe569ac9bfb6ad243cbee97811f00a30c2fe65858; v1-run4.steps sha256 e7b0c2697260cc4fddcca9f83fcfde5d79d2799ba5a4095f63480051885df1c8
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+38,38,0.808,47.01,256,65.4,42.752,0,0.00,008001a65faa19fa,22216b578f19b9a6,1.38141,0.672,0,294,19.42,0,0,0,1
+321,27,0.478,56.45,489,23.9,42.875,0,0.00,ee8d22aeb2da48a2,4d025f2a5d326967,1.38391,0.634,294,810,19.44,2,0,0,0
+846,36,0.641,56.17,243,23.1,43.118,0,0.00,6e83244182aa8793,d016f9d61eb84ab2,1.27809,0.626,810,1089,19.46,0,0,0,1
+1120,31,0.505,61.35,315,19.2,46.983,0,0.00,29564d4ab1b8a338,2f91aea627876859,1.12280,0.670,1089,1435,19.48,0,0,0,0
+1475,40,0.625,63.99,155,21.0,47.110,0,0.00,94d6956d54335c5b,fd3476fff1520e03,1.08878,0.671,1435,1630,19.50,7,0,0,0
+===== chat session: v0-run4.csv (sha256 5b0b4c4047783c0edbb725de71011996244690e5ddb2115add0892331fd79935); v0-run4.err sha256 2c8213f1a99ad3cb737899a457315f3efba360968f453fed6fdf26aea6f85901; v0-run4.steps sha256 fdd2dd2d5748de875640088c0f1238af7c58bd8435172eafe1ade23ae9f7a542
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+38,38,0.864,44.00,256,67.8,40.229,0,0.00,a78495b62399806c,22216b578f19b9a6,1.38253,0.672,0,294,19.37,0,0,0,1
+321,27,0.530,50.99,489,27.1,40.396,0,0.00,c271462c3fe32fd6,4d025f2a5d326967,1.38959,0.628,294,810,19.40,2,0,0,0
+846,36,0.778,46.25,243,24.9,40.841,0,0.00,069340eea32b6c42,d016f9d61eb84ab2,1.27433,0.626,810,1089,19.42,0,0,0,1
+1120,31,0.583,53.20,315,22.3,43.414,0,0.00,6719f3fc3726a8a2,2f91aea627876859,1.12367,0.679,1089,1435,19.44,0,0,0,0
+1475,40,0.811,49.33,155,24.0,44.019,0,0.00,a4e546e8f3869e1a,fd3476fff1520e03,1.09032,0.671,1435,1630,19.45,7,0,0,0
+
+===== chat session: summary (bench's report of the runs above)
+# bench: chat
+
+- bench 482e1711d589; engine qwen36; Linux (Intel(R) Xeon(R) CPU @ 2.00GHz, Tesla T4); 2026-10-26 20:48
+- model q36; session chat.sess
+- runs: a warm-up of v0 (does not count), then 4 per version, the order turning at every round (ABBA); before every run: wait until cool (at most 900 s), then 60 s of rest
+
+## v0 dev: 4 runs (median, min–max)
+
+| turn | prompt | reused | read | to first token s | first step ms | decode tok/s | answer | nll | top1 | greedy same | tool calls exact | stops | RSS GB | experts read |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 38 | 0 | 38 | 0.86 (0.83–0.86) | 68 (66–68) | 40.56 (39.95–40.90) | 256 | 1.3825 | 0.672 | 0/256 | 0/0 | yes | 19.37 | 0 |
+| 2 | 321 | 294 | 27 | 0.52 (0.51–0.54) | 27 (26–27) | 40.77 (40.05–41.19) | 489 | 1.3896 | 0.628 | 2/489 | 0/0 | no | 19.40 | 0 |
+| 3 | 846 | 810 | 36 | 0.77 (0.77–0.78) | 25 (24–25) | 41.06 (40.66–41.68) | 243 | 1.2743 | 0.626 | 0/243 | 0/0 | yes | 19.42 | 0 |
+| 4 | 1120 | 1089 | 31 | 0.57 (0.56–0.58) | 22 (22–22) | 43.73 (43.41–44.19) | 315 | 1.1237 | 0.679 | 0/315 | 0/0 | no | 19.44 | 0 |
+| 5 | 1475 | 1435 | 40 | 0.81 (0.80–0.81) | 24 (23–24) | 44.20 (43.75–44.66) | 155 | 1.0903 | 0.671 | 7/155 | 0/0 | no | 19.45 | 0 |
+
+session: 5 turns; prompts read 172 tokens, reused 3628; all turns 38.5 (38.1–39.0) s; to first token in all 3.5 (3.5–3.6) s; answers 1458 tokens, nll 1.2799, top1 0.651; tool calls exact 0 of 0; turns that stop 2 of 5
+fingerprints equal in every run: yes
+
+## v1 pr: 4 runs (median, min–max)
+
+| turn | prompt | reused | read | to first token s | first step ms | decode tok/s | answer | nll | top1 | greedy same | tool calls exact | stops | RSS GB | experts read |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 38 | 0 | 38 | 0.80 (0.80–0.81) | 65 (65–65) | 43.23 (42.75–43.79) | 256 | 1.3814 | 0.672 | 0/256 | 0/0 | yes | 19.41 | 0 |
+| 2 | 321 | 294 | 27 | 0.47 (0.47–0.48) | 24 (24–24) | 43.35 (42.88–43.77) | 489 | 1.3839 | 0.634 | 2/489 | 0/0 | no | 19.44 | 0 |
+| 3 | 846 | 810 | 36 | 0.62 (0.61–0.64) | 23 (22–23) | 43.71 (43.12–44.08) | 243 | 1.2781 | 0.626 | 0/243 | 0/0 | yes | 19.46 | 0 |
+| 4 | 1120 | 1089 | 31 | 0.49 (0.49–0.51) | 19 (19–19) | 47.42 (46.98–47.72) | 315 | 1.1228 | 0.670 | 0/315 | 0/0 | no | 19.48 | 0 |
+| 5 | 1475 | 1435 | 40 | 0.62 (0.60–0.64) | 21 (20–21) | 47.46 (46.81–47.90) | 155 | 1.0888 | 0.671 | 7/155 | 0/0 | no | 19.49 | 0 |
+
+session: 5 turns; prompts read 172 tokens, reused 3628; all turns 35.7 (35.4–36.1) s; to first token in all 3.0 (3.0–3.1) s; answers 1458 tokens, nll 1.2780, top1 0.651; tool calls exact 0 of 0; turns that stop 2 of 5
+fingerprints equal in every run: yes
+
+## v1 pr against v0 dev (medians; positive = faster)
+
+same prompts and teacher-forced answers: yes
+
+| turn | to first token | first step | decode | nll | experts read |
+|---|---|---|---|---|---|
+| 1 | +7.1%, every run faster | +3.8%, every run faster | +6.6%, every run faster | -0.0011 | 0 → 0 |
+| 2 | +11.1%, every run faster | +15.0%, every run faster | +6.3%, every run faster | -0.0057 | 0 → 0 |
+| 3 | +24.6%, every run faster | +10.0%, every run faster | +6.5%, every run faster | +0.0038 | 0 → 0 |
+| 4 | +16.3%, every run faster | +16.0%, every run faster | +8.4%, every run faster | -0.0009 | 0 → 0 |
+| 5 | +30.7%, every run faster | +15.3%, every run faster | +7.4%, every run faster | -0.0015 | 0 → 0 |
+
+all turns: +7.8%, every run faster; to first token in all: +17.3%, every run faster
+runs not cool: none
+pages written to swap during the measurement: 0, 0 of them in the runs that count

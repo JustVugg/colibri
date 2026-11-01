@@ -11,6 +11,12 @@ import threading
 import time
 
 
+try:
+    from tools.benchmark_process import close_engine
+except ModuleNotFoundError:              # direct execution from c/tools
+    from benchmark_process import close_engine
+
+
 def frame(request_id, slot, prompt, max_tokens):
     body = prompt.encode()
     return (
@@ -73,8 +79,10 @@ def run_phase(proc, batch, tokens, phase_id):
     if start is None:
         raise RuntimeError("last request produced no token")
     end = max(item[0] for item in done.values())
+    # The boundary token was produced by prefill before the timer starts.
+    # Count only tokens produced in the measured decode interval.
     measured_tokens = sum(
-        sum(timestamp >= start for timestamp in timestamps)
+        sum(timestamp > start for timestamp in timestamps)
         for timestamps in data.values()
     )
     gaps = []
@@ -140,9 +148,7 @@ def main():
         for phase_id, batch in enumerate(batches, 1):
             results.append(run_phase(proc, batch, args.tokens, phase_id))
     finally:
-        if proc.stdin:
-            proc.stdin.close()
-        proc.wait(timeout=60)
+        close_engine(proc)
         thread.join(timeout=1)
 
     grouped = {}

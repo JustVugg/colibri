@@ -16,6 +16,10 @@ const en: Record<string, string> = {
   "ui.theme": "Change theme",
   "ui.navigation": "Chat, Brain and Profiling",
   "ui.export": "Export conversation",
+  "chat.toBottom": "Go to the latest message",
+  "chat.image": "Image",
+  "ui.exportMarkdown": "Markdown (.md)",
+  "ui.exportJson": "JSON (.json)",
   "ui.close": "Close",
   "ui.idea": "Explore an idea",
   "ui.code": "Write code",
@@ -165,8 +169,9 @@ const en: Record<string, string> = {
   "topbar.tokens": "{{n}} tokens",
   "topbar.tokPerSec": "{{n}} tok/s",
   "topbar.slot": "slot {{n}}",
+  "chat.compacted": "The first {{n}} messages no longer fit the model's context: they were summarized, and the conversation goes on from the summary (hover to read it).",
   "topbar.truncated": "Truncated",
-  "topbar.truncatedHelp": "The response hit the max output tokens limit and was cut off. Raise \"Max output tokens\" to see the full answer.",
+  "topbar.truncatedHelp": "The response reached the output limit or the end of the context and was cut off. If you lowered \"Max output tokens\", raise it; otherwise continue the response.",
   "topbar.clear": "Clear",
 
   // hero / empty state

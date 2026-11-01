@@ -137,6 +137,43 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(check["details"], {"requested": [1], "detected": []})
         self.assertEqual(exit_code(report), 1)
 
+    def test_vulkan_engine_is_a_gpu_engine(self):
+        """#2081: a VK=1 engine opens the Vulkan loader at run time, so ldd shows no GPU
+        runtime and doctor called a working Vulkan build CPU-only. The loader's name in
+        the binary says what it is; the plan is a COLI_VULKAN=1 run's."""
+        self.engine.write_bytes(b"\x7fELF ... [VK] ... libvulkan.so.1 ... libvulkan.so ...")
+        self.engine.chmod(0o755)
+        with mock.patch("doctor.vulkan_loader_present", return_value=True):
+            self.assertEqual(cuda_linkage(self.engine), {"linked": True, "missing": False, "vulkan": True})
+        with mock.patch("doctor.vulkan_loader_present", return_value=False):
+            self.assertEqual(cuda_linkage(self.engine), {"linked": False, "missing": True, "vulkan": True})
+        device = {"name": "Fixture GPU", "type": "discrete"}
+        with mock.patch("setup_hw.detect_vulkan", return_value={"devices": [device]}):
+            report = self.report(gpu_indices=None, linkage={"linked": True, "missing": False, "vulkan": True})
+        check = self.checks_by_id(report)["accelerator.gpu"]
+        self.assertEqual(check["status"], "pass")
+        self.assertIn("Vulkan", check["summary"])
+        self.assertEqual(report["plan"]["vulkan"], device)
+        from resource_plan import format_plan
+        self.assertIn("VRAM   Vulkan · Fixture GPU (discrete)", format_plan(report["plan"]))
+        report = self.report(gpu_indices=None, linkage={"linked": False, "missing": True, "vulkan": True})
+        self.assertEqual(self.checks_by_id(report)["accelerator.gpu"]["status"], "fail")
+
+    def test_vulkan_plan_respects_explicit_cpu_selection(self):
+        device = {'name': 'Fixture GPU', 'type': 'discrete'}
+        with mock.patch('setup_hw.detect_vulkan', return_value={'devices': [device]}):
+            report = self.report(gpu_indices=[], linkage={
+                'linked': True, 'missing': False, 'vulkan': True})
+        self.assertEqual(self.checks_by_id(report)['accelerator.gpu']['status'], 'skip')
+        self.assertIsNone(report['plan']['vulkan'])
+
+    def test_cpu_binary_does_not_inherit_vulkan_placement_from_environment(self):
+        device = {'name': 'Fixture GPU', 'type': 'discrete'}
+        with mock.patch.dict(os.environ, {'COLI_VULKAN': '1'}), \
+                mock.patch('setup_hw.detect_vulkan', return_value={'devices': [device]}):
+            report = self.report(gpu_indices=None, linkage={'linked': False, 'missing': False})
+        self.assertIsNone(report['plan']['vulkan'])
+
     def test_cpu_engine_with_detected_gpu_is_only_a_warning(self):
         gpu = {"index": 0, "name": "fixture", "total_bytes": 12 * GB,
                "free_bytes": 10 * GB}

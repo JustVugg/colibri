@@ -1,0 +1,115 @@
+{
+  "version": 1,
+  "hypothesis": "Scoring the MTP head's drafts over an adaptive list of the most used tokens (16000 and the conversation's) with the rows of the lm_head already on the card, instead of the whole 248320-token vocabulary, raises Qwen3.6's decode with the head's drafts on an L4 with every expert in VRAM, with the same logits (prose, the most likely token, one draft a step).",
+  "commit": "16d9f6703aeb716135d5df22092e742be9cc9b5b",
+  "model": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64",
+  "command": "cd c && make qwen36_tier.o backend_cuda.o cuda_chain.o cu_xb.o cu_tier.o CUDA=1 CUDA_ARCH=sm_89 && gcc -O3 -march=native -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_CUDA -I. ../docs/experiments/qwen36-mtp-draft-list-2026-10-26/bench.c qwen36_tier.o backend_cuda.o cuda_chain.o cu_xb.o cu_tier.o -o qwen36-bench -lm -fopenmp -pthread -L/usr/local/cuda/lib64 -Wl,-rpath,/usr/local/cuda/lib64 -lcudart -lcublasLt -lcublas -lstdc++; env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/lib64-nvidia COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close Q36_MTP=1 Q36_MTP_DRAFTS=1 ./qwen36-bench --model <model> --text <dir>/promessi_sposi.txt --lengths 64,512 --gen 32 --steps <steps file>",
+  "prompt_hash": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "hardware": {
+    "cpu": "Intel(R) Xeon(R) CPU @ 2.20GHz (6 cores / 12 threads, 38.5 MiB L3) + NVIDIA L4 (23034 MiB, sm_89)",
+    "ram": "52 GiB",
+    "storage": "Google Colab VM disk (the model downloaded to /content before the runs, then read once into the page cache)",
+    "os": "Ubuntu 24.04.4 LTS, Linux 6.6.122+ x86_64 (Google Colab), CUDA 13.0 (nvcc V13.0.88), driver 580.82.07, gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "Q36_MTP": 1,
+      "Q36_MTP_DRAFTS": 1,
+      "mtp_head": "convert_qwen36.py --mtp-only",
+      "prompt_tokens": 64,
+      "decode_steps": 32,
+      "teacher_forced": false,
+      "engine_build": "16d9f670"
+    },
+    "samples": {
+      "tok_s": [
+        82.29,
+        82.739,
+        82.027,
+        81.848
+      ],
+      "decode_tok_s_after_512": [
+        70.611,
+        71.248,
+        70.579,
+        70.424
+      ],
+      "prompt_tok_s_64": [
+        104.92,
+        104.71,
+        104.41,
+        105.23
+      ],
+      "prompt_tok_s_512": [
+        1606.44,
+        1658.98,
+        1641.89,
+        1636.77
+      ]
+    },
+    "median_tok_s": 82.1585,
+    "quality": {
+      "method": "make -C c check (macOS arm64) passes, and on the L4 VM qwen36-tiny-mtp-check, qwen38-tiny-mtp-check, spec-drafts-check and cuda-chain-check cuda-test CUDA=1 CUDA_ARCH=sm_89; every run of both versions gives the same fingerprint of every logit and token (FNV-1a: d9d3351b46e6980d at 64 tokens, 14c3a19d195d62a3 at 512)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-mtp-draft-list-2026-10-26/prose-free-1-draft.txt",
+      "sha256": "7e4945db346c42017077345dbe6c2717a0d0ccd6d7f524095572c22115b334c9"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "Q36_MTP": 1,
+      "Q36_MTP_DRAFTS": 1,
+      "mtp_head": "convert_qwen36.py --mtp-only",
+      "prompt_tokens": 64,
+      "decode_steps": 32,
+      "teacher_forced": false,
+      "engine_build": "16d9f670 + this change"
+    },
+    "samples": {
+      "tok_s": [
+        88.796,
+        88.691,
+        91.063,
+        89.373
+      ],
+      "decode_tok_s_after_512": [
+        76.736,
+        77.994,
+        78.681,
+        77.804
+      ],
+      "prompt_tok_s_64": [
+        102.5,
+        103.16,
+        103.04,
+        103.42
+      ],
+      "prompt_tok_s_512": [
+        1647.94,
+        1653.96,
+        1640.79,
+        1638.26
+      ]
+    },
+    "median_tok_s": 89.0845,
+    "quality": {
+      "method": "make -C c check (macOS arm64) passes, and on the L4 VM qwen36-tiny-mtp-check, qwen38-tiny-mtp-check, spec-drafts-check and cuda-chain-check cuda-test CUDA=1 CUDA_ARCH=sm_89; every run of both versions gives the same fingerprint of every logit and token (FNV-1a: d9d3351b46e6980d at 64 tokens, 14c3a19d195d62a3 at 512)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-mtp-draft-list-2026-10-26/prose-free-1-draft.txt",
+      "sha256": "7e4945db346c42017077345dbe6c2717a0d0ccd6d7f524095572c22115b334c9"
+    }
+  },
+  "outcome": "improvement"
+}

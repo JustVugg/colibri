@@ -43,13 +43,18 @@ class StopLivenessTest(unittest.TestCase):
         self.assertFalse(self.coli._pid_alive(p.pid))
 
     def test_sigkill_lookup_is_guarded(self):
-        """signal.SIGKILL is absent on win32 and AttributeError is not OSError."""
+        """signal.SIGKILL is absent on win32 and AttributeError is not OSError. The forced
+        end lives in _terminate since #2091; cmd_stop goes through it."""
         with open(COLI, encoding="utf-8") as f: src = f.read()
-        stop = src[src.index("def cmd_stop("):]
-        stop = stop[:stop.index("\ndef ")]
+        def body(name):
+            text = src[src.index(f"def {name}("):]
+            return text[:text.index("\ndef ")]
+        stop, terminate = body("cmd_stop"), body("_terminate")
         # the *call* must not name it directly; the explanatory comment may.
-        self.assertNotIn("os.kill(pid, signal.SIGKILL)", stop)
-        self.assertIn('getattr(signal, "SIGKILL"', stop)
+        for text in (stop, terminate):
+            self.assertNotIn("os.kill(pid, signal.SIGKILL)", text)
+        self.assertIn("_terminate(pid)", stop)
+        self.assertIn('getattr(signal, "SIGKILL"', terminate)
 
 
 class OrphanJobTest(unittest.TestCase):

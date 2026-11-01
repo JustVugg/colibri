@@ -332,6 +332,53 @@ missing (compiler, model files, permissions) and how to fix it.
 
 ---
 
+## Old processors (no AVX2)
+
+The engines in the release archives, and the ones `coli setup` downloads when
+there is no compiler, are built for x86-64-v3: they use AVX2, FMA and BMI2.
+Intel processors before Haswell (2013) and AMD processors before Excavator
+(2015) do not have them. After 2.0.0 an engine checks this before it starts and
+says so in one line:
+
+```
+colibri: this processor has no avx2 fma bmi2, which this engine build needs; ...
+```
+
+and `coli setup` names it in the hardware report and does not install the
+prebuilt engine. An older engine stopped at its first such instruction instead:
+the banner, then "colibri engine exited unexpectedly" (#1979).
+
+Build the engines for the processor, from a git clone (section 2):
+
+```bash
+cd colibri/c
+make qwen36 ARCH=x86-64-v2          # the engine of your model: qwen36, qwen38, glm53, mimo, ...
+```
+
+On Windows, in the MSYS2 UCRT64 shell (section 1):
+
+```bash
+pacman -S --needed git make mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-libgomp
+git clone https://github.com/JustVugg/colibri
+cd colibri/c
+make qwen36.exe ARCH=x86-64-v2
+```
+
+then run `coli` from that `c` folder (`python coli web --model ...`). With a
+compiler installed, `coli setup` builds the engine for the processor by itself
+(`ARCH=native`).
+
+What it costs, measured on Qwen3.6-35B-A3B int4 (the same machine, a Ryzen 7
+PRO 8700GE, both builds, 128 tokens greedy): x86-64-v3 prefills 13.7 tok/s and
+generates 8.6 tok/s; x86-64-v2 prefills 6.0 tok/s and generates 3.6 tok/s, about
+2.4 times slower, with the same text and the same perplexity. On an older
+processor both numbers are lower.
+
+`COLI_CPU_CHECK=0` skips the check, in the engines and in `coli setup` (an
+emulator or a hypervisor that reports fewer features than it runs).
+
+---
+
 ## Where to go next
 
 | Topic | Doc |

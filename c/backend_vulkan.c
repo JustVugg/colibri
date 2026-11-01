@@ -1,15 +1,22 @@
 // Vulkan compute backend for colibri's quantized matmul, targeting the
 // Strix Halo iGPU (RADV gfx1151). Mirrors backend_cuda.c's contract but
-// exploits unified memory: weight "uploads" write into HOST_VISIBLE|
-// DEVICE_LOCAL memory — the same physical RAM the iGPU reads — so there is
+// exploits unified memory: weight "uploads" write into host-visible memory
+// (vk_memtype.h) — the same physical RAM the iGPU reads — so there is
 // no PCIe copy. That is what makes offloading *streamed experts* profitable
 // here, which the discrete-CUDA path deliberately avoids.
 //
 // M2 scope: correctness + a standalone GPU-vs-CPU test harness. Synchronous
 // submit/wait per call; async queues and zero-copy import come in M4.
+#include <math.h>
+#ifdef __GLIBC__
+#include <malloc.h>   /* malloc_trim: the exit report's resident set */
+#endif
 #include "backend_vulkan.h"
+#include "blockdec_host.h"           /* the block formats' sizes and table (blockdec_table.h) */
 #include "vk_alloc.h"
+#include "vk_igpu_threshold.h"
 #include "vk_load.h"
+#include "vk_memtype.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -97,15 +104,21 @@ int coli_vk_load(void) {
     return 1;
 }
 
+static int vk_integrated(VkPhysicalDevice phys) {
+    VkPhysicalDeviceProperties p;
+    vkGetPhysicalDeviceProperties(phys, &p);
+    return p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+}
+
 #define VKCHECK(x, what) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
     fprintf(stderr, "[VK] %s failed: %d\n", what, _r); return 0; } } while (0)
 
 /* ---- device memory books, and COLI_VK_DEVICE_CAP_MB (docs/vulkan.md, "A partial chain") --
  * Every device memory allocation of the process goes through vk_mem_alloc / vk_mem_free
  * (the macros below rename the Vulkan calls in this file; vk_chain.c reaches them through
- * coli_vk_mem_alloc / coli_vk_mem_free): the bytes in a device-local heap are counted per
- * device (0 = G, 1 = G2). COLI_VK_DEVICE_CAP_MB=n (tests; a fraction is taken) makes a
- * device hold at most n MiB of them: an allocation past it fails as
+ * coli_vk_mem_alloc / coli_vk_mem_free): the bytes in the device memory (vk_memtype.h) are
+ * counted per device (0 = G, 1 = G2). COLI_VK_DEVICE_CAP_MB=n (tests; a fraction is taken)
+ * limits a device to n MiB of them: an allocation past it fails as
  * VK_ERROR_OUT_OF_DEVICE_MEMORY, as a full card's does, and the budget the engines read
  * (coli_vk_mem_budget, _budget2, coli_vk_free_bytes, coli_vk_device_local_bytes, the
  * expert batch's heap room) is the cap and those bytes. So Lavapipe behaves like a small
@@ -116,7 +129,8 @@ typedef struct { uint64_t key, bytes; int dev; } VkMemRec;
 static struct {
     pthread_mutex_t mx;
     VkDevice dev[2];
-    uint32_t dl_types[2];          /* memory types whose heap is device-local */
+    uint32_t device_types[2];      /* memory types whose heap is device memory */
+    int8_t retry_type[2][32];      /* vk_retry_memtype of each memory type */
     uint64_t cap[2], used[2], peak[2];
     unsigned long long refused[2];
     VkMemRec *rec; size_t nrec, crec;
@@ -128,10 +142,20 @@ static int vk_mem_imported(const VkMemoryAllocateInfo *ai) {
         if (p->sType == VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT) return 1;
     return 0;
 }
+/* vkAllocateMemory, retried in the type of vk_retry_memtype when the driver runs out of memory. */
+static VkResult vk_mem_try(VkDevice d, int k, const VkMemoryAllocateInfo *ai, const VkAllocationCallbacks *cb,
+                           VkDeviceMemory *m) {
+    VkResult r = vkAllocateMemory(d, ai, cb, m);
+    const int retry = ai->memoryTypeIndex < 32 && !vk_mem_imported(ai) ? g_mem.retry_type[k][ai->memoryTypeIndex] : -1;
+    if ((r != VK_ERROR_OUT_OF_DEVICE_MEMORY && r != VK_ERROR_OUT_OF_HOST_MEMORY) || retry < 0) return r;
+    VkMemoryAllocateInfo again = *ai;
+    again.memoryTypeIndex = (uint32_t)retry;
+    return vkAllocateMemory(d, &again, cb, m);
+}
 static VkResult vk_mem_alloc(VkDevice d, const VkMemoryAllocateInfo *ai, const VkAllocationCallbacks *cb,
                              VkDeviceMemory *m) {
     int k = vk_mem_dev(d);
-    int counted = ai->memoryTypeIndex < 32 && (g_mem.dl_types[k] >> ai->memoryTypeIndex & 1u) && !vk_mem_imported(ai);
+    int counted = ai->memoryTypeIndex < 32 && (g_mem.device_types[k] >> ai->memoryTypeIndex & 1u) && !vk_mem_imported(ai);
     uint64_t n = ai->allocationSize;
     if (counted) {
         pthread_mutex_lock(&g_mem.mx);
@@ -144,7 +168,7 @@ static VkResult vk_mem_alloc(VkDevice d, const VkMemoryAllocateInfo *ai, const V
         if (g_mem.used[k] > g_mem.peak[k]) g_mem.peak[k] = g_mem.used[k];
         pthread_mutex_unlock(&g_mem.mx);
     }
-    VkResult r = vkAllocateMemory(d, ai, cb, m);
+    VkResult r = vk_mem_try(d, k, ai, cb, m);
     if (!counted) return r;
     pthread_mutex_lock(&g_mem.mx);
     if (r != VK_SUCCESS) g_mem.used[k] -= n;
@@ -182,18 +206,24 @@ static void vk_mem_free(VkDevice d, VkDeviceMemory m, const VkAllocationCallback
 static void vk_mem_device(int k, VkPhysicalDevice phys, VkDevice d) {
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(phys, &mp);
+    const int integrated = vk_integrated(phys);
     uint32_t mask = 0;
-    for (uint32_t i = 0; i < mp.memoryTypeCount && i < 32; i++)
-        if (mp.memoryHeaps[mp.memoryTypes[i].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) mask |= 1u << i;
+    int8_t retry[32];
+    memset(retry, -1, sizeof retry);
+    for (uint32_t i = 0; i < mp.memoryTypeCount && i < 32; i++) {
+        if (vk_heap_is_device_memory(&mp, integrated, mp.memoryTypes[i].heapIndex)) mask |= 1u << i;
+        retry[i] = (int8_t)vk_retry_memtype(&mp, integrated, i);
+    }
     const char *e = getenv("COLI_VK_DEVICE_CAP_MB");
     double mb = e && *e ? atof(e) : 0.0;
     pthread_mutex_lock(&g_mem.mx);
-    g_mem.dev[k] = d; g_mem.dl_types[k] = mask;
+    g_mem.dev[k] = d; g_mem.device_types[k] = mask;
+    memcpy(g_mem.retry_type[k], retry, sizeof retry);
     g_mem.cap[k] = mb > 0 ? (uint64_t)(mb * 1048576.0) : 0;
     g_mem.used[k] = g_mem.peak[k] = 0; g_mem.refused[k] = 0;
     pthread_mutex_unlock(&g_mem.mx);
     if (g_mem.cap[k])
-        fprintf(stderr, "[VK] COLI_VK_DEVICE_CAP_MB=%s: %s takes at most %.3f MiB of device-local memory\n",
+        fprintf(stderr, "[VK] COLI_VK_DEVICE_CAP_MB=%s: %s takes at most %.3f MiB of device memory\n",
                 e, k ? "the second device" : "the device", (double)g_mem.cap[k] / 1048576.0);
 }
 /* The device is gone (shutdown): its books go with it. */
@@ -201,12 +231,21 @@ static void vk_mem_forget(int k) {
     pthread_mutex_lock(&g_mem.mx);
     for (size_t i = g_mem.nrec; i-- > 0;)
         if (g_mem.rec[i].dev == k) g_mem.rec[i] = g_mem.rec[--g_mem.nrec];
-    g_mem.dev[k] = VK_NULL_HANDLE; g_mem.dl_types[k] = 0; g_mem.used[k] = 0;
+    g_mem.dev[k] = VK_NULL_HANDLE; g_mem.device_types[k] = 0; g_mem.used[k] = 0;
+    memset(g_mem.retry_type[k], -1, sizeof g_mem.retry_type[k]);
     pthread_mutex_unlock(&g_mem.mx);
 }
 static uint64_t vk_mem_room(int k) {   /* lock-free read is enough for a budget */
     uint64_t c = g_mem.cap[k], u = __atomic_load_n(&g_mem.used[k], __ATOMIC_RELAXED);
     return c > u ? c - u : 0;
+}
+/* The size of the device memory of device k, at most the cap: the heaps the books count. */
+static size_t vk_device_memory_bytes(VkPhysicalDevice phys, int k) {
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(phys, &mp);
+    VkDeviceSize m = vk_device_memory_size(&mp, vk_integrated(phys));
+    if (g_mem.cap[k] && g_mem.cap[k] < m) m = g_mem.cap[k];   /* COLI_VK_DEVICE_CAP_MB */
+    return (size_t)m;
 }
 static void vk_pool_blocks(int k);   /* the weight pools' block size, below */
 size_t coli_vk_device_cap(void) { return (size_t)g_mem.cap[0]; }
@@ -240,12 +279,16 @@ struct ColiVkTensor {
     uint8_t *wmap, *smap;  /* mapped memory: the rows' and the scales' mapping (coli_vk_tensor_refill) */
     VkDeviceMemory imp;    /* coli_vk_tensor_import: the host memory its rows are read from, in place */
     struct ColiVkTensor *imp_next;   /* the live imports, freed at shutdown */
+    size_t wcap, scap;     /* the bytes its two ranges hold (tensor_alloc_pad: room for a bigger format) */
+    size_t acct;           /* what tensor_alloc added to the pool's counters, taken back at the release */
+    uint8_t wide;          /* a scale times the format's largest code passes f16 (scales_wide): off the cooperative-matrix GEMMs, which hold the weights in f16 */
 };
 
 /* ---- memory placement without Resizable BAR (docs/vulkan.md) ------------------------
  * Resident data (the weights, the expert tier, the MLA KV mirror) is written by the host
  * once and read by the device for the rest of the run. The mapped path puts it in the
- * HOST_VISIBLE|DEVICE_LOCAL type and writes it through the mapping: on an integrated GPU,
+ * type for what the CPU writes (vk_memtype.h: HOST_VISIBLE|DEVICE_LOCAL, system memory on
+ * an integrated GPU) and writes it through the mapping: on an integrated GPU,
  * a CPU device or a discrete card with Resizable BAR that type covers the device's
  * memory. Without Resizable BAR a discrete card exposes it as a window of about 256 MB:
  * NVIDIA refuses allocations past it, RADV puts them in system RAM, read over PCIe.
@@ -257,6 +300,7 @@ struct ColiVkTensor {
 #define VK_UP_SLOT ((size_t)16 << 20)
 typedef struct {
     int on;                           /* staged uploads on this device */
+    int later;                        /* mapped for now: staged if vk_window_decide finds the window small */
     uint32_t mt_dev, mt_stage;        /* the device-local target type, the host staging type */
     VkDevice dev; VkQueue q; uint32_t fam; int shared;   /* shared: q is the main queue, locked */
     uint32_t fams[3], nfams;          /* the families that touch device-local tensors (CONCURRENT when > 1) */
@@ -333,8 +377,10 @@ typedef struct { int bm, bn, wm, wn, bk; } VkCoopTile;
 
 /* Persistent device-side KV latent/rope cache for one layer (MLA attention).
  * Host appends rows as tokens decode (absolute-position indexing); the absorb
- * kernel reads them in place. Allocated once at max_t rows, like the CUDA
- * kv_dev shadow. */
+ * kernel reads them in place. It grows with the conversation (coli_vk_kv_grow),
+ * as the dense chain's mirror does: allocated at max_t rows, a 20-token chat with
+ * the gateway's 131072 tokens of context asked GLM-5.3's 79 layers for 23.6 GB on
+ * a 24 GB card, and every layer past the first ~40 failed at every token (#2314). */
 #define VK_KV_LAYERS 160
 typedef struct {
     VkBuffer bl, br; VkDeviceMemory ml, mr; void *pl, *pr;
@@ -350,6 +396,7 @@ static struct {
     uint32_t qfam;
     uint32_t memtype;            // HOST_VISIBLE|HOST_COHERENT (prefer DEVICE_LOCAL) — for inputs/weights
     uint32_t memtype_cached;     // HOST_CACHED — for buffers the CPU reads back (outputs)
+    int memtype_sys;             // HOST_VISIBLE in system RAM, not DEVICE_LOCAL: the tier's host pool (-1: none, an integrated GPU)
     VkDescriptorSetLayout dsl;
     VkPipelineLayout plyt;
     VkPipeline pipe;
@@ -370,7 +417,8 @@ static struct {
     VkCoopTile coop_t[VK_COOP_SLOTS];
     int gemm_min_s, gemm_min_so, has_coop, coop_sg, coop_off;
     int pin_sg;            /* the subgroup size the chain pins its pipelines to (vk_pin_sg); 0 = none */
-    int has_bda;           /* bufferDeviceAddress on: the expert batch's grouped GEMM reads weights by address */
+    int has_bda;           /* bufferDeviceAddress on: the grouped GEMM (with the matrix units) and the chain's
+                            * routed experts (chain_moe.comp) read the tier's weights by address */
     /* fused dual gate+up+silu pipeline (6 bindings): x, Wg, gscale, Wu, uscale, hidden */
     VkShaderModule shader_gu; VkDescriptorSetLayout dsl_gu; VkPipelineLayout plyt_gu;
     VkPipeline pipe_gu; VkDescriptorPool dpool_gu; VkDescriptorSet dset_gu;
@@ -417,6 +465,11 @@ static struct {
      * (measured: decode attention 7.8s at 7.6 GB resident -> 17.8s at 15.2 GB).
      * VK_EXT_memory_budget lets the tier fill stop at a reserve instead of guessing. */
     int has_prio, has_budget, has_hostmem;
+    /* VK_KHR_shader_integer_dot_product on (COLI_VK_IDOT=0 leaves it off): 1, 2 with the
+     * packed 4 x 8 signed dot accelerated (coli_vk_idot) */
+    int has_idot;
+    int has_tsem;                /* timelineSemaphore on: the dense chain's hybrid steps (vk_chain.c) */
+    int compute_units;           /* VK_AMD_shader_core_properties2: the active ones, 0 when not reported */
     float prio;                  /* priority applied to the NEXT allocations (class knob) */
     /* the routed-expert tier's queue (coli_vk_xb_*): family, index, whether it is the
      * main queue after all, and its timestamp bits; device limits its batches respect */
@@ -426,6 +479,7 @@ static struct {
     uint32_t memtype_dev;        /* DEVICE_LOCAL, for scratch only the device touches */
     char spv_path[1024];         /* the main shader, its siblings are found beside it */
 } G;
+static int g_vk_software;   /* G's device is a CPU one (llvmpipe): vk_fence_wait_us waits longer */
 
 struct PC { int fmt, S, I, O, rowWords, gs; };
 /* gate_up shader only: the activation (COLI_VK_ACT_*) and its parameters: act 0's
@@ -452,7 +506,11 @@ struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; i
  * shaders size their work by gl_SubgroupSize and gl_SubgroupID; an Intel Iris Xe
  * (8 to 32) ran chain_gemv and chain_gemv2 at another width than the one they read,
  * and every decode GEMV of the chain came out wrong. 0: a device with one size (NVIDIA,
- * Lavapipe), no control, or COLI_VK_SUBGROUP=0 (the driver's choice, as before). */
+ * Lavapipe), no control, or COLI_VK_SUBGROUP=0 (the driver's choice, as before).
+ * COLI_VK_SUBGROUP=n pins n instead (every pipeline that takes this size: the chain's,
+ * build_pipeline's and the expert batch's), a power of two the device allows: Mesa's ANV
+ * (Intel Meteor Lake, Mesa 26.2) took over 38 minutes to compile chain_moe.spv at the
+ * reported 32 and 72-195 s at 16, where test_vk_chain passes. */
 static int vk_pin_sg(VkPhysicalDevice phys, int has_ext) {
 #ifdef VK_EXT_subgroup_size_control
     const char *e = getenv("COLI_VK_SUBGROUP");
@@ -469,6 +527,14 @@ static int vk_pin_sg(VkPhysicalDevice phys, int has_ext) {
     VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sg};
     vkGetPhysicalDeviceProperties2(phys, &p2);
     uint32_t n = sg.subgroupSize;
+    if (e && *e) {
+        long want = strtol(e, NULL, 10);
+        if (want >= (long)sp.minSubgroupSize && want <= (long)sp.maxSubgroupSize && !(want & (want - 1)))
+            n = (uint32_t)want;
+        else
+            fprintf(stderr, "[VK] COLI_VK_SUBGROUP=%s: not a size this device allows (%u to %u); pinning %u\n",
+                    e, sp.minSubgroupSize, sp.maxSubgroupSize, n);
+    }
     if (!f.subgroupSizeControl || !(sp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) ||
         sp.minSubgroupSize >= sp.maxSubgroupSize || n < sp.minSubgroupSize || n > sp.maxSubgroupSize || (n & (n - 1)))
         return 0;
@@ -497,68 +563,67 @@ static int vk_create_device_pinned(VkPhysicalDevice phys, const VkDeviceCreateIn
     return 0;
 }
 
-static int pick_memtype(VkPhysicalDevice phys) {
+static int pick_memtype(VkPhysicalDevice phys, ColiVkMemUse use) {
+    VkPhysicalDeviceMemoryProperties m;
+    vkGetPhysicalDeviceMemoryProperties(phys, &m);
+    return vk_pick_memtype(&m, vk_integrated(phys), use);
+}
+
+/* System RAM the device reads over PCIe (HOST_VISIBLE|HOST_COHERENT, not DEVICE_LOCAL,
+ * cached before write-combined): the tier's host pool. The CPU computes its experts in
+ * place (vk_dmoe.h's hybrid steps), which write-combined memory made 25 times slower
+ * (6.7 ms an expert of Qwen3.8 against 0.16); an RTX PRO 4000 reads both at the same
+ * 9.7 to 10.9 GB/s over PCIe 4.0 x8. -1 when every host-visible type is device-local (an integrated GPU,
+ * a CPU device: their tier pool is that memory already). */
+static int pick_memtype_sys(VkPhysicalDevice phys) {
     VkPhysicalDeviceMemoryProperties m;
     vkGetPhysicalDeviceMemoryProperties(phys, &m);
     int best = -1;
     for (uint32_t i = 0; i < m.memoryTypeCount; i++) {
         VkMemoryPropertyFlags f = m.memoryTypes[i].propertyFlags;
-        if ((f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
-            (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
-            if (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) return (int)i; // ideal on APU
-            if (best < 0) best = (int)i;
-        }
+        if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) || !(f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ||
+            (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) || (m.memoryHeaps[m.memoryTypes[i].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT))
+            continue;
+        if (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) return (int)i;
+        if (best < 0) best = (int)i;
     }
     return best;
 }
 
-/* Cached+coherent host-visible type for buffers the CPU READS BACK. pick_memtype prefers
- * DEVICE_LOCAL host-visible = write-combined VRAM over ReBAR, which the CPU writes fast but
- * reads catastrophically slowly (~40 MB/s). Outputs must be HOST_CACHED for cheap readback. */
-static int pick_memtype_cached(VkPhysicalDevice phys) {
-    VkPhysicalDeviceMemoryProperties m;
-    vkGetPhysicalDeviceMemoryProperties(phys, &m);
-    for (uint32_t i = 0; i < m.memoryTypeCount; i++) {
-        VkMemoryPropertyFlags f = m.memoryTypes[i].propertyFlags;
-        if ((f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) &&
-            (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) return (int)i;
-    }
-    return pick_memtype(phys);   /* no cached type -> fall back (no worse than before) */
-}
-
-/* DEVICE_LOCAL for buffers only the device reads and writes (the expert batch's
- * intermediates); the host-visible type when there is none. */
-static int pick_memtype_device(VkPhysicalDevice phys) {
-    VkPhysicalDeviceMemoryProperties m;
-    vkGetPhysicalDeviceMemoryProperties(phys, &m);
-    for (uint32_t i = 0; i < m.memoryTypeCount; i++)
-        if (m.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) return (int)i;
-    return pick_memtype(phys);
-}
-
 /* Staged or mapped (see VkUp above). Staged when COLI_VK_STAGED=1, or, unset, when the
  * host-visible device-local heap (the heap of mt_host, the type the mapped path writes,
- * when that is device-local; none otherwise) holds less than a quarter of the largest
- * device-local heap: a discrete card without Resizable BAR (256 MB of 8 GB), never one
- * with it, an integrated GPU or Lavapipe (the whole heap is host-visible).
+ * when that is device-local; none otherwise; all the memory on an integrated GPU) holds less
+ * than a quarter of the largest device-local heap: a discrete card without Resizable BAR
+ * (256 MB of 8 GB), never one with it, an integrated GPU or Lavapipe (the whole heap is
+ * host-visible).
  * COLI_VK_HOST_VISIBLE_CAP_MB=N treats the host-visible heap as at most N MiB, which
  * lets a device with Resizable BAR or unified memory take the decision a card without
  * it takes. The target type: device-local and not host-visible on the largest
  * device-local heap (the host never maps it), else that heap's device-local type
  * (Lavapipe has one type for everything); vendor-specific types (uncached, coherent)
  * are passed over. The staging type: host-visible and coherent, not device-local
- * where there is one, so staging never takes the window. */
+ * where there is one, so staging never takes the window.
+ * A discrete card whose host-visible device-local type is as big as its heap may still be given less of
+ * it: on an A100 80 GB (NVIDIA's 580 driver) the engine's device is given 39.75 GiB of it, mapped or not,
+ * and refused the next block while the heap says 80 GiB and VK_EXT_memory_budget 79.21. The mapped path
+ * then fills the window (the expert tier and the weights add up to about that), and the allocations after
+ * it (the streaming slots, the expert batch's scratch) are refused: a prompt of 512 tokens ends on the CPU.
+ * So a discrete card that place_decide leaves mapped is asked once its device exists (vk_window_decide):
+ * 1 GiB blocks of that type, up to 9/10 of its heap in whole GiB (less if VK_EXT_memory_budget says less is
+ * free), all given back when the loop ends. COLI_VK_WINDOW_PROBE_MB=n answers n MiB instead, without asking;
+ * COLI_VK_WINDOW_ASK_MB=n asks for n MiB at most instead of the 9/10, so the loop runs for real (tests). */
 static int place_plain(VkMemoryPropertyFlags f) {
     return !(f & (VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT | 0xC0u));
 }
-static int place_decide(VkPhysicalDevice phys, int mt_host, VkUp *u) {
+static int place_decide(VkPhysicalDevice phys, int mt_host, VkUp *u, int may_later) {   /* may_later: device 0 only */
     VkPhysicalDeviceMemoryProperties m;
     vkGetPhysicalDeviceMemoryProperties(phys, &m);
     VkDeviceSize dl_max = 0, hv = 0;
     for (uint32_t i = 0; i < m.memoryHeapCount; i++)
         if ((m.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && m.memoryHeaps[i].size > dl_max)
             dl_max = m.memoryHeaps[i].size;
-    if (mt_host >= 0 && (m.memoryTypes[mt_host].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+    if (vk_integrated(phys)) hv = dl_max;
+    else if (mt_host >= 0 && (m.memoryTypes[mt_host].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
         hv = m.memoryHeaps[m.memoryTypes[mt_host].heapIndex].size;
     const char *cap = getenv("COLI_VK_HOST_VISIBLE_CAP_MB");
     if (cap && *cap && (VkDeviceSize)atoll(cap) << 20 < hv) hv = (VkDeviceSize)atoll(cap) << 20;
@@ -588,8 +653,76 @@ static int place_decide(VkPhysicalDevice phys, int mt_host, VkUp *u) {
         on = 0;
     }
     u->on = on;
-    if (on) { u->mt_dev = (uint32_t)dev; u->mt_stage = (uint32_t)st; }
+    VkPhysicalDeviceProperties pp;
+    vkGetPhysicalDeviceProperties(phys, &pp);
+    const char *kn = getenv("COLI_VK_WINDOW_PROBE_MB"), *ka = getenv("COLI_VK_WINDOW_ASK_MB");
+    u->later = may_later && !on && !(e && *e) && dev >= 0 && st >= 0 && mt_host >= 0 &&
+               (m.memoryTypes[mt_host].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+               (pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU || (kn && *kn) || (ka && *ka));
+    if (on || u->later) { u->mt_dev = (uint32_t)dev; u->mt_stage = (uint32_t)st; }
     return on;
+}
+/* The probe kept the mapped path: clear what coli_vk_init set on the uploader for a staged card and a mapped one
+ * does not have: the lock on the main queue's submits (shared), the families its buffers are shared between
+ * (nfams, so EXCLUSIVE) and the device handle. The queue, the families' list and the memory types stay set;
+ * they are read only when the uploader is on. */
+static void vk_window_mapped(VkUp *u) {
+    u->shared = 0; u->nfams = 0; u->dev = VK_NULL_HANDLE;
+}
+/* The device exists: does the host-visible device-local type take 9/10 of its heap (see above), or what the
+ * driver's budget still leaves if that is less (memory another process holds is not the type's limit)? If not,
+ * the staged path, which place_decide would have taken. Said at every start it asks, with what it cost (but
+ * when the small allocation for the block list fails: mapped, no line).
+ * The blocks go through vk_mem_alloc like every allocation here: the books count them until they are freed, and
+ * COLI_VK_DEVICE_CAP_MB limits them (a capped device reads as a small window). */
+static void vk_window_decide(VkUp *u) {
+    u->later = 0;   /* decided from here on */
+    VkPhysicalDeviceMemoryProperties m;
+    vkGetPhysicalDeviceMemoryProperties(G.phys, &m);
+    const uint32_t hi = m.memoryTypes[G.memtype].heapIndex;
+    int want = (int)(m.memoryHeaps[hi].size >> 30) * 9 / 10;   /* GiB */
+    const char *kn = getenv("COLI_VK_WINDOW_PROBE_MB"), *ka = getenv("COLI_VK_WINDOW_ASK_MB");
+    const char *by = kn && *kn ? " (COLI_VK_WINDOW_PROBE_MB)" : ka && *ka ? " (COLI_VK_WINDOW_ASK_MB)" : "";
+    if (!(kn && *kn) && ka && *ka) {   /* tests: ask this much at most, so the loop below runs on any device */
+        const int a = (int)(atof(ka) / 1024.0);
+        if (a < want) want = a > 0 ? a : 1;
+    }
+#ifdef VK_EXT_memory_budget
+    if (!(kn && *kn) && G.has_budget) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT bud = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 mp2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bud};
+        vkGetPhysicalDeviceMemoryProperties2(G.phys, &mp2);
+        if (bud.heapBudget[hi]) {
+            const int room = bud.heapBudget[hi] > bud.heapUsage[hi] ? (int)((bud.heapBudget[hi] - bud.heapUsage[hi]) >> 30) : 0;
+            if (room < want) want = room;
+        }
+    }
+#endif
+    int got = 0;
+    double ms = 0;
+    VkDeviceMemory *blk = want > 0 ? calloc((size_t)want, sizeof *blk) : NULL;
+    if (want > 0 && !blk) { vk_window_mapped(u); return; }
+    if (kn && *kn) got = (int)(atof(kn) / 1024.0);
+    else {
+        double t0 = vk_now();
+        for (; got < want; got++) {
+            VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                .allocationSize = (VkDeviceSize)1 << 30, .memoryTypeIndex = G.memtype};
+            if (vkAllocateMemory(G.dev, &ai, NULL, &blk[got]) != VK_SUCCESS) break;
+        }
+        for (int i = 0; i < got; i++) vkFreeMemory(G.dev, blk[i], NULL);
+        ms = vk_now() - t0;
+    }
+    free(blk);
+    if (got >= want) {
+        fprintf(stderr, "[VK] memory: mapped weights, the host-visible device-local memory gave the %d GiB asked (9/10 of "
+                "its heap, less if its budget leaves less), found in %.1f s%s\n", got, ms / 1000.0, by);
+        vk_window_mapped(u);
+        return;
+    }
+    u->on = 1;
+    snprintf(u->why, sizeof u->why, "the driver gave %d of the %d GiB asked of the host-visible device-local memory (9/10 of "
+             "its heap, less if its budget leaves less), found in %.1f s%s", got, want, ms / 1000.0, by);
 }
 /* The uploader's command buffers, fences and staging slots (u->dev, u->fam set). */
 /* A slot's imports, once its copies are done (or it was never submitted). */
@@ -601,27 +734,34 @@ static void up_imp_release(VkUp *u, int s) {
     u->nimp[s] = 0;
 }
 /* The host image a tier tensor is filled in (coli_vk_tier_tensor, staged uploads): aligned
- * and rounded to the device's import alignment, so up_import can copy from it in place. */
+ * and rounded to the device's import alignment, so up_import can copy from it in place.
+ * Off Windows it is aligned by hand inside a calloc'd block, whose address sits just before
+ * the image, as the path without imports allocates: posix_memalign + memset kept ~5 GiB of
+ * freed images in glibc's arenas over a prompt (pure Vulkan, V4 Flash REAP: anon 45.4 GiB
+ * against 40.3 this way), past what the host pool's sizing leaves the engine. */
 static uint8_t *up_img_alloc(int dev, size_t bytes, uint8_t *aligned) {
     size_t al = g_up[dev].imp_align;
     *aligned = al != 0;
     if (!al) return calloc(1, bytes);
-    void *p = NULL;
     size_t sz = (bytes + al - 1) / al * al;
 #ifdef _WIN32
-    p = _aligned_malloc(sz, al);
-#else
-    if (posix_memalign(&p, al, sz)) p = NULL;
-#endif
+    void *p = _aligned_malloc(sz, al);
     if (p) memset(p, 0, sz);
     return p;
+#else
+    uint8_t *raw = calloc(1, sz + al + sizeof(void *));
+    if (!raw) return NULL;
+    uint8_t *p = (uint8_t *)(((uintptr_t)raw + sizeof(void *) + al - 1) / al * al);
+    memcpy(p - sizeof(void *), &raw, sizeof raw);
+    return p;
+#endif
 }
 static void up_img_free(uint8_t *p, int aligned) {
     if (!p) return;
 #ifdef _WIN32
     if (aligned) { _aligned_free(p); return; }
 #else
-    (void)aligned;
+    if (aligned) { void *raw; memcpy(&raw, p - sizeof(void *), sizeof raw); free(raw); return; }
 #endif
     free(p);
 }
@@ -707,7 +847,22 @@ static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, vo
  * engine sets 0.4 around the bulk expert-tier fill, dense stays at the 0.75 default. */
 void coli_vk_alloc_priority(float p) { G.prio = p < 0 ? 0 : p > 1 ? 1 : p; }
 
-/* Device-local heap usage/budget in GB (VK_EXT_memory_budget). Returns 0 when the
+#ifdef VK_EXT_memory_budget
+/* Usage and budget of the device memory in GB (vk_device_memory_budget). */
+static int vk_device_budget(VkPhysicalDevice phys, double *used_gb, double *budget_gb) {
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT bud = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 mp2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bud};
+    vkGetPhysicalDeviceMemoryProperties2(phys, &mp2);
+    VkDeviceSize u, b;
+    vk_device_memory_budget(&mp2.memoryProperties, vk_integrated(phys), bud.heapUsage, bud.heapBudget, &u, &b);
+    if (used_gb) *used_gb = (double)u / 1e9;
+    if (budget_gb) *budget_gb = (double)b / 1e9;
+    return b > 0;
+}
+#endif
+/* Usage/budget of the device memory in GB (VK_EXT_memory_budget). Returns 0 when the
  * extension is absent — callers then keep their count-based caps unchanged. */
 int coli_vk_mem_budget(double *used_gb, double *budget_gb) {
     if (g_mem.cap[0] && G.phys) {   /* COLI_VK_DEVICE_CAP_MB: the cap and this process's bytes */
@@ -717,25 +872,13 @@ int coli_vk_mem_budget(double *used_gb, double *budget_gb) {
     }
 #ifdef VK_EXT_memory_budget
     if (!G.has_budget || !G.phys) return 0;
-    VkPhysicalDeviceMemoryBudgetPropertiesEXT bud = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
-    VkPhysicalDeviceMemoryProperties2 mp2 = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bud};
-    vkGetPhysicalDeviceMemoryProperties2(G.phys, &mp2);
-    double u = 0, b = 0;
-    for (uint32_t i = 0; i < mp2.memoryProperties.memoryHeapCount; i++)
-        if (mp2.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
-            u += (double)bud.heapUsage[i]; b += (double)bud.heapBudget[i];
-        }
-    if (used_gb) *used_gb = u / 1e9;
-    if (budget_gb) *budget_gb = b / 1e9;
-    return b > 0;
+    return vk_device_budget(G.phys, used_gb, budget_gb);
 #else
     (void)used_gb; (void)budget_gb; return 0;
 #endif
 }
 /* Free device memory now: the cap less what this process holds (COLI_VK_DEVICE_CAP_MB), else
- * VK_EXT_memory_budget's budget less its usage, else the largest device-local heap less
+ * VK_EXT_memory_budget's budget less its usage, else the size of the device memory less
  * what this process holds. */
 size_t coli_vk_free_bytes(void) {
     if (!G.phys) return 0;
@@ -767,9 +910,21 @@ static int scratch_reserve_mt(Scratch *s, size_t bytes, uint32_t memtype) {
 }
 static int scratch_reserve(Scratch *s, size_t bytes) { return scratch_reserve_mt(s, bytes, G.memtype); }
 
+/* Block formats (shaders/blockdec.glsl): fmt 100 + t is ggml block type t, its rows as the
+ * GGUF file stores them; 200, 201, 202 are colibri's int2-g32, int2-g16 and int3-g16 experts
+ * (203 vq2: codes | 4-bit scales per 32 | f32 row scale, its codebooks in the table buffer)
+ * as codes | group scales (I/32 bytes) | f32 row scale. The scales live in the rows: the
+ * scale array is bound but unused. Elements and bytes per block: blockdec_host.h. */
+static int bd_fmt(int fmt) { return (fmt >= 101 && fmt < 143 && BD_BLK[fmt - 100] >= 32) || (fmt >= 200 && fmt <= 203); }
+static size_t bd_row_bytes(int fmt, int I) {
+    if (fmt == 203) return (size_t)I / 4 + (size_t)I / 64 + 4;
+    if (fmt >= 200) return (size_t)I / 128 * (fmt == 202 ? 48 : 32) + (size_t)I / 32 + 4;
+    return (size_t)I / BD_BLK[fmt - 100] * BD_BYTES[fmt - 100];
+}
 /* Bytes of one weight row on the CPU side. fmt 10 (f32) and 11 (bf16) are the plain
  * float weights the newer engines keep resident; they carry no scales. */
 static size_t cpu_row_bytes(int fmt, int I) {
+    if (bd_fmt(fmt)) return bd_row_bytes(fmt, I);
     return fmt == 1 || fmt == 12 || fmt == 13 ? (size_t)I   // int8, fp8: one byte per weight
          : fmt == 5  ? ((size_t)I + 63) / 64 * 24            // int3-g64: 24B per 64-group
          : fmt == 10 ? (size_t)I * 4
@@ -782,7 +937,7 @@ static int rowwords(int fmt, int I) {
 /* Scale floats per tensor: per-row formats carry O, int3-g64 carries O*ceil(I/64)
  * (one f32 per 64-input group). upload_tensor and tensor_free must agree on this. */
 static size_t scale_floats(int fmt, int I, int O, int gs) {
-    if (fmt == 10 || fmt == 11 || fmt == 14) return 1;    // unused by the shader; bound anyway
+    if (fmt == 10 || fmt == 11 || fmt == 14 || bd_fmt(fmt)) return 1;    // unused by the shader; bound anyway
     if (fmt == 5) return (size_t)O * (((size_t)I + 63) / 64);
     if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13)
         return (size_t)O * (((size_t)I + gs - 1) / gs);   // per-group [O,ng]
@@ -807,6 +962,27 @@ static VkShaderModule load_spv(VkDevice dev, const char *path) {
     return r == VK_SUCCESS ? m : VK_NULL_HANDLE;
 }
 
+/* The subgroup size a device's pipelines run at (vk_pin_sg, 0 = the driver's choice).
+ * The GEMV shaders (qmatmul, qmatmul_gate_up, the expert batch's) size their reductions
+ * by gl_SubgroupSize, as the chain's do; an Intel GPU compiles a shader at 8, 16 or 32
+ * lanes by its register pressure (the heavier block-format decoders of blockdec.glsl
+ * among them). Only the chain's pipelines were pinned (#1954): on Mesa ANV every
+ * expert-tier format but int3-g64 came out wrong and qwen36 answered nothing (#2036),
+ * while the chain alone passed. Pinned here too. */
+static int dev_pin_sg(VkDevice dev);
+static const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT *pin_info(VkDevice dev,
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT *rss) {
+#ifdef VK_EXT_subgroup_size_control
+    int n = dev_pin_sg(dev);
+    if (n <= 0) return NULL;
+    *rss = (VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT){
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+        .requiredSubgroupSize = (uint32_t)n};
+    return rss;
+#else
+    (void)dev; (void)rss; return NULL;
+#endif
+}
 /* Build a compute pipeline + descriptor pool/set for nbind storage buffers with a
  * pc_size-byte push constant. Used by the 4-binding matmul, 6-binding gate_up and
  * 7-binding absorb attention pipelines. */
@@ -824,8 +1000,9 @@ static int build_pipeline(VkDevice dev, int nbind, size_t pc_size, VkShaderModul
     VkPipelineLayoutCreateInfo pli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1, .pSetLayouts = dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr};
     VKCHECK(vkCreatePipelineLayout(dev, &pli, NULL, plyt), "pipelineLayout");
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss;
     VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = pin_info(dev, &rss),
                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main"},
         .layout = *plyt};
     VKCHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, NULL, pipe), "pipeline");
@@ -981,6 +1158,7 @@ int coli_vk_init(const char *spv_path) {
                    p.deviceType == VK_PHYSICAL_DEVICE_TYPE_OTHER          ? 1 : 0; // CPU last
         if (rank > bestrank) { bestrank = rank; G.phys = devs[i]; }
     }
+    { VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G.phys, &p); g_vk_software = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU; }
 
     uint32_t nq = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(G.phys, &nq, NULL);
@@ -1026,7 +1204,7 @@ int coli_vk_init(const char *spv_path) {
      * its queues: a transfer-only family (a copy engine), else a spare queue of a family
      * already asked for, else the main queue, shared under g_qmx[0]. */
     uint32_t up_fam = G.qfam, up_idx = 0; int up_shared = 1;
-    if (place_decide(G.phys, pick_memtype(G.phys), &g_up[0])) {
+    if (place_decide(G.phys, pick_memtype(G.phys, COLI_VK_MEM_CPU_WRITES), &g_up[0], 1) || g_up[0].later) {
         uint32_t t = UINT32_MAX;
         for (uint32_t i = 0; i < nq && t == UINT32_MAX; i++)
             if ((qf[i].queueFlags & VK_QUEUE_TRANSFER_BIT) && qf[i].queueCount &&
@@ -1059,17 +1237,43 @@ int coli_vk_init(const char *spv_path) {
 #ifdef VK_EXT_memory_budget
                 if (!strcmp(ep[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) G.has_budget = 1;
 #endif
+#ifdef VK_KHR_shader_integer_dot_product
+                if (!strcmp(ep[i].extensionName, VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME)) G.has_idot = 1;
+#endif
 #ifdef VK_EXT_external_memory_host
                 if (!strcmp(ep[i].extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) G.has_hostmem = 1;
 #endif
 #ifdef VK_KHR_cooperative_matrix
                 if (!strcmp(ep[i].extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) has_cm = 1;
 #endif
+#ifdef VK_AMD_shader_core_properties2
+                if (!strcmp(ep[i].extensionName, VK_AMD_SHADER_CORE_PROPERTIES_2_EXTENSION_NAME)) {
+                    VkPhysicalDeviceShaderCoreProperties2AMD core = {
+                        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_PROPERTIES_2_AMD};
+                    VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &core};
+                    vkGetPhysicalDeviceProperties2(G.phys, &p2);
+                    G.compute_units = (int)core.activeComputeUnitCount;
+                }
+#endif
 #ifdef VK_EXT_subgroup_size_control
                 if (!strcmp(ep[i].extensionName, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) has_ssc = 1;
 #endif
             }
             free(ep);
+        }
+    }
+    /* timeline semaphores, where the device has them (core in 1.2): the chain's hybrid steps
+     * (vk_chain.c). Asked of every device, with or without the matrix units and whatever the
+     * headers of the build: an RTX 3070 built against headers before the cooperative matrix
+     * came up without the semaphores, and its hybrid steps (the host pool's experts on the
+     * CPU beside the device's) never ran. */
+    {
+        VkPhysicalDeviceProperties tp; vkGetPhysicalDeviceProperties(G.phys, &tp);
+        if (tp.apiVersion >= VK_API_VERSION_1_2) {
+            VkPhysicalDeviceTimelineSemaphoreFeatures tq = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+            VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &tq};
+            vkGetPhysicalDeviceFeatures2(G.phys, &f2);
+            G.has_tsem = tq.timelineSemaphore != 0;
         }
     }
     /* Cooperative-matrix GEMM (optional, COLI_VK_COOP=0 turns it off): the KHR extension
@@ -1085,7 +1289,22 @@ int coli_vk_init(const char *spv_path) {
     {
         const char *e = getenv("COLI_VK_COOP");
         VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(G.phys, &pp);
-        if (has_cm && has_ssc && pp.apiVersion >= VK_API_VERSION_1_2 && !(e && *e == '0')) {
+        /* AMD's own driver (Windows, 32.0.32015.7029) crashed inside its compiler on a
+         * Radeon 780M once the cooperative-matrix features were on, before the engine was
+         * ready, with subgroups of 64 and of 32 alike (#2289): a crash in the driver no
+         * fallback here can catch, so the default leaves them off on that driver.
+         * RADV runs them on the same chip (measured). COLI_VK_COOP=1 tries them. */
+        int amd_own = 0;
+        if (has_cm && has_ssc && pp.apiVersion >= VK_API_VERSION_1_2) {
+            VkPhysicalDeviceDriverProperties dp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+            VkPhysicalDeviceProperties2 dp2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &dp};
+            vkGetPhysicalDeviceProperties2(G.phys, &dp2);
+            amd_own = dp.driverID == VK_DRIVER_ID_AMD_PROPRIETARY && !(e && *e == '1');
+            if (amd_own && !(e && *e == '0'))
+                fprintf(stderr, "[VK] cooperative matrix off on AMD's own driver (%s %s: it crashed compiling the shader "
+                                "on a Radeon 780M, #2289); COLI_VK_COOP=1 tries it\n", dp.driverName, dp.driverInfo);
+        }
+        if (has_cm && has_ssc && pp.apiVersion >= VK_API_VERSION_1_2 && !(e && *e == '0') && !amd_own) {
             VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &v12f};
             vkGetPhysicalDeviceFeatures2(G.phys, &f2);
             VkPhysicalDeviceSubgroupSizeControlPropertiesEXT ssp = {
@@ -1133,6 +1352,7 @@ int coli_vk_init(const char *spv_path) {
     v12f.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES; v12f.pNext = &sscf;
     v12f.shaderFloat16 = VK_TRUE; v12f.vulkanMemoryModel = VK_TRUE;
     v12f.bufferDeviceAddress = G.has_bda ? VK_TRUE : VK_FALSE;
+    v12f.timelineSemaphore = G.has_tsem ? VK_TRUE : VK_FALSE;   /* queried above, for every device */
 #endif
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = nqi, .pQueueCreateInfos = qis};
@@ -1144,6 +1364,33 @@ int coli_vk_init(const char *spv_path) {
 #endif
 #ifdef VK_EXT_memory_budget
     if (G.has_budget) dext[ndext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+#endif
+#ifdef VK_KHR_shader_integer_dot_product
+    /* the chain's routed experts in the CPU's integer form (chain_moe_i8.spv): the feature,
+     * and whether its packed 4 x 8 signed dot is accelerated (the default then) */
+    VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR idf = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR};
+    {
+        const char *ie = getenv("COLI_VK_IDOT");
+        if (G.has_idot && !(ie && *ie == '0')) {
+            VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &idf};
+            vkGetPhysicalDeviceFeatures2(G.phys, &f2);
+            VkPhysicalDeviceShaderIntegerDotProductPropertiesKHR ip = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES_KHR};
+            VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &ip};
+            vkGetPhysicalDeviceProperties2(G.phys, &p2);
+            G.has_idot = idf.shaderIntegerDotProduct ? (ip.integerDotProduct4x8BitPackedSignedAccelerated ? 2 : 1) : 0;
+        } else G.has_idot = 0;
+        if (G.has_idot) {
+            dext[ndext++] = VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME;
+            idf = (VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR){
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR,
+                .pNext = (void *)di.pNext, .shaderIntegerDotProduct = VK_TRUE};
+            di.pNext = &idf;
+        }
+    }
+#else
+    G.has_idot = 0;
 #endif
 #ifdef VK_EXT_external_memory_host
     /* host memory the device reads in place (no copy): measured by the harness
@@ -1164,9 +1411,41 @@ int coli_vk_init(const char *spv_path) {
         if (vkCreateDevice(G.phys, &dc, NULL, &G.dev) != VK_SUCCESS) { G.has_coop = 0; G.has_bda = 0; G.dev = VK_NULL_HANDLE; }
     }
 #endif
+    /* the timeline semaphores without the matrix units' device (whose Vulkan 1.2 features
+     * carry them): a feature struct of their own */
+    VkPhysicalDeviceTimelineSemaphoreFeatures tsf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+    if (!G.dev && G.has_tsem) { tsf.timelineSemaphore = VK_TRUE; tsf.pNext = (void *)di.pNext; di.pNext = &tsf; }
+    /* bufferDeviceAddress without the matrix units: the dense chain's routed experts read
+     * the tier's weights by address (chain_moe.comp). COLI_VK_BDA=0 leaves it off; a
+     * device that refuses it comes up without it. */
+    VkPhysicalDeviceBufferDeviceAddressFeatures bdaf = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+    const void *di_next = di.pNext;
+    if (!G.dev) {
+        const char *be = getenv("COLI_VK_BDA");
+        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(G.phys, &pp);
+        G.has_bda = 0;
+        if (pp.apiVersion >= VK_API_VERSION_1_2 && !(be && *be == '0')) {
+            VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &bdaf};
+            vkGetPhysicalDeviceFeatures2(G.phys, &f2);
+            if (bdaf.bufferDeviceAddress) {
+                bdaf = (VkPhysicalDeviceBufferDeviceAddressFeatures){
+                    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES,
+                    .pNext = (void *)di.pNext, .bufferDeviceAddress = VK_TRUE};
+                di.pNext = &bdaf;
+                G.has_bda = 1;
+            }
+        }
+    }
     /* the cooperative-matrix device enables subgroup size control already */
     G.pin_sg = vk_pin_sg(G.phys, has_ssc);
-    if (!G.dev && G.pin_sg && !vk_create_device_pinned(G.phys, &di, &G.dev)) G.pin_sg = 0;
+    for (int bda = G.has_bda; !G.dev; bda = 0) {
+        if (G.pin_sg && !vk_create_device_pinned(G.phys, &di, &G.dev)) G.pin_sg = 0;
+        if (!G.dev && vkCreateDevice(G.phys, &di, NULL, &G.dev) != VK_SUCCESS) G.dev = VK_NULL_HANDLE;
+        if (G.dev || !bda) break;
+        di.pNext = di_next; G.has_bda = 0;   /* again without the addresses */
+        G.pin_sg = vk_pin_sg(G.phys, has_ssc);
+    }
     if (!G.dev)
     VKCHECK(vkCreateDevice(G.phys, &di, NULL, &G.dev), "vkCreateDevice");
     vk_mem_device(0, G.phys, G.dev);   /* the device memory books, and COLI_VK_DEVICE_CAP_MB */
@@ -1174,7 +1453,7 @@ int coli_vk_init(const char *spv_path) {
     vkGetDeviceQueue(G.dev, G.qfam, 0, &G.queue);
     vkGetDeviceQueue(G.dev, G.tq_fam, G.tq_idx, &G.tqueue);
     G.tq_shared = G.tqueue == G.queue;
-    if (g_up[0].on) {
+    if (g_up[0].on || g_up[0].later) {
         VkUp *u = &g_up[0];
         u->dev = G.dev; u->fam = up_fam; u->shared = up_shared;
         if (up_shared) u->q = G.queue; else vkGetDeviceQueue(G.dev, up_fam, up_idx, &u->q);
@@ -1205,11 +1484,17 @@ int coli_vk_init(const char *spv_path) {
         fprintf(stderr, "[VK] VRAM pressure-proofing: memory_priority %s, memory_budget %s\n",
                 G.has_prio ? "on" : "absent", G.has_budget ? "on" : "absent");
 
-    int mt = pick_memtype(G.phys);
+    int mt = pick_memtype(G.phys, COLI_VK_MEM_CPU_WRITES);
     if (mt < 0) { fprintf(stderr, "[VK] no host-visible memory\n"); return 0; }
     G.memtype = (uint32_t)mt;
-    G.memtype_cached = (uint32_t)pick_memtype_cached(G.phys);
-    G.memtype_dev = (uint32_t)pick_memtype_device(G.phys);
+    G.memtype_cached = (uint32_t)pick_memtype(G.phys, COLI_VK_MEM_CPU_READS);
+    G.memtype_dev = (uint32_t)pick_memtype(G.phys, COLI_VK_MEM_GPU_ONLY);
+    G.memtype_sys = pick_memtype_sys(G.phys);
+    {   /* COLI_VK_TIER_HOST=1 on a device that shares the host's RAM (tests): the host pool in
+         * its host-visible type, the same memory as the tier's pool, the same paths as on a card */
+        const char *e = getenv("COLI_VK_TIER_HOST");
+        if (G.memtype_sys < 0 && e && !strcmp(e, "1")) G.memtype_sys = (int)G.memtype;
+    }
 
     /* Resizable-BAR sanity (#523): on discrete cards the weight tiers want
      * HOST_VISIBLE|DEVICE_LOCAL. With ReBAR disabled that combination exists only in a
@@ -1227,6 +1512,8 @@ int coli_vk_init(const char *spv_path) {
                 mp.memoryHeaps[i].size > dl_max) dl_max = mp.memoryHeaps[i].size;
         VkMemoryPropertyFlags cf = mp.memoryTypes[G.memtype].propertyFlags;
         VkDeviceSize hv_dl = mp.memoryHeaps[mp.memoryTypes[G.memtype].heapIndex].size;
+        const int integrated = vk_integrated(G.phys);   /* an integrated GPU has no BAR window and uses system memory */
+        if (g_up[0].later) vk_window_decide(&g_up[0]);
         if (g_up[0].on && !up_init(&g_up[0])) {
             fprintf(stderr, "[VK] staged uploads unavailable (no staging buffer): resident data stays in mapped memory\n");
             up_destroy(&g_up[0]);
@@ -1240,12 +1527,12 @@ int coli_vk_init(const char *spv_path) {
                     (unsigned long long)(mp.memoryHeaps[mp.memoryTypes[u->mt_dev].heapIndex].size >> 20), u->mt_stage,
                     u->shared ? "the main queue" : u->fam != G.qfam && u->fam != G.tq_fam ? "a transfer queue" : "a queue of its own",
                     u->why);
-        } else if (dl_max && !(cf & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+        } else if (dl_max && !integrated && !(cf & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
             fprintf(stderr, "[VK] warning: no host-visible+device-local memory type — weight tiers "
                     "will live in system RAM and every access crosses PCIe (expect slower than "
                     "CPU-only). On a discrete card, enable Resizable BAR in the BIOS or leave "
                     "COLI_VK_STAGED unset.\n");
-        else if (dl_max && hv_dl * 4 < dl_max)
+        else if (dl_max && !integrated && hv_dl * 4 < dl_max)
             fprintf(stderr, "[VK] warning: only %llu of %llu MB VRAM is host-visible (Resizable BAR "
                     "appears disabled) — allocations beyond the %llu MB window fall back to system "
                     "RAM and will be slow. Enable Resizable BAR / Smart Access Memory in the BIOS, "
@@ -1390,11 +1677,12 @@ void coli_vk_mem_info(size_t *used, size_t *count) {
  * lock covers its books only: the uploader thread of the tier allocates while the
  * engine thread uploads dense matrices. A free while async work is in flight on the
  * tensor's device waits for that work (coli_vk_tensor_free). */
-typedef struct { VkDeviceMemory mem; uint8_t *base; } VkBlk;
+typedef struct { VkDeviceMemory mem; uint8_t *base; void *imp; } VkBlk;   /* imp: the host pool block's own pages (pool_import) */
 struct VkWPool {
     VkaPool p;
     pthread_mutex_t mx;
     int dev;                 /* 0 = G, 1 = G2 */
+    int host;                /* 1 = system RAM the device reads over PCIe (G.memtype_sys), mapped, never staged */
     float prio;              /* eviction priority of its blocks; < 0 = G.prio at creation */
     int counted;             /* 1 = its tensors are coli_vk_mem_info's (the resident weights) */
     size_t bytes, tensors;   /* payload of its live tensors (rows + scales) */
@@ -1407,6 +1695,11 @@ static VkWPool g_tpool2 = {.p = {.block_bytes = VK_WBLOCK}, .mx = PTHREAD_MUTEX_
 /* the tier's extra layers (an MTP head's), whose experts have another size than the
  * main ones': a pool of their own, so neither leaves holes the other cannot use */
 static VkWPool g_xpool  = {.p = {.block_bytes = VK_WBLOCK}, .mx = PTHREAD_MUTEX_INITIALIZER, .dev = 0, .prio = 0.4f};
+/* the tier's experts the primary device's memory has no room for, in system RAM it reads
+ * by address over PCIe (coli_vk_tier_tensor_pad dev 2): a discrete card only */
+static VkWPool g_hpool  = {.p = {.block_bytes = VK_WBLOCK}, .mx = PTHREAD_MUTEX_INITIALIZER, .dev = 0, .prio = -1.f, .host = 1};
+/* a pool whose memory the uploader fills (staged uploads), or the host's own mapping */
+static int pool_staged(const VkWPool *P);
 /* Device k's pools take VK_WBLOCK blocks, smaller ones under COLI_VK_DEVICE_CAP_MB. */
 static void vk_pool_blocks(int k) {
     size_t bb = VK_WBLOCK;
@@ -1631,6 +1924,77 @@ static void up_zero(int dev, VkDeviceMemory mem, uint64_t cap) {
 /* The primary device's pools are addressable when bufferDeviceAddress is on (the
  * expert batch's grouped GEMM reads expert weights through an address table). */
 static int pool_bda(const VkWPool *P) { return P->dev == 0 && G.has_bda; }
+/* An imported block's pages: MinGW has no posix_memalign, and what _aligned_malloc returns
+ * goes back through _aligned_free. */
+static void *pool_host_alloc(size_t al, size_t bytes) {
+#ifdef _WIN32
+    return _aligned_malloc(bytes, al);
+#else
+    void *p = NULL;
+    return posix_memalign(&p, al, bytes) ? NULL : p;
+#endif
+}
+static void pool_host_free(void *p) {
+#ifdef _WIN32
+    _aligned_free(p);
+#else
+    free(p);
+#endif
+}
+/* The host pool's blocks from the process's own pages (VK_EXT_external_memory_host), where
+ * the driver has them: the memory vkAllocateMemory gives for a host-visible type without
+ * HOST_CACHED is write-combined for the CPU (NVIDIA's Linux driver offers no cached type),
+ * and the hybrid steps' CPU pairs read it at about 12 GB/s on twelve cores -- 133 us a
+ * pair of Qwen3.6 int4 (1.57 MB) against 44 from cached memory (an RTX 3070 and a
+ * Threadripper 3945WX). The device reads imported pages over PCIe at the same speed as its
+ * own allocation (bench_hostmem). COLI_VK_HOST_POOL_IMPORT=0 keeps the driver's memory. */
+static int pool_import_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_HOST_POOL_IMPORT"); on = !(e && *e == '0'); }
+    return on && G.has_hostmem;
+}
+static int pool_import(VkWPool *P, VkBlk *bk, uint64_t cap, const VkMemoryAllocateFlagsInfo *afl) {
+#ifdef VK_EXT_external_memory_host
+    if (!P->host || P->dev || !pool_import_on()) return 0;
+    static size_t al;
+    static PFN_vkGetMemoryHostPointerPropertiesEXT gp;
+    if (!al) {
+        VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &hp};
+        vkGetPhysicalDeviceProperties2(G.phys, &p2);
+        al = hp.minImportedHostPointerAlignment ? (size_t)hp.minImportedHostPointerAlignment : 4096;
+        gp = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(G.dev, "vkGetMemoryHostPointerPropertiesEXT");
+    }
+    if (!gp || cap % al) return 0;
+    void *host = pool_host_alloc(al, (size_t)cap);
+    if (!host) return 0;
+    VkMemoryHostPointerPropertiesEXT mp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    if (gp(G.dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host, &mp) != VK_SUCCESS ||
+        !(mp.memoryTypeBits & (1u << pool_memtype(P)))) { pool_host_free(host); return 0; }
+    VkImportMemoryHostPointerInfoEXT imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, .pNext = (void *)afl,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, .pHostPointer = host};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp, .allocationSize = cap,
+        .memoryTypeIndex = pool_memtype(P)};
+    if (vkAllocateMemory(G.dev, &ai, NULL, &bk->mem) != VK_SUCCESS) { pool_host_free(host); bk->mem = VK_NULL_HANDLE; return 0; }
+    bk->base = host; bk->imp = host;
+    static int said;
+    if (!said++) fprintf(stderr, "[VK] host pool: its blocks are the process's own pages, imported (cached for the CPU; COLI_VK_HOST_POOL_IMPORT=0 takes the driver's)\n");
+    return 1;
+#else
+    (void)P; (void)bk; (void)cap; (void)afl;
+    return 0;
+#endif
+}
+/* a block's memory and pages back (lock held) */
+static void blk_free(VkDevice dev, VkBlk *bk) {
+    if (!bk) return;
+    if (dev) {
+        if (bk->base && !bk->imp) vkUnmapMemory(dev, bk->mem);
+        if (bk->mem) vkFreeMemory(dev, bk->mem, NULL);
+    }
+    if (bk->imp) pool_host_free(bk->imp);
+    free(bk);
+}
 /* Block memory for a pool (lock held). */
 static VkBlk *pool_new_block(VkWPool *P, uint64_t cap) {
     VkBlk *bk = calloc(1, sizeof(*bk));
@@ -1646,7 +2010,8 @@ static VkBlk *pool_new_block(VkWPool *P, uint64_t cap) {
         .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
     if (pool_bda(P)) { afl.pNext = ai.pNext; ai.pNext = &afl; }
     VkDevice dev = pool_device(P);
-    int staged = g_up[P->dev].on;   /* device-local, never mapped: the uploader fills it */
+    if (pool_import(P, bk, cap, pool_bda(P) ? &afl : NULL)) return bk;   /* the host pool: the process's pages */
+    int staged = pool_staged(P);   /* device-local, never mapped: the uploader fills it */
     if (staged && up_fault("block")) { free(bk); return NULL; }
     if (vkAllocateMemory(dev, &ai, NULL, &bk->mem) != VK_SUCCESS ||
         (!staged && vkMapMemory(dev, bk->mem, 0, cap, 0, (void **)&bk->base) != VK_SUCCESS)) {
@@ -1657,9 +2022,7 @@ static VkBlk *pool_new_block(VkWPool *P, uint64_t cap) {
     return bk;
 }
 static void pool_release_block(VkWPool *P, int k) {   /* lock held, block empty */
-    VkBlk *bk = P->p.b[k].user;
-    VkDevice dev = pool_device(P);
-    if (bk) { if (bk->base) vkUnmapMemory(dev, bk->mem); vkFreeMemory(dev, bk->mem, NULL); free(bk); }
+    blk_free(pool_device(P), P->p.b[k].user);
     vka_pool_drop_block(&P->p, k);
 }
 
@@ -1670,8 +2033,16 @@ static int pool_suballoc(VkWPool *P, size_t bytes, VkBuffer *buf, void **ptr, Vk
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = bytes ? bytes : 4, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
-    if (g_up[P->dev].on) { bi.usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT; up_sharing(&g_up[P->dev], &bi); }
+    if (pool_staged(P)) { bi.usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT; up_sharing(&g_up[P->dev], &bi); }
+    /* the host pool's: the source of a copy to the device (coli_vk_tensor_copy), on the uploader's queue */
+    else if (P->host) { bi.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT; up_sharing(&g_up[P->dev], &bi); }
     if (pool_bda(P)) bi.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+#ifdef VK_EXT_external_memory_host
+    /* the host pool's buffers may land in an imported block (pool_import): declared at creation */
+    VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, .pNext = (void *)bi.pNext,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
+    if (P->host && !P->dev && pool_import_on()) bi.pNext = &eb;
+#endif
     VKCHECK(vkCreateBuffer(dev, &bi, NULL, buf), "vkCreateBuffer");
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(dev, *buf, &req);
@@ -1688,10 +2059,8 @@ static int pool_suballoc(VkWPool *P, size_t bytes, VkBuffer *buf, void **ptr, Vk
             cap = (P->p.limit - P->p.total) & ~(uint64_t)4095;
         VkBlk *bk = vka_pool_can_grow(&P->p, cap) && cap >= req.size ? pool_new_block(P, cap) : NULL;
         if (bk) {
-            if (vka_pool_add_block(&P->p, cap, bk) < 0) {
-                if (bk->base) vkUnmapMemory(dev, bk->mem);
-                vkFreeMemory(dev, bk->mem, NULL); free(bk);
-            } else ok = vka_alloc(&P->p, req.size, align, r);
+            if (vka_pool_add_block(&P->p, cap, bk) < 0) blk_free(dev, bk);
+            else ok = vka_alloc(&P->p, req.size, align, r);
         } else P->p.refusals++;
     }
     VkBlk *blk = ok ? P->p.b[r->block].user : NULL;
@@ -1718,8 +2087,7 @@ static void pool_destroy(VkWPool *P) {
     VkDevice dev = pool_device(P);
     for (int k = 0; k < P->p.nb; k++) {
         if (!P->p.b[k].present) continue;
-        VkBlk *bk = P->p.b[k].user;
-        if (bk) { if (dev) { if (bk->base) vkUnmapMemory(dev, bk->mem); vkFreeMemory(dev, bk->mem, NULL); } free(bk); }
+        blk_free(dev, P->p.b[k].user);
     }
     uint64_t bb = P->p.block_bytes, lim = P->p.limit;
     vka_pool_destroy(&P->p);
@@ -1733,7 +2101,14 @@ static void pool_destroy(VkWPool *P) {
  * are device-local: *wptr and *sptr are then a zeroed host image of the same layout
  * that coli_vk_tensor_commit copies over (or, wptr NULL, nothing: upload_tensor_pool
  * streams the rows itself). */
-static ColiVkTensor *tensor_alloc(VkWPool *P, int fmt, int I, int O, int gs, void **wptr, void **sptr) {
+/* tensor_alloc with ranges of at least pad_w and pad_s bytes: room for the tensor to take
+ * a bigger format later (coli_vk_tensor_refill_as), and every tensor of a tier whose
+ * layers mix formats the same size, so a freed one leaves a hole any other fits in. */
+static VkBuffer bdtab_buf(int dev);
+static int bd_shaders(void);
+static ColiVkTensor *tensor_alloc_pad(VkWPool *P, int fmt, int I, int O, int gs, size_t pad_w, size_t pad_s,
+                                      void **wptr, void **sptr) {
+    if (bd_fmt(fmt) && (!bd_shaders() || !bdtab_buf(P->dev))) return NULL;   /* its GEMVs and the table they read */
     ColiVkTensor *t = calloc(1, sizeof(*t));
     if (!t) return NULL;
     t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I);
@@ -1741,12 +2116,14 @@ static ColiVkTensor *tensor_alloc(VkWPool *P, int fmt, int I, int O, int gs, voi
     t->dev = P->dev; t->pool = P;
     t->wbytes = (size_t)t->rowWords * 4 * (size_t)O;
     size_t sbytes = scale_floats(fmt, I, O, gs) * sizeof(float);
+    t->wcap = t->wbytes > pad_w ? t->wbytes : pad_w;
+    t->scap = sbytes > pad_s ? sbytes : pad_s;
     void *wp = NULL, *sp = NULL;
-    if (!pool_suballoc(P, t->wbytes, &t->wbuf, &wp, &t->wr)) { free(t); return NULL; }
-    if (!pool_suballoc(P, sbytes, &t->sbuf, &sp, &t->sr)) {
+    if (!pool_suballoc(P, t->wcap, &t->wbuf, &wp, &t->wr)) { free(t); return NULL; }
+    if (!pool_suballoc(P, t->scap, &t->sbuf, &sp, &t->sr)) {
         vkDestroyBuffer(pool_device(P), t->wbuf, NULL); pool_free_range(P, t->wr); free(t); return NULL;
     }
-    if (g_up[P->dev].on) {
+    if (pool_staged(P)) {
         if (wptr && !(t->img = up_img_alloc(P->dev, t->wbytes + sbytes, &t->img_al))) {
             vkDestroyBuffer(pool_device(P), t->wbuf, NULL); vkDestroyBuffer(pool_device(P), t->sbuf, NULL);
             pool_free_range(P, t->wr); pool_free_range(P, t->sr); free(t); return NULL;
@@ -1757,30 +2134,46 @@ static ColiVkTensor *tensor_alloc(VkWPool *P, int fmt, int I, int O, int gs, voi
         memset(*wptr, 0, t->wbytes);
         t->wmap = wp; t->smap = sp;
     }
-    __atomic_add_fetch(&P->bytes, t->wbytes + sbytes, __ATOMIC_RELAXED);
+    t->acct = t->wcap + t->scap;
+    __atomic_add_fetch(&P->bytes, t->acct, __ATOMIC_RELAXED);
     __atomic_add_fetch(&P->tensors, 1, __ATOMIC_RELAXED);
     if (P->counted) {
         // Counters are touched concurrently: frees run from expert_load under
         // `#pragma omp parallel`, so RMW them atomically (torn counts otherwise).
-        __atomic_add_fetch(&G.used_bytes, t->wbytes + sbytes, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&G.used_bytes, t->acct, __ATOMIC_RELAXED);
         __atomic_add_fetch(&G.tensor_count, 1, __ATOMIC_RELAXED);
     }
     return t;
 }
+static ColiVkTensor *tensor_alloc(VkWPool *P, int fmt, int I, int O, int gs, void **wptr, void **sptr) {
+    return tensor_alloc_pad(P, fmt, I, O, gs, 0, 0, wptr, sptr);
+}
 static int fmt_uploadable(int fmt, int gs) {
-    return fmt == 1 || fmt == 2 || fmt == 5 || fmt == 10 || fmt == 11 || fmt == 14 ||   /* fmt=4/7: word-aligned groups only */
+    return fmt == 1 || fmt == 2 || fmt == 5 || fmt == 10 || fmt == 11 || fmt == 14 || bd_fmt(fmt) ||   /* fmt=4/7: word-aligned groups only */
            ((fmt == 4 || fmt == 7) && gs >= 8 && gs % 8 == 0) ||
            ((fmt == 12 || fmt == 13) && gs >= 4 && gs % 4 == 0);           /* fp8 / int8: 4 per word */
 }
 
+/* The cooperative-matrix GEMMs (qmatmul_coop.comp, chain_gemm.comp) hold the dequantised weights, code
+ * times scale, in f16. A matrix with a scale past 65504 / (the format's largest code) would turn to inf
+ * there and its output column to NaN; GLM-5.3 Flash's layer-0 v_proj has 148 weights of 1e20 to 1e33
+ * (int4 g64 scales to 1e34), which the fp32 GEMMs and the CPU take in stride. Such a matrix stays on them. */
+static int scales_wide(int fmt, const float *scales, size_t n) {
+    if (!scales || !(fmt == 1 || fmt == 2 || fmt == 4 || fmt == 5 || fmt == 7 || fmt == 12)) return 0;
+    /* largest |code|: int8 127, fp8 e4m3 448, int4 8 (also bounds int3 and MXFP4) */
+    float lim = 65504.0f / (fmt == 12 ? 448.0f : fmt == 1 ? 127.0f : 8.0f);
+    for (size_t i = 0; i < n; i++) if (!(fabsf(scales[i]) <= lim)) return 1;   /* also a NaN */
+    return 0;
+}
 static void tensor_release(ColiVkTensor *t);
 static int upload_tensor_pool(VkWPool *P, ColiVkTensor **out, const void *weights, const float *scales,
                               int fmt, int I, int O, int gs) {
     if (*out) return (*out)->fmt == fmt && (*out)->I == I && (*out)->O == O;
     if (!fmt_uploadable(fmt, gs)) return 0;
-    if (g_up[P->dev].on) {   /* staged: the rows and the scales through the uploader */
+    if (pool_staged(P)) {   /* staged: the rows and the scales through the uploader */
         ColiVkTensor *t = tensor_alloc(P, fmt, I, O, gs, NULL, NULL);
         if (!t) return 0;
+        t->wide = scales_wide(fmt, scales, scale_floats(fmt, I, O, gs));
         static const float one = 1.0f;   /* float weights: no scales */
         UpRows rows = {weights, cpu_row_bytes(fmt, I), (size_t)t->rowWords * 4};
         size_t sb = scale_floats(fmt, I, O, gs) * sizeof(float);
@@ -1790,7 +2183,7 @@ static int upload_tensor_pool(VkWPool *P, ColiVkTensor **out, const void *weight
         size_t z = 0;
         int ok = ((rows.cpu_rb == rows.stride && up_add_host(u, weights, t->wbytes, 1, &t->wbuf, &z, &z, &t->wbytes)) ||
                   up_add(u, P->dev, t->wbuf, 0, t->wbytes, up_fill_rows, &rows)) &&
-                 up_add(u, P->dev, t->sbuf, 0, sb, up_fill_bytes, fmt == 10 || fmt == 11 || fmt == 14 ? (const void *)&one : scales);
+                 up_add(u, P->dev, t->sbuf, 0, sb, up_fill_bytes, fmt == 10 || fmt == 11 || fmt == 14 || bd_fmt(fmt) ? (const void *)&one : scales);
         ok = up_finish(u, P->dev) && ok;
         pthread_mutex_unlock(&u->mx);
         if (!ok) {   /* the matrix stays on the CPU (with the device, if it was lost) */
@@ -1804,13 +2197,14 @@ static int upload_tensor_pool(VkWPool *P, ColiVkTensor **out, const void *weight
     void *wptr, *sptr;
     ColiVkTensor *t = tensor_alloc(P, fmt, I, O, gs, &wptr, &sptr);
     if (!t) return 0;
+    t->wide = scales_wide(fmt, scales, scale_floats(fmt, I, O, gs));
     size_t stride = (size_t)t->rowWords * 4;         // padded row bytes
     size_t cpu_rb = cpu_row_bytes(fmt, I);
     for (int o = 0; o < O; o++)                        // copy row-by-row into padded layout
         memcpy((uint8_t *)wptr + (size_t)o * stride,
                (const uint8_t *)weights + (size_t)o * cpu_rb, cpu_rb);
     size_t sfl = scale_floats(fmt, I, O, gs);            // fmt=5: O*ceil(I/64) group scales
-    if (fmt == 10 || fmt == 11 || fmt == 14) ((float *)sptr)[0] = 1.0f;   /* float weights: no scales */
+    if (fmt == 10 || fmt == 11 || fmt == 14 || bd_fmt(fmt)) ((float *)sptr)[0] = 1.0f;   /* float weights, blocks: no scales */
     else memcpy(sptr, scales, sfl * sizeof(float));
     *out = t;
     return 1;
@@ -1818,6 +2212,53 @@ static int upload_tensor_pool(VkWPool *P, ColiVkTensor **out, const void *weight
 static int upload_tensor(ColiVkTensor **out, const void *weights, const float *scales,
                          int fmt, int I, int O, int gs) {
     return upload_tensor_pool(&g_wpool, out, weights, scales, fmt, I, O, gs);
+}
+
+/* ---- the block formats' table (shaders/blockdec_table.h) --------------------------
+ * One per device, made at the first block-format tensor and bound in the place of every
+ * block-format tensor's scales, which those formats do not have (sbuf_of). */
+static ColiVkTensor *g_bdtab[2];
+static pthread_mutex_t g_bdtab_mx = PTHREAD_MUTEX_INITIALIZER;
+static int bd_dev_ready(int dev);   /* after G2 */
+static uint32_t g_vq2_words[BDT_WORDS - BDT_VQ2];   /* coli_vk_set_vq2_books */
+/* the table's buffer on device dev, made now if it is not there yet; NULL handle when
+ * the device has no room for it (no block format goes there then) */
+static VkBuffer bdtab_buf(int dev) {
+    ColiVkTensor *t = __atomic_load_n(&g_bdtab[dev], __ATOMIC_ACQUIRE);
+    if (t) return t->wbuf;
+    pthread_mutex_lock(&g_bdtab_mx);
+    if (!g_bdtab[dev] && bd_dev_ready(dev)) {
+        uint32_t *w = malloc((size_t)BDT_WORDS * 4);
+        ColiVkTensor *n = NULL;
+        if (w) { bdtab_fill(w, g_vq2_words); upload_tensor_pool(dev ? &g_wpool2 : &g_wpool, &n, w, NULL, 10, BDT_WORDS, 1, 0); free(w); }
+        __atomic_store_n(&g_bdtab[dev], n, __ATOMIC_RELEASE);
+    }
+    t = g_bdtab[dev];
+    pthread_mutex_unlock(&g_bdtab_mx);
+    return t ? t->wbuf : VK_NULL_HANDLE;
+}
+static void bdtab_free(int dev) {
+    if (g_bdtab[dev]) { tensor_release(g_bdtab[dev]); g_bdtab[dev] = NULL; }
+}
+/* The block formats run in shaders of their own (qmatmul_bd.spv, qmatmul_gate_up_bd.spv
+ * beside the main shader, the expert batch's p_mv_bd / p_gu_bd): every other matrix keeps
+ * qmatmul.spv and qmatmul_gate_up.spv as they were. 1 when both files are there; without
+ * them no block-format tensor is made (the engines then give the tier int8). */
+static int bd_shaders(void) {
+    static int v = -1;
+    if (v >= 0 || !G.ready) return v > 0;
+    char a[1100], b[1100];
+    derive_sibling(G.spv_path, "_bd.spv", a, sizeof a); derive_sibling(G.spv_path, "_gate_up_bd.spv", b, sizeof b);
+    FILE *fa = fopen(a, "rb"), *fb = fopen(b, "rb");
+    v = fa && fb;
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    return v;
+}
+/* what a tensor's scales binding names: the table for a block format, else its scales */
+static VkBuffer sbuf_of(const ColiVkTensor *t) {
+    if (bd_fmt(t->fmt)) { VkBuffer b = bdtab_buf(t->dev); if (b) return b; }
+    return t->sbuf;
 }
 
 /* Upload a resident tensor without computing (for the expert tier: gate/up/down are
@@ -1974,6 +2415,11 @@ int coli_vk_tensor_import(ColiVkTensor **tensor, const void *weights, size_t all
  * then fall back to the blocking wait. The spinning thread is stalled on the
  * GPU result anyway. COLI_VK_SPIN_US=0 restores the pure blocking wait. */
 static long g_vk_spin_us = -1;
+/* The blocked wait's limit before the device counts as lost: 10 s tells a GPU that
+ * hangs. A software device (llvmpipe) generates a shader's code at its first launch,
+ * inside the wait, and caches it on disk: on a CI runner's empty cache the block-format
+ * GEMVs' first batch (qmatmul*_bd.spv) took longer than that, and the tier was given up
+ * for a compile. There a wait runs up to 5 minutes, as the chain's frames do. */
 static VkResult vk_fence_wait_us(VkDevice dev, VkFence f, long spin_us) {
     if (spin_us > 0) {
         double t0 = vk_now();
@@ -1982,7 +2428,7 @@ static VkResult vk_fence_wait_us(VkDevice dev, VkFence f, long spin_us) {
             if (r != VK_NOT_READY) return r;   /* VK_SUCCESS or a real error */
         } while ((vk_now() - t0) * 1000.0 < (double)spin_us);
     }
-    return vkWaitForFences(dev, 1, &f, VK_TRUE, 10000000000ULL);
+    return vkWaitForFences(dev, 1, &f, VK_TRUE, g_vk_software && dev == G.dev ? 300000000000ULL : 10000000000ULL);
 }
 static long vk_spin_us(void) {
     if (g_vk_spin_us < 0) {
@@ -2028,8 +2474,8 @@ static void vk_prof_paths(void) {
  * boundaries on its staged steps (one group scale per step). */
 static int coop_fmt(const ColiVkTensor *t) {
     int gs = t->fmt == 5 ? 64 : t->gs;
-    return t->fmt == 1 || t->fmt == 2 ||
-           ((t->fmt == 4 || t->fmt == 5 || t->fmt == 7 || t->fmt == 12) && gs % G.coop_t[0].bk == 0);
+    return !t->wide && (t->fmt == 1 || t->fmt == 2 ||
+           ((t->fmt == 4 || t->fmt == 5 || t->fmt == 7 || t->fmt == 12) && gs % G.coop_t[0].bk == 0));
 }
 /* Its x upload: the rows, then their powers of two rs[s] = 2^(15-e) with
  * max|x[s,:]| < 2^e, so a scaled row stays under 2^15 (fp16 max 65504) and its hi/lo
@@ -2058,6 +2504,11 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
                    const void *weights, const float *scales,
                    int fmt, int S, int I, int O, int gs) {
     if (!G.ready || S < 1 || !upload_tensor(tensor, weights, scales, fmt, I, O, gs)) return 0;
+    /* A block format (a GGUF's ggml type, colibri's low-bit experts) has no shader here: its
+     * GEMVs are the expert batch's and the chain's (qmatmul_bd.spv, chain_gemv_bd.spv), and
+     * qmatmul.spv read its rows as zeros, returning 1. The tensor stays up for those; the
+     * caller's CPU path computes this one. */
+    if (bd_fmt(fmt)) return 0;
     ColiVkTensor *t = *tensor;
     /* VK_PROF=1: phase split of the dense per-call cost, printed every 8192 calls —
      * separates our code (memcpy/desc/record) from the driver (submit) and the GPU
@@ -2087,7 +2538,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
         VkDescriptorBufferInfo bi[4] = {
             {.buffer = G.x.buf, .range = VK_WHOLE_SIZE},
             {.buffer = t->wbuf, .range = VK_WHOLE_SIZE},
-            {.buffer = t->sbuf, .range = VK_WHOLE_SIZE},
+            {.buffer = sbuf_of(t), .range = VK_WHOLE_SIZE},
             {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
         VkWriteDescriptorSet w[4];
         for (int i = 0; i < 4; i++) w[i] = (VkWriteDescriptorSet){
@@ -2255,9 +2706,15 @@ static double dho_rss_gib(void) {
 #endif
 }
 static void dho_exit_report(void) {
+#ifdef __GLIBC__
+    /* what this process holds, not what glibc kept of what it freed: without the trim the
+     * same run on Lavapipe read anywhere from 0.547 to 0.594 GiB (LLVM's and the load's
+     * freed blocks), which the gates comparing two runs took for the host copies */
+    malloc_trim(0);
+#endif
     double rss = dho_rss_gib();
     char r[48] = "";
-    if (rss >= 0) snprintf(r, sizeof r, "; RSS %.2f GiB", rss);
+    if (rss >= 0) snprintf(r, sizeof r, "; RSS %.3f GiB", rss);   /* to the MiB: the gates compare tens of MiB */
     if (!g_dho) {   /* the same line with the host copies kept, for a comparison of the two */
         fprintf(stderr, "[VK] %s: dense weights at exit: on the device and in host RAM%s\n", g_dho_engine, r);
         return;
@@ -2324,7 +2781,7 @@ void coli_vk_dense_host_placed(const char *engine, const char *kept) {
     if (!g_dho) return;
     double rss = dho_rss_gib();
     char r[48] = "";
-    if (rss >= 0) snprintf(r, sizeof r, "; RSS now %.2f GiB", rss);
+    if (rss >= 0) snprintf(r, sizeof r, "; RSS now %.3f GiB", rss);
     char a[32], ln[96];
     fprintf(stderr, "[VK] %s: %llu dense matrices on the device only, %s of host RAM given back%s%s%s%s\n",
             engine, __atomic_load_n(&g_dho_drop_n, __ATOMIC_RELAXED),
@@ -2353,7 +2810,9 @@ unsigned long long coli_vk_dense_host_dropped_bytes(void) { return __atomic_load
  *   and prefill, 9.5 against 12.2 s); qwen38 OFF (its chain won prefill, 30.1 against
  *   38.7 s, and lost decode, 3.2 against 3.8 tok/s: the device's GEMV at the GPU's
  *   800 MHz floor is slower than the CPU's int8 one on a 4.3 GB trunk; prompts only
- *   still lost 5% of decode, the trunk's device copy taking from the tier's budget).
+ *   still lost 5% of decode, the trunk's device copy taking from the tier's budget),
+ *   and ON on a Radeon 8060S, which has 40 compute units (coli_vk_device_igpu_many_cu): it
+ *   decoded 17.4 tok/s against 8.3 with the trunk on the CPU.
  *   olmoe ON (OLMoE-1B-7B: the chain decoded 17.3 against 12.8 tok/s and prefilled 512
  *   tokens in 5.5 against 6.4 s; the CPU alone decodes 23.1 tok/s, its trunk being f32).
  *   inkling passes COLI_VK_CHAIN_UNMEASURED (no checkpoint of it runs on the box).
@@ -2390,9 +2849,19 @@ int coli_vk_chain_decide(const char *engine, int tier_on, int igpu) {
     return on;
 }
 
+/* #2289: a COLI_VULKAN set in another console left a Vulkan build on the CPU without a
+ * word. The build says the device stays unused, and why, once a process. */
+void coli_vk_say_unused(const char *engine) {
+    static int said;
+    const char *on = getenv("COLI_VULKAN");
+    if (said++) return;
+    fprintf(stderr, "[VK] %s: %s: the Vulkan device stays unused (COLI_VULKAN=1 uses it)\n", engine,
+            on && *on ? "COLI_VULKAN=0" : "COLI_VULKAN is not set");
+}
+
 int coli_vk_init_env_tier(const char *engine, int tier_on) {
     const char *on = getenv("COLI_VULKAN");
-    if (!on || !atoi(on)) return 0;
+    if (!on || !atoi(on)) { coli_vk_say_unused(engine); return 0; }
     char buf[1024];
     const char *spv = coli_vk_shader_path(buf, sizeof buf);
     int ok = coli_vk_init(spv) && coli_vk_available();
@@ -2422,8 +2891,8 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
 
     VkDescriptorBufferInfo bi[6] = {
         {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = tg->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = tg->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = tu->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = tu->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.h.buf, .range = VK_WHOLE_SIZE}};
+        {.buffer = sbuf_of(tg), .range = VK_WHOLE_SIZE}, {.buffer = tu->wbuf, .range = VK_WHOLE_SIZE},
+        {.buffer = sbuf_of(tu), .range = VK_WHOLE_SIZE}, {.buffer = G.h.buf, .range = VK_WHOLE_SIZE}};
     VkWriteDescriptorSet w[6];
     for (int i = 0; i < 6; i++) w[i] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = G.dset_gu,
@@ -2511,12 +2980,12 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
         VkDeviceSize xo = (VkDeviceSize)off[c]*D*4, ho = (VkDeviceSize)off[c]*I*4, yo = (VkDeviceSize)off[c]*D*4;
         VkDescriptorBufferInfo gi[6] = {
             {G.eg_x.buf, xo, (VkDeviceSize)rows[c]*D*4}, {gates[c]->wbuf, 0, VK_WHOLE_SIZE},
-            {gates[c]->sbuf, 0, VK_WHOLE_SIZE}, {ups[c]->wbuf, 0, VK_WHOLE_SIZE},
-            {ups[c]->sbuf, 0, VK_WHOLE_SIZE}, {G.eg_h.buf, ho, (VkDeviceSize)rows[c]*I*4}};
+            {sbuf_of(gates[c]), 0, VK_WHOLE_SIZE}, {ups[c]->wbuf, 0, VK_WHOLE_SIZE},
+            {sbuf_of(ups[c]), 0, VK_WHOLE_SIZE}, {G.eg_h.buf, ho, (VkDeviceSize)rows[c]*I*4}};
         wr_desc(G.eg_gu[c], 6, gi);
         VkDescriptorBufferInfo di[4] = {
             {G.eg_h.buf, ho, (VkDeviceSize)rows[c]*I*4}, {downs[c]->wbuf, 0, VK_WHOLE_SIZE},
-            {downs[c]->sbuf, 0, VK_WHOLE_SIZE}, {G.eg_y.buf, yo, (VkDeviceSize)rows[c]*D*4}};
+            {sbuf_of(downs[c]), 0, VK_WHOLE_SIZE}, {G.eg_y.buf, yo, (VkDeviceSize)rows[c]*D*4}};
         wr_desc(G.eg_dn[c], 4, di);
     }
     if (G.eg_prof) G.eg_t2 = vk_now();
@@ -2567,9 +3036,9 @@ int coli_vk_expert_group_issue(ColiVkTensor *const *gates, ColiVkTensor *const *
 int coli_vk_expert_group_take(float *y) {
     if (!G.eg_inflight) return 0;
     G.eg_inflight = 0;
-    if (vk_fence_wait(G.dev, G.eg_fence) != VK_SUCCESS) {
+    if (vk_fence_wait(G.dev, G.eg_fence) != VK_SUCCESS) {   /* no async_end: the group may still run */
         fprintf(stderr, "[VK] expert-group fence wait failed — disabling GPU offload\n");
-        G.ready = 0; async_end(0); return 0;
+        G.ready = 0; return 0;
     }
     async_end(0);
     double t4 = G.eg_prof ? vk_now() : 0;
@@ -2641,7 +3110,10 @@ static int scratch_reserve_d2(Scratch *s, size_t bytes, uint32_t memtype) {
     return 1;
 }
 static VkDevice pool_device(const VkWPool *P) { return P->dev ? G2.dev : G.dev; }
+static int bd_dev_ready(int dev) { return dev ? G2.ready : G.ready; }
+static int pool_staged(const VkWPool *P) { return g_up[P->dev].on && !P->host; }
 static uint32_t pool_memtype(const VkWPool *P) {
+    if (P->host) return (uint32_t)G.memtype_sys;
     return g_up[P->dev].on ? g_up[P->dev].mt_dev : P->dev ? G2.memtype : G.memtype;
 }
 /* An upload's fence failed: the device is gone, as for any other wait. */
@@ -2651,7 +3123,7 @@ static void up_lost(int dev) {
     /* another thread (the tier's uploader) may be the one that finds out */
     if (dev) __atomic_store_n(&G2.ready, 0, __ATOMIC_RELEASE); else __atomic_store_n(&G.ready, 0, __ATOMIC_RELEASE);
 }
-static int pool_has_prio(const VkWPool *P) { return P->dev ? 0 : G.has_prio; }
+static int pool_has_prio(const VkWPool *P) { return P->dev || P->host ? 0 : G.has_prio; }
 static int upload_tensor_d2(ColiVkTensor **out, const void *weights, const float *scales,
                             int fmt, int I, int O, int gs) {
     return upload_tensor_pool(&g_wpool2, out, weights, scales, fmt, I, O, gs);
@@ -2732,11 +3204,11 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
     vk_mem_device(1, G2.phys, G2.dev);
     vk_pool_blocks(1);
     vkGetDeviceQueue(G2.dev, G2.qfam, 0, &G2.queue);
-    int mt = pick_memtype(G2.phys);
+    int mt = pick_memtype(G2.phys, COLI_VK_MEM_CPU_WRITES);
     if (mt < 0) { fprintf(stderr, "[VK] dev2: no host-visible memory\n"); return 0; }
     G2.memtype = (uint32_t)mt;
-    G2.memtype_cached = (uint32_t)pick_memtype_cached(G2.phys);
-    G2.memtype_dev = (uint32_t)pick_memtype_device(G2.phys);
+    G2.memtype_cached = (uint32_t)pick_memtype(G2.phys, COLI_VK_MEM_CPU_READS);
+    G2.memtype_dev = (uint32_t)pick_memtype(G2.phys, COLI_VK_MEM_GPU_ONLY);
     {   /* the expert batch's limits on this device, as coli_vk_init reads them for G */
         VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(G2.phys, &pp);
         G2.ssbo_align = (size_t)pp.limits.minStorageBufferOffsetAlignment;
@@ -2757,7 +3229,7 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
         }
     }
     /* its experts as device 0's: staged uploads by the same rule, on its one queue */
-    if (place_decide(G2.phys, mt, &g_up[1])) {
+    if (place_decide(G2.phys, mt, &g_up[1], 0)) {
         VkUp *u = &g_up[1];
         u->dev = G2.dev; u->q = G2.queue; u->fam = G2.qfam; u->shared = 1;
         u->fams[0] = G2.qfam; u->nfams = 1;
@@ -2802,19 +3274,7 @@ int coli_vk_mem_budget2(double *used_gb, double *budget_gb) {
     }
 #ifdef VK_EXT_memory_budget
     if (!G2.has_budget || !G2.phys) return 0;
-    VkPhysicalDeviceMemoryBudgetPropertiesEXT bud = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
-    VkPhysicalDeviceMemoryProperties2 mp2 = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bud};
-    vkGetPhysicalDeviceMemoryProperties2(G2.phys, &mp2);
-    double u = 0, b = 0;
-    for (uint32_t i = 0; i < mp2.memoryProperties.memoryHeapCount; i++)
-        if (mp2.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
-            u += (double)bud.heapUsage[i]; b += (double)bud.heapBudget[i];
-        }
-    if (used_gb) *used_gb = u / 1e9;
-    if (budget_gb) *budget_gb = b / 1e9;
-    return b > 0;
+    return vk_device_budget(G2.phys, used_gb, budget_gb);
 #else
     (void)used_gb; (void)budget_gb; return 0;
 #endif
@@ -2843,14 +3303,8 @@ int coli_vk_dev_info(int dev, ColiVkDevInfo *o) {
         return 1;
     }
     if (dev != 1 || !G2.ready) return 0;
-    VkPhysicalDeviceMemoryProperties mp;
-    vkGetPhysicalDeviceMemoryProperties(G2.phys, &mp);
-    VkDeviceSize m = 0;
-    for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
-        if ((mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mp.memoryHeaps[i].size > m) m = mp.memoryHeaps[i].size;
-    if (g_mem.cap[1] && g_mem.cap[1] < m) m = g_mem.cap[1];   /* COLI_VK_DEVICE_CAP_MB */
     o->name = G2.name; o->integrated = G2.integrated; o->shares_ram = G2.shares_ram;
-    o->local_bytes = (size_t)m; o->buf_align = G2.buf_align;
+    o->local_bytes = vk_device_memory_bytes(G2.phys, 1); o->buf_align = G2.buf_align;
     double u = 0, b = 0;
     o->has_budget = coli_vk_mem_budget2(&u, &b);
     size_t held = (size_t)__atomic_load_n(&g_mem.used[1], __ATOMIC_RELAXED);
@@ -2863,6 +3317,70 @@ int coli_vk_dev_info(int dev, ColiVkDevInfo *o) {
 int coli_vk_tensor_ensure2(ColiVkTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int grp) {
     if (!G2.ready) return 0;
     return upload_tensor_d2(tensor, weights, scales, fmt, I, O, grp);
+}
+
+/* ---- f32 matrices that are bf16 or f16 widened -------------------------------------
+ * Engines keep their dense matrices as f32 on the host, read from bf16 or f16
+ * checkpoints. From bf16 every float has a zero low half; from f16 every float is one an
+ * f16 holds exactly. Either way a 2-byte device copy holds the same values in half the
+ * bytes: fmt 11 (bf16) or fmt 14 (f16). OLMoE-1B-7B's dense part takes 0.75 GB of VRAM
+ * instead of 1.5. A matrix with any other float stays fmt 10. */
+/* f32 bits an f16 holds exactly: a normal half (10 bits of mantissa), a subnormal one
+ * (k * 2^-24, k < 1024), a zero, an infinity, or a NaN whose payload fits */
+static int f32_is_f16(uint32_t u) {
+    const uint32_t a = u & 0x7fffffffu, m = a & 0x7fffffu;
+    const int e = (int)(a >> 23) - 127;
+    if (!a) return 1;
+    if (e == 128) return (m & 0x1fffu) == 0;
+    if (e > 15 || e < -24) return 0;
+    if (e >= -14) return (m & 0x1fffu) == 0;
+    return ((m | 0x800000u) & ((1u << (-1 - e)) - 1)) == 0;   /* subnormal: k = sig >> (-1 - e) */
+}
+/* the f16 of such bits */
+static uint16_t f32_to_f16_exact(uint32_t u) {
+    const uint16_t sign = (uint16_t)((u >> 16) & 0x8000u);
+    const uint32_t a = u & 0x7fffffffu, m = a & 0x7fffffu;
+    const int e = (int)(a >> 23) - 127;
+    if (!a) return sign;
+    if (e == 128) return (uint16_t)(sign | 0x7c00u | (m >> 13));
+    if (e >= -14) return (uint16_t)(sign | ((uint32_t)(e + 15) << 10) | (m >> 13));
+    return (uint16_t)(sign | ((m | 0x800000u) >> (-1 - e)));
+}
+int coli_vk_f32_fmt(const float *w, size_t n) {
+    const uint32_t *u = (const uint32_t *)w;
+    int bf16 = 1, f16 = 1;
+    for (size_t i = 0; i < n && (bf16 || f16); i++) {
+        if (u[i] & 0xffffu) bf16 = 0;
+        if (f16 && !f32_is_f16(u[i])) f16 = 0;
+    }
+    return bf16 ? 11 : f16 ? 14 : 10;
+}
+size_t coli_vk_f32_payload(const float *w, int I, int O) {
+    return coli_vk_tensor_payload(w ? coli_vk_f32_fmt(w, (size_t)I * O) : 10, I, O, 0);
+}
+int coli_vk_tensor_ensure_f32(ColiVkTensor **tensor, const float *w, int I, int O, int dev2) {
+    if (*tensor) {
+        const int f = (*tensor)->fmt;
+        return (f == 10 || f == 11 || f == 14) && (*tensor)->I == I && (*tensor)->O == O;
+    }
+    if (!w) return 0;
+    size_t n = (size_t)I * O;
+    const int fmt = coli_vk_f32_fmt(w, n);
+    if (fmt == 10)
+        return dev2 ? coli_vk_tensor_ensure2(tensor, w, NULL, 10, I, O, 0) : coli_vk_tensor_ensure(tensor, w, NULL, 10, I, O, 0);
+    uint16_t *h = malloc(n * sizeof *h);
+    if (!h) return 0;
+    const uint32_t *u = (const uint32_t *)w;
+    if (fmt == 11) for (size_t i = 0; i < n; i++) h[i] = (uint16_t)(u[i] >> 16);
+    else           for (size_t i = 0; i < n; i++) h[i] = f32_to_f16_exact(u[i]);
+    /* the uploads are done when they return (staged ones wait for their copies) */
+    int ok = dev2 ? coli_vk_tensor_ensure2(tensor, h, NULL, fmt, I, O, 0) : coli_vk_tensor_ensure(tensor, h, NULL, fmt, I, O, 0);
+    free(h);
+    return ok;
+}
+int coli_vk_matmul_f32(ColiVkTensor **tensor, float *y, const float *x, const float *w, int S, int I, int O) {
+    if (!G.ready || !coli_vk_tensor_ensure_f32(tensor, w, I, O, 0)) return 0;
+    return coli_vk_matmul(tensor, y, x, NULL, NULL, (*tensor)->fmt, S, I, O, 0);
 }
 
 /* dev2 mirror of eg_prepare_submit: identical structure on G2's pipelines/scratches. */
@@ -2906,12 +3424,12 @@ static int eg2_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
         VkDeviceSize xo = (VkDeviceSize)off[c]*D*4, ho = (VkDeviceSize)off[c]*I*4, yo = (VkDeviceSize)off[c]*D*4;
         VkDescriptorBufferInfo gi[6] = {
             {G2.x.buf, xo, (VkDeviceSize)rows[c]*D*4}, {gates[c]->wbuf, 0, VK_WHOLE_SIZE},
-            {gates[c]->sbuf, 0, VK_WHOLE_SIZE}, {ups[c]->wbuf, 0, VK_WHOLE_SIZE},
-            {ups[c]->sbuf, 0, VK_WHOLE_SIZE}, {G2.h.buf, ho, (VkDeviceSize)rows[c]*I*4}};
+            {sbuf_of(gates[c]), 0, VK_WHOLE_SIZE}, {ups[c]->wbuf, 0, VK_WHOLE_SIZE},
+            {sbuf_of(ups[c]), 0, VK_WHOLE_SIZE}, {G2.h.buf, ho, (VkDeviceSize)rows[c]*I*4}};
         wr_desc_dev(G2.dev, G2.gu[c], 6, gi);
         VkDescriptorBufferInfo di[4] = {
             {G2.h.buf, ho, (VkDeviceSize)rows[c]*I*4}, {downs[c]->wbuf, 0, VK_WHOLE_SIZE},
-            {downs[c]->sbuf, 0, VK_WHOLE_SIZE}, {G2.y.buf, yo, (VkDeviceSize)rows[c]*D*4}};
+            {sbuf_of(downs[c]), 0, VK_WHOLE_SIZE}, {G2.y.buf, yo, (VkDeviceSize)rows[c]*D*4}};
         wr_desc_dev(G2.dev, G2.dn[c], 4, di);
     }
     if (G.eg_prof) { tA = vk_now(); q_desc += tA - t0; t0 = tA; }
@@ -2957,9 +3475,9 @@ int coli_vk_expert_group_issue2(ColiVkTensor *const *gates, ColiVkTensor *const 
 int coli_vk_expert_group_take2(float *y) {
     if (!G2.inflight) return 0;
     G2.inflight = 0;
-    if (vk_fence_wait(G2.dev, G2.fence) != VK_SUCCESS) {
+    if (vk_fence_wait(G2.dev, G2.fence) != VK_SUCCESS) {   /* no async_end: the group may still run */
         fprintf(stderr, "[VK] dev2 expert-group fence wait failed — disabling dev2 offload\n");
-        G2.ready = 0; async_end(1); return 0;
+        G2.ready = 0; return 0;
     }
     async_end(1);
     memcpy(y, G2.y.ptr, G2.pending_yb);
@@ -3056,10 +3574,7 @@ static int alloc_dev(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem) {
                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 }
 
-int coli_vk_kv_ensure(int layer, int max_rows, int K, int Rd) {
-    if (!G.ready || layer < 0 || layer >= VK_KV_LAYERS || max_rows < 1 || K < 1 || Rd < 1) return 0;
-    VkKvLayer *v = &G.kv[layer];
-    if (v->bl) return v->rows >= max_rows && v->K == K && v->R == Rd;  /* resize goes through coli_vk_kv_reset */
+static int kv_layer_alloc(VkKvLayer *v, int max_rows, int K, int Rd) {
     float p0 = G.prio; G.prio = 1.0f;            /* KV mirror rides every attention submit */
     int ok1, ok;
     if (g_up[0].on) {   /* staged: device-local, the rows through PW */
@@ -3076,6 +3591,43 @@ int coli_vk_kv_ensure(int layer, int max_rows, int K, int Rd) {
     }
     v->rows = max_rows; v->K = K; v->R = Rd;
     return 1;
+}
+static void kv_layer_free(VkKvLayer *v) {
+    if (v->bl && G.ready) {   /* dead device: leak GPU handles like coli_vk_tensor_free */
+        vkDestroyBuffer(G.dev, v->bl, NULL); vkFreeMemory(G.dev, v->ml, NULL);
+        vkDestroyBuffer(G.dev, v->br, NULL); vkFreeMemory(G.dev, v->mr, NULL);
+    }
+    memset(v, 0, sizeof(*v));
+}
+int coli_vk_kv_ensure(int layer, int max_rows, int K, int Rd) {
+    if (!G.ready || layer < 0 || layer >= VK_KV_LAYERS || max_rows < 1 || K < 1 || Rd < 1) return 0;
+    VkKvLayer *v = &G.kv[layer];
+    if (v->bl) return v->rows >= max_rows && v->K == K && v->R == Rd;  /* resize goes through coli_vk_kv_reset */
+    return kv_layer_alloc(v, max_rows, K, Rd);
+}
+/* The least rows a layer's mirror could not get (0: none yet): no mirror that large is
+ * asked for again until coli_vk_kv_reset, so a full device costs one refusal, not one
+ * per layer and token. */
+static int g_kv_refused;
+int coli_vk_kv_grow(int layer, int need, int max_rows, int K, int Rd) {
+    if (!G.ready || layer < 0 || layer >= VK_KV_LAYERS || need < 1 || max_rows < need || K < 1 || Rd < 1) return 0;
+    VkKvLayer *v = &G.kv[layer];
+    if (v->bl && v->rows >= need && v->K == K && v->R == Rd) return 1;
+    int cap = 256;
+    while (cap < need) cap *= 2;
+    if (cap > max_rows) cap = max_rows;
+    if (g_kv_refused && cap >= g_kv_refused) return 0;
+    /* the old rows go first (their pending copies with them): the new size needs the room */
+    if (v->bl) { if (PW.n && !pw_flush()) return 0; kv_layer_free(v); }
+    PW.last1[layer] = 0;
+    if (!kv_layer_alloc(v, cap, K, Rd)) {
+        if (!g_kv_refused)
+            fprintf(stderr, "[VK] attention KV mirror: no room on the device for %d rows a layer (layer %d); a layer "
+                            "whose rows do not fit computes its attention on the CPU\n", cap, layer);
+        g_kv_refused = cap;
+        return 0;
+    }
+    return 2;
 }
 
 /* Mirror one host cache row into the device copy (write-combined memory: the CPU
@@ -3099,15 +3651,8 @@ int coli_vk_kv_row(int layer, int pos, const float *L, const float *R) {
 /* Drop all per-layer KV device caches (cache resize in kv_alloc). */
 void coli_vk_kv_reset(void) {
     if (PW.n) pw_flush();   /* nothing pending may name a buffer that goes */
-    for (int i = 0; i < VK_KV_LAYERS; i++) {
-        VkKvLayer *v = &G.kv[i];
-        if (!v->bl) continue;
-        if (G.ready) {   /* dead device: leak GPU handles like coli_vk_tensor_free */
-            vkDestroyBuffer(G.dev, v->bl, NULL); vkFreeMemory(G.dev, v->ml, NULL);
-            vkDestroyBuffer(G.dev, v->br, NULL); vkFreeMemory(G.dev, v->mr, NULL);
-        }
-        memset(v, 0, sizeof(*v));
-    }
+    for (int i = 0; i < VK_KV_LAYERS; i++) if (G.kv[i].bl) kv_layer_free(&G.kv[i]);
+    g_kv_refused = 0;
 }
 
 /* Decode MLA absorption core for S causal query rows of one sequence, one submit:
@@ -3133,7 +3678,7 @@ int coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc,
 
     VkDescriptorBufferInfo bi[7] = {
         {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = t->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = t->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = kv->bl, .range = VK_WHOLE_SIZE},
+        {.buffer = sbuf_of(t), .range = VK_WHOLE_SIZE}, {.buffer = kv->bl, .range = VK_WHOLE_SIZE},
         {.buffer = kv->br, .range = VK_WHOLE_SIZE}, {.buffer = G.att_sc.buf, .range = VK_WHOLE_SIZE},
         {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
     VkWriteDescriptorSet wd[7];
@@ -3176,6 +3721,7 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
                         int fmt, const float *x, int S, int I, int grp) {
     if (!G.ready || S < 1) return 0;
     if (!upload_tensor(t1p, w1, s1, fmt, I, O1, grp) || !upload_tensor(t2p, w2, s2, fmt, I, O2, grp)) return 0;
+    if (bd_fmt(fmt)) return 0;   /* no block-format shader here (coli_vk_matmul) */
     ColiVkTensor *t1 = *t1p, *t2 = *t2p;
     size_t xb = (size_t)S * I * 4, yb1 = (size_t)S * O1 * 4, yb2 = (size_t)S * O2 * 4;
     if (!scratch_reserve(&G.x, xb) || !scratch_reserve_mt(&G.y, yb1, G.memtype_cached) ||
@@ -3193,10 +3739,10 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
     }
     VkDescriptorBufferInfo b1[4] = {
         {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = t1->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = t1->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
+        {.buffer = sbuf_of(t1), .range = VK_WHOLE_SIZE}, {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
     VkDescriptorBufferInfo b2[4] = {
         {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = t2->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = t2->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.y2.buf, .range = VK_WHOLE_SIZE}};
+        {.buffer = sbuf_of(t2), .range = VK_WHOLE_SIZE}, {.buffer = G.y2.buf, .range = VK_WHOLE_SIZE}};
     wr_desc(G.dset, 4, b1);
     wr_desc(G.dset_pair, 4, b2);
 
@@ -3269,16 +3815,16 @@ int coli_vk_attn_qprep(int layer,
 
     VkDescriptorBufferInfo b1[4] = {
         {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = tqa->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = tqa->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.qp1.buf, .range = VK_WHOLE_SIZE}};
+        {.buffer = sbuf_of(tqa), .range = VK_WHOLE_SIZE}, {.buffer = G.qp1.buf, .range = VK_WHOLE_SIZE}};
     VkDescriptorBufferInfo b2[4] = {
         {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = tkv->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = tkv->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.y2.buf, .range = VK_WHOLE_SIZE}};
+        {.buffer = sbuf_of(tkv), .range = VK_WHOLE_SIZE}, {.buffer = G.y2.buf, .range = VK_WHOLE_SIZE}};
     VkDescriptorBufferInfo bn[3] = {
         {.buffer = G.qp1.buf, .range = VK_WHOLE_SIZE}, {.buffer = G.lnbuf[layer], .range = VK_WHOLE_SIZE},
         {.buffer = G.qp2.buf, .range = VK_WHOLE_SIZE}};
     VkDescriptorBufferInfo b3[4] = {
         {.buffer = G.qp2.buf, .range = VK_WHOLE_SIZE}, {.buffer = tqb->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = tqb->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
+        {.buffer = sbuf_of(tqb), .range = VK_WHOLE_SIZE}, {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
     if (!G.pair_pool) {   /* the chain reuses the pair's 2nd matmul set */
         VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 4};
         VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -3363,7 +3909,7 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
 
     VkDescriptorBufferInfo bi[7] = {
         {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = t->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = t->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = kv->bl, .range = VK_WHOLE_SIZE},
+        {.buffer = sbuf_of(t), .range = VK_WHOLE_SIZE}, {.buffer = kv->bl, .range = VK_WHOLE_SIZE},
         {.buffer = kv->br, .range = VK_WHOLE_SIZE}, {.buffer = G.att_sc.buf, .range = VK_WHOLE_SIZE},
         {.buffer = G.att_ctx.buf, .range = VK_WHOLE_SIZE}};
     VkWriteDescriptorSet wd[7];
@@ -3374,7 +3920,7 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
     vkUpdateDescriptorSets(G.dev, 7, wd, 0, NULL);
     VkDescriptorBufferInfo oi[4] = {
         {.buffer = G.att_ctx.buf, .range = VK_WHOLE_SIZE}, {.buffer = to->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = to->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
+        {.buffer = sbuf_of(to), .range = VK_WHOLE_SIZE}, {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
     wr_desc(G.dset, 4, oi);
 
     VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
@@ -3445,7 +3991,7 @@ static void tensor_release(ColiVkTensor *t) {
     }
     // Mirror tensor_alloc exactly (rows + scales), atomically: frees run from
     // expert_load under `#pragma omp parallel` and from the tier's uploader.
-    size_t b = t->wbytes + scale_floats(t->fmt, t->I, t->O, t->gs) * sizeof(float);
+    size_t b = t->acct ? t->acct : t->wbytes + scale_floats(t->fmt, t->I, t->O, t->gs) * sizeof(float);
     __atomic_sub_fetch(&P->bytes, b, __ATOMIC_RELAXED);
     __atomic_sub_fetch(&P->tensors, 1, __ATOMIC_RELAXED);
     if (P->counted) {
@@ -3475,6 +4021,12 @@ static void tensor_reap(int dev) {
     pthread_mutex_unlock(&g_deferred_mx);
     while (mine) { ColiVkTensor *n = mine->next_free; tensor_release(mine); mine = n; }
 }
+/* A join whose wait fails does not call async_end. A wait that gives up (VK_TIMEOUT: a
+ * slow device, a loaded machine) does not stop the work, which may still be running and
+ * reading every tensor it names, so the device stays counted busy and its frees wait for
+ * the vkDeviceWaitIdle of the shutdown. #1988: a tier batch's wait timed out on Lavapipe,
+ * the tier's teardown at exit freed that batch's experts, and Lavapipe's queue thread,
+ * still running it, read freed memory. */
 static void async_end(int dev) {
     __atomic_sub_fetch(&g_async_inflight[dev], 1, __ATOMIC_ACQ_REL);
     tensor_reap(dev);
@@ -3493,7 +4045,8 @@ void coli_vk_tensor_free(ColiVkTensor *t) {
 }
 
 static VkWPool *pool_of(int which) {
-    return which == 1 ? &g_tpool : which == 2 ? &g_wpool2 : which == 3 ? &g_tpool2 : which == 4 ? &g_xpool : &g_wpool;
+    return which == 1 ? &g_tpool : which == 2 ? &g_wpool2 : which == 3 ? &g_tpool2 : which == 4 ? &g_xpool :
+           which == 5 ? &g_hpool : &g_wpool;
 }
 void coli_vk_pool_stats(int which, ColiVkPoolStats *st) {
     VkWPool *P = pool_of(which);
@@ -3511,8 +4064,10 @@ void coli_vk_pool_stats(int which, ColiVkPoolStats *st) {
 static void tier_pool_limit(VkWPool *P, size_t bytes) {
     pthread_mutex_lock(&P->mx);
     P->p.limit = bytes;
-    /* blocks no larger than the budget, so a small budget is not one refused block */
-    size_t bb = coli_vk_block_bytes_dev(P->dev, VK_WBLOCK);
+    /* blocks no larger than the budget, so a small budget is not one refused block; the host
+     * pool's are system RAM, which COLI_VK_DEVICE_CAP_MB does not shrink (under the cap its
+     * 2 MiB blocks held one expert each: Flint's 18.5 GB took 24.5 GiB) */
+    size_t bb = P->host ? VK_WBLOCK : coli_vk_block_bytes_dev(P->dev, VK_WBLOCK);
     P->p.block_bytes = bytes && bytes < bb ? ((bytes + 4095) & ~(size_t)4095) : bb;
     /* the empty block the pool keeps as a spare (vka_free) goes too: a tier started
      * again after a shutdown would otherwise fill it past its new, smaller budget */
@@ -3521,22 +4076,66 @@ static void tier_pool_limit(VkWPool *P, size_t bytes) {
     pthread_mutex_unlock(&P->mx);
 }
 void coli_vk_tier_pool_limit(size_t bytes) { tier_pool_limit(&g_tpool, bytes); }
-void coli_vk_tier_pool_limit_dev(int dev, size_t bytes) { tier_pool_limit(dev == 1 ? &g_tpool2 : &g_tpool, bytes); }
+void coli_vk_tier_pool_limit_dev(int dev, size_t bytes) { tier_pool_limit(dev == 2 ? &g_hpool : dev == 1 ? &g_tpool2 : &g_tpool, bytes); }
+int coli_vk_tier_pool_blocks(uint64_t *bytes, int max) {
+    VkWPool *P = &g_tpool;
+    pthread_mutex_lock(&P->mx);
+    const int nb = P->p.nb;
+    for (int k = 0; bytes && k < nb && k < max; k++) bytes[k] = P->p.b[k].present ? P->p.b[k].cap : 0;
+    pthread_mutex_unlock(&P->mx);
+    return nb;
+}
+int coli_vk_tier_host_pool(void) { return G.ready && G.has_bda && G.memtype_sys >= 0; }
+/* The room the driver leaves in the system-RAM heap the host pool lives in (G.memtype_sys's):
+ * its budget less its usage (VK_EXT_memory_budget), else the heap's size; 0 when unknown. The
+ * heap is not all the RAM: NVIDIA's on Linux is three quarters of it (46.9 of 62.6 GiB on an
+ * RTX PRO 4000's host), on Windows about half, and blocks past it are refused (#2314). */
+size_t coli_vk_tier_host_heap_room(void) {
+    if (!G.ready || !G.phys || G.memtype_sys < 0) return 0;
+    const char *t = getenv("COLI_VK_TIER_HOST_HEAP_GB");   /* tests: the room a driver would leave */
+    if (t && *t && atof(t) > 0) return (size_t)(atof(t) * 1073741824.0);
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(G.phys, &mp);
+    uint32_t hi = mp.memoryTypes[G.memtype_sys].heapIndex;
+#ifdef VK_EXT_memory_budget
+    if (G.has_budget) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT bud = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 mp2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bud};
+        vkGetPhysicalDeviceMemoryProperties2(G.phys, &mp2);
+        if (bud.heapBudget[hi]) return bud.heapBudget[hi] > bud.heapUsage[hi] ? (size_t)(bud.heapBudget[hi] - bud.heapUsage[hi]) : 0;
+    }
+#endif
+    return (size_t)mp.memoryHeaps[hi].size;
+}
 void coli_vk_tier_extra_pool_limit(size_t bytes) { tier_pool_limit(&g_xpool, bytes); }
 
 size_t coli_vk_tensor_bytes(const ColiVkTensor *t) { return t ? t->wbytes : 0; }
 
 /* Is the device we picked an integrated GPU? The backend already computes this
  * at device selection (see the deviceType ranking above) but only uses it to
- * rank candidates. The RAM planner needs it too: on an integrated GPU our
- * HOST_VISIBLE|DEVICE_LOCAL allocations are the same physical memory the host
- * expert cache draws from, so whoever sizes that cache has to know. Mirrors
+ * rank candidates. The RAM planner needs it too: on an integrated GPU the
+ * allocations of the backend are in the same physical memory as the host expert
+ * cache, so whoever sizes that cache has to know. Mirrors
  * coli_cuda_device_integrated() (#653) for the Vulkan path. */
 int coli_vk_device_integrated(void) {
-    if (!G.phys) return 0;
-    VkPhysicalDeviceProperties p;
-    vkGetPhysicalDeviceProperties(G.phys, &p);
-    return p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 1 : 0;
+    return G.phys ? vk_integrated(G.phys) : 0;
+}
+/* An integrated GPU with COLI_VK_IGPU_MANY_CU active compute units or more. A device without
+ * VK_AMD_shader_core_properties2 reports no count and is treated as having fewer. */
+int coli_vk_device_igpu_many_cu(void) {
+    return coli_vk_device_integrated() && G.compute_units >= COLI_VK_IGPU_MANY_CU;
+}
+/* The integer dot product on the primary device: 0 none, 1 supported, 2 accelerated. */
+int coli_vk_idot(void) { return G.dev ? G.has_idot : 0; }
+/* Timeline semaphores on the primary device. */
+int coli_vk_timeline(void) { return G.dev ? G.has_tsem : 0; }
+/* The host's view of a tensor in the tier's host pool: its rows (and scales) in system RAM,
+ * where the CPU can read them; NULL for any other tensor. */
+const void *coli_vk_tensor_host_rows(const ColiVkTensor *t, const void **scales) {
+    if (scales) *scales = NULL;
+    if (!t || !t->pool || !t->pool->host || !t->wmap) return NULL;
+    if (scales) *scales = t->smap;
+    return t->wmap;
 }
 /* An integrated GPU or a CPU device (Lavapipe): its "device memory" is host RAM. */
 int coli_vk_device_shares_ram(void) {
@@ -3545,16 +4144,9 @@ int coli_vk_device_shares_ram(void) {
     vkGetPhysicalDeviceProperties(G.phys, &p);
     return p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU || p.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
 }
-/* The largest DEVICE_LOCAL heap, for a budget when VK_EXT_memory_budget is absent. */
+/* The size of the device memory, for a budget when VK_EXT_memory_budget is absent. */
 size_t coli_vk_device_local_bytes(void) {
-    if (!G.phys) return 0;
-    VkPhysicalDeviceMemoryProperties mp;
-    vkGetPhysicalDeviceMemoryProperties(G.phys, &mp);
-    VkDeviceSize m = 0;
-    for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
-        if ((mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mp.memoryHeaps[i].size > m) m = mp.memoryHeaps[i].size;
-    if (g_mem.cap[0] && g_mem.cap[0] < m) m = g_mem.cap[0];   /* COLI_VK_DEVICE_CAP_MB */
-    return (size_t)m;
+    return G.phys ? vk_device_memory_bytes(G.phys, 0) : 0;
 }
 const char *coli_vk_device_name(void) {
     static VkPhysicalDeviceProperties p;
@@ -3600,6 +4192,25 @@ struct ColiVkExpert {
     ColiVkExpert *prev, *next;
     struct XbCtx *X;               /* the device's batch it belongs to */
 };
+/* An expert's three tensors (gate, up, down). */
+void coli_vk_xb_expert_tensors(const ColiVkExpert *e, ColiVkTensor **g, ColiVkTensor **u, ColiVkTensor **d) {
+    *g = e ? e->g : NULL; *u = e ? e->u : NULL; *d = e ? e->d : NULL;
+}
+int coli_vk_xb_expert_blocks(const ColiVkExpert *e, int *blk, int max) {
+    int n = 0;
+    const ColiVkTensor *t[3] = {e ? e->g : NULL, e ? e->u : NULL, e ? e->d : NULL};
+    for (int k = 0; k < 3; k++) {
+        if (!t[k] || t[k]->pool != &g_tpool) continue;
+        const VkaRange r[2] = {t[k]->wr, t[k]->sr};
+        for (int j = 0; j < 2; j++) {
+            if (!r[j].len) continue;
+            int seen = 0;
+            for (int q = 0; q < n; q++) seen |= blk[q] == r[j].block;
+            if (!seen && n < max) blk[n++] = r[j].block;
+        }
+    }
+    return n;
+}
 typedef struct { VkBuffer buf; VkDeviceMemory mem; void *ptr; size_t region; } XbBuf;
 typedef struct XbCtx {
     /* the device (0 = G, 1 = G2) and what the batch needs of it, set by xb_bind */
@@ -3614,10 +4225,12 @@ typedef struct XbCtx {
     int D, I, act; float limit, a, b;
     VkCommandPool cpool; VkCommandBuffer cmd; VkFence fence;
     VkQueryPool qpool; int has_ts;
-    VkShaderModule sh_act, sh_gu, sh_mv, sh_mm, sh_coop;
+    VkShaderModule sh_act, sh_gu, sh_mv, sh_mm, sh_coop, sh_gu_bd, sh_mv_bd, sh_mm_bd;
     VkDescriptorSetLayout dsl6, dsl4, dsl3;
     VkPipelineLayout pl6, pl4, pl3;
     VkPipeline p_gu, p_mv, p_act, p_mm[VK_GEMM_SLOTS], p_coop[VK_COOP_SLOTS];
+    VkPipeline p_gu_bd, p_mv_bd;   /* the block formats' GEMVs (bd_shaders), NULL without them */
+    VkPipeline p_mm_bd[64]; uint8_t mm_bd_tried[64];   /* their tiled GEMM (qmatmul_gemm_bd.spv), a pipeline per ggml type, made on first use */
     VkDescriptorPool *dpools; int ndpools;
     VkDescriptorPool act_pool; VkDescriptorSet act_set;
     XbBuf x, g, u, h, y;          /* x host-written, g/u/h device-only, y host-read */
@@ -3636,9 +4249,12 @@ typedef struct XbCtx {
     VkDescriptorPool v4_pool; VkDescriptorSet v4_set;
     /* sub-batches (coli_vk_xb_sub_*, the tier's big prefill steps): two halves of the
      * scratch, each with its own command buffer, fence and timestamps, up to two in flight */
-    struct { VkCommandBuffer cmd; VkFence fence; VkQueryPool qp; int inflight, nrows, cyoff; size_t *yoff; } sub[2];
+    /* cp: copies recorded at the head of a half's next submit (coli_vk_xb_sub_copy: the host
+     * pool's experts into the streaming's slots), ncp of them */
+    struct { VkCommandBuffer cmd; VkFence fence; VkQueryPool qp; int inflight, nrows, cyoff; size_t *yoff;
+             struct { VkBuffer s, d; VkDeviceSize n; } *cp; int ncp, ccp; } sub[2];
     size_t sub_x, sub_i, sub_y;           /* a half's bytes of each scratch (0: not reserved) */
-    unsigned long long sub_batches, sub_experts, sub_rows, sub_gemm;
+    unsigned long long sub_batches, sub_experts, sub_rows, sub_gemm, sub_copies;
     double sub_ms;
     /* The grouped GEMM (qmatmul_grp.comp, [0] down, [1] gate+up+SwiGLU): every expert of
      * a batch in one dispatch per phase, the weights read through an address table. The
@@ -3646,11 +4262,32 @@ typedef struct XbCtx {
      * (xb_grp_init). Tables and sets per batch that can be in flight: [0] the single
      * batch, [1 + h] sub-batch half h. */
     VkShaderModule sh_grp[2]; VkDescriptorSetLayout dsl_grp; VkPipelineLayout pl_grp;
+    /* the block formats' grouped GEMM (qmatmul_grp_bd.comp: [0] down, [1] gate+up), a pipeline
+     * per ggml type, made on first use; grp_bd: its shaders and the grouped sets are there */
+    VkShaderModule sh_grp_bd[2]; VkPipeline p_grp_bd[2][64]; uint8_t grp_bd_tried[2][64]; int grp_bd;
     VkPipeline p_grp[2]; VkDescriptorPool grp_pool; VkDescriptorSet grp_set[3][2];
     VkShaderModule sh_gv[2]; VkPipeline p_gv[2];   /* qmatmul_grp_gemv.comp: the same batches below grp_rows */
     XbBuf grp_it[3][2], grp_et[3][2], grp_map[3];
     int grp_rows;
+    int grp_q;   /* the grouped GEMM is qmatmul_grp_qc.comp (subgroups of 32): its tiles */
     unsigned long long grp_batches, gv_batches;
+    /* chain_moe_gv.comp, the dense chain's decode experts, for the experts of a batch below
+     * gemm_rows rows the grouped routes leave (xb_cgv_init, xb_cgv_record): a pipeline per
+     * format (1, 2, 4, 7) and pass (0 gate and up, 1 down), made on first use; per batch
+     * that can be in flight a set, its rows' table indices and its experts' entries */
+    VkShaderModule sh_cgv; VkDescriptorSetLayout dsl_cgv; VkPipelineLayout pl_cgv; VkDescriptorPool cgv_pool;
+    VkDescriptorSet cgv_set[3]; VkPipeline p_cgv[4][2]; int cgv_n[4][2];   /* the row width each was made for */
+    XbBuf cgv_ids[3], cgv_tab[3];
+    int cgv;
+    unsigned long long cgv_batches;
+    /* chain_moe.comp's block formats (a GGUF's experts), the dense chain's decode kernel, for
+     * a batch of experts of 4 rows or fewer (xb_cbd_record): a pipeline per (gate and up's
+     * type, down's type, staging), the hidden and output rows of each batch in flight */
+    VkShaderModule sh_cbd; VkDescriptorSetLayout dsl_cbd; VkPipelineLayout pl_cbd; VkDescriptorPool cbd_pool;
+    VkDescriptorSet cbd_set[3]; XbBuf cbd_ids[3], cbd_tab[3], cbd_h[3];
+    struct { int tg, td, xs; VkPipeline p; } cbd_p[64]; int cbd_np, cbd_xs;
+    int cbd;
+    unsigned long long cbd_batches;
     /* a big step's whole-step buffers (coli_vk_xb_step_*): its token rows once (xt), every
      * assignment's output row in place (ys, s*K + k), the routed sum (out) and its inputs */
     struct {
@@ -3663,8 +4300,9 @@ typedef struct XbCtx {
 } XbCtx;
 static XbCtx g_xb[2];
 static int xb_dev_ready(const XbCtx *X) { return X->d ? G2.ready : G.ready; }
+static int dev_pin_sg(VkDevice dev) { return dev == G.dev ? G.pin_sg : dev == G2.dev ? G2.pin_sg : 0; }
 struct PCV4 { int rows, n; };
-struct PCGRP { int I, O; float limit; int ibase; int kgat; int rpw; };   /* qmatmul_grp.comp, qmatmul_grp_gemv.comp (rpw) */
+struct PCGRP { int I, O; float limit; int ibase; int kgat; int rpw; int act; float a, b; };   /* qmatmul_grp.comp, qmatmul_grp_gemv.comp (rpw, act, a, b) */
 #define XB_GV_RPW 64   /* outputs per grouped-GEMV workgroup */
 #define XB_GRP_TT 4   /* 16-row tiles of an expert per workgroup: 64 rows (2, 4 or 8) */
 
@@ -3691,16 +4329,16 @@ static int xb_buf(XbCtx *X, XbBuf *b, size_t region, uint32_t memtype, int map) 
 static void xb_write_sets(ColiVkExpert *e) {
     XbCtx *X = e->X;
     VkDescriptorBufferInfo gu[6] = {
-        {X->x.buf, 0, X->x.region}, {e->g->wbuf, 0, VK_WHOLE_SIZE}, {e->g->sbuf, 0, VK_WHOLE_SIZE},
-        {e->u->wbuf, 0, VK_WHOLE_SIZE}, {e->u->sbuf, 0, VK_WHOLE_SIZE}, {X->h.buf, 0, X->h.region}};
+        {X->x.buf, 0, X->x.region}, {e->g->wbuf, 0, VK_WHOLE_SIZE}, {sbuf_of(e->g), 0, VK_WHOLE_SIZE},
+        {e->u->wbuf, 0, VK_WHOLE_SIZE}, {sbuf_of(e->u), 0, VK_WHOLE_SIZE}, {X->h.buf, 0, X->h.region}};
     VkDescriptorBufferInfo dn[4] = {
-        {X->h.buf, 0, X->h.region}, {e->d->wbuf, 0, VK_WHOLE_SIZE}, {e->d->sbuf, 0, VK_WHOLE_SIZE},
+        {X->h.buf, 0, X->h.region}, {e->d->wbuf, 0, VK_WHOLE_SIZE}, {sbuf_of(e->d), 0, VK_WHOLE_SIZE},
         {X->y.buf, 0, X->y.region}};
     VkDescriptorBufferInfo mg[4] = {
-        {X->x.buf, 0, X->x.region}, {e->g->wbuf, 0, VK_WHOLE_SIZE}, {e->g->sbuf, 0, VK_WHOLE_SIZE},
+        {X->x.buf, 0, X->x.region}, {e->g->wbuf, 0, VK_WHOLE_SIZE}, {sbuf_of(e->g), 0, VK_WHOLE_SIZE},
         {X->g.buf, 0, X->g.region}};
     VkDescriptorBufferInfo mu[4] = {
-        {X->x.buf, 0, X->x.region}, {e->u->wbuf, 0, VK_WHOLE_SIZE}, {e->u->sbuf, 0, VK_WHOLE_SIZE},
+        {X->x.buf, 0, X->x.region}, {e->u->wbuf, 0, VK_WHOLE_SIZE}, {sbuf_of(e->u), 0, VK_WHOLE_SIZE},
         {X->u.buf, 0, X->u.region}};
     VkWriteDescriptorSet w[18]; int n = 0;
     struct { VkDescriptorSet set; VkDescriptorBufferInfo *bi; int nb, d0, d1; } sets[4] = {
@@ -3750,21 +4388,37 @@ static int xb_reserve(XbCtx *X, size_t xr, size_t ir, size_t yr) {
     if (xr <= X->x.region && ir <= X->g.region && yr <= X->y.region) return 1;
     size_t nx, ni, ny;
     if (!xb_sizes(X, xr, ir, yr, &nx, &ni, &ny)) return 0;   /* one window cannot address it */
+    size_t ox = X->x.region, oi = X->g.region, oy = X->y.region;
     int ok = 1;
     if (nx != X->x.region) ok &= xb_buf(X, &X->x, nx, X->mt_host, 1);
     if (ni != X->g.region) ok &= xb_buf(X, &X->g, ni, X->mt_dev, 0) && xb_buf(X, &X->u, ni, X->mt_dev, 0) &&
                                  xb_buf(X, &X->h, ni, X->mt_dev, 0);
     if (ny != X->y.region) ok &= xb_buf(X, &X->y, ny, X->mt_cached, 1);
-    if (!ok) {   /* out of device memory: no batch from here on */
+    if (!ok) {
+        /* Out of device memory for the growth: the sizes before it back (the room its
+         * frees left), this step's experts on the CPU and the batch kept for the next. A
+         * step that needed more (an MTP head's prompt rows beside a full card) used to stop
+         * the tier for good. Only where the old sizes do not come back does the batch stop. */
+        XbBuf *bs[5] = {&X->x, &X->g, &X->u, &X->h, &X->y};
+        size_t old[5] = {ox, oi, oi, oi, oy};
+        uint32_t mt[5] = {X->mt_host, X->mt_dev, X->mt_dev, X->mt_dev, X->mt_cached};
+        int mp[5] = {1, 0, 0, 0, 1}, back = ox && oi && oy;
+        for (int k = 0; k < 5; k++)   /* every grown buffer freed first, so the old sizes have their room */
+            if (bs[k]->region != old[k] && bs[k]->buf) {
+                vkDestroyBuffer(X->dev, bs[k]->buf, NULL); vkFreeMemory(X->dev, bs[k]->mem, NULL); memset(bs[k], 0, sizeof *bs[k]);
+            }
+        for (int k = 0; k < 5 && back; k++) if (bs[k]->region != old[k]) back = xb_buf(X, bs[k], old[k], mt[k], mp[k]);
         fprintf(stderr, "[VK] %sexpert batch: scratch of %.1f MiB failed, %s\n", X->d ? "dev2 " : "",
-                (double)(nx + 3 * ni + ny) * 2 / 1048576.0, X->d ? "the second device stops" : "the tier stops");
-        X->ready = 0;
-        return 0;
+                (double)(nx + 3 * ni + ny) * 2 / 1048576.0,
+                back ? "this step's experts on the CPU (the batch keeps its scratch)"
+                     : X->d ? "the second device stops" : "the tier stops");
+        if (!back) { X->ready = 0; return 0; }
+        ok = 0;
     }
     for (ColiVkExpert *e = X->live; e; e = e->next) xb_write_sets(e);
     xb_write_act_set(X);
     if (X->v4_set) xb_write_v4_set(X);
-    return 1;
+    return ok;
 }
 
 static int xb_layout(XbCtx *X, int nbind, unsigned dynmask, size_t pc, VkDescriptorSetLayout *dsl, VkPipelineLayout *pl) {
@@ -3782,9 +4436,10 @@ static int xb_layout(XbCtx *X, int nbind, unsigned dynmask, size_t pc, VkDescrip
     return 1;
 }
 static int xb_pipeline(XbCtx *X, VkShaderModule sh, VkPipelineLayout pl, const VkSpecializationInfo *si, VkPipeline *pipe) {
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss;
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                  .module = sh, .pName = "main", .pSpecializationInfo = si}, .layout = pl};
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = pin_info(X->dev, &rss),
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = sh, .pName = "main", .pSpecializationInfo = si}, .layout = pl};
     VKCHECK(vkCreateComputePipelines(X->dev, VK_NULL_HANDLE, 1, &ci, NULL, pipe), "xb pipeline");
     return 1;
 }
@@ -3842,8 +4497,28 @@ static int xb_coop_slot(XbCtx *X, const ColiVkTensor *t, int rows, int gemm) {
 
 /* Keep each projection's format check: mixed gate/up/down quantization may make
  * only some projections eligible. Small verifies retain their scalar GEMV path. */
+/* qmatmul_gemm_bd.spv's pipeline for a block-format tensor (64 x 64 tiles), made on first
+ * use; NULL for a type it does not decode or a width that is not whole tiles of 64 */
+static VkPipeline xb_bdg_pipe(XbCtx *X, const ColiVkTensor *t) {
+    int ty = t->fmt - 100;
+    if (!X->sh_mm_bd || !bd_fmt(t->fmt) || ty < 0 || ty >= 64 || t->I % 64 ||
+        !(ty == 8 || ty == 10 || ty == 11 || ty == 12 || ty == 13 || ty == 14 || ty == 16 || ty == 17 || ty == 18 || ty == 19 || ty == 20 ||
+          ty == 21 || ty == 22 || ty == 23 || ty == 29 || ty == 42) ||
+        ((ty == 12 || ty == 13) && t->rowWords % 4)) return VK_NULL_HANDLE;
+    if (!X->mm_bd_tried[ty]) {
+        X->mm_bd_tried[ty] = 1;
+        int32_t v = ty;
+        VkSpecializationMapEntry me = {0, 0, 4};
+        VkSpecializationInfo si = {1, &me, 4, &v};
+        if (!xb_pipeline(X, X->sh_mm_bd, X->pl4, &si, &X->p_mm_bd[ty])) X->p_mm_bd[ty] = VK_NULL_HANDLE;
+    }
+    return X->p_mm_bd[ty];
+}
+#define XB_ROUTE_BDG 1000   /* route[c]: the experts' block formats through xb_bdg_pipe's GEMM */
+#define XB_ROUTE_CGV (-2)   /* route[c]: chain_moe_gv.comp with the batch's other small experts */
 static VkPipeline xb_mm_pipeline(XbCtx *X, const ColiVkTensor *t, int rows, int slot,
                                  int *bm, int *bn, int *cooperative) {
+    if (slot == XB_ROUTE_BDG) { *bm = 64; *bn = 64; return xb_bdg_pipe(X, t); }
     int k = xb_coop_slot(X, t, rows, slot);
     if (k >= 0) {
         *bm = G.coop_t[k].bm; *bn = G.coop_t[k].bn; (*cooperative)++;
@@ -3907,11 +4582,24 @@ static int xb_gemm_slot(const XbCtx *X, int S) {
 }
 
 /* The grouped GEMM's pipelines (qmatmul_grp*.spv beside the main shader); leaves
- * X->grp_rows at 0 when the device or the files do not allow it. */
+ * X->grp_rows at 0 when the device or the files do not allow it. qmatmul_grp_gate_up's
+ * shared arrays have a fixed size, held to the compiled shader's by
+ * tests/test_vk_shared_memory.py: a device with less keeps the per-expert route (#1998). */
+#define GRP_GATE_UP_SHARED 36864u
 static void xb_grp_init(XbCtx *X) {
     const char *e = getenv("COLI_VK_XB_GROUPED");
-    if (X->d || !G.has_bda || !G.has_coop || G.coop_sg != 64 || (e && *e == '0')) return;
+    if (X->d || !G.has_bda || !G.has_coop || (G.coop_sg != 64 && G.coop_sg != 32) || (e && *e == '0')) return;
+    VkPhysicalDeviceProperties lp; vkGetPhysicalDeviceProperties(X->phys, &lp);
+    if (lp.limits.maxComputeSharedMemorySize < GRP_GATE_UP_SHARED) return;
+    /* matrix units at subgroups of 32 (NVIDIA): the dense chain's grouped GEMM of a prompt
+     * chunk (qmatmul_grp_qc.comp, vk_chain.c's vkc_moe_rows), whose items, expert table,
+     * bindings and push constants are qmatmul_grp.comp's, its tiles 32 rows of 32 outputs
+     * (gate+up) or 64 (down): a prompt chunk's experts had a GEMM each there, three dispatches
+     * an expert (Qwen3.6's 467 rows of 8 of 256 int4-g64 experts, 8.3 ms a layer on an RTX PRO
+     * 4000), and the streaming step's sums (coli_vk_xb_step_*) need it */
+    X->grp_q = G.coop_sg == 32;
     const char *nm[2] = {"qmatmul_grp.spv", "qmatmul_grp_gate_up.spv"};
+    if (X->grp_q) { nm[0] = "qmatmul_grp_qc.spv"; nm[1] = "qmatmul_grp_gate_up_qc.spv"; }
     for (int v = 0; v < 2; v++) {
         char path[1100];
         derive_dir_file(X->spv, nm[v], path, sizeof path);
@@ -3923,19 +4611,21 @@ static void xb_grp_init(XbCtx *X) {
     VkSpecializationInfo si = {1, &me, sizeof tt, &tt};
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
-        .requiredSubgroupSize = 64};
+        .requiredSubgroupSize = (uint32_t)G.coop_sg};
     for (int v = 0; v < 2; v++) {
         VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
             .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = &rss,
                       .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT,
                       .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = X->sh_grp[v], .pName = "main",
-                      .pSpecializationInfo = &si}, .layout = X->pl_grp};
+                      .pSpecializationInfo = X->grp_q ? NULL : &si}, .layout = X->pl_grp};
         if (vkCreateComputePipelines(X->dev, VK_NULL_HANDLE, 1, &ci, NULL, &X->p_grp[v]) != VK_SUCCESS) {
             X->p_grp[v] = VK_NULL_HANDLE; return;
         }
     }
-    /* the grouped GEMV for the small batches (COLI_VK_XB_GEMV=0: per-expert GEMVs) */
+    /* the grouped GEMV for the small batches (COLI_VK_XB_GEMV=0: per-expert GEMVs); at
+     * subgroups of 32 the small experts take the dense chain's decode kernel (xb_cgv_record) */
     const char *ge = getenv("COLI_VK_XB_GEMV");
+    if (X->grp_q) ge = "0";
     const char *gnm[2] = {"qmatmul_grp_gemv.spv", "qmatmul_grp_gemv_gate_up.spv"};
     for (int v = 0; v < 2 && !(ge && *ge == '0'); v++) {
         char path[1100];
@@ -3979,6 +4669,305 @@ static void xb_grp_init(XbCtx *X) {
     if (vkAllocateDescriptorSets(X->dev, &da2, &X->st.set) != VK_SUCCESS) X->st.pipe = VK_NULL_HANDLE;
 }
 
+/* The block formats' grouped GEMM (qmatmul_grp_bd.spv, qmatmul_grp_gate_up_bd.spv): float
+ * arithmetic, any subgroup size, so a card without the matrix units' route of xb_grp_init
+ * takes it too. The grouped sets xb_grp_init makes, made here when it did not (no
+ * cooperative matrices). COLI_VK_XB_GROUPED_BD=0 keeps the per-expert dispatches. */
+#define GRP_BD_SHARED 35648u   /* the gate+up variant's tiles and bdstep.glsl's tables */
+#define GEMM_BD_SHARED 44544u  /* qmatmul_gemm_bd.comp's tiles and tables (vk_chain.c's too) */
+static void xb_grp_bd_init(XbCtx *X) {
+    const char *e = getenv("COLI_VK_XB_GROUPED_BD");
+    if (X->d || !G.has_bda || !bd_shaders() || (e && *e == '0')) return;
+    VkPhysicalDeviceProperties lp; vkGetPhysicalDeviceProperties(X->phys, &lp);
+    if (lp.limits.maxComputeSharedMemorySize < GRP_BD_SHARED) return;
+    const char *nm[2] = {"qmatmul_grp_bd.spv", "qmatmul_grp_gate_up_bd.spv"};
+    for (int v = 0; v < 2; v++) {
+        char path[1100];
+        derive_dir_file(X->spv, nm[v], path, sizeof path);
+        if (!(X->sh_grp_bd[v] = load_spv(X->dev, path))) return;
+    }
+    if (!X->pl_grp && !xb_layout(X, 5, 0u, sizeof(struct PCGRP), &X->dsl_grp, &X->pl_grp)) return;
+    if (!X->grp_pool) {
+        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 30};
+        VkDescriptorPoolCreateInfo dp = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .maxSets = 6, .poolSizeCount = 1, .pPoolSizes = &ps};
+        if (vkCreateDescriptorPool(X->dev, &dp, NULL, &X->grp_pool) != VK_SUCCESS) { X->grp_pool = VK_NULL_HANDLE; return; }
+        VkDescriptorSetLayout l6[6] = {X->dsl_grp, X->dsl_grp, X->dsl_grp, X->dsl_grp, X->dsl_grp, X->dsl_grp};
+        VkDescriptorSetAllocateInfo da = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = X->grp_pool, .descriptorSetCount = 6, .pSetLayouts = l6};
+        if (vkAllocateDescriptorSets(X->dev, &da, &X->grp_set[0][0]) != VK_SUCCESS) return;
+    }
+    X->grp_bd = 1;
+}
+/* its pipeline for v (0 down, 1 gate+up) and ggml type t, made on first use */
+static VkPipeline xb_grp_bd_pipe(XbCtx *X, int v, int t) {
+    if (!X->grp_bd || t < 0 || t >= 64 || !(t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 18 ||
+        t == 19 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42)) return VK_NULL_HANDLE;
+    if (!X->grp_bd_tried[v][t]) {
+        X->grp_bd_tried[v][t] = 1;
+        int32_t sv = t;
+        VkSpecializationMapEntry me = {0, 0, 4};
+        VkSpecializationInfo si = {1, &me, 4, &sv};
+        if (!xb_pipeline(X, X->sh_grp_bd[v], X->pl_grp, &si, &X->p_grp_bd[v][t])) X->p_grp_bd[v][t] = VK_NULL_HANDLE;
+    }
+    return X->p_grp_bd[v][t];
+}
+
+/* chain_moe_gv.comp in the expert batch (the shader beside the main one): the dense chain's
+ * decode kernel for a batch's small experts, a row a pair (K 1), so a row's bits there are
+ * the chain's (a prompt chunk's experts through the tier, its next tokens through the chain,
+ * as OLMoE and Qwen run them, give a resumed prefix the cold forward's numbers). Where the
+ * grouped routes do not take a batch (no cooperative matrices at subgroups of 64: NVIDIA,
+ * Intel, Lavapipe) a decode step's K experts took 2K dispatches,
+ * a GEMV of 8 outputs a workgroup each. COLI_VK_XB_GEMV=0 keeps those. */
+static void xb_barrier(VkCommandBuffer c);
+struct PCCGV { int mode, S, K, D, I, act; float limit, a, b; int t_off, x_off, x_row, i_off, i_row, lpr, tiles, y_off, y_row; };
+static int cgv_fi(int fmt) { return fmt == 1 ? 1 : fmt == 2 ? 2 : fmt == 4 ? 3 : fmt == 7 ? 4 : 0; }
+static void xb_cgv_init(XbCtx *X) {
+    const char *e = getenv("COLI_VK_XB_GEMV");
+    if (X->d || !G.has_bda || (e && *e == '0')) return;
+    char path[1100];
+    derive_dir_file(X->spv, "chain_moe_gv.spv", path, sizeof path);
+    if (!(X->sh_cgv = load_spv(X->dev, path))) return;
+    if (!xb_layout(X, 6, 0u, sizeof(struct PCCGV), &X->dsl_cgv, &X->pl_cgv)) return;
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 18};
+    VkDescriptorPoolCreateInfo dp = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 3, .poolSizeCount = 1, .pPoolSizes = &ps};
+    if (vkCreateDescriptorPool(X->dev, &dp, NULL, &X->cgv_pool) != VK_SUCCESS) { X->cgv_pool = VK_NULL_HANDLE; return; }
+    VkDescriptorSetLayout l3[3] = {X->dsl_cgv, X->dsl_cgv, X->dsl_cgv};
+    VkDescriptorSetAllocateInfo da = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = X->cgv_pool, .descriptorSetCount = 3, .pSetLayouts = l3};
+    if (vkAllocateDescriptorSets(X->dev, &da, X->cgv_set) != VK_SUCCESS) return;
+    X->cgv = 1;
+}
+/* its pipeline for format fmt and pass v (0 gate and up over D inputs, 1 down over I),
+ * the staging sized for the pass's rows; NULL where they do not fit */
+static VkPipeline xb_cgv_pipe(XbCtx *X, int fmt, int v) {
+    int fi = cgv_fi(fmt), n = v ? X->I : X->D;
+    if (!X->cgv || !fi || n < 32 || n % 32) return VK_NULL_HANDLE;
+    VkPipeline *pp = &X->p_cgv[fi - 1][v];
+    int *pn = &X->cgv_n[fi - 1][v];
+    if (*pn == n) return *pp;   /* made (or tried) for these rows */
+    /* the batch's geometry changed (xb_init with no expert allocated, so no batch in
+     * flight): the staging is sized by the rows, a pipeline again */
+    if (*pp) { vkDestroyPipeline(X->dev, *pp, NULL); *pp = VK_NULL_HANDLE; }
+    *pn = n;
+    VkPhysicalDeviceProperties lp; vkGetPhysicalDeviceProperties(X->phys, &lp);
+    int32_t sv[2] = {n / 4 + n / 32 + 1, fmt};   /* the staged row with chain_moe_gv.comp's pad */
+    if ((size_t)sv[0] * 16 + 2048 > lp.limits.maxComputeSharedMemorySize) return VK_NULL_HANDLE;
+    VkSpecializationMapEntry me[2] = {{0, 0, 4}, {1, 4, 4}};
+    VkSpecializationInfo si = {2, me, sizeof sv, sv};
+    if (!xb_pipeline(X, X->sh_cgv, X->pl_cgv, &si, pp)) *pp = VK_NULL_HANDLE;
+    return *pp;
+}
+/* Whether the shader takes expert c of the batch: below gemm_rows rows, in one of its
+ * formats (int4 and MXFP4 groups whole 16-byte steps or, int4, 8-weight words), its
+ * entry readable by address, an activation it computes. */
+static int xb_cgv_takes(XbCtx *X, const ColiVkExpert *e, int rows, int v4) {
+    if (!X->cgv || v4 || (X->act != COLI_VK_ACT_SWIGLU && X->act != COLI_VK_ACT_SITU) ||
+        (X->gemm_rows && rows >= X->gemm_rows)) return 0;
+    const ColiVkTensor *t[3] = {e->g, e->u, e->d};
+    for (int k = 0; k < 3; k++) {
+        int f = t[k]->fmt;
+        if (!cgv_fi(f) || t[k]->rowWords % 4 || (f == 4 && (t[k]->gs < 8 || t[k]->gs % 8)) || (f == 7 && t[k]->gs % 32)) return 0;
+    }
+    if (e->u->fmt != e->g->fmt || e->u->gs != e->g->gs || e->u->rowWords != e->g->rowWords) return 0;
+    uint32_t ent[COLI_VK_XB_ENTRY];
+    return coli_vk_xb_expert_entry(e, ent) && xb_cgv_pipe(X, e->g->fmt, 0) && xb_cgv_pipe(X, e->d->fmt, 1);
+}
+/* Record the experts take[c] of the batch laid out at off[] (rows from the bases x0, i0,
+ * y0 at the same row index, as xb_grp_record's) into cmd: every row of the batch a pair of
+ * the shader (S the batch's rows, K 1), an untaken row's id -1. Their formats: those of the
+ * first taken expert (a batch is one layer's). 0 = nothing recorded. */
+static int xb_cgv_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *const *ex, const int *rows,
+                         int count, const size_t *off, size_t x0, size_t i0, size_t y0, uint8_t *take) {
+    const int D = X->D, I = X->I;
+    const size_t dr = (size_t)D * 4, ir = (size_t)I * 4;
+    if (dr % X->align || ir % X->align) return 0;
+    int first = -1, span = 0, n = 0;
+    for (int c = 0; c < count; c++) {
+        int end = (int)((off[3 * c] - x0) / dr) + rows[c];
+        if (end > span) span = end;
+        if (!take[c]) continue;
+        if (first < 0) first = c;
+        else if (ex[c]->g->fmt != ex[first]->g->fmt || ex[c]->d->fmt != ex[first]->d->fmt) take[c] = 0;
+    }
+    if (first < 0) return 0;
+    for (int c = 0; c < count; c++) n += take[c];
+    XbBuf *ib = &X->cgv_ids[slot], *tb = &X->cgv_tab[slot];
+    size_t ni = (size_t)span * 4, nt = (size_t)n * COLI_VK_XB_ENTRY * 4;
+    if ((ni > ib->region && !xb_buf(X, ib, xb_up(ni + ni / 2, 4096), X->mt_host, 1)) ||
+        (nt > tb->region && !xb_buf(X, tb, xb_up(nt + nt / 2, 4096), X->mt_host, 1))) return 0;
+    int *ids = ib->ptr; uint32_t *tab = tb->ptr;
+    for (int r = 0; r < span; r++) ids[r] = -1;
+    for (int c = 0, k = 0; c < count; c++) {
+        if (!take[c]) continue;
+        if (!coli_vk_xb_expert_entry(ex[c], tab + (size_t)k * COLI_VK_XB_ENTRY)) return 0;
+        int r0 = (int)((off[3 * c] - x0) / dr);
+        for (int r = 0; r < rows[c]; r++) ids[r0 + r] = k;
+        k++;
+    }
+    VkDescriptorBufferInfo bi[6] = {{X->x.buf, x0, (size_t)span * dr}, {ib->buf, 0, ni}, {ib->buf, 0, ni},
+                                    {tb->buf, 0, nt}, {X->h.buf, i0, (size_t)span * ir}, {X->y.buf, y0, (size_t)span * dr}};
+    VkWriteDescriptorSet w[6];
+    for (int b = 0; b < 6; b++)
+        w[b] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = X->cgv_set[slot],
+            .dstBinding = (uint32_t)b, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[b]};
+    vkUpdateDescriptorSets(X->dev, 6, w, 0, NULL);
+    int fg = ex[first]->g->fmt, fd = ex[first]->d->fmt;
+    int l0 = coli_vk_gv_lanes(fg, D), l1 = coli_vk_gv_lanes(fd, I);
+    /* as vk_chain.c's vkc_moe records it: the gate and up pass a grid of (units, rows) */
+    struct PCCGV pc = {0, span, 1, D, I, X->act, X->limit, X->a, X->b, 0, 0, D, 0, 1, l0, 1, 0, D};
+    int upw = 256 / l0, nwg = (I + upw - 1) / upw;
+    if (nwg > 1024) nwg = 1024;
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->pl_cgv, 0, 1, &X->cgv_set[slot], 0, NULL);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, xb_cgv_pipe(X, fg, 0));
+    vkCmdPushConstants(cmd, X->pl_cgv, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+    vkCmdDispatch(cmd, (uint32_t)nwg, (uint32_t)span, 1);
+    xb_barrier(cmd);
+    int rpp = 256 / l1;   /* a down tile: the rows one pass of the workgroup takes */
+    pc.mode = 1; pc.lpr = l1; pc.tiles = (D + rpp - 1) / rpp;
+    uint64_t nwd = (uint64_t)span * pc.tiles;
+    uint32_t gx = nwd < 65535 ? (uint32_t)nwd : 65535, gy = (uint32_t)((nwd + gx - 1) / gx);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, xb_cgv_pipe(X, fd, 1));
+    vkCmdPushConstants(cmd, X->pl_cgv, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+    vkCmdDispatch(cmd, gx, gy, 1);
+    X->cgv_batches++;
+    return 1;
+}
+
+/* chain_moe.comp's block formats in the expert batch: the dense chain's decode kernel for a
+ * GGUF's experts (bdstep.glsl, a row over a few lanes, its float form), for a batch whose
+ * experts all have XB_CBD_ROWS rows or fewer (a decode step, an MTP verify). The grouped GEMM
+ * of the block formats takes 32-row tiles and the per-expert GEMVs a row a subgroup: a decode
+ * step's eight Q4_K experts of GLM's 6144 x 2048 took 2712 us on an RTX PRO 4000, eight
+ * IQ2_S/Q2_0 of Kimi K3's 7168 x 2048 3144. Its passes 0 (gate and up) and 1 (down) with
+ * every row a pair (K 1), down's rows copied to the batch's. COLI_VK_XB_GEMV=0 keeps the
+ * per-expert GEMVs and the grouped GEMM. */
+#define XB_CBD_ROWS 4
+struct PCCBD { int mode, S, K, D, I, act; float limit, a, b;
+               int t_off, x_off, x_row, i_off, i_row, w_off, w_row, y_off, y_row, rpw, spl; };
+static void xb_cbd_init(XbCtx *X) {
+    const char *e = getenv("COLI_VK_XB_GEMV");
+    if (X->d || !G.has_bda || !bd_shaders() || (e && *e == '0')) return;
+    VkPhysicalDeviceProperties lp; vkGetPhysicalDeviceProperties(X->phys, &lp);
+    uint32_t sl = lp.limits.maxComputeSharedMemorySize;
+    int xs = (int)((sl > 8768 ? sl - 8768 : 0) / 4) & ~3;   /* past bdstep.glsl's tables, as vk_chain.c's */
+    X->cbd_xs = xs > 8192 ? 8192 : xs >= 1024 ? xs : 0;
+    if (!X->cbd_xs) return;
+    char path[1100];
+    derive_dir_file(X->spv, "chain_moe.spv", path, sizeof path);
+    if (!(X->sh_cbd = load_spv(X->dev, path))) return;
+    if (!xb_layout(X, 7, 0u, sizeof(struct PCCBD), &X->dsl_cbd, &X->pl_cbd)) return;
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 21};
+    VkDescriptorPoolCreateInfo dp = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 3, .poolSizeCount = 1, .pPoolSizes = &ps};
+    if (vkCreateDescriptorPool(X->dev, &dp, NULL, &X->cbd_pool) != VK_SUCCESS) { X->cbd_pool = VK_NULL_HANDLE; return; }
+    VkDescriptorSetLayout l3[3] = {X->dsl_cbd, X->dsl_cbd, X->dsl_cbd};
+    VkDescriptorSetAllocateInfo da = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = X->cbd_pool, .descriptorSetCount = 3, .pSetLayouts = l3};
+    if (vkAllocateDescriptorSets(X->dev, &da, X->cbd_set) != VK_SUCCESS) return;
+    X->cbd = 1;
+}
+/* the pipeline of block types tg (gate and up) and td (down), ggml types, for the batch's
+ * rows (vk_chain.c's moe_pipe_f: the row padded to 256, a vec4 of pad every 8) */
+static VkPipeline xb_cbd_pipe(XbCtx *X, int tg, int td) {
+    int sn = X->D > X->I ? X->D : X->I, np = (sn + 255) & ~255, need = (np + np / 8 + 4 + 3) / 4, xs = 4 * need;
+    if (!X->cbd || xs > X->cbd_xs) return VK_NULL_HANDLE;
+    for (int k = 0; k < X->cbd_np; k++)
+        if (X->cbd_p[k].tg == tg && X->cbd_p[k].td == td && X->cbd_p[k].xs == xs) return X->cbd_p[k].p;
+    if (X->cbd_np >= 64) return VK_NULL_HANDLE;
+    int32_t v[5] = {xs, 1, 0, tg + 1, td + 1};   /* XS, BD, FMTC, BTG, BTD: the layer's types plus one */
+    VkSpecializationMapEntry me[5] = {{0, 0, 4}, {1, 4, 4}, {3, 8, 4}, {4, 12, 4}, {5, 16, 4}};
+    VkSpecializationInfo si = {5, me, sizeof v, v};
+    VkPipeline p = VK_NULL_HANDLE;
+    if (!xb_pipeline(X, X->sh_cbd, X->pl_cbd, &si, &p)) p = VK_NULL_HANDLE;
+    X->cbd_p[X->cbd_np].tg = tg; X->cbd_p[X->cbd_np].td = td; X->cbd_p[X->cbd_np].xs = xs; X->cbd_p[X->cbd_np].p = p;
+    X->cbd_np++;   /* a failed one stays, so it is tried once */
+    return p;
+}
+/* whether every expert of the batch is the kernel's: block formats of one pair of types,
+ * XB_CBD_ROWS rows or fewer, entries readable by address */
+static int xb_cbd_takes(XbCtx *X, ColiVkExpert *const *ex, const int *rows, int count, int v4) {
+    if (!X->cbd || v4 || count < 1 || (X->act != COLI_VK_ACT_SWIGLU && X->act != COLI_VK_ACT_SITU)) return 0;
+    int tg = ex[0]->g->fmt, td = ex[0]->d->fmt;
+    if (!bd_fmt(tg) || !bd_fmt(td) || tg >= 200 || td >= 200) return 0;
+    uint32_t ent[COLI_VK_XB_ENTRY];
+    for (int c = 0; c < count; c++)
+        if (rows[c] > XB_CBD_ROWS || ex[c]->g->fmt != tg || ex[c]->u->fmt != tg || ex[c]->d->fmt != td ||
+            !coli_vk_xb_expert_entry(ex[c], ent)) return 0;
+    return xb_cbd_pipe(X, tg - 100, td - 100) != VK_NULL_HANDLE;
+}
+/* Record the batch (laid out at off[], rows at the same index past x0, i0, y0) into cmd:
+ * passes 0 and 1 into the slot's hidden rows, then each expert's output rows to its own. */
+static int xb_cbd_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *const *ex, const int *rows,
+                         int count, const size_t *off, size_t x0, size_t y0) {
+    const int D = X->D, I = X->I;
+    const size_t dr = (size_t)D * 4;
+    if (dr % X->align) return 0;
+    int span = 0;
+    for (int c = 0; c < count; c++) { int end = (int)((off[3 * c] - x0) / dr) + rows[c]; if (end > span) span = end; }
+    int tg = ex[0]->g->fmt - 100, td = ex[0]->d->fmt - 100;
+    VkPipeline pipe = xb_cbd_pipe(X, tg, td);
+    VkBuffer bt = bdtab_buf(0);
+    if (!pipe || !bt) return 0;
+    XbBuf *ib = &X->cbd_ids[slot], *tb = &X->cbd_tab[slot], *hb = &X->cbd_h[slot];
+    size_t ni = (size_t)span * 4, nt = (size_t)count * COLI_VK_XB_ENTRY * 4, nh = (size_t)span * (size_t)(I + D) * 4;
+    if ((ni > ib->region && !xb_buf(X, ib, xb_up(ni + ni / 2, 4096), X->mt_host, 1)) ||
+        (nt > tb->region && !xb_buf(X, tb, xb_up(nt + nt / 2, 4096), X->mt_host, 1)) ||
+        (nh > hb->region && !xb_buf(X, hb, xb_up(nh + nh / 2, 4096), X->mt_dev, 0))) return 0;   /* hid: the device's, as X->h */
+    int *ids = ib->ptr; uint32_t *tab = tb->ptr;
+    for (int r = 0; r < span; r++) ids[r] = -1;
+    for (int c = 0; c < count; c++) {
+        if (!coli_vk_xb_expert_entry(ex[c], tab + (size_t)c * COLI_VK_XB_ENTRY)) return 0;
+        int r0 = (int)((off[3 * c] - x0) / dr);
+        for (int r = 0; r < rows[c]; r++) ids[r0 + r] = c;
+    }
+    VkDescriptorBufferInfo bi[7] = {{X->x.buf, x0, (size_t)span * dr}, {ib->buf, 0, ni}, {ib->buf, 0, ni},
+                                    {tb->buf, 0, nt}, {hb->buf, 0, nh}, {hb->buf, 0, nh}, {bt, 0, VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet w[7];
+    for (int b = 0; b < 7; b++)
+        w[b] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = X->cbd_set[slot],
+            .dstBinding = (uint32_t)b, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[b]};
+    vkUpdateDescriptorSets(X->dev, 7, w, 0, NULL);
+    /* vk_chain.c's vkc_moe: the rows a workgroup and 32-weight steps a lane, pass by pass */
+    int kq = tg == 8 || tg == 10 || tg == 11 || tg == 12 || tg == 13 || tg == 14;
+    int wide = kq || (long long)span * ((I + 63) / 64) >= 128;
+    int rg = wide ? 64 : 32, sg = wide ? 16 : 8, rd = 128, sd = 8;
+    struct PCCBD pc = {0, span, 1, D, I, X->act, X->limit, X->a, X->b, 0, 0, D, 0, 1, 0, 1, 0, D, rg, sg};
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->pl_cbd, 0, 1, &X->cbd_set[slot], 0, NULL);
+    for (int v = 0; v < 2; v++) {
+        uint64_t n = (uint64_t)span * (uint64_t)(v ? (D + rd - 1) / rd : (I + rg - 1) / rg);
+        uint32_t gx = n < 65535 ? (uint32_t)n : 65535u, gy = (uint32_t)((n + gx - 1) / gx);
+        if (v) { pc.mode = 1; pc.rpw = rd; pc.spl = sd; }
+        vkCmdPushConstants(cmd, X->pl_cbd, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+        vkCmdDispatch(cmd, gx, gy, 1);
+        xb_barrier(cmd);
+    }
+    /* down's rows (hid past the span's hidden rows) to the batch's output rows, expert by expert */
+    VkMemoryBarrier tb2 = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &tb2, 0, NULL, 0, NULL);
+    VkBufferCopy *rg2 = malloc((size_t)count * sizeof *rg2);
+    if (!rg2) return 0;
+    for (int c = 0; c < count; c++) {
+        size_t r0 = (off[3 * c] - x0) / dr;
+        rg2[c] = (VkBufferCopy){((size_t)span * I + r0 * D) * 4, off[3 * c + 2], (size_t)rows[c] * dr};
+    }
+    vkCmdCopyBuffer(cmd, hb->buf, X->y.buf, (uint32_t)count, rg2);
+    free(rg2);
+    VkMemoryBarrier hb2 = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &hb2, 0, NULL, 0, NULL);
+    X->cbd_batches++;
+    (void)y0;
+    return 1;
+}
+
 static int xb_init(XbCtx *X, int d, int D, int I, int act, float limit, float a, float b) {
     if (X->ready) {   /* the activation rides the push constants; the geometry changes
                        * only while no expert is allocated (scratch grows by bytes) */
@@ -4005,6 +4994,21 @@ static int xb_init(XbCtx *X, int d, int D, int I, int act, float limit, float a,
     X->sh_mm = X->gemm_shader ? load_spv(X->dev, mm_path) : VK_NULL_HANDLE;
     if (!X->sh_gu || !X->sh_mv || (!X->d && X->gemm_shader && !X->sh_mm)) return 0;   /* the second device: GEMVs only */
     if (!xb_pipeline(X, X->sh_gu, X->pl6, NULL, &X->p_gu) || !xb_pipeline(X, X->sh_mv, X->pl4, NULL, &X->p_mv)) return 0;
+    if (bd_shaders()) {   /* a batch with a block-format expert and no pipeline for it fails (xb_record_submit) */
+        char gb[1100], mb[1100];
+        derive_sibling(X->spv, "_gate_up_bd.spv", gb, sizeof gb); derive_sibling(X->spv, "_bd.spv", mb, sizeof mb);
+        X->sh_gu_bd = load_spv(X->dev, gb); X->sh_mv_bd = load_spv(X->dev, mb);
+        if (!X->sh_gu_bd || !xb_pipeline(X, X->sh_gu_bd, X->pl6, NULL, &X->p_gu_bd)) X->p_gu_bd = VK_NULL_HANDLE;
+        if (!X->sh_mv_bd || !xb_pipeline(X, X->sh_mv_bd, X->pl4, NULL, &X->p_mv_bd)) X->p_mv_bd = VK_NULL_HANDLE;
+        /* the tiled GEMM of a prompt's rows (its tiles and bdstep.glsl's tables: 43.5 KiB of
+         * shared memory); COLI_VK_TIER_GEMM_BD=0 keeps the GEMVs */
+        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(X->d ? G2.phys : G.phys, &pp);
+        const char *ge = getenv("COLI_VK_TIER_GEMM_BD");
+        if (!X->d && !(ge && *ge == '0') && pp.limits.maxComputeSharedMemorySize >= GEMM_BD_SHARED) {
+            char gm[1100]; derive_dir_file(X->spv, "qmatmul_gemm_bd.spv", gm, sizeof gm);
+            X->sh_mm_bd = load_spv(X->dev, gm);
+        }
+    }
     /* the GEMM route: the backend's tiles, and expert_act.spv beside the main shader */
     char act_path[1100];
     derive_dir_file(X->spv, "expert_act.spv", act_path, sizeof act_path);
@@ -4025,6 +5029,9 @@ static int xb_init(XbCtx *X, int d, int D, int I, int act, float limit, float a,
     if (X->gemm_rows < 0) X->gemm_rows = 0;
     xb_coop_init(X);
     xb_grp_init(X);
+    xb_grp_bd_init(X);
+    xb_cgv_init(X);
+    xb_cbd_init(X);
     VkCommandPoolCreateInfo cp = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = X->q_fam};
     VKCHECK(vkCreateCommandPool(X->dev, &cp, NULL, &X->cpool), "xb cmd pool");
@@ -4052,7 +5059,18 @@ static int xb_init(XbCtx *X, int d, int D, int I, int act, float limit, float a,
     X->ready = 1;
     return 1;
 }
+/* COLI_VK_WAIT_FAULT=n (tests): the n-th batch joined on the primary device after
+ * coli_vk_xb_init gives up at once with VK_TIMEOUT, as a wait that runs out of time
+ * does: the batch may still be running. One stderr line says when it fired. */
+static long g_wait_fault_at, g_wait_fault_n;
+static int wait_fault(void) {
+    if (g_wait_fault_at <= 0 || ++g_wait_fault_n != g_wait_fault_at) return 0;
+    fprintf(stderr, "[VK] COLI_VK_WAIT_FAULT: the wait for batch #%ld gives up\n", g_wait_fault_at);
+    return 1;
+}
 int coli_vk_xb_init(int D, int I, int act, float limit, float a, float b) {
+    const char *e = getenv("COLI_VK_WAIT_FAULT");
+    g_wait_fault_at = e && *e ? atol(e) : 0; g_wait_fault_n = 0;
     return xb_init(&g_xb[0], 0, D, I, act, limit, a, b);
 }
 int coli_vk_xb_init_dev(int dev, int D, int I, int act, float limit, float a, float b) {
@@ -4100,12 +5118,14 @@ ColiVkExpert *coli_vk_xb_expert(ColiVkTensor *g, ColiVkTensor *u, ColiVkTensor *
 }
 
 /* The expert's sets and its three tensors. Not while a batch is in flight (the
- * batch may name it); the tier frees at its join. */
+ * batch may name it); the tier frees at its join. After a batch stopped the context
+ * (X->ready 0: a failed wait, and that batch may still be running) the sets stay
+ * until xb_shutdown destroys their pools, after the device's wait. */
 static void xb_expert_unlink(ColiVkExpert *e) {   /* its sets, not its tensors */
     XbCtx *X = e->X;
     if (e->prev) e->prev->next = e->next; else X->live = e->next;
     if (e->next) e->next->prev = e->prev;
-    if (xb_dev_ready(X) && e->dpool < X->ndpools) {
+    if (X->ready && xb_dev_ready(X) && e->dpool < X->ndpools) {
         VkDescriptorSet sets[4] = {e->s_gu, e->s_dn, e->s_g, e->s_u};
         vkFreeDescriptorSets(X->dev, X->dpools[e->dpool], 4, sets);
     }
@@ -4151,6 +5171,29 @@ static uint64_t vk_addr(VkBuffer b) {
  * rows start at the same row index past the batch's bases x0, i0, y0 (its scratch half),
  * which the sets bind as their offsets. `slot`: whose tables and sets (0 the single
  * batch, 1 + h a sub-batch half). 0 = not taken, nothing recorded. */
+int coli_vk_xb_expert_entry(const ColiVkExpert *e, uint32_t *o) {
+    if (!e) return 0;
+    return coli_vk_tensor_xb_entry(e->g, e->u, e->d, o);
+}
+int coli_vk_tensor_xb_entry(const ColiVkTensor *g, const ColiVkTensor *u, const ColiVkTensor *d, uint32_t *o) {
+    if (!o || !G.ready || !G.has_bda) return 0;
+    const ColiVkTensor *t[3] = {g, u, d};
+    /* a block format (a GGUF's experts) has no scales: chain_moe.comp reads its blocks and
+     * the table, and the entry's scale address stays its weights' (never read) */
+    for (int k = 0; k < 3; k++)
+        if (!t[k] || t[k]->dev || !t[k]->pool || !pool_bda(t[k]->pool) || (!t[k]->sbuf && !bd_fmt(t[k]->fmt)) ||
+            (bd_fmt(t[k]->fmt) && (t[k]->fmt >= 200 || t[k]->I % 32))) return 0;
+    memset(o, 0, COLI_VK_XB_ENTRY * sizeof *o);
+    for (int k = 0; k < 3; k++) {
+        uint64_t w = vk_addr(t[k]->wbuf), s = t[k]->sbuf ? vk_addr(t[k]->sbuf) : w;
+        o[4 * k] = (uint32_t)w; o[4 * k + 1] = (uint32_t)(w >> 32);
+        o[4 * k + 2] = (uint32_t)s; o[4 * k + 3] = (uint32_t)(s >> 32);
+    }
+    o[12] = (uint32_t)t[0]->fmt; o[13] = (uint32_t)t[0]->rowWords; o[14] = (uint32_t)t[0]->gs;
+    o[15] = (uint32_t)t[2]->fmt; o[16] = (uint32_t)t[2]->rowWords; o[17] = (uint32_t)t[2]->gs;
+    o[18] = 1;
+    return 1;
+}
 /* Whether the grouped route takes this batch (and its row total). */
 /* Whether the grouped route takes this batch (and its row total): 1 the grouped GEMM
  * (grp_rows rows or more), 2 the grouped GEMV (fewer), 0 neither. */
@@ -4160,17 +5203,31 @@ static int xb_grp_ok(const XbCtx *X, ColiVkExpert *const *ex, const int *rows, i
     int total = 0;
     for (int c = 0; c < count; c++) total += rows[c];
     if (total_out) *total_out = total;
-    if (!X->grp_rows || X->act != COLI_VK_ACT_SWIGLU || dr % X->align || ir % X->align) return 0;
+    /* mode 3: a GGUF's experts, every one in the batch's block types (one layer's) */
+    if (X->grp_bd && X->act == COLI_VK_ACT_SWIGLU && dr % X->align == 0 && ir % X->align == 0 && D % 64 == 0 &&
+        I % 64 == 0 && count > 0 && bd_fmt(ex[0]->g->fmt) && bd_fmt(ex[0]->d->fmt) && g_bdtab[0]) {
+        int tg = ex[0]->g->fmt, td = ex[0]->d->fmt, ok = 1;
+        for (int c = 0; c < count && ok; c++) {
+            const ColiVkTensor *t[3] = {ex[c]->g, ex[c]->u, ex[c]->d};
+            for (int k = 0; k < 3; k++)
+                ok = ok && !t[k]->dev && t[k]->pool && t[k]->fmt == (k < 2 ? tg : td) &&
+                     (!(t[k]->fmt == 112 || t[k]->fmt == 113) || t[k]->rowWords % 4 == 0);
+        }
+        if (ok && xb_grp_bd_pipe((XbCtx *)X, 1, tg - 100) && xb_grp_bd_pipe((XbCtx *)X, 0, td - 100)) return 3;
+    }
+    if (!X->grp_rows || dr % X->align || ir % X->align) return 0;
     int mode = total >= X->grp_rows ? 1 : X->p_gv[0] ? 2 : 0;
-    if (mode == 1 && (D % 128 || I % 128)) return 0;
-    if (mode == 2 && (D % 32 || I % 32 || D > 8192 || I > 8192)) return 0;
+    /* the grouped GEMV also computes SiTU and MXFP4 (Kimi K3, MiMo, DeepSeek V4.1): on a Radeon
+     * 780M, 25-35% faster than chain_moe_gv.comp's way (xb_cgv_record), which these took */
+    if (mode == 1 && (X->act != COLI_VK_ACT_SWIGLU || D % 128 || I % 128)) return 0;
+    if (mode == 2 && ((X->act != COLI_VK_ACT_SWIGLU && X->act != COLI_VK_ACT_SITU) || D % 32 || I % 32 || D > 8192 || I > 8192)) return 0;
     if (!mode) return 0;
     for (int c = 0; c < count; c++) {
         const ColiVkTensor *t[3] = {ex[c]->g, ex[c]->u, ex[c]->d};
         for (int k = 0; k < 3; k++) {
-            int f = t[k]->fmt;
-            if (t[k]->dev || !t[k]->pool || !(f == 1 || f == 2 || f == 4) || t[k]->rowWords % 4 ||
-                (f == 4 && (t[k]->gs < 8 || t[k]->gs % (mode == 2 ? 32 : 8)))) return 0;
+            int f = t[k]->fmt;   /* MXFP4 (7) in the GEMV only */
+            if (t[k]->dev || !t[k]->pool || !(f == 1 || f == 2 || f == 4 || (f == 7 && mode == 2)) || t[k]->rowWords % 4 ||
+                ((f == 4 || f == 7) && (t[k]->gs < 8 || t[k]->gs % (mode == 2 ? 32 : 8)))) return 0;
         }
         if (ex[c]->u->fmt != ex[c]->g->fmt || ex[c]->u->gs != ex[c]->g->gs) return 0;
     }
@@ -4193,11 +5250,14 @@ static int xb_grp_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *
     /* items: (expert, first row, 128-row output block), 64 rows a workgroup; the tiles
      * of one (expert, block) adjacent, so workgroups in flight share weights */
     /* the GEMV's items: (expert, row, XB_GV_RPW outputs) */
-    const int tm = mode == 1 ? 16 * XB_GRP_TT : 1, bo = mode == 1 ? 128 : XB_GV_RPW;
+    /* mode 3 (the block formats'): 32 rows, 64 outputs of the down and 32 of gate+up */
+    const int tm = mode == 1 ? (X->grp_q ? 32 : 16 * XB_GRP_TT) : mode == 3 ? 32 : 1;
+    const int bov[2] = {mode == 1 ? (X->grp_q ? 64 : 128) : mode == 3 ? 64 : XB_GV_RPW,
+                        mode == 1 ? (X->grp_q ? 32 : 128) : mode == 3 ? 32 : XB_GV_RPW};
     int nit[2] = {0, 0};
     for (int c = 0; c < count; c++) {
         int nt = (rows[c] + tm - 1) / tm;
-        nit[0] += nt * ((D + bo - 1) / bo); nit[1] += nt * ((I + bo - 1) / bo);
+        nit[0] += nt * ((D + bov[0] - 1) / bov[0]); nit[1] += nt * ((I + bov[1] - 1) / bov[1]);
     }
     for (int v = 0; v < 2; v++) {
         XbBuf *ib = &X->grp_it[slot][v], *eb = &X->grp_et[slot][v];
@@ -4208,9 +5268,10 @@ static int xb_grp_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *
             return 0;
         }
     }
+    const uint64_t tab = mode == 3 ? vk_addr(g_bdtab[0]->wbuf) : 0;   /* blockdec_table.h's, read by address */
     for (int v = 0; v < 2; v++) {   /* v 1: gate+up (out I), v 0: down (out D) */
         uint32_t et[16], *it = X->grp_it[slot][v].ptr;
-        int n = 0, O = v ? I : D;
+        int n = 0, O = v ? I : D, bo = bov[v];
         for (int c = 0; c < count; c++) {
             const ColiVkTensor *a = v ? ex[c]->g : ex[c]->d, *b = v ? ex[c]->u : NULL;
             uint64_t ad[4] = {vk_addr(a->wbuf), vk_addr(a->sbuf), b ? vk_addr(b->wbuf) : 0, b ? vk_addr(b->sbuf) : 0};
@@ -4218,11 +5279,12 @@ static int xb_grp_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *
             for (int k = 0; k < 4; k++) { et[2 * k] = (uint32_t)ad[k]; et[2 * k + 1] = (uint32_t)(ad[k] >> 32); }
             et[8] = (uint32_t)rows[c]; et[9] = (uint32_t)((off[3 * c] - x0) / dr);
             et[10] = (uint32_t)a->fmt; et[11] = (uint32_t)a->rowWords; et[12] = (uint32_t)a->gs;
+            et[14] = (uint32_t)tab; et[15] = (uint32_t)(tab >> 32);
             memcpy((uint8_t *)X->grp_et[slot][v].ptr + (size_t)c * 64, et, sizeof et);   /* written, never read back */
             for (int ob = 0; ob < (O + bo - 1) / bo; ob++)
                 for (int t0 = 0; t0 < rows[c]; t0 += tm) {
                     /* the GEMM takes a block index, the GEMV its first output */
-                    uint32_t q[4] = {(uint32_t)c, (uint32_t)t0, (uint32_t)(mode == 1 ? ob : ob * bo), 1};
+                    uint32_t q[4] = {(uint32_t)c, (uint32_t)t0, (uint32_t)(mode == 1 || mode == 3 ? ob : ob * bo), 1};
                     memcpy(it + (size_t)n * 4, q, sizeof q); n++;
                 }
         }
@@ -4247,10 +5309,11 @@ static int xb_grp_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *
                 .dstBinding = (uint32_t)b, .descriptorCount = 1,
                 .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[b]};
         vkUpdateDescriptorSets(X->dev, 5, w, 0, NULL);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, mode == 1 ? X->p_grp[v] : X->p_gv[v]);
+        VkPipeline gp = mode == 3 ? xb_grp_bd_pipe(X, v, (v ? ex[0]->g : ex[0]->d)->fmt - 100) : mode == 1 ? X->p_grp[v] : X->p_gv[v];
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gp);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->pl_grp, 0, 1, &X->grp_set[slot][v], 0, NULL);
         for (int i0n = 0; i0n < nit[v]; i0n += 65535) {   /* the grid's x limit every device has */
-            struct PCGRP pc = {v ? D : I, v ? I : D, X->limit, i0n, amap ? X->st.K : 0, XB_GV_RPW};
+            struct PCGRP pc = {v ? D : I, v ? I : D, X->limit, i0n, amap ? X->st.K : 0, XB_GV_RPW, X->act, X->a, X->b};
             vkCmdPushConstants(cmd, X->pl_grp, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
             vkCmdDispatch(cmd, (uint32_t)(nit[v] - i0n < 65535 ? nit[v] - i0n : 65535), 1, 1);
         }
@@ -4275,22 +5338,57 @@ static int xb_record_submit(XbCtx *X, VkCommandBuffer cmd, VkFence fence, VkQuer
         vkCmdResetQueryPool(cmd, qp, 0, 2);
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 0);
     }
+    if (slot >= 1 && slot <= 2 && X->sub[slot - 1].ncp) {   /* a sub-batch's host pool experts into their slots first */
+        __typeof__(X->sub[0]) *b = &X->sub[slot - 1];
+        for (int i = 0; i < b->ncp; i++) { VkBufferCopy r = {0, 0, b->cp[i].n}; vkCmdCopyBuffer(cmd, b->cp[i].s, b->cp[i].d, 1, &r); }
+        VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                              .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        X->sub_copies += (unsigned long long)b->ncp;
+        b->ncp = 0;
+    }
     /* the route of each expert: its GEMM slot, or -1 for the GEMVs */
     int *route = malloc((size_t)count * sizeof(int));
     if (!route) { vkEndCommandBuffer(cmd); return 0; }
-    int ngemm = 0, cooperative = 0, grouped = !v4 && xb_grp_record(X, cmd, slot, ex, rows, count, off, x0, i0, y0, amap);
+    for (int c = 0; c < count; c++)
+        if ((bd_fmt(ex[c]->g->fmt) && !X->p_gu_bd) || (bd_fmt(ex[c]->d->fmt) && !X->p_mv_bd)) { vkEndCommandBuffer(cmd); free(route); return 0; }
+    int ngemm = 0, cooperative = 0, grouped = 0;
+    /* a decode step's GGUF experts on the chain's kernel (xb_cbd_record), else the routes below */
+    if (!amap && xb_cbd_takes(X, ex, rows, count, v4) && xb_cbd_record(X, cmd, slot, ex, rows, count, off, x0, y0))
+        goto recorded;
+    grouped = !v4 && xb_grp_record(X, cmd, slot, ex, rows, count, off, x0, i0, y0, amap);
     if (grouped) ngemm = count;
     else {
         for (int c = 0; c < count; c++) {
             int k = X->gemm_rows && rows[c] >= X->gemm_rows ? xb_gemm_slot(X, rows[c]) : -1;
-            route[c] = k >= 0 && X->p_mm[k] ? k : -1;
+            /* the block formats: their own GEMM (qmatmul_gemm_bd.comp) where it decodes the
+             * three matrices' types, at any rows (each weight decoded once for 64 of them; the
+             * GEMVs, blockdec.glsl's in qmatmul*_bd.comp, decode it again for every row) */
+            int bg = bd_fmt(ex[c]->g->fmt), bdn = bd_fmt(ex[c]->d->fmt);
+            if (bg || bdn)
+                route[c] = bg && bdn && rows[c] > 1 && xb_bdg_pipe(X, ex[c]->g) && xb_bdg_pipe(X, ex[c]->u) &&
+                           xb_bdg_pipe(X, ex[c]->d) ? XB_ROUTE_BDG : -1;
+            else route[c] = k >= 0 && X->p_mm[k] ? k : -1;
             ngemm += route[c] >= 0;
         }
+        /* the experts the GEMVs would take, on the chain's decode kernel where it takes them:
+         * each by itself, whatever the batch around it */
+        if (X->cgv && !amap) {
+            uint8_t *take = calloc((size_t)count, 1);
+            int any = 0;
+            for (int c = 0; take && c < count; c++)
+                if (route[c] == -1 && !bd_fmt(ex[c]->g->fmt) && !bd_fmt(ex[c]->d->fmt) && xb_cgv_takes(X, ex[c], rows[c], v4)) take[c] = 1, any = 1;
+            if (any && xb_cgv_record(X, cmd, slot, ex, rows, count, off, x0, i0, y0, take))
+                for (int c = 0; c < count; c++) if (take[c]) route[c] = XB_ROUTE_CGV;
+            free(take);
+        }
         /* phase 1: gate and up of every expert (fused GEMV, or two GEMMs) */
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->p_gu);
+        VkPipeline gv = VK_NULL_HANDLE;
         for (int c = 0; c < count; c++) {
-            if (route[c] >= 0) continue;
+            if (route[c] != -1) continue;
             const ColiVkExpert *e = ex[c];
+            VkPipeline want = bd_fmt(e->g->fmt) ? X->p_gu_bd : X->p_gu;
+            if (want != gv) { vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); gv = want; }
             uint32_t dyn[2] = {(uint32_t)off[3 * c], (uint32_t)off[3 * c + 1]};
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->pl6, 0, 1, &e->s_gu, 2, dyn);
             struct PCGU pc = {e->g->fmt, rows[c], D, I, e->g->rowWords, e->g->gs, X->limit, X->act, X->a, X->b};
@@ -4348,7 +5446,8 @@ static int xb_record_submit(XbCtx *X, VkCommandBuffer cmd, VkFence fence, VkQuer
             const ColiVkExpert *e = ex[c];
             int k = route[c], gemm = k >= 0;
             int bm = 8, bn = 1;
-            VkPipeline pipe = gemm ? xb_mm_pipeline(X, e->d, rows[c], k, &bm, &bn, &cooperative) : X->p_mv;
+            if (k == XB_ROUTE_CGV) continue;   /* down on the chain's kernel already */
+            VkPipeline pipe = gemm ? xb_mm_pipeline(X, e->d, rows[c], k, &bm, &bn, &cooperative) : bd_fmt(e->d->fmt) ? X->p_mv_bd : X->p_mv;
             if (pipe != bound) { vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe); bound = pipe; }
             uint32_t dyn[2] = {(uint32_t)off[3 * c + 1], (uint32_t)off[3 * c + 2]};
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->pl4, 0, 1, &e->s_dn, 2, dyn);
@@ -4359,6 +5458,7 @@ static int xb_record_submit(XbCtx *X, VkCommandBuffer cmd, VkFence fence, VkQuer
             } else vkCmdDispatch(cmd, (uint32_t)((D + 7) / 8), (uint32_t)rows[c], 1);
         }
     }
+recorded:
     /* the host reads y after the fence */
     VkMemoryBarrier hb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
@@ -4446,16 +5546,16 @@ static int dev2_fault(void) {
 static int xb_join(XbCtx *X, const float **yrows, double *device_ms) {
     if (!X->inflight) return 0;
     X->inflight = 0;
-    VkResult r = vk_fence_wait(X->dev, X->fence);
+    VkResult r = !X->d && wait_fault() ? VK_TIMEOUT : vk_fence_wait(X->dev, X->fence);
     if (r == VK_SUCCESS && X->d && dev2_fault()) r = VK_ERROR_DEVICE_LOST;
-    async_end(X->d);
-    if (r != VK_SUCCESS) {
+    if (r != VK_SUCCESS) {   /* no async_end: the batch may still run */
         fprintf(stderr, "[VK] %sexpert batch: fence wait failed (%d), %s\n", X->d ? "dev2 " : "", r,
                 X->d ? "the second device stops" : "the tier stops");
         X->ready = 0;
         if (X->d) __atomic_store_n(&G2.ready, 0, __ATOMIC_RELEASE);   /* lost: nothing else runs there */
         return 0;
     }
+    async_end(X->d);
     double ms = 0;
     if (X->has_ts) {
         uint64_t ts[2];
@@ -4473,7 +5573,7 @@ int coli_vk_xb_join(const float **yrows, double *device_ms) { return xb_join(&g_
 int coli_vk_xb_join_dev(int dev, const float **yrows, double *device_ms) {
     return dev == 0 || dev == 1 ? xb_join(&g_xb[dev], yrows, device_ms) : 0;
 }
-int coli_vk_xb_busy_dev(int dev) { return (dev == 0 || dev == 1) && g_xb[dev].inflight; }
+int coli_vk_xb_busy_dev(int dev) { return (dev == 0 || dev == 1) && xb_busy(&g_xb[dev]); }   /* a batch or a sub-batch */
 
 static void xb_stats(const XbCtx *X, ColiVkXbStats *st) {
     memset(st, 0, sizeof(*st));
@@ -4484,6 +5584,7 @@ static void xb_stats(const XbCtx *X, ColiVkXbStats *st) {
     st->sub_batches = X->sub_batches; st->sub_experts = X->sub_experts; st->sub_rows = X->sub_rows;
     st->sub_gemm = X->sub_gemm; st->sub_ms = X->sub_ms;
     st->cooperative_matmuls = X->cooperative_matmuls; st->grouped_batches = X->grp_batches; st->gemv_batches = X->gv_batches;
+    st->chain_gemv_batches = X->cgv_batches + X->cbd_batches;
 }
 void coli_vk_xb_stats(ColiVkXbStats *st) { xb_stats(&g_xb[0], st); }
 void coli_vk_xb_stats_dev(int dev, ColiVkXbStats *st) {
@@ -4538,18 +5639,19 @@ int coli_vk_xb_sub_fit(int rows, int experts, size_t extra_budget) {
     if (X->has_budget) mp.pNext = &bud;
 #endif
     vkGetPhysicalDeviceMemoryProperties2(X->phys, &mp);
-    size_t room[VK_MAX_MEMORY_HEAPS];
-    for (uint32_t h = 0; h < mp.memoryProperties.memoryHeapCount; h++) {
-        room[h] = (size_t)mp.memoryProperties.memoryHeaps[h].size / 8;
+    const int integrated = vk_integrated(X->phys);
+    const VkDeviceSize *usage = NULL, *budget = NULL;
 #ifdef VK_EXT_memory_budget
-        if (X->has_budget) room[h] = bud.heapBudget[h] > bud.heapUsage[h] ? (size_t)((bud.heapBudget[h] - bud.heapUsage[h]) / 2) : 0;
+    if (X->has_budget) { usage = bud.heapUsage; budget = bud.heapBudget; }
 #endif
-        if (g_mem.cap[0] && (mp.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) &&
+    VkDeviceSize room[VK_MAX_MEMORY_HEAPS];
+    vk_batch_room(&mp.memoryProperties, integrated, usage, budget, room);
+    for (uint32_t h = 0; h < mp.memoryProperties.memoryHeapCount; h++)
+        if (g_mem.cap[0] && vk_heap_is_device_memory(&mp.memoryProperties, integrated, h) &&
             room[h] > vk_mem_room(0) / 2) room[h] = (size_t)(vk_mem_room(0) / 2);   /* COLI_VK_DEVICE_CAP_MB */
-    }
-    uint32_t xheap = mp.memoryProperties.memoryTypes[X->mt_host].heapIndex;
-    uint32_t iheap = mp.memoryProperties.memoryTypes[X->mt_dev].heapIndex;
-    uint32_t yheap = mp.memoryProperties.memoryTypes[X->mt_cached].heapIndex;
+    uint32_t xheap = vk_batch_slot(integrated, mp.memoryProperties.memoryTypes[X->mt_host].heapIndex);
+    uint32_t iheap = vk_batch_slot(integrated, mp.memoryProperties.memoryTypes[X->mt_dev].heapIndex);
+    uint32_t yheap = vk_batch_slot(integrated, mp.memoryProperties.memoryTypes[X->mt_cached].heapIndex);
     int lo = 0, hi = rows;
     while (lo < hi) {
         int mid = lo + (hi - lo + 1) / 2;
@@ -4626,12 +5728,12 @@ int coli_vk_xb_sub_join(int h, float *const *yout, double *device_ms) {
     if (device_ms) *device_ms = 0;
     if (h < 0 || h > 1 || !X->sub[h].inflight) return 0;
     X->sub[h].inflight = 0;
-    VkResult r = vk_fence_wait_gemm(X->dev, X->sub[h].fence);
-    async_end(X->d);
-    if (r != VK_SUCCESS) {
+    VkResult r = wait_fault() ? VK_TIMEOUT : vk_fence_wait_gemm(X->dev, X->sub[h].fence);
+    if (r != VK_SUCCESS) {   /* no async_end: the batch may still run */
         fprintf(stderr, "[VK] expert batch: fence wait failed (%d), the tier stops\n", r);
         X->ready = 0; return 0;
     }
+    async_end(X->d);
     double ms = 0;
     if (X->has_ts && X->sub[h].qp) {
         uint64_t ts[2];
@@ -4749,8 +5851,10 @@ const float *coli_vk_xb_step_sum(const float *w, const uint8_t *use, double *dev
     if (vkResetFences(X->dev, 1, &X->fence) != VK_SUCCESS || vk_submit(X->d, X->q, &si, X->fence) != VK_SUCCESS) return NULL;
     async_begin(X->d);
     VkResult r = vk_fence_wait_gemm(X->dev, X->fence);
+    if (r != VK_SUCCESS) {   /* no async_end: the sum may still run */
+        fprintf(stderr, "[VK] expert batch: the step's sum failed (%d)\n", r); X->ready = 0; return NULL;
+    }
     async_end(X->d);
-    if (r != VK_SUCCESS) { fprintf(stderr, "[VK] expert batch: the step's sum failed (%d)\n", r); X->ready = 0; return NULL; }
     double ms = 0;
     if (X->has_ts) {
         uint64_t ts[2];
@@ -4771,7 +5875,7 @@ static void xb_shutdown(XbCtx *X) {
         if (X->sub[h].inflight) { vk_fence_wait(X->dev, X->sub[h].fence); X->sub[h].inflight = 0; async_end(X->d); }
         if (X->sub[h].fence) vkDestroyFence(X->dev, X->sub[h].fence, NULL);
         if (X->sub[h].qp) vkDestroyQueryPool(X->dev, X->sub[h].qp, NULL);
-        free(X->sub[h].yoff);
+        free(X->sub[h].yoff); free(X->sub[h].cp);
     }
     while (X->live) coli_vk_xb_expert_free(X->live);
     XbBuf *bufs[17] = {&X->x, &X->g, &X->u, &X->h, &X->y};
@@ -4781,10 +5885,16 @@ static void xb_shutdown(XbCtx *X) {
     for (int v = 0; v < 2; v++) {
         if (X->p_grp[v]) vkDestroyPipeline(X->dev, X->p_grp[v], NULL);
         if (X->sh_grp[v]) vkDestroyShaderModule(X->dev, X->sh_grp[v], NULL);
+        for (int t = 0; t < 64; t++) if (X->p_grp_bd[v][t]) vkDestroyPipeline(X->dev, X->p_grp_bd[v][t], NULL);
+        if (X->sh_grp_bd[v]) vkDestroyShaderModule(X->dev, X->sh_grp_bd[v], NULL);
     }
     if (X->grp_pool) vkDestroyDescriptorPool(X->dev, X->grp_pool, NULL);
     XbBuf *sb[8] = {&X->st.xt, &X->st.ys, &X->st.out, &X->st.w, &X->st.use, &X->grp_map[0], &X->grp_map[1], &X->grp_map[2]};
     for (int k = 0; k < 8; k++) if (sb[k]->buf) { vkDestroyBuffer(X->dev, sb[k]->buf, NULL); vkFreeMemory(X->dev, sb[k]->mem, NULL); }
+    for (int k = 0; k < 15; k++) {
+        XbBuf *cb = k < 3 ? &X->cgv_ids[k] : k < 6 ? &X->cgv_tab[k - 3] : k < 9 ? &X->cbd_ids[k - 6] : k < 12 ? &X->cbd_tab[k - 9] : &X->cbd_h[k - 12];
+        if (cb->buf) { vkDestroyBuffer(X->dev, cb->buf, NULL); vkFreeMemory(X->dev, cb->mem, NULL); }
+    }
     if (X->st.pipe) vkDestroyPipeline(X->dev, X->st.pipe, NULL);
     if (X->st.sh) vkDestroyShaderModule(X->dev, X->st.sh, NULL);
     if (X->st.pool) vkDestroyDescriptorPool(X->dev, X->st.pool, NULL);
@@ -4794,6 +5904,16 @@ static void xb_shutdown(XbCtx *X) {
         if (X->p_gv[v]) vkDestroyPipeline(X->dev, X->p_gv[v], NULL);
         if (X->sh_gv[v]) vkDestroyShaderModule(X->dev, X->sh_gv[v], NULL);
     }
+    for (int f = 0; f < 4; f++) for (int v = 0; v < 2; v++) if (X->p_cgv[f][v]) vkDestroyPipeline(X->dev, X->p_cgv[f][v], NULL);
+    for (int k = 0; k < X->cbd_np; k++) if (X->cbd_p[k].p) vkDestroyPipeline(X->dev, X->cbd_p[k].p, NULL);
+    if (X->sh_cbd) vkDestroyShaderModule(X->dev, X->sh_cbd, NULL);
+    if (X->pl_cbd) vkDestroyPipelineLayout(X->dev, X->pl_cbd, NULL);
+    if (X->dsl_cbd) vkDestroyDescriptorSetLayout(X->dev, X->dsl_cbd, NULL);
+    if (X->cbd_pool) vkDestroyDescriptorPool(X->dev, X->cbd_pool, NULL);
+    if (X->sh_cgv) vkDestroyShaderModule(X->dev, X->sh_cgv, NULL);
+    if (X->pl_cgv) vkDestroyPipelineLayout(X->dev, X->pl_cgv, NULL);
+    if (X->dsl_cgv) vkDestroyDescriptorSetLayout(X->dev, X->dsl_cgv, NULL);
+    if (X->cgv_pool) vkDestroyDescriptorPool(X->dev, X->cgv_pool, NULL);
     if (X->pl_grp) vkDestroyPipelineLayout(X->dev, X->pl_grp, NULL);
     if (X->dsl_grp) vkDestroyDescriptorSetLayout(X->dev, X->dsl_grp, NULL);
     for (int k = 0; k < X->ndpools; k++) vkDestroyDescriptorPool(X->dev, X->dpools[k], NULL);
@@ -4806,6 +5926,12 @@ static void xb_shutdown(XbCtx *X) {
     if (X->sh_gu) vkDestroyShaderModule(X->dev, X->sh_gu, NULL);
     if (X->sh_mv) vkDestroyShaderModule(X->dev, X->sh_mv, NULL);
     if (X->sh_mm) vkDestroyShaderModule(X->dev, X->sh_mm, NULL);
+    if (X->p_gu_bd) vkDestroyPipeline(X->dev, X->p_gu_bd, NULL);
+    if (X->p_mv_bd) vkDestroyPipeline(X->dev, X->p_mv_bd, NULL);
+    if (X->sh_gu_bd) vkDestroyShaderModule(X->dev, X->sh_gu_bd, NULL);
+    if (X->sh_mv_bd) vkDestroyShaderModule(X->dev, X->sh_mv_bd, NULL);
+    for (int t = 0; t < 64; t++) if (X->p_mm_bd[t]) vkDestroyPipeline(X->dev, X->p_mm_bd[t], NULL);
+    if (X->sh_mm_bd) vkDestroyShaderModule(X->dev, X->sh_mm_bd, NULL);
     for (int k = 0; k < VK_COOP_SLOTS; k++) if (X->p_coop[k]) vkDestroyPipeline(X->dev, X->p_coop[k], NULL);
     if (X->sh_coop) vkDestroyShaderModule(X->dev, X->sh_coop, NULL);
     if (X->pl6) vkDestroyPipelineLayout(X->dev, X->pl6, NULL);
@@ -4830,14 +5956,23 @@ static void xb_shutdown(XbCtx *X) {
  * rows of cpu_row_bytes at *stride bytes apart (the padding is zero), and the
  * scales (fmt 10/11: one float the caller sets to 1). The tier's uploader thread
  * calls this; the pool's lock is the only shared state it touches. */
-int coli_vk_tier_tensor_dev(int dev, ColiVkTensor **t, int fmt, int I, int O, int gs,
+int coli_vk_tier_tensor_pad(int dev, ColiVkTensor **t, int fmt, int I, int O, int gs, size_t pad_w, size_t pad_s,
                             uint8_t **rows, size_t *stride, float **scales) {
-    if ((dev == 1 ? !G2.ready : !G.ready) || !fmt_uploadable(fmt, gs)) return 0;
+    if ((dev == 1 ? !G2.ready : !G.ready) || !fmt_uploadable(fmt, gs) || (dev == 2 && !coli_vk_tier_host_pool())) return 0;
     void *w, *s;
-    ColiVkTensor *n = tensor_alloc(dev == 1 ? &g_tpool2 : &g_tpool, fmt, I, O, gs, &w, &s);
+    ColiVkTensor *n = tensor_alloc_pad(dev == 2 ? &g_hpool : dev == 1 ? &g_tpool2 : &g_tpool, fmt, I, O, gs, pad_w, pad_s, &w, &s);
     if (!n) return 0;
     *t = n; *rows = w; *stride = (size_t)n->rowWords * 4; *scales = s;
     return 1;
+}
+int coli_vk_tier_tensor_dev(int dev, ColiVkTensor **t, int fmt, int I, int O, int gs,
+                            uint8_t **rows, size_t *stride, float **scales) {
+    return coli_vk_tier_tensor_pad(dev, t, fmt, I, O, gs, 0, 0, rows, stride, scales);
+}
+size_t coli_vk_tensor_alloc_bytes(int fmt, int I, int O, int gs, size_t *scale_bytes) {
+    if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) { if (gs < 1) return 0; } else gs = 0;
+    if (scale_bytes) *scale_bytes = scale_floats(fmt, I, O, gs) * sizeof(float);
+    return (size_t)rowwords(fmt, I) * 4 * (size_t)O;
 }
 int coli_vk_tier_tensor(ColiVkTensor **t, int fmt, int I, int O, int gs,
                         uint8_t **rows, size_t *stride, float **scales) {
@@ -4879,6 +6014,105 @@ int coli_vk_tensor_commit(ColiVkTensor *const *t, int n) {
     for (int k = 0; k < n; k++) if (t[k]) { up_img_free(t[k]->img, t[k]->img_al); t[k]->img = NULL; }
     return ok;
 }
+/* A tier tensor on device dev (0, or 1: COLI_VK_DEV2's) with the layout of src, a tensor of
+ * the host pool, and its ranges padded as coli_vk_tier_tensor_pad's: with staged uploads
+ * empty, for coli_vk_tensor_copy to fill; with mapped memory filled here from src's
+ * mapping. 0 = no room or no memory. */
+int coli_vk_tier_tensor_like(int dev, ColiVkTensor **t, const ColiVkTensor *src, size_t pad_w, size_t pad_s) {
+    if (!G.ready || !t || !src || src->pool != &g_hpool || !src->wmap || !src->smap || (dev == 1 && !G2.ready)) return 0;
+    VkWPool *P = dev == 1 ? &g_tpool2 : &g_tpool;
+    size_t sb = scale_floats(src->fmt, src->I, src->O, src->gs) * sizeof(float);
+    if (pool_staged(P)) {
+        ColiVkTensor *n = tensor_alloc_pad(P, src->fmt, src->I, src->O, src->gs, pad_w, pad_s, NULL, NULL);
+        if (!n) return 0;
+        *t = n;
+        return 1;
+    }
+    void *w, *s;
+    ColiVkTensor *n = tensor_alloc_pad(P, src->fmt, src->I, src->O, src->gs, pad_w, pad_s, &w, &s);
+    if (!n) return 0;
+    memcpy(w, src->wmap, src->wbytes);
+    memcpy(s, src->smap, sb);
+    *t = n;
+    return 1;
+}
+/* Tensors made by coli_vk_tier_tensor_like filled from their sources in the host pool by
+ * the device's copy engine (staged uploads; nothing to do with mapped memory), all n
+ * before this returns: the bytes go over the bus once, none through the CPU. Any thread;
+ * the n tensors on one device. 0 = the copy failed (the device is lost): free them. */
+int coli_vk_tensor_copy(ColiVkTensor *const *dst, ColiVkTensor *const *src, int n) {
+    int dev = -1;
+    for (int k = 0; k < n; k++) if (dst[k] && pool_staged(dst[k]->pool)) dev = dst[k]->dev;
+    if (dev < 0) return 1;
+    VkUp *u = &g_up[dev];
+    pthread_mutex_lock(&u->mx);
+    int ok = 1;
+    for (int k = 0; k < n && ok; k++) {
+        if (!dst[k] || !pool_staged(dst[k]->pool)) continue;
+        if (!src[k] || src[k]->pool != &g_hpool || src[k]->wbytes != dst[k]->wbytes) { ok = 0; break; }
+        size_t sb = scale_floats(src[k]->fmt, src[k]->I, src[k]->O, src[k]->gs) * sizeof(float);
+        if (!(ok = up_open(u))) break;
+        VkBufferCopy cw = {0, 0, src[k]->wbytes}, cs = {0, 0, sb};
+        vkCmdCopyBuffer(u->cmd[u->cur], src[k]->wbuf, dst[k]->wbuf, 1, &cw);
+        if (sb) vkCmdCopyBuffer(u->cmd[u->cur], src[k]->sbuf, dst[k]->sbuf, 1, &cs);
+        u->bytes += src[k]->wbytes + sb; u->copies += 1 + (sb != 0);
+        if (k == 0 && n > 1 && up_fault("copy")) ok = up_fail(u, VK_ERROR_OUT_OF_DEVICE_MEMORY, "copy");
+    }
+    ok = up_finish(u, dev) && ok;
+    if (!ok) up_failed(dev, "the tensors are not resident");
+    pthread_mutex_unlock(&u->mx);
+    return ok;
+}
+/* coli_vk_tensor_copy into tier tensors whose ranges hold their sources' (the streaming's
+ * slots, made by coli_vk_tier_tensor_pad with the room of every form): each takes its
+ * source's format and shape first, as coli_vk_tensor_refill_as does, then the copy engine
+ * fills it (staged uploads), or the CPU through the mapping (mapped memory). All n before
+ * this returns. 0 = a source not in the host pool, no room, or the copy failed. */
+/* coli_vk_tensor_copy_as' and coli_vk_xb_sub_copy's first part: each dst takes its source's
+ * format and shape; mapped memory copies here, through the CPU. 0 = not a host pool source,
+ * or no room. */
+static int copy_as_prep(ColiVkTensor *const *dst, ColiVkTensor *const *src, int n) {
+    if (!G.ready || n < 1) return 0;
+    for (int k = 0; k < n; k++) {
+        ColiVkTensor *t = dst[k]; const ColiVkTensor *f = src[k];
+        if (!t || !f || t->pool != &g_tpool || f->pool != &g_hpool || !f->wmap || !f->smap) return 0;
+        if (t->fmt != f->fmt || t->I != f->I || t->O != f->O || t->gs != f->gs) {
+            size_t sb = scale_floats(f->fmt, f->I, f->O, f->gs) * sizeof(float);
+            if (bd_fmt(f->fmt) != bd_fmt(t->fmt) || f->wbytes > t->wcap || sb > t->scap) return 0;   /* its sets name the table or its scales */
+            t->fmt = f->fmt; t->I = f->I; t->O = f->O; t->gs = f->gs; t->rowWords = f->rowWords; t->wbytes = f->wbytes;
+        }
+        if (!pool_staged(t->pool)) {   /* mapped: the rows and scales through the CPU */
+            if (!t->wmap || !t->smap) return 0;
+            memcpy(t->wmap, f->wmap, f->wbytes);
+            memcpy(t->smap, f->smap, scale_floats(f->fmt, f->I, f->O, f->gs) * sizeof(float));
+        }
+    }
+    return 1;
+}
+int coli_vk_tensor_copy_as(ColiVkTensor *const *dst, ColiVkTensor *const *src, int n) {
+    return copy_as_prep(dst, src, n) && coli_vk_tensor_copy(dst, src, n);
+}
+int coli_vk_xb_sub_copy(int h, ColiVkTensor *const *dst, ColiVkTensor *const *src, int n) {
+    XbCtx *X = &g_xb[0];
+    if (!X->ready || h < 0 || h > 1 || !copy_as_prep(dst, src, n)) return 0;
+    if (!pool_staged(dst[0]->pool)) return 1;   /* copied already */
+    __typeof__(X->sub[0]) *b = &X->sub[h];
+    if (b->ncp + 2 * n > b->ccp) {
+        int nc = b->ccp ? b->ccp : 64;
+        while (nc < b->ncp + 2 * n) nc *= 2;
+        void *p = realloc(b->cp, (size_t)nc * sizeof *b->cp);
+        if (!p) return 0;
+        b->cp = p; b->ccp = nc;
+    }
+    for (int k = 0; k < n; k++) {
+        const ColiVkTensor *f = src[k]; ColiVkTensor *t = dst[k];
+        size_t sb = scale_floats(f->fmt, f->I, f->O, f->gs) * sizeof(float);
+        b->cp[b->ncp].s = f->wbuf; b->cp[b->ncp].d = t->wbuf; b->cp[b->ncp++].n = f->wbytes;
+        if (sb) { b->cp[b->ncp].s = f->sbuf; b->cp[b->ncp].d = t->sbuf; b->cp[b->ncp++].n = sb; }
+    }
+    return 1;
+}
+void coli_vk_xb_sub_copy_drop(void) { g_xb[0].sub[0].ncp = g_xb[0].sub[1].ncp = 0; }
 /* A tier tensor filled again in place (a staging slot of the tier's streaming): mapped
  * memory hands its mapping back (the padding past each row is still the zeros of its
  * allocation, and the caller writes the rows only), staged uploads a fresh zeroed host
@@ -4897,8 +6131,47 @@ int coli_vk_tensor_refill(ColiVkTensor *t, uint8_t **rows, size_t *stride, float
     *stride = (size_t)t->rowWords * 4;
     return 1;
 }
+/* coli_vk_tensor_refill in another format (a streaming slot of a tier whose layers mix
+ * formats): the tensor takes fmt/I/O/gs when its ranges hold them (tensor_alloc_pad's
+ * room), the rows zeroed past their bytes. 0 = no room or no memory. */
+int coli_vk_tensor_refill_as(ColiVkTensor *t, int fmt, int I, int O, int gs,
+                             uint8_t **rows, size_t *stride, float **scales) {
+    if (!G.ready || !t || t->pool != &g_tpool) return 0;
+    if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) { if (gs < 1) return 0; } else gs = 0;
+    if (t->fmt != fmt || t->I != I || t->O != O || t->gs != gs) {
+        if (!fmt_uploadable(fmt, gs) || bd_fmt(fmt) != bd_fmt(t->fmt)) return 0;   /* its sets name the table or its scales */
+        size_t wb = (size_t)rowwords(fmt, I) * 4 * (size_t)O, sb = scale_floats(fmt, I, O, gs) * sizeof(float);
+        if (wb > t->wcap || sb > t->scap) return 0;
+        t->fmt = fmt; t->I = I; t->O = O; t->gs = gs; t->rowWords = rowwords(fmt, I); t->wbytes = wb;
+        if (!g_up[t->dev].on && t->wmap) memset(t->wmap, 0, wb);   /* staged: refill's image is zeroed */
+    }
+    return coli_vk_tensor_refill(t, rows, stride, scales);
+}
 int coli_vk_staged(void) { return G.ready && g_up[0].on; }
 size_t coli_vk_tensor_row_bytes(int fmt, int I) { return cpu_row_bytes(fmt, I); }
+/* elements per block of a block format (shaders/blockdec.glsl), 0 for any other format */
+int coli_vk_block_elems(int fmt) { return !bd_fmt(fmt) || !bd_shaders() ? 0 : fmt == 203 ? 64 : fmt >= 200 ? 128 : (int)BD_BLK[fmt - 100]; }
+void *coli_vk_block_table_dev(int dev) { return bd_shaders() ? (void *)bdtab_buf(dev == 1 ? 1 : 0) : NULL; }
+size_t coli_vk_block_table_bytes(int dev) {
+    const ColiVkTensor *t = __atomic_load_n(&g_bdtab[dev == 1 ? 1 : 0], __ATOMIC_ACQUIRE);
+    return t ? t->acct : 0;
+}
+uint64_t coli_vk_block_table_addr(int dev) {   /* the primary device's (vk_addr's) */
+    VkBuffer b = !dev && bd_shaders() && G.has_bda ? bdtab_buf(0) : VK_NULL_HANDLE;
+    return b ? vk_addr(b) : 0;
+}
+/* vq2's codebooks (two 256 x 8 int8, row-major) into the table buffer. The table is built
+ * once, at the first block-format tensor: call this before (the tier's start); -1 when a
+ * table is already on a device with other books. */
+int coli_vk_set_vq2_books(const int8_t *a, const int8_t *b) {
+    uint32_t w[BDT_WORDS - BDT_VQ2];
+    memcpy(w, a, 2048); memcpy((uint8_t *)w + 2048, b, 2048);
+    pthread_mutex_lock(&g_bdtab_mx);
+    int built = g_bdtab[0] || g_bdtab[1], same = !memcmp(w, g_vq2_words, sizeof w);
+    if (!built) memcpy(g_vq2_words, w, sizeof w);
+    pthread_mutex_unlock(&g_bdtab_mx);
+    return built && !same ? -1 : 0;
+}
 size_t coli_vk_tensor_payload(int fmt, int I, int O, int gs) {
     if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) { if (gs < 1) return 0; } else gs = 0;
     return (size_t)rowwords(fmt, I) * 4 * (size_t)O + scale_floats(fmt, I, O, gs) * sizeof(float);
@@ -4924,10 +6197,11 @@ static void place_report(void) {
     size_t host = ((fd & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? 0 : w.peak_used + t.peak_used + kv + ln);
     const double M = 1048576.0;
     fprintf(stderr, "[VK] memory at exit: weights %.1f MiB, expert tier %.1f MiB (peaks), KV mirror %.1f MiB in "
-            "device-local memory type %u (%s); the dense chain's state in type %u (%s); %.1f MiB staged in %llu copies "
+            "memory type %u (%s, %s); the dense chain's state in type %u (%s); %.1f MiB staged in %llu copies "
             "(%llu submits), %.1f MiB of them straight from host memory in %llu copies (%llu not imported), "
             "%llu blocks zero-filled; resident data in host memory: %.1f MiB\n",
             w.peak_used / M, t.peak_used / M, (kv + ln) / M, u->mt_dev,
+            (fd & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? "device-local" : "host memory",
             (fd & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? "host-visible" : "not host-visible", G.memtype_dev,
             (fc & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? "device-local" : "host memory",
             (u->bytes + PW.bytes + u->imp_bytes) / M, u->copies + u->imp_copies, u->submits, u->imp_bytes / M,
@@ -4945,6 +6219,7 @@ static void dev2_shutdown(void) {
     G2.inflight = 0;
     g_async_inflight[1] = 0;   /* idle: the deferred frees run now */
     tensor_reap(1);
+    bdtab_free(1);
     Scratch *sc[3] = {&G2.x, &G2.h, &G2.y};
     for (int k = 0; k < 3; k++) if (sc[k]->buf) { vkDestroyBuffer(G2.dev, sc[k]->buf, NULL); vkFreeMemory(G2.dev, sc[k]->mem, NULL); }
     if (G2.pool) vkDestroyDescriptorPool(G2.dev, G2.pool, NULL);
@@ -5020,6 +6295,7 @@ void coli_vk_shutdown(void) {
     }
     g_async_inflight[0] = 0;   /* idle after vkDeviceWaitIdle: the deferred frees run now */
     tensor_reap(0);
+    bdtab_free(0);
     pthread_mutex_lock(&g_imports_mx);   /* imported rows: their memory objects go before the device */
     for (ColiVkTensor *t = g_imports; t; t = t->imp_next) {
         vkDestroyBuffer(G.dev, t->wbuf, NULL); vkFreeMemory(G.dev, t->imp, NULL);
@@ -5030,6 +6306,7 @@ void coli_vk_shutdown(void) {
     pool_destroy(&g_wpool);    /* weight blocks: unmapped/freed with the device */
     pool_destroy(&g_tpool);
     pool_destroy(&g_xpool);
+    pool_destroy(&g_hpool);
     if (PW.buf) { vkDestroyBuffer(G.dev, PW.buf, NULL); vkFreeMemory(G.dev, PW.mem, NULL); }
     free(PW.cp);
     memset(&PW, 0, sizeof PW);
@@ -5069,12 +6346,13 @@ int coli_vk_core(ColiVkCore *o) {
     o->integrated = coli_vk_device_integrated(); o->shares_ram = coli_vk_device_shares_ram();
     o->coop_sg = G.has_coop ? G.coop_sg : 0;
     o->pin_sg = G.pin_sg;
+    o->bda = G.has_bda;
     return 1;
 }
 int coli_vk_tensor_info(const ColiVkTensor *t, ColiVkTensorInfo *o) {
     if (!t || !o || t->dev != 0) return 0;
     o->wbuf = (void *)t->wbuf; o->sbuf = (void *)t->sbuf;
-    o->fmt = t->fmt; o->I = t->I; o->O = t->O; o->rowWords = t->rowWords; o->gs = t->gs;
+    o->fmt = t->fmt; o->I = t->I; o->O = t->O; o->rowWords = t->rowWords; o->gs = t->gs; o->wide = t->wide;
     return 1;
 }
 /* A fence the chain waited on failed: the device is gone, everyone falls back. */
@@ -5107,7 +6385,7 @@ int coli_vk_queue_submit_dev(int d, void *queue, const void *submit_info, void *
 int coli_vk_tensor_info_dev(const ColiVkTensor *t, ColiVkTensorInfo *o, int *dev) {
     if (!t || !o || t->dev < 0 || t->dev > 1) return 0;
     o->wbuf = (void *)t->wbuf; o->sbuf = (void *)t->sbuf;
-    o->fmt = t->fmt; o->I = t->I; o->O = t->O; o->rowWords = t->rowWords; o->gs = t->gs;
+    o->fmt = t->fmt; o->I = t->I; o->O = t->O; o->rowWords = t->rowWords; o->gs = t->gs; o->wide = t->wide;
     if (dev) *dev = t->dev;
     return 1;
 }
@@ -5117,14 +6395,7 @@ int coli_vk_mem_budget_dev(int d, double *used_gb, double *budget_gb) {
 size_t coli_vk_device_used_dev(int d) { return (size_t)__atomic_load_n(&g_mem.used[d == 1 ? 1 : 0], __ATOMIC_RELAXED); }
 size_t coli_vk_device_local_bytes_dev(int d) {
     if (d != 1) return coli_vk_device_local_bytes();
-    if (!G2.phys) return 0;
-    VkPhysicalDeviceMemoryProperties mp;
-    vkGetPhysicalDeviceMemoryProperties(G2.phys, &mp);
-    VkDeviceSize m = 0;
-    for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
-        if ((mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mp.memoryHeaps[i].size > m) m = mp.memoryHeaps[i].size;
-    if (g_mem.cap[1] && g_mem.cap[1] < m) m = g_mem.cap[1];   /* COLI_VK_DEVICE_CAP_MB */
-    return (size_t)m;
+    return G2.phys ? vk_device_memory_bytes(G2.phys, 1) : 0;
 }
 size_t coli_vk_free_bytes_dev(int d) {
     if (d != 1) return coli_vk_free_bytes();
@@ -5514,7 +6785,7 @@ static double bench_experts_fair(int fmt, int D, int I, int K, int Npass) {
     vkAllocateDescriptorSets(G.dev, &dsa, sets);
     memcpy(G.x.ptr, x, (size_t)D*4);
     for (int c = 0; c < K; c++) {
-        VkDescriptorBufferInfo bi[6] = {{.buffer=G.x.buf,.range=VK_WHOLE_SIZE},{.buffer=tg[c]->wbuf,.range=VK_WHOLE_SIZE},{.buffer=tg[c]->sbuf,.range=VK_WHOLE_SIZE},{.buffer=tu[c]->wbuf,.range=VK_WHOLE_SIZE},{.buffer=tu[c]->sbuf,.range=VK_WHOLE_SIZE},{.buffer=G.h.buf,.range=VK_WHOLE_SIZE}};
+        VkDescriptorBufferInfo bi[6] = {{.buffer=G.x.buf,.range=VK_WHOLE_SIZE},{.buffer=tg[c]->wbuf,.range=VK_WHOLE_SIZE},{.buffer=sbuf_of(tg[c]),.range=VK_WHOLE_SIZE},{.buffer=tu[c]->wbuf,.range=VK_WHOLE_SIZE},{.buffer=sbuf_of(tu[c]),.range=VK_WHOLE_SIZE},{.buffer=G.h.buf,.range=VK_WHOLE_SIZE}};
         VkWriteDescriptorSet w[6]; for (int i = 0; i < 6; i++) w[i] = (VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=sets[c],.dstBinding=(uint32_t)i,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&bi[i]};
         vkUpdateDescriptorSets(G.dev, 6, w, 0, NULL);
     }
@@ -5624,6 +6895,7 @@ static int run_expert_group(int fmt, int D, int I, int K) {
  * qabs = sum_d q[d]*deq(row rbase+d)*ws, scores over cache rows [st0, T-S+s],
  * softmax, weighted latent, value-row projection. */
 static int g_absorb_rewind;   /* write every row twice, first garbage: a rewound mirror */
+static int g_absorb_grow;     /* the mirror grown a row at a time (coli_vk_kv_grow), as colibri's decode does */
 static int run_absorb(int fmt, int S, int H, int Q, int R, int V, int K, int st0, int T, int layer) {
     size_t rb = ref_rowbytes(fmt, K);
     int O = H * (Q + V), ngK = (K + 63) / 64;
@@ -5638,14 +6910,24 @@ static int run_absorb(int fmt, int S, int H, int Q, int R, int V, int K, int st0
     for (int i = 0; i < T * K; i++) L[i] = (rand() % 200 - 100) / 100.0f;
     for (int i = 0; i < T * R; i++) Rr[i] = (rand() % 200 - 100) / 100.0f;
     float scale = 0.13f;
-    if (!coli_vk_kv_ensure(layer, T, K, R)) { printf("kv_ensure failed\n"); return 1; }
+    if (g_absorb_grow) {   /* 256 rows, then 512, 1024 and T: each new buffer filled again from row 0 */
+        int valid = 0, grown = 0;
+        for (int t = 0; t < T; t++) {
+            int g = coli_vk_kv_grow(layer, t + 1, T, K, R);
+            if (!g) { printf("kv_grow failed at row %d\n", t); return 1; }
+            if (g == 2) { valid = 0; grown++; }
+            for (; valid <= t; valid++)
+                if (!coli_vk_kv_row(layer, valid, L + (size_t)valid * K, Rr + (size_t)valid * R)) { printf("kv_row failed\n"); return 1; }
+        }
+        if (grown != 4) { printf("kv_grow: %d buffers for %d rows, not 4\n", grown, T); return 1; }
+    } else if (!coli_vk_kv_ensure(layer, T, K, R)) { printf("kv_ensure failed\n"); return 1; }
     if (g_absorb_rewind) {   /* garbage rows, then the real ones from the middle and from 0 */
         for (int t = 0; t < T; t++)
             if (!coli_vk_kv_row(layer, t, Rr, L)) { printf("kv_row failed\n"); return 1; }
         for (int t = T / 2; t < T; t++)
             if (!coli_vk_kv_row(layer, t, L + (size_t)t * K, Rr + (size_t)t * R)) { printf("kv_row failed\n"); return 1; }
     }
-    for (int t = 0; t < T; t++)
+    for (int t = 0; t < T && !g_absorb_grow; t++)
         if (!coli_vk_kv_row(layer, t, L + (size_t)t * K, Rr + (size_t)t * R)) { printf("kv_row failed\n"); return 1; }
     ColiVkTensor *kvb = NULL;
     if (!coli_vk_attention_absorb(&kvb, w, ws, fmt, g_ref_gs, cg, q, layer, S, H, Q, R, V, K, st0, T, scale)) {
@@ -5949,7 +7231,7 @@ static int run_xbatch(int fmt, int dfmt, int gs, int D, int I, int act, float li
             for (int d = 0; d < D; d++) ref[(size_t)j * D + d] = (float)xref_dot(hid, md[c].w + (size_t)d * drb, md[c].s, d, dfmt, I, gs);
         }
     int bad = 0; double dms = 0;
-    unsigned long long coop_before = g_xb[0].cooperative_matmuls, coop_expected = 0;
+    unsigned long long coop_before = g_xb[0].cooperative_matmuls, coop_expected = 0, cgv_before = g_xb[0].cgv_batches;
     for (int c = 0; c < K; c++) {
         int slot = gemm_slot(rows[c]);
         if (g_xb[0].gemm_rows && rows[c] >= g_xb[0].gemm_rows && g_xb[0].p_mm[slot])
@@ -5988,9 +7270,16 @@ static int run_xbatch(int fmt, int dfmt, int gs, int D, int I, int act, float li
         else if (!bad) same &= !memcmp(y1, yr[1], (size_t)D * 4);
     }
     const char *an = act == COLI_VK_ACT_SITU ? "situ" : limit > 0 ? "swiglu-limit" : "swiglu";
-    printf("xbatch fmt=%d/%d gs=%d D=%d I=%d %s, rows %d/%d/%d/%d/%d (GEMM from %d, %llu cooperative matmuls) | maxrel=%.3g | row bits independent of the batch: %s | device %.3f ms\n",
+    /* the small experts on the chain's decode kernel (xb_cgv_record) where no grouped route
+     * takes the batches: the first one's beside the GEMMs, the two after it whole */
+    unsigned long long cgv = g_xb[0].cgv_batches - cgv_before;
+    int cf = (fmt == 1 || fmt == 2 || (fmt == 4 && gs % 8 == 0) || (fmt == 7 && gs % 32 == 0)) &&
+             (dfmt == 1 || dfmt == 2 || (dfmt == 4 && gs % 8 == 0) || (dfmt == 7 && gs % 32 == 0)) && D % 32 == 0 && I % 32 == 0;
+    int cgv_want = g_xb[0].cgv && !g_xb[0].grp_rows && cf && (act == COLI_VK_ACT_SWIGLU || act == COLI_VK_ACT_SITU);
+    printf("xbatch fmt=%d/%d gs=%d D=%d I=%d %s, rows %d/%d/%d/%d/%d (GEMM from %d, %llu cooperative matmuls, %llu on chain_moe_gv) | maxrel=%.3g | row bits independent of the batch: %s | device %.3f ms\n",
            fmt, dfmt, gs, D, I, an, rows[0], rows[1], rows[2], rows[3], rows[4], g_xb[0].gemm_rows,
-           coop_done, maxrel, same ? "yes" : "NO", dms);
+           coop_done, cgv, maxrel, same ? "yes" : "NO", dms);
+    if (cgv_want && cgv < 3) { printf("xbatch fmt=%d/%d: %llu batches on chain_moe_gv, expected 3\n", fmt, dfmt, cgv); bad = 1; }
     if (maxrel > 3e-3 || !same) bad = 1;
     for (int c = 0; c < K; c++) { coli_vk_xb_expert_free(ex[c]); xmat_drop(&mg[c]); xmat_drop(&mu[c]); xmat_drop(&md[c]); }
     free(x); free(ref); free(hid); free(xr); free(yr); free(y1);
@@ -6460,6 +7749,11 @@ int main(int argc, char **argv) {
      * cases above. CI runs this on Lavapipe, where the benches below say nothing and
      * take most of the time. */
     if (getenv("COLI_VK_TEST_MATMUL_ONLY") && atoi(getenv("COLI_VK_TEST_MATMUL_ONLY"))) {
+        if (G.pipe_att) {   /* the absorb core's KV mirror growing with the conversation (#2314), staged and mapped */
+            g_absorb_grow = 1;
+            bad |= run_absorb(2, 1, 64, 192, 64, 256, 512, 0, 1500, 10);
+            g_absorb_grow = 0;
+        }
         printf("outputs digest %016llx\n", (unsigned long long)g_digest);
         bad |= run_late_cases();
         printf(bad ? "FAIL\n" : "PASS\n");
@@ -6580,6 +7874,9 @@ int main(int argc, char **argv) {
         g_absorb_rewind = 1;   /* every row written twice, out of order: a rewound mirror */
         bad |= run_absorb(2, 1, 64, 192, 64, 256, 512, 0, 300, 9);
         g_absorb_rewind = 0;
+        g_absorb_grow = 1;     /* a mirror that grows with the conversation (#2314) */
+        bad |= run_absorb(2, 1, 64, 192, 64, 256, 512, 0, 1500, 10);
+        g_absorb_grow = 0;
     }
     printf("outputs digest %016llx\n", (unsigned long long)g_digest);
     bad |= run_late_cases();

@@ -1,0 +1,745 @@
+# CUDA chain, the one-pass prompt attention (cc_attn_f2) on sm_75: the tests, the code other cards run, and the kernel each version runs (2026-10-28)
+# Google Colab T4 high-RAM VM: Intel(R) Xeon(R) CPU @ 2.00GHz (4 cores / 8 threads, 38.5 MiB L3) + NVIDIA Tesla T4 (15360 MiB, sm_75, up to PCIe Gen3 x16), 51 GiB; Ubuntu 24.04.4 LTS, CUDA 13.0 (nvcc V13.0.88), driver 580.82.07, gcc 13.3.0.
+# Model: Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64 (int4, 64-input groups; 40 layers of 256 experts, 10 of them full attention with 16 query heads and 2 kv heads of 256); CUDA_EXPERT_GB=auto: 6605 of the 10240 experts on the card, 3635 in the page-locked host pool, no heat file; the KV cache and its mirrors float16 (origin/dev's default).
+# This change's commit is 60c72fa6 (c/ tree df3fc684854104c832825d064485ff5fab970b52), on origin/dev 2e981752; the runs measured it before its review, 3655d4e8 (correctness.txt prints the review's diff).
+# Harness: bench.c beside this file (sha256 8bfbeab882467558e8647dd03543ded67696e64917c4a4c2b137d146de2db458), built against each version's c/ by bench's driver (make CUDA=1 CUDA_ARCH=sm_75).
+
+## the review's diff: the runs measured 3655d4e8; this change is 60c72fa6 (`git diff 3655d4e8 60c72fa6 -- c`)
+#   | diff --git a/c/cuda_chain.cu b/c/cuda_chain.cu
+#   | index 4a19d2b1..c8c18251 100644
+#   | --- a/c/cuda_chain.cu
+#   | +++ b/c/cuda_chain.cu
+#   | @@ -410,8 +410,9 @@ __global__ static void __launch_bounds__(128) cc_attn_fk(const float *__restrict
+#   |  #endif
+#   |  }
+#   |  /* A prompt chunk's causal attention in one pass on the tensor cores' m16n8k16 f16 MMA (sm_80
+#   | - * and later; on sm_75 each is two m16n8k8), FlashAttention-2's online softmax. A block of NW warps takes 16 * NW query rows:
+#   | - * 16 * NW / GQ tokens x the GQ query heads of one kv head, warp w rows 16w .. 16w + 15, so each
+#   | + * and later; on sm_75 each is two m16n8k8), FlashAttention-2's online softmax. A block of NW
+#   | + * warps takes 16 * NW query rows: 16 * NW / GQ tokens x the GQ query heads of one kv head,
+#   | + * warp w rows 16w .. 16w + 15, so each
+#   |   * key block of BC keys is staged once for all of them (K and V rounded to f16 as they are
+#   |   * staged, rows of HD + 8 halves). A warp's scores stay in its registers: per row the running
+#   |   * max m and sum l rescale its output fragments as the blocks go by, and P = exp(s - m) goes
+#   | @@ -595,24 +596,26 @@ __global__ static void __launch_bounds__(32 * NW) cc_attn_f2(const float *__rest
+#   |      }
+#   |  #endif
+#   |  }
+#   | +#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)   /* the opt-in limit's attribute is CUDA's */
+#   |  /* cc_attn_f2 at head dim 256 with blocks of BC keys (1: launched); ok says whether the card gives
+#   |   * its shared memory, asked once: 1 allowed, -1 refused, 0 not asked */
+#   | -template <int BC, bool QREG, typename KT>
+#   | +template <int BC, typename KT>
+#   |  static int cc_f2_256(CcCtx *c, int &ok, dim3 fg, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, const CcAttn *p,
+#   |                       int G, int win, const float *sk, int so, int ring) {
+#   | -    const size_t sm = cc_f2_smem_bytes<256, 4, BC, QREG>();
+#   | +    const size_t sm = cc_f2_smem_bytes<256, 4, BC, false>();
+#   |      if (!ok) {
+#   |          int optin = 0;
+#   |          ok = cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, c->device) == cudaSuccess &&
+#   |               (size_t)optin >= sm &&
+#   | -             cudaFuncSetAttribute(cc_attn_f2<256, 4, BC, QREG, KT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm) == cudaSuccess
+#   | +             cudaFuncSetAttribute(cc_attn_f2<256, 4, BC, false, KT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm) == cudaSuccess
+#   |               ? 1 : -1;
+#   |          (void)cudaGetLastError();
+#   |      }
+#   |      if (ok < 0) return 0;
+#   | -    cc_attn_f2<256, 4, BC, QREG, KT><<<fg, 128, sm, c->stream>>>(fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
+#   | +    cc_attn_f2<256, 4, BC, false, KT><<<fg, 128, sm, c->stream>>>(fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
+#   |      return 1;
+#   |  }
+#   | +#endif
+#   |  /* cc_attn_f2 for a prompt chunk where it applies (1: launched): sm_75 and later, head dim 64,
+#   |   * 128 or 256, the query heads of a kv head dividing 64, rows and caches at float4 offsets;
+#   |   * COLI_CUDA_CHAIN_FLASH2=0 keeps cc_attn_fk */
+#   | @@ -634,8 +637,8 @@ static int cc_attn_f2_go(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcB
+#   |      } else {   /* blocks of 32 keys where the card gives 66 KiB, else of 16 (49.5 KiB: a T4 gives 64) */
+#   |          int &big = sizeof(KT) == 2 ? c->f2_big_h : c->f2_big;   /* a float16 cache's kernels are other functions */
+#   |          int &mid = sizeof(KT) == 2 ? c->f2_mid_h : c->f2_mid;
+#   | -        if (!cc_f2_256<32, false, KT>(c, big, fg, q, kc, vc, o, gate, p, G, win, sk, so, ring) &&
+#   | -            !cc_f2_256<16, false, KT>(c, mid, fg, q, kc, vc, o, gate, p, G, win, sk, so, ring)) return 0;
+#   | +        if (!cc_f2_256<32, KT>(c, big, fg, q, kc, vc, o, gate, p, G, win, sk, so, ring) &&
+#   | +            !cc_f2_256<16, KT>(c, mid, fg, q, kc, vc, o, gate, p, G, win, sk, so, ring)) return 0;
+#   |      }
+#   |      return 1;
+#   |  #else
+#   | diff --git a/c/tests/test_cuda_chain.cu b/c/tests/test_cuda_chain.cu
+#   | index 9adaeafe..375b518d 100644
+#   | --- a/c/tests/test_cuda_chain.cu
+#   | +++ b/c/tests/test_cuda_chain.cu
+#   | @@ -243,6 +243,44 @@ static std::vector<float> down(CcBuf *b, size_t n) {
+#   |  }
+#   |  static std::vector<float> rnd(size_t n, unsigned seed, float scale = 1.f) { std::vector<float> v(n); unsigned s = seed; for (auto &x : v) x = frand(&s) * scale; return v; }
+#   |  
+#   | +/* A chunk as long as an 8192-token prompt's last, Qwen3.6's attention: 2043 rows after 6144
+#   | + * positions, H 16, KV 2, hd 256, on the tensor cores where the card has them (in one pass from
+#   | + * sm_75; a T4's blocks of 16 keys). 2043 rows leave the last block of 8 tokens 3, the ragged
+#   | + * edge. Four rows within 1e-4 of the reference (the kernel's error is ~4e-6, and half a k16
+#   | + * wrong misses by ~8e-3: the means over 8000 keys are small), and a float16 cache of the same
+#   | + * values (attn_h) gives the float32 cache's bits. */
+#   | +static void prompt_rows_one_pass_long(void) {
+#   | +    const int H = 16, KV = 2, hd = 256, S = 2043, pos = 6144, cap = 8384, qdim = 2 * hd, k_off = 32;
+#   | +    std::vector<float> q = rnd((size_t)S * H * qdim, 61), kc = rnd((size_t)k_off + (size_t)KV * cap * hd, 62),
+#   | +                       vc = rnd(kc.size(), 63);
+#   | +    kv16_round(kc.data(), (int64_t)kc.size()); kv16_round(vc.data(), (int64_t)vc.size());   /* the same values in both caches */
+#   | +    size_t n = (size_t)S * H * hd;
+#   | +    CcAttn p = {S, H, KV, hd, pos, cap, 0, H * qdim, qdim, hd, H * qdim, qdim, 1, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), k_off, k_off};
+#   | +    CcBuf *qb = up(q), *kb = up(kc), *vb = up(vc), *ob = T->buf(n * 4, CC_DEV);
+#   | +    int ran = T->begin() && T->attn(qb, kb, vb, ob, qb, NULL, &p) && T->submit(1);
+#   | +    std::vector<float> o = down(ob, n);
+#   | +    double d = 0;
+#   | +    for (int r : {0, 1, 1024, 2042}) {   /* a row alone: one position more each */
+#   | +        CcAttn pr = p; pr.S = 1; pr.pos_base = pos + r; pr.q_off = r * p.q_row; pr.g_off = p.g_off + r * p.g_row; pr.o_off = 0;
+#   | +        std::vector<float> ref((size_t)H * hd);
+#   | +        ref_attn(q.data(), kc.data(), vc.data(), ref.data(), q.data(), NULL, &pr);
+#   | +        d = fmax(d, maxdiff(o.data() + (size_t)r * H * hd, ref.data(), ref.size()));
+#   | +    }
+#   | +    ck(ran && d < 1e-4, "prompt rows, a long chunk: H 16 KV 2 hd 256, 2043 rows after 6144, rows 0, 1, 1024 and 2042");
+#   | +    printf("  the long chunk, rows 0, 1, 1024 and 2042: max |diff| %.2e\n", d);
+#   | +    if (T->size < offsetof(ColiCudaChainOps, copy_regions_h) + sizeof T->copy_regions_h || !T->kvh()) printf("  (no float16 cache here)\n");
+#   | +    else {
+#   | +        std::vector<uint16_t> kh(kc.size()), vh(vc.size());
+#   | +        kv16_pack(kh.data(), kc.data(), (int64_t)kc.size()); kv16_pack(vh.data(), vc.data(), (int64_t)vc.size());
+#   | +        CcBuf *khb = T->buf(kh.size() * 2, CC_DEV), *vhb = T->buf(vh.size() * 2, CC_DEV), *o16 = T->buf(n * 4, CC_DEV);
+#   | +        int ok = ran && khb && vhb && o16 && T->begin() && T->write(khb, 0, kh.data(), kh.size() * 2) &&
+#   | +                 T->write(vhb, 0, vh.data(), vh.size() * 2) && T->attn_h(qb, khb, vhb, o16, qb, NULL, &p) && T->submit(1);
+#   | +        ck(ok && !memcmp(o.data(), down(o16, n).data(), n * 4), "and from a float16 cache of the same values, the float32 cache's bits");
+#   | +        T->free(khb); T->free(vhb); T->free(o16);
+#   | +    }
+#   | +    T->free(qb); T->free(kb); T->free(vb); T->free(ob);
+#   | +}
+#   | +
+#   |  /* the router's pick (chain_route.comp's rules: the lower expert on a tie, groups by their two best) */
+#   |  static void ref_route(const float *l, const float *bias, int *ids, float *w, const CcRoute *p) {
+#   |      std::vector<float> sc(p->E), pk(p->E);
+#   | @@ -334,42 +372,6 @@ static ColiCudaTensor *moe_mat(int fmt, int gs, int I, int O, unsigned seed, std
+#   |      return ok ? t : NULL;
+#   |  }
+#   |  
+#   | -/* The last chunk of an 8192-token prompt, Qwen3.6's attention: 2043 rows after 6144 positions,
+#   | - * H 16, KV 2, hd 256, on the tensor cores where the card has them (in one pass from sm_75; a
+#   | - * T4's blocks of 16 keys). Four rows within 4e-3 of the reference, and a float16 cache of the
+#   | - * same values (attn_h) gives the float32 cache's bits. */
+#   | -static void prompt_rows_one_pass_long(void) {
+#   | -    const int H = 16, KV = 2, hd = 256, S = 2043, pos = 6144, cap = 8384, qdim = 2 * hd, k_off = 32;
+#   | -    std::vector<float> q = rnd((size_t)S * H * qdim, 61), kc = rnd((size_t)k_off + (size_t)KV * cap * hd, 62),
+#   | -                       vc = rnd(kc.size(), 63);
+#   | -    kv16_round(kc.data(), (int64_t)kc.size()); kv16_round(vc.data(), (int64_t)vc.size());   /* the same values in both caches */
+#   | -    size_t n = (size_t)S * H * hd;
+#   | -    CcAttn p = {S, H, KV, hd, pos, cap, 0, H * qdim, qdim, hd, H * qdim, qdim, 1, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), k_off, k_off};
+#   | -    CcBuf *qb = up(q), *kb = up(kc), *vb = up(vc), *ob = T->buf(n * 4, CC_DEV);
+#   | -    int ran = T->begin() && T->attn(qb, kb, vb, ob, qb, NULL, &p) && T->submit(1);
+#   | -    std::vector<float> o = down(ob, n);
+#   | -    double d = 0;
+#   | -    for (int r : {0, 1, 1024, 2042}) {   /* a row alone: one position more each */
+#   | -        CcAttn pr = p; pr.S = 1; pr.pos_base = pos + r; pr.q_off = r * p.q_row; pr.g_off = p.g_off + r * p.g_row; pr.o_off = 0;
+#   | -        std::vector<float> ref((size_t)H * hd);
+#   | -        ref_attn(q.data(), kc.data(), vc.data(), ref.data(), q.data(), NULL, &pr);
+#   | -        d = fmax(d, maxdiff(o.data() + (size_t)r * H * hd, ref.data(), ref.size()));
+#   | -    }
+#   | -    ck(ran && d < 4e-3, "prompt rows, the last chunk of 8192: H 16 KV 2 hd 256, 2043 rows after 6144, rows 0, 1, 1024 and 2042");
+#   | -    printf("  the last chunk of 8192, rows 0, 1, 1024 and 2042: max |diff| %.2e\n", d);
+#   | -    if (T->size < offsetof(ColiCudaChainOps, copy_regions_h) + sizeof T->copy_regions_h || !T->kvh()) printf("  (no float16 cache here)\n");
+#   | -    else {
+#   | -        std::vector<uint16_t> kh(kc.size()), vh(vc.size());
+#   | -        kv16_pack(kh.data(), kc.data(), (int64_t)kc.size()); kv16_pack(vh.data(), vc.data(), (int64_t)vc.size());
+#   | -        CcBuf *khb = T->buf(kh.size() * 2, CC_DEV), *vhb = T->buf(vh.size() * 2, CC_DEV), *o16 = T->buf(n * 4, CC_DEV);
+#   | -        int ok = ran && khb && vhb && o16 && T->begin() && T->write(khb, 0, kh.data(), kh.size() * 2) &&
+#   | -                 T->write(vhb, 0, vh.data(), vh.size() * 2) && T->attn_h(qb, khb, vhb, o16, qb, NULL, &p) && T->submit(1);
+#   | -        ck(ok && !memcmp(o.data(), down(o16, n).data(), n * 4), "and from a float16 cache of the same values, the float32 cache's bits");
+#   | -        T->free(khb); T->free(vhb); T->free(o16);
+#   | -    }
+#   | -    T->free(qb); T->free(kb); T->free(vb); T->free(ob);
+#   | -}
+#   | -
+#   |  int main(void) {
+#   |      int dev = 0;
+#   |      if (!coli_cuda_init(&dev, 1)) { printf("no CUDA device: skipped\n"); return 0; }
+
+## the tests on this change (3fd269b2, this commit's tree), on a second T4 VM after the review: each make log's sha256 and its result lines
+
+=== make cuda-chain-check CUDA_ARCH=sm_75, rc 0 (make log sha256 66c6819089cd79263926ad8c285268294c9b12eb186fb9e2e840e1fed0b0bce4) ===
+3fd269b2 CUDA chain: cc_attn_f2 on sm_75 too
+  ok   prompt rows: H 4 KV 2 hd 64, 40 rows after 0, the gate
+  prompt rows: H 4 KV 2 hd 64, 40 rows after 0, the gate: max |diff| 1.52e-04
+  ok   prompt rows: H 16 KV 2 hd 256, 70 rows after 33, the gate
+  prompt rows: H 16 KV 2 hd 256, 70 rows after 33, the gate: max |diff| 6.80e-05
+  ok   prompt rows: H 8 KV 8 hd 128, 17 rows after 200
+  prompt rows: H 8 KV 8 hd 128, 17 rows after 200: max |diff| 4.78e-05
+  ok   prompt rows: H 16 KV 4 hd 128, 64 rows after 0
+  prompt rows: H 16 KV 4 hd 128, 64 rows after 0: max |diff| 3.16e-04
+  ok   prompt rows, window 129 and sinks: H 32 KV 4 hd 128, 300 rows after 700
+  prompt rows, window 129 and sinks: H 32 KV 4 hd 128, 300 rows after 700: max |diff| 7.69e-05
+  ok   prompt rows, window 129 and sinks: H 32 KV 4 hd 128, 90 rows after 900, a ring
+  prompt rows, window 129 and sinks: H 32 KV 4 hd 128, 90 rows after 900, a ring: max |diff| 6.89e-05
+  ok   prompt rows, window 100 and sinks: H 16 KV 2 hd 256, 70 rows after 300
+  prompt rows, window 100 and sinks: H 16 KV 2 hd 256, 70 rows after 300: max |diff| 7.39e-05
+  ok   prompt rows, window 20 and sinks: H 8 KV 8 hd 64, 33 rows after 0
+  prompt rows, window 20 and sinks: H 8 KV 8 hd 64, 33 rows after 0: max |diff| 2.64e-04
+  ok   prompt rows, window 513 and sinks: H 32 KV 4 hd 128, 200 rows after 0
+  prompt rows, window 513 and sinks: H 32 KV 4 hd 128, 200 rows after 0: max |diff| 3.20e-04
+  ok   prompt rows, a long chunk: H 16 KV 2 hd 256, 2043 rows after 6144, rows 0, 1, 1024 and 2042
+  the long chunk, rows 0, 1, 1024 and 2042: max |diff| 4.15e-06
+  ok   and from a float16 cache of the same values, the float32 cache's bits
+  ok   a float16 cache: H 16 KV 2 hd 256, 3 rows after 2500: a float32 cache's bits
+  ok   a float16 cache: H 8 KV 8 hd 128, 4 rows after 700: a float32 cache's bits
+  ok   a float16 cache: H 16 KV 2 hd 256, 70 rows after 33: a float32 cache's bits
+  ok   a float16 cache: H 4 KV 2 hd 64, 40 rows after 0: a float32 cache's bits
+  ok   a float16 cache: H 32 KV 4 hd 128, 1 rows after 4000, a window and sinks in a ring: a float32 cache's bits
+  ok   a float16 cache: H 32 KV 4 hd 128, 90 rows after 900, a window and sinks in a ring: a float32 cache's bits
+  ok   a float16 cache: H 32 KV 4 hd 128, 3 rows after 5000, a window and sinks: a float32 cache's bits
+OK test_cuda_chain: every op of the CUDA chain matches its reference
+  ok   a failed launch loses the device to the chain
+  ok   every later call returns 0
+OK test_cuda_chain: every op of the CUDA chain matches its reference
+
+=== the same with b0 and b1 swapped in the pair of m16n8k8 (vm/muta.py 1): the prompt rows must fail against the reference; make rc 2, as the step wants (make log sha256 696c7f15b77d8ecdb538c66aab6ef0aa8b7e54f445c9556f8f8371e9cf8e7dfc) ===
+muta 1 ok
+ c/cuda_chain.cu | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+  FAIL prompt rows: H 4 KV 2 hd 64, 40 rows after 0, the gate
+  prompt rows: H 4 KV 2 hd 64, 40 rows after 0, the gate: max |diff| 1.21e+00
+  FAIL prompt rows: H 16 KV 2 hd 256, 70 rows after 33, the gate
+  prompt rows: H 16 KV 2 hd 256, 70 rows after 33, the gate: max |diff| 1.93e-01
+  FAIL prompt rows: H 8 KV 8 hd 128, 17 rows after 200
+  prompt rows: H 8 KV 8 hd 128, 17 rows after 200: max |diff| 7.68e-02
+  FAIL prompt rows: H 16 KV 4 hd 128, 64 rows after 0
+  prompt rows: H 16 KV 4 hd 128, 64 rows after 0: max |diff| 1.96e+00
+  FAIL prompt rows, window 129 and sinks: H 32 KV 4 hd 128, 300 rows after 700
+  prompt rows, window 129 and sinks: H 32 KV 4 hd 128, 300 rows after 700: max |diff| 1.69e-01
+  FAIL prompt rows, window 129 and sinks: H 32 KV 4 hd 128, 90 rows after 900, a ring
+  prompt rows, window 129 and sinks: H 32 KV 4 hd 128, 90 rows after 900, a ring: max |diff| 1.53e-01
+  FAIL prompt rows, window 100 and sinks: H 16 KV 2 hd 256, 70 rows after 300
+  prompt rows, window 100 and sinks: H 16 KV 2 hd 256, 70 rows after 300: max |diff| 1.69e-01
+  FAIL prompt rows, window 20 and sinks: H 8 KV 8 hd 64, 33 rows after 0
+  prompt rows, window 20 and sinks: H 8 KV 8 hd 64, 33 rows after 0: max |diff| 1.60e+00
+  FAIL prompt rows, window 513 and sinks: H 32 KV 4 hd 128, 200 rows after 0
+  prompt rows, window 513 and sinks: H 32 KV 4 hd 128, 200 rows after 0: max |diff| 1.60e+00
+  FAIL prompt rows, a long chunk: H 16 KV 2 hd 256, 2043 rows after 6144, rows 0, 1, 1024 and 2042
+  the long chunk, rows 0, 1, 1024 and 2042: max |diff| 9.54e-03
+  ok   and from a float16 cache of the same values, the float32 cache's bits
+  ok   a float16 cache: H 16 KV 2 hd 256, 3 rows after 2500: a float32 cache's bits
+  ok   a float16 cache: H 8 KV 8 hd 128, 4 rows after 700: a float32 cache's bits
+  ok   a float16 cache: H 16 KV 2 hd 256, 70 rows after 33: a float32 cache's bits
+  ok   a float16 cache: H 4 KV 2 hd 64, 40 rows after 0: a float32 cache's bits
+  ok   a float16 cache: H 32 KV 4 hd 128, 1 rows after 4000, a window and sinks in a ring: a float32 cache's bits
+  ok   a float16 cache: H 32 KV 4 hd 128, 90 rows after 900, a window and sinks in a ring: a float32 cache's bits
+  ok   a float16 cache: H 32 KV 4 hd 128, 3 rows after 5000, a window and sinks: a float32 cache's bits
+make rc=2
+?? cuda_chain_test
+
+=== the same with the second m16n8k8 taking a[0] and a[1] instead of a[2] and a[3] (vm/muta.py 2); make rc 2, as the step wants (make log sha256 81c6e874ac500f9df5d62c0bee60a2366e39eeb5afd42d1b40f5a14395c04851) ===
+muta 2 ok
+ c/cuda_chain.cu | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+  FAIL prompt rows: H 4 KV 2 hd 64, 40 rows after 0, the gate
+  prompt rows: H 4 KV 2 hd 64, 40 rows after 0, the gate: max |diff| 6.71e-01
+  FAIL prompt rows: H 16 KV 2 hd 256, 70 rows after 33, the gate
+  prompt rows: H 16 KV 2 hd 256, 70 rows after 33, the gate: max |diff| 1.34e-01
+  FAIL prompt rows: H 8 KV 8 hd 128, 17 rows after 200
+  prompt rows: H 8 KV 8 hd 128, 17 rows after 200: max |diff| 8.45e-02
+  FAIL prompt rows: H 16 KV 4 hd 128, 64 rows after 0
+  prompt rows: H 16 KV 4 hd 128, 64 rows after 0: max |diff| 1.11e+00
+  FAIL prompt rows, window 129 and sinks: H 32 KV 4 hd 128, 300 rows after 700
+  prompt rows, window 129 and sinks: H 32 KV 4 hd 128, 300 rows after 700: max |diff| 1.29e-01
+  FAIL prompt rows, window 129 and sinks: H 32 KV 4 hd 128, 90 rows after 900, a ring
+  prompt rows, window 129 and sinks: H 32 KV 4 hd 128, 90 rows after 900, a ring: max |diff| 1.21e-01
+  FAIL prompt rows, window 100 and sinks: H 16 KV 2 hd 256, 70 rows after 300
+  prompt rows, window 100 and sinks: H 16 KV 2 hd 256, 70 rows after 300: max |diff| 1.48e-01
+  FAIL prompt rows, window 20 and sinks: H 8 KV 8 hd 64, 33 rows after 0
+  prompt rows, window 20 and sinks: H 8 KV 8 hd 64, 33 rows after 0: max |diff| 9.14e-01
+  FAIL prompt rows, window 513 and sinks: H 32 KV 4 hd 128, 200 rows after 0
+  prompt rows, window 513 and sinks: H 32 KV 4 hd 128, 200 rows after 0: max |diff| 1.14e+00
+  FAIL prompt rows, a long chunk: H 16 KV 2 hd 256, 2043 rows after 6144, rows 0, 1, 1024 and 2042
+  the long chunk, rows 0, 1, 1024 and 2042: max |diff| 7.86e-03
+  ok   and from a float16 cache of the same values, the float32 cache's bits
+  ok   a float16 cache: H 16 KV 2 hd 256, 3 rows after 2500: a float32 cache's bits
+  ok   a float16 cache: H 8 KV 8 hd 128, 4 rows after 700: a float32 cache's bits
+  ok   a float16 cache: H 16 KV 2 hd 256, 70 rows after 33: a float32 cache's bits
+  ok   a float16 cache: H 4 KV 2 hd 64, 40 rows after 0: a float32 cache's bits
+  ok   a float16 cache: H 32 KV 4 hd 128, 1 rows after 4000, a window and sinks in a ring: a float32 cache's bits
+  ok   a float16 cache: H 32 KV 4 hd 128, 90 rows after 900, a window and sinks in a ring: a float32 cache's bits
+  ok   a float16 cache: H 32 KV 4 hd 128, 3 rows after 5000, a window and sinks: a float32 cache's bits
+make rc=2
+?? cuda_chain_test
+
+=== make cuda-test CUDA=1 CUDA_ARCH=sm_75: each test binary and its last line, rc 0 (make log sha256 5d78a83b5af3c853d9d219bb4e34a2cb3ba3968b8633ba7656f2acc77d021948) ===
+./backend_cuda_test: cuda backend: q8/q4/q2/f32/e8 correctness ok on 1 device(s)
+./cuda_init_failure_test: CUDA initialization rollback: PASS
+./ragged_attention_test: ragged_relative_rms=0 ragged_g64_relative_rms=0 warm_ms=6.981 cross_page_growth_ms=0.106 grow_1024_ms=2.302 steady_1024_ms=0.264
+./cuda_fmt_trap_test: cuda fmt trap tests: ok
+./fp8_warp_test: OK
+./absorb_determinism_test: absorb_determinism iters_per_cell=30 S_batch=128 S_ragged=128 batch_differing=0/145 batch_worst_pct_of_range=0 ragged_differing=0/29 ragged_worst_pct_of_range=0
+./fp8_cuda_test: OK
+./weights_owned_test: weights_owned upload-failure test passed (8 fail cycles, 0 bytes cumulative)
+./mxfp4_cuda_test: test_mxfp4_cuda: ok
+./mxfp4_expert_cuda_test: ok SiTU expert S=1 D=64 I=128 b1=1.5 b2=2.5
+./alloc_footprint_test: test_alloc_footprint_cuda: ok
+
+## the two m16n8k8 mutations of the counter-tests (vm/muta.py, sha256 529d6ce98db288ae4efa414c94345feb70542a5a200f54a1bed61ac72a68cd8d)
+#   | #!/usr/bin/env python3
+#   | # muta.py <cuda_chain.cu> <1|2>: a counter-test of the sm_75 MMA pair, one exact line changed (asserted once).
+#   | #  1: b0 and b1 swapped (each k half multiplied by the other half's B)
+#   | #  2: the second m16n8k8 with a0 a1 (k 0-7 twice, k 8-15 never)
+#   | import sys
+#   | p, case = sys.argv[1], sys.argv[2]
+#   | L1 = '                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(b0));\n'
+#   | L2 = '                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[2]), "r"(a[3]), "r"(b1));\n'
+#   | s = open(p).read()
+#   | assert s.count(L1) == 1 and s.count(L2) == 1, "the pair's lines are not there once each"
+#   | if case == "1":
+#   |     s = s.replace(L1, L1.replace('"r"(b0)', '"r"(b1)')).replace(L2, L2.replace('"r"(b1)', '"r"(b0)'))
+#   | else:
+#   |     s = s.replace(L2, L2.replace('"r"(a[2]), "r"(a[3])', '"r"(a[0]), "r"(a[1])'))
+#   | open(p, "w").write(s)
+#   | print("muta", case, "ok")
+
+## the review changed no device code: every function of cuda_chain.o built for sm_75, sm_80 and sm_89, 3bf5bd91 (the runs' tree) against 3fd269b2 (make cuda_chain.o CUDA=1 CUDA_ARCH=<arch>, cuobjdump -sass; each dump's sha256, then vm2/sass-tutte.py, sha256 cd2b9c9edbd9c437014a891745c7acd99cc2ba60b2205a1ee7eadcd572432e4d)
+== sm_75
+00eb91b5be39f111dd2da2c0984e24f7271db3f84180ab6c1ab59d1b52b05e04  /content/p2/sass/old-sm_75.txt
+00eb91b5be39f111dd2da2c0984e24f7271db3f84180ab6c1ab59d1b52b05e04  /content/p2/sass/pr-sm_75.txt
+functions on OLD: 56; on PR: 56; the same SASS: 56; different: 0; missing on PR: 0; new on PR: 0
+== sm_80
+2ef41aca4eb466252ee3f066401af69f7b63dc742505f8b66ef289c6cc1ad31e  /content/p2/sass/old-sm_80.txt
+2ef41aca4eb466252ee3f066401af69f7b63dc742505f8b66ef289c6cc1ad31e  /content/p2/sass/pr-sm_80.txt
+functions on OLD: 56; on PR: 56; the same SASS: 56; different: 0; missing on PR: 0; new on PR: 0
+== sm_89
+46aeea84386e7db7d091621f8676a08aa1c5994166f20bafc58da5969b5b6fe3  /content/p2/sass/old-sm_89.txt
+46aeea84386e7db7d091621f8676a08aa1c5994166f20bafc58da5969b5b6fe3  /content/p2/sass/pr-sm_89.txt
+functions on OLD: 56; on PR: 56; the same SASS: 56; different: 0; missing on PR: 0; new on PR: 0
+
+## the code other cards run: sm_80 and sm_89, origin/dev against 3655d4e8. Each cc_attn_f2 function's SASS (nvcc -cubin of cuda_chain.o, cuobjdump -sass), compared line by line (vm/sass.py, sha256 943b1eef49aafdfc6198f52449af352822366e4618f3c518157e42aea700b8fe)
+== sm_80
+cc_attn_f2 functions on dev: 6; the same SASS on the PR: 6; different: 0; missing: 0; new: 2
+  new _Z10cc_attn_f2ILi256ELi4ELi16ELb0E6__halfEvPKfPKT3_S5_PfS2_6CcAttniiS2_ii
+  new _Z10cc_attn_f2ILi256ELi4ELi16ELb0EfEvPKfPKT3_S4_PfS1_6CcAttniiS1_ii
+== sm_89
+cc_attn_f2 functions on dev: 6; the same SASS on the PR: 6; different: 0; missing: 0; new: 2
+  new _Z10cc_attn_f2ILi256ELi4ELi16ELb0E6__halfEvPKfPKT3_S5_PfS2_6CcAttniiS2_ii
+  new _Z10cc_attn_f2ILi256ELi4ELi16ELb0EfEvPKfPKT3_S4_PfS1_6CcAttniiS1_ii
+
+## the shared-memory forms at head dim 256 on sm_75: a probe commit, not part of this change (12f235b7, on 3655d4e8), picks cc_attn_f2<256, 4, 32, true> (queries in registers, 33,792 bytes) with DIAG_F2_T4=1, else <256, 4, 16, false> (this change, 50,688 bytes). Its diff:
+#   | diff --git a/c/cuda_chain.cu b/c/cuda_chain.cu
+#   | index 4a19d2b1..62090d56 100644
+#   | --- a/c/cuda_chain.cu
+#   | +++ b/c/cuda_chain.cu
+#   | @@ -634,8 +634,11 @@ static int cc_attn_f2_go(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcB
+#   |      } else {   /* blocks of 32 keys where the card gives 66 KiB, else of 16 (49.5 KiB: a T4 gives 64) */
+#   |          int &big = sizeof(KT) == 2 ? c->f2_big_h : c->f2_big;   /* a float16 cache's kernels are other functions */
+#   |          int &mid = sizeof(KT) == 2 ? c->f2_mid_h : c->f2_mid;
+#   | +        static int t4 = -1;   /* DIAG (a probe, never published): 1 = Q in registers, 32 keys (33 KiB) */
+#   | +        if (t4 < 0) { const char *e = getenv("DIAG_F2_T4"); t4 = e && *e == '1'; fprintf(stderr, "[diag] f2 T4 form %s\n", t4 ? "qreg 32" : "16 keys"); }
+#   |          if (!cc_f2_256<32, false, KT>(c, big, fg, q, kc, vc, o, gate, p, G, win, sk, so, ring) &&
+#   | -            !cc_f2_256<16, false, KT>(c, mid, fg, q, kc, vc, o, gate, p, G, win, sk, so, ring)) return 0;
+#   | +            !(t4 ? cc_f2_256<32, true, KT>(c, mid, fg, q, kc, vc, o, gate, p, G, win, sk, so, ring)
+#   | +                 : cc_f2_256<16, false, KT>(c, mid, fg, q, kc, vc, o, gate, p, G, win, sk, so, ring))) return 0;
+#   |      }
+#   |      return 1;
+#   |  #else
+
+=== the kernels' resources in the probe's test binary, sm_75 (cuobjdump --dump-resource-usage) ===
+  ok   every later call returns 0
+OK test_cuda_chain: every op of the CUDA chain matches its reference
+ Function _Z10cc_attn_fkILi256E6__halfEvPKfPKT0_S5_PfS2_6CcAttniiS2_ii:
+  REG:161 STACK:0 SHARED:40576 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_fkILi128E6__halfEvPKfPKT0_S5_PfS2_6CcAttniiS2_ii:
+  REG:102 STACK:0 SHARED:24192 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_fkILi64E6__halfEvPKfPKT0_S5_PfS2_6CcAttniiS2_ii:
+  REG:101 STACK:0 SHARED:16000 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_f2ILi256ELi4ELi16ELb0E6__halfEvPKfPKT3_S5_PfS2_6CcAttniiS2_ii:
+  REG:168 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_f2ILi256ELi4ELi32ELb1E6__halfEvPKfPKT3_S5_PfS2_6CcAttniiS2_ii:
+  REG:255 STACK:104 SHARED:0 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_f2ILi256ELi4ELi32ELb0E6__halfEvPKfPKT3_S5_PfS2_6CcAttniiS2_ii:
+  REG:240 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_f2ILi128ELi4ELi64ELb1E6__halfEvPKfPKT3_S5_PfS2_6CcAttniiS2_ii:
+  REG:183 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_f2ILi64ELi4ELi64ELb1E6__halfEvPKfPKT3_S5_PfS2_6CcAttniiS2_ii:
+  REG:140 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_fkILi256EfEvPKfPKT0_S4_PfS1_6CcAttniiS1_ii:
+  REG:161 STACK:0 SHARED:40576 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_fkILi128EfEvPKfPKT0_S4_PfS1_6CcAttniiS1_ii:
+  REG:102 STACK:0 SHARED:24192 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_fkILi64EfEvPKfPKT0_S4_PfS1_6CcAttniiS1_ii:
+  REG:101 STACK:0 SHARED:16000 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_f2ILi256ELi4ELi16ELb0EfEvPKfPKT3_S4_PfS1_6CcAttniiS1_ii:
+  REG:168 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_f2ILi256ELi4ELi32ELb1EfEvPKfPKT3_S4_PfS1_6CcAttniiS1_ii:
+  REG:255 STACK:48 SHARED:0 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_f2ILi256ELi4ELi32ELb0EfEvPKfPKT3_S4_PfS1_6CcAttniiS1_ii:
+  REG:242 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_f2ILi128ELi4ELi64ELb1EfEvPKfPKT3_S4_PfS1_6CcAttniiS1_ii:
+  REG:183 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_f2ILi64ELi4ELi64ELb1EfEvPKfPKT3_S4_PfS1_6CcAttniiS1_ii:
+  REG:136 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+
+=== the 8192-token prompt alone under nsys (--trace=cuda), one process each: nsys stats cuda_gpu_kern_sum, the attention's rows (4 chunks x 10 attention layers), and the run's CSV ===
+
+--- a = origin/dev 2e981752 (2e981752, c/ tree f52d06702fb1f564dd5f573ab5eab90be89beb30)
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+46.8,5608648847,40,140216221.2,139026297.0,28657268,254181647,82754850.0,"void cc_attn_fk<(int)256, __half>(const float *, const T2 *, const T2 *, float *, const float *, CcAttn, int, int, const float *, int, int)"
+0.0,1418828,10,141882.8,141822.0,141022,142942,557.6,"void cc_attn_decg_k<(int)8, __half>(const float *, const T2 *, const T2 *, float *, CcAttn, int, int, int, int)"
+0.0,117374,10,11737.4,11759.5,11167,12128,242.5,"void cc_attn_dec_k<__half>(const float *, const T1 *, const T1 *, float *, const float *, float *, CcAttn, int, int, int, const float *, int, int, int)"
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+8192,8192,13.117,624.51,1,73.1,0.000,0,0.00,89891dc3baca37c7,437dd9ebdd95690d,3.65969,0.000
+Collecting data...
+Generating '/tmp/nsys-report-483a.qdstrm'
+
+[1/1] [0%                          ] n8192-a.nsys-rep
+[1/1] [0%                          ] n8192-a.nsys-rep
+[1/1] [0%                          ] n8192-a.nsys-rep
+[1/1] [0%                          ] n8192-a.nsys-rep
+[1/1] [==20%                       ] n8192-a.nsys-rep
+[1/1] [=16%                        ] n8192-a.nsys-rep
+[1/1] [13%                         ] n8192-a.nsys-rep
+[1/1] [11%                         ] n8192-a.nsys-rep
+[1/1] [===23%                      ] n8192-a.nsys-rep
+[1/1] [==20%                       ] n8192-a.nsys-rep
+[1/1] [==18%                       ] n8192-a.nsys-rep
+[1/1] [=16%                        ] n8192-a.nsys-rep
+[1/1] [=15%                        ] n8192-a.nsys-rep
+[1/1] [13%                         ] n8192-a.nsys-rep
+[1/1] [12%                         ] n8192-a.nsys-rep
+[1/1] [11%                         ] n8192-a.nsys-rep
+[1/1] [10%                         ] n8192-a.nsys-rep
+[1/1] [9%                          ] n8192-a.nsys-rep
+[1/1] [8%                          ] n8192-a.nsys-rep
+[1/1] [7%                          ] n8192-a.nsys-rep
+[1/1] [11%                         ] n8192-a.nsys-rep
+[1/1] [14%                         ] n8192-a.nsys-rep
+[1/1] [==18%                       ] n8192-a.nsys-rep
+[1/1] [===22%                      ] n8192-a.nsys-rep
+[1/1] [====26%                     ] n8192-a.nsys-rep
+[1/1] [=====29%                    ] n8192-a.nsys-rep
+[1/1] [======33%                   ] n8192-a.nsys-rep
+[1/1] [=======37%                  ] n8192-a.nsys-rep
+[1/1] [========40%                 ] n8192-a.nsys-rep
+[1/1] [=========44%                ] n8192-a.nsys-rep
+[1/1] [==========48%               ] n8192-a.nsys-rep
+[1/1] [===========51%              ] n8192-a.nsys-rep
+[1/1] [============54%             ] n8192-a.nsys-rep
+[1/1] [=============58%            ] n8192-a.nsys-rep
+[1/1] [==============61%           ] n8192-a.nsys-rep
+[1/1] [==============64%           ] n8192-a.nsys-rep
+[1/1] [===============67%          ] n8192-a.nsys-rep
+[1/1] [=================72%        ] n8192-a.nsys-rep
+[1/1] [==================76%       ] n8192-a.nsys-rep
+[1/1] [===================81%      ] n8192-a.nsys-rep
+[1/1] [========================100%] n8192-a.nsys-rep
+[1/1] [========================100%] n8192-a.nsys-rep
+Generated:
+	/content/f2/forme/n8192-a.nsys-rep
+
+--- v2 = the probe 12f235b7 without DIAG_F2_T4: this change's form, <256, 4, 16, false>
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+12.1,913090980,40,22827274.5,22509802.0,4968635,41439241,12912867.2,"void cc_attn_f2<(int)256, (int)4, (int)16, (bool)0, __half>(const float *, const T5 *, const T5 *, float *, const float *, CcAttn, int, int, const float *, int, int)"
+0.0,1422093,10,142209.3,142126.0,141342,143070,610.0,"void cc_attn_decg_k<(int)8, __half>(const float *, const T2 *, const T2 *, float *, CcAttn, int, int, int, int)"
+0.0,116988,10,11698.8,11631.5,11488,12255,219.6,"void cc_attn_dec_k<__half>(const float *, const T1 *, const T1 *, float *, const float *, float *, CcAttn, int, int, int, const float *, int, int, int)"
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+8192,8192,8.806,930.31,1,70.0,0.000,0,0.00,05c6e327fe51b379,437dd9ebdd95690d,3.61567,0.000
+Collecting data...
+Generating '/tmp/nsys-report-8f0d.qdstrm'
+
+[1/1] [0%                          ] n8192-v2.nsys-rep
+[1/1] [0%                          ] n8192-v2.nsys-rep
+[1/1] [0%                          ] n8192-v2.nsys-rep
+[1/1] [==20%                       ] n8192-v2.nsys-rep
+[1/1] [=16%                        ] n8192-v2.nsys-rep
+[1/1] [13%                         ] n8192-v2.nsys-rep
+[1/1] [11%                         ] n8192-v2.nsys-rep
+[1/1] [===23%                      ] n8192-v2.nsys-rep
+[1/1] [==20%                       ] n8192-v2.nsys-rep
+[1/1] [==18%                       ] n8192-v2.nsys-rep
+[1/1] [=16%                        ] n8192-v2.nsys-rep
+[1/1] [=15%                        ] n8192-v2.nsys-rep
+[1/1] [13%                         ] n8192-v2.nsys-rep
+[1/1] [12%                         ] n8192-v2.nsys-rep
+[1/1] [11%                         ] n8192-v2.nsys-rep
+[1/1] [10%                         ] n8192-v2.nsys-rep
+[1/1] [9%                          ] n8192-v2.nsys-rep
+[1/1] [8%                          ] n8192-v2.nsys-rep
+[1/1] [7%                          ] n8192-v2.nsys-rep
+[1/1] [11%                         ] n8192-v2.nsys-rep
+[1/1] [14%                         ] n8192-v2.nsys-rep
+[1/1] [==18%                       ] n8192-v2.nsys-rep
+[1/1] [===22%                      ] n8192-v2.nsys-rep
+[1/1] [====26%                     ] n8192-v2.nsys-rep
+[1/1] [=====29%                    ] n8192-v2.nsys-rep
+[1/1] [======33%                   ] n8192-v2.nsys-rep
+[1/1] [=======37%                  ] n8192-v2.nsys-rep
+[1/1] [========40%                 ] n8192-v2.nsys-rep
+[1/1] [=========44%                ] n8192-v2.nsys-rep
+[1/1] [==========48%               ] n8192-v2.nsys-rep
+[1/1] [===========51%              ] n8192-v2.nsys-rep
+[1/1] [============54%             ] n8192-v2.nsys-rep
+[1/1] [=============58%            ] n8192-v2.nsys-rep
+[1/1] [==============61%           ] n8192-v2.nsys-rep
+[1/1] [==============64%           ] n8192-v2.nsys-rep
+[1/1] [===============67%          ] n8192-v2.nsys-rep
+[1/1] [=================72%        ] n8192-v2.nsys-rep
+[1/1] [==================76%       ] n8192-v2.nsys-rep
+[1/1] [===================81%      ] n8192-v2.nsys-rep
+[1/1] [========================100%] n8192-v2.nsys-rep
+[1/1] [========================100%] n8192-v2.nsys-rep
+Generated:
+	/content/f2/forme/n8192-v2.nsys-rep
+
+--- v1 = the probe 12f235b7 with DIAG_F2_T4=1, the form not taken
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+11.5,876741615,40,21918540.4,21661233.0,4899743,39282842,12225872.7,"void cc_attn_f2<(int)256, (int)4, (int)32, (bool)1, __half>(const float *, const T5 *, const T5 *, float *, const float *, CcAttn, int, int, const float *, int, int)"
+0.0,1416045,10,141604.5,141582.0,140958,142686,528.8,"void cc_attn_decg_k<(int)8, __half>(const float *, const T2 *, const T2 *, float *, CcAttn, int, int, int, int)"
+0.0,118014,10,11801.4,11808.0,11455,12064,219.8,"void cc_attn_dec_k<__half>(const float *, const T1 *, const T1 *, float *, const float *, float *, CcAttn, int, int, int, const float *, int, int, int)"
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+8192,8192,8.839,926.77,1,70.0,0.000,0,0.00,51f9df5cf8be464b,437dd9ebdd95690d,3.62086,0.000
+Collecting data...
+Generating '/tmp/nsys-report-8370.qdstrm'
+
+[1/1] [0%                          ] n8192-v1.nsys-rep
+[1/1] [0%                          ] n8192-v1.nsys-rep
+[1/1] [0%                          ] n8192-v1.nsys-rep
+[1/1] [==20%                       ] n8192-v1.nsys-rep
+[1/1] [=16%                        ] n8192-v1.nsys-rep
+[1/1] [13%                         ] n8192-v1.nsys-rep
+[1/1] [11%                         ] n8192-v1.nsys-rep
+[1/1] [===23%                      ] n8192-v1.nsys-rep
+[1/1] [==20%                       ] n8192-v1.nsys-rep
+[1/1] [==18%                       ] n8192-v1.nsys-rep
+[1/1] [=16%                        ] n8192-v1.nsys-rep
+[1/1] [=15%                        ] n8192-v1.nsys-rep
+[1/1] [13%                         ] n8192-v1.nsys-rep
+[1/1] [12%                         ] n8192-v1.nsys-rep
+[1/1] [11%                         ] n8192-v1.nsys-rep
+[1/1] [10%                         ] n8192-v1.nsys-rep
+[1/1] [9%                          ] n8192-v1.nsys-rep
+[1/1] [8%                          ] n8192-v1.nsys-rep
+[1/1] [7%                          ] n8192-v1.nsys-rep
+[1/1] [11%                         ] n8192-v1.nsys-rep
+[1/1] [14%                         ] n8192-v1.nsys-rep
+[1/1] [==18%                       ] n8192-v1.nsys-rep
+[1/1] [===22%                      ] n8192-v1.nsys-rep
+[1/1] [====26%                     ] n8192-v1.nsys-rep
+[1/1] [=====29%                    ] n8192-v1.nsys-rep
+[1/1] [======33%                   ] n8192-v1.nsys-rep
+[1/1] [=======37%                  ] n8192-v1.nsys-rep
+[1/1] [========40%                 ] n8192-v1.nsys-rep
+[1/1] [=========44%                ] n8192-v1.nsys-rep
+[1/1] [==========48%               ] n8192-v1.nsys-rep
+[1/1] [===========51%              ] n8192-v1.nsys-rep
+[1/1] [============54%             ] n8192-v1.nsys-rep
+[1/1] [=============58%            ] n8192-v1.nsys-rep
+[1/1] [==============61%           ] n8192-v1.nsys-rep
+[1/1] [==============64%           ] n8192-v1.nsys-rep
+[1/1] [===============67%          ] n8192-v1.nsys-rep
+[1/1] [=================72%        ] n8192-v1.nsys-rep
+[1/1] [==================76%       ] n8192-v1.nsys-rep
+[1/1] [===================81%      ] n8192-v1.nsys-rep
+[1/1] [========================100%] n8192-v1.nsys-rep
+[1/1] [========================100%] n8192-v1.nsys-rep
+Generated:
+	/content/f2/forme/n8192-v1.nsys-rep
+
+## the kernel each version runs: a 2048-token prompt under nsys (--trace=cuda), nsys stats cuda_gpu_kern_sum, the attention's rows (one chunk: the 10 attention layers' calls)
+
+=== a = origin/dev 2e981752 (2e981752, c/ tree f52d06702fb1f564dd5f573ab5eab90be89beb30) ===
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+14.6,339993791,10,33999379.1,32244616.5,27717517,61900087,9979403.7,"void cc_attn_fk<(int)256, __half>(const float *, const T2 *, const T2 *, float *, const float *, CcAttn, int, int, const float *, int, int)"
+0.0,395096,10,39509.6,39279.5,38911,41631,762.9,"void cc_attn_decg_k<(int)8, __half>(const float *, const T2 *, const T2 *, float *, CcAttn, int, int, int, int)"
+0.0,75488,10,7548.8,7536.0,7360,7744,118.3,"void cc_attn_dec_k<__half>(const float *, const T1 *, const T1 *, float *, const float *, float *, CcAttn, int, int, int, const float *, int, int, int)"
+
+=== b = origin/dev 2e981752 + this change before its review (3655d4e8, c/ tree b462be1166044e1ab76a948dd07d9af31e3ebe52) ===
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+2.6,53500538,10,5350053.8,5325574.0,4908796,5783759,250482.0,"void cc_attn_f2<(int)256, (int)4, (int)16, (bool)0, __half>(const float *, const T5 *, const T5 *, float *, const float *, CcAttn, int, int, const float *, int, int)"
+0.0,392282,10,39228.2,39215.5,39008,39392,125.7,"void cc_attn_decg_k<(int)8, __half>(const float *, const T2 *, const T2 *, float *, CcAttn, int, int, int, int)"
+0.0,75551,10,7555.1,7583.5,7168,7776,173.6,"void cc_attn_dec_k<__half>(const float *, const T1 *, const T1 *, float *, const float *, float *, CcAttn, int, int, int, const float *, int, int, int)"
+
+## head dims 128 and 64 on sm_75, which a T4 now runs with cc_attn_f2 too: the attention alone, on the second T4 VM. A probe of the chain's test (1e46f09d, on 3fd269b2, never published), COLI_PROBE_F2="H KVH hd S pos win kv16 sink": a chunk of S rows after pos positions, 10 calls a frame, the best of five frames; each shape 12 processes, COLI_CUDA_CHAIN_FLASH2=0 (cc_attn_fk) and unset (cc_attn_f2) in ABBA order three times. Flint's heads: 32 query heads on 4 kv heads of 128, a sink per head, windows of 513. nvidia-smi's clocks, temperature and throttle reasons between the shapes. Its diff:
+#   | diff --git a/c/tests/test_cuda_chain.cu b/c/tests/test_cuda_chain.cu
+#   | index 375b518d..f808b280 100644
+#   | --- a/c/tests/test_cuda_chain.cu
+#   | +++ b/c/tests/test_cuda_chain.cu
+#   | @@ -372,6 +372,43 @@ static ColiCudaTensor *moe_mat(int fmt, int gs, int I, int O, unsigned seed, std
+#   |      return ok ? t : NULL;
+#   |  }
+#   |  
+#   | +/* DIAG, never published. COLI_PROBE_F2="H KVH hd S pos win kv16 sink": a prompt chunk's attention
+#   | + * of S rows after pos positions, 10 calls a frame, the best of five frames (from the frame's
+#   | + * begin to its end); win > 0 a window, sink 1 a sink per head (Flint's), kv16 1 a float16 cache.
+#   | + * Run twice: COLI_CUDA_CHAIN_FLASH2=0 (cc_attn_fk) and unset (cc_attn_f2 where it applies). */
+#   | +static void probe_f2(const char *sh) {
+#   | +    int H = 16, KVH = 2, hd = 256, S = 2048, pos = 6144, win = 0, k16 = 1, snk = 0, n = 10;
+#   | +    sscanf(sh, "%d %d %d %d %d %d %d %d", &H, &KVH, &hd, &S, &pos, &win, &k16, &snk);
+#   | +    int h16 = k16 && T->size >= offsetof(ColiCudaChainOps, copy_regions_h) + sizeof T->copy_regions_h && T->kvh();
+#   | +    size_t cap = (size_t)pos + S, kv = (size_t)KVH * cap * hd;
+#   | +    std::vector<float> q = rnd((size_t)S * H * hd, 71), k = rnd(kv, 72), sk = rnd(H, 73);
+#   | +    std::vector<uint16_t> kh(kv);
+#   | +    kv16_round(k.data(), (int64_t)kv); kv16_pack(kh.data(), k.data(), (int64_t)kv);
+#   | +    CcBuf *qb = up(q), *sb = up(sk), *ob = T->buf((size_t)S * H * hd * 4, CC_DEV);
+#   | +    CcBuf *kb = T->buf(kv * (h16 ? 2 : 4), CC_DEV), *vb = T->buf(kv * (h16 ? 2 : 4), CC_DEV);
+#   | +    const void *src = h16 ? (const void *)kh.data() : (const void *)k.data();
+#   | +    int ok = qb && sb && ob && kb && vb && T->begin() && T->write(kb, 0, src, kv * (h16 ? 2 : 4)) &&
+#   | +             T->write(vb, 0, src, kv * (h16 ? 2 : 4)) && T->submit(1);
+#   | +    CcAttn a = {S, H, KVH, hd, pos, (int)cap, 0, H * hd, hd, 0, 0, 0, 0, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), 0, 0};
+#   | +    CcAttnW w = {a, win, snk, 0};
+#   | +    double best = 1e9;
+#   | +    for (int r = 0; r < 5 && ok; r++) {
+#   | +        auto t0 = std::chrono::steady_clock::now();
+#   | +        ok = T->begin();
+#   | +        for (int l = 0; l < n && ok; l++)
+#   | +            ok = win || snk ? (h16 ? T->attn_wh(qb, kb, vb, ob, NULL, sb, &w, 0) : T->attn_w(qb, kb, vb, ob, NULL, sb, &w))
+#   | +                     : (h16 ? T->attn_h(qb, kb, vb, ob, NULL, NULL, &a) : T->attn(qb, kb, vb, ob, NULL, NULL, &a));
+#   | +        ok = T->submit(1) && ok;
+#   | +        double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+#   | +        if (dt < best) best = dt;
+#   | +    }
+#   | +    const char *f2 = getenv("COLI_CUDA_CHAIN_FLASH2");
+#   | +    if (ok) printf("probe f2 H %d/%d hd %d S %d after %d win %d sink %d%s FLASH2=%s: %.3f ms a call\n", H, KVH, hd, S, pos, win, snk,
+#   | +                   h16 ? " float16" : " float32", f2 ? f2 : "unset", best * 1e3 / n);
+#   | +    else printf("probe f2 H %d/%d hd %d S %d after %d win %d: the frame failed\n", H, KVH, hd, S, pos, win);
+#   | +    T->free(qb); T->free(sb); T->free(ob); T->free(kb); T->free(vb);
+#   | +}
+#   | +
+#   |  int main(void) {
+#   |      int dev = 0;
+#   |      if (!coli_cuda_init(&dev, 1)) { printf("no CUDA device: skipped\n"); return 0; }
+#   | @@ -380,6 +417,7 @@ int main(void) {
+#   |      if (!T) return 1;
+#   |      ck(T->init(0), "a context on device 0");
+#   |      ck(T->ready() && !T->lost(), "ready, not lost");
+#   | +    if (const char *pf = getenv("COLI_PROBE_F2")) { probe_f2(pf); return 0; }
+#   |  
+#   |      printf("buffers and frames\n");
+#   |      {
+
+=== the probe's log (each shape's label is in Italian: piena = a full layer, finestra = a window, primo = the first chunk; fk and f2 start each run's line; the table at its end: forma = shape, modo = kernel, mediana = median, mediane = medians) ===
+name, clocks.current.sm [MHz], clocks.max.sm [MHz], temperature.gpu, power.draw [W]
+Tesla T4, 735 MHz, 1590 MHz, 44, 29.23 W
+== qwen36: 16 2 256 2048 6144 0 1 0
+fk probe f2 H 16/2 hd 256 S 2048 after 6144 win 0 sink 0 float16 FLASH2=0: 243.359 ms a call
+f2 probe f2 H 16/2 hd 256 S 2048 after 6144 win 0 sink 0 float16 FLASH2=unset: 30.927 ms a call
+f2 probe f2 H 16/2 hd 256 S 2048 after 6144 win 0 sink 0 float16 FLASH2=unset: 31.089 ms a call
+fk probe f2 H 16/2 hd 256 S 2048 after 6144 win 0 sink 0 float16 FLASH2=0: 243.138 ms a call
+fk probe f2 H 16/2 hd 256 S 2048 after 6144 win 0 sink 0 float16 FLASH2=0: 243.316 ms a call
+f2 probe f2 H 16/2 hd 256 S 2048 after 6144 win 0 sink 0 float16 FLASH2=unset: 31.641 ms a call
+f2 probe f2 H 16/2 hd 256 S 2048 after 6144 win 0 sink 0 float16 FLASH2=unset: 31.743 ms a call
+fk probe f2 H 16/2 hd 256 S 2048 after 6144 win 0 sink 0 float16 FLASH2=0: 243.156 ms a call
+fk probe f2 H 16/2 hd 256 S 2048 after 6144 win 0 sink 0 float16 FLASH2=0: 243.345 ms a call
+f2 probe f2 H 16/2 hd 256 S 2048 after 6144 win 0 sink 0 float16 FLASH2=unset: 32.471 ms a call
+f2 probe f2 H 16/2 hd 256 S 2048 after 6144 win 0 sink 0 float16 FLASH2=unset: 32.548 ms a call
+fk probe f2 H 16/2 hd 256 S 2048 after 6144 win 0 sink 0 float16 FLASH2=0: 244.439 ms a call
+1590 MHz, 78, 0x0000000000000000
+== flint-piena-sink: 32 4 128 2048 14336 0 1 1
+fk probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float16 FLASH2=0: 336.662 ms a call
+f2 probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float16 FLASH2=unset: 66.614 ms a call
+f2 probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float16 FLASH2=unset: 66.384 ms a call
+fk probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float16 FLASH2=0: 334.976 ms a call
+fk probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float16 FLASH2=0: 334.223 ms a call
+f2 probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float16 FLASH2=unset: 65.838 ms a call
+f2 probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float16 FLASH2=unset: 65.836 ms a call
+fk probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float16 FLASH2=0: 334.001 ms a call
+fk probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float16 FLASH2=0: 335.468 ms a call
+f2 probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float16 FLASH2=unset: 66.206 ms a call
+f2 probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float16 FLASH2=unset: 66.110 ms a call
+fk probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float16 FLASH2=0: 335.250 ms a call
+1575 MHz, 76, 0x0000000000000004
+== flint-finestra: 32 4 128 2048 14336 513 1 1
+fk probe f2 H 32/4 hd 128 S 2048 after 14336 win 513 sink 1 float16 FLASH2=0: 9.755 ms a call
+f2 probe f2 H 32/4 hd 128 S 2048 after 14336 win 513 sink 1 float16 FLASH2=unset: 2.152 ms a call
+f2 probe f2 H 32/4 hd 128 S 2048 after 14336 win 513 sink 1 float16 FLASH2=unset: 2.205 ms a call
+fk probe f2 H 32/4 hd 128 S 2048 after 14336 win 513 sink 1 float16 FLASH2=0: 9.740 ms a call
+fk probe f2 H 32/4 hd 128 S 2048 after 14336 win 513 sink 1 float16 FLASH2=0: 9.723 ms a call
+f2 probe f2 H 32/4 hd 128 S 2048 after 14336 win 513 sink 1 float16 FLASH2=unset: 2.194 ms a call
+f2 probe f2 H 32/4 hd 128 S 2048 after 14336 win 513 sink 1 float16 FLASH2=unset: 2.184 ms a call
+fk probe f2 H 32/4 hd 128 S 2048 after 14336 win 513 sink 1 float16 FLASH2=0: 9.665 ms a call
+fk probe f2 H 32/4 hd 128 S 2048 after 14336 win 513 sink 1 float16 FLASH2=0: 9.742 ms a call
+f2 probe f2 H 32/4 hd 128 S 2048 after 14336 win 513 sink 1 float16 FLASH2=unset: 2.166 ms a call
+f2 probe f2 H 32/4 hd 128 S 2048 after 14336 win 513 sink 1 float16 FLASH2=unset: 2.192 ms a call
+fk probe f2 H 32/4 hd 128 S 2048 after 14336 win 513 sink 1 float16 FLASH2=0: 9.777 ms a call
+1575 MHz, 75, 0x0000000000000004
+== flint-primo: 32 4 128 2048 0 0 1 1
+fk probe f2 H 32/4 hd 128 S 2048 after 0 win 0 sink 1 float16 FLASH2=0: 17.616 ms a call
+f2 probe f2 H 32/4 hd 128 S 2048 after 0 win 0 sink 1 float16 FLASH2=unset: 3.614 ms a call
+f2 probe f2 H 32/4 hd 128 S 2048 after 0 win 0 sink 1 float16 FLASH2=unset: 3.542 ms a call
+fk probe f2 H 32/4 hd 128 S 2048 after 0 win 0 sink 1 float16 FLASH2=0: 17.424 ms a call
+fk probe f2 H 32/4 hd 128 S 2048 after 0 win 0 sink 1 float16 FLASH2=0: 17.511 ms a call
+f2 probe f2 H 32/4 hd 128 S 2048 after 0 win 0 sink 1 float16 FLASH2=unset: 3.596 ms a call
+f2 probe f2 H 32/4 hd 128 S 2048 after 0 win 0 sink 1 float16 FLASH2=unset: 3.559 ms a call
+fk probe f2 H 32/4 hd 128 S 2048 after 0 win 0 sink 1 float16 FLASH2=0: 17.408 ms a call
+fk probe f2 H 32/4 hd 128 S 2048 after 0 win 0 sink 1 float16 FLASH2=0: 17.479 ms a call
+f2 probe f2 H 32/4 hd 128 S 2048 after 0 win 0 sink 1 float16 FLASH2=unset: 3.605 ms a call
+f2 probe f2 H 32/4 hd 128 S 2048 after 0 win 0 sink 1 float16 FLASH2=unset: 3.627 ms a call
+fk probe f2 H 32/4 hd 128 S 2048 after 0 win 0 sink 1 float16 FLASH2=0: 17.617 ms a call
+1575 MHz, 75, 0x0000000000000004
+== flint-piena-f32: 32 4 128 2048 14336 0 0 1
+fk probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float32 FLASH2=0: 332.487 ms a call
+f2 probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float32 FLASH2=unset: 46.320 ms a call
+f2 probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float32 FLASH2=unset: 46.244 ms a call
+fk probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float32 FLASH2=0: 333.628 ms a call
+fk probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float32 FLASH2=0: 332.338 ms a call
+f2 probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float32 FLASH2=unset: 45.899 ms a call
+f2 probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float32 FLASH2=unset: 45.733 ms a call
+fk probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float32 FLASH2=0: 331.805 ms a call
+fk probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float32 FLASH2=0: 332.137 ms a call
+f2 probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float32 FLASH2=unset: 45.819 ms a call
+f2 probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float32 FLASH2=unset: 45.957 ms a call
+fk probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float32 FLASH2=0: 332.588 ms a call
+1575 MHz, 77, 0x0000000000000004
+== hd64: 16 2 64 2048 6144 0 1 0
+fk probe f2 H 16/2 hd 64 S 2048 after 6144 win 0 sink 0 float16 FLASH2=0: 24.166 ms a call
+f2 probe f2 H 16/2 hd 64 S 2048 after 6144 win 0 sink 0 float16 FLASH2=unset: 3.668 ms a call
+f2 probe f2 H 16/2 hd 64 S 2048 after 6144 win 0 sink 0 float16 FLASH2=unset: 3.661 ms a call
+fk probe f2 H 16/2 hd 64 S 2048 after 6144 win 0 sink 0 float16 FLASH2=0: 24.148 ms a call
+fk probe f2 H 16/2 hd 64 S 2048 after 6144 win 0 sink 0 float16 FLASH2=0: 24.229 ms a call
+f2 probe f2 H 16/2 hd 64 S 2048 after 6144 win 0 sink 0 float16 FLASH2=unset: 3.639 ms a call
+f2 probe f2 H 16/2 hd 64 S 2048 after 6144 win 0 sink 0 float16 FLASH2=unset: 3.705 ms a call
+fk probe f2 H 16/2 hd 64 S 2048 after 6144 win 0 sink 0 float16 FLASH2=0: 24.182 ms a call
+fk probe f2 H 16/2 hd 64 S 2048 after 6144 win 0 sink 0 float16 FLASH2=0: 24.284 ms a call
+f2 probe f2 H 16/2 hd 64 S 2048 after 6144 win 0 sink 0 float16 FLASH2=unset: 3.680 ms a call
+f2 probe f2 H 16/2 hd 64 S 2048 after 6144 win 0 sink 0 float16 FLASH2=unset: 3.617 ms a call
+fk probe f2 H 16/2 hd 64 S 2048 after 6144 win 0 sink 0 float16 FLASH2=0: 24.219 ms a call
+1575 MHz, 76, 0x0000000000000004
+forma              modo  n  mediana ms      min      max   fk/f2 (mediane)
+qwen36             fk   6     243.331  243.138  244.439
+qwen36             f2   6      31.692   30.927   32.548   7.68x
+flint-piena-sink   fk   6     335.113  334.001  336.662
+flint-piena-sink   f2   6      66.158   65.836   66.614   5.07x
+flint-finestra     fk   6       9.741    9.665    9.777
+flint-finestra     f2   6       2.188    2.152    2.205   4.45x
+flint-primo        fk   6      17.495   17.408   17.617
+flint-primo        f2   6       3.601    3.542    3.627   4.86x
+flint-piena-f32    fk   6     332.413  331.805  333.628
+flint-piena-f32    f2   6      45.928   45.733   46.320   7.24x
+hd64               fk   6      24.200   24.148   24.284
+hd64               f2   6       3.665    3.617    3.705   6.60x
+
+=== the same probe under nsys (--trace=cuda), Flint's full layer, fk then f2: the attention's row of cuda_gpu_kern_sum ===
+== fk rc=0
+probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float16 FLASH2=0: 335.179 ms a call
+100.0,16782827073,50,335656541.5,335795541.0,331659710,338968192,1127597.3,"void cc_attn_fk<(int)128, __half>(const float *, const T2 *, const T2 *, float *, const float *, CcAttn, int, int, const float *, int, int)"
+== f2 rc=0
+probe f2 H 32/4 hd 128 S 2048 after 14336 win 0 sink 1 float16 FLASH2=unset: 66.266 ms a call
+100.0,3406297528,50,68125950.6,66250490.5,65557768,114943447,7640580.5,"void cc_attn_f2<(int)128, (int)4, (int)64, (bool)1, __half>(const float *, const T5 *, const T5 *, float *, const float *, CcAttn, int, int, const float *, int, int)"
+
+## the HIP build: the CI's «HIP syntax check», make -C c gpu-compile HIP=1 HIP_ARCH=gfx1100 with ROCm 6.2 (hipcc from AMD's repository), on a Colab CPU VM: origin/dev, 3bf5bd91 and this change
+
+=== origin/dev 2e981752 (make log sha256 40fa8a40a9506c25fa89d6be01ae666fcaa23d50dca89bf413990b58514eb7a5) ===
+2e981752 Merge pull request #2441 from JustVugg/perf/vk-decode
+gpu-compile rc=0
+      |              ^
+107 warnings generated when compiling for host.
+make: Leaving directory '/content/h/h-DEV/c'
+
+=== 3bf5bd91, cc_f2_256 outside the HIP guard (make log sha256 8fae83487cc149abbba03f7f956852821dbcb4b5f987b4f30aad49c2c991e3f4) ===
+3bf5bd91 CUDA chain: cc_attn_f2 on sm_75 too
+gpu-compile rc=2
+1166:cuda_chain.cu:606:45: error: use of undeclared identifier 'cudaDevAttrMaxSharedMemoryPerBlockOptin'
+1271:40 warnings and 1 error generated when compiling for gfx1100.
+failed to execute:/opt/rocm-6.2.0/lib/llvm/bin/clang++  --offload-arch=gfx1100  -O3 -std=c++17 -x hip -Wall -Wextra -fPIE -c cuda_chain.cu -o "cuda_chain.o"
+make: *** [Makefile:1075: cuda_chain.o] Error 1
+make: Leaving directory '/content/h/h-OLD/c'
+
+=== 3fd269b2, this change (make log sha256 0a7d847551c7aca80f0c28c4e2b4736a306b5e024a182df60619b017b4c65d33) ===
+3fd269b2 CUDA chain: cc_attn_f2 on sm_75 too
+gpu-compile rc=0
+      |              ^
+107 warnings generated when compiling for host.
+make: Leaving directory '/content/h/h-PR/c'

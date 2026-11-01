@@ -1,0 +1,493 @@
+#version 450
+// The routed experts on the dense chain (vk_chain.c, chain_moe; vk_chain.h: vkc_moe), for
+// S rows routed to K experts each by the device (chain_route.comp): the layer's MoE without
+// the host, every expert's weights read by address from the table the tier keeps
+// (backend_vulkan.h: coli_vk_xb_expert_entry), so which experts run is the device's own
+// choice. Pair j = s*K + k is row s's expert of rank k, e = ids[s][k].
+//   mode 0, gate and up: one workgroup per (pair, rpw outputs of I):
+//           hid[j][o] = act(gate_e[o] . x[s], up_e[o] . x[s])
+//   mode 1, down: one workgroup per (pair, rpw outputs of D): yk[j][o] = down_e[o] . hid[j]
+//   mode 2, the sum: one workgroup per (row, 256 outputs of D): y[s][o] = the sum over k in
+//           rank order of w[s][k] * yk[s*K + k][o], from 0
+// A slot without an expert (id -1) or with an expert the table does not hold (a zero entry)
+// is skipped everywhere (the host's sum adds those itself). hid holds S*K rows of I floats
+// and then yk, S*K rows of D. act 0: SwiGLU silu(g) * u, with limit > 0 the gate clamped
+// from above and up to [-limit, limit] first; act 1: SiTU-GLU a*tanh(g/a)*sigmoid(g) *
+// b*tanh(u/b) (expert_act.comp's formulas).
+// Weight formats as qmatmul.comp lays them out: 1 int8 and 2 int4 with a scale per row,
+// 4 int4 and 7 MXFP4 per gs inputs, 5 int3-g64, 10 f32, 11 bf16, 12 FP8 E4M3 and 13 int8
+// per gs inputs; and the block formats (100 + a ggml type, a GGUF's experts as the file has
+// them, its table at binding 6): the types bdstep.glsl decodes a row over lpr lanes (a power
+// of two, about eight 32-weight steps a lane, the subgroup's other lanes on other rows),
+// every other type blockdec.glsl's, a row a subgroup, 32 weights a lane a step. The input row sits in shared memory, zero past its end up to the rows'
+// padded length; a row of 16-byte steps (row words % 4 == 0, every format but int3) is
+// spread over lpr lanes (a power of two up to the subgroup and the row's steps), each lane
+// reading a 16-byte step of RPS rows at once, the lanes' sums joined by clustered adds:
+// qmatmul_grp_gemv.comp's way through the weights, every format of the tier. Other rows
+// (int3, an unpadded row, an input past the staging) read one 32-bit word a lane, a row a
+// subgroup.
+// Every index is in range on every lane, the lanes a loop or a branch has left included
+// (a software device reads on inactive lanes too, at the index they hold).
+// IDOT (chain_moe_i8.spv, built with -DIDOT): the bdstep.glsl types in the CPU's integer
+// form (bdstep_i8.glsl): the input row quantized to int8 per 32 in shared memory (XQ uvec4s
+// of codes, no float staging: XS 4), packed 4 x 8 integer dot products. A module of its own,
+// since the integer dot product is a capability not every device has.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const int XS = 4096;   // staged input floats (a multiple of 4)
+// 1 = the block formats' paths are compiled in (a GGUF's experts: vk_chain.c's second
+// pipeline); 0 leaves them out, so the other formats' pipeline stays as small as it was
+// (a software device compiles and runs every path it holds)
+layout(constant_id = 1) const int BD = 0;
+#ifdef IDOT
+layout(constant_id = 2) const int XQ = 256;   // uvec4s of the quantized row's codes: 16 XQ inputs at most
+#endif
+// 1, 2 or 4: the 16-byte way decodes that format only (the matrices' format, which the host
+// knows a layer's), so the other formats' bodies are not in the pipeline: with all of them
+// the gate and up pass of Qwen3.6's int4-g64 experts took 77 us a layer on an RTX PRO 4000,
+// with fmt 4's alone 42. 0: every format, by the table's word.
+layout(constant_id = 3) const int FMTC = 0;
+// a GGUF layer's block types plus one (gate and up; down), so the block formats' pipeline
+// holds those decoders alone: with every type's, a software device took minutes to build
+// it at its first launch (each entry of the layer has these types; the host keeps
+// vk_dmoe.h's tables so). 0: the table's word, every type.
+layout(constant_id = 4) const int BTG = 0;
+layout(constant_id = 5) const int BTD = 0;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer WRef4 { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer WRef { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer SRef { float v[]; };
+
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer ID { int ids[]; };
+layout(std430, binding = 2) readonly buffer RW { float rw[]; };
+layout(std430, binding = 3) readonly buffer T { uint tab[]; };
+layout(std430, binding = 4) buffer H { float hid[]; };
+layout(std430, binding = 5) writeonly buffer Y { float y[]; };
+layout(std430, binding = 6) readonly buffer TB { uint bdtab[]; };   // the block formats' table (blockdec_table.h)
+
+layout(push_constant) uniform P {
+    int mode, S, K, D, I, act;
+    float limit, a, b;
+    int t_off, x_off, x_row, i_off, i_row, w_off, w_row, y_off, y_row, rpw;
+    int spl;   // the block path: about this many 32-weight steps a lane (vk_chain.c's, by pass)
+} p;
+
+// an entry: 32 words (coli_vk_xb_expert_entry): [0..1] gate rows, [2..3] its scales,
+// [4..5] up, [6..7], [8..9] down, [10..11]; [12] gate/up fmt, [13] their row words,
+// [14] their gs, [15] down's fmt, [16] row words, [17] gs; [18] 1 = resident
+#define ENT 32u
+#define RPS 4u
+
+shared vec4 xs4[XS / 4];
+int g_n, g_src, g_base;   // the input row: length, 0 = x / 1 = hid, where it starts
+bool g_staged;
+
+// ---- decoding --------------------------------------------------------------------
+float i8(uint w, int k) { return float(bitfieldExtract(int(w), 8 * k, 8)); }
+float i4(uint w, int k) { return float(int(bitfieldExtract(w, 4 * k, 4)) - 8); }
+float mx4(uint w, int k) {
+    uint n = bitfieldExtract(w, 4 * k, 4);
+    const float lut[8] = float[8](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
+    float v = lut[n & 7u];
+    return (n & 8u) != 0u ? -v : v;
+}
+float e4m3(uint w, int k) {
+    uint b = bitfieldExtract(w, 8 * k, 8);
+    if ((b & 0x7fu) == 0x7fu) return uintBitsToFloat(0x7fc00000u);
+    uint e = (b >> 3) & 0xfu, m = b & 7u;
+    float v = e == 0u ? float(m) * 0.001953125 : ldexp(1.0 + float(m) * 0.125, int(e) - 7);
+    return (b & 0x80u) != 0u ? -v : v;
+}
+uint vpw(int fmt) { return fmt == 10 ? 1u : fmt == 11 ? 2u : (fmt == 2 || fmt == 4 || fmt == 7) ? 8u : 4u; }
+bool grouped(int fmt) { return fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13; }
+// the staged row keeps a vec4 of padding after every 8: a lane's step reads 8 (or 4)
+// consecutive vec4s and the next lane's start 8 further on, which without it put the
+// lanes of a phase on the same banks of shared memory
+uint xsw(uint i) { return i + (i >> 3); }
+vec4 xv4(uint i) { return xs4[min(xsw(i), uint(XS / 4 - 1))]; }   // inputs 4i..4i+3, staged
+// one 32-bit word of inputs from iw (a multiple of vpw) against the staged row
+float word_dot(int fmt, uint w, uint iw) {
+    if (fmt == 10) { vec4 a = xv4(iw >> 2); return a[iw & 3u] * uintBitsToFloat(w); }
+    if (fmt == 11) { vec4 a = xv4(iw >> 2); uint h = iw & 3u;
+                     return a[h] * uintBitsToFloat(w << 16) + a[h + 1u] * uintBitsToFloat(w & 0xffff0000u); }
+    if (fmt == 1 || fmt == 13) { vec4 a = xv4(iw >> 2); return dot(a, vec4(i8(w, 0), i8(w, 1), i8(w, 2), i8(w, 3))); }
+    if (fmt == 12) { vec4 a = xv4(iw >> 2); return dot(a, vec4(e4m3(w, 0), e4m3(w, 1), e4m3(w, 2), e4m3(w, 3))); }
+    vec4 a = xv4(iw >> 2), c = xv4((iw >> 2) + 1u);
+    if (fmt == 7) return dot(a, vec4(mx4(w, 0), mx4(w, 1), mx4(w, 2), mx4(w, 3))) +
+                         dot(c, vec4(mx4(w, 4), mx4(w, 5), mx4(w, 6), mx4(w, 7)));
+    return dot(a, vec4(i4(w, 0), i4(w, 1), i4(w, 2), i4(w, 3))) + dot(c, vec4(i4(w, 4), i4(w, 5), i4(w, 6), i4(w, 7)));
+}
+
+// ---- the 16-byte way: RPS rows of a matrix, lane jj of the row's lpr ---------------
+// rows o0 + qbase + t*rg for t < RPS (those past RW or O read nothing); acc[t] = the
+// lane's part of row t's dot with the staged input, its grouped scales applied. One body
+// per format (FMT a constant in each), so that the decode has no branch in the loop.
+#define BLOCK_BODY(FMT) {                                                                          \
+    const int fmt = FMT;                                                                           \
+    const uint per = (fmt == 10 ? 1u : fmt == 11 ? 2u : (fmt == 2 || fmt == 4 || fmt == 7) ? 8u : 4u) * 4u; \
+    const bool grp = fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13;                               \
+    uint ng = gs > 0u ? (uint(g_n) + gs - 1u) / gs : 1u, r4 = rowWords / 4u;                       \
+    bool one = grp && gs % per == 0u;                                                              \
+    uint ob[RPS]; bool okr[RPS];                                                                   \
+    [[unroll]] for (uint t = 0u; t < RPS; t++) {                                                   \
+        uint q = qbase + t * rg;                                                                   \
+        okr[t] = t * rg < remaining && q < RW && o0 + q < O;                                       \
+        ob[t] = min(o0 + q, O - 1u);                                                               \
+        acc[t] = 0.0;                                                                              \
+    }                                                                                              \
+    for (uint j = jj; j < W4; j += lpr) {                                                          \
+        uint jc = min(j, W4 - 1u), i0 = jc * per;                                                  \
+        uvec4 v[RPS];                                                                              \
+        [[unroll]] for (uint t = 0u; t < RPS; t++) v[t] = okr[t] ? w.v[ob[t] * r4 + jc] : uvec4(0u); \
+        [[unroll]] for (uint t = 0u; t < RPS; t++) {                                               \
+            if (!grp || one) {                                                                     \
+                float d = word_dot(fmt, v[t].x, i0) + word_dot(fmt, v[t].y, i0 + per / 4u) +       \
+                          word_dot(fmt, v[t].z, i0 + per / 2u) + word_dot(fmt, v[t].w, i0 + 3u * per / 4u); \
+                acc[t] += grp ? (okr[t] ? sc.v[ob[t] * ng + min(i0 / gs, ng - 1u)] : 0.0) * d : d; \
+            } else {                                                                               \
+                [[unroll]] for (uint h = 0u; h < 4u; h++) {                                        \
+                    uint iw = i0 + h * (per / 4u);                                                 \
+                    float s = okr[t] ? sc.v[ob[t] * ng + min(iw / gs, ng - 1u)] : 0.0;             \
+                    acc[t] += s * word_dot(fmt, v[t][h], iw);                                      \
+                }                                                                                  \
+            }                                                                                      \
+        }                                                                                          \
+    }                                                                                              \
+}
+#define BLOCK_ARGS WRef4 w, SRef sc, uint rowWords, uint gs, uint O, uint o0, uint qbase, uint remaining, \
+                   uint RW, uint rg, uint jj, uint lpr, uint W4, out float acc[RPS]
+void block_1(BLOCK_ARGS) BLOCK_BODY(1)
+void block_2(BLOCK_ARGS) BLOCK_BODY(2)
+void block_4(BLOCK_ARGS) BLOCK_BODY(4)
+void block_7(BLOCK_ARGS) BLOCK_BODY(7)
+void block_10(BLOCK_ARGS) BLOCK_BODY(10)
+void block_11(BLOCK_ARGS) BLOCK_BODY(11)
+void block_12(BLOCK_ARGS) BLOCK_BODY(12)
+void block_13(BLOCK_ARGS) BLOCK_BODY(13)
+void block(WRef4 w, SRef sc, int fmt, uint rowWords, uint gs, uint O, uint o0, uint qbase, uint remaining,
+           uint RW, uint rg, uint jj, uint lpr, uint W4, out float acc[RPS]) {
+    if (FMTC != 0) {   // a pipeline of one format: another (the host's mistake) comes out as NaN
+        if (fmt != FMTC) { [[unroll]] for (uint t = 0u; t < RPS; t++) acc[t] = uintBitsToFloat(0x7fc00000u); return; }
+        if (FMTC == 1) block_1(w, sc, rowWords, gs, O, o0, qbase, remaining, RW, rg, jj, lpr, W4, acc);
+        else if (FMTC == 2) block_2(w, sc, rowWords, gs, O, o0, qbase, remaining, RW, rg, jj, lpr, W4, acc);
+        else block_4(w, sc, rowWords, gs, O, o0, qbase, remaining, RW, rg, jj, lpr, W4, acc);
+        return;
+    }
+    if (fmt == 1) block_1(w, sc, rowWords, gs, O, o0, qbase, remaining, RW, rg, jj, lpr, W4, acc);
+    else if (fmt == 2) block_2(w, sc, rowWords, gs, O, o0, qbase, remaining, RW, rg, jj, lpr, W4, acc);
+    else if (fmt == 4) block_4(w, sc, rowWords, gs, O, o0, qbase, remaining, RW, rg, jj, lpr, W4, acc);
+    else if (fmt == 7) block_7(w, sc, rowWords, gs, O, o0, qbase, remaining, RW, rg, jj, lpr, W4, acc);
+    else if (fmt == 10) block_10(w, sc, rowWords, gs, O, o0, qbase, remaining, RW, rg, jj, lpr, W4, acc);
+    else if (fmt == 11) block_11(w, sc, rowWords, gs, O, o0, qbase, remaining, RW, rg, jj, lpr, W4, acc);
+    else if (fmt == 12) block_12(w, sc, rowWords, gs, O, o0, qbase, remaining, RW, rg, jj, lpr, W4, acc);
+    else block_13(w, sc, rowWords, gs, O, o0, qbase, remaining, RW, rg, jj, lpr, W4, acc);
+}
+float red(float v, uint lpr) {
+    if (lpr == 64u) return subgroupClusteredAdd(v, 64u);
+    if (lpr == 32u) return subgroupClusteredAdd(v, 32u);
+    if (lpr == 16u) return subgroupClusteredAdd(v, 16u);
+    if (lpr == 8u) return subgroupClusteredAdd(v, 8u);
+    if (lpr == 4u) return subgroupClusteredAdd(v, 4u);
+    if (lpr == 2u) return subgroupClusteredAdd(v, 2u);
+    return v;
+}
+
+// ---- the 32-bit way: a row a subgroup ------------------------------------------------
+float xin(int i) {
+    i = clamp(i, 0, g_n - 1);
+    if (g_staged) return xs4[min(int(xsw(uint(i >> 2))), XS / 4 - 1)][i & 3];
+    return g_src == 0 ? x[g_base + i] : hid[g_base + i];
+}
+// the block formats (blockdec.glsl): the weights of the matrix g_bdw names, the staged row
+WRef g_bdw;
+#define BD_P bd_
+#define BD_W(i) g_bdw.v[i]
+#define BD_X(i) xin(int(i))
+#define BD_G(i) bdtab[i]
+#include "blockdec.glsl"
+// the types bdstep.glsl decodes: the matrix g_bw names (g_b16: its address 16-byte aligned,
+// so a uvec4 is one load), the staged row
+WRef g_bw; WRef4 g_bw4; bool g_b16;
+shared float bs_kvt[16];
+shared uint bs_grid[2048];
+shared uint bs_ks[128];
+#define BS_W1(i) g_bw.v[i]
+#define BS_W4(i) (g_b16 ? g_bw4.v[i] : uvec4(g_bw.v[4u * (i)], g_bw.v[4u * (i) + 1u], g_bw.v[4u * (i) + 2u], g_bw.v[4u * (i) + 3u]))
+float g_acc;
+#define BS_ACC(w, i) g_acc += dot((w), xv4(i))
+#define BS_G(i) bdtab[i]
+#include "bdstep.glsl"
+#ifdef IDOT
+// the quantized row: codes (a uvec4 of padding after every 8, as the floats' staging),
+// the scale of each block of 32, the codes' sum of each group of 16
+shared uvec4 xq4[XQ + XQ / 8 + 1];
+shared float xdx[XQ / 2 + 1];
+shared int xsum[XQ + 1];
+bool g_idq;
+#define BSI_NR 1
+#define BSI_X(r, i) int(xq4[min(xsw((i) >> 2), uint(XQ + XQ / 8))][(i) & 3u])
+#define BSI_DX(r, b) xdx[min((b), uint(XQ / 2))]
+#define BSI_XS(r, g) xsum[min((g), uint(XQ))]
+#define BSI_ACC(r, v) g_acc += (v)
+#include "bdstep_i8.glsl"
+// the input row (src 0 x, 1 hid; n inputs from base) quantized as gq_quant_act_ref does: a
+// block of 32 a thread
+void quant_x(int src, int base, int n, int tid) {
+    for (int b = tid; b < n / 32; b += 256) {
+        float v[32]; float amax = 0.0;
+        [[unroll]] for (int k = 0; k < 32; k++) { v[k] = src == 0 ? x[base + 32 * b + k] : hid[base + 32 * b + k]; amax = max(amax, abs(v[k])); }
+        float d = bsi_div(amax, 127.0), id = bsi_id(amax);
+        int s0 = 0, s1 = 0; uint w[8];
+        [[unroll]] for (int k = 0; k < 8; k++) {
+            ivec4 c = clamp(ivec4(roundEven(vec4(v[4 * k], v[4 * k + 1], v[4 * k + 2], v[4 * k + 3]) * id)), ivec4(-127), ivec4(127));
+            int cs = c.x + c.y + c.z + c.w;
+            if (k < 4) s0 += cs; else s1 += cs;
+            w[k] = (uint(c.x) & 255u) | ((uint(c.y) & 255u) << 8) | ((uint(c.z) & 255u) << 16) | ((uint(c.w) & 255u) << 24);
+        }
+        xq4[xsw(uint(2 * b))] = uvec4(w[0], w[1], w[2], w[3]);
+        xq4[xsw(uint(2 * b + 1))] = uvec4(w[4], w[5], w[6], w[7]);
+        xdx[b] = d; xsum[2 * b] = s0; xsum[2 * b + 1] = s1;
+    }
+}
+#define BS_STEP(t, rb, q) { if (g_idq) bsi_step(t, rb, q); else bs_step(t, rb, q); }
+#else
+#define BS_STEP(t, rb, q) bs_step(t, rb, q)
+#endif
+void bs_mat(uint at) { uvec2 a = uvec2(tab[at], tab[at + 1u]); g_bw = WRef(a); g_bw4 = WRef4(a); g_b16 = (a.x & 15u) == 0u; }
+float bs_row(int t, uint rb, uint jj, uint lpr, uint nst) {
+    g_acc = 0.0;
+    for (uint q = jj; q < nst; q += lpr) BS_STEP(t, rb, q);
+    return g_acc;
+}
+// gate and up of one row together: the two matrices' steps side by side, the staged x read once
+vec2 bs_row2(int t, uvec2 ga, uvec2 ua, uint rb, uint jj, uint lpr, uint nst) {
+    float g = 0.0, u = 0.0;
+    WRef wg = WRef(ga), wu = WRef(ua); WRef4 wg4 = WRef4(ga), wu4 = WRef4(ua);
+    bool g16 = (ga.x & 15u) == 0u, u16 = (ua.x & 15u) == 0u;
+    for (uint q = jj; q < nst; q += lpr) {
+        g_bw = wg; g_bw4 = wg4; g_b16 = g16; g_acc = g; BS_STEP(t, rb, q); g = g_acc;
+        g_bw = wu; g_bw4 = wu4; g_b16 = u16; g_acc = u; BS_STEP(t, rb, q); u = g_acc;
+    }
+    return vec2(g, u);
+}
+float rowdot(WRef W, SRef Sc, int fmt, int rowWords, int gs, int o, int lane, int sgs) {
+    int n = g_n;
+    uint rb = uint(o) * uint(rowWords);
+    float sum = 0.0;
+    if (BD != 0 && fmt >= 100) {   // a unit of 32 weights a lane (the host checks n % 32 == 0)
+        g_bdw = W;
+        for (int u = lane; u < n / 32; u += sgs) sum += bd_unit(fmt, rb * 4u, uint(u), uint(n));
+        return sum;
+    }
+    if (fmt == 10) {
+        for (int i = lane; i < n; i += sgs) sum += xin(i) * uintBitsToFloat(W.v[rb + uint(min(i, n - 1))]);
+    } else if (fmt == 11) {
+        int words = (n + 1) / 2;
+        for (int wi = lane; wi < words; wi += sgs) {
+            uint pk = W.v[rb + uint(min(wi, words - 1))]; int i0 = wi * 2;
+            sum += xin(i0) * uintBitsToFloat(pk << 16);
+            if (i0 + 1 < n) sum += xin(i0 + 1) * uintBitsToFloat(pk & 0xffff0000u);
+        }
+    } else if (fmt == 1) {
+        int words = (n + 3) / 4;
+        for (int wi = lane; wi < words; wi += sgs) {
+            uint pk = W.v[rb + uint(min(wi, words - 1))]; int i0 = wi * 4;
+            for (int k = 0; k < 4; k++) if (i0 + k < n) sum += xin(i0 + k) * i8(pk, k);
+        }
+    } else if (fmt == 12 || fmt == 13) {
+        int words = (n + 3) / 4, ng = (n + gs - 1) / gs;
+        uint sb = uint(o) * uint(ng);
+        for (int wi = lane; wi < words; wi += sgs) {
+            int wc = min(wi, words - 1);
+            uint pk = W.v[rb + uint(wc)]; int i0 = wc * 4;
+            float a = 0.0;
+            if (fmt == 12) { for (int k = 0; k < 4; k++) if (i0 + k < n) a += xin(i0 + k) * e4m3(pk, k); }
+            else           { for (int k = 0; k < 4; k++) if (i0 + k < n) a += xin(i0 + k) * i8(pk, k); }
+            sum += a * Sc.v[sb + uint(i0 / gs)];
+        }
+    } else if (fmt == 2) {
+        int words = (n + 7) / 8;
+        for (int wi = lane; wi < words; wi += sgs) {
+            uint pk = W.v[rb + uint(min(wi, words - 1))]; int i0 = wi * 8;
+            for (int k = 0; k < 8; k++) if (i0 + k < n) sum += xin(i0 + k) * i4(pk, k);
+        }
+    } else if (fmt == 4 || fmt == 7) {
+        int words = (n + 7) / 8, ng = (n + gs - 1) / gs;
+        uint sb = uint(o) * uint(ng);
+        for (int wi = lane; wi < words; wi += sgs) {
+            int wc = min(wi, words - 1);
+            uint pk = W.v[rb + uint(wc)]; int i0 = wc * 8;
+            float a = 0.0;
+            if (fmt == 4) { for (int k = 0; k < 8; k++) if (i0 + k < n) a += xin(i0 + k) * i4(pk, k); }
+            else          { for (int k = 0; k < 8; k++) if (i0 + k < n) a += xin(i0 + k) * mx4(pk, k); }
+            sum += a * Sc.v[sb + uint(i0 / gs)];
+        }
+    } else if (fmt == 5) {
+        int ng = (n + 63) >> 6;
+        uint sb = uint(o) * uint(ng);
+        for (int m = lane; m < ng * 4; m += sgs) {
+            int mc = min(m, ng * 4 - 1), g = mc >> 2, mw = mc & 3;
+            uint blo = W.v[rb + uint(g) * 6u + uint(mw)];
+            uint bhi = W.v[rb + uint(g) * 6u + 4u + uint(mw >> 1)];
+            int hs = (mw & 1) * 16, i0 = (g << 6) + (mw << 4);
+            float a = 0.0;
+            for (int k = 0; k < 16; k++)
+                if (i0 + k < n) {
+                    uint u = ((blo >> uint(k * 2)) & 3u) | (((bhi >> uint(hs + k)) & 1u) << 2);
+                    a += xin(i0 + k) * float(int(u) - 4);
+                }
+            sum += a * Sc.v[sb + uint(g)];
+        }
+    }
+    return sum;
+}
+
+uvec2 addr(uint at) { return uvec2(tab[at], tab[at + 1u]); }
+float situ_tanh(float v) { return abs(v) < 0.000244140625 ? v : tanh(v); }
+float act(float g, float u) {
+    if (p.act == 1) return p.a * situ_tanh(g / p.a) * (1.0 / (1.0 + exp(-g))) * (p.b * situ_tanh(u / p.b));
+    if (p.limit > 0.0) { g = min(g, p.limit); u = clamp(u, -p.limit, p.limit); }
+    return (g / (1.0 + exp(-g))) * u;
+}
+// the input row into shared memory (zeros past n up to pad) when it fits
+void stage(int src, int base, int n, int pad, int tid) {
+    g_src = src; g_base = base; g_n = n; g_staged = pad + pad / 8 + 4 <= XS;
+    if (g_staged)
+        for (int i = tid; i < pad / 4; i += 256) {
+            vec4 v = vec4(0.0);
+            [[unroll]] for (int c = 0; c < 4; c++) {
+                int k = min(4 * i + c, n - 1);
+                float f = src == 0 ? x[base + k] : hid[base + k];
+                v[c] = 4 * i + c < n ? f : 0.0;
+            }
+            xs4[xsw(uint(i))] = v;
+        }
+}
+// whether a matrix of rowWords words a row takes the 16-byte way, and its padded inputs
+bool wide(int fmt, int rowWords, int n) {
+    return fmt != 5 && fmt < 100 && rowWords % 4 == 0 && rowWords * int(vpw(fmt)) <= XS && rowWords * int(vpw(fmt)) >= n;
+}
+
+void main() {
+    int wg = int(gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x);
+    int tid = int(gl_LocalInvocationID.x), lane = int(gl_SubgroupInvocationID), sgs = int(gl_SubgroupSize);
+    int sg = int(gl_SubgroupID), nsg = int(gl_NumSubgroups), rpw = p.rpw;
+    int yko = p.S * p.K * p.I;                          // where yk starts in hid
+    if (p.mode == 2) {
+        int nt = (p.D + 255) / 256, s = wg / nt, t = wg - s * nt;
+        if (s >= p.S) return;
+        int o = t * 256 + tid, oc = min(o, p.D - 1);
+        float acc = 0.0;
+        for (int k = 0; k < p.K; k++) {
+            int e = ids[p.i_off + s * p.i_row + k];
+            if (e < 0 || tab[uint(p.t_off + max(e, 0)) * ENT + 18u] == 0u) continue;
+            acc += rw[p.w_off + s * p.w_row + k] * hid[yko + (s * p.K + k) * p.D + oc];
+        }
+        if (o < p.D) y[p.y_off + s * p.y_row + o] = acc;
+        return;
+    }
+    int O = p.mode == 0 ? p.I : p.D, n = p.mode == 0 ? p.D : p.I;
+    int nt = (O + rpw - 1) / rpw, j = wg / nt, t = wg - j * nt;
+    if (j >= p.S * p.K) return;                         // uniform: the workgroup's pair
+    int s = j / p.K, k = j - s * p.K;
+    int e = ids[p.i_off + s * p.i_row + k];
+    uint eb = uint(p.t_off + max(e, 0)) * ENT;
+    if (e < 0 || tab[eb + 18u] == 0u) return;
+    uint fo = p.mode == 0 ? 12u : 15u;                  // the matrices' format words
+    int fmt = int(tab[eb + fo]), rws = int(tab[eb + fo + 1u]), gs = int(tab[eb + fo + 2u]);
+    if (BD != 0 && BTG > 0 && BTD > 0) fmt = p.mode == 0 ? 99 + BTG : 99 + BTD;
+    int tg = BTG > 0 ? BTG - 1 : fmt - 100, td = BTD > 0 ? BTD - 1 : fmt - 100;   // each pass's type, constant when known
+    bool wd = wide(fmt, rws, n);
+#ifdef IDOT
+    /* uniform: the pair's format */
+    g_idq = BD != 0 && fmt >= 100 && fmt < 164 && bsi_has(fmt - 100) && n % 32 == 0 && n <= 16 * XQ;
+    if (g_idq) { g_src = p.mode == 0 ? 0 : 1; g_base = p.mode == 0 ? p.x_off + s * p.x_row : j * p.I; g_n = n; g_staged = false;
+                 quant_x(g_src, g_base, n, tid); }
+    else
+#endif
+    stage(p.mode == 0 ? 0 : 1, p.mode == 0 ? p.x_off + s * p.x_row : j * p.I, n, wd ? rws * int(vpw(fmt)) : n, tid);
+    if (BD != 0 && fmt >= 100 && fmt < 164) bs_tables_fill(fmt - 100, tid);
+    barrier();
+    wd = wd && g_staged;
+    uint o0 = uint(t * rpw);
+#ifdef IDOT
+    bool blk = g_staged || g_idq;
+#else
+    bool blk = g_staged;
+#endif
+    if (BD != 0 && fmt >= 100 && fmt < 164 && bs_has(fmt - 100) && n % 32 == 0 && blk) {
+        /* about spl steps a lane (measured: the latency of a step's loads wants work beside
+         * it), and lanes enough that the workgroup's subgroups all have rows of the rpw */
+        uint steps = uint(n) / 32u, lpr = 1u, spl = uint(max(p.spl, 1));
+        while (lpr * 2u <= uint(sgs) && (lpr * spl < steps || uint(nsg) * (uint(sgs) / lpr) > uint(rpw))) lpr *= 2u;
+        uint rg = uint(sgs) / lpr, rr = uint(lane) / lpr, jj = uint(lane) % lpr;
+        for (uint base = uint(sg) * rg; base < uint(rpw); base += uint(nsg) * rg) {   // uniform in the subgroup
+            uint r = base + rr, o = o0 + r, oc = min(o, uint(O) - 1u);
+            bool live = r < uint(rpw) && o < uint(O);
+            uint rb = oc * uint(rws) * 4u, nst = live ? steps : 0u;
+            float g, u = 0.0;
+            if (p.mode == 0) {
+                vec2 gu = bs_row2(tg, addr(eb), addr(eb + 4u), rb, jj, lpr, nst);
+                g = red(gu.x, lpr); u = red(gu.y, lpr);
+            } else { bs_mat(eb + 8u); g = red(bs_row(td, rb, jj, lpr, nst), lpr); }
+            if (jj != 0u || !live) continue;
+            if (p.mode == 0) hid[j * p.I + int(o)] = act(g, u);
+            else hid[yko + j * p.D + int(o)] = g;
+        }
+        return;
+    }
+    if (wd) {
+        uint W4 = uint(rws) / 4u, cap = min(min(uint(sgs), W4), 64u), lpr = 1u;
+        while (lpr * 2u <= cap) lpr *= 2u;
+        uint rg = uint(sgs) / lpr, rr = uint(lane) / lpr, jj = uint(lane) % lpr;
+        uint RW = uint(rpw), rows_sg = (RW + uint(nsg) - 1u) / uint(nsg);
+        for (uint base = 0u; base < rows_sg; base += RPS * rg) {
+            uint qbase = uint(sg) * rows_sg + base + rr, remaining = rows_sg - min(rows_sg, base + rr);
+            float ag[RPS], au[RPS];
+            if (p.mode == 0) {
+                block(WRef4(addr(eb)), SRef(addr(eb + 2u)), fmt, uint(rws), uint(gs), uint(O), o0, qbase, remaining, RW, rg, jj, lpr, W4, ag);
+                block(WRef4(addr(eb + 4u)), SRef(addr(eb + 6u)), fmt, uint(rws), uint(gs), uint(O), o0, qbase, remaining, RW, rg, jj, lpr, W4, au);
+            } else {
+                block(WRef4(addr(eb + 8u)), SRef(addr(eb + 10u)), fmt, uint(rws), uint(gs), uint(O), o0, qbase, remaining, RW, rg, jj, lpr, W4, ag);
+            }
+            [[unroll]] for (uint r = 0u; r < RPS; r++) {
+                uint q = qbase + r * rg, o = o0 + q, oc = min(o, uint(O) - 1u);
+                bool writer = jj == 0u && r * rg < remaining && q < RW && o < uint(O);
+                float g = red(ag[r], lpr), u = p.mode == 0 ? red(au[r], lpr) : 0.0;
+                if (!writer) continue;
+                // the row scale at oc: the lanes `continue` left still load (o past the
+                // matrix there; a read past the scales, of the process's memory on a
+                // software device, crashed when it crossed into an unmapped page)
+                if (p.mode == 0) {
+                    if (fmt == 1 || fmt == 2) { g *= SRef(addr(eb + 2u)).v[oc]; u *= SRef(addr(eb + 6u)).v[oc]; }
+                    hid[j * p.I + int(o)] = act(g, u);
+                } else {
+                    if (fmt == 1 || fmt == 2) g *= SRef(addr(eb + 10u)).v[oc];
+                    hid[yko + j * p.D + int(o)] = g;
+                }
+            }
+        }
+        return;
+    }
+    for (int r = sg; r < rpw; r += nsg) {
+        int o = t * rpw + r;
+        if (o >= O) break;                              // uniform in the subgroup
+        if (p.mode == 0) {
+            SRef gsc = SRef(addr(eb + 2u)), usc = SRef(addr(eb + 6u));
+            float g = subgroupAdd(rowdot(WRef(addr(eb)), gsc, fmt, rws, gs, o, lane, sgs));
+            float u = subgroupAdd(rowdot(WRef(addr(eb + 4u)), usc, fmt, rws, gs, o, lane, sgs));
+            if (fmt == 1 || fmt == 2) { g *= gsc.v[o]; u *= usc.v[o]; }
+            if (lane == 0) hid[j * p.I + o] = act(g, u);
+        } else {
+            SRef dsc = SRef(addr(eb + 10u));
+            float d = subgroupAdd(rowdot(WRef(addr(eb + 8u)), dsc, fmt, rws, gs, o, lane, sgs));
+            if (fmt == 1 || fmt == 2) d *= dsc.v[o];
+            if (lane == 0) hid[yko + j * p.D + o] = d;
+        }
+    }
+}

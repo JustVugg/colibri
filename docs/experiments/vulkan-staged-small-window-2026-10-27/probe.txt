@@ -1,0 +1,600 @@
+# How far a Colab A100's Vulkan memory goes, by memory type, and what the change's probe does beside a neighbour (2026-10-26 and 27)
+# PART 1 (sonda is Italian for probe): a first A100 VM of the same kind as runs.txt's (NVIDIA A100-SXM4-80GB, driver 580.82.07, the same ICD), 2026-10-26, before the runs of the earlier version of this change. sonda2.c, sonda3.c
+#   and sonda4.c are small C programs written for this question: sonda2.c allocates blocks the way the weight pool does
+#   (backend_vulkan.c pool_new_block: 256 MiB or 1 GiB blocks, the device-address flag, not mapped) in the host-visible
+#   device-local type until the driver refuses, then one big block, then the device-only type. sonda3.c and sonda4.c
+#   are the same program grown in two steps: they make the device with or without bufferDeviceAddress and
+#   VK_EXT_memory_budget (BDA=1, BUDGET=1), sonda4.c also with a CUDA context, the allocation flag and the mapping
+#   (CUDA=1, FLAG=1, MAP=1), to see whether any of them changes where the driver stops; the variants are named in their
+#   outputs. All three sources are below. Built and run on the VM with:
+#   gcc -O1 -Wall -o sonda sonda.c -lvulkan && LD_LIBRARY_PATH=/usr/lib64-nvidia VK_DRIVER_FILES=<icd> ./sonda
+#   (sonda4.c with -lcudart for the CUDA variants).
+# Read: the host-visible device-local type (type 5, flags 0x7) gives 39.75 GiB (159 blocks of 256 MiB, or 39 of 1 GiB), mapped
+#   or not, whichever way the device is made; one 40 GiB block is refused after 2.2 s, a 60 GiB one after 8.1 s. The
+#   device-only type (type 1) gave all of the 72 GiB asked, in blocks and in one. The card's heap says 80 GiB and the memory budget 79.21 GiB.
+#   Flags: 0x1 device-local, 0x2 host-visible, 0x4 host-coherent, 0x8 host-cached; VkResult -2 is VK_ERROR_OUT_OF_DEVICE_MEMORY.
+# What this does not show: a throwaway device made before the engine's own, in the engine's process, was given 72 GiB of
+#   type 5 in about 19 s (an earlier version of this change asked there; no log of it is kept); no probe of ours made outside
+#   the engine's process gave that, and the cause was not found. The change asks on the engine's device, after it exists.
+# PART 2, the VM of runs.txt: its BAR1 line (nvidia-smi -q -d MEMORY: BAR1 131072 MiB, larger than the heap), the changed
+#   tier test on the card, and the test beside hold.c, a process that holds GiB of the device-only type 1 (1 GiB blocks) while the test
+#   starts its device: h1-hold30 held 30 GiB and the probe, capped by the memory budget, asked 49 GiB (the budget left) and the
+#   host-visible type gave 24 of the 49 asked (39 of the 72 asked with nothing held): staged. h2-hold60 asked 60 GiB, held 49,
+#   and nvidia-smi then read 80992 MiB used (why was not examined): the probe's budget left 0 GiB
+#   ("gave the 0 GiB asked", the mapped line), and every case of the test failed with "nothing ran on the device", so that run says
+#   only what the line prints when nothing is free.
+
+#################### PART 1: the first A100 VM (2026-10-26), copied from its record ####################
+===== sonda2.log (sha256 79585e55e1680278a4cce48a35ca23848feb2d7efddfee27d8ea3c2bc14f4dab)
+
+device: NVIDIA A100-SXM4-80GB
+heap 0: 80.00 GiB device-local
+heap 1: 125.29 GiB
+type 0: heap 1 flags 0x0
+type 1: heap 0 flags 0x1
+type 2: heap 0 flags 0x1
+type 3: heap 1 flags 0x6
+type 4: heap 1 flags 0xe
+type 5: heap 0 flags 0x7
+  at the start: heap 0 budget 79.21 GiB, usage 0.00 GiB
+  at the start: heap 1 budget 125.29 GiB, usage 0.01 GiB
+host-visible device-local type 5, device-only type 1
+single 20.00 GiB: taken (VkResult 0) in 616 ms, freed
+single 39.50 GiB: taken (VkResult 0) in 1180 ms, freed
+single 40.00 GiB: refused (VkResult -2) in 2188 ms
+single 60.00 GiB: refused (VkResult -2) in 8120 ms
+single 72.00 GiB: refused (VkResult -2) in 9862 ms
+single 60.00 GiB: taken (VkResult 0) in 3021 ms, freed
+single 72.00 GiB: taken (VkResult 0) in 3534 ms, freed
+chunked 1024 MiB, up to 72 GiB: 39 blocks = 39.00 GiB, refused (VkResult -2); allocations 1224 ms, frees 891 ms
+chunked 256 MiB, up to 72 GiB: 159 blocks = 39.75 GiB, refused (VkResult -2); allocations 908 ms, frees 777 ms
+chunked 1024 MiB, up to 72 GiB: 72 blocks = 72.00 GiB, stopped at the limit (VkResult 0); allocations 1780 ms, frees 1651 ms
+
+===== sonda3.log (sha256 bef3922df9723c6b87e707229259d5fbac8b10c1f7159a9d5e286976f5a45d30)
+
+--- variant: []
+device made with: bufferDeviceAddress off, VK_EXT_memory_budget off
+chunked 1024 MiB, up to 72 GiB: 39 blocks = 39.00 GiB, refused (VkResult -2); allocations 1237 ms, frees 891 ms
+single 40.00 GiB: refused (VkResult -2) in 2052 ms
+--- variant: [BDA=1]
+device made with: bufferDeviceAddress on, VK_EXT_memory_budget off
+chunked 1024 MiB, up to 72 GiB: 39 blocks = 39.00 GiB, refused (VkResult -2); allocations 1173 ms, frees 876 ms
+single 40.00 GiB: refused (VkResult -2) in 2033 ms
+--- variant: [BUDGET=1]
+device made with: bufferDeviceAddress off, VK_EXT_memory_budget on
+chunked 1024 MiB, up to 72 GiB: 39 blocks = 39.00 GiB, refused (VkResult -2); allocations 1185 ms, frees 891 ms
+single 40.00 GiB: refused (VkResult -2) in 2067 ms
+--- variant: [BDA=1 BUDGET=1]
+device made with: bufferDeviceAddress on, VK_EXT_memory_budget on
+chunked 1024 MiB, up to 72 GiB: 39 blocks = 39.00 GiB, refused (VkResult -2); allocations 1178 ms, frees 890 ms
+single 40.00 GiB: refused (VkResult -2) in 2057 ms
+
+===== sonda4.log (sha256 1f358234dc1e00376a02f5530408a616d1d7ee66506e99a9637b35c6b62dda22)
+
+--- variant: [CUDA=1]
+CUDA context: made
+device made with: bufferDeviceAddress off, VK_EXT_memory_budget off
+chunked 1024 MiB, up to 72 GiB: 39 blocks = 39.00 GiB, refused (VkResult -2); allocations 1198 ms, frees 895 ms
+--- variant: [CUDA=1 BDA=1 FLAG=1 MAP=1]
+CUDA context: made
+device made with: bufferDeviceAddress on, VK_EXT_memory_budget off
+chunked 1024 MiB, up to 72 GiB: 39 blocks = 39.00 GiB, refused (VkResult -2); allocations 1182 ms, frees 898 ms
+--- variant: [BDA=1 FLAG=1 MAP=1]
+device made with: bufferDeviceAddress on, VK_EXT_memory_budget off
+chunked 1024 MiB, up to 72 GiB: 39 blocks = 39.00 GiB, refused (VkResult -2); allocations 1182 ms, frees 895 ms
+
+===== the card's queue families (an excerpt of 1-apt.log, vulkaninfo; the whole log has sha256 5544b524166f9395cf801447a5b6500d510652de33b78389d9e54983ed1b6cd2)
+
+	deviceName        = NVIDIA A100-SXM4-80GB
+	queueProperties[0]:
+		queueCount                  = 16
+		queueFlags                  = QUEUE_GRAPHICS_BIT | QUEUE_COMPUTE_BIT | QUEUE_TRANSFER_BIT | QUEUE_SPARSE_BINDING_BIT
+	queueProperties[1]:
+		queueCount                  = 2
+		queueFlags                  = QUEUE_TRANSFER_BIT | QUEUE_SPARSE_BINDING_BIT
+	queueProperties[2]:
+		queueCount                  = 8
+		queueFlags                  = QUEUE_COMPUTE_BIT | QUEUE_TRANSFER_BIT | QUEUE_SPARSE_BINDING_BIT
+	queueProperties[3]:
+		queueCount                  = 5
+		queueFlags                  = QUEUE_TRANSFER_BIT | QUEUE_SPARSE_BINDING_BIT | QUEUE_VIDEO_DECODE_BIT_KHR
+	queueProperties[4]:
+		queueCount                  = 1
+		queueFlags                  = QUEUE_TRANSFER_BIT | QUEUE_SPARSE_BINDING_BIT | QUEUE_OPTICAL_FLOW_BIT_NV
+
+===== sonda2.c (sha256 3d4bb70b0268780d9cace66a0931c077c2f425ba05f5ef2ec4ee48f34ab6f127)
+
+/* sonda2.c (from sonda.c): how long it takes to find where the host-visible device-local type stops, two ways, and
+ * whether one big allocation is refused too. Was: how far a Vulkan device's memory goes in 256 MiB blocks, the way colibri's weight pools take it
+ * (backend_vulkan.c pool_new_block): the host-visible device-local type allocated with the device-address flag
+ * and mapped whole (the mapped path, memtype 5 on the A100), the same without the mapping, then the device-only
+ * type (the staged path). For each: blocks, GiB, the call that failed and its VkResult. Before: heaps, types and
+ * the driver's budget (VK_EXT_memory_budget).
+ *   gcc -O1 -o sonda sonda.c -lvulkan && VK_DRIVER_FILES=<icd> ./sonda */
+#include <vulkan/vulkan.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define BLK ((VkDeviceSize)256 << 20)
+#define MAXB 2048   /* 512 GiB: past any card */
+
+static VkPhysicalDevice phys;
+static VkDevice dev;
+static VkDeviceMemory mem[MAXB];
+static int has_budget;
+
+static void budget(const char *when) {
+    if (!has_budget) return;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 p = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &b};
+    vkGetPhysicalDeviceMemoryProperties2(phys, &p);
+    for (uint32_t i = 0; i < p.memoryProperties.memoryHeapCount; i++)
+        printf("  %s: heap %u budget %.2f GiB, usage %.2f GiB\n", when, i, b.heapBudget[i] / 1073741824.0,
+               b.heapUsage[i] / 1073741824.0);
+}
+
+
+#include <time.h>
+static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
+static VkResult alloc(uint32_t type, VkDeviceSize bytes, VkDeviceMemory *m) {
+    VkMemoryAllocateFlagsInfo fl = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = getenv("NOFLAG") ? NULL : &fl, .allocationSize = bytes, .memoryTypeIndex = type};
+    return vkAllocateMemory(dev, &ai, NULL, m);
+}
+/* chunked: GiB-sized blocks (not mapped) until a refusal or `limit` GiB; the elapsed time of the allocations, then of the frees */
+static void chunked(uint32_t type, int chunk_mib, int limit_gib) {
+    VkDeviceSize b = (VkDeviceSize)chunk_mib << 20; int n = 0; VkResult r = VK_SUCCESS;
+    double t0 = now();
+    for (; n < MAXB && (double)n * chunk_mib / 1024.0 < limit_gib; n++) if ((r = alloc(type, b, &mem[n])) != VK_SUCCESS) break;
+    double t1 = now();
+    for (int i = 0; i < n; i++) vkFreeMemory(dev, mem[i], NULL);
+    double t2 = now();
+    printf("chunked %d MiB, up to %d GiB: %d blocks = %.2f GiB, %s (VkResult %d); allocations %.0f ms, frees %.0f ms\n",
+           chunk_mib, limit_gib, n, n * chunk_mib / 1024.0, r == VK_SUCCESS ? "stopped at the limit" : "refused", (int)r, t1 - t0, t2 - t1);
+    fflush(stdout);
+}
+/* one allocation of `gib` GiB: refused or not, and how long (a success is freed at once) */
+static void single(uint32_t type, double gib) {
+    VkDeviceMemory m; double t0 = now();
+    VkResult r = alloc(type, (VkDeviceSize)(gib * 1073741824.0), &m);
+    double t1 = now();
+    if (r == VK_SUCCESS) vkFreeMemory(dev, m, NULL);
+    printf("single %.2f GiB: %s (VkResult %d) in %.0f ms%s\n", gib, r == VK_SUCCESS ? "taken" : "refused", (int)r, t1 - t0,
+           r == VK_SUCCESS ? ", freed" : "");
+    fflush(stdout);
+}
+int main(void) {
+    VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_2};
+    VkInstanceCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
+    VkInstance inst;
+    if (vkCreateInstance(&ii, NULL, &inst) != VK_SUCCESS) { puts("no instance"); return 1; }
+    uint32_t nd = 8; VkPhysicalDevice pd[8];
+    vkEnumeratePhysicalDevices(inst, &nd, pd);
+    for (uint32_t i = 0; i < nd && !phys; i++) {
+        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(pd[i], &pp);
+        if (pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) { phys = pd[i]; printf("device: %s\n", pp.deviceName); }
+    }
+    if (!phys) { puts("no discrete GPU"); return 1; }
+    uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(phys, NULL, &ne, NULL);
+    VkExtensionProperties *ep = calloc(ne, sizeof *ep); vkEnumerateDeviceExtensionProperties(phys, NULL, &ne, ep);
+    for (uint32_t i = 0; i < ne; i++) if (!strcmp(ep[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) has_budget = 1;
+
+    VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(phys, &mp);
+    VkDeviceSize dl_max = 0;
+    for (uint32_t i = 0; i < mp.memoryHeapCount; i++) {
+        printf("heap %u: %.2f GiB%s\n", i, mp.memoryHeaps[i].size / 1073741824.0,
+               mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? " device-local" : "");
+        if ((mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mp.memoryHeaps[i].size > dl_max)
+            dl_max = mp.memoryHeaps[i].size;
+    }
+    int hv = -1, dv = -1;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
+        printf("type %u: heap %u flags 0x%x\n", i, mp.memoryTypes[i].heapIndex, (unsigned)f);
+        int big = (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && mp.memoryHeaps[mp.memoryTypes[i].heapIndex].size == dl_max;
+        if (f & 0xC0u) continue;   /* vendor types, passed over as place_decide does */
+        if (big && (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) && hv < 0) hv = (int)i;
+        if (big && !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && dv < 0) dv = (int)i;
+    }
+    float prio = 1.0f;
+    VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = 0,
+                                  .queueCount = 1, .pQueuePriorities = &prio};
+    VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+                                            .bufferDeviceAddress = VK_TRUE};
+    const char *ext[1] = {VK_EXT_MEMORY_BUDGET_EXTENSION_NAME};
+    VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f12, .queueCreateInfoCount = 1,
+                             .pQueueCreateInfos = &qi, .enabledExtensionCount = has_budget ? 1 : 0, .ppEnabledExtensionNames = ext};
+    if (vkCreateDevice(phys, &di, NULL, &dev) != VK_SUCCESS) { puts("no device"); return 1; }
+    budget("at the start");
+    if (hv < 0) { puts("no host-visible device-local type"); return 1; }
+    printf("host-visible device-local type %u, device-only type %d\n", (unsigned)hv, dv);
+    single((uint32_t)hv, 20); single((uint32_t)hv, 39.5); single((uint32_t)hv, 40); single((uint32_t)hv, 60); single((uint32_t)hv, 72);
+    if (dv >= 0) { single((uint32_t)dv, 60); single((uint32_t)dv, 72); }
+    chunked((uint32_t)hv, 1024, 72);
+    chunked((uint32_t)hv, 256, 72);
+    if (dv >= 0) chunked((uint32_t)dv, 1024, 72);
+    vkDestroyDevice(dev, NULL); vkDestroyInstance(inst, NULL);
+    return 0;
+}
+
+===== sonda3.c (sha256 622d0f0753f39274ef9a09008a4f7d7154da1d3279a7f96b68e29e35646531cb)
+
+/* sonda3.c (from sonda2.c: the device made with or without bufferDeviceAddress and VK_EXT_memory_budget, by BDA= and
+ * BUDGET= in the environment; one 1 GiB chunked run on the host-visible type). sonda2.c (from sonda.c): how long it takes to find where the host-visible device-local type stops, two ways, and
+ * whether one big allocation is refused too. Was: how far a Vulkan device's memory goes in 256 MiB blocks, the way colibri's weight pools take it
+ * (backend_vulkan.c pool_new_block): the host-visible device-local type allocated with the device-address flag
+ * and mapped whole (the mapped path, memtype 5 on the A100), the same without the mapping, then the device-only
+ * type (the staged path). For each: blocks, GiB, the call that failed and its VkResult. Before: heaps, types and
+ * the driver's budget (VK_EXT_memory_budget).
+ *   gcc -O1 -o sonda sonda.c -lvulkan && VK_DRIVER_FILES=<icd> ./sonda */
+#include <vulkan/vulkan.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define BLK ((VkDeviceSize)256 << 20)
+#define MAXB 2048   /* 512 GiB: past any card */
+
+static VkPhysicalDevice phys;
+static VkDevice dev;
+static VkDeviceMemory mem[MAXB];
+static int has_budget;
+
+static void budget(const char *when) {
+    if (!has_budget) return;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 p = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &b};
+    vkGetPhysicalDeviceMemoryProperties2(phys, &p);
+    for (uint32_t i = 0; i < p.memoryProperties.memoryHeapCount; i++)
+        printf("  %s: heap %u budget %.2f GiB, usage %.2f GiB\n", when, i, b.heapBudget[i] / 1073741824.0,
+               b.heapUsage[i] / 1073741824.0);
+}
+
+
+#include <time.h>
+static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
+static VkResult alloc(uint32_t type, VkDeviceSize bytes, VkDeviceMemory *m) {
+    VkMemoryAllocateFlagsInfo fl = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = getenv("NOFLAG") ? NULL : &fl, .allocationSize = bytes, .memoryTypeIndex = type};
+    return vkAllocateMemory(dev, &ai, NULL, m);
+}
+/* chunked: GiB-sized blocks (not mapped) until a refusal or `limit` GiB; the elapsed time of the allocations, then of the frees */
+static void chunked(uint32_t type, int chunk_mib, int limit_gib) {
+    VkDeviceSize b = (VkDeviceSize)chunk_mib << 20; int n = 0; VkResult r = VK_SUCCESS;
+    double t0 = now();
+    for (; n < MAXB && (double)n * chunk_mib / 1024.0 < limit_gib; n++) if ((r = alloc(type, b, &mem[n])) != VK_SUCCESS) break;
+    double t1 = now();
+    for (int i = 0; i < n; i++) vkFreeMemory(dev, mem[i], NULL);
+    double t2 = now();
+    printf("chunked %d MiB, up to %d GiB: %d blocks = %.2f GiB, %s (VkResult %d); allocations %.0f ms, frees %.0f ms\n",
+           chunk_mib, limit_gib, n, n * chunk_mib / 1024.0, r == VK_SUCCESS ? "stopped at the limit" : "refused", (int)r, t1 - t0, t2 - t1);
+    fflush(stdout);
+}
+/* one allocation of `gib` GiB: refused or not, and how long (a success is freed at once) */
+static void single(uint32_t type, double gib) {
+    VkDeviceMemory m; double t0 = now();
+    VkResult r = alloc(type, (VkDeviceSize)(gib * 1073741824.0), &m);
+    double t1 = now();
+    if (r == VK_SUCCESS) vkFreeMemory(dev, m, NULL);
+    printf("single %.2f GiB: %s (VkResult %d) in %.0f ms%s\n", gib, r == VK_SUCCESS ? "taken" : "refused", (int)r, t1 - t0,
+           r == VK_SUCCESS ? ", freed" : "");
+    fflush(stdout);
+}
+int main(void) {
+    VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_2};
+    VkInstanceCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
+    VkInstance inst;
+    if (vkCreateInstance(&ii, NULL, &inst) != VK_SUCCESS) { puts("no instance"); return 1; }
+    uint32_t nd = 8; VkPhysicalDevice pd[8];
+    vkEnumeratePhysicalDevices(inst, &nd, pd);
+    for (uint32_t i = 0; i < nd && !phys; i++) {
+        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(pd[i], &pp);
+        if (pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) { phys = pd[i]; printf("device: %s\n", pp.deviceName); }
+    }
+    if (!phys) { puts("no discrete GPU"); return 1; }
+    uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(phys, NULL, &ne, NULL);
+    VkExtensionProperties *ep = calloc(ne, sizeof *ep); vkEnumerateDeviceExtensionProperties(phys, NULL, &ne, ep);
+    for (uint32_t i = 0; i < ne; i++) if (!strcmp(ep[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) has_budget = 1;
+
+    VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(phys, &mp);
+    VkDeviceSize dl_max = 0;
+    for (uint32_t i = 0; i < mp.memoryHeapCount; i++) {
+        printf("heap %u: %.2f GiB%s\n", i, mp.memoryHeaps[i].size / 1073741824.0,
+               mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? " device-local" : "");
+        if ((mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mp.memoryHeaps[i].size > dl_max)
+            dl_max = mp.memoryHeaps[i].size;
+    }
+    int hv = -1, dv = -1;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
+        printf("type %u: heap %u flags 0x%x\n", i, mp.memoryTypes[i].heapIndex, (unsigned)f);
+        int big = (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && mp.memoryHeaps[mp.memoryTypes[i].heapIndex].size == dl_max;
+        if (f & 0xC0u) continue;   /* vendor types, passed over as place_decide does */
+        if (big && (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) && hv < 0) hv = (int)i;
+        if (big && !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && dv < 0) dv = (int)i;
+    }
+    float prio = 1.0f;
+    VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = 0,
+                                  .queueCount = 1, .pQueuePriorities = &prio};
+    VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+                                            .bufferDeviceAddress = VK_TRUE};
+    const char *ext[1] = {VK_EXT_MEMORY_BUDGET_EXTENSION_NAME};
+    int use_bda = getenv("BDA") != NULL, use_budget = getenv("BUDGET") != NULL && has_budget;
+    printf("device made with: bufferDeviceAddress %s, VK_EXT_memory_budget %s\n", use_bda ? "on" : "off", use_budget ? "on" : "off");
+    VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = use_bda ? &f12 : NULL, .queueCreateInfoCount = 1,
+                             .pQueueCreateInfos = &qi, .enabledExtensionCount = use_budget ? 1 : 0, .ppEnabledExtensionNames = ext};
+    if (vkCreateDevice(phys, &di, NULL, &dev) != VK_SUCCESS) { puts("no device"); return 1; }
+    budget("at the start");
+    if (hv < 0) { puts("no host-visible device-local type"); return 1; }
+    printf("host-visible device-local type %u, device-only type %d\n", (unsigned)hv, dv);
+    chunked((uint32_t)hv, 1024, 72);
+    single((uint32_t)hv, 40);
+    vkDestroyDevice(dev, NULL); vkDestroyInstance(inst, NULL);
+    return 0;
+}
+
+===== sonda4.c (sha256 ed29c837201b42c0c036e952573aefc3c066b02ca376bcb9d54b45b5ef1279c1)
+
+/* sonda3.c (from sonda2.c: the device made with or without bufferDeviceAddress and VK_EXT_memory_budget, by BDA= and
+ * BUDGET= in the environment; one 1 GiB chunked run on the host-visible type). sonda2.c (from sonda.c): how long it takes to find where the host-visible device-local type stops, two ways, and
+ * whether one big allocation is refused too. Was: how far a Vulkan device's memory goes in 256 MiB blocks, the way colibri's weight pools take it
+ * (backend_vulkan.c pool_new_block): the host-visible device-local type allocated with the device-address flag
+ * and mapped whole (the mapped path, memtype 5 on the A100), the same without the mapping, then the device-only
+ * type (the staged path). For each: blocks, GiB, the call that failed and its VkResult. Before: heaps, types and
+ * the driver's budget (VK_EXT_memory_budget).
+ *   gcc -O1 -o sonda sonda.c -lvulkan && VK_DRIVER_FILES=<icd> ./sonda */
+#include <vulkan/vulkan.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define BLK ((VkDeviceSize)256 << 20)
+#define MAXB 2048   /* 512 GiB: past any card */
+
+static VkPhysicalDevice phys;
+static VkDevice dev;
+static VkDeviceMemory mem[MAXB];
+static int has_budget;
+
+static void budget(const char *when) {
+    if (!has_budget) return;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 p = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &b};
+    vkGetPhysicalDeviceMemoryProperties2(phys, &p);
+    for (uint32_t i = 0; i < p.memoryProperties.memoryHeapCount; i++)
+        printf("  %s: heap %u budget %.2f GiB, usage %.2f GiB\n", when, i, b.heapBudget[i] / 1073741824.0,
+               b.heapUsage[i] / 1073741824.0);
+}
+
+
+#include <time.h>
+#include <cuda_runtime.h>
+static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
+static VkResult alloc(uint32_t type, VkDeviceSize bytes, VkDeviceMemory *m) {
+    VkMemoryAllocateFlagsInfo fl = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = getenv("FLAG") ? &fl : NULL, .allocationSize = bytes, .memoryTypeIndex = type};
+    return vkAllocateMemory(dev, &ai, NULL, m);
+}
+/* chunked: GiB-sized blocks (not mapped) until a refusal or `limit` GiB; the elapsed time of the allocations, then of the frees */
+static void chunked(uint32_t type, int chunk_mib, int limit_gib) {
+    VkDeviceSize b = (VkDeviceSize)chunk_mib << 20; int n = 0; VkResult r = VK_SUCCESS;
+    double t0 = now();
+    for (; n < MAXB && (double)n * chunk_mib / 1024.0 < limit_gib; n++) { if ((r = alloc(type, b, &mem[n])) != VK_SUCCESS) break;
+        if (getenv("MAP")) { void *p = NULL; if ((r = vkMapMemory(dev, mem[n], 0, b, 0, &p)) != VK_SUCCESS) { vkFreeMemory(dev, mem[n], NULL); break; } ((volatile char *)p)[b - 1] = 1; } }
+    double t1 = now();
+    for (int i = 0; i < n; i++) vkFreeMemory(dev, mem[i], NULL);
+    double t2 = now();
+    printf("chunked %d MiB, up to %d GiB: %d blocks = %.2f GiB, %s (VkResult %d); allocations %.0f ms, frees %.0f ms\n",
+           chunk_mib, limit_gib, n, n * chunk_mib / 1024.0, r == VK_SUCCESS ? "stopped at the limit" : "refused", (int)r, t1 - t0, t2 - t1);
+    fflush(stdout);
+}
+/* one allocation of `gib` GiB: refused or not, and how long (a success is freed at once) */
+static void single(uint32_t type, double gib) {
+    VkDeviceMemory m; double t0 = now();
+    VkResult r = alloc(type, (VkDeviceSize)(gib * 1073741824.0), &m);
+    double t1 = now();
+    if (r == VK_SUCCESS) vkFreeMemory(dev, m, NULL);
+    printf("single %.2f GiB: %s (VkResult %d) in %.0f ms%s\n", gib, r == VK_SUCCESS ? "taken" : "refused", (int)r, t1 - t0,
+           r == VK_SUCCESS ? ", freed" : "");
+    fflush(stdout);
+}
+int main(void) {
+    if (getenv("CUDA")) { cudaError_t e = cudaFree(0); printf("CUDA context: %s\n", e == cudaSuccess ? "made" : "FAILED"); }
+    VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_2};
+    VkInstanceCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
+    VkInstance inst;
+    if (vkCreateInstance(&ii, NULL, &inst) != VK_SUCCESS) { puts("no instance"); return 1; }
+    uint32_t nd = 8; VkPhysicalDevice pd[8];
+    vkEnumeratePhysicalDevices(inst, &nd, pd);
+    for (uint32_t i = 0; i < nd && !phys; i++) {
+        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(pd[i], &pp);
+        if (pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) { phys = pd[i]; printf("device: %s\n", pp.deviceName); }
+    }
+    if (!phys) { puts("no discrete GPU"); return 1; }
+    uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(phys, NULL, &ne, NULL);
+    VkExtensionProperties *ep = calloc(ne, sizeof *ep); vkEnumerateDeviceExtensionProperties(phys, NULL, &ne, ep);
+    for (uint32_t i = 0; i < ne; i++) if (!strcmp(ep[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) has_budget = 1;
+
+    VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(phys, &mp);
+    VkDeviceSize dl_max = 0;
+    for (uint32_t i = 0; i < mp.memoryHeapCount; i++) {
+        printf("heap %u: %.2f GiB%s\n", i, mp.memoryHeaps[i].size / 1073741824.0,
+               mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? " device-local" : "");
+        if ((mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mp.memoryHeaps[i].size > dl_max)
+            dl_max = mp.memoryHeaps[i].size;
+    }
+    int hv = -1, dv = -1;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
+        printf("type %u: heap %u flags 0x%x\n", i, mp.memoryTypes[i].heapIndex, (unsigned)f);
+        int big = (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && mp.memoryHeaps[mp.memoryTypes[i].heapIndex].size == dl_max;
+        if (f & 0xC0u) continue;   /* vendor types, passed over as place_decide does */
+        if (big && (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) && hv < 0) hv = (int)i;
+        if (big && !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && dv < 0) dv = (int)i;
+    }
+    float prio = 1.0f;
+    VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = 0,
+                                  .queueCount = 1, .pQueuePriorities = &prio};
+    VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+                                            .bufferDeviceAddress = VK_TRUE};
+    const char *ext[1] = {VK_EXT_MEMORY_BUDGET_EXTENSION_NAME};
+    int use_bda = getenv("BDA") != NULL, use_budget = getenv("BUDGET") != NULL && has_budget;
+    printf("device made with: bufferDeviceAddress %s, VK_EXT_memory_budget %s\n", use_bda ? "on" : "off", use_budget ? "on" : "off");
+    VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = use_bda ? &f12 : NULL, .queueCreateInfoCount = 1,
+                             .pQueueCreateInfos = &qi, .enabledExtensionCount = use_budget ? 1 : 0, .ppEnabledExtensionNames = ext};
+    if (vkCreateDevice(phys, &di, NULL, &dev) != VK_SUCCESS) { puts("no device"); return 1; }
+    budget("at the start");
+    if (hv < 0) { puts("no host-visible device-local type"); return 1; }
+    printf("host-visible device-local type %u, device-only type %d\n", (unsigned)hv, dv);
+    chunked((uint32_t)hv, 1024, 72);
+    single((uint32_t)hv, 40);
+    vkDestroyDevice(dev, NULL); vkDestroyInstance(inst, NULL);
+    return 0;
+}
+
+#################### PART 2: the second A100 VM (2026-10-27), the one of runs.txt ####################
+
+===== bar1.txt (sha256 4543ad0d2bc3ae11ec52aebaa21dc3da6d2b407bc293d3e4979c6aefae923da2): nvidia-smi -q -d MEMORY before the runs
+
+
+==============NVSMI LOG==============
+
+Timestamp                                 : Tue Oct 27 00:03:00 2026
+Driver Version                            : 580.82.07
+CUDA Version                              : 13.0
+
+Attached GPUs                             : 1
+GPU 00000000:00:05.0
+    FB Memory Usage
+        Total                             : 81920 MiB
+        Reserved                          : 768 MiB
+        Used                              : 0 MiB
+        Free                              : 81153 MiB
+    BAR1 Memory Usage
+        Total                             : 131072 MiB
+        Used                              : 1 MiB
+        Free                              : 131071 MiB
+    Conf Compute Protected Memory Usage
+        Total                             : 0 MiB
+        Used                              : 0 MiB
+        Free                              : 0 MiB
+
+===== w4-a100.log (sha256 541c560c90e7677c32583117cd66a8d70562d98067bab909cb2e12133dd9769f): the changed tier test on the A100 itself (excerpt: the memory lines, the window case, the verdict; the whole log has the sha256 above)
+
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 81920 MiB heap) copied from host staging memory (type 3) on a transfer queue (the driver gave 39 of the 72 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 2.8 s)
+[VK] memory at exit: weights 0.0 MiB, expert tier 8.3 MiB (peaks), KV mirror 0.0 MiB in memory type 1 (device-local, not host-visible); the dense chain's state in type 1 (device-local); 225.1 MiB staged in 13454 copies (2087 submits), 224.6 MiB of them straight from host memory in 13405 copies (0 not imported), 99 blocks zero-filled; resident data in host memory: 0.0 MiB
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 81920 MiB heap) copied from host staging memory (type 3) on a transfer queue (COLI_VK_STAGED=1)
+[VK] memory at exit: weights 0.0 MiB, expert tier 0.3 MiB (peaks), KV mirror 0.0 MiB in memory type 1 (device-local, not host-visible); the dense chain's state in type 1 (device-local); 225.3 MiB staged in 13468 copies (2089 submits), 224.7 MiB of them straight from host memory in 13419 copies (0 not imported), 100 blocks zero-filled; resident data in host memory: 0.0 MiB
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 81920 MiB heap) copied from host staging memory (type 3) on a transfer queue (COLI_VK_STAGED=1)
+[VK] memory at exit: weights 0.0 MiB, expert tier 0.4 MiB (peaks), KV mirror 0.0 MiB in memory type 1 (device-local, not host-visible); the dense chain's state in type 1 (device-local); 225.7 MiB staged in 13528 copies (2100 submits), 225.1 MiB of them straight from host memory in 13479 copies (0 not imported), 101 blocks zero-filled; resident data in host memory: 0.0 MiB
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 81920 MiB heap) copied from host staging memory (type 3) on a transfer queue (the driver gave 0 of the 72 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_PROBE_MB))
+[VK] memory at exit: weights 0.0 MiB, expert tier 0.0 MiB (peaks), KV mirror 0.0 MiB in memory type 1 (device-local, not host-visible); the dense chain's state in type 1 (device-local); 225.7 MiB staged in 13528 copies (2100 submits), 225.1 MiB of them straight from host memory in 13479 copies (0 not imported), 101 blocks zero-filled; resident data in host memory: 0.0 MiB
+window:
+  a window of 1 MiB: staged
+[VK] memory: mapped weights, the host-visible device-local memory gave the 97656 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_PROBE_MB)
+  a window of the whole heap and more: mapped
+  COLI_VK_STAGED=0 over a window of 1 MiB: mapped
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 81920 MiB heap) copied from host staging memory (type 3) on a transfer queue (COLI_VK_STAGED=1)
+[VK] memory at exit: weights 0.0 MiB, expert tier 0.0 MiB (peaks), KV mirror 0.0 MiB in memory type 1 (device-local, not host-visible); the dense chain's state in type 1 (device-local); 225.7 MiB staged in 13528 copies (2100 submits), 225.1 MiB of them straight from host memory in 13479 copies (0 not imported), 101 blocks zero-filled; resident data in host memory: 0.0 MiB
+  COLI_VK_STAGED=1 over a window of the whole heap: staged
+PASS
+== a100 test rc=0
+
+===== h1-hold30: the changed test beside a process that holds 30 GiB of the device-only type (hold.c below); logs h1-hold30.log (sha256 b41dd7c0137892b773604df85afad154e0683a5de0003b11572c5d585936040b), h1-hold30-hold.txt (sha256 f37ecf670ed5d9b760710c3f96a5c03559b235d71b6d4b76adb61ca7c703974d), h1-hold30-test.txt (sha256 f2ed15609ca4278bbe39b474fd56f82dcc69a30b6d0042ebe6f0201d8a16db70; excerpt below: the memory lines and the verdict)
+
+holding 30 of 30 GiB of the device-only type 1
+holding 30 of 30 GiB of the device-only type 1
+timestamp, memory.used [MiB], utilization.gpu [%], temperature.gpu, clocks.current.sm [MHz]
+2026/10/27 00:14:10.932, 30767 MiB, 0 %, 34, 1155 MHz
+test rc=0
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 81920 MiB heap) copied from host staging memory (type 3) on a transfer queue (the driver gave 24 of the 49 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 1.3 s)
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 81920 MiB heap) copied from host staging memory (type 3) on a transfer queue (COLI_VK_STAGED=1)
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 81920 MiB heap) copied from host staging memory (type 3) on a transfer queue (COLI_VK_STAGED=1)
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 81920 MiB heap) copied from host staging memory (type 3) on a transfer queue (the driver gave 0 of the 72 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_PROBE_MB))
+[VK] memory: mapped weights, the host-visible device-local memory gave the 97656 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_PROBE_MB)
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 81920 MiB heap) copied from host staging memory (type 3) on a transfer queue (COLI_VK_STAGED=1)
+PASS
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 81920 MiB heap) copied from host staging memory (type 3) on a transfer queue (the driver gave 24 of the 49 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 1.3 s)
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 81920 MiB heap) copied from host staging memory (type 3) on a transfer queue (COLI_VK_STAGED=1)
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 81920 MiB heap) copied from host staging memory (type 3) on a transfer queue (COLI_VK_STAGED=1)
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 81920 MiB heap) copied from host staging memory (type 3) on a transfer queue (the driver gave 0 of the 72 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_PROBE_MB))
+[VK] memory: mapped weights, the host-visible device-local memory gave the 97656 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_PROBE_MB)
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 81920 MiB heap) copied from host staging memory (type 3) on a transfer queue (COLI_VK_STAGED=1)
+PASS
+
+===== h2-hold60: the changed test beside a process that holds 60 GiB of the device-only type (hold.c below); logs h2-hold60.log (sha256 84c32f717daec24b9372ab94cd9ad1bac54938305a5571ffa18c348f589dc69f), h2-hold60-hold.txt (sha256 eb937b3460162ae0d86a23425d7550c571282cfda22f2623c72a3b4cf2b87664), h2-hold60-test.txt (sha256 8dc6c39528c82cba1d792a6520e5fad6c746e4beda47bf4d185227c1e9a51d54; excerpt below: the memory lines and the verdict)
+
+holding 49 of 60 GiB of the device-only type 1
+holding 49 of 60 GiB of the device-only type 1
+timestamp, memory.used [MiB], utilization.gpu [%], temperature.gpu, clocks.current.sm [MHz]
+2026/10/27 00:14:49.063, 80992 MiB, 0 %, 35, 1155 MHz
+test rc=1
+[VK] memory: mapped weights, the host-visible device-local memory gave the 0 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s
+FAIL tests/test_vk_tier.c:435: Q4_0: nothing ran on the device
+FAIL tests/test_vk_tier.c:435: Q4_1: nothing ran on the device
+FAIL tests/test_vk_tier.c:435: Q5_0: nothing ran on the device
+FAIL tests/test_vk_tier.c:435: Q5_1: nothing ran on the device
+FAIL tests/test_vk_tier.c:435: Q8_0: nothing ran on the device
+FAIL tests/test_vk_tier.c:435: IQ4_NL: nothing ran on the device
+FAIL tests/test_vk_tier.c:435: MXFP4 (ggml): nothing ran on the device
+FAIL tests/test_vk_tier.c:435: NVFP4: nothing ran on the device
+FAIL tests/test_vk_tier.c:435: Q1_0: nothing ran on the device
+FAIL tests/test_vk_tier.c:435: Q2_0: nothing ran on the device
+FAIL tests/test_vk_tier.c:435: Q2_K: nothing ran on the device
+[VK] memory: mapped weights, the host-visible device-local memory gave the 0 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 81920 MiB heap) copied from host staging memory (type 3) on a transfer queue (COLI_VK_STAGED=1)
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 81920 MiB heap) copied from host staging memory (type 3) on a transfer queue (COLI_VK_STAGED=1)
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 81920 MiB heap) copied from host staging memory (type 3) on a transfer queue (the driver gave 0 of the 72 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_PROBE_MB))
+[VK] memory: mapped weights, the host-visible device-local memory gave the 97656 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_PROBE_MB)
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 81920 MiB heap) copied from host staging memory (type 3) on a transfer queue (COLI_VK_STAGED=1)
+FAIL (42)
+
+===== hold.c (sha256 049aa08b635b5be49be9264be015a7db7e2f758a742f5340f2bc086ecd1d22a9)
+
+/* hold.c <GiB>: holds that many GiB of the device-only memory type (1 GiB blocks) until /content/hold.stop exists,
+ * to see what the engine's start-up probe does beside a neighbour that holds memory on the same card.
+ *   gcc -O1 -Wall -o hold hold.c -lvulkan && VK_DRIVER_FILES=<icd> ./hold 60 */
+#include <vulkan/vulkan.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    int want = argc > 1 ? atoi(argv[1]) : 0, got = 0;
+    VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_2};
+    VkInstanceCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
+    VkInstance inst;
+    if (vkCreateInstance(&ii, NULL, &inst) != VK_SUCCESS) { puts("no instance"); return 1; }
+    uint32_t nd = 8; VkPhysicalDevice pd[8], phys = NULL;
+    vkEnumeratePhysicalDevices(inst, &nd, pd);
+    for (uint32_t i = 0; i < nd && !phys; i++) {
+        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(pd[i], &pp);
+        if (pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) phys = pd[i];
+    }
+    if (!phys) { puts("no discrete GPU"); return 1; }
+    VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(phys, &mp);
+    int dv = -1;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
+        if ((f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !(f & 0xC0u) && dv < 0) dv = (int)i;
+    }
+    if (dv < 0) { puts("no device-only type"); return 1; }
+    float prio = 1.0f;
+    VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = 0, .queueCount = 1,
+                                  .pQueuePriorities = &prio};
+    VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi};
+    VkDevice dev;
+    if (vkCreateDevice(phys, &di, NULL, &dev) != VK_SUCCESS) { puts("no device"); return 1; }
+    for (; got < want; got++) {
+        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = (VkDeviceSize)1 << 30,
+                                   .memoryTypeIndex = (uint32_t)dv};
+        VkDeviceMemory m;
+        if (vkAllocateMemory(dev, &ai, NULL, &m) != VK_SUCCESS) break;
+    }
+    printf("holding %d of %d GiB of the device-only type %d\n", got, want, dv);
+    fflush(stdout);
+    while (access("/content/hold.stop", F_OK) != 0) sleep(1);
+    return 0;
+}

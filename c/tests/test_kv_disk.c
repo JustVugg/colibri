@@ -1,4 +1,4 @@
-/* .coli_kv round-trip: v1 (f32) and v2 (KV8 fp8+scale) records, the v1->v2
+/* .coli_kv round-trip: v1 (f32), v2 (KV8 fp8+scale) and v4 (KV16 float16) records, the v1->v2
  * upgrade path (quantize-on-load; the v1 file survives until the first save rewrites it
  * as v2), the v2-under-f32 reject, and the format-mismatch self-heal in
  * kv_disk_append (magic differs -> file rewritten from record 0). No model
@@ -36,6 +36,23 @@ int main(void){
     for(int i=0;i<m.c.n_layers;i++) for(int p=0;p<NP;p++)
         for(int j=0;j<m.c.kv_lora;j++)
             CHECK(m.Lc[i][(int64_t)p*m.c.kv_lora+j]==fill(i,p,j), "v1 Lc[%d] p%d j%d", i,p,j);
+
+    /* A token id outside [0,vocab) cuts the history at that record, like a short read. */
+    { int32_t bad[3]={-1,m.c.vocab,INT32_MAX}, k=3;
+      for(int b=0;b<3;b++){
+          FILE *f=fopen(PATH,"r+b");
+          CHECK(f && fseek(f,40+k*kv_rec_bytes(&m),SEEK_SET)==0 && fwrite(&bad[b],4,1,f)==1,
+                "poison token id"); if(f) fclose(f);
+          kv_alloc(&m,16); m.kv->disk_nrec=0;
+          CHECK(kv_disk_load(&m,hist2,16)==k, "bad id %d load", bad[b]);
+          CHECK(m.kv->disk_nrec==k, "bad id disk_nrec=%d", m.kv->disk_nrec);
+          for(int p=0;p<k;p++) CHECK(hist2[p]==hist[p], "bad id hist[%d]", p);
+      }
+      FILE *f=fopen(PATH,"r+b");
+      CHECK(f && fseek(f,40+k*kv_rec_bytes(&m),SEEK_SET)==0 && fwrite(&hist[k],4,1,f)==1,
+            "restore token id"); if(f) fclose(f);
+      kv_alloc(&m,16); m.kv->disk_nrec=0;
+      CHECK(kv_disk_load(&m,hist2,16)==NP, "restored v1 load"); }
 
 #ifndef _WIN32
     /* A real failed data flush must not publish an unwritten tail or suppress
@@ -186,8 +203,64 @@ int main(void){
     CHECK(kv_disk_load(&m,hist2,16)==0, "v3 under different bit width must be rejected");
     g_tq=0;
 
+    /* ---- v4: KV16 float16 rows. A v1 file under KV16 converts on load (the file
+     * intact until the first save rewrites it), v4 round-trips byte for byte, v4 under
+     * float32 widens exactly, v4 under KV8 is refused ---- */
+    if(m.kv->disk_fp){ fclose(m.kv->disk_fp); m.kv->disk_fp=NULL; }
+    remove(PATH);
+    g_kv8=0; g_tq=0; g_kv16=0; kv_alloc(&m,16); m.kv->disk_nrec=0;
+    for(int i=0;i<m.c.n_layers;i++) for(int p=0;p<NP;p++){
+        for(int j=0;j<m.c.kv_lora;j++) m.Lc[i][(int64_t)p*m.c.kv_lora+j]=fill(i,p,j);
+        for(int j=0;j<m.c.qk_rope;j++) m.Rc[i][(int64_t)p*m.c.qk_rope+j]=fill(i+9,p,j);
+    }
+    kv_disk_append(&m,hist,NP);                     /* a v1 file */
+    if(m.kv->disk_fp){ fclose(m.kv->disk_fp); m.kv->disk_fp=NULL; }
+    g_kv16=1; kv_alloc(&m,16); m.kv->disk_nrec=0;
+    CHECK(m.Lc8 && !m.Lsc, "KV16 rows in Lc8, no scales");
+    CHECK(kv_disk_load(&m,hist2,16)==NP, "v1->kv16 load");
+    CHECK(m.kv->disk_nrec==0, "v1->kv16 leaves disk_nrec=0 for the full rewrite");
+    { FILE *f=fopen(PATH,"rb"); char mg[8]={0};
+      CHECK(f && fread(mg,1,8,f)==8 && !memcmp(mg,KV_MAGIC,8), "v1 file must survive the kv16 load untouched");
+      if(f) fclose(f); }
+    for(int i=0;i<m.c.n_layers;i++) for(int p=0;p<NP;p++){
+        const uint16_t *L=(const uint16_t *)coli_kv_row8(m.Lc8[i],p,2*m.c.kv_lora);
+        const uint16_t *R=(const uint16_t *)coli_kv_row8(m.Rc8[i],p,2*m.c.qk_rope);
+        for(int j=0;j<m.c.kv_lora;j++) CHECK(L[j]==kv16_from(fill(i,p,j)), "v1->kv16 Lc[%d] p%d j%d", i,p,j);
+        for(int j=0;j<m.c.qk_rope;j++) CHECK(R[j]==kv16_from(fill(i+9,p,j)), "v1->kv16 Rc[%d] p%d j%d", i,p,j);
+    }
+    kv_disk_append(&m,hist,NP);
+    CHECK(m.kv->disk_nrec==NP, "v4 append nrec=%d", m.kv->disk_nrec);
+    { FILE *f=fopen(PATH,"rb"); char mg[8]={0};
+      CHECK(f && fread(mg,1,8,f)==8 && !memcmp(mg,KV_MAGIC4,8), "v4 magic on disk");
+      if(f) fclose(f); }
+    uint16_t keepL4[2][5*8], keepR4[2][5*4];
+    for(int i=0;i<m.c.n_layers;i++){
+        memcpy(keepL4[i], m.Lc8[i], (size_t)NP*m.c.kv_lora*2);
+        memcpy(keepR4[i], m.Rc8[i], (size_t)NP*m.c.qk_rope*2);
+    }
+    kv_alloc(&m,16); m.kv->disk_nrec=0;
+    CHECK(kv_disk_load(&m,hist2,16)==NP, "v4 load");
+    for(int i=0;i<m.c.n_layers;i++){
+        CHECK(!memcmp(m.Lc8[i], keepL4[i], (size_t)NP*m.c.kv_lora*2), "v4 Lc8 bytes layer %d", i);
+        CHECK(!memcmp(m.Rc8[i], keepR4[i], (size_t)NP*m.c.qk_rope*2), "v4 Rc8 bytes layer %d", i);
+    }
+    if(m.kv->disk_fp){ fclose(m.kv->disk_fp); m.kv->disk_fp=NULL; }
+    g_kv16=0; kv_alloc(&m,16); m.kv->disk_nrec=0;
+    CHECK(kv_disk_load(&m,hist2,16)==NP, "v4 under f32 load");
+    CHECK(m.kv->disk_nrec==0, "v4 under f32 leaves disk_nrec=0 for the full rewrite");
+    for(int i=0;i<m.c.n_layers;i++) for(int p=0;p<NP;p++){
+        for(int j=0;j<m.c.kv_lora;j++)
+            CHECK(m.Lc[i][(int64_t)p*m.c.kv_lora+j]==kv16_to(keepL4[i][p*m.c.kv_lora+j]), "v4->f32 Lc[%d] p%d j%d", i,p,j);
+        for(int j=0;j<m.c.qk_rope;j++)
+            CHECK(m.Rc[i][(int64_t)p*m.c.qk_rope+j]==kv16_to(keepR4[i][p*m.c.qk_rope+j]), "v4->f32 Rc[%d] p%d j%d", i,p,j);
+    }
+    if(m.kv->disk_fp){ fclose(m.kv->disk_fp); m.kv->disk_fp=NULL; }
+    g_kv8=1; kv_alloc(&m,16); m.kv->disk_nrec=0;
+    CHECK(kv_disk_load(&m,hist2,16)==0, "v4 under KV8 must be rejected");
+    g_kv8=0;
+
     remove(PATH);
     if(fails){ fprintf(stderr,"%d failure(s)\n",fails); return 1; }
-    printf("OK kv_disk v1/v2 round-trip + upgrade + reject + self-heal\n");
+    printf("OK kv_disk v1/v2/v3/v4 round-trip + upgrade + reject + self-heal\n");
     return 0;
 }

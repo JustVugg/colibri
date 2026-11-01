@@ -1,5 +1,7 @@
 #version 450
-// Qwen3.8's QSA indexer on the device (vk_chain.c, VKC_P_QSA), two modes.
+#extension GL_GOOGLE_include_directive : require
+#include "chain_qsa.h"
+// Qwen3.8's QSA indexer on the device (vk_chain.c, VKC_P_QSA), three modes.
 //
 // mode 0, the block keys: one workgroup per block b = b0 + WorkGroupID.x whose R index
 // keys are all written. Its key is what qwen38_core.h's q38_attention builds for every
@@ -8,41 +10,145 @@
 // row b - b0 of cs). A block's key depends on its own rows only, so the device keeps
 // it (pk[b]) and computes each block once, when a step completes it.
 //
-// mode 1, the selection: one workgroup per query row s, position pos_base + s. With
-// visible = pos + 1 positions, blocks = visible / R complete blocks and
-// take = min(blocks, budget / R): when every block is taken the row attends to all of
-// 0..pos (count -1 in sel, chain_attn.comp's contiguous case). Otherwise each block
-// scores sum_h max(0, q_h . pk[b]) / sqrt(ID) over the IQ index heads (the CPU's sums,
-// in its order), a block is taken when fewer than `take` blocks rank above it (score
-// higher, or equal with a lower index: the CPU's sort order), and sel gets the taken
-// blocks' positions in block order followed by the incomplete tail block's.
-layout(local_size_x = 128) in;
+// modes 1 and 2, the selection, which vkc_qsa runs as two dispatches: one workgroup per
+// query row s, position pos_base + s. With visible = pos + 1 positions, blocks = visible / R
+// complete blocks and take = min(blocks, budget / R): when every block is taken the row
+// attends to all of 0..pos (count -1 in sel, chain_attn.comp's contiguous case). Otherwise
+// the row takes the `take` blocks that rank first in the order of q38_block_desc
+// (qwen38_core.h: higher score first, equal scores the lower block first). sel gets their
+// positions in block order, followed by the positions of the incomplete tail block.
+//
+// mode 1, the scores: one workgroup per (row s, group of WG blocks). Each thread scores one
+// block: sum_h max(0, q_h . pk[b]) / sqrt(ID) over the IQ index heads (the sums
+// computed on the CPU, in the same order), into sc[s * nbmax + b].
+//
+// mode 2, the blocks taken: a radix select over the scores of the row, a byte at a time
+// from the top, finds the score of the last block taken and how many of the blocks with
+// that score are taken. Prefix sums over the threads then give each block taken its place
+// in sel.
+layout(local_size_x = QSA_WG) in;
 
 layout(std430, binding = 0) readonly buffer AB { float src[]; };   // mode 0: index keys [cap][ID]; mode 1: index queries
 layout(std430, binding = 1) readonly buffer WB { float w[]; };     // mode 0: k norm weight; mode 1: (unused)
 layout(std430, binding = 2) buffer PB { float pk[]; };             // block keys [nbmax][ID]
 layout(std430, binding = 3) readonly buffer CB { float cs[]; };    // mode 0: cos/sin rows
-layout(std430, binding = 4) buffer SB { float sc[]; };             // mode 1: scratch [S][2*nbmax]
-layout(std430, binding = 5) buffer LB { int sel[]; };              // mode 1: [S][sel_row]
+layout(std430, binding = 4) buffer SB { float sc[]; };             // modes 1, 2: scores [S][nbmax]
+layout(std430, binding = 5) buffer LB { int sel[]; };              // mode 2: [S][sel_row]
 
 layout(push_constant) uniform P {
     int mode, ID, R;
     int b0, half_;                      // mode 0
-    int S, pos_base, budget, IQ;        // mode 1
+    int S, pos_base, budget, IQ;        // modes 1, 2
     int q_off, q_row, nbmax, sel_row;
     float eps;
     int src_off, w_off, pk_off, nb;
 } p;
 
+const int MODE_SELECT = 2;
+
+const int WG = int(gl_WorkGroupSize.x);   // divides BINS
+const int RADIX_BITS = 8;
+const int BINS = 1 << RADIX_BITS;
+const int PASSES = 32 / RADIX_BITS;
+const int BINS_PER_THREAD = BINS / WG;
+
 shared float pool[256];
-shared float red[128];
+shared float red[WG];
+shared uint hist[BINS];
+shared uint sums[WG];
+shared uint picked_digit, picked_to_take;
+
+// The inclusive prefix sum of v over the threads, in thread order. Every thread of the
+// workgroup calls it in uniform control flow. It uses sums as scratch.
+uint scan(uint v, int tid) {
+    sums[tid] = v;
+    barrier();
+    for (int off = 1; off < WG; off <<= 1) {
+        uint a = tid >= off ? sums[tid - off] : 0u;
+        barrier();
+        sums[tid] += a;
+        barrier();
+    }
+    return sums[tid];
+}
+
+struct Row {
+    int scores_at, list_at;
+    int visible, blocks, take;
+};
+
+// bits: the bit pattern of the score of the last block taken. ties_to_take: how many of
+// the blocks with that score are taken, the lowest ones.
+struct Cutoff {
+    uint bits, ties_to_take;
+};
+
+// Scores are never negative, so their bit patterns order like the numbers.
+uint score_bits(Row row, int b) { return floatBitsToUint(sc[row.scores_at + b]); }
+
+Cutoff find_cutoff(int tid, Row row) {
+    uint cutoff_bits = 0u, found_mask = 0u, to_take = uint(row.take);
+    for (int pass = 0; pass < PASSES; pass++) {
+        int shift = (PASSES - 1 - pass) * RADIX_BITS;
+        for (int bin = tid; bin < BINS; bin += WG) hist[bin] = 0u;
+        barrier();
+        for (int b = tid; b < row.blocks; b += WG) {
+            uint bits = score_bits(row, b);
+            if ((bits & found_mask) == cutoff_bits) atomicAdd(hist[(bits >> shift) & uint(BINS - 1)], 1u);
+        }
+        barrier();
+        int top_bin = BINS - 1 - tid * BINS_PER_THREAD;
+        uint in_bins = 0u;
+        for (int i = 0; i < BINS_PER_THREAD; i++) in_bins += hist[top_bin - i];
+        uint above = scan(in_bins, tid) - in_bins;
+        for (int i = 0; i < BINS_PER_THREAD; i++) {
+            uint count = hist[top_bin - i];
+            if (above < to_take && to_take <= above + count) {
+                picked_digit = uint(top_bin - i);
+                picked_to_take = to_take - above;
+            }
+            above += count;
+        }
+        barrier();
+        cutoff_bits |= picked_digit << shift;
+        found_mask |= uint(BINS - 1) << shift;
+        to_take = picked_to_take;
+    }
+    return Cutoff(cutoff_bits, to_take);
+}
+
+void write_selection(int tid, Row row, Cutoff cutoff) {
+    int blocks_per_thread = (row.blocks + WG - 1) / WG;
+    int first_block = tid * blocks_per_thread, end_block = min(row.blocks, first_block + blocks_per_thread);
+    uint higher = 0u, ties = 0u;
+    for (int b = first_block; b < end_block; b++) {
+        uint bits = score_bits(row, b);
+        higher += bits > cutoff.bits ? 1u : 0u;
+        ties += bits == cutoff.bits ? 1u : 0u;
+    }
+    uint ties_before = scan(ties, tid) - ties;
+    uint ties_taken = cutoff.ties_to_take > ties_before ? min(ties, cutoff.ties_to_take - ties_before) : 0u;
+    uint slot = scan(higher + ties_taken, tid) - higher - ties_taken;
+    for (int b = first_block; b < end_block; b++) {
+        uint bits = score_bits(row, b);
+        bool tie_taken = bits == cutoff.bits && ties_taken > 0u;
+        if (tie_taken) ties_taken--;
+        if (bits > cutoff.bits || tie_taken) {
+            for (int r = 0; r < p.R; r++) sel[row.list_at + 1 + int(slot) * p.R + r] = b * p.R + r;
+            slot++;
+        }
+    }
+    int tail = row.visible - row.blocks * p.R;
+    for (int t = tid; t < tail; t += WG) sel[row.list_at + 1 + row.take * p.R + t] = row.blocks * p.R + t;
+    if (tid == 0) sel[row.list_at] = row.take * p.R + tail;
+}
 
 void main() {
     int tid = int(gl_LocalInvocationID.x);
     if (p.mode == 0) {
         int b = p.b0 + int(gl_WorkGroupID.x);
         float ss = 0.0;
-        for (int d = tid; d < p.ID; d += 128) {
+        for (int d = tid; d < p.ID; d += WG) {
             float v = 0.0;
             for (int r = 0; r < p.R; r++) v += src[p.src_off + (b * p.R + r) * p.ID + d] / float(p.R);
             pool[d] = v;
@@ -50,16 +156,16 @@ void main() {
         }
         red[tid] = ss;
         barrier();
-        for (int off = 64; off > 0; off >>= 1) {
+        for (int off = WG / 2; off > 0; off >>= 1) {
             if (tid < off) red[tid] += red[tid + off];
             barrier();
         }
         float rr = 1.0 / sqrt(red[0] / float(p.ID) + p.eps);
         barrier();
-        for (int d = tid; d < p.ID; d += 128) pool[d] = pool[d] * rr * (1.0 + w[p.w_off + d]);
+        for (int d = tid; d < p.ID; d += WG) pool[d] = pool[d] * rr * (1.0 + w[p.w_off + d]);
         barrier();
         int cb = int(gl_WorkGroupID.x) * 2 * p.half_;
-        for (int d = tid; d < p.ID; d += 128) {
+        for (int d = tid; d < p.ID; d += WG) {
             float v = pool[d];
             if (d < p.half_) {
                 float c = cs[cb + 2 * d], s = cs[cb + 2 * d + 1];
@@ -75,42 +181,23 @@ void main() {
     }
     int s = int(gl_WorkGroupID.x);
     int visible = p.pos_base + s + 1, blocks = visible / p.R;
-    int take = min(blocks, p.budget / p.R);
-    int lb = s * p.sel_row;
-    if (take >= blocks) {
-        if (tid == 0) sel[lb] = -1;
+    Row row = Row(s * p.nbmax, s * p.sel_row, visible, blocks, min(blocks, p.budget / p.R));
+    if (row.take >= row.blocks) {
+        if (p.mode == MODE_SELECT && tid == 0) sel[row.list_at] = -1;
         return;
     }
-    int sb = s * 2 * p.nbmax;
+    if (p.mode == MODE_SELECT) {
+        write_selection(tid, row, find_cutoff(tid, row));
+        return;
+    }
+    int b = int(gl_WorkGroupID.y) * WG + tid;
+    if (b >= row.blocks) return;
     int qb = p.q_off + s * p.q_row;
-    for (int b = tid; b < blocks; b += 128) {
-        float score = 0.0;
-        for (int h = 0; h < p.IQ; h++) {
-            float a = 0.0;
-            for (int d = 0; d < p.ID; d++) a += src[qb + h * p.ID + d] * pk[p.pk_off + b * p.ID + d];
-            if (a > 0.0) score += a;
-        }
-        sc[sb + b] = score / sqrt(float(p.ID));
+    float score = 0.0;
+    for (int h = 0; h < p.IQ; h++) {
+        float a = 0.0;
+        for (int d = 0; d < p.ID; d++) a += src[qb + h * p.ID + d] * pk[p.pk_off + b * p.ID + d];
+        if (a > 0.0) score += a;
     }
-    memoryBarrierBuffer();
-    barrier();
-    for (int b = tid; b < blocks; b += 128) {
-        float v = sc[sb + b];
-        int rank = 0;
-        for (int b2 = 0; b2 < blocks; b2++) {
-            float v2 = sc[sb + b2];
-            if (v2 > v || (v2 == v && b2 < b)) rank++;
-        }
-        sc[sb + p.nbmax + b] = rank < take ? 1.0 : 0.0;
-    }
-    memoryBarrierBuffer();
-    barrier();
-    if (tid == 0) {
-        int n = 0;
-        for (int b = 0; b < blocks; b++)
-            if (sc[sb + p.nbmax + b] != 0.0)
-                for (int r = 0; r < p.R; r++) sel[lb + 1 + n++] = b * p.R + r;
-        for (int t = blocks * p.R; t < visible; t++) sel[lb + 1 + n++] = t;
-        sel[lb] = n;
-    }
+    sc[row.scores_at + b] = score / sqrt(float(p.ID));
 }

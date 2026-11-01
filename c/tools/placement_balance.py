@@ -30,6 +30,8 @@ def read_usage(path: Path) -> dict[tuple[int, int], int]:
             if len(fields) != 3:
                 raise ValueError(f"{stats}:{lineno}: expected layer expert count")
             layer, expert, count = map(int, fields)
+            if layer < 0:  # header record (route_trace.h), not an expert
+                continue
             key = (layer, expert)
             run[key] = max(run.get(key, 0), count)
         for key, count in run.items():

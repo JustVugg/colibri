@@ -135,7 +135,31 @@ static int inkc_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2")
  * of the fused [ns][R][I] tensors): the per-matrix path's copy when it keeps a table
  * for the tensor (ink_vk_view_tensor, keyed by the view's first element in the tensor),
  * else the chain's own. NULL: not a form the shaders read as this CPU does (ink_vk_fmt). */
+/* The chain's form of a matrix [O x I]: ink_vk_fmt's, or a GGUF's blocks as the file has
+ * them (100 + the ggml type) where the device has that block format; 0: none. */
+static int inkc_fmt(const Wt *w, int I) {
+    if (w->gq) {
+        const int b = gq_r16_base(w->gqt), t = b >= 0 ? b : w->gqt, be = coli_vk_block_elems(100 + t);
+        return be > 0 && I % be == 0 ? 100 + t : 0;
+    }
+    return ink_vk_fmt(w);
+}
 static ColiVkTensor *inkc_tensor(int d, Wt view, int I, int O) {
+    if (view.gq) {   /* a GGUF's: its blocks (rows the loader interleaved by 16 back to the file's first) */
+        const int fmt = inkc_fmt(&view, I), b = gq_r16_base(view.gqt);
+        /* whole groups of 16 back; the head's unpadded vocabulary stops inside the last one,
+         * whose rows the matrix holds (qn: its bytes) */
+        const int Og = (O + 15) / 16 * 16;
+        uint8_t *rows = NULL;
+        if (!fmt || (b >= 0 && (view.qn < (int64_t)Og * gq_row_bytes(view.gqt, I) ||
+                                !(rows = malloc((size_t)gq_row_bytes(fmt - 100, I) * (size_t)Og))))) return NULL;
+        if (rows) gq_r16_unpack(view.gqt, rows, view.gq, Og, I);
+        const void *src = rows ? (const void *)rows : (const void *)view.gq;
+        ColiVkTensor *t = NULL;
+        int ok = d ? coli_vk_tensor_ensure2(&t, src, NULL, fmt, I, O, 0) : coli_vk_tensor_ensure(&t, src, NULL, fmt, I, O, 0);
+        free(rows);
+        return ok ? t : NULL;
+    }
     if (view.vk && !d) return ink_vk_view_tensor(&view, I, O);   /* the per-matrix path's table, keyed by the view */
     int fmt = ink_vk_fmt(&view);
     const void *data = view.q4 ? (const void *)view.q4 : view.f ? (const void *)view.f : (const void *)view.h;
@@ -224,8 +248,8 @@ static int inkc_place_layer(Model *m, InkChain *ch, int i, const char **what) {
         if (!(ch->t_dg[i] = inkc_tensor(d, l->dg, D, c->dense_inter)) || !(ch->t_du[i] = inkc_tensor(d, l->du, D, c->dense_inter)) ||
             !(ch->t_dd[i] = inkc_tensor(d, l->dd, c->dense_inter, D))) *what = "a dense MLP matrix";
     } else {
-        if (!(d ? coli_vk_tensor_ensure2(&ch->t_router[i], l->router, NULL, 10, D, E + ns, 0)
-                : coli_vk_tensor_ensure(&ch->t_router[i], l->router, NULL, 10, D, E + ns, 0))) *what = "the router";
+        /* the router's f32: bf16 or f16 where exact */
+        if (!coli_vk_tensor_ensure_f32(&ch->t_router[i], l->router, D, E + ns, d)) *what = "the router";
         for (int j = 0; j < ns && !*what; j++)
             if (!(ch->t_sg[(size_t)i * nsl + j] = inkc_tensor(d, wt_off_i(l->sh_g, (int64_t)j * I * D, D), D, I)) ||
                 !(ch->t_su[(size_t)i * nsl + j] = inkc_tensor(d, wt_off_i(l->sh_u, (int64_t)j * I * D, D), D, I)) ||
@@ -295,7 +319,7 @@ static void inkc_fit_start(Model *m) {
     if (L < 1 || !inkc_geometry_ok(m, 0)) return;
     size_t *per = calloc((size_t)L, sizeof *per), *mat = calloc((size_t)L, sizeof *mat);
     int ok = per && mat;
-#define INKC_FITW(w, In, Out) do { const Wt *w_ = (w); int f_ = ink_vk_fmt(w_), g_ = w_->q4 ? w_->gs : 0; \
+#define INKC_FITW(w, In, Out) do { const Wt *w_ = (w); int f_ = inkc_fmt(w_, (In)), g_ = w_->q4 ? w_->gs : 0; \
         if (!f_) ok = 0; else { per[i] += vkc_fit_tensor(f_, (In), (Out), g_); mat[i] += coli_vk_tensor_payload(f_, (In), (Out), g_); } } while (0)
     for (int i = 0; i < L && ok; i++) {
         const Layer *l = &m->L[i];
@@ -304,7 +328,8 @@ static void inkc_fit_start(Model *m) {
         INKC_FITW(&l->r, D, H * dr); INKC_FITW(&l->o, H * hd, D);
         if (!c->sparse[i]) { INKC_FITW(&l->dg, D, c->dense_inter); INKC_FITW(&l->du, D, c->dense_inter); INKC_FITW(&l->dd, c->dense_inter, D); }
         else {
-            per[i] += vkc_fit_tensor(10, D, E + ns, 0); mat[i] += coli_vk_tensor_payload(10, D, E + ns, 0);
+            int rf = l->router ? coli_vk_f32_fmt(l->router, (size_t)D * (E + ns)) : 10;
+            per[i] += vkc_fit_tensor(rf, D, E + ns, 0); mat[i] += coli_vk_tensor_payload(rf, D, E + ns, 0);
             for (int j = 0; j < ns; j++) { INKC_FITW(&l->sh_g, D, I); INKC_FITW(&l->sh_u, D, I); INKC_FITW(&l->sh_d, I, D); }
         }
         per[i] += ((size_t)2 * D + 2 * (size_t)hd + (size_t)dr * L_EXT(c, i) + (size_t)2 * kvo * CK + (size_t)2 * D * CK) * sizeof(float);
@@ -316,13 +341,13 @@ static void inkc_fit_start(Model *m) {
         per[i] += 2 * vkc_fit_buf((size_t)KV * rows0 * hd * sizeof(float));
     }
 #undef INKC_FITW
-    if (!ink_vk_fmt(&m->lm_head)) ok = 0;
+    if (!inkc_fmt(&m->lm_head, D)) ok = 0;
     if (!ok) {   /* a matrix the shaders do not read as this CPU does: the chain declines as before */
         free(per); free(mat);
         return;
     }
     const Wt *h = &m->lm_head;
-    int hf = ink_vk_fmt(h);
+    int hf = inkc_fmt(h, D);
     size_t tail = vkc_fit_tensor(hf, D, c->unpad_vocab, h->q4 ? h->gs : 0);
     InkChain g; memset(&g, 0, sizeof g);
     inkc_geom(&g, m);
@@ -358,13 +383,14 @@ static size_t inkc_fit_later(const Model *m) {
         const Layer *l = &m->L[i];
         int H = L_HEADS(c, i), hd = L_HD(c, i), kvo = L_KV(c, i) * hd, D = c->hidden, I = c->moe_inter;
         size_t w = 0;
-#define INKC_LW(x, In, Out) do { const Wt *x_ = (x); InkVk *v_ = x_->vk; int f_ = v_ && v_->gone ? v_->fmt : ink_vk_fmt(x_); \
+#define INKC_LW(x, In, Out) do { const Wt *x_ = (x); InkVk *v_ = x_->vk; int f_ = v_ && v_->gone ? v_->fmt : inkc_fmt(x_, (In)); \
         w += vkc_fit_tensor(f_, (In), (Out), v_ && v_->gone ? v_->gs : x_->q4 ? x_->gs : 0); } while (0)
         INKC_LW(&l->q, D, H * hd); INKC_LW(&l->k, D, kvo); INKC_LW(&l->v, D, kvo);
         INKC_LW(&l->r, D, H * c->d_rel); INKC_LW(&l->o, H * hd, D);
         if (!c->sparse[i]) { INKC_LW(&l->dg, D, c->dense_inter); INKC_LW(&l->du, D, c->dense_inter); INKC_LW(&l->dd, c->dense_inter, D); }
         else {
-            w += vkc_fit_tensor(10, D, c->n_experts + c->n_shared, 0);
+            w += vkc_fit_tensor(l->router ? coli_vk_f32_fmt(l->router, (size_t)D * (c->n_experts + c->n_shared)) : 10,
+                                D, c->n_experts + c->n_shared, 0);
             for (int j = 0; j < c->n_shared; j++) { INKC_LW(&l->sh_g, D, I); INKC_LW(&l->sh_u, D, I); INKC_LW(&l->sh_d, I, D); }
         }
 #undef INKC_LW
@@ -688,8 +714,8 @@ static int inkc_push_state(InkChain *ch, Model *m, int pos_base, int n) {
     for (int i = ch->lo; i < ch->lo + ch->nl && ok; i++) {
         if (ch->ks.on && ch->kli[i] >= 0) {
             int KV = L_KV(c, i), hd = L_HD(c, i);
-            VkcKvPart pt[2] = {{KV, hd, m->K[i], (size_t)ch->cap[i] * hd, ch->kc[i], 0},
-                               {KV, hd, m->V[i], (size_t)ch->cap[i] * hd, ch->vc[i], 0}};
+            VkcKvPart pt[2] = {{KV, hd, m->K[i], (size_t)ch->cap[i] * hd, ch->kc[i], 0, 0},
+                               {KV, hd, m->V[i], (size_t)ch->cap[i] * hd, ch->vc[i], 0, 0}};
             vkc_kv_place(&ch->ks, ch->kli[i], pos_base, n);
             ok = vkc_kv_push(&ch->ks, ch->kli[i], pt, 2, pos_base);
             continue;
@@ -769,7 +795,7 @@ static int inkc_attention(InkChain *ch, Model *m, int i, int n, int pb) {
         /* the split: the step's rows into their window slots first (the window holds every
          * row of a step), then the attention over the device's rows and the host's */
         int li = ch->kli[i];
-        VkcKvPart pk = {KV, hd, m->K[i], (size_t)cap * hd, ch->kc[i], 0}, pv = {KV, hd, m->V[i], (size_t)cap * hd, ch->vc[i], 0};
+        VkcKvPart pk = {KV, hd, m->K[i], (size_t)cap * hd, ch->kc[i], 0, 0}, pv = {KV, hd, m->V[i], (size_t)cap * hd, ch->vc[i], 0, 0};
         size_t ko = (size_t)ch->slot[i] * 2 * ch->rows * ch->kvo_max;
         VkcKvRel a = {&ch->ks, li, ch->q, ch->kc[i], ch->vc[i], ch->r, ch->tau, ch->prm, ch->ctx, n, H, KV, hd, pb,
                       L_EXT(c, i), dr, H * hd, H * dr, (int)ch->o_relp[i], 0, H * hd, 1.f / (float)hd,
@@ -878,6 +904,10 @@ static int inkc_forward_seg(Model *m, InkChain *ch, float *xh, int S, int pos_ba
     if (want_x && !xfin) return 0;
     vkc_gemm_rows(-1);
     for (int c0 = 0; c0 < S; c0 += rows) {
+        /* a served prompt's CANCEL between two chunks (prompt_break.h): not taken, and step_mm
+         * leaves without a CPU redo; ink_serve_start starts the state over (state_reset tells
+         * the device too) */
+        if (coli_prompt_break()) { free(xfin); return 0; }
         int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0;
         if (!vkc_begin() || !vkc_write(ch->x, 0, xh + (size_t)c0 * D, (size_t)n * D * sizeof(float)) ||
             !inkc_push_state(ch, m, pb, n)) goto lost;
@@ -1013,7 +1043,6 @@ static void inkc_report(Model *m) {
  * priority; the chain's pipelines, and its teardown registered after the tier's so
  * that it runs first at exit. */
 static void inkc_start(Model *m) {
-    (void)m;
     if (!g_vk_ready) return;
     const char *e = getenv("COLI_VK_CHAIN");
 #ifdef COLI_CUDA

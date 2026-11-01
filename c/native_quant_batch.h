@@ -7,6 +7,9 @@
  * scalar column accumulation order of the single-token reference kernels. */
 int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
                               const float *inputs, int batch);
+/* CPU-only grouped projection; unsupported layouts return -1 for fallback. */
+int coli_fp8_grouped_matvec_ref(float *outputs, const ColiTensorView *weight,
+                                const float *inputs, int groups);
 int coli_fp4_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
                               const float *inputs, int batch);
 

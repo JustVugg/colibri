@@ -428,7 +428,7 @@ class EvalGlmEvidenceTests(unittest.TestCase):
     def test_banner_kernels_and_load_boundaries_are_exact(self):
         self.assertEqual(
             EVAL.parse_engine_banner(self.BANNER)["kernel"], "neon-i8mm")
-        for kernel in ("avx512-vnni", "avx-vnni", "avx2", "neon-i8mm",
+        for kernel in ("avx512-vnni", "avx-vnni", "avx2", "ssse3", "neon-i8mm",
                        "neon", "vsx", "scalar"):
             line = self.BANNER.replace("neon-i8mm", kernel)
             self.assertEqual(EVAL.parse_engine_banner(line)["kernel"], kernel)

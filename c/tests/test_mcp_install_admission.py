@@ -61,7 +61,7 @@ class InstallAdmissionTest(unittest.TestCase):
                 self.assertFalse(replies[1]["isError"])
                 self.assertTrue(replies[2]["isError"])
                 self.assertIn("already running", replies[2]["content"][0]["text"])
-                self.assertEqual(setup_flow.read_state()["pid"], children[0].pid)
+                self.assertEqual(mcp_server._current_install_state()["pid"], children[0].pid)
             finally:
                 release.set()
                 for thread in server.threads:

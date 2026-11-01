@@ -38,7 +38,7 @@ static double shared_run(Model *m,Layer *l,const float *x,const float *seed,
 
 static int shared_benchmark(void) {
     Model m;memset(&m,0,sizeof(m));m.c.hidden=I;m.c.shared_inter=O;
-    Layer l;memset(&l,0,sizeof(l));
+    Layer l;memset(&l,0,sizeof(l));l.sh_I=O;   /* the layer's shared width */
     l.sh_g.w=falloc((int64_t)O*I);l.sh_u.w=falloc((int64_t)O*I);
     l.sh_d.w=falloc((int64_t)I*O);l.sh_gate=falloc(I);
     for(int64_t i=0;i<(int64_t)O*I;i++){((float*)l.sh_g.w)[i]=value(i,2);((float*)l.sh_u.w)[i]=value(i,3);}

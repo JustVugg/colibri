@@ -118,8 +118,11 @@ def load_config(model_dir):
         return settings
     root = Path(model_dir)
     processor = root / "preprocessor_config.json"
-    if processor.exists():
-        raw = json.loads(processor.read_text())
+    raw = json.loads(processor.read_text()) if processor.exists() else None
+    if raw is None and (root / "processor_config.json").exists():
+        # LFM3-VL's processor_config.json: the image processor's settings under its own key
+        raw = json.loads((root / "processor_config.json").read_text()).get("image_processor")
+    if isinstance(raw, dict):
         for key in ("patch_size", "merge_size", "temporal_patch_size",
                     "image_mean", "image_std"):
             if key in raw:
@@ -156,7 +159,7 @@ def preprocess(source, model_dir=None, max_tokens=None):
         import numpy
         from PIL import Image
     except ImportError as exc:                    # pragma: no cover
-        raise SystemExit(f"serve Pillow e numpy: {exc}")
+        raise ImportError(f"serve Pillow e numpy: {exc}") from exc   # not SystemExit: the gateway answers 400
 
     settings = load_config(model_dir)
     patch = int(settings.get("patch_size", PATCH))
@@ -204,8 +207,12 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="solo la griglia, su stdout")
     arguments = parser.parse_args()
 
-    patches, grid_h, grid_w = preprocess(arguments.image, arguments.model,
-                                         arguments.max_tokens)
+    try:
+        patches, grid_h, grid_w = preprocess(arguments.image, arguments.model,
+                                             arguments.max_tokens)
+    except ImportError as missing:
+        print(missing, file=sys.stderr)
+        return 1
     if arguments.json:
         print(json.dumps({"grid_h": grid_h, "grid_w": grid_w,
                           "patches": int(patches.shape[0]),

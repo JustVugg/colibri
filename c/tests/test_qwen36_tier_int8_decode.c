@@ -154,7 +154,7 @@ static void case_int8_decode(void) {
      * was `if (s->g4) qt_note(...)` with g4 == NULL: zero offers, zero
      * uploads, resident 0/4 for the life of the process (#1391). */
     for (int e = 0; e < NE; e++)
-        decode_offer(0, e, &m.cache[0].slots[e]);
+        decode_offer(&m, 0, e, &m.cache[0].slots[e]);
     qt_fill_wait();
 
     ck(fake_uploads > 0, "the decode offer enqueued int8 experts (fake_uploads > 0)");
@@ -196,7 +196,7 @@ static void case_int4_decode(void) {
     g_expert_is_int4 = 1;
 
     for (int e = 0; e < NE; e++)
-        decode_offer(0, e, &m.cache[0].slots[e]);
+        decode_offer(&m, 0, e, &m.cache[0].slots[e]);
     qt_fill_wait();
 
     ck(fake_uploads > 0, "the decode offer still enqueues on an int4 container");

@@ -1,0 +1,129 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+// Gated DeltaNet's recurrence for a prompt chunk's rows (vk_chain.c, vkc_dnrec from
+// VKC_DNREC_ROWS rows): chain_dnrec.comp's arithmetic and bindings, its rows R at a time.
+// chain_dnrec.comp takes four barriers a row (the norms of q and k, then of the output,
+// each over the workgroup), and a Qwen3.6 prompt's rows went through it at about 7 us a
+// row a layer, a third of the prefill. Here, per block of R rows:
+//   1. in parallel, a subgroup a vector: q and k l2-normalized (q also times qscale),
+//      into shared memory with v, beta and decay;
+//   2. the rows in order with no barrier: NSPL lanes beside each other own column
+//      S[h][:, v] in registers for the whole call, a part of its KD each, k . S and q . S
+//      joined by shuffles (chain_dnrec.comp's order), the output o into shared memory;
+//   3. in parallel, a subgroup a row: o's gated RMSNorm, y written.
+// Three barriers a block. The norms' sums run in another order than chain_dnrec.comp's
+// (a subgroup's lanes, then the subgroup's sum), the state's exactly as it does.
+// snap_row >= 0: the state after that row is also written to snap (MTP verify).
+// Limits: VD <= 128, KD a multiple of NSPL and the specialization constant.
+layout(local_size_x_id = 2) in;   // 128 * NSPL
+layout(constant_id = 0) const int KD = 128;
+layout(constant_id = 1) const int NSPL = 8;
+layout(constant_id = 3) const int R = 16;   // rows a block (the host fits the shared memory)
+const int HK = KD / NSPL;                   // a thread's part of the column
+const int KP = NSPL * (HK + 1);             // a row of q or k in shared memory: each part one word apart, no bank conflict
+
+layout(std430, binding = 0) readonly buffer CV { float cv[]; };   // conv output rows
+layout(std430, binding = 1) readonly buffer AB { float ab[]; };   // b and a projections
+layout(std430, binding = 2) readonly buffer ZB { float z[]; };    // z projection rows
+layout(std430, binding = 3) buffer ST { float st[]; };            // state [VH][KD][VD]
+layout(std430, binding = 4) readonly buffer PB { float prm[]; };  // A_log[VH], dt_bias[VH], norm[VD]
+layout(std430, binding = 5) writeonly buffer OB { float y[]; };
+layout(std430, binding = 6) writeonly buffer SB { float snap[]; };
+
+layout(push_constant) uniform P {
+    int S, VH, KH, VD, Ktot;
+    int cv_off, cv_row;
+    int b_off, b_row, a_off, a_row;
+    int z_off, z_row, y_off, y_row;
+    int snap_row, flags;
+    float eps, qscale;
+    int st_off, snap_off, prm_off;
+} p;
+
+shared float qs[R * KP];
+shared float ks[R * KP];
+shared float vs[R * 128];
+shared float os[R * 128];
+shared float bs[R];
+shared float ds[R];
+
+float softplus(float x) {
+    if (x > 20.0) return x;
+    float e = exp(x);
+    return e < 1e-4 ? e - 0.5 * e * e : log(1.0 + e);     // log1p
+}
+int kp(int k) { return (k / HK) * (HK + 1) + k % HK; }
+
+void main() {
+    int h = int(gl_WorkGroupID.x);
+    int t = int(gl_LocalInvocationID.x), v = t / NSPL, hk = t % NSPL;   // column v, part hk of its KD
+    int sg = int(gl_SubgroupID), nsg = int(gl_NumSubgroups), lane = int(gl_SubgroupInvocationID), sgs = int(gl_SubgroupSize);
+    int nt = 128 * NSPL;
+    bool own = v < p.VD;
+    int kh = (p.flags & 4) != 0 ? h % p.KH : h / (p.VH / p.KH);
+    float col[HK];   // S[h][k0 + j][v]
+    int k0 = hk * HK, q0 = hk * (HK + 1);
+    int sb = p.st_off + h * KD * p.VD, nb = p.snap_off + h * KD * p.VD;
+    [[unroll]] for (int j = 0; j < HK; j++) col[j] = own ? st[sb + (k0 + j) * p.VD + v] : 0.0;
+    float alog = prm[p.prm_off + h], dtb = prm[p.prm_off + p.VH + h];
+    for (int s0 = 0; s0 < p.S; s0 += R) {
+        int nr = min(R, p.S - s0);
+        // 1. the block's q and k normalized, a subgroup a vector; v, beta and decay
+        for (int w = sg; w < 2 * nr; w += nsg) {
+            int r = w >> 1, isk = w & 1, cb = p.cv_off + (s0 + r) * p.cv_row + isk * p.Ktot + kh * KD;
+            float a = 0.0;
+            for (int k = lane; k < KD; k += sgs) { float x = cv[cb + k]; a += x * x; }
+            a = subgroupAdd(a);
+            float sc = 1.0 / sqrt(a + 1e-6) * (isk != 0 ? 1.0 : p.qscale);
+            for (int k = lane; k < KD; k += sgs) {
+                float x = cv[cb + k] * sc;
+                if (isk != 0) ks[r * KP + kp(k)] = x; else qs[r * KP + kp(k)] = x;
+            }
+        }
+        for (int i = t; i < nr * p.VD; i += nt) {
+            int r = i / p.VD, c = i - r * p.VD;
+            vs[r * 128 + c] = cv[p.cv_off + (s0 + r) * p.cv_row + 2 * p.Ktot + h * p.VD + c];
+        }
+        if (t < nr) {
+            int s = s0 + t;
+            float bv = ab[p.b_off + s * p.b_row + h], av = ab[p.a_off + s * p.a_row + h];
+            bs[t] = 1.0 / (1.0 + exp(-bv));
+            ds[t] = exp(((p.flags & 2) != 0 ? alog : -exp(alog)) * softplus(av + dtb));
+        }
+        barrier();
+        // 2. the rows in order
+        for (int r = 0; r < nr; r++) {
+            float decay = ds[r], beta = bs[r];
+            float kvs = 0.0;
+            [[unroll]] for (int j = 0; j < HK; j++) { col[j] *= decay; kvs += ks[r * KP + q0 + j] * col[j]; }
+            for (uint m = 1u; m < uint(NSPL); m <<= 1u) kvs += subgroupShuffleXor(kvs, m);   // the column's other parts (the lanes beside)
+            float vin = own ? vs[r * 128 + v] : 0.0;
+            float delta = (vin - kvs) * beta;
+            [[unroll]] for (int j = 0; j < HK; j++) col[j] += ks[r * KP + q0 + j] * delta;
+            float o = 0.0;
+            [[unroll]] for (int j = 0; j < HK; j++) o += qs[r * KP + q0 + j] * col[j];
+            for (uint m = 1u; m < uint(NSPL); m <<= 1u) o += subgroupShuffleXor(o, m);
+            if (own && hk == 0) os[r * 128 + v] = o;
+            if (own && s0 + r == p.snap_row)
+                [[unroll]] for (int j = 0; j < HK; j++) snap[nb + (k0 + j) * p.VD + v] = col[j];
+        }
+        barrier();
+        // 3. each row's gated RMSNorm, a subgroup a row
+        for (int r = sg; r < nr; r += nsg) {
+            int s = s0 + r;
+            float oo = 0.0;
+            for (int c = lane; c < p.VD; c += sgs) { float o = os[r * 128 + c]; oo += o * o; }
+            oo = subgroupAdd(oo);
+            float rr = 1.0 / sqrt(oo / float(p.VD) + p.eps);
+            for (int c = lane; c < p.VD; c += sgs) {
+                float zv = z[p.z_off + s * p.z_row + h * p.VD + c];
+                float g = (p.flags & 1) != 0 ? 1.0 / (1.0 + exp(-zv)) : zv / (1.0 + exp(-zv));
+                y[p.y_off + s * p.y_row + h * p.VD + c] = os[r * 128 + c] * rr * prm[p.prm_off + 2 * p.VH + c] * g;
+            }
+        }
+        barrier();
+    }
+    if (own) [[unroll]] for (int j = 0; j < HK; j++) st[sb + (k0 + j) * p.VD + v] = col[j];
+}

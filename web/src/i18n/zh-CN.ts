@@ -49,7 +49,7 @@ const zhCN: Record<string, string> = {
   "topbar.tokPerSec": "{{n}} tok/s",
   "topbar.slot": "槽位 {{n}}",
   "topbar.truncated": "已截断",
-  "topbar.truncatedHelp": "回复达到最大输出 token 上限而被截断。请调高“最大输出 token 数”以查看完整回答。",
+  "topbar.truncatedHelp": "回复达到输出上限或上下文末尾而被截断。如果你调低过“最大输出 token 数”，请调高；否则请继续生成回复。",
   "topbar.clear": "清空",
 
   "hero.title": "COLIBRÌ 引擎",
@@ -61,6 +61,10 @@ const zhCN: Record<string, string> = {
   "prompts.caching": "比较 RAM 和 VRAM 缓存",
 
   "chat.you": "你",
+  "chat.toBottom": "跳到最新消息",
+  "chat.image": "图片",
+  "ui.exportMarkdown": "Markdown (.md)",
+  "ui.exportJson": "JSON (.json)",
   "chat.colibri": "colibrì",
   "chat.placeholder": "给 colibrì 发消息…",
   "chat.inputHint": "回车发送 · Shift+回车换行",

@@ -161,6 +161,10 @@ int main(void) {
     const int invalid_id[]={14};range=NULL;range_n=0;
     CHECK(decode_range_alloc(invalid_id,0,1,&range,&range_n)==0);
     CHECK(range_n==3&&!memcmp(range,replacement,3));free(range);
+    free(g_tok[14]);g_tok[14]=strdup("<0xC3>");CHECK(g_tok[14]!=NULL);
+    const int cut_ids[]={12,14};range=NULL;range_n=0;   /* a reply cut inside a codepoint */
+    CHECK(decode_range_alloc(cut_ids,0,2,&range,&range_n)==0);
+    CHECK(range_n==131&&range[127]==' '&&!memcmp(range+128,replacement,3));free(range);
 
     SMap full={0};CHECK(smap_init(&full,2)==0);
     CHECK(smap_put(&full,"a",1)==0);CHECK(smap_put(&full,"b",2)==0);

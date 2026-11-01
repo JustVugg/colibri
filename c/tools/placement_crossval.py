@@ -19,6 +19,8 @@ def read_run(path: Path) -> dict[tuple[int, int], int]:
         if len(fields) != 3:
             raise ValueError(f"{path}:{lineno}: expected layer expert count")
         layer, expert, count = map(int, fields)
+        if layer < 0:  # header record (route_trace.h), not an expert
+            continue
         counts[layer, expert] = count
     if not counts:
         raise ValueError(f"{path}: empty stats")

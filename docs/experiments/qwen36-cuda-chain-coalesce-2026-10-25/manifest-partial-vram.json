@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "hypothesis": "On a card holding part of the experts the change does not slow the decode.",
+  "commit": "7bbea341bb4bf9c812fed9d80501cf5fc1615042",
+  "model": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64",
+  "command": "cd c && make qwen36_tier.o backend_cuda.o cuda_chain.o cu_xb.o cu_tier.o CUDA=1 CUDA_ARCH=sm_89 && gcc -O3 -march=native -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_CUDA -I. ../docs/experiments/qwen36-cuda-chain-coalesce-2026-10-25/bench.c qwen36_tier.o backend_cuda.o cuda_chain.o cu_xb.o cu_tier.o -o qwen36-bench -lm -fopenmp -pthread -L/usr/local/cuda/lib64 -Wl,-rpath,/usr/local/cuda/lib64 -lcudart -lcublasLt -lcublas -lstdc++; env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/lib64-nvidia COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close CUDA_EXPERT_GB=5 ./qwen36-bench --model <model> --text <dir>/promessi_sposi.txt --lengths 64,512 --gen 32 --teacher --steps <steps file>",
+  "prompt_hash": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "hardware": {
+    "cpu": "Intel(R) Xeon(R) CPU @ 2.20GHz (6 cores / 12 threads, 38.5 MiB L3) + NVIDIA L4 (23034 MiB, sm_89)",
+    "ram": "52 GiB",
+    "storage": "Google Colab VM disk (the model downloaded to /content before the runs, then read once into the page cache)",
+    "os": "Ubuntu 24.04.4 LTS, Linux 6.6.122+ x86_64 (Google Colab), CUDA 13.0 (nvcc V13.0.88), driver 580.82.07, gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": 5,
+      "HEAT_FILE": "unset",
+      "prompt_tokens": 64,
+      "decode_steps": 32,
+      "engine_build": "origin/dev 7bbea341"
+    },
+    "samples": {
+      "tok_s": [
+        29.278,
+        29.203,
+        29.16,
+        29.184
+      ],
+      "decode_tok_s_after_512": [
+        31.585,
+        31.54,
+        31.361,
+        31.296
+      ],
+      "prompt_tok_s_64": [
+        44.48,
+        44.6,
+        44.88,
+        44.67
+      ],
+      "prompt_tok_s_512": [
+        306.94,
+        307.38,
+        303.57,
+        305.14
+      ]
+    },
+    "median_tok_s": 29.1935,
+    "quality": {
+      "method": "make -C c check (macOS arm64) and make -C c cuda-chain-check cuda-test CUDA=1 CUDA_ARCH=sm_89 (L4) pass; after 64 tokens every run of both versions gives the same fingerprint of every logit and token (FNV-1a 1e40892a3a7ff8df); after 512 the fingerprints vary from run to run in both versions (origin/dev 2 values in 4 runs, this change 4, 2 of them origin/dev's): the tier moves hot experts to the card while the run goes on with uploads that do not wait, so the step from which one runs there can change from run to run, and an expert gives slightly different values on the host and on the card; with the tier's tick off (partial-vram-no-swap.txt) every run of both versions gives the same fingerprints",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-chain-coalesce-2026-10-25/partial-vram.txt",
+      "sha256": "d2f431960ade3a55c0cc759bb2decefcc372e4644105d804d1f444f8170acc40"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": 5,
+      "HEAT_FILE": "unset",
+      "prompt_tokens": 64,
+      "decode_steps": 32,
+      "engine_build": "7bbea341 + this change"
+    },
+    "samples": {
+      "tok_s": [
+        29.393,
+        29.337,
+        29.331,
+        29.32
+      ],
+      "decode_tok_s_after_512": [
+        31.412,
+        31.612,
+        31.595,
+        31.465
+      ],
+      "prompt_tok_s_64": [
+        44.72,
+        44.65,
+        44.33,
+        44.43
+      ],
+      "prompt_tok_s_512": [
+        306.74,
+        307.67,
+        306.5,
+        309.29
+      ]
+    },
+    "median_tok_s": 29.334,
+    "quality": {
+      "method": "make -C c check (macOS arm64) and make -C c cuda-chain-check cuda-test CUDA=1 CUDA_ARCH=sm_89 (L4) pass; after 64 tokens every run of both versions gives the same fingerprint of every logit and token (FNV-1a 1e40892a3a7ff8df); after 512 the fingerprints vary from run to run in both versions (origin/dev 2 values in 4 runs, this change 4, 2 of them origin/dev's): the tier moves hot experts to the card while the run goes on with uploads that do not wait, so the step from which one runs there can change from run to run, and an expert gives slightly different values on the host and on the card; with the tier's tick off (partial-vram-no-swap.txt) every run of both versions gives the same fingerprints",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-chain-coalesce-2026-10-25/partial-vram.txt",
+      "sha256": "d2f431960ade3a55c0cc759bb2decefcc372e4644105d804d1f444f8170acc40"
+    }
+  },
+  "outcome": "improvement"
+}

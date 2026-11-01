@@ -18,16 +18,34 @@ export type Table = {
 /* Split one row into cells. The outer pipes are delimiters when present, so
    they are stripped before splitting rather than left to produce empty edge
    cells — otherwise "| a | b |" and "a | b" would disagree on column count.
-   A backslash-escaped pipe is content. */
+   A pipe is content only when an odd run of backslashes precedes it, and only
+   the backslash right before it goes. After an even run (`a \\| b`) the pipe is
+   still a delimiter. Other backslashes stay as written, because the inline
+   marks never unescape: a cell's `"\\d+"` is a code span that keeps both. */
 export function splitRow(line: string): string[] {
   let text = line.trim()
   if (text.startsWith("|")) text = text.slice(1)
-  if (text.endsWith("|") && !text.endsWith("\\|")) text = text.slice(0, -1)
+  if (text.endsWith("|")) {
+    let slashes = 0
+    for (let i = text.length - 2; i >= 0 && text[i] === "\\"; i--) slashes++
+    if (slashes % 2 === 0) text = text.slice(0, -1)
+  }
 
   const out: string[] = []
   let cell = ""
   for (let at = 0; at < text.length; at++) {
-    if (text[at] === "\\" && text[at + 1] === "|") { cell += "|"; at++; continue }
+    if (text[at] === "\\") {
+      let run = 1
+      while (text[at + run] === "\\") run++
+      if (run % 2 === 1 && text[at + run] === "|") {
+        cell += "\\".repeat(run - 1) + "|"
+        at += run
+        continue
+      }
+      cell += "\\".repeat(run)
+      at += run - 1
+      continue
+    }
     if (text[at] === "|") { out.push(cell); cell = ""; continue }
     cell += text[at]
   }
@@ -67,8 +85,10 @@ export function parseTableAt(lines: string[], from: number): Table | null {
   const align = rowAlignments(lines[from + 1])
   if (!align) return null
 
+  /* GFM: the header and the delimiter row have the same number of cells, or this
+     is not a table. A line with a pipe followed by a "---" rule is prose and a rule. */
   const head = splitRow(header)
-  if (!head.length || head.every((cell) => !cell)) return null
+  if (!head.length || head.every((cell) => !cell) || head.length !== align.length) return null
 
   const rows: string[][] = []
   let at = from + 2

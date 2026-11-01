@@ -8,6 +8,7 @@ import platform
 import re
 import shutil
 import statistics
+import struct
 import subprocess
 import sys
 import threading
@@ -76,7 +77,7 @@ class _CgroupMount:
 # sidecar and self-invalidate on any change. Best-effort: any read/write failure falls
 # straight back to a full recompute (see analyze_model). Sits alongside .coli_usage/.coli_ssd.
 _ANALYSIS_CACHE_NAME = ".coli_analysis.json"
-_ANALYSIS_CACHE_VERSION = 11
+_ANALYSIS_CACHE_VERSION = 14   # 13: a GGUF's experts counted for every family (V4, Inkling); 14: V4.1's engram tables out of a GGUF's dense bytes
 
 
 def _dense_in_ram(descriptor, on_disk_bytes):
@@ -101,7 +102,8 @@ def _dense_in_ram(descriptor, on_disk_bytes):
 
 # A token embedding table: "embed_tokens", DeepSeek's "embed", "tok_embeddings",
 # "wte"; not a vision tower's patch or position embedding.
-_EMBED_TABLE = re.compile(r"(^|\.)(embed_tokens|embed|tok_embeddings|wte|word_embeddings)\.weight$")
+# token_embd: a GGUF's (_gguf_tensor_sizes keeps the file's names but the experts')
+_EMBED_TABLE = re.compile(r"(^|\.)(embed_tokens|embed|tok_embeddings|wte|word_embeddings|token_embd)\.weight$")
 
 
 def _vk_flag(env, name):
@@ -115,8 +117,11 @@ def _vk_flag(env, name):
 
 
 # The families whose dense chain is on by default on an integrated GPU with the
-# expert tier (coli_vk_chain_decide's measured `igpu`, docs/vulkan.md).
+# expert tier (coli_vk_chain_decide's measured `igpu`, docs/vulkan.md), and those where
+# it is on only from MANY_COMPUTE_UNITS compute units.
 _VK_IGPU_CHAIN_ON = ("qwen36", "olmoe")
+_VK_IGPU_MANY_CU_CHAIN_ON = ("qwen38",)
+MANY_COMPUTE_UNITS = 32
 _VK_DENSE_HOST_FAMILIES = frozenset((
     "qwen36", "qwen38", "glm", "glm53", "inkling", "kimi", "mimo",
     "olmoe", "deepseek_v4", "deepseek_v41",
@@ -133,6 +138,20 @@ def _vk_device(env, vulkan):
         return None
 
 
+def _vk_igpu_many_units(vulkan):
+    """Whether the device is an integrated GPU with MANY_COMPUTE_UNITS compute units or more
+    (coli_vk_device_igpu_many_cu); setup_hw reads the units."""
+    device = vulkan or {}
+    return device.get("type") == "integrated" and (device.get("compute_units") or 0) >= MANY_COMPUTE_UNITS
+
+
+def _vk_igpu_units_unknown(vulkan):
+    """Whether the device is an integrated GPU without a count of compute units. setup_hw
+    reads the count through the Vulkan loader, not through `vulkaninfo`."""
+    device = vulkan or {}
+    return device.get("type") == "integrated" and device.get("compute_units") is None
+
+
 def _vk_chain_dense(family_id, env, vulkan):
     """(chain, dense): whether the engine runs its dense chain, and its per-matrix
     path, on the Vulkan device (coli_vk_chain_decide, coli_vk_dense_decide); both
@@ -146,8 +165,10 @@ def _vk_chain_dense(family_id, env, vulkan):
     tier = _vk_flag(env, "COLI_VK_TIER") != 0
     chain, dense = _vk_flag(env, "COLI_VK_CHAIN"), _vk_flag(env, "COLI_VK_DENSE")
     if chain is None:
-        chain = (kind not in ("integrated", "cpu") or
-                 kind == "integrated" and tier and family_id in _VK_IGPU_CHAIN_ON)
+        # COLI_VK_DENSE=0 keeps the trunk on the CPU, and the chain with it
+        igpu_on = (family_id in _VK_IGPU_CHAIN_ON or
+                   family_id in _VK_IGPU_MANY_CU_CHAIN_ON and _vk_igpu_many_units(vulkan))
+        chain = dense != 0 and (kind not in ("integrated", "cpu") or kind == "integrated" and tier and igpu_on)
     if dense is None:
         # colibri.c passes default=0 to coli_vk_dense_decide; its chain is
         # independent, but disabling that chain does not enable per-matrix GEMVs.
@@ -265,7 +286,22 @@ def _glm53_dense_tensors(info, env):
     return dict(info, dense_bytes=total, embed_bytes=embedding, dense_tensors=adjusted)
 
 
-def _vk_released_tensor_bytes(tensor, family, env):
+def _q38_state_file(env, setting, default, model_dir):
+    return os.path.realpath(env.get(setting) or os.path.join(model_dir, default))
+
+
+def _q38_draft_list_on(env, model_dir):
+    """Whether qwen38 may score MTP drafts from a token list (draft_vocab.h), which needs the host
+    int8 rows of the lm_head. The head drafts unless Q38_MTP=0, and from a list unless Q38_MTP_VOCAB=0
+    or the counts file of the list is the file of the expert history.
+    A checkpoint without an MTP head has no list. Crediting 0 for the lm_head of that checkpoint is
+    still a lower bound."""
+    return ((env.get("Q38_MTP") or "").strip() != "0" and (env.get("Q38_MTP_VOCAB") or "").strip() != "0" and
+            _q38_state_file(env, "COLI_VOCAB_USAGE", ".coli_vocab", model_dir) !=
+            _q38_state_file(env, "COLI_USAGE", ".coli_usage", model_dir))
+
+
+def _vk_released_tensor_bytes(tensor, family, env, model_dir=""):
     """A lower bound on the host allocation an engine's dho pass can free.
 
     Only audited matrix names and source formats get credit. Keep norms, vision,
@@ -282,6 +318,8 @@ def _vk_released_tensor_bytes(tensor, family, env):
     head = name == "lm_head.weight"
     floating = dtype in ("BF16", "F16", "F32")
     if family == "qwen38":
+        if head and _q38_draft_list_on(env, model_dir):
+            return 0
         known = (head or part in _Q38_TRUNK_COMPONENTS or
                  part in ("linear_attn.in_proj_a", "linear_attn.in_proj_b", "ple.key_proj", "ple.value_proj") or
                  name in ("model.hyper_connection_mixer.input_mix_weight_down.weight",
@@ -389,6 +427,101 @@ _VK_ALIGN = 256   # coli_vk_buffer_alignment: a storage buffer's alignment, at l
 
 def _vk_up(value, align=_VK_ALIGN):
     return (value + align - 1) // align * align
+
+
+_HALF_FMT = {}
+_SHARD_INDEX = {}
+
+
+def _shard_key(model_dir):
+    """A checkpoint's shards as they are now: a rewritten one is another key."""
+    shards = sorted(Path(model_dir).glob("*.safetensors"))
+    try:
+        return (str(model_dir),) + tuple((p.name, p.stat().st_size, p.stat().st_mtime_ns) for p in shards)
+    except OSError:
+        return (str(model_dir),)
+
+
+def _shard_index(model_dir):
+    """{tensor name: (shard, first byte, last byte + 1)} over a checkpoint's shards, once."""
+    key = _shard_key(model_dir)
+    if key not in _SHARD_INDEX:
+        index = {}
+        for shard in sorted(Path(model_dir).glob("*.safetensors")):
+            try:
+                with shard.open("rb") as stream:
+                    length = int.from_bytes(stream.read(8), "little")
+                    header = json.loads(stream.read(length))
+            except (OSError, ValueError):
+                continue
+            for name, meta in header.items():
+                if name != "__metadata__" and isinstance(meta, dict):
+                    begin, stop = meta.get("data_offsets") or (0, 0)
+                    index.setdefault(name, (shard, 8 + length + begin, 8 + length + stop))
+        _SHARD_INDEX[key] = index
+    return _SHARD_INDEX[key]
+
+
+def _f32_is_f16(u):
+    """f32 bits an f16 holds exactly (backend_vulkan.c f32_is_f16)."""
+    a, e = u & 0x7FFFFFFF, ((u >> 23) & 0xFF) - 127
+    m = a & 0x7FFFFF
+    if not a:
+        return True
+    if e == 128:
+        return not m & 0x1FFF
+    if e > 15 or e < -24:
+        return False
+    if e >= -14:
+        return not m & 0x1FFF
+    return not (m | 0x800000) & ((1 << (-1 - e)) - 1)
+
+
+def _half_fmt(info, name):
+    """The 2-byte format an engine uploads its f32 copy of checkpoint tensor `name` in, or
+    None when it stays f32: the test backend_vulkan.c's coli_vk_f32_fmt makes, bf16 (fmt
+    11) when every value is a bf16 widened, f16 (fmt 14) when every value is one an f16
+    holds. A BF16 tensor is the first and an F16 one the second, from the header; an F32
+    one is read from its shard once (up to the first value that rules both out); any
+    other dtype (FP8 with its scales, a quantized container) is taken as neither. The one
+    read of tensor values the planner makes, and only for F32 matrices: the checkpoints
+    themselves are BF16 or F16."""
+    tensor = next((t for t in info.get("dense_tensors", []) if _text_weight_name(t["name"]) == name), None)
+    if tensor is None:
+        return None
+    if tensor["dtype"] in ("BF16", "F16"):
+        return 11 if tensor["dtype"] == "BF16" else 14
+    if tensor["dtype"] != "F32" or not info.get("path"):
+        return None
+    key = (_shard_key(info["path"]), tensor["name"])
+    if key not in _HALF_FMT:
+        where = _shard_index(info["path"]).get(tensor["name"])
+        bf16 = f16 = where is not None and (where[2] - where[1]) % 4 == 0
+        if bf16:
+            try:
+                with where[0].open("rb") as stream:
+                    stream.seek(where[1])
+                    left = where[2] - where[1]
+                    while left and (bf16 or f16):
+                        data = stream.read(min(left, 1 << 24))
+                        if not data:
+                            bf16 = f16 = False
+                            break
+                        words = len(data) // 4
+                        # little-endian floats: bytes 0 and 1 of every word are its low half
+                        bf16 = bf16 and data[0::4].count(0) == words and data[1::4].count(0) == words
+                        if f16:
+                            f16 = all(_f32_is_f16(u) for u in struct.unpack(f"<{words}I", data))
+                        left -= len(data)
+            except OSError:
+                bf16 = f16 = False
+        _HALF_FMT[key] = 11 if bf16 else 14 if f16 else None
+    return _HALF_FMT[key]
+
+
+def _f32_vk_fmt(info, name):
+    """The format an engine uploads its f32 copy of checkpoint tensor `name` in."""
+    return (_half_fmt(info, name) if name else None) or 10
 
 
 def vk_tensor_bytes(fmt, columns, rows, group=0):
@@ -649,7 +782,7 @@ def _q36_chain_layout(info, env, vulkan):
         types = ["full_attention" if i % interval == interval - 1 else "linear_attention" for i in range(L)]
     if L < 1 or len(types) < L:
         return None
-    attn = [t == "full_attention" for t in types[:L]]
+    attn = [t in ("full_attention", "sliding_attention") for t in types[:L]]   # Flint's windowed layers attend too
     rot = int(meta.get("rotary_dim") or 0)
     if rot <= 0:
         factor = float(meta.get("partial_rotary_factor") or c.get("partial_rotary_factor") or 0)
@@ -664,6 +797,9 @@ def _q36_chain_layout(info, env, vulkan):
         if layer is not None and layer < L and part in ("self_attn.q_norm", "self_attn.k_norm"):
             norms[layer] += hd
             continue
+        if layer is not None and layer < L and name.endswith(".self_attn.softmax_offset") and isinstance(shape, list) and shape:
+            norms[layer] += int(shape[0])                              # Flint: a sink per head, with the norms
+            continue
         if not isinstance(shape, list) or len(shape) != 2:
             continue
         if name == "lm_head.weight" or (layer is not None and layer < L and (part in _Q36_CHAIN_TAGS or part in (
@@ -673,7 +809,7 @@ def _q36_chain_layout(info, env, vulkan):
     def rows(part, default=0):
         return rows_of[part][0] if part in rows_of else default
     E = rows("mlp.gate")
-    SI = rows("mlp.shared_expert.gate_proj") or rows("mlp.gate_proj")
+    SI = max(rows("mlp.shared_expert.gate_proj"), rows("mlp.gate_proj"))   # Flint's dense layers: a wider MLP
     vh = rows("linear_attn.in_proj_b")
     conv, vd = rows("linear_attn.in_proj_qkv"), rows("linear_attn.in_proj_z")
     qo, kvo = rows("self_attn.q_proj"), rows("self_attn.k_proj")
@@ -726,8 +862,9 @@ _VK_CHAIN_LAYOUT["qwen36"] = _q36_chain_layout
 
 
 def _olmoe_chain_layout(info, env, vulkan):
-    """olmoe_chain.h olc_fit_start: q, k, v, o and the router as f32 tensors, the K/V
-    mirror at the split's floor, the parameters; one chunk's scratch; lm_head the tail."""
+    """olmoe_chain.h olc_fit_start: q, k, v, o and the router as the engine uploads its f32
+    copies (bf16 or f16 where exact, _f32_vk_fmt), the K/V mirror at the split's floor, the
+    parameters; one chunk's scratch; lm_head the tail."""
     c = info.get("config") or {}
     try:
         L, D, H = int(c["num_hidden_layers"]), int(c["hidden_size"]), int(c["num_attention_heads"])
@@ -737,14 +874,18 @@ def _olmoe_chain_layout(info, env, vulkan):
     if L < 1 or H < 1 or D % H:
         return None
     hd = D // H
-    layer = (4 * vk_tensor_bytes(10, D, D) + vk_tensor_bytes(10, D, E) +
-             2 * vk_buf_bytes(H * 3 * _vk_kv_block(env) * hd * 4) + 4 * 4 * D)
+    layers = []
+    for i in range(L):
+        p = f"model.layers.{i}."
+        layers.append(sum(vk_tensor_bytes(_f32_vk_fmt(info, p + f"self_attn.{x}_proj.weight"), D, D) for x in "qkvo") +
+                      vk_tensor_bytes(_f32_vk_fmt(info, p + "mlp.gate.weight"), D, E) +
+                      2 * vk_buf_bytes(H * 3 * _vk_kv_block(env) * hd * 4) + 4 * 4 * D)
     r = _vk_chain_rows(env)
     counts = [r * D] * 8 + [r * E, D, r * D, r * E, 2 * r * D, vocab, r * D, r * hd, r * D]
     if (env.get("PILOT") or "").strip() not in ("", "0"):
         counts.append(r * D)   # PILOT's rows after attention
     fixed = sum(vk_buf_bytes(4 * max(n, 1)) for n in counts) + vk_buf_bytes(4 * D) + vk_buf_bytes(4)
-    return VkChainLayout([layer] * L, fixed, vk_tensor_bytes(10, D, vocab))
+    return VkChainLayout(layers, fixed, vk_tensor_bytes(_f32_vk_fmt(info, "lm_head.weight"), D, vocab))
 
 
 _VK_CHAIN_LAYOUT["olmoe"] = _olmoe_chain_layout
@@ -842,7 +983,7 @@ def _q38_chain_layout(info, env, vulkan):
     # streams' read-back and the final norm
     r, nb, rot = rows, 1, rotary if rotary > 0 else 2
     counts = [r * W, r * W, r * R, r * W, r * H, r * C, r * C, r * H, r * QH * 2 * D, r * kvo, r * kvo,
-              r * (IQ + 1) * ID, r * QH * D, r * 2 * nb, r * (budget + ratio), r * CD, r * VH * VD, r * 2 * VH,
+              r * (IQ + 1) * ID, r * QH * D, r * nb, r * (budget + ratio), r * CD, r * VH * VD, r * 2 * VH,
               r * CD, r * VH * VD, r * E, r * SI, r * SI, r * SI, r * H, r, r * H, r * W, r * H, r * W, r * W,
               r * H, r * E, r * (2 * kvo + ID), 2 * vocab, r * H, r * Ep, r * rot, nb * rot]
     fixed = sum(4 * (n if n else 1) for n in counts) + (rows + 1) * W * 4
@@ -887,7 +1028,8 @@ _VK_CHAIN_LAYOUT["qwen38"] = _q38_chain_layout
 
 def _glm53_chain_layout(info, env, vulkan):
     """glm53_chain.h g53c_fit_plan: each layer's device bytes (the mHC mixes in f32, its
-    matrices at GLM53_BITS as quantize_loaded leaves them, an int4 container's as it is,
+    matrices at GLM53_BITS as quantize_loaded leaves them (32: f32, uploaded as bf16 or f16 where
+    exact, _f32_vk_fmt), an int4 container's as it is,
     the absorbed kv_b halves, its share of the parameter arena, a KDA layer's state and
     window, an MLA layer's caches at their first 256 positions), the scratch of one prompt
     chunk at GLM53_MAXT and the head."""
@@ -919,11 +1061,13 @@ def _glm53_chain_layout(info, env, vulkan):
     packed = {_text_weight_name(t["name"]) for t in info.get("dense_tensors", []) if t.get("dtype") in ("U8", "I8")}
     P, nm, HD = kh * kd, (2 + H) * H, H * D
 
-    def mat(rows, columns, name=None):
+    def mat(rows, columns, name=None, source=None):
+        # source: the checkpoint tensor an f32 matrix's values come from (kv_b's absorbed
+        # halves are a reordering of kv_b): bf16 on the device where exact
         if name is not None and name in packed:
             return vk_tensor_bytes(4, columns, rows, 64)
         if bits == 32:
-            return vk_tensor_bytes(10, columns, rows)
+            return vk_tensor_bytes(_f32_vk_fmt(info, source or name), columns, rows)
         if bits == 4 and columns % 64 == 0:
             return vk_tensor_bytes(4, columns, rows, 64)
         return vk_tensor_bytes(1, columns, rows)
@@ -934,7 +1078,8 @@ def _glm53_chain_layout(info, env, vulkan):
         if full[i]:
             a = p + "self_attn."
             size += (mat(ql, D, a + "q_a_proj.weight") + mat(nh * (qn + qr), ql, a + "q_b_proj.weight") +
-                     mat(kvl + qr, D, a + "kv_a_proj_with_mqa.weight") + mat(nh * kvl, qn) + mat(nh * vh, kvl) +
+                     mat(kvl + qr, D, a + "kv_a_proj_with_mqa.weight") +
+                     mat(nh * kvl, qn, source=a + "kv_b_proj.weight") + mat(nh * vh, kvl, source=a + "kv_b_proj.weight") +
                      mat(D, nh * vh, a + "o_proj.weight") + mat(IH * ID, ql, a + "indexer.wq_b.weight") +
                      mat(ID, D, a + "indexer.wk.weight") + mat(IH, D, a + "indexer.weights_proj.weight") +
                      mat(ID, D, a + "indexer.index_kpool_compress_gate"))
@@ -1120,6 +1265,8 @@ def _k3_chain_layout(info, env, vulkan):
 
     def w(name, out, columns, b):
         fmt, group = _k3_vk_fmt(tensors, name, out, columns, b, explicit)
+        if fmt == 10:   # an f32 W goes up as bf16 or f16 where exact (k3_vk_ensure)
+            fmt = _f32_vk_fmt(info, name)
         return vk_tensor_bytes(fmt, columns, out, group)
     rows = _vk_rows(env, 256)
     layers = []
@@ -1130,7 +1277,10 @@ def _k3_chain_layout(info, env, vulkan):
             for part in ("q", "k", "v", "g"):
                 b += w(p + f"self_attn.{part}_proj.weight", P, D, bits)
             b += w(p + "self_attn.o_proj.weight", D, P, bits)
-            b += vk_tensor_bytes(10, D, hd) + vk_tensor_bytes(10, hd, P) + vk_tensor_bytes(10, D, heads)
+            a = p + "self_attn."
+            b += (vk_tensor_bytes(_f32_vk_fmt(info, a + "f_a_proj.weight"), D, hd) +
+                  vk_tensor_bytes(_f32_vk_fmt(info, a + "f_b_proj.weight"), hd, P) +
+                  vk_tensor_bytes(_f32_vk_fmt(info, a + "b_proj.weight"), D, heads))
             b += vk_buf_bytes(3 * P * conv * 4) + vk_buf_bytes(heads * hd * hd * 4)
             floats += 3 * P * conv + heads + P + hd
         else:
@@ -1144,7 +1294,7 @@ def _k3_chain_layout(info, env, vulkan):
             floats += QL + KL + rows * (KL + R)
         if i >= first_dense:
             moe, si = p + "block_sparse_moe.", inter * shared
-            b += vk_tensor_bytes(10, D, E)
+            b += vk_tensor_bytes(_f32_vk_fmt(info, moe + "gate.weight"), D, E)
             b += (w(moe + "routed_expert_down_proj.weight", LT, D, bits) + w(moe + "routed_expert_up_proj.weight", D, LT, bits) +
                   w(moe + "shared_experts.gate_proj.weight", si, D, bits) + w(moe + "shared_experts.up_proj.weight", si, D, bits) +
                   w(moe + "shared_experts.down_proj.weight", D, si, bits))
@@ -1272,7 +1422,7 @@ def _inkling_chain_layout(info, env, vulkan):
                 return None   # a form the shaders do not take: the chain declines, N = L as before
             total += vk_tensor_bytes(f[0], columns, rows, f[1])
         if sparse[i]:
-            total += vk_tensor_bytes(10, D, E + ns)   # the router's f32 copy
+            total += vk_tensor_bytes(_f32_vk_fmt(info, p + "mlp.gate.weight"), D, E + ns)   # the router's f32 copy
             for suffix, columns, rows in (("mlp.shared_experts.gate_proj", D, inter),
                                           ("mlp.shared_experts.up_proj", D, inter),
                                           ("mlp.shared_experts.down_proj", inter, D)):
@@ -1449,17 +1599,122 @@ def _tensor_sizes(path, with_shape=False):
         yield (*item, meta.get("shape")) if with_shape else item
 
 
+def _gguf_sources(model_dir):
+    """A model directory made by tools/gguf_import.py: (gguf.json, [GGUF parts]) or None."""
+    link = Path(model_dir) / "gguf.json"
+    if not link.is_file():
+        return None
+    meta = json.loads(link.read_text(encoding="utf-8"))
+    target = Path(meta["gguf"])
+    if not target.is_absolute():
+        target = Path(model_dir) / target
+    m = re.match(r"^(.*)-00001-of-(\d{5})\.gguf$", str(target))
+    parts = [Path(f"{m.group(1)}-{i:05d}-of-{m.group(2)}.gguf") for i in range(1, int(m.group(2)) + 1)] if m else [target]
+    missing = [str(p) for p in parts if not p.is_file()]
+    if missing:
+        raise ValueError(f"GGUF named by {link} is missing: {', '.join(missing)}")
+    return link, parts
+
+
+# The routed experts _gguf_tensor_sizes names, one entry per expert whatever the family
+# (analyze_model counts them as experts without the family's checkpoint names).
+_GGUF_EXPERT = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(?:(?:gate|up|down)_proj\.weight|gguf)$")
+
+
+def _gguf_tensor_sizes(parts, layers=None):
+    """(name, bytes, dtype, shape) for a GGUF model, the shape in safetensors
+    order (rows first; ggml stores the dimensions the other way round), named so the family's expert
+    inventory sees one entry per routed expert (the file stores each layer's
+    experts fused, or packed by tools/gguf_import.py --mode copy). layers: the
+    model's own layers (its config); past them a multi-token-prediction head's,
+    which the engine does not load. Unset, the file's block_count less its
+    nextn_predict_layers."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("gguf_reader", Path(__file__).resolve().parent / "tools" / "gguf_reader.py")
+    gr = importlib.util.module_from_spec(spec); spec.loader.exec_module(gr)
+    fused = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
+    packed = re.compile(r"^blk\.(\d+)\.ffn_exps_colibri$")
+    last = None
+    for part in parts:
+        reader = gr.GGUFReader(str(part))
+        try:
+            meta = reader.metadata
+            arch = meta.get("general.architecture", "")
+            # a multi-token-prediction head is stored as extra layers past the
+            # model's own (nextn_predict_layers); the engine does not load it.
+            # Only the first part of a split model carries the metadata.
+            blocks = meta.get(f"{arch}.block_count")
+            if layers:
+                last = int(layers)
+            elif blocks:
+                last = int(blocks) - int(meta.get(f"{arch}.nextn_predict_layers", 0) or 0)
+            stride_bytes = None
+            if meta.get("colibri.layout") == "expert-packed-v1":
+                b = meta.get("colibri.expert_bytes") or []
+                stride_bytes = [sum(b[3 * i:3 * i + 3]) for i in range(len(b) // 3)]
+            for t in reader.tensors:
+                dtype = "GGUF_" + t["type_name"]
+                m = fused.match(t["name"])
+                if m and last is not None and int(m.group(1)) >= last:
+                    continue
+                if m:
+                    n = int(t["dims"][-1])
+                    shape = [int(d) for d in reversed(t["dims"][:-1])]
+                    for e in range(n):
+                        yield (f"model.layers.{m.group(1)}.mlp.experts.{e}.{m.group(2)}_proj.weight",
+                               t["nbytes"] // n, dtype, shape)
+                    continue
+                m = packed.match(t["name"])
+                if m and stride_bytes is not None:
+                    layer, n = int(m.group(1)), int(t["dims"][1])
+                    for e in range(n):
+                        yield (f"model.layers.{layer}.mlp.experts.{e}.gguf", stride_bytes[layer], dtype, None)
+                    continue
+                yield t["name"], t["nbytes"], dtype, [int(d) for d in reversed(t["dims"])]
+        finally:
+            reader.close()
+
+
+def _gguf_head(model_dir):
+    """gguf.json's "dspark": the path of a draft head's own GGUF (DeepSeek V4.1's DSpark), or None."""
+    link = Path(model_dir) / "gguf.json"
+    try:
+        head = json.loads(link.read_text(encoding="utf-8")).get("dspark")
+    except (OSError, ValueError):
+        return None
+    if not head:
+        return None
+    path = Path(head)
+    return path if path.is_absolute() else Path(model_dir) / path
+
+
+def _gguf_head_sizes(path, layers):
+    """(name, bytes, dtype, shape) for a draft head's own GGUF: its stages' routed experts
+    filed after the model's `layers` (the engine gives a stage an expert cache as it does a
+    layer, and _dsv41_expert_inventory files a checkpoint's mtp.* experts there too), the
+    rest under the head's names."""
+    for name, size, dtype, shape in _gguf_tensor_sizes([path], layers=1 << 30):
+        m = re.match(r"^model\.layers\.(\d+)\.mlp\.experts\.(.*)$", name)
+        if m:
+            yield f"model.layers.{layers + int(m.group(1))}.mlp.experts.{m.group(2)}", size, dtype, shape
+        else:
+            yield f"dspark.{name}", size, dtype, shape
+
+
 def analyze_model(model):
     resolved = resolve_model(model)
     model = Path(resolved.model_dir)
     config = resolved.config
-    shards = sorted(model.glob("*.safetensors"))
+    gguf = _gguf_sources(model)
+    shards = gguf[1] if gguf else sorted(model.glob("*.safetensors"))
     if not shards:
         raise ValueError(f"no safetensors shards: {model}")
 
     # Sidecar cache: return the stored analysis if every shard + config is unchanged.
     # resolve_model() already read config.json, so it exists by this point.
     signature = _analysis_signature(shards, model / "config.json")
+    if gguf:
+        signature += f"|gguf.json:{gguf[0].stat().st_size}:{gguf[0].stat().st_mtime_ns}"
     cache_path = model / _ANALYSIS_CACHE_NAME
     try:
         cached = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -1505,9 +1760,14 @@ def analyze_model(model):
     dense_tensors = []
     expert_groups = {}
     tensor_names = set()
-    for shard in shards:
+    own_layers = (resolved.family_config.get("text_config") or resolved.family_config).get("num_hidden_layers")
+    for shard in ([None] if gguf else shards):
         try:
-            sizes = list(_tensor_sizes(shard, with_shape=True))
+            sizes = (list(_gguf_tensor_sizes(shards, own_layers if isinstance(own_layers, int) else None)) if gguf
+                     else list(_tensor_sizes(shard, with_shape=True)))
+            head = _gguf_head(model) if gguf and isinstance(own_layers, int) else None
+            if head is not None:
+                sizes += list(_gguf_head_sizes(head, own_layers))
         except OSError as error:
             # Name the file. An OSError raised by read() on an already-open
             # stream carries no filename, so `coli doctor` reported bare
@@ -1520,7 +1780,9 @@ def analyze_model(model):
                           f"{error.strerror or error}: {shard}") from error
         for name, size, dtype, shape in sizes:
             tensor_names.add(name)
-            contributions = expert_contributions(resolved, name, size, dtype)
+            m = _GGUF_EXPERT.match(name) if gguf else None
+            contributions = (((int(m.group(1)), int(m.group(2)), size),) if m
+                             else expert_contributions(resolved, name, size, dtype))
             if contributions:
                 for layer, expert, byte_count in contributions:
                     key = (layer, expert)
@@ -1638,6 +1900,8 @@ def analyze_model(model):
 
 
 QWEN38_INT4_SIDECAR = "experts-int4g64"
+QWEN38_INT2_SIDECAR = "experts-int2g32"
+QWEN38_LOWBIT = ("int2g32", "int2g16", "int3g16", "vq2g32", "vq1g64")   # Q38_EXPERT_LOWBIT: experts-<name>/ (qwen38_core.h)
 
 
 def qwen38_int4_sidecar(info):
@@ -1652,18 +1916,27 @@ def qwen38_int4_sidecar(info):
     sidecar that disagrees with it. Returns the analysis unchanged when the
     sidecar does not apply, otherwise a copy priced with its records and
     marked `qwen38_int4_experts`: no FP8 scale bank is built either.
+    Q38_EXPERT_LOWBIT=<name> (int2g32, int2g16, int3g16, vq2g32, vq1g64; Q38_EXPERT_INT2=1:
+    int2g32) makes the engine load experts-<name>/ instead (1.40 MB a record at 2 bits,
+    2.01 MB at 3, 1.32 MB vq2, 0.82 MB vq1 on the release), priced the same way: by the
+    record its index states, whatever the name, so a format this list does not know yet is
+    never priced with the FP8 bytes (a 188-expert cap where RAM held 512, 2026-10-14).
     """
     resolved = info["resolved_family"]
-    if resolved.descriptor.id != "qwen38" or os.environ.get("Q38_EXPERT_INT4") == "0":
+    lowbit = (os.environ.get("Q38_EXPERT_LOWBIT") or "").strip()
+    if not re.fullmatch(r"[a-z0-9]+", lowbit):   # a sidecar name; its index is checked below
+        lowbit = "int2g32" if os.environ.get("Q38_EXPERT_INT2") == "1" else ""
+    if resolved.descriptor.id != "qwen38" or (os.environ.get("Q38_EXPERT_INT4") == "0" and not lowbit):
         return info
     try:
-        index = json.loads((Path(info["path"]) / QWEN38_INT4_SIDECAR / "index.json")
-                           .read_text(encoding="utf-8"))
+        index = json.loads((Path(info["path"]) / (f"experts-{lowbit}" if lowbit else QWEN38_INT4_SIDECAR) /
+                            "index.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return info
     config = info["config"]
     text = config.get("text_config", config) if isinstance(config, dict) else {}
-    want = {"format": "colibri.qwen38.experts-int4g64", "version": 1, "complete": True,
+    want = {"format": f"colibri.qwen38.experts-{lowbit}" if lowbit else "colibri.qwen38.experts-int4g64",
+            "version": 1, "complete": True,
             "layers": text.get("num_hidden_layers"), "experts": text.get("num_experts"),
             "hidden_size": text.get("hidden_size"),
             "moe_intermediate_size": text.get("moe_intermediate_size")}
@@ -1679,7 +1952,15 @@ def qwen38_int4_sidecar(info):
                 expert_fixed_bytes=0, qwen38_int4_experts=True)
 
 
-def _q38_mtp_head(info, env):
+def _q38_mtp_igpu_defaults(env, vulkan):
+    """Whether qwen38.c sets the values for an integrated GPU with many compute units
+    (q38_mtp_igpu_defaults): the expert tier is wanted and the dense chain runs for decode."""
+    chain, _dense = _vk_chain_dense("qwen38", env, vulkan)
+    return (_vk_igpu_many_units(vulkan) and _vk_flag(env, "COLI_VK_TIER") != 0 and chain and
+            _vk_flag(env, "COLI_VK_CHAIN") != 2)
+
+
+def _q38_mtp_head(info, env, vulkan):
     """Price Qwen3.8's MTP head when the engine attaches it (qwen38_core.h,
     q38_mtp_attach): on by default when the config names one head and the
     checkpoint carries its weights, off with Q38_MTP=0. The head is one more
@@ -1689,9 +1970,12 @@ def _q38_mtp_head(info, env):
     routed experts get their own cache of Q38_MTP_CAP slots, the layers' cap by
     default, at the head's own record (the snapshot's FP8: the int4-g64 sidecar
     holds the model's layers only). With the default that is one more expert per
-    cache slot; a fixed Q38_MTP_CAP is a fixed cost instead. Without this the
-    plan handed the cache about 0.9 GB the head then took (cap 161 on Qwen3.8
-    Flash Next: 161 FP8 experts of 4.69 MiB, and 173 MiB of head)."""
+    cache slot; a fixed Q38_MTP_CAP is a fixed cost instead. The cache of every
+    expert of the head that qwen38.c sets on an integrated GPU with many compute
+    units, the expert tier and the dense chain (q38_mtp_igpu_defaults) is a
+    fixed cost too. Without this the plan handed the cache about 0.9 GB the head
+    then took (cap 161 on Qwen3.8 Flash Next: 161 FP8 experts of 4.69 MiB, and
+    173 MiB of head)."""
     resolved = info["resolved_family"]
     if resolved.descriptor.id != "qwen38" or (env.get("Q38_MTP") or "").strip() == "0":
         return info
@@ -1720,6 +2004,8 @@ def _q38_mtp_head(info, env):
     cap = (env.get("Q38_MTP_CAP") or "").strip()
     if cap.isdigit() and int(cap) > 0:
         fixed += min(int(cap), len(experts)) * record
+    elif _q38_mtp_igpu_defaults(env, vulkan):
+        fixed += len(experts) * record
     else:
         per_cap += record
     return dict(info, dense_bytes=info["dense_bytes"] + dense, per_cap_bytes=per_cap,
@@ -1860,36 +2146,46 @@ def _parse_cgroup_counter(text):
     return value if value <= _CGROUP_UINT64_MAX else None
 
 
-def _cgroup_inactive_file(directory, v1=False):
-    """Return the inactive file cache charged to one cgroup, in bytes.
+def _cgroup_file_cache(directory, v1=False):
+    """Return the file cache charged to one cgroup, inactive and active, in bytes.
 
     ``memory.current`` (v1: ``usage_in_bytes``) charges clean page cache -- for
     this engine, the mmap'd shards a previous run left behind -- while the host
     half of the minimum, MemAvailable, counts such cache as available. Subtract
-    ``inactive_file`` (v1: ``total_inactive_file``, the hierarchical figure that
-    pairs with the hierarchical usage counter) the way Docker and cAdvisor
-    derive a working set. Absent statistics, or a kernel without the key,
-    subtract nothing; a present but malformed file is a refusal.
+    ``inactive_file`` and ``active_file`` (v1: ``total_inactive_file`` and
+    ``total_active_file``, the hierarchical figures that pair with the
+    hierarchical usage counter): at the limit the kernel reclaims from both
+    lists before it calls the OOM killer, and the pages of a model an engine
+    has mapped and read sit on the active one (seen on Linux 6.8 with MGLRU:
+    pages touched through a mapping went active, pages read with read() stayed
+    inactive). Docker and cAdvisor subtract only the inactive pages, which
+    counts such a model as spent. Not ``file``:
+    it includes tmpfs and shared memory, which sit on the anon lists. Absent
+    statistics, or a kernel without a key, subtract nothing for it; a present
+    but malformed file is a refusal.
     """
     stat_path = Path(directory) / "memory.stat"
     present, text = _read_bounded_ascii(stat_path, _CGROUP_STAT_MAX_BYTES,
                                         "cgroup memory statistics")
     if not present:
         return 0
-    key = "total_inactive_file" if v1 else "inactive_file"
-    values = []
+    prefix = "total_" if v1 else ""
+    values = {prefix + "inactive_file": [], prefix + "active_file": []}
     for line in _proc_lines(text, "cgroup memory statistics"):
         match = re.fullmatch(r"([A-Za-z0-9_]+) (\d+)", line)
         if match is None:
             raise CgroupFormatError(f"malformed cgroup memory statistics: {stat_path}")
-        if match.group(1) == key:
-            values.append(match.group(2))
-    if len(values) > 1:
-        raise CgroupFormatError(f"duplicate {key} in cgroup memory statistics: {stat_path}")
-    value = _parse_cgroup_counter(values[0]) if values else 0
-    if value is None:
-        raise CgroupFormatError(f"malformed {key} in cgroup memory statistics: {stat_path}")
-    return value
+        if match.group(1) in values:
+            values[match.group(1)].append(match.group(2))
+    cache = 0
+    for key, found in values.items():
+        if len(found) > 1:
+            raise CgroupFormatError(f"duplicate {key} in cgroup memory statistics: {stat_path}")
+        value = _parse_cgroup_counter(found[0]) if found else 0
+        if value is None:
+            raise CgroupFormatError(f"malformed {key} in cgroup memory statistics: {stat_path}")
+        cache += value
+    return cache
 
 
 def _cgroup_pair_remaining(directory, limit_name, current_name, v1=False):
@@ -1899,8 +2195,8 @@ def _cgroup_pair_remaining(directory, limit_name, current_name, v1=False):
     (v2 ``max``; v1's sentinel just below 2**63). Both files must be present
     and well-formed together: an incomplete pair or a malformed counter is a
     refusal, never something a looser ancestor may mask. Headroom is measured
-    against the working set, charged usage less reclaimable inactive file
-    cache, so a previous run's cached model pages do not read as spent budget.
+    against the working set, charged usage less reclaimable file cache
+    (inactive and active), so cached model pages do not read as spent budget.
     """
     directory = Path(directory)
     limit_path = directory / limit_name
@@ -1924,7 +2220,7 @@ def _cgroup_pair_remaining(directory, limit_name, current_name, v1=False):
         raise CgroupFormatError(f"malformed cgroup memory limit: {limit_path}")
     if v1 and limit >= _CGROUP_V1_UNLIMITED_MIN:
         return (True, None)
-    working_set = max(0, current - _cgroup_inactive_file(directory, v1=v1))
+    working_set = max(0, current - _cgroup_file_cache(directory, v1=v1))
     return (True, max(0, limit - working_set))
 
 
@@ -2702,13 +2998,25 @@ def physical_cpu_count():
         except (OSError, ValueError, AttributeError) as error:
             _physical_cores_warn(f"Windows core probe failed: {error}")
     if sys.platform == "darwin":
-        # Apple Silicon's performance cores pace barriered expert matmuls. The
-        # physical count includes efficiency cores, which is not the useful
-        # OpenMP team size for this workload.
+        # Apple Silicon: every core but the efficiency tier's paces barriered expert
+        # matmuls (omp_tune.h coli_physical_cores, the same rule). The tiers are
+        # hw.perflevel0 .. hw.perflevel(N-1), fastest first, the last the efficiency
+        # cores: two on an M1-M4 (perflevel0 alone), three on an M6 (2 Super + 4
+        # Performance, #2194); one tier is every core.
+        def sysctl_int(name):
+            result = subprocess.run(["sysctl", "-n", name], text=True, capture_output=True,
+                                    check=True, timeout=5)
+            return int(result.stdout.strip())
         try:
-            result = subprocess.run(["sysctl", "-n", "hw.perflevel0.logicalcpu"],
-                                    text=True, capture_output=True, check=True, timeout=5)
-            cores = int(result.stdout.strip())
+            levels = sysctl_int("hw.nperflevels")
+            cores = sum(sysctl_int(f"hw.perflevel{i}.logicalcpu")
+                        for i in range(min(max(levels - 1, 1), 16))) if levels >= 1 else 0
+            if cores > 0:
+                return cores
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+        try:
+            cores = sysctl_int("hw.perflevel0.logicalcpu")
             if cores > 0:
                 return cores
         except (OSError, ValueError, subprocess.SubprocessError):
@@ -2762,6 +3070,92 @@ def physical_cpu_count():
         f"physical-core probes unavailable; using {logical} logical CPUs "
         f"(SMT may over-subscribe). Set OMP_NUM_THREADS to physical cores if slow.")
     return logical
+
+
+def _cpulist(text):
+    """The CPUs of a sysfs list ("0-11,16") as a set; empty on a malformed one."""
+    cpus = set()
+    for part in text.strip().split(","):
+        if not part:
+            continue
+        try:
+            lo, _, hi = part.partition("-")
+            cpus.update(range(int(lo), int(hi or lo) + 1))
+        except ValueError:
+            return set()
+    return cpus
+
+
+def performance_core_count():
+    """The performance cores of a hybrid x86 CPU (Intel's P and E cores), else None.
+
+    An OpenMP team meets at a barrier after every matmul, so its slowest thread sets the
+    pace, as on Apple Silicon (physical_cpu_count leaves the efficiency cores out there,
+    #707). Measured on an i5-13500 (6 P + 8 E cores), Qwen3.8 IQ2_XS on the CPU alone,
+    four runs each: the 6 P-cores decoded at 9.40 tok/s against 9.00 for all 14 and
+    prefilled 1.7% faster. None on a CPU with one kind of core, or where the probe
+    cannot tell (the caller keeps the physical count)."""
+    if sys.platform == "win32":
+        # PROCESSOR_RELATIONSHIP's EfficiencyClass (byte 9 of a RelationProcessorCore
+        # record): larger is faster; one value for every core means one kind of core
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            k32.GetLogicalProcessorInformationEx.argtypes = [
+                ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+            k32.GetLogicalProcessorInformationEx.restype = ctypes.c_int
+            need = ctypes.c_ulong(0)
+            k32.GetLogicalProcessorInformationEx(0, None, ctypes.byref(need))
+            buf = (ctypes.c_char * need.value)()
+            if not k32.GetLogicalProcessorInformationEx(0, buf, ctypes.byref(need)):
+                return None
+            return _windows_performance_cores(bytes(buf)[:need.value])
+        except (OSError, ValueError, AttributeError):
+            return None
+    if sys.platform.startswith("linux"):
+        return _linux_performance_cores(Path("/sys"))
+    return None
+
+
+def _linux_performance_cores(sysfs):
+    """performance_core_count's Linux half: a hybrid Intel CPU registers two core PMUs,
+    cpu_core (P) and cpu_atom (E); the P-cores counted once per SMT sibling list."""
+    try:
+        p = _cpulist((sysfs / "devices/cpu_core/cpus").read_text(encoding="ascii"))
+        e = _cpulist((sysfs / "devices/cpu_atom/cpus").read_text(encoding="ascii"))
+    except OSError:
+        return None
+    if not p or not e:
+        return None
+    cores = set()
+    for cpu in p:
+        try:
+            cores.add((sysfs / f"devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text(encoding="ascii").strip())
+        except OSError:
+            return None
+    return len(cores) or None
+
+
+def _windows_performance_cores(raw):
+    """performance_core_count's Windows half, on GetLogicalProcessorInformationEx's buffer."""
+    classes, off = [], 0
+    while off + 10 <= len(raw):
+        relationship = int.from_bytes(raw[off:off + 4], "little")
+        size = int.from_bytes(raw[off + 4:off + 8], "little")
+        if size <= 0 or off + size > len(raw):
+            return None
+        if relationship == 0:  # RelationProcessorCore
+            classes.append(raw[off + 9])
+        off += size
+    if not classes or len(set(classes)) < 2:
+        return None
+    return classes.count(max(classes))
+
+
+def team_cpu_count():
+    """The OpenMP team a launch defaults to: the performance cores of a hybrid CPU
+    (performance_core_count), else the physical cores (physical_cpu_count)."""
+    return performance_core_count() or physical_cpu_count()
 
 
 def _resolve_physical_cores(physical_cpus):
@@ -2939,6 +3333,76 @@ def _family_expert_cache_knob(family_id, cache_bytes):
     return None
 
 
+# The context a chat server starts with when the operator set none. Each family's own
+# default (4096-8192) is what its engine assumes standing alone; a chat in `coli web` or
+# `coli chat` outgrew it in a few long answers (and was then compacted, or before that
+# refused). The step chosen is the largest whose conversation state, for every KV slot,
+# takes at most this share of the memory there is: the expert cache keeps the rest.
+# Up to CHAT_CONTEXT_AGENT the share is larger: coding agents do not run below 64k
+# (Hermes Agent refuses a smaller window, OpenClaw's system prompt alone is about 17k
+# tokens), so a server that could hold 64k and gave 32k left them nothing to work with.
+CHAT_CONTEXT_STEPS = (16384, 32768, 65536, 131072, 262144)
+CHAT_CONTEXT_SHARE = 0.10
+CHAT_CONTEXT_AGENT = 65536
+CHAT_CONTEXT_AGENT_SHARE = 0.25
+# The engines that size their expert cache from the plan and cannot start without a
+# slot a layer (cap_for_arch): the plan reserves their workspace at the full context,
+# so the step counts it beside the state. DeepSeek V4.1 prefills a prompt in one
+# forward, about 200 KB a token: on a 64 GB box the 262144 the state alone allowed
+# took 53.7 GB of workspace, left the cache no slot, and `coli serve` did not start.
+CHAT_CONTEXT_WORKSPACE = ("deepseek_v41", "mimo")
+
+
+def chat_context(model, env=None, kv_slots=1, available=None):
+    """(context, reason) for a text model whose context nobody set; (None, reason) leaves
+    the engine its own default. `available`: bytes, measured when not given (RAM_GB, when
+    set, is the budget instead)."""
+    from family_registry import checkpoint_decides, default_context
+    env = os.environ if env is None else env
+    resolved = resolve_model(model)
+    family = resolved.descriptor
+    limits = family.limits
+    if family.modality != "text" or checkpoint_decides(resolved) or not limits.context_env:
+        return None, "not a chat model"
+    for name in (limits.context_env,) + (("MIMO_CTX",) if family.id == "mimo" else ()):
+        if env.get(name):
+            return None, f"{name} is set"
+    ram = env.get("RAM_GB", "")
+    try:
+        budget = float(ram) * GB if ram not in ("", "auto") else None
+    except ValueError:
+        budget = None
+    if budget is None or budget <= 0:
+        try:
+            budget = available if available is not None else memory_available()
+        except Exception:                 # an unreadable cgroup: keep the default
+            budget = None
+    if not budget:
+        return None, "available memory unknown"
+    base = default_context(resolved)
+    chosen = base
+    for step in CHAT_CONTEXT_STEPS:
+        if step <= chosen or step > limits.max_context:
+            continue
+        try:
+            geometry = planner_geometry(resolved, step)
+        except ValueError:
+            break
+        workspace = geometry.workspace_bytes if family.id in CHAT_CONTEXT_WORKSPACE else 0
+        share = CHAT_CONTEXT_AGENT_SHARE if step <= CHAT_CONTEXT_AGENT else CHAT_CONTEXT_SHARE
+        if geometry.context_state_bytes * kv_slots + workspace > share * budget:
+            break
+        chosen = step
+    if chosen == base:
+        return None, f"{base} tokens is what {budget / GB:.1f} GB allows"
+    geometry = planner_geometry(resolved, chosen)
+    state = geometry.context_state_bytes * kv_slots
+    workspace = (f" and {geometry.workspace_bytes / GB:.1f} GB of prompt workspace"
+                 if family.id in CHAT_CONTEXT_WORKSPACE else "")
+    return chosen, (f"{chosen} tokens of context ({state / GB:.1f} GB of conversation state"
+                    f"{workspace} of {budget / GB:.1f} GB); --ctx sets it")
+
+
 def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                available_memory=None, available_disk=None, gpus=None,
                policy="quality", physical_cpus=None, cpu_sockets=None,
@@ -2947,12 +3411,12 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         raise ValueError(f"unknown policy: {policy}")
     info = qwen38_int4_sidecar(analyze_model(model))
     env_now = os.environ if env is None else env
+    vulkan = _vk_device(env_now, vulkan)
     info = _q38_cpu_dense_tensors(info, env_now)
-    info = _q38_mtp_head(info, env_now)
+    info = _q38_mtp_head(info, env_now, vulkan)
     info = _glm53_dense_tensors(info, env_now)
     # Only the matrices a family's dho pass can release earn RAM credit. The
     # embedding, norms, CPU-only components and unrecognized formats stay reserved.
-    vulkan = _vk_device(env_now, vulkan)
     family_id = info["resolved_family"].descriptor.id
     kept = min(info["dense_bytes"], info.get("embed_bytes", 0))
     device_dense_bytes = max(0, info["dense_bytes"] - kept)
@@ -2968,7 +3432,8 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         return layer is not None and layer < chain_fit["n"]
     tensors_on_device = [tensor for tensor in info.get("dense_tensors", []) if on_device(tensor)]
     if partial:
-        released = sum(_vk_released_tensor_bytes(tensor, family_id, env_now) for tensor in tensors_on_device)
+        released = sum(_vk_released_tensor_bytes(tensor, family_id, env_now, info["path"])
+                       for tensor in tensors_on_device)
         vk_dense, vk_dense_why = ((False, None) if chain_fit["n"] == 0 else
                                   vk_dense_device_only(released, family_id, env_now, vulkan))
     else:
@@ -2977,7 +3442,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     dense_on_device = 0
     if vk_dense:
         dense_on_device = min(device_dense_bytes, sum(
-            _vk_released_tensor_bytes(tensor, family_id, env_now)
+            _vk_released_tensor_bytes(tensor, family_id, env_now, info["path"])
             for tensor in tensors_on_device))
         info = dict(info, dense_bytes=info["dense_bytes"] - dense_on_device)
     # On an integrated/software device the remaining device copy still consumes
@@ -2988,6 +3453,9 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     shared_dense_bytes = (device_copy
                           if (vulkan or {}).get("type") in ("integrated", "cpu")
                           and _vk_dense_active(family_id, env_now, vulkan) else 0)
+    # the team a launch defaults to (environment_for_plan): a hybrid CPU's performance
+    # cores, probed only when the caller did not name a count
+    team_cpus = (performance_core_count() if physical_cpus is None else None)
     physical_cpus = physical_cpu_count() if physical_cpus is None else physical_cpus
     cpu_sockets = cpu_socket_count() if cpu_sockets is None else cpu_sockets
     resolved = info["resolved_family"]
@@ -3160,6 +3628,11 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     if placement_unified:
         warnings.append(
             "GPU and RAM share one physical memory pool; budgets were jointly constrained")
+    if family_id == "qwen38" and _vk_flag(env_now, "COLI_VULKAN") and _vk_igpu_units_unknown(vulkan):
+        warnings.append(
+            f"the integrated GPU reports no compute units: qwen38 is planned as with fewer than "
+            f"{MANY_COMPUTE_UNITS}, the dense chain off and the cache of the MTP head as large as "
+            "the cache of a layer")
     # The plan sizes the hot tier from *free* VRAM, so running it while an engine
     # instance already holds the GPUs silently produces a tiny tier and a
     # pessimistic hit rate that describe nothing. That is exactly when a user
@@ -3226,8 +3699,13 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                   "configured_experts": configured_experts},
         "cpu": {"physical_cores": _resolve_physical_cores(physical_cpus),
                  "sockets": max(1, int(cpu_sockets)),
-                 "thread_policy": "physical-cores"},
+                 "team_threads": _resolve_physical_cores(team_cpus or physical_cpus),
+                 "thread_policy": "performance-cores" if team_cpus else "physical-cores"},
         "memory": {"unified": unified, "available_bytes": available_memory},
+        # the Vulkan device a COLI_VULKAN=1 run opens (its expert tier and dense chain
+        # size themselves from its free memory at start)
+        "vulkan": ({"name": vulkan.get("name"), "type": vulkan.get("type")}
+                   if vulkan and _vk_flag(env_now, "COLI_VULKAN") else None),
         "tiers": {
             "disk": {"role": "cold-backing", "model_bytes": info["model_bytes"],
                      "available_bytes": available_disk, "cold_expert_bytes": cold_bytes},
@@ -3281,7 +3759,7 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
     """Apply a plan without overriding explicit user environment settings."""
     result = dict(env or {})
     result.setdefault("COLI_POLICY", plan["policy"]["name"])
-    result.setdefault("OMP_NUM_THREADS", str(plan["cpu"]["physical_cores"]))
+    result.setdefault("OMP_NUM_THREADS", str(plan["cpu"].get("team_threads", plan["cpu"]["physical_cores"])))
     # NOTE: we intentionally do NOT set OMP_PROC_BIND / OMP_PLACES here.
     # The engine's own hot-thread tuning (glm.c main(), the COLI_OMP_TUNED
     # self-exec) sets OMP_PROC_BIND=close with overwrite=0 -- it prefers
@@ -3340,7 +3818,18 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
     if "COLI_GPU" not in result and "COLI_GPUS" not in result:
         key = "COLI_GPU" if len(devices) == 1 else "COLI_GPUS"
         result[key] = ",".join(map(str, devices))
-    result.setdefault("CUDA_EXPERT_GB", f"{vram['budget_bytes'] / GB:.3f}")
+    # The qwen36 and qwen38 CUDA tier (qwen36_tier.c) reads CUDA_EXPERT_GB as GiB
+    # for each card, its trunk included; unset, it sizes each card from what is
+    # free there, less its trunk, its reserves and 1 GiB. This budget is GB for
+    # all the cards, with qwen38's trunk already out: every card would get the
+    # total, and the trunk would go twice. So a card of its own gets no number.
+    # A card that shares the host's memory keeps one, in the tier's unit: there
+    # the plan's budget is what keeps the tier off the RAM cache's pages.
+    if plan.get("model", {}).get("family_id") not in ("qwen36", "qwen38"):
+        result.setdefault("CUDA_EXPERT_GB", f"{vram['budget_bytes'] / GB:.3f}")
+    elif any(device.get("unified_memory") for device in vram["devices"] if plans_placement(device)):
+        tier = vram["budget_bytes"] + vram.get("trunk_bytes", 0)
+        result.setdefault("CUDA_EXPERT_GB", f"{tier / (1 << 30):.3f}")
     if result.get("PIN"):
         result.setdefault("PIN_GB", f"{vram['budget_bytes'] / GB:.3f}")
     return result
@@ -3386,6 +3875,10 @@ def format_plan(plan):
             lines.append("VRAM   " + (f"{format_bytes(trunk)} int8 trunk + " if trunk else "") +
                          f"{format_bytes(vram['budget_bytes'])} hot tier · "
                          f"~{vram['expert_capacity']} experts · {names}")
+    elif plan.get("vulkan"):
+        vk = plan["vulkan"]
+        lines.append(f"VRAM   Vulkan · {vk.get('name') or 'device'} ({vk.get('type') or '?'}) · the expert tier "
+                     "and the dense chain size themselves from its free memory at start")
     else:
         # Backend-neutral, matching the accelerator wording #903 settled on:
         # an AMD or Intel host that finds nothing is not "no NVIDIA device".

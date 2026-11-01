@@ -221,6 +221,7 @@ Size `CUDA_EXPERT_GB` so dense (~10 GB) + experts + working set stays under your
 | `'printf' is not recognized` / `The system cannot find the path specified` during `make colibri.exe` | scoop MinGW has no `sh.exe`; make fell back to cmd.exe (#478) | §0 — use MSYS2/w64devkit, or `set PATH=%PATH%;C:\msys64\usr\bin` |
 | `An Application Control policy has blocked this file` | Smart App Control | §2 — turn SAC off + **reboot** |
 | `cannot execute 'collect2.exe': CreateProcess: No such file or directory` | Smart App Control blocked the freshly installed compiler (#1900) | §2: SAC off and a reboot, or wait for SAC's verdict |
+| `storage size of 'r' isn't known` / `implicit declaration of function 'getrusage'`, or `make` stops with "builds for x86_64-pc-msys" (or cygwin) | the gcc that ran is MSYS2's own (the plain `gcc` package, or the "MSYS2 MSYS" shell): it targets the MSYS runtime, not Windows, and does not define `_WIN32` (#1979) | open "MSYS2 UCRT64", `pacman -S --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-libgomp`, check that `gcc -dumpmachine` says `x86_64-w64-mingw32` |
 | `cannot find -lgomp` at the link | MSYS2's gcc 16 no longer pulls libgomp (#1900) | `pacman -S mingw-w64-ucrt-x86_64-libgomp` (`coli setup` lists it) |
 | `make qwen38` (or glm53, inkling, kimi_k3, olmoe, deepseek_v41) ends in `undefined reference to ...` | older tree: no bare target for that engine, make compiled the `.c` alone (#1945) | update, or name the binary: `make qwen38.exe ...` |
 | `coli setup` does not find MSYS2 installed by scoop, or uses another gcc on the PATH without Vulkan | older tree (#1900) | update, or set `MSYS2_ROOT` to the MSYS2 folder |
@@ -722,3 +723,16 @@ translation unit are pending, with each window capped at 64 MiB. Excess hints,
 unavailable APIs and failed mappings are safely skipped; ordinary model reads
 still supply the weights. This applies to the common file-advice path used by
 the CPU and GPU engines and does not change their weight formats or arithmetic.
+
+## Expert reads
+
+A shard is opened once and every thread reads that descriptor. A descriptor
+from the C runtime's `open()` is a synchronous handle, and Windows serves one
+read at a time through it whatever the thread count, so each shard also gets a
+second descriptor opened with `FILE_FLAG_OVERLAPPED`. The reader that finds the
+shard free reads through the first descriptor, as before; a reader that finds
+it taken reads through the second, where any number of reads are in flight
+together. `pread` is still a blocking call; it waits for its own read. If the
+second descriptor cannot be opened the shard keeps the one it has, and its
+reads are serialized rather than refused. This changes when the bytes are
+read, never which bytes.

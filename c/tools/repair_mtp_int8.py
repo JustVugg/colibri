@@ -123,15 +123,41 @@ def quant_int8(w):
 # ---------- local safetensors IO (no deps; preserves byte-identity of untouched tensors) ----------
 def read_shard(path):
     with open(path, "rb") as fh:
-        n = struct.unpack("<Q", fh.read(8))[0]
-        hdr = json.loads(fh.read(n))
+        size = os.fstat(fh.fileno()).st_size
+        length = fh.read(8)
+        if len(length) != 8:
+            raise ValueError(f"{path}: incomplete safetensors header length")
+        n = struct.unpack("<Q", length)[0]
+        if n > size - 8:
+            raise ValueError(f"{path}: safetensors header extends beyond the file")
+        raw_header = fh.read(n)
+        if len(raw_header) != n:
+            raise ValueError(f"{path}: incomplete safetensors header")
+        hdr = json.loads(raw_header)
+        if not isinstance(hdr, dict):
+            raise ValueError(f"{path}: safetensors header must be an object")
         base = 8 + n
-        order = sorted(((k, v) for k, v in hdr.items() if k != "__metadata__"),
-                       key=lambda kv: kv[1]["data_offsets"][0])
+        order = []
+        for k, v in hdr.items():
+            if k == "__metadata__":
+                continue
+            offsets = v.get("data_offsets") if isinstance(v, dict) else None
+            if (not isinstance(offsets, list) or len(offsets) != 2 or
+                    any(type(offset) is not int for offset in offsets)):
+                raise ValueError(f"{path}: {k}: data_offsets must be two integers")
+            start, end = offsets
+            if not 0 <= start <= end <= size - base:
+                raise ValueError(f"{path}: {k}: data_offsets extend outside the payload")
+            order.append((k, v))
+        order.sort(key=lambda kv: kv[1]["data_offsets"][0])
         out = {}
         for k, v in order:
-            fh.seek(base + v["data_offsets"][0])
-            out[k] = (v["dtype"], v["shape"], fh.read(v["data_offsets"][1] - v["data_offsets"][0]))
+            start, end = v["data_offsets"]
+            fh.seek(base + start)
+            raw = fh.read(end - start)
+            if len(raw) != end - start:
+                raise ValueError(f"{path}: {k}: incomplete tensor payload")
+            out[k] = (v["dtype"], v["shape"], raw)
     return out, hdr.get("__metadata__")
 
 

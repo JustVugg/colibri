@@ -198,6 +198,7 @@ static void tiny_model_build(void) {
         l->sh_g = tqw(D, c->shared_inter, 0.06f, &seed);
         l->sh_u = tqw(D, c->shared_inter, 0.06f, &seed);
         l->sh_d = tqw(c->shared_inter, D, 0.06f, &seed);
+        l->sh_I = c->shared_inter;   /* the layer's shared width, as model_init_range sets it */
         l->sh_gate = tw(D, 0.06f, &seed);
         if (c->is_attn[i]) {
             l->q = tqw(D, q_out, 0.06f, &seed);
