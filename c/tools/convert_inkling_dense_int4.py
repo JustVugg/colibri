@@ -265,7 +265,11 @@ def main():
                     f.seek(base + o0)
                     left = o1 - o0
                     while left > 0:
-                        chunk = f.read(min(left, 8 << 20)); w.write(chunk); left -= len(chunk)
+                        chunk = f.read(min(left, 8 << 20))
+                        if not chunk:
+                            sys.exit(f"[ERR] short read for {name}: {left} tensor bytes missing")
+                        w.write(chunk)
+                        left -= len(chunk)
             else:
                 R, I = flat2d(shape)
                 packs, scales, errs = [], [], []
