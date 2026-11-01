@@ -428,3 +428,27 @@ describe("generateImage", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 })
+
+
+describe("multiline chat SSE data", () => {
+  it("assembles data lines in a frame before decoding its JSON", () => {
+    const parsed = extractSSE('data: {"choices": [\n' + 'data: {"delta":{"content":"hello"}}]}\n\n');
+    expect(parsed.data).toEqual(['{"choices": [\n{"delta":{"content":"hello"}}]}']);
+    expect(JSON.parse(parsed.data[0]).choices[0].delta.content).toBe("hello");
+  });
+  it("preserves data whitespace beyond the optional single separator space", () => {
+    expect(extractSSE("data:  leading\n\n").data).toEqual([" leading"]);
+  });
+});
+
+it("streams a chat completion whose JSON spans multiple SSE data lines", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(
+    'data: {"choices": [\n' + 'data: {"delta":{"content":"hello"}}]}\n\n' + 'data: [DONE]\n\n',
+    { headers: { "content-type": "text/event-stream" } },
+  )));
+  const deltas: string[] = [];
+  await streamChat({ baseUrl: "http://fixture.invalid/v1", apiKey: "", model: "fixture", messages: [],
+    temperature: 0, maxTokens: 8, enableThinking: false, signal: new AbortController().signal,
+    onDelta: text => deltas.push(text) });
+  expect(deltas).toEqual(["hello"]);
+});

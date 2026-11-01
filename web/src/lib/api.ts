@@ -183,15 +183,8 @@ export async function getProfile(baseUrl: string, apiKey = "", signal?: AbortSig
 }
 
 export function extractSSE(buffer: string) {
-  const frames = buffer.split(/\r?\n\r?\n/)
-  const rest = frames.pop() || ""
-  const data = frames.flatMap((frame) =>
-    frame
-      .split(/\r?\n/)
-      .filter((line) => line.startsWith("data:"))
-      .map((line) => line.slice(5).trimStart()),
-  )
-  return { data, rest }
+  const { events, rest } = extractSSEEvents(buffer)
+  return { data: events.map(event => event.data), rest }
 }
 
 export interface SSEEvent {
