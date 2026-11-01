@@ -120,7 +120,7 @@ def check_growing_conversation(binary: Path, model: Path,
     first_ids = list(case["prompt_ids"])            # type: ignore[arg-type]
     max_new = 4
 
-    warm = Serve(binary, model, extra_env=extra_env)
+    warm = Serve(binary, model, extra=extra_env)
     try:
         first_text, first_reuse = warm.submit(token_prompt(first_ids), max_new)
         if first_reuse != 0:
@@ -141,7 +141,7 @@ def check_growing_conversation(binary: Path, model: Path,
     finally:
         warm.close()
 
-    cold = Serve(binary, model, extra_env=extra_env)
+    cold = Serve(binary, model, extra=extra_env)
     try:
         cold_text, cold_reuse = cold.submit(token_prompt(second_ids), max_new)
     finally:
@@ -245,8 +245,7 @@ def check_short_request_parks(binary: Path, model: Path,
                    warm.submit(token_prompt(second_ids), max_new)]
         finally:
             warm.close()
-        assert warm.process.stderr is not None
-        return out, warm.process.stderr.read().decode("utf-8", "replace")
+        return out, warm.stderr_text
 
     (_, (side_text, _), (second_text, second_reuse)), log = run({})
     if "conversation parked for a" not in log or "conversation is back" not in log:
@@ -297,7 +296,7 @@ def check_cold_tier_disk(binary: Path, fixture: Path) -> None:
         prompt_b1 = system + tail_b
         hint = 64 * len("<t000>")   # the byte offset where the system turn ends
 
-        warm = Serve(binary, model, extra_env=env)
+        warm = Serve(binary, model, extra=env)
         try:
             text_a1, reuse = warm.submit(token_prompt(prompt_a1), 4,
                                          prefix_bytes=hint)
@@ -333,7 +332,7 @@ def check_cold_tier_disk(binary: Path, fixture: Path) -> None:
 
         # Cold restart: a fresh process scans the model dir and restores the
         # stored system prefix instead of re-prefilling it.
-        fresh = Serve(binary, model, extra_env=env)
+        fresh = Serve(binary, model, extra=env)
         try:
             _, reuse = fresh.submit(token_prompt(prompt_b1), 4)
         finally:
@@ -349,7 +348,7 @@ def check_cold_tier_disk(binary: Path, fixture: Path) -> None:
 
         # Mid-fork: shares only the first 32 tokens with every stored
         # boundary -- no stored strict prefix exists, so it re-prefills.
-        forked = Serve(binary, model, extra_env=env)
+        forked = Serve(binary, model, extra=env)
         try:
             _, reuse = forked.submit(
                 token_prompt(system[:32] + [70 + index for index in range(20)]),
