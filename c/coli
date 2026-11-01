@@ -4203,9 +4203,9 @@ def main():
                       help="use a model already on disk instead of downloading one")
     pset.add_argument("--dir",default=None,metavar="DIR",
                       help="folder for downloaded models (default ~/colibri-models)")
-    pset.add_argument("--backend",choices=("auto","cpu","vulkan","cuda"),default=None,
+    pset.add_argument("--backend",choices=("auto","cpu","vulkan","cuda","metal"),default=None,
                       help="engine build: auto (default) picks CUDA when the toolkit builds for the "
-                      "card, then Vulkan, then the CPU, and a build that fails falls back to the next")
+                      "card, then Vulkan, then the CPU. Metal on macOS is opt in for supported engines")
     pset.add_argument("--no-gpu",action="store_true",help="same as --backend cpu")
     pset.add_argument("--host",default=None,help="address to serve on (default 127.0.0.1)")
     pset.add_argument("--port",type=int,default=None,help="port to serve on (default 8000)")

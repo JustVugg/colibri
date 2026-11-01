@@ -464,8 +464,10 @@ CUDA_ENGINES = {
 }
 
 #: How a backend is named in a sentence: "the CUDA build", "using the CPU".
-BACKEND_NAME = {"cuda": "CUDA", "vulkan": "Vulkan", "cpu": "CPU"}
-USING = {"cuda": "CUDA", "vulkan": "Vulkan", "cpu": "the CPU"}
+METAL_ENGINES = frozenset({"glm", "glm53", "inkling", "kimi"})
+
+BACKEND_NAME = {"metal": "Metal", "cuda": "CUDA", "vulkan": "Vulkan", "cpu": "CPU"}
+USING = {"metal": "Metal", "cuda": "CUDA", "vulkan": "Vulkan", "cpu": "the CPU"}
 
 
 def cuda_problem(cards, family, tc):
@@ -548,6 +550,21 @@ def choose_backend(hw, family, tc, requested="auto", exclude=()):
     if requested == "cpu":
         decision["reason"] = "CPU only, as requested"
         return decision
+    metal = gpu.get("metal")
+    if requested == "metal" and "metal" not in exclude:
+        if host_os() != "darwin" or not metal:
+            raise SetupError("no Metal GPU answered on macOS")
+        if family.id not in METAL_ENGINES:
+            raise SetupError(f"{family.display_name} has no supported Metal setup path")
+        if not tc.get("can_build") and not prebuilt_runs(family, "metal"):
+            raise SetupError("Metal needs a source build or an existing Metal engine")
+        decision.update(backend="metal", gpu=metal["name"],
+                        reason=f"{metal['name']} with Metal, as requested")
+        return decision
+    if metal and requested == "auto":
+        decision["reason"] = (f"{metal['name']} supports Metal. Metal is experimental and opt in "
+                              "through --backend metal for supported models. Using the CPU")
+        return decision
     cuda_engine = family.id in CUDA_ENGINES and host_os().startswith("linux")
     win_cuda = host_os() == "win32" and family.id in WINDOWS_CUDA_ENGINES
     blocked = None
@@ -618,7 +635,9 @@ def choose_backend(hw, family, tc, requested="auto", exclude=()):
             return decision
         needs = ["vulkan"] if tc.get("can_build") else ["build", "vulkan"]
         decision["missing"].append(("vulkan", _gpu_hint(needs, hw, tc)))
-    if not vk and not nvidia:
+    if metal:
+        decision["reason"] = f"{metal['name']} is available but the selected backend uses the CPU"
+    elif not vk and not nvidia:
         decision["reason"] = "no GPU found: the engine runs on the CPU"
     elif requested == "vulkan" and not vk:
         decision["reason"] = "no Vulkan GPU answered: the engine runs on the CPU"
@@ -658,13 +677,15 @@ def binary_backends(path):
         found.add("cuda")
     if binary_links(path, (b"libvulkan.so", b"vulkan-1.dll", b"libvulkan.1.dylib")):
         found.add("vulkan")
+    if binary_links(path, (b"/Metal.framework/",)):
+        found.add("metal")
     return found
 
 
 def binary_backend(path):
     """The kind of build the binary is, which a rebuild keeps: CUDA before Vulkan."""
     found = binary_backends(path)
-    return "cuda" if "cuda" in found else "vulkan" if "vulkan" in found else "cpu"
+    return "cuda" if "cuda" in found else "vulkan" if "vulkan" in found else "metal" if "metal" in found else "cpu"
 
 
 def prebuilt_runs(family, backend, directory=None):
@@ -732,7 +753,9 @@ def make_command(family, backend, tc, make_args=()):
     the default one."""
     target = family.build_target
     args = [target, f"ARCH={os.environ.get('ARCH') or 'native'}"]
-    if backend == "vulkan":
+    if backend == "metal":
+        args.append("METAL=1")
+    elif backend == "vulkan":
         args.append("VK=1")
     elif backend == "cuda":
         args.append("CUDA=1")
@@ -1200,6 +1223,8 @@ def urls(host, port):
 def run_environment(backend, engine, family, hw):
     """The environment `coli start` adds for the chosen backend."""
     env = {}
+    if backend == "metal":
+        env["K3_METAL" if family.id == "kimi" else "COLI_METAL"] = "1"
     if backend == "vulkan":
         env["COLI_VULKAN"] = "1"
         shaders = os.path.join(os.path.dirname(engine), "shaders")

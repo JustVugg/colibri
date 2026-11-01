@@ -53,3 +53,16 @@ threshold (default 16). Streaming, cache, MTP, DSA and the persistence formats
 are unchanged; every GPU path falls back to the CPU per-block on any fault.
 Numerics are dequant→f32-MAC (same as the CUDA tier); greedy outputs are
 byte-identical to the CPU engine.
+
+## Setup
+
+Setup detects Metal capable GPUs on macOS and shows their names in the hardware
+report. Automatic selection keeps Metal opt in while the backend is experimental.
+
+From a source checkout, select Metal explicitly for GLM, GLM 5.3 Flash, Inkling,
+or Kimi K3 with `./start-here.sh --backend metal` and select a supported model.
+Setup builds with `METAL=1` and saves the activation variable for subsequent runs.
+An existing Metal engine can also be used without a compiler.
+
+The standard Qwen setup downloads do not use the separate qpack Metal path.
+Selecting Metal for these models reports an error rather than claiming GPU use.
