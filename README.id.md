@@ -532,6 +532,20 @@ membaca pull request yang merusak batas ukuran cache: <strong>request changes pa
 Halaman **Profiling** menunjukkan di mana waktu setiap turn digunakan, fase demi
 fase, dengan 30 turn terakhir sebagai tren.
 
+### Antarmuka terminal
+
+`coli tui` adalah chat yang sama di terminal, satu file C tanpa pustaka: daftar
+percakapan, jawaban yang mengalir dengan penalaran terlipat, monitor (`F2`) dengan
+CPU dan RAM mesin, GPU dan VRAM-nya serta profil setiap turn, peta pakar (`ctrl+e`),
+dan kolibri dari halaman chat, digambar sebagai gambar di terminal yang menggambar
+sixel (Windows Terminal, foot, WezTerm). Ia terhubung ke `coli serve` yang sedang
+berjalan, atau menjalankan satu dengan `--model`. Lihat [docs/tui.md](docs/tui.md).
+
+<p align="center">
+  <img src="docs/media/tui/tui-chat.png" width="900" alt="antarmuka terminal: daftar percakapan, sebuah pertanyaan, penalaran terlipat, jawaban dan kecepatannya, serta kolibri di atas kotak input">
+</p>
+<p align="center"><em>Qwen3.8-Flash-Next pada RTX PRO 4000 melalui <code>coli serve</code>, dengan konteks 256K.</em></p>
+
 ## Gunakan dari aplikasi lain
 
 `coli serve` (yang dijalankan proses penyiapan untuk Anda) adalah satu server
@@ -688,9 +702,9 @@ halaman setiap model:
 ### Konteks panjang dan agen
 
 - **Konteks 256k dengan kecepatan 64k.** Qwen3.8-Flash-Next IQ2_XS pada chain CUDA
-  mesin D, dengan konteks 262144 token: prompt dari 15.6 ke 149 tok/s, decode dari
-  9.6 ke 45.7 (rencana RAM pada satu segmen prompt, K/V dalam float16 di kartu;
-  pada 65536 membaca 188 dan decode 48.4) ([qwen38.md](docs/qwen38.md)).
+  mesin D, dengan konteks 262144 token: prompt dari 15.6 ke 151 tok/s, decode dari
+  9.6 ke 42.9 (rencana RAM pada satu segmen prompt, K/V dalam float16 di kartu;
+  pada 65536 membaca 208 dan decode 52.2, pada 131072 190 dan 51.9) ([qwen38.md](docs/qwen38.md)).
 - **Giliran agen hanya membaca yang baru.** Permintaan singkat di antara dua
   giliran (agen yang meminta judul percakapan) memarkir percakapan alih-alih
   mengambil state-nya, di setiap engine (`COLI_PARK`). Giliran kedua Hermes Agent
@@ -759,6 +773,7 @@ chat template-nya, sehingga perintahnya sama untuk setiap model:
 ./coli tune  --model /nvme/qwen36          # measure and save this machine's fastest safe settings
 ./coli import /nvme/Flint-UD-Q4_K_XL.gguf  # a GGUF: writes Flint-UD-Q4_K_XL.colibri next to it
 ./coli ui                                  # the chat UI, next to a running coli serve
+./coli tui                                 # the chat in the terminal, on a running coli serve (or --model)
 ```
 
 Di Windows, archive rilis menyertakan `coli.cmd` (`coli.cmd chat --model
@@ -807,6 +822,7 @@ penjelasan.
 | File GGUF: arsitektur, dua mode, apa yang dilakukan setiap engine dengan bloknya | [gguf.md](docs/gguf.md) |
 | Model pada engine Qwen3.6 (Flint, Muse Spark Open, LFM3-VL) dan Mistral-Large-4 | [qwen36.md](docs/qwen36.md), [mistral-large4.md](docs/mistral-large4.md) |
 | UI chat (`coli ui`) | [ui/README.md](ui/README.md) |
+| Antarmuka terminal (`coli tui`) | [tui.md](docs/tui.md) |
 | Vulkan: expert tier, dense chain, kartu tanpa Resizable BAR | [vulkan.md](docs/vulkan.md) |
 | CUDA, dan CUDA tier Qwen3.6 | [cuda.md](docs/cuda.md), [qwen36-cuda-tier.md](docs/qwen36-cuda-tier.md) |
 | Apple Silicon, Windows | [metal.md](docs/metal.md), [windows.md](docs/windows.md) |
@@ -837,6 +853,7 @@ c/
 ├── qwenimage.c           Qwen-Image-2.1  (make qwenimage)
 ├── laya.c                Laya  (make laya)
 ├── gliner_decide.c       GLiNER2.5-Decide  (make gliner_decide)
+├── tui.c                 the terminal UI, a client of coli serve  (make colibri-tui)
 │
 ├── st.h, quant.h, idot.h        safetensors reads, container decoders, integer kernels
 ├── expert_ffn.h, expert_store.h routed-expert kernel and streaming expert cache

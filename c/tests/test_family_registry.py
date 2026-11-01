@@ -1100,7 +1100,8 @@ class FamilyRegistryTest(unittest.TestCase):
         source = cli_path.read_text(encoding="utf-8")
         self.assertNotRegex(source, r"family\.(?:cli|gateway)_adapter\s+not in")
         self.assertNotIn("K3CHAT1", source)
-        self.assertEqual(source.count("if not family.has_gateway_adapter:"), 3)
+        # tune, chat, serve and tui start the gateway: each checks the adapter first
+        self.assertEqual(source.count("if not family.has_gateway_adapter:"), 4)
         self.assertEqual(source.count("if not family.has_cli_adapter:"), 1)
         self.assertEqual(set(openai_server.family_ids()),
                          {family.id for family in FAMILIES})

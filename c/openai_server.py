@@ -12,6 +12,7 @@ import mimetypes
 import os
 import select
 import queue
+import shutil
 import signal
 import stat
 import socket
@@ -4561,6 +4562,40 @@ CONTINUATION_FAMILIES = {"glm53", "qwen38", "qwen36", "glm", "olmoe", "deepseek_
 _CPU_LAST = {}
 
 
+_GPU_LAST = {"t": 0.0, "v": None}
+
+
+def _gpu_stats():
+    """The NVIDIA cards as nvidia-smi sees them (use, memory, temperature, power), at most once a
+    second: the monitors (the TUI's, the chat page's) poll /health every second or two. None when
+    there is no nvidia-smi, which is then not looked for again."""
+    now = time.monotonic()
+    if _GPU_LAST.get("absent") or now - _GPU_LAST["t"] < 1.0:
+        return _GPU_LAST["v"]
+    _GPU_LAST["t"] = now
+    smi = shutil.which("nvidia-smi")
+    if not smi:
+        _GPU_LAST["absent"] = True
+        _GPU_LAST["v"] = None
+        return None
+    try:
+        r = subprocess.run([smi, "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,"
+                            "power.draw,power.limit", "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=2)
+        rows = []
+        for line in r.stdout.strip().splitlines():
+            f = [x.strip() for x in line.split(",")]
+            num = lambda v: float(v) if v not in ("", "[N/A]", "N/A") else None
+            rows.append({"name": f[0], "util": num(f[1]),
+                         "mem_used_gb": round(num(f[2]) / 1024, 2) if num(f[2]) is not None else None,
+                         "mem_total_gb": round(num(f[3]) / 1024, 2) if num(f[3]) is not None else None,
+                         "temp": num(f[4]), "power_w": num(f[5]), "power_max_w": num(f[6])})
+        _GPU_LAST["v"] = rows or None
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        _GPU_LAST["v"] = None
+    return _GPU_LAST["v"]
+
+
 def _system_stats(engine):
     """RAM of the box and of the engine process, and the engine's CPU since the last call
     (100 = one core busy). Read from /proc, so empty fields off Linux."""
@@ -4577,6 +4612,9 @@ def _system_stats(engine):
         out["cores"] = os.cpu_count() or 0
     except (OSError, KeyError, ValueError):
         pass
+    gpus = _gpu_stats()
+    if gpus:
+        out["gpus"] = gpus
     pid = getattr(getattr(engine, "process", None), "pid", None)
     if pid:
         try:
