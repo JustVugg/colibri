@@ -5,6 +5,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Metal
+
+- Multi-row Metal matmuls (prefill GEMMs, GLM-5.3 / Kimi K3 resident matmuls) now
+  use Apple's Metal Performance Shaders: the weight is decoded once on the GPU and
+  `MPSMatrixMultiplication` does a tiled GEMM, instead of re-reading every weight row
+  per input row. On by default in `METAL=1` builds for S >= 8 rows; `COLI_METAL_MPS=0`
+  opts out, `METAL_MPS=0` compiles it out. See docs/metal.md.
 ## [2.1.0] - 2026-10-31
 
 387 pull requests since v2.0.0, 208 of them from 35 contributors. GGUF files run

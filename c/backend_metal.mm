@@ -2,6 +2,15 @@
 // zero-copy over unified memory. See backend_metal.h and docs/plans/2026-07-10-*.
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
+// Metal Performance Shaders: Apple's tuned GPU GEMM. Used for the large-batch
+// (prefill / multi-row) matmuls, see mps_gemm() below. Ships with every macOS
+// SDK; -DCOLI_METAL_NO_MPS compiles it out and keeps the hand-written kernels only.
+#if !defined(COLI_METAL_NO_MPS) && __has_include(<MetalPerformanceShaders/MetalPerformanceShaders.h>)
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
+#define COLI_HAS_MPS 1
+#else
+#define COLI_HAS_MPS 0
+#endif
 #include "backend_metal.h"
 #include <cstring>
 #include <vector>
@@ -689,6 +698,56 @@ kernel void kda_state(
   oh[hq + i] = oi;
 }
 
+// ---- MPS GEMM support: expand a quantized weight block to dense f32 ----
+// wd[r*I + i] = dequant(W[o0+r, i]) for r in [0,och), i in [0,I). The row scale
+// (fmt 1/2/3), group scale (fmt 4) or 128x128 block scale (fmt 8) is applied here,
+// so the following MPSMatrixMultiplication is a plain y = x * wd^T. Decoding mirrors
+// mm_gemv branch for branch (same nibble order, same -8/-2 zero points, same e4m3
+// NaN policy); only the point where the scale is multiplied in differs, which is a
+// last-ulp rounding difference the metal-test tolerance (1e-4) already covers.
+// One thread per output element; dispatched as a 2D grid (I, och).
+kernel void mm_dequant(device const uchar* w     [[buffer(0)]],
+                       device const float* scale [[buffer(1)]],
+                       device float*       wd    [[buffer(2)]],
+                       constant int& I   [[buffer(3)]],
+                       constant int& fmt [[buffer(4)]],
+                       constant int& gsz [[buffer(5)]],
+                       constant int& o0  [[buffer(6)]],
+                       constant int& och [[buffer(7)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+  int i = int(gid.x), r = int(gid.y);
+  if (i >= I || r >= och) return;
+  long o = (long)o0 + r;
+  float v;
+  if (fmt == 1) {
+    v = float(((device const char*)w)[o * I + i]) * scale[o];
+  } else if (fmt == 2 || fmt == 4) {
+    long rb = (I + 1) / 2;
+    uchar b = w[o * rb + (i >> 1)];
+    int q = (i & 1) ? (b >> 4) : (b & 0xF);
+    float sc = (fmt == 2) ? scale[o] : scale[o * ((I + gsz - 1) / gsz) + i / gsz];
+    v = float(q - 8) * sc;
+  } else if (fmt == 3) {
+    long rb = (I + 3) / 4;
+    uchar b = w[o * rb + (i >> 2)];
+    v = float(int((b >> (2 * (i & 3))) & 0x3) - 2) * scale[o];
+  } else if (fmt == 8) {
+    int nblkI = (I + 127) / 128;
+    uchar b = w[o * I + i];
+    uint sign = b >> 7, ex = (b >> 3) & 0xF, mant = b & 0x7;
+    float wv;
+    if (ex == 0xF && mant == 0x7) {
+      wv = as_type<float>(0x7fc00000u);
+    } else {
+      float mag = (ex == 0) ? (float(mant) * 0.001953125f)
+                            : (1.0f + float(mant) * 0.125f) * as_type<float>((uint(ex) + 120u) << 23);
+      wv = sign ? -mag : mag;
+    }
+    v = wv * scale[(o / 128) * nblkI + i / 128];
+  } else {
+    v = ((device const float*)w)[o * I + i];
+  }
+  wd[(long)r * I + i] = v;
 // ---- training kernels (QLoRA, M6): correctness-first, unfused ----
 // t_tmul: dx[s,i] += sum_o dequant(W[o,i])*scale[o]*dy[s,o] — the frozen-base
 // transpose multiply of backward. One thread per (s,i): adjacent threads read
@@ -791,6 +850,20 @@ static id<MTLCommandQueue> g_queue;
 static id<MTLComputePipelineState> g_gemv, g_moe_gemv, g_moe_silu, g_moe_silu_clamped, g_moe_fwht;
 static id<MTLComputePipelineState> g_affine_q4, g_affine_q8;
 static int g_affine_width_ok;
+
+// ---- MPS GEMM state (see mps_gemm) ----
+// COLI_METAL_MPS=0            opt out (hand-written kernels only, the pre-MPS behavior)
+// COLI_METAL_MPS_MIN=N        min rows S to use MPS (default 8; below it mm_gemv wins:
+//                             the dequant pass costs ~one extra weight read+write)
+// COLI_METAL_MPS_SCRATCH_MB=N f32 dequant scratch budget (default 256); larger weights
+//                             are processed in output-column chunks that fit it
+static id<MTLComputePipelineState> g_dequant;
+static int    g_mps_on = 0;
+static int    g_mps_min = 8;
+static size_t g_mps_scratch = (size_t)256 << 20;
+static uint64_t g_mps_calls, g_mps_fb;
+static double g_mps_gpu;
+static id<MTLBuffer> g_mps_wd; static size_t g_mps_wd_cap;
 
 // fmt=6: sign-bit buffers for the GPU FWHT, one per tile size, cached forever (a
 // handful of sizes). The xorshift64* draw replicates quant.h e8_signs exactly —
@@ -1043,6 +1116,19 @@ extern "C" int coli_metal_init(void) {
     g_kv_rope=P("kv_rope"); g_kv_clear=P("kv_clear");
     g_kda_state=P("kda_state");
     g_kda_conv_silu=P("kda_conv_silu"); g_kda_l2_norm=P("kda_l2_norm");
+    g_dequant=P("mm_dequant");   // optional: only the MPS GEMM path needs it
+#if COLI_HAS_MPS
+    { const char *e = getenv("COLI_METAL_MPS");
+      int want = !(e && e[0] == '0' && !e[1]);
+      const char *m = getenv("COLI_METAL_MPS_MIN");
+      if (m) { g_mps_min = atoi(m); if (g_mps_min < 1) g_mps_min = 1; }
+      const char *sm = getenv("COLI_METAL_MPS_SCRATCH_MB");
+      if (sm && atoi(sm) > 0) g_mps_scratch = (size_t)atoi(sm) << 20;
+      g_mps_on = want && g_dequant && MPSSupportsMTLDevice(g_dev);
+      if (want && !g_mps_on)
+        fprintf(stderr, "[metal] MPS GEMM unavailable on this device -- built-in kernels only\n");
+    }
+#endif
     if(!g_a_add||!g_r_router||!g_r_top8||!g_r_top8p||!g_kv_rope||!g_kv_clear||!g_kda_state||!g_kda_conv_silu||!g_kda_l2_norm){ fprintf(stderr,"[metal] tail pipelines failed\n"); g_dev=nil; return 0; }
     if (!g_affine_q4 || !g_affine_q8) {
       fprintf(stderr,"[metal] MLX affine GEMV disabled: pipeline creation failed\n");
@@ -1186,6 +1272,7 @@ extern "C" void coli_metal_shutdown(void) {
 #endif
   g_resset_obj=nil; g_resset_enabled=false; g_resset_dirty=false;
   g_gemv=nil; g_affine_q4=nil; g_affine_q8=nil; g_affine_width_ok=0;
+  g_dequant=nil; g_mps_wd=nil; g_mps_wd_cap=0; g_mps_on=0;
   g_queue=nil; g_dev=nil; g_tensor_count=g_tensor_bytes=0;
 }
 extern "C" int  coli_metal_available(void) { return g_dev != nil; }
@@ -1206,6 +1293,111 @@ extern "C" int  coli_metal_mem_info(size_t *used, size_t *total) {
   if (used) *used = (size_t)[g_dev currentAllocatedSize];
   if (total) *total = (size_t)[g_dev recommendedMaxWorkingSetSize];
   return 1;
+}
+
+// ---- MPS GEMM: y[S,O] = x[S,I] @ dequant(W[O,I])^T ----
+// mm_gemv computes one output element per simdgroup, so at S rows every weight row is
+// fetched and decoded S times. Here the weight is decoded ONCE per call into an f32
+// scratch (mm_dequant) and Apple's MPSMatrixMultiplication does the multiply with its
+// tiled simdgroup-matrix GEMM, which reuses each weight tile across all S rows. Both
+// steps share one command buffer, so the submit latency is paid once.
+//
+// The scratch is bounded (g_mps_scratch): weights bigger than the budget are processed
+// in output-column chunks, each chunk's dequant writing the scratch and its GEMM writing
+// columns [o0, o0+n) of y through resultMatrixOrigin. The scratch is a private,
+// hazard-TRACKED buffer (independent of COLI_METAL_UNTRACKED), so Metal orders chunk k's
+// GEMM read before chunk k+1's dequant write inside the command buffer.
+//
+// wb/sb must already be GPU-visible (registered slab or resident wrap); sb may be nil
+// only for fmt 0. Returns 1 on success, 0 when MPS is off/below threshold/failed -- the
+// caller then runs its existing kernel path, so MPS can never make a call fail.
+#if COLI_HAS_MPS
+static std::mutex g_mps_mu;
+static int mps_gemm(id<MTLBuffer> wb, size_t woff, id<MTLBuffer> sb, size_t soff,
+                    int fmt, int gs, int I, int O,
+                    id<MTLBuffer> xb, size_t xoff, id<MTLBuffer> yb, size_t yoff, int S) {
+  if (!g_mps_on || S < g_mps_min || I <= 0 || O <= 0) return 0;
+  if (fmt != 0 && fmt != 1 && fmt != 2 && fmt != 3 && fmt != 4 && fmt != 8) return 0;
+  if (fmt != 0 && !sb) return 0;
+  if (fmt == 4 && gs <= 0) return 0;
+  std::lock_guard<std::mutex> lk(g_mps_mu);
+  const size_t rowb = (size_t)I * sizeof(float);
+  int64_t och64 = (int64_t)(g_mps_scratch / rowb);
+  if (och64 >= O) och64 = O;
+  else if (och64 >= 64) och64 &= ~(int64_t)63;   // keep chunks on a GEMM-friendly width
+  if (och64 < 1) och64 = 1;
+  const int och = (int)och64;
+  const size_t need = (size_t)och * rowb;
+  if (!g_mps_wd || g_mps_wd_cap < need) {
+    g_mps_wd = [g_dev newBufferWithLength:need options:MTLResourceStorageModePrivate];
+    g_mps_wd_cap = g_mps_wd ? need : 0;
+    if (!g_mps_wd) { g_mps_fb++; return 0; }
+  }
+  @autoreleasepool {
+    MPSMatrixDescriptor *dx = [MPSMatrixDescriptor matrixDescriptorWithRows:(NSUInteger)S
+        columns:(NSUInteger)I rowBytes:rowb dataType:MPSDataTypeFloat32];
+    MPSMatrixDescriptor *dy = [MPSMatrixDescriptor matrixDescriptorWithRows:(NSUInteger)S
+        columns:(NSUInteger)O rowBytes:(size_t)O * sizeof(float) dataType:MPSDataTypeFloat32];
+    MPSMatrix *mx = [[MPSMatrix alloc] initWithBuffer:xb offset:xoff descriptor:dx];
+    MPSMatrix *my = [[MPSMatrix alloc] initWithBuffer:yb offset:yoff descriptor:dy];
+    if (!mx || !my) { g_mps_fb++; return 0; }
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    for (int o0 = 0; o0 < O; o0 += och) {
+      const int n = (O - o0 < och) ? (O - o0) : och;
+      id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+      [e setComputePipelineState:g_dequant];
+      [e setBuffer:wb offset:woff atIndex:0];
+      [e setBuffer:sb offset:soff atIndex:1];
+      [e setBuffer:g_mps_wd offset:0 atIndex:2];
+      [e setBytes:&I length:4 atIndex:3];  [e setBytes:&fmt length:4 atIndex:4];
+      [e setBytes:&gs length:4 atIndex:5]; [e setBytes:&o0 length:4 atIndex:6];
+      [e setBytes:&n length:4 atIndex:7];
+      [e dispatchThreads:MTLSizeMake((NSUInteger)I, (NSUInteger)n, 1)
+          threadsPerThreadgroup:MTLSizeMake(64, 4, 1)];
+      [e endEncoding];
+      MPSMatrixDescriptor *dw = [MPSMatrixDescriptor matrixDescriptorWithRows:(NSUInteger)n
+          columns:(NSUInteger)I rowBytes:rowb dataType:MPSDataTypeFloat32];
+      MPSMatrix *mw = [[MPSMatrix alloc] initWithBuffer:g_mps_wd offset:0 descriptor:dw];
+      MPSMatrixMultiplication *mm = [[MPSMatrixMultiplication alloc] initWithDevice:g_dev
+          transposeLeft:NO transposeRight:YES
+          resultRows:(NSUInteger)S resultColumns:(NSUInteger)n interiorColumns:(NSUInteger)I
+          alpha:1.0 beta:0.0];
+      if (!mw || !mm) { g_mps_fb++; return 0; }   // nothing committed yet: cb is dropped
+      // MPS matrix origins are (x = ROW, y = COLUMN): this chunk writes columns [o0, o0+n)
+      // of every row. (x = o0 trips MPS's "requested rows exceeds result matrix" assert.)
+      mm.resultMatrixOrigin = MTLOriginMake(0, (NSUInteger)o0, 0);
+      [mm encodeToCommandBuffer:cb leftMatrix:mx rightMatrix:mw resultMatrix:my];
+    }
+    [cb commit]; [cb waitUntilCompleted];
+    if (cb.status == MTLCommandBufferStatusError) {
+      fprintf(stderr, "[metal] MPS gemm cmdbuf error (S=%d I=%d O=%d fmt=%d): %s\n", S, I, O, fmt,
+              cb.error ? [[cb.error localizedDescription] UTF8String] : "?");
+      g_mps_fb++; return 0;
+    }
+    g_mps_calls++; g_mps_gpu += [cb GPUEndTime] - [cb GPUStartTime];
+  }
+  return 1;
+}
+#else
+static int mps_gemm(id<MTLBuffer>, size_t, id<MTLBuffer>, size_t, int, int, int, int,
+                    id<MTLBuffer>, size_t, id<MTLBuffer>, size_t, int) { return 0; }
+#endif
+
+extern "C" int coli_metal_mps_available(void) { return g_dev != nil && g_mps_on; }
+extern "C" void coli_metal_mps_config(int enabled, int min_rows, size_t scratch_bytes) {
+#if COLI_HAS_MPS
+  std::lock_guard<std::mutex> lk(g_mps_mu);
+  if (enabled >= 0) g_mps_on = enabled && g_dev && g_dequant && MPSSupportsMTLDevice(g_dev);
+  if (min_rows > 0) g_mps_min = min_rows;
+  if (scratch_bytes > 0) { g_mps_scratch = scratch_bytes; g_mps_wd = nil; g_mps_wd_cap = 0; }
+#else
+  (void)enabled; (void)min_rows; (void)scratch_bytes;
+#endif
+}
+extern "C" void coli_metal_mps_counts(uint64_t *calls, uint64_t *fallbacks, double *gpu_s) {
+  if (calls) *calls = g_mps_calls;
+  if (fallbacks) *fallbacks = g_mps_fb;
+  if (gpu_s) *gpu_s = g_mps_gpu;
 }
 
 extern "C" int coli_metal_matmul(ColiMetalTensor **tp, float *y, const float *x,
@@ -1243,6 +1435,11 @@ extern "C" int coli_metal_matmul(ColiMetalTensor **tp, float *y, const float *x,
     }
     id<MTLBuffer> bx = [g_dev newBufferWithBytes:x length:(size_t)S*I*sizeof(float) options:MTLResourceStorageModeShared];
     id<MTLBuffer> by = [g_dev newBufferWithLength:(size_t)S*O*sizeof(float) options:MTLResourceStorageModeShared];
+    if (!bx || !by) return 0;
+    if (mps_gemm(t->w, 0, t->s, 0, fmt, gs, I, O, bx, 0, by, 0, S)) {   // multi-row: MPS
+      memcpy(y, [by contents], (size_t)S*O*sizeof(float));
+      return 1;
+    }
     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
     id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
     [e setComputePipelineState:g_gemv];
@@ -1735,7 +1932,15 @@ extern "C" int coli_metal_gemm(float *y, const float *x, const void *wp, const f
     if(!wb||!sb) return 0;
     size_t woff=wa-(uint64_t)[wb gpuAddress], soff=sa-(uint64_t)[sb gpuAddress];
     g_gx=ensure(g_gx,&g_gx_cap,(size_t)S*I*4); g_gy=ensure(g_gy,&g_gy_cap,(size_t)S*O*4);
+    if(!g_gx||!g_gy) return 0;
     memcpy([g_gx contents],x,(size_t)S*I*4);
+    // Prefill's big GEMMs: decode the weight once + MPS tiled GEMM (see mps_gemm). Falls
+    // through to the mm_gemv path below if MPS is off, S is under COLI_METAL_MPS_MIN, or
+    // the MPS submission fails. MPS needs no grid-size chunking: it tiles internally.
+    if(mps_gemm(wb,woff,sb,soff,fmt,gs,I,O,g_gx,0,g_gy,0,S)){
+      memcpy(y,[g_gy contents],(size_t)S*O*4);
+      return 1;
+    }
     id<MTLCommandBuffer> cb=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
     [e useResource:wb usage:MTLResourceUsageRead]; [e useResource:sb usage:MTLResourceUsageRead];
     [e setComputePipelineState:g_gemv];
