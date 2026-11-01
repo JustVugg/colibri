@@ -3030,6 +3030,71 @@ def server_model_entry(base, api_key=None, timeout=1.5):
     except Exception:
         return {}
 
+def tui_binary():
+    """colibri-tui next to coli (an archive, a source build), or in libexec (make install)."""
+    local = os.path.join(HERE, "colibri-tui" + _EXE)
+    return local if os.path.exists(local) else os.path.join(_LIBEXEC, "colibri-tui" + _EXE)
+
+def run_tui(a, base):
+    """The terminal interface against the server at `base`, until the user quits it. The key
+    travels in the environment, not on the command line, where `ps` would show it."""
+    env = dict(os.environ)
+    if getattr(a, "api_key", None): env["COLI_API_KEY"] = a.api_key
+    return subprocess.call([tui_binary(), "--server", base], env=env)
+
+def cmd_tui(a):
+    """`coli tui`: the TUI attached to a running coli serve (--attach, else localhost:8000), or to a
+    server it starts for --model and stops when the TUI quits. The server's output goes to a log:
+    on the terminal it would draw over the interface."""
+    if not os.path.exists(tui_binary()):
+        sys.exit(f"colibri-tui is not built: run `make -C c colibri-tui` (docs/tui.md)")
+    base = getattr(a, "attach", None) or "http://127.0.0.1:8000"
+    if not getattr(a, "no_attach", False):
+        mid = server_probe(base, getattr(a, "api_key", None))
+        if mid:
+            sys.exit(run_tui(a, base))
+        if getattr(a, "attach", None):
+            sys.exit(f"--attach: no coli serve answering at {base} (start one with: coli serve --model <dir>)")
+    if not a.model:
+        sys.exit("coli tui: no coli serve answers at http://127.0.0.1:8000. Start one "
+                 "(coli serve --model <dir>) or give the model here: coli tui --model <dir>")
+    need_model(a.model)
+    resolved = resolve_model(a.model); family = resolved.descriptor; arch = family.id
+    if not family.has_gateway_adapter:
+        sys.exit(f"{family.display_name}: gateway adapter is not wired")
+    if family.modality != "text":
+        sys.exit(f"{family.display_name} is not a text model: the TUI chats; use coli chat")
+    engine = engine_for(a.model)
+    need_model(a.model, engine)
+    from family_registry import default_model_id
+    model_id = default_model_id(resolved)
+    import openai_server
+    cmd = [sys.executable, openai_server.__file__, "--model", a.model, "--engine", engine, "--arch", arch,
+           "--model-id", model_id, "--host", "127.0.0.1", "--port", "8000", "--max-tokens", str(serve_max_tokens(a))]
+    if a.cap is not None: cmd += ["--cap", str(a.cap)]
+    if a.api_key: cmd += ["--api-key", a.api_key]
+    log_path = os.path.join(tempfile.gettempdir(), "colibri-tui-server.log")
+    with open(log_path, "w", encoding="utf-8") as log:
+        p = subprocess.Popen(cmd, env=env_for_engine(a, arch), stdout=log, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL)
+    try:
+        sp = Spinner(f"loading {model_id}…"); sp.start()
+        for _ in range(1800):
+            if p.poll() is not None:
+                sp.stop(); sys.exit(f"{model_id} server exited while loading: see {log_path}")
+            if server_probe("http://127.0.0.1:8000", a.api_key, timeout=1.0):
+                sp.stop()
+                code = run_tui(a, "http://127.0.0.1:8000")
+                print(f"  {C.dim}the server's log: {log_path}{C.r}")
+                sys.exit(code)
+            time.sleep(1)
+        sp.stop(); sys.exit(f"timed out loading {model_id}: see {log_path}")
+    finally:
+        if p.poll() is None:
+            p.terminate()
+            try: p.wait(timeout=10)
+            except subprocess.TimeoutExpired: p.kill()
+
 def cmd_chat(a):
     # ATTACH: a running `coli serve` beats a private engine every time — the load
     # (34-136 s) and the cache warmth survive between sessions. Explicit --attach
@@ -4134,6 +4199,12 @@ def main():
                     help="generation statistics footer after each answer: full (tokens, seconds, tok/s), "
                          "compact (tokens, tok/s), off. Default from COLI_CHAT_STATS, else full. "
                          "Counts are exact when the server reports completion_tokens, ~estimated otherwise.")
+    pt=sub.add_parser("tui", parents=[common],
+                      help="the terminal interface (colibri-tui) on a running coli serve, or on one it starts for --model")
+    pt.add_argument("--attach", default=None, metavar="URL",
+                    help="the coli serve to use (default: http://127.0.0.1:8000 when it answers)")
+    pt.add_argument("--no-attach", action="store_true", help="always start a server for --model")
+    pt.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
     ps=sub.add_parser("serve", parents=[common])
     ps.add_argument("--host",default="127.0.0.1"); ps.add_argument("--port",type=int,default=8000)
     ps.add_argument("--model-id",default=os.environ.get("COLI_MODEL_ID"))
@@ -4270,7 +4341,7 @@ def main():
     a=ap.parse_args()
     handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"mirror":cmd_mirror,
              "doctor":cmd_doctor,"tune":cmd_tune,
-             "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
+             "run":cmd_run,"chat":cmd_chat,"tui":cmd_tui,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
              "convert":cmd_convert,"import":cmd_import,"web":cmd_web,"ui":cmd_ui}.get(a.cmd)
     if a.cmd in ("setup","start","status","logs"):
         import setup_flow

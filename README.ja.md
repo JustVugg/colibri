@@ -315,6 +315,15 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 
 **Profiling** ページは、各ターンがどこで時間を使っているかをフェーズごとに示し、直近 30 ターンを推移として表示します。
 
+### ターミナル UI
+
+`coli tui` はターミナルで動く同じチャットで、ライブラリなしの C ファイル 1 つです：会話の一覧、推論を折りたたんだストリーミングの回答、モニター（`F2`：エンジンの CPU と RAM、GPU とその VRAM、各ターンのプロファイル）、エキスパートマップ（`ctrl+e`）、そしてチャットページのハチドリ。sixel を描けるターミナル（Windows Terminal、foot、WezTerm）では画像として描かれます。実行中の `coli serve` に接続し、`--model` を付ければ自分で起動します。[docs/tui.md](docs/tui.md) を参照してください。
+
+<p align="center">
+  <img src="docs/media/tui/tui-chat.png" width="900" alt="ターミナル UI：会話の一覧、質問、折りたたまれた推論、回答とその速度、入力欄にとまるハチドリ">
+</p>
+<p align="center"><em>RTX PRO 4000 上の Qwen3.8-Flash-Next、<code>coli serve</code> 経由、コンテキスト 256K。</em></p>
+
 ## ほかのアプリから使う
 
 `coli serve`（セットアップが起動してくれるもの）は、複数の API を備えた 1 つのサーバーです：
@@ -402,7 +411,7 @@ RAM 62 GB の i5-13500 と RTX PRO 4000 Blackwell SFF（24 GB、70 W）。各モ
 
 ### 長いコンテキストとエージェント
 
-- **256k のコンテキストを 64k の速度で。** マシン D の CUDA チェーンで Qwen3.8-Flash-Next IQ2_XS、コンテキスト 262,144 トークン：プロンプト 15.6 -> 149 tok/s、デコード 9.6 -> 45.7（RAM の計画をプロンプト 1 セグメント分に、K/V はカード上で float16。65,536 では読み込み 188、デコード 48.4）（[qwen38.md](docs/qwen38.md)）。
+- **256k のコンテキストを 64k の速度で。** マシン D の CUDA チェーンで Qwen3.8-Flash-Next IQ2_XS、コンテキスト 262,144 トークン：プロンプト 15.6 -> 151 tok/s、デコード 9.6 -> 42.9（RAM の計画をプロンプト 1 セグメント分に、K/V はカード上で float16。65,536 では読み込み 208、デコード 52.2、131,072 では 190 と 51.9）（[qwen38.md](docs/qwen38.md)）。
 - **エージェントのターンは新しい部分だけを読む。** 2 つのターンの間の短いリクエスト（会話のタイトルを尋ねるエージェント）は、会話の状態を奪わずに会話を退避させます。すべてのエンジンで有効です（`COLI_PARK`）。Qwen3.8-Flash-Next での Hermes Agent の 2 ターン目、14,810 トークン：86 s -> 4.9 s（[qwen38.md](docs/qwen38.md#an-agents-turns)）。
 - **float16 の KV キャッシュ**：GLM-5.3 は 131,072 トークンで 23.9 GB ではなく 11.9 GB（[CHANGELOG](CHANGELOG.md)）。
 
@@ -439,6 +448,7 @@ make qwen36 VK=1                          # one engine, here with Vulkan (CUDA=1
 ./coli tune  --model /nvme/qwen36          # measure and save this machine's fastest safe settings
 ./coli import /nvme/Flint-UD-Q4_K_XL.gguf  # a GGUF: writes Flint-UD-Q4_K_XL.colibri next to it
 ./coli ui                                  # the chat UI, next to a running coli serve
+./coli tui                                 # the chat in the terminal, on a running coli serve (or --model)
 ```
 
 Windows では、リリースアーカイブに `coli.cmd` が同梱されています（`coli.cmd chat --model D:\qwen36`）。ソースのチェックアウトからは `py -3 c\coli` を使ってください。`.exe` ファイルはエンジンであり、ランチャーではありません。すべてのオプションと環境変数：[SETTINGS.md](docs/SETTINGS.md)、[ENVIRONMENT.md](docs/ENVIRONMENT.md)。
@@ -469,6 +479,7 @@ colibri は、フロンティアモデルが希少なハードウェアに頼る
 | GGUF ファイル：アーキテクチャ、2 つのモード、各エンジンがブロックをどう扱うか | [gguf.md](docs/gguf.md) |
 | Qwen3.6 エンジン上のモデル（Flint、Muse Spark Open、LFM3-VL）と Mistral-Large-4 | [qwen36.md](docs/qwen36.md)、[mistral-large4.md](docs/mistral-large4.md) |
 | チャット UI（`coli ui`） | [ui/README.md](ui/README.md) |
+| ターミナル UI（`coli tui`） | [tui.md](docs/tui.md) |
 | Vulkan：エキスパートティア、密チェーン、Resizable BAR のないカード | [vulkan.md](docs/vulkan.md) |
 | CUDA と、Qwen3.6 の CUDA ティア | [cuda.md](docs/cuda.md)、[qwen36-cuda-tier.md](docs/qwen36-cuda-tier.md) |
 | Apple Silicon、Windows | [metal.md](docs/metal.md)、[windows.md](docs/windows.md) |
@@ -499,6 +510,7 @@ c/
 ├── qwenimage.c           Qwen-Image-2.1  (make qwenimage)
 ├── laya.c                Laya  (make laya)
 ├── gliner_decide.c       GLiNER2.5-Decide  (make gliner_decide)
+├── tui.c                 the terminal UI, a client of coli serve  (make colibri-tui)
 │
 ├── st.h, quant.h, idot.h        safetensors reads, container decoders, integer kernels
 ├── expert_ffn.h, expert_store.h routed-expert kernel and streaming expert cache
