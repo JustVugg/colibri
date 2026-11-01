@@ -35,6 +35,13 @@ typedef struct {
     uint64_t bytes_read;
     uint64_t resident_bytes;
     uint64_t capacity_bytes;
+    /* The decode-only view of requests/hits (the S-store map's hit_rate_d):
+     * requests while the token path held the decode phase -- prefill lookups
+     * and the prewarm fill count nothing here. Same lease population as
+     * requests/hits, so hit_rate_d is the like-for-like number against an
+     * engine whose prefill never touches the store. */
+    uint64_t requests_decode;
+    uint64_t hits_decode;
 } ColiExpertStoreStats;
 
 /*

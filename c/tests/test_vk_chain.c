@@ -6,7 +6,9 @@
  * and in another order; the references sum in double):
  *   matmul   GEMV (chain_gemv.comp's vectorized one and qmatmul.comp's) and tiled
  *            GEMM, int8 rows, int4-g64, f32, bf16, offsets the device can bind and
- *            offsets it cannot (through the frame's temporaries)
+ *            offsets it cannot (through the frame's temporaries); mm8, the tiled
+ *            weight-stationary fmt-12 GEMM (COLI_VK_MM8) against the fp64/e4m3
+ *            reference at the six real projection shapes, determinism, refusals
  *   norm     zero-centred, plain, no weight, L2; heads with a gate between them, a
  *            weight slice per stream, in place
  *   rope     rotate-half from a host table, heads at a stride
@@ -35,7 +37,8 @@
  *            and its window, the recurrence and its state over two submissions, the
  *            decay, beta, output norm and gate
  *   mhc      hyper_connections.h's split, collapse and write back, the mean, and the
- *            clamped SwiGLU
+ *            clamped SwiGLU; the S=1 fused pair (COLI_VK_CHAIN_MHC_S1) against the
+ *            standing chain the engine records at one row
  *   kda k3   Kimi K3's KDA layer (kimi_k3.c's kda_forward): exp(A_log) as the engine
  *            keeps it, its order of the l2 norms and the update, over two submissions
  *   ares     Kimi K3's attention residuals (res_mix) over 0 to 15 block snapshots, and
@@ -68,6 +71,7 @@
 #include "../backend_vulkan.h"
 #include "../vk_chain.h"
 #include "../vk_tier.h"           /* vkt_host_pairs: the bench's CPU in place */
+#include "../vk_dmoe.h"           /* COLI_VK_DMOE's parse: the one-layer arm's lever */
 #include "../vk_kvsplit.h"        /* the KV cache split between the device and the host */
 #include "../kv16.h"              /* a float16 KV cache's numbers (test_attn_kvh) */
 #include "../delta_attention.h"      /* the KDA step the KDA ops follow */
@@ -1509,6 +1513,92 @@ static void test_mhc(int H, int D, int iters) {
     free(hp); free(col); free(out); free(mean); free(ga); free(ua); free(rr); free(yy);
 }
 
+/* the S=1 single-dispatch mHC pair (chain_mhc_dec.comp, COLI_VK_CHAIN_MHC_S1) against
+ * the standing chain the engine records at one row (the fn matmul, SPLIT, COLLAPSE,
+ * the bf16 round, the norm, the round, then POST and its round) -- the mission's oracle:
+ * the fused pair is a thresholded class against it (the fork's bodies: the affine and
+ * collapse products single-rounding fmas, fma reduction trees, (x*inv)*w). The hp layout
+ * and the CPU's sinkhorn (over the device's own mixes) guard the port against a layout
+ * slip both device paths could share. */
+static void test_mhc_dec(int H, int D, int iters) {
+    int S = 1, HD = H * D, nm = (2 + H) * H, hrow = 2 * H + H * H, noff = 3 + nm + 5;
+    float eps = 1e-6f, hce = 1e-6f;
+    float *x = fvec((size_t)S * HD, 1.f), *fn = fvec((size_t)nm * HD, 0.05f), *br = fvec((size_t)S * D, 1.f);
+    float *prm = malloc(((size_t)noff + D) * 4);
+    for (int i = 0; i < 3; i++) prm[i] = 0.5f + (rnd() % 100) / 100.f;
+    for (int i = 0; i < nm; i++) prm[3 + i] = frnd() * 0.5f;
+    for (int i = 0; i < D; i++) prm[noff + i] = 1.f + frnd() * 0.5f;   /* the branch norm's weight */
+    ColiVkTensor *t = NULL;
+    if (!coli_vk_tensor_ensure(&t, fn, NULL, 10, HD, nm, 0)) { CHECK(0, "mhc dec: upload"); return; }
+    VkcBuf *xb = up(x, (size_t)S * HD), *bb = up(br, (size_t)S * D), *pb = up(prm, (size_t)noff + D);
+    VkcBuf *mb = vkc_buf((size_t)S * nm * 4, VKC_DEV);
+    VkcBuf *hb = vkc_buf((size_t)S * hrow * 4, VKC_DEV), *cb = vkc_buf((size_t)S * D * 4, VKC_DEV);
+    VkcBuf *nb = vkc_buf((size_t)S * D * 4, VKC_DEV), *ob = vkc_buf((size_t)S * HD * 4, VKC_DEV);
+    VkcBuf *hb2 = vkc_buf((size_t)S * hrow * 4, VKC_DEV), *nb2 = vkc_buf((size_t)S * D * 4, VKC_DEV);
+    VkcBuf *ob2 = vkc_buf((size_t)S * HD * 4, VKC_DEV), *ob3 = vkc_buf((size_t)S * HD * 4, VKC_DEV);
+    VkcMhc sp = {S, H, D, iters, 0, HD, 0, nm, 0, hrow, 0, D, 0, 0, eps, hce, 0.f};
+    VkcMhc po = {S, H, D, iters, 0, HD, 0, D, 0, hrow, 0, HD, 0, 0, eps, hce, 0.f};
+    VkcNorm np = {S, D, 1, 0, D, D, 0, D, D, noff, 0, 0, eps, 1.f};
+    VkcDsRound rp = {VKC_DS_BF16, S, 1, D, 0, 0, 0, 0, 0, 0, 0, 0, 0.f};
+    VkcDsRound rpo = {VKC_DS_BF16, S, 1, HD, 0, 0, 0, 0, 0, 0, 0, 0, 0.f};
+    /* the standing chain, exactly v4c_pre / v4c_post's dispatches at one row */
+    int ok = vkc_begin() && vkc_matmul(t, xb, 0, mb, 0, S) && vkc_mhc(VKC_MHC_SPLIT, xb, mb, hb, pb, NULL, &sp) &&
+             vkc_mhc(VKC_MHC_COLLAPSE, xb, NULL, hb, NULL, cb, &sp) && vkc_dsv4_round(cb, cb, &rp) &&
+             vkc_norm(cb, pb, nb, &np) && vkc_dsv4_round(nb, nb, &rp) &&
+             vkc_mhc(VKC_MHC_POST, xb, bb, hb, NULL, ob, &po) && vkc_dsv4_round(ob, ob, &rpo) && vkc_submit(1);
+    /* the fused pair, the lever armed: the same mix row, then the two dispatches */
+    VkcMhcDec dp = {H, D, iters, 0, 0, 0, 0, 0, noff, eps, hce, eps};
+    setenv("COLI_VK_CHAIN_MHC_S1", "1", 1);
+    VkcStats s0; vkc_stats(&s0);
+    int ok2 = vkc_begin() && vkc_matmul(t, xb, 0, mb, 0, S) && vkc_mhc_dec(0, xb, mb, hb2, pb, nb2, &dp) &&
+              vkc_mhc_dec(1, xb, bb, hb2, NULL, ob2, &dp) && vkc_mhc_dec(1, xb, bb, hb2, NULL, ob3, &dp) && vkc_submit(1);
+    VkcStats s1; vkc_stats(&s1);
+    unsetenv("COLI_VK_CHAIN_MHC_S1");
+    float *hp = down(hb, 0, hrow), *nrm = down(nb, 0, D), *out = down(ob, 0, HD);
+    float *hp2 = down(hb2, 0, hrow), *nrm2 = down(nb2, 0, D), *out2 = down(ob2, 0, HD), *out3 = down(ob3, 0, HD);
+    /* hp against the CPU's sinkhorn over the device's own mixes (the layout guard) */
+    float *mix = down(mb, 0, nm), *cpu = malloc((size_t)hrow * 4);
+    {
+        float ms = 0; for (int i = 0; i < HD; i++) ms += x[i] * x[i];
+        float ir = 1.f / sqrtf(ms / HD + eps), *mx = malloc((size_t)nm * 4);
+        for (int r = 0; r < nm; r++) mx[r] = mix[r] * ir;
+        coli_hc_split_sinkhorn(cpu, cpu + H, cpu + 2 * H, mx, prm, prm + 3, H, iters, hce);
+        free(mx);
+    }
+    double ehp = 0, ecpu = 0, enrm = 0, eout = 0, mn = 1e-6, mo = 1e-6; int bn = 1, bo = 1;
+    for (int i = 0; i < hrow; i++) {
+        double d = fabs((double)hp2[i] - hp[i]), dc = fabs((double)hp2[i] - cpu[i]);
+        if (d > ehp) ehp = d; if (dc > ecpu) ecpu = dc;
+    }
+    for (int i = 0; i < D; i++) { double d = fabs((double)nrm2[i] - nrm[i]); if (d > enrm) enrm = d;
+        double a = fabs((double)nrm[i]); if (a > mn) mn = a; bn &= nrm2[i] == nrm[i]; }
+    for (int i = 0; i < HD; i++) { double d = fabs((double)out2[i] - out[i]); if (d > eout) eout = d;
+        double a = fabs((double)out[i]); if (a > mo) mo = a; bo &= out2[i] == out[i]; }
+    int bits2 = 1;
+    for (int i = 0; i < HD; i++) bits2 &= out2[i] == out3[i];   /* the same bits a second run */
+    CHECK(ok && ok2 && ehp < 2e-5 && ecpu < 5e-6 && enrm / mn < 8e-3 && eout / mo < 8e-3 && bits2 &&
+          !bad(nrm2, D) && !bad(out2, HD) && s1.mhc_dec - s0.mhc_dec == 3,
+          "mhc dec H %d D %d iters %d: ok %d/%d hp %.2e (cpu %.2e) nrm %.2e out %.2e%s",
+          H, D, iters, ok, ok2, ehp, ecpu, enrm / mn, eout / mo, bits2 ? "" : ", UNSTABLE BITS");
+    printf("  mhc dec H %d D %d iters %d: hp %.2e (cpu %.2e) nrm %.2e (%d/%d bits) out %.2e (%d/%d bits), engaged %llu\n",
+           H, D, iters, ehp, ecpu, enrm / mn, bn, D, eout / mo, bo, HD, s1.mhc_dec - s0.mhc_dec);
+    /* the refusals: a D past the shader's cap declines under the armed lever, and the
+     * lever unset never engages */
+    setenv("COLI_VK_CHAIN_MHC_S1", "1", 1);
+    VkcMhcDec badp = dp; badp.D = 4097;
+    int took = vkc_mhc_dec(0, xb, mb, hb2, pb, nb2, &badp);
+    vkc_stats(&s0);
+    unsetenv("COLI_VK_CHAIN_MHC_S1");
+    took = took || vkc_mhc_dec(0, xb, mb, hb2, pb, nb2, &dp);
+    vkc_stats(&s1);
+    CHECK(!took && s1.mhc_dec == s0.mhc_dec,
+          "mhc dec refuse: D past the cap declines armed, the lever off never records");
+    vkc_free(xb); vkc_free(bb); vkc_free(pb); vkc_free(mb); vkc_free(hb); vkc_free(cb); vkc_free(nb); vkc_free(ob);
+    vkc_free(hb2); vkc_free(nb2); vkc_free(ob2); vkc_free(ob3); coli_vk_tensor_free(t);
+    free(x); free(fn); free(br); free(prm); free(hp); free(nrm); free(out); free(hp2); free(nrm2);
+    free(out2); free(out3); free(mix); free(cpu);
+}
+
 /* k-pooling against sparse_index.h. Equal gates and no bias make each pooled key the
  * exact mean of its members, so with quarter-step values and power-of-two scales the
  * scores are exact on both sides and the selection must be the CPU's slot for slot;
@@ -1789,6 +1879,29 @@ static void test_route(const char *what, int S, int E, int K, int kind, int has_
     free(lg); free(bias); free(rid); free(rw); free(gi); free(gw); free(gi2); free(gw2);
 }
 
+/* COLI_VK_DMOE's parse (vk_dmoe.h): a layer index arms that one layer; 0, unset,
+ * junk and negatives are off, so the default run arms nothing -- no dmoe buffers, no
+ * dispatch (the arm's parse is what decides, before any vkc_dmoe_* call). */
+static void test_dmoe_parse(void) {
+    CHECK(vkc_dmoe_layer_env() == 0, "dmoe parse: the default (unset) is off");
+    CHECK(vkc_dmoe_layer_parse(NULL) == 0, "dmoe parse: NULL");
+    CHECK(vkc_dmoe_layer_parse("") == 0, "dmoe parse: empty");
+    CHECK(vkc_dmoe_layer_parse("0") == 0, "dmoe parse: 0");
+    CHECK(vkc_dmoe_layer_parse("5") == 5, "dmoe parse: 5");
+    CHECK(vkc_dmoe_layer_parse("60") == 60, "dmoe parse: 60");
+    CHECK(vkc_dmoe_layer_parse("-3") == 0, "dmoe parse: -3");
+    CHECK(vkc_dmoe_layer_parse("junk") == 0, "dmoe parse: junk");
+    CHECK(vkc_dmoe_layer_parse("7x") == 7, "dmoe parse: a trailing word");
+    CHECK(vkc_dmoe_rows_max_parse(NULL) == 0, "rows max parse: the default (unset) is off");
+    CHECK(vkc_dmoe_rows_max_parse("") == 0, "rows max parse: empty");
+    CHECK(vkc_dmoe_rows_max_parse("0") == 0, "rows max parse: 0");
+    CHECK(vkc_dmoe_rows_max_parse("512") == 512, "rows max parse: 512");
+    CHECK(vkc_dmoe_rows_max_parse("-8") == 0, "rows max parse: negative");
+    CHECK(vkc_dmoe_rows_max_parse("junk") == 0, "rows max parse: junk");
+    CHECK(vkc_dmoe_rows_max_parse("7x") == 7, "rows max parse: a trailing word");
+    printf("dmoe parse done\n");
+}
+
 /* ---- the routed experts (chain_moe.comp) ------------------------------------------------ */
 /* weight (o, i) of an [O x I] matrix in the tier's layout, as qmatmul.comp reads it */
 static float moe_e4m3(unsigned b) {
@@ -2028,6 +2141,69 @@ static void test_ds_attn(int S, int H, int hd, int nwin, int ncmp, int cnt, int 
     printf("  dsv4 attn S %d H %d hd %d cnt %d flags %d: rel err %.2e\n", S, H, hd, cnt, flags, e);
     vkc_free(qb); vkc_free(wb); vkc_free(cb); vkc_free(sb); vkc_free(ob); vkc_free(lb);
     free(q); free(win); free(cmp); free(sink); free(ref); free(sc); free(list); free(kvall); free(got);
+}
+
+/* the flash tile (chain_dsv4_fa.comp, COLI_VK_CHAIN_ATTN_FA) on test_ds_attn's
+ * reference, at the shapes the tile takes: hd 512, heads % 8, offsets the vec4 loads
+ * can bind. `arm` sets the lever (1 the f16 mirror, 2 the fp32 rows); S 1 rides the
+ * decode twin, S > 1 the prefill tile. The run is checked bit-stable too (the fork's
+ * own gate class: deterministic tile order, run to run). */
+static void test_ds_attn_fa(int S, int H, int nwin, int ncmp, int cnt, int flags, int arm) {
+    int hd = 512, qrow = H * hd + 4, lrow = cnt + 2, orow = H * hd + 4;
+    float *q = fvec((size_t)S * qrow, 1.f), *win = fvec((size_t)(nwin * hd + 8), 1.f), *cmp = fvec((size_t)(ncmp * hd + 8), 1.f);
+    float *sink = fvec((size_t)H + 2, 2.f), *ref = calloc((size_t)S * orow, 4), *sc = malloc((size_t)cnt * 4);
+    int *list = malloc((size_t)S * lrow * 4);
+    float *kvall = malloc((size_t)(nwin + ncmp) * hd * 4);
+    memcpy(kvall, win + 8, (size_t)nwin * hd * 4); memcpy(kvall + (size_t)nwin * hd, cmp + 8, (size_t)ncmp * hd * 4);
+    for (int s = 0; s < S; s++)
+        for (int j = 0; j < lrow; j++) {
+            int r = (int)(rnd() % 5);
+            list[s * lrow + j] = s == S - 1 && S > 1 ? -1                                     /* a row with nothing to read */
+                               : r == 0 ? -1 : r < 3 ? (int)(rnd() % (unsigned)nwin) : nwin + (int)(rnd() % (unsigned)ncmp);
+        }
+    for (int s = 0; s < S; s++)
+        for (int h = 0; h < H; h++) {
+            const float *qq = q + (size_t)s * qrow + 4 + h * hd;
+            float *o = ref + (size_t)s * orow + 4 + h * hd;
+            const int *idx = list + s * lrow + 2;
+            if (!(flags & 1)) { coli_sparse_attend_scalar(o, qq, kvall, idx, cnt, hd, sink[1 + h], 1.f / sqrtf((float)hd), sc); continue; }
+            float best = -1e30f;   /* DeepSeek V4's reference: w to bf16 before the value sum, the output to bf16 */
+            for (int j = 0; j < cnt; j++) {
+                if (idx[j] < 0) { sc[j] = -INFINITY; continue; }
+                float d = 0; for (int i = 0; i < hd; i++) d += qq[i] * kvall[(size_t)idx[j] * hd + i];
+                sc[j] = d * (1.f / sqrtf((float)hd)); if (sc[j] > best) best = sc[j];
+            }
+            float den = expf(sink[1 + h] - best);
+            for (int i = 0; i < hd; i++) o[i] = 0;
+            for (int j = 0; j < cnt; j++) {
+                if (idx[j] < 0) continue;
+                float w = expf(sc[j] - best); den += w; w = bf16r(w);
+                for (int i = 0; i < hd; i++) o[i] += w * kvall[(size_t)idx[j] * hd + i];
+            }
+            for (int i = 0; i < hd; i++) o[i] = bf16r(o[i] / den);
+        }
+    VkcBuf *qb = up(q, (size_t)S * qrow), *wb = up(win, (size_t)nwin * hd + 8), *cb = up(cmp, (size_t)ncmp * hd + 8);
+    VkcBuf *sb = up(sink, (size_t)H + 2), *ob = vkc_buf((size_t)S * orow * 4, VKC_DEV), *ob2 = vkc_buf((size_t)S * orow * 4, VKC_DEV);
+    VkcBuf *lb = vkc_buf((size_t)S * lrow * 4, VKC_DEV);
+    vkc_begin(); vkc_write(lb, 0, list, (size_t)S * lrow * 4); vkc_submit(1);
+    VkcDsAttn p = {S, H, hd, cnt, 2, lrow, nwin, 8, 8, 4, qrow, 4, orow, 1, flags, 1.f / sqrtf((float)hd)};
+    char arm_s[8]; snprintf(arm_s, sizeof arm_s, "%d", arm);
+    setenv("COLI_VK_CHAIN_ATTN_FA", arm_s, 1);
+    vkc_begin(); int ok = vkc_dsv4_attn(qb, wb, cb, lb, sb, ob, &p);
+    ok = ok && vkc_dsv4_attn(qb, wb, cb, lb, sb, ob2, &p);   /* the second run: the same bits */
+    vkc_submit(1);
+    unsetenv("COLI_VK_CHAIN_ATTN_FA");
+    float *got = down(ob, 0, (size_t)S * orow), *got2 = down(ob2, 0, (size_t)S * orow);
+    double e = 0; int bits = 1, zero = 1;
+    for (int s = 0; s < S; s++) { double r = relerr(got + (size_t)s * orow + 4, ref + (size_t)s * orow + 4, (size_t)H * hd, 1e-3); if (r > e) e = r; }
+    for (size_t i = 0; i < (size_t)S * orow; i++) bits &= got[i] == got2[i] || (isnan(got[i]) && isnan(got2[i]));
+    if (S > 1) for (int i = 0; i < H * hd; i++) zero &= got[(size_t)(S - 1) * orow + 4 + i] == 0.f;
+    double tol = (flags & 1) ? 8e-3 : 2e-3;
+    CHECK(ok && e < tol && bits && (S == 1 || zero) && !bad(got, (size_t)S * orow),
+          "dsv4 attn FA S %d H %d cnt %d flags %d arm %d: rel err %.2e%s", S, H, cnt, flags, arm, e, bits ? "" : ", UNSTABLE BITS");
+    printf("  dsv4 attn FA S %d H %d cnt %d flags %d arm %d: rel err %.2e\n", S, H, cnt, flags, arm, e);
+    vkc_free(qb); vkc_free(wb); vkc_free(cb); vkc_free(sb); vkc_free(ob); vkc_free(ob2); vkc_free(lb);
+    free(q); free(win); free(cmp); free(sink); free(ref); free(sc); free(list); free(kvall); free(got); free(got2);
 }
 
 /* deepseek_v41.c's rope_apply: interleaved pairs, forward and inverse, segments at a stride */
@@ -2431,6 +2607,129 @@ static void test_frames(void) {
     VkcStats st; vkc_stats(&st);
     CHECK(ok && e < 1e-5, "frames: err %.2e (%llu frames, %llu barriers)", e, st.frames, st.barriers);
     vkc_free(x); vkc_free(y); free(a); free(acc); free(got);
+}
+
+/* The decode attention cell's frame discipline (COLI_VK_CHAIN_ATTN_CELL, the chain's A1
+ * site): the cell frame (the one holding the attention and the h2d copy) is submitted,
+ * the next frame (the shared expert's A2) is recorded and submitted while the device
+ * still runs the cell, and the settle is the cell's own fence (vkc_wait_serial) -- the
+ * host then reads the cell's DOWN buffer with A2 still in flight, and the frame after
+ * it (the next layer's join) reads both sides. This is that structure on chain_ew, a
+ * CPU mirror of the three frames, and a frame-count check: a round is exactly three
+ * submissions whatever settles them. */
+static void test_cell_frames(void) {
+    int n = 700;
+    VkcBuf *x = vkc_buf((size_t)n * 4, VKC_DEV), *y = vkc_buf((size_t)n * 4, VKC_DEV);
+    VkcBuf *dx = vkc_buf((size_t)n * 4, VKC_DOWN), *j = vkc_buf((size_t)n * 4, VKC_DEV);
+    VkcEw add = {VKC_EW_ADD, n, n, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
+    float *a = fvec(n, 1.f), *cx = malloc((size_t)n * 4), *cy = malloc((size_t)n * 4);
+    int ok = a && cx && cy && x && y && dx && j;
+    for (int i = 0; ok && i < n; i++) { cx[i] = a[i]; cy[i] = a[i] * 0.5f; }
+    if (ok) ok = vkc_begin() && vkc_write(x, 0, cx, (size_t)n * 4) && vkc_write(y, 0, cy, (size_t)n * 4) && vkc_submit(1);
+    for (int r = 0; ok && r < 4; r++) {
+        VkcStats f0; vkc_stats(&f0);
+        /* F1, the cell: the attention's sum, then the h2d copy riding the same frame */
+        ok = vkc_begin() && vkc_ew(x, x, y, NULL, NULL, &add) && vkc_copy(dx, 0, x, 0, n) && vkc_submit(0);
+        for (int i = 0; i < n; i++) cx[i] += cy[i];
+        unsigned long long cell = ok ? vkc_serial() : 0;
+        /* F2, A2: recorded and submitted under the cell's run, reading what F1 wrote */
+        ok = ok && vkc_begin() && vkc_ew(y, y, x, NULL, NULL, &add) && vkc_submit(0);
+        for (int i = 0; i < n; i++) cy[i] += cx[i];
+        /* the cell's own fence: the h2d read with A2 still in flight */
+        ok = ok && vkc_wait_serial(cell);
+        const float *h2d = (const float *)vkc_ptr(dx);
+        double eh = 0;
+        for (int i = 0; i < n; i++) { double d = fabs((double)h2d[i] - cx[i]); if (d > eh) eh = d; }
+        CHECK(ok && eh == 0, "cell frames: the cell's h2d copy settles at its own fence (err %.2e)", eh);
+        /* F3, the join: reads both frames' outputs; the round's frames are three */
+        ok = vkc_begin() && vkc_ew(j, x, y, NULL, NULL, &add) && vkc_copy(x, 0, j, 0, n) && vkc_submit(1);
+        for (int i = 0; i < n; i++) cx[i] += cy[i];
+        VkcStats f1; vkc_stats(&f1);
+        CHECK(ok && f1.frames - f0.frames == 3, "cell frames: a round is three submissions (%llu)", f1.frames - f0.frames);
+        if (r == 3) {
+            float *join = down(x, 0, n);
+            CHECK(join && !bad(join, n), "cell frames: the join reads both sides finite");
+            free(join);
+        }
+    }
+    ok = ok && vkc_finish();
+    printf("  cell frames: 4 rounds x 3 frames, the cell's own fence settled with A2 in flight\n");
+    vkc_free(x); vkc_free(y); vkc_free(dx); vkc_free(j);
+    free(a); free(cx); free(cy);
+    CHECK(ok, "cell frames: every frame took");
+}
+
+/* COLI_VK_CHAIN_DPROF: the decode window (vkc_dwin) and the roles (vkc_role) as the
+ * engine stamps them -- frames submitted inside the window count once each by role,
+ * their fence waits with them, and the frames outside it count nowhere. The device
+ * split (d_dev_ms) needs COLI_VK_CHAIN_PROF's query pools, which this run does not
+ * arm: it only checks the counters that every leg reads regardless. */
+static void test_dprof(void) {
+    setenv("COLI_VK_CHAIN_DPROF", "1", 1);
+    int n = 256;
+    float *a = fvec(n, 1.f);
+    VkcBuf *x = vkc_buf((size_t)n * 4, VKC_DEV), *y = vkc_buf((size_t)n * 4, VKC_DEV);
+    VkcStats s0; vkc_stats(&s0);
+    int ok = vkc_dprof();
+    ok &= vkc_begin() && vkc_write(y, 0, a, (size_t)n * 4) && vkc_submit(1);   /* outside the window: counts nowhere */
+    vkc_dwin(1);                                    /* a decode forward opens the window */
+    vkc_role(VKC_R_A1);
+    ok &= vkc_begin() && vkc_write(y, 0, a, (size_t)n * 4) && vkc_submit(0) && vkc_finish();   /* A1, waited at the finish */
+    vkc_role(VKC_R_A2);
+    ok &= vkc_begin() && vkc_write(x, 0, a, (size_t)n * 4) && vkc_submit(1);                    /* A2, submit(1) waits it */
+    vkc_dwin(0);                                   /* the window closes: a prompt forward */
+    ok &= vkc_begin() && vkc_write(y, 0, a, (size_t)n * 4) && vkc_submit(1);   /* outside again */
+    VkcStats s1; vkc_stats(&s1);
+    CHECK(ok, "dprof: the frames ran");
+    CHECK(s1.d_fwd == s0.d_fwd + 1, "dprof: one window forward (%llu)", s1.d_fwd - s0.d_fwd);
+    CHECK(s1.d_frames == s0.d_frames + 2, "dprof: the window's two frames (%llu)", s1.d_frames - s0.d_frames);
+    CHECK(s1.d_wait_n >= s0.d_wait_n + 2, "dprof: the window's waits (%llu)", s1.d_wait_n - s0.d_wait_n);
+    CHECK(s1.d_wait_ms[VKC_R_A1] > s0.d_wait_ms[VKC_R_A1] && s1.d_wait_ms[VKC_R_A2] > s0.d_wait_ms[VKC_R_A2],
+          "dprof: both roles waited (A1 %.3f ms, A2 %.3f ms)",
+          s1.d_wait_ms[VKC_R_A1] - s0.d_wait_ms[VKC_R_A1], s1.d_wait_ms[VKC_R_A2] - s0.d_wait_ms[VKC_R_A2]);
+    CHECK(s1.d_wait_ms[VKC_R_OTHER] == s0.d_wait_ms[VKC_R_OTHER] && s1.d_wait_ms[VKC_R_DMOE] == s0.d_wait_ms[VKC_R_DMOE] &&
+          s1.d_wait_ms[VKC_R_TAIL] == s0.d_wait_ms[VKC_R_TAIL], "dprof: the unstamped roles stay empty");
+    CHECK(s1.d_submit_ms >= s0.d_submit_ms, "dprof: the submit time counts (%.3f ms)", s1.d_submit_ms - s0.d_submit_ms);
+    /* the prompt window (OB0's S0): vkc_dwin(2) opens one per chunk, vkc_dwin(0) closes it
+     * at the chunk's end, and the host timeline charges the window's wall to the role
+     * stamped when it ran -- the host-MoE step (MOEH) and the staging uploads (STAGE) stamp
+     * no frames, only wall; the dense frames stamp frames and waits as the decode window's
+     * do. The roles must tile the wall exactly and leave the decode counters alone. */
+    VkcStats s2; vkc_stats(&s2);
+    vkc_dwin(2);                                   /* a prompt chunk opens its own window (it closes the decode one) */
+    vkc_role(VKC_R_A1);
+    ok &= vkc_begin() && vkc_write(y, 0, a, (size_t)n * 4) && vkc_submit(0) && vkc_finish();   /* a dense frame, waited */
+    vkc_role(VKC_R_MOEH);                          /* the host's routed-expert step: wall, no frames */
+    for (volatile long i = 0; i < 4000000; i++) {}   /* a span the clock can see */
+    vkc_role(VKC_R_STAGE);                         /* the staging upload's frame */
+    ok &= vkc_begin() && vkc_write(x, 0, a, (size_t)n * 4) && vkc_submit(1);
+    vkc_dwin(0);                                   /* the chunk's end: the window closes */
+    ok &= vkc_begin() && vkc_write(y, 0, a, (size_t)n * 4) && vkc_submit(1);   /* outside again */
+    VkcStats s3; vkc_stats(&s3);
+    CHECK(ok, "dprof: the prompt frames ran");
+    CHECK(s3.p_fwd == s2.p_fwd + 1, "dprof: one prompt chunk window (%llu)", s3.p_fwd - s2.p_fwd);
+    CHECK(s3.p_frames == s2.p_frames + 2, "dprof: the window's two frames (%llu)", s3.p_frames - s2.p_frames);
+    CHECK(s3.p_wait_n >= s2.p_wait_n + 2, "dprof: the window's waits (%llu)", s3.p_wait_n - s2.p_wait_n);
+    CHECK(s3.p_wait_ms[VKC_R_A1] > s2.p_wait_ms[VKC_R_A1] && s3.p_wait_ms[VKC_R_STAGE] > s2.p_wait_ms[VKC_R_STAGE],
+          "dprof: the prompt roles waited (A1 %.3f ms, staging %.3f ms)",
+          s3.p_wait_ms[VKC_R_A1] - s2.p_wait_ms[VKC_R_A1], s3.p_wait_ms[VKC_R_STAGE] - s2.p_wait_ms[VKC_R_STAGE]);
+    CHECK(s3.p_host_ms[VKC_R_MOEH] - s2.p_host_ms[VKC_R_MOEH] > 0.1,
+          "dprof: the host-MoE span charges the wall (%.3f ms)", s3.p_host_ms[VKC_R_MOEH] - s2.p_host_ms[VKC_R_MOEH]);
+    CHECK(s3.p_host_ms[VKC_R_A1] > s2.p_host_ms[VKC_R_A1] && s3.p_host_ms[VKC_R_STAGE] > s2.p_host_ms[VKC_R_STAGE] &&
+          s3.p_host_ms[VKC_R_OTHER] == s2.p_host_ms[VKC_R_OTHER] && s3.p_host_ms[VKC_R_DMOE] == s2.p_host_ms[VKC_R_DMOE] &&
+          s3.p_host_ms[VKC_R_TAIL] == s2.p_host_ms[VKC_R_TAIL],
+          "dprof: the unstamped roles' host spans stay empty (A2 carries the window's head in, as designed: %.3f ms)",
+          s3.p_host_ms[VKC_R_A2] - s2.p_host_ms[VKC_R_A2]);
+    {   /* the roles tile the window's wall */
+        double hs = 0, wall = s3.p_wall_ms - s2.p_wall_ms;
+        for (int r = 0; r < VKC_R_N; r++) hs += s3.p_host_ms[r] - s2.p_host_ms[r];
+        CHECK(wall > 0 && hs > 0 && (hs - wall < 1e-3 && wall - hs < 1e-3),
+              "dprof: the host spans tile the wall (%.3f ms of %.3f ms)", hs, wall);
+    }
+    CHECK(s3.p_submit_ms >= s2.p_submit_ms, "dprof: the prompt submit time counts (%.3f ms)", s3.p_submit_ms - s2.p_submit_ms);
+    CHECK(s3.d_fwd == s2.d_fwd && s3.d_frames == s2.d_frames && s3.d_wait_n == s2.d_wait_n,
+          "dprof: the prompt window leaves the decode counters alone");
+    vkc_free(x); vkc_free(y); free(a);
 }
 
 /* ---- the KV cache split between the device and the host (chain_kvs, vk_kvsplit.h) --
@@ -3084,6 +3383,381 @@ static void bd_fix(int t, uint8_t *b) {
     }
     #undef F16AT
 }
+/* ---- mm8: the tiled weight-stationary fmt-12 GEMM (qmatmul_mm8.comp, COLI_VK_MM8) ----------
+ * The fp8 matrices' prompt rows on the tiled GEMM against a host fp64/e4m3 reference,
+ * and against the fmt-12 GEMV (qmatmul.spv) whose per-row bits the knob off keeps. The
+ * two kernels associate the same exact terms differently (the GEMV: a per-word fp32
+ * partial scaled per group, lanes striding the row, a subgroup tree; mm8: one fp32
+ * accumulator an output, k ascending), so the comparison against the GEMV is an
+ * observation, never a gate; the envelope against the fp64 reference is. The data is
+ * the production class: x values on the e4m3 grid, e4m3 weights, power-of-two scales
+ * (UE8M0-derived, one f32 a row a 128-input group). distinct scales make every (row,
+ * group) scale different, so a shader reading the fork's 128x128-blocked scale layout
+ * instead of the per-row per-group one cannot pass (mm8's port changed exactly that). */
+static float e4m3_val(uint8_t b) {   /* the CPU's E4M3_LUT semantics, as the shaders decode */
+    if ((b & 0x7f) == 0x7f) return NAN;
+    int e = (b >> 3) & 15, m = b & 7;
+    float v = e == 0 ? (float)m * 0.001953125f : ldexpf(1.0f + m * 0.125f, e - 7);
+    return (b & 0x80) ? -v : v;
+}
+static uint8_t e4m3_rnd(int emax) {  /* a random code, no NaN, exponent at most emax */
+    uint8_t b = (uint8_t)(rnd() & 0x7f);
+    if (b == 0x7f) b ^= 1;
+    if ((b >> 3) > emax) b = (uint8_t)((b & 0x07) | (uint8_t)((rnd() % (unsigned)(emax + 1)) << 3));
+    return b | (uint8_t)((rnd() & 1) << 7);
+}
+static double g_mm8_tol = 1e-4;   /* measured below on every shape: both kernels are pure fp32 sums of exact terms */
+static void test_mm8_case(int O, int I, int S, int distinct) {
+    int ng = (I + 127) / 128;
+    uint8_t *w = malloc((size_t)O * I);
+    float *sc = malloc((size_t)O * ng * sizeof(float));
+    for (size_t i = 0; i < (size_t)O * I; i++) w[i] = e4m3_rnd(10);
+    for (int o = 0; o < O; o++) for (int g = 0; g < ng; g++)
+        sc[o * ng + g] = ldexpf(1.f, -8 + (int)(distinct ? o + 3 * g : (int)rnd()) % 13);
+    float *x = malloc((size_t)S * I * sizeof(float));
+    for (size_t i = 0; i < (size_t)S * I; i++) x[i] = e4m3_val(e4m3_rnd(8));
+    ColiVkTensor *t = NULL;
+    if (!coli_vk_tensor_ensure(&t, w, sc, 12, I, O, 128)) {
+        CHECK(0, "mm8 %d x %d: the fmt-12 upload", O, I); free(w); free(sc); free(x); return;
+    }
+    float *ref = malloc((size_t)S * O * sizeof(float));   /* the fp64 sum, rounded once to f32 (a reference's own output rounding) */
+    for (int s = 0; s < S; s++) for (int o = 0; o < O; o++) {
+        double a = 0;
+        for (int i = 0; i < I; i++) a += (double)x[(size_t)s * I + i] * (e4m3_val(w[(size_t)o * I + i]) * sc[o * ng + i / 128]);
+        ref[(size_t)s * O + o] = (float)a;
+    }
+    VkcBuf *xb = vkc_buf((size_t)S * I * 4, VKC_DEV), *yb = vkc_buf((size_t)S * O * 4, VKC_DOWN);
+    vkc_begin(); vkc_write(xb, 0, x, (size_t)S * I * 4); vkc_submit(1);
+    float *yg = malloc((size_t)S * O * sizeof(float)), *ym = malloc((size_t)S * O * sizeof(float));
+    vkc_gemm_rows(0);   /* the rows policy of the engine's default: the fmt-12 GEMV below, not qmatmul_gemm */
+    vkc_mm8_set(0);   /* the knob off: the fmt-12 GEMV, today's bits */
+    vkc_begin(); int okg = vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
+    memcpy(yg, vkc_ptr(yb), (size_t)S * O * 4);
+    vkc_mm8_set(1);   /* the tiled GEMM, twice: run-to-run determinism */
+    VkcStats s0, s1; vkc_stats(&s0);   /* the dispatch must be counted: not the GEMV benchmarked twice */
+    vkc_begin(); int okm = vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
+    vkc_stats(&s1);
+    memcpy(ym, vkc_ptr(yb), (size_t)S * O * 4);
+    vkc_begin(); int okm2 = vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
+    int same = !memcmp(vkc_ptr(yb), ym, (size_t)S * O * 4);
+    vkc_mm8_set(0); vkc_gemm_rows(-1);
+    double em = relerr(ym, ref, (size_t)S * O, 1e-3);
+    double eg = relerr(yg, ref, (size_t)S * O, 1e-3);
+    double ev = relerr(ym, yg, (size_t)S * O, 1e-3);
+    CHECK(okg && okm && okm2 && s1.mm8 == s0.mm8 + 1 && em < g_mm8_tol && eg < g_mm8_tol &&
+          !bad(ym, (size_t)S * O) && same,
+          "mm8 %d x %d S %d%s: ok %d/%d/%d dispatches %llu err mm8 %.2e gemv %.2e mm8-vs-gemv %.2e%s",
+          O, I, S, distinct ? " (distinct scales)" : "", okg, okm, okm2, s1.mm8 - s0.mm8, em, eg, ev,
+          !memcmp(ym, yg, (size_t)S * O * 4) ? ", bitwise vs the GEMV" : "");
+    printf("  mm8 [%5d x %5d] S %3d%s: mm8-vs-ref %.2e, gemv-vs-ref %.2e, mm8-vs-gemv %.2e%s\n",
+           O, I, S, distinct ? " distinct-scales" : "", em, eg, ev,
+           !memcmp(ym, yg, (size_t)S * O * 4) ? ", bitwise" : "");
+    vkc_free(xb); vkc_free(yb); coli_vk_tensor_free(t);
+    free(w); free(sc); free(x); free(ref); free(yg); free(ym);
+}
+/* every tile of the table on one shape, byte-compared against the frozen F tile: each
+ * variant keeps ONE fp32 accumulator an output over the full K, k ascending (BK and
+ * NDBUF change the staging, never the FMA order -- the forced-NDBUF legs below run
+ * both staging modes), so the tiles must agree bit for bit
+ * -- qmatmul_mm8.comp's NUMERICS contract, asserted here instead of assumed. The
+ * distinct-scales shape: a wrong scale index lands on a different power-of-two scale,
+ * so no variant can pass by reading another tile's layout. */
+static void test_mm8_tiles(void) {
+    int O = 300, I = 320, S = 130, ng = (I + 127) / 128;
+    uint8_t *w = malloc((size_t)O * I);
+    float *sc = malloc((size_t)O * ng * sizeof(float));
+    for (size_t i = 0; i < (size_t)O * I; i++) w[i] = e4m3_rnd(10);
+    for (int o = 0; o < O; o++) for (int g = 0; g < ng; g++)
+        sc[o * ng + g] = ldexpf(1.f, -8 + (o + 3 * g) % 13);
+    float *x = malloc((size_t)S * I * sizeof(float));
+    for (size_t i = 0; i < (size_t)S * I; i++) x[i] = e4m3_val(e4m3_rnd(8));
+    ColiVkTensor *t = NULL;
+    if (!coli_vk_tensor_ensure(&t, w, sc, 12, I, O, 128)) {
+        CHECK(0, "mm8 tiles %d x %d: the fmt-12 upload", O, I); free(w); free(sc); free(x); return;
+    }
+    VkcBuf *xb = vkc_buf((size_t)S * I * 4, VKC_DEV), *yb = vkc_buf((size_t)S * O * 4, VKC_DOWN);
+    vkc_begin(); vkc_write(xb, 0, x, (size_t)S * I * 4); vkc_submit(1);
+    float *yf = malloc((size_t)S * O * sizeof(float)), *yv = malloc((size_t)S * O * sizeof(float));
+    vkc_gemm_rows(0); vkc_mm8_set(1);
+    VkcStats s0; vkc_stats(&s0);
+    int f = -1;   /* the frozen f tile by name: the bits every variant must return */
+    for (int v = 0; v < vkc_mm8_tile_count(); v++) if (!strcmp(vkc_mm8_tile_name(v), "f")) f = v;
+    vkc_mm8_set_tile(f);
+    vkc_begin(); int okf = f >= 0 && vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
+    memcpy(yf, vkc_ptr(yb), (size_t)S * O * 4);
+    int diff = 0, okall = okf;
+    for (int v = 0; v < vkc_mm8_tile_count(); v++) {   /* forced one by one, the bench's hook */
+        vkc_mm8_set_tile(v);
+        vkc_begin(); int ok = vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
+        memcpy(yv, vkc_ptr(yb), (size_t)S * O * 4);
+        if (ok && !memcmp(yv, yf, (size_t)S * O * 4)) continue;
+        if (ok) diff++; else okall = 0;
+        printf("  mm8 tile %-7s: %s the f tile's bits\n", vkc_mm8_tile_name(v),
+               ok ? "DIFFERS from" : "refused, not");
+    }
+    VkcStats s1; vkc_stats(&s1);
+    vkc_mm8_set(0); vkc_mm8_set_tile(-2); vkc_gemm_rows(-1);
+    CHECK(okall && okf && !diff && s1.mm8 == s0.mm8 + (unsigned long long)(vkc_mm8_tile_count() + 1),
+          "mm8 tiles: f ok %d, %d of %d variants differ, dispatches %llu",
+          okf, diff, vkc_mm8_tile_count(), s1.mm8 - s0.mm8);
+    printf("  mm8 tiles: %d variants, all bitwise the f tile, dispatches %llu\n",
+           vkc_mm8_tile_count(), s1.mm8 - s0.mm8);
+    /* forced NDBUF: the ping-pong staging (2) against the single buffer (0) on the F
+     * tile -- the same FMA order an accumulator either way, so the two must agree bit
+     * for bit; forced both ways because the auto pick is the device's shared-memory
+     * fit, not a choice the tile makes. The path the merged tree never ran (the host
+     * passed 1, which the shader reads as single-buffer). */
+    VkcStats s2; vkc_stats(&s2);
+    vkc_mm8_set(1); vkc_mm8_set_tile(f);
+    vkc_mm8_set_ndbuf(0);
+    vkc_begin(); int okn0 = f >= 0 && vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
+    memcpy(yv, vkc_ptr(yb), (size_t)S * O * 4);
+    vkc_mm8_set_ndbuf(2);
+    vkc_begin(); int okn2 = f >= 0 && vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
+    VkcStats s3; vkc_stats(&s3);
+    int samen = !memcmp(vkc_ptr(yb), yv, (size_t)S * O * 4);
+    vkc_mm8_set_ndbuf(-2); vkc_mm8_set(0); vkc_mm8_set_tile(-2); vkc_gemm_rows(-1);
+    CHECK(okn0 && okn2 && samen && s3.mm8 == s2.mm8 + 2,
+          "mm8 ndbuf: single-buffer ok %d, ping-pong ok %d, bitwise %d, dispatches %llu",
+          okn0, okn2, samen, s3.mm8 - s2.mm8);
+    printf("  mm8 ndbuf: forced ping-pong vs forced single buffer %s\n",
+           samen ? "bitwise equal" : "DIFFERS");
+    /* the env arm itself (mm8_ndbuf_auto's getenv parse, the path the forced pins above
+     * bypass): setenv 2 and drop the pipelines, so the next build reads the env, says its
+     * armed line and bakes the ping-pong; unset and dropped again, the build bakes the
+     * measured single buffer in silence. The observable is the baked spec constant -- the
+     * outputs are bitwise either way, the legs above -- and the f tile's doubled staging
+     * (26,112 B) fits the spec's 32 KiB shared-memory floor every conformant device has */
+    setenv("COLI_VK_CHAIN_MM8_NDBUF", "2", 1);
+    vkc_mm8_set_ndbuf(-2); vkc_mm8_set(1); vkc_mm8_set_tile(f);
+    vkc_begin(); int oke = f >= 0 && vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
+    CHECK(oke && vkc_mm8_ndbuf_baked() == 2,
+          "mm8 ndbuf env: COLI_VK_CHAIN_MM8_NDBUF=2 arms the ping-pong (baked %d)", vkc_mm8_ndbuf_baked());
+    unsetenv("COLI_VK_CHAIN_MM8_NDBUF");
+    vkc_mm8_set_ndbuf(-2);
+    vkc_begin(); int oku = f >= 0 && vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
+    CHECK(oku && vkc_mm8_ndbuf_baked() == 0,
+          "mm8 ndbuf env: unset bakes the measured single buffer (baked %d)", vkc_mm8_ndbuf_baked());
+    printf("  mm8 ndbuf: the env arm's builds baked 2 then 0\n");
+    vkc_mm8_set(0); vkc_mm8_set_tile(-2);
+        vkc_free(xb); vkc_free(yb); coli_vk_tensor_free(t);
+    free(w); free(sc); free(x); free(yf); free(yv);
+}
+/* the arm's gates and its default: what refuses (S < 2, I not a multiple of 64), what the
+ * rows policy does and does not govern, and the knob off leaving the dispatches alone */
+static void test_mm8_refusals(void) {
+    int I = 192, O = 64, ng = (I + 127) / 128;
+    uint8_t *w = malloc((size_t)O * I); float *sc = malloc((size_t)O * ng * sizeof(float));
+    for (size_t i = 0; i < (size_t)O * I; i++) w[i] = e4m3_rnd(10);
+    for (int i = 0; i < O * ng; i++) sc[i] = ldexpf(1.f, -(int)(i % 13));
+    ColiVkTensor *t = NULL;
+    int upt = coli_vk_tensor_ensure(&t, w, sc, 12, I, O, 128);
+    uint8_t *w2 = malloc((size_t)O * 100);   /* I a non-multiple of 64: never eligible */
+    ColiVkTensor *t2 = NULL;
+    int upt2 = coli_vk_tensor_ensure(&t2, w2, sc, 12, 100, O, 128);
+    float x[2 * 192];
+    for (size_t i = 0; i < sizeof x / sizeof *x; i++) x[i] = e4m3_val(e4m3_rnd(8));
+    VkcBuf *xb = up(x, 2 * 192), *yb = vkc_buf((size_t)2 * O * 4, VKC_DOWN);
+    VkcStats s0, s1;
+    vkc_stats(&s0);
+    if (upt) {   /* S = 1: the decode step's GEMV with the knob on */
+        vkc_mm8_set(1); vkc_begin(); int ok = vkc_matmul(t, xb, 0, yb, 0, 1); vkc_submit(1); vkc_mm8_set(0);
+        vkc_stats(&s1);
+        CHECK(ok && s1.mm8 == s0.mm8, "mm8: S 1 refused to the GEMV (dispatches %llu)", s1.mm8 - s0.mm8);
+    }
+    if (upt2) {  /* I = 100: no multiple of 64 */
+        VkcBuf *xb2 = up(x, 2 * 100), *yb2 = vkc_buf((size_t)2 * O * 4, VKC_DOWN);
+        vkc_mm8_set(1); vkc_begin(); int ok = vkc_matmul(t2, xb2, 0, yb2, 0, 2); vkc_submit(1); vkc_mm8_set(0);
+        vkc_stats(&s1);
+        CHECK(ok && s1.mm8 == s0.mm8, "mm8: I 100 refused to the GEMV (dispatches %llu)", s1.mm8 - s0.mm8);
+        vkc_free(xb2); vkc_free(yb2);
+    }
+    {   /* the knob off: an eligible S stays on the GEMV (the default's byte-for-byte) */
+        vkc_begin(); int ok = vkc_matmul(t, xb, 0, yb, 0, 2); vkc_submit(1);
+        vkc_stats(&s1);
+        CHECK(ok && s1.mm8 == s0.mm8, "mm8: the knob off left the GEMV (dispatches %llu)", s1.mm8 - s0.mm8);
+    }
+    {   /* vkc_gemm_rows(0) -- a verify's setting -- governs the qmatmul_gemm arm only:
+         * the mm8 knob still takes the tiled GEMM, the documented policy break */
+        vkc_gemm_rows(0); vkc_mm8_set(1);
+        vkc_begin(); int ok = vkc_matmul(t, xb, 0, yb, 0, 2); vkc_submit(1);
+        vkc_mm8_set(0); vkc_gemm_rows(-1);
+        vkc_stats(&s1);
+        CHECK(ok && s1.mm8 == s0.mm8 + 1, "mm8: the verify's rows take the tiled GEMM with the knob on");
+    }
+    {   /* COLI_VK_MM8=-1: the fill rule as the rows policy gates it, exactly the f32
+         * GEMM's take on the same shape (observed with the knob off) -- so a verify's
+         * pin (vkc_gemm_rows 0) keeps the rows on the GEMV, as the GEMM's own -1 does.
+         * The shape passes the rule itself: S 2 x O 2048 is the S*O >= 4096 floor */
+        int O3 = 2048;
+        uint8_t *w3 = malloc((size_t)O3 * I); float *sc3 = malloc((size_t)O3 * ng * sizeof(float));
+        for (size_t i = 0; i < (size_t)O3 * I; i++) w3[i] = e4m3_rnd(10);
+        for (int i = 0; i < O3 * ng; i++) sc3[i] = ldexpf(1.f, -(int)(i % 13));
+        ColiVkTensor *t3 = NULL;
+        int upt3 = coli_vk_tensor_ensure(&t3, w3, sc3, 12, I, O3, 128);
+        if (upt3) {
+            VkcBuf *xb3 = up(x, 2 * I), *yb3 = vkc_buf((size_t)2 * O3 * 4, VKC_DOWN);
+            VkcStats sa; vkc_stats(&sa);
+            vkc_gemm_rows(-1); vkc_mm8_set(0);
+            vkc_begin(); int okf = vkc_matmul(t3, xb3, 0, yb3, 0, 2); vkc_submit(1);
+            vkc_stats(&s1);
+            int fires = s1.gemms + s1.tile_gemms > sa.gemms + sa.tile_gemms;   /* the f32 GEMM's take */
+            vkc_mm8_set(-1);
+            vkc_begin(); int ok1 = vkc_matmul(t3, xb3, 0, yb3, 0, 2); vkc_submit(1);   /* the rule's choice */
+            vkc_stats(&s1);
+            CHECK(okf && ok1 && s1.mm8 == sa.mm8 + (fires ? 1 : 0),
+                  "mm8 -1: the fill rule took it where the f32 GEMM's own rule did");
+            vkc_gemm_rows(0);   /* a verify's pin: the GEMV, whatever the rule says */
+            vkc_begin(); int ok2 = vkc_matmul(t3, xb3, 0, yb3, 0, 2); vkc_submit(1);
+            vkc_stats(&s1);
+            CHECK(ok2 && s1.mm8 == sa.mm8 + (fires ? 1 : 0),
+                  "mm8 -1: a verify's rows pin kept the GEMV (dispatches %llu)", s1.mm8 - sa.mm8);
+            vkc_mm8_set(0); vkc_gemm_rows(-1);
+            printf("  mm8 -1: the fill rule %s, the rows pin kept the GEMV\n", fires ? "fires here" : "is off here");
+            vkc_free(xb3); vkc_free(yb3); coli_vk_tensor_free(t3);
+        }
+        free(w3); free(sc3);
+    }
+    if (upt) coli_vk_tensor_free(t);
+    if (upt2) coli_vk_tensor_free(t2);
+    vkc_free(xb); vkc_free(yb); free(w); free(w2); free(sc);
+}
+/* the split-K arm (COLI_VK_MM8_SPLITK): the K range cut into k chunks, the partial planes
+ * summed in ascending k. Deterministic run to run (byte-identical, no atomics), a
+ * reassociation class of the unsplit sum (an envelope, never bitwise); a count that
+ * breaks the partition invariant (I % k || (I/k) % 64 -- a chunk not a whole staged
+ * block would double-count its tail) refuses to the unsplit arm, BITWISE. The auto rule
+ * (unset) splits only a shape whose tiles cannot fill the device: the fill target 2048. */
+static void test_mm8_split_case(int O, int I, int S, int k, const char *what) {
+    int ng = (I + 127) / 128;
+    uint8_t *w = malloc((size_t)O * I);
+    float *sc = malloc((size_t)O * ng * sizeof(float));
+    for (size_t i = 0; i < (size_t)O * I; i++) w[i] = e4m3_rnd(10);
+    for (int i = 0; i < O * ng; i++) sc[i] = ldexpf(1.f, -(int)(i % 13));
+    float *x = malloc((size_t)S * I * sizeof(float));
+    for (size_t i = 0; i < (size_t)S * I; i++) x[i] = e4m3_val(e4m3_rnd(8));
+    ColiVkTensor *t = NULL;
+    if (!coli_vk_tensor_ensure(&t, w, sc, 12, I, O, 128)) {
+        CHECK(0, "mm8 split %d x %d: the fmt-12 upload", O, I); free(w); free(sc); free(x); return;
+    }
+    float *ref = malloc((size_t)S * O * sizeof(float));
+    for (int s = 0; s < S; s++) for (int o = 0; o < O; o++) {
+        double a = 0;
+        for (int i = 0; i < I; i++) a += (double)x[(size_t)s * I + i] * (e4m3_val(w[(size_t)o * I + i]) * sc[o * ng + i / 128]);
+        ref[(size_t)s * O + o] = (float)a;
+    }
+    VkcBuf *xb = up(x, (size_t)S * I), *yb = vkc_buf((size_t)S * O * 4, VKC_DOWN);
+    float *yu = malloc((size_t)S * O * sizeof(float)), *ys = malloc((size_t)S * O * sizeof(float));
+    vkc_gemm_rows(0); vkc_mm8_set(1);
+    vkc_mm8_set_splitk(0);   /* the unsplit arm, the bitwise baseline */
+    VkcStats s0; vkc_stats(&s0);
+    vkc_begin(); int oku = vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
+    memcpy(yu, vkc_ptr(yb), (size_t)S * O * 4);
+    vkc_mm8_set_splitk(k);
+    vkc_begin(); int oks = vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
+    memcpy(ys, vkc_ptr(yb), (size_t)S * O * 4);
+    vkc_begin(); int oks2 = vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
+    int same = !memcmp(vkc_ptr(yb), ys, (size_t)S * O * 4);
+    vkc_mm8_set(0); vkc_mm8_set_splitk(-1); vkc_gemm_rows(-1);
+    VkcStats s1; vkc_stats(&s1);
+    int nsplit = (int)(s1.mm8_split - s0.mm8_split);
+    int inv = I % k != 0 || (I / k) % 64 != 0;   /* a forced count the invariant refuses */
+    double es = relerr(ys, ref, (size_t)S * O, 1e-3);
+    double ev = relerr(ys, yu, (size_t)S * O, 1e-3);
+    CHECK(oku && oks && oks2 && same && !bad(ys, (size_t)S * O) && es < g_mm8_tol &&
+          (inv ? nsplit == 0 && !memcmp(ys, yu, (size_t)S * O * 4)
+               : nsplit == 2 && ev < g_mm8_tol),
+          "mm8 split %d x %d S %d k %d%s: ok %d/%d/%d splits %d err ref %.2e vs unsplit %.2e%s",
+          O, I, S, k, what, oku, oks, oks2, nsplit, es, ev,
+          inv ? ", refused bitwise" : !memcmp(ys, yu, (size_t)S * O * 4) ? ", bitwise vs unsplit" : "");
+    printf("  mm8 split [%5d x %5d] S %3d k %2d%s: vs ref %.2e, vs unsplit %.2e%s\n",
+           O, I, S, k, inv ? " (invalid, refused)" : "", es, ev,
+           !memcmp(ys, yu, (size_t)S * O * 4) ? ", bitwise" : "");
+    vkc_free(xb); vkc_free(yb); coli_vk_tensor_free(t);
+    free(w); free(sc); free(x); free(ref); free(yu); free(ys);
+}
+static void test_mm8_split(void) {
+    /* wkv and wo_b, the shapes the fork split for: small O starves the M tiles */
+    test_mm8_split_case(512, 4096, 8, 8, "");
+    test_mm8_split_case(512, 4096, 8, 2, "");
+    test_mm8_split_case(4096, 8192, 2, 4, "");
+    test_mm8_split_case(4096, 8192, 2, 8, "");
+    /* counts the partition invariant refuses: not a divisor, or a chunk not a whole
+     * 64 (I 4096 k 3 or 7; I 320 k 2, chunk 160): bitwise the unsplit arm */
+    test_mm8_split_case(512, 4096, 8, 3, "");
+    test_mm8_split_case(512, 4096, 8, 7, "");
+    test_mm8_split_case(300, 320, 130, 2, "");
+    /* the auto rule (the knob back to unset): a starved shape splits, a filled one does not */
+    {   /* 512 x 4096 S 8: 16 M-tiles x 1 S-tile -- k 8; 32768 x 1024 S 128: 1024 x 2 -- unsplit */
+        int k1 = vkc_mm8_splitk_choose(8, 4096, 512), k2 = vkc_mm8_splitk_choose(128, 1024, 32768);
+        CHECK(k1 == 8 && k2 == 1, "mm8 split auto: wkv k %d (8), wq_b k %d (1)", k1, k2);
+        printf("  mm8 split auto: 512 x 4096 S 8 -> k %d, 32768 x 1024 S 128 -> k %d\n", k1, k2);
+    }
+    test_mm8_split_case(512, 4096, 8, -1, " (auto)");
+}
+/* COLI_VK_CHAIN_BENCH=mm8: the tiled weight-stationary GEMM over the fork's six real
+ * projection shapes (O x I), every tile of the table, split-K (the auto rule) against
+ * the unsplit arm, in GMAC/s of S*O*I MACs a dispatch (the best of 5; the fmt-12 GEMV
+ * the knob off keeps as the first line). COLI_VK_BENCH_S overrides the rows (128). */
+static void bench_mm8(void) {
+    static const int shapes[6][2] = {{32768, 1024}, {4096, 8192}, {1024, 4096}, {512, 4096}, {2048, 4096}, {4096, 2048}};
+    const char *se = getenv("COLI_VK_BENCH_S");
+    int S = se && atoi(se) > 0 ? atoi(se) : 128;
+    for (int k = 0; k < 6; k++) {
+        int O = shapes[k][0], I = shapes[k][1], ng = (I + 127) / 128;
+        uint8_t *w = malloc((size_t)O * I); float *sc = malloc((size_t)O * ng * sizeof(float));
+        for (size_t i = 0; i < (size_t)O * I; i++) w[i] = e4m3_rnd(10);
+        for (int i = 0; i < O * ng; i++) sc[i] = ldexpf(1.f, -(int)(i % 13));
+        ColiVkTensor *t = NULL;
+        if (!coli_vk_tensor_ensure(&t, w, sc, 12, I, O, 128)) {
+            printf("bench mm8 [%d x %d]: the fmt-12 upload refused\n", O, I); free(w); free(sc); continue;
+        }
+        float *x = malloc((size_t)S * I * sizeof(float));
+        for (size_t i = 0; i < (size_t)S * I; i++) x[i] = e4m3_val(e4m3_rnd(8));
+        VkcBuf *xb = up(x, (size_t)S * I), *yb = vkc_buf((size_t)S * O * 4, VKC_DOWN);
+        double macs = (double)S * O * I / 1e9;   /* GMACs a dispatch */
+        vkc_gemm_rows(0);   /* the engine's default: every row on the GEMV */
+        double best = 1e9;
+        for (int r = 0; r < 6 && xb && yb; r++) {
+            vkc_begin(); vkc_matmul(t, xb, 0, yb, 0, S); double t0 = bnow(); vkc_submit(1); double dt = bnow() - t0;
+            if (dt < best) best = dt;
+        }
+        printf("bench mm8 [%5d x %5d] S %3d: GEMV %8.1f GMAC/s", O, I, S, macs / best);
+        vkc_mm8_set(1);
+        for (int v = 0; v < vkc_mm8_tile_count(); v++) {
+            vkc_mm8_set_tile(v);
+            double bu = 1e9, bs = 1e9;
+            for (int r = 0; r < 6 && xb && yb; r++) {
+                vkc_mm8_set_splitk(0);   /* unsplit */
+                vkc_begin(); vkc_matmul(t, xb, 0, yb, 0, S); double t0 = bnow(); vkc_submit(1); double dt = bnow() - t0;
+                if (dt < bu) bu = dt;
+            }
+            for (int r = 0; r < 6 && xb && yb; r++) {
+                vkc_mm8_set_splitk(-1);   /* the auto rule */
+                vkc_begin(); vkc_matmul(t, xb, 0, yb, 0, S); double t0 = bnow(); vkc_submit(1); double dt = bnow() - t0;
+                if (dt < bs) bs = dt;
+            }
+            printf("\n  %-7s %8.1f unsplit, %8.1f split k %d", vkc_mm8_tile_name(v), macs / bu, macs / bs,
+                   vkc_mm8_splitk_choose(S, I, O));
+        }
+        printf("\n");
+        vkc_mm8_set(0); vkc_mm8_set_tile(-2); vkc_mm8_set_splitk(-1); vkc_gemm_rows(-1);
+        vkc_free(xb); vkc_free(yb); coli_vk_tensor_free(t);
+        free(w); free(sc); free(x);
+    }
+}
+static void test_mm8(void) {
+    /* the fork's six real projection shapes (O x I) at the chunk rows the chain
+     * dispatches them with */
+    static const int shapes[6][2] = {{32768, 1024}, {4096, 8192}, {1024, 4096}, {512, 4096}, {2048, 4096}, {4096, 2048}};
+    static const int Ss[4] = {2, 8, 64, 128};
+    for (int k = 0; k < 6; k++) for (int j = 0; j < 4; j++) test_mm8_case(shapes[k][0], shapes[k][1], Ss[j], 0);
+    /* rows past a tile's BN (128) and a partial group column tail (I = 320 = 2x128 + 64) */
+    test_mm8_case(300, 320, 130, 1);
+    test_mm8_tiles();
+    test_mm8_refusals();
+    test_mm8_split();
+}
 /* vkc_moe_rows (a prompt chunk's routed experts on the device) against vkc_moe (chain_moe,
  * whose block path the GGUF gates hold to the CPU's): S rows of K experts of E, the experts
  * random blocks of gate/up type tg and down type td with sane scale fields, the same route */
@@ -3161,12 +3835,13 @@ done:
     free(t); free(ex); free(tab); free(wg); free(wu); free(wd);
 }
 /* The same for our own formats (qmatmul_grp_q.comp): int8 rows (fmt 1), int4 rows (2), int4
- * with a scale per gs inputs (4), against chain_moe's float form of the same experts */
+ * with a scale per gs inputs (4), and MXFP4 (7, qmatmul_grp_mx.comp: e2m1 nibbles, a float
+ * scale a gs-input group), against chain_moe's float form of the same experts */
 static void test_moe_rows_q(int fmt, int gs, int S, int K, int E, int D, int I) {
     if (!vkc_moe_rows_ready(fmt, fmt)) { printf("moe rows fmt %d: not on this device\n", fmt); return; }
     if (!coli_vk_xb_init(D, I, COLI_VK_ACT_SWIGLU, 0, 0, 0)) { CHECK(0, "moe rows fmt %d: the expert batch did not start", fmt); return; }
     size_t rg = fmt == 1 ? (size_t)D : (size_t)D / 2, rd = fmt == 1 ? (size_t)I : (size_t)I / 2;
-    size_t ng = fmt == 4 ? (size_t)D / gs : 1, nd = fmt == 4 ? (size_t)I / gs : 1;
+    size_t ng = (fmt == 4 || fmt == 7) ? (size_t)D / gs : 1, nd = (fmt == 4 || fmt == 7) ? (size_t)I / gs : 1;
     uint8_t *wg = malloc(rg * I), *wu = malloc(rg * I), *wd = malloc(rd * D);
     float *sg = malloc((size_t)I * ng * 4), *su = malloc((size_t)I * ng * 4), *sd = malloc((size_t)D * nd * 4);
     ColiVkTensor **t = calloc((size_t)3 * E, sizeof *t);
@@ -3178,7 +3853,7 @@ static void test_moe_rows_q(int fmt, int gs, int S, int K, int E, int D, int I) 
         for (size_t i = 0; i < rd * D; i++) wd[i] = (uint8_t)rnd();
         for (size_t i = 0; i < (size_t)I * ng; i++) { sg[i] = 0.002f + 0.002f * (rnd() & 255) / 255.f; su[i] = 0.002f + 0.002f * (rnd() & 255) / 255.f; }
         for (size_t i = 0; i < (size_t)D * nd; i++) sd[i] = 0.002f + 0.002f * (rnd() & 255) / 255.f;
-        int g = fmt == 4 ? gs : 0;
+        int g = (fmt == 4 || fmt == 7) ? gs : 0;
         ok = coli_vk_tensor_ensure(&t[3 * e], wg, sg, fmt, D, I, g) && coli_vk_tensor_ensure(&t[3 * e + 1], wu, su, fmt, D, I, g) &&
              coli_vk_tensor_ensure(&t[3 * e + 2], wd, sd, fmt, I, D, g) && (ex[e] = coli_vk_xb_expert(t[3 * e], t[3 * e + 1], t[3 * e + 2])) &&
              coli_vk_xb_expert_entry(ex[e], tab + (size_t)e * COLI_VK_XB_ENTRY);
@@ -3220,6 +3895,129 @@ done:
         else for (int k = 0; k < 3; k++) if (t[3 * e + k]) coli_vk_tensor_free(t[3 * e + k]);
     }
     free(t); free(ex); free(tab); free(wg); free(wu); free(wd); free(sg); free(su); free(sd);
+}
+/* COLI_VK_DMOE_ROWS_MAX's split (vk_dmoe.h's vkc_dmoe_layer big branch, the unit seam):
+ * the same S rows, the same route and experts, computed (a) in one vkc_moe_rows call and
+ * (b) in R-row groups -- each group routing its own rows and computing them into its own
+ * slice of y, vkc_submit(0) + vkc_begin between the groups, exactly what the lever's
+ * frame split records -- must give the same y bit for bit (a row's experts and their sums
+ * are the row's own; only the submission boundaries move), and the split must actually
+ * submit once a group. */
+static void test_moe_rows_split(int fmt, int gs, int S, int R, int K, int E, int D, int I) {
+    if (!vkc_moe_rows_ready(fmt, fmt)) { printf("moe rows split fmt %d: not on this device\n", fmt); return; }
+    if (!coli_vk_xb_init(D, I, COLI_VK_ACT_SWIGLU, 0, 0, 0)) { CHECK(0, "moe rows split: the expert batch did not start"); return; }
+    size_t rg = fmt == 1 ? (size_t)D : (size_t)D / 2, rd = fmt == 1 ? (size_t)I : (size_t)I / 2;
+    size_t ng = (fmt == 4 || fmt == 7) ? (size_t)D / gs : 1, nd = (fmt == 4 || fmt == 7) ? (size_t)I / gs : 1;
+    uint8_t *wg = malloc(rg * I), *wu = malloc(rg * I), *wd = malloc(rd * D);
+    float *sg = malloc((size_t)I * ng * 4), *su = malloc((size_t)I * ng * 4), *sd = malloc((size_t)D * nd * 4);
+    ColiVkTensor **t = calloc((size_t)3 * E, sizeof *t);
+    ColiVkExpert **ex = calloc((size_t)E, sizeof *ex);
+    uint32_t *tab = calloc((size_t)E * COLI_VK_XB_ENTRY, 4);
+    int ok = wg && wu && wd && sg && su && sd && t && ex && tab;
+    for (int e = 0; e < E && ok; e++) {
+        for (size_t i = 0; i < rg * I; i++) { wg[i] = (uint8_t)rnd(); wu[i] = (uint8_t)rnd(); }
+        for (size_t i = 0; i < rd * D; i++) wd[i] = (uint8_t)rnd();
+        for (size_t i = 0; i < (size_t)I * ng; i++) { sg[i] = 0.002f + 0.002f * (rnd() & 255) / 255.f; su[i] = 0.002f + 0.002f * (rnd() & 255) / 255.f; }
+        for (size_t i = 0; i < (size_t)D * nd; i++) sd[i] = 0.002f + 0.002f * (rnd() & 255) / 255.f;
+        int g = (fmt == 4 || fmt == 7) ? gs : 0;
+        ok = coli_vk_tensor_ensure(&t[3 * e], wg, sg, fmt, D, I, g) && coli_vk_tensor_ensure(&t[3 * e + 1], wu, su, fmt, D, I, g) &&
+             coli_vk_tensor_ensure(&t[3 * e + 2], wd, sd, fmt, I, D, g) && (ex[e] = coli_vk_xb_expert(t[3 * e], t[3 * e + 1], t[3 * e + 2])) &&
+             coli_vk_xb_expert_entry(ex[e], tab + (size_t)e * COLI_VK_XB_ENTRY);
+    }
+    if (!ok) { CHECK(0, "moe rows split fmt %d: the experts did not go up", fmt); goto done; }
+    {
+        float *lg = fvec((size_t)S * E, 2.f), *x = fvec((size_t)S * D, .1f);
+        VkcBuf *lb = up(lg, (size_t)S * E), *xb = up(x, (size_t)S * D), *tb = vkc_buf((size_t)E * COLI_VK_XB_ENTRY * 4, VKC_DEV);
+        VkcBuf *ib = vkc_buf((size_t)S * K * 4, VKC_DOWN), *wb = vkc_buf((size_t)S * K * 4, VKC_DEV);
+        VkcBuf *y0 = vkc_buf((size_t)S * D * 4, VKC_DOWN), *y1 = vkc_buf((size_t)S * D * 4, VKC_DOWN);
+        VkcRoute rp = {S, E, K, 0, 0, E, 0, 0, 0, K, 0, K, 1, 1, 1, 1.f, 1.f, 0.f};
+        VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, 0, 0, fmt, fmt, E, 0, 0};
+        VkcMoeRows rr = {0};
+        VkcStats s0, s1; vkc_stats(&s0);
+        ok = vkc_begin() && vkc_write(tb, 0, tab, (size_t)E * COLI_VK_XB_ENTRY * 4) && vkc_route(lb, NULL, ib, wb, &rp) &&
+             vkc_moe_rows(xb, ib, wb, tb, &rr, y0, &mp) && vkc_submit(1);
+        CHECK(ok, "moe rows split fmt %d S %d: the unsplit frame failed", fmt, S);
+        vkc_stats(&s0);
+        int groups = (S + R - 1) / R, ok2 = vkc_begin(), first = 1;   /* the engine's caller holds the frame open; the unit opens its own */
+        for (int off = 0; off < S && ok2; first = 0, off += R) {   /* the lever's own loop: a frame a group */
+            int gn = S - off < R ? S - off : R;
+            VkcRoute rgl = rp; VkcMoe mgl = mp;
+            rgl.S = gn; rgl.l_off = off * E; rgl.i_off = off * K; rgl.w_off = off * K;
+            mgl.S = gn; mgl.x_off = off * D; mgl.i_off = off * K; mgl.w_off = off * K; mgl.y_off = off * D;
+            if (!first && !(vkc_submit(0) && vkc_begin())) ok2 = 0;
+            if (ok2 && !vkc_route(lb, NULL, ib, wb, &rgl)) ok2 = 0;
+            if (ok2 && !vkc_moe_rows(xb, ib, wb, tb, &rr, y1, &mgl)) ok2 = 0;
+        }
+        if (ok2 && !vkc_submit(1)) ok2 = 0;
+        vkc_stats(&s1);
+        CHECK(ok2, "moe rows split fmt %d S %d R %d: the split frames failed", fmt, S, R);
+        if (ok && ok2) {
+            const float *a = vkc_ptr(y0), *b = vkc_ptr(y1);
+            int same = memcmp(a, b, (size_t)S * D * 4) == 0;
+            CHECK(same, "moe rows split fmt %d S %d R %d: the split's y differs from the unsplit's", fmt, S, R);
+            printf("moe rows split fmt %d gs %d S %d R %d K %d E %d: %d groups, %llu frames, y %s the unsplit's\n",
+                   fmt, gs, S, R, K, E, groups, s1.frames - s0.frames, same ? "bit-identical to" : "DIFFERS from");
+        }
+        vkc_moe_rows_free(&rr);
+        VkcBuf *fr[] = {lb, xb, tb, ib, wb, y0, y1};
+        for (size_t k = 0; k < sizeof fr / sizeof *fr; k++) if (fr[k]) vkc_free(fr[k]);
+        free(lg); free(x);
+    }
+done:
+    for (int e = 0; e < E && t && ex; e++) {
+        if (ex[e]) coli_vk_xb_expert_free(ex[e]);
+        else for (int k = 0; k < 3; k++) if (t[3 * e + k]) coli_vk_tensor_free(t[3 * e + k]);
+    }
+    free(t); free(ex); free(tab); free(wg); free(wu); free(wd); free(sg); free(su); free(sd);
+}
+/* DeepSeek V4's router (deepseek_v4.c's route_bf16_impl) against chain_route.comp's kind 2:
+ * score = sqrt(softplus(logit)), the bias added for the pick only, the K best picks with
+ * the lower expert on a tie, w = score / total * routed_scaling_factor. The ids exactly
+ * (ties included), the weights to 1e-6 rel: the shader's softplus rounds log(1 + exp(v)),
+ * the host's log1p(exp(-|v|)) — the same value's last bits */
+static void route_bf16_ref(const float *lg, const float *bias, int E, int K, float scale, int *ids, float *w) {
+    float sc[1024], sel[1024];
+    unsigned char taken[1024]; memset(taken, 0, (size_t)E);
+    for (int e = 0; e < E; e++) {
+        float v = lg[e];
+        sc[e] = sqrtf(fmaxf(v, 0.f) + log1pf(expf(-fabsf(v))));
+        sel[e] = sc[e] + bias[e];
+    }
+    for (int k = 0; k < K; k++) {
+        int best = -1;
+        for (int e = 0; e < E; e++)
+            if (!taken[e] && (best < 0 || sel[e] > sel[best])) best = e;
+        ids[k] = best; taken[best] = 1;
+    }
+    float total = 0.f;
+    for (int k = 0; k < K; k++) total += sc[ids[k]];
+    for (int k = 0; k < K; k++) w[k] = sc[ids[k]] / total * scale;
+}
+static void test_route_bf16(int S, int E, int K, float scale, int ties) {
+    int lrow = E + 3, irow = K + 2, wrow = K + 1;
+    float *lg = fvec((size_t)S * lrow, 4.f), *bias = fvec((size_t)E + 5, 0.3f);
+    if (ties) for (size_t i = 0; i < (size_t)S * lrow; i++) lg[i] = 0.5f;
+    if (ties) for (int e = 0; e < E; e++) bias[e] = 0.25f;   /* equal picks: the tie order */
+    int *rid = malloc((size_t)S * K * sizeof(int)); float *rw = malloc((size_t)S * K * sizeof(float));
+    for (int s = 0; s < S; s++)
+        route_bf16_ref(lg + (size_t)s * lrow + 1, bias + 2, E, K, scale, rid + (size_t)s * K, rw + (size_t)s * K);
+    VkcBuf *lb = up(lg, (size_t)S * lrow), *bb = up(bias, (size_t)E + 5);
+    VkcBuf *ib = vkc_buf((size_t)(S * irow + 4) * 4, VKC_DEV), *wb = vkc_buf((size_t)(S * wrow + 4) * 4, VKC_DEV);
+    VkcRoute rp = {S, E, K, 2, 1, lrow, 2, 1, 3, irow, 1, wrow, 1, 1, 1, 1.f, scale, 0.f};
+    int ok = vkc_begin() && vkc_route(lb, bb, ib, wb, &rp) && vkc_submit(1);
+    float *gi = down(ib, 3, (size_t)S * irow), *gw = down(wb, 1, (size_t)S * wrow);
+    int same = 1; double worst = 0;
+    for (int s = 0; s < S; s++) for (int k = 0; k < K; k++) {
+        int id; memcpy(&id, &gi[(size_t)s * irow + k], 4);
+        same &= id == rid[(size_t)s * K + k];
+        double r = rw[(size_t)s * K + k], g = gw[(size_t)s * wrow + k], d = fabs(g - r) / fabs(r);
+        if (d > worst) worst = d;
+    }
+    CHECK(ok && same && worst < 1e-6, "route bf16%s (S %d E %d K %d): ok %d, ids %s, weights off by %.2e",
+          ties ? " ties" : "", S, E, K, ok, same ? "the CPU's" : "DIFFER", worst);
+    if (getenv("VKC_TEST_VERBOSE")) printf("route bf16%s: weights %.2e\n", ties ? " ties" : "", worst);
+    vkc_free(lb); vkc_free(bb); vkc_free(ib); vkc_free(wb);
+    free(lg); free(bias); free(rid); free(rw); free(gi); free(gw);
 }
 /* A GGUF's experts in the CPU's integer form (chain_moe_i8: vkc_moe_set_idot(1)) against
  * the CPU's own: each input row quantized as gq_quant_act_ref does it, each expert row
@@ -4070,6 +4868,7 @@ int main(int argc, char **argv) {
     }
     if (!coli_vk_init(spv)) { printf("FAIL: no Vulkan device (shaders %s)\n", spv); return 1; }
     if (!vkc_init()) { printf("FAIL: the chain's pipelines did not come up\n"); return 1; }
+    test_dmoe_parse();   /* COLI_VK_DMOE's parse (vk_dmoe.h): no device needed */
     if (getenv("COLI_VK_CHAIN_BENCH")) {
         if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "bd")) bench_bd();
         if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "small")) bench_small();
@@ -4081,6 +4880,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "rows")) bench_rows();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "kda")) bench_kda();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "route")) bench_route();
+        else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "mm8")) bench_mm8();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "adec")) bench_adec();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "disp")) bench_disp();
         else bench_gemv();
@@ -4129,6 +4929,7 @@ int main(int argc, char **argv) {
         VkcStats s1; vkc_stats(&s1);
         printf("  prompt GEMMs on chain_gemm: %llu\n", s1.tile_gemms - s0.tile_gemms);
     }
+    test_mm8();
     printf("matmul done\n");
     test_norm(VKC_NORM_ADD1, 0); test_norm(VKC_NORM_ADD1, 1); test_norm(0, 0); test_norm(VKC_NORM_NOW, 1); test_norm(VKC_NORM_L2 | VKC_NORM_NOW, 0);
     printf("norm done\n");
@@ -4276,6 +5077,8 @@ int main(int argc, char **argv) {
     test_qsa();
     test_ple();
     test_frames();
+    test_cell_frames();   /* the decode attention cell's discipline (COLI_VK_CHAIN_ATTN_CELL) */
+    test_dprof();
     if (!vkc_mla_ready()) { fails++; printf("FAIL: the MLA shaders did not load\n"); }
     else {
         int hf[9] = {1, 2, 4, 5, 7, 10, 11, 12, 13};
@@ -4347,6 +5150,10 @@ int main(int argc, char **argv) {
         printf("kda done\n");
         test_mhc(2, 64, 3); test_mhc(4, 96, 20); test_mhc(3, 40, 1);
         printf("mhc done\n");
+        /* the S=1 fused pair against the standing chain (COLI_VK_CHAIN_MHC_S1): the
+         * model's geometry, the tiny's, the widest streams */
+        test_mhc_dec(4, 4096, 20); test_mhc_dec(2, 128, 3); test_mhc_dec(8, 2048, 1);
+        printf("mhc dec done\n");
         test_kda_k3(2, 16, 4, 1.f); test_kda_k3(3, 32, 4, 1.f); test_kda_k3(2, 128, 4, 1.f); test_kda_k3(1, 64, 2, 1.f);
         test_kda_k3(2, 16, 4, 0.002f);
         printf("kda k3 done\n");
@@ -4371,6 +5178,14 @@ int main(int argc, char **argv) {
         test_route("kimi sigmoid top-16 of 896", 3, 896, 16, 1, 1, 1, 1, 1, 1.f, 2.827f, 0.f, 0);
         test_route("deepseek sqrt(softplus)", 5, 256, 6, 2, 1, 1, 1, 2, 1.3f, 1.5f, 1e-20f, 0);
         test_route("deepseek K = 1 (no norm)", 2, 256, 1, 2, 1, 1, 1, 2, 1.f, 1.5f, 1e-20f, 0);
+        /* V4's own form of it (route_bf16_impl): norm 1, no eps, the routed scaling factor */
+        test_route_bf16(7, 256, 6, 2.5f, 0);
+        test_route_bf16(2, 64, 4, 1.f, 1);
+        /* and the same shape through the generic harness (COLI_VK_DMOE's arm,
+         * route_bf16_impl's parameters): sqrt(softplus), the bias for the pick only,
+         * norm 1 with no eps, temp 1 */
+        test_route("deepseek v4 sqrt(softplus), bias pick, norm 1", 6, 256, 6, 2, 1, 1, 1, 1, 1.f, 2.5f, 0.f, 0);
+        test_route("deepseek v4, ties to the lower expert", 4, 256, 6, 2, 1, 1, 1, 1, 1.f, 2.5f, 0.f, 1);
         test_route("1024 experts, top-32", 2, 1024, 32, 0, 0, 1, 1, 1, 1.f, 1.f, 0.f, 0);
         test_route("896 experts, top-32, bias", 3, 896, 32, 1, 1, 1, 1, 1, 1.f, 2.5f, 0.f, 0);
         test_route("fewer kept experts than K", 2, 64, 32, 0, 0, 8, 2, 1, 1.f, 1.f, 0.f, 0);
@@ -4443,6 +5258,14 @@ int main(int argc, char **argv) {
         test_moe_rows_q(2, 0, 40, 4, 12, 512, 256);
         test_moe_rows_q(4, 64, 40, 4, 12, 512, 256);
         test_moe_rows_q(4, 32, 7, 2, 6, 256, 256);
+        /* and MXFP4 (fmt 7, gs 32): the mx pipelines' rows against chain_moe's float form */
+        test_moe_rows_q(7, 32, 40, 4, 12, 512, 256);
+        test_moe_rows_q(7, 32, 7, 2, 6, 256, 256);
+        /* the frame split at equal rows: the armed path's own format (fmt 7), groups that
+         * divide S, one that does not, and a group size above S (one group) */
+        test_moe_rows_split(7, 32, 40, 16, 4, 12, 512, 256);
+        test_moe_rows_split(7, 32, 40, 7, 4, 12, 512, 256);
+        test_moe_rows_split(7, 32, 7, 64, 2, 6, 256, 256);
         /* the integer form, every type it decodes, against the CPU's */
         test_moe_i8(GQ_IQ2_S, GQ_Q2_0, 3, 4, 12, 512, 256);
         test_moe_i8(GQ_Q4_K, GQ_Q6_K, 2, 4, 12, 512, 256);
@@ -4471,8 +5294,28 @@ int main(int argc, char **argv) {
     else CHECK(0, "inkling's ops: chain_sconv.spv or chain_relattn.spv did not load");
     if (!vkc_dsv4_ready()) { fails++; printf("FAIL: the DeepSeek V4 shader did not load\n"); }
     else {
+        /* gap-wave4: the mode-0 reference legs pin COLI_VK_CHAIN_ATTN_FA=0 -- the
+         * default arms the tile, and these legs' shapes all refuse it (head dim, head
+         * count, unaligned offsets), so they ran mode 0 by accident of shape; the pin
+         * makes the reference the construction, not the gate's side effect */
+        setenv("COLI_VK_CHAIN_ATTN_FA", "0", 1);
         test_ds_attn(1, 4, 64, 8, 5, 13, 0); test_ds_attn(3, 2, 512, 128, 40, 300, 0); test_ds_attn(2, 3, 100, 6, 9, 20, 0);
         test_ds_attn(2, 2, 64, 8, 12, 2900, 0); test_ds_attn(3, 4, 64, 8, 5, 13, 1);
+        unsetenv("COLI_VK_CHAIN_ATTN_FA");
+        {   /* the flash tile's oracle (COLI_VK_CHAIN_ATTN_FA), the stream kept for the rest */
+            unsigned keep = rng;
+            VkcStats s0; vkc_stats(&s0);
+            test_ds_attn_fa(1, 8, 128, 64, 640, 1, 1);      /* the decode twin + the f16 mirror, the model's list shape */
+            test_ds_attn_fa(1, 8, 128, 64, 640, 0, 1);      /* the V4.1 class (no bf16 rounds) */
+            test_ds_attn_fa(3, 16, 128, 40, 300, 1, 1);     /* the prefill tile over dead entries and both row kinds */
+            test_ds_attn_fa(2, 8, 6, 9, 20, 1, 2);          /* the fp32 arm */
+            test_ds_attn(1, 4, 64, 8, 5, 13, 1);            /* a shape the tile refuses: mode 0 under the armed lever -- the unset default since gap-wave4 */
+            VkcStats s1; vkc_stats(&s1);
+            CHECK(s1.attn_fa - s0.attn_fa >= 4, "dsv4 attn FA: the tile engaged (%llu of the runs)",
+                  s1.attn_fa - s0.attn_fa);
+            printf("  dsv4 attn FA: %llu attentions on the tile\n", s1.attn_fa - s0.attn_fa);
+            rng = keep;
+        }
         test_ds_rope(0); test_ds_rope(1);
         test_ds_compress(2, 0, 0); test_ds_compress(1, 0, 0); test_ds_compress(4, 0, 0); test_ds_compress(4, 1, 1);
         test_ds_compress(3, 0, 1);

@@ -1,0 +1,41 @@
+#version 450
+// qmatmul_mm8_reduce — T2: the k-split reduction for qmatmul_mm8.spv. Direct
+// analogue of ggml-vulkan's `split_k_reduce` pipeline (`ggml_vk_matmul`'s
+// split_k>1 branch dispatches `pipeline_matmul_split_k_reduce` with push constants
+// {m*n*batch, split_k}); see ggml-vulkan/vulkan-shaders/... `split_k_reduce.comp`
+// upstream, whose contract this mirrors: one thread per output element, sum the
+// `split` partial planes in ASCENDING k order.
+//
+// Input layout (written by qmatmul_mm8.comp, THIS port's fmt-12 y: n = S*O):
+// partials[k * n + i] for k in [0, split), where i is the same flattened output
+// index the matmul uses, (s*O + o) — the fork's grouped out_mode (n = groups*S*O)
+// does not exist here. Output:
+//   y[i] = sum_{k=0}^{split-1} partials[k*n + i]
+// The ascending-k sum is deterministic (no atomics), so two runs of the same
+// binary are bit-identical; only the K-grouping differs from the unsplit
+// single-accumulator chain (the accepted CUDA-like tolerance class).
+//
+// The linear index spills past the x-grid limit (the host's grid() helper): groups
+// over 65535 wrap into gl_GlobalInvocationID.y, as every chain_*.comp here does.
+//
+// Recipe: glslc --target-env=vulkan1.2 qmatmul_mm8_reduce.comp -o qmatmul_mm8_reduce.spv
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer P { float p[]; };
+layout(std430, binding = 1) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform PC {
+    uint n;      // flattened output elements (S*O)
+    uint split;  // k-split count (partial planes)
+} pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u;
+    if (i >= pc.n) return;
+    float s = p[i];
+    // Ascending k: deterministic and matches the host's split ordering.
+    for (uint k = 1u; k < pc.split; k++)
+        s += p[k * pc.n + i];
+    y[i] = s;
+}

@@ -17,8 +17,10 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -35,6 +37,7 @@ class Serve:
     """One persistent `SERVE=1` engine process."""
 
     def __init__(self, binary: Path, model: Path, ctx: str = "128",
+
                  extra: dict[str, str] | None = None) -> None:
         env = dict(os.environ, SERVE="1", SNAP=str(model), CTX=ctx,
                    V4_PREFIX_LOG="1", **(extra or {}))
@@ -43,14 +46,19 @@ class Serve:
             stderr=subprocess.PIPE, env=env,
         )
         self.counter = 0
+        self.stderr_text = ""
 
-    def submit(self, prompt: str, max_tokens: int) -> tuple[str, int]:
-        """Returns the generated text and the DONE frame's reuse count."""
+    def submit(self, prompt: str, max_tokens: int,
+               prefix_bytes: int = 0) -> tuple[str, int]:
+        """Returns the generated text and the DONE frame's reuse count.
+        prefix_bytes is the optional gateway hint (the 8th SUBMIT field: the
+        byte offset where the rendered system turn ends)."""
         self.counter += 1
         request_id = f"r{self.counter}"
         payload = prompt.encode("utf-8")
+        hint = f" 0 {prefix_bytes}" if prefix_bytes else ""
         header = (f"SUBMIT {request_id} 0 {len(payload)} {max_tokens} "
-                  f"0.0 1.0 0\n").encode("ascii")
+                  f"0.0 1.0{hint}\n").encode("ascii")
         assert self.process.stdin is not None
         self.process.stdin.write(header + payload + b"\n")
         self.process.stdin.flush()
@@ -96,15 +104,23 @@ class Serve:
             self.process.wait(timeout=30)
         except Exception:                          # pragma: no cover
             self.process.kill()
+        finally:
+            assert self.process.stderr is not None
+            try:
+                self.stderr_text = self.process.stderr.read().decode(
+                    "utf-8", "replace")
+            except Exception:                      # pragma: no cover
+                self.stderr_text = ""
 
 
 def check_growing_conversation(binary: Path, model: Path,
-                               case: dict[str, object]) -> None:
+                               case: dict[str, object],
+                               extra_env: dict[str, str] | None = None) -> None:
     """Turn 2 extends turn 1: the state is reused, the output does not change."""
     first_ids = list(case["prompt_ids"])            # type: ignore[arg-type]
     max_new = 4
 
-    warm = Serve(binary, model)
+    warm = Serve(binary, model, extra_env=extra_env)
     try:
         first_text, first_reuse = warm.submit(token_prompt(first_ids), max_new)
         if first_reuse != 0:
@@ -125,7 +141,7 @@ def check_growing_conversation(binary: Path, model: Path,
     finally:
         warm.close()
 
-    cold = Serve(binary, model)
+    cold = Serve(binary, model, extra_env=extra_env)
     try:
         cold_text, cold_reuse = cold.submit(token_prompt(second_ids), max_new)
     finally:
@@ -206,6 +222,7 @@ def check_repeated_prompt(binary: Path, model: Path,
     print("PASS prefix repeat: identical prompt re-prefills, answer unchanged")
 
 
+
 def check_short_request_parks(binary: Path, model: Path,
                               case: dict[str, object]) -> None:
     """A short request between two turns keeps the conversation (park.h).
@@ -252,6 +269,102 @@ def check_short_request_parks(binary: Path, model: Path,
     print(f"PASS prefix park: the next turn reused {second_reuse} tokens after a short "
           f"request, answers identical to a cold engine")
 
+def check_cold_tier_disk(binary: Path, fixture: Path) -> None:
+    """The disk catalog across restarts and interleaved lineages (P1.1).
+
+    Runs on a COPY of the tiny fixture (the checkpoint directory lives inside
+    the model dir, and no test may write into a tracked path) with the capture
+    floor lowered to 64 (the fixture's context is 128 tokens) and prompt-end
+    persistence on (V4_PREFIX_CKPT_DISK=2; the default 1 persists prefix
+    captures only -- flipping that default is a separate gated change):
+      - cold restart: agent A captures the shared 64-token system prefix via
+        the gateway hint; a FRESH process on the same model dir restores it
+        (stderr: disk load + hit, DONE reuse=64) instead of re-prefilling;
+      - interleaving A/B/A/B: each turn restores the other lineage's stored
+        boundary (live strict-prefix reuse can never fire there);
+      - mid-fork: a prompt sharing only 32 tokens with every boundary has no
+        stored strict prefix and re-prefills (reuse=0).
+    """
+    work = Path(tempfile.mkdtemp(prefix="v4_cold_tier_"))
+    model = work / "tiny"
+    shutil.copytree(fixture, model)
+    env = {"V4_PREFIX_CKPT_DISK": "2", "V4_PREFIX_CKPT_MIN": "64"}
+    try:
+        system = [5 + (index * 11) % 97 for index in range(64)]
+        tail_a = [5 + (index * 13) % 89 for index in range(20)]
+        tail_b = [5 + (index * 17) % 83 for index in range(20)]
+        prompt_a1 = system + tail_a
+        prompt_b1 = system + tail_b
+        hint = 64 * len("<t000>")   # the byte offset where the system turn ends
+
+        warm = Serve(binary, model, extra_env=env)
+        try:
+            text_a1, reuse = warm.submit(token_prompt(prompt_a1), 4,
+                                         prefix_bytes=hint)
+            if reuse != 0:
+                raise AssertionError(f"first turn reused {reuse} tokens")
+            reply_a = parse_tokens(text_a1)
+            prompt_b1_text, reuse_b1 = warm.submit(token_prompt(prompt_b1), 4)
+            if reuse_b1 != 64:
+                raise AssertionError(
+                    f"same-process lineage switch restored {reuse_b1}, want 64")
+            # A2 extends A1 (prompt + reply minus the last token + new text):
+            # the live state holds B's lineage, so only the stored A1
+            # prompt-end boundary can serve this turn.
+            prompt_a2 = prompt_a1 + (reply_a[:-1] if len(reply_a) > 1 else [])
+            prompt_a2 += [40 + index for index in range(4)]
+            _, reuse_a2 = warm.submit(token_prompt(prompt_a2), 4)
+            if reuse_a2 < len(prompt_a1):
+                raise AssertionError(
+                    f"A2 restored only {reuse_a2} tokens, want the stored "
+                    f"{len(prompt_a1)}-token prompt-end boundary")
+            prompt_b2 = prompt_b1 + [60 + index for index in range(4)]
+            _, reuse_b2 = warm.submit(token_prompt(prompt_b2), 4)
+            if reuse_b2 < len(prompt_b1):
+                raise AssertionError(
+                    f"B2 restored only {reuse_b2} tokens, want the stored "
+                    f"{len(prompt_b1)}-token prompt-end boundary")
+        finally:
+            warm.close()
+        if "v4_ckpt store prefix=64" not in warm.stderr_text:
+            raise AssertionError(
+                "the gateway hint never stored the system prefix:\n"
+                + warm.stderr_text)
+
+        # Cold restart: a fresh process scans the model dir and restores the
+        # stored system prefix instead of re-prefilling it.
+        fresh = Serve(binary, model, extra_env=env)
+        try:
+            _, reuse = fresh.submit(token_prompt(prompt_b1), 4)
+        finally:
+            fresh.close()
+        if reuse != 64:
+            raise AssertionError(
+                f"cold restart restored {reuse} tokens, want 64")
+        for line in ("v4_ckpt disk load prefix=64", "v4_ckpt hit prefix=64"):
+            if line not in fresh.stderr_text:
+                raise AssertionError(
+                    f"missing {line!r} on the cold restart:\n"
+                    + fresh.stderr_text)
+
+        # Mid-fork: shares only the first 32 tokens with every stored
+        # boundary -- no stored strict prefix exists, so it re-prefills.
+        forked = Serve(binary, model, extra_env=env)
+        try:
+            _, reuse = forked.submit(
+                token_prompt(system[:32] + [70 + index for index in range(20)]),
+                4)
+        finally:
+            forked.close()
+        if reuse != 0:
+            raise AssertionError(
+                f"mid-fork prompt restored {reuse} tokens; a boundary inside "
+                "an entry cannot be rewound to")
+        print("PASS cold tier: restart restore, interleaved A/B/A/B, "
+              "mid-fork re-prefill")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -265,7 +378,13 @@ def main() -> int:
     check_growing_conversation(arguments.binary, arguments.fixture, case)
     check_repeated_prompt(arguments.binary, arguments.fixture, case)
     check_divergent_prompt_resets(arguments.binary, arguments.fixture, case)
+
     check_short_request_parks(arguments.binary, arguments.fixture, case)
+    check_cold_tier_disk(arguments.binary, arguments.fixture)
+    # The same live-reuse property against the V4_PREFIX_CKPT_DISK=0 memory
+    # backend: the catalog is the default, the slot pool must still work.
+    check_growing_conversation(arguments.binary, arguments.fixture, case,
+                               extra_env={"V4_PREFIX_CKPT_DISK": "0"})
     print("PASS DeepSeek V4 KV prefix reuse: all checks completed")
     return 0
 

@@ -547,6 +547,12 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32
 # needs a CUDA device and the CUDA objects: make tests/test_cu_tier CUDA=1
 TEST_EXCLUDE += test_cu_tier
+# test_vk_degrade forks per case (unistd/sys/wait) and links the VK objects: it
+# joins `check` only on Linux VK=1 builds (plain `check` builds VK=0); the
+# device end of the gate is tests/vulkan_strict.sh via vk-strict-check.
+ifneq ($(VK)$(LINUX),1linux)
+TEST_EXCLUDE += test_vk_degrade
+endif
 # takes a fixture and the CPU build's logits on its command line (ci.yml, the int4 gs64 A/B step)
 TEST_EXCLUDE += test_qwen36_tier_stream_engine
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
@@ -723,7 +729,7 @@ endif
 VK_OBJ    = backend_vulkan.o vk_tier.o
 VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_bd.spv shaders/qmatmul_gate_up_bd.spv shaders/attention_absorb.spv shaders/rmsnorm.spv \
             shaders/qmatmul_gemm.spv shaders/qmatmul_coop.spv shaders/expert_act.spv \
-            shaders/expert_act_v4.spv shaders/qmatmul_grp.spv shaders/qmatmul_grp_gate_up.spv shaders/expert_sum.spv shaders/qmatmul_grp_gemv.spv shaders/qmatmul_grp_gemv_gate_up.spv
+            shaders/expert_act_v4.spv shaders/qmatmul_grp.spv shaders/qmatmul_grp_gate_up.spv shaders/expert_sum.spv shaders/expert_sum_dec.spv shaders/qmatmul_grp_gemv.spv shaders/qmatmul_grp_gemv_gate_up.spv
 # vk_chain.o: a layer's dense chain recorded into one submission (vk_chain.h), and
 # its shaders; an engine that does not call it links nothing from it.
 VK_OBJ   += vk_chain.o
@@ -735,10 +741,19 @@ VK_SPV   += shaders/chain_norm.spv shaders/chain_rope.spv shaders/chain_attn.spv
 VK_SPV   += shaders/chain_mla.spv shaders/chain_hgemv.spv shaders/chain_dsa.spv
 # Kimi Delta Attention and manifold-constrained hyper-connections (vk_chain.h)
 VK_SPV   += shaders/chain_kda.spv shaders/chain_kda_rows.spv shaders/chain_mhc.spv
+# the single-row mHC pair (COLI_VK_CHAIN_MHC_S1; the fork's mhc_dec_{pre,post}.comp on
+# chain_mhc's contract), optional at run time -- the lever off never loads it
+VK_SPV   += shaders/chain_mhc_dec.spv
 # the int8 decode GEMV with per-matrix rows per workgroup (optional at run time)
 VK_SPV   += shaders/chain_gemv2.spv
 # DeepSeek V4.1 Flash and DeepSeek V4 attention (vk_chain.h: vkc_dsv4_*)
 VK_SPV   += shaders/chain_dsv4.spv
+# its flash-attention tile (COLI_VK_CHAIN_ATTN_FA; the fork's sparse_attn_fa family):
+# Br 8 and the Br 2 decode twin, each with the KV_F16 build that reads the f16 mirror,
+# and the mirror's gather -- five builds of the two sources, the fork's tile defines
+VK_SPV   += shaders/chain_dsv4_fa.spv shaders/chain_dsv4_fa_f16.spv \
+            shaders/chain_dsv4_fa_dec.spv shaders/chain_dsv4_fa_dec_f16.spv \
+            shaders/chain_dsv4_fa_gather.spv
 # Kimi K3's attention residuals and SiTU-GLU (vk_chain.h)
 VK_SPV   += shaders/chain_ares.spv
 # the router's pick on the device, every MoE engine's kind (vk_chain.h: vkc_route)
@@ -753,6 +768,10 @@ VK_SPV   += shaders/chain_gemv_bd.spv shaders/qmatmul_gemm_bd.spv
 VK_SPV   += shaders/chain_gemv_bd_i8.spv
 # the expert batch's grouped GEMM for a GGUF's experts, down and gate+up (backend_vulkan.c)
 VK_SPV   += shaders/qmatmul_grp_bd.spv shaders/qmatmul_grp_gate_up_bd.spv
+VK_SPV   += shaders/qmatmul_grp_mx.spv shaders/qmatmul_grp_gate_up_mx.spv
+# the fork's dedicated fmt-15 S=1 GEMV (COLI_VK_V4_S1GEMV; the fork's qmatmul_s1_fp4.comp
+# on its decode group's down matmul), optional at run time -- the lever off never loads it
+VK_SPV   += shaders/qmatmul_s1_mx.spv
 # and both on the matrix units (cooperative matrices at subgroups of 64 or 32)
 VK_SPV   += shaders/qmatmul_gemm_bdc.spv shaders/qmatmul_gemm_bdcw.spv shaders/qmatmul_grp_bdc.spv shaders/qmatmul_grp_gate_up_bdc.spv
 VK_SPV   += shaders/qmatmul_grp_bdcw.spv shaders/qmatmul_grp_gate_up_bdcw.spv
@@ -769,6 +788,12 @@ VK_SPV   += shaders/chain_attnb.spv
 VK_SPV   += shaders/chain_copy2d.spv
 # the int8/int4 prompt GEMM on the matrix units (optional at run time)
 VK_SPV   += shaders/chain_gemm.spv
+# the tiled weight-stationary GEMM for the fp8 matrices (vk_chain.c: matmul_aligned's
+# mm8 arm, COLI_VK_MM8), optional at run time
+VK_SPV   += shaders/qmatmul_mm8.spv
+# its split-K reduce (qmatmul_mm8_reduce.comp): the partial planes summed in
+# ascending k, deterministic, no atomics (COLI_VK_MM8_SPLITK)
+VK_SPV   += shaders/qmatmul_mm8_reduce.spv
 # the KV cache split between the device and the host past the device's budget
 # (vk_chain.h: vkc_kvs_*; vk_kvsplit.h)
 VK_SPV   += shaders/chain_kvs.spv
@@ -825,8 +850,9 @@ kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
 		--binary ./kimi_k3$(EXE) \
 		--fixture ./kimi_k3_tiny
 
-.PHONY: deepseek-v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
-	deepseek-v4-tiny-check deepseek-v4-clean
+.PHONY: deepseek-v4 deepseek_v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
+	deepseek-v4-tiny-check deepseek-v4-tiny-check-dmoe deepseek-v4-tiny-check-cs deepseek-v4-tiny-check-ring \
+	deepseek-v4-tiny-check-pilot deepseek-v4-clean
 ifeq ($(COLI_V4_SUPPORTED),1)
 # Every shader the other engines build (VK_SPV, empty without VK=1): backend_vulkan.c
 # looks for them at run time and goes without one that is not there, and
@@ -838,6 +864,11 @@ ifeq ($(COLI_V4_SUPPORTED),1)
 V4_CUT_OBJS = $(if $(filter 1,$(CUDA)),$(if $(IS_WIN),,$(CUDA_OBJ)))
 deepseek-v4: $(VK_SPV) $(V4_CUT_OBJS)
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) V4_CUT_OBJS="$(V4_CUT_OBJS)" deepseek-v4
+
+# the bare binary name answers like the hyphenated one (297dd370's alias, split into
+# its own rule so the registry contract's ^deepseek-v4 rule stays canonical): without
+# it 'make deepseek_v4' was a silent no-op on the stale file
+deepseek_v4: deepseek-v4
 
 deepseek-v4-clean:
 	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
@@ -859,6 +890,141 @@ deepseek-v4-tiny-check: deepseek-v4-tiny-generate
 		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
 		--fixture $(CURDIR)/deepseek_v4_tiny
 
+# deepseek-v4-smoke — the model-scale smoke gate (AI-pw-w1's institutional lesson: a
+# slice that changes a tier/chain default owes one short generation on the real model
+# before merge; the fmt-15 P0's every unit gate stayed green because no unit geometry
+# reaches the model's). The real checkpoint (MODEL, default the rig's path) on a
+# ~100-token prompt for 16 tokens: rc=0, a coherent generated_text, no failure lines.
+# SKIPS cleanly when the model, the Vulkan device or the build is absent; the tier's
+# format lever rides the caller's environment (COLI_VK_TIER_FMT15=0 runs the escape
+# hatch). tests/deepseek_v4_smoke.sh has the cases.
+.PHONY: deepseek-v4-smoke
+deepseek-v4-smoke:
+	bash tests/deepseek_v4_smoke.sh
+
+# COLI_VK_DMOE's own gate (the L2 Stage A wiring, specs/L2-chain-moe-vkdmoe.md section
+# 5.3): the tiny check with the arm on -- the same three harnesses, the same token-exact
+# oracle, one non-hash layer's routed experts in the frame instead of the host's step.
+# Layer 1 (layer 0 is the fixture's hash layer, which vkc_route cannot express), VK=1
+# because the arm is the device's, and the tier's 12 experts of the fixture all resident
+# so the all-or-nothing gate passes. The arm's numerics are chain_moe.comp's rank order
+# against the CPU block's ascending expert id -- a float-reassociation class, so the gate
+# is the token-exact oracle, not bit equality; the pre-registered fallback if that ever
+# breaks (max |dlogit| <= 1e-3*max(1,|logit|) on the first-token logits and >= 32 greedy
+# tokens equal, as a new expectations file) is in the spec, not silently widened here.
+# COLI_VK_DMOE_ROWS=1 adds the prompt-chunk path (chain_moe_rows.comp's grouped GEMMs);
+# the long case's 72-token prompt crosses the chunk boundary, so both paths run.
+# COLI_VK_TIER_BANK_LAYER=1 runs the same tiny legs with the VRAM bank armed (S1's gate
+# addition): the tier's stream slots carved for layer 1's experts, planned to the device
+# and pinned -- the same token-exact oracle, now over the banked residency (a decline
+# where the tiny budget cannot hold the carve keeps the leg exact, only quieter). The
+# brio leg composes the whole S1 arm's shape: the bank, the chunk rows, and
+# COLI_VK_DMOE_ROWS_MAX's frame split (8-row groups) -- the amdgpu boundary's cap over
+# the banked layer's grouped GEMMs, token-exact.
+# The S3 legs (COLI_VK_CHAIN_ORDER=layer) re-run the oracle through the layer-outer
+# reorder: COLI_VK_CHAIN_ROWS=4 cuts every prompt into several chunks a layer, so the
+# order the units visit them really inverts (the reorder of one chunk is the chunk
+# order); the prefix leg exercises a layer-ordered continuation over a pinned prefix
+# (start > 0: the lowering at each layer's head against the rings' snapshot). The
+# composed leg is the whole Option-B fold at tiny: the bank rotating per layer
+# (vkt_bank_switch at each head), COLI_VK_DMOE=all's lo..L arm (layer 0 is the fixture's
+# hash layer and keeps the host's step), and the ROWS_MAX split -- a layer's first chunk
+# pays the host's step while the bank's fill publishes its places, the rest compute in
+# the frame, token-exact throughout.
+deepseek-v4-tiny-check-dmoe: deepseek-v4-tiny-generate
+	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(if $(strip $(ARCH)),$(ARCH),$(PORTABLE_ARCH)) VK=1 deepseek-v4
+	COLI_VULKAN=1 COLI_VK_DMOE=1 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_DMOE=1 $(PYTHON) tests/test_deepseek_v4_prefix.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_DMOE=1 COLI_VK_DMOE_ROWS=1 $(PYTHON) tests/test_deepseek_v4_brio.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_DMOE=1 COLI_VK_TIER_BANK_LAYER=1 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_DMOE=1 COLI_VK_TIER_BANK_LAYER=1 COLI_VK_DMOE_ROWS=1 COLI_VK_DMOE_ROWS_MAX=8 $(PYTHON) tests/test_deepseek_v4_brio.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_CHAIN_ORDER=layer COLI_VK_CHAIN_ROWS=4 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_CHAIN_ORDER=layer COLI_VK_CHAIN_ROWS=4 $(PYTHON) tests/test_deepseek_v4_prefix.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_CHAIN_ORDER=layer COLI_VK_CHAIN_ROWS=4 COLI_VK_TIER_BANK_LAYER=1 COLI_VK_DMOE=all \
+	COLI_VK_DMOE_ROWS=1 COLI_VK_DMOE_ROWS_MAX=8 $(PYTHON) tests/test_deepseek_v4_brio.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+
+# COLI_VK_TIER_EXPERTS's own gate (the compute site, CS-1b): the same three harnesses
+# and the same token-exact oracle, now over the finish-site group -- the tier's
+# residents from their cached handles beside zero-copy store-slab aliases (CS-1a),
+# issued in ONE expert-batch group per layer-token. The base leg arms the compute
+# site alone (COLI_VK_TIER_EXPERTS=1); the growth leg composes it with the headroom
+# growth (COLI_VK_TIER_DECODE_GROW + _HEADROOM + _TARGET, and COLI_VK_TIER_PROMO_CAP=-1
+# uncapping the forward's promotions) -- _TARGET is read only under _HEADROOM
+# (vk_tier.c), so the headroom env is part of the arm, not an extra. VK=1 because
+# the arm is the device's; the same token-exact oracle, exact ids or nothing.
+.PHONY: deepseek-v4-tiny-check-cs
+deepseek-v4-tiny-check-cs: deepseek-v4-tiny-generate
+	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(if $(strip $(ARCH)),$(ARCH),$(PORTABLE_ARCH)) VK=1 deepseek-v4
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 $(PYTHON) tests/test_deepseek_v4_prefix.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 $(PYTHON) tests/test_deepseek_v4_brio.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_TIER_DECODE_GROW=1 COLI_VK_TIER_DECODE_GROW_HEADROOM=1 \
+	COLI_VK_TIER_DECODE_GROW_TARGET=800 COLI_VK_TIER_PROMO_CAP=-1 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_TIER_DECODE_GROW=1 COLI_VK_TIER_DECODE_GROW_HEADROOM=1 \
+	COLI_VK_TIER_DECODE_GROW_TARGET=800 COLI_VK_TIER_PROMO_CAP=-1 $(PYTHON) tests/test_deepseek_v4_prefix.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_TIER_DECODE_GROW=1 COLI_VK_TIER_DECODE_GROW_HEADROOM=1 \
+	COLI_VK_TIER_DECODE_GROW_TARGET=800 COLI_VK_TIER_PROMO_CAP=-1 $(PYTHON) tests/test_deepseek_v4_brio.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+
+# COLI_VK_V4_DECODE_PATH=fork's own gate (gap-wave3, the forked decode path): the
+# compute site's harnesses with the forked arm beside them -- the store's slot slabs
+# come out of the registry's mapped arena and the CS alias is a calloc against it (no
+# import, no slab_buf handles), so the same token-exact oracle now covers the
+# registry's tensor lifetime. The tiny fixture keeps every expert resident, so the
+# alias path itself is exercised by the forced-alias legs (COLI_VK_TIER_GB=0: no
+# resident budget, every selection aliases off its registry slab) and the engagement
+# line (decode-path=fork ... slabs=) is asserted by the harness (--expect-stderr).
+# The growth-composition leg mirrors -cs's (EXPERTS=2 + headroom + target + promo
+# cap). Model-scale oracle recipe (not run this wave): deepseek-v4-oracle with the
+# same env, teacher-forcing 32 + greedy 20, the -cs leg's class.
+.PHONY: deepseek-v4-tiny-check-forkdec
+deepseek-v4-tiny-check-forkdec: deepseek-v4-tiny-generate
+	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(if $(strip $(ARCH)),$(ARCH),$(PORTABLE_ARCH)) VK=1 deepseek_v4
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_V4_DECODE_PATH=fork $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny \
+		--expect-stderr 'decode-path=fork arena=.*GiB slabs='
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_V4_DECODE_PATH=fork COLI_VK_TIER_GB=0 COLI_VK_TIER_WARM=0 COLI_VK_TIER_PROMOTE=0 $(PYTHON) tests/test_deepseek_v4_prefix.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_V4_DECODE_PATH=fork COLI_VK_TIER_GB=0 COLI_VK_TIER_WARM=0 COLI_VK_TIER_PROMOTE=0 $(PYTHON) tests/test_deepseek_v4_brio.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_V4_DECODE_PATH=fork COLI_VK_TIER_DECODE_GROW=1 COLI_VK_TIER_DECODE_GROW_HEADROOM=1 \
+	COLI_VK_TIER_DECODE_GROW_TARGET=800 COLI_VK_TIER_PROMO_CAP=-1 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+
 deepseek-v4-oracle: deepseek-v4
 	@test -n "$(MODEL)" || { echo "usage: make deepseek-v4-oracle MODEL=/path/to/checkpoint" >&2; exit 2; }
 	$(PYTHON) tools/make_deepseek_v4_oracle.py --model "$(MODEL)" \
@@ -869,6 +1035,109 @@ deepseek-v4-oracle: deepseek-v4
 		--validate \
 		--teacher-forcing $(or $(ORACLE_TEACHER_FORCING),32) \
 		--greedy $(or $(ORACLE_GREEDY),20)
+
+# COLI_VK_V4_S1GEMV's own gate (gap-wave3, the forked decode's first kernel adopter):
+# the -cs legs with the fork's dedicated fmt-15 S=1 GEMV (qmatmul_s1_mx.comp, the fork's
+# qmatmul_s1_fp4.comp) armed on the compute site's decode down. The kernel may not arm
+# anywhere until its parity leg passes bit-exact (backend_vulkan.c xb_s1gemv_parity, run
+# at the arm: the generic dispatch and the dedicated one on the same random weights, bit
+# for bit -- the fork's own test-vk-dsv4-experts discipline), so these token-exact legs
+# run past that gate; the A/B plumbing leg lives in vk-tier-check's s1gemv invocation.
+.PHONY: deepseek-v4-tiny-check-s1gemv
+deepseek-v4-tiny-check-s1gemv: deepseek-v4-tiny-generate
+	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(if $(strip $(ARCH)),$(ARCH),$(PORTABLE_ARCH)) VK=1 deepseek-v4
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_V4_S1GEMV=1 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_V4_S1GEMV=1 $(PYTHON) tests/test_deepseek_v4_prefix.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_V4_S1GEMV=1 $(PYTHON) tests/test_deepseek_v4_brio.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+
+# gap-wave4's own gate: the tiny harnesses at the NEW DEFAULTS -- no lever env at
+# all (the plain deepseek-v4-tiny-check runs the portable build with no device, so
+# the levers never engage there): the fork registry's arena slots, the compute
+# site's finish-site groups, the decode growth, the dedicated S=1 GEMV and the FA
+# tile all standing as a boot with no environment now arms them, against the same
+# token-exact oracle. The second half is the hatch: COLI_VK_LEGACY=1, the upstream
+# base -- the fmt-15 precedent's escape-hatch leg, now for the whole default set.
+# If the FA tile's thresholded class ever flips a tiny token, the defaults half is
+# the leg that says so (regenerate the fixture's expectations under the defaults,
+# the hatch half keeps the base's -- never silently one class for both).
+.PHONY: deepseek-v4-tiny-check-defaults
+deepseek-v4-tiny-check-defaults: deepseek-v4-tiny-generate
+	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(if $(strip $(ARCH)),$(ARCH),$(PORTABLE_ARCH)) VK=1 deepseek-v4
+	COLI_VULKAN=1 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+	COLI_VULKAN=1 $(PYTHON) tests/test_deepseek_v4_prefix.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 $(PYTHON) tests/test_deepseek_v4_brio.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_LEGACY=1 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_LEGACY=1 $(PYTHON) tests/test_deepseek_v4_prefix.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_LEGACY=1 $(PYTHON) tests/test_deepseek_v4_brio.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+
+# COLI_VK_TIER_PILOT's own gate (the decode read-ahead, gap-wave2): the same three
+# harnesses and the same token-exact oracle with the pilot armed beside the compute
+# site. The tiny fixture keeps one hash layer (its layer 0), so no chain host-step has
+# a hash layer at i+depth and the pilot stays shape-inert here -- the PW-C2/ring
+# precedent; the mechanics live in tests/test_deepseek_v4's pilot case (fire/quiesce,
+# warm-hit byte-identity, misprediction harmlessness, the single-flight late read).
+# VK=1 because the fire site is the chain's.
+.PHONY: deepseek-v4-tiny-check-pilot
+deepseek-v4-tiny-check-pilot: deepseek-v4-tiny-generate
+	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(if $(strip $(ARCH)),$(ARCH),$(PORTABLE_ARCH)) VK=1 deepseek-v4
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_TIER_PILOT=1 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_TIER_PILOT=1 COLI_VK_TIER_PILOT_DEPTH=3 $(PYTHON) tests/test_deepseek_v4_prefix.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_TIER_PILOT=1 COLI_VK_CHAIN_DPROF=1 $(PYTHON) tests/test_deepseek_v4_brio.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+
+# COLI_VK_TIER_STREAM_RING's own gate (PW-B, the fork's ring class): the tiny oracle with
+# the stream's fills moved onto the ring's worker -- the same token-exact expectations,
+# the arm's environment on (COLI_VK_TIER_STREAM_BYPASS arms the ring's bypass reader,
+# which the ring requires). The tiny fixture keeps every expert resident, so the ring
+# itself is shape-inert here (the PW-C2 precedent); the mechanics live in test_vk_tier's
+# `ring` case and the engagement in deepseek-v4-smoke with the same two envs. PW-B2 adds
+# the cold leg (COLI_VK_TIER_STREAM_RING_COLD): the same inertness over the cold branch's
+# whole-layer plan.
+.PHONY: deepseek-v4-tiny-check-ring
+deepseek-v4-tiny-check-ring: deepseek-v4-tiny-generate
+	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(if $(strip $(ARCH)),$(ARCH),$(PORTABLE_ARCH)) VK=1 deepseek-v4
+	COLI_VULKAN=1 COLI_VK_TIER_STREAM_BYPASS=1 COLI_VK_TIER_STREAM_RING=1 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_STREAM_BYPASS=1 COLI_VK_TIER_STREAM_RING=1 $(PYTHON) tests/test_deepseek_v4_prefix.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_STREAM_BYPASS=1 COLI_VK_TIER_STREAM_RING=1 COLI_VK_TIER_STREAM_RING_COLD=1 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+# COLI_VK_TIER_STREAM_DEPTH's own leg (the prefill wave): the ring's bypass arm with
+# the stage pools deepened qd16-class (16 x 16 MiB) -- the same token-exact oracle over
+# the wider reads; the depth changes read parallelism only, and the boot line names it.
+	COLI_VULKAN=1 COLI_VK_TIER_STREAM_BYPASS=1 COLI_VK_TIER_STREAM_RING=1 COLI_VK_TIER_STREAM_DEPTH=16 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
 else
 deepseek-v4 deepseek-v4-oracle:
 	@echo "$@ is supported only on x86-64/aarch64 Linux and Windows/MSYS2" >&2; exit 1
@@ -876,6 +1145,12 @@ deepseek-v4-clean:
 	@:
 deepseek-v4-tiny-check:
 	@echo "SKIP deepseek-v4-tiny-check: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
+deepseek-v4-tiny-check-dmoe:
+	@echo "SKIP deepseek-v4-tiny-check-dmoe: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
+deepseek-v4-tiny-check-cs:
+	@echo "SKIP deepseek-v4-tiny-check-cs: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
+deepseek-v4-tiny-check-forkdec:
+	@echo "SKIP deepseek-v4-tiny-check-forkdec: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
 deepseek-v4-tiny-generate:
 	@echo "SKIP deepseek-v4-tiny-generate: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
 endif
@@ -939,9 +1214,26 @@ shaders/qmatmul_grp_gate_up.spv: shaders/qmatmul_grp.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@ || { [ -f $@ ] && touch $@ && \
 	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+# the MXFP4 pair from the same source (0e79f870 committed the .spv without it; b8affcad
+# untracked them, which left VK_SPV pointing at a target no rule could build)
+shaders/qmatmul_grp_mx.spv: shaders/qmatmul_grp_mx.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+shaders/qmatmul_grp_gate_up_mx.spv: shaders/qmatmul_grp_mx.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
 shaders/qmatmul_grp_gemv_gate_up.spv: shaders/qmatmul_grp_gemv.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
+# the dedicated S=1 fmt-15 GEMV (COLI_VK_V4_S1GEMV, the fork's qmatmul_s1_fp4.comp):
+# same glslc requirement and fallback as the grouped pair; at run time the batch keeps
+# the generic down GEMV without it -- the lever off never loads it
+shaders/qmatmul_s1_mx.spv: shaders/qmatmul_s1_mx.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
 vk_chain.o: vk_chain.c .build-config
 	$(CC) $(CFLAGS) -c vk_chain.c -o $@
 # the block formats' decoders (fmt >= 100), included by the GEMV shaders and the chain's
@@ -978,10 +1270,43 @@ shaders/qmatmul_grp_gate_up_qc.spv: shaders/qmatmul_grp_qc.comp
 shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@
+# the single-row mHC pair takes no defines (its caps are runtime refusals); same glslc
+# fallback as the flash tile: a deployment without glslc keeps the committed .spv
+shaders/chain_mhc_dec.spv: shaders/chain_mhc_dec.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
 shaders/chain_qsa.spv: shaders/chain_qsa.h
 # chain_attn_flash.comp needs the same glslc as qmatmul_coop.comp below, with the same
 # fallback; without its .spv the chain keeps chain_attn.comp.
 shaders/chain_attn_flash.spv: shaders/chain_attn_flash.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+# chain_dsv4_fa.comp's five builds. The four tile builds MUST carry the -D set below
+# (the fork's lesson: a plain build silently bakes the #ifndef defaults and the host's
+# heads-per-workgroup pick then dispatches dead workgroups). Br 8 is the prefill tile,
+# Br 2 its decode twin (a head's numerics unchanged, heads/2 workgroups at tokens==1);
+# the _f16 pair reads the f16 mirror chain_dsv4_fa_gather.spv writes (the gather build
+# itself takes no defines).
+DSV4_FA_TILE = -DWorkGroupSize=256 -Drow_split=2 -DD_split=16 -DBc=16 -DHSK=512 -DHSV=512
+shaders/chain_dsv4_fa.spv: shaders/chain_dsv4_fa.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $(DSV4_FA_TILE) -DBr=8 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+shaders/chain_dsv4_fa_f16.spv: shaders/chain_dsv4_fa.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $(DSV4_FA_TILE) -DBr=8 -DKV_F16 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+shaders/chain_dsv4_fa_dec.spv: shaders/chain_dsv4_fa.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $(DSV4_FA_TILE) -DBr=2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+shaders/chain_dsv4_fa_dec_f16.spv: shaders/chain_dsv4_fa.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $(DSV4_FA_TILE) -DBr=2 -DKV_F16 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+shaders/chain_dsv4_fa_gather.spv: shaders/chain_dsv4_fa_gather.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
 	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
@@ -2490,10 +2815,44 @@ tests/test_vq1_g64$(EXE): tests/test_vq1_g64.c
 tests/test_vk_alloc$(EXE): tests/test_vk_alloc.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# The strict capability gate's helper (backend_vulkan.c's coli_vk_degrade): classes,
+# exit 70, the dedup table, the env parse — no device, but it lives in the VK
+# objects, so VK=1 and (outside Linux) out of `check` like test_vk_tier.
+tests/test_vk_degrade$(EXE): tests/test_vk_degrade.c $(VK_OBJ)
+	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_degrade needs VK=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
 # The Vulkan routed-expert tier (vk_tier.c) against a CPU reference: every source
 # format, warm start, eviction, partial batches. It needs VK=1 and a Vulkan device
 # (CI: Lavapipe), so it stays out of `check` (TEST_EXCLUDE) and runs from
-# vk-tier-check.
+# vk-tier-check -- whose fourth invocation (`dgrow`) carries the decode-growth
+# headroom/promo-cap legs: their guard-made places allocate as installs proceed, so
+# block counts, frag and the probe-derived arm counts differ between any two runs,
+# and the strict gate byte-compares the plain invocation's unset-vs-0 pair. The
+# fifth (`dprof`) runs the same suite with COLI_VK_CHAIN_DPROF on from the top --
+# the CS alias cache's hit/miss wall split parses there (cs_alias_scan_skip's leg).
+# The sixth invocation (`pilot`) carries COLI_VK_TIER_PILOT's lifecycle: the pilot
+# lives in the store unit (deepseek_v4.c), which VK_OBJ does not link, so the leg
+# runs that unit's own pilot case (tests/test_deepseek_v4 pilot) armed with depth 1
+# -- hash and non-hash fires (the tid2eid table and its NULL), warm reads that move
+# no demand book, a misprediction that costs a slot and nothing else, the
+# single-flight late read, and the unset no-op.
+# The seventh (`forkdec`) carries COLI_VK_V4_DECODE_PATH=fork's store seam: registry-
+# backed slots, an LRU victim's in-place rewrite serving its new expert's exact bytes
+# through the same slab, the registry alias's geometry and f16 wide verdict read off
+# the slab's own scale bytes, and free(t)'s own-nothing lifetime -- the same unit's
+# forkdec case with a device, or the malloc ladder without one.
+# The eighth (`s1gemv`) carries COLI_VK_V4_S1GEMV, the fork's dedicated fmt-15 S=1
+# GEMV (qmatmul_s1_mx.comp, the fork's qmatmul_s1_fp4.comp) on the decode down: the
+# whole suite runs with it armed, so every case's own reference CHECKs cover it, and
+# the s1gemv case A/Bs the same rows through the generic and the dedicated kernel bit
+# for bit -- on top of the arm's own in-init parity leg (xb_s1gemv_parity), which
+# refuses the arm on any bit difference.
+# The ninth (`COLI_VK_LEGACY=1`) runs the whole suite at the upstream-base hatch:
+# every gap-wave4 default lever off (the s1gemv case's off half asserts the
+# not-armed/no-dispatch pair there), the cases that arm a lever explicitly still arm
+# it (an explicit env always wins over the hatch) -- the byte-comparable base leg
+# the strict gate's equivalence cases lean on.
 # The routed-expert tier on a CUDA device (cu_tier.h) against a CPU reference.
 tests/test_cu_tier$(EXE): tests/test_cu_tier.c $(CUDA_OBJ)
 	@case "$(CUDA_OBJ)" in *cu_tier.o*) ;; *) echo "tests/test_cu_tier needs CUDA=1 (or HIP=1)" >&2; exit 1 ;; esac
@@ -2506,9 +2865,16 @@ tests/bench_host_pairs$(EXE): tests/bench_host_pairs.c $(VK_OBJ)
 	@[ "$(VK)" = 1 ] || { echo "tests/bench_host_pairs needs VK=1" >&2; exit 1; }
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 .PHONY: vk-tier-check
-vk-tier-check: tests/test_vk_tier$(EXE)
+vk-tier-check: tests/test_vk_tier$(EXE) tests/test_deepseek_v4$(EXE)
 	./tests/test_vk_tier$(EXE) shaders/qmatmul.spv
 	./tests/test_vk_tier$(EXE) shaders/qmatmul.spv host-pairs
+	COLI_VK_TIER_FMT15=1 ./tests/test_vk_tier$(EXE) shaders/qmatmul.spv fmt15
+	./tests/test_vk_tier$(EXE) shaders/qmatmul.spv dgrow
+	COLI_VK_CHAIN_DPROF=1 ./tests/test_vk_tier$(EXE) shaders/qmatmul.spv dprof
+	COLI_VK_TIER_PILOT=1 COLI_VK_TIER_PILOT_DEPTH=1 ./tests/test_deepseek_v4$(EXE) pilot
+	COLI_VK_TIER_EXPERTS=1 COLI_VK_V4_DECODE_PATH=fork ./tests/test_deepseek_v4$(EXE) forkdec shaders/qmatmul.spv
+	COLI_VK_V4_S1GEMV=1 ./tests/test_vk_tier$(EXE) shaders/qmatmul.spv s1gemv
+	COLI_VK_LEGACY=1 ./tests/test_vk_tier$(EXE) shaders/qmatmul.spv
 
 # The dense chain's ops (vk_chain.c, shaders/chain_*.comp) against CPU references, on
 # a Vulkan device (CI: Lavapipe); like test_vk_tier it needs VK=1 and stays out of
@@ -2519,6 +2885,19 @@ tests/test_vk_chain$(EXE): tests/test_vk_chain.c $(VK_OBJ) $(VK_SPV)
 .PHONY: vk-chain-check
 vk-chain-check: tests/test_vk_chain$(EXE)
 	./tests/test_vk_chain$(EXE) shaders/qmatmul.spv
+
+# The strict capability gate end to end (tests/vulkan_strict.sh): the helper's unit
+# test needs no device; the device cases skip themselves (exit 0) where there is
+# no Vulkan device. A VK=0 build has no gate at all — also a skip, not a failure.
+.PHONY: vk-strict-check
+ifeq ($(VK),1)
+vk-strict-check:
+	$(MAKE) tests/test_vk_degrade$(EXE) tests/test_vk_tier$(EXE) tests/test_vk_chain$(EXE)
+	bash tests/vulkan_strict.sh
+else
+vk-strict-check:
+	@echo "vk-strict-check: VK=0, no Vulkan backend (skip)"
+endif
 
 # Checks the choice of memory type and the size, budget and room of the device memory
 # (vk_memtype.h) on memory-property tables written by the test. It needs the Vulkan headers
@@ -2676,8 +3055,11 @@ SEGMENT_V4_UNITS = $(filter-out COLI_V4_UNIT_PROMPT \
 	COLI_V4_UNIT_GENERATE_STATS,$(V4_TARGET_UNITS)) $(V4_SEGMENT_UNIT)
 SEGMENT_V4_OBJS = $(addprefix $(SEGMENT_BUILD_DIR)/,$(addsuffix .o,$(SEGMENT_V4_UNITS)))
 SEGMENT_V4_REGISTRY_OBJ = $(SEGMENT_BUILD_DIR)/expert_store_registry.o
+# The hot-store unit's mfu table object (Makefile.deepseek-v4's mfu_table.o,
+# built here with the segment flags).
+SEGMENT_V4_MFU_OBJ = $(SEGMENT_BUILD_DIR)/mfu_table.o
 SEGMENT_ALL_OBJS = $(SEGMENT_ENGINE_OBJS) $(SEGMENT_V4_OBJS) \
-	$(SEGMENT_V4_REGISTRY_OBJ)
+	$(SEGMENT_V4_REGISTRY_OBJ) $(SEGMENT_V4_MFU_OBJ)
 SEGMENT_RUNTIME_OBJS = \
 	$(SEGMENT_BUILD_DIR)/segment_runtime.o \
 	$(SEGMENT_BUILD_DIR)/edge_runtime.o
@@ -2712,6 +3094,9 @@ $(SEGMENT_V4_OBJS): $(SEGMENT_BUILD_DIR)/%.o: deepseek_v4.c | $(SEGMENT_BUILD_DI
 
 $(SEGMENT_V4_REGISTRY_OBJ): expert_store_registry.c | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -c expert_store_registry.c -o $@
+
+$(SEGMENT_V4_MFU_OBJ): mfu_table.c | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -c mfu_table.c -o $@
 
 $(SEGMENT_BUILD_DIR)/segment_runtime.o: segment_runtime.c | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -c segment_runtime.c -o $@
@@ -2815,6 +3200,7 @@ V4_TEST_LINK_OBJS = \
 	COLI_V4_UNIT_SPARSE_ATTENTION.o \
 	COLI_V4_UNIT_RESOURCE_PLAN.o \
 	COLI_V4_UNIT_PROMPT.o \
+	mfu_table.o \
 	$(filter-out COLI_V4_UNIT_EXPERT_STORE.o COLI_V4_UNIT_EXPERT.o,$(addsuffix .o,$(V4_TEST_UNITS))) \
 	$(V4_HOT_TEST_OBJ) \
 	$(V4_BATCH_TEST_OBJ) \
@@ -2830,15 +3216,27 @@ ifneq ($(IS_WIN),)
 V4_TEST_LINK_OBJS += COLI_V4_UNIT_GPU.o backend_loader_dsv4.o
 V4_TEST_EXTRA_TARGETS = COLI_V4_UNIT_GPU.o backend_loader_dsv4.o
 endif
+# Under VK=1 the test's units compile with -DCOLI_VULKAN, and CS-1c's forget hook
+# (vkt_slab_forget at both store destroys, deepseek_v4.c's EXPERT_STORE unit)
+# references the tier's symbol: the link needs the Vulkan backend, and the rule
+# takes it from $(VK_OBJ), the objects every other VK-calling test link uses --
+# the shape tests/test_makefile_vk_obj pins (backend_vulkan.o on the link line,
+# $(VK_OBJ) a prerequisite of the rule itself). backend_vulkan.c and vk_tier.c
+# read none of the sub-make's V4-only defines, so the main Makefile's objects
+# are the same code; the engine binary keeps its own -flto V4_VK_OBJ
+# (Makefile.deepseek-v4).
+ifeq ($(VK),1)
+V4_TEST_LINK_OBJS += $(VK_OBJ)
+endif
 
 tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c sse41_kernels.h deepseek_v4.c deepseek_v4.h compat.h \
-		Makefile.deepseek-v4.units Makefile.deepseek-v4
+		Makefile.deepseek-v4.units Makefile.deepseek-v4 $(VK_OBJ)
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4-test-objs \
 		COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
 		COLI_V4_UNIT_ROUTE_BF16.o \
 		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_NATIVE_QUANT.o \
 		COLI_V4_UNIT_NATIVE_QUANT_DUAL.o COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o \
-		COLI_V4_UNIT_EXPERT_ROWS16.o \
+		COLI_V4_UNIT_EXPERT_ROWS16.o mfu_table.o \
 		$(V4_HOT_TEST_OBJ) \
 		$(V4_BATCH_TEST_OBJ) \
 		$(V4_TEST_EXTRA_TARGETS)
@@ -3140,6 +3538,15 @@ tests/bench_i4p_gidot$(EXE): tests/bench_i4p_gidot.c colibri.c $(VK_OBJ)
 tests/bench_gemv_stream$(EXE): tests/bench_gemv_stream.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
+# bench_vk_import_read: CS-0's falsifier leg (specs/CS-expert-compute-site.md §6): a
+# k=6 decode expert group at DeepSeek V4's geometry, its weights imported host slabs
+# (VK_EXT_external_memory_host) vs VRAM copies, one submit a layer-token -- the PCIe
+# read wall against the 2.5 ms bar. NOT a test gate (a real-device probe, run by hand
+# on the rig). Build on demand: make tests/bench_vk_import_read VK=1
+tests/bench_vk_import_read$(EXE): tests/bench_vk_import_read.c $(VK_OBJ) $(VK_SPV)
+	@[ "$(VK)" = 1 ] || { echo "tests/bench_vk_import_read needs VK=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
 # bench_matmul_f32: microbenchmark (pre-#442 scalar vs row-blocked fmaf f32 matmul at
 # router shapes), NOT a test gate. Build on demand: make tests/bench_matmul_f32
 tests/bench_matmul_f32$(EXE): tests/bench_matmul_f32.c
@@ -3150,6 +3557,14 @@ tests/bench_matmul_f32$(EXE): tests/bench_matmul_f32.c
 # Build on demand: make tests/bench_attn_f32
 tests/bench_attn_f32$(EXE): tests/bench_attn_f32.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# bench_chain_attn_fa: microbenchmark (DeepSeek V4's sparse attention on the flash tile
+# COLI_VK_CHAIN_ATTN_FA vs mode 0, AG §4's decode geometry and the S 256 chunk), NOT a
+# test gate -- test_vk_chain's test_ds_attn_fa gates the tile's bits. Needs VK=1.
+# Build on demand: make tests/bench_chain_attn_fa VK=1
+tests/bench_chain_attn_fa$(EXE): tests/bench_chain_attn_fa.c $(VK_OBJ) $(VK_SPV)
+	@[ "$(VK)" = 1 ] || { echo "tests/bench_chain_attn_fa needs VK=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_matmul_f32$(EXE): tests/test_matmul_f32.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -3388,7 +3803,7 @@ clean:
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
 .PHONY: all deepseek-v4 deepseek-v4-clean deepseek-v4-oracle \
-	deepseek-v4-tiny-generate deepseek-v4-tiny-check \
+	deepseek-v4-tiny-generate deepseek-v4-tiny-check deepseek-v4-tiny-check-dmoe deepseek-v4-tiny-check-cs \
 	qwen38-tiny-generate qwen38-tiny-check \
 	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench fp8-bench cuda-dll hip-dll portable \
 	test-c test-python test check clean install uninstall bench

@@ -1,0 +1,359 @@
+#version 450
+// DeepSeek V4.1 Flash's and DeepSeek V4's sparse attention as a flash-attention tile
+// (vk_chain.c, COLI_VK_CHAIN_ATTN_FA; the fork's sparse_attn_fa.comp, d11fba5b, ported
+// onto chain_dsv4.comp mode 0's contract). The fork's kernel is itself a port of
+// llama.cpp's Vulkan flash_attn.comp (MIT): one workgroup covers Br query heads of one
+// token and streams the token's rows in Bc tiles, the K/V rows staged once in LDS
+// (K ≡ V — one latent row serves the score and the value passes), an online softmax with
+// per-row M/L registers, a fp32 subgroup-tree score dot, a shmem cross-thread reduction
+// and llama's end-of-loop sink block. Ported unchanged except where named below:
+//   - the rows resolve through chain_dsv4 mode 0's selection list (binding 3), not the
+//     fork's meta/sel tables: entry e < 0 is skipped, e < nwin reads the window ring's
+//     slot e (w_off + e*hd), any other the compressed row e - nwin (c_off + ...) — the
+//     same rows, offsets and strides (floats) mode 0 reads, so vkc_dsv4_attn dispatches
+//     either kernel from one call;
+//   - the push constants are chain_dsv4's int v[32] at mode 0's slots (v[1] S, v[2] H,
+//     v[3] hd, v[4] the list width, v[5]/v[6] its offset/stride, v[7] nwin, v[8]/v[9]
+//     the ring/pool offsets, v[10..13] the query/output offsets and strides, v[14] the
+//     sinks' offset, v[15] flags, v[16] scale), v[0] the mode word (0 here);
+//   - the bf16 rounds (the probability and the output, as the CPU reference's V4 class)
+//     follow mode 0's flags bit 1 at run time instead of the fork's build-time default;
+//   - scale is folded into Q at staging (the fork's form; mode 0 multiplies after the
+//     dot — both inside the thresholded class).
+// Numerics class (the fork's, gated by its tests at 2e-3 and here by test_vk_chain at
+// the mode-0 class): the score dot is a fp32 subgroup tree and the softmax rescales
+// partial sums by exp(Mold - M), so the accumulation order differs from the scalar
+// path's single pass; the tile max carries llama's FATTN_KQ_MAX_OFFSET (+3*ln2), a
+// global shift that cancels in the normalization but moves the bf16 probability
+// rounding's scale; den accumulates the UNROUNDED exp (as the CPU reference), only the
+// value numerator uses the rounded probability. A row with no live entry gives 0.
+//
+//
+// KV_F16 (the fork's COLI_DSV4_VK_KV_F16 class, its standing arm): the fork stored the
+// ring and pool as fp16 and read them with f16 kernels — storage-only, every stored row
+// bf16/fp8-rounded and fp16's 11-bit significand holding those values exactly in the
+// normal range. This port's ring and pool are written by device copies the fork's
+// writers replaced, so the f16 form is a read-side mirror instead: chain_dsv4_fa_gather
+// .comp (one dispatch an attention, loaded beside this shader) converts every ring and
+// pool row to f16 (round to nearest even, the fork's storage conversion) into a scratch
+// this kernel's KV_F16 builds read — the same numerics class, half the KV read bytes,
+// and nothing permanent (the FA reads only rows that pass wrote).
+//
+// Build tiles (the fork's, bench-selected on this port's own RX 6900 XT): 256 threads,
+// Br 8 (prefill) with the decode twin Br 2 at tokens==1 — every per-head numerics
+// parameter kept, so a head's accumulation order is the same in both, only the live
+// workgroup count changes (heads/8 -> heads/2). row_split 2, D_split 16, Bc 16, HSK
+// HSV 512: the tile's K/V rows (~32 KB) fit beside the Q staging (~16.5 KB) in LDS.
+// The host refuses shapes that do not match (hd != HSK, heads % Br, or a q/o/w/c offset
+// or stride not a multiple of 4 floats) and binds chain_dsv4 mode 0 instead — the same
+// bindings and push constants, so the fallback is one branch in vkc_dsv4_attn.
+//
+// Dispatch: (tokens, heads / Br) workgroups.
+
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : enable
+#ifdef KV_F16
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
+// ---- the compile-time tile (must match the Makefile -D set / the host pick) ----
+#ifndef WorkGroupSize
+#define WorkGroupSize 256
+#endif
+#ifndef HSK
+#define HSK 512          // head dim (keys); the host refuses hd != HSK
+#endif
+#ifndef HSV
+#define HSV 512          // head dim (values) — the same latent row here
+#endif
+#ifndef Br
+#define Br 8             // query heads a workgroup
+#endif
+#ifndef row_split
+#define row_split 2      // rowgroups (Br / row_split = rows a rowgroup)
+#endif
+#ifndef D_split
+#define D_split 16       // d-slices a rowgroup (the subgroup-shuffle width)
+#endif
+#ifndef Bc
+#define Bc 16            // KV rows a tile
+#endif
+
+#if (Br % row_split) != 0 || (WorkGroupSize % row_split) != 0
+#error "Br and WorkGroupSize must be divisible by row_split"
+#endif
+#if ((WorkGroupSize / row_split) % D_split) != 0 || (Bc % (WorkGroupSize / row_split / D_split)) != 0
+#error "rowgroup threads must divide into D_split x integer column lanes"
+#endif
+#if (HSK % 4) != 0 || (HSV % 4) != 0 || (D_split > 32)
+#error "head dims must be vec4-multiples; D_split must fit one subgroup"
+#endif
+
+layout(local_size_x = WorkGroupSize) in;
+
+// chain_dsv4 mode 0's bindings (q, ring, pool, list, params, out). In the KV_F16 builds
+// bindings 1/2 read f16 — the mirror chain_dsv4_fa_gather.comp wrote, never the fp32
+// stores themselves (the output stays fp32 at binding 5, mode 0's contract).
+layout(std430, binding = 0) readonly buffer Q  { vec4 qv[];  };  // q at v[10] + t*v[11] + h*hd
+#ifdef KV_F16
+layout(std430, binding = 1) readonly buffer Win { f16vec4 wv[]; };  // the f16 mirror, ring rows
+#else
+layout(std430, binding = 1) readonly buffer Win { vec4 wv[]; };    // the ring [nwin*HSK/4]
+#endif
+#ifdef KV_F16
+layout(std430, binding = 2) readonly buffer Cp  { f16vec4 cpv[]; }; // the f16 mirror, pool rows
+#else
+layout(std430, binding = 2) readonly buffer Cp  { vec4 cpv[]; };    // the pool [rows*HSK/4]
+#endif
+layout(std430, binding = 3) readonly buffer Sl { int sl[]; };   // the list [tokens*l_row + l_off]
+layout(std430, binding = 4) readonly buffer B4 { float b4[]; }; // the sinks [sink_off + h]
+layout(std430, binding = 5) buffer Y5 { vec4 y5[]; };           // the output
+
+// chain_dsv4's push constants: the mode, then the op's fields (mode 0's slots).
+layout(push_constant) uniform P {
+    int v[32];
+} pc;
+#define p_S     pc.v[1]
+#define p_H     pc.v[2]
+#define p_hd    pc.v[3]
+#define p_n     pc.v[4]
+#define p_loff  pc.v[5]
+#define p_lrow  pc.v[6]
+#define p_nwin  pc.v[7]
+#define p_woff  pc.v[8]
+#define p_coff  pc.v[9]
+#define p_qoff  pc.v[10]
+#define p_qrow  pc.v[11]
+#define p_ooff  pc.v[12]
+#define p_orow  pc.v[13]
+#define p_sink  pc.v[14]
+#define p_flags pc.v[15]
+
+const int VEC = HSK / 4;                     // vec4s a row (128 at 512)
+const int rows_per_thread = Br / row_split;
+const int threads_per_rowgroup = WorkGroupSize / row_split;
+const int cols_per_iter = threads_per_rowgroup / D_split;
+const int cols_per_thread = Bc / cols_per_iter;
+const int HSK_per_thread = HSK / D_split;    // dims a d-slice
+const int HSV_per_thread = HSV / D_split;
+const int qf_stride = VEC + 1;
+const float NEG_MAX = -3.4e38;                       // ~-FLT_MAX (llama's NEG_FLT_MAX_OVER_2)
+const float KQ_MAX_OFFSET = 3.0f * 0.6931f;          // llama's FATTN_KQ_MAX_OFFSET
+#define NEG_INF uintBitsToFloat(0xff800000u)
+
+shared vec4 Qf[Br * qf_stride];
+// the tile's K/V rows staged once (K ≡ V): the 2-rowgroup x 2-pass global re-read of
+// the same rows (4x a tile) becomes 1x, and cross-workgroup amplification is heads/Br.
+shared vec4 ksh[Bc * VEC];
+shared int kent[Bc];                    // the tile's list entries (-1: skipped)
+shared float tmpsh[WorkGroupSize];
+shared vec4 tmpshv4[WorkGroupSize];
+
+float bf16r(float x) {   // round to nearest even, as chain_dsv4's mode 0
+    uint u = floatBitsToUint(x);
+    return uintBitsToFloat((u + 0x7fffu + ((u >> 16) & 1u)) & 0xffff0000u);
+}
+
+vec4 bf16r4(vec4 x) {
+    uvec4 u = floatBitsToUint(x);
+    return uintBitsToFloat((u + 0x7fffu + ((u >> 16) & 1u)) & 0xffff0000u);
+}
+
+// One vec4 of a row's latent KV: entry e < nwin the ring's slot e, any other the pool's
+// row e - nwin (the fp16 mirror keeps the same row index, so the read is uniform).
+vec4 kv_load(int e, int v) {
+#ifdef KV_F16
+    f16vec4 r = wv[e * VEC + v];   // the mirror is entry-indexed: ring rows [0, nwin), pool rows after
+    return vec4(r.x, r.y, r.z, r.w);
+#else
+    if (e < p_nwin) return wv[(p_woff >> 2) + e * VEC + v];
+    return cpv[(p_coff >> 2) + (e - p_nwin) * VEC + v];
+#endif
+}
+
+void main() {
+    const int t  = int(gl_WorkGroupID.x);
+    const int hb = int(gl_WorkGroupID.y);
+    if (t >= p_S || hb * Br >= p_H) return;
+    if (p_hd != HSK) return;                // the host pick guarantees; belt+suspenders
+
+    const uint tid = gl_LocalInvocationIndex;
+    const int row_tid         = int(tid) / threads_per_rowgroup;
+    const int rowgroup_tid    = int(tid) % threads_per_rowgroup;
+    const int d_tid           = rowgroup_tid % D_split;
+    const int col_tid         = rowgroup_tid / D_split;
+    const int tile_row_base   = row_tid * rows_per_thread;
+
+    const int n = p_n;                       // the list width (dead entries skipped)
+    if (n < 1 || n > 4096) return;           // the host's cnt guard is tighter
+
+    const int h0 = hb * Br;
+
+    // ---- stage Q (scaled) for the workgroup's Br heads ----
+    for (int idx = int(tid); idx < Br * VEC; idx += WorkGroupSize) {
+        int d = idx % VEC;
+        int r = idx / VEC;
+        bool live = (h0 + r) < p_H;
+        Qf[r * qf_stride + d] = live
+            ? qv[((p_qoff + t * p_qrow + (h0 + r) * HSK) >> 2) + d] * intBitsToFloat(pc.v[16])
+            : vec4(0.0);
+    }
+    barrier();
+
+    // ---- per-row registers (llama's online-softmax state) ----
+    vec4 Of[rows_per_thread][HSV_per_thread / 4];
+    [[unroll]] for (int r = 0; r < rows_per_thread; ++r)
+        [[unroll]] for (int d = 0; d < HSV_per_thread / 4; ++d)
+            Of[r][d] = vec4(0.0);
+    float Lf[rows_per_thread], Mf[rows_per_thread];
+    [[unroll]] for (int r = 0; r < rows_per_thread; ++r) { Lf[r] = 0.0; Mf[r] = NEG_MAX; }
+
+    const int num_tiles = (n + Bc - 1) / Bc;
+
+    for (int j = 0; j < num_tiles; ++j) {
+        // ---- stage the tile's entries and K/V rows once in LDS (K ≡ V) ----
+        for (int e = int(tid); e < Bc * VEC; e += WorkGroupSize) {
+            int cc = e / VEC;
+            int vv = e - cc * VEC;
+            int lin = j * Bc + cc;
+            int ent = lin < n ? sl[p_loff + t * p_lrow + lin] : -1;
+            kent[cc] = ent;
+            ksh[e] = ent >= 0 ? kv_load(ent, vv) : vec4(0.0);
+        }
+        barrier();
+
+        // ---- score pass: Sf[r][c] = dot(q_r * scale, k_c), d-split partial ----
+        float Sf[rows_per_thread][cols_per_thread];
+        [[unroll]] for (int r = 0; r < rows_per_thread; ++r)
+            [[unroll]] for (int c = 0; c < cols_per_thread; ++c)
+                Sf[r][c] = 0.0;
+
+        [[unroll]] for (int d = 0; d < HSK_per_thread / 4; ++d) {
+            vec4 Q_cache[rows_per_thread];
+            [[unroll]] for (int r = 0; r < rows_per_thread; ++r)
+                Q_cache[r] = Qf[(tile_row_base + r) * qf_stride + d * D_split + d_tid];
+            [[unroll]] for (int c = 0; c < cols_per_thread; ++c) {
+                int cc = c * cols_per_iter + col_tid;
+                if (kent[cc] < 0) continue;               // a skipped entry scores nothing
+                vec4 kt = ksh[cc * VEC + d * D_split + d_tid];
+                [[unroll]] for (int r = 0; r < rows_per_thread; ++r)
+                    Sf[r][c] += dot(Q_cache[r], kt);
+            }
+        }
+
+        // reduce the d-slices (16 aligned lanes inside one subgroup — the workgroup
+        // layout keeps every D_split block subgroup-aligned), then kill dead columns
+        [[unroll]] for (int c = 0; c < cols_per_thread; ++c)
+            [[unroll]] for (int hs = D_split / 2; hs > 0; hs >>= 1)
+                [[unroll]] for (int r = 0; r < rows_per_thread; ++r)
+                    Sf[r][c] += subgroupShuffleXor(Sf[r][c], hs);
+        [[unroll]] for (int c = 0; c < cols_per_thread; ++c)
+            if (kent[c * cols_per_iter + col_tid] < 0)
+                [[unroll]] for (int r = 0; r < rows_per_thread; ++r)
+                    Sf[r][c] = NEG_INF;
+
+        // ---- online softmax update (per row) ----
+        float eMf[rows_per_thread];
+        [[unroll]] for (int r = 0; r < rows_per_thread; ++r) {
+            float rowmax = NEG_MAX;
+            [[unroll]] for (int c = 0; c < cols_per_thread; ++c)
+                rowmax = max(rowmax, Sf[r][c]);
+            rowmax += KQ_MAX_OFFSET;
+            float mold = Mf[r];
+            Mf[r] = max(rowmax, mold);
+            eMf[r] = exp(mold - Mf[r]);
+            Lf[r] *= eMf[r];
+        }
+        [[unroll]] for (int r = 0; r < rows_per_thread; ++r)
+            [[unroll]] for (int d = 0; d < HSV_per_thread / 4; ++d)
+                Of[r][d] *= eMf[r];
+
+        // ---- value pass: P in registers, V rows for this thread's columns ----
+        [[unroll]] for (int c = 0; c < cols_per_thread; ++c) {
+            int cc = c * cols_per_iter + col_tid;
+            if (kent[cc] < 0) continue;
+            float Pf[rows_per_thread];
+            [[unroll]] for (int r = 0; r < rows_per_thread; ++r) {
+                float e = exp(Sf[r][c] - Mf[r]);
+                Lf[r] += e;                       // den: UNROUNDED (the CPU ref order)
+                Pf[r] = e;
+                if ((p_flags & 1) != 0) Pf[r] = bf16r(Pf[r]);   // V4's probability round
+            }
+            [[unroll]] for (int d = 0; d < HSV_per_thread / 4; ++d) {
+                vec4 vt = ksh[cc * VEC + d * D_split + d_tid];
+                [[unroll]] for (int r = 0; r < rows_per_thread; ++r)
+                    Of[r][d] += Pf[r] * vt;
+            }
+        }
+        barrier();                                   // ksh reused by the next tile
+    }
+
+    // ---- final cross-thread reduction (shmem trees; wave-size agnostic) ----
+    barrier();
+    [[unroll]] for (int r = 0; r < rows_per_thread; ++r) {
+        float rowmax = Mf[r];
+        barrier();
+        tmpsh[tid] = rowmax;
+        barrier();
+        [[unroll]] for (int s = threads_per_rowgroup / 2; s >= D_split; s >>= 1) {
+            if (rowgroup_tid < s) tmpsh[tid] = max(tmpsh[tid], tmpsh[tid ^ s]);
+            barrier();
+        }
+        rowmax = tmpsh[row_tid * threads_per_rowgroup + d_tid];
+
+        float mold = Mf[r];
+        Mf[r] = max(rowmax, mold);
+        float em = exp(mold - Mf[r]);
+        Lf[r] *= em;
+
+        barrier();
+        tmpsh[tid] = Lf[r];
+        barrier();
+        [[unroll]] for (int s = threads_per_rowgroup / 2; s >= D_split; s >>= 1) {
+            if (rowgroup_tid < s) tmpsh[tid] = tmpsh[tid] + tmpsh[tid ^ s];
+            barrier();
+        }
+        Lf[r] = tmpsh[row_tid * threads_per_rowgroup + d_tid];
+
+        [[unroll]] for (int d = 0; d < HSV_per_thread / 4; ++d) {
+            Of[r][d] *= em;
+            barrier();
+            tmpshv4[tid] = Of[r][d];
+            barrier();
+            [[unroll]] for (int s = threads_per_rowgroup / 2; s >= D_split; s >>= 1) {
+                if (rowgroup_tid < s) {
+                    Of[r][d] += tmpshv4[tid ^ s];
+                    tmpshv4[tid] = Of[r][d];
+                }
+                barrier();
+            }
+            Of[r][d] = tmpshv4[row_tid * threads_per_rowgroup + d_tid];
+        }
+    }
+
+    // ---- sink term (llama's SINK_ENABLE end block) + normalize + store ----
+    [[unroll]] for (int r = 0; r < rows_per_thread; ++r) {
+        int h = h0 + tile_row_base + r;
+        float sink = h < p_H ? b4[p_sink + h] : 0.0f;
+        float ms = 1.0f, vs = 1.0f;
+        if (sink > Mf[r]) {
+            ms = exp(Mf[r] - sink);
+            [[unroll]] for (int d = 0; d < HSV_per_thread / 4; ++d)
+                Of[r][d] *= ms;
+        } else {
+            vs = exp(sink - Mf[r]);
+        }
+        Lf[r] = Lf[r] * ms + vs;
+    }
+
+    [[unroll]] for (int r = 0; r < rows_per_thread; ++r) {
+        float lrcp = (Lf[r] == 0.0) ? 0.0 : 1.0 / Lf[r];
+        int h = h0 + tile_row_base + r;
+        if (h >= p_H || col_tid != 0) continue;
+        [[unroll]] for (int d = 0; d < HSV_per_thread / 4; ++d) {
+            vec4 o = Of[r][d] * lrcp;
+            if ((p_flags & 1) != 0) o = bf16r4(o);       // V4's output round
+            y5[((p_ooff + t * p_orow + h * HSV) >> 2) + d * D_split + d_tid] = o;
+        }
+    }
+}

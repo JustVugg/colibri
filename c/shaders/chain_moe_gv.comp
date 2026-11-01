@@ -3,7 +3,7 @@
 // gate and up pass and the down pass of chain_moe.comp, laid out as chain_gemv.comp lays a
 // dense GEMV. FMT, a specialization constant, is the layer's format: 1 int8 with a scale per
 // row, 2 int4 with a scale per row, 4 int4 with a scale per gs inputs, 7 MXFP4 with a scale
-// per gs inputs, gs a multiple of 32 (the tier's layout: signed bytes, nibbles v + 8 with the
+// per gs inputs (15 the same with the scales as packed ue8m0 bytes), gs a multiple of 32 (the tier's layout: signed bytes, nibbles v + 8 with the
 // low one the even input, or e2m1 nibbles in int4's order). chain_moe.comp spread a
 // row of Qwen3.6's 2048 inputs over 32 lanes, two 16-byte steps each, and a workgroup over
 // 64 outputs: its gate and up pass took 72-80 us a layer on an RTX PRO 4000, where
@@ -113,6 +113,15 @@ float dotmx(uvec4 w, int xb) {
 float stepmx(uvec4 v, int q, SRef sc, uint row, uint ng, uint gs) {
     return dotmx(v, q * 8) * sc.v[row * ng + uint(q * 32) / gs];
 }
+// a step of FMT 15: the scale a ue8m0 byte, 4 to a word; its float is the exponent into
+// the float's exponent field — the same bits the f32-scale form (7) holds expanded
+float sc8(SRef sc, uint b) {
+    uint w = floatBitsToUint(sc.v[b >> 2u]);
+    return uintBitsToFloat(uint(bitfieldExtract(w, int((b & 3u) * 8u), 8)) << 23);
+}
+float stepmx8(uvec4 v, int q, SRef sc, uint row, uint ng, uint gs) {
+    return dotmx(v, q * 8) * sc8(sc, row * ng + uint(q * 32) / gs);
+}
 // FMT 4 with groups that split a step (gs not a multiple of 32, a multiple of 8): each word's
 // 8 weights times their group's scale
 float dot4w(uint w, int xb, SRef sc, uint sb, uint i, uint gs) {
@@ -134,6 +143,7 @@ float rowpart(WRef4 w, SRef sc, uint row, uint rw4, uint ng, uint gs, int nq, in
         if (FMT == 1) acc += dot8(v, q * 4);
         else if (FMT == 2) acc += dot4(v, q * 8);
         else if (FMT == 7) acc += stepmx(v, q, sc, row, ng, gs);
+        else if (FMT == 15) acc += stepmx8(v, q, sc, row, ng, gs);
         else acc += step4(v, q, sc, row, ng, gs);
     }
     return acc;
@@ -210,12 +220,13 @@ void main() {
                     if (FMT == 1) { g += dot8(vg, q * 4); uu += dot8(vu, q * 4); }
                     else if (FMT == 2) { g += dot4(vg, q * 8); uu += dot4(vu, q * 8); }
                     else if (FMT == 7) { g += stepmx(vg, q, sg_, uint(o), ng, gs); uu += stepmx(vu, q, su, uint(o), ng, gs); }
+                    else if (FMT == 15) { g += stepmx8(vg, q, sg_, uint(o), ng, gs); uu += stepmx8(vu, q, su, uint(o), ng, gs); }
                     else { g += step4(vg, q, sg_, uint(o), ng, gs); uu += step4(vu, q, su, uint(o), ng, gs); }
                 }
             }
             g = lanes_sum(g, lpr); uu = lanes_sum(uu, lpr);
             if (lane == 0 && live) {
-                if (FMT != 4 && FMT != 7) { g *= sg_.v[o]; uu *= su.v[o]; }
+                if (FMT != 4 && FMT != 7 && FMT != 15) { g *= sg_.v[o]; uu *= su.v[o]; }
                 hid[(s * p.K + k) * p.I + o] = act(g, uu);
             }
         }
@@ -247,6 +258,6 @@ void main() {
                               : w4 ? rowpart4(wd, sd, uint(oc), rws / 4u, ng, gs, nq, lane, lpr)
                               : rowpart(wd, sd, uint(oc), rws / 4u, ng, gs, nq, lane, lpr);
         d = lanes_sum(d, lpr);
-        if (lane == 0 && live) yo[p.y_off + j * p.y_row + o] = FMT != 4 && FMT != 7 ? d * sd.v[oc] : d;
+        if (lane == 0 && live) yo[p.y_off + j * p.y_row + o] = FMT != 4 && FMT != 7 && FMT != 15 ? d * sd.v[oc] : d;
     }
 }

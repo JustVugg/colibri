@@ -1,0 +1,98 @@
+The independent second audit's fresh reproduction (2026-10-31, 17:42–19:16):
+12 legs, all GREEN, zero gate-skips, zero device-losts. PR binary
+/root/audit-wt/pr-bench/c @ cb0a0a91; base binary /root/audit-wt/base-tests/c
+@ d67ebd8b. Driver driver.sh (this directory, verbatim) over the harness copy
+run-audit.sh (this directory, verbatim — the imp3-stack run-arm2276.sh with
+only OUT= changed); the whole session, every launch, gate decision, parse
+line and mem peak is in window.raw.txt. Every number below is recomputable
+from the raw logs beside this file: ttft and wall from each log's own lines
+(`timing time_to_first_token=…s after_first=…s`, `TUNE decode: 64 tokens in
+…s`), decode = 63/(wall − ttft), the harness parse convention (identical to
+the gap4 record's); the after_first cross-check column differs from
+wall − ttft only by the timing line's rounding (<= 0.026 s every leg).
+
+leg (raw file)        arm / binary / env                 ttft s   decode tok/s   wall s   after_first s   mem peak
+legacy-r1.raw.txt     LEGACY  PR  COLI_VK_LEGACY=1       253.953      0.7882     333.877       79.901       15.80 GiB
+legacy-r2.raw.txt     LEGACY  PR  COLI_VK_LEGACY=1       252.481      0.8708     324.826       72.321       15.80 GiB
+legacy-r3.raw.txt     LEGACY  PR  COLI_VK_LEGACY=1       261.163      0.6208     362.648      101.462       15.80 GiB
+defaults-r1.raw.txt   defaults PR  (env-free)            260.897      0.8987     330.998       70.077        2.42 GiB
+defaults-r2.raw.txt   defaults PR  (env-free)            245.498      0.9037     315.215       69.694        2.42 GiB
+defaults-r3.raw.txt   defaults PR  (env-free)            251.805      0.9193     320.339       68.511        2.41 GiB
+oneline-r1.raw.txt    oneline PR  PROFILE=RDNA2 HOST_GB=2 149.080     0.8911     219.779       70.675        2.30 GiB
+oneline-r2.raw.txt    oneline PR  PROFILE=RDNA2 HOST_GB=2 155.972     0.9330     223.494       67.499        2.24 GiB
+oneline-r3.raw.txt    oneline PR  PROFILE=RDNA2 HOST_GB=2 160.839     0.8740     232.923       72.059        2.27 GiB
+uvk-r1.raw.txt        base    BASE d67ebd8b (env-free)   414.880      0.5239     535.135      120.231       n/a (D2)
+uvk-r2.raw.txt        base    BASE d67ebd8b (env-free)   434.471      0.5135     557.156      122.661       n/a (D2)
+mm8-r1.raw.txt        mm8 opt-in PR  oneline + MM8_NDBUF=2 162.178    0.9570     228.009       65.807        2.28 GiB
+
+(63/after_first — the decode rate over the log's own after-first span — agrees
+with the quoted decode to <= 0.001 tok/s on every leg, e.g. legacy-r1
+63/79.901 = 0.7885 vs 0.7882, mm8-r1 63/65.807 = 0.9574 vs 0.9570.)
+
+mem peaks from window.raw.txt (the per-leg VmHWM sampler; both uvk legs were
+missed by the sampler — D2 in the audit report; their logs show the mapped
+13 GiB weights path). The host-RAM drop 15.80 -> ~2.3 GiB is the forked
+decode path's slab registry (LEGACY keeps the malloc/import path).
+
+arm (n)            decode med (range)      ttft med s (range)      wall med s
+legacy (3)         0.7882 (0.6208–0.8708)  253.953 (252.481–261.163)  333.877
+defaults (3)       0.9037 (0.8987–0.9193)  251.805 (245.498–260.897)  320.339
+oneline (3)        0.8911 (0.8740–0.9330)  155.972 (149.080–160.839)  223.494
+uvk / base (2)     0.5187 (0.5135–0.5239)  424.675 (414.880–434.471)  546.145
+mm8 opt-in (1)     0.9570                 162.178                  228.009
+
+The audit report's headline deltas, recomputed from the medians above (the
+report truncates some of these; the recomputation is exact):
+
+  defaults vs LEGACY, decode med/med:   0.9037 / 0.7882  = +14.65%  (report
+      "+14.7%"; per-rep +14.0 / +3.8 / +48.1%) — TTFT −0.8% (parity)
+  oneline vs LEGACY, ttft med/med:      155.972 / 253.953 = −38.58%  (report
+      "−38.5%"; per-rep −41.3 / −38.2 / −38.4%), decode +13.1%
+  oneline vs defaults, ttft med/med:    155.972 / 251.805 = −38.06%  (report
+      "−38.0%"), decode −1.4% (parity kept)
+  oneline vs fresh base (uvk), decode:  0.8911 / 0.5187  = +71.79%  (report
+      "+71.7%"), ttft 155.972 / 424.675 = −63.27% (report "−63.3%")
+  mm8 opt-in vs oneline (n=1):          decode +7.4%, ttft +4.0%
+
+The gap4 record's +41.8% did not materialize at that size this session
+(LEGACY ran 0.62–0.87 — above its gap4 band — while defaults ran 0.90):
+direction reproduced in every rep, magnitude +14.7% med/med. The one-line
+TTFT −38.5% matches the first audit's −37%, short of the PR title's −45%.
+The fresh base no longer matches the PR's cited base arm: d67ebd8b maps the
+13 GiB host-visible weights onto the device budget before the chain fit
+(chain 9/43 layers, decode 0.52, TTFT ~420–435 s) — an upstream-side change
+(the PR's window probe is what restores 43/43 in every PR leg here); the
+PR's gap4-uvk-r3 base leg (0.7291 @ 263.635, 43/43) is on the record in
+docs/experiments/dsv4-perf-2026-10-30-gap4/.
+
+n disclosure: legacy 3, defaults 3, oneline 3, uvk (base) 2, mm8 1. The uvk
+legs were scheduled into reps 1–2; their first two attempts failed instantly
+(a concurrent base-tree make check had wiped the base binary — window.raw.txt
+rc=NA "missing …/base-tests/c/deepseek_v4") and both re-ran GREEN in driver
+pass 2 on the tests lane's relink (md5 8b29e19b7b4bdc09b86a55d160eaaf77,
+make -j18 VK=1 deepseek-v4 up-to-date; LTO link size differs from the 17:08
+build, placement/budget logic untouched). mm8 is the optional tail leg, n=1
+by design.
+
+Regime (every leg, from driver.sh / window.raw.txt): VRAM_MAX_USED_MB=3584
+RAM_GB=16 COLI_BENCH_MEMORY_GB=24, OMP 16, the same 2,515-token prompt_2k,
+64 decode tokens, .coli_usage state snapshotted per leg, legs interleaved
+R=1..3 with per-rep shuffle, pre-leg VRAM gate (7x10 s: band <= 64 MiB, max
+<= 3544 MiB, avail >= 2 GiB), one -r2 retry per failed leg.
+
+Quality gates (this record's arms at cb0a0a91, verified by the audit's
+build/test matrix the same day): make check VK=1 green 2,787 OK (skipped
+322); vk-tier-check 9 legs incl. the COLI_VK_LEGACY=1 leg; vk-chain-check;
+vk-memtype-check; vk-strict-check incl. the LEGACY==base byte-identity case;
+tiny-fixture stdout byte-identical across base / LEGACY=1 / defaults (md5s
+cf882339…, 81aaba18…, 6b7d7ac0…). python3 c/experiment_manifest.py passes
+this record's manifest.json (baseline/trial are the n=3 legacy/defaults
+arms; oneline/uvk/mm8 are the disclosed extra arms).
+
+Boot-line cross-checks in the raw logs: every PR leg "the window probe freed
+13 GiB; the driver's budget read them back in 181 ms" and chain "43 of 43
+layers"; LEGACY legs carry "legacy (COLI_VK_LEGACY=1)" per lever and "FA
+refused: legacy"; defaults/oneline/mm8 carry "decode-path=fork … engaged",
+"s1gemv … armed", "cs experts armed", "FA engaged"; oneline/mm8 add
+"profile: RDNA2 -> ttft … CHAIN_ROWS_MAX=2048" and 2048-row prompt chunks;
+the base legs carry fmt 7, chain "9 of 43", no probe wait.

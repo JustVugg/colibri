@@ -71,6 +71,11 @@ shaders/qmatmul_gate_up.spv
 shaders/expert_act.spv
 shaders/expert_act_v4.spv
 shaders/rmsnorm.spv
+shaders/chain_dsv4_fa.spv
+shaders/chain_dsv4_fa_f16.spv
+shaders/chain_dsv4_fa_dec.spv
+shaders/chain_dsv4_fa_dec_f16.spv
+shaders/chain_dsv4_fa_gather.spv
 # Optional XDNA test scaffolding that the *.o / *.dll globs above do not cover.
 tests/xdna_exec_fixtures/
 tests/xdna_fail_fixtures/

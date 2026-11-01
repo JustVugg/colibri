@@ -103,8 +103,17 @@ float e4m3(uint w, int k) {
     float v = e == 0u ? float(m) * 0.001953125 : ldexp(1.0 + float(m) * 0.125, int(e) - 7);
     return (b & 0x80u) != 0u ? -v : v;
 }
-uint vpw(int fmt) { return fmt == 10 ? 1u : fmt == 11 ? 2u : (fmt == 2 || fmt == 4 || fmt == 7) ? 8u : 4u; }
-bool grouped(int fmt) { return fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13; }
+uint vpw(int fmt) { return fmt == 10 ? 1u : fmt == 11 ? 2u : (fmt == 2 || fmt == 4 || fmt == 7 || fmt == 15) ? 8u : 4u; }
+bool grouped(int fmt) { return fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13 || fmt == 15; }
+// fmt 15: the scale a ue8m0 byte, 4 to a word; its float is the exponent into the float's
+// exponent field -- the same bits the f32-scale form (7) holds after the host's expansion
+float gsc(SRef sc, int fmt, uint b) {
+    if (fmt == 15) {
+        uint w = floatBitsToUint(sc.v[b >> 2u]);
+        return uintBitsToFloat(uint(bitfieldExtract(w, int((b & 3u) * 8u), 8)) << 23);
+    }
+    return sc.v[b];
+}
 // the staged row keeps a vec4 of padding after every 8: a lane's step reads 8 (or 4)
 // consecutive vec4s and the next lane's start 8 further on, which without it put the
 // lanes of a phase on the same banks of shared memory
@@ -118,8 +127,8 @@ float word_dot(int fmt, uint w, uint iw) {
     if (fmt == 1 || fmt == 13) { vec4 a = xv4(iw >> 2); return dot(a, vec4(i8(w, 0), i8(w, 1), i8(w, 2), i8(w, 3))); }
     if (fmt == 12) { vec4 a = xv4(iw >> 2); return dot(a, vec4(e4m3(w, 0), e4m3(w, 1), e4m3(w, 2), e4m3(w, 3))); }
     vec4 a = xv4(iw >> 2), c = xv4((iw >> 2) + 1u);
-    if (fmt == 7) return dot(a, vec4(mx4(w, 0), mx4(w, 1), mx4(w, 2), mx4(w, 3))) +
-                         dot(c, vec4(mx4(w, 4), mx4(w, 5), mx4(w, 6), mx4(w, 7)));
+    if (fmt == 7 || fmt == 15) return dot(a, vec4(mx4(w, 0), mx4(w, 1), mx4(w, 2), mx4(w, 3))) +
+                              dot(c, vec4(mx4(w, 4), mx4(w, 5), mx4(w, 6), mx4(w, 7)));
     return dot(a, vec4(i4(w, 0), i4(w, 1), i4(w, 2), i4(w, 3))) + dot(c, vec4(i4(w, 4), i4(w, 5), i4(w, 6), i4(w, 7)));
 }
 
@@ -129,8 +138,8 @@ float word_dot(int fmt, uint w, uint iw) {
 // per format (FMT a constant in each), so that the decode has no branch in the loop.
 #define BLOCK_BODY(FMT) {                                                                          \
     const int fmt = FMT;                                                                           \
-    const uint per = (fmt == 10 ? 1u : fmt == 11 ? 2u : (fmt == 2 || fmt == 4 || fmt == 7) ? 8u : 4u) * 4u; \
-    const bool grp = fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13;                               \
+    const uint per = (fmt == 10 ? 1u : fmt == 11 ? 2u : (fmt == 2 || fmt == 4 || fmt == 7 || fmt == 15) ? 8u : 4u) * 4u; \
+    const bool grp = fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13 || fmt == 15;                  \
     uint ng = gs > 0u ? (uint(g_n) + gs - 1u) / gs : 1u, r4 = rowWords / 4u;                       \
     bool one = grp && gs % per == 0u;                                                              \
     uint ob[RPS]; bool okr[RPS];                                                                   \
@@ -148,11 +157,11 @@ float word_dot(int fmt, uint w, uint iw) {
             if (!grp || one) {                                                                     \
                 float d = word_dot(fmt, v[t].x, i0) + word_dot(fmt, v[t].y, i0 + per / 4u) +       \
                           word_dot(fmt, v[t].z, i0 + per / 2u) + word_dot(fmt, v[t].w, i0 + 3u * per / 4u); \
-                acc[t] += grp ? (okr[t] ? sc.v[ob[t] * ng + min(i0 / gs, ng - 1u)] : 0.0) * d : d; \
+                acc[t] += grp ? (okr[t] ? gsc(sc, fmt, ob[t] * ng + min(i0 / gs, ng - 1u)) : 0.0) * d : d; \
             } else {                                                                               \
                 [[unroll]] for (uint h = 0u; h < 4u; h++) {                                        \
                     uint iw = i0 + h * (per / 4u);                                                 \
-                    float s = okr[t] ? sc.v[ob[t] * ng + min(iw / gs, ng - 1u)] : 0.0;             \
+                    float s = okr[t] ? gsc(sc, fmt, ob[t] * ng + min(iw / gs, ng - 1u)) : 0.0;     \
                     acc[t] += s * word_dot(fmt, v[t][h], iw);                                      \
                 }                                                                                  \
             }                                                                                      \
@@ -165,6 +174,7 @@ void block_1(BLOCK_ARGS) BLOCK_BODY(1)
 void block_2(BLOCK_ARGS) BLOCK_BODY(2)
 void block_4(BLOCK_ARGS) BLOCK_BODY(4)
 void block_7(BLOCK_ARGS) BLOCK_BODY(7)
+void block_15(BLOCK_ARGS) BLOCK_BODY(15)
 void block_10(BLOCK_ARGS) BLOCK_BODY(10)
 void block_11(BLOCK_ARGS) BLOCK_BODY(11)
 void block_12(BLOCK_ARGS) BLOCK_BODY(12)
@@ -182,6 +192,7 @@ void block(WRef4 w, SRef sc, int fmt, uint rowWords, uint gs, uint O, uint o0, u
     else if (fmt == 2) block_2(w, sc, rowWords, gs, O, o0, qbase, remaining, RW, rg, jj, lpr, W4, acc);
     else if (fmt == 4) block_4(w, sc, rowWords, gs, O, o0, qbase, remaining, RW, rg, jj, lpr, W4, acc);
     else if (fmt == 7) block_7(w, sc, rowWords, gs, O, o0, qbase, remaining, RW, rg, jj, lpr, W4, acc);
+    else if (fmt == 15) block_15(w, sc, rowWords, gs, O, o0, qbase, remaining, RW, rg, jj, lpr, W4, acc);
     else if (fmt == 10) block_10(w, sc, rowWords, gs, O, o0, qbase, remaining, RW, rg, jj, lpr, W4, acc);
     else if (fmt == 11) block_11(w, sc, rowWords, gs, O, o0, qbase, remaining, RW, rg, jj, lpr, W4, acc);
     else if (fmt == 12) block_12(w, sc, rowWords, gs, O, o0, qbase, remaining, RW, rg, jj, lpr, W4, acc);
@@ -316,7 +327,7 @@ float rowdot(WRef W, SRef Sc, int fmt, int rowWords, int gs, int o, int lane, in
             uint pk = W.v[rb + uint(min(wi, words - 1))]; int i0 = wi * 8;
             for (int k = 0; k < 8; k++) if (i0 + k < n) sum += xin(i0 + k) * i4(pk, k);
         }
-    } else if (fmt == 4 || fmt == 7) {
+    } else if (fmt == 4 || fmt == 7 || fmt == 15) {
         int words = (n + 7) / 8, ng = (n + gs - 1) / gs;
         uint sb = uint(o) * uint(ng);
         for (int wi = lane; wi < words; wi += sgs) {
@@ -325,7 +336,7 @@ float rowdot(WRef W, SRef Sc, int fmt, int rowWords, int gs, int o, int lane, in
             float a = 0.0;
             if (fmt == 4) { for (int k = 0; k < 8; k++) if (i0 + k < n) a += xin(i0 + k) * i4(pk, k); }
             else          { for (int k = 0; k < 8; k++) if (i0 + k < n) a += xin(i0 + k) * mx4(pk, k); }
-            sum += a * Sc.v[sb + uint(i0 / gs)];
+            sum += a * gsc(Sc, fmt, sb + uint(i0 / gs));
         }
     } else if (fmt == 5) {
         int ng = (n + 63) >> 6;

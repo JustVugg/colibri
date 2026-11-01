@@ -1,0 +1,58 @@
+[OMP] deepseek-v4: effective team size 16
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] memory: the window probe freed 13 GiB; the driver's budget read them back in 201 ms
+[VK] memory: mapped weights, the host-visible device-local memory gave the 13 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s
+[VK] ready: AMD Radeon RX 6900 XT (RADV NAVI21), compute qfam 0, memtype 3, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096
+[VK] deepseek_v4: device ready, dense matrices on the device (default)
+[VK] deepseek_v4: dense chain on (a discrete GPU, beside the expert tier)
+[VK] deepseek_v4 chain fit: free 15074533376 B, reserve 1073741824 B, fixed 585961472 B (the engine's 99422208 B, the pools' 486539264 B), tail 1149250560 B, layers 140221400 140221400 170801880 150056408 170801880 150056408 170801880 150056408 170801880 150056408 170801880 150056408 170801880 150056408 170801880 150056408 170801880 150056408 170801880 150056408 170801880 150056408 170801880 150056408 170801880 150056408 170801880 150056408 170801880 150056408 170801880 150056408 170801880 150056408 170801880 150056408 170801880 150056408 170801880 150056408 170801880 150056408 170801880 B, matrices 139395080 139395080 169541660 147783696 169541660 147783696 169541660 147783696 169541660 147783696 169541660 147783696 169541660 147783696 169541660 147783696 169541660 147783696 169541660 147783696 169541660 147783696 169541660 147783696 169541660 147783696 169541660 147783696 169541660 147783696 169541660 147783696 169541660 147783696 169541660 147783696 169541660 147783696 169541660 147783696 169541660 147783696 169541660 B
+[VK] deepseek_v4 chain: 43 of 43 layers on the device (6.40 GiB), 0 on the CPU (free 14.04 GiB, reserve 1.00 GiB)
+[VK] deepseek_v4: dense weights on the device only (a discrete GPU with room for them: 6.02 of 13.04 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+ram_tiers available=16.00GiB dense=device(6.02GiB on the device, 0.25GiB in RAM) target_slots=25 target_cache=13.39GiB head=resident-bf16 projected=15.51GiB
+v4_open index=0.11s plan=0.00s (index built once, reused by plan/inventory/head)
+[VK] tier : decode-path=fork arena=13.39GiB slabs=1075 slab=12.76MiB engaged (registry block=2048MiB cap=17.03GiB)
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=/root/Projects/colibri-v4-docker/models/DeepSeek-V4-Flash/.coli_usage selections=625094
+v4_mfu history=/root/Projects/colibri-v4-docker/models/DeepSeek-V4-Flash/.coli_mfu selections=1560384
+v4_hot_policy pin_slots_per_layer=16 frozen_per_layer=0 repin_interval=6 mode=resident-ram rows16=hot-pins
+v4_dense_resident layers=43 bytes=6.267GiB
+[VK] deepseek_v4 chain: 43 layers on the device (41 compressing, 21 indexing), 4 streams, 7.1 MiB of parameters, 897 matrices (6480.1 MiB) on the device
+[VK] deepseek_v4 chain: 43 of 43 layers placed: 6794838940 B of matrices on the device (the fit counted 6794838940 B for these layers), chain buffers 50600520 B, device memory held 7113539584 B
+[VK] deepseek_v4: 489 dense matrices on the device only, 6.02 GiB of host RAM given back; kept on the host: norms, block scales, the router, the indexer's weights_proj, the mHC mixes, the head; RSS now 1.300 GiB
+[VK] tier s1gemv: qmatmul_s1_mx armed (down of S=1 rows, parity vs qmatmul exact)
+[VK] tier deepseek_v4: cs experts armed (1): decode's routed group -- the residents' handles and zero-copy store-slab aliases -- issues at the token's finish site
+[VK] tier deepseek_v4: on, AMD Radeon RX 6900 XT (RADV NAVI21), budget 6.40 GiB = 448 experts of 12.8 MiB (fmt 15 gs 32, down fmt 15 gs 32), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] tier deepseek_v4: host pool on, 39 experts in 512.0 MiB of system RAM the device reads over PCIe (the RAM plan leaves 501.3 MiB of the 16.00 GiB budget; 10560 the devices leave, not all of them; COLI_VK_TIER_HOST=0 off, COLI_VK_TIER_HOST_GB overrides)
+[VK] tier deepseek_v4: warm start, 487 experts in 2.8s (487 from the history, 0 more to fill the device)
+v4_cli mode=chat memory=limited target_only=1
+[VK] deepseek_v4 chain: prompt chunks of up to 768 rows (1054 KiB a row; 1.65 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[VK] chain: attention FA engaged: the flash tile takes the dsv4 attention (a thresholded class, never bit-identical to mode 0)
+[VK] tier deepseek_v4 stream: a step of 768 rows; cold experts with 16 rows or more go to the device (the GEMM's 16 rows: the upload and the CPU's rows not measured yet); layer 0: 1 resident, 105 streamed (0 of them copied from the host pool), 116 kept on the CPU (931 rows)
+[VK] tier deepseek_v4 stream: a step of 768 rows; cold experts with 16 rows or more go to the device (an upload of 12.8 MiB at 8.9 GB/s takes 1.495 ms, the CPU 1.2626 ms a row; the GEMM from more rows); layer 0: 36 resident, 104 streamed (0 of them copied from the host pool), 81 kept on the CPU (421 rows)
+[VK] tier deepseek_v4 stream: a step of 768 rows; cold experts with 16 rows or more go to the device (an upload of 12.8 MiB at 9.2 GB/s takes 1.458 ms, the CPU 0.8798 ms a row; the GEMM from more rows); layer 0: 3 resident, 110 streamed (0 of them copied from the host pool), 108 kept on the CPU (820 rows)
+[VK] tier deepseek_v4 stream: a step of 211 rows; cold experts with 16 rows or more go to the device (an upload of 12.8 MiB at 9.2 GB/s takes 1.457 ms, the CPU 1.0802 ms a row; the GEMM from more rows); layer 0: 2 resident, 16 streamed (0 of them copied from the host pool), 169 kept on the CPU (924 rows)
+Looking[VK] tier deepseek_v4: decode grow armed (headroom): 97.6 MiB free less 512.0 MiB reserve at the probe, the guard re-probes as installs proceed -> up to 0 places, 62 stream slots beyond, budget 448 experts now, cutoff 2186 (COLI_VK_TIER_DECODE_GROW_HEADROOM; installs rank by the engine's decode-only counts)
+ at this code, I can see that the `solve` function and `SegmentTree` class are being defined multiple times with identical implementations. This is redundant code duplication.
+
+The key observations:
+
+1. **`solve` function**: This is the classic Two Sum problem solution using a hash map for O(n) time
+v4_tokens prompt=2515 generated=64 total=2579 expert_requests=39359 hits=8079 misses=31280 hit_rate=20.526 hit_rate_d=53.907 bytes=418193080320 target_only=1
+TUNE decode: 64 tokens in 300.637s
+generated_text=Looking at this code, I can see that the `solve` function and `SegmentTree` class are being defined multiple times with identical implementations. This is redundant code duplication.
+
+The key observations:
+
+1. **`solve` function**: This is the classic Two Sum problem solution using a hash map for O(n) time
+timing time_to_first_token=235.782s after_first=64.830s
+[VK] deepseek_v4 chain: 64 forwards, 6072 frames (197537 ops, 37051 matmuls, 0 tiled GEMM), 9785.9 ms waiting for the device, 196710.0 ms of routed experts on the host, 1004.4 MiB on the device
+[VK] tier deepseek_v4 run: device 574196 of 665124 routed experts (86.3%; this run 574196 of 665124) | CPU RAM hits 8079, disk loads 31280 | resident 497 (budget 497, 6.38 GiB of 7.01 GiB, 26 blocks, frag 0.13) | uploads 785 (9.20 GiB, 487 warm), evictions 249, skipped 9 queue + 35 rate, failed 0 | device 13875.2 ms, CPU share 145036.5 ms, waited 10910.5 ms (21% of device time hidden) | decode: 16254 of 16254 routed experts on the device (100.0%) | decode grow: 49 installed by decode-only rank (cutoff 2186), 49 of the stream slots' places (slots 64 -> 15) | cs: 2709 groups, 3775 resident + 12479 aliased entries on the device, 0 cpu-fallback (0 alias refusals, 12479 registry) | balance: device share 1.00, 0 rows handed to the CPU | exclusive: 42 RAM copies of device experts given up first | stream: 172 steps, 8731 cold experts (125.33 GiB, 9.12 GB/s) and 346240 rows streamed in 561 sub-batches, prefetched 8177 (6842 used), 16814 cold experts (90928 rows) kept on the CPU, R=16 | host pool: resident 39 (budget 39, 497.2 MiB of 512.0 MiB), the RAM plan leaves 501.3 MiB of the 16.00 GiB budget
+[VK] deepseek_v4: 2945 matmuls on the GPU
+[VK] deepseek_v4: 941 resident matrices on the device, 7576.1 MiB (fp8 as fmt 12, bf16 as fmt 11)
+[STATS] 1226170 selections across 9150 distinct experts -> /root/Projects/colibri-v4-docker/models/DeepSeek-V4-Flash/.coli_usage
+v4_rows16 packed_slots=0
+v4_direct reads=487 flock_reads=0 fallbacks=31280 payload_bytes=6127878144
+[VK] deepseek_v4: dense weights at exit: 489 matrices on the device only (6.02 GiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 0.617 GiB
+rc=0 gap4-defaults-r5
+mem peak=12.52GiB oom_kill=0
+vram0=2732949504 B (/sys/class/drm/card2/device/mem_info_vram_used)

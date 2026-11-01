@@ -60,6 +60,7 @@ typedef struct {
     uint8_t host;                      /* dev 0 with its tensors in the host pool (coli_vk_tier_host_pool): the
                                         * primary device reads them over PCIe, in a batch and in the dense chain */
     uint8_t up;                        /* T.full: on its way from the host pool to the device (promote) */
+    uint8_t pin;                       /* the hot set's (hot_pin): no victim path may take this resident */
     ColiVkExpert *hex;                 /* T.full: its copy in the host pool (ex itself while host) */
 } VSlot;
 /* dev: the place (place_of); src: a promotion's host pool copy, copied up instead of buf */
@@ -71,6 +72,28 @@ typedef struct { int layer, eid, ok, copy_failed; ColiVkTensor *g, *u, *d, *hg, 
 enum { SS_FREE = 0, SS_FILLED, SS_BUSY };
 typedef struct { ColiVkTensor *t[3]; ColiVkExpert *ex; int layer, eid, state, pending, pref; } VStage;
 typedef struct { int n, nslot, cap, *slot; float **yout; } VSub;
+/* One tier-owned CS alias keepalive (COLI_VK_TIER_CS_ALIAS_CACHE): the exact alias-source
+ * geometry as the key -- slab pointer and bytes beside woff/soff, fmt, I/O and gs, so a slot
+ * rewritten to another expert's geometry (or reallocated elsewhere) is a different entry -- and
+ * the one slab reference the cache holds across joins (the tensors' own references ride the
+ * in-flight group and go at its join). imp_bytes is the slab's imported bytes, the MB bound's
+ * charge; seq is the LRU stamp. The scan-skip lever (COLI_VK_TIER_CS_ALIAS_SCAN_SKIP) records
+ * beside them the CONTENT the entry's f16-range verdicts (wide, one a tensor role) were earned
+ * for -- layer and eid: the same (layer, expert) re-aliased from the same address is the same
+ * bytes (the store's record reads are fixed per expert), so its hits pass the verdicts to
+ * coli_vk_tensor_alias_wide and skip the scale scan; anything else (a slot rewritten to
+ * another expert at the same geometry, a forgotten-and-reallocated address) rebuilds with
+ * the scan. wide_ok 0 until a build recorded them. */
+typedef struct {
+    const void *slab; size_t bytes;
+    size_t woff[3], soff[3];
+    int I[3], O[3], fmt, gs;
+    ColiVkSlab *imp;
+    size_t imp_bytes;
+    int layer, eid;
+    uint8_t wide[3], wide_ok;
+    unsigned long long seq;
+} VCsAlias;
 
 static struct {
     int on;
@@ -113,6 +136,18 @@ static struct {
     ColiVkExpert **dfree; int ndfree, cdfree;
     unsigned long long ups, up_victims, vram_routed;
     unsigned long long dec_routed, dec_vram;   /* the same in steps of up to VKT_UP_ROWS rows (decode, a verify) */
+    unsigned long long d_routed, d_served;     /* routed and served of those steps only, issue's and dev_count's books
+                                                * alike: the report's decode-only device share (the run's own line is
+                                                * dominated by a prompt's rows) */
+    double d_wait_ms, d_dev_ms, d_cpu_ms;      /* COLI_VK_CHAIN_DPROF: the join's wait, device and CPU ms of those
+                                                * steps (vkt_join), beside wait_ms/dev_ms/cpu_ms */
+    unsigned long long d_up_bytes;             /* and promote()'s queued upload bytes: H1's PCIe traffic term */
+    double p_wait_ms, p_dev_ms, p_cpu_ms;      /* the same mirror for the prompt class (S > VKT_UP_ROWS): a step's whole span,
+                                                * issue to join -- its fence waits, its batches' device time, and the rest, the
+                                                * host's own loads/uploads/grouping; the engine's host-MoE window charges that
+                                                * span's wall, this line splits it (the decode class keeps d_* above) */
+    unsigned long long p_steps;
+    double p_t0, p_w0, p_d0;                   /* the span's capture, at issue's head */
     size_t stage_room;                 /* left out of the budget for a prompt chunk's staging (VktConfig.stage) */
     /* the second device (COLI_VK_DEV2) */
     int d2;                            /* the tier holds experts there */
@@ -132,7 +167,9 @@ static struct {
     double d2_ms;
     VSlot *s;
     uint32_t tick, decay_at;          /* tokens seen (rows of the forward's first layer) */
-    int last_layer, first_layer, promos[2], promo_cap;   /* promotions this forward, the main layers' and the extra ones', each up to the cap */
+    int last_layer, first_layer, promos[2], promo_cap;   /* promotions this forward, the main layers' and the extra ones', each up to the
+                                                          * cap: the rate's per-token arithmetic, or promo_fix's fixed take */
+    int promo_fix;                      /* COLI_VK_TIER_PROMO_CAP: the forward's cap set outright (negative: none) */
     int begin;                         /* vkt_begin_forward: the next issue starts a forward */
     /* uploader */
     pthread_t th; int th_on, stop;
@@ -186,10 +223,151 @@ static struct {
      * to the device failed, or the batch could not take the uploaded expert's sets */
     unsigned long long f_pool, f_copy, f_sets;
     int plan_hist;                        /* the last plan's experts from the history (vkt_plan) */
+    /* the hot set (COLI_VK_TIER_HOT, hot_pin): hot its share of the resident places in %,
+     * hot_scope 1 the per-layer rule, hot_update a re-pin at every forward, hot_hash the
+     * first main layers a hash router serves (no meaningful heat: never pinned), pin_layer
+     * COLI_VK_TIER_PIN_LAYER's layer, pool_layer COLI_VK_TIER_POOL_LAYER's (its experts go
+     * to the host pool, not the device) and pool_said its one line, npin the pins standing,
+     * hot_order/n_hot_order the ranking it keeps them in */
+    int hot, hot_scope, hot_update, hot_hash, pin_layer, pool_layer, npin, n_hot_order, *hot_order;
+    uint8_t pool_said;
+    /* the VRAM bank (COLI_VK_TIER_BANK_LAYER): the tier's stream slots exchanged for one
+     * layer's experts, resident on the device and pinned for the bank's tenure. bank_layer
+     * the env's layer (-1 off), bank_on armed after the carve found the room, bank_cur the
+     * layer its places hold now (the env's at boot; a rotation's vkt_bank_switch moves it),
+     * bank_slots0 the slot budget before the carve (the ledger line's pair), bank_valid /
+     * bank_tried per expert of bank_cur (resident / refilled once this tenure -- at most
+     * once: a failure is never re-read until the layer switch clears both), the counters,
+     * bank_said the one decline line's latch */
+    int bank_layer, bank_on, bank_cur, bank_slots0;
+    uint8_t *bank_valid, *bank_tried;
+    unsigned long long bank_refills, bank_bytes;
+    uint8_t bank_said;
+    /* decode growth (COLI_VK_TIER_DECODE_GROW): the resident set stops being the warm
+     * start's fixed one. At the tier's first decode-class step (the prompt done, the
+     * chain's KV mirror and the head allocated -- the free VRAM the boot arithmetic
+     * could only reserve for) the tier measures what the device has free and grows its
+     * budget into that first, then -- only beyond it -- retires stream slots one place
+     * at a time as decode demand installs: at decode the slots are idle staging (big
+     * steps alone use them), so their bytes are the room that costs nothing but the
+     * next prompt's stream breadth. The installs rank by the engine's decode-only
+     * counts (VktConfig.decode_heat) through a K-th-largest cutoff over the experts the
+     * device does not hold -- the fork's cache_reorder rule -- and no victim ever gives
+     * way: growth only takes free or retired bytes, so the warm set stands (evictions
+     * stay what they were). With COLI_VK_TIER_DECODE_GROW_HEADROOM the free part is the
+     * live guard's instead of the one-time probe's: a place is made per install the
+     * card's free VRAM (less the reserve) still holds, re-probed fork-style as installs
+     * proceed, so the growth owns real free room, not only the slots' recycled bytes
+     * (dg_head_room), the target (_TARGET, the fork's gpu_cap class) capping its count.
+     * dgrow armed, dgrow_dec the running step is decode-class
+     * (S <= VKT_UP_ROWS; the note/promote gate), dgrow_armed the one-time probe ran,
+     * dgrow_cut the count bar (0: room beyond the known-hot set is demand-filled),
+     * dgrow_slots0 the live slots before the first retire, dgrow_used the bytes grown
+     * against the operator's cap (dgrow_cap, 0 = none), the counters for the run line. */
+    int dgrow, dgrow_dec, dgrow_armed, dgrow_cut, dgrow_slots0;
+    size_t dgrow_cap, dgrow_used;
+    uint32_t *dgrow_heat;                /* the tier's copy of decode_heat, flat [layers*experts] */
+    unsigned long long dgrow_installs, dgrow_retires, dgrow_heads;
+    int dgrow_head, dgrow_target;        /* the headroom lever armed, its resident-count target */
+    double dgrow_reserve;                /* the probe's safety reserve, read once (env bytes) */
+    double dg_hfree; unsigned dg_hprobe; /* the live guard's free-VRAM reading and its probe counter */
+    /* tier adaptive (COLI_VK_TIER_ADAPTIVE, fork-parity): a forward-boundary re-probe
+     * that owns dmax[0]'s free-VRAM changes -- grows into room above adapt_reserve +
+     * adapt_margin and sheds the coldest residents (the LFRU victim order) when free
+     * falls below adapt_reserve, so a co-tenant's reclaim never OOM-kills the process.
+     * adapt_cap is the growth's byte ceiling (0 = none, beyond the free VRAM itself). */
+    int adapt;
+    double adapt_reserve, adapt_margin, adapt_cap;
+    unsigned long long adapt_grows, adapt_sheds;
+    /* the compute site (COLI_VK_TIER_EXPERTS, CS-1b): csx the arm (1 the finish-site
+     * group, 2 the growth composition), a decode walk that defers -- cs_pending the
+     * step owes vkt_issue_group at the token's finish site (layer cs_layer, nothing
+     * submitted yet, the flight slot held), cs_ex/csn the transient aliased experts of
+     * the in-flight group (freed at its join: not while a batch is in flight), the
+     * counters the run line's own segment (resident and aliased entries, the selections
+     * that fell back to the CPU, and of those how many the alias itself refused) */
+    int csx, cs_pending, cs_layer;
+    ColiVkExpert **cs_ex; int cs_nex, cs_cex;
+    unsigned long long cs_groups, cs_res, cs_alias, cs_fallback, cs_refuse, cs_fork;   /* cs_fork: decode-path=fork's registry aliases (the import branch's complement) */
+    /* the CS alias keepalive cache (COLI_VK_TIER_CS_ALIAS_CACHE, CS-1c): a tier-owned
+     * hold on each aliased store slab across the group's join, so a decode expert's
+     * slab is imported once and reused at its exact geometry, not re-imported every
+     * token. Byte-bound by cs_cache_cap (COLI_VK_TIER_CS_ALIAS_CACHE_MB, 4096 when
+     * armed), count-bound by the backend's live-import cap, LRU-evicted at the join
+     * (never while a group is in flight). */
+    int cs_cache;
+    size_t cs_cache_cap;
+    int cs_scan_skip;                  /* COLI_VK_TIER_CS_ALIAS_SCAN_SKIP: a hit of the same content passes the recorded f16 verdicts and skips the scale scan */
+    VCsAlias *cs_cache_e; int cs_cache_n, cs_cache_capn;
+    size_t cs_cache_bytes;
+    unsigned long long cs_cache_seq, cs_cache_hits, cs_cache_misses, cs_cache_evicts, cs_cache_forgets, cs_scan_skips;
+    /* CS diagnostics (COLI_VK_CHAIN_DPROF=1 only): the deferred group's window split,
+     * double-ms + counts; all zero and untimed unless the gate is on. They reconcile
+     * against the decode dprof line's waited/device/CPU (see vkt_report's cs dprof):
+     * per group CPU window = settle + lookup + issue + residual (the serial CPU loop,
+     * zero under CS); waited = fence + qread + release + residual join glue; device is
+     * the timestamp span. alias/xbex are subsets of lookup (which is itself the
+     * resident-lookup + alias-build loop), import a subset of alias, and release is a
+     * subset of waited. vkt_report prints the two equations with their residuals. */
+    double cs_settle_ms;               /* A: defer -> group build entry (the loader's slide-join/read settle) */
+    unsigned long long cs_settle_n;
+    double cs_lookup_ms;               /* B: the group's entry loop (resident lookup + alias builds) */
+    double cs_alias_ms;                /* B: cs_alias_expert's span, a subset of cs_lookup_ms */
+    double cs_alias_hit_ms, cs_alias_miss_ms;   /* B: the same span by the cache's outcome (a hit rode the keepalive, a miss built the entry) -- the bench wave's effectiveness read, beside the backend's create/hit import split */
+    double cs_xbex_ms;                 /* B: coli_vk_xb_expert's span, a subset of cs_alias_ms */
+    double cs_import_ms;               /* B: coli_vk_slab_import's span, a subset of cs_alias_ms (the import
+                                        * churn's own time, beside the backend's create/hit split) */
+    unsigned long long cs_import_n;
+    unsigned long long cs_build_n;
+    double cs_issue_ms;                /* C: coli_vk_xb_issue_w/_dev's CPU span (the xb submit call) */
+    unsigned long long cs_issue_n;
+    double cs_fence_ms;                /* C: xb_join's fence-wait CPU span (backend, delta) */
+    double cs_qread_ms;                /* C: xb_join's query-pool-result read span (backend, delta) */
+    double cs_dev_ms;                  /* C: the group's device elapsed (timestamps) */
+    double cs_release_ms;              /* D: cs_ex_release's span, inside the join's waited */
+    unsigned long long cs_release_n;
+    unsigned long long cs_alias_bytes; /* E: aliased tensor bytes (weights + scales) built */
+    /* CS device-sum (COLI_VK_TIER_CS_DEVSUM, armed only with COLI_VK_TIER_EXPERTS): the
+     * group's rows summed on the device by a tail dispatch riding its own submit, one
+     * row back at the join in place of the k-row readback + host bf16 merge. cs_devsum
+     * the arm, cs_sum this group carries the tail, the books count the groups that
+     * read a merged row (and the rows they did not read back). */
+    int cs_devsum, cs_sum;
+    unsigned long long cs_sum_n, cs_sum_rows;
+    /* PROMPT dprof (COLI_VK_CHAIN_DPROF, the prompt class S > VKT_UP_ROWS): the p_*
+     * mirror's host side split. pd_* nest inside one step's window: issue is the
+     * issue_big wall (fill/joins/submit are disjoint spans inside it, the rest of
+     * it classify+pack), kept is the engine's own span from the issue's end to the
+     * join's entry (the kept rows' CPU compute), and the remainder of p_cpu_ms is
+     * the join-side glue the report prints as residual. The stage fills run in
+     * vkt_stream_prefetch, between steps -- outside every p_* window, the chain's
+     * staging role; pdst_* time their fill groups so the per-group cost (the
+     * 6.4 ms a sub-batch question, gap-wave1 ttft F1/F3) reads off the tier's books. */
+    double pd_issue_ms;                /* issue_big's whole wall, ⊂ p_cpu_ms */
+    unsigned long long pd_issue_n;
+    double pd_fill_ms;                 /* st_fill_group's wall, inline in issue_big (⊂ pd_issue_ms) */
+    unsigned long long pd_fill_n;
+    unsigned long long pd_fill_exp;     /* the experts those groups gathered (DPROF: the schedule's width) */
+    double pd_fill_max;
+    double pd_rjoin_ms;                /* st_join_half/st_ring_take inside issue_big (⊂ pd_issue_ms) */
+    unsigned long long pd_rjoin_n;
+    double pd_submit_ms;               /* the xb sub-batch submits inside issue_big (⊂ pd_issue_ms) */
+    unsigned long long pd_submit_n;
+    double pd_kept_ms;                 /* issue's end -> join's entry: the kept rows' CPU compute */
+    double pdst_fill_ms;               /* the stage prefetch's st_fill_group wall, outside the p_* window */
+    unsigned long long pdst_fill_n;
+    double pdst_fill_max;
     double dev_ms, cpu_ms, wait_ms;
     unsigned long long rep_routed, rep_served;
     /* streaming (big prefill steps; see "streaming" below) */
     int st_ok, st_slots, st_n, st_per, st_half, st_rows_env, gemm_rows, st_par;
+    /* COLI_VK_TIER_STREAM_ROWS_ADAPTIVE: the R rule's floor is the measured break-even
+     * alone (1 before it exists), not the GEMM's rows -- the prefill keeps nothing on the
+     * CPU the upload does not pay for. st_group (COLI_VK_TIER_STREAM_GROUP) and st_pred
+     * (COLI_VK_TIER_STREAM_PRED) below: the inline fill groups' cap and the prefetch
+     * plan's row floor multiple. */
+    int st_rows_adapt, st_group;
+    double st_pred;
     VStage *st;
     double bw_up, cpu_row_ms;             /* measured: bytes per ms into a slot; CPU ms per (row, expert) */
     int big, big_fail, big_n, big_taken, said_fwd;
@@ -207,6 +385,20 @@ static struct {
      * place by the GEMMs; bpool[e] marks them in the step */
     int pool_copy; uint8_t *bpool;
     unsigned long long pc_experts; double pc_bytes;
+    /* the stream ring (COLI_VK_TIER_STREAM_RING, the fork's v4_ram class): ring_on the
+     * env armed it (and the engine gave ring_batch), ring_run a job's worker is in
+     * flight, ring_lo/hi the slot range the running job owns -- the engine's scans skip
+     * it (the join, not a read, is the handoff), ring_stop the teardown's cancel flag
+     * (polled between reads: never wait out a stream the run is discarding), ring_job
+     * the job itself, ring_half the half the next job takes. ring_ok drops to 0 for
+     * good when a worker could not be made; the inline fill takes over from there.
+     * ring_cold (COLI_VK_TIER_STREAM_RING_COLD) lifts the cold branch's gate: a next
+     * layer with no prediction is planned by its heat, the fork's whole-layer cold
+     * fill, instead of handed to the inline path. */
+    int ring_on, ring_ok, ring_run, ring_stop, ring_lo, ring_hi, ring_half, ring_cold;
+    pthread_t ring_th;
+    struct VRing *ring_job;
+    unsigned long long ring_jobs, ring_experts;
 } T;
 
 /* "2.31 GiB", "35.0 MiB", "9.5 KiB": the budget lines read on a 24 GB card and a tiny fixture alike */
@@ -217,6 +409,13 @@ static const char *human(double b, char *buf, size_t n) {
     return buf;
 }
 static double vkt_now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
+/* COLI_VK_CHAIN_DPROF's own reading for the CS group split (the same grammar vkt_report
+ * uses): cached, so a disabled run takes no timers and prints no CS diagnostics. */
+static int vkt_cs_dprof(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_CHAIN_DPROF"); on = e && *e && *e != '0' ? 1 : 0; }
+    return on;
+}
 static VSlot *slot(int layer, int eid) { return &T.s[(size_t)layer * T.c.experts + eid]; }
 static int kind_of(int layer) { return layer >= T.main_layers; }   /* main (0) or extra (1): the pool */
 /* where a slot's tensors are or go: its device, or 2 for the primary device's host pool */
@@ -261,7 +460,25 @@ static size_t src_scale_bytes(VktFmt f, int I, int O) {
     if (f.kind == VKT_SRC_FP8_BLOCK) return (((size_t)O + f.gs - 1) / f.gs) * ng * 4;
     return (size_t)O * ng * 4;
 }
-/* The backend format a source kind lands in; 0 when the combination is not one. */
+/* The backend format a source kind lands in; 0 when the combination is not one.
+ * VKT_SRC_MXFP4_E8M0's scales are ue8m0 bytes: the Vulkan backend keeps them
+ * packed (fmt 15, 12.75 MiB a DeepSeek V4 expert against fmt 7's 15.0 -- the expansion
+ * to f32 is exact, so the packing changes bytes, never values). The W1 window's P0
+ * (AI-pw-w1-2026-10-25) was NOT this form itself: host_pairs, the hybrid CPU path that
+ * reads host-pool experts in place, advanced each output row's scale pointer by the
+ * f32-scale stride, so fmt 15's packed bytes were read 4x too deep -- past the scale
+ * range into the pool's other bytes, 2^127-scale garbage, non-finite expert rows and the
+ * router failing one layer below (the unit gates stayed green because their rel()'s NaN
+ * comparison is false: a non-finite row never raises a worst; fixed with host_scale_row,
+ * PW-Dfix -- AJ-pw-dfix-2026-10-26). fmt 15 is the default again; COLI_VK_TIER_FMT15=0
+ * keeps the f32-scale fmt 7. The CUDA tier's ops table (cu_xb.cu) has no fmt 15 at all:
+ * it keeps the f32-scale form. */
+#ifndef COLI_CUDA
+static int tier_fmt15(void) {   /* COLI_VK_TIER_FMT15: the packed form unless it says 0 */
+    const char *e = getenv("COLI_VK_TIER_FMT15");
+    return !(e && *e == '0') ? 1 : 0;
+}
+#endif
 static int dev_fmt(VktFmt f, int *fmt, int *gs) {
     int g = f.gs;
     if (f.kind >= VKT_SRC_GGML) { *fmt = 100 + (int)(f.kind - VKT_SRC_GGML); *gs = 0; return coli_vk_block_elems(*fmt) > 0; }
@@ -273,7 +490,14 @@ static int dev_fmt(VktFmt f, int *fmt, int *gs) {
     case VKT_SRC_I8_AS_I4_GS: case VKT_SRC_I4S_PAIRS_GS: case VKT_SRC_I4U_PAIRS_GS: *fmt = 4; *gs = g; return g >= 8 && g % 8 == 0;
     case VKT_SRC_I4U_PLANAR64: *fmt = 4; *gs = 64; return 1;
     case VKT_SRC_I3_G64: *fmt = 5; *gs = 0; return 1;
-    case VKT_SRC_MXFP4_F32: case VKT_SRC_MXFP4_E8M0: *fmt = 7; *gs = g; return g >= 8 && g % 8 == 0;
+    case VKT_SRC_MXFP4_E8M0:
+#ifdef COLI_CUDA
+        *fmt = 7;
+#else
+        *fmt = tier_fmt15() ? 15 : 7;   /* COLI_VK_TIER_FMT15=0 keeps fmt 7: see tier_fmt15 above */
+#endif
+        *gs = g; return g >= 8 && g % 8 == 0;
+    case VKT_SRC_MXFP4_F32: *fmt = 7; *gs = g; return g >= 8 && g % 8 == 0;
     case VKT_SRC_FP8_GS: case VKT_SRC_FP8_BLOCK: *fmt = 12; *gs = g; return g >= 4 && g % 4 == 0;
     case VKT_SRC_BF16: *fmt = 11; *gs = 0; return 1;
     case VKT_SRC_F32: *fmt = 10; *gs = 0; return 1;
@@ -351,11 +575,24 @@ static void convert_par(VktFmt f, int I, int O, const uint8_t *codes, const void
         break;
     }
     if (f.kind == VKT_SRC_BF16 || f.kind == VKT_SRC_F32 || f.kind >= VKT_SRC_GGML) { sc[0] = 1.0f; return; }
-    if (f.kind == VKT_SRC_MXFP4_E8M0) {        /* ue8m0 -> f32 2^(s-127), quant.h's mx4_scale */
+    if (f.kind == VKT_SRC_MXFP4_E8M0) {
         size_t n = (size_t)O * (((size_t)I + f.gs - 1) / f.gs);
         const uint8_t *e = scales;
+#ifdef COLI_CUDA
+        /* the CUDA tier keeps fmt 7: ue8m0 -> f32 2^(s-127), quant.h's mx4_scale */
         for (size_t i = 0; i < n; i++) { uint32_t u = (uint32_t)e[i] << 23; memcpy(&sc[i], &u, 4); }
         return;
+#else
+        if (!tier_fmt15()) {   /* fmt 7, the escape hatch (COLI_VK_TIER_FMT15=0): ue8m0 -> f32 2^(s-127) */
+            for (size_t i = 0; i < n; i++) { uint32_t u = (uint32_t)e[i] << 23; memcpy(&sc[i], &u, 4); }
+            return;
+        }
+        /* fmt 15: the bytes as they are, the word pad zeroed (never read, copied whole) */
+        size_t words = ((n + 3) / 4) * 4;
+        memcpy(sc, e, n);
+        memset((uint8_t *)sc + n, 0, words - n);
+        return;
+#endif
     }
     if (f.kind == VKT_SRC_FP8_BLOCK) {         /* [O/bs][I/bs] blocks -> one row each */
         size_t nb = ((size_t)I + f.gs - 1) / f.gs;
@@ -556,8 +793,14 @@ static void free_victims(void) {
     pthread_cond_broadcast(&T.cv_room);
     pthread_mutex_unlock(&T.mx);
 }
+static void st_ring_take(void);   /* the stream ring's join (COLI_VK_TIER_STREAM_RING): before any engine touch of the slots it fills */
+static void st_ring_cancel(void);
 static void quiesce(void) {
     if (T.inflight) return;
+    /* COLI_VK_TIER_SYNC=1: the stream ring joins the drain too -- what is in the slots
+     * at a quiescent point then depends on the routing alone, never on thread timing
+     * (the uploader's contract, extended to the ring's worker) */
+    if (T.sync) st_ring_take();
     int freed = 0, had = T.nevict + T.ndfree;
     for (int i = 0; i < T.nevict; i++) {
         VSlot *v = &T.s[T.evict[i]];
@@ -624,6 +867,7 @@ static void quiesce(void) {
             v->hex = h ? h : T.full && v->host ? e : NULL;
             v->ex = e; v->state = VS_RESIDENT; T.resident++; if (kd) T.xres++; else T.dres[pl]++;
             note_change(d[i].layer * T.c.experts + d[i].eid);
+            if (T.bank_on && d[i].layer == T.bank_cur && d[i].eid < T.c.experts) T.bank_valid[d[i].eid] = 1;
             T.uploads++; T.upload_bytes += coli_vk_tensor_bytes(d[i].g) + coli_vk_tensor_bytes(d[i].u) + coli_vk_tensor_bytes(d[i].d);
             if (dv) T.d2_uploads++;
         } else {
@@ -710,7 +954,8 @@ static void refresh_candidates(void) {
     size_t n = (size_t)T.c.layers * T.c.experts;
     for (size_t i = 0; i < n; i++) {
         VSlot *v = &T.s[i];
-        if (v->state != VS_RESIDENT || (T.full && (v->host || !v->hex))) continue;
+        if (v->state != VS_RESIDENT || v->pin || (T.full && !v->hex) ||
+            (v->host && (T.full || T.dmax[2] > 0))) continue;
         int k = vcls_of((int)(i / (size_t)T.c.experts)), *c = T.cand[k];
         uint64_t sc = score(v), *cs = T.cand_score[k];
         if (T.ncand[k] == VKT_CAND && sc >= cs[VKT_CAND - 1]) continue;
@@ -727,14 +972,15 @@ static void drop_victim(int k) {
     memmove(T.cand[k], T.cand[k] + 1, (size_t)--T.ncand[k] * sizeof(int));
     memmove(T.cand_score[k], T.cand_score[k] + 1, (size_t)T.ncand[k] * sizeof(uint64_t));
 }
-static int peek_victim(int k, uint64_t hs) {
+static int peek_victim(int k, uint64_t hs, int cheap) {
     while (T.ncand[k]) {
         int i = T.cand[k][0];
         VSlot *v = &T.s[i];
-        if (v->state != VS_RESIDENT || (T.full && v->host)) { drop_victim(k); continue; }
+        if (v->state != VS_RESIDENT || v->pin || (v->host && (T.full || T.dmax[2] > 0))) { drop_victim(k); continue; }
         uint64_t cs = score(v);
-        /* T.full: a swap copies nothing back and no CPU time goes into it, so any hotter one wins */
-        return hs > (T.full ? cs + ((uint64_t)VKT_UP_MARGIN << 8) : cs + (cs >> 2) + (4u << 8)) ? i : -1;
+        /* T.full, a promotion: a swap copies nothing back and no CPU time goes into it,
+         * so any hotter one wins */
+        return hs > (T.full || cheap ? cs + ((uint64_t)VKT_UP_MARGIN << 8) : cs + (cs >> 2) + (4u << 8)) ? i : -1;
     }
     return -1;
 }
@@ -747,29 +993,45 @@ static int rooms_hold(int a, int b) {   /* pad class a's rooms hold pad class b'
     for (int r = 0; r < 2; r++) if (T.pad_w[a][r] < T.pad_w[b][r] || T.pad_s[a][r] < T.pad_s[b][r]) return 0;
     return 1;
 }
-static int pick_victim(int layer, uint64_t hs, int *from) {
+static int pick_victim(int layer, uint64_t hs, int *from, int cheap) {
     const int k = vcls_of(layer);
-    int v = peek_victim(k, hs);
+    int v = peek_victim(k, hs, cheap);
     *from = k;
     if (v >= 0 || k == 1 || !T.per_layer) return v;
     const int o = k == 0 ? 2 : 0;
     if (!rooms_hold(o == 2, k == 2)) return -1;
     *from = o;
-    return peek_victim(o, hs);
+    return peek_victim(o, hs, cheap);
 }
 
 /* A forward starts when the layer index goes back (a layer that issues several
  * blocks of rows, or rows one by one, is the same forward). The tick counts tokens:
  * the rows of the forward's first layer, every block of them. */
+static void hot_pin(void);
+static void tier_adaptive(void);
 static void new_forward(void) {
     T.promos[0] = T.promos[1] = 0; T.promo_cap = 0; T.said_fwd = 0; T.upromos = 0;
+    if (T.promo_fix)   /* COLI_VK_TIER_PROMO_CAP: the forward's cap set outright, not the rate's take */
+        T.promo_cap = T.promo_fix < 0 ? 1 << 30 : T.promo_fix;
+    if (T.hot_update) hot_pin();   /* COLI_VK_TIER_HOT_UPDATE=1: the pins move with the live counts, before the candidates are built */
     if (T.tick >= T.decay_at) {
         size_t n = (size_t)T.c.layers * T.c.experts;
         for (size_t i = 0; i < n; i++) T.s[i].heat = tier_decay_value(T.s[i].heat);
         T.decay_at = T.tick + VKT_DECAY_TOKENS;
     }
     refresh_candidates();
+    tier_adaptive();   /* the fork-parity request-boundary re-probe: nothing is in flight here */
 }
+
+/* ---- decode growth (COLI_VK_TIER_DECODE_GROW) ------------------------------------- */
+static int dgrow_hot(int layer, int e);
+static int dgrow_room1(void);
+static int dgrow_retire(void);
+static int dg_head_room1(void);
+static int dg_head_room(void);
+static void dgrow_arm(void);
+static double dg_free_now(void);
+static void tier_adaptive(void);
 
 /* The bytes of an expert the CPU just computed pass by: promote it when there is
  * room, or when it is hot enough to displace the coldest resident. The copy is the
@@ -785,8 +1047,21 @@ void vkt_note(int layer, int eid, const VktExpertSrc *src) {
     const __typeof__(T.form[0]) *fm = &T.form[form_of(layer)];
     if (fm->gu_scales && (!src->gs || !src->us || !src->ds)) return;
     int victim = -1, dev = room_dev(layer), vc = vcls_of(layer);
+    /* decode growth: a decode-class step's main-layer expert installs by the decode-only
+     * rank alone -- above the cutoff into a grown place (the live guard's free VRAM under
+     * HEADROOM, or a stream slot retired for it), never a victim's; below it not at all, for
+     * the grown room is the rank's (a cold demand would spend it before decode's hot arrive
+     * -- the ordinary free-room path admits by live heat, the growth by rank; cutoff 0, the
+     * room-bounded bar, admits every demand, the standing class) */
+    const int dg = T.dgrow_armed && T.dgrow_dec && !kd;
+    if (dg && !dgrow_hot(layer, eid)) return;
+    if (dg) {
+        if (dev < 0 && !dg_head_room() && !dgrow_retire()) return;   /* the guard's free place first, a retired slot's only beyond */
+        if (dev < 0) dev = 0;   /* the place the guard or the retire made */
+        T.dgrow_installs++;
+    }
     /* T.full: the device's residents give way to promote's, which keeps their host pool copy */
-    if (dev < 0 && (T.full || !v->heat || (victim = pick_victim(layer, score(v), &vc)) < 0)) return;
+    else if (dev < 0 && (T.full || !v->heat || (victim = pick_victim(layer, score(v), &vc, 0)) < 0)) return;
     if (victim >= 0) dev = place_of(&T.s[victim]);   /* the newcomer takes its place, on its device or in the host pool */
     pthread_mutex_lock(&T.mx);
     int qfull = T.qn >= VKT_QCAP;
@@ -827,7 +1102,11 @@ int vkt_wants(int layer, int eid) {
     VSlot *v = slot(layer, eid);
     if (v->state != VS_NONE || T.promos[kind_of(layer)] >= T.promo_cap) return 0;
     int from;
-    if (room_dev(layer) < 0 && (T.full || !v->heat || pick_victim(layer, score(v), &from) < 0)) return 0;
+    if (T.dgrow_armed && T.dgrow_dec && !kind_of(layer)) {   /* vkt_note's rank gate, its mirror */
+        if (!dgrow_hot(layer, eid)) return 0;
+        return room_dev(layer) >= 0 || dg_head_room1() || dgrow_room1();   /* a grown place, the guard's or a slot's */
+    }
+    if (room_dev(layer) < 0 && (T.full || !v->heat || pick_victim(layer, score(v), &from, 0) < 0)) return 0;
     pthread_mutex_lock(&T.mx);
     int qfull = T.qn >= VKT_QCAP;
     pthread_mutex_unlock(&T.mx);
@@ -843,9 +1122,19 @@ int vkt_wants(int layer, int eid) {
  * dense chain's books after its frame (vkt_dev_count), or a batch's step after its issue. */
 static void promote(int layer, int e) {
     VSlot *v = slot(layer, e);
-    if (!T.full || v->state != VS_RESIDENT || !v->host || v->up || !v->hex || kind_of(layer) || T.upromos >= T.promote_rate) return;
+    if (!T.promote_rate || v->state != VS_RESIDENT || !v->host || v->up || kind_of(layer) || T.upromos >= T.promote_rate) return;
+    if (T.pool_layer == layer) return;   /* COLI_VK_TIER_POOL_LAYER: that layer's residency is the pool, pinned there (hot_pin) -- moving it up would take the device places the lever promises not to touch */
+    if (T.bank_on && layer == T.bank_cur) return;   /* the bank's layer: its residency is the carve's, pinned (hot_pin) -- the same promise, the device's places */
+    /* decode growth: the room it made is the decode rank's -- a pooled expert below the
+     * cutoff waits for a place the ordinary path would give it (a victim's), not the
+     * grown one, or the merged-history warm would spend the growth before decode's hot */
+    if (T.dgrow_armed && T.dres[0] + T.dque[0] < T.dmax[0] && !dgrow_hot(layer, e)) return;
+    if (!v->hex) {
+        if (!T.dmax[2]) return;   /* no pool behind it: nothing to copy up from */
+        v->hex = v->ex;           /* a partial pool's own copy: the landing keeps it beside the device's */
+    }
     int victim = -1, from = vcls_of(layer);
-    if (T.dres[0] + T.dque[0] >= T.dmax[0] && (victim = pick_victim(layer, score(v), &from)) < 0) return;
+    if (T.dres[0] + T.dque[0] >= T.dmax[0] && (victim = pick_victim(layer, score(v), &from, 1)) < 0) return;
     pthread_mutex_lock(&T.mx);
     int qfull = T.qn >= VKT_QCAP;
     pthread_mutex_unlock(&T.mx);
@@ -859,13 +1148,23 @@ static void promote(int layer, int e) {
             T.dfree = n; T.cdfree = nc;
         }
         drop_victim(from);
-        T.dfree[T.ndfree++] = w->ex;
-        w->ex = w->hex; w->host = 1; T.dres[0]--; T.dres[2]++; T.evictions++; T.up_victims++;
+        if (w->hex) {   /* its pool copy takes it back: nothing is copied */
+            T.dfree[T.ndfree++] = w->ex;
+            w->ex = w->hex; w->host = 1; T.dres[0]--; T.dres[2]++; T.evictions++; T.up_victims++;
+        } else {         /* a partial pool: no copy to fall back on — the device's frees, the slot empties */
+            T.dfree[T.ndfree++] = w->ex;
+            w->ex = NULL; w->state = VS_NONE; T.resident--; T.dres[place_of(w)]--; T.evictions++;
+        }
         note_change(victim);   /* published at the next quiescent point: a chain's frame start (vkt_settle) */
         pthread_mutex_lock(&T.mx); T.evict_pending = T.nevict + T.ndfree; pthread_mutex_unlock(&T.mx);
         free_victims();   /* nothing in flight: freed right away; else at the join */
     }
     v->up = 1; T.queued++; T.dque[0]++; T.upromos++;
+    {   /* DPROF: the bytes this promotion will move over PCIe (both callers are decode-class steps) */
+        ColiVkTensor *src[3];
+        coli_vk_xb_expert_tensors(v->hex, &src[0], &src[1], &src[2]);
+        T.d_up_bytes += coli_vk_tensor_bytes(src[0]) + coli_vk_tensor_bytes(src[1]) + coli_vk_tensor_bytes(src[2]);
+    }
     pthread_mutex_lock(&T.mx);
     T.q[(T.qh + T.qn) % VKT_QCAP] = (VQ){layer, e, 0, NULL, v->hex}; T.qn++;
     pthread_cond_signal(&T.cv);
@@ -893,6 +1192,69 @@ int vkt_plan(int *layers, int *eids, int max) {
     T.plan_hist = 0;
     if (!T.on) return 0;
     int L = T.main_layers, E = T.c.experts, n = 0, k = 0;   /* the main layers' */
+    /* COLI_VK_TIER_POOL_LAYER (the COLI_VK_DMOE arm's residency lever that is not a
+     * device pin, the L2 spec's Stage C): layer n's experts go to the HOST POOL, place 2
+     * -- the device's budget, its stream slots and its prefetch untouched, and
+     * vkt_dev_table counts them anyway (place 2 keeps dev 0), so the dmoe gate's
+     * all-or-nothing test passes without ~3.75 GiB of device room. All or nothing, like
+     * that gate: unless the pool holds every one of the layer's E experts, none is placed
+     * and one line says so. hot_pin pins them and promote leaves them where they are.
+     * Ahead of the pin block, so a layer both knobs name stays in the pool. */
+    if (T.pool_layer >= 0 && T.pool_layer < L && !T.pool_said) {
+        int room = T.dmax[2] - T.dres[2] - T.dque[2];
+        if (room >= E && k + E <= max) {
+            for (int e = 0; e < E; e++) {
+                VSlot *v = slot(T.pool_layer, e);
+                v->state = VS_QUEUED; set_place(v, 2); T.queued++; T.dque[2]++;
+                layers[k] = T.pool_layer; eids[k] = e; k++;
+            }
+            fprintf(stderr, VKT_TAG " tier %s: COLI_VK_TIER_POOL_LAYER=%d: layer %d's %d experts placed in the host pool and "
+                            "pinned there, no device place taken (vkt_dev_table counts them: the dmoe gate opens)\n",
+                    T.engine, T.pool_layer, T.pool_layer, E);
+        } else
+            fprintf(stderr, VKT_TAG " tier %s: COLI_VK_TIER_POOL_LAYER=%d: the host pool has %d places free of the %d layer %d "
+                            "needs; nothing placed, all or nothing like the dmoe gate (COLI_VK_TIER_HOST_GB raises the pool)\n",
+                    T.engine, T.pool_layer, room < 0 ? 0 : room, E, T.pool_layer);
+        T.pool_said = 1;
+    }
+    /* COLI_VK_TIER_BANK_LAYER (the S1 fold's substrate): layer n's experts planned into
+     * DEVICE residency, place 0, real expert tensors -- the tier's stream slots exchanged
+     * for a layer (the carve at vkt_init took the slot budget down by this layer's count,
+     * so the places this plans are the slots' bytes with a different tenure: the bank and
+     * the slot budget never add). Ahead of the pin block like the pool's, so a layer two
+     * knobs name stays wherever the first put it; all or nothing, like the dmoe gate it
+     * serves -- the armed layer serves by construction or not at all. The warm start fills
+     * these places (vkt_put); the tier's ordinary paths serve and count them from there
+     * (vkt_dev_table: zero new gate code), hot_pin pins them, and vkt_bank_fill refills a
+     * missing one at most once per layer tenure at the routed step. */
+    if (T.bank_on && !T.bank_said) {
+        int room = T.dmax[0] - T.dres[0] - T.dque[0];
+        if (room >= E && k + E <= max) {
+            for (int e = 0; e < E; e++) {
+                VSlot *v = slot(T.bank_layer, e);
+                if (v->state != VS_NONE) continue;
+                v->state = VS_QUEUED; set_place(v, 0); T.queued++; T.dque[0]++;
+                layers[k] = T.bank_layer; eids[k] = e; k++;
+            }
+            T.bank_cur = T.bank_layer;
+        } else
+            fprintf(stderr, VKT_TAG " tier %s: COLI_VK_TIER_BANK_LAYER=%d: %d device places free of the %d layer %d needs; nothing placed, all or nothing like the dmoe gate (the carve left the room; a smaller COLI_VK_TIER_GB took it)\n",
+                    T.engine, T.bank_layer, room < 0 ? 0 : room, E, T.bank_layer);
+        T.bank_said = 1;
+    }
+    /* COLI_VK_TIER_PIN_LAYER (the COLI_VK_DMOE arm's scaffolding): layer n's
+     * experts ahead of the history, so the one layer the arm wires is fully resident
+     * from the warm start whatever the heat says -- hot_pin has pinned them too, so no
+     * promotion can take them back. Their E experts (256 of 12.75 MiB for DeepSeek V4,
+     * fmt 15's packed scales)
+     * need a COLI_VK_TIER_GB the operator raises to hold them. */
+    if (T.pin_layer >= 0 && T.pin_layer < L)
+        for (int e = 0; e < E && k < max && room_dev(0) >= 0; e++) {
+            VSlot *v = slot(T.pin_layer, e);
+            if (v->state != VS_NONE) continue;
+            v->state = VS_QUEUED; set_place(v, 0); T.queued++; T.dque[0]++;
+            layers[k] = T.pin_layer; eids[k] = e; k++;
+        }
     /* the extra layers' experts first where they stay whole (extra_whole): their own pool,
      * and no history names them */
     if (T.c.extra_whole && T.xmax >= T.c.extra_layers * E)
@@ -945,6 +1307,70 @@ void vkt_warm_report(const char *engine, int n, double seconds) {
             engine, n, seconds, T.plan_hist < n ? T.plan_hist : n, n > T.plan_hist ? n - T.plan_hist : 0,
             all && n >= all ? ": every expert of the model" : "");
 }
+
+/* ---- the hot set (COLI_VK_TIER_HOT) -------------------------------------------- */
+/* The frozen section: the top share of the resident places by the RAW history counts
+ * (g_heat_hist, the same table the warm start ranks by -- never the 1..31 heat the seed
+ * scales each layer to, which would make every layer's hottest expert equal and the set
+ * a per-layer film), marked on the slots and skipped by every victim path, so the
+ * adaptive tail's promotions cannot churn the warm start's head. Pins are derived, never
+ * persisted: the history's counts stay the only authority. COLI_VK_TIER_PIN_LAYER's
+ * layer is the explicit form -- its experts pin whole, ahead of the ranking. */
+static void hot_pin(void) {
+    T.npin = 0;
+    size_t n = (size_t)T.c.layers * T.c.experts;
+    for (size_t i = 0; i < n; i++) T.s[i].pin = 0;
+    const int E = T.c.experts;
+    int pinned = 0;
+    if (T.pool_layer >= 0 && T.pool_layer < T.main_layers) {   /* the pool-placed layer: its residency is the pool */
+        for (int e = 0; e < E; e++) slot(T.pool_layer, e)->pin = 1;
+        pinned = E;
+    }
+    if (T.bank_on && T.bank_cur >= 0 && T.bank_cur < T.main_layers) {   /* the bank's layer: its places are the carve's, held for the tenure */
+        int fresh = 0;
+        for (int e = 0; e < E; e++) { VSlot *v = slot(T.bank_cur, e); if (!v->pin) { v->pin = 1; fresh++; } }
+        pinned += fresh;
+    }
+    if (T.pin_layer >= 0 && T.pin_layer < T.main_layers) {   /* the explicit pin wins over the ranking */
+        int fresh = 0;
+        for (int e = 0; e < E; e++) { VSlot *v = slot(T.pin_layer, e); if (!v->pin) { v->pin = 1; fresh++; } }
+        pinned += fresh;
+    }
+    if (!T.hot || !g_heat_hist) { T.npin = pinned; return; }   /* no share, or nothing to rank */
+    long long K = (long long)T.hot * (T.dmax[0] + T.dmax[2]) / 100;   /* the resident places: the device and the host pool */
+    const int L = T.main_layers;
+    if (!T.hot_order) T.hot_order = malloc((size_t)L * E * sizeof(int));
+    if (!T.hot_order) { T.npin = pinned; return; }
+    g_plan_heat = (const uint32_t *const *)g_heat_hist; g_plan_E = E;   /* plan_cmp: raw counts, ties by slot */
+    T.n_hot_order = 0;
+    if (T.hot_scope) {   /* per layer: each layer's own top ceil(K/L), so every layer keeps a frozen share */
+        int nl = 0;
+        for (int l = T.hot_hash; l < L; l++) nl += g_heat_hist[l] != NULL;
+        long long per = nl > 0 ? (K + nl - 1) / nl : 0;
+        for (int l = T.hot_hash; l < L && per > 0; l++) {
+            if (!g_heat_hist[l]) continue;
+            int at = T.n_hot_order;
+            for (int e = 0; e < E; e++) if (g_heat_hist[l][e]) T.hot_order[T.n_hot_order++] = l * E + e;
+            qsort(T.hot_order + at, (size_t)(T.n_hot_order - at), sizeof(int), plan_cmp);
+            if (T.n_hot_order > at + per) T.n_hot_order = at + (int)per;
+        }
+        qsort(T.hot_order, (size_t)T.n_hot_order, sizeof(int), plan_cmp);   /* the merge, hottest first */
+    } else {   /* global: the hottest whatever their layer */
+        for (int l = T.hot_hash; l < L; l++) {
+            if (!g_heat_hist[l]) continue;
+            for (int e = 0; e < E; e++) if (g_heat_hist[l][e]) T.hot_order[T.n_hot_order++] = l * E + e;
+        }
+        qsort(T.hot_order, (size_t)T.n_hot_order, sizeof(int), plan_cmp);
+    }
+    for (int i = 0; i < T.n_hot_order && pinned < K; i++) {
+        VSlot *v = &T.s[T.hot_order[i]];
+        if (v->pin) continue;
+        v->pin = 1;
+        pinned++;
+    }
+    T.npin = pinned;
+}
+
 int vkt_put(int layer, int eid, const VktExpertSrc *src) {
     if (!T.on || layer < 0 || layer >= T.c.layers || eid < 0 || eid >= T.c.experts) return 0;
     ColiVkTensor *t[3] = {NULL, NULL, NULL};
@@ -961,6 +1387,119 @@ int vkt_put(int layer, int eid, const VktExpertSrc *src) {
     return ok;
 }
 void vkt_put_done(void) { if (T.on) quiesce(); }
+
+/* ---- the VRAM bank (COLI_VK_TIER_BANK_LAYER) --------------------------------------
+ * The fork's bank discipline in the tier's own places: the bank holds ONE layer's
+ * experts at a time, and when the layer it holds changes the bitmap clears and the
+ * new layer's routed experts refill the places the old one held -- every expert read
+ * from the store AT MOST ONCE per layer tenure (the fork's route-aware refill: its
+ * CPU union re-read the same experts several times a layer). The switch is explicit
+ * (vkt_bank_switch), driven where nothing reads the old layer's experts -- by the
+ * engine's rule (one step in flight) that is before the new layer's issue: the device
+ * copies free at once, their entries publish with the epoch, and a chain re-reads the
+ * table at its next frame start -- the same contract promote's victim frees keep. */
+static void bank_switch(int layer) {
+    const int E = T.c.experts;
+    if (T.bank_cur >= 0 && T.bank_cur < T.c.layers && T.bank_cur != layer) {
+        for (int e = 0; e < E; e++) {
+            int i = T.bank_cur * E + e;
+            VSlot *v = &T.s[i];
+            v->pin = 0;
+            if (v->state == VS_RESIDENT && !v->host) {
+                if (T.ndfree == T.cdfree) {
+                    int nc = T.cdfree ? 2 * T.cdfree : 64;
+                    ColiVkExpert **n = realloc(T.dfree, (size_t)nc * sizeof(*n));
+                    if (!n) continue;   /* no record for the free: it stays resident, only the bitmap clears */
+                    T.dfree = n; T.cdfree = nc;
+                }
+                T.dfree[T.ndfree++] = v->ex;
+                if (v->hex) {   /* its pool copy takes it back: nothing is copied, the slot keeps serving from the pool */
+                    v->ex = v->hex; v->host = 1; T.dres[0]--; T.dres[2]++;
+                } else {
+                    v->ex = NULL; v->state = VS_NONE; T.resident--; T.dres[0]--;
+                }
+                T.evictions++;
+                note_change(i);
+            } else if (v->state == VS_QUEUED) {   /* a place the refill never filled */
+                v->state = VS_NONE; T.queued--; T.dque[0]--;
+            }
+        }
+        T.bank_cur = layer;
+    } else if (T.bank_cur < 0) T.bank_cur = layer;
+    for (int e = 0; e < E; e++) {   /* the new layer's places, as the plan would have laid them */
+        VSlot *v = slot(layer, e);
+        if (v->state == VS_NONE) { v->state = VS_QUEUED; set_place(v, 0); T.queued++; T.dque[0]++; }
+        v->pin = 1;
+    }
+    memset(T.bank_valid, 0, (size_t)E);   /* the fork's switch clear: the new tenure starts empty */
+    memset(T.bank_tried, 0, (size_t)E);
+    for (int e = 0; e < E; e++) if (slot(layer, e)->state == VS_RESIDENT) T.bank_valid[e] = 1;
+    pthread_mutex_lock(&T.mx); T.evict_pending = T.nevict + T.ndfree; pthread_mutex_unlock(&T.mx);
+    free_victims();   /* nothing in flight here: the frees land now */
+}
+/* The rotation, the explicit seam (S3's layer-outer loop; the unit gate's 2-layer case):
+ * move the bank to another layer. S1's engine seam never calls this -- a chunk-outer
+ * engine visits every layer each chunk, and a bank that followed the visit order would
+ * thrash a place a layer (the fork's prefill is layer-outer, so its bank follows its
+ * loop; the port's S1 holds the env's layer for the run and the rotation waits for the
+ * reorder). */
+void vkt_bank_switch(int layer) {
+    if (!T.on || !T.bank_on || !T.s) return;
+    if (layer < 0 || layer >= T.c.layers) return;
+    if (layer != T.bank_cur) bank_switch(layer);
+}
+/* The refill, at the armed layer's routed step (post-router, pre-issue: the engine's
+ * tier seam): the missing set -- routed, not valid, not tried yet -- loads through the
+ * engine's group reader (the bypass reader where the engine armed it: no lease, no
+ * cache slot, the stage pool's bounded reads) and uploads sequential into the bank's
+ * places, vkt_put_done landing them (the tier's ordinary upload path: its books, the
+ * bitmap and the published table). An expert that fails to load or land is marked
+ * tried -- the CPU serves it and the bank never re-reads it this tenure. A step of
+ * another layer is not the bank's: the env's layer holds the places for the run
+ * (vkt_bank_switch moves them). */
+void vkt_bank_fill(int layer, const int *idx, int n) {
+    if (!T.on || !T.bank_on || !T.s || !idx || n < 1) return;
+    if (layer < 0 || layer >= T.c.layers || layer != T.bank_cur) return;
+    const int E = T.c.experts;
+    uint8_t *seen = malloc((size_t)E);
+    int *eids = malloc((size_t)(n < E ? n : E) * sizeof(int));
+    int nm = 0;
+    if (seen && eids) {
+        memset(seen, 0, (size_t)E);
+        for (int i = 0; i < n; i++) {
+            int e = idx[i];
+            if (e < 0 || e >= E || seen[e]) continue;
+            seen[e] = 1;
+            VSlot *v = slot(layer, e);
+            if (!T.bank_valid[e] && !T.bank_tried[e] && (v->state == VS_NONE || v->state == VS_QUEUED)) eids[nm++] = e;
+        }
+    }
+    free(seen);
+    if (nm < 1) { free(eids); return; }
+    if (!T.c.load_batch && !T.c.load) {   /* no reader: the tenure's tries are spent, the CPU serves the layer */
+        for (int i = 0; i < nm; i++) T.bank_tried[eids[i]] = 1;
+        free(eids);
+        return;
+    }
+    VktExpertSrc srcs[64]; void *hs[64];
+    int at = 0;
+    while (at < nm) {
+        int g = nm - at < 64 ? nm - at : 64, got = 0;
+        if (T.c.load_batch) got = T.c.load_batch(T.c.load_ctx, layer, eids + at, g, srcs, hs);
+        else if (T.c.load(T.c.load_ctx, layer, eids[at], &srcs[0], &hs[0])) got = 1;
+        for (int i = 0; i < got; i++) {   /* what the reader returned: up it goes, one at a time */
+            int e = eids[at + i];
+            T.bank_tried[e] = 1;
+            if (vkt_put(layer, e, &srcs[i])) { T.bank_refills++; T.bank_bytes += T.exp_bytes; }
+            if (T.c.release) T.c.release(T.c.load_ctx, hs[i]);
+        }
+        if (!got) break;   /* the reader failed the group: the rest are spent too */
+        at += got;
+    }
+    for (; at < nm; at++) T.bank_tried[eids[at]] = 1;
+    free(eids);
+    vkt_put_done();   /* the quiescent point: what landed is resident, valid and published */
+}
 
 /* ---- one layer step -------------------------------------------------------------- */
 /* The per-step arrays: assignments (map), groups (bex, brows, bfirst, touched) and
@@ -1027,11 +1566,18 @@ static int grow_rows(int need) {
  * of a step between issue and join, loads included). Below R the CPU keeps the expert:
  * its rows cost the CPU less than the upload. Until both are measured R = G.
  * COLI_VK_TIER_STREAM_ROWS=n fixes R at n (tests). A [VK] line per forward says what the
- * rule gave, and the run's line how much streamed. */
+ * rule gave, and the run's line how much streamed and the R it settled at (an arm that
+ * changes the load path moves bw_up, so R moves with it: compare arms at the same R).
+ * COLI_VK_TIER_STREAM_ROWS_ADAPTIVE=1 drops the GEMM floor from the rule: R is the
+ * measured break-even alone, and 1 until the measurement exists -- the cs-timing2
+ * evidence class, where G=4 kept 5,408 rows (23.7 s) on the CPU while the run's own
+ * break-even (upload 1.69 ms against 4.391 ms a row) was under half a row. A cold
+ * expert of fewer rows than G still runs on the device, its rows through the per-row
+ * GEMV the batch takes below gemm_rows; a fixed COLI_VK_TIER_STREAM_ROWS keeps precedence. */
 static double vkt_now_ms(void);
 static int stream_min_rows(void) {
     if (T.st_rows_env > 0) return T.st_rows_env;
-    int r = T.gemm_rows;
+    int r = T.st_rows_adapt ? 1 : T.gemm_rows;   /* the armed rule's floor: the measurement's, else 1 */
     if (T.bw_up > 0 && T.cpu_row_ms > 0) {
         double up = (double)T.exp_bytes / T.bw_up, need = up / T.cpu_row_ms;
         if (need > 1e6) need = 1e6;
@@ -1136,10 +1682,70 @@ static void st_copy_group(int layer, const int *eids, const int *slots, int n, u
     }
     if (good) { T.pc_experts += (unsigned long long)n; T.pc_bytes += bytes; }
 }
+/* A device upload group can exceed the RAM cache. Consume each cache-sized
+ * batch completely before loading the next, which may reuse those RAM slots.
+ * A partial batch is capacity, not a reason to serialize all remaining reads.
+ * Fill the uploader's bounded staging window across the complete group: committing
+ * each expert separately drains that window and waits for a fence after just three
+ * matrices, serializing transfers on discrete GPUs. A failed group is wholly left to
+ * the CPU; no partial expert is published. The reader is a pair of hooks with their
+ * ctx -- the engine's (this thread) or the stream ring's (the ring worker, whose
+ * reader fills only a prefix and has no lone fallback: what it does not fill stays to
+ * the inline fill at the step). stop, polled between reads, is the ring teardown's
+ * cancel (never wait out a stream the run is discarding); pref marks the slots as a
+ * prefetch's (the ring's fills are one). The books land in ms and done -- the caller's,
+ * the engine's T's or the worker's job's, merged at the join. */
+static void st_fill_load(int layer, const int *eids, const int *slots, int n, uint8_t *ok,
+                         int (*batch)(void *, int, const int *, int, VktExpertSrc *, void **),
+                         int (*one)(void *, int, int, VktExpertSrc *, void **), void *ctx,
+                         volatile int *stop, int pref, double *ms, int *done) {
+    VktExpertSrc srcs[64]; void *hs[64];
+    if (n > 64) n = 64;
+    memset(ok, 0, (size_t)n);   /* a reader that fills nothing, or a stop before it, leaves every expert the inline fill's */
+    for (int base = 0; base < n;) {
+        if (stop && __atomic_load_n(stop, __ATOMIC_ACQUIRE)) return;
+        int left = n - base;
+        int got = batch && (left >= 2 || !one) ? batch(ctx, layer, eids + base, left, srcs, hs) : 0;
+        if (got < 0 || got > left) got = 0;
+        if (got) {
+            double t0 = vkt_now_ms();
+            #pragma omp parallel for schedule(dynamic, 1) if (T.st_par)
+            for (int j = 0; j < got; j++)
+                ok[base + j] = (uint8_t)st_put(layer, eids[base + j], &T.st[slots[base + j]], &srcs[j], 0);
+            *ms += vkt_now_ms() - t0;
+            for (int j = 0; j < got; j++) T.c.release(T.c.load_ctx, hs[j]);
+            base += got;
+            continue;
+        }
+        if (!one) return;   /* the ring's reader: the rest are the inline fill's */
+        /* A lone expert, or an engine without a usable batch hook. Its rows can
+         * still convert in parallel (COLI_VK_TIER_STREAM_PAR=0 keeps one thread). */
+        void *h = NULL; VktExpertSrc src;
+        ok[base] = 0;
+        if (one(ctx, layer, eids[base], &src, &h)) {
+            double t0 = vkt_now_ms();
+            ok[base] = (uint8_t)st_put(layer, eids[base], &T.st[slots[base]], &src, T.st_par);
+            *ms += vkt_now_ms() - t0;
+            T.c.release(T.c.load_ctx, h);
+        }
+        base++;
+    }
+    double t0 = vkt_now_ms();
+    ColiVkTensor *tensors[3 * 64]; int nt = 0;
+    for (int i = 0; i < n; i++) if (ok[i])
+        for (int k = 0; k < 3; k++) tensors[nt++] = T.st[slots[i]].t[k];
+    if (nt && !coli_vk_tensor_commit(tensors, nt)) memset(ok, 0, (size_t)n);
+    for (int i = 0; i < n; i++) {
+        VStage *v = &T.st[slots[i]];
+        if (!ok[i]) { v->state = SS_FREE; continue; }
+        v->layer = layer; v->eid = eids[i]; v->state = SS_FILLED; v->pending = 0; v->pref = pref;
+        (*done)++;
+    }
+    *ms += vkt_now_ms() - t0;
+}
 /* experts into slots: pool[i] set (or NULL), the host pool's copied on the device, the rest
  * loaded by the engine and uploaded */
 static void st_fill_group(int layer, const int *eids, const int *slots, int n, uint8_t *ok, const uint8_t *pool, int half) {
-    VktExpertSrc srcs[64]; void *hs[64];
     if (n > 64) n = 64;
     if (pool) {
         int ce[64], cs[64], ci[64], nc = 0, le[64], ls[64], li[64], nl = 0;
@@ -1153,53 +1759,8 @@ static void st_fill_group(int layer, const int *eids, const int *slots, int n, u
         return;
     }
     double ms = 0;
-    /* A device upload group can exceed the RAM cache. Consume each cache-sized
-     * batch completely before loading the next, which may reuse those RAM slots.
-     * A partial batch is capacity, not a reason to serialize all remaining reads. */
-    for (int base = 0; base < n;) {
-        int left = n - base;
-        int got = T.c.load_batch && left >= 2
-                ? T.c.load_batch(T.c.load_ctx, layer, eids + base, left, srcs, hs) : 0;
-        if (got < 0 || got > left) got = 0;
-        if (got) {
-            double t0 = vkt_now_ms();
-            #pragma omp parallel for schedule(dynamic, 1) if (T.st_par)
-            for (int j = 0; j < got; j++)
-                ok[base + j] = (uint8_t)st_put(layer, eids[base + j], &T.st[slots[base + j]], &srcs[j], 0);
-            ms += vkt_now_ms() - t0;
-            for (int j = 0; j < got; j++) T.c.release(T.c.load_ctx, hs[j]);
-            base += got;
-            continue;
-        }
-        /* A lone expert, or an engine without a usable batch hook. Its rows can
-         * still convert in parallel (COLI_VK_TIER_STREAM_PAR=0 keeps one thread). */
-        void *h = NULL; VktExpertSrc src;
-        ok[base] = 0;
-        if (T.c.load(T.c.load_ctx, layer, eids[base], &src, &h)) {
-            double t0 = vkt_now_ms();
-            ok[base] = (uint8_t)st_put(layer, eids[base], &T.st[slots[base]], &src, T.st_par);
-            ms += vkt_now_ms() - t0;
-            T.c.release(T.c.load_ctx, h);
-        }
-        base++;
-    }
-    double t0 = vkt_now_ms();
-    /* Fill the uploader's bounded staging window across the complete group.
-     * Committing each expert separately drains that window and waits for a
-     * fence after just three matrices, serializing transfers on discrete GPUs.
-     * A failed group is wholly left to the CPU; no partial expert is published. */
-    ColiVkTensor *tensors[3 * 64]; int nt = 0;
-    for (int i = 0; i < n; i++) if (ok[i])
-        for (int k = 0; k < 3; k++) tensors[nt++] = T.st[slots[i]].t[k];
-    if (nt && !coli_vk_tensor_commit(tensors, nt)) memset(ok, 0, (size_t)n);
     int done = 0;
-    for (int i = 0; i < n; i++) {
-        VStage *v = &T.st[slots[i]];
-        if (!ok[i]) { v->state = SS_FREE; continue; }
-        v->layer = layer; v->eid = eids[i]; v->state = SS_FILLED; v->pending = 0; v->pref = 0;
-        done++;
-    }
-    ms += vkt_now_ms() - t0;
+    st_fill_load(layer, eids, slots, n, ok, T.c.load_batch, T.c.load, T.c.load_ctx, NULL, 0, &ms, &done);
     T.st_up_ms += ms; T.st_bytes += (unsigned long long)done * T.exp_bytes;
     if (done && ms > 0) { double bw = (double)done * T.exp_bytes / ms; T.bw_up = T.bw_up > 0 ? 0.8 * T.bw_up + 0.2 * bw : bw; }
 }
@@ -1341,8 +1902,11 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
         ndev += cls[e] == BC_DEV; nst += cls[e] == BC_STREAM; nd2 += cls[e] == BC_DEV2;
         if (cls[e] == BC_CPU) { nkept++; kept_rows += cnt[e]; }
     }
-    /* prefetched slots this step does not stream go back */
+    /* prefetched slots this step does not stream go back; the running ring job's half
+     * is the next step's set, not this step's leftovers -- it goes back when its own
+     * step takes it, never here */
     for (int i = 0; T.st && i < T.st_n; i++) {
+        if (T.ring_run && i >= T.ring_lo && i < T.ring_hi) continue;
         VStage *v = &T.st[i];
         if (v->state == SS_FILLED && (v->layer != layer || cls[v->eid] != BC_STREAM)) v->state = SS_FREE;
     }
@@ -1358,10 +1922,14 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
         fprintf(stderr, VKT_TAG " tier %s stream: a step of %d rows; cold experts with %d rows or more go to the device (",
                 T.engine, S, R);
         if (T.st_rows_env > 0) fprintf(stderr, "COLI_VK_TIER_STREAM_ROWS");
+        else if (T.st_rows_adapt && !(T.bw_up > 0 && T.cpu_row_ms > 0))
+            fprintf(stderr, "1 row until the upload and the CPU's rows are measured (COLI_VK_TIER_STREAM_ROWS_ADAPTIVE)");
         else if (T.bw_up > 0 && T.cpu_row_ms > 0)
-            fprintf(stderr, "an upload of %s at %.1f GB/s takes %.3f ms, the CPU %.4f ms a row; the GEMM from %d rows",
+            fprintf(stderr, "an upload of %s at %.1f GB/s takes %.3f ms, the CPU %.4f ms a row; %s",
                     human((double)T.exp_bytes, hb, sizeof hb), T.bw_up / 1e6, (double)T.exp_bytes / T.bw_up,
-                    T.cpu_row_ms, T.gemm_rows);
+                    T.cpu_row_ms,
+                    T.st_rows_adapt ? "the measured break-even alone (COLI_VK_TIER_STREAM_ROWS_ADAPTIVE)"
+                                    : "the GEMM from more rows");
         else fprintf(stderr, "the GEMM's %d rows: the upload and the CPU's rows not measured yet", T.gemm_rows);
         fprintf(stderr, "); layer %d: %d resident, %d streamed (%d of them copied from the host pool), %d kept on the CPU (%d rows)",
                 layer, ndev, nst, npool, nkept, kept_rows);
@@ -1414,6 +1982,7 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
     if (!ok) { free(order); free(bex); free(brows); free(bx); free(bw); free(bidx); free(eslot); T.big = 0; return 0; }
     for (int e = 0; e < E; e++) { eslot[e] = -1; if (cls[e] == BC_DEV) order[no++] = e; }
     for (int i = 0; T.st && i < T.st_n; i++) {
+        if (T.ring_run && i >= T.ring_lo && i < T.ring_hi) continue;   /* the ring's half is another layer's; the join hands it over, never this scan */
         VStage *v = &T.st[i];
         if (v->state == SS_FILLED && v->layer == layer && cls[v->eid] == BC_STREAM && eslot[v->eid] < 0) {
             eslot[v->eid] = i; order[no++] = v->eid;
@@ -1422,15 +1991,20 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
     }
     for (int e = 0; e < E; e++) if (cls[e] == BC_STREAM && eslot[e] < 0) order[no++] = e;
     /* the second device's batch first, so it runs beside every sub-batch */
+    double tsd2 = vkt_cs_dprof() && nd2 ? vkt_now_ms() : 0;   /* DPROF: its gather + submit counts with the issue's submits */
     int d2_taken = nd2 ? d2_issue_big(layer, x, K, w, cnt, ofs, cls, taken) : 0;
+    if (tsd2) { T.pd_submit_ms += vkt_now_ms() - tsd2; T.pd_submit_n++; }
     /* sub-batches */
     int cnt_b = 0, rows_b = 0, nst_b = 0, total = 0;
     VSub *cur = NULL;
     int curh = 0;
 #define SUBMIT_CURRENT() do { \
         if (cnt_b) { \
-            int okk = !T.big_fail && (T.sy_step ? coli_vk_xb_sub_issue_step(curh, bex, brows, cnt_b, bidx, bw) \
+            int attempt = !T.big_fail; \
+            double ts = attempt && vkt_cs_dprof() ? vkt_now_ms() : 0; \
+            int okk = attempt && (T.sy_step ? coli_vk_xb_sub_issue_step(curh, bex, brows, cnt_b, bidx, bw) \
                                                 : coli_vk_xb_sub_issue(curh, bex, brows, cnt_b, bx, bw)); \
+            if (ts) { T.pd_submit_ms += vkt_now_ms() - ts; T.pd_submit_n++; } \
             if (okk) { \
                 for (int q = 0; q < rows_b; q++) { taken[bidx[q]] = 1; T.map[bidx[q]] = bidx[q]; } \
                 total += rows_b; T.st_subs++; T.sk++; \
@@ -1453,28 +2027,57 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
             if (nst_b >= T.st_per) SUBMIT_CURRENT();
             if (T.big_fail) break;
             if (eslot[e] < 0) {
-                /* this expert and the next ones without a slot, as many as the sub-batch has
-                 * room for, loaded and uploaded together; free slots first, joining the
-                 * oldest sub-batch in flight when there are not enough */
-                int room = T.st_per - nst_b, gid[64], gsl[64], gn = 0;
+                /* this expert and the next ones without a slot, loaded and uploaded together;
+                 * free slots first, joining the oldest sub-batch in flight when there are
+                 * not enough. The group's cap is the sub-batch's remaining room -- unless
+                 * COLI_VK_TIER_STREAM_GROUP widened it: then the group reaches past the
+                 * sub-batch into the step's later cold experts, which land filled and are
+                 * taken from their slots when their turn comes (the prefetched-slot state
+                 * the order scan already consumes). Only the schedule changes: one read
+                 * round, one conversion pass and one commit's fence per group instead of
+                 * one per sub-batch's worth -- the cs-timing2 fills ran 1.65 GB/s against
+                 * the ring worker's 7.97 GB/s on the same stream, a group a sub-batch. */
+                int room = T.st_group > 0 ? T.st_group : T.st_per - nst_b, gid[64], gsl[64], gn = 0;
                 if (room > 64) room = 64;
+                if (room < 1) room = 1;
                 for (int o2 = o; o2 < no && gn < room; o2++)
                     if (cls[order[o2]] == BC_STREAM && eslot[order[o2]] < 0) gid[gn++] = order[o2];
                 int nfree = 0;
+                if (T.ring_run) {   /* free room outside the ring's half first; short of it, take the ring (another layer's set) rather than race it */
+                    for (int i = 0; i < T.st_n; i++)
+                        if (!(i >= T.ring_lo && i < T.ring_hi) && T.st[i].state == SS_FREE) nfree++;
+                    if (nfree < gn) {
+                        double tj = vkt_cs_dprof() ? vkt_now_ms() : 0;   /* DPROF: the ring's take joined inside the issue */
+                        st_ring_take();
+                        if (vkt_cs_dprof()) { T.pd_rjoin_ms += vkt_now_ms() - tj; T.pd_rjoin_n++; }
+                    }
+                }
                 for (int tries = 0; tries < 3; tries++) {
                     nfree = 0;
-                    for (int i = 0; i < T.st_n && nfree < gn; i++) if (T.st[i].state == SS_FREE) gsl[nfree++] = i;
+                    for (int i = 0; i < T.st_n && nfree < gn; i++) {
+                        if (T.ring_run && i >= T.ring_lo && i < T.ring_hi) continue;
+                        if (T.st[i].state == SS_FREE) gsl[nfree++] = i;
+                    }
                     if (nfree >= gn) break;
                     int old = coli_vk_xb_sub_busy(T.sk % 2) ? (int)(T.sk % 2) : (int)((T.sk + 1) % 2);
                     if (cur && old == curh && cnt_b) old = !curh;   /* never the half being filled */
                     if (!coli_vk_xb_sub_busy(old)) break;
+                    double tj = vkt_cs_dprof() ? vkt_now_ms() : 0;   /* DPROF: an in-flight sub-batch joined for its slots */
                     st_join_half(old);
+                    if (vkt_cs_dprof()) { T.pd_rjoin_ms += vkt_now_ms() - tj; T.pd_rjoin_n++; }
                 }
                 if (T.big_fail) break;
                 if (nfree < gn) gn = nfree;
                 uint8_t gok[64], gpool[64];
                 for (int i = 0; i < gn; i++) gpool[i] = T.bpool ? T.bpool[gid[i]] : 0;
+                double tf = vkt_cs_dprof() ? vkt_now_ms() : 0;   /* DPROF: one fill group's wall (read + convert + upload) */
                 st_fill_group(layer, gid, gsl, gn, gok, gpool, cur ? curh : (int)(T.sk % 2));   /* the half they go to */
+                if (vkt_cs_dprof()) {
+                    double d = vkt_now_ms() - tf;
+                    T.pd_fill_ms += d; T.pd_fill_n++;
+                    T.pd_fill_exp += (unsigned long long)gn;
+                    if (d > T.pd_fill_max) T.pd_fill_max = d;
+                }
                 for (int i = 0; i < gn; i++) {
                     if (gok[i]) eslot[gid[i]] = gsl[i];
                     else if (gpool[i]) { cls[gid[i]] = BC_DEV; T.bpool[gid[i]] = 0; }   /* not copied: read in place */
@@ -1497,7 +2100,12 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
             if (T.big_fail) break;
             if (!cur) {   /* a new sub-batch in half sk % 2: the one there before is joined first */
                 curh = (int)(T.sk % 2);
-                if (coli_vk_xb_sub_busy(curh) && !st_join_half(curh)) break;
+                if (coli_vk_xb_sub_busy(curh)) {
+                    double tj = vkt_cs_dprof() ? vkt_now_ms() : 0;   /* DPROF: the half this sub-batch needs joined first */
+                    int jok = st_join_half(curh);
+                    if (vkt_cs_dprof()) { T.pd_rjoin_ms += vkt_now_ms() - tj; T.pd_rjoin_n++; }
+                    if (!jok) break;
+                }
                 cur = &T.hf[curh]; cur->n = cur->nslot = 0;
             }
             int take = cnt[e] - r0; if (take > half - rows_b) take = half - rows_b;
@@ -1549,6 +2157,7 @@ static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, in
 static int join_big(const float **rows) {
     double t0 = vkt_now_ms(), tc = t0 - T.t_issued;
     T.cpu_ms += tc;
+    if (vkt_cs_dprof() && T.p_t0 > 0) T.pd_kept_ms += tc;   /* DPROF: the issue's end -> the join's entry: the kept rows' compute */
     /* the host pool's pairs of few rows, while the device computes its batches */
     const int hn = T.hy_n;
     int hok = 1;
@@ -1569,6 +2178,12 @@ static int join_big(const float **rows) {
         T.wait_ms += vkt_now_ms() - t1; T.dev_ms += dms; T.d2_ms += dms;
         if (ok1) for (int q = 0; q < T.nd2; q++) memcpy((T.sy_step ? T.sy_step : T.sy) + (size_t)T.d2_idx[q] * T.c.hidden, T.d2_y[q], (size_t)T.c.hidden * sizeof(float));
         T.d2_inflight = 0;
+    }
+    if (T.p_t0 > 0) {   /* DPROF: the prompt mirror closes the big step's span, issue to join (all its waits are in) */
+        double w = T.wait_ms - T.p_w0;
+        T.p_wait_ms += w; T.p_dev_ms += T.dev_ms - T.p_d0;
+        T.p_cpu_ms += vkt_now_ms() - T.p_t0 - w;
+        T.p_steps++; T.p_t0 = 0;
     }
     int cpu_pairs = T.big_n - T.big_taken - hn;   /* the engine's own */
     if (cpu_pairs >= 32 && tc > 0) {
@@ -1599,17 +2214,26 @@ static int join_big(const float **rows) {
     return 1;
 }
 
-/* layer's likely streamed experts into the free slots, while the device runs its attention */
-int vkt_stream_prefetch(int layer, int S) {
-    if (!T.on || !T.st_ok || T.inflight || layer < 0 || layer >= T.main_layers || S < T.gemm_rows) return 0;
-    if (!coli_vk_xb_ready() || !st_alloc()) return 0;
+/* layer's likely streamed experts, best first: the prediction's rows per expert where
+ * the layer has a big step behind it (T.pred), else the heat; the resident and the
+ * below-rule ones never make the list (the rule's floor times COLI_VK_TIER_STREAM_PRED,
+ * above). cand must hold T.c.experts ints; returns the
+ * count, capped at `cap`. Called on the engine thread (the slot table is read).
+ * `whole` (the ring's cold branch, COLI_VK_TIER_STREAM_RING_COLD) drops the below-rule
+ * filter: with no prediction to scale at the coming step's S there is nothing to hold
+ * against R, so every non-resident expert makes the list -- the fork's unconditional
+ * whole-layer coverage -- still ranked by the same estimate. */
+static int st_prefetch_plan(int layer, int S, int *cand, int cap, int whole) {
     const int E = T.c.experts, K = T.c.topk;
     int R = stream_min_rows();
-    /* the slots a step before left filled are free again */
-    for (int i = 0; i < T.st_n; i++) if (T.st[i].state != SS_BUSY) T.st[i].state = SS_FREE;
+    /* COLI_VK_TIER_STREAM_PRED (default 1, byte-identical): the plan's row floor is R
+     * times it. >1 tightens coverage -- the cs-timing2 over-fetch was 2,176 of 12,550
+     * prefetched experts unused (~27.9 GB of reads and uploads), the plan's low-row
+     * tail; a trimmed expert that does route falls back to the inline fill at the step
+     * (the `whole` branch keeps its filter dropped either way, as before). */
+    const double floor = (double)R * T.st_pred;
     double *est = malloc((size_t)E * sizeof(double));
-    int *cand = malloc((size_t)E * sizeof(int));
-    if (!est || !cand) { free(est); free(cand); return 0; }
+    if (!est) return 0;
     double tot = 0;
     if (T.pred && T.pred_ok[layer]) {
         double sum = 0;
@@ -1621,26 +2245,163 @@ int vkt_stream_prefetch(int layer, int S) {
         for (int e = 0; e < E; e++) est[e] = tot > 0 ? (double)slot(layer, e)->heat * S * K / tot : 0;
     }
     int nc = 0;
-    if (tot > 0)
+    if (tot > 0 || whole)
         for (int e = 0; e < E; e++) {
             VSlot *v = slot(layer, e);
-            if (v->state == VS_RESIDENT || est[e] < R) continue;
-            int at = nc++;
+            if (v->state == VS_RESIDENT || (est[e] < floor && !whole)) continue;
+            int at = nc;
             while (at > 0 && est[cand[at - 1]] < est[e]) { cand[at] = cand[at - 1]; at--; }
             cand[at] = e;
+            nc++;
         }
+    free(est);
+    if (nc > cap) nc = cap;
+    return nc;
+}
+
+/* ---- the stream ring (COLI_VK_TIER_STREAM_RING) ----------------------------------
+ * The fork's v4_ram class on the port's slots: while the engine computes layer L, a
+ * worker fills the NEXT layer's predicted set into the half of the streaming slots the
+ * step is not using (they alternate -- the half L's own prefilled set sits in is the
+ * one L's sub-batches read, and join_big frees it before the next job takes it). One
+ * job, one worker at a time: the prefetch call for layer L is the fork's switch point --
+ * it joins the running job (the take; the books merge, the slot handoff is the join,
+ * never a concurrent read) and hands the worker layer L+1's plan where a prediction
+ * exists (a cold layer, the first chunk's walk, keeps the inline fill at the step --
+ * the fallback that also covers every miss: an unpredicted expert, a refused read, a
+ * worker that could not be made; COLI_VK_TIER_STREAM_RING_COLD plans those by their
+ * heat instead, the fork's whole-layer cold fill). The engine's scans skip the running job's slot range;
+ * an inline fill short of room elsewhere joins the ring rather than race it. */
+struct VRing { int layer, n, lo, hi; int *eids; double ms; int done; unsigned long long got; };
+
+static void *st_ring_worker(void *argument) {
+    struct VRing *job = argument;
+    for (int used = 0; used < job->n; used += 64) {   /* the fill group's cap */
+        int gn = job->n - used < 64 ? job->n - used : 64, gsl[64];
+        uint8_t gok[64];
+        for (int i = 0; i < gn; i++) gsl[i] = job->lo + used + i;
+        st_fill_load(job->layer, job->eids + used, gsl, gn, gok, T.c.ring_batch, NULL,
+                     T.c.load_ctx, &T.ring_stop, 1, &job->ms, &job->done);
+        for (int i = 0; i < gn; i++) job->got += gok[i];
+    }
+    return NULL;
+}
+
+/* Join the running job (the take). A cancelled job's books still count what it filled,
+ * but its upload-rate sample does not (a cut-off stream is not a sample -- the fork's
+ * rule); nothing merges twice. */
+static void st_ring_join(int cancelled) {
+    if (!T.ring_run) return;
+    pthread_join(T.ring_th, NULL);
+    T.ring_run = 0;
+    struct VRing *job = T.ring_job;
+    T.ring_job = NULL;
+    if (!job) return;
+    T.pf_n += job->got;
+    T.st_up_ms += job->ms;
+    T.st_bytes += (unsigned long long)job->done * T.exp_bytes;
+    T.ring_experts += job->got;
+    if (!cancelled && job->done && job->ms > 0) {
+        double bw = (double)job->done * T.exp_bytes / job->ms;
+        T.bw_up = T.bw_up > 0 ? 0.8 * T.bw_up + 0.2 * bw : bw;
+    }
+    free(job->eids);
+    free(job);
+}
+
+static void st_ring_take(void) { st_ring_join(0); }
+
+/* The teardown's cancel (the fork's issue #4): ask the worker to stop between reads and
+ * join -- the wait bounds to the read in flight, not the rest of the layer. */
+static void st_ring_cancel(void) {
+    if (!T.ring_run) return;
+    __atomic_store_n(&T.ring_stop, 1, __ATOMIC_RELEASE);
+    st_ring_join(1);
+    __atomic_store_n(&T.ring_stop, 0, __ATOMIC_RELEASE);
+}
+
+/* The prefetch's ring arm: the take of the job that runs, then the next layer's plan to
+ * the worker. Returns the experts handed over, 0 when there was nothing to hand (the
+ * last layer; a cold layer with COLD unset), -1 when the ring cannot this time and the
+ * inline fill takes the call. */
+static int st_ring_submit(int layer, int S) {
+    st_ring_take();
+    if (!T.ring_ok) return -1;
+    const int next = layer + 1;
+    if (next >= T.main_layers) return 0;
+    const int cold = !T.pred || !T.pred_ok[next];   /* no big step behind the next layer yet */
+    /* The cold branch: the prompt's first chunk, the layer's first visit. As landed it
+     * hands nothing over, so the whole fill runs inline at the step -- off-thread
+     * placement without plan coverage, which W2 measured a strict pessimization
+     * (42 jobs, 8 experts filled, 0 used; host-MoE 44.9 -> 131.0 s).
+     * COLI_VK_TIER_STREAM_RING_COLD is the fork's literal cold shape: the plan runs
+     * without the prediction too, so the heat ranks the next layer's whole non-resident
+     * set (the same in-RAM exclusion, the same cap) and the job covers it ahead; where a
+     * prediction exists the plan is the prediction's, unchanged. */
+    if (cold && !T.ring_cold) return 0;
+    int *cand = malloc((size_t)T.c.experts * sizeof(int));
+    if (!cand) return -1;
+    /* The half the running step is not reading: one sub-batch's worth (st_per), so the
+     * job's set and the step's own fills share the window without meeting. An expert
+     * the engine still holds in RAM is left to the inline fill (its read is cheap). */
+    int nc = st_prefetch_plan(next, S, cand, T.st_per, cold);
+    for (int i = 0; i < nc; i++)
+        if (T.c.in_ram && T.c.in_ram(T.c.ram_ctx, next, cand[i])) { cand[i] = -1; }
+    int n = 0;
+    for (int i = 0; i < nc; i++) if (cand[i] >= 0) cand[n++] = cand[i];
+    if (!n) { free(cand); return 0; }
+    struct VRing *job = calloc(1, sizeof *job);
+    if (!job) { free(cand); return -1; }
+    job->layer = next;
+    job->eids = cand;
+    job->n = n;
+    T.ring_half ^= 1;
+    job->lo = T.ring_half ? T.st_per : 0;
+    job->hi = T.ring_half ? (T.st_per * 2 < T.st_n ? T.st_per * 2 : T.st_n) : T.st_per;
+    T.ring_lo = job->lo; T.ring_hi = job->hi;
+    if (pthread_create(&T.ring_th, NULL, st_ring_worker, job)) {
+        fprintf(stderr, VKT_TAG " tier %s: no thread for the stream ring; the prefetch fills inline for the rest of the run\n", T.engine);
+        T.ring_ok = 0;
+        free(job->eids); free(job);
+        return -1;
+    }
+    T.ring_job = job;
+    T.ring_run = 1;
+    T.ring_jobs++;
+    return n;
+}
+
+/* layer's likely streamed experts into the free slots, while the device runs its attention */
+int vkt_stream_prefetch(int layer, int S) {
+    if (!T.on || !T.st_ok || T.inflight || layer < 0 || layer >= T.main_layers || S < T.gemm_rows) return 0;
+    if (!coli_vk_xb_ready() || !st_alloc()) return 0;
+    if (T.ring_on) {
+        int n = st_ring_submit(layer, S);
+        if (n >= 0) return n;
+    }
+    const int E = T.c.experts;
+    int *cand = malloc((size_t)E * sizeof(int));
+    if (!cand) return 0;
+    /* the slots a step before left filled are free again */
+    for (int i = 0; i < T.st_n; i++) if (T.st[i].state != SS_BUSY) T.st[i].state = SS_FREE;
+    int nc = st_prefetch_plan(layer, S, cand, T.st_n, 0);
     int got = 0, used = 0;
-    if (nc > T.st_n) nc = T.st_n;
     while (used < nc) {   /* groups of a sub-batch's worth, into the slots in order */
         int gn = nc - used < T.st_per ? nc - used : T.st_per, gsl[64]; uint8_t gok[64];
         if (gn > 64) gn = 64;
         for (int i = 0; i < gn; i++) gsl[i] = used + i;
+        double tf = vkt_cs_dprof() ? vkt_now_ms() : 0;   /* DPROF: the stage fill's wall -- the chain's staging role is the window around it */
         st_fill_group(layer, cand + used, gsl, gn, gok, NULL, 0);
+        if (vkt_cs_dprof()) {
+            double d = vkt_now_ms() - tf;
+            T.pdst_fill_ms += d; T.pdst_fill_n++;
+            if (d > T.pdst_fill_max) T.pdst_fill_max = d;
+        }
         for (int i = 0; i < gn; i++) if (gok[i]) { T.st[gsl[i]].pref = 1; got++; }
         used += gn;
     }
     T.pf_n += (unsigned long long)got;
-    free(est); free(cand);
+    free(cand);
     return got;
 }
 
@@ -1666,11 +2427,11 @@ static int host_fmt_ok(const ColiVkTensorInfo *ti) {
     if (ti->I % 32) return 0;
     if (ti->fmt == 1 || ti->fmt == 2) return 1;
     if (ti->fmt == 5) return ti->I % 64 == 0;
-    return (ti->fmt == 4 || ti->fmt == 13 || ti->fmt == 7 || ti->fmt == 12) && ti->gs >= 32 && ti->gs % 32 == 0;
+    return (ti->fmt == 4 || ti->fmt == 13 || ti->fmt == 7 || ti->fmt == 12 || ti->fmt == 15) && ti->gs >= 32 && ti->gs % 32 == 0;
 }
 static int host_type(const ColiVkTensorInfo *ti) { return ti->fmt >= 100 ? ti->fmt - 100 : -ti->fmt; }
 static int host_gs(const ColiVkTensorInfo *ti) {
-    return ti->fmt == 5 ? 64 : ti->fmt == 4 || ti->fmt == 13 || ti->fmt == 7 || ti->fmt == 12 ? ti->gs : 0;
+    return ti->fmt == 5 ? 64 : ti->fmt == 4 || ti->fmt == 13 || ti->fmt == 7 || ti->fmt == 12 || ti->fmt == 15 ? ti->gs : 0;
 }
 /* A resident expert of the host pool the CPU computes in place in a hybrid step: outside the
  * device's share (by a hash of (layer, expert): the same split at every step and every read
@@ -1718,7 +2479,8 @@ static void hy_sched(void) {
     if (kind) omp_set_schedule(omp_sched_dynamic, 8); else omp_set_schedule(omp_sched_static, 0);
 #endif
 }
-/* colibri's int8 (fmt 1, 13), int4 (fmt 2, 4), int3-g64 (fmt 5), MXFP4 (fmt 7) and FP8 (fmt 12)
+/* colibri's int8 (fmt 1, 13), int4 (fmt 2, 4), int3-g64 (fmt 5), MXFP4 (fmt 7, and its
+ * packed-scales twin 15) and FP8 (fmt 12)
  * rows. dev_codes: an int4 row's codes in element order (the pairs' low nibble first), 0..15
  * (the value + 8), into u (I bytes). */
 static void dev_codes(uint8_t *u, const uint8_t *row, int I) {
@@ -1793,8 +2555,12 @@ static float dev_dot(const int8_t *w8, const uint8_t *u4, int zero, const float 
     return gs ? r : r * rs[0];
 }
 /* the float reference: the row dequantized (its codes times their scale) */
+static float dev_ue8m0(uint8_t e) {   /* fmt 15's scale: the exponent into the float's field */
+    uint32_t u = (uint32_t)e << 23; float f; memcpy(&f, &u, 4); return f;
+}
 static void dev_dequant(float *o, const uint8_t *row, int fmt, const float *rs, int gs, int I) {
     static const float e2m1[8] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6};
+    const uint8_t *rs8 = (const uint8_t *)rs;   /* fmt 15: its scales are ue8m0 bytes */
     for (int i = 0; i < I; i++) {
         float w;
         if (fmt == 1 || fmt == 13) w = (float)((const int8_t *)row)[i];
@@ -1804,9 +2570,9 @@ static void dev_dequant(float *o, const uint8_t *row, int fmt, const float *rs, 
             w = (float)((int)(((lo[j >> 2] >> ((j & 3) * 2)) & 3u) | (((hi[j >> 3] >> (j & 7)) & 1u) << 2)) - 4);
         } else {
             const int nib = (i & 1) ? row[i >> 1] >> 4 : row[i >> 1] & 15;
-            w = fmt == 7 ? ((nib & 8) ? -e2m1[nib & 7] : e2m1[nib & 7]) : (float)(nib - 8);
+            w = (fmt == 7 || fmt == 15) ? ((nib & 8) ? -e2m1[nib & 7] : e2m1[nib & 7]) : (float)(nib - 8);
         }
-        o[i] = w * (gs ? rs[i / gs] : rs[0]);
+        o[i] = w * (gs ? (fmt == 15 ? dev_ue8m0(rs8[i / gs]) : rs[i / gs]) : rs[0]);
     }
 }
 /* The integer form of colibri's rows without the unpack, and with four sums in flight
@@ -1932,7 +2698,7 @@ static float hy_dot8(const int8_t *w8, const float *rs, int gs, const gq_act *a,
  * bits whatever rows share the call. tmp: I floats, and for an int4 row I bytes after them. */
 static inline void host_rows(float *y, int ys, const gq_act *a, const HyAct *hp, const float *const *xf, const uint8_t *row, int t, int I,
                              float *tmp, const float *rs, int gs) {
-    if (t < 0 && (-t == 12 || (-t == 7 && I / gs > 2048)) && !gq_exact_mode()) {   /* FP8 has no integer form: its floats against x's */
+    if (t < 0 && (-t == 12 || (((-t == 7 || -t == 15)) && I / gs > 2048)) && !gq_exact_mode()) {   /* FP8 has no integer form: its floats against x's */
         dev_dequant(tmp, row, -t, rs, gs, I);
         for (int s = 0; s < a->S; s++) {
             const float *x = xf[s];
@@ -1956,9 +2722,10 @@ static inline void host_rows(float *y, int ys, const gq_act *a, const HyAct *hp,
         float half[2048], *rsx = (float *)rs;
         if (fmt == 2 || fmt == 4) { u = (uint8_t *)(tmp + I); dev_codes(u, row, I); zero = 8; }
         else if (fmt == 5) { u = (uint8_t *)(tmp + I); dev_codes3(u, row, I); zero = 4; }
-        else if (fmt == 7) {   /* the values doubled: the group's scale halved */
+        else if (fmt == 7 || fmt == 15) {   /* the values doubled: the group's scale halved */
             int8_t *w = (int8_t *)(tmp + I); dev_codes_fp4(w, row, I); w8 = w;
-            for (int g = 0; g < I / gs; g++) half[g] = 0.5f * rs[g];   /* at most 2048: above */
+            if (fmt == 7) for (int g = 0; g < I / gs; g++) half[g] = 0.5f * rs[g];   /* at most 2048: above */
+            else for (int g = 0; g < I / gs; g++) half[g] = 0.5f * dev_ue8m0(((const uint8_t *)rs)[g]);
             rsx = half;
         }
         for (int s = 0; s < a->S; s++)
@@ -1976,18 +2743,25 @@ static inline void host_rows(float *y, int ys, const gq_act *a, const HyAct *hp,
     }
 }
 /* host_rows for four consecutive rows (rb bytes apart, their scales nsc floats apart), row r
+ * of the four reading host_rs4's pointer (fmt 15's packed ue8m0 scales are a byte a group —
+ * the same advance host_scale_row makes one row at a time, so the fast path stays exact there)
  * at y + r * ystep: one check for the four. Four rows sharing one pass over the activation
  * (a sum in flight per row) was tried and lost to hy_dot4's four sums per row: 183 against
  * 129 us a pair on one core, 36 against 34 on twelve. */
+static inline const float *host_rs4(const float *rs, int t, size_t nsc, int r) {
+    if (!rs) return NULL;
+    if (t == -15) return (const float *)((const uint8_t *)rs + (size_t)r * nsc);   /* a byte a group */
+    return rs + (size_t)r * nsc;
+}
 static inline void host_rows4(float *y, int ys, int ystep, const gq_act *a, const HyAct *hp, const float *const *xf, const uint8_t *row,
                               size_t rb, int t, int I, float *tmp, const float *rs, size_t nsc, int gs) {
     if (t < 0 && (-t == 2 || -t == 4) && hp && hp->S == a->S && !gq_exact_mode()) {
         for (int s = 0; s < a->S; s++) {
-            for (int r = 0; r < 4; r++) y[(size_t)s * ys + (size_t)r * ystep] = hy_dot4(row + (size_t)r * rb, rs ? rs + (size_t)r * nsc : NULL, gs, hp, s);
+            for (int r = 0; r < 4; r++) y[(size_t)s * ys + (size_t)r * ystep] = hy_dot4(row + (size_t)r * rb, host_rs4(rs, t, nsc, r), gs, hp, s);
         }
         return;
     }
-    for (int r = 0; r < 4; r++) host_rows(y + (size_t)r * ystep, ys, a, hp, xf, row + (size_t)r * rb, t, I, tmp, rs ? rs + (size_t)r * nsc : NULL, gs);
+    for (int r = 0; r < 4; r++) host_rows(y + (size_t)r * ystep, ys, a, hp, xf, row + (size_t)r * rb, t, I, tmp, host_rs4(rs, t, nsc, r), gs);
 }
 typedef struct { const uint8_t *g; int p; } HyKey;
 static int hy_key_cmp(const void *a, const void *b) {
@@ -2048,6 +2822,17 @@ static void hy_act_v4(float *h, const float *g, const float *u, int I, float lim
 }
 /* pw: the pairs' route weights for DeepSeek V4's expert (hy_act_v4, the weight in the row as
  * the device's), NULL for SwiGLU */
+/* One output row's scales of a matrix the CPU computes from the host pool's rows: the
+ * f32-scale formats stride ng floats a row (host_pairs' callers); fmt 15's are the packed
+ * ue8m0 BYTES, ng a row -- a quarter of the f32 stride, so the two must not share the
+ * pointer arithmetic (the W1 P0: every row past the first read its bytes 4x too deep,
+ * past the scale range into the pool's other bytes, 2^127-scale garbage and non-finite
+ * expert outputs at model scale; AI-pw-w1-2026-10-25, PW-Dfix). */
+static const float *host_scale_row(const float *base, int t, int gs, int I, int row) {
+    size_t ng = gs ? (size_t)((I + gs - 1) / gs) : 1;
+    if (t == -15) return (const float *)((const uint8_t *)base + (size_t)row * ng);   /* a byte a group */
+    return base + (size_t)row * ng;
+}
 static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, int np, int D, int I,
                       float limit, int nt, float *gu, float *hh, float *dn, const float *pw) {
     if (np < 1) return 1;
@@ -2112,18 +2897,21 @@ static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, in
                 continue;
             }
             const size_t nsc = h->gsgu ? (size_t)(D + h->gsgu - 1) / h->gsgu : 1;
-            if (whole && h->tg < 0) {   /* two fours: one check for each */
+            if (whole && h->tg < 0) {   /* two fours: one check for each (fmt 15 included: host_rs4
+                                 * inside advances the packed byte scales, host_scale_row the base) */
                 for (int o = o0; o < o1; o += 4) {
                     const int oo = o < I ? o : o - I;
                     host_rows4(gu + (size_t)q0 * 2 * I + o, 2 * I, 1, &ag[g], &pg[g], xo + q0, (o < I ? h->g : h->u) + (size_t)oo * h->rgu, h->rgu,
-                               h->tg, D, tmp, (o < I ? h->sg : h->su) + (size_t)oo * nsc, nsc, h->gsgu);
+                               h->tg, D, tmp, host_scale_row(o < I ? h->sg : h->su, h->tg, h->gsgu, D, oo), nsc, h->gsgu);
                 }
                 continue;
             }
             for (int o = o0; o < o1; o++) {
                 const int oo = o < I ? o : o - I;
                 const uint8_t *row = (o < I ? h->g : h->u) + (size_t)oo * h->rgu;
-                const float *rs = h->tg < 0 ? (o < I ? h->sg : h->su) + (size_t)oo * nsc : NULL;
+                /* host_scale_row, not the f32 stride: fmt 15's packed ue8m0 scales are a byte
+                 * a group (the W1 P0; -t == 15), the gq_rows_f8 path above never takes them) */
+                const float *rs = h->tg < 0 ? host_scale_row(o < I ? h->sg : h->su, h->tg, h->gsgu, D, oo) : NULL;
                 host_rows(gu + (size_t)q0 * 2 * I + o, 2 * I, &ag[g], &pg[g], xo + q0, row, h->tg, D, tmp, rs, h->gsgu);
             }
         }
@@ -2156,11 +2944,12 @@ static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, in
             if (o1 - o0 == 8 && h->td < 0) {
                 for (int o = o0; o < o1; o += 4)
                     host_rows4(dy + (size_t)q0 * D + o, D, 1, &ah[g], &ph[g], ho + q0, h->d + (size_t)o * h->rd, h->rd, h->td, I, tmp,
-                               h->sd + (size_t)o * nsc, nsc, h->gsd);
+                               host_scale_row(h->sd, h->td, h->gsd, I, o), nsc, h->gsd);
                 continue;
             }
             for (int o = o0; o < o1; o++) {
-                const float *rs = h->td < 0 ? h->sd + (size_t)o * nsc : NULL;
+                /* host_scale_row, not the f32 stride: fmt 15's scales are a byte a group (the W1 P0) */
+                const float *rs = h->td < 0 ? host_scale_row(h->sd, h->td, h->gsd, I, o) : NULL;
                 host_rows(dy + (size_t)q0 * D + o, D, &ah[g], &ph[g], ho + q0, h->d + (size_t)o * h->rd, h->td, I, tmp, rs, h->gsd);
             }
         }
@@ -2225,11 +3014,16 @@ static const float *hy_keep_x(const float *src) {
 static int issue(int layer, const float *x, int S, int K, const int *idx, const float *w, uint8_t *taken) {
     if (S > 0 && K > 0) memset(taken, 0, (size_t)S * K);
     if (!T.on || T.inflight || layer < 0 || layer >= T.c.layers || S < 1 || K < 1) return 0;
+    /* a decode-class step retires stream slots (decode growth): the ring's half is
+     * not the engine's to take while a job runs -- join it first (a big step coexists
+     * with the running job instead, the halves apart) */
+    if (S <= VKT_UP_ROWS) st_ring_take();
     if (!coli_vk_xb_ready()) {
         if (T.on) { fprintf(stderr, VKT_TAG " tier %s: the device stopped answering, the experts stay on the CPU\n", T.engine); T.on = 0; }
         return 0;
     }
     if (T.d2 && !coli_vk_xb_ready_dev(1)) d2_stop("the second device stopped answering");
+    T.p_t0 = vkt_now_ms(); T.p_w0 = T.wait_ms; T.p_d0 = T.dev_ms;   /* DPROF: the prompt mirror's span opens here (the join closes it) */
     if (layer < T.last_layer || T.begin) { T.begin = 0; T.first_layer = layer; new_forward(); }
     if (T.routed_at) {   /* this step's routing: its experts are not offered to the RAM cache's eviction */
         uint32_t q = ++T.seq;
@@ -2239,14 +3033,60 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
     }
     if (layer == T.first_layer) {   /* COLI_VK_TIER_RATE promotions per token of the forward */
         T.tick += (uint32_t)S;
-        long cap = (long)T.promo_cap + (long)T.rate * S;
-        T.promo_cap = cap > (1 << 30) ? 1 << 30 : (int)cap;
+        if (!T.promo_fix) {   /* COLI_VK_TIER_PROMO_CAP holds the forward's cap fixed instead */
+            long cap = (long)T.promo_cap + (long)T.rate * S;
+            T.promo_cap = cap > (1 << 30) ? 1 << 30 : (int)cap;
+        }
     }
     T.last_layer = layer;
     quiesce();
-    if (T.st_ok && S >= T.gemm_rows && layer < T.main_layers) return issue_big(layer, x, S, K, idx, w, taken);
+    T.dgrow_dec = S <= VKT_UP_ROWS;   /* decode growth: the running step's class (notes gate on it) */
+    if (T.dgrow && !T.dgrow_armed && T.dgrow_dec) dgrow_arm();
+    if (T.st_ok && S >= T.gemm_rows && layer < T.main_layers) {   /* DPROF: the prompt window's issue wall, the p_cpu mirror's head */
+        int pd = vkt_cs_dprof();
+        double ti = pd ? vkt_now_ms() : 0;
+        int r = issue_big(layer, x, S, K, idx, w, taken);
+        if (pd) { T.pd_issue_ms += vkt_now_ms() - ti; T.pd_issue_n++; }
+        return r;
+    }
     int E = T.c.experts, H = T.c.hidden, n = S * K;
     if (!grow_map(n)) return 0;
+    if (T.csx && S == 1) {
+        /* COLI_VK_TIER_EXPERTS: the compute site moves to the finish site. The walk's
+         * bookkeeping runs as always (heat, the routing guard, the forward's tick, the
+         * host pool's promote) but nothing is submitted: the return says the whole
+         * selection is the deferred group's, and taken[] marks only the experts whose
+         * cached handles need no read -- the loader reads the rest exactly as before
+         * (they are the alias views' bytes, k - taken of them), a pure feeder. ONE
+         * group goes out at vkt_issue_group, after the engine's loader slide-join
+         * settled those bytes. rows == 1 only: prefill keeps the union/batch path, and
+         * the hybrid host-pool classification is skipped (those residents ride the
+         * group through their handles). */
+        int valid = 0;
+        for (int i = 0; i < n; i++) {
+            T.map[i] = -1;
+            int e = idx[i];
+            if (e < 0 || e >= E) continue;
+            T.routed++;
+            if (S <= VKT_UP_ROWS) T.d_routed++;
+            if (layer >= T.main_layers) T.extra_routed++;
+            VSlot *v = slot(layer, e);
+            if (v->heat < 0xFFFFFFFFu) v->heat++;
+            v->last = T.tick;
+            valid++;
+            if (v->state == VS_RESIDENT && v->ex) taken[i] = 1;   /* the handle serves it: no read */
+        }
+        T.can_balance = 0;
+        T.hy_n = T.hy_nx = 0;
+        if (!valid) return 0;
+        for (int i = 0; T.promote_rate && S <= VKT_UP_ROWS && layer < T.main_layers && i < n; i++)
+            if (idx[i] >= 0 && idx[i] < E) promote(layer, idx[i]);
+        T.cs_pending = 1; T.cs_layer = layer;
+        T.d0_inflight = T.d2_inflight = 0;
+        T.inflight = 1; T.S = S; T.K = K; T.steps++;
+        T.t_issued = vkt_now_ms();   /* DPROF: the window opens at the deferral, as at a submit */
+        return valid;
+    }
     /* a hybrid step: the host pool's experts the CPU can compute in place are its, at the join */
     const int hyb = T.hybrid && S <= VKT_UP_ROWS && layer < T.main_layers && grow_hy(n, 0) && grow_hyx(S);
     T.hy_n = T.hy_nx = 0;
@@ -2258,6 +3098,7 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
         int e = idx[i];
         if (e < 0 || e >= E) continue;
         T.routed++;
+        if (S <= VKT_UP_ROWS) T.d_routed++;   /* the decode-only share (vkt_report) */
         if (layer >= T.main_layers) T.extra_routed++;
         VSlot *v = slot(layer, e);
         if (v->heat < 0xFFFFFFFFu) v->heat++;
@@ -2366,6 +3207,7 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
         taken[i] = 1; took++;
     }
     T.served += (unsigned long long)took;
+    if (S <= VKT_UP_ROWS) T.d_served += (unsigned long long)took;   /* the decode-only share (vkt_report) */
     if (T.hy_n) {   /* the join computes them */
         for (int i = 0; i < n; i++) if (T.hy_of[i] >= 0) taken[i] = 1;
         for (int p = 0; p < T.hy_n; p++) T.hy_hx[p] = &T.hy_v[p];
@@ -2375,7 +3217,7 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
     T.inflight = 1; T.S = S; T.K = K; T.steps++;
     /* T.full: the batch is in flight with the experts it took: a victim's device copy is
      * freed at its join */
-    for (int i = 0; T.full && S <= VKT_UP_ROWS && i < n; i++)
+    for (int i = 0; T.promote_rate && S <= VKT_UP_ROWS && i < n; i++)
         if (idx[i] >= 0 && idx[i] < E && layer < T.main_layers) promote(layer, idx[i]);
     if (layer >= T.main_layers) T.extra_served += (unsigned long long)took;
     if (T.d2_inflight) { T.d2_served += (unsigned long long)(total - rows0); T.d2_steps++; }
@@ -2389,8 +3231,375 @@ int vkt_issue_w(int layer, const float *x, int S, int K, const int *idx, const f
     return issue(layer, x, S, K, idx, w, taken);
 }
 
-int vkt_join(const float **rows) {
+/* ---- the compute site's group (COLI_VK_TIER_EXPERTS, CS-1b) ------------------------- */
+static int cs_ex_keep(ColiVkExpert *e) {   /* the transient aliased experts, freed at the join */
+    if (T.cs_nex >= T.cs_cex) {
+        int nc = T.cs_cex ? T.cs_cex * 2 : 8;
+        ColiVkExpert **a = realloc(T.cs_ex, (size_t)nc * sizeof(*a));
+        if (!a) return 0;
+        T.cs_ex = a; T.cs_cex = nc;
+    }
+    T.cs_ex[T.cs_nex++] = e;
+    return 1;
+}
+static void cs_ex_release(void) {
+    double t0 = vkt_cs_dprof() ? vkt_now_ms() : 0;
+    for (int i = 0; i < T.cs_nex; i++) coli_vk_xb_expert_free(T.cs_ex[i]);
+    if (vkt_cs_dprof()) { T.cs_release_ms += vkt_now_ms() - t0; T.cs_release_n++; }
+    T.cs_nex = 0;
+}
+
+/* ---- the CS alias keepalive cache (COLI_VK_TIER_CS_ALIAS_CACHE) -------------------- */
+static int cs_cache_key_eq(const VCsAlias *e, const VktAliasSrc *s) {
+    if (e->slab != s->slab || e->bytes != s->bytes || e->fmt != s->fmt || e->gs != s->gs) return 0;
+    for (int k = 0; k < 3; k++)
+        if (e->woff[k] != s->woff[k] || e->soff[k] != s->soff[k] || e->I[k] != s->I[k] || e->O[k] != s->O[k]) return 0;
+    return 1;
+}
+static int cs_cache_find(const VktAliasSrc *s) {
+    if (!T.cs_cache) return -1;
+    for (int i = 0; i < T.cs_cache_n; i++)
+        if (cs_cache_key_eq(&T.cs_cache_e[i], s)) return i;
+    return -1;
+}
+/* the slab pointer is the store slot's own buffer (one slot, one record): a new geometry
+ * at the same pointer is the slot rewritten in place, so the old entry -- still pinning
+ * those pages -- is dropped before the new import reads what the slot now holds */
+static int cs_cache_find_slab(const void *slab) {
+    if (!T.cs_cache || !slab) return -1;
+    for (int i = 0; i < T.cs_cache_n; i++)
+        if (T.cs_cache_e[i].slab == slab) return i;
+    return -1;
+}
+static void cs_cache_drop(int i) {
+    VCsAlias *e = &T.cs_cache_e[i];
+    coli_vk_slab_unref(e->imp);   /* the keepalive reference: the last one frees the import */
+    T.cs_cache_bytes -= e->imp_bytes;
+    T.cs_cache_n--;
+    if (i < T.cs_cache_n) T.cs_cache_e[i] = T.cs_cache_e[T.cs_cache_n];
+    T.cs_cache_evicts++;
+}
+static void cs_cache_drop_lru(void) {
+    int bi = -1;
+    unsigned long long bs = ~0ull;
+    for (int i = 0; i < T.cs_cache_n; i++)
+        if (T.cs_cache_e[i].seq < bs) { bs = T.cs_cache_e[i].seq; bi = i; }
+    if (bi >= 0) cs_cache_drop(bi);
+}
+/* the byte bound is retired at the join, after the group's tensors are gone: evicting
+ * here can free a slab the batch no longer reads (never while it is in flight) */
+static void cs_cache_evict_bytes(void) {
+    if (!T.cs_cache) return;
+    while (T.cs_cache_n && T.cs_cache_bytes > T.cs_cache_cap) cs_cache_drop_lru();
+}
+static VCsAlias *cs_cache_insert(const VktAliasSrc *s, ColiVkSlab *r) {
+    long cap = coli_vk_slab_cap();   /* the live-import count cap: keep one slot free so the next fresh alias can import before the cache retires a hold */
+    if (cap <= 1) return NULL;       /* 0/1: no room for a keepalive beside the one live import */
+    while (T.cs_cache_n && (long)T.cs_cache_n >= cap - 1) cs_cache_drop_lru();
+    if (T.cs_cache_n == T.cs_cache_capn) {
+        int nc = T.cs_cache_capn ? T.cs_cache_capn * 2 : 16;
+        VCsAlias *a = realloc(T.cs_cache_e, (size_t)nc * sizeof(*a));
+        if (!a) return NULL;   /* no room for the hold: this group still uses the slab, its pages go at the join */
+        T.cs_cache_e = a; T.cs_cache_capn = nc;
+    }
+    VCsAlias *e = &T.cs_cache_e[T.cs_cache_n++];
+    memset(e, 0, sizeof *e);
+    e->slab = s->slab; e->bytes = s->bytes; e->fmt = s->fmt; e->gs = s->gs;
+    for (int k = 0; k < 3; k++) { e->woff[k] = s->woff[k]; e->soff[k] = s->soff[k]; e->I[k] = s->I[k]; e->O[k] = s->O[k]; }
+    e->imp = r;
+    e->imp_bytes = coli_vk_slab_bytes(r);
+    e->seq = ++T.cs_cache_seq;
+    T.cs_cache_bytes += e->imp_bytes;
+    coli_vk_slab_ref(r);   /* the keepalive reference beside the caller's own */
+    return e;
+}
+static void cs_cache_clear(void) {
+    if (!T.cs_cache_e) return;
+    for (int i = 0; i < T.cs_cache_n; i++) coli_vk_slab_unref(T.cs_cache_e[i].imp);
+    T.cs_cache_n = 0;
+    T.cs_cache_bytes = 0;
+}
+/* Drop every hold keyed on this slab address (its pages are going away, the store's
+ * slot-free path): the drop-index discipline is cs_cache_find_slab's -- a dropped
+ * entry is replaced by the last, so the walk only steps on a match's survivor. */
+static void cs_cache_forget(const void *slab) {
+    for (int i = 0; i < T.cs_cache_n; )
+        if (T.cs_cache_e[i].slab == slab) { cs_cache_drop(i); T.cs_cache_forgets++; }
+        else i++;
+}
+/* The VA-reuse guard (gap-wave1's mandatory hardening): the cache's key is the exact
+ * alias-source geometry, which cannot tell two generations of one address apart -- a
+ * slab freed and its address returned for the same size would hit the stale entry (and
+ * the import dedup under it), a pinned import of pages the allocator has since given
+ * out, and the device would read whatever sits there now, silently. The store's
+ * slot-free path hands the address here before the pages go: the holds drop (never in
+ * flight -- the store frees at destroy, past every lease) and the backend blinds its
+ * dedup, so a later alias at this address is a fresh miss that imports the new pages. */
+void vkt_slab_forget(const void *slab) {
+    if (!slab) return;
+    if (T.cs_cache) cs_cache_forget(slab);
+    coli_vk_slab_forget(slab);
+}
+
+/* ---- the forked decode path's store routing (COLI_VK_V4_DECODE_PATH=fork) -------------
+ * The engine's expert store asks these at its slot alloc/free sites; the registry
+ * itself is the backend's (coli_vk_slabreg_*, backend_vulkan.c). Every refusal is the
+ * ladder: the slot keeps its malloc/import path and the CS alias takes the import
+ * branch exactly as today -- never an error, never fatal. */
+int vkt_forkdec_wanted(void) {
+    static int w;
+    if (!w) {
+        w = -1;
+        if (coli_vk_slabreg_wanted()) {
+            /* EXPERTS reads with the default-on policy (gap-wave4): unset is 1, so the
+             * gate's refusal line below fires only on an explicit 0 (or a =2 without
+             * its headroom) -- the compute site is the alias's consumer either way */
+            int csx = coli_vk_env_int("COLI_VK_TIER_EXPERTS", 1);
+            if (csx == 1 || csx == 2) w = 1;
+            else fprintf(stderr, VKT_TAG " tier: COLI_VK_V4_DECODE_PATH=fork needs COLI_VK_TIER_EXPERTS=1; the forked decode path stays off, slots keep the malloc/import path\n");
+        }
+    }
+    return w > 0;
+}
+int vkt_slabreg_slot(size_t bytes, void **host, void **reg) {
+    if (!vkt_forkdec_wanted() || !host || !reg) return 0;
+    *host = NULL; *reg = NULL;
+    return coli_vk_slabreg_alloc(bytes, host, (ColiVkSlabReg **)reg);
+}
+void vkt_slabreg_slot_free(void *reg, void *host) {
+    (void)host;   /* the slab's pages are the registry's own (vk_slab_forget walked it first) */
+    if (reg) coli_vk_slabreg_free((ColiVkSlabReg *)reg);
+}
+void vkt_forkdec_store_line(int slots, size_t slab_bytes) {
+    if (!vkt_forkdec_wanted()) return;   /* legacy and the EXPERTS gate said their one line */
+    /* the lever's ONE engaged line, over the plan just sized and the registry's probe:
+     * armed (the plan is real -- the arena takes these slots) or the probe's refusal
+     * line already said the slots keep the malloc path (nothing printed here) */
+    long bm = 0; double cap = 0;
+    if (coli_vk_slabreg_status(&bm, &cap) < 0) return;
+    fprintf(stderr, VKT_TAG " tier %s: decode-path=fork arena=%.2fGiB slabs=%d slab=%.2fMiB engaged", T.engine,
+            (double)slots * (double)slab_bytes / 1073741824.0, slots, slab_bytes / 1048576.0);
+    if (bm > 0)
+        fprintf(stderr, " (registry block=%ldMiB cap=%.2fGiB)", bm, cap);
+    else fprintf(stderr, " (registry arms at the first slab)");
+    fprintf(stderr, "\n");
+}
+
+/* One aliased expert over its imported slab: CS-1a's capability, VktAliasSrc's three
+ * records as ColiVkTensors and an expert of them. The import is refcounted by the
+ * slab's own pages (a slot reused keeps it); this call's own reference goes back once
+ * the tensors hold theirs -- the expert's free at the join releases those. NULL: the
+ * import, a tensor or the sets refused; the selection computes on the CPU. layer/eid
+ * name the CONTENT the source's slab holds (the store's view serves only its own
+ * expert's lease, its record bytes fixed per pair) -- the scan-skip lever's guarantee.
+ * *hit, when given, tells the caller the keepalive cache served this one. */
+static ColiVkExpert *cs_alias_expert(int layer, int eid, const VktAliasSrc *s, int *hit) {
+    if (!s->slab || !s->bytes || (s->fmt != 7 && s->fmt != 15) || !s->gs) { T.cs_refuse++; return NULL; }
+    for (int t = 0; t < 3; t++)
+        if (s->I[t] < 1 || s->O[t] < 1 || s->woff[t] >= s->bytes || s->soff[t] >= s->bytes) {
+            T.cs_refuse++;
+            return NULL;
+        }
+    int ci = -1;
+    if (T.cs_cache) {
+        ci = cs_cache_find(s);
+        if (ci >= 0) {
+            T.cs_cache_hits++;
+            T.cs_cache_e[ci].seq = ++T.cs_cache_seq;   /* the fresh store view (ptr+bytes) is the key match: the slot still holds this geometry */
+        } else {
+            T.cs_cache_misses++;
+            int pi = cs_cache_find_slab(s->slab);
+            if (pi >= 0) cs_cache_drop(pi);   /* the slot was rewritten: invalidate the old geometry's hold before the new import */
+        }
+    }
+    if (hit) *hit = ci >= 0;
+    /* the forked decode path (COLI_VK_V4_DECODE_PATH=fork): a registry-backed slot
+     * (its slab came out of the arena) aliases straight off the slab's own buffer --
+     * no import, no slab_buf handles, 3 callocs; the alias cache's entry (when armed)
+     * keeps only its f16 verdicts, the keepalive is the registry's own residence */
+    ColiVkSlabReg *freg = NULL;
+    int forked = coli_vk_slabreg_lookup(s->slab, &freg, NULL) ? 1 : 0;
+#ifdef COLI_CUDA
+    (void)freg;   /* cu_tier.c's shim declines the lookup: forked stays 0, the branch below is dead */
+#endif
+    if (forked) T.cs_fork++;
+    ColiVkSlab *r = NULL;
+    if (!forked) {
+        double tim = vkt_cs_dprof() ? vkt_now_ms() : 0;   /* the import's own span: the alias churn question (create vs hit is the backend's) */
+        if (!coli_vk_slab_import(s->slab, s->bytes, &r)) { T.cs_refuse++; return NULL; }
+        if (vkt_cs_dprof()) { T.cs_import_ms += vkt_now_ms() - tim; T.cs_import_n++; }
+    }
+    VCsAlias *ce = NULL;   /* this source's entry (a hit's, or the one the miss just inserted): the verdicts' home while the skip lever is armed */
+    if (T.cs_cache) ce = ci >= 0 ? &T.cs_cache_e[ci] : cs_cache_insert(s, forked ? NULL : r);
+    /* the skip applies only to provably the same content: the entry's recorded (layer,
+     * eid) -- a same-geometry rewrite to another expert, or an address the store freed
+     * and the allocator re-took (the entry is gone: vkt_slab_forget), keeps the scan */
+    int know = T.cs_scan_skip && ce && ce->wide_ok && ce->layer == layer && ce->eid == eid;
+    if (know) T.cs_scan_skips++;
+    ColiVkTensor *t[3] = {NULL, NULL, NULL};
+    int ok = 1;
+    for (int k = 0; ok && k < 3; k++)
+        ok = forked
+            ? coli_vk_slabreg_alias(freg, s->slab, s->woff[k], s->soff[k], s->fmt, s->I[k], s->O[k], s->gs,
+                                    know ? (int)ce->wide[k] : -1, &t[k]) == 1
+            : coli_vk_tensor_alias_wide(r, s->woff[k], s->soff[k], s->fmt, s->I[k], s->O[k], s->gs,
+                                        know ? (int)ce->wide[k] : -1, &t[k]) == 1;
+    double t1 = vkt_cs_dprof() ? vkt_now_ms() : 0;
+    ColiVkExpert *ex = ok ? coli_vk_xb_expert(t[0], t[1], t[2]) : NULL;
+    if (vkt_cs_dprof()) T.cs_xbex_ms += vkt_now_ms() - t1;
+    if (!ex) {   /* the sets refused: the tensors (their import references with them) give way here */
+        T.cs_refuse++;
+        for (int k = 0; k < 3; k++) coli_vk_tensor_free(t[k]);
+    } else {
+        if (T.cs_scan_skip && ce) {   /* the verdicts this content earned, read back off the tensors the build made */
+            int all = 1;
+            for (int k = 0; k < 3; k++) {
+                ColiVkTensorInfo ti;
+                if (coli_vk_tensor_info(t[k], &ti)) ce->wide[k] = (uint8_t)(ti.wide != 0);
+                else all = 0;   /* cannot know: the next build rescans */
+            }
+            ce->layer = layer; ce->eid = eid; ce->wide_ok = (uint8_t)all;
+        }
+        if (vkt_cs_dprof()) {   /* E: the actual bytes this alias built (weights + scales), from the geometry the tensors hold */
+            for (int k = 0; k < 3; k++) {
+                size_t sb = 0;
+                T.cs_alias_bytes += coli_vk_tensor_alloc_bytes(s->fmt, s->I[k], s->O[k], s->gs, &sb) + sb;
+            }
+        }
+    }
+    if (!forked) coli_vk_slab_unref(r);   /* the built tensors hold their own; an empty hand returns the pages */
+    return ex;
+}
+
+int vkt_issue_group(int layer, const float *x, int S, int K, const int *idx, const float *w,
+                    const VktAliasSrc *src, uint8_t *taken) {
+    if (!T.on || !T.inflight || !T.cs_pending || !taken) return 0;
+    int n = S * K;
+    if (T.cs_layer != layer || S != 1 || K != T.K || n < 1 || !idx) { T.cs_pending = T.inflight = 0; return 0; }
+#ifdef _OPENMP
+    if (omp_in_parallel()) { T.cs_pending = T.inflight = 0; return 0; }   /* the engine thread alone holds the xb queue */
+#endif
+    if (!coli_vk_xb_ready()) {
+        fprintf(stderr, VKT_TAG " tier %s: the device stopped answering, the deferred group's experts stay on the CPU\n", T.engine);
+        T.on = 0;
+        T.cs_pending = T.inflight = 0;
+        return 0;
+    }
+    if (T.d2 && !coli_vk_xb_ready_dev(1)) d2_stop("the second device stopped answering");
+    if (vkt_cs_dprof()) { T.cs_settle_ms += vkt_now_ms() - T.t_issued; T.cs_settle_n++; }   /* A: defer -> group build entry (the loader's slide-join/read settle) */
+    int E = T.c.experts;
+    if (!grow_map(n) || !grow_groups(n) || !grow_rows(n)) { T.cs_pending = T.inflight = 0; return 0; }
+    ColiVkExpert **ex = malloc((size_t)n * sizeof(*ex));
+    uint8_t *res = malloc((size_t)n);
+    if (!ex || !res) { free(ex); free(res); T.cs_pending = T.inflight = 0; return 0; }
+    /* the entries: a resident's cached handle, else the aliased expert; a refusal (no
+     * source, the import, the batch's cap) leaves the selection the CPU's */
+    int ng = 0, total = 0, d2sel = 0;
+    double tb = vkt_cs_dprof() ? vkt_now_ms() : 0;
+    for (int i = 0; i < n; i++) {
+        T.map[i] = -1;
+        taken[i] = 0;
+        ex[i] = NULL;
+        res[i] = 0;
+        int e = idx[i];
+        if (e < 0 || e >= E) continue;
+        if (total >= T.max_dev_rows) { T.cs_fallback++; continue; }   /* the batch is as large as it gets */
+        VSlot *v = slot(layer, e);
+        if (v->state == VS_RESIDENT && v->ex) { ex[i] = v->ex; res[i] = 1; if (v->dev) d2sel = 1; }
+        else if (src && src[i].slab) {
+            double ta = vkt_cs_dprof() ? vkt_now_ms() : 0;
+            int ahit = 0;
+            ex[i] = cs_alias_expert(layer, e, &src[i], &ahit);
+            if (vkt_cs_dprof()) {   /* the span and its outcome split: the cache's own wall, hit vs fresh */
+                double da = vkt_now_ms() - ta;
+                T.cs_alias_ms += da;
+                if (ahit) T.cs_alias_hit_ms += da; else T.cs_alias_miss_ms += da;
+            }
+            if (ex[i] && !cs_ex_keep(ex[i])) {
+                coli_vk_xb_expert_free(ex[i]);   /* the kept list could not grow: not worth the batch's failure */
+                ex[i] = NULL;
+            }
+            /* CS x decode-growth composition: the alias serves THIS token; feed the
+             * same bytes the CPU's note would have staged so the growth still installs
+             * them for the tokens ahead. vkt_note's own gate keeps the rank/cutoff,
+             * the byte cap and the forward's promo cap, and its staged copy never
+             * touches the group built here (the alias stays this token's entry). */
+            if (ex[i] && T.csx && T.dgrow_armed && T.dgrow_dec && !kind_of(layer)) {
+                const uint8_t *b = (const uint8_t *)src[i].slab;
+                VktExpertSrc ns = { b + src[i].woff[0], b + src[i].woff[1], b + src[i].woff[2],
+                                    b + src[i].soff[0], b + src[i].soff[1], b + src[i].soff[2] };
+                vkt_note(layer, e, &ns);
+            }
+        }
+        if (!ex[i]) { T.cs_fallback++; continue; }
+        ng++; total++;
+    }
+    if (vkt_cs_dprof()) { T.cs_lookup_ms += vkt_now_ms() - tb; T.cs_build_n++; }
+    /* the device sum's arm (COLI_VK_TIER_CS_DEVSUM): only a group that flies whole
+     * (ng == n: no selection the CPU's, the join would merge a host row among the
+     * device's) on the primary device alone (no dev2 resident: the two devices' rows
+     * are contiguous runs, not k order, and a cross-device sum reassociates), with no
+     * hybrid host rows -- the host merge's bf16 rounds and rank order, bit-for-bit */
+    T.cs_sum = T.cs_devsum && !T.hy_n && !d2sel && ng == n && coli_vk_xb_sum_arm(n) ? 1 : 0;
+    int took = 0;
+    if (ng) {
+        /* the primary device's groups first, then the second's, as issue() orders them:
+         * contiguous runs of groups and of rows -- one row an expert here, so rows are
+         * groups and the second's rows start at the primary's count */
+        int at = 0, n0 = 0;
+        for (int pass = 0; pass < 2 && at < ng; pass++)
+            for (int i = 0; i < n; i++) {
+                if (!ex[i] || T.map[i] >= 0) continue;
+                VSlot *v = slot(layer, idx[i]);
+                int dev2 = res[i] ? v->dev : 0;   /* an alias's tensors are the primary device's */
+                if ((pass == 0) != (dev2 == 0)) continue;
+                T.bex[at] = ex[i]; T.brows[at] = 1; T.map[i] = at;
+                T.bx[at] = x; T.bw[at] = w ? w[i] : 1.0f;
+                at++;
+                if (pass == 0) n0 = at;
+            }
+        double ti = (vkt_cs_dprof() && n0 > 0) ? vkt_now_ms() : 0;
+        T.d0_inflight = n0 > 0 && coli_vk_xb_issue_w(T.bex, T.brows, n0, T.bx, w ? T.bw : NULL);
+        if (vkt_cs_dprof() && n0 > 0) { T.cs_issue_ms += vkt_now_ms() - ti; T.cs_issue_n++; }
+        T.d2_inflight = 0; T.d2_rows0 = n0;
+        if (n0 < ng) {
+            double tj = vkt_cs_dprof() ? vkt_now_ms() : 0;
+            T.d2_inflight = coli_vk_xb_issue_dev(1, T.bex + n0, T.brows + n0, ng - n0, T.bx + n0, w ? T.bw + n0 : NULL);
+            if (vkt_cs_dprof()) { T.cs_issue_ms += vkt_now_ms() - tj; T.cs_issue_n++; }
+            if (!T.d2_inflight && !coli_vk_xb_ready_dev(1)) d2_stop("the second device's group failed");
+        }
+        for (int i = 0; i < n; i++) {
+            int j = T.map[i];
+            if (j < 0) continue;
+            if (j < n0 ? !T.d0_inflight : !T.d2_inflight) { T.map[i] = -1; T.cs_fallback++; continue; }
+            taken[i] = 1;
+            if (res[i]) T.cs_res++; else T.cs_alias++;
+            took++;
+        }
+    }
+    T.served += (unsigned long long)took;
+    if (S <= VKT_UP_ROWS) T.d_served += (unsigned long long)took;
+    if (layer >= T.main_layers) T.extra_served += (unsigned long long)took;
+    free(ex); free(res);
+    if (!took) {   /* nothing flew: the transient experts give way, every selection the CPU's */
+        cs_ex_release();
+        T.cs_pending = T.inflight = 0;
+        return 0;
+    }
+    T.cs_groups++;   /* one group a layer-token; the join at the finish retires it */
+    T.cs_pending = 0;
+    return took;
+}
+
+int vkt_join(const float **rows) { return vkt_join_merged(rows, NULL); }
+/* vkt_join; for a CS group that carried the device-sum tail (COLI_VK_TIER_CS_DEVSUM),
+ * *sum = its ONE merged row (each row bf16 rounded, added in rank order -- the finish
+ * site's host merge, bit-for-bit) beside the rows, which stay valid; *sum = NULL on
+ * every other join, the rows as vkt_join gives them. */
+int vkt_join_merged(const float **rows, const float **sum) {
+    if (sum) *sum = NULL;
     if (!T.inflight) return 0;
+    T.cs_pending = 0;   /* whatever a join retires, no step is owed a group any more */
     if (T.big) {
         int ok = join_big(rows);
         if (T.sy_step) coli_vk_xb_step_end();   /* rows stay readable until the next step */
@@ -2409,12 +3618,33 @@ int vkt_join(const float **rows) {
         T.hy_n = 0;
     }
     T.cpu_ms += tc;
-    int ok = !T.d0_inflight || coli_vk_xb_join(T.by, &dms);
+    /* C/D: the CS group's fence-wait and query-read spans are the backend's own
+     * counters; snapshot deltas around the joins so only this group's calls count. */
+    int csd = vkt_cs_dprof() && T.csx && T.S == 1;
+    ColiVkCsDiag db, da;
+    if (csd) coli_vk_cs_diag(&db);
+    const float *dsum = NULL;
+    int ok = !T.d0_inflight || (T.cs_sum ? coli_vk_xb_join_sum(T.by, &dsum, &dms) : coli_vk_xb_join(T.by, &dms));
+    if (csd) coli_vk_cs_diag(&da);
     int ok1 = !T.d2_inflight || coli_vk_xb_join_dev(1, T.by + T.d2_rows0, &dms1);
+    if (csd) {
+        ColiVkCsDiag dc; coli_vk_cs_diag(&dc);
+        T.cs_fence_ms += (da.xb_fence_ms[0] - db.xb_fence_ms[0]) + (dc.xb_fence_ms[1] - da.xb_fence_ms[1]);
+        T.cs_qread_ms += (da.xb_qread_ms[0] - db.xb_qread_ms[0]) + (dc.xb_qread_ms[1] - da.xb_qread_ms[1]);
+        T.cs_dev_ms += dms + dms1;
+    }
     T.d0_inflight = T.d2_inflight = 0;
+    if (T.cs_nex) cs_ex_release();   /* the group's aliased experts: the batch is done, never freed in flight */
+    cs_cache_evict_bytes();          /* the keepalive byte bound retires here, after the batch's tensors gave way */
     double tw = vkt_now_ms() - t0;
     T.wait_ms += tw;
     T.dev_ms += dms + dms1; T.d2_ms += dms1;
+    if (T.S <= VKT_UP_ROWS) { T.d_wait_ms += tw; T.d_dev_ms += dms + dms1; T.d_cpu_ms += tc; }   /* DPROF: the decode class */
+    else if (T.p_t0 > 0) {   /* DPROF: the prompt mirror (S > VKT_UP_ROWS): the span issue to join */
+        T.p_wait_ms += tw; T.p_dev_ms += dms + dms1;
+        T.p_cpu_ms += vkt_now_ms() - T.p_t0 - tw;
+        T.p_steps++; T.p_t0 = 0;
+    }
     if (dms1 > dms) dms = dms1;   /* the two ran side by side: the step waited for the slower */
     /* The balance moves only on steps where it had a choice. Waiting for more than
      * a tenth of the CPU's own time: give the CPU more. The device done well before
@@ -2426,6 +3656,12 @@ int vkt_join(const float **rows) {
         if (T.share < 0.05f) T.share = 0.05f;
     }
     T.inflight = 0;
+    if (dsum) {   /* the group read ONE merged row: the books count the rows not read back */
+        T.cs_sum_n++;
+        T.cs_sum_rows += (unsigned long long)(T.S * T.K);
+        if (sum) *sum = dsum;
+    }
+    T.cs_sum = 0;
     int n = T.S * T.K;
     for (int i = 0; i < n; i++)
         rows[i] = !(ok && ok1 && hok) ? NULL : T.map[i] >= 0 ? T.by[T.map[i]]
@@ -2476,13 +3712,273 @@ int vkt_resident(int layer, int eid) {
     return T.on && layer >= 0 && layer < T.c.layers && eid >= 0 && eid < T.c.experts &&
            slot(layer, eid)->state == VS_RESIDENT;
 }
+int vkt_cs_served(int layer, int eid) {
+    if (!T.on || layer < 0 || layer >= T.c.layers || eid < 0 || eid >= T.c.experts)
+        return 0;
+    VSlot *v = slot(layer, eid);
+    return v->state == VS_RESIDENT && v->ex != NULL;   /* the CS defer's taken rule */
+}
 int vkt_ready(void) { return T.on; }
+int vkt_cs_armed(void) { return T.on && T.csx > 0; }
 
 /* ---- budget ---------------------------------------------------------------------- */
 static size_t mem_available(void) { return (size_t)(compat_mem_available_gb() * 1e9); }
 static double env_gb(const char *name, double def) {
     const char *e = getenv(name);
     return e && *e ? atof(e) : def;
+}
+/* the card's free VRAM now: the probe the arm and the live guard share (the budget
+ * books under COLI_VK_DEVICE_CAP_MB, else VK_EXT_memory_budget's budget less its
+ * usage -- every holder's bytes counted). 0 when the backend cannot read it.
+ * COLI_VK_TIER_FREE_MB overrides it (tests: a fixed free reading, the grow/shed legs). */
+static double dg_free_now(void) {
+    const char *o = getenv("COLI_VK_TIER_FREE_MB");
+    if (o && *o) return atof(o) * 1048576.0;
+    double used = 0, bud = 0;
+    return coli_vk_mem_budget(&used, &bud) && bud > used ? (bud - used) * 1e9 : 0;
+}
+
+/* ---- tier adaptive (COLI_VK_TIER_ADAPTIVE) --------------------------------------- */
+/* the free-VRAM reading, fresh each forward (the fork's request-boundary cadence), and
+ * whether it is a reading at all: 0 means the card is full only when the backend says
+ * it read the budget -- an unreadable budget must never shed. */
+static int adapt_probe(double *free) {
+    const char *o = getenv("COLI_VK_TIER_FREE_MB");
+    if (o && *o) { *free = atof(o) * 1048576.0; return 1; }
+    double used = 0, bud = 0;
+    if (coli_vk_mem_budget(&used, &bud)) { *free = bud > used ? (bud - used) * 1e9 : 0; return 1; }
+    *free = 0;
+    return 0;
+}
+/* the coldest shed candidate across the main layers' device classes (0 and 2), or -1:
+ * the LFRU victim order refresh_candidates built, skipping pinned, host-pool and
+ * second-device residents. */
+static int adapt_coldest(void) {
+    int best = -1; uint64_t bs = 0;
+    for (int k = 0; k < 3; k++) {
+        if (k == 1) continue;   /* the extra layers' pool is not dmax[0]'s to shed */
+        while (T.ncand[k]) {
+            int i = T.cand[k][0];
+            VSlot *v = &T.s[i];
+            if (v->state != VS_RESIDENT || v->pin || v->host || v->dev != 0) { drop_victim(k); continue; }
+            uint64_t sc = score(v);
+            if (best < 0 || sc < bs) { best = i; bs = sc; }
+            break;
+        }
+    }
+    if (best >= 0) drop_victim(vcls_of(best / T.c.experts));
+    return best;
+}
+/* grow dmax[0] into free VRAM above reserve + margin: whole experts, bounded by the
+ * expert count, the byte cap and the operator's max_experts. The places are real free
+ * room; the installs ride vkt_note's ordinary promotion (rate/cap and, with DECODE_GROW
+ * armed, its decode-only cutoff). */
+static int adapt_grow(double free) {
+    double head = free - T.adapt_reserve - T.adapt_margin;
+    if (head <= 0 || !T.exp_bytes) return 0;
+    long long n = (long long)(head / (double)T.exp_bytes);
+    if (n < 1) return 0;
+    long long all = (long long)T.main_layers * T.c.experts;
+    if ((long long)T.dmax[0] + n > all) n = all - T.dmax[0];
+    if (T.c.max_experts > 0 && (long long)T.dmax[0] + n > T.c.max_experts) n = T.c.max_experts - T.dmax[0];
+    if (T.adapt_cap > 0) {
+        long long left = T.exp_bytes ? (long long)(((double)T.adapt_cap - (double)T.budget) / (double)T.exp_bytes) : 0;
+        if (n > left) n = left;
+    }
+    if (n < 1) return 0;
+    T.dmax[0] += (int)n; T.max_resident += (int)n;
+    T.budget += (size_t)n * T.exp_bytes; T.adapt_grows += (unsigned long long)n;
+    ColiVkPoolStats ps; coli_vk_pool_stats(1, &ps);
+    coli_vk_tier_pool_limit(ps.limit + (size_t)n * T.exp_bytes);
+    return (int)n;
+}
+/* shed under pressure (free < reserve): evict the coldest primary-device residents and
+ * shrink dmax[0]/budget/pool limit with them, so the freed VRAM is not re-taken on the
+ * next promotion. Pinned and host-pool residents are never touched; nothing is in flight
+ * (the forward boundary). Keeps at least two primary-device places. */
+static int adapt_shed(double free) {
+    if (free >= T.adapt_reserve || !T.exp_bytes) return 0;
+    double deficit = T.adapt_reserve - free;
+    long long want = (long long)((deficit + (double)T.exp_bytes - 1) / (double)T.exp_bytes);
+    if (want < 1) want = 1;
+    long long cap = (long long)T.dmax[0] - 2;
+    if (want > cap) want = cap;
+    if (want < 1) return 0;
+    refresh_candidates();
+    int n = 0;
+    while (n < want) {
+        int victim = adapt_coldest();
+        if (victim < 0) break;
+        VSlot *v = &T.s[victim];
+        if (v->ex) coli_vk_xb_expert_free(v->ex);
+        if (v->hex && v->hex != v->ex) coli_vk_xb_expert_free(v->hex);
+        v->ex = v->hex = NULL;
+        v->state = VS_NONE;
+        T.resident--; T.dres[0]--; T.evictions++;
+        note_change(victim);
+        n++;
+    }
+    if (n) {
+        T.dmax[0] -= n; T.max_resident -= n;
+        T.budget -= (size_t)n * T.exp_bytes; T.adapt_sheds += (unsigned long long)n;
+        ColiVkPoolStats ps; coli_vk_pool_stats(1, &ps);
+        size_t back = (size_t)n * T.exp_bytes;
+        coli_vk_tier_pool_limit(ps.limit > back ? ps.limit - back : 0);
+    }
+    return n;
+}
+/* the forward-boundary re-probe (new_forward): grow, shed, or hold -- one line per
+ * decision; grow/shed always, hold under DPROF (it would repeat every forward). */
+static void tier_adaptive(void) {
+    if (!T.adapt) return;
+    double free;
+    if (!adapt_probe(&free)) {   /* no reading: never shed on an unknown free */
+        if (vkt_cs_dprof()) fprintf(stderr, VKT_TAG " tier %s: tier adaptive: hold (free unknown)\n", T.engine);
+        return;
+    }
+    int grew = 0, shed = 0;
+    if (free > T.adapt_reserve + T.adapt_margin) grew = adapt_grow(free);
+    else if (free < T.adapt_reserve) shed = adapt_shed(free);
+    if (grew) fprintf(stderr, VKT_TAG " tier %s: tier adaptive: grow %d (free %.1f MB)\n", T.engine, grew, free / 1048576.0);
+    else if (shed) fprintf(stderr, VKT_TAG " tier %s: tier adaptive: shed %d (free %.1f MB)\n", T.engine, shed, free / 1048576.0);
+    else if (vkt_cs_dprof()) fprintf(stderr, VKT_TAG " tier %s: tier adaptive: hold (free %.1f MB)\n", T.engine, free / 1048576.0);
+}
+
+/* ---- decode growth (COLI_VK_TIER_DECODE_GROW) ------------------------------------- */
+/* above the growth's count bar: the decode-only table's rank admits the install.
+ * A bar of 0 (more room than the table's nonzero counts, or a cold table) admits
+ * every demand -- the fork's demand installs, room-bounded. */
+static int dgrow_hot(int layer, int e) {
+    return T.dgrow_heat[(size_t)layer * T.c.experts + e] >= (uint32_t)T.dgrow_cut;
+}
+/* one stream slot's place: the live slots end loses its tensors (idle staging at a
+ * decode step -- big steps alone fill them) and the residents' budget takes their
+ * bytes. The stream keeps its own floor of two (st_alloc's least), so it stays
+ * alive, narrower, for the next prompt. */
+static int dgrow_room1(void) {
+    return T.dgrow_armed && !T.big && T.st_ok && T.st && T.st_n > 2 &&
+           (!T.dgrow_cap || T.dgrow_used + T.exp_bytes <= T.dgrow_cap) &&
+           (!T.dgrow_target || T.dmax[0] < T.dgrow_target);
+}
+static int dgrow_retire(void) {
+    if (!dgrow_room1() || T.st[T.st_n - 1].state == SS_BUSY) return 0;
+    VStage *v = &T.st[T.st_n - 1];
+    if (v->ex) coli_vk_xb_expert_free(v->ex);   /* it owns the slot's three tensors (vkt_shutdown's teardown frees it, never the tensors beside it) */
+    memset(v, 0, sizeof *v);
+    T.st_n--; T.st_per = T.st_n / 2;
+    T.dmax[0]++; T.max_resident++;
+    T.budget += T.exp_bytes; T.dgrow_used += T.exp_bytes; T.dgrow_retires++;
+    ColiVkPoolStats ps; coli_vk_pool_stats(1, &ps);
+    coli_vk_tier_pool_limit(ps.limit + T.exp_bytes);   /* the freed bytes are the residents' */
+    return 1;
+}
+/* COLI_VK_TIER_DECODE_GROW_HEADROOM's live guard, the fork gpu_mfu_cache's cadence:
+ * the free-VRAM reading cached, re-probed every 64th ask and whenever it reads
+ * empty, so a full card costs the one query an ask and a freeing card is caught
+ * within a probe window as installs proceed */
+static double dg_head_free(void) {
+    if (T.dg_hfree <= 0 || (T.dg_hprobe++ & 63) == 63) T.dg_hfree = dg_free_now();
+    return T.dg_hfree;
+}
+/* its question, without side effects (vkt_wants asks it too): could a place be made
+ * now -- the target's count and the operator's byte cap held, the live free VRAM
+ * less the safety reserve big enough for one expert */
+static int dg_head_room1(void) {
+    if (T.adapt) return 0;   /* COLI_VK_TIER_ADAPTIVE owns the free-VRAM probe (precedence) */
+    if (!T.dgrow_armed || !T.dgrow_head) return 0;
+    if (T.dgrow_target && T.dmax[0] >= T.dgrow_target) return 0;
+    if (T.dgrow_cap && T.dgrow_used + T.exp_bytes > T.dgrow_cap) return 0;
+    return dg_head_free() >= T.dgrow_reserve + (double)T.exp_bytes;
+}
+/* the place itself: the residents' count budget, the tier's bytes and the pool's
+ * limit grow one expert, charged to the operator's cap -- real free room the guard
+ * stands behind, never a victim's (the warm set stands, as the growth's rule) */
+static int dg_head_room(void) {
+    if (!dg_head_room1()) return 0;
+    T.dmax[0]++; T.max_resident++;
+    T.budget += T.exp_bytes; T.dgrow_used += T.exp_bytes; T.dgrow_heads++;
+    ColiVkPoolStats ps; coli_vk_pool_stats(1, &ps);
+    coli_vk_tier_pool_limit(ps.limit + T.exp_bytes);
+    return 1;
+}
+static int u32_desc(const void *a, const void *b) {
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+/* The one-time arm, at the first decode-class step: grow into what the device has
+ * free (less a reserve; the boot's own budget could only guess at what the chain,
+ * the KV mirror and the head take, and by now they have taken it), then, beyond
+ * that, the stream slots the demand may retire. The cutoff over the experts the
+ * device does not hold, K-th largest -- the fork's cache_reorder rule -- is the
+ * rank the installs must beat while the room lasts.
+ * COLI_VK_TIER_DECODE_GROW_HEADROOM: the free part is the live guard's instead of
+ * this probe's -- no place is made here; dg_head_room makes one per install the
+ * card's free VRAM still holds, so the growth owns real free room, not only the
+ * slots' recycled bytes (W2's armed line read `budget 367 -> 367`: 0 free places,
+ * the slots the one source, the tier's budget left unspent beside them). A target
+ * named sizes the rank's K with its count and caps every source's; without one the
+ * probe's reading sizes K, as ever. */
+static void dgrow_arm(void) {
+    T.dgrow_armed = 1;
+    const double GiB = 1073741824.0;
+    T.dgrow_reserve = env_gb("COLI_VK_TIER_DECODE_GROW_RESERVE_GB", 0.5) * GiB;
+    double free_b = dg_free_now();
+    double take = free_b - T.dgrow_reserve;
+    if (take < 0) take = 0;
+    if (T.dgrow_cap && take > (double)T.dgrow_cap) take = (double)T.dgrow_cap;
+    long long kfree;   /* the free part: places made here, or (headroom) the guard's ceiling */
+    if (T.dgrow_head)
+        kfree = T.dgrow_target > T.dmax[0] ? T.dgrow_target - T.dmax[0]
+                                           : (T.exp_bytes ? (long long)(take / (double)T.exp_bytes) : 0);
+    else
+        kfree = T.exp_bytes ? (long long)(take / (double)T.exp_bytes) : 0;
+    long long slots = T.st_ok && T.st && T.st_n > 2 ? T.st_n - 2 : 0;
+    if (T.dgrow_cap) {   /* the operator's cap bounds the whole growth, both sources */
+        long long left = T.exp_bytes ? (long long)((double)T.dgrow_cap / (double)T.exp_bytes) - kfree : 0;
+        if (slots > left) slots = left;
+    }
+    if (slots < 0) slots = 0;
+    long long K = kfree + slots;
+    uint32_t cut = 0;
+    if (K > 0) {   /* the candidates: the experts the device does not hold */
+        const int Ln = T.main_layers, E = T.c.experts;
+        uint32_t *cs = malloc((size_t)Ln * E * sizeof(uint32_t));
+        if (cs) {
+            int n = 0;
+            for (int l = 0; l < Ln; l++) for (int e = 0; e < E; e++) {
+                VSlot *v = &T.s[(size_t)l * E + e];
+                if ((v->state == VS_RESIDENT || v->state == VS_QUEUED) && !v->host && !v->dev) continue;
+                cs[n++] = T.dgrow_heat[(size_t)l * E + e];
+            }
+            qsort(cs, (size_t)n, sizeof(uint32_t), u32_desc);
+            if (K <= n) cut = cs[K - 1];
+            free(cs);
+        }
+    }
+    if (kfree > 0 && !T.dgrow_head && !T.adapt) {   /* the headroom's places wait for the guard, an install each */
+        T.dmax[0] += (int)kfree; T.max_resident += (int)kfree;
+        T.budget += (size_t)kfree * T.exp_bytes; T.dgrow_used += (size_t)kfree * T.exp_bytes;
+        ColiVkPoolStats ps; coli_vk_pool_stats(1, &ps);
+        coli_vk_tier_pool_limit(ps.limit + (size_t)kfree * T.exp_bytes);
+    }
+    T.dgrow_cut = (int)(cut > 0x7fffffffu ? 0x7fffffffu : cut);
+    T.dgrow_slots0 = T.st ? T.st_n : 0;
+    char hf[32], hr[32];
+    if (T.adapt)
+        fprintf(stderr, VKT_TAG " tier %s: decode grow armed (adaptive): %s free less %s reserve -- the free places are COLI_VK_TIER_ADAPTIVE's, %lld stream slots beyond, cutoff %u (installs still rank by the engine's decode-only counts)\n",
+                T.engine, human(free_b, hf, sizeof hf), human(T.dgrow_reserve, hr, sizeof hr), slots, (unsigned)cut);
+    else if (T.dgrow_head)
+        fprintf(stderr, VKT_TAG " tier %s: decode grow armed (headroom): %s free less %s reserve at the probe, the guard re-probes as installs proceed -> up to %lld places%s, %lld stream slots beyond, budget %d experts now, cutoff %u (COLI_VK_TIER_DECODE_GROW_HEADROOM%s; installs rank by the engine's decode-only counts)\n",
+                T.engine, human(free_b, hf, sizeof hf), human(T.dgrow_reserve, hr, sizeof hr), kfree,
+                T.dgrow_target ? ", the target's count" : "", slots, T.dmax[0], (unsigned)cut,
+                T.dgrow_target ? " + _TARGET" : "");
+    else if (K > 0)
+        fprintf(stderr, VKT_TAG " tier %s: decode grow armed: %s free less %s reserve -> %lld places, %lld stream slots beyond, budget %d -> %d experts, cutoff %u (COLI_VK_TIER_DECODE_GROW; installs rank by the engine's decode-only counts)\n",
+                T.engine, human(free_b, hf, sizeof hf), human(T.dgrow_reserve, hr, sizeof hr),
+                kfree, slots, T.dmax[0] - (int)kfree, T.dmax[0], (unsigned)cut);
+    else
+        fprintf(stderr, VKT_TAG " tier %s: decode grow: %s free less %s reserve and %d retirable slots -- no room to grow into, the warm set stands\n",
+                T.engine, human(free_b, hf, sizeof hf), human(T.dgrow_reserve, hr, sizeof hr), T.st ? (T.st_n > 2 ? T.st_n - 2 : 0) : 0);
 }
 
 int vkt_wanted(void) {
@@ -2638,6 +4134,19 @@ static void d2_init(long long fit0, long long all, int act) {
             di.shares_ram ? "shared RAM" : "device memory");
 }
 
+/* The host pool's room in bytes: with the engine's RAM plan, what that plan
+ * leaves unclaimed, never above the budget it resolved; without one, what is
+ * available less the engine's cache growth (hold = VktConfig.ram_reserve) and 4 GiB
+ * (the engine's own growth, the page cache the loads go through). Pure arithmetic,
+ * for tests; never negative, never above avail. */
+size_t vkt_host_room(size_t avail, size_t budget, size_t spare, int planned, size_t hold) {
+    const size_t GiB = (size_t)1073741824;
+    size_t room = 0;
+    if (planned) room = spare < budget ? spare : budget;
+    else if (avail > hold && avail - hold > 4 * GiB) room = avail - hold - 4 * GiB;
+    return room > avail ? avail : room;
+}
+
 /* The host pool (backend_vulkan.h: coli_vk_tier_host_pool): the main layers' experts that
  * neither device's memory holds, in system RAM the primary device reads by address over
  * PCIe. They count as the primary device's (dev 0): its batch takes them, and the dense
@@ -2646,17 +4155,43 @@ static void d2_init(long long fit0, long long all, int act) {
  * every layer's frame for the host. Only beside the exclusive RAM/VRAM books
  * (COLI_VK_TIER_EXCLUSIVE): the engine's RAM cache gives up the copies of what the
  * device holds, so the pool takes RAM the cache would have, not RAM beside it. Its size:
- * what RAM has free less 4 GiB (the engine's own growth, the page cache the loads go
- * through), at most what the devices leave; COLI_VK_TIER_HOST_GB sets it and
- * COLI_VK_TIER_HOST=0 turns it off. COLI_VK_TIER_HOST=1 turns it on where the device
- * shares the host's RAM too (tests: the same memory, the paths of a card). */
+ * what the engine's RAM plan leaves unclaimed (VktConfig.ram_spare -- beside its expert
+ * cache at capacity, its dense weights in RAM, its head and its KV/workspace reserves;
+ * vkt_host_room), at most what the devices leave; an engine without a plan falls back to
+ * MemAvailable less 4 GiB and its cache growth still to come. COLI_VK_TIER_HOST_GB sets
+ * it and wins over the plan, never over MemAvailable; COLI_VK_TIER_HOST=0 turns it off.
+ * COLI_VK_TIER_HOST=1 turns it on where the device shares the host's RAM too (tests: the
+ * same memory, the paths of a card). */
 static void host_init(long long all) {
     const char *e = getenv("COLI_VK_TIER_HOST"), *g = getenv("COLI_VK_TIER_HOST_GB");
     if ((e && *e == '0') || (T.uma && !(e && !strcmp(e, "1"))) || !T.excl || !T.exp_bytes || !coli_vk_tier_host_pool()) return;
     long long left = all - T.dmax[0] - T.dmax[1];
     if (left <= 0) return;
     const double GiB = 1073741824.0;
-    double want = g && *g ? atof(g) * GiB : (double)mem_available() - 4.0 * GiB - (double)T.c.ram_later;
+    size_t avail = mem_available();
+    char hs[32], hb[32];
+    /* the engine's RAM plan sizes the pool when it keeps one (VktConfig.ram_planned:
+     * vkt_host_room's arithmetic); without one, what is available less 4 GiB, the state the
+     * engine allocates once it serves (ram_later) and its cache growth still to come coming
+     * out below */
+    double want = T.c.ram_planned
+        ? (double)vkt_host_room(avail, T.c.ram_budget, T.c.ram_spare, 1, 0)
+        : (double)avail - 4.0 * GiB - (double)T.c.ram_later;
+    if (g && *g) {   /* the operator's explicit size: it wins over the plan, never over the RAM there is */
+        double gb = atof(g) * GiB;
+        if (gb <= 0) {
+            static int junk;
+            if (!junk) { junk = 1; fprintf(stderr, "[VK] tier %s: COLI_VK_TIER_HOST_GB=%s is not a positive size, "
+                            "the pool stays off\n", T.engine, g); }
+            return;
+        }
+        if (T.c.ram_planned && gb > (double)T.c.ram_spare)
+            fprintf(stderr, "[VK] tier %s: COLI_VK_TIER_HOST_GB=%s GiB over the RAM plan (%s left of the %s budget)\n",
+                    T.engine, g, human((double)T.c.ram_spare, hs, sizeof hs), human((double)T.c.ram_budget, hb, sizeof hb));
+        if (gb > (double)avail) gb = (double)avail;
+        if (gb < 0) gb = 0;
+        want = gb;
+    }
     /* The driver's heap for the system RAM the device reads (coli_vk_tier_host_heap_room) is
      * not all the RAM: about half of it on Windows, three quarters with NVIDIA's on Linux.
      * Past its room the pool's blocks are refused, and the experts planned there were in
@@ -2681,9 +4216,19 @@ static void host_init(long long all) {
                  human((double)T.c.ram_later, x, sizeof x));
     }
     size_t blk = (size_t)256 << 20;   /* the host pool's blocks (system RAM: no device cap shrinks them) */
-    if (want < (double)T.exp_bytes || blk < T.exp_bytes) {
-        if (hh[0]) fprintf(stderr, VKT_TAG " tier %s: host pool off: the driver leaves %s of system RAM for the device\n", T.engine, hh);
-        else if (hl[0]) fprintf(stderr, VKT_TAG " tier %s: host pool off: no room past the RAM it leaves (%s)\n", T.engine, hl + 2);
+    if (blk < T.exp_bytes) return;
+    if (want < (double)T.exp_bytes) {   /* no room for one expert: say so, unless the operator sized it */
+        if (!(g && *g)) {
+            if (hh[0]) fprintf(stderr, VKT_TAG " tier %s: host pool off: the driver leaves %s of system RAM for the device\n", T.engine, hh);
+            else if (T.c.ram_planned)
+                fprintf(stderr, "[VK] tier %s: host pool off: the RAM plan leaves %s beside the expert cache (budget %s; "
+                                "COLI_VK_TIER_HOST_GB overrides, COLI_VK_TIER_HOST=0 silences)\n",
+                        T.engine, human(want, hs, sizeof hs), human((double)T.c.ram_budget, hb, sizeof hb));
+            else if (hl[0]) fprintf(stderr, VKT_TAG " tier %s: host pool off: no room past the RAM it leaves (%s)\n", T.engine, hl + 2);
+            else
+                fprintf(stderr, "[VK] tier %s: host pool off: MemAvailable less the engine's cache growth and 4 GiB leaves %s "
+                                "(COLI_VK_TIER_HOST_GB sets it)\n", T.engine, human(want, hs, sizeof hs));
+        }
         return;
     }
     size_t full = (size_t)want / blk, rest = (size_t)want - full * blk;
@@ -2694,7 +4239,8 @@ static void host_init(long long all) {
      * start's set, and on another topic than the history's it reads most of a token's
      * experts over the bus. COLI_VK_TIER_PROMOTE=0 keeps that set, =n sets the rate. */
     const char *pe = getenv("COLI_VK_TIER_PROMOTE");
-    int rate = pe && *pe ? atoi(pe) : 32;
+    T.full = !T.d2 && fit >= all;   /* its rate default below: a pool short of every expert is opt-in */
+    int rate = pe && *pe ? atoi(pe) : (T.full ? 32 : 0);
     /* A pool that holds every expert frees none (promote moves the device's copies), so its
      * experts need not the room of a bigger form's: with forms by layer it keeps each at its
      * own (h_exact), a block's end losing at most the largest. Flint UD-Q3_K_XL: 24.50 GiB in
@@ -2711,7 +4257,7 @@ static void host_init(long long all) {
      * the pool's room and the pool's bytes out of them (ram_given); an engine that cannot lower
      * them keeps ram_reserve, and the pool takes what is left. */
     size_t given = 0;
-    if (fit < left && !(g && *g)) {
+    if (fit < left && !(g && *g) && !T.c.ram_planned) {
         /* the caches' least out of the RAM's share (want + cut): what the heap cut off is RAM
          * beside the pool already */
         double least = T.c.ram_given ? (double)T.c.ram_floor : (double)T.c.ram_reserve;
@@ -2731,19 +4277,31 @@ static void host_init(long long all) {
     if (held < per) lim = (size_t)held * (T.h_exact ? T.h_bytes : T.exp_bytes) + (T.h_exact ? T.h_max : 0) + 4096;
     coli_vk_tier_pool_limit_dev(2, lim);
     T.dmax[2] = (int)fit; T.max_resident += (int)fit; T.h_budget = lim;
-    T.promote_rate = T.full ? rate : 0;
+    T.promote_rate = rate > 0 && (T.full || T.dmax[2] > 0) ? rate : 0;   /* a partial pool: COLI_VK_TIER_PROMOTE turns it on */
     if (given) T.c.ram_given(T.c.ram_ctx, lim);
-    char hb[32];
-    if (T.full)
+    char hm[32];
+    if (T.full) {
         fprintf(stderr, VKT_TAG " tier %s: host pool on, %lld experts in %s of system RAM the device reads over PCIe (every expert "
                         "of the model: the %lld its memory leaves and a copy of its own, from which the routed ones move up, up "
                         "to %d a forward; COLI_VK_TIER_PROMOTE sets it, COLI_VK_TIER_HOST=0 off%s)\n",
-                T.engine, held, human((double)lim, hb, sizeof hb), left, T.promote_rate, hl);
+                T.engine, held, human((double)lim, hm, sizeof hm), left, T.promote_rate, hl);
+        if (T.c.ram_planned)   /* the plan bounded the room this pool was sized from */
+            fprintf(stderr, VKT_TAG " tier %s: the RAM plan leaves %s of the %s budget\n",
+                    T.engine, human((double)T.c.ram_spare, hs, sizeof hs), human((double)T.c.ram_budget, hb, sizeof hb));
+    } else if (T.c.ram_planned)
+        fprintf(stderr, VKT_TAG " tier %s: host pool on, %d experts in %s of system RAM the device reads over PCIe "
+                        "(the RAM plan leaves %s of the %s budget; %lld the devices leave%s; "
+                        "COLI_VK_TIER_HOST=0 off, COLI_VK_TIER_HOST_GB overrides%s%s%s)\n",
+                T.engine, T.dmax[2], human((double)lim, hm, sizeof hm), human((double)T.c.ram_spare, hs, sizeof hs),
+                human((double)T.c.ram_budget, hb, sizeof hb), left, fit < left ? ", not all of them" : "",
+                T.promote_rate ? "; the routed ones move up from it, up to so many a forward (COLI_VK_TIER_PROMOTE)" : "",
+                hh[0] ? "; the driver's heap for it leaves " : "", hh);
     else
         fprintf(stderr, VKT_TAG " tier %s: host pool on, %d experts in %s of system RAM the device reads over PCIe "
-                        "(the %lld its memory leaves%s%s%s%s; COLI_VK_TIER_HOST=0 off, COLI_VK_TIER_HOST_GB sets it)\n",
-                T.engine, T.dmax[2], human((double)lim, hb, sizeof hb), left, fit < left ? ", not all of them" : "",
-                hh[0] ? ": the driver's heap for it leaves " : "", hh, hl);
+                        "(the %lld its memory leaves%s%s%s%s%s; COLI_VK_TIER_HOST=0 off, COLI_VK_TIER_HOST_GB sets it)\n",
+                T.engine, T.dmax[2], human((double)lim, hm, sizeof hm), left, fit < left ? ", not all of them" : "",
+                T.promote_rate ? "; the routed ones move up from it, up to so many a forward (COLI_VK_TIER_PROMOTE)" : "",
+                hh[0] ? "; the driver's heap for it leaves " : "", hh, hl);
 }
 
 int vkt_host_pool_on(void) { return T.on && T.dmax[2] > 0; }
@@ -2850,6 +4408,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (!form_init(0, T.c.gate_up, T.c.down)) {
         fprintf(stderr, VKT_TAG " tier %s: expert format %d/%d (gs %d/%d) has no device form, the experts stay on the CPU\n",
                 eng, T.c.gate_up.kind, T.c.down.kind, T.c.gate_up.gs, T.c.down.gs);
+        coli_vk_degrade(COLI_VK_REFUSE, "tier expert format", "the expert format has no device form: the experts stay on the CPU");
         return 0;
     }
     int act = T.c.act == VKT_ACT_SITU ? COLI_VK_ACT_SITU
@@ -2862,6 +4421,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (!forms_per_layer()) {
         fprintf(stderr, VKT_TAG " tier %s: the layers' expert formats (more than %d forms, or one with no device form) do not "
                         "all go to the device, the experts stay on the CPU\n", eng, VKT_FORMS - 1);
+        coli_vk_degrade(COLI_VK_REFUSE, "tier forms", "more forms than the tier holds, or one with no device form");
         return 0;
     }
     T.exp_bytes = T.per_layer ? tier_expert_bytes_at(coli_vk_buffer_alignment()) : vkt_expert_bytes(H, F, T.c.gate_up, T.c.down);
@@ -2870,9 +4430,11 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         if (form_init(1, T.c.extra_gate_up, T.c.extra_down) && T.exp_bytes &&
             (T.x_bytes = vkt_expert_bytes(H, F, T.c.extra_gate_up, T.c.extra_down)))
             T.c.layers += T.c.extra_layers;
-        else
+        else {
             fprintf(stderr, VKT_TAG " tier %s: the extra layers' expert format %d/%d (gs %d/%d) has no device form, their experts stay on the CPU\n",
                     eng, T.c.extra_gate_up.kind, T.c.extra_down.kind, T.c.extra_gate_up.gs, T.c.extra_down.gs);
+            coli_vk_degrade(COLI_VK_REFUSE, "tier extra format", "the extra layers' format has no device form: their experts stay on the CPU");
+        }
     }
     if (T.main_layers == T.c.layers) T.c.extra_layers = 0;
 
@@ -2984,22 +4546,218 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     /* Streaming (big prefill steps, see "streaming" above): COLI_VK_TIER_STREAM=0 turns
      * it off; it needs the engine's load hook and the GEMM route. Its staging slots come
      * out of the budget: the residents give up what the budget cannot hold beside them. */
+    {   /* the hot set (hot_pin, below): read before the carve, which must leave the pins their places */
+        const char *he = getenv("COLI_VK_TIER_HOT");
+        T.hot = he && *he ? atoi(he) : 0;
+        if (T.hot < 0) T.hot = 0;
+        if (T.hot > 100) T.hot = 100;
+        const char *sc = getenv("COLI_VK_TIER_HOT_SCOPE");
+        T.hot_scope = sc && *sc == 'l';   /* "layer"; anything else, the default, is global */
+        const char *hu = getenv("COLI_VK_TIER_HOT_UPDATE");
+        T.hot_update = hu && *hu && atoi(hu) != 0;
+        const char *hh = getenv("COLI_VK_TIER_HOT_HASH");
+        T.hot_hash = hh && *hh ? atoi(hh) : 0;
+        if (T.hot_hash < 0) T.hot_hash = 0;
+        const char *pl = getenv("COLI_VK_TIER_PIN_LAYER");
+        T.pin_layer = pl && *pl ? atoi(pl) : -1;
+        const char *po = getenv("COLI_VK_TIER_POOL_LAYER");
+        T.pool_layer = po && *po ? atoi(po) : -1;
+        const char *bk = getenv("COLI_VK_TIER_BANK_LAYER");
+        T.bank_layer = bk && *bk ? atoi(bk) : -1;
+        /* decode growth: the DEFAULT since gap-wave4 (unset arms it, =0 off,
+         * COLI_VK_LEGACY=1 off with one line); the cap and the reserve are its own knobs
+         * (COLI_VK_TIER_DECODE_GROW_GB bounds the whole growth, free VRAM and retired
+         * slots together; _RESERVE_GB is what the probe leaves for what still allocates
+         * at decode -- the KV's growth, scratch, the driver: the big pre-decode masses
+         * are inside the probe already) */
+        const char *dge = getenv("COLI_VK_TIER_DECODE_GROW");
+        T.dgrow = coli_vk_env_int("COLI_VK_TIER_DECODE_GROW", 1) != 0;
+        if (!T.dgrow && coli_vk_legacy() && !(dge && *dge))
+            fprintf(stderr, VKT_TAG " tier %s: decode grow: legacy (COLI_VK_LEGACY=1) -- the warm set stands\n", eng);
+        if (T.dgrow) {
+            const char *ce = getenv("COLI_VK_TIER_DECODE_GROW_GB");
+            T.dgrow_cap = ce && *ce && atof(ce) > 0 ? (size_t)(atof(ce) * 1073741824.0) : 0;
+            /* headroom: the DEFAULT with the growth (unset arms it); the growth's free
+             * places are the live guard's, not the one-time
+             * probe's; the target (_TARGET, the fork's gpu_cap class) is the residents'
+             * count it may grow to -- W2 grew 0 free places (the budget full at the arm)
+             * and only recycled slots while the card had room the probe never re-read */
+            T.dgrow_head = coli_vk_env_int("COLI_VK_TIER_DECODE_GROW_HEADROOM", 1) != 0;
+            if (T.dgrow_head) {
+                const char *te = getenv("COLI_VK_TIER_DECODE_GROW_TARGET");
+                T.dgrow_target = te && *te ? atoi(te) : 0;
+                if (T.dgrow_target < 0) T.dgrow_target = 0;
+            }
+        }
+        /* the compute site (CS-1b): the DEFAULT since gap-wave4 (unset is 1; =0 the
+         * per-lever escape hatch; COLI_VK_LEGACY=1 off with one line). 1 moves decode's
+         * routed-expert compute out of the engine's serial CPU loop into the tier's
+         * ONE expert-batch group, issued at the token's finish site -- the residents'
+         * cached handles beside zero-copy fmt-15 aliases of the store's host slabs
+         * (CS-1a's import), rows16 packing off at store open while armed. 2 is 1
+         * composed with the growth machinery (the arm needs
+         * COLI_VK_TIER_DECODE_GROW_HEADROOM's levers landed and armed; no second
+         * growth mechanism, no second guard). */
+        const char *xe = getenv("COLI_VK_TIER_EXPERTS");
+        { int v = coli_vk_env_int("COLI_VK_TIER_EXPERTS", 1); T.csx = v == 2 ? 2 : v != 0; }
+        if (!T.csx && coli_vk_legacy() && !(xe && *xe))
+            fprintf(stderr, VKT_TAG " tier %s: cs experts: legacy (COLI_VK_LEGACY=1) -- the serial CPU loop\n", eng);
+        if (T.csx != 1 && T.csx != 2) T.csx = 0;
+        if (T.csx == 2 && !(T.dgrow && T.dgrow_head)) {
+            fprintf(stderr, VKT_TAG " tier %s: COLI_VK_TIER_EXPERTS=2 is the growth composition and needs COLI_VK_TIER_DECODE_GROW_HEADROOM armed with it; the compute site stays off\n", eng);
+            T.csx = 0;
+        }
+        if (T.csx)
+            fprintf(stderr, VKT_TAG " tier %s: cs experts armed (%d): decode's routed group -- the residents' handles and zero-copy store-slab aliases -- issues at the token's finish site%s\n",
+                    eng, T.csx, T.csx == 2 ? ", composed with the decode-growth headroom arm" : "");
+        if (T.csx) {   /* CS-1c: the alias keepalive cache (off unless asked; the byte bound's default 4096) */
+            const char *ce = getenv("COLI_VK_TIER_CS_ALIAS_CACHE");
+            T.cs_cache = ce && *ce && atoi(ce) != 0 ? 1 : 0;
+            if (T.cs_cache) {
+                const char *me = getenv("COLI_VK_TIER_CS_ALIAS_CACHE_MB");
+                long mb = me && *me ? atol(me) : 4096;
+                if (mb < 0) mb = 0;
+                T.cs_cache_cap = (size_t)mb * 1048576u;
+                /* the hit fast path (off unless asked): a hit of the entry's recorded
+                 * content passes its f16 verdicts to the tensor build and skips the
+                 * scale scan -- provably the same bytes, the store's records fixed per
+                 * (layer, expert); any other hit rescans */
+                const char *se = getenv("COLI_VK_TIER_CS_ALIAS_SCAN_SKIP");
+                T.cs_scan_skip = se && *se && atoi(se) != 0 ? 1 : 0;
+                /* the forked decode path supersedes the keepalive (the registry IS the
+                 * residence); the verdict cache composes unchanged (content-keyed) */
+                if (coli_vk_slabreg_wanted())
+                    fprintf(stderr, VKT_TAG " tier %s: alias cache idle: registry resident (COLI_VK_V4_DECODE_PATH=fork; the verdict cache composes)\n", eng);
+            }
+        }
+        /* CS device-sum (COLI_VK_TIER_CS_DEVSUM, off unless asked): the group's rows
+         * merge on the device (each bf16 rounded, added in row order -- the finish
+         * site's host merge bit-for-bit), one row back at the join. Only a group that
+         * flies whole on the primary device carries the tail; every other group keeps
+         * the rows path, so the arm changes bytes nowhere else. */
+        T.cs_devsum = 0;
+        if (T.csx) {
+            const char *de = getenv("COLI_VK_TIER_CS_DEVSUM");
+            T.cs_devsum = de && *de && atoi(de) != 0 ? 1 : 0;
+            if (T.cs_devsum)
+                fprintf(stderr, VKT_TAG " tier %s: cs device-sum armed: a whole primary-device group's rows merge on the device, one row reads back\n", eng);
+        }
+        /* tier adaptive (COLI_VK_TIER_ADAPTIVE): the fork-parity live guard, off unless
+         * asked. Its reserve defaults to the boot's (COLI_VK_TIER_RESERVE_GB); the margin
+         * is the hysteresis above it before a grow; _GB caps the grown bytes (0 = none).
+         * With DECODE_GROW also armed, adaptive owns the free-VRAM probe and dgrow keeps
+         * its slot retirement and decode-only cutoff (dg_head_room1 steps aside). */
+        {
+        const char *ae = getenv("COLI_VK_TIER_ADAPTIVE");
+        T.adapt = ae && *ae && atoi(ae) != 0 ? 1 : 0;
+        if (T.adapt) {
+            T.adapt_reserve = env_gb("COLI_VK_TIER_ADAPTIVE_RESERVE_GB", reserve / GiB) * GiB;
+            T.adapt_margin = env_gb("COLI_VK_TIER_ADAPTIVE_MARGIN_GB", 0.25) * GiB;
+            const char *ce = getenv("COLI_VK_TIER_ADAPTIVE_GB");
+            T.adapt_cap = ce && *ce && atof(ce) > 0 ? atof(ce) * GiB : 0;   /* its own cap; the boot's COLI_VK_TIER_GB bounds only the boot fit */
+            char hr[32], hm[32], hg[32];
+            fprintf(stderr, VKT_TAG " tier %s: tier adaptive armed: reserve %s, margin %s, grow above %s free%s\n",
+                    eng, human(T.adapt_reserve, hr, sizeof hr), human(T.adapt_margin, hm, sizeof hm),
+                    human(T.adapt_reserve + T.adapt_margin, hg, sizeof hg), T.adapt_cap ? " (capped)" : "");
+        }
+        }
+    }
     {
         ColiVkXbStats xs; coli_vk_xb_stats(&xs);
         T.gemm_rows = xs.gemm_rows;
         const char *se = getenv("COLI_VK_TIER_STREAM"), *sn = getenv("COLI_VK_TIER_STREAM_SLOTS");
         const char *sr = getenv("COLI_VK_TIER_STREAM_ROWS");
+        static int st_boot = 1;   /* the first init past the gates is the boot: the derived
+                                  * count's boot line says its resolution alone. A later arm
+                                  * that unsets the knob (the tests' derived-rule legs) is not
+                                  * the boot and stays silent, or the strict gate's =0 leg
+                                  * would print the very line the hatch leg strips */
+        int boot = st_boot; st_boot = 0;
         int want_st = !(se && *se == '0') && T.c.load && T.c.release && T.gemm_rows > 0;
-        int slots = sn && *sn ? atoi(sn) : 64;
+        /* COLI_VK_TIER_STREAM_SLOTS, the self-tuning default: a set env wins outright;
+         * unset spends up to a QUARTER of the raw fit on streaming -- a slot is an
+         * expert's device bytes, and fit_raw already counts expert places, so the spend
+         * is fit_raw/4 of them -- clamped to the base's floor of 64 and a ceiling of
+         * 4096; COLI_VK_LEGACY=1 keeps the base's 64. The half-of-fit clamp below still
+         * applies to the derived count as it always did to a set one (the bench rig's
+         * 7.85 GiB fit at 12.76 MiB an expert lands at 157 slots, the measured prefill
+         * shape's 150-256 band) */
+        int slots_set = sn && *sn;
+        long long quarter = fit_raw / 4;
+        if (quarter < 64) quarter = 64;
+        if (quarter > 4096) quarter = 4096;
+        int slots = slots_set ? atoi(sn) : coli_vk_env_def("COLI_VK_TIER_STREAM_SLOTS", (int)quarter, 64);
         if (slots > fit_raw / 2) slots = (int)(fit_raw / 2);
+        /* the hot set's pins come first: staging cannot shrink the residents below the
+         * frozen section. Its count here is the device's share (the host pool is sized
+         * after this, and staging carves the device's places only) */
+        int hotpins = T.hot > 0 ? (int)((long long)T.hot * fit / 100) : 0;
+        if (T.pin_layer >= 0 && T.pin_layer < T.main_layers) hotpins += T.c.experts;
+        /* COLI_VK_TIER_BANK_LAYER's carve: the bank's layer, E experts, comes out of the
+         * SLOT budget -- never the residents' -- so the bank and the slots never add and
+         * a resident keeps its place (the 98fcee51 rule: a carve that replaces budget,
+         * never silently takes it). The slots must be able to BECOME the bank: fewer of
+         * them than the bank's experts, or a budget that cannot then hold the bank beside
+         * the pins and two residents, is a decline -- one line, the plan the history's;
+         * the operator's COLI_VK_TIER_STREAM_SLOTS raises them (the standing arm's 256
+         * slots trade exactly for DeepSeek V4's 256-expert layer, ~3.75 GiB of mirror). */
+        if (T.bank_layer >= 0) {
+            char hb[32], he[32];
+            if (T.bank_layer >= T.main_layers)
+                fprintf(stderr, VKT_TAG " tier %s: COLI_VK_TIER_BANK_LAYER=%d is out of range (%d main layers); the bank stays off, the plan the history's\n",
+                        eng, T.bank_layer, T.main_layers);
+            else if (T.bank_layer < T.hot_hash)
+                fprintf(stderr, VKT_TAG " tier %s: COLI_VK_TIER_BANK_LAYER=%d is a hash layer (COLI_VK_TIER_HOT_HASH's first %d); the bank stays off, the plan the history's\n",
+                        eng, T.bank_layer, T.hot_hash);
+            else if (!want_st)
+                fprintf(stderr, VKT_TAG " tier %s: COLI_VK_TIER_BANK_LAYER=%d: streaming is off (COLI_VK_TIER_STREAM=0, or the engine gave no load hooks) -- the carve is the stream slots' bytes and there are none; the bank stays off, the plan the history's\n",
+                        eng, T.bank_layer);
+            else if (slots < T.c.experts || (long long)fit_raw - hotpins < (long long)T.c.experts + 2)
+                fprintf(stderr, VKT_TAG " tier %s: COLI_VK_TIER_BANK_LAYER=%d: no room -- %d stream slots (%s) against the bank's %d experts (%s) and %d pinned places; raise COLI_VK_TIER_STREAM_SLOTS or the budget (COLI_VK_TIER_GB); the bank stays off, the plan the history's\n",
+                        eng, T.bank_layer, slots, human((double)slots * T.exp_bytes, hb, sizeof hb), T.c.experts,
+                        human((double)T.c.experts * T.exp_bytes, he, sizeof he), hotpins);
+            else {
+                T.bank_on = 1; T.bank_cur = T.bank_layer; T.bank_slots0 = slots;
+                slots -= T.c.experts;
+                hotpins += T.c.experts;   /* the bank is pinned (hot_pin): the clamp below keeps its room like a pin's */
+                fprintf(stderr, VKT_TAG " tier %s: bank=layer %d, %d experts (%s), the stream slots' budget %d -> %d (the carve: the bank is the slots' bytes with a different tenure, the residents keep theirs)\n",
+                        eng, T.bank_layer, T.c.experts, human((double)T.c.experts * T.exp_bytes, he, sizeof he), T.bank_slots0, slots);
+            }
+        }
+        if (hotpins > 0 && slots > (int)(fit_raw - hotpins)) slots = (int)(fit_raw - hotpins);
         if (want_st && slots >= 2) {
             if (fit > fit_raw - slots) fit = fit_raw - slots;
             T.st_ok = fit >= 2;
             if (!T.st_ok) fit = fit_raw > all ? all : fit_raw;
         }
+        if (T.bank_on && fit > fit_raw - slots)
+            fit = fit_raw - slots;   /* the carve's freed places join the residents even when streaming did not survive it (every slot became the bank) */
         if (T.st_ok) {
             T.st_slots = slots;
+            if (boot && !slots_set) {   /* the derived count's ONE boot line: the arithmetic said */
+                if (!coli_vk_legacy()) {
+                    char hslot[32], hfit[32];
+                    fprintf(stderr, VKT_TAG " tier: %d stream slots (unset; %s of the %s fit)\n",
+                            T.st_slots, human((double)T.st_slots * T.exp_bytes, hslot, sizeof hslot),
+                            human((double)fit_raw * T.exp_bytes, hfit, sizeof hfit));
+                } else
+                    fprintf(stderr, VKT_TAG " tier: stream slots: legacy (COLI_VK_LEGACY=1) -- 64 slots\n");
+            }
             T.st_rows_env = sr && *sr ? atoi(sr) : 0;
+            {   /* COLI_VK_TIER_STREAM_ROWS_ADAPTIVE: the rule's floor the measurement's */
+                const char *sa = getenv("COLI_VK_TIER_STREAM_ROWS_ADAPTIVE");
+                T.st_rows_adapt = sa && *sa && atoi(sa) != 0;
+            }
+            {   /* COLI_VK_TIER_STREAM_GROUP: the inline fill groups' cap (the sub-batch's
+                 * room by default); COLI_VK_TIER_STREAM_PRED: the prefetch plan's floor */
+                const char *sg = getenv("COLI_VK_TIER_STREAM_GROUP");
+                T.st_group = sg && *sg ? atoi(sg) : 0;
+                if (T.st_group < 0) T.st_group = 0;
+                if (T.st_group > 64) T.st_group = 64;   /* the fill group's arrays are 64 wide */
+                T.st_pred = 1.0;
+                const char *spe = getenv("COLI_VK_TIER_STREAM_PRED");
+                if (spe && *spe) { T.st_pred = atof(spe); if (!(T.st_pred >= 0.0)) T.st_pred = 1.0; }
+            }
             /* a sub-batch's rows: its x rows within 32 MiB (a card without Resizable BAR
              * keeps them in its host-visible window) */
             long hr = (32L << 20) / ((long)T.c.hidden * 4);
@@ -3039,9 +4797,26 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     const char *r = getenv("COLI_VK_TIER_RATE");
     T.rate = r && *r ? atoi(r) : 16;
     if (T.rate < 0) T.rate = 0;
+    {   /* COLI_VK_TIER_PROMO_CAP: the promotions cap a forward, set outright -- the
+         * rate's per-token arithmetic replaced (W2's growth was rate-starved, its run
+         * line reading `skipped 312 rate` while the tier's budget stood unspent);
+         * negative: no cap */
+        const char *pc = getenv("COLI_VK_TIER_PROMO_CAP");
+        T.promo_fix = pc && *pc ? atoi(pc) : 0;
+        if (T.promo_fix < 0) T.promo_fix = -1;
+    }
     T.s = calloc((size_t)T.c.layers * T.c.experts, sizeof(VSlot));
     T.grp = malloc((size_t)T.c.experts * sizeof(int));
     if (!T.s || !T.grp) { free(T.s); free(T.grp); return 0; }
+    if (T.bank_on) {   /* the bank's bitmaps (the carve above armed it) */
+        T.bank_valid = calloc((size_t)T.c.experts, 1);
+        T.bank_tried = calloc((size_t)T.c.experts, 1);
+        if (!T.bank_valid || !T.bank_tried) {
+            free(T.bank_valid); free(T.bank_tried);
+            T.bank_valid = T.bank_tried = NULL; T.bank_on = 0;
+            fprintf(stderr, VKT_TAG " tier %s: no memory for the bank's bitmap; the bank stays off, the plan the history's\n", eng);
+        }
+    }
     for (int e = 0; e < T.c.experts; e++) T.grp[e] = -1;
     T.max_dev_rows = T.c.max_rows > 0 ? T.c.max_rows : 1 << 20;
     T.last_layer = 1 << 30; T.first_layer = -1; T.decay_at = VKT_DECAY_TOKENS;
@@ -3049,6 +4824,20 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
      * proportion, so a few minutes of a new workload can displace it (raw counts
      * from a long history would hold the tier for hours). */
     g_heat_hist = heat;
+    if (T.dgrow) {   /* its own copy of the decode-only counts: the rank the growth installs by */
+        if (cfg->decode_heat) {
+            T.dgrow_heat = calloc((size_t)T.main_layers * T.c.experts, sizeof(uint32_t));
+            if (T.dgrow_heat)
+                for (int l = 0; l < T.main_layers; l++)
+                    if (cfg->decode_heat[l])
+                        memcpy(T.dgrow_heat + (size_t)l * T.c.experts, cfg->decode_heat[l],
+                               (size_t)T.c.experts * sizeof(uint32_t));
+        }
+        if (!T.dgrow_heat) {
+            fprintf(stderr, VKT_TAG " tier %s: COLI_VK_TIER_DECODE_GROW: the engine gave no decode-only counts to rank by; the growth stays off, the warm set stands\n", eng);
+            T.dgrow = 0;
+        }
+    }
     if (heat)
         for (int l = 0; l < T.main_layers; l++) {   /* the history has the main layers */
             if (!heat[l]) continue;
@@ -3060,6 +4849,9 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (pthread_mutex_init(&T.mx, NULL) || pthread_cond_init(&T.cv, NULL) || pthread_cond_init(&T.cv_room, NULL) ||
         pthread_cond_init(&T.cv_done, NULL)) return 0;
     { const char *sy = getenv("COLI_VK_TIER_SYNC"); T.sync = sy && *sy == '1'; }
+    { const char *rg = getenv("COLI_VK_TIER_STREAM_RING"); T.ring_on = rg && *rg && atoi(rg) != 0 && !!T.c.ring_batch; }
+    { const char *rc = getenv("COLI_VK_TIER_STREAM_RING_COLD"); T.ring_cold = T.ring_on && rc && *rc && atoi(rc) != 0; }
+    T.ring_ok = T.ring_on;
     if (pthread_create(&T.th, NULL, uploader, NULL)) return 0;
     T.th_on = 1;
     T.on = 1;
@@ -3084,11 +4876,23 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (T.c.chain_bytes) fprintf(stderr, "; %s left for the dense chain's KV mirror and a prompt chunk",
                                  human((double)T.c.chain_bytes, hb, sizeof hb));
     if (T.stage_room) fprintf(stderr, "; %s for a prompt chunk's host pool experts", human((double)T.stage_room, hb, sizeof hb));
-    fprintf(stderr, "), %s, %s queue, up to %d promotions per token%s%s",
+    fprintf(stderr, "), %s, %s queue, up to %d promotions per token%s%s%s",
             T.uma ? (cap && *cap ? "shared RAM (COLI_VK_TIER_GB)" : "shared RAM: a quarter of what the expert cache leaves")
                   : "device memory", coli_vk_xb_queue_shared() ? "shared" : "own", T.rate,
+            T.promo_fix < 0 ? ", promotions uncapped (COLI_VK_TIER_PROMO_CAP)"
+                            : T.promo_fix > 0 ? ", the promotion cap fixed a forward (COLI_VK_TIER_PROMO_CAP)" : "",
             T.balance ? ", balanced against the CPU" : "", T.sync ? ", uploads awaited (COLI_VK_TIER_SYNC)" : "");
-    if (T.st_ok) fprintf(stderr, ", streaming cold experts of prompt steps through %d slots", T.st_slots);
+    if (T.st_ok) {
+        fprintf(stderr, ", streaming cold experts of prompt steps through %d slots", T.st_slots);
+        if (T.st_rows_adapt)
+            fprintf(stderr, ", the R rule the measured break-even's (COLI_VK_TIER_STREAM_ROWS_ADAPTIVE)");
+        if (T.st_group > 0)
+            fprintf(stderr, ", inline fill groups of up to %d experts (COLI_VK_TIER_STREAM_GROUP)", T.st_group);
+        if (T.st_pred != 1.0)
+            fprintf(stderr, ", the prefetch plan's floor %.2f x R (COLI_VK_TIER_STREAM_PRED)", T.st_pred);
+        if (T.ring_on) fprintf(stderr, ", the stream ring on (COLI_VK_TIER_STREAM_RING)");
+        if (T.ring_cold) fprintf(stderr, ", its cold layers whole-layer (COLI_VK_TIER_STREAM_RING_COLD)");
+    }
     if (T.xmax) {
         char hx[32], hp[32];
         fprintf(stderr, "; the extra layers' experts (%d, fmt %d): %d of %s in a pool of %s", T.c.extra_layers,
@@ -3097,6 +4901,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     fprintf(stderr, "\n");
     d2_init(fit, all, act);   /* COLI_VK_DEV2: the experts after these on a second device */
     host_init(all);           /* and the rest in system RAM the device reads */
+    hot_pin();                /* the hot set: the pins, once the resident places are known */
     /* hybrid steps: a decode step's or a verify's host pool experts of block types on the CPU,
      * in place, while the device computes the ones it holds (COLI_VK_HYBRID=0: the device
      * reads them over PCIe). SwiGLU, and DeepSeek V4's expert with the device's roundings
@@ -3117,6 +4922,11 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
 
 void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long long disk_loads) {
     if (!T.s) return;
+    if (!T.inflight) st_ring_take();   /* a running job's books merge before the line reads them; a report inside a step waits for its own join */
+    /* cu_tier.c compiles this file again for a CUDA device, where the Vulkan chain's
+     * accessor is not linked: the env is read here too (the same grammar as vkc_dprof) */
+    static int dprof = -1;
+    if (dprof < 0) { const char *e = getenv("COLI_VK_CHAIN_DPROF"); dprof = e && *e && *e != '0' ? 1 : 0; }
     ColiVkPoolStats ps; coli_vk_pool_stats(1, &ps);
     unsigned long long r = T.routed - T.rep_routed, sv = T.served - T.rep_served;
     T.rep_routed = T.routed; T.rep_served = T.served;
@@ -3131,6 +4941,90 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
             human((double)T.budget, hb, sizeof hb), ps.blocks, ps.frag, T.uploads,
             human((double)T.upload_bytes, hl, sizeof hl), T.warm, T.evictions, T.qfull, T.rated, T.failed,
             T.dev_ms, T.cpu_ms, T.wait_ms, T.dev_ms > 0 ? 100.0 * hidden / T.dev_ms : 0.0);
+    if (T.npin || T.pin_layer >= 0)   /* the hot set (hot_pin): the frozen section's standing */
+        fprintf(stderr, " | pins %d (hot %d%% of %d resident places, %s, %s)", T.npin, T.hot,
+                T.dmax[0] + T.dmax[2], T.hot_scope ? "per layer" : "global",
+                T.hot_update ? "re-pinned every forward" : "fixed");
+    if (T.d_routed)   /* the headline's own share of the decode steps, which a prompt's rows dominate */
+        fprintf(stderr, " | decode: %llu of %llu routed experts on the device (%.1f%%)",
+                T.d_served, T.d_routed, 100.0 * T.d_served / (double)T.d_routed);
+    if (T.dgrow_armed)   /* decode growth: what grew, and by whose bytes */
+        fprintf(stderr, " | decode grow: %llu installed by decode-only rank (cutoff %u), %llu of the stream slots' places (slots %d -> %d)",
+                T.dgrow_installs, (unsigned)T.dgrow_cut, T.dgrow_retires, T.dgrow_slots0, T.st ? T.st_n : 0);
+    if (T.dgrow_heads)   /* the headroom lever's own places: real free VRAM, guard-made */
+        fprintf(stderr, ", %llu by the live guard", T.dgrow_heads);
+    if (dprof && T.d_routed)   /* COLI_VK_CHAIN_DPROF: the decode steps' wait/device/CPU split, promote's bytes */
+        fprintf(stderr, " | decode dprof: waited %.1f ms, device %.1f ms, CPU %.1f ms, promoted %.1f MiB",
+                T.d_wait_ms, T.d_dev_ms, T.d_cpu_ms, (double)T.d_up_bytes / 1048576.0);
+    if (T.cs_groups || T.cs_refuse) {   /* COLI_VK_TIER_EXPERTS: the finish-site group's own books (one group a layer-token);
+                                   * cs_refuse alone still prints -- a run whose every alias refused (no import
+                                   * alignment, an import cap hit) must not lose its refusal count to silence */
+        fprintf(stderr, " | cs: %llu groups, %llu resident + %llu aliased entries on the device, %llu cpu-fallback (%llu alias refusals",
+                T.cs_groups, T.cs_res, T.cs_alias, T.cs_fallback, T.cs_refuse);
+        if (T.cs_fork)   /* COLI_VK_V4_DECODE_PATH=fork: how many of the aliased came off the registry (no import) */
+            fprintf(stderr, ", %llu registry", T.cs_fork);
+        fprintf(stderr, ")");
+        if (T.cs_sum_n)   /* CS_DEVSUM: the groups whose join read one merged row, and the rows they did not */
+            fprintf(stderr, ", %llu device-merged (%llu rows)", T.cs_sum_n, T.cs_sum_rows);
+    }
+    if (T.cs_cache) {   /* CS-1c: the alias keepalive cache's standing (entries, pinned bytes, reuse; forgotten = vkt_slab_forget's invalidations, the VA-reuse guard) */
+        char hc[32];
+        fprintf(stderr, " | cs alias cache: %d entries, %zu bytes (%s), %llu hits, %llu misses, %llu evictions, %llu forgotten",
+                T.cs_cache_n, T.cs_cache_bytes, human((double)T.cs_cache_bytes, hc, sizeof hc),
+                T.cs_cache_hits, T.cs_cache_misses, T.cs_cache_evicts, T.cs_cache_forgets);
+        if (T.cs_scan_skip)   /* the hit fast path's own arm: its saves on the same line */
+            fprintf(stderr, ", %llu scans skipped", T.cs_scan_skips);
+    }
+    if (dprof && T.cs_groups) {   /* COLI_VK_CHAIN_DPROF: the group's window split. Reconciliation against the
+                                   * decode dprof line (all CS decode steps): CPU window = settle + build + issue
+                                   * + residual (the serial CPU loop, 0 under CS); waited = fence + qread +
+                                   * release + residual join glue; device = the timestamp span. alias and
+                                   * xb_expert are subsets of build (the lookup loop); release is a subset of
+                                   * waited. resident bytes = resident entries * the tier's per-expert bytes. */
+        ColiVkCsDiag cd; coli_vk_cs_diag(&cd);
+        fprintf(stderr, " | cs dprof: settle %.1f ms (%llu), build %.1f ms (%llu; alias %.1f (hit %.1f / miss %.1f), import %.1f (%llu), xb_expert %.1f), "
+                "issue %.1f ms (%llu), fence %.1f ms, qread %.1f ms, device %.1f ms, release %.1f ms (%llu) | "
+                "slab import %llu create + %llu hit (create %.1f ms, hit %.1f ms), unref-zero %llu (%.1f ms), alias buffers %llu destroyed (%.1f ms) | "
+                "aliased %.1f MiB, resident %.1f MiB",
+                T.cs_settle_ms, T.cs_settle_n, T.cs_lookup_ms, T.cs_build_n, T.cs_alias_ms, T.cs_alias_hit_ms, T.cs_alias_miss_ms, T.cs_import_ms, T.cs_import_n, T.cs_xbex_ms,
+                T.cs_issue_ms, T.cs_issue_n, T.cs_fence_ms, T.cs_qread_ms, T.cs_dev_ms, T.cs_release_ms, T.cs_release_n,
+                cd.slab_creates, cd.slab_hits, cd.slab_create_ms, cd.slab_hit_ms, cd.slab_zeros, cd.slab_zero_ms,
+                cd.alias_buf_destroys, cd.alias_buf_destroy_ms,
+                (double)T.cs_alias_bytes / 1048576.0, (double)((unsigned long long)T.cs_res * (unsigned long long)T.exp_bytes) / 1048576.0);
+        /* The reconciliation printed, not left in the commit message (gap-wave1 inventory gap 3):
+         * over the decode class, cpu = settle + build + issue + residual and waited =
+         * fence + qread + release + residual. A negative residual says the books do not
+         * close (non-CS decode steps contribute to d_*, the serial CPU loop's compute);
+         * the mallocs and grow_* of vkt_issue_group are the residual's own content. */
+        fprintf(stderr, " | cs resid: cpu %.1f = settle %.1f + build %.1f + issue %.1f + %.1f; "
+                "waited %.1f = fence %.1f + qread %.1f + release %.1f + %.1f",
+                T.d_cpu_ms, T.cs_settle_ms, T.cs_lookup_ms, T.cs_issue_ms,
+                T.d_cpu_ms - T.cs_settle_ms - T.cs_lookup_ms - T.cs_issue_ms,
+                T.d_wait_ms, T.cs_fence_ms, T.cs_qread_ms, T.cs_release_ms,
+                T.d_wait_ms - T.cs_fence_ms - T.cs_qread_ms - T.cs_release_ms);
+        if (cd.xb_foreign_joins)   /* the fence/qread deltas assume one joining thread */
+            fprintf(stderr, ", %llu xb joins off the delta thread (fence/qread dirty)", cd.xb_foreign_joins);
+    }
+    if (dprof && T.p_steps) {   /* COLI_VK_CHAIN_DPROF: the prompt steps' span (S > VKT_UP_ROWS), issue to join: the host-MoE window's tier half,
+                                * split now (gap-wave1 ttft F1/F3): host = issue wall (fill / joins / submit inside it,
+                                * the rest classify+pack) + kept (the issue's end to the join's entry, the kept rows' CPU
+                                * compute) + the join-side glue as residual. The stage fills run between steps, outside this
+                                * window -- they are the chain's staging role, beside its own line. */
+        fprintf(stderr, " | prompt dprof: %llu steps, waited %.1f ms, device %.1f ms, host %.1f ms "
+                "(issue %.1f in %llu calls [fill %.1f in %llu groups of %.1f experts (mean %.0f us, max %.1f ms), joins %.1f (%llu), submit %.1f (%llu), classify+pack %.1f], "
+                "kept %.1f, join glue %.1f)",
+                T.p_steps, T.p_wait_ms, T.p_dev_ms, T.p_cpu_ms,
+                T.pd_issue_ms, T.pd_issue_n, T.pd_fill_ms, T.pd_fill_n,
+                T.pd_fill_n ? (double)T.pd_fill_exp / (double)T.pd_fill_n : 0.0,
+                T.pd_fill_n ? T.pd_fill_ms * 1e3 / (double)T.pd_fill_n : 0.0, T.pd_fill_max,
+                T.pd_rjoin_ms, T.pd_rjoin_n, T.pd_submit_ms, T.pd_submit_n,
+                T.pd_issue_ms - T.pd_fill_ms - T.pd_rjoin_ms - T.pd_submit_ms,
+                T.pd_kept_ms, T.p_cpu_ms - T.pd_issue_ms - T.pd_kept_ms);
+        if (T.pdst_fill_n)   /* the stage prefetch's fills: per-group wall, the 6.4 ms a sub-batch question */
+            fprintf(stderr, " | stage dprof: %llu fill groups, %.1f ms (mean %.0f us, max %.1f ms), prefetched %llu (%llu used)",
+                    T.pdst_fill_n, T.pdst_fill_ms,
+                    T.pdst_fill_ms * 1e3 / (double)T.pdst_fill_n, T.pdst_fill_max, T.pf_n, T.pf_used);
+    }
     if (T.failed)
         fprintf(stderr, " | failed: %llu refused by the pool, %llu copies to the device, %llu not taken by the batch",
                 T.f_pool, T.f_copy, T.f_sets);
@@ -3149,26 +5043,41 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
     if (T.st_ok && T.st_steps) {
         char hs[32];
         fprintf(stderr, " | stream: %llu steps, %llu cold experts (%s, %.2f GB/s) and %llu rows streamed in %llu sub-batches, "
-                "prefetched %llu (%llu used), %llu cold experts (%llu rows) kept on the CPU",
+                "prefetched %llu (%llu used), %llu cold experts (%llu rows) kept on the CPU, R=%d%s",
                 T.st_steps, T.st_experts, human((double)T.st_bytes, hs, sizeof hs),
                 T.st_up_ms > 0 ? (double)T.st_bytes / T.st_up_ms / 1e6 : 0.0, T.st_rows, T.st_subs, T.pf_n, T.pf_used,
-                T.st_kept, T.st_kept_rows);
+                T.st_kept, T.st_kept_rows, stream_min_rows(),
+                T.st_rows_env > 0 ? " (fixed)" : T.st_rows_adapt ? " (adaptive)" : "");
         if (T.st_sums) fprintf(stderr, ", %llu steps summed on the device", T.st_sums);
+        if (T.ring_jobs) fprintf(stderr, ", the ring %llu jobs (%llu experts)", T.ring_jobs, T.ring_experts);
         if (T.pc_experts) {
             char hc[32];
             fprintf(stderr, ", %llu host pool experts copied into the slots (%s)", T.pc_experts, human(T.pc_bytes, hc, sizeof hc));
         }
     }
+    if (T.bank_on) {   /* the bank (COLI_VK_TIER_BANK_LAYER): its standing beside the books it keeps */
+        int nv = 0;
+        char hb[32];
+        for (int e = 0; e < T.c.experts; e++) nv += T.bank_valid[e] != 0;
+        fprintf(stderr, " | bank: layer %d, %d of %d experts valid, %llu refilled (%s), slots %d -> %d",
+                T.bank_cur, nv, T.c.experts, T.bank_refills, human((double)T.bank_bytes, hb, sizeof hb),
+                T.bank_slots0, T.st_ok ? T.st_slots : 0);
+    }
     if (T.dmax[2]) {
         ColiVkPoolStats ph; coli_vk_pool_stats(5, &ph);
-        char hh[32], hb[32];
+        char hh[32], hbd[32];
         if (T.full)   /* every expert, and those the device reads from it (the ones on their way up among them) */
             fprintf(stderr, " | host pool: every expert (%s of %s), %d read from it, %llu moved up to the device "
                             "(%llu residents gave way)", human((double)ph.used, hh, sizeof hh),
-                    human((double)T.h_budget, hb, sizeof hb), T.dres[2], T.ups, T.up_victims);
+                    human((double)T.h_budget, hbd, sizeof hbd), T.dres[2], T.ups, T.up_victims);
         else
             fprintf(stderr, " | host pool: resident %d (budget %d, %s of %s)", T.dres[2], T.dmax[2],
-                    human((double)ph.used, hh, sizeof hh), human((double)T.h_budget, hb, sizeof hb));
+                    human((double)ph.used, hh, sizeof hh), human((double)T.h_budget, hbd, sizeof hbd));
+        if (T.c.ram_planned)   /* the plan figure the pool was sized from */
+            fprintf(stderr, ", the RAM plan leaves %s of the %s budget",
+                    human((double)T.c.ram_spare, hh, sizeof hh), human((double)T.c.ram_budget, hbd, sizeof hbd));
+        if (!T.full && (T.ups || T.up_victims))   /* a partial pool's promotions */
+            fprintf(stderr, "; %llu moved up to the device (%llu residents gave way)", T.ups, T.up_victims);
         if (T.chain_served)
             fprintf(stderr, "; of the chain's routed experts %.1f%% in the device's memory, %.1f%% of a decode step's",
                     100.0 * T.vram_routed / T.chain_served, T.dec_routed ? 100.0 * T.dec_vram / T.dec_routed : 0.0);
@@ -3267,6 +5176,7 @@ static int dev_entry_hybrid(int layer, int e, uint32_t *o, VktHostExpert *hx) {
  * served (the device took every resident one) */
 void vkt_dev_count(int layer, int S, int K, const int *idx) {
     if (!T.on || layer < 0 || layer >= T.c.layers || S < 1 || K < 1 || !idx) return;
+    if (S <= VKT_UP_ROWS) st_ring_take();   /* a decode frame's promote path retires stream slots: the ring joins first (issue's note) */
     if (layer < T.last_layer || T.begin) { T.begin = 0; T.first_layer = layer; new_forward(); }
     if (T.routed_at) {
         uint32_t q = ++T.seq;
@@ -3276,20 +5186,26 @@ void vkt_dev_count(int layer, int S, int K, const int *idx) {
     }
     if (layer == T.first_layer) {
         T.tick += (uint32_t)S;
-        long cap = (long)T.promo_cap + (long)T.rate * S;
-        T.promo_cap = cap > (1 << 30) ? 1 << 30 : (int)cap;
+        if (!T.promo_fix) {   /* COLI_VK_TIER_PROMO_CAP holds the forward's cap fixed instead */
+            long cap = (long)T.promo_cap + (long)T.rate * S;
+            T.promo_cap = cap > (1 << 30) ? 1 << 30 : (int)cap;
+        }
     }
     T.last_layer = layer;
+    T.dgrow_dec = S <= VKT_UP_ROWS;   /* decode growth: the chain's decode frames are this seam's too */
+    if (T.dgrow && !T.dgrow_armed && T.dgrow_dec) dgrow_arm();
     for (int i = 0; i < S * K; i++) {
         int e = idx[i];
         if (e < 0 || e >= T.c.experts) continue;
         T.routed++;
+        if (S <= VKT_UP_ROWS) T.d_routed++;   /* the decode-only share (vkt_report) */
         if (layer >= T.main_layers) T.extra_routed++;
         VSlot *v = slot(layer, e);
         if (v->heat < 0xFFFFFFFFu) v->heat++;
         v->last = T.tick;
         if (v->state != VS_RESIDENT || v->dev != 0) continue;
         T.served++; T.chain_served++;
+        if (S <= VKT_UP_ROWS) T.d_served++;   /* the same share: a chain frame's steps are decode's */
         if (layer >= T.main_layers) T.extra_served++;
         if (!v->host) T.vram_routed++;
         if (S > VKT_UP_ROWS) continue;
@@ -3299,7 +5215,7 @@ void vkt_dev_count(int layer, int S, int K, const int *idx) {
 }
 /* T.full: the promotions that landed into the slot table, at a frame's start (vk_dmoe.h)
  * where nothing reads the experts: the table read next has them. */
-void vkt_settle(void) { if (T.on && T.full) quiesce(); }
+void vkt_settle(void) { if (T.on) quiesce(); }   /* a partial pool's promotions land here too */
 int vkt_layers(void) { return T.on ? T.c.layers : 0; }
 static VSlot *g_old_slots;   /* the slot table of the tier shut down last (vkt_shutdown) */
 static uint32_t *g_old_routed, *g_old_seq;
@@ -3321,6 +5237,7 @@ void vkt_ram_gave(void) { __atomic_add_fetch(&T.ram_gave, 1, __ATOMIC_RELAXED); 
 
 void vkt_shutdown(void) {
     if (!T.s) return;
+    st_ring_cancel();   /* the ring's worker first: never wait out a stream the teardown discards (the fork's issue #4) */
     if (T.th_on) {
         pthread_mutex_lock(&T.mx); T.stop = 1; pthread_cond_broadcast(&T.cv); pthread_cond_broadcast(&T.cv_room); pthread_cond_broadcast(&T.cv_done); pthread_mutex_unlock(&T.mx);
         pthread_join(T.th, NULL);
@@ -3335,6 +5252,8 @@ void vkt_shutdown(void) {
     T.qn = 0;
     if (coli_vk_available()) {
         quiesce();
+        cs_ex_release();   /* a group abandoned mid-step: its transient aliases go with the rest */
+        cs_cache_clear();  /* the keepalive holds go with them (the device is idle here) */
         size_t n = (size_t)T.c.layers * T.c.experts;
         for (size_t i = 0; i < n; i++) {
             if (T.s[i].hex && T.s[i].hex != T.s[i].ex) coli_vk_xb_expert_free(T.s[i].hex);
@@ -3354,6 +5273,10 @@ void vkt_shutdown(void) {
     free(T.st); free(T.sy); free(T.bcnt); free(T.bofs); free(T.bcls); free(T.blist); free(T.pred); free(T.pred_ok);
     for (int h = 0; h < 2; h++) { free(T.hf[h].slot); free(T.hf[h].yout); }
     free(T.d2_idx); free(T.d2_y); free(T.d2_bex); free(T.d2_brows); free(T.d2_bx); free(T.d2_bw);
+    free(T.hot_order);
+    free(T.bank_valid); free(T.bank_tried);
+    free(T.dgrow_heat);
+    free(T.cs_cache_e);
     free(T.hy_of); free(T.hy_v); free(T.hy_hx); free(T.hy_x); free(T.hy_gu); free(T.hy_hh); free(T.hy_out); free(T.hy_w); free(T.hy_xb); free(T.hy_src); free(T.bpool);
     memset(&T, 0, sizeof T);
 }

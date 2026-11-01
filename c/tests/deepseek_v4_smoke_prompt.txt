@@ -1,0 +1,1 @@
+Write a Python function two_sum(nums, target) that returns the indices of the two numbers adding up to target, or None. Use a hash map so it runs in one pass, explain the idea in two sentences, and add a short doctest with [2, 7, 11, 15] and target 9.

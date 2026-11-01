@@ -402,6 +402,17 @@ int vkc_mhc_ready(void);
 typedef struct { int S, H, D, iters, x_off, x_row, m_off, m_row, hp_off, hp_row, y_off, y_row, prm_off, n;
                  float eps, hc_eps, lim; } VkcMhc;
 int vkc_mhc(int mode, VkcBuf *x, VkcBuf *m, VkcBuf *hp, VkcBuf *prm, VkcBuf *y, const VkcMhc *p);
+/* the S=1 single-dispatch pair of the same op (chain_mhc_dec.comp, COLI_VK_CHAIN_MHC_S1;
+ * the fork's mhc_dec_{pre,post}.comp on chain_mhc's buffers): one row of H streams of D
+ * floats at x_off -- mode 0 the whole pre tail (RMS-inverse, Sinkhorn, collapse, branch
+ * RMSNorm, the bf16 rounds folded) of the mixes m at m_off with the hc scale/base at
+ * hc_off and the branch norm weight at n_off in prm, into hp (chain_mhc's layout, a
+ * standing POST can read it) and the normed row y at y_off; mode 1 the post of the
+ * branch m at m_off, y[j*D+d] = sum_i hp's comb * x + post[j]*m[d], bf16-rounded.
+ * Refuses (and the caller's standing chain runs) unless the lever is on and H <= 8,
+ * D <= 4096, iters >= 1 (mode 0); thresholded numerics, D11's class */
+typedef struct { int H, D, iters, x_off, m_off, hp_off, y_off, hc_off, n_off; float eps, hc_eps, n_eps; } VkcMhcDec;
+int vkc_mhc_dec(int mode, VkcBuf *x, VkcBuf *m, VkcBuf *hp, VkcBuf *prm, VkcBuf *y, const VkcMhcDec *p);
 /* Inkling's ops, their pipelines made on first use (an engine checks *_ready at setup:
  * a build without the shader keeps every other op, and that engine's chain off).
  * chain_sconv.comp (mode 0: the depthwise causal short convolution, residual inside, in
@@ -466,12 +477,15 @@ typedef struct {
 int vkc_moe_ready(void);
 /* A prompt chunk's routed experts, every row on the device (chain_moe_rows.comp): the
  * pairs counted and planned by expert there, gate+up and down as the block formats'
- * grouped GEMMs (qmatmul_grp_gate_up_bd.comp, qmatmul_grp_bd.comp) over the tiles of each
+ * grouped GEMMs (qmatmul_grp_gate_up_bd.comp, qmatmul_grp_bd.comp) — or, gfmt and dfmt
+ * both 7, fmt 7's (qmatmul_grp_mx.comp, in floats) — over the tiles of each
  * expert's rows, dispatched with the counts the device wrote, then each row's sum over its
- * experts in rank order. p as vkc_moe's with x_off 0, act 0, E, gfmt and dfmt (the layer's
- * experts' block formats), D and I multiples of 64; y as vkc_moe's. The tables and the
- * rows' hidden and down outputs live in *r between calls (vkc_moe_rows_free). 0 when the
- * device lacks the pipelines (vkc_moe_rows_ready) or a parameter is out of range. */
+ * experts in rank order. p as vkc_moe's with act 0, E, gfmt and dfmt (the layer's
+ * experts' formats), D and I multiples of 64; x_off (floats, like vkc_moe's) may name a
+ * row group's own first row -- COLI_VK_DMOE_ROWS_MAX's frame split calls this once per
+ * group, the ids/w/y offsets of the same group beside it; y as vkc_moe's. The tables and
+ * the rows' hidden and down outputs live in *r between calls (vkc_moe_rows_free). 0 when
+ * the device lacks the pipelines (vkc_moe_rows_ready) or a parameter is out of range. */
 typedef struct { VkcBuf *cnt, *amap, *items, *etab, *aux, *hid, *yk; } VkcMoeRows;
 int vkc_moe_rows_ready(int gfmt, int dfmt);
 int vkc_moe_rows(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcMoeRows *r, VkcBuf *y, const VkcMoe *p);
@@ -480,14 +494,15 @@ void vkc_moe_rows_free(VkcMoeRows *r);
  * has room: the block formats' GEMV and tiled GEMM for the ggml types in `types` (bit t for
  * format 100 + t), chain_moe's pipeline (moe 1: colibri's formats, 2: the block formats'),
  * DeltaNet's recurrence for key dimension dn_kd (0: none), and a prompt chunk's grouped
- * GEMMs (vkc_moe_rows) for the experts' gate/up types ex_gu and down types ex_dn, or for our
- * own formats (ex_ours), and the attention on the matrix units (attn_hd, attn_gq). An engine
- * calls it once its dense chain is placed, before its expert tier fills the device. A
+ * GEMMs (vkc_moe_rows) for the experts' gate/up types ex_gu and down types ex_dn, for our
+ * own formats (ex_ours), or for fmt 7 (ex_mx: qmatmul_grp_mx.comp), and the attention on
+ * the matrix units (attn_hd, attn_gq). An engine calls it once its dense chain is placed, before its expert tier fills the device. A
  * discrete card's default (COLI_VK_CHAIN_PREWARM=1 on any device, 0 never); the pipelines
  * made. */
 typedef struct {
     uint64_t types; int moe, dn_kd; uint64_t ex_gu, ex_dn;
     int ex_ours;                /* the experts are our own formats (1, 2, 4): their grouped GEMMs (qmatmul_grp_q.comp) */
+    int ex_mx;                  /* the experts are fmt 7 (MXFP4, both matrices): theirs (qmatmul_grp_mx.comp) */
     int gemv_i[16], n_gemv_i;   /* the GEMV's widths of x (a matrix's I) the types meet: its staging sizes */
     int moe_d, moe_i;           /* the experts' D and I: chain_moe's staging size (0: the device's largest) */
     int attn_hd, attn_gq;       /* the attention's head dim and query heads per kv head: chain_attn_flash's (0: none) */
@@ -872,6 +887,13 @@ typedef struct { int mode, C, H, W, up, Ho, Wo, y0, n, x_off, o_off, Co, dupC; }
 int vkc_vae(VkcBuf *x, VkcBuf *o, VkcBuf *tab, const VkcVae *p);
 int vkc_vae_ready(void);
 
+/* COLI_VK_CHAIN_DPROF: the role a frame is submitted under (vkc_role), DeepSeek V4's
+ * chain's three record sites and the dmoe path's; other engines' frames land in OTHER.
+ * MOEH and STAGE stamp no frames: the host's routed-expert step of a prompt chunk and
+ * the staging uploads around it -- the prompt window's host timeline charges its wall
+ * to them (p_host_ms), the TTFT decomposition S0 measures */
+enum { VKC_R_OTHER = 0, VKC_R_A1, VKC_R_A2, VKC_R_DMOE, VKC_R_TAIL, VKC_R_MOEH, VKC_R_STAGE, VKC_R_N };
+
 /* counters, for the engines' [VK] lines */
 typedef struct {
     unsigned long long frames, waits, ops, matmuls, gemms, barriers, bytes_up, bytes_down;
@@ -889,12 +911,60 @@ typedef struct {
     unsigned long long attn_dec;       /* decode attentions split over their positions' blocks (chain_attn_dec.comp) */
     unsigned long long attn_dec_gqa;   /* of them, a KV head's query heads a workgroup (its grouped mode) */
     unsigned long long moe_gv;         /* routed-expert decode steps in our formats on chain_moe_gv.comp */
+    unsigned long long mm8;            /* fmt-12 matmuls on the tiled GEMM (qmatmul_mm8.comp, COLI_VK_MM8) */
+    unsigned long long mm8_split;      /* of those, the split-K ones (partial planes + the ascending-k reduce) */
+    unsigned long long attn_fa;        /* DeepSeek V4 attentions on the flash tile (chain_dsv4_fa.comp, COLI_VK_CHAIN_ATTN_FA) */
+    unsigned long long mhc_dec;        /* single-row mHC sites on the fused pair (chain_mhc_dec.comp, COLI_VK_CHAIN_MHC_S1) */
+    /* COLI_VK_CHAIN_DPROF=1 (vkc_dwin/vkc_role): the decode window -- the forwards of one
+     * row and the frames submitted in them, by role: the host's fence waits on those
+     * frames, their device time (COLI_VK_CHAIN_PROF's timestamps; 0 without it) and the
+     * time spent inside vkQueueSubmit. All zero at the default. */
+    unsigned long long d_fwd, d_frames, d_wait_n;
+    double d_wait_ms[VKC_R_N], d_dev_ms[VKC_R_N], d_submit_ms;
+    /* the decode window's own host timeline, the prompt line's shape: the wall since
+     * the last vkc_role stamp charged to the role it ran under (dwin_t0 opens a span a
+     * decode forward), so the roles sum to d_wall_ms -- the host-MoE step (MOEH) and
+     * the staging uploads (STAGE) at decode, the CS-0 print's numbers. Zero at the default. */
+    double d_host_ms[VKC_R_N], d_wall_ms;
+    /* the same for the prompt window (vkc_dwin(2), one per prompt chunk): p_host_ms is
+     * that window's own instrument -- the host wall charged to the role stamped when it
+     * ran, so the roles sum to p_wall_ms and the prompt's wall splits into dense frames
+     * (A1/A2), the host-MoE step (MOEH), the staging uploads (STAGE) and the tail */
+    unsigned long long p_fwd, p_frames, p_wait_n;
+    double p_wait_ms[VKC_R_N], p_dev_ms[VKC_R_N], p_submit_ms;
+    double p_host_ms[VKC_R_N], p_wall_ms;
     unsigned long long tile_wide;      /* of the tile GEMMs, a GGUF's on 128 x 128 tiles (qmatmul_gemm_bdcw.comp) */
     unsigned long long grp_wide;       /* of the grouped expert GEMMs, those at the wider item (qmatmul_grp*_bdcw.comp) */
 } VkcStats;
 void vkc_stats(VkcStats *st);
+/* mm8 (the tiled weight-stationary GEMM for fmt 12): the test/bench hooks over the
+ * same state COLI_VK_MM8 fills lazily -- vkc_mm8_set(0) the default (every matmul on
+ * its other paths), 1 every eligible matmul (S >= 2, I a multiple of 64), -1 the
+ * backend's fill rule as vkc_gemm_rows gates it; the tile -2 the default (the frozen f),
+ * -1 the per-shape rule, >= 0 forced */
+void vkc_mm8_set(int on);
+void vkc_mm8_set_tile(int v);
+void vkc_mm8_set_ndbuf(int v);   /* the staging constant: -2 the measured default (0; COLI_VK_CHAIN_MM8_NDBUF=2 arms the ping-pong), 0 single, 2 ping-pong */
+int vkc_mm8_ndbuf_baked(void);   /* the staging constant the LAST mm8 pipeline build baked (spec id 11): the env arm's observable, the env leg asserts it */
+const char *vkc_mm8_tile_name(int v);
+int vkc_mm8_tile_count(void);
+/* the split-K count a call takes (COLI_VK_MM8_SPLITK: 0 off/bitwise, unset auto -- the
+ * fill-target rule -- N forced): 1 the unsplit arm, k > 1 the partial planes + the reduce */
+void vkc_mm8_set_splitk(int v);
+int vkc_mm8_splitk_choose(int S, int I, int O);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */
 void vkc_prof_print(void);
+/* COLI_VK_CHAIN_DPROF=1: the window counters above. vkc_dwin(1) opens the decode
+ * window (an engine's forward of one row, a decode step: d_fwd counts each opening),
+ * vkc_dwin(2) opens a prompt window -- one per prompt chunk, closed by vkc_dwin(0) at
+ * the chunk's end -- and vkc_role names the frame the engine is about to submit (dense
+ * A1/A2, the dmoe path's, the forward's tail) or the host span it is about to run
+ * (MOEH, STAGE: the prompt window charges its wall to the stamped role). Frames and
+ * spans outside an open window count nowhere in them. vkc_dprof: the env's answer, for
+ * the engines' own lines. */
+int  vkc_dprof(void);
+int  vkc_dwin(int on);
+void vkc_role(int role);
 
 #ifdef __cplusplus
 }

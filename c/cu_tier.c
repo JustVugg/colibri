@@ -81,6 +81,8 @@ static const CuTierOps *cut_ops(void) {
 #define coli_vk_xb_issue_w(...) (cut_ops()->xb_issue_w(__VA_ARGS__))
 #define coli_vk_xb_issue_dev(...) (cut_ops()->xb_issue_dev(__VA_ARGS__))
 #define coli_vk_xb_join(...) (cut_ops()->xb_join(__VA_ARGS__))
+#define coli_vk_xb_join_sum(...) (cut_ops()->xb_join_sum(__VA_ARGS__))
+#define coli_vk_xb_sum_arm(...) (cut_ops()->xb_sum_arm(__VA_ARGS__))
 #define coli_vk_xb_join_dev(...) (cut_ops()->xb_join_dev(__VA_ARGS__))
 #define coli_vk_xb_busy_dev(...) (cut_ops()->xb_busy_dev(__VA_ARGS__))
 #define coli_vk_xb_stats(...) (cut_ops()->xb_stats(__VA_ARGS__))
@@ -98,6 +100,9 @@ static const CuTierOps *cut_ops(void) {
 
 /* the tier's names */
 #define vkt_begin_forward cut_begin_forward
+#define vkt_cs_armed cut_cs_armed
+#define vkt_bank_fill cut_bank_fill
+#define vkt_bank_switch cut_bank_switch
 #define vkt_dev_changes cut_dev_changes
 #define vkt_dev_count cut_dev_count
 #define vkt_dev_entry cut_dev_entry
@@ -107,14 +112,19 @@ static const CuTierOps *cut_ops(void) {
 #define vkt_devices cut_devices
 #define vkt_epoch cut_epoch
 #define vkt_expert_bytes cut_expert_bytes
+#define vkt_forkdec_store_line cut_forkdec_store_line
+#define vkt_forkdec_wanted cut_forkdec_wanted
 #define vkt_give_back cut_give_back
 #define vkt_host_pairs cut_host_pairs
 #define vkt_host_pairs_w cut_host_pairs_w
 #define vkt_host_pool_on cut_host_pool_on
+#define vkt_host_room cut_host_room
 #define vkt_init cut_init
 #define vkt_issue cut_issue
 #define vkt_issue_w cut_issue_w
+#define vkt_issue_group cut_issue_group
 #define vkt_join cut_join
+#define vkt_join_merged cut_join_merged
 #define vkt_join_sum cut_join_sum
 #define vkt_layers cut_layers
 #define vkt_note cut_note
@@ -126,8 +136,12 @@ static const CuTierOps *cut_ops(void) {
 #define vkt_ready cut_ready
 #define vkt_report cut_report
 #define vkt_resident cut_resident
+#define vkt_cs_served cut_cs_served
 #define vkt_score cut_score
 #define vkt_settle cut_settle
+#define vkt_slab_forget cut_slab_forget
+#define vkt_slabreg_slot cut_slabreg_slot
+#define vkt_slabreg_slot_free cut_slabreg_slot_free
 #define vkt_shutdown cut_shutdown
 #define vkt_stage_room cut_stage_room
 #define vkt_step_rows cut_step_rows
@@ -136,6 +150,34 @@ static const CuTierOps *cut_ops(void) {
 #define vkt_wants cut_wants
 #define vkt_warm_report cut_warm_report
 
+/* the Vulkan strict gate (COLI_VK_STRICT, backend_vulkan.c) has no CUDA side: the
+ * tier's refusal lines above keep their own fprintf, behaviour unchanged */
+#define coli_vk_degrade(cls, op, reason) ((void)0)
+/* CS-1b's slab-alias capability is the Vulkan backend's own (VK_EXT_external_memory_host
+ * imports of the store's host pages); a CUDA backend has no such import, so the calls
+ * refuse and the compute site's group degrades its aliased experts to the CPU -- the
+ * lever's refusal ladder, never a drop */
+#define coli_vk_slab_import(...) (0)
+#define coli_vk_tensor_alias(...) (0)
+#define coli_vk_tensor_alias_wide(...) (0)
+#define coli_vk_slab_unref(...) ((void)0)
+#define coli_vk_slab_ref(...) ((void)0)
+#define coli_vk_slab_bytes(...) (0)
+#define coli_vk_slab_cap() (0)
+#define coli_vk_slab_forget(...) ((void)0)
+/* the forked decode path's registry is the Vulkan backend's own (coli_vk_slabreg_*,
+ * backend_vulkan.c); a CUDA backend has no such registry, so every call declines and
+ * the store's slots keep the malloc path, the CS alias the import branch (itself
+ * shimmed above) -- the lever's refusal ladder, never a drop */
+#define coli_vk_slabreg_wanted() (0)
+#define coli_vk_slabreg_status(...) (0)   /* never reached: wanted() declines first */
+#define coli_vk_slabreg_alloc(...) (0)
+#define coli_vk_slabreg_free(...) ((void)0)
+#define coli_vk_slabreg_lookup(...) (0)
+#define coli_vk_slabreg_alias(...) (0)
+/* the Vulkan backend's CS diagnostics (backend_vulkan.h); the CUDA tier has no slab
+ * import, so vk_tier.c's report reads an all-zero snapshot */
+#define coli_vk_cs_diag(out) (memset((out), 0, sizeof *(out)))
 #define VKT_TAG "[CUDA]"
 #ifndef COLI_VULKAN
 #define COLI_VULKAN 1   /* vk_tier.c's body */

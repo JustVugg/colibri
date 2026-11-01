@@ -401,11 +401,23 @@ turned itself off (`moe-double=off`).
   reuse fails at the reply boundary. `V4_PREFIX_CKPT_SLOTS` (4) in-memory
   slots, LRU with prompt-end evicted first. Log lines: `v4_ckpt store
   prefix=N` / `prompt_end=N`, `v4_ckpt hit prefix=N`.
-- **Persistence.** Prefix captures are written to `<model>/.coli_ckpt/`
-  (`V4_PREFIX_CKPT_DISK`=1; `2` also persists prompt-end captures, `0` off;
-  ~140 MB for an 8.3k-token prefix, config-fingerprinted, temp+rename) and
-  loaded lazily on the first request after a restart — a fresh serve no
-  longer re-prefills the system prompt.
+- **Persistence — the cold tier (disk is the system of record).** With
+  `V4_PREFIX_CKPT_DISK`=1 (default) captures go to a process-global,
+  content-addressed catalog under `<model>/.coli_ckpt/`:
+  `kv_<fingerprint>_<idhash>.bin`, header `COLIV4C3` with payload length and
+  CRC32C, written layer-by-layer through a per-pid temp name and rename. A RAM
+  catalog holds only ids + metadata (4 B/token), so an idle lineage costs no
+  snapshot RAM; GC bounds prompt-end entries (`V4_PREFIX_CKPT_SLOTS`=32) and
+  payload bytes (`V4_PREFIX_CKPT_DISK_GB`=8), and pinned system prefixes have
+  their own cap. A scan at the first request rebuilds the catalog (POSIX and
+  Windows); a torn or checksum-failed entry is dropped and removed, and a
+  lcp-discovered capture is restored by longest exact prefix. `2` also persists
+  prompt-end captures from a cancelled prefill, `0` keeps the in-memory
+  backend. Legacy `ckpt_*` files are logged and left in place;
+  `V4_PREFIX_CKPT_LEGACY_IMPORT=1` imports them once, byte-for-byte, into the
+  new format. The fingerprint covers the config geometry, `sliding_window` and
+  the shard count/size/mtime, so a re-downloaded checkpoint cannot restore
+  stale KV.
 
 ## Performance (RTX 5080 16 GB, 2× NVMe mirror, 32 GB RAM, i9-class CPU)
 
@@ -552,7 +564,9 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 |---|---|
 | `V4_PREFILL_CHUNK` (128) | chunk width, clamp [1,128] |
 | `V4_PREFILL_SEGMENT` (4096) | atomic segment length (cancel/resume granularity, expert re-sweeps) |
-| `V4_PREFIX_CKPT` (1) / `V4_PREFIX_CKPT_MIN` (512) / `V4_PREFIX_CKPT_SLOTS` (4) / `V4_PREFIX_CKPT_DISK` (1) | prefix checkpoints, see above |
+| `V4_PREFIX_CKPT` (1) / `V4_PREFIX_CKPT_MIN` (512) / `V4_PREFIX_CKPT_SLOTS` (4) / `V4_PREFIX_CKPT_DISK` (1) | prefix checkpoints: `_SLOTS` bounds prompt-end entries in the catalog; `_DISK=1` uses the content-addressed disk catalog, `2` also captures at a cancelled-prefill boundary, `0` keeps the in-memory backend |
+| `V4_PREFIX_CKPT_DISK_GB` (8) | payload byte budget of the cold catalog (`0` = unlimited); GC evicts LRU prompt-end entries first, pinned system prefixes have their own cap |
+| `V4_PREFIX_CKPT_LEGACY_IMPORT` (0) | `1` imports legacy `ckpt_<fp>_<n>.bin` files once into the content-addressed catalog (payload byte-preserved), then removes the legacy file; default leaves them untouched |
 | `V4_PREFIX_LOG` | log hint boundary / reuse decisions |
 | `V4_IDX_BATCH` (1) | batched indexer selection in prefill; `0` = legacy per-token |
 | `V4_IDX_IDENTITY` (0) | `1` = skip indexer scoring when every candidate fits under `index_topk` (index order instead of upstream's score order; ~8 % faster prefill, changes rounding) |
@@ -568,7 +582,9 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_EXPERT_UNION` (1) | per-chunk expert union batching on the CPU path |
 | `COLI_V4_DIRECT` (1) | O_DIRECT streaming reads |
 | `COLI_V4_AUTOPIN`, `COLI_V4_SAVE_USAGE` | hot-expert pinning from `.coli_usage` history |
-| `COLI_V4_PREWARM` (unset) | the expert cache filled before the first request: unset, a serve (chat, web) reads every expert its RAM plan holds, or with a smaller cache each layer's most used ones in `.coli_usage`, before it says ready, in parallel with a progress line, and stops short of the RAM the plan keeps for the system; a one-shot run fills it as experts are used. `0` skips it, `1` fills it in every run (#2109) |
+| `COLI_V4_FROZEN_PCT` (0) | frozen MFU section on the expert store: that percent of each layer's slots (capped at `slots_per_layer − 6`, so the decode reserve and the pool borrow stay intact) is victim-exempt and ranked by the decode-only `.coli_mfu` history instead of the merged `.coli_usage` — it rides the pin machinery (exemption, rows16 packing), no new victim selector. `0` is today's exact policy. **Measured negative (2026-10-23, `bench/up2276/s7-*`): the control's decode-only hit rate is already at the fork's 68.5 % (hit_rate_d 68.1) once prefill streams bypass the store; freezing lowers hit_rate_d (68.1 → 62.9) and decode tok/s (−16 % at 42/layer) — the history rank displaces the live decode set. Ship `0`; the keepers are `hit_rate_d` itself and the `.coli_mfu`-seeded prewarm (TTFT −5 s) |
+| `.coli_mfu` / `COLI_DSV4_VK_MFU_DECAY_SHIFT` (0) | the decode-only popularity table beside `.coli_usage`: one count per routed selection of a decode/spec token (prefill never counts; the fork's format, `mfu_table.c`). Saved at store close whenever a decode selection was recorded, knob or no knob (the fork's rule — the file is the next run's prewarm seed and frozen ranking; a run that recorded nothing writes nothing). The shift is its only decay knob: `N>0` halves counts `>>N` at load for A/B, `0` keeps history in full |
+| `COLI_V4_PREWARM` (unset) | the expert cache filled before the first request: unset, a serve (chat, web) reads every expert its RAM plan holds, or with a smaller cache each layer's most used ones in `.coli_usage` — or, for a layer the decode-only `.coli_mfu` history has seen, its mfu-ranked experts — before it says ready, in parallel with a progress line, and stops short of the RAM the plan keeps for the system; a one-shot run fills it as experts are used. `0` skips it, `1` fills it in every run (#2109) |
 
 **Speculative decoding** (off by default): `V4_DRAFT`, `V4_MTP`, `V4_MTP_GB`,
 `V4_MTP_MIN`, `V4_MTP_DRAFT`, `V4_MTP_PARTIAL_KEEP`, `V4_NGRAM` (1),
@@ -600,6 +616,24 @@ Tiny fixture (generated locally, ignored):
 python -m pip install -r tools/requirements-deepseek-v4-tiny.txt
 make deepseek-v4-tiny-check
 ```
+
+Model-scale smoke (the real checkpoint, a ~100-token prompt for 16 tokens; needs
+`make deepseek_v4 VK=1`):
+
+```bash
+make deepseek-v4-smoke MODEL=/path/to/DeepSeek-V4-Flash
+```
+
+One short real-model generation is in the standard gate set for a slice that
+changes a tier or chain default: every unit and tiny gate passed the fmt-15
+packed-scale defect of 2026-10-26 because their geometries cannot reach the
+model's resident path, and one ~2-minute generation caught it
+(`docs/research/AJ-pw-dfix-2026-10-26.md`). The gate checks the exit code, a
+coherent generated text, and the failure lines that defect printed; it skips
+cleanly when the model, the Vulkan device or the build is absent, fails when
+the card has other holders, and leaves the model's expert history as it found
+it. The tier's levers ride the caller's environment: `COLI_VK_TIER_FMT15=0`
+runs the same generation on the f32-scale escape hatch.
 
 Real checkpoint oracle:
 

@@ -1,0 +1,26 @@
+#version 450
+// The decode group's row sum on the device (COLI_VK_TIER_CS_DEVSUM, backend_vulkan.c's
+// coli_vk_xb_sum_arm): the finish-site group's own y rows, each rounded to bf16
+// (nearest even, the host's coli_bf16_round) then added in row order from 0 with
+// plain adds -- exactly the finish site's host merge (deepseek_v4.c's
+// output[i] += coli_bf16_round(dev[k][i]), k ascending), so one row reads back where
+// the host read K. The rows sit at expert-aligned offsets in the batch's y buffer;
+// off[j] is row j's index in floats.
+// Grid: x = ceil(D / 256), y = 1.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Y { float y[]; };
+layout(std430, binding = 1) readonly buffer R { uint off[]; };
+layout(std430, binding = 2) writeonly buffer O { float o[]; };
+layout(push_constant) uniform P { int n, D; } p;
+float bf16(float x) {
+    uint u = floatBitsToUint(x);
+    if ((u & 0x7f800000u) != 0x7f800000u) u += 0x7fffu + ((u >> 16) & 1u);
+    return uintBitsToFloat(u & 0xffff0000u);
+}
+void main() {
+    uint d = gl_GlobalInvocationID.x;
+    if (d >= uint(p.D)) return;
+    float acc = 0.0;
+    for (int j = 0; j < p.n; j++) acc += bf16(y[off[j] + d]);
+    o[d] = acc;
+}

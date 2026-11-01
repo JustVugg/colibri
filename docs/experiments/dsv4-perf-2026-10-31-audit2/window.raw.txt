@@ -1,0 +1,165 @@
+=== AUDIT2 DRIVER START Sat Oct 31 05:42:48 PM AEDT 2026 (pid 143904) — regime: VRAM_MAX_USED_MB=3584 RAM_GB=16 COLI_BENCH_MEMORY_GB=24 — PR=/root/audit-wt/pr-bench/c BASE=/root/audit-wt/base-tests/c ===
+preflight ok Sat Oct 31 05:42:48 PM AEDT 2026: binaries+nm, model, prompt, harness; vram_sysfs=/sys/class/drm/card2/device/mem_info_vram_used vram0=2036568064
+rep 1 shuffled order: uvk legacy defaults oneline
+  gate[uvk-r1]: w1 retry (band=117MiB max=1968MiB avail=31GiB — need band<=64MiB max<=3544 avail>=2GiB)
+  gate[uvk-r1]: GO (band=20MiB max=1942MiB avail=30GiB)
+audit2-uvk-r1: launch 17:45:48 dir=/root/audit-wt/base-tests/c vram0=2035380224 free-g: total 38 used 8 free 25 avail 30 envs: 
+audit2-uvk-r1: done rc=NA 00:00:06; parse:missing /root/audit-wt/base-tests/c/deepseek_v4; mem peak=0.00GiB (VmHWM 0 kB, scope memory.peak 0 B)
+audit2-uvk-r1-r2: launch 17:45:54 dir=/root/audit-wt/base-tests/c vram0=2033283072 free-g: total 38 used 8 free 25 avail 30 envs: 
+audit2-uvk-r1-r2: done rc=NA 00:00:06; parse:missing /root/audit-wt/base-tests/c/deepseek_v4; mem peak=0.00GiB (VmHWM 0 kB, scope memory.peak 0 B)
+audit2-uvk-r1: FAILED (2 attempts; tails in audit2-uvk-r1.log / audit2-uvk-r1-r2.log)
+  gate[legacy-r1]: GO (band=14MiB max=1951MiB avail=30GiB)
+audit2-legacy-r1: launch 17:47:00 dir=/root/audit-wt/pr-bench/c vram0=2034774016 free-g: total 38 used 8 free 25 avail 30 envs: COLI_VK_LEGACY=1
+audit2-legacy-r1: done rc=0 00:05:50; parse:   audit2-legacy-r1  ttft decode wall: 253.953 0.7882 333.877; mem peak=15.80GiB (VmHWM 16569644 kB, scope memory.peak 0 B)
+  tier-boot: [VK] tier deepseek_v4: on, AMD Radeon RX 6900 XT (RADV NAVI21), budget 6.45 GiB = 452 experts of 12.8 MiB (fmt 15 gs 32, down fmt 15 gs 32), device memory, own queue, up to 16 promotions per
+  chain: chain: 43 of 43 layers on the device
+  windowprobe: [VK] memory: the window probe freed 13 GiB; the driver's budget read them back in 181 ms
+  fa: [VK] chain: attention FA refused: legacy (COLI_VK_LEGACY=1) -- mode 0
+  legacy1: [VK] tier: decode-path=fork legacy (COLI_VK_LEGACY=1) -- the slots keep the malloc/import path
+audit2-legacy-r1: GREEN
+  gate[defaults-r1]: GO (band=22MiB max=1526MiB avail=30GiB)
+audit2-defaults-r1: launch 17:53:50 dir=/root/audit-wt/pr-bench/c vram0=1600958464 free-g: total 38 used 8 free 24 avail 30 envs: 
+audit2-defaults-r1: done rc=0 00:05:50; parse:   audit2-defaults-r1  ttft decode wall: 260.897 0.8987 330.998; mem peak=2.42GiB (VmHWM 2532404 kB, scope memory.peak 0 B)
+  tier-boot: [VK] tier deepseek_v4: on, AMD Radeon RX 6900 XT (RADV NAVI21), budget 6.84 GiB = 483 experts of 12.8 MiB (fmt 15 gs 32, down fmt 15 gs 32), device memory, own queue, up to 16 promotions per
+  chain: chain: 43 of 43 layers on the device
+  windowprobe: [VK] memory: the window probe freed 13 GiB; the driver's budget read them back in 181 ms
+  fa: [VK] chain: attention FA engaged: the flash tile takes the dsv4 attention (a thresholded class, never bit-identical to m
+  fork: [VK] tier : decode-path=fork arena=13.39GiB slabs=1075 slab=12.76MiB engaged (registry block=2048MiB cap=17.03GiB)
+  s1gemv: [VK] tier s1gemv: qmatmul_s1_mx armed (down of S=1 rows, parity vs qmatmul exact)
+  cs: [VK] tier deepseek_v4: cs experts armed (1): decode's routed group -- the residents' handles and zero-copy store-slab al
+  grow: Looking[VK] tier deepseek_v4: decode grow armed (headroom): 156.3 MiB free less 512.0 MiB reserve at the probe, the guar
+audit2-defaults-r1: GREEN
+  gate[oneline-r1]: GO (band=19MiB max=1412MiB avail=30GiB)
+audit2-oneline-r1: launch 18:00:40 dir=/root/audit-wt/pr-bench/c vram0=1481351168 free-g: total 38 used 8 free 17 avail 30 envs: COLI_VK_PROFILE=RDNA2 COLI_VK_TIER_HOST_GB=2
+audit2-oneline-r1: done rc=0 00:03:54; parse:   audit2-oneline-r1  ttft decode wall: 149.080 0.8911 219.779; mem peak=2.30GiB (VmHWM 2414472 kB, scope memory.peak 0 B)
+  tier-boot: [VK] tier deepseek_v4: on, AMD Radeon RX 6900 XT (RADV NAVI21), budget 6.97 GiB = 301 experts of 12.8 MiB (fmt 15 gs 32, down fmt 15 gs 32), device memory, own queue, up to 16 promotions per
+  chain: chain: 43 of 43 layers on the device
+  windowprobe: [VK] memory: the window probe freed 13 GiB; the driver's budget read them back in 181 ms
+  fa: [VK] chain: attention FA engaged: the flash tile takes the dsv4 attention (a thresholded class, never bit-identical to m
+  fork: [VK] tier : decode-path=fork arena=13.39GiB slabs=1075 slab=12.76MiB engaged (registry block=2048MiB cap=17.03GiB)
+  s1gemv: [VK] tier s1gemv: qmatmul_s1_mx armed (down of S=1 rows, parity vs qmatmul exact)
+  cs: [VK] tier deepseek_v4: cs experts armed (1): decode's routed group -- the residents' handles and zero-copy store-slab al
+  grow: Looking[VK] tier deepseek_v4: decode grow armed (headroom): 0.0 KiB free less 512.0 MiB reserve at the probe, the guard 
+audit2-oneline-r1: GREEN
+checkpoint: appended INTERIM Rep 1 to /root/audit-wt/bench/interim.md
+rep 2 shuffled order: legacy defaults uvk oneline
+  gate[legacy-r2]: GO (band=0MiB max=1338MiB avail=31GiB)
+audit2-legacy-r2: launch 18:05:34 dir=/root/audit-wt/pr-bench/c vram0=1403035648 free-g: total 38 used 7 free 21 avail 31 envs: COLI_VK_LEGACY=1
+audit2-legacy-r2: done rc=0 00:05:40; parse:   audit2-legacy-r2  ttft decode wall: 252.481 0.8708 324.826; mem peak=15.80GiB (VmHWM 16572404 kB, scope memory.peak 0 B)
+  tier-boot: [VK] tier deepseek_v4: on, AMD Radeon RX 6900 XT (RADV NAVI21), budget 7.04 GiB = 499 experts of 12.8 MiB (fmt 15 gs 32, down fmt 15 gs 32), device memory, own queue, up to 16 promotions per
+  chain: chain: 43 of 43 layers on the device
+  windowprobe: [VK] memory: the window probe freed 13 GiB; the driver's budget read them back in 181 ms
+  fa: [VK] chain: attention FA refused: legacy (COLI_VK_LEGACY=1) -- mode 0
+  legacy1: [VK] tier: decode-path=fork legacy (COLI_VK_LEGACY=1) -- the slots keep the malloc/import path
+audit2-legacy-r2: GREEN
+  gate[defaults-r2]: GO (band=32MiB max=1202MiB avail=31GiB)
+audit2-defaults-r2: launch 18:12:14 dir=/root/audit-wt/pr-bench/c vram0=1227456512 free-g: total 38 used 7 free 18 avail 31 envs: 
+audit2-defaults-r2: done rc=0 00:05:29; parse:   audit2-defaults-r2  ttft decode wall: 245.498 0.9037 315.215; mem peak=2.42GiB (VmHWM 2533780 kB, scope memory.peak 0 B)
+  tier-boot: [VK] tier deepseek_v4: on, AMD Radeon RX 6900 XT (RADV NAVI21), budget 7.20 GiB = 512 experts of 12.8 MiB (fmt 15 gs 32, down fmt 15 gs 32), device memory, own queue, up to 16 promotions per
+  chain: chain: 43 of 43 layers on the device
+  windowprobe: [VK] memory: the window probe freed 13 GiB; the driver's budget read them back in 181 ms
+  fa: [VK] chain: attention FA engaged: the flash tile takes the dsv4 attention (a thresholded class, never bit-identical to m
+  fork: [VK] tier : decode-path=fork arena=13.39GiB slabs=1075 slab=12.76MiB engaged (registry block=2048MiB cap=17.03GiB)
+  s1gemv: [VK] tier s1gemv: qmatmul_s1_mx armed (down of S=1 rows, parity vs qmatmul exact)
+  cs: [VK] tier deepseek_v4: cs experts armed (1): decode's routed group -- the residents' handles and zero-copy store-slab al
+  grow: Looking[VK] tier deepseek_v4: decode grow armed (headroom): 0.0 KiB free less 512.0 MiB reserve at the probe, the guard 
+audit2-defaults-r2: GREEN
+  gate[uvk-r2]: w1 retry (band=242MiB max=1099MiB avail=30GiB — need band<=64MiB max<=3544 avail>=2GiB)
+  gate[uvk-r2]: w2 retry (band=105MiB max=1221MiB avail=29GiB — need band<=64MiB max<=3544 avail>=2GiB)
+  gate[uvk-r2]: GO (band=18MiB max=1255MiB avail=30GiB)
+audit2-uvk-r2: launch 18:22:43 dir=/root/audit-wt/base-tests/c vram0=1316278272 free-g: total 38 used 8 free 18 avail 30 envs: 
+audit2-uvk-r2: done rc=NA 00:00:06; parse:missing /root/audit-wt/base-tests/c/deepseek_v4; mem peak=0.00GiB (VmHWM 0 kB, scope memory.peak 0 B)
+audit2-uvk-r2-r2: launch 18:22:49 dir=/root/audit-wt/base-tests/c vram0=1316290560 free-g: total 38 used 8 free 18 avail 30 envs: 
+audit2-uvk-r2-r2: done rc=NA 00:00:06; parse:missing /root/audit-wt/base-tests/c/deepseek_v4; mem peak=0.00GiB (VmHWM 0 kB, scope memory.peak 0 B)
+audit2-uvk-r2: FAILED (2 attempts; tails in audit2-uvk-r2.log / audit2-uvk-r2-r2.log)
+  gate[oneline-r2]: GO (band=2MiB max=1257MiB avail=30GiB)
+audit2-oneline-r2: launch 18:23:55 dir=/root/audit-wt/pr-bench/c vram0=1318375424 free-g: total 38 used 8 free 18 avail 30 envs: COLI_VK_PROFILE=RDNA2 COLI_VK_TIER_HOST_GB=2
+audit2-oneline-r2: done rc=0 00:04:00; parse:   audit2-oneline-r2  ttft decode wall: 155.972 0.9330 223.494; mem peak=2.24GiB (VmHWM 2350564 kB, scope memory.peak 0 B)
+  tier-boot: [VK] tier deepseek_v4: on, AMD Radeon RX 6900 XT (RADV NAVI21), budget 7.12 GiB = 313 experts of 12.8 MiB (fmt 15 gs 32, down fmt 15 gs 32), device memory, own queue, up to 16 promotions per
+  chain: chain: 43 of 43 layers on the device
+  windowprobe: [VK] memory: the window probe freed 13 GiB; the driver's budget read them back in 181 ms
+  fa: [VK] chain: attention FA engaged: the flash tile takes the dsv4 attention (a thresholded class, never bit-identical to m
+  fork: [VK] tier : decode-path=fork arena=13.39GiB slabs=1075 slab=12.76MiB engaged (registry block=2048MiB cap=17.03GiB)
+  s1gemv: [VK] tier s1gemv: qmatmul_s1_mx armed (down of S=1 rows, parity vs qmatmul exact)
+  cs: [VK] tier deepseek_v4: cs experts armed (1): decode's routed group -- the residents' handles and zero-copy store-slab al
+  grow: Looking[VK] tier deepseek_v4: decode grow armed (headroom): 0.0 KiB free less 512.0 MiB reserve at the probe, the guard 
+audit2-oneline-r2: GREEN
+checkpoint: appended INTERIM Rep 2 to /root/audit-wt/bench/interim.md
+rep 3 shuffled order: oneline defaults legacy
+  gate[oneline-r3]: GO (band=0MiB max=16MiB avail=29GiB)
+audit2-oneline-r3: launch 18:28:55 dir=/root/audit-wt/pr-bench/c vram0=17178624 free-g: total 38 used 9 free 20 avail 29 envs: COLI_VK_PROFILE=RDNA2 COLI_VK_TIER_HOST_GB=2
+audit2-oneline-r3: done rc=0 00:04:10; parse:   audit2-oneline-r3  ttft decode wall: 160.839 0.8740 232.923; mem peak=2.27GiB (VmHWM 2382176 kB, scope memory.peak 0 B)
+  tier-boot: [VK] tier deepseek_v4: on, AMD Radeon RX 6900 XT (RADV NAVI21), budget 8.33 GiB = 410 experts of 12.8 MiB (fmt 15 gs 32, down fmt 15 gs 32), device memory, own queue, up to 16 promotions per
+  chain: chain: 43 of 43 layers on the device
+  windowprobe: [VK] memory: the window probe freed 13 GiB; the driver's budget read them back in 201 ms
+  fa: [VK] chain: attention FA engaged: the flash tile takes the dsv4 attention (a thresholded class, never bit-identical to m
+  fork: [VK] tier : decode-path=fork arena=13.39GiB slabs=1075 slab=12.76MiB engaged (registry block=2048MiB cap=17.03GiB)
+  s1gemv: [VK] tier s1gemv: qmatmul_s1_mx armed (down of S=1 rows, parity vs qmatmul exact)
+  cs: [VK] tier deepseek_v4: cs experts armed (1): decode's routed group -- the residents' handles and zero-copy store-slab al
+  grow: Looking[VK] tier deepseek_v4: decode grow armed (headroom): 0.0 KiB free less 512.0 MiB reserve at the probe, the guard 
+audit2-oneline-r3: GREEN
+  gate[defaults-r3]: GO (band=0MiB max=16MiB avail=28GiB)
+audit2-defaults-r3: launch 18:34:05 dir=/root/audit-wt/pr-bench/c vram0=17178624 free-g: total 38 used 9 free 20 avail 28 envs: 
+audit2-defaults-r3: done rc=0 00:05:39; parse:   audit2-defaults-r3  ttft decode wall: 251.805 0.9193 320.339; mem peak=2.41GiB (VmHWM 2529472 kB, scope memory.peak 0 B)
+  tier-boot: [VK] tier deepseek_v4: on, AMD Radeon RX 6900 XT (RADV NAVI21), budget 8.33 GiB = 602 experts of 12.8 MiB (fmt 15 gs 32, down fmt 15 gs 32), device memory, own queue, up to 16 promotions per
+  chain: chain: 43 of 43 layers on the device
+  windowprobe: [VK] memory: the window probe freed 13 GiB; the driver's budget read them back in 202 ms
+  fa: [VK] chain: attention FA engaged: the flash tile takes the dsv4 attention (a thresholded class, never bit-identical to m
+  fork: [VK] tier : decode-path=fork arena=13.39GiB slabs=1075 slab=12.76MiB engaged (registry block=2048MiB cap=17.03GiB)
+  s1gemv: [VK] tier s1gemv: qmatmul_s1_mx armed (down of S=1 rows, parity vs qmatmul exact)
+  cs: [VK] tier deepseek_v4: cs experts armed (1): decode's routed group -- the residents' handles and zero-copy store-slab al
+  grow: Looking[VK] tier deepseek_v4: decode grow armed (headroom): 0.0 KiB free less 512.0 MiB reserve at the probe, the guard 
+audit2-defaults-r3: GREEN
+  gate[legacy-r3]: GO (band=0MiB max=16MiB avail=28GiB)
+audit2-legacy-r3: launch 18:40:44 dir=/root/audit-wt/pr-bench/c vram0=17178624 free-g: total 38 used 10 free 18 avail 28 envs: COLI_VK_LEGACY=1
+audit2-legacy-r3: done rc=0 00:06:22; parse:   audit2-legacy-r3  ttft decode wall: 261.163 0.6208 362.648; mem peak=15.80GiB (VmHWM 16568560 kB, scope memory.peak 0 B)
+  tier-boot: [VK] tier deepseek_v4: on, AMD Radeon RX 6900 XT (RADV NAVI21), budget 8.33 GiB = 602 experts of 12.8 MiB (fmt 15 gs 32, down fmt 15 gs 32), device memory, own queue, up to 16 promotions per
+  chain: chain: 43 of 43 layers on the device
+  windowprobe: [VK] memory: the window probe freed 13 GiB; the driver's budget read them back in 201 ms
+  fa: [VK] chain: attention FA refused: legacy (COLI_VK_LEGACY=1) -- mode 0
+  legacy1: [VK] tier: decode-path=fork legacy (COLI_VK_LEGACY=1) -- the slots keep the malloc/import path
+audit2-legacy-r3: GREEN
+checkpoint: appended INTERIM Rep 3 to /root/audit-wt/bench/interim.md
+  gate[mm8-r1]: GO (band=0MiB max=16MiB avail=30GiB)
+audit2-mm8-r1: launch 18:48:06 dir=/root/audit-wt/pr-bench/c vram0=17190912 free-g: total 38 used 8 free 17 avail 30 envs: COLI_VK_PROFILE=RDNA2 COLI_VK_TIER_HOST_GB=2 COLI_VK_CHAIN_MM8_NDBUF=2
+audit2-mm8-r1: done rc=0 00:04:05; parse:   audit2-mm8-r1  ttft decode wall: 162.178 0.9570 228.009; mem peak=2.28GiB (VmHWM 2390964 kB, scope memory.peak 0 B)
+  tier-boot: [VK] tier deepseek_v4: on, AMD Radeon RX 6900 XT (RADV NAVI21), budget 8.33 GiB = 410 experts of 12.8 MiB (fmt 15 gs 32, down fmt 15 gs 32), device memory, own queue, up to 16 promotions per
+  chain: chain: 43 of 43 layers on the device
+  windowprobe: [VK] memory: the window probe freed 13 GiB; the driver's budget read them back in 181 ms
+  fa: [VK] chain: attention FA engaged: the flash tile takes the dsv4 attention (a thresholded class, never bit-identical to m
+  fork: [VK] tier : decode-path=fork arena=13.39GiB slabs=1075 slab=12.76MiB engaged (registry block=2048MiB cap=17.03GiB)
+  s1gemv: [VK] tier s1gemv: qmatmul_s1_mx armed (down of S=1 rows, parity vs qmatmul exact)
+  cs: [VK] tier deepseek_v4: cs experts armed (1): decode's routed group -- the residents' handles and zero-copy store-slab al
+  grow: Looking[VK] tier deepseek_v4: decode grow armed (headroom): 0.0 KiB free less 512.0 MiB reserve at the probe, the guard 
+audit2-mm8-r1: GREEN
+checkpoint: appended INTERIM Tail (mm8) to /root/audit-wt/bench/interim.md
+=== AUDIT2 DRIVER COMPLETE Sat Oct 31 06:52:12 PM AEDT 2026 (elapsed 69 min) ===
+=== AUDIT2 DRIVER START Sat Oct 31 06:54:00 PM AEDT 2026 (pid 307087) — regime: VRAM_MAX_USED_MB=3584 RAM_GB=16 COLI_BENCH_MEMORY_GB=24 — PR=/root/audit-wt/pr-bench/c BASE=/root/audit-wt/base-tests/c ===
+preflight ok Sat Oct 31 06:54:00 PM AEDT 2026: binaries+nm, model, prompt, harness; vram_sysfs=/sys/class/drm/card2/device/mem_info_vram_used vram0=17178624
+rep 1 shuffled order: uvk legacy defaults oneline
+  gate[uvk-r1]: GO (band=0MiB max=16MiB avail=30GiB)
+audit2-uvk-r1: launch 18:55:00 dir=/root/audit-wt/base-tests/c vram0=17178624 free-g: total 38 used 8 free 20 avail 30 envs: 
+audit2-uvk-r1: done rc=0 00:09:10; parse:   audit2-uvk-r1  ttft decode wall: 414.880 0.5239 535.135; mem peak=0.00GiB (VmHWM 0 kB, scope memory.peak 0 B)
+  tier-boot: [VK] tier deepseek_v4: on, AMD Radeon RX 6900 XT (RADV NAVI21), budget 13.33 GiB = 842 experts of 15.0 MiB (fmt 7 gs 32, down fmt 7 gs 32), device memory, own queue, up to 16 promotions per 
+  chain: chain: 9 of 43 layers on the device
+audit2-uvk-r1: GREEN
+audit2-legacy-r1: SKIP (already green: GREEN Sat Oct 31 05:52:50 PM AEDT 2026 ::    audit2-legacy-r1  ttft decode wall: 253.953 0.7882 333.877)
+audit2-defaults-r1: SKIP (already green: GREEN Sat Oct 31 05:59:40 PM AEDT 2026 ::    audit2-defaults-r1  ttft decode wall: 260.897 0.8987 330.998)
+audit2-oneline-r1: SKIP (already green: GREEN Sat Oct 31 06:04:34 PM AEDT 2026 ::    audit2-oneline-r1  ttft decode wall: 149.080 0.8911 219.779)
+rep 2 shuffled order: uvk oneline legacy defaults
+  gate[uvk-r2]: w1 retry (band=2395MiB max=2411MiB avail=30GiB — need band<=64MiB max<=3544 avail>=2GiB)
+  gate[uvk-r2]: GO (band=0MiB max=16MiB avail=30GiB)
+audit2-uvk-r2: launch 19:07:10 dir=/root/audit-wt/base-tests/c vram0=17178624 free-g: total 38 used 7 free 19 avail 30 envs: 
+audit2-uvk-r2: done rc=0 00:09:31; parse:   audit2-uvk-r2  ttft decode wall: 434.471 0.5135 557.156; mem peak=0.00GiB (VmHWM 0 kB, scope memory.peak 0 B)
+  tier-boot: [VK] tier deepseek_v4: on, AMD Radeon RX 6900 XT (RADV NAVI21), budget 13.33 GiB = 842 experts of 15.0 MiB (fmt 7 gs 32, down fmt 7 gs 32), device memory, own queue, up to 16 promotions per 
+  chain: chain: 9 of 43 layers on the device
+audit2-uvk-r2: GREEN
+audit2-oneline-r2: SKIP (already green: GREEN Sat Oct 31 06:27:55 PM AEDT 2026 ::    audit2-oneline-r2  ttft decode wall: 155.972 0.9330 223.494)
+audit2-legacy-r2: SKIP (already green: GREEN Sat Oct 31 06:11:14 PM AEDT 2026 ::    audit2-legacy-r2  ttft decode wall: 252.481 0.8708 324.826)
+audit2-defaults-r2: SKIP (already green: GREEN Sat Oct 31 06:17:43 PM AEDT 2026 ::    audit2-defaults-r2  ttft decode wall: 245.498 0.9037 315.215)
+rep 3 shuffled order: defaults oneline legacy
+audit2-defaults-r3: SKIP (already green: GREEN Sat Oct 31 06:39:44 PM AEDT 2026 ::    audit2-defaults-r3  ttft decode wall: 251.805 0.9193 320.339)
+audit2-oneline-r3: SKIP (already green: GREEN Sat Oct 31 06:33:05 PM AEDT 2026 ::    audit2-oneline-r3  ttft decode wall: 160.839 0.8740 232.923)
+audit2-legacy-r3: SKIP (already green: GREEN Sat Oct 31 06:47:06 PM AEDT 2026 ::    audit2-legacy-r3  ttft decode wall: 261.163 0.6208 362.648)
+audit2-mm8-r1: SKIP (already green: GREEN Sat Oct 31 06:52:11 PM AEDT 2026 ::    audit2-mm8-r1  ttft decode wall: 162.178 0.9570 228.009)
+=== AUDIT2 DRIVER COMPLETE Sat Oct 31 07:16:41 PM AEDT 2026 (elapsed 22 min) ===

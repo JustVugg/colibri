@@ -116,6 +116,27 @@
  *        likely stream while the device works.
  *    COLI_VK_TIER_STREAM=0 turns it off: the tier behaves as without the hooks.
  *
+ *    COLI_VK_TIER_STREAM_RING=1 (with .ring_batch given; default off = the inline
+ *    prefetch above, unchanged) moves the fills onto a worker thread, the fork's ring
+ *    discipline: the prefetch call for layer L joins the ring's job for L (the take) and
+ *    hands the worker the NEXT layer's predicted set (T.pred, the last big step's rows
+ *    per expert at that layer -- where no prediction exists yet, a cold start, nothing
+ *    is handed over and the engine fills inline as before); the worker reads the experts
+ *    through .ring_batch and uploads them into its half of the streaming slots while the
+ *    engine computes layer L, the step joins nothing it does not need, and every miss
+ *    (an unpredicted expert, a refused read, a failed worker) takes the inline fill at
+ *    the step. COLI_VK_TIER_STREAM_SYNC=1's deterministic drain includes the ring: every
+ *    quiescent point joins the worker too, so what is in the slots at a step depends on
+ *    the routing alone, never on thread timing.
+ *
+ *    COLI_VK_TIER_STREAM_RING_COLD=1 (needs the ring; default off = the pred-gated rule
+ *    above stands) is the fork's literal cold shape for the cold branch: a next layer
+ *    with no prediction behind it -- the prompt's first chunk, the layer's first visit --
+ *    is planned whole instead of handed to the inline fill, so the job covers the next
+ *    layer's whole non-resident set ahead (the same in-RAM exclusion, the same st_per
+ *    cap; the below-rule filter drops, for there is no prediction to scale at the coming
+ *    step's S). Where a prediction exists the plan is the prediction's, unchanged.
+ *
  * Source kinds (VktSrc) and what the device holds -- the conversion runs on the
  * uploader thread, nothing changes in the engine's RAM:
  *   VKT_SRC_I8_ROW        int8, f32 per row                      -> fmt 1
@@ -129,7 +150,9 @@
  *   VKT_SRC_I4U_PLANAR64  expert_ffn.h planar blocks of 64, v+8, f32 per 64 -> fmt 4 gs 64
  *   VKT_SRC_I3_G64        int3-g64 planes                        -> fmt 5
  *   VKT_SRC_MXFP4_F32     e2m1 pairs, f32 per gs                 -> fmt 7
- *   VKT_SRC_MXFP4_E8M0    e2m1 pairs, ue8m0 byte per gs          -> fmt 7 (kimi_k3, mimo, deepseek_v41)
+ *   VKT_SRC_MXFP4_E8M0    e2m1 pairs, ue8m0 byte per gs          -> fmt 15, the bytes packed
+ *                         as the store holds them (kimi_k3, mimo, deepseek_v4/_v41; fmt 7
+ *                         on the CUDA tier, whose ops table has no fmt 15 yet)
  *   VKT_SRC_FP8_GS        e4m3, f32 per (row, gs)                -> fmt 12
  *   VKT_SRC_FP8_BLOCK     e4m3, f32 per gs x gs block            -> fmt 12 (qwen38 native)
  *   VKT_SRC_BF16, VKT_SRC_F32                                    -> fmt 11, 10
@@ -153,6 +176,7 @@
 #define COLI_VK_TIER_H
 #include <stdint.h>
 #include <stddef.h>
+#include "vk_policy.h"   /* the default-on levers' env resolution (the engine's store unit reads it through this header) */
 
 typedef enum {
     VKT_SRC_NONE = 0,
@@ -176,6 +200,23 @@ typedef struct {
     const void *g, *u, *d;
     const void *gs, *us, *ds;
 } VktExpertSrc;
+
+/* One aliased selection for the compute-site group (COLI_VK_TIER_EXPERTS, CS-1b): the
+ * store slot's own slab (imported whole, refcounted by pointer: one
+ * VK_EXT_external_memory_host import serves every record it holds) and the three
+ * matrices' records in it -- code and scale byte offsets, input and output widths,
+ * the format (15 the MXFP4 codes with packed ue8m0 scales, 7 their f32-scale twin)
+ * and its group size. The engine fills it at the token's finish site from the view
+ * the loader just read; rows are the native layout (a rows16-packed or foreign-layout
+ * view never reaches the tier -- the engine refuses it and that expert computes on
+ * the CPU, the refusal ladder). */
+typedef struct {
+    const void *slab;
+    size_t bytes;
+    size_t woff[3], soff[3];   /* gate, up, down */
+    int I[3], O[3];
+    int fmt, gs;
+} VktAliasSrc;
 
 typedef struct {
     const char *engine;            /* names the [VK] tier lines */
@@ -201,6 +242,12 @@ typedef struct {
     size_t dense_bytes;            /* dense weights the engine puts on the device after vkt_init */
     size_t chain_bytes;            /* what the dense chain allocates at its first forward, after the
                                       tier has filled the device (its KV mirror, a prompt chunk): left free */
+    /* The engine's RAM plan, when it keeps one (0 = it keeps none, today's behaviour):
+     * ram_budget is what it resolved (--memory-gb / RAM_GB / MemAvailable), ram_spare
+     * what that plan leaves unclaimed -- the most the tier's host pool may take. */
+    int    ram_planned;
+    size_t ram_budget;
+    size_t ram_spare;
     /* Optional: is this expert in the engine's RAM cache right now? With it the tier
      * balances a step: when the device keeps the CPU waiting, resident experts the
      * CPU also holds in RAM go back to the CPU (never ones it would read from disk),
@@ -223,6 +270,14 @@ typedef struct {
      * the first ones in order. A partial batch is consumed and released before the
      * next batch; 0 falls back to load for the next expert. */
     int  (*load_batch)(void *ctx, int layer, const int *eids, int n, VktExpertSrc *srcs, void **h);
+    /* Optional, with load: the stream ring's own reader (COLI_VK_TIER_STREAM_RING), the
+     * group shape of load_batch called on the ring's worker thread instead of the
+     * engine thread -- straight from the engine's store, off its leases and caches, so
+     * it must take no lock the engine's own loads take (a bypass/pread reader). Only a
+     * leading prefix need be filled (the first ones in order), released by release(ctx,
+     * h) on the same thread; an expert it does not fill stays to the engine's inline
+     * fill at the step. Without it the ring never arms. */
+    int  (*ring_batch)(void *ctx, int layer, const int *eids, int n, VktExpertSrc *srcs, void **h);
     /* Optional: layers past `layers` (an MTP head's) whose experts the engine holds in another
      * form (extra_gate_up, extra_down), with the same geometry: index them layers..
      * layers+extra_layers-1 in every call. They never stream (an MTP head's steps are a few
@@ -240,6 +295,12 @@ typedef struct {
      * at most VKT_FORMS - 1 distinct pairs, gate_up/down among them or not; NULL = every
      * layer gate_up/down. The arrays are read during vkt_init only. */
     const VktFmt *layer_gate_up, *layer_down;
+    /* Optional, COLI_VK_TIER_DECODE_GROW: the engine's decode-only routing counts,
+     * [layers][experts] like `heat` (the .coli_mfu class -- prefill never counts there),
+     * the rank that decides which experts the tier's decode-time growth installs as
+     * decode runs. NULL = no such table and the growth never arms. Read during vkt_init
+     * only (the tier keeps its own copy). */
+    uint32_t *const *decode_heat;
     /* Optional: 1 = the dense chain copies a prompt chunk's host pool experts into the
      * device's memory a layer at a time (vk_dmoe.h): when the host pool will hold experts,
      * room for a layer's share of them comes out of the budget (vkt_stage_room). */
@@ -258,6 +319,10 @@ int  vkt_wanted(void);
 /* 1 = the tier is on. heat: [layers][experts] routing counts, or NULL. */
 int  vkt_init(const VktConfig *cfg, uint32_t *const *heat);
 int  vkt_ready(void);
+/* 1 = the compute site's arm (COLI_VK_TIER_EXPERTS) is on and this tier serves it:
+ * the engine wires its finish-site group seam only then, so an unarmed run keeps
+ * today's issue/join path whole. */
+int  vkt_cs_armed(void);
 void vkt_shutdown(void);
 int  vkt_plan(int *layers, int *eids, int max);
 /* The warm start's line ("[VK] tier <engine>: warm start, N experts in Xs (...)"): what
@@ -275,12 +340,30 @@ int  vkt_issue_w(int layer, const float *x, int S, int K, const int *idx, const 
  * whose RAM form must be converted before vkt_note can read it, so it converts only
  * the experts the tier will take. No side effects. */
 int  vkt_wants(int layer, int eid);
+/* COLI_VK_TIER_EXPERTS (CS-1b): the compute site at the token's finish. After a
+ * vkt_issue that deferred the step (every valid selection marked taken, nothing
+ * submitted), builds ONE expert-batch group -- the residents' cached handles beside
+ * aliased store slabs (VktAliasSrc) -- and submits it on the tier's xb queue, outside
+ * the chain's frame ring. On return taken[i] names the sites (1 the device computed
+ * it); a selection whose alias or the batch itself refused keeps taken 0 and computes
+ * on the CPU -- degrade, never drop. 0: nothing flew, every selection the CPU's. */
+int  vkt_issue_group(int layer, const float *x, int S, int K, const int *idx, const float *w,
+                     const VktAliasSrc *src, uint8_t *taken);
 int  vkt_join(const float **rows);
+/* vkt_join; for a CS group that carried the device-sum tail (COLI_VK_TIER_CS_DEVSUM),
+ * *sum = its ONE merged row (each row bf16 rounded, added in rank order -- the finish
+ * site's host merge, bit-for-bit) beside the rows, which stay valid; *sum = NULL on
+ * every other join. */
+int  vkt_join_merged(const float **rows, const float **sum);
 /* vkt_join; for a big step that ran wholly on the device, *sum = its S routed rows (the
  * rank-order sum of w[s*K+k] * expert(s, k) as an fma chain from 0, the engines' loop),
  * summed on the device; else *sum = NULL. w as vkt_issue_w's (NULL = 1). */
 int vkt_join_sum(const float **rows, const float *w, const float **sum);
 int  vkt_resident(int layer, int eid);
+/* The CS defer's own taken rule, read-only: would a decode issue mark (layer, eid)
+ * taken with no read (a resident's cached ColiVkExpert handle)? The pilot
+ * (COLI_VK_TIER_PILOT) skips those -- a warm read of one is pure disk traffic. */
+int  vkt_cs_served(int layer, int eid);
 /* The next vkt_issue starts a forward (promotion rate, decay, eviction candidates).
  * Optional: the tier tells forwards apart by the layer index going back, which a model
  * with a single MoE layer never does; such an engine calls this at its first MoE layer. */
@@ -336,13 +419,50 @@ unsigned vkt_epoch(void);
 int  vkt_dev_table(int layer, uint32_t *entries);
 void vkt_dev_count(int layer, int S, int K, const int *idx);
 void vkt_settle(void);
+/* The store's slot-free path (an expert store's destroy, deepseek_v4.c) hands each
+ * slab here before its pages are freed: the CS alias cache's keepalive holds on that
+ * address drop and the backend's import dedup goes blind to it, so a later allocation
+ * at the SAME address -- which the geometry key alone cannot tell apart -- misses and
+ * imports the new pages fresh (the VA-reuse hazard's guard). Cheap and a no-op when
+ * the cache holds nothing for the address. */
+void vkt_slab_forget(const void *slab);
+/* The forked decode path (COLI_VK_V4_DECODE_PATH=fork, gap-wave3): the expert store's
+ * slot slabs route through the backend's persistent slab registry (arena blocks of
+ * mapped HOST_COHERENT system RAM, one STORAGE VkBuffer a slot) so the CS alias is a
+ * calloc against the registry, not a per-token host-page import. vkt_forkdec_wanted
+ * reads the arm (COLI_VK_V4_DECODE_PATH=fork AND COLI_VK_TIER_EXPERTS=1/2 -- the
+ * compute site is the alias's consumer; anything else: one stderr line, ignored).
+ * vkt_slabreg_slot is the alloc (0: this slot keeps the malloc/import path, the
+ * ladder), vkt_slabreg_slot_free the destroy-time return (after vkt_slab_forget),
+ * vkt_forkdec_store_line the store's one engagement line (planned slots and slab
+ * bytes, the registry's own cap line said the rest). */
+int  vkt_forkdec_wanted(void);
+int  vkt_slabreg_slot(size_t bytes, void **host, void **reg);
+void vkt_slabreg_slot_free(void *reg, void *host);
+void vkt_forkdec_store_line(int slots, size_t slab_bytes);
 int  vkt_dev_changes(unsigned since, int *slots, int max);
+/* The VRAM bank's refill (COLI_VK_TIER_BANK_LAYER, vk_tier.c "the VRAM bank"): at the
+ * banked layer's routed step, post-router and pre-issue -- the engine's tier seam --
+ * with idx the step's routed expert ids (rank order, -1 a free slot, any count). The
+ * missing set -- routed, not valid yet, not tried this tenure -- loads through
+ * VktConfig.load_batch (the bypass group reader where the engine armed it) and uploads
+ * sequential into the bank's places, each expert at most once a tenure; a failure is
+ * never re-read until the layer switches, the CPU serves it. A step of another layer is
+ * not the bank's: the env's layer holds the places for the run.
+ * vkt_bank_switch moves them to another layer (the fork's switch discipline: the bitmap
+ * clears, the old layer's device copies free at a quiescent point, the new layer's
+ * places queue) -- the rotation seam S3's layer-outer loop drives; no engine calls it
+ * in S1. No-op without the tier or the bank (the default): nothing arms, nothing
+ * changes. */
+void vkt_bank_fill(int layer, const int *idx, int n);
+void vkt_bank_switch(int layer);
 /* The dense chain's hybrid steps (vk_dmoe.h): an expert of the host pool the CPU can
  * compute in place (a GGUF block type: its rows as the file has them, in system RAM) gets
  * a zero entry, so the device skips it, and its rows in hx[e]; every other expert's entry
  * as vkt_dev_table gives it, its hx[e] zero. The count is vkt_dev_table's. */
 /* tg, td: a ggml type (>= 0) or -fmt, colibri's int8 and int4 device formats (fmt 1, 13, 2, 4)
- * with their f32 scales sg/su/sd (a row's, or a group's of gsgu/gsd columns); rgu, rd: bytes a row */
+ * with their scales sg/su/sd -- f32 (a row's, or a group's of gsgu/gsd columns), fmt 15's the
+ * packed ue8m0 bytes, one a group (host_scale_row strides the two apart); rgu, rd: bytes a row */
 typedef struct { const uint8_t *g, *u, *d; int tg, td; size_t rgu, rd; const float *sg, *su, *sd; int gsgu, gsd; } VktHostExpert;
 int  vkt_dev_table_hybrid(int layer, uint32_t *entries, VktHostExpert *hx);
 int  vkt_dev_entry(int layer, int eid, uint32_t *ent, uint32_t *ent_hybrid, VktHostExpert *hx, uint8_t *host);
@@ -376,6 +496,10 @@ int  vkt_dev_host(int layer, uint8_t *host);
 /* score[e]: the tier's rank of layer `layer`'s expert e (its heat and recency: the order it
  * keeps experts in, the higher the hotter); returns 0, -1 when off */
 int  vkt_score(int layer, uint64_t *score);
+/* The host pool's room in bytes: with the engine's RAM plan, what it leaves unclaimed
+ * (never above the budget itself); without one, what is available less the engine's
+ * cache growth (hold) and 4 GiB. Pure arithmetic, for tests; never above avail. */
+size_t vkt_host_room(size_t avail, size_t budget, size_t spare, int planned, size_t hold);
 /* Device memory back to the engine (a dense chain's KV mirror growing with the context): at
  * least `bytes` of the tier's pool on the primary device emptied and released, the coldest
  * blocks first, their residents back to their host pool copies (the CPU computes them) or
@@ -387,8 +511,11 @@ static inline int vkt_host_pool_on(void){return 0;}
 static inline size_t vkt_stage_room(void){return 0;}
 static inline int vkt_dev_host(int l,uint8_t *h){(void)l;(void)h;return -1;}
 static inline int vkt_score(int l,uint64_t *s){(void)l;(void)s;return -1;}
+static inline size_t vkt_host_room(size_t avail, size_t budget, size_t spare, int planned, size_t hold){
+    (void)avail;(void)budget;(void)spare;(void)planned;(void)hold;return 0;}
 static inline size_t vkt_give_back(size_t b){(void)b;return 0;}
-typedef struct { const uint8_t *g, *u, *d; int tg, td; size_t rgu, rd; const float *sg, *su, *sd; int gsgu, gsd; } VktHostExpert;
+
+typedef struct { const uint8_t *g, *u, *d; int tg, td; size_t rgu, rd; const float *sg, *su, *sd; int gsgu, gsd; } VktHostExpert;   /* rgu, rd: bytes a row; sg/su/sd: f32 scales, fmt 15's ue8m0 bytes */
 static inline int vkt_dev_table_hybrid(int l,uint32_t *e,VktHostExpert *h){(void)l;(void)e;(void)h;return -1;}
 static inline int vkt_dev_entry(int l,int e,uint32_t *t,uint32_t *th,VktHostExpert *h,uint8_t *o){(void)l;(void)e;(void)t;(void)th;(void)h;(void)o;return -1;}
 static inline int vkt_host_pairs(const VktHostExpert *const *h,const float *const *x,int n,int D,int I,float l,int t,float *g,float *u,float *o){(void)h;(void)x;(void)n;(void)D;(void)I;(void)l;(void)t;(void)g;(void)u;(void)o;return 0;}
@@ -406,8 +533,10 @@ static inline int  vkt_issue(int l,const float *x,int S,int K,const int *i,uint8
 static inline int  vkt_issue_w(int l,const float *x,int S,int K,const int *i,const float *w,uint8_t *t){(void)l;(void)x;(void)S;(void)K;(void)i;(void)w;(void)t;return 0;}
 static inline int  vkt_wants(int l,int e){(void)l;(void)e;return 0;}
 static inline int  vkt_join(const float **r){(void)r;return 0;}
+static inline int  vkt_join_merged(const float **r, const float **s){(void)r;*s=0;return 0;}
 static inline int  vkt_join_sum(const float **r, const float *w, const float **s){(void)r;(void)w;*s=0;return 0;}
 static inline int  vkt_resident(int l,int e){(void)l;(void)e;return 0;}
+static inline int  vkt_cs_served(int l,int e){(void)l;(void)e;return 0;}
 static inline void vkt_begin_forward(void){}
 static inline void vkt_report(const char *s,unsigned long long r,unsigned long long d){(void)s;(void)r;(void)d;}
 static inline size_t vkt_expert_bytes(int h,int i,VktFmt a,VktFmt b){(void)h;(void)i;(void)a;(void)b;return 0;}
@@ -421,6 +550,13 @@ static inline unsigned vkt_epoch(void){return 0;}
 static inline int  vkt_dev_table(int l,uint32_t *e){(void)l;(void)e;return -1;}
 static inline void vkt_dev_count(int l,int S,int K,const int *i){(void)l;(void)S;(void)K;(void)i;}
 static inline void vkt_settle(void){}
+static inline void vkt_slab_forget(const void *s){(void)s;}
+static inline int  vkt_forkdec_wanted(void){return 0;}
+static inline int  vkt_slabreg_slot(size_t b, void **h, void **r){(void)b;(void)h;(void)r;return 0;}
+static inline void vkt_slabreg_slot_free(void *r, void *h){(void)r;(void)h;}
+static inline void vkt_forkdec_store_line(int s, size_t b){(void)s;(void)b;}
+static inline void vkt_bank_fill(int l,const int *i,int n){(void)l;(void)i;(void)n;}
+static inline void vkt_bank_switch(int l){(void)l;}
 #endif
 
 #endif

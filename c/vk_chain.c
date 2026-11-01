@@ -60,11 +60,11 @@ static const char *const pipe_file[P_NPIPE] = {
 /* COLI_VK_CHAIN_PROF=1: device time per kind of op (timestamps after every op; ops
  * that run side by side between two barriers share the time unevenly) */
 enum { PK_GEMV8, PK_GEMV, PK_GEMM, PK_NORM, PK_ROPE, PK_ATTN, PK_DNCONV, PK_DNREC, PK_EW, PK_QSA, PK_PLE, PK_COPY,
-       PK_MLA, PK_MLAW, PK_DSA, PK_KDA, PK_MHC, PK_ARES, PK_ROUTE, PK_MOE, PK_WAIT, PK_N };
+       PK_MLA, PK_MLAW, PK_DSA, PK_KDA, PK_MHC, PK_ARES, PK_ROUTE, PK_MOE, PK_MM8, PK_WAIT, PK_N };
 static const char *const pk_name[PK_N] = {"GEMV int8", "GEMV other", "tiled GEMM", "norm", "rope", "attention",
                                           "dn conv", "dn recurrence", "element-wise", "qsa", "ple", "copy",
                                           "mla", "mla weights", "dsa", "kda", "mhc", "attnres", "route", "experts",
-                                          "waiting for the host"};
+                                          "mm8 GEMM", "waiting for the host"};
 /* the MLA, KDA, mHC and AttnRes pipelines: optional (an engine without such layers
  * needs none of them, and a missing one turns off only its own ops) */
 enum { PM_MLA, PM_HGEMV, PM_DSA, PM_KDA, PM_MHC, PM_ARES, PM_ROUTE, PM_N };
@@ -97,6 +97,7 @@ typedef struct {
     uint64_t wait_h, sig_g;           /* hybrid steps: the host's value this frame waits for, the value it signals */
     VkQueryPool qp; int nq; unsigned char kind[VKC_PROF_Q];   /* COLI_VK_CHAIN_PROF: a timestamp after each op */
     uint32_t shape[VKC_PROF_Q];   /* COLI_VK_CHAIN_PROF=2: a matmul's (fmt, O, I) slot in prof_sh, else 0 */
+    int dec, prm; unsigned char role;   /* COLI_VK_CHAIN_DPROF: submitted inside the decode/prompt window, under vkc_role's role */
 } VkcFrame;
 
 typedef struct {
@@ -137,6 +138,7 @@ typedef struct {
     VkShaderModule mod_bdgw; VkPipeline bdgw[64]; uint8_t bdgw_tried[64];             /* qmatmul_gemm_bdcw.comp: its 128 tile */
     VkShaderModule mod_grpq[2]; VkPipeline grpq[2]; uint8_t grpq_tried[2];      /* our formats' (1, 2, 4) in floats: qmatmul_grp_q.comp */
     VkShaderModule mod_grpqc[2]; VkPipeline grpqc[2]; uint8_t grpqc_tried[2];   /* and on the matrix units: qmatmul_grp_qc.comp */
+    VkShaderModule mod_mx[2]; VkPipeline mx[2]; uint8_t mx_tried[2];             /* fmt 7's (both matrices, in floats): qmatmul_grp_mx.comp */
     int rows_tried;
     int discrete;                     /* a discrete card: vkc_prewarm's default */
     int gv2_all;                      /* chain_gemv2 for every int8 decode matrix it takes (COLI_VK_CHAIN_GEMV2=1, or not NVIDIA) */
@@ -150,11 +152,19 @@ typedef struct {
     VkPipeline gemv4x;                /* chain_gemv.comp with x read from its buffer (a row past the staging) */
     VkPipeline gemv4n, gemv4xn;       /* the same taking up to 4 rows of x a workgroup (a verify's), NR 4 */
     VkShaderModule mod_adec; VkPipeline adec; int adec_tried; VkcBuf *adec_x;   /* chain_attn_dec.comp and its scratch */
+    VkcBuf *fa16;                    /* chain_dsv4_fa's f16 mirror scratch (COLI_VK_CHAIN_ATTN_FA) */
     VkPipeline adg[VKC_ADG_MAX]; int adg_hd[VKC_ADG_MAX], adg_gq[VKC_ADG_MAX], adg_kv[VKC_ADG_MAX], nadg;   /* its grouped mode's */
     VkPipeline attn_h, adec_h; int attn_h_tried, adec_h_tried;   /* chain_attn and chain_attn_dec over a float16 cache (KV16) */
     VkShaderModule mod_mdec; VkPipeline mdec; int mdec_tried;   /* chain_mla_dec.comp (the same scratch) */
     /* chain_gemm.comp: int8/int4 prompt GEMMs, x rounded to f16 once (COLI_VK_CHAIN_GEMM) */
     VkShaderModule mod_tg; VkPipeline tg;
+    /* qmatmul_mm8.comp: the tiled weight-stationary GEMM for fmt 12, one pipeline per
+     * tile set, made on first use (vk_chain.c's mm8 arm, COLI_VK_MM8); its split-K
+     * reduce (qmatmul_mm8_reduce.comp, COLI_VK_MM8_SPLITK) shares this layout (2 of
+     * the 8 binding slots, an 8-byte push constant) */
+#define VKC_MM8_VAR 9
+    VkShaderModule mod_mm8; VkPipeline mm8[VKC_MM8_VAR]; uint8_t mm8_tried[VKC_MM8_VAR];
+    VkShaderModule mod_mm8red; VkPipeline mm8red; uint8_t mm8red_tried;
     VkShaderModule mmod[PM_N]; VkPipeline mpipe[PM_N]; int mla_ok;   /* chain_mla, chain_hgemv, chain_dsa */
     /* chain_attn_flash.comp: the attention core on the matrix units for prompt chunks,
      * one pipeline per (head dim, query heads per kv head) */
@@ -176,6 +186,9 @@ typedef struct {
     VkcStats st;
     int prof, kind; float ts_period; uint32_t ts_mask;
     double prof_ms[PK_N]; unsigned long long prof_n[PK_N];
+    int dwin, pwin, drole;                    /* COLI_VK_CHAIN_DPROF: the open window (decode / prompt chunk), the role frames submit under;
+                                               each window charges its wall to the role stamped when it ran (role_t0, vkc_dwin) */
+    double role_t0, pwin_t0, dwin_t0;
     /* COLI_VK_CHAIN_PROF=2: the matmuls' time by (fmt, rows of x, O, I), the slots' keys */
     int prof_shapes; uint64_t prof_key[64]; double prof_sh_ms[64]; unsigned long long prof_sh_n[64];
 } VkcCtx;
@@ -471,6 +484,8 @@ static int coop_on(const char *env) {
 }
 
 static void dsv4_init(void);       /* chain_dsv4.comp (DeepSeek V4.1 / V4), below */
+static void dsv4_fa_shutdown(void);  /* chain_dsv4_fa.comp (COLI_VK_CHAIN_ATTN_FA), below */
+static void mhcd_shutdown(void);   /* chain_mhc_dec.comp (COLI_VK_CHAIN_MHC_S1), below */
 static void dsv4_shutdown(void);
 static void kvs_shutdown(void);    /* chain_kvs.comp (the split KV cache), below */
 /* The compute shared memory a workgroup may declare: the device's
@@ -766,7 +781,10 @@ static int frame_wait(VkcFrame *f) {
     for (long spin = chain_spin_us(); spin > 0 && r == VK_NOT_READY && (vkc_now_ms() - t0) * 1000.0 < spin; )
         r = vkGetFenceStatus(KC.dev, f->fence);
     if (r == VK_NOT_READY) r = vkWaitForFences(KC.dev, 1, &f->fence, VK_TRUE, KC.fence_ns);
-    KC.st.wait_ms += vkc_now_ms() - t0; KC.st.waits++;
+    double w = vkc_now_ms() - t0;
+    KC.st.wait_ms += w; KC.st.waits++;
+    if (f->dec) { KC.st.d_wait_ms[f->role] += w; KC.st.d_wait_n++; }   /* DPROF: the frame was submitted in the window */
+    if (f->prm) { KC.st.p_wait_ms[f->role] += w; KC.st.p_wait_n++; }
     f->inflight = 0;
     if (r != VK_SUCCESS) { lose("fence wait", r); return 0; }
     if (KC.prof && f->qp && f->nq > 1) {
@@ -777,6 +795,8 @@ static int frame_wait(VkcFrame *f) {
                 uint64_t d = (ts[i] - ts[i - 1]) & (KC.ts_mask == 0xffffffffu ? ~0ull : (uint64_t)KC.ts_mask);
                 KC.prof_ms[f->kind[i]] += (double)d * KC.ts_period / 1e6; KC.prof_n[f->kind[i]]++;
                 if (f->shape[i]) { KC.prof_sh_ms[f->shape[i] - 1] += (double)d * KC.ts_period / 1e6; KC.prof_sh_n[f->shape[i] - 1]++; }
+                if (f->dec) KC.st.d_dev_ms[f->role] += (double)d * KC.ts_period / 1e6;
+                if (f->prm) KC.st.p_dev_ms[f->role] += (double)d * KC.ts_period / 1e6;
             }
         f->nq = 0;
     }
@@ -875,7 +895,16 @@ int vkc_submit(int wait) {
         if (f->sig_g) { tsi.signalSemaphoreValueCount = 1; tsi.pSignalSemaphoreValues = &f->sig_g;
                         si.signalSemaphoreCount = 1; si.pSignalSemaphores = &KC.tsem_g; }
     }
+    /* DPROF: the frame is stamped at its submission -- the engine sets the role around the
+     * record site that closes it (a begin's stamp would name the previous site: the tail's
+     * frame is opened after the last layer's MoE, a dmoe layer's after the one before) */
+    f->dec = KC.dwin != 0;
+    f->prm = KC.pwin != 0;
+    f->role = (unsigned char)(KC.drole >= 0 && KC.drole < VKC_R_N ? KC.drole : VKC_R_OTHER);
+    double t0 = (f->dec || f->prm) ? vkc_now_ms() : 0.0;
     VkResult r = (VkResult)coli_vk_queue_submit_dev(g_kd, KC.queue, &si, f->fence);   /* the backend's lock, staged uploads */
+    if (f->dec) { KC.st.d_submit_ms += vkc_now_ms() - t0; KC.st.d_frames++; }
+    if (f->prm) { KC.st.p_submit_ms += vkc_now_ms() - t0; KC.st.p_frames++; }
     if (r != VK_SUCCESS) { lose("queue submit", r); return 0; }
     f->inflight = 1;
     KC.st.frames++;
@@ -1460,13 +1489,252 @@ static int matmul_bd(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcBuf *y
     KC.st.matmuls += ok;
     return ok;
 }
+
+/* ---- mm8: the tiled weight-stationary GEMM for fmt 12 (qmatmul_mm8.comp) -------------
+ * The dense chain's fp8 matrices (e4m3 weights, one f32 scale a row a 128-input group)
+ * have no tiled path on a device without cooperative matrices: every prompt chunk's
+ * rows fall to qmatmul.spv's GEMV, a workgroup a row. mm8 tiles them weight-stationary
+ * (the fork's issue #46 kernel; the scale staging reads this tree's per-row per-group
+ * layout, qmatmul_mm8.comp's note). The default since the self-tuning defaults: an
+ * unset env is `-1`, the backend's own fill rule -- a prompt chunk's eligible rows
+ * tile, and a verify's rows and every decode step keep the GEMV's bits, so the
+ * pre-flip byte-for-byte standing survives everywhere but the prompt itself. `1` takes
+ * it for every eligible matmul (fmt 12, S >= 2, I a multiple of 64), a speculative
+ * verify's rows too, the documented reassociation-class break of the rows policy;
+ * `0` keeps every matmul on the GEMV byte-for-byte (the per-lever hatch), and
+ * COLI_VK_LEGACY=1 turns an unset env back to `0`. The fill rule is the tiled GEMM's
+ * own `-1` (gemm_min_s) as that policy gates it: a per-call vkc_gemm_rows pin (a
+ * verify's 0) keeps the rows on the GEMV.
+ * A refusal anywhere (no pipeline, an unaligned I) leaves the matmul on the paths
+ * below. */
+typedef struct { int blk, bm, bn, bk, wm, wn, wmiter, tm, tn, tk, warp; const char *name; } VkcMm8Tile;
+enum { MM8_F, MM8_M, MM8_S, MM8_M16, MM8_F64, MM8_FTM4, MM8_FTN4, MM8_MWM4, MM8_MBN128 };
+/* the fork's sweep set (an RX 6900 XT, GMAC/s at S=128): the frozen F tile won five
+ * of the six real projection shapes; m16 measured ~+18% on the wq_b class (large O,
+ * small K). The small S tile did not help -- the k-split covers small-O starvation */
+static const VkcMm8Tile vkc_mm8_tile[VKC_MM8_VAR] = {
+    /* F   frozen        128t 32x64 BK32 */ {128, 32, 64, 32, 32, 32, 2, 2, 2, 1, 64, "f"},
+    /* M   golden medium 128t 64x64 BK32 */ {128, 64, 64, 32, 64, 32, 2, 4, 2, 1, 64, "m"},
+    /* S   golden small   64t 32x32 BK32 */ { 64, 32, 32, 32, 32, 32, 2, 2, 2, 1, 64, "s"},
+    /* M16 medium BK16 (the wq_b class)   */ {128, 64, 64, 16, 64, 32, 2, 4, 2, 1, 64, "m16"},
+    /* F64 the F tile with BK=64           */ {128, 32, 64, 64, 32, 32, 2, 2, 2, 1, 64, "f64"},
+    /* FTM4 the F tile with TM=4           */ {128, 32, 64, 32, 32, 32, 2, 4, 2, 1, 64, "ftm4"},
+    /* FTN4 the F tile with TN=4           */ {128, 32, 64, 32, 32, 32, 2, 2, 4, 1, 64, "ftn4"},
+    /* MWM4 medium with WMITER=4           */ {128, 64, 64, 32, 64, 32, 4, 2, 2, 1, 64, "mwm4"},
+    /* MBN128 medium with BN=128           */ {128, 64, 128, 32, 64, 64, 2, 2, 2, 1, 64, "mbn128"},
+};
+static int g_mm8_mode = -2;      /* -2 unread, 0 off, 1 every eligible, -1 the fill rule (the unset default) */
+static int g_mm8_tile_sel = -2;  /* -2 the frozen F tile, -1 the per-shape rule, >=0 forced (the bench) */
+static int g_mm8_ndbuf = -2;     /* id 11: -2 the measured default (single buffer; COLI_VK_CHAIN_MM8_NDBUF=2 arms the ping-pong), 0/2 forced (the tests) */
+static int g_mm8_ndbuf_baked = -1;   /* what the LAST pipeline build baked at id 11 (the env arm's observable, the tests assert it) */
+void vkc_mm8_set(int on) { g_mm8_mode = on; }
+void vkc_mm8_set_tile(int v) { g_mm8_tile_sel = v; }
+const char *vkc_mm8_tile_name(int v) { return v >= 0 && v < VKC_MM8_VAR ? vkc_mm8_tile[v].name : "?"; }
+int vkc_mm8_tile_count(void) { return VKC_MM8_VAR; }
+static int mm8_mode(void) {
+    if (g_mm8_mode == -2) {
+        const char *e = getenv("COLI_VK_MM8");
+        int v = coli_vk_env_def("COLI_VK_MM8", -1, 0);   /* unset: the fill rule; LEGACY: the GEMV */
+        g_mm8_mode = v < 0 ? -1 : v > 0 ? 1 : 0;
+        /* the lever's ONE boot line, the tier's lever lines' pattern (first read wins,
+         * later dispatches quiet; a set env stays silent -- the tests' pin bypasses the
+         * env, so no strict byte-equality leg that pins it can see a line) */
+        if (!(e && *e)) {
+            if (g_mm8_mode < 0)
+                fprintf(stderr, "[VK] chain: mm8: follows the rows rule (unset) -- a prompt's fp8 rows the tiled weight-stationary GEMM, a verify's rows and decode the GEMV\n");
+            else
+                fprintf(stderr, "[VK] chain: mm8: legacy (COLI_VK_LEGACY=1) -- every fp8 matmul the per-row GEMV\n");
+        }
+    }
+    return g_mm8_mode;
+}
+/* the per-shape tile: the frozen F tile by default, m16 on the large-O small-K class */
+static int mm8_variant_for(int O) {
+    if (g_mm8_tile_sel >= 0) return g_mm8_tile_sel;
+    if (g_mm8_tile_sel == -1) return O >= 16384 ? MM8_M16 : MM8_F;
+    return MM8_F;
+}
+/* one pipeline a tile set, made on first use (the shader's tile is a spec-constant set) */
+/* id 11's default: the single-buffer staging. The fork's ping-pong (2) is correct and
+ * test-covered but measured 5.6-7.7% slower decode at the profile shape on the RX 6900 XT
+ * (2,515-token prompt, 3 reps under the single-buffer arm's floor; outputs bit-identical,
+ * the streaming sub-batches regularized 402..16413-erratic -> a stable ~596), so it rides
+ * COLI_VK_CHAIN_MM8_NDBUF=2, capped to 0 where the doubled staging does not fit the device's
+ * shared-memory limit. A SET env states its standing in one boot line below -- armed, the
+ * cap's refusal naming the tile and the limit, or =1 rejected (the historically broken
+ * incantation) -- while an unset env stays byte-silent, so no LEGACY or strict
+ * byte-equality leg (which never sets it) can see a line */
+/* the lever's ONE boot line, fa4_note's pattern: first event wins, later builds quiet.
+ * Exactly one line a run, and only for a set env (the note is mm8_ndbuf_auto's alone --
+ * the tests' pin bypasses the env and stays silent) */
+static void mm8_ndbuf_note(const char *line) {
+    static int said;
+    if (said) return;
+    said = 1;
+    fputs(line, stderr);
+}
+static int32_t mm8_ndbuf_auto(uint32_t lds2, const char *tile) {
+    const char *e = getenv("COLI_VK_CHAIN_MM8_NDBUF");
+    if (!e || !*e) return 0;
+    int v = atoi(e);
+    if (v >= 2) {
+        uint32_t lim = kc_shared_limit();
+        if (lds2 <= lim) {
+            char line[128];
+            snprintf(line, sizeof line,
+                     "[VK] chain: mm8 ndbuf: ping-pong armed (COLI_VK_CHAIN_MM8_NDBUF=%s, spec 11)\n", e);
+            mm8_ndbuf_note(line);
+            return 2;
+        }
+        char line[224];
+        snprintf(line, sizeof line,
+                 "[VK] chain: mm8 ndbuf: COLI_VK_CHAIN_MM8_NDBUF=%s refused: the %s tile's doubled staging "
+                 "(%u B) is over the device's %u B shared-memory limit; the single buffer stands\n",
+                 e, tile, lds2, lim);
+        mm8_ndbuf_note(line);
+        return 0;
+    }
+    if (v == 1)
+        mm8_ndbuf_note("[VK] chain: mm8 ndbuf: COLI_VK_CHAIN_MM8_NDBUF=1 is not a mode (0 single buffer, 2 ping-pong); "
+                       "the single buffer stands\n");
+    return 0;
+}
+static VkPipeline mm8_pipe(int v) {
+    if (v < 0 || v >= VKC_MM8_VAR) v = MM8_F;
+    if (KC.mm8[v] || KC.mm8_tried[v] || !vkc_ready()) return KC.mm8[v];
+    KC.mm8_tried[v] = 1;
+    if (!KC.mod_mm8 && !(KC.mod_mm8 = load_module(KC.core.spv_path, "qmatmul_mm8.spv"))) return VK_NULL_HANDLE;
+    const VkcMm8Tile *t = &vkc_mm8_tile[v];
+    /* id 11 = NDBUF: 2 arms the ping-pong (double-buffered) staging, 0 the single
+     * buffer -- the shader takes its double-buffer path only on 2 (its explicit
+     * protocol; the 1 this arm once passed compiled the single buffer, the fork's
+     * silent dead code). Default 0 (the measured optimum above); 2 only via
+     * COLI_VK_CHAIN_MM8_NDBUF or the tests' pin, and only when the doubled staging
+     * fits: NBUF=2 buffers of (bm weights + bn activations) rows, each (bk/2+1)
+     * vec2 -- 2*(bm+bn)*(bk/2+1)*8 bytes, the shader's own arrays */
+    uint32_t lds2 = 2u * (uint32_t)(t->bm + t->bn) * (uint32_t)(t->bk / 2 + 1) * 8u;
+    int32_t vals[12] = {t->blk, t->bm, t->bn, t->bk, t->wm, t->wn, t->wmiter, t->tm, t->tn,
+                        t->tk, t->warp, g_mm8_ndbuf >= 0 ? g_mm8_ndbuf : mm8_ndbuf_auto(lds2, t->name)};
+    g_mm8_ndbuf_baked = vals[11];   /* what this build baked: the env arm's observable */
+    VkSpecializationMapEntry e[12];
+    for (int i = 0; i < 12; i++) e[i] = (VkSpecializationMapEntry){(uint32_t)i, (uint32_t)(i * 4), 4};
+    VkSpecializationInfo si = {12, e, sizeof vals, vals};
+    return KC.mm8[v] = make_pipe(KC.mod_mm8, &si);
+}
+static void mm8_shutdown(void) {
+    for (int i = 0; i < VKC_MM8_VAR; i++) if (KC.mm8[i]) vkDestroyPipeline(KC.dev, KC.mm8[i], NULL);
+    if (KC.mod_mm8) vkDestroyShaderModule(KC.dev, KC.mod_mm8, NULL);
+    memset(KC.mm8, 0, sizeof KC.mm8); memset(KC.mm8_tried, 0, sizeof KC.mm8_tried);
+    KC.mod_mm8 = VK_NULL_HANDLE;
+    if (KC.mm8red) vkDestroyPipeline(KC.dev, KC.mm8red, NULL);
+    if (KC.mod_mm8red) vkDestroyShaderModule(KC.dev, KC.mod_mm8red, NULL);
+    KC.mm8red = VK_NULL_HANDLE; KC.mm8red_tried = 0;
+}
+/* the tests' NDBUF pin (-2 the device-fit auto, 0 single, 2 ping-pong): the constant
+ * bakes into the PIPELINES, so a change drops them for a rebuild -- and only them:
+ * destroying the module too and reloading the same bytes double-freed inside the
+ * driver (RADV dedups them), while the module itself carries no spec constants */
+void vkc_mm8_set_ndbuf(int v) {
+    g_mm8_ndbuf = v;
+    for (int i = 0; i < VKC_MM8_VAR; i++)
+        if (KC.mm8[i]) { vkDestroyPipeline(KC.dev, KC.mm8[i], NULL); KC.mm8[i] = VK_NULL_HANDLE; }
+    memset(KC.mm8_tried, 0, sizeof KC.mm8_tried);
+    if (KC.mm8red) { vkDestroyPipeline(KC.dev, KC.mm8red, NULL); KC.mm8red = VK_NULL_HANDLE; }
+    KC.mm8red_tried = 0;
+}
+int vkc_mm8_ndbuf_baked(void) { return g_mm8_ndbuf_baked; }
+struct VkcMm8PC { int S, I, O, rowWords, gs, k_split; };   /* qmatmul_mm8.comp */
+/* ---- the split-K arm (COLI_VK_MM8_SPLITK, the fork's T2) ----------------------------------
+ * A small-O shape starves the tile grid (wkv: O 512 at bm 32 is 16 M-tiles), so the K
+ * range is cut into k chunks, each workgroup writing its partial tile into frame-scoped
+ * planes at ik*(S*O), and qmatmul_mm8_reduce.spv sums the planes in ascending k -- a
+ * reassociation class of the unsplit sum, deterministic (no atomics) but not bitwise.
+ * The partials live in the frame's temporaries (vkc_buf through f->tmp), never a permanent
+ * KC buffer: they are released with the frame, inside the vkc_fit* books. */
+static int g_mm8_splitk = -2;    /* -2 unread, 0 off (bitwise), -1 auto (the default), N forced */
+void vkc_mm8_set_splitk(int v) { g_mm8_splitk = v; }
+static int mm8_splitk_mode(void) {
+    if (g_mm8_splitk == -2) {
+        const char *e = getenv("COLI_VK_MM8_SPLITK");
+        g_mm8_splitk = !e || !*e ? -1 : atoi(e);
+        if (g_mm8_splitk < 0) g_mm8_splitk = -1;   /* 0 off, N forced, unset/negative auto */
+    }
+    return g_mm8_splitk;
+}
+/* the partition invariant: every split boundary a whole staged block of every tile in
+ * the table (BK spans 16-64, so a multiple of 64; that is word-aligned too, the fork's
+ * (I/k)%4). A chunk not a multiple of BK would stage past its end_k -- the next split
+ * counts those k again -- so a count that fails it degrades: the auto rule steps k down
+ * to the largest safe divisor, a forced count refuses to the unsplit arm (bitwise) */
+static int mm8_splitk_ok(int I, int k) { return I % k == 0 && (I / k) % 64 == 0; }
+/* the fork's choice (fill target 2048, k clamped to 8; the sweep there measured the
+ * 2048 target beating 512 on every underfilled shape): auto splits only a shape whose
+ * tiles cannot fill the device, forced N is taken as given and refused below */
+static int mm8_splitk_choose(int S, int I, int O, const VkcMm8Tile *t, int forced) {
+    if (forced > 1) return mm8_splitk_ok(I, forced) ? forced : 1;
+    if (I < 1024 || S < 2) return 1;
+    long wg = (long)((O + t->bm - 1) / t->bm) * (long)((S + t->bn - 1) / t->bn);
+    if (wg >= 2048) return 1;
+    long k = (2048 + wg - 1) / wg;
+    if (k > 8) k = 8;
+    if (k < 2) k = 2;
+    while (k > 1 && !mm8_splitk_ok(I, (int)k)) k--;
+    return (int)k;
+}
+int vkc_mm8_splitk_choose(int S, int I, int O) {   /* the bench's k, at the current tile */
+    const VkcMm8Tile *t = &vkc_mm8_tile[mm8_variant_for(O)];
+    int m = mm8_splitk_mode();
+    if (m == 0) return 1;   /* off: the unsplit arm, bitwise */
+    return mm8_splitk_choose(S, I, O, t, m);
+}
+/* qmatmul_mm8_reduce.spv: one thread an output element, the planes summed in ascending k */
+static VkPipeline mm8_red_pipe(void) {
+    if (KC.mm8red || KC.mm8red_tried || !vkc_ready()) return KC.mm8red;
+    KC.mm8red_tried = 1;
+    if (!(KC.mod_mm8red = load_module(KC.core.spv_path, "qmatmul_mm8_reduce.spv"))) return VK_NULL_HANDLE;
+    return KC.mm8red = make_pipe(KC.mod_mm8red, NULL);
+}
+static int mm8_record(const ColiVkTensorInfo *ti, VkcBind *bd, int S) {
+    int v = mm8_variant_for(ti->O);
+    VkPipeline p = mm8_pipe(v);
+    if (!p) return 0;
+    const VkcMm8Tile *t = &vkc_mm8_tile[v];
+    int m = mm8_splitk_mode();
+    int k = m == 0 ? 1 : mm8_splitk_choose(S, ti->I, ti->O, t, m);
+    struct VkcMm8PC pc = {S, ti->I, ti->O, ti->rowWords, ti->gs, k};
+    uint32_t gx = (uint32_t)((ti->O + t->bm - 1) / t->bm) * (uint32_t)k, gy = (uint32_t)((S + t->bn - 1) / t->bn);
+    if (k <= 1) return record(p, bd, 4, &pc, sizeof pc, gx, gy, 1);
+    if (!mm8_red_pipe()) return 0;   /* no reduce: the unsplit arm below (bitwise) */
+    /* the partial planes, frame-scoped so they never outlive the submission */
+    VkcFrame *f = open_frame();
+    if (!f) return 0;
+    size_t out = (size_t)S * (size_t)ti->O;
+    VkcBuf *pb = vkc_buf(out * (size_t)k * 4, VKC_DEV);
+    if (!pb) return 0;
+    if (f->ntmp + 1 > f->ctmp) {
+        int c = f->ctmp ? 2 * f->ctmp : 8; while (c < f->ntmp + 1) c *= 2;
+        VkcBuf **n = realloc(f->tmp, (size_t)c * sizeof *n);
+        if (!n) { buf_release(pb); return 0; }
+        f->tmp = n; f->ctmp = c;
+    }
+    f->tmp[f->ntmp++] = pb;
+    VkcBind sbd[4] = {bd[0], bd[1], bd[2], {pb->buf, 0, 0, 1}};
+    if (!record(p, sbd, 4, &pc, sizeof pc, gx, gy, 1)) return 0;   /* the frame frees pb */
+    struct { uint32_t n, split; } rpc = {(uint32_t)out, (uint32_t)k};   /* qmatmul_mm8_reduce.comp */
+    VkcBind rbd[2] = {{pb->buf, 0, 0, 0}, bd[3]};
+    uint32_t rgx, rgy; grid(((uint64_t)out + 255) / 256, &rgx, &rgy);   /* S*O past the x limit spills into y */
+    if (!record(KC.mm8red, rbd, 2, &rpc, sizeof rpc, rgx, rgy, 1)) return 0;
+    KC.st.mm8_split += 1;
+    return 1;
+}
 static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcBuf *y, size_t yb, int S) {
     if (ti->fmt >= 100) return matmul_bd(ti, x, xb, y, yb, S);
     int path = -1;   /* GEMM slot, -1 the GEMV */
+    int take = 0;   /* the tiled GEMM's fill rule as the rows policy gates it (mm8's -1 shares it) */
     if (KC.ngemm && S >= 2) {
-        int take = KC.gemm_rows < 0 ? (KC.core.gemm_min_s && S >= KC.core.gemm_min_s &&
-                                      (int64_t)S * ti->O >= KC.core.gemm_min_so)
-                                   : (KC.gemm_rows > 0 && S >= KC.gemm_rows);
+        take = KC.gemm_rows < 0 ? (KC.core.gemm_min_s && S >= KC.core.gemm_min_s &&
+                                   (int64_t)S * ti->O >= KC.core.gemm_min_so)
+                                : (KC.gemm_rows > 0 && S >= KC.gemm_rows);
         if (take) { path = 0; while (path + 1 < KC.ngemm && S > KC.gemm_bn[path]) path++; }
     }
     VkcBind bd[4] = {{x->buf, xb, 0, 0}, {(VkBuffer)ti->wbuf, 0, 0, 0}, {(VkBuffer)ti->sbuf, 0, 0, 0},
@@ -1481,6 +1749,17 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
     int v4 = path < 0 && KC.gemv4 && per && ti->rowWords % 4 == 0 && ti->I % 4 == 0 &&
              (ti->fmt != 4 || (ti->gs > 0 && ti->gs % 32 == 0)) && (xg ? KC.gemv4x : KC.gemv4);
     KC.kind = path >= 0 ? PK_GEMM : ti->fmt == 1 ? PK_GEMV8 : PK_GEMV;
+    /* mm8: the tiled weight-stationary GEMM for the fp8 matrices from 2 rows, opt-in
+     * (COLI_VK_MM8): `1` takes every eligible matmul independently of the rows policy
+     * above -- a verify's rows take it too, the documented reassociation-class break;
+     * `-1` shares the tiled GEMM's fill rule as that policy gates it (take), so a
+     * per-call vkc_gemm_rows(0) pin keeps a verify's rows on the GEMV; a refusal
+     * falls through to the same paths as with the knob off */
+    if (ti->fmt == 12 && S >= 2 && ti->I % 64 == 0 && mm8_mode() && (mm8_mode() > 0 || take)) {
+        KC.kind = PK_MM8;   /* before the dispatches: record()'s prof_mark files them under the mm8 bucket */
+        if ((ok = mm8_record(ti, bd, S))) { KC.st.matmuls += ok; KC.st.mm8 += ok; return ok; }
+        KC.kind = path >= 0 ? PK_GEMM : ti->fmt == 1 ? PK_GEMV8 : PK_GEMV;   /* refused: the paths below */
+    }
     int xv = ti->I / 4 + ti->I / 32;   /* a row of x staged, with chain_gemv2's padding */
     /* a matrix of few long rows: a row a workgroup with every lane on it (an RTX PRO 4000,
      * Qwen3.8's 320 x 10240 hyper-connection mixer: 20 workgroups of 16 rows 34 us, 320 of
@@ -1767,25 +2046,27 @@ static VkPipeline adg_pipe(int hd, int gq) {
     KC.adg[KC.nadg] = p; KC.adg_hd[KC.nadg] = hd; KC.adg_kv[KC.nadg] = g_kvh; KC.adg_gq[KC.nadg++] = gq;
     return p;
 }
-/* the blocks' scratch, at least `bytes`: a smaller one goes with the open frame (freed when
+/* a grown scratch, at least `bytes`: a smaller one goes with the open frame (freed when
  * the frame comes back), so a call never waits on the frames before it */
-static VkcBuf *adec_scratch(size_t bytes) {
-    if (KC.adec_x && KC.adec_x->bytes >= bytes) return KC.adec_x;
+static VkcBuf *scratch_grow(VkcBuf **slot, size_t bytes) {
+    if (*slot && (*slot)->bytes >= bytes) return *slot;
     VkcFrame *f = open_frame();
     if (!f) return NULL;
     VkcBuf *nb = vkc_buf(bytes + bytes / 2, VKC_DEV);
     if (!nb) return NULL;
-    if (KC.adec_x) {
+    if (*slot) {
         if (f->ntmp == f->ctmp) {
             int c = f->ctmp ? 2 * f->ctmp : 8;
             VkcBuf **t = realloc(f->tmp, (size_t)c * sizeof *t);
             if (!t) { buf_release(nb); return NULL; }
             f->tmp = t; f->ctmp = c;
         }
-        f->tmp[f->ntmp++] = KC.adec_x;
+        f->tmp[f->ntmp++] = *slot;
     }
-    return KC.adec_x = nb;
+    return *slot = nb;
 }
+static VkcBuf *adec_scratch(size_t bytes) { return scratch_grow(&KC.adec_x, bytes); }
+static VkcBuf *fa16_scratch(size_t bytes);   /* the f16 mirror's, below at the FA family */
 static int attn_dec(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *snk, const VkcAttnW *w) {
     int S = w->a.S, last = w->a.pos_base + S;   /* the last row's positions */
     int n = w->win > 0 && w->win < last ? w->win : last;
@@ -2313,6 +2594,65 @@ int vkc_mhc(int mode, VkcBuf *x, VkcBuf *m, VkcBuf *hp, VkcBuf *prm, VkcBuf *y, 
     return n == 0 || record(KC.mpipe[PM_MHC], bd, 5, &pc, sizeof pc, gx, gy, 1);
 }
 
+/* ---- the S=1 single-dispatch mHC pair (chain_mhc_dec.comp, COLI_VK_CHAIN_MHC_S1) --------
+ * The fork's mhc_dec_{pre,post}.comp (its Level-1 decode fusion, d11fba5b) on chain_mhc's
+ * own buffers and offsets: mode 0 records the whole pre tail of a one-row site -- the
+ * RMS-inverse, the Sinkhorn, the collapse and the branch RMSNorm, the bf16 rounds folded
+ * -- as ONE 256-thread workgroup over the streams x, the fn matmul's mixes m, the hc
+ * scale/base (prm at hc_off) and the branch norm weight (prm at n_off), into hp
+ * (chain_mhc's [pre H][post H][comb H*H] layout, so a standing POST can consume it) and
+ * the normed row y; mode 1 is the post, one thread an output, the bf16 round folded. At
+ * S = 1 the standing chain is six dispatches a site (matmul, SPLIT, COLLAPSE, round,
+ * norm, round) plus POST and a round -- the multi-dispatch class the fork measured
+ * regressing at one row (its COLI_VK_MHC_DECODE, 0.315 -> 1.161 ms/call) before the same
+ * bodies fused took the op back to a wash. COLI_VK_CHAIN_MHC_S1 (read per call, so a
+ * test arms it case by case): unset/0 keeps the standing chain, byte-identical by
+ * construction (the module is not even loaded); 1 takes the pair wherever a forward is
+ * one row. A shape the shader cannot take (H > 8 streams, D > 4096 -- the collapsed row
+ * stages in LDS at the fork's own cap) or a pipeline that did not load makes the call
+ * refuse and the caller's standing chain run -- never a misread. Numerics: the fork's
+ * fused bodies verbatim, a thresholded class against the standing chain (the affine and
+ * collapse products single-rounding fmas where the standing shaders make two roundings,
+ * fma reduction trees against strided adds, (x*inv)*w against (x*w)*r) -- D11's class,
+ * not bit-identity. The dispatches record under PK_MHC, so the DPROF mHC bucket keeps
+ * counting them; vkc_stats's mhc_dec counts engagements. */
+static struct { VkShaderModule mod; VkPipeline pipe; int tried; } g_mhcd[2];
+#define MHCD (g_mhcd[g_kd])
+static void mhcd_shutdown(void) {
+    if (MHCD.pipe) vkDestroyPipeline(KC.dev, MHCD.pipe, NULL);
+    if (MHCD.mod) vkDestroyShaderModule(KC.dev, MHCD.mod, NULL);
+    memset(&MHCD, 0, sizeof MHCD);
+}
+static VkPipeline mhcd_pipe(void) {   /* lazy: only an armed call loads the module */
+    if (MHCD.pipe || MHCD.tried || !vkc_ready()) return MHCD.pipe;
+    MHCD.tried = 1;
+    if ((MHCD.mod = load_module(KC.core.spv_path, "chain_mhc_dec.spv"))) MHCD.pipe = make_pipe(MHCD.mod, NULL);
+    return MHCD.pipe;
+}
+static int mhc_dec_wanted(void) {   /* COLI_VK_CHAIN_MHC_S1: 1 the fused pair, else the standing chain */
+    const char *e = getenv("COLI_VK_CHAIN_MHC_S1");
+    return e && *e && *e != '0';
+}
+int vkc_mhc_dec(int mode, VkcBuf *x, VkcBuf *m, VkcBuf *hp, VkcBuf *prm, VkcBuf *y, const VkcMhcDec *p) {
+    if (mode < 0 || mode > 1 || !mhc_dec_wanted() || p->H < 1 || p->H > 8 || p->D < 1 || p->D > 4096 ||
+        p->iters < (mode == 0 ? 1 : 0) || p->x_off < 0 || p->m_off < 0 || p->hp_off < 0 || p->y_off < 0 ||
+        (mode == 0 && (p->hc_off < 0 || p->n_off < 0))) return 0;
+    VkPipeline pipe = mhcd_pipe();
+    if (!pipe) return 0;
+    struct { int mode; VkcMhcDec b; } pc = {mode, *p};
+    VkcBind bd[5] = {B(x, 0), B(m, 0), B(hp, mode == 0), B(prm, 0), B(y, 1)};
+    KC.kind = PK_MHC;
+    if (mode == 0) {   /* the pre: the whole tail, one workgroup */
+        if (!record(pipe, bd, 5, &pc, sizeof pc, 1, 1, 1)) return 0;
+    } else {           /* the post: one thread an output */
+        uint32_t gx, gy;
+        grid(((uint64_t)p->H * p->D + 255) / 256, &gx, &gy);
+        if (!record(pipe, bd, 5, &pc, sizeof pc, gx, gy, 1)) return 0;
+    }
+    KC.st.mhc_dec++;
+    return 1;
+}
+
 /* ---- attention residuals and SiTU-GLU (chain_ares.comp) ---------------------------- */
 /* the router's pick (chain_route.comp): one workgroup per row */
 int vkc_route_ready(void) { return vkc_ready() && KC.mpipe[PM_ROUTE]; }
@@ -2464,6 +2804,7 @@ static int moe_build(void) {
 static int rows_make(void);
 static VkPipeline grp_pipe(int v, int t, int coop);
 static VkPipeline grpq_pipe(int v, int coop);
+static VkPipeline mx_pipe(int v);
 static VkPipeline grpw_pipe(int v, int t);
 static int grp_wide_rows(void);
 int vkc_prewarm(const VkcPrewarm *pw) {
@@ -2543,7 +2884,7 @@ int vkc_prewarm(const VkcPrewarm *pw) {
      * once; the grouped GEMMs get an item of expert 0 with no rows and no input (I 0), whose
      * table entry has only the block table's address for the decoders' tables: nothing is
      * read past them, nothing written. */
-    if (ok && (pw->ex_gu || pw->ex_dn || pw->ex_ours) && rows_make()) {
+    if (ok && (pw->ex_gu || pw->ex_dn || pw->ex_ours || pw->ex_mx) && rows_make()) {
         struct { int mode, S, K, E, D, I, t_off, imax, i_off, i_row, w_off, w_row, y_off, y_row; uint32_t tab_lo, tab_hi; int tm, bo1, bo0; } rp =
             {0, 0, 1, 1, 64, 64, 0, 1, 0, 1, 0, 1, 0, 64, 0, 0, 32, 32, 64};
         VkcBind rb[7] = {B(ids, 0), B(tab, 0), B(hid, 1), B(y, 1), B(w, 1), B(x, 1), B(rw, 1)};
@@ -2568,6 +2909,13 @@ int vkc_prewarm(const VkcPrewarm *pw) {
                 VkPipeline g = grpq_pipe(v, c);
                 if (g) { ok = record(g, gb, 5, &gp, sizeof gp, 1, 1, 1); n += ok; }
             }
+        }
+        /* and fmt 7's (qmatmul_grp_mx.comp, in floats): the same empty item — the
+         * shader reads no push-constant field past gp's (act/a/b unused), and I 0
+         * reads and writes nothing */
+        for (int v = 0; v < 2 && ok && pw->ex_mx; v++) {
+            VkPipeline g = mx_pipe(v);
+            if (g) { ok = record(g, gb, 5, &gp, sizeof gp, 1, 1, 1); n += ok; }
         }
     }
     /* a prompt chunk's attention on the matrix units (chain_attn_flash), launched on one row */
@@ -2756,10 +3104,23 @@ static VkPipeline grpq_pipe(int v, int coop) {
     }
     return KC.grpq[v];
 }
+/* fmt 7's grouped GEMM (the tier's native MXFP4 tensors, [0] down, [1] gate+up):
+ * qmatmul_grp_mx.comp, in floats only — the tier's expert-batch mode 4 runs it in
+ * production; no matrix-unit variant exists, the format stays off them */
+static VkPipeline mx_pipe(int v) {
+    static const char *file[2] = {"qmatmul_grp_mx.spv", "qmatmul_grp_gate_up_mx.spv"};
+    if (!KC.mx_tried[v]) {
+        KC.mx_tried[v] = 1;
+        if ((KC.mod_mx[v] = load_module(KC.core.spv_path, file[v]))) KC.mx[v] = make_pipe(KC.mod_mx[v], NULL);
+    }
+    return KC.mx[v];
+}
 static int our_fmt(int f) { return f == 1 || f == 2 || f == 4; }
+static int mx_fmt(int f) { return f == 7 || f == 15; }   /* MXFP4, f32 scales and its packed ue8m0 twin */
 /* pass v's (1 gate+up, 0 down) pipeline for a matrix of format f: a GGUF's block type, or ours */
 static VkPipeline rows_pipe1(int v, int f, int coop) {
-    return f >= 100 ? grp_pipe(v, f - 100, coop) : our_fmt(f) ? grpq_pipe(v, coop) : VK_NULL_HANDLE;
+    return mx_fmt(f) ? (coop ? VK_NULL_HANDLE : mx_pipe(v)) :
+        f >= 100 ? grp_pipe(v, f - 100, coop) : our_fmt(f) ? grpq_pipe(v, coop) : VK_NULL_HANDLE;
 }
 /* coop asks for the matrix units, which a format or a device without them answers in floats;
  * without the floats' pipeline (too little shared memory for it), the matrix units' */
@@ -2848,9 +3209,11 @@ static int rows_make(void) {
     return KC.rows != VK_NULL_HANDLE;
 }
 int vkc_moe_rows_ready(int gfmt, int dfmt) {
-    /* a GGUF's block types (their decoders read the block table), or our formats (both matrices) */
-    int bd = gfmt >= 100 && dfmt >= 100 && coli_vk_block_table_addr(g_kd), q = our_fmt(gfmt) && our_fmt(dfmt);
-    return (bd || q) && rows_make() && rows_pipe(1, gfmt, 0) && rows_pipe(0, dfmt, 0);
+    /* a GGUF's block types (their decoders read the block table), our formats, or fmt 7
+     * (both matrices: the mx pipelines', in floats) */
+    int bd = gfmt >= 100 && dfmt >= 100 && coli_vk_block_table_addr(g_kd),
+        q = (our_fmt(gfmt) && our_fmt(dfmt)) || (mx_fmt(gfmt) && mx_fmt(dfmt)), mx = mx_fmt(gfmt) && mx_fmt(dfmt);
+    return (bd || q) && rows_make() && rows_pipe(1, gfmt, 0) && rows_pipe(0, dfmt, 0) && (!mx || (mx_pipe(0) && mx_pipe(1)));
 }
 void vkc_moe_rows_free(VkcMoeRows *r) {
     VkcBuf **b[7] = {&r->cnt, &r->amap, &r->items, &r->etab, &r->aux, &r->hid, &r->yk};
@@ -2860,7 +3223,7 @@ int vkc_moe_rows(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcMoeRows *r
     KC.kind = PK_MOE;
     int E = p->E;
     if (p->S < 1 || p->K < 1 || p->K > VKC_ROUTE_KMAX || E < 1 || E > VKC_ROUTE_EMAX || p->act != 0 || p->D % 64 ||
-        p->I % 64 || p->t_off < 0 || p->x_off || !x || !ids || !w || !table || !y || !r || !vkc_moe_rows_ready(p->gfmt, p->dfmt)) return 0;
+        p->I % 64 || p->t_off < 0 || p->x_off < 0 || !x || !ids || !w || !table || !y || !r || !vkc_moe_rows_ready(p->gfmt, p->dfmt)) return 0;
     size_t pairs = (size_t)p->S * p->K;
     /* the wider item when the experts' rows fill it, both passes on the matrix units */
     int wr = grp_wide_rows();
@@ -2885,20 +3248,27 @@ int vkc_moe_rows(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcMoeRows *r
     int ok = vkc_zero(r->cnt, 0, (size_t)E) && record(KC.rows, sb, 7, &pc, sizeof pc, gp, 1, 1);
     pc.mode = 1; ok = ok && record(KC.rows, sb, 7, &pc, sizeof pc, 1, 1, 1);
     pc.mode = 2; ok = ok && record(KC.rows, sb, 7, &pc, sizeof pc, gp, 1, 1);
-    /* gate+up: the tokens' rows gathered by amap into the packed hidden rows */
+    /* gate+up: the tokens' rows gathered by amap into the packed hidden rows; fmt 7's mx
+     * pipeline takes a 36-byte push constant (its layout's act/a/b, act 0 here) */
     struct { int I, O; float limit; int ibase, kgat, rpw; } pg = {p->D, p->I, p->limit, 0, p->K, 0};
+    struct { int I, O; float limit; int ibase, kgat, rpw, act; float a, b; } pmg = {p->D, p->I, p->limit, 0, p->K, 0, 0, 0.f, 0.f};
+    int mg = mx_fmt(p->gfmt);
+    size_t pgb = mg ? sizeof pmg : sizeof pg;
     size_t eb0 = (size_t)16 * E * 4;   /* the down pass's table */
     VkcBind gb[5] = {B(x, 0), B(r->items, 0), {r->etab->buf, 0, eb0, 0}, B(r->hid, 1), B(r->amap, 0)};
+    gb[0].off = (VkDeviceSize)p->x_off * 4u;   /* COLI_VK_DMOE_ROWS_MAX's split: a row group's x begins at its own rows */
     r->etab->last_frame = KC.serial;
     /* on the matrix units unless the caller keeps the floats (p->floats: the tier's host pool,
      * whose experts the GEMMs read over PCIe; there the floats' were faster) */
     VkPipeline pgu = wide ? grpw_pipe(1, p->gfmt - 100) : rows_pipe(1, p->gfmt, !p->floats),
                pdn = wide ? grpw_pipe(0, p->dfmt - 100) : rows_pipe(0, p->dfmt, !p->floats);
-    ok = ok && record_indirect(pgu, gb, 5, &pg, sizeof pg, r->aux, 0);
+    ok = ok && record_indirect(pgu, gb, 5, mg ? (const void *)&pmg : (const void *)&pg, pgb, r->aux, 0);
     /* down: the packed hidden rows into the pairs' rows (amap) */
     struct { int I, O; float limit; int ibase, kgat, rpw; } pd = {p->I, p->D, 0.f, (int)imax, p->K, 0};
+    struct { int I, O; float limit; int ibase, kgat, rpw, act; float a, b; } pmd = {p->I, p->D, 0.f, (int)imax, p->K, 0, 0, 0.f, 0.f};
     VkcBind db[5] = {B(r->hid, 0), B(r->items, 0), {r->etab->buf, eb0, eb0, 0}, B(r->yk, 1), B(r->amap, 0)};
-    ok = ok && record_indirect(pdn, db, 5, &pd, sizeof pd, r->aux, 16);
+    int md = mx_fmt(p->dfmt);
+    ok = ok && record_indirect(pdn, db, 5, md ? (const void *)&pmd : (const void *)&pd, md ? sizeof pmd : sizeof pd, r->aux, 16);
     if (ok) KC.st.grp_coop += wide ? 2 : rows_coop(1, p->gfmt, pgu) + rows_coop(0, p->dfmt, pdn);
     if (ok && wide) KC.st.grp_wide += 2;
     /* the rows' sums over their experts, in rank order */
@@ -3270,6 +3640,64 @@ int vkc_enc_rel(VkcBuf *x, VkcBuf *pt, VkcBuf *y, const VkcEncRel *p) {
 
 void vkc_stats(VkcStats *st) { *st = KC.st; }
 
+/* ---- COLI_VK_CHAIN_DPROF: the decode window's counters (vk_chain.h) ---------------- */
+int vkc_dprof(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_CHAIN_DPROF"); on = e && *e && *e != '0' ? 1 : 0; }
+    return on;
+}
+int vkc_dwin(int on) {
+    if (!vkc_dprof()) return 0;
+    if (on == 2) {   /* a prompt chunk: its own window, closed by the next call (a chunk's end) */
+        if (KC.pwin) return 1;
+        if (KC.dwin) {   /* a prompt closes the decode window, as a forward of more rows always did */
+            double now = vkc_now_ms();
+            KC.st.d_host_ms[KC.drole] += now - KC.role_t0;
+            KC.st.d_wall_ms += now - KC.dwin_t0;
+            KC.dwin = 0;
+        }
+        KC.pwin = 1; KC.st.p_fwd++;
+        KC.role_t0 = KC.pwin_t0 = vkc_now_ms();
+        return 1;
+    }
+    if (KC.pwin) {   /* the chunk's end: the last role's span, and the window's wall */
+        double now = vkc_now_ms();
+        KC.st.p_host_ms[KC.drole] += now - KC.role_t0;
+        KC.st.p_wall_ms += now - KC.pwin_t0;
+        KC.pwin = 0;
+    }
+    if (on == 1 && KC.dwin) {   /* the next decode forward of the open window: the last role's span */
+        double now = vkc_now_ms();
+        KC.st.d_host_ms[KC.drole] += now - KC.role_t0;
+        KC.st.d_wall_ms += now - KC.dwin_t0;
+        KC.role_t0 = KC.dwin_t0 = now;
+    } else if (on == 1) {       /* the window opens: its first span runs under OTHER until a role is stamped */
+        KC.st.d_fwd++;
+        KC.drole = VKC_R_OTHER;
+        KC.role_t0 = KC.dwin_t0 = vkc_now_ms();
+    }
+    if (on != 1 && KC.dwin) {   /* the window closes: its last span and wall */
+        double now = vkc_now_ms();
+        KC.st.d_host_ms[KC.drole] += now - KC.role_t0;
+        KC.st.d_wall_ms += now - KC.dwin_t0;
+    }
+    KC.dwin = on == 1;
+    return 1;
+}
+void vkc_role(int role) {
+    if (role < 0 || role >= VKC_R_N) role = VKC_R_OTHER;
+    if (KC.pwin) {   /* the prompt window's host timeline: the wall since the last stamp is the old role's */
+        double now = vkc_now_ms();
+        KC.st.p_host_ms[KC.drole] += now - KC.role_t0;
+        KC.role_t0 = now;
+    } else if (KC.dwin) {   /* the decode window's own, the same charge (CS-0's print) */
+        double now = vkc_now_ms();
+        KC.st.d_host_ms[KC.drole] += now - KC.role_t0;
+        KC.role_t0 = now;
+    }
+    KC.drole = role;
+}
+
 /* ---- big prefill chunks ------------------------------------------------------------
  * The rows of a prompt chunk (vk_chain.h, vkc_chunk_rows). The free device memory is
  * read once, at an engine's first call: a later reading would count the chain's own
@@ -3500,6 +3928,7 @@ void vkc_shutdown(void) {
     KC.tsem_g = KC.tsem_h = VK_NULL_HANDLE;
     if (KC.dummy) buf_release(KC.dummy);
     if (KC.adec_x) buf_release(KC.adec_x);
+    if (KC.fa16) buf_release(KC.fa16);
     for (int k = 0; k < 3; k++) {
         VkaPool *P = &KC.pool[k].p;
         for (int b = 0; b < P->nb; b++) {
@@ -3512,6 +3941,7 @@ void vkc_shutdown(void) {
     if (KC.cpool) vkDestroyCommandPool(KC.dev, KC.cpool, NULL);
     kx_shutdown();
     kab_shutdown();
+    mm8_shutdown();
     cp2_shutdown();
     ke_shutdown();
     kf_shutdown();
@@ -3589,6 +4019,8 @@ void vkc_shutdown(void) {
         if (KC.mod_grpq[v]) vkDestroyShaderModule(KC.dev, KC.mod_grpq[v], NULL);
         if (KC.grpqc[v]) vkDestroyPipeline(KC.dev, KC.grpqc[v], NULL);
         if (KC.mod_grpqc[v]) vkDestroyShaderModule(KC.dev, KC.mod_grpqc[v], NULL);
+        if (KC.mx[v]) vkDestroyPipeline(KC.dev, KC.mx[v], NULL);
+        if (KC.mod_mx[v]) vkDestroyShaderModule(KC.dev, KC.mod_mx[v], NULL);
     }
     if (KC.mod_moe) vkDestroyShaderModule(KC.dev, KC.mod_moe, NULL);
     for (int f = 0; f < 3; f++) for (int b = 0; b < 10; b++) if (KC.moe_gv[f][b]) vkDestroyPipeline(KC.dev, KC.moe_gv[f][b], NULL);
@@ -3603,6 +4035,8 @@ void vkc_shutdown(void) {
     if (KC.pl) vkDestroyPipelineLayout(KC.dev, KC.pl, NULL);
     if (KC.dsl) vkDestroyDescriptorSetLayout(KC.dev, KC.dsl, NULL);
     dsv4_shutdown();
+    dsv4_fa_shutdown();
+    mhcd_shutdown();
     kvs_shutdown();
     memset(&KC, 0, sizeof KC);
     KC.cur = -1; KC.gemm_rows = -1;
@@ -3632,33 +4066,143 @@ int vkc_dsv4_ready(void) { return vkc_ready() && D4.pipe; }
 
 /* the shader reads one block of 32 words: the mode, then the op's fields */
 typedef struct { int mode; int w[31]; } Dsv4PC;
-static int dsv4_rec(int kind, int mode, const void *b, size_t bytes, VkcBind *bd, int nb, uint32_t gx, uint32_t gy) {
-    if (!D4.pipe || !open_frame() || KC.lost || bytes > sizeof(int) * 31) return 0;
+static int dsv4_rec(int kind, VkPipeline pipe, int mode, const void *b, size_t bytes, VkcBind *bd, int nb, uint32_t gx, uint32_t gy) {
+    if (!pipe || !open_frame() || KC.lost || bytes > sizeof(int) * 31) return 0;
     Dsv4PC pc; memset(&pc, 0, sizeof pc);
     pc.mode = mode; memcpy(pc.w, b, bytes);
     KC.kind = kind;
-    return record(D4.pipe, bd, nb, &pc, sizeof pc, gx, gy, 1);
+    return record(pipe, bd, nb, &pc, sizeof pc, gx, gy, 1);
+}
+/* ---- the flash-attention tile (chain_dsv4_fa.comp, COLI_VK_CHAIN_ATTN_FA) ------------
+ * The fork's sparse_attn_fa family (d11fba5b, itself llama.cpp's flash_attn.comp) on
+ * this chain's mode-0 contract: same bindings and push constants, so vkc_dsv4_attn
+ * dispatches either. One workgroup covers Br query heads of one token and streams the
+ * token's rows in Bc tiles, the K/V rows staged once in LDS (K == V, one latent row
+ * both passes) instead of mode 0's every-head re-read from VRAM (the census' ~16x row
+ * amplification), an online softmax, a subgroup-tree score dot and llama's sink end
+ * block. Four builds from the one source, the fork's four: Br 8 (prefill) and the Br 2
+ * decode twin at tokens == 1 (a head's accumulation order unchanged, only heads/2
+ * workgroups instead of heads/8), each with a KV_F16 twin reading the f16 mirror
+ * chain_dsv4_fa_gather.comp writes a dispatch ahead -- the fork's storage-only fp16
+ * (its COLI_DSV4_VK_KV_F16, retired ON in the fork's standing arm) as a read-side
+ * mirror over this port's fp32 stores: half the KV read bytes, the same numerics
+ * class (fp16 holds the bf16/fp8-rounded rows exactly in its normal range), nothing
+ * permanent. Numerics: thresholded against the scalar path, never bit-identical (the
+ * fork held 2e-3): the dot is a subgroup tree, the softmax rescales in tile order and
+ * the tile max carries llama's KQ_MAX_OFFSET, which also moves the bf16 probability
+ * rounding's scale (flags 1). COLI_VK_CHAIN_ATTN_FA: unset/0 keeps mode 0 (today's
+ * bits, read per call so a test can arm it case by case); 1 the fork's standing class
+ * (the tile + the f16 mirror); 2 the tile over the fp32 rows (the fork's KV_F16=0
+ * arm). A shape the tile cannot take (hd != 512, heads % 8, or a q/o/w/c offset or
+ * stride not a multiple of 4 floats) or a pipeline that did not load falls back to
+ * mode 0 -- never a misread. */
+enum { FA_BR8, FA_BR8_F16, FA_BR2, FA_BR2_F16, FA_GATHER, FA_N };
+static struct { VkShaderModule mod[FA_N]; VkPipeline pipe[FA_N]; int tried; } g_fa4[2];
+#define FA4 (g_fa4[g_kd])
+static const char *const fa4_file[FA_N] = {"chain_dsv4_fa.spv", "chain_dsv4_fa_f16.spv", "chain_dsv4_fa_dec.spv",
+                                           "chain_dsv4_fa_dec_f16.spv", "chain_dsv4_fa_gather.spv"};
+static void dsv4_fa_shutdown(void) {
+    for (int i = 0; i < FA_N; i++) {
+        if (FA4.pipe[i]) vkDestroyPipeline(KC.dev, FA4.pipe[i], NULL);
+        if (FA4.mod[i]) vkDestroyShaderModule(KC.dev, FA4.mod[i], NULL);
+    }
+    memset(&FA4, 0, sizeof FA4);
+}
+static VkPipeline fa4_pipe(int i) {   /* lazy: only an armed attention loads the family */
+    if (FA4.pipe[i] || FA4.tried || !vkc_ready()) return FA4.pipe[i];
+    FA4.tried = 1;
+    for (int k = 0; k < FA_N; k++)
+        if ((FA4.mod[k] = load_module(KC.core.spv_path, fa4_file[k]))) FA4.pipe[k] = make_pipe(FA4.mod[k], NULL);
+    return FA4.pipe[i];
+}
+static VkcBuf *fa16_scratch(size_t bytes) { return scratch_grow(&KC.fa16, bytes); }
+static int attn_fa_wanted(void) {   /* COLI_VK_CHAIN_ATTN_FA: 1 f16 mirror, 2 fp32 rows. The
+        * DEFAULT since gap-wave4 is 1 -- the tile and its own gates (a shape it cannot
+        * take or a pipeline that did not load falls back to mode 0, never a misread);
+        * =0 and COLI_VK_LEGACY=1 keep mode 0. Read per call so a test can arm it case
+        * by case. */
+    const char *e = getenv("COLI_VK_CHAIN_ATTN_FA");
+    int v;
+    if (e && *e) { v = atoi(e); return v == 1 || v == 2 ? v : 0; }
+    return coli_vk_legacy() ? 0 : 1;
+}
+/* The lever's ONE boot line (gap-wave4): the first dsv4 attention states the tile's
+ * standing -- engaged, refused:<reason> (a pipeline that did not load or a shape the
+ * tile cannot take -- mode 0) or legacy -- so a default-on tile can never engage or
+ * decline silently on any hardware (64 KiB-LDS cards compile both tiles, 48 KiB cards
+ * the 42,080 B decode twin only (the 54,464 B prefill tile's pipeline-create fails,
+ * spec-required), <=32 KiB cards neither and everything degrades to mode 0; only the
+ * stats line counted before). First event wins; later dispatches stay quiet. */
+static void fa4_note(int engaged, const char *why) {
+    static int said;
+    if (said) return;
+    said = 1;
+    if (engaged)
+        fprintf(stderr, "[VK] chain: attention FA engaged: the flash tile takes the dsv4 attention (a thresholded class, never bit-identical to mode 0)\n");
+    else fprintf(stderr, "[VK] chain: attention FA refused: %s -- mode 0\n", why);
 }
 int vkc_dsv4_attn(VkcBuf *q, VkcBuf *win, VkcBuf *cmp, VkcBuf *list, VkcBuf *prm, VkcBuf *out, const VkcDsAttn *p) {
     if (p->S < 1 || p->S > 65535 || p->H < 1 || p->H > 65535 || p->hd < 1 || p->hd > 1024 || p->cnt < 0 || p->cnt > 3072)
         return 0;
     if (p->cnt == 0) return 0;
+    if (!attn_fa_wanted() && coli_vk_legacy() &&
+        !(getenv("COLI_VK_CHAIN_ATTN_FA") && *getenv("COLI_VK_CHAIN_ATTN_FA")))
+        fa4_note(0, "legacy (COLI_VK_LEGACY=1)");
+    if (attn_fa_wanted() && p->hd == 512 && !(p->H % 8) &&
+        !((p->q_off | p->q_row | p->o_off | p->o_row | p->w_off | p->c_off) & 3)) {
+        int dec = p->S == 1, br = dec ? 2 : 8;   /* the decode twin keeps a head's order */
+        VkPipeline fp = VK_NULL_HANDLE;
+        VkcBuf *kv = NULL;
+        if (attn_fa_wanted() == 1) {   /* the f16 mirror: every ring and pool row, one dispatch */
+            /* the pool rows are read at c_off (the gather's binding 2), so the count
+             * comes off the c_off tail -- deriving it from w_off would read past the
+             * buffer the day a caller splits the two offsets (both real callers pass 0) */
+            size_t pool = ((cmp ? cmp->bytes : win->bytes) - (size_t)p->c_off * 4) /
+                          ((size_t)p->hd * 4);
+            VkcBuf *mir = fa16_scratch((size_t)(p->nwin + pool) * p->hd * 2);
+            VkPipeline gth = fa4_pipe(FA_GATHER);
+            if (mir && gth) {
+                Dsv4PC gpc; memset(&gpc, 0, sizeof gpc);
+                gpc.mode = 1; memcpy(gpc.w, p, sizeof *p); gpc.w[16] = p->nwin + (int)pool;
+                uint32_t gx, gy;
+                grid(((uint64_t)(p->nwin + pool) * (p->hd / 4) + 255) / 256, &gx, &gy);
+                VkcBind gb[8] = {B(NULL, 0), B(win, 0), B(cmp ? cmp : win, 0), B(NULL, 0), B(NULL, 0), B(mir, 1),
+                                 B(NULL, 0), B(NULL, 0)};
+                KC.kind = PK_ATTN;
+                if (record(gth, gb, 8, &gpc, sizeof gpc, gx, gy, 1)) {
+                    fp = fa4_pipe(dec ? FA_BR2_F16 : FA_BR8_F16);
+                    kv = mir;
+                }
+            }
+        }
+        if (!fp) fp = fa4_pipe(dec ? FA_BR2 : FA_BR8);
+        if (fp) {
+            VkcBind fbd[6] = {B(q, 0), B(kv ? kv : win, 0), B(kv ? kv : (cmp ? cmp : win), 0), B(list, 0), B(prm, 0),
+                              B(out, 1)};
+            if (dsv4_rec(PK_ATTN, fp, 0, p, sizeof *p, fbd, 6, (uint32_t)p->S, (uint32_t)(p->H / br))) {
+                fa4_note(1, NULL);
+                KC.st.attn_fa++;
+                return 1;
+            }
+        } else fa4_note(0, "the tile's pipelines did not load");
+    } else if (attn_fa_wanted())
+        fa4_note(0, "a shape the tile cannot take");
     VkcBind bd[6] = {B(q, 0), B(win, 0), B(cmp ? cmp : win, 0), B(list, 0), B(prm, 0), B(out, 1)};
-    return dsv4_rec(PK_ATTN, 0, p, sizeof *p, bd, 6, (uint32_t)p->H, (uint32_t)p->S);
+    return dsv4_rec(PK_ATTN, D4.pipe, 0, p, sizeof *p, bd, 6, (uint32_t)p->H, (uint32_t)p->S);
 }
 int vkc_dsv4_rope(VkcBuf *x, VkcBuf *cs, const VkcDsRope *p) {
     if (p->nseg < 0 || p->per_row < 1 || p->rd < 2 || (p->rd & 1)) return 0;
     if (p->nseg == 0) return open_frame() && !KC.lost;
     VkcBind bd[6] = {B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(cs, 0), B(x, 1)};
     uint32_t gx, gy; grid(((uint64_t)p->nseg * (p->rd / 2) + 255) / 256, &gx, &gy);
-    return dsv4_rec(PK_ROPE, 1, p, sizeof *p, bd, 6, gx, gy);
+    return dsv4_rec(PK_ROPE, D4.pipe, 1, p, sizeof *p, bd, 6, gx, gy);
 }
 int vkc_dsv4_compress(VkcBuf *kv, VkcBuf *sc, VkcBuf *ring, VkcBuf *prm, VkcBuf *out, const VkcDsComp *p) {
     if (p->S < 0 || p->ratio < 1 || p->P < 1 || p->D < 1 || p->D > p->P || (p->overlap && p->P < 2 * p->D)) return 0;
     if (p->S == 0) return open_frame() && !KC.lost;
     VkcBind bd[8] = {B(kv, 0), B(sc, 0), B(NULL, 0), B(NULL, 0), B(p->ape_off >= 0 ? prm : NULL, 0), B(out, 1), B(NULL, 0),
                      B(ring, 1)};
-    return dsv4_rec(PK_DSA, 2, p, sizeof *p, bd, 8, 1, 1);
+    return dsv4_rec(PK_DSA, D4.pipe, 2, p, sizeof *p, bd, 8, 1, 1);
 }
 int vkc_dsv4_score(VkcBuf *iq, VkcBuf *hw, VkcBuf *keys, VkcBuf *mask, VkcBuf *sc, const VkcDsScore *p) {
     /* queries above 4096 floats: mode 9, the same sums with the queries read from memory */
@@ -3670,26 +4214,26 @@ int vkc_dsv4_score(VkcBuf *iq, VkcBuf *hw, VkcBuf *keys, VkcBuf *mask, VkcBuf *s
     /* many columns: on a grid of 256 / IH columns a workgroup (mode 10, the same bits) */
     if (dsa_grid_on() && p->IH <= 256 && p->width >= VKC_DSA_GRID) {
         int P = 256 / p->IH;
-        return dsv4_rec(PK_DSA, 10, p, sizeof *p, bd, 6, (uint32_t)((p->width + P - 1) / P), (uint32_t)p->S);
+        return dsv4_rec(PK_DSA, D4.pipe, 10, p, sizeof *p, bd, 6, (uint32_t)((p->width + P - 1) / P), (uint32_t)p->S);
     }
-    return dsv4_rec(PK_DSA, wide ? 9 : 3, p, sizeof *p, bd, 6, (uint32_t)p->S, 1);
+    return dsv4_rec(PK_DSA, D4.pipe, wide ? 9 : 3, p, sizeof *p, bd, 6, (uint32_t)p->S, 1);
 }
 int vkc_dsv4_cand(VkcBuf *sc, VkcBuf *mask, const VkcDsCand *p) {
     if (p->S < 1 || p->S > 65535 || p->block < 1 || p->ratio < 1 || p->width < 0 ||
         (p->width + p->block - 1) / p->block > 4096 || p->mask_row < p->width) return 0;
     VkcBind bd[7] = {B(sc, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(mask, 1)};
-    return dsv4_rec(PK_DSA, 4, p, sizeof *p, bd, 7, (uint32_t)p->S, 1);
+    return dsv4_rec(PK_DSA, D4.pipe, 4, p, sizeof *p, bd, 7, (uint32_t)p->S, 1);
 }
 int vkc_dsv4_topk(VkcBuf *sc, VkcBuf *list, const VkcDsTopk *p) {
     if (p->S < 1 || p->S > 65535 || p->topk < 0 || p->width < 0 || (p->order && p->topk > 4096)) return 0;
     if (p->topk == 0) return open_frame() && !KC.lost;
     VkcBind bd[7] = {B(sc, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(list, 1)};
-    return dsv4_rec(PK_DSA, 5, p, sizeof *p, bd, 7, (uint32_t)p->S, 1);
+    return dsv4_rec(PK_DSA, D4.pipe, 5, p, sizeof *p, bd, 7, (uint32_t)p->S, 1);
 }
 int vkc_dsv4_engram(VkcBuf *kv, VkcBuf *prm, VkcBuf *x, const VkcDsEngram *p) {
     if (p->S < 1 || p->S > 65535 || p->H < 1 || p->D < 1) return 0;
     VkcBind bd[6] = {B(kv, 0), B(prm, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(x, 1)};
-    return dsv4_rec(PK_EW, 6, p, sizeof *p, bd, 6, (uint32_t)p->H, (uint32_t)p->S);
+    return dsv4_rec(PK_EW, D4.pipe, 6, p, sizeof *p, bd, 6, (uint32_t)p->H, (uint32_t)p->S);
 }
 int vkc_dsv4_round(VkcBuf *x, VkcBuf *y, const VkcDsRound *p) {
     if (!x || !y || p->kind < VKC_DS_BF16 || p->kind > VKC_DS_HADAMARD || p->nseg < 0 || p->per_row < 1 || p->len < 1)
@@ -3707,14 +4251,14 @@ int vkc_dsv4_round(VkcBuf *x, VkcBuf *y, const VkcDsRound *p) {
                     : (uint64_t)p->nseg * ((p->len + p->block - 1) / p->block);
     uint32_t gx, gy; grid(groups, &gx, &gy);
     VkcBind bd[6] = {B(x == y ? NULL : x, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(y, 1)};
-    return dsv4_rec(PK_EW, 7, w, sizeof w, bd, 6, gx, gy);
+    return dsv4_rec(PK_EW, D4.pipe, 7, w, sizeof w, bd, 6, gx, gy);
 }
 int vkc_dsv4_swiglu(VkcBuf *a, VkcBuf *b, VkcBuf *y, const VkcDsSwiglu *p) {
     if (!a || !b || !y || p->n < 0) return 0;
     if (p->n == 0) return open_frame() && !KC.lost;
     uint32_t gx, gy; grid(((uint64_t)p->n + 255) / 256, &gx, &gy);
     VkcBind bd[6] = {B(a, 0), B(b, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(y, 1)};
-    return dsv4_rec(PK_EW, 8, p, sizeof *p, bd, 6, gx, gy);
+    return dsv4_rec(PK_EW, D4.pipe, 8, p, sizeof *p, bd, 6, gx, gy);
 }
 
 /* ---- a KV cache split between the device and the host (chain_kvs.comp) ------------

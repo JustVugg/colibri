@@ -259,8 +259,12 @@ TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
 TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
 V4_HOT_TEST_OBJ = COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16_TEST.o
 V4_BATCH_TEST_OBJ = COLI_V4_UNIT_NATIVE_QUANT_BATCH_TEST.o
-V4_OBJS = $(TARGET_OBJS) $(V4_WIN_EXTRA_OBJS) $(REGISTRY_OBJ) $(V4_VK_OBJ) $(V4_CUT_OBJS)
+V4_OBJS = $(TARGET_OBJS) $(V4_WIN_EXTRA_OBJS) $(REGISTRY_OBJ) $(V4_MFU_OBJ) $(V4_VK_OBJ) $(V4_CUT_OBJS)
 REGISTRY_OBJ = expert_store_registry.o
+# The decode-only MFU popularity table (the fork's mfu_table.{c,h}, lifted
+# as-is; S-store map §5b). Standalone like the registry, not a deepseek_v4.c
+# unit: it has zero engine deps, and the hot-store unit includes mfu_table.h.
+V4_MFU_OBJ = mfu_table.o
 V4_SERVE_TEST := tests/test_v4_serve_framing$(if $(IS_WIN),.exe,)
 V4_SERVE_TEST_OBJS := $(filter-out COLI_V4_UNIT_GENERATE_STATS.o,$(V4_OBJS))
 
@@ -344,6 +348,9 @@ $(REGISTRY_OBJ): expert_store_registry.c expert_store_registry.h expert_store.h 
 	$(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -c expert_store_registry.c -o $@
 
+$(V4_MFU_OBJ): mfu_table.c mfu_table.h $(V4_FLAGS_STAMP)
+	$(CC) $(CFLAGS) -c mfu_table.c -o $@
+
 $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
 	deepseek_v4_internal.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h fp8_format.h sse41_kernels.h \
 	route_trace.h vk_tier.h deepseek_v4_chain.h vk_chain.h \
@@ -396,6 +403,6 @@ test_expert_store_registry: test_expert_store_registry.c expert_store_registry.c
 
 deepseek-v4-clean:
 	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_HOT_TEST_OBJ) \
-		$(V4_BATCH_TEST_OBJ) \
+		$(V4_BATCH_TEST_OBJ) $(V4_MFU_OBJ) \
 		$(V4_SERVE_TEST) test_expert_store_registry $(V4_FLAGS_STAMP) \
 		$(V4_CUDA_FLAGS_STAMP) backend_vulkan_v4.o vk_tier_v4.o vk_chain_v4.o

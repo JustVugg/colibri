@@ -5,6 +5,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+
 ## [2.1.0] - 2026-10-31
 
 387 pull requests since v2.0.0, 208 of them from 35 contributors. GGUF files run

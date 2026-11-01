@@ -1,6 +1,7 @@
 /* Merged DeepSeek V4 unit tests (GLM-style single harness). */
 #include "../deepseek_v4_internal.h"
 #include "../compat.h"
+#include "../mfu_table.h"
 #include "../native_quant.h"
 #include "../native_quant_batch.h"
 #include "../native_quant_dual.h"
@@ -1405,6 +1406,590 @@ out:
     return 0;
 }
 
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+/* S2's primitive, the stream fills' bypass reader: coli_v4_expert_store_read_private
+ * must return bit for bit the bytes a lease returns -- whichever loaded an expert, the
+ * same bytes reach the device -- while touching none of the store's counters or slots:
+ * a fill through it neither fills nor evicts the cache, and a slot a lease holds
+ * survives it. The lease path's own counters then still move as always (the
+ * counter-assert), which is what lets an arm compare hit rates. */
+static int tensor_bytes_equal(const ColiTensorView *a, const ColiTensorView *b) {
+    return a->format == b->format && a->rows == b->rows && a->columns == b->columns &&
+           a->block_rows == b->block_rows && a->block_columns == b->block_columns &&
+           a->data_bytes == b->data_bytes && a->scale_bytes == b->scale_bytes &&
+           memcmp(a->data, b->data, a->data_bytes) == 0 &&
+           memcmp(a->scales, b->scales, a->scale_bytes) == 0;
+}
+static int test_expert_store_read_private(void) {
+    char directory[] = "colibri-v4-bypass-XXXXXX";
+    char path[256], error[256];
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    setenv("COLI_V4_ROWS16", "0", 1);
+    if (!mkdtemp(directory)) { perror("mkdtemp bypass"); return 1; }
+    snprintf(path, sizeof(path), "%s/model.safetensors", directory);
+    if (write_fixture(path) != 0) { perror("write_fixture"); return 1; }
+    ColiDeepSeekV4ExpertStoreOptions options = { directory, 1, 7, 306, -1, 0, 0, 0 };
+    ColiExpertStore *store = NULL;
+    unsigned char *stage = NULL;
+    int failed = 0;
+    if (coli_deepseek_v4_expert_store_open(&options, &store,
+                                            error, sizeof(error)) != 0) {
+        fprintf(stderr, "%s\n", error);
+        failed = 1;
+        goto out;
+    }
+    uint64_t record = coli_v4_expert_store_record_bytes(store);
+    if (record != 51) {
+        fprintf(stderr, "record bytes %llu, want 51\n", (unsigned long long)record);
+        failed = 1;
+        goto out;
+    }
+    if (posix_memalign((void **)&stage, 4096, (size_t)record + 8192u)) {
+        fprintf(stderr, "no stage buffer\n");
+        failed = 1;
+        goto out;
+    }
+    /* the lease's bytes of expert 3, held so its slot cannot be evicted under the test */
+    ColiExpertView leased;
+    if (coli_expert_lookup(store, (ColiExpertKey){0, 3}, &leased) != 0 ||
+        !expect_fixture_expert(&leased, 3)) {
+        fprintf(stderr, "lease of expert 3 failed\n");
+        failed = 1;
+        goto out;
+    }
+    ColiExpertStoreStats before, after;
+    store->ops->stats(store, &before);
+    if (before.requests != 1 || before.misses != 1 || before.resident_bytes != 51) {
+        fprintf(stderr, "stats before the bypass: requests=%llu misses=%llu resident=%llu\n",
+                (unsigned long long)before.requests, (unsigned long long)before.misses,
+                (unsigned long long)before.resident_bytes);
+        failed = 1;
+        goto out;
+    }
+    for (int expert = 0; expert < 7 && !failed; expert++) {
+        ColiExpertView view;
+        if (coli_v4_expert_store_read_private(store, (ColiExpertKey){0, expert},
+                                              stage, &view) != 0 ||
+            !expect_fixture_expert(&view, expert)) {
+            fprintf(stderr, "bypass read of expert %d failed\n", expert);
+            failed = 1;
+            break;
+        }
+        if (expert == 3 &&   /* bit for bit the lease's bytes, expert 3's own */
+            !(tensor_bytes_equal(&view.gate, &leased.gate) &&
+              tensor_bytes_equal(&view.up, &leased.up) &&
+              tensor_bytes_equal(&view.down, &leased.down))) {
+            fprintf(stderr, "bypass bytes differ from the lease's\n");
+            failed = 1;
+        }
+    }
+    store->ops->stats(store, &after);
+    if (after.requests != before.requests || after.hits != before.hits ||
+        after.misses != before.misses || after.bytes_read != before.bytes_read ||
+        after.resident_bytes != before.resident_bytes) {
+        fprintf(stderr, "the bypass moved the store: requests %llu->%llu hits %llu->%llu "
+                "misses %llu->%llu bytes %llu->%llu resident %llu->%llu\n",
+                (unsigned long long)before.requests, (unsigned long long)after.requests,
+                (unsigned long long)before.hits, (unsigned long long)after.hits,
+                (unsigned long long)before.misses, (unsigned long long)after.misses,
+                (unsigned long long)before.bytes_read, (unsigned long long)after.bytes_read,
+                (unsigned long long)before.resident_bytes, (unsigned long long)after.resident_bytes);
+        failed = 1;
+    }
+    coli_expert_release(store, &leased);
+    /* the counter-assert: the lease path still counts as always, the leased slot
+     * survived every bypass read (a hit) and a cold lease still misses */
+    ColiExpertView again;
+    if (coli_expert_lookup(store, (ColiExpertKey){0, 3}, &again) != 0) {
+        fprintf(stderr, "re-lease of expert 3 failed\n");
+        failed = 1;
+    } else coli_expert_release(store, &again);
+    ColiExpertView cold;
+    if (coli_expert_lookup(store, (ColiExpertKey){0, 4}, &cold) != 0) {
+        fprintf(stderr, "lease of expert 4 failed\n");
+        failed = 1;
+    } else coli_expert_release(store, &cold);
+    store->ops->stats(store, &after);
+    if (after.requests != 3 || after.hits != 1 || after.misses != 2 ||
+        after.resident_bytes != 102) {
+        fprintf(stderr, "stats after the re-leases: requests=%llu hits=%llu misses=%llu "
+                "resident=%llu (want 3/1/2/102)\n",
+                (unsigned long long)after.requests, (unsigned long long)after.hits,
+                (unsigned long long)after.misses, (unsigned long long)after.resident_bytes);
+        failed = 1;
+    }
+out:
+    compat_aligned_free(stage);
+    if (store) store->ops->destroy(store);
+    if (scratch_remove(directory, path)) return 1;
+    if (failed) return 1;
+    puts("DeepSeek-V4 ExpertStore read_private: ok");
+    return 0;
+}
+#endif /* COLI_VULKAN || COLI_CUDA */
+
+/* S7, the engine-store MFU cache (S-store map §5a/§5b/§5c-seed): the
+ * decode-only mfu table beside the store. Four behaviours:
+ *   hit_rate_d      -- decode_phase(1) lookups count requests_decode/hits_decode,
+ *                      prefill-phase lookups do not;
+ *   persistence     -- the fork's rule: <model>/.coli_mfu is saved at destroy iff
+ *                      a decode selection was recorded, knob or no knob, and a
+ *                      run that recorded nothing leaves no file (default-off
+ *                      byte-identity for the file, alongside the suite's other
+ *                      default-path tests for the policy itself);
+ *   the seed        -- COLI_V4_PREWARM=1 ranks each layer by .coli_mfu when it
+ *                      has seen the layer (not by the merged .coli_usage), and
+ *                      re-stamps LRU age in reverse rank order so the first
+ *                      miss eats the coldest seed, not the hottest;
+ *   the freeze      -- COLI_V4_FROZEN_PCT rides the pin machinery: a recency
+ *                      storm cannot evict the frozen set, and the same storm
+ *                      without the knob evicts exactly those experts. */
+static int test_expert_store_mfu(void) {
+    enum { LAYERS = 2, EXPERTS = 16, SLOTS = 8, NARROW = 6 };
+    char directory[] = "colibri-v4-mfu-XXXXXX";
+    char path[256], mfu_path[300], usage_path[300], error[256];
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    setenv("COLI_V4_ROWS16", "0", 1);
+    unsetenv("COLI_V4_PREWARM");
+    unsetenv("COLI_V4_FROZEN_PCT");
+    if (!mkdtemp(directory)) { perror("mkdtemp mfu"); return 1; }
+    snprintf(path, sizeof(path), "%s/model.safetensors", directory);
+    snprintf(mfu_path, sizeof(mfu_path), "%s/.coli_mfu", directory);
+    snprintf(usage_path, sizeof(usage_path), "%s/.coli_usage", directory);
+    if (write_fixture_layers(path, LAYERS, EXPERTS)) {
+        perror("write mfu fixture");
+        rmdir(directory);
+        return 1;
+    }
+    int failed = 0;
+    ColiExpertStore *store = NULL;
+    ColiExpertStoreStats stats;
+    ColiDeepSeekV4ExpertStoreOptions options = {
+        directory, LAYERS, EXPERTS, (uint64_t)LAYERS * SLOTS * 51, -1, 0, 0, 0
+    };
+
+    /* -- hit_rate_d counts decode lookups only -- */
+    if (coli_deepseek_v4_expert_store_open(&options, &store, error, sizeof(error))) {
+        fprintf(stderr, "mfu store open failed: %s\n", error);
+        failed = 1;
+        goto out;
+    }
+    coli_v4_expert_store_decode_phase(store, 1);
+    for (int i = 0; i < 3 && !failed; i++)
+        failed = lookup_fixture_at(store, 0, i % 2, EXPERTS);   /* miss, hit, miss */
+    coli_v4_expert_store_decode_phase(store, 0);
+    for (int i = 0; i < 2 && !failed; i++)
+        failed = lookup_fixture_at(store, 0, 2, EXPERTS);       /* miss, hit */
+    store->ops->stats(store, &stats);
+    if (stats.requests != 5 || stats.hits != 2 ||
+        stats.requests_decode != 3 || stats.hits_decode != 1) {
+        fprintf(stderr, "decode-only counters: requests=%llu hits=%llu "
+                "requests_decode=%llu hits_decode=%llu (want 5/2/3/1)\n",
+                (unsigned long long)stats.requests,
+                (unsigned long long)stats.hits,
+                (unsigned long long)stats.requests_decode,
+                (unsigned long long)stats.hits_decode);
+        failed = 1;
+    }
+    store->ops->destroy(store);
+    store = NULL;
+    /* nothing was recorded: the fork's rule leaves no file behind */
+    FILE *leftover = fopen(mfu_path, "r");
+    if (leftover) fclose(leftover);
+    if (!failed && leftover) {
+        fprintf(stderr, "a run with no recorded selection wrote %s\n", mfu_path);
+        failed = 1;
+    }
+    if (failed) goto out;
+
+    /* -- a recorded run persists, knob or no knob, and reloads -- */
+    if (coli_deepseek_v4_expert_store_open(&options, &store, error, sizeof(error))) {
+        fprintf(stderr, "mfu record store open failed: %s\n", error);
+        failed = 1;
+        goto out;
+    }
+    for (int i = 0; i < 3; i++)
+        coli_v4_expert_store_mfu_record(store, (ColiExpertKey){0, 0});
+    for (int i = 0; i < 2; i++)
+        coli_v4_expert_store_mfu_record(store, (ColiExpertKey){0, 5});
+    coli_v4_expert_store_mfu_record(store, (ColiExpertKey){1, 7});
+    store->ops->destroy(store);
+    store = NULL;
+    MfuTable table;
+    mfu_init(&table);
+    int load_result = mfu_load(&table, mfu_path);
+    if (load_result != 0 || table.total_accesses != 6 ||
+        mfu_count(&table, 0, 0) != 3 || mfu_count(&table, 0, 5) != 2 ||
+        mfu_count(&table, 1, 7) != 1) {
+        fprintf(stderr, ".coli_mfu round-trip: load=%d total=%llu "
+                "(0,0)=%u (0,5)=%u (1,7)=%u\n",
+                load_result,
+                (unsigned long long)table.total_accesses,
+                mfu_count(&table, 0, 0), mfu_count(&table, 0, 5),
+                mfu_count(&table, 1, 7));
+        failed = 1;
+        goto out;
+    }
+
+    /* -- the prewarm seed ranks by .coli_mfu, not the merged usage -- */
+    unlink(mfu_path);
+    mfu_init(&table);
+    table.counts[0 * MFU_EXPERTS_PER_LAYER + 2] = 100;
+    table.counts[0 * MFU_EXPERTS_PER_LAYER + 5] = 80;
+    table.counts[0 * MFU_EXPERTS_PER_LAYER + 9] = 60;
+    table.counts[0 * MFU_EXPERTS_PER_LAYER + 12] = 40;
+    table.counts[0 * MFU_EXPERTS_PER_LAYER + 7] = 30;
+    table.counts[0 * MFU_EXPERTS_PER_LAYER + 1] = 20;
+    table.counts[1 * MFU_EXPERTS_PER_LAYER + 1] = 50;
+    table.counts[1 * MFU_EXPERTS_PER_LAYER + 4] = 45;
+    if (mfu_save(&table, mfu_path)) { perror("mfu_save seed"); failed = 1; goto out; }
+    FILE *usage = fopen(usage_path, "w");   /* a usage history that ranks elsewhere */
+    if (!usage) { perror("usage seed"); failed = 1; goto out; }
+    for (int expert = 0; expert < NARROW; expert++)
+        fprintf(usage, "0 %d %d\n1 %d %d\n", expert, 90 - 10 * expert,
+                expert, 90 - 10 * expert);
+    fclose(usage);
+    setenv("COLI_V4_AUTOPIN", "1", 1);
+    setenv("COLI_V4_PREWARM", "1", 1);
+    ColiDeepSeekV4ExpertStoreOptions narrow = {
+        directory, LAYERS, EXPERTS, (uint64_t)LAYERS * NARROW * 51, -1, 0, 0, 0
+    };
+    if (coli_deepseek_v4_expert_store_open(&narrow, &store, error, sizeof(error))) {
+        fprintf(stderr, "mfu seed store open failed: %s\n", error);
+        failed = 1;
+        goto out;
+    }
+    store->ops->stats(store, &stats);
+    if (stats.requests) {
+        fprintf(stderr, "the mfu-seeded prewarm counted a request\n");
+        failed = 1;
+    }
+    for (int layer = 0; layer < LAYERS && !failed; layer++)
+        for (int expert = 0; expert < EXPERTS && !failed; expert++) {
+            int want = layer == 0
+                ? (expert == 1 || expert == 2 || expert == 5 || expert == 7 ||
+                   expert == 9 || expert == 12)
+                : (expert == 1 || expert == 4);
+            int have = coli_v4_test_expert_slot_index(
+                store, (ColiExpertKey){layer, expert}) >= 0;
+            if (have != want) {
+                fprintf(stderr, "mfu-seeded prewarm: layer %d expert %d %s\n",
+                        layer, expert,
+                        have ? "read but not in the mfu top"
+                             : "in the mfu top but not read");
+                failed = 1;
+            }
+        }
+    /* the re-stamp: the first miss eats the coldest seed (1), never the
+     * hottest (2) -- without it the fill order leaves expert 2 the oldest */
+    if (!failed) failed = lookup_fixture_at(store, 0, 0, EXPERTS);
+    if (!failed &&
+        (coli_v4_test_expert_slot_index(store, (ColiExpertKey){0, 2}) < 0 ||
+         coli_v4_test_expert_slot_index(store, (ColiExpertKey){0, 1}) >= 0)) {
+        fprintf(stderr, "the seed re-stamp: expert 2 evicted or expert 1 resident "
+                "after one cold miss\n");
+        failed = 1;
+    }
+    store->ops->destroy(store);
+    store = NULL;
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    unsetenv("COLI_V4_PREWARM");
+    unlink(usage_path);
+    unlink(mfu_path);
+    if (failed) goto out;
+
+    /* -- the frozen section survives a recency storm; without the knob the
+     * same storm eats exactly those experts -- */
+    mfu_init(&table);
+    table.counts[0 * MFU_EXPERTS_PER_LAYER + 3] = 100;
+    table.counts[0 * MFU_EXPERTS_PER_LAYER + 5] = 50;
+    if (mfu_save(&table, mfu_path)) { perror("mfu_save frozen"); failed = 1; goto out; }
+    setenv("COLI_V4_FROZEN_PCT", "100", 1);   /* 8 slots -> min(8, 8-6) = 2 frozen */
+    if (coli_deepseek_v4_expert_store_open(&options, &store, error, sizeof(error))) {
+        fprintf(stderr, "frozen store open failed: %s\n", error);
+        failed = 1;
+        goto out;
+    }
+    /* load every expert once (the frozen ones included), then storm the rest */
+    for (int expert = 0; expert < EXPERTS && !failed; expert++)
+        failed = lookup_fixture_at(store, 0, expert, EXPERTS);
+    for (int pass = 0; pass < 2 && !failed; pass++)
+        for (int expert = 0; expert < EXPERTS && !failed; expert++)
+            if (expert != 3 && expert != 5)
+                failed = lookup_fixture_at(store, 0, expert, EXPERTS);
+    if (!failed &&
+        (coli_v4_test_expert_slot_index(store, (ColiExpertKey){0, 3}) < 0 ||
+         coli_v4_test_expert_slot_index(store, (ColiExpertKey){0, 5}) < 0)) {
+        fprintf(stderr, "the recency storm evicted a frozen expert\n");
+        failed = 1;
+    }
+    store->ops->destroy(store);
+    store = NULL;
+    unsetenv("COLI_V4_FROZEN_PCT");
+    if (coli_deepseek_v4_expert_store_open(&options, &store, error, sizeof(error))) {
+        fprintf(stderr, "unfrozen store open failed: %s\n", error);
+        failed = 1;
+        goto out;
+    }
+    for (int expert = 0; expert < EXPERTS && !failed; expert++)
+        failed = lookup_fixture_at(store, 0, expert, EXPERTS);
+    for (int pass = 0; pass < 2 && !failed; pass++)
+        for (int expert = 0; expert < EXPERTS && !failed; expert++)
+            if (expert != 3 && expert != 5)
+                failed = lookup_fixture_at(store, 0, expert, EXPERTS);
+    if (!failed &&
+        (coli_v4_test_expert_slot_index(store, (ColiExpertKey){0, 3}) >= 0 ||
+         coli_v4_test_expert_slot_index(store, (ColiExpertKey){0, 5}) >= 0)) {
+        fprintf(stderr, "without COLI_V4_FROZEN_PCT the storm kept the mfu-hot "
+                "experts: the default is not today's policy\n");
+        failed = 1;
+    }
+
+out:
+    if (store) store->ops->destroy(store);
+    unsetenv("COLI_V4_FROZEN_PCT");
+    unsetenv("COLI_V4_PREWARM");
+    unlink(mfu_path);
+    unlink(usage_path);
+    if (scratch_remove(directory, path)) return 1;
+    if (failed) return 1;
+    puts("DeepSeek-V4 ExpertStore mfu: ok");
+    return 0;
+}
+
+/* ==== begin test_deepseek_v4_pilot.c ==== */
+/* COLI_VK_TIER_PILOT's lifecycle (the store unit's decode read-ahead): the
+ * non-hash fallback fires nothing, a fired prediction lands and the entry's
+ * own lookup hits the warm slot byte-identically, the pilot's reads move no
+ * demand book (requests/hits/misses stay zero while the slot turns resident),
+ * a misprediction costs a slot and nothing else, an entry that comes while
+ * the pilot's read is still on disk coalesces onto it (one disk read, exact
+ * bytes -- lookup_hot's single flight), and the depth knob clamps. The reads
+ * ride a gate hook so the in-flight leg is deterministic. */
+static pthread_mutex_t pilot_gate_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t pilot_gate_cond = PTHREAD_COND_INITIALIZER;
+static int pilot_gate_entered, pilot_gate_release, pilot_gate_reads;
+
+static void pilot_read_hook(ColiExpertKey key) {
+    (void)key;
+    pthread_mutex_lock(&pilot_gate_mutex);
+    pilot_gate_entered = 1;
+    pilot_gate_reads++;
+    pthread_cond_broadcast(&pilot_gate_cond);
+    while (!pilot_gate_release)
+        pthread_cond_wait(&pilot_gate_cond, &pilot_gate_mutex);
+    pthread_mutex_unlock(&pilot_gate_mutex);
+}
+
+static int pilot_wait_gate(int milliseconds) {
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_nsec += (long)milliseconds * 1000000L;
+    if (until.tv_nsec >= 1000000000L) {
+        until.tv_sec += until.tv_nsec / 1000000000L;
+        until.tv_nsec %= 1000000000L;
+    }
+    pthread_mutex_lock(&pilot_gate_mutex);
+    int entered = pilot_gate_entered;
+    while (!entered && pthread_cond_timedwait(&pilot_gate_cond,
+                                              &pilot_gate_mutex, &until) == 0)
+        entered = pilot_gate_entered;
+    pthread_mutex_unlock(&pilot_gate_mutex);
+    return entered;
+}
+
+static int pilot_expect_stats(ColiExpertStore *store, unsigned requests,
+                              unsigned hits, unsigned misses,
+                              unsigned long long resident) {
+    ColiExpertStoreStats stats;
+    store->ops->stats(store, &stats);
+    if (stats.requests != requests || stats.hits != hits ||
+        stats.misses != misses || stats.resident_bytes != resident) {
+        fprintf(stderr, "pilot stats mismatch: requests=%llu (want %u), hits=%llu "
+                        "(want %u), misses=%llu (want %u), resident=%llu (want %llu)\n",
+                (unsigned long long)stats.requests, requests,
+                (unsigned long long)stats.hits, hits,
+                (unsigned long long)stats.misses, misses,
+                (unsigned long long)stats.resident_bytes, resident);
+        return 1;
+    }
+    return 0;
+}
+
+typedef struct {
+    ColiExpertStore *store;
+    ColiExpertKey key;
+    ColiExpertView view;
+    int result;
+} PilotEntryJob;
+
+static void *pilot_entry_lookup(void *opaque) {
+    PilotEntryJob *job = opaque;
+    job->result = coli_expert_lookup(job->store, job->key, &job->view);
+    return NULL;
+}
+
+static int test_pilot(void) {
+    char directory[] = "colibri-v4-pilot-XXXXXX";
+    char path[256], error[256];
+    int failed = 0;
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    setenv("COLI_V4_ROWS16", "0", 1);
+    setenv("COLI_VK_TIER_PILOT", "1", 1);
+    setenv("COLI_VK_CHAIN_DPROF", "1", 1);
+    setenv("COLI_VK_TIER_PILOT_DEPTH", "99", 1);
+    coli_v4_test_pilot_env_reset();
+    if (v4_pilot_depth() != 8) {   /* clamped to the useful span */
+        fprintf(stderr, "pilot depth 99 clamped to %d, want 8\n", v4_pilot_depth());
+        return 1;
+    }
+    setenv("COLI_VK_TIER_PILOT_DEPTH", "0", 1);
+    coli_v4_test_pilot_env_reset();
+    if (v4_pilot_depth() != 1) {
+        fprintf(stderr, "pilot depth 0 clamped to %d, want 1\n", v4_pilot_depth());
+        return 1;
+    }
+    setenv("COLI_VK_TIER_PILOT_DEPTH", "1", 1);
+    coli_v4_test_pilot_env_reset();
+    if (!mkdtemp(directory)) { perror("mkdtemp"); return 1; }
+    snprintf(path, sizeof path, "%s/model.safetensors", directory);
+    if (write_fixture(path) != 0) { perror("write_fixture"); return 1; }
+    ColiDeepSeekV4ExpertStoreOptions options = { directory, 1, 7, 306, -1, 0, 0, 0 };
+    ColiExpertStore *store = NULL;
+    if (coli_deepseek_v4_expert_store_open(&options, &store, error,
+                                           sizeof error) != 0) {
+        fprintf(stderr, "%s\n", error);
+        return 1;
+    }
+    /* token 3 of a 7-expert hash layer selects {2, 5}; the other cells keep
+     * out-of-range ids, which the fire must skip without reading */
+    int64_t table[8 * 2];
+    for (int i = 0; i < 16; i++) table[i] = i / 2 == 3 ? (i % 2 ? 5 : 2) : 9;
+
+    /* a non-hash layer (no tid2eid) fires nothing: the fallback, exact */
+    coli_v4_test_pilot_fire(store, 0, 3, 2, NULL, 7, 8);
+    coli_v4_test_pilot_quiesce();
+    if (pilot_expect_stats(store, 0, 0, 0, 0)) failed = 1;
+
+    /* the prediction lands: two warm reads, zero demand books moved, the
+     * slots resident -- then the entry's own lookup hits one, byte-identical */
+    coli_v4_test_pilot_fire(store, 0, 3, 2, table, 7, 8);
+    coli_v4_test_pilot_quiesce();
+    if (pilot_expect_stats(store, 0, 0, 0, 102)) failed = 1;
+    if (coli_v4_test_pilot_stat(0) != 2 || coli_v4_test_pilot_stat(3) != 2 ||
+        coli_v4_test_pilot_stat(4) != 0) {
+        fprintf(stderr, "pilot issued/landed/failed = %llu/%llu/%llu, want 2/2/0\n",
+                coli_v4_test_pilot_stat(0), coli_v4_test_pilot_stat(3),
+                coli_v4_test_pilot_stat(4));
+        failed = 1;
+    }
+    v4_pilot_classify(0, 2);   /* the preload marker's question, at the entry */
+    v4_pilot_classify(0, 5);
+    v4_pilot_classify(0, 4);   /* never predicted: a cold read as today */
+    if (coli_v4_test_pilot_stat(5) != 2 || coli_v4_test_pilot_stat(7) != 1 ||
+        coli_v4_test_pilot_stat(6) != 0) {
+        fprintf(stderr, "pilot entry split hit/late/miss = %llu/%llu/%llu, want 2/0/1\n",
+                coli_v4_test_pilot_stat(5), coli_v4_test_pilot_stat(6),
+                coli_v4_test_pilot_stat(7));
+        failed = 1;
+    }
+    ColiExpertView warm;
+    if (coli_expert_lookup(store, (ColiExpertKey){0, 2}, &warm) != 0 ||
+        !expect_fixture_expert(&warm, 2)) {
+        fprintf(stderr, "the entry's read of a landed prediction is not exact\n");
+        failed = 1;
+    }
+    coli_expert_release(store, &warm);
+    if (pilot_expect_stats(store, 1, 1, 0, 102)) failed = 1;   /* the demand read counted, as a hit */
+
+    /* a misprediction: token 5's selections warm, nothing ever demands them
+     * -- two slots, no book, no byte of output anywhere */
+    int64_t mispredict[16];
+    for (int i = 0; i < 16; i++) mispredict[i] = i / 2 == 5 ? (i % 2 ? 6 : 1) : 9;
+    coli_v4_test_pilot_fire(store, 0, 5, 2, mispredict, 7, 8);
+    coli_v4_test_pilot_quiesce();
+    if (pilot_expect_stats(store, 1, 1, 0, 204)) failed = 1;
+
+    /* a re-fire of the resident prediction: no read, no books */
+    coli_v4_test_pilot_fire(store, 0, 3, 2, table, 7, 8);
+    coli_v4_test_pilot_quiesce();
+    if (pilot_expect_stats(store, 1, 1, 0, 204)) failed = 1;
+
+    /* an entry that comes while the pilot's read is on disk: one read, exact
+     * bytes -- the single flight, never two slabs */
+    int64_t late[2] = {4, 4};
+    pthread_mutex_lock(&pilot_gate_mutex);
+    pilot_gate_entered = pilot_gate_release = pilot_gate_reads = 0;
+    pthread_mutex_unlock(&pilot_gate_mutex);
+    coli_v4_test_expert_read_hook = pilot_read_hook;
+    coli_v4_test_pilot_fire(store, 0, 1, 1, late, 7, 8);
+    if (!pilot_wait_gate(5000)) {
+        fprintf(stderr, "the pilot's read never reached the disk hook\n");
+        failed = 1;
+    }
+    if (!failed) {
+        v4_pilot_classify(0, 4);   /* still READING: the late class */
+        PilotEntryJob job = { store, {0, 4}, {{0}}, 0 };
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, pilot_entry_lookup, &job)) {
+            fprintf(stderr, "could not start the entry's lookup\n");
+            failed = 1;
+        } else {
+            struct timespec pause = {0, 100 * 1000000L};
+            nanosleep(&pause, NULL);   /* the entry parks on the load, or serves it */
+            pthread_mutex_lock(&pilot_gate_mutex);
+            pilot_gate_release = 1;
+            pthread_cond_broadcast(&pilot_gate_cond);
+            pthread_mutex_unlock(&pilot_gate_mutex);
+            pthread_join(thread, NULL);
+            if (job.result != 0 || !expect_fixture_expert(&job.view, 4)) {
+                fprintf(stderr, "the entry's read over an in-flight pilot is not exact\n");
+                failed = 1;
+            } else
+                coli_expert_release(store, &job.view);
+            if (pilot_gate_reads != 1) {
+                fprintf(stderr, "the coalesced read did not stay single: %d reads\n",
+                        pilot_gate_reads);
+                failed = 1;
+            }
+            if (coli_v4_test_pilot_stat(6) != 1) {
+                fprintf(stderr, "the in-flight prediction did not classify late\n");
+                failed = 1;
+            }
+        }
+    }
+    coli_v4_test_expert_read_hook = NULL;
+    pthread_mutex_lock(&pilot_gate_mutex);
+    pilot_gate_release = 1;
+    pthread_cond_broadcast(&pilot_gate_cond);
+    pthread_mutex_unlock(&pilot_gate_mutex);
+    coli_v4_test_pilot_quiesce();
+
+    /* unset: fire is a no-op, the lever off costs nothing */
+    unsetenv("COLI_VK_TIER_PILOT");
+    coli_v4_test_pilot_env_reset();
+    coli_v4_test_pilot_fire(store, 0, 3, 2, table, 7, 8);
+    coli_v4_test_pilot_quiesce();
+    if (pilot_expect_stats(store, 2, 2, 0, 255)) failed = 1;   /* only the late leg's demand read since */
+    setenv("COLI_VK_TIER_PILOT", "1", 1);
+
+    coli_v4_test_pilot_quiesce();
+    store->ops->destroy(store);   /* zero leases left: the drain held */
+    unsetenv("COLI_VK_TIER_PILOT");
+    unsetenv("COLI_VK_CHAIN_DPROF");
+    unsetenv("COLI_VK_TIER_PILOT_DEPTH");
+    coli_v4_test_pilot_env_reset();
+    unlink(path);
+    if (scratch_remove(directory, path)) return 1;
+    if (failed) return 1;
+    puts("DeepSeek-V4 pilot read-ahead: ok");
+    return 0;
+}
+/* ==== end test_deepseek_v4_pilot.c ==== */
+
 /* The CUDA expert bank's books (coli_v4_expert_store_touch_union and
  * note_union). The bank reads each routed expert once per layer per prompt,
  * uncounted, and hands the store each chunk's routing (the router's ids, every
@@ -1860,6 +2445,7 @@ static int test_expert_store_union_recency(void) {
          "reads, base store no-op)");
     return 0;
 }
+
 /* ==== end test_deepseek_v4_expert_store.c ==== */
 
 /* ==== begin test_deepseek_v4_kv_cache.c ==== */
@@ -2412,7 +2998,249 @@ static int test_fp8_decode_batch_order(void) {
     return 0;
 }
 
+#ifdef COLI_VULKAN
+#include "../backend_vulkan.h"
+#endif
+
+/* `forkdec`: the forked decode path's store-side seam (COLI_VK_V4_DECODE_PATH=fork,
+ * vk-tier-check's seventh leg names this case; the alias seam end-to-end is
+ * deepseek-v4-tiny-check-forkdec's token-exact oracle). The fixture keeps every
+ * record 16-byte aligned (48 B of scales then 48 B of weights an expert) so the
+ * registry alias's descriptor offsets align, and ONE slot a layer so a second
+ * expert rewrites the first's slot in place -- the fork's LRU rewrite, the exact
+ * hazard the per-token alias model must survive (no content-keyed alias persists,
+ * every alias reads the slot's CURRENT bytes). Optional argv[2] is the shader path:
+ * given and a device comes up, the registry path itself is asserted (slot in the
+ * arena, alias geometry + the wide verdict off the slab's own bytes, free(t)
+ * lifetime); without it the case asserts the ladder -- slots fall back to malloc,
+ * the store serves byte-identical records either way. */
+static int forkdec_write_fixture(const char *path) {
+    static const char *matrix_names[3] = {"w1", "w2", "w3"};
+    const int experts = 8, per_cell = 3264;   /* 3x64B scales + 3x1KB weights; 6 slots of the 8 */
+    size_t header_capacity = 8192;
+    char *header = malloc(header_capacity);
+    size_t payload_size = 16 + (size_t)experts * per_cell;
+    unsigned char *payload = malloc(payload_size);
+    if (!header || !payload) { free(payload); free(header); return -1; }
+    size_t used = (size_t)snprintf(
+        header, header_capacity,
+        "{\"resident\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}");
+    for (int expert = 0; expert < experts; expert++) {
+        size_t cell = 16 + (size_t)expert * per_cell;
+        for (int matrix = 0; matrix < 3; matrix++) {
+            int count = snprintf(
+                header + used, header_capacity - used,
+                ",\"layers.0.ffn.experts.%d.%s.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[1,64],"
+                "\"data_offsets\":[%zu,%zu]}",
+                expert, matrix_names[matrix], cell + (size_t)matrix * 64,
+                cell + (size_t)matrix * 64 + 64);
+            if (count < 0 || (size_t)count >= header_capacity - used) {
+                free(payload); free(header); return -1; }
+            used += (size_t)count;
+        }
+        for (int matrix = 0; matrix < 3; matrix++) {
+            int count = snprintf(
+                header + used, header_capacity - used,
+                ",\"layers.0.ffn.experts.%d.%s.weight\":{\"dtype\":\"I8\",\"shape\":[1,1024],"
+                "\"data_offsets\":[%zu,%zu]}",
+                expert, matrix_names[matrix], cell + 192 + (size_t)matrix * 1024,
+                cell + 192 + (size_t)matrix * 1024 + 1024);
+            if (count < 0 || (size_t)count >= header_capacity - used) {
+                free(payload); free(header); return -1; }
+            used += (size_t)count;
+        }
+    }
+    if (used + 1 >= header_capacity) { free(payload); free(header); return -1; }
+    header[used++] = '}';
+    header[used] = '\0';
+    for (size_t i = 0; i < payload_size; i++) payload[i] = 0;
+    for (int expert = 0; expert < experts; expert++) {
+        size_t cell = 16 + (size_t)expert * per_cell;
+        for (int m = 0; m < 3; m++)
+            for (int b = 0; b < 64; b++) {
+                /* ue8m0 exponents: 128..135 (narrow) everywhere but expert 1's gate
+                 * scale[0] = 145, past the f16 verdict's 140 line (a wide tensor) */
+                payload[cell + (size_t)m * 64 + b] =
+                    (expert == 1 && m == 0 && b == 0) ? 145
+                    : (unsigned char)(128 + ((expert + m) & 7));
+            }
+        for (int m = 0; m < 3; m++)
+            for (int b = 0; b < 1024; b++)
+                payload[cell + 192 + (size_t)m * 1024 + b] =
+                    (unsigned char)(expert * 3 + m);   /* every weight byte names its (expert, matrix) */
+    }
+    uint64_t header_length = used;
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY | COMPAT_O_BINARY, 0600);
+    if (fd < 0) { free(payload); free(header); return -1; }
+    int result = write_all(fd, &header_length, sizeof(header_length)) ||
+                 write_all(fd, header, (size_t)header_length) ||
+                 write_all(fd, payload, payload_size);
+    close(fd);
+    free(payload);
+    free(header);
+    return result ? -1 : 0;
+}
+
+static int forkdec_expect_view(const ColiExpertView *view, int expert) {
+    const unsigned char *gs = view->gate.scales, *gd = view->gate.data,
+                        *dd = view->down.data, *ud = view->up.data;
+    /* the record's packed layout: scales [0,192), weights [192, 3264) as w1 w2 w3;
+     * every weight byte names its (expert, matrix) -- a stale slot's bytes cannot pass */
+    return view->gate.format == COLI_TENSOR_FP4_NATIVE_BLOCK &&
+           view->gate.rows == 1 && view->gate.columns == 2048 &&
+           view->gate.data_bytes == 1024 && view->gate.scale_bytes == 64 &&
+           (size_t)(gd - gs) == 192 && (size_t)(dd - gs) == 192 + 1024 &&
+           (size_t)(ud - gs) == 192 + 2048 &&
+           gs[0] == (unsigned char)(expert == 1 ? 145 : 128 + (expert & 7)) &&
+           gd[0] == (unsigned char)(expert * 3) &&
+           dd[0] == (unsigned char)(expert * 3 + 1) &&
+           ud[0] == (unsigned char)(expert * 3 + 2);
+}
+
+static int test_forkdec(const char *spv) {
+    char directory[] = "colibri-v4-forkdec-XXXXXX";
+    char path[256], error[256];
+    int failed = 0, device = 0;
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    setenv("COLI_VK_TIER_EXPERTS", "1", 1);
+    setenv("COLI_VK_V4_DECODE_PATH", "fork", 1);
+#ifdef COLI_VULKAN
+    if (spv && *spv) device = coli_vk_init(spv);   /* 0: no device -- the ladder path */
+#endif
+    if (!mkdtemp(directory)) { perror("mkdtemp"); return 1; }
+    snprintf(path, sizeof path, "%s/model.safetensors", directory);
+    if (forkdec_write_fixture(path) != 0) { perror("forkdec_write_fixture"); return 1; }
+    ColiDeepSeekV4ExpertStoreOptions options = { directory, 1, 8, 6 * 3264, -1, 0, 0, 0 };   /* 6 of the 8 experts: victims exist */
+    ColiExpertStore *store = NULL;
+    if (coli_deepseek_v4_expert_store_open(&options, &store, error, sizeof error)) {
+        fprintf(stderr, "%s\n", error);
+        return 1;
+    }
+    ColiExpertView view;
+    const unsigned char *slab = NULL;
+    /* the round table: 0..5 fill every slot, 6 takes the LRU victim (expert 0's slot,
+     * rewritten in place -- the fork's rewrite model), then 1 (a hit, the wide-tensor
+     * alias case) and 0 again (another rewrite, back to the first expert's bytes) */
+    static const int rounds[] = {0, 1, 2, 3, 4, 5, 6, 1, 0};
+    for (unsigned round = 0; round < sizeof rounds / sizeof rounds[0]; round++) {
+        int expert = rounds[round];
+        if (coli_expert_lookup(store, (ColiExpertKey){0, expert}, &view)) {
+            fprintf(stderr, "forkdec: lookup round %d failed\n", round);
+            failed = 1;
+            break;
+        }
+        if (!forkdec_expect_view(&view, expert)) {
+            fprintf(stderr, "forkdec: round %d served expert %d's bytes wrong (stale slot rewrite?)\n",
+                    round, expert);
+            failed = 1;
+        }
+        size_t bytes = 0;
+        const unsigned char *s = coli_v4_expert_store_view_slab(store, &view, &bytes);
+        if (!s || bytes != 3264) {
+            fprintf(stderr, "forkdec: round %u (expert %d) view_slab refused (bytes=%zu)\n",
+                    round, expert, bytes);
+            failed = 1;
+        } else if (round == 0)
+            slab = s;   /* expert 0's slot: round 6 (expert 6) must REWRITE this very one */
+        else if (round == 6 && s != slab) {
+            fprintf(stderr, "forkdec: expert 6 did not rewrite expert 0's slot in place (%p -> %p)\n",
+                    (const void *)slab, (const void *)s);
+            failed = 1;
+        }
+#ifdef COLI_VULKAN
+        if (device) {
+            ColiVkSlabReg *reg = NULL;
+            size_t base = (size_t)-1;
+            if (!coli_vk_slabreg_lookup(s, &reg, &base) || base != 0) {
+                fprintf(stderr, "forkdec: round %d's slab is not the registry's (base=%zd)\n",
+                        round, (ssize_t)base);
+                failed = 1;
+            } else {
+                /* the alias seam's geometry, exactly as v4_vk_alias_src fills it: the
+                 * three matrices' woff/soff off the slot's own slab */
+                static const int woff[3] = {192, 2240, 1216}, soff[3] = {0, 128, 64};   /* w1 w3 w2 */
+                for (int m = 0; m < 3; m++) {
+                    ColiVkTensor *t = NULL;
+                    if (!coli_vk_slabreg_alias(reg, s, (size_t)woff[m], (size_t)soff[m],
+                                               15, 2048, 1, 32, -1, &t)) {
+                        fprintf(stderr, "forkdec: round %u (expert %d) matrix %d alias refused\n",
+                                round, expert, m);
+                        failed = 1;
+                        continue;
+                    }
+                    ColiVkTensorInfo info;
+                    if (!coli_vk_tensor_info(t, &info) || info.fmt != 15 || info.I != 2048 ||
+                        info.O != 1 || info.rowWords != 256) {
+                        fprintf(stderr, "forkdec: round %u (expert %d) matrix %d geometry wrong\n",
+                                round, expert, m);
+                        failed = 1;
+                    }
+                    /* the wide verdict: the scan of the slab's own scale bytes -- expert 1's
+                     * gate (m=0) is the one past 140, every other tensor narrow */
+                    int want_wide = (expert == 1 && m == 0);
+                    if (info.wide != want_wide) {
+                        fprintf(stderr, "forkdec: round %u (expert %d) matrix %d wide=%d, want %d\n",
+                                round, expert, m, (int)info.wide, want_wide);
+                        failed = 1;
+                    }
+                    coli_vk_tensor_free(t);   /* free(t): owns nothing, the slab stays */
+                }
+                /* a registry tensor's free must leave the slot serving (no handle went away) */
+                ColiExpertView again;
+                if (coli_expert_lookup(store, (ColiExpertKey){0, expert}, &again) ||
+                    !forkdec_expect_view(&again, expert)) {
+                    fprintf(stderr, "forkdec: round %u (expert %d) re-lookup after alias frees failed\n",
+                            round, expert);
+                    failed = 1;
+                } else
+                    coli_expert_release(store, &again);
+            }
+        }
+#endif
+        coli_expert_release(store, &view);
+    }
+#ifdef COLI_VULKAN
+    if (!device)
+        fprintf(stderr, "forkdec: no Vulkan device -- the malloc ladder served every round\n");
+#endif
+    store->ops->destroy(store);   /* zero leases: the registry slabs go back here */
+#ifdef COLI_VULKAN
+    if (device && slab) {   /* the store's destroy returned the slab's buffer: gone */
+        ColiVkSlabReg *reg = NULL;
+        if (coli_vk_slabreg_lookup(slab, &reg, NULL)) {
+            fprintf(stderr, "forkdec: the destroyed store's slab is still registered\n");
+            failed = 1;
+        }
+    }
+#endif
+    unlink(path);
+    rmdir(directory);
+    if (failed) return 1;
+    puts("DeepSeek-V4 forkdec: registry slots, in-place rewrites, alias lifetime ok");
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    /* `pilot` runs only the read-ahead case: vk-tier-check's fifth leg names it
+     * (the pilot lives in this store unit, deepseek_v4.c -- not in VK_OBJ), so
+     * the leg needs this binary's one case without the rest of the suite. */
+    if (argc > 1 && !strcmp(argv[1], "pilot")) {
+        if (test_pilot() != 0) {
+            fprintf(stderr, "FAIL: test_pilot\n");
+            return 1;
+        }
+        return 0;
+    }
+    /* `forkdec` (argv[2] = the shader path, optional): the forked decode path's
+     * store seam, vk-tier-check's seventh leg. */
+    if (argc > 1 && !strcmp(argv[1], "forkdec")) {
+        if (test_forkdec(argc > 2 ? argv[2] : NULL) != 0) {
+            fprintf(stderr, "FAIL: test_forkdec\n");
+            return 1;
+        }
+        return 0;
+    }
     if (test_fp8_decode_batch_order() || test_sparse_attention_parallel_order() ||
         test_route_bf16_parallel_order() || test_fp8_grouped_projection()) return 1;
     if (test_attention_cache() != 0) {
@@ -2455,6 +3283,20 @@ int main(int argc, char **argv) {
         fprintf(stderr, "FAIL: test_expert_store_prewarm\n");
         return 1;
     }
+    if (test_expert_store_mfu() != 0) {
+        fprintf(stderr, "FAIL: test_expert_store_mfu\n");
+        return 1;
+    }
+    if (test_pilot() != 0) {
+        fprintf(stderr, "FAIL: test_pilot\n");
+        return 1;
+    }
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+    if (test_expert_store_read_private() != 0) {
+        fprintf(stderr, "FAIL: test_expert_store_read_private\n");
+        return 1;
+    }
+#endif
     if (test_expert_store_bank_books() != 0) {
         fprintf(stderr, "FAIL: test_expert_store_bank_books\n");
         return 1;

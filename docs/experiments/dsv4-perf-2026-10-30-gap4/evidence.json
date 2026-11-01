@@ -1,0 +1,165 @@
+{
+ "version": 1,
+ "hypothesis": "Inside the opt-in COLI_VULKAN=1 backend, the five default-on probe-gated levers (COLI_VK_TIER_EXPERTS, COLI_VK_V4_DECODE_PATH=fork, COLI_VK_V4_S1GEMV, COLI_VK_TIER_DECODE_GROW, COLI_VK_CHAIN_ATTN_FA) lift DeepSeek V4 decode throughput over the upstream base path by tens of percent at equal TTFT, and the one-line opt-in stage shape (COLI_VK_PROFILE=RDNA2 + COLI_VK_TIER_HOST_GB=2) additionally cuts TTFT by ~45% — the PR's two headline claims, measured same-session on one rig",
+ "commit": "739727c8e668a9f0960346248d79313d20f3ed93",
+ "model": "DeepSeek-V4-Flash, 160 GB on-disk checkpoint (/root/Projects/colibri-v4-docker/models/DeepSeek-V4-Flash), .coli_usage/.coli_mfu expert-history snapshots restored before every leg; no other model",
+ "command": "bench/up2276/run-arm2276.sh \"<engine-c-dir>\" \"<tag>\" [ENV=..] per leg (systemd-run scope MemoryMax=RAM_GB+6G, COLI_TEMP=0 KVSAVE=0 V4_PREFIX_CKPT=0 COLI_VULKAN=1 COLI_V4_PREWARM=0 OMP_NUM_THREADS=16 OMP_PROC_BIND=close OMP_PLACES=cores, --prompt-file prompt_2k --max-tokens 64 --memory-gb 16), legs interleaved; commit = the campaign integration tree post chunk-fix (port/pr-perf lineage, flattened into this PR's single commit cb0a0a91771c72dab6822eebb2e0fa648c499022); the upstream arm ran the campaign's upstream anchor binary (c1c06ac6-era, same gap2/gap3 U binary)",
+ "prompt_hash": "sha256:2e06e22974e445d49e623405d10b4f065bcb88369f63aeff8c9cba0aa904cc3d (bench/prompt_2k.txt, 8,944 bytes, the campaign's fixed 2,515-token prompt; v4_tokens prompt=2515 generated=64 in every raw log)",
+ "hardware": {
+  "cpu": "12th Gen Intel Core i9-12900K, 18 cores seen by the scheduler ([OMP] effective team size 16, bound close/cores)",
+  "ram": "38 GiB DDR5",
+  "storage": "NVMe (Crucial P5 2TB), f2fs root; the model on the same root",
+  "os": "Arch Linux, kernel 7.1.11, gcc 16.2.1, Vulkan 1.4.357 (Mesa RADV 26.2.1); the device: AMD Radeon RX 6900 XT (RADV NAVI21, RDNA2, no cooperative matrices, 64 KiB shared memory a workgroup), with a display co-tenant at ~1.9-2.6 GiB VRAM (each leg's vram0= stamp, inside the 3584 MiB gate ceiling by design)"
+ },
+ "warmup_runs": 0,
+ "changed_variables": [
+  "COLI_VK_LEGACY"
+ ],
+ "baseline": {
+  "config": {
+   "COLI_VK_LEGACY": "1 (the aggregate hatch: every default-on lever off; proven byte-equal to all-levers-=0 and to the upstream base by c/tests/vulkan_strict.sh)",
+   "COLI_VK_PROFILE": "unset",
+   "COLI_VK_TIER_HOST_GB": "unset",
+   "REGIME": "VRAM_MAX_USED_MB=3584 RAM_GB=16 COLI_BENCH_MEMORY_GB=24, prompt_2k 2,515 tokens, 64 decode tokens",
+   "BUILD": "make VK=1, campaign integration tree @ 739727c8"
+  },
+  "samples": {
+   "tok_s": [
+    0.6459,
+    0.7124
+   ],
+   "ttft_s": [
+    263.62,
+    270.442
+   ],
+   "wall_s": [
+    361.161,
+    358.873
+   ],
+   "raw": [
+    "legacy-r4.raw.txt",
+    "legacy-r5.raw.txt"
+   ]
+  },
+  "median_tok_s": 0.67915,
+  "quality": {
+   "method": "every shipped leg rc=0 with its full boot/generation log in-tree (43/43 chain layers, tier budget 6.40 GiB = 448 experts fmt 15, FA and every lever's 'legacy (COLI_VK_LEGACY=1)' boot lines in the raw logs); the levers' correctness gates re-verified on the flattened PR commit cb0a0a91 by the 2026-10-31 independent audit: make check VK=1 green (2,787 OK), vk-tier-check (9 legs incl. LEGACY), vk-chain-check, vk-strict-check (LEGACY=1 == base byte-identity), tiny oracle",
+   "passed": true
+  },
+  "evidence": {
+   "uri": "docs/experiments/dsv4-perf-2026-10-30-gap4/ (legacy-r4.raw.txt, legacy-r5.raw.txt verbatim from /root/bench-colibri/up2276/gap4-legacy-r{4,5}.log; samples.txt; sha256sums.txt — the sha256 below covers the eight raw logs of this record in name order)",
+   "sha256": "955a8e0399981de7fc300fc398d31db93990e390856b0757e6b3729fa52541f0"
+  }
+ },
+ "trial": {
+  "config": {
+   "COLI_VK_LEGACY": "unset (the five default-on levers armed: TIER_EXPERTS, V4_DECODE_PATH=fork, V4_S1GEMV, TIER_DECODE_GROW, CHAIN_ATTN_FA; one boot line per lever in each raw log)",
+   "COLI_VK_PROFILE": "unset",
+   "COLI_VK_TIER_HOST_GB": "unset",
+   "REGIME": "VRAM_MAX_USED_MB=3584 RAM_GB=16 COLI_BENCH_MEMORY_GB=24, prompt_2k 2,515 tokens, 64 decode tokens",
+   "BUILD": "make VK=1, campaign integration tree @ 739727c8"
+  },
+  "samples": {
+   "tok_s": [
+    0.9544,
+    0.9714
+   ],
+   "ttft_s": [
+    248.015,
+    235.782
+   ],
+   "wall_s": [
+    314.022,
+    300.637
+   ],
+   "raw": [
+    "defaults-r4.raw.txt",
+    "defaults-r5.raw.txt"
+   ]
+  },
+  "median_tok_s": 0.9629,
+  "quality": {
+   "method": "every shipped leg rc=0 with its full boot/generation log in-tree (43/43 chain layers, decode-path=fork arena=13.39GiB engaged, s1gemv armed, cs experts armed, FA engaged, decode grow armed, probe wait 201 ms); gates as the baseline arm — re-verified at cb0a0a91 by the 2026-10-31 audit (make check 2,787, the full VK suite, tiny-fixture byte-identity across base / LEGACY=1 / defaults)",
+   "passed": true
+  },
+  "evidence": {
+   "uri": "docs/experiments/dsv4-perf-2026-10-30-gap4/ (defaults-r4.raw.txt, defaults-r5.raw.txt verbatim from /root/bench-colibri/up2276/gap4-defaults-r{4,5}.log; samples.txt; sha256sums.txt — the sha256 below covers the eight raw logs of this record in name order)",
+   "sha256": "955a8e0399981de7fc300fc398d31db93990e390856b0757e6b3729fa52541f0"
+  }
+ },
+ "outcome": "improvement",
+ "session": {
+  "date": "2026-10-30",
+  "window_log": "/root/bench-colibri/up2276/gap4-window.log (cited, not copied: the session's launches, gate refusals and pre-fix reps)",
+  "postfix_legs": "gap4-full2-r{1,2,3} 14:08-14:16, gap4-defaults-r{4,5} 14:30-14:41, gap4-legacy-r{4,5} 14:36-14:48 (log mtimes); gap4-diag-r{1,2} 13:17-13:23 are the fix's diagnosis legs",
+  "excluded": "the pre-fix shadow-era reps of the same arms (gap4-legacy-r1/r2/r3, gap4-defaults-r1/r3, gap4-defprof-r1..r3; TTFT 438.7-552.3 s under the upstream window-probe shadow, a different code state before 739727c8) stay in the campaign logs — quoted by the PR as the regression's before-picture, not part of these arms"
+ },
+ "arms": {
+  "legacy": {
+   "env": "COLI_VK_LEGACY=1",
+   "legs": ["legacy-r4.raw.txt", "legacy-r5.raw.txt"],
+   "n": 2,
+   "decode_toks": [0.6459, 0.7124],
+   "ttft_s": [263.62, 270.442],
+   "wall_s": [361.161, 358.873],
+   "decode_median": 0.67915,
+   "ttft_median_s": 267.031,
+   "mem_peak_gib": [17.26, 17.48]
+  },
+  "defaults": {
+   "env": "(none — env-free, the levers' defaults)",
+   "legs": ["defaults-r4.raw.txt", "defaults-r5.raw.txt"],
+   "n": 2,
+   "decode_toks": [0.9544, 0.9714],
+   "ttft_s": [248.015, 235.782],
+   "wall_s": [314.022, 300.637],
+   "decode_median": 0.9629,
+   "ttft_median_s": 241.899,
+   "mem_peak_gib": [16.19, 12.52]
+  },
+  "oneline_shape": {
+   "env": "COLI_VK_PROFILE=RDNA2 COLI_VK_TIER_HOST_GB=2 over the defaults (the PR's one-line recommended shape; the session's full2 tag)",
+   "legs": ["full2-r1.raw.txt", "full2-r2.raw.txt", "full2-r3.raw.txt"],
+   "n": 3,
+   "decode_toks": [0.9155, 1.0413, 0.9244],
+   "ttft_s": [139.8, 148.759, 147.535],
+   "wall_s": [208.612, 209.258, 215.687],
+   "decode_median": 0.9244,
+   "ttft_median_s": 147.535,
+   "mem_peak_gib": [12.13, 12.28, 12.44],
+   "notes": "the profile's ttft-stage set rides the queued 2,515-token prompt (profile: RDNA2 -> ttft, prompt 2515 tokens >= 1000): prompt chunks of up to 2048 rows vs the defaults' 768, host pool 2.00 GiB = 160 experts"
+  },
+  "upstream_engine": {
+   "env": "(none on the campaign's upstream anchor binary — upstream's own engine, not this PR's tree)",
+   "legs": ["uvk-r3.raw.txt"],
+   "n": 1,
+   "decode_toks": [0.7291],
+   "ttft_s": [263.635],
+   "wall_s": [350.039],
+   "decode_median": 0.7291,
+   "ttft_median_s": 263.635,
+   "mem_peak_gib": [17.97],
+   "notes": "fmt-7 tier of 320 experts in 5.65 GiB, chain 43/43, no lever lines, no probe wait (the shadow only collapses the fit beside a co-tenant on later upstream builds — see the 2026-10-31 audit2 record); r1/r2 were refused by the pre-run VRAM gate (co-tenant 3794-5758 MiB over the 3584 ceiling), on record in gap4-window.log"
+  }
+ },
+ "n_disclosure": {
+  "legacy": 2,
+  "defaults": 2,
+  "oneline_shape": 3,
+  "upstream_engine": 1,
+  "note": "the post-fix arms did not all reach the campaign's x3 protocol before the session closed; every existing green rep of every arm is shipped above, nothing dropped. c/experiment_manifest.py's >=3-samples-per-arm bar is therefore not met by baseline/trial here — this record discloses the shortfall instead of padding it; the independent 2026-10-31 reproduction re-ran LEGACY and defaults at n=3 each and that manifest (docs/experiments/dsv4-perf-2026-10-31-audit2/) passes the validator"
+ },
+ "deltas_quoted": {
+  "defaults_vs_legacy_decode_med_med": "+41.8% (0.9629 vs 0.67915; per-rep +47.8% r4/r4, +36.4% r5/r5 — the PR's '+41-46% decode, med/med +41.8%, per-rep +36...+48%')",
+  "oneline_vs_legacy_ttft_med_med": "-44.75% (147.535 vs 267.031 s; the PR's '139.8-148.8 vs 263.6-270.4, -45% TTFT')",
+  "upstream_same_session_n1": "0.7291 tok/s @ 263.635 s",
+  "fork_parity": "defaults decode 0.9544-0.9714 inside the fork reference's 0.9531-1.0050 (gap3, cross-session)"
+ },
+ "cross_session_provenance": {
+  "note": "the numbers below are cited from the campaign's session logs on the rig and the campaign branches (port/pr-perf, archive/performance-pr-178) — they are NOT recomputable from this directory's files and are not claims of this record, only anchors for the PR's parity framing",
+  "gap2_upstream_on_vulkan": "decode median 0.587, n=4 (u-vk-r1..r4; TTFT 271.304-282.806, median 276.986 ~ 277) — source /root/bench-colibri/up2276/gap2-window.log",
+  "gap3_both_arm_pre_merge": "TTFT 149.670-157.124, n=3 (decode 0.8998-0.9602, median 0.910) — source /root/bench-colibri/up2276/gap3-window.log",
+  "gap3_fork_reference": "decode 0.9531-1.0050, TTFT 108.916-110.681, n=3 — source /root/bench-colibri/up2276/gap3-window.log"
+ },
+ "validator_note": "python3 c/experiment_manifest.py docs/experiments/dsv4-perf-2026-10-30-gap4/manifest.json fails on purpose at the 3-sample floor (baseline/trial n=2, disclosed in n_disclosure); every other requirement of the schema (full commit, one changed variable, medians derived from samples, hashed evidence, passing gate) is met. The record exists to put the PR's quoted headline numbers on hashed in-tree raw evidence per CONTRIBUTING's perf-PR contract; the validator-clean n=3 re-run of the same two arms is docs/experiments/dsv4-perf-2026-10-31-audit2/"
+}
