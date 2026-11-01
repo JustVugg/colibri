@@ -19,12 +19,13 @@ class FusedExpertCount(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.build = tempfile.TemporaryDirectory()
-        cls.exe = Path(cls.build.name) / 'reader'
+        cls.exe = Path(cls.build.name) / ('reader.exe' if os.name == 'nt' else 'reader')
         src = Path(cls.build.name) / 'reader.c'
         src.write_text('#define ST_GGUF\n#include "st.h"\n'
                        'int main(int argc,char **argv){if(argc!=2)return 2;'
                        'shards S={0};return st_init_gguf(&S,argv[1])?0:3;}\n')
-        subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-D_GNU_SOURCE',
+        # -D_FILE_OFFSET_BITS=64 as the Makefile builds st.h (compat.h requires it on Windows)
+        subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-D_GNU_SOURCE', '-D_FILE_OFFSET_BITS=64',
                         '-Wall', '-Wextra', '-Wno-unused-function', '-I', str(ROOT),
                         str(src), '-lm', '-o', str(cls.exe)], check=True)
 
