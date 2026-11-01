@@ -727,6 +727,32 @@ verify's copies of the DeltaNet state and the routed experts' scratch of a promp
 2048-row chunks it kept 3.21 GiB where the chain used 3.34-3.51, a verify's copies were refused
 and every verify ran on the CPU (decode 43.6 -> 20.4 tok/s in such a run).
 
+**A short prompt's pooled experts on the CPU** (`q38cc_pc_take`, `COLI_CUDA_CHAIN_POOL_CPU_ROWS`).
+The staging copies every pooled expert of a layer, routed or not: Qwen3.8-Flash-Next IQ2_XS
+on an RTX PRO 4000 copied 18 GB a chunk (1.8 s at 11.8 GB/s) for a prompt of 76 tokens as for
+one of 2048, while a 452-token prompt routes about 1,600 distinct pooled experts, 5.5 rows each.
+A prompt of one chunk now takes the decode table where that pays: the card computes its
+residents, the CPU the pooled slots grouped by expert (`q38cc_pool_groups`: an expert's rows
+through its matrices together, eight output rows at a time where the type has the kernel, the
+decode step's bits per slot), as a decode step's hybrid layers do. Where it pays is measured: at
+the pool's start a 256 MiB copy times the bus and the grouped kernel on four layers' pooled
+experts times a slot; a prompt goes to the CPU where its estimate (rows x top-k x layers x the
+pool's share of the routes x the time a slot) is at most 1.5 times the copy of what a chunk
+stages; after the first prompt the books' share and the prompts' own time a slot replace the
+history's and the probe's. The probe reads high (53 us a slot against 35-44 in the prompts) and
+the history's share too (12.6 % against about 5 %), so a session's first prompt of 700 to 2048
+rows stages as before and the next ones take the CPU. Measured, the served bench (the second of
+two fresh prompts):
+
+| prompt tokens | 76 | 452 | 1012 | 1512 | 1912 | 2612 (staged both) |
+|---|---|---|---|---|---|---|
+| staged, tok/s | 42.7 | 215-216 | 370 | 412 | 418 | 392 |
+| on the CPU, tok/s | 206-211 | 447-450 | 473-475 | 437 | 433-439 | 404 |
+
+The index keys of an attention layer now come down in one copy over the rows: a copy a row
+filled the driver's queue on a 1912-row prompt while a hybrid layer held the stream, and the
+host blocked there before serving it; the staged 2612-token prompt gains 3 % from it.
+
 `tests/test_qwen38_cuda_chain.c` (`make qwen38-cuda-chain-check`, in CI beside
 `qwen38-dn-gpu-check`) runs the tiny FP8 fixture's oracle on the fake tier with the
 chain's ops from the fake's host-side table: the chain on (8/8 tokens, cosine 0.99998), a
