@@ -193,7 +193,7 @@ class MimoToolParseTest(unittest.TestCase):
                 self.assertEqual(text, reply)
 
     def test_json_decoder_nesting_limit_preserves_model_output(self):
-        raw = '[' * 10000 + '0' + ']' * 10000
+        raw = '[' * 100000 + '0' + ']' * 100000
         for body in ('{"city":' + raw + '}', '<parameter=units>' + raw + '</parameter>'):
             with self.subTest(tagged=body.startswith('<')):
                 reply = '<tool_call><function=get_weather>' + body + '</function></tool_call>'

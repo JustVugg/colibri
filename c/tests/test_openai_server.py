@@ -614,7 +614,7 @@ class TemplateTest(unittest.TestCase):
                                 render_chat_qwen38(history, True, "xhigh"))
 
     def test_embedded_history_json_limits_keep_renderer_error_policy(self):
-        bad_arguments = ('[' * 10000 + '0' + ']' * 10000, '9' * 10000)
+        bad_arguments = ('[' * 100000 + '0' + ']' * 100000, '9' * 10000)
         for arch in ('glm', 'glm53', 'qwen36', 'qwen38', 'mimo', 'olmoe'):
             for raw in bad_arguments:
                 with self.subTest(arch=arch, nested=raw.startswith('[')):
@@ -639,7 +639,7 @@ class TemplateTest(unittest.TestCase):
                             self.assertEqual(engine.calls, [])
 
     def test_coder_history_json_nesting_is_a_client_error(self):
-        raw = '[' * 10000 + '0' + ']' * 10000
+        raw = '[' * 100000 + '0' + ']' * 100000
         with self.assertRaises(APIError) as caught:
             openai_server.render_chat_qwen3_coder([
                 {'role': 'assistant', 'content': '', 'tool_calls': [
