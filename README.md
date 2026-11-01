@@ -175,8 +175,8 @@ gives the logits of the one before it, byte for byte:
 - a prompt step on the GPU (`coli_cuda_k3.dll`): its routed experts as their reads arrive
   (dp4a, the CPU's lanes and sums; exp and tanh to MinGW's bits, checked on all 2^32
   floats), its other dense matrices, the gated MLA's attention, the shared experts and the
-  routers; a 20 GB pool reads the next layer's experts while this one computes, and the
-  whole prompt goes in one 4,096-token step.
+  routers; a 20 GB pool reads the next layer's experts while this one computes, and a
+  prompt goes in steps of 8,192 tokens (up to 16,384), each reading an expert once.
 - `c\tools\start_kimi_k3_4090.ps1` serves the OpenAI/Anthropic API on port 18080 (model
   `kimi-k3`), with photos of every turn so agent clients that drop the reasoning resume
   instead of recomputing the conversation.
@@ -196,8 +196,8 @@ gives the logits of the one before it, byte for byte:
 состояния на каждом ходе для агентов. Промпт считается на GPU (`coli_cuda_k3.dll`) в той же
 арифметике, что и на CPU, до бита: эксперты по мере чтения (dp4a; exp и tanh дают биты MinGW,
 проверено на всех 2^32 float), остальные плотные матрицы, внимание MLA, общие эксперты и
-роутеры; пул 20 ГБ читает эксперты следующего слоя, пока считается текущий, весь промпт идёт
-одним шагом до 4096 токенов. Запуск: `c\tools\start_kimi_k3_4090.ps1`.
+роутеры; пул 20 ГБ читает эксперты следующего слоя, пока считается текущий, промпт идёт
+шагами по 8192 токена (до 16384), каждый читает эксперт один раз. Запуск: `c\tools\start_kimi_k3_4090.ps1`.
 Замеры на настоящей модели: **0,81 токена/с** (первая версия — 0,56), запуск 44 с (было 161),
 промпт из 35 токенов за 33 с (57); 60,5% экспертов находятся в ОЗУ, **промпт из 2637 токенов —
 113 с** (было 1401, затем 549 на CPU и 137 на GPU), логиты те же байт в байт. Подробно: [docs/kimi_k3-4090.md](docs/kimi_k3-4090.md).

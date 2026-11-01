@@ -238,3 +238,25 @@ card from pinned memory runs at 26.7 GB/s alone, 26.75 beside the drives' reads 
 37 GB/s of CPU sweeps too (`h2d_load.cu`), so the routed experts' copies were not what held it.
 What is left of the 113 s: attention 32.5 s (KDA 25: its resident matmuls 15.6, its CPU work
 9.6), the MoE 76.5 s (routed experts 44, shared 17.3, latent 5.6).
+
+## Steps past 4,096 rows (`raw/big_*`, `decc_*`, `dec_*`)
+
+A step of 4,096 rows or more reads nearly every expert of every MoE layer once, so a prompt
+of n tokens read 1.4 TB n/4,096 times. `K3_CHUNK` now goes to 16,384. A first try (a
+5,862-token prompt, `long6k_prompt.txt`) found that a whole 4,096-row step's device buffers
+did not fit beside the 20 GiB of resident matrices (kimi_k3 22.8 GiB dedicated, dwm 1.6):
+Windows moved the card's memory to RAM without an error, the GPU at 100% and the drives
+idle for minutes (the 2,637-token prompt had never filled a step). The GPU's calls now take
+a step's rows 2,048 at a time (`K3_GPU_ROWS`: coli_cuda.dll's resident matmuls, the MLA
+core, the routers; the dense matrices and shared experts were 1,024 already): every
+kernel's row is its own, so the pieces give the step's bytes (`k3tiny_big.sh`: 6,000 ids at
+steps of 2,048, 4,096 and 8,192 the same logits, every GPU path forced).
+
+| run | what | result |
+|---|---|---:|
+| `big_4096_logits`, `big_8192_logits` | 5,862 tokens, the logits of every position | the same bytes; 2,891 -> 1,446 GB read |
+| `big_4096_time`, `big_8192_time` | the same, timed | **253.5 -> 199.6 s** |
+| `decc_4096_*`, `decc_8192_*` (`series_decchunk.sh`) | decode with the activations' RAM of each (81 -> 78 slots a layer) | 0.81 -> 0.80 tok/s (55.7 -> 56.0 s for 45 tokens, twice), the same text |
+| `dec_cpu_*`, `dec_gpu_*` (`series_dec.sh`) | decode's routed experts on the GPU too (`K3_GPU_EXPERT_ROWS=1`, not kept) | 0.70 against 0.81-0.88 tok/s, the same text: the copies take the RAM the CPU's experts read (shared 157 -> 210 ms, waiting for reads 328 -> 430) |
+
+The launcher's default step is now 8,192.

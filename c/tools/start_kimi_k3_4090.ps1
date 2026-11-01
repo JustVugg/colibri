@@ -28,10 +28,13 @@ param(
     # The most tokens a reply may have when a request does not ask for fewer (reasoning included)
     [ValidateRange(256,1048576)][int]$MaxOutput = 32768,
     # Prompt tokens a prefill step takes at once: each expert a step needs is read once for
-    # all of them, so larger steps read the disks less per prompt token (with the experts on
-    # the GPU, a 2,637-token prompt 352 s in steps of 2048, 268 s in one of 4096); past 512 a
-    # step's token holds 1.4 MB of RAM, taken from the expert cache (3 of 97 slots a layer)
-    [ValidateRange(1,4096)][int]$Chunk = 4096,
+    # all of them (a step of 4,096 or more reads nearly every one, 1.4 TB), so larger steps
+    # read the disks less per prompt token (a 2,637-token prompt 352 s in steps of 2,048, 268 s
+    # in one of 4,096; a 5,862-token one 254 s in steps of 4,096, 200 s in one of 8,192); past
+    # 512 a step's token holds 1.4 MB of RAM, taken from the expert cache (with the read-ahead
+    # pool 84 slots a layer at 512, 81 at 4,096, 78 at 8,192: decode 0.81 -> 0.80 tok/s; about
+    # 71 at 16,384)
+    [ValidateRange(1,16384)][int]$Chunk = 8192,
     # A long prompt's read-ahead pool, GB: the next MoE layer's experts read while this one
     # computes (2,637 tokens 170 -> 137 s at 20); its RAM comes out of the expert cache
     # (decode 0.83 -> 0.81 tok/s), 0 gives decode all of it

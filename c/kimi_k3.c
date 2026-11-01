@@ -74,7 +74,7 @@
  *                        K3_CUDA_DENSE_GB (20) beside K3_CUDA_RESERVE_GB (2) free;
  *                        K3_CUDA_RELEASE_HOST=1 frees their host copies
  *   K3_TOPP=F            keep routed experts to cumulative weight F (0 = off)
- *   K3_CHUNK=N           prefill chunk size (default 32, at most 4096; 1 = token-at-a-time)
+ *   K3_CHUNK=N           prefill chunk size (default 32, at most 16384; 1 = token-at-a-time)
  *   K3_THINK=0|1         chat mode: open the think channel (default 1)
  *   K3_LAYERS=N          truncate to first N layers (validation; skips head)
  *   K3_TRACE=path        dump f32 hidden state after every layer (validation)
@@ -328,13 +328,23 @@ static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
  * reserve = page cache + activations + KV + optional recurrent checkpoints,
  * all in GB. `cap_requested` is what K3_EXPERT_GB asked for: this only ever
  * LOWERS it, never raises it, so an explicit small cache stays small. */
-/* K3_CHUNK: the most prompt rows a step takes (default 32), 1..4096. A step reads each
+/* K3_CHUNK: the most prompt rows a step takes (default 32), 1..16384. A step reads each
  * expert it needs once, from the drives and then from RAM, for all its rows: larger
- * steps read less a prompt token and hold more activations (k3_act_gb). */
+ * steps read less a prompt token and hold more activations (k3_act_gb). A step of 4,096
+ * rows or more reads nearly every expert of every MoE layer (1.4 TB at the default bits). */
+#define K3_CHUNK_MAX 16384
 static int k3_chunk_rows(void){
     int c=getenv("K3_CHUNK")?atoi(getenv("K3_CHUNK")):32;
-    return c<1?1:c>4096?4096:c;
+    return c<1?1:c>K3_CHUNK_MAX?K3_CHUNK_MAX:c;
 }
+/* the most rows one GPU call takes: a bigger step goes in pieces, so the device buffers
+ * that grow with the rows (coli_cuda.dll's input and output, the MLA core's, the routers')
+ * stay within the 2-2.5 GiB the card has beside the 20 GiB of resident matrices. Measured
+ * on the RTX 4090: a whole 4,096-row step's buffers did not fit (Windows paged the card's
+ * memory to RAM, the GPU at 100% and the drives idle for minutes); a 2,637-row step left
+ * about 0.6 GiB, these pieces about 0.8. Every kernel's row is its own, so the pieces give
+ * the step's bytes. */
+#define K3_GPU_ROWS 2048
 /* The activations and logits a step of k3_chunk_rows() rows holds at once, GB: 1.2 up to
  * 512 rows, then about 1.4 MB a row (the hidden rows and AttnRes blocks, a layer's
  * buffers, and the waves' inputs and outputs of 16 experts a row). */
@@ -708,8 +718,13 @@ static void w_matmul(float *y, const float *x, const W *w, int S){
         /* several rows (a prompt step): the tiled kernel, the same bytes about 4x sooner */
         int (*mm)(ColiCudaTensor**,float*,const float*,const void*,const float*,int,int,int,int,int,int)
             = S>1?coli_cuda_matmul_tiled:coli_cuda_matmul;
-        if(mm((ColiCudaTensor**)&((W*)w)->cuda,y,x,src,w->s,k3_cuda_fmt(w),S,w->I,w->O,
-              g_k3_cuda_dev,w->fmt==4?w->gs:0)){
+        int ok=1;
+        for(int s0=0;s0<S&&ok;s0+=K3_GPU_ROWS){
+            const int n=S-s0<K3_GPU_ROWS?S-s0:K3_GPU_ROWS;
+            ok=mm((ColiCudaTensor**)&((W*)w)->cuda,y+(int64_t)s0*w->O,x+(int64_t)s0*w->I,src,w->s,k3_cuda_fmt(w),
+                  n,w->I,w->O,g_k3_cuda_dev,w->fmt==4?w->gs:0);
+        }
+        if(ok){
             g_k3_cuda_calls++; g_k3_cuda_ms+=(now_s()-t0)*1e3;
             return;
         }
@@ -2442,8 +2457,12 @@ static void k3_mla_scores_g(float *sc, const float *qab, const float *const *qrp
     /* a prompt step's attention core on the GPU, the loop below's bytes (k3cu_mla) */
     if(!mr&&g_k3g_on&&C>=g_k3g_min_rows&&a->kvb.fmt==1&&a->kvb.q8&&kvl%8==0&&(qr==0||qr%8==0)){
         double t0=now_s();
-        on_gpu=k3cu_mla(m->Lc[li],m->Rc[li],pos0+C,pos0,C,qv,gv,a->kvb.q8,a->kvb.s,H,c->qk_nope,qr,vh,kvl,
-                        c->attn_scale,ctx);
+        on_gpu=1;   /* rows K3_GPU_ROWS a call, each with the positions up to its own */
+        for(int c0=0;c0<C&&on_gpu;c0+=K3_GPU_ROWS){
+            const int n=C-c0<K3_GPU_ROWS?C-c0:K3_GPU_ROWS;
+            on_gpu=k3cu_mla(m->Lc[li],m->Rc[li],pos0+c0+n,pos0+c0,n,qv+(int64_t)c0*H*qh,gv+(int64_t)c0*H*vh,
+                            a->kvb.q8,a->kvb.s,H,c->qk_nope,qr,vh,kvl,c->attn_scale,ctx+(int64_t)c0*H*vh);
+        }
         if(on_gpu) m->t_mla_gpu+=now_s()-t0;
     }
 #endif
@@ -2965,7 +2984,12 @@ static inline float k3_dot_bf16w(const float *x, const uint16_t *w, int I){
 static void k3_router_scores(Moe *o, float *sco, const float *x, int C, int D, int E){
 #ifdef COLI_K3_CUDA
     /* a prompt step's: on the GPU, the same lanes and tree (k3cu_router) */
-    if(o->router16&&g_k3g_on&&C>=g_k3g_min_rows&&MATMUL_F32_LANES==32&&D%32==0&&k3cu_router(sco,x,o->router16,C,D,E)) return;
+    if(o->router16&&g_k3g_on&&C>=g_k3g_min_rows&&MATMUL_F32_LANES==32&&D%32==0){
+        int ok=1;
+        for(int c0=0;c0<C&&ok;c0+=K3_GPU_ROWS)
+            ok=k3cu_router(sco+(int64_t)c0*E,x+(int64_t)c0*D,o->router16,C-c0<K3_GPU_ROWS?C-c0:K3_GPU_ROWS,D,E);
+        if(ok) return;
+    }
 #endif
 #if defined(__AVX2__) && defined(__FMA__)
     if(o->router16&&C>=2&&D%MATMUL_F32_LANES==0&&MATMUL_F32_LANES==32){

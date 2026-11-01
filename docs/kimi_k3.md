@@ -229,7 +229,7 @@ Judge quantization choices on real-text logits, not synthetic-vector norms.
 | `K3_WAIT_LAYERS` | 0 | measurement: a decode token's wait for reads and its demand reads, by layer (last lines) |
 | `K3_REUSE` | -- | measurement: every MoE layer's LRU stack distances and predicted share, written to this file at exit |
 | `K3_TOPP` | 0 | keep routed experts to cumulative weight p (0 = off) |
-| `K3_CHUNK` | 32 | prefill chunk size, at most 4096 (1 = token-at-a-time; forced 1 under `K3_TRACE`); past 512 rows the RAM budget reserves 1.4 MB of activations a row |
+| `K3_CHUNK` | 32 | prefill chunk size, at most 16384 (1 = token-at-a-time; forced 1 under `K3_TRACE`); past 512 rows the RAM budget reserves 1.4 MB of activations a row |
 | `K3_THINK` | 1 | chat mode: open the structural think channel (0 = response-only) |
 | `K3_DIRS` | — | extra shard directories (multi-drive split, no duplication; `tools/k3_download.py` cuts every layer over them) |
 | `K3_MAXT` | prompt+ngen | context capacity |
@@ -272,9 +272,14 @@ every row's and position's arithmetic:
   their 8 group scales in one multiply (the routed experts 255 -> 216 s), and both sum a
   group's 8 rows' lanes together (`hsum256_x8`, hsum256's pairs); the shared experts'
   SiTU runs over every worker;
-- `K3_CHUNK` may be up to 4096: a step reads every expert it needs once from the drives and
+- `K3_CHUNK` may be up to 16384: a step reads every expert it needs once from the drives and
   once from RAM for all its rows (2,048 against 512: 5,784 -> 2,455 GB read for that
-  prompt, 845 -> 697 s);
+  prompt, 845 -> 697 s; a step of 4,096 or more reads nearly every expert, 1.4 TB: a
+  5,862-token prompt 254 s in two steps of 4,096, 200 s in one of 8,192, the logits of every
+  position the same bytes). The GPU's calls take a step's rows 2,048 at a time
+  (`K3_GPU_ROWS`), so their device buffers fit beside the 20 GiB of resident matrices: a
+  whole 4,096-row step's did not (Windows moved the card's memory to RAM without an error,
+  minutes at 100% GPU with the drives idle);
 - KDA's short convolutions and heads go over a step's tokens channel by channel and head
   by head (one parallel region each where there were four a token; `k3_kda_head` is the
   one head step both orders call, the conv's taps fused adds in order as compiled before);

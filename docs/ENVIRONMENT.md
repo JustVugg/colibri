@@ -501,7 +501,7 @@ Read **only** by `c/kimi_k3.c`. The K3 engine has its own loader, cache and quan
 | `K3_EXPERT_GB` | `8.0` | RAM budget (GB) for the expert LRU cache; per-layer slots are derived from it. |
 | `K3_LAYERS` | `0` (all) | Load only the first N layers — for smoke tests and trace-only runs. |
 | `K3_MAXT` | `np + ngen` one-shot, `8192` in serve | KV cache capacity in tokens. In serve mode it is also the prompt-rejection bound. |
-| `K3_CHUNK` | `32` | Prefill chunk size in tokens. Clamped to [1,4096]; past 512 rows the RAM budget reserves 1.4 MB a row. |
+| `K3_CHUNK` | `32` | Prefill chunk size in tokens. Clamped to [1,16384]; past 512 rows the RAM budget reserves 1.4 MB a row. A CUDA build's GPU calls take a step's rows 2,048 at a time. |
 | `K3_GPU_EXPERTS` | `1` (on) | Windows `CUDA_DLL=1` build with `coli_cuda_k3.dll` beside it: a prompt step's routed experts, the dense matrices `K3_CUDA_DENSE` did not place, the gated MLA's attention core, the shared experts and the routers on the card, in the CPU's arithmetic to the bit. `=0`: the CPU's alone. See [kimi_k3.md](kimi_k3.md#cuda-a-prompt-step-on-the-gpu-the-cpus-bytes-coli_cuda_k3dll). |
 | `K3_GPU_MIN_ROWS` | `32` | The prompt rows a step needs before the card takes its parts (`1` in tests). |
 | `K3_GPU_CPU_WAVE` | `4` | Experts the CPU computes at a time beside the card. |
