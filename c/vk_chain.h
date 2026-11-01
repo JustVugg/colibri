@@ -610,6 +610,15 @@ int vkc_dsv4_ready(void);
 typedef struct { int S, H, hd, cnt, l_off, l_row, nwin, w_off, c_off, q_off, q_row, o_off, o_row, sink_off, flags;
                  float scale; } VkcDsAttn;
 int vkc_dsv4_attn(VkcBuf *q, VkcBuf *win, VkcBuf *cmp, VkcBuf *list, VkcBuf *prm, VkcBuf *out, const VkcDsAttn *p);
+/* chain_dsv4_fa.comp's d-split lanes (the Makefile's DSV4_FA_TILE -DD_split=16; the
+ * shader's own static rule: "D_split must fit one subgroup"). The tile folds them
+ * into its score dot with subgroupShuffleXor over that many aligned lanes, so a
+ * device whose compute subgroups are narrower (Lavapipe: 8) refuses the lever whole
+ * and mode 0 stands. vkc_dsv4_fa_subgroup() is the width its pipelines would run at:
+ * the chain's pin (make_pipe requires it on every pipeline), else the size the device
+ * reports. */
+#define VKC_DSV4_FA_DSPLIT 16
+int vkc_dsv4_fa_subgroup(void);
 typedef struct { int nseg, per_row, rd, x_off, x_row, x_seg, cs_off, cs_row, inverse, flags; } VkcDsRope;
 int vkc_dsv4_rope(VkcBuf *x, VkcBuf *cs, const VkcDsRope *p);
 typedef struct { int S, pos_base, ratio, P, D, overlap, kv_off, kv_row, sc_off, sc_row, ape_off, out_off, out_row,

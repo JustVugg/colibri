@@ -2147,7 +2147,10 @@ static void test_ds_attn(int S, int H, int hd, int nwin, int ncmp, int cnt, int 
  * reference, at the shapes the tile takes: hd 512, heads % 8, offsets the vec4 loads
  * can bind. `arm` sets the lever (1 the f16 mirror, 2 the fp32 rows); S 1 rides the
  * decode twin, S > 1 the prefill tile. The run is checked bit-stable too (the fork's
- * own gate class: deterministic tile order, run to run). */
+ * own gate class: deterministic tile order, run to run). A device whose compute
+ * subgroups are narrower than the tile's d-split lanes refuses the lever whole
+ * (vkc_dsv4_attn's per-device gate) and these runs fall to mode 0: still checked,
+ * mode-0 bits -- the engagement check below holds the refusal to it. */
 static void test_ds_attn_fa(int S, int H, int nwin, int ncmp, int cnt, int flags, int arm) {
     int hd = 512, qrow = H * hd + 4, lrow = cnt + 2, orow = H * hd + 4;
     float *q = fvec((size_t)S * qrow, 1.f), *win = fvec((size_t)(nwin * hd + 8), 1.f), *cmp = fvec((size_t)(ncmp * hd + 8), 1.f);
@@ -5311,9 +5314,20 @@ int main(int argc, char **argv) {
             test_ds_attn_fa(2, 8, 6, 9, 20, 1, 2);          /* the fp32 arm */
             test_ds_attn(1, 4, 64, 8, 5, 13, 1);            /* a shape the tile refuses: mode 0 under the armed lever -- the unset default since gap-wave4 */
             VkcStats s1; vkc_stats(&s1);
-            CHECK(s1.attn_fa - s0.attn_fa >= 4, "dsv4 attn FA: the tile engaged (%llu of the runs)",
-                  s1.attn_fa - s0.attn_fa);
-            printf("  dsv4 attn FA: %llu attentions on the tile\n", s1.attn_fa - s0.attn_fa);
+            /* the tile's d-split tree needs VKC_DSV4_FA_DSPLIT aligned lanes in ONE
+             * subgroup: a device narrower than that (Lavapipe's 8) refuses the lever
+             * whole (vk_chain.c's per-device gate) and the legs above ran mode 0 -- the
+             * refusal is what stands to check there, not the engagement */
+            if (vkc_dsv4_fa_subgroup() >= VKC_DSV4_FA_DSPLIT) {
+                CHECK(s1.attn_fa - s0.attn_fa >= 4, "dsv4 attn FA: the tile engaged (%llu of the runs)",
+                      s1.attn_fa - s0.attn_fa);
+                printf("  dsv4 attn FA: %llu attentions on the tile\n", s1.attn_fa - s0.attn_fa);
+            } else {
+                CHECK(s1.attn_fa == s0.attn_fa,
+                      "dsv4 attn FA: %d-wide subgroups must refuse the tile (mode 0 standing), %llu ran",
+                      vkc_dsv4_fa_subgroup(), s1.attn_fa - s0.attn_fa);
+                printf("  dsv4 attn FA: %d-wide subgroups refuse the tile, mode 0 standing\n", vkc_dsv4_fa_subgroup());
+            }
             rng = keep;
         }
         test_ds_rope(0); test_ds_rope(1);

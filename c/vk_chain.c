@@ -4094,8 +4094,11 @@ static int dsv4_rec(int kind, VkPipeline pipe, int mode, const void *b, size_t b
  * bits, read per call so a test can arm it case by case); 1 the fork's standing class
  * (the tile + the f16 mirror); 2 the tile over the fp32 rows (the fork's KV_F16=0
  * arm). A shape the tile cannot take (hd != 512, heads % 8, or a q/o/w/c offset or
- * stride not a multiple of 4 floats) or a pipeline that did not load falls back to
- * mode 0 -- never a misread. */
+ * stride not a multiple of 4 floats), a pipeline that did not load, or a device whose
+ * compute subgroups are narrower than the tile's D_SPLIT d-split lanes (vkc_dsv4_fa_
+ * subgroup: the score dot's subgroupShuffleXor tree needs 16 aligned lanes in ONE
+ * subgroup; Lavapipe reports 8 and cannot be pinned wider) falls back to mode 0 --
+ * never a misread. */
 enum { FA_BR8, FA_BR8_F16, FA_BR2, FA_BR2_F16, FA_GATHER, FA_N };
 static struct { VkShaderModule mod[FA_N]; VkPipeline pipe[FA_N]; int tried; } g_fa4[2];
 #define FA4 (g_fa4[g_kd])
@@ -4141,6 +4144,30 @@ static void fa4_note(int engaged, const char *why) {
         fprintf(stderr, "[VK] chain: attention FA engaged: the flash tile takes the dsv4 attention (a thresholded class, never bit-identical to mode 0)\n");
     else fprintf(stderr, "[VK] chain: attention FA refused: %s -- mode 0\n", why);
 }
+/* The subgroup width the tile's pipelines run at: the chain's pin (make_pipe requires
+ * it on every pipeline), else the size the device reports. The tile folds its D_SPLIT
+ * d-slices into the score dot with subgroupShuffleXor over that many aligned lanes --
+ * "D_split must fit one subgroup", the shader's own static rule -- so on a device whose
+ * compute subgroups are narrower the xor crosses a subgroup boundary: lanes undefined
+ * per spec, and on llvmpipe (Vulkan 1.4, subgroupSize 8, min = max -- no pin exists)
+ * deterministically wrong bits in BOTH the f16 and the fp32 arm (test_vk_chain's four
+ * FA legs, rel err 0.33-0.42, run-to-run stable; the RADV 6900 XT holds the class at
+ * 6e-3). The gate is per device, not per shape: vkc_dsv4_attn refuses the lever whole
+ * on such a device and mode 0 stands. */
+int vkc_dsv4_fa_subgroup(void) {
+    static int w = -1;
+    if (!KC.ready) return 0;
+    if (w < 0) {
+        w = KC.core.pin_sg;
+        if (!w) {
+            VkPhysicalDeviceSubgroupProperties sgp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+            VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sgp};
+            vkGetPhysicalDeviceProperties2((VkPhysicalDevice)KC.core.phys, &p2);
+            w = (int)sgp.subgroupSize;
+        }
+    }
+    return w;
+}
 int vkc_dsv4_attn(VkcBuf *q, VkcBuf *win, VkcBuf *cmp, VkcBuf *list, VkcBuf *prm, VkcBuf *out, const VkcDsAttn *p) {
     if (p->S < 1 || p->S > 65535 || p->H < 1 || p->H > 65535 || p->hd < 1 || p->hd > 1024 || p->cnt < 0 || p->cnt > 3072)
         return 0;
@@ -4148,8 +4175,15 @@ int vkc_dsv4_attn(VkcBuf *q, VkcBuf *win, VkcBuf *cmp, VkcBuf *list, VkcBuf *prm
     if (!attn_fa_wanted() && coli_vk_legacy() &&
         !(getenv("COLI_VK_CHAIN_ATTN_FA") && *getenv("COLI_VK_CHAIN_ATTN_FA")))
         fa4_note(0, "legacy (COLI_VK_LEGACY=1)");
-    if (attn_fa_wanted() && p->hd == 512 && !(p->H % 8) &&
-        !((p->q_off | p->q_row | p->o_off | p->o_row | p->w_off | p->c_off) & 3)) {
+    int fa_want = attn_fa_wanted();
+    int fa_shape = fa_want && p->hd == 512 && !(p->H % 8) &&
+                   !((p->q_off | p->q_row | p->o_off | p->o_row | p->w_off | p->c_off) & 3);
+    if (fa_shape && vkc_dsv4_fa_subgroup() < VKC_DSV4_FA_DSPLIT) {
+        char why[96];   /* the lever's one boot line names the width it refused on */
+        snprintf(why, sizeof why, "the device's subgroups are %d wide -- the tile's d-split tree needs %d aligned lanes",
+                 vkc_dsv4_fa_subgroup(), VKC_DSV4_FA_DSPLIT);
+        fa4_note(0, why);
+    } else if (fa_shape) {
         int dec = p->S == 1, br = dec ? 2 : 8;   /* the decode twin keeps a head's order */
         VkPipeline fp = VK_NULL_HANDLE;
         VkcBuf *kv = NULL;
@@ -4185,7 +4219,7 @@ int vkc_dsv4_attn(VkcBuf *q, VkcBuf *win, VkcBuf *cmp, VkcBuf *list, VkcBuf *prm
                 return 1;
             }
         } else fa4_note(0, "the tile's pipelines did not load");
-    } else if (attn_fa_wanted())
+    } else if (fa_want)
         fa4_note(0, "a shape the tile cannot take");
     VkcBind bd[6] = {B(q, 0), B(win, 0), B(cmp ? cmp : win, 0), B(list, 0), B(prm, 0), B(out, 1)};
     return dsv4_rec(PK_ATTN, D4.pipe, 0, p, sizeof *p, bd, 6, (uint32_t)p->H, (uint32_t)p->S);
