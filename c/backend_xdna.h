@@ -41,7 +41,11 @@ extern "C" {
 
 /* Symbols the helper must export, all prefixed coli_xdna_helper_ so they can
  * never collide with the host-side coli_xdna_ names in this header. */
+#ifdef _WIN32
 #define COLI_XDNA_HELPER_DLL "coli_xdna.dll"
+#else
+#define COLI_XDNA_HELPER_DLL "libcoli_xdna.so"
+#endif
 
 /* Directory, relative to the executable, holding the qualified artifacts of the
  * optional XDNA package. A fixed relative name, joined to an absolute
@@ -102,6 +106,11 @@ int coli_xdna_test_load_attempts(void);
 /* 1 only when a complete, compatible entry-point set is currently callable. A
  * rejected helper must leave this 0 -- binding is all-or-nothing. */
 int coli_xdna_test_entry_points_bound(void);
+
+/* Look up an extra export of the currently bound helper (the synthetic test
+ * helpers export fake_set_fail / fake_reset). NULL when nothing is bound or the
+ * symbol is missing. Lets the tests reach the helper without platform code. */
+void *coli_xdna_test_helper_symbol(const char *name);
 
 /* -- artifact registry ----------------------------------------------------
  *

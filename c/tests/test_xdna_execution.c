@@ -18,6 +18,13 @@
 
 #include "../backend_xdna.c"
 
+/* Extension of the synthetic helpers the Makefile builds beside this test. */
+#ifdef _WIN32
+#define FAKE_EXT ".dll"
+#else
+#define FAKE_EXT ".so"
+#endif
+
 static int g_fail = 0;
 static void ck(int cond, const char *what){
     if(!cond){ printf("  FAIL %s\n", what); g_fail = 1; }
@@ -166,9 +173,9 @@ int main(int argc, char **argv){
     if(sl) *sl = '\0'; else snprintf(dir,sizeof dir,".");
 
     snprintf(g_root, sizeof g_root, "%s/xdna_exec_fixtures", dir);
-    snprintf(g_helper, sizeof g_helper, "%s/xdna_fake_helper.dll", dir);
-    snprintf(g_helper_abi1, sizeof g_helper_abi1, "%s/xdna_fake_helper_abi1.dll", dir);
-    snprintf(g_helper_partial, sizeof g_helper_partial, "%s/xdna_fake_helper_partial.dll", dir);
+    snprintf(g_helper, sizeof g_helper, "%s/xdna_fake_helper" FAKE_EXT, dir);
+    snprintf(g_helper_abi1, sizeof g_helper_abi1, "%s/xdna_fake_helper_abi1" FAKE_EXT, dir);
+    snprintf(g_helper_partial, sizeof g_helper_partial, "%s/xdna_fake_helper_partial" FAKE_EXT, dir);
 #ifdef _WIN32
     { char cmd[1200]; snprintf(cmd,sizeof cmd,"mkdir \"%s\" 2>nul", g_root);
       for(char *p=cmd;*p;p++) if(*p=='/') *p='\\';
@@ -431,8 +438,8 @@ int main(int argc, char **argv){
             /* reach into the loaded fake to arm the injection */
             ck(coli_xdna_binding()==COLI_XDNA_AVAILABLE, "fake helper bound");
             {
-                void (*setf)(int) = (void(*)(int))(void*)GetProcAddress(g_xdna.dll,"fake_set_fail");
-                void (*rst)(void) = (void(*)(void))(void*)GetProcAddress(g_xdna.dll,"fake_reset");
+                void (*setf)(int) = (void(*)(int))coli_xdna_test_helper_symbol("fake_set_fail");
+                void (*rst)(void) = (void(*)(void))coli_xdna_test_helper_symbol("fake_reset");
                 if(rst) rst();
                 if(setf) setf(fs[c].stage);
             }
@@ -455,7 +462,7 @@ int main(int argc, char **argv){
             snprintf(msg,sizeof msg,"%s failure -> fmt4 source unchanged", fs[c].what);
             ck(W.q4 != NULL && W.gs == 64, msg);
             coli_xdna_prepared_release(&slot); free(x); free(y);
-            { void (*rst)(void) = (void(*)(void))(void*)GetProcAddress(g_xdna.dll,"fake_reset");
+            { void (*rst)(void) = (void(*)(void))coli_xdna_test_helper_symbol("fake_reset");
               if(rst) rst(); }
         }
     }
@@ -715,9 +722,14 @@ int main(int argc, char **argv){
         int ok = coli_xdna_product_artifact_root(root, sizeof root);
         ck(ok, "product root resolves");
         if(ok){
-            /* Absolute: on Windows a drive letter and colon, or a UNC prefix. */
+            /* Absolute: on Windows a drive letter and colon, or a UNC prefix;
+             * elsewhere a leading slash. */
+#ifdef _WIN32
             int absolute = (root[0] && root[1] == ':') ||
                            (root[0] == '\\' && root[1] == '\\');
+#else
+            int absolute = root[0] == '/';
+#endif
             ck(absolute, "product root is absolute, not relative to the CWD");
             /* It ends with the fixed artifact directory name. */
             size_t rl = strlen(root), dl = strlen(COLI_XDNA_ARTIFACT_DIR);
@@ -742,7 +754,8 @@ int main(int argc, char **argv){
 
         /* PACKAGE MISSING: point the root at a directory that does not exist. */
         {   char nowhere[1024];
-            snprintf(nowhere, sizeof nowhere, "%s/no_such_package_dir", g_root);
+            ck(snprintf(nowhere, sizeof nowhere, "%s/no_such_package_dir", g_root)
+               < (int)sizeof nowhere, "fixture path fits");
             coli_xdna_test_set_artifact_root(nowhere);
             const char *who = NULL;
             ColiXdnaProvision p = coli_xdna_provision_status(&who);
