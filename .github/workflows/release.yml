@@ -110,6 +110,23 @@ jobs:
           make colibri-tui
           ./colibri-tui${{ matrix.ext }} --version
 
+      # The desktop window (desktop/, Tauri): the chat page in a window that starts coli's
+      # server by itself. Rust is on every runner; Linux needs WebKitGTK to build it. pwsh on
+      # Windows: the MSVC linker, not the link.exe of a POSIX shell's PATH. It needs a display
+      # to run, so the verify step checks that it is in the archive.
+      - if: matrix.os == 'ubuntu-latest'
+        run: bash .github/scripts/apt-install.sh libwebkit2gtk-4.1-dev
+      - name: Build the desktop window
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        working-directory: desktop/src-tauri
+        run: cargo build --release --locked
+      - name: Build the desktop window (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        working-directory: desktop/src-tauri
+        run: cargo build --release --locked
+
       # DeepSeek V4 has its own Makefile and its own target name (`deepseek-v4`,
       # producing `deepseek_v4`), so it never joined the loop above -- and #858 is
       # the result: v1.5.0 was titled "DeepSeek V4 Flash" and shipped no
@@ -175,6 +192,8 @@ jobs:
           cp c/gliner_decide${{ matrix.ext }} dist/gliner_decide${{ matrix.ext }}
           # the terminal interface, next to coli: `coli tui` looks for it there (tui_binary())
           cp c/colibri-tui${{ matrix.ext }} dist/colibri-tui${{ matrix.ext }}
+          # the desktop window, next to coli: it finds coli and ui/ beside itself
+          cp desktop/src-tauri/target/release/colibri-desktop${{ matrix.ext }} dist/colibri-desktop${{ matrix.ext }}
           # deepseek_v4 -- underscore, not the hyphen of the make target: engine_for()
           # looks for "deepseek_v4" next to coli. Guarded, not unconditional, because
           # the macos-arm64 archive has no such engine to ship (#858).
@@ -254,6 +273,8 @@ jobs:
           test -x colibri-tui${{ matrix.ext }} || { echo "FAIL: colibri-tui missing from archive"; ls -la; exit 1; }
           ./colibri-tui${{ matrix.ext }} --version | grep -q "^colibri-tui " \
             || { echo "FAIL: the packaged colibri-tui does not run"; exit 1; }
+          # the desktop window: present and executable (it needs a display to run)
+          test -x colibri-desktop${{ matrix.ext }} || { echo "FAIL: colibri-desktop missing from archive"; ls -la; exit 1; }
           # Kimi K3 needs tokenizer.json synthesized from tiktoken.model; without this
           # script in the archive the engine ships but cannot be driven by coli chat.
           test -f tools/k3_tokenizer.py || { echo "FAIL: k3_tokenizer.py missing from archive"; exit 1; }

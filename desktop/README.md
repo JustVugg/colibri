@@ -52,6 +52,13 @@ The page's server writes to `colibri-desktop-ui.log` in the system's temporary
 directory. The colibri server it starts writes where `coli start` always does
 (`coli logs`).
 
+## In the release archives
+
+Every archive carries the program next to `coli`: `colibri-desktop.exe` on
+Windows, `colibri-desktop` on Linux and macOS. Windows has the WebView2 runtime
+it needs (part of Windows 10 and 11); Linux needs WebKitGTK 4.1
+(`libwebkit2gtk-4.1-0` on Debian and Ubuntu).
+
 ## Build
 
 ```sh
@@ -60,9 +67,8 @@ cargo build --release
 ```
 
 The program lands in `desktop/src-tauri/target/release/`; run from there, it
-finds `c/coli` and `ui/server.py` of this checkout. Windows needs the WebView2
-runtime (part of Windows 10 and 11); Linux needs WebKitGTK 4.1
-(`libwebkit2gtk-4.1-dev` to build).
+finds `c/coli` and `ui/server.py` of this checkout. On Linux the build needs
+`libwebkit2gtk-4.1-dev`.
 
 ## Validation
 

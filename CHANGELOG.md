@@ -16,7 +16,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 - **The desktop window** (`desktop/`, Tauri): the chat page in a window of its own. It finds
   `coli` and Python, uses the colibri server that runs or starts the configured one with
   `coli start` and waits for its model, serves the page on a fixed local port, and on close
-  stops what it started. `--backend URL` points it at another server
+  stops what it started. `--backend URL` points it at another server. The release archives
+  carry it next to `coli` (`colibri-desktop`, `colibri-desktop.exe`)
   ([desktop/README.md](desktop/README.md)).
 - **`/health` reports the NVIDIA cards** (`system.gpus`: use, memory, temperature, power, from
   `nvidia-smi` at most once a second), for the monitors.
