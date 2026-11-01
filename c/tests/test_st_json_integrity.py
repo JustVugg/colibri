@@ -57,6 +57,40 @@ class SafetensorsJsonIntegrity(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertIn("safetensors header", result.stderr)
 
+    def test_header_requires_utf8(self):
+        # JSON strings in a safetensors header are UTF-8, not arbitrary bytes.
+        # Exercise both tensor names and ignored metadata values: ignoring a
+        # field must not turn a corrupt header into a successful model load.
+        invalid = (b"\x80", b"\xc0\xaf", b"\xc2", b"\xe0\x80\xaf",
+                   b"\xed\xa0\x80", b"\xe2\x82", b"\xf0\x80\x80\xaf",
+                   b"\xf4\x90\x80\x80", b"\xf5\x80\x80\x80", b"\xff")
+        for raw in invalid:
+            for position in ("name", "metadata"):
+                with self.subTest(raw=raw, position=position):
+                    if position == "name":
+                        header = (b'{"' + raw + b'":' + json.dumps(
+                            {"dtype": "F32", "shape": [0], "data_offsets": [0, 0]}).encode()
+                                  + b',"tensor":' + json.dumps(TENSOR).encode() + b'}')
+                    else:
+                        header = (b'{"__metadata__":{"note":"' + raw + b'"},"tensor":'
+                                  + json.dumps(TENSOR).encode() + b'}')
+                    with self.assertRaises(UnicodeDecodeError):
+                        header.decode("utf-8")
+                    result = self.load(header)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn("safetensors header", result.stderr)
+
+    def test_utf8_metadata_boundaries(self):
+        # Independent encoder supplies shortest-form Unicode boundary scalars.
+        text = "".join(chr(cp) for cp in (0x7f, 0x80, 0x7ff, 0x800, 0xd7ff,
+                                        0xe000, 0xffff, 0x10000, 0x10ffff))
+        header = json.dumps({"__metadata__": {"note": text}, "tensor": TENSOR},
+                            ensure_ascii=False).encode("utf-8")
+        self.assertEqual(json.loads(header.decode("utf-8"))["__metadata__"]["note"], text)
+        result = self.load(header)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "2.5")
+
     def test_corrupt_stamp(self):
         for stamp in ('{"tensor":"int8"', '{"tensor":"int8"} trailing'):
             with self.subTest(stamp=stamp):
