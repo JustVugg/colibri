@@ -2482,6 +2482,10 @@ tests/test_expert_ffn$(EXE): tests/test_expert_ffn.c
 # int4-g64 rows interleaved by 16 (expert_ffn.h xf16_*) against their reference.
 tests/test_xf16$(EXE): tests/test_xf16.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# the SSE2 i8 expert kernel (no AVX2+FMA) against xf_dot_i8_ref, bit for bit.
+tests/test_xf_sse2_int16$(EXE): tests/test_xf_sse2_int16.c
+	$(CC) $(if $(X86_64),$(filter-out -march=% -mavx% -mfma%,$(CFLAGS)) -march=x86-64 -mno-avx -mno-avx2 -mno-fma -ffp-contract=off,$(CFLAGS)) $< -o $@ $(LDFLAGS)
+
 tests/test_int2_g32$(EXE): tests/test_int2_g32.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_lowbit_g16$(EXE): tests/test_lowbit_g16.c

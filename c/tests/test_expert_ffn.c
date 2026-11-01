@@ -217,6 +217,8 @@ int main(void) {
 #else
         " (maddubs)");
 #endif
+#elif defined(XF_HAVE_SSE2_INT16)
+    printf("path: SSE2 int16 (PMADDWD)\n");
 #else
     printf("path: scalar\n");
 #endif
