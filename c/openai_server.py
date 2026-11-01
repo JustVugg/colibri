@@ -9761,17 +9761,18 @@ class APIHandler(BaseHTTPRequestHandler):
         """Summarize the conversation before its last exchanges; (new done, new summary),
         or None when there is nothing older left to summarize.
 
-        The summary is asked for after the history the engine already holds (everything
-        before the new user message), rendered as the conversation was, so the engine
-        prefills only the request to summarize. A range too long for that is halved."""
+        Each summary request contains only the prefix that will be replaced, rendered
+        with any summary already accumulated. The selected verbatim tail is excluded.
+        A range too long for the available context is halved."""
         limit = getattr(self.server, "context_limit", None) or 4096
         ratio = getattr(self.server, "tokens_per_char", None) or COMPACT_DEFAULT_RATIO
         start = compaction_tail_start(conversation, done, ratio, int(limit * COMPACT_KEEP_SHARE))
         if start is None:
             return None
-        users = [i for i in range(done, len(conversation))
-                 if isinstance(conversation[i], dict) and conversation[i].get("role") == "user"]
-        end = users[-1]                   # the summary covers everything before the new request
+        # This summary is cached under keys[start] and replaces only that prefix.
+        # Including the retained tail would duplicate it in this turn and leak its
+        # branch-specific facts into any conversation sharing the shorter prefix.
+        end = start
         if end <= done:
             return None
         words = max(80, min(400, limit // 24))
