@@ -40,6 +40,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -509,9 +510,31 @@ def _dir_size(path):
     return total
 
 
+def _container_meta(path):
+    """The converter's <family>_meta.json (qwen36_meta.json, qwen38_meta.json, ...): the file the engine
+    reads, with the expert bits (ebits) the container was written with. {} when there is none."""
+    try:
+        names = sorted(n for n in os.listdir(path) if n.endswith("_meta.json"))
+    except OSError:
+        return {}
+    for name in names:
+        try:
+            with open(os.path.join(path, name), encoding="utf-8") as f:
+                meta = json.load(f)
+            if isinstance(meta, dict):
+                return meta
+        except (OSError, ValueError):
+            continue
+    return {}
+
+
 def _model_format(path):
+    """gguf (coli import), colibri (a converted int4/int8 container) or safetensors (a checkpoint the
+    engine reads as it is, Qwen3.8's FP8 for one)."""
     if os.path.isfile(os.path.join(path, "gguf.json")):
         return "gguf"
+    if _container_meta(path).get("ebits"):
+        return "colibri"
     try:
         with open(os.path.join(path, "config.json"), encoding="utf-8") as f:
             cfg = json.load(f)
@@ -530,6 +553,15 @@ def _model_quant(path):
             cfg = json.load(f)
     except (OSError, ValueError):
         cfg = {}
+    meta = _container_meta(path)
+    if meta.get("ebits"):
+        label = f"int{meta['ebits']}"
+        if meta.get("group_size"):
+            label += f"-g{meta['group_size']}"
+        return label
+    if os.path.isdir(os.path.join(path, "experts-int4g64")):
+        # Qwen3.8's FP8 checkpoint with the int4-g64 expert sidecar: the experts are what is read per token
+        return "FP8+int4-g64"
     for key in ("colibri", "quantization_config"):
         q = cfg.get(key)
         if isinstance(q, dict):
@@ -542,11 +574,13 @@ def _model_quant(path):
         try:
             with open(os.path.join(path, "gguf.json"), encoding="utf-8") as f:
                 g = json.load(f)
-            return str(g.get("file_type") or g.get("quant") or "GGUF")
+            if g.get("file_type") or g.get("quant"):
+                return str(g.get("file_type") or g.get("quant"))
+            # the type is in the file's name the way the quantizers write it: ...-Q4_K_M.gguf, ...-IQ2_XXS.gguf
+            m = re.search(r"(IQ\d_[A-Z]+|Q\d_K_[SML]|Q\d_K|Q\d_\d|BF16|F16|F32)", os.path.basename(str(g.get("gguf") or "")))
+            return m.group(1) if m else "GGUF"
         except (OSError, ValueError):
             return "GGUF"
-    if os.path.isdir(os.path.join(path, "experts-int4g64")):
-        return "FP8+int4-g64"
     return str(cfg.get("torch_dtype") or "")
 
 
@@ -840,7 +874,7 @@ class Puller:
             threading.Thread(target=lambda: [out_tail.append(l) for l in iter(child.stdout.readline, b"")],
                              daemon=True).start()
             while child.poll() is None:
-                time.sleep(0.5)
+                time.sleep(0.2)
                 try:
                     with open(state_path, encoding="utf-8") as f:
                         st = json.load(f)
@@ -882,6 +916,20 @@ class Gateway(ThreadingHTTPServer):
         self.think_in_content = think_in_content
         self.allowed_hosts = allowed_hosts
         self.started = time.time()
+        self.stopfile = None      # `coli stop --port` leaves this file: taking it is the stop request
+
+    def service_actions(self):
+        """Between accepts (serve_forever's poll): a `coli stop --port <gateway port>` left its stop
+        file -- consume it (that is the acknowledgement coli stop waits for) and shut down, the
+        engine child with us."""
+        path = self.stopfile
+        if path and os.path.exists(path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            print("[gateway] stop requested (coli stop)", file=sys.stderr, flush=True)
+            threading.Thread(target=self.shutdown, daemon=True).start()
 
 
 class GatewayHandler(BaseHTTPRequestHandler):
@@ -1265,6 +1313,19 @@ def main(argv=None):
     names = ", ".join(registry.names()) or "(none: --models-dir is empty; --model NAME=PATH adds one)"
     print(f"[gateway] the Ollama API on http://{a.host}:{a.port} -> coli serve on {manager.base}; models: {names}",
           file=sys.stderr, flush=True)
+    # The same pid and stop files `coli serve` keeps, under the gateway's port: `coli stop --port 11434`
+    # finds this process by the pidfile, asks through the stop file, and waits for it to end.
+    pidfile = os.path.join(tempfile.gettempdir(), f"coli-serve-{a.port}.pid")
+    server.stopfile = os.path.join(tempfile.gettempdir(), f"coli-serve-{a.port}.stop")
+    try:
+        os.unlink(server.stopfile)   # a request left for a gateway that is gone is not ours
+    except OSError:
+        pass
+    try:
+        with open(pidfile, "w") as f:
+            f.write(f"{os.getpid()} gateway\n")
+    except OSError:
+        pidfile = None
 
     def stop(*_):
         print("[gateway] stopping", file=sys.stderr, flush=True)
@@ -1284,6 +1345,11 @@ def main(argv=None):
     finally:
         server.server_close()
         manager.shutdown()
+        if pidfile:
+            try:
+                os.unlink(pidfile)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

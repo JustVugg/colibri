@@ -272,5 +272,153 @@ class GatewayAttached(unittest.TestCase):
         self.assertEqual(st, 404)
 
 
+FAKE_COLI = r"""
+import json, os, sys, time
+# a stand-in for `coli setup --yes --model ID --no-start --no-browser --dir ROOT`: it writes the
+# install-state.json the real setup writes, in the phases the gateway turns into Ollama's status lines
+home = os.environ["COLI_SETUP_HOME"]; os.makedirs(home, exist_ok=True)
+state = os.path.join(home, "install-state.json")
+model = sys.argv[sys.argv.index("--model") + 1]
+def put(d):
+    with open(state + ".tmp", "w") as f: json.dump(d, f)
+    os.replace(state + ".tmp", state)
+for done in (0, 500, 1000):
+    put({"phase": "download", "model": model, "file": "model-00000.safetensors", "total": 1000, "done": done}); time.sleep(0.5)
+put({"phase": "build", "model": model}); time.sleep(0.15)
+if model == "broken":
+    print("the converter said no"); sys.exit(3)
+root = sys.argv[sys.argv.index("--dir") + 1]
+os.makedirs(os.path.join(root, model), exist_ok=True)
+with open(os.path.join(root, model, "config.json"), "w") as f: json.dump({"model_type": "qwen3_5_moe"}, f)
+with open(os.path.join(root, model, "qwen36_meta.json"), "w") as f: json.dump({"ebits": 4, "group_size": 64}, f)
+put({"phase": "ready", "model": model})
+"""
+
+
+class _Entry:
+    def __init__(self, id):
+        self.id = id
+
+
+class PullWithFakeSetup(unittest.TestCase):
+    """/api/pull runs `coli setup` as a child and reads its install-state.json: here a stand-in
+    coli writes the phases, so the status lines, the failure and the registry refresh are checked
+    without a download."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="coli-gw-pull-")
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
+        self.coli = os.path.join(self.tmp, "coli")
+        with open(self.coli, "w") as f:
+            f.write(FAKE_COLI)
+        self.models = os.path.join(self.tmp, "models"); os.makedirs(self.models)
+        self.home = os.path.join(self.tmp, "home")
+        self.old_home = os.environ.get("COLI_SETUP_HOME")
+        os.environ["COLI_SETUP_HOME"] = self.home     # the parent's state_path() reads it too
+        self.addCleanup(self._restore_home)
+        registry = gw.ModelRegistry(self.models, [], {})
+        manager = gw.EngineManager(self.coli, 0, engine_url="http://127.0.0.1:1", engine_model="none")
+        puller = gw.Puller(self.coli, self.models, setup_home=self.home)
+        puller.catalog = lambda: {"tiny": _Entry("tiny"), "broken": _Entry("broken")}
+        self.gw = gw.Gateway(("127.0.0.1", 0), registry, manager, puller)
+        g = threading.Thread(target=self.gw.serve_forever, args=(0.01,), daemon=True); g.start()
+        self.addCleanup(g.join, timeout=2); self.addCleanup(self.gw.server_close); self.addCleanup(self.gw.shutdown)
+        self.base = f"http://127.0.0.1:{self.gw.server_port}"
+
+    def _restore_home(self):
+        if self.old_home is None:
+            os.environ.pop("COLI_SETUP_HOME", None)
+        else:
+            os.environ["COLI_SETUP_HOME"] = self.old_home
+
+    def _post(self, path, body):
+        req = Request(self.base + path, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+        try:
+            with urlopen(req, timeout=30) as r:
+                return r.status, r.read().decode()
+        except HTTPError as e:
+            return e.code, e.read().decode()
+
+    def test_pull_streams_progress_then_lists_the_model(self):
+        st, text = self._post("/api/pull", {"model": "tiny"})
+        self.assertEqual(st, 200)
+        lines = [json.loads(l) for l in text.splitlines() if l.strip()]
+        self.assertEqual(lines[0], {"status": "pulling manifest"})
+        progress = [l for l in lines if l["status"].startswith("pulling model-00000")]
+        self.assertTrue(progress, lines)
+        self.assertEqual(progress[-1]["total"], 1000)
+        self.assertEqual(progress[-1]["completed"], 1000)
+        self.assertEqual(lines[-1], {"status": "success"})
+        with urlopen(self.base + "/api/tags", timeout=10) as r:
+            tags = json.loads(r.read().decode())
+        self.assertEqual([m["name"] for m in tags["models"]], ["tiny"])
+        self.assertEqual(tags["models"][0]["details"]["quantization_level"], "int4-g64")
+        self.assertEqual(tags["models"][0]["details"]["format"], "colibri")
+        # pulling a model that is there is a no-op success, as with Ollama
+        st, text = self._post("/api/pull", {"model": "tiny", "stream": False})
+        self.assertEqual(json.loads(text), {"status": "success"})
+        # and /api/delete removes it (it is under the models directory)
+        req = Request(self.base + "/api/delete", data=json.dumps({"model": "tiny"}).encode(), method="DELETE",
+                      headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=10) as r:
+            self.assertEqual(json.loads(r.read().decode()), {"status": "success"})
+        self.assertFalse(os.path.exists(os.path.join(self.models, "tiny")))
+
+    def test_pull_failure_and_unknown(self):
+        st, text = self._post("/api/pull", {"model": "broken"})
+        lines = [json.loads(l) for l in text.splitlines() if l.strip()]
+        self.assertIn("error", lines[-1])
+        self.assertIn("the converter said no", lines[-1]["error"])
+        st, text = self._post("/api/pull", {"model": "nothing-like-it", "stream": False})
+        self.assertEqual(st, 404)
+        self.assertIn("not in colibri's catalog", json.loads(text)["error"])
+
+
+class ModelFiles(unittest.TestCase):
+    """What /api/tags says about a folder: the converter's meta file, a GGUF's type, a sidecar."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="coli-gw-files-")
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
+
+    def _dir(self, name, files):
+        d = os.path.join(self.tmp, name); os.makedirs(d)
+        for fname, content in files.items():
+            if content is None:
+                os.makedirs(os.path.join(d, fname))
+            else:
+                with open(os.path.join(d, fname), "w") as f:
+                    json.dump(content, f)
+        return d
+
+    def test_labels(self):
+        d = self._dir("i4", {"config.json": {"model_type": "qwen3_5_moe"}, "qwen36_meta.json": {"ebits": 4}})
+        self.assertEqual((gw._model_format(d), gw._model_quant(d)), ("colibri", "int4"))
+        d = self._dir("i4g", {"config.json": {}, "qwen38_meta.json": {"ebits": 4, "group_size": 64}})
+        self.assertEqual((gw._model_format(d), gw._model_quant(d)), ("colibri", "int4-g64"))
+        d = self._dir("gg", {"config.json": {}, "gguf.json": {"format": "colibri-gguf-v1", "gguf": "/x/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"}})
+        self.assertEqual((gw._model_format(d), gw._model_quant(d)), ("gguf", "Q4_K_M"))
+        d = self._dir("fp8", {"config.json": {"quantization_config": {"quant_method": "fp8"}}, "experts-int4g64": None})
+        self.assertEqual((gw._model_format(d), gw._model_quant(d)), ("safetensors", "FP8+int4-g64"))
+        d = self._dir("bf16", {"config.json": {"torch_dtype": "bfloat16"}})
+        self.assertEqual((gw._model_format(d), gw._model_quant(d)), ("safetensors", "bfloat16"))
+
+
+class StopFile(unittest.TestCase):
+    def test_coli_stop_request_ends_the_gateway(self):
+        import tempfile
+        registry = gw.ModelRegistry(None, [], {})
+        manager = gw.EngineManager("coli", 0, engine_url="http://127.0.0.1:1", engine_model="none")
+        server = gw.Gateway(("127.0.0.1", 0), registry, manager, gw.Puller("coli", None))
+        fd, server.stopfile = tempfile.mkstemp(prefix="coli-gw-stop-"); os.close(fd)
+        t = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True); t.start()
+        t.join(timeout=5)
+        self.assertFalse(t.is_alive(), "the gateway did not stop on the stop file")
+        self.assertFalse(os.path.exists(server.stopfile), "the stop file was not taken")
+        server.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()
