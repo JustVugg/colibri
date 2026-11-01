@@ -90,6 +90,12 @@ class WavAudioTest(unittest.TestCase):
                 self.wav(fmt=self.extensible_fmt(bits, subtype), data=data), 'audio')
             self.np.testing.assert_array_equal(decoded, expected)
 
+    def test_nonfinite_float_audio_is_rejected_before_generation(self):
+        for value in (float('nan'), float('inf'), float('-inf')):
+            with self.subTest(value=value):
+                self.assert_invalid_http(self.wav(fmt=self.fmt(bits=32, encoding=3),
+                                                  data=struct.pack('<ffff', 0.0, value, 0.5, -0.5)))
+
     def test_short_fmt_is_client_error(self):
         self.assert_invalid_http(self.wav(fmt=b'\x01\0'))
 
