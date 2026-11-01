@@ -13,8 +13,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   GPU), the expert map, and the chat page's hummingbird with its moves, drawn as a sixel picture
   where the terminal can. It attaches to a running server or starts one for `--model`; the
   release archives carry it next to `coli` ([docs/tui.md](docs/tui.md)).
+- **The desktop window** (`desktop/`, Tauri): the chat page in a window of its own. It finds
+  `coli` and Python, uses the colibri server that runs or starts the configured one with
+  `coli start` and waits for its model, serves the page on a fixed local port, and on close
+  stops what it started. `--backend URL` points it at another server
+  ([desktop/README.md](desktop/README.md)).
 - **`/health` reports the NVIDIA cards** (`system.gpus`: use, memory, temperature, power, from
   `nvidia-smi` at most once a second), for the monitors.
+
+### Fixed
+
+- The chat page's first-run dialog waits for the models service to finish measuring the
+  machine; on a fresh state it showed "- GB di RAM" and no model that fits.
 
 ### Docs
 

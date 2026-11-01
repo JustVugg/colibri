@@ -5,6 +5,11 @@ window is a Tauri v2 shell with no second frontend: it shows the same page the
 browser does, served by the same `ui/server.py`. The model stays where the user
 put it: the window starts and stops colibri's server, it does not carry one.
 
+<p align="center">
+  <img src="../docs/media/desktop/desktop-chat.png" width="900" alt="the colibri window on Windows: the chat page, a question, the reasoning folded, the answer and its speed">
+</p>
+<p align="center"><em>The window on Windows, its page talking to Qwen3.8-Flash-Next on a CPU-only server through an ssh tunnel.</em></p>
+
 ## What it does when it opens
 
 1. It finds `coli`: next to the program (a release archive) or above it (this
