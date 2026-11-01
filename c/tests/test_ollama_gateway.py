@@ -164,6 +164,20 @@ class TranslateReplies(unittest.TestCase):
         self.assertEqual(out["eval_count"], 1)
         self.assertTrue(out["done"])
 
+    def test_load_time_is_not_eval_time(self):
+        import time
+        started = time.time() - 100.0            # the request began 100 s ago; 90 of them were the load
+        out = gw.openai_reply_to_ollama({"choices": [{"message": {"role": "assistant", "content": "x"}, "finish_reason": "stop"}],
+                                         "usage": {"prompt_tokens": 3, "completion_tokens": 2}}, "m", started, load_seconds=90.0)
+        self.assertGreaterEqual(out["total_duration"], 100 * 10**9)
+        self.assertEqual(out["load_duration"], 90 * 10**9)
+        self.assertLess(out["eval_duration"], 11 * 10**9)
+        conv = gw.SseToOllama("m", started=started, load_seconds=90.0)
+        lines = conv.feed('data: {"choices": [{"index": 0, "delta": {"content": "x"}, "finish_reason": "stop"}]}')
+        lines += conv.finish()
+        self.assertLess(lines[-1]["prompt_eval_duration"], 11 * 10**9)
+        self.assertEqual(lines[-1]["load_duration"], 90 * 10**9)
+
     def test_error_form(self):
         st, body = gw.openai_error_to_ollama(400, b'{"error": {"message": "bad", "type": "invalid_request_error"}}')
         self.assertEqual((st, body), (400, {"error": "bad"}))
