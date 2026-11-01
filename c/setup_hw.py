@@ -865,6 +865,22 @@ def _run(cmd, timeout=10):
         return ""
 
 
+def detect_metal():
+    """Read the Metal capability reported by macOS without assuming a GPU exists."""
+    if host_os() != "darwin":
+        return None
+    try:
+        report = json.loads(_run(["system_profiler", "SPDisplaysDataType", "-json"], timeout=15))
+        for card in report.get("SPDisplaysDataType", []):
+            support = str(card.get("spdisplays_metal", ""))
+            if support == "spdisplays_supported" or ("metal" in support.lower() and "unsupported" not in support.lower()):
+                return {"name": card.get("sppci_model") or card.get("_name") or "Apple GPU",
+                        "type": "integrated", "metal_support": support}
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return None
+
+
 def gpu_summary(vulkan, nvidia):
     """What the setup acts on: the Vulkan device the engine would pick (when it
     is a usable GPU) and the NVIDIA cards."""
@@ -897,6 +913,9 @@ def detect(target_dir=None, probe_gpu=True):
         if not report["vulkan"]["devices"]:
             report["windows_video"] = detect_windows_video()
     report["gpu"] = gpu_summary(report["vulkan"], report["nvidia"])
+    metal = detect_metal() if probe_gpu else None
+    if metal:
+        report["gpu"].update(metal=metal, has_gpu=True)
     return report
 
 
@@ -931,6 +950,9 @@ def format_report(report):
             lines.append(f"          warning: {warning}")
     gpu = report.get("gpu", {})
     shown = False
+    if gpu.get("metal"):
+        lines.append(f"  GPU     {gpu['metal']['name']} (Metal, shares RAM)")
+        shown = True
     if gpu.get("vulkan"):
         device = gpu["vulkan"]
         memory = device.get("budget_bytes") or device.get("device_local_bytes")
