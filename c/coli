@@ -3790,6 +3790,16 @@ def _stop_environ(pid):
     pairs=[t for t in out.split() if "=" in t and t.split("=",1)[0].replace("_","").isalnum()]
     return b"\0".join(t.encode("utf-8","replace") for t in pairs)+b"\0"
 
+def cmd_gateway(a):
+    """`coli gateway`: the Ollama API (/api/chat, /api/tags, /api/pull, ...) on port 11434 in front
+    of `coli serve`, so Open WebUI and the other Ollama clients run on colibri unchanged. The
+    options are ollama_gateway.py's (`coli gateway --help`); `coli stop --port 11434` ends it
+    and the engine it started. main() hands the word over before parsing (see there); this
+    handler is for the subparser's listing in `coli --help` and a `coli gateway` typed through it."""
+    import ollama_gateway
+    ollama_gateway.main(getattr(a,"gateway_args",[]))
+
+
 def cmd_stop(a):
     """Shut down a running `coli serve` AND its engine — one command, no pkill.
     The engine re-execs itself for OMP tuning, so its process is named `exe`,
@@ -3809,8 +3819,11 @@ def cmd_stop(a):
     targets={}  # pid -> descrizione
     pf=serve_pidfile(a.port)
     try:
-        with open(pf) as f: pid=int(f.read().split()[0])
-        if _pid_alive(pid): targets[pid]=f"coli serve (pidfile, port {a.port})"
+        with open(pf) as f: words=f.read().split()
+        pid=int(words[0])
+        # `coli gateway` keeps the same pidfile under its port: it ends its engine child itself.
+        what="coli gateway" if words[1:2]==["gateway"] else "coli serve"
+        if _pid_alive(pid): targets[pid]=f"{what} (pidfile, port {a.port})"
     except (OSError,ValueError,IndexError): pass
     process_names={"exe"}
     for family in all_families(): process_names.update(family.process_names)
@@ -3829,8 +3842,8 @@ def cmd_stop(a):
     # (stdin EOF -> atexit -> HEAT_FILE save). SIGTERM the launchers and
     # give them the drain window to exit on their own; engine pids left
     # behind (orphaned, no launcher) get the old treatment after.
-    launchers = [pid for pid, d in targets.items() if d.startswith("coli serve")]
-    strays   = [pid for pid, d in targets.items() if not d.startswith("coli serve")]
+    launchers = [pid for pid, d in targets.items() if d.startswith(("coli serve", "coli gateway"))]
+    strays   = [pid for pid, d in targets.items() if not d.startswith(("coli serve", "coli gateway"))]
     deadline = time.time() + 30.0
     # The serve's own stop first (_request_stop): it needs no rights on the process.
     # On Windows a SIGTERM is TerminateProcess, no drain, so it is sent only to a
@@ -4196,6 +4209,12 @@ def cmd_mirror(a):
 
 
 def main():
+    # `coli gateway ...`: every option after the word is ollama_gateway.py's (--port, --model
+    # NAME=PATH, --help), so it does not go through this parser; argparse's REMAINDER would
+    # still read a leading --port as one of coli's own options.
+    if len(sys.argv)>1 and sys.argv[1]=="gateway":
+        import ollama_gateway
+        return ollama_gateway.main(sys.argv[2:])
     common=argparse.ArgumentParser(add_help=False)
     common.add_argument("--model", default=DEF_MODEL); common.add_argument("--ram", type=int, default=0)  # 0 = auto (il motore usa l'88% della RAM disponibile)
     common.add_argument("--auto-tier",action="store_true",help="automatically apply the RAM/VRAM plan")
@@ -4326,6 +4345,10 @@ def main():
     pworker.add_argument("--node-id",default=None); pworker.add_argument("--advertise-host",default=None)
     pworker.add_argument("--layers",default="all",help="topology label, e.g. 0-37")
     pworker.add_argument("--ebits",type=int,default=8); pworker.add_argument("--dbits",type=int,default=8)
+    pg=sub.add_parser("gateway", add_help=False,
+                      help="the Ollama API (port 11434) in front of coli serve: Open WebUI and other "
+                           "Ollama clients run on colibri unchanged (`coli gateway --help` for its options)")
+    pg.add_argument("gateway_args", nargs=argparse.REMAINDER)
     pst=sub.add_parser("stop", parents=[common], help="shut down a running coli serve and its engine")
     pst.add_argument("--port",type=int,default=None,
                      help="port of the server to stop (default 8000, or the one `coli setup` configured)")
@@ -4445,6 +4468,7 @@ def main():
     handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"mirror":cmd_mirror,
              "doctor":cmd_doctor,"tune":cmd_tune,
              "run":cmd_run,"chat":cmd_chat,"tui":cmd_tui,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
+             "gateway":cmd_gateway,
              "convert":cmd_convert,"import":cmd_import,"web":cmd_web,"ui":cmd_ui}.get(a.cmd)
     if a.cmd in ("setup","start","status","logs"):
         import setup_flow
