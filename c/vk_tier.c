@@ -4739,6 +4739,23 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
             T.st_ok = fit >= 2;
             if (!T.st_ok) fit = fit_raw > all ? all : fit_raw;
         }
+        /* The derived GEMM-rows crossover is a full-budget tier's measurement; a tier the
+         * carve left at streaming's least (the residents at their floor beside the slots)
+         * has no place for the eviction's overlap -- a promotion uploads its replacement
+         * while the victim's places are still the pool's -- and the upload is refused
+         * ("failed: N refused by the pool", an eviction gate's FAIL: glm's two-expert
+         * budget, both device classes). There the derived value does not apply: it stays
+         * at the base's 16 -- the standing path, the slots armed but never taken by these
+         * shapes -- and the ONE line says so. A set env keeps its value; the base itself
+         * is already 16. */
+        {
+            const char *gre = getenv("COLI_VK_TIER_GEMM_ROWS");
+            if (T.st_ok && slots >= 2 && fit <= 2 && !(gre && *gre) && T.gemm_rows > 0 && T.gemm_rows < 16) {
+                fprintf(stderr, VKT_TAG " tier: grouped GEMM rows: the budget holds only the streaming least (%d residents beside %d slots) -- the derived crossover stands down, %d rows\n",
+                        fit, slots, 16);
+                T.gemm_rows = 16;
+            }
+        }
         if (T.bank_on && fit > fit_raw - slots)
             fit = fit_raw - slots;   /* the carve's freed places join the residents even when streaming did not survive it (every slot became the bank) */
         if (T.st_ok) {
