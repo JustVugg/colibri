@@ -1380,10 +1380,13 @@ async function generate(cont){
     const r=await fetch(url('/v1/chat/completions'),{method:'POST',headers:H(),body:JSON.stringify(body),signal:ctl.signal});
     if(!r.ok)throw new Error(await errText(r));
     const qw=r.headers.get('x-colibri-queue-wait-ms');if(qw&&+qw>500){phase='queued'}
-    const rd=r.body.getReader(),dec=new TextDecoder();let buf='';
+    const rd=r.body.getReader(),dec=new TextDecoder();let buf='',ended=false;
     for(;;){const {value,done}=await rd.read();buf+=dec.decode(value||new Uint8Array(),{stream:!done});
       const frames=buf.split(/\r?\n\r?\n/);buf=frames.pop()||'';
-      for(const f of frames)for(const line of f.split(/\r?\n/)){if(!line.startsWith('data:'))continue;const d=line.slice(5).trim();if(!d||d==='[DONE]')continue;
+      /* an event's data lines joined by a newline, the one optional space after "data:" dropped (the SSE
+         rules): a JSON split over lines is one event; [DONE] ends the read, whether or not the server closes */
+      for(const f of frames){const dls=f.split(/\r?\n/).filter(l=>l.startsWith('data:')).map(l=>l.slice(l.startsWith('data: ')?6:5));
+        if(!dls.length)continue;const d=dls.join('\n').trim();if(d==='[DONE]'){ended=true;break}if(!d)continue;
         let ev;try{ev=JSON.parse(d)}catch(_){continue}
         if(ev.compaction)a.compaction=ev.compaction;if(ev.usage)usage=ev.usage;
         const ch=ev.choices&&ev.choices[0];if(!ch)continue;const dl=ch.delta||{};
@@ -1391,7 +1394,8 @@ async function generate(cont){
         if(dl.reasoning_content){if(!tFirst)tFirst=performance.now();nTok++;roundReason+=dl.reasoning_content;a.reasoning=(a.reasoning||'')+dl.reasoning_content;if(!gotReason){gotReason=true;phase='gen';setPill('tool','Ragiona');if(M.token===t)setAnim('lean')}repaint()}
         if(dl.content){if(!tFirst)tFirst=performance.now();nTok++;roundText+=dl.content;a.content+=dl.content;if(!gotContent){gotContent=true;phase='gen';setPill('gen','Scrive');if(M.token===t){setAnim(['fly1','fly2'],14);tween(300,k=>{M.lift=-8*k},t).catch(()=>{})}}repaint()}
         if(ch.finish_reason)finish=ch.finish_reason}
-      if(done)break}
+      if(ended||done)break}
+    if(ended)rd.cancel().catch(()=>{});
     if(usage){sawUsage=true;outTot+=usage.completion_tokens||0}
     const live=calls.filter(c=>c&&c.name);
     if(!(useTools&&live.length)||round>=WEB_ROUNDS+1)break;
