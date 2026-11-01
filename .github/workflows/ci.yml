@@ -1002,7 +1002,8 @@ jobs:
           # engine, so rebuild the normal one first.
           make clean >/dev/null 2>&1 || true
           make qwen36
-          QWEN36_TINY=qwen36_tiny_c python3 -m unittest -v tests.test_qwen36_prefix_serve tests.test_qwen36_text_stops
+          QWEN36_TINY=qwen36_tiny_c QWEN3_CODER_TINY=qwen3_coder_tiny_c \
+            python3 -m unittest -v tests.test_qwen36_prefix_serve tests.test_qwen36_text_stops
           make tests/test_qwen36_prefill_control
           for dense in 0 1; do
             for cap in 1 8; do

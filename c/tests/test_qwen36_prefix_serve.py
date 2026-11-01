@@ -26,6 +26,10 @@ from prefix_serve_harness import (PrefixReuseContract, ServeEngine,  # noqa: E40
 HERE = Path(__file__).resolve().parent.parent
 ENGINE = HERE / ("qwen36.exe" if sys.platform == "win32" else "qwen36")
 FIXTURE = Path(os.environ.get("QWEN36_TINY", HERE / "qwen36_tiny_c"))
+# Qwen3-Coder's geometry on the same engine (tools/make_qwen36_tiny.py --geometry
+# qwen3-coder-30b): attention alone, so it also resumes where a prompt leaves the
+# held state.
+CODER_FIXTURE = Path(os.environ.get("QWEN3_CODER_TINY", HERE / "qwen3_coder_tiny_c"))
 
 
 def cpu_prefill_engine(cap, dense, slots):
@@ -204,6 +208,28 @@ class Qwen36PrefillEnvironmentTest(unittest.TestCase):
         env = self.capture(case.spawn)
         for key, value in self.ACCELERATORS.items():
             self.assertEqual(env[key], value)
+
+
+
+@unittest.skipUnless(ENGINE.exists(), "qwen36 is not built")
+@unittest.skipUnless((CODER_FIXTURE / "model-globals.safetensors").exists(),
+                     "tiny Qwen3-Coder container is absent (tools/make_qwen36_tiny.py "
+                     "--geometry qwen3-coder-30b, then tools/convert_qwen36.py)")
+class Qwen3CoderPrefixServeTest(PrefixReuseContract, unittest.TestCase):
+    """Every layer full attention: the contract, plus resuming midway. An agent that
+    starts a new task on the same system prompt and tools reads only what follows them;
+    a side request that shares nothing still parks the conversation."""
+    PARKS = True
+    RESUMES_MIDWAY = True
+
+    @classmethod
+    def setUpClass(cls):
+        ensure_byte_tokenizer(CODER_FIXTURE)
+
+    def spawn(self, log_prefix=True, reuse=True):
+        return ServeEngine(ENGINE, ["8", "8"],
+                           {"SNAP": str(CODER_FIXTURE), "SERVE": "1", "COLI_DENSE_I8": "0"},
+                           log_prefix=log_prefix, reuse=reuse)
 
 
 if __name__ == "__main__":
