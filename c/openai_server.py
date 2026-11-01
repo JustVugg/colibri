@@ -5078,6 +5078,9 @@ def anthropic_to_openai(body):
                                    f"{where}.signature")
                 reasoning.append(block["thinking"])
             elif kind == "tool_use":
+                if role != "assistant":
+                    raise APIError(400, "`tool_use` blocks are valid only in assistant messages.",
+                                   where, "unsupported_content_type")
                 name = block.get("name")
                 if not isinstance(name, str) or not name:
                     raise APIError(400, "`tool_use` blocks require a string `name`.", f"{where}.name")
@@ -5091,6 +5094,9 @@ def anthropic_to_openai(body):
                               "function": {"name": name,
                                            "arguments": json.dumps(arguments, ensure_ascii=False)}})
             elif kind == "tool_result":
+                if role != "user":
+                    raise APIError(400, "`tool_result` blocks are valid only in user messages.",
+                                   where, "unsupported_content_type")
                 pictures = []
                 results.append({"role": "tool",
                                 "tool_call_id": block.get("tool_use_id") or "",

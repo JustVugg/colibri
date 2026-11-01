@@ -240,6 +240,23 @@ class MessagesHTTPTest(unittest.TestCase):
         body.update(extra)
         return body
 
+    def test_misplaced_tool_blocks_are_rejected_before_generation(self):
+        cases = (
+            ('user', {'type': 'tool_use', 'id': 't1', 'name': 'f', 'input': {}}),
+            ('assistant', {'type': 'tool_result', 'tool_use_id': 't1', 'content': 'done'}),
+        )
+        for role, block in cases:
+            with self.subTest(role=role, block=block['type']):
+                body = self.base_body(messages=[{'role': role, 'content': [block]}])
+                with self.assertRaises(HTTPError) as caught:
+                    self.post(body)
+                with caught.exception as response:
+                    self.assertEqual(response.code, 400)
+                    error = json.load(response)['error']
+                self.assertEqual(error['type'], 'invalid_request_error')
+                self.assertIn(block['type'], error['message'])
+        self.assertEqual(self.engine.prompts, [])
+
     def test_message_response_shape(self):
         with self.post(self.base_body()) as response:
             payload = json.load(response)
