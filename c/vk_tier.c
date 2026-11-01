@@ -4602,6 +4602,15 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         { int v = coli_vk_env_int("COLI_VK_TIER_EXPERTS", 1); T.csx = v == 2 ? 2 : v != 0; }
         if (!T.csx && coli_vk_legacy() && !(xe && *xe))
             fprintf(stderr, VKT_TAG " tier %s: cs experts: legacy (COLI_VK_LEGACY=1) -- the serial CPU loop\n", eng);
+        /* the seam gate: a deferred step is only the engine's to serve -- it owes the
+         * group at its token's finish (vkt_issue_group, VktConfig.cs_finish), and only
+         * an engine that wired the seam issues it. Any other engine would join a step
+         * nothing submitted: the join reports success and its rows read NULL, so the
+         * lever refuses here (one line) and decode keeps the standing issue/join path. */
+        if (T.csx && !T.c.cs_finish) {
+            fprintf(stderr, VKT_TAG " tier %s: cs experts refused: the engine wires no finish-site group -- decode keeps the issue/join path\n", eng);
+            T.csx = 0;
+        }
         if (T.csx != 1 && T.csx != 2) T.csx = 0;
         if (T.csx == 2 && !(T.dgrow && T.dgrow_head)) {
             fprintf(stderr, VKT_TAG " tier %s: COLI_VK_TIER_EXPERTS=2 is the growth composition and needs COLI_VK_TIER_DECODE_GROW_HEADROOM armed with it; the compute site stays off\n", eng);

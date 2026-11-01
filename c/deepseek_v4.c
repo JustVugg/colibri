@@ -15439,7 +15439,10 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
                     .load_batch = v4_vkt_bypass ? v4_vkt_load_batch : NULL,
                     /* the ring's reader: the Vulkan backend's commit is any-thread; the CUDA
                      * tier keeps its fills on the engine thread as before (no armed ring) */
-                    .ring_batch = v4_vkt_bypass && !xt_cuda() ? v4_vkt_ring_batch : NULL};
+                    .ring_batch = v4_vkt_bypass && !xt_cuda() ? v4_vkt_ring_batch : NULL,
+                    /* CS-1b: this engine wires the finish-site group (v4_vkt_issue_group
+                     * below), so the tier may defer a decode step to it */
+                    .cs_finish = 1};
     /* COLI_VK_TIER_DECODE_GROW's rank: the decode-only counts (.coli_mfu), handed over
      * as rows only where the engine's geometry is the fork table's own (the check is
      * the store unit's, which owns the table's macros); the tier keeps its copy and

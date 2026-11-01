@@ -257,6 +257,13 @@ typedef struct {
     /* Optional: at most this many experts resident whatever the budget holds (0 = no
      * cap); for an engine whose users already size its device tier in experts. */
     int max_experts;
+    /* Optional, COLI_VK_TIER_EXPERTS (CS-1b): 1 = the engine wired the finish-site
+     * seam -- it owes the deferred step ONE vkt_issue_group at the token's finish, as
+     * deepseek_v4's expert store does (vkt_cs_armed told it the tier would defer).
+     * Without the seam a deferred step would reach vkt_join with nothing submitted:
+     * the join reports success and its rows read NULL, so the lever refuses at init
+     * (one line) and the engine keeps the standing issue/join path whole. */
+    int cs_finish;
     /* Optional, for streaming (a big prefill step's cold experts computed on the device,
      * see "streaming" below): get an expert's bytes as the engine's CPU path would (its
      * RAM cache, else the disk), valid until release(ctx, *h). 1 = *src filled; 0 = not

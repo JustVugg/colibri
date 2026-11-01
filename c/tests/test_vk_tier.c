@@ -334,7 +334,10 @@ static void route(int S, int lo, int span, int *idx, float *w) {
 static VktConfig cfg_of(VktFmt gu, VktFmt dn, int act, float limit) {
     return (VktConfig){.engine = "test", .layers = L, .experts = E, .hidden = H, .inter = F, .topk = K,
                        .gate_up = gu, .down = dn, .act = act, .act_limit = limit, .act_a = 4.f, .act_b = 25.f,
-                       .max_rows = 1 << 20};
+                       .max_rows = 1 << 20,
+                       /* the helper owes the deferred group at its finish (step() calls
+                        * vkt_issue_group exactly as an engine's token finish does) */
+                       .cs_finish = 1};
 }
 static void set_budget(int experts, VktFmt gu, VktFmt dn) {
     char b[64]; snprintf(b, sizeof b, "%.12f", (experts + 0.5) * vkt_expert_bytes(H, F, gu, dn) / 1073741824.0);
