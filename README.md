@@ -158,9 +158,9 @@ token before any cache hit, at 16.9 GB/s with both drives reading at once
 ([the plan, the other K3 engines and what was taken from them](docs/kimi_k3-4090.md)).
 Measured on the real model ([docs/experiments/kimi-k3-4090-2026-10-31](docs/experiments/kimi-k3-4090-2026-10-31/README.md)):
 **0.81 tokens a second** (the first engine here 0.56), a 44 s start (161), a 35-token prompt
-in 33 s (57), a **2,637-token prompt in 137 s** (1,401 s with the first CPU kernels, 549 s
-with the faster ones: its experts, MLA attention and routers now run on the GPU in the CPU's
-arithmetic, to the bit); 60.5% of the experts a token asks for are found in RAM. Every step
+in 33 s (57), a **2,637-token prompt in 113 s** (1,401 s with the first CPU kernels, 549 s
+with the faster ones, 137 s with its experts, MLA attention and routers on the GPU in the
+CPU's arithmetic, to the bit; the matrices that stay on the card now 2x sooner, the same bytes); 60.5% of the experts a token asks for are found in RAM. Every step
 gives the logits of the one before it, byte for byte:
 
 - `c\tools\download_kimi_k3_4090.ps1` fetches the checkpoint and cuts every MoE layer's
@@ -200,7 +200,7 @@ gives the logits of the one before it, byte for byte:
 одним шагом до 4096 токенов. Запуск: `c\tools\start_kimi_k3_4090.ps1`.
 Замеры на настоящей модели: **0,81 токена/с** (первая версия — 0,56), запуск 44 с (было 161),
 промпт из 35 токенов за 33 с (57); 60,5% экспертов находятся в ОЗУ, **промпт из 2637 токенов —
-137 с** (было 1401, затем 549 на CPU), логиты те же байт в байт. Подробно: [docs/kimi_k3-4090.md](docs/kimi_k3-4090.md).
+113 с** (было 1401, затем 549 на CPU и 137 на GPU), логиты те же байт в байт. Подробно: [docs/kimi_k3-4090.md](docs/kimi_k3-4090.md).
 
 </details>
 <p align="center">

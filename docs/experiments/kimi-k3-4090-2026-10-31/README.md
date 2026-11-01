@@ -207,3 +207,34 @@ Vulkan build, omp_spin.o only without Vulkan.
 The GPU's timing on this machine varies by up to a quarter for minutes at a time
 (`s2_d32_long`: coli_cuda.dll's unchanged dense calls 35.3 -> 44.6 s), so a change is kept
 on an alternating series or a bench of its own, never on one run.
+
+## The card's own matrices 2x sooner (`raw/s3_*`, `ab3_*`, 2026-11-01)
+
+The 369 matrices coli_cuda.dll holds (KDA's projections, the gated MLA's o_proj and gate,
+the head) took 32.6 s of the 2,637-token prompt in `quant_matmul_tiled`, 8 outputs by 8 rows a
+block. `quant_matmul_blocked` keeps quant_matmul's 256 sums an output and its tree, so the same
+bytes, with 16 outputs by 8 rows a thread, the rows in blocks of 8 (two 16-byte loads a step),
+the next step's inputs and weights in flight during this one, and a nibble's decode one mask
+and one fused add (`(b & m) ^ c` reads as 2^23 + 16^p (n + 8); the old decode's shift, constant
+and mask cost more than the product). Found on the way with `bench_qmt.cu` and `fp32peak.cu`
+(the GPU's counters need an administrator's setting, so by probes): the 4090 issues about 35 T
+fused adds a second, 19 T int4 multiply-adds with the product rounded first, 10.7 T with the
+old decode at 8 rows a weight; with its inputs or weights served from L1 the int4 kernel kept
+its time (bound by its instructions and its loads' latency at 2 warps a scheduler, not by L2's
+3.6 TB/s), while int8 halved (its byte loads). Weights through shared memory, two named
+register sets, two threads a chain: no faster.
+
+| run | what | the 2,637-token prompt |
+|---|---|---:|
+| `bench_qmt.cu` | 12288x7168 int4 (KDA q/k/v/g), 7168x12288 int4 (KDA o), 7168x12288 and 12288x7168 int8 (MLA), 2,637 rows | 72 -> 24, 69 -> 23, 109 -> 27, 120 -> 30 ms a matmul; the same bytes (zeros of both signs, subnormal and large inputs) |
+| `s3_qmb_logits`, `s3_qmb2_logits` | the logits of all 2,637 positions, the first build and the final one | the same bytes as `s2_long_ref` |
+| `s3_qmb_time` | the first build: a third device buffer of 130 MB | 125.6 s, the MoE 10 s slower beside it: x now lands in the output's buffer |
+| `ab3_qmb_*`, `ab3_tiled_*` (`series_qmb.sh`) | A/B twice, `COLI_CUDA_QMB=0` the old kernel | **113.0, 112.4 s** against 128.8, 128.2 s: attention 48.7 -> 32.5 s, the resident matmuls 32.6 -> 15.6 s |
+
+The prompt now waits for C:. During the A/B's prompts C: read 91-92% of the time (8.2 GiB/s
+when busy, against 83% with the old kernel) and D: 81-84% (5.6 GiB/s): every MoE layer reads
+nearly all of its experts once, 1,446 GB a cold prompt, 61.4% of them from C:. A copy to the
+card from pinned memory runs at 26.7 GB/s alone, 26.75 beside the drives' reads and 23.3 beside
+37 GB/s of CPU sweeps too (`h2d_load.cu`), so the routed experts' copies were not what held it.
+What is left of the 113 s: attention 32.5 s (KDA 25: its resident matmuls 15.6, its CPU work
+9.6), the MoE 76.5 s (routed experts 44, shared 17.3, latent 5.6).

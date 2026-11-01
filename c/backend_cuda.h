@@ -239,8 +239,10 @@ COLI_CUDA_DLLEXPORT int coli_cuda_matmul(ColiCudaTensor **tensor,
  * (fmt=4) in tiles of 8 outputs by 8 rows: each decoded weight serves 8 rows instead
  * of being read again for every row, the sums and their tree exactly quant_matmul's,
  * so a row's bytes do not depend on the rows called with it (tests/test_cuda_matmul_tiled.c).
- * Other formats go to coli_cuda_matmul. Kimi K3's prompt steps; an older DLL without
- * it: the loader calls coli_cuda_matmul instead. */
+ * Kimi K3's trunk shapes (7168 or 12288 columns, outputs a multiple of 16, int4 in groups
+ * of 64) take quant_matmul_blocked, the same bytes in tiles of 16 outputs by 8 rows, about
+ * 3x sooner (COLI_CUDA_QMB=0: the 8 by 8 tiles). Other formats go to coli_cuda_matmul.
+ * Kimi K3's prompt steps; an older DLL without it: the loader calls coli_cuda_matmul instead. */
 COLI_CUDA_DLLEXPORT int coli_cuda_matmul_tiled(ColiCudaTensor **tensor,
                      float *y, const float *x,
                      const void *weights, const float *scales,
