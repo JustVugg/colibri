@@ -479,6 +479,11 @@ __global__ void dg_swiglu_quant_routes(const __nv_bfloat16*in,uint8_t*q,int*sfa,
 __global__ void dg_quant_routes_map(const float*x,uint8_t*q,int*sfa,int tokens,int K,int rows,const int*rowmap){int route=blockIdx.x/(K/512),pack=blockIdx.x%(K/512);if(route>=tokens*6)return;int token=route/6,row=rowmap[route];__shared__ float mx[128];uint32_t codes=0;for(int b=0;b<4;b++){int k=(pack*4+b)*128+threadIdx.x;float v=x[(long long)token*K+k];mx[threadIdx.x]=fabsf(v);__syncthreads();for(int n=64;n;n>>=1){if(threadIdx.x<n)mx[threadIdx.x]=fmaxf(mx[threadIdx.x],mx[threadIdx.x+n]);__syncthreads();}uint8_t code=dg_scale_code(mx[0]);float scale=dg_scale_value(code);q[(long long)row*K+k]=__nv_cvt_float_to_fp8(fmaxf(-448.f,fminf(448.f,v/scale)),__NV_SATFINITE,__NV_E4M3);if(!threadIdx.x)codes|=(uint32_t)code<<(8*b);__syncthreads();}if(!threadIdx.x)sfa[(long long)pack*rows+row]=(int)codes;}
 __global__ void dg_swiglu_quant_routes_map(const __nv_bfloat16*in,uint8_t*q,int*sfa,const float*weight,float limit,int routes,int rows,const int*rowmap){int route=blockIdx.x;if(route>=routes)return;int row=rowmap[route];__shared__ float mx[128],value[128];uint32_t pack=0;for(int g=0;g<16;g++){int k=g*128+threadIdx.x;float gate=fminf(__bfloat162float(in[(long long)row*4096+k]),limit),up=fmaxf(-limit,fminf(__bfloat162float(in[(long long)row*4096+2048+k]),limit));float v=__bfloat162float(__float2bfloat16(weight[route]*__bfloat162float(__float2bfloat16((gate/(1.f+expf(-gate)))*up))));value[threadIdx.x]=v;mx[threadIdx.x]=fabsf(v);__syncthreads();for(int n=64;n;n>>=1){if(threadIdx.x<n)mx[threadIdx.x]=fmaxf(mx[threadIdx.x],mx[threadIdx.x+n]);__syncthreads();}uint8_t code=dg_scale_code(mx[0]);float scale=dg_scale_value(code);q[(long long)row*2048+k]=__nv_cvt_float_to_fp8(fmaxf(-448.f,fminf(448.f,value[threadIdx.x]/scale)),__NV_SATFINITE,__NV_E4M3);if(!threadIdx.x){pack|=(uint32_t)code<<(8*(g&3));if((g&3)==3){sfa[(long long)(g/4)*rows+row]=(int)pack;pack=0;}}__syncthreads();}}
 __global__ void dg_reduce_routes_map(float*out,const __nv_bfloat16*parts,int tokens,const int*rowmap){long long p=(long long)blockIdx.x*blockDim.x+threadIdx.x,n=(long long)tokens*4096;if(p<n){int t=p/4096,h=p%4096;float v=0;for(int k=0;k<6;k++)v+=__bfloat162float(parts[(long long)rowmap[t*6+k]*4096+h]);out[p]=__bfloat162float(__float2bfloat16(v));}}
+/* EP2 variants: rowmap entries -1 mark routes that belong to the other device
+ * and contribute nothing -- skip them in quant/swiglu and in the reduce sum. */
+__global__ void dg_quant_routes_map_skip(const float*x,uint8_t*q,int*sfa,int tokens,int K,int rows,const int*rowmap){int route=blockIdx.x/(K/512),pack=blockIdx.x%(K/512);if(route>=tokens*6)return;int row=rowmap[route];if(row<0)return;int token=route/6;__shared__ float mx[128];uint32_t codes=0;for(int b=0;b<4;b++){int k=(pack*4+b)*128+threadIdx.x;float v=x[(long long)token*K+k];mx[threadIdx.x]=fabsf(v);__syncthreads();for(int n=64;n;n>>=1){if(threadIdx.x<n)mx[threadIdx.x]=fmaxf(mx[threadIdx.x],mx[threadIdx.x+n]);__syncthreads();}uint8_t code=dg_scale_code(mx[0]);float scale=dg_scale_value(code);q[(long long)row*K+k]=__nv_cvt_float_to_fp8(fmaxf(-448.f,fminf(448.f,v/scale)),__NV_SATFINITE,__NV_E4M3);if(!threadIdx.x)codes|=(uint32_t)code<<(8*b);__syncthreads();}if(!threadIdx.x)sfa[(long long)pack*rows+row]=(int)codes;}
+__global__ void dg_swiglu_quant_routes_map_skip(const __nv_bfloat16*in,uint8_t*q,int*sfa,const float*weight,float limit,int routes,int rows,const int*rowmap){int route=blockIdx.x;if(route>=routes)return;int row=rowmap[route];if(row<0)return;__shared__ float mx[128],value[128];uint32_t pack=0;for(int g=0;g<16;g++){int k=g*128+threadIdx.x;float gate=fminf(__bfloat162float(in[(long long)row*4096+k]),limit),up=fmaxf(-limit,fminf(__bfloat162float(in[(long long)row*4096+2048+k]),limit));float v=__bfloat162float(__float2bfloat16(weight[route]*__bfloat162float(__float2bfloat16((gate/(1.f+expf(-gate)))*up))));value[threadIdx.x]=v;mx[threadIdx.x]=fabsf(v);__syncthreads();for(int n=64;n;n>>=1){if(threadIdx.x<n)mx[threadIdx.x]=fmaxf(mx[threadIdx.x],mx[threadIdx.x+n]);__syncthreads();}uint8_t code=dg_scale_code(mx[0]);float scale=dg_scale_value(code);q[(long long)row*2048+k]=__nv_cvt_float_to_fp8(fmaxf(-448.f,fminf(448.f,value[threadIdx.x]/scale)),__NV_SATFINITE,__NV_E4M3);if(!threadIdx.x){pack|=(uint32_t)code<<(8*(g&3));if((g&3)==3){sfa[(long long)(g/4)*rows+row]=(int)pack;pack=0;}}__syncthreads();}}
+__global__ void dg_reduce_routes_map_skip(float*out,const __nv_bfloat16*parts,int tokens,const int*rowmap){long long p=(long long)blockIdx.x*blockDim.x+threadIdx.x,n=(long long)tokens*4096;if(p<n){int t=p/4096,h=p%4096;float v=0;for(int k=0;k<6;k++){int row=rowmap[t*6+k];if(row>=0)v+=__bfloat162float(parts[(long long)row*4096+h]);}out[p]=__bfloat162float(__float2bfloat16(v));}}
 __global__ void dg_reduce_routes(float*out,const __nv_bfloat16*parts,int tokens,int align){long long p=(long long)blockIdx.x*blockDim.x+threadIdx.x,n=(long long)tokens*4096;if(p<n){int t=p/4096,h=p%4096;float v=0;for(int k=0;k<6;k++)v+=__bfloat162float(parts[((long long)(t*6+k)*align)*4096+h]);out[p]=__bfloat162float(__float2bfloat16(v));}}
 __global__ void swiglu_rows(float*out,const float*gate,const float*up,float limit,int rows,int I){long long p=(long long)blockIdx.x*blockDim.x+threadIdx.x,n=(long long)rows*I;if(p<n){float g=fminf(gate[p],limit),u=fmaxf(-limit,fminf(up[p],limit));out[p]=__bfloat162float(__float2bfloat16((g/(1.f+expf(-g)))*u));}}
 __global__ void add_rows(float*out,const float*x,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=__bfloat162float(__float2bfloat16(out[i]+x[i]));}
@@ -722,6 +727,43 @@ static int dg_moe_batch_contiguous(Dev*c,Dsv4CudaExpertSet*set,const float*input
     if(!dg_map(&a,CU_TENSOR_MAP_DATA_TYPE_UINT8,c->dga2,2048,M,2048,128,A,CU_TENSOR_MAP_SWIZZLE_128B)||!dg_map(&b,CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B,set->bank_fc2,2048,(unsigned long long)G*N,1024,128,64,CU_TENSOR_MAP_SWIZZLE_128B)||!dg_map(&sa,CU_TENSOR_MAP_DATA_TYPE_INT32,c->dgsfa2,M,4,(unsigned long long)M*4,A,1,CU_TENSOR_MAP_SWIZZLE_NONE)||!dg_map(&sb,CU_TENSOR_MAP_DATA_TYPE_INT32,set->bank_fc2_dg_scale,N,(unsigned long long)G*16,16384,64,1,CU_TENSOR_MAP_SWIZZLE_NONE)||!dg_map(&d,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,c->dgmm2,N,M,(unsigned long long)N*2,64,A,CU_TENSOR_MAP_SWIZZLE_128B))return 0;
     auto fc2=c->sms>=170?deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N,2048,128,32,G,64,64,128,128,128,128,3,128,256,170,deep_gemm::GemmType::MGroupedContiguous,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>:deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N,2048,128,32,G,64,64,128,128,128,128,3,128,256,84,deep_gemm::GemmType::MGroupedContiguous,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>;if(!ok(cudaFuncSetAttribute(fc2,cudaFuncAttributeMaxDynamicSharedMemorySize,92672),"batched MoE FC2 shared memory"))return 0;fc2<<<(c->sms>=170?170:84),384,92672,c->stream>>>((DgOutput*)c->dgmm2,nullptr,(__nv_fp8_e4m3*)c->dga2,(__nv_fp8_e4m3*)set->bank_fc2,c->dglayout,nullptr,nullptr,M,N,2048,N,0,0,deep_gemm::TmaParamPad48{},a,b,sa,sb,d);if(use_map)dg_reduce_routes_map<<<((long long)tokens*4096+255)/256,256,0,c->stream>>>(out,c->dgmm2,tokens,c->dgrowmap);else dg_reduce_routes<<<((long long)tokens*4096+255)/256,256,0,c->stream>>>(out,c->dgmm2,tokens,A);return ok(cudaGetLastError(),"batched contiguous MoE launch");
 }
+/* EP2 slice of dg_moe_batch_contiguous: only routes whose expert id lies in
+ * [lo,hi) are computed; all other routes are sentinels (-1) the DG kernels
+ * skip, and out receives the in-range routed sum only (no shared experts --
+ * the caller adds those once on the primary side or relies on the zeroed
+ * shared mirrors of the peer bank). host_ids must be non-null (grouped layout
+ * is mandatory here); returns 1 with no kernel work when no route is in
+ * range. */
+static int dg_moe_batch_masked(Dev*c,Dsv4CudaExpertSet*set,const float*input,const int*ids,const float*weight,int tokens,float limit,float*out,const int*host_ids,int lo,int hi){
+    constexpr int N=4096,A=64,G=256;int routes=tokens*6;
+    int cnt[G]={0};for(int r=0;r<routes;r++){int e=host_ids[r];if(e<0||e>=G)return 0;if(e>=lo&&e<hi)cnt[e]++;}
+    int base[G];int m=0;for(int e=0;e<G;e++)if(cnt[e])base[e]=m,m+=(cnt[e]+A-1)/A*A;
+    if(!m)return 1;
+    int M=m;std::vector<int> hrow(routes,-1),hlayout(M,0);
+    int fill[G]={0};for(int r=0;r<routes;r++){int e=host_ids[r];if(e>=lo&&e<hi)hrow[r]=base[e]+fill[e]++;}
+    for(int e=0;e<G;e++)if(cnt[e]){int g=(cnt[e]+A-1)/A*A;for(int i=0;i<g;i++)hlayout[base[e]+i]=e;}
+    size_t a1=(size_t)M*4096,a2=(size_t)M*2048,s1=(size_t)M*8*4,s2=(size_t)M*4*4,mm=(size_t)M*N*2;
+    if(set->count!=G||set->H!=4096||set->I!=2048||!buf((void**)&c->dga1,&c->dga1cap,a1)||!buf((void**)&c->dga2,&c->dga2cap,a2)||!buf((void**)&c->dgsfa1,&c->dgsfa1cap,s1)||!buf((void**)&c->dgsfa2,&c->dgsfa2cap,s2)||!buf((void**)&c->dglayout,&c->dglayoutcap,(size_t)M*sizeof(int))||!buf((void**)&c->dgrowmap,&c->dgrowmapcap,(size_t)routes*sizeof(int))||!buf((void**)&c->dgmm1,&c->dgmm1cap,mm)||!buf((void**)&c->dgmm2,&c->dgmm2cap,mm))return 0;
+    if(!ok(cudaMemcpyAsync(c->dgrowmap,hrow.data(),(size_t)routes*sizeof(int),cudaMemcpyHostToDevice,c->stream),"masked MoE rowmap upload")||
+       !ok(cudaMemcpyAsync(c->dglayout,hlayout.data(),(size_t)M*sizeof(int),cudaMemcpyHostToDevice,c->stream),"masked MoE layout upload")||
+       !ok(cudaMemsetAsync(c->dga1,0,a1,c->stream),"masked MoE A1 clear")||!ok(cudaMemsetAsync(c->dgsfa1,0,s1,c->stream),"masked MoE S1 clear")||
+       !ok(cudaMemsetAsync(c->dga2,0,a2,c->stream),"masked MoE A2 clear")||!ok(cudaMemsetAsync(c->dgsfa2,0,s2,c->stream),"masked MoE S2 clear"))return 0;
+    if(!buf((void**)&c->expert_weights,&c->expert_weightscap,(size_t)routes*sizeof(float)))return 0;
+    if(!ok(cudaMemcpyAsync(c->expert_weights,weight,(size_t)routes*sizeof(float),cudaMemcpyHostToDevice,c->stream),"masked MoE weight upload"))return 0;
+    dg_quant_routes_map_skip<<<routes*8,128,0,c->stream>>>(input,c->dga1,c->dgsfa1,tokens,4096,M,c->dgrowmap);
+    CUtensorMap a,b,sa,sb,d;
+    if(!dg_map(&a,CU_TENSOR_MAP_DATA_TYPE_UINT8,c->dga1,4096,M,4096,128,A,CU_TENSOR_MAP_SWIZZLE_128B)||!dg_map(&b,CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B,set->bank_fc1,4096,(unsigned long long)G*N,2048,128,64,CU_TENSOR_MAP_SWIZZLE_128B)||!dg_map(&sa,CU_TENSOR_MAP_DATA_TYPE_INT32,c->dgsfa1,M,8,(unsigned long long)M*4,A,1,CU_TENSOR_MAP_SWIZZLE_NONE)||!dg_map(&sb,CU_TENSOR_MAP_DATA_TYPE_INT32,set->bank_fc1_dg_scale,N,(unsigned long long)G*32,16384,64,1,CU_TENSOR_MAP_SWIZZLE_NONE)||!dg_map(&d,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,c->dgmm1,N,M,(unsigned long long)N*2,64,A,CU_TENSOR_MAP_SWIZZLE_128B))return 0;
+    auto fc1=c->sms>=170?deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N,4096,128,32,G,64,64,128,128,128,128,3,128,256,170,deep_gemm::GemmType::MGroupedContiguous,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>:deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N,4096,128,32,G,64,64,128,128,128,128,3,128,256,84,deep_gemm::GemmType::MGroupedContiguous,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>;
+    if(!ok(cudaFuncSetAttribute(fc1,cudaFuncAttributeMaxDynamicSharedMemorySize,92672),"masked MoE FC1 shared memory"))return 0;
+    fc1<<<(c->sms>=170?170:84),384,92672,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(__nv_fp8_e4m3*)c->dga1,(__nv_fp8_e4m3*)set->bank_fc1,c->dglayout,nullptr,nullptr,M,N,4096,N,0,0,deep_gemm::TmaParamPad48{},a,b,sa,sb,d);
+    dg_swiglu_quant_routes_map_skip<<<routes,128,0,c->stream>>>(c->dgmm1,c->dga2,c->dgsfa2,c->expert_weights,limit,routes,M,c->dgrowmap);
+    if(!dg_map(&a,CU_TENSOR_MAP_DATA_TYPE_UINT8,c->dga2,2048,M,2048,128,A,CU_TENSOR_MAP_SWIZZLE_128B)||!dg_map(&b,CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B,set->bank_fc2,2048,(unsigned long long)G*N,1024,128,64,CU_TENSOR_MAP_SWIZZLE_128B)||!dg_map(&sa,CU_TENSOR_MAP_DATA_TYPE_INT32,c->dgsfa2,M,4,(unsigned long long)M*4,A,1,CU_TENSOR_MAP_SWIZZLE_NONE)||!dg_map(&sb,CU_TENSOR_MAP_DATA_TYPE_INT32,set->bank_fc2_dg_scale,N,(unsigned long long)G*16,16384,64,1,CU_TENSOR_MAP_SWIZZLE_NONE)||!dg_map(&d,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,c->dgmm2,N,M,(unsigned long long)N*2,64,A,CU_TENSOR_MAP_SWIZZLE_128B))return 0;
+    auto fc2=c->sms>=170?deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N,2048,128,32,G,64,64,128,128,128,128,3,128,256,170,deep_gemm::GemmType::MGroupedContiguous,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>:deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N,2048,128,32,G,64,64,128,128,128,128,3,128,256,84,deep_gemm::GemmType::MGroupedContiguous,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>;
+    if(!ok(cudaFuncSetAttribute(fc2,cudaFuncAttributeMaxDynamicSharedMemorySize,92672),"masked MoE FC2 shared memory"))return 0;
+    fc2<<<(c->sms>=170?170:84),384,92672,c->stream>>>((DgOutput*)c->dgmm2,nullptr,(__nv_fp8_e4m3*)c->dga2,(__nv_fp8_e4m3*)set->bank_fc2,c->dglayout,nullptr,nullptr,M,N,2048,N,0,0,deep_gemm::TmaParamPad48{},a,b,sa,sb,d);
+    dg_reduce_routes_map_skip<<<((long long)tokens*4096+255)/256,256,0,c->stream>>>(out,c->dgmm2,tokens,c->dgrowmap);
+    return ok(cudaGetLastError(),"masked batched MoE launch");
+}
 static int dg_moe_tp2(Dev*c,Dsv4CudaExpertSet*set,const float*weight,float limit,float*out){constexpr int G=256,M=384,A=64,H=4096,J=1024,N1=2048;
     int trace=getenv("DSV4_CUDA_TP2_TRACE")&&atoi(getenv("DSV4_CUDA_TP2_TRACE"));
     size_t a1=(size_t)M*H,a2=(size_t)M*J,s1=(size_t)M*(H/512)*4,s2=(size_t)M*(J/512)*4;
@@ -872,6 +914,13 @@ extern "C" long long dsv4_cuda_mem_free_mb(int device){
     size_t free_b=0,total_b=0;
     if(!ok(cudaMemGetInfo(&free_b,&total_b),"device meminfo"))return -1;
     return (long long)(free_b>>20);
+}
+
+/* 1 when the device was opened by dsv4_cuda_init and has a live context;
+ * operations targeting a device without one fail cleanly instead of
+ * crashing. */
+extern "C" int dsv4_cuda_device_active(int device){
+    return device>=0 && device<16 && ctx(device)!=nullptr;
 }
 
 /* 1 when the device shares its memory with the host (GB10 / DGX Spark, Jetson,
@@ -2525,6 +2574,91 @@ extern "C" int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation*input,cons
     run_mm_batch(sd,c->p3,c->p4,count,c->stream);
     moe_combine<<<((long long)count*H+255)/256,256,0,c->stream>>>(output->data,c->p4,count*H);
     return ok(cudaGetLastError(),"generic batched MoE launch");
+#endif
+}
+/* EP2 masked slice of route_moe_ids_batch: only routes with id in
+ * [lo,hi) contribute; everything else is skipped. The bank's shared
+ * experts are still added on top (primary passes its real mirrors; the peer
+ * bank carries zeroed mirrors so the shared add is a no-op). */
+extern "C" int dsv4_cuda_route_moe_ids_batch_masked(const Dsv4CudaActivation*input,const int*ids,const float*weights,int count,Dsv4CudaExpertSet*set,float limit,Dsv4CudaActivation*output,int lo,int hi){
+#ifdef COLI_DSV4_DEEPGEMM
+    Dev*c=input?ctx(input->device):nullptr;
+    if(!c||!ids||!weights||!set||!output||count<1||count>128||set->device!=input->device||output->device!=input->device||
+       set->count!=256||set->H!=4096||set->I!=2048||!set->bank_fc1||lo<0||hi>256||lo>hi||
+       input->elements<(long long)count*4096||output->elements<(long long)count*4096||
+       !ok(cudaSetDevice(input->device),"select masked batched MoE device"))return 0;
+    int routes=count*6;
+    for(int r=0;r<routes;r++)if(ids[r]<0||ids[r]>=set->count)return 0;
+    size_t ib=(size_t)routes*sizeof(int),wb=(size_t)routes*sizeof(float);
+    if(!buf((void**)&c->expert_ids,&c->expert_idcap,ib)||!buf((void**)&c->expert_weights,&c->expert_weightscap,wb))return 0;
+    if(!ok(cudaMemcpyAsync(c->expert_ids,ids,ib,cudaMemcpyHostToDevice,c->stream),"masked MoE id upload")||
+       !ok(cudaMemcpyAsync(c->expert_weights,weights,wb,cudaMemcpyHostToDevice,c->stream),"masked MoE weight upload"))return 0;
+    if(!dg_moe_batch_masked(c,set,input->data,c->expert_ids,c->expert_weights,count,limit,output->data,ids,lo,hi))return 0;
+    Dsv4CudaTensor*sg=set->sg,*su=set->su,*sd=set->sd;if(!sg||!su||!sd||sg->O!=2048||su->O!=2048||sd->I!=2048)return 0;
+    size_t mid=(size_t)count*2048*sizeof(float),hb=(size_t)count*4096*sizeof(float);
+    if(!buf((void**)&c->p1,&c->p1cap,mid)||!buf((void**)&c->p2,&c->p2cap,mid)||!buf((void**)&c->p3,&c->p3cap,mid)||!buf((void**)&c->p4,&c->p4cap,hb))return 0;
+    if(!dg_dense_batch_dispatch(c,sg,input->data,c->p1,count)||!dg_dense_batch_dispatch(c,su,input->data,c->p2,count))return 0;
+    swiglu_rows<<<((long long)count*2048+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,limit,count,2048);
+    if(!dg_dense_batch_dispatch(c,sd,c->p3,c->p4,count))return 0;
+    add_rows<<<((long long)count*4096+255)/256,256,0,c->stream>>>(output->data,c->p4,count*4096);
+    return ok(cudaGetLastError(),"masked batched MoE launch");
+#else
+    Dev*c=input?ctx(input->device):nullptr;
+    if(!c||!ids||!weights||!set||!output||count<1||count>128||set->device!=input->device||output->device!=input->device||
+       set->count!=256||set->H!=4096||set->I!=2048||!set->bank_fc1||lo<0||hi>256||lo>hi||
+       input->elements<(long long)count*4096||output->elements<(long long)count*4096||
+       !ok(cudaSetDevice(input->device),"select generic masked batched MoE device"))return 0;
+    const int H=4096,I=2048,K=6;int routes=count*K;
+    for(int r=0;r<routes;r++)if(ids[r]<0||ids[r]>=set->count)return 0;
+    Dsv4CudaTensor*sg=set->sg,*su=set->su,*sd=set->sd;
+    if(!sg||!su||!sd||sg->fmt!=8||su->fmt!=8||sd->fmt!=8||sg->O!=I||su->O!=I||sd->I!=I||sg->I!=H||sd->O!=H)return 0;
+    size_t w1=(size_t)I*(H/2),s1=(size_t)I*(H/32),w2=(size_t)H*(I/2),s2=(size_t)H*(I/32);
+    /* out-of-range routes point at a device-resident zero slab so their GEMV
+     * rows contribute exact zeros without any kernel changes. */
+    static void*zero_slab[16]={0};static size_t zero_cap[16]={0};
+    size_t need=2*w1+2*s1+w2+s2;
+    if(!zero_slab[c->id]||zero_cap[c->id]<need){
+        void*nb=nullptr;if(!ok(cudaMalloc(&nb,need+256+2*w1+2*s1+w2+s2),"zero slab"))return 0;
+        if(zero_slab[c->id]){cudaSetDevice(c->id);cudaFree(zero_slab[c->id]);}
+        zero_slab[c->id]=nb;zero_cap[c->id]=need+256+2*w1+2*s1+w2+s2;
+        if(!ok(cudaMemset(nb,0,zero_cap[c->id]),"zero slab clear"))return 0;
+    }
+    size_t rb=(size_t)routes*I*sizeof(float),pb=(size_t)routes*H*sizeof(float),wb2=(size_t)routes*sizeof(float);
+    if(!buf((void**)&c->p1,&c->p1cap,rb)||!buf((void**)&c->p2,&c->p2cap,rb)||!buf((void**)&c->p3,&c->p3cap,rb)||
+       !buf((void**)&c->p4,&c->p4cap,pb)||!buf((void**)&c->expert_weights,&c->expert_weightscap,wb2)||
+       !buf((void**)&c->mvdesc,&c->mvdesccap,(size_t)routes*2*sizeof(MvDesc)))return 0;
+    if(!ok(cudaMemcpyAsync(c->expert_weights,weights,wb2,cudaMemcpyHostToDevice,c->stream),"generic masked MoE weight upload"))return 0;
+    std::vector<MvDesc> hd((size_t)routes*2);
+    int in_range=0;
+    for(int r=0;r<routes;r++){int e=ids[r],t=r/K;
+        const float*x=input->data+(long long)t*H;
+        if(lo!=0&&(e<lo||e>=hi)){
+            hd[2*r]={(uint8_t*)zero_slab[c->id],(uint8_t*)zero_slab[c->id]+2*w1,x,c->p1+(long long)r*I};
+            hd[2*r+1]={(uint8_t*)zero_slab[c->id]+w1,(uint8_t*)zero_slab[c->id]+2*w1+s1,x,c->p2+(long long)r*I};
+            continue;}
+        in_range=1;
+        const uint8_t*fc1=set->bank_fc1+(size_t)e*2*w1,*fc1s=set->bank_fc1_scale+(size_t)e*2*s1;
+        hd[2*r]={fc1,fc1s,x,c->p1+(long long)r*I};
+        hd[2*r+1]={fc1+w1,fc1s+s1,x,c->p2+(long long)r*I};}
+    (void)in_range;
+    if(!ok(cudaMemcpyAsync(c->mvdesc,hd.data(),(size_t)routes*2*sizeof(MvDesc),cudaMemcpyHostToDevice,c->stream),"generic masked MoE fc1 descriptors"))return 0;
+    mv_fp4_grouped<4><<<dim3((I+3)/4,routes*2),256,0,c->stream>>>(c->mvdesc,routes*2,I,H);
+    expert_act_grouped<<<((long long)routes*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,c->expert_weights,limit,routes,I);
+    fp8_sim<<<routes*((I+127)/128),128,0,c->stream>>>(c->p3,routes,I);
+    for(int r=0;r<routes;r++){int e=ids[r];
+        if(lo!=0&&(e<lo||e>=hi)){hd[r]={(uint8_t*)zero_slab[c->id]+2*w1+2*s1,(uint8_t*)zero_slab[c->id]+2*w1+2*s1+w2,c->p3+(long long)r*I,c->p4+(long long)r*H};continue;}
+        hd[r]={set->bank_fc2+(size_t)e*w2,set->bank_fc2_scale+(size_t)e*s2,c->p3+(long long)r*I,c->p4+(long long)r*H};}
+    if(!ok(cudaMemcpyAsync(c->mvdesc,hd.data(),(size_t)routes*sizeof(MvDesc),cudaMemcpyHostToDevice,c->stream),"generic masked MoE down descriptors"))return 0;
+    mv_fp4_grouped<4><<<dim3((H+3)/4,routes),256,0,c->stream>>>(c->mvdesc,routes,H,I);
+    expert_reduce_rows<<<((long long)count*H+255)/256,256,0,c->stream>>>(output->data,c->p4,count,K,H);
+    size_t mid=(size_t)count*I*sizeof(float),hb=(size_t)count*H*sizeof(float);
+    if(!buf((void**)&c->p1,&c->p1cap,mid)||!buf((void**)&c->p2,&c->p2cap,mid)||!buf((void**)&c->p3,&c->p3cap,mid)||!buf((void**)&c->p4,&c->p4cap,hb))return 0;
+    run_mm_batch(sg,input->data,c->p1,count,c->stream);run_mm_batch(su,input->data,c->p2,count,c->stream);
+    expert_act_rows1<<<((long long)count*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,limit,count*I);
+    fp8_sim<<<count*((I+127)/128),128,0,c->stream>>>(c->p3,count,I);
+    run_mm_batch(sd,c->p3,c->p4,count,c->stream);
+    moe_combine<<<((long long)count*H+255)/256,256,0,c->stream>>>(output->data,c->p4,count*H);
+    return ok(cudaGetLastError(),"generic masked batched MoE launch");
 #endif
 }
 extern "C" int dsv4_cuda_route_moe_ep2(const Dsv4CudaActivation*input,Dsv4CudaTensor*gate,Dsv4CudaTensor*bias,

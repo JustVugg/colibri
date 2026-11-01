@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "commit": "b4c8a587c9da194872f6686631471b258c8b60b5",
+  "model": "deepseek-ai/DeepSeek-V4-Flash-0731, released checkpoint served from the stack's /model volume, fp8 dense weights + fp4 routed experts, 43 layers, engine id deepseek-v4-colibri, 131072-token context",
+  "command": "curl -s -m 1500 -X POST http://colibri-deepseek-v4-flash:5000/v1/chat/completions -H 'Content-Type: application/json' -d @/data/perf.req (16 prompt tokens, 358 generated, nondeterminism eliminated with temperature 0 and the engine's greedy top-k; one 'Say READY.' warm-up request per arm before timing; 3 sequential runs per arm; tok_s is generated tokens over the whole turn including prefill)",
+  "prompt_hash": "1db6cf2f9827e4e9c450b880f4b1736b0fb9a9b7961dcc90b123f1c5582e8119",
+  "hardware": {
+    "cpu": "AMD Ryzen 7 2700X (8C/16T)",
+    "ram": "62 GB DDR4",
+    "storage": "Intel SSDPEKNU020TZ NVMe 2TB (model volume), WDC WDS200T1R0B SATA 2TB (/mnt/m2 checkpoint store), ST2000LM007 2TB",
+    "os": "Ubuntu 24.04, kernel 7.0.0-38-generic, gcc 13.3.0, CUDA 12.8.93, 2x NVIDIA GeForce RTX 5060 Ti 16 GB (sm_120a), driver r580"
+  },
+  "warmup_runs": 1,
+  "hypothesis": "Splitting the 256 routed experts into per-device bands across two CUDA devices (DSV4_CUDA_EP_DEVICES=0,1) roughly halves decode wall clock versus the single-device tier without changing the output tokens.",
+  "changed_variables": ["DSV4_CUDA_EP_DEVICES"],
+  "baseline": {
+    "config": {"DSV4_CUDA_EP_DEVICES": "unset (single-device GPU tier)"},
+    "samples": {"tok_s": [0.3780, 0.3829, 0.3833], "wall_s": [947, 935, 934]},
+    "median_tok_s": 0.3829,
+    "quality": {
+      "method": "token-exact: every run in both arms returns the identical 358-token response (content sha256 0b810df860cc79589824d7b95382cf40b3dcc3a9f5bf9c3d0ee995bc08afa7af for all six runs); tok_s is generated tokens over the whole turn (POST to final body), prefill included",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/ep-n-2026-10-29-raw.txt, sections Baseline run 1-3",
+      "sha256": "5f803b98b2e2e88af2eee813e92b2c6deb4ee1c59cc8f196b48d0b5cc72692f1"
+    }
+  },
+  "trial": {
+    "config": {"DSV4_CUDA_EP_DEVICES": "0,1"},
+    "samples": {"tok_s": [0.7868, 0.8118, 0.8118], "wall_s": [455, 441, 441]},
+    "median_tok_s": 0.8118,
+    "quality": {
+      "method": "token-exact: every run in both arms returns the identical 358-token response (content sha256 0b810df860cc79589824d7b95382cf40b3dcc3a9f5bf9c3d0ee995bc08afa7af for all six runs); tok_s is generated tokens over the whole turn (POST to final body), prefill included",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/ep-n-2026-10-29-raw.txt, sections Trial run 1-3",
+      "sha256": "5f803b98b2e2e88af2eee813e92b2c6deb4ee1c59cc8f196b48d0b5cc72692f1"
+    }
+  },
+  "outcome": "improvement"
+}
