@@ -84,6 +84,9 @@ typedef struct {
     double cpu_ms, wait_ms;            /* the pairs' compute; waiting for the device's frame A */
     float *gu, *hh, *dn, *ys; int cap; /* scratch: gate and up, the hidden rows, down, the rows' sums, for cap pairs */
     int ycap;
+    int *ps, *pk, pcap; const VktHostExpert **hp; const float **xp;   /* a prompt chunk's pairs: past the decode's arrays */
+    int big_team;                      /* a prompt chunk's team (vkc_dmoe_pc_probe), 0: the decode's */
+    unsigned long long big_pairs; double big_ms;   /* a prompt chunk's pairs and their time */
 } VkcHyb;
 /* one for every engine's steps on the device: the host's timeline rises in their order */
 static VkcHyb g_vkc_hyb;
@@ -110,6 +113,13 @@ typedef struct VkcDmoe_ {
      * CPU's sum (cy), its worker, and the timeline's last value */
     int hybrid;
     uint32_t *tabhh; VktHostExpert *hx; VkcBuf *tabhyb, *hxx, *cy;
+    /* pc_prompt (the engine's, a forward at a time): a prompt chunk's layers take the hybrid steps too,
+     * the CPU computing their host pool pairs, instead of staging the host pool; pc_cap the rows
+     * hxx and cy hold for it (0: none), pc_steps such layer steps */
+    int pc_prompt, pc_cap; unsigned long long pc_steps;
+    /* the measures the engine's choice reads (vkc_dmoe_pc_probe, once): a layer's staging copy's
+     * rate, a pair's time on the CPU, what a chunk stages; the routes the host pool served */
+    int pc_probed; double pc_bus_gbs, pc_pair_us, pc_stage_bytes; unsigned long long pc_routes, pc_pool;
     int ev;                        /* the steps on events, inside their frame (vkc_dmoe_flags at the first read) */
     int *hx_n;                     /* per layer: its experts the CPU computes (0: the full table's step) */
     int D, I;
@@ -177,11 +187,21 @@ static void vkc_hyb_compute(VkcDmoe *d, const VkcHybJob *j) {
      * CPU does not cache, on a discrete card often its BAR) in one copy at the end; reading
      * it back as the sum grew cost about 70 us a step of Flint's three pairs */
     float *y = (float *)vkc_ptr(d->cy);
-    int ps[VKC_DMOE_ROWS * VKC_ROUTE_KMAX], pk[VKC_DMOE_ROWS * VKC_ROUTE_KMAX], np = 0;
+    VkcHyb *w = &g_vkc_hyb;
+    int ps_d[VKC_DMOE_ROWS * VKC_ROUTE_KMAX], pk_d[VKC_DMOE_ROWS * VKC_ROUTE_KMAX], np = 0, *ps = ps_d, *pk = pk_d;
+    if (n * K > VKC_DMOE_ROWS * VKC_ROUTE_KMAX) {   /* a prompt chunk's */
+        if (w->pcap < n * K) {
+            free(w->ps); free(w->pk); free(w->hp); free(w->xp);
+            w->ps = malloc((size_t)n * K * sizeof(int)); w->pk = malloc((size_t)n * K * sizeof(int));
+            w->hp = malloc((size_t)n * K * sizeof *w->hp); w->xp = malloc((size_t)n * K * sizeof *w->xp);
+            w->pcap = w->ps && w->pk && w->hp && w->xp ? n * K : 0;
+            if (!w->pcap) { w->err = 1; return; }
+        }
+        ps = w->ps; pk = w->pk;
+    }
     const VktHostExpert *hx = d->hx + (size_t)j->i * E;
     for (int s = 0; s < n; s++)
         for (int k = 0; k < K; k++) { int e = ids[s * K + k]; if (e >= 0 && e < E && hx[e].g) { ps[np] = s; pk[np] = k; np++; } }
-    VkcHyb *w = &g_vkc_hyb;
     /* the sum in the host's own memory (cy is the device's: its mapping is uncached for the
      * CPU, and reading it back line by line through the BAR cost more than the pairs) */
     if (w->ycap < n * D) {
@@ -191,6 +211,7 @@ static void vkc_hyb_compute(VkcDmoe *d, const VkcHybJob *j) {
     memset(w->ys, 0, (size_t)n * D * sizeof(float));
     if (!np) { memcpy(y, w->ys, (size_t)n * D * sizeof(float)); return; }
     w->pairs += (unsigned long long)np;
+    if (n > VKC_DMOE_ROWS) w->big_pairs += (unsigned long long)np;
     if (w->cap < np) {
         free(w->gu); free(w->hh); free(w->dn);
         w->gu = malloc((size_t)np * 2 * I * sizeof(float)); w->hh = malloc((size_t)np * I * sizeof(float)); w->dn = malloc((size_t)np * D * sizeof(float));
@@ -198,9 +219,11 @@ static void vkc_hyb_compute(VkcDmoe *d, const VkcHybJob *j) {
         if (!w->cap) { w->err = 1; return; }
     }
     float *dn = w->dn;
-    const VktHostExpert *hp[VKC_DMOE_ROWS * VKC_ROUTE_KMAX]; const float *xp[VKC_DMOE_ROWS * VKC_ROUTE_KMAX];
+    const VktHostExpert *hp_d[VKC_DMOE_ROWS * VKC_ROUTE_KMAX], **hp = hp_d; const float *xp_d[VKC_DMOE_ROWS * VKC_ROUTE_KMAX], **xp = xp_d;
+    if (ps != ps_d) { hp = w->hp; xp = w->xp; }
     for (int p = 0; p < np; p++) { hp[p] = &hx[ids[ps[p] * K + pk[p]]]; xp[p] = x + (size_t)ps[p] * D; }
-    if (!vkt_host_pairs(hp, xp, np, D, I, j->limit, vkc_hyb_threads(), w->gu, w->hh, dn)) w->err = 1;
+    if (!vkt_host_pairs(hp, xp, np, D, I, j->limit, n > VKC_DMOE_ROWS && w->big_team > 0 ? w->big_team : vkc_hyb_threads(),
+                        w->gu, w->hh, dn)) w->err = 1;
     for (int p = 0; p < np; p++) {   /* in rank order within a row */
         float wv = wt[ps[p] * K + pk[p]]; float *ys = w->ys + (size_t)ps[p] * D; const float *o = dn + (size_t)p * D;
         for (int c = 0; c < D; c++) ys[c] += wv * o[c];
@@ -260,6 +283,7 @@ static void vkc_hyb_flush_oldest(void) {
         w->wait_ms += t1 - t0;
         vkc_hyb_compute(j.d, &j);
         w->cpu_ms += vkc_hyb_now_ms() - t1;
+        if (j.n > VKC_DMOE_ROWS) w->big_ms += vkc_hyb_now_ms() - t1;
     }
     if (j.flags) vkc_hyb_flag_signal(j.d, j.g); else vkc_hybrid_host_signal(j.g);
     w->steps++;
@@ -627,6 +651,78 @@ static int vkc_dmoe_prepare(VkcDmoe *d, int lo, int L, int E, int K, int D, int 
     d->cap = (int)rc;
     return 1;
 }
+/* A prompt chunk's hybrid steps for `rows` rows: the input rows and the CPU's sum sized for them;
+ * 1 when they can run */
+static int vkc_dmoe_pc_ready(VkcDmoe *d, int rows) {
+    if (!d->hybrid || !d->ev || rows <= VKC_DMOE_ROWS) return 0;
+    if (d->pc_cap >= rows) return 1;
+    vkc_hyb_drain();   /* the worker reads the buffers it had */
+    d->pc_cap = vkc_reserve(&d->hxx, (size_t)rows * d->D * sizeof(float), VKC_DOWN) &&
+                vkc_reserve(&d->cy, (size_t)rows * d->D * sizeof(float), VKC_UP) ? rows : 0;
+    return d->pc_cap > 0;
+}
+/* The measures, once, after a prompt chunk's tables were read (the staging's regions there):
+ * the copy of the layer that stages the most into stg, timed twice (the second kept), and
+ * vkt_host_pairs over up to 24 host pool experts of four layers spread at 7 rows each (a
+ * 452-token prompt's experts averaged 5.5), for the decode's team and every logical CPU, the
+ * faster kept for the prompt's steps. stg's contents are the probe's after it. */
+static void vkc_dmoe_pc_probe(VkcDmoe *d) {
+    if (d->pc_probed || !d->hybrid || !d->hx) return;
+    d->pc_probed = 1;
+    int L = d->L, E = d->E, D = d->D, I = d->I;
+    d->pc_stage_bytes = 0;
+    if (d->stg_on && d->nfr > 0) {
+        int best = -1; double bb = 0;
+        for (int i = 0; i < L; i++) {
+            double b = 0;
+            for (int k = 0; k < d->frn[i]; k++) b += 4.0 * d->frh[4 * (d->fro[i] + k) + 3];
+            d->pc_stage_bytes += b;
+            if (b > bb) { bb = b; best = i; }
+        }
+        for (int t = 0; best >= 0 && t < 2; t++) {
+            double t0 = vkc_hyb_now_ms();
+            if (!vkc_begin() || !vkc_write(d->fr, 0, d->frh, (size_t)d->nfr * 4 * sizeof(uint32_t)) || !vkc_barrier() ||
+                !vkc_fetch(d->fr, d->fro[best], d->frn[best], d->frmax[best], d->stg) || !vkc_submit(1)) { d->pc_bus_gbs = 0; break; }
+            double ms = vkc_hyb_now_ms() - t0;
+            d->pc_bus_gbs = ms > 0 ? bb / ms / 1e6 : 0;
+        }
+        d->stg_layer = -1; d->keep_valid = 0; d->dirty = 1;   /* stg holds the probe's copy now */
+    }
+    enum { R = 7, NX = 24 };
+    const VktHostExpert *hp[NX * R]; const float *xp[NX * R];
+    float *x = malloc((size_t)R * D * sizeof(float)), *gu = malloc((size_t)NX * R * 2 * I * sizeof(float)),
+          *hh = malloc((size_t)NX * R * I * sizeof(float)), *dn = malloc((size_t)NX * R * D * sizeof(float));
+    if (!x || !gu || !hh || !dn) { free(x); free(gu); free(hh); free(dn); return; }
+    for (size_t k = 0; k < (size_t)R * D; k++) x[k] = (float)((k * 2654435761u >> 16) & 1023) / 512.f - 1.f;
+    int teams[2] = {vkc_hyb_threads(), 0}, nt = 1;
+#ifdef _OPENMP
+    if (omp_get_num_procs() > teams[0]) teams[nt++] = omp_get_num_procs();
+#endif
+    double kept = 0;
+    for (int ti = 0; ti < nt; ti++) {
+        double us = 0; int nl = 0;
+        for (int q = 0; q < 4; q++) {
+            int i = q * L / 4, np = 0;
+            for (int e = 0; e < E && np < NX * R; e++) {
+                const VktHostExpert *h = &d->hx[(size_t)i * E + e];
+                if (!h->g) continue;
+                for (int r = 0; r < R; r++) { hp[np] = h; xp[np] = x + (size_t)r * D; np++; }
+            }
+            if (np < R) continue;
+            double u = 0;
+            for (int t = 0; t < 2; t++) {
+                double t0 = vkc_hyb_now_ms();
+                if (!vkt_host_pairs(hp, xp, np, D, I, 0.f, teams[ti], gu, hh, dn)) { u = 0; break; }
+                u = (vkc_hyb_now_ms() - t0) * 1e3 / np;
+            }
+            if (u > 0) { us += u; nl++; }
+        }
+        us = nl ? us / nl : 0;
+        if (us > 0 && (kept <= 0 || us < kept)) { kept = us; g_vkc_hyb.big_team = teams[ti]; }
+    }
+    d->pc_pair_us = kept;
+    free(x); free(gu); free(hh); free(dn);
+}
 /* The table into the device, in a frame just begun: read again first when the tier's
  * residents changed since (a host layer before it ran the tier), written when it changed.
  * 0 only when the write fails; a table that cannot be read turns the layers down. */
@@ -682,6 +778,23 @@ static int vkc_dmoe_layer(VkcDmoe *d, int layer, int n, VkcBuf *lg, VkcBuf *bias
     m.w_off = 0; m.w_row = d->K; m.y_off = 0; m.y_row = mp->D;
     if (!m.gfmt && d->tabh) m.gfmt = vkc_dmoe_fmt(d, i, 12);   /* the layer's gate/up format */
     if (!m.dfmt && d->tabh) m.dfmt = vkc_dmoe_fmt(d, i, 15);   /* and down's (the integer form wants both) */
+    if (n > VKC_DMOE_ROWS && d->pc_prompt && d->pc_cap >= n && d->hybrid && d->ev && d->hx_n && d->hx_n[i] > 0 && m.act == 0) {
+        /* a prompt chunk's hybrid step: the grouped GEMMs over the device's experts (the hybrid
+         * table, every entry in VRAM: the matrix units'), the CPU the host pool's pairs, as a
+         * decode step's in the frame on events */
+        uint64_t g = ++g_vkc_hyb_seq;
+        VkcEw add = {VKC_EW_ADD, n * d->D, d->D, 1, 0, 0, 0, 0, 0, 0, 0, 1.f};
+        m.E = d->E; m.floats = 0;
+        if (!vkc_route(lg, bias, d->rid, d->rwt, &r) || !vkc_copy(d->hxx, 0, x, 0, (size_t)n * d->D) || !vkc_hyb_start() ||
+            !vkc_ev_signal(g)) return 0;
+        VkcHybJob j = {d, i, n, g, m.act, m.limit, 1, vkc_serial() + 1};
+        vkc_hyb_post(&j);
+        if (!vkc_moe_rows(x, d->rid, d->rwt, d->tabhyb, &d->rows, d->y, &m) || !vkc_ev_wait(g) ||
+            !vkc_ew(d->y, d->y, d->cy, NULL, NULL, &add)) return 0;
+        d->steps++; d->big_steps++; d->hyb_steps++; d->pc_steps++;
+        while (g_vkc_hyb.nq > 1 && !g_vkc_hyb_in) vkc_hyb_flush_oldest();
+        return 1;
+    }
     if (n > VKC_DMOE_ROWS) {   /* a prompt chunk: the grouped GEMMs (vkc_dmoe_prepare checked the layer's formats) */
         m.E = d->E;
         /* With a host pool the GEMMs read some experts over PCIe, and the floats' were faster
@@ -770,6 +883,11 @@ static void vkc_dmoe_hyb_report(const char *engine, const VkcDmoe *d) {
     if (d->keep_fills)
         fprintf(stderr, "[VK] %s chain: between prompt chunks the staging held the host pool's hottest %d experts (%llu fills)\n",
                 engine, d->nkeep, d->keep_fills);
+    if (d->pc_steps)
+        fprintf(stderr, "[VK] %s chain: %llu prompt layer steps computed the host pool's experts on the CPU instead of staging them "
+                        "(%llu pairs in %.1f ms, %.1f us a pair, %d threads)\n",
+                engine, d->pc_steps, w->big_pairs, w->big_ms, w->big_pairs ? w->big_ms * 1e3 / (double)w->big_pairs : 0.0,
+                w->big_team > 0 ? w->big_team : vkc_hyb_threads());
     if (d->patches)
         fprintf(stderr, "[VK] %s chain: the experts' table read whole %llu times, patched %llu times (%llu entries the tier changed)\n",
                 engine, d->reads, d->patches, d->patched);

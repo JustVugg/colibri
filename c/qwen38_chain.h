@@ -99,6 +99,7 @@ typedef struct {
     VkcBuf *ones;                     /* rows x C ones: the head's fc_embedding row added to each stream */
     VkcDmoe dm_mtp;                   /* the head's routed experts in the frame (its layer whole in the tier) */
     unsigned long long mtp_rows;      /* the head's rows run here */
+    unsigned long long pc_took, pc_staged;   /* prompts whose host pool experts the CPU computed, and those staged (q38c_pc_take) */
 } Q38Chain;
 /* the MTP head's layer on the device beside the full chain (q38c_mtp_rows); Q38_MTP_CHAIN=0:
  * on the CPU, as before */
@@ -1183,11 +1184,55 @@ static void q38c_kv_down(Q38Chain *ch, Model *m, int i, int n, int pb) {
  * alone (a verify's rows keep a decode step's bits). The books follow at the frame's end
  * from the ids: the history (rt_count), HITS and the tier's heat. Off with ROUTE_TRACE,
  * the CUDA tier, and on the second device. */
-static int q38c_dmoe(Q38Chain *ch, Model *m, int rows) {
+/* COLI_VK_CHAIN_POOL_CPU_ROWS: a prompt of up to this many rows may have the CPU compute its host
+ * pool experts beside the device's (vk_dmoe.h's hybrid steps, pc_prompt) instead of staging them
+ * (q38c_pc_take decides); 0 stages them as before */
+#define Q38C_PC_ROWS 2048
+static int q38c_pc_rows(void) {
+    static int r = -1;
+    if (r < 0) { const char *e = getenv("COLI_VK_CHAIN_POOL_CPU_ROWS"); r = e && *e ? atoi(e) : Q38C_PC_ROWS; if (r < 0) r = 0; }
+    return r;
+}
+/* the CPU where its estimate is at most this many times the staging's copy (qwen38_cuda_chain.h's
+ * Q38CC_PC_BUS, the same reason) */
+#define Q38C_PC_BUS 1.5
+/* A prompt of S rows: the CPU's pairs where its estimate (the rows' pairs by the host pool's share
+ * of the routes, the books' once there are enough, else the history's, at the measured time a
+ * pair, the prompts' own once there are some) is at most Q38C_PC_BUS times the copy of what a
+ * chunk stages at the measured rate (vkc_dmoe_pc_probe); with nothing staging, the GEMMs would
+ * read the host pool over the bus: the CPU */
+static int q38c_pc_take(Q38Chain *ch, Model *m, int S, int rows) {
+    VkcDmoe *d = &ch->dm;
+    if (S <= VKC_DMOE_ROWS || S > q38c_pc_rows() || !vkt_host_pool_on() || !d->hybrid || !d->ev || !d->hx) return 0;
+    vkc_dmoe_pc_probe(d);
+    if (!vkc_dmoe_pc_ready(d, rows)) return 0;
+    if (!d->stg_on || d->pc_bus_gbs <= 0 || d->pc_pair_us <= 0) return 1;
+    const Cfg *c = &m->c; int E = d->E;
+    double frac = 0;
+    if (d->pc_routes >= 100000) frac = (double)d->pc_pool / (double)d->pc_routes;
+    else {   /* the history's routes to the host pool's experts */
+        uint32_t **hist = rt_counts_all(); double hp = 0, ha = 0;
+        for (int i = 0; hist && i < d->L; i++) for (int e = 0; hist[d->lo + i] && e < E; e++) {
+            double n = hist[d->lo + i][e]; ha += n; if (d->hx[(size_t)i * E + e].g) hp += n;
+        }
+        frac = ha > 0 ? hp / ha : 0;
+    }
+    const VkcHyb *w = &g_vkc_hyb;
+    const double us = w->big_pairs >= 2000 ? w->big_ms * 1e3 / (double)w->big_pairs : d->pc_pair_us;
+    const double cpu_ms = (double)S * c->topk * d->L * frac * us / 1e3, bus_ms = d->pc_stage_bytes / d->pc_bus_gbs / 1e6;
+    return cpu_ms <= Q38C_PC_BUS * bus_ms;
+}
+static int q38c_dmoe(Q38Chain *ch, Model *m, int rows, int S) {
     Cfg *c = &m->c;
     if (ch->d || c->experts <= 0 || rt_fp || qt_ready()) return 0;
     ch->dm.big = 1;   /* a prompt chunk too: a GGUF's experts and ours through the grouped GEMMs */
-    return vkc_dmoe_prepare(&ch->dm, ch->lo, ch->nl, c->experts, c->topk, c->hidden, c->inter, rows);
+    ch->dm.pc_prompt = 0;
+    int ok = vkc_dmoe_prepare(&ch->dm, ch->lo, ch->nl, c->experts, c->topk, c->hidden, c->inter, rows);
+    if (ok && rows > VKC_DMOE_ROWS) {   /* the tables read: the choice for this prompt */
+        ch->dm.pc_prompt = q38c_pc_take(ch, m, S, rows);
+        if (ch->dm.pc_prompt) ch->pc_took++; else ch->pc_staged++;
+    }
+    return ok;
 }
 static void q38c_dmoe_done(Q38Chain *ch, Model *m, int from, int to, int n, int pb) {
     Cfg *c = &m->c; int K = c->topk;
@@ -1198,6 +1243,10 @@ static void q38c_dmoe_done(Q38Chain *ch, Model *m, int from, int to, int n, int 
         for (int s = 0; s < n; s++) rt_count(i, ids + s * K, K);
         for (int j = 0; j < n * K; j++) if (ids[j] >= 0) q38_ehit_mark(m, i, ids[j]);
         vkt_dev_count(i, n, K, ids);
+        if (ch->dm.hybrid && ch->dm.hx) {   /* the routes the host pool served (q38c_pc_take's share) */
+            const VktHostExpert *hx = ch->dm.hx + (size_t)(i - ch->dm.lo) * c->experts;
+            for (int j = 0; j < n * K; j++) if (ids[j] >= 0 && ids[j] < c->experts) { ch->dm.pc_routes++; ch->dm.pc_pool += hx[ids[j]].g != NULL; }
+        }
     }
 }
 
@@ -1335,9 +1384,9 @@ static int q38c_forward_seg(Model *m, Q38Chain *ch, const int *ids, int S, int p
     }
     int half = c->rotary_dim / 2;
     vkc_gemm_rows(g_q38_rowwise ? 0 : -1);   /* a verify's rows get a decode step's bits */
-    int snapped = 0, dmoe = q38c_dmoe(ch, m, rows);
+    int snapped = 0, dmoe = q38c_dmoe(ch, m, rows, S);
     if (dmoe && S > rows && q38c_layer_major() && ch->head && !want_streams && !mixed_h && !ch->ks.on &&
-        m->snap_rows <= 0 && vkt_host_pool_on()) {
+        m->snap_rows <= 0 && vkt_host_pool_on() && !ch->dm.pc_prompt) {
         int r = q38c_forward_lm(m, ch, ids, S, pos_base, nlogits, hyper_h, logit, rows);
         if (r < 0) goto lost;
         if (r == 2) { vkc_gemm_rows(-1); return 0; }   /* stopped: not taken */
@@ -1635,6 +1684,10 @@ static void q38c_report(Model *m) {
                             "(COLI_VK_CHAIN_LAYERWISE=0: chunk by chunk)\n", q38c_name(ch), ch->lm_forwards);
         vkc_kv_report(&ch->ks);
         vkc_dmoe_hyb_report(q38c_name(ch), &ch->dm);
+        if (ch->pc_took || ch->pc_staged)
+            fprintf(stderr, "[VK] %s chain: %llu prompts' host pool experts on the CPU, %llu staged (the measures: the staging %.1f GB/s, "
+                            "%.2f GB a chunk, %.1f us a pair on the CPU; COLI_VK_CHAIN_POOL_CPU_ROWS=0 stages every prompt)\n",
+                    q38c_name(ch), ch->pc_took, ch->pc_staged, ch->dm.pc_bus_gbs, ch->dm.pc_stage_bytes / 1e9, ch->dm.pc_pair_us);
         vkc_prof_print();
         vkc_device(was);
     }
