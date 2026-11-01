@@ -20,6 +20,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
@@ -193,13 +194,23 @@ class MimoToolParseTest(unittest.TestCase):
                 self.assertEqual(text, reply)
 
     def test_json_decoder_nesting_limit_preserves_model_output(self):
-        raw = '[' * 100000 + '0' + ']' * 100000
-        for body in ('{"city":' + raw + '}', '<parameter=units>' + raw + '</parameter>'):
-            with self.subTest(tagged=body.startswith('<')):
-                reply = '<tool_call><function=get_weather>' + body + '</function></tool_call>'
-                text, calls = openai_server.parse_mimo_tool_calls(reply, [WEATHER])
-                self.assertEqual(calls, [])
-                self.assertEqual(text, reply)
+        # How deep json.loads goes before RecursionError depends on the interpreter and its C
+        # stack (Python 3.12 stops near 1,000 levels; 3.14 with a large stack parses 100,000):
+        # the decoder's limit is made to happen at this input on every version.
+        real = json.loads
+
+        def limited(s, *args, **kwargs):
+            if isinstance(s, str) and '[' * 64 in s:
+                raise RecursionError('maximum recursion depth exceeded while decoding a JSON array')
+            return real(s, *args, **kwargs)
+        raw = '[' * 10000 + '0' + ']' * 10000
+        with patch.object(json, 'loads', limited):
+            for body in ('{"city":' + raw + '}', '<parameter=units>' + raw + '</parameter>'):
+                with self.subTest(tagged=body.startswith('<')):
+                    reply = '<tool_call><function=get_weather>' + body + '</function></tool_call>'
+                    text, calls = openai_server.parse_mimo_tool_calls(reply, [WEATHER])
+                    self.assertEqual(calls, [])
+                    self.assertEqual(text, reply)
 
     def test_union_type_uses_declared_json_value(self):
         tool = copy.deepcopy(WEATHER)
