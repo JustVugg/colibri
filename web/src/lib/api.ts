@@ -272,12 +272,13 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ""
+  let finished = false
   let finishReason: string | null = null
   let usage: TokenUsage | null = null
   let compaction: Compaction | null = null
 
   const consume = (data: string) => {
-    if (data === "[DONE]") return
+    if (data === "[DONE]") { finished = true; return }
     const event = JSON.parse(data) as {
       choices?: Array<{ delta?: { content?: string; reasoning_content?: string }; finish_reason?: string | null }>
       usage?: TokenUsage | null
@@ -293,14 +294,23 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
     if (event.usage) usage = event.usage
   }
 
-  while (true) {
-    const { value, done } = await reader.read()
-    buffer += decoder.decode(value, { stream: !done })
-    const parsed = extractSSE(buffer)
-    buffer = parsed.rest
-    parsed.data.forEach(consume)
-    if (done) break
+  try {
+    while (!finished) {
+      const { value, done } = await reader.read()
+      buffer += decoder.decode(value, { stream: !done })
+      const parsed = extractSSE(buffer)
+      buffer = parsed.rest
+      for (const data of parsed.data) {
+        consume(data)
+        if (finished) break
+      }
+      if (done) break
+    }
+  } catch (cause) {
+    reader.cancel().catch(() => undefined)
+    throw cause
   }
+  if (finished) reader.cancel().catch(() => undefined)
 
   const queueWaitHeader = response.headers.get("x-colibri-queue-wait-ms")
   const parsedQueueWait = queueWaitHeader === null ? null : Number(queueWaitHeader)
