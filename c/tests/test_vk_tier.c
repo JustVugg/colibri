@@ -2992,7 +2992,7 @@ static void cs_devsum(void) {
             if (sum)
                 CHECK(memcmp(sum, merged[t], (size_t)H * sizeof(float)) == 0,
                       "cs devsum: group %d's merged row is not bit-for-bit the host merge", t);
-            if (!leg) memcpy(first[t], merged[t], sizeof first[t]);
+            if (!leg) memcpy(first[t], merged[t], (size_t)H * sizeof(float));
             else CHECK(memcmp(merged[t], first[t], (size_t)H * sizeof(float)) == 0,
                        "cs devsum: group %d's host merge moved between the legs", t);
         }
