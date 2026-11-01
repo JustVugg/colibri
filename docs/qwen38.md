@@ -746,8 +746,8 @@ two fresh prompts):
 
 | prompt tokens | 76 | 452 | 1012 | 1512 | 1912 | 2612 (staged both) |
 |---|---|---|---|---|---|---|
-| staged, tok/s | 42.7 | 215-216 | 370 | 412 | 418 | 392 |
-| on the CPU, tok/s | 206-211 | 447-450 | 473-475 | 437 | 433-439 | 404 |
+| staged, tok/s | 42.7 | 213-215 | 357-367 | 412 | 418 | 392 |
+| on the CPU, tok/s | 206-211 | 480-491 | 500-518 | 437 | 433-439 | 404 |
 
 The index keys of an attention layer now come down in one copy over the rows: a copy a row
 filled the driver's queue on a 1912-row prompt while a hybrid layer held the stream, and the
