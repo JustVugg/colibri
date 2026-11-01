@@ -8230,6 +8230,34 @@ static double q36_turn_hit(const Model *m, const Q36ReqClock *c) {
     return n > 0 ? 100.0 * h / n : 0.0;
 }
 
+/* A model whose state is attention alone: every layer full attention, no sliding window,
+ * no MTP head, no picture rows. Its rows depend on their prefix and nothing later, so a
+ * prompt that leaves the held state in the middle can resume there (kv_prefix_common), as
+ * olmoe.c does. Qwen3-Coder (qwen3_moe) and the dense Qwen3 are this; the hybrid Qwen3.6
+ * and Qwen3.8 carry a DeltaNet recurrence, which cannot be cut back, and keep the
+ * all-or-nothing reuse. One sequence only: the multiplexed slots keep their own. */
+static int q36_attention_only(const Model *m) {
+    const Cfg *c = &m->c;
+    if (c->win_layer || c->window > 0 || g_q36_mtp.on || m->vis_rows_n > 0 || g_q36_mux_slots > 1)
+        return 0;
+    for (int i = 0; i < c->n_layers; i++) if (!c->is_attn[i]) return 0;
+    return 1;
+}
+
+/* Back to the first `len` positions of the held state: what q36_spec_rollback does for
+ * a verify, without the recurrence there is none of. The device mirrors keep their rows
+ * up to `len` and take the rest again from the host. */
+static void q36_rewind(Model *m, int len) {
+#ifdef COLI_VULKAN
+    q36c_rollback(m, -1, len);
+#endif
+#ifdef COLI_CUDA
+    q36cc_rollback(m, -1, len);
+#endif
+    m->kv_len = len;
+    if (m->kvp.len > len) m->kvp.len = len;
+}
+
 /* A request's prompt into the conversation the Model holds: its tokens and image,
  * the budget, ACCEPT, the prefix reuse and the pins, the prefill and its read-out.
  * 1 with the prompt's ids and the logits after it; 0 when the request ended here,
@@ -8284,15 +8312,25 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     int reuse = kv_prefix_off() ? 0 : kv_prefix_reuse(&m->kvp, ids, np);
     /* the sliding layers' rings must still hold the window before the first fresh token */
     if (reuse && !q36_ring_holds(m->ring_pos, m->kv_ring, reuse - m->c.window + 1, reuse)) reuse = 0;
+    /* Attention alone resumes where the prompt leaves the held state: a client that starts
+     * a new task on the same system prompt and tools, or changes a turn, reads only what
+     * follows the shared positions. A read-out asks a frame for every position, so it
+     * reads the whole prompt. */
+    int rewind = 0;
+    if (!reuse && !kv_prefix_off() && q->logprobs == 0 && q36_attention_only(m))
+        rewind = kv_prefix_common(&m->kvp, ids, np);
     if (getenv("COLI_PREFIX_LOG")) {
         if (reuse)
             fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens (%.0f%%)\n",
                     reuse, np, 100.0 * reuse / np);
+        else if (rewind)
+            fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens (%.0f%%), up to where it leaves the held state\n",
+                    rewind, np, 100.0 * rewind / np);
         else
             fprintf(stderr, "[PREFIX] no reuse: held=%d cap=%d prompt=%d%s%s\n",
                     m->kvp.len, m->kvp.cap, np, m->kvp.tainted ? " tainted" : "",
                     (m->kvp.len > 0 && m->kvp.len < np) ? " (diverged)" : "");
-        if (!reuse) kv_prefix_miss_log(&m->kvp, ids, np, decode_id_to_bytes);
+        if (!reuse && !rewind) kv_prefix_miss_log(&m->kvp, ids, np, decode_id_to_bytes);
         fflush(stderr);
     }
     /* Con la lettura accesa il riuso arretra di un token: il predittore del
@@ -8320,7 +8358,12 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     if (g_echo_k > 0 && !g_pin_use_logit) reuse = 0;
     if (!reuse) {
         q36_park(m, np, q->max_tok);   /* a short request keeps the conversation (q36_unpark) */
-        reset_recurrent(m); m->kv_len = 0;
+        if (rewind > 0 && !g_pin_use_logit) {
+            q36_rewind(m, rewind);     /* parked first: the copy holds the whole conversation */
+            reuse = rewind;
+        } else {
+            reset_recurrent(m); m->kv_len = 0;
+        }
     }
     /* Per-REQUEST state, not per-process: without this the server keeps the
      * first request's prefill flag and expert-collection set forever, so
