@@ -2828,20 +2828,11 @@ static int64_t q38_hash_row(Model *m,int head,int ngram,int64_t cur,int64_t p1,i
  *
  * Riordino puro: stessi byte, letti prima. I token non cambiano, e il test lo
  * pretende invece di darlo per scontato. */
-static void q38_ple_prefetch(Model *m,const int *ids,int S) {
+/* The PLE table's rows of ids[0..S) (ngram_heads a position): the two-token window is
+ * SIMULATED, not moved: q38_ple moves it on its own as it runs, and moving it here would
+ * advance it twice. */
+static void q38_ple_hash_rows(Model *m,const int *ids,int S,int64_t *rows) {
     Cfg *c=&m->c;
-    free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;
-    if(c->ple_layer<0||S<1||c->ngram_heads<1||c->ngram_head_dim<1) return;
-    if(!q38_env_bool("Q38_PLE_PREFETCH",1)) return;
-
-    int64_t per_row=c->ngram_head_dim, per_pos=(int64_t)c->ngram_heads*per_row;
-    if(S>INT_MAX/c->ngram_heads) return;
-    float *buffer=(float*)malloc((size_t)S*per_pos*sizeof(float));
-    int64_t *rows=(int64_t*)malloc((size_t)S*c->ngram_heads*sizeof(int64_t));
-    if(!buffer||!rows){free(buffer);free(rows);return;}   /* niente prefetch: si legge inline */
-
-    /* La finestra di due token viene SIMULATA, non mutata: q38_ple la aggiorna
-     * per conto suo mentre gira, e toccarla qui la farebbe avanzare due volte. */
     int64_t history[2]={0,0};
     int history_len=0;
     if(!m->mux_rows){history[0]=m->ple_history[0];history[1]=m->ple_history[1];history_len=m->ple_history_len;}
@@ -2861,6 +2852,36 @@ static void q38_ple_prefetch(Model *m,const int *ids,int S) {
         else if(history_len==1){history[1]=ids[s];history_len=2;}
         else {history[0]=history[1];history[1]=ids[s];}
     }
+}
+/* The rows of positions from..S-1 of ids asked of the OS ahead (gguf_advise): a speculative
+ * step knows a verify's tokens one by one, each a draft frame before the verify reads their
+ * rows at its start (q38_ple_prefetch), which then find them read. A GGUF's table only. */
+static void q38_ple_advise(Model *m,const int *ids,int S,int from) {
+    Cfg *c=&m->c;
+    if(!m->ple_gg||c->ple_layer<0||S<1||from>=S||c->ngram_heads<1||c->ngram_head_dim<1||m->mux_rows) return;
+    static int on=-1;
+    if(on<0) on=q38_env_bool("Q38_PLE_ADVISE",1);
+    if(!on) return;
+    int64_t rows[Q38_SPEC_ROWS*64];
+    if(S>Q38_SPEC_ROWS||c->ngram_heads>64) return;
+    q38_ple_hash_rows(m,ids,S,rows);
+    const gguf_tensor *t=m->ple_gg; const int64_t rb=gq_row_bytes(t->type,c->ngram_head_dim);
+    for(int64_t i=(int64_t)from*c->ngram_heads;i<(int64_t)S*c->ngram_heads;i++)
+        if(rows[i]>=0&&rows[i]<t->ne[1]) gguf_advise(q38_gg_ctx_of(t),t,rows[i]*rb,rb);
+}
+static void q38_ple_prefetch(Model *m,const int *ids,int S) {
+    Cfg *c=&m->c;
+    free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;
+    if(c->ple_layer<0||S<1||c->ngram_heads<1||c->ngram_head_dim<1) return;
+    if(!q38_env_bool("Q38_PLE_PREFETCH",1)) return;
+
+    int64_t per_row=c->ngram_head_dim, per_pos=(int64_t)c->ngram_heads*per_row;
+    if(S>INT_MAX/c->ngram_heads) return;
+    float *buffer=(float*)malloc((size_t)S*per_pos*sizeof(float));
+    int64_t *rows=(int64_t*)malloc((size_t)S*c->ngram_heads*sizeof(int64_t));
+    if(!buffer||!rows){free(buffer);free(rows);return;}   /* niente prefetch: si legge inline */
+
+    q38_ple_hash_rows(m,ids,S,rows);
 
     int64_t total=(int64_t)S*c->ngram_heads;
     volatile int failed=0;
@@ -5950,6 +5971,7 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
             float *hidden=falloc(c->hc_width);
             t_verify=now_s();   /* the head's first draft is the head pass a plain step makes too */
             m->mtp_p=-1.0f;
+            q38_ple_advise(m,&tok,1,0);   /* the verify's first row's PLE rows, read while the head drafts */
             d[0]=q38_mtp_draft(m,tok,pos,hidden);
             sp->ahead_p[0]=m->mtp_p;
             double t_first=now_s();
@@ -5958,6 +5980,7 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
                 if(sp->pstep&&sp->depth&&!sp->force&&!spec_gate_deeper_p(&sp->gate,SPEC_SRC_MTP,j,sp->ahead_p)){k=j;break;}
                 double t0=now_s();
                 m->mtp_p=-1.0f;
+                {int seq[Q38_SPEC_ROWS];seq[0]=tok;memcpy(seq+1,d,(size_t)j*sizeof(int));q38_ple_advise(m,seq,j+1,j);}   /* the last draft's */
                 d[j]=q38_mtp_draft_more(m,hidden,d[j-1],pos+j-1);
                 sp->ahead_p[j]=m->mtp_p;
                 spec_gate_draft_cost(&sp->gate,SPEC_SRC_MTP,now_s()-t0);

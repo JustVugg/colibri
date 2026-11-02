@@ -68,6 +68,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   Qwen3.8-Flash-Next IQ2_XS on an RTX PRO 4000, served, nothing set, the history held fixed:
   512-token answers 53.3-54.0 -> 71.7-72.3 tok/s, 128-token answers 54.4-55.4 -> 64.4-65.0; the
   452-token prompt 635-661 -> 574-624 (the card holds 494 experts fewer for the head's).
+- **The CUDA chains' small copies by kernel, off the copy engine** (`COLI_CUDA_COPY_K`). A copy of up
+  to 1 MiB, mapped host memory on either side or none, and a copy of scattered regions now run as a
+  kernel on the chain's stream: as `cudaMemcpyAsync` they took the copy engine and queued behind
+  the megabytes of the experts the chain promotes on its copy stream, so a draft's frame started
+  up to 12.5 ms late. Qwen3.8's chain writes a step's streams through mapped memory, its expert
+  table's changed entries from mapped copies of the tables, waits for a decode step's frame alone
+  (not for the promotions' copies, which land on their own), and the device's memory pool keeps 64
+  MiB of the kernels' scratch between synchronizations (a `cudaMallocAsync` went to the driver
+  each time, 300 us). Qwen3.8-Flash-Next IQ2_XS on an RTX PRO 4000 with the MTP head, 256-token
+  answers on the engine: 73.9-76.4 -> 77.4-80.1 tok/s (the cycle of a verify and its drafts 34.9
+  -> 31.9 ms before the waits' and the pool's part).
+- **Qwen3.8: a speculative step's PLE rows asked of the disk ahead** (`Q38_PLE_ADVISE`): a verify read
+  its rows of the PLE table (a GGUF's, on the disk) at its start, 0.75 ms a verify on the main
+  thread. Each row's token is known one draft before: its rows are now asked of the OS then
+  (`POSIX_FADV_WILLNEED`), and the verify finds them read.
 
 ### Fixed
 
