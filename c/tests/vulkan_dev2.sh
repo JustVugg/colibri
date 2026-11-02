@@ -54,6 +54,10 @@ d2_check() {
 # <runner> <tokens out> <log> <env...> runs the engine once and writes what its CPU and
 # Vulkan runs must share (tokens, ids) to <tokens out>.
 d2_case() {
+  # a budget that must evict (EVICT=1, the evict case: the second device held to a few
+  # experts) or a RAM cache that must give up device experts (excl, noexcl): the history
+  # alone, no fill, or a primary that holds the whole model leaves nothing to give up
+  case "${EVICT:-0}:$4" in 1:*|*:evict|*:excl|*:noexcl) local -x COLI_VK_TIER_FILL=0 ;; esac
   local eng=$1 run=$2 tag=$3 kind=$4; shift 4
   local x=()
   local D2_X=1 D2_SMALL=0

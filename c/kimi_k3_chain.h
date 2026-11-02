@@ -170,20 +170,14 @@ static int k3c_chunk_rows(K3Chain *ch, const Model *m) {
 static ColiVkTensor *k3c_w(W *w, ColiVkTensor **t) {
     if (g_k3c_dev) {
         if (*t) return *t;
-        int fmt = k3_vk_fmt(w);
-        if (fmt < 0 || w->mapped) return NULL;
-        const void *src = fmt == 1 ? (const void *)w->q8 : fmt == 4 ? (const void *)w->q4 : (const void *)w->f;
-        return coli_vk_tensor_ensure2(t, src, fmt == 10 ? NULL : w->s, fmt, w->I, w->O, fmt == 4 ? w->gs : 0) ? *t : NULL;
+        return k3_vk_ensure(w, t, 1) ? *t : NULL;
     }
     if (!*t && w->vk) *t = (ColiVkTensor *)w->vk;
     if (*t) return *t;
     /* the dense weights on the device only, the chain's fit: the per-matrix path's copy,
      * made here layer by layer (k3_vk_tier_start leaves the chain's layers to it) */
     if (g_k3_dho && g_k3_fit.L > 0 && w_vk_upload(w)) return *t = (ColiVkTensor *)w->vk;
-    int fmt = k3_vk_fmt(w);
-    if (fmt < 0 || w->mapped) return NULL;
-    const void *src = fmt == 1 ? (const void *)w->q8 : fmt == 4 ? (const void *)w->q4 : (const void *)w->f;
-    return coli_vk_tensor_ensure(t, src, fmt == 10 ? NULL : w->s, fmt, w->I, w->O, fmt == 4 ? w->gs : 0) ? *t : NULL;
+    return k3_vk_ensure(w, t, 0) ? *t : NULL;
 }
 /* the shared experts go where the per-matrix path puts them when it puts them on the
  * device (COLI_VK_DENSE): one copy for both */
@@ -191,8 +185,9 @@ static ColiVkTensor *k3c_w_shared(W *w, ColiVkTensor **t) {
     if (!*t && !g_k3c_dev && coli_vk_dense() && !w->vk) w_vk_upload(w);
     return k3c_w(w, t);
 }
+/* an f32 matrix of the chain's own: bf16 on the device where that holds it exactly */
 static ColiVkTensor *k3c_f32(const float *w, int I, int O, ColiVkTensor **own) {
-    return (g_k3c_dev ? coli_vk_tensor_ensure2(own, w, NULL, 10, I, O, 0) : coli_vk_tensor_ensure(own, w, NULL, 10, I, O, 0)) ? *own : NULL;
+    return coli_vk_tensor_ensure_f32(own, w, I, O, g_k3c_dev) ? *own : NULL;
 }
 
 /* ---- the KDA state between the host and the device ------------------------------ */
@@ -245,6 +240,17 @@ static void k3c_host_wrote(Model *m, int zero) {
         if (!ch || !ch->ok || ch->m != m) continue;
         ch->where = K3C_HOST; ch->host_zero = zero;
         if (zero) { for (int i = 0; i < m->c.n_layers; i++) ch->kv_valid[i] = 0; vkc_kv_reset(&ch->ks); }
+    }
+}
+/* The host's state rewritten from position 0 (a parked conversation back, park.h): the
+ * recurrent state goes up from the host, and every MLA mirror again. */
+static void k3c_host_rewrote(Model *m) {
+    for (int d = 0; d < 2; d++) {
+        K3Chain *ch = k3c_of(d);
+        if (!ch || !ch->ok || ch->m != m) continue;
+        ch->where = K3C_HOST; ch->host_zero = 0;
+        for (int i = 0; i < m->c.n_layers; i++) ch->kv_valid[i] = 0;
+        vkc_kv_reset(&ch->ks);
     }
 }
 /* The CPU runs one chain's layers from pos0: the device's state stale after (and its MLA
@@ -325,20 +331,21 @@ static const char *k3c_unsupported(const Model *m) {
     if (nbmax > 15) return "more AttnRes blocks than its shader takes";
     return NULL;
 }
-/* a W as k3c_w puts it on the device: its bytes there and its payload */
+/* a W as k3c_w puts it on the device: its bytes there and its payload (a GGUF's blocks too) */
 static void k3c_fit_w(const W *w, size_t *b, size_t *mm) {
-    int fmt = k3_vk_fmt(w);
-    if (fmt < 0 || w->mapped || !(w->f || w->q8 || w->q4) || w->O < 1 || w->I < 1) return;
+    int fmt = k3_vk_dev_fmt(w);
+    if (fmt < 0 || w->mapped || !(w->f || w->q8 || w->q4 || w->gg) || w->O < 1 || w->I < 1) return;
     int gs = fmt == 4 ? w->gs : 0;
     *b += vkc_fit_tensor(fmt, w->I, w->O, gs); *mm += coli_vk_tensor_payload(fmt, w->I, w->O, gs);
 }
-static void k3c_fit_f32(int I, int O, size_t *b, size_t *mm) {
-    *b += vkc_fit_tensor(10, I, O, 0); *mm += coli_vk_tensor_payload(10, I, O, 0);
+static void k3c_fit_f32(const float *w, int I, int O, size_t *b, size_t *mm) {
+    int fmt = w ? coli_vk_f32_fmt(w, (size_t)I * O) : 10;
+    *b += vkc_fit_tensor(fmt, I, O, 0); *mm += coli_vk_tensor_payload(fmt, I, O, 0);
 }
 /* What layer i puts on the device, as vkc_fit counts it: its matrices (the router and the
- * KDA decay and beta projections as f32), its state at its first size (the KDA state and
- * convolution windows, an MLA layer's mirror at `rows` positions and its rows of the down
- * buffer), its part of the parameters; *mat its matrices' payload. */
+ * KDA decay and beta projections as f32, bf16 or f16 where exact), its state at its first size
+ * (the KDA state and convolution windows, an MLA layer's mirror at `rows` positions and
+ * its rows of the down buffer), its part of the parameters; *mat its matrices' payload. */
 static size_t k3c_layer_bytes(const Model *m, int i, int rows, size_t *mat) {
     const Cfg *c = &m->c; const Layer *l = &m->L[i];
     int D = c->hidden, P = c->kda_proj;
@@ -347,7 +354,7 @@ static size_t k3c_layer_bytes(const Model *m, int i, int rows, size_t *mat) {
         const Kda *k = &l->a;
         k3c_fit_w(&k->q, &b, &mm); k3c_fit_w(&k->k, &b, &mm); k3c_fit_w(&k->v, &b, &mm);
         k3c_fit_w(&k->g, &b, &mm); k3c_fit_w(&k->o, &b, &mm);
-        k3c_fit_f32(D, c->kda_hd, &b, &mm); k3c_fit_f32(c->kda_hd, P, &b, &mm); k3c_fit_f32(D, c->kda_heads, &b, &mm);
+        k3c_fit_f32(k->fa, D, c->kda_hd, &b, &mm); k3c_fit_f32(k->fb, c->kda_hd, P, &b, &mm); k3c_fit_f32(k->bp, D, c->kda_heads, &b, &mm);
         b += vkc_fit_buf((size_t)3 * P * c->conv_k * sizeof(float)) +
              vkc_fit_buf((size_t)c->kda_heads * c->kda_hd * c->kda_hd * sizeof(float));
         f += (size_t)3 * P * c->conv_k + c->kda_heads + P + c->kda_hd;
@@ -361,7 +368,7 @@ static size_t k3c_layer_bytes(const Model *m, int i, int rows, size_t *mat) {
     }
     if (l->sparse) {
         const Moe *o = &l->moe;
-        k3c_fit_f32(D, c->n_experts, &b, &mm);
+        k3c_fit_f32(o->router, D, c->n_experts, &b, &mm);
         k3c_fit_w(&o->lat_down, &b, &mm); k3c_fit_w(&o->lat_up, &b, &mm);
         k3c_fit_w(&o->sh_gate, &b, &mm); k3c_fit_w(&o->sh_up, &b, &mm); k3c_fit_w(&o->sh_down, &b, &mm);
         f += c->latent;
@@ -435,7 +442,7 @@ static int k3c_layer_up(K3Chain *ch, Model *m, int i, const char **why) {
         /* kv_b as it is: per head Q key rows then V value rows, the absorption reads it transposed */
         *t = (VkcMla){c->n_heads, c->qk_nope, c->qk_rope, c->v_head, c->kv_lora, D, c->q_lora, c->eps,
                       c->attn_scale, VKC_ROPE_HALF, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-                      ch->prm, ch->o_qn[i], ch->o_kn[i]};
+                      ch->prm, ch->o_qn[i], ch->o_kn[i], 0};
         ok = k3c_w(&q->qa, &t->q_a) && k3c_w(&q->qb, &t->q_b) && k3c_w(&q->kva, &t->kv_a) && k3c_w(&q->kvb, &t->kv_b) &&
              k3c_w(&q->o, &t->o) && k3c_w(&q->g, &ch->mg[i]);
     }
@@ -711,7 +718,7 @@ static int k3c_push(K3Chain *ch, const Model *m, int pb, int n_rows) {
     }
     for (int i = ch->lo; i < ch->lo + ch->n && ok; i++) {
         if (!m->L[i].kda && ch->ks.on) {   /* the split: the window placed, its rows below pb uploaded */
-            VkcKvPart pt[2] = {{1, K, m->Lc[i], 0, ch->kv[i].lat, 0}, {1, R, m->Rc[i], 0, ch->kv[i].rope, 0}};
+            VkcKvPart pt[2] = {{1, K, m->Lc[i], 0, ch->kv[i].lat, 0, 0}, {1, R, m->Rc[i], 0, ch->kv[i].rope, 0, 0}};
             vkc_kv_place(&ch->ks, ch->mla_ord[i], pb, n_rows);
             ok = vkc_kv_push(&ch->ks, ch->mla_ord[i], pt, R ? 2 : 1, pb);
             ch->kv_valid[i] = pb;

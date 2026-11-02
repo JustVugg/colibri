@@ -30,6 +30,9 @@
 #include <string.h>
 
 typedef struct { uint64_t off, len; } VkaExt;
+/* an extent, without a compound literal: the header is C++ too (cu_xb.cu, which MSVC
+ * compiles for the Windows CUDA DLL) */
+static inline VkaExt vka_ext(uint64_t off, uint64_t len) { VkaExt e; e.off = off; e.len = len; return e; }
 
 typedef struct {
     uint64_t cap;              /* bytes in the block */
@@ -107,7 +110,7 @@ static inline int vka_pool_add_block(VkaPool *p, uint64_t cap, void *user) {
     VkaBlock *b = &p->b[k];
     memset(b, 0, sizeof(*b));
     b->cap = cap; b->user = user; b->present = 1;
-    if (!vka_ext_insert(b, 0, (VkaExt){0, cap})) { free(b->fx); b->present = 0; return -1; }
+    if (!vka_ext_insert(b, 0, vka_ext(0, cap))) { free(b->fx); b->present = 0; return -1; }
     p->total += cap;
     if (k == p->nb) p->nb++;
     return k;
@@ -140,7 +143,7 @@ static inline int vka_alloc(VkaPool *p, uint64_t size, uint64_t align, VkaRange 
     /* the head pad stays free; the tail stays free; the range is [boff, boff+size) */
     if (head && tail) {
         b->fx[bi].len = head;
-        if (!vka_ext_insert(b, bi + 1, (VkaExt){boff + size, tail})) { b->fx[bi] = e; return 0; }
+        if (!vka_ext_insert(b, bi + 1, vka_ext(boff + size, tail))) { b->fx[bi] = e; return 0; }
     } else if (head) {
         b->fx[bi].len = head;
     } else if (tail) {
@@ -173,7 +176,7 @@ static inline int vka_free(VkaPool *p, VkaRange r) {
         b->fx[i - 1].len += r.len;
     } else if (merge_next) {
         b->fx[i].off = r.off; b->fx[i].len += r.len;
-    } else if (!vka_ext_insert(b, i, (VkaExt){r.off, r.len})) {
+    } else if (!vka_ext_insert(b, i, vka_ext(r.off, r.len))) {
         return 0;   /* out of host memory: the range leaks, the books stay consistent */
     }
     b->used -= r.len; b->live--;

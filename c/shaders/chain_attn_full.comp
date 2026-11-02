@@ -13,6 +13,10 @@
 // tile's row max, the running sum and the output rescaled by exp(old max - new max); the
 // CPU normalizes the scores first and sums the row in double, so the two agree to
 // rounding. HD (a specialization constant) is 32, 64 or 128. Shared memory: 38.8 KB.
+// The loops over a thread's rows, keys and dims are unrolled, so acc, s and e4 are indexed
+// by constants: indexed at run time, an NVIDIA driver (595.91) got every S past 2 wrong at
+// HD 128 and 64 (tests/test_vk_chain.c's attn full), HD 32 and the other devices right.
+#extension GL_EXT_control_flow_attributes : require
 layout(local_size_x = 256) in;
 layout(constant_id = 0) const int HD = 128;
 #define BR 64
@@ -41,12 +45,12 @@ void main() {
     vec4 acc[4][2];                // rows x (up to two vec4 groups of dims)
     vec2 acc2[4];                  // HD 32
     float m[4], l[4];
-    for (int i = 0; i < 4; i++) {
+    [[unroll]] for (int i = 0; i < 4; i++) {
         m[i] = -1e30; l[i] = 0.0; acc[i][0] = vec4(0.0); acc[i][1] = vec4(0.0); acc2[i] = vec2(0.0);
     }
     for (int kb = 0; kb < p.T; kb += BC) {
         vec4 s[4];
-        for (int i = 0; i < 4; i++) s[i] = vec4(0.0);
+        [[unroll]] for (int i = 0; i < 4; i++) s[i] = vec4(0.0);
         for (int dc = 0; dc < HD; dc += DC) {
             barrier();   // the previous chunk (or V) is read
             for (int e = t; e < BR * DC; e += 256) {
@@ -63,32 +67,32 @@ void main() {
         }
         // the tile's row maxima across the 16 threads that share the rows
         float mn[4];
-        for (int i = 0; i < 4; i++) {
+        [[unroll]] for (int i = 0; i < 4; i++) {
             float mt = -1e30;
-            for (int j = 0; j < 4; j++) {
+            [[unroll]] for (int j = 0; j < 4; j++) {
                 s[i][j] = kb + 4 * tx + j < p.T ? s[i][j] * p.scale : -1e30;
                 mt = max(mt, s[i][j]);
             }
             red[(4 * ty + i) * 16 + tx] = mt;
         }
         barrier();
-        for (int i = 0; i < 4; i++) {
+        [[unroll]] for (int i = 0; i < 4; i++) {
             float mx = m[i];
-            for (int k = 0; k < 16; k++) mx = max(mx, red[(4 * ty + i) * 16 + k]);
+            [[unroll]] for (int k = 0; k < 16; k++) mx = max(mx, red[(4 * ty + i) * 16 + k]);
             mn[i] = mx;
         }
         barrier();   // red is read: the sums take it
         vec4 e4[4];
-        for (int i = 0; i < 4; i++) {
-            for (int j = 0; j < 4; j++) e4[i][j] = kb + 4 * tx + j < p.T ? exp(s[i][j] - mn[i]) : 0.0;
+        [[unroll]] for (int i = 0; i < 4; i++) {
+            [[unroll]] for (int j = 0; j < 4; j++) e4[i][j] = kb + 4 * tx + j < p.T ? exp(s[i][j] - mn[i]) : 0.0;
             red[(4 * ty + i) * 16 + tx] = e4[i].x + e4[i].y + e4[i].z + e4[i].w;
         }
-        for (int j = 0; j < 4; j++)   // P^T: key 4tx+j, rows 4ty..4ty+3 as one vec4
+        [[unroll]] for (int j = 0; j < 4; j++)   // P^T: key 4tx+j, rows 4ty..4ty+3 as one vec4
             pt4[((4 * tx + j) * LD + 4 * ty) >> 2] = vec4(e4[0][j], e4[1][j], e4[2][j], e4[3][j]);
         barrier();
-        for (int i = 0; i < 4; i++) {
+        [[unroll]] for (int i = 0; i < 4; i++) {
             float sum = 0.0;
-            for (int k = 0; k < 16; k++) sum += red[(4 * ty + i) * 16 + k];
+            [[unroll]] for (int k = 0; k < 16; k++) sum += red[(4 * ty + i) * 16 + k];
             float al = exp(m[i] - mn[i]);
             l[i] = l[i] * al + sum; m[i] = mn[i];
             acc[i][0] *= al; acc[i][1] *= al; acc2[i] *= al;
@@ -105,7 +109,7 @@ void main() {
             for (int kk = 0; kk < 32; kk++) {
                 vec4 pv = pt4[((kc + kk) * LD + 4 * ty) >> 2];
                 if (HD >= 64) {
-                    for (int g = 0; g < NG; g++) {
+                    [[unroll]] for (int g = 0; g < NG; g++) {
                         vec4 vv = sb4[(kk * HD + 64 * g + 4 * tx) >> 2];
                         acc[0][g] += pv.x * vv; acc[1][g] += pv.y * vv; acc[2][g] += pv.z * vv; acc[3][g] += pv.w * vv;
                     }
@@ -116,14 +120,14 @@ void main() {
             }
         }
     }
-    for (int i = 0; i < 4; i++) {
+    [[unroll]] for (int i = 0; i < 4; i++) {
         int row = r0 + 4 * ty + i;
         if (row >= p.S) continue;
         float inv = 1.0 / l[i];
         int ob = p.o_off + row * p.o_row + hb;
         if (HD >= 64) {
-            for (int g = 0; g < NG; g++)
-                for (int k = 0; k < 4; k++) o[ob + 64 * g + 4 * tx + k] = acc[i][g][k] * inv;
+            [[unroll]] for (int g = 0; g < NG; g++)
+                [[unroll]] for (int k = 0; k < 4; k++) o[ob + 64 * g + 4 * tx + k] = acc[i][g][k] * inv;
         } else {
             o[ob + 2 * tx] = acc2[i].x * inv; o[ob + 2 * tx + 1] = acc2[i].y * inv;
         }

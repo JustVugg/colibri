@@ -1,0 +1,97 @@
+{
+  "version": 1,
+  "hypothesis": "Without the number dev's --auto-tier planner writes, the qwen38 CUDA tier sizes the card itself (allowance 20.8 GiB instead of 21.7): 400 fewer experts on an L4, so the decode of a prose the history fits slows a little, with the same text.",
+  "commit": "77530b49ddd2f4e6ad1b3bb52500491e0c8ed9bb",
+  "model": "unsloth/Qwen3.8-Flash-Next-GGUF UD-Q2_K_XL",
+  "command": "cd c && make qwen38 CUDA=1 CUDA_ARCH=sm_89 && env COLI_CUDA=1 COLI_GPU=0 COLI_VULKAN=0 COLI_TEMP=0 USAGE_SAVE=0 OMP_NUM_THREADS=6 SNAP=<model> [CUDA_EXPERT_GB=21.660] N_NEW=128 COLI_USAGE=<history.usage> ./qwen38 128 8 <prompt>",
+  "prompt_hash": "cd8eba88480c681ec210d697557c5a727fd5e297bfe91c30c3e36dc9b55f5b45",
+  "hardware": {
+    "cpu": "a Colab L4 VM: 12 threads (nproc), 6 physical cores (the plan's OMP_NUM_THREADS), Intel(R) Xeon(R) CPU @ 2.20GHz (lscpu) + NVIDIA L4 (23034 MiB, 22564 MiB free, sm_89)",
+    "ram": "53.0 GiB, no swap; the GGUF (74 GiB) does not fit it",
+    "storage": "the VM's disk (overlay, 194GB free); the file cache evicted before each run",
+    "os": "Colab (Python 3.13.16), driver 580.82.07 (CUDA 13.0), nvcc V13.0.88"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "CUDA_EXPERT_GB"
+  ],
+  "baseline": {
+    "config": {
+      "model": "unsloth/Qwen3.8-Flash-Next-GGUF UD-Q2_K_XL",
+      "prompt": "prose, 150 tokens",
+      "new_tokens": 128,
+      "history": "history.usage.gz",
+      "engine_build": "origin/dev 77530b49",
+      "CUDA_EXPERT_GB": "21.660"
+    },
+    "samples": {
+      "tok_s": [
+        25.81,
+        25.89,
+        25.9,
+        25.88
+      ],
+      "t1_ms": [
+        37.7,
+        37.6,
+        37.8,
+        37.9
+      ],
+      "ttft_s": [
+        6.02,
+        8.25,
+        7.07,
+        7.33
+      ]
+    },
+    "median_tok_s": 25.885,
+    "quality": {
+      "method": "the generated text (128 tokens, greedy: COLI_TEMP=0) is the same in all 8 counted runs of both sides once the engine's own lines that land in the stream are taken out (prose.txt's summary); make -C c check passes on macOS arm64",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen38-auto-tier-number-2026-10-26/prose.txt",
+      "sha256": "de8dd43e67307413ecdd8f3275df30a4461ce51f00cea4b09dc154fda5e59af5"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "unsloth/Qwen3.8-Flash-Next-GGUF UD-Q2_K_XL",
+      "prompt": "prose, 150 tokens",
+      "new_tokens": 128,
+      "history": "history.usage.gz",
+      "engine_build": "origin/dev 77530b49",
+      "CUDA_EXPERT_GB": "unset"
+    },
+    "samples": {
+      "tok_s": [
+        25.38,
+        25.32,
+        25.27,
+        25.4
+      ],
+      "t1_ms": [
+        38.2,
+        38.5,
+        38.4,
+        38.3
+      ],
+      "ttft_s": [
+        8.4,
+        11.29,
+        7.56,
+        7.32
+      ]
+    },
+    "median_tok_s": 25.35,
+    "quality": {
+      "method": "the generated text (128 tokens, greedy: COLI_TEMP=0) is the same in all 8 counted runs of both sides once the engine's own lines that land in the stream are taken out (prose.txt's summary); make -C c check passes on macOS arm64",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen38-auto-tier-number-2026-10-26/prose.txt",
+      "sha256": "de8dd43e67307413ecdd8f3275df30a4461ce51f00cea4b09dc154fda5e59af5"
+    }
+  },
+  "outcome": "regression"
+}

@@ -381,6 +381,9 @@ def verify_full_mirror(model, mirror, source_dirs=()):
         except MirrorError:
             failures.append(name + " (header)")
             continue
+        if sha256(target) != sha256(item["source"]):
+            failures.append(name + " (sha256)")
+            continue
         mirrored_bytes += size
 
     return {
@@ -408,6 +411,10 @@ def verify_mirror(mirror, model=None, source_dirs=()):
     if receipt.get("schema") != SCHEMA or not isinstance(files, list) or not files:
         return {"schema": SCHEMA, "ready": False, "mirror_root": str(mirror),
                 "reason": "invalid_receipt", "failures": []}
+    sources = None
+    if model is not None:
+        _directories, candidates = discover_shards(model, source_dirs)
+        sources = {item["name"]: item for item in candidates}
     mirrored_bytes = 0
     names = set()
     for item in files:
@@ -426,6 +433,12 @@ def verify_mirror(mirror, model=None, source_dirs=()):
                 not isinstance(digest, str) or SHA256_HEX.fullmatch(digest) is None):
             failures.append(name + " (metadata)")
             continue
+        if sources is not None:
+            source = sources.get(name)
+            if source is None:
+                failures.append(name + " (source missing)")
+            elif source["size"] != size or sha256(source["source"]) != digest:
+                failures.append(name + " (source sha256)")
         mirrored_bytes += size
         if target.is_symlink() or not target.is_file() or target.stat().st_size != size:
             failures.append(name + " (size)")

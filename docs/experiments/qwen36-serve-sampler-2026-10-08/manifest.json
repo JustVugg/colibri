@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "hypothesis": "serve_sample sorted all 248,320 token probabilities with qsort at every token drawn with temperature > 0; sorting only the exponent buckets that hold the top_p nucleus draws the same token for the same rand() value (tokens of exactly equal probability now in token id order) in much less time over the tokens of chat replies at the gateway's default temperature 0.7 and top_p 0.9.",
+  "commit": "7a65e03aa5965092e69234a50a139e53ba8f5d60",
+  "model": "Qwen3.6-35B-A3B (Colibri qwen36 container, INT4 experts gs=64): the logits of every token of three chat replies, saved by sample_gen.c (logits.txt)",
+  "command": "from the repository root, with the flags of make -C c qwen36: clang -O3 -Xclang -fopenmp -I<libomp>/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -Ic docs/experiments/qwen36-serve-sampler-2026-10-08/sample_bench.c -o sample_bench -lm -L<libomp>/lib -lomp; then, in the directory of the logit files: PICKS=<run>.picks ./sample_bench logits-it.f32 logits-en.f32 logits-code.f32 -- reply-it.f32 reply-en.f32 reply-code.f32 (PICKS= also writes every drawn token, for picks.c; baseline built against dev 94dee9d2, trial against 0f4864a2); tok_s = draws per second over every reply token (the last line of each run); 7a65e03a has the measured code of 0f4864a2, rebased onto dev 1509ea5b: sample_bench compiles to the same code section on the M1 from dev 1509ea5b as from dev 94dee9d2, and from 7a65e03a as from 0f4864a2",
+  "prompt_hash": "f6e6aebed976b308663b49764aade7e26c2fc534a96c18ca1e7153b4379f9c1f",
+  "hardware": {
+    "cpu": "Apple M1, 4 performance + 4 efficiency cores (MacBook Air, MacBookAir10,1, no fan)",
+    "ram": "8 GB unified memory",
+    "storage": "internal APPLE SSD AP0256Q, APFS",
+    "os": "macOS 26.6.2 (25G83), Apple clang 21.0.0 (clang-2100.3.34.2), Homebrew libomp"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "SAMPLER"
+  ],
+  "baseline": {
+    "config": {
+      "LOGITS": "every token of three chat replies of Qwen3.6-35B-A3B (reply-it/en/code.f32, logits.txt)",
+      "SETTING": "temperature 0.7, top_p 0.9 (the gateway's default); 5 calls per token, srand() before each with a seed spread over the range of rand()",
+      "BUILD": "flags of make -C c qwen36 on macOS: clang -O3 -Xclang -fopenmp, no -mcpu",
+      "ORDER": "1 warm-up run per version (dev, then PR; discarded), then dev PR PR dev dev PR PR dev, one process each",
+      "REST": "thermal state nominal, then 60 s, before every run",
+      "SAMPLER": "qsort of the whole vocabulary (dev 94dee9d2)"
+    },
+    "samples": {
+      "tok_s": [
+        42.05,
+        42.43,
+        42.32,
+        42.4
+      ]
+    },
+    "median_tok_s": 42.36,
+    "quality": {
+      "method": "every drawn token (3 prompt vectors x 5 settings x 100 calls, and 5 calls per reply token) the same in all five runs of each version; of the 3195 draws (448 not the most likely token) 9 differ between the versions, each between two tokens of exactly the same probability (picks.txt); tests/test_qwen36_sample.c compares 1612 draws with a full sort",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-serve-sampler-2026-10-08/baseline.txt",
+      "sha256": "2172061eedf287712293d60fd50f11cde6fc0974331d76c1e2a627b85d739d7a"
+    }
+  },
+  "trial": {
+    "config": {
+      "LOGITS": "every token of three chat replies of Qwen3.6-35B-A3B (reply-it/en/code.f32, logits.txt)",
+      "SETTING": "temperature 0.7, top_p 0.9 (the gateway's default); 5 calls per token, srand() before each with a seed spread over the range of rand()",
+      "BUILD": "flags of make -C c qwen36 on macOS: clang -O3 -Xclang -fopenmp, no -mcpu",
+      "ORDER": "1 warm-up run per version (dev, then PR; discarded), then dev PR PR dev dev PR PR dev, one process each",
+      "REST": "thermal state nominal, then 60 s, before every run",
+      "SAMPLER": "exponent buckets, only the nucleus sorted (0f4864a2)"
+    },
+    "samples": {
+      "tok_s": [
+        903.69,
+        901.76,
+        908.91,
+        912.39
+      ]
+    },
+    "median_tok_s": 906.3,
+    "quality": {
+      "method": "every drawn token (3 prompt vectors x 5 settings x 100 calls, and 5 calls per reply token) the same in all five runs of each version; of the 3195 draws (448 not the most likely token) 9 differ between the versions, each between two tokens of exactly the same probability (picks.txt); tests/test_qwen36_sample.c compares 1612 draws with a full sort",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-serve-sampler-2026-10-08/trial.txt",
+      "sha256": "d3e35b43b322e4ef2dedfa0363d6f71ef9c3e865d57cb35b2a1946b988c20eda"
+    }
+  },
+  "outcome": "improvement"
+}

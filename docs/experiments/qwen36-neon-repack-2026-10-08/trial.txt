@@ -1,0 +1,193 @@
+Paths shortened: <model> is the model directory; bin-dev/ and bin-pr1/ hold the two builds of the harness; promessi_sposi.txt is the text. Units: /usr/bin/time -l gives bytes; the engine's own lines ('[bench] peak RSS', '[dense-i8] ... GB f32 freed') are in GiB, and summary.txt's 'peak memory ... MB' is in MiB.
+
+# this branch d5d844e8: NEON repack
+
+model <model>; text promessi_sposi.txt; lengths 64,512; gen 32; runs 4; extra env: none
+cooldown before every run: 60 seconds, after waiting for thermal state 0: yes, at most 900s; thermal states: 0 nominal, 1 fair, 2 serious, 3 critical
+v0: bin-dev/qwen36-bench (commit 94dee9d26fcc375fc7ea885e7c7189124697a3f3 (CPU engine, make qwen36 flags on macOS))
+v1: bin-pr1/qwen36-bench (commit d5d844e8b628dff3a653387edaae54bf3bb7add4 (CPU engine, make qwen36 flags on macOS))
+order: the binaries' order turns at every round (ABBA)
+
+host before the runs: 2026-10-08 00:19:15 chrome=0 System-wide memory free percentage: 78% swap_used=290.38M swapouts=2161584
+
+host after the runs: 2026-10-08 01:09:53 chrome=0 System-wide memory free percentage: 83% swap_used=1449.50M swapouts=3199998
+
+## v1-run1
+### before the run (date, thermal state, swap, wait)
+2026-10-08 00:32:54
+0
+swap_used=471.56M swapouts=2430622
+waited for state 0: 0s
+
+### harness output
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,24.637,2.60,32,592.6,2.072,11275,12.78,f1300d8431ba2787,833c8fed434981a0,0.00000,0.000
+512,512,158.733,3.23,32,999.0,2.084,61469,26.59,8e0bf69c62deb041,a85d82db8081fff4,0.00000,0.000
+
+### engine log and /usr/bin/time -l
+[tok] loaded 248044 pieces (max id 248069) from <model>/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[bench] CPU ready in 5.94 s; text 5871 tokens; lengths 64,512; gen 32; each length from an empty state
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[bench] peak RSS 2.99 GB
+      221.03 real      1192.22 user        34.51 sys
+          3207053312  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1241220  page reclaims
+                  36  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+               32102  voluntary context switches
+             2258860  involuntary context switches
+       5195947020504  instructions retired
+       3155091463453  cycles elapsed
+          6760724160  peak memory footprint
+
+### after the run
+2026-10-08 00:36:35
+0
+swap_used=1651.62M swapouts=2573006
+
+## v1-run2
+### before the run (date, thermal state, swap, wait)
+2026-10-08 00:37:35
+0
+swap_used=596.19M swapouts=2573506
+waited for state 0: 0s
+
+### harness output
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,24.742,2.59,32,585.5,2.095,11275,12.55,f1300d8431ba2787,833c8fed434981a0,0.00000,0.000
+512,512,158.192,3.24,32,926.1,2.108,61469,26.43,8e0bf69c62deb041,a85d82db8081fff4,0.00000,0.000
+
+### engine log and /usr/bin/time -l
+[tok] loaded 248044 pieces (max id 248069) from <model>/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[bench] CPU ready in 6.12 s; text 5871 tokens; lengths 64,512; gen 32; each length from an empty state
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[bench] peak RSS 2.99 GB
+      220.33 real      1192.46 user        33.47 sys
+          3206070272  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1179720  page reclaims
+                  29  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+               31965  voluntary context switches
+             2256981  involuntary context switches
+       5195260572508  instructions retired
+       3152223289524  cycles elapsed
+          6622770688  peak memory footprint
+
+### after the run
+2026-10-08 00:41:16
+0
+swap_used=1885.62M swapouts=2707458
+
+## v1-run3
+### before the run (date, thermal state, swap, wait)
+2026-10-08 00:55:01
+0
+swap_used=515.75M swapouts=2895566
+waited for state 0: 0s
+
+### harness output
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,24.479,2.61,32,956.4,1.141,11275,16.33,f1300d8431ba2787,833c8fed434981a0,0.00000,0.000
+512,512,158.110,3.24,32,1074.7,1.852,61469,27.04,8e0bf69c62deb041,a85d82db8081fff4,0.00000,0.000
+
+### engine log and /usr/bin/time -l
+[tok] loaded 248044 pieces (max id 248069) from <model>/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[bench] CPU ready in 5.61 s; text 5871 tokens; lengths 64,512; gen 32; each length from an empty state
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[bench] peak RSS 2.96 GB
+      234.45 real      1186.05 user        88.85 sys
+          3177988096  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             3631491  page reclaims
+                  48  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+               33107  voluntary context switches
+             2722447  involuntary context switches
+       5234689898346  instructions retired
+       3292161311608  cycles elapsed
+          5703397056  peak memory footprint
+
+### after the run
+2026-10-08 00:58:56
+0
+swap_used=690.31M swapouts=2996146
+
+## v1-run4
+### before the run (date, thermal state, swap, wait)
+2026-10-08 00:59:56
+0
+swap_used=472.19M swapouts=2996146
+waited for state 0: 0s
+
+### harness output
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,24.416,2.62,32,1029.1,1.468,11275,15.43,f1300d8431ba2787,833c8fed434981a0,0.00000,0.000
+512,512,158.221,3.24,32,1035.7,1.959,61469,27.44,8e0bf69c62deb041,a85d82db8081fff4,0.00000,0.000
+
+### engine log and /usr/bin/time -l
+[tok] loaded 248044 pieces (max id 248069) from <model>/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[bench] CPU ready in 5.72 s; text 5871 tokens; lengths 64,512; gen 32; each length from an empty state
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[bench] peak RSS 2.96 GB
+      227.67 real      1188.49 user        57.95 sys
+          3181625344  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             2427245  page reclaims
+                  37  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+               32935  voluntary context switches
+             2419042  involuntary context switches
+       5215159430494  instructions retired
+       3216406235755  cycles elapsed
+          6110048704  peak memory footprint
+
+### after the run
+2026-10-08 01:03:44
+0
+swap_used=1014.75M swapouts=3098110

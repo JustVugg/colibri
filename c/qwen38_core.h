@@ -1,4 +1,7 @@
 #include "qwen36_tier.h"   /* CUDA VRAM expert tier, shared with qwen36; CPU-only builds get the inline no-op stubs */
+#ifdef COLI_CUDA
+#include "cuda_chain.h"     /* cc_moe_block_type: the GGUF types the tier's groups compute; the backend's block formats */
+#endif
 #include "vk_tier.h"       /* Vulkan routed-expert tier (COLI_VULKAN=1); builds without VK=1 get inline no-op stubs */
 /* Native Qwen3.8-Flash-Next text core.
  *
@@ -12,8 +15,16 @@
 #ifndef COLI_QWEN38_CORE_H
 #define COLI_QWEN38_CORE_H
 #include "kv_prefix.h"
+#include "kv16.h"         /* Q38_KV=f16: K and V rounded to float16 (q38_kv16) */
+#include "prompt_break.h"   /* a served prompt that a STOP or CANCEL stops between two layers */
 #include "spec_draft.h"   /* prompt-lookup drafts and the gate that decides when drafting pays */
+#include "draft_vocab.h"  /* the tokens the MTP head scores for a draft (Q38_MTP_VOCAB) */
 #include "expert_ffn.h"   /* the int4-g64 routed experts (experts-int4g64/ sidecar) run through its f32 kernel */
+#include "int2_g32.h"     /* the int2-g32 routed experts (experts-int2g32/ sidecar) */
+#include "lowbit_g16.h"   /* the int2-g16 and int3-g16 routed experts (experts-int2g16/, experts-int3g16/) */
+#include "vq2_g32.h"     /* the vq2 routed experts: two-stage vector codes (experts-vq2g32/) */
+#include "vq1_g64.h"     /* the vq1 routed experts: 16-dim vector codes at ~1.3 bits (experts-vq1g64/) */
+#include "gguf.h"         /* SNAP = a tools/gguf_import.py directory: llama.cpp's qwen4exp GGUF, read in place */
 #include <pthread.h>   /* q38_ehit_mark publishes the lazy HITS table under a lock */
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h" /* COLI_VULKAN=1: the int8 trunk on a Vulkan device */
@@ -60,8 +71,38 @@ typedef enum {
     Q38_WEIGHT_F32,
     Q38_WEIGHT_BF16,
     Q38_WEIGHT_FP8,
-    Q38_WEIGHT_INT4G64             /* routed experts from the experts-int4g64/ sidecar */
+    Q38_WEIGHT_INT4G64,            /* routed experts from the experts-int4g64/ sidecar */
+    Q38_WEIGHT_GGML,               /* GGUF mode: rows of ggml blocks of gq_type, as the file stores them */
+    Q38_WEIGHT_INT2G32,            /* routed experts from the experts-int2g32/ sidecar: data codes, x2q group scales, scales row scales */
+    Q38_WEIGHT_LOWBIT16,           /* routed experts from experts-int2g16/ or -int3g16/ (lowbit_g16.h): as INT2G32, lbits bits, 4-bit scales per 16 */
+    Q38_WEIGHT_VQ2,                /* routed experts from experts-vq2g32/ (vq2_g32.h): data codes, x2q 4-bit scales per 32, scales row scales, vqb the codebooks */
+    Q38_WEIGHT_VQ1                 /* routed experts from experts-vq1g64/ (vq1_g64.h): as VQ2 with 10-bit indices of 16-vectors, scales per 64, vq1b the codebooks */
 } Q38WeightKind;
+
+/* GGUF mode (SNAP holds gguf.json, written by tools/gguf_import.py). llama.cpp's
+ * conversion of the same checkpoint changes what the forward pass reads, and each
+ * change is taken as the file stores it, measured tensor by tensor on the tiny model
+ * (its F32 GGUF against its safetensors):
+ *  - every RMSNorm weight but the DeltaNet's is stored as 1 + w: the loader takes the
+ *    1 off (exact in f32 for a bf16 w);
+ *  - A_log is stored as A = -exp(A_log) (g_q38_a_direct);
+ *  - the DeltaNet's value heads are "tiled": value head h reads key head h % kheads,
+ *    not h / rep (g_q38_dn_tiled), in qkv, z, a, b, the convolution, dt_bias, A and
+ *    out_proj's columns alike; undoing it would mean permuting columns inside
+ *    quantized blocks, which is not lossless;
+ *  - the indexer's q and k projections are two tensors (rows concatenated here), the
+ *    experts one 3D tensor per projection, the PLE table one tensor
+ *    (per_layer_token_embd) and its hash constants metadata.
+ * The MTP head is llama.cpp's nextn layer, blk.<layers>: in the model's GGUF when its
+ * converter kept it there, or in a GGUF of its own (unsloth's mtp-*.gguf, named by
+ * gguf.json "mtp", g_q38gg_mtp). A tensor is looked up in the model's file first, so a
+ * self-contained head's own copies of token_embd and output stay unread: the head
+ * drafts through the model's embedding and lm_head, as the checkpoint's does. Its
+ * fc_embedding and fc_hidden are the two column halves of nextn.eh_proj, its norms
+ * (enorm, hnorm, hc_head_norm) stored as 1 + w like the model's. */
+static gguf_ctx g_q38gg, g_q38gg_mtp;
+static int g_q38_gguf, g_q38_a_direct, g_q38_dn_tiled;
+static int g_q38_gg_mtp_layer=-1;   /* blk.<this> is the head, once q38_mtp_attach found it */
 
 /* int4-g64 rows: ceil(cols/2) bytes of codes and one f32 scale per 64 inputs */
 static inline int64_t q38_int4_row_bytes(int cols){ return ((int64_t)cols+1)/2; }
@@ -75,11 +116,21 @@ typedef struct {
     Q38WeightKind kind;
     unsigned owns_data:1, owns_scales:1;
     int gpu;                       /* 0 = CPU; else 1 + tier handle of an int8 copy resident in VRAM (decode, S == 1) */
+    uint8_t *q4; float *q4sc;      /* Q38_TRUNK_CPU_INT4: the trunk's rows as planar int4-g64 (expert_ffn.h), one scale per 64 */
+    double *act2; int64_t act_n;   /* Q38_TRUNK_STATS: sum of x^2 per input column over the rows this matrix met */
     int8_t *q8; float *q8sc;       /* the trunk's int8 rows on the CPU (default; Q38_TRUNK_CPU_INT8=0 keeps BF16): the same rows the GPU holds, met by an int8 activation in idot.h */
+    int q8r16;                     /* q8 interleaved by 16 (idot.h i8r16_pack, q38_trunk_q8_interleave): CPU only, the same bits */
     void *vk; int vk_off;          /* COLI_VULKAN=1: device copy of q8, or of the BF16/F32 rows (uploaded at the first matmul), vk_off = upload failed, stays on the CPU */
     int vk_res;                    /* COLI_VULKAN=1: a resident matrix (q38_load_weight), never an expert slot that is refilled in place */
     char *vk_name;                 /* COLI_VULKAN=1: its tensor's name, to read it back from disk (q38_dho_reload) */
     int vk_fmt, vk_gone;           /* dense weights on the device only (COLI_VK_DENSE_HOST): the device copy's format, and 1 while no host copy is kept */
+    int gq_type;                   /* Q38_WEIGHT_GGML: the ggml type of the rows */
+    const uint8_t *x2q;            /* Q38_WEIGHT_INT2G32: u8 scale per row and 32 inputs; LOWBIT16: two 4-bit ones per byte (borrowed, like data) */
+    int lbits;                     /* Q38_WEIGHT_LOWBIT16: 2 or 3 */
+    int r16;                       /* Q38_WEIGHT_LOWBIT16 / VQ2: data holds the rows interleaved by 16 (lowbit_g16.h xl16_*, vq2_g32.h vq2r16_*), codes, scales and row scales together; x2q/scales unset */
+    const Vq2Books *vqb;           /* Q38_WEIGHT_VQ2: the sidecar's codebooks (borrowed) */
+    const Vq1Books *vq1b;          /* Q38_WEIGHT_VQ1: the sidecar's codebooks (borrowed) */
+    void *cc;                      /* COLI_CUDA_CHAIN: the chain's own device copy of a matrix the tier did not place (qwen38_cuda_chain.h) */
 } Q38Weight;
 
 typedef struct { float *norm; Q38Weight down, up, inject; } GatedResidual;
@@ -100,6 +151,9 @@ typedef enum {
     Q38_TM_QSA_ATTENTION,
     Q38_TM_PLE,
     Q38_TM_LM_HEAD,
+    Q38_TM_DN_RECUR,               /* inside deltanet: conv, recurrence, gated norm (no weights) */
+    Q38_TM_DN_SNAP,                /* inside deltanet: a verify's per-row state copies */
+    Q38_TM_LM_DRAFT,               /* the MTP head's lm-head (its drafts), apart from lm-head */
     Q38_TM_COUNT
 } Q38Timer;
 
@@ -132,6 +186,7 @@ typedef struct {
     int64_t fp8_slab_bytes;
     void *int4_slab;               /* one experts-int4g64/ record: codes, then scales */
     int64_t int4_slab_bytes;
+    int8_t *t8; float *t8s;        /* GGUF mode, for the Vulkan tier: the expert as int8-g32 (fmt 13), only while the tier reads it */
 } Slot;
 typedef struct { Slot *slots; int *by_expert, n, cap; } LCache;
 
@@ -149,6 +204,12 @@ typedef struct {
     int64_t *off;                  /* [layer*experts + expert] where the record starts */
     int64_t code_bytes[3], scale_count[3];   /* gate, up, down */
     int64_t scale_off, record_bytes;
+    const struct Q38Lowbit *lb;    /* NULL: experts-int4g64/; else the low-bit format of the sidecar */
+    Vq2Books *vqb;                 /* lb->vq == 1: the codebooks index.json carries */
+    Vq1Books *vq1b;                /* lb->vq == 2 */
+    int bits;                      /* 4: experts-int4g64/; 2: experts-int2g32/, whose record holds
+                                    * the u8 group scales at q_off and one f32 per row at scale_off */
+    int64_t q_off, q_bytes[3];
 } Q38Int4Experts;
 
 typedef enum {
@@ -181,6 +242,7 @@ typedef struct {
     shards S;
     char prefix[32];
     Q38Weight embed, lm_head;
+    uint8_t *draft_codes; float *draft_sc;   /* Q38_DRAFT_HEAD=int4: lm_head as planar int4-g64 for the MTP drafts only */
     GatedResidual final_gr;
     Layer *L;
     LCache *cache;
@@ -202,6 +264,7 @@ typedef struct {
     st_tensor *ple_parts[Q38_MAX_PLE_PARTS];
     char ple_part_names[Q38_MAX_PLE_PARTS][320];
     int64_t ple_part_start[Q38_MAX_PLE_PARTS + 1];
+    const gguf_tensor *ple_gg;      /* GGUF mode: per_layer_token_embd, the whole table */
     int ple_part_count;
     float ple_weight_scale;
     int64_t ple_multipliers[3], ple_head_vocab[64], ple_head_offset[64];
@@ -235,12 +298,16 @@ typedef struct {
      * a verify that stood: up to Q38_SPEC_ROWS, every one but the last with
      * its next token in mtp_pend_tok). */
     int mtp, mtp_wiring;
+    int mtp_drafts;                   /* drafts per verify when Q38_MTP_DRAFTS is unset */
+    size_t mtp_expert_bytes;          /* one routed expert of the head, gate, up and down (0 when fused) */
     char mtp_prefix[32];
     float *mtp_norm_emb, *mtp_norm_hid;
     Q38Weight mtp_fc_emb, mtp_fc_hid;
     GatedResidual mtp_mixer;
     int mtp_len, mtp_pend_n, mtp_pend_tok[Q38_SPEC_ROWS];
     float *mtp_pend;                  /* Q38_SPEC_ROWS rows of hc_width */
+    DraftVocab *draft_vocab;          /* the tokens the head scores for a draft; NULL = the whole vocabulary */
+    float mtp_p;                      /* the last draft's probability under the head (q38_draft_p) */
     /* A verify forward copies the DeltaNet and PLE state as it stands after
      * each of its first snap_rows rows, row r into slot r (0 = no copy), so a
      * draft rejected after row r+1 rolls back by swapping slot r in instead
@@ -257,6 +324,9 @@ typedef struct {
 #ifdef COLI_VULKAN
     void *vkchain;                 /* the dense chain's device state (qwen38_chain.h), NULL until it runs */
     void *vkchain2;                /* its layers on COLI_VK_DEV2's device, after the primary's (qwen38_chain.h) */
+#endif
+#ifdef COLI_CUDA
+    void *cchain;                  /* the CUDA dense chain's device state (qwen38_cuda_chain.h), NULL until it runs */
 #endif
 } Model;
 
@@ -324,6 +394,7 @@ static void q38_weight_free(Q38Weight *weight) {
     if(weight->owns_data)free(weight->data);
     if(weight->owns_scales)free(weight->scales);
     free(weight->q8); free(weight->q8sc);
+    free(weight->q4); free(weight->q4sc); free(weight->act2);
 #ifdef COLI_VULKAN
     if(weight->vk)coli_vk_tensor_free((ColiVkTensor*)weight->vk);
     free(weight->vk_name);
@@ -360,9 +431,19 @@ static void q38_weight_reserve(Q38Weight *weight,Q38WeightKind kind,int rows,int
 }
 
 static uint64_t q38_weight_bytes(const Q38Weight *weight) {
+    if(weight->kind==Q38_WEIGHT_GGML)
+        return (uint64_t)weight->rows*(uint64_t)gq_row_bytes(weight->gq_type,weight->cols);
     if(weight->kind==Q38_WEIGHT_INT4G64)
         return (uint64_t)weight->rows*(uint64_t)q38_int4_row_bytes(weight->cols)+
                (uint64_t)weight->scale_count*sizeof(float);
+    if(weight->kind==Q38_WEIGHT_INT2G32)
+        return (uint64_t)weight->rows*(x2_code_bytes(weight->cols)+(uint64_t)x2_groups(weight->cols)+sizeof(float));
+    if(weight->kind==Q38_WEIGHT_LOWBIT16)
+        return (uint64_t)weight->rows*(xl_code_bytes(weight->lbits,weight->cols)+xl_scale_bytes(weight->cols)+sizeof(float));
+    if(weight->kind==Q38_WEIGHT_VQ2)
+        return (uint64_t)weight->rows*(vq2_code_bytes(weight->cols)+vq2_scale_bytes(weight->cols)+sizeof(float));
+    if(weight->kind==Q38_WEIGHT_VQ1)
+        return (uint64_t)weight->rows*(vq1_code_bytes(weight->cols)+vq1_scale_bytes(weight->cols)+sizeof(float));
     uint64_t element_size=weight->kind==Q38_WEIGHT_F32?sizeof(float):
                           weight->kind==Q38_WEIGHT_BF16?sizeof(uint16_t):
                           weight->kind==Q38_WEIGHT_FP8?sizeof(uint8_t):0;
@@ -373,16 +454,49 @@ static uint64_t q38_weight_bytes(const Q38Weight *weight) {
 /* Native BF16 storage with FP32 activations and accumulation.  This deliberately
  * does not round activations to BF16 or use BF16 dot-product instructions: it is
  * the storage-equivalent form of the existing st_read_f32 reference. */
+/* BF16 rows (the small trunk matrices kept in BF16: DeltaNet's gates, the PLE
+ * projections, the MTP head's): eight lanes a row, lane l summing elements l, l+8, ...
+ * with fma in order, then the lanes added as xf_hsum8; a row's weights widened to f32
+ * once for up to four activation rows. Each row's result is the same whatever S is.
+ * The scalar loop this replaces summed one element at a time on one lane. */
+#if defined(__AVX2__)&&defined(__FMA__)
+static inline __attribute__((always_inline)) void q38_bf16_rows(float *y,int ys,const uint16_t *w,const float *x,int I,const int S) {
+    __m256 acc[4];
+    for(int s=0;s<S;s++)acc[s]=_mm256_setzero_ps();
+    int i=0;
+    for(;i+8<=I;i+=8){
+        const __m256 wf=_mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*)(w+i))),16));
+        for(int s=0;s<S;s++)acc[s]=_mm256_fmadd_ps(wf,_mm256_loadu_ps(x+(int64_t)s*I+i),acc[s]);
+    }
+    for(int s=0;s<S;s++){
+        float a=xf_hsum8(acc[s]);
+        for(int k=i;k<I;k++)a=fmaf(x[(int64_t)s*I+k],bf16_to_f32(w[k]),a);
+        y[(int64_t)s*ys]=a;
+    }
+}
+#endif
 static void q38_matmul_bf16(float *y,const float *x,const uint16_t *W,
                             int S,int I,int O) {
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){
         const uint16_t *w=W+(int64_t)o*I;
+#if defined(__AVX2__)&&defined(__FMA__)
+        for(int s0=0;s0<S;s0+=4){
+            const int n=S-s0<4?S-s0:4;float *yo=y+(int64_t)s0*O+o;const float *xs=x+(int64_t)s0*I;
+            switch(n){
+            case 1:q38_bf16_rows(yo,O,w,xs,I,1);break;
+            case 2:q38_bf16_rows(yo,O,w,xs,I,2);break;
+            case 3:q38_bf16_rows(yo,O,w,xs,I,3);break;
+            default:q38_bf16_rows(yo,O,w,xs,I,4);break;
+            }
+        }
+#else
         for(int s=0;s<S;s++){
             const float *xs=x+(int64_t)s*I;float a=0.f;
             for(int i=0;i<I;i++)a+=xs[i]*bf16_to_f32(w[i]);
             y[(int64_t)s*O+o]=a;
         }
+#endif
     }
 }
 
@@ -466,22 +580,25 @@ static void q38_matmul_int4g64(float *y,const float *x,const uint8_t *codes,
                                const float *scales,int S,int I,int O) {
     int64_t row_bytes=q38_int4_row_bytes(I),groups=q38_int4_groups(I);
     int body=I/XF_BLOCK*XF_BLOCK;
+    const float **xs_rows=(const float**)malloc((size_t)(S>0?S:1)*sizeof(float*));
+    if(!xs_rows){fprintf(stderr,"OOM int4 rows\n");exit(1);}
+    for(int s=0;s<S;s++)xs_rows[s]=x+(int64_t)s*I;
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){
         const uint8_t *w=codes+(int64_t)o*row_bytes;
         const float *sc=scales+(int64_t)o*groups;
-        for(int s=0;s<S;s++){
-            const float *xs=x+(int64_t)s*I;
-            float a=body?xf_dot_f32(w,sc,xs,body):0.f;
-            if(body<I){
-                float tail=0.f;
-                for(int i=body;i<I;i++)
-                    tail+=(float)((int)((w[i>>1]>>((i&1)*4))&15)-8)*xs[i];
-                a=fmaf(tail,sc[groups-1],a);
-            }
-            y[(int64_t)s*O+o]=a;
+        /* every row at once: the nibbles widened once, each row's bits xf_dot_f32's */
+        if(body)xf_dot_f32_rows(y+o,O,w,sc,xs_rows,body,S);
+        else for(int s=0;s<S;s++)y[(int64_t)s*O+o]=0.f;
+        if(body<I)for(int s=0;s<S;s++){
+            const float *xs=xs_rows[s];
+            float tail=0.f;
+            for(int i=body;i<I;i++)
+                tail+=(float)((int)((w[i>>1]>>((i&1)*4))&15)-8)*xs[i];
+            y[(int64_t)s*O+o]=fmaf(tail,sc[groups-1],y[(int64_t)s*O+o]);
         }
     }
+    free(xs_rows);
 }
 
 #ifdef COLI_VULKAN
@@ -498,15 +615,27 @@ static void q38_matmul_int4g64(float *y,const float *x,const uint8_t *codes,
  * on the CPU in every format. The device copy lives in weight->vk from the
  * first call; a failed upload sets vk_off and the matrix stays on the CPU.
  * The backend has one command buffer: never from a parallel region. */
+/* A GGUF's matrix of ggml blocks the device reads as the file has them (blockdec.glsl):
+ * only the dense chain does (qwen38_chain.h); the per-matrix dense path and the host-copy
+ * drop leave it on the CPU, which also runs the prompts' longer chunks. */
+static int q38_vk_blocks(const Q38Weight *w) {
+    if(w->kind!=Q38_WEIGHT_GGML)return 0;
+    const int base=gq_r16_base(w->gq_type),t=base>=0?base:w->gq_type,be=coli_vk_block_elems(100+t);
+    return be>0&&w->cols%be==0;
+}
 static int q38_vk_eligible(const Q38Weight *w) {
     return w->q8 || w->vk_gone || (w->vk_res && w->data &&
-                     (w->kind==Q38_WEIGHT_BF16 || w->kind==Q38_WEIGHT_F32));
+                     (w->kind==Q38_WEIGHT_BF16 || w->kind==Q38_WEIGHT_F32 || q38_vk_blocks(w)));
 }
-/* The format of the weight's device copy: the int8 rows, else the rows as loaded; with
- * the host copy dropped (vk_gone), the one it was uploaded in. */
+/* The format of the weight's device copy: the int8 rows, else the rows as loaded (a
+ * GGUF's blocks: 100 + their ggml type); with the host copy dropped (vk_gone), the one it
+ * was uploaded in. */
 static int q38_vk_fmt(const Q38Weight *w) {
+    if(!w->vk_gone&&!w->q8&&w->kind==Q38_WEIGHT_GGML){const int b=gq_r16_base(w->gq_type);return 100+(b>=0?b:w->gq_type);}
     return w->vk_gone?w->vk_fmt:w->q8?1:w->kind==Q38_WEIGHT_BF16?11:10;
 }
+/* eligible for the per-matrix dense path (q38_vk_matmul) and the host-copy drop */
+static int q38_vk_dense_ok(const Q38Weight *w) { return q38_vk_eligible(w)&&!q38_vk_blocks(w); }
 static unsigned g_q38_vk_placed[3];   /* uploads by format: int8 rows, bf16, f32 */
 /* A partial dense chain (qwen38_chain.h, q38c_start): the first N layers' matrices are on
  * the device, the other layers and the head stay on the CPU, so nothing that is not on
@@ -526,8 +655,16 @@ static ColiVkTensor *q38_vk_tensor(const Q38Weight *weight) {
     int fmt=q38_vk_fmt(w);
     const void *wq=w->q8?(const void*)w->q8:(const void*)w->data;
     const float *sc=w->q8?w->q8sc:NULL;   /* fmt 10/11: no scales */
-    if(!(g_q38_vk_dev?coli_vk_tensor_ensure2(t,wq,sc,fmt,w->cols,w->rows,0)
-                     :coli_vk_tensor_ensure(t,wq,sc,fmt,w->cols,w->rows,0))){w->vk_off=1;return NULL;}
+    uint8_t *rows=NULL;   /* a GGUF's rows interleaved by 16 for the CPU: the file's rows back */
+    if(fmt>=100&&gq_r16_base(w->gq_type)>=0){
+        if(!(rows=(uint8_t*)malloc((size_t)gq_row_bytes(fmt-100,w->cols)*w->rows))){w->vk_off=1;return NULL;}
+        gq_r16_unpack(w->gq_type,rows,(const uint8_t*)w->data,w->rows,w->cols);
+        wq=rows;
+    }
+    int ok=g_q38_vk_dev?coli_vk_tensor_ensure2(t,wq,sc,fmt,w->cols,w->rows,0)
+                       :coli_vk_tensor_ensure(t,wq,sc,fmt,w->cols,w->rows,0);
+    free(rows);
+    if(!ok){w->vk_off=1;return NULL;}
     g_q38_vk_placed[fmt==1?0:fmt==11?1:2]++;
     return *t;
 }
@@ -535,7 +672,7 @@ static int q38_vk_matmul(float *y,const float *x,const Q38Weight *weight,int S,i
 #ifdef _OPENMP
     if(omp_in_parallel())return 0;
 #endif
-    if(weight->vk_off||S<1||S>65535)return 0;
+    if(weight->vk_off||S<1||S>65535||!q38_vk_dense_ok(weight))return 0;
     Q38Weight *w=(Q38Weight*)weight;
     int fmt=q38_vk_fmt(w);
     const void *wq=w->q8?(const void*)w->q8:(const void*)w->data;
@@ -555,6 +692,22 @@ static void q38_vk_report(void) {
             g_q38_vk_placed[0],g_q38_vk_placed[1],g_q38_vk_placed[2]);
 }
 #endif
+#ifdef XF16_ON
+/* rows [r0,r1) (whole groups) of an int4-g64 matrix held in xf16 groups, for n activation
+ * rows of ga (gq_act: the codes, scales per 32 and sums per 16 xf16_rows takes): y[a*ys + o] */
+static void q38_xf16_rows(float *y,int ys,const Q38Weight *w,const gq_act *ga,int r0,int r1,int n) {
+    const int I=w->cols;const size_t gb=xf16_group_bytes(I);
+    for(int a0=0;a0<n;a0+=64){
+        const int k=n-a0<64?n-a0:64;
+        float *yp[64];const int8_t *xp[64];const float *dp[64];const int32_t *sp[64];
+        for(int a=0;a<k;a++){
+            const int64_t r=a0+a;
+            yp[a]=y+r*ys;xp[a]=ga->q+r*I;dp[a]=ga->d+r*(I/32);sp[a]=ga->s+r*(I/16);
+        }
+        for(int o=r0;o<r1;o+=16)xf16_rows(yp,o,(const uint8_t*)w->data+(size_t)(o/16)*gb,xp,dp,sp,I,k);
+    }
+}
+#endif
 static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
                               int S,int I,int O) {
     /* Every CPU kernel below computes a row the same way whatever S is, so an
@@ -565,10 +718,32 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
     if(S>1&&g_q38_rowwise&&weight&&
        (weight->gpu
 #ifdef COLI_VULKAN
-        ||(g_vk_ready&&g_vk_dense&&q38_vk_eligible(weight)&&(weight->vk||!g_q38_vk_noup))
+        ||(g_vk_ready&&g_vk_dense&&q38_vk_dense_ok(weight)&&(weight->vk||!g_q38_vk_noup))
 #endif
        )){
         for(int s=0;s<S;s++)q38_weight_matmul(y+(int64_t)s*O,x+(int64_t)s*I,weight,1,I,O);
+        return;
+    }
+    if(weight&&weight->act2&&weight->cols==I){   /* Q38_TRUNK_STATS: what this matrix reads */
+        Q38Weight *wm=(Q38Weight*)weight;
+        for(int s=0;s<S;s++){const float *xs=x+(int64_t)s*I;for(int i=0;i<I;i++)wm->act2[i]+=(double)xs[i]*xs[i];}
+        wm->act_n+=S;
+    }
+    if(weight&&weight->q4&&weight->rows==O&&weight->cols==I){
+        /* Q38_TRUNK_CPU_INT4: int8 activations per row (as the int8 trunk), planar int4-g64
+         * rows through expert_ffn.h's integer dot; a row's result does not depend on S */
+        const int ng=xf_groups(I);const size_t rb=xf_row_bytes(I);
+        int8_t *xq=(int8_t*)malloc((size_t)S*I);float *xsum=(float*)malloc((size_t)S*ng*sizeof(float));
+        float *sx=(float*)malloc((size_t)S*sizeof(float));
+        if(!xq||!xsum||!sx){fprintf(stderr,"OOM int4 trunk activation\n");exit(1);}
+        for(int s=0;s<S;s++)sx[s]=xf_act_i8(x+(int64_t)s*I,I,xq+(int64_t)s*I,xsum+(int64_t)s*ng);
+        double started=now_s();
+        #pragma omp parallel for schedule(static)
+        for(int o=0;o<O;o++)for(int s0=0;s0<S;s0+=XF_MAX_ROWS)   /* each row's nibbles split once for every s */
+            xf_dot_i8_rows(y+(int64_t)s0*O+o,O,weight->q4+(size_t)o*rb,weight->q4sc+(size_t)o*ng,xq+(int64_t)s0*I,
+                           xsum+(int64_t)s0*ng,sx+s0,I,S-s0<XF_MAX_ROWS?S-s0:XF_MAX_ROWS);
+        (void)started;
+        free(xq);free(xsum);free(sx);
         return;
     }
     /* A matrix the tier placed in VRAM (q38_trunk_place) answers a decode
@@ -577,7 +752,7 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
     if(S==1&&weight&&weight->gpu&&weight->rows==O&&weight->cols==I&&
        qt_dense_matmul(weight->gpu-1,y,x,I,O))return;
 #ifdef COLI_VULKAN
-    if(g_vk_ready&&g_vk_dense&&weight&&weight->rows==O&&weight->cols==I&&q38_vk_eligible(weight)&&
+    if(g_vk_ready&&g_vk_dense&&weight&&weight->rows==O&&weight->cols==I&&q38_vk_dense_ok(weight)&&
        q38_vk_matmul(y,x,weight,S,I,O))return;
     /* the CPU needs a matrix the device holds alone (a lost device): read it back */
     if(weight&&weight->vk_gone)q38_dho_reload((Q38Weight*)weight);
@@ -591,6 +766,17 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
         int8_t *xq=(int8_t*)malloc((size_t)S*I); float *sx=(float*)malloc((size_t)S*sizeof(float));
         if(!xq||!sx){fprintf(stderr,"OOM activation quantization\n");exit(1);}
         for(int s=0;s<S;s++)sx[s]=dense_act_i8(x+(int64_t)s*I,I,xq+(int64_t)s*I,NULL);
+#ifdef IDOT_R16
+        if(weight->q8r16){   /* interleaved rows: 128 * each activation row's sum comes off */
+            int32_t xsum[64],*xs=S<=64?xsum:(int32_t*)malloc((size_t)S*sizeof(int32_t));
+            if(!xs){fprintf(stderr,"OOM activation quantization\n");exit(1);}
+            for(int s=0;s<S;s++){int32_t t=0;const int8_t *r=xq+(int64_t)s*I;for(int i=0;i<I;i++)t+=r[i];xs[s]=t;}
+            matmul_q_idot_r16(y,xq,sx,xs,weight->q8,weight->q8sc,S,I,O);
+            if(xs!=xsum)free(xs);
+            free(xq);free(sx);
+            return;
+        }
+#endif
         matmul_q_idot(y,xq,sx,weight->q8,weight->q8sc,S,I,O);
         free(xq);free(sx);
         return;
@@ -606,8 +792,64 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
         q38_matmul_bf16(y,x,(const uint16_t*)weight->data,S,I,O);
     else if(weight->kind==Q38_WEIGHT_FP8&&weight->scales)
         q38_matmul_fp8(y,x,(const uint8_t*)weight->data,weight->scales,S,I,O);
+#ifdef XF16_ON
+    else if(weight->kind==Q38_WEIGHT_INT4G64&&weight->r16){   /* xf16 groups: int8 activations per 32 */
+        gq_act a; memset(&a,0,sizeof a);
+        if(gq_act_set(&a,x,S,I)){fprintf(stderr,"OOM int4 activation\n");exit(1);}
+        #pragma omp parallel for schedule(static)
+        for(int g=0;g<O/16;g++)q38_xf16_rows(y,O,weight,&a,16*g,16*g+16,S);
+        gq_act_free(&a);
+    }
+#endif
     else if(weight->kind==Q38_WEIGHT_INT4G64&&weight->scales)
         q38_matmul_int4g64(y,x,(const uint8_t*)weight->data,weight->scales,S,I,O);
+    else if(weight->kind==Q38_WEIGHT_INT2G32&&weight->scales&&weight->x2q){
+        /* int2_g32.h: int8 activations per 32 (the GGUF path's contract), exact integer
+         * dots per group, one fma per group; the same bits for a row whatever S is */
+        if(x2_matmul(y,x,(const uint8_t*)weight->data,weight->x2q,weight->scales,S,I,O)){
+            fprintf(stderr,"OOM int2-g32 activation\n");exit(1);
+        }
+    }
+#ifdef XL16_ON
+    else if(weight->kind==Q38_WEIGHT_LOWBIT16&&weight->r16){   /* gq_act: the same bytes and scales as x2_quant_act, plus the sums per 16 */
+        gq_act a; memset(&a,0,sizeof a);
+        if(gq_act_set(&a,x,S,I)){fprintf(stderr,"OOM low-bit activation\n");exit(1);}
+        const size_t gb=xl16_group_bytes(weight->lbits,I);
+        #pragma omp parallel for schedule(static)
+        for(int g=0;g<O/16;g++)xl16_rows(y+16*g,O,(const uint8_t*)weight->data+(size_t)g*gb,a.q,a.d,a.s,I,S,weight->lbits);
+        gq_act_free(&a);
+    }
+#endif
+#ifdef VQ2R16_ON
+    else if(weight->kind==Q38_WEIGHT_VQ2&&weight->r16&&weight->vqb){
+        gq_act a; memset(&a,0,sizeof a);
+        if(gq_act_set(&a,x,S,I)){fprintf(stderr,"OOM vq2 activation\n");exit(1);}
+        const size_t gb=vq2r16_group_bytes(I);
+        #pragma omp parallel for schedule(static)
+        for(int g=0;g<O/16;g++)vq2r16_rows(y+16*g,O,weight->vqb,(const uint8_t*)weight->data+(size_t)g*gb,a.q,a.d,a.s,I,S);
+        gq_act_free(&a);
+    }
+#endif
+    else if(weight->kind==Q38_WEIGHT_LOWBIT16&&weight->scales&&weight->x2q){
+        if(xl_matmul(y,x,(const uint8_t*)weight->data,weight->x2q,weight->scales,weight->lbits,S,I,O)){
+            fprintf(stderr,"OOM low-bit activation\n");exit(1);
+        }
+    }
+    else if(weight->kind==Q38_WEIGHT_VQ2&&weight->scales&&weight->x2q&&weight->vqb){
+        if(vq2_matmul(y,x,weight->vqb,(const uint8_t*)weight->data,weight->x2q,weight->scales,S,I,O)){
+            fprintf(stderr,"OOM vq2 activation\n");exit(1);
+        }
+    }
+    else if(weight->kind==Q38_WEIGHT_VQ1&&weight->scales&&weight->x2q&&weight->vq1b){
+        if(vq1_matmul(y,x,weight->vq1b,(const uint8_t*)weight->data,weight->x2q,weight->scales,S,I,O)){
+            fprintf(stderr,"OOM vq1 activation\n");exit(1);
+        }
+    }
+    else if(weight->kind==Q38_WEIGHT_GGML){
+        if(gq_matmul(y,x,(const uint8_t*)weight->data,weight->gq_type,S,I,O)){
+            fprintf(stderr,"qwen38: GGUF matrix of type %s is not supported\n",gq_type_name(weight->gq_type));exit(1);
+        }
+    }
     else {fprintf(stderr,"unsupported matmul weight kind %d\n",(int)weight->kind);exit(1);}
 }
 
@@ -621,6 +863,15 @@ static void q38_weight_row(const Q38Weight *weight,int row,float *out) {
     else if(weight->kind==Q38_WEIGHT_BF16){
         const uint16_t *src=(const uint16_t*)weight->data+(int64_t)row*weight->cols;
         for(int i=0;i<weight->cols;i++)out[i]=bf16_to_f32(src[i]);
+    } else if(weight->kind==Q38_WEIGHT_GGML){
+        int64_t rb=gq_row_bytes(weight->gq_type,weight->cols);
+        if(gq_r16_base(weight->gq_type)>=0){
+            if(gq_r16_dequant_row(weight->gq_type,(const uint8_t*)weight->data,row,out,weight->cols)){
+                fprintf(stderr,"qwen38: GGUF row of type %s is not supported\n",gq_type_name(weight->gq_type));exit(1);
+            }
+        } else if(rb<0||gq_dequant_row(weight->gq_type,(const uint8_t*)weight->data+(int64_t)row*rb,out,weight->cols)){
+            fprintf(stderr,"qwen38: GGUF row of type %s is not supported\n",gq_type_name(weight->gq_type));exit(1);
+        }
     } else {fprintf(stderr,"weight kind %d has no dense row view\n",(int)weight->kind);exit(1);}
 }
 
@@ -655,8 +906,15 @@ static void q38_rmsg(float *out,const float *x,const float *gate,const float *w,
 
 static void q38_rope(float *x, int dim, int rotary_dim, int pos, float theta) {
     int half=rotary_dim/2;
+    /* theta^(2i/rotary_dim), the same powf, kept per thread for the last base: the
+     * indexer ropes every context block of every layer each forward */
+    static __thread float base_theta, base[256]; static __thread int base_rd;
+    if((base_theta!=theta||base_rd!=rotary_dim)&&half<=256){
+        for(int i=0;i<half;i++)base[i]=powf(theta,(float)(2*i)/rotary_dim);
+        base_theta=theta;base_rd=rotary_dim;
+    }
     for(int i=0;i<half;i++) {
-        float ang=(float)pos/powf(theta,(float)(2*i)/rotary_dim);
+        float ang=(float)pos/(half<=256?base[i]:powf(theta,(float)(2*i)/rotary_dim));
         float co=cosf(ang), si=sinf(ang), a=x[i], b=x[i+half];
         x[i]=a*co-b*si; x[i+half]=b*co+a*si;
     }
@@ -929,7 +1187,221 @@ static void q38_validate_cfg(const Cfg *c) {
     Q38_NEED(c->ple_layer>=0&&c->ple_layer<c->layers,"PLE layer=%d",c->ple_layer);
 }
 
+/* GGUF mode: the GGUF layer of a checkpoint layer name, *off where its suffix starts:
+ * model.layers.N. is blk.N, the MTP head's mtp.layers.0. is blk.<layers>; -1 otherwise. */
+static int q38_gg_layer(const char *hf,int *off) {
+    int L=-1,n=0;
+    if(sscanf(hf,"model.layers.%d.%n",&L,&n)==1&&L>=0&&n){*off=n;return L;}
+    if(g_q38_gg_mtp_layer>=0&&!strncmp(hf,"mtp.layers.0.",13)){*off=13;return g_q38_gg_mtp_layer;}
+    return -1;
+}
+
+/* GGUF mode: the tensor a checkpoint name is in the file, by llama.cpp's qwen4exp names;
+ * *norm: a norm the file stores as 1 + w. The routed experts and the indexer's fused
+ * projection have loaders of their own. */
+static const char *q38_gg_name(const char *hf,char *out,size_t cap,int *norm) {
+    static const struct { const char *hf,*gg; int norm; } top[]={
+        {"model.embed_tokens.weight","token_embd.weight",0},
+        {"lm_head.weight","output.weight",0},
+        {"model.hyper_connection_mixer.hc_norm.weight","output_hc_norm.weight",1},
+        {"model.hyper_connection_mixer.input_mix_weight_down.weight","output_hc_down.weight",0},
+        {"model.hyper_connection_mixer.input_mix_weight_up.weight","output_hc_up.weight",0},
+    };
+    static const struct { const char *hf,*gg; int norm; } lay[]={
+        {"attn_hyper_connection.block_inject_weight.weight","hc_attn_inject.weight",0},
+        {"attn_hyper_connection.hc_norm.weight","hc_attn_norm.weight",1},
+        {"attn_hyper_connection.input_mix_weight_down.weight","hc_attn_down.weight",0},
+        {"attn_hyper_connection.input_mix_weight_up.weight","hc_attn_up.weight",0},
+        {"mlp_hyper_connection.block_inject_weight.weight","hc_ffn_inject.weight",0},
+        {"mlp_hyper_connection.hc_norm.weight","hc_ffn_norm.weight",1},
+        {"mlp_hyper_connection.input_mix_weight_down.weight","hc_ffn_down.weight",0},
+        {"mlp_hyper_connection.input_mix_weight_up.weight","hc_ffn_up.weight",0},
+        {"linear_attn.A_log","ssm_a",0},
+        {"linear_attn.conv1d.weight","ssm_conv1d.weight",0},
+        {"linear_attn.dt_bias","ssm_dt.bias",0},
+        {"linear_attn.in_proj_a.weight","ssm_alpha.weight",0},
+        {"linear_attn.in_proj_b.weight","ssm_beta.weight",0},
+        {"linear_attn.in_proj_qkv.weight","attn_qkv.weight",0},
+        {"linear_attn.in_proj_z.weight","attn_gate.weight",0},
+        {"linear_attn.norm.weight","ssm_norm.weight",0},
+        {"linear_attn.out_proj.weight","ssm_out.weight",0},
+        {"mlp.gate.weight","ffn_gate_inp.weight",0},
+        {"mlp.shared_expert.gate_proj.weight","ffn_gate_shexp.weight",0},
+        {"mlp.shared_expert.up_proj.weight","ffn_up_shexp.weight",0},
+        {"mlp.shared_expert.down_proj.weight","ffn_down_shexp.weight",0},
+        {"mlp.shared_expert_gate.weight","ffn_gate_inp_shexp.weight",0},
+        {"ple.conv1d.weight","ple_conv1d.weight",0},
+        {"ple.key_proj.weight","ple_key.weight",0},
+        {"ple.value_proj.weight","ple_value.weight",0},
+        {"ple.norm_conv.weight","ple_norm_conv.weight",1},
+        {"ple.norm_key.weight","ple_norm_key.weight",1},
+        {"ple.norm_query.weight","ple_norm_query.weight",1},
+        {"self_attn.indexer.k_layernorm.weight","indexer.k_norm.weight",1},
+        {"self_attn.indexer.q_layernorm.weight","indexer.q_norm.weight",1},
+        {"self_attn.k_norm.weight","attn_k_norm.weight",1},
+        {"self_attn.q_norm.weight","attn_q_norm.weight",1},
+        {"self_attn.q_proj.weight","attn_q.weight",0},
+        {"self_attn.k_proj.weight","attn_k.weight",0},
+        {"self_attn.v_proj.weight","attn_v.weight",0},
+        {"self_attn.o_proj.weight","attn_output.weight",0},
+    };
+    static const struct { const char *hf,*gg; int norm; } head[]={   /* the MTP head, around its layer */
+        {"mtp.pre_fc_norm_embedding.weight","nextn.enorm.weight",1},
+        {"mtp.pre_fc_norm_hidden.weight","nextn.hnorm.weight",1},
+        {"mtp.hyper_connection_mixer.hc_norm.weight","nextn.hc_head_norm.weight",1},
+        {"mtp.hyper_connection_mixer.input_mix_weight_down.weight","nextn.hc_head_down.weight",0},
+        {"mtp.hyper_connection_mixer.input_mix_weight_up.weight","nextn.hc_head_up.weight",0},
+    };
+    *norm=0;
+    for(size_t i=0;i<sizeof top/sizeof *top;i++)
+        if(!strcmp(hf,top[i].hf)){*norm=top[i].norm;snprintf(out,cap,"%s",top[i].gg);return out;}
+    if(g_q38_gg_mtp_layer>=0)
+        for(size_t i=0;i<sizeof head/sizeof *head;i++)
+            if(!strcmp(hf,head[i].hf)){*norm=head[i].norm;snprintf(out,cap,"blk.%d.%s",g_q38_gg_mtp_layer,head[i].gg);return out;}
+    int off=0,L=q38_gg_layer(hf,&off);
+    if(L<0)return NULL;
+    if(!strcmp(hf+off,"ple.ple_embedding.ngram_embedding.weight")){snprintf(out,cap,"per_layer_token_embd.weight");return out;}
+    for(size_t i=0;i<sizeof lay/sizeof *lay;i++)
+        if(!strcmp(hf+off,lay[i].hf)){*norm=lay[i].norm;snprintf(out,cap,"blk.%d.%s",L,lay[i].gg);return out;}
+    return NULL;
+}
+/* the file a tensor was read from: the model's GGUF or the MTP head's */
+static const gguf_ctx *q38_gg_ctx_of(const gguf_tensor *t) {
+    if(g_q38gg_mtp.t&&t>=g_q38gg_mtp.t&&t<g_q38gg_mtp.t+g_q38gg_mtp.n_tensors)return &g_q38gg_mtp;
+    return &g_q38gg;
+}
+/* a GGUF name, marked used: the model's file first, then the MTP head's */
+static const gguf_tensor *q38_gg_find(const char *gg) {
+    const gguf_tensor *t=gguf_mark(&g_q38gg,gg);
+    if(!t&&g_q38gg_mtp.t)t=gguf_mark(&g_q38gg_mtp,gg);
+    return t;
+}
+static const gguf_tensor *q38_gg(const char *hf,int *norm) {
+    char nm[256]; int dummy; const char *g=q38_gg_name(hf,nm,sizeof nm,norm?norm:&dummy);
+    return g?q38_gg_find(g):NULL;
+}
+static int64_t q38_gg_numel(const gguf_tensor *t) { return t->ne[0]*t->ne[1]*t->ne[2]*t->ne[3]; }
+static void q38_gg_read(const gguf_tensor *t,void *dst,int64_t off,int64_t n) {
+    if(gguf_read(q38_gg_ctx_of(t),t,dst,off,n)){fprintf(stderr,"GGUF %s: read failed\n",t->name);exit(1);}
+}
+static void q38_gg_read_f32(const gguf_tensor *t,float *dst) {
+    if(gguf_read_f32(q38_gg_ctx_of(t),t,dst)){fprintf(stderr,"GGUF %s: read failed (type %s)\n",t->name,gq_type_name(t->type));exit(1);}
+}
+/* The type a matrix of a GGUF block type is held in for the CPU: its rows interleaved by 16
+ * (gq_r16_*, GQ_*_R16), the same bytes or a few percent more, on an AVX2 or AVX-512 build, when
+ * the type has that form and the matrix whole groups; else the file's rows. Q38_ILV16=0
+ * keeps the file's rows, as GQ_EXACT=1 does. */
+static int q38_gg_held_type(int type,int rows,int cols) {
+#ifdef GQ_R16_ON
+    static int on=-1;
+    if(on<0){const char *e=getenv("Q38_ILV16");on=!(e&&!strcmp(e,"0"))&&!gq_exact_mode();}
+    const int r=gq_r16_of(type);
+    if(on&&r>=0&&rows%16==0&&cols%GQ_TYPES[type].blck==0)return r;
+#else
+    (void)rows;(void)cols;
+#endif
+    return type;
+}
+/* A matrix [rows][cols] from the GGUF: f32/f16 as f32, bf16 as bf16, any other ggml
+ * type as its blocks (Q38_WEIGHT_GGML; with `held`, in q38_gg_held_type's form). `parts`
+ * tensors of the same type are stacked by rows (the indexer's q and k projections). */
+static Q38Weight q38_gg_weight_parts(Model *m,const gguf_tensor *const *parts,int n,int rows,int cols,int held) {
+    Q38Weight w={0}; int64_t have=0; int type=parts[0]->type;
+    for(int i=0;i<n;i++){
+        const gguf_tensor *t=parts[i];
+        if(t->type!=type||t->ne[0]!=cols||t->ne[2]*t->ne[3]!=1){
+            fprintf(stderr,"GGUF %s: [%lld x %lld] %s, expected rows of %d of %s\n",t->name,(long long)t->ne[1],
+                    (long long)t->ne[0],gq_type_name(t->type),cols,gq_type_name(type));exit(1);
+        }
+        have+=t->ne[1];
+    }
+    if(have!=rows){fprintf(stderr,"GGUF %s: %lld rows, expected %d\n",parts[0]->name,(long long)have,rows);exit(1);}
+    if(type==GQ_F32||type==GQ_F16||(type==GQ_BF16&&!m->native_bf16)){
+        q38_weight_reserve(&w,Q38_WEIGHT_F32,rows,cols);
+        float *p=(float*)w.data;
+        for(int i=0;i<n;i++){
+            q38_gg_read_f32(parts[i],p);
+            p+=parts[i]->ne[1]*cols;
+        }
+    } else if(type==GQ_BF16){
+        q38_weight_reserve(&w,Q38_WEIGHT_BF16,rows,cols);
+        uint8_t *p=(uint8_t*)w.data;
+        for(int i=0;i<n;i++){q38_gg_read(parts[i],p,0,parts[i]->nbytes);p+=parts[i]->nbytes;}
+    } else if(gq_blk_decoder(type)){
+        int64_t rb=gq_row_bytes(type,cols);
+        w.data=malloc((size_t)(rb*rows)); if(!w.data){fprintf(stderr,"OOM GGUF weight\n");exit(1);}
+        uint8_t *p=(uint8_t*)w.data;
+        for(int i=0;i<n;i++){q38_gg_read(parts[i],p,0,parts[i]->nbytes);p+=parts[i]->nbytes;}
+        const int ht=held?q38_gg_held_type(type,rows,cols):type;
+        if(ht!=type){   /* interleaved by 16 for the CPU's kernels */
+            const int64_t hb=gq_row_bytes(ht,cols); uint8_t *h=(uint8_t*)malloc((size_t)(hb*rows));
+            if(!h){fprintf(stderr,"OOM GGUF weight\n");exit(1);}
+            #pragma omp parallel for schedule(static)
+            for(int g=0;g<rows/16;g++)gq_r16_pack(ht,h+(int64_t)g*16*hb,(const uint8_t*)w.data+(int64_t)g*16*rb,16,cols);
+            free(w.data);w.data=h;type=ht;
+        }
+        w.kind=Q38_WEIGHT_GGML;w.gq_type=type;w.rows=rows;w.cols=cols;w.elements=(int64_t)rows*cols;w.owns_data=1;
+    } else {fprintf(stderr,"GGUF %s: type %s is not supported\n",parts[0]->name,gq_type_name(type));exit(1);}
+    m->resident_weight_bytes+=q38_weight_bytes(&w);
+    return w;
+}
+/* Columns [col0, col0+cols) of every row of t (rows x 2*cols): the MTP head's fc_embedding
+ * and fc_hidden, the two halves of nextn.eh_proj. A block type splits on a block boundary
+ * (cols a multiple of its block); f32/f16/bf16 are kept as f32. */
+static Q38Weight q38_gg_weight_cols(Model *m,const gguf_tensor *t,int rows,int cols,int col0) {
+    Q38Weight w={0}; int type=t->type; int64_t full=t->ne[0];
+    if(full!=2*(int64_t)cols||t->ne[1]!=rows||t->ne[2]*t->ne[3]!=1||(col0!=0&&col0!=cols)){
+        fprintf(stderr,"GGUF %s: [%lld x %lld], expected [%d x %d]\n",t->name,(long long)t->ne[1],(long long)full,rows,2*cols);exit(1);
+    }
+    if(type==GQ_F32||type==GQ_F16||type==GQ_BF16){
+        float *all=falloc((int64_t)rows*full); q38_gg_read_f32(t,all);
+        q38_weight_reserve(&w,Q38_WEIGHT_F32,rows,cols);
+        for(int r=0;r<rows;r++)memcpy((float*)w.data+(int64_t)r*cols,all+(int64_t)r*full+col0,(size_t)cols*sizeof(float));
+        free(all);
+    } else if(gq_blk_decoder(type)){
+        int64_t rbf=gq_row_bytes(type,full),rbh=gq_row_bytes(type,cols);
+        if(rbh<=0||rbf!=2*rbh){fprintf(stderr,"GGUF %s: %s does not split at column %d\n",t->name,gq_type_name(type),cols);exit(1);}
+        uint8_t *all=(uint8_t*)malloc((size_t)(rbf*rows)); w.data=malloc((size_t)(rbh*rows));
+        if(!all||!w.data){fprintf(stderr,"OOM GGUF weight\n");exit(1);}
+        q38_gg_read(t,all,0,rbf*rows);
+        for(int r=0;r<rows;r++)memcpy((uint8_t*)w.data+(int64_t)r*rbh,all+(int64_t)r*rbf+(col0?rbh:0),(size_t)rbh);
+        free(all);
+        w.kind=Q38_WEIGHT_GGML;w.gq_type=type;w.rows=rows;w.cols=cols;w.elements=(int64_t)rows*cols;w.owns_data=1;
+    } else {fprintf(stderr,"GGUF %s: type %s is not supported\n",t->name,gq_type_name(type));exit(1);}
+    m->resident_weight_bytes+=q38_weight_bytes(&w);
+    return w;
+}
+static Q38Weight q38_gg_weight(Model *m,const char *name,int rows,int cols) {
+    const gguf_tensor *parts[2]; int n=1;
+    int off=0,L=q38_gg_layer(name,&off);
+    if(g_q38_gg_mtp_layer>=0&&(!strcmp(name,"mtp.fc_embedding.weight")||!strcmp(name,"mtp.fc_hidden.weight"))){
+        char eh[96]; snprintf(eh,sizeof eh,"blk.%d.nextn.eh_proj.weight",g_q38_gg_mtp_layer);
+        const gguf_tensor *t=q38_gg_find(eh);
+        if(!t){fprintf(stderr,"GGUF: no %s for %s\n",eh,name);exit(1);}
+        return q38_gg_weight_cols(m,t,rows,cols,strcmp(name,"mtp.fc_hidden.weight")?0:cols);   /* [embedding | hidden] */
+    }
+    if(L>=0&&!strcmp(name+off,"self_attn.indexer.index_qk_proj.weight")){
+        char a[96],b[96]; snprintf(a,sizeof a,"blk.%d.indexer.q_proj.weight",L); snprintf(b,sizeof b,"blk.%d.indexer.k_proj.weight",L);
+        parts[0]=q38_gg_find(a); parts[1]=q38_gg_find(b); n=2;
+        if(!parts[0]||!parts[1]){fprintf(stderr,"GGUF: missing %s or %s\n",a,b);exit(1);}
+    } else {
+        parts[0]=q38_gg(name,NULL);
+        if(!parts[0]){fprintf(stderr,"GGUF: no tensor for %s\n",name);exit(1);}
+    }
+    /* the embedding is read a row at a time: its file rows */
+    return q38_gg_weight_parts(m,parts,n,rows,cols,!strstr(name,"embed_tokens"));
+}
+
 static float *q38_load_tensor(Model *m,const char *name,int64_t want) {
+    if(g_q38_gguf){
+        int norm=0; const gguf_tensor *t=q38_gg(name,&norm);
+        if(!t){fprintf(stderr,"GGUF: no tensor for %s\n",name);exit(1);}
+        if(q38_gg_numel(t)!=want){fprintf(stderr,"GGUF %s: %lld elements, expected %lld\n",t->name,(long long)q38_gg_numel(t),(long long)want);exit(1);}
+        float *p=falloc(want);
+        q38_gg_read_f32(t,p);
+        if(norm)for(int64_t i=0;i<want;i++)p[i]-=1.f;
+        return p;
+    }
     st_tensor *t=st_find(&m->S,name);
     if(!t){fprintf(stderr,"missing %s\n",name);exit(1);}
     if(t->numel!=want){fprintf(stderr,"%s: %lld elements, expected %lld\n",name,(long long)t->numel,(long long)want);exit(1);}
@@ -944,6 +1416,15 @@ static int q38_env_bool(const char *name,int default_value) {
 }
 
 static Q38Weight q38_load_weight(Model *m,const char *name,int rows,int cols) {
+    if(g_q38_gguf){
+        Q38Weight w=q38_gg_weight(m,name,rows,cols);
+#ifdef COLI_VULKAN
+        w.vk_res=1;   /* as below: its rows may live on the device (a block type's on the dense chain only) */
+        w.vk_name=strdup(name);
+        if(!w.vk_name){fprintf(stderr,"OOM weight name\n");exit(1);}
+#endif
+        return w;
+    }
     st_tensor *tensor=st_find(&m->S,name);Q38Weight weight={0};
     if(!tensor){fprintf(stderr,"missing %s\n",name);exit(1);}
     if(tensor->rank!=2||tensor->shape[0]!=rows||tensor->shape[1]!=cols||
@@ -1004,6 +1485,22 @@ static void q38_load_ple(Model *m,Layer *l) {
     const char *bufs[]={"layer_multipliers","ngram_heads_vocab_sizes","ngram_heads_offsets"};
     int64_t *dsts[]={m->ple_multipliers,m->ple_head_vocab,m->ple_head_offset};
     int counts[]={c->ngram_size,c->ngram_heads,c->ngram_heads};
+    if(g_q38_gguf){   /* the hash constants are metadata, the table one tensor */
+        const char *keys[]={"qwen4exp.ple.layer_multipliers","qwen4exp.ple.head_vocab_sizes","qwen4exp.ple.head_offsets"};
+        for(int b=0;b<3;b++){
+            const gguf_kv *kv=gguf_get(&g_q38gg,keys[b]);
+            Q38_NEED(kv&&kv->type==GGUF_T_ARRAY&&(int64_t)kv->n==counts[b]&&
+                     (kv->atype==GGUF_T_I64||kv->atype==GGUF_T_U64),"GGUF: %s missing or not %d 64-bit integers",keys[b],counts[b]);
+            memcpy(dsts[b],kv->arr,(size_t)counts[b]*8);
+        }
+        const gguf_tensor *t=gguf_mark(&g_q38gg,"per_layer_token_embd.weight");
+        Q38_NEED(t&&t->ne[0]==c->ngram_head_dim&&t->ne[2]*t->ne[3]==1,"GGUF: per_layer_token_embd missing or not rows of %d",c->ngram_head_dim);
+        m->ple_gg=t; m->ple_part_count=1; m->ple_part_start[0]=0; m->ple_part_start[1]=t->ne[1];
+        m->ple_weight_scale=1.f;
+        int64_t need=0; for(int h=0;h<c->ngram_heads;h++) if(m->ple_head_offset[h]+m->ple_head_vocab[h]>need) need=m->ple_head_offset[h]+m->ple_head_vocab[h];
+        Q38_NEED(t->ne[1]>=need,"PLE table rows %lld < required %lld",(long long)t->ne[1],(long long)need);
+        return;
+    }
     for(int b=0;b<3;b++){
         q38_name(m,nm,sizeof nm,i,"ple.ple_embedding."); strncat(nm,bufs[b],sizeof(nm)-strlen(nm)-1);
         st_tensor *t=st_find(&m->S,nm); if(!t||t->dtype!=6||t->numel!=counts[b]){fprintf(stderr,"invalid %s\n",nm);exit(1);}
@@ -1224,6 +1721,15 @@ static void q38_load_layer(Model *m,int i,int cap) {
     if(!lc->slots||!lc->by_expert){fprintf(stderr,"OOM expert cache\n");exit(1);} for(int e=0;e<c->experts;e++)lc->by_expert[e]=-1;
 }
 
+/* Replaces the slot table of an expert cache with an empty one of `cap` slots. Returns -1 when
+ * out of memory and leaves the table unchanged. */
+static int q38_cache_slots_set(LCache *cache,int cap){
+    Slot *slots=(Slot*)calloc((size_t)cap,sizeof(*slots));
+    if(!slots)return -1;
+    free(cache->slots);cache->slots=slots;cache->cap=cap;
+    return 0;
+}
+
 static void model_init_range(Model *m,const char *snap,int cap,int bits,
                              int layer_begin,int layer_end,int load_boundaries,
                              int allocate_state) {
@@ -1233,11 +1739,17 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
     m->expert_prefetch=q38_env_bool("Q38_EXPERT_PREFETCH",1);
     m->expert_parallel_reads=q38_env_bool("Q38_EXPERT_PARALLEL_READS",1);
     m->prefill_batch=q38_env_bool("Q38_PREFILL_BATCH",1);
-    q38_load_cfg(&m->c,snap); q38_validate_cfg(&m->c); st_init(&m->S,snap);
+    q38_load_cfg(&m->c,snap); q38_validate_cfg(&m->c);
     Cfg *c=&m->c; char nm[320];
-    if(st_has(&m->S,"model.language_model.embed_tokens.weight")) snprintf(m->prefix,sizeof m->prefix,"model.language_model");
-    else if(st_has(&m->S,"model.embed_tokens.weight")) snprintf(m->prefix,sizeof m->prefix,"model");
-    else {fprintf(stderr,"checkpoint has no Qwen4-Exp text embedding\n");exit(1);}
+    if(g_q38_gguf){   /* the checkpoint's names map onto the GGUF's (q38_gg_name) */
+        snprintf(m->prefix,sizeof m->prefix,"model");
+        m->expert_prefetch=0;   /* it reads safetensors ranges; the parallel batch reads the GGUF's */
+    } else {
+        st_init(&m->S,snap);
+        if(st_has(&m->S,"model.language_model.embed_tokens.weight")) snprintf(m->prefix,sizeof m->prefix,"model.language_model");
+        else if(st_has(&m->S,"model.embed_tokens.weight")) snprintf(m->prefix,sizeof m->prefix,"model");
+        else {fprintf(stderr,"checkpoint has no Qwen4-Exp text embedding\n");exit(1);}
+    }
     if(layer_end==0) layer_end=c->layers;
     if(layer_begin<0||layer_begin>=layer_end||layer_end>c->layers){fprintf(stderr,"invalid Qwen3.8 layer range [%d,%d)\n",layer_begin,layer_end);exit(1);}
     m->range_begin=layer_begin; m->range_end=layer_end;
@@ -1257,7 +1769,7 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
     /* La torre solo quando il motore possiede la sequenza intera: uno shard che
      * ospita solo alcuni layer non ha da fare niente con le immagini, e
      * caricarla la' sarebbe mezzo giga per nulla. */
-    if(load_boundaries&&q38_env_bool("Q38_VISION",1)) q38_load_vision(m);
+    if(load_boundaries&&!g_q38_gguf&&q38_env_bool("Q38_VISION",1)) q38_load_vision(m);   /* GGUF: the tower is a separate mmproj file */
     if(allocate_state) q38_alloc_state(m);
     m->dense_load_s=now_s()-t0;
     fprintf(stderr,"[qwen38] native text weights: prefix=%s, %d layers, PLE=%d, cache=%d/layer, "
@@ -1517,7 +2029,7 @@ static int q38_try_load_native_fp8_expert(Model *m,int layer,int expert,Slot *sl
  * the model's layers only: the MTP head's layer (index c.layers) keeps the
  * snapshot's FP8 experts with a sidecar or without one. */
 static inline int q38_layer_int4(const Model *m,int layer) {
-    return m->x4&&layer>=0&&layer<m->c.layers;
+    return m->x4&&layer>=0&&layer<m->c.layers&&m->x4->fd[layer]>=0;   /* a partial sidecar (Q38_EXPERT_PARTIAL) misses some */
 }
 
 /* Advise the kernel of the experts a route is about to miss: the int4
@@ -1637,6 +2149,48 @@ static void q38_load_expert_slice(Model *m,const char *name,const st_tensor *ten
 #define Q38_INT4_DIR "experts-int4g64"
 #define Q38_INT4_FORMAT "colibri.qwen38.experts-int4g64"
 #define Q38_INT4_VERSION 1
+/* The int2-g32 sidecar (int2_g32.h's format), written by
+ * tools/convert_qwen38_experts_int4.py --int2 into <snap>/experts-int2g32/ and
+ * attached instead of the int4 one when Q38_EXPERT_INT2=1. A record is
+ *
+ *   gate codes [I][H/4] | up codes [I][H/4] | down codes [H][I/4] |
+ *   gate q [I][H/32] | up q | down q [H][I/32] | gate d [I] | up d [I] | down d [H]
+ *
+ * (U8 "...weight" [rows][cols/4], U8 "...weight.q8" [rows][cols/32], F32
+ * "...weight.d" [rows][1]): 1.40 MB an expert on the release, 51% of the
+ * int4 record and 28% of the FP8 one. */
+#define Q38_INT2_DIR "experts-int2g32"
+#define Q38_INT2_FORMAT "colibri.qwen38.experts-int2g32"
+#define Q38_INT2_VERSION 1
+/* The low-bit sidecars, one record layout for all of them (codes, group scales, row
+ * scales; a row's scales are cols/32 bytes in every format): int2-g32 (int2_g32.h, a byte
+ * per 32) and int2-g16 / int3-g16 (lowbit_g16.h, a nibble per 16), written by
+ * tools/convert_qwen38_experts_int4.py --lowbit NAME into <snap>/experts-NAME/.
+ * Q38_EXPERT_LOWBIT=NAME attaches one; Q38_EXPERT_INT2=1 is int2g32. vq2g32
+ * (vq2_g32.h, vq 1) and vq1g64 (vq1_g64.h, vq 2: 10-bit indices, cols/64 x 10 code bytes,
+ * a nibble per 64, 1024 x 16 books) keep the record but not the cols/32 scale bytes: a nibble per 32,
+ * and two 256 x 8 int8 codebooks in index.json ("codebooks": {"a": [...], "b": [...]}). */
+typedef struct Q38Lowbit { const char *name,*dir,*format,*codes,*scales,*qtail; int bits,gs,vq; } Q38Lowbit;
+static const Q38Lowbit Q38_LOWBIT[5]={
+    {"int2g32","experts-int2g32","colibri.qwen38.experts-int2g32","planar128-2bit-lv10","u8-per-32-f32-per-row",".q8",2,32,0},
+    {"int2g16","experts-int2g16","colibri.qwen38.experts-int2g16","planar128-2bit-lv10","u4-per-16-f32-per-row",".q4",2,16,0},
+    {"int3g16","experts-int3g16","colibri.qwen38.experts-int3g16","planar128-3bit-lv26","u4-per-16-f32-per-row",".q4",3,16,0},
+    {"vq2g32","experts-vq2g32","colibri.qwen38.experts-vq2g32","vq2-2x256x8-int8","u4-per-32-f32-per-row",".q4",2,32,1},
+    {"vq1g64","experts-vq1g64","colibri.qwen38.experts-vq1g64","vq1-2x1024x16-int8","u4-per-64-f32-per-row",".q4",2,64,2},
+};
+static size_t q38_lb_scale_bytes(const Q38Lowbit *lb,int cols) { return lb->vq==2?vq1_scale_bytes(cols):lb->vq?vq2_scale_bytes(cols):xl_scale_bytes(cols); }
+static size_t q38_lb_code_bytes(const Q38Lowbit *lb,int cols) { return lb->vq==2?vq1_code_bytes(cols):xl_code_bytes(lb->bits,cols); }
+static const Q38Lowbit *q38_expert_lowbit_wanted(void) {
+    const char *name=getenv("Q38_EXPERT_LOWBIT");
+    if(name&&*name){
+        for(int i=0;i<5;i++)if(!strcmp(name,Q38_LOWBIT[i].name))return &Q38_LOWBIT[i];
+        fprintf(stderr,"Q38_EXPERT_LOWBIT must be int2g32, int2g16, int3g16, vq2g32 or vq1g64\n");exit(1);
+    }
+    const char *value=getenv("Q38_EXPERT_INT2");
+    if(!value||!*value||(value[0]=='0'&&!value[1]))return NULL;
+    if(value[0]=='1'&&!value[1])return &Q38_LOWBIT[0];
+    fprintf(stderr,"Q38_EXPERT_INT2 must be exactly 0 or 1\n");exit(1);
+}
 
 /* Q38_EXPERT_INT4: unset = the sidecar when there is one, 0 = never (the
  * snapshot's FP8), 1 = refuse to start without it (a benchmark that must not
@@ -1669,16 +2223,22 @@ static int q38_int4_record_at(Model *m,Q38Int4Experts *x,int layer,int expert,
     Cfg *c=&m->c;const char *projection[3]={"gate_proj","up_proj","down_proj"};
     int rows[3]={c->inter,c->inter,c->hidden},cols[3]={c->hidden,c->hidden,c->inter};
     char suffix[192],name[320];int64_t at=0;
-    for(int part=0;part<6;part++){
-        int k=part%3,is_scale=part>=3;
+    const int int2=x->lb!=NULL,parts=int2?9:6;
+    for(int part=0;part<parts;part++){
+        /* int4: codes, f32 scales per 64; int2: codes, u8 scales per 32, f32 per row */
+        int k=part%3,kind=part/3;
+        const char *tail=!kind?"":int2?(kind==1?x->lb->qtail:".d"):".qs";
         int length=snprintf(suffix,sizeof suffix,"mlp.experts.%d.%s.weight%s",
-                            expert,projection[k],is_scale?".qs":"");
+                            expert,projection[k],tail);
         if(length<0||(size_t)length>=sizeof suffix)return -1;
         q38_name(m,name,sizeof name,layer,suffix);
         st_tensor *t=st_find(&x->S,name);
-        int64_t width=is_scale?q38_int4_groups(cols[k]):q38_int4_row_bytes(cols[k]);
-        int64_t bytes=is_scale?x->scale_count[k]*(int64_t)sizeof(float):x->code_bytes[k];
-        if(!t||t->dtype!=(is_scale?2:3)||t->rank!=2||t->shape[0]!=rows[k]||
+        int is_f32=int2?kind==2:kind==1;
+        int64_t width=int2?(kind==0?(int64_t)q38_lb_code_bytes(x->lb,cols[k]):kind==1?(int64_t)q38_lb_scale_bytes(x->lb,cols[k]):1):
+                      kind?q38_int4_groups(cols[k]):q38_int4_row_bytes(cols[k]);
+        int64_t bytes=int2?(kind==0?x->code_bytes[k]:kind==1?x->q_bytes[k]:x->scale_count[k]*(int64_t)sizeof(float)):
+                      kind?x->scale_count[k]*(int64_t)sizeof(float):x->code_bytes[k];
+        if(!t||t->dtype!=(is_f32?2:3)||t->rank!=2||t->shape[0]!=rows[k]||
            t->shape[1]!=width||t->nbytes!=bytes)return -1;
         if(!part){
             if(t->off%(int64_t)sizeof(float))return -1;
@@ -1695,16 +2255,20 @@ static int q38_int4_record_at(Model *m,Q38Int4Experts *x,int layer,int expert,
  * index, is refused rather than ignored; one still being written is skipped
  * with a line saying so (or refused under Q38_EXPERT_INT4=1). */
 static void q38_expert_int4_attach(Model *m,const char *snap) {
-    int wanted=q38_expert_int4_wanted();
+    if(g_q38_gguf)return;   /* GGUF: the experts are the file's ggml blocks */
+    const Q38Lowbit *lb=q38_expert_lowbit_wanted();
+    const int int2=lb!=NULL;
+    int wanted=int2?1:q38_expert_int4_wanted();
     if(!wanted)return;
     Cfg *c=&m->c;char dir[2100],path[2200];
-    snprintf(dir,sizeof dir,"%s/%s",snap,Q38_INT4_DIR);
+    snprintf(dir,sizeof dir,"%s/%s",snap,int2?lb->dir:Q38_INT4_DIR);
     snprintf(path,sizeof path,"%s/index.json",dir);
     FILE *f=fopen(path,"rb");
     if(!f){
         if(wanted>0){
-            fprintf(stderr,"Q38_EXPERT_INT4=1 but %s cannot be opened "
-                           "(tools/convert_qwen38_experts_int4.py writes it)\n",path);exit(1);
+            fprintf(stderr,"%s but %s cannot be opened "
+                           "(tools/convert_qwen38_experts_int4.py%s%s writes it)\n",
+                    int2?"a low-bit sidecar was asked for":"Q38_EXPERT_INT4=1",path,int2?" --lowbit ":"",int2?lb->name:"");exit(1);
         }
         return;
     }
@@ -1718,7 +2282,16 @@ static void q38_expert_int4_attach(Model *m,const char *snap) {
     jval *root=json_parse(text,&arena);
     if(!root||root->t!=J_OBJ)q38_int4_refuse(dir,"index.json is not a JSON object");
     const char *format=jstr(root,"format"),*codes=jstr(root,"codes"),*scales=jstr(root,"scales");
-    if(!format||strcmp(format,Q38_INT4_FORMAT)||q38_json_int(root,"version")!=Q38_INT4_VERSION||
+    if(int2){
+        if(!format||strcmp(format,lb->format)||q38_json_int(root,"version")!=Q38_INT2_VERSION||
+           !codes||strcmp(codes,lb->codes)||!scales||strcmp(scales,lb->scales)||
+           q38_json_int(root,"group_size")!=lb->gs){
+            char why[400];
+            snprintf(why,sizeof why,"index.json is not format %s version 1 (codes %s, scales %s, groups of %d)",
+                     lb->format,lb->codes,lb->scales,lb->gs);
+            q38_int4_refuse(dir,why);
+        }
+    } else if(!format||strcmp(format,Q38_INT4_FORMAT)||q38_json_int(root,"version")!=Q38_INT4_VERSION||
        !codes||strcmp(codes,"planar64-v8")||!scales||strcmp(scales,"f32-per-64")||
        q38_json_int(root,"group_size")!=XF_BLOCK)
         q38_int4_refuse(dir,"index.json is not format " Q38_INT4_FORMAT " version 1, int4 codes v+8 "
@@ -1726,7 +2299,18 @@ static void q38_expert_int4_attach(Model *m,const char *snap) {
     Q38Int4Experts *x=(Q38Int4Experts*)calloc(1,sizeof(*x));
     if(!x){fprintf(stderr,"OOM int4 expert index\n");exit(1);}
     int rows[3]={c->inter,c->inter,c->hidden},cols[3]={c->hidden,c->hidden,c->inter};
-    for(int k=0;k<3;k++){
+    x->bits=int2?lb->bits:4;x->lb=lb;
+    if(int2){
+        for(int k=0;k<3;k++)if(!xl_layout_ok(cols[k]))
+            q38_int4_refuse(dir,"the low-bit formats need widths that are multiples of 128");
+        for(int k=0;k<3;k++){
+            x->code_bytes[k]=(int64_t)rows[k]*(int64_t)q38_lb_code_bytes(lb,cols[k]);
+            x->q_bytes[k]=(int64_t)rows[k]*(int64_t)q38_lb_scale_bytes(lb,cols[k]);
+            x->scale_count[k]=rows[k];
+            x->q_off+=x->code_bytes[k];
+        }
+        x->scale_off=x->q_off+x->q_bytes[0]+x->q_bytes[1]+x->q_bytes[2];
+    } else for(int k=0;k<3;k++){
         x->code_bytes[k]=(int64_t)rows[k]*q38_int4_row_bytes(cols[k]);
         x->scale_count[k]=(int64_t)rows[k]*q38_int4_groups(cols[k]);
         x->scale_off+=x->code_bytes[k];
@@ -1738,8 +2322,55 @@ static void q38_expert_int4_attach(Model *m,const char *snap) {
        q38_json_int(root,"moe_intermediate_size")!=c->inter||
        q38_json_int(root,"record_bytes")!=x->record_bytes||x->scale_off%(int64_t)sizeof(float))
         q38_int4_refuse(dir,"index.json was written for another geometry than config.json's");
+    if(int2&&lb->vq){
+        /* the codebooks, row-major int8: vq2 256 x 8, vq1 1024 x 16; per coordinate
+         * max|a| + max|b| <= 127, so any sum is an int8 */
+        const int nb=lb->vq==2?VQ1_BOOK:VQ2_BOOK,dim=lb->vq==2?16:8;
+        int8_t *dsta,*dstb;
+        if(lb->vq==2){
+            if(!(x->vq1b=(Vq1Books*)calloc(1,sizeof(Vq1Books)))){fprintf(stderr,"OOM vq1 codebooks\n");exit(1);}
+            dsta=&x->vq1b->a[0][0];dstb=&x->vq1b->b[0][0];
+        } else {
+            if(!(x->vqb=(Vq2Books*)calloc(1,sizeof(Vq2Books)))){fprintf(stderr,"OOM vq2 codebooks\n");exit(1);}
+            dsta=&x->vqb->a[0][0];dstb=&x->vqb->b[0][0];
+        }
+        jval *books=json_get(root,"codebooks");
+        for(int which=0;which<2;which++){
+            jval *list=books&&books->t==J_OBJ?json_get(books,which?"b":"a"):NULL;
+            if(!list||list->t!=J_ARR||list->len!=nb*dim)q38_int4_refuse(dir,"index.json has no codebooks of the format's size");
+            int8_t *dst=which?dstb:dsta;
+            for(int i=0;i<nb*dim;i++){
+                const jval *v=list->kids[i];
+                if(v->t!=J_NUM||v->num!=floor(v->num)||v->num<-127||v->num>127)
+                    q38_int4_refuse(dir,"a codebook entry is not an integer in -127..127");
+                dst[i]=(int8_t)v->num;
+            }
+        }
+        int top_a[16]={0},top_b[16]={0};
+        for(int e=0;e<nb;e++)for(int j=0;j<dim;j++){
+            int a=abs(dsta[e*dim+j]),b=abs(dstb[e*dim+j]);
+            if(a>top_a[j])top_a[j]=a;
+            if(b>top_b[j])top_b[j]=b;
+        }
+        for(int j=0;j<dim;j++)if(top_a[j]+top_b[j]>127)q38_int4_refuse(dir,"the codebooks' sums leave int8");
+    }
     jval *complete=json_get(root,"complete"),*done=json_get(root,"done");
-    if(!complete||complete->t!=J_BOOL||!complete->boolean){
+    /* Q38_EXPERT_PARTIAL=1: a sidecar still being written serves the layers it lists as
+     * done, the others keep the snapshot's experts -- the sequential calibration
+     * (tools/convert_qwen38_experts_int4.py --dump-target) dumps the inputs a model with
+     * its first layers already quantized gives the next ones. CPU only. */
+    const char *pe=getenv("Q38_EXPERT_PARTIAL");
+    int partial=pe&&pe[0]=='1'&&(!complete||complete->t!=J_BOOL||!complete->boolean)&&done&&done->t==J_ARR&&done->len>0;
+    uint8_t *have=NULL;
+    if(partial){
+        have=(uint8_t*)calloc((size_t)c->layers,1);
+        if(!have){fprintf(stderr,"OOM partial sidecar\n");exit(1);}
+        for(int i=0;i<done->len;i++){const jval *v=done->kids[i];if(v->t==J_NUM&&v->num>=0&&v->num<c->layers)have[(int)v->num]=1;}
+        int n=0;for(int l=0;l<c->layers;l++)n+=have[l];
+        fprintf(stderr,"[qwen38] %s: partial sidecar (Q38_EXPERT_PARTIAL=1), %d of %d layers; the others keep "
+                       "the snapshot's experts\n",dir,n,c->layers);
+    }
+    if(!partial&&(!complete||complete->t!=J_BOOL||!complete->boolean)){
         int layers_done=done&&done->t==J_ARR?done->len:0;
         if(wanted>0){
             fprintf(stderr,"[qwen38] %s: conversion incomplete (%d of %d layers); "
@@ -1747,7 +2378,7 @@ static void q38_expert_int4_attach(Model *m,const char *snap) {
         }
         fprintf(stderr,"[qwen38] %s: conversion incomplete (%d of %d layers); "
                        "the routed experts stay as the snapshot has them\n",dir,layers_done,c->layers);
-        json_free(root);free(arena);free(text);free(x);
+        json_free(root);free(arena);free(text);free(x->vqb);free(x->vq1b);free(x);
         return;
     }
     json_free(root);free(arena);free(text);
@@ -1760,17 +2391,18 @@ static void q38_expert_int4_attach(Model *m,const char *snap) {
         for(int expert=0;expert<c->experts;expert++)x->off[(int64_t)layer*c->experts+expert]=-1;
     }
     for(int layer=m->range_begin;layer<m->range_end;layer++)
-        for(int expert=0;expert<c->experts;expert++){
+        for(int expert=0;expert<c->experts&&(!have||have[layer]);expert++){
             int fd=-1;int64_t start=-1;
             if(q38_int4_record_at(m,x,layer,expert,&fd,&start)||
                (x->fd[layer]>=0&&fd!=x->fd[layer])){
                 char why[160];
-                snprintf(why,sizeof why,"layer %d expert %d is missing or is not one int4-g64 "
-                         "record of %lld bytes",layer,expert,(long long)x->record_bytes);
+                snprintf(why,sizeof why,"layer %d expert %d is missing or is not one %s "
+                         "record of %lld bytes",layer,expert,int2?lb->name:"int4-g64",(long long)x->record_bytes);
                 q38_int4_refuse(dir,why);
             }
             x->fd[layer]=fd;x->off[(int64_t)layer*c->experts+expert]=start;
         }
+    free(have);
     m->x4=x;
 }
 
@@ -1780,6 +2412,18 @@ static void q38_bind_int4_record(Model *m,Slot *slot,uint8_t *record) {
     int rows[3]={c->inter,c->inter,c->hidden},cols[3]={c->hidden,c->hidden,c->inter};
     Q38Weight *dst[3]={&slot->gate,&slot->up,&slot->down};
     uint8_t *codes=record;float *scales=(float*)(record+x->scale_off);
+    if(x->lb){
+        const uint8_t *q=record+x->q_off;
+        for(int k=0;k<3;k++){
+            Q38Weight *weight=dst[k];q38_weight_free(weight);
+            weight->data=codes;weight->x2q=q;weight->scales=scales;weight->rows=rows[k];weight->cols=cols[k];
+            weight->elements=(int64_t)rows[k]*cols[k];weight->scale_count=x->scale_count[k];
+            weight->kind=x->lb->vq==2?Q38_WEIGHT_VQ1:x->lb->vq?Q38_WEIGHT_VQ2:x->lb->gs==32?Q38_WEIGHT_INT2G32:Q38_WEIGHT_LOWBIT16;
+            weight->lbits=x->lb->bits;weight->vqb=x->vqb;weight->vq1b=x->vq1b;
+            codes+=x->code_bytes[k];q+=x->q_bytes[k];scales+=x->scale_count[k];
+        }
+        return;
+    }
     for(int k=0;k<3;k++){
         Q38Weight *weight=dst[k];q38_weight_free(weight);
         weight->data=codes;weight->scales=scales;weight->rows=rows[k];weight->cols=cols[k];
@@ -1789,6 +2433,27 @@ static void q38_bind_int4_record(Model *m,Slot *slot,uint8_t *record) {
     }
 }
 
+/* int2/int3-g16, vq2 and int4-g64 experts held interleaved by 16 for the CPU (lowbit_g16.h
+ * xl16_*, vq2_g32.h vq2r16_*, expert_ffn.h xf16_*): 1 for int2/int3-g16, 2 for vq2, 3 for
+ * int4-g64, 0 for the rows. A read slot, not a mapped one, and every matrix whole groups (the
+ * experts' shapes are). Q38_ILV16=0 keeps the rows. */
+static int q38_lb_r16(const Model *m) {
+    static int on=-1;
+    if(on<0){const char *e=getenv("Q38_ILV16");on=!(e&&!strcmp(e,"0"));}
+    const Q38Int4Experts *x=m->x4; const int H=m->c.hidden,F=m->c.inter;
+    if(!on||!x||H%16||F%16)return 0;
+#ifdef XF16_ON
+    if(!x->lb&&H%XF_BLOCK==0&&F%XF_BLOCK==0)return 3;   /* int8 activations per 32 where the rows take f32 */
+#endif
+    if(!x->lb)return 0;
+#ifdef XL16_ON
+    if(!x->lb->vq&&x->lb->gs==16&&H%128==0&&F%128==0)return 1;
+#endif
+#ifdef VQ2R16_ON
+    if(x->lb->vq==1&&H%64==0&&F%64==0)return 2;
+#endif
+    return 0;
+}
 /* One read per miss, into the slot's own slab; with COLI_MAP_EXPERTS=1 the
  * slot points into the mapped file instead, as the FP8 path does. Safe from
  * the parallel batch loader: every job owns a distinct slot. */
@@ -1806,13 +2471,86 @@ static void q38_load_int4_record(Model *m,int layer,int expert,Slot *slot) {
         if(!replacement){fprintf(stderr,"OOM int4 expert record\n");exit(1);}
         slot->int4_slab=replacement;slot->int4_slab_bytes=x->record_bytes;
     }
+    const int lr=q38_lb_r16(m);
+    if(lr){   /* int2/int3-g16, vq2, int4-g64: read beside, interleave into the slot (each loader thread its buffer) */
+        static __thread uint8_t *raw; static __thread int64_t cap;
+        if(cap<x->record_bytes){free(raw);raw=(uint8_t*)malloc((size_t)x->record_bytes);cap=raw?x->record_bytes:0;
+                                if(!raw){fprintf(stderr,"OOM int4 expert record\n");exit(1);}}
+        st_read_range_raw_cap(&x->S,fd,off,x->record_bytes,raw,x->record_bytes,1,"pread Qwen3.8 int4 expert");
+        q38_bind_int4_record(m,slot,raw);   /* the three matrices' fields, then their interleaved form */
+        Q38Weight *dst[3]={&slot->gate,&slot->up,&slot->down}; uint8_t *o=(uint8_t*)slot->int4_slab;
+        for(int k=0;k<3;k++){
+            Q38Weight *w=dst[k]; size_t gb=0;
+#ifdef XL16_ON
+            if(lr==1){xl16_pack(o,(const uint8_t*)w->data,w->x2q,w->scales,w->rows,w->lbits,w->cols);gb=xl16_group_bytes(w->lbits,w->cols);}
+#endif
+#ifdef VQ2R16_ON
+            if(lr==2){vq2r16_pack(o,(const uint8_t*)w->data,w->x2q,w->scales,w->rows,w->cols);gb=vq2r16_group_bytes(w->cols);}
+#endif
+#ifdef XF16_ON
+            if(lr==3){xf16_pack(o,(const uint8_t*)w->data,w->scales,w->rows,w->cols);gb=xf16_group_bytes(w->cols);}
+#endif
+            w->data=o;w->x2q=NULL;w->scales=NULL;w->r16=1;
+            o+=(size_t)(w->rows/16)*gb;
+        }
+        return;
+    }
     q38_bind_int4_record(m,slot,(uint8_t*)slot->int4_slab);
     st_read_range_raw_cap(&x->S,fd,off,x->record_bytes,slot->int4_slab,
                           slot->int4_slab_bytes,1,"pread Qwen3.8 int4 expert");
 }
 
+/* GGUF mode: expert eid's three matrices, each a slice of its projection's 3D tensor
+ * ([experts][rows][cols], the rows ggml blocks), read into the slot as they are. */
+/* The layer's three expert tensors, checked: looked up (and marked used) on one
+ * thread, so the parallel batch below only reads. */
+static void q38_gg_expert_tensors(Model *m,int layer,const gguf_tensor *t[3]) {
+    const Cfg *c=&m->c; const int H=c->hidden,I=c->inter;
+    static const char *kn[3]={"ffn_gate_exps","ffn_up_exps","ffn_down_exps"};
+    const int os[3]={I,I,H},is[3]={H,H,I};
+    for(int k=0;k<3;k++){
+        char nm[96]; snprintf(nm,sizeof nm,"blk.%d.%s.weight",layer,kn[k]);
+        t[k]=q38_gg_find(nm);
+        if(!t[k]||t[k]->ne[0]!=is[k]||t[k]->ne[1]!=os[k]||t[k]->ne[2]!=c->experts||t[k]->ne[3]!=1){fprintf(stderr,"GGUF: %s missing or not [%d][%d][%d]\n",nm,c->experts,os[k],is[k]);exit(1);}
+        if(gq_row_bytes(t[k]->type,is[k])<=0||(!gq_blk_decoder(t[k]->type)&&t[k]->type!=GQ_F32&&t[k]->type!=GQ_F16&&t[k]->type!=GQ_BF16)){fprintf(stderr,"GGUF %s: type %s is not supported\n",nm,gq_type_name(t[k]->type));exit(1);}
+    }
+}
+
+/* Expert eid's rows of the three tensors into the slot: preads only, safe in parallel. */
+static void q38_gg_read_expert(Model *m,const gguf_tensor *const t[3],int eid,Slot *s) {
+    const Cfg *c=&m->c; const int H=c->hidden,I=c->inter;
+    Q38Weight *dst[3]={&s->gate,&s->up,&s->down}; const int os[3]={I,I,H},is[3]={H,H,I};
+    for(int k=0;k<3;k++){
+        int64_t rb=gq_row_bytes(t[k]->type,is[k]),eb=rb*os[k];
+        Q38Weight *w=dst[k]; const int st=q38_gg_held_type(t[k]->type,os[k],is[k]);
+        if(w->kind!=Q38_WEIGHT_GGML||w->gq_type!=st||w->rows!=os[k]||w->cols!=is[k]||!w->owns_data){
+            q38_weight_free(w);
+            w->data=malloc((size_t)(gq_row_bytes(st,is[k])*os[k])); if(!w->data){fprintf(stderr,"OOM GGUF expert\n");exit(1);}
+            w->kind=Q38_WEIGHT_GGML;w->gq_type=st;w->rows=os[k];w->cols=is[k];w->elements=(int64_t)os[k]*is[k];w->owns_data=1;
+        }
+        if(st!=t[k]->type){   /* read beside, interleave into the slot (each loader thread its buffer) */
+            static __thread uint8_t *raw; static __thread int64_t cap;
+            if(cap<eb){free(raw);raw=(uint8_t*)malloc((size_t)eb);cap=raw?eb:0;if(!raw){fprintf(stderr,"OOM GGUF expert\n");exit(1);}}
+            q38_gg_read(t[k],raw,(int64_t)eid*eb,eb);
+            gq_r16_pack(st,(uint8_t*)w->data,raw,os[k],is[k]);
+            continue;
+        }
+        q38_gg_read(t[k],w->data,(int64_t)eid*eb,eb);
+    }
+}
+
+static void q38_gg_load_expert(Model *m,int layer,int eid,Slot *s) {
+    const gguf_tensor *t[3]; q38_gg_expert_tensors(m,layer,t); q38_gg_read_expert(m,t,eid,s);
+}
+
 static void q38_load_expert(Model *m,int layer,int eid,Slot *s) {
     Cfg *c=&m->c; int H=c->hidden,I=c->inter; char nm[320],sn[340];
+    if(g_q38_gguf){
+        double started=now_s();
+        q38_gg_load_expert(m,layer,eid,s);
+        q38_tm_add(m,Q38_TM_EXPERT_READ,started);m->expert_weight_reads++;
+        return;
+    }
     if(q38_layer_int4(m,layer)){
         double started=now_s();
         q38_load_int4_record(m,layer,eid,s);
@@ -1940,8 +2678,10 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
     if(count>cache->cap)
         return q38_expert_batch_fallback(m,Q38_EXPERT_BATCH_FALLBACK_CACHE_CAPACITY,
                                          layer,cache->cap,count);
-    int x4=q38_layer_int4(m,layer);
-    if(!x4&&!q38_prepare_expert_scale_bank(m,layer))
+    int x4=q38_layer_int4(m,layer),gg=g_q38_gguf;
+    const gguf_tensor *ggt[3]={0};
+    if(gg)q38_gg_expert_tensors(m,layer,ggt);
+    if(!x4&&!gg&&!q38_prepare_expert_scale_bank(m,layer))
         return q38_expert_batch_fallback(m,Q38_EXPERT_BATCH_FALLBACK_SCALE_BANK,layer,0,0);
     /* The demand set is no longer bounded by the decode top-k: the MoE prefill
      * hands over the whole chunk union (up to the cache cap) so its loads run
@@ -1967,7 +2707,7 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
             continue;
         }
         st_tensor *weight[3];
-        if(!x4&&!q38_native_fp8_expert_tensors(m,layer,expert,weight)){
+        if(!x4&&!gg&&!q38_native_fp8_expert_tensors(m,layer,expert,weight)){
             free(jobs);
             return q38_expert_batch_fallback(m,Q38_EXPERT_BATCH_FALLBACK_LAYOUT,
                                              layer,expert,0);
@@ -1998,7 +2738,7 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
                 if(slot->eid>=0)cache->by_expert[slot->eid]=-1;
             }
             slot->eid=-1;jobs[job_count].expert=expert;jobs[job_count].slot=slot;
-            if(!x4&&!q38_native_fp8_expert_tensors(m,layer,expert,jobs[job_count].weight)){
+            if(!x4&&!gg&&!q38_native_fp8_expert_tensors(m,layer,expert,jobs[job_count].weight)){
                 fprintf(stderr,"Qwen3.8 expert layout changed during batch reservation\n");exit(1);
             }
             job_count++;
@@ -2017,13 +2757,14 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
         double started=now_s();
         #pragma omp parallel for schedule(static) num_threads(workers) if(job_count>1)
         for(int job=0;job<job_count;job++){
-            if(x4)q38_load_int4_record(m,layer,jobs[job].expert,jobs[job].slot);
+            if(gg)q38_gg_read_expert(m,ggt,jobs[job].expert,jobs[job].slot);
+            else if(x4)q38_load_int4_record(m,layer,jobs[job].expert,jobs[job].slot);
             else q38_load_native_fp8_ranges(m,layer,jobs[job].expert,jobs[job].slot,
                                             jobs[job].weight);
         }
         q38_tm_add(m,Q38_TM_EXPERT_READ,started);
-        m->expert_weight_reads+=(uint64_t)job_count*(x4?1:2);
-        if(!x4)m->expert_pair_reads+=(uint64_t)job_count;
+        m->expert_weight_reads+=(uint64_t)job_count*(gg?3:x4?1:2);
+        if(!x4&&!gg)m->expert_pair_reads+=(uint64_t)job_count;
         if(job_count>1)m->expert_parallel_batches++;
         for(int job=0;job<job_count;job++){
             Slot *slot=jobs[job].slot;slot->eid=jobs[job].expert;
@@ -2036,6 +2777,14 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
 
 static void q38_ple_row(Model *m,int64_t row,float *out) {
     Cfg *c=&m->c; int p=0;
+    if(m->ple_gg){   /* GGUF: one row of the table's ggml blocks */
+        const gguf_tensor *t=m->ple_gg; int64_t rb=gq_row_bytes(t->type,c->ngram_head_dim);
+        Q38_NEED(row>=0&&row<t->ne[1]&&rb>0,"PLE row out of range: %lld",(long long)row);
+        uint8_t raw[1024]; Q38_NEED(rb<=(int64_t)sizeof raw,"PLE row too wide");
+        q38_gg_read(t,raw,row*rb,rb);
+        if(gq_dequant_row(t->type,raw,out,c->ngram_head_dim)){fprintf(stderr,"GGUF %s: type %s\n",t->name,gq_type_name(t->type));exit(1);}
+        return;
+    }
     while(p+1<m->ple_part_count&&row>=m->ple_part_start[p+1])p++;
     if(p>=m->ple_part_count||row<m->ple_part_start[p]){fprintf(stderr,"PLE row out of range: %lld\n",(long long)row);exit(1);}
     int64_t local=row-m->ple_part_start[p]; st_tensor *t=m->ple_parts[p]; const char *nm=m->ple_part_names[p];
@@ -2193,6 +2942,18 @@ static void q38_ple(Model *m,const int *ids,int S,const float *hyper,float *out)
     q38_tm_add(m,Q38_TM_PLE,phase_started);
 }
 
+/* The integer setting `name` from min_value to max_value; any other text or number ends the run. */
+static int q38_env_int_in_range(const char *name,int default_value,int min_value,int max_value) {
+    const char *value=getenv(name);
+    if(!value||!*value)return default_value;
+    char *end=NULL;long parsed=strtol(value,&end,10);
+    if(end==value||*end||parsed<min_value||parsed>(long)max_value){
+        fprintf(stderr,"%s must be an integer in %d..%d\n",name,min_value,max_value);
+        exit(1);
+    }
+    return (int)parsed;
+}
+
 /* The chunk ceiling and the workspace budget used to be compile-time only.  An
  * isolated prefill measurement (274 tokens, one forward) showed that the
  * ceiling -- not the budget -- is what binds: 32 rows cut the prompt into nine
@@ -2205,14 +2966,7 @@ static void q38_ple(Model *m,const int *ids,int S,const float *hyper,float *out)
  * neither routing nor accumulation order -- so this is a pure A/B. */
 static int q38_env_positive_int(const char *name,int default_value,
                                 int max_value) {
-    const char *value=getenv(name);
-    if(!value||!*value)return default_value;
-    char *end=NULL;long parsed=strtol(value,&end,10);
-    if(end==value||*end||parsed<1||parsed>(long)max_value){
-        fprintf(stderr,"%s must be an integer in 1..%d\n",name,max_value);
-        exit(1);
-    }
-    return (int)parsed;
+    return q38_env_int_in_range(name,default_value,1,max_value);
 }
 
 static int q38_prefill_batch_rows(void) {
@@ -2298,6 +3052,7 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
     float *aa=falloc((int64_t)rows_capacity*VH);
     float *norm=falloc((int64_t)rows_capacity*V);
     float *conv=falloc(CD);
+    float *convs=falloc((int64_t)rows_capacity*CD);   /* each row's conv output */
     float *q=falloc((int64_t)VH*KD),*k=falloc((int64_t)VH*KD);
     float *core=falloc(V);
     /* a multiplexed step parks every conversation: each row's state below */
@@ -2313,13 +3068,13 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
         q38_dense_matmul(m,aa,x,&l->dn_a,1,H,VH);
         float egh[64],beta[64];
         for(int h=0;h<VH&&h<64;h++){
-            egh[h]=expf(-expf(l->dn_alog[h])*q38_softplus(aa[h]+l->dn_dtbias[h]));
+            egh[h]=expf((g_q38_a_direct?l->dn_alog[h]:-expf(l->dn_alog[h]))*q38_softplus(aa[h]+l->dn_dtbias[h]));
             beta[h]=q38_sigmoid(bb[h]);
         }
         q38_dn_gpu_push(m,layer);
         if(m->dn_dev_fresh[layer]&&qt_dn_gpu_step(layer,x,out,egh,beta)){
             m->dn_host_stale[layer]=1;
-            free(qkv);free(z);free(bb);free(aa);free(norm);free(conv);free(q);free(k);free(core);
+            free(qkv);free(z);free(bb);free(aa);free(norm);free(conv);free(convs);free(q);free(k);free(core);
             q38_tm_add(m,Q38_TM_DELTANET,phase_started);
             return;
         }
@@ -2334,26 +3089,47 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
         q38_dense_matmul(m,bb,chunk,&l->dn_b,rows,H,VH);
         q38_dense_matmul(m,aa,chunk,&l->dn_a,rows,H,VH);
 
-        for(int s=0;s<rows;s++) {
-            if(m->mux_rows){rec=m->mux_rows[base+s].seq->DN_rec[layer];ring=m->mux_rows[base+s].seq->DN_conv[layer];}
-            float *qkv_row=qkv+(int64_t)s*CD;
-            float *z_row=z+(int64_t)s*V;
-            float *b_row=bb+(int64_t)s*VH;
-            float *a_row=aa+(int64_t)s*VH;
-            for(int d=0;d<CD;d++) {
+        double recur_started=now_s(),snap_s=0.0;
+        /* One parallel region for all the rows. The causal conv by channel, each
+         * channel's rows in order (its ring advances row by row, and a verify keeps the
+         * ring each row leaves); then each value head with every row in turn, while
+         * its state is in that core's cache (q/k normalized, the recurrence, the
+         * rollback copy, the gated norm). A (row, head) is computed from the same
+         * values in the same order as one region per row did, so the bits are those;
+         * the state is crossed once instead of once a row. */
+        #pragma omp parallel
+        {
+        #pragma omp for schedule(static)
+        for(int d=0;d<CD;d++) {
+            for(int s=0;s<rows;s++){
+                float *ring_s=m->mux_rows?m->mux_rows[base+s].seq->DN_conv[layer]:ring;
+                const float *qkv_row=qkv+(int64_t)s*CD;
                 float value=l->dn_conv[(int64_t)d*CK+CK-1]*qkv_row[d];
-                float *history=ring+(int64_t)d*(CK-1);
+                float *history=ring_s+(int64_t)d*(CK-1);
                 for(int tap=0;tap<CK-1;tap++)
                     value+=l->dn_conv[(int64_t)d*CK+tap]*history[tap];
-                conv[d]=q38_silu(value);
+                convs[(int64_t)s*CD+d]=q38_silu(value);
                 for(int tap=0;tap<CK-2;tap++)history[tap]=history[tap+1];
                 history[CK-2]=qkv_row[d];
+                /* a verify: the ring this row leaves, for the rollback (q38_spec_rollback) */
+                if(base+s<m->snap_rows)
+                    memcpy(m->snap_conv[base+s][layer]+(int64_t)d*(CK-1),history,(size_t)(CK-1)*sizeof(float));
             }
-            const float *qi=conv,*ki=conv+K,*vi=conv+2*K;
-            for(int h=0;h<VH;h++) {
-                float *qh=q+(int64_t)h*KD,*kh=k+(int64_t)h*KD;
-                memcpy(qh,qi+(int64_t)(h/rep)*KD,(size_t)KD*sizeof(float));
-                memcpy(kh,ki+(int64_t)(h/rep)*KD,(size_t)KD*sizeof(float));
+        }
+        #pragma omp for schedule(static)
+        for(int h=0;h<VH;h++) {
+            float *qh=q+(int64_t)h*KD,*kh=k+(int64_t)h*KD;
+            int kh_of=g_q38_dn_tiled?h%KH:h/rep;   /* GGUF: value heads tiled over the key heads */
+            for(int s=0;s<rows;s++){
+                float *rec_s=m->mux_rows?m->mux_rows[base+s].seq->DN_rec[layer]:rec;
+                const float *qi=convs+(int64_t)s*CD,*ki=qi+K,*vi=qi+2*K;
+                const float *z_row=z+(int64_t)s*V,*b_row=bb+(int64_t)s*VH,*a_row=aa+(int64_t)s*VH;
+                float *norm_row=norm+(int64_t)s*V;
+                /* a verify: the state this row leaves, for the rollback of a draft rejected
+                 * after it (q38_spec_rollback), copied while it is in this core's cache */
+                float *snap_rec=base+s<m->snap_rows?m->snap_rec[base+s][layer]:NULL;
+                memcpy(qh,qi+(int64_t)kh_of*KD,(size_t)KD*sizeof(float));
+                memcpy(kh,ki+(int64_t)kh_of*KD,(size_t)KD*sizeof(float));
                 double qsum=1e-6,ksum=1e-6;
                 for(int d=0;d<KD;d++) {
                     qsum+=(double)qh[d]*qh[d];
@@ -2362,59 +3138,106 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
                 float qscale=1.f/sqrtf((float)qsum)/sqrtf((float)KD);
                 float kscale=1.f/sqrtf((float)ksum);
                 for(int d=0;d<KD;d++){qh[d]*=qscale;kh[d]*=kscale;}
-            }
-            #pragma omp parallel for schedule(static)
-            for(int h=0;h<VH;h++) {
-                float *state=rec+(int64_t)h*KD*VD;
-                const float *qh=q+(int64_t)h*KD;
-                const float *kh=k+(int64_t)h*KD;
+                float *state=rec_s+(int64_t)h*KD*VD;
                 const float *vh=vi+(int64_t)h*VD;
-                float alpha=expf(-expf(l->dn_alog[h])*
+                float alpha=expf((g_q38_a_direct?l->dn_alog[h]:-expf(l->dn_alog[h]))*
                                  q38_softplus(a_row[h]+l->dn_dtbias[h]));
                 float beta=q38_sigmoid(b_row[h]);
-                float delta[512];
-                int64_t state_cells=(int64_t)KD*VD;
-                for(int64_t cell=0;cell<state_cells;cell++)state[cell]*=alpha;
-                for(int value=0;value<VD;value++) {
-                    float previous=0.f;
-                    for(int d=0;d<KD;d++)
-                        previous+=kh[d]*state[(int64_t)d*VD+value];
-                    delta[value]=(vh[value]-previous)*beta;
+                /* Two passes over the state, both along its rows (contiguous,
+                 * vectorized): decay and k^T S, then the update and q^T S on the
+                 * updated row. Every value's sums run over d in order, as the
+                 * column loops did; explicit fmaf keeps the bits independent of
+                 * the compiler's contraction choices. */
+                float previous[512],delta[512],*current=core+(int64_t)h*VD;
+                for(int value=0;value<VD;value++)previous[value]=0.f;
+                for(int d=0;d<KD;d++){
+                    float *row=state+(int64_t)d*VD;const float kd=kh[d];
+                    for(int value=0;value<VD;value++){row[value]*=alpha;previous[value]=fmaf(kd,row[value],previous[value]);}
                 }
-                for(int d=0;d<KD;d++)for(int value=0;value<VD;value++)
-                    state[(int64_t)d*VD+value]+=kh[d]*delta[value];
-                for(int value=0;value<VD;value++) {
-                    float current=0.f;
-                    for(int d=0;d<KD;d++)
-                        current+=qh[d]*state[(int64_t)d*VD+value];
-                    core[(int64_t)h*VD+value]=current;
+                for(int value=0;value<VD;value++){delta[value]=(vh[value]-previous[value])*beta;current[value]=0.f;}
+                for(int d=0;d<KD;d++){
+                    float *row=state+(int64_t)d*VD;const float kd=kh[d],qd=qh[d];
+                    for(int value=0;value<VD;value++){
+                        row[value]=fmaf(kd,delta[value],row[value]);
+                        current[value]=fmaf(qd,row[value],current[value]);
+                    }
                 }
-            }
-            float *norm_row=norm+(int64_t)s*V;
-            for(int h=0;h<VH;h++)
-                q38_rmsg(norm_row+(int64_t)h*VD,core+(int64_t)h*VD,
-                         z_row+(int64_t)h*VD,l->dn_norm,VD,c->eps,1);
-            /* a verify: the state this row leaves, for the rollback of a
-             * draft rejected after it (q38_spec_rollback) */
-            if(base+s<m->snap_rows){
-                memcpy(m->snap_rec[base+s][layer],rec,(size_t)VH*KD*VD*sizeof(float));
-                memcpy(m->snap_conv[base+s][layer],ring,(size_t)CD*(CK-1)*sizeof(float));
+                if(snap_rec)memcpy(snap_rec+(int64_t)h*KD*VD,state,(size_t)KD*VD*sizeof(float));
+                q38_rmsg(norm_row+(int64_t)h*VD,current,z_row+(int64_t)h*VD,l->dn_norm,VD,c->eps,1);
             }
         }
+        }
+        m->timers.seconds[Q38_TM_DN_RECUR]+=now_s()-recur_started-snap_s;
+        m->timers.seconds[Q38_TM_DN_SNAP]+=snap_s;
         q38_dense_matmul(m,out+(int64_t)base*H,norm,&l->dn_out,
                          rows,V,H);
         base+=rows;
     }
     if(m->dn_dev_fresh)m->dn_dev_fresh[layer]=0;   /* the host advanced: the card's copy is old */
-    free(qkv);free(z);free(bb);free(aa);free(norm);free(conv);
+    free(qkv);free(z);free(bb);free(aa);free(norm);free(conv);free(convs);
     free(q);free(k);free(core);
     q38_tm_add(m,Q38_TM_DELTANET,phase_started);
+}
+
+/* sum a[i]*b[i] over 8 lanes (lane = i % 8, in order) and a fixed tree of the lanes: the
+ * same bits with and without AVX2. QSA's query-key and indexer dots were scalar loops the
+ * compiler cannot vectorize without reordering the sum (35 ms a forward at 3k tokens). */
+static inline float q38_dot8(const float *a,const float *b,int n){
+#if defined(__AVX2__)&&defined(__FMA__)
+    __m256 acc=_mm256_setzero_ps();int i=0;
+    for(;i+8<=n;i+=8)acc=_mm256_fmadd_ps(_mm256_loadu_ps(a+i),_mm256_loadu_ps(b+i),acc);
+    float l[8];_mm256_storeu_ps(l,acc);
+#else
+    float l[8]={0,0,0,0,0,0,0,0};int i=0;
+    for(;i+8<=n;i+=8)for(int k=0;k<8;k++)l[k]=fmaf(a[i+k],b[i+k],l[k]);
+#endif
+    float r=((l[0]+l[4])+(l[2]+l[6]))+((l[1]+l[5])+(l[3]+l[7]));
+    for(;i<n;i++)r=fmaf(a[i],b[i],r);
+    return r;
+}
+/* q38_dot8 of four rows of q (qstride apart) against one row b, each with q38_dot8's own
+ * operations in its order, so the same four values: one load of b serves the four, and the
+ * four accumulator chains run side by side instead of each waiting on its own FMA. */
+static inline void q38_dot8_x4(float *out,const float *q,int64_t qstride,const float *b,int n){
+#if defined(__AVX2__)&&defined(__FMA__)
+    __m256 a0=_mm256_setzero_ps(),a1=a0,a2=a0,a3=a0;int i=0;
+    const float *q0=q,*q1=q+qstride,*q2=q+2*qstride,*q3=q+3*qstride;
+    for(;i+8<=n;i+=8){
+        const __m256 bv=_mm256_loadu_ps(b+i);
+        a0=_mm256_fmadd_ps(_mm256_loadu_ps(q0+i),bv,a0);a1=_mm256_fmadd_ps(_mm256_loadu_ps(q1+i),bv,a1);
+        a2=_mm256_fmadd_ps(_mm256_loadu_ps(q2+i),bv,a2);a3=_mm256_fmadd_ps(_mm256_loadu_ps(q3+i),bv,a3);
+    }
+    const __m256 acc[4]={a0,a1,a2,a3};const float *qr[4]={q0,q1,q2,q3};
+    for(int g=0;g<4;g++){
+        float l[8];_mm256_storeu_ps(l,acc[g]);
+        float r=((l[0]+l[4])+(l[2]+l[6]))+((l[1]+l[5])+(l[3]+l[7]));
+        for(int k=i;k<n;k++)r=fmaf(qr[g][k],b[k],r);
+        out[g]=r;
+    }
+#else
+    for(int g=0;g<4;g++)out[g]=q38_dot8(q+g*qstride,b,n);
+#endif
 }
 
 typedef struct { float score; int block; } Q38Block;
 static int q38_block_desc(const void *aa,const void *bb){
     const Q38Block *a=(const Q38Block*)aa,*b=(const Q38Block*)bb;
     if(a->score>b->score)return -1;if(a->score<b->score)return 1;return a->block-b->block;
+}
+
+/* K and V rounded to float16 where they are made (kv16.h): the CPU's rows here, the CUDA and
+ * Vulkan chains' (CC_EW_F16, VKC_EW_F16), so every backend holds the same values; the host's
+ * caches keep them as floats and the CUDA chain's mirrors as halves (cc_attn_h: half the device
+ * memory a context takes, the rest for the experts). Q38_KV=f32 keeps float32, f16 rounds;
+ * unset, a served model rounds and an argv run (its .json references are float32) does not.
+ * The index keys stay float32: they choose the positions. */
+static int g_q38_kv16=-1;
+static inline int q38_kv16(void){
+    if(g_q38_kv16<0){
+        const char *e=getenv("Q38_KV"),*s=getenv("SERVE");
+        g_q38_kv16=e&&*e?strcmp(e,"f32")!=0:(s&&s[0]=='1');
+    }
+    return g_q38_kv16;
 }
 
 static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int pos_base,float *out) {
@@ -2436,67 +3259,126 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
         float *Kl=mr?mr[s].seq->K[layer]:m->K[layer],*Vl=mr?mr[s].seq->V[layer]:m->V[layer];
         float *IKl=mr?mr[s].seq->IK[layer]:m->IK[layer];
         for(int h=0;h<KVH;h++){
-            float *kh=kp+(int64_t)s*KVH*D+(int64_t)h*D;q38_rms0(kh,kh,l->kn,D,c->eps);q38_rope(kh,D,c->rotary_dim,pos,theta);
+            float *kh=kp+(int64_t)s*KVH*D+(int64_t)h*D,*vh=vp+(int64_t)s*KVH*D+(int64_t)h*D;
+            q38_rms0(kh,kh,l->kn,D,c->eps);q38_rope(kh,D,c->rotary_dim,pos,theta);
+            if(q38_kv16()){kv16_round(kh,D);kv16_round(vh,D);}
             memcpy(Kl+((int64_t)h*m->kv_cap+pos)*D,kh,(size_t)D*sizeof(float));
-            memcpy(Vl+((int64_t)h*m->kv_cap+pos)*D,vp+(int64_t)s*KVH*D+(int64_t)h*D,(size_t)D*sizeof(float));
+            memcpy(Vl+((int64_t)h*m->kv_cap+pos)*D,vh,(size_t)D*sizeof(float));
         }
         memcpy(IKl+(int64_t)pos*ID,ip+(int64_t)s*(IQ+1)*ID+(int64_t)IQ*ID,(size_t)ID*sizeof(float));
     }
     float *heads=falloc((int64_t)S*QH*D);
-    /* Ranking and attention are independent per position: no shared writes
-     * (heads is row-disjoint, the scratch is per-thread) and no FP order
-     * changes inside a position, so the result is bit-identical to the
-     * serial path. The scheduling is dynamic because the ranking cost grows
-     * with the position (the IK prefix to read is O(pos)). */
-    double index_dt=0,attn_dt=0;
-    /* Wall, not aggregate CPU: the reduction below sums per-thread seconds, so
-     * at prefill these two phases would report ~20x what the clock saw while
-     * every other phase reports wall -- on a 3006-token prompt the phase sum
-     * came to 510 s against a 268 s TTFT, the parts outweighing the whole.
-     * Take the clock across the whole team and split it by CPU share.  At
-     * decode S==1 the loop is serial, cpu_total equals the wall, and the
-     * rescale below is an exact no-op. */
-    double qsa_wall_started=now_s();
-    #pragma omp parallel for schedule(dynamic,8) reduction(+:index_dt,attn_dt) if(S>1)
+    /* Three phases, every value from the code and in the order the per-row loop had,
+     * so the bits are its (the ranking and attention are independent per position):
+     *   A  each context block's pooled, normed and roped key, once for all the rows,
+     *      scored against every row that sees it -- by block, on every thread (the
+     *      per-row loop ran a row's whole context on one thread: three threads in a
+     *      verify, one in decode, thousands of blocks at a long context);
+     *   B  each row's ranking and selection;
+     *   C  attention by (row, head). */
+    double qsa_started=now_s();
+    int maxblocks=0;
+    int *nblk=(int*)malloc((size_t)S*sizeof(int)),*nsel=(int*)calloc((size_t)S,sizeof(int));
+    float *qidx=falloc((int64_t)S*IQ*ID);
+    int *selected=(int*)malloc((size_t)S*maxsel*sizeof(int));
+    if(!nblk||!nsel||!selected){fprintf(stderr,"OOM QSA selection\n");exit(1);}
     for(int s=0;s<S;s++){
-        int pos=mr?mr[s].pos:pos_base+s,visible=pos+1,blocks=visible/R,tail=blocks*R;
-        const float *Kl=mr?mr[s].seq->K[layer]:m->K[layer],*Vl=mr?mr[s].seq->V[layer]:m->V[layer];
-        const float *IKl=mr?mr[s].seq->IK[layer]:m->IK[layer];
-        double phase_started=now_s();
-        float *qidx=falloc((int64_t)IQ*ID),*pool=falloc(ID);
-        int *selected=(int*)malloc((size_t)maxsel*sizeof(int));
-        if(!selected){fprintf(stderr,"OOM QSA selection\n");exit(1);}
-        for(int h=0;h<IQ;h++){float *qh=qidx+(int64_t)h*ID;memcpy(qh,ip+(int64_t)s*(IQ+1)*ID+(int64_t)h*ID,(size_t)ID*sizeof(float));q38_rms0(qh,qh,l->idx_qn,ID,c->eps);q38_rope(qh,ID,c->rotary_dim,pos,theta);}
-        int take=blocks<c->idx_budget/R?blocks:c->idx_budget/R,nsel=0;
-        Q38Block *rank=blocks?(Q38Block*)malloc((size_t)blocks*sizeof(Q38Block)):NULL;
-        if(blocks&&!rank){fprintf(stderr,"OOM QSA block ranking\n");exit(1);}
-        for(int b=0;b<blocks;b++){
+        int pos=mr?mr[s].pos:pos_base+s;nblk[s]=(pos+1)/R;if(nblk[s]>maxblocks)maxblocks=nblk[s];
+        for(int h=0;h<IQ;h++){float *qh=qidx+((int64_t)s*IQ+h)*ID;memcpy(qh,ip+(int64_t)s*(IQ+1)*ID+(int64_t)h*ID,(size_t)ID*sizeof(float));q38_rms0(qh,qh,l->idx_qn,ID,c->eps);q38_rope(qh,ID,c->rotary_dim,pos,theta);}
+    }
+    Q38Block *rank=maxblocks?(Q38Block*)malloc((size_t)S*maxblocks*sizeof(Q38Block)):NULL;
+    if(maxblocks&&!rank){fprintf(stderr,"OOM QSA block ranking\n");exit(1);}
+    /* the rows share one conversation's IK unless multiplexed: then the blocks by row */
+    const int shared_ik=!mr;
+    const int items=shared_ik?maxblocks:S*maxblocks;
+    #pragma omp parallel
+    {
+        float *pool=falloc(ID);
+        #pragma omp for schedule(dynamic,16)
+        for(int it=0;it<items;it++){
+            const int b=shared_ik?it:it%maxblocks,s0=shared_ik?0:it/maxblocks,s1=shared_ik?S:s0+1;
+            if(!shared_ik&&b>=nblk[s0])continue;
+            const float *IKl=mr?mr[s0].seq->IK[layer]:m->IK[layer];
             memset(pool,0,(size_t)ID*sizeof(float));for(int r=0;r<R;r++){const float *raw=IKl+(int64_t)(b*R+r)*ID;for(int d=0;d<ID;d++)pool[d]+=raw[d]/R;}
             q38_rms0(pool,pool,l->idx_kn,ID,c->eps);q38_rope(pool,ID,c->rotary_dim,b*R,theta);
-            float score=0.f;for(int h=0;h<IQ;h++){float a=0.f;for(int d=0;d<ID;d++)a+=qidx[(int64_t)h*ID+d]*pool[d];if(a>0.f)score+=a;}rank[b]=(Q38Block){score/sqrtf((float)ID),b};
+            for(int s=s0;s<s1;s++){
+                if(b>=nblk[s])continue;
+                const float *qs=qidx+(int64_t)s*IQ*ID;
+                float score=0.f;for(int h=0;h<IQ;h++){float a=q38_dot8(qs+(int64_t)h*ID,pool,ID);if(a>0.f)score+=a;}
+                rank[(int64_t)s*maxblocks+b]=(Q38Block){score/sqrtf((float)ID),b};
+            }
         }
-        if(blocks)qsort(rank,(size_t)blocks,sizeof(Q38Block),q38_block_desc);
-        for(int z=0;z<take;z++)for(int r=0;r<R;r++)selected[nsel++]=rank[z].block*R+r;
-        for(int t=tail;t<visible;t++)selected[nsel++]=t;free(rank);
-        index_dt+=now_s()-phase_started; phase_started=now_s();
-        for(int h=0;h<QH;h++){
-            float *qraw=qp+(int64_t)s*QH*2*D+(int64_t)h*2*D;
-            float *qh=falloc(D);memcpy(qh,qraw,(size_t)D*sizeof(float));q38_rms0(qh,qh,l->qn,D,c->eps);q38_rope(qh,D,c->rotary_dim,pos,theta);
-            float *score=falloc(nsel);float mx=-INFINITY;
-            int khidx=h/(QH/KVH);for(int j=0;j<nsel;j++){const float *kh=Kl+((int64_t)khidx*m->kv_cap+selected[j])*D;float a=0.f;for(int d=0;d<D;d++)a+=qh[d]*kh[d];a/=sqrtf((float)D);score[j]=a;if(a>mx)mx=a;}
-            float den=0.f;for(int j=0;j<nsel;j++){score[j]=expf(score[j]-mx);den+=score[j];}
-            float *oh=heads+(int64_t)s*QH*D+(int64_t)h*D;memset(oh,0,(size_t)D*sizeof(float));
-            for(int j=0;j<nsel;j++){float a=score[j]/den;const float *vh=Vl+((int64_t)khidx*m->kv_cap+selected[j])*D;for(int d=0;d<D;d++)oh[d]+=a*vh[d];}
-            for(int d=0;d<D;d++)oh[d]*=q38_sigmoid(qraw[D+d]);free(qh);free(score);
+        free(pool);
+        #pragma omp for schedule(static)
+        for(int s=0;s<S;s++){
+            int pos=mr?mr[s].pos:pos_base+s,visible=pos+1,blocks=nblk[s],tail=blocks*R;
+            int take=blocks<c->idx_budget/R?blocks:c->idx_budget/R,n=0;
+            Q38Block *rk=rank+(int64_t)s*maxblocks;int *sel=selected+(int64_t)s*maxsel;
+            if(blocks)qsort(rk,(size_t)blocks,sizeof(Q38Block),q38_block_desc);
+            for(int z=0;z<take;z++)for(int r=0;r<R;r++)sel[n++]=rk[z].block*R+r;
+            for(int t=tail;t<visible;t++)sel[n++]=t;
+            nsel[s]=n;
         }
-        attn_dt+=now_s()-phase_started;
-        free(qidx);free(pool);free(selected);
     }
-    double qsa_wall=now_s()-qsa_wall_started,cpu_total=index_dt+attn_dt;
-    if(cpu_total>0.0){
-        index_dt=qsa_wall*(index_dt/cpu_total);
-        attn_dt =qsa_wall*(attn_dt /cpu_total);
+    double index_dt=now_s()-qsa_started;qsa_started=now_s();
+    /* C by (row, KV head): the query heads that share a KV head read its selected K and V rows
+     * once between them, not once each (Qwen3.8: 24 heads over 2 KV heads, so every row was
+     * read twelve times). Each head's operations, and their order, are the per-head loop's, so
+     * the bits are its. A task takes gq heads of a group: the whole group when the rows keep
+     * every thread busy, fewer in a decode step or a verify. */
+    const int G=QH/KVH;
+    int gq=G;
+    {
+        int threads=1;
+#ifdef _OPENMP
+        threads=omp_get_max_threads();
+#endif
+        while(gq>1&&(int64_t)S*KVH*(G/gq)<4*threads){int d=gq-1;while(d>1&&G%d)d--;gq=d;}
     }
+    const int nsub=G/gq;
+    #pragma omp parallel
+    {
+        float *qh=falloc((int64_t)gq*D),*mx=falloc(2*gq),*den=mx+gq,*score=NULL;size_t score_cap=0;
+        #pragma omp for schedule(dynamic,1)
+        for(int it=0;it<S*KVH*nsub;it++){
+            const int s=it/(KVH*nsub),r=it%(KVH*nsub),kv=r/nsub,h0=kv*G+(r%nsub)*gq;
+            const int pos=mr?mr[s].pos:pos_base+s,ns=nsel[s];
+            const float *Kl=mr?mr[s].seq->K[layer]:m->K[layer],*Vl=mr?mr[s].seq->V[layer]:m->V[layer];
+            const int *sel=selected+(int64_t)s*maxsel;
+            size_t need=(size_t)gq*(ns>0?ns:1);
+            if(need>score_cap){free(score);score=falloc((int64_t)need);score_cap=need;}
+            for(int g=0;g<gq;g++){
+                const float *qraw=qp+(int64_t)s*QH*2*D+(int64_t)(h0+g)*2*D;float *q=qh+(int64_t)g*D;
+                memcpy(q,qraw,(size_t)D*sizeof(float));q38_rms0(q,q,l->qn,D,c->eps);q38_rope(q,D,c->rotary_dim,pos,theta);
+                mx[g]=-INFINITY;
+            }
+            for(int j=0;j<ns;j++){
+                const float *kh=Kl+((int64_t)kv*m->kv_cap+sel[j])*D;
+                int g=0;
+                for(;g+4<=gq;g+=4){
+                    float d4[4];q38_dot8_x4(d4,qh+(int64_t)g*D,D,kh,D);
+                    for(int e=0;e<4;e++){float a=d4[e];a/=sqrtf((float)D);score[(int64_t)(g+e)*ns+j]=a;if(a>mx[g+e])mx[g+e]=a;}
+                }
+                for(;g<gq;g++){float a=q38_dot8(qh+(int64_t)g*D,kh,D);a/=sqrtf((float)D);score[(int64_t)g*ns+j]=a;if(a>mx[g])mx[g]=a;}
+            }
+            for(int g=0;g<gq;g++){
+                float *sc=score+(int64_t)g*ns,dn=0.f;
+                for(int j=0;j<ns;j++){sc[j]=expf(sc[j]-mx[g]);dn+=sc[j];}
+                den[g]=dn;memset(heads+(int64_t)s*QH*D+(int64_t)(h0+g)*D,0,(size_t)D*sizeof(float));
+            }
+            for(int j=0;j<ns;j++){
+                const float *vh=Vl+((int64_t)kv*m->kv_cap+sel[j])*D;
+                for(int g=0;g<gq;g++){float a=score[(int64_t)g*ns+j]/den[g];float *oh=heads+(int64_t)s*QH*D+(int64_t)(h0+g)*D;for(int d=0;d<D;d++)oh[d]+=a*vh[d];}
+            }
+            for(int g=0;g<gq;g++){
+                const float *qraw=qp+(int64_t)s*QH*2*D+(int64_t)(h0+g)*2*D;float *oh=heads+(int64_t)s*QH*D+(int64_t)(h0+g)*D;
+                for(int d=0;d<D;d++)oh[d]*=q38_sigmoid(qraw[D+d]);
+            }
+        }
+        free(qh);free(mx);free(score);
+    }
+    double attn_dt=now_s()-qsa_started;
+    free(nblk);free(nsel);free(qidx);free(selected);free(rank);
     m->timers.seconds[Q38_TM_QSA_INDEX]+=index_dt;
     m->timers.seconds[Q38_TM_QSA_ATTENTION]+=attn_dt;
     q38_dense_matmul(m,out,heads,&l->o,S,QH*D,H);
@@ -2514,7 +3396,32 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
  * tier copies what it needs during qt_note; the slot may be recycled by the
  * next token. Only native FP8 slots are reported: gate.data at the slab start
  * is what q38_bind_fp8_slot() produces, an expanded slot points elsewhere. */
+static int g_q38_gguf_tier;   /* the tier holds a GGUF's experts as the file has them (q38_tier_start) */
 static void q38_tier_note(int layer,int eid,const Slot *ex) {
+    if(g_q38_gguf_tier){
+        /* the file's rows: as the slot holds them, or back from its interleaved copy into a
+         * buffer of this thread's (the tier copies before qt_note returns) */
+        if(!qt_ready()||ex->gate.kind!=Q38_WEIGHT_GGML)return;
+        if(!qt_note_wanted(layer,eid)){ qt_note_heat(layer,eid); return; }   /* converted only for an expert it takes */
+        const Q38Weight *w[3]={&ex->gate,&ex->up,&ex->down};
+        if(gq_r16_base(w[0]->gq_type)<0&&gq_r16_base(w[1]->gq_type)<0&&gq_r16_base(w[2]->gq_type)<0){
+            qt_note(layer,eid,(const uint8_t*)w[0]->data,(const uint8_t*)w[1]->data,(const uint8_t*)w[2]->data,NULL,NULL,NULL);
+            return;
+        }
+        static __thread uint8_t *buf; static __thread size_t cap;
+        size_t off[4]={0};
+        for(int k=0;k<3;k++){
+            const int ft=gq_r16_base(w[k]->gq_type)>=0?gq_r16_base(w[k]->gq_type):w[k]->gq_type;
+            off[k+1]=off[k]+(size_t)w[k]->rows*gq_row_bytes(ft,w[k]->cols);
+        }
+        if(off[3]>cap){ uint8_t *nb=(uint8_t*)realloc(buf,off[3]); if(!nb)return; buf=nb; cap=off[3]; }
+        for(int k=0;k<3;k++){
+            if(gq_r16_base(w[k]->gq_type)>=0)gq_r16_unpack(w[k]->gq_type,buf+off[k],(const uint8_t*)w[k]->data,w[k]->rows,w[k]->cols);
+            else memcpy(buf+off[k],w[k]->data,off[k+1]-off[k]);
+        }
+        qt_note(layer,eid,buf,buf+off[1],buf+off[2],NULL,NULL,NULL);
+        return;
+    }
     if(!qt_ready()||!ex->fp8_slab||ex->gate.data!=ex->fp8_slab)return;
     qt_note(layer,eid,(const uint8_t*)ex->gate.data,(const uint8_t*)ex->up.data,
             (const uint8_t*)ex->down.data,ex->gate.scales,ex->up.scales,ex->down.scales);
@@ -2528,12 +3435,25 @@ static void q38_tier_note(int layer,int eid,const Slot *ex) {
  * 127, the qwen36 dnproj/lmhead format) and uploaded once; the BF16 copy
  * stays for prefill and as fallback. Q38_TRUNK_GPU=0 keeps the trunk on the
  * CPU (parity runs against the BF16 reference). */
-typedef struct { Q38Weight *w; char name[16]; int layer, cpu_only; } Q38TrunkItem;
+typedef struct { Q38Weight *w; char name[16]; int layer, cpu_only, gq; } Q38TrunkItem;   /* gq: a GGUF's blocks, uploaded as they are */
 static Q38TrunkItem *g_trunk; static int g_trunk_n, g_trunk_cap, g_trunk_offer_gpu;
 static long g_trunk_min_kb; static const char *g_trunk_skip;   /* read once per load in q38_trunk_offer_all */
+/* A GGUF matrix on the CUDA device: the backend's block format 100 + its type (the file's
+ * rows, back from the CPU's copy interleaved by 16), 0 when the backend does not take it */
+static int q38_cuda_gq_fmt(const Q38Weight *w) {
+#ifdef COLI_CUDA
+    if(!w||w->kind!=Q38_WEIGHT_GGML||!w->data)return 0;
+    const int b=gq_r16_base(w->gq_type),t=b>=0?b:w->gq_type,be=coli_cuda_block_elems(100+t);
+    return be>0&&w->cols%be==0&&w->cols%32==0?100+t:0;
+#else
+    (void)w; return 0;
+#endif
+}
 static void q38_trunk_add(Q38Weight *w,const char *name,int layer) {
-    if(!w||!w->data||(w->kind!=Q38_WEIGHT_BF16&&w->kind!=Q38_WEIGHT_F32))return;
-    size_t bytes=(size_t)w->rows*w->cols+(size_t)w->rows*sizeof(float);
+    int gq=g_trunk_offer_gpu&&q38_cuda_gq_fmt(w);   /* a GGUF's matrix goes up as its blocks, nothing for the CPU to convert */
+    if(!w||!w->data||(!gq&&w->kind!=Q38_WEIGHT_BF16&&w->kind!=Q38_WEIGHT_F32))return;
+    size_t bytes=gq?(size_t)w->rows*(((size_t)gq_row_bytes(q38_cuda_gq_fmt(w)-100,w->cols)+3)/4*4)
+                   :(size_t)w->rows*w->cols+(size_t)w->rows*sizeof(float);
     /* Q38_TRUNK_MIN_KB (default 1024): a round trip costs more than a tiny
      * GEMV saves, and a tiny matrix in BF16 costs nothing on the CPU either;
      * Q38_TRUNK_SKIP=name,name: leave those components in BF16 on the CPU
@@ -2550,7 +3470,7 @@ static void q38_trunk_add(Q38Weight *w,const char *name,int layer) {
         g_trunk=(Q38TrunkItem*)realloc(g_trunk,(size_t)g_trunk_cap*sizeof(*g_trunk));
         if(!g_trunk){fprintf(stderr,"OOM trunk table\n");exit(1);}
     }
-    Q38TrunkItem *it=&g_trunk[g_trunk_n++]; it->w=w; it->layer=layer; it->cpu_only=0;
+    Q38TrunkItem *it=&g_trunk[g_trunk_n++]; it->w=w; it->layer=layer; it->cpu_only=0; it->gq=gq;
     snprintf(it->name,sizeof it->name,"%s",name);
     if(g_trunk_offer_gpu)qt_trunk_offer(it->name,layer,bytes);
 }
@@ -2630,6 +3550,109 @@ static void q38_trunk_quantize(const Q38Weight *w,int8_t **qp,float **scp) {
  * the memory. Default on; Q38_TRUNK_CPU_INT8=0 keeps the BF16 rows and the
  * f32 kernel, the numeric reference. A matrix the tier already quantized for
  * the GPU keeps those same rows here (prefill rows run on the CPU). */
+/* ---- the trunk in int4 on the CPU (Q38_TRUNK_CPU_INT4=1) ----------------------------
+ * Q38_TRUNK_STATS=<file> collects, for every trunk matrix, the sum of the squares of
+ * each input column over the rows it met (added to the file at exit, by name and
+ * layer, so several runs add up). Q38_TRUNK_CPU_INT4=1 then builds the trunk's rows
+ * as planar int4-g64 straight from BF16, the scale of each group of 64 chosen among
+ * absmax/7 times 1.0..0.6 for the least activation-weighted error when
+ * Q38_TRUNK_STATS_IN=<file> names such statistics (plain absmax/7 without), as the
+ * routed experts' weighted int4 does. lm_head (unless Q38_TRUNK_INT4_HEAD=1) and the
+ * routers stay int8, and so does a matrix whose width is not a multiple of 64. CPU
+ * only: with COLI_VULKAN=1 or COLI_CUDA=1 the devices read the int8 rows. */
+static char g_q38_tstats_path[4096];
+static void q38_tstats_write(void) {
+    if(!g_q38_tstats_path[0])return;
+    /* an earlier run's sums: added, matched by name and layer */
+    FILE *f=fopen(g_q38_tstats_path,"rb");
+    if(f){
+        char magic[8];int32_t cnt=0;
+        if(fread(magic,8,1,f)==1&&!memcmp(magic,"Q38TRK1\0",8)&&fread(&cnt,4,1,f)==1){
+            for(int32_t i=0;i<cnt;i++){
+                char name[16];int32_t layer,cols;int64_t n;
+                if(fread(name,16,1,f)!=1||fread(&layer,4,1,f)!=1||fread(&cols,4,1,f)!=1||fread(&n,8,1,f)!=1)break;
+                double *a=(double*)malloc((size_t)cols*sizeof(double));
+                if(!a||fread(a,sizeof(double),(size_t)cols,f)!=(size_t)cols){free(a);break;}
+                for(int j=0;j<g_trunk_n;j++){
+                    Q38Weight *w=g_trunk[j].w;
+                    if(w->act2&&g_trunk[j].layer==layer&&w->cols==cols&&!strncmp(g_trunk[j].name,name,16)){
+                        for(int c=0;c<cols;c++)w->act2[c]+=a[c];
+                        w->act_n+=n;break;
+                    }
+                }
+                free(a);
+            }
+        }
+        fclose(f);
+    }
+    f=fopen(g_q38_tstats_path,"wb");
+    if(!f){perror(g_q38_tstats_path);return;}
+    int32_t cnt=0;for(int j=0;j<g_trunk_n;j++)cnt+=g_trunk[j].w->act2!=NULL;
+    int ok=fwrite("Q38TRK1\0",8,1,f)==1&&fwrite(&cnt,4,1,f)==1;
+    for(int j=0;ok&&j<g_trunk_n;j++){
+        Q38Weight *w=g_trunk[j].w;if(!w->act2)continue;
+        char name[16]={0};memcpy(name,g_trunk[j].name,sizeof name);
+        int32_t layer=g_trunk[j].layer,cols=w->cols;int64_t n=w->act_n;
+        ok=fwrite(name,16,1,f)==1&&fwrite(&layer,4,1,f)==1&&fwrite(&cols,4,1,f)==1&&fwrite(&n,8,1,f)==1&&
+           fwrite(w->act2,sizeof(double),(size_t)cols,f)==(size_t)cols;
+    }
+    if(fclose(f)||!ok)fprintf(stderr,"[trunk-stats] %s: write failed\n",g_q38_tstats_path);
+    else fprintf(stderr,"[trunk-stats] %s: %d matrices\n",g_q38_tstats_path,(int)cnt);
+}
+/* importance per column for trunk item j from a Q38_TRUNK_STATS file (mean x^2), NULL if absent */
+static float *q38_tstats_importance(FILE *f,const Q38TrunkItem *it,int cols) {
+    if(!f)return NULL;
+    rewind(f);
+    char magic[8];int32_t cnt=0;
+    if(fread(magic,8,1,f)!=1||memcmp(magic,"Q38TRK1\0",8)||fread(&cnt,4,1,f)!=1)return NULL;
+    for(int32_t i=0;i<cnt;i++){
+        char name[16];int32_t layer,c;int64_t n;
+        if(fread(name,16,1,f)!=1||fread(&layer,4,1,f)!=1||fread(&c,4,1,f)!=1||fread(&n,8,1,f)!=1)return NULL;
+        if(layer==it->layer&&c==cols&&!strncmp(name,it->name,16)&&n>0){
+            double *a=(double*)malloc((size_t)c*sizeof(double));float *imp=(float*)malloc((size_t)c*sizeof(float));
+            if(!a||!imp||fread(a,sizeof(double),(size_t)c,f)!=(size_t)c){free(a);free(imp);return NULL;}
+            for(int k=0;k<c;k++)imp[k]=(float)(a[k]/(double)n)+1e-12f;
+            free(a);return imp;
+        }
+        if(fseek(f,(long)c*(long)sizeof(double),SEEK_CUR))return NULL;
+    }
+    return NULL;
+}
+/* one trunk matrix's rows as planar int4-g64, from its BF16/F32 rows */
+static void q38_trunk_int4(Q38Weight *w,const float *imp) {
+    const int O=w->rows,I=w->cols,ng=xf_groups(I);const size_t rb=xf_row_bytes(I);
+    uint8_t *q=(uint8_t*)malloc((size_t)O*rb);float *sc=(float*)malloc((size_t)O*ng*sizeof(float));
+    if(!q||!sc){fprintf(stderr,"OOM int4 trunk\n");exit(1);}
+    static const float alphas[9]={1.f,.95f,.9f,.85f,.8f,.75f,.7f,.65f,.6f};
+    #pragma omp parallel
+    {
+        float *row=falloc(I);
+        #pragma omp for schedule(static)
+        for(int r=0;r<O;r++){
+            q38_weight_row(w,r,row);
+            uint8_t *dst=q+(size_t)r*rb;
+            for(int g=0;g<ng;g++){
+                const float *v=row+g*XF_BLOCK;const float *a=imp?imp+g*XF_BLOCK:NULL;
+                float am=0.f;for(int i=0;i<XF_BLOCK;i++){float t=fabsf(v[i]);if(t>am)am=t;}
+                float base=am>0.f?am/7.f:1.f,best_s=base;double best_e=-1.0;
+                for(int k=0;k<(a?9:1);k++){
+                    float s=base*alphas[k],inv=1.f/s;double e=0.0;
+                    for(int i=0;i<XF_BLOCK;i++){int c=(int)lrintf(v[i]*inv);c=c<-8?-8:c>7?7:c;double d=v[i]-s*(float)c;e+=(a?a[i]:1.f)*d*d;}
+                    if(best_e<0||e<best_e){best_e=e;best_s=s;}
+                }
+                sc[(size_t)r*ng+g]=best_s;
+                float inv=1.f/best_s;
+                for(int k=0;k<32;k++){
+                    int lo=(int)lrintf(v[k]*inv),hi=(int)lrintf(v[k+32]*inv);
+                    lo=lo<-8?-8:lo>7?7:lo;hi=hi<-8?-8:hi>7?7:hi;
+                    dst[g*XF_BLOCK_BYTES+k]=(uint8_t)((lo+8)|((hi+8)<<4));
+                }
+            }
+        }
+        free(row);
+    }
+    w->q4=q;w->q4sc=sc;
+}
 static int q38_trunk_cpu_int8_wanted(void) {
     const char *e=getenv("Q38_TRUNK_CPU_INT8"); return !(e&&e[0]=='0'&&!e[1]);
 }
@@ -2637,8 +3660,37 @@ static void q38_trunk_cpu_int8(Model *m) {
     if(!q38_trunk_cpu_int8_wanted())return;
     if(!m->trunk_table_built)q38_trunk_offer_all(m);   /* the tier may have built it already */
     double t0=now_s(); size_t bytes=0,released=0; int n=0;
+    const char *ts=getenv("Q38_TRUNK_STATS");
+    if(ts&&*ts){
+        snprintf(g_q38_tstats_path,sizeof g_q38_tstats_path,"%s",ts);
+        for(int i=0;i<g_trunk_n;i++)g_trunk[i].w->act2=(double*)calloc((size_t)g_trunk[i].w->cols,sizeof(double));
+        atexit(q38_tstats_write);
+        fprintf(stderr,"[trunk-stats] collecting the trunk's input statistics into %s\n",ts);
+    }
+    const char *t4=getenv("Q38_TRUNK_CPU_INT4"),*vk=getenv("COLI_VULKAN"),*cu=getenv("COLI_CUDA");
+    int int4=t4&&t4[0]=='1'&&!t4[1];
+    if(int4&&((vk&&vk[0]=='1')||(cu&&cu[0]=='1'))){
+        fprintf(stderr,"[qwen38] Q38_TRUNK_CPU_INT4=1 ignored: a device tier reads the trunk's int8 rows\n");int4=0;
+    }
+    const char *head4=getenv("Q38_TRUNK_INT4_HEAD"),*sin=getenv("Q38_TRUNK_STATS_IN");
+    FILE *stats_in=int4&&sin&&*sin?fopen(sin,"rb"):NULL;
+    if(int4&&sin&&*sin&&!stats_in){perror(sin);exit(1);}
+    int n4=0,weighted=0;size_t bytes4=0;
     for(int i=0;i<g_trunk_n;i++){
         Q38Weight *w=g_trunk[i].w;
+        if(g_trunk[i].gq)continue;   /* a GGUF's blocks: the CPU keeps its own kernels on them */
+        int take4=int4&&w->data&&!w->q8&&w->cols%XF_BLOCK==0&&strcmp(g_trunk[i].name,"router")&&
+                  (strcmp(g_trunk[i].name,"lmhead")||(head4&&head4[0]=='1'));
+        if(take4){
+            float *imp=q38_tstats_importance(stats_in,&g_trunk[i],w->cols);
+            q38_trunk_int4(w,imp);weighted+=imp!=NULL;free(imp);
+            size_t b=(size_t)w->rows*(xf_row_bytes(w->cols)+(size_t)xf_groups(w->cols)*sizeof(float));
+            bytes4+=b;n4++;
+            uint64_t was=q38_weight_bytes(w);
+            if(w->owns_data){free(w->data);w->data=NULL;w->owns_data=0;released+=was;
+                             m->resident_weight_bytes-=was;m->resident_weight_bytes+=b;}
+            continue;
+        }
         if(!w->q8)q38_trunk_quantize(w,&w->q8,&w->q8sc);
         bytes+=(size_t)w->rows*w->cols+(size_t)w->rows*sizeof(float); n++;
         if(w->owns_data&&w->data){
@@ -2648,8 +3700,105 @@ static void q38_trunk_cpu_int8(Model *m) {
             m->resident_weight_bytes-=was; m->resident_weight_bytes+=(size_t)w->rows*w->cols+(size_t)w->rows*sizeof(float);
         }
     }
+    if(stats_in)fclose(stats_in);
+    if(n4)fprintf(stderr,"[qwen38] trunk: %d matrices int4-g64 on the CPU (%.2f GiB, %d weighted by Q38_TRUNK_STATS_IN), the rest int8\n",
+                  n4,bytes4/1073741824.0,weighted);
     fprintf(stderr,"[qwen38] trunk: %d matrices int8 on the CPU (%.2f GiB, %.2f GiB of BF16 released) in %.1fs; Q38_TRUNK_CPU_INT8=0 keeps BF16\n",
             n,bytes/1073741824.0,released/1073741824.0,now_s()-t0);
+}
+
+/* The trunk's int8 rows interleaved by 16 for the CPU's kernel (idot.h matmul_q_idot_r16):
+ * the same bytes and the same bits, a prompt's rows about twice as fast. In place, a group
+ * of 16 rows at a time (a group's rows and its interleaved form are the same byte range).
+ * After the draft head has read the rows, and only when no device reads them: the caller
+ * skips it under a GPU tier or the Vulkan dense path. Q38_ILV16=0 keeps the rows. */
+static void q38_trunk_q8_interleave(Model *m) {
+    (void)m;
+#ifdef IDOT_R16
+    const char *e=getenv("Q38_ILV16"); if(e&&!strcmp(e,"0"))return;
+    if(!m->trunk_table_built)return;
+    int n=0; double t0=now_s();
+    for(int i=0;i<g_trunk_n;i++){
+        Q38Weight *w=g_trunk[i].w;
+        if(!w->q8||w->q8r16||w->rows%16||w->cols%4)continue;
+        const int I=w->cols;
+        #pragma omp parallel
+        {
+            int8_t *t=(int8_t*)malloc((size_t)16*I);
+            if(!t){fprintf(stderr,"OOM trunk interleave\n");exit(1);}
+            #pragma omp for schedule(static)
+            for(int g=0;g<w->rows/16;g++){
+                int8_t *grp=w->q8+(size_t)g*16*I;
+                i8r16_pack(t,grp,16,I); memcpy(grp,t,(size_t)16*I);
+            }
+            free(t);
+        }
+        w->q8r16=1; n++;
+    }
+    if(n)fprintf(stderr,"[qwen38] trunk: %d int8 matrices interleaved by 16 for the CPU in %.2fs (Q38_ILV16=0 keeps the rows)\n",n,now_s()-t0);
+#endif
+}
+/* Q38_DRAFT_HEAD=int4: the MTP drafts' lm_head as planar int4-g64 (expert_ffn.h's
+ * layout, absmax/7 per 64), built once from the rows the model keeps (int8 or BF16).
+ * A draft only needs the most likely token and the verify recomputes every row with
+ * the full lm_head, so the generated text is the same; what can change is how often a
+ * draft is right. Half the bytes of the int8 rows, read with int8 activations. */
+static void q38_draft_head_build(Model *m) {
+    const char *e=getenv("Q38_DRAFT_HEAD");
+    if(!e||strcmp(e,"int4")||!m->mtp_wiring||!m->lm_head.rows)return;
+    const int V=m->lm_head.rows,H=m->lm_head.cols;
+    if(H%XF_BLOCK){fprintf(stderr,"[qwen38] Q38_DRAFT_HEAD=int4: hidden %d is not a multiple of 64, ignored\n",H);return;}
+    double t0=now_s();
+    m->draft_codes=(uint8_t*)malloc((size_t)V*xf_row_bytes(H));
+    m->draft_sc=(float*)malloc((size_t)V*xf_groups(H)*sizeof(float));
+    if(!m->draft_codes||!m->draft_sc){fprintf(stderr,"OOM draft head\n");exit(1);}
+    const Q38Weight *w=&m->lm_head;
+    #pragma omp parallel
+    {
+        float *row=falloc(H);
+        #pragma omp for schedule(static)
+        for(int r=0;r<V;r++){
+            if(w->q8)for(int i=0;i<H;i++)row[i]=(float)w->q8[(size_t)r*H+i]*w->q8sc[r];   /* the trunk's int8 rows (BF16 released) */
+            else q38_weight_row(w,r,row);
+            uint8_t *dst=m->draft_codes+(size_t)r*xf_row_bytes(H);
+            for(int g=0;g<H/XF_BLOCK;g++){
+                const float *v=row+g*XF_BLOCK;float am=0.f;
+                for(int i=0;i<XF_BLOCK;i++){float a=fabsf(v[i]);if(a>am)am=a;}
+                float sc=am>0.f?am/7.f:1.f,inv=1.f/sc;
+                m->draft_sc[(size_t)r*xf_groups(H)+g]=sc;
+                for(int k=0;k<32;k++){
+                    int lo=(int)lrintf(v[k]*inv),hi=(int)lrintf(v[k+32]*inv);
+                    lo=lo<-8?-8:lo>7?7:lo;hi=hi<-8?-8:hi>7?7:hi;
+                    dst[g*XF_BLOCK_BYTES+k]=(uint8_t)((lo+8)|((hi+8)<<4));
+                }
+            }
+        }
+        free(row);
+    }
+    fprintf(stderr,"[qwen38] MTP drafts: lm_head as int4-g64 (%.2f GiB, built in %.1fs); the verify keeps the full one\n",
+            ((double)V*xf_row_bytes(H)+(double)V*xf_groups(H)*sizeof(float))/1073741824.0,now_s()-t0);
+}
+/* logit[V] for one row x[H]: the draft head when there is one, else lm_head */
+#ifdef COLI_VULKAN
+static int q38c_draft_logits(Model *m,float *logit,const float *x);   /* qwen38_chain.h */
+static int q38c_mtp_rows(Model *m,const float *streams,const int *next,int S,int pos_base,float *logit,
+                         float *hidden,int settle);   /* qwen38_chain.h: the head's layer on the device */
+static void q38c_mtp_host(Model *m,int pos);
+#endif
+static void q38_draft_logits(Model *m,float *logit,const float *x) {
+    const int V=m->lm_head.rows,H=m->lm_head.cols;
+#ifdef COLI_VULKAN
+    if(q38c_draft_logits(m,logit,x))return;   /* the device's lm_head, where the chain holds it */
+#endif
+    if(!m->draft_codes){q38_weight_matmul(logit,x,&m->lm_head,1,H,V);return;}
+    int8_t *xq=(int8_t*)malloc((size_t)H);float *xsum=falloc(H/XF_BLOCK);
+    if(!xq){fprintf(stderr,"OOM draft activation\n");exit(1);}
+    float sx=xf_act_i8(x,H,xq,xsum);
+    const size_t rb=xf_row_bytes(H);const int ng=xf_groups(H);
+    #pragma omp parallel for schedule(static)
+    for(int r=0;r<V;r++)
+        logit[r]=xf_dot_i8(m->draft_codes+(size_t)r*rb,m->draft_sc+(size_t)r*ng,xq,xsum,sx,H);
+    free(xq);free(xsum);
 }
 #ifdef COLI_VULKAN
 /* ---- dense weights on the device only (COLI_VK_DENSE_HOST) ----------------------
@@ -2659,7 +3808,8 @@ static void q38_trunk_cpu_int8(Model *m) {
  * after a lost device: q38_weight_matmul reads it back from the checkpoint first
  * (q38_load_weight, then the int8 rows exactly as q38_trunk_cpu_int8 made them) and the
  * copy stays from there on. What keeps its host copy: the embedding (its rows are
- * gathered on the CPU), the vision tower (CPU only), norms and vectors. */
+ * gathered on the CPU), the vision tower (CPU only), norms and vectors, and with an MTP draft
+ * list (q38_vocab_decide) the lm_head, because the list is scored from its int8 rows. */
 static Model *g_q38_dho_model;
 static pthread_mutex_t g_q38_dho_mx=PTHREAD_MUTEX_INITIALIZER;
 static size_t q38_dho_host_bytes(const Q38Weight *w) {
@@ -2684,8 +3834,12 @@ static void q38_dho_reload(Q38Weight *w) {
     }
     pthread_mutex_unlock(&g_q38_dho_mx);
 }
+/* The CPU scores the draft list from the int8 rows of the lm_head. */
+static int q38_dho_keeps_host_copy(const Q38Weight *w) {
+    return g_q38_dho_model->draft_vocab&&w==&g_q38_dho_model->lm_head;
+}
 static void q38_dho_drop(Q38Weight *w,size_t *bytes,int *n) {
-    if(!w->vk_res||w->vk_gone||!q38_vk_eligible(w)||!w->vk_name||!q38_vk_tensor(w))return;
+    if(!w->vk_res||w->vk_gone||!q38_vk_dense_ok(w)||!w->vk_name||!q38_vk_tensor(w)||q38_dho_keeps_host_copy(w))return;
     size_t b=q38_dho_host_bytes(w);
     w->vk_fmt=q38_vk_fmt(w);
     if(w->q8){free(w->q8);free(w->q8sc);w->q8=NULL;w->q8sc=NULL;}
@@ -2713,7 +3867,7 @@ static void q38_dho_each(Model *m,void (*f)(Q38Weight *,size_t *,int *),size_t *
     if(m->mtp&&head){f(&m->mtp_fc_emb,bytes,n);f(&m->mtp_fc_hid,bytes,n);f(&m->mtp_mixer.down,bytes,n);f(&m->mtp_mixer.up,bytes,n);}
 }
 static void q38_dho_count(Q38Weight *w,size_t *bytes,int *n) {
-    if(w->vk_res&&!w->vk_off&&q38_vk_eligible(w)){*bytes+=q38_dho_host_bytes(w);(*n)++;}
+    if(w->vk_res&&!w->vk_off&&q38_vk_dense_ok(w)&&!q38_dho_keeps_host_copy(w)){*bytes+=q38_dho_host_bytes(w);(*n)++;}
 }
 #endif
 
@@ -2727,6 +3881,18 @@ static void q38_trunk_place_all(Model *m) {
         int dev=qt_place_of(it->name,it->layer);
         if(dev==QT_PLACE_CPU)continue;
         int O=w->rows,I=w->cols;
+        if(it->gq){   /* a GGUF's blocks as the file has them (the rows back from the CPU's interleaved copy) */
+            const int fmt=q38_cuda_gq_fmt(w); uint8_t *rows=NULL;
+            if(gq_r16_base(w->gq_type)>=0){
+                rows=(uint8_t*)malloc((size_t)O*gq_row_bytes(fmt-100,I));
+                if(!rows){fprintf(stderr,"OOM GGUF trunk matrix for the device\n");exit(1);}
+                gq_r16_unpack(w->gq_type,rows,(const uint8_t*)w->data,O,I);
+            }
+            int h=qt_dense_init_fmt(rows?(const void*)rows:w->data,NULL,fmt,I,O,dev);
+            free(rows);
+            if(h>=0){ w->gpu=h+1; placed++; placed_bytes+=(size_t)O*gq_row_bytes(fmt-100,I); }
+            continue;
+        }
         if(!w->q8)q38_trunk_quantize(w,&w->q8,&w->q8sc);   /* kept: the CPU answers prefill rows from the same bytes */
         const int8_t *q=w->q8; const float *sc=w->q8sc;
         int h=qt_dense_init(q,sc,I,O,dev);
@@ -2743,7 +3909,7 @@ static void q38_trunk_place_all(Model *m) {
         if(h>=0){ w->gpu=h+1; placed++; placed_bytes+=(size_t)O*I; }
     }
     if(g_trunk_n)
-        fprintf(stderr,"[qtier] qwen38 trunk: %d of %d offered matrices resident as int8 (%.2f GiB) in %.1fs; the rest answers from the CPU\n",
+        fprintf(stderr,"[qtier] qwen38 trunk: %d of %d offered matrices resident (int8, a GGUF's blocks as they are; %.2f GiB) in %.1fs; the rest answers from the CPU\n",
                 placed,offered,placed_bytes/1073741824.0,now_s()-t0);
 }
 
@@ -2751,15 +3917,112 @@ static void q38_trunk_place_all(Model *m) {
  * tier reads that itself); it needs every layer's experts in native FP8 with
  * the block-scale bank resident, because the GPU kernels consume exactly the
  * checkpoint layout (e4m3 bytes + [ceil(O/128), ceil(I/128)] scales). */
+/* The CUDA tier's warm start for a GGUF's experts: the history's most used (.coli_usage,
+ * qt_heat_order) until the budget is full, read by layer and expert as the file has them
+ * (the three matrices' rows) in parallel and handed over (the tier copies them). Before,
+ * the tier started empty and filled as the CPU's experts passed, converting each. */
+static void q38_tier_warm(Model *m,int hist) {
+    Cfg *c=&m->c; const int L=c->layers,E=c->experts,all=L*E;
+    const char *w=getenv("COLI_CUDA_TIER_WARM");   /* 0: the tier fills as experts pass */
+    if(w&&w[0]=='0')return;
+    /* hist: rt_load read selections. rt_init makes the counters with or without a history, and
+     * their zeros would only replace the tier's order (HEAT_FILE's, or none) with a sort of ties. */
+    if(hist)qt_heat_order(rt_counts_all(),L,E);
+    int *pl=(int*)malloc((size_t)all*sizeof(int)),*pe=(int*)malloc((size_t)all*sizeof(int));
+    if(!pl||!pe){free(pl);free(pe);return;}
+    int n=qt_plan_fill(pl,pe,all);
+    /* the plan read by layer, then expert: a layer's experts lie in that order in its three
+     * tensors, and in the history's order the reads jump across the file, each one on its own
+     * on a disk whose pages are not cached. The set is the plan's; the tier takes its arena's
+     * slots, which are all alike, in this order. */
+    uint8_t *in=(uint8_t*)calloc((size_t)all,1);
+    if(in){
+        for(int i=0;i<n;i++)in[pl[i]*E+pe[i]]=1;
+        for(int g=0,k=0;g<all;g++)if(in[g]){pl[k]=g/E;pe[k]=g%E;k++;}
+        free(in);
+    }
+    double t0=now_s();
+    #pragma omp parallel
+    {
+        uint8_t *buf=NULL; size_t cap=0;
+        #pragma omp for schedule(dynamic,4)
+        for(int i=0;i<n;i++){
+            const gguf_tensor *t[3]; q38_gg_expert_tensors(m,pl[i],t);
+            int64_t eb[3]; size_t tot=0;
+            for(int k=0;k<3;k++){eb[k]=t[k]->nbytes/E;tot+=(size_t)eb[k];}
+            if(tot>cap){uint8_t *nb=(uint8_t*)realloc(buf,tot);if(!nb){qt_note_planned(pl[i],pe[i],NULL,NULL,NULL,NULL,NULL,NULL);continue;}buf=nb;cap=tot;}
+            for(int k=0,o=0;k<3;o+=(int)eb[k],k++)q38_gg_read(t[k],buf+o,(int64_t)pe[i]*eb[k],eb[k]);
+            qt_note_planned(pl[i],pe[i],buf,buf+eb[0],buf+eb[0]+eb[1],NULL,NULL,NULL);
+        }
+        free(buf);
+    }
+    qt_fill_wait();
+    fprintf(stderr,"[qtier] qwen38: warm start, %d of the GGUF's experts in VRAM, the history's most used first (%s) -- %.1f s\n",
+            n,hist?".coli_usage":"no history: expert by expert across the layers",now_s()-t0);
+    free(pl);free(pe);
+}
+#ifdef COLI_CUDA
+static size_t q38cc_reserve_bytes(Model *m);   /* qwen38_cuda_chain.h */
+static int q38cc_env_on(void);
+#endif
 static void q38_tier_start(Model *m,int cap) {
     const char *on=getenv("COLI_CUDA");
     if(!on||on[0]!='1'||on[1])return;
     Cfg *c=&m->c;
+    if(g_q38_gguf){
+#ifdef COLI_CUDA
+        /* a GGUF's experts as the file has them (the backend's block formats), gate/up and
+         * down types by layer; every layer's types ones the tier's groups compute */
+        const int L=c->layers;
+        int *tg=(int*)malloc((size_t)L*sizeof(int)),*td=(int*)malloc((size_t)L*sizeof(int));
+        size_t *bg=(size_t*)malloc((size_t)L*sizeof(size_t)),*bd=(size_t*)malloc((size_t)L*sizeof(size_t));
+        int ok=tg&&td&&bg&&bd;
+        for(int l=0;ok&&l<L;l++){
+            const gguf_tensor *t[3]; q38_gg_expert_tensors(m,l,t);
+            int eg=coli_cuda_block_elems(100+t[0]->type),ed=coli_cuda_block_elems(100+t[2]->type);
+            ok=t[0]->type==t[1]->type&&cc_moe_block_type(t[0]->type)&&cc_moe_block_type(t[2]->type)&&
+               eg>0&&ed>0&&c->hidden%eg==0&&c->inter%ed==0;
+            if(ok){ tg[l]=t[0]->type; td[l]=t[2]->type; bg[l]=(size_t)(t[0]->nbytes/c->experts); bd[l]=(size_t)(t[2]->nbytes/c->experts); }
+        }
+        if(!ok)fprintf(stderr,"[qtier] qwen38: the GGUF's expert types are not all ones the CUDA tier computes; the experts stay on the CPU\n");
+        q38_trunk_offer_all(m);
+        /* the chain's own device memory (COLI_CUDA_CHAIN=1), before the arena takes the budget */
+        if(ok&&q38cc_env_on()){
+            size_t rb=q38cc_reserve_bytes(m);
+            qt_trunk_offer("chain",0,rb);
+            fprintf(stderr,"[qtier] qwen38: %.2f GiB kept for the CUDA chain (its mirrors at %d positions, its scratch and own matrices)\n",
+                    rb/1073741824.0,m->kv_cap>0?m->kv_cap:m->max_t>0?m->max_t:qwen38_max_ctx());
+        }
+        if(ok&&qt_init_gguf(L,c->experts,c->hidden,c->inter,cap,c->topk,tg,td,bg,bd,1)){
+            atexit(qt_shutdown); g_q38_gguf_tier=1;
+            fprintf(stderr,"[qtier] qwen38: the GGUF's experts on the CUDA tier as the file has them (RAM LRU %d/layer; experts go to VRAM as they get hot)\n",cap);
+            q38_trunk_place_all(m);   /* the warm start (q38_tier_warm) once the history is loaded */
+        }
+        free(tg); free(td); free(bg); free(bd);
+#else
+        (void)cap;
+#endif
+        return;
+    }
     if(m->x4){
         /* The tier streams e4m3 bytes (fmt 8) and copies them at qt_note; its
-         * int4 mode wants every expert resident in RAM. Neither is this. */
-        fprintf(stderr,"[qtier] qwen38: the expert tier streams native FP8 experts only; the int4-g64 "
-                       "experts stay on the CPU and the tier stays off (Q38_EXPERT_INT4=0 gives it the FP8 ones)\n");
+         * int4 mode wants every expert resident in RAM. Neither is this. A build with
+         * Vulkan too hands these experts to the Vulkan tier, which takes colibri's int4
+         * and low-bit records (blockdec.glsl), and its dense chain: the same card, unless
+         * COLI_VULKAN=0 keeps them on the CPU (the other engines' way, #2248). */
+#ifdef COLI_VULKAN
+        const char *vk=getenv("COLI_VULKAN");
+        if(!(vk&&*vk)){
+            setenv("COLI_VULKAN","1",1);
+            fprintf(stderr,"[qtier] qwen38: the expert tier streams native FP8 experts only; the %s experts go to "
+                           "the Vulkan tier, the same card (COLI_VULKAN=0 keeps them on the CPU)\n",
+                    m->x4->lb?m->x4->lb->name:"int4-g64");
+            return;
+        }
+#endif
+        fprintf(stderr,"[qtier] qwen38: the expert tier streams native FP8 experts only; the %s "
+                       "experts stay on the CPU and the tier stays off (Q38_EXPERT_INT4=0 gives it the FP8 ones)\n",
+                m->x4->lb?m->x4->lb->name:"int4-g64");
         return;
     }
     if(!m->native_fp8){
@@ -2780,8 +4043,10 @@ static void q38_tier_start(Model *m,int cap) {
          * on one card, the conv ring, the recurrence and the gated norm go there
          * too, and a decode token runs the layer end to end on the device
          * (qwen36 measured 8 of 39 ms/token in these round trips). */
-        const char *dg=getenv("Q38_DN_GPU");
-        if(dg&&dg[0]=='1'&&!dg[1]){
+        const char *dg=getenv("Q38_DN_GPU"),*cc=getenv("COLI_CUDA_CHAIN");
+        if(cc&&cc[0]=='1'&&dg&&dg[0]=='1')
+            fprintf(stderr,"[dn] qwen38: COLI_CUDA_CHAIN=1 runs the DeltaNet layers inside the chain; Q38_DN_GPU's per-layer step is not set up beside it\n");
+        if(dg&&dg[0]=='1'&&!dg[1]&&!(cc&&cc[0]=='1')){
             int n=0; double vram=0;
             for(int i=0;i<c->layers;i++){
                 Layer *L=&m->L[i];
@@ -2805,16 +4070,615 @@ static void q38_tier_start(Model *m,int cap) {
  * resident. The MTP head's layer too (index c.layers, the tier's extra layer), with
  * the experts the snapshot keeps (FP8 beside the sidecar's int4). A slot's bytes are
  * what the tier reads when it promotes the expert: codes and scales of each matrix. */
-static VktExpertSrc q38_vk_src(const Slot *ex) {
+/* GGUF mode: the tier takes int8 with a scale per 32 (gq_rows_i8, +0.4-0.55% on the ggml
+ * types, exact for Q8_0); converted only for an expert it takes (vkt_wants), and given
+ * back once it has copied it (q38_vk_src_done): no second copy stays in RAM. */
+static int g_q38_vk_raw;   /* the tier holds the GGUF experts' blocks as the file has them (blockdec.glsl) */
+static VktExpertSrc q38_vk_src(Slot *ex) {
+    if(g_q38_gguf&&ex->gate.kind==Q38_WEIGHT_GGML&&g_q38_vk_raw){
+        if(gq_r16_base(ex->gate.gq_type)>=0||gq_r16_base(ex->up.gq_type)>=0||gq_r16_base(ex->down.gq_type)>=0){
+            /* the file's rows back from the interleaved slot, in one copy q38_vk_src_done frees */
+            const Q38Weight *w[3]={&ex->gate,&ex->up,&ex->down}; int64_t off[4]={0};
+            for(int k=0;k<3;k++){
+                const int ft=gq_r16_base(w[k]->gq_type)>=0?gq_r16_base(w[k]->gq_type):w[k]->gq_type;
+                off[k+1]=off[k]+(int64_t)w[k]->rows*gq_row_bytes(ft,w[k]->cols);
+            }
+            if(!ex->t8&&!(ex->t8=(int8_t*)malloc((size_t)off[3]))){fprintf(stderr,"OOM GGUF expert for the Vulkan tier\n");exit(1);}
+            uint8_t *b=(uint8_t*)ex->t8;
+            for(int k=0;k<3;k++){
+                if(gq_r16_base(w[k]->gq_type)>=0)gq_r16_unpack(w[k]->gq_type,b+off[k],(const uint8_t*)w[k]->data,w[k]->rows,w[k]->cols);
+                else memcpy(b+off[k],w[k]->data,(size_t)(off[k+1]-off[k]));
+            }
+            return (VktExpertSrc){b,b+off[1],b+off[2],NULL,NULL,NULL};
+        }
+        return (VktExpertSrc){ex->gate.data,ex->up.data,ex->down.data,NULL,NULL,NULL};
+    }
+#ifdef VQ2R16_ON
+    if(ex->gate.kind==Q38_WEIGHT_VQ2&&ex->gate.r16){
+        /* as below for the rows: per matrix its codes, then its scale bytes and f32 row scales */
+        const Q38Weight *w[3]={&ex->gate,&ex->up,&ex->down};size_t tot=0;
+        for(int k=0;k<3;k++)tot+=(size_t)w[k]->rows*(vq2_code_bytes(w[k]->cols)+vq2_scale_bytes(w[k]->cols)+sizeof(float));
+        if(!ex->t8&&!(ex->t8=(int8_t*)malloc(tot))){fprintf(stderr,"OOM low-bit expert for the Vulkan tier\n");exit(1);}
+        uint8_t *b=(uint8_t*)ex->t8;const void *cd[3],*bl[3];
+        for(int k=0;k<3;k++){
+            const size_t cbk=(size_t)w[k]->rows*vq2_code_bytes(w[k]->cols),qr=(size_t)w[k]->rows*vq2_scale_bytes(w[k]->cols);
+            vq2r16_unpack(b,b+cbk,(float*)(b+cbk+qr),(const uint8_t*)w[k]->data,w[k]->rows,w[k]->cols);
+            cd[k]=b;bl[k]=b+cbk;b+=cbk+qr+(size_t)w[k]->rows*sizeof(float);
+        }
+        return (VktExpertSrc){cd[0],cd[1],cd[2],bl[0],bl[1],bl[2]};
+    }
+#endif
+#ifdef XL16_ON
+    if(ex->gate.kind==Q38_WEIGHT_LOWBIT16&&ex->gate.r16){
+        /* the interleaved slot back to the rows the tier reads: per matrix its codes, then
+         * its scale bytes and f32 row scales, in one copy q38_vk_src_done frees */
+        const Q38Weight *w[3]={&ex->gate,&ex->up,&ex->down};size_t tot=0;
+        for(int k=0;k<3;k++)tot+=(size_t)w[k]->rows*(xl_code_bytes(w[k]->lbits,w[k]->cols)+xl_scale_bytes(w[k]->cols)+sizeof(float));
+        if(!ex->t8&&!(ex->t8=(int8_t*)malloc(tot))){fprintf(stderr,"OOM low-bit expert for the Vulkan tier\n");exit(1);}
+        uint8_t *b=(uint8_t*)ex->t8;const void *cd[3],*bl[3];
+        for(int k=0;k<3;k++){
+            const size_t cbk=(size_t)w[k]->rows*xl_code_bytes(w[k]->lbits,w[k]->cols),qr=(size_t)w[k]->rows*xl_scale_bytes(w[k]->cols);
+            xl16_unpack(b,b+cbk,(float*)(b+cbk+qr),(const uint8_t*)w[k]->data,w[k]->rows,w[k]->lbits,w[k]->cols);
+            cd[k]=b;bl[k]=b+cbk;b+=cbk+qr+(size_t)w[k]->rows*sizeof(float);
+        }
+        return (VktExpertSrc){cd[0],cd[1],cd[2],bl[0],bl[1],bl[2]};
+    }
+#endif
+#ifdef XF16_ON
+    if(ex->gate.kind==Q38_WEIGHT_INT4G64&&ex->gate.r16){
+        /* the interleaved slot back to the planar rows and their scales the tier reads, per
+         * matrix its codes then its scales, in one copy q38_vk_src_done frees */
+        const Q38Weight *w[3]={&ex->gate,&ex->up,&ex->down};size_t tot=0;
+        for(int k=0;k<3;k++)tot+=(size_t)w[k]->rows*(xf_row_bytes(w[k]->cols)+(size_t)xf_groups(w[k]->cols)*sizeof(float));
+        if(!ex->t8&&!(ex->t8=(int8_t*)malloc(tot))){fprintf(stderr,"OOM int4 expert for the Vulkan tier\n");exit(1);}
+        uint8_t *b=(uint8_t*)ex->t8;const void *cd[3],*sc[3];
+        for(int k=0;k<3;k++){
+            const size_t cbk=(size_t)w[k]->rows*xf_row_bytes(w[k]->cols);
+            xf16_unpack(b,(float*)(b+cbk),(const uint8_t*)w[k]->data,w[k]->rows,w[k]->cols);
+            cd[k]=b;sc[k]=b+cbk;b+=cbk+(size_t)w[k]->rows*xf_groups(w[k]->cols)*sizeof(float);
+        }
+        return (VktExpertSrc){cd[0],cd[1],cd[2],sc[0],sc[1],sc[2]};
+    }
+#endif
+    if(ex->gate.kind==Q38_WEIGHT_INT2G32||ex->gate.kind==Q38_WEIGHT_LOWBIT16||ex->gate.kind==Q38_WEIGHT_VQ2){
+        /* the low-bit forms (VKT_SRC_LB_*): codes, and per matrix its group scales (a byte
+         * per 32 inputs, vq2 per 64) then its f32 row scales in one block, the copy freed by
+         * q38_vk_src_done */
+        const Q38Weight *w[3]={&ex->gate,&ex->up,&ex->down};size_t tot=0;
+        const size_t per=ex->gate.kind==Q38_WEIGHT_VQ2?64:32;
+        for(int k=0;k<3;k++)tot+=(size_t)w[k]->rows*((size_t)w[k]->cols/per+4);
+        if(!ex->t8&&!(ex->t8=(int8_t*)malloc(tot))){fprintf(stderr,"OOM low-bit expert for the Vulkan tier\n");exit(1);}
+        uint8_t *b=(uint8_t*)ex->t8;const void *bl[3];
+        for(int k=0;k<3;k++){
+            size_t qr=(size_t)w[k]->rows*((size_t)w[k]->cols/per);
+            memcpy(b,w[k]->x2q,qr);memcpy(b+qr,w[k]->scales,(size_t)w[k]->rows*sizeof(float));
+            bl[k]=b;b+=qr+(size_t)w[k]->rows*sizeof(float);
+        }
+        return (VktExpertSrc){ex->gate.data,ex->up.data,ex->down.data,bl[0],bl[1],bl[2]};
+    }
+    if(g_q38_gguf&&ex->gate.kind==Q38_WEIGHT_GGML){
+        const Q38Weight *w[3]={&ex->gate,&ex->up,&ex->down}; const int64_t n=(int64_t)ex->gate.rows*ex->gate.cols;
+        if(!ex->t8){
+            ex->t8=(int8_t*)malloc((size_t)(3*n)); ex->t8s=(float*)malloc((size_t)(3*(n/32))*sizeof(float));
+            if(!ex->t8||!ex->t8s){fprintf(stderr,"OOM GGUF expert for the Vulkan tier\n");exit(1);}
+        }
+        for(int k=0;k<3;k++){
+            int t=w[k]->gq_type; const uint8_t *rows=(const uint8_t*)w[k]->data; uint8_t *plain=NULL;
+            if(gq_r16_base(t)>=0){   /* the device reads the file's rows */
+                const int ft=gq_r16_base(t);
+                plain=(uint8_t*)malloc((size_t)(w[k]->rows*gq_row_bytes(ft,w[k]->cols)));
+                if(!plain){fprintf(stderr,"OOM GGUF expert for the Vulkan tier\n");exit(1);}
+                gq_r16_unpack(t,plain,rows,w[k]->rows,w[k]->cols); rows=plain; t=ft;
+            }
+            gq_rows_i8(t,rows,w[k]->rows,w[k]->cols,1.f,ex->t8+k*n,ex->t8s+k*(n/32));
+            free(plain);
+        }
+        return (VktExpertSrc){ex->t8,ex->t8+n,ex->t8+2*n,ex->t8s,ex->t8s+n/32,ex->t8s+2*(n/32)};
+    }
     VktExpertSrc s={ex->gate.data,ex->up.data,ex->down.data,ex->gate.scales,ex->up.scales,ex->down.scales};
     return s;
 }
+static void q38_vk_src_done(Slot *ex) { free(ex->t8); free(ex->t8s); ex->t8=NULL; ex->t8s=NULL; }
+/* vkt_note for an expert the CPU computed: GGUF converts only one the tier takes now */
+static void q38_vk_note(int layer,int eid,Slot *ex) {
+    if(g_q38_gguf&&!vkt_wants(layer,eid))return;
+    VktExpertSrc src=q38_vk_src(ex); vkt_note(layer,eid,&src); q38_vk_src_done(ex);
+}
+/* Q38_ACT_STATS=<file>: calibration statistics of the routed experts' inputs, for a
+ * data-aware quantizer: per layer and expert, the rows seen and the sum of squares of
+ * every gate/up input channel (hidden wide) and every down input channel (the SwiGLU
+ * output, inter wide), as float64. Collected wherever the CPU computes a routed
+ * expert: the prefill's grouped loop and the decode rows (a teacher-forced PPL=1 run
+ * prefills only its prompt, then scores token by token). Experts a device tier runs
+ * are not seen. Added to the file at exit so that several runs add up. */
+static double *g_q38_act; static int64_t *g_q38_act_n; static int g_q38_act_dims[4]; static char g_q38_act_path[4096];
+static void q38_act_add(int layer,int e,const float *xin,const float *hid,int n) {
+    const int L=g_q38_act_dims[0],E=g_q38_act_dims[1],H=g_q38_act_dims[2],I=g_q38_act_dims[3];
+    if(!g_q38_act||layer<0||layer>=L||e<0||e>=E)return;
+    double *a=g_q38_act+((int64_t)layer*E+e)*(H+I);
+    for(int r=0;r<n;r++){
+        const float *x=xin+(int64_t)r*H,*h=hid+(int64_t)r*I;
+        for(int i=0;i<H;i++)a[i]+=(double)x[i]*x[i];
+        for(int j=0;j<I;j++)a[H+j]+=(double)h[j]*h[j];
+    }
+    g_q38_act_n[(int64_t)layer*E+e]+=n;
+}
+static void q38_act_write(void) {
+    const int64_t cells=(int64_t)g_q38_act_dims[0]*g_q38_act_dims[1],width=g_q38_act_dims[2]+g_q38_act_dims[3];
+    FILE *f=fopen(g_q38_act_path,"rb");
+    if(f){   /* an earlier run's statistics of the same geometry: add them */
+        int dims[4]; double *a=(double*)malloc((size_t)(cells*width)*sizeof(double)); int64_t *n=(int64_t*)malloc((size_t)cells*sizeof(int64_t));
+        char magic[8];
+        if(a&&n&&fread(magic,8,1,f)==1&&!memcmp(magic,"Q38ACT1\0",8)&&fread(dims,sizeof dims,1,f)==1&&!memcmp(dims,g_q38_act_dims,sizeof dims)&&
+           fread(n,sizeof(int64_t),(size_t)cells,f)==(size_t)cells&&fread(a,sizeof(double),(size_t)(cells*width),f)==(size_t)(cells*width)){
+            for(int64_t i=0;i<cells;i++)g_q38_act_n[i]+=n[i];
+            for(int64_t i=0;i<cells*width;i++)g_q38_act[i]+=a[i];
+        } else fprintf(stderr,"[act] %s: not statistics of this model, overwritten\n",g_q38_act_path);
+        free(a);free(n);fclose(f);
+    }
+    f=fopen(g_q38_act_path,"wb");
+    if(!f){perror(g_q38_act_path);return;}
+    int ok=fwrite("Q38ACT1\0",8,1,f)==1&&fwrite(g_q38_act_dims,sizeof g_q38_act_dims,1,f)==1&&
+           fwrite(g_q38_act_n,sizeof(int64_t),(size_t)cells,f)==(size_t)cells&&
+           fwrite(g_q38_act,sizeof(double),(size_t)(cells*width),f)==(size_t)(cells*width);
+    if(fclose(f)||!ok)fprintf(stderr,"[act] %s: write failed\n",g_q38_act_path);
+    else{ int64_t rows=0; for(int64_t i=0;i<cells;i++)rows+=g_q38_act_n[i];
+          fprintf(stderr,"[act] %s: %lld expert rows in total\n",g_q38_act_path,(long long)rows); }
+}
+static void q38_act_init(Model *m) {
+    const char *p=getenv("Q38_ACT_STATS");
+    if(!p||!*p||m->c.experts<1)return;
+    snprintf(g_q38_act_path,sizeof g_q38_act_path,"%s",p);
+    g_q38_act_dims[0]=m->c.layers;g_q38_act_dims[1]=m->c.experts;g_q38_act_dims[2]=m->c.hidden;g_q38_act_dims[3]=m->c.inter;
+    const int64_t cells=(int64_t)m->c.layers*m->c.experts;
+    g_q38_act=(double*)calloc((size_t)(cells*(m->c.hidden+m->c.inter)),sizeof(double));
+    g_q38_act_n=(int64_t*)calloc((size_t)cells,sizeof(int64_t));
+    if(!g_q38_act||!g_q38_act_n){fprintf(stderr,"Q38_ACT_STATS: out of memory\n");exit(1);}
+    atexit(q38_act_write);
+    fprintf(stderr,"[act] collecting the routed experts' input statistics into %s\n",p);
+}
+
+/* Q38_ACT_COV=<file>: per layer the second moment sum_t x x^T of the routed experts'
+ * input (the hidden row the router and every expert of the layer read), H x H float64,
+ * for the error-compensating quantizer (tools/convert_qwen38_experts_int4.py --cov).
+ * Once per token and layer, in decode rows and prefill chunks alike; added to the file
+ * at exit, like Q38_ACT_STATS. The file: "Q38COV1\0", int32 layers and hidden, int64
+ * tokens per layer, then each layer's full symmetric matrix. */
+static double *g_q38_cov; static int64_t *g_q38_cov_n; static int g_q38_cov_dims[2]; static char g_q38_cov_path[4096];
+static void q38_cov_add(int layer,const float *x,int n) {
+    const int L=g_q38_cov_dims[0],H=g_q38_cov_dims[1];
+    if(!g_q38_cov||layer<0||layer>=L||n<1)return;
+    double *A=g_q38_cov+(int64_t)layer*H*H;
+    double *xd=(double*)malloc((size_t)n*H*sizeof(double));
+    if(!xd){fprintf(stderr,"Q38_ACT_COV: out of memory\n");exit(1);}
+    for(int64_t i=0;i<(int64_t)n*H;i++)xd[i]=x[i];
+    /* the upper triangle, row i from column i: rows are independent */
+    #pragma omp parallel for schedule(dynamic,16)
+    for(int i=0;i<H;i++){
+        double *a=A+(int64_t)i*H;
+        for(int r=0;r<n;r++){
+            const double *v=xd+(int64_t)r*H;const double vi=v[i];
+            for(int j=i;j<H;j++)a[j]+=vi*v[j];
+        }
+    }
+    free(xd);
+    g_q38_cov_n[layer]+=n;
+}
+static void q38_cov_write(void) {
+    const int L=g_q38_cov_dims[0],H=g_q38_cov_dims[1];const int64_t per=(int64_t)H*H;
+    for(int l=0;l<L;l++){double *A=g_q38_cov+l*per;for(int i=0;i<H;i++)for(int j=0;j<i;j++)A[(int64_t)i*H+j]=A[(int64_t)j*H+i];}
+    FILE *f=fopen(g_q38_cov_path,"rb");
+    if(f){   /* an earlier run's matrices of the same geometry: add them, one layer at a time */
+        char magic[8];int dims[2];int64_t *n=(int64_t*)malloc((size_t)L*sizeof(int64_t));double *a=(double*)malloc((size_t)per*sizeof(double));
+        int ok=a&&n&&fread(magic,8,1,f)==1&&!memcmp(magic,"Q38COV1\0",8)&&fread(dims,sizeof dims,1,f)==1&&
+               !memcmp(dims,g_q38_cov_dims,sizeof dims)&&fread(n,sizeof(int64_t),(size_t)L,f)==(size_t)L;
+        for(int l=0;ok&&l<L;l++){
+            ok=fread(a,sizeof(double),(size_t)per,f)==(size_t)per;
+            if(ok)for(int64_t i=0;i<per;i++)g_q38_cov[l*per+i]+=a[i];
+        }
+        if(ok)for(int l=0;l<L;l++)g_q38_cov_n[l]+=n[l];
+        else fprintf(stderr,"[cov] %s: not matrices of this model, overwritten\n",g_q38_cov_path);
+        free(a);free(n);fclose(f);
+    }
+    f=fopen(g_q38_cov_path,"wb");
+    if(!f){perror(g_q38_cov_path);return;}
+    int ok=fwrite("Q38COV1\0",8,1,f)==1&&fwrite(g_q38_cov_dims,sizeof g_q38_cov_dims,1,f)==1&&
+           fwrite(g_q38_cov_n,sizeof(int64_t),(size_t)L,f)==(size_t)L&&
+           fwrite(g_q38_cov,sizeof(double),(size_t)(L*per),f)==(size_t)(L*per);
+    if(fclose(f)||!ok)fprintf(stderr,"[cov] %s: write failed\n",g_q38_cov_path);
+    else fprintf(stderr,"[cov] %s: %lld tokens in layer 0\n",g_q38_cov_path,(long long)g_q38_cov_n[0]);
+}
+static void q38_cov_init(Model *m) {
+    const char *p=getenv("Q38_ACT_COV");
+    if(!p||!*p||m->c.experts<1)return;
+    snprintf(g_q38_cov_path,sizeof g_q38_cov_path,"%s",p);
+    g_q38_cov_dims[0]=m->c.layers;g_q38_cov_dims[1]=m->c.hidden;
+    g_q38_cov=(double*)calloc((size_t)m->c.layers*m->c.hidden*m->c.hidden,sizeof(double));
+    g_q38_cov_n=(int64_t*)calloc((size_t)m->c.layers,sizeof(int64_t));
+    if(!g_q38_cov||!g_q38_cov_n){fprintf(stderr,"Q38_ACT_COV: out of memory\n");exit(1);}
+    atexit(q38_cov_write);
+    fprintf(stderr,"[cov] collecting the routed experts' input second moments into %s\n",p);
+}
+
+/* Q38_ACT_DUMP=<dir>: every token's routed-expert input with its route, one file per
+ * layer, for the quantizer that fits each expert to the rows it really receives
+ * (tools/convert_qwen38_experts_int4.py --dump). <dir>/layer-NNN.bin: "Q38DMP1\0",
+ * int32 hidden and top-k, then per token K int32 expert ids in rank order, their K f32
+ * gates (the weights of the reduction) and the H f32 inputs. Runs append, so the
+ * calibration blocks add up. Prefill chunks and decode rows alike. */
+static FILE **g_q38_dump; static int g_q38_dump_layers;
+static void q38_dump_add(int layer,const float *x,const int *idx,const float *gates,int K,int H) {
+    if(!g_q38_dump||layer<0||layer>=g_q38_dump_layers||!g_q38_dump[layer])return;
+    FILE *f=g_q38_dump[layer];int32_t ids[Q38_MAX_TOPK];
+    for(int k=0;k<K;k++)ids[k]=idx[k];
+    if(fwrite(ids,sizeof(int32_t),(size_t)K,f)!=(size_t)K||fwrite(gates,sizeof(float),(size_t)K,f)!=(size_t)K||
+       fwrite(x,sizeof(float),(size_t)H,f)!=(size_t)H){perror("Q38_ACT_DUMP");exit(1);}
+}
+static void q38_dump_close(void) {
+    for(int l=0;l<g_q38_dump_layers;l++)if(g_q38_dump[l]&&fclose(g_q38_dump[l]))perror("Q38_ACT_DUMP");
+    fprintf(stderr,"[dump] %d layer files closed\n",g_q38_dump_layers);
+}
+static void q38_dump_init(Model *m) {
+    const char *dir=getenv("Q38_ACT_DUMP");
+    if(!dir||!*dir||m->c.experts<1)return;
+    const int L=m->c.layers;const int32_t dims[2]={m->c.hidden,m->c.topk};
+    int dlo=0,dhi=L-1;const char *dl=getenv("Q38_ACT_DUMP_LAYERS");   /* "a-b": only those layers' files */
+    if(dl&&*dl&&sscanf(dl,"%d-%d",&dlo,&dhi)!=2){fprintf(stderr,"Q38_ACT_DUMP_LAYERS must be a-b\n");exit(1);}
+    g_q38_dump=(FILE**)calloc((size_t)L,sizeof(FILE*));
+    if(!g_q38_dump){fprintf(stderr,"Q38_ACT_DUMP: out of memory\n");exit(1);}
+    for(int l=0;l<L;l++){
+        char path[4200];snprintf(path,sizeof path,"%s/layer-%03d.bin",dir,l);
+        FILE *probe=fopen(path,"rb");char head[16];
+        int fresh=!probe;
+        if(probe){   /* an earlier run's file: the same geometry, or refuse */
+            if(fread(head,1,16,probe)!=16||memcmp(head,"Q38DMP1\0",8)||memcmp(head+8,dims,8)){
+                fprintf(stderr,"Q38_ACT_DUMP: %s holds another model's rows\n",path);exit(1);
+            }
+            fclose(probe);
+        }
+        if(l<dlo||l>dhi)continue;   /* Q38_ACT_DUMP_LAYERS: these layers only */
+        if(!(g_q38_dump[l]=fopen(path,"ab"))){perror(path);exit(1);}
+        if(fresh&&(fwrite("Q38DMP1\0",8,1,g_q38_dump[l])!=1||fwrite(dims,sizeof dims,1,g_q38_dump[l])!=1)){perror(path);exit(1);}
+    }
+    g_q38_dump_layers=L;
+    atexit(q38_dump_close);
+    fprintf(stderr,"[dump] the routed experts' inputs and routes of %d layers into %s\n",L,dir);
+}
+
 static void q38_expert_row(Model *m,int layer,int eid,const float *xs,float *eg,float *eu,float *eh,float *eo) {
     Cfg *c=&m->c;int H=c->hidden,I=c->inter;
     Slot *ex=q38_expert_get(m,layer,eid);double started=now_s();
     q38_weight_matmul(eg,xs,&ex->gate,1,H,I);q38_weight_matmul(eu,xs,&ex->up,1,H,I);
-    for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_weight_matmul(eo,eh,&ex->down,1,I,H);
+    for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];
+    if(g_q38_act)q38_act_add(layer,eid,xs,eh,1);
+    q38_weight_matmul(eo,eh,&ex->down,1,I,H);
     q38_tm_add(m,Q38_TM_ROUTED_EXPERT,started);
+}
+
+/* ---- decode rows grouped by expert --------------------------------------------
+ * The decode loop below runs every routed expert of every row on its own: three
+ * parallel regions per expert and row, about 90 a layer for an MTP verify of 3 rows,
+ * each a few hundred rows of work. Here the rows are routed first, the distinct
+ * experts loaded as one batch, and one parallel region runs gate+up over (expert, row
+ * block) items for all the rows each expert received, the hidden rows, then down.
+ * Every output row comes from the per-row kernel q38_weight_matmul calls for that
+ * matrix (q38_matmul_int4g64, x2_matmul, xl_matmul: a row's bits do not depend on how
+ * many activation rows share the call), and each row's sum is added in rank order as
+ * the decode loop adds it, so the output is the decode loop's to the bit.
+ * Q38_MOE_GROUPED=0 keeps the decode loop. */
+enum { Q38_ROWS_NONE = 0, Q38_ROWS_F32 = 1, Q38_ROWS_X2 = 2, Q38_ROWS_GQ = 3 };
+/* decode rows, MTP verifies and a prompt's chunks up to this many rows. The per-expert
+ * paths (q38_moe_decode_ex, q38_moe_prefill) open three parallel regions per distinct
+ * expert, a few rows each: a 32-row chunk of ISTA's Qwen3.8 spent a third of its threads'
+ * time waiting at their barriers. Here a layer is two regions for all its experts. */
+#define Q38_GROUPED_ROWS 256
+/* how a routed expert's matrix takes its input here: f32 (int4-g64), int8 per 32
+ * (int2-g32, int2-g16, int3-g16), a GGUF block type's integer form (gq_act), or not
+ * at all (GQ_EXACT=1's float path among them) */
+static int q38_rows_kind(const Q38Weight *w) {
+    if(!w->data||w->q4||w->q8||w->gpu||w->act2)return Q38_ROWS_NONE;
+    if(w->kind==Q38_WEIGHT_INT4G64&&w->r16)return Q38_ROWS_GQ;   /* xf16 rows take gq_act */
+    if(w->kind==Q38_WEIGHT_INT4G64&&w->scales)return Q38_ROWS_F32;
+    if((w->kind==Q38_WEIGHT_LOWBIT16||(w->kind==Q38_WEIGHT_VQ2&&w->vqb))&&w->r16)return Q38_ROWS_GQ;   /* xl16 / vq2r16 rows take gq_act */
+    if((w->kind==Q38_WEIGHT_INT2G32||w->kind==Q38_WEIGHT_LOWBIT16)&&w->scales&&w->x2q)return Q38_ROWS_X2;
+    if(w->kind==Q38_WEIGHT_VQ2&&w->scales&&w->x2q&&w->vqb)return Q38_ROWS_X2;
+    if(w->kind==Q38_WEIGHT_VQ1&&w->scales&&w->x2q&&w->vq1b)return Q38_ROWS_X2;
+    if(w->kind==Q38_WEIGHT_GGML&&gq_int_ok(w->gq_type,w->cols)&&gq_row_bytes(w->gq_type,w->cols)>0)return Q38_ROWS_GQ;
+    return Q38_ROWS_NONE;
+}
+/* rows [r0,r1) of w (O x I) for n activation rows: y[a*ys + o]; xr[a] the f32 rows,
+ * xq/dx the int8-per-32 ones ([n][I], [n][I/32]), ga the GGUF types' (n rows) */
+static void q38_rows(float *y,int ys,const Q38Weight *w,int I,int r0,int r1,
+                     const float *const *xr,const int8_t *xq,const float *dx,const gq_act *ga,int n) {
+#ifdef XF16_ON
+    if(w->kind==Q38_WEIGHT_INT4G64&&w->r16){q38_xf16_rows(y,ys,w,ga,r0,r1,n);return;}   /* whole groups, as below */
+#endif
+#ifdef XL16_ON
+    if(w->kind==Q38_WEIGHT_LOWBIT16&&w->r16){   /* whole groups: the callers' blocks start and end on 16 */
+        const size_t gb=xl16_group_bytes(w->lbits,I);
+        for(int o=r0;o<r1;o+=16)xl16_rows(y+o,ys,(const uint8_t*)w->data+(size_t)(o/16)*gb,ga->q,ga->d,ga->s,I,n,w->lbits);
+        return;
+    }
+#endif
+#ifdef VQ2R16_ON
+    if(w->kind==Q38_WEIGHT_VQ2&&w->r16){
+        const size_t gb=vq2r16_group_bytes(I);
+        for(int o=r0;o<r1;o+=16)vq2r16_rows(y+o,ys,w->vqb,(const uint8_t*)w->data+(size_t)(o/16)*gb,ga->q,ga->d,ga->s,I,n);
+        return;
+    }
+#endif
+    if(w->kind==Q38_WEIGHT_GGML){   /* gq_matmul_act's rows */
+        const int64_t rb=gq_row_bytes(w->gq_type,I);
+#ifdef GQ_R16_ON
+        if(gq_r16_base(w->gq_type)>=0){   /* whole groups: the callers' blocks start and end on 16 */
+            for(int o=r0;o<r1;o+=16)gq_r16_rows(w->gq_type,y+o,ys,(const uint8_t*)w->data+(int64_t)o*rb,ga,I);
+            return;
+        }
+#endif
+        int o=r0;
+#ifdef GQ_TILE16_BIAS
+        if(n>=GQ_TILE16_MIN_S&&gq_tile16_ok(w->gq_type,I)){   /* a prompt's rows: 16 file rows unpacked once (gq_tile16_pack) */
+            static __thread uint8_t *tile;static __thread int8_t *w8;static __thread float *sw;static __thread int cap;
+            if(cap<I){
+                free(tile);free(w8);free(sw);
+                tile=(uint8_t*)malloc(gq_tile16_bytes(I));w8=(int8_t*)malloc((size_t)I);sw=(float*)malloc((size_t)(I/16)*2*sizeof(float));
+                if(!tile||!w8||!sw){fprintf(stderr,"OOM prompt tile\n");exit(1);}
+                cap=I;
+            }
+            for(;o+16<=r1;o+=16){
+                gq_tile16_pack(tile,(const uint8_t*)w->data+(int64_t)o*rb,rb,w->gq_type,I,w8,sw,sw+I/16);
+                gq_tile16_rows(y+o,ys,tile,ga,I);
+            }
+        }
+#endif
+        if(gq_f8_ok(w->gq_type,I))   /* the file's rows by eight (ggml_quants.h gq_rows_f8) */
+            for(;o+8<=r1;o+=8)gq_rows_f8(y+o,ys,ga,(const uint8_t*)w->data+(int64_t)o*rb,rb,w->gq_type,I,8);
+        for(;o<r1;o++)gq_row_all(y+o,ys,ga,(const uint8_t*)w->data+(int64_t)o*rb,w->gq_type,I);
+        return;
+    }
+    if(w->kind==Q38_WEIGHT_INT4G64){
+        const int64_t rb=q38_int4_row_bytes(I),groups=q38_int4_groups(I);const int body=I/XF_BLOCK*XF_BLOCK;
+        for(int o=r0;o<r1;o++){
+            const uint8_t *wr=(const uint8_t*)w->data+(int64_t)o*rb;const float *sc=w->scales+(int64_t)o*groups;
+            /* the body for every row at once (the nibbles widened once, each row's bits xf_dot_f32's) */
+            if(body)xf_dot_f32_rows(y+o,ys,wr,sc,xr,body,n);
+            else for(int a=0;a<n;a++)y[(int64_t)a*ys+o]=0.f;
+            if(body<I)for(int a=0;a<n;a++){
+                const float *xs=xr[a];
+                float tail=0.f;
+                for(int i=body;i<I;i++)tail+=(float)((int)((wr[i>>1]>>((i&1)*4))&15)-8)*xs[i];
+                y[(int64_t)a*ys+o]=fmaf(tail,sc[groups-1],y[(int64_t)a*ys+o]);
+            }
+        }
+        return;
+    }
+    const int ng=I/32;
+    if(w->kind==Q38_WEIGHT_VQ1){
+        const size_t cb=vq1_code_bytes(I),qb=vq1_scale_bytes(I);
+        for(int o=r0;o<r1;o++)
+            for(int a0=0;a0<n;a0+=X2_MAX_ROWS){
+                const int k=n-a0<X2_MAX_ROWS?n-a0:X2_MAX_ROWS;
+                vq1_dot(y+(int64_t)a0*ys+o,ys,w->vq1b,(const uint8_t*)w->data+(size_t)o*cb,w->x2q+(size_t)o*qb,
+                        w->scales[o],xq+(size_t)a0*I,dx+(size_t)a0*ng,I,k);
+            }
+        return;
+    }
+    if(w->kind==Q38_WEIGHT_VQ2){
+        const size_t cb=vq2_code_bytes(I),qb=vq2_scale_bytes(I);
+        for(int o=r0;o<r1;o++)
+            for(int a0=0;a0<n;a0+=X2_MAX_ROWS){
+                const int k=n-a0<X2_MAX_ROWS?n-a0:X2_MAX_ROWS;
+                vq2_dot(y+(int64_t)a0*ys+o,ys,w->vqb,(const uint8_t*)w->data+(size_t)o*cb,w->x2q+(size_t)o*qb,
+                        w->scales[o],xq+(size_t)a0*I,dx+(size_t)a0*ng,I,k);
+            }
+        return;
+    }
+    const int lb=w->kind==Q38_WEIGHT_LOWBIT16;
+    const size_t cb=lb?xl_code_bytes(w->lbits,I):x2_code_bytes(I),qb=lb?xl_scale_bytes(I):(size_t)ng;
+    for(int o=r0;o<r1;o++)
+        for(int a0=0;a0<n;a0+=X2_MAX_ROWS){
+            const int k=n-a0<X2_MAX_ROWS?n-a0:X2_MAX_ROWS;
+            const uint8_t *code=(const uint8_t*)w->data+(size_t)o*cb,*q=w->x2q+(size_t)o*qb;
+            if(lb)xl_dot(y+(int64_t)a0*ys+o,ys,code,q,w->scales[o],w->lbits,xq+(size_t)a0*I,dx+(size_t)a0*ng,I,k);
+            else  x2_dot(y+(int64_t)a0*ys+o,ys,code,q,w->scales[o],xq+(size_t)a0*I,dx+(size_t)a0*ng,I,k);
+        }
+}
+/* idx_in, gates_in (S*K each, rank order) and dev_in (S*K flags): the routes a CUDA chain
+ * made on its device and the slots it computes there (cuda_chain's hybrid layer): out gets
+ * the rest, routed_only, with no router, no history and no tier group here. NULL: the
+ * routes from logits_in or the router. */
+static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int S,float *out,
+                                  const float *logits_in,int routed_only,int row0,
+                                  const int *idx_in,const float *gates_in,const uint8_t *dev_in) {
+    static int on=-1;
+    if(on<0){const char *e=getenv("Q38_MOE_GROUPED");on=!(e&&e[0]=='0');}
+    Cfg *c=&m->c;const int H=c->hidden,E=c->experts,K=c->topk,I=c->inter,SI=c->shared_inter;
+    if(!on||S<1||S>Q38_GROUPED_ROWS||!(q38_layer_int4(m,layer)||g_q38_gguf)||H%32||I%32)return 0;
+    /* every distinct expert of the rows in the cache at once, or the per-expert paths */
+    if((S*K<E?S*K:E)>m->cache[layer].cap)return 0;   /* at most E distinct, however many rows */
+    /* the device tiers take experts per row; the statistics hooks keep the loop's order. The
+     * CUDA tier: a decode row's residents go to the device (qt_issue) and the rest are
+     * grouped here, as without it; more rows keep the loop. */
+    int cuda=qt_ready()&&layer<c->layers;
+    if((vkt_ready()&&layer<vkt_layers())||(cuda&&S>1&&!idx_in))return 0;
+    if(g_q38_act||g_q38_dump||g_q38_cov)return 0;
+    const int np=S*K;
+    /* scratch: routes, then per assignment in grouped order its input and outputs */
+    float *logits=falloc((int64_t)S*E),*gates=falloc(np),*sg=falloc((int64_t)S*SI),*su=falloc((int64_t)S*SI);
+    float *sh=falloc((int64_t)S*SI),*shared=falloc((int64_t)S*H),*sgate=falloc(S);
+    float *eg=falloc((int64_t)np*I),*eu=falloc((int64_t)np*I),*ehf=falloc((int64_t)np*I),*eo=falloc((int64_t)np*H);
+    float *dxt=falloc((int64_t)S*(H/32)),*dxg=falloc((int64_t)np*(H/32)),*ehdx=falloc((int64_t)np*(I/32));
+    int8_t *xqt=(int8_t*)malloc((size_t)S*H),*xg=(int8_t*)malloc((size_t)np*H),*ehq=(int8_t*)malloc((size_t)np*I);
+    gq_act gin,gh;memset(&gin,0,sizeof gin);memset(&gh,0,sizeof gh);   /* the GGUF kinds' inputs, grouped order */
+    int *idx=(int*)malloc((size_t)np*sizeof(int)),*pos=(int*)malloc((size_t)np*sizeof(int));
+    int *uniq=(int*)malloc((size_t)np*sizeof(int)),*cnt=(int*)calloc((size_t)np,sizeof(int)),*start=(int*)malloc((size_t)np*sizeof(int));
+    int *who=(int*)malloc((size_t)np*sizeof(int));   /* grouped position -> assignment s*K+z */
+    int *pos_row=(int*)malloc((size_t)np*sizeof(int));   /* grouped position -> its activation row */
+    const float **xr=(const float**)malloc((size_t)np*sizeof(float*)),**hr=(const float**)malloc((size_t)np*sizeof(float*));
+    Slot **slot=(Slot**)malloc((size_t)np*sizeof(Slot*));
+    uint8_t *ondev=(uint8_t*)calloc((size_t)np,1);   /* the assignments a device computes */
+    if(!xqt||!xg||!ehq||!idx||!pos||!uniq||!cnt||!start||!who||!pos_row||!xr||!hr||!slot||!ondev){fprintf(stderr,"OOM grouped MoE\n");exit(1);}
+    /* route every row, in the decode loop's order and with its side effects */
+    if(idx_in){memcpy(idx,idx_in,(size_t)np*sizeof(int));memcpy(gates,gates_in,(size_t)np*sizeof(float));}
+    else if(logits_in)memcpy(logits,logits_in,(size_t)S*E*sizeof(float));
+    else q38_dense_matmul(m,logits,x,&l->router,S,H,E);
+    for(int s=0;s<S&&!idx_in;s++){
+        float *lg=logits+(int64_t)s*E;
+        float mx=lg[0];for(int e=1;e<E;e++)if(lg[e]>mx)mx=lg[e];
+        double all=0;for(int e=0;e<E;e++){lg[e]=expf(lg[e]-mx);all+=lg[e];}
+        int *ix=idx+(int64_t)s*K;float val[Q38_MAX_TOPK];
+        for(int z=0;z<K;z++){int best=-1;float bv=-1.f;for(int e=0;e<E;e++){int used=0;for(int j=0;j<z;j++)if(ix[j]==e)used=1;if(!used&&lg[e]>bv){bv=lg[e];best=e;}}ix[z]=rt_router_pick(best,z,E,layer);val[z]=lg[ix[z]];}
+        double top=0;for(int z=0;z<K;z++)top+=val[z];double den=c->norm_topk?top:all;
+        for(int z=0;z<K;z++)gates[s*K+z]=(float)(val[z]/den);
+        rt_route(layer,row0+s,ix,gates+(int64_t)s*K,K);
+    }
+    /* the CUDA tier's residents of the row run on the device from here on (qt_take adds them
+     * after the CPU's, as the loop does); the rest are this function's */
+    uint32_t qmask=cuda&&!idx_in?qt_issue(layer,idx,K,x):0;
+    for(int i=0;i<np;i++)ondev[i]=idx_in?dev_in[i]:(uint8_t)((qmask>>i)&1u);
+    /* the distinct experts in first-seen order and each one's assignments, grouped */
+    int nu=0,nc=0;   /* nc: the assignments computed here */
+    for(int i=0;i<np;i++){
+        if(ondev[i]){pos[i]=-1;continue;}
+        int j=0;for(;j<nu;j++)if(uniq[j]==idx[i])break;
+        if(j==nu)uniq[nu++]=idx[i];
+        cnt[j]++;nc++;
+    }
+    for(int j=0,p=0;j<nu;j++){start[j]=p;p+=cnt[j];cnt[j]=0;}
+    for(int i=0;i<np;i++){
+        if(ondev[i])continue;
+        int j=0;while(uniq[j]!=idx[i])j++;
+        int p=start[j]+cnt[j]++;pos[i]=p;who[p]=i;
+    }
+    q38_prefetch_experts(m,layer,uniq,nu);
+    /* the shared expert, all rows at once (each row's bits as one at a time) */
+    double started=now_s();
+    if(!routed_only){
+        q38_weight_matmul(sg,x,&l->sh_g,S,H,SI);q38_weight_matmul(su,x,&l->sh_u,S,H,SI);
+        for(int64_t j=0;j<(int64_t)S*SI;j++)sh[j]=q38_silu(sg[j])*su[j];
+        q38_weight_matmul(shared,sh,&l->sh_d,S,SI,H);
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*H;float g=0.f;
+            for(int d=0;d<H;d++)g+=xs[d]*l->sh_gate[d];
+            sgate[s]=q38_sigmoid(g);
+        }
+        q38_tm_add(m,Q38_TM_SHARED_EXPERT,started);
+    }
+    started=now_s();
+    int loaded=nu>=2?q38_expert_get_batch(m,layer,uniq,nu,slot):0;
+    if(nu==1){slot[0]=q38_expert_get(m,layer,uniq[0]);loaded=1;}
+    int kin=Q38_ROWS_NONE,kdn=Q38_ROWS_NONE;
+    if(loaded){
+        kin=q38_rows_kind(&slot[0]->gate);kdn=q38_rows_kind(&slot[0]->down);
+        for(int j=0;j<nu;j++)
+            if(q38_rows_kind(&slot[j]->gate)!=kin||q38_rows_kind(&slot[j]->up)!=kin||q38_rows_kind(&slot[j]->down)!=kdn)kin=Q38_ROWS_NONE;
+    }
+    if(!loaded||kin==Q38_ROWS_NONE||kdn==Q38_ROWS_NONE){
+        /* no batch of slots (or a kind without a row kernel here): each expert used as
+         * soon as it is loaded, as the decode loop does */
+        for(int i=0;i<np;i++){
+            int p=pos[i];Slot *ex=NULL;
+            if(p<0)continue;   /* the device's */
+            if(loaded){for(int j=0;j<nu;j++)if(uniq[j]==idx[i])ex=slot[j];}
+            else ex=q38_expert_get(m,layer,idx[i]);
+            const float *xs=x+(int64_t)(i/K)*H;float *g=eg+(int64_t)p*I,*u=eu+(int64_t)p*I,*h=ehf+(int64_t)p*I;
+            q38_weight_matmul(g,xs,&ex->gate,1,H,I);q38_weight_matmul(u,xs,&ex->up,1,H,I);
+            for(int j=0;j<I;j++)h[j]=q38_silu(g[j])*u[j];
+            q38_weight_matmul(eo+(int64_t)p*H,h,&ex->down,1,I,H);
+        }
+    } else {
+        /* the inputs: f32 row pointers, or int8 per 32 once per row, gathered per assignment */
+        for(int p=0;p<nc;p++){xr[p]=x+(int64_t)(who[p]/K)*H;hr[p]=ehf+(int64_t)p*I;}
+        if(kin==Q38_ROWS_GQ){   /* gq_matmul's quantization, once per row, then each assignment its row's copy */
+            gq_act gx;memset(&gx,0,sizeof gx);
+            for(int p=0;p<nc;p++)pos_row[p]=who[p]/K;
+            if(gq_act_set(&gx,x,S,H)||gq_act_gather(&gin,&gx,pos_row,nc)){fprintf(stderr,"OOM grouped MoE\n");exit(1);}
+            gq_act_free(&gx);
+        }
+        if(kdn==Q38_ROWS_GQ){
+            gh.q=(int8_t*)malloc((size_t)np*I);gh.d=falloc((int64_t)np*(I/32));gh.s=(int32_t*)malloc((size_t)np*(I/16)*sizeof(int32_t));
+            gh.l4=(int32_t*)malloc((size_t)np*(I/4)*sizeof(int32_t));
+            if(!gh.q||!gh.d||!gh.s||!gh.l4){fprintf(stderr,"OOM grouped MoE\n");exit(1);}
+            gh.S=nc;gh.I=I;gh.cap=np*I;
+        }
+        if(kin==Q38_ROWS_X2){
+            for(int s=0;s<S;s++)x2_quant_act(x+(int64_t)s*H,H,xqt+(int64_t)s*H,dxt+(int64_t)s*(H/32));
+            for(int p=0;p<nc;p++){
+                int s=who[p]/K;
+                memcpy(xg+(int64_t)p*H,xqt+(int64_t)s*H,(size_t)H);
+                memcpy(dxg+(int64_t)p*(H/32),dxt+(int64_t)s*(H/32),(size_t)(H/32)*sizeof(float));
+            }
+        }
+        int T=1;
+#ifdef _OPENMP
+        T=omp_get_max_threads();
+#endif
+        /* (expert, row block) items: enough for every thread, blocks of 8 rows or more */
+        int cF=(4*T+nu-1)/nu;if(cF>I/8)cF=I/8;if(cF<1)cF=1;
+        int cH=(4*T+nu-1)/nu;if(cH>H/8)cH=H/8;if(cH<1)cH=1;
+        int rF=(I+cF-1)/cF,rH=(H+cH-1)/cH;
+        if(I%16==0&&rF%16)rF+=16-rF%16;   /* whole groups of 16 rows (GQ_*_R16) */
+        if(H%16==0&&rH%16)rH+=16-rH%16;
+        cF=(I+rF-1)/rF;cH=(H+rH-1)/rH;
+        #pragma omp parallel
+        {
+            #pragma omp for schedule(dynamic,1)
+            for(int it=0;it<nu*cF;it++){
+                const int j=it/cF,r0=(it%cF)*rF,r1=r0+rF<I?r0+rF:I,p0=start[j],n=cnt[j];
+                const gq_act ga={gin.q+(int64_t)p0*H,gin.d+(int64_t)p0*(H/32),gin.s+(int64_t)p0*(H/16),n,H,0,
+                                 gin.l4?gin.l4+(int64_t)p0*(H/4):NULL};
+                q38_rows(eg+(int64_t)p0*I,I,&slot[j]->gate,H,r0,r1,xr+p0,xg+(int64_t)p0*H,dxg+(int64_t)p0*(H/32),&ga,n);
+                q38_rows(eu+(int64_t)p0*I,I,&slot[j]->up,H,r0,r1,xr+p0,xg+(int64_t)p0*H,dxg+(int64_t)p0*(H/32),&ga,n);
+            }
+            #pragma omp for schedule(static)
+            for(int p=0;p<nc;p++){
+                const float *g=eg+(int64_t)p*I,*u=eu+(int64_t)p*I;float *h=ehf+(int64_t)p*I;
+                for(int j=0;j<I;j++)h[j]=q38_silu(g[j])*u[j];
+                if(kdn==Q38_ROWS_X2)x2_quant_act(h,I,ehq+(int64_t)p*I,ehdx+(int64_t)p*(I/32));
+                if(kdn==Q38_ROWS_GQ){
+                    gq_quant_act(h,I,gh.q+(int64_t)p*I,gh.d+(int64_t)p*(I/32),gh.s+(int64_t)p*(I/16));
+                    gq_lane_sums(gh.q+(int64_t)p*I,I,gh.l4+(int64_t)p*(I/4));
+                }
+            }
+            #pragma omp for schedule(dynamic,1)
+            for(int it=0;it<nu*cH;it++){
+                const int j=it/cH,r0=(it%cH)*rH,r1=r0+rH<H?r0+rH:H,p0=start[j],n=cnt[j];
+                const gq_act ga={gh.q+(int64_t)p0*I,gh.d+(int64_t)p0*(I/32),gh.s+(int64_t)p0*(I/16),n,I,0,
+                                 gh.l4?gh.l4+(int64_t)p0*(I/4):NULL};
+                q38_rows(eo+(int64_t)p0*H,H,&slot[j]->down,I,r0,r1,hr+p0,ehq+(int64_t)p0*I,ehdx+(int64_t)p0*(I/32),&ga,n);
+            }
+        }
+    }
+    q38_tm_add(m,Q38_TM_ROUTED_EXPERT,started);
+    static int said;
+    if(!said&&kin!=Q38_ROWS_NONE&&kdn!=Q38_ROWS_NONE&&loaded){
+        said=1;
+        fprintf(stderr,"[qwen38] decode rows' routed experts grouped by expert, one parallel region a layer "
+                       "(Q38_MOE_GROUPED=0: one expert at a time)\n");
+    }
+    /* the tier promotes what the CPU computed (it copies the rows before qt_note returns) */
+    if(cuda&&loaded)for(int j=0;j<nu;j++)q38_tier_note(layer,uniq[j],slot[j]);
+    /* each row: its experts' outputs in rank order (the CPU's, then the device's: qt_take),
+     * then the shared expert */
+    for(int s=0;s<S;s++){
+        float *ys=out+(int64_t)s*H;memset(ys,0,(size_t)H*sizeof(float));
+        for(int z=0;z<K;z++){
+            if(pos[s*K+z]<0)continue;
+            const float g=gates[s*K+z];const float *e=eo+(int64_t)pos[s*K+z]*H;
+            for(int d=0;d<H;d++)ys[d]+=g*e[d];
+        }
+        if(cuda&&!idx_in&&!qt_take(qmask,gates+(int64_t)s*K,K,ys)){
+            fprintf(stderr,"qwen38: CUDA expert collection failed at layer %d; stopping inference\n",layer);
+            exit(1);
+        }
+        if(!routed_only)for(int d=0;d<H;d++)ys[d]+=sgate[s]*shared[(int64_t)s*H+d];
+    }
+    rt_trace_end();
+    free(logits);free(gates);free(sg);free(su);free(sh);free(shared);free(sgate);
+    free(eg);free(eu);free(ehf);free(eo);free(dxt);free(dxg);free(ehdx);free(xqt);free(xg);free(ehq);
+    free(idx);free(pos);free(uniq);free(cnt);free(start);free(who);free(pos_row);free(xr);free(hr);free(slot);free(ondev);
+    gq_act_free(&gin);gq_act_free(&gh);
+    return 1;
 }
 
 /* logits_in: the router's raw rows (S x E) when the caller has them, else NULL and the
@@ -2823,6 +4687,7 @@ static void q38_expert_row(Model *m,int layer,int eid,const float *xs,float *eg,
  * expert on the device and adds them there). q38_moe passes NULL, 0: unchanged. */
 static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,float *out,
                               const float *logits_in,int routed_only) {
+    if(q38_moe_decode_grouped(m,l,layer,x,S,out,logits_in,routed_only,0,NULL,NULL,NULL))return;
     Cfg *c=&m->c;int H=c->hidden,E=c->experts,K=c->topk,I=c->inter,SI=c->shared_inter;
     float *logits=falloc(E),*sg=falloc(SI),*su=falloc(SI),*sh=falloc(SI),*shared=falloc(H);
     float *eg=falloc(I),*eu=falloc(I),*eh=falloc(I),*eo=falloc(H);
@@ -2830,6 +4695,7 @@ static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,f
     float *ebuf=vk?falloc((int64_t)K*H):NULL;
     for(int s=0;s<S;s++){
         const float *xs=x+(int64_t)s*H;float *ys=out+(int64_t)s*H;memset(ys,0,(size_t)H*sizeof(float));
+        if(g_q38_cov)q38_cov_add(layer,xs,1);
         if(logits_in)memcpy(logits,logits_in+(int64_t)s*E,(size_t)E*sizeof(float));
         else q38_dense_matmul(m,logits,xs,&l->router,1,H,E);
         float mx=logits[0];for(int e=1;e<E;e++)if(logits[e]>mx)mx=logits[e];
@@ -2840,6 +4706,7 @@ static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,f
         float route_gates[Q38_MAX_TOPK];
         for(int z=0;z<K;z++) route_gates[z]=(float)(val[z]/den);
         rt_route(layer,s,idx,route_gates,K); /* shared counts + post-normalization trace */
+        if(g_q38_dump)q38_dump_add(layer,xs,idx,route_gates,K,H);
         /* Resident experts run on the GPU from here on (asynchronously); the
          * CPU only loads and computes the rest, in route order. The tier
          * knows the model's layers only: the MTP head's stays on the CPU. */
@@ -2865,10 +4732,12 @@ static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,f
             int z=cpu_rank[i];
             Slot *ex=loaded_batch?selected[i]:q38_expert_get(m,layer,cpu_idx[i]);phase_started=now_s();
             q38_weight_matmul(eg,xs,&ex->gate,1,H,I);q38_weight_matmul(eu,xs,&ex->up,1,H,I);
-            for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_weight_matmul(eo,eh,&ex->down,1,I,H);
+            for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];
+            if(g_q38_act)q38_act_add(layer,cpu_idx[i],xs,eh,1);
+            q38_weight_matmul(eo,eh,&ex->down,1,I,H);
             if(vk){
                 memcpy(ebuf+(int64_t)z*H,eo,(size_t)H*sizeof(float));
-                VktExpertSrc src=q38_vk_src(ex); vkt_note(layer,cpu_idx[i],&src);
+                q38_vk_note(layer,cpu_idx[i],ex);
             }
             else for(int d=0;d<H;d++)ys[d]+=route_gates[z]*eo[d];
             q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
@@ -3000,6 +4869,7 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
     for(int base=0;base<S;) {
         int rows=S-base<rows_capacity?S-base:rows_capacity;
         int assignment_count=rows*K;
+        if(g_q38_cov)q38_cov_add(layer,x+(int64_t)base*H,rows);
         memset(group_counts,0,(size_t)E*sizeof(*group_counts));
 
         /* Route the complete chunk with one resident router matmul.  Selection
@@ -3042,6 +4912,7 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
                 group_counts[selected[rank]]++;
             }
             rt_route(layer,base+s,selected,gates,K);
+            if(g_q38_dump)q38_dump_add(layer,x+(int64_t)(base+s)*H,selected,gates,K,H);
         }
 
         /* Prefixing by expert makes every group contiguous while the inverse
@@ -3133,7 +5004,7 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
                     for(int a=0;a<count;a++)if(!vk_taken[assignments[first+a]])vk_sub[n++]=first+a;
                     q38_prefill_expert_rows(m,expert,x+(int64_t)base*H,K,assignments,vk_sub,n,
                                             expert_input,expert_gate,expert_up,routed_out);
-                    VktExpertSrc src=q38_vk_src(expert); vkt_note(layer,e,&src);
+                    q38_vk_note(layer,e,expert);
                     continue;
                 }
                 for(int a=0;a<count;a++) {
@@ -3150,6 +5021,7 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
                     expert_gate[(int64_t)a*I+j]=
                         q38_silu(expert_gate[(int64_t)a*I+j])*
                         expert_up[(int64_t)a*I+j];
+                if(g_q38_act)q38_act_add(layer,e,expert_input,expert_gate,count);
                 q38_weight_matmul(routed_out+(int64_t)first*H,expert_gate,
                                   &expert->down,count,I,H);
                 q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
@@ -3197,6 +5069,31 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
 
 static void q38_moe_ex(Model *m,Layer *l,int layer,const float *x,int S,float *out,
                        const float *logits_in,int routed_only) {
+    /* Up to Q38_GROUPED_ROWS rows (decode, an MTP verify, a prompt chunk) grouped by
+     * expert, two parallel regions a layer, when it applies; it gives the bits the
+     * paths below give. */
+    if(S>=1){
+        /* rows in groups: each its own grouped call (every row computed as alone, so
+         * the split changes no bits), as many rows as the grouped path takes at once
+         * (their assignments all in the expert cache); the first group decides whether
+         * it applies at all, and a later refusal leaves the rest to the paths below */
+        const int H=m->c.hidden,E=m->c.experts,K=m->c.topk;
+        int group=m->cache[layer].cap>=E?Q38_GROUPED_ROWS:m->cache[layer].cap/(K>0?K:1);
+        if(group>Q38_GROUPED_ROWS)group=Q38_GROUPED_ROWS;
+        if(group<1)group=1;
+        int n0=S<group?S:group,base=0;
+        if(q38_moe_decode_grouped(m,l,layer,x,n0,out,logits_in,routed_only,0,NULL,NULL,NULL)){
+            for(base=n0;base<S;base+=group){
+                int n=S-base<group?S-base:group;
+                if(!q38_moe_decode_grouped(m,l,layer,x+(int64_t)base*H,n,out+(int64_t)base*H,
+                                           logits_in?logits_in+(int64_t)base*E:NULL,routed_only,base,NULL,NULL,NULL))break;
+            }
+            if(base>=S)return;
+            x+=(int64_t)base*H;out+=(int64_t)base*H;
+            if(logits_in)logits_in+=(int64_t)base*E;
+            S-=base;
+        }
+    }
     /* An MTP verify on the CUDA tier routes row by row as decode does, so
      * the tier's resident experts serve it (the batched path is CPU only). */
     if(S<=1||!m->prefill_batch||(g_q38_rowwise&&qt_ready()&&layer<m->c.layers))
@@ -3206,8 +5103,13 @@ static void q38_moe_ex(Model *m,Layer *l,int layer,const float *x,int S,float *o
 static void q38_moe(Model *m,Layer *l,int layer,const float *x,int S,float *out) {
     q38_moe_ex(m,l,layer,x,S,out,NULL,0);
 }
+enum { Q38_MTP_WHOLE_NORM='a', Q38_MTP_STREAM_NORM='b' };   /* the MTP head's wiring (q38_mtp_input) */
 #ifdef COLI_VULKAN
+static void q38_embed_row(Model *m,int id,int abs_pos,float *out);   /* below; the chain's MTP head embeds its tokens too */
 #include "qwen38_chain.h"  /* COLI_VK_CHAIN: every layer's dense chain on the device */
+#endif
+#ifdef COLI_CUDA
+#include "qwen38_cuda_chain.h"  /* COLI_CUDA_CHAIN: every layer's dense chain on the CUDA device */
 #endif
 
 static void reset_recurrent(Model *m) {
@@ -3222,6 +5124,9 @@ static void reset_recurrent(Model *m) {
     q38_dn_gpu_invalidate(m);       /* zeros on the host are the truth; the card re-loads before its next step */
 #ifdef COLI_VULKAN
     q38c_host_wrote(m,1);           /* zeros: the dense chain fills its copy with zeros */
+#endif
+#ifdef COLI_CUDA
+    q38cc_host_wrote(m,1);
 #endif
 }
 
@@ -3328,12 +5233,13 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
     }
     float *mixed=falloc((int64_t)S*H),*inject=falloc((int64_t)S*C),*block=falloc((int64_t)S*H);
     int first=0;   /* the layers a partial dense chain ran on the device (COLI_VULKAN) */
+    float *chain_logit=NULL;   /* the Vulkan or the CUDA chain ran the final mixer and lm_head */
+    (void)chain_logit;
 #ifdef COLI_VULKAN
     /* COLI_VK_CHAIN: the layers, the final mixer and lm_head on the device; the streams
      * come back for the MTP head, every row's mixed for the prefill read-out. A partial
      * chain runs its first N layers there and hands the streams back after layer N-1:
      * the CPU runs the other layers and the head from them, below. */
-    float *chain_logit=NULL;
     if(g_vk_chain){
         int echo=g_echo_k>0&&g_echo_id&&S>1;
         chain_logit=falloc((int64_t)nlogits*c->vocab);
@@ -3357,23 +5263,48 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
             }
         }
     }
-    if(!chain_logit){
 #endif
-    for(int i=first;i<c->layers;i++)
-        q38_layer_forward(m,i,hyper,ids,S,pos_base,mixed,inject,block);
-    q38_gr_read(m,&m->final_gr,hyper,S,mixed,NULL);
-#ifdef COLI_VULKAN
+#ifdef COLI_CUDA
+    /* COLI_CUDA_CHAIN: the same on the CUDA device (qwen38_cuda_chain.h), every layer */
+    if(g_cuda_chain&&!chain_logit){
+        int echo=g_echo_k>0&&g_echo_id&&S>1;
+        chain_logit=falloc((int64_t)nlogits*c->vocab);
+        int took=q38cc_forward(m,ids,S,pos_base,nlogits,hyper,streams!=NULL,echo?mixed:NULL,chain_logit);
+        if(took){
+            free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;   /* consumed, as q38_layer_forward does */
+        } else {
+            free(chain_logit); chain_logit=NULL;
+            q38cc_cpu_step(m,pos_base);
+            for(int s=0;s<S;s++){
+                float *e=hyper+(int64_t)s*W;
+                q38_embed_row(m,ids[s],pos_base+s,e);
+                for(int b=1;b<C;b++)memcpy(e+(int64_t)b*H,e,(size_t)H*sizeof(float));
+            }
+        }
     }
 #endif
+    if(!chain_logit){
+    for(int i=first;i<c->layers;i++){
+        /* stopped before layer i: kv_len and the kv_prefix record are left as they were,
+         * the K/V rows written so far are a stale tail, and the caller puts the recurrent
+         * state back */
+        if(coli_prompt_break()){   /* prompt_break.h: set by q38_serve_prefill only */
+            free(hyper);free(mixed);free(inject);free(block);
+            free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;
+            if(streams)*streams=NULL;
+            return NULL;
+        }
+        q38_layer_forward(m,i,hyper,ids,S,pos_base,mixed,inject,block);
+    }
+    q38_gr_read(m,&m->final_gr,hyper,S,mixed,NULL);
+    }
     m->kv_len=pos_base+S;
     /* Rewinding and writing a shorter branch invalidates its old tail. */
     if(m->kvp.len>pos_base)m->kvp.len=pos_base;
     kv_prefix_record(&m->kvp,ids,pos_base,S);
     if(m->vis_map && m->vis_rows_n>0)kv_prefix_taint(&m->kvp);
     float *logit;
-#ifdef COLI_VULKAN
     if(chain_logit)logit=chain_logit; else
-#endif
     logit=falloc((int64_t)nlogits*c->vocab);
     double phase_started=now_s();
     /* Lettura del prefill: la posizione p predice il token p+1. Il primo token
@@ -3383,18 +5314,14 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
         if(g_echo_pin_logit)
             q38_echo(g_echo_id,pos_base,ids[0],g_echo_pin_logit,c->vocab,g_echo_k);
         float *elog=logit;
-#ifdef COLI_VULKAN
         if(chain_logit)elog=falloc(c->vocab);   /* logit already holds the chain's last rows */
-#endif
         for(int p=0;p+1<S;p++){
             q38_weight_matmul(elog,mixed+(int64_t)p*H,&m->lm_head,1,H,c->vocab);
             q38_echo(g_echo_id,pos_base+p+1,ids[p+1],elog,c->vocab,g_echo_k);
         }
         if(elog!=logit)free(elog);
     }
-#ifdef COLI_VULKAN
     if(!chain_logit)
-#endif
     q38_weight_matmul(logit,mixed+(int64_t)(S-nlogits)*H,&m->lm_head,nlogits,H,c->vocab);
     q38_tm_add(m,Q38_TM_LM_HEAD,phase_started);
     if(streams)*streams=hyper; else free(hyper);
@@ -3543,7 +5470,6 @@ static float *q38_forward_rows(Model *m,const Q38Row *rows,const int *ids,int S)
  * forward waits in mtp_pend, a draft runs the pending rows with the token
  * the caller just picked, and the rows of a verify wait until the caller's
  * next pick settles which of them stand. */
-enum { Q38_MTP_WHOLE_NORM='a', Q38_MTP_STREAM_NORM='b' };
 
 /* Q38_MTP_FORCE (tests): 'r' rejects every draft, a right one too, so the
  * rollback runs on every token; 'a' drafts the reference's next token
@@ -3576,16 +5502,105 @@ static void q38_mtp_input(Model *m,const float *streams,const int *next,int S,in
     free(fh);free(en);free(fe);free(row);free(hn);
 }
 
+static int q38_argmax(const float *lo,int V) {
+    int best=0;float value=lo[0];
+    for(int i=1;i<V;i++)if(lo[i]>value){value=lo[i];best=i;}
+    return best;
+}
+
+/* y[j] is the score of token ids[j] for the row x, read from the int8 rows of the head by id:
+ * the value q38_weight_matmul gives for that row of the lm_head. */
+static void q38_head_scores(float *y,const float *x,const Q38Weight *head,const int *ids,int n) {
+    int I=head->cols;
+    int8_t *xq=(int8_t*)malloc((size_t)I);
+    if(!xq){fprintf(stderr,"OOM activation quantization\n");exit(1);}
+    float sx=dense_act_i8(x,I,xq,NULL);
+#ifdef IDOT_R16
+    if(head->q8r16) matmul_q_idot_rows_r16(y,xq,sx,head->q8,head->q8sc,ids,n,I);
+    else
+#endif
+    matmul_q_idot_rows(y,xq,sx,head->q8,head->q8sc,ids,n,I);
+    free(xq);
+}
+
+/* The draft for the mixed row: the best token of the draft list (the lower id on a tie, like
+ * q38_argmax), or the best token of the logits of the whole vocabulary (q38_draft_logits) when
+ * there is no list. A token missing from the list costs a rejected draft at most, because the
+ * verify step checks every token. */
+/* The probability the head gives its pick: softmax over the scores it had, the ones within
+ * 20 of the best (the rest add under 2e-9 each) -- the per-draft estimate the verify's
+ * depth is picked from (spec_gate_pick_p) */
+static float q38_draft_p(const float *l,int n,int best) {
+    float mx=l[best];double s=0.0;
+    for(int i=0;i<n;i++){float d=l[i]-mx;if(d>-20.0f)s+=exp((double)d);}
+    return s>0.0?(float)(1.0/s):0.0f;
+}
+static int q38_mtp_best_token(Model *m,const float *mixed) {
+    Cfg *c=&m->c;DraftVocab *v=m->draft_vocab;
+#ifdef COLI_VULKAN
+    if(g_vk_chain)v=NULL;   /* the chain's device scores the whole vocabulary (q38c_draft_logits): the list is for the CPU */
+#endif
+    int pick;
+    if(v){
+        float *score=falloc(v->list_n);
+        q38_head_scores(score,mixed,&m->lm_head,v->list,v->list_n);
+        pick=v->list[0];float best=score[0];int at=0;
+        for(int j=1;j<v->list_n;j++)
+            if(score[j]>best||(score[j]==best&&v->list[j]<pick)){best=score[j];pick=v->list[j];at=j;}
+        m->mtp_p=q38_draft_p(score,v->list_n,at);
+        free(score);
+        return pick;
+    }
+    float *logit=falloc(c->vocab);
+    q38_draft_logits(m,logit,mixed);
+    pick=q38_argmax(logit,c->vocab);
+    m->mtp_p=q38_draft_p(logit,c->vocab,pick);
+    free(logit);
+    return pick;
+}
+
+/* The start of a Q38_MTP_DUMP record: the position of the head's last row and the token
+ * that follows it. The logits of the whole vocabulary come after it. */
+typedef struct { int32_t row, token; } Q38MtpDumpRow;
+
+/* Writes the record of a draft: the logits of the whole vocabulary for its row. */
+static void q38_mtp_dump_record(const Model *m,const float *logit,Q38MtpDumpRow at) {
+    if(fwrite(&at,sizeof at,1,g_q38_mtp_dump)!=1||
+       fwrite(logit,sizeof(float),(size_t)m->c.vocab,g_q38_mtp_dump)!=(size_t)m->c.vocab){
+        fprintf(stderr,"Q38_MTP_DUMP: write failed\n");exit(1);
+    }
+}
+
+/* The record of a draft made on the CPU, with the logits q38_mtp_best_token reads. */
+static void q38_mtp_dump_logits(Model *m,const float *mixed,Q38MtpDumpRow at) {
+    float *logit=falloc(m->c.vocab);
+    q38_draft_logits(m,logit,mixed);
+    q38_mtp_dump_record(m,logit,at);
+    free(logit);
+}
+
 /* The head over S pairs at rows pos_base..pos_base+S-1: their K/V/indexer
- * rows enter its attention and, with `logit`, the last row's logits come
+ * rows enter its attention and, with `draft`, the draft for the last row comes
  * back through the head's mixer and lm_head; with `hidden`, the last row's
  * four streams as the head's layer leaves them (what a deeper draft reads in
  * place of the model's). Rows go in bounded chunks so a long prompt's pairs
  * do not need a prompt-sized workspace; the head's attention is causal, so
  * chunking changes no result. */
-static void q38_mtp_rows(Model *m,const float *streams,const int *next,int S,int pos_base,float *logit,
+static void q38_mtp_rows(Model *m,const float *streams,const int *next,int S,int pos_base,int *draft,
                          float *hidden) {
     Cfg *c=&m->c; int H=c->hidden,W=c->hc_width,C=c->hc_count;
+#ifdef COLI_VULKAN
+    float *logit=draft?falloc(c->vocab):NULL;
+    int ran=q38c_mtp_rows(m,streams,next,S,pos_base,logit,hidden,1);   /* the dense chain runs the head's layer */
+    if(ran&&draft){
+        *draft=q38_argmax(logit,c->vocab);
+        m->mtp_p=q38_draft_p(logit,c->vocab,*draft);
+        if(g_q38_mtp_dump)q38_mtp_dump_record(m,logit,(Q38MtpDumpRow){pos_base+S-1,next[S-1]});
+    }
+    free(logit);
+    if(ran)return;
+    q38c_mtp_host(m,pos_base);   /* the head's rows from here are the host's: the device's mirror behind them */
+#endif
     int cap=q38_bounded_prefill_rows(S,0,(uint64_t)(3*W+2*H+C)*sizeof(float));
     float *hyper=falloc((int64_t)cap*W),*mixed=falloc((int64_t)cap*H);
     float *inject=falloc((int64_t)cap*C),*block=falloc((int64_t)cap*H);
@@ -3595,11 +5610,12 @@ static void q38_mtp_rows(Model *m,const float *streams,const int *next,int S,int
         q38_layer_forward(m,c->layers,hyper,next+base,rows,pos_base+base,mixed,inject,block);
         m->mtp_len=pos_base+base+rows;
         if(hidden&&base+rows==S)memcpy(hidden,hyper+(int64_t)(rows-1)*W,(size_t)W*sizeof(float));
-        if(logit&&base+rows==S){
+        if(draft&&base+rows==S){
             double started=now_s();
             q38_gr_read(m,&m->mtp_mixer,hyper+(int64_t)(rows-1)*W,1,mixed,NULL);
-            q38_weight_matmul(logit,mixed,&m->lm_head,1,H,c->vocab);
-            q38_tm_add(m,Q38_TM_LM_HEAD,started);
+            *draft=q38_mtp_best_token(m,mixed);
+            q38_tm_add(m,Q38_TM_LM_DRAFT,started);
+            if(g_q38_mtp_dump)q38_mtp_dump_logits(m,mixed,(Q38MtpDumpRow){pos_base+S-1,next[S-1]});
         }
     }
     free(hyper);free(mixed);free(inject);free(block);
@@ -3607,11 +5623,11 @@ static void q38_mtp_rows(Model *m,const float *streams,const int *next,int S,int
 
 /* The pending rows meet their next token: the head reads them (each but the
  * last with the token already known in mtp_pend_tok, the last with `tok`). */
-static void q38_mtp_take_pending(Model *m,int tok,float *logit,float *hidden) {
+static void q38_mtp_take_pending(Model *m,int tok,int *draft,float *hidden) {
     int next[Q38_SPEC_ROWS],n=m->mtp_pend_n;
     for(int j=0;j+1<n;j++)next[j]=m->mtp_pend_tok[j];
     next[n-1]=tok;
-    q38_mtp_rows(m,m->mtp_pend,next,n,m->mtp_len,logit,hidden);
+    q38_mtp_rows(m,m->mtp_pend,next,n,m->mtp_len,draft,hidden);
     m->mtp_pend_n=0;
 }
 
@@ -3634,29 +5650,13 @@ static void q38_mtp_feed(Model *m,const int *ids,int S,int pos_base,const float 
     m->mtp_pend_n=1;
 }
 
-static int q38_argmax(const float *lo,int V) {
-    int best=0;float value=lo[0];
-    for(int i=1;i<V;i++)if(lo[i]>value){value=lo[i];best=i;}
-    return best;
-}
-
-/* The head's draft for the token after `tok`, which is about to be fed at
- * `pos`: the pending rows take `tok`, and the last one's logits name the
- * token at pos+1; `hidden` gets that row's streams. -1 when the head has not
- * read up to pos. */
+/* The draft made by the head for the token after `tok`, which is about to be fed at
+ * `pos`: the pending rows take `tok`, and `hidden` gets the streams of the last row.
+ * -1 when the head has not read up to pos. */
 static int q38_mtp_draft(Model *m,int tok,int pos,float *hidden) {
     if(!m->mtp_pend_n||m->mtp_len+m->mtp_pend_n!=pos)return -1;
-    float *logit=falloc(m->c.vocab);
-    q38_mtp_take_pending(m,tok,logit,hidden);
-    int draft=q38_argmax(logit,m->c.vocab);
-    if(g_q38_mtp_dump){
-        int32_t head[2]={pos-1,tok};
-        if(fwrite(head,sizeof head,1,g_q38_mtp_dump)!=1||
-           fwrite(logit,sizeof(float),(size_t)m->c.vocab,g_q38_mtp_dump)!=(size_t)m->c.vocab){
-            fprintf(stderr,"Q38_MTP_DUMP: write failed\n");exit(1);
-        }
-    }
-    free(logit);
+    int draft;
+    q38_mtp_take_pending(m,tok,&draft,hidden);
     return draft;
 }
 
@@ -3669,22 +5669,30 @@ static int q38_mtp_draft(Model *m,int tok,int pos,float *hidden) {
  * streams, for the draft after. */
 static int q38_mtp_draft_more(Model *m,float *hidden,int tok,int row) {
     Cfg *c=&m->c; int H=c->hidden,W=c->hc_width,C=c->hc_count;
-    float *hyper=falloc(W),*mixed=falloc(H),*inject=falloc(C),*block=falloc(H),*logit=falloc(c->vocab);
+#ifdef COLI_VULKAN
+    {   /* the dense chain runs the head's layer: its tail row at `row`, hidden in and out */
+        float *lo=falloc(c->vocab);
+        if(q38c_mtp_rows(m,hidden,&tok,1,row,lo,hidden,0)){int d=q38_argmax(lo,c->vocab);m->mtp_p=q38_draft_p(lo,c->vocab,d);free(lo);return d;}
+        free(lo);
+        q38c_mtp_host(m,row);
+    }
+#endif
+    float *hyper=falloc(W),*mixed=falloc(H),*inject=falloc(C),*block=falloc(H);
     q38_mtp_input(m,hidden,&tok,1,row,hyper);
     q38_layer_forward(m,c->layers,hyper,&tok,1,row,mixed,inject,block);
     memcpy(hidden,hyper,(size_t)W*sizeof(float));
     double started=now_s();
     q38_gr_read(m,&m->mtp_mixer,hyper,1,mixed,NULL);
-    q38_weight_matmul(logit,mixed,&m->lm_head,1,H,c->vocab);
-    q38_tm_add(m,Q38_TM_LM_HEAD,started);
-    int draft=q38_argmax(logit,c->vocab);
-    free(hyper);free(mixed);free(inject);free(block);free(logit);
+    int draft=q38_mtp_best_token(m,mixed);
+    q38_tm_add(m,Q38_TM_LM_DRAFT,started);
+    free(hyper);free(mixed);free(inject);free(block);
     return draft;
 }
 
 static float *step(Model *m,const int *ids,int S,int pos_base) {
     float *streams=NULL;
     float *logit=q38_forward(m,ids,S,pos_base,1,m->mtp?&streams:NULL);
+    if(!logit)return NULL;   /* g_q38_breaker stopped it */
     if(streams){q38_mtp_feed(m,ids,S,pos_base,streams);free(streams);}
     return logit;
 }
@@ -3718,8 +5726,8 @@ static float *step(Model *m,const int *ids,int S,int pos_base) {
  * exception is the CUDA expert tier, whose float order already depends on
  * which experts are resident when, with drafts or without.
  *
- * How many drafts: Q38_MTP_DRAFTS (1..3, default 2) fixes the head's; 0 lets
- * the gate pick 0..3 from the measured acceptance per draft position and the
+ * How many drafts: Q38_MTP_DRAFTS (1..3, default Model.mtp_drafts) fixes the head's;
+ * 0 lets the gate pick 0..3 from the measured acceptance per draft position and the
  * measured cost of a verify by its rows (spec_draft.h). Lookup drafts are
  * always gated (COLI_SPEC_GATE=0 drafts every proposal in full: tests). With
  * both sources a verify carries the proposal whose expected tokens per unit of
@@ -3735,6 +5743,8 @@ typedef struct {
      * 0..ahead_n-1 at ahead_pos.., ids[] their tokens, ahead_i the next row to
      * hand out (its draft ids[ahead_i] must be the caller's pick) */
     int ahead_n, ahead_i, ahead_pos, ahead_src, head_ok;
+    int pstep;                   /* Q38_MTP_PSTEP: the verify's depth from the drafts' own probabilities */
+    float ahead_p[Q38_SPEC_ROWS];/* those probabilities, for the gate once the verify is judged */
     int ids[Q38_SPEC_ROWS];
     float *ahead_logit, *ahead_streams;
     uint64_t drafts, accepted, forwards, tokens;   /* the MTP head's drafts (the report's counts) */
@@ -3785,6 +5795,9 @@ static void q38_spec_rollback(Model *m,int len,int keep) {
 #ifdef COLI_VULKAN
     q38c_rollback(m,slot,len);   /* the dense chain's own copies: its device buffers swap too */
 #endif
+#ifdef COLI_CUDA
+    q38cc_rollback(m,slot,len);
+#endif
     for(int i=0;i<c->layers;i++)if(!c->is_attn[i]){
         float *t=m->DN_rec[i];m->DN_rec[i]=m->snap_rec[slot][i];m->snap_rec[slot][i]=t;
         t=m->DN_conv[i];m->DN_conv[i]=m->snap_conv[slot][i];m->snap_conv[slot][i]=t;
@@ -3810,7 +5823,9 @@ static void q38_spec_settle(Model *m,Q38Spec *sp,int keep,int rejected) {
         m->mtp_pend_n=keep;
         for(int j=0;j+1<keep;j++)m->mtp_pend_tok[j]=sp->ids[j+1];
     }
-    spec_gate_result(&sp->gate,sp->ahead_src,keep-1+(rejected?1:0),keep-1);
+    if(sp->ahead_src==SPEC_SRC_MTP&&sp->pstep)
+        spec_gate_result_p(&sp->gate,sp->ahead_src,keep-1+(rejected?1:0),keep-1,sp->ahead_p);
+    else spec_gate_result(&sp->gate,sp->ahead_src,keep-1+(rejected?1:0),keep-1);
     free(sp->ahead_logit);free(sp->ahead_streams);
     sp->ahead_logit=sp->ahead_streams=NULL;sp->ahead_n=sp->ahead_i=0;
 }
@@ -3887,7 +5902,11 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
         int km=0;double vm=0.0;
         if(head_ready){
             int maxm=room<3?room:3;
-            if(sp->depth){km=sp->depth<maxm?sp->depth:maxm;vm=spec_gate_value(&sp->gate,SPEC_SRC_MTP,km,NULL);}
+            if(sp->depth){
+                /* the plain step that keeps T(1) measured for the trim below (see q36_mtp_depth) */
+                if(sp->depth>1&&sp->pstep&&!sp->gate.off&&!sp->force&&sp->gate.since_plain>=SPEC_REFRESH){sp->gate.declined[SPEC_SRC_MTP]++;vm=1.0;}
+                else{km=sp->depth<maxm?sp->depth:maxm;vm=spec_gate_value(&sp->gate,SPEC_SRC_MTP,km,NULL);}
+            }
             else km=spec_gate_pick(&sp->gate,SPEC_SRC_MTP,maxm,&vm);
         }
         if(kl>0&&(km==0||sp->lk_force||vl>vm||(vl==vm&&kl>km))){k=kl;src=SPEC_SRC_LOOKUP;memcpy(d,dl,(size_t)k*sizeof(int));}
@@ -3896,14 +5915,29 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
         if(k>0&&src==SPEC_SRC_MTP){
             float *hidden=falloc(c->hc_width);
             t_verify=now_s();   /* the head's first draft is the head pass a plain step makes too */
+            m->mtp_p=-1.0f;
             d[0]=q38_mtp_draft(m,tok,pos,hidden);
+            sp->ahead_p[0]=m->mtp_p;
             double t_first=now_s();
             for(int j=1;j<k;j++){
+                /* the drafts so far leave no next draft that could pass */
+                if(sp->pstep&&sp->depth&&!sp->force&&!spec_gate_deeper_p(&sp->gate,SPEC_SRC_MTP,j,sp->ahead_p)){k=j;break;}
                 double t0=now_s();
+                m->mtp_p=-1.0f;
                 d[j]=q38_mtp_draft_more(m,hidden,d[j-1],pos+j-1);
+                sp->ahead_p[j]=m->mtp_p;
                 spec_gate_draft_cost(&sp->gate,SPEC_SRC_MTP,now_s()-t0);
             }
             free(hidden);
+            /* the depth this step's drafts are worth, from their probabilities (DeepSeek's
+             * confidence-scheduled verification): the drafts past it go unverified.
+             * The first stays (the head pass that made it is a plain step's too). */
+            int known=1;
+            for(int j=0;j<k;j++)known=known&&sp->ahead_p[j]>=0.0f;
+            if(sp->pstep&&sp->depth&&known&&!sp->force&&k>1){   /* a fixed depth: see qwen36.c */
+                int kp=spec_gate_pick_p(&sp->gate,SPEC_SRC_MTP,k,sp->ahead_p,NULL);
+                k=kp<1?1:kp;
+            }
             t_verify+=now_s()-t_first;   /* the deeper drafts are the gate's d, not the verify's */
             if(sp->force)for(int j=1;j<=k;j++){
                 int t=q38_spec_forced(sp->force,sp->force_row,(int)sp->verifies,k,j,pos,V);
@@ -3976,6 +6010,16 @@ static void q38_mtp_attach(Model *m,int cap) {
     int forced=asked&&*asked;
     if(!q38_env_bool("Q38_MTP",1))return;
     Cfg *c=&m->c;int H=c->hidden,W=c->hc_width;
+    if(g_q38_gguf){   /* the head is blk.<layers>, in the model's GGUF or in gguf.json's "mtp" */
+        char eh[96]; snprintf(eh,sizeof eh,"blk.%d.nextn.eh_proj.weight",c->layers);
+        if(!gguf_find(&g_q38gg,eh)&&!(g_q38gg_mtp.t&&gguf_find(&g_q38gg_mtp,eh))){
+            if(forced){fprintf(stderr,"Q38_MTP=1 but the GGUF has no MTP head (%s) and gguf.json names no "
+                                      "mtp-*.gguf (tools/gguf_import.py --mtp) -- refusing\n",eh);exit(1);}
+            fprintf(stderr,"[qwen38] speculative decoding with the MTP head: off (the GGUF has none; "
+                           "tools/gguf_import.py --mtp names an mtp-*.gguf; Q38_MTP=0 silences this)\n");
+            return;
+        }
+    }
     if(!forced&&(m->range_begin!=0||m->range_end!=c->layers||!m->lm_head.rows||c->mtp_layers!=1)){
         fprintf(stderr,"[qwen38] speculative decoding with the MTP head: off (%s; Q38_MTP=0 silences this)\n",
                 c->mtp_layers==0?"the checkpoint has no MTP head":c->mtp_layers!=1?"an MTP head this engine does not run":
@@ -4004,6 +6048,7 @@ static void q38_mtp_attach(Model *m,int cap) {
     char probe[96];const char *found=NULL;
     const char *bases[3]={"mtp","model.mtp",NULL};
     char nested[48];snprintf(nested,sizeof nested,"%s.mtp",m->prefix);bases[2]=nested;
+    if(g_q38_gguf){found="mtp";g_q38_gg_mtp_layer=c->layers;}   /* the checkpoint's names, mapped onto the GGUF's (q38_gg_name) */
     for(int i=0;i<3&&!found;i++){
         snprintf(probe,sizeof probe,"%s.fc_embedding.weight",bases[i]);
         if(st_has(&m->S,probe))found=bases[i];
@@ -4023,6 +6068,7 @@ static void q38_mtp_attach(Model *m,int cap) {
     snprintf(nm,sizeof nm,"%s.fc_hidden.weight",found); m->mtp_fc_hid=q38_load_weight(m,nm,H,H);
     snprintf(base,sizeof base,"%s.hyper_connection_mixer",found); q38_load_gr_at(m,&m->mtp_mixer,base,0);
     m->mtp=1;                                 /* from here on index c.layers is the head's layer */
+    m->mtp_drafts=2;
     /* Q38_MTP_CAP: the head's expert cache, by default the cap every layer
      * has. Its experts are FP8 even beside the int4 sidecar, so on a cap
      * sized to fill RAM with int4 experts it costs more than a model layer. */
@@ -4032,19 +6078,68 @@ static void q38_mtp_attach(Model *m,int cap) {
     /* the verify's first rollback copy (q38_spec_rollback); deeper verifies add theirs */
     if(!q38_spec_alloc(m,1)){fprintf(stderr,"OOM MTP rollback state\n");exit(1);}
     snprintf(nm,sizeof nm,"%s.layers.0.mlp.experts.0.gate_proj.weight",found);
-    st_tensor *expert=st_find(&m->S,nm);
+    st_tensor *expert=g_q38_gguf?NULL:st_find(&m->S,nm);
     double expert_bytes=expert?3.0*(double)expert->nbytes:0.0;   /* gate, up and down are the same size */
+    const char *expert_kind=expert?st_dtype_name(expert->dtype):"(fused)";
+    if(g_q38_gguf){
+        const gguf_tensor *t[3]; q38_gg_expert_tensors(m,c->layers,t);
+        expert_bytes=0; for(int k=0;k<3;k++)expert_bytes+=(double)t[k]->nbytes/c->experts;
+        expert_kind=gq_type_name(t[0]->type);
+    }
+    m->mtp_expert_bytes=(size_t)expert_bytes;
     const char *how=m->mtp_wiring==Q38_MTP_STREAM_NORM?"a norm per stream, fc_hidden per stream":
                     "one norm over the four streams, fc_hidden per stream (diagnostic; b is the default)";
     fprintf(stderr,"[qwen38] MTP head %s.*: wiring %c (%s), RoPE base %g, %.2f MiB resident; "
                    "routed experts %s from the snapshot%s, cache %d (Q38_MTP_CAP) x %.2f MiB = %.2f GiB full\n",
             found,m->mtp_wiring,how,(double)c->mtp_theta,
             (m->resident_weight_bytes-resident_before)/1048576.0,
-            expert?st_dtype_name(expert->dtype):"(fused)",m->x4?" (the int4-g64 sidecar covers the model's layers)":"",
+            expert_kind,g_q38_gguf?(g_q38gg_mtp.t?" (its own GGUF)":" (the model's GGUF)"):
+            m->x4?(m->x4->lb?" (the low-bit sidecar covers the model's layers)":" (the int4-g64 sidecar covers the model's layers)"):"",
             mtp_cap,expert_bytes/1048576.0,expert_bytes*mtp_cap/1073741824.0);
     fprintf(stderr,"[qwen38] MTP norm weights, mean: embedding %.4f, hidden %.4f, mixer %.4f "
                    "(q38_rms0 scales by 1+w; a plain norm's weights would sit near 1)\n",
             q38_mean(m->mtp_norm_emb,H),q38_mean(m->mtp_norm_hid,W),q38_mean(m->mtp_mixer.norm,W));
+}
+
+/* Whether the MTP head takes the values of q38_mtp_igpu_defaults: it is attached, the device is
+ * an integrated GPU with many compute units, and the dense chain runs every step. The Vulkan
+ * expert tier must be up too. */
+static int q38_mtp_igpu_wanted(const Model *m,int many_cu,int chain_on){
+    return m->mtp&&many_cu&&chain_on;
+}
+
+/* The slots q38_mtp_igpu_defaults gives the expert cache of the head: one for each expert,
+ * or the size Q38_MTP_CAP already set. */
+static int q38_mtp_igpu_slots(const Model *m){
+    const char *cap=getenv("Q38_MTP_CAP");
+    return cap&&*cap?m->cache[m->c.layers].cap:m->c.experts;
+}
+
+/* The RAM the Vulkan expert tier leaves free for the CPU caches: every layer at `cap` (the
+ * tier's ram_reserve; at top-k its ram_floor) and, with `igpu`, the slots q38_mtp_igpu_defaults
+ * adds to the cache of the head, which the host pool's lowering of the layers' caches leaves. */
+static size_t q38_vk_tier_ram_reserve(Model *m,int cap,size_t ram_expert,int igpu){
+    size_t reserve=ram_expert*(size_t)cap*(size_t)m->c.layers;
+    int more=q38_mtp_igpu_slots(m)-m->cache[m->c.layers].cap;
+    return igpu&&more>0?reserve+(size_t)more*m->mtp_expert_bytes:reserve;
+}
+
+/* The values for the MTP head on an integrated GPU with many compute units, the dense chain and
+ * the Vulkan expert tier (measured on a Radeon 8060S, docs/vulkan.md): one draft per verify and
+ * a cache slot for each expert of the head. The expert tier reserves RAM for that cache.
+ * Q38_MTP_DRAFTS and Q38_MTP_CAP override them. */
+static void q38_mtp_igpu_defaults(Model *m){
+    const char *drafts=getenv("Q38_MTP_DRAFTS");
+    const char *why="an integrated GPU with many compute units, the dense chain and the expert tier on";
+    if(!(drafts&&*drafts)){
+        m->mtp_drafts=1;
+        fprintf(stderr,"[qwen38] MTP drafts per verify 1 (%s; Q38_MTP_DRAFTS sets it)\n",why);
+    }
+    LCache *head=&m->cache[m->c.layers];
+    int slots=q38_mtp_igpu_slots(m);
+    if(head->n||slots==head->cap)return;
+    if(q38_cache_slots_set(head,slots)){fprintf(stderr,"OOM expert cache\n");exit(1);}
+    fprintf(stderr,"[qwen38] MTP head expert cache %d (%s; Q38_MTP_CAP sets it)\n",slots,why);
 }
 
 static int q38_tm_enabled(void) {
@@ -4056,7 +6151,8 @@ static void q38_tm_report_bank(const Q38Timers *timers,const char *scope) {
     if(!q38_tm_enabled())return;
     static const char *names[Q38_TM_COUNT]={
         "expert-read","fp8-expand","routed-expert","shared-expert",
-        "resident-mm","deltanet","qsa-index","qsa-attn","ple","lm-head"
+        "resident-mm","deltanet","qsa-index","qsa-attn","ple","lm-head",
+        "dn-recur","dn-snap","lm-draft"
     };
     double per=timers->forwards?1000.0/timers->forwards:0.0;
     fprintf(stderr,"[qwen38 timers] %s: %llu forwards\n",scope,
@@ -4114,6 +6210,7 @@ static void q38_layer_free(Layer *l) {
 
 static void q38_model_free(Model *m) {
     if(!m) return;
+    q38_tstats_write();g_q38_tstats_path[0]=0;   /* Q38_TRUNK_STATS: while the sums still exist */
     kv_prefix_free(&m->kvp);
     int rows=q38_layer_rows(m);
     for(int i=0;i<rows;i++) {
@@ -4139,12 +6236,14 @@ static void q38_model_free(Model *m) {
     }
     for(int sl=0;sl<Q38_SPEC_SNAPS;sl++){ free(m->snap_rec[sl]); free(m->snap_conv[sl]); free(m->snap_ple[sl]); }
     free(m->mtp_pend);
+    draft_vocab_free(m->draft_vocab);
     free(m->mtp_norm_emb); free(m->mtp_norm_hid);
     q38_weight_free(&m->mtp_fc_emb); q38_weight_free(&m->mtp_fc_hid);
     free(m->mtp_mixer.norm); q38_weight_free(&m->mtp_mixer.down); q38_weight_free(&m->mtp_mixer.up);
     if(m->x4){st_destroy(&m->x4->S);free(m->x4->fd);free(m->x4->off);free(m->x4);}
     free(m->L); free(m->cache); free(m->expert_scales); free(m->DN_rec); free(m->DN_conv); free(m->dn_dev_fresh); free(m->dn_host_stale); free(m->K); free(m->V); free(m->IK);
     q38_weight_free(&m->embed);q38_weight_free(&m->lm_head);
+    free(m->draft_codes);free(m->draft_sc);m->draft_codes=NULL;m->draft_sc=NULL;
     free(m->final_gr.norm);q38_weight_free(&m->final_gr.down);q38_weight_free(&m->final_gr.up);q38_weight_free(&m->final_gr.inject);
     free(m->ple_history); free(m->PLE_conv_state); free(m->c.is_attn); st_destroy(&m->S);
     memset(m,0,sizeof(*m));

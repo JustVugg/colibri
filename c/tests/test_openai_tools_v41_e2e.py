@@ -191,6 +191,20 @@ class ToolCallingV41E2E(unittest.TestCase):
         self.assertEqual(out["choices"][0]["message"]["content"],
                          "Hello from the mock V4.1 engine.")
 
+    def test_namespace_tool_with_non_string_function_description_generates(self):
+        """The DSML adapter joined namespace.description to function.description.
+        A number, list, or object in the latter raised TypeError and became HTTP 500."""
+        for description in (5, ["search"], {"summary": "search"}):
+            with self.subTest(description=description):
+                tools = [{"type": "function",
+                          "namespace": {"name": "browser", "description": "Browser tools"},
+                          "function": {"name": "search", "description": description}}]
+                out = self.post({"model": self.model_id(),
+                                 "messages": [{"role": "user", "content": "hello"}],
+                                 "tools": tools, "temperature": 0, "max_tokens": 64})
+                self.assertEqual(out["choices"][0]["message"]["content"],
+                                 "Hello from the mock V4.1 engine.")
+
 
 class Dsv41VendorEncodingCases(unittest.TestCase):
     """The checkpoint's own encoding test cases, rendered by the gateway.
@@ -240,6 +254,29 @@ class Dsv41VendorEncodingCases(unittest.TestCase):
 
     def test_case2_plain_multi_turn_chat(self):
         self._assert_case(2)
+
+    def test_non_string_tool_call_ids_do_not_break_the_reorder(self):
+        """The parallel-call reorder keys a dict by tool-call id: an id that is an object
+        or an array raised TypeError (unhashable), which do_POST answered with HTTP 500."""
+        import openai_server
+
+        call = {"type": "function", "function": {"name": "f", "arguments": "{}"}}
+        for bad in ({"a": 1}, [None]):
+            for messages in (
+                    [{"role": "user", "content": "hi"},
+                     {"role": "assistant", "content": None,
+                      "tool_calls": [dict(call, id=bad), dict(call, id="c2")]},
+                     {"role": "tool", "tool_call_id": "c2", "content": "two"},
+                     {"role": "tool", "tool_call_id": "c1", "content": "one"}],
+                    [{"role": "user", "content": "hi"},
+                     {"role": "assistant", "content": None,
+                      "tool_calls": [dict(call, id="c1"), dict(call, id="c2")]},
+                     {"role": "tool", "tool_call_id": "c2", "content": "two"},
+                     {"role": "tool", "tool_call_id": bad, "content": "one"}]):
+                with self.subTest(bad=bad, where=messages[1]["tool_calls"][0]["id"]):
+                    rendered = openai_server.render_chat_dsv41(messages)
+                    self.assertIn("two", rendered)
+                    self.assertIn("one", rendered)
 
     def test_tag_names_carry_the_leading_space(self):
         import v41_dsml

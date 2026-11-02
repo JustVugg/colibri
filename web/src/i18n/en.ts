@@ -171,7 +171,7 @@ const en: Record<string, string> = {
   "topbar.slot": "slot {{n}}",
   "chat.compacted": "The first {{n}} messages no longer fit the model's context: they were summarized, and the conversation goes on from the summary (hover to read it).",
   "topbar.truncated": "Truncated",
-  "topbar.truncatedHelp": "The response hit the max output tokens limit and was cut off. Raise \"Max output tokens\" to see the full answer.",
+  "topbar.truncatedHelp": "The response reached the output limit or the end of the context and was cut off. If you lowered \"Max output tokens\", raise it; otherwise continue the response.",
   "topbar.clear": "Clear",
 
   // hero / empty state

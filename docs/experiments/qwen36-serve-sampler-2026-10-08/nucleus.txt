@@ -1,0 +1,18 @@
+logits-it.f32 temperature 0.70 top_p 0.90: top token 99.9953%, nucleus 1 tokens, candidates 1
+logits-it.f32 temperature 0.60 top_p 0.95: top token 99.9993%, nucleus 1 tokens, candidates 1
+logits-it.f32 temperature 1.00 top_p 1.00: top token 99.7972%, nucleus 248319 tokens, candidates (the full sort) 248320
+logits-it.f32 temperature 1.50 top_p 0.95: top token 90.0406%, nucleus 279 tokens, candidates 944
+logits-it.f32 temperature 2.00 top_p 0.90: top token 29.8771%, nucleus 111205 tokens, candidates 197186
+logits-en.f32 temperature 0.70 top_p 0.90: top token 99.6642%, nucleus 1 tokens, candidates 1
+logits-en.f32 temperature 0.60 top_p 0.95: top token 99.8985%, nucleus 1 tokens, candidates 1
+logits-en.f32 temperature 1.00 top_p 1.00: top token 96.3905%, nucleus 248320 tokens, candidates (the full sort) 248320
+logits-en.f32 temperature 1.50 top_p 0.95: top token 67.6079%, nucleus 807 tokens, candidates 2372
+logits-en.f32 temperature 2.00 top_p 0.90: top token 19.5032%, nucleus 77474 tokens, candidates 198867
+logits-code.f32 temperature 0.70 top_p 0.90: top token 99.9990%, nucleus 1 tokens, candidates 1
+logits-code.f32 temperature 0.60 top_p 0.95: top token 99.9999%, nucleus 1 tokens, candidates 1
+logits-code.f32 temperature 1.00 top_p 1.00: top token 99.9355%, nucleus 248319 tokens, candidates (the full sort) 248320
+logits-code.f32 temperature 1.50 top_p 0.95: top token 95.6592%, nucleus 1 tokens, candidates 1
+logits-code.f32 temperature 2.00 top_p 0.90: top token 44.3708%, nucleus 111565 tokens, candidates 222648
+reply-it.f32 temperature 0.70 top_p 0.90: 128 tokens; nucleus of 1 token 63, up to 4 104, up to 16 125, up to 64 128, largest 49; candidates median 2, 90th percentile 10, largest 98
+reply-en.f32 temperature 0.70 top_p 0.90: 128 tokens; nucleus of 1 token 74, up to 4 124, up to 16 128, up to 64 128, largest 6; candidates median 1, 90th percentile 4, largest 9
+reply-code.f32 temperature 0.70 top_p 0.90: 83 tokens; nucleus of 1 token 79, up to 4 83, up to 16 83, up to 64 83, largest 3; candidates median 1, 90th percentile 1, largest 3

@@ -147,8 +147,17 @@ static void stops_arm_tok(const Cfg *c, int tok_eos, Tok *T){
     for (int i = 0; i < c->n_stop && g_nstop < 64; i++) g_stop[g_nstop++] = c->stop_ids[i];
     if (tok_eos >= 0 && !is_stop(tok_eos) && g_nstop < 64) g_stop[g_nstop++] = tok_eos;
     int nsp = 0;
-    if (T) for (int id = 0; id < T->n_ids && g_nstop < 64; id++)
-        if (T->id_special[id] && !is_stop(id)) { g_stop[g_nstop++] = id; nsp++; }
+    /* control tokens that are an answer's content, not its end: Mistral's reasoning and tool
+     * calls ([THINK]...[/THINK], [TOOL_CALLS]name[ARGS]{...}); as stops they cut every answer at
+     * its first token, as Mistral-Large-4 opens its reasoning */
+    static const char *const content_ctl[] = {"[THINK]", "[/THINK]", "[TOOL_CALLS]", "[ARGS]", "[CALL_ID]"};
+    if (T) for (int id = 0; id < T->n_ids && g_nstop < 64; id++) {
+        if (!T->id_special[id] || is_stop(id)) continue;
+        int content = 0;
+        for (size_t k = 0; k < sizeof content_ctl / sizeof *content_ctl; k++)
+            if (T->id2str[id] && !strcmp(T->id2str[id], content_ctl[k])) content = 1;
+        if (!content) { g_stop[g_nstop++] = id; nsp++; }
+    }
     /* #401: in batched gateway mode keep ONLY <|endoftext|>. Role markers
      * <|user|>/<|observation|> (config stops + tokenizer special set) are boundaries
      * the Python server owns; as hard stops they cut generation the moment the model

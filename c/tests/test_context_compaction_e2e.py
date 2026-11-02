@@ -213,6 +213,66 @@ class ContextCompactionE2E(unittest.TestCase):
             health = json.loads(resp.read())
         self.assertIs(health.get("context_compaction"), True)
         self.assertEqual(health.get("context_tokens"), CAPACITY)
+        self.assertEqual(health.get("max_tokens"), 64)   # --max-tokens: the web UI's default
+
+
+
+@unittest.skipUnless(os.name == "posix",
+                     "the mock engine is a shebang script the gateway execs directly")
+class ResponseCeilingE2E(unittest.TestCase):
+    """#382: a gateway started without --max-tokens (what coli serve, web and chat do
+    without --ngen) lets a response run to the end of the context the engine holds, says
+    so in /health for the web UI's default, and sends that ceiling with a request that
+    names none."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        (Path(cls.tmp.name) / "config.json").write_text(
+            json.dumps({"model_type": "glm_moe_dsa"}), encoding="utf-8")
+        mock = Path(cls.tmp.name) / "mock_engine.py"
+        mock.write_text(MOCK_ENGINE)
+        mock.chmod(0o755)
+        cls.log = Path(cls.tmp.name) / "prompts.jsonl"
+        cls.log.touch()
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            cls.port = probe.getsockname()[1]
+        env = dict(os.environ, MOCK_LOG=str(cls.log), MOCK_CTX=str(CAPACITY), CTX=str(CAPACITY))
+        env.pop("COLI_API_KEY", None)
+        cls.server = subprocess.Popen(
+            [sys.executable, str(SERVER), "--model", cls.tmp.name, "--engine", str(mock),
+             "--port", str(cls.port)],
+            env=env, stderr=subprocess.DEVNULL)
+        cls.base = f"http://127.0.0.1:{cls.port}"
+        for _ in range(100):
+            try:
+                with urllib.request.urlopen(cls.base + "/v1/models", timeout=2) as resp:
+                    cls.model = json.loads(resp.read())["data"][0]["id"]
+                    return
+            except OSError:
+                if cls.server.poll() is not None:
+                    raise RuntimeError("gateway exited during startup")
+                time.sleep(0.1)
+        raise RuntimeError("gateway did not come up")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.terminate()
+        cls.server.wait(timeout=5)
+        cls.tmp.cleanup()
+
+    def test_the_ceiling_is_the_context(self):
+        with urllib.request.urlopen(self.base + "/health", timeout=5) as resp:
+            health = json.loads(resp.read())
+        self.assertEqual((health.get("max_tokens"), health.get("context_tokens")), (CAPACITY, CAPACITY))
+        body = {"model": self.model, "messages": [{"role": "user", "content": "hi"}]}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", json.dumps(body).encode(),
+                                     {"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            json.loads(resp.read())
+        sent = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertEqual(sent[-1]["max_tokens"], CAPACITY)
 
 
 if __name__ == "__main__":

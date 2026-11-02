@@ -2,7 +2,8 @@
 // The dense chain's prompt GEMM on the matrix units (vk_chain.c): y[s,o] = sum_i x[s,i] *
 // dequant(W[o,i]) for int8 per row (fmt 1), int4 per row (2) and int4 per (row, gs)
 // (4), the bindings and push constants of qmatmul_gemm.comp. 256 invocations = 4
-// subgroups of 64 (required), a block of 128 outputs x 16*TT rows; per 64-input step two
+// subgroups of 64 or 8 of 32 (the device's cooperative-matrix width, required), a block
+// of 128 outputs x 16*TT rows; per 64-input step two
 // lanes dequantise one weight row to f16 in shared memory and x is rounded to f16 beside
 // it, the next step's words fetched into registers during the multiplies. Shared memory
 // holds each 16x16 operand tile contiguously (stride 16): strided cooperative-matrix
@@ -30,7 +31,7 @@ layout(push_constant) uniform P { int fmt, S, I, O, rowWords, gs; } p;
 #define TM (16u * TT)                  // token rows per workgroup
 shared uvec4 sx[TM * 8u];              // x slice, A tiles row-major, 8 f16 per uvec4
 shared uvec4 sg[BO * 8u];              // weights, B tiles COLUMN-major (= W[n][k], k contiguous)
-shared float spatch[4u * 256u];        // per-subgroup 16x16 patch for partial token tiles (4 x wave64)
+shared float spatch[8u * 256u];        // per-subgroup 16x16 patch for partial token tiles (up to 8 subgroups)
 
 // Shared memory holds every 16x16 operand tile CONTIGUOUSLY (256 values, loaded
 // with stride 16): strided cooperative-matrix loads out of a wide row-major
@@ -69,6 +70,12 @@ void fetch_raw(uint s0, uint o0, uint k0, uint tid) {
     }
 }
 uint pk(float a, float b) { return packFloat2x16(f16vec2(float16_t(a), float16_t(b))); }
+// an activation operand: held to +-65504 (a value past it would round to inf and the tile's
+// sums with it; the CUDA f16 GEMMs hold x the same way), a NaN kept a NaN. The weights, a
+// format's codes times its scales, stay well inside f16 and skip it (the hold on them cost
+// Qwen3.6's prompt 4%)
+float h16(float a) { return isnan(a) ? a : clamp(a, -65504.0, 65504.0); }
+uint pkx(float a, float b) { return pk(h16(a), h16(b)); }
 uint i8(uint w, uint k) { return uint(int(w << (24u - 8u * k)) >> 24); }
 void store_raw(uint tid) {
     {
@@ -76,7 +83,7 @@ void store_raw(uint tid) {
         [[unroll]] for (uint c = 0u; c < XPL / 8u; c++) {
             uint k = kk + 8u * c;
             uint base = ((r >> 4u) * 4u + (k >> 4u)) * 32u + (r & 15u) * 2u + ((k & 15u) >> 3u);
-            sx[base] = uvec4(pk(rx[8u*c], rx[8u*c+1u]), pk(rx[8u*c+2u], rx[8u*c+3u]), pk(rx[8u*c+4u], rx[8u*c+5u]), pk(rx[8u*c+6u], rx[8u*c+7u]));
+            sx[base] = uvec4(pkx(rx[8u*c], rx[8u*c+1u]), pkx(rx[8u*c+2u], rx[8u*c+3u]), pkx(rx[8u*c+4u], rx[8u*c+5u]), pkx(rx[8u*c+6u], rx[8u*c+7u]));
         }
     }
     uint n = tid >> 1u, hf = tid & 1u;
@@ -101,7 +108,7 @@ void store_raw(uint tid) {
 }
 
 // Each subgroup owns output tiles q = sgi, sgi + nsg, ... (8 per workgroup) for
-// all TT token tiles: MAXQ tiles per subgroup at most (8 with one wave64 group of 4).
+// all TT token tiles: MAXQ tiles per subgroup at most (2 with four of 64, 1 with eight of 32).
 #define MAXQ 2u
 
 void main() {
@@ -129,7 +136,8 @@ void main() {
             [[unroll]] for (uint t = 0u; t < TT; t++)
                 coopMatLoad(A[t], sx, (t * 4u + kt) * 32u, 2u, gl_CooperativeMatrixLayoutRowMajor);
             [[unroll]] for (uint qi = 0u; qi < MAXQ; qi++) {
-                uint q = sgi + qi * 4u;                    // wave64 assumed (requiredSubgroupSize = 64)
+                uint q = sgi + qi * nsg;                   // subgroup-uniform
+                if (qi >= nq || q >= 8u) break;
                 coopMatLoad(B, sg, (q * 4u + kt) * 32u, 2u, gl_CooperativeMatrixLayoutColumnMajor);
                 [[unroll]] for (uint t = 0u; t < TT; t++) G[qi * TT + t] = coopMatMulAdd(A[t], B, G[qi * TT + t]);
             }

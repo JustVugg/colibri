@@ -226,7 +226,7 @@ MTP_SEED_OFFSET = 0x4D5450      # "MTP": the head's weights come from their own 
 MTP_ROPE_THETA = 50000.0        # not the model's 10000, so a head on the wrong base shows
 
 
-def _add_mtp(out: Path, config, seed, fp8_experts=False, expert_gain=1.0):
+def _add_mtp(out: Path, config, seed, fp8_experts=False, expert_gain=1.0, model_base=False):
     """Add an MTP head with the release's tensor names to the saved fixture.
 
     Transformers has no MTP module (it ignores ``mtp.*`` on load), so the head
@@ -277,7 +277,10 @@ def _add_mtp(out: Path, config, seed, fp8_experts=False, expert_gain=1.0):
     cfg_path = out / "config.json"
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     cfg["mtp_num_hidden_layers"] = 1
-    cfg["mtp"] = {"layer_types": ["full_attention"], "rope_theta": MTP_ROPE_THETA, "hybrid": True}
+    # model_base (--geometry): a GGUF stores one RoPE base for the model and its head, as
+    # the release has (both 1e7), so the head takes the model's
+    theta = cfg.get("rope_parameters", {}).get("rope_theta", 10000.0) if model_base else MTP_ROPE_THETA
+    cfg["mtp"] = {"layer_types": ["full_attention"], "rope_theta": theta, "hybrid": True}
     cfg["mtp_use_dedicated_embeddings"] = False
     cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
     print(f"mtp head: {len(head)} tensors (decoder layer shaped like {source}*)")
@@ -320,8 +323,21 @@ def _int4_experts_in_model(model, out: Path):
     print(f"int4 experts: {sidecar} written, the model now holds its dequantized values")
 
 
+# --geometry gguf-256, for the GGUF oracle: every matrix whose rows a ggml type blocks
+# (the input width) is a whole number of 256 weights, so the K and i-quant types apply to
+# all of them, and 32 value : 16 key DeltaNet heads, so llama.cpp's value-head reorder is
+# really exercised. The vocabulary is 320 so a byte tokenizer fits in it.
+GEOMETRIES = {
+    "gguf-256": dict(vocab_size=320, hidden_size=256, num_attention_heads=4, num_key_value_heads=2,
+                     head_dim=64, linear_key_head_dim=8, linear_value_head_dim=8,
+                     linear_num_key_heads=16, linear_num_value_heads=32, hc_lowrank=256,
+                     ple_embed_dim=256, indexer_head_dim=64, num_experts=8,
+                     moe_intermediate_size=256, shared_expert_intermediate_size=256),
+}
+
+
 def build(out: Path, prompt_ids=None, max_new=8, seed=SEED, emit_ref=True, fp8_experts=False,
-          int4_experts=False, expert_gain=1.0, mtp=False, ple_layer=1):
+          int4_experts=False, expert_gain=1.0, mtp=False, ple_layer=1, geometry=None):
     if max_new < 1:
         raise ValueError("max_new must be at least 1")
     random.seed(seed)
@@ -335,7 +351,7 @@ def build(out: Path, prompt_ids=None, max_new=8, seed=SEED, emit_ref=True, fp8_e
     # partial Vulkan chain's tests put it past the layers on the device.
     if not 1 <= ple_layer <= 4:
         raise ValueError("ple_layer must be in 1..4 (one-based)")
-    config = ConfigCls(
+    shape = dict(
         vocab_size=64,
         hidden_size=32,
         num_hidden_layers=4,
@@ -391,10 +407,22 @@ def build(out: Path, prompt_ids=None, max_new=8, seed=SEED, emit_ref=True, fp8_e
         bos_token_id=1,
         eos_token_id=2,
     )
+    if geometry:
+        shape.update(GEOMETRIES[geometry])
+    config = ConfigCls(**shape)
     model = ModelCls(config)
     # The released checkpoint is BF16.  Materialize the fixture in BF16 before
     # saving so the digest emitted here is exactly reproducible after a
     # save/load round trip (and follows the production arithmetic path).
+    if geometry:
+        # The oracle must see every per-channel vector: at the default initialization the
+        # norms, A_log and dt_bias are constant, so a permuted or swapped one would go
+        # unnoticed. Give them values of their own, from their own seed.
+        gen = torch.Generator().manual_seed(seed + 7)
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if param.ndim == 1 or name.endswith(("A_log", "dt_bias")):
+                    param.add_(0.2 * torch.randn(param.shape, generator=gen))
     model = model.to(dtype=torch.bfloat16)
     model.eval()
     if expert_gain != 1.0:
@@ -417,8 +445,17 @@ def build(out: Path, prompt_ids=None, max_new=8, seed=SEED, emit_ref=True, fp8_e
     # from, and qwen38 picks it up by itself: regenerating the fixture drops it.
     shutil.rmtree(out / "experts-int4g64", ignore_errors=True)
     model.save_pretrained(str(out), safe_serialization=True)
+    if geometry:
+        # Transformers saves "qwen_sparse_attention"; the release's config.json says
+        # "full_attention", and llama.cpp's converter writes the indexer's compress ratio
+        # only for those
+        cfg_path = out / "config.json"
+        cfg_json = json.loads(cfg_path.read_text())
+        cfg_json["layer_types"] = ["full_attention" if t == "qwen_sparse_attention" else t
+                                   for t in cfg_json["layer_types"]]
+        cfg_path.write_text(json.dumps(cfg_json, indent=2) + "\n")
     if mtp:
-        _add_mtp(out, config, seed, fp8_experts=fp8_experts, expert_gain=expert_gain)
+        _add_mtp(out, config, seed, fp8_experts=fp8_experts, expert_gain=expert_gain, model_base=bool(geometry))
     if packed:
         _rewrite_shard_fp8(out, packed)
 
@@ -484,6 +521,8 @@ def main():
                              "and write ref_int4.json, the reference of the dequantized sidecar")
     parser.add_argument("--ple-layer", type=int, default=1,
                         help="the PLE layer, one-based as in the config (default 1: layer 0)")
+    parser.add_argument("--geometry", choices=sorted(GEOMETRIES),
+                        help="wider shapes for an oracle (gguf-256: the GGUF types)")
     parser.add_argument("--mtp", action="store_true",
                         help="add an MTP head (mtp.*, random weights from their own seed) with the "
                              "release's tensor names; the model and ref.json do not change")
@@ -491,7 +530,8 @@ def main():
     prompt = [int(x) for x in args.prompt_ids.split(",") if x.strip()] if args.prompt_ids else None
     build(args.out, prompt_ids=prompt, max_new=args.max_new, seed=args.seed, emit_ref=not args.no_ref,
           fp8_experts=args.fp8_experts, int4_experts=args.int4_experts,
-          expert_gain=args.expert_gain, mtp=args.mtp, ple_layer=args.ple_layer)
+          expert_gain=args.expert_gain, mtp=args.mtp, ple_layer=args.ple_layer,
+          geometry=args.geometry)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,6 @@
+tie_cost.c, built with clang -O3 against the qwen36_sample.h of this change (the same comparator as this branch's), on the
+three prompt vectors of logits.txt, on 2026-10-05:
+
+logits-it.f32: full sort, old comparator median 23.089 ms, new (ties by id) 23.964 ms; tokens tied with the previous: 16826 of 248320
+logits-en.f32: full sort, old comparator median 23.138 ms, new (ties by id) 23.973 ms; tokens tied with the previous: 18086 of 248320
+logits-code.f32: full sort, old comparator median 23.277 ms, new (ties by id) 24.086 ms; tokens tied with the previous: 19006 of 248320

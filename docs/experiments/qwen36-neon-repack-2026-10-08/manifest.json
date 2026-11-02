@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "hypothesis": "On ARM the qwen36 CPU engine repacks every INT4 routed expert read from disk with a scalar loop; a NEON path for xf_repack_row_pairs_signed gives the same bytes in far less time, so generation (steady decode) after a 512-token prompt gets faster with a 16-expert cache per layer, where each generated token reads and repacks the routed experts that miss the cache (up to 40 layers x 8).",
+  "commit": "d042565c066d12f72e0efb51ec01960b52553b82",
+  "model": "Qwen3.6-35B-A3B (Qwen3_5MoeForConditionalGeneration) converted to Colibri's qwen36 container: INT4 routed experts with gs=64 group scales, f16 dense weights (quantized to INT8 at load) and f16 embedding; 23 GB of safetensors",
+  "command": "for each version, git archive <its commit> c | tar -x -C <dir>, then from the repository root, with the flags of make -C c qwen36: clang -O3 -Xclang -fopenmp -I<libomp>/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -I<dir>/c docs/experiments/qwen36-neon-repack-2026-10-08/bench.c -o <dir>/qwen36-bench -lm -L<libomp>/lib -lomp; every run: /usr/bin/time -l env -i PATH=/usr/bin:/bin HOME=$HOME SNAP=<model> <dir>/qwen36-bench promessi_sposi.txt 64,512 32; baseline = dev 94dee9d2, trial = d5d844e8; d042565c has the measured code of d5d844e8 (the same machine code on the M1: since then only its test, its commit message and two preprocessor lines of expert_ffn.h changed), rebased onto dev 1509ea5b: the harness compiles to the same code section on the M1 from dev 1509ea5b as from dev 94dee9d2, and from d042565c as from d5d844e8",
+  "prompt_hash": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "hardware": {
+    "cpu": "Apple M1, 4 performance + 4 efficiency cores (MacBook Air, MacBookAir10,1, no fan)",
+    "ram": "8 GB unified memory",
+    "storage": "internal APPLE SSD AP0256Q, APFS",
+    "os": "macOS 26.6.2 (25G83), Apple clang 21.0.0 (clang-2100.3.34.2), Homebrew libomp"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "REPACK"
+  ],
+  "baseline": {
+    "config": {
+      "SNAP": "Qwen3.6-35B-A3B, Colibri qwen36 container, INT4 experts gs=64, internal SSD",
+      "BUILD": "flags of make -C c qwen36 on macOS: clang -O3 -Xclang -fopenmp, no -mcpu, no METAL",
+      "EXPERT_CACHE": "16 experts per layer, set by the harness (qwen36's default until dev sized the cache from the RAM, which the harness does not use)",
+      "PROMPT": "the first 64 and the first 512 tokens of promessi_sposi.txt (speed-bench/promessi_sposi.txt of antirez's ds4 at commit 0aaea5a, of which the harness reads the first 20,480 bytes; prompt_hash is its SHA-256), each from an empty state; after each, 32 greedy tokens",
+      "ORDER": "1 warm-up run (baseline, discarded), then baseline trial trial baseline baseline trial trial baseline, one process each",
+      "REST": "thermal state nominal, then 60 s, before every run",
+      "REPACK": "scalar loop (dev 94dee9d2)",
+      "MEASURED": "tokens per second of the 32 tokens generated after the 512-token prompt (the first token excluded)"
+    },
+    "samples": {
+      "tok_s": [
+        1.273,
+        1.243,
+        1.476,
+        1.575
+      ]
+    },
+    "median_tok_s": 1.3745,
+    "quality": {
+      "method": "FNV-1a fingerprint of every logit of the run, and the hash of the generated tokens, per prompt length: 64 tokens f1300d8431ba2787/833c8fed434981a0, 512 tokens 8e0bf69c62deb041/a85d82db8081fff4, the same in all nine runs of both versions",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-neon-repack-2026-10-08/baseline.txt",
+      "sha256": "32546d508aa3674d27d76b2a720f7d93462ac24a0bab8ee172a2964a304dfa2d"
+    }
+  },
+  "trial": {
+    "config": {
+      "SNAP": "Qwen3.6-35B-A3B, Colibri qwen36 container, INT4 experts gs=64, internal SSD",
+      "BUILD": "flags of make -C c qwen36 on macOS: clang -O3 -Xclang -fopenmp, no -mcpu, no METAL",
+      "EXPERT_CACHE": "16 experts per layer, set by the harness (qwen36's default until dev sized the cache from the RAM, which the harness does not use)",
+      "PROMPT": "the first 64 and the first 512 tokens of promessi_sposi.txt (speed-bench/promessi_sposi.txt of antirez's ds4 at commit 0aaea5a, of which the harness reads the first 20,480 bytes; prompt_hash is its SHA-256), each from an empty state; after each, 32 greedy tokens",
+      "ORDER": "1 warm-up run (baseline, discarded), then baseline trial trial baseline baseline trial trial baseline, one process each",
+      "REST": "thermal state nominal, then 60 s, before every run",
+      "REPACK": "NEON path (d5d844e8)",
+      "MEASURED": "tokens per second of the 32 tokens generated after the 512-token prompt (the first token excluded)"
+    },
+    "samples": {
+      "tok_s": [
+        2.084,
+        2.108,
+        1.852,
+        1.959
+      ]
+    },
+    "median_tok_s": 2.0215,
+    "quality": {
+      "method": "FNV-1a fingerprint of every logit of the run, and the hash of the generated tokens, per prompt length: 64 tokens f1300d8431ba2787/833c8fed434981a0, 512 tokens 8e0bf69c62deb041/a85d82db8081fff4, the same in all nine runs of both versions",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-neon-repack-2026-10-08/trial.txt",
+      "sha256": "3f346cbb692ccd2946c41fd099c15c5ee124aabdd5b13e2d4a209aa21bc90632"
+    }
+  },
+  "outcome": "improvement"
+}

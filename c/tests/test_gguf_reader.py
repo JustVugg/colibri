@@ -179,6 +179,9 @@ class GGMLTypeTableTest(unittest.TestCase):
             gguf_reader.GGML_TYPE_TQ1_0: (QK_K, 54),
             gguf_reader.GGML_TYPE_TQ2_0: (QK_K, 66),
             gguf_reader.GGML_TYPE_MXFP4: (32, 17),
+            gguf_reader.GGML_TYPE_NVFP4: (64, 36),
+            gguf_reader.GGML_TYPE_Q1_0: (128, 18),
+            gguf_reader.GGML_TYPE_Q2_0: (64, 18),
         }
 
     def test_block_table_matches_verified_values(self):

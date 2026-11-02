@@ -1,4 +1,5 @@
 #include "../backend_cuda_dsv4_quant.cuh"
+#include "dsv4_test_devices.h"
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -68,7 +69,9 @@ int main() {
         memcpy(&value, &raw, sizeof(value));
         if (std::isfinite(value) && fabsf(value) <= 448.f) values.push_back(value);
     }
-    for (int device : {0, 5}) {
+    int devices[2];
+    dsv4_test_devices(devices);
+    for (int device : devices) {
         assert(cudaSetDevice(device) == cudaSuccess);
         float *input;
         unsigned *failures, result = 0;

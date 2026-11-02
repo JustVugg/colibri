@@ -34,8 +34,19 @@ custom `stop` sequences. `max_tokens` is a ceiling, not a target: when the
 prompt leaves less room than the budget asks for, every engine clamps the
 budget to what the context holds and the reply ends with `finish_reason:
 "length"`; only a prompt that does not fit is refused, with
-`context_length_exceeded` (#260, #1641). Stop sequences are removed from the response and end
-generation early in both JSON and streaming modes.
+`context_length_exceeded` (#260, #1641). A request without a budget gets the server's
+ceiling (`--max-tokens`, reported by `GET /health` as `max_tokens`); a chat server started by
+`coli serve`, `coli web` or `coli chat` without `--ngen` sets none, so a response may run to
+the end of the context: a reasoning model's turn is its reasoning plus its answer (#382).
+Stop sequences are removed from the response and end generation early in both JSON and
+streaming modes.
+
+On the GLM engine, legacy `POST /v1/completions` also accepts a non-empty
+`prompt` array of integer token IDs, for example `[12, 345, 6]`. The IDs go
+directly to the engine's pre-tokenized intake; they must be non-negative and
+within the model's vocabulary. An out-of-vocabulary ID receives a `prompt`
+400. Other engines currently reject token-ID prompts with a named 400, and
+batched prompts (arrays of strings or arrays of arrays) remain unsupported.
 
 A trailing `assistant` message *continues* that turn instead of starting a new
 one: the prompt ends inside it, which is the official template rendered with
@@ -100,6 +111,10 @@ named error, never silently ignored. `seed` is accepted and ignored (see
 below). Audio is accepted only by Inkling checkpoints with audio support. The
 default bind address is localhost; set `COLI_API_KEY` before exposing the
 server beyond the machine.
+
+Request bodies must fit within 4 MiB and the running Python JSON parser's
+limits. An integer or nesting depth the runtime cannot parse receives HTTP
+400 before engine work; the gateway preserves the runtime's limits.
 
 The hosted-platform bookkeeping fields `store`, `metadata`, `service_tier`,
 `user`, `safety_identifier`, `parallel_tool_calls`, `prompt_cache_key`,
@@ -314,6 +329,24 @@ request keeps priority across all slots. A full waiting queue does not reject
 a request that can immediately take an unreserved free slot; the queue limit
 bounds waiting requests, independently of active capacity.
 
+### When the engine stops
+
+`coli serve` starts the engine again when it dies (a crash, the out-of-memory
+killer, a kill). While the new engine loads, `GET /health` answers 503 with
+`{"status": "restarting"}` and `Retry-After: 5`, and nothing is admitted: a
+request waits in the queue for the new engine, within `--queue-timeout`, rather
+than failing on the old one. A request the dead engine was answering fails with
+`engine_error` and frees its slot. A start that fails is tried again after 2 s,
+then twice as long each time, up to 60 s. The authenticated `/health` counts the
+restarts in `engine_restarts`, and the log names the cause:
+
+```
+[gateway] the engine stopped (colibri engine exited unexpectedly (killed by signal 9, SIGKILL, most often the out-of-memory killer)); starting it again
+[gateway] the engine is running again (restart 1)
+```
+
+`coli chat` waits for a restarting server instead of starting a second one.
+
 ## Prometheus metrics
 
 `GET /metrics` returns Prometheus text exposition (version 0.0.4). When an
@@ -522,6 +555,16 @@ KV configuration actually allows. Tool calling in pi works on the engines in
 the [tool-calling matrix](#tool-calling-support) above; on unsupported engines
 pi's tool calls fail the same way any OpenAI `tools` request does.
 
+The same provider entry serves the other engines — swap the model `id` and
+`name` (`qwen3.6-colibri` for Qwen3.6, `deepseek-v4-flash-colibri` for DeepSeek
+V4 Flash; `coli status` prints the id of the running model). Serve with a
+context that fits pi's preamble plus the working set: pi sends its system
+prompt, tool catalog and project instructions — about 5,000 tokens — before the
+first user word, so start the server with e.g. `coli serve --ctx 32768` and set
+`contextWindow` to the same value. Measured with pi 1.4.0 against
+Qwen3.6-35B-A3B resident in RAM (Vulkan, Ryzen 9 9950X): the ~4,900-token
+preamble prefills in about 30 s, and follow-up turns reuse the cached prefix.
+
 **Continue, Cline / Roo, `llm`, the OpenAI SDKs, …** — set the provider's base
 URL to `http://localhost:8000/v1`, the model to `glm-5.2-colibri`, and any dummy
 key (`OPENAI_API_KEY` / `OPENAI_BASE_URL` for env-based tools).
@@ -643,7 +686,11 @@ and 262144 tokens (up to the family's maximum) whose conversation state, for eve
 KV slot, takes at most a quarter of the memory up to 65536 tokens and a tenth
 beyond (`RAM_GB` when set, the available memory otherwise), and the family's own
 default when even 16384 does not fit that. The larger share up to 64k is for
-coding agents, which do not run on less. The startup log says which
+coding agents, which do not run on less. DeepSeek V4.1 and MiMo, whose expert cache
+the plan sizes and which do not start without a slot a layer, count the prompt's
+workspace beside the state: V4.1 prefills a prompt in one forward (about 200 KB a
+token), so a 64 GB box gets 65536 tokens rather than the 262144 its 6.4 KB a token of
+state allowed, which left the cache nothing. The startup log says which
 (`[gateway] 65536 tokens of context ...`), and `GET /v1/models` reports it as
 `context_length` (and `max_model_len`), where agents read it.
 

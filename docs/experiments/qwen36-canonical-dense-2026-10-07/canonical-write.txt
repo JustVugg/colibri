@@ -1,0 +1,23 @@
+qwen36-canonical writing the file once for <model>, on 2026-10-05 at 17:49: this change's tool as it was then (its code changed since; see the manifest), run under /usr/bin/time -l with <out>/canonical-pr.qc as its output, <out> being a directory outside the model's. Below, its stdout (one line), then its stderr. The tool's own time starts after it has read the model's metadata and fingerprinted the matrices; /usr/bin/time -l times the whole process and gives bytes.
+
+<out>/canonical-pr.qc: 291 INT8 matrices, 1941078016 bytes, 4.3 s
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+        4.38 real         6.44 user         1.22 sys
+           141262848  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+                8812  page reclaims
+                   6  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                1007  voluntary context switches
+               11247  involuntary context switches
+         61583212390  instructions retired
+         21591335993  cycles elapsed
+           140428544  peak memory footprint

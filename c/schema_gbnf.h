@@ -26,6 +26,7 @@
  */
 #ifndef SCHEMA_GBNF_H
 #define SCHEMA_GBNF_H
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -71,7 +72,14 @@ static void sgb_put_json_string_lit(SgbCtx *C, const char *raw){
         unsigned char c = *p;
         if (c == '"')       sgb_put(C, "\\\\\\\"");   /* JSON \"  inside GBNF literal */
         else if (c == '\\') sgb_put(C, "\\\\\\\\");
-        else if (c < 0x20){ snprintf(b, sizeof b, "\\x%02x", c); sgb_put(C, b); } /* raw ctl byte (invalid JSON anyway) */
+        else if (c < 0x20){
+            /* json.h already decoded the schema string. Escape the control
+             * for JSON first, then escape that backslash for the GBNF literal. */
+            const char *short_escape = c == '\b' ? "\\\\b" : c == '\f' ? "\\\\f"
+                : c == '\n' ? "\\\\n" : c == '\r' ? "\\\\r" : c == '\t' ? "\\\\t" : NULL;
+            if (short_escape) sgb_put(C, short_escape);
+            else { snprintf(b, sizeof b, "\\\\u%04x", c); sgb_put(C, b); }
+        }
         else if (c == 0x7f) sgb_put(C, "\\x7f");
         else { b[0] = (char)c; b[1] = 0; sgb_put(C, b); }
     }
@@ -80,9 +88,19 @@ static void sgb_put_json_string_lit(SgbCtx *C, const char *raw){
 
 /* emit a number the way a model would print it: shortest round-trip via %g */
 static void sgb_put_number_lit(SgbCtx *C, double d){
+    /* 1e9999 parses as inf. %.17g then writes the literal inf, which is not JSON. */
+    if (!isfinite(d)){ sgb_fail(C, "non-finite number"); return; }
     char b[64]; snprintf(b, sizeof b, "\"%.17g\"", d);
-    /* trim %.17g noise for integers */
-    if (d == (double)(long long)d && d < 1e15 && d > -1e15)
+    /* %.17g writes 0.1 as 0.10000000000000001: a fraction takes the fewest
+     * digits that read back as the same double, the text a model writes. */
+    if (d < 9007199254740992.0 && d > -9007199254740992.0 && d != (double)(long long)d)
+        for (int prec = 15; prec < 17; prec++){
+            char t[64]; snprintf(t, sizeof t, "\"%.*g\"", prec, d);
+            if (strtod(t + 1, NULL) == d){ memcpy(b, t, sizeof b); break; }
+        }
+    /* Check the formatting range before converting: finite schema numbers
+     * outside it need not be representable as long long. */
+    if (d < 1e15 && d > -1e15 && d == (double)(long long)d)
         snprintf(b, sizeof b, "\"%lld\"", (long long)d);
     sgb_put(C, b);
 }
@@ -171,8 +189,16 @@ static void sgb_item(SgbCtx *C, jval *items, int depth, const char *rule){
 static void sgb_array(SgbCtx *C, jval *sc, int depth){
     jval *items = json_get(sc, "items");
     jval *mi    = json_get(sc, "minItems");
-    int min1 = mi && mi->t == J_NUM && mi->num >= 1;
-    if (mi && mi->t == J_NUM && mi->num > 1){ sgb_fail(C, "minItems > 1"); return; }
+    /* Only the integers 0 and 1 are implemented. 0.5 and -1 used to fall
+     * through as "zero or more", and true is a bool that is not a number. */
+    int min1 = 0;
+    if (mi){
+        if (mi->t != J_NUM || !isfinite(mi->num) || mi->num != floor(mi->num) ||
+            mi->num < 0.0 || mi->num > 1.0){
+            sgb_fail(C, "minItems must be 0 or 1"); return;
+        }
+        min1 = mi->num == 1.0;
+    }
     if (!items){ sgb_fail(C, "array without items"); return; }
     char rule[32] = "";
     if (sgb_has_array(items, depth + 1)){

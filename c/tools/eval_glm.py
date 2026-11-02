@@ -39,6 +39,7 @@ import time
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
+from engine_environment import engine_environment
 from engine_evidence import (PreambleError, parse_engine_banner,
                              parse_engine_loaded, parse_engine_preamble)
 
@@ -531,7 +532,7 @@ def main():
         written = f.write(request_payload)
         if written != len(request_payload):
             raise EvidenceError("short write while freezing SCORE requests")
-    env = dict(os.environ, SNAP=a.snap, SCORE=req_path)
+    env = engine_environment(SNAP=a.snap, SCORE=req_path)
     if a.ram: env["RAM_GB"] = str(a.ram)
     cmd = [a.glm, str(a.cap)] + a.bits.split()
     print("running:", " ".join(cmd), file=sys.stderr)

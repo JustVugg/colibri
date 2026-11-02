@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "hypothesis": "Converting planar int4 RAM blocks into the device's signed pairs while staging lets the CUDA chain promote experts with the default planar CPU kernel, raising decode on a card that holds only part of the experts.",
+  "commit": "561966ec2337bc2ef097c78ee031bf554424646c",
+  "model": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64",
+  "command": "make -C c qwen36 CUDA=1 CUDA_ARCH=sm_89; COLI_CUDA=1 COLI_GPUS=0 HEAT_FILE=<a copy of the frozen heat file> CUDA_EXPERT_GB=5 OMP_NUM_THREADS=6 OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close SNAP=<model> COLI_TEMP=0 COLI_TIMERS=1 NOSTREAM=1 N_NEW=200 ./c/qwen36 256 4 prompt_story_short.txt",
+  "prompt_hash": "cb8b63fc451ed6dafa845ea65056000d32dd0c8132e1ee7c71a4cc50c259a297",
+  "hardware": {
+    "cpu": "Intel Xeon @ 2.20GHz (6 cores / 12 threads, 38.5 MiB L3) + NVIDIA L4 (23034 MiB, sm_89)",
+    "ram": "52 GiB",
+    "storage": "Google Colab VM disk (model copied to /content/models before the runs)",
+    "os": "Linux x86_64 (Google Colab), CUDA 13.0, driver 580.82.07"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64 (planar int4 in RAM)",
+      "CUDA_EXPERT_GB": 5,
+      "COLI_CUDA_CHAIN_PROMOTE": 4,
+      "N_NEW": 200,
+      "prompt_tokens": 41,
+      "OMP_NUM_THREADS": 6,
+      "engine_build": "origin/dev 561966ec"
+    },
+    "samples": {
+      "tok_s": [
+        24.99,
+        25.03,
+        25.05,
+        25.03
+      ]
+    },
+    "median_tok_s": 25.03,
+    "quality": {
+      "method": "make -C c check; tests/test_qwen36_tier_promote on the L4 with and without AVX2; greedy text bit-identical to origin/dev with every expert in VRAM (CUDA_EXPERT_GB=auto) and with COLI_CUDA_CHAIN_PROMOTE=0; at CUDA_EXPERT_GB=5 the greedy text parts (a promoted expert runs the card's kernel instead of the CPU's), so quality is the teacher-forced loss (PPL=1): 3.0719 nats/token with promotion against 3.0774 without and 3.0725 with every expert in VRAM (600-token prose, 250 scored)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-promote-planar-2026-10-25-raw.txt",
+      "sha256": "2692b38f8f525d0cc2daeabeb0e37da837c41f3ee90e84a9b0063ba126bb154b"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64 (planar int4 in RAM)",
+      "CUDA_EXPERT_GB": 5,
+      "COLI_CUDA_CHAIN_PROMOTE": 4,
+      "N_NEW": 200,
+      "prompt_tokens": 41,
+      "OMP_NUM_THREADS": 6,
+      "engine_build": "561966ec + this change"
+    },
+    "samples": {
+      "tok_s": [
+        29.96,
+        29.99,
+        30.05,
+        30.05
+      ]
+    },
+    "median_tok_s": 30.02,
+    "quality": {
+      "method": "make -C c check; tests/test_qwen36_tier_promote on the L4 with and without AVX2; greedy text bit-identical to origin/dev with every expert in VRAM (CUDA_EXPERT_GB=auto) and with COLI_CUDA_CHAIN_PROMOTE=0; at CUDA_EXPERT_GB=5 the greedy text parts (a promoted expert runs the card's kernel instead of the CPU's), so quality is the teacher-forced loss (PPL=1): 3.0719 nats/token with promotion against 3.0774 without and 3.0725 with every expert in VRAM (600-token prose, 250 scored)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-promote-planar-2026-10-25-raw.txt",
+      "sha256": "2692b38f8f525d0cc2daeabeb0e37da837c41f3ee90e84a9b0063ba126bb154b"
+    }
+  },
+  "outcome": "improvement"
+}

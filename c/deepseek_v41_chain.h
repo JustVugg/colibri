@@ -163,10 +163,87 @@ static float *v41c_fp8_scales(const W8 *w) {
         for (int g = 0; g < groups; g++) scales[(size_t)o * groups + g] = ue8m0(w->s[(size_t)(o / FP8_TILE) * groups + g]);
     return scales;
 }
+/* A GGUF's matrix (a W8 or WB the loader read as ggml rows of type gt, interleaved by 16
+ * where the type has that form) on the device, as deepseek_v4's chain takes them: its
+ * blocks as the file has them (100 + the type), a float type as floats (f16 as fmt 14).
+ * For the per-head reader (vkc_mla_hgemv, which has no block form: wo_a) Q8_0 goes up as
+ * int8 with a scale per 32 (fmt 13, the same numbers) and any other type as floats.
+ * -1: no device form. */
+static int v41c_gq_fmt(int gt, int I, int hgemv) {
+    const int b = gq_r16_base(gt), base = b >= 0 ? b : gt;
+    if (base == GQ_F32) return 10;
+    if (base == GQ_BF16) return 11;
+    if (base == GQ_F16) return hgemv ? 10 : 14;
+    if (hgemv) return base == GQ_Q8_0 && I % 32 == 0 ? 13 : 10;
+    const int be = coli_vk_block_elems(100 + base);
+    return be > 0 && I % be == 0 ? 100 + base : -1;
+}
+static ColiVkTensor *v41c_gq(const uint8_t *data, int gt, int O, int I, int hgemv) {
+    const int fmt = v41c_gq_fmt(gt, I, hgemv);
+    if (!data || fmt < 0 || O < 1 || I < 1) return NULL;
+    const int b = gq_r16_base(gt), base = b >= 0 ? b : gt;
+    const int64_t rb = gq_row_bytes(base, I);   /* a file row */
+    if (rb <= 0 || (b >= 0 && O % 16)) return NULL;
+    ColiVkTensor **slot = NULL;
+    VkEntry *e = NULL;
+    if (vkc_device_now()) {
+        if (!(slot = v41c_d2_slot(data))) return NULL;
+        if (*slot) return *slot;
+    } else {
+        if (!(e = vk_entry(data, fmt, O, I)) || e->refused) return NULL;
+        if (e->t) return e->t;
+    }
+    const uint8_t *src = data;
+    uint8_t *file = NULL;   /* the file's rows of an interleaved matrix */
+    void *conv = NULL;      /* fmt 13's codes or fmt 10's floats */
+    float *sc = NULL;
+    int gs = 0, ok = 1;
+    if (b >= 0) {
+        if (!(file = malloc((size_t)rb * O))) ok = 0;
+        else { gq_r16_unpack(gt, file, data, O, I); src = file; }
+    }
+    const void *weights = src;
+    if (ok && fmt == 13) {   /* Q8_0 (a half scale, 32 int8 codes a block): codes and scales apart */
+        const int nb = I / 32;
+        int8_t *q = malloc((size_t)O * I);
+        sc = malloc((size_t)O * nb * sizeof(float));
+        if (!q || !sc) { free(q); ok = 0; }
+        else {
+            for (int r = 0; r < O; r++)
+                for (int k = 0; k < nb; k++) {
+                    const uint8_t *blk = src + (size_t)r * rb + (size_t)k * 34;
+                    uint16_t h; memcpy(&h, blk, 2);
+                    sc[(size_t)r * nb + k] = gq_f16(h);
+                    memcpy(q + (size_t)r * I + (size_t)k * 32, blk + 2, 32);
+                }
+            weights = conv = q; gs = 32;
+        }
+    } else if (ok && fmt == 10 && base != GQ_F32) {   /* the per-head reader's floats */
+        float *f = malloc((size_t)O * I * sizeof(float));
+        if (!f) ok = 0;
+        else {
+            for (int r = 0; r < O; r++) {
+                const uint8_t *row = src + (size_t)r * rb;
+                float *o = f + (size_t)r * I;
+                if (base == GQ_F16) for (int c = 0; c < I; c++) { uint16_t h; memcpy(&h, row + 2 * c, 2); o[c] = gq_f16(h); }
+                else if (base == GQ_BF16) for (int c = 0; c < I; c++) { uint16_t h; memcpy(&h, row + 2 * c, 2); uint32_t u = (uint32_t)h << 16; memcpy(&o[c], &u, 4); }
+                else gq_dequant_row(base, row, o, I);
+            }
+            weights = conv = f;
+        }
+    }
+    if (ok) ok = slot ? coli_vk_tensor_ensure2(slot, weights, sc, fmt, I, O, gs)
+                      : coli_vk_tensor_ensure(&e->t, weights, sc, fmt, I, O, gs);
+    free(file); free(conv); free(sc);
+    if (slot) return ok ? *slot : NULL;
+    if (!ok && !e->t) e->refused = 1;
+    return ok ? e->t : NULL;
+}
 /* The device copies the per-matrix path keeps (vk_entry), uploaded here if it has not:
  * fp8 as fmt 12 with each 32x32 tile's scale written out for its rows, bf16 as fmt 11.
- * With the second device current, its own copies there. */
+ * With the second device current, its own copies there. A GGUF's: v41c_gq. */
 static ColiVkTensor *v41c_w8(const W8 *w) {
+    if (w->gx) return v41c_gq(w->q, w->gt, w->O, w->I, 0);
     if (!w->q || w->O < 1 || w->I < 1) return NULL;
     if (vkc_device_now()) {
         ColiVkTensor **t = v41c_d2_slot(w->q);
@@ -187,6 +264,7 @@ static ColiVkTensor *v41c_w8(const W8 *w) {
     return ok ? e->t : NULL;
 }
 static ColiVkTensor *v41c_wb(const WB *w) {
+    if (w->gx) return v41c_gq(w->g, w->gt, w->O, w->I, 0);
     if (!w->w || w->O < 1 || w->I < 1) return NULL;
     if (vkc_device_now()) {
         ColiVkTensor **t = v41c_d2_slot(w->w);
@@ -199,6 +277,9 @@ static ColiVkTensor *v41c_wb(const WB *w) {
     v41_dho_host(w->w);
     return coli_vk_tensor_ensure(&e->t, w->w, NULL, 11, w->I, w->O, 0) ? e->t : NULL;
 }
+
+/* wo_a for the per-head reader (vkc_mla_hgemv): a GGUF's in the reader's form */
+static ColiVkTensor *v41c_w8h(const W8 *w) { return w->gx ? v41c_gq(w->q, w->gt, w->O, w->I, 1) : v41c_w8(w); }
 
 /* ---- the host's writes: the device's copies follow ------------------------------------- */
 static void v41c_lower_one(Model *m, V41Chain *ch, int pos) {
@@ -290,7 +371,8 @@ static int v41c_engram_layer(const Model *m, int i) {
  * state at its first size (the window ring, the compressor's group, 64 compressed rows and
  * keys), its part of the parameters and of a forward's pull buffer at `rows` rows; *mat
  * its matrices' payload (coli_vk_mem_info's count). From the config alone: it runs before
- * the layers are read. */
+ * the layers are read (a GGUF's forms from its loaded layers: a GGUF has no device-only
+ * placement, so the fit runs after the load). */
 static size_t v41c_layer_bytes(const Model *m, int i, int rows, int dho, int views, size_t *mat) {
     const Cfg *c = &m->c;
     int D = c->dim, H = c->hc_mult, nm = (2 + H) * H, hd = c->head_dim, nh = c->n_heads, r = c->compress_ratio[i];
@@ -298,15 +380,27 @@ static size_t v41c_layer_bytes(const Model *m, int i, int rows, int dho, int vie
     int eng = v41c_engram_layer(m, i);
     size_t b = 0, mm = 0;
     #define T(fmt, I, O, gs) do { b += vkc_fit_tensor(fmt, I, O, gs); mm += coli_vk_tensor_payload(fmt, I, O, gs); } while (0)
+    /* fp8 (or a GGUF's W8: its form, from the loaded layer, as v41c_gq puts it up) */
+    /* l: the loaded layer, a GGUF's only (the checkpoint's fit with the dense weights on
+     * the device runs before the layers are read, when m->L is not there yet) */
+    #define T8(w, I, O, hg) do { const W8 *w_ = l ? (w) : NULL; \
+        if (w_ && w_->gx) { int f_ = v41c_gq_fmt(w_->gt, I, hg); if (f_ >= 0) T(f_, I, O, f_ == 13 ? 32 : 0); } \
+        else T(12, I, O, FP8_TILE); } while (0)
+    #define TB(w, I, O) do { const WB *w_ = l ? (w) : NULL; \
+        if (w_ && w_->gx) { int f_ = v41c_gq_fmt(w_->gt, I, 0); if (f_ >= 0) T(f_, I, O, 0); } \
+        else T(11, I, O, 0); } while (0)
+    const Layer *l = m->gguf && m->L ? &m->L[i] : NULL;
     T(10, H * D, nm, 0); T(10, H * D, nm, 0);                          /* the mHC mix matrices */
-    T(12, D, QL, FP8_TILE); T(12, QL, nh * hd, FP8_TILE); T(12, D, hd, FP8_TILE);
-    T(12, nh * hd / og, og * ol, FP8_TILE);                            /* wo_a whole, the chain's */
+    T8(&l->wq_a, D, QL, 0); T8(&l->wq_b, QL, nh * hd, 0); T8(&l->wkv, D, hd, 0);
+    T8(&l->wo_a, nh * hd / og, og * ol, 1);                            /* wo_a whole, the chain's */
     for (int g = 0; views && g < og; g++) T(12, nh * hd / og, ol, FP8_TILE);   /* and per group, the per-matrix path's */
-    T(12, og * ol, D, FP8_TILE);
-    T(12, D, c->moe_inter, FP8_TILE); T(12, D, c->moe_inter, FP8_TILE); T(12, c->moe_inter, D, FP8_TILE);
-    if (c->kv_source[i]) { T(11, D, hd, 0); if (r > 1) T(11, D, hd, 0); T(11, hd, ID, 0); }
-    if (c->index_source[i] && (r > 0 || dho)) { T(12, QL, IH * ID, FP8_TILE); T(11, D, IH, 0); }
-    if (eng) T(12, m->engram.cols * m->engram.head_dim, D * (H + 1), FP8_TILE);
+    T8(&l->wo_b, og * ol, D, 0);
+    T8(&l->sh_w1, D, c->moe_inter, 0); T8(&l->sh_w3, D, c->moe_inter, 0); T8(&l->sh_w2, c->moe_inter, D, 0);
+    if (c->kv_source[i]) { TB(&l->comp_wkv, D, hd); if (r > 1) TB(&l->comp_wgate, D, hd); TB(&l->idx_wk, hd, ID); }
+    if (c->index_source[i] && (r > 0 || dho)) { T8(&l->idx_wq_b, QL, IH * ID, 0); TB(&l->idx_wproj, D, IH); }
+    if (eng) T8(&l->eng_wkv, m->engram.cols * m->engram.head_dim, D * (H + 1), 0);
+    #undef TB
+    #undef T8
     #undef T
     b += vkc_fit_buf((size_t)(W + v41c_rows()) * hd * sizeof(float));
     size_t f = (size_t)2 * D + QL + hd + nh + (size_t)2 * (3 + nm);
@@ -424,7 +518,7 @@ static int v41c_layer_up(V41Chain *ch, Model *m, int i, const char **why) {
     Cfg *c = &m->c; Layer *l = &m->L[i];
     int r = c->compress_ratio[i];
     *why = "a matrix the device refused";
-    int ok = v41c_w8(&l->wq_a) && v41c_w8(&l->wq_b) && v41c_w8(&l->wkv) && v41c_w8(&l->wo_a) && v41c_w8(&l->wo_b) &&
+    int ok = v41c_w8(&l->wq_a) && v41c_w8(&l->wq_b) && v41c_w8(&l->wkv) && v41c_w8h(&l->wo_a) && v41c_w8(&l->wo_b) &&
              v41c_w8(&l->sh_w1) && v41c_w8(&l->sh_w3) && v41c_w8(&l->sh_w2);
     if (ok && c->kv_source[i]) ok = v41c_wb(&l->comp_wkv) && (r <= 1 || v41c_wb(&l->comp_wgate)) && v41c_wb(&l->idx_wk);
     if (ok && c->index_source[i] && r > 0) ok = v41c_w8(&l->idx_wq_b) && v41c_wb(&l->idx_wproj);
@@ -445,11 +539,14 @@ static void v41c_layer_free(V41Chain *ch, Model *m, int i) {
     const WB *wb[] = {&l->comp_wkv, &l->comp_wgate, &l->idx_wk, &l->idx_wproj};
     if (ch->d) {   /* the second device's own copies */
         for (size_t k = 0; k < sizeof w8 / sizeof *w8; k++) v41c_d2_forget(w8[k]->q);
-        for (size_t k = 0; k < sizeof wb / sizeof *wb; k++) v41c_d2_forget(wb[k]->w);
+        for (size_t k = 0; k < sizeof wb / sizeof *wb; k++) v41c_d2_forget(wb[k]->gx ? (const void *)wb[k]->g : (const void *)wb[k]->w);
         return;
     }
     for (size_t k = 0; k < sizeof w8 / sizeof *w8; k++) if (w8[k]->q) v41_vk_forget_range(w8[k]->q, (size_t)w8[k]->O * w8[k]->I);
-    for (size_t k = 0; k < sizeof wb / sizeof *wb; k++) if (wb[k]->w) v41_vk_forget_range(wb[k]->w, (size_t)wb[k]->O * wb[k]->I * 2);
+    for (size_t k = 0; k < sizeof wb / sizeof *wb; k++) {
+        if (wb[k]->w) v41_vk_forget_range(wb[k]->w, (size_t)wb[k]->O * wb[k]->I * 2);
+        if (wb[k]->gx && wb[k]->g) v41_vk_forget_range(wb[k]->g, 1);   /* a GGUF's rows: the entry is keyed on their start */
+    }
 }
 /* Layer i did not reach the device: it and the layers after it off the device (with the
  * trunk on the device only, their host copies read back), the chain cut before it. */
@@ -795,7 +892,7 @@ static int v41c_attention(V41Chain *ch, Model *m, int i, const V41Fwd *f) {
                  v41c_rope(ch, m, ch->ikey[i], np, 1, g0 * ihd + ihd - rd, ihd, 0, bc, r * rd, 0) &&
                  v41c_rope(ch, m, cb, np, 1, (int)co + hd - rd, hd, 0, bc, r * rd, 0);
             if (ok && sp) {   /* into their slots, and down for the host's ckv once the frame is through */
-                VkcKvPart pt = {1, hd, l->ckv, 0, ch->ckv[i], 0};
+                VkcKvPart pt = {1, hd, l->ckv, 0, ch->ckv[i], 0, 0};
                 ok = vkc_kv_store(&ch->ks, ch->sli[i], &pt, cb, 0, (size_t)hd, 0, g0, np) &&
                      vkc_copy(ch->cdn, 0, cb, 0, (size_t)np * hd);
                 vkc_kv_done(&ch->ks, ch->sli[i], g0 + np);
@@ -831,7 +928,7 @@ static int v41c_attention(V41Chain *ch, Model *m, int i, const V41Fwd *f) {
     VkcHgemv g = {0, nr, og, ol, ol, 0, 0, qrow, pg, 0, og * ol, ol, 0, 0, 0};
     if (ch->ks.on && r > 0) {   /* stage selected cold rows, preserving the original sparse attention order */
         int own = c->index_owner[i], li = ch->sli[own];
-        VkcKvPart pt = {1, hd, m->L[own].ckv, 0, ch->ckv[own], 0};
+        VkcKvPart pt = {1, hd, m->L[own].ckv, 0, ch->ckv[own], 0, 0};
         VkcKvDs d = {&ch->ks, li, ch->q, ch->win[i], ch->ckv[own], ch->prm, ch->list, ch->heads, nr, nh, hd, a.cnt, 0, LR,
                      ch->Wd, 0, 0, qrow, (int)ch->o_sink[i], 0, 0, qrow, (pb + nr) / r, a.scale, m->L[own].ckv};
         /* the blocks pinned since the chunk began, and the table, before this read */
@@ -839,7 +936,7 @@ static int v41c_attention(V41Chain *ch, Model *m, int i, const V41Fwd *f) {
     } else ok = vkc_dsv4_attn(ch->q, ch->win[i], r > 0 ? ch->ckv[c->index_owner[i]] : NULL, ch->list, ch->prm, ch->heads, &a);
     return ok &&
            v41c_rope(ch, m, ch->heads, nr * nh, nh, hd - rd, qrow, hd, tcs, rd, 1) &&
-           vkc_mla_hgemv(v41c_w8(&l->wo_a), ch->heads, ch->grp, NULL, &g) &&
+           vkc_mla_hgemv(v41c_w8h(&l->wo_a), ch->heads, ch->grp, NULL, &g) &&
            vkc_matmul(v41c_w8(&l->wo_b), ch->grp, 0, ch->br, 0, nr);
 }
 
@@ -1007,6 +1104,12 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
     }
     vkc_gemm_rows(spec ? 0 : -1);                          /* a verify's rows get a decode step's bits */
     for (int c0 = 0; c0 < n; c0 += rows) {
+        /* a served prompt's STOP or CANCEL between two chunks (prompt_break.h): the caller
+         * starts the state over, on the host and on the device (model_reset, v41c_reset) */
+        if (coli_prompt_break()) {
+            free(f.keyl); free(f.praw); free(need); free(outs); free(pres); free(wl); free(cs_); free(er); free(pc);
+            return 0;
+        }
         int nr = n - c0 < rows ? n - c0 : rows, pb = start + c0, last = c0 + nr == n;
         f.pb = pb; f.nr = nr;
         /* this chunk's RoPE rows (the CPU's own tables): window ones at 0, compress ones at
@@ -1073,13 +1176,18 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
         for (int i = 0; ch->ks.on && i < L && ok; i++) {   /* the split: each table's window over this chunk's new rows */
             if (ch->sli[i] < 0) continue;
             int r = c->compress_ratio[i], g0 = pb / r;
-            VkcKvPart pt = {1, hd, m->L[i].ckv, 0, ch->ckv[i], 0};
+            VkcKvPart pt = {1, hd, m->L[i].ckv, 0, ch->ckv[i], 0, 0};
             vkc_kv_place(&ch->ks, ch->sli[i], g0, (pb + nr) / r - g0);
             ok = vkc_kv_push(&ch->ks, ch->sli[i], &pt, 1, g0);
         }
         if (!ok) goto lost;
         int pending = 0;
-        for (int i = lo; i < hi && ok; i++) {
+        /* a chunk all before the prompt's tail stops after the cross-layer source
+         * (v41_prefill_tail): the layers after it run on the tail only */
+        int top = hi;
+        if (m->ptail_rows > 0 && m->ptail_after < hi - 1 && c0 + nr <= n - m->ptail_rows)
+            top = m->ptail_after + 1 > lo ? m->ptail_after + 1 : lo;   /* a second device's segment: none of it */
+        for (int i = lo; i < top && ok; i++) {
             Layer *l = &m->L[i];
             if (pending) {                                 /* the FFN branch of the layer before */
                 VkcEw add = {VKC_EW_ADD, nr * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Offline GLM expert-residency policy simulator.
+"""Offline expert-residency policy simulator (GLM and OLMoE).
 
 The simulator consumes Colibri ROUTE_TRACE output without loading a model. It
-replays GLM's routed-expert unions through bounded per-layer caches and compares
-placement policies under the same expert-residency byte budget. It deliberately
+replays an engine's routed-expert demand through bounded per-layer caches and
+compares placement policies under the same expert-residency byte budget. It deliberately
 models demand residency only: no speculative reads, routing changes, or token
 semantics are involved.
 
@@ -24,7 +24,7 @@ import math
 import re
 import statistics
 from collections import Counter, OrderedDict, defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Sequence
 
@@ -39,6 +39,7 @@ class AccessEvent:
     selections: tuple[int, ...] = ()
     call: int | None = None
     source: str = ""
+    rows: int = field(default=0, compare=False)
 
     def selection_counts(self) -> Counter[int]:
         return Counter(self.selections or self.experts)
@@ -77,10 +78,10 @@ class PolicyStats:
         }
 
 
-def _build_event(key, union, selections, source):
+def _build_event(key, union, selections, source, rows=0):
     if key is None or not union:
         return None
-    return AccessEvent(key[1], tuple(union), tuple(selections), key[0], source)
+    return AccessEvent(key[1], tuple(union), tuple(selections), key[0], source, rows)
 
 
 def parse_trace(path: Path) -> list[AccessEvent]:
@@ -107,7 +108,7 @@ def parse_trace(path: Path) -> list[AccessEvent]:
             raise ValueError(f"{path}:{lineno}: negative call/row/layer")
         next_key = (call, layer)
         if next_key != key:
-            event = _build_event(key, union, selections, str(path))
+            event = _build_event(key, union, selections, str(path), next_row)
             if event:
                 events.append(event)
             if next_key in seen_keys:
@@ -140,7 +141,7 @@ def parse_trace(path: Path) -> list[AccessEvent]:
             if expert not in known:
                 known.add(expert)
                 union.append(expert)
-    event = _build_event(key, union, selections, str(path))
+    event = _build_event(key, union, selections, str(path), next_row)
     if event:
         events.append(event)
     return events
@@ -156,12 +157,56 @@ def validate_glm_trace(events: Sequence[AccessEvent], path: Path) -> None:
             f"{path}: trace lacks advancing GLM call ids; unsupported engine or corrupt trace")
 
 
-def read_traces(paths: Sequence[Path]) -> list[list[AccessEvent]]:
+# olmoe.c moe_by_expert: a prompt is routed in blocks of this many rows.
+OLMOE_PREFILL_ROWS = 128
+
+
+def olmoe_fetches(events: Sequence[AccessEvent], path: Path) -> list[AccessEvent]:
+    """Expand OLMoE call groups into the engine's expert_get() order.
+
+    olmoe.c fetches one expert at a time and admits a miss immediately into its
+    per-layer LRU (always-admit, no 64-expert promotion block). A one-row call
+    (decode) fetches its top-k in rank order. A prompt (S > 1) is processed in
+    blocks of OLMOE_PREFILL_ROWS rows; each block fetches every expert it routed
+    once, in ascending expert id (the counting sort in moe_by_expert). Each fetch
+    becomes a one-expert event, so the shared lookup-then-admit replay matches
+    the engine exactly. The event keeps the block's selection multiplicity for
+    training counts.
+    """
+    fetches = []
+    for event in events:
+        rows = event.rows or 1
+        if len(event.selections) % rows:
+            raise ValueError(
+                f"{path}: call {event.call} layer {event.layer}: rows route "
+                "different expert counts; not an OLMoE trace")
+        width = len(event.selections) // rows
+        blocks = ([event.selections] if rows == 1 else [
+            event.selections[start:start + OLMOE_PREFILL_ROWS * width]
+            for start in range(0, len(event.selections), OLMOE_PREFILL_ROWS * width)])
+        for block in blocks:
+            counts = Counter(block)
+            order = list(dict.fromkeys(block)) if rows == 1 else sorted(counts)
+            for expert in order:
+                fetches.append(AccessEvent(
+                    event.layer, (expert,), (expert,) * counts[expert],
+                    event.call, event.source, 1))
+    return fetches
+
+
+ENGINES = ("glm", "olmoe")
+
+
+def read_traces(paths: Sequence[Path], engine: str = "glm") -> list[list[AccessEvent]]:
+    if engine not in ENGINES:
+        raise ValueError(f"unknown engine {engine!r}")
     traces = [parse_trace(path) for path in paths]
     if not traces or any(not trace for trace in traces):
         raise ValueError("every trace must contain at least one routing event")
     for path, trace in zip(paths, traces):
         validate_glm_trace(trace, path)
+    if engine == "olmoe":
+        traces = [olmoe_fetches(trace, path) for path, trace in zip(paths, traces)]
     return traces
 
 
@@ -1092,8 +1137,8 @@ def _real_inputs(args):
         raise ValueError("duplicate file in --eval")
     if set(train_identities) & set(eval_identities):
         raise ValueError("train/eval paths refer to the same file")
-    train = read_traces(train_paths)
-    evaluation = read_traces(eval_paths)
+    train = read_traces(train_paths, args.engine)
+    evaluation = read_traces(eval_paths, args.engine)
     specs = load_specs(train + evaluation, args.manifest,
                        args.read_gbps, args.felt_fraction)
     return train, evaluation, specs
@@ -1128,6 +1173,7 @@ def command_run(args):
         for row in sensitivity["candidates"]))
     if args.json_out:
         document = {
+            "engine": args.engine,
             "result": result,
             "categories": categories,
             "profile_costs": costs,
@@ -1175,7 +1221,7 @@ def command_sweep(args):
             f"{'PASS' if row['pass_all_scales'] else 'FAIL'}"
             for row in entry["sensitivity"]["candidates"]))
     if args.json_out:
-        args.json_out.write_text(json.dumps({"sweeps": results}, indent=2) + "\n",
+        args.json_out.write_text(json.dumps({"engine": args.engine, "sweeps": results}, indent=2) + "\n",
                                  encoding="utf-8")
 
 
@@ -1183,6 +1229,8 @@ def add_real_trace_arguments(parser):
     parser.add_argument("--train", type=Path, nargs="+", required=True)
     parser.add_argument("--eval", type=Path, nargs="+", required=True)
     parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--engine", choices=ENGINES, default="glm",
+                        help="replay the cache traversal of this engine's CPU path")
     parser.add_argument("--read-gbps", type=float, default=3.0)
     parser.add_argument("--felt-fraction", type=float, default=1.0)
     parser.add_argument("--felt-scales", type=float, nargs="+", default=[0.5, 1.0, 1.5])
@@ -1210,7 +1258,7 @@ def main():
                       default=list(POLICIES))
     demo.set_defaults(func=command_demo)
 
-    run = sub.add_parser("run", help="simulate real GLM ROUTE_TRACE files")
+    run = sub.add_parser("run", help="simulate real GLM or OLMoE ROUTE_TRACE files")
     add_real_trace_arguments(run)
     run.add_argument("--expert-budget-gb", type=float, required=True)
     run.set_defaults(func=command_run)

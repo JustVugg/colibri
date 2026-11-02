@@ -19,6 +19,12 @@ class PlacementBalanceTest(unittest.TestCase):
             (path / "b.txt").write_text("3 0 6\n3 1 1\n")
             self.assertEqual(read_counts(path), [10, 9])
 
+    def test_skips_history_header_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".coli_usage"
+            path.write_text("-1 92 256\n-2 1 3815245270\n3 0 4\n3 1 8\n")
+            self.assertEqual(read_counts(path), [8, 4])
+
     def test_balances_critical_tier_instead_of_filling(self):
         plan = solve([40, 30, 20, 10], 4, 2.0, 1.0)
         self.assertEqual(plan.slots, 2)

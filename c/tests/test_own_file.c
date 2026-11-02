@@ -85,6 +85,18 @@ int main(void){
     CHECK((f = coli_own_fopen(at(".coli_usage.tmp"), "w")) != NULL);
     CHECK(fprintf(f, "0 1 2\n") > 0 && fclose(f) == 0);
 
+    /* a state file replaced as a whole: written under <path>.tmp, then renamed over <path> */
+    for(int round = 0; round < 2; round++){
+        const char *text = round ? "second state" : "first state";
+        CHECK((f = coli_own_fopen_tmp(at("state"))) != NULL);
+        CHECK(fputs(text, f) >= 0 && fclose(f) == 0);
+        CHECK(coli_own_replace(at("state")) == 0);
+        CHECK(!strcmp(get(at("state")), text));
+        CHECK(remove(at("state.tmp")) != 0);
+    }
+    errno = 0;
+    CHECK(coli_own_fopen_tmp(at("no/such/state")) == NULL && errno == ENOENT);
+
     /* a missing file is not created by a read mode */
     errno = 0;
     CHECK(coli_own_fopen(at("absent"), "rb") == NULL && errno == ENOENT);
@@ -118,6 +130,27 @@ int main(void){
     struct stat st;
     CHECK(stat(at("not-yet"), &st) != 0 && errno == ENOENT);
 
+    /* a link planted under the temp name is replaced. The file it points to is unchanged. */
+    CHECK(symlink(at("victim"), at("state.tmp")) == 0);
+    CHECK((f = coli_own_fopen_tmp(at("state"))) != NULL);
+    CHECK(fputs("third state", f) >= 0 && fclose(f) == 0);
+    CHECK(!coli_own_is_link(at("state.tmp")));
+    CHECK(coli_own_replace(at("state")) == 0);
+    CHECK(!strcmp(get(at("state")), "third state"));
+    CHECK(!strcmp(get(at("victim")), "keep me"));
+
+    /* one file under several spellings, through a link, or not created yet */
+    char spelled[700];
+    snprintf(spelled, sizeof spelled, "%s/./state", dir);
+    CHECK(coli_own_same_path(at("state"), spelled));
+    CHECK(coli_own_same_path(at("link"), at("victim")));
+    snprintf(spelled, sizeof spelled, "%s/sub/../later", dir);
+    CHECK(coli_own_same_path(at("later"), spelled));
+    CHECK(!coli_own_same_path(at("state"), at("victim")));
+    CHECK(!coli_own_same_path(at("later"), at("sooner")));
+    CHECK(coli_own_same_path(at("no/such/x"), at("no/such/x")));
+    CHECK(!coli_own_same_path(at("no/such/x"), at("no/such/y")));
+
     /* a symlinked directory is reported, and a link to a directory refused */
     CHECK(symlink(at("sub"), at("sublink")) == 0);
     CHECK(coli_own_is_link(at("sublink")));
@@ -140,7 +173,7 @@ int main(void){
     unlink(at("fifo")); unlink(at("sublink")); unlink(at("dangling"));
     unlink(at("link")); unlink(at("victim"));
 #endif
-    remove(at(".coli_usage.tmp")); remove(at(".coli_kv"));
+    remove(at(".coli_usage.tmp")); remove(at(".coli_kv")); remove(at("state"));
 #ifdef _WIN32
     _rmdir(at("sub")); _rmdir(dir);
 #else

@@ -1,4 +1,5 @@
 #include "../backend_cuda_dsv4.h"
+#include "dsv4_test_devices.h"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -7,7 +8,8 @@
 #include <vector>
 
 int main(int argc, char **) {
-    int devices[] = {0, 5};
+    int devices[2];
+    dsv4_test_devices(devices);
     assert(dsv4_cuda_init(devices, 2));
     const int H = argc > 1 ? 4096 : 128, I = argc > 1 ? 2048 : 128;
     constexpr int E = 256;

@@ -430,6 +430,28 @@ class ServeTuneTest(unittest.TestCase):
                 self.assertFalse(profile["accepted"])
                 self.assertEqual(profile["winner"]["cap"], 16)
 
+    def test_progress_names_the_cache_each_measurement_launches_with(self):
+        # The progress line used to print the baseline cap for every measurement,
+        # so cache-75 read "cap=16" while its engine ran with 12 slots.
+        FakeServeEngine.reset(cap_speeds={16: 1.0, 12: 1.30, 8: 1.10})
+        p = plan(cores=8, gpu=False, cold=1 << 30)
+        p["tiers"]["ram"] = {
+            "budget_bytes": 24 * (1024 ** 3),
+            "expert_cache_bytes": 16 * (1024 ** 3),
+            "cache_slots_per_layer": 16,
+        }
+        messages = []
+        self.run_serve_tune(
+            arch="inkling", plan=p,
+            base_env={"COLI_NO_OMP_TUNE": "1"},
+            repeats=2, prompts=("prompt-a", "prompt-b"),
+            progress=messages.append,
+        )
+        labels = {message.split(" (")[0] for message in messages if " cap=" in message}
+        self.assertEqual(labels, {
+            "baseline cap=16", "cache-75 cap=12", "cache-50 cap=8",
+            "confirm-winner cap=12", "confirm-baseline cap=16",
+        })
 
 class AutotuneIntegrationTest(unittest.TestCase):
     def test_unset_cap_resolves_from_the_plan_not_str_none(self):

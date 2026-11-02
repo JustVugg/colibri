@@ -38,9 +38,13 @@ function segments(source: string): Segment[] {
   return out
 }
 
-/** Inline marks, innermost first so `**a *b* **` does not swallow its own stars. */
+/** Inline marks, innermost first so `**a *b* **` does not swallow its own stars.
+    A link's URL may hold one level of balanced parentheses, as CommonMark allows:
+    Wikipedia's ".../Python_(programming_language)". Emphasis neither opens before
+    nor closes after a space, as in CommonMark, so "w * h * d" and "2 ** 3 ** 2"
+    stay arithmetic. */
 function inline(text: string, key = "i"): React.ReactNode[] {
-  const pattern = /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(\*[^*\n]+\*)|(\[[^\]\n]+\]\([^)\s]+\))/
+  const pattern = /(`[^`\n]+`)|(\*\*[^*\s](?:[^*\n]*[^*\s])?\*\*)|(\*[^*\s](?:[^*\n]*[^*\s])?\*)|(\[[^\]\n]+\]\((?:[^()\s]|\([^()\s]*\))+\))/
   const nodes: React.ReactNode[] = []
   let rest = text
   let index = 0
@@ -108,7 +112,7 @@ function blocks(source: string, key: string): React.ReactNode[] {
   const out: React.ReactNode[] = []
   const lines = source.split("\n")
   let paragraph: string[] = []
-  let list: { ordered: boolean; items: string[] } | null = null
+  let list: { ordered: boolean; start: number; items: string[] } | null = null
   let quote: string[] = []
 
   const flushParagraph = () => {
@@ -119,7 +123,8 @@ function blocks(source: string, key: string): React.ReactNode[] {
   const flushList = () => {
     if (!list) return
     const items = list.items.map((item, at) => <li key={at}>{inline(item, `${key}-li${at}`)}</li>)
-    out.push(list.ordered ? <ol key={`${key}-l${out.length}`}>{items}</ol>
+    /* A list resumed after a code block or blank line keeps its step number. */
+    out.push(list.ordered ? <ol key={`${key}-l${out.length}`} start={list.start === 1 ? undefined : list.start}>{items}</ol>
                           : <ul key={`${key}-l${out.length}`}>{items}</ul>)
     list = null
   }
@@ -134,7 +139,7 @@ function blocks(source: string, key: string): React.ReactNode[] {
     const line = lines[at]
     const heading = /^(#{1,4})\s+(.*)$/.exec(line)
     const bullet = /^\s*[-*+]\s+(.*)$/.exec(line)
-    const numbered = /^\s*\d+[.)]\s+(.*)$/.exec(line)
+    const numbered = /^\s*(\d+)[.)]\s+(.*)$/.exec(line)
     const quoted = /^>\s?(.*)$/.exec(line)
 
     if (!line.trim()) { flushAll(); continue }
@@ -160,8 +165,11 @@ function blocks(source: string, key: string): React.ReactNode[] {
     if (bullet || numbered) {
       flushParagraph(); flushQuote()
       const ordered = Boolean(numbered)
-      const item = (numbered || bullet)![1]
-      if (!list || list.ordered !== ordered) { flushList(); list = { ordered, items: [] } }
+      const item = numbered ? numbered[2] : bullet![1]
+      if (!list || list.ordered !== ordered) {
+        flushList()
+        list = { ordered, start: numbered ? Number(numbered[1]) : 1, items: [] }
+      }
       list.items.push(item)
       continue
     }

@@ -444,6 +444,47 @@ void score_wide() {
     }
 }
 
+// ---- mode 10 -----------------------------------------------------------------------
+// modes 3 and 9 on a grid (vkc_dsv4_score from VKC_DSA_GRID columns, IH <= 256): workgroup
+// (block x of 256 / IH columns, row y), a thread a (column, head) for the head's dot in
+// their order, then a thread a column joining the heads in their order, so the same bits.
+// A row's one workgroup scoring every column itself (DeepSeek V4's 64 heads of 128: 8192
+// products a column a thread) left a decode step waiting on one workgroup.
+void score_grid() {
+    int s = int(gl_WorkGroupID.y), tid = int(gl_LocalInvocationID.x);
+    int pos = p.v[2] + s, lens = (pos + 1) / p.v[3];
+    int IH = p.v[4], ID = p.v[5], width = p.v[6];
+    int qb = p.v[7] + s * p.v[8], wb = p.v[9] + s * p.v[10];
+    int ko = p.v[11], kr = p.v[12], mr = p.v[13], sb = p.v[16] + s * p.v[14], mb = p.v[17] + s * mr;
+    float wscale = intBitsToFloat(p.v[15]);
+    int P = max(1, 256 / IH), j0 = int(gl_WorkGroupID.x) * P;
+    if (j0 >= width) return;   // uniform
+    bool sh = IH <= 64 && IH * ID <= 4096;   // mode 3's queries in shared memory; else mode 9's from memory
+    int wo = sh ? 4096 : 0;
+    if (sh) for (int i = tid; i < IH * ID; i += 256) sm[i] = b0[qb + i];
+    for (int h = tid; h < IH; h += 256) sm[wo + h] = b1[wb + h] * wscale;
+    barrier();
+    int jj = tid / IH, h = tid - jj * IH, j = j0 + jj;
+    if (jj < P && j < width && j < lens && (mr <= 0 || l3[mb + j] != 0)) {
+        int kb = ko + j * kr;
+        float d = 0.0;
+        if (sh) for (int i = 0; i < ID; i++) d += sm[h * ID + i] * b2[kb + i];
+        else for (int i = 0; i < ID; i++) d += b0[qb + h * ID + i] * b2[kb + i];
+        red[tid] = d;
+    }
+    barrier();
+    int jt = j0 + tid;
+    if (tid < P && jt < width) {
+        float v = NEG_INF;
+        if (jt < lens && (mr <= 0 || l3[mb + jt] != 0)) {
+            float tot = 0.0;
+            for (int g = 0; g < IH; g++) { float d = red[tid * IH + g]; if (d > 0.0) tot += d * sm[wo + g]; }
+            v = tot;
+        }
+        y5[sb + jt] = v;
+    }
+}
+
 // ---- mode 7 ------------------------------------------------------------------------
 float pow2(int k) { return uintBitsToFloat(uint(k + 127) << 23); }   // 2^k, -126 <= k <= 127
 // |x| <= 448: the nearest E4M3 value (ties to even), coli_e4m3fn_encode then _decode
@@ -558,4 +599,5 @@ void main() {
     else if (m == 7) roundings();
     else if (m == 8) swiglu_v4();
     else if (m == 9) score_wide();
+    else if (m == 10) score_grid();
 }

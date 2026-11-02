@@ -2,6 +2,7 @@
  * CPU compressor, including overwriting speculative futures after rollback. */
 #include "../backend_cuda_dsv4.cu"
 #include "../native_quant.h"
+#include "dsv4_test_devices.h"
 #include <cassert>
 #include <cmath>
 extern "C" void target_reference(int,int,const float*,const float*,const float*,float*,float*,float*);
@@ -187,4 +188,4 @@ static void check_workspace() {
     dsv4_cuda_target_workspace_free(a);dsv4_cuda_target_workspace_free(b);
     puts("workspace admission, FP8 capability, cross-device data/position/token transfer passed");
 }
-int main(){int devices[]={0,5};assert(dsv4_cuda_init(devices,2));for(int d:devices){check(d,4);check(d,128);check_mma(d,false);check_mma(d,true);check_head(d);check_fp4(d);}check_workspace();dsv4_cuda_shutdown();}
+int main(){int devices[2];dsv4_test_devices(devices);assert(dsv4_cuda_init(devices,2));for(int d:devices){check(d,4);check(d,128);check_mma(d,false);check_mma(d,true);check_head(d);check_fp4(d);}check_workspace();dsv4_cuda_shutdown();}
