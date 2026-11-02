@@ -123,7 +123,10 @@ def _pi_provider(models_json, base_v1, model, ctx, key):
     name = next((n for n, p in provs.items() if isinstance(p, dict) and str(p.get("baseUrl", "")).rstrip("/") == base_v1), None)
     changed = False
     if name is None:
-        name = "colibri" if "colibri" not in provs else "colibri-ui"
+        name, suffix = "colibri", 0
+        while name in provs:
+            suffix += 1
+            name = "colibri-ui" if suffix == 1 else "colibri-ui-%d" % suffix
         provs[name] = {"baseUrl": base_v1, "api": "openai-completions", "apiKey": key or "colibri", "models": []}
         changed = True
     ms = provs[name].setdefault("models", [])
