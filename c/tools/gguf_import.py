@@ -22,7 +22,7 @@ serve`, `coli web` and the planner treat it like any other.
 Supported architectures: qwen35moe (Qwen3.5 / Qwen3.6 MoE -> qwen36 engine), qwen35 (their
 dense models -> qwen36 engine), qwen3moe (Qwen3 MoE, Qwen3-Coder -> qwen36 engine), qwen3 (the dense
 Qwen3 -> qwen36 engine), flint (Flint -> qwen36 engine), muse-spark (Muse Spark Open -> qwen36
-engine), qwen4exp (Qwen3.8-Flash-Next -> qwen38 engine), deepseek4 (DeepSeek V4
+engine), lfm3 (LFM3-VL's text model -> qwen36 engine), qwen4exp (Qwen3.8-Flash-Next -> qwen38 engine), deepseek4 (DeepSeek V4
 Flash -> deepseek_v4 engine), inkling (Inkling -> inkling engine), glm5-next (GLM-5.3-Flash ->
 glm53 engine), glm-dsa (GLM-5.2 / GLM-5.3 -> colibri engine), mimo2 (MiMo-V2.6 -> mimo engine),
 deepseek41 (DeepSeek V4.1 Flash, files with the config whole and the published K-quant and IQ ones ->
@@ -140,7 +140,8 @@ def qwen35moe_config(meta, tensors, overrides=None):
         "hidden_size": int(need("embedding_length")),
         "num_hidden_layers": layers,
         "num_attention_heads": int(need("attention.head_count")),
-        "num_key_value_heads": int(need("attention.head_count_kv")),
+        # Ollama's converter writes head_count_kv per layer (0 on the DeltaNet layers): the attention layers' value
+        "num_key_value_heads": max(int(v) for v in need("attention.head_count_kv")) if isinstance(need("attention.head_count_kv"), list) else int(need("attention.head_count_kv")),
         "head_dim": head_dim,
         "num_experts": int(need("expert_count")),
         "num_experts_per_tok": int(need("expert_used_count")),
@@ -317,6 +318,49 @@ def muse_config(meta, tensors, overrides=None):
         "layer_rope_theta": [theta if s_ else 0 for s_ in sliding],
         "output_multiplier": float(need("logit_scale")),
         "final_logit_softcapping": float(meta.get(p + "final_logit_softcapping", 0.0)),
+        "tie_word_embeddings": "output.weight" not in tensors,
+        "hidden_act": "silu",
+    }
+    return cfg, layers
+
+
+def lfm3_config(meta, tensors, overrides=None):
+    """LFM3 (the GGUF arch lfm3: LiquidAI/LFM3-VL's text model) as the qwen36 engine's config.json,
+    in the checkpoint's text_config form. The engine reads everything from the GGUF; this is what
+    coli's planner, doctor and gateway read (the layer kinds, the window, the conv's taps)."""
+    p = "lfm3."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    layers = int(need("block_count"))
+    emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
+    kv = need("attention.head_count_kv")
+    kv = list(kv) if isinstance(kv, (list, tuple)) else [int(kv)] * layers
+    sliding = list(need("attention.sliding_window_pattern"))
+    if len(kv) != layers or len(sliding) != layers:
+        sys.exit(f"GGUF {p}attention patterns: {len(kv)} and {len(sliding)} entries for {layers} layers")
+    kinds = ["conv" if not int(kv[i]) else "sliding_attention" if sliding[i] else "full_attention" for i in range(layers)]
+    heads = int(need("attention.head_count"))
+    head_dim = int(meta.get(p + "attention.key_length", int(need("embedding_length")) // heads))
+    cfg = {
+        "model_type": "lfm3",
+        "architectures": ["Lfm3ForCausalLM"],
+        "hidden_size": int(need("embedding_length")),
+        "num_hidden_layers": layers,
+        "num_attention_heads": heads,
+        "num_key_value_heads": max(int(v) for v in kv),
+        "head_dim": head_dim,
+        "intermediate_size": int(need("feed_forward_length")),
+        "vocab_size": int(emb["dims"][1]),
+        "norm_eps": float(meta.get(p + "attention.layer_norm_rms_epsilon", 1e-5)),
+        "rms_norm_eps": float(meta.get(p + "attention.layer_norm_rms_epsilon", 1e-5)),
+        "max_position_embeddings": int(meta.get(p + "context_length", 128000)),
+        "conv_L_cache": int(need("shortconv.l_cache")),
+        "sliding_window": int(need("attention.sliding_window")),
+        "layer_types": kinds,
+        # the full layers' partial rotation is in the file's rope_freqs, which the engine reads
+        "rope_parameters": {
+            "full_attention": {"rope_type": "default", "rope_theta": float(meta.get(p + "rope.freq_base", 1000000.0))},
+            "sliding_attention": {"rope_type": "default", "rope_theta": float(meta.get(p + "rope.freq_base_swa", 10000.0))}},
+        "use_sandwich_norm": True,
         "tie_word_embeddings": "output.weight" not in tensors,
         "hidden_act": "silu",
     }
@@ -543,6 +587,62 @@ def glmdsa_config(meta, tensors, overrides=None):
         "index_head_dim": int(need("attention.indexer.key_length")),
         "indexer_types": ["full" if f"blk.{i}.indexer.attn_q_b.weight" in tensors else "shared" for i in range(layers)],
         "num_nextn_predict_layers": nextn if has_mtp else 0,
+        "tie_word_embeddings": "output.weight" not in tensors,
+        "bos_token_id": meta.get("tokenizer.ggml.bos_token_id"), "eos_token_id": meta.get("tokenizer.ggml.eos_token_id"),
+    }
+    return cfg, layers
+
+
+def mistral_large4_config(meta, tensors, overrides=None):
+    """Mistral-Large-4 (mistral-large4) as the colibri engine's config.json, the shape of
+    Mistral's (MistralLarge4ForConditionalGeneration's text_config): GLM-5.2's DSA attention
+    without the query LoRA, the layers' rotary pattern, KV sources and indexer types by layer,
+    YaRN, a softmax router, the final logit softcap."""
+    p = "mistral-large4."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    layers = int(need("block_count"))
+    rope = int(need("rope.dimension_count"))
+    emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
+    if int(meta.get(p + "expert_group_count", 1)) != 1:
+        sys.exit("mistral-large4: expert groups other than 1 are not this model")
+    if int(meta.get(p + "expert_gating_func", 1)) != 1:
+        sys.exit("mistral-large4: a router other than softmax (expert_gating_func 1) is not this model")
+    flags = lambda k: [bool(x) for x in need(k)][:layers]
+    rope_on, full = flags("attention.rope_pattern"), flags("attention.indexer.types")
+    source = [int(x) for x in need("attention.kv_source_map")][:layers]
+    cfg = {
+        "architectures": ["MistralLarge4ForCausalLM"], "model_type": "mistral_large4",
+        "vocab_size": int(meta.get(p + "vocab_size", emb["dims"][1])),
+        "hidden_size": int(need("embedding_length")),
+        "intermediate_size": int(need("feed_forward_length")),
+        "moe_intermediate_size": int(need("expert_feed_forward_length")),
+        "num_hidden_layers": layers, "num_attention_heads": int(need("attention.head_count")),
+        "num_key_value_heads": int(need("attention.head_count")),
+        "n_routed_experts": int(need("expert_count")), "num_experts_per_tok": int(need("expert_used_count")),
+        "n_shared_experts": int(meta.get(p + "expert_shared_count", 1)),
+        "first_k_dense_replace": int(meta.get(p + "leading_dense_block_count", 0)),
+        "q_lora_rank": 0, "kv_lora_rank": int(need("attention.kv_lora_rank")),
+        "qk_rope_head_dim": rope, "qk_nope_head_dim": int(need("attention.key_length_mla")) - rope,
+        "v_head_dim": int(need("attention.value_length_mla")),
+        "n_group": 1, "topk_group": 1, "scoring_func": "softmax", "norm_topk_prob": True,
+        "routed_scaling_factor": float(meta.get(p + "expert_weights_scale", 1.0)),
+        "rms_norm_eps": float(meta.get(p + "attention.layer_norm_rms_epsilon", 1e-5)),
+        "indexer_norm_eps": float(meta.get(p + "attention.layer_norm_epsilon", 1e-6)),
+        "rope_parameters": {
+            "rope_type": str(meta.get(p + "rope.scaling.type", "default")),
+            "rope_theta": float(meta.get(p + "rope.freq_base", 10000.0)),
+            "factor": float(meta.get(p + "rope.scaling.factor", 1.0)),
+            "original_max_position_embeddings": int(meta.get(p + "rope.scaling.original_context_length", 0)),
+            "beta_fast": float(meta.get(p + "rope.scaling.yarn_beta_fast", 32.0)),
+            "beta_slow": float(meta.get(p + "rope.scaling.yarn_beta_slow", 1.0)),
+            "attention_factor": 1.0},
+        "max_position_embeddings": int(meta.get(p + "context_length", 1048576)),
+        "index_topk": int(need("attention.indexer.top_k")), "index_n_heads": int(need("attention.indexer.head_count")),
+        "index_head_dim": int(need("attention.indexer.key_length")),
+        "indexer_types": ["full" if f else "shared" for f in full],
+        "no_rope_layers": [1 if r else 0 for r in rope_on],
+        "kv_source_layers": source,
+        "final_logit_softcapping": float(meta.get(p + "final_logit_softcapping", 0.0)),
         "tie_word_embeddings": "output.weight" not in tensors,
         "bos_token_id": meta.get("tokenizer.ggml.bos_token_id"), "eos_token_id": meta.get("tokenizer.ggml.eos_token_id"),
     }
@@ -927,7 +1027,7 @@ def qwen4exp_config(meta, tensors, overrides=None):
 
 
 COPY_UNREAD = {"qwen4exp"}   # their engine does not read the colibri container (copy mode)
-ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "flint": flint_config, "muse-spark": muse_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "mimo2": mimo2_config, "deepseek41": deepseek41_config, "kimi-k3": kimik3_config, "olmoe": olmoe_config, "qwen4exp": qwen4exp_config}
+ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "flint": flint_config, "muse-spark": muse_config, "lfm3": lfm3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "mistral-large4": mistral_large4_config, "mimo2": mimo2_config, "deepseek41": deepseek41_config, "kimi-k3": kimik3_config, "olmoe": olmoe_config, "qwen4exp": qwen4exp_config}
 
 # unsloth ships Qwen3.8-Flash-Next's MTP head apart, in an MTP/ folder of the repository:
 # shared-* borrow token_embd and output from the model (the engine always does), the
@@ -971,6 +1071,50 @@ def mtp_head_ok(path, meta, layers):
 
 
 DSPARK_PREFERENCE = ("Q8_0", "BF16")
+
+
+# LFM3-VL's vision tower and projector ship as their own GGUF (mmproj-*.gguf, arch clip, projector
+# lfm3vl): one next to the model is linked, the engine runs it through lfm3_vision.h.
+# Mistral-Large-4's Pixtral tower too (projector pixtral): mistral_vision.h, its geometry for the
+# gateway's tools/mistral_image.py in preprocessor_config.json beside the link.
+MMPROJ_PROJECTORS = {"lfm3": "lfm3vl", "mistral-large4": "pixtral"}
+
+
+def write_pixtral_preprocessor(out_dir, mmproj):
+    """preprocessor_config.json for tools/mistral_image.py, from the mmproj's own numbers."""
+    with GGUFReader(mmproj) as r:
+        meta = r.metadata
+    conf = {"patch_size": int(meta["clip.vision.patch_size"]),
+            "spatial_merge_size": int(meta.get("clip.vision.spatial_merge_size", 2)),
+            "longest_edge": int(meta["clip.vision.image_size"]),
+            "image_mean": [float(v) for v in meta["clip.vision.image_mean"]],
+            "image_std": [float(v) for v in meta["clip.vision.image_std"]]}
+    (Path(out_dir) / "preprocessor_config.json").write_text(json.dumps(conf, indent=1), encoding="utf-8")
+
+
+def mmproj_of(path, arch):
+    """Whether path is an mmproj this arch's engine reads: (True, '') or (False, why)."""
+    try:
+        with GGUFReader(path) as r:
+            meta = r.metadata
+    except (OSError, GGUFError) as problem:
+        return False, f"unreadable ({problem})"
+    if meta.get("general.architecture") != "clip":
+        return False, f"architecture {meta.get('general.architecture')!r}, not clip"
+    # LFM3's file names it clip.vision.projector_type, Mistral's (Pixtral) clip.projector_type
+    want, got = MMPROJ_PROJECTORS.get(arch), meta.get("clip.vision.projector_type") or meta.get("clip.projector_type")
+    if got != want:
+        return False, f"projector {got!r}, {arch} reads {want!r}"
+    return True, ""
+
+
+def mmproj_candidates(src):
+    """mmproj-*.gguf next to the model: its folder, then the parent; BF16 and F16 first."""
+    found = []
+    for d in (src.parent, src.parent.parent):
+        found += sorted(d.glob("mmproj*.gguf")) if d.is_dir() else []
+    rank = lambda f: 0 if re.search(r"(?i)[-_.](bf16|f16|f32)\.gguf$", f.name) else 1
+    return sorted(found, key=rank)
 
 
 def dspark_candidates(src):
@@ -1062,11 +1206,17 @@ FLINT_SPLITS = ["\\p{N}{1,3}", "[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+",
                 "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
                 "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
                 " ?[\\p{P}\\p{S}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"]
-PRE_SPLITS = {"glm4": CL100K_SPLITS, "flint": FLINT_SPLITS, "kimi-k2": KIMI_SPLITS, "deepseek-v3": DEEPSEEK_SPLITS, "joyai-llm": DEEPSEEK_SPLITS,
+# Mistral's Tekken (tekken-num3, Mistral-Large-4's tokenizer.json): o200k's letter runs without the
+# contractions, numbers in groups of three counted from their end
+TEKKEN_NUM3_SPLITS = [r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|"
+                      r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|"
+                      r"\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))|\p{N}{1,2}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"]
+PRE_SPLITS = {"glm4": CL100K_SPLITS, "lfm2": CL100K_SPLITS, "tekken-num3": TEKKEN_NUM3_SPLITS, "flint": FLINT_SPLITS, "kimi-k2": KIMI_SPLITS, "deepseek-v3": DEEPSEEK_SPLITS, "joyai-llm": DEEPSEEK_SPLITS,
               "hunyuan-dense": DEEPSEEK_SPLITS, "hy_v4": DEEPSEEK_SPLITS,
               "inkling": O200K_SPLITS, "gpt-4o": O200K_SPLITS}
 # BPE options of the tokenizer.json a family ships (the GGUF does not carry them)
-PRE_MODEL = {"inkling": {"ignore_merges": True}, "gpt-4o": {"ignore_merges": True}, "glm4": {"ignore_merges": True}}
+PRE_MODEL = {"inkling": {"ignore_merges": True}, "gpt-4o": {"ignore_merges": True}, "glm4": {"ignore_merges": True},
+             "lfm2": {"ignore_merges": True}, "tekken-num3": {"ignore_merges": True}}
 
 
 def pre_tokenizer(pre):
@@ -1261,6 +1411,10 @@ def main():
                          "the parent, an MTP/ folder in either; shared-Q8_0 first); deepseek41: the DSpark head's "
                          "(dspark-*.gguf, arch dflash), which drafts only when named")
     ap.add_argument("--no-mtp", action="store_true", help="qwen4exp, deepseek41: no draft head, plain decoding")
+    ap.add_argument("--mmproj", type=Path, default=None,
+                    help="lfm3, mistral-large4: the vision tower's GGUF (mmproj-*.gguf), unset one next to the model (its folder, "
+                         "then the parent; BF16 and F16 first)")
+    ap.add_argument("--no-mmproj", action="store_true", help="lfm3, mistral-large4: text only, no vision tower linked")
     ap.add_argument("--indexer-compress-ratio", type=int, default=0,
                     help="qwen4exp: when the GGUF's attention.compress_ratios are all 0 (a converter "
                          "that read the layers as qwen_sparse_attention)")
@@ -1327,6 +1481,19 @@ def main():
         link["mtp"] = str(mtp_file)
     if dspark_file:
         link["dspark"] = str(dspark_file)
+    if arch in MMPROJ_PROJECTORS and not args.no_mmproj:   # a vision tower of its own file
+        if args.mmproj:
+            ok, why = mmproj_of(args.mmproj, arch)
+            if not ok:
+                sys.exit(f"--mmproj {args.mmproj}: {why}")
+            link["mmproj"] = str(args.mmproj.resolve())
+        else:
+            link_to = next((c for c in mmproj_candidates(src) if mmproj_of(c, arch)[0]), None)
+            if link_to:
+                link["mmproj"] = str(link_to.resolve())
+        print(f"  vision tower: {link.get('mmproj', 'none found next to the model (--mmproj names one): text only')}")
+        if link.get("mmproj") and MMPROJ_PROJECTORS[arch] == "pixtral":
+            write_pixtral_preprocessor(args.out, link["mmproj"])
     (args.out / "gguf.json").write_text(json.dumps(link, indent=1), encoding="utf-8")
     for r in readers:
         r.close()

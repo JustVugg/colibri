@@ -20,8 +20,14 @@
 // The CPU's floats in the CPU's orders where it matters for the pick and the weights:
 // exp and the sums of a softmax are the device's, so a weight can differ in its last
 // bits; the ids are the CPU's unless two picks are that close.
+// A row of few experts (E up to four subgroups' lanes, no groups, K up to a subgroup's
+// lanes) runs on the workgroup's first subgroup alone, with no barrier (route_sg): the same
+// trees over the same 256 slots, the same picks, the same bits. wg 1 keeps the workgroup's
+// path (vkc_route: COLI_VK_ROUTE_SG=0).
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_ballot : require
 #extension GL_EXT_control_flow_attributes : require
 layout(local_size_x = 256) in;
 
@@ -36,6 +42,7 @@ layout(push_constant) uniform P {
     int i_off, i_row, w_off, w_row;
     int n_group, topk_group, norm;
     float temp, scale, norm_eps;
+    int wg;
 } p;
 
 const float NEG = -3.402823466e38;
@@ -54,10 +61,82 @@ shared float wv[32];
 // index is read with every lane active, clamped as well.
 #define A(i) min(i, 1023)
 
+// precise: a temperature's division is not fused into what reads it, which one path or the
+// other would do (a Radeon 780M fused one and not the other: other bits)
 float logit(int lb, int e) {
     float v = l[lb + e];
     if (p.has_bias == 2) v += bias[p.b_off + e];
-    return v / p.temp;
+    precise float r = v / p.temp;
+    return r;
+}
+
+// The workgroup's tree (rv[t] = rv[t] op rv[t + off], off 128 down to 1) over its 256 slots,
+// slot l + SG * j on lane l of one subgroup (j < 4; the slots past 4 * SG hold the identity,
+// as the workgroup's threads past E do, so those steps change nothing): every lane gets rv[0]
+float tree4(float v0, float v1, float v2, float v3, bool mx) {
+    uint SG = gl_SubgroupSize, ln = gl_SubgroupInvocationID;
+    for (uint off = 128u; off > 0u; off >>= 1) {
+        if (off >= 4u * SG) continue;
+        if (off == 2u * SG) { v0 = mx ? max(v0, v2) : v0 + v2; v1 = mx ? max(v1, v3) : v1 + v3; }
+        else if (off == SG) v0 = mx ? max(v0, v1) : v0 + v1;
+        else { float o = subgroupShuffle(v0, min(ln + off, SG - 1u)); v0 = mx ? max(v0, o) : v0 + o; }
+    }
+    return subgroupBroadcastFirst(v0);
+}
+
+// One row on one subgroup: main()'s steps lane by lane, each lane its four slots in registers.
+// An RTX PRO 4000, 64 experts: top-8 7.4 -> 6.3 us a row, top-1 4.2 -> 3.8 (48 rows in turn).
+void route_sg(int s, int lb) {
+    uint SG = gl_SubgroupSize, ln = gl_SubgroupInvocationID;
+    float sc4[4];
+    if (p.kind == 0) {
+        float lg[4], ex[4];
+        [[unroll]] for (int j = 0; j < 4; j++) { int e = int(ln + SG * j); lg[j] = e < p.E ? logit(lb, e) : NEG; }
+        float mx = tree4(lg[0], lg[1], lg[2], lg[3], true);
+        [[unroll]] for (int j = 0; j < 4; j++) { int e = int(ln + SG * j); precise float d = lg[j] - mx; ex[j] = e < p.E ? exp(d) : 0.0; }
+        float sum = tree4(ex[0], ex[1], ex[2], ex[3], false);
+        [[unroll]] for (int j = 0; j < 4; j++) sc4[j] = ex[j] / sum;
+    } else {
+        [[unroll]] for (int j = 0; j < 4; j++) {
+            int e = int(ln + SG * j);
+            float v = e < p.E ? logit(lb, e) : 0.0;
+            sc4[j] = p.kind == 1 ? 1.0 / (1.0 + exp(-v)) : sqrt(v > 20.0 ? v : log(1.0 + exp(v)));
+        }
+    }
+    float mine[4];
+    [[unroll]] for (int j = 0; j < 4; j++) {
+        int e = int(ln + SG * j);
+        float v = sc4[j];
+        if (p.has_bias == 1 && e < p.E) v += bias[p.b_off + e];
+        mine[j] = e < p.E && !isnan(v) ? v : NEG;
+    }
+    // top K: the largest pick left, the lower expert on a tie; its score, and the weights' sum
+    // in rank order as main() takes them
+    int myc = -1; float myw = 0.0, sum = 0.0;
+    for (int k = 0; k < p.K; k++) {
+        float bv = NEG; int be = 0x7fffffff;
+        [[unroll]] for (int j = 0; j < 4; j++) {
+            int e = int(ln + SG * j);
+            if (mine[j] > bv || (mine[j] == bv && mine[j] > NEG && e < be)) { bv = mine[j]; be = e; }
+        }
+        float m = subgroupMax(bv);
+        int me = subgroupMin(bv == m && m > NEG ? be : 0x7fffffff);
+        int c = m > NEG && me != 0x7fffffff ? me : -1;
+        float own = NEG;
+        [[unroll]] for (int j = 0; j < 4; j++) if (c == int(ln + SG * j)) { mine[j] = NEG; own = sc4[j]; }
+        float sv = subgroupMax(own);
+        float wk = c >= 0 ? sv : 0.0;
+        sum += wk;
+        if (int(ln) == k) { myc = c; myw = wk; }
+    }
+    float div = sum + p.norm_eps;
+    bool norm = (p.norm == 1 || (p.norm == 2 && p.K > 1)) && div > 0.0;
+    if (int(ln) < p.K) {
+        float x = myw;
+        if (norm) x = x / div;
+        ids[p.i_off + s * p.i_row + int(ln)] = myc;
+        w[p.w_off + s * p.w_row + int(ln)] = x * p.scale;
+    }
 }
 
 void main() {
@@ -65,6 +144,10 @@ void main() {
     if (s >= p.S) return;                          // uniform across the workgroup
     int tid = int(gl_LocalInvocationID.x);
     int lb = p.l_off + s * p.l_row;
+    if (p.wg == 0 && p.n_group <= 1 && gl_SubgroupSize <= 64u && p.E <= 4 * int(gl_SubgroupSize) && p.K <= int(gl_SubgroupSize)) {
+        if (gl_SubgroupID == 0u) route_sg(s, lb);   // uniform: no barrier on this path
+        return;
+    }
 
     int nsg = int(gl_NumSubgroups), sg = int(gl_SubgroupID);
     // scores (the row's max and sum by the workgroup's tree: its order of the sum is the
@@ -80,7 +163,7 @@ void main() {
         float mx = rv[0];
         barrier();
         float acc = 0.0;
-        for (int e = tid; e < p.E; e += 256) { float v = exp(logit(lb, e) - mx); sc[e] = v; acc += v; }
+        for (int e = tid; e < p.E; e += 256) { precise float d = logit(lb, e) - mx; float v = exp(d); sc[e] = v; acc += v; }
         rv[tid] = acc;
         barrier();
         for (int off = 128; off > 0; off >>= 1) { if (tid < off) rv[tid] += rv[tid + off]; barrier(); }

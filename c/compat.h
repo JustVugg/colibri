@@ -223,10 +223,10 @@ static inline int compat_posix_memalign(void **memptr, size_t alignment, size_t 
  * ullAvailPhys ~ MemAvailable di Linux (include standby/free/zero pages —
  * pagine recuperabili senza swap), MA limitata da ullAvailPageFile, il commit
  * ancora concedibile: e' quello che decide se il prossimo malloc riesce, come
- * in compat_meminfo_gb (#1375). Guida il cap automatico della cache expert di
- * kimi_k3 e la telemetria: con la sola RAM fisica una macchina il cui commit
- * e' quasi esaurito (un pagefile piccolo, una VM che ha prenotato la sua RAM)
- * dimensionava una cache che Windows poi rifiutava. */
+ * in compat_meminfo_gb (#1375), che ha la stessa formula. Guida la telemetria
+ * (telemetry.h); i budget passano da compat_meminfo_gb. Con la sola RAM fisica
+ * una macchina il cui commit e' quasi esaurito (un pagefile piccolo, una VM che
+ * ha prenotato la sua RAM) dimensionava una cache che Windows poi rifiutava. */
 static inline void compat_meminfo(double *total_gb, double *avail_gb){
     MEMORYSTATUSEX msx = {0};
     msx.dwLength = sizeof(msx);
@@ -294,10 +294,12 @@ static inline ssize_t compat_getline(char **lineptr, size_t *n, FILE *stream){
  * posix_memalign(4096) e il percorso DIRECT=1 del motore allinea gia' offset
  * e len); richieste non allineate falliscono con -1, mai dati corrotti.
  * Il fd si usa con la normale pread() (compat_pread -> ReadFile+OVERLAPPED). */
+/* compat_pread owns a separate completion event per call. The shared direct
+ * descriptor must be overlapped too, otherwise Windows serializes its reads. */
 static inline int compat_open_direct(const char *path){
     HANDLE h = CreateFileA(path, GENERIC_READ,
                            FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
-                           NULL, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, NULL);
+                           NULL, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, NULL);
     if(h == INVALID_HANDLE_VALUE) return -1;
     int fd = _open_osfhandle((intptr_t)h, _O_RDONLY|_O_BINARY);
     if(fd < 0){ CloseHandle(h); return -1; }

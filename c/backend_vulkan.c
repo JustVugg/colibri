@@ -8,6 +8,9 @@
 // M2 scope: correctness + a standalone GPU-vs-CPU test harness. Synchronous
 // submit/wait per call; async queues and zero-copy import come in M4.
 #include <math.h>
+#ifdef __GLIBC__
+#include <malloc.h>   /* malloc_trim: the exit report's resident set */
+#endif
 #include "backend_vulkan.h"
 #include "blockdec_host.h"           /* the block formats' sizes and table (blockdec_table.h) */
 #include "vk_alloc.h"
@@ -297,6 +300,7 @@ struct ColiVkTensor {
 #define VK_UP_SLOT ((size_t)16 << 20)
 typedef struct {
     int on;                           /* staged uploads on this device */
+    int later;                        /* mapped for now: staged if vk_window_decide finds the window small */
     uint32_t mt_dev, mt_stage;        /* the device-local target type, the host staging type */
     VkDevice dev; VkQueue q; uint32_t fam; int shared;   /* shared: q is the main queue, locked */
     uint32_t fams[3], nfams;          /* the families that touch device-local tensors (CONCURRENT when > 1) */
@@ -598,11 +602,20 @@ static int pick_memtype_sys(VkPhysicalDevice phys) {
  * device-local heap (the host never maps it), else that heap's device-local type
  * (Lavapipe has one type for everything); vendor-specific types (uncached, coherent)
  * are passed over. The staging type: host-visible and coherent, not device-local
- * where there is one, so staging never takes the window. */
+ * where there is one, so staging never takes the window.
+ * A discrete card whose host-visible device-local type is as big as its heap may still be given less of
+ * it: on an A100 80 GB (NVIDIA's 580 driver) the engine's device is given 39.75 GiB of it, mapped or not,
+ * and refused the next block while the heap says 80 GiB and VK_EXT_memory_budget 79.21. The mapped path
+ * then fills the window (the expert tier and the weights add up to about that), and the allocations after
+ * it (the streaming slots, the expert batch's scratch) are refused: a prompt of 512 tokens ends on the CPU.
+ * So a discrete card that place_decide leaves mapped is asked once its device exists (vk_window_decide):
+ * 1 GiB blocks of that type, up to 9/10 of its heap in whole GiB (less if VK_EXT_memory_budget says less is
+ * free), all given back when the loop ends. COLI_VK_WINDOW_PROBE_MB=n answers n MiB instead, without asking;
+ * COLI_VK_WINDOW_ASK_MB=n asks for n MiB at most instead of the 9/10, so the loop runs for real (tests). */
 static int place_plain(VkMemoryPropertyFlags f) {
     return !(f & (VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT | 0xC0u));
 }
-static int place_decide(VkPhysicalDevice phys, int mt_host, VkUp *u) {
+static int place_decide(VkPhysicalDevice phys, int mt_host, VkUp *u, int may_later) {   /* may_later: device 0 only */
     VkPhysicalDeviceMemoryProperties m;
     vkGetPhysicalDeviceMemoryProperties(phys, &m);
     VkDeviceSize dl_max = 0, hv = 0;
@@ -640,8 +653,76 @@ static int place_decide(VkPhysicalDevice phys, int mt_host, VkUp *u) {
         on = 0;
     }
     u->on = on;
-    if (on) { u->mt_dev = (uint32_t)dev; u->mt_stage = (uint32_t)st; }
+    VkPhysicalDeviceProperties pp;
+    vkGetPhysicalDeviceProperties(phys, &pp);
+    const char *kn = getenv("COLI_VK_WINDOW_PROBE_MB"), *ka = getenv("COLI_VK_WINDOW_ASK_MB");
+    u->later = may_later && !on && !(e && *e) && dev >= 0 && st >= 0 && mt_host >= 0 &&
+               (m.memoryTypes[mt_host].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+               (pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU || (kn && *kn) || (ka && *ka));
+    if (on || u->later) { u->mt_dev = (uint32_t)dev; u->mt_stage = (uint32_t)st; }
     return on;
+}
+/* The probe kept the mapped path: clear what coli_vk_init set on the uploader for a staged card and a mapped one
+ * does not have: the lock on the main queue's submits (shared), the families its buffers are shared between
+ * (nfams, so EXCLUSIVE) and the device handle. The queue, the families' list and the memory types stay set;
+ * they are read only when the uploader is on. */
+static void vk_window_mapped(VkUp *u) {
+    u->shared = 0; u->nfams = 0; u->dev = VK_NULL_HANDLE;
+}
+/* The device exists: does the host-visible device-local type take 9/10 of its heap (see above), or what the
+ * driver's budget still leaves if that is less (memory another process holds is not the type's limit)? If not,
+ * the staged path, which place_decide would have taken. Said at every start it asks, with what it cost (but
+ * when the small allocation for the block list fails: mapped, no line).
+ * The blocks go through vk_mem_alloc like every allocation here: the books count them until they are freed, and
+ * COLI_VK_DEVICE_CAP_MB limits them (a capped device reads as a small window). */
+static void vk_window_decide(VkUp *u) {
+    u->later = 0;   /* decided from here on */
+    VkPhysicalDeviceMemoryProperties m;
+    vkGetPhysicalDeviceMemoryProperties(G.phys, &m);
+    const uint32_t hi = m.memoryTypes[G.memtype].heapIndex;
+    int want = (int)(m.memoryHeaps[hi].size >> 30) * 9 / 10;   /* GiB */
+    const char *kn = getenv("COLI_VK_WINDOW_PROBE_MB"), *ka = getenv("COLI_VK_WINDOW_ASK_MB");
+    const char *by = kn && *kn ? " (COLI_VK_WINDOW_PROBE_MB)" : ka && *ka ? " (COLI_VK_WINDOW_ASK_MB)" : "";
+    if (!(kn && *kn) && ka && *ka) {   /* tests: ask this much at most, so the loop below runs on any device */
+        const int a = (int)(atof(ka) / 1024.0);
+        if (a < want) want = a > 0 ? a : 1;
+    }
+#ifdef VK_EXT_memory_budget
+    if (!(kn && *kn) && G.has_budget) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT bud = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 mp2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bud};
+        vkGetPhysicalDeviceMemoryProperties2(G.phys, &mp2);
+        if (bud.heapBudget[hi]) {
+            const int room = bud.heapBudget[hi] > bud.heapUsage[hi] ? (int)((bud.heapBudget[hi] - bud.heapUsage[hi]) >> 30) : 0;
+            if (room < want) want = room;
+        }
+    }
+#endif
+    int got = 0;
+    double ms = 0;
+    VkDeviceMemory *blk = want > 0 ? calloc((size_t)want, sizeof *blk) : NULL;
+    if (want > 0 && !blk) { vk_window_mapped(u); return; }
+    if (kn && *kn) got = (int)(atof(kn) / 1024.0);
+    else {
+        double t0 = vk_now();
+        for (; got < want; got++) {
+            VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                .allocationSize = (VkDeviceSize)1 << 30, .memoryTypeIndex = G.memtype};
+            if (vkAllocateMemory(G.dev, &ai, NULL, &blk[got]) != VK_SUCCESS) break;
+        }
+        for (int i = 0; i < got; i++) vkFreeMemory(G.dev, blk[i], NULL);
+        ms = vk_now() - t0;
+    }
+    free(blk);
+    if (got >= want) {
+        fprintf(stderr, "[VK] memory: mapped weights, the host-visible device-local memory gave the %d GiB asked (9/10 of "
+                "its heap, less if its budget leaves less), found in %.1f s%s\n", got, ms / 1000.0, by);
+        vk_window_mapped(u);
+        return;
+    }
+    u->on = 1;
+    snprintf(u->why, sizeof u->why, "the driver gave %d of the %d GiB asked of the host-visible device-local memory (9/10 of "
+             "its heap, less if its budget leaves less), found in %.1f s%s", got, want, ms / 1000.0, by);
 }
 /* The uploader's command buffers, fences and staging slots (u->dev, u->fam set). */
 /* A slot's imports, once its copies are done (or it was never submitted). */
@@ -834,7 +915,7 @@ static int scratch_reserve(Scratch *s, size_t bytes) { return scratch_reserve_mt
  * (203 vq2: codes | 4-bit scales per 32 | f32 row scale, its codebooks in the table buffer)
  * as codes | group scales (I/32 bytes) | f32 row scale. The scales live in the rows: the
  * scale array is bound but unused. Elements and bytes per block: blockdec_host.h. */
-static int bd_fmt(int fmt) { return (fmt >= 102 && fmt < 143 && BD_BLK[fmt - 100] >= 32) || (fmt >= 200 && fmt <= 203); }
+static int bd_fmt(int fmt) { return (fmt >= 101 && fmt < 143 && BD_BLK[fmt - 100] >= 32) || (fmt >= 200 && fmt <= 203); }
 static size_t bd_row_bytes(int fmt, int I) {
     if (fmt == 203) return (size_t)I / 4 + (size_t)I / 64 + 4;
     if (fmt >= 200) return (size_t)I / 128 * (fmt == 202 ? 48 : 32) + (size_t)I / 32 + 4;
@@ -1123,7 +1204,7 @@ int coli_vk_init(const char *spv_path) {
      * its queues: a transfer-only family (a copy engine), else a spare queue of a family
      * already asked for, else the main queue, shared under g_qmx[0]. */
     uint32_t up_fam = G.qfam, up_idx = 0; int up_shared = 1;
-    if (place_decide(G.phys, pick_memtype(G.phys, COLI_VK_MEM_CPU_WRITES), &g_up[0])) {
+    if (place_decide(G.phys, pick_memtype(G.phys, COLI_VK_MEM_CPU_WRITES), &g_up[0], 1) || g_up[0].later) {
         uint32_t t = UINT32_MAX;
         for (uint32_t i = 0; i < nq && t == UINT32_MAX; i++)
             if ((qf[i].queueFlags & VK_QUEUE_TRANSFER_BIT) && qf[i].queueCount &&
@@ -1179,6 +1260,20 @@ int coli_vk_init(const char *spv_path) {
 #endif
             }
             free(ep);
+        }
+    }
+    /* timeline semaphores, where the device has them (core in 1.2): the chain's hybrid steps
+     * (vk_chain.c). Asked of every device, with or without the matrix units and whatever the
+     * headers of the build: an RTX 3070 built against headers before the cooperative matrix
+     * came up without the semaphores, and its hybrid steps (the host pool's experts on the
+     * CPU beside the device's) never ran. */
+    {
+        VkPhysicalDeviceProperties tp; vkGetPhysicalDeviceProperties(G.phys, &tp);
+        if (tp.apiVersion >= VK_API_VERSION_1_2) {
+            VkPhysicalDeviceTimelineSemaphoreFeatures tq = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+            VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &tq};
+            vkGetPhysicalDeviceFeatures2(G.phys, &f2);
+            G.has_tsem = tq.timelineSemaphore != 0;
         }
     }
     /* Cooperative-matrix GEMM (optional, COLI_VK_COOP=0 turns it off): the KHR extension
@@ -1257,13 +1352,7 @@ int coli_vk_init(const char *spv_path) {
     v12f.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES; v12f.pNext = &sscf;
     v12f.shaderFloat16 = VK_TRUE; v12f.vulkanMemoryModel = VK_TRUE;
     v12f.bufferDeviceAddress = G.has_bda ? VK_TRUE : VK_FALSE;
-    {   /* timeline semaphores, where the device has them (core in 1.2): the chain's hybrid steps */
-        VkPhysicalDeviceTimelineSemaphoreFeatures tq = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
-        VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &tq};
-        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(G.phys, &pp);
-        if (pp.apiVersion >= VK_API_VERSION_1_2) { vkGetPhysicalDeviceFeatures2(G.phys, &f2); G.has_tsem = tq.timelineSemaphore != 0; }
-    }
-    v12f.timelineSemaphore = G.has_tsem ? VK_TRUE : VK_FALSE;
+    v12f.timelineSemaphore = G.has_tsem ? VK_TRUE : VK_FALSE;   /* queried above, for every device */
 #endif
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = nqi, .pQueueCreateInfos = qis};
@@ -1364,7 +1453,7 @@ int coli_vk_init(const char *spv_path) {
     vkGetDeviceQueue(G.dev, G.qfam, 0, &G.queue);
     vkGetDeviceQueue(G.dev, G.tq_fam, G.tq_idx, &G.tqueue);
     G.tq_shared = G.tqueue == G.queue;
-    if (g_up[0].on) {
+    if (g_up[0].on || g_up[0].later) {
         VkUp *u = &g_up[0];
         u->dev = G.dev; u->fam = up_fam; u->shared = up_shared;
         if (up_shared) u->q = G.queue; else vkGetDeviceQueue(G.dev, up_fam, up_idx, &u->q);
@@ -1424,6 +1513,7 @@ int coli_vk_init(const char *spv_path) {
         VkMemoryPropertyFlags cf = mp.memoryTypes[G.memtype].propertyFlags;
         VkDeviceSize hv_dl = mp.memoryHeaps[mp.memoryTypes[G.memtype].heapIndex].size;
         const int integrated = vk_integrated(G.phys);   /* an integrated GPU has no BAR window and uses system memory */
+        if (g_up[0].later) vk_window_decide(&g_up[0]);
         if (g_up[0].on && !up_init(&g_up[0])) {
             fprintf(stderr, "[VK] staged uploads unavailable (no staging buffer): resident data stays in mapped memory\n");
             up_destroy(&g_up[0]);
@@ -1587,7 +1677,7 @@ void coli_vk_mem_info(size_t *used, size_t *count) {
  * lock covers its books only: the uploader thread of the tier allocates while the
  * engine thread uploads dense matrices. A free while async work is in flight on the
  * tensor's device waits for that work (coli_vk_tensor_free). */
-typedef struct { VkDeviceMemory mem; uint8_t *base; } VkBlk;
+typedef struct { VkDeviceMemory mem; uint8_t *base; void *imp; } VkBlk;   /* imp: the host pool block's own pages (pool_import) */
 struct VkWPool {
     VkaPool p;
     pthread_mutex_t mx;
@@ -1834,6 +1924,77 @@ static void up_zero(int dev, VkDeviceMemory mem, uint64_t cap) {
 /* The primary device's pools are addressable when bufferDeviceAddress is on (the
  * expert batch's grouped GEMM reads expert weights through an address table). */
 static int pool_bda(const VkWPool *P) { return P->dev == 0 && G.has_bda; }
+/* An imported block's pages: MinGW has no posix_memalign, and what _aligned_malloc returns
+ * goes back through _aligned_free. */
+static void *pool_host_alloc(size_t al, size_t bytes) {
+#ifdef _WIN32
+    return _aligned_malloc(bytes, al);
+#else
+    void *p = NULL;
+    return posix_memalign(&p, al, bytes) ? NULL : p;
+#endif
+}
+static void pool_host_free(void *p) {
+#ifdef _WIN32
+    _aligned_free(p);
+#else
+    free(p);
+#endif
+}
+/* The host pool's blocks from the process's own pages (VK_EXT_external_memory_host), where
+ * the driver has them: the memory vkAllocateMemory gives for a host-visible type without
+ * HOST_CACHED is write-combined for the CPU (NVIDIA's Linux driver offers no cached type),
+ * and the hybrid steps' CPU pairs read it at about 12 GB/s on twelve cores -- 133 us a
+ * pair of Qwen3.6 int4 (1.57 MB) against 44 from cached memory (an RTX 3070 and a
+ * Threadripper 3945WX). The device reads imported pages over PCIe at the same speed as its
+ * own allocation (bench_hostmem). COLI_VK_HOST_POOL_IMPORT=0 keeps the driver's memory. */
+static int pool_import_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_HOST_POOL_IMPORT"); on = !(e && *e == '0'); }
+    return on && G.has_hostmem;
+}
+static int pool_import(VkWPool *P, VkBlk *bk, uint64_t cap, const VkMemoryAllocateFlagsInfo *afl) {
+#ifdef VK_EXT_external_memory_host
+    if (!P->host || P->dev || !pool_import_on()) return 0;
+    static size_t al;
+    static PFN_vkGetMemoryHostPointerPropertiesEXT gp;
+    if (!al) {
+        VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &hp};
+        vkGetPhysicalDeviceProperties2(G.phys, &p2);
+        al = hp.minImportedHostPointerAlignment ? (size_t)hp.minImportedHostPointerAlignment : 4096;
+        gp = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(G.dev, "vkGetMemoryHostPointerPropertiesEXT");
+    }
+    if (!gp || cap % al) return 0;
+    void *host = pool_host_alloc(al, (size_t)cap);
+    if (!host) return 0;
+    VkMemoryHostPointerPropertiesEXT mp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    if (gp(G.dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host, &mp) != VK_SUCCESS ||
+        !(mp.memoryTypeBits & (1u << pool_memtype(P)))) { pool_host_free(host); return 0; }
+    VkImportMemoryHostPointerInfoEXT imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, .pNext = (void *)afl,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, .pHostPointer = host};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp, .allocationSize = cap,
+        .memoryTypeIndex = pool_memtype(P)};
+    if (vkAllocateMemory(G.dev, &ai, NULL, &bk->mem) != VK_SUCCESS) { pool_host_free(host); bk->mem = VK_NULL_HANDLE; return 0; }
+    bk->base = host; bk->imp = host;
+    static int said;
+    if (!said++) fprintf(stderr, "[VK] host pool: its blocks are the process's own pages, imported (cached for the CPU; COLI_VK_HOST_POOL_IMPORT=0 takes the driver's)\n");
+    return 1;
+#else
+    (void)P; (void)bk; (void)cap; (void)afl;
+    return 0;
+#endif
+}
+/* a block's memory and pages back (lock held) */
+static void blk_free(VkDevice dev, VkBlk *bk) {
+    if (!bk) return;
+    if (dev) {
+        if (bk->base && !bk->imp) vkUnmapMemory(dev, bk->mem);
+        if (bk->mem) vkFreeMemory(dev, bk->mem, NULL);
+    }
+    if (bk->imp) pool_host_free(bk->imp);
+    free(bk);
+}
 /* Block memory for a pool (lock held). */
 static VkBlk *pool_new_block(VkWPool *P, uint64_t cap) {
     VkBlk *bk = calloc(1, sizeof(*bk));
@@ -1849,6 +2010,7 @@ static VkBlk *pool_new_block(VkWPool *P, uint64_t cap) {
         .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
     if (pool_bda(P)) { afl.pNext = ai.pNext; ai.pNext = &afl; }
     VkDevice dev = pool_device(P);
+    if (pool_import(P, bk, cap, pool_bda(P) ? &afl : NULL)) return bk;   /* the host pool: the process's pages */
     int staged = pool_staged(P);   /* device-local, never mapped: the uploader fills it */
     if (staged && up_fault("block")) { free(bk); return NULL; }
     if (vkAllocateMemory(dev, &ai, NULL, &bk->mem) != VK_SUCCESS ||
@@ -1860,9 +2022,7 @@ static VkBlk *pool_new_block(VkWPool *P, uint64_t cap) {
     return bk;
 }
 static void pool_release_block(VkWPool *P, int k) {   /* lock held, block empty */
-    VkBlk *bk = P->p.b[k].user;
-    VkDevice dev = pool_device(P);
-    if (bk) { if (bk->base) vkUnmapMemory(dev, bk->mem); vkFreeMemory(dev, bk->mem, NULL); free(bk); }
+    blk_free(pool_device(P), P->p.b[k].user);
     vka_pool_drop_block(&P->p, k);
 }
 
@@ -1877,6 +2037,12 @@ static int pool_suballoc(VkWPool *P, size_t bytes, VkBuffer *buf, void **ptr, Vk
     /* the host pool's: the source of a copy to the device (coli_vk_tensor_copy), on the uploader's queue */
     else if (P->host) { bi.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT; up_sharing(&g_up[P->dev], &bi); }
     if (pool_bda(P)) bi.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+#ifdef VK_EXT_external_memory_host
+    /* the host pool's buffers may land in an imported block (pool_import): declared at creation */
+    VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, .pNext = (void *)bi.pNext,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
+    if (P->host && !P->dev && pool_import_on()) bi.pNext = &eb;
+#endif
     VKCHECK(vkCreateBuffer(dev, &bi, NULL, buf), "vkCreateBuffer");
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(dev, *buf, &req);
@@ -1893,10 +2059,8 @@ static int pool_suballoc(VkWPool *P, size_t bytes, VkBuffer *buf, void **ptr, Vk
             cap = (P->p.limit - P->p.total) & ~(uint64_t)4095;
         VkBlk *bk = vka_pool_can_grow(&P->p, cap) && cap >= req.size ? pool_new_block(P, cap) : NULL;
         if (bk) {
-            if (vka_pool_add_block(&P->p, cap, bk) < 0) {
-                if (bk->base) vkUnmapMemory(dev, bk->mem);
-                vkFreeMemory(dev, bk->mem, NULL); free(bk);
-            } else ok = vka_alloc(&P->p, req.size, align, r);
+            if (vka_pool_add_block(&P->p, cap, bk) < 0) blk_free(dev, bk);
+            else ok = vka_alloc(&P->p, req.size, align, r);
         } else P->p.refusals++;
     }
     VkBlk *blk = ok ? P->p.b[r->block].user : NULL;
@@ -1923,8 +2087,7 @@ static void pool_destroy(VkWPool *P) {
     VkDevice dev = pool_device(P);
     for (int k = 0; k < P->p.nb; k++) {
         if (!P->p.b[k].present) continue;
-        VkBlk *bk = P->p.b[k].user;
-        if (bk) { if (dev) { if (bk->base) vkUnmapMemory(dev, bk->mem); vkFreeMemory(dev, bk->mem, NULL); } free(bk); }
+        blk_free(dev, P->p.b[k].user);
     }
     uint64_t bb = P->p.block_bytes, lim = P->p.limit;
     vka_pool_destroy(&P->p);
@@ -2543,6 +2706,12 @@ static double dho_rss_gib(void) {
 #endif
 }
 static void dho_exit_report(void) {
+#ifdef __GLIBC__
+    /* what this process holds, not what glibc kept of what it freed: without the trim the
+     * same run on Lavapipe read anywhere from 0.547 to 0.594 GiB (LLVM's and the load's
+     * freed blocks), which the gates comparing two runs took for the host copies */
+    malloc_trim(0);
+#endif
     double rss = dho_rss_gib();
     char r[48] = "";
     if (rss >= 0) snprintf(r, sizeof r, "; RSS %.3f GiB", rss);   /* to the MiB: the gates compare tens of MiB */
@@ -3060,7 +3229,7 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
         }
     }
     /* its experts as device 0's: staged uploads by the same rule, on its one queue */
-    if (place_decide(G2.phys, mt, &g_up[1])) {
+    if (place_decide(G2.phys, mt, &g_up[1], 0)) {
         VkUp *u = &g_up[1];
         u->dev = G2.dev; u->q = G2.queue; u->fam = G2.qfam; u->shared = 1;
         u->fams[0] = G2.qfam; u->nfams = 1;
@@ -3895,8 +4064,10 @@ void coli_vk_pool_stats(int which, ColiVkPoolStats *st) {
 static void tier_pool_limit(VkWPool *P, size_t bytes) {
     pthread_mutex_lock(&P->mx);
     P->p.limit = bytes;
-    /* blocks no larger than the budget, so a small budget is not one refused block */
-    size_t bb = coli_vk_block_bytes_dev(P->dev, VK_WBLOCK);
+    /* blocks no larger than the budget, so a small budget is not one refused block; the host
+     * pool's are system RAM, which COLI_VK_DEVICE_CAP_MB does not shrink (under the cap its
+     * 2 MiB blocks held one expert each: Flint's 18.5 GB took 24.5 GiB) */
+    size_t bb = P->host ? VK_WBLOCK : coli_vk_block_bytes_dev(P->dev, VK_WBLOCK);
     P->p.block_bytes = bytes && bytes < bb ? ((bytes + 4095) & ~(size_t)4095) : bb;
     /* the empty block the pool keeps as a spare (vka_free) goes too: a tier started
      * again after a shutdown would otherwise fill it past its new, smaller budget */
@@ -3906,6 +4077,14 @@ static void tier_pool_limit(VkWPool *P, size_t bytes) {
 }
 void coli_vk_tier_pool_limit(size_t bytes) { tier_pool_limit(&g_tpool, bytes); }
 void coli_vk_tier_pool_limit_dev(int dev, size_t bytes) { tier_pool_limit(dev == 2 ? &g_hpool : dev == 1 ? &g_tpool2 : &g_tpool, bytes); }
+int coli_vk_tier_pool_blocks(uint64_t *bytes, int max) {
+    VkWPool *P = &g_tpool;
+    pthread_mutex_lock(&P->mx);
+    const int nb = P->p.nb;
+    for (int k = 0; bytes && k < nb && k < max; k++) bytes[k] = P->p.b[k].present ? P->p.b[k].cap : 0;
+    pthread_mutex_unlock(&P->mx);
+    return nb;
+}
 int coli_vk_tier_host_pool(void) { return G.ready && G.has_bda && G.memtype_sys >= 0; }
 /* The room the driver leaves in the system-RAM heap the host pool lives in (G.memtype_sys's):
  * its budget less its usage (VK_EXT_memory_budget), else the heap's size; 0 when unknown. The
@@ -4016,6 +4195,21 @@ struct ColiVkExpert {
 /* An expert's three tensors (gate, up, down). */
 void coli_vk_xb_expert_tensors(const ColiVkExpert *e, ColiVkTensor **g, ColiVkTensor **u, ColiVkTensor **d) {
     *g = e ? e->g : NULL; *u = e ? e->u : NULL; *d = e ? e->d : NULL;
+}
+int coli_vk_xb_expert_blocks(const ColiVkExpert *e, int *blk, int max) {
+    int n = 0;
+    const ColiVkTensor *t[3] = {e ? e->g : NULL, e ? e->u : NULL, e ? e->d : NULL};
+    for (int k = 0; k < 3; k++) {
+        if (!t[k] || t[k]->pool != &g_tpool) continue;
+        const VkaRange r[2] = {t[k]->wr, t[k]->sr};
+        for (int j = 0; j < 2; j++) {
+            if (!r[j].len) continue;
+            int seen = 0;
+            for (int q = 0; q < n; q++) seen |= blk[q] == r[j].block;
+            if (!seen && n < max) blk[n++] = r[j].block;
+        }
+    }
+    return n;
 }
 typedef struct { VkBuffer buf; VkDeviceMemory mem; void *ptr; size_t region; } XbBuf;
 typedef struct XbCtx {

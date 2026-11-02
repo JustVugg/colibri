@@ -1910,6 +1910,7 @@ def render_gen_stats(st, mode):
 # comando. Ogni forma si accetta sia con / sia con : -- i comandi storici usano
 # i due punti e non si toglie a nessuno l'abitudine.
 CHAT_COMMANDS = {
+    "file":   "PATH       a text file or a PDF, read here, its text sent with your next message",
     "decide": "a | b | c  System One mode: score the options instead of generating; no options returns to chat",
     "reset": "            start the conversation again",
     "help":  "            this list",
@@ -2065,6 +2066,7 @@ def chat_attached(a, base, model_id):
     if arch in CHAT_THINK_OFF and getattr(a,"think",None) is None:
         print(f"  {C.dim}thinking is off here (--think turns it on){C.r}\n")
     msgs=[]
+    preload=chat_preload(a, base)  # --file, /file: documents' text, sent with the next message
     compaction_seen=None     # the summary the server compacted this chat into, once said
     brio_options=[]          # non vuoto = modalita System One accesa (/decide)
     w=term_w()-4
@@ -2089,8 +2091,15 @@ def chat_attached(a, base, model_id):
             chat_commands_help(); continue
         if name in ("quit",): break
         if name == "help": chat_commands_help(); continue
+        if name == "file":
+            if not rest: print(f"  {C.yel}  /file needs a path: /file ~/notes.txt{C.r}\n"); continue
+            block = read_document(rest, base)
+            if block is not None:
+                preload += ("\n\n" if preload else "") + block
+                print(f"  {C.dim}  it goes with your next message{C.r}\n")
+            continue
         if name == "reset":
-            msgs=[]; brio_options=[]; compaction_seen=None
+            msgs=[]; brio_options=[]; compaction_seen=None; preload=""
             print(f"  {C.dim}✦ new conversation{C.r}\n"); continue
         # ---- modalita System One (/decide) ---------------------------------
         # Lo stesso modello con cui stai chattando smette di generare e comincia
@@ -2123,6 +2132,10 @@ def chat_attached(a, base, model_id):
         # --------------------------------------------------------------------
         payload = message_with_images(msg)
         if payload is None: continue          # percorso sbagliato: gia' detto
+        if preload:   # --file and /file: the documents go with this message
+            if isinstance(payload, str): payload = preload + "\n\n" + payload
+            else: payload = [{"type":"text","text":preload}] + payload
+            preload = ""
         msgs.append({"role":"user","content":payload})
         # Il livello di ragionamento e' una leva di tempo, non di gusto: su un
         # motore che streamma gli esperti da disco, "max" vuol dire centinaia
@@ -2335,6 +2348,167 @@ def message_with_images(text):
         # COLI_IMAGE_ROOT, and a path sent by mistake would be refused.
         content.append({"type":"image_url","image_url":{"url":image_data_uri(path)}})
     return content
+
+# ---- documents in chat (#2431): /file PATH, and coli chat --file PATH ----------------
+#
+# A document goes to the model only when the user names it: `/file PATH` in the chat (it
+# goes with the next message) or `coli chat --file PATH` (with the first). A path is never
+# picked out of a message's text: text pasted from elsewhere would otherwise read a file
+# from this machine and send it to the server, which `--attach` can put on another host.
+# What is read is bounded and checked first: a regular file (a FIFO or a device would block
+# or never end), one of the text suffixes below or a PDF (a key or a dotfile has none of
+# them), at most DOC_MAX_BYTES on disk and DOC_MAX_CHARS of text, no NUL byte, the control
+# characters other than tab and newline taken out. A PDF is parsed by another process,
+# never this one: pdftotext (poppler) or pypdf in a child Python, from an empty temporary
+# directory (no module there for it to import), with a time limit, a memory limit where the
+# system has one, and its output read up to the bound; the path is absolute, so it can never
+# read as an option.
+DOCUMENT_SUFFIXES = (".txt", ".md", ".markdown", ".rst", ".csv", ".tsv", ".json", ".jsonl",
+                     ".log", ".xml", ".yaml", ".yml", ".tex", ".pdf")
+DOC_MAX_BYTES = 64 << 20          # a file, on disk
+DOC_MAX_CHARS = 2_000_000         # its text: about 500K tokens, past every context served
+DOC_PDF_SECONDS = 120
+DOC_PDF_MEMORY = 2 << 30          # the PDF reader's address space, where RLIMIT_AS exists
+_DOC_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+_PYPDF_CHILD = (
+    "import sys\n"
+    "from pypdf import PdfReader\n"
+    "left = int(sys.argv[2])\n"
+    "for page in PdfReader(sys.argv[1]).pages:\n"
+    "    t = (page.extract_text() or '') + '\\n\\n'\n"
+    "    sys.stdout.write(t[:left]); left -= len(t)\n"
+    "    if left <= 0: break\n")
+
+
+def printable_name(path):
+    """A file's name as the terminal may print it: control characters (an escape sequence
+    in a name would drive the terminal) shown as '?'."""
+    return _DOC_CONTROL.sub("?", os.path.basename(path)) or "?"
+
+
+def _run_bounded(cmd, cap):
+    """cmd's stdout, read up to cap bytes, from an empty temporary directory, under
+    DOC_PDF_SECONDS and, where sh has ulimit -v, DOC_PDF_MEMORY (set by a shell that then
+    execs cmd, its words passed as arguments, never as shell text; no preexec_fn, which is
+    not safe beside the chat's threads). (bytes, None) or (None, why)."""
+    sh = shutil.which("sh") if os.name == "posix" else None
+    if sh:
+        cmd = [sh, "-c", f'ulimit -v {DOC_PDF_MEMORY >> 10} 2>/dev/null; exec "$0" "$@"'] + list(cmd)
+    with tempfile.TemporaryDirectory(prefix="coli-doc-") as empty:
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                                 cwd=empty, start_new_session=os.name == "posix")
+        except OSError as error:
+            return None, str(error)
+        out = bytearray()
+        def pump():
+            while len(out) <= cap:
+                chunk = p.stdout.read(1 << 16)
+                if not chunk:
+                    break
+                out.extend(chunk)
+        reader = threading.Thread(target=pump, daemon=True)
+        reader.start()
+        reader.join(DOC_PDF_SECONDS)
+        if reader.is_alive() or len(out) > cap:
+            try:   # the reader and whatever it started: none may keep the pipe open
+                if os.name == "posix": os.killpg(p.pid, signal.SIGKILL)
+                else: p.kill()
+            except OSError:
+                pass
+            p.wait(); reader.join(5)
+            if not reader.is_alive(): p.stdout.close()
+            return None, (f"its text is past {DOC_MAX_CHARS:,} characters" if len(out) > cap
+                          else f"reading it took longer than {DOC_PDF_SECONDS} s")
+        code = p.wait(); p.stdout.close()
+        if code != 0:
+            return None, f"the PDF reader stopped (exit {code})"
+        return bytes(out), None
+
+
+def document_text(path):
+    """(text, None) for a document the user named, or (None, why); see the block above."""
+    import importlib.util, stat as stat_mod
+    path = os.path.abspath(path)
+    name = path.lower()
+    if not name.endswith(DOCUMENT_SUFFIXES):
+        return None, "not a text file or a PDF (" + ", ".join(DOCUMENT_SUFFIXES) + ")"
+    try:
+        st = os.stat(path)
+    except OSError as error:
+        return None, error.strerror or str(error)
+    if not stat_mod.S_ISREG(st.st_mode):
+        return None, "not a regular file"
+    if st.st_size > DOC_MAX_BYTES:
+        return None, f"{st.st_size:,} bytes, past the {DOC_MAX_BYTES >> 20} MiB a document may have"
+    if name.endswith(".pdf"):
+        cap = DOC_MAX_CHARS * 4   # UTF-8 bytes of at most that many characters
+        tool = shutil.which("pdftotext")
+        if tool:
+            raw, why = _run_bounded([tool, "-layout", "-enc", "UTF-8", path, "-"], cap)
+        elif importlib.util.find_spec("pypdf") is not None:
+            raw, why = _run_bounded([sys.executable, "-c", _PYPDF_CHILD, path, str(DOC_MAX_CHARS + 1)], cap)
+        else:
+            return None, ("reading a PDF needs pdftotext (poppler: apt install poppler-utils, "
+                          "brew install poppler) or pypdf (pip install pypdf)")
+        if raw is None:
+            return None, why
+        text = raw.decode("utf-8", "replace")
+        if not text.strip():
+            return None, "the PDF has no text layer (a scan: it needs OCR first)"
+    else:
+        try:
+            with open(path, "rb") as handle:
+                raw = handle.read(DOC_MAX_BYTES + 1)
+        except OSError as error:
+            return None, error.strerror or str(error)
+        if b"\0" in raw:
+            return None, "not a text file (it holds NUL bytes)"
+        text = raw.decode("utf-8", "replace")
+    if len(text) > DOC_MAX_CHARS:
+        return None, f"its text is past {DOC_MAX_CHARS:,} characters"
+    return _DOC_CONTROL.sub("", text), None
+
+
+def document_block(path, text):
+    name = printable_name(path)
+    return f"[file {name}]\n{text.rstrip()}\n[end of {name}]"
+
+
+def read_document(path, base=None, note=None):
+    """The block for a document the user named (`/file`, `--file`), after saying what was
+    read and, for a server not on this machine, where it goes. None after saying why not."""
+    note = note or print
+    local = to_local_path(path)
+    text, why = document_text(local)
+    if text is None:
+        note(f"  {C.yel}✗ {printable_name(local)}{C.r}: {why}")
+        return None
+    note(f"  {C.grn}✓ attached{C.r} {printable_name(local)} {C.dim}· {len(text):,} characters, "
+         f"about {len(text) // 4:,} tokens{C.r}")
+    if base and not is_local_base(base):
+        note(f"  {C.yel}  its text goes to {base}, a server on another machine{C.r}")
+    return document_block(local, text)
+
+
+def is_local_base(base):
+    """A server address on this machine (loopback names and addresses)."""
+    from urllib.parse import urlparse
+    host = (urlparse(base).hostname or "").lower()
+    return host in ("localhost", "::1") or host.startswith("127.")
+
+
+def chat_preload(a, base=None):
+    """`coli chat --file`'s documents as one text, which goes with the first message; a
+    file that cannot be read stops the chat before it starts."""
+    blocks = []
+    for path in getattr(a, "file", None) or []:
+        block = read_document(path, base)
+        if block is None:
+            sys.exit(f"--file {printable_name(path)}: not read (above)")
+        blocks.append(block)
+    return "\n\n".join(blocks)
+
 
 def image_data_uri(path):
     """base64 data: URI of a local image, MIME from the extension (PNG when unknown)."""
@@ -2856,6 +3030,71 @@ def server_model_entry(base, api_key=None, timeout=1.5):
     except Exception:
         return {}
 
+def tui_binary():
+    """colibri-tui next to coli (an archive, a source build), or in libexec (make install)."""
+    local = os.path.join(HERE, "colibri-tui" + _EXE)
+    return local if os.path.exists(local) else os.path.join(_LIBEXEC, "colibri-tui" + _EXE)
+
+def run_tui(a, base):
+    """The terminal interface against the server at `base`, until the user quits it. The key
+    travels in the environment, not on the command line, where `ps` would show it."""
+    env = dict(os.environ)
+    if getattr(a, "api_key", None): env["COLI_API_KEY"] = a.api_key
+    return subprocess.call([tui_binary(), "--server", base], env=env)
+
+def cmd_tui(a):
+    """`coli tui`: the TUI attached to a running coli serve (--attach, else localhost:8000), or to a
+    server it starts for --model and stops when the TUI quits. The server's output goes to a log:
+    on the terminal it would draw over the interface."""
+    if not os.path.exists(tui_binary()):
+        sys.exit(f"colibri-tui is not built: run `make -C c colibri-tui` (docs/tui.md)")
+    base = getattr(a, "attach", None) or "http://127.0.0.1:8000"
+    if not getattr(a, "no_attach", False):
+        mid = server_probe(base, getattr(a, "api_key", None))
+        if mid:
+            sys.exit(run_tui(a, base))
+        if getattr(a, "attach", None):
+            sys.exit(f"--attach: no coli serve answering at {base} (start one with: coli serve --model <dir>)")
+    if not a.model:
+        sys.exit("coli tui: no coli serve answers at http://127.0.0.1:8000. Start one "
+                 "(coli serve --model <dir>) or give the model here: coli tui --model <dir>")
+    need_model(a.model)
+    resolved = resolve_model(a.model); family = resolved.descriptor; arch = family.id
+    if not family.has_gateway_adapter:
+        sys.exit(f"{family.display_name}: gateway adapter is not wired")
+    if family.modality != "text":
+        sys.exit(f"{family.display_name} is not a text model: the TUI chats; use coli chat")
+    engine = engine_for(a.model)
+    need_model(a.model, engine)
+    from family_registry import default_model_id
+    model_id = default_model_id(resolved)
+    import openai_server
+    cmd = [sys.executable, openai_server.__file__, "--model", a.model, "--engine", engine, "--arch", arch,
+           "--model-id", model_id, "--host", "127.0.0.1", "--port", "8000", "--max-tokens", str(serve_max_tokens(a))]
+    if a.cap is not None: cmd += ["--cap", str(a.cap)]
+    if a.api_key: cmd += ["--api-key", a.api_key]
+    log_path = os.path.join(tempfile.gettempdir(), "colibri-tui-server.log")
+    with open(log_path, "w", encoding="utf-8") as log:
+        p = subprocess.Popen(cmd, env=env_for_engine(a, arch), stdout=log, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL)
+    try:
+        sp = Spinner(f"loading {model_id}…"); sp.start()
+        for _ in range(1800):
+            if p.poll() is not None:
+                sp.stop(); sys.exit(f"{model_id} server exited while loading: see {log_path}")
+            if server_probe("http://127.0.0.1:8000", a.api_key, timeout=1.0):
+                sp.stop()
+                code = run_tui(a, "http://127.0.0.1:8000")
+                print(f"  {C.dim}the server's log: {log_path}{C.r}")
+                sys.exit(code)
+            time.sleep(1)
+        sp.stop(); sys.exit(f"timed out loading {model_id}: see {log_path}")
+    finally:
+        if p.poll() is None:
+            p.terminate()
+            try: p.wait(timeout=10)
+            except subprocess.TimeoutExpired: p.kill()
+
 def cmd_chat(a):
     # ATTACH: a running `coli serve` beats a private engine every time — the load
     # (34-136 s) and the cache warmth survive between sessions. Explicit --attach
@@ -3028,6 +3267,7 @@ def cmd_chat(a):
                     print(f"  {C.dgray}{chunk}{C.r}")
     except Exception: pass
     print(f"  {C.dim}type and press Enter · Ctrl-C stops the answer · :more continues · :reset clears memory · :q exits{C.r}\n")
+    preload=chat_preload(a)
     w=term_w()-4
     try:
         while True:
@@ -3050,6 +3290,13 @@ def cmd_chat(a):
             if msg in (":piu",":più",":more",":continua"):
                 p.stdin.write(b"\x02MORE\n"); p.stdin.flush()
             else:
+                if msg.startswith(("/file ",":file ")):   # a document for the next message
+                    block=read_document(msg.split(None,1)[1])
+                    if block is not None:
+                        preload+=("\n\n" if preload else "")+block
+                        print(f"  {C.dim}  it goes with your next message{C.r}\n")
+                    continue
+                if preload: msg=preload+"\n\n"+msg; preload=""   # --file and /file: with this message
                 p.stdin.write((msg.replace("\n"," ")+"\n").encode()); p.stdin.flush()
             print(f"\n  {C.teal}◆ colibri{C.r}")
             dec=codecs.getincrementaldecoder("utf-8")("replace")
@@ -3537,6 +3784,38 @@ def cmd_stop(a):
     except OSError: pass
     print(f"  {C.grn}✓ stopped{C.r} — RAM released")
 
+def cmd_ui(a):
+    """the chat UI (ui/server.py) against a running gateway (`coli serve`), the browser
+    opened on it once it answers"""
+    cands = [os.path.join(HERE, "ui", "server.py"),
+             os.path.join(os.path.dirname(os.path.abspath(HERE)), "ui", "server.py")]
+    server = next((c for c in cands if os.path.exists(c)), None)
+    if server is None:
+        sys.exit(f"{C.yel}the chat UI is not in this tree{C.r} (ui/server.py next to coli or one level up)")
+    shown = "127.0.0.1" if a.host in ("0.0.0.0", "") else a.host
+    url = f"http://{shown}:{a.port}/"
+    print(f"  {C.dim}the chat UI on {url}, the gateway at {a.backend} "
+          f"(start it with  coli serve --model DIR  if it is not running){C.r}")
+    if not a.no_browser:
+        import threading, urllib.request, webbrowser
+        def opener():
+            for _ in range(150):
+                time.sleep(0.2)
+                try:
+                    urllib.request.urlopen(url, timeout=2); break
+                except OSError:
+                    continue
+            webbrowser.open(url)
+        threading.Thread(target=opener, daemon=True).start()
+    cmd = [sys.executable, server, "--host", a.host, "--port", str(a.port), "--backend", a.backend]
+    if a.models_backend: cmd += ["--models-backend", a.models_backend]
+    for d in a.models_dir or []: cmd += ["--models-dir", d]
+    if a.searx: cmd += ["--searx", a.searx]
+    try:
+        sys.exit(subprocess.call(cmd))
+    except KeyboardInterrupt:
+        sys.exit(0)
+
 def cmd_web(a):
     """serve + open the dashboard in the browser once the API answers."""
     need_model(a.model)
@@ -3913,10 +4192,19 @@ def main():
     pc.add_argument("--no-attach", action="store_true",
                     help="never auto-attach, always spawn a private engine")
     pc.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
+    pc.add_argument("--file", action="append", default=None, metavar="PATH",
+                    help="a text file or a PDF whose text goes with your first message (repeatable); "
+                         "in the chat, /file PATH does the same for the next one.")
     pc.add_argument("--stats", choices=list(CHAT_STATS_MODES), default=None,
                     help="generation statistics footer after each answer: full (tokens, seconds, tok/s), "
                          "compact (tokens, tok/s), off. Default from COLI_CHAT_STATS, else full. "
                          "Counts are exact when the server reports completion_tokens, ~estimated otherwise.")
+    pt=sub.add_parser("tui", parents=[common],
+                      help="the terminal interface (colibri-tui) on a running coli serve, or on one it starts for --model")
+    pt.add_argument("--attach", default=None, metavar="URL",
+                    help="the coli serve to use (default: http://127.0.0.1:8000 when it answers)")
+    pt.add_argument("--no-attach", action="store_true", help="always start a server for --model")
+    pt.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
     ps=sub.add_parser("serve", parents=[common])
     ps.add_argument("--host",default="127.0.0.1"); ps.add_argument("--port",type=int,default=8000)
     ps.add_argument("--model-id",default=os.environ.get("COLI_MODEL_ID"))
@@ -3961,6 +4249,19 @@ def main():
                        help="additional Host header accepted by the DNS-rebinding guard; repeat as needed"))):
         pw.add_argument(arg,**kw)
     pw.add_argument("--no-browser",action="store_true",help="don't auto-open the browser")
+    pui=sub.add_parser("ui",help="the chat UI (ui/server.py) against a running coli serve")
+    pui.add_argument("--host",default="127.0.0.1"); pui.add_argument("--port",type=int,default=8790)
+    pui.add_argument("--backend",default=os.environ.get("COLIBRI_BACKEND","http://127.0.0.1:8000"),
+                     help="the gateway's address (coli serve's default)")
+    pui.add_argument("--models-backend",default=os.environ.get("COLIBRI_MODELS_BACKEND",""),
+                     help="the Models page's service on the engine's machine (python3 ui/models.py "
+                     "there), when the gateway is elsewhere; with a gateway on this machine it runs here")
+    pui.add_argument("--models-dir",action="append",default=[],metavar="DIR",
+                     help="where models are, for the Models page (default: the folder coli setup "
+                     "uses, ~/colibri-models)")
+    pui.add_argument("--searx",default=os.environ.get("COLIBRI_SEARX",""),
+                     help="a SearXNG instance for the chat's web search (default: DuckDuckGo's HTML results)")
+    pui.add_argument("--no-browser",action="store_true",help="don't open the browser")
     # One-step setup (setup_flow.py). No `common` parent: --model here names a
     # catalog entry, not a model directory, and nothing below loads an engine.
     pset=sub.add_parser("setup",help="one step: detect hardware, pick a model, build or fetch "
@@ -4040,8 +4341,8 @@ def main():
     a=ap.parse_args()
     handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"mirror":cmd_mirror,
              "doctor":cmd_doctor,"tune":cmd_tune,
-             "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
-             "convert":cmd_convert,"import":cmd_import,"web":cmd_web}.get(a.cmd)
+             "run":cmd_run,"chat":cmd_chat,"tui":cmd_tui,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
+             "convert":cmd_convert,"import":cmd_import,"web":cmd_web,"ui":cmd_ui}.get(a.cmd)
     if a.cmd in ("setup","start","status","logs"):
         import setup_flow
         flow={"setup":setup_flow.cmd_setup,"start":setup_flow.cmd_start,

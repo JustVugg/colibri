@@ -1826,7 +1826,7 @@ qwen36_gguf_chain_gates() {
   # that room and the cache's allocation failed at start)
   grep -q "host pool on, [1-9].* of RAM left for the KV and state the engine allocates later" vk.log ||
     { cat vk.log; fail "chain qwen36 GGUF hybrid: the host pool left no room for the KV cache"; }
-  grep -q "hybrid layer steps, [1-9][0-9]* host pool pairs on the CPU" vk.log || { cat vk.log; fail "chain qwen36 GGUF hybrid: no pair on the CPU"; }
+  grep -q "hybrid layer steps\( ([^)]*)\)\{0,1\}, [1-9][0-9]* host pool pairs on the CPU" vk.log || { cat vk.log; fail "chain qwen36 GGUF hybrid: no pair on the CPU"; }
   # the host pool within the driver's heap for it (#2314: Windows leaves about half the RAM,
   # and the blocks past it were refused): a heap whose room past the 2 GiB the staging keeps
   # holds a few experts, the pool takes those, the engine's cache keeps the rest (and so the
@@ -1874,6 +1874,26 @@ flint_chain_serve() {
   printf '{"format": "colibri-gguf-v1", "gguf": "%s/muse_tiny/model.gguf", "mode": "link", "arch": "muse", "parts": 1}\n' "$PWD" > muse_tiny/gguf.json
   CHAIN_SERVE_TOL=1e-3 CHAIN_SERVE_SLOTS=3 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_EXPECT='decode steps of several conversations in the chain \([0-9]* rows, [1-9]' \
     $PY tests/vulkan_chain_serve.py ./qwen36 muse_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 KV_SLOTS=3
+}
+# LFM3 (short gated convolutions, attention with a gate per head, a sliding window, every
+# branch normalised): its tiny GGUF's float32 tokens on the chain, the chain on a partial
+# fit, and serve mode against the CPU frame for frame (pins, reused prefixes, prompts on
+# the device and decode on the CPU, a ring, the KV cache in float16, two conversations).
+lfm3_chain_serve() {
+  rm -rf lfm3_tiny
+  $PY tools/make_lfm3_tiny.py --out lfm3_tiny --emit-ref lfm3_tiny/ref.json > /dev/null
+  COLI_VULKAN=1 SNAP=lfm3_tiny/model.gguf ./qwen36 16 8 lfm3_tiny/ref.json > vk.log 2>&1
+  grep -qE 'Matching tokens: ([0-9]+)/\1$' vk.log || { cat vk.log; fail "lfm3: oracle on the chain"; }
+  COLI_VULKAN=1 COLI_VK_CHAIN_LAYERS=3 SNAP=lfm3_tiny/model.gguf ./qwen36 16 8 lfm3_tiny/ref.json > vk.log 2>&1
+  grep -qE 'Matching tokens: ([0-9]+)/\1$' vk.log || { cat vk.log; fail "lfm3: oracle on a partial chain"; }
+  $PY -c "import sys; sys.path.insert(0, 'tests'); from prefix_serve_harness import ensure_byte_tokenizer as t; from pathlib import Path; t(Path('lfm3_tiny'))"
+  printf '{"format": "colibri-gguf-v1", "gguf": "%s/lfm3_tiny/model.gguf", "mode": "link", "arch": "lfm3", "parts": 1}\n' "$PWD" > lfm3_tiny/gguf.json
+  CHAIN_SERVE_CONTINUE=1 $PY tests/vulkan_chain_serve.py ./qwen36 lfm3_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0
+  COLI_VK_CHAIN=2 CHAIN_SERVE_CONTINUE=1 $PY tests/vulkan_chain_serve.py ./qwen36 lfm3_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0
+  CHAIN_SERVE_CONTINUE=1 CHAIN_SERVE_EXPECT='keep a ring of 14 rows' $PY tests/vulkan_chain_serve.py ./qwen36 lfm3_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 Q36_KV_RING_SPARE=9
+  CHAIN_SERVE_KV16=1 CHAIN_SERVE_CONTINUE=1 $PY tests/vulkan_chain_serve.py ./qwen36 lfm3_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0
+  CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_EXPECT='decode steps of several conversations in the chain \([0-9]* rows, [1-9]' \
+    $PY tests/vulkan_chain_serve.py ./qwen36 lfm3_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 KV_SLOTS=2
 }
 family_qwen_chain() {
   make qwen36 qwen38 tests/test_vk_chain VK=1
@@ -1931,7 +1951,7 @@ family_qwen_chain() {
   dmoe_gate qwen36 "chain qwen36 the host pool" all COLI_VK_TIER_GB=0.00077 COLI_VK_TIER_HOST=1 GQ_EXACT=1 COLI_DENSE_I8=0 \
     SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
   grep -q "host pool on, [1-9]" vk.log || { cat vk.log; fail "chain qwen36 the host pool: no expert in the host pool"; }
-  grep -q "hybrid layer steps, [1-9][0-9]* host pool pairs on the CPU" vk.log || { cat vk.log; fail "chain qwen36 the host pool: no int4 pair on the CPU"; }
+  grep -q "hybrid layer steps\( ([^)]*)\)\{0,1\}, [1-9][0-9]* host pool pairs on the CPU" vk.log || { cat vk.log; fail "chain qwen36 the host pool: no int4 pair on the CPU"; }
   # the device lost mid-decode: the state rebuilt on the CPU, the run finishes there; in a
   # step's frames on the host's routing, and in a step that is one frame
   lost_late qwen36 "chain qwen36 device lost" 20 rebuild COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
@@ -1972,6 +1992,7 @@ family_qwen_chain() {
   COLI_VK_CHAIN=2 $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0
   qwen36_gguf_chain_gates
   flint_chain_serve
+  lfm3_chain_serve
 
   # qwen38: every resident format, prefill batching, every expert form, MTP
   $PY tools/make_qwen38_tiny.py --out qwen38_tiny
@@ -1989,6 +2010,21 @@ family_qwen_chain() {
   done
   chain_gate qwen38 "chain qwen38 tier off" 1 OMP_NUM_THREADS=2 COLI_VK_TIER=0 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
   chain_gate qwen38 "chain qwen38 prefill in chunks of 3" 1 OMP_NUM_THREADS=2 COLI_VK_CHAIN_ROWS=3 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
+  # a prompt layer by layer (q38c_forward_lm; forced here, where no expert stages): the
+  # CPU's tokens, and bit for bit the logits of the same chunks run chunk by chunk
+  V38LW="OMP_NUM_THREADS=2 COLI_VK_TIER_HOST=1 COLI_VK_TIER_GB=0.00005 COLI_VK_CHAIN_ROWS=3 SNAP=qwen38_tiny"
+  chain_gate qwen38 "chain qwen38 a prompt layer by layer" 1 $V38LW COLI_VK_CHAIN_LAYERWISE=1 -- 4 8 qwen38_tiny/ref.json
+  grep -q "prompts layer by layer" vk.log || { cat vk.log; fail "chain qwen38 a prompt layer by layer: it ran chunk by chunk"; }
+  cp vk.f32 lw.f32
+  chain_gate qwen38 "chain qwen38 the same prompt chunk by chunk" 1 $V38LW COLI_VK_CHAIN_LAYERWISE=0 -- 4 8 qwen38_tiny/ref.json
+  cmp -s lw.f32 vk.f32 || fail "chain qwen38 a prompt layer by layer: other logits than chunk by chunk"
+  # one row a chunk, four a segment: the 5-token prompt in two segments, the same logits again
+  V38LW1="OMP_NUM_THREADS=2 COLI_VK_TIER_HOST=1 COLI_VK_TIER_GB=0.00005 COLI_VK_CHAIN_ROWS=1 COLI_VK_CHAIN_LAYERWISE_ROWS=4 SNAP=qwen38_tiny"
+  chain_gate qwen38 "chain qwen38 a prompt layer by layer in two segments" 1 $V38LW1 COLI_VK_CHAIN_LAYERWISE=1 -- 4 8 qwen38_tiny/ref.json
+  grep -q "prompts layer by layer" vk.log || { cat vk.log; fail "chain qwen38 a prompt layer by layer in two segments: it ran chunk by chunk"; }
+  cp vk.f32 lw.f32
+  chain_gate qwen38 "chain qwen38 the same prompt a row a chunk" 1 $V38LW1 COLI_VK_CHAIN_LAYERWISE=0 -- 4 8 qwen38_tiny/ref.json
+  cmp -s lw.f32 vk.f32 || fail "chain qwen38 a prompt layer by layer in two segments: other logits than chunk by chunk"
   $PY tools/make_qwen38_tiny.py --out qwen38_tiny_mtp --mtp
   $PY tools/make_edge_tiny_tokenizer.py --vocab-size 64 ./qwen38_tiny_mtp   # serve speaks text
   $PY tools/make_qwen38_tiny.py --out qwen38_tiny_fp8_mtp --fp8-experts --mtp
@@ -2355,12 +2391,21 @@ family_inkling_olmoe_chain() {
   chain_gate olmoe "chain olmoe trunk shared with the per-matrix path" 1 COLI_VK_DENSE=1 SNAP=olmoe_tiny_c -- 8 8 $OR
   chain_gate olmoe "chain olmoe a budget of three experts" 1 COLI_VK_TIER_GB=0.000025 SNAP=olmoe_tiny_c -- 8 8 $OR
   chain_gate olmoe "chain olmoe prefill in chunks of 3" 1 COLI_VK_CHAIN_ROWS=3 SNAP=olmoe_tiny_c -- 8 8 $OR
+  grep -q "the device's KV cache counts" vk.log || { cat vk.log; fail "chain olmoe: the device's KV does not count"; }
   chain_gate olmoe "chain olmoe tiled GEMM" 1 COLI_VK_GEMM_MIN_S=2 SNAP=olmoe_tiny_c -- 8 8 $OR
   chain_gate olmoe "chain olmoe the per-row GEMV" 1 COLI_VK_CHAIN_GEMV=0 SNAP=olmoe_tiny_c -- 8 8 $OR
+  chain_gate olmoe "chain olmoe float16 K/V (the mirror in float16)" 1 KV16=1 SNAP=olmoe_tiny_c -- 8 8 $OR
+  grep -q 'KV mirror in float16' vk.log || { cat vk.log; fail "chain olmoe float16 K/V: the mirror stayed float32"; }
   CHAINMODE=2 chain_gate olmoe "chain olmoe prompts only" 1 SNAP=olmoe_tiny_c -- 8 8 $OR
   dmoe_gate olmoe "chain olmoe the routed experts in the frame" all SNAP=olmoe_tiny_c -- 8 8 $OR
   dmoe_gate olmoe "chain olmoe the host's routing (COLI_VK_CHAIN_MOE=0)" none COLI_VK_CHAIN_MOE=0 SNAP=olmoe_tiny_c -- 8 8 $OR
   lost_late olmoe "chain olmoe device lost mid-decode" 7 redo SNAP=olmoe_tiny_c -- 8 8 $OR
+  # the device's KV counts (dev_kv): the rows only it held rebuilt on the CPU from the ids
+  grep -q "rebuilding the KV of positions 0\.\.[1-9]" vk.log || { cat vk.log; fail "chain olmoe device lost mid-decode: the device's rows were not rebuilt"; }
+  echo "OK chain olmoe device lost mid-decode: $(grep -o 'rebuilding the KV of positions [0-9.]*' vk.log)"
+  chain_gate olmoe "chain olmoe the host's KV canonical (COLI_VK_CHAIN_DEVKV=0)" 1 COLI_VK_CHAIN_DEVKV=0 SNAP=olmoe_tiny_c -- 8 8 $OR
+  if grep -q "the device's KV cache counts" vk.log; then cat vk.log; fail "chain olmoe COLI_VK_CHAIN_DEVKV=0: the device's KV still counts"; fi
+  lost_late olmoe "chain olmoe device lost mid-decode, the host's KV canonical" 7 redo COLI_VK_CHAIN_DEVKV=0 SNAP=olmoe_tiny_c -- 8 8 $OR
   DMOE=1 lost_late olmoe "chain olmoe device lost mid-decode, the routed experts in the frame" 3 redo SNAP=olmoe_tiny_c -- 8 8 $OR
   # a bf16 or f16 checkpoint's dense matrices go up as bf16 (fmt 11) or f16 (fmt 14): the
   # CPU's tokens in about half the device bytes of the f32 snapshot's, with the host
@@ -2386,6 +2431,7 @@ family_inkling_olmoe_chain() {
   $PY tests/vulkan_chain_serve.py ./olmoe olmoe_tiny_c
   $PY tests/vulkan_chain_serve.py ./olmoe olmoe_tiny_c PILOT=1 WIDE=2
   COLI_VK_CHAIN=2 $PY tests/vulkan_chain_serve.py ./olmoe olmoe_tiny_c
+  CHAIN_SERVE_KV16=1 CHAIN_SERVE_EXPECT='KV mirror in float16' $PY tests/vulkan_chain_serve.py ./olmoe olmoe_tiny_c
   # (these compare a warm session's logprobs with a cold one's to the last printed
   # digit: no history file and COLI_VK_TIER_BALANCE=0, so both sessions split their
   # experts between the device and the CPU alike. Use per-row attention on both:
@@ -2562,6 +2608,17 @@ family_glm_chain() {
   grep -q "tier colibri: the GGUF experts' blocks go to the device" vk.log && [ "$(tier_count colibri vk.log)" -gt 0 ] ||
     { cat vk.log; fail "chain colibri GGUF: the tier took no expert as the file has it"; }
   mla_gate colibri "chain colibri GGUF, DSA top-4" 1 "${gg[@]}" DSA_TOPK=4 -- 64 16 16
+  # Mistral-Large-4 (tools/make_mistral_large4_tiny.py): no query latent, NoPE and shared-KV layers,
+  # SSMax on the attention's and the indexer's queries, the indexer's LayerNorm on its input, YaRN
+  # over the learned factors; the selection active past 6 positions
+  $PY tools/make_mistral_large4_tiny.py --out ml4_tiny --emit-ref ml4_tiny/ref.json > /dev/null
+  $PY tools/gguf_import.py ml4_tiny/model.gguf ml4_tiny/coli > /dev/null
+  local ml=(SNAP=ml4_tiny/coli REF=ml4_tiny/ref.json)
+  mla_gate colibri "chain colibri Mistral-Large-4" 1 "${ml[@]}" -- 8 16 16
+  mla_gate colibri "chain colibri Mistral-Large-4, prefill" 1 "${ml[@]}" TF=1 -- 8 16 16
+  mla_gate colibri "chain colibri Mistral-Large-4, prefill in chunks of 5" 1 "${ml[@]}" TF=1 COLI_VK_CHAIN_ROWS=5 -- 8 16 16
+  mla_gate colibri "chain colibri Mistral-Large-4, KV16" 0 "${ml[@]}" KV16=1 -- 8 16 16   # tokens, as GLM's KV16 gates: 6.4e-4 and 8.2e-4 of the 6.6e-4 bound on two runs
+  mla_gate colibri "chain colibri Mistral-Large-4, DSA_FORCE" 1 "${ml[@]}" DSA_FORCE=1 -- 8 16 16
   mla_gate colibri "chain colibri MTP with DSA top-4" 1 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DSA_TOPK=4 -- 64 16 16
   mla_gate colibri "chain colibri MTP, 4-bit" 1 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json IDOT=0 DRAFT=2 -- 2 4 4
   # around the chain: the tier off, the per-matrix trunk and core, the GEMM and GEMV choices

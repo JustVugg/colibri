@@ -1,0 +1,87 @@
+{
+  "version": 1,
+  "hypothesis": "Prompt chunks of 2048 rows instead of 512 in qwen38's CUDA chain, which copy the host pool's experts over the bus once a chunk, read a prompt of about 4000 tokens faster, with the same text.",
+  "commit": "77530b49ddd2f4e6ad1b3bb52500491e0c8ed9bb",
+  "model": "unsloth/Qwen3.8-Flash-Next-GGUF UD-Q2_K_XL",
+  "command": "cd c && make -j qwen38 CUDA=1 CUDA_ARCH=native && env COLI_CUDA=1 COLI_VULKAN=0 COLI_TEMP=0 COLI_TIMERS=1 USAGE_SAVE=0 OMP_NUM_THREADS=29 OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close SNAP=<model> COLI_USAGE=<history.usage> N_NEW=64 ./qwen38 128 8 <prompt>",
+  "prompt_hash": "c8e8fd3f17270e0cac44ba18f75ad8ebe2ce00239e64f1543f676dbabdf2516f",
+  "hardware": {
+    "cpu": "AMD EPYC 7763 64-Core Processor (64 cores / 128 threads, 256 MiB L3; the container's quota 30.72 CPUs, OMP_NUM_THREADS=29) + NVIDIA RTX PRO 4000 Blackwell (24467 MiB, sm_120, PCIe 4 x16: 28.3 GB/s (28.2-28.4, the median of 5 measurements) to the card and 558 GB/s (557-560, the median of 5 measurements) on it)",
+    "ram": "503.5 GiB on the host, the container's memory limit 241.7 GiB",
+    "storage": "the instance's disk; every routed expert in the chain's host pool (49.80 GiB of page-locked RAM) in every run",
+    "os": "Ubuntu 24.04.1 LTS (container nvidia/cuda:12.8.1-devel-ubuntu24.04) on Linux 5.15.0-174-generic x86_64, Vast.ai, driver 595.58.03"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "unsloth/Qwen3.8-Flash-Next-GGUF UD-Q2_K_XL",
+      "case": "prose prompt of about 4000 tokens",
+      "history": "history.usage.gz",
+      "new_tokens": 64,
+      "prompt_tokens": 3763,
+      "engine_build": "origin/dev 77530b49 (512 rows a prompt chunk)",
+      "metric": "prompt tok/s"
+    },
+    "samples": {
+      "tok_s": [
+        213.3,
+        214.2,
+        213.3,
+        214.4
+      ],
+      "decode_tok_s": [
+        30.7,
+        30.55,
+        30.7,
+        30.26
+      ]
+    },
+    "median_tok_s": 213.75,
+    "quality": {
+      "method": "the generated text (64 tokens, greedy: COLI_TEMP=0) is the same in the warm-up and in all 8 runs of both versions (stdout sha256 d399cc79b3af89e8b547ce36c475bb657be266f07f4ffa2885ca7440c7e70579); the logits after the prompt compared in logits.txt; make -C c check and tests/test_qwen38_cuda_chain pass on macOS arm64; make -C c cuda-test CUDA=1 CUDA_ARCH=native passes on this machine",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen38-chain-prompt-rows-2026-10-26/long-4k.txt",
+      "sha256": "f53ad349e869e80e8dbb2b163619c01f69574d29b345c0266e85cb8a98ef1123"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "unsloth/Qwen3.8-Flash-Next-GGUF UD-Q2_K_XL",
+      "case": "prose prompt of about 4000 tokens",
+      "history": "history.usage.gz",
+      "new_tokens": 64,
+      "prompt_tokens": 3763,
+      "engine_build": "77530b49 + this change (2048 rows a prompt chunk)",
+      "metric": "prompt tok/s"
+    },
+    "samples": {
+      "tok_s": [
+        390.8,
+        389.1,
+        390.4,
+        389.1
+      ],
+      "decode_tok_s": [
+        30.12,
+        30.08,
+        30.27,
+        30.08
+      ]
+    },
+    "median_tok_s": 389.75,
+    "quality": {
+      "method": "the generated text (64 tokens, greedy: COLI_TEMP=0) is the same in the warm-up and in all 8 runs of both versions (stdout sha256 d399cc79b3af89e8b547ce36c475bb657be266f07f4ffa2885ca7440c7e70579); the logits after the prompt compared in logits.txt; make -C c check and tests/test_qwen38_cuda_chain pass on macOS arm64; make -C c cuda-test CUDA=1 CUDA_ARCH=native passes on this machine",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen38-chain-prompt-rows-2026-10-26/long-4k.txt",
+      "sha256": "f53ad349e869e80e8dbb2b163619c01f69574d29b345c0266e85cb8a98ef1123"
+    }
+  },
+  "outcome": "improvement"
+}

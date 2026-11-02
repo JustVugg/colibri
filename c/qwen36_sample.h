@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "argmax_first.h"
 
 /* temperature + top-p sampler. The probabilities and their sum are taken as
  * before, one pass over the vocabulary; the nucleus is then found without
@@ -40,7 +41,7 @@ static int serve_sample_sorted(const float *lo, int V, float temp, float top_p){
     free(rank); return pick;
 }
 static int serve_sample(const float *lo, int V, float temp, float top_p){
-    if(temp<=0.f){ int b=0; for(int i=1;i<V;i++) if(lo[i]>lo[b]) b=i; return b; }
+    if(temp<=0.f) return argmax_first(lo, V);
     if(!(top_p>0.f&&top_p<1.f)) return serve_sample_sorted(lo,V,temp,top_p);   /* every token is in the nucleus */
     float *prob=malloc((size_t)V*sizeof(float)), mx=lo[0];
     if(!prob){ fprintf(stderr,"OOM sampling\n"); exit(1); }

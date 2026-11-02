@@ -2,7 +2,8 @@
 // with x, one decoder per type, for the GEMVs that take a row over several lanes
 // (chain_gemv_bd.comp, a pipeline per type; chain_moe.comp, a GGUF's routed experts). The
 // types: 8 Q8_0, 10 Q2_K, 11 Q3_K, 12 Q4_K, 13 Q5_K, 14 Q6_K, 16 IQ2_XXS, 17 IQ2_XS,
-// 18 IQ3_XXS, 19 IQ1_S, 20 IQ4_NL, 21 IQ3_S, 22 IQ2_S, 23 IQ4_XS, 29 IQ1_M, 42 Q2_0 (bs_has).
+// 18 IQ3_XXS, 19 IQ1_S, 20 IQ4_NL, 21 IQ3_S, 22 IQ2_S, 23 IQ4_XS, 29 IQ1_M, 42 Q2_0, and the
+// 16-bit floats 1 F16 and 30 BF16 (a step is 64 bytes of the row, read 16 at a time) (bs_has).
 // IQ1_S and IQ1_M read their grid (2048 rows of 8, 16 KiB) from the table, not shared memory. Q4_K and Q5_K read 16-byte steps (their blocks, 144 and 176
 // bytes, keep a row's 16-byte alignment); the others words, two for one where a block of 34,
 // 210, 18, 110, 82 or 66 bytes leaves a field at an even byte (bs_ldu). A step q is weights
@@ -23,7 +24,7 @@
 #include "blockdec_table.h"
 
 bool bs_has(int t) { return t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 18 || t == 19 || t == 20 ||
-                            t == 21 || t == 22 || t == 23 || t == 29 || t == 42; }
+                            t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 1 || t == 30; }
 // type t's tables into shared memory (a workgroup of 256)
 void bs_tables_fill(int t, int tid) {
     if ((t == 20 || t == 23) && tid < 16) bs_kvt[tid] = float(int(BS_G(BDT_IQ4NL + uint(tid))));
@@ -79,6 +80,22 @@ uvec2 bs_k4sm(uvec4 hd, uint g) {
 // vec4 of them goes to BS_ACC(w, i) against the x elements 4i..4i+3, which the including
 // shader adds to as many rows of x as it keeps (a verify's rows share the decode).
 void bs_step(int t, uint rb, uint q) {
+    if (t == 1 || t == 30) {   // F16, BF16: the step is bytes 64q .. 64q + 63 of the row (16-byte aligned rows)
+        uint b4 = (rb >> 4) + 4u * q;
+        [[unroll]] for (uint k = 0u; k < 4u; k++) {
+            uvec4 v = BS_W4(b4 + k);
+            vec4 lo, hi;
+            if (t == 1) {
+                lo = vec4(unpackHalf2x16(v.x), unpackHalf2x16(v.y)); hi = vec4(unpackHalf2x16(v.z), unpackHalf2x16(v.w));
+            } else {
+                lo = uintBitsToFloat(uvec4(v.x << 16, v.x & 0xffff0000u, v.y << 16, v.y & 0xffff0000u));
+                hi = uintBitsToFloat(uvec4(v.z << 16, v.z & 0xffff0000u, v.w << 16, v.w & 0xffff0000u));
+            }
+            BS_ACC(lo, 8u * q + 2u * k);
+            BS_ACC(hi, 8u * q + 2u * k + 1u);
+        }
+        return;
+    }
     if (t == 12 || t == 13) {   // 8 steps a block: chunk c (64 weights), half h of its 32 bytes
         uint b = q >> 3, c = (q >> 1) & 3u, h = q & 1u;
         uint base = rb + b * (t == 12 ? 144u : 176u);

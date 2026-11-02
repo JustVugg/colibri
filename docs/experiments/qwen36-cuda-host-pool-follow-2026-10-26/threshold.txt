@@ -1,0 +1,168 @@
+# qwen36 CUDA tier, the host pool following the card's residents: where Q36CC_FOLLOW_ROWS comes from (2026-10-26)
+# An earlier version of this change followed before every prompt chunk of more than 32 rows (Q36CC_STAGE_ROWS)
+# once the residents had moved. The same day, on another Google Colab T4 high-RAM VM of the same shape,
+# bench.c --session ran origin/dev 77530b49 against it with the conversations of sessions.txt (the same
+# commands, a warm-up, then ABBA 4+4); then that version with the diagnostic line below (not part of this change)
+# ran each conversation once. Below: the patch, the two reports, the diagnostic's follow and turn lines. In the
+# reports below 'v1 pr' is that earlier version, not this change; only bench's reports are kept, not the CSVs of
+# their runs.
+# What they say, medians of the time to the first token (origin/dev -> that version):
+#   chat turn 3, 36 tokens read after a 489-token answer: 0.76 -> 0.90 s; the follow before it moved 317 + 317 experts
+#     in 193 ms, so the copies gave back about 53 ms;
+#   agent turn 8, 35 tokens after a 467-token answer: 0.93 -> 1.08 s, 239 + 239 moved in 147 ms: about nothing back (-3 ms);
+#   chat turn 5, 40 tokens: 0.79 -> 0.77 s, 39 + 39 moved in 24 ms: about 44 ms back;
+#   agent turn 7, 348 tokens: 2.60 -> 1.49 s, 50 + 50 moved in 32 ms: about 1.14 s back.
+# A follow costs about 0.30 ms an expert moved. Between 36 and 348 rows the copies give back about 3.5 ms a row more
+#   (gain(rows) = g36 + (g348 - g36) * (rows - 36) / 312, g36 = 53 ms, g348 = 1142 ms);
+#   with the most moves seen (317 + 317, 193 ms) the follow pays from about 76 rows (80 in the texts),
+#   and a chunk of 128 gives back about 374 ms, enough for 1229 experts moved.
+
+===== the diagnostic line, on that version (sha256 88c3070b291d5d6478b5a358d3a90e623b6b73a6cc52e1a8369bf87b4e0ea7c1)
+diff --git a/c/qwen36_cuda_chain.h b/c/qwen36_cuda_chain.h
+index ee07e8e0..6934ccb1 100644
+--- a/c/qwen36_cuda_chain.h
++++ b/c/qwen36_cuda_chain.h
+@@ -1361,6 +1361,7 @@ static int q36cc_dm_begin(Q36CChain *ch, Model *m, int n) {
+         double th = tm_now(); int hj, hl;
+         if (qt_chain_host_follow(&hj, &hl)) { ch->hp_follows++; ch->hp_joined += (unsigned)hj; ch->hp_left += (unsigned)hl; }
+         ch->hp_ms += tm_now() - th;
++        fprintf(stderr, "[t1] follow: %d joined, %d left, %.3f ms\n", hj, hl, tm_now() - th);
+         if (!q36cc_stage_table(ch, m)) {
+             if (cc_lost()) return 0;
+             fprintf(stderr, "[chain] qwen36: no VRAM to stage the host pool's experts in; a prompt chunk's go to the host's step\n");
+
+===== the agent conversation, bench's report (sha256 7059322be541e05fab9327ee008a65368a1809da1f55e0ab180977663a8fbd31)
+# bench: agente
+
+- bench 482e1711d589; engine qwen36; Linux (Intel(R) Xeon(R) CPU @ 2.00GHz, Tesla T4); 2026-10-26 09:01
+- model q36; session agente.sess
+- runs: a warm-up of v0 (does not count), then 4 per version, the order turning at every round (ABBA); before every run: wait until cool (at most 900 s), then 60 s of rest
+
+## v0 dev: 4 runs (median, min–max)
+
+| turn | prompt | reused | read | to first token s | first step ms | decode tok/s | answer | nll | top1 | greedy same | tool calls exact | stops | RSS GB | experts read |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 663 | 0 | 663 | 1.41 (1.38–1.42) | 65 (63–65) | 34.75 (34.01–35.50) | 57 | 1.7384 | 0.737 | 0/57 | 0/1 | yes | 19.43 | 0 |
+| 2 | 1954 | 720 | 1234 | 6.84 (6.73–6.96) | 29 (28–30) | 39.04 (38.34–39.78) | 32 | 0.0223 | 1.000 | 32/32 | 1/1 | no | 19.60 | 0 |
+| 3 | 4248 | 1986 | 2262 | 13.90 (13.61–14.06) | 26 (25–26) | 39.30 (38.75–40.17) | 87 | 1.1243 | 0.724 | 0/87 | 0/1 | yes | 19.71 | 0 |
+| 4 | 5741 | 4335 | 1406 | 8.38 (8.23–8.42) | 27 (26–27) | 38.71 (38.45–39.57) | 44 | 0.2254 | 0.932 | 0/44 | 0/1 | yes | 19.74 | 0 |
+| 5 | 7083 | 5785 | 1298 | 7.63 (7.54–7.66) | 30 (29–31) | 38.02 (37.73–38.61) | 54 | 1.0957 | 0.796 | 1/54 | 0/1 | yes | 19.80 | 0 |
+| 6 | 8041 | 7137 | 904 | 5.60 (5.59–5.64) | 26 (26–27) | 38.60 (38.13–39.27) | 24 | 0.2908 | 0.875 | 0/24 | 0/1 | yes | 19.86 | 0 |
+| 7 | 8413 | 8065 | 348 | 2.60 (2.59–2.62) | 30 (29–30) | 37.42 (37.17–38.02) | 467 | 0.8474 | 0.764 | 0/467 | 0/1 | yes | 19.90 | 0 |
+| 8 | 8915 | 8880 | 35 | 0.93 (0.93–0.94) | 24 (24–25) | 40.38 (40.13–41.07) | 186 | 0.8916 | 0.731 | 0/186 | 0/0 | yes | 19.92 | 0 |
+
+session: 8 turns; prompts read 8150 tokens, reused 36908; all turns 72.3 (71.2–72.9) s; to first token in all 47.3 (46.6–47.7) s; answers 951 tokens, nll 0.8784, top1 0.773; tool calls exact 1 of 7; turns that stop 7 of 8
+fingerprints equal in every run: NO, turns [2, 3, 4, 5, 6, 7, 8]
+
+## v1 pr: 4 runs (median, min–max)
+
+| turn | prompt | reused | read | to first token s | first step ms | decode tok/s | answer | nll | top1 | greedy same | tool calls exact | stops | RSS GB | experts read |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 663 | 0 | 663 | 1.40 (1.38–1.41) | 64 (64–66) | 34.42 (34.28–34.61) | 57 | 1.7384 | 0.737 | 0/57 | 0/1 | yes | 19.43 | 0 |
+| 2 | 1954 | 720 | 1234 | 1.93 (1.93–1.94) | 28 (28–29) | 39.13 (39.01–39.24) | 32 | 0.0230 | 1.000 | 32/32 | 1/1 | no | 19.59 | 0 |
+| 3 | 4248 | 1986 | 2262 | 4.22 (4.21–4.24) | 26 (26–26) | 39.41 (38.71–39.70) | 87 | 1.1193 | 0.713 | 0/87 | 0/1 | yes | 19.68 | 0 |
+| 4 | 5741 | 4335 | 1406 | 2.82 (2.81–2.84) | 26 (25–26) | 40.35 (39.80–40.53) | 44 | 0.2267 | 0.932 | 0/44 | 0/1 | yes | 19.75 | 0 |
+| 5 | 7083 | 5785 | 1298 | 3.08 (3.06–3.10) | 29 (29–31) | 40.90 (40.39–41.09) | 54 | 1.0846 | 0.796 | 1/54 | 0/1 | yes | 19.81 | 0 |
+| 6 | 8041 | 7137 | 904 | 2.57 (2.56–2.59) | 24 (24–24) | 41.43 (40.81–41.63) | 24 | 0.2863 | 0.875 | 0/24 | 0/1 | yes | 19.86 | 0 |
+| 7 | 8413 | 8065 | 348 | 1.49 (1.49–1.50) | 29 (29–30) | 38.51 (38.09–38.65) | 467 | 0.8430 | 0.762 | 0/467 | 0/1 | yes | 19.91 | 0 |
+| 8 | 8915 | 8880 | 35 | 1.08 (1.08–1.09) | 23 (23–24) | 41.26 (41.02–41.85) | 186 | 0.8847 | 0.720 | 0/186 | 0/0 | yes | 19.93 | 0 |
+
+session: 8 turns; prompts read 8150 tokens, reused 36908; all turns 42.9 (42.8–43.2) s; to first token in all 18.6 (18.6–18.7) s; answers 951 tokens, nll 0.8736, top1 0.768; tool calls exact 1 of 7; turns that stop 7 of 8
+fingerprints equal in every run: NO, turns [2, 3, 4, 5, 6, 7, 8]
+
+## v1 pr against v0 dev (medians; positive = faster)
+
+same prompts and teacher-forced answers: yes
+
+| turn | to first token | first step | decode | nll | experts read |
+|---|---|---|---|---|---|
+| 1 | +0.7%, ranges overlap | +0.3%, ranges overlap | -0.9%, ranges overlap | +0.0000 | 0 → 0 |
+| 2 | +253.9%, every run faster | +1.6%, ranges overlap | +0.2%, ranges overlap | +0.0007 | 0 → 0 |
+| 3 | +229.1%, every run faster | -1.3%, ranges overlap | +0.3%, ranges overlap | -0.0050 | 0 → 0 |
+| 4 | +197.1%, every run faster | +2.7%, ranges overlap | +4.2%, every run faster | +0.0013 | 0 → 0 |
+| 5 | +147.7%, every run faster | +3.3%, ranges overlap | +7.6%, every run faster | -0.0111 | 0 → 0 |
+| 6 | +117.7%, every run faster | +8.4%, every run faster | +7.3%, every run faster | -0.0045 | 0 → 0 |
+| 7 | +74.2%, every run faster | +2.4%, ranges overlap | +2.9%, every run faster | -0.0044 | 0 → 0 |
+| 8 | -13.6%, every run slower | +2.4%, every run faster | +2.2%, ranges overlap | -0.0069 | 0 → 0 |
+
+all turns: +68.3%, every run faster; to first token in all: +154.2%, every run faster
+runs not cool: none
+pages written to swap during the measurement: 0, 0 of them in the runs that count
+
+===== the chat, bench's report (sha256 b1323a546370f4482f7d4222045be959a65a3478f2b3403cf5e88bddebe0b50a)
+# bench: chat
+
+- bench 482e1711d589; engine qwen36; Linux (Intel(R) Xeon(R) CPU @ 2.00GHz, Tesla T4); 2026-10-26 09:27
+- model q36; session chat.sess
+- runs: a warm-up of v0 (does not count), then 4 per version, the order turning at every round (ABBA); before every run: wait until cool (at most 900 s), then 60 s of rest
+
+## v0 dev: 4 runs (median, min–max)
+
+| turn | prompt | reused | read | to first token s | first step ms | decode tok/s | answer | nll | top1 | greedy same | tool calls exact | stops | RSS GB | experts read |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 38 | 0 | 38 | 0.85 (0.84–0.86) | 63 (63–70) | 42.05 (41.80–42.39) | 256 | 1.3825 | 0.672 | 0/256 | 0/0 | yes | 19.37 | 0 |
+| 2 | 321 | 294 | 27 | 0.48 (0.48–0.49) | 26 (25–26) | 42.47 (42.41–42.70) | 489 | 1.3896 | 0.628 | 2/489 | 0/0 | no | 19.40 | 0 |
+| 3 | 846 | 810 | 36 | 0.76 (0.76–0.76) | 24 (24–24) | 43.00 (42.80–43.07) | 243 | 1.2743 | 0.626 | 0/243 | 0/0 | yes | 19.42 | 0 |
+| 4 | 1120 | 1089 | 31 | 0.53 (0.53–0.54) | 22 (21–22) | 45.55 (45.28–45.81) | 315 | 1.1237 | 0.679 | 0/315 | 0/0 | no | 19.43 | 0 |
+| 5 | 1475 | 1435 | 40 | 0.79 (0.79–0.79) | 23 (23–24) | 46.09 (45.86–46.25) | 155 | 1.0903 | 0.671 | 7/155 | 0/0 | no | 19.45 | 0 |
+
+session: 5 turns; prompts read 172 tokens, reused 3628; all turns 37.0 (36.9–37.1) s; to first token in all 3.4 (3.4–3.4) s; answers 1458 tokens, nll 1.2799, top1 0.651; tool calls exact 0 of 0; turns that stop 2 of 5
+fingerprints equal in every run: yes
+
+## v1 pr: 4 runs (median, min–max)
+
+| turn | prompt | reused | read | to first token s | first step ms | decode tok/s | answer | nll | top1 | greedy same | tool calls exact | stops | RSS GB | experts read |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 38 | 0 | 38 | 0.84 (0.83–0.86) | 64 (62–64) | 42.03 (41.82–42.09) | 256 | 1.3825 | 0.672 | 0/256 | 0/0 | yes | 19.37 | 0 |
+| 2 | 321 | 294 | 27 | 0.49 (0.48–0.50) | 26 (26–26) | 42.58 (42.45–42.75) | 489 | 1.3896 | 0.628 | 2/489 | 0/0 | no | 19.40 | 0 |
+| 3 | 846 | 810 | 36 | 0.90 (0.90–0.90) | 24 (24–25) | 42.98 (42.91–43.07) | 243 | 1.2736 | 0.626 | 0/243 | 0/0 | yes | 19.42 | 0 |
+| 4 | 1120 | 1089 | 31 | 0.53 (0.53–0.54) | 22 (21–22) | 45.69 (45.63–45.76) | 315 | 1.1235 | 0.679 | 0/315 | 0/0 | no | 19.44 | 0 |
+| 5 | 1475 | 1435 | 40 | 0.77 (0.76–0.77) | 23 (23–23) | 46.05 (45.92–46.25) | 155 | 1.0907 | 0.677 | 7/155 | 0/0 | no | 19.45 | 0 |
+
+session: 5 turns; prompts read 172 tokens, reused 3628; all turns 37.1 (37.0–37.1) s; to first token in all 3.5 (3.5–3.6) s; answers 1458 tokens, nll 1.2798, top1 0.652; tool calls exact 0 of 0; turns that stop 2 of 5
+fingerprints equal in every run: yes
+
+## v1 pr against v0 dev (medians; positive = faster)
+
+same prompts and teacher-forced answers: yes
+
+| turn | to first token | first step | decode | nll | experts read |
+|---|---|---|---|---|---|
+| 1 | +1.2%, ranges overlap | -0.4%, ranges overlap | -0.0%, ranges overlap | +0.0000 | 0 → 0 |
+| 2 | -1.9%, ranges overlap | -1.3%, ranges overlap | +0.3%, ranges overlap | +0.0000 | 0 → 0 |
+| 3 | -15.9%, every run slower | -0.6%, ranges overlap | -0.1%, ranges overlap | -0.0007 | 0 → 0 |
+| 4 | -0.3%, ranges overlap | +0.0%, ranges overlap | +0.3%, ranges overlap | -0.0002 | 0 → 0 |
+| 5 | +3.5%, every run faster | -0.2%, ranges overlap | -0.1%, ranges overlap | +0.0004 | 0 → 0 |
+
+all turns: -0.3%, ranges overlap; to first token in all: -3.2%, every run slower
+runs not cool: none
+pages written to swap during the measurement: 0, 0 of them in the runs that count
+
+===== the diagnostic run, agent: its follow and turn lines (agente.err, sha256 d6b25df4350b9bf7b54cf47d25a1457775c9d9e8696623b9d734116a65ac4e2f)
+[t1] follow: 0 joined, 0 left, 0.080 ms
+[bench] turn 1: prompt 663 tokens (0 reused, 663 read in 1.39 s), answer 57 tokens: first step 65 ms, then 35.15 tok/s; nll 1.7384, top1 0.737, greedy prefix 0 of 57, tool calls exact 0 of 1, stop yes; kv_len 720, peak RSS 19.43 GB
+[t1] follow: 232 joined, 228 left, 139.875 ms
+[bench] turn 2: prompt 1954 tokens (720 reused, 1234 read in 1.87 s), answer 32 tokens: first step 28 ms, then 39.66 tok/s; nll 0.0230, top1 1.000, greedy prefix 32 of 32, tool calls exact 1 of 1, stop no; kv_len 1986, peak RSS 19.59 GB
+[t1] follow: 165 joined, 169 left, 104.303 ms
+[t1] follow: 25 joined, 0 left, 10.625 ms
+[bench] turn 3: prompt 4248 tokens (1986 reused, 2262 read in 4.09 s), answer 87 tokens: first step 25 ms, then 40.48 tok/s; nll 1.1247, top1 0.724, greedy prefix 0 of 87, tool calls exact 0 of 1, stop yes; kv_len 4335, peak RSS 19.68 GB
+[t1] follow: 5 joined, 30 left, 9.639 ms
+[bench] turn 4: prompt 5741 tokens (4335 reused, 1406 read in 2.68 s), answer 44 tokens: first step 25 ms, then 41.20 tok/s; nll 0.2272, top1 0.932, greedy prefix 0 of 44, tool calls exact 0 of 1, stop yes; kv_len 5785, peak RSS 19.75 GB
+[t1] follow: 51 joined, 51 left, 32.648 ms
+[bench] turn 5: prompt 7083 tokens (5785 reused, 1298 read in 3.00 s), answer 54 tokens: first step 29 ms, then 41.74 tok/s; nll 1.0886, top1 0.796, greedy prefix 1 of 54, tool calls exact 0 of 1, stop yes; kv_len 7137, peak RSS 19.81 GB
+[t1] follow: 52 joined, 52 left, 34.864 ms
+[bench] turn 6: prompt 8041 tokens (7137 reused, 904 read in 2.51 s), answer 24 tokens: first step 24 ms, then 42.38 tok/s; nll 0.2892, top1 0.875, greedy prefix 0 of 24, tool calls exact 0 of 1, stop yes; kv_len 8065, peak RSS 19.86 GB
+[t1] follow: 50 joined, 50 left, 31.696 ms
+[bench] turn 7: prompt 8413 tokens (8065 reused, 348 read in 1.46 s), answer 467 tokens: first step 29 ms, then 39.41 tok/s; nll 0.8423, top1 0.762, greedy prefix 0 of 467, tool calls exact 0 of 1, stop yes; kv_len 8880, peak RSS 19.91 GB
+[t1] follow: 239 joined, 239 left, 146.981 ms
+[bench] turn 8: prompt 8915 tokens (8880 reused, 35 read in 1.07 s), answer 186 tokens: first step 23 ms, then 42.44 tok/s; nll 0.8877, top1 0.726, greedy prefix 0 of 186, tool calls exact 0 of 0, stop yes; kv_len 9101, peak RSS 19.93 GB
+
+===== the diagnostic run, chat: its follow and turn lines (chat.err, sha256 60cef91da201316e228e43df34848286288df87d3c42c8d0382e853d12e2e468)
+[t1] follow: 0 joined, 0 left, 0.091 ms
+[bench] turn 1: prompt 38 tokens (0 reused, 38 read in 0.86 s), answer 256 tokens: first step 65 ms, then 41.90 tok/s; nll 1.3825, top1 0.672, greedy prefix 0 of 256, tool calls exact 0 of 0, stop yes; kv_len 294, peak RSS 19.37 GB
+[bench] turn 2: prompt 321 tokens (294 reused, 27 read in 0.51 s), answer 489 tokens: first step 28 ms, then 42.28 tok/s; nll 1.3896, top1 0.628, greedy prefix 2 of 489, tool calls exact 0 of 0, stop no; kv_len 810, peak RSS 19.40 GB
+[t1] follow: 317 joined, 317 left, 192.935 ms
+[bench] turn 3: prompt 846 tokens (810 reused, 36 read in 0.91 s), answer 243 tokens: first step 24 ms, then 42.41 tok/s; nll 1.2736, top1 0.626, greedy prefix 0 of 243, tool calls exact 0 of 0, stop yes; kv_len 1089, peak RSS 19.42 GB
+[bench] turn 4: prompt 1120 tokens (1089 reused, 31 read in 0.54 s), answer 315 tokens: first step 22 ms, then 45.48 tok/s; nll 1.1235, top1 0.679, greedy prefix 0 of 315, tool calls exact 0 of 0, stop no; kv_len 1435, peak RSS 19.44 GB
+[t1] follow: 39 joined, 39 left, 24.145 ms
+[bench] turn 5: prompt 1475 tokens (1435 reused, 40 read in 0.77 s), answer 155 tokens: first step 23 ms, then 45.89 tok/s; nll 1.0907, top1 0.677, greedy prefix 7 of 155, tool calls exact 0 of 0, stop no; kv_len 1630, peak RSS 19.45 GB

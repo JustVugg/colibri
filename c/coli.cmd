@@ -44,7 +44,10 @@ if "%~1"=="" (
     echo     coli.cmd doctor --model D:\models\glm52_i4     check a model is usable
     echo     coli.cmd info                                  what this build supports
     echo.
-    echo The .exe files next to this script are the ENGINES. They are not meant
+    echo Once a model is set up, colibri-desktop.exe opens the chat in a window:
+    echo it starts the server by itself and stops it when you close the window.
+    echo.
+    echo The other .exe files next to this script are the ENGINES. They are not meant
     echo to be started directly: without a model they exit at once, which is why
     echo double-clicking one only flashes a window.
     echo.

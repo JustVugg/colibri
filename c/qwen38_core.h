@@ -15,6 +15,8 @@
 #ifndef COLI_QWEN38_CORE_H
 #define COLI_QWEN38_CORE_H
 #include "kv_prefix.h"
+#include "kv16.h"         /* Q38_KV=f16: K and V rounded to float16 (q38_kv16) */
+#include "prompt_break.h"   /* a served prompt that a STOP or CANCEL stops between two layers */
 #include "spec_draft.h"   /* prompt-lookup drafts and the gate that decides when drafting pays */
 #include "draft_vocab.h"  /* the tokens the MTP head scores for a draft (Q38_MTP_VOCAB) */
 #include "expert_ffn.h"   /* the int4-g64 routed experts (experts-int4g64/ sidecar) run through its f32 kernel */
@@ -3193,11 +3195,49 @@ static inline float q38_dot8(const float *a,const float *b,int n){
     for(;i<n;i++)r=fmaf(a[i],b[i],r);
     return r;
 }
+/* q38_dot8 of four rows of q (qstride apart) against one row b, each with q38_dot8's own
+ * operations in its order, so the same four values: one load of b serves the four, and the
+ * four accumulator chains run side by side instead of each waiting on its own FMA. */
+static inline void q38_dot8_x4(float *out,const float *q,int64_t qstride,const float *b,int n){
+#if defined(__AVX2__)&&defined(__FMA__)
+    __m256 a0=_mm256_setzero_ps(),a1=a0,a2=a0,a3=a0;int i=0;
+    const float *q0=q,*q1=q+qstride,*q2=q+2*qstride,*q3=q+3*qstride;
+    for(;i+8<=n;i+=8){
+        const __m256 bv=_mm256_loadu_ps(b+i);
+        a0=_mm256_fmadd_ps(_mm256_loadu_ps(q0+i),bv,a0);a1=_mm256_fmadd_ps(_mm256_loadu_ps(q1+i),bv,a1);
+        a2=_mm256_fmadd_ps(_mm256_loadu_ps(q2+i),bv,a2);a3=_mm256_fmadd_ps(_mm256_loadu_ps(q3+i),bv,a3);
+    }
+    const __m256 acc[4]={a0,a1,a2,a3};const float *qr[4]={q0,q1,q2,q3};
+    for(int g=0;g<4;g++){
+        float l[8];_mm256_storeu_ps(l,acc[g]);
+        float r=((l[0]+l[4])+(l[2]+l[6]))+((l[1]+l[5])+(l[3]+l[7]));
+        for(int k=i;k<n;k++)r=fmaf(qr[g][k],b[k],r);
+        out[g]=r;
+    }
+#else
+    for(int g=0;g<4;g++)out[g]=q38_dot8(q+g*qstride,b,n);
+#endif
+}
 
 typedef struct { float score; int block; } Q38Block;
 static int q38_block_desc(const void *aa,const void *bb){
     const Q38Block *a=(const Q38Block*)aa,*b=(const Q38Block*)bb;
     if(a->score>b->score)return -1;if(a->score<b->score)return 1;return a->block-b->block;
+}
+
+/* K and V rounded to float16 where they are made (kv16.h): the CPU's rows here, the CUDA and
+ * Vulkan chains' (CC_EW_F16, VKC_EW_F16), so every backend holds the same values; the host's
+ * caches keep them as floats and the CUDA chain's mirrors as halves (cc_attn_h: half the device
+ * memory a context takes, the rest for the experts). Q38_KV=f32 keeps float32, f16 rounds;
+ * unset, a served model rounds and an argv run (its .json references are float32) does not.
+ * The index keys stay float32: they choose the positions. */
+static int g_q38_kv16=-1;
+static inline int q38_kv16(void){
+    if(g_q38_kv16<0){
+        const char *e=getenv("Q38_KV"),*s=getenv("SERVE");
+        g_q38_kv16=e&&*e?strcmp(e,"f32")!=0:(s&&s[0]=='1');
+    }
+    return g_q38_kv16;
 }
 
 static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int pos_base,float *out) {
@@ -3219,9 +3259,11 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
         float *Kl=mr?mr[s].seq->K[layer]:m->K[layer],*Vl=mr?mr[s].seq->V[layer]:m->V[layer];
         float *IKl=mr?mr[s].seq->IK[layer]:m->IK[layer];
         for(int h=0;h<KVH;h++){
-            float *kh=kp+(int64_t)s*KVH*D+(int64_t)h*D;q38_rms0(kh,kh,l->kn,D,c->eps);q38_rope(kh,D,c->rotary_dim,pos,theta);
+            float *kh=kp+(int64_t)s*KVH*D+(int64_t)h*D,*vh=vp+(int64_t)s*KVH*D+(int64_t)h*D;
+            q38_rms0(kh,kh,l->kn,D,c->eps);q38_rope(kh,D,c->rotary_dim,pos,theta);
+            if(q38_kv16()){kv16_round(kh,D);kv16_round(vh,D);}
             memcpy(Kl+((int64_t)h*m->kv_cap+pos)*D,kh,(size_t)D*sizeof(float));
-            memcpy(Vl+((int64_t)h*m->kv_cap+pos)*D,vp+(int64_t)s*KVH*D+(int64_t)h*D,(size_t)D*sizeof(float));
+            memcpy(Vl+((int64_t)h*m->kv_cap+pos)*D,vh,(size_t)D*sizeof(float));
         }
         memcpy(IKl+(int64_t)pos*ID,ip+(int64_t)s*(IQ+1)*ID+(int64_t)IQ*ID,(size_t)ID*sizeof(float));
     }
@@ -3279,19 +3321,61 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
         }
     }
     double index_dt=now_s()-qsa_started;qsa_started=now_s();
-    #pragma omp parallel for schedule(dynamic,1)
-    for(int it=0;it<S*QH;it++){
-        const int s=it/QH,h=it%QH,pos=mr?mr[s].pos:pos_base+s,ns=nsel[s];
-        const float *Kl=mr?mr[s].seq->K[layer]:m->K[layer],*Vl=mr?mr[s].seq->V[layer]:m->V[layer];
-        const int *sel=selected+(int64_t)s*maxsel;
-        float *qraw=qp+(int64_t)s*QH*2*D+(int64_t)h*2*D;
-        float *qh=falloc(D);memcpy(qh,qraw,(size_t)D*sizeof(float));q38_rms0(qh,qh,l->qn,D,c->eps);q38_rope(qh,D,c->rotary_dim,pos,theta);
-        float *score=falloc(ns>0?ns:1);float mx=-INFINITY;
-        int khidx=h/(QH/KVH);for(int j=0;j<ns;j++){const float *kh=Kl+((int64_t)khidx*m->kv_cap+sel[j])*D;float a=q38_dot8(qh,kh,D);a/=sqrtf((float)D);score[j]=a;if(a>mx)mx=a;}
-        float den=0.f;for(int j=0;j<ns;j++){score[j]=expf(score[j]-mx);den+=score[j];}
-        float *oh=heads+(int64_t)s*QH*D+(int64_t)h*D;memset(oh,0,(size_t)D*sizeof(float));
-        for(int j=0;j<ns;j++){float a=score[j]/den;const float *vh=Vl+((int64_t)khidx*m->kv_cap+sel[j])*D;for(int d=0;d<D;d++)oh[d]+=a*vh[d];}
-        for(int d=0;d<D;d++)oh[d]*=q38_sigmoid(qraw[D+d]);free(qh);free(score);
+    /* C by (row, KV head): the query heads that share a KV head read its selected K and V rows
+     * once between them, not once each (Qwen3.8: 24 heads over 2 KV heads, so every row was
+     * read twelve times). Each head's operations, and their order, are the per-head loop's, so
+     * the bits are its. A task takes gq heads of a group: the whole group when the rows keep
+     * every thread busy, fewer in a decode step or a verify. */
+    const int G=QH/KVH;
+    int gq=G;
+    {
+        int threads=1;
+#ifdef _OPENMP
+        threads=omp_get_max_threads();
+#endif
+        while(gq>1&&(int64_t)S*KVH*(G/gq)<4*threads){int d=gq-1;while(d>1&&G%d)d--;gq=d;}
+    }
+    const int nsub=G/gq;
+    #pragma omp parallel
+    {
+        float *qh=falloc((int64_t)gq*D),*mx=falloc(2*gq),*den=mx+gq,*score=NULL;size_t score_cap=0;
+        #pragma omp for schedule(dynamic,1)
+        for(int it=0;it<S*KVH*nsub;it++){
+            const int s=it/(KVH*nsub),r=it%(KVH*nsub),kv=r/nsub,h0=kv*G+(r%nsub)*gq;
+            const int pos=mr?mr[s].pos:pos_base+s,ns=nsel[s];
+            const float *Kl=mr?mr[s].seq->K[layer]:m->K[layer],*Vl=mr?mr[s].seq->V[layer]:m->V[layer];
+            const int *sel=selected+(int64_t)s*maxsel;
+            size_t need=(size_t)gq*(ns>0?ns:1);
+            if(need>score_cap){free(score);score=falloc((int64_t)need);score_cap=need;}
+            for(int g=0;g<gq;g++){
+                const float *qraw=qp+(int64_t)s*QH*2*D+(int64_t)(h0+g)*2*D;float *q=qh+(int64_t)g*D;
+                memcpy(q,qraw,(size_t)D*sizeof(float));q38_rms0(q,q,l->qn,D,c->eps);q38_rope(q,D,c->rotary_dim,pos,theta);
+                mx[g]=-INFINITY;
+            }
+            for(int j=0;j<ns;j++){
+                const float *kh=Kl+((int64_t)kv*m->kv_cap+sel[j])*D;
+                int g=0;
+                for(;g+4<=gq;g+=4){
+                    float d4[4];q38_dot8_x4(d4,qh+(int64_t)g*D,D,kh,D);
+                    for(int e=0;e<4;e++){float a=d4[e];a/=sqrtf((float)D);score[(int64_t)(g+e)*ns+j]=a;if(a>mx[g+e])mx[g+e]=a;}
+                }
+                for(;g<gq;g++){float a=q38_dot8(qh+(int64_t)g*D,kh,D);a/=sqrtf((float)D);score[(int64_t)g*ns+j]=a;if(a>mx[g])mx[g]=a;}
+            }
+            for(int g=0;g<gq;g++){
+                float *sc=score+(int64_t)g*ns,dn=0.f;
+                for(int j=0;j<ns;j++){sc[j]=expf(sc[j]-mx[g]);dn+=sc[j];}
+                den[g]=dn;memset(heads+(int64_t)s*QH*D+(int64_t)(h0+g)*D,0,(size_t)D*sizeof(float));
+            }
+            for(int j=0;j<ns;j++){
+                const float *vh=Vl+((int64_t)kv*m->kv_cap+sel[j])*D;
+                for(int g=0;g<gq;g++){float a=score[(int64_t)g*ns+j]/den[g];float *oh=heads+(int64_t)s*QH*D+(int64_t)(h0+g)*D;for(int d=0;d<D;d++)oh[d]+=a*vh[d];}
+            }
+            for(int g=0;g<gq;g++){
+                const float *qraw=qp+(int64_t)s*QH*2*D+(int64_t)(h0+g)*2*D;float *oh=heads+(int64_t)s*QH*D+(int64_t)(h0+g)*D;
+                for(int d=0;d<D;d++)oh[d]*=q38_sigmoid(qraw[D+d]);
+            }
+        }
+        free(qh);free(mx);free(score);
     }
     double attn_dt=now_s()-qsa_started;
     free(nblk);free(nsel);free(qidx);free(selected);free(rank);
@@ -3833,9 +3917,9 @@ static void q38_trunk_place_all(Model *m) {
  * tier reads that itself); it needs every layer's experts in native FP8 with
  * the block-scale bank resident, because the GPU kernels consume exactly the
  * checkpoint layout (e4m3 bytes + [ceil(O/128), ceil(I/128)] scales). */
-/* The CUDA tier's warm start for a GGUF's experts: the history's most used first
- * (.coli_usage, qt_heat_order), each read as the file has it (the three matrices' rows)
- * in parallel and handed over (the tier copies them), until the budget is full. Before,
+/* The CUDA tier's warm start for a GGUF's experts: the history's most used (.coli_usage,
+ * qt_heat_order) until the budget is full, read by layer and expert as the file has them
+ * (the three matrices' rows) in parallel and handed over (the tier copies them). Before,
  * the tier started empty and filled as the CPU's experts passed, converting each. */
 static void q38_tier_warm(Model *m,int hist) {
     Cfg *c=&m->c; const int L=c->layers,E=c->experts,all=L*E;
@@ -3847,6 +3931,16 @@ static void q38_tier_warm(Model *m,int hist) {
     int *pl=(int*)malloc((size_t)all*sizeof(int)),*pe=(int*)malloc((size_t)all*sizeof(int));
     if(!pl||!pe){free(pl);free(pe);return;}
     int n=qt_plan_fill(pl,pe,all);
+    /* the plan read by layer, then expert: a layer's experts lie in that order in its three
+     * tensors, and in the history's order the reads jump across the file, each one on its own
+     * on a disk whose pages are not cached. The set is the plan's; the tier takes its arena's
+     * slots, which are all alike, in this order. */
+    uint8_t *in=(uint8_t*)calloc((size_t)all,1);
+    if(in){
+        for(int i=0;i<n;i++)in[pl[i]*E+pe[i]]=1;
+        for(int g=0,k=0;g<all;g++)if(in[g]){pl[k]=g/E;pe[k]=g%E;k++;}
+        free(in);
+    }
     double t0=now_s();
     #pragma omp parallel
     {
@@ -3864,7 +3958,7 @@ static void q38_tier_warm(Model *m,int hist) {
     }
     qt_fill_wait();
     fprintf(stderr,"[qtier] qwen38: warm start, %d of the GGUF's experts in VRAM, the history's most used first (%s) -- %.1f s\n",
-            n,hist?".coli_usage":"no history: in order",now_s()-t0);
+            n,hist?".coli_usage":"no history: expert by expert across the layers",now_s()-t0);
     free(pl);free(pe);
 }
 #ifdef COLI_CUDA
@@ -4321,7 +4415,25 @@ static void q38_rows(float *y,int ys,const Q38Weight *w,int I,int r0,int r1,
             return;
         }
 #endif
-        for(int o=r0;o<r1;o++)gq_row_all(y+o,ys,ga,(const uint8_t*)w->data+(int64_t)o*rb,w->gq_type,I);
+        int o=r0;
+#ifdef GQ_TILE16_BIAS
+        if(n>=GQ_TILE16_MIN_S&&gq_tile16_ok(w->gq_type,I)){   /* a prompt's rows: 16 file rows unpacked once (gq_tile16_pack) */
+            static __thread uint8_t *tile;static __thread int8_t *w8;static __thread float *sw;static __thread int cap;
+            if(cap<I){
+                free(tile);free(w8);free(sw);
+                tile=(uint8_t*)malloc(gq_tile16_bytes(I));w8=(int8_t*)malloc((size_t)I);sw=(float*)malloc((size_t)(I/16)*2*sizeof(float));
+                if(!tile||!w8||!sw){fprintf(stderr,"OOM prompt tile\n");exit(1);}
+                cap=I;
+            }
+            for(;o+16<=r1;o+=16){
+                gq_tile16_pack(tile,(const uint8_t*)w->data+(int64_t)o*rb,rb,w->gq_type,I,w8,sw,sw+I/16);
+                gq_tile16_rows(y+o,ys,tile,ga,I);
+            }
+        }
+#endif
+        if(gq_f8_ok(w->gq_type,I))   /* the file's rows by eight (ggml_quants.h gq_rows_f8) */
+            for(;o+8<=r1;o+=8)gq_rows_f8(y+o,ys,ga,(const uint8_t*)w->data+(int64_t)o*rb,rb,w->gq_type,I,8);
+        for(;o<r1;o++)gq_row_all(y+o,ys,ga,(const uint8_t*)w->data+(int64_t)o*rb,w->gq_type,I);
         return;
     }
     if(w->kind==Q38_WEIGHT_INT4G64){
@@ -5172,8 +5284,18 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
     }
 #endif
     if(!chain_logit){
-    for(int i=first;i<c->layers;i++)
+    for(int i=first;i<c->layers;i++){
+        /* stopped before layer i: kv_len and the kv_prefix record are left as they were,
+         * the K/V rows written so far are a stale tail, and the caller puts the recurrent
+         * state back */
+        if(coli_prompt_break()){   /* prompt_break.h: set by q38_serve_prefill only */
+            free(hyper);free(mixed);free(inject);free(block);
+            free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;
+            if(streams)*streams=NULL;
+            return NULL;
+        }
         q38_layer_forward(m,i,hyper,ids,S,pos_base,mixed,inject,block);
+    }
     q38_gr_read(m,&m->final_gr,hyper,S,mixed,NULL);
     }
     m->kv_len=pos_base+S;
@@ -5570,6 +5692,7 @@ static int q38_mtp_draft_more(Model *m,float *hidden,int tok,int row) {
 static float *step(Model *m,const int *ids,int S,int pos_base) {
     float *streams=NULL;
     float *logit=q38_forward(m,ids,S,pos_base,1,m->mtp?&streams:NULL);
+    if(!logit)return NULL;   /* g_q38_breaker stopped it */
     if(streams){q38_mtp_feed(m,ids,S,pos_base,streams);free(streams);}
     return logit;
 }

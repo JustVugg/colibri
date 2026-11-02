@@ -1,0 +1,59 @@
+# qwen36 CUDA chain, the head's logits written on the card then copied to the host: five edits that turn the unit test red (2026-10-27)
+# macOS arm64, Apple clang, tests/test_qwen36_cuda_chain.c on the fake CUDA backend (tests/qwen36_fake_cuda.h), as in the first commit
+# of this PR (c/qwen36_cuda_chain.h sha256 b0fb77261c87c510ee8801c7593a5f2fa39bfaab2f7f7ccbf7cfbc76bb656092). Each edit is applied alone to c/qwen36_cuda_chain.h; the test
+# binary is deleted, rebuilt (make tests/test_qwen36_cuda_chain, in c/) and run (./tests/test_qwen36_cuda_chain), and must fail; unedited it
+# must pass. (The binary is deleted first because Apple's make compares file times to the second and can call a binary built a
+# moment ago up to date.) Below: the lines taken out (-) and put in (+), the number of FAIL lines the run printed, and the first six.
+
+===== 1. the copy is taken out: outd stays what it was
+-                 cc_matmul(ch->t_lm, ch->fin, (size_t)dst * D, ch->out, (size_t)dst * c->vocab, lo_n) &&
+-                 cc_copy(ch->outd, (size_t)dst * c->vocab, ch->out, (size_t)dst * c->vocab, (size_t)lo_n * c->vocab);
++                 cc_matmul(ch->t_lm, ch->fin, (size_t)dst * D, ch->out, (size_t)dst * c->vocab, lo_n);
+29 FAIL
+  FAIL the prompt's logits equal the CPU path's (max diff 1.27e+01 of 1.27e+01, argmax 0/57)
+  FAIL decode token 4 (max diff 1.92e+01 of 1.92e+01, argmax 0/49)
+  FAIL decode token 5 (max diff 1.98e+01 of 1.98e+01, argmax 0/49)
+  FAIL decode token 6 (max diff 1.77e+01 of 1.77e+01, argmax 0/27)
+  FAIL after the reset the chain starts from zeros too (max diff 1.14e+01 of 1.14e+01, argmax 0/37)
+  FAIL the chain continues from the host's state, the KV rows the CPU wrote uploaded first (max diff 1.98e+01 of 1.98e+01, argmax 0/49)
+
+===== 2. the head writes into outd again, as before this change
+-                 cc_matmul(ch->t_lm, ch->fin, (size_t)dst * D, ch->out, (size_t)dst * c->vocab, lo_n) &&
+-                 cc_copy(ch->outd, (size_t)dst * c->vocab, ch->out, (size_t)dst * c->vocab, (size_t)lo_n * c->vocab);
++                 cc_matmul(ch->t_lm, ch->fin, (size_t)dst * D, ch->outd, (size_t)dst * c->vocab, lo_n);
+5 FAIL
+  FAIL prompt chunk: one route-ids download, no route-weights download, the logits
+  FAIL decode steps: one route-ids download across all layers, the logits
+  FAIL prompt chunk: the hybrid layer's three copies, then one ids copy, the logits
+  FAIL decode steps: the hybrid layer's three copies, then one ids copy, the logits
+  FAIL no matmul of those steps stored into host memory: the head's logits come down in a copy
+
+===== 3. out does not grow with the rows of a verify
+-                         !cc_reserve(&ch->out, (size_t)nlogits * c->vocab * sizeof(float), CC_DEV) ||
+2 FAIL
+  FAIL the device copied the state after rows 0 and 1
+  FAIL the chain took the three steps, none went to the CPU
+
+===== 4. the copy takes one row, whatever the chunk holds
+-                 cc_matmul(ch->t_lm, ch->fin, (size_t)dst * D, ch->out, (size_t)dst * c->vocab, lo_n) &&
+-                 cc_copy(ch->outd, (size_t)dst * c->vocab, ch->out, (size_t)dst * c->vocab, (size_t)lo_n * c->vocab);
++                 cc_matmul(ch->t_lm, ch->fin, (size_t)dst * D, ch->out, (size_t)dst * c->vocab, lo_n) &&
++                 cc_copy(ch->outd, (size_t)dst * c->vocab, ch->out, (size_t)dst * c->vocab, (size_t)c->vocab);
+4 FAIL
+  FAIL row 1 (max diff 1.61e+01 of 1.61e+01, argmax 0/27)
+  FAIL a verify's three rows through the chain
+  FAIL row 1 (max diff 1.21e+01 of 1.21e+01, argmax 0/33)
+  FAIL a verify's three rows, two chunks
+
+===== 5. the copy puts a chunk's rows where the first chunk's go
+-                 cc_matmul(ch->t_lm, ch->fin, (size_t)dst * D, ch->out, (size_t)dst * c->vocab, lo_n) &&
+-                 cc_copy(ch->outd, (size_t)dst * c->vocab, ch->out, (size_t)dst * c->vocab, (size_t)lo_n * c->vocab);
++                 cc_matmul(ch->t_lm, ch->fin, (size_t)dst * D, ch->out, (size_t)dst * c->vocab, lo_n) &&
++                 cc_copy(ch->outd, 0, ch->out, (size_t)dst * c->vocab, (size_t)lo_n * c->vocab);
+2 FAIL
+  FAIL row 0 of a verify split in two chunks (max diff 2.58e+01 of 2.03e+01, argmax 52/59)
+  FAIL a verify's three rows, two chunks
+
+===== 0. unedited
+0 FAIL
+OK test_qwen36_cuda_chain: the CUDA chain gives the CPU path's logits; host and device state agree; a lost device rebuilds

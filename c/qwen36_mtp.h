@@ -361,6 +361,7 @@ typedef struct {
     VkcBuf *prm, *emb, *hin, *cat, *x, *nrm, *q, *k, *v, *ctx, *tmp, *cs, *kc, *vc;
     VkcBuf *lg, *lgd, *gs, *us, *hs, *sd, *sg, *ge, *ue, *he, *ys, *wt, *rt, *fin, *hid, *outd;
     int dm, dfg, dfd; VkcBuf *dtab, *dix, *dhid;   /* the head's experts through the chain's device MoE (vkc_moe) */
+    VkcBuf *pk, *pv; int pn;   /* a parked conversation's first pn rows of kc and vc (q36_mg_park) */
     QW rq, sq;   /* the router and the shared expert's gate, f32 rows */
     size_t o_en, o_hn, o_in, o_post, o_qn, o_kn, o_head;
 } Q36MtpGpu;
@@ -429,6 +430,32 @@ static int q36_mg_bufs(Model *m, int R) {
            q36_mg_res(&g->k, r * KV * kvd, VKC_DEV) && q36_mg_res(&g->v, r * KV * kvd, VKC_DEV) &&
            q36_mg_res(&g->ctx, r * H * c->head_dim, VKC_DEV) && q36_mg_res(&g->tmp, r * D, VKC_DEV) &&
            q36_mg_res(&g->cs, r * (c->rotary_dim > 0 ? c->rotary_dim : 2), VKC_UP);
+}
+/* The first n rows of the head's device cache into a copy of their own (out), or back from
+ * it: the server's parked conversation (qwen36.c, q36_park); out < 0 drops it. 1 when the
+ * device holds no cache of the head; 0 when it refused, and then the copy is gone. */
+static int q36_mg_park(Model *m, int n, int out) {
+    Q36MtpGpu *g = &g_q36_mg; int KV = m->c.kv_heads, kvd = m->c.k_head_dim;
+    if (out < 0) { vkc_free(g->pk); vkc_free(g->pv); g->pk = g->pv = NULL; g->pn = 0; return 1; }   /* the copy dropped */
+    if (out) {
+        g->pn = 0;
+        if (!g->on || !g->kc || !g->vc) return 1;
+        if (n > g->cap) n = g->cap;
+        if (!q36_mg_res(&g->pk, (size_t)KV * n * kvd, VKC_DEV) || !q36_mg_res(&g->pv, (size_t)KV * n * kvd, VKC_DEV)) return 0;
+    } else {
+        if (!g->pn) return 1;
+        n = g->pn;
+    }
+    int ok = g->kc && g->vc && n <= g->cap && vkc_begin();
+    for (int h = 0; ok && h < KV; h++) {
+        size_t at = (size_t)h * g->cap * kvd, pa = (size_t)h * n * kvd, len = (size_t)n * kvd;
+        ok = out ? vkc_copy(g->pk, pa, g->kc, at, len) && vkc_copy(g->pv, pa, g->vc, at, len)
+                 : vkc_copy(g->kc, at, g->pk, pa, len) && vkc_copy(g->vc, at, g->pv, pa, len);
+    }
+    ok = ok && vkc_submit(1);
+    g->pn = out && ok ? n : 0;
+    if (!g->pn) { vkc_free(g->pk); vkc_free(g->pv); g->pk = g->pv = NULL; }
+    return ok;
 }
 static int q36_mg_norm(VkcBuf *x, size_t xo, int xrow, size_t wo, VkcBuf *y, size_t yo, int yrow, int rows, int D, float eps) {
     VkcNorm np = {rows, D, 1, (int)xo, xrow, D, (int)yo, yrow, D, (int)wo, 0, VKC_NORM_ADD1, eps, 1.f};

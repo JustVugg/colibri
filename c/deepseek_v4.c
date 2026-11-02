@@ -789,6 +789,10 @@ int coli_v4_layer_plan_index(ColiDeepSeekV4LayerPlan *plan,
             spec.convert = 3;   /* BF16 values a converter wrote as F16 (exact both ways in range) */
         } else if (t && spec.dtype == COLI_ST_F32 && t->dtype == COLI_ST_F16) {
             spec.convert = 4;
+        } else if (t && spec.dtype == COLI_ST_F32 && st_is_ggml(t->dtype)) {
+            /* an F32 tensor the GGUF quantized (the compressors' ape as Q8_0 in a REAP's Q2_K
+             * file, #2438): its blocks dequantized at load, an F32 tensor as before */
+            spec.convert = 5; spec.stored = t->dtype;
         }
         plan->tensors[kept++] = spec;
     }
@@ -808,6 +812,7 @@ static int v4_spec_stored_dtype(const ColiDeepSeekV4TensorSpec *spec) {
         case 1: return COLI_ST_F32;
         case 2: return 7;
         case 3: case 4: return COLI_ST_F16;
+        case 5: return spec->stored;
         default: return spec->dtype;
     }
 }
@@ -817,7 +822,7 @@ static uint64_t v4_spec_resident_bytes(const ColiDeepSeekV4TensorSpec *spec,
     if (tensor->dtype == COLI_ST_F8_E8M0) return (uint64_t)tensor->numel * sizeof(float);
     if (spec->convert == 1 || spec->convert == 3) return (uint64_t)tensor->numel * 2;
     if (spec->convert == 2) return (uint64_t)tensor->numel * 8;
-    if (spec->convert == 4) return (uint64_t)tensor->numel * 4;
+    if (spec->convert == 4 || spec->convert == 5) return (uint64_t)tensor->numel * 4;
     return (uint64_t)tensor->nbytes;
 }
 
@@ -1003,10 +1008,13 @@ int coli_v4_layer_load(ColiV4Engine *engine,
             return set_error(error, error_size, "out of memory loading: %s", spec->name);
         }
         int read_failed;
-        if (spec->convert) {   /* GGUF: F32 / F16 back to the BF16 they were, I32 to I64, F16 to F32 */
+        if (spec->convert) {   /* GGUF: F32 / F16 back to the BF16 they were, I32 to I64, F16 or blocks to F32 */
             void *stored = malloc((size_t)tensor->nbytes);
             read_failed = !stored || coli_st_read_tensor(index, tensor, stored) != 0;
-            for (int64_t k = 0; !read_failed && k < tensor->numel; k++) {
+            if (!read_failed && spec->convert == 5)
+                read_failed = gq_dequant_row(st_ggml_type(spec->stored), (const uint8_t *)stored,
+                                             (float *)weights->data[i], tensor->numel) != 0;
+            for (int64_t k = 0; !read_failed && spec->convert != 5 && k < tensor->numel; k++) {
                 if (spec->convert == 2) { ((int64_t *)weights->data[i])[k] = ((const int32_t *)stored)[k]; continue; }
                 float value = spec->convert == 1 ? ((const float *)stored)[k]
                                                  : f16_to_f32(((const uint16_t *)stored)[k]);
@@ -1335,15 +1343,9 @@ uint64_t coli_v4_os_available_memory(void) {
                (uint64_t)page;
     return 0;
 #else
-    FILE *stream = fopen("/proc/meminfo", "r");
-    if (stream) {
-        char line[256];
-        unsigned long long kib = 0;
-        while (fgets(line, sizeof(line), stream))
-            if (sscanf(line, "MemAvailable: %llu kB", &kib) == 1) break;
-        fclose(stream);
-        if (kib) return (uint64_t)kib * 1024;
-    }
+    /* MemAvailable bounded by a container's cgroup (compat_mem_available_gb) */
+    double gb = compat_mem_available_gb();
+    if (gb > 0.0) return (uint64_t)(gb * 1e9);
     long pages = sysconf(_SC_AVPHYS_PAGES), page_size = sysconf(_SC_PAGESIZE);
     if (pages <= 0 || page_size <= 0) return 0;
     return (uint64_t)pages * (uint64_t)page_size;
@@ -16765,6 +16767,48 @@ static void v4_ckpt_store(ColiV4Session *session, int len, int kind) {
     }
 }
 
+/* A short request between two turns of the session's conversation (park.h's conditions):
+ * every layer's whole attention state, the snapshots a speculative verify already
+ * round-trips (the window, the compressed rows, the compressor, the indexer), with the
+ * conversation's ids; back when the session's next prompt arrives. One conversation at a
+ * time (KV_SLOTS=1); COLI_PARK=0 never parks. */
+static struct { ColiV4Session *session; ColiV4AttentionSnapshot **snap; int layers, len; int *ids; } g_v4_park;
+static void v4_park(ColiV4Session *session, int prompt_count, int max_new) {
+    ColiPark none = {0};
+    int layers = session->config.num_hidden_layers;
+    if (g_v4_mux_slots != 1 || g_v4_park.snap ||
+        !coli_park_rows_for(&none, &session->fed, session->fed.len, prompt_count, max_new, 16)) return;
+    int *ids = malloc((size_t)session->fed.len * sizeof(int));
+    ColiV4AttentionSnapshot **snap = ids ? spec_attention_save(session->attention, layers) : NULL;
+    if (!snap) { free(ids); return; }
+    memcpy(ids, session->fed.fed, (size_t)session->fed.len * sizeof(int));
+    g_v4_park.session = session; g_v4_park.snap = snap; g_v4_park.layers = layers;
+    g_v4_park.len = session->fed.len; g_v4_park.ids = ids;
+    if (getenv("COLI_PREFIX_LOG"))
+        fprintf(stderr, "[PREFIX] the %d-token conversation parked for a %d-token request\n", g_v4_park.len, prompt_count);
+}
+static void v4_unpark(ColiV4Session *session) {
+    if (!g_v4_park.snap || g_v4_park.session != session) return;
+    if (!spec_attention_restore(session->attention, g_v4_park.snap, g_v4_park.layers)) {
+#ifdef COLI_VULKAN
+        v4c_reset();   /* the host's state is the conversation's again: the chain's copies go */
+#endif
+        kv_prefix_clear(&session->fed);
+        kv_prefix_record(&session->fed, g_v4_park.ids, 0, g_v4_park.len);
+        if (getenv("COLI_PREFIX_LOG")) fprintf(stderr, "[PREFIX] the %d-token conversation is back\n", g_v4_park.len);
+    } else {
+        /* a layer refused its snapshot: the state is part one, part the other's, so none of it */
+        for (int layer = 0; layer < g_v4_park.layers; layer++) coli_v4_window_attention_reset(session->attention[layer]);
+#ifdef COLI_VULKAN
+        v4c_reset();
+#endif
+        kv_prefix_clear(&session->fed);
+    }
+    spec_attention_free(g_v4_park.snap, g_v4_park.layers);
+    free(g_v4_park.ids);
+    memset(&g_v4_park, 0, sizeof g_v4_park);
+}
+
 static int session_generate_impl(ColiV4Session *session,
                                  const char *prompt, size_t prompt_length,
                                  const ColiV4SessionGenerateOptions *options,
@@ -16833,6 +16877,7 @@ static int session_generate_impl(ColiV4Session *session,
      * tail is prefilled at start=reuse, so the logits are the ones a cold run
      * would have produced.
      * ------------------------------------------------------------------- */
+    v4_unpark(session);   /* a conversation the last request parked: back first */
     int reuse = kv_prefix_reuse(&session->fed, session->prompt_ids, prompt_count);
     int ckpt_at = 0;
     if (!reuse) {
@@ -16849,6 +16894,7 @@ static int session_generate_impl(ColiV4Session *session,
         }
     }
     if (!reuse) {
+        v4_park(session, prompt_count, max_new);   /* a short request keeps the conversation (v4_unpark) */
 #ifdef COLI_V4_GPU_TIER
         coli_v4_gpu_kv_cache_invalidate_all();
 #endif

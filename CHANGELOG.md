@@ -5,25 +5,222 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-### Added
+### New
 
-- `COLI_VK_CHAIN_GEMM_ROWS`: DeepSeek V4's chain prompt rows may take the
-  backend's tiled GEMM instead of the per-row GEMV (`-1` follows the backend's
-  rule, `N` from N rows; a verify's rows and decode keep the GEMV's bits). On
-  an RX 6900 XT a 2,515-token prompt's first token goes from 189.6 s to
-  152.1 s median (prefill 13.3 to 16.5 tok/s; experiment record in
-  `docs/experiments/gemm-rows-2026-10-20/`); the default stays `0`, keeping a
-  row's bits independent of the chunking.
-- SSSE3 integer-dot tier in `c/idot.h`: `maddubs`/`madd` kernels for
-  `dense_act_i8`, `dot_i8i8`, `dot_i4i8`, `dot_i4p_u` and `i4p_gidot_rows`
-  give pre-AVX2 x86-64 CPUs (SSSE3, no AVX2/FMA) an accelerated path where
-  they previously fell through to the scalar reference. Exact int32 sums,
-  so every ISA path stays bit-identical to the scalar reference.
-- `residency_sim.py --engine olmoe`: the offline residency simulator replays
-  OLMoE `ROUTE_TRACE` files with OLMoE's own cache traversal (one expert per
-  fetch, immediate admission into the per-layer LRU, 128-row prompt blocks in
-  ascending expert id), so expert-placement policies can be compared on a model
-  that runs on a CPU-only machine.
+- **The terminal UI, `coli tui`** (`c/tui.c`, `make colibri-tui`): the chat in a terminal, one
+  C file with no libraries, a client of `coli serve`. The conversations, the answer streamed
+  with its reasoning folded, the monitor (Overview and Profiling, as on the chat page, plus the
+  GPU), the expert map, and the chat page's hummingbird with its moves, drawn as a sixel picture
+  where the terminal can. It attaches to a running server or starts one for `--model`; the
+  release archives carry it next to `coli` ([docs/tui.md](docs/tui.md)).
+- **The desktop window** (`desktop/`, Tauri): the chat page in a window of its own. It finds
+  `coli` and Python, uses the colibri server that runs or starts the configured one with
+  `coli start` and waits for its model, serves the page on a fixed local port, and on close
+  stops what it started. `--backend URL` points it at another server. The release archives
+  carry it next to `coli` (`colibri-desktop`, `colibri-desktop.exe`)
+  ([desktop/README.md](desktop/README.md)).
+- **`/health` reports the NVIDIA cards** (`system.gpus`: use, memory, temperature, power, from
+  `nvidia-smi` at most once a second), for the monitors.
+
+### Performance
+
+- **Qwen3.8's CUDA and Vulkan chains: a short prompt's host pool experts on the CPU.** A prompt chunk copied
+  every pooled expert of every layer over the bus, routed or not (18 GB for any prompt up to
+  2048 tokens on Qwen3.8-Flash-Next IQ2_XS with an RTX PRO 4000). A prompt of one chunk now has
+  the CPU compute its pooled slots, grouped by expert, while the card computes its own, where a
+  measure of the bus and of the CPU at startup says it is faster
+  (`COLI_CUDA_CHAIN_POOL_CPU_ROWS`, 0 off). 452 tokens 213-215 -> 480-491 tok/s, 1012 tokens
+  357-367 -> 500-518, 76 tokens 42.7 -> 206, 1912 tokens 418 -> 433-439; the decode the same (48.5
+  against 48.6 tok/s after the 1012-token prompt, the history held fixed). The Vulkan chain the same
+  way (`COLI_VK_CHAIN_POOL_CPU_ROWS`): 452 tokens 206-207 -> 471-477, 1012 tokens 308-310 -> 476-482.
+  An attention layer's index keys come down in one copy, not one a row (a staged 2612-token prompt
+  +3 %).
+- **The CUDA chains' selection attention, a kv head's query heads a block** (`COLI_CUDA_ATTN_GROUPED`):
+  a prompt chunk's QSA rows read their selected keys and values once for the 12 query heads that share
+  them on Qwen3.8, not once a head, with each head's sums in the same order (the same bits). A
+  1012-token prompt on Qwen3.8-Flash-Next IQ2_XS 522-528 -> 641-645 tok/s, 452 tokens 493-504 ->
+  532-538; the decode untouched.
+- **Qwen3.8's CUDA chain: the PLE projections as BF16 rows** (`COLI_CUDA_CHAIN_PLE_BF16`): the
+  key and value projections, BF16 in the GGUF, went up as f32 and a prompt chunk took them through
+  the three-part TF32 GEMM (140 ms of a 470-token prompt's 1,000). They go up as BF16 rows, half the
+  bytes: a prompt chunk's through the f16 tiles, a decode step's through a BF16 GEMV that reads 16
+  bytes a lane (every CUDA BF16 row's GEMV takes it). Qwen3.8-Flash-Next IQ2_XS on an RTX PRO 4000,
+  with the grouped attention: 452 tokens 538-540 -> 639-656 tok/s, 1012 tokens 638-648 -> 772-805,
+  the greedy answers to four prompts the same. The PLE rows go to the card once before the
+  projections: they were read from host memory over the bus again for every output row (a decode
+  step's key and value 424 and 408 us); decode 50.3-52.8 -> 52.5-54.5 tok/s.
+
+### Fixed
+
+- The chat page's first-run dialog waits for the models service to finish measuring the
+  machine; on a fresh state it showed "- GB di RAM" and no model that fits.
+
+### Docs
+
+- Qwen3.8-Flash-Next's long-context table measured again on 2.1.0: 65,536 tokens 208 / 52.2
+  tok/s, 131,072 190 / 51.9, 262,144 151 / 42.9 (prompt / decode).
+
+## [2.1.0] - 2026-10-31
+
+387 pull requests since v2.0.0, 208 of them from 35 contributors. GGUF files run
+natively on every engine, on the CPU, on Vulkan and on CUDA. CUDA gets device
+chains of its own and a routed-expert tier for every engine. New models:
+Mistral-Large-4 (text and pictures), LFM3-VL, Flint and Muse Spark Open, the
+published GGUFs of DeepSeek V4.1 Flash and Kimi K3. Qwen3.8 Flash Next runs a
+256k context at the speed of 64k. A new chat UI (`coli ui`). An agent's short
+requests between two turns no longer make the conversation read again, on every
+engine.
+
+### New models
+
+- **#2493**, **#2500**, **#2503**: Mistral-Large-4, the text model from every
+  published GGUF and from the FP8 release, on the CPU, the Vulkan chain and CUDA,
+  and its pictures (the Pixtral tower, from the GGUF's mmproj or our containers).
+- **#2489**, **#2491**: LFM3-VL's text model (from its GGUFs or the converted
+  checkpoint) and its pictures.
+- **#2292**, **#2297**, **#2310**, **#2316**: Flint, its safetensors and every
+  unsloth GGUF, on the CPU, Vulkan and CUDA; its sliding layers keep their K/V in
+  a ring.
+- **#2293**, **#2324**: Muse Spark Open from the unsloth GGUFs, CPU, Vulkan and
+  CUDA.
+- **#2143**, **#2269**: DeepSeek-V4.1-Flash-1017 as it is, and the published
+  DeepSeek V4.1 GGUFs with their DSpark head.
+- **#2274**: the published Kimi K3 GGUFs, on the CPU, the Vulkan chain and the
+  tier.
+- **#2102**: Qwen-Image gets a single-frame CPU VAE encoder.
+
+### GGUF on every engine
+
+- **#2130**: GGUF models read natively, the CPU kernels interleaved by 16 rows.
+- **#2140**, **#2141**: DeepSeek V4, Inkling, GLM-5.3 Flash, GLM-5.2, MiMo,
+  DeepSeek V4.1 and OLMoE read GGUFs too.
+- **#2182**, **#2185**, **#2195**, **#2228**, **#2237**, **#2238**: a GGUF's
+  dense matrices and routed experts on the Vulkan chain, its prompt on the
+  device's tiled and grouped GEMMs and on the matrix units; IQ1, IQ2, IQ3 and
+  K-quant block decoders.
+- **#2252**, **#2254**, **#2255**, **#2491**: a GGUF's block formats on CUDA,
+  Qwen3.6's and Qwen3.8's CUDA chains on a GGUF, the prompt GEMM on f16
+  `mma.sync`.
+- **#2239**, **#2248**: on an NVIDIA card a GGUF runs on Vulkan where CUDA does
+  not cover its work (GLM-5.2, DeepSeek V4, Kimi K3, Inkling).
+- **#2503**, **#2515**: colibri.c's GGUF experts and dense matrices on CUDA, and
+  F16 and BF16 matrices on the GPU as block formats (Qwen3-0.6B F16 on CUDA:
+  prompt 137 to 15,921 tok/s).
+- **#2198**, **#2280**: IQ2_S and IQ3_S rows in one gather; expert reads without
+  readahead (Kimi K3 decode +30 %).
+
+### CUDA
+
+- **#1992**, **#2089**: every layer of Qwen3.6 and of Qwen3.8 as one chain on the
+  CUDA device (`COLI_CUDA_CHAIN`).
+- **#2209**, **#2231**, **#2232**, **#2233**: the routed experts in the chain's
+  frame, a prompt chunk's attention and GEMMs on the tensor cores, the experts
+  outside VRAM staged from the RAM cache.
+- **#2276**, **#2277**, **#2278**, **#2279**: a routed-expert tier on a CUDA
+  device for every engine (`cu_tier`), and the dense matrices on the card
+  (`cu_dense.h`) for DeepSeek V4, V4.1, Kimi K3, GLM-5.3 and MiMo.
+- **#2257**, **#2332**, **#2377**, **#2395**, **#2416**, **#2417**, **#2423**:
+  the card's residents follow the conversation, promoted from the host pool.
+- **#2335**: the Vulkan and CUDA chains serve several conversations at once, each
+  one's state on the device.
+- **#2459**, **#2461**: the decision engines (Laya, GLiNER2.5-Decide) and OLMoE,
+  every layer with its experts, on a CUDA card.
+- **#2462**, **#2497**, **#2385**, **#2392**, **#2408**, **#2418**, **#2421**,
+  **#2453**: programmatic dependent launch, add and norm in one pass, the MTP
+  head's draft on the device, one-pass prompt attention on sm_75.
+
+### Vulkan
+
+- **#2093**, **#2206**, **#2430**, **#2432**, **#2490**: a layer's routing and
+  routed experts in the dense chain's frame; the host pool's experts on the CPU
+  beside the device's, measured against the device's reads and kept where they
+  win, inside the frame on events.
+- **#2184**, **#2258**, **#2318**: a host pool in system RAM the device reads, its
+  experts moving up to the device as a conversation routes them.
+- **#2225**, **#2435**, **#2437**, **#2499**, **#2253**: a prompt's GEMMs,
+  experts and attention on the matrix units at subgroups of 32, flash attention
+  with windows and sinks, vec4 reads (`COLI_VK_CHAIN_GEMM_ROWS` for DeepSeek
+  V4's chain).
+- **#2440**, **#2441**, **#2442**, **#2447**, **#2454**, **#2484**: decode after
+  a long prompt, float16 KV mirrors, polling through a step, wider prompt tiles,
+  OLMoE's device KV cache (prompt +51 %).
+- **#2046**, **#2328**, **#2404**: the pipelines at the pinned subgroup size, the
+  cooperative matrix off by default on AMD's own driver.
+
+### Speculative decoding
+
+- **#2250**, **#2251**, **#2256**: Qwen3.6's MTP head on Vulkan, CUDA and the
+  CPU; a verify's rows share the decode GEMV's weight loads and get its bits.
+- **#2187**, **#2200**, **#2118**: Qwen3.8's MTP head on the device.
+- **#2376**, **#2407**: DSpark's verify depth from its confidence; the gate skips
+  drafts that cannot pay.
+
+### Long contexts, conversations and agents
+
+- **#1973**: a conversation longer than the context goes on from a summary.
+- **#2113**, **#2114**: a chat's next turn continues from what the engine holds,
+  its reasoning included.
+- **#2326**, **#2327**: the KV caches in float16 (GLM-5.3 at 131,072 tokens:
+  11.9 GB instead of 23.9).
+- **#2517**: Qwen3.8 Flash Next at a 256k context at the speed of 64k (prompt
+  15.6 to 149 tok/s, decode 9.6 to 45.7 on an RTX PRO 4000).
+- **#2517**, **#2521**: an agent's short request between two turns (a title, a
+  summary) parks the conversation instead of taking its state, on every engine
+  (`COLI_PARK`); Hermes on Qwen3.8 86 s to 4.9 s a turn, Qwen3.6-35B on the CPU
+  51.6 s to 3.3 s.
+- **#2485**, **#2309**: a served prompt stops on CANCEL while it is read, on every
+  engine; a dead engine starts again.
+- **#2025**: agents get the context they need.
+
+### The CPU
+
+- **#2042**: SSSE3 integer-dot kernels for x86-64 CPUs without AVX2, bit-identical
+  to the scalar reference.
+- **#2486**, **#2502**, **#2495**, **#2199**: prompt reading on the CPU (OLMoE
+  2.5x, Qwen3.6 +15 %), the hot OpenMP team (decode up to +13 %), one place per
+  core, a hybrid CPU's team on its performance cores.
+- **#2009**, **#2069**, **#2511**: NEON paths (the int4 expert repack, the sparse
+  attention row) and faster DeepSeek V4 CPU decode kernels.
+
+### Interface
+
+- **#2505**: a new chat UI (`coli ui`): reasoning, pictures, web search, the
+  expert map, a live monitor, models, coding agents.
+- **#2087**, **#2094**, **#2004**, **#2005**, **#2457**: the web chat sends a past
+  turn's reasoning back and follows a streaming answer; Brazilian Portuguese;
+  `coli chat` reads documents (`/file`, `--file`).
+- **#2144**: `residency_sim.py --engine olmoe` replays OLMoE traces with OLMoE's
+  own cache traversal.
+
+### Setup and platforms
+
+- **#1981**, **#1990**: an engine on a processor without AVX2 says so; a clear
+  stop on an MSYS or Cygwin gcc.
+- **#2026**, **#2095**, **#2099**, **#2100**, **#2197**: setup applies the plan
+  off CUDA and takes `--ctx`, CUDA on Windows, models split across drives,
+  `coli stop`, GGUF import on Windows.
+- **#2315**, **#2325**, **#2037**, **#2509**: Windows heap and memory fixes, a
+  shard's readers overlapping.
+- **#2396**, **#2397**: a container's cgroup limit bounds the RAM.
+
+### Cluster
+
+- **#1962**, **#1963**, **#1964**, **#1967**, **#1969**, **#1970**, **#2120**,
+  **#2388**: protocol v2, q8 activations on the wire, DeepSeek V4.1 expert
+  workers, bit-exact sums for any worker count.
+
+### Fixes and hardening
+
+- **#2522**: a grammar whose alternates fan out into the same stacks no longer
+  holds up the engine (a fixed budget of walker steps a byte).
+- **#2524**: `/v1/systemone` answers on GLM-5.2 and Mistral-Large-4 (the header
+  colibri.c reads).
+- **#2523**: a cold Qwen3.6 engine on the CUDA chain no longer hangs on a first
+  prompt of a few tokens.
+- **#2457**: the `/v1/systemone` error body, and question ids up to 256
+  characters.
+- Over a hundred fixes across the API, setup, benchmarks, the MCP server, images,
+  audio, JSON schemas and LoRA adapters; 92 pull requests from rudycelekli alone.
 
 ## [2.0.0] - 2026-10-06
 

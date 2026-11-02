@@ -6,7 +6,10 @@
 //   acc = w[c][ck-1] * in[s][c] + sum_k w[c][k] * ring[k]   (order 1: the input first)
 //   out[s][c] = silu(acc); the ring drops its oldest input and takes in[s][c].
 // The two orders are the two engines' (qwen36.c, qwen38_core.h), so the sum rounds as
-// on the CPU. snap_row >= 0: the ring as it stands after that row is copied to snap
+// on the CPU. Order 2 is LFM3's gated convolution (qwen36.c shortconv): an input row is
+// B | C | x of CD channels each, the convolution runs over B * x (the taps first, as
+// order 0), out[s][c] = C * acc, no activation, and the ring keeps B * x.
+// snap_row >= 0: the ring as it stands after that row is copied to snap
 // (the state an MTP verify's first row leaves, for the rollback of its draft).
 layout(local_size_x = 64) in;
 
@@ -32,10 +35,11 @@ void main() {
     int wb = p.w_off + c * p.CK;
     float wl = w[wb + p.CK - 1];
     for (int s = 0; s < p.S; s++) {
-        float cur = xin[p.in_off + s * p.in_row + c];
+        int ib = p.in_off + s * p.in_row;
+        float cur = p.order == 2 ? xin[ib + c] * xin[ib + c + 2 * p.CD] : xin[ib + c];
         float acc;
         /* constant trip counts: the ring stays in registers */
-        if (p.order == 0) {
+        if (p.order != 1) {
             acc = 0.0;
             for (int k = 0; k < 8; k++) if (k < nh) acc += w[wb + k] * hist[k];
             acc += wl * cur;
@@ -43,7 +47,7 @@ void main() {
             acc = wl * cur;
             for (int k = 0; k < 8; k++) if (k < nh) acc += w[wb + k] * hist[k];
         }
-        o[p.out_off + s * p.out_row + c] = acc / (1.0 + exp(-acc));
+        o[p.out_off + s * p.out_row + c] = p.order == 2 ? xin[ib + c + p.CD] * acc : acc / (1.0 + exp(-acc));
         for (int k = 0; k < 7; k++) if (k + 1 < nh) hist[k] = hist[k + 1];
         for (int k = 0; k < 8; k++) if (k == nh - 1) hist[k] = cur;
         if (s == p.snap_row)

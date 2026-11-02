@@ -87,6 +87,7 @@ static int qwen36_max_ctx(void) {
 #include "expert_ffn.h"    /* routed experts: planar int4 kernel + layer runner */
 #include "idot.h"          /* integer dot kernels for the dense trunk (COLI_DENSE_IDOT, COLI_DENSE_BITS) */
 #include "qwen38_vision.h" /* the ViT: the same tower in Qwen3.5/3.6/3.8 (#1757) */
+#include "lfm3_vision.h"   /* LFM3-VL's tower and projector */
 #include "qwen36_qpack.h"  /* optional MLX-affine qpack routed-expert path */
 #include "affine_quant.h"  /* MLX affine dense triples in model.safetensors */
 #ifdef COLI_METAL
@@ -142,9 +143,10 @@ static void q36_wfree(void *p){
  * Undoing the last one would mean permuting columns inside quantized blocks,
  * which is not lossless; reading in the file's order is. */
 static gguf_ctx g_gg;
+static gguf_ctx g_mmproj; static int g_mmproj_open;   /* a GGUF's vision tower, its own file (gguf.json "mmproj") */
 static int   g_gguf = 0;
 static int   g_gguf_dry = 0;       /* GGUF_CHECK=1: validate every tensor the loader wants, read none */
-static int   g_gguf_plain = 0;     /* qwen3moe, qwen3: llama.cpp's names for a Qwen3 layer (ffn_norm after attention) */
+static int   g_gguf_plain = 0;     /* qwen3moe, qwen3, lfm3: llama.cpp's names for a Qwen3 layer (ffn_norm after attention) */
 static int   g_ssm_a_direct = 0, g_dn_tiled = 0;
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
@@ -312,7 +314,10 @@ static int try_special(const char *s,int i,int n,int *id_out){
 /* Pre-tokenize splitter, mirrors the HF/Qwen regex alternation:
  *   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+ | \p{N}
  *   | ?[^\s\p{L}\p{M}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+ * g_pretok_d3: the same regex with \p{N}{1,3}, digits by three (LFM3's, a GGUF's
+ * tokenizer.ggml.pre "lfm2").
  * Returns the byte index just past the piece starting at i. */
+static int g_pretok_d3 = 0;
 static int pretok_end(const char *s,int i,int n){
     if (s[i]=='\''){
         const char *cands[]={"ll","ve","re","s","t","m","d"}; int clen[]={2,2,2,1,1,1,1};
@@ -332,7 +337,12 @@ static int pretok_end(const char *s,int i,int n){
             return k;
         }
     }
-    if(uclass(c0)==U_N) return i+adv;
+    if(uclass(c0)==U_N){
+        if(!g_pretok_d3) return i+adv;
+        int k=i+adv;
+        for(int d=1;d<3&&k<n;d++){ int a; unsigned cc=utf8_decode(s,k,n,&a); if(uclass(cc)!=U_N) break; k+=a; }
+        return k;
+    }
     { /* rule4: optional space + punctuation run (+ trailing newlines) */
         int k=i;
         if(s[i]==' '&&i+1<n){ int a1; unsigned c1=utf8_decode(s,i+1,n,&a1); if(uclass(c1)!=U_W&&uclass(c1)!=U_L&&uclass(c1)!=U_N&&c1!='\r'&&c1!='\n'){ k=i+1; while(k<n){int a;unsigned cc=utf8_decode(s,k,n,&a); if(uclass(cc)!=U_W&&uclass(cc)!=U_L&&uclass(cc)!=U_N&&cc!='\r'&&cc!='\n')k+=a; else break;} while(k<n&&(s[k]=='\r'||s[k]=='\n'))k++; return k; } }
@@ -595,6 +605,12 @@ static void load_tokenizer(const char *path){
             jval *pat = json_get(seq->kids[k], "pattern"), *rx = pat ? json_get(pat, "Regex") : NULL;
             if (rx && rx->t == J_STR && strstr(rx->str, "\\p{Lu}") && strstr(rx->str, "[\\r\\n/]*")) g_pretok_o200k = 1;
         }
+        /* the Qwen regex with \p{N}{1,3} (LFM3's): digits by three */
+        for (int k = 0; !g_pretok_flint && !g_pretok_o200k && seq && seq->t == J_ARR && k < seq->len; k++) {
+            jval *pat = json_get(seq->kids[k], "pattern"), *rx = pat ? json_get(pat, "Regex") : NULL;
+            if (rx && rx->t == J_STR && strstr(rx->str, "|\\p{N}{1,3}|") && strstr(rx->str, "[^\\r\\n\\p{L}\\p{N}]?\\p{L}+")) g_pretok_d3 = 1;
+        }
+        if (g_pretok_d3) fprintf(stderr, "[tok] digits by three\n");
         jval *im = json_get(model, "ignore_merges");
         g_ignore_merges = im && im->t == J_BOOL && im->boolean;
         if (g_pretok_o200k) fprintf(stderr, "[tok] o200k's pre-tokenizer%s\n", g_ignore_merges ? ", whole pieces first" : "");
@@ -709,6 +725,7 @@ static int load_tokenizer_gguf(const gguf_ctx *g){
     const char *pre = gguf_get_str(g, "tokenizer.ggml.pre");
     g_pretok_flint = pre && !strcmp(pre, "flint");
     g_pretok_o200k = g_ignore_merges = pre && (!strcmp(pre, "gpt-4o") || !strcmp(pre, "llama4"));   /* tiktoken's split and rule */
+    if (pre && !strcmp(pre, "lfm2")) g_pretok_d3 = g_ignore_merges = 1;   /* LFM3: digits by three, whole pieces first */
     int n = (int)tk->n;
     const int32_t *types = (ty && ty->type == GGUF_T_ARRAY && (ty->atype == GGUF_T_I32 || ty->atype == GGUF_T_U32) && ty->n == tk->n)
                            ? (const int32_t *)ty->arr : NULL;
@@ -795,22 +812,28 @@ static int json_escape(const unsigned char *s, int n, char *out, int outsz){
 
 /* Append b[0..n) into buf (*bn), extract as many LEADING complete UTF-8
  * codepoints as possible into out[0..*outn) (max 255). Trailing partial
- * sequence stays in buf. Returns bytes written to out. */
+ * sequence stays in buf. Returns bytes written to out. The codepoints are
+ * taken after every byte, so buf only ever holds a partial one (at most
+ * three bytes): appending the whole token first cut every byte past the
+ * 16th, and a Cyrillic word is often a token longer than that (" экскурсии"
+ * 19 bytes, " удовольствием" 27), #2492. */
 static int utf8_drain(unsigned char *buf, int *bn, const unsigned char *b, int n, unsigned char *out, int *outn){
     *outn = 0;
-    for (int k=0;k<n;k++){ if (*bn < 16) buf[(*bn)++] = b[k]; }
-    int j = 0;
-    while (j < *bn){
-        unsigned char lead = buf[j]; int need;
-        if (lead < 0x80) need = 1;
-        else if ((lead & 0xE0) == 0xC0) need = 2;
-        else if ((lead & 0xF0) == 0xE0) need = 3;
-        else if ((lead & 0xF8) == 0xF0) need = 4;
-        else { memmove(buf+j, buf+j+1, *bn-j-1); (*bn)--; continue; }
-        if (j+need > *bn) break;
-        if (*outn + need <= 255){ for (int x=0;x<need;x++) out[(*outn)++] = buf[j+x]; }
-        memmove(buf+j, buf+j+need, *bn-j-need);
-        *bn -= need;
+    for (int k=0;k<n;k++){
+        if (*bn < 16) buf[(*bn)++] = b[k];
+        int j = 0;
+        while (j < *bn){
+            unsigned char lead = buf[j]; int need;
+            if (lead < 0x80) need = 1;
+            else if ((lead & 0xE0) == 0xC0) need = 2;
+            else if ((lead & 0xF0) == 0xE0) need = 3;
+            else if ((lead & 0xF8) == 0xF0) need = 4;
+            else { memmove(buf+j, buf+j+1, *bn-j-1); (*bn)--; continue; }
+            if (j+need > *bn) break;
+            if (*outn + need <= 255){ for (int x=0;x<need;x++) out[(*outn)++] = buf[j+x]; }
+            memmove(buf+j, buf+j+need, *bn-j-need);
+            *bn -= need;
+        }
     }
     return *outn;
 }
@@ -1030,6 +1053,9 @@ typedef struct {
      * = text only (a container converted without it, or a text-only checkpoint). */
     int vis_depth, vis_hidden, vis_heads, vis_inter, vis_patch, vis_merge;
     int vis_temporal, vis_in_ch, vis_out_hidden, vis_num_pos;
+    /* LFM3-VL's tower (lfm3_vision.h): grouped-query heads, a projector of its own width,
+     * the layers that attend (the others convolve), its norms' epsilon and rope base */
+    int vis_lfm3, vis_kv_heads, vis_proj_hidden; float vis_eps, vis_theta; uint64_t vis_attn;
     int image_token;
     /* Interleaved M-RoPE: frequency j rotates by the height position when
      * j % 3 == 1 and j < 3*sec[1], by the width one when j % 3 == 2 and
@@ -1054,7 +1080,20 @@ typedef struct {
      * experts' width for every model: hidden but on Muse. */
     int muse, ehid;
     float post_eps, logit_scale, softcap;
+    /* LFM3 (LiquidAI/LFM3-VL, the lfm3 GGUF): a dense model whose layers are short gated
+     * convolutions (is_attn 0: in_proj to B, C, x; C * conv(B * x) over the last dn_convk
+     * rows, channel by channel; out_proj) or attention with q/k norms and one sigmoid gate
+     * per head (attn_gate, D -> H, on the attention's input), the sliding layers (win_layer)
+     * at theta_swa with every frequency, the full ones at theta with only the first
+     * rot_full of head_dim/2 (the rest unrotated); every branch normalised before its
+     * residual (post_op, post_ffn: sandwich norms). The conv's window is DN_conv
+     * (dn_conv_dim = hidden channels, dn_convk taps), the layers carry no DN_rec. */
+    int lfm3, rot_full;
+    float theta_swa;
 } Cfg;
+/* a recurrent layer's state cells: DeltaNet's [vh, kdim, vdim] recurrence; an LFM3 conv layer has
+ * none and keeps one cell, so DN_rec[i] marks every layer with a state (its ring in DN_conv) */
+static inline size_t q36_rec_cells(const Cfg *c) { size_t n = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim; return n ? n : 1; }
 /* the experts' width: ehid, or hidden for a Cfg built without it (the tests' hand-made ones) */
 static inline int q36_eh(const Cfg *c) { return c->ehid > 0 ? c->ehid : c->hidden; }
 
@@ -1076,14 +1115,16 @@ static inline int q36_eh(const Cfg *c) { return c->ehid > 0 ? c->ehid : c->hidde
  * vk/vk_off: the Vulkan device copy (COLI_VULKAN=1) of whichever of q4, q or w
  * matmul_d reads, uploaded at the first matmul_d and kept; vk_off = the upload
  * failed once, this matrix stays on the CPU. Both stay zero without VK=1. */
-/* h: the matrix as f16 (COLI_DENSE_BITS=16), the only copy then. */
+/* h: the matrix as f16 (COLI_DENSE_BITS=16), the only copy then.
+ * wf16: a GGUF's F16 (1) or BF16 (30) matrix: w holds it in f32 for the CPU, and the GPUs
+ * get the file's 16-bit rows back from w (q36_wf16_rows, exact) as block format 100 + wf16. */
 /* vk_name, vk_tag, vk_quant: what load_tq read it with, to read it back from disk
  * (q36_dho_reload); vk_fmt, vk_gone: with the dense weights on the device only
  * (COLI_VK_DENSE_HOST), the device copy's format and 1 while no host copy is kept. */
 typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; float *sg; int ng;
                  void *vk; int vk_off; uint16_t *h;
                  char *vk_name; const char *vk_tag; int vk_quant, vk_fmt, vk_gone, vk_imported;
-                 uint8_t *gq; int gq_type; float gs;
+                 uint8_t *gq; int gq_type; float gs; int wf16;
                  int q8r16; } QW;   /* q8r16: q's rows interleaved by 16 (idot.h i8r16_*, q36_trunk_q8_interleave) */
 static void qw_free(QW *w) {
 #ifdef COLI_VULKAN
@@ -1109,6 +1150,9 @@ typedef struct {
      * expert's output (post_en) and the branch (post_fn). */
     QW ag, lat_d, lat_u;
     float *ra_a, *ra_b, *rf_a, *rf_b, *pre_en, *post_en, *post_fn;
+    /* LFM3: the short conv's projections and taps [hidden, convk], and the norms after
+     * each branch (post_op after the conv or attention, post_ffn after the MLP) */
+    QW sc_in, sc_out; float *sc_conv, *post_op, *post_ffn;
     /* Gated DeltaNet (linear_attention) dense weights (f16->f32 via st_read_f32). */
     QW dn_qkv, dn_z; float *dn_b, *dn_a;   /* in_proj_qkv/z (int8-during-load), b/a (not dense-matmul'd) */
     float *dn_conv;                        /* conv1d.weight [conv_dim, convk] (groups=conv_dim) */
@@ -1121,6 +1165,7 @@ typedef struct {
      * see trunk_offer_dense / trunk_place_dense. */
     int qth_dnout, qth_q, qth_k, qth_v, qth_o, qth_shg, qth_shu, qth_shd;
     int qth_ag, qth_ld, qth_lu;   /* Muse Spark's attention gate (with "attnproj") and latent projections ("shexp") */
+    int qth_scin, qth_scout;      /* LFM3's conv projections (with "dnout") */
 } Layer;
 
 /* ---------- LRU expert cache (int8 weights + per-row float scales) ---------- */
@@ -1232,6 +1277,7 @@ typedef struct {
      * positions of the prompt, and past it every axis is pos + rope_delta
      * (HF's mrope_position_deltas). All of it is dropped after the turn. */
     Q38Vision vis; int vis_ready;
+    Lfm3Vision lvis;
     float *vis_rows; int vis_rows_n;
     int *vis_map, vis_map_len;
     int *mpos, mpos_len, rope_delta;
@@ -1897,6 +1943,7 @@ static void vk_q4_planar_to_fmt4(const QW *w, uint8_t *dst) {
             }
     }
 }
+static uint16_t *q36_wf16_rows(const QW *w);
 static unsigned g_vk_placed[4];   /* uploads by format: int8 rows, int4, f32, f16 */
 static int g_q36_vk_dev;          /* the device vk_qw_tensor uploads a new matrix to: 1 for the
                                    * chain's layers on COLI_VK_DEV2's (qwen36_chain.h) */
@@ -1912,7 +1959,10 @@ static int vk_qw_fmt(const QW *w, const void **wq, const float **sc) {
     if (w->q4) { *wq = w->q4; *sc = w->sg; return 4; }
     if (w->q) { *wq = w->q; *sc = w->sc; return 1; }
     if (w->h) { *wq = w->h; *sc = NULL; return 14; }
-    *wq = w->w; *sc = NULL;   /* fmt 10: no scales */
+    *wq = w->w; *sc = NULL;
+    /* a GGUF's F16 or BF16: the block format of its 16 bits (vk_qw_tensor rebuilds them from w),
+     * the block formats' GEMVs and tiled GEMMs; fmt 10 (f32, no scales) where the device lacks it */
+    if (w->wf16 && w->I % 32 == 0 && coli_vk_block_elems(100 + w->wf16)) return 100 + w->wf16;
     return 10;
 }
 static void q36_dho_reload(QW *w);
@@ -1933,12 +1983,14 @@ static ColiVkTensor *vk_qw_tensor(const QW *w) {
     int fmt = vk_qw_fmt(w, &wq, &sc), gs = fmt == 4 ? 64 : 0;
     if (!wq) return NULL;
     int ok;
-    if (w->gq) {   /* a GGUF's blocks for the dense chain (blockdec.glsl), as the file has them */
+    if (w->gq || fmt >= 100) {   /* a GGUF's blocks for the dense chain (blockdec.glsl), as the file has them */
         const int be = coli_vk_block_elems(fmt);
-        if (w->gs != 1.f || !be || I % be) { mw->vk_off = 1; return NULL; }   /* no device form, or a scale the shader lacks */
+        if ((w->gq && w->gs != 1.f) || !be || I % be) { mw->vk_off = 1; return NULL; }   /* no device form, or a scale the shader lacks */
         uint8_t *rows = NULL;
-        if (gq_r16_base(w->gq_type) >= 0 && !(rows = malloc((size_t)gq_row_bytes(fmt - 100, I) * O))) { mw->vk_off = 1; return NULL; }
-        if (rows) gq_r16_unpack(w->gq_type, rows, w->gq, O, I);
+        if (!w->gq) {   /* F16, BF16: their 16 bits again */
+            if (!(rows = (uint8_t *)q36_wf16_rows(w))) { mw->vk_off = 1; return NULL; }
+        } else if (gq_r16_base(w->gq_type) >= 0 && !(rows = malloc((size_t)gq_row_bytes(fmt - 100, I) * O))) { mw->vk_off = 1; return NULL; }
+        else if (rows) gq_r16_unpack(w->gq_type, rows, w->gq, O, I);
         const void *src = rows ? (const void *)rows : (const void *)w->gq;
         ok = g_q36_vk_dev ? coli_vk_tensor_ensure2(t, src, NULL, fmt, I, O, 0) : coli_vk_tensor_ensure(t, src, NULL, fmt, I, O, 0);
         free(rows);
@@ -2019,7 +2071,7 @@ static void vk_report(void) {
 }
 #endif
 /* f32 -> f16, round to nearest even: exact for a value that came from f16 (the
- * container), which is the only use (COLI_DENSE_BITS=16). */
+ * container, a GGUF's F16), which is the only use (COLI_DENSE_BITS=16, q36_wf16_rows). */
 static uint16_t f32_to_f16_bits(float f){
     uint32_t x; memcpy(&x, &f, 4);
     uint32_t sign = (x >> 16) & 0x8000u, mant = x & 0x7fffffu;
@@ -2037,6 +2089,20 @@ static uint16_t f32_to_f16_bits(float f){
     uint32_t v = ((uint32_t)exp << 10) | (mant >> 13), rest = mant & 0x1fffu;
     if (rest > 0x1000u || (rest == 0x1000u && (v & 1))) v++;
     return (uint16_t)(sign | v);
+}
+/* A GGUF's F16 or BF16 matrix for a GPU: its rows in the file's 16 bits again, from the f32
+ * copy the CPU reads (exact: every value came from them, rotary rows already in their order);
+ * malloc'd, NULL when out of memory. */
+static uint16_t *q36_wf16_rows(const QW *w) {
+    const int64_t n = (int64_t)w->I * w->O;
+    uint16_t *r = w->w ? malloc((size_t)n * 2) : NULL;
+    if (!r) return NULL;
+    #pragma omp parallel for schedule(static) if (n > (1 << 20))
+    for (int64_t k = 0; k < n; k++) {
+        uint32_t b; memcpy(&b, &w->w[k], 4);
+        r[k] = w->wf16 == GQ_F16 ? f32_to_f16_bits(w->w[k]) : (uint16_t)(b >> 16);
+    }
+    return r;
 }
 
 /* y[S,O] = x[S,I] @ W^T with W in f16 (COLI_DENSE_BITS=16). A thread converts
@@ -2200,6 +2266,10 @@ int coli_cuda_block_elems(int fmt);
 #endif
 static int qdw_gq_fmt(const QW *w) {
 #ifdef COLI_CUDA
+    if (g_gguf && !w->gq && w->wf16 && w->w) {   /* F16, BF16: blocks of 32 of their 16 bits (q36_wf16_rows) */
+        const int be = coli_cuda_block_elems(100 + w->wf16);
+        return be > 0 && w->I % be == 0 && w->I % 32 == 0 ? 100 + w->wf16 : 0;
+    }
     if (!g_gguf || !w->gq || w->gs != 1.f) return 0;
     const int r = gq_r16_base(w->gq_type), t = r >= 0 ? r : w->gq_type, be = coli_cuda_block_elems(100 + t);
     return be > 0 && w->I % be == 0 && w->I % 32 == 0 ? 100 + t : 0;
@@ -2215,6 +2285,7 @@ static size_t qdw_gq_bytes(const QW *w) {
  * *rows (free it after the upload); NULL when out of memory */
 static const void *qdw_gq_rows(const QW *w, int fmt, uint8_t **rows) {
     *rows = NULL;
+    if (!w->gq) return *rows = (uint8_t *)q36_wf16_rows(w);   /* F16, BF16 */
     if (gq_r16_base(w->gq_type) < 0) return w->gq;
     if (!(*rows = malloc((size_t)gq_row_bytes(fmt - 100, w->I) * w->O))) return NULL;
     gq_r16_unpack(w->gq_type, *rows, w->gq, w->O, w->I);
@@ -2466,11 +2537,18 @@ static void validate_cfg(const Cfg *c, int n_layers_from_config) {
                  c->vis_temporal > 0 && c->vis_temporal <= 8 && c->vis_in_ch > 0 && c->vis_in_ch <= 8,
                  "vision patch %d merge %d temporal %d channels %d", c->vis_patch, c->vis_merge,
                  c->vis_temporal, c->vis_in_ch);
-        CFG_NEED(c->vis_num_pos > 0 && c->vis_num_pos <= 65536, "vision positions %d", c->vis_num_pos);
+        if (c->vis_lfm3)
+            CFG_NEED(c->vis_kv_heads > 0 && c->vis_heads % c->vis_kv_heads == 0 && (c->vis_hidden / c->vis_heads) % 4 == 0 &&
+                     c->vis_proj_hidden > 0 && c->vis_proj_hidden <= 65536 && c->vis_eps > 0.f && c->vis_theta > 0.f,
+                     "LFM3 vision: %d heads over %d key heads, projector %d, eps %g, theta %g", c->vis_heads,
+                     c->vis_kv_heads, c->vis_proj_hidden, c->vis_eps, c->vis_theta);
+        else
+            CFG_NEED(c->vis_num_pos > 0 && c->vis_num_pos <= 65536, "vision positions %d", c->vis_num_pos);
         CFG_NEED(c->vis_out_hidden == c->hidden, "vision tower writes %d wide rows into a %d-wide model",
                  c->vis_out_hidden, c->hidden);
         CFG_NEED(c->image_token >= 0 && c->image_token < c->vocab, "image_token_id %d outside the vocabulary",
                  c->image_token);
+        if (!c->vis_lfm3)   /* LFM3 keeps its text positions across a picture: no M-RoPE */
         CFG_NEED(c->mrope_section[0] >= 0 && c->mrope_section[1] >= 0 && c->mrope_section[2] >= 0 &&
                  2 * (c->mrope_section[0] + c->mrope_section[1] + c->mrope_section[2]) == c->rotary_dim,
                  "mrope_section %d+%d+%d does not cover rotary_dim %d", c->mrope_section[0],
@@ -2484,8 +2562,12 @@ static void validate_cfg(const Cfg *c, int n_layers_from_config) {
              c->q_heads, c->kv_heads);
     CFG_NEED(c->k_head_dim > 0 && c->v_head_dim > 0 && c->q_head_dim > 0,
              "per-head dims must be positive");
+    /* LFM3's conv layers: the ring of hidden channels, convk - 1 rows, and nothing else */
+    if (c->lfm3 && c->n_active < c->n_layers)
+        CFG_NEED(c->dn_convk >= 2 && c->dn_conv_dim == c->hidden && c->dn_vheads == 0,
+                 "lfm3 conv layers: %d taps over %d channels (hidden %d)", c->dn_convk, c->dn_conv_dim, c->hidden);
     /* DeltaNet: every one of these indexes a buffer or divides. */
-    if (c->n_active < c->n_layers) {          /* at least one DeltaNet layer */
+    else if (c->n_active < c->n_layers) {          /* at least one DeltaNet layer */
         CFG_NEED(c->dn_vheads > 0 && c->dn_kheads > 0,
                  "dn_vheads %d / dn_kheads %d must be positive (rep = vh / vk)",
                  c->dn_vheads, c->dn_kheads);
@@ -2549,6 +2631,10 @@ static void load_meta(Cfg *c, const char *snap) {
         if((v=json_get(r,"zero_centered_norms"))&&v->t==J_BOOL) c->zero_centered_norms=v->boolean;
         if((v=json_get(r,"has_bias"))&&v->t==J_BOOL) c->has_bias=v->boolean;
         if((v=json_get(r,"has_qk_norm"))&&v->t==J_BOOL) c->has_qk_norm=v->boolean;
+        /* LFM3 (the Cfg comment): layer_types "conv" are its short convolutions */
+        if((v=json_get(r,"lfm3"))&&v->t==J_BOOL) c->lfm3=v->boolean;
+        if((v=json_get(r,"rope_theta_swa"))&&v->t==J_NUM) c->theta_swa=(float)v->num;
+        if((v=json_get(r,"rot_full"))&&v->t==J_NUM) c->rot_full=(int)v->num;
         if((v=json_get(r,"image_token_id"))&&v->t==J_NUM) c->image_token=(int)v->num;
         if((v=json_get(r,"mrope_section"))&&v->t==J_ARR&&v->len==3)
             for(int k=0;k<3;k++) if(v->kids[k]->t==J_NUM) c->mrope_section[k]=(int)v->kids[k]->num;
@@ -2561,7 +2647,13 @@ static void load_meta(Cfg *c, const char *snap) {
                 GV("inter",vis_inter); GV("patch",vis_patch); GV("merge",vis_merge);
                 GV("temporal",vis_temporal); GV("in_ch",vis_in_ch);
                 GV("out_hidden",vis_out_hidden); GV("num_pos",vis_num_pos);
+                GV("kv_heads",vis_kv_heads); GV("proj_hidden",vis_proj_hidden);
                 #undef GV
+                if((w=json_get(vv,"kind"))&&w->t==J_STR&&!strcmp(w->str,"lfm3")) c->vis_lfm3=1;
+                if((w=json_get(vv,"eps"))&&w->t==J_NUM) c->vis_eps=(float)w->num;
+                if((w=json_get(vv,"theta"))&&w->t==J_NUM) c->vis_theta=(float)w->num;
+                if((w=json_get(vv,"attn_layers"))&&w->t==J_ARR)
+                    for(int k=0;k<w->len&&k<64;k++) if(w->kids[k]->t==J_NUM&&w->kids[k]->num!=0) c->vis_attn|=1ull<<k;
             }
         }
         /* derive rotary_dim from head_dim * partial_rotary_factor (HF formula) */
@@ -2610,6 +2702,8 @@ static void load_meta(Cfg *c, const char *snap) {
             }
         }
         CFG_NEED(!c->win_layer || c->window > 0, "sliding_attention layers need sliding_window > 0 (got %d)", c->window);
+        CFG_NEED(!c->lfm3 || (c->rot_full >= 0 && c->rot_full <= c->head_dim / 2 && c->theta_swa > 0.f),
+                 "lfm3: rot_full %d (0..%d) and rope_theta_swa %g", c->rot_full, c->head_dim / 2, c->theta_swa);
         CFG_NEED(!c->dense_layer || c->dense_inter > 0, "mlp_only_layers need dense_inter > 0 (got %d)", c->dense_inter);
     }
     free(buf); free(arena);
@@ -2784,6 +2878,11 @@ static const char *gg_name(const char *hf, char *out, size_t cap) {
         { "linear_attn.A_log", "ssm_a" },
         { "linear_attn.norm.weight", "ssm_norm.weight" },
         { "linear_attn.out_proj.weight", "ssm_out.weight" },
+        /* lfm3: the short conv and the norm after the conv or attention branch */
+        { "conv.in_proj.weight", "shortconv.in_proj.weight" },
+        { "conv.conv.weight", "shortconv.conv.weight" },
+        { "conv.out_proj.weight", "shortconv.out_proj.weight" },
+        { "post_operator_norm.weight", "post_attention_norm.weight" },
     };
     int L = -1, off = 0;
     if (sscanf(hf, "model.layers.%d.%n", &L, &off) != 1 || L < 0 || !off) return NULL;
@@ -2796,6 +2895,8 @@ static const gguf_tensor *gg_tensor(const char *hf) {
     char nm[256]; const char *g = gg_name(hf, nm, sizeof nm);
     /* tied embeddings (the small dense models): no output.weight, the head reads token_embd */
     if (g && !strcmp(g, "output.weight") && !gguf_find(&g_gg, g)) g = "token_embd.weight";
+    /* Ollama's converter names the DeltaNet's dt bias blk.N.ssm_dt (the same values) */
+    if (g && !gguf_find(&g_gg, g)) { size_t L = strlen(g); if (L > 12 && !strcmp(g + L - 12, ".ssm_dt.bias")) { nm[L - 5] = 0; g = nm; } }
     return g ? gguf_mark(&g_gg, g) : NULL;
 }
 static int64_t gg_numel(const gguf_tensor *t) { return t->ne[0] * t->ne[1] * t->ne[2] * t->ne[3]; }
@@ -2902,6 +3003,10 @@ static int qwen_dense_list(const Cfg *c, QwenDenseList *l) {
             QDL_ADD(c->hidden, kr, "model.layers.%d.self_attn.k_proj.weight", i);
             QDL_ADD(c->hidden, vr, "model.layers.%d.self_attn.v_proj.weight", i);
             QDL_ADD(c->o_in, c->hidden, "model.layers.%d.self_attn.o_proj.weight", i);
+            if (c->lfm3) QDL_ADD(c->hidden, c->q_heads, "model.layers.%d.self_attn.gate_proj.weight", i);
+        } else if (c->lfm3) {   /* LFM3's short conv */
+            QDL_ADD(c->hidden, 3 * c->hidden, "model.layers.%d.conv.in_proj.weight", i);
+            QDL_ADD(c->hidden, c->hidden, "model.layers.%d.conv.out_proj.weight", i);
         } else {
             QDL_ADD(c->hidden, c->dn_conv_dim, "model.layers.%d.linear_attn.in_proj_qkv.weight", i);
             QDL_ADD(c->hidden, vd, "model.layers.%d.linear_attn.in_proj_z.weight", i);
@@ -3055,6 +3160,7 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
         if (t->type == GQ_F32 || t->type == GQ_F16 || t->type == GQ_BF16) {
             out->w = load_t_n(m, name, (int64_t)I * O);
             if (rheads && out->w) q36_rope_unpermute((void *)out->w, (size_t)I * sizeof(float), rheads, O / rheads);
+            out->wf16 = t->type == GQ_F32 ? 0 : t->type;
             return;
         }
         if (!gq_blk_decoder(t->type)) { fprintf(stderr, "GGUF %s: type %s is not supported\n", t->name, gq_type_name(t->type)); exit(1); }
@@ -3179,9 +3285,18 @@ static void q36_vis_norm(Model *m, Q38Norm *n, const char *stem, int width) {
     snprintf(nm, sizeof nm, "model.visual.%s.weight", stem); n->w = load_t_n(m, nm, width);
     snprintf(nm, sizeof nm, "model.visual.%s.bias", stem);   n->b = load_t_n(m, nm, width);
 }
+static void q36_load_lfm3_vision(Model *m);
 static void q36_load_vision(Model *m) {
     Cfg *c = &m->c;
     if (!c->vis_depth) return;
+    if (c->vis_lfm3) {
+        if (!g_mmproj_open && !st_has(&m->S, "model.vision_tower.patchifier.weight")) {
+            fprintf(stderr, "[qwen36] qwen36_meta.json describes a vision tower but the container has none; text only\n");
+            c->vis_depth = 0; return;
+        }
+        q36_load_lfm3_vision(m);
+        return;
+    }
     if (!st_has(&m->S, "model.visual.pos_embed.weight")) {
         fprintf(stderr, "[qwen36] qwen36_meta.json describes a vision tower but the container has none; text only\n");
         c->vis_depth = 0; return;
@@ -3220,6 +3335,110 @@ static void q36_load_vision(Model *m) {
             v->depth, v->hidden, v->heads, v->patch, v->merge);
 }
 
+/* LFM3-VL's tower (lfm3_vision.h): from the container (model.vision_tower.*, the converter's
+ * copy) or from a GGUF's mmproj file (v.*, mm.*: the patch embedding as one conv kernel per
+ * frame, interleaved back into the patchifier's C x T x P x P inputs) */
+static float *l3v_load(Model *m, const char *hf, const char *gg, int64_t want) {
+    if (!g_mmproj_open) return load_t_n(m, hf, want);
+    const gguf_tensor *t = gguf_mark(&g_mmproj, gg);
+    if (!t) { fprintf(stderr, "mmproj: missing %s\n", gg); exit(1); }
+    if (gg_numel(t) != want) { fprintf(stderr, "mmproj %s: %lld values, %lld expected\n", gg, (long long)gg_numel(t), (long long)want); exit(1); }
+    float *p = falloc(want);
+    if (gguf_read_f32(&g_mmproj, t, p)) { fprintf(stderr, "mmproj %s: read failed (type %s)\n", gg, gq_type_name(t->type)); exit(1); }
+    return p;
+}
+static void q36_load_lfm3_vision(Model *m) {
+    Cfg *c = &m->c;
+    Lfm3Vision *v = &m->lvis;
+    memset(v, 0, sizeof *v);
+    v->depth = c->vis_depth; v->hidden = c->vis_hidden; v->heads = c->vis_heads; v->kv_heads = c->vis_kv_heads;
+    v->head_dim = c->vis_hidden / c->vis_heads; v->inter = c->vis_inter; v->patch = c->vis_patch;
+    v->merge = c->vis_merge; v->temporal = c->vis_temporal; v->in_ch = c->vis_in_ch;
+    v->out_hidden = c->vis_out_hidden; v->proj_hidden = c->vis_proj_hidden;
+    v->eps = c->vis_eps; v->proj_eps = 1e-6f; v->theta = c->vis_theta;
+    const int D = v->hidden, F = v->inter, hd = v->head_dim, PP = v->patch * v->patch, PD = v->in_ch * v->temporal * PP;
+    if (g_mmproj_open) {   /* one [D, C, P, P] kernel a frame: patchifier[o][c][t][p] = frame t's [o][c][p] */
+        float *pw = falloc((int64_t)D * PD);
+        for (int t = 0; t < v->temporal; t++) {
+            char nm[64];
+            if (t) snprintf(nm, sizeof nm, "v.patch_embd.weight.%d", t); else snprintf(nm, sizeof nm, "v.patch_embd.weight");
+            float *f = l3v_load(m, NULL, nm, (int64_t)D * v->in_ch * PP);
+            for (int o = 0; o < D; o++)
+                for (int ch = 0; ch < v->in_ch; ch++)
+                    memcpy(pw + (size_t)o * PD + ((size_t)ch * v->temporal + t) * PP, f + ((size_t)o * v->in_ch + ch) * PP, PP * sizeof(float));
+            free(f);
+        }
+        v->patchifier = pw;
+    } else v->patchifier = l3v_load(m, "model.vision_tower.patchifier.weight", NULL, (int64_t)D * PD);
+    v->emb_norm = l3v_load(m, "model.vision_tower.embedding_norm.weight", "v.embedding_norm.weight", D);
+    v->layers = calloc((size_t)v->depth, sizeof(L3VLayer));
+    if (!v->layers) { fprintf(stderr, "OOM vision layers\n"); exit(1); }
+    for (int i = 0; i < v->depth; i++) {
+        L3VLayer *L = &v->layers[i];
+        char h[160], g[96];
+        #define L3V(dst, hfs, ggs, n) do { snprintf(h, sizeof h, "model.vision_tower.layers.%d.%s.weight", i, hfs); \
+                                           snprintf(g, sizeof g, "v.blk.%d.%s.weight", i, ggs); dst = l3v_load(m, h, g, n); } while (0)
+        L->attn = (int)((c->vis_attn >> i) & 1);
+        L3V(L->op_norm, "operator_norm", "ln1", D);
+        L3V(L->ffn_norm, "ffn_norm", "ln2", D);
+        if (L->attn) {
+            L3V(L->q, "self_attn.q_proj", "attn_q", (int64_t)v->heads * hd * D);
+            L3V(L->k, "self_attn.k_proj", "attn_k", (int64_t)v->kv_heads * hd * D);
+            L3V(L->v, "self_attn.v_proj", "attn_v", (int64_t)v->kv_heads * hd * D);
+            L3V(L->o, "self_attn.out_proj", "attn_out", (int64_t)D * v->heads * hd);
+            L3V(L->qn, "self_attn.q_layernorm", "attn_q_norm", hd);
+            L3V(L->kn, "self_attn.k_layernorm", "attn_k_norm", hd);
+        } else {
+            L3V(L->in_proj, "conv.in_proj", "conv2d_in_proj", (int64_t)3 * D * D);
+            L3V(L->spatial, "conv.spatial_conv", "conv2d_spatial", (int64_t)D * 9);
+            L3V(L->out_proj, "conv.out_proj", "conv2d_out_proj", (int64_t)D * D);
+        }
+        L3V(L->w1, "feed_forward.w1", "ffn_gate", (int64_t)F * D);
+        L3V(L->w3, "feed_forward.w3", "ffn_up", (int64_t)F * D);
+        L3V(L->w2, "feed_forward.w2", "ffn_down", (int64_t)D * F);
+        #undef L3V
+    }
+    const int W4 = D * v->merge * v->merge, P = v->proj_hidden;
+    v->ln_w = l3v_load(m, "model.multi_modal_projector.layer_norm.weight", "mm.input_norm.weight", D);
+    v->ln_b = l3v_load(m, "model.multi_modal_projector.layer_norm.bias", "mm.input_norm.bias", D);
+    v->l1_w = l3v_load(m, "model.multi_modal_projector.linear_1.weight", "mm.0.weight", (int64_t)P * W4);
+    v->l1_b = l3v_load(m, "model.multi_modal_projector.linear_1.bias", "mm.0.bias", P);
+    v->l2_w = l3v_load(m, "model.multi_modal_projector.linear_2.weight", "mm.2.weight", (int64_t)v->out_hidden * P);
+    v->l2_b = l3v_load(m, "model.multi_modal_projector.linear_2.bias", "mm.2.bias", v->out_hidden);
+    m->vis_ready = 1;
+    int na = 0; for (int i = 0; i < v->depth; i++) na += v->layers[i].attn;
+    fprintf(stderr, "[qwen36] LFM3 vision tower%s: %d layers (%d attention, %d convolution), hidden %d, %d heads over %d, patch %d, merge %d\n",
+            g_mmproj_open ? " (mmproj)" : "", v->depth, na, v->depth - na, D, v->heads, v->kv_heads, v->patch, v->merge);
+}
+/* an mmproj's shape (clip.vision.*) into the config: LFM3's tower, the layers with attention
+ * those that carry attn_q. 0 when the file is not one. */
+static int q36_mmproj_cfg(Cfg *c) {
+    const gguf_ctx *g = &g_mmproj;
+    const char *pt = gguf_get_str(g, "clip.vision.projector_type");
+    if (!pt || strcmp(pt, "lfm3vl")) { fprintf(stderr, "[qwen36] mmproj projector %s: not LFM3's, text only\n", pt ? pt : "(none)"); return 0; }
+    c->vis_lfm3 = 1;
+    c->vis_depth = (int)gguf_get_int(g, "clip.vision.block_count", 0);
+    c->vis_hidden = (int)gguf_get_int(g, "clip.vision.embedding_length", 0);
+    c->vis_inter = (int)gguf_get_int(g, "clip.vision.feed_forward_length", 0);
+    c->vis_heads = (int)gguf_get_int(g, "clip.vision.attention.head_count", 0);
+    c->vis_kv_heads = (int)gguf_get_int(g, "clip.vision.attention.head_count_kv", c->vis_heads);
+    c->vis_patch = (int)gguf_get_int(g, "clip.vision.patch_size", 16);
+    c->vis_merge = (int)gguf_get_int(g, "clip.vision.spatial_merge_size", 2);
+    c->vis_out_hidden = (int)gguf_get_int(g, "clip.vision.projection_dim", 0);
+    c->vis_eps = (float)gguf_get_float(g, "clip.vision.attention.layer_norm_epsilon", 1e-5);
+    c->vis_theta = 1e6f;   /* the checkpoint's rope_theta; the mmproj does not carry it */
+    c->vis_in_ch = 3;
+    c->vis_temporal = gguf_find(g, "v.patch_embd.weight.1") ? 2 : 1;
+    const gguf_tensor *l1 = gguf_find(g, "mm.0.bias");
+    c->vis_proj_hidden = l1 ? (int)l1->ne[0] : 0;
+    c->vis_attn = 0;
+    for (int i = 0; i < c->vis_depth && i < 64; i++) {
+        char nm[64]; snprintf(nm, sizeof nm, "v.blk.%d.attn_q.weight", i);
+        if (gguf_find(g, nm)) c->vis_attn |= 1ull << i;
+    }
+    return c->vis_depth > 0;
+}
+
 static void q36_vision_detach(Model *m) {
     free(m->vis_rows); free(m->vis_map); free(m->mpos);
     m->vis_rows = NULL; m->vis_map = NULL; m->mpos = NULL;
@@ -3251,6 +3470,19 @@ static int q36_vision_attach(Model *m, const float *patches, int grid_h, int gri
             return -1;
         }
     q36_vision_detach(m);
+    if (c->vis_lfm3) {   /* LFM3: the picture's rows over its tokens, the text's positions unchanged */
+        m->vis_rows = calloc((size_t)tokens * c->hidden, sizeof(float));
+        m->vis_map = malloc((size_t)n * sizeof(int));
+        if (!m->vis_rows || !m->vis_map) { q36_vision_detach(m); return -1; }
+        double t0 = now_s();
+        if (lfm3_vision_forward(&m->lvis, patches, grid_h, grid_w, m->vis_rows) != tokens) { q36_vision_detach(m); return -1; }
+        fprintf(stderr, "[qwen36] picture: %d x %d patches, %d rows, the tower %.2f s\n", grid_h, grid_w, tokens, now_s() - t0);
+        const char *dump = getenv("Q36_VIS_DUMP");   /* the picture's rows, raw f32, for a check against a reference */
+        if (dump && *dump) { FILE *f = fopen(dump, "wb"); if (f) { fwrite(m->vis_rows, sizeof(float), (size_t)tokens * c->hidden, f); fclose(f); } }
+        for (int i = 0; i < n; i++) m->vis_map[i] = i >= first && i < first + tokens ? i - first : -1;
+        m->vis_rows_n = tokens; m->vis_map_len = n;
+        return tokens;
+    }
     m->vis_rows = calloc((size_t)tokens * c->hidden, sizeof(float));
     m->vis_map = malloc((size_t)n * sizeof(int));
     m->mpos = malloc((size_t)n * 3 * sizeof(int));
@@ -3334,15 +3566,17 @@ static void gguf_load_cfg(Cfg *c) {
      * layers, layers without RoPE, dense layers in front and sigmoid routing */
     /* muse-spark: Muse Spark (meta-models/Muse-Spark-Open), every layer attention, the
      * layer of the Cfg comment */
-    const int dense = arch && (!strcmp(arch, "qwen35") || !strcmp(arch, "qwen3"));
+    /* lfm3: LFM3 (LiquidAI/LFM3-VL), dense, short convolutions and attention (the Cfg comment) */
+    const int lfm3 = arch && !strcmp(arch, "lfm3");
+    const int dense = arch && (!strcmp(arch, "qwen35") || !strcmp(arch, "qwen3") || lfm3);
     const int flint = arch && !strcmp(arch, "flint");
     const int muse = arch && !strcmp(arch, "muse-spark");
     const int plain = arch && (!strcmp(arch, "qwen3moe") || !strcmp(arch, "qwen3") || flint || muse);
     if (!arch || (strcmp(arch, "qwen35moe") && !dense && !plain)) {
         fprintf(stderr, "GGUF architecture '%s' is not one of qwen35moe (Qwen3.5 / 3.6 MoE), qwen35 (their dense models), "
-                        "qwen3moe (Qwen3 MoE), qwen3 (dense Qwen3), flint or muse-spark: this engine cannot run it\n", arch ? arch : "?"); exit(1);
+                        "qwen3moe (Qwen3 MoE), qwen3 (dense Qwen3), flint, muse-spark or lfm3: this engine cannot run it\n", arch ? arch : "?"); exit(1);
     }
-    g_gguf_plain = plain;
+    g_gguf_plain = plain || lfm3;
     char key[128];
     #define GK(k) (snprintf(key, sizeof key, "%s.%s", arch, k), key)
     memset(c, 0, sizeof *c);
@@ -3351,6 +3585,11 @@ static void gguf_load_cfg(Cfg *c) {
     c->hidden   = (int)gguf_get_int(g, GK("embedding_length"), 0);
     c->q_heads  = (int)gguf_get_int(g, GK("attention.head_count"), 0);
     c->kv_heads = (int)gguf_get_int(g, GK("attention.head_count_kv"), 0);
+    {   /* Ollama's converter writes it per layer (0 on the DeltaNet layers): the attention layers' value */
+        const gguf_kv *kvh = gguf_get(g, GK("attention.head_count_kv"));
+        if (kvh && kvh->type == GGUF_T_ARRAY && kvh->arr && (kvh->atype == GGUF_T_U32 || kvh->atype == GGUF_T_I32))
+            for (uint64_t j = 0; j < kvh->n; j++) { int v = (int)((const int32_t *)kvh->arr)[j]; if (v > c->kv_heads) c->kv_heads = v; }
+    }
     c->head_dim = (int)gguf_get_int(g, GK("attention.key_length"), c->q_heads > 0 ? c->hidden / c->q_heads : 0);
     c->k_head_dim = c->head_dim;
     c->v_head_dim = (int)gguf_get_int(g, GK("attention.value_length"), c->head_dim);
@@ -3407,22 +3646,34 @@ static void gguf_load_cfg(Cfg *c) {
                  "GGUF muse-spark: moe_latent_size %d, sliding_window %d, post_norm_epsilon %g, logit_scale %g, softcapping %g",
                  q36_eh(c), c->window, c->post_eps, c->logit_scale, c->softcap);
     }
+    if (lfm3) {
+        /* the conv's window rides on the DeltaNet layers' ring: hidden channels, l_cache taps */
+        c->lfm3 = 1;
+        c->dn_convk = (int)gguf_get_int(g, GK("shortconv.l_cache"), 0);
+        c->dn_conv_dim = c->hidden; c->dn_vheads = c->dn_kheads = c->dn_kdim = c->dn_vdim = 0;
+        c->window = (int)gguf_get_int(g, GK("attention.sliding_window"), 0);
+        c->theta_swa = (float)gguf_get_float(g, GK("rope.freq_base_swa"), c->theta);
+        CFG_NEED(c->dn_convk >= 2 && c->dn_convk <= 64 && c->window > 0,
+                 "GGUF lfm3: shortconv.l_cache %d, sliding_window %d", c->dn_convk, c->window);
+    }
     #undef GK
     CFG_NEED(c->n_layers > 0 && c->n_layers <= 512 && c->hidden > 0 && c->q_heads > 0 && c->head_dim > 0 && interval > 0,
              "GGUF metadata: layers %d hidden %d heads %d head_dim %d interval %d", c->n_layers, c->hidden, c->q_heads, c->head_dim, interval);
     if (plain) {   /* no DeltaNet: every layer attends; the rotary spans the head */
         if (!rope_given) rope_n = c->head_dim;
         interval = 1;
+    } else if (lfm3) {   /* the layers' kinds come from their tensors, below */
+        if (!rope_given) rope_n = c->head_dim;
     } else {
         CFG_NEED(c->dn_vheads > 0 && inner % c->dn_vheads == 0, "GGUF ssm.inner_size %d / time_step_rank %d", inner, c->dn_vheads);
         c->dn_vdim = inner / c->dn_vheads;
         c->dn_conv_dim = 2 * c->dn_kheads * c->dn_kdim + c->dn_vheads * c->dn_vdim;
     }
-    c->n_group = 1; c->topk_group = 1; c->norm_topk = 1; c->attn_output_gate = !plain;
+    c->n_group = 1; c->topk_group = 1; c->norm_topk = 1; c->attn_output_gate = !plain && !lfm3;
     c->partial_rotary_factor = (float)rope_n / (float)c->head_dim;
     c->rotary_dim = rope_n; c->rope_dim = rope_n;
     c->o_in = c->q_heads * c->head_dim;
-    c->q_head_dim = plain ? c->head_dim : c->head_dim * 2;
+    c->q_head_dim = plain || lfm3 ? c->head_dim : c->head_dim * 2;
     c->expert_gs = 0;
     const gguf_tensor *emb = gguf_find(g, "token_embd.weight");
     CFG_NEED(emb && emb->ne[0] == c->hidden, "GGUF token_embd.weight missing or not [hidden x vocab]");
@@ -3434,6 +3685,12 @@ static void gguf_load_cfg(Cfg *c) {
         snprintf(nm, sizeof nm, "blk.%d.attn_q.weight", i);
         const gguf_tensor *q = gguf_find(g, nm);
         c->is_attn[i] = q != NULL;
+        if (lfm3) {   /* head_count_kv per layer: 0 on a conv layer */
+            const gguf_kv *kvh = gguf_get(g, "lfm3.attention.head_count_kv");
+            const long kv_i = kvh && kvh->type == GGUF_T_ARRAY && kvh->arr && (uint64_t)i < kvh->n ? q36_kv_arr_int(kvh, (uint64_t)i) : c->kv_heads;
+            CFG_NEED((kv_i > 0) == c->is_attn[i] && (!kv_i || kv_i == c->kv_heads),
+                     "GGUF lfm3 layer %d: head_count_kv %ld and its attention tensors disagree", i, kv_i);
+        } else
         CFG_NEED(c->is_attn[i] == ((i + 1) % interval == 0), "GGUF layer %d: attention tensors disagree with full_attention_interval %d", i, interval);
         if (q) {
             c->n_active++;
@@ -3443,6 +3700,10 @@ static void gguf_load_cfg(Cfg *c) {
     }
     snprintf(nm, sizeof nm, "blk.%d.attn_q_norm.weight", c->n_layers - 1);
     c->has_qk_norm = gguf_find(g, nm) != NULL;
+    for (int i = 0; lfm3 && !c->has_qk_norm && i < c->n_layers; i++) {   /* its last layer is a conv */
+        snprintf(nm, sizeof nm, "blk.%d.attn_q_norm.weight", i);
+        c->has_qk_norm = c->is_attn[i] && gguf_find(g, nm) != NULL;
+    }
     if (flint) {
         c->attn_sinks = gguf_find(g, "blk.0.attn_sinks.weight") != NULL;
         c->win_layer = calloc((size_t)c->n_layers, 1); c->nope_layer = calloc((size_t)c->n_layers, 1);
@@ -3487,9 +3748,52 @@ static void gguf_load_cfg(Cfg *c) {
                         "between two projections, logits x %g capped at %g\n",
                 nwin, c->window, c->n_layers - nwin, q36_eh(c), c->logit_scale, c->softcap);
     }
+    if (lfm3) {
+        /* sliding_window_pattern: 1 on a sliding layer (theta_swa, every frequency). The full
+         * layers rotate the frequencies rope_freqs leaves at 1, a prefix; the others carry a
+         * factor that divides them to nothing (1e30): HF's partial_rotary_factor, zero-tailed */
+        c->win_layer = calloc((size_t)c->n_layers, 1);
+        if (!c->win_layer) { fprintf(stderr, "OOM lfm3 layers\n"); exit(1); }
+        const gguf_kv *a = gguf_get(g, "lfm3.attention.sliding_window_pattern");
+        CFG_NEED(a && a->type == GGUF_T_ARRAY && a->atype == GGUF_T_BOOL && a->n == (uint64_t)c->n_layers,
+                 "GGUF lfm3.attention.sliding_window_pattern: a bool per layer (%d)", c->n_layers);
+        int nwin = 0;
+        for (int i = 0; i < c->n_layers; i++) {
+            c->win_layer[i] = ((const uint8_t *)a->arr)[i] != 0;
+            CFG_NEED(!c->win_layer[i] || c->is_attn[i], "GGUF lfm3 layer %d: a sliding window on a conv layer", i);
+            nwin += c->win_layer[i];
+        }
+        const int half = c->head_dim / 2;
+        CFG_NEED(rope_n == c->head_dim, "GGUF lfm3.rope.dimension_count %d: the rotary spans the head (%d)", rope_n, c->head_dim);
+        c->rot_full = half;
+        const gguf_tensor *rf = gguf_mark(g, "rope_freqs.weight");
+        if (rf) {
+            CFG_NEED(gg_numel(rf) == half, "GGUF rope_freqs.weight: %lld factors for %d frequencies", (long long)gg_numel(rf), half);
+            float *f = g_gguf_dry ? NULL : falloc(half);
+            if (f) {
+                if (gguf_read_f32(g, rf, f)) { fprintf(stderr, "GGUF rope_freqs.weight: read failed\n"); exit(1); }
+                int k = 0; while (k < half && f[k] == 1.f) k++;
+                for (int j = k; j < half; j++)
+                    CFG_NEED(f[j] >= 1e20f, "GGUF rope_freqs.weight[%d] = %g: only a prefix of 1 and the rest unrotated", j, f[j]);
+                c->rot_full = k; free(f);
+            }
+        }
+        fprintf(stderr, "[gguf] lfm3: %d layers (%d attention, %d of them sliding over %d rows), hidden %d, MLP %d, vocab %d, "
+                        "conv %d taps, full layers rotate %d of %d frequencies (theta %g), sliding all (theta %g)\n",
+                c->n_layers, c->n_active, nwin, c->window, c->hidden, c->shared_inter, c->vocab, c->dn_convk,
+                c->rot_full, half, c->theta, c->theta_swa);
+    }
     snprintf(nm, sizeof nm, "blk.0.exp_probs_b.bias");
     c->has_bias = gguf_find(g, nm) != NULL;
-    if (plain && dense)
+    if (lfm3) {
+        if (g_mmproj_open && q36_mmproj_cfg(c)) {   /* the picture's placeholder, by its piece */
+            const gguf_kv *tk = gguf_get(g, "tokenizer.ggml.tokens");
+            for (uint64_t i = 0; tk && tk->type == GGUF_T_ARRAY && tk->atype == GGUF_T_STRING && i < tk->n; i++)
+                if (tk->strs[i] && !strcmp(tk->strs[i], "<|image|>")) { c->image_token = (int)i; break; }
+            if (c->image_token < 0) { fprintf(stderr, "[gguf] lfm3: an mmproj but no <|image|> token; text only\n"); c->vis_depth = 0; }
+        }
+    }
+    else if (plain && dense)
         fprintf(stderr, "[gguf] qwen3 (dense): %d layers (all attention), hidden %d, MLP %d, vocab %d\n",
                 c->n_layers, c->hidden, c->shared_inter, c->vocab);
     else if (plain)
@@ -3527,6 +3831,18 @@ static void gguf_expert_held(Model *m, GqExp *x) {
     if (tot > m->gqe_max) m->gqe_max = tot;
 }
 static int gguf_expert_ilv(const GqExp *x) { return x->hg != x->tg || x->hu != x->tu || x->hd != x->td; }
+/* The CUDA expert tier takes a GGUF's experts as the file has them: the RAM slots then hold the
+ * file's rows too, not the rows interleaved by 16. The tier reads them in place (an interleaved
+ * slot unpacked each into a second buffer of its own: Flint UD-Q3_K_XL, an 18.5 GB file, took
+ * 30.6 GB of RSS), the host pool copies a prompt chunk's experts from them to the device, and
+ * the CPU computes its experts eight rows at a time (gq_rows_f8). Before any slot is filled. */
+static void gguf_hold_file_rows(Model *m) {
+    for (int i = 0; i < m->c.n_layers; i++) {
+        GqExp *x = &m->gqx[i];
+        x->hg = x->tg; x->hu = x->tu; x->hd = x->td;
+        x->hb_g = x->eb_g; x->hb_u = x->eb_u; x->hb_d = x->eb_d;
+    }
+}
 
 /* GGUF mode: locate every layer's fused expert tensors and size the slot. */
 static void gguf_map_experts(Model *m) {
@@ -3615,6 +3931,8 @@ static int gguf_report_unused(const Cfg *c) {
         if (L > 12 && !strcmp(t->name + L - 12, ".input_scale")) continue;
         int layer = -1;
         if (sscanf(t->name, "blk.%d.", &layer) == 1 && layer >= c->n_layers) continue;   /* MTP / nextn */
+        /* Ollama's files carry the MTP head (mtp.*) and the vision tower and projector (v.*, mm.*) in the model's file */
+        if (!strncmp(t->name, "mtp.", 4) || !strncmp(t->name, "v.", 2) || !strncmp(t->name, "mm.", 3)) continue;
         n++;
         char pat[96]; const char *d = t->name; int o = 0;   /* blk.N. -> blk.*. for a short summary */
         while (*d && o < 90) { if (d[0] == '.' && d[1] >= '0' && d[1] <= '9') { pat[o++] = '.'; pat[o++] = '*'; d++; while (*d >= '0' && *d <= '9') d++; } else pat[o++] = *d++; }
@@ -3789,6 +4107,16 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.pre_expert_norm.weight", ai);
             l->pre_en = load_norm_n(m, nm, q36_eh(c));
         }
+        if (c->lfm3) {   /* LFM3 (the Cfg comment): the norms after each branch, the heads' gate */
+            snprintf(nm,sizeof(nm),"model.layers.%d.post_operator_norm.weight", ai);
+            l->post_op = load_norm_n(m, nm, c->hidden);
+            snprintf(nm,sizeof(nm),"model.layers.%d.post_feedforward_layernorm.weight", ai);
+            l->post_ffn = load_norm_n(m, nm, c->hidden);
+            if (c->is_attn[i]) {
+                snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.gate_proj.weight", ai);
+                load_tq_noted(m, nm, c->hidden, c->q_heads, quantize_dense, "attn", &l->ag); QCOUNT(l->ag);
+            }
+        }
         if (c->is_attn[i]) {
             /* Gated Attention (full_attention) layer, dense projections int8-during-load */
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.q_proj.weight", ai);
@@ -3801,6 +4129,15 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
             load_tq_noted(m, nm, c->o_in, c->hidden, quantize_dense, "attn", &l->o); QCOUNT(l->o);
             l->dn_qkv=l->dn_z=(QW){0}; l->dn_b=l->dn_a=l->dn_conv=NULL;
             l->dn_dtbias=l->dn_alog=l->dn_norm=NULL; l->dn_out=(QW){0};
+        } else if (c->lfm3) {
+            /* LFM3's short conv: in_proj to B, C and x, the taps by channel, out_proj */
+            l->q=l->k=l->v=l->o=(QW){0};
+            snprintf(nm,sizeof(nm),"model.layers.%d.conv.in_proj.weight", ai);
+            load_tq_noted(m, nm, c->hidden, 3 * c->hidden, quantize_dense, "scproj", &l->sc_in); QCOUNT(l->sc_in);
+            snprintf(nm,sizeof(nm),"model.layers.%d.conv.conv.weight", ai);
+            l->sc_conv = load_t_n(m, nm, (int64_t)c->hidden * c->dn_convk);
+            snprintf(nm,sizeof(nm),"model.layers.%d.conv.out_proj.weight", ai);
+            load_tq_noted(m, nm, c->hidden, c->hidden, quantize_dense, "scproj", &l->sc_out); QCOUNT(l->sc_out);
         } else {
             /* Gated DeltaNet (linear_attention) layer */
             l->q=l->k=l->v=l->o=(QW){0};
@@ -3881,8 +4218,8 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     m->dn_dev_fresh = calloc((size_t)c->n_layers, 1); m->dn_host_stale = calloc((size_t)c->n_layers, 1); m->dn_dev = 0;
     for (int i = layer_begin; allocate_state && i < layer_end; i++) {
         if (c->is_attn[i]) { m->DN_rec[i] = NULL; m->DN_conv[i] = NULL; continue; }
-        if (c->dn_vheads <= 0) { fprintf(stderr, "layer %d is DeltaNet but dn dims missing from meta\n", i); exit(1); }
-        m->DN_rec[i]  = calloc((size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, sizeof(float));
+        if (c->dn_vheads <= 0 && !c->lfm3) { fprintf(stderr, "layer %d is DeltaNet but dn dims missing from meta\n", i); exit(1); }
+        m->DN_rec[i]  = calloc(q36_rec_cells(c), sizeof(float));
         m->DN_conv[i] = calloc((size_t)c->dn_conv_dim * (c->dn_convk - 1), sizeof(float));
     }
     m->freq = calloc((size_t)c->n_layers * c->n_experts, sizeof(uint32_t));
@@ -4474,6 +4811,20 @@ static void rope_head_partial(float *x, int pos, int rope_dim, int head_dim, flo
     }
 }
 
+/* LFM3's rotation (HF Lfm3RotaryEmbedding, zero-tailed): the pairs (j, j + hd/2) of the first
+ * nrot frequencies of the whole head, theta^(-2j/hd); the others stay as they are. With
+ * nrot = hd/2 it is rope_head_partial over the head, operation for operation. */
+static void rope_head_zt(float *x, int pos, int hd, int nrot, float theta) {
+    int h = hd / 2;
+    for (int j = 0; j < nrot && j < h; j++) {
+        float inv = powf(theta, -2.0f * j / hd);
+        float ang = pos * inv, cs = cosf(ang), sn = sinf(ang);
+        float a = x[j], b = x[j+h];
+        x[j]   = a*cs - b*sn;
+        x[j+h] = b*cs + a*sn;
+    }
+}
+
 /* The same rotation with a position per axis (interleaved M-RoPE, see Cfg).
  * With the three positions equal it is rope_head_partial, operation for
  * operation. */
@@ -4533,6 +4884,10 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     }
     const Q36Row *mr = m->mux_rows;   /* a multiplexed step: each row's own conversation and position */
     const int nope = c->nope_layer && c->nope_layer[layer];   /* Flint: a layer without RoPE */
+    /* LFM3: a sliding layer rotates every frequency at theta_swa, a full one the first rot_full at theta */
+    const int lswa = c->lfm3 && c->win_layer && c->win_layer[layer];
+    const int lrot = c->lfm3 ? (lswa ? hd / 2 : c->rot_full) : 0;
+    const float ltheta = lswa ? c->theta_swa : c->theta;
     for (int s = 0; s < S; s++) {
         int pos = mr ? mr[s].pos : pos_base + s;
         /* the rope of the row's conversation: an image turn's decode rows sit at
@@ -4544,14 +4899,16 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             float *qh = query + ((int64_t)s*H + hh)*hd;
             if (l->qn) rmsnorm_row(qh, qh, l->qn, hd, c->eps);
             if (nope) continue;
-            if (mrope) rope_head_mrope(qh, p3, c->mrope_section, rotary, c->theta);
+            if (c->lfm3) rope_head_zt(qh, pos, hd, lrot, ltheta);
+            else if (mrope) rope_head_mrope(qh, p3, c->mrope_section, rotary, c->theta);
             else rope_head_partial(qh, pos, rotary, hd, c->theta);
         }
         for (int kvh = 0; kvh < KV; kvh++) {
             float *kh = k + (int64_t)s*KV*kvd + kvh*kvd;
             if (l->kn) rmsnorm_row(kh, kh, l->kn, kvd, c->eps);
             if (nope) continue;
-            if (mrope) rope_head_mrope(kh, p3, c->mrope_section, rotary, c->theta);
+            if (c->lfm3) rope_head_zt(kh, pos, kvd, lrot, ltheta);
+            else if (mrope) rope_head_mrope(kh, p3, c->mrope_section, rotary, c->theta);
             else rope_head_partial(kh, pos, rotary, kvd, c->theta);
         }
     }
@@ -4641,6 +4998,15 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             gate = falloc((int64_t)S*H*hd); gate_dim = hd;
             if (!qtd_batch(l->qth_ag, gate, x, S, D, H*hd)) matmul_d(gate, x, &l->ag, S, D, H*hd);
         }
+    }
+    /* LFM3: one gate per head, its own projection of the attention's input (attn_gate, D -> H),
+     * spread over the head's hd outputs */
+    if (c->lfm3 && l->ag.O) {
+        float *hg = falloc((int64_t)S*H);
+        if (!qtd_batch(l->qth_ag, hg, x, S, D, H)) matmul_d(hg, x, &l->ag, S, D, H);
+        gate = falloc((int64_t)S*H*hd); gate_dim = hd;
+        for (int64_t r = 0; r < (int64_t)S*H; r++) for (int dd = 0; dd < hd; dd++) gate[r*hd + dd] = hg[r];
+        free(hg);
     }
     /* apply attn_output_gate: attn_out *= sigmoid(gate). Without a gate (Qwen3 MoE)
      * the output passes as it is: a missing gate is not sigmoid(0) = 0.5. */
@@ -5159,21 +5525,23 @@ static void moe_vk_run(Model *m, Layer *l, int layer, const float *x, int S, flo
 /* Decode (one token, cache can hold all K at once): every routed expert's
  * gate and up rows in ONE parallel region, then every down row in another,
  * instead of two regions per expert. Returns 0, or -1 to take the general path. */
-/* u rows of W from its first (a group of 16 when t is a GQ_*_R16 form) against the
- * one-row activation a */
+/* u rows of W from its first (a group of 16 when t is a GQ_*_R16 form, eight file rows
+ * through gq_rows_f8) against the one-row activation a */
 static inline void gq_rows_u(float *y, int u, const gq_act *a, const uint8_t *W, int t, int I) {
 #ifdef GQ_R16_ON
     if (gq_r16_base(t) >= 0) { gq_r16_rows(t, y, 16, W, a, I); return; }
 #endif
     const int64_t rb = gq_row_bytes(t, I);
+    if (u == 8 && gq_f8_ok(t, I)) { gq_rows_f8(y, 8, a, W, rb, t, I, 8); return; }
     for (int j = 0; j < u; j++) gq_row_all(y + j, 1, a, W + (int64_t)j * rb, t, I);
 }
 static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const int *idx, const float *val) {
     Cfg *c = &m->c; const int D = q36_eh(c), K = c->topk, I = c->inter;
     const GqExp *gx = &m->gqx[layer];
     if (m->cache[layer].cap < K || K > 64 || !gq_int_ok(gx->hg, D) || !gq_int_ok(gx->hu, D) || !gq_int_ok(gx->hd, I)) return -1;
-    /* rows interleaved by 16 (q36_gq_held) go a group at a time, and then every matrix's rows by 16 */
-    const int u = gguf_expert_ilv(gx) ? 16 : 1;
+    /* rows interleaved by 16 (q36_gq_held) go a group at a time, and then every matrix's rows by 16;
+     * the file's rows by eight where all three types have gq_rows_f8 */
+    const int u = gguf_expert_ilv(gx) ? 16 : I % 8 == 0 && D % 8 == 0 && gq_f8_ok(gx->hg, D) && gq_f8_ok(gx->hu, D) && gq_f8_ok(gx->hd, I) ? 8 : 1;
     if (u == 16 && (I % 16 || D % 16)) return -1;
     Slot *sl[64]; int ids[64]; float w[64]; int n = 0;
     for (int k = 0; k < K; k++) if (idx[k] >= 0) { ids[n] = idx[k]; w[n] = val[k]; n++; }
@@ -5640,6 +6008,41 @@ static int dn_gpu_env_on(void) {
     return on;
 }
 
+/* LFM3's short gated convolution (HF Lfm3ShortConv): B, C, x = in_proj(x) in three, then
+ * out_proj(C * conv(B * x)). The conv is causal and by channel over dn_convk taps,
+ * conv[t] = sum_k w[k] * bx[t + k - (K-1)]; the K-1 rows before the step come from the ring
+ * (DN_conv[layer], [hidden, K-1], oldest first, deltanet's layout) and the step's rows go in
+ * after them, each conversation's own in a multiplexed step, and a verify keeps the ring after
+ * each row as deltanet does. A prompt runs channel by channel, every row in order: the same
+ * sums in the same order as one row at a time. */
+static void shortconv(Model *m, Layer *l, int layer, const float *x, int S, float *out) {
+    Cfg *c = &m->c;
+    const int D = c->hidden, K = c->dn_convk, W = K - 1;
+    float *bcx = falloc((int64_t)S * 3 * D), *y = falloc((int64_t)S * D);
+    if (!qtd_batch(l->qth_scin, bcx, x, S, D, 3 * D)) matmul_d(bcx, x, &l->sc_in, S, D, 3 * D);
+    const Q36Row *mr = m->mux_rows;
+    float *ring = m->DN_conv ? m->DN_conv[layer] : NULL;
+    #pragma omp parallel for schedule(static) if ((int64_t)S * D >= 65536)
+    for (int ch = 0; ch < D; ch++) {
+        const float *w = l->sc_conv + (int64_t)ch * K;
+        for (int s = 0; s < S; s++) {
+            float *rg = (mr ? mr[s].seq->DN_conv[layer] : ring) + (int64_t)ch * W;
+            const float *r = bcx + (int64_t)s * 3 * D;
+            const float bx = r[ch] * r[2 * D + ch];
+            float acc = 0.f;
+            for (int k = 0; k < W; k++) acc += w[k] * rg[k];
+            acc += w[W] * bx;
+            for (int k = 0; k + 1 < W; k++) rg[k] = rg[k + 1];
+            rg[W - 1] = bx;
+            y[(int64_t)s * D + ch] = r[D + ch] * acc;
+            /* a verify: the ring after each of its first snap_rows rows (q36_spec_rollback) */
+            if (s < m->snap_rows) memcpy(m->snap_conv[s][layer] + (int64_t)ch * W, rg, (size_t)W * sizeof(float));
+        }
+    }
+    if (!qtd_batch(l->qth_scout, out, y, S, D, D)) matmul_d(out, y, &l->sc_out, S, D, D);
+    free(bcx); free(y);
+}
+
 static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     (void)pos_base;
     Cfg *c = &m->c;
@@ -5726,6 +6129,72 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
         matmul(bb, xb, l->dn_b, rows, H, vh);
         matmul(ab, xb, l->dn_a, rows, H, vh);
         if (tm_on() && S==1){ double t=tm_now(); g_dn_sub[0]+=t-_d0; _d0=t; }
+        /* A prompt's block (not a multiplexed step, a verify or DN_DBG): the conv by channel with
+         * every row in order, then each value head with every row in turn while its state is in
+         * one core's cache, two passes over it a row (the decay with k^T S, the update with q^T S
+         * on the updated row) and its gated norm, in one parallel region for the block. The
+         * per-row loop below forked a region per row for four passes. Every value is computed
+         * from the same values with the same operations in the same order: the same bits. */
+        if (rows > 1 && !m->mux_rows && !dbg && m->snap_rows <= 0) {
+            float *conv_all = falloc((int64_t)rows * conv_dim);
+            #pragma omp parallel for schedule(static)
+            for (int cc = 0; cc < conv_dim; cc++) {
+                const float *w = l->dn_conv + (int64_t)cc * convk;
+                float *rg = ring + (int64_t)cc * (convk - 1);
+                for (int r = 0; r < rows; r++) {
+                    const float *qkv = gpu_block ? qkvz + (int64_t)r * proj_dim : qkvb + (int64_t)r * conv_dim;
+                    float acc = 0.f;
+                    for (int kk = 0; kk < convk - 1; kk++) acc += w[kk] * rg[kk];
+                    acc += w[convk - 1] * qkv[cc];
+                    conv_all[(int64_t)r * conv_dim + cc] = acc / (1.f + expf(-acc));   /* silu */
+                    for (int kk = 0; kk < convk - 2; kk++) rg[kk] = rg[kk + 1];
+                    rg[convk - 2] = qkv[cc];
+                }
+            }
+            #pragma omp parallel for schedule(static)
+            for (int h = 0; h < vh; h++) {
+                float qh[512], kh[512], kvl[512], dl[512], ov[512];   /* kdim, vdim <= 512 */
+                float *Sh = rec + (int64_t)h * kdim * vdim;
+                const int vk_idx = g_dn_tiled ? h % vk : h / rep;
+                for (int r = 0; r < rows; r++) {
+                    const float *cv = conv_all + (int64_t)r * conv_dim;
+                    const float *b = bb + (int64_t)r * vh, *a = ab + (int64_t)r * vh;
+                    const float bet = 1.f / (1.f + expf(-b[h]));
+                    const float g = (g_ssm_a_direct ? l->dn_alog[h] : -expf(l->dn_alog[h])) * softplus_f(a[h] + l->dn_dtbias[h]);
+                    memcpy(qh, cv + (int64_t)vk_idx * kdim, kdim * sizeof(float));
+                    memcpy(kh, cv + key_dim_tot + (int64_t)vk_idx * kdim, kdim * sizeof(float));
+                    double sq = 1e-6; for (int d = 0; d < kdim; d++) sq += (double)qh[d] * qh[d];
+                    double nq = sqrt(sq);
+                    for (int d = 0; d < kdim; d++) qh[d] = (float)((double)qh[d] / nq * scale);
+                    double sk = 1e-6; for (int d = 0; d < kdim; d++) sk += (double)kh[d] * kh[d];
+                    double nk = sqrt(sk);
+                    for (int d = 0; d < kdim; d++) kh[d] = (float)((double)kh[d] / nk);
+                    const float egh = expf(g);
+                    const float *vd = cv + 2 * key_dim_tot + (int64_t)h * vdim;
+                    for (int vv = 0; vv < vdim; vv++) kvl[vv] = 0.f;
+                    for (int kk = 0; kk < kdim; kk++) {
+                        float kkd = kh[kk]; float *Sr = Sh + (int64_t)kk * vdim;
+                        for (int vv = 0; vv < vdim; vv++) { Sr[vv] *= egh; kvl[vv] += kkd * Sr[vv]; }
+                    }
+                    for (int vv = 0; vv < vdim; vv++) dl[vv] = (vd[vv] - kvl[vv]) * bet;
+                    for (int vv = 0; vv < vdim; vv++) ov[vv] = 0.f;
+                    for (int kk = 0; kk < kdim; kk++) {
+                        float kkd = kh[kk], qkd = qh[kk]; float *Sr = Sh + (int64_t)kk * vdim;
+                        for (int vv = 0; vv < vdim; vv++) { Sr[vv] += kkd * dl[vv]; ov[vv] += qkd * Sr[vv]; }
+                    }
+                    const float *zr = (gpu_block ? qkvz + (int64_t)r * proj_dim + conv_dim : zb + (int64_t)r * value_dim) + (int64_t)h * vdim;
+                    const float *w = l->dn_norm;
+                    double ms = 0; for (int d = 0; d < vdim; d++) ms += (double)ov[d] * ov[d];
+                    float rr = 1.f / sqrtf((float)(ms / vdim) + c->eps);
+                    float *outr = outrb + (int64_t)r * value_dim + (int64_t)h * vdim;
+                    for (int d = 0; d < vdim; d++) {
+                        float val = ov[d] * rr * w[d];
+                        outr[d] = val * zr[d] / (1.f + expf(-zr[d]));
+                    }
+                }
+            }
+            free(conv_all);
+        } else
         for (int r = 0; r < rows; r++) {
         if (m->mux_rows) { rec = m->mux_rows[base + r].seq->DN_rec[layer]; ring = m->mux_rows[base + r].seq->DN_conv[layer]; }
         const float *qkv = gpu_block ? qkvz + (int64_t)r * proj_dim : qkvb + (int64_t)r * conv_dim;
@@ -5878,7 +6347,8 @@ static void trunk_offer_dense(Model *m){
     Cfg *c = &m->c;
     for (int i = 0; i < c->n_layers; i++) {
         if (c->is_attn[i]) continue;
-        size_t b = qdw_bytes(&m->L[i].dn_out);
+        /* LFM3: a conv layer's two projections, its non-attention work */
+        size_t b = c->lfm3 ? qdw_bytes(&m->L[i].sc_in) + qdw_bytes(&m->L[i].sc_out) : qdw_bytes(&m->L[i].dn_out);
         if (b) qt_trunk_offer("dnout", i, b);
     }
     for (int i = 0; i < c->n_layers; i++) {
@@ -5917,7 +6387,12 @@ static int trunk_place_dense(Model *m, double *vram_bytes, int kinds[3]){
     kinds[0] = kinds[1] = kinds[2] = 0;   /* dnout, attnproj, shexp: the line says which went up */
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
-        if (!c->is_attn[i]) {
+        if (!c->is_attn[i] && c->lfm3) {
+            int dev = qt_place_of("dnout", i);
+            l->qth_scin = qdw_place(&l->sc_in, dev); l->qth_scout = qdw_place(&l->sc_out, dev);
+            if (l->qth_scin) { placed++; kinds[0]++; vram += (double)qdw_bytes(&l->sc_in); }
+            if (l->qth_scout) { placed++; kinds[0]++; vram += (double)qdw_bytes(&l->sc_out); }
+        } else if (!c->is_attn[i]) {
             l->qth_dnout = qdw_place(&l->dn_out, qt_place_of("dnout", i));
             if (l->qth_dnout) { placed++; kinds[0]++; vram += (double)qdw_bytes(&l->dn_out); }
         } else {
@@ -6031,12 +6506,16 @@ static int layers_forward_control(Model *m, float *x, int S, int pos_base,
         if (c->is_attn[i]) {
             attention(m, l, i, nrm, S, pos_base, tmp);
             tm_add(S, 1, tm_now()-_t0);
+        } else if (c->lfm3) {
+            shortconv(m, l, i, nrm, S, tmp);
+            tm_add(S, 0, tm_now()-_t0);
         } else {
             deltanet(m, l, i, nrm, S, pos_base, tmp);
             tm_add(S, 0, tm_now()-_t0);
         }
         if (lf) fwrite(tmp + (int64_t)(S-1)*D, sizeof(float), D, lf);   /* sublayer output */
         if (c->muse) for (int s = 0; s < S; s++) rmsnorm_plain(tmp + (int64_t)s*D, tmp + (int64_t)s*D, D, c->post_eps);
+        if (c->lfm3) for (int s = 0; s < S; s++) rmsnorm_row(tmp + (int64_t)s*D, tmp + (int64_t)s*D, l->post_op, D, c->eps);
         q36_residual(x, tmp, l->ra_a, l->ra_b, S, D);
         if (lf) fwrite(x + (int64_t)(S-1)*D, sizeof(float), D, lf);   /* post-deltanet residual */
         if (allow_prefetch && g_pilot >= 1 && S <= 8 && i + 1 < c->n_layers)
@@ -6046,6 +6525,7 @@ static int layers_forward_control(Model *m, float *x, int S, int pos_base,
         moe(m, l, i, nrm, S, tmp);
         tm_add(S, 2, tm_now()-_t0);
         if (c->muse) for (int s = 0; s < S; s++) rmsnorm_scaled(tmp + (int64_t)s*D, tmp + (int64_t)s*D, l->post_fn, D, c->post_eps);
+        if (c->lfm3) for (int s = 0; s < S; s++) rmsnorm_row(tmp + (int64_t)s*D, tmp + (int64_t)s*D, l->post_ffn, D, c->eps);
         q36_residual(x, tmp, l->rf_a, l->rf_b, S, D);
         if (lf) fwrite(x + (int64_t)(S-1)*D, sizeof(float), D, lf);
         if (allow_prefetch && g_pilot >= 2 && S <= 8 && i + 2 < c->n_layers)
@@ -6180,6 +6660,16 @@ static void q36_embed_row(Model *m, int id, int pos, float *row) {
 
 #ifdef COLI_CUDA
 #include "qwen36_cuda_chain.h"  /* COLI_CUDA_CHAIN: every layer's dense chain on the CUDA device */
+/* The CUDA chain's prompt staging (q36cc_gguf_stage_bytes), out of the tier's expert budget when
+ * the card holds fewer than every routed expert of a GGUF (qt_reserve_short): taken from the
+ * mirrors' room instead, a 16K prompt on Flint (RTX PRO 4000) found no memory for the routed
+ * experts' buffers and took the host's step from then on. COLI_CUDA_HOST_POOL=0: none. */
+static void q36_gguf_stage_reserve(Model *m) {
+    const char *e = getenv("COLI_CUDA_HOST_POOL");
+    size_t st = g_gguf && !(e && *e == '0') ? q36cc_gguf_stage_bytes(m) : 0, routed = 0;
+    for (int i = 0; i < m->c.n_layers; i++) routed += !q36_dense_l(&m->c, i);
+    if (st) qt_reserve_short(st, routed * (size_t)m->c.n_experts);
+}
 #endif
 
 /* The CUDA tier with every routed expert on the device, run by the CUDA chain: what a step
@@ -6233,8 +6723,11 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
                     ids[s], c->vocab - 1);
             exit(1);
         }
-        q36_embed_row(m, ids[s], pos_base + s, x + (int64_t)s*D);
     }
+    /* a prompt's rows over the team: each decoded from the file's blocks on its own (LFM3's
+     * Q6_K table, 2048 a row: on one thread the prompt waited for them before the device) */
+    #pragma omp parallel for schedule(static) if (S >= 16)
+    for (int s = 0; s < S; s++) q36_embed_row(m, ids[s], pos_base + s, x + (int64_t)s*D);
     tier_rebuild_evicted(m);
     int chain_n = 0;   /* layers the chain ran (a partial chain: the CPU runs the rest) */
     float *chain_logit = NULL;   /* the Vulkan or the CUDA chain ran the final norm and lm_head */
@@ -6425,7 +6918,7 @@ static int q36_seq_alloc(Model *m, Q36Seq *q) {
             q->K[i] = malloc(kv * q36_kv_es()); q->V[i] = malloc(kv * q36_kv_es());
             ok = q->K[i] && q->V[i];
         } else if (m->DN_rec[i]) {
-            q->DN_rec[i] = calloc((size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, sizeof(float));
+            q->DN_rec[i] = calloc(q36_rec_cells(c), sizeof(float));
             q->DN_conv[i] = calloc((size_t)c->dn_conv_dim * (c->dn_convk - 1), sizeof(float));
             ok = q->DN_rec[i] && q->DN_conv[i];
         }
@@ -6648,7 +7141,7 @@ static Q36PinState *q36_pin_state_save(Model *m, Q36PinState *reuse){
 #ifdef COLI_CUDA
     q36cc_sync_host(m);
 #endif
-    size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim;
+    size_t nr = q36_rec_cells(c);
     size_t nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
     Q36PinState *st = reuse;
     if (st && st->n_layers != c->n_layers) { q36_pin_state_free(st); st = NULL; }
@@ -6693,12 +7186,39 @@ static void pin_save(Model *m, const int *ids, int n, const float *logit){
     fprintf(stderr, "[PIN] scatto a %d token\n", n); fflush(stderr);
 }
 
+/* A saved state back into the Model: the DeltaNet layers' recurrences and conv windows,
+ * the MTP head's pending row. The chains and the card's DeltaNet copy read it from the
+ * host before their next step. */
+static void q36_pin_state_put(Model *m, const Q36PinState *st){
+    Cfg *c = &m->c;
+    size_t nr = q36_rec_cells(c);
+    size_t nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
+    for (int i = 0; i < c->n_layers; i++){
+        if (c->is_attn[i]) continue;
+        if (m->DN_rec[i]  && st->rec[i])  memcpy(m->DN_rec[i],  st->rec[i],  nr * sizeof(float));
+        if (m->DN_conv[i] && st->conv[i]) memcpy(m->DN_conv[i], st->conv[i], nc * sizeof(float));
+    }
+#ifdef COLI_VULKAN
+    q36c_host_wrote(m, 0);   /* the device's copy goes up again before the next chain step */
+#endif
+#ifdef COLI_CUDA
+    q36cc_host_wrote(m, 0);
+#endif
+    dn_gpu_invalidate(m);   /* restored on the host: the card's copy is from another prompt */
+    if (g_q36_mtp.on) {
+        g_q36_mtp.has_pend = st->mtp_valid;
+        if (st->mtp_valid) {
+            memcpy(g_q36_mtp.pend, st->mtp_pend, (size_t)c->hidden * sizeof(float));
+            g_q36_mtp.len = st->mtp_len;
+        }
+        g_q36_mtp.last_n = 0; g_q36_mtp.done_pos = -1;
+    }
+}
+
 /* Se la fotografia e un prefisso del nuovo prompt, la si rimette e si riparte
  * da li. Restituisce quanti token sono gia fatti, 0 se non si applica. */
 static int pin_restore(Model *m, const int *ids, int n){
     Cfg *c = &m->c;
-    size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim;
-    size_t nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
     g_pin_logit = NULL;
     /* Il piu profondo degli scatti che sia un prefisso stretto di questo
      * prompt. Gli strati di attenzione non stanno nella fotografia: le loro
@@ -6712,26 +7232,7 @@ static int pin_restore(Model *m, const int *ids, int n){
         Q36PinState *st = (Q36PinState *)k->state;
         if (st && kv_prefix_holds(&m->kvp, k->ids, k->len) &&
             q36_ring_holds(m->ring_pos, m->kv_ring, k->len - c->window + 1, k->len)) {   /* and the window's rows in the rings */
-            for (int i = 0; i < c->n_layers; i++){
-                if (c->is_attn[i]) continue;
-                if (m->DN_rec[i]  && st->rec[i])  memcpy(m->DN_rec[i],  st->rec[i],  nr * sizeof(float));
-                if (m->DN_conv[i] && st->conv[i]) memcpy(m->DN_conv[i], st->conv[i], nc * sizeof(float));
-            }
-#ifdef COLI_VULKAN
-            q36c_host_wrote(m, 0);   /* the device's copy goes up again before the next chain step */
-#endif
-#ifdef COLI_CUDA
-            q36cc_host_wrote(m, 0);
-#endif
-            dn_gpu_invalidate(m);   /* restored on the host: the card's copy is from another prompt */
-            if (g_q36_mtp.on) {
-                g_q36_mtp.has_pend = st->mtp_valid;
-                if (st->mtp_valid) {
-                    memcpy(g_q36_mtp.pend, st->mtp_pend, (size_t)c->hidden * sizeof(float));
-                    g_q36_mtp.len = st->mtp_len;
-                }
-                g_q36_mtp.last_n = 0; g_q36_mtp.done_pos = -1;
-            }
+            q36_pin_state_put(m, st);
             m->kv_len = k->len;
             kv_prefix_clear(&m->kvp);
             kv_prefix_record(&m->kvp, k->ids, 0, k->len);
@@ -6754,7 +7255,7 @@ static void reset_recurrent(Model *m){
     if (m->ring_pos) for (int r = 0; r < m->kv_ring; r++) m->ring_pos[r] = -1;
     for (int i = 0; i < c->n_layers; i++){
         if (c->is_attn[i]) continue;
-        if (m->DN_rec[i])  memset(m->DN_rec[i],  0, (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim * sizeof(float));
+        if (m->DN_rec[i])  memset(m->DN_rec[i],  0, q36_rec_cells(c) * sizeof(float));
         if (m->DN_conv[i]) memset(m->DN_conv[i], 0, (size_t)c->dn_conv_dim * (c->dn_convk - 1) * sizeof(float));
     }
 #ifdef COLI_VULKAN
@@ -6773,6 +7274,143 @@ static void q36_prefill_abort(Model *m) {
     m->resident_collecting = 0;
     m->first_step = 1;
     if (m->seen) memset(m->seen, 0, (size_t)m->c.n_layers * m->c.n_experts);
+}
+
+/* A client's short request between two turns of a conversation (Hermes asks for its title
+ * after the first) leaves the conversation after a few tokens and would take the only state
+ * there is: the conversation's next turn then reads every token again (Qwen3.6-35B on the
+ * CPU: 4,325 tokens, 32.1 s, where the turn after it read 25 in 6.6 s). The conversation is
+ * parked instead: its tokens, its DeltaNet state (a pin's copy, the MTP head's pending row)
+ * and the K/V rows the request may write over (a full layer's first rows, a sliding layer's
+ * ring rows, the MTP head's on the host and on the device); the request runs from the start;
+ * when its turn ends the conversation is back as it was, and its next turn reads only what
+ * is new. One conversation at a time (serve_one), a held one of at least Q36_PARK_MIN tokens
+ * (COLI_PARK_MIN sets another), a request shorter than it with what it may write;
+ * COLI_PARK=0 never parks. qwen38.c parks the same way. */
+#define Q36_PARK_MIN 1024
+#define Q36_PARK_GEN 4096                     /* the request's tokens whose rows are kept apart: past them it is not a short one */
+#define Q36_PARK_SPEC Q36_SPEC_ROWS          /* the rows a verify writes past the tokens that stand, and one more */
+static struct { int on, len, kv_len, rows, kv_cap, kv_ring, mtp_rows, mtp_stride; int *fed, *ring_pos;
+                Q36PinState *st; void **K, **V, *mk, *mv; } g_q36_park;
+
+static void q36_park_free(Model *m) {
+    for (int i = 0; i < m->c.n_layers; i++) {
+        if (g_q36_park.K) free(g_q36_park.K[i]);
+        if (g_q36_park.V) free(g_q36_park.V[i]);
+    }
+    free(g_q36_park.K); free(g_q36_park.V); free(g_q36_park.mk); free(g_q36_park.mv);
+    free(g_q36_park.fed); free(g_q36_park.ring_pos);
+    q36_pin_state_free(g_q36_park.st);
+#ifdef COLI_VULKAN
+    q36_mg_park(m, 0, -1);
+#endif
+#ifdef COLI_CUDA
+    q36_mc_park(m, 0, -1);
+#endif
+    memset(&g_q36_park, 0, sizeof g_q36_park);
+}
+/* rows [0, r) of a K or V cache of `rows` rows a head, head by head, between it and a copy */
+static void q36_park_copy(const Cfg *c, void *kv, int rows, void *copy, int r, int out) {
+    const size_t es = q36_kv_es(), D = (size_t)c->k_head_dim, b = (size_t)r * D * es;
+    for (int h = 0; h < c->kv_heads; h++) {
+        char *a = (char *)kv + (size_t)h * rows * D * es, *p = (char *)copy + (size_t)h * b;
+        if (out) memcpy(p, a, b); else memcpy(a, p, b);
+    }
+}
+static int q36_park_rows(const Model *m, int i, int n) { int R = q36_kv_rows(m, i); return n < R ? n : R; }
+static void q36_park(Model *m, int np, int max_tok) {
+    const char *e = getenv("COLI_PARK"), *mn = getenv("COLI_PARK_MIN");
+    const int H = m->kvp.len, gen = max_tok < Q36_PARK_GEN ? max_tok : Q36_PARK_GEN,
+              least = mn && atoi(mn) > 0 ? atoi(mn) : Q36_PARK_MIN, n = np + gen + Q36_PARK_SPEC;
+    if ((e && *e == '0') || g_q36_park.on || g_q36_mux_slots != 1 || !m->kvp.fed || m->kvp.tainted ||
+        H < least || m->kv_len != H || m->vis_rows || n >= H || !m->K || !m->V) return;
+    const Cfg *c = &m->c; const size_t es = q36_kv_es(), D = (size_t)c->k_head_dim;
+    int ok = (g_q36_park.K = calloc((size_t)c->n_layers, sizeof(void *))) != NULL &&
+             (g_q36_park.V = calloc((size_t)c->n_layers, sizeof(void *))) != NULL &&
+             (g_q36_park.fed = malloc((size_t)H * sizeof(int))) != NULL;
+    for (int i = 0; ok && i < c->n_layers; i++) {
+        if (!c->is_attn[i] || !m->K[i] || !m->V[i]) continue;
+        int r = q36_park_rows(m, i, n);
+        size_t b = (size_t)c->kv_heads * r * D * es;
+        ok = (g_q36_park.K[i] = malloc(b)) != NULL && (g_q36_park.V[i] = malloc(b)) != NULL;
+        if (ok) {
+            q36_park_copy(c, m->K[i], q36_kv_rows(m, i), g_q36_park.K[i], r, 1);
+            q36_park_copy(c, m->V[i], q36_kv_rows(m, i), g_q36_park.V[i], r, 1);
+        }
+    }
+    if (ok && m->kv_ring && m->ring_pos) {
+        ok = (g_q36_park.ring_pos = malloc((size_t)m->kv_ring * sizeof(int))) != NULL;
+        if (ok) memcpy(g_q36_park.ring_pos, m->ring_pos, (size_t)m->kv_ring * sizeof(int));
+    }
+    const Q36Mtp *p = &g_q36_mtp;
+    if (ok && p->on && p->Kc && p->Vc) {   /* the CPU head's rows (with the device's head: rows it never wrote) */
+        int r = n < p->stride ? n : p->stride;
+        size_t b = (size_t)c->kv_heads * r * D * es;
+        ok = (g_q36_park.mk = malloc(b)) != NULL && (g_q36_park.mv = malloc(b)) != NULL;
+        if (ok) {
+            q36_park_copy(c, p->Kc, p->stride, g_q36_park.mk, r, 1);
+            q36_park_copy(c, p->Vc, p->stride, g_q36_park.mv, r, 1);
+            g_q36_park.mtp_rows = r; g_q36_park.mtp_stride = p->stride;
+        }
+    }
+#ifdef COLI_VULKAN
+    ok = ok && q36_mg_park(m, n, 1);
+#endif
+#ifdef COLI_CUDA
+    ok = ok && q36_mc_park(m, n, 1);
+#endif
+    /* the DeltaNet state from the device too, before anything of the request runs */
+    ok = ok && (g_q36_park.st = q36_pin_state_save(m, NULL)) != NULL;
+    if (!ok) { q36_park_free(m); return; }
+    memcpy(g_q36_park.fed, m->kvp.fed, (size_t)H * sizeof(int));
+    g_q36_park.len = H; g_q36_park.kv_len = m->kv_len; g_q36_park.rows = n;
+    g_q36_park.kv_cap = m->kv_cap; g_q36_park.kv_ring = m->kv_ring; g_q36_park.on = 1;
+    if (getenv("COLI_PREFIX_LOG"))
+        fprintf(stderr, "[PREFIX] the %d-token conversation parked for a %d-token request (%d rows kept apart)\n", H, np, n);
+}
+/* the end of the request's turn: the conversation back, its tokens, state and rows; the
+ * chains read its rows and its DeltaNet state from the host again */
+static void q36_unpark(Model *m) {
+    if (!g_q36_park.on) return;
+    const Cfg *c = &m->c;
+    Q36Mtp *p = &g_q36_mtp;
+    if (m->kv_len + Q36_PARK_SPEC > g_q36_park.rows || m->kv_cap != g_q36_park.kv_cap ||
+        m->kv_ring != g_q36_park.kv_ring || (g_q36_park.mk && p->stride != g_q36_park.mtp_stride)) {
+        if (getenv("COLI_PREFIX_LOG"))
+            fprintf(stderr, "[PREFIX] the request wrote past the rows kept apart: the conversation will be read again\n");
+        q36_park_free(m); return;
+    }
+    for (int i = 0; i < c->n_layers; i++) {
+        if (!g_q36_park.K[i] || !m->K[i] || !m->V[i]) continue;
+        int r = q36_park_rows(m, i, g_q36_park.rows);
+        q36_park_copy(c, m->K[i], q36_kv_rows(m, i), g_q36_park.K[i], r, 0);
+        q36_park_copy(c, m->V[i], q36_kv_rows(m, i), g_q36_park.V[i], r, 0);
+    }
+    if (g_q36_park.ring_pos && m->ring_pos) memcpy(m->ring_pos, g_q36_park.ring_pos, (size_t)m->kv_ring * sizeof(int));
+    if (g_q36_park.mk && p->Kc && p->Vc) {
+        q36_park_copy(c, p->Kc, p->stride, g_q36_park.mk, g_q36_park.mtp_rows, 0);
+        q36_park_copy(c, p->Vc, p->stride, g_q36_park.mv, g_q36_park.mtp_rows, 0);
+    }
+    int head = 1;
+#ifdef COLI_VULKAN
+    head = q36_mg_park(m, 0, 0) && head;
+#endif
+#ifdef COLI_CUDA
+    head = q36_mc_park(m, 0, 0) && head;
+#endif
+    q36_pin_state_put(m, g_q36_park.st);
+    if (!head && p->on) { p->has_pend = 0; p->len = -1; }   /* the head's device rows are the request's: it rests until a prompt from 0 */
+    kv_prefix_clear(&m->kvp);
+    kv_prefix_record(&m->kvp, g_q36_park.fed, 0, g_q36_park.len);
+    m->kv_len = g_q36_park.kv_len;
+#ifdef COLI_VULKAN
+    q36c_rollback(m, -1, 0);   /* every mirror's watermark to 0: the rows go up again from the host */
+#endif
+#ifdef COLI_CUDA
+    q36cc_rollback(m, -1, 0);
+#endif
+    if (getenv("COLI_PREFIX_LOG")) fprintf(stderr, "[PREFIX] the %d-token conversation is back\n", g_q36_park.len);
+    q36_park_free(m);
 }
 
 /* Allocate (once) or reuse the KV cache across requests. Grows only when a
@@ -6800,6 +7438,20 @@ static void ensure_kv(Model *m){
      * per head -- one flat memcpy would land every head but the first at the
      * wrong offset, and that reads as a plausible answer from another
      * conversation rather than as a crash. */
+    /* Growth by half again at least, from 1024 rows, in steps of 256, up to the context the
+     * engine holds: a chat resends a longer transcript every turn, and growing to exactly the
+     * new length paid the reallocation, the rows' copy and (a GPU chain) its KV mirrors' again
+     * on every turn (LFM3-VL-2B on CUDA: a prompt of a new length 48 ms instead of 35). The
+     * RAM plan reserves the whole context's cache already. */
+    {
+        const int top = qwen36_max_ctx();
+        int want = m->max_t;
+        if (m->K && m->kv_cap + m->kv_cap / 2 > want) want = m->kv_cap + m->kv_cap / 2;
+        if (want < 1024) want = 1024;
+        want = (want + 255) / 256 * 256;
+        if (want > top) want = top;
+        if (want > m->max_t) m->max_t = want;
+    }
     void **oldK = m->K, **oldV = m->V;
     int old_stride = m->kv_cap, keep = m->K ? m->kvp.len : 0;
     if (keep > old_stride) keep = old_stride;
@@ -6993,7 +7645,7 @@ static void q36_spec_free(Q36Spec *sp) { free(sp->hist); sp->hist = NULL; sp->hi
 static int q36_spec_alloc(Model *m, int rows) {
     Cfg *c = &m->c;
     if (rows > Q36_SPEC_SNAPS) rows = Q36_SPEC_SNAPS;
-    size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
+    size_t nr = q36_rec_cells(c), nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
     for (int sl = m->snap_slots; sl < rows; sl++) {
         if (!m->snap_rec[sl] && !(m->snap_rec[sl] = (float **)calloc((size_t)c->n_layers, sizeof(float *)))) return 0;
         if (!m->snap_conv[sl] && !(m->snap_conv[sl] = (float **)calloc((size_t)c->n_layers, sizeof(float *)))) return 0;
@@ -7640,6 +8292,7 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
             fprintf(stderr, "[PREFIX] no reuse: held=%d cap=%d prompt=%d%s%s\n",
                     m->kvp.len, m->kvp.cap, np, m->kvp.tainted ? " tainted" : "",
                     (m->kvp.len > 0 && m->kvp.len < np) ? " (diverged)" : "");
+        if (!reuse) kv_prefix_miss_log(&m->kvp, ids, np, decode_id_to_bytes);
         fflush(stderr);
     }
     /* Con la lettura accesa il riuso arretra di un token: il predittore del
@@ -7665,7 +8318,10 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
      * The pin path above is untouched -- a photograph carries the logits for the position
      * that follows it, so it still resumes. */
     if (g_echo_k > 0 && !g_pin_use_logit) reuse = 0;
-    if (!reuse) { reset_recurrent(m); m->kv_len = 0; }
+    if (!reuse) {
+        q36_park(m, np, q->max_tok);   /* a short request keeps the conversation (q36_unpark) */
+        reset_recurrent(m); m->kv_len = 0;
+    }
     /* Per-REQUEST state, not per-process: without this the server keeps the
      * first request's prefill flag and expert-collection set forever, so
      * COLIBRI_RESIDENT=1 collects on request #1 and never again, and the
@@ -7718,7 +8374,7 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     return 1;
 }
 
-static void serve_one(Model *m, ServeReq *q){
+static void serve_one_turn(Model *m, ServeReq *q){
     int *ids=NULL, np=0; float *lo=NULL; Q36ReqClock clk;
     if(!q36_serve_start(m,q,&ids,&np,&lo,&clk)) return;
     int gen=0, limited=1, forwards=1;   /* il prefill e' il primo forward */
@@ -7791,6 +8447,11 @@ static void serve_one(Model *m, ServeReq *q){
     q36c_report(m);
     vk_tier_turn(m, "turn");
 #endif
+}
+/* one request on its own; a conversation it parked comes back when its turn ends */
+static void serve_one(Model *m, ServeReq *q){
+    serve_one_turn(m, q);
+    q36_unpark(m);
 }
 
 /* ======================= Clef: DECIDE on the same engine ======================= *
@@ -8637,7 +9298,7 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
                     .ram_floor = slot * (size_t)c->topk * (size_t)c->n_layers, .ram_given = vk_ram_given,
                     .ram_later = q36_kv_later(m),
                     .dense_bytes = vk_dense_bytes(m), .stage = g_vk_chain,
-                    .chain_bytes = g_vk_chain ? q36c_late_bytes(m, qwen36_max_ctx()) : 0,
+                    .chain_bytes = g_vk_chain ? q36c_late_bytes(m, qwen36_max_ctx() < Q36C_KV_START ? qwen36_max_ctx() : Q36C_KV_START) : 0,
                     .in_ram = vk_in_ram, .ram_ctx = m,
                     .load = vk_load, .release = vk_release, .load_ctx = m,
                     .layer_gate_up = lgu, .layer_down = ldn};
@@ -8684,11 +9345,13 @@ int main(int argc, char **argv) {
      * do. Without it this engine takes one thread per logical CPU, which on an
      * SMT host doubles the team for no arithmetic and pays a barrier per tiny
      * per-expert region (#718 measured +2.3x from the sizing alone on a
-     * 16C/32T part). OMP_NUM_THREADS wins, COLI_NO_OMP_TUNE=1 disables. */
+     * 16C/32T part). OMP_NUM_THREADS wins, COLI_NO_OMP_TUNE=1 disables. Before it,
+     * the hot team (omp_tune.h), which re-runs the engine once with libgomp's settings. */
+    coli_omp_hot_team(argv, "qwen36", coli_omp_env_on("COLI_CUDA") || coli_omp_env_on("COLI_METAL"));
     coli_omp_tune_threads("qwen36");
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("Qwen3.6", "SNAP=<model directory> ./qwen36 ..."); return 1; }
-    static char gguf_path[4096]; int gguf_dir = 0;
+    static char gguf_path[4096], mmproj_path[4096]; int gguf_dir = 0;
     {   /* a model directory made by tools/gguf_import.py: gguf.json names the file */
         char gj[4096]; snprintf(gj, sizeof gj, "%s/gguf.json", snap);
         FILE *f = fopen(gj, "rb");
@@ -8698,11 +9361,21 @@ int main(int argc, char **argv) {
             const char *g = r ? jstr(r, "gguf") : NULL;
             if (!g || !*g) { fprintf(stderr, "%s: no \"gguf\" path\n", gj); return 1; }
             gguf_path_join(gguf_path, sizeof gguf_path, snap, g);
+            const char *mp = jstr(r, "mmproj");   /* a vision tower's file (LFM3-VL's) */
+            if (mp && *mp) gguf_path_join(mmproj_path, sizeof mmproj_path, snap, mp);
             free(arena); gguf_dir = 1;
         }
     }
     if (gguf_dir || gguf_is_file(snap)) {
         const char *gp = gguf_dir ? gguf_path : snap;
+        {   /* the vision tower's own GGUF: gguf.json's mmproj, Q36_MMPROJ over it (0: none) */
+            const char *e = getenv("Q36_MMPROJ");
+            const char *mp = e ? (strcmp(e, "0") ? e : NULL) : (mmproj_path[0] ? mmproj_path : NULL);
+            if (mp && *mp) {
+                if (gguf_open(&g_mmproj, mp)) fprintf(stderr, "[qwen36] mmproj %s: %s; text only\n", mp, g_mmproj.err);
+                else g_mmproj_open = 1;
+            }
+        }
         if (getenv("GGUF_CHECK")) gguf_header_only = 1;
         if (gguf_open(&g_gg, gp)) { fprintf(stderr, "GGUF: %s\n", g_gg.err); return 1; }
         if (getenv("GGUF_CHECK")) {
@@ -9049,8 +9722,10 @@ int main(int argc, char **argv) {
     /* the CUDA chain uploads its own router, DeltaNet b|a and gate rows after the tier sized
      * its budget: out of the tier's allowance, or the tier fills the card and the chain's
      * prompt scratch and KV mirror find no room (Muse Spark's f32 router: 496 MiB) */
-    if (q36cc_env_on() && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1')
+    if (q36cc_env_on() && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1') {
         qt_reserve(q36cc_own_bytes(&m) + q36cc_mirror_bytes(&m, qwen36_max_ctx()));   /* and the KV mirrors of a model whose chain needs them whole */
+        q36_gguf_stage_reserve(&m);   /* and a GGUF's prompt staging, where the card holds fewer than all its experts */
+    }
 #endif
 #ifdef COLI_CUDA
     if (g_gguf && !qq_active() && m.c.n_experts > 0 && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1') {
@@ -9065,7 +9740,12 @@ int main(int argc, char **argv) {
                  q36_eh(&m.c) % coli_cuda_block_elems(100 + x->tg) == 0 && m.c.inter % coli_cuda_block_elems(100 + x->td) == 0;
             if (ok) { tg[l] = x->tg; td[l] = x->td; bg[l] = (size_t)x->eb_g; bdn[l] = (size_t)x->eb_d; }
         }
-        if (ok && qt_init_gguf(L, m.c.n_experts, q36_eh(&m.c), m.c.inter, cap, m.c.topk, tg, td, bg, bdn, 0)) gguf_tier = 1;   /* the slots' rows stay */
+        /* each expert in a slot of its own layer's size (COLI_CUDA_EXACT_SLOTS=0: the largest layer's) */
+        { const char *xs = getenv("COLI_CUDA_EXACT_SLOTS"); qt_gguf_exact_slots(!(xs && *xs == '0')); }
+        if (ok && qt_init_gguf(L, m.c.n_experts, q36_eh(&m.c), m.c.inter, cap, m.c.topk, tg, td, bg, bdn, 0)) {
+            gguf_tier = 1;   /* the slots' rows stay */
+            gguf_hold_file_rows(&m);
+        }
         else fprintf(stderr, "[qwen36] COLI_CUDA=1: %s; the routed experts stay on the CPU\n",
                      ok ? "the CUDA expert tier did not start" : "the GGUF's expert types are not all ones the CUDA chain's experts take");
         free(tg); free(td); free(bg); free(bdn);
@@ -9076,9 +9756,12 @@ int main(int argc, char **argv) {
      * them so, and no experts of the mixed layout (one format per expert): the
      * dense trunk goes to the devices all the same (-1). Not a GGUF. */
     if (m.c.n_experts > 0 && !g_gguf) qt_source_planar(xf_mode(&m));
+    /* a dense model (no routed experts: LFM3, the dense Qwen3.5 and Qwen3) starts the tier for
+     * its trunk alone (-1), which the CUDA chain runs whole */
     if (gguf_tier || (!qq_active() && !g_gguf && m.c.n_experts > 0 &&
         qt_init(m.c.n_layers, m.c.n_experts, q36_eh(&m.c), m.c.inter, cap, m.c.topk,
-                m.c.expert_gs, expert_mixed ? -1 : expert_is_int4))) {
+                m.c.expert_gs, expert_mixed ? -1 : expert_is_int4)) ||
+        (!qq_active() && m.c.n_experts == 0 && qt_init(m.c.n_layers, 0, m.c.hidden, 0, 1, 1, 0, -1))) {
         fprintf(stderr, qt_experts_on() ? "[gpu] MoE experts -> CUDA VRAM tier\n"
                                         : "[gpu] dense trunk -> CUDA (the routed experts stay on the CPU)\n");
         atexit(qt_shutdown);
@@ -9184,8 +9867,8 @@ int main(int argc, char **argv) {
             else fprintf(stderr, "[dn] Q36_DN_GPU=1 but no layer has both projections on one card; the CPU path stands\n");
         }
         /* Warmstart: fill the VRAM budget BEFORE the first token (heat order
-         * when HEAT_FILE exists, natural order otherwise), loading all RAM
-         * slots along the way. */
+         * when HEAT_FILE exists, otherwise every layer's expert 0, then 1, ...),
+         * loading all RAM slots along the way. */
         const char *nws = getenv("QT_NO_WARMSTART");
         if (!(nws && *nws=='1') && qt_experts_on()) tier_warmstart(&m, expert_is_int4);
     }

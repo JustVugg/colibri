@@ -28,6 +28,10 @@
  *      as a fuzz for the class of #1339. The row limit is read from the array
  *      the rows index, so the stride cannot drift from it again.
  *
+ *   4. The warmstart spreads the card over the layers. Without a heat file the
+ *      plan takes expert 0 of every layer, then expert 1, ...; with one, the
+ *      hottest first, as before.
+ *
  * Everything runs in the plain CPU build; no GPU, no toolkit. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -429,6 +433,52 @@ static void test_issue_geometry(int ndev, int seeds) {
     qt_shutdown();
 }
 
+/* ======================================================================== */
+/* 4. the warmstart's order                                                 */
+/* ======================================================================== */
+/* Without a heat file the plan takes expert 0 of every layer, then expert 1, ...: each layer
+ * its share of the card. Index order took whole layers, and a prompt chunk then copied the
+ * other layers' experts over the bus one layer after another. With a heat file, the heat's
+ * order, as before. */
+static void test_fill_order(void) {
+    enum { NL = 2, NE = 16 };
+    const int want_l[5] = {0, 1, 0, 1, 0}, want_e[5] = {0, 0, 1, 1, 2};
+    const char *heat = "test_qwen36_tier_invariants.heat";
+    int layers[NL * NE], eids[NL * NE], n, ok;
+    char b[64], msg[160];
+    make_weights(NE);
+    setenv("HEAT_FILE", "", 1);
+    if (!start_tier(1, NL, NE, 4, NULL)) { check(0, "tier did not start"); return; }
+    budget_for(5, b, sizeof b);
+    qt_shutdown();
+    if (!start_tier(1, NL, NE, 4, b)) { check(0, "tier did not start with a small budget"); return; }
+    n = qt_plan_fill(layers, eids, NL * NE);
+    ok = n == 5;
+    for (int i = 0; ok && i < 5; i++) ok = layers[i] == want_l[i] && eids[i] == want_e[i];
+    snprintf(msg, sizeof msg, "no heat file: expert by expert across the layers (%d planned, (%d,%d) (%d,%d) first)",
+             n, layers[0], eids[0], layers[1], eids[1]);
+    check(ok, msg);
+    qt_shutdown();
+
+    /* a heat file: layer 1's experts hotter than layer 0's, the higher index the hotter */
+    FILE *f = fopen(heat, "wb");
+    uint32_t hdr[3] = {0x51544831u, NL, NE}, h[NL * NE];
+    for (int l = 0; l < NL; l++) for (int e = 0; e < NE; e++) h[l * NE + e] = (l ? 100u : 0u) + (uint32_t)e;
+    ok = f && fwrite(hdr, 4, 3, f) == 3 && fwrite(h, 4, NL * NE, f) == NL * NE;
+    if (f) fclose(f);
+    check(ok, "heat file written");
+    setenv("HEAT_FILE", heat, 1);
+    if (!start_tier(1, NL, NE, 4, b)) { check(0, "tier did not start with the heat file"); setenv("HEAT_FILE", "", 1); remove(heat); return; }
+    n = qt_plan_fill(layers, eids, NL * NE);
+    ok = n == 5;
+    for (int i = 0; ok && i < 5; i++) ok = layers[i] == 1 && eids[i] == NE - 1 - i;
+    snprintf(msg, sizeof msg, "heat file: the hottest first (%d planned, (%d,%d) first)", n, layers[0], eids[0]);
+    check(ok, msg);
+    setenv("HEAT_FILE", "", 1);   /* before the shutdown, which writes the heat back to it */
+    qt_shutdown();
+    remove(heat);
+}
+
 int main(void) {
     printf("qwen36 tier invariants\n");
     printf(" 1. budget accounting, 1 device\n");  test_budget_accounting(1);
@@ -436,6 +486,7 @@ int main(void) {
     printf(" 2. shutdown wakes every waiter\n");  test_shutdown_wakes_everyone();
     printf(" 3. issue geometry, random routing, 1/2/3 devices x 200 seeds\n");
     test_issue_geometry(1, 200); test_issue_geometry(2, 200); test_issue_geometry(3, 200);
+    printf(" 4. the warmstart's order, without and with a heat file\n"); test_fill_order();
     if (fails) { printf("test_qwen36_tier_invariants: %d failure(s)\n", fails); return 1; }
     printf("test_qwen36_tier_invariants: ok\n");
     return 0;

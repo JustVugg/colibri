@@ -205,7 +205,11 @@ static int kv_disk_load(Model *m, int *hist, int maxctx){
     float *stage = (kv_coded()&&dt==0) || (!kv_coded()&&dt==3) ? falloc(c->kv_lora>c->qk_rope?c->kv_lora:c->qk_rope) : NULL;
     uint16_t *stage16 = (!kv_coded()&&dt==3) ? malloc(sizeof(uint16_t)*(size_t)(c->kv_lora>c->qk_rope?c->kv_lora:c->qk_rope)) : NULL;
     for(int p=0;p<nrec;p++){
-        int32_t tk; if(fread(&tk,4,1,f)!=1){ nrec=p; break; } hist[p]=tk;
+        int32_t tk; if(fread(&tk,4,1,f)!=1){ nrec=p; break; }
+        if(tk<0 || tk>=c->vocab){
+            fprintf(stderr,"[KV] .coli_kv token id %d out of range at record %d: keeping the first %d\n",tk,p,p);
+            nrec=p; break; }
+        hist[p]=tk;
         for(int i=0;i<c->n_layers;i++){
             if(dt==2){                                /* v3: byte polari + raggio, gia' nel formato in RAM */
                 int lbb=coli_kvq_row_bytes(c->kv_lora,g_tq_bits,g_tq_codec), rbb=coli_kvq_row_bytes(c->qk_rope,g_tq_bits,g_tq_codec);

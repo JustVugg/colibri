@@ -730,7 +730,9 @@ jobs:
 
   engine-cuda-syntax:
     name: CUDA syntax check
-    runs-on: ubuntu-latest
+    # 24.04, not ubuntu-latest: on 26.04 the toolkit action's network method finds no
+    # cuda-nvcc-12-6 package in NVIDIA's ubuntu2604 repository (2026-10-28)
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install CUDA toolkit (compiler only)
@@ -1720,6 +1722,16 @@ jobs:
           cd c
           gcc -O3 -march=native -fopenmp -I. tests/test_int_kernel_exact.c -o /tmp/tike -lm
           /tmp/tike
+          # GGUF rows eight at a time: the runner's own ISA, and the release builds' (no VNNI)
+          gcc -O3 -march=native -fopenmp -I. tests/test_rows_f8.c -o /tmp/trf8 -lm
+          /tmp/trf8
+          gcc -O3 -march=x86-64-v3 -fopenmp -I. tests/test_rows_f8.c -o /tmp/trf8v3 -lm
+          /tmp/trf8v3
+          # a prompt's rows of the grid types, 16 file rows unpacked once: the same two ISAs
+          gcc -O3 -march=native -fopenmp -I. tests/test_tile16.c -o /tmp/tt16 -lm
+          /tmp/tt16
+          gcc -O3 -march=x86-64-v3 -fopenmp -I. tests/test_tile16.c -o /tmp/tt16v3 -lm
+          /tmp/tt16v3
       - name: Generate the glm_tiny fixture
         run: cd c && python3 tools/make_glm_oracle.py
       - name: Oracle (30–32/32 teacher forcing + exact greedy)
@@ -1733,6 +1745,54 @@ jobs:
           KV16=1 SNAP=./glm_tiny TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=2 ./colibri 64 16 16 > kv16.log 2>&1 || { cat kv16.log; exit 1; }
           cat kv16.log
           grep -q "latent KV cache in float16" kv16.log && ! grep -q "oracle run keeps" kv16.log
+      - name: Mistral-Large-4 tiny oracle (tools/make_mistral_large4_tiny.py)
+        # NoPE and shared-KV layers, full and shared indexers with the selection active, YaRN
+        # over the learned alpha, SSMax, the softmax router and the softcap, through the GGUF
+        # import, against a float32 transcription of the release's code; the KV in float16 too
+        run: |
+          cd c
+          python3 tools/make_mistral_large4_tiny.py --out /tmp/ml4 --emit-ref /tmp/ml4/ref.json
+          python3 tools/gguf_import.py /tmp/ml4/model.gguf /tmp/ml4/coli
+          SNAP=/tmp/ml4/coli REF=/tmp/ml4/ref.json COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 8 16 16
+          SNAP=/tmp/ml4/coli REF=/tmp/ml4/ref.json TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 8 16 16
+          KV16=1 SNAP=/tmp/ml4/coli REF=/tmp/ml4/ref.json TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 8 16 16
+          # Mistral's FP8 release (its own names, qscale_weight per 128 x 128 block) through
+          # convert_fp8_to_int4.py at 8 bits: teacher forcing within the oracle's allowance (int8
+          # per row is coarser than the reference's float32; the attention dense here, where the
+          # tiny model's tied index scores would turn that noise into another selection)
+          python3 tools/make_mistral_large4_tiny.py --out /tmp/ml4f --emit-ref /tmp/ml4f/ref.json \
+            --fp8-checkpoint /tmp/ml4f/fp8 --min-gap 0.15 --max-new 8 --override '{"index_topk": 64}'
+          # its vision tower in the release's names (a shard of its own here): the converter writes
+          # it as the container's mmproj.gguf, the published file's tensors, which serve mode loads
+          python3 tools/make_mistral_vision_tiny.py --out /tmp/ml4fv --out-hidden 64 --release /tmp/ml4f/fp8
+          python3 tools/convert_fp8_to_int4.py --indir /tmp/ml4f/fp8 --outdir /tmp/ml4f/coli --ebits 8 --xbits 8 --io-bits 8 --n-layers 8
+          SNAP=/tmp/ml4f/coli REF=/tmp/ml4f/ref.json TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=2 ./colibri 8 16 16
+          python3 tools/make_mistral_vision_tiny.py --out /tmp/ml4fv --same-as /tmp/ml4f/coli/mmproj.gguf
+          served=$(SERVE=1 SNAP=/tmp/ml4f/coli ./colibri 8 < /dev/null 2>&1 || true)
+          echo "$served" | grep "vision tower (mmproj): 2 layers"
+          # The published GGUFs' types, layer by layer as their headers have them (MIXES): these
+          # six hold all fourteen (BF16, Q8_0, Q3_K-Q6_K, IQ1_S, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_XS
+          # beside F32). The float path (GQ_EXACT=1) against the reference on the blocks' own
+          # values; the integer kernels against the reference that rounds their inputs to int8
+          # as they do (teacher forcing, an allowance: a sum in another order can round one
+          # code the other way on another CPU, and this small model amplifies it)
+          make tests/test_ggml_quants
+          for q in BF16 UD-IQ1_M UD-IQ2_XXS UD-IQ3_XXS UD-Q3_K_XL UD-Q5_K_XL; do
+            python3 tools/make_mistral_large4_tiny.py --out /tmp/ml4q/$q --emit-ref /tmp/ml4q/$q/ref.json --quant $q
+            python3 tools/gguf_import.py /tmp/ml4q/$q/model.gguf /tmp/ml4q/$q/coli
+            GQ_EXACT=1 SNAP=/tmp/ml4q/$q/coli REF=/tmp/ml4q/$q/ref.json COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 8 16 16
+            GQ_EXACT=1 SNAP=/tmp/ml4q/$q/coli REF=/tmp/ml4q/$q/ref.json TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 8 16 16
+          done
+          python3 tools/make_mistral_large4_tiny.py --out /tmp/ml4a --emit-ref /tmp/ml4a/ref.json --quant UD-IQ1_S --act-q8
+          python3 tools/gguf_import.py /tmp/ml4a/model.gguf /tmp/ml4a/coli
+          SNAP=/tmp/ml4a/coli REF=/tmp/ml4a/ref.json TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=3 ./colibri 8 16 16
+      - name: Mistral-Large-4 vision tower (mistral_vision.h against tools/mistral_vision_ref.py)
+        run: |
+          cd c
+          # a tiny mmproj in the published layout (BF16, q and k permuted for an interleaved
+          # rotation): the engine's rows within 1e-4 of the numpy reference's; the same tower in
+          # the release's names through tools/ml4_mmproj.py gives that file tensor for tensor
+          make mistral-vision-check
       - name: Oracle allowance and failure regressions
         run: |
           cd c
@@ -1740,6 +1800,12 @@ jobs:
           # Reuse the generated fixture: discovery without this variable skips
           # every serving context-refusal regression.
           COLI_ORACLE_FIXTURE="$PWD/glm_tiny" python3 -m unittest -v tests.test_run_serve_context_exceeded
+          # a CANCEL sent while a served prompt is read stops the reading (prompt_break.h)
+          COLI_ORACLE_FIXTURE="$PWD/glm_tiny" python3 -m unittest -v tests.test_glm_prompt_cancel
+          # /v1/systemone on colibri.c: answered, and a header it cannot read answered by its id
+          COLI_ORACLE_FIXTURE="$PWD/glm_tiny" python3 -m unittest -v tests.test_glm_systemone
+          # a short request between two turns keeps the one slot's conversation (park.h)
+          COLI_ORACLE_FIXTURE="$PWD/glm_tiny" python3 -m unittest -v tests.test_glm_park
       - name: The MTP head under the draft gate (docs/speculative.md)
         # Greedy stays exact whatever the gate picks (a draft is only ever verified),
         # with the gate deciding from measured times and with every draft carried.

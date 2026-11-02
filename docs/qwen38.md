@@ -158,6 +158,65 @@ when nothing is cached and roughly half that at the cap-32 hit rate, so at this
 cache size the engine spends about two thirds of every request waiting on the
 disk, and the planner labels cold expert reads as the expected bottleneck.
 
+## A long context
+
+The model reads up to 262,144 positions (`--ctx 262144`). Twelve of its 48 layers keep K and V
+(two heads of 256) and an index key of 128 per position: about 55 KB a position in float32, 14.5 GB
+at the full context. What a long context costs is what it takes from the experts' caches, so:
+
+- **K and V in float16** (`Q38_KV`, on when serving): the CUDA chain's mirrors take 2 bytes a value
+  instead of 4. At 262,144 positions the chain keeps 12.86 GiB instead of 19.23, and the card's
+  expert budget goes from 0.65 GB to 7.03 GB.
+- **The RAM plan prices one prompt segment, not the context**: serve reads a prompt in segments
+  (8,192 rows with a dense chain, 2,048 without; `COLI_PROMPT_SEGMENT`), so a forward's row buffers
+  hold one segment. The plan used to price the whole context as one forward: 38 GB at 262,144
+  positions, and no expert cache in RAM (`coli serve` started at 10 slots a layer).
+
+Qwen3.8-Flash-Next IQ2_XS on an RTX PRO 4000 (24 GB) with 62 GB of RAM, served on the CUDA chain, a
+452-token prompt and 128 tokens:
+
+| context | prompt | decode | RAM cache, slots a layer | card's expert budget |
+|---|---:|---:|---:|---:|
+| 65,536, before | 188 tok/s | 48.4 tok/s | 512 | 12.5 GB |
+| 131,072, before | 132 tok/s | 43.6 tok/s | 337 | 8.6 GB |
+| 262,144, before | 15.6 tok/s | 9.6 tok/s | 10 | 0.65 GB |
+| 262,144, the plan's segment | 84 tok/s | 21.9 tok/s | 490 | 0.65 GB |
+| 262,144, and K/V in float16 | 149 tok/s | 45.7 tok/s | 490 | 7.03 GB |
+| 65,536, 2.1.0 | 208 tok/s | 52.2 tok/s | 512 | 14.1 GB |
+| 131,072, 2.1.0 | 190 tok/s | 51.9 tok/s | 512 | 11.7 GB |
+| 262,144, 2.1.0 | 151 tok/s | 42.9 tok/s | 489 | 7.03 GB |
+
+The last three rows are v2.1.0 (`main` at 0a5504a1) measured again the same way, the better
+of two runs (`bench_serve.py`, a fresh 452-token prompt, then 128 streamed tokens; the
+request's HTTP included).
+
+## An agent's turns
+
+A model with recurrent layers continues only from a state it kept: the live state (where the last
+answer ended) or the prompt-end snapshot. A turn whose prompt leaves both earlier reads the whole
+conversation again. Hermes Agent (a 14,785-token prompt with its tools) did so at every turn, for two
+reasons, both answered in the engine:
+
+- **The answer comes back without its reasoning.** The model wrote `<think>` and a line break; the
+  next prompt renders that answer as `<think>`, two line breaks and `</think>`. The snapshot, taken
+  after `<think>`, missed by one token (14,809 of 14,810). It is now taken where the answer starts,
+  past `<|im_start|>assistant\n`, when only the answer's opening follows it.
+- **A short request between two turns** (Hermes asks for the conversation's title after the first)
+  took the only state there is. The conversation is now parked for it (`COLI_PARK`): its tokens,
+  its recurrent state and the K/V rows the request may write over, put back when the request ends.
+
+Qwen3.8-Flash-Next IQ2_XS on the CUDA chain, Hermes's second turn (14,810 tokens): 86 s before,
+4.9 s after (14,783 tokens reused, 27 read). `COLI_PREFIX_LOG=1` says, for a prompt that reuses
+nothing, how far it follows the live state and the snapshot and the text where it stops.
+
+The other engines that serve one conversation park it the same way (`park.h`): qwen36 (Qwen3.6,
+Flint, Muse Spark, Qwen3-Coder, LFM3), olmoe, colibri.c (GLM-5.2, Mistral-Large-4), deepseek_v4,
+deepseek_v41, kimi_k3, mimo and inkling. With the same agent's requests (its tools, a title request
+after the first turn), the second turn after the title: Qwen3.6-35B on the CPU 51.6 s before,
+3.3 s after; OLMoE-1B-7B on the CPU 39.9 s before, 6.5 s after, every answer identical to the same
+conversation without the title. OLMoE, attention alone, also resumes where a prompt leaves the
+held state (an answer sent back without its reasoning, a changed turn) instead of reading it all.
+
 ## Routed experts as int4-g64
 
 Optional. Decode waits on routed experts: a miss is a disk read, and how many
@@ -649,6 +708,50 @@ the token stays the experts': about 1 s of expert reads per forward (24,576 FP8 
 behind a 4 GiB trunk on 8 GB) and 290 ms of routed experts, which no chain touches. The
 chain uploads 174 MiB itself (the matrices the placer never sees) and holds 381 MiB of
 state (the K/V, index-key and pooled-key mirrors, the DeltaNet state, the PLE ring).
+
+**A long prompt layer by layer** (`q38cc_forward_lm`, `COLI_CUDA_CHAIN_LAYERWISE`). A
+prompt chunk copies every layer's host pool experts into VRAM before that layer's experts
+run (`q38cc_stage_from`), so a 4K-token prompt in 2048-row chunks copied each layer's pool
+experts twice. Where every layer runs its experts in the frame and a chunk stages them, a
+prompt of more chunks than one now runs layer by layer: each layer's chunks in order, its
+copy waited for at its first chunk and the next staged layer's started after its last (on
+the copy stream, beside the next frames), every row's streams kept on the device between
+layers. Each layer's chunk is a frame waited for, so the K/V rows and the routes' books
+come down a chunk at a time as before, and a chunk runs the same ops on the same rows.
+RTX PRO 4000 (PCIe gen 4 x8), Qwen3.8-Flash-Next IQ2_XS with the host pool, prompts of
+1K / 4K tokens: 321.3 / 309.0 -> 321.2 / 343.0 tok/s, the decode the same (43.6 tok/s).
+The Vulkan chain does the same (`q38c_forward_lm`, `COLI_VK_CHAIN_LAYERWISE`). A prompt longer
+than a segment (8192 rows) runs a segment at a time, so the rows' streams on the device stay
+bounded. The chain's VRAM reserve (`q38cc_reserve_bytes`) counts a segment's streams, a
+verify's copies of the DeltaNet state and the routed experts' scratch of a prompt chunk: with
+2048-row chunks it kept 3.21 GiB where the chain used 3.34-3.51, a verify's copies were refused
+and every verify ran on the CPU (decode 43.6 -> 20.4 tok/s in such a run).
+
+**A short prompt's pooled experts on the CPU** (`q38cc_pc_take`, `COLI_CUDA_CHAIN_POOL_CPU_ROWS`).
+The staging copies every pooled expert of a layer, routed or not: Qwen3.8-Flash-Next IQ2_XS
+on an RTX PRO 4000 copied 18 GB a chunk (1.8 s at 11.8 GB/s) for a prompt of 76 tokens as for
+one of 2048, while a 452-token prompt routes about 1,600 distinct pooled experts, 5.5 rows each.
+A prompt of one chunk now takes the decode table where that pays: the card computes its
+residents, the CPU the pooled slots grouped by expert (`q38cc_pool_groups`: an expert's rows
+through its matrices together, eight output rows at a time where the type has the kernel, the
+decode step's bits per slot), as a decode step's hybrid layers do. Where it pays is measured: at
+the pool's start a 256 MiB copy times the bus and the grouped kernel on four layers' pooled
+experts times a slot; a prompt goes to the CPU where its estimate (rows x top-k x layers x the
+pool's share of the routes x the time a slot) is at most 1.5 times the copy of what a chunk
+stages; after the first prompt the books' share and the prompts' own time a slot replace the
+history's and the probe's. The probe reads high (53 us a slot against 35-44 in the prompts) and
+the history's share too (12.6 % against about 5 %), so a session's first prompt of 700 to 2048
+rows stages as before and the next ones take the CPU. Measured, the served bench (the second of
+two fresh prompts):
+
+| prompt tokens | 76 | 452 | 1012 | 1512 | 1912 | 2612 (staged both) |
+|---|---|---|---|---|---|---|
+| staged, tok/s | 42.7 | 213-215 | 357-367 | 412 | 418 | 392 |
+| on the CPU, tok/s | 206-211 | 480-491 | 500-518 | 437 | 433-439 | 404 |
+
+The index keys of an attention layer now come down in one copy over the rows: a copy a row
+filled the driver's queue on a 1912-row prompt while a hybrid layer held the stream, and the
+host blocked there before serving it; the staged 2612-token prompt gains 3 % from it.
 
 `tests/test_qwen38_cuda_chain.c` (`make qwen38-cuda-chain-check`, in CI beside
 `qwen38-dn-gpu-check`) runs the tiny FP8 fixture's oracle on the fake tier with the

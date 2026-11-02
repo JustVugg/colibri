@@ -79,10 +79,24 @@ def handshake(process):
         raise AssertionError(f"seconda riga {stat!r}, atteso STAT")
 
 
-def submit_bytes(process, request_id, body, max_tokens=4, temperature=0.0, top_p=1.0):
+def submit_frame(request_id, body, max_tokens=4, temperature=0.0, top_p=1.0):
     header = (f"SUBMIT {request_id} 0 {len(body)} {max_tokens} "
               f"{temperature} {top_p}\n").encode("utf-8")
-    process.stdin.write(header + body + b"\n")
+    return header + body + b"\n"
+
+
+def submit_bytes(process, request_id, body, max_tokens=4, temperature=0.0, top_p=1.0):
+    process.stdin.write(submit_frame(request_id, body, max_tokens, temperature, top_p))
+    process.stdin.flush()
+
+
+def submit_busy_pair(process, active_id, intruder_id, body, max_tokens):
+    # Queue both small frames in one write, before reading any output. A tiny
+    # engine can finish its eight tokens while the reader is descheduled after
+    # the first DATA; sending the intruder then is legitimately no longer busy.
+    # This exercises rejection during prefill without a reader/engine race.
+    process.stdin.write(submit_frame(active_id, body, max_tokens) +
+                        submit_frame(intruder_id, body, 1))
     process.stdin.flush()
 
 
@@ -371,8 +385,7 @@ def main() -> int:
         # venga comunque consumato: e' a byte contati, e lasciarlo nello stream
         # disallineerebbe tutto quello che segue.
         busy_budget = 8
-        submit(process, 15, prompt, max_tokens=busy_budget)
-        sent_intruder = False
+        submit_busy_pair(process, 15, 16, prompt.encode("utf-8"), busy_budget)
         busy = None
         done15 = None
         while True:
@@ -382,9 +395,6 @@ def main() -> int:
                 if int(got_id) != 15:
                     raise AssertionError(f"DATA per {got_id}, atteso 15")
                 process.stdout.read(int(count) + 1)
-                if not sent_intruder:
-                    sent_intruder = True
-                    submit(process, 16, prompt, max_tokens=1)
             elif line.startswith("ERROR "):
                 busy = line
             elif line.startswith("DONE "):

@@ -103,10 +103,6 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
-#ifdef __APPLE__
-#include <sys/sysctl.h>
-#include <mach/mach.h>
-#endif
 #include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
 #include "cli_args.h"
 #define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
@@ -123,10 +119,12 @@
 #include "vk_tier.h"       /* the shared Vulkan routed-expert tier (COLI_VULKAN=1; stubs without VK=1) */
 #include "xtier.h"         /* that tier on the CUDA device too (cu_tier.h): XT(f) */
 #include "kv_prefix.h"
+#include "park.h"   /* a short request keeps the conversation aside (COLI_PARK) */
 #include "pin_pool.h"   /* coli_pin_slots_wanted: quanti scatti tenere */
 #include "hybrid_split.h"                    /* KV prefix reuse (shared) */
 #include "serve_codec.h"
 #include "serve_budget.h"
+#include "argmax_first.h"   /* serve_sample's greedy pick */
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
 #include "segment_adapters.h"
@@ -301,26 +299,11 @@ static int k3_cap_for_ram(double budget_gb, double resident_gb, double reserve_g
 }
 
 /* Memory the OS says is still reclaimable without swapping, in GB; 0 if unknown.
- * The same quantity colibri.c's cap_for_ram() budgets against -- Linux
- * MemAvailable, Windows ullAvailPhys bounded by the commit still grantable
- * (compat_meminfo), macOS free+inactive+purgeable. #855. */
-static double k3_mem_avail(void){
-#ifdef _WIN32
-    double total=0, avail=0; compat_meminfo(&total,&avail); return avail;
-#elif defined(__APPLE__)
-    int64_t pgsz=0; size_t sl=sizeof(pgsz);
-    if(sysctlbyname("hw.pagesize",&pgsz,&sl,NULL,0)||pgsz<=0) pgsz=16384;
-    vm_statistics64_data_t vs; mach_msg_type_number_t nc=HOST_VM_INFO64_COUNT;
-    if(host_statistics64(mach_host_self(),HOST_VM_INFO64,(host_info64_t)&vs,&nc)!=KERN_SUCCESS)
-        return 0;
-    return (double)(vs.free_count+vs.inactive_count+vs.purgeable_count)*(double)pgsz/1e9;
-#else
-    FILE *f=fopen("/proc/meminfo","r"); if(!f) return 0;
-    char ln[256]; double kb=0;
-    while(fgets(ln,sizeof(ln),f)) if(sscanf(ln,"MemAvailable: %lf",&kb)==1) break;
-    fclose(f); return kb/1e6;
-#endif
-}
+ * compat_mem_available_gb, the quantity colibri.c's cap_for_ram() budgets
+ * against: Linux MemAvailable bounded by a container's cgroup, Windows
+ * ullAvailPhys bounded by the commit still grantable, macOS
+ * free+inactive+purgeable. #855. */
+static double k3_mem_avail(void){ return compat_mem_available_gb(); }
 static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r);
 #if defined(__APPLE__)
     return r.ru_maxrss/(1024.0*1024.0*1024.0);
@@ -3275,7 +3258,7 @@ static int sample_prob_desc(const void *a,const void *b){
     return d>0?1:d<0?-1:0;
 }
 static int sample_tok(const float *lo, int V, float temp, float top_p){
-    if(temp<=0.f){ int b=0; for(int i=1;i<V;i++) if(lo[i]>lo[b]) b=i; return b; }
+    if(temp<=0.f) return argmax_first(lo, V);
     SampleProb *rank=malloc((size_t)V*sizeof(SampleProb)); float mx=lo[0];
     if(!rank){ fprintf(stderr,"OOM sampling\n"); exit(1); }
     for(int i=1;i<V;i++) if(lo[i]>mx) mx=lo[i];
@@ -3854,6 +3837,70 @@ static int k3_ckpt_restore_best(Model *m, const int *ids, int np){
     return k->pos;
 }
 
+/* A short request between two turns of the conversation (park.h): every KDA layer's state
+ * whole, and the MLA rows and index keys of the positions the request may write. The MLA
+ * arrays stay (grown first, keeping the conversation, when the request asks for more
+ * positions): a query reads only the rows of positions at or before its own, so the
+ * conversation's further rows wait untouched, and only the KDA state starts over. They come
+ * back when the next request arrives; the chains read the state and the rows from the host. */
+#define K3_PARK_SPEC 16   /* the rows a verify writes past the tokens that stand */
+static ColiPark g_k3_park;
+static ColiParkPart *k3_park_parts(Model *m, int *n_out){
+    Cfg *c=&m->c; int n=0;
+    ColiParkPart *p=malloc(sizeof *p*((size_t)c->n_layers*4));
+    if(!p){ *n_out=0; return NULL; }
+    size_t ks=(size_t)c->kda_heads*c->kda_hd*c->kda_hd*sizeof(float), cw=(size_t)c->kda_proj*c->conv_k*sizeof(float);
+    for(int i=0;i<c->n_layers;i++){
+        if(m->L[i].kda){
+            p[n++]=coli_park_whole(m->kstate[i],ks); p[n++]=coli_park_whole(m->cwq[i],cw);
+            p[n++]=coli_park_whole(m->cwk[i],cw);    p[n++]=coli_park_whole(m->cwv[i],cw);
+        } else {
+            Mla *a=&m->L[i].m;
+            p[n++]=coli_park_rows(m->Lc?m->Lc[i]:NULL,(size_t)c->kv_lora*sizeof(float),m->max_t);
+            p[n++]=coli_park_rows(m->Rc?m->Rc[i]:NULL,(size_t)c->qk_rope*sizeof(float),m->max_t);
+            p[n++]=coli_park_rows(c->index_hd>0&&c->idx_type[i]?a->Ic:NULL,(size_t)c->index_hd*sizeof(float),m->max_t);
+        }
+    }
+    *n_out=n;
+    return p;
+}
+/* 1 when the conversation is parked and only the KDA state started over */
+static int k3_park(Model *m, int np, int max_t){
+    int n=g_k3_mux_slots==1&&m->Lc ? coli_park_rows_for(&g_k3_park,&m->kvp,m->kvp.len,np,max_t-np-8,K3_PARK_SPEC) : 0, k=0;
+    if(!n) return 0;
+    kv_alloc(m,max_t);   /* grown now, keeping the conversation's rows, so the bases kept apart stay */
+#ifdef COLI_VULKAN
+    k3c_sync_host(m);    /* the dense chain may hold the newest recurrent state */
+#endif
+    ColiParkPart *p=k3_park_parts(m,&k);
+    int ok=p&&coli_park_save(&g_k3_park,&m->kvp,m->kvp.len,p,k,n);
+    free(p);
+    if(!ok) return 0;
+    Cfg *c=&m->c;
+    kv_prefix_clear(&m->kvp);
+#ifdef COLI_VULKAN
+    k3c_host_wrote(m,1);
+#endif
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].kda){
+        memset(m->kstate[i],0,(size_t)c->kda_heads*c->kda_hd*c->kda_hd*sizeof(float));
+        memset(m->cwq[i],0,(size_t)c->kda_proj*c->conv_k*sizeof(float));
+        memset(m->cwk[i],0,(size_t)c->kda_proj*c->conv_k*sizeof(float));
+        memset(m->cwv[i],0,(size_t)c->kda_proj*c->conv_k*sizeof(float));
+    }
+    return 1;
+}
+static void k3_unpark(Model *m){
+    if(!g_k3_park.on) return;
+    int k=0, len=m->kvp.len;
+    ColiParkPart *p=k3_park_parts(m,&k);
+    if(p&&coli_park_restore(&g_k3_park,&m->kvp,&len,m->kvp.len,K3_PARK_SPEC,p,k)){
+#ifdef COLI_VULKAN
+        k3c_host_rewrote(m);
+#endif
+    } else coli_park_free(&g_k3_park);
+    free(p);
+}
+
 /* Decide reuse before changing the state it describes. A miss discards the
  * old recurrent/KV state first and allocates a fresh target; a hit grows the
  * existing target while preserving its prefix. The old order allocated first,
@@ -3864,7 +3911,7 @@ static int prepare_request_state(Model *m, const int *ids, int np, int max_t){
     /* Divergent prompt: before surrendering to a full reset, try the
      * checkpoint pool (a no-op unless COLI_K3_CKPT enabled it). */
     if(!reuse) reuse=k3_ckpt_restore_best(m,ids,np);
-    if(!reuse) model_state_reset(m);
+    if(!reuse && !k3_park(m,np,max_t)) model_state_reset(m);   /* a short request keeps the conversation (k3_unpark) */
     kv_alloc(m,max_t);
     return reuse;
 }
@@ -4142,6 +4189,7 @@ static int k3_serve_start(Model *m, Tok *T, ServeReq *q, int **ids_out, int *np_
 static int serve_one(Model *m, Tok *T, ServeReq *q){
     int *ids=NULL, np=0; float *lo=NULL; K3ReqClock clk; K3ReqChat ci;
     K3ServePoll poll={q->id,0};
+    k3_unpark(m);   /* a conversation the last request parked: back first */
     int started=k3_serve_start(m,T,q,&ids,&np,&lo,&clk,&ci,&poll);
     if(started<=0) return started;
     int chat=ci.chat, thinking=ci.thinking, *sp=ci.sp;

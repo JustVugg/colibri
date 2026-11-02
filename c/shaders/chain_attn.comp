@@ -32,6 +32,11 @@ layout(local_size_x = 128) in;
 layout(std430, binding = 0) readonly buffer QB { float q[]; };
 layout(std430, binding = 1) readonly buffer KB { float kc[]; };
 layout(std430, binding = 2) readonly buffer VB { float vc[]; };
+layout(constant_id = 7) const bool KV16 = false;   // K and V float16, two a word (vk_chain.c's vkc_attn_h)
+layout(std430, binding = 1) readonly buffer KBH { uint kch[]; };
+layout(std430, binding = 2) readonly buffer VBH { uint vch[]; };
+float kf(int i) { return KV16 ? unpackHalf2x16(kch[i >> 1])[i & 1] : kc[i]; }
+float vf(int i) { return KV16 ? unpackHalf2x16(vch[i >> 1])[i & 1] : vc[i]; }
 layout(std430, binding = 3) buffer OB { float o[]; };
 layout(std430, binding = 4) readonly buffer GB { float gt[]; };
 layout(std430, binding = 5) readonly buffer LB { int sel[]; };
@@ -80,7 +85,7 @@ void main() {
             pt[tid] = r;
             int kb = p.k_off + (p.kv_pm != 0 ? r * p.KVH + kvh : kbase + r) * p.hd;
             float a = 0.0;
-            for (int d = 0; d < p.hd; d++) a += qs[d] * kc[kb + d];
+            for (int d = 0; d < p.hd; d++) a += qs[d] * kf(kb + d);
             sv = a * p.scale;
         }
         red[tid] = sv;
@@ -107,8 +112,8 @@ void main() {
         for (int j = 0; j < cnt; j++) {
             int vb = p.v_off + (p.kv_pm != 0 ? pt[j] * p.KVH + kvh : kbase + pt[j]) * p.vd;
             float w = pe[j];
-            if (d0 < p.vd) acc0 += w * vc[vb + d0];
-            if (d1 < p.vd) acc1 += w * vc[vb + d1];
+            if (d0 < p.vd) acc0 += w * vf(vb + d0);
+            if (d1 < p.vd) acc1 += w * vf(vb + d1);
         }
         m = mn;
         barrier();

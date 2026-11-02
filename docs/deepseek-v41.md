@@ -25,6 +25,18 @@ No conversion. The released checkpoint is already fp8 (dense) and fp4 (experts),
 colibri reads both formats natively -- the fp4 expert layout is byte-identical to the
 mxfp4 it already reads for Kimi K3.
 
+Preparing the engram sidecar needs `transformers`, `tokenizers`, `numpy`, and
+`sympy` in the Python environment used for `prepare_dsv41.py`. For example, on
+Linux or macOS, create a virtual environment and install them once:
+
+```sh
+python3 -m venv ~/.venvs/dsv41
+~/.venvs/dsv41/bin/python -m pip install transformers tokenizers numpy sympy
+```
+
+Use `~/.venvs/dsv41/bin/python` in place of `python3` in the preparation commands
+below. The model engine itself does not require those Python packages.
+
 ```sh
 hf download deepseek-ai/DeepSeek-V4.1-Flash --local-dir ~/Models/DeepSeek-V4.1-Flash
 python3 c/tools/prepare_dsv41.py --model ~/Models/DeepSeek-V4.1-Flash   # ~1 MB sidecar, once

@@ -247,7 +247,13 @@ static int gguf_parse_one(gguf_ctx *g, int part, const char *path, int want_kv) 
         if (r.bad) { free(t->name); break; }
         int64_t rb = gq_row_bytes(t->type, t->ne[0]);
         if (rb < 0) { r.bad = 1; snprintf(g->err, sizeof g->err, "%s: tensor %s: type %d (%s) cannot hold rows of %lld", path, t->name, t->type, gq_type_name(t->type), (long long)t->ne[0]); free(t->name); break; }
-        t->nbytes = rb * (numel / t->ne[0]);
+        int64_t rows = numel / t->ne[0];
+        if (rb > INT64_MAX / rows) {
+            r.bad = 1;
+            snprintf(g->err, sizeof g->err, "%s: tensor %s byte size overflows int64", path, t->name);
+            free(t->name); break;
+        }
+        t->nbytes = rb * rows;
         t->file = part; t->off = rel;          /* made absolute below */
         g->n_tensors++;
     }
@@ -291,10 +297,18 @@ static int gguf_is_file(const char *path) {
  * (NAME-00001-of-000NN.gguf), in which case every part is opened. */
 static int gguf_open(gguf_ctx *g, const char *path) {
     memset(g, 0, sizeof *g);
-    const char *of = strstr(path, "-of-");
+    const char *filename = strrchr(path, '/');
+    filename = filename ? filename + 1 : path;
+#ifdef _WIN32
+    const char *backslash = strrchr(filename, '\\');
+    if (backslash) filename = backslash + 1;
+#endif
+    size_t flen = strlen(filename);
+    const char *of = flen >= 20 ? filename + flen - 14 : NULL;
     int parts = 1;
     size_t plen = strlen(path);
-    if (of && of - path >= 6 && plen >= 5 && !strcmp(path + plen - 5, ".gguf")) {
+    if (of && !strncmp(of, "-of-", 4) && of - filename >= 6 &&
+        plen >= 5 && !strcmp(path + plen - 5, ".gguf")) {
         const char *num = of - 5;
         int a = atoi(num), b = atoi(of + 4);
         if (num[-1] == '-' && a == 1 && b >= 1 && b <= 9999) parts = b;

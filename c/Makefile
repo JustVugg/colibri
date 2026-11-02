@@ -521,12 +521,12 @@ TEST_RULES  := $(patsubst tests/%,%,$(filter tests/test_%,$(RULE_NAMES)))
 # arm64 (e.g. macOS): "unsupported option '-msse4.1' for target arm64-...".
 # Appended back below only on x86-64 hosts, alongside the other conditional
 # platform tests already handled the same way.
-# test_xdna_execution and test_xdna_failure are Windows-only for the same kind
-# of reason: they load tests/xdna_fake_helper.dll through the XDNA loader, which
-# is LoadLibraryExA. Off Windows the loader answers ABSENT by design, so there
-# is nothing for them to bind to, and the synthetic helper is a __declspec DLL
-# that gcc and clang refuse to compile. The other three XDNA owners (registry,
-# prepared state, QT state) touch no loader and stay portable gates.
+# test_xdna_execution and test_xdna_failure run on Windows and Linux: they load
+# the synthetic helper (tests/xdna_fake_helper.dll / .so) through the XDNA
+# loader, which is LoadLibraryExA or dlopen. Elsewhere the loader answers ABSENT
+# by design, so there is nothing for them to bind to. The other three XDNA
+# owners (registry, prepared state, QT state) touch no loader and stay portable
+# gates.
 # test_e8x4g64_loader takes a minted container directory on argv and prints its
 # usage (exit 2) without one, so it is a harness rather than a gate: it has a
 # rule here so it compiles under the suite's own $(CFLAGS) and its warnings are
@@ -553,7 +553,7 @@ TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
-ifneq (,$(IS_WIN))
+ifneq (,$(IS_WIN)$(LINUX))
 TEST_BINS += tests/test_xdna_execution$(EXE) tests/test_xdna_failure$(EXE)
 endif
 ifneq (,$(X86_64))
@@ -728,7 +728,7 @@ VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_bd.s
 # vk_chain.o: a layer's dense chain recorded into one submission (vk_chain.h), and
 # its shaders; an engine that does not call it links nothing from it.
 VK_OBJ   += vk_chain.o
-VK_SPV   += shaders/chain_norm.spv shaders/chain_rope.spv shaders/chain_attn.spv shaders/chain_dnconv.spv \
+VK_SPV   += shaders/chain_norm.spv shaders/chain_rope.spv shaders/chain_attn.spv shaders/chain_dnconv.spv shaders/chain_dnconv_rows.spv \
             shaders/chain_dnrec.spv shaders/chain_dnrec_rows.spv shaders/chain_ew.spv shaders/chain_qsa.spv shaders/chain_ple.spv \
             shaders/chain_gemv.spv shaders/chain_attn_dec.spv shaders/chain_mla_dec.spv
 # the MLA ops (vk_chain.h): attention core, RoPE and LayerNorm rows, per-head weight
@@ -755,7 +755,8 @@ VK_SPV   += shaders/chain_gemv_bd_i8.spv
 # the expert batch's grouped GEMM for a GGUF's experts, down and gate+up (backend_vulkan.c)
 VK_SPV   += shaders/qmatmul_grp_bd.spv shaders/qmatmul_grp_gate_up_bd.spv
 # and both on the matrix units (cooperative matrices at subgroups of 64 or 32)
-VK_SPV   += shaders/qmatmul_gemm_bdc.spv shaders/qmatmul_grp_bdc.spv shaders/qmatmul_grp_gate_up_bdc.spv
+VK_SPV   += shaders/qmatmul_gemm_bdc.spv shaders/qmatmul_gemm_bdcw.spv shaders/qmatmul_grp_bdc.spv shaders/qmatmul_grp_gate_up_bdc.spv
+VK_SPV   += shaders/qmatmul_grp_bdcw.spv shaders/qmatmul_grp_gate_up_bdcw.spv
 # and for our own formats' experts on the chain's prompt chunks (vk_chain.c: vkc_moe_rows)
 VK_SPV   += shaders/qmatmul_grp_q.spv shaders/qmatmul_grp_gate_up_q.spv
 # and on the matrix units (cooperative matrices at subgroups of 64 or 32)
@@ -816,6 +817,9 @@ kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
 		--binary ./kimi_k3$(EXE) \
 		--fixture ./kimi_k3_tiny
 	$(PYTHON) tests/test_kimi_k3_ckpt.py \
+		--binary ./kimi_k3$(EXE) \
+		--fixture ./kimi_k3_tiny
+	$(PYTHON) tests/kimi_k3_park_harness.py \
 		--binary ./kimi_k3$(EXE) \
 		--fixture ./kimi_k3_tiny
 	$(PYTHON) tests/test_kimi_k3_dashboard.py \
@@ -945,7 +949,7 @@ vk_chain.o: vk_chain.c .build-config
 # routed experts; the chain's block GEMV reads the same table
 shaders/qmatmul_bd.spv shaders/qmatmul_gate_up_bd.spv shaders/chain_moe.spv: shaders/blockdec.glsl shaders/blockdec_table.h
 # the per-type decoders of the chain's block GEMV and of its routed experts
-shaders/chain_gemv_bd.spv shaders/chain_moe.spv shaders/qmatmul_gemm_bd.spv shaders/qmatmul_grp_bd.spv shaders/qmatmul_gemm_bdc.spv shaders/qmatmul_grp_bdc.spv: shaders/bdstep.glsl shaders/blockdec_table.h
+shaders/chain_gemv_bd.spv shaders/chain_moe.spv shaders/qmatmul_gemm_bd.spv shaders/qmatmul_grp_bd.spv shaders/qmatmul_gemm_bdc.spv shaders/qmatmul_gemm_bdcw.spv shaders/qmatmul_grp_bdc.spv shaders/qmatmul_grp_bdcw.spv: shaders/bdstep.glsl shaders/blockdec_table.h
 shaders/chain_gemv_bd_i8.spv: shaders/chain_gemv_bd.comp shaders/bdstep.glsl shaders/bdstep_i8.glsl shaders/blockdec_table.h
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DIDOT $< -o $@ || { [ -f $@ ] && touch $@ && \
@@ -958,6 +962,9 @@ shaders/qmatmul_grp_gate_up_bd.spv: shaders/qmatmul_grp_bd.comp shaders/bdstep.g
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
 shaders/qmatmul_grp_gate_up_bdc.spv: shaders/qmatmul_grp_bdc.comp shaders/bdstep.glsl shaders/blockdec_table.h
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
+shaders/qmatmul_grp_gate_up_bdcw.spv: shaders/qmatmul_grp_bdcw.comp shaders/bdstep.glsl shaders/blockdec_table.h
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
 shaders/qmatmul_grp_gate_up_q.spv: shaders/qmatmul_grp_q.comp
@@ -1010,6 +1017,20 @@ backend_loader.o: backend_loader.c .build-config
 xdna-obj: backend_xdna.o
 backend_xdna.o: backend_xdna.c .build-config
 	$(CC) $(CFLAGS) -c backend_xdna.c -o $@
+
+# The optional helper on Linux: the ONLY target that compiles against XRT, and
+# never part of `all` or `check`. Needs the XRT SDK (headers + libxrt_coreutil)
+# and a C++17 compiler; the runtime is found through the rpath set here, so the
+# helper can sit beside the executable with no LD_LIBRARY_PATH. On Windows the
+# helper is built with MSVC (see backend_xdna_helper.cpp).
+XRT_ROOT ?= /opt/xilinx/xrt
+CXX      ?= g++
+.PHONY: xdna-helper
+xdna-helper: libcoli_xdna.so
+libcoli_xdna.so: backend_xdna_helper.cpp
+	$(CXX) -std=c++17 -O2 -fPIC -shared -fvisibility=hidden -Wall -Wextra \
+		-I$(XRT_ROOT)/include $< -o $@ \
+		-L$(XRT_ROOT)/lib -Wl,-rpath,$(XRT_ROOT)/lib -lxrt_coreutil
 
 # Windows CUDA DLL: compile backend_cuda.cu with nvcc (+MSVC cl.exe as host
 # compiler, required by nvcc on Windows) into coli_cuda.dll. Run this from a
@@ -1065,7 +1086,7 @@ backend_cuda_ink.o: backend_cuda_ink.cu backend_cuda_ink.h .build-config
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_ink.cu -o $@
 
-backend_cuda.o: backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h .build-config
+backend_cuda.o: backend_cuda.cu backend_cuda.h cuda_bd.cuh cuda_chain.h fp8_format.h backend_gpu_compat.h .build-config
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) -c backend_cuda.cu -o $@
 
@@ -1367,18 +1388,16 @@ fp8-bench: fp8_bench$(EXE)
 tests/bench_cuda_resident_batch$(EXE): tests/bench_cuda_resident_batch.cu backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/bench_cuda_resident_batch.cu -o $@ $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 
-# NOCUDA_*: olmoe.c has no COLI_CUDA code at all, so CUDA=1 would otherwise
-# hand it a define matching nothing and link a runtime it never calls -- a
-# build whose compile line, libraries and exit status all claim "CUDA" while
-# the GPU sits idle. Same guard #783 put on kimi_k3, which since gaining an
-# MXFP4 expert path no longer needs it. tests/test_makefile_cuda_scope.py
-# asserts this shape.
+# An engine whose CUDA path is the chain alone (olmoe_cuda_chain.h, the decision engines'
+# decide_cuda.h) links the backend and its chain, or the DLL's loader on Windows.
+# tests/test_makefile_cuda_scope.py asserts olmoe gets CUDA=1's flags.
+CHAIN_CUDA_OBJ = $(filter backend_loader.o backend_cuda.o cuda_chain.o,$(CUDA_OBJ))
 ifneq ($(EXE),)
 .PHONY: olmoe
 olmoe: olmoe$(EXE)
 endif
-olmoe$(EXE): olmoe.c $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(NOCUDA_CFLAGS) olmoe.c $(VK_OBJ) -o olmoe$(EXE) $(NOCUDA_LDFLAGS)
+olmoe$(EXE): olmoe.c $(CHAIN_CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) olmoe.c $(CHAIN_CUDA_OBJ) $(VK_OBJ) -o olmoe$(EXE) $(LDFLAGS)
 
 # Qwen3.6-35B-A3B engine (hybrid Gated Attention + Gated DeltaNet + streaming
 # MoE). With CUDA=1 the optional VRAM expert tier (qwen36_tier.c) is compiled
@@ -1444,6 +1463,18 @@ endif
 qwenimage$(EXE): qwenimage.c $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(CFLAGS) qwenimage.c $(VK_OBJ) -o qwenimage$(EXE) $(LDFLAGS)
 
+# colibri-tui: the terminal interface (docs/tui.md), a client of coli serve. One C file and the
+# chat page's mascot (tui_mascot.h, from tools/make_tui_mascot.py); no OpenMP, no GPU, no
+# libraries beyond the C library (and Winsock on Windows), so it builds the same everywhere.
+TUI_VERSION := $(shell sed -n 's/^__version__ = "\(.*\)"/\1/p' version.py)
+TUI_LIBS    := -lm $(if $(IS_WIN),-lws2_32 -static,)
+ifneq ($(EXE),)
+.PHONY: colibri-tui
+colibri-tui: colibri-tui$(EXE)
+endif
+colibri-tui$(EXE): tui.c tui_mascot.h version.py
+	$(CC) -O2 -std=c11 -Wall -Wextra -DCOLI_VERSION='"$(TUI_VERSION)"' tui.c -o colibri-tui$(EXE) $(TUI_LIBS)
+
 # Laya (Convai Innovations), a decision model: ModernBERT encoder + decision
 # head, served on POST /v1/systemone through the DECIDE command (docs/laya.md).
 # One file; qi_gemm.h is its matrix kernel, decide_serve.h its serve loop.
@@ -1451,8 +1482,8 @@ ifneq ($(EXE),)
 .PHONY: laya
 laya: laya$(EXE)
 endif
-laya$(EXE): laya.c $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(CFLAGS) laya.c $(VK_OBJ) -o laya$(EXE) $(LDFLAGS)
+laya$(EXE): laya.c $(CHAIN_CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) laya.c $(CHAIN_CUDA_OBJ) $(VK_OBJ) -o laya$(EXE) $(LDFLAGS)
 
 # GLiNER2.5-Decide (fastino), a decision model: DeBERTa-v3 encoder + GLiNER2's
 # classification head, served on POST /v1/systemone through the DECIDE command
@@ -1462,8 +1493,8 @@ ifneq ($(EXE),)
 .PHONY: gliner_decide
 gliner_decide: gliner_decide$(EXE)
 endif
-gliner_decide$(EXE): gliner_decide.c $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(CFLAGS) gliner_decide.c $(VK_OBJ) -o gliner_decide$(EXE) $(LDFLAGS)
+gliner_decide$(EXE): gliner_decide.c $(CHAIN_CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) gliner_decide.c $(CHAIN_CUDA_OBJ) $(VK_OBJ) -o gliner_decide$(EXE) $(LDFLAGS)
 
 # Tiny Laya checkpoint + the laya package's own answers on it. The generator is
 # numpy and deterministic; laya_tiny/ref.json is committed and comes from the
@@ -1974,15 +2005,23 @@ tests/test_xdna_registry$(EXE): tests/test_xdna_registry.c backend_xdna.c
 # Synthetic ABI-2 helpers for the execution tests. Plain C, no XRT, no device:
 # they let the whole execution control flow be qualified on a machine with no
 # NPU. Three variants so the all-or-nothing binding contract is testable.
-XDNA_FAKE_HELPERS = tests/xdna_fake_helper.dll \
-                    tests/xdna_fake_helper_abi1.dll \
-                    tests/xdna_fake_helper_partial.dll
-tests/xdna_fake_helper.dll: tests/xdna_fake_helper.c
-	$(CC) $(CFLAGS) -shared $< -o $@
-tests/xdna_fake_helper_abi1.dll: tests/xdna_fake_helper.c
-	$(CC) $(CFLAGS) -DFAKE_ABI1 -shared $< -o $@
-tests/xdna_fake_helper_partial.dll: tests/xdna_fake_helper.c
-	$(CC) $(CFLAGS) -DFAKE_PARTIAL -shared $< -o $@
+# A .dll on Windows, a position-independent .so elsewhere.
+ifneq (,$(IS_WIN))
+XDNA_DLEXT   = .dll
+XDNA_SHARED  = -shared
+else
+XDNA_DLEXT   = .so
+XDNA_SHARED  = -shared -fPIC
+endif
+XDNA_FAKE_HELPERS = tests/xdna_fake_helper$(XDNA_DLEXT) \
+                    tests/xdna_fake_helper_abi1$(XDNA_DLEXT) \
+                    tests/xdna_fake_helper_partial$(XDNA_DLEXT)
+tests/xdna_fake_helper$(XDNA_DLEXT): tests/xdna_fake_helper.c
+	$(CC) $(CFLAGS) $(XDNA_SHARED) $< -o $@
+tests/xdna_fake_helper_abi1$(XDNA_DLEXT): tests/xdna_fake_helper.c
+	$(CC) $(CFLAGS) -DFAKE_ABI1 $(XDNA_SHARED) $< -o $@
+tests/xdna_fake_helper_partial$(XDNA_DLEXT): tests/xdna_fake_helper.c
+	$(CC) $(CFLAGS) -DFAKE_PARTIAL $(XDNA_SHARED) $< -o $@
 
 tests/test_xdna_execution$(EXE): tests/test_xdna_execution.c backend_xdna.c $(XDNA_FAKE_HELPERS)
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -1995,10 +2034,11 @@ tests/test_xdna_failure$(EXE): tests/test_xdna_failure.c colibri.c tests/backend
 
 # NOT a test gate -- intentionally absent from TEST_BINS (its name does not match
 # the tests/test_*$(EXE) pattern the gate list is derived from). It needs a real
-# XDNA2 NPU, a working XRT, a built coli_xdna.dll and the qualified artifact
-# bytes, none of which a build machine may assume. Build and run it explicitly:
+# XDNA2 NPU, a working XRT, a built helper (coli_xdna.dll, or libcoli_xdna.so
+# from `make xdna-helper` on Linux) and the qualified artifact bytes, none of
+# which a build machine may assume. Build and run it explicitly:
 #   make tests/xdna_physical_probe$(EXE)
-#   tests/xdna_physical_probe <artifact-root> <path-to-coli_xdna.dll> [M-list]
+#   tests/xdna_physical_probe <artifact-root> <path-to-helper> [M-list]
 #
 # M-list defaults to 1,32,64 (the M64 bucket); pass 65,130,256 to qualify
 # the M256 bucket through the same owner.
@@ -2015,6 +2055,19 @@ tests/test_tok_gpt2$(EXE): tests/test_tok_gpt2.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_tok_deepseek$(EXE): tests/test_tok_deepseek.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_tok_tekken$(EXE): tests/test_tok_tekken.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# Mistral-Large-4's vision tower (mistral_vision.h) against tools/mistral_vision_ref.py on a tiny mmproj
+tests/mistral_vision_check$(EXE): tests/mistral_vision_check.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+.PHONY: mistral-vision-check
+mistral-vision-check: tests/mistral_vision_check$(EXE)
+	$(PYTHON) tools/make_mistral_vision_tiny.py --out $${TMPDIR:-/tmp}/coli_mistral_vision_tiny \
+	  --release $${TMPDIR:-/tmp}/coli_mistral_vision_tiny/release --check ./tests/mistral_vision_check$(EXE)
+	$(PYTHON) tools/ml4_mmproj.py --release $${TMPDIR:-/tmp}/coli_mistral_vision_tiny/release \
+	  --out $${TMPDIR:-/tmp}/coli_mistral_vision_tiny/from_release
+	$(PYTHON) tools/make_mistral_vision_tiny.py --out $${TMPDIR:-/tmp}/coli_mistral_vision_tiny \
+	  --same-as $${TMPDIR:-/tmp}/coli_mistral_vision_tiny/from_release/mmproj.gguf
 
 tests/test_k3_ram_budget$(EXE): tests/test_k3_ram_budget.c kimi_k3.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
@@ -2216,6 +2269,14 @@ tests/test_gq_dot$(EXE): tests/test_gq_dot.c
 # no-op on a build without AVX2. `tests/test_gq_r16 bench S` times them.
 tests/test_gq_r16$(EXE): tests/test_gq_r16.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# A matrix's file rows eight at a time (gq_rows_f8) against their scalar reference and the R16
+# forms' kernels, to the bit; a no-op on a build without AVX2. `tests/test_rows_f8 bench` times them.
+tests/test_rows_f8$(EXE): tests/test_rows_f8.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# A prompt's rows of the types with no R16 form, 16 file rows unpacked once (gq_tile16_rows),
+# against their scalar reference to the bit and the row kernels; `tests/test_tile16 bench` times them.
+tests/test_tile16$(EXE): tests/test_tile16.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # The trunk's int8 rows interleaved by 16 (idot.h) against matmul_q_idot, to the bit.
 tests/test_idot_r16$(EXE): tests/test_idot_r16.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -2299,8 +2360,8 @@ tests/test_k3_chat_tools$(EXE): tests/test_k3_chat_tools.c kimi_k3.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 # olmoe's matmul_q, not colibri's: compares the IDOT path against FP32
-# ACTIVATIONS rather than an integer reference. NOCUDA_* for the same reason
-# the olmoe target uses it -- olmoe.c contains no COLI_CUDA code.
+# ACTIVATIONS rather than an integer reference. NOCUDA_*: these tests read the
+# CPU paths, so olmoe.c compiles without its CUDA chain (olmoe_cuda_chain.h).
 tests/test_olmoe_matmul_q$(EXE): tests/test_olmoe_matmul_q.c olmoe.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
@@ -2445,6 +2506,10 @@ tests/test_expert_ffn$(EXE): tests/test_expert_ffn.c
 # int4-g64 rows interleaved by 16 (expert_ffn.h xf16_*) against their reference.
 tests/test_xf16$(EXE): tests/test_xf16.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# the SSE2 i8 expert kernel (no AVX2+FMA) against xf_dot_i8_ref, bit for bit.
+tests/test_xf_sse2_int16$(EXE): tests/test_xf_sse2_int16.c
+	$(CC) $(if $(X86_64),$(filter-out -march=% -mavx% -mfma%,$(CFLAGS)) -march=x86-64 -mno-avx -mno-avx2 -mno-fma -ffp-contract=off,$(CFLAGS)) $< -o $@ $(LDFLAGS)
+
 tests/test_int2_g32$(EXE): tests/test_int2_g32.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_lowbit_g16$(EXE): tests/test_lowbit_g16.c
@@ -2475,6 +2540,10 @@ tests/test_cu_tier$(EXE): tests/test_cu_tier.c $(CUDA_OBJ)
 	$(CC) $(CFLAGS) $< $(CUDA_OBJ) -o $@ $(LDFLAGS)
 tests/test_vk_tier$(EXE): tests/test_vk_tier.c $(VK_OBJ) $(VK_SPV)
 	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_tier needs VK=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+# the hybrid steps' CPU pairs alone (vkt_host_pairs), no device: ./tests/bench_host_pairs [fmt: 2 int4 rows, 4 int4-g64, 1 int8]
+tests/bench_host_pairs$(EXE): tests/bench_host_pairs.c $(VK_OBJ)
+	@[ "$(VK)" = 1 ] || { echo "tests/bench_host_pairs needs VK=1" >&2; exit 1; }
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 .PHONY: vk-tier-check
 vk-tier-check: tests/test_vk_tier$(EXE)
@@ -2571,6 +2640,10 @@ tests/test_router_nan$(EXE): tests/test_router_nan.c colibri.c $(VK_OBJ)
 
 tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# CPU-only state-policy regression; independent of model files and GPU flags.
+tests/test_glm53_live_prefix$(EXE): tests/test_glm53_live_prefix.c glm53.c
+	$(CC) $(NOCUDA_CFLAGS) -UCOLI_METAL -UCOLI_VULKAN $< -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_compat_direct$(EXE): tests/test_compat_direct.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -2980,6 +3053,14 @@ tests/test_qwen36_tier_replan$(EXE): tests/test_qwen36_tier_replan.c qwen36_tier
 tests/test_qwen36_tier_promote$(EXE): tests/test_qwen36_tier_promote.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+# qt_chain_host_follow: after the promotions the host pool is the non-residents again (fake backend).
+tests/test_qwen36_tier_host_pool$(EXE): tests/test_qwen36_tier_host_pool.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# qt_chain_hold: no upload, a free slot's included, while a chain's forward holds the tier (fake backend).
+tests/test_qwen36_tier_hold$(EXE): tests/test_qwen36_tier_hold.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
 tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c qwen36.c qwen36_tier.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
@@ -3304,7 +3385,7 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) mimo$(EXE) qwenimage$(EXE) laya$(EXE) gliner_decide$(EXE) \
+install: colibri-tui$(EXE) colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) mimo$(EXE) qwenimage$(EXE) laya$(EXE) gliner_decide$(EXE) \
 	$(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
@@ -3322,6 +3403,7 @@ install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen3
 	$(INSTALL) -m 755 gliner_decide$(EXE) $(DESTDIR)$(LIBEXECDIR)/gliner_decide$(EXE)
 	$(INSTALL) -m 755 deepseek_v41$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v41$(EXE)
 	$(INSTALL) -m 755 mimo$(EXE) $(DESTDIR)$(LIBEXECDIR)/mimo$(EXE)
+	$(INSTALL) -m 755 colibri-tui$(EXE) $(DESTDIR)$(LIBEXECDIR)/colibri-tui$(EXE)
 	@if [ -f deepseek_v4$(EXE) ]; then \
 	  $(INSTALL) -m 755 deepseek_v4$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v4$(EXE); \
 	fi

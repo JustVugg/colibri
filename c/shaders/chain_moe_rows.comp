@@ -8,8 +8,9 @@
 //           rows' order), cur[e] = off[e]; each pass's expert table (16 words an expert,
 //           qmatmul_grp.comp's: the matrices' addresses, rows, first packed row, format,
 //           row words, gs, the block table's address) and its items, (e, first row of e's,
-//           output block, 1): every expert's tiles of 32 rows by its output blocks, in
-//           expert order; the two passes' indirect dispatches {items, 1, 1}
+//           output block, 1): every expert's tiles of tm rows by its output blocks (bo1
+//           outputs gate+up's, bo0 down's), in expert order; the two passes' indirect
+//           dispatches {items, 1, 1}
 //   mode 2, scatter: one thread a pair, amap[cur[e]++] = p (an expert's rows in any
 //           order: each row's output is its own sums, the same in every order)
 //   mode 3, sum: one workgroup a (row, 256 outputs), y[s][o] = the sum over k in rank
@@ -36,10 +37,11 @@ layout(push_constant) uniform P {
     int t_off, imax;               // the layer's first entry in tab; the items room a pass
     int i_off, i_row, w_off, w_row, y_off, y_row;
     uint tab_lo, tab_hi;           // blockdec_table.h's table, by address
+    int tm, bo1, bo0;              // mode 1: rows a tile, outputs a block of each pass (32, 32, 64:
+                                   // qmatmul_grp*_bd.comp's; 64, 64, 128: qmatmul_grp*_bdcw.comp's)
 } p;
 
 #define ENT 32u
-#define TM 32u                     // rows a tile (qmatmul_grp_bd.comp's)
 shared uint sh_n[256];
 
 bool live(int e) { return e >= 0 && e < p.E && tab[uint(p.t_off + e) * ENT + 18u] != 0u; }
@@ -71,7 +73,7 @@ void main() {
         return;
     }
     // mode 1: one workgroup; a thread takes experts tid, tid + 256, ...
-    uint nob1 = (uint(p.I) + 31u) / 32u, nob0 = (uint(p.D) + 63u) / 64u;   // the passes' output blocks
+    uint TM = uint(p.tm), nob1 = (uint(p.I) + uint(p.bo1) - 1u) / uint(p.bo1), nob0 = (uint(p.D) + uint(p.bo0) - 1u) / uint(p.bo0);
     uint rows_mine = 0u, items_mine = 0u;
     for (uint e = tid; e < E; e += 256u) { uint c = cnt[e]; rows_mine += c; items_mine += (c + TM - 1u) / TM; }
     // the experts' rows and tiles before this thread's first: a scan over the threads, then

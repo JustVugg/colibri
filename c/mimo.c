@@ -60,6 +60,8 @@
 #include "quant.h"
 #include "omp_tune.h"
 #include "kv_prefix.h"
+#include "park.h"   /* a short request keeps the conversation aside (COLI_PARK) */
+#include "prompt_break.h"   /* a served prompt that a STOP or CANCEL stops between two blocks */
 #include "pin_pool.h"
 #include "tok.h"
 #include "serve_codec.h"
@@ -973,13 +975,19 @@ static void kv_alloc(Model *m, int ctx) {
     kv_prefix_alloc(&m->kvp, ctx);
 }
 
-static void model_reset(Model *m) {
+/* The state from nothing. n >= 0: only the rows positions [0, n) reach (a short request beside
+ * a parked conversation, park.h): a query reads the rows of its own positions, a window's by
+ * the position its slot holds, so the conversation's further rows wait untouched. */
+static void model_reset_rows(Model *m, int n) {
     Cfg *c = &m->c;
-    for (int li = 0; li < c->n_layers; li++)
-        for (int r = 0; r < m->L[li].rows; r++) m->L[li].ring_pos[r] = -1;
+    for (int li = 0; li < c->n_layers; li++) {
+        int r0 = n >= 0 && n < m->L[li].rows ? n : m->L[li].rows;
+        for (int r = 0; r < r0; r++) m->L[li].ring_pos[r] = -1;
+    }
     m->pos = 0;
     kv_prefix_clear(&m->kvp);
 }
+static void model_reset(Model *m) { model_reset_rows(m, -1); }
 
 static void model_load(Model *m, const char *dir, int cap) {
     Cfg *c = &m->c;
@@ -1742,9 +1750,11 @@ static void echo_frame(const Echo *e, int pos, int token, const float *lo, int v
 /* A prompt in blocks of MIMO_CHUNK rows (default 64): the last block's last
  * row (or every row, for the teacher-forcing dump) comes back in `logits`.
  * With `echo`, every row of every block goes through the head and is read out
- * as it comes; only one block of logits is ever held, not the prompt's. */
-static void prefill(Model *m, const int *ids, int n, float *logits, float *all_logits,
-                    const ImageRows *img, const Echo *echo) {
+ * as it comes; only one block of logits is ever held, not the prompt's.
+ * 0 when a served prompt's STOP or CANCEL stopped it before a block (prompt_break.h):
+ * the blocks before it are read and recorded, as complete as any step leaves them. */
+static int prefill(Model *m, const int *ids, int n, float *logits, float *all_logits,
+                   const ImageRows *img, const Echo *echo) {
     int chunk = env_int("MIMO_CHUNK", 64);
 #ifdef COLI_VULKAN
     /* the dense chain with a chunk from the budget (vkc_chunk_auto): blocks of its chunk,
@@ -1763,6 +1773,7 @@ static void prefill(Model *m, const int *ids, int n, float *logits, float *all_l
         echo_frame(echo, m->pos, ids[0], echo->first, V);
     }
     for (int b = 0; b < n; b += chunk) {
+        if (coli_prompt_break()) { free(rows); return 0; }
         int nb = n - b < chunk ? n - b : chunk;
         if (all_logits) forward(m, ids + b, nb, all_logits + (size_t)b * V, 1, img, &used);
         else if (rows) {
@@ -1777,6 +1788,7 @@ static void prefill(Model *m, const int *ids, int n, float *logits, float *all_l
     }
     free(rows);
     if (all_logits && logits) memcpy(logits, all_logits + (size_t)(n - 1) * V, (size_t)V * sizeof(float));
+    return 1;
 }
 
 /* ----------------------------------------------------------------- vision ---- */
@@ -2485,8 +2497,61 @@ typedef struct { double started, disk0, expert0, attn0; uint64_t hits0, miss0, f
  * the image, the prefix reuse and the photos, ACCEPT, the prefill and its read-out.
  * 1 with the logits after the prompt; 0 when the request ended here, its ERROR written
  * and its command disposed. serve_loop and serve_mux start every request here. */
+/* A lone request's prompt reads its STOP or CANCEL between two blocks, the way its decode
+ * loop does between two tokens: control 1 CANCEL, 2 STOP. The multiplexed loop owns its
+ * command stream and reads it between steps. */
+static int mimo_prompt_poll(ColiPromptBreak *b) {
+    while (!b->control && !b->eof && coli_serve_stdin_ready()) {
+        ColiServeCommand control;
+        ColiServeReadResult inner = coli_serve_read_command(stdin, &mimo_wire, &control);
+        if (inner == COLI_SERVE_READ_EOF) { b->eof = 1; break; }
+        if (control.kind == COLI_SERVE_COMMAND_CANCEL && !strcmp(control.id, b->id)) b->control = 1;
+        else if (control.kind == COLI_SERVE_COMMAND_STOP && !strcmp(control.id, b->id)) b->control = 2;
+        else if (control.kind == COLI_SERVE_COMMAND_SUBMIT) coli_serve_write_error(stdout, control.id, "SLOT_BUSY");
+        coli_serve_command_dispose(&control);
+    }
+    return b->control;
+}
+
+/* A short request between two turns of the conversation the lone serve holds (park.h): every
+ * layer's first K and V rows (a sliding layer's ring rows) and their positions, back when the
+ * next request arrives; the host's caches stay canonical, the chains' watermarks come down. */
+static ColiPark g_mimo_park;
+static ColiParkPart *mimo_park_parts(Model *m, int *n_out) {
+    Cfg *c = &m->c; int n = 0;
+    ColiParkPart *p = malloc(sizeof *p * ((size_t)c->n_layers * 3));
+    if (!p) { *n_out = 0; return NULL; }
+    for (int li = 0; li < c->n_layers; li++) {
+        Layer *l = &m->L[li]; int k = c->swa[li];
+        p[n++] = coli_park_rows(l->K, (size_t)c->kv_heads[k] * c->head_dim[k] * sizeof(float), l->rows);
+        p[n++] = coli_park_rows(l->V, (size_t)c->kv_heads[k] * c->v_dim[k] * sizeof(float), l->rows);
+        p[n++] = coli_park_rows(l->ring_pos, sizeof(int), l->rows);
+    }
+    *n_out = n;
+    return p;
+}
+static int mimo_park(Model *m, int np, int max_tok) {   /* the rows kept apart, 0: not parked */
+    int n = g_mimo_mux_slots == 1 ? coli_park_rows_for(&g_mimo_park, &m->kvp, m->pos, np, max_tok, 16) : 0, k = 0;
+    if (!n) return 0;
+    ColiParkPart *p = mimo_park_parts(m, &k);
+    int ok = p && coli_park_save(&g_mimo_park, &m->kvp, m->pos, p, k, n);
+    free(p);
+    return ok ? n : 0;
+}
+static void mimo_unpark(Model *m) {
+    if (!g_mimo_park.on) return;
+    int k = 0;
+    ColiParkPart *p = mimo_park_parts(m, &k);
+    if (p && coli_park_restore(&g_mimo_park, &m->kvp, &m->pos, m->pos, 16, p, k)) {
+#ifdef COLI_VULKAN
+        mc_cpu_step(m, 0);   /* the host's rows from 0 are the conversation's again: the mirrors go up again */
+#endif
+    } else coli_park_free(&g_mimo_park);
+    free(p);
+}
+
 static int mimo_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int *ids, float *logits,
-                            float **pending, int *pending_h, int *pending_w, MimoReq *rq) {
+                            float **pending, int *pending_h, int *pending_w, MimoReq *rq, int lone) {
     Cfg *c = &m->c;
     double started = now_s();
     double disk0 = m->t_disk, expert0 = m->t_expert, attn0 = m->t_attn;
@@ -2554,7 +2619,11 @@ static int mimo_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int
         fprintf(stderr, "[PIN] resumed from the photo of %d tokens, %d to prefill\n", reuse, n_prompt - reuse);
         fflush(stderr);
     }
-    if (!reuse) model_reset(m);
+    if (!reuse) {
+        /* a short request keeps the conversation (mimo_unpark): only the rows it reaches start over */
+        int parked = lone && !(*pending) ? mimo_park(m, n_prompt, cmd->max_tokens) : 0;
+        model_reset_rows(m, parked ? parked : -1);
+    }
     coli_serve_write_accept(stdout, cmd->id, n_prompt);
     if ((*pending)) {
         image = vision_run(m, (*pending), (*pending_h), (*pending_w), &image_rows);
@@ -2562,9 +2631,25 @@ static int mimo_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int
     }
     ImageRows img = { image, image_rows };
     Echo echo = { cmd->id, cmd->logprobs, tokenizer, pin_logit };
-    prefill(m, ids + reuse, n_prompt - reuse, logits, NULL, image ? &img : NULL,
-            cmd->logprobs > 0 ? &echo : NULL);
+    ColiPromptBreak brk = { .poll = mimo_prompt_poll, .id = cmd->id };
+    if (lone && cmd->logprobs == 0) g_coli_prompt_break = &brk;
+    int read = prefill(m, ids + reuse, n_prompt - reuse, logits, NULL, image ? &img : NULL,
+                       cmd->logprobs > 0 ? &echo : NULL);
+    g_coli_prompt_break = NULL;
     if (image) kv_prefix_taint(&m->kvp);
+    if (!read) {
+        /* what was read stays the conversation's state: a request that sends it again reuses it */
+        coli_prompt_break_log(brk.control == 1, m->kvp.len, n_prompt);
+        if (brk.control == 1) coli_serve_write_error(stdout, cmd->id, "CANCELLED");
+        else {
+            ColiServeDone done = { 0, 0.0, 0.0, rss_gb(), n_prompt, 0 };
+            coli_serve_write_done(stdout, cmd->id, &done);
+        }
+        fflush(stdout);
+        free(image);
+        coli_serve_command_dispose(cmd);
+        return 0;
+    }
     if (cmd->pin) {
         /* a photo is described by its ids, and these do not describe the picture */
         if (image) fprintf(stderr, "[PIN] no photo: the prompt carries a picture\n");
@@ -2700,7 +2785,7 @@ static void serve_mux(Model *m, Tok *tokenizer, const char *dir) {
                 snprintf(t->id, sizeof t->id, "%s", command.id);
                 t->temperature = command.temperature; t->top_p = command.top_p; t->logprobs = command.logprobs;
                 mimo_mux_bind(m, command.slot);
-                if (mimo_serve_start(m, tokenizer, &command, ids, t->logits, &pending, &pending_h, &pending_w, &t->rq)) {
+                if (mimo_serve_start(m, tokenizer, &command, ids, t->logits, &pending, &pending_h, &pending_w, &t->rq, 0)) {
                     t->active = 1; t->limited = 1;
                     coli_serve_command_dispose(&command);
                 }
@@ -2783,7 +2868,8 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *dir) {
             continue;
         }
         MimoReq rq;
-        if (!mimo_serve_start(m, tokenizer, &command, ids, logits, &pending, &pending_h, &pending_w, &rq)) continue;
+        mimo_unpark(m);   /* a conversation the last request parked: back first */
+        if (!mimo_serve_start(m, tokenizer, &command, ids, logits, &pending, &pending_h, &pending_w, &rq, 1)) continue;
         double started = rq.started;
         double disk0 = rq.disk0, expert0 = rq.expert0, attn0 = rq.attn0;
         uint64_t hits0 = rq.hits0, miss0 = rq.miss0, fw0 = rq.fw0;

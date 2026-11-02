@@ -32,6 +32,24 @@ int main(int argc, char **argv) {
                           1.f, 1.00048828125f, 1.000732421875f, 65504.f, 65519.f, 65520.f, 1e30f, INFINITY};
     for (unsigned i = 0; i < sizeof edge / sizeof *edge; i++)
         for (int d = -2; d <= 2; d++) for (int s = 0; s < 2; s++, n++) check((bits(edge[i]) + d) ^ (s ? 0x80000000u : 0), &bad);
+    /* the array loops (eight at a time where the host has F16C) against the scalar conversion,
+     * value by value: every float the step samples, 64 a call (a tail of 3 after each 61) */
+    {
+        float xs[64], rr[64], un[64]; uint16_t pk[64];
+        int k = 0, len = 61;
+        for (uint64_t u = 0; u <= 0xffffffffull; u += step | 1u) {
+            xs[k++] = flt((uint32_t)u);
+            if (k < len) continue;
+            memcpy(rr, xs, sizeof rr); kv16_round(rr, len); kv16_pack(pk, xs, len); kv16_unpack(un, pk, len);
+            for (int j = 0; j < len; j++, n++) {
+                uint16_t h = kv16_from(xs[j]); float w = kv16_to(h);
+                int nan = isnan(w), ok = nan ? isnan(rr[j]) && isnan(un[j]) : bits(rr[j]) == bits(w) && pk[j] == h && bits(un[j]) == bits(w);
+                if (!ok) { if (bad < 8) fprintf(stderr, "array loops, x=%a: round 0x%08x pack 0x%04x unpack 0x%08x, scalar 0x%04x\n",
+                                                xs[j], bits(rr[j]), pk[j], bits(un[j]), h); ++bad; }
+            }
+            k = 0; len = len == 61 ? 64 : 61;
+        }
+    }
     /* the stored half widens back to what was rounded, and clamping never makes an infinity */
     for (uint32_t h = 0; h < 0x10000u; h++) {
         float f = kv16_to((uint16_t)h);
@@ -67,6 +85,9 @@ int main(int argc, char **argv) {
            ", F16C loops"
 #else
            ", scalar loops"
+#endif
+#ifdef KV16_CVT8
+           ", F16C conversions"
 #endif
            );
     return bad != 0;

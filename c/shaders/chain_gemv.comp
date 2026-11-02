@@ -73,14 +73,26 @@ vec4 rowpart(int o, int nq, int q0, int qs, int nrow) {
     int rb = o * nq, ng = p.gs > 0 ? (p.I + p.gs - 1) / p.gs : 1;
     vec4 a0 = vec4(0.0), a1 = vec4(0.0), a2 = vec4(0.0), a3 = vec4(0.0);
     if (p.fmt == 1) {
-        for (int q = q0; q < nq; q += qs) {
-            uvec4 w = w4[rb + q]; int xb = q * 4;
-            [[unroll]] for (int r = 0; r < NR; r++) if (r < nrow) {
-                vec4 x0 = XV(r, xb), x1 = XV(r, xb + 1), x2 = XV(r, xb + 2), x3 = XV(r, xb + 3);
-                a0[r] += x0.x * sb(w.x, 0) + x0.y * sb(w.x, 8) + x0.z * sb(w.x, 16) + x0.w * sb(w.x, 24);
-                a1[r] += x1.x * sb(w.y, 0) + x1.y * sb(w.y, 8) + x1.z * sb(w.y, 16) + x1.w * sb(w.y, 24);
-                a2[r] += x2.x * sb(w.z, 0) + x2.y * sb(w.z, 8) + x2.z * sb(w.z, 16) + x2.w * sb(w.z, 24);
-                a3[r] += x3.x * sb(w.w, 0) + x3.y * sb(w.w, 8) + x3.z * sb(w.w, 16) + x3.w * sb(w.w, 24);
+        // four steps' loads issued before the first is used: a loop that loads one step and
+        // sums it waits for every load in turn (an RTX 3070, int8 8192 x 2048: 81 -> 48 us a
+        // matrix in the bench); the sums go into the same accumulators in the same order, so
+        // a row's bits are the loop's
+        for (int q = q0; q < nq; q += 4 * qs) {
+            uvec4 wv0 = w4[rb + q];
+            uvec4 wv1 = q + qs < nq ? w4[rb + q + qs] : uvec4(0u);
+            uvec4 wv2 = q + 2 * qs < nq ? w4[rb + q + 2 * qs] : uvec4(0u);
+            uvec4 wv3 = q + 3 * qs < nq ? w4[rb + q + 3 * qs] : uvec4(0u);
+            [[unroll]] for (int t = 0; t < 4; t++) {
+                int qq = q + t * qs;
+                if (qq >= nq) break;
+                uvec4 w = t == 0 ? wv0 : t == 1 ? wv1 : t == 2 ? wv2 : wv3; int xb = qq * 4;
+                [[unroll]] for (int r = 0; r < NR; r++) if (r < nrow) {
+                    vec4 x0 = XV(r, xb), x1 = XV(r, xb + 1), x2 = XV(r, xb + 2), x3 = XV(r, xb + 3);
+                    a0[r] += x0.x * sb(w.x, 0) + x0.y * sb(w.x, 8) + x0.z * sb(w.x, 16) + x0.w * sb(w.x, 24);
+                    a1[r] += x1.x * sb(w.y, 0) + x1.y * sb(w.y, 8) + x1.z * sb(w.y, 16) + x1.w * sb(w.y, 24);
+                    a2[r] += x2.x * sb(w.z, 0) + x2.y * sb(w.z, 8) + x2.z * sb(w.z, 16) + x2.w * sb(w.z, 24);
+                    a3[r] += x3.x * sb(w.w, 0) + x3.y * sb(w.w, 8) + x3.z * sb(w.w, 16) + x3.w * sb(w.w, 24);
+                }
             }
         }
     } else if (p.fmt == 4) {

@@ -1134,11 +1134,20 @@ extern "C" void coli_metal_unregister(void *base) {
 }
 // Resolve a host pointer inside a registered slab to (buffer, gpuAddress). Returns nil if unknown.
 static id<MTLBuffer> resolve(const void *p, uint64_t *addr) {
-  std::lock_guard<std::mutex> lk(g_slab_mtx);
-  uintptr_t u=(uintptr_t)p;
-  for (auto &s : g_slabs) { uintptr_t b=(uintptr_t)s.base;
-    if (u>=b && u<b+s.len) { *addr = (uint64_t)[s.buf gpuAddress] + (u-b); return s.buf; } }
-  return nil;
+  const uintptr_t u=(uintptr_t)p;
+  uintptr_t base=0;
+  id<MTLBuffer> buffer=nil;  // ARC retains it across removal from the registry.
+  {
+    std::lock_guard<std::mutex> lk(g_slab_mtx);
+    for (auto &s : g_slabs) {
+      const uintptr_t b=(uintptr_t)s.base;
+      if (u>=b && u-b<s.len) { buffer=s.buf; base=b; break; }
+    }
+  }
+  if (!buffer) return nil;
+  // Driver calls must not hold up independent slab registration/unregistration.
+  *addr=(uint64_t)[buffer gpuAddress]+(u-base);
+  return buffer;
 }
 
 // Keep-alive spinner (COLI_METAL_SPIN=1): keeps trivial GPU work in flight so the GPU

@@ -61,10 +61,10 @@ def memory_from_windows_status(total_phys, avail_phys, avail_pagefile=None):
     """GlobalMemoryStatusEx figures. Available is the smaller of free physical
     memory and the commit Windows can still grant (resource_plan's rule, #1375)."""
     available = avail_phys
-    if avail_pagefile and 0 < avail_pagefile < avail_phys:
+    if avail_pagefile is not None and 0 <= avail_pagefile < avail_phys:
         available = avail_pagefile
     return {"total": int(total_phys) if total_phys else None,
-            "available": int(available) if available else None}
+            "available": int(available) if available is not None else None}
 
 
 def memory_from_darwin(memsize_text, vm_stat_text=""):

@@ -12,6 +12,7 @@ import mimetypes
 import os
 import select
 import queue
+import shutil
 import signal
 import stat
 import socket
@@ -29,7 +30,7 @@ from family_registry import (FamilyConfigError, UnknownFamilyError, family_by_id
 from family_registry import default_model_id as registry_default_model_id
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 
 HERE = Path(__file__).resolve().parent
@@ -446,7 +447,7 @@ def _fallback_tool_calls(tool_calls, index):
         if isinstance(args, str):
             try:
                 args = json.loads(args) if args else {}
-            except (json.JSONDecodeError, TypeError, ValueError):
+            except (TypeError, ValueError, RecursionError):
                 raise APIError(400, "`function.arguments` must be a JSON object.",
                                f"messages.{index}.tool_calls.{position}.function.arguments")
         if args and not isinstance(args, dict):
@@ -1079,10 +1080,12 @@ def _parse_arch_tool_calls(reply, tools, tool_reply, track_spans):
             _sideband_text, calls = parse_k3_tool_calls(tool_reply, tools)
             return reply.strip(), calls, None, None
         return parse_k3_tool_calls(reply, tools) + (None, None)  # pre-#1147 engines
-    if chat_flavor() in ("qwen36", "qwen38", "qwen3_coder"):
+    if chat_flavor() in ("qwen36", "qwen38", "qwen3_coder", "lfm3"):
         return parse_qwen_tool_calls(reply, tools) + (None, None)
     if chat_flavor() == "muse":
         return parse_muse_tool_calls(reply, tools) + (None, None)
+    if chat_flavor() == "mistral_large4":
+        return parse_mistral_tool_calls(reply, tools) + (None, None)
     if ARCH == "mimo":
         return _parse_mimo_tool_calls(reply, tools, track_spans)
     return _parse_tool_calls(reply, tools, track_spans)
@@ -1100,6 +1103,8 @@ def _tool_stream_markers():
         return (K3_TOOLS_OPEN,)
     if chat_flavor() == "muse":
         return (MUSE_ATEM_OPEN,)
+    if chat_flavor() == "mistral_large4":
+        return (ML4_CALLS,)
     return (BOX_START,)
 
 
@@ -1135,6 +1140,14 @@ def chat_flavor():
 
 def detect_chat_flavor(family_id, model_dir):
     """The template a checkpoint ships, when it differs from its family's (see CHAT_FLAVOR)."""
+    if family_id == "glm" and model_dir:   # the colibri engine: Mistral-Large-4's own chat format
+        try:
+            config = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            config = {}
+        if isinstance(config, dict) and config.get("model_type") == "mistral_large4":
+            return "mistral_large4"
+        return None
     if family_id != "qwen36" or not model_dir:
         return None
     for name in ("chat_template.jinja", "tokenizer_config.json"):
@@ -1154,6 +1167,9 @@ def detect_chat_flavor(family_id, model_dir):
         # Muse Spark: messages to recipients, calls as <atem:function_calls>
         if "render_valid_recipients" in text:
             return "muse"
+        # LFM3 (LiquidAI/LFM3-VL): ChatML after its BOS, <think> always written, tools as JSON
+        if "macro render_tool_response" in text and "<additional_tools>" in text:
+            return "lfm3"
     return None
 
 INK_THINK, INK_TEXT = "<|content_thinking|>", "<|content_text|>"
@@ -1349,6 +1365,22 @@ def decode_wav_mono16k(data, param):
             if len(body) < 16:
                 raise APIError(400, "WAV fmt chunk is too short.", param, "invalid_value")
             fmt = _struct.unpack_from("<HHIIHH", body, 0)
+            if fmt[0] == 0xFFFE:      # WAVE_FORMAT_EXTENSIBLE identifies encoding by GUID.
+                if len(body) < 40:
+                    raise APIError(400, "WAV extensible fmt chunk is too short.", param, "invalid_value")
+                extension_size = _struct.unpack_from("<H", body, 16)[0]
+                if extension_size < 22 or 18 + extension_size > len(body):
+                    raise APIError(400, "WAV extensible fmt has an invalid extension size.",
+                                   param, "invalid_value")
+                guid = body[24:40]
+                guid_tail = bytes.fromhex("00001000800000aa00389b71")
+                if guid == b"\x01\0\0\0" + guid_tail:
+                    fmt = (1,) + fmt[1:]
+                elif guid == b"\x03\0\0\0" + guid_tail:
+                    fmt = (3,) + fmt[1:]
+                else:
+                    raise APIError(400, "Unsupported WAV extensible subformat; use PCM16 or float32.",
+                                   param, "invalid_value")
         elif cid == b"data":
             raw = body
         pos += 8 + size + pad
@@ -1360,8 +1392,6 @@ def decode_wav_mono16k(data, param):
     audio_format, channels, rate, _, _, bits = fmt
     if channels == 0:
         raise APIError(400, "WAV channel count must be positive.", param, "invalid_value")
-    if audio_format == 0xFFFE:      # WAVE_FORMAT_EXTENSIBLE: trust the bit width
-        audio_format = 3 if bits == 32 else 1
     if rate != AUDIO_SAMPLE_RATE:
         raise APIError(400, f"Audio must be {AUDIO_SAMPLE_RATE} Hz (got {rate}). "
                             "Resample at the capture edge.", param, "invalid_value")
@@ -1376,6 +1406,8 @@ def decode_wav_mono16k(data, param):
     else:
         raise APIError(400, f"Unsupported WAV encoding (format {audio_format}, {bits}-bit); "
                             "use PCM16 or float32.", param, "invalid_value")
+    if not np.isfinite(samples).all():
+        raise APIError(400, "WAV samples must be finite numbers.", param, "invalid_value")
     if channels > 1:
         samples = samples.reshape(-1, channels).mean(axis=1)
     return samples
@@ -1465,7 +1497,9 @@ def _k3_parse_arguments(raw):
     skip()
     if idx >= len(s) or s[idx] != "{": return None
     idx += 1; skip()
-    if idx < len(s) and s[idx] == "}": return []
+    if idx < len(s) and s[idx] == "}":
+        idx += 1; skip()
+        return [] if idx == len(s) else None
     out = []
     try:
         while True:
@@ -1481,7 +1515,7 @@ def _k3_parse_arguments(raw):
             skip()
             if idx >= len(s): return None
             c = s[idx]; idx += 1; skip()
-            if c == "}": return out
+            if c == "}": return out if idx == len(s) else None
             if c != ",": return None
     except (json.JSONDecodeError, ValueError):
         return None
@@ -1921,6 +1955,9 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
             if not isinstance(reasoning, str):
                 raise APIError(400, "`reasoning_content` must be a string.",
                                f"messages.{index}.reasoning_content")
+            if add_generation_prompt is CONTINUE_IN_THINK:
+                parts.append(f"<|im_start|>assistant\n<think>\n{reasoning.strip()}")
+                continue
             parts.append(f"<|im_start|>assistant\n<think>\n{reasoning.strip()}\n</think>\n\n"
                          f"{text}")
             continue
@@ -2018,7 +2055,7 @@ def _qwen_tool_calls(tool_calls, has_content, index):
         if isinstance(args, str) and args:
             try:
                 args = json.loads(args)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, RecursionError):
                 raise APIError(400, "`function.arguments` must be a JSON object.",
                                f"messages.{index}.tool_calls.{position}.function.arguments")
         if isinstance(args, dict):
@@ -2613,6 +2650,136 @@ def parse_muse_tool_calls(reply, tools):
     return text.strip(), calls
 
 
+LFM3_BOS = "<|startoftext|>"
+
+
+def _lfm3_value(value):
+    """The template's render_value: a str as it is, true/false, null, JSON for a mapping or a
+    list, anything else through str()."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _lfm3_tool_calls(calls, index):
+    """The template's render_tool_calls: one <tool_call> block per call, a blank line between."""
+    out = []
+    for position, call in enumerate(calls):
+        where = f"messages.{index}.tool_calls.{position}"
+        fn = call.get("function", call) if isinstance(call, dict) else None
+        if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or not fn["name"]:
+            raise APIError(400, "Each tool call needs a `function.name`.", where)
+        args = fn.get("arguments")
+        if isinstance(args, str):   # the OpenAI shape: the object the template expects, as JSON
+            try:
+                args = json.loads(args) if args.strip() not in ("", "{}", "null") else {}
+            except ValueError:
+                raise APIError(400, "`function.arguments` must be a JSON object.", f"{where}.function.arguments")
+        if args is not None and not isinstance(args, dict):
+            raise APIError(400, "`function.arguments` must be a JSON object.", f"{where}.function.arguments")
+        body = "".join(f"<parameter={key}>\n{_lfm3_value(value)}\n</parameter>\n" for key, value in (args or {}).items())
+        out.append(f"<tool_call>\n<function={fn['name']}>\n{body}</function>\n</tool_call>")
+    return "\n\n".join(out)
+
+
+def render_chat_lfm3(messages, enable_thinking=True, tools=None, tool_choice=None,
+                     add_generation_prompt=True, preserve_thinking=False):
+    """LFM3's chat_template (LiquidAI/LFM3-VL), byte for byte on the OpenAI shapes: its BOS, then
+    ChatML turns with a newline after every <|im_end|>; the tools (their function objects as JSON,
+    one per line) in a <tools> block after the client's system text; an assistant turn after the
+    last user turn keeps its reasoning as <think>...</think> (an empty pair when it has none), an
+    earlier one gets the empty pair and only the text after its </think>; calls as
+    <tool_call><function=...><parameter=...>; a tool result in its own tool turn inside
+    <tool_response>. The generation prompt opens <think> (thinking on, the template's default)
+    or writes the closed pair. add_generation_prompt=False leaves a trailing assistant turn open."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tool_choice == "none":
+        tools = None
+    if tools is not None and not isinstance(tools, list):
+        raise APIError(400, "`tools` must be an array.", "tools")
+    start, system = 0, ""
+    first = messages[0]
+    if isinstance(first, dict) and first.get("role") in ("system", "developer"):
+        raw = first.get("content")
+        system = content_text(raw, "messages.0.content") if raw else ""
+        start = 1
+    if tools:
+        lines = []
+        for position, tool in enumerate(tools):
+            fn = tool.get("function", tool) if isinstance(tool, dict) else None
+            if not isinstance(fn, dict):
+                raise APIError(400, "Each tool must be an object.", f"tools.{position}")
+            if fn.get("defer_loading") or (isinstance(tool, dict) and tool.get("defer_loading")):
+                continue
+            lines.append(json.dumps({k: v for k, v in fn.items() if k != "defer_loading"}, ensure_ascii=False))
+        if lines:
+            system += ("\n\n" if system else "") + "<tools>\n" + "\n".join(lines) + "\n</tools>"
+    parts = [LFM3_BOS]
+    if system:
+        parts.append(f"<|im_start|>system\n{system}<|im_end|>\n")
+    loop = messages[start:]
+    last_user = -1
+    for offset, message in enumerate(loop):
+        if isinstance(message, dict) and message.get("role") == "user":
+            last_user = offset
+    for offset, message in enumerate(loop):
+        index = start + offset
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role == "developer":
+            role = "system"
+        if role not in ("system", "user", "assistant", "tool"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw else ""
+        if role == "tool":
+            if isinstance(raw, list):   # the template's render_tool_response: one item per line
+                text = "\n".join(content_text([part], f"messages.{index}.content") for part in raw)
+            body = text if isinstance(raw, str) and "<tool_response>" in text else \
+                f"<tool_response>\n{text}\n</tool_response>"
+            parts.append(f"<|im_start|>tool\n{body}<|im_end|>\n")
+            continue
+        if role != "assistant":
+            parts.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
+            continue
+        keep = preserve_thinking or offset > last_user
+        thinking = None
+        for key in ("thinking", "reasoning", "reasoning_content"):
+            if key in message:
+                thinking = message[key]
+                break
+        if thinking is not None and not isinstance(thinking, str):
+            raise APIError(400, f"`{key}` must be a string.", f"messages.{index}.{key}")
+        head = ""
+        if any(key in message for key in ("thinking", "reasoning", "reasoning_content")) and keep:
+            head = f"<think>{thinking or ''}</think>"
+        elif keep and "</think>" not in (raw if isinstance(raw, str) else ""):
+            head = "<think></think>"
+        if not keep:
+            if "</think>" in text:
+                text = text.split("</think>")[-1].strip()
+            text = "<think></think>" + text
+        calls = message.get("tool_calls")
+        if calls is not None and not isinstance(calls, list):
+            raise APIError(400, "`tool_calls` must be an array.", f"messages.{index}.tool_calls")
+        rendered = head + text + (_lfm3_tool_calls(calls, index) if calls else "")
+        if not add_generation_prompt and offset == len(loop) - 1:
+            parts.append(f"<|im_start|>assistant\n{rendered}")   # continued, still open
+            continue
+        parts.append(f"<|im_start|>assistant\n{rendered}<|im_end|>\n")
+    if add_generation_prompt:
+        parts.append("<|im_start|>assistant\n" + ("<think>" if enable_thinking else "<think></think>"))
+    return "".join(parts)
+
+
 def render_chat_qwen3_coder(messages, tools=None, tool_choice=None, add_generation_prompt=True):
     """Qwen3-Coder's chat_template (qwen3_moe), byte for byte: ChatML with a newline after
     every <|im_end|>, no thinking at all, the system turn carrying the client's system text
@@ -2676,7 +2843,7 @@ def render_chat_qwen3_coder(messages, tools=None, tool_choice=None, add_generati
                 if isinstance(args, str):
                     try:
                         args = json.loads(args) if args.strip() else {}
-                    except ValueError:
+                    except (ValueError, RecursionError):
                         raise APIError(400, "`function.arguments` must be a JSON object.",
                                        f"{where}.function.arguments")
                 if not isinstance(args, dict):
@@ -2914,7 +3081,7 @@ def _mimo_tool_calls(calls, index):
             if isinstance(args, str) and args.strip():
                 try:
                     args = json.loads(args)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, RecursionError):
                     raise APIError(400, "`function.arguments` must be a JSON object.",
                                    f"{where}.function.arguments")
             if isinstance(args, dict):
@@ -3020,39 +3187,52 @@ def _parse_mimo_tool_calls(reply, tools, track_spans):
     def make_call(name, body):
         args = {}
         found = MIMO_PARAM_RE.findall(body)
-        for key, raw in found:
-            key = key.strip()
-            if raw.startswith("\n"):
-                raw = raw[1:]
-            if raw.endswith("\n"):
-                raw = raw[:-1]
-            declared = (schema.get(name) or {}).get(key) or {}
-            kind = declared.get("type") if isinstance(declared, dict) else None
-            args[key] = _coerce_arg(raw, kind if isinstance(kind, str) else None) \
-                if kind not in (None, "string") else raw
-        if not found and body.strip():
-            try:
+        if found and MIMO_PARAM_RE.sub("", body).strip():
+            return None
+        try:
+            for key, raw in found:
+                key = key.strip()
+                if key in args:
+                    return None
+                if raw.startswith("\n"):
+                    raw = raw[1:]
+                if raw.endswith("\n"):
+                    raw = raw[:-1]
+                declared = (schema.get(name) or {}).get(key) or {}
+                args[key] = _qwen_argument(raw, declared)
+            if not found and body.strip():
                 parsed = json.loads(body)
-                if isinstance(parsed, dict):
-                    args = parsed
-            except (TypeError, ValueError):
-                pass
+                if not isinstance(parsed, dict):
+                    return None
+                args = parsed
+            # Python accepts NaN/Infinity in JSON; these are not JSON arguments.
+            arguments = json.dumps(args, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError, RecursionError):
+            return None
         return {"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
-                "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
+                "function": {"name": name, "arguments": arguments}}
 
     text = reply or ""
     matches = list(MIMO_CALL_RE.finditer(text))
-    calls = [make_call(m.group(1).strip(), m.group(2)) for m in matches]
+    accepted = []
+    calls = []
+    for match in matches:
+        call = make_call(match.group(1).strip(), match.group(2))
+        if call is not None:
+            calls.append(call)
+            accepted.append(match)
     if not calls and tools and ("<tool_call>" in text or "<function=" in text):
         sys.stderr.write("[api] mimo tool markers present but no call parsed -- "
                          "possibly truncated or mangled output\n")
         sys.stderr.flush()
     if not track_spans:
-        return MIMO_CALL_RE.sub("", text).strip(), calls, None, None
-    # The same two deletions as the line above -- every call block, then the surrounding
+        for match in reversed(accepted):
+            text = text[:match.start()] + text[match.end():]
+        return text.strip(), calls, None, None
+    # The same two deletions as the line above -- accepted call blocks, then surrounding
     # whitespace -- found as ranges, so logprobs.content can describe the content returned
     # rather than the raw reply with the call syntax in it.
-    content, box_map = _apply_cuts(text, [(m.start(), m.end()) for m in matches])
+    content, box_map = _apply_cuts(text, [(m.start(), m.end()) for m in accepted])
     head = len(content) - len(content.lstrip())
     kept = len(content.strip())
     content, step = _apply_cuts(content, [(0, head), (head + kept, len(content))])
@@ -3157,6 +3337,9 @@ def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, to
             if not isinstance(reasoning, str):
                 raise APIError(400, "`reasoning_content` must be a string.",
                                f"messages.{index}.reasoning_content")
+            if add_generation_prompt is CONTINUE_IN_THINK and index == len(messages) - 1:
+                parts.append(f"<|im_start|>assistant\n<think>\n{reasoning.strip()}")
+                continue
             calls = message.get("tool_calls")
             rendered = f"<think>\n{reasoning.strip()}\n</think>\n\n{text}"
             if calls:
@@ -3367,7 +3550,7 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
                 if isinstance(args, str):
                     try:
                         args = json.loads(args)
-                    except (json.JSONDecodeError, TypeError):
+                    except (TypeError, ValueError, RecursionError):
                         args = {}
                 if not isinstance(args, dict):
                     # `arguments` that is valid JSON but not an object ("[1,2]",
@@ -3506,10 +3689,11 @@ def _preprocess_qwen38_image(data, model_dir, max_tokens=None):
         from pathlib import Path as _Path
         _sys.path.insert(0, str(_Path(__file__).resolve().parent / "tools"))
         from qwen38_image import preprocess
+        return preprocess(data, model_dir, max_tokens)   # Pillow and numpy are imported when it runs
     except ImportError as problem:
-        raise APIError(400, f"image support needs Pillow and numpy ({problem}).",
+        raise APIError(400, f"image support needs Pillow and numpy ({problem}); "
+                                 "pip install pillow numpy",
                        "messages")
-    return preprocess(data, model_dir, max_tokens)
 
 
 def _text_part(part, index, position):
@@ -3523,7 +3707,7 @@ def _text_part(part, index, position):
     return text
 
 
-def expand_qwen38_images(messages, model_dir, max_tokens=None):
+def expand_qwen38_images(messages, model_dir, max_tokens=None, pad=QWEN38_IMAGE_PAD):
     """Replace image parts with their placeholders and pull out the patches.
 
     Returns (rewritten messages, images). The messages come back as plain text,
@@ -3549,20 +3733,92 @@ def expand_qwen38_images(messages, model_dir, max_tokens=None):
                     data, model_dir, max_tokens)
                 tokens = (grid_h // 2) * (grid_w // 2)
                 images.append((patches, grid_h, grid_w))
-                pieces.append(QWEN38_VISION_START + QWEN38_IMAGE_PAD * tokens
-                              + QWEN38_VISION_END)
+                pieces.append(QWEN38_VISION_START + pad * tokens + QWEN38_VISION_END)
             else:
                 raise APIError(400, f"unsupported content part {kind!r}.", "messages")
         rewritten.append({**message, "content": "".join(pieces)})
     return rewritten, images
 
 
+# LFM3-VL's placeholder (its processor's image_token), and a ceiling on a picture's tokens: its
+# window reaches 16M pixels, 16384 tokens, and the tower attends over all of a picture's patches
+LFM3_IMAGE_PAD = "<|image|>"
+LFM3_MAX_IMAGE_TOKENS = 1024
+
+
+def _preprocess_ml4_image(data, model_dir, max_tokens=None):
+    try:
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(__file__).resolve().parent / "tools"))
+        from mistral_image import preprocess
+        return preprocess(data, model_dir, max_tokens)   # Pillow and numpy are imported when it runs
+    except ImportError as problem:
+        raise APIError(400, f"image support needs Pillow and numpy ({problem}); "
+                                 "pip install pillow numpy",
+                       "messages")
+
+
+ML4_MAX_IMAGE_TOKENS = 256   # merged tokens a picture at most (ML4_MAX_IMAGE_TOKENS): the tower runs on the CPU
+
+
+def expand_ml4_images(messages, model_dir, max_tokens=None):
+    """Mistral-Large-4: each picture becomes its [IMG] rows (a row of merged tokens closed by
+    [IMG_BREAK], the last by [IMG_END], tools/mistral_image.py's placeholder) and its patches.
+    The other parts stay as they are (an assistant turn's thinking chunks among them), for
+    render_chat_mistral_large4. Returns (messages, images); images are (patches, patch rows,
+    patch columns), as the engine's IMAGE frame takes them."""
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
+    from mistral_image import MERGE, placeholder
+    images, rewritten = [], []
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list) or not any(isinstance(p, dict) and p.get("type") in ("image_url", "input_image")
+                                                    for p in content):
+            rewritten.append(message)
+            continue
+        parts = []
+        for part in content:
+            kind = part.get("type") if isinstance(part, dict) else None
+            if kind in ("image_url", "input_image"):
+                url = _image_part_url(part, kind)
+                patches, grid_h, grid_w = _preprocess_ml4_image(_image_bytes_from_url(url), model_dir, max_tokens)
+                images.append((patches, grid_h * MERGE, grid_w * MERGE))
+                parts.append({"type": "text", "text": placeholder(grid_h, grid_w)})
+            else:
+                parts.append(part)
+        rewritten.append({**message, "content": parts})
+    return rewritten, images
+
+
+def ml4_has_vision(model_dir):
+    """Whether a Mistral-Large-4 folder has its vision tower: a GGUF folder's linked mmproj
+    (gguf.json), or the mmproj.gguf a container converted from the FP8 release carries."""
+    if not model_dir:
+        return False
+    if (Path(model_dir) / "mmproj.gguf").is_file():
+        return True
+    try:
+        link = json.loads((Path(model_dir) / "gguf.json").read_text(encoding="utf-8"))
+        return isinstance(link, dict) and bool(link.get("mmproj"))
+    except (OSError, ValueError):
+        return False
+
+
 def qwen36_has_vision(model_dir):
     """Whether a qwen36 container carries its vision tower (#1757). The converter
     writes the tower's shape into qwen36_meta.json only when it copied the weights;
-    older containers, and text-only checkpoints, have none."""
+    older containers, and text-only checkpoints, have none. A GGUF folder links one
+    by its gguf.json's mmproj (LFM3-VL)."""
     if not model_dir:
         return False
+    try:
+        link = json.loads((Path(model_dir) / "gguf.json").read_text(encoding="utf-8"))
+        if isinstance(link, dict) and link.get("mmproj"):
+            return True
+    except (OSError, ValueError):
+        pass
     try:
         meta = json.loads((Path(model_dir) / "qwen36_meta.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -3657,10 +3913,11 @@ def _preprocess_dsv41_image(data, model_dir, max_tokens=None):
         from pathlib import Path as _Path
         _sys.path.insert(0, str(_Path(__file__).resolve().parent / "tools"))
         from dsv41_image import preprocess
+        return preprocess(data, model_dir, max_tokens)   # Pillow and numpy are imported when it runs
     except ImportError as problem:
-        raise APIError(400, f"image support needs Pillow and numpy ({problem}).",
+        raise APIError(400, f"image support needs Pillow and numpy ({problem}); "
+                                 "pip install pillow numpy",
                        "messages")
-    return preprocess(data, model_dir, max_tokens)
 
 
 def _preprocess_image(data, model_dir):
@@ -3671,10 +3928,11 @@ def _preprocess_image(data, model_dir):
         from pathlib import Path as _Path
         _sys.path.insert(0, str(_Path(__file__).resolve().parent / "tools"))
         from glm53_image import preprocess
+        return preprocess(data, model_dir)   # Pillow and numpy are imported when it runs
     except ImportError as problem:
-        raise APIError(400, f"image support needs Pillow and numpy ({problem}).",
+        raise APIError(400, f"image support needs Pillow and numpy ({problem}); "
+                                 "pip install pillow numpy",
                        "messages")
-    return preprocess(data, model_dir)
 
 
 GLM53_TOOL_PREAMBLE = (
@@ -3732,7 +3990,7 @@ def _glm53_tool_calls(calls):
         if isinstance(arguments, str):
             try:
                 arguments = json.loads(arguments)
-            except ValueError:
+            except (ValueError, RecursionError):
                 arguments = {}
         if not isinstance(arguments, dict):
             arguments = {}                        # same gap as render_chat above
@@ -3981,6 +4239,240 @@ def _dsv41_merge_turns(messages):
     return turns
 
 
+# ---- Mistral-Large-4 (mistralai/Mistral-Large-4-1T-A52B, the colibri engine) -------------------
+# The release's chat_template.jinja, byte for byte (tests/test_mistral_large4_chat.py, against the
+# template when COLI_ML4_TEMPLATE names it): <s>, consecutive turns of one role (but system and
+# tool) merged with blank lines between them, [AVAILABLE_TOOLS] and [MODEL_SETTINGS] (the
+# reasoning effort, low to high; a response format's JSON schema) before the first user turn,
+# [INST]...[/INST], an assistant turn's reasoning in [THINK]...[/THINK] and its calls as
+# [TOOL_CALLS]name[ARGS]{json}, then </s>; [TOOL_RESULTS]...[/TOOL_RESULTS]; system turns in
+# [SYSTEM_PROMPT]. The answer opens its own [THINK]: the gateway reads it as <think>.
+ML4_BOS, ML4_EOS = "<s>", "</s>"
+ML4_THINK_OPEN, ML4_THINK_CLOSE = "[THINK]", "[/THINK]"
+ML4_CALLS, ML4_ARGS = "[TOOL_CALLS]", "[ARGS]"
+
+
+def _ml4_json(value):
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _ml4_render_content(content, where, kinds, thinking, images):
+    if isinstance(content, str):
+        return content
+    if content:
+        out = []
+        for block in content:
+            kind = block.get("type") if isinstance(block, dict) else None
+            if kind == "text":
+                out.append(block.get("text", ""))
+            elif thinking and kind == "thinking":
+                out.append(ML4_THINK_OPEN + block.get("thinking", ""))
+                if block.get("closed", True):
+                    out.append(ML4_THINK_CLOSE)
+            elif images and kind in ("image", "image_url", "input_image"):
+                # expand_ml4_images turned every picture into its [IMG] rows before this; one left
+                # here is one the engine cannot read
+                raise APIError(400, "Mistral-Large-4's pictures need its vision tower: link the GGUF's "
+                                    "mmproj-*.gguf (coli import) and serve again.", "messages",
+                               "unsupported_content_type")
+            else:
+                raise APIError(400, f"Only {kinds} chunks are supported in {where}.", "messages")
+        return "".join(out)
+    raise APIError(400, f"{where} must have non-empty content.", "messages")
+
+
+def _ml4_merge(messages):
+    """Consecutive turns of one role, but system and tool, as one: their texts with a blank
+    line between, a reasoning field as a leading thinking chunk, their calls in order."""
+    merged, group, role = [], [], None
+
+    def flush():
+        if role == "tool":
+            merged.extend(group)
+            return
+        if role is None:
+            return
+        text_parts, chunks, non_text, calls = [], [], False, []
+        for msg in group:
+            reasoning = msg.get("reasoning_content", msg.get("reasoning"))
+            content = msg.get("content")
+            if reasoning is not None and reasoning != "":
+                if content is not None and not isinstance(content, str):
+                    if any(isinstance(b, dict) and b.get("type") == "thinking" for b in content):
+                        raise APIError(400, "Message cannot have both thinking chunks in content and a "
+                                            "top-level `reasoning` or `reasoning_content` field.", "messages")
+                think = {"type": "thinking", "thinking": reasoning}
+                if isinstance(content, str) and content != "":
+                    content = [think, {"type": "text", "text": content}]
+                elif content is not None and not isinstance(content, str) and len(content) > 0:
+                    content = [think] + list(content)
+                else:
+                    content = [think]
+            if isinstance(content, str):
+                text_parts.append(content)
+            elif content is not None:
+                parts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        parts.append(block.get("text", ""))
+                    else:
+                        if parts:
+                            text_parts.append("".join(parts))
+                            parts = []
+                        if text_parts:
+                            chunks.append({"type": "text", "text": "\n\n".join(text_parts)})
+                            text_parts = []
+                        chunks.append(block)
+                        non_text = True
+                if parts:
+                    text_parts.append("".join(parts))
+            if msg.get("tool_calls") is not None:
+                calls.extend(msg["tool_calls"])
+        if non_text:
+            if text_parts:
+                chunks.append({"type": "text", "text": "\n\n".join(text_parts)})
+            body = chunks
+        else:
+            body = "\n\n".join(text_parts)
+        out = {"role": role, "content": body}
+        if calls:
+            out["tool_calls"] = calls
+        merged.append(out)
+
+    for message in list(messages) + [{"role": "__sentinel__"}]:
+        r = message.get("role")
+        if r != role or r in ("system", "tool"):
+            flush()
+            if r != "__sentinel__":
+                group, role = [message], r
+        else:
+            group.append(message)
+    return merged
+
+
+ML4_NEXT = {"system": ("user", "assistant", "system"), "user": ("assistant", "system", "user"),
+            "assistant": ("assistant", "user", "tool"), "tool": ("assistant", "tool", "user")}
+
+
+def render_chat_mistral_large4(messages, enable_thinking=True, reasoning_effort=None, tools=None,
+                               tool_choice=None, add_generation_prompt=True, response_format=None):
+    """Mistral-Large-4's prompt (its chat template). enable_thinking False asks for the lowest
+    effort the template knows ("low"): it has no switch that turns the reasoning off."""
+    effort = reasoning_effort or ("high" if enable_thinking else "low")
+    if effort not in ("low", "medium", "high"):
+        raise APIError(400, 'reasoning_effort must be one of "low", "medium", "high"', "reasoning_effort")
+    schema = None
+    if response_format is not None:
+        kind = response_format.get("type", "text")
+        if kind not in ("text", "json_object", "json_schema"):
+            raise APIError(400, f"Response format type must be one of text, json_object or json_schema, got {kind}.",
+                           "response_format")
+        if kind == "json_schema":
+            js = response_format.get("json_schema")
+            if js is None or js.get("schema") is None:
+                raise APIError(400, "Response format `json_schema` must define the schema", "response_format")
+            schema = js["schema"]
+        elif kind == "json_object":
+            schema = {"anyOf": [{"type": "object"}, {"type": "array"}]}
+    settings = ([f'"json_schema": {_ml4_json(schema)}'] if schema is not None else []) + [f'"reasoning_effort": "{effort}"']
+    preamble = (f"[AVAILABLE_TOOLS]{_ml4_json(tools)}[/AVAILABLE_TOOLS]" if tools else "") + \
+        "[MODEL_SETTINGS]{" + ", ".join(settings) + "}[/MODEL_SETTINGS]"
+    turns = _ml4_merge(messages)
+    if turns and turns[0]["role"] not in ("user", "system"):
+        raise APIError(400, f"Conversation must start with a user or system message, got {turns[0]['role']}.", "messages")
+    for prev, cur in zip(turns, turns[1:]):
+        if prev["role"] in ML4_NEXT and cur["role"] not in ML4_NEXT[prev["role"]]:
+            raise APIError(400, f"Unexpected role '{cur['role']}' after role '{prev['role']}'", "messages")
+    out, emitted = [ML4_BOS], False
+    for msg in turns:
+        role, content = msg["role"], msg.get("content")
+        if role == "user":
+            if not emitted:
+                out.append(preamble)
+                emitted = True
+            if (not isinstance(content, str) and content and len(content) == 2 and content[0].get("type") == "text"
+                    and content[1].get("type") in ("image", "image_url")):
+                content = [content[1], content[0]]
+            out.append("[INST]" + _ml4_render_content(content, "user message content", "text, image and image_url",
+                                                      False, True) + "[/INST]")
+        elif role == "assistant":
+            calls = msg.get("tool_calls") or []
+            if (content is None or content == "" or len(content) == 0) and not calls:
+                raise APIError(400, "Assistant message must have a string or a list of chunks in content or a list "
+                                    "of tool calls.", "messages")
+            if content:
+                out.append(_ml4_render_content(content, "assistant message contents", "text and thinking", True, False))
+            for call in calls:
+                fn = call.get("function") or {}
+                args = fn.get("arguments")
+                if not isinstance(args, str):
+                    args = _ml4_json(args)
+                elif args == "":
+                    args = "{}"
+                out.append(ML4_CALLS + fn.get("name", "") + ML4_ARGS + args)
+            out.append(ML4_EOS)
+        elif role == "tool":
+            out.append("[TOOL_RESULTS]" + _ml4_render_content(content, "tool message contents", "text and image",
+                                                              False, True) + "[/TOOL_RESULTS]")
+        elif role == "system":
+            out.append("[SYSTEM_PROMPT]" + _ml4_render_content(content, "system message contents", "text", False, False)
+                       + "[/SYSTEM_PROMPT]")
+        else:
+            raise APIError(400, f"Only user, assistant, system and tool roles are supported, got {role}.", "messages")
+    return "".join(out)
+
+
+def ml4_think_filter(on_text):
+    """Mistral-Large-4's [THINK] / [/THINK] in the engine's text as <think> / </think>, the
+    markers the reasoning splitters read; a tail that may be the start of one waits for the
+    next piece. feed(text, final) returns nothing; on_text gets the translated text."""
+    held = [""]
+    marks = ((ML4_THINK_OPEN, THINK_OPEN), (ML4_THINK_CLOSE, THINK_CLOSE))
+
+    def feed(text, final=False):
+        buf = held[0] + text
+        for theirs, ours in marks:
+            buf = buf.replace(theirs, ours)
+        hold = 0
+        if not final:
+            for theirs, _ in marks:
+                for k in range(min(len(theirs) - 1, len(buf)), 0, -1):
+                    if buf.endswith(theirs[:k]):
+                        hold = max(hold, k)
+                        break
+        held[0] = buf[len(buf) - hold:] if hold else ""
+        out = buf[:len(buf) - hold] if hold else buf
+        if out:
+            on_text(out)
+    return feed
+
+
+def parse_mistral_tool_calls(reply, tools=None):
+    """[TOOL_CALLS]name[ARGS]{json} blocks back into OpenAI tool_calls: the text before the
+    first block is the content; a call whose arguments are not one JSON object, or whose name
+    the request did not declare, stays text."""
+    reply = reply or ""
+    first = reply.find(ML4_CALLS)
+    if first < 0:
+        return reply.strip(), []
+    names = {(t.get("function") or t).get("name") for t in (tools or []) if isinstance(t, dict)}
+    calls, decoder = [], json.JSONDecoder()
+    for block in reply[first:].split(ML4_CALLS)[1:]:
+        name, sep, rest = block.partition(ML4_ARGS)
+        name = name.strip()
+        if not sep or not name or (tools and name not in names):
+            return reply.strip(), []
+        try:
+            args, end = decoder.raw_decode(rest.lstrip())
+        except ValueError:
+            return reply.strip(), []
+        if not isinstance(args, dict) or rest.lstrip()[end:].strip().replace(ML4_EOS, ""):
+            return reply.strip(), []
+        calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
+                      "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+    return reply[:first].strip(), calls
+
+
 def render_chat_dsv41(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                       tool_choice=None, add_generation_prompt=True):
     """encoding.py _encode_messages_text for one turn.
@@ -4098,6 +4590,107 @@ CONTINUATION_FAMILIES = {"glm53", "qwen38", "qwen36", "glm", "olmoe", "deepseek_
                          "kimi", "deepseek_v41", "mimo"}
 
 
+_CPU_LAST = {}
+
+
+_GPU_LAST = {"t": 0.0, "v": None}
+
+
+def _gpu_stats():
+    """The NVIDIA cards as nvidia-smi sees them (use, memory, temperature, power), at most once a
+    second: the monitors (the TUI's, the chat page's) poll /health every second or two. None when
+    there is no nvidia-smi, which is then not looked for again."""
+    now = time.monotonic()
+    if _GPU_LAST.get("absent") or now - _GPU_LAST["t"] < 1.0:
+        return _GPU_LAST["v"]
+    _GPU_LAST["t"] = now
+    smi = shutil.which("nvidia-smi")
+    if not smi:
+        _GPU_LAST["absent"] = True
+        _GPU_LAST["v"] = None
+        return None
+    try:
+        r = subprocess.run([smi, "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,"
+                            "power.draw,power.limit", "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=2)
+        rows = []
+        for line in r.stdout.strip().splitlines():
+            f = [x.strip() for x in line.split(",")]
+            num = lambda v: float(v) if v not in ("", "[N/A]", "N/A") else None
+            rows.append({"name": f[0], "util": num(f[1]),
+                         "mem_used_gb": round(num(f[2]) / 1024, 2) if num(f[2]) is not None else None,
+                         "mem_total_gb": round(num(f[3]) / 1024, 2) if num(f[3]) is not None else None,
+                         "temp": num(f[4]), "power_w": num(f[5]), "power_max_w": num(f[6])})
+        _GPU_LAST["v"] = rows or None
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        _GPU_LAST["v"] = None
+    return _GPU_LAST["v"]
+
+
+def _system_stats(engine):
+    """RAM of the box and of the engine process, and the engine's CPU since the last call
+    (100 = one core busy). Read from /proc, so empty fields off Linux."""
+    out = {}
+    try:
+        mi = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":", 1)
+                mi[k] = int(v.split()[0])
+        out["ram_total_gb"] = round(mi["MemTotal"] / 1048576, 2)
+        out["ram_avail_gb"] = round(mi["MemAvailable"] / 1048576, 2)
+        out["load1"] = round(os.getloadavg()[0], 2)
+        out["cores"] = os.cpu_count() or 0
+    except (OSError, KeyError, ValueError):
+        pass
+    gpus = _gpu_stats()
+    if gpus:
+        out["gpus"] = gpus
+    pid = getattr(getattr(engine, "process", None), "pid", None)
+    if pid:
+        try:
+            with open(f"/proc/{pid}/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        out["engine_rss_gb"] = round(int(line.split()[1]) / 1048576, 2)
+                    elif line.startswith("Threads:"):
+                        out["engine_threads"] = int(line.split()[1])
+            with open(f"/proc/{pid}/stat") as f:
+                st = f.read().rsplit(")", 1)[1].split()
+            ticks = int(st[11]) + int(st[12])          # utime + stime
+            now = time.monotonic()
+            last = _CPU_LAST.get(pid)
+            if last is None or now - last[0] > 0.5:
+                _CPU_LAST[pid] = (now, ticks)
+            if last and now - last[0] > 0.5:
+                out["engine_cpu_pct"] = round(100.0 * (ticks - last[1]) / os.sysconf("SC_CLK_TCK") / (now - last[0]), 1)
+            elif last and "pct" in _CPU_LAST:
+                out["engine_cpu_pct"] = _CPU_LAST["pct"]
+            if "engine_cpu_pct" in out:
+                _CPU_LAST["pct"] = out["engine_cpu_pct"]
+        except (OSError, ValueError, IndexError):
+            pass
+    return out
+
+
+class _ContinueInThink(int):
+    """The third answer of resolve_generation_prompt: continue a turn that stopped while
+    it was still reasoning (no answer text yet, its `reasoning_content` set). It is 0, so
+    every renderer and caller reads it as add_generation_prompt=False -- no cue, the last
+    turn left open -- and only the places that must tell it apart check for it by identity:
+    the renderer leaves <think> OPEN after the reasoning instead of closing it (a closed,
+    empty block is the out-of-distribution position #1327 removed), and starts_in_reasoning
+    starts the output inside the block, so what the model writes next is reasoning until it
+    closes the block itself."""
+    def __repr__(self):
+        return "CONTINUE_IN_THINK"
+
+
+CONTINUE_IN_THINK = _ContinueInThink(0)
+# Families whose renderer leaves a continued turn's <think> open (CONTINUE_IN_THINK).
+REASONING_CONTINUATION_FAMILIES = {"qwen38", "qwen36"}
+
+
 def resolve_generation_prompt(messages, body):
     """Does this prompt end on a generation cue, or on an assistant turn to continue?
 
@@ -4159,6 +4752,9 @@ def resolve_generation_prompt(messages, body):
         raise APIError(400, "Message content must be a string or an array of blocks.",
                        f"{where}.content")
     if not text.strip():
+        reasoning = last.get("reasoning_content")
+        if ARCH in REASONING_CONTINUATION_FAMILIES and isinstance(reasoning, str) and reasoning.strip():
+            return CONTINUE_IN_THINK   # stopped while reasoning: go on inside the open block
         raise APIError(400, "A continued `assistant` turn needs text to continue. An empty "
                        "one ends the prompt on a closed, empty <think></think> block, which "
                        "is the out-of-distribution position #1327 removed -- the model "
@@ -4202,9 +4798,15 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
     if chat_flavor() == "muse":
         return render_chat_muse(messages, enable_thinking, reasoning_effort, tools, tool_choice,
                                 add_generation_prompt)
+    if chat_flavor() == "lfm3":
+        return render_chat_lfm3(messages, enable_thinking, tools, tool_choice, add_generation_prompt,
+                                preserve_thinking)
     if ARCH == "qwen36":
         return render_chat_qwen(messages, enable_thinking, reasoning_effort, tools,
                                 tool_choice, add_generation_prompt, preserve_thinking)
+    if chat_flavor() == "mistral_large4":
+        return render_chat_mistral_large4(messages, enable_thinking, reasoning_effort, tools,
+                                          tool_choice, add_generation_prompt)
     if ARCH == "glm":
         return render_chat(messages, enable_thinking, reasoning_effort, tools,
                            tool_choice, add_generation_prompt)
@@ -4261,7 +4863,11 @@ def starts_in_reasoning(enable_thinking, add_generation_prompt=True):
     zero di risposta, col prompt corretto sul filo. Vale anche per glm53: la
     regola di famiglia sopra dice dove comincia un turno NUOVO, e il turno
     proseguito non ne apre nessuno."""
+    if add_generation_prompt is CONTINUE_IN_THINK:   # the prompt ends inside an open <think>
+        return True
     if chat_flavor() in ("flint", "muse"):   # a turn starts as text, and <think> opens reasoning
+        return False
+    if chat_flavor() == "mistral_large4":   # its answer opens [THINK] itself (read as <think>)
         return False
     return (enable_thinking or ARCH == "glm53") and add_generation_prompt
 
@@ -4288,7 +4894,7 @@ class ThinkingStreamSplit:
         self.thinking = initial_thinking
         # Flint writes <think> itself when it decides to reason: the opening marker switches
         # to reasoning there (every other family's prompt opened or closed the block already)
-        self.opens = chat_flavor() in ("flint", "muse")   # Muse Spark's through MuseChannels
+        self.opens = chat_flavor() in ("flint", "muse", "mistral_large4")   # Muse Spark's through MuseChannels
         self.buf = ""
         self.track_spans = track_spans
         self.thinking_spans = []
@@ -4488,6 +5094,9 @@ def anthropic_to_openai(body):
                                    f"{where}.signature")
                 reasoning.append(block["thinking"])
             elif kind == "tool_use":
+                if role != "assistant":
+                    raise APIError(400, "`tool_use` blocks are valid only in assistant messages.",
+                                   where, "unsupported_content_type")
                 name = block.get("name")
                 if not isinstance(name, str) or not name:
                     raise APIError(400, "`tool_use` blocks require a string `name`.", f"{where}.name")
@@ -4501,6 +5110,9 @@ def anthropic_to_openai(body):
                               "function": {"name": name,
                                            "arguments": json.dumps(arguments, ensure_ascii=False)}})
             elif kind == "tool_result":
+                if role != "user":
+                    raise APIError(400, "`tool_result` blocks are valid only in user messages.",
+                                   where, "unsupported_content_type")
                 pictures = []
                 results.append({"role": "tool",
                                 "tool_call_id": block.get("tool_use_id") or "",
@@ -5638,16 +6250,20 @@ def _engine_extension_args(engine_k):
     takes its keys straight after top_p, so the extra field would land where it wants a
     key and be answered with "bad submit extension".
 
-    That is this helper's decision for THESE endpoints, not a property of the request
-    builder. `gbytes_before_ext` is a per-call-site parameter, and the other caller that
-    sends an extension key -- /v1/systemone's scoring -- does not pass it and keeps the header it has
-    always sent; changing that endpoint's wire is not this change's to make."""
+    /v1/systemone's scoring sends its keys through the same rule (`_engine_gbytes_args`):
+    without the field, colibri.c refused its header and the request waited for an answer
+    that never came."""
     if not engine_k:
         return {}
     args = {"logprobs": engine_k}
-    if family_by_id(ARCH).capabilities.submit_gbytes:
-        args["gbytes_before_ext"] = True
+    args.update(_engine_gbytes_args())
     return args
+
+
+def _engine_gbytes_args():
+    """`gbytes_before_ext` for an engine whose SUBMIT header carries the grammar's byte
+    count before its key=value tokens (`submit_gbytes`), nothing for the others."""
+    return {"gbytes_before_ext": True} if family_by_id(ARCH).capabilities.submit_gbytes else {}
 
 
 # An instruction the processor does not have: SIGILL on POSIX, STATUS_ILLEGAL_INSTRUCTION on
@@ -6337,8 +6953,15 @@ class Engine:
         self.emap = None
         self.hits = None
         self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
+        self.hits_live = collections.deque(maxlen=256)   # HITL frames: experts routed per decode step
+        self.hits_live_seq = 0
         self.profile = collections.deque(maxlen=PROFILE_TURNS)  # per-turn phase timings
         self.profile_seq = 0
+        # The turns the engine is on right now, for a live monitor: the prompt size from
+        # ACCEPT, then one DATA frame per token it writes (a token that does not close a
+        # UTF-8 character sends none). Gone at DONE or ERROR.
+        self.live = {}
+        self.live_lock = threading.Lock()
         self.caps = {}                         # the engine's CAPS handshake line, key=value
         # What the engine wrote before READY, the last 4 KiB of it: an engine that
         # exits instead of saying READY leaves its LOAD_FAIL line there.
@@ -6540,6 +7163,15 @@ class Engine:
                         except APIError as error:
                             self._record_fault(entry, error)
                             continue
+                    with self.live_lock:
+                        lv = self.live.get(request_id)
+                        if lv is not None:
+                            t = time.time()
+                            lv["tokens"] += 1
+                            lv["last"] = t
+                            lv["recent"].append(t)
+                            if lv["first"] is None:
+                                lv["first"] = t
                     entry.events.put(("data", data if record is None else (data, record)))
                 elif kind == "TOOL" and len(fields) == 3:
                     # Opaque, request-scoped structured output. K3 emits an
@@ -6636,10 +7268,17 @@ class Engine:
                     with self.pending_lock:
                         entry = self.pending.get(request_id)
                     if entry is not None and entry.failed is None:
+                        with self.live_lock:
+                            self.live[request_id] = {"started": time.time(), "prompt_tokens": int(fields[2]),
+                                                     "tokens": 0, "first": None, "last": None,
+                                                     "recent": collections.deque(maxlen=32),
+                                                     "forwards0": self.hits_live_seq}
                         entry.events.put(("accept", {"prompt_tokens": int(fields[2])}))
                 elif kind == "DONE" and len(fields) >= 7:
                     request_id = fields[1]
                     stats = self._stats(fields[2:])
+                    with self.live_lock:
+                        self.live.pop(request_id, None)
                     with self.pending_lock:
                         entry = self.pending.pop(request_id, None)
                     if entry is not None:
@@ -6660,6 +7299,9 @@ class Engine:
                 elif kind == "HITS" and len(fields) == 4:
                     self.hits = fields[3]
                     self.hits_seq += 1
+                elif kind == "HITL" and len(fields) == 2:
+                    self.hits_live_seq += 1
+                    self.hits_live.append((self.hits_live_seq, fields[1]))
                 elif kind == "PROF" and len(fields) >= 10:
                     # per-turn phase timings: where the engine spent this turn's wall time
                     turn = {
@@ -6687,6 +7329,8 @@ class Engine:
                 elif kind == "ERROR" and len(fields) >= 2:
                     request_id = fields[1]
                     message = " ".join(fields[2:]) or "engine request failed"
+                    with self.live_lock:
+                        self.live.pop(request_id, None)
                     with self.pending_lock:
                         entry = self.pending.pop(request_id, None)
                     if entry is not None:
@@ -6708,6 +7352,27 @@ class Engine:
                 self.dispatcher_error = error
                 print(f"colibri: the engine dispatcher stopped: {error}", file=sys.stderr)
                 self._fail_pending(error)
+
+    def live_snapshot(self):
+        """The turns in flight: reading the prompt until the first token, then writing,
+        with the average decode rate and the rate over the last 32 tokens."""
+        now = time.time()
+        out = []
+        with self.live_lock:
+            for lv in self.live.values():
+                first, last, n, r = lv["first"], lv["last"], lv["tokens"], list(lv["recent"])
+                avg = (n - 1) / (last - first) if first and n > 1 and last > first else 0.0
+                span = (r[-1] - r[0]) if len(r) > 1 else 0.0
+                if r and now - r[-1] > 1.0:
+                    span = now - r[0]              # stalled: the recent rate falls
+                cur = (len(r) - 1) / span if len(r) > 1 and span > 0 else 0.0
+                out.append({"state": "writing" if first else "reading",
+                            "elapsed_s": round(now - lv["started"], 3),
+                            "read_s": round((first or now) - lv["started"], 3),
+                            "prompt_tokens": lv["prompt_tokens"], "tokens": n,
+                            "forwards": max(0, self.hits_live_seq - lv["forwards0"]),
+                            "tok_s": round(avg, 3), "tok_s_now": round(cur, 3)})
+        return out
 
     def _dispatcher_cause(self, error):
         """The dispatcher's error, with the engine's exit status when the engine is gone:
@@ -6805,6 +7470,9 @@ class Engine:
             raise APIError(400, "Grammar and audio cannot be combined.", "response_format")
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         tool_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        if chat_flavor() == "mistral_large4":   # [THINK] as <think> before every splitter
+            ml4_feed = ml4_think_filter(on_text)
+            on_text = lambda text, _feed=ml4_feed: _feed(text)
 
         def decode(data):
             text = decoder.decode(data)
@@ -7017,6 +7685,8 @@ class Engine:
                 tail = decoder.decode(b"", final=True)
                 if tail:
                     on_text(tail)
+                if chat_flavor() == "mistral_large4":
+                    ml4_feed("", True)   # what waited as a possible marker's start
                 tool_tail = tool_decoder.decode(b"", final=True)
                 if tool_tail and on_tool is not None:
                     on_tool(tool_tail)
@@ -7777,6 +8447,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
                     if hwinfo: payload["hwinfo"] = hwinfo
                     payload["capabilities"] = self.server.capabilities()
+                    eng = self.server.engine
+                    payload["live"] = eng.live_snapshot() if hasattr(eng, "live_snapshot") else []
+                    payload["system"] = _system_stats(eng)
                     if is_image_engine(self.server.engine):
                         payload["image"] = dict(getattr(self.server.engine, "info", None) or {})
                 self.send_json(200, payload, request_id)
@@ -7784,10 +8457,23 @@ class APIHandler(BaseHTTPRequestHandler):
             if path == "/experts":
                 payload = {"rows": 0, "cols": 0, "map": "", "hits": "", "seq": 0}
                 eng = self.server.engine
+                since = parse_qs(urlsplit(self.path).query).get("since")
                 if self._is_authed() and eng and getattr(eng, "emap", None):   # (#SEC-8) hide routing telemetry unless authed
+                    live_seq = getattr(eng, "hits_live_seq", 0)
+                    if since:
+                        # Live map: the decode steps after `since`, each one the experts
+                        # it routed as 4-hex-digit indices (layer*cols+expert). No map,
+                        # so a page polling a few times a second stays a few KB.
+                        try: start = int(since[0])
+                        except ValueError: start = 0
+                        frames = [f for s, f in list(getattr(eng, "hits_live", ())) if s > start][-64:]
+                        payload = {"rows": eng.emap["rows"], "cols": eng.emap["cols"], "live_seq": live_seq, "steps": frames}
+                        self.send_json(200, payload, request_id)
+                        return
                     payload.update(eng.emap)
                     payload["hits"] = eng.hits or ""
                     payload["seq"] = eng.hits_seq
+                    payload["live_seq"] = live_seq
                 self.send_json(200, payload, request_id)
                 return
             if path == "/profile":
@@ -7952,7 +8638,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.server.generate(
                     text, 0, 0.0, 1.0, lambda _chunk: None, cache_slot,
                     self.client_disconnected, logprobs=1, pin=pin,
-                    on_echo=echoes.append, on_accept=on_accept)
+                    on_echo=echoes.append, on_accept=on_accept, **_engine_gbytes_args())
                 n = accepted.get("prompt_tokens")
                 if n is None:                        # motore senza ACCEPT (olmoe)
                     n = max((e["pos"] for e in echoes), default=-1) + 1
@@ -8067,6 +8753,7 @@ class APIHandler(BaseHTTPRequestHandler):
     # theirs are, with this server's error envelope. docs/systemone.md has the
     # mapping table.
     _SYSTEMONE_MAX_QUESTIONS = 64
+    _SYSTEMONE_MAX_ID = 256
 
     @staticmethod
     def _systemone_text(value, where):
@@ -8094,6 +8781,35 @@ class APIHandler(BaseHTTPRequestHandler):
         caller sent (text, object or array), or `level <n>` for one sent as null."""
         return value if isinstance(value, (str, dict, list)) else f"level {index}"
 
+    @staticmethod
+    def _systemone_loc(param):
+        """Jev's `loc` for an error's param: "questions.q.criteria[1]" is ["body",
+        "questions", "q", "criteria", 1]. A dot separates two names unless the next bracket
+        after it closes one (a dot inside [...]), and each name's trailing [n] groups are
+        its indices, a name without them kept whole. One pass each way over the text."""
+        s = param or ""
+        closes = [False] * (len(s) + 1)   # the first bracket at or after i is "]"
+        for i in range(len(s) - 1, -1, -1):
+            closes[i] = s[i] == "]" or (s[i] != "[" and closes[i + 1])
+        parts, start = [], 0
+        for i, ch in enumerate(s):
+            if ch == "." and not closes[i + 1]:
+                parts.append(s[start:i]); start = i + 1
+        parts.append(s[start:])
+        loc = ["body"]
+        for part in parts:
+            end, idx = len(part), []
+            while end and part[end - 1] == "]":
+                at = part.rfind("[", 0, end - 1)
+                digits = part[at + 1:end - 1] if at >= 0 else ""
+                if not digits.isdecimal() or len(digits) > 18:
+                    break
+                idx.append(int(digits)); end = at
+            if end:
+                loc.append(part[:end])
+            loc.extend(reversed(idx))
+        return loc
+
     def systemone(self, body, request_id):
         if body.get("state") is None:
             raise APIError(422, "`state` is required: the content the questions are about.", "state")
@@ -8108,9 +8824,11 @@ class APIHandler(BaseHTTPRequestHandler):
                            "questions")
         plan = []                                   # (id, kind, text, options, levels)
         for qid, question in raw.items():
-            where = f"questions.{qid}"
             if not isinstance(qid, str) or not qid.strip():
                 raise APIError(422, "Every question id must be a non-empty string.", "questions")
+            if len(qid) > self._SYSTEMONE_MAX_ID:
+                raise APIError(422, f"A question id has at most {self._SYSTEMONE_MAX_ID} characters.", "questions")
+            where = f"questions.{qid}"
             if not isinstance(question, dict):
                 raise APIError(422, f"`{where}` must be an object.", where)
             kind = question.get("type")
@@ -8508,13 +9226,7 @@ class APIHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/v1/systemone" and error.status == 422:
             body = error_object(error)
-            loc = ["body"]
-            for part in re.split(r"\.(?![^\[]*\])", error.param or ""):
-                match = re.fullmatch(r"(.*?)((?:\[\d+\])*)", part)
-                if match.group(1):
-                    loc.append(match.group(1))
-                loc.extend(int(i) for i in re.findall(r"\[(\d+)\]", match.group(2)))
-            body["detail"] = [{"loc": loc, "msg": error.message, "type": "value_error"}]
+            body["detail"] = [{"loc": self._systemone_loc(error.param), "msg": error.message, "type": "value_error"}]
             return body
         if path != "/v1/messages":
             return error_object(error)
@@ -8810,7 +9522,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 sideband = ToolSideband(ARCH == "kimi", stop_sequences,
                                         ignore_leading_stop)
                 qwen_stream = (QwenToolStream(emit, tools) if chat_flavor() in
-                               ("qwen36", "qwen38", "qwen3_coder") else None)
+                               ("qwen36", "qwen38", "qwen3_coder", "lfm3") else None)
 
                 def feed_content(chunk):               # answer text only (post-</think>)
                     raw.append(chunk)
@@ -8967,8 +9679,8 @@ class APIHandler(BaseHTTPRequestHandler):
             # preserve the older opt-in default for the other families.
             if chat_flavor() in ("qwen38", "muse"):   # Muse Spark's template: xhigh unless told
                 reasoning_effort = "xhigh"
-            elif ARCH == "mimo" or os.environ.get("COLI_THINK", "0") == "1":
-                # MiMo-V2.6's template thinks unless told not to (enable_thinking false)
+            elif ARCH == "mimo" or chat_flavor() == "lfm3" or os.environ.get("COLI_THINK", "0") == "1":
+                # MiMo-V2.6's and LFM3's templates think unless told not to (enable_thinking false)
                 reasoning_effort = "high"
         enable_thinking = body.get("enable_thinking", reasoning_effort not in (None, "none"))
         if not isinstance(enable_thinking, bool):
@@ -9211,6 +9923,17 @@ class APIHandler(BaseHTTPRequestHandler):
             ceiling = os.environ.get("MIMO_MAX_IMAGE_TOKENS")
             messages, images = expand_qwen38_images(messages, model_dir,
                                                     int(ceiling) if ceiling else None)
+        elif CHAT_FLAVOR == "mistral_large4" and ml4_has_vision(model_dir):
+            # Mistral-Large-4: Pixtral's patches (14, merge 2), [IMG] rows closed by [IMG_BREAK] / [IMG_END]
+            ceiling = os.environ.get("ML4_MAX_IMAGE_TOKENS")
+            messages, images = expand_ml4_images(messages, model_dir,
+                                                 int(ceiling) if ceiling else ML4_MAX_IMAGE_TOKENS)
+        elif ARCH == "qwen36" and CHAT_FLAVOR == "lfm3" and qwen36_has_vision(model_dir):
+            # LFM3-VL: the Qwen processor's patches (16, merge 2, two frames), its own placeholder
+            ceiling = os.environ.get("LFM3_MAX_IMAGE_TOKENS")
+            messages, images = expand_qwen38_images(messages, model_dir,
+                                                    int(ceiling) if ceiling else LFM3_MAX_IMAGE_TOKENS,
+                                                    pad=LFM3_IMAGE_PAD)
         elif ARCH == "qwen38" or (ARCH == "qwen36" and qwen36_has_vision(model_dir)):
             # Qwen3.5/3.6/3.8 share the tower and the preprocessor, so qwen36
             # checkpoints converted with their tower take the same path (#1757).
@@ -9241,7 +9964,7 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "`thinking` must be an object.", "thinking")
         enable_thinking = bool(thinking and thinking.get("type") == "enabled")
         if not enable_thinking and thinking is None:
-            if chat_flavor() == "qwen38" or ARCH == "mimo":
+            if chat_flavor() in ("qwen38", "lfm3") or ARCH == "mimo":
                 enable_thinking = True
             elif os.environ.get("COLI_THINK", "0") == "1":
                 enable_thinking = True
@@ -9461,7 +10184,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     state["buf"] = state["buf"][flush:]
 
             qwen_stream = (QwenToolStream(emit_text, tools) if tools and chat_flavor() in
-                           ("qwen36", "qwen38", "qwen3_coder") else None)
+                           ("qwen36", "qwen38", "qwen3_coder", "lfm3") else None)
 
             def emit_thinking(chunk):
                 if not enable_thinking:

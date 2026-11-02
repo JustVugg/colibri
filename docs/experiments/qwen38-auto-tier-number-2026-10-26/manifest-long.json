@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "hypothesis": "With the number dev's --auto-tier planner writes, a 1628-token prompt has the CUDA chain's routed-expert buffers refused on an L4 and the host computes them from there on; without the number the prompt reads on the card, so its first token comes sooner (prompt tok/s = prompt tokens / TTFT).",
+  "commit": "77530b49ddd2f4e6ad1b3bb52500491e0c8ed9bb",
+  "model": "unsloth/Qwen3.8-Flash-Next-GGUF UD-Q2_K_XL",
+  "command": "cd c && make qwen38 CUDA=1 CUDA_ARCH=sm_89 && env COLI_CUDA=1 COLI_GPU=0 COLI_VULKAN=0 COLI_TEMP=0 USAGE_SAVE=0 OMP_NUM_THREADS=6 SNAP=<model> [CUDA_EXPERT_GB=21.660] N_NEW=64 COLI_USAGE=<history.usage> ./qwen38 128 8 <prompt>",
+  "prompt_hash": "f3306e5f57ab2527735662aafb31c14e76d3b1a73cc86508b6ff020e43f4e4aa",
+  "hardware": {
+    "cpu": "a Colab L4 VM: 12 threads (nproc), 6 physical cores (the plan's OMP_NUM_THREADS), Intel(R) Xeon(R) CPU @ 2.20GHz (lscpu) + NVIDIA L4 (23034 MiB, 22564 MiB free, sm_89)",
+    "ram": "53.0 GiB, no swap; the GGUF (74 GiB) does not fit it",
+    "storage": "the VM's disk (overlay, 194GB free); the file cache evicted before each run",
+    "os": "Colab (Python 3.13.16), driver 580.82.07 (CUDA 13.0), nvcc V13.0.88"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "CUDA_EXPERT_GB"
+  ],
+  "baseline": {
+    "config": {
+      "model": "unsloth/Qwen3.8-Flash-Next-GGUF UD-Q2_K_XL",
+      "prompt": "prose, 1628 tokens",
+      "new_tokens": 64,
+      "history": "history.usage.gz",
+      "engine_build": "origin/dev 77530b49",
+      "CUDA_EXPERT_GB": "21.660"
+    },
+    "samples": {
+      "tok_s": [
+        3.61,
+        3.62,
+        3.57,
+        3.63
+      ],
+      "ttft_s": [
+        451.2,
+        449.44,
+        455.84,
+        447.94
+      ],
+      "after_first_token_s": [
+        34.7,
+        34.8,
+        34.8,
+        34.1
+      ],
+      "host_experts_ms": [
+        473473.7,
+        472027.4,
+        478389.8,
+        470386.2
+      ]
+    },
+    "median_tok_s": 3.615,
+    "quality": {
+      "method": "each side generates the same 64 tokens (greedy: COLI_TEMP=0) in all its runs (long-prompt.txt's summary), so each speed is of one computation; the two sides' texts have the same first 16 words and then differ: with A the prompt's routed experts ran on the host, with B on the card, and the two sum in a different order (not isolated), so the texts are not compared further",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen38-auto-tier-number-2026-10-26/long-prompt.txt",
+      "sha256": "fbeaa69c1e9467c841ca751d8903a0ba707ce6c5fb6dd059f98c30ff6db24956"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "unsloth/Qwen3.8-Flash-Next-GGUF UD-Q2_K_XL",
+      "prompt": "prose, 1628 tokens",
+      "new_tokens": 64,
+      "history": "history.usage.gz",
+      "engine_build": "origin/dev 77530b49",
+      "CUDA_EXPERT_GB": "unset"
+    },
+    "samples": {
+      "tok_s": [
+        36.69,
+        35.04,
+        36.39,
+        34.76
+      ],
+      "ttft_s": [
+        44.37,
+        46.46,
+        44.74,
+        46.83
+      ],
+      "after_first_token_s": [
+        3.1,
+        3.1,
+        3.2,
+        3.2
+      ],
+      "host_experts_ms": [
+        23457.6,
+        26145.3,
+        24061.0,
+        25870.8
+      ]
+    },
+    "median_tok_s": 35.715,
+    "quality": {
+      "method": "each side generates the same 64 tokens (greedy: COLI_TEMP=0) in all its runs (long-prompt.txt's summary), so each speed is of one computation; the two sides' texts have the same first 16 words and then differ: with A the prompt's routed experts ran on the host, with B on the card, and the two sum in a different order (not isolated), so the texts are not compared further",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen38-auto-tier-number-2026-10-26/long-prompt.txt",
+      "sha256": "fbeaa69c1e9467c841ca751d8903a0ba707ce6c5fb6dd059f98c30ff6db24956"
+    }
+  },
+  "outcome": "improvement"
+}

@@ -50,6 +50,8 @@
 #include "omp_tune.h"
 #include "route_trace.h"                    /* shared routing telemetry (#700) */
 #include "kv_prefix.h"
+#include "park.h"      /* a short request keeps the conversation aside (COLI_PARK) */
+#include "prompt_break.h"   /* a served prompt that a CANCEL stops between two layers */
 #include "pin_pool.h"                       /* piu scatti annidati */   /* riuso del prefisso tra turni (shared) */
 #include "serve_codec.h"
 #include "serve_budget.h"
@@ -159,6 +161,7 @@ typedef struct {
     int gx;
     int *gx_t;
     int64_t *gx_len, gx_part[3];
+    int gx_r16;   /* the CPU alone reads the expert slots: they hold the rows interleaved by 16 */
 #ifdef COLI_VULKAN
     void *vk_lm_head;
     void *vkchain;          /* the dense chain's device state (olmoe_chain.h), NULL until it runs */
@@ -368,6 +371,20 @@ static float g_nuc  = 0.95f;  /* NUCLEUS env overrides */
 
 #include "matmul_f32.h"   /* y[S,O] = x[S,I] @ W^T, W [O,I] f32 row-major */
 #include "matmul_f16.h"   /* the same product with W kept as half (FP16 needs F16C, BF16 runs anywhere): bit-identical, half the bytes */
+#include "kv16.h"
+
+/* ---- the KV cache's numbers (kv16.h) ------------------------------------------------
+ * Each K and V value is clamped to +-65504 and rounded to the nearest float16 as a step
+ * computes it, before anything reads it (attention(), and the Vulkan chain's rows alike).
+ * The cache stays float32 arrays holding float16's values, so the chain's mirror keeps
+ * them in float16 (olc_kvh) with the same numbers: half a decode step's reads. KV16=0:
+ * float32's. An argv run against a .json reference (the tiny oracle) keeps float32
+ * unless KV16 is set. */
+static int g_olm_kv16 = -1;
+static inline int olm_kv16(void) {
+    if (g_olm_kv16 < 0) { const char *e = getenv("KV16"); g_olm_kv16 = !(e && *e == '0'); }
+    return g_olm_kv16;
+}
 
 /* matmul for a RESIDENT f32 matrix W [O,I], with *vk caching its device copy:
  * on Vulkan when the device is up, the CPU's matmul otherwise. The backend has one
@@ -795,6 +812,10 @@ static void olm_gx_geometry(Model *m, int layer_begin, int layer_end) {
                 fprintf(stderr, "%s: not %lld rows of %lld in a ggml type\n", nm, (long long)rows, (long long)cols); exit(1); }
             m->gx_t[3 * i + k] = type; m->gx_len[3 * i + k] = t->nbytes;
             if (t->nbytes > m->gx_part[k]) m->gx_part[k] = t->nbytes;
+            /* a slot holds the file's rows or the rows interleaved by 16 (load_expert_gguf),
+             * whichever is larger */
+            const int64_t held = gq_row_bytes(coli_ggml_held_type(type, rows, cols, "OLM_ILV16"), cols) * rows;
+            if (held > m->gx_part[k]) m->gx_part[k] = held;
         }
     fprintf(stderr, "olmoe: GGUF experts %s gate/up, %s down (layer %d)", gq_type_name(m->gx_t[3 * layer_begin]),
             gq_type_name(m->gx_t[3 * layer_begin + 2]), layer_begin);
@@ -1003,6 +1024,9 @@ static void olc_place(Model *m);
 static void olm_dho_start(Model *m);
 static void olm_dho_finish(Model *m);
 #endif
+#ifdef COLI_CUDA
+static void occ_start(Model *m);   /* olmoe_cuda_chain.h */
+#endif
 static void model_init(Model *m, const char *snap, int cap, int bits) {
     model_init_range(m, snap, cap, bits, 0, 0, 1, 1);
 #ifdef COLI_VULKAN
@@ -1028,6 +1052,15 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
                 vkt_ready() ? "routed experts go to the expert tier, the embedding lookup stays on the CPU"
                             : "routed experts and the embedding lookup stay on the CPU");
     olc_start(m);   /* COLI_VK_CHAIN: every layer's dense part as one frame on the device */
+#endif
+#ifdef COLI_CUDA
+    occ_start(m);   /* COLI_CUDA=1: every layer and its experts on the card (olmoe_cuda_chain.h) */
+#endif
+    /* the CPU alone reads the expert slots, unless a Vulkan device's tier uploads them in the
+     * file's form (load_expert_gguf); the CUDA chain reads the file */
+    m->gx_r16 = m->gx;
+#ifdef COLI_VULKAN
+    if (g_vk_ready) m->gx_r16 = 0;
 #endif
 }
 
@@ -1062,6 +1095,12 @@ static void slot_ensure_allocated(Model *m, Slot *s) {
 }
 
 /* A GGUF's expert into its slot: the file's blocks (olm_gx_geometry). */
+/* A GGUF expert into its slot. On the CPU alone (m->gx_r16) its rows are interleaved by 16
+ * as the dense matrices are (coli_ggml_held_type, OLM_ILV16=0 keeps the file's rows), so a
+ * prompt's rows of one expert go through gq_r16_rows, one integer product for 16 rows, not
+ * through gq_row_all, which unpacks a row and takes the activation rows one at a time: that
+ * was 37% of a 1,800-token prompt's time on the CPU. The Vulkan expert tier uploads a slot's
+ * bytes in the file's form (olmoe_vk_src), so with a Vulkan device the slots keep them. */
 static void load_expert_gguf(Model *m, int layer, int eid, Slot *s) {
     static const char *const k3[3] = {"gate_proj", "up_proj", "down_proj"};
     int8_t *dst[3] = {s->g, s->u, s->d};
@@ -1070,12 +1109,22 @@ static void load_expert_gguf(Model *m, int layer, int eid, Slot *s) {
         char nm[160];
         snprintf(nm, sizeof nm, "model.layers.%d.mlp.experts.%d.%s.weight", layer, eid, k3[k]);
         st_tensor *t = st_find(&m->S, nm);
-        if (!t || st_ggml_type_any(t->dtype) != m->gx_t[3 * layer + k] || t->nbytes != m->gx_len[3 * layer + k]) {
+        const int type = m->gx_t[3 * layer + k];
+        if (!t || st_ggml_type_any(t->dtype) != type || t->nbytes != m->gx_len[3 * layer + k]) {
             fprintf(stderr, "%s: missing, or not the type and bytes of the layer's expert 0, "
                             "refusing (untrusted container)\n", nm); exit(1); }
-        st_read_raw(&m->S, nm, dst[k], g_expert_drop);
+        const int64_t rows = k == 2 ? m->c.hidden : m->c.inter, cols = k == 2 ? m->c.inter : m->c.hidden;
+        const int held = m->gx_r16 ? coli_ggml_held_type(type, rows, cols, "OLM_ILV16") : type;
+        if (held == type) st_read_raw(&m->S, nm, dst[k], g_expert_drop);
+        else {
+            uint8_t *raw = malloc((size_t)t->nbytes);
+            if (!raw) { fprintf(stderr, "OOM reading %s\n", nm); exit(1); }
+            st_read_raw(&m->S, nm, raw, g_expert_drop);
+            gq_r16_pack(held, (uint8_t *)dst[k], raw, (int)rows, (int)cols);
+            free(raw);
+        }
+        s->gt[k] = held;
     }
-    for (int k = 0; k < 3; k++) s->gt[k] = m->gx_t[3 * layer + k];
     __atomic_fetch_add(&m->disk_ns, (uint64_t)((now_s() - started) * 1e9), __ATOMIC_RELAXED);
 }
 
@@ -1562,6 +1611,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         int pos = m->mux_rows ? m->mux_rows[s].pos : pos_base + s;
         for (int hh = 0; hh < H; hh++) { rope_head(q + (int64_t)s*D + hh*hd, pos, c); rope_head(k + (int64_t)s*D + hh*hd, pos, c); }
     }
+    if (olm_kv16()) { kv16_round(k, (int64_t)S*D); kv16_round(vv, (int64_t)S*D); }   /* the cache's numbers, before anything reads them */
     /* scrive k,v nella kv-cache alle posizioni pos_base..pos_base+S-1 (in un passo
      * multiplexato: ogni riga alla sua, nella cache della sua conversazione) */
     const OlmRow *mr = m->mux_rows;
@@ -1913,6 +1963,7 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
     int D = c->hidden;
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
     for (int i = layer_begin; i < layer_end; i++) {
+        if (coli_prompt_break()) break;   /* a served prompt's CANCEL: step() leaves without the rest */
         Layer *l = &m->L[i];
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
         double t_attn = now_s();
@@ -2091,6 +2142,10 @@ static void olm_dho_finish(Model *m) {
 }
 #endif
 
+#ifdef COLI_CUDA
+#include "olmoe_cuda_chain.h"   /* COLI_CUDA=1: every layer, its experts too, as one chain on the card */
+#endif
+
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
     kv_room_fit(m, pos_base + S);   /* before the positions' pages are written */
@@ -2108,27 +2163,43 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     }
     float *x = falloc((int64_t)S*D);
     for (int s = 0; s < S; s++) olm_embed_row(m, ids[s], x + (int64_t)s*D);
-#ifdef COLI_VULKAN
-    /* COLI_VK_CHAIN: the layers, the final norm and lm_head on the device; x comes
-     * back only when the prefill read-out below needs every row */
+    /* a chain (COLI_VK_CHAIN, or the CUDA one): the layers, the final norm and lm_head on the
+     * device; x comes back only when the prefill read-out below needs every row */
     float *chain_logit = NULL;
     int chain_n = 0;   /* layers the chain ran (a partial chain: the CPU runs the rest and the head) */
+#ifdef COLI_VULKAN
     if (g_vk_chain) {
         int rows_only = 0;
         chain_logit = falloc(c->vocab);
-        chain_n = olc_forward(m, x, S, pos_base, g_echo_k > 0 && g_echo_id && S > 1, chain_logit, &rows_only);
+        chain_n = olc_forward(m, ids, x, S, pos_base, g_echo_k > 0 && g_echo_id && S > 1, chain_logit, &rows_only);
+        olc_fed(m, ids, pos_base, S);   /* every step's ids, whoever runs it (olc_recover) */
         if (!chain_n) {
             free(chain_logit); chain_logit = NULL;
+            olc_host_kv(m, pos_base, S);   /* the device's rows below pos_base into the host's cache, for the CPU */
             olc_cpu_step(m, pos_base);
             /* the primary's layers may have run before the second device's were lost: their
              * residual is in x, and the CPU redoes the whole step from the embedding */
             for (int s = 0; s < S; s++) olm_embed_row(m, ids[s], x + (int64_t)s*D);
         } else if (rows_only) { free(chain_logit); chain_logit = NULL; }
     }
-    if (!chain_logit) layers_forward_range(m, x, S, pos_base, chain_n, c->n_layers, 1);
-#else
-    layers_forward_range(m, x, S, pos_base, 0, c->n_layers, 1);
 #endif
+#ifdef COLI_CUDA
+    if (!chain_n && g_occ && g_occ->ok && !g_occ->failed) {
+        chain_logit = falloc(c->vocab);
+        chain_n = occ_forward(m, ids, x, S, pos_base, g_echo_k > 0 && g_echo_id && S > 1, chain_logit);
+        if (!chain_n) {   /* declined or lost: the CPU runs the step from the embedding rows */
+            free(chain_logit); chain_logit = NULL;
+            occ_cpu_step(m, pos_base);
+            for (int s = 0; s < S; s++) olm_embed_row(m, ids[s], x + (int64_t)s*D);
+        }
+    }
+#endif
+    if (!chain_logit) layers_forward_range(m, x, S, pos_base, chain_n, c->n_layers, 1);
+    /* A CANCEL stopped a served prompt between two layers (olm_serve_start): kv_len and the
+     * kv_prefix record stay where they were. This is a model of attention alone, so the rows
+     * the stopped layers wrote are past kv_len, a stale tail the next step overwrites, and the
+     * prefix held before the prompt is still whole. */
+    if (!chain_logit && coli_prompt_broken()) { free(x); return NULL; }
     /* count actual tokens processed (S>1 during prefill) */
     m->token_count += S; m->freq_token_count += S;
     if (!m->hot_pinned && m->hot_n > 0 && m->freq_token_count >= m->warmup_tokens)
@@ -2153,13 +2224,11 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         }
         free(erow); free(elog);
     }
-#ifdef COLI_VULKAN
     if (chain_logit) {   /* the chain's last frame ran the final norm and lm_head */
         g_prof_forwards += 1;
         free(x);
         return chain_logit;
     }
-#endif
     float *last = falloc(D);
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     float *logit = falloc(c->vocab);
@@ -2580,6 +2649,9 @@ static void run_chat(Model *m, Tok *T, int ctx_cap) {
 #ifdef COLI_VULKAN
         olmoe_vk_report(); vkt_report("turn", m->hits, m->miss); olc_report(m);
 #endif
+#ifdef COLI_CUDA
+        occ_report();
+#endif
     }
     free(line); free(turn); free(newids); free(gen); free(outbuf); free(hist);
 }
@@ -2682,12 +2754,70 @@ static int kv_prefix_off(void){ const char *e = getenv("COLI_KV_PREFIX"); return
 /* The counters when a request's prefill began: DONE and PROF report its share. */
 typedef struct { double t0, attn0, moe0, head0; uint64_t h0, m0, disk0; long long fwd0; } OlmReqClock;
 
+/* A short request between two turns of the conversation the Model holds (park.h): the
+ * conversation's first rows of every layer's K and V aside with its tokens, back when the
+ * request's turn ends. The chains keep their rows on the device: the host's cache takes them
+ * all first, and after the conversation is back every mirror goes up again from the host. */
+static ColiPark g_olm_park;
+/* a token's bytes for COLI_PREFIX_LOG (kv_prefix_miss_log), through the request's tokenizer */
+static void olm_decode_one(int id, unsigned char *out, int *n) {
+    *n = g_echo_tok ? tok_decode(g_echo_tok, &id, 1, (char *)out, 255) : 0;
+    if (*n < 0) *n = 0;
+}
+static ColiParkPart *olm_park_parts(Model *m) {
+    Cfg *c = &m->c; size_t row = (size_t)c->head_dim * sizeof(float), hs = (size_t)m->max_t * row;
+    ColiParkPart *p = malloc((size_t)2 * c->n_layers * sizeof *p);
+    for (int i = 0; p && i < c->n_layers; i++) {
+        p[2 * i] = coli_park_heads(m->K[i], row, m->max_t, c->n_heads, hs);
+        p[2 * i + 1] = coli_park_heads(m->V[i], row, m->max_t, c->n_heads, hs);
+    }
+    return p;
+}
+static void olm_park(Model *m, int np, int max_tok) {
+    int n = m->K && m->V ? coli_park_rows_for(&g_olm_park, &m->kvp, m->kv_len, np, max_tok, 1) : 0;
+    if (!n) return;
+#ifdef COLI_VULKAN
+    olc_host_all(m, m->kv_len);
+#endif
+#ifdef COLI_CUDA
+    occ_host_all(m, m->kv_len);
+#endif
+    ColiParkPart *p = olm_park_parts(m);
+    if (p) coli_park_save(&g_olm_park, &m->kvp, m->kv_len, p, 2 * m->c.n_layers, n);
+    free(p);
+}
+static void olm_unpark(Model *m) {
+    if (!g_olm_park.on) return;
+    ColiParkPart *p = olm_park_parts(m);
+    if (!p) { coli_park_free(&g_olm_park); return; }
+    if (coli_park_restore(&g_olm_park, &m->kvp, &m->kv_len, m->kv_len, 1, p, 2 * m->c.n_layers)) {
+#ifdef COLI_VULKAN
+        olc_host_wrote(m, m->kvp.fed, m->kv_len);
+#endif
+#ifdef COLI_CUDA
+        occ_host_wrote(m, m->kvp.fed, m->kv_len);
+#endif
+    }
+    free(p);
+}
+
 /* A request's prompt into the KV the Model holds: its tokens, the budget, the
  * prefix reuse and the pins, the prefill and its read-out. 1 with the prompt's ids
  * and the logits after it; 0 when the request ended here, its ERROR written.
  * serve_one and serve_mux start every request here. */
+/* A lone request's prompt polls for its CANCEL between two layers of the CPU's path
+ * (prompt_break.h). The multiplexed loop owns its command stream and reads it between steps. */
+static int olm_prompt_poll(ColiPromptBreak *b) {
+    while (!b->control && !b->eof && coli_stdin_readable()) {
+        int r = serve_read_cmd(stdin, stdout, b->id);
+        if (r < 0) b->eof = 1;   /* as the decode loop: it stops at its next read */
+        else if (r > 0) b->control = 1;
+    }
+    return b->control;
+}
+
 static int olm_serve_start(Model *m, Tok *T, SReq *q, int ctx_cap, int **ids_out, int *np_out,
-                           float **logit_out, OlmReqClock *clk) {
+                           float **logit_out, OlmReqClock *clk, int lone) {
     Cfg *c = &m->c;
     int cap = q->plen + 16;
     int *ids = malloc((size_t)cap * sizeof(int));
@@ -2748,11 +2878,27 @@ static int olm_serve_start(Model *m, Tok *T, SReq *q, int ctx_cap, int **ids_out
         }
     }
     g_echo_k = q->logprobs; g_echo_id = q->id; g_echo_tok = T;
+    int partial = 0;
+    if (!reuse && getenv("COLI_PREFIX_LOG")) kv_prefix_miss_log(&m->kvp, ids, np, olm_decode_one);
+    if (!reuse && lone) olm_park(m, np, q->max_tok);   /* a short request keeps the conversation (olm_unpark) */
+    if (!reuse && !kv_prefix_off() && q->logprobs == 0) {
+        /* Attention alone: the rows of the positions this prompt shares with what the cache
+         * holds are its rows too, whatever followed them (a client that sends an answer back
+         * without its reasoning, or changes a turn, leaves the conversation there). The rows
+         * past them are a stale tail the prompt overwrites. A read-out asks a frame for every
+         * position, so it reads the whole prompt. */
+        int d = kv_prefix_common(&m->kvp, ids, np);
+        if (d > 0) {
+            kv_prefix_clear(&m->kvp);
+            kv_prefix_record(&m->kvp, ids, 0, d);
+            m->kv_len = d; reuse = d; partial = 1;
+        }
+    }
     if (!reuse) kv_prefix_clear(&m->kvp);
     if (getenv("COLI_PREFIX_LOG")) {
         if (reuse)
-            fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens (%.0f%%)\n",
-                    reuse, np, 100.0 * reuse / np);
+            fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens (%.0f%%)%s\n",
+                    reuse, np, 100.0 * reuse / np, partial ? ", up to where it leaves the held state" : "");
         else
             fprintf(stderr, "[PREFIX] no reuse: held=%d cap=%d prompt=%d\n",
                     m->kvp.len, m->kvp.cap, np);
@@ -2766,7 +2912,37 @@ static int olm_serve_start(Model *m, Tok *T, SReq *q, int ctx_cap, int **ids_out
     /* `reuse` is the ABSOLUTE position of the first fresh token: attention
      * and the KV rows are position-indexed, so this has to be the real
      * offset, not a count of what is left to do. */
-    float *logit = step(m, ids + reuse, np - reuse, reuse);
+    ColiPromptBreak brk = {.poll = olm_prompt_poll, .id = q->id};
+    int chain = 0;   /* a chain runs its own layers on the device and is not stopped inside */
+#ifdef COLI_VULKAN
+    chain |= g_vk_chain != 0;
+#endif
+#ifdef COLI_CUDA
+    chain |= g_occ && g_occ->ok && !g_occ->failed;
+#endif
+    float *logit = NULL;
+    if (lone && chain && q->logprobs == 0) {
+        /* a chain is not stopped inside its forward: the prompt goes in segments, checked
+         * between them, each a whole step (kv_len and the record follow it) */
+        int seg = coli_prompt_segment_rows(2048);
+        for (int at = reuse; at < np; ) {
+            if (coli_prompt_poll(&brk)) { free(logit); logit = NULL; break; }
+            int n = np - at < seg ? np - at : seg;
+            float *next = step(m, ids + at, n, at);
+            free(logit); logit = next; at += n;
+        }
+    } else {
+        if (lone && q->logprobs == 0) g_coli_prompt_break = &brk;
+        logit = step(m, ids + reuse, np - reuse, reuse);
+        g_coli_prompt_break = NULL;
+    }
+    if (!logit) {
+        coli_prompt_break_log(1, m->kvp.len, np);
+        g_echo_k = 0; g_echo_id = NULL;
+        coli_serve_write_error(stdout, q->id, "CANCELLED");
+        free(ids);
+        return 0;
+    }
     if (q->pin && logit) {
         coli_pin_pool_init(&g_pins, c->vocab);
         if (coli_pin_store(&g_pins, ids, np, logit)) {
@@ -2778,10 +2954,10 @@ static int olm_serve_start(Model *m, Tok *T, SReq *q, int ctx_cap, int **ids_out
     return 1;
 }
 
-static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
+static int serve_one_turn(Model *m, Tok *T, SReq *q, int ctx_cap) {
     Cfg *c = &m->c;
     int *ids = NULL, np = 0; float *logit = NULL; OlmReqClock clk;
-    if (!olm_serve_start(m, T, q, ctx_cap, &ids, &np, &logit, &clk)) return 0;
+    if (!olm_serve_start(m, T, q, ctx_cap, &ids, &np, &logit, &clk, 1)) return 0;
     double t0 = clk.t0;
     uint64_t h0 = clk.h0, m0 = clk.m0;
     uint64_t disk0 = clk.disk0;
@@ -2838,9 +3014,18 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
 #ifdef COLI_VULKAN
     olmoe_vk_report(); vkt_report("turn", m->hits, m->miss); olc_report(m);
 #endif
+#ifdef COLI_CUDA
+    occ_report();
+#endif
     serve_hits(m);
     free(ids);
     return 0;
+}
+/* one request on its own; a conversation it parked comes back when its turn ends */
+static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
+    int r = serve_one_turn(m, T, q, ctx_cap);
+    olm_unpark(m);
+    return r;
 }
 
 /* dashboard HWINFO/TIERS/EMAP: same lines the other serve-capable engines
@@ -3032,7 +3217,7 @@ static void serve_mux(Model *m, Tok *T, int ctx_cap) {
                         t->q.payload = (char *)coli_serve_command_take_payload(&command);
                         t->q.plen = (int)command.payload_bytes;
                         olm_mux_bind(m, command.slot);
-                        int ok = olm_serve_start(m, T, &t->q, ctx_cap, &t->ids, &t->np, &t->lo, &t->clk);
+                        int ok = olm_serve_start(m, T, &t->q, ctx_cap, &t->ids, &t->np, &t->lo, &t->clk, 0);
                         free(t->q.payload); t->q.payload = NULL;
                         if (ok) {
                             t->active = 1; t->limited = 1;
@@ -3101,10 +3286,27 @@ static void serve_loop(Model *m, Tok *T, int ctx_cap) {
 }
 
 /* ---------- lettura ref.json ---------- */
+/* qwen38.c's: a file that is not an oracle's (no such array, a value that is no token id)
+ * is refused with a line, where it read through a null pointer */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
     jval *a = json_get(o, key);
-    int *r = malloc(a->len * sizeof(int));
-    for (int i = 0; i < a->len; i++) r[i] = (int)a->kids[i]->num;
+    if (!a || a->t != J_ARR) { fprintf(stderr, "ref.json: missing array \"%s\"\n", key); exit(1); }
+    if ((uint64_t)a->len > SIZE_MAX / sizeof(int)) {
+        fprintf(stderr, "ref.json: invalid array length for \"%s\"\n", key); exit(1);
+    }
+    /* lengths and id ranges are ref_fits()'s, once the vocabulary is known: here only
+     * what the cast to int needs */
+    int *r = malloc((size_t)(a->len ? a->len : 1) * sizeof(int));
+    if (!r) { fprintf(stderr, "ref.json: OOM reading \"%s\"\n", key); exit(1); }
+    for (int i = 0; i < a->len; i++) {
+        jval *v = a->kids[i];
+        if (!v || v->t != J_NUM || !isfinite(v->num) || v->num < INT_MIN ||
+            v->num > INT_MAX || floor(v->num) != v->num) {
+            fprintf(stderr, "ref.json: %s[%d] is not an integer\n", key, i);
+            exit(1);
+        }
+        r[i] = (int)v->num;
+    }
     *n_out = a->len; return r;
 }
 
@@ -3138,7 +3340,8 @@ static int ref_fits(const int *prompt, int np, const int *full, int nfull, int v
 
 #ifndef OLMOE_NO_MAIN
 int main(int argc, char **argv) {
-    coli_omp_tune_threads("olmoe");   /* squadra sui core fisici, niente spin-wait: vedi omp_tune.h */
+    coli_omp_hot_team(argv, "olmoe", coli_omp_env_on("COLI_CUDA") || coli_omp_env_on("COLI_METAL"));   /* omp_tune.h */
+    coli_omp_tune_threads("olmoe");   /* squadra sui core fisici: vedi omp_tune.h */
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("OLMoE", "SNAP=<model directory> ./olmoe ..."); return 1; }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;
@@ -3254,6 +3457,7 @@ int main(int argc, char **argv) {
     }
 
     const char *refpath = argc > 3 ? argv[3] : "ref.json";
+    if (!(getenv("KV16") && *getenv("KV16"))) g_olm_kv16 = 0;   /* the oracle's reference: float32 unless asked */
 
     float smooth = getenv("SMOOTH") ? (float)atof(getenv("SMOOTH")) : 0.3f;
     float conf   = getenv("CONF_LIMIT") ? (float)atof(getenv("CONF_LIMIT")) : 0.92f;
@@ -3289,6 +3493,9 @@ int main(int argc, char **argv) {
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
 #ifdef COLI_VULKAN
         fflush(stdout); olmoe_vk_report(); vkt_report("run", m.hits, m.miss); olc_report(&m);
+#endif
+#ifdef COLI_CUDA
+        occ_report();
 #endif
         free(buf); free(arena);
         return 0;      /* PPL is a measurement run: no rt_save on purpose, so a loss
@@ -3342,6 +3549,9 @@ int main(int argc, char **argv) {
     printf("TUNE decode: %d tokens in %.3fs\n", n_new, dt);
 #ifdef COLI_VULKAN
     fflush(stdout); olmoe_vk_report(); vkt_report("run", m.hits, m.miss); olc_report(&m);
+#endif
+#ifdef COLI_CUDA
+    occ_report();
 #endif
     free(buf); free(arena);
     return 0;

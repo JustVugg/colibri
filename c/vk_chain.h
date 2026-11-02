@@ -143,6 +143,15 @@ int  vkc_attn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf
 typedef struct { VkcAttn a; int win, ring, vd, kv_pm, sink, sink_off; } VkcAttnW;
 int  vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, VkcBuf *snk,
                 const VkcAttnW *p);
+/* A float16 KV cache: vkc_attn and vkc_attn_w over caches of halves (kc, vc and their offsets
+ * in halves; flash's offsets multiples of eight), every path the bits of a float32 cache of the
+ * same values; vkc_copy_regions_h copies float32 regions of src (offsets in floats) into such
+ * a cache (offsets and lengths in halves, even), each value rounded to the nearest float16.
+ * vkc_kvh_ready: 1 when the device takes them. */
+int  vkc_attn_h(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, const VkcAttn *p);
+int  vkc_attn_wh(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, VkcBuf *snk, const VkcAttnW *p);
+int  vkc_copy_regions_h(VkcBuf *dst, VkcBuf *src, const VkcRegion *r, int n);
+int  vkc_kvh_ready(void);
 /* From this many rows (COLI_VK_ATTN_BLOCK, 16; 0 = never) vkc_attn and vkc_attn_w take
  * chain_attnb.comp: a workgroup per KV head and block of rows, each K and V row read once
  * per block instead of once per (head, row); below it chain_attn as before. */
@@ -171,7 +180,8 @@ long long vkc_attn_slice_budget(void);   /* COLI_VK_ATTN_SLICE below: rows x pos
  * each ending its frame (submitted, not waited for) and the next in a new one: no single
  * submission of a big prompt chunk runs for seconds (a driver resets a job past its
  * timeout: amdgpu 10 s, Windows 2 s). The rows' arithmetic does not change. */
-/* chain_dnconv.comp */
+/* chain_dnconv.comp (order 0, 1: Gated DeltaNet's, the sum's two orders; 2: LFM3's gated
+ * convolution, input rows B | C | x of CD channels, out = C * conv(B * x), no activation) */
 typedef struct { int S, CD, CK, in_off, in_row, out_off, out_row, snap_row, order, w_off, ring_off, snap_off; } VkcDnConv;
 int  vkc_dnconv(VkcBuf *in, VkcBuf *w, VkcBuf *ring, VkcBuf *out, VkcBuf *snap, const VkcDnConv *p);
 /* chain_dnrec.comp (KD a specialization constant, VD <= 128); from VKC_DNREC_ROWS rows
@@ -194,6 +204,9 @@ int  vkc_dnrec(int KD, VkcBuf *cv, VkcBuf *ab, VkcBuf *z, VkcBuf *st, VkcBuf *pr
 #define VKC_EW_SIGMUL   9    /* y = a * sigmoid(b) */
 #define VKC_EW_RESGATE  10   /* y = e[col] * a + c[col] * b (alpha, beta a column) */
 #define VKC_EW_F16      11   /* y = a clamped to +-65504 and rounded to the nearest float16 (kv16.h: a KV cache in float16) */
+#define VKC_EW_HEADGATE 12   /* y = a * sigmoid(b[b_off + i / D]): a gate per head of D values (LFM3) */
+#define VKC_EW_SSMAX    13   /* y = a * (e[e_off + h] * c[c_off + r] + e[e_off + C + h]), h = (i / D) % C, r = i / (D * C):
+                              * Mistral-Large-4's SSMax (c the rows' log(pos + 1), e the heads' s, then b) */
 typedef struct { int op, n, D, C, flags, e_row, y_off, a_off, b_off, c_off, e_off; float fc; } VkcEw;
 int  vkc_ew(VkcBuf *y, VkcBuf *a, VkcBuf *b, VkcBuf *c, VkcBuf *e, const VkcEw *p);
 /* chain_qsa.comp (mode 0: nb block keys from b0; mode 1: the selection of S rows, run as two dispatches that write the
@@ -424,6 +437,7 @@ typedef struct {
     int i_off, i_row, w_off, w_row;
     int n_group, topk_group, norm;
     float temp, scale, norm_eps;
+    int wg;                                    /* 1: the workgroup's path where one subgroup would take the row (tests) */
 } VkcRoute;
 int vkc_route_ready(void);
 int vkc_route(VkcBuf *logits, VkcBuf *bias, VkcBuf *ids, VkcBuf *w, const VkcRoute *p);
@@ -509,6 +523,22 @@ int  vkc_hybrid_submit(uint64_t g);
 void vkc_hybrid_wait_next(uint64_t h);
 int  vkc_hybrid_host_wait(uint64_t g);
 int  vkc_hybrid_host_signal(uint64_t h);
+/* fn runs before the host waits for any frame (vk_dmoe.h's vkc_hyb_flush: the host's part
+ * of a hybrid step still to come, which the frames from C on wait for); NULL none */
+void vkc_hybrid_set_flush(void (*fn)(void));
+/* The hybrid steps inside one frame (vk_dmoe.h, as the CUDA chain's cc_signal and
+ * cc_wait_host), on Vulkan events: step g's pair of events (a ring; the step 256 before
+ * reused them, its frame waited for first). vkc_ev_signal sets the device's once everything
+ * recorded before it is done and visible to the host; vkc_ev_wait holds the queue until
+ * the host sets its (vkc_ev_host_set, after writing what the step reads), and makes the
+ * host's writes visible to what follows; vkc_ev_host_done asks whether the device's is set.
+ * A shader polling a word in host memory did not work here: an RTX 3070 served the loads
+ * (and the atomics) from its L2 and saw the host's write only at the frame's end. */
+int  vkc_ev_ready(void);
+int  vkc_ev_signal(uint64_t g);
+int  vkc_ev_wait(uint64_t g);
+int  vkc_ev_host_done(uint64_t g);
+int  vkc_ev_host_set(uint64_t g);
 
 /* ---- attention residuals and SiTU-GLU (chain_ares.comp) ----------------------------
  * Kimi K3's residual stream (AttnRes) and its activation, for S rows:
@@ -857,7 +887,10 @@ typedef struct {
     unsigned long long grp_coop;       /* grouped expert GEMMs on the matrix units (qmatmul_grp_qc, qmatmul_grp*_bdc) */
     unsigned long long gemv_xg;        /* decode GEMVs whose row is past the staging: x from its buffer (chain_gemv.comp XG) */
     unsigned long long attn_dec;       /* decode attentions split over their positions' blocks (chain_attn_dec.comp) */
+    unsigned long long attn_dec_gqa;   /* of them, a KV head's query heads a workgroup (its grouped mode) */
     unsigned long long moe_gv;         /* routed-expert decode steps in our formats on chain_moe_gv.comp */
+    unsigned long long tile_wide;      /* of the tile GEMMs, a GGUF's on 128 x 128 tiles (qmatmul_gemm_bdcw.comp) */
+    unsigned long long grp_wide;       /* of the grouped expert GEMMs, those at the wider item (qmatmul_grp*_bdcw.comp) */
 } VkcStats;
 void vkc_stats(VkcStats *st);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */

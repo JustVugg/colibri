@@ -71,6 +71,7 @@
 #include "uring.h"
 #endif
 #include "tok.h"
+#include "mistral_vision.h"   /* Mistral-Large-4's vision tower (Pixtral), from a linked mmproj */
 #include "tier.h"
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
 #include "spec_draft.h"                           /* COLI_LOOKUP=1: the n-gram drafts from spec_draft.h, gated */
@@ -80,6 +81,8 @@
 #include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
 #include "decode_batch.h"
 #include "pin_pool.h"   /* piu scatti annidati dello stato */
+#include "park.h"       /* a short request keeps the one slot's conversation aside (COLI_PARK) */
+#include "prompt_break.h"   /* a served prompt that a STOP or CANCEL stops between two layers */
 #include "route_trace.h"                           /* ROUTE_TRACE + .coli_usage, engine-agnostic (#700) */
 #include "kv_fp8.h"                               /* KV8=1: cache latente in fp8 e4m3 + scala per-riga */
 #include "kv_tq.h"                                /* KV_TQ=3|4: cache latente PolarQuant (rot+polare) */
@@ -110,13 +113,24 @@ static inline void omp_set_num_threads(int n){ (void)n; }
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
 #endif
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+#define COLI_XT 1   /* the routed-expert tier on a device: Vulkan's or CUDA's (xtier.h) */
+#endif
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h"
-#include "vk_tier.h"                              /* the routed-expert tier the MoE engines share */
 #endif
-#ifndef COLI_VULKAN   /* exclusive RAM/VRAM (vk_tier.h) is the Vulkan build's: no device holds an expert */
+#ifdef COLI_XT
+#include "xtier.h"   /* the routed-expert tier the MoE engines share, on Vulkan or (COLI_VULKAN=0 COLI_CUDA=1,
+                      * a GGUF) on CUDA: XT(f) is vkt_f or cut_f, the same tier compiled over either backend */
+#endif
+#ifdef COLI_CUDA
+#include "cu_dense.h"   /* a GGUF's dense matrices on the CUDA tier's device (cud_mm) */
+#endif
+#ifndef COLI_XT   /* exclusive RAM/VRAM (vk_tier.h) is a device build's: no device holds an expert */
 static inline int  vkt_ram_first(int layer, int eid) { (void)layer; (void)eid; return 0; }
 static inline void vkt_ram_gave(void) {}
+#define XT(f) vkt_##f   /* no tier device: the stubs above (xtier.h's choice in a Vulkan build) */
+static inline int xt_cuda(void) { return 0; }
 #endif
 #ifdef COLI_XDNA
 /* Optional AMD XDNA2 lane. This header pulls in no XRT: the engine owns the
@@ -191,6 +205,15 @@ typedef struct {
     int index_topk, index_nh, index_hd;          /* DSA lightning indexer */
     int8_t idx_type[128];                        /* per layer: 1=full (calcola), 0=shared (riusa) */
     float eps, theta, attn_scale, routed_scale;
+    /* Mistral-Large-4 (model_type mistral_large4): no query LoRA (q_lora 0, q_proj straight from
+     * the input), per layer a rotary part or none (rope_on: a NoPE layer's key and query are
+     * qk_head wide unrotated) and a KV source (kv_src: a layer reading another's latent has no
+     * kv_a), SSMax on the queries, the indexer from the input's LayerNorm, a softmax router, YaRN
+     * frequencies times the learned exp(alpha) (rope_inv), a final logit softcap */
+    int ml4, softmax_router, rope_inv_on;
+    int8_t rope_on[128]; int16_t kv_src[128];
+    float softcap, ix_eps, rope_inv[128];
+    float yarn_factor, yarn_beta_fast, yarn_beta_slow; int yarn_orig;
     char config_sha256[65];                      /* digest of the loaded config.json bytes */
 } Cfg;
 
@@ -285,6 +308,7 @@ typedef struct {
     int planar;  /* K1: fmt=2 con nibble a PIANI (vedi quant.h) — i kernel *_i4p; 0 = coppie classiche */
 #ifdef COLI_CUDA
     ColiCudaTensor *cuda;
+    int cud_dense, cud_no;   /* a GGUF's resident dense matrix for cud_mm (the tier on CUDA), and its refusal */
 #endif
 #ifdef COLI_VULKAN
     ColiVkTensor *vk; int vk_eligible;   /* resident on the Vulkan expert tier */
@@ -448,6 +472,10 @@ typedef struct {
     int router_cuda_bad;                         /* upload failed once: stay on the CPU router */
 #endif
     QT sh_gate, sh_up, sh_down;                  /* shared expert */
+    /* the layer's key: nope unrotated dims then rope rotated ones (GLM: the config's; Mistral-
+     * Large-4's NoPE layers: qk_head and 0), SSMax's scale and bias per head (Mistral) */
+    int nope, rope;
+    float *ssm_s, *ssm_b;
 } Layer;
 
 /* slot di un expert: pesi quantizzati + scale. Nel container pre-quantizzato g/u/d sono
@@ -487,11 +515,11 @@ static int eslot_lru_victim(ESlot *slots,int n,int ecap,int layer){
         if(s->eid==-1) return i;              /* slot libero che possiede ancora lo slab */
         /* un expert che il tier Vulkan tiene gia' esce prima (vkt_ram_first: con poca RAM
          * la RAM e la VRAM non tengono gli stessi expert) */
-        if(vkt_ram_first(layer,s->eid)){ if(dev<0 || s->used<slots[dev].used) dev=i; continue; }
+        if(XT(ram_first)(layer,s->eid)){ if(dev<0 || s->used<slots[dev].used) dev=i; continue; }
         if(lru<0 || s->used<slots[lru].used) lru=i;
     }
     if(empty>=0 && live<ecap) return empty;   /* sotto il tetto: meglio il vuoto che sfrattare */
-    if(dev>=0){ vkt_ram_gave(); return dev; }
+    if(dev>=0){ XT(ram_gave)(); return dev; }
     return lru;
 }
 
@@ -565,6 +593,7 @@ typedef struct {
     int has_dsa;
     QT *ix_wq, *ix_wk, *ix_wp;                   /* per layer FULL: wq_b, wk, weights_proj */
     float **ix_knw, **ix_knb;                    /* k_norm (LayerNorm, eps 1e-6) */
+    float **ix_qnw, **ix_qnb, **ix_ssm_s, **ix_ssm_b;   /* Mistral-Large-4: q_input_norm, SSMax */
     float **Ic;                                  /* alias KVState: cache indexer [max_t*hd] */
     int *dsa_sel, *dsa_nsel; int dsa_scap;       /* selezione per posizione del batch corrente */
     /* testa MTP (layer n_layers, stile DeepSeek-V3): draft nativi ad alta acceptance */
@@ -667,11 +696,13 @@ static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S)
 
 static int g_repin;
 static uint64_t g_last_repin;
-#ifdef COLI_VULKAN
+#ifdef COLI_XT
 static int g_vulkan;          /* COLI_VULKAN=1: the device is open */
 static int g_vk_experts=-1;   /* COLI_VK_EXPERTS (deprecated): -1 unset; 0 = no expert tier;
                                * N = the shared tier (vk_tier.c) holds at most N experts */
+#ifdef COLI_VULKAN
 static int g_vk_resident;     /* how many experts currently VK-resident */
+#endif
 /* The routed experts on the device live in the shared tier (vk_tier.c: adaptive, with
  * eviction and a budget). The registry below is the second device's only
  * (COLI_VK_DEV2): its top heat-ranked experts, uploaded ONCE at startup, keyed by
@@ -698,14 +729,20 @@ static struct {
 } g_vkt;
 static int vk_tier_resident_count(Model *m);
 static void vk_tier_turn(Model *m);   /* "[VK] tier colibri turn: ..." after a serve turn */
+#ifdef COLI_VULKAN
 static int g_vk_dense;        /* COLI_VK_DENSE=1: run the resident dense matmuls (attention
                                * projections + shared expert) on Vulkan too */
+#endif
 /* A partial chain (glm_chain.h, vkc_fit): the device holds the first N layers only, or not
  * the head and the MTP layer. The per-matrix path then multiplies on the device only what
  * is there already: a matrix without a device copy stays on the CPU (VK_MAY). */
+#ifdef COLI_VULKAN
 static int g_glmc_partial;
 #define VK_MAY(t) (!g_glmc_partial || (t)->vk != NULL)
+#endif
+#ifdef COLI_VULKAN
 static int g_vk_budget2;      /* COLI_VK_EXPERTS2: dev2 expert-tier cap (with COLI_VK_DEV2) */
+#endif
 static int g_vk_reg_n2;       /* experts resident on the dev2 tier */
 /* Resolve the main shader path (#523): COLI_VK_SHADERS may be the qmatmul.spv file itself
  * OR a directory containing it; unset, look alongside the binary (<exedir>/shaders/, the
@@ -713,16 +750,26 @@ static int g_vk_reg_n2;       /* experts resident on the dev2 tier */
  * launching from outside c/ works. The other shaders load as siblings of the returned path
  * (backend derive_*). The backend's coli_vk_shader_path, which every other engine uses:
  * this copy of it looked beside the binary on Linux only. */
+#ifdef COLI_VULKAN
 static const char *vk_resolve_spv(char *buf, size_t n){ return coli_vk_shader_path(buf, n); }
+#endif
 /* PROF anatomy of the VK expert block (master-thread accumulated in moe(), printed by
  * profile_print): where a decode block's wall goes besides t_ecpu/t_ewait/t_egpu. */
-static double g_vkb_cls, g_vkb_issue, g_vkb_acc, g_vkb_wrk, g_vkb_join;
-static int64_t g_vkb_blocks, g_vkb_nvk, g_vkb_nvk2, g_vkb_ncpu;
+static double g_vkb_issue, g_vkb_acc;
+static int64_t g_vkb_blocks, g_vkb_nvk, g_vkb_ncpu;
+#ifdef COLI_VULKAN   /* the second device's and the chain's (PROF) */
+static double g_vkb_cls, g_vkb_wrk, g_vkb_join;
+static int64_t g_vkb_nvk2;
+#endif
+#ifdef COLI_VULKAN
 static int g_vk_attn;         /* COLI_VK_ATTN=1: run the MLA absorb attention core on Vulkan
                                * (mirrors COLI_CUDA_ATTN; KV latent cache mirrored on-device) */
 #endif
+#endif
 #ifdef COLI_CUDA
 static int g_cuda_enabled;
+static size_t g_cud_dense_bytes;   /* a GGUF's resident dense matrices (qt_load): cud_open's ask */
+static size_t g_cl_cud;            /* the room cud_open took on the CUDA tier's device */
 static double g_cuda_expert_gb;
 static int g_cuda_expert_auto;
 static int g_cuda_dense;
@@ -1366,7 +1413,12 @@ static void qt_kvb_absorb(const QT *w, int h, const float *q_nope, float *q_lat)
     qt_ggml_rows_f32(&w->kvb->kb,h*w->kvb->L,w->kvb->L,q_nope,q_lat);
 }
 static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot){
-    if(w->fmt==QT_GGML){ (void)allow_idot; qt_ggml_rows(w,0,w->O,x,y,S); return; }   /* the CPU's, no device */
+#if defined(COLI_CUDA) && defined(COLI_VULKAN)
+    /* a GGUF's resident dense matrix on the CUDA tier's device, once it took it (cu_dense.h) */
+    if(w->fmt==QT_GGML && w->cud_dense && xt_cuda() &&
+       cud_mm((void **)&w->cuda,&w->cud_no,y,x,S,100+w->gt,w->q4,NULL,w->O,w->I,0)) return;
+#endif
+    if(w->fmt==QT_GGML){ (void)allow_idot; qt_ggml_rows(w,0,w->O,x,y,S); return; }   /* the CPU's */
     if(w->fmt==QT_KVB){ qt_kvb_matmul(y,x,w,S); return; }
 #ifdef COLI_VULKAN
     if(__atomic_load_n(&w->vk_gone, __ATOMIC_ACQUIRE)){
@@ -1855,7 +1907,8 @@ static void rope_interleave(float *v, int pos, const Cfg *c){
     static _Thread_local RopeCache cache;
     float in[256]; memcpy(in,v,c->qk_rope*sizeof(float));
     if(!cache.inv_valid||cache.qk!=c->qk_rope||cache.inv_theta!=c->theta){
-        for(int j=0;j<half;j++) cache.inv[j]=powf(c->theta,-2.0f*j/c->qk_rope);
+        /* Mistral-Large-4: YaRN's frequencies over the learned exp(alpha), set at load */
+        for(int j=0;j<half;j++) cache.inv[j]=c->rope_inv_on ? c->rope_inv[j] : powf(c->theta,-2.0f*j/c->qk_rope);
         cache.qk=c->qk_rope; cache.inv_theta=c->theta; cache.inv_valid=1;
         cache.valid=0;   /* inv[] changed -> force cs/sn refresh below */
     }
@@ -1973,6 +2026,31 @@ static void load_cfg(Cfg *c, const char *snap){
               c->idx_type[i] = !strcmp(it->kids[i]->str,"full");
           else { int v=i-off+1; if(v<0) v=0; c->idx_type[i] = (v%freq)==0; }
       } }
+    {   /* Mistral-Large-4's per-layer shape, router, rope scaling and softcap */
+        jval *mt=json_get(r,"model_type");
+        c->ml4 = mt && mt->t==J_STR && mt->str && !strcmp(mt->str,"mistral_large4");
+        jval *sf=json_get(r,"scoring_func");
+        c->softmax_router = sf && sf->t==J_STR && sf->str && !strcmp(sf->str,"softmax");
+        jval *fc=json_get(r,"final_logit_softcapping"); c->softcap = fc&&fc->t==J_NUM ? (float)fc->num : 0.f;
+        jval *ie=json_get(r,"indexer_norm_eps"); c->ix_eps = ie&&ie->t==J_NUM ? (float)ie->num : 1e-6f;
+        jval *nr=json_get(r,"no_rope_layers"), *ks=json_get(r,"kv_source_layers");
+        for(int i=0;i<c->n_layers && i<128;i++){
+            c->rope_on[i] = !(nr && nr->t==J_ARR && i<nr->len && nr->kids[i]->t==J_NUM && nr->kids[i]->num==0);
+            c->kv_src[i] = ks && ks->t==J_ARR && i<ks->len && ks->kids[i]->t==J_NUM ? (int16_t)ks->kids[i]->num : (int16_t)i;
+            if(c->kv_src[i]<0 || c->kv_src[i]>i){ fprintf(stderr,"config: kv_source_layers[%d]=%d is not an earlier layer\n",i,c->kv_src[i]); exit(1); }
+            if(c->kv_src[i]!=i && c->rope_on[i]!=c->rope_on[c->kv_src[i]]){
+                fprintf(stderr,"config: layer %d reads layer %d's KV but one rotates and the other not\n",i,c->kv_src[i]); exit(1); }
+        }
+        jval *rt=rp?json_get(rp,"rope_type"):NULL;
+        if(rt && rt->t==J_STR && rt->str && !strcmp(rt->str,"yarn")){
+            jval *f=json_get(rp,"factor"), *o=json_get(rp,"original_max_position_embeddings");
+            jval *bf=json_get(rp,"beta_fast"), *bs=json_get(rp,"beta_slow");
+            c->yarn_factor = f&&f->t==J_NUM ? (float)f->num : 1.f;
+            c->yarn_orig = o&&o->t==J_NUM ? (int)o->num : 0;
+            c->yarn_beta_fast = bf&&bf->t==J_NUM ? (float)bf->num : 32.f;
+            c->yarn_beta_slow = bs&&bs->t==J_NUM ? (float)bs->num : 1.f;
+        }
+    }
     c->qk_head=c->qk_nope+c->qk_rope;
     c->attn_scale = 1.f / sqrtf((float)c->qk_head);
     if(c->n_group!=1){ fprintf(stderr,"this engine requires n_group=1 (GLM-5.2)\n"); exit(1); }
@@ -2487,6 +2565,11 @@ static int qt_load_mmap(Model *m, const char *name, int O, int I, QT *t){
     return 0;
 }
 
+#ifdef COLI_CUDA
+/* a GGUF's resident dense matrix: cud_mm's when the tier runs on CUDA (colibri_cu_tier_start),
+ * its bytes in what cud_open is asked for */
+static void qt_cud_mark(QT *t){ if(t->fmt==QT_GGML){ t->cud_dense=1; g_cud_dense_bytes+=(size_t)qt_bytes(t); } }
+#endif
 static QT qt_load(Model *m, const char *name, int O, int I, int bits){
     QT t; memset(&t,0,sizeof(t)); qt_from_disk(m,name,O,I,bits,0,&t);
 #ifdef COLI_VULKAN
@@ -2494,7 +2577,8 @@ static QT qt_load(Model *m, const char *name, int O, int I, int bits){
     if(!(t.vk_name=strdup(name))){ fprintf(stderr,"OOM tensor name\n"); exit(1); }
 #endif
 #ifdef COLI_CUDA
-    if(g_cuda_enabled&&g_cuda_dense&&t.fmt!=QT_GGML){   /* a GGUF matrix stays the CPU's */
+    qt_cud_mark(&t);
+    if(g_cuda_enabled&&g_cuda_dense&&t.fmt!=QT_GGML){   /* the old path's; a GGUF matrix goes to cud_mm */
         t.cuda_eligible=1;
         int slot=g_cuda_rr++%g_cuda_ndev; t.cuda_device=g_cuda_devices[slot];
         g_cuda_dense_projected[slot]+=qt_bytes(&t);
@@ -2509,7 +2593,12 @@ static QT qt_load(Model *m, const char *name, int O, int I, int bits){
 static QT qt_load_ex(Model *m, const char *name, int O, int I, int bits, int mmap_ok){
     if(mmap_ok){
         QT t;
-        if(qt_load_mmap(m,name,O,I,&t)==0) return t;
+        if(qt_load_mmap(m,name,O,I,&t)==0){
+#ifdef COLI_CUDA
+            qt_cud_mark(&t);   /* a GGUF's matrix read in place goes up as one qt_load gives */
+#endif
+            return t;
+        }
     }
     return qt_load(m,name,O,I,bits);
 }
@@ -2714,6 +2803,45 @@ static void metal_fmt_gate_notice(Model *m){
         k>=5?"sparse ":"", nbad[k]==1?"":"s");
 }
 
+/* the head's logits for S rows (lm_head), under the final softcap where the model has one
+ * (Mistral-Large-4: cap * tanh(logit / cap)) */
+static void lm_logits(Model *m, float *y, const float *x, int S){
+    matmul_qt(y, x, &m->lm_head, S);
+    const float cap=m->c.softcap;
+    if(cap>0.f) for(int64_t i=0;i<(int64_t)S*m->c.vocab;i++) y[i]=cap*tanhf(y[i]/cap);
+}
+/* Mistral-Large-4's rotary frequencies (transformers' _compute_yarn_parameters, truncate on):
+ * YaRN's blend of the interpolated and extrapolated frequencies, then over the GGUF's
+ * freq_factors (exp(-alpha), the learned LeRoPE alpha: checked against the checkpoint's
+ * lerope.alpha), into rope_inv for rope_interleave */
+static void ml4_rope_table(Model *m){
+    Cfg *c=&m->c; const int dim=c->qk_rope, half=dim/2;
+    if(half<1 || half>128) return;
+    const double base=c->theta, factor=c->yarn_factor>0 ? c->yarn_factor : 1.0;
+    double low=0, high=0;
+    if(factor>1.0 && c->yarn_orig>0){
+        double lo=(dim*log(c->yarn_orig/(c->yarn_beta_fast*2*3.14159265358979323846)))/(2*log(base));
+        double hi=(dim*log(c->yarn_orig/(c->yarn_beta_slow*2*3.14159265358979323846)))/(2*log(base));
+        low=floor(lo); high=ceil(hi);
+        if(low<0) low=0;
+        if(high>dim-1) high=dim-1;
+        if(low==high) high+=0.001;
+    }
+    float ff[128]; int has_ff=0;
+    if(st_has(&m->S,"model.rotary_emb.freq_factors") && st_numel(&m->S,"model.rotary_emb.freq_factors")==half){
+        float *f=ld(m,"model.rotary_emb.freq_factors"); memcpy(ff,f,half*sizeof(float)); has_ff=1; }
+    for(int j=0;j<half;j++){
+        float pos=powf((float)base,(float)(2*j)/(float)dim);
+        double inv=1.0/pos;
+        if(factor>1.0 && c->yarn_orig>0){
+            double ramp=(j-low)/(high-low); ramp=ramp<0?0:ramp>1?1:ramp;
+            inv=(1.0/(factor*pos))*ramp + (1.0/pos)*(1.0-ramp);
+        }
+        if(has_ff) inv/=ff[j];
+        c->rope_inv[j]=(float)inv;
+    }
+    c->rope_inv_on=1;
+}
 static void model_init_range(Model *m, const char *snap, int cap,
                              int ebits, int dbits, int layer_begin,
                              int layer_end, int load_boundaries, int load_mtp,
@@ -2723,6 +2851,7 @@ static void model_init_range(Model *m, const char *snap, int cap,
     { const char *xd=getenv("COLI_MODEL_DIRS");        /* SPLIT: model shards spread across N drives */
       st_init_multi(&m->S,snap,(xd&&*xd)?xd:NULL); }
     Cfg *c=&m->c; char nm[256]; int H=c->n_heads, D=c->hidden;
+    if(c->ml4) ml4_rope_table(m);
     if(layer_end==0) layer_end=c->n_layers;
     if(layer_begin<0||layer_begin>=layer_end||layer_end>c->n_layers){
         fprintf(stderr,"invalid GLM layer range [%d,%d) for %d layers\n",
@@ -2785,15 +2914,27 @@ static void model_init_range(Model *m, const char *snap, int cap,
         #define P(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
         l->in_ln=ld(m,P("input_layernorm.weight"));
         l->post_ln=ld(m,P("post_attention_layernorm.weight"));
+        l->rope = c->ml4 && !c->rope_on[i] ? 0 : c->qk_rope;   /* a NoPE layer: its whole key unrotated */
+        l->nope = c->qk_head - l->rope;
+        if(c->ml4){   /* Mistral-Large-4: the query straight from the input (in q_b), kv_a on a KV source only */
+            l->q_b = qt_load_ex(m,P("self_attn.q_proj.weight"), H*c->qk_head, D, dbits,mmap_ok);
+            if(c->kv_src[i]==i){
+                l->kv_a  = qt_load_ex(m,P("self_attn.kv_a_proj_with_mqa.weight"), c->kv_lora+l->rope, D, dbits,mmap_ok);
+                l->kv_a_ln= ld(m,P("self_attn.kv_a_layernorm.weight"));
+            }
+            l->ssm_s = ld(m,P("self_attn.softmax_scaling.scale"));
+            l->ssm_b = ld(m,P("self_attn.softmax_scaling.bias"));
+        } else {
         l->q_a   = qt_load_ex(m,P("self_attn.q_a_proj.weight"), c->q_lora, D, dbits,mmap_ok);
         l->q_a_ln= ld(m,P("self_attn.q_a_layernorm.weight"));
         l->q_b   = qt_load_ex(m,P("self_attn.q_b_proj.weight"), H*c->qk_head, c->q_lora, dbits,mmap_ok);
         l->kv_a  = qt_load_ex(m,P("self_attn.kv_a_proj_with_mqa.weight"), c->kv_lora+c->qk_rope, D, dbits,mmap_ok);
         l->kv_a_ln= ld(m,P("self_attn.kv_a_layernorm.weight"));
+        }
         if(st_has(&m->S,P("self_attn.kv_b_proj.weight")))
-            l->kv_b  = qt_load_ex(m,P("self_attn.kv_b_proj.weight"), H*(c->qk_nope+c->v_head), c->kv_lora, dbits,mmap_ok);
+            l->kv_b  = qt_load_ex(m,P("self_attn.kv_b_proj.weight"), H*(l->nope+c->v_head), c->kv_lora, dbits,mmap_ok);
         else { char pre[64]; snprintf(pre,sizeof pre,"model.layers.%d.",i);   /* a GGUF's k_b / v_b */
-            l->kv_b = qt_kvb_gguf(m,pre,H,c->qk_nope,c->v_head,c->kv_lora); }
+            l->kv_b = qt_kvb_gguf(m,pre,H,l->nope,c->v_head,c->kv_lora); }
         l->o     = qt_load_ex(m,P("self_attn.o_proj.weight"), D, H*c->v_head, dbits,mmap_ok);
 #ifdef COLI_CUDA
         qt_cuda_colocate(&l->o,&l->kv_b);
@@ -2813,7 +2954,7 @@ static void model_init_range(Model *m, const char *snap, int cap,
             if(!l->down_proj.mmap_view) qt_planarize(&l->down_proj);
         } else {
             l->router=ld(m,P("mlp.gate.weight"));
-            l->router_bias=ld(m,P("mlp.gate.e_score_correction_bias"));
+            l->router_bias=c->softmax_router ? NULL : ld(m,P("mlp.gate.e_score_correction_bias"));   /* softmax: no bias */
             int sI=c->moe_inter*c->n_shared;
             l->sh_gate = qt_load_ex(m,P("mlp.shared_experts.gate_proj.weight"), sI, D, dbits,mmap_ok);
             l->sh_up   = qt_load_ex(m,P("mlp.shared_experts.up_proj.weight"),   sI, D, dbits,mmap_ok);
@@ -2909,10 +3050,18 @@ static void model_init_range(Model *m, const char *snap, int cap,
             m->ix_wq=calloc(c->n_layers,sizeof(QT)); m->ix_wk=calloc(c->n_layers,sizeof(QT));
             m->ix_wp=calloc(c->n_layers,sizeof(QT));
             m->ix_knw=calloc(c->n_layers,sizeof(float*)); m->ix_knb=calloc(c->n_layers,sizeof(float*));
+            if(c->ml4){
+                m->ix_qnw=calloc(c->n_layers,sizeof(float*)); m->ix_qnb=calloc(c->n_layers,sizeof(float*));
+                m->ix_ssm_s=calloc(c->n_layers,sizeof(float*)); m->ix_ssm_b=calloc(c->n_layers,sizeof(float*));
+            }
             for(int i=layer_begin;i<layer_end;i++){
                 if(!c->idx_type[i]) continue;
                 #define PI(s) (snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.indexer." s,i),nm)
-                m->ix_wq[i]=qt_load(m,PI("wq_b.weight"), c->index_nh*c->index_hd, c->q_lora, dbits);
+                if(c->ml4){   /* Mistral-Large-4: the indexer's query from the input's LayerNorm, its own SSMax */
+                    m->ix_qnw[i]=ld(m,PI("q_input_norm.weight")); m->ix_qnb[i]=ld(m,PI("q_input_norm.bias"));
+                    m->ix_ssm_s[i]=ld(m,PI("softmax_scaling.scale")); m->ix_ssm_b[i]=ld(m,PI("softmax_scaling.bias"));
+                }
+                m->ix_wq[i]=qt_load(m,PI("wq_b.weight"), c->index_nh*c->index_hd, c->ml4 ? D : c->q_lora, dbits);
                 m->ix_wk[i]=qt_load(m,PI("wk.weight"), c->index_hd, D, dbits);
                 m->ix_wp[i]=qt_load(m,PI("weights_proj.weight"), c->index_nh, D, dbits);
                 m->ix_knw[i]=ld(m,PI("k_norm.weight")); m->ix_knb[i]=ld(m,PI("k_norm.bias"));
@@ -5118,9 +5267,159 @@ static void kv_lc_rows_f32(Model *m, int layer, int64_t t0, int64_t n, float *ds
 #ifdef COLI_VULKAN
 static void glmc_cpu_rows(Model *m, int layer, KVState *const *kvs, const int *positions, int pos_base, int S);
 #endif
+/* Mistral-Large-4's attention (model_type mistral_large4), on the CPU: GLM-5.2's MLA without the
+ * query LoRA (q_proj straight from the input), the layer's own key width (a NoPE layer's whole
+ * key unrotated, no rotary cache row), the queries times SSMax (s * log(pos + 1) + b per head)
+ * after their rotation, a layer reading another's KV latent copying that layer's rows into its
+ * own (the source runs first in the same forward), the indexer from the input's LayerNorm with
+ * its own SSMax (rotated on RoPE layers only), the "shared" layers reading the last full one's
+ * selection. The scores over the latent as in the absorbed path below (q_nope through k_b,
+ * the context back through v_b); the KV rows float32 or float16 (KV16). */
+static inline const float *ml4_row(KVState *ks, int layer, int t, int n, int rope, float *buf){
+    if(g_kv16){ kv16_unpack(buf,(const uint16_t *)coli_kv_row8(rope ? ks->Rc8[layer] : ks->Lc8[layer],t,2*n),n); return buf; }
+    return coli_kv_row(rope ? ks->Rc[layer] : ks->Lc[layer],t,n);
+}
+static inline void ml4_put(KVState *ks, int layer, int t, int n, int rope, const float *v){
+    if(g_kv16) kv16_pack((uint16_t *)coli_kv_row8(rope ? ks->Rc8[layer] : ks->Lc8[layer],t,2*n),v,n);
+    else memcpy(coli_kv_row(rope ? ks->Rc[layer] : ks->Lc[layer],t,n),v,(size_t)n*sizeof(float));
+}
+static void attention_rows_ml4(Model *m, Layer *l, int layer, float *x, int S, int pos_base,
+                               KVState *const *kvs, const int *positions, float *out){
+    Cfg *c=&m->c; const int H=c->n_heads, D=c->hidden, qh=c->qk_head, vh=c->v_head, kvl=c->kv_lora;
+    const int R=l->rope, nope=l->nope, src=c->kv_src[layer], RQ=c->qk_rope;
+    double ta0=now_s();
+    float *Q=falloc((int64_t)S*H*qh), *ctx=falloc((int64_t)S*H*vh), *comp=NULL;
+    matmul_qt_ex(Q, x, &l->q_b, S, 0);
+    if(src==layer){ comp=falloc((int64_t)S*(kvl+R)); matmul_qt_ex(comp, x, &l->kv_a, S, 0); }
+    for(int s=0;s<S;s++){
+        KVState *ks=kvs?kvs[s]:m->kv;
+        int pos=positions?positions[s]:pos_base+s;
+        float *qs=Q+(int64_t)s*H*qh, lp=logf((float)pos+1.f);
+        for(int h=0;h<H;h++){
+            float *qp=qs+(int64_t)h*qh;
+            if(R) rope_interleave(qp+nope, pos, c);
+            float f=l->ssm_s[h]*lp+l->ssm_b[h];
+            for(int d=0;d<qh;d++) qp[d]*=f;
+        }
+        if(src==layer){
+            float *Ls=comp+(int64_t)s*(kvl+R);
+            rmsnorm(Ls, Ls, l->kv_a_ln, kvl, c->eps);
+            ml4_put(ks,layer,pos,kvl,0,Ls);
+            if(R){ rope_interleave(Ls+kvl, pos, c); ml4_put(ks,layer,pos,RQ,1,Ls+kvl); }
+        } else {   /* the source layer's rows, written earlier in this forward */
+            float b1[512], b2[256];
+            ml4_put(ks,layer,pos,kvl,0,ml4_row(ks,src,pos,kvl,0,b1));
+            if(R) ml4_put(ks,layer,pos,RQ,1,ml4_row(ks,src,pos,RQ,1,b2));
+        }
+    }
+    /* the indexer: a full layer's keys into Ic and every row's top index_topk keys, which the
+     * shared layers after it read */
+    const int *dsel=NULL, *dnsel=NULL; int dtopk=0;
+    if(m->has_dsa){
+        const int nh=c->index_nh, hd=c->index_hd; dtopk=c->index_topk;
+        if(c->idx_type[layer]){
+            float *KD=falloc((int64_t)S*hd);
+            matmul_qt_ex(KD, x, &m->ix_wk[layer], S, 0);
+            for(int s=0;s<S;s++){
+                KVState *ks=kvs?kvs[s]:m->kv;
+                int pos=positions?positions[s]:pos_base+s;
+                float *kd=coli_kv_row(ks->Ic[layer],pos,hd);
+                memcpy(kd, KD+(int64_t)s*hd, (size_t)hd*sizeof(float));
+                layernorm(kd, m->ix_knw[layer], m->ix_knb[layer], hd, c->ix_eps);
+                if(R) rope_interleave(kd, pos, c);
+            }
+            free(KD);
+            if((int64_t)S*dtopk > m->dsa_scap){
+                free(m->dsa_sel); free(m->dsa_nsel);
+                m->dsa_scap=(int64_t)S*dtopk;
+                m->dsa_sel=malloc((size_t)m->dsa_scap*sizeof(int));
+                m->dsa_nsel=malloc((size_t)S*sizeof(int));
+            }
+            #pragma omp parallel for schedule(dynamic,1) if(S > 1)
+            for(int s=0;s<S;s++){
+                KVState *ks=kvs?kvs[s]:m->kv;
+                int pos=positions?positions[s]:pos_base+s, nk=pos+1;
+                if(ks->kv_start[layer]!=0 || (nk<=dtopk && !g_dsa_force)){ m->dsa_nsel[s]=0; continue; }
+                int keep = nk<dtopk ? nk : dtopk;
+                float *xn=falloc(D), *qi=falloc((int64_t)nh*hd), *w32=falloc(nh), *isc=falloc(nk), *tmp=falloc(nk);
+                memcpy(xn, x+(int64_t)s*D, (size_t)D*sizeof(float));
+                layernorm(xn, m->ix_qnw[layer], m->ix_qnb[layer], D, c->ix_eps);
+                matmul_qt(qi, xn, &m->ix_wq[layer], 1);
+                float lp=logf((float)pos+1.f);
+                for(int h=0;h<nh;h++){
+                    float f=m->ix_ssm_s[layer][h]*lp+m->ix_ssm_b[layer][h];
+                    for(int i=0;i<hd;i++) qi[(int64_t)h*hd+i]*=f;
+                    if(R) rope_interleave(qi+(int64_t)h*hd, pos, c);
+                }
+                matmul_qt(w32, x+(int64_t)s*D, &m->ix_wp[layer], 1);
+                float wsc=1.f/sqrtf((float)nh), rs=1.f/sqrtf((float)hd);
+                for(int t=0;t<nk;t++){
+                    const float *kt=coli_kv_row(ks->Ic[layer],t,hd);
+                    float a=0;
+                    for(int h=0;h<nh;h++){ const float *qhp=qi+(int64_t)h*hd;
+                        float d0=0; for(int i=0;i<hd;i++) d0+=qhp[i]*kt[i];
+                        d0*=rs; if(d0>0) a+=w32[h]*d0;
+                    }
+                    isc[t]=a*wsc;
+                }
+                memcpy(tmp,isc,nk*sizeof(float));
+                partial_select_desc(tmp,nk,keep);
+                float thr=tmp[0]; for(int t=1;t<keep;t++) if(tmp[t]<thr) thr=tmp[t];
+                int *dst=m->dsa_sel+(int64_t)s*dtopk, nd=0;
+                for(int t=0;t<nk && nd<keep;t++) if(isc[t]>thr) dst[nd++]=t;
+                for(int t=0;t<nk && nd<keep;t++) if(isc[t]==thr) dst[nd++]=t;
+                m->dsa_nsel[s]=nd;
+                free(xn); free(qi); free(w32); free(isc); free(tmp);
+            }
+        }
+        if(m->dsa_nsel){ dsel=m->dsa_sel; dnsel=m->dsa_nsel; }
+    }
+    int64_t sc_cap=1;
+    for(int s=0;s<S;s++){
+        KVState *ks=kvs?kvs[s]:m->kv;
+        int pos=positions?positions[s]:pos_base+s;
+        int64_t nt=(dnsel && dnsel[s]>0) ? dnsel[s] : pos+1-ks->kv_start[layer];
+        if(nt>sc_cap) sc_cap=nt;
+    }
+    float *sc_all=falloc((int64_t)omp_get_max_threads()*sc_cap);
+    #pragma omp parallel for collapse(2) schedule(static,1)
+    for(int s=0;s<S;s++) for(int h=0;h<H;h++){
+        KVState *ks=kvs?kvs[s]:m->kv;
+        int pos=positions?positions[s]:pos_base+s, st0=ks->kv_start[layer];
+        const float *qp=Q+((int64_t)s*H+h)*qh, *qr=qp+nope;
+        const int rbase=h*(nope+vh);
+        float qabs[512]; memset(qabs,0,kvl*sizeof(float));
+        if(l->kv_b.fmt==QT_KVB) qt_kvb_absorb(&l->kv_b,h,qp,qabs);
+        else for(int d=0;d<nope;d++) qt_addrow(&l->kv_b, rbase+d, qp[d], qabs);
+        float *sc=sc_all+(int64_t)omp_get_thread_num()*sc_cap;
+        int ns=(dnsel && dnsel[s]>0) ? dnsel[s] : 0;
+        const int *tl=ns ? dsel+(int64_t)s*dtopk : NULL;
+        int nt=ns ? ns : pos+1-st0;
+        float lb[512], rb[256];
+        for(int jj=0;jj<nt;jj++){ int t=tl ? tl[jj] : st0+jj;
+            const float *Lt=ml4_row(ks,layer,t,kvl,0,lb);
+            float a=0;
+            for(int i=0;i<kvl;i++) a+=qabs[i]*Lt[i];
+            if(R){ const float *kr=ml4_row(ks,layer,t,RQ,1,rb); for(int d=0;d<R;d++) a+=qr[d]*kr[d]; }
+            sc[jj]=a*c->attn_scale;
+        }
+        softmax(sc,nt);
+        float clat[512]; memset(clat,0,kvl*sizeof(float));
+        for(int jj=0;jj<nt;jj++){ int t=tl ? tl[jj] : st0+jj;
+            const float *Lt=ml4_row(ks,layer,t,kvl,0,lb);
+            for(int i=0;i<kvl;i++) clat[i]+=sc[jj]*Lt[i];
+        }
+        qt_matvec_rows(&l->kv_b, rbase+nope, vh, clat, ctx+((int64_t)s*H+h)*vh);
+    }
+    free(sc_all);
+    matmul_qt(out, ctx, &l->o, S);
+    free(Q); free(ctx); free(comp);
+    m->t_attn += now_s()-ta0;
+}
 static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int pos_base,
                            KVState *const *kvs, const int *positions, float *out){
     Cfg *c=&m->c; int H=c->n_heads, D=c->hidden, qh=c->qk_head, vh=c->v_head;
+    if(c->ml4){ attention_rows_ml4(m,l,layer,x,S,pos_base,kvs,positions,out); return; }
     int kvb_dim=H*(c->qk_nope+vh), Tk=pos_base+S;
     double ta0=now_s();
 #ifdef COLI_VULKAN
@@ -6157,8 +6456,8 @@ static void ecache_promote_ws(Model *m,int layer,int nmiss){
 /* pin ∪ LRU residency probe (used by CACHE_ROUTE max-rank fill), plus the Vulkan expert
  * tier's residents: no disk read either (vkt_resident is 0 without COLI_VULKAN=1). */
 static int expert_is_resident(Model *m, int layer, int eid){
-#ifdef COLI_VULKAN
-    if(vkt_resident(layer,eid)) return 1;
+#ifdef COLI_XT
+    if(XT(resident)(layer,eid)) return 1;
 #endif
     return pin_indexed(m,layer,eid)!=NULL || ecache_indexed(m,layer,eid,0)!=NULL;
 }
@@ -6217,8 +6516,8 @@ static int mb_gs_compat(int est_fmt, int est_gs, int fmt, int gs){
     return !(est_fmt==4 && fmt==4 && gs!=est_gs);
 }
 
-#ifdef COLI_VULKAN
-/* ---- the routed experts on the Vulkan device (COLI_VULKAN=1) -----------------------
+#ifdef COLI_XT
+/* ---- the routed experts on the Vulkan device (COLI_VULKAN=1), or CUDA's (a GGUF, COLI_VULKAN=0) ----
  * The shared tier (vk_tier.c) holds a cache of routed experts on the device: warm from
  * .coli_usage at startup, then adapting while you chat (an expert the CPU computes is
  * offered to it and promoted when there is room or when it is hotter than the coldest
@@ -6274,14 +6573,14 @@ static int vk_slot_src(const ESlot *e, int layer, VktExpertSrc *src){
  * int8 beside int4, COLI_VK_TIER_MTP). CUDA, Metal, the cluster workers and the
  * ablation harness keep moe()'s own loop. */
 static int moe_vk_on(Model *m,int layer){
-    if(!g_vulkan || layer<0 || layer>=(vkt_ready() ? vkt_layers() : m->c.n_layers) || omp_in_parallel()) return 0;
-    if(!vkt_ready() && g_vk_reg_n2<=0) return 0;
+    if(!(g_vulkan || xt_cuda()) || layer<0 || layer>=(XT(ready)() ? XT(layers)() : m->c.n_layers) || omp_in_parallel()) return 0;
+    if(!XT(ready)() && g_vk_reg_n2<=0) return 0;
     if(g_abl.mode || g_metal_enabled || g_pre_idx) return 0;
 #if !defined(_WIN32)
     if(g_cluster_n) return 0;
 #endif
 #ifdef COLI_CUDA
-    if(g_cuda_enabled) return 0;
+    if(g_cuda_enabled && !xt_cuda()) return 0;   /* the old CUDA expert path; a GGUF's tier on CUDA is this one */
 #endif
     return 1;
 }
@@ -6340,9 +6639,9 @@ static void vk_cpu_pairs(Model *m,int layer,const float *x,int rows,int K,const 
             VktExpertSrc vs;
             if(note && e->g.fmt==QT_GGML){   /* a GGUF expert: back to the file's rows only for the tier to take */
                 uint8_t *buf=NULL;
-                if((e->g.gt==qt_ggml_file_type(&e->g) || vkt_wants(layer,eid)) && vk_slot_src_ggml(e,layer,&vs,&buf)) vkt_note(layer,eid,&vs);
+                if((e->g.gt==qt_ggml_file_type(&e->g) || XT(wants)(layer,eid)) && vk_slot_src_ggml(e,layer,&vs,&buf)) XT(note)(layer,eid,&vs);
                 free(buf);
-            } else if(note && vk_slot_src(e,layer,&vs)) vkt_note(layer,eid,&vs);   /* may promote it to the device */
+            } else if(note && vk_slot_src(e,layer,&vs)) XT(note)(layer,eid,&vs);   /* may promote it to the device */
         }
         ecache_promote_ws(m,layer,nmiss);
     }
@@ -6351,7 +6650,7 @@ static void vk_cpu_pairs(Model *m,int layer,const float *x,int rows,int K,const 
 static void moe_vk(Model *m,int layer,const float *x,int S,float *out,const int *idxs,const float *ws,
                    const int *keff,float *xg,float *gg,float *uu,float *hh){
     Cfg *c=&m->c; int D=c->hidden, K=c->topk, E=c->n_experts;
-    int B = vkt_step_rows(S,GLM_VK_ROWS), nmax=B*K, dev2=g_vk_reg_n2>0;   /* a whole prompt chunk when the tier streams */
+    int B = XT(step_rows)(S,GLM_VK_ROWS), nmax=B*K, dev2=g_vk_reg_n2>0;   /* a whole prompt chunk when the tier streams */
     int *ib=xalloc((size_t)nmax*sizeof(int),"vk ib"), *r2=xalloc((size_t)nmax*sizeof(int),"vk r2");
     uint8_t *taken=xalloc((size_t)nmax,"vk taken"), *want=xalloc((size_t)nmax,"vk want"), *on2=xzalloc((size_t)nmax,"vk on2");
     const float **dev=xalloc((size_t)nmax*sizeof(*dev),"vk dev");
@@ -6364,14 +6663,16 @@ static void moe_vk(Model *m,int layer,const float *x,int S,float *out,const int 
         for(int s=0;s<rows;s++) for(int k=0;k<K;k++)
             ib[s*K+k] = k<keff[s0+s] ? idxs[(int64_t)(s0+s)*K+k] : -1;
         double t0=now_s();
-        int ndev=vkt_issue(layer,xb,rows,K,ib,taken);   /* returns at once; 0 = nothing on the device */
+        int ndev=XT(issue)(layer,xb,rows,K,ib,taken);   /* returns at once; 0 = nothing on the device */
         if(g_prof){ g_vkb_issue+=now_s()-t0; g_vkb_blocks++; }
         memset(seen,0,(size_t)E); memset(on2,0,(size_t)n);
         for(int i=0;i<n;i++) if(taken[i] && !seen[ib[i]]){ seen[ib[i]]=1; m->hits++; m->hit_vk++; if(g_prof) g_vkb_nvk++; }
         /* the second device: the pairs the tier did not take whose expert is in its
          * registry, one group (64 experts at most), issued on a worker thread */
+        int iss2_on=0;
+#ifdef COLI_VULKAN
         ColiVkTensor *g2[64],*u2[64],*d2[64]; int n2rows[64], ne2=0, tot2=0;
-        Vk2Iss iss2={0}; pthread_t iss2_th; int iss2_threaded=0, iss2_on=0;
+        Vk2Iss iss2={0}; pthread_t iss2_th; int iss2_threaded=0;
         if(dev2){
             int eo[64];
             for(int i=0;i<n && ne2<64;i++){ int e=ib[i];
@@ -6390,15 +6691,17 @@ static void moe_vk(Model *m,int layer,const float *x,int S,float *out,const int 
                 else iss2.rc=coli_vk_expert_group_issue2(g2,u2,d2,n2rows,ne2,x2);
             }
         }
+#endif
         for(int i=0;i<n;i++) want[i] = ib[i]>=0 && !taken[i] && !on2[i];
         if(g_prof) for(int i=0;i<n;i++) if(want[i]) g_vkb_ncpu++;
         vk_cpu_pairs(m,layer,xb,rows,K,ib,want,ctb,xg,gg,uu,hh,1);   /* while the batches run */
         double tj=now_s();
-        if(ndev && !vkt_join(dev)){                /* the batch failed (the tier stops): those pairs here */
+        if(ndev && !XT(join)(dev)){                /* the batch failed (the tier stops): those pairs here */
             vk_cpu_pairs(m,layer,xb,rows,K,ib,taken,ctb,xg,gg,uu,hh,0);
             memset(taken,0,(size_t)n);
         }
         if(g_prof) m->t_egpu+=now_s()-tj;
+#ifdef COLI_VULKAN
         if(iss2_on){
             if(iss2_threaded){ double t_j0=now_s(); pthread_join(iss2_th,NULL);
                 if(g_prof){ g_vkb_join+=now_s()-t_j0; g_vkb_wrk+=iss2.dt; } }
@@ -6407,6 +6710,8 @@ static void moe_vk(Model *m,int layer,const float *x,int S,float *out,const int 
                 memset(on2,0,(size_t)n);
             }
         }
+#endif
+        (void)iss2_on;
         /* every rank of every row in routing order, wherever it was computed */
         for(int s=0;s<rows;s++){
             float *os=out+(int64_t)(s0+s)*D;
@@ -6516,6 +6821,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     if(!pre_routed)
     for(int s=0;s<S;s++){
         float *logit=logits_all+(int64_t)s*E;
+        if(c->softmax_router){   /* Mistral-Large-4: a softmax over the experts, no bias in the choice */
+            float mx=logit[0]; for(int e=1;e<E;e++) if(logit[e]>mx) mx=logit[e];
+            float tot=0; for(int e=0;e<E;e++){ logit[e]=expf(logit[e]-mx); tot+=logit[e]; }
+            for(int e=0;e<E;e++){ logit[e]/=tot; choice[e]=logit[e]; }
+        } else
         for(int e=0;e<E;e++){ logit[e]=sigmoidf(logit[e]); choice[e]=logit[e]+l->router_bias[e]; }
         int *idx=idxs+(int64_t)s*K; float *w=ws+(int64_t)s*K;
         int Ksel = g_topk>0 ? (g_topk<K?g_topk:K) : K;
@@ -6873,8 +7183,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     float *group_weight=group_enabled?xalloc((size_t)64*S*sizeof(float),"moe group_weight"):NULL;
 #endif
     int vk_active = 0; (void)vk_active;
-#ifdef COLI_VULKAN
-    /* COLI_VULKAN=1 with an expert tier (vk_tier.c, or COLI_VK_DEV2's registry):
+#ifdef COLI_XT
+    /* COLI_VULKAN=1 with an expert tier (vk_tier.c, or COLI_VK_DEV2's registry), or a GGUF's on CUDA:
      * moe_vk() takes this call's routed experts, by blocks of rows, in place of the
      * loop below; the shared expert stays in FASE E. Off, nothing here runs. */
     vk_active = moe_vk_on(m,layer);
@@ -7582,7 +7892,7 @@ static void la_predict(Model *m, int target, const float *h, int kind){
         rmsnorm(nrm, hc, l->post_ln, D, c->eps);
         free(snrm); free(sg); free(su); free(sout); free(hc);
         matmul(ch, nrm, l->router, 1, D, E);
-        for(int e=0;e<E;e++) ch[e] = sigmoidf(ch[e]) + l->router_bias[e];
+        if(!c->softmax_router) for(int e=0;e<E;e++) ch[e] = sigmoidf(ch[e]) + l->router_bias[e];   /* softmax: the logits rank alike */
         int *pred = la_pred[2][target];
         for(int kk=0;kk<K;kk++){ int best=-1; float bv=-1e30f;
             for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(pred[j]==e){tk=1;break;}
@@ -7596,7 +7906,7 @@ static void la_predict(Model *m, int target, const float *h, int kind){
     /* Baseline kinds 0 and 1: pure router on the given state */
     rmsnorm(nrm,h,l->post_ln,D,c->eps);
     matmul(ch,nrm,l->router,1,D,E);
-    for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
+    if(!c->softmax_router) for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
     int *pred=la_pred[kind][target];
     for(int kk=0;kk<K;kk++){ int best=-1; float bv=-1e30f;
         for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(pred[j]==e){tk=1;break;}
@@ -7652,7 +7962,7 @@ static void pilot_realload(Model *m, int layer, int eid){
          * hotter than the speculation by tier_pick_lfru's 25%+4-freq hysteresis; the
          * un-narrowed #474 test dropped ~all speculations on a full cache (#490).
          * Skips free slots (eid==-1). Cache placement only -> output unchanged. */
-        if(g_pilot_evict_guard && m->eheat && m->elast && Sl[slot].eid>=0 && !vkt_ram_first(layer,Sl[slot].eid)){
+        if(g_pilot_evict_guard && m->eheat && m->elast && Sl[slot].eid>=0 && !XT(ram_first)(layer,Sl[slot].eid)){
             int vid=Sl[slot].eid; uint32_t vh=m->eheat[layer][vid];
             if(vh>=2){
                 uint64_t vs=tier_lfru_score(vh,m->elast[layer][vid],m->eaccess_clock);
@@ -7722,7 +8032,7 @@ static void pilot_uring_batch(Model *m){
         if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); pthread_mutex_unlock(&g_pilot_mx); continue; }
         /* LFRU eviction guard (#441, narrowed by #497): protect only a genuinely WARM
          * resident (>=2 accesses) that is clearly hotter (see pilot_realload) */
-        if(g_pilot_evict_guard && m->eheat && m->elast && Sl[slot].eid>=0 && !vkt_ram_first(layer,Sl[slot].eid)){
+        if(g_pilot_evict_guard && m->eheat && m->elast && Sl[slot].eid>=0 && !XT(ram_first)(layer,Sl[slot].eid)){
             int vid=Sl[slot].eid; uint32_t vh=m->eheat[layer][vid];
             if(vh>=2){
                 uint64_t vs=tier_lfru_score(vh,m->elast[layer][vid],m->eaccess_clock);
@@ -7932,7 +8242,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
             rmsnorm(nrm, xs, l->post_ln, D, c->eps);
         }
         matmul(ch, nrm, l->router, 1, D, E);
-        for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
+        if(!c->softmax_router) for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
         for(int kk=0;kk<K;kk++){
             int best=0; for(int e=1;e<E;e++) if(ch[e]>ch[best]) best=e;
             ch[best]=-2e30f;
@@ -8274,6 +8584,7 @@ static void layers_forward_rows_range(Model *m, float *x, int S, int pos_base,
 #endif
     double tl0=now_s();
     for(int i=layer_begin;i<layer_end;i++){
+        if(coli_prompt_break()) break;   /* a served prompt's STOP or CANCEL (mux_submit): step() leaves */
         /* progresso su stderr per i batch grossi (prefill): il primo byte di risposta
          * puo' arrivare dopo MINUTI di streaming — al buio sembra un blocco. */
         if(S>=8 && (i%4==0 || i==layer_end-1))
@@ -8441,6 +8752,71 @@ static void dump_logits(const float *lo, int64_t n){
 }
 #define DUMP_LOGITS(lo,n) dump_logits((lo),(n))
 static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int pos_base);
+/* ---- Mistral-Large-4's pictures (mistral_vision.h) ---------------------------------------
+ * A SUBMIT that follows an IMAGE frame runs the tower on its patches; the rows replace the
+ * embeddings at the prompt's [IMG] positions while that prompt's prefill runs (g_vis_map: an
+ * absolute position to its row, -1 none), then they go. */
+static MistralVision g_mlv;
+#ifdef COLI_VULKAN
+static int g_mlv_vk_keep; static size_t g_mlv_bytes;
+/* The tower's products on the Vulkan device, its matrices as the mmproj has them (bf16, f16,
+ * f32). ML4_VISION_GPU: unset or 1 = each matrix up for its products and freed after (the
+ * tier keeps the device's memory), keep = resident after a first picture (the tier leaves
+ * room for it, g_mlv_bytes), 0 = the CPU. Mistral-Large-4 UD-IQ1_S on an RTX PRO 4000, a
+ * picture of 384 patches: the CPU 5.07 s, up and freed 3.61, kept 1.07 after a first 4.44
+ * (the 210 uploads and allocations are the cost: 3.4 GB at 1.1 GB/s). */
+static int mlv_vk_mm(MvMat *w, float *y, const float *x, int S){
+    if(!g_vulkan) return 0;
+    const int fmt = w->type==GQ_BF16 ? 11 : w->type==GQ_F16 ? 14 : w->type==GQ_F32 ? 10 : 0;
+    if(!fmt) return 0;
+    int ok=coli_vk_matmul((ColiVkTensor **)&w->dev,y,x,w->data,NULL,fmt,S,w->I,w->O,0);
+    if(!g_mlv_vk_keep && w->dev){ coli_vk_tensor_free((ColiVkTensor *)w->dev); w->dev=NULL; }
+    return ok;
+}
+#endif
+static struct { float *patches; unsigned long long bytes; int gh, gw, present; } g_mlv_pending;
+static float *g_vis_rows; static int *g_vis_map, g_vis_map_len;
+static void vis_apply(Model *m, float *x, int S, int pos_base){
+    if(!g_vis_map) return;
+    const int D=m->c.hidden;
+    for(int s=0;s<S;s++){
+        int p=pos_base+s;
+        if(p>=0 && p<g_vis_map_len && g_vis_map[p]>=0)
+            memcpy(x+(int64_t)s*D, g_vis_rows+(int64_t)g_vis_map[p]*D, (size_t)D*sizeof(float));
+    }
+}
+static void vis_clear(void){ free(g_vis_rows); free(g_vis_map); g_vis_rows=NULL; g_vis_map=NULL; g_vis_map_len=0; }
+static void mlv_pending_clear(void){ free(g_mlv_pending.patches); memset(&g_mlv_pending,0,sizeof g_mlv_pending); }
+/* The pending picture over prompt ids[0, n): its [IMG] tokens take the tower's rows in order
+ * (rows of [IMG]s, each closed by [IMG_BREAK], the last by [IMG_END]). *first: the first [IMG]
+ * position. 0, or -1 with the reason on stderr. */
+static int mlv_attach(Model *m, Tok *T, const int *ids, int n, int *first){
+    *first=-1;
+    if(!g_mlv.ready){ fprintf(stderr,"[ml4] a picture, but no vision tower is loaded (an mmproj linked, ML4_VISION unset)\n"); return -1; }
+    const int gh=g_mlv_pending.gh, gw=g_mlv_pending.gw, mg=g_mlv.merge, pd=g_mlv.in_ch*g_mlv.patch*g_mlv.patch;
+    if(gh%mg || gw%mg || g_mlv_pending.bytes!=(unsigned long long)gh*gw*pd*sizeof(float)){
+        fprintf(stderr,"[ml4] picture of %d x %d patches: %llu bytes, %llu expected\n",gh,gw,g_mlv_pending.bytes,
+                (unsigned long long)gh*gw*pd*sizeof(float));
+        return -1;
+    }
+    const int img=tok_id_of(T,"[IMG]"), rows=(gh/mg)*(gw/mg);
+    int slots=0;
+    for(int i=0;i<n;i++) if(ids[i]==img){ if(*first<0) *first=i; slots++; }
+    if(img<0 || slots!=rows){
+        fprintf(stderr,"[ml4] the prompt has %d [IMG] tokens, the picture %d rows\n",slots,rows); return -1; }
+    vis_clear();
+    g_vis_rows=malloc((size_t)rows*m->c.hidden*sizeof(float)); g_vis_map=malloc((size_t)n*sizeof(int));
+    if(!g_vis_rows || !g_vis_map){ vis_clear(); return -1; }
+    double t0=now_s();
+    if(mistral_vision_forward(&g_mlv,g_mlv_pending.patches,gh,gw,g_vis_rows)!=rows){ vis_clear(); return -1; }
+    fprintf(stderr,"[ml4] picture: %d x %d patches, %d rows, the tower %.2f s\n",gh,gw,rows,now_s()-t0);
+    const char *dump=getenv("ML4_VIS_DUMP");   /* the rows, raw f32, for a check against tools/mistral_vision_ref.py */
+    if(dump && *dump){ FILE *f=fopen(dump,"wb"); if(f){ fwrite(g_vis_rows,sizeof(float),(size_t)rows*m->c.hidden,f); fclose(f); } }
+    for(int i=0,k=0;i<n;i++) g_vis_map[i]=ids[i]==img ? k++ : -1;
+    g_vis_map_len=n;
+    return 0;
+}
+
 static float *step(Model *m, const int *ids, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
     /* Chunked prefill (COLI_PREFILL_CHUNK=N): run a long prompt through the
@@ -8460,20 +8836,27 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
         while(S-done>chunk){
             float *cx=falloc((int64_t)chunk*D);
             for(int s=0;s<chunk;s++) embed_row(m, ids[done+s], cx+(int64_t)s*D);
+            vis_apply(m,cx,chunk,pos_base+done);
             layers_forward(m,cx,chunk,pos_base+done);
             free(cx);
+            if(coli_prompt_broken()) return NULL;
             done+=chunk;
         }
         ids+=done; S-=done; pos_base+=done;
     }
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
+    vis_apply(m,x,S,pos_base);
     layers_forward(m,x,S,pos_base);
+    /* a served prompt stopped between two layers (mux_submit): the slot's length stays where it
+     * was, and the rows the stopped layers wrote are past it, a stale tail the next step writes
+     * over; the attention here is attention alone, so the prefix before them is still whole */
+    if(coli_prompt_broken()){ free(x); return NULL; }
     if(m->hlast) memcpy(m->hlast, x+(int64_t)(S-1)*D, D*sizeof(float));
     if(m->has_mtp && S>=2 && g_draft>0) mtp_absorb(m, ids+1, x, S-1, pos_base);
     float *last=falloc(D); rmsnorm(last, x+(int64_t)(S-1)*D, m->final_norm, D, c->eps);
     double th0=now_s();
-    float *logit=falloc(c->vocab); matmul_qt(logit,last,&m->lm_head,1);
+    float *logit=falloc(c->vocab); lm_logits(m,logit,last,1);
     m->t_head += now_s()-th0;
     DUMP_LOGITS(logit,c->vocab);
     free(x); free(last); return logit;
@@ -8484,12 +8867,13 @@ static float *step_all(Model *m, const int *ids, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
+    vis_apply(m,x,S,pos_base);
     layers_forward(m,x,S,pos_base);
     if(m->h_all) memcpy(m->h_all, x, (int64_t)S*D*sizeof(float));   /* hidden di TUTTE le pos (S<=512) */
     if(m->hlast) memcpy(m->hlast, x+(int64_t)(S-1)*D, D*sizeof(float));
     float *lo=falloc((int64_t)S*c->vocab), *row=falloc(D);
     for(int s=0;s<S;s++){ rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);
-        matmul_qt(lo+(int64_t)s*c->vocab, row, &m->lm_head, 1); }
+        lm_logits(m,lo+(int64_t)s*c->vocab, row,1); }
     DUMP_LOGITS(lo,(int64_t)S*c->vocab);
     free(x); free(row); return lo;
 }
@@ -8527,7 +8911,7 @@ static float *step_decode_batch(Model *m, const DecodeRow *rows, int S){
         rmsnorm(norm+(int64_t)s*D,x+(int64_t)s*D,m->final_norm,D,c->eps);
     double th0=now_s();
     float *logit=falloc((int64_t)S*c->vocab);
-    matmul_qt(logit,norm,&m->lm_head,S);
+    lm_logits(m,logit,norm,S);
     m->t_head+=now_s()-th0;
     free(x); free(norm);
     return logit;
@@ -8625,12 +9009,12 @@ static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft, float *p
         double n_eh=0; for(int d=0;d<D;d++) n_eh+=hx[d]*hx[d];
         int dbg = getenv("MTP_DEBUG") && atoi(getenv("MTP_DEBUG"))>=2;
         int t_pre=-1;
-        if(dbg){ rmsnorm(row, hx, m->mtp_norm, D, c->eps); matmul_qt(logit, row, &m->lm_head, 1);
+        if(dbg){ rmsnorm(row, hx, m->mtp_norm, D, c->eps); lm_logits(m,logit, row,1);
                  t_pre=mtp_argmax(logit, c->vocab); }
         layer_forward(m, &m->mtpL, li, hx, 1, pos, nrm, tmp);
         double n_post=0; for(int d=0;d<D;d++) n_post+=hx[d]*hx[d];
         rmsnorm(row, hx, m->mtp_norm, D, c->eps);
-        matmul_qt(logit, row, &m->lm_head, 1);
+        lm_logits(m,logit, row,1);
         int t2=mtp_argmax(logit, c->vocab);
         if(dbg) fprintf(stderr,"[mtp2] pos=%d in_tok=%d ||eh||=%.1f ||post||=%.1f pre_blk=%d post_blk=%d\n",
                         pos, tok, sqrt(n_eh), sqrt(n_post), t_pre, t2);
@@ -8696,7 +9080,7 @@ static int grammar_setup_text(GrDraft *g, Tok *T, char *txt, const char *label){
     if(gr_parse(&g->gram,txt)){ fprintf(stderr,"[GRAMMAR] %s: %s\n",label,g->gram.err); free(txt); return -1; }
     free(txt);
     gr_state_init(&g->st,&g->gram);
-    if(!g->st.alive){ fprintf(stderr,"[GRAMMAR] %s: grammar cannot be evaluated (left recursion?)\n",label); return -1; }
+    if(!g->st.alive){ fprintf(stderr,"[GRAMMAR] %s: grammar cannot be evaluated (left recursion, or alternates that fan out past the walker's budget)\n",label); return -1; }
     if(g->max<1) g->max=24;
     if(g->max>48) g->max=48;
     g->T=T; g->on=1; g->armed=0;
@@ -9061,7 +9445,7 @@ static int forward_all(Model *m, const int *ids, int S, int *pred, const int *re
     float *row=falloc(D);
     for(int s=0;s<S;s++){
         rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);   /* heap row (#183) */
-        matmul_qt(lo, row, &m->lm_head, 1);
+        lm_logits(m,lo, row,1);
         DUMP_LOGITS(lo,c->vocab);
         if(!oracle_logits_finite(lo,c->vocab)){
             fprintf(stderr,"[ORACLE] non-finite logits at teacher-forcing position %d\n",s);
@@ -9164,7 +9548,7 @@ static void run_score(Model *m, const char *snap, const char *path){
         double lp=0; int greedy=1;
         for(int pos=ctxlen-1; pos<T-1; pos++){
             rmsnorm(row, x+(int64_t)pos*D, m->final_norm, D, c->eps);
-            matmul_qt(lo,row,&m->lm_head,1);
+            lm_logits(m,lo,row,1);
             int am; lp += logprob_target(lo,c->vocab,ids[pos+1],&am); if(!am) greedy=0;
         }
         printf("%.6f %d %d\n", lp, contlen, greedy); fflush(stdout);
@@ -9895,7 +10279,7 @@ static int ablate_model_row_output(void *ctx, FILE *of, int64_t pos){
     if(ABLATE_MODEL_COMPUTE_ENABLED){
         rmsnorm(rows->row, rows->x+(int64_t)pos*rows->D,
                 m->final_norm, rows->D, c->eps);
-        matmul_qt(rows->lo, rows->row, &m->lm_head, 1);
+        lm_logits(m,rows->lo, rows->row,1);
     }
     return ablate_logit_record(of,rows->item,pos,rows->ids[pos+1],
                                rows->lo,rows->V);
@@ -10695,7 +11079,10 @@ static void repin_pass_limit(Model *m,int limit){
  * alternative di una sola. Con uno scatto solo si e costretti a scegliere, e
  * l'altro livello lo si ripaga ogni volta. Vedi pin_pool.h. */
 typedef struct { KVState kv; int *hist, len, first;
-                 ColiPinPool pins; } ServeCtx;
+                 ColiPinPool pins;
+                 int vis_end;     /* the first position of a picture this slot's KV holds, plus one (0: none):
+                                   * no later prompt reuses the rows from there on */
+                 } ServeCtx;
 static double kv_pool_bytes(Model *m, int max_ctx);
 static double kvb_transient_bytes(Model *m, int max_ctx);
 
@@ -10818,6 +11205,7 @@ static float *mux_prefill_echo(Model *m, Tok *T, unsigned long long id,
     int add=nt-from;
     float *x=falloc((int64_t)add*D);
     for(int s=0;s<add;s++) embed_row(m, ids[from+s], x+(int64_t)s*D);
+    vis_apply(m,x,add,from);
     layers_forward(m,x,add,from);
     if(m->hlast) memcpy(m->hlast, x+(int64_t)(add-1)*D, D*sizeof(float));
     if(m->has_mtp && add>=2 && g_draft>0) mtp_absorb(m, ids+from+1, x, add-1, from);  /* same as step() */
@@ -10829,11 +11217,11 @@ static float *mux_prefill_echo(Model *m, Tok *T, unsigned long long id,
     double th0=now_s();
     for(int pos=from+1; pos<nt; pos++){
         rmsnorm(row, x+(int64_t)(pos-1-from)*D, m->final_norm, D, c->eps);
-        matmul_qt(lo, row, &m->lm_head, 1);
+        lm_logits(m,lo, row,1);
         mux_echo(T,id,pos,ids[pos],lo,V,topk);
     }
     rmsnorm(row, x+(int64_t)(add-1)*D, m->final_norm, D, c->eps);
-    matmul_qt(lo, row, &m->lm_head, 1);
+    lm_logits(m,lo, row,1);
     m->t_head += now_s()-th0;
     free(x); free(row);
     return lo;                           /* last position: the generation continuation */
@@ -10978,7 +11366,7 @@ static void coli_kv_share_adopt_rows(Cfg *cc, KVState *sc, KVState *dn,
             memcpy(coli_kv_row(sc->Rc[l],from,cc->qk_rope),
                    coli_kv_row(dn->Rc[l],from,cc->qk_rope),
                    (size_t)n*cc->qk_rope*sizeof(float));
-        if(sc->Ic&&dn->Ic&&sc->Ic[l]&&dn->Ic[l])
+        if(l<cc->n_layers&&sc->Ic&&dn->Ic&&sc->Ic[l]&&dn->Ic[l])   /* Ic has no MTP row (kv_alloc) */
             memcpy(coli_kv_row(sc->Ic[l],from,cc->index_hd),
                    coli_kv_row(dn->Ic[l],from,cc->index_hd),
                    (size_t)n*cc->index_hd*sizeof(float));
@@ -11006,14 +11394,102 @@ static void coli_kv_share_adopt_rows(Cfg *cc, KVState *sc, KVState *dn,
     memcpy(sc_hist+from,dn_hist+from,(size_t)n*sizeof(int));
 }
 
+/* A short request between two turns of the one slot's conversation (park.h): a client's title
+ * or summary request leaves the conversation after a few tokens, and its rows would take the
+ * slot's from there on; the conversation's next turn then read it all again (minutes on the
+ * largest models). The slot's first rows of every KV array (the latent and rope rows, the DSA
+ * index keys, the coded rows and their scales, the MTP layer's), its tokens and its layers'
+ * first rows go aside before the request reads its prompt; the next request finds them back,
+ * and the devices' copies go up again from the host, whose rows stay the canonical ones. One
+ * slot only (KV_SLOTS=1), never under a cluster (its workers hold their layers' rows), a
+ * picture or a read-out. */
+#define GLM_PARK_SPEC 16   /* the rows a speculative turn writes past the tokens that stand */
+static ColiPark g_glm_park;
+static int g_glm_park_from;   /* the request's shared prefix: the KV file's rows past it are the request's */
+static ColiParkPart *glm_park_parts(Model *m, KVState *k, int *n_out){
+    Cfg *cc=&m->c; int NR=cc->n_layers+1, T=k->max_t, n=0;
+    ColiParkPart *p=malloc(sizeof(ColiParkPart)*((size_t)NR*7+1));
+    if(!p){ *n_out=0; return NULL; }
+    for(int l=0;l<NR;l++){
+        p[n++]=coli_park_rows(k->Lc?k->Lc[l]:NULL,(size_t)cc->kv_lora*sizeof(float),T);
+        p[n++]=coli_park_rows(k->Rc?k->Rc[l]:NULL,(size_t)cc->qk_rope*sizeof(float),T);
+        p[n++]=coli_park_rows(k->Ic&&l<cc->n_layers?k->Ic[l]:NULL,(size_t)cc->index_hd*sizeof(float),T);   /* no MTP row: Ic has n_layers */
+        if(kv_coded()){
+            p[n++]=coli_park_rows(k->Lc8?k->Lc8[l]:NULL,(size_t)kv_lrow_bytes(cc->kv_lora),T);
+            p[n++]=coli_park_rows(k->Rc8?k->Rc8[l]:NULL,(size_t)kv_rrow_bytes(cc->qk_rope),T);
+            if(!g_kv16){
+                int nsl=g_kv8?coli_kv8_nscale(cc->kv_lora,g_kv8_gs):1;
+                p[n++]=coli_park_rows(k->Lsc?k->Lsc[l]:NULL,(size_t)nsl*sizeof(float),T);
+                p[n++]=coli_park_rows(k->Rsc?k->Rsc[l]:NULL,sizeof(float),T);
+            }
+        }
+    }
+    p[n++]=coli_park_whole(k->kv_start,(size_t)NR*sizeof(int));
+    *n_out=n;
+    return p;
+}
+static void glm_park(Model *m, ServeCtx *sc, int nt, int max_tokens, int prefix, int maxctx){
+    kv_prefix v={sc->hist,sc->len,maxctx,0};
+    int n=coli_park_rows_for(&g_glm_park,&v,sc->len,nt,max_tokens,GLM_PARK_SPEC), np=0;
+    if(!n) return;
+    ColiParkPart *p=glm_park_parts(m,&sc->kv,&np);
+    if(p && coli_park_save(&g_glm_park,&v,sc->len,p,np,n)) g_glm_park_from=prefix;
+    free(p);
+}
+static void glm_unpark(Model *m, ServeCtx *sc, int maxctx){
+    if(!g_glm_park.on) return;
+    int np=0, len=sc->len;
+    ColiParkPart *p=glm_park_parts(m,&sc->kv,&np);
+    if(!p){ coli_park_free(&g_glm_park); return; }
+    kv_prefix v={sc->hist,sc->len,maxctx,0};
+    if(coli_park_restore(&g_glm_park,&v,&len,sc->len,GLM_PARK_SPEC,p,np)){
+        sc->len=len; sc->first=0;
+        /* the host's rows from 0 are the conversation's again: every device copy goes up again */
+        if(m->kv==&sc->kv && m->kv_dev_valid) for(int i=0;i<m->c.n_layers+1;i++) m->kv_dev_valid[i]=0;
+#ifdef COLI_VULKAN
+        if(m->kv==&sc->kv && m->vk_kv_valid) for(int i=0;i<m->c.n_layers+1;i++) m->vk_kv_valid[i]=0;
+        glmc_host_rows(m,&sc->kv,0);
+#endif
+        kv_disk_truncate(m,g_glm_park_from);   /* the next append writes the conversation's rows past it */
+    }
+    free(p);
+}
+
 /* Read and prefill one request. Returns -1 on EOF, 0 for a rejected frame and
  * 1 for an accepted request. Prefill deliberately remains serial: continuous
  * batching starts at decode, where every active slot contributes one row. */
+/* A lone slot's prompt reads its STOP or CANCEL between two layers (prompt_break.h) through
+ * mux_ctl_poll, the reader its speculative turn uses between tokens: control 1 CANCEL, 2 STOP.
+ * With several slots the loop reads stdin between steps, for every slot. */
+static int glm_prompt_poll(ColiPromptBreak *b){
+    mux_ctl_poll(*(const unsigned long long *)b->ctx);
+    if(g_mux_cancel) b->control=1; else if(g_mux_stop) b->control=2;
+    return b->control;
+}
+
 static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *grd,
                       int nctx, int maxctx, int eos){
     char *line=NULL; size_t cap=0; ssize_t nr=getline(&line,&cap,stdin);
     if(nr<0){ free(line); return -1; }
     if(nr && line[nr-1]=='\n') line[--nr]=0;
+    if(!strncmp(line,"IMAGE ",6)){
+        /* IMAGE <id> <bytes> <grid_h> <grid_w>, the patches and a newline: kept for the SUBMIT
+         * that follows. The payload is read whatever happens next (left in the stream it would
+         * be the next frame's header); a header that does not say how long it is ends the session. */
+        unsigned long long iid=0, bytes=0; int gh=0, gw=0;
+        if(sscanf(line+6,"%llu %llu %d %d",&iid,&bytes,&gh,&gw)!=4 || bytes>(1ull<<30) || gh<1 || gw<1){
+            printf("ERROR %llu BAD_IMAGE\n",iid); fflush(stdout); free(line); return -1; }
+        unsigned char *buf=malloc((size_t)bytes+1);
+        if(!buf){ printf("ERROR %llu BAD_IMAGE\n",iid); fflush(stdout); free(line); return -1; }
+        if(bytes && fread(buf,1,(size_t)bytes,stdin)!=(size_t)bytes){ free(buf); free(line); return -1; }
+        int t=fgetc(stdin); if(t=='\r') t=fgetc(stdin);
+        if(t!='\n'){ free(buf); free(line); return -1; }
+        if(g_mlv_pending.present) fprintf(stderr,"[ml4] a second picture came before its SUBMIT; the first is dropped\n");
+        mlv_pending_clear();
+        g_mlv_pending.patches=(float*)buf; g_mlv_pending.bytes=bytes;
+        g_mlv_pending.gh=gh; g_mlv_pending.gw=gw; g_mlv_pending.present=1;
+        free(line); return 0;
+    }
     if(!strncmp(line,"STOP ",5)){
         unsigned long long id=0; char tail;
         if(sscanf(line+5,"%llu %c",&id,&tail)!=1 || id==0){
@@ -11039,7 +11515,24 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
         printf("ERROR %llu NOT_FOUND\n",id); fflush(stdout); free(line); return 0;
     }
     ColiSubmit sub; int valid=coli_submit_parse(line,&sub);
-    if(!valid){ printf("ERROR 0 BAD_REQUEST\n"); fflush(stdout); free(line); return 0; }
+    if(!valid){
+        /* A header this engine cannot read (an extension key where it reads the grammar's byte
+         * count, a field out of range): when its id and its payload's length are readable the
+         * request is answered by its id and the payload drained, so the gateway ends that
+         * request instead of waiting for it, and the payload is not read as commands. */
+        unsigned long long bid=0, bb=0; int bslot=0;
+        if(sscanf(line,"SUBMIT %llu %d %llu",&bid,&bslot,&bb)==3 && bid && bb<=(1ull<<30)){
+            char tmp[4096];
+            for(unsigned long long left=bb; left; ){
+                size_t k=left<sizeof tmp?(size_t)left:sizeof tmp;
+                if(fread(tmp,1,k,stdin)!=k){ free(line); return -1; }
+                left-=k;
+            }
+            (void)fgetc(stdin);   /* the payload's newline */
+            printf("ERROR %llu BAD_REQUEST\n",bid);
+        } else printf("ERROR 0 BAD_REQUEST\n");
+        fflush(stdout); free(line); return 0;
+    }
     char *raw=malloc((size_t)sub.bytes+1);
     if(!raw){ fprintf(stderr,"OOM multiplex payload\n"); exit(1); }
     if(fread(raw,1,(size_t)sub.bytes,stdin)!=(size_t)sub.bytes){ free(raw); free(line); return -1; }
@@ -11085,6 +11578,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
         }
     }
     ServeCtx *sc=&ctx[sub.slot]; kv_bind(m,&sc->kv);
+    if(nctx==1) glm_unpark(m,sc,maxctx);   /* a conversation the last request parked: back first */
     int *tmp=malloc(maxctx*sizeof(int));
     if(!tmp){ fprintf(stderr,"OOM mux_submit tmp\n"); free(raw); free(line); exit(1); }
     /* Encode with one token of headroom (maxctx-1, buffer is maxctx) purely to DETECT overflow:
@@ -11118,6 +11612,12 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
                 nt,maxctx-2,maxctx);
         printf("ERROR %llu CONTEXT_EXCEEDED %d %d\n",sub.id,nt,maxctx-2);
         fflush(stdout); return 0;
+    }
+    int vis_first=-1;   /* the prompt's first [IMG], when an IMAGE frame came before it */
+    if(g_mlv_pending.present){
+        int bad=mlv_attach(m,T,tmp,nt,&vis_first);
+        mlv_pending_clear();
+        if(bad<0){ free(tmp); printf("ERROR %llu BAD_IMAGE\n",sub.id); fflush(stdout); return 0; }
     }
     /* #597: the submission is valid (encoded, non-empty, fits the context). Announce it before
      * prefill so the gateway commits the streaming 200 only now. Every failure above returned
@@ -11160,6 +11660,12 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
         if(pin_len>0 && pin_len<=prefix){ prefix=pin_len; coli_pin_touch(&sc->pins,pin_slot); }
         else prefix=0;
     }
+    /* a picture's rows are never reused: not this prompt's, not one the slot's KV still holds
+     * (the same [IMG] tokens may stand for another picture) */
+    if(vis_first>=0 && prefix>vis_first) prefix=vis_first;
+    if(sc->vis_end>0 && prefix>sc->vis_end-1) prefix=sc->vis_end-1;
+    if(nctx==1 && !echo && vis_first<0 && sc->vis_end==0 && !g_cluster_n && prefix<sc->len)
+        glm_park(m,sc,nt,sub.max_tokens,prefix,maxctx);   /* a short request keeps the conversation (glm_unpark) */
     if(prefix<sc->len){ sc->len=prefix; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
         kv_disk_truncate(m,sc->len); }
     /* Cross-slot prefix adoption (COLI_KV_SHARE=1): if another slot's history
@@ -11173,6 +11679,8 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
             if(i==sub.slot) continue;
             ServeCtx *dc2=&ctx[i];
             int lim=dc2->len<nt?dc2->len:nt, p=0;
+            if(dc2->vis_end>0 && lim>dc2->vis_end-1) lim=dc2->vis_end-1;   /* a picture's rows stay its slot's */
+            if(vis_first>=0 && lim>vis_first) lim=vis_first;
             while(p<lim && dc2->hist[p]==tmp[p]) p++;
             if(p>blen){ blen=p; best=i; }
         }
@@ -11195,11 +11703,29 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     if(add>0) memcpy(sc->hist+sc->len,tmp+sc->len,(size_t)add*sizeof(int));
     fprintf(stderr,"[API] KV slot %d prefix %d/%d token, prefill %d\n",sub.slot,sc->len,nt,add);
     free(tmp);
+    unsigned long long brk_id=sub.id;
+    ColiPromptBreak brk={.poll=glm_prompt_poll,.ctx=&brk_id};
+    int breakable=!echo && nctx==1 && add>0;
+    if(breakable){ g_mux_stop=0; g_mux_cancel=0; g_coli_prompt_break=&brk; }
     float *logit = echo ? mux_prefill_echo(m,T,sub.id,sc->hist,nt,sub.logprobs,
                                           echo_pin?prefix:0,
                                           echo_pin?pin_lo:NULL)
                         : add>0 ? step(m,sc->hist+sc->len,add,sc->len)
                                 : step(m,sc->hist+sc->len-1,1,sc->len-1);
+    g_coli_prompt_break=NULL;
+    if(g_vis_map){ vis_clear(); sc->vis_end=vis_first+1; }   /* the picture is in the KV now, from vis_first */
+    if(brk.control){
+        /* stopped while reading: the slot keeps the conversation it held before this prompt */
+        g_mux_stop=0; g_mux_cancel=0;
+        free(logit);
+        coli_prompt_break_log(brk.control==1,sc->len,nt);
+        if(brk.control==1){ printf("ERROR %llu CANCELLED\n",sub.id); fflush(stdout); return 0; }
+        ServeReq *r=&req[sub.slot]; memset(r,0,sizeof(*r));
+        r->id=sub.id; r->prompt_tokens=nt; r->started=now_s(); r->hits0=m->hits; r->miss0=m->miss;
+        prof_base(m,&r->pb);
+        mux_done(m,sc,r);
+        return 1;
+    }
     sc->len+=add; sc->first=0;
     if(sub.pin && logit){
         coli_pin_pool_init(&sc->pins,m->c.vocab);
@@ -11271,7 +11797,8 @@ static void run_serve_mux(Model *m, const char *snap){
 #endif
     setvbuf(stdin,NULL,_IONBF,0);
     intr_install();                      /* Ctrl-C = chiudi i turni in volo, non il processo */
-    printf("\x01\x01READY\x01\x01\nSTAT 0 0.00 0.0 %.2f\n",rss_gb()); fflush(stdout);
+    /* CAPS vision=: Mistral-Large-4's tower loaded (a linked mmproj), the gateway's word for image input */
+    printf("\x01\x01READY\x01\x01\nCAPS vision=%d\nSTAT 0 0.00 0.0 %.2f\n",g_mlv.ready?1:0,rss_gb()); fflush(stdout);
     hwinfo_emit(m);
     tiers_emit(m);
     emap_emit(m);
@@ -11689,6 +12216,8 @@ static void vk_dense_preload(Model *m){
     if(nt) fprintf(stderr,"[VK] dense preloaded: %d tensors, %.2f GB VRAM in %.1fs\n",
                    nt,bytes/1e9,now_s()-t0);
 }
+#endif
+#ifdef COLI_XT   /* the tier's experts on Vulkan or CUDA */
 
 /* ---- COLI_VULKAN=1: the routed experts' places on the device, at startup ----------
  * vk_tier_start describes the routed experts to the shared tier (vk_tier.c) and warms
@@ -11746,8 +12275,8 @@ static void vk_ram_given(void *ctx,size_t bytes){
     for(int i=0;i<=c->n_layers;i++) if(cap<m->ecn[i]) cap=m->ecn[i];   /* slots filled already stay */
     if(cap>m->ecap) cap=m->ecap;
     m->ecap=cap;
-    fprintf(stderr,"[VK] colibri: the tier's host pool took %.1f GiB of the RAM the expert LRU was sized from: %d slots a layer, not %d\n",
-            bytes/1073741824.0,cap,was);
+    fprintf(stderr,"%s colibri: the tier's host pool took %.1f GiB of the RAM the expert LRU was sized from: %d slots a layer, not %d\n",
+            XT_TAG,bytes/1073741824.0,cap,was);
 }
 /* The tier's streaming (a big prompt chunk's cold experts on the device): a group of
  * experts as vk_cpu_pairs resolves them -- the pin set, the LRU, the misses read into
@@ -11806,20 +12335,62 @@ static void vk_tmp_slot_free(ESlot *t,int rtq){
     memset(t,0,sizeof(*t)); t->eid=-1;
 }
 static Model *g_vk_model;                    /* the run's report at exit */
+#ifdef COLI_CUDA
+static void colibri_cu_report(void){ cud_report("colibri"); }
+#endif
 static void vk_tier_report_run(void){
-    if(g_vk_model) vkt_report("run",g_vk_model->hit_pin+g_vk_model->hit_ecache,g_vk_model->miss);
+    if(g_vk_model) XT(report)("run",g_vk_model->hit_pin+g_vk_model->hit_ecache,g_vk_model->miss);
 }
-static void vk_tier_turn(Model *m){ vkt_report("turn",m->hit_pin+m->hit_ecache,m->miss); }
+static void vk_tier_turn(Model *m){ XT(report)("turn",m->hit_pin+m->hit_ecache,m->miss); }
 static int vk_tier_resident_count(Model *m){
-    int n=0; if(!vkt_ready()) return 0;
-    for(int i=0;i<m->c.n_layers;i++) for(int e=0;e<m->c.n_experts;e++) n+=vkt_resident(i,e);
+    int n=0; if(!XT(ready)()) return 0;
+    for(int i=0;i<m->c.n_layers;i++) for(int e=0;e<m->c.n_experts;e++) n+=XT(resident)(i,e);
     return n;
+}
+#ifdef COLI_CUDA
+static void vk_tier_start(Model *m);
+/* A GGUF under COLI_CUDA=1 with no Vulkan device (COLI_VULKAN=0, or a build that hands the
+ * GGUF to Vulkan only when it was not asked): the old CUDA path takes none of its blocks, so
+ * the routed experts go to the shared tier on the CUDA device (cu_tier.h through xtier.h) and
+ * the resident dense matrices to it as far as their budget goes (cu_dense.h); the attention
+ * stays the CPU's. Containers keep the old path. */
+static void colibri_cu_tier_start(Model *m){
+    if(!g_cuda_enabled || g_vulkan || m->c.n_experts<1 || !cut_wanted()) return;
+    int gguf=0;
+    for(int l=0;l<m->c.n_layers && !gguf;l++) if(m->L[l].sparse){
+        char gn[288]; snprintf(gn,sizeof gn,"model.layers.%d.mlp.experts.0.gate_proj.weight",l);
+        st_tensor *g0=st_find(&m->S,gn); gguf = g0 && st_is_ggml(g0->dtype); break; }
+    if(!gguf) return;
+    xt_use_cuda(1);
+    g_cl_cud=cud_open("colibri",coli_cuda_device_at(0),g_cud_dense_bytes);   /* the tier leaves it room */
+    vk_tier_start(m);
+    if(!cut_ready()){ xt_use_cuda(0); g_cud.on=0; return; }
+    atexit(colibri_cu_report);
+}
+#endif
+/* a block format's elements on the tier's device, 0 when it does not take it */
+static int xt_block_elems(int fmt){
+#ifdef COLI_CUDA
+    if(xt_cuda()) return coli_cuda_block_elems(fmt);
+#endif
+#ifdef COLI_VULKAN
+    return coli_vk_block_elems(fmt);
+#else
+    return 0;
+#endif
+}
+/* the tier's device shares the RAM (an iGPU): CUDA's never does here */
+static int xt_shares_ram(void){
+#ifdef COLI_VULKAN
+    if(!xt_cuda()) return coli_vk_device_shares_ram();
+#endif
+    return 0;
 }
 static void vk_tier_start(Model *m){
     Cfg *c=&m->c; int E=c->n_experts, NL=c->n_layers;
-    if(!g_vulkan || E<=0 || g_vk_experts==0 || !vkt_wanted()) return;
+    if(!(g_vulkan || xt_cuda()) || E<=0 || g_vk_experts==0 || !XT(wanted)()) return;
 #ifdef COLI_CUDA
-    if(g_cuda_enabled){ fprintf(stderr,"[VK] tier colibri: the CUDA expert tier is on and wins; the Vulkan tier stays off\n"); return; }
+    if(g_cuda_enabled && !xt_cuda()){ fprintf(stderr,"%s tier colibri: the CUDA expert tier is on and wins; the Vulkan tier stays off\n",XT_TAG); return; }
 #endif
     int pl=-1; for(int i=0;i<NL;i++) if(m->L[i].sparse){ pl=i; break; }
     if(pl<0) return;
@@ -11844,10 +12415,10 @@ static void vk_tier_start(Model *m){
             int t[3];
             for(int k=0;k<3;k++){ char nm[288]; snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.0.%s.weight",l,suf[k]);
                 st_tensor *tt=st_find(&m->S,nm); t[k]=tt&&st_is_ggml(tt->dtype)?st_ggml_type(tt->dtype):-1; }
-            const int bg=t[0]>=0?coli_vk_block_elems(100+t[0]):0, bd=t[2]>=0?coli_vk_block_elems(100+t[2]):0;
+            const int bg=t[0]>=0?xt_block_elems(100+t[0]):0, bd=t[2]>=0?xt_block_elems(100+t[2]):0;
             if(t[0]!=t[1] || !bg || !bd || c->hidden%bg || c->moe_inter%bd){
                 if(l<NL) no="a type without a device form, or gate and up of two types";
-                else { fprintf(stderr,"[VK] tier colibri: the MTP head's GGUF experts have no device form, they stay on the CPU\n");
+                else { fprintf(stderr,"%s tier colibri: the MTP head's GGUF experts have no device form, they stay on the CPU\n",XT_TAG);
                        g_vkt.gt[2*NL]=g_vkt.gt[2*NL+1]=-1; }
                 continue; }
             g_vkt.gt[2*l]=t[0]; g_vkt.gt[2*l+1]=t[2];
@@ -11859,12 +12430,12 @@ static void vk_tier_start(Model *m){
             forms+=!seen; if(nsame>bestn){ bestn=nsame; best=l; }
         }
         if(!no && forms>VKT_FORMS-1) no="more distinct types than the tier holds";
-        if(no){ fprintf(stderr,"[VK] tier colibri: the GGUF's experts: %s; the routed experts stay on the CPU\n",no);
+        if(no){ fprintf(stderr,"%s tier colibri: the GGUF's experts: %s; the routed experts stay on the CPU\n",XT_TAG,no);
                 free(lgu); free(ldn); free(g_vkt.gt); g_vkt.gt=NULL; return; }
         for(int l=0;l<NL;l++) if(!m->L[l].sparse){ lgu[l]=lgu[best]; ldn[l]=ldn[best]; }
         gu=lgu[best]; dn=ldn[best];
         int sparse=0; for(int l=0;l<NL;l++) sparse+=m->L[l].sparse;
-        fprintf(stderr,"[VK] tier colibri: the GGUF experts' blocks go to the device as the file has them (%s gate/up, %s down",
+        fprintf(stderr,"%s tier colibri: the GGUF experts' blocks go to the device as the file has them (%s gate/up, %s down",XT_TAG,
                 gq_type_name(g_vkt.gt[2*best]),gq_type_name(g_vkt.gt[2*best+1]));
         if(forms>1) fprintf(stderr," on %d of %d layers, the others their own types",bestn,sparse);
         fprintf(stderr,")\n");
@@ -11872,8 +12443,8 @@ static void vk_tier_start(Model *m){
         f[0]=f[1]=f[2]=QT_GGML; gs[0]=gs[1]=gs[2]=0;
     } else
     if(f[0]!=f[1] || gs[0]!=gs[1] || !vk_src_kind(f[0],gs[0],&gu) || !vk_src_kind(f[2],gs[2],&dn)){
-        fprintf(stderr,"[VK] tier colibri: experts in fmt %d/%d/%d (gate/up/down) have no device form "
-                "(int2, E8/IQ3 fmt=6 and fp8 stay on the CPU, gate and up must match), the routed experts stay on the CPU\n",f[0],f[1],f[2]);
+        fprintf(stderr,"%s tier colibri: experts in fmt %d/%d/%d (gate/up/down) have no device form "
+                "(int2, E8/IQ3 fmt=6 and fp8 stay on the CPU, gate and up must match), the routed experts stay on the CPU\n",XT_TAG,f[0],f[1],f[2]);
         return;
     }
     /* What the device still has to hold besides the experts: the absorb core's KV
@@ -11885,6 +12456,10 @@ static void vk_tier_start(Model *m){
      * for 23.6 GB on a 24 GB card and left the tier none); a longer conversation grows it
      * while there is room, and a layer that finds none computes its attention on the CPU. */
     double dense=0;
+#ifdef COLI_CUDA
+    if(xt_cuda()) dense+=(double)g_cl_cud;   /* cu_dense.h's budget, taken before the tier's */
+#endif
+#ifdef COLI_VULKAN   /* the absorb core's KV mirror, and a partial dense chain: Vulkan's */
     if(g_vk_attn){ int ctx=getenv("CTX")?atoi(getenv("CTX")):4096; if(ctx<1) ctx=4096;
         double mir=(double)(g_glmc_partial ? g_glmc_fit.n : NL)*ctx*(c->kv_lora+c->qk_rope)*4.0;
         const char *tr=getenv("COLI_VK_TIER_RESERVE_GB");
@@ -11899,6 +12474,8 @@ static void vk_tier_start(Model *m){
     /* a partial chain: nothing more of the trunk goes up, but the chain's first forward
      * allocates its scratch and the N layers' KV mirrors */
     if(g_glmc_partial) dense+=(double)g_glmc_lazy;
+    if(g_mlv_vk_keep) dense+=(double)g_mlv_bytes;   /* Mistral-Large-4's vision tower, kept on the device */
+#endif
     { const char *r=getenv("COLI_VK_RESERVE_GB"), *tr=getenv("COLI_VK_TIER_RESERVE_GB");
       if(r && *r){ double extra=atof(r)-(tr&&*tr?atof(tr):1.0); if(extra>0) dense+=extra*1073741824.0; } }
     /* The MTP head's layer (index NL): its experts as the container keeps them (int8
@@ -11907,7 +12484,7 @@ static void vk_tier_start(Model *m){
      * MTP head's layer on the tier"); COLI_VK_TIER_MTP=1 or 0 decides. */
     VktFmt xgu={VKT_SRC_NONE,0}, xdn={VKT_SRC_NONE,0}; int xf[3]={0,0,0}, xgs[3]={0,0,0};
     { const char *tm=getenv("COLI_VK_TIER_MTP");
-      int want = tm&&*tm ? *tm!='0' : !coli_vk_device_shares_ram();
+      int want = tm&&*tm ? *tm!='0' : !xt_shares_ram();
       if(m->has_mtp && want && gguf){
           if(g_vkt.gt[2*NL]>0){
               xgu=(VktFmt){(VktSrc)(VKT_SRC_GGML+g_vkt.gt[2*NL]),0}; xdn=(VktFmt){(VktSrc)(VKT_SRC_GGML+g_vkt.gt[2*NL+1]),0};
@@ -11916,7 +12493,7 @@ static void vk_tier_start(Model *m){
       } else if(m->has_mtp && want){
           for(int k=0;k<3;k++) xf[k]=vk_expert_fmt(m,NL,0,k,&xgs[k]);
           if(xf[0]!=xf[1] || xgs[0]!=xgs[1] || !vk_src_kind(xf[0],xgs[0],&xgu) || !vk_src_kind(xf[2],xgs[2],&xdn)){
-              fprintf(stderr,"[VK] tier colibri: the MTP head's experts in fmt %d/%d/%d have no device form, they stay on the CPU\n",
+              fprintf(stderr,"%s tier colibri: the MTP head's experts in fmt %d/%d/%d have no device form, they stay on the CPU\n",XT_TAG,
                       xf[0],xf[1],xf[2]);
               xgu.kind=VKT_SRC_NONE;
           }
@@ -11939,20 +12516,23 @@ static void vk_tier_start(Model *m){
                   .max_experts=g_vk_experts>0 ? g_vk_experts : 0,
                   .load=vk_load, .release=vk_unhold, .load_ctx=m, .load_batch=vk_load_batch,
                   .layer_gate_up=lgu, .layer_down=ldn};
-    atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
-    const int tier_on=vkt_init(&vc,m->eusage);
+    /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
+#ifdef COLI_VULKAN
+    if(!xt_cuda()) atexit(coli_vk_shutdown);
+#endif
+    const int tier_on=XT(init)(&vc,m->eusage);
     free(lgu); free(ldn);   /* read during vkt_init only */
     if(!tier_on) return;
     g_vkt.on=1; g_vkt.nl=NL; g_vkt.gu_fmt[0]=f[0]; g_vkt.gu_gs[0]=gs[0]; g_vkt.dn_fmt[0]=f[2]; g_vkt.dn_gs[0]=gs[2];
     g_vkt.gu_fmt[1]=xf[0]; g_vkt.gu_gs[1]=xgs[0]; g_vkt.dn_fmt[1]=xf[2]; g_vkt.dn_gs[1]=xgs[2];
-    g_vkt.exp_bytes=vkt_expert_bytes(c->hidden,c->moe_inter,gu,dn);
-    atexit(vkt_shutdown);
+    g_vkt.exp_bytes=XT(expert_bytes)(c->hidden,c->moe_inter,gu,dn);
+    atexit(XT(shutdown));
     g_vk_model=m; atexit(vk_tier_report_run);   /* runs first: the tier is still up */
     /* warm start: the history's hottest experts, read in parallel (pinned ones from RAM) */
     int all=NL*E;
     int *ql=malloc((size_t)all*sizeof(int)), *qe=malloc((size_t)all*sizeof(int));
     const char *warm=getenv("COLI_VK_TIER_WARM");   /* 0: no warm start, the tier fills as experts pass by */
-    int n = ql&&qe&&!(warm&&*warm=='0') ? vkt_plan(ql,qe,all) : 0;
+    int n = ql&&qe&&!(warm&&*warm=='0') ? XT(plan)(ql,qe,all) : 0;
     if(n>0){
         double t0=now_s(); int nt=omp_get_max_threads();
         ESlot *tmp=xzalloc((size_t)nt*sizeof(ESlot),"vk warm slots");
@@ -11961,21 +12541,23 @@ static void vk_tier_start(Model *m){
         for(int i=0;i<n;i++){
             VktExpertSrc vs; ESlot *p=pin_indexed(m,ql[i],qe[i]); uint8_t *buf=NULL;
             if(p && (p->g.fmt==QT_GGML ? vk_slot_src_ggml(p,ql[i],&vs,&buf) : vk_slot_src(p,ql[i],&vs))){
-                vkt_put(ql[i],qe[i],&vs); free(buf); continue; }
+                XT(put)(ql[i],qe[i],&vs); free(buf); continue; }
             ESlot *t=&tmp[omp_get_thread_num()];
             int ok = expert_load(m,ql[i],qe[i],t,0,0)==0 &&   /* demand=0: startup */
                      (t->g.fmt==QT_GGML ? vk_slot_src_ggml(t,ql[i],&vs,&buf) : vk_slot_src(t,ql[i],&vs));
-            vkt_put(ql[i],qe[i],ok?&vs:NULL);   /* NULL: planned but not placed (a mixed container) */
+            XT(put)(ql[i],qe[i],ok?&vs:NULL);   /* NULL: planned but not placed (a mixed container) */
             free(buf);
         }
-        vkt_put_done();
+        XT(put_done)();
         for(int t=0;t<nt;t++) vk_tmp_slot_free(&tmp[t],vk_experts_rtq(m,pl));
         free(tmp);
-        vkt_warm_report("colibri", n, now_s() - t0);
+        XT(warm_report)("colibri", n, now_s() - t0);
     }
     free(ql); free(qe);
 }
 
+#endif
+#ifdef COLI_VULKAN
 /* COLI_VK_DEV2: the second device's registry takes the hottest experts of the history
  * that the tier does not hold, up to COLI_VK_EXPERTS2 and COLI_VK_RESERVE2_GB, uploaded
  * once (int4 per row, int4-gs and int3-g64 experts). Only when the shared tier did not
@@ -11988,7 +12570,7 @@ static int vk_cand_cmp(const void *a, const void *b){
 }
 static void vk_dev2_fill(Model *m){
     Cfg *c=&m->c; int E=c->n_experts, NL=c->n_layers;
-    if(!g_vulkan || g_vk_budget2<=0 || !coli_vk_dev2_available() || vkt_devices()>1) return;
+    if(!g_vulkan || g_vk_budget2<=0 || !coli_vk_dev2_available() || XT(devices)()>1) return;
     int64_t nz=0;
     for(int i=0;i<NL;i++) if(m->eusage[i]) for(int e=0;e<E;e++) if(m->eusage[i][e]) nz++;
     if(!nz){ fprintf(stderr,"[VK] dev2 tier: no usage history yet — tier empty this run "
@@ -11996,7 +12578,7 @@ static void vk_dev2_fill(Model *m){
     VkCand *cand=malloc((size_t)nz*sizeof(VkCand)); if(!cand) return;
     int64_t n=0;
     for(int i=0;i<NL;i++) if(m->eusage[i]) for(int e=0;e<E;e++)
-        if(m->eusage[i][e] && !vkt_resident(i,e)) cand[n++]=(VkCand){m->eusage[i][e],i,e};
+        if(m->eusage[i][e] && !XT(resident)(i,e)) cand[n++]=(VkCand){m->eusage[i][e],i,e};
     qsort(cand,(size_t)n,sizeof(VkCand),vk_cand_cmp);
     g_vk_reg=calloc((size_t)NL*E*3,sizeof(*g_vk_reg)); g_vk_reg_E=E; g_vk_reg_NL=NL;
     if(!g_vk_reg){ free(cand); return; }
@@ -13373,12 +13955,12 @@ static int g_glm_dho_on;
  * and that tail fit (glm_dho_finish); without one, every matrix here, as before. */
 static void glm_dho_start(Model *m){
     if(!g_vulkan) return;
-    int tier_on = vkt_wanted() && g_vk_experts!=0 && m->c.n_experts>0;
+    int tier_on = XT(wanted)() && g_vk_experts!=0 && m->c.n_experts>0;
     int chain = coli_vk_chain_decide(NULL, tier_on, COLI_VK_CHAIN_UNMEASURED), cuda = 0;
 #ifdef COLI_CUDA
     cuda = g_cuda_enabled;
 #endif
-    if(cuda || g_kv8 || g_tq || g_pilot) chain = COLI_VK_CHAIN_OFF;   /* glmc_start keeps it off */
+    if(cuda || g_kv8 || g_tq || g_pilot || m->c.ml4) chain = COLI_VK_CHAIN_OFF;   /* glmc_start keeps it off */
     int slots = getenv("KV_SLOTS") ? atoi(getenv("KV_SLOTS")) : 1;
     DhoPass p = {0};
     const char *xv = getenv("COLI_EXACT_VERIFY");   /* exact_verify_on() prints its line later, where it always did */
@@ -13538,6 +14120,11 @@ int main(int argc, char **argv){
                        "measured slower on Apple Silicon (COLI_NO_OMP_TUNE=1 to skip)\n");
 #endif
         setenv("OMP_PROC_BIND","close",0);     /* pack the team onto adjacent cores for cache locality */
+        /* places = cores: without it libgomp makes one place per hardware thread, and where
+         * a core's SMT siblings are numbered side by side (Intel's hybrid CPUs on Linux: CPUs
+         * 0,1 are P-core 0) a team of the physical-core count landed on half the cores, both
+         * threads of each. i5-13500, Mistral-Large-4 decode: the 6-thread team on CPUs 0-5. */
+        setenv("OMP_PLACES","cores",0);
         setenv("OMP_DYNAMIC","FALSE",0);       /* fixed team size: no per-region thread-count churn */
         setenv("COLI_OMP_TUNED","1",1);
 #ifdef __linux__
@@ -13608,8 +14195,9 @@ int main(int argc, char **argv){
             if(cu&&*cu=='1'&&!(vk&&*vk)){
 #ifdef COLI_VULKAN
                 setenv("COLI_VULKAN","1",1); setenv("COLI_CUDA","0",1);
-                fprintf(stderr,"[gguf] the CUDA backend has no ggml block types: this GGUF runs on Vulkan, the same card "
-                               "(COLI_VULKAN=0 keeps CUDA, the matrices and experts then on the CPU)\n");
+                fprintf(stderr,"[gguf] this GGUF runs on Vulkan, the same card, its attention in the dense chain "
+                               "(COLI_VULKAN=0 keeps CUDA: the routed experts on the CUDA tier, the dense matrices "
+                               "on the card, the attention on the CPU)\n");
 #else
                 fprintf(stderr,"[gguf] the CUDA backend has no ggml block types: this GGUF's matrices and experts run on the CPU "
                                "(a VK=1 build runs them on the card through Vulkan)\n");
@@ -13839,7 +14427,7 @@ int main(int argc, char **argv){
          * uploaded before (320 by default), is kept as a deprecated alias: N caps the
          * tier at N experts, 0 turns it off as COLI_VK_TIER=0 does. */
         { const char *ve=getenv("COLI_VK_EXPERTS"); g_vk_experts = ve&&*ve ? atoi(ve) : -1; }
-        int vk_tier_on = vkt_wanted() && g_vk_experts!=0;
+        int vk_tier_on = XT(wanted)() && g_vk_experts!=0;
         g_vk_dense = coli_vk_dense_decide(NULL, vk_tier_on, 0);   /* COLI_VK_DENSE; this engine's default is off */
         g_vk_attn = getenv("COLI_VK_ATTN") ? atoi(getenv("COLI_VK_ATTN")) : 0;
         if(vk_tier_on)
@@ -14130,6 +14718,12 @@ int main(int argc, char **argv){
      * with the run's tokens already correct (#1262). Static storage outlives
      * every thread, so the pointer the worker holds stays valid. */
     static Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
+    if(m.c.ml4){   /* Mistral-Large-4: its attention is the CPU's (attention_rows_ml4), its KV float32 or float16 */
+        if(g_kv8||g_tq){ fprintf(stderr,"[ML4] KV8 and KV_TQ are not this model's yet: the KV cache in float16\n"); g_kv8=g_tq=0; g_kv16=1; }
+#ifdef COLI_CUDA
+        if(g_cuda_pipe){ fprintf(stderr,"[ML4] COLI_CUDA_PIPE runs GLM-5.2's attention: off for this model\n"); g_cuda_pipe=0; }
+#endif
+    }
     /* KV_TQ requires power-of-two row widths: both codecs rotate through a
      * radix-2 FWHT, and coli_kvq_quant_row returns an inert radius 0 for any
      * other width. On a model whose kv_lora/qk_rope are not powers of two that
@@ -14229,6 +14823,46 @@ int main(int argc, char **argv){
                            "         Keep it on a native Linux fs (ext4/xfs/zfs) for memory efficiency and speed.\n", snap);
     }
 #endif
+    /* Mistral-Large-4's vision tower (gguf.json "mmproj", else the mmproj.gguf a container converted
+     * from the FP8 release carries, tools/ml4_mmproj.py; ML4_MMPROJ names one, ML4_VISION=0 skips
+     * it), in serve mode, where the gateway sends pictures: before the pins and cap_for_ram, which
+     * then count its bytes as resident. */
+    if(m.c.ml4 && getenv("SERVE") && !(getenv("ML4_VISION") && getenv("ML4_VISION")[0]=='0')){
+        char mp[4096]=""; const char *me=getenv("ML4_MMPROJ");
+        if(me && *me) snprintf(mp,sizeof mp,"%s",me);
+        else {
+            char gj[4096]; snprintf(gj,sizeof gj,"%s/gguf.json",snap);
+            FILE *gf=fopen(gj,"rb");
+            if(gf){
+                char buf[16384]; size_t nb=fread(buf,1,sizeof buf-1,gf); fclose(gf); buf[nb]=0;
+                char *arena=NULL; jval *root=json_parse(buf,&arena);
+                jval *mv=root?json_get(root,"mmproj"):NULL;
+                if(mv && mv->t==J_STR && mv->str[0]) gguf_path_join(mp,sizeof mp,snap,mv->str);
+                free(arena);
+            }
+            if(!mp[0]){
+                char own[4096]; snprintf(own,sizeof own,"%s/mmproj.gguf",snap);
+                FILE *of=fopen(own,"rb");
+                if(of){ fclose(of); snprintf(mp,sizeof mp,"%s",own); }
+            }
+        }
+        if(mp[0]){
+            double tv=now_s();
+            if(mistral_vision_load(&g_mlv,mp,m.c.hidden,m.c.eps)==0){
+                size_t vb=0;
+                for(int l=0;l<g_mlv.depth;l++){ MvLayer *L=&g_mlv.layers[l];
+                    vb+=(size_t)(L->q.rb*L->q.O+L->k.rb*L->k.O+L->v.rb*L->v.O+L->o.rb*L->o.O+L->gate.rb*L->gate.O+L->up.rb*L->up.O+L->down.rb*L->down.O); }
+                vb+=(size_t)(g_mlv.merger.rb*g_mlv.merger.O+g_mlv.l1.rb*g_mlv.l1.O+g_mlv.l2.rb*g_mlv.l2.O);
+                m.resident_bytes+=vb;
+                fprintf(stderr,"[ml4] vision tower (mmproj): %d layers of %d, %d heads, patch %d, merge %d, %.2f GB in %.1f s\n",
+                        g_mlv.depth,g_mlv.hidden,g_mlv.heads,g_mlv.patch,g_mlv.merge,vb/1e9,now_s()-tv);
+#ifdef COLI_VULKAN
+                { const char *vg=getenv("ML4_VISION_GPU");
+                  if(g_vulkan && !(vg && vg[0]=='0')){ mv_device_mm=mlv_vk_mm; g_mlv_vk_keep=vg && !strcmp(vg,"keep"); g_mlv_bytes=vb; } }
+#endif
+            } else fprintf(stderr,"[ml4] %s: the vision tower did not load; pictures are refused\n",mp);
+        }
+    }
     /* DUAL-SSD: register the mirror copy BEFORE any pin/autopin load, so the
      * OMP-parallel pin warmup already streams from both drives. */
     mirror_setup(&m);
@@ -14343,6 +14977,9 @@ int main(int argc, char **argv){
     vk_tier_start(&m);      /* the shared expert tier: needs the usage history and the cap above */
     vk_dev2_fill(&m);       /* COLI_VK_DEV2: the hottest experts the tier does not hold */
     glmc_atexit(&m);        /* after the tier's: the chain goes before the device */
+#endif
+#ifdef COLI_CUDA
+    colibri_cu_tier_start(&m);   /* COLI_CUDA=1 with no Vulkan device and a GGUF: the same tier on CUDA */
 #endif
     const char *stats=getenv("STATS");   /* STATS=<file> -> istogramma uso expert a fine run */
 

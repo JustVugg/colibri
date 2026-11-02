@@ -44,6 +44,8 @@
 #include "omp_tune.h"
 #include "route_trace.h"
 #include "kv_prefix.h"
+#include "park.h"   /* a short request keeps the conversation aside (COLI_PARK) */
+#include "prompt_break.h"   /* a served prompt that a CANCEL stops between two layers */
 #include "pin_pool.h"                          /* KV prefix reuse (shared) */                          /* shared routing telemetry (#700) */
 #include "serve_codec.h"
 #include "serve_budget.h"
@@ -2842,6 +2844,7 @@ static void inkling_layers_forward_range(Model *m, float *x, int S, int pos0,
     Cfg *c = &m->c; int D = c->hidden;
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
     for (int i = layer_begin; i < layer_end; i++) {
+        if (coli_prompt_break()) break;   /* a served prompt's CANCEL: step_mm leaves without the rest */
         Layer *l = &m->L[i];
         for (int s = 0; s < S; s++)
             rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D,
@@ -2981,7 +2984,7 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
         chain_logit = falloc(c->unpad_vocab);
         int took = inkc_forward(m, x, S, pos0, (g_echo_k > 0 && g_echo_id && S > 1) || tf_out != NULL, chain_logit);
         if (took != 1) { free(chain_logit); chain_logit = NULL; }
-        if (!took) inkc_cpu_step(m, pos0, S);
+        if (!took && !coli_prompt_broken()) inkc_cpu_step(m, pos0, S);   /* stopped: no CPU redo */
         else if (took == 2) layer0 = inkc_ran();   /* a partial chain: x is the residual after the last layer it ran */
     }
     if (!chain_logit)
@@ -2989,6 +2992,10 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
 #else
     inkling_layers_forward_range(m, x, S, pos0, 0, c->n_layers);
 #endif
+    /* stopped between two layers (ink_serve_start): kv_len and the kv_prefix record stay as
+     * they were, and the caller resets the rings and the convolution banks the layers before
+     * the stop wrote into */
+    if (coli_prompt_broken()) { free(x); return NULL; }
     m->kv_len = pos0 + S;
     /* record what was just fed, at the positions it went to (kv_prefix.h).
      * Audio taints the record: every frame carries the same token id while the
@@ -3466,8 +3473,62 @@ typedef struct { double t0, f0, e0, s0, a0; uint64_t h0, m0; } InkReqClock;
  * budget, the prefix reuse and the photos, the prefill and its read-out. 1 with the
  * prompt's ids and the logits after it; 0 when the request ended here, its ERROR
  * written. serve_one and serve_mux start every request here. */
+/* A lone request's prompt reads its CANCEL between two layers of the CPU's path
+ * (prompt_break.h), with the reader its decode loop uses. The multiplexed loop owns its
+ * command stream and reads it between steps. */
+static int ink_prompt_poll(ColiPromptBreak *b) {
+    while (!b->control && !b->eof && stdin_readable()) {
+        int r = serve_read_cmd(stdin, stdout, b->id);
+        if (r < 0) b->eof = 1;   /* as the decode loop: it stops at its next read */
+        else if (r > 0) b->control = 1;
+    }
+    return b->control;
+}
+
+/* A short request between two turns of the conversation the lone serve holds (park.h): every
+ * layer's first K/V rows (a sliding layer's ring rows) and its four convolution states, back
+ * when the next request arrives. A reset clears only the convolution states, and a query reads
+ * the rows of its own positions, so the conversation's further rows wait untouched. The host's
+ * state stays canonical: the chain uploads the rows that came back, and the states. */
+static ColiPark g_ink_park;
+static ColiParkPart *ink_park_parts(Model *m, int *n_out) {
+    Cfg *c = &m->c; int n = 0;
+    ColiParkPart *p = malloc(sizeof *p * ((size_t)c->n_layers * 6));
+    if (!p) { *n_out = 0; return NULL; }
+    for (int i = 0; i < c->n_layers; i++) {
+        int kv = L_KV(c,i), hd = L_HD(c,i), rows = (int)kv_ring_rows(c, i, m->max_t);
+        size_t row = (size_t)hd * sizeof(float), hs = (size_t)rows * row;
+        p[n++] = coli_park_heads(m->K ? m->K[i] : NULL, row, rows, kv, hs);
+        p[n++] = coli_park_heads(m->V ? m->V[i] : NULL, row, rows, kv, hs);
+        for (int j = 0; j < 4; j++) p[n++] = coli_park_whole(m->cs[j][i], (size_t)ink_cs_cells(c, j, i) * sizeof(float));
+    }
+    *n_out = n;
+    return p;
+}
+static void ink_park(Model *m, int np, int max_tok) {
+    int n = m->K && g_ink_mux_slots == 1 ? coli_park_rows_for(&g_ink_park, &m->kvp, m->kv_len, np, max_tok, 16) : 0, k = 0;
+    if (!n) return;
+    ColiParkPart *p = ink_park_parts(m, &k);
+    if (p) coli_park_save(&g_ink_park, &m->kvp, m->kv_len, p, k, n);
+    free(p);
+}
+static void ink_unpark(Model *m) {
+    if (!g_ink_park.on) return;
+    int k = 0;
+    const int n = g_ink_park.n;   /* the rows that come back: the chain uploads them */
+    (void)n;
+    ColiParkPart *p = ink_park_parts(m, &k);
+    if (p && coli_park_restore(&g_ink_park, &m->kvp, &m->kv_len, m->kv_len, 16, p, k)) {
+#ifdef COLI_VULKAN
+        inkc_host_wrote(m, 0);      /* the convolution states go up again */
+        inkc_cpu_step(m, 0, n);     /* and the rows of positions [0, n), the ones that came back */
+#endif
+    } else coli_park_free(&g_ink_park);
+    free(p);
+}
+
 static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out, float **logit_out,
-                           InkReqClock *clk) {
+                           InkReqClock *clk, int lone) {
     Cfg *c = &m->c;
     int cap = q->plen + 16;
     int *ids = malloc((size_t)cap * sizeof(int));
@@ -3557,6 +3618,7 @@ static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out
                     (m->kvp.len > 0 && m->kvp.len < np) ? " (diverged)" : "");
         fflush(stderr);
     }
+    if (!reuse && lone && naud == 0) ink_park(m, np, q->max_tok);   /* a short request keeps the conversation (ink_unpark) */
     if (!reuse) state_reset(m);
     clk->t0 = now_s();
     clk->h0 = m->hits; clk->m0 = m->miss;
@@ -3564,7 +3626,44 @@ static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out
     clk->f0 = m->t_fill; clk->e0 = m->t_expert; clk->s0 = m->t_shared; clk->a0 = m->t_attn;
     /* `reuse` is the ABSOLUTE position of the first fresh token: attention and
      * the KV slots are position-indexed, so this has to be the real offset. */
-    float *logit = step_mm(m, ids + reuse, np - reuse, reuse, NULL, q->audio, naud);
+    ColiPromptBreak brk = { .poll = ink_prompt_poll, .id = q->id };
+    int chain = 0;   /* a chain runs its layers on the device and is not stopped inside */
+#ifdef COLI_VULKAN
+    chain = g_vk_chain != 0;
+#endif
+    float *logit = NULL;
+    int whole_steps = 0;   /* stopped between two segments: the state is the prompt read so far */
+    if (lone && chain && q->logprobs == 0 && naud == 0) {
+        /* a chain is not stopped inside its forward: the prompt goes in segments, checked
+         * between them, each a whole step (its rings and banks as complete as any step's) */
+        int seg = coli_prompt_segment_rows(2048);
+        whole_steps = 1;
+        for (int at = reuse; at < np; ) {
+            if (coli_prompt_poll(&brk)) { free(logit); logit = NULL; break; }
+            int n = np - at < seg ? np - at : seg;
+            g_coli_prompt_break = &brk;   /* and between the chain's chunks inside the step */
+            float *next = step_mm(m, ids + at, n, at, NULL, NULL, 0);
+            g_coli_prompt_break = NULL;
+            free(logit); logit = next;
+            if (!next) { whole_steps = 0; break; }   /* stopped inside a step */
+            at += n;
+        }
+    } else {
+        if (lone && !chain && q->logprobs == 0) g_coli_prompt_break = &brk;
+        logit = step_mm(m, ids + reuse, np - reuse, reuse, NULL, q->audio, naud);
+        g_coli_prompt_break = NULL;
+    }
+    if (!logit) {
+        /* stopped inside a forward: the sliding layers' rings and the convolution banks hold
+         * part of this prompt, so the state starts over and the next request reads its prompt
+         * whole; between two segments it is the prompt read so far */
+        if (!whole_steps) state_reset(m);
+        coli_prompt_break_log(1, whole_steps ? m->kvp.len : 0, np);
+        g_echo_k = 0; g_echo_id = NULL;
+        coli_serve_write_error(stdout, q->id, "CANCELLED");
+        free(ids);
+        return 0;
+    }
     if (q->pin && logit && naud == 0) {
         coli_pin_pool_init(&g_pins, c->unpad_vocab);
         ColiPin *k = coli_pin_store(&g_pins, ids, np, logit);
@@ -3583,7 +3682,8 @@ static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out
 static int serve_one(Model *m, Tok *T, SReq *q) {
     Cfg *c = &m->c;
     int *ids = NULL, np = 0; float *logit = NULL; InkReqClock clk;
-    if (!ink_serve_start(m, T, q, &ids, &np, &logit, &clk)) return 0;
+    ink_unpark(m);   /* a conversation the last request parked: back first */
+    if (!ink_serve_start(m, T, q, &ids, &np, &logit, &clk, 1)) return 0;
     double t0 = clk.t0;
     uint64_t h0 = clk.h0, m0 = clk.m0;
     double f0 = clk.f0, e0 = clk.e0, s0 = clk.s0, a0 = clk.a0;
@@ -3820,7 +3920,7 @@ static void serve_mux(Model *m, Tok *T) {
                         t->q.audio = coli_serve_command_extension(&command);
                         t->q.payload = (char *)coli_serve_command_take_payload(&command);
                         ink_mux_bind(m, command.slot);
-                        int ok = ink_serve_start(m, T, &t->q, &t->ids, &t->np, &t->lo, &t->clk);
+                        int ok = ink_serve_start(m, T, &t->q, &t->ids, &t->np, &t->lo, &t->clk, 0);
                         free(t->q.payload); t->q.payload = NULL; t->q.audio = NULL;
                         if (ok) {
                             t->active = 1; t->limited = 1; t->forwards = 1;
@@ -3916,6 +4016,7 @@ int main(int argc, char **argv) {
         setenv("OMP_WAIT_POLICY","active",0);
         setenv("GOMP_SPINCOUNT","200000",0);
         setenv("OMP_PROC_BIND","close",0);
+        setenv("OMP_PLACES","cores",0);        /* a place per core, not per SMT thread (see colibri.c) */
         setenv("OMP_DYNAMIC","FALSE",0);
         setenv("COLI_OMP_TUNED","1",1);
 #ifdef __linux__

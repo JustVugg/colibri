@@ -76,9 +76,11 @@ class DisplayVariant:
     of very different size: Qwen3.6-35B-A3B and Qwen3.8-2.4T-A95B both say
     ``qwen3_5_moe_text``. A single display_name would announce the 2.4T as a
     35B, which is the kind of banner that costs someone a day (#1045). The
-    ``geometry`` pairs are config keys the family config must match exactly;
-    the first matching variant names the model. No match: the model keeps its
-    own model_type as its name rather than borrowing a sibling's.
+    ``geometry`` pairs are config keys the family config must match exactly
+    (positive integers, or the model_type itself as a string, where one family
+    serves two models: GLM-5.2's engine runs Mistral-Large-4 too); the first
+    matching variant names the model. No match: the model keeps its own
+    model_type as its name rather than borrowing a sibling's.
     """
     geometry: tuple
     display_name: str
@@ -344,6 +346,13 @@ def _qwen36_geometry(config, context, _model_dir):
     full = sum(kind in ("full_attention", "sliding_attention") for kind in kinds)
     kv = (full * context * _required_int(config, "num_key_value_heads", "qwen36") *
           _required_int(config, "head_dim", "qwen36") * 2 * 4)
+    if any(kind == "conv" for kind in kinds):
+        # LFM3: a conv layer keeps its last conv_L_cache - 1 rows of every channel, whatever
+        # the context; the MLP is dense, nothing routed
+        taps = _required_int(config, "conv_L_cache", "qwen36", 2)
+        conv = sum(kind == "conv" for kind in kinds)
+        fixed = conv * _required_int(config, "hidden_size", "qwen36") * (taps - 1) * 4
+        return PlannerGeometry(kv, fixed, 0, 0, dense=True)
     if full == layers:
         # all attention (qwen3_moe): no recurrent state, and no linear_* keys to read
         if "num_experts" not in config:
@@ -366,6 +375,19 @@ def _qwen36_geometry(config, context, _model_dir):
 
 _QWEN38_PREFILL_BATCH_ROWS = 32
 _QWEN38_PREFILL_WORKSPACE_BYTES = 64 << 20
+# serve reads a prompt in segments of this many rows at most (q38_serve_prefill:
+# coli_prompt_segment_rows, 8192 with a dense chain, 2048 without), so a forward's
+# row buffers hold one segment, not the context. COLI_PROMPT_SEGMENT sets both.
+_QWEN38_PROMPT_SEGMENT_ROWS = 8192
+
+
+def _qwen38_prompt_rows(context):
+    """The most rows one forward holds: the context, or serve's prompt segment."""
+    try:
+        segment = int(os.environ.get("COLI_PROMPT_SEGMENT", "") or 0)
+    except ValueError:
+        segment = 0
+    return min(context, segment if segment > 0 else _QWEN38_PROMPT_SEGMENT_ROWS)
 
 
 def _qwen38_bounded_prefill(rows, fixed_bytes, row_bytes):
@@ -502,7 +524,10 @@ def _qwen38_geometry(config, context, _model_dir):
     qsa_fixed = (index_q * index_dim + index_dim + index_budget + index_ratio - 1 +
                  max(2 * (context // index_ratio),
                      head_dim + index_budget + index_ratio - 1))
-    workspace = (context * max(gated_residual_row, qsa_row, ple_row) +
+    # The outer rows of one forward: serve's prompt segment, not the whole context (a
+    # 262144-token context priced as one forward held 38 GB that serve never takes).
+    rows = _qwen38_prompt_rows(context)
+    workspace = (rows * max(gated_residual_row, qsa_row, ple_row) +
                  max(moe_fixed, gdn_fixed, ple_fixed, qsa_fixed)) * 4
 
     # q38_moe_prefill() and q38_deltanet() batch only a bounded row chunk.
@@ -514,7 +539,7 @@ def _qwen38_geometry(config, context, _model_dir):
         topk * moe_assignment_bytes
     moe_fixed_bytes = experts * (4 * 4 + 8) + 4
     moe_rows = _qwen38_bounded_prefill(
-        context, moe_fixed_bytes, moe_row_bytes)
+        rows, moe_fixed_bytes, moe_row_bytes)
     moe_chunk_bytes = moe_fixed_bytes + moe_rows * moe_row_bytes
 
     delta_row_bytes = (gdn_conv_width + 2 * value_heads * value_dim +
@@ -523,9 +548,9 @@ def _qwen38_geometry(config, context, _model_dir):
                          2 * value_heads * key_dim +
                          value_heads * value_dim) * 4
     delta_rows = _qwen38_bounded_prefill(
-        context, delta_fixed_bytes, delta_row_bytes)
+        rows, delta_fixed_bytes, delta_row_bytes)
     delta_chunk_bytes = delta_fixed_bytes + delta_rows * delta_row_bytes
-    prefill_workspace = context * base_row * 4 + max(
+    prefill_workspace = rows * base_row * 4 + max(
         moe_chunk_bytes, delta_chunk_bytes)
     workspace = max(workspace, prefill_workspace)
     return PlannerGeometry(context_state, fixed, workspace,
@@ -1326,7 +1351,7 @@ FAMILIES = (
     ),
     FamilyDescriptor(
         id="glm",
-        model_types=("glm_moe_dsa", "glm5_moe", "glm"),
+        model_types=("glm_moe_dsa", "glm5_moe", "glm", "mistral_large4"),
         # Two model names, one family, and that is not a shortcut. Z.ai state
         # it on GLM-5.3's own card: "GLM-5.3 uses the same base model as
         # GLM-5.2 -- every gain comes from post-training." The checkpoints
@@ -1344,6 +1369,16 @@ FAMILIES = (
         # family loads. If a future release ever adds a real discriminator,
         # split this then, on evidence.
         display_name="GLM-5.2/5.3",
+        # Mistral-Large-4 (mistralai/Mistral-Large-4-1T-A52B): GLM-5.2's DSA attention without the
+        # query LoRA, the same engine (colibri.c's attention_rows_ml4), its own chat format (the
+        # gateway's mistral_large4 flavor) and name. The model_type tells them apart, at any size.
+        display_variants=(
+            DisplayVariant((("model_type", "glm_moe_dsa"),), "GLM-5.2/5.3", "744B"),
+            DisplayVariant((("model_type", "glm5_moe"),), "GLM-5.2/5.3", "744B"),
+            DisplayVariant((("model_type", "glm"),), "GLM-5.2/5.3", "744B"),
+            DisplayVariant((("model_type", "mistral_large4"),), "Mistral-Large-4-1T-A52B", "1T",
+                           model_id="mistral-large-4-colibri"),
+        ),
         converter="convert_fp8_to_int4.py",
         converter_accepts=("ebits", "io_bits", "xbits", "group_size"),
         converter_mtp_pass=True,
@@ -1364,7 +1399,9 @@ FAMILIES = (
         expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
         config_section="root",
         limits=FamilyLimits(4096, 1048576, 1024, 16384, 16, 0, "CTX"),
-        capabilities=FamilyCapabilities(True, True, False, True,
+        # image: Mistral-Large-4's pictures (expand_ml4_images); the engine says whether it loaded
+        # the tower (CAPS vision=), GLM-5.2 has none
+        capabilities=FamilyCapabilities(True, True, False, True, image=True,
                                         logprobs_echo=True, submit_gbytes=True),
         has_gateway_adapter=True,
         has_cli_adapter=True,
@@ -1456,12 +1493,11 @@ FAMILIES = (
         planner_id="olmoe_gqa",
         planner_geometry=_olmoe_geometry,
         planner_unsupported_reason="",
-        # No VRAM tier to plan: olmoe.c has no CUDA/Metal backend ("CPU-only (no
-        # CUDA/Metal backend), so the GPU fields are always empty") and its build
-        # rule links NOCUDA_LDFLAGS. Since #1830 a VK=1 build can put its resident
-        # matrices on a Vulkan device (COLI_VULKAN=1), opt-in and outside the
-        # planner. Left at the default this advertised a VRAM tier.
-        supports_accelerator=False,
+        # A CUDA build runs every layer and every routed expert as one chain on
+        # the card with COLI_CUDA=1 (olmoe_cuda_chain.h: the whole model in VRAM,
+        # or the CPU when it does not fit). Since #1830 a VK=1 build can put it on
+        # a Vulkan device too (COLI_VULKAN=1), opt-in and outside the planner.
+        supports_accelerator=True,
         expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
         # coli convert routes to convert_olmoe_merged.py (d4d11ef dispatch);
         # the converter takes no precision flags (--ebits / --group-size etc.).
@@ -1493,8 +1529,10 @@ FAMILIES = (
         # sliding-window layers, dense layers in front and sigmoid routing.
         # muse_spark: Muse Spark Open (its GGUFs, tools/gguf_import.py), Flint's window and
         # layers without RoPE, residual gates and the experts at their own width.
+        # lfm3: LFM3 (LiquidAI/LFM3-VL, its text model; lfm3_vl the checkpoint's own type),
+        # dense, short gated convolutions beside attention layers.
         model_types=("qwen3_5_moe", "qwen3_5_moe_text", "qwen3_5", "qwen3_5_text", "qwen3_moe", "qwen3", "flint",
-                     "muse_spark"),
+                     "muse_spark", "lfm3", "lfm3_vl"),
         display_name="Qwen3.6-35B-A3B",
         display_scale="35B",
         # Both checkpoints declare qwen3_5_moe_text. Keyed on the three
@@ -1523,6 +1561,9 @@ FAMILIES = (
             DisplayVariant((("num_hidden_layers", 62),
                             ("num_experts", 256), ("hidden_size", 8192)),
                            "Muse-Spark-Open-816B-A42B", "816B", model_id="muse-spark-open-colibri"),
+            DisplayVariant((("num_hidden_layers", 24), ("hidden_size", 2048),
+                            ("intermediate_size", 7680)),
+                           "LFM3-VL-2B", "2B", model_id="lfm3-vl-2b-colibri"),
         ),
         engine_artifact="qwen36",
         engine_aliases=(),
@@ -1791,7 +1832,8 @@ FAMILIES = (
         # one-shot `coli run` has nothing to run: a decision needs questions,
         # which come over POST /v1/systemone from `coli serve` / `coli web`
         has_cli_adapter=False,
-        supports_accelerator=False,
+        # COLI_CUDA=1 (--gpu): the forward on a CUDA device (decide_cuda.h); no tier to size
+        supports_accelerator=True,
         modality="decision",
         tokenizer_file="tokenizer/tokenizer.json",
         checkpoint_files=("tokenizer/tokenizer_config.json", "encoder/config.json"),
@@ -1836,7 +1878,8 @@ FAMILIES = (
         capabilities=FamilyCapabilities(False, False, False, False, decision=True),
         has_gateway_adapter=True,
         has_cli_adapter=False,
-        supports_accelerator=False,
+        # COLI_CUDA=1 (--gpu): the forward on a CUDA device (decide_cuda.h); no tier to size
+        supports_accelerator=True,
         modality="decision",
         tokenizer_file="tokenizer.json",
         checkpoint_files=("config.json", "encoder_config/config.json"),
@@ -1879,7 +1922,8 @@ def _build_registry(families):
                     not isinstance(variant.display_name, str) or not variant.display_name or
                     not isinstance(variant.display_scale, str) or
                     any(not isinstance(key, str) or not key or isinstance(value, bool) or
-                        not isinstance(value, int) or value < 1
+                        not ((isinstance(value, int) and value >= 1) or
+                             (key == "model_type" and isinstance(value, str) and value))
                         for key, value in variant.geometry)):
                 raise RegistryError(f"invalid display variant: {family.id}")
         # The static display_name is what the READMEs are held to mention, so
@@ -2000,8 +2044,9 @@ def _resolve_decision_checkpoint(model):
 
 
 # GLiNER2's config.json says model_type "extractor" whatever the architecture
-# and the encoder; the encoder's own config sits in encoder_config/.
-GLINER2_MODEL_TYPE = "extractor"
+# and the encoder ("gliner2" in fastino's repository since its transformers form,
+# the same weights); the encoder's own config sits in encoder_config/.
+GLINER2_MODEL_TYPES = ("extractor", "gliner2")
 GLINER2_ENCODER_CONFIG = "encoder_config/config.json"
 
 
@@ -2063,7 +2108,7 @@ def resolve_model(model_dir):
             "  carries model_index.json instead.") from error
     except json.JSONDecodeError as error:
         raise FamilyConfigError(f"invalid config.json: {error}") from error
-    if isinstance(config, dict) and config.get("model_type") == GLINER2_MODEL_TYPE:
+    if isinstance(config, dict) and config.get("model_type") in GLINER2_MODEL_TYPES:
         return _resolve_gliner2_checkpoint(model, config)
     family = family_for_config(config)
     family_config = config

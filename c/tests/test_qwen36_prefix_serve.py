@@ -47,6 +47,8 @@ def cpu_prefill_engine(cap, dense, slots):
 @unittest.skipUnless((FIXTURE / "model-globals.safetensors").exists(),
                      "tiny qwen36 container is absent (tools/convert_qwen36.py)")
 class Qwen36PrefixServeTest(PrefixReuseContract, unittest.TestCase):
+    PARKS = True
+
     @classmethod
     def setUpClass(cls):
         # The fixture ships no tokenizer: the oracle path feeds ids directly.

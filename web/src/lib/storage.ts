@@ -9,11 +9,11 @@ export function stored(storage: Pick<StringStorage, "getItem">, key: string, fal
 }
 
 export function persistPublicSettings(storage: StringStorage, baseUrl: string, model: string) {
+  // Cleanup must not depend on preference writes: a full quota can reject
+  // setItem while still allowing the legacy entry to be removed.
+  try { storage.removeItem("colibri.apiKey") } catch { /* restricted storage mode */ }
   try {
     storage.setItem("colibri.baseUrl", baseUrl)
     storage.setItem("colibri.model", model)
-    // API credentials intentionally remain memory-only. Remove values left by
-    // older web releases whenever public settings are persisted.
-    storage.removeItem("colibri.apiKey")
   } catch { /* restricted storage mode */ }
 }

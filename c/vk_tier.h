@@ -376,11 +376,18 @@ int  vkt_dev_host(int layer, uint8_t *host);
 /* score[e]: the tier's rank of layer `layer`'s expert e (its heat and recency: the order it
  * keeps experts in, the higher the hotter); returns 0, -1 when off */
 int  vkt_score(int layer, uint64_t *score);
+/* Device memory back to the engine (a dense chain's KV mirror growing with the context): at
+ * least `bytes` of the tier's pool on the primary device emptied and released, the coldest
+ * blocks first, their residents back to their host pool copies (the CPU computes them) or
+ * out of the tier; the tier then holds that much less. Between steps, on the engine's
+ * thread. The bytes released, 0 when none could be. */
+size_t vkt_give_back(size_t bytes);
 #else
 static inline int vkt_host_pool_on(void){return 0;}
 static inline size_t vkt_stage_room(void){return 0;}
 static inline int vkt_dev_host(int l,uint8_t *h){(void)l;(void)h;return -1;}
 static inline int vkt_score(int l,uint64_t *s){(void)l;(void)s;return -1;}
+static inline size_t vkt_give_back(size_t b){(void)b;return 0;}
 typedef struct { const uint8_t *g, *u, *d; int tg, td; size_t rgu, rd; const float *sg, *su, *sd; int gsgu, gsd; } VktHostExpert;
 static inline int vkt_dev_table_hybrid(int l,uint32_t *e,VktHostExpert *h){(void)l;(void)e;(void)h;return -1;}
 static inline int vkt_dev_entry(int l,int e,uint32_t *t,uint32_t *th,VktHostExpert *h,uint8_t *o){(void)l;(void)e;(void)t;(void)th;(void)h;(void)o;return -1;}

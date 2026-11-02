@@ -439,6 +439,11 @@ int coli_vk_timeline(void);
 const void *coli_vk_tensor_host_rows(const ColiVkTensor *t, const void **scales);
 /* An expert's three tensors (gate, up, down), for coli_vk_tensor_host_rows. */
 void coli_vk_xb_expert_tensors(const ColiVkExpert *e, ColiVkTensor **g, ColiVkTensor **u, ColiVkTensor **d);
+/* The tier pool on the primary device as vkt_give_back sees it: its block indices' bytes into
+ * bytes[0 .. max) (0 for an index whose block was released; bytes NULL: only the count), the
+ * number of indices; and the blocks of that pool an expert's tensors sit in (at most max). */
+int  coli_vk_tier_pool_blocks(uint64_t *bytes, int max);
+int  coli_vk_xb_expert_blocks(const ColiVkExpert *e, int *blk, int max);
 /* The size of the device memory in bytes (for a budget without VK_EXT_memory_budget). */
 size_t coli_vk_device_local_bytes(void);
 const char *coli_vk_device_name(void);

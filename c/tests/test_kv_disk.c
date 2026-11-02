@@ -37,6 +37,23 @@ int main(void){
         for(int j=0;j<m.c.kv_lora;j++)
             CHECK(m.Lc[i][(int64_t)p*m.c.kv_lora+j]==fill(i,p,j), "v1 Lc[%d] p%d j%d", i,p,j);
 
+    /* A token id outside [0,vocab) cuts the history at that record, like a short read. */
+    { int32_t bad[3]={-1,m.c.vocab,INT32_MAX}, k=3;
+      for(int b=0;b<3;b++){
+          FILE *f=fopen(PATH,"r+b");
+          CHECK(f && fseek(f,40+k*kv_rec_bytes(&m),SEEK_SET)==0 && fwrite(&bad[b],4,1,f)==1,
+                "poison token id"); if(f) fclose(f);
+          kv_alloc(&m,16); m.kv->disk_nrec=0;
+          CHECK(kv_disk_load(&m,hist2,16)==k, "bad id %d load", bad[b]);
+          CHECK(m.kv->disk_nrec==k, "bad id disk_nrec=%d", m.kv->disk_nrec);
+          for(int p=0;p<k;p++) CHECK(hist2[p]==hist[p], "bad id hist[%d]", p);
+      }
+      FILE *f=fopen(PATH,"r+b");
+      CHECK(f && fseek(f,40+k*kv_rec_bytes(&m),SEEK_SET)==0 && fwrite(&hist[k],4,1,f)==1,
+            "restore token id"); if(f) fclose(f);
+      kv_alloc(&m,16); m.kv->disk_nrec=0;
+      CHECK(kv_disk_load(&m,hist2,16)==NP, "restored v1 load"); }
+
 #ifndef _WIN32
     /* A real failed data flush must not publish an unwritten tail or suppress
      * the next save. Keep two committed rows, then deny extending the file. */

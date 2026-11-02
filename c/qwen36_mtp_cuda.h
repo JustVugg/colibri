@@ -20,6 +20,7 @@ typedef struct {
     CcBuf *prm, *emb, *hin, *cat, *x, *nrm, *q, *k, *v, *ctx, *tmp, *cs, *kc, *vc;
     CcBuf *lg, *gsb, *us, *hs, *sd, *sg, *ids, *wt, *rt, *fin, *hid, *outd, *pick, *vids, *tab, *mh;
     ColiCudaTensor *eh, *lq, *lk, *lv, *lo, *shg, *shu, *shd, *rq, *sq, *lm, **ex;
+    CcBuf *pk, *pv; int pn;   /* a parked conversation's first pn rows of kc and vc (q36_mc_park) */
     size_t o_en, o_hn, o_in, o_post, o_qn, o_kn, o_head;
 } Q36MtpCuda;
 static Q36MtpCuda g_q36_mc;
@@ -153,6 +154,31 @@ static int q36_mc_bufs(Model *m, int R) {
            q36_mc_res(&g->k, r * KV * kvd, CC_DEV) && q36_mc_res(&g->v, r * KV * kvd, CC_DEV) &&
            q36_mc_res(&g->ctx, r * H * c->head_dim, CC_DEV) && q36_mc_res(&g->tmp, r * D, CC_DEV) &&
            q36_mc_res(&g->cs, r * (c->rotary_dim > 0 ? c->rotary_dim : 2), CC_DEV);
+}
+/* The first n rows of the head's device cache into a copy of their own (out), or back from
+ * it: qwen36_mtp.h's q36_mg_park on the CUDA chain's device. */
+static int q36_mc_park(Model *m, int n, int out) {
+    Q36MtpCuda *g = &g_q36_mc; int KV = m->c.kv_heads, kvd = m->c.k_head_dim;
+    if (out < 0) { cc_free(g->pk); cc_free(g->pv); g->pk = g->pv = NULL; g->pn = 0; return 1; }   /* the copy dropped */
+    if (out) {
+        g->pn = 0;
+        if (!g->on || !g->kc || !g->vc) return 1;
+        if (n > g->cap) n = g->cap;
+        if (!q36_mc_res(&g->pk, (size_t)KV * n * kvd, CC_DEV) || !q36_mc_res(&g->pv, (size_t)KV * n * kvd, CC_DEV)) return 0;
+    } else {
+        if (!g->pn) return 1;
+        n = g->pn;
+    }
+    int ok = g->kc && g->vc && n <= g->cap && cc_begin();
+    for (int h = 0; ok && h < KV; h++) {
+        size_t at = (size_t)h * g->cap * kvd, pa = (size_t)h * n * kvd, len = (size_t)n * kvd;
+        ok = out ? cc_copy(g->pk, pa, g->kc, at, len) && cc_copy(g->pv, pa, g->vc, at, len)
+                 : cc_copy(g->kc, at, g->pk, pa, len) && cc_copy(g->vc, at, g->pv, pa, len);
+    }
+    ok = ok && cc_submit(1);
+    g->pn = out && ok ? n : 0;
+    if (!g->pn) { cc_free(g->pk); cc_free(g->pv); g->pk = g->pv = NULL; }
+    return ok;
 }
 static int q36_mc_norm(CcBuf *x, size_t xo, int xrow, size_t wo, CcBuf *y, size_t yo, int yrow, int rows, int D, float eps) {
     CcNorm np = {rows, D, 1, (int)xo, xrow, D, (int)yo, yrow, D, (int)wo, 0, CC_NORM_ADD1, eps, 1.f};

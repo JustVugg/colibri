@@ -1310,8 +1310,8 @@ static inline __attribute__((always_inline)) void i8r16_group2(float *y, int O, 
 static void matmul_q_idot_r16(float *y, const int8_t *xq, const float *sx, const int32_t *xsum,
                               const int8_t *q, const float *scale, int S, int I, int O){
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__)
-    if(S>=4&&(O/16)%2==0){   /* a prompt's rows: two groups a task */
-        #pragma omp parallel for schedule(static)
+    if(S>=4&&(O/16)%2==0){   /* a prompt's rows: two groups a task, handed out one at a time */
+        #pragma omp parallel for schedule(dynamic, 1)
         for(int g=0;g<O/16;g+=2){
             const int8_t *grp=q+(size_t)g*16*I; const float *sc=scale+16*g;
             for(int s0=0;s0<S;s0+=8){
@@ -1323,6 +1323,26 @@ static void matmul_q_idot_r16(float *y, const int8_t *xq, const float *sx, const
         return;
     }
 #endif
+    /* a prompt's rows: groups handed out one at a time (the fast cores of a hybrid CPU do not
+     * wait on the slow ones; a group is one thread's, the same bits); decode: the static split */
+    if(S>=4){
+        #pragma omp parallel for schedule(dynamic, 1)
+        for(int g=0;g<O/16;g++){
+            const int8_t *grp=q+(size_t)g*16*I; const float *sc=scale+16*g;
+            for(int s0=0;s0<S;s0+=8){
+                const int n=S-s0<8?S-s0:8; float *ys=y+(size_t)s0*O+16*g;
+                const int8_t *xs=xq+(size_t)s0*I; const float *sxs=sx+s0; const int32_t *xss=xsum+s0;
+                switch(n){
+                case 1: i8r16_group(ys,O,grp,sc,xs,sxs,xss,I,1); break;
+                case 2: i8r16_group(ys,O,grp,sc,xs,sxs,xss,I,2); break;
+                case 3: i8r16_group(ys,O,grp,sc,xs,sxs,xss,I,3); break;
+                case 4: i8r16_group(ys,O,grp,sc,xs,sxs,xss,I,4); break;
+                default: i8r16_group(ys,O,grp,sc,xs,sxs,xss,I,n); break;
+                }
+            }
+        }
+        return;
+    }
     #pragma omp parallel for schedule(static)
     for(int g=0;g<O/16;g++){
         const int8_t *grp=q+(size_t)g*16*I; const float *sc=scale+16*g;

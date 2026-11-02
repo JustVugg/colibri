@@ -173,6 +173,110 @@ DeepSeek V4 Flash UD-IQ1_S (82.5 GB) on an RTX PRO 4000 (24 GB, PCIe 4.0 x8) wit
 
 The same models on the CPU, Vulkan and CUDA, one machine and one build: [gpu-parity.md](gpu-parity.md).
 
+## OLMoE on the card (`olmoe_cuda_chain.h`)
+
+OLMoE-1B-7B is small enough to hold whole on a card (Q4_K_M: 3.9 GiB of experts and 0.6 GiB of
+the rest), so a CUDA build (`make olmoe CUDA=1`) with `COLI_CUDA=1` (`coli serve --gpu`) puts
+every layer, every routed expert and lm_head on the device and runs a step of any rows as one
+frame: the norms, q/k/v (one matrix where their forms agree), OLMoE's q and k norms over the
+whole projection, RoPE, the new K/V rows into a float16 mirror, the attention, o_proj, the router,
+its softmax and top-k, the experts and the residual adds, then the final norm and lm_head. The
+dense matrices stay in their GGUF blocks (or f32), the experts in their blocks or the merged
+checkpoint's int8 rows. It needs the whole model, a prompt chunk's scratch and the KV mirror in
+the card's free memory, and declines otherwise (the CPU runs it), as with `KV_SLOTS` > 1.
+
+While it runs, the device's KV cache is the one that counts: the host's catches up only when the
+CPU needs it (a step the chain declines reads the missing rows down), and a device lost mid-step
+rebuilds them on the CPU from the token ids the chain recorded, the CPU running from then on
+(`COLI_CUDA_CHAIN_FAULT=n` fakes the loss at the n-th frame).
+
+Measured on an RTX PRO 4000 (PCIe gen 4 x8), OLMoE-1B-7B-0125-Instruct Q4_K_M, `coli serve`,
+tok/s:
+
+| | prompt 1K / 3K tokens | decode after 1K |
+|---|---|---|
+| the CPU (before: no CUDA path) | 101 / 79 | 32.5 |
+| this chain | 9798-10107 / 8584-8599 | 316.5-316.6 |
+| our Vulkan chain, the same build | 4634 / 5140 | 275.0 |
+| the reference GGUF engine, CUDA | 10690 / 8403 | 325.9 |
+
+Where the time went, and what changed it (decode, a token): a RoPE reading its cos/sin table from
+host memory over the bus took 22.5 us a call (0.7 ms of 3.9), now copied to the device a frame;
+bringing every step's K/V rows down into the host's cache cost a 1K-token prompt more than its
+kernels, now they stay on the device; q, k and v in one matrix (and the q and k norms and RoPE
+in one launch each) took the decode from 293.6 to 315.0. `COLI_CUDA_CHAIN_QKV=0` keeps the three
+matrices apart.
+
+`tests/cuda_olmoe_compare.py` runs the tiny fixture's oracle on the CPU and on the device
+(`KV16=1`, `COLI_CUDA_CHAIN_ROWS=3`, `COLI_CUDA_CHAIN_QKV=0`, `COLI_CUDA_CHAIN_FAULT=n`): the
+reference's tokens and the last logits within 1e-5 of the CPU's.
+
+## The decision engines
+
+Laya (`laya.c`) and GLiNER2.5-Decide (`gliner_decide.c`) answer a decision with one forward
+over the request's rows and generate no text ([systemone.md](systemone.md#decision-engines)).
+In a CUDA build (`make laya gliner_decide CUDA=1`) with `COLI_CUDA=1` (`coli serve --gpu`),
+`decide_cuda.h` opens the device once the weights are loaded, uploads every matrix of the
+encoder and of Laya's head as f32 (the checkpoint's values), and runs each forward as frames
+of the CUDA chain, one submission a forward: the embedding rows go up, the activations stay on
+the device, and only the rows the scorer reads come back (Laya's markers and each sequence's
+first row, GLiNER2.5-Decide's `[L]` rows). The scorer, the act head and the classifier stay on
+the CPU. It is `decide_vk.h`'s forward, op for op, on the chain's encoder ops (`cc_enc_*` in
+`cuda_chain.h`, the arithmetic of `chain_enc.comp`): the LayerNorm with the residual add, a
+matrix's bias and its GELU or ReLU, ModernBERT's GeGLU and RoPE, a type row per row, the
+bidirectional attention over each row's range of rows with DeBERTa's two relative terms, and
+those terms' products. The LayerNorm sums in double as the engines do, and the GELU is
+`erff`'s.
+
+The device is `COLI_GPUS`' first (device 0 without it); `COLI_CUDA_CHAIN=0` keeps the
+forward on the CPU, and with `COLI_VULKAN=1` as well the Vulkan device takes it. A device lost
+mid-forward (`COLI_CUDA_CHAIN_FAULT=n` fakes it at the n-th frame) leaves that forward and
+every later one to the CPU, which recomputes it from the ids. Each request ends with
+`[CUDA] <engine> chain: F forwards on the device ..., N on the CPU`.
+
+Measured on an RTX PRO 4000 (the CPU an i5-13500, 6 performance-core threads), the release
+checkpoints, requests of 12 questions over a 1,700-character email:
+
+| | CPU, a request | CUDA, a request | the decisions | probabilities |
+|---|---|---|---|---|
+| Laya (ModernBERT-large, 28 layers; 6,144 rows a request) | 11.4-13.0 s | 0.69 s | the CPU's | within 3.3e-6 |
+| GLiNER2.5-Decide (DeBERTa-v3-large, 24 layers; one sequence of about 1,100 rows) | 2.0-2.6 s | 0.16-0.21 s | the CPU's | within 5.4e-7 |
+
+`tests/test_cuda_chain.cu` checks every encoder op against a CPU reference;
+`tests/cuda_decide_compare.py laya|gliner` runs each tiny fixture's cases on the CPU and on
+the device and holds the answers to the CPU's (the decisions, the refusals, every
+probability within 1e-5), with `COLI_CUDA_CHAIN_FAULT=n` a loss in the middle of the run.
+
+## Kernels that start while the one before ends (`COLI_CUDA_PDL`)
+
+A decode step runs its kernels one after another on one stream: about 800 a token on
+Qwen3.6-35B, 300 on OLMoE. With a plain launch the device sits idle between two of them while
+the next grid is set up and the last blocks of the one before drain. On sm_90 and later the
+chain's kernels start through programmatic dependent launch (`coli_launch`,
+`backend_gpu_compat.h`): the next kernel is set up while the one before ends, and its first
+statement waits on the device (`griddepcontrol.wait`) until the grids before it have completed
+and their writes are visible. Each kernel reads and writes what it did after a plain launch, so
+every result keeps its bits.
+
+It covers the CUDA chain's ops, the GGUF block GEMVs, and the backend kernels the chain reaches:
+the dense GEMVs and GEMMs of every format, the routed experts' kernels, their sort and their
+sum. HIP, cards before sm_90, a build whose code for the card was compiled below sm_90, and the
+legacy default stream launch plainly. `COLI_CUDA_PDL=0` does so everywhere.
+
+Measured on an RTX PRO 4000 (sm_120), alternating server starts, `dev` against this, tok/s:
+
+| | decode after 1K | decode after a long prompt | prompt |
+|---|---|---|---|
+| Qwen3.6-35B UD-Q4_K_M, every expert on the card | 101.1-102.3 -> 103.8-104.1 | 18K: 90.1-90.9 -> 92.4-92.7 | the same |
+| Qwen3.6-35B, colibri's int8 trunk and int4 experts | 105.0-105.5 -> 109.8-110.0 | 18K: 93.8-94.0 -> 97.2-97.4 | the same |
+| OLMoE-1B-7B Q4_K_M | 312.5-313.4 -> 322.4-322.8 | 3.8K: 239.8-240.6 -> 246.4-247.0 | the same |
+| Qwen3.8-Flash-Next IQ2_XS with the host pool | 40.8-41.1 -> 40.8-42.2 | 4.8K: 29.3-29.4 -> 28.7-30.0 | the same |
+
+The prompt column compares `COLI_CUDA_PDL=0` and `1` on one build, three alternated starts
+each (OLMoE: prompts of 1K and 3.4K tokens; Qwen3.6: 1K and 4.4K). Letting each kernel release
+the next one at its start (`griddepcontrol.launch_dependents`) measured slower: Qwen3.6
+103.3 / 102.7 tok/s after 1K against 104.8 / 103.9 with the wait alone.
+
 ## Notes and limitations
 
 - Text-mode timing reports prefill separately from decode.

@@ -19,6 +19,7 @@ layout(local_size_x = 256) in;
 layout(constant_id = 0) const int T = 12;
 
 layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 0) readonly buffer X4 { vec4 x4[]; };   // the same rows, four at a time (I a multiple of 64)
 layout(std430, binding = 1) readonly buffer W1 { uint w1[]; };
 layout(std430, binding = 1) readonly buffer W4 { uvec4 w4[]; };
 layout(std430, binding = 2) readonly buffer G { uint gt[]; };   // blockdec_table.h's table
@@ -78,9 +79,10 @@ void main() {
         } else {               // x rows: 64 x 64 values, 8 a uvec4, four a thread
             [[unroll]] for (uint e = tid - 2u * TM; e < TM * TK / 8u; e += 2u * TM) {
                 uint r = e / (TK / 8u), k = (e - r * (TK / 8u)) * 8u, s = min(s0 + r, S - 1u);
-                uint b = s * K + k0 + k;
+                uint b = (s * K + k0 + k) >> 2;   // two vec4 loads, not eight scalar ones
+                vec4 a = x4[b], c = x4[b + 1u];
                 sx[((r >> 4u) * 4u + (k >> 4u)) * 32u + (r & 15u) * 2u + ((k & 15u) >> 3u)] =
-                    uvec4(pkx(x[b], x[b + 1u]), pkx(x[b + 2u], x[b + 3u]), pkx(x[b + 4u], x[b + 5u]), pkx(x[b + 6u], x[b + 7u]));
+                    uvec4(pkx(a.x, a.y), pkx(a.z, a.w), pkx(c.x, c.y), pkx(c.z, c.w));
             }
         }
         barrier();

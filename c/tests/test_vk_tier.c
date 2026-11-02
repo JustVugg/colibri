@@ -1596,6 +1596,45 @@ static void pool_copy_case(void) {
     H = H0; F = F0;
 }
 
+/* The probe of the host-visible window (vk_window_decide, place_decide): COLI_VK_WINDOW_PROBE_MB=n says what the
+ * type took, on any device. Under 9/10 of its heap the device takes the staged path, at or over it the mapped one,
+ * and COLI_VK_STAGED=0 or 1 decides whatever the window is. The last two rows run the real loop
+ * (COLI_VK_WINDOW_ASK_MB asks a few GiB at most): one the device gives, one refused past COLI_VK_DEVICE_CAP_MB.
+ * A device that is staged on its own account (no Resizable BAR, COLI_VK_HOST_VISIBLE_CAP_MB) never gets to the
+ * probe: the case skips the rows that want the mapped path. */
+static void window_case(const char *spv) {
+    /* probe: COLI_VK_WINDOW_PROBE_MB, the answer without asking; ask: COLI_VK_WINDOW_ASK_MB, how much the real loop asks;
+     * cap: COLI_VK_DEVICE_CAP_MB, which refuses the blocks past it as a full card does */
+    static const struct { const char *staged, *probe, *ask, *cap; int want; const char *what; } t[] = {
+        {NULL, "1", NULL, NULL, 1, "a window of 1 MiB"},
+        {NULL, "100000000", NULL, NULL, 0, "a window of the whole heap and more"},
+        {"0", "1", NULL, NULL, 0, "COLI_VK_STAGED=0 over a window of 1 MiB"},
+        {"1", "100000000", NULL, NULL, 1, "COLI_VK_STAGED=1 over a window of the whole heap"},
+        {NULL, NULL, "1024", NULL, 0, "a real probe of 1 GiB, which the device gives"},
+        {NULL, NULL, "3072", "2048", 1, "a real probe of 3 GiB under a device cap of 2 GiB, which refuses the third"}};
+    static const char *const var[] = {"COLI_VK_STAGED", "COLI_VK_WINDOW_PROBE_MB", "COLI_VK_WINDOW_ASK_MB", "COLI_VK_DEVICE_CAP_MB"};
+    char *was[4];
+    for (int k = 0; k < 4; k++) { const char *v = getenv(var[k]); was[k] = v ? strdup(v) : NULL; }
+    for (size_t i = 0; i < sizeof t / sizeof *t; i++) {
+        const char *set[4] = {t[i].staged, t[i].probe, t[i].ask, t[i].cap};
+        for (int k = 0; k < 4; k++) { if (set[k]) setenv(var[k], set[k], 1); else unsetenv(var[k]); }
+        int ready = coli_vk_init(spv);
+        CHECK(ready, "window, %s: no device", t[i].what);
+        if (!ready) continue;
+        const int staged = coli_vk_staged();
+        if (!t[i].want && !t[i].staged && staged) {   /* staged on its own account, whatever the window: nothing to tell apart */
+            printf("  %s: skipped, the device takes staged uploads\n", t[i].what);
+            coli_vk_shutdown();
+            continue;
+        }
+        CHECK(staged == t[i].want, "window, %s: the device is %s, wanted %s", t[i].what,
+              staged ? "staged" : "mapped", t[i].want ? "staged" : "mapped");
+        printf("  %s: %s\n", t[i].what, staged ? "staged" : "mapped");
+        coli_vk_shutdown();
+    }
+    for (int k = 0; k < 4; k++) { if (was[k]) { setenv(var[k], was[k], 1); free(was[k]); } else unsetenv(var[k]); }
+}
+
 int main(int argc, char **argv) {
     char buf[1024];
     const char *spv = argc > 1 ? argv[1] : coli_vk_shader_path(buf, sizeof buf);
@@ -1644,6 +1683,7 @@ int main(int argc, char **argv) {
     coli_vk_shutdown();   /* with staged uploads: where the experts were ("[VK] memory at exit") */
     stream_commit_failure(spv);
     printf("wait timeout:\n"); wait_timeout(spv);
+    printf("window:\n"); window_case(spv);
     printf(fails ? "FAIL (%d)\n" : "PASS\n", fails);
     return fails != 0;
 }

@@ -81,6 +81,7 @@ static int qwen38_max_ctx(void) {
 #include "route_trace.h"             /* shared ROUTE_TRACE + .coli_usage contract */
 #include "serve_codec.h"             /* shared SUBMIT/STOP/CANCEL framing */
 #include "pin_pool.h"                /* piu scatti annidati dello stato */
+#include "argmax_first.h"            /* serve_sample's greedy pick */
 /* ---------- tokenizer (optional, for human-readable output) ---------- */
 static char **g_tok = NULL;   /* id -> piece string (strdup'd) */
 static int    g_tok_n = 0;
@@ -1442,7 +1443,7 @@ static int sample_prob_desc(const void *a, const void *b){
     return (x->id>y->id)-(x->id<y->id);
 }
 static int serve_sample(const float *lo, int V, float temp, float top_p){
-    if(temp<=0.f){ int b=0; for(int i=1;i<V;i++) if(lo[i]>lo[b]) b=i; return b; }
+    if(temp<=0.f) return argmax_first(lo, V);
     float *p=malloc((size_t)V*sizeof(float)); SampleProb *head=malloc((size_t)V*sizeof(SampleProb)); float mx=lo[0];
     if(!p||!head){ fprintf(stderr,"OOM sampling\n"); exit(1); }
     for(int i=1;i<V;i++) if(lo[i]>mx) mx=lo[i];
@@ -1902,8 +1903,235 @@ typedef struct { double started; uint64_t hits, misses; Q38Timers timers; } Q38R
  * the budget, ACCEPT, the pins and the prefix cache, the prefill and its read-out.
  * 1 with the prompt's ids and the logits after it; 0 when the request ended here,
  * its ERROR frame written. serve_one and serve_mux start every request here. */
+/* A served prompt in segments, so that a STOP or CANCEL arriving while it is read stops the
+ * reading instead of waiting for its end (a 40,000-token prompt took about 17 minutes on an
+ * 8-core CPU, and a client that gave up kept the engine busy all that time).
+ *
+ * Between two segments the state is the prompt read so far, recorded in the kv_prefix as any
+ * step leaves it, so a request that sends the same conversation again reuses all of it. On
+ * the CPU's layers the control is also polled before every layer (g_q38_breaker): a stop
+ * there puts back the recurrent state copied at the segment's start, and the rows the segment
+ * wrote are a stale tail. Segment boundaries change no result: the attention rows, the
+ * DeltaNet recurrence and the MoE routing are per row and in row order (qwen38_core.h).
+ *
+ * A chain takes segments of 8192 rows, the size of its own layer-by-layer segments, and checks
+ * between two layers (layer by layer) or two chunks inside them; it then declines the step,
+ * the CPU's loop sees the stop before its first layer, and the copy goes back here too. An
+ * echo (logprobs) and a prompt with an image are read in one call, as before.
+ * COLI_PROMPT_SEGMENT sets the rows (2048 on the CPU, 8192 for a chain). */
+static int q38_prompt_poll(ColiPromptBreak *b){   /* control: 1 STOP, 3 CANCEL (serve_read_req) */
+    while(!b->control&&!b->eof&&coli_stdin_readable()){
+        int r=serve_read_req(stdin,stdout,NULL,b->id);
+        if(r<0)b->eof=1;
+        else if(r==1||r==3)b->control=r;
+    }
+    return b->control!=0;
+}
+/* ids[from..np) at position from. NULL when a control stopped it (ctl->control says which).
+ * ctl NULL (the multiplexed loop, which owns its command stream): the same segments, no poll.
+ * One forward holds a segment's rows, never the context's: the planner prices that
+ * (family_registry.py, _qwen38_prompt_rows). */
+static float *q38_serve_prefill(Model *m,const int *ids,int from,int np,ColiPromptBreak *ctl){
+    int chain=0;
+#ifdef COLI_VULKAN
+    chain|=g_vk_chain!=0;
+#endif
+#ifdef COLI_CUDA
+    chain|=g_cuda_chain!=0;
+#endif
+    if(g_echo_k>0||(m->vis_map&&m->vis_rows_n>0))return step(m,ids+from,np-from,from);
+    /* a chain's segment is the one its own layer-by-layer prompt takes (q38cc_lm_rows), so it
+     * does the same work as when it took the prompt in one call */
+    const int seg=coli_prompt_segment_rows(chain?8192:2048);
+    if(!ctl){
+        float *lo=NULL;
+        for(int at=from;at<np;){
+            int n=np-at<seg?np-at:seg;
+            float *next=step(m,ids+at,n,at);
+            free(lo);lo=next;
+            if(!next)break;
+            at+=n;
+        }
+        return lo;
+    }
+    Q38PinState *st=NULL;
+    float *lo=NULL;
+    for(int at=from;at<np;){
+        if(coli_prompt_poll(ctl)){free(lo);lo=NULL;break;}
+        int n=np-at<seg?np-at:seg;
+        /* the state at the segment's start (from the device too, for a chain), so a stop inside
+         * the segment can put it back */
+        if(q38_pin_state_copy(m,&st,1))g_coli_prompt_break=ctl;
+        float *next=step(m,ids+at,n,at);
+        g_coli_prompt_break=NULL;
+        if(!next){q38_pin_state_copy(m,&st,0);free(lo);lo=NULL;break;}
+        free(lo);lo=next;at+=n;
+    }
+    q38_pin_state_free(st);
+    return lo;
+}
+
+/* ---- a long conversation parked for a short request -------------------------------- */
+/* A client's short request between two turns of a conversation (Hermes asks for its title
+ * after the first) leaves the conversation after a few tokens and would take the only state
+ * there is: the conversation's next turn then reads every token again (Qwen3.8 IQ2_XS on the
+ * CUDA chain: 14,785 tokens, 86 s). The conversation is parked instead: its tokens, its
+ * recurrent state (a pin's copy) and the K/V and index rows the request may write over; the
+ * request runs from the start; when its turn ends the conversation is back as it was, and its
+ * next turn reads only what is new. One conversation at a time (serve_one), a held one of at
+ * least Q38_PARK_MIN tokens (COLI_PARK_MIN sets another), a request shorter than it with what
+ * it may write; COLI_PARK=0 never parks. */
+#define Q38_PARK_MIN 1024
+#define Q38_PARK_GEN 4096    /* the request's tokens whose rows are kept apart: past them it is not a short one */
+static struct { int on, len, kv_len, rows, nl; int *fed; Q38PinState *st; float **K, **V, **IK;
+                Q38PrefixCache snap; } g_q38_park;   /* snap: the conversation's prompt-end snapshot, kept too */
+
+static void q38_park_free_rows(void){
+    for(int i=0;i<g_q38_park.nl;i++){
+        if(g_q38_park.K)free(g_q38_park.K[i]);
+        if(g_q38_park.V)free(g_q38_park.V[i]);
+        if(g_q38_park.IK)free(g_q38_park.IK[i]);
+    }
+    free(g_q38_park.K);free(g_q38_park.V);free(g_q38_park.IK);free(g_q38_park.fed);
+    g_q38_park.K=g_q38_park.V=g_q38_park.IK=NULL;g_q38_park.fed=NULL;g_q38_park.nl=0;g_q38_park.on=0;
+}
+/* rows [0, n) of an attention layer's K, V (head by head) and index keys, between the cache and a copy */
+static void q38_park_rows(Model *m,int i,int n,int out){
+    const Cfg *c=&m->c;const size_t D=(size_t)c->head_dim,ID=(size_t)c->idx_dim;
+    for(int h=0;h<c->kv_heads;h++){
+        float *k=m->K[i]+(size_t)h*m->kv_cap*D,*v=m->V[i]+(size_t)h*m->kv_cap*D;
+        float *pk=g_q38_park.K[i]+(size_t)h*n*D,*pv=g_q38_park.V[i]+(size_t)h*n*D;
+        if(out){memcpy(pk,k,(size_t)n*D*sizeof(float));memcpy(pv,v,(size_t)n*D*sizeof(float));}
+        else{memcpy(k,pk,(size_t)n*D*sizeof(float));memcpy(v,pv,(size_t)n*D*sizeof(float));}
+    }
+    if(out)memcpy(g_q38_park.IK[i],m->IK[i],(size_t)n*ID*sizeof(float));
+    else memcpy(m->IK[i],g_q38_park.IK[i],(size_t)n*ID*sizeof(float));
+}
+static void q38_park(Model *m,int np,int max_tok){
+    const char *e=getenv("COLI_PARK"),*mn=getenv("COLI_PARK_MIN");
+    const int H=m->kvp.len,gen=max_tok<Q38_PARK_GEN?max_tok:Q38_PARK_GEN,least=mn&&atoi(mn)>0?atoi(mn):Q38_PARK_MIN;
+    if((e&&*e=='0')||g_q38_park.on||!m->kvp.fed||m->kvp.tainted||H<least||m->kv_len!=H||
+       g_pending_image.present||np+gen+Q38_SPEC_ROWS>=H)return;
+    const Cfg *c=&m->c;const int L=q38_layer_rows(m),n=np+gen+Q38_SPEC_ROWS;
+    const size_t D=(size_t)c->head_dim,ID=(size_t)c->idx_dim;
+    g_q38_park.nl=L;
+    g_q38_park.K=(float**)calloc((size_t)L,sizeof(float*));g_q38_park.V=(float**)calloc((size_t)L,sizeof(float*));
+    g_q38_park.IK=(float**)calloc((size_t)L,sizeof(float*));g_q38_park.fed=(int*)malloc((size_t)H*sizeof(int));
+    int ok=g_q38_park.K&&g_q38_park.V&&g_q38_park.IK&&g_q38_park.fed;
+    for(int i=0;ok&&i<L;i++){
+        if(!m->K[i])continue;
+        g_q38_park.K[i]=(float*)malloc((size_t)c->kv_heads*n*D*sizeof(float));
+        g_q38_park.V[i]=(float*)malloc((size_t)c->kv_heads*n*D*sizeof(float));
+        g_q38_park.IK[i]=(float*)malloc((size_t)n*ID*sizeof(float));
+        ok=g_q38_park.K[i]&&g_q38_park.V[i]&&g_q38_park.IK[i];
+        if(ok)q38_park_rows(m,i,n,1);
+    }
+    /* the recurrent state from the device too, before anything of the request runs */
+    ok=ok&&q38_pin_state_copy(m,&g_q38_park.st,1);
+    if(!ok){q38_park_free_rows();return;}
+    memcpy(g_q38_park.fed,m->kvp.fed,(size_t)H*sizeof(int));
+    g_q38_park.len=H;g_q38_park.kv_len=m->kv_len;g_q38_park.rows=n;g_q38_park.on=1;
+    g_q38_park.snap=g_q38_prefix;memset(&g_q38_prefix,0,sizeof g_q38_prefix);   /* the request takes a snapshot of its own */
+    if(getenv("COLI_PREFIX_LOG"))
+        fprintf(stderr,"[PREFIX] the %d-token conversation parked for a %d-token request (%d rows kept apart)\n",H,np,n);
+}
+/* the end of the request's turn: the conversation back, its tokens, state and rows; the chains
+ * read its rows and state from the host again */
+static void q38_unpark(Model *m){
+    if(!g_q38_park.on)return;
+    q38_prefix_cache_dispose(&g_q38_prefix);   /* the request's snapshot; the conversation's comes back below */
+    g_q38_prefix=g_q38_park.snap;memset(&g_q38_park.snap,0,sizeof g_q38_park.snap);
+    if(m->kv_len+Q38_SPEC_ROWS>g_q38_park.rows||m->kv_cap<g_q38_park.len){
+        if(getenv("COLI_PREFIX_LOG"))
+            fprintf(stderr,"[PREFIX] the request wrote past the rows kept apart: the conversation will be read again\n");
+        q38_prefix_cache_invalidate();q38_park_free_rows();return;
+    }
+    for(int i=0;i<g_q38_park.nl;i++)if(m->K[i]&&g_q38_park.K[i])q38_park_rows(m,i,g_q38_park.rows,0);
+    q38_pin_state_copy(m,&g_q38_park.st,0);
+    memcpy(m->kvp.fed,g_q38_park.fed,(size_t)g_q38_park.len*sizeof(int));
+    m->kvp.len=g_q38_park.len;m->kvp.tainted=0;m->kv_len=g_q38_park.kv_len;
+#ifdef COLI_VULKAN
+    q38c_rollback(m,-1,0);
+#endif
+#ifdef COLI_CUDA
+    q38cc_rollback(m,-1,0);
+#endif
+    if(getenv("COLI_PREFIX_LOG"))fprintf(stderr,"[PREFIX] the %d-token conversation is back\n",g_q38_park.len);
+    q38_park_free_rows();
+}
+
+/* Where a chat prompt's answer starts: past its last "<|im_start|>assistant\n", when only the
+ * template's opening of the answer follows it (a few tokens: Qwen3.8's "<think>\n"); -1 when
+ * the prompt is not such a prompt. */
+static int q38_answer_start(const int *ids,int np){
+    static int *seq=NULL,n=-1;
+    if(n<0){
+        n=0;
+        if(g_tok){const char *s="<|im_start|>assistant\n";encode_text_n(s,strlen(s),&seq,&n);}
+    }
+    if(n<=0||!ids)return -1;
+    for(int j=np-n;j>=0&&j>=np-n-8;j--)
+        if(!memcmp(ids+j,seq,(size_t)n*sizeof(int)))return j+n<np?j+n:-1;
+    return -1;
+}
+/* The prompt [from, np) in two stretches when the answer's opening follows its last turn: the
+ * prompt-end snapshot is taken where the answer starts, not after the opening. A client that
+ * sends an answer back without its reasoning renders "<think>" with what follows otherwise
+ * ("\n\n</think>"): Hermes on Qwen3.8 left the snapshot one token short, and every turn read
+ * 14,809 tokens again. *snapped: 1 when the snapshot was taken here. */
+static float *q38_serve_prefill_at(Model *m,const int *ids,int from,int np,ColiPromptBreak *ctl,int snap_ok,int *snapped){
+    *snapped=0;
+    const int a=snap_ok?q38_answer_start(ids,np):-1;
+    if(a<=from)return q38_serve_prefill(m,ids,from,np,ctl);
+    float *lo=q38_serve_prefill(m,ids,from,a,ctl);
+    if(!lo)return NULL;
+    *snapped=q38_prefix_cache_save(m,ids,a,lo,0);
+    free(lo);
+    return q38_serve_prefill(m,ids,a,np,ctl);
+}
+
+/* COLI_PREFIX_LOG, a prompt that reused nothing: how far it follows what the engine holds (the
+ * live state's tokens, the prompt-end snapshot's) and the text where it stops. A model with
+ * recurrent layers restarts only from those two places, so a client that changes its history
+ * before them (a system prompt with the time in it, an answer sent back without its
+ * reasoning) re-reads the whole conversation every turn: this says where. */
+static int q38_common_len(const int *a,int na,const int *b,int nb){
+    int n=na<nb?na:nb,i=0;
+    if(!a||!b)return 0;
+    while(i<n&&a[i]==b[i])i++;
+    return i;
+}
+static void q38_log_ids_text(const char *what,const int *ids,int from,int to){
+    if(!g_tok||!ids)return;
+    if(from<0)from=0;
+    fprintf(stderr,"%s \"",what);
+    for(int i=from;i<to;i++){
+        unsigned char *t=NULL;int n=0;
+        if(decode_id_alloc(ids[i],&t,&n))break;
+        for(int j=0;j<n;j++){
+            unsigned char ch=t[j];
+            if(ch=='\n')fputs("\\n",stderr);else if(ch<32)fprintf(stderr,"\\x%02x",ch);else fputc(ch,stderr);
+        }
+        free(t);
+    }
+    fputs("\"\n",stderr);
+}
+static void q38_prefix_miss_log(Model *m,const int *ids,int np){
+    int hl=m->kvp.fed?m->kvp.len:0,sl=g_q38_prefix.valid?g_q38_prefix.len:0;
+    int dl=q38_common_len(ids,np,m->kvp.fed,hl),ds=q38_common_len(ids,np,g_q38_prefix.ids,sl);
+    fprintf(stderr,"[PREFIX] the prompt follows the live state for %d of its %d tokens, the prompt-end snapshot for %d of %d\n",
+            dl,hl,ds,sl);
+    const int at=dl>=ds?dl:ds,*held=dl>=ds?m->kvp.fed:g_q38_prefix.ids,len=dl>=ds?hl:sl;
+    if(at>=len)return;   /* it follows all of it: what stopped the reuse was not the text */
+    q38_log_ids_text("[PREFIX]   before:",ids,at-16,at);
+    q38_log_ids_text("[PREFIX]   prompt:",ids,at,at+16<np?at+16:np);
+    q38_log_ids_text("[PREFIX]   held:  ",held,at,at+16<len?at+16:len);
+}
+
+/* lone: one conversation, whose prompt reads its STOP or CANCEL while it is read
+ * (q38_serve_prefill); the multiplexed loop owns its command stream and passes 0. */
 static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, float **lo_out,
-                           Q38ReqClock *clk){
+                           Q38ReqClock *clk, int lone){
     int *ids=NULL, np=0;
     encode_text_n(q->payload,(size_t)q->plen,&ids,&np); /* byte-counted prompt; qwen38 adds no BOS */
     if(g_pending_image.present){
@@ -1988,9 +2216,11 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         if(reuse)
             fprintf(stderr,"[PREFIX] reusing %d of %d prompt tokens (%.0f%%) from %s\n",
                     reuse,np,100.0*reuse/np,reused_from);
-        else
+        else{
             fprintf(stderr,"[PREFIX] no reuse: held=%d prompt=%d%s%s\n",m->kvp.len,np,
                     m->kvp.tainted?" tainted":"",prefix_off?" (COLI_KV_PREFIX=0)":"");
+            q38_prefix_miss_log(m,ids,np);
+        }
         fflush(stderr);
     }
     /* L'eco vale per il prefill, e il predittore del primo token fresco sono i
@@ -2000,24 +2230,42 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     g_echo_pin_logit=(reuse>0&&reuse<np)
                      ? (pin_lo?pin_lo:q38_prefix_cached_logits(m)) : NULL;
     float *lo=NULL;
+    ColiPromptBreak ctl={.poll=q38_prompt_poll,.id=q->id},*pc=lone?&ctl:NULL;
+    /* the prompt-end snapshot where the answer starts (q38_serve_prefill_at): not for an echo
+     * (its logits per row), a pin (its own) or a picture's rows */
+    int snapped=0;const int snap_ok=!prefix_off&&!q->logprobs&&!q->pin&&!(m->vis_map&&m->vis_rows_n>0);
     if(reuse==np){
         const float *cached=q38_prefix_cached_logits(m);
         if(!cached){
             q38_prefix_cache_invalidate();reset_recurrent(m);m->kv_len=0;
-            lo=step(m,ids,np,0);reuse=0;
+            lo=q38_serve_prefill(m,ids,0,np,pc);reuse=0;
         }else{
             lo=falloc(m->c.vocab);
             memcpy(lo,cached,(size_t)m->c.vocab*sizeof(float));
         }
     }else if(reuse>0){
-        lo=step(m,ids+reuse,np-reuse,reuse);
+        lo=q38_serve_prefill_at(m,ids,reuse,np,pc,snap_ok,&snapped);
     }else{
+        if(lone&&!prefix_off&&!q->logprobs)q38_park(m,np,q->max_tok);   /* a short request: the conversation kept apart */
         /* A miss invalidates the snapshot before reset so no later request can
          * pair its recurrent state with the old token record. */
         q38_prefix_cache_invalidate();reset_recurrent(m);m->kv_len=0;
-        lo=step(m,ids,np,0);
+        lo=q38_serve_prefill_at(m,ids,0,np,pc,snap_ok,&snapped);
     }
     g_echo_k=0; g_echo_id=NULL; g_echo_pin_logit=NULL;   /* la lettura e finita col prefill */
+    if(ctl.control){
+        /* stopped while reading: what was read stays the live state; a STOP ends the turn
+         * with no token, a CANCEL with the error the gateway waits for */
+        coli_prompt_break_log(ctl.control==3,m->kvp.len,np);
+        if(ctl.control==3)coli_serve_write_error(stdout,q->id,"CANCELLED");
+        else{
+            ColiServeDone done={0,0.0,0.0,rss_gb(),np,0};
+            coli_serve_write_done(stdout,q->id,&done);
+        }
+        fflush(stdout);
+        free(ids);
+        return 0;
+    }
     /* Una fotografia chiesta esplicitamente sopravvive alle richieste che la
      * estendono; la si lascia andare solo quando non e servita a niente
      * (reuse==0: il prompt nuovo non comincia piu con lei), cosi la chat
@@ -2033,7 +2281,7 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
             else k->len=0;                 /* senza stato lo scatto e una bugia */
         }
     }
-    if(reuse!=np&&
+    if(reuse!=np&&!snapped&&
        !q38_prefix_cache_save(m,ids,np,lo,0)&&getenv("Q38_PREFIX_LOG"))
         fprintf(stderr,"[qwen38 prefix] cache disabled for request %s (state snapshot unavailable)\n",q->id);
     if(getenv("Q38_PREFIX_LOG"))
@@ -2043,9 +2291,16 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     return 1;
 }
 
+static int serve_one_turn(Model *m, ServeReq *q);
+/* one request; a conversation parked for it (q38_park) comes back when it ends, however it ends */
 static int serve_one(Model *m, ServeReq *q){
+    int r=serve_one_turn(m,q);
+    q38_unpark(m);
+    return r;
+}
+static int serve_one_turn(Model *m, ServeReq *q){
     int *ids=NULL, np=0; float *lo=NULL; Q38ReqClock clk;
-    if(!q38_serve_start(m,q,&ids,&np,&lo,&clk)) return 0;
+    if(!q38_serve_start(m,q,&ids,&np,&lo,&clk,1)) return 0;
     double request_started=clk.started;
     uint64_t hits_before=clk.hits, misses_before=clk.misses;
     Q38Timers timers_before=clk.timers;
@@ -2301,7 +2556,7 @@ static int q38_mux_read(Model *m,Q38MuxReq *rq,int n){
     r->q.logprobs=command.logprobs;r->q.pin=command.pin;
     coli_serve_command_dispose(&command);
     q38_mux_bind(m,r->q.slot);
-    int ok=q38_serve_start(m,&r->q,&r->ids,&r->np,&r->lo,&r->clk);
+    int ok=q38_serve_start(m,&r->q,&r->ids,&r->np,&r->lo,&r->clk,0);
     free(r->q.payload);r->q.payload=NULL;
     if(!ok)return 0;
     q38_vision_detach(m);   /* the image's rows are the prompt's: no decode row reads them */
@@ -2432,7 +2687,9 @@ int main(int argc, char **argv) {
      * do. Without it this engine takes one thread per logical CPU, which on an
      * SMT host doubles the team for no arithmetic and pays a barrier per tiny
      * per-expert region (#718 measured +2.3x from the sizing alone on a
-     * 16C/32T part). OMP_NUM_THREADS wins, COLI_NO_OMP_TUNE=1 disables. */
+     * 16C/32T part). OMP_NUM_THREADS wins, COLI_NO_OMP_TUNE=1 disables. Before it,
+     * the hot team (omp_tune.h), which re-runs the engine once with libgomp's settings. */
+    coli_omp_hot_team(argv, "qwen38", coli_omp_env_on("COLI_CUDA") || coli_omp_env_on("COLI_METAL"));
     coli_omp_tune_threads("qwen38");
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }

@@ -904,6 +904,10 @@ static int inkc_forward_seg(Model *m, InkChain *ch, float *xh, int S, int pos_ba
     if (want_x && !xfin) return 0;
     vkc_gemm_rows(-1);
     for (int c0 = 0; c0 < S; c0 += rows) {
+        /* a served prompt's CANCEL between two chunks (prompt_break.h): not taken, and step_mm
+         * leaves without a CPU redo; ink_serve_start starts the state over (state_reset tells
+         * the device too) */
+        if (coli_prompt_break()) { free(xfin); return 0; }
         int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0;
         if (!vkc_begin() || !vkc_write(ch->x, 0, xh + (size_t)c0 * D, (size_t)n * D * sizeof(float)) ||
             !inkc_push_state(ch, m, pb, n)) goto lost;

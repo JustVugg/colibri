@@ -52,6 +52,10 @@
 #else
 #include <dirent.h>
 #endif
+#if defined(__linux__) || defined(__FreeBSD__)
+#include <sched.h>
+#include <unistd.h>
+#endif
 
 /* Numero di core FISICI, o 0 se non determinabile. Mai un valore inventato. */
 #if defined(_WIN32)
@@ -249,6 +253,63 @@ static void coli_omp_tune_threads(const char *engine)
                 engine, phys, logical);
 #else
     (void)engine;
+#endif
+}
+
+/* 1 when an engine switch such as COLI_CUDA is on (set, and not 0/false/off/no) */
+static inline int coli_omp_env_on(const char *name)
+{
+    const char *v = getenv(name);
+    if (!v || !*v) return 0;
+    return !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0 || strcmp(v, "off") == 0 || strcmp(v, "no") == 0);
+}
+
+/* The hot team colibri.c gives itself, for the engines that only had the sizing above:
+ * OMP_WAIT_POLICY=active with GOMP_SPINCOUNT=200000 (spin a moment between the many small
+ * matmul regions of a token, then sleep, so a wait on the disk does not burn a core),
+ * KMP_BLOCKTIME=200 for LLVM's libomp (#341: an idle team spinning forever), the team on
+ * whole cores (OMP_PROC_BIND=close, OMP_PLACES=cores) and of fixed size. libgomp reads them
+ * in its constructor, before main(): they are set, then the engine runs itself again, once
+ * (Linux, FreeBSD). Not on macOS (#707: slower with Apple's libomp), not with CUDA or Metal
+ * on (gpu_on; colibri.c leaves those out too), not under COLI_NO_OMP_TUNE; a variable the
+ * user set wins. On Linux the engine keeps its own name (the path /proc/self/exe points to,
+ * not "exe": a `pgrep -x olmoe` still finds it). Measured on an i5-13500 (6 P + 8 E cores),
+ * served, Q4_K_M on the CPU: OLMoE decode 43.3 and 42.7 -> 47.9 and 47.6 tok/s, LFM3 33.7
+ * and 33.8 -> 34.5 and 34.5, Qwen3.6 13.5 -> 13.9, Qwen3.8 IQ2_XS from the disk 7.9-8.1 -> 9.0-9.1
+ * (its prompt 4% slower) (docs/tuning.md). */
+static void coli_omp_hot_team(char **argv, const char *engine, int gpu_on)
+{
+#if defined(_OPENMP) && !defined(__APPLE__) && (defined(__linux__) || defined(__FreeBSD__))
+    if (getenv("COLI_OMP_TUNED") || getenv("COLI_NO_OMP_TUNE") || gpu_on || !argv || !argv[0]) return;
+    setenv("OMP_WAIT_POLICY", "active", 0);
+    setenv("GOMP_SPINCOUNT", "200000", 0);
+    setenv("KMP_BLOCKTIME", "200", 0);
+    setenv("OMP_PROC_BIND", "close", 0);
+    setenv("OMP_PLACES", "cores", 0);
+    setenv("OMP_DYNAMIC", "FALSE", 0);
+    setenv("COLI_OMP_TUNED", "1", 1);
+    fprintf(stderr, "[OMP] %s: hot-thread tuning, re-exec once (COLI_NO_OMP_TUNE=1 to skip)\n", engine);
+#ifdef __linux__
+#ifdef CPU_SETSIZE
+    {   /* #471: a user's OMP_PROC_BIND already bound this thread to one place; the new image
+         * would inherit that mask and put its whole team there */
+        cpu_set_t all; CPU_ZERO(&all);
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        if (n > CPU_SETSIZE) n = CPU_SETSIZE;
+        for (long i = 0; i < n; i++) CPU_SET((int)i, &all);
+        if (sched_setaffinity(0, sizeof all, &all) != 0) perror("[OMP] sched_setaffinity before the re-exec (continuing)");
+    }
+#endif
+    char self[4096];
+    ssize_t k = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (k > 0) { self[k] = 0; execv(self, argv); }
+    execv("/proc/self/exe", argv);
+#else
+    execv("/proc/curproc/file", argv);
+#endif
+    perror("[OMP] re-exec failed, running untuned");
+#else
+    (void)argv; (void)engine; (void)gpu_on;
 #endif
 }
 

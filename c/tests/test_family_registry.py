@@ -151,7 +151,9 @@ class FamilyRegistryTest(unittest.TestCase):
         # vision_config and no model.visual.* tensors.
         by_id, _ = _build_registry(FAMILIES)
         for family_id, expected in (("glm53", True), ("qwen38", True), ("qwen36", True),
-                                    ("deepseek_v41", True), ("mimo", True), ("glm", False), ("kimi", False),
+                                    ("deepseek_v41", True), ("mimo", True),
+                                    ("glm", True),   # Mistral-Large-4's pictures (expand_ml4_images); GLM-5.2's engine says vision=0
+                                    ("kimi", False),
                                     ("inkling", False), ("olmoe", False),
                                     ("deepseek_v4", False), ("qwen_image", False)):
             with self.subTest(family=family_id):
@@ -293,6 +295,18 @@ class FamilyRegistryTest(unittest.TestCase):
             moe_chunk_bytes, delta_chunk_bytes)
         expected_workspace = max(legacy_workspace, batched_workspace)
         self.assertEqual(geometry.workspace_bytes, expected_workspace)
+
+        # serve reads a prompt in segments (q38_serve_prefill): past one segment's rows the
+        # forward's buffers stop growing with the context; the K/V and index rows do not
+        segment = planner_geometry(resolved, 8192)
+        full = planner_geometry(resolved, 262144)
+        self.assertEqual(full.context_state_bytes,
+                         12 * 262144 * (2 * 2 * 256 + 128) * 4 + 262144 * 4)
+        pooled = 4 * (2 * (262144 // 4) - 2 * (8192 // 4))   # the selection's pooled scores
+        self.assertLessEqual(full.workspace_bytes, segment.workspace_bytes + pooled)
+        self.assertLess(full.workspace_bytes, 1_500_000_000)
+        with mock.patch.dict("os.environ", {"COLI_PROMPT_SEGMENT": "2048"}):
+            self.assertLess(planner_geometry(resolved, 262144).workspace_bytes, full.workspace_bytes)
 
         family = resolved.descriptor
         invalid = {
@@ -1086,7 +1100,8 @@ class FamilyRegistryTest(unittest.TestCase):
         source = cli_path.read_text(encoding="utf-8")
         self.assertNotRegex(source, r"family\.(?:cli|gateway)_adapter\s+not in")
         self.assertNotIn("K3CHAT1", source)
-        self.assertEqual(source.count("if not family.has_gateway_adapter:"), 3)
+        # tune, chat, serve and tui start the gateway: each checks the adapter first
+        self.assertEqual(source.count("if not family.has_gateway_adapter:"), 4)
         self.assertEqual(source.count("if not family.has_cli_adapter:"), 1)
         self.assertEqual(set(openai_server.family_ids()),
                          {family.id for family in FAMILIES})
@@ -1685,7 +1700,7 @@ class DisplayVariantTest(unittest.TestCase):
         self.assertEqual([v["display_name"] for v in meta["display_variants"]],
                          ["Qwen3.6-35B-A3B", "Qwen3.8-2.4T-A95B", "Qwen3.8-27B",
                           "Qwen3-Coder-30B-A3B", "Qwen3-Coder-REAP-25B-A3B", "Flint",
-                          "Muse-Spark-Open-816B-A42B"])
+                          "Muse-Spark-Open-816B-A42B", "LFM3-VL-2B"])
         self.assertEqual(meta["display_variants"][3]["geometry"],
                          {"num_hidden_layers": 48, "num_experts": 128, "hidden_size": 2048})
         self.assertEqual(meta["display_variants"][2]["geometry"],

@@ -13,6 +13,8 @@
  *   - bdf_decode: shaders/blockdec.glsl's general path, every block type, a 32-weight unit
  *     as int weights with a scale and a min per 16, in floats (the other types: Q4_0, Q4_1,
  *     Q5_0, Q5_1, TQ1_0, TQ2_0, MXFP4, NVFP4, Q1_0).
+ *   - F16 (101) and BF16 (130): units of 32 values (64 bytes) read as floats by the float
+ *     GEMV, bd_dec16h and bd_dec16 (blockdec_host.h's blocks of 32).
  * A row's words: W (32-bit, 16-byte aligned rows for Q4_K and Q5_K, whose 144- and 176-byte
  * blocks keep it); a field at any even byte comes from one word or two (bd_ldu). */
 #ifndef CUDA_BD_CUH
@@ -621,7 +623,86 @@ __device__ __forceinline__ void bd_bytes16(const bd_u32 *__restrict__ W, bd_u32 
     b[0] = bd_ldu(W, off); b[1] = bd_ldu(W, off + 4u); b[2] = bd_ldu(W, off + 8u); b[3] = bd_ldu(W, off + 12u);
 }
 __device__ __forceinline__ bd_u32 bd_byte_of(const bd_u32 *b, int j) { return (b[j >> 2] >> (8 * (j & 3))) & 0xffu; }
+/* bd_dec16's 16 weights for the types whose codes come to f16 exactly by their bits (Q8_0,
+ * Q4_K, Q5_K, Q6_K), as eight half2: four codes of a word, each a byte, go to two half2 of
+ * 1024 + code (0x64 above the byte: f16's integers from 1024 are exact), 1024 (and a code's
+ * offset) less, then times the scale less the min in half2: about two instructions a weight
+ * where bd_dec16 and the f16 rounding after it took six (Qwen3.6 UD-Q4_K_M, a 1K-token
+ * prompt on an RTX PRO 4000: the experts' gate and up 133 ms, 24 with no decode at all). The
+ * same codes; the scale and the min rounded to f16 before the product, not after it. */
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+__device__ __forceinline__ bd_u32 bd_h2u(__half2 h) { return *reinterpret_cast<bd_u32 *>(&h); }
+__device__ __forceinline__ __half2 bd_u2h(bd_u32 u) { return *reinterpret_cast<__half2 *>(&u); }
+__device__ __forceinline__ void bd_codes_h(bd_u32 c4, __half2 off, __half2 s, __half2 m, bd_u32 *o) {
+    /* four byte codes: bytes 0, 1 and 2, 3 with 0x64 above each, then (1024 + c - off) * s - m */
+    __half2 a = __hsub2(bd_u2h(__byte_perm(c4, 0x64646464u, 0x5140u)), off);
+    __half2 b = __hsub2(bd_u2h(__byte_perm(c4, 0x64646464u, 0x5342u)), off);
+    o[0] = bd_h2u(__hfma2(a, s, m)); o[1] = bd_h2u(__hfma2(b, s, m));
+}
+/* two BF16 values as a half2, held to +-65504 as the f16 GEMMs hold their inputs (a NaN stays one) */
+__device__ __forceinline__ float bd_hold(float f) { return f != f ? f : fminf(fmaxf(f, -65504.f), 65504.f); }
+__device__ __forceinline__ bd_u32 bd_bf2h2(bd_u32 v) {
+    return bd_h2u(__floats2half2_rn(bd_hold(__uint_as_float(v << 16)), bd_hold(__uint_as_float(v & 0xffff0000u))));
+}
+__device__ __forceinline__ bool bd_dec16h(int t, const bd_u32 *__restrict__ W, bd_u32 e0, bd_u32 *out) {
+    if (t == 1 || t == 30) {   /* F16, BF16: the 16 values are bytes 2 e0 .. 2 e0 + 31 (16-byte aligned) */
+        uint4 a = bd_w4(W, e0 >> 3), b = bd_w4(W, (e0 >> 3) + 1u);
+        bd_u32 v[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+        #pragma unroll
+        for (int k = 0; k < 8; k++)
+            out[k] = t == 1 ? v[k] : bd_bf2h2(v[k]);
+        return true;
+    }
+    if (t == 12 || t == 13) {   /* Q4_K, Q5_K: groups of 32, a 6-bit scale and min each */
+        bd_u32 b = e0 >> 8, e = e0 & 255u, c = e >> 6, pos = e & 63u, hi = pos >= 32u, g = 2u * c + hi, p = pos & 31u;
+        bd_u32 base = b * (t == 12 ? 144u : 176u);
+        uint4 hd = bd_w4(W, base >> 4);
+        uint2 sm = bdi_k4sm(hd, g);
+        float d = bd_h2f(hd.x) * (float)sm.x, m = bd_h2f(hd.x >> 16) * (float)sm.y;
+        uint4 q = bd_w4(W, (base + (t == 12 ? 16u : 48u) + 32u * c + p) >> 4);
+        uint4 h = t == 13 ? bd_w4(W, (base + 16u + p) >> 4) : make_uint4(0u, 0u, 0u, 0u);
+        bd_u32 qw[4] = {q.x, q.y, q.z, q.w}, hw[4] = {h.x, h.y, h.z, h.w}, sh = hi ? 4u : 0u;
+        __half2 off = __float2half2_rn(1024.f), s2 = __float2half2_rn(d), m2 = __float2half2_rn(-m);
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            bd_u32 v = (qw[k] >> sh) & 0x0F0F0F0Fu;
+            if (t == 13) v |= ((hw[k] >> g) & 0x01010101u) << 4;
+            bd_codes_h(v, off, s2, m2, out + 2 * k);
+        }
+        return true;
+    }
+    if (t == 14) {   /* Q6_K: (6-bit code - 32), a signed scale per 16 */
+        bd_u32 b = e0 >> 8, e = e0 & 255u, n = e >> 7, r = e & 127u, base = b * 210u;
+        bd_u32 ql[4], qh[4];
+        bd_bytes16(W, base + 64u * n + (r & 63u), ql); bd_bytes16(W, base + 128u + 32u * n + (r & 31u), qh);
+        bd_u32 ns = 4u * (r >> 6), hs = 2u * (r >> 5);
+        float d = bd_f16at(W, base + 208u) * (float)(int)(signed char)bd_u8at(W, base + 192u + (e >> 4));
+        __half2 off = __float2half2_rn(1056.f), s2 = __float2half2_rn(d), z2 = __float2half2_rn(0.f);
+        #pragma unroll
+        for (int k = 0; k < 4; k++) bd_codes_h(((ql[k] >> ns) & 0x0F0F0F0Fu) | (((qh[k] >> hs) & 0x03030303u) << 4), off, s2, z2, out + 2 * k);
+        return true;
+    }
+    if (t == 8) {   /* Q8_0: blocks of 32, signed codes (their top bit flipped: code + 128) */
+        bd_u32 b = e0 >> 5, base = b * 34u, w[4];
+        bd_bytes16(W, base + 2u + 16u * ((e0 >> 4) & 1u), w);
+        __half2 off = __float2half2_rn(1152.f), s2 = __float2half2_rn(bd_f16at(W, base)), z2 = __float2half2_rn(0.f);
+        #pragma unroll
+        for (int k = 0; k < 4; k++) bd_codes_h(w[k] ^ 0x80808080u, off, s2, z2, out + 2 * k);
+        return true;
+    }
+    return false;
+}
+#endif
 __device__ __forceinline__ bool bd_dec16(int t, const bd_u32 *__restrict__ W, bd_u32 e0, const bd_u32 *__restrict__ tab, float *out) {
+    if (t == 1 || t == 30) {   /* F16, BF16: the values themselves */
+        #pragma unroll
+        for (int j = 0; j < 16; j += 2) {
+            bd_u32 v = bd_w(W, (e0 + (bd_u32)j) >> 1);
+            out[j] = t == 1 ? bd_h2f(v) : __uint_as_float(v << 16);
+            out[j + 1] = t == 1 ? bd_h2f(v >> 16) : __uint_as_float(v & 0xffff0000u);
+        }
+        return true;
+    }
     if (t == 12 || t == 13) {   /* Q4_K, Q5_K: groups of 32, a 6-bit scale and min each */
         bd_u32 b = e0 >> 8, e = e0 & 255u, c = e >> 6, pos = e & 63u, hi = pos >= 32u, g = 2u * c + hi, p = pos & 31u;
         bd_u32 base = b * (t == 12 ? 144u : 176u);
@@ -788,6 +869,7 @@ __host__ __device__ inline size_t bd_gemv_i8_smem(int T, int I, int nr) { return
 template <int T, int NR>
 __global__ static void __launch_bounds__(256) bd_gemv_i8_k(float *__restrict__ y, const float *__restrict__ x, const bd_u32 *__restrict__ W,
         const bd_u32 *__restrict__ tab, int I, int O, int rowWords, int S, int nr, int lpr) {
+    COLI_PDL_WAIT();
     extern __shared__ uint4 bd_sm4[];
     constexpr int TW = bd_tab_words(T);
     BdTabs tb = bd_tables_fill<T>(reinterpret_cast<bd_u32 *>(bd_sm4), tab);
@@ -826,6 +908,7 @@ __host__ __device__ inline size_t bd_gemv_f_smem(int I, int nr) { return (size_t
 template <int NR>
 __global__ static void __launch_bounds__(256) bd_gemv_f_k(float *__restrict__ y, const float *__restrict__ x, const bd_u32 *__restrict__ W,
         const bd_u32 *__restrict__ tab, int fmt, int I, int O, int rowWords, int S, int nr) {
+    COLI_PDL_WAIT();
     extern __shared__ float4 bd_smf[];
     int s0 = (int)blockIdx.y * nr, nrow = min(nr, S - s0);
     int I4 = I / 4, XR = bd_x4(I4) + 1;
@@ -839,6 +922,31 @@ __global__ static void __launch_bounds__(256) bd_gemv_f_k(float *__restrict__ y,
         #pragma unroll
         for (int r = 0; r < NR; r++) acc[r] = 0.f;
         for (int u = lane; u < units; u += 32) {
+            if (fmt == 101 || fmt == 130) {   /* F16, BF16: the unit's 32 values (64 bytes), no scale */
+                float wf[32];
+                #pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    uint4 v = bd_w4(Wr, 4u * (bd_u32)u + (bd_u32)k);
+                    bd_u32 ww[4] = {v.x, v.y, v.z, v.w};
+                    #pragma unroll
+                    for (int h = 0; h < 4; h++) {
+                        wf[8 * k + 2 * h] = fmt == 101 ? bd_h2f(ww[h]) : __uint_as_float(ww[h] << 16);
+                        wf[8 * k + 2 * h + 1] = fmt == 101 ? bd_h2f(ww[h] >> 16) : __uint_as_float(ww[h] & 0xffff0000u);
+                    }
+                }
+                #pragma unroll
+                for (int r = 0; r < NR; r++) if (r < nrow) {
+                    const float4 *xr = bd_smf + r * XR;
+                    float a = 0.f;
+                    #pragma unroll
+                    for (int j4 = 0; j4 < 8; j4++) {
+                        float4 p = xr[bd_x4(8 * u + j4)];
+                        a += wf[4 * j4] * p.x + wf[4 * j4 + 1] * p.y + wf[4 * j4 + 2] * p.z + wf[4 * j4 + 3] * p.w;
+                    }
+                    acc[r] += a;
+                }
+                continue;
+            }
             int wv[32]; float sA, mA, sB, mB;
             bdf_decode(fmt, Wr, (bd_u32)u, tab, wv, sA, mA, sB, mB);
             #pragma unroll
@@ -864,6 +972,51 @@ __global__ static void __launch_bounds__(256) bd_gemv_f_k(float *__restrict__ y,
     }
 }
 
+/* BF16 rows (fmt 130) for a decode step's or a verify's rows: a warp a row, each lane eight weights
+ * (16 bytes) a step, so a warp's loads cover 512 contiguous bytes; x read through the cache as two
+ * float4s a step, each weight exact as a float (a BF16 is a float's top half), the NR rows of x
+ * sharing every weight load. bd_gemv_f_k's form for BF16 (a 64-byte unit a lane, x from shared
+ * memory) ran a 10240 x 2560 matrix at about a third of the bus's rate on an RTX PRO 4000. */
+template<int NR>
+__global__ static void __launch_bounds__(256) bd_gemv_bf16_k(float *__restrict__ y, const float *__restrict__ x, const bd_u32 *__restrict__ W,
+        int I, int O, int rowWords, int S, int nr) {
+    COLI_PDL_WAIT();
+    const int s0 = (int)blockIdx.y * nr, nrow = min(nr, S - s0), lane = threadIdx.x & 31, warp = threadIdx.x >> 5, C = I / 8;
+    for (int o = (int)blockIdx.x * 8 + warp; o < O; o += (int)gridDim.x * 8) {
+        const uint4 *Wr = reinterpret_cast<const uint4 *>(W + (size_t)o * rowWords);
+        float acc[NR];
+        #pragma unroll
+        for (int r = 0; r < NR; r++) acc[r] = 0.f;
+        for (int c = lane; c < C; c += 32) {
+            const uint4 v = __ldg(Wr + c);
+            const float w0 = __uint_as_float(v.x << 16), w1 = __uint_as_float(v.x & 0xffff0000u), w2 = __uint_as_float(v.y << 16),
+                        w3 = __uint_as_float(v.y & 0xffff0000u), w4 = __uint_as_float(v.z << 16), w5 = __uint_as_float(v.z & 0xffff0000u),
+                        w6 = __uint_as_float(v.w << 16), w7 = __uint_as_float(v.w & 0xffff0000u);
+            #pragma unroll
+            for (int r = 0; r < NR; r++) if (r < nrow) {
+                const float4 *xr = reinterpret_cast<const float4 *>(x + (size_t)(s0 + r) * I) + 2 * c;
+                const float4 a = __ldg(xr), b = __ldg(xr + 1);
+                acc[r] += w0 * a.x + w1 * a.y + w2 * a.z + w3 * a.w + w4 * b.x + w5 * b.y + w6 * b.z + w7 * b.w;
+            }
+        }
+        #pragma unroll
+        for (int r = 0; r < NR; r++) if (r < nrow) {
+            float v = acc[r];
+            for (int off = 16; off > 0; off >>= 1) v += bd_shfl_xor(v, off);
+            if (lane == 0) y[(size_t)(s0 + r) * O + o] = v;
+        }
+    }
+}
+static int bd_gemv_bf16_launch(float *y, const float *x, const bd_u32 *W, int I, int O, int rowWords, int S, cudaStream_t st) {
+    if (I % 8 || (rowWords & 3) || ((uintptr_t)x & 15) || ((uintptr_t)W & 15)) return 0;
+    const int nr = S < BD_GEMV_NR ? S : BD_GEMV_NR;
+    int bx = (O + 7) / 8;
+    if (bx > 4 * BD_GEMV_BLOCKS) bx = 4 * BD_GEMV_BLOCKS;
+    dim3 g((unsigned)bx, (unsigned)((S + nr - 1) / nr));
+    if (nr > 1) coli_launch(bd_gemv_bf16_k<BD_GEMV_NR>, g, 256, 0, st, y, x, W, I, O, rowWords, S, nr);
+    else coli_launch(bd_gemv_bf16_k<1>, g, 256, 0, st, y, x, W, I, O, rowWords, S, 1);
+    return 1;
+}
 /* The launch for a block-format matrix (fmt 100 + t, rows of rowWords words at W, I a
  * multiple of 32 and of the type's block) on S rows of x: the integer form where the type
  * has one (each verify's rows a block, up to BD_GEMV_NR), else the float form. smem_max:
@@ -889,11 +1042,11 @@ static int bd_gemv_i8_launch(float *y, const float *x, const bd_u32 *W, const bd
     if (nr > 1) {
         static unsigned raised;   /* past 48 KiB a kernel asks for it, once a device */
         bd_smem_raise((const void *)bd_gemv_i8_k<T, BD_GEMV_NR>, sm, smem_max, &raised);
-        bd_gemv_i8_k<T, BD_GEMV_NR><<<g, 256, sm, st>>>(y, x, W, tab, I, O, rowWords, S, nr, lpr);
+        coli_launch(bd_gemv_i8_k<T, BD_GEMV_NR>, g, 256, sm, st, y, x, W, tab, I, O, rowWords, S, nr, lpr);
     } else {
         static unsigned raised;
         bd_smem_raise((const void *)bd_gemv_i8_k<T, 1>, sm, smem_max, &raised);
-        bd_gemv_i8_k<T, 1><<<g, 256, sm, st>>>(y, x, W, tab, I, O, rowWords, S, 1, lpr);
+        coli_launch(bd_gemv_i8_k<T, 1>, g, 256, sm, st, y, x, W, tab, I, O, rowWords, S, 1, lpr);
     }
     return 1;
 }
@@ -909,17 +1062,17 @@ static int bd_gemv_f_launch(float *y, const float *x, const bd_u32 *W, const bd_
     if (nr > 1) {
         static unsigned raised;   /* past 48 KiB a kernel asks for it, once a device */
         bd_smem_raise((const void *)bd_gemv_f_k<BD_GEMV_NR>, sm, smem_max, &raised);
-        bd_gemv_f_k<BD_GEMV_NR><<<g, 256, sm, st>>>(y, x, W, tab, fmt, I, O, rowWords, S, nr);
+        coli_launch(bd_gemv_f_k<BD_GEMV_NR>, g, 256, sm, st, y, x, W, tab, fmt, I, O, rowWords, S, nr);
     } else {
         static unsigned raised;
         bd_smem_raise((const void *)bd_gemv_f_k<1>, sm, smem_max, &raised);
-        bd_gemv_f_k<1><<<g, 256, sm, st>>>(y, x, W, tab, fmt, I, O, rowWords, S, 1);
+        coli_launch(bd_gemv_f_k<1>, g, 256, sm, st, y, x, W, tab, fmt, I, O, rowWords, S, 1);
     }
     return 1;
 }
 /* 1 = fmt is a block format this file decodes (I a multiple of its block, checked by the caller) */
 static inline int bd_fmt_ok(int fmt) {
-    if (fmt < 102 || fmt >= 143) return 0;
+    if (fmt < 101 || fmt >= 143) return 0;
     int t = fmt - 100;
     return BD_BLK[t] >= 32;
 }
@@ -933,6 +1086,7 @@ static int bd_gemv_launch(float *y, const float *x, const bd_u32 *W, const bd_u3
 #undef BD_I8_CASE
         default: break;
     }
+    if (!force_float && fmt == 130 && bd_gemv_bf16_launch(y, x, W, I, O, rowWords, S, st)) return 1;
     return bd_gemv_f_launch(y, x, W, tab, fmt, I, O, rowWords, S, smem_max, st);
 }
 #endif
