@@ -79,6 +79,8 @@ typedef struct {
      * keys from there (q38cc_srv_where); hd_res: every one in the pool */
     uint8_t *hd_base, *hd_res; size_t hd_stride; int hd_tg, hd_td, hd_k0;
     CcBuf *hd_ids, *hd_w, *hd_idsd, *hd_wd; unsigned long long hd_rows;
+    /* or on the card in Q2_0 (q38cc_head_card): hd_dev their bytes, hd_tab their entries */
+    CcBuf *hd_dev, *hd_tab; unsigned long long hd_card_rows;
     CcBuf *dv_ids, *dv_y, *dv_x, *dv_pick; unsigned long long dv_drafts;   /* the draft list scored on the card */
     unsigned long long mtp_rows, drafts;
     float *host_routed, *host_emb;
@@ -142,6 +144,7 @@ static int q38cc_mtp_planned(Model *m) {
     return m->mtp && e && *e && *e != '0' && !(k && *k == '0');
 }
 static int q38cc_dm_able(Q38CChain *ch, Model *m);
+static int q38cc_head_card(Q38CChain *ch, Model *m);
 static int g_cuda_chain = 0;     /* COLI_CUDA_CHAIN asked for it and the chain is up */
 static unsigned long long g_q38cc_mtp_rows;   /* the MTP head's rows the chain ran, every model (tests) */
 
@@ -299,6 +302,23 @@ static size_t q38cc_prompt_stage_bytes(Model *m) {
     if (n > (size_t)m->c.experts) n = (size_t)m->c.experts;
     return n * st;
 }
+/* The MTP head's routed experts on the card in Q2_0 (q38cc_head_card), COLI_CUDA_CHAIN_MTP_CARD=0
+ * off: the head's file has them in Q8_0 (2.49 GiB for Qwen3.8's 512), and a draft's ten from RAM
+ * kept the card waiting 1.9 ms for the CPU (an i5-13500, 16 threads) against 0.6 ms of the
+ * head's own work. A draft is only a guess the verify judges: its experts' precision moves how
+ * often a draft passes, never the text. Gate, up and down at 0, Q38CC_PAD(gate), twice that. */
+static int q38cc_head_card_on(Model *m) {
+    const char *e = getenv("COLI_CUDA_CHAIN_MTP_CARD");
+    if ((e && *e == '0') || !q38cc_mtp_planned(m) || !g_q38_gguf || m->c.experts <= 0 || m->c.hidden % 64 || m->c.inter % 64 ||
+        !cc_moe_block_type(GQ_Q2_0))
+        return 0;
+    const gguf_tensor *g[3]; q38_gg_expert_tensors(m, m->c.layers, g);
+    for (int q = 0; q < 3; q++) if (!g[q] || !gq_has_int(g[q]->type)) return 0;
+    return 1;
+}
+static size_t q38cc_head_card_stride(const Cfg *c) {
+    return 2 * Q38CC_PAD(gq_row_bytes(GQ_Q2_0, c->hidden) * c->inter) + Q38CC_PAD(gq_row_bytes(GQ_Q2_0, c->inter) * c->hidden);
+}
 /* the K/V mirrors in float16: the rows rounded to it (q38_kv16) and a backend that reads such a
  * cache (cc_attn_h); a mirror holds their values exactly, in half the device memory */
 static int q38cc_kvh(void) { return q38_kv16() && cc_kvh_ready(); }
@@ -351,6 +371,7 @@ static size_t q38cc_reserve_bytes(Model *m) {
             if (!offered) b += (size_t)hw[k]->rows * hw[k]->cols * 4;
         }
     }
+    if (head && q38cc_head_card_on(m)) b += (size_t)c->experts * q38cc_head_card_stride(c);   /* the head's experts in Q2_0 */
     /* a sixteenth more: the chain's buffers came to 3.92 GiB against 4.31 estimated (Qwen3.8 IQ2_XS, 65536 positions) */
     return b + b / 16 + q38cc_prompt_stage_bytes(m);
 }
@@ -544,6 +565,7 @@ static Q38CChain *q38cc_setup(Model *m, int mux_slots) {
     { const char *e = getenv("COLI_CUDA_CHAIN_FAULT"); ch->fault_at = e && *e ? strtoull(e, NULL, 10) : 0; }
     ch->ok = 1;
     ch->dm_on = q38cc_dm_able(ch, m);
+    if (ch->dm_on) q38cc_head_card(ch, m);   /* the MTP head's experts in Q2_0 on the card */
     if (ch->dm_on) fprintf(stderr, "[chain] qwen38: a decode step's routed experts in the frame (the tier's residents by address, "
                                    "format %d%s, group %d; COLI_CUDA_CHAIN_MOE=0: the host's step)\n", ch->dm_fmt,
                                    ch->dm_fmt >= 100 ? " (a GGUF's blocks, by layer)" : "", ch->dm_gs);
@@ -1429,7 +1451,7 @@ static void q38cc_pool_init(Model *m) {
         g_q38cc_pg_team = ch->pc_team;
     }
     if (ch->pool_cpu && fit > 0 && !ch->srv) q38cc_srv_up(ch, m);
-    if (ch->srv) q38cc_head_pool(ch, m);
+    if (ch->srv && !ch->hd_tab) q38cc_head_pool(ch, m);
     if (ch->pool_n == all && full)
         fprintf(stderr, "[chain] qwen38: host pool, every expert (the %d the card leaves and its own %d) in %.2f GiB of page-locked RAM "
                         "the device reads over the bus (%.1f s to allocate, %.1f s to read; COLI_CUDA_CHAIN_POOL=0 off)\n",
@@ -2245,6 +2267,110 @@ static void q38cc_srv_up(Q38CChain *ch, Model *m) {
     fprintf(stderr, "[chain] qwen38: the pool's server: %d threads for a decode step's pooled experts (COLI_CUDA_CHAIN_SERVE_THREADS=0: "
                     "the recording thread's)\n", ch->srv->started);
 }
+/* One pass of a block's Q2_0 search: v = s x, its code q = round(v id) within -1..2, the sums of v q and
+ * q q (eight lanes, integer rounding and clamps: the loop vectorizes) */
+static void q38cc_q2_0_pass(const float *x, float s, float id, float *sxq, float *sqq) {
+    float a[8] = {0}, c8[8] = {0};
+    for (int j = 0; j < 64; j += 8)
+        for (int l = 0; l < 8; l++) {
+            const float v = s * x[j + l];
+            int q = (int)(v * id + 8.5f) - 8; q = q < -1 ? -1 : q; q = q > 2 ? 2 : q;
+            a[l] += v * (float)q; c8[l] += (float)(q * q);
+        }
+    *sxq = *sqq = 0.f;
+    for (int l = 0; l < 8; l++) { *sxq += a[l]; *sqq += c8[l]; }
+}
+/* 64 weights as a Q2_0 block (ggml_quants.h's gq_blk_q2_0: an f16 scale d, then a 2-bit code c a
+ * weight, weight 4k + r in bits 2r of byte k, its value (c - 1) d). The grid {-1, 0, 1, 2} is not
+ * symmetric, so both signs of d are tried, each from two starts (the wider side's end on its code,
+ * 0.6 of it), every start refitted by least squares twice; the least squared error wins, and the
+ * codes are taken again for the f16 scale. */
+static void q38cc_q2_0_block(const float *x, uint8_t *b) {
+    float mx = x[0], mn = x[0];
+    for (int j = 1; j < 64; j++) { mx = x[j] > mx ? x[j] : mx; mn = x[j] < mn ? x[j] : mn; }
+    float best = INFINITY, bd = 0.f;
+    for (int s = -1; s <= 1; s += 2) {
+        const float hi = s > 0 ? mx : -mn, lo = s > 0 ? -mn : mx, big = hi / 2 > lo ? hi / 2 : lo, st[2] = {big, 0.6f * big};
+        for (int k = 0; k < 2; k++) {
+            float d = st[k];
+            for (int it = 0; it < 3 && d > 0.f; it++) {
+                float sxq, sqq;
+                q38cc_q2_0_pass(x, (float)s, 1.f / d, &sxq, &sqq);
+                const float e = d * d * sqq - 2.f * d * sxq;   /* the squared error less the block's sum of squares */
+                if (e < best) { best = e; bd = s * d; }
+                if (sqq <= 0.f || sxq <= 0.f) break;
+                d = sxq / sqq;
+            }
+        }
+    }
+    const uint16_t h = kv16_from(bd);
+    const float d = kv16_to(h), id = d != 0.f ? 1.f / d : 0.f;
+    uint8_t c[64];
+    for (int j = 0; j < 64; j++) { int q = (int)(x[j] * id + 8.5f) - 8; q = q < -1 ? -1 : q; q = q > 2 ? 2 : q; c[j] = (uint8_t)(q + 1); }
+    b[0] = (uint8_t)(h & 0xff); b[1] = (uint8_t)(h >> 8);
+    for (int k = 0; k < 16; k++) b[2 + k] = (uint8_t)(c[4 * k] | c[4 * k + 1] << 2 | c[4 * k + 2] << 4 | c[4 * k + 3] << 6);
+}
+/* The MTP head's routed experts on the card in Q2_0 (q38cc_head_card_on): read from the head's
+ * file a few at a time, each row's blocks quantized, copied up; the table points at them. A draft
+ * routes, computes them and sums them on the card (q38cc_mtp_rows). 0: they stay where they were
+ * (the pool's server, q38cc_head_pool), the card had no room or no copy. */
+static int q38cc_head_card(Q38CChain *ch, Model *m) {
+    if (!q38cc_head_card_on(m) || !ch->mtp_on || !ch->dm_on || !cc_fetch_ready() || ch->hd_tab) return 0;
+    Cfg *c = &m->c; const int L = c->layers, E = c->experts, K = c->topk, H = c->hidden, I = c->inter;
+    const gguf_tensor *t[3]; q38_gg_expert_tensors(m, L, t);
+    const int64_t eb[3] = {gq_row_bytes(t[0]->type, H) * I, gq_row_bytes(t[1]->type, H) * I, gq_row_bytes(t[2]->type, I) * H};
+    const int64_t qg = gq_row_bytes(GQ_Q2_0, H), qd = gq_row_bytes(GQ_Q2_0, I);
+    const size_t pg = Q38CC_PAD(qg * I), stride = q38cc_head_card_stride(c), r = (size_t)Q38CC_DM_ROWS;
+    const double t0 = now_s();
+    if (!cc_reserve(&ch->hd_dev, (size_t)E * stride, CC_DEV) || !cc_reserve(&ch->hd_tab, (size_t)E * sizeof(CcExpert), CC_DEV) ||
+        !cc_reserve(&ch->hd_ids, r * K * 4, CC_DEV) || !cc_reserve(&ch->hd_w, r * K * 4, CC_DEV)) {
+        cc_free(ch->hd_dev); cc_free(ch->hd_tab); ch->hd_dev = ch->hd_tab = NULL;
+        fprintf(stderr, "[chain] qwen38: no room on the card for the MTP head's experts in Q2_0 (%.2f GiB); they stay in RAM\n",
+                (double)E * stride / 1073741824.0);
+        return 0;
+    }
+    const char *base = (const char *)cc_dev_addr(ch->hd_dev);
+    enum { B = 32 };   /* experts a copy */
+    uint8_t *hb = base ? (uint8_t *)malloc((size_t)B * stride) : NULL;
+    CcExpert *tab = hb ? (CcExpert *)calloc((size_t)E, sizeof *tab) : NULL;
+    int ok = tab != NULL;
+    for (int e0 = 0; e0 < E && ok; e0 += B) {
+        const int ne = E - e0 < B ? E - e0 : B;
+        int bad = 0;
+        #pragma omp parallel for schedule(dynamic, 1) reduction(| : bad) num_threads(omp_get_num_procs())
+        for (int k = 0; k < ne * 3; k++) {   /* an expert's matrix */
+            const int x = k / 3, q = k % 3, rows = q < 2 ? I : H, cols = q < 2 ? H : I;
+            const int64_t rb = gq_row_bytes(t[q]->type, cols), qb = q < 2 ? qg : qd;
+            uint8_t *raw = (uint8_t *)malloc((size_t)eb[q]), *dst = hb + (size_t)x * stride + (size_t)q * pg;
+            float *f = (float *)malloc((size_t)cols * sizeof(float));
+            if (!raw || !f) bad = 1;
+            else {
+                q38_gg_read(t[q], raw, (int64_t)(e0 + x) * eb[q], eb[q]);
+                for (int o = 0; o < rows && !bad; o++) {
+                    if (gq_dequant_row(t[q]->type, raw + (int64_t)o * rb, f, cols)) { bad = 1; break; }
+                    for (int j = 0; j < cols; j += 64) q38cc_q2_0_block(f + j, dst + (int64_t)o * qb + (j / 64) * 18);
+                }
+            }
+            free(raw); free(f);
+        }
+        ok = !bad && cc_begin() && cc_write(ch->hd_dev, (size_t)e0 * stride / 4, hb, (size_t)ne * stride) && cc_submit(1);
+    }
+    for (int e = 0; e < E && ok; e++) {
+        const char *g = base + (size_t)e * stride;
+        tab[e].g = g; tab[e].u = g + pg; tab[e].d = g + 2 * pg;
+    }
+    ok = ok && cc_begin() && cc_write(ch->hd_tab, 0, tab, (size_t)E * sizeof *tab) && cc_submit(1);
+    free(hb); free(tab);
+    if (!ok) {
+        cc_free(ch->hd_dev); cc_free(ch->hd_tab); ch->hd_dev = ch->hd_tab = NULL;
+        if (cc_lost()) return 0;
+        fprintf(stderr, "[chain] qwen38: the MTP head's experts did not reach the card in Q2_0; they stay in RAM\n");
+        return 0;
+    }
+    fprintf(stderr, "[chain] qwen38: the MTP head's %d routed experts on the card in Q2_0 (%.2f GiB, from %s in %.1f s; "
+                    "COLI_CUDA_CHAIN_MTP_CARD=0: in RAM)\n", E, (double)E * stride / 1073741824.0, gq_type_name(t[0]->type), now_s() - t0);
+    return 1;
+}
 /* The MTP head's routed experts for the pool's server: every one in RAM as the pool lays them out
  * (gate, up and down at 0, Q38CC_PAD(gate), twice that), read once from the head's GGUF. A draft
  * then routes on the device and the server computes its experts while the card runs the shared
@@ -2632,8 +2758,16 @@ static int q38cc_mtp_rows(Model *m, const float *streams, const int *next, int S
                  cc_ew(ch->hyper, ch->ones, ch->blk, NULL, NULL, &add);
         ok = ok && q38cc_gr_read(ch, m, &l->attn_gr, ch->o_an[L], n, ch->inj_a) && q38cc_attention(ch, m, l, L, n, pb) &&
              q38cc_gr_apply(ch, m, ch->inj_a, n) && q38cc_gr_read(ch, m, &l->mlp_gr, ch->o_mn[L], n, ch->inj_m);
-        const int hyb = ch->hd_base && ch->srv && ch->dm_dfl && n <= Q38CC_DM_ROWS;   /* the head's experts on the pool's server */
-        if (hyb) {   /* routed on the device, the server computes them while the card runs the shared expert, one frame */
+        const int card = ch->hd_tab && ch->dm_hid && ch->dm_y && n <= Q38CC_DM_ROWS;   /* the head's experts on the card */
+        const int hyb = !card && ch->hd_base && ch->srv && ch->dm_dfl && n <= Q38CC_DM_ROWS;   /* on the pool's server */
+        if (card) {   /* routed, computed and summed on the card, in Q2_0 (q38cc_head_card) */
+            CcRoute rp = {n, E, c->topk, 0, 0, E, 0, 0, 0, c->topk, 0, c->topk, 1, 1, c->norm_topk ? 1 : 0, 1.f, 1.f, 0.f};
+            CcMoe mp = {n, c->topk, H, c->inter, 100 + GQ_Q2_0, 0, 0, 3, 0, 0, H, 0, c->topk, 0, c->topk, 0, H, -1, E, 0, 100 + GQ_Q2_0};
+            ok = ok && cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->hd_ids, ch->hd_w, &rp) &&
+                 q38cc_shared(ch, m, l, L, n) && cc_moe(ch->hd_tab, ch->mixed, ch->hd_ids, ch->hd_w, ch->dm_hid, ch->dm_y, NULL, &mp) &&
+                 q38cc_moe_apply(ch, m, n, ch->dm_y);
+            ch->hd_card_rows += (unsigned long long)n;
+        } else if (hyb) {   /* routed on the device, the server computes them while the card runs the shared expert, one frame */
             CcRoute rp = {n, E, c->topk, 0, 0, E, 0, 0, 0, c->topk, 0, c->topk, 1, 1, c->norm_topk ? 1 : 0, 1.f, 1.f, 0.f};
             const unsigned v = ++ch->dm_seq;
             const size_t nk = (size_t)n * c->topk;
@@ -2669,7 +2803,7 @@ static int q38cc_mtp_rows(Model *m, const float *streams, const int *next, int S
         ok = ok && cc_submit(1);
         if (sv) { ok = q38cc_srv_close(sv, ok, ch->dm_seq) && ok; q38cc_srv_books(ch); sv = NULL; }
         if (!ok) goto lost;
-        if (hyb) q38cc_kv_down(ch, m, L, n, pb);
+        if (hyb || card) q38cc_kv_down(ch, m, L, n, pb);
         if (settle) { ch->kv_valid[L] = pb + n; m->mtp_len = pb + n; }
         if (last && hidden) memcpy(hidden, cc_ptr(ch->hypd), (size_t)W * sizeof(float));
         if (last && logit && voc) {
@@ -2703,6 +2837,7 @@ static void q38cc_report(Model *m) {
                 ch->dm_steps, ch->dm_hyb, ch->dm_pairs, ch->dm_host_ms, ch->dm_spin_ms, ch->pool_reads);
     if (ch->dv_drafts) fprintf(stderr, "[chain] qwen38: %llu drafts from the draft list's lm_head rows on the card\n", ch->dv_drafts);
     if (ch->hd_rows) fprintf(stderr, "[chain] qwen38: %llu MTP head rows with their routed experts on the pool's server\n", ch->hd_rows);
+    if (ch->hd_card_rows) fprintf(stderr, "[chain] qwen38: %llu MTP head rows with their routed experts on the card (Q2_0)\n", ch->hd_card_rows);
     if (ch->srv && ch->sv_jobs)
         fprintf(stderr, "[chain] qwen38: the pool's server (%d threads): %llu layer steps, %llu pooled slots (%llu experts' groups) "
                         "in %.1f ms (%.1f us a slot)\n", ch->srv->started, ch->sv_jobs, ch->sv_slots, (unsigned long long)Q38CC_LD(&ch->srv->groups),

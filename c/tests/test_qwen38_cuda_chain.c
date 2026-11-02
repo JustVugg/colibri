@@ -266,6 +266,42 @@ int main(void) {
         free(pool); free(x); free(out); free(want);
     }
 
+    printf(" the MTP head's experts in Q2_0 for the card (q38cc_q2_0_block)\n");
+    {   /* blocks of weights as gq_blk_q2_0 decodes them back: within the 2-bit grid's error, which
+         * on Gaussian weights is about 0.41 of their RMS; zeros stay zeros, a flat block is exact on
+         * either sign (the grid's 2 or its -1) */
+        float x[64], y[64]; uint8_t b[18];
+        double err = 0, mag = 0, worst = 0;
+        for (int t = 0; t < 400; t++) {
+            const float sc = 0.001f + (float)(t_rnd() % 1000) / 1000.f * 0.05f, skew = (t & 1) ? 1.f : -1.f;
+            double e = 0, m = 0;
+            for (int j = 0; j < 64; j++) {
+                float g = 0.f;
+                for (int k = 0; k < 6; k++) g += (float)(t_rnd() % 10000) / 10000.f - 0.5f;
+                x[j] = sc * g + (j == t % 64 ? skew * 3.f * sc : 0.f);   /* one weight well out on one side */
+            }
+            q38cc_q2_0_block(x, b);
+            if (gq_dequant_row(GQ_Q2_0, b, y, 64)) { worst = 1e9; break; }
+            for (int j = 0; j < 64; j++) { e += (double)(x[j] - y[j]) * (x[j] - y[j]); m += (double)x[j] * x[j]; }
+            err += e; mag += m;
+            if (e / m > worst) worst = e / m;
+        }
+        tk(sqrt(err / mag) < 0.45 && sqrt(worst) < 0.6, "random blocks within the grid's error");
+        for (int j = 0; j < 64; j++) x[j] = 0.f;
+        q38cc_q2_0_block(x, b);
+        int zero = !gq_dequant_row(GQ_Q2_0, b, y, 64);
+        for (int j = 0; j < 64; j++) zero = zero && y[j] == 0.f;
+        tk(zero, "a block of zeros decodes to zeros");
+        int flat = 1;
+        for (int s = -1; s <= 1; s += 2) {
+            for (int j = 0; j < 64; j++) x[j] = s * 0.0123f;
+            q38cc_q2_0_block(x, b);
+            flat = flat && !gq_dequant_row(GQ_Q2_0, b, y, 64);
+            for (int j = 0; j < 64; j++) flat = flat && fabsf(y[j] - x[j]) <= 1e-3f * 0.0123f;
+        }
+        tk(flat, "a flat block, positive or negative, decodes to itself");
+    }
+
     if (t_fails) { printf("test_qwen38_cuda_chain: %d failure(s)\n", t_fails); return 1; }
     printf("OK test_qwen38_cuda_chain: Qwen3.8's chain on the card gives the oracle's tokens\n");
     return 0;
