@@ -1,9 +1,12 @@
-"""Client hangups cancel Responses work even before the backend emits text."""
+"""Confirmed client resets cancel Responses work; orderly half-close stays valid."""
+import http.client
 import importlib.util
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import socket
+import struct
+import os
 import select
 import sys
 import threading
@@ -21,6 +24,13 @@ from test_openai_server import ScriptedEngine, _spawn_test_server
 spec = importlib.util.spec_from_file_location("responses_disconnect_shim", C.parent / "ui/responses_shim.py")
 shim = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(shim)
+
+
+def reset_connection(connection):
+    # Winsock's linger members are unsigned shorts; POSIX uses two ints.
+    linger = struct.pack("HH" if os.name == "nt" else "ii", 1, 0)
+    connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, linger)
+    connection.close()
 
 
 class PrefillEngine(ScriptedEngine):
@@ -99,9 +109,12 @@ class ResponsesDisconnectTest(unittest.TestCase):
         try:
             self.assertTrue(engine.entered.wait(2), "backend never entered prefill")
         finally:
-            connection.close()
+            if proxy:
+                reset_connection(connection)
+            else:
+                connection.close()
         try:
-            self.assertTrue(engine.cancelled.wait(1), "disconnected client left prefill running")
+            self.assertTrue(engine.cancelled.wait(1), "reset client left prefill running")
             self.assertTrue(engine.finished.wait(1))
             # The cancelled request must release admission for the next request.
             next_body = {"model": "test-model", "stream": False}
@@ -113,6 +126,44 @@ class ResponsesDisconnectTest(unittest.TestCase):
             self.assert_watchers_finished()
         finally:
             engine.release.set()
+
+    def half_close(self, streaming):
+        engine, endpoint, path = self.harness(True)
+        data = json.dumps({"input": "hello", "model": "test-model", "stream": streaming}).encode()
+        connection = socket.create_connection((endpoint.hostname, endpoint.port), timeout=3)
+        try:
+            connection.sendall(("POST %s HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret\r\n"
+                                "Content-Type: application/json\r\nContent-Length: %d\r\n\r\n" % (path, len(data))).encode() + data)
+            self.assertTrue(engine.entered.wait(2))
+            connection.shutdown(socket.SHUT_WR)
+            self.assertFalse(engine.cancelled.wait(0.2), "write-half-close abandoned a live response reader")
+            engine.release.set()
+            response = http.client.HTTPResponse(connection)
+            try:
+                response.begin()
+                self.assertEqual(response.status, 200)
+                body = response.read()
+                if streaming:
+                    self.assertIn(b"response.completed", body)
+                else:
+                    self.assertEqual(json.loads(body)["status"], "completed")
+            finally:
+                response.close()
+            self.assertTrue(engine.finished.wait(1))
+            req = Request(endpoint.geturl() + path, data=json.dumps({"input": "next", "model": "test-model"}).encode(), headers={
+                "Content-Type": "application/json", "Authorization": "Bearer secret"})
+            with urlopen(req, timeout=3) as next_response:
+                self.assertEqual(json.load(next_response)["status"], "completed")
+            self.assert_watchers_finished()
+        finally:
+            engine.release.set()
+            connection.close()
+
+    def test_streaming_half_close_keeps_response_reader_and_next_request_alive(self):
+        self.half_close(True)
+
+    def test_nonstreaming_half_close_keeps_response_reader_and_next_request_alive(self):
+        self.half_close(False)
 
     def assert_watchers_finished(self):
         for thread in threading.enumerate():
@@ -221,7 +272,7 @@ class ResponsesDisconnectTest(unittest.TestCase):
                 self.assert_watchers_finished()
                 return
         finally:
-            connection.close()
+            reset_connection(connection)
         try:
             self.assertTrue(gone.wait(1), "response-owned upstream socket stayed open")
             self.assert_watchers_finished()
@@ -245,10 +296,10 @@ class ResponsesDisconnectTest(unittest.TestCase):
     def test_direct_gateway_prefill_cancellation_control(self):
         self.disconnect(False, True)
 
-    def test_streaming_responses_disconnect_cancels_prefill(self):
+    def test_streaming_responses_reset_cancels_prefill(self):
         self.disconnect(True, True)
 
-    def test_nonstreaming_responses_disconnect_cancels_prefill(self):
+    def test_nonstreaming_responses_reset_cancels_prefill(self):
         self.disconnect(True, False)
 
 

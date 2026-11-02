@@ -243,11 +243,17 @@ def _cancel_on_disconnect(h, conn):
         while not stopped.wait(0.05):
             try:
                 readable, _, _ = select.select([h.connection], [], [], 0)
-                if not readable or h.connection.recv(1, socket.MSG_PEEK) != b"":
+                if not readable:
                     continue
+                if h.connection.recv(1, socket.MSG_PEEK) == b"":
+                    # FIN closes only the peer's write side. It may still be
+                    # reading its response; do not cancel that valid request.
+                    return
+                continue
+            except ConnectionResetError:
+                disconnected.set()
             except (OSError, ValueError):
-                pass
-            disconnected.set()
+                return
             try:
                 upstream.shutdown(socket.SHUT_RDWR)
             except OSError:
