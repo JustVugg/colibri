@@ -2387,6 +2387,47 @@ class WindowsToolchainTests(unittest.TestCase):
 
 
 
+class DownloadProgressTest(HomeTestCase):
+    def test_resumed_download_speed_ignores_bytes_already_on_disk(self):
+        entry = mock.Mock(repo="tester/m", revision="main", include=None, exclude=None, id="m")
+        model_dir = os.path.join(self.tmp.name, "model")
+        os.makedirs(model_dir)
+        stream = io.StringIO()
+        stream.isatty = lambda: True
+        ui = setup_flow.UI(False, stream=stream)
+        clock = {"t": 1_000.0}
+        total = 1_000_000_000
+
+        def pull(*args, progress, **kwargs):
+            clock["t"] = 1_000.0
+            progress({"file": "config.json", "done": 1_000, "total": total, "fresh": 0})
+            clock["t"] = 1_000.3
+            progress({"file": "model.safetensors", "done": 900_000_000, "total": total, "fresh": 0})
+            clock["t"] = 1_002.3
+            progress({"file": "model.safetensors", "done": 902_000_000, "total": total, "fresh": 2_000_000})
+
+        with mock.patch.object(setup_download, "hf_token", return_value=None), \
+             mock.patch.object(setup_download, "list_repo_files",
+                               return_value=[{"path": "model.safetensors", "size": total}]), \
+             mock.patch.object(setup_download, "bytes_present", return_value=900_000_000), \
+             mock.patch.object(setup_hw, "disk_free", return_value=None), \
+             mock.patch.object(setup_hw, "is_wsl", return_value=False), \
+             mock.patch.object(setup_flow.time, "time", side_effect=lambda: clock["t"]), \
+             mock.patch.object(setup_flow, "write_state"), \
+             mock.patch.object(setup_flow, "write_state_throttled"), \
+             mock.patch.object(setup_download, "download_repo", side_effect=pull):
+            setup_flow.download_model(ui, entry, model_dir)
+        text = stream.getvalue()
+        self.assertIn("resuming:", text)
+        lines = [line.strip() for line in text.split("\r") if line.strip()]
+        verified = next(line for line in lines if "90.0%" in line)
+        self.assertIn("?", verified)
+        self.assertNotIn("MB/s", verified)
+        moving = next(line for line in lines if "90.2%" in line)
+        self.assertIn("1.0 MB/s", moving)
+        self.assertIn("2 min left", moving)
+
+
 class PortFreeTest(unittest.TestCase):
     """A port is free when nothing answers on it AND a server could bind it now."""
 
