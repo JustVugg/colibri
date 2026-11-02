@@ -162,7 +162,7 @@ class Events:
             return ""
         m, self.msg = self.msg, None
         part = {"type": "output_text", "text": m["text"], "annotations": []}
-        item = {"type": "message", "id": m["id"], "role": "assistant", "status": "completed", "content": [part]}
+        item = {"type": "message", "id": m["id"], "role": "assistant", "status": "incomplete" if self.incomplete_reason else "completed", "content": [part]}
         self.items.append(item)
         return self.ev("response.output_text.done", item_id=m["id"], output_index=m["i"], content_index=0, text=m["text"]) + \
             self.ev("response.content_part.done", item_id=m["id"], output_index=m["i"], content_index=0, part=part) + \
@@ -228,7 +228,7 @@ class Events:
                 out.append(self.ev("response.custom_tool_call_input.delta", item_id=iid, output_index=i, delta=item["input"]))
                 out.append(self.ev("response.custom_tool_call_input.done", item_id=iid, output_index=i, input=item["input"]))
             else:
-                item = {"type": "function_call", "id": iid, "call_id": cid, "name": e["name"], "arguments": e["args"] or "{}", "status": "completed"}
+                item = {"type": "function_call", "id": iid, "call_id": cid, "name": e["name"], "arguments": e["args"] or "{}", "status": "incomplete" if self.incomplete_reason else "completed"}
                 out.append(self.ev("response.output_item.added", output_index=i, item=dict(item, arguments="", status="in_progress")))
                 out.append(self.ev("response.function_call_arguments.delta", item_id=iid, output_index=i, delta=item["arguments"]))
                 out.append(self.ev("response.function_call_arguments.done", item_id=iid, output_index=i, arguments=item["arguments"]))

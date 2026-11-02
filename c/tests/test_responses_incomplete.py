@@ -26,11 +26,21 @@ class IncompleteResponseTest(unittest.TestCase):
             self.assertEqual(response["incomplete_details"], {"reason": "max_output_tokens"})
             self.assertEqual(response["usage"]["total_tokens"], 5)
             self.assertEqual(response["output"][0]["content"][0]["text"], "partial answer")
+            self.assertEqual(response["output"][0]["status"], "incomplete")
 
     def test_content_filter_reason_is_preserved(self):
         _, last = self.events("content_filter")
         self.assertEqual(last["type"], "response.incomplete")
         self.assertEqual(last["response"]["incomplete_details"]["reason"], "content_filter")
+
+    def test_truncated_tool_arguments_remain_incomplete(self):
+        e = shim.Events("model", set())
+        e.chunk({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_test", "function": {
+            "name": "inspect", "arguments": '{"path":'}}]}, "finish_reason": "length"}]})
+        events = [json.loads(line[6:]) for line in e.finish().splitlines() if line.startswith("data: ")]
+        item = events[-1]["response"]["output"][0]
+        self.assertEqual(item["arguments"], '{"path":')
+        self.assertEqual(item["status"], "incomplete")
 
     def test_normal_and_tool_call_finishes_remain_completed(self):
         for reason in ("stop", "tool_calls"):
