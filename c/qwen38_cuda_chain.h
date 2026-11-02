@@ -1332,9 +1332,12 @@ static void q38cc_pool_init(Model *m) {
     if (pcap > 0 && (ch->dm_stage = cc_buf((size_t)pcap * stride, CC_DEV))) ch->dm_stage_cap = pcap;
     /* the staging: the GEMV kernels' word loads over the bus came at a third of its rate, a
      * copy in 16-byte loads first at the whole of it (Q38CC_STAGE places; past them, a step's
-     * pooled experts are read where they are) */
+     * pooled experts are read where they are). None where the CPU takes the pool's slots: a
+     * decode step's table then holds none of them and a prompt chunk has more slots than the
+     * staging maps, while its kernel scanned every step's routes for nothing (3.8 us a layer of
+     * a Qwen3.8 decode step on an RTX PRO 4000) */
     const char *pst = getenv("COLI_CUDA_CHAIN_POOL_STAGE");   /* 0: the kernels read the pool where it is (A/B) */
-    int nst = pst && *pst == '0' ? 0 : Q38CC_STAGE;
+    int nst = (pst && *pst == '0') || ch->pool_cpu ? 0 : Q38CC_STAGE;
     if (nst && cc_moe_stage_ready() && (ch->pool_stage = cc_buf(CC_MOE_STAGE_MAP + (size_t)nst * stride, CC_DEV)) &&
         !cc_moe_stage(ch->pool_stage, stride, nst)) { cc_free(ch->pool_stage); ch->pool_stage = NULL; }
     /* what a chunk stages, and the measures */
