@@ -88,6 +88,7 @@ typedef struct {
      * zero one), ls_rg the copies of the entries into the table and back */
     int ls_i, ls_n, ls_cap; int *ls_cnt, *ls_e, *ls_cand; uint8_t *ls_mark; CcFetch *ls_fr; CcRegion *ls_rg; CcBuf *ls_ent;
     unsigned long long ls_experts, ls_layers;
+    CcBuf *ps; int ps_valid;   /* a prompt-end snapshot's DeltaNet states and PLE ring, copied down by the frame (q38cc_snap_down) */
     Q38CCLane lane2; int lane_cur, lane_rows;  /* a prompt chunk's other lane (q38cc_chunk_lanes), the lane whose buffers are in, the rows its host arrays hold */
     unsigned long long lane_chunks;
     CcBuf *qkv, *z, *ab, *cv, *dny, *lg, *gs, *us, *hs, *ds, *sgd;
@@ -746,6 +747,58 @@ static int q38cc_sync_one(Model *m, Q38CChain *ch) {
 }
 static void q38cc_sync_host(Model *m) {
     if (!q38cc_sync_one(m, q38cc_of(m))) q38cc_recover(m, m->kv_len);
+}
+/* A prompt-end snapshot of the state the card holds: its DeltaNet states and PLE ring copied
+ * into mapped memory by the stream itself, nothing waited for; q38cc_snap_take hands them over
+ * once they are needed (a later prompt's restore, a parked conversation). The host's copies
+ * after the prompt's last frame came to 25 ms before its first token (a 470-token prompt of
+ * Qwen3.8-Flash-Next on an RTX PRO 4000: 36 layers' states, 118 MB, read one by one, then
+ * copied again into the cache). 0: not taken (the host's copy then). */
+static int q38cc_snap_down(Model *m) {
+    Q38CChain *ch = g_cuda_chain ? q38cc_of(m) : NULL;
+    if (!ch || !ch->ok || ch->failed || ch->dn_where != Q38CC_DEV) return 0;
+    Cfg *c = &m->c;
+    const size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
+    const size_t np = ch->ple_ring && m->PLE_conv_state ? q38cc_ple_cells(c) : 0;
+    size_t total = np, o = 0;
+    for (int i = 0; i < c->layers; i++) if (!c->is_attn[i]) total += nr + nc;
+    ch->ps_valid = 0;
+    if (!cc_reserve(&ch->ps, total * 4, CC_DOWN)) return 0;
+    int ok = cc_begin();
+    for (int i = 0; i < c->layers && ok; i++) {
+        if (c->is_attn[i]) continue;
+        ok = cc_copy(ch->ps, o, ch->rec[i], 0, nr) && cc_copy(ch->ps, o + nr, ch->ring[i], 0, nc);
+        o += nr + nc;
+    }
+    if (ok && np) ok = cc_copy(ch->ps, o, ch->ple_ring, (size_t)ch->ple_slot[0] * np, np);
+    ok = ok && cc_submit(0);
+    if (!ok) { if (cc_lost()) q38cc_recover(m, m->kv_len); return 0; }
+    ch->ps_valid = 1;
+    return 1;
+}
+/* the snapshot q38cc_snap_down took, into the cache's arrays (a DeltaNet layer's recurrent state
+ * and conv ring, the PLE ring): 0 where there is none or the device is gone */
+static int q38cc_snap_take(Model *m, float **rec, float **conv, float *ple) {
+    Q38CChain *ch = q38cc_of(m);
+    if (!ch || !ch->ps_valid || !cc_finish()) return 0;
+    Cfg *c = &m->c;
+    const size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
+    const float *p = (const float *)cc_ptr(ch->ps);
+    size_t o = 0;
+    for (int i = 0; i < c->layers; i++) {
+        if (c->is_attn[i]) continue;
+        memcpy(rec[i], p + o, nr * 4); memcpy(conv[i], p + o + nr, nc * 4);
+        o += nr + nc;
+    }
+    if (ple && ch->ple_ring && m->PLE_conv_state) memcpy(ple, p + o, q38cc_ple_cells(c) * 4);
+    ch->ps_valid = 0;
+    return 1;
+}
+/* the chain takes a prompt of n rows in one chunk: a served prompt's stop lands before it or not
+ * at all (q38cc_forward checks it between chunks), so its state needs no copy to come back to */
+static int q38cc_one_chunk(Model *m, int n) {
+    const Q38CChain *ch = g_cuda_chain ? q38cc_of(m) : NULL;
+    return ch && ch->ok && !ch->failed && n <= q38cc_rows_env();
 }
 static void q38cc_host_wrote(Model *m, int zero) {
     Q38CChain *ch = q38cc_of(m);

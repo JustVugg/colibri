@@ -1542,6 +1542,7 @@ typedef struct {
      * streams still waiting for their next token (Model.mtp_*) */
     float *mtp_pend;
     int mtp_len, mtp_pend_n, mtp_pend_tok[Q38_SPEC_ROWS];
+    int dev;   /* dn_rec, dn_conv and ple_conv still in the CUDA chain's copy (q38cc_snap_down): q38_prefix_settle */
 } Q38PrefixCache;
 
 static Q38PrefixCache g_q38_prefix;
@@ -1753,7 +1754,26 @@ static int q38_prefix_ids_reserve(int len){
     free(g_q38_prefix.ids);g_q38_prefix.ids=ids;g_q38_prefix.id_cap=len;return 1;
 }
 
+/* the snapshot's arrays filled where the CUDA chain still holds them (Q38PrefixCache.dev); a
+ * snapshot the device lost is no snapshot */
+static void q38_prefix_settle(Model *m){
+#ifdef COLI_CUDA
+    if(g_q38_prefix.dev&&g_q38_prefix.owner==m&&
+       !q38cc_snap_take(m,g_q38_prefix.dn_rec,g_q38_prefix.dn_conv,g_q38_prefix.ple_conv))g_q38_prefix.valid=0;
+#else
+    (void)m;
+#endif
+    g_q38_prefix.dev=0;
+}
+
 static void q38_prefix_copy_state(Model *m,int to_cache){
+    int dev=0;   /* the CUDA chain's frame copies the device's state down (q38cc_snap_down) */
+    if(!to_cache)q38_prefix_settle(m);
+#ifdef COLI_CUDA
+    if(to_cache)dev=q38cc_snap_down(m);
+#endif
+    g_q38_prefix.dev=dev;
+    if(!dev){
     if(to_cache)q38_dn_gpu_pull_all(m); else q38_dn_gpu_invalidate(m);
 #ifdef COLI_VULKAN
     if(to_cache)q38c_sync_host(m);
@@ -1763,7 +1783,8 @@ static void q38_prefix_copy_state(Model *m,int to_cache){
     if(to_cache)q38cc_sync_host(m);
     else q38cc_host_wrote(m,0);
 #endif
-    for(int i=0;i<m->c.layers;i++)if(!m->c.is_attn[i]){
+    }
+    for(int i=0;i<m->c.layers&&!dev;i++)if(!m->c.is_attn[i]){
         float *rec=to_cache?g_q38_prefix.dn_rec[i]:m->DN_rec[i];
         float *conv=to_cache?g_q38_prefix.dn_conv[i]:m->DN_conv[i];
         const float *src_rec=to_cache?m->DN_rec[i]:g_q38_prefix.dn_rec[i];
@@ -1773,8 +1794,8 @@ static void q38_prefix_copy_state(Model *m,int to_cache){
     }
     if(g_q38_prefix.ple_cells){
         if(to_cache){
-            memcpy(g_q38_prefix.ple_conv,m->PLE_conv_state,
-                   g_q38_prefix.ple_cells*sizeof(float));
+            if(!dev)memcpy(g_q38_prefix.ple_conv,m->PLE_conv_state,
+                           g_q38_prefix.ple_cells*sizeof(float));
             g_q38_prefix.ple_history_len=m->ple_history_len;
             memcpy(g_q38_prefix.ple_history,m->ple_history,sizeof(g_q38_prefix.ple_history));
         }else{
@@ -1969,8 +1990,14 @@ static float *q38_serve_prefill(Model *m,const int *ids,int from,int np,ColiProm
         if(coli_prompt_poll(ctl)){free(lo);lo=NULL;break;}
         int n=np-at<seg?np-at:seg;
         /* the state at the segment's start (from the device too, for a chain), so a stop inside
-         * the segment can put it back */
-        if(q38_pin_state_copy(m,&st,1))g_coli_prompt_break=ctl;
+         * the segment can put it back; none where the CUDA chain takes it in one chunk, which a
+         * stop finds before it starts or not at all (a 470-token prompt's copy of the DeltaNet
+         * state from the card took 10 ms before its first layer) */
+        int one=0;
+#ifdef COLI_CUDA
+        one=q38cc_one_chunk(m,n);
+#endif
+        if(!one&&q38_pin_state_copy(m,&st,1))g_coli_prompt_break=ctl;
         float *next=step(m,ids+at,n,at);
         g_coli_prompt_break=NULL;
         if(!next){q38_pin_state_copy(m,&st,0);free(lo);lo=NULL;break;}
@@ -2040,6 +2067,7 @@ static void q38_park(Model *m,int np,int max_tok){
     if(!ok){q38_park_free_rows();return;}
     memcpy(g_q38_park.fed,m->kvp.fed,(size_t)H*sizeof(int));
     g_q38_park.len=H;g_q38_park.kv_len=m->kv_len;g_q38_park.rows=n;g_q38_park.on=1;
+    q38_prefix_settle(m);   /* the request's snapshot will take the chain's copy */
     g_q38_park.snap=g_q38_prefix;memset(&g_q38_prefix,0,sizeof g_q38_prefix);   /* the request takes a snapshot of its own */
     if(getenv("COLI_PREFIX_LOG"))
         fprintf(stderr,"[PREFIX] the %d-token conversation parked for a %d-token request (%d rows kept apart)\n",H,np,n);
@@ -2444,6 +2472,7 @@ typedef struct {
 
 static void q38_mux_bind(Model *m,int slot){
     if(g_q38_mux_cur==slot)return;
+    q38_prefix_settle(m);   /* another sequence's snapshot will take the chain's copy */
     for(int k=0;k<2;k++){   /* the held one back to its place, then the asked one in */
         int x=k?slot:g_q38_mux_cur;
         if(x<0)continue;

@@ -24,6 +24,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **Qwen3.8 served on the CUDA chain: the state's copies off a prompt's first token.** A served
+  prompt copied the DeltaNet state from the card before its first layer (so a stop could put it
+  back) and again after its last (the prompt-end snapshot), 118 MB each way read layer by layer
+  and copied twice: 10 and 25 ms of a 470-token prompt. A prompt the chain takes in one chunk
+  needs no copy to come back to (a stop finds it before it starts or not at all), and the
+  snapshot is copied down by the stream into mapped memory without waiting, taken from there
+  when a later request needs it. Served on an RTX PRO 4000: 452-token prompts 682-702 -> 744-757
+  tok/s, 92 tokens 297-324 -> 327-367.
 - **Qwen3.8's CUDA chain: a prompt in two lanes, the CPU's pool slots beside the card's work.**
   A prompt chunk with the host pool on the CPU left the card waiting at every layer while the
   CPU computed the layer's pooled slots. A chunk of 384 rows or more now runs as two lanes, its
