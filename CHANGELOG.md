@@ -45,8 +45,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   the three-part TF32 GEMM (140 ms of a 470-token prompt's 1,000). They go up as BF16 rows, half the
   bytes: a prompt chunk's through the f16 tiles, a decode step's through a BF16 GEMV that reads 16
   bytes a lane (every CUDA BF16 row's GEMV takes it). Qwen3.8-Flash-Next IQ2_XS on an RTX PRO 4000,
-  with the grouped attention: 452 tokens 538-540 -> 639-656 tok/s, 1012 tokens 638-648 -> 772-805;
-  the decode the same (49.7-52.1 against 50.6-52.2), the greedy answers to four prompts the same.
+  with the grouped attention: 452 tokens 538-540 -> 639-656 tok/s, 1012 tokens 638-648 -> 772-805,
+  the greedy answers to four prompts the same. The PLE rows go to the card once before the
+  projections: they were read from host memory over the bus again for every output row (a decode
+  step's key and value 424 and 408 us); decode 50.3-52.8 -> 52.5-54.5 tok/s.
 
 ### Fixed
 

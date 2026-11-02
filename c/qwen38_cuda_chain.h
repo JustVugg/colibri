@@ -65,7 +65,7 @@ typedef struct {
     CcBuf *hyper, *hn, *low, *mix, *mixed, *inj_a, *inj_m, *blk, *q, *k, *v, *ip, *ctx, *qsc, *sel;
     CcBuf *hyper_all;                          /* every row's streams through a prompt run layer by layer (q38cc_forward_lm) */
     CcBuf *qkv, *z, *ab, *cv, *dny, *lg, *gs, *us, *hs, *ds, *sgd;
-    CcBuf *emb, *keys, *val, *gated, *normv;
+    CcBuf *emb, *embd, *keys, *val, *gated, *normv;   /* emb: the PLE rows the host writes, embd: on the device */
     CcBuf *mixd, *lgd, *kvd, *outd, *hypd, *find, *routed, *cs, *pcs;
     CcBuf *gseg, *nseg;               /* a deep verify's PLE rows past its first copy (q38cc_ple) */
     float *host_routed, *host_emb;
@@ -291,7 +291,8 @@ static size_t q38cc_reserve_bytes(Model *m) {
     size_t W = c->hc_width, H = c->hidden, QH = c->q_heads, D = c->head_dim, V = (size_t)c->dn_vheads * c->dn_vdim, E = c->experts;
     size_t SI = c->shared_inter, ipw = (size_t)(c->idx_qheads + 1) * c->idx_dim, Ep = (size_t)c->ngram_heads * c->ngram_head_dim;
     size_t row = 7 * W + c->hc_rank + 6 * H + 2 * (size_t)c->hc_count + 3 * QH * D + 2 * kvo + ipw + 2 * nb + (size_t)q38cc_selrow(c) +
-                 2 * (size_t)c->dn_conv_dim + 2 * V + 2 * (size_t)c->dn_vheads + 2 * E + 3 * SI + Ep + (size_t)(c->rotary_dim > 0 ? c->rotary_dim : 2);
+                 2 * (size_t)c->dn_conv_dim + 2 * V + 2 * (size_t)c->dn_vheads + 2 * E + 3 * SI + 2 * Ep /* emb, embd */ +
+                 (size_t)(c->rotary_dim > 0 ? c->rotary_dim : 2);
     b += (size_t)q38cc_rows_env() * row * F + 2 * (size_t)c->vocab * F;
     /* a verify's copies of the DeltaNet state and rings (q38cc_spec_slots), the routed experts'
      * scratch for a prompt chunk (q38cc_dm_begin: their hidden rows, the sum, the routes), and a
@@ -515,7 +516,8 @@ static int q38cc_bufs(Q38CChain *ch, Model *m, int rows) {
              cc_reserve(&ch->mixd, r * H * F, CC_DOWN) && cc_reserve(&ch->lgd, r * E * F, CC_DOWN) &&
              cc_reserve(&ch->kvd, (size_t)(ch->n_attn ? ch->n_attn : 1) * q38cc_kv_stride(ch, c) * F, CC_DOWN) &&
              cc_reserve(&ch->outd, 2 * (size_t)c->vocab * F, CC_DOWN) && cc_reserve(&ch->routed, r * H * F, CC_UP) &&
-             cc_reserve(&ch->emb, r * Ep * F, CC_UP) && cc_reserve(&ch->cs, r * (c->rotary_dim > 0 ? c->rotary_dim : 2) * F, CC_UP) &&
+             cc_reserve(&ch->emb, r * Ep * F, CC_UP) && cc_reserve(&ch->embd, r * Ep * F, CC_DEV) &&
+             cc_reserve(&ch->cs, r * (c->rotary_dim > 0 ? c->rotary_dim : 2) * F, CC_UP) &&
              cc_reserve(&ch->pcs, (size_t)nbmax * (c->rotary_dim > 0 ? c->rotary_dim : 2) * F, CC_UP);
     /* a verify's PLE segments (q38cc_ple) here, not in the frame: growing a buffer there waits
      * for the stream, which a hybrid layer before it holds until the host serves it */
@@ -870,9 +872,12 @@ static int q38cc_ple(Q38CChain *ch, Model *m, int n, int c0, int ns) {
     Cfg *c = &m->c; Layer *l = &m->L[c->ple_layer];
     int W = c->hc_width, H = c->hidden, E = c->ngram_heads * c->ngram_head_dim;
     size_t pc = q38cc_ple_cells(c);
-    int ok = cc_write(ch->emb, 0, ch->host_emb, (size_t)n * E * 4) &&
-             cc_matmul(q38cc_tb(ch, &l->ple_key), ch->emb, 0, ch->keys, 0, n) &&
-             cc_matmul(q38cc_tb(ch, &l->ple_value), ch->emb, 0, ch->val, 0, n);
+    /* the rows to the device once: the projections read their input row again for every output
+     * row, which from the host's memory was over the bus every time (a decode step's key and value
+     * 424 and 408 us on an RTX PRO 4000, 124 and 32 GB/s) */
+    int ok = cc_write(ch->emb, 0, ch->host_emb, (size_t)n * E * 4) && cc_copy(ch->embd, 0, ch->emb, 0, (size_t)n * E) &&
+             cc_matmul(q38cc_tb(ch, &l->ple_key), ch->embd, 0, ch->keys, 0, n) &&
+             cc_matmul(q38cc_tb(ch, &l->ple_value), ch->embd, 0, ch->val, 0, n);
     CcPle g = {0, n, c->hc_count, H, c->ple_convk, c->ngram_size, 0, 0, 0, -1, 0, c->eps, (int)ch->o_ple, 0, 0};
     ok = ok && cc_ple(ch->keys, ch->hyper, ch->val, ch->prm, ch->gated, ch->normv, NULL, NULL, &g);
     if (ns <= 1) {
