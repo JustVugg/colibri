@@ -109,6 +109,9 @@ def to_chat(body):
         chat["tool_choice"] = body["tool_choice"]
     if body.get("parallel_tool_calls") is not None:
         chat["parallel_tool_calls"] = bool(body["parallel_tool_calls"])
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning.get("effort") is not None:
+        chat["reasoning_effort"] = reasoning["effort"]
     for a, b in (("max_output_tokens", "max_tokens"), ("temperature", "temperature"), ("top_p", "top_p")):
         if body.get(a) is not None:
             chat[b] = body[a]
