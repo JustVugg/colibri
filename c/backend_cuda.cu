@@ -3547,7 +3547,8 @@ __global__ static void __launch_bounds__(256) hcg2_dense_k(float *__restrict__ y
 static int hcm_type(int fmt, int I) {
     int tt = fmt - 100;
     if (tt == 8 || tt == 1 || tt == 30) return I % 32 ? 0 : tt;   /* Q8_0, F16, BF16 */
-    if (tt == 12 || tt == 13 || tt == 14) return I % 256 ? 0 : tt;
+    if (tt == 12 || tt == 13 || tt == 14 || tt == 22) return I % 256 ? 0 : tt;   /* 22 IQ2_S: the routed experts' only (hcm_moe) */
+    if (tt == 42) return I % 64 ? 0 : tt;   /* Q2_0: the routed experts' only */
     return 0;
 }
 /* A prompt chunk's rows of a Q8_0, Q4_K, Q5_K, Q6_K, F16 or BF16 tensor through f16 mma.sync, the weights'
@@ -3620,6 +3621,13 @@ __device__ __forceinline__ void hcm_fetch(HcmRaw &w, const bd_u32 *__restrict__ 
         hcm_ld5(W, base + 64u * n + (r & 63u), w.r);
         hcm_ld5(W, base + 128u + 32u * n + (r & 31u), w.r + 5);
         w.r[10] = __ldg(W + ((base + 192u + (e >> 4)) >> 2)); w.r[11] = __ldg(W + ((base + 208u) >> 2));
+    } else if (T == 22) {   /* IQ2_S: the scale, the two chunks' grid indices and signs, their high bits, their 4-bit scale */
+        bd_u32 b = e0 >> 8, e = e0 & 255u, k0 = e >> 3, base = b * 82u;
+        w.r[0] = __ldg(W + (base >> 2)); w.r[1] = __ldg(W + ((base + 2u + k0) >> 2)); w.r[2] = __ldg(W + ((base + 34u + k0) >> 2));
+        w.r[3] = __ldg(W + ((base + 66u + (k0 >> 2)) >> 2)); w.r[4] = __ldg(W + ((base + 74u + (e >> 5)) >> 2));
+    } else if (T == 42) {   /* Q2_0: the scale, the 16 weights' four bytes of 2-bit codes (two words where they straddle) */
+        bd_u32 b = e0 >> 6, base = b * 18u, o = base + 2u + ((e0 & 63u) >> 2);
+        w.r[0] = __ldg(W + (base >> 2)); w.r[1] = __ldg(W + (o >> 2)); w.r[2] = (o & 2u) ? __ldg(W + (o >> 2) + 1u) : 0u;
     } else {   /* Q8_0 */
         bd_u32 b = e0 >> 5, base = b * 34u;
         hcm_ld5(W, base + 2u + 16u * ((e0 >> 4) & 1u), w.r);
@@ -3628,7 +3636,33 @@ __device__ __forceinline__ void hcm_fetch(HcmRaw &w, const bd_u32 *__restrict__ 
 }
 /* hcm_fetch's words as bd_dec16h's eight half2 */
 template<int T>
-__device__ __forceinline__ void hcm_dec(const HcmRaw &w, bd_u32 e0, bd_u32 *out) {
+__device__ __forceinline__ void hcm_dec(const HcmRaw &w, bd_u32 e0, bd_u32 *out, const bd_u32 *__restrict__ tab = nullptr) {
+    if (T == 22) {   /* IQ2_S: two chunks of 8, each a grid row (bytes 8, 25, 43) with its signs, times d (0.5 + s) / 4 */
+        bd_u32 b = e0 >> 8, e = e0 & 255u, k0 = e >> 3, base = b * 82u;
+        bd_u32 oq = base + 2u + k0, os = base + 34u + k0, oh = base + 66u + (k0 >> 2), oc = base + 74u + (e >> 5);
+        bd_u32 q2 = w.r[1] >> ((oq & 2u) * 8u), s2b = w.r[2] >> ((os & 2u) * 8u), qh = w.r[3] >> ((oh & 3u) * 8u), sc = w.r[4] >> ((oc & 3u) * 8u);
+        float d = bd_h2f(w.r[0] >> ((base & 2u) * 8u)) * (0.5f + (float)((sc >> (4u * ((e >> 4) & 1u))) & 15u)) * 0.25f;
+        __half2 off = __float2half2_rn(1152.f), s2 = __float2half2_rn(d), z2 = __float2half2_rn(0.f);
+        #pragma unroll
+        for (int ll = 0; ll < 2; ll++) {
+            bd_u32 k = k0 + (bd_u32)ll, idx = ((q2 >> (8 * ll)) & 255u) | (((qh >> (2u * (k & 3u))) & 3u) << 8), sg = s2b >> (8 * ll);
+            const uint2 gr = __ldg(reinterpret_cast<const uint2 *>(tab + BDT_IQ2S) + idx);   /* the row in one load */
+            bd_codes_h(bdi_neg(gr.x, sg) ^ 0x80808080u, off, s2, z2, out + 4 * ll);
+            bd_codes_h(bdi_neg(gr.y, sg >> 4) ^ 0x80808080u, off, s2, z2, out + 4 * ll + 2);
+        }
+        return;
+    }
+    if (T == 42) {   /* Q2_0: code - 1, times d; a byte's four codes to a word's four bytes */
+        bd_u32 b = e0 >> 6, base = b * 18u, o = base + 2u + ((e0 & 63u) >> 2);
+        bd_u32 q4 = __funnelshift_r(w.r[1], w.r[2], (o & 2u) * 8u);
+        __half2 off = __float2half2_rn(1025.f), s2 = __float2half2_rn(bd_h2f(w.r[0] >> ((base & 2u) * 8u))), z2 = __float2half2_rn(0.f);
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            bd_u32 x = (q4 >> (8 * k)) & 255u;
+            bd_codes_h((x | (x << 6) | (x << 12) | (x << 18)) & 0x03030303u, off, s2, z2, out + 2 * k);
+        }
+        return;
+    }
     if (T == 1) {
         #pragma unroll
         for (int k = 0; k < 8; k++) out[k] = w.r[k];
@@ -3689,6 +3723,7 @@ struct HcmArgs {
     const __half *xh; int ldx; const int *xrows;
     int m0, M, n0, kb0, nk;
     const bd_u32 *w, *wu; int rw, O;
+    const bd_u32 *tab;   /* the decoders' table (bd_table): IQ2_S's grid */
 };
 template<int T, int BM, int BN, bool GLU>
 __device__ __forceinline__ void hcm_body(const HcmArgs &A) {
@@ -3742,7 +3777,7 @@ __device__ __forceinline__ void hcm_body(const HcmArgs &A) {
     } while (0)
     #define HCM_STW(st_, kb_) do { \
         _Pragma("unroll") for (int q = 0; q < NW; q++) { \
-            bd_u32 h_[8]; hcm_dec<T>(raw[q], (bd_u32)(kb0 + (kb_) * HCM_BK + lh * 16), h_); \
+            bd_u32 h_[8]; hcm_dec<T>(raw[q], (bd_u32)(kb0 + (kb_) * HCM_BK + lh * 16), h_, A.tab); \
             unsigned char *d_ = Wsm + (st_) * WB; \
             *reinterpret_cast<uint4 *>(d_ + hcm_swz(lr + 128 * q, 2 * lh)) = make_uint4(h_[0], h_[1], h_[2], h_[3]); \
             *reinterpret_cast<uint4 *>(d_ + hcm_swz(lr + 128 * q, 2 * lh + 1)) = make_uint4(h_[4], h_[5], h_[6], h_[7]); \
@@ -3827,7 +3862,7 @@ __global__ static void __launch_bounds__(256, (HcmTile<BM, BN>::MINB)) hcm_dense
     COLI_PDL_WAIT();
     const int m0 = blockIdx.y * BM, kb0 = blockIdx.z * kc;
     HcmArgs A = {y + (size_t)blockIdx.z * S * O, O, nullptr, xh, I, nullptr, m0, S - m0 < BM ? S - m0 : BM, (int)blockIdx.x * BN, kb0,
-                 (I - kb0 < kc ? I - kb0 : kc) / HCM_BK, w, wu, rw, O};
+                 (I - kb0 < kc ? I - kb0 : kc) / HCM_BK, w, wu, rw, O, nullptr};
     hcm_body<T, BM, BN, GLU>(A);
 }
 /* a split K's partial sums, in the order of the splits */
@@ -3872,6 +3907,7 @@ static int hcm_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float
         e = getenv("COLI_CUDA_HCM_SPLIT"); fsplit = e ? atoi(e) : 0;    /* this split always */
     }
     int tt = hcm_type(t->fmt, t->I);
+    if (tt == 22 || tt == 42) tt = 0;   /* the routed experts' types (hcm_moe): hcm_launch has no dense tiles of them */
     if (!on || !tt || ctx->compute_major < 8 || S <= BD_GEMV_MAX_S) return 0;
     const int I = t->I, O = t->O, glu = tu != nullptr, OB = glu ? 2 * O : O;   /* OB: the blocks' weight rows */
     if (glu && (tu->fmt != t->fmt || tu->I != I || tu->O != O || tu->row_words != t->row_words || tu->device != t->device)) return 0;
@@ -4697,7 +4733,7 @@ __global__ static void __launch_bounds__(256) hcg_moe_dn_bd_k(const CcExpert *__
  * tokens' rows, hh hid's. */
 template<int T>
 __global__ static void __launch_bounds__(256, (HcmTile<64, 128>::MINB)) hcm_moe_gu_k(const CcExpert *__restrict__ tab,
-        const __half *__restrict__ xh, float *__restrict__ hid, MoeSort m, CcMoe p, int rw) {
+        const __half *__restrict__ xh, float *__restrict__ hid, MoeSort m, CcMoe p, int rw, const bd_u32 *__restrict__ btab) {
     COLI_PDL_WAIT();
     __shared__ int xr[64], pr[64];
     if ((int)blockIdx.y >= *m.ntile) return;
@@ -4705,12 +4741,12 @@ __global__ static void __launch_bounds__(256, (HcmTile<64, 128>::MINB)) hcm_moe_
     __syncthreads();
     const CcExpert ex = tab[p.t_off + e];
     HcmArgs A = {hid, p.I, pr, xh, p.D, xr, 0, M, (int)blockIdx.x * 128, 0, p.D / HCM_BK,
-                 (const bd_u32 *)ex.g, (const bd_u32 *)ex.u, rw, p.I};
+                 (const bd_u32 *)ex.g, (const bd_u32 *)ex.u, rw, p.I, btab};
     hcm_body<T, 64, 128, true>(A);
 }
 template<int T>
 __global__ static void __launch_bounds__(256, (HcmTile<64, 128>::MINB)) hcm_moe_dn_k(const CcExpert *__restrict__ tab,
-        const __half *__restrict__ hh, float *__restrict__ hid, MoeSort m, CcMoe p, int rw) {
+        const __half *__restrict__ hh, float *__restrict__ hid, MoeSort m, CcMoe p, int rw, const bd_u32 *__restrict__ btab) {
     COLI_PDL_WAIT();
     __shared__ int xr[64], pr[64];
     if ((int)blockIdx.y >= *m.ntile) return;
@@ -4718,7 +4754,7 @@ __global__ static void __launch_bounds__(256, (HcmTile<64, 128>::MINB)) hcm_moe_
     __syncthreads();
     const CcExpert ex = tab[p.t_off + e];
     HcmArgs A = {hid + (size_t)p.S * p.K * p.I, p.D, pr, hh, p.I, xr, 0, M, (int)blockIdx.x * 128, 0, p.I / HCM_BK,
-                 (const bd_u32 *)ex.d, nullptr, rw, p.D};
+                 (const bd_u32 *)ex.d, nullptr, rw, p.D, btab};
     hcm_body<T, 64, 128, false>(A);
 }
 /* rows of x (x_row floats apart) into f16, hcm_half_k's rounding */
@@ -4735,15 +4771,17 @@ __global__ static void hcm_half_rows_k(const float *__restrict__ x, int x_row, u
 #endif
 }
 /* the experts through hcm_moe_*_k where their types and rows let them; 0: not taken (hcg_tile's) */
-static int hcm_moe(DeviceContext *ctx, const CcExpert *tab, const float *x, float *hid, MoeSort m, const CcMoe *p, cudaStream_t st) {
+static int hcm_moe(DeviceContext *ctx, const CcExpert *tab, const float *x, float *hid, MoeSort m, const CcMoe *p, cudaStream_t st,
+                   const bd_u32 *btab) {
 #if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
-    (void)ctx; (void)tab; (void)x; (void)hid; (void)m; (void)p; (void)st; return 0;
+    (void)ctx; (void)tab; (void)x; (void)hid; (void)m; (void)p; (void)st; (void)btab; return 0;
 #else
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_CUDA_MOE_HCM"); on = !(e && *e == '0'); }
     const int fd = p->fmt_d ? p->fmt_d : p->fmt, tg = hcm_type(p->fmt, p->D), td = hcm_type(fd, p->I);
     if (!on || !ctx || ctx->compute_major < 8 || !tg || !td || p->D % 4 || p->I % 4 || p->x_row % 4) return 0;
     if (tg == 1 || tg == 30 || td == 1 || td == 30) return 0;   /* 16-bit experts: hcg's tiles (HCM_MOE's types below) */
+    if ((tg == 22 || td == 22) && !btab) return 0;   /* IQ2_S reads its grid from the decoders' table */
     const size_t rbg = bd_file_row_bytes(p->fmt, p->D), rbd = bd_file_row_bytes(fd, p->I);
     if (!rbg || !rbd || rbg % 4 || rbd % 4) return 0;
     const size_t A = (size_t)p->S * p->K, nx = (size_t)p->S * p->D, nh = A * p->I;
@@ -4756,11 +4794,12 @@ static int hcm_moe(DeviceContext *ctx, const CcExpert *tab, const float *x, floa
     const int rwg = (int)(rbg / 4), rwd = (int)(rbd / 4);
     #define HCM_MOE(K_, T_, ...) do { switch (T_) { \
         case 8: coli_launch(K_<8>, __VA_ARGS__); break;   case 12: coli_launch(K_<12>, __VA_ARGS__); break; \
-        case 13: coli_launch(K_<13>, __VA_ARGS__); break; default: coli_launch(K_<14>, __VA_ARGS__); break; } } while (0)
-    HCM_MOE(hcm_moe_gu_k, tg, gg, 256, HcmTile<64, 128>::SMEM, st, tab, (const __half *)xh, hid, m, *p, rwg);
+        case 13: coli_launch(K_<13>, __VA_ARGS__); break; case 22: coli_launch(K_<22>, __VA_ARGS__); break; \
+        case 42: coli_launch(K_<42>, __VA_ARGS__); break; default: coli_launch(K_<14>, __VA_ARGS__); break; } } while (0)
+    HCM_MOE(hcm_moe_gu_k, tg, gg, 256, HcmTile<64, 128>::SMEM, st, tab, (const __half *)xh, hid, m, *p, rwg, btab);
     long long h4 = (long long)(nh / 4);
     coli_launch(hcm_half_k, (unsigned)((h4 + 255) / 256), 256, 0, st, reinterpret_cast<const float4 *>(hid), reinterpret_cast<uint2 *>(hh), h4);
-    HCM_MOE(hcm_moe_dn_k, td, gd, 256, HcmTile<64, 128>::SMEM, st, tab, (const __half *)hh, hid, m, *p, rwd);
+    HCM_MOE(hcm_moe_dn_k, td, gd, 256, HcmTile<64, 128>::SMEM, st, tab, (const __half *)hh, hid, m, *p, rwd, btab);
     #undef HCM_MOE
     cudaError_t le = cudaGetLastError();
     (void)cudaFreeAsync(scr, st);
@@ -4775,7 +4814,7 @@ static int moe_rows_bd_launch(DeviceContext *ctx, const CcExpert *tab, const flo
     coli_launch(moe_sort_count_k, ga, 256, 0, st, tab, ids, m, *p);
     coli_launch(moe_sort_scan_k, 1, 32, 0, st, m, *p);
     coli_launch(moe_sort_place_k, ga, 256, 0, st, tab, ids, m, *p);
-    if (hcm_moe(ctx, tab, x, hid, m, p, st)) return 1;
+    if (hcm_moe(ctx, tab, x, hid, m, p, st, btab)) return 1;
     dim3 gg((unsigned)((p->I + TCG_BN - 1) / TCG_BN), (unsigned)m.T), gd((unsigned)((p->D + TCG_BN - 1) / TCG_BN), (unsigned)m.T);
     HCG_BT_LAUNCH(hcg_moe_gu_bd_k, p->fmt, gg, st, tab, x, hid, m, *p, btab);
     HCG_BT_LAUNCH(hcg_moe_dn_bd_k, p->fmt_d ? p->fmt_d : p->fmt, gd, st, tab, hid, m, *p, btab);
