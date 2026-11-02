@@ -3787,7 +3787,7 @@ static void q38c_mtp_host(Model *m,int pos);
 #endif
 #ifdef COLI_CUDA
 static int q38cc_mtp_rows(Model *m,const float *streams,const int *next,int S,int pos_base,float *logit,
-                          float *hidden,int settle);   /* qwen38_cuda_chain.h: the head's layer on the card */
+                          float *hidden,int settle,int *pick,float *pick_p);   /* qwen38_cuda_chain.h: the head's layer on the card */
 static void q38cc_mtp_host(Model *m,int pos);
 #endif
 static void q38_draft_logits(Model *m,float *logit,const float *x) {
@@ -5545,6 +5545,7 @@ static int q38_mtp_best_token(Model *m,const float *mixed) {
 #ifdef COLI_VULKAN
     if(g_vk_chain)v=NULL;   /* the chain's device scores the whole vocabulary (q38c_draft_logits): the list is for the CPU */
 #endif
+    if(v&&!m->lm_head.q8)v=NULL;   /* the list was made for the CUDA chain's card: the CPU scores the whole vocabulary */
     int pick;
     if(v){
         float *score=falloc(v->list_n);
@@ -5609,8 +5610,10 @@ static void q38_mtp_rows(Model *m,const float *streams,const int *next,int S,int
 #ifdef COLI_CUDA
     {   /* the CUDA chain runs the head's layer */
         float *lc=draft?falloc(c->vocab):NULL;
-        int rc=q38cc_mtp_rows(m,streams,next,S,pos_base,lc,hidden,1);
-        if(rc&&draft){
+        int pk=-1;float pp=0.f;
+        int rc=q38cc_mtp_rows(m,streams,next,S,pos_base,lc,hidden,1,draft&&!g_q38_mtp_dump?&pk:NULL,&pp);
+        if(rc==2&&draft){*draft=pk;m->mtp_p=pp;}   /* the draft list scored on the card */
+        else if(rc&&draft){
             *draft=q38_argmax(lc,c->vocab);
             m->mtp_p=q38_draft_p(lc,c->vocab,*draft);
             if(g_q38_mtp_dump)q38_mtp_dump_record(m,lc,(Q38MtpDumpRow){pos_base+S-1,next[S-1]});
@@ -5699,7 +5702,10 @@ static int q38_mtp_draft_more(Model *m,float *hidden,int tok,int row) {
 #ifdef COLI_CUDA
     {   /* the CUDA chain runs the head's layer: its tail row at `row`, hidden in and out */
         float *lo=falloc(c->vocab);
-        if(q38cc_mtp_rows(m,hidden,&tok,1,row,lo,hidden,0)){int d=q38_argmax(lo,c->vocab);m->mtp_p=q38_draft_p(lo,c->vocab,d);free(lo);return d;}
+        int pk=-1;float pp=0.f;
+        int rc=q38cc_mtp_rows(m,hidden,&tok,1,row,lo,hidden,0,&pk,&pp);
+        if(rc==2){m->mtp_p=pp;free(lo);return pk;}   /* the draft list scored on the card */
+        if(rc){int d=q38_argmax(lo,c->vocab);m->mtp_p=q38_draft_p(lo,c->vocab,d);free(lo);return d;}
         free(lo);
         q38cc_mtp_host(m,row);
     }

@@ -79,6 +79,7 @@ typedef struct {
      * keys from there (q38cc_srv_where); hd_res: every one in the pool */
     uint8_t *hd_base, *hd_res; size_t hd_stride; int hd_tg, hd_td, hd_k0;
     CcBuf *hd_ids, *hd_w, *hd_idsd, *hd_wd; unsigned long long hd_rows;
+    CcBuf *dv_ids, *dv_y, *dv_x, *dv_pick; unsigned long long dv_drafts;   /* the draft list scored on the card */
     unsigned long long mtp_rows, drafts;
     float *host_routed, *host_emb;
     unsigned long long forwards, frames, fault_at, dec_n;
@@ -2577,10 +2578,13 @@ static void q38cc_mtp_host(Model *m, int pos) {
  * meanwhile); with `logit`, the last row's mixer and lm_head; with `hidden`, the last row's
  * streams as the layer leaves them (what a deeper draft reads). settle: settled pairs (the
  * head's rows end there, mtp_len), else a deeper draft's tail row, which the settled pair at
- * that row overwrites before anything reads past it. 0: not here (the CPU runs it); a frame
- * that fails gives the device up, the state on the CPU (q38cc_recover), and the CPU runs it. */
+ * that row overwrites before anything reads past it. With `pick` and the model's draft list
+ * (draft_vocab.h), only the listed rows of lm_head are scored (cc_matmul_rows: each the bits the
+ * whole lm_head gives it) and the card picks (cc_pick: the best, the lowest place on a tie, and its
+ * probability): *pick and *pick_p, and 2 is returned; else 1 with logit. 0: not here (the CPU runs
+ * it); a frame that fails gives the device up, the state on the CPU (q38cc_recover), and the CPU runs it. */
 static int q38cc_mtp_rows(Model *m, const float *streams, const int *next, int S, int pos_base, float *logit,
-                          float *hidden, int settle) {
+                          float *hidden, int settle, int *pick, float *pick_p) {
     Q38CChain *ch = q38cc_of(m);
     if (!g_cuda_chain || !ch || !ch->ok || ch->failed || !ch->mtp_on || S < 1 || cc_lost()) return 0;
     Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, C = c->hc_count, E = c->experts, V = c->vocab, L = c->layers;
@@ -2588,6 +2592,15 @@ static int q38cc_mtp_rows(Model *m, const float *streams, const int *next, int S
     Layer *l = &m->L[L];
     Q38CCSrv *sv = NULL;   /* the head's experts on the pool's server (q38cc_head_pool) */
     if (!q38cc_mirror(ch, m)) return 0;
+    /* the draft list scored on the card: the list (rebuilt by a request, tokens appended after) into
+     * host memory the card reads, the listed lm_head rows, the pick */
+    DraftVocab *dv = pick ? m->draft_vocab : NULL;
+    ColiCudaTensor *lmt = dv ? q38cc_t(ch, &m->lm_head) : NULL;
+    int vn = dv ? dv->list_n : 0;   /* matmul_rows takes the lm_head as the card holds it: f32, int8 rows or a GGUF's blocks */
+    int voc = logit && lmt && vn > 0 && cc_matmul_rows_ready() && cc_pick_ready() &&
+              cc_reserve(&ch->dv_ids, (size_t)V * 4, CC_UP) && cc_reserve(&ch->dv_y, (size_t)V * 4, CC_DEV) &&
+              cc_reserve(&ch->dv_x, (size_t)H * 4, CC_DEV) && cc_reserve(&ch->dv_pick, 64, CC_DOWN);
+    if (voc) memcpy(cc_ptr(ch->dv_ids), dv->list, (size_t)vn * sizeof(int));
     int CH = q38cc_rows_env(), rows = S < CH ? S : CH;
     float *emb = (float *)malloc((size_t)rows * (H + C) * sizeof(float)), *ones = emb ? emb + (size_t)rows * H : NULL;
     if (!emb || !q38cc_scratch(ch, m, rows) || (hidden && !cc_reserve(&ch->hypd, (size_t)rows * W * 4, CC_DOWN)) ||
@@ -2650,18 +2663,25 @@ static int q38cc_mtp_rows(Model *m, const float *streams, const int *next, int S
         if (ok && last && hidden) ok = cc_copy(ch->hypd, 0, ch->hyper, (size_t)(n - 1) * W, (size_t)W);
         if (ok && last && logit)
             ok = q38cc_gr_read(ch, m, &m->mtp_mixer, ch->o_mtp_mix, n, NULL) &&
-                 cc_matmul(q38cc_t(ch, &m->lm_head), ch->mixed, (size_t)(n - 1) * H, ch->outd, 0, 1);
+                 (voc ? cc_copy(ch->dv_x, 0, ch->mixed, (size_t)(n - 1) * H, (size_t)H) && cc_matmul_rows(lmt, ch->dv_ids, ch->dv_x, ch->dv_y, vn) &&
+                            cc_pick(ch->dv_y, ch->dv_pick, vn)
+                      : cc_matmul(q38cc_t(ch, &m->lm_head), ch->mixed, (size_t)(n - 1) * H, ch->outd, 0, 1));
         ok = ok && cc_submit(1);
         if (sv) { ok = q38cc_srv_close(sv, ok, ch->dm_seq) && ok; q38cc_srv_books(ch); sv = NULL; }
         if (!ok) goto lost;
         if (hyb) q38cc_kv_down(ch, m, L, n, pb);
         if (settle) { ch->kv_valid[L] = pb + n; m->mtp_len = pb + n; }
         if (last && hidden) memcpy(hidden, cc_ptr(ch->hypd), (size_t)W * sizeof(float));
-        if (last && logit) { memcpy(logit, cc_ptr(ch->outd), (size_t)V * sizeof(float)); ch->drafts++; }
+        if (last && logit && voc) {
+            const void *pk = cc_ptr(ch->dv_pick);
+            const int b = ((const int *)pk)[0];
+            *pick = dv->list[b >= 0 && b < vn ? b : 0]; if (pick_p) *pick_p = ((const float *)pk)[1];
+            ch->drafts++; ch->dv_drafts++;
+        } else if (last && logit) { memcpy(logit, cc_ptr(ch->outd), (size_t)V * sizeof(float)); ch->drafts++; }
         ch->mtp_rows += (unsigned long long)n; g_q38cc_mtp_rows += (unsigned long long)n;
     }
     free(emb);
-    return 1;
+    return voc ? 2 : 1;
 lost:   /* a frame failed: the device is gone; the CPU takes over, the head too */
     free(emb);
     if (sv) { q38cc_srv_close(sv, 0, ch->dm_seq); q38cc_srv_books(ch); }
@@ -2681,6 +2701,7 @@ static void q38cc_report(Model *m) {
         fprintf(stderr, "[chain] qwen38: %llu layer steps with the routed experts in the frame, %llu of them hybrid "
                         "(%llu slots on the host in %.1f ms, %.1f ms waiting for the device's routes), %llu slots from the host pool\n",
                 ch->dm_steps, ch->dm_hyb, ch->dm_pairs, ch->dm_host_ms, ch->dm_spin_ms, ch->pool_reads);
+    if (ch->dv_drafts) fprintf(stderr, "[chain] qwen38: %llu drafts from the draft list's lm_head rows on the card\n", ch->dv_drafts);
     if (ch->hd_rows) fprintf(stderr, "[chain] qwen38: %llu MTP head rows with their routed experts on the pool's server\n", ch->hd_rows);
     if (ch->srv && ch->sv_jobs)
         fprintf(stderr, "[chain] qwen38: the pool's server (%d threads): %llu layer steps, %llu pooled slots (%llu experts' groups) "

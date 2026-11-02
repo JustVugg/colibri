@@ -4316,6 +4316,23 @@ extern "C" int coli_cuda_tensor_glu_async(ColiCudaTensor *tg, ColiCudaTensor *tu
     if (!select_ctx(ctx) || !bd_table(ctx)) return 0;
     return hcm_gemm(ctx, tg, y_dev, x_dev, S, (cudaStream_t)stream, tu);
 }
+/* y[j] = row ids[j] of a block-format tensor against one row of x, each the bits the whole GEMV
+ * gives that row (a draft's vocabulary, cuda_chain.cu's cc_matmul_rows); 0 where not taken (another
+ * format, GQ_EXACT's float form) */
+extern "C" int coli_cuda_tensor_gemv_rows_async(ColiCudaTensor *t, const int *ids_dev, float *y_dev, const float *x_dev, int n, void *stream) {
+    if (fault_injected() || !t || !ids_dev || !y_dev || !x_dev || n < 1 || t->fmt < 100 || ((uintptr_t)x_dev & 15)) return 0;
+    static int exact = -1;
+    if (exact < 0) {
+        const char *e = std::getenv("COLI_CUDA_BD_FLOAT"), *q = std::getenv("GQ_EXACT");
+        exact = (e && *e == '1') || (q && *q == '1');
+    }
+    if (exact) return 0;
+    DeviceContext *ctx = find_ctx(t->device);
+    const bd_u32 *tab = select_ctx(ctx) ? bd_table(ctx) : nullptr;
+    if (!tab || !bd_gemv_rows_launch(y_dev, x_dev, (const bd_u32 *)t->weights, tab, ids_dev, t->fmt, t->I, t->O, t->row_words, n,
+                                     ctx->smem_optin, (cudaStream_t)stream)) return 0;
+    return cuda_ok(cudaGetLastError(), "block rows gemv launch");
+}
 extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream) {
     if (fault_injected()) return 0;
     if (!t || !y_dev || !x_dev || S < 1) return 0;

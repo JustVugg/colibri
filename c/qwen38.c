@@ -956,7 +956,8 @@ static int64_t q38_telemetry_init(const char *snap, const Model *m) {
 
 /* Creates the draft list (draft_vocab.h) when the head can use one: Q38_MTP_VOCAB is above 0,
  * Q38_MTP_DUMP is unset (the dump contains the logits of the whole vocabulary), Q38_DRAFT_HEAD
- * has built no int4 copy of the lm_head, the lm_head has int8 rows on the host and the counts
+ * has built no int4 copy of the lm_head, the lm_head has int8 rows on the host (or the CUDA
+ * chain, which scores the list from the lm_head on the card, may run the head) and the counts
  * file is not the file of the expert history, which the counts would replace. It runs after the
  * trunk is int8 and before COLI_VK_DENSE_HOST releases host copies, so the lm_head rows can stay
  * on the host. */
@@ -969,7 +970,11 @@ static void q38_vocab_decide(Model *m, const char *snap) {
                         "vocabulary from its own copy of the lm_head\n");
         return;
     }
-    if (!m->lm_head.q8) {
+    int card = 0;   /* the CUDA chain scores the list from the lm_head on the card (q38cc_mtp_rows) */
+#ifdef COLI_CUDA
+    card = q38cc_env_on();
+#endif
+    if (!m->lm_head.q8 && !card) {
         fprintf(stderr, "[qwen38 MTP] draft vocabulary: the lm_head has no int8 rows on the host, "
                         "so the head scores the whole vocabulary (Q38_MTP_VOCAB=0 silences this)\n");
         return;
