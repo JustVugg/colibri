@@ -123,6 +123,7 @@ class Events:
         self.seq, self.items, self.n = 0, [], 0
         self.msg = self.rsn = None
         self.calls, self.usage = {}, None
+        self.incomplete_reason = None
 
     def ev(self, typ, **kw):
         kw = {"type": typ, "sequence_number": self.seq, **kw}
@@ -130,9 +131,13 @@ class Events:
         return "event: %s\ndata: %s\n\n" % (typ, json.dumps(kw))
 
     def response(self, status):
+        if status == "completed" and self.incomplete_reason:
+            status = "incomplete"
         r = {"id": self.rid, "object": "response", "created_at": int(time.time()), "status": status, "model": self.model,
              "output": list(self.items)}
-        if status == "completed":
+        if status == "incomplete":
+            r["incomplete_details"] = {"reason": self.incomplete_reason}
+        if status in ("completed", "incomplete"):
             u = self.usage or {}
             pt, ct = int(u.get("prompt_tokens") or 0), int(u.get("completion_tokens") or 0)
             r["usage"] = {"input_tokens": pt, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": ct,
@@ -168,6 +173,9 @@ class Events:
         if isinstance(d.get("usage"), dict):
             self.usage = d["usage"]
         for ch in d.get("choices") or []:
+            reason = ch.get("finish_reason")
+            if reason in ("length", "content_filter"):
+                self.incomplete_reason = "max_output_tokens" if reason == "length" else reason
             delta = ch.get("delta") or {}
             r = delta.get("reasoning_content") or delta.get("reasoning")
             if isinstance(r, str) and r:
@@ -226,7 +234,8 @@ class Events:
                 out.append(self.ev("response.function_call_arguments.done", item_id=iid, output_index=i, arguments=item["arguments"]))
             self.items.append(item)
             out.append(self.ev("response.output_item.done", output_index=i, item=item))
-        out.append(self.ev("response.completed", response=self.response("completed")))
+        response = self.response("completed")
+        out.append(self.ev("response." + response["status"], response=response))
         return "".join(out)
 
 
