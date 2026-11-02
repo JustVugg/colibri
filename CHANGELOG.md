@@ -57,6 +57,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   Qwen3.8-Flash-Next IQ2_XS on an RTX PRO 4000 with an i5-13500, after a 452-token prompt, the
   history held fixed: decode 49.7-50.2 -> 52.3-52.9 tok/s (16 threads, 64-68 us a slot against
   83-89).
+- **Qwen3.8's CUDA chain: the MTP head on the card, on by default.** The head's layer runs on the
+  card (`Q38_MTP_CHAIN`), its 512 routed experts too, quantized at the start from the head's Q8_0
+  file to Q2_0 (0.66 GiB, `COLI_CUDA_CHAIN_MTP_CARD`; in RAM they take the pool's server,
+  `COLI_CUDA_CHAIN_MTP_POOL`), and a draft's list of tokens is scored on the card from the
+  lm_head's rows there, the pick too (`coli_cuda_tensor_gemv_rows_async`, each row the bits of the
+  whole GEMV). A draft then costs 0.6 ms of the card, so where the head's experts reach the card
+  the head drafts by default, three drafts a verify cut by their probabilities, over a list of
+  64,000 tokens. A draft is only a guess the verify judges: the text is that of plain decoding.
+  Qwen3.8-Flash-Next IQ2_XS on an RTX PRO 4000, served, nothing set, the history held fixed:
+  512-token answers 53.3-54.0 -> 71.7-72.3 tok/s, 128-token answers 54.4-55.4 -> 64.4-65.0; the
+  452-token prompt 635-661 -> 574-624 (the card holds 494 experts fewer for the head's).
 
 ### Fixed
 
