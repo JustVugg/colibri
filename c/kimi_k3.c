@@ -340,8 +340,9 @@ static int k3_chunk_rows(void){
     return c<1?1:c>K3_CHUNK_MAX?K3_CHUNK_MAX:c;
 }
 /* the most rows one GPU call takes: a bigger step goes in pieces, so the device buffers
- * that grow with the rows (coli_cuda.dll's input and output, the MLA core's, the routers')
- * stay within the 2-2.5 GiB the card has beside the 20 GiB of resident matrices. Measured
+ * that grow with the rows (coli_cuda.dll's input and output, the routers'; the MLA core
+ * takes a whole step in chunks of its own) stay within the 2-2.5 GiB the card has beside
+ * the 20 GiB of resident matrices. Measured
  * on the RTX 4090: a whole 4,096-row step's buffers did not fit (Windows paged the card's
  * memory to RAM, the GPU at 100% and the drives idle for minutes), and with 2,048-row
  * pieces the desktop's 150 MB more slowed coli_cuda_k3.dll's dense calls 2-6x. Every
@@ -2505,13 +2506,8 @@ static void k3_mla_scores_g(float *sc, const float *qab, const float *const *qrp
 #ifdef COLI_K3_CUDA
     /* a prompt step's attention core on the GPU, the loop below's bytes (k3cu_mla) */
     if(!mr&&g_k3g_on&&C>=g_k3g_min_rows&&a->kvb.fmt==1&&a->kvb.q8&&kvl%8==0&&(qr==0||qr%8==0)){
-        double t0=now_s();
-        on_gpu=1;   /* rows K3_GPU_ROWS a call, each with the positions up to its own */
-        for(int c0=0;c0<C&&on_gpu;c0+=K3_GPU_ROWS){
-            const int n=C-c0<K3_GPU_ROWS?C-c0:K3_GPU_ROWS;
-            on_gpu=k3cu_mla(m->Lc[li],m->Rc[li],pos0+c0+n,pos0+c0,n,qv+(int64_t)c0*H*qh,gv+(int64_t)c0*H*vh,
-                            a->kvb.q8,a->kvb.s,H,c->qk_nope,qr,vh,kvl,c->attn_scale,ctx+(int64_t)c0*H*vh);
-        }
+        double t0=now_s();   /* the whole step: the call takes its rows in chunks, each with the positions up to its own */
+        on_gpu=k3cu_mla(m->Lc[li],m->Rc[li],pos0+C,pos0,C,qv,gv,a->kvb.q8,a->kvb.s,H,c->qk_nope,qr,vh,kvl,c->attn_scale,ctx);
         if(on_gpu) m->t_mla_gpu+=now_s()-t0;
     }
 #endif

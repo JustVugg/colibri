@@ -368,3 +368,60 @@ experts' copies are 90% of the MoE's expert phase at 23 GB/s (the drives' DMA an
 the RAM they are read from), and the rest is attention (KDA 25 s: its five quant_matmul_blocked
 projections; the MLA core 11.5 s at about 4 TMAC/s, where the card's FP32 allows several times
 that).
+
+## The MLA core in tiles, exp_f in float pairs (`raw/mla_*`, `mlb_*`, 2026-11-02)
+
+The gated MLA's attention core (`k3cu_mla`) took 11.3 s of the 5,862-token prompt, 0.43 s a
+layer. `mla_bench.cu` timed its five kernels at that prompt's calls (1,024 rows a call, the
+scores 128 MB a chunk): the absorbed query 29.3 ms a layer, the scores 128.2 ms (8.7 TMAC/s,
+64-by-64 tiles of 4 by 4 a thread), the softmax 62.9, the values 93.0 (10.6 TMAC/s) and
+kv_b's rows 114.3 -- a block a row, a thread one of kv_b's rows, read a byte at a time. The
+softmax was the card's doubles: k3_exact.h's exp_f costs about 20 double FMAs a value, and
+the 4090 runs doubles at 1/64 of its FP32 rate (`expf_fast_check.cu`: 27.6 G values/s).
+
+- **exp_f in float pairs** (`k3d_expf`): e^x = 2^m 2^(j/64) e^r with r = x - k ln2/64 kept as
+  a float pair (ln2/64 in three parts; k times the first is exact, and so is x minus it),
+  2^(j/64) a pair from a table, e^r - 1 to r^5/120: e^x within about 2^-46 as f + d. Where
+  every number within 2^-42 of f + d rounds to f, f is exp_f's value; elsewhere -- 2,681 of
+  the 2.24 billion floats in [-87, 88] (`expf_fallback_count.cu`), and the floats past them
+  -- the double path decides (`k3d_expf_d`). 458 G values/s, exp_f's bits on every one of
+  the 2^32 floats (`tests/test_k3_cuda_experts.c --all-floats`, the double path alone too).
+  Every kernel of the DLL takes it: the softmax and the gates, KDA's conv, decay and beta,
+  SiTU's sigmoid.
+- **Four products in 128-by-128 tiles**, 8 by 8 outputs a thread, 8 k a step through two
+  shared buffers: the absorbed query and kv_b's rows (a GEMM a head over the chunk's rows,
+  kv_b's int8 widened as it loads), the scores (products rounded, added in order) and the
+  values (fused). A block of scores whose positions all lie past its rows' nt does not run.
+- **The softmax between them**: its max from the score blocks' own (the largest of the row's,
+  order-free; s[0] if that is NaN, as softmax_), the exps and their sum in t's order in a
+  block of 32 rows -- a thread the exps of one position in 16 rows, read and written whole,
+  into shared memory, then warp 0 adds the step's 128 a row while the others load the next --
+  and the division as the values load them.
+- **The step whole, in chunks**: one call a layer (the caller handed it 1,024 rows at a
+  time), chunks of up to 256 rows whose scores fit in 128 MB, each with the positions up to
+  its own last row's; a chunk's q and gate rows go up on a copy stream into one of two
+  buffers while the chunk before computes, its outputs down while the next one does. The
+  card no longer holds a call's q, gate and outputs whole (175 MB at 1,024 rows).
+
+| run | what | result |
+|---|---|---:|
+| `mla_bench.cu`, `mla_bench2.cu` | one layer of the 5,862-token prompt's calls, random data, kernels only | 427.6 -> 145-160 ms: the query 29.3 -> 5.2, scores 128.2 -> 69-83 (13.8 TMAC/s at best), softmax 62.9 -> 14.4, values 93.0 -> 50 (17 TMAC/s), kv_b's rows 114.3 -> 9 |
+| `mla_call_bench.cu` | the whole call with its copies from ordinary memory: 1,024-row calls against one | a layer at 5,862 tokens 165-180 -> 162-166 ms, at 2,637 41-60 -> 36-48 ms; the same outputs |
+| `expf_fast_check.cu`, `expf_fallback_count.cu` | k3d_expf against k3d_expf_d | every float the same; 458 against 27.6 G values/s; 2,681 floats of [-87, 88] to the doubles |
+| `tests/test_k3_cuda_experts.c` | k3cu_mla against mla_forward's loop: K3's shapes at 40, 300 and 200 rows (two chunks, chunks cut by their scores), the tiny model's at 37 and 600 rows (three chunks), 5 heads of 24+8 (partial tiles every way) | 0 differ; exp_f on all 2^32 floats the same |
+| `k3tiny.sh`, `k3tiny_big2.sh` | the tiny model at steps of 1 to 8,192 | the same logits as 04623a27 at every position; 40-token decode the same |
+| `mla_*_logits` (`series_mla.sh`) | the kernels alone (1,024-row calls): the logits of every position, against `long_ref` and `big6k_4096` | the same bytes |
+| `mla_5862_*`, `mla_2637_*` | A/B twice against 04623a27 (`pre_mla/`) | **126.5, 124.7 s** against 131.8, 131.3 s (the core 11.6 -> 5.4 s); 2,637 tokens 106.3, 106.3 against 107.0, 106.3 s |
+| `mlb_*_logits` (`series_mlb.sh`) | + one call a step, the copies under the kernels, exp_f in pairs everywhere: the logits of every position | the same bytes |
+| `mlb_5862_*`, `mlb_2637_*` | A/B against 04623a27, twice at 5,862 tokens, once at 2,637 | **122.9, 122.5 s** against 131.6, 131.7 s: the core 11.6 -> 4.0 s, KDA's layers 23.6 -> 22.5 s, attention 44.3 -> 35.7 s; 2,637 tokens 106.2 against 106.3 s (waiting for reads 34.8 -> 38.8 s) |
+
+Tried and dropped: a lane a row for the softmax's chain (125 ms a layer: 177 warps for the
+whole card), 16 k a barrier (no faster), the chunk's rows a multiple of the values' wave of
+blocks (47-49 against 51 ms, within the noise). The card ran at 2.865 GHz: 23.5 TMAC/s
+unfused and 47 fused at most, so the scores reach about 59% of their peak and the values
+about 36%; neither the values' data (their A or B from a 16 KB corner) nor the divisions in
+their loads (multiplies instead) moved them.
+
+The 2,637-token prompt waits for C: as before: the 3 s attention saved went into waiting for
+reads. At 5,862 tokens attention is now 35.7 s (KDA 24.5, the MLA layers 11.2 with their core
+4.0) and the MoE 79 s; a layer's compute is still above the drives' 1.05 s of reads.

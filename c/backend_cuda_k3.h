@@ -53,7 +53,8 @@ K3CU_API int k3cu_matmul(int fmt, float *y, const float *x, const void *w, const
 /* A prompt step's gated MLA attention core, mla_forward's loop to the bit: rows pos0..pos0+C-1
  * of a layer whose cache holds N = pos0 + C positions (Lc [N][kvl], Rc [N][qr]); qv [C][H][qn+qr]
  * (qb's output), gv [C][H][vh] (the gate's, before its sigmoid), kv_b int8 rows
- * [H*(qn+vh)][kvl] and their scales; ctx [C][H][vh]. 0 when it cannot (the CPU's). */
+ * [H*(qn+vh)][kvl] and their scales; ctx [C][H][vh]. kvl, qn and qr multiples of 8; any C (the
+ * rows go up and the outputs down a chunk at a time). 0 when it cannot (the CPU's). */
 K3CU_API int k3cu_mla(const float *Lc, const float *Rc, int N, int pos0, int C, const float *qv, const float *gv,
                       const int8_t *kvb, const float *kvbs, int H, int qn, int qr, int vh, int kvl, float scale,
                       float *ctx);

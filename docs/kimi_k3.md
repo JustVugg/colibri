@@ -279,8 +279,9 @@ every row's and position's arithmetic:
   prompt, 845 -> 697 s; a step of 4,096 or more reads nearly every expert, 1.4 TB: a
   5,862-token prompt 254 s in two steps of 4,096, 200 s in one of 8,192, the logits of every
   position the same bytes). The GPU's calls take a step's rows 1,024 at a time
-  (`K3_GPU_ROWS`) and the MLA core's scores 128 MB, so their device buffers fit beside the
-  20 GiB of resident matrices: a whole 4,096-row step's did not (Windows moved the card's
+  (`K3_GPU_ROWS`; the MLA core the whole step, in chunks whose scores fit in 128 MB), so
+  their device buffers fit beside the 20 GiB of resident matrices: a whole 4,096-row step's
+  did not (Windows moved the card's
   memory to RAM without an error, minutes at 100% GPU with the drives idle), and with
   2,048-row pieces 150 MB more of the desktop's slowed coli_cuda_k3.dll's calls 2-6x;
 - KDA's short convolutions and heads go over a step's tokens channel by channel and head
@@ -460,9 +461,14 @@ way.
   number between them rounds the same way, and the 731 and 415 floats where they differ
   carry MinGW's bits in `k3_exact_tables.h` (`tools/k3_exact_tables.c` writes it and checks
   every one of the 2^32 floats; `tests/test_k3_cuda_experts.c --all-floats` runs the
-  device's code on all of them). Then `mxfp4_qx`'s quantization and down, written straight
-  into one pinned buffer, a warp a row's 128 bytes (pieces of 16 bytes over PCIe slowed the
-  expert copies the other way from 26 to 20 GB/s). A feeder thread hands the card every expert whose bytes are in
+  device's code on all of them). exp_f, which every kernel here calls, first tries float
+  pairs, since the card runs doubles at 1/64 of its FP32 rate: e^x within about 2^-46 as a
+  float and a remainder, the float taken where every number within 2^-42 of the pair rounds
+  to it, the double path elsewhere (2,681 of the 2.24 billion floats in [-87, 88], and the
+  floats past them): 17 times as fast, exp_f's bits on all 2^32 floats. Then `mxfp4_qx`'s
+  quantization and down, written straight into one pinned buffer, a warp a row's 128 bytes
+  (pieces of 16 bytes over PCIe slowed the expert copies the other way from 26 to 20 GB/s).
+  A feeder thread hands the card every expert whose bytes are in
   RAM as the reads bring them, frees its slot and queues the step's next read into it; the
   CPU computes the shared experts meanwhile, then waves of `K3_GPU_CPU_WAVE` experts
   itself; the weighted sums run as before, in the union's order, a token a worker (its pairs
@@ -478,8 +484,14 @@ way.
 - **The gated MLA's attention core** (`k3cu_mla`): mla_forward's loop -- the absorbed
   query (fused, w_addrow's), the scores (products rounded, added in order from zero,
   then scaled), `softmax_` (its sum in order), the values (fused over the positions in
-  order), kv_b's rows (`k3_rowdot8_i8`) and the sigmoid gate -- as tiled kernels whose
-  every output adds its terms in order. It grows with the square of the context.
+  order), kv_b's rows (`k3_rowdot8_i8`) and the sigmoid gate. The four products run in
+  tiles of 128 by 128 outputs, 8 by 8 a thread, every output adding its terms in order (a
+  block of scores whose positions all lie past its rows' does not run); softmax_ takes its
+  max from the score blocks' own, a warp adds 32 rows' exps in order while its block
+  computes the next 128 positions', and the division happens as the values load them. The
+  step goes in chunks of up to 256 rows whose scores fit in 128 MB, a chunk's rows going up
+  and its outputs down while the next one computes. It grows with the square of the
+  context: at 5,862 tokens 4.0 s, 11.6 s in the 64-by-64 tiles of 4 by 4 a thread before.
 - **The routers** (`k3cu_router`): the bf16 router's 32 lanes and halving tree, a warp an
   output.
 - **The KDA layers** (`k3cu_kda`): kda_forward's by-step path in pieces of

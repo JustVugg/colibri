@@ -1,7 +1,8 @@
 /* coli_cuda_k3.dll against kimi_k3.c, bit for bit.
  *
- * 1. The device's exp_f and tanhf (k3_exact.h and its tables) against exp_f.h's exp_f and the
- *    C library's tanhf: every 4099th float, or with --all-floats every one of the 2^32.
+ * 1. The device's exp_f (in float pairs, and its fallback in doubles: k3_exact.h and its
+ *    table) and tanhf against exp_f.h's exp_f and the C library's tanhf: every 4099th float,
+ *    or with --all-floats every one of the 2^32.
  * 2. A prompt step's routed experts: random MXFP4 experts of Kimi K3's widths (latent 3584,
  *    moe_inter 3072, SiTU's 4 and 25) and of the tiny model's, over rows quantized by
  *    mxfp4_qx, through k3_wave (the CPU's gate and up, SiTU, quantization and down) and
@@ -24,7 +25,7 @@ static int check_exact(int all){
     uint32_t *out = malloc((size_t)chunk * 4);
     unsigned long long n = 0, bad = 0;
     if(!out){ printf("OOM\n"); return 1; }
-    for(int kind = 0; kind < 2; kind++)
+    for(int kind = 0; kind < 3; kind++)   /* exp_f, tanhf, exp_f's fallback in doubles */
         for(uint64_t first = 0; first < (1ull << 32); first += all ? chunk : (uint64_t)chunk * 97){
             if(!k3cu_exact_eval(kind, (uint32_t)first, chunk, out)){ printf("exact eval failed\n"); free(out); return 1; }
             unsigned long long b = 0;
@@ -33,16 +34,17 @@ static int check_exact(int all){
                 if(!all && i % 4099) continue;
                 uint32_t xb = (uint32_t)(first + (uint64_t)i);
                 float x; memcpy(&x, &xb, 4);
-                float r = kind ? tanhf(x) : exp_f(x);
+                float r = kind == 1 ? tanhf(x) : exp_f(x);
                 uint32_t rb; memcpy(&rb, &r, 4);
                 if(rb != out[i]){
-                    if(b < 3) printf("  %s(%a = 0x%08x): device 0x%08x, host 0x%08x\n", kind ? "tanhf" : "exp_f", x, xb, out[i], rb);
+                    if(b < 3) printf("  %s(%a = 0x%08x): device 0x%08x, host 0x%08x\n", kind == 1 ? "tanhf" : kind ? "exp_f (doubles)" : "exp_f", x, xb, out[i], rb);
                     b++;
                 }
             }
             bad += b; n += all ? chunk : chunk / 4099 + 1;
         }
-    printf("exp_f and tanhf on the device: %llu floats each%s, %llu differ\n", n / 2, all ? " (all)" : " (every 4099th)", bad);
+    printf("exp_f, tanhf and exp_f's fallback on the device: %llu floats each%s, %llu differ\n", n / 3,
+           all ? " (all)" : " (every 4099th)", bad);
     free(out);
     return bad != 0;
 }
@@ -165,6 +167,7 @@ static int check_mla(int H, int qn, int qr, int vh, int kvl, int pos0, int C){
         const float *qvt = qv + (int64_t)tt * H * qh, *gvt = gv + (int64_t)tt * H * vh;
         float *ctxt = cc + (int64_t)tt * H * vh;
         const int ngr = (H + K3_MLA_G - 1) / K3_MLA_G;
+        #pragma omp parallel for schedule(dynamic)
         for(int hg = 0; hg < ngr; hg++){
             const int h0 = hg * K3_MLA_G, nh = H - h0 < K3_MLA_G ? H - h0 : K3_MLA_G;
             float *qab = falloc((int64_t)K3_MLA_G * kvl), *scs = falloc((int64_t)K3_MLA_G * nt);
@@ -352,7 +355,11 @@ int main(int argc, char **argv){
     bad += check_dense(1, 33, 7168, 100, 0);
     bad += check_dense(1, 1030, 512, 40, 0);
     bad += check_mla(96, 128, 64, 128, 512, 100, 40);
+    bad += check_mla(96, 128, 64, 128, 512, 1000, 300);   /* two chunks of rows, the scores' blocks past nt skipped */
+    bad += check_mla(96, 128, 64, 128, 512, 3000, 200);   /* chunks cut to their scores' 128 MB */
     bad += check_mla(8, 16, 8, 16, 32, 0, 37);
+    bad += check_mla(8, 16, 8, 16, 32, 50, 600);          /* three chunks: a buffer used twice */
+    bad += check_mla(5, 24, 8, 40, 64, 7, 300);           /* partial tiles every way */
     bad += check_router(37, 7168, 896);
     bad += check_router(70, 128, 13);
     bad += check_shared(40, 1024, 768, 2, 64);
