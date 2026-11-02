@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "hypothesis": "Keeping OLMoE attention q/k/v/o and lm_head half-resident (widened to f32 per element, same matmul lanes) halves the dense bytes a cached decode step streams from DRAM, so tokens/s rises with no change to any value.",
+  "commit": "0d239d4f2649733d168788af329f53e44e52dd6c",
+  "model": "OLMoE-1B-7B-Instruct, Colibri int8-expert container (dense tensors FP16 on disk), 7.2 GB",
+  "command": "make -C c olmoe; for each arm, alternating B,T,T,B,... after one warm-up pair: SNAP=<model> COLI_TEMP=0 COLI_DENSE_F16=<0|1> PPL=1 ./olmoe 64 8 ref_pr.json (tok_s = the Speed line: 256 teacher-forced decode steps + 24-token prefill); quality: same ref with PPL unset, greedy generate of 128 tokens, token streams compared; the measured binary was built from afeab04d (this change on top of the FUSED3 gate fix in #2039): FUSED3 is off in both arms, so the two trees run identical code on this path",
+  "prompt_hash": "b39e8d62373e17a800f4825beae300149f7b029d22c06a4bbbaf755fc3697f0b",
+  "hardware": {
+    "cpu": "12th Gen Intel Core i7-12700H, 14 cores / 20 threads (6P+8E), AVX2/F16C/FMA",
+    "ram": "16 GB DDR4-3200 (single 16 GB module, as reported by Win32_PhysicalMemory)",
+    "storage": "WD PC SN740 512 GB NVMe, NTFS; model files read through the OS page cache (warm after the first pair)",
+    "os": "Windows 11 Education 10.0.26200, gcc 16.1.0 (MinGW-W64 ucrt, Brecht Sanders r4), -O3 -march=x86-64-v3 -fopenmp; laptop on mains power"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "COLI_DENSE_F16"
+  ],
+  "baseline": {
+    "config": {
+      "COLI_DENSE_F16": 0,
+      "fixed": "SNAP=OLMoE-1B-7B-Instruct int8 experts, COLI_TEMP=0, PPL=1 teacher-forced 24-token prompt + 256 tokens, cap 64 (every expert cached), bits 8, OMP defaults"
+    },
+    "samples": {
+      "tok_s": [
+        5.37,
+        5.24,
+        5.36,
+        5.28,
+        5.19,
+        5.28,
+        5.34,
+        5.22
+      ]
+    },
+    "median_tok_s": 5.28,
+    "quality": {
+      "method": "TF-NLL 1.4863 and greedy 128-token stream identical to the trial arm",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/olmoe-dense-f16-2026-10-12-raw.txt",
+      "sha256": "210088f9923567c9a8b2d3b8dbaa92bde61bd64ce0201285e9ba240229330aec"
+    }
+  },
+  "trial": {
+    "config": {
+      "COLI_DENSE_F16": 1,
+      "fixed": "SNAP=OLMoE-1B-7B-Instruct int8 experts, COLI_TEMP=0, PPL=1 teacher-forced 24-token prompt + 256 tokens, cap 64 (every expert cached), bits 8, OMP defaults"
+    },
+    "samples": {
+      "tok_s": [
+        6.7,
+        6.64,
+        6.81,
+        6.7,
+        6.61,
+        6.56,
+        6.69,
+        6.64
+      ]
+    },
+    "median_tok_s": 6.665,
+    "quality": {
+      "method": "TF-NLL 1.4863 and greedy 128-token stream identical to the baseline arm; tests/test_matmul_f16.c compares the matmul bits",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/olmoe-dense-f16-2026-10-12-raw.txt",
+      "sha256": "210088f9923567c9a8b2d3b8dbaa92bde61bd64ce0201285e9ba240229330aec"
+    }
+  },
+  "outcome": "improvement"
+}

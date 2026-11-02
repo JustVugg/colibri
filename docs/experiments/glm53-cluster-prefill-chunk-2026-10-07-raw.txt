@@ -1,0 +1,920 @@
+# GLM-5.3 cluster prefill chunk 128 vs 256 (2026-10-07), raw evidence
+# Every run in execution order: the bench log line, then the run's full stderr and stdout.
+# Prompt sha256: dbfbf4c85ed8d67d9b15f76b51756af0518c48a3463593182ec9480744489407
+
+===== warmup-chunk256
+2026-10-07T08:29:58Z warmup-chunk256 arm=B chunk=256 rc=0 wall=619s prefill 245 tokens in 462.4s tokens_md5=36662cee66d0 worker_mean_ms=3487.1/4066.9/
+----- stderr
+expert budget: 11.0 GB (33.4 total, 183.2 model, 4.0 margin, 14.0 available)
+experts: 14.2 MB slots, 18 per layer across 42 sparse layers (10.7 GB resident)
+[CLUSTER] coordinator connected to 2 expert worker(s) | routing worker-a:9100 52% / worker-b:9100 48% (COLI_CLUSTER_WEIGHTS)
+[USAGE] expert history: 3213168 selections (<model>/.coli_usage)
+GLM-5.3-Flash: 45 layers (34 KDA + 11 full) + 1 MTP, hidden 4096, vocab 154880
+  MoE      : 288 routed (top-8) + 1 shared, inter 2048, from layer 3, scale 2.50
+  KDA      : 64 heads x 128, conv 4, gate floor -5.0
+  MLA      : q_lora 1536, kv_lora 512, qk 256 (nope, NoPE), v 256, 64 heads
+  indexer  : top-2048, 32 heads x 128, kpool 4 (+tail)
+  mHC      : mult 4, 20 Sinkhorn iterations
+  vision   : yes
+  routed experts: 311.7 B parameters (175 GB at int4-g64)
+             24 blocks x 1024, 16 heads, patch 14, 448px, merge 2 -> 4096
+cache: 33.0 KB per token across 11 DSA layers (0.01 GB at 247 positions)
+[CLUSTER] layer 3: worker-a:9100 1047 rows 9586 ms worker-b:9100 913 rows 15325 ms | waited 15325 ms
+[CLUSTER] layer 4: worker-a:9100 1179 rows 9602 ms worker-b:9100 781 rows 13046 ms | waited 13046 ms
+[CLUSTER] layer 5: worker-a:9100 1059 rows 8468 ms worker-b:9100 901 rows 8470 ms | waited 8470 ms
+[CLUSTER] layer 6: worker-a:9100 944 rows 6701 ms worker-b:9100 1016 rows 6703 ms | waited 6703 ms
+[CLUSTER] layer 7: worker-a:9100 923 rows 5802 ms worker-b:9100 1037 rows 5811 ms | waited 5811 ms
+[CLUSTER] layer 8: worker-a:9100 955 rows 6846 ms worker-b:9100 1005 rows 7860 ms | waited 7860 ms
+[CLUSTER] layer 9: worker-a:9100 984 rows 7243 ms worker-b:9100 976 rows 11153 ms | waited 11153 ms
+[CLUSTER] layer 10: worker-a:9100 1042 rows 9069 ms worker-b:9100 918 rows 12416 ms | waited 12416 ms
+[CLUSTER] layer 11: worker-a:9100 866 rows 6498 ms worker-b:9100 1094 rows 7276 ms | waited 7276 ms
+[CLUSTER] layer 12: worker-a:9100 976 rows 7055 ms worker-b:9100 984 rows 7057 ms | waited 7057 ms
+[CLUSTER] layer 13: worker-a:9100 1044 rows 6954 ms worker-b:9100 916 rows 6957 ms | waited 6957 ms
+[CLUSTER] layer 14: worker-a:9100 1273 rows 7281 ms worker-b:9100 687 rows 7282 ms | waited 7282 ms
+[CLUSTER] layer 15: worker-a:9100 1046 rows 7068 ms worker-b:9100 914 rows 7075 ms | waited 7075 ms
+[CLUSTER] layer 16: worker-a:9100 1027 rows 7115 ms worker-b:9100 933 rows 7118 ms | waited 7118 ms
+[CLUSTER] layer 17: worker-a:9100 1077 rows 6760 ms worker-b:9100 883 rows 6762 ms | waited 6762 ms
+[CLUSTER] layer 18: worker-a:9100 1213 rows 6238 ms worker-b:9100 747 rows 6240 ms | waited 6240 ms
+[CLUSTER] layer 19: worker-a:9100 1052 rows 6146 ms worker-b:9100 908 rows 6153 ms | waited 6153 ms
+[CLUSTER] layer 20: worker-a:9100 1072 rows 6247 ms worker-b:9100 888 rows 6260 ms | waited 6260 ms
+[CLUSTER] layer 21: worker-a:9100 966 rows 6305 ms worker-b:9100 994 rows 6839 ms | waited 6839 ms
+[CLUSTER] layer 22: worker-a:9100 934 rows 5771 ms worker-b:9100 1026 rows 10265 ms | waited 10265 ms
+[CLUSTER] layer 23: worker-a:9100 995 rows 6206 ms worker-b:9100 965 rows 6214 ms | waited 6214 ms
+[CLUSTER] layer 24: worker-a:9100 1054 rows 7053 ms worker-b:9100 906 rows 7055 ms | waited 7055 ms
+[CLUSTER] layer 25: worker-a:9100 919 rows 6265 ms worker-b:9100 1041 rows 6267 ms | waited 6267 ms
+[CLUSTER] layer 26: worker-a:9100 899 rows 6527 ms worker-b:9100 1061 rows 7797 ms | waited 7797 ms
+[CLUSTER] layer 27: worker-a:9100 1022 rows 6738 ms worker-b:9100 938 rows 9558 ms | waited 9558 ms
+[CLUSTER] layer 28: worker-a:9100 864 rows 6762 ms worker-b:9100 1096 rows 9621 ms | waited 9621 ms
+[CLUSTER] layer 29: worker-a:9100 1096 rows 6915 ms worker-b:9100 864 rows 9787 ms | waited 9787 ms
+[CLUSTER] layer 30: worker-a:9100 923 rows 6965 ms worker-b:9100 1037 rows 7099 ms | waited 7099 ms
+[CLUSTER] layer 31: worker-a:9100 1008 rows 7933 ms worker-b:9100 952 rows 7940 ms | waited 7940 ms
+[CLUSTER] layer 32: worker-a:9100 862 rows 7075 ms worker-b:9100 1098 rows 7077 ms | waited 7077 ms
+[CLUSTER] layer 33: worker-a:9100 1063 rows 6739 ms worker-b:9100 897 rows 6742 ms | waited 6742 ms
+[CLUSTER] layer 34: worker-a:9100 903 rows 6490 ms worker-b:9100 1057 rows 6493 ms | waited 6493 ms
+[CLUSTER] layer 35: worker-a:9100 975 rows 6906 ms worker-b:9100 985 rows 6914 ms | waited 6914 ms
+[CLUSTER] layer 36: worker-a:9100 982 rows 7218 ms worker-b:9100 978 rows 7221 ms | waited 7221 ms
+[CLUSTER] layer 37: worker-a:9100 1028 rows 6899 ms worker-b:9100 932 rows 6901 ms | waited 6901 ms
+[CLUSTER] layer 38: worker-a:9100 1144 rows 6486 ms worker-b:9100 816 rows 6488 ms | waited 6488 ms
+[CLUSTER] layer 39: worker-a:9100 876 rows 6442 ms worker-b:9100 1084 rows 10071 ms | waited 10071 ms
+[CLUSTER] layer 40: worker-a:9100 1176 rows 7755 ms worker-b:9100 784 rows 8241 ms | waited 8241 ms
+[CLUSTER] layer 41: worker-a:9100 898 rows 6606 ms worker-b:9100 1062 rows 9025 ms | waited 9025 ms
+[CLUSTER] layer 42: worker-a:9100 1045 rows 6807 ms worker-b:9100 915 rows 6809 ms | waited 6809 ms
+[CLUSTER] layer 43: worker-a:9100 989 rows 4510 ms worker-b:9100 971 rows 5290 ms | waited 5290 ms
+[CLUSTER] layer 44: worker-a:9100 801 rows 2992 ms worker-b:9100 1159 rows 6542 ms | waited 6542 ms
+load 142.9s, prefill 245 tokens in 462.4s
+prefill profile: attention 91.2s, ffn 360.4s (disk 0.0s), head 6.1s
+[glm53] 3 stop id(s) from generation_config.json
+[CLUSTER] layer 3: worker-a:9100 6 rows 312 ms worker-b:9100 2 rows 312 ms | waited 312 ms
+[CLUSTER] layer 4: worker-a:9100 5 rows 277 ms worker-b:9100 3 rows 337 ms | waited 337 ms
+[CLUSTER] layer 5: worker-a:9100 4 rows 233 ms worker-b:9100 4 rows 251 ms | waited 251 ms
+[CLUSTER] layer 6: worker-a:9100 4 rows 309 ms worker-b:9100 4 rows 201 ms | waited 309 ms
+[CLUSTER] layer 7: worker-a:9100 6 rows 226 ms worker-b:9100 2 rows 226 ms | waited 226 ms
+[CLUSTER] layer 8: worker-a:9100 5 rows 198 ms worker-b:9100 3 rows 198 ms | waited 198 ms
+[CLUSTER] layer 9: worker-a:9100 3 rows 80 ms worker-b:9100 5 rows 305 ms | waited 305 ms
+[CLUSTER] layer 10: worker-a:9100 4 rows 219 ms worker-b:9100 4 rows 219 ms | waited 219 ms
+[CLUSTER] layer 11: worker-a:9100 6 rows 236 ms worker-b:9100 2 rows 236 ms | waited 236 ms
+[CLUSTER] layer 12: worker-a:9100 2 rows 13 ms worker-b:9100 6 rows 400 ms | waited 400 ms
+[CLUSTER] layer 13: worker-a:9100 3 rows 105 ms worker-b:9100 5 rows 374 ms | waited 374 ms
+[CLUSTER] layer 14: worker-a:9100 6 rows 52 ms worker-b:9100 2 rows 208 ms | waited 208 ms
+[CLUSTER] layer 15: worker-a:9100 4 rows 16 ms worker-b:9100 4 rows 213 ms | waited 213 ms
+[CLUSTER] layer 16: worker-a:9100 3 rows 32 ms worker-b:9100 5 rows 347 ms | waited 347 ms
+[CLUSTER] layer 17: worker-a:9100 6 rows 151 ms worker-b:9100 2 rows 150 ms | waited 151 ms
+[CLUSTER] layer 18: worker-a:9100 4 rows 37 ms worker-b:9100 4 rows 158 ms | waited 158 ms
+[CLUSTER] layer 19: worker-a:9100 2 rows 19 ms worker-b:9100 6 rows 263 ms | waited 263 ms
+[CLUSTER] layer 20: worker-a:9100 5 rows 125 ms worker-b:9100 3 rows 125 ms | waited 125 ms
+[CLUSTER] layer 21: worker-a:9100 4 rows 161 ms worker-b:9100 4 rows 161 ms | waited 161 ms
+[CLUSTER] layer 22: worker-a:9100 6 rows 94 ms worker-b:9100 2 rows 94 ms | waited 94 ms
+[CLUSTER] layer 23: worker-a:9100 3 rows 231 ms worker-b:9100 5 rows 231 ms | waited 231 ms
+[CLUSTER] layer 24: worker-a:9100 3 rows 24 ms worker-b:9100 5 rows 225 ms | waited 225 ms
+[CLUSTER] layer 25: worker-a:9100 4 rows 166 ms worker-b:9100 4 rows 166 ms | waited 166 ms
+[CLUSTER] layer 26: worker-a:9100 3 rows 101 ms worker-b:9100 5 rows 233 ms | waited 233 ms
+[CLUSTER] layer 27: worker-a:9100 5 rows 131 ms worker-b:9100 3 rows 131 ms | waited 131 ms
+[CLUSTER] layer 28: worker-a:9100 4 rows 166 ms worker-b:9100 4 rows 166 ms | waited 166 ms
+[CLUSTER] layer 29: worker-a:9100 6 rows 90 ms worker-b:9100 2 rows 90 ms | waited 90 ms
+[CLUSTER] layer 30: worker-a:9100 6 rows 85 ms worker-b:9100 2 rows 78 ms | waited 85 ms
+[CLUSTER] layer 31: worker-a:9100 3 rows 83 ms worker-b:9100 5 rows 245 ms | waited 245 ms
+[CLUSTER] layer 32: worker-a:9100 4 rows 164 ms worker-b:9100 4 rows 164 ms | waited 164 ms
+[CLUSTER] layer 33: worker-a:9100 6 rows 84 ms worker-b:9100 2 rows 84 ms | waited 84 ms
+[CLUSTER] layer 34: worker-a:9100 5 rows 117 ms worker-b:9100 3 rows 117 ms | waited 117 ms
+[CLUSTER] layer 35: worker-a:9100 5 rows 233 ms worker-b:9100 3 rows 233 ms | waited 233 ms
+[CLUSTER] layer 36: worker-a:9100 4 rows 110 ms worker-b:9100 4 rows 168 ms | waited 168 ms
+[CLUSTER] layer 37: worker-a:9100 3 rows 33 ms worker-b:9100 5 rows 222 ms | waited 222 ms
+[CLUSTER] layer 38: worker-a:9100 5 rows 117 ms worker-b:9100 3 rows 117 ms | waited 117 ms
+[CLUSTER] layer 39: worker-a:9100 6 rows 284 ms worker-b:9100 2 rows 284 ms | waited 284 ms
+[CLUSTER] layer 40: worker-a:9100 3 rows 38 ms worker-b:9100 5 rows 529 ms | waited 529 ms
+[CLUSTER] layer 41: worker-a:9100 2 rows 580 ms worker-b:9100 6 rows 580 ms | waited 580 ms
+[CLUSTER] layer 42: worker-a:9100 3 rows 33 ms worker-b:9100 5 rows 789 ms | waited 789 ms
+[CLUSTER] layer 43: worker-a:9100 4 rows 79 ms worker-b:9100 4 rows 292 ms | waited 292 ms
+[CLUSTER] layer 44: worker-a:9100 4 rows 29 ms worker-b:9100 4 rows 478 ms | waited 478 ms
+[STATS] 3295824 selections across 11968 distinct experts -> <model>/.coli_usage
+[CLUSTER] worker-a:9100: 84 requests, 42380 rows, 3487.1 ms mean reply
+[CLUSTER] worker-b:9100: 84 requests, 40276 rows, 4066.9 ms mean reply
+----- stdout
+teacher_forcing 154822 1588 6645 23511 369 264 501 714 315 8472 264 9020 315 18347 15534 320 1614 13 264 69878 16279 12639 13 8884 10647 2436 264 323 6203 11 6203 6203 6203 5611 1817 17481 7798 1817 3468 264 315 279 6203 11641 13 862 1828 69878 82 13 576 1246 304 553 3019 11 304 14386 4128 11 1246 264 3175 1196 374 911 11206 11206 374 1526 419 1849 11 1246 279 11206 22056 279 7162 7559 7162 11 1128 6896 11858 56818 504 13355 323 1181 11873 11 1246 279 6203 311 700 304 2176 11858 1573 894 11248 4041 4362 1182 1246 1246 279 1590 5780 979 279 1614 525 279 1091 279 3922 13 29620 7512 279 14166 4344 311 3931 279 4361 6248 30156 6193 30156 11 11827 279 3175 4680 3950 11 323 1977 1817 825 1977 1128 432 1035 6629 311 12112 432 6439 13 1128 1410 728 432 1102 9152 13 4686 835 13 3498 279 6193 374 374 10591 13 17353 553 264 2805 14301 498 5675 1410 1598 311 1449 279 501 315 504 2 3885 279 1614 7337 525 19479 19479 25 825 702 264 4937 36178 323 264 11641 13931 11 1008 1083 8472 279 6929 15713 11 264 74174 3538 13 279 279 1008 702 264 28294 36178 714 264 770 4303 653 13 81247 1246 315 697 2326 7337 803 311 387 279 17831 369 279 6193 11 81247
+ Explain
+decode 1 token in 11.2s = 0.089 tok/s (11.2 s/token)
+experts hits 0 miss 0 bytes 0
+
+===== chunk128-1
+2026-10-07T08:43:47Z chunk128-1 arm=B chunk=128 rc=0 wall=829s prefill 245 tokens in 618.1s tokens_md5=36662cee66d0 worker_mean_ms=3673.0/3989.6/
+----- stderr
+expert budget: 10.9 GB (33.4 total, 183.2 model, 4.0 margin, 13.9 available)
+experts: 14.2 MB slots, 18 per layer across 42 sparse layers (10.7 GB resident)
+[CLUSTER] coordinator connected to 2 expert worker(s) | routing worker-a:9100 52% / worker-b:9100 48% (COLI_CLUSTER_WEIGHTS)
+[USAGE] expert history: 3295824 selections (<model>/.coli_usage)
+GLM-5.3-Flash: 45 layers (34 KDA + 11 full) + 1 MTP, hidden 4096, vocab 154880
+  MoE      : 288 routed (top-8) + 1 shared, inter 2048, from layer 3, scale 2.50
+  KDA      : 64 heads x 128, conv 4, gate floor -5.0
+  MLA      : q_lora 1536, kv_lora 512, qk 256 (nope, NoPE), v 256, 64 heads
+  indexer  : top-2048, 32 heads x 128, kpool 4 (+tail)
+  mHC      : mult 4, 20 Sinkhorn iterations
+  vision   : yes
+  routed experts: 311.7 B parameters (175 GB at int4-g64)
+             24 blocks x 1024, 16 heads, patch 14, 448px, merge 2 -> 4096
+cache: 33.0 KB per token across 11 DSA layers (0.01 GB at 247 positions)
+[CLUSTER] layer 3: worker-a:9100 528 rows 8259 ms worker-b:9100 496 rows 12809 ms | waited 12809 ms
+[CLUSTER] layer 4: worker-a:9100 621 rows 8921 ms worker-b:9100 403 rows 9464 ms | waited 9464 ms
+[CLUSTER] layer 5: worker-a:9100 545 rows 7365 ms worker-b:9100 479 rows 7367 ms | waited 7367 ms
+[CLUSTER] layer 6: worker-a:9100 508 rows 5338 ms worker-b:9100 516 rows 5339 ms | waited 5339 ms
+[CLUSTER] layer 7: worker-a:9100 471 rows 5396 ms worker-b:9100 553 rows 5401 ms | waited 5401 ms
+[CLUSTER] layer 8: worker-a:9100 494 rows 5765 ms worker-b:9100 530 rows 5767 ms | waited 5767 ms
+[CLUSTER] layer 9: worker-a:9100 501 rows 5938 ms worker-b:9100 523 rows 5939 ms | waited 5939 ms
+[CLUSTER] layer 10: worker-a:9100 516 rows 6175 ms worker-b:9100 508 rows 6176 ms | waited 6176 ms
+[CLUSTER] layer 11: worker-a:9100 440 rows 4731 ms worker-b:9100 584 rows 7554 ms | waited 7554 ms
+[CLUSTER] layer 12: worker-a:9100 517 rows 5546 ms worker-b:9100 507 rows 8567 ms | waited 8567 ms
+[CLUSTER] layer 13: worker-a:9100 536 rows 5626 ms worker-b:9100 488 rows 5628 ms | waited 5628 ms
+[CLUSTER] layer 14: worker-a:9100 684 rows 5517 ms worker-b:9100 340 rows 5518 ms | waited 5518 ms
+[CLUSTER] layer 15: worker-a:9100 542 rows 5563 ms worker-b:9100 482 rows 5567 ms | waited 5567 ms
+[CLUSTER] layer 16: worker-a:9100 561 rows 5860 ms worker-b:9100 463 rows 5861 ms | waited 5861 ms
+[CLUSTER] layer 17: worker-a:9100 516 rows 5305 ms worker-b:9100 508 rows 5306 ms | waited 5306 ms
+[CLUSTER] layer 18: worker-a:9100 661 rows 4735 ms worker-b:9100 363 rows 4736 ms | waited 4736 ms
+[CLUSTER] layer 19: worker-a:9100 536 rows 5462 ms worker-b:9100 488 rows 5466 ms | waited 5466 ms
+[CLUSTER] layer 20: worker-a:9100 571 rows 4705 ms worker-b:9100 453 rows 4706 ms | waited 4706 ms
+[CLUSTER] layer 21: worker-a:9100 522 rows 4854 ms worker-b:9100 502 rows 4855 ms | waited 4855 ms
+[CLUSTER] layer 22: worker-a:9100 490 rows 5004 ms worker-b:9100 534 rows 5006 ms | waited 5006 ms
+[CLUSTER] layer 23: worker-a:9100 502 rows 4751 ms worker-b:9100 522 rows 4756 ms | waited 4756 ms
+[CLUSTER] layer 24: worker-a:9100 586 rows 5531 ms worker-b:9100 438 rows 5532 ms | waited 5532 ms
+[CLUSTER] layer 25: worker-a:9100 438 rows 4545 ms worker-b:9100 586 rows 4546 ms | waited 4546 ms
+[CLUSTER] layer 26: worker-a:9100 462 rows 4712 ms worker-b:9100 562 rows 4714 ms | waited 4714 ms
+[CLUSTER] layer 27: worker-a:9100 561 rows 4871 ms worker-b:9100 463 rows 4875 ms | waited 4875 ms
+[CLUSTER] layer 28: worker-a:9100 429 rows 5517 ms worker-b:9100 595 rows 6026 ms | waited 6026 ms
+[CLUSTER] layer 29: worker-a:9100 551 rows 5208 ms worker-b:9100 473 rows 6367 ms | waited 6367 ms
+[CLUSTER] layer 30: worker-a:9100 490 rows 5548 ms worker-b:9100 534 rows 6013 ms | waited 6013 ms
+[CLUSTER] layer 31: worker-a:9100 536 rows 6213 ms worker-b:9100 488 rows 6493 ms | waited 6493 ms
+[CLUSTER] layer 32: worker-a:9100 466 rows 5738 ms worker-b:9100 558 rows 5739 ms | waited 5739 ms
+[CLUSTER] layer 33: worker-a:9100 568 rows 5450 ms worker-b:9100 456 rows 5451 ms | waited 5451 ms
+[CLUSTER] layer 34: worker-a:9100 479 rows 5134 ms worker-b:9100 545 rows 5135 ms | waited 5135 ms
+[CLUSTER] layer 35: worker-a:9100 479 rows 5909 ms worker-b:9100 545 rows 5913 ms | waited 5913 ms
+[CLUSTER] layer 36: worker-a:9100 441 rows 5557 ms worker-b:9100 583 rows 5558 ms | waited 5558 ms
+[CLUSTER] layer 37: worker-a:9100 557 rows 5140 ms worker-b:9100 467 rows 5141 ms | waited 5141 ms
+[CLUSTER] layer 38: worker-a:9100 614 rows 4756 ms worker-b:9100 410 rows 4758 ms | waited 4758 ms
+[CLUSTER] layer 39: worker-a:9100 433 rows 4921 ms worker-b:9100 591 rows 4926 ms | waited 4926 ms
+[CLUSTER] layer 40: worker-a:9100 624 rows 6246 ms worker-b:9100 400 rows 6246 ms | waited 6246 ms
+[CLUSTER] layer 41: worker-a:9100 435 rows 6094 ms worker-b:9100 589 rows 6095 ms | waited 6095 ms
+[CLUSTER] layer 42: worker-a:9100 549 rows 5221 ms worker-b:9100 475 rows 5222 ms | waited 5222 ms
+[CLUSTER] layer 43: worker-a:9100 490 rows 3665 ms worker-b:9100 534 rows 4083 ms | waited 4083 ms
+[CLUSTER] layer 44: worker-a:9100 399 rows 1755 ms worker-b:9100 625 rows 3977 ms | waited 3977 ms
+[CLUSTER] layer 3: worker-a:9100 519 rows 7683 ms worker-b:9100 417 rows 7684 ms | waited 7684 ms
+[CLUSTER] layer 4: worker-a:9100 558 rows 8644 ms worker-b:9100 378 rows 8645 ms | waited 8645 ms
+[CLUSTER] layer 5: worker-a:9100 514 rows 7896 ms worker-b:9100 422 rows 7897 ms | waited 7897 ms
+[CLUSTER] layer 6: worker-a:9100 436 rows 6788 ms worker-b:9100 500 rows 7225 ms | waited 7225 ms
+[CLUSTER] layer 7: worker-a:9100 452 rows 5726 ms worker-b:9100 484 rows 6337 ms | waited 6337 ms
+[CLUSTER] layer 8: worker-a:9100 461 rows 5587 ms worker-b:9100 475 rows 5589 ms | waited 5589 ms
+[CLUSTER] layer 9: worker-a:9100 483 rows 6189 ms worker-b:9100 453 rows 6190 ms | waited 6190 ms
+[CLUSTER] layer 10: worker-a:9100 526 rows 6234 ms worker-b:9100 410 rows 7085 ms | waited 7085 ms
+[CLUSTER] layer 11: worker-a:9100 426 rows 4836 ms worker-b:9100 510 rows 8293 ms | waited 8293 ms
+[CLUSTER] layer 12: worker-a:9100 459 rows 5093 ms worker-b:9100 477 rows 7665 ms | waited 7665 ms
+[CLUSTER] layer 13: worker-a:9100 508 rows 6496 ms worker-b:9100 428 rows 6497 ms | waited 6497 ms
+[CLUSTER] layer 14: worker-a:9100 589 rows 5331 ms worker-b:9100 347 rows 5332 ms | waited 5332 ms
+[CLUSTER] layer 15: worker-a:9100 504 rows 5810 ms worker-b:9100 432 rows 5811 ms | waited 5811 ms
+[CLUSTER] layer 16: worker-a:9100 466 rows 6012 ms worker-b:9100 470 rows 6014 ms | waited 6014 ms
+[CLUSTER] layer 17: worker-a:9100 561 rows 5070 ms worker-b:9100 375 rows 5070 ms | waited 5070 ms
+[CLUSTER] layer 18: worker-a:9100 552 rows 4442 ms worker-b:9100 384 rows 4443 ms | waited 4443 ms
+[CLUSTER] layer 19: worker-a:9100 516 rows 4587 ms worker-b:9100 420 rows 4588 ms | waited 4588 ms
+[CLUSTER] layer 20: worker-a:9100 501 rows 4512 ms worker-b:9100 435 rows 4513 ms | waited 4513 ms
+[CLUSTER] layer 21: worker-a:9100 444 rows 4759 ms worker-b:9100 492 rows 4760 ms | waited 4760 ms
+[CLUSTER] layer 22: worker-a:9100 444 rows 5147 ms worker-b:9100 492 rows 5148 ms | waited 5148 ms
+[CLUSTER] layer 23: worker-a:9100 493 rows 4663 ms worker-b:9100 443 rows 5124 ms | waited 5124 ms
+[CLUSTER] layer 24: worker-a:9100 468 rows 5085 ms worker-b:9100 468 rows 7139 ms | waited 7139 ms
+[CLUSTER] layer 25: worker-a:9100 481 rows 5643 ms worker-b:9100 455 rows 6035 ms | waited 6035 ms
+[CLUSTER] layer 26: worker-a:9100 437 rows 5428 ms worker-b:9100 499 rows 6624 ms | waited 6624 ms
+[CLUSTER] layer 27: worker-a:9100 461 rows 4644 ms worker-b:9100 475 rows 4645 ms | waited 4645 ms
+[CLUSTER] layer 28: worker-a:9100 435 rows 5018 ms worker-b:9100 501 rows 6018 ms | waited 6018 ms
+[CLUSTER] layer 29: worker-a:9100 545 rows 5722 ms worker-b:9100 391 rows 6024 ms | waited 6024 ms
+[CLUSTER] layer 30: worker-a:9100 433 rows 5577 ms worker-b:9100 503 rows 7226 ms | waited 7226 ms
+[CLUSTER] layer 31: worker-a:9100 472 rows 6397 ms worker-b:9100 464 rows 6398 ms | waited 6398 ms
+[CLUSTER] layer 32: worker-a:9100 396 rows 5934 ms worker-b:9100 540 rows 5936 ms | waited 5936 ms
+[CLUSTER] layer 33: worker-a:9100 495 rows 5075 ms worker-b:9100 441 rows 5076 ms | waited 5076 ms
+[CLUSTER] layer 34: worker-a:9100 424 rows 4952 ms worker-b:9100 512 rows 4954 ms | waited 4954 ms
+[CLUSTER] layer 35: worker-a:9100 496 rows 5376 ms worker-b:9100 440 rows 5378 ms | waited 5378 ms
+[CLUSTER] layer 36: worker-a:9100 541 rows 5635 ms worker-b:9100 395 rows 5636 ms | waited 5636 ms
+[CLUSTER] layer 37: worker-a:9100 471 rows 4994 ms worker-b:9100 465 rows 4995 ms | waited 4995 ms
+[CLUSTER] layer 38: worker-a:9100 530 rows 4852 ms worker-b:9100 406 rows 4853 ms | waited 4853 ms
+[CLUSTER] layer 39: worker-a:9100 443 rows 6156 ms worker-b:9100 493 rows 6158 ms | waited 6158 ms
+[CLUSTER] layer 40: worker-a:9100 552 rows 7084 ms worker-b:9100 384 rows 7085 ms | waited 7085 ms
+[CLUSTER] layer 41: worker-a:9100 463 rows 5244 ms worker-b:9100 473 rows 5245 ms | waited 5245 ms
+[CLUSTER] layer 42: worker-a:9100 496 rows 4991 ms worker-b:9100 440 rows 4992 ms | waited 4992 ms
+[CLUSTER] layer 43: worker-a:9100 499 rows 2954 ms worker-b:9100 437 rows 3676 ms | waited 3676 ms
+[CLUSTER] layer 44: worker-a:9100 402 rows 1686 ms worker-b:9100 534 rows 3931 ms | waited 3931 ms
+load 197.4s, prefill 245 tokens in 618.1s
+prefill profile: attention 84.8s, ffn 521.2s (disk 0.0s), head 5.8s
+[glm53] 3 stop id(s) from generation_config.json
+[CLUSTER] layer 3: worker-a:9100 6 rows 222 ms worker-b:9100 2 rows 222 ms | waited 222 ms
+[CLUSTER] layer 4: worker-a:9100 5 rows 260 ms worker-b:9100 3 rows 146 ms | waited 260 ms
+[CLUSTER] layer 5: worker-a:9100 4 rows 228 ms worker-b:9100 4 rows 228 ms | waited 228 ms
+[CLUSTER] layer 6: worker-a:9100 4 rows 236 ms worker-b:9100 4 rows 236 ms | waited 236 ms
+[CLUSTER] layer 7: worker-a:9100 6 rows 188 ms worker-b:9100 2 rows 107 ms | waited 188 ms
+[CLUSTER] layer 8: worker-a:9100 5 rows 113 ms worker-b:9100 3 rows 113 ms | waited 113 ms
+[CLUSTER] layer 9: worker-a:9100 3 rows 81 ms worker-b:9100 5 rows 179 ms | waited 179 ms
+[CLUSTER] layer 10: worker-a:9100 4 rows 98 ms worker-b:9100 4 rows 165 ms | waited 165 ms
+[CLUSTER] layer 11: worker-a:9100 6 rows 106 ms worker-b:9100 2 rows 90 ms | waited 106 ms
+[CLUSTER] layer 12: worker-a:9100 2 rows 13 ms worker-b:9100 6 rows 254 ms | waited 254 ms
+[CLUSTER] layer 13: worker-a:9100 3 rows 30 ms worker-b:9100 5 rows 228 ms | waited 228 ms
+[CLUSTER] layer 14: worker-a:9100 6 rows 52 ms worker-b:9100 2 rows 79 ms | waited 79 ms
+[CLUSTER] layer 15: worker-a:9100 4 rows 31 ms worker-b:9100 4 rows 144 ms | waited 144 ms
+[CLUSTER] layer 16: worker-a:9100 3 rows 28 ms worker-b:9100 5 rows 232 ms | waited 232 ms
+[CLUSTER] layer 17: worker-a:9100 6 rows 48 ms worker-b:9100 2 rows 173 ms | waited 173 ms
+[CLUSTER] layer 18: worker-a:9100 4 rows 34 ms worker-b:9100 4 rows 153 ms | waited 153 ms
+[CLUSTER] layer 19: worker-a:9100 2 rows 14 ms worker-b:9100 6 rows 273 ms | waited 273 ms
+[CLUSTER] layer 20: worker-a:9100 5 rows 126 ms worker-b:9100 3 rows 126 ms | waited 126 ms
+[CLUSTER] layer 21: worker-a:9100 4 rows 28 ms worker-b:9100 4 rows 166 ms | waited 166 ms
+[CLUSTER] layer 22: worker-a:9100 6 rows 85 ms worker-b:9100 2 rows 85 ms | waited 85 ms
+[CLUSTER] layer 23: worker-a:9100 3 rows 18 ms worker-b:9100 5 rows 422 ms | waited 422 ms
+[CLUSTER] layer 24: worker-a:9100 3 rows 26 ms worker-b:9100 5 rows 465 ms | waited 465 ms
+[CLUSTER] layer 25: worker-a:9100 4 rows 39 ms worker-b:9100 4 rows 268 ms | waited 268 ms
+[CLUSTER] layer 26: worker-a:9100 3 rows 26 ms worker-b:9100 5 rows 524 ms | waited 524 ms
+[CLUSTER] layer 27: worker-a:9100 5 rows 283 ms worker-b:9100 3 rows 283 ms | waited 283 ms
+[CLUSTER] layer 28: worker-a:9100 4 rows 32 ms worker-b:9100 4 rows 268 ms | waited 268 ms
+[CLUSTER] layer 29: worker-a:9100 6 rows 281 ms worker-b:9100 2 rows 281 ms | waited 281 ms
+[CLUSTER] layer 30: worker-a:9100 6 rows 87 ms worker-b:9100 2 rows 372 ms | waited 372 ms
+[CLUSTER] layer 31: worker-a:9100 3 rows 85 ms worker-b:9100 5 rows 642 ms | waited 642 ms
+[CLUSTER] layer 32: worker-a:9100 4 rows 288 ms worker-b:9100 4 rows 288 ms | waited 288 ms
+[CLUSTER] layer 33: worker-a:9100 6 rows 344 ms worker-b:9100 2 rows 344 ms | waited 344 ms
+[CLUSTER] layer 34: worker-a:9100 5 rows 69 ms worker-b:9100 3 rows 313 ms | waited 313 ms
+[CLUSTER] layer 35: worker-a:9100 5 rows 79 ms worker-b:9100 3 rows 408 ms | waited 408 ms
+[CLUSTER] layer 36: worker-a:9100 4 rows 120 ms worker-b:9100 4 rows 261 ms | waited 261 ms
+[CLUSTER] layer 37: worker-a:9100 3 rows 32 ms worker-b:9100 5 rows 509 ms | waited 509 ms
+[CLUSTER] layer 38: worker-a:9100 5 rows 121 ms worker-b:9100 3 rows 121 ms | waited 121 ms
+[CLUSTER] layer 39: worker-a:9100 6 rows 107 ms worker-b:9100 2 rows 81 ms | waited 107 ms
+[CLUSTER] layer 40: worker-a:9100 3 rows 19 ms worker-b:9100 5 rows 163 ms | waited 163 ms
+[CLUSTER] layer 41: worker-a:9100 2 rows 17 ms worker-b:9100 6 rows 226 ms | waited 226 ms
+[CLUSTER] layer 42: worker-a:9100 3 rows 30 ms worker-b:9100 5 rows 225 ms | waited 225 ms
+[CLUSTER] layer 43: worker-a:9100 4 rows 18 ms worker-b:9100 4 rows 131 ms | waited 131 ms
+[CLUSTER] layer 44: worker-a:9100 4 rows 157 ms worker-b:9100 4 rows 157 ms | waited 157 ms
+[STATS] 3378480 selections across 11968 distinct experts -> <model>/.coli_usage
+[CLUSTER] worker-a:9100: 126 requests, 42380 rows, 3673.0 ms mean reply
+[CLUSTER] worker-b:9100: 126 requests, 40276 rows, 3989.6 ms mean reply
+----- stdout
+teacher_forcing 154822 1588 6645 23511 369 264 501 714 315 8472 264 9020 315 18347 15534 320 1614 13 264 69878 16279 12639 13 8884 10647 2436 264 323 6203 11 6203 6203 6203 5611 1817 17481 7798 1817 3468 264 315 279 6203 11641 13 862 1828 69878 82 13 576 1246 304 553 3019 11 304 14386 4128 11 1246 264 3175 1196 374 911 11206 11206 374 1526 419 1849 11 1246 279 11206 22056 279 7162 7559 7162 11 1128 6896 11858 56818 504 13355 323 1181 11873 11 1246 279 6203 311 700 304 2176 11858 1573 894 11248 4041 4362 1182 1246 1246 279 1590 5780 979 279 1614 525 279 1091 279 3922 13 29620 7512 279 14166 4344 311 3931 279 4361 6248 30156 6193 30156 11 11827 279 3175 4680 3950 11 323 1977 1817 825 1977 1128 432 1035 6629 311 12112 432 6439 13 1128 1410 728 432 1102 9152 13 4686 835 13 3498 279 6193 374 374 10591 13 17353 553 264 2805 14301 498 5675 1410 1598 311 1449 279 501 315 504 2 3885 279 1614 7337 525 19479 19479 25 825 702 264 4937 36178 323 264 11641 13931 11 1008 1083 8472 279 6929 15713 11 264 74174 3538 13 279 279 1008 702 264 28294 36178 714 264 770 4303 653 13 81247 1246 315 697 2326 7337 803 311 387 279 17831 369 279 6193 11 81247
+ Explain
+decode 1 token in 11.1s = 0.090 tok/s (11.1 s/token)
+experts hits 0 miss 0 bytes 0
+
+===== chunk256-1
+2026-10-07T08:53:58Z chunk256-1 arm=B chunk=256 rc=0 wall=611s prefill 245 tokens in 451.0s tokens_md5=36662cee66d0 worker_mean_ms=3515.6/3945.4/
+----- stderr
+expert budget: 10.3 GB (33.4 total, 183.2 model, 4.0 margin, 13.3 available)
+experts: 14.2 MB slots, 17 per layer across 42 sparse layers (10.1 GB resident)
+[CLUSTER] coordinator connected to 2 expert worker(s) | routing worker-a:9100 52% / worker-b:9100 48% (COLI_CLUSTER_WEIGHTS)
+[USAGE] expert history: 3378480 selections (<model>/.coli_usage)
+GLM-5.3-Flash: 45 layers (34 KDA + 11 full) + 1 MTP, hidden 4096, vocab 154880
+  MoE      : 288 routed (top-8) + 1 shared, inter 2048, from layer 3, scale 2.50
+  KDA      : 64 heads x 128, conv 4, gate floor -5.0
+  MLA      : q_lora 1536, kv_lora 512, qk 256 (nope, NoPE), v 256, 64 heads
+  indexer  : top-2048, 32 heads x 128, kpool 4 (+tail)
+  mHC      : mult 4, 20 Sinkhorn iterations
+  vision   : yes
+  routed experts: 311.7 B parameters (175 GB at int4-g64)
+             24 blocks x 1024, 16 heads, patch 14, 448px, merge 2 -> 4096
+cache: 33.0 KB per token across 11 DSA layers (0.01 GB at 247 positions)
+[CLUSTER] layer 3: worker-a:9100 1047 rows 10199 ms worker-b:9100 913 rows 15574 ms | waited 15574 ms
+[CLUSTER] layer 4: worker-a:9100 1179 rows 11449 ms worker-b:9100 781 rows 14048 ms | waited 14048 ms
+[CLUSTER] layer 5: worker-a:9100 1059 rows 9190 ms worker-b:9100 901 rows 9192 ms | waited 9192 ms
+[CLUSTER] layer 6: worker-a:9100 944 rows 7209 ms worker-b:9100 1016 rows 7213 ms | waited 7213 ms
+[CLUSTER] layer 7: worker-a:9100 923 rows 6211 ms worker-b:9100 1037 rows 6220 ms | waited 6220 ms
+[CLUSTER] layer 8: worker-a:9100 955 rows 7118 ms worker-b:9100 1005 rows 7122 ms | waited 7122 ms
+[CLUSTER] layer 9: worker-a:9100 984 rows 7061 ms worker-b:9100 976 rows 7065 ms | waited 7065 ms
+[CLUSTER] layer 10: worker-a:9100 1042 rows 7351 ms worker-b:9100 918 rows 7353 ms | waited 7353 ms
+[CLUSTER] layer 11: worker-a:9100 866 rows 5879 ms worker-b:9100 1094 rows 6752 ms | waited 6752 ms
+[CLUSTER] layer 12: worker-a:9100 976 rows 7720 ms worker-b:9100 984 rows 11062 ms | waited 11062 ms
+[CLUSTER] layer 13: worker-a:9100 1044 rows 6777 ms worker-b:9100 916 rows 9296 ms | waited 9296 ms
+[CLUSTER] layer 14: worker-a:9100 1273 rows 7188 ms worker-b:9100 687 rows 9067 ms | waited 9067 ms
+[CLUSTER] layer 15: worker-a:9100 1046 rows 7017 ms worker-b:9100 914 rows 7160 ms | waited 7160 ms
+[CLUSTER] layer 16: worker-a:9100 1027 rows 6902 ms worker-b:9100 933 rows 6904 ms | waited 6904 ms
+[CLUSTER] layer 17: worker-a:9100 1077 rows 6645 ms worker-b:9100 883 rows 6648 ms | waited 6648 ms
+[CLUSTER] layer 18: worker-a:9100 1213 rows 6342 ms worker-b:9100 747 rows 6344 ms | waited 6344 ms
+[CLUSTER] layer 19: worker-a:9100 1052 rows 6326 ms worker-b:9100 908 rows 6334 ms | waited 6334 ms
+[CLUSTER] layer 20: worker-a:9100 1072 rows 6729 ms worker-b:9100 888 rows 6736 ms | waited 6736 ms
+[CLUSTER] layer 21: worker-a:9100 966 rows 6056 ms worker-b:9100 994 rows 6061 ms | waited 6061 ms
+[CLUSTER] layer 22: worker-a:9100 934 rows 5727 ms worker-b:9100 1026 rows 5729 ms | waited 5729 ms
+[CLUSTER] layer 23: worker-a:9100 995 rows 6134 ms worker-b:9100 965 rows 6142 ms | waited 6142 ms
+[CLUSTER] layer 24: worker-a:9100 1054 rows 6787 ms worker-b:9100 906 rows 6790 ms | waited 6790 ms
+[CLUSTER] layer 25: worker-a:9100 919 rows 6192 ms worker-b:9100 1041 rows 6195 ms | waited 6195 ms
+[CLUSTER] layer 26: worker-a:9100 899 rows 6336 ms worker-b:9100 1061 rows 6339 ms | waited 6339 ms
+[CLUSTER] layer 27: worker-a:9100 1022 rows 7191 ms worker-b:9100 938 rows 7198 ms | waited 7198 ms
+[CLUSTER] layer 28: worker-a:9100 864 rows 6723 ms worker-b:9100 1096 rows 6726 ms | waited 6726 ms
+[CLUSTER] layer 29: worker-a:9100 1096 rows 6793 ms worker-b:9100 864 rows 6795 ms | waited 6795 ms
+[CLUSTER] layer 30: worker-a:9100 923 rows 6668 ms worker-b:9100 1037 rows 6671 ms | waited 6671 ms
+[CLUSTER] layer 31: worker-a:9100 1008 rows 8971 ms worker-b:9100 952 rows 8979 ms | waited 8979 ms
+[CLUSTER] layer 32: worker-a:9100 862 rows 6883 ms worker-b:9100 1098 rows 6886 ms | waited 6886 ms
+[CLUSTER] layer 33: worker-a:9100 1063 rows 6753 ms worker-b:9100 897 rows 6755 ms | waited 6755 ms
+[CLUSTER] layer 34: worker-a:9100 903 rows 6264 ms worker-b:9100 1057 rows 6267 ms | waited 6267 ms
+[CLUSTER] layer 35: worker-a:9100 975 rows 6769 ms worker-b:9100 985 rows 6778 ms | waited 6778 ms
+[CLUSTER] layer 36: worker-a:9100 982 rows 7957 ms worker-b:9100 978 rows 7959 ms | waited 7959 ms
+[CLUSTER] layer 37: worker-a:9100 1028 rows 6893 ms worker-b:9100 932 rows 10257 ms | waited 10257 ms
+[CLUSTER] layer 38: worker-a:9100 1144 rows 6341 ms worker-b:9100 816 rows 10167 ms | waited 10167 ms
+[CLUSTER] layer 39: worker-a:9100 876 rows 6398 ms worker-b:9100 1084 rows 6916 ms | waited 6916 ms
+[CLUSTER] layer 40: worker-a:9100 1176 rows 7531 ms worker-b:9100 784 rows 7538 ms | waited 7538 ms
+[CLUSTER] layer 41: worker-a:9100 898 rows 6555 ms worker-b:9100 1062 rows 6558 ms | waited 6558 ms
+[CLUSTER] layer 42: worker-a:9100 1045 rows 6697 ms worker-b:9100 915 rows 6699 ms | waited 6699 ms
+[CLUSTER] layer 43: worker-a:9100 989 rows 4559 ms worker-b:9100 971 rows 5400 ms | waited 5400 ms
+[CLUSTER] layer 44: worker-a:9100 801 rows 3054 ms worker-b:9100 1159 rows 5777 ms | waited 5777 ms
+load 143.2s, prefill 245 tokens in 451.0s
+prefill profile: attention 92.4s, ffn 347.4s (disk 0.0s), head 5.7s
+[glm53] 3 stop id(s) from generation_config.json
+[CLUSTER] layer 3: worker-a:9100 6 rows 331 ms worker-b:9100 2 rows 332 ms | waited 332 ms
+[CLUSTER] layer 4: worker-a:9100 5 rows 294 ms worker-b:9100 3 rows 294 ms | waited 294 ms
+[CLUSTER] layer 5: worker-a:9100 4 rows 231 ms worker-b:9100 4 rows 157 ms | waited 231 ms
+[CLUSTER] layer 6: worker-a:9100 4 rows 317 ms worker-b:9100 4 rows 317 ms | waited 317 ms
+[CLUSTER] layer 7: worker-a:9100 6 rows 186 ms worker-b:9100 2 rows 109 ms | waited 186 ms
+[CLUSTER] layer 8: worker-a:9100 5 rows 102 ms worker-b:9100 3 rows 102 ms | waited 102 ms
+[CLUSTER] layer 9: worker-a:9100 3 rows 78 ms worker-b:9100 5 rows 235 ms | waited 235 ms
+[CLUSTER] layer 10: worker-a:9100 4 rows 154 ms worker-b:9100 4 rows 154 ms | waited 154 ms
+[CLUSTER] layer 11: worker-a:9100 6 rows 104 ms worker-b:9100 2 rows 86 ms | waited 104 ms
+[CLUSTER] layer 12: worker-a:9100 2 rows 14 ms worker-b:9100 6 rows 257 ms | waited 257 ms
+[CLUSTER] layer 13: worker-a:9100 3 rows 84 ms worker-b:9100 5 rows 392 ms | waited 392 ms
+[CLUSTER] layer 14: worker-a:9100 6 rows 226 ms worker-b:9100 2 rows 226 ms | waited 226 ms
+[CLUSTER] layer 15: worker-a:9100 4 rows 27 ms worker-b:9100 4 rows 253 ms | waited 253 ms
+[CLUSTER] layer 16: worker-a:9100 3 rows 30 ms worker-b:9100 5 rows 489 ms | waited 489 ms
+[CLUSTER] layer 17: worker-a:9100 6 rows 318 ms worker-b:9100 2 rows 318 ms | waited 318 ms
+[CLUSTER] layer 18: worker-a:9100 4 rows 270 ms worker-b:9100 4 rows 270 ms | waited 270 ms
+[CLUSTER] layer 19: worker-a:9100 2 rows 17 ms worker-b:9100 6 rows 571 ms | waited 571 ms
+[CLUSTER] layer 20: worker-a:9100 5 rows 341 ms worker-b:9100 3 rows 341 ms | waited 341 ms
+[CLUSTER] layer 21: worker-a:9100 4 rows 36 ms worker-b:9100 4 rows 222 ms | waited 222 ms
+[CLUSTER] layer 22: worker-a:9100 6 rows 293 ms worker-b:9100 2 rows 293 ms | waited 293 ms
+[CLUSTER] layer 23: worker-a:9100 3 rows 25 ms worker-b:9100 5 rows 536 ms | waited 536 ms
+[CLUSTER] layer 24: worker-a:9100 3 rows 22 ms worker-b:9100 5 rows 427 ms | waited 427 ms
+[CLUSTER] layer 25: worker-a:9100 4 rows 38 ms worker-b:9100 4 rows 273 ms | waited 273 ms
+[CLUSTER] layer 26: worker-a:9100 3 rows 103 ms worker-b:9100 5 rows 540 ms | waited 540 ms
+[CLUSTER] layer 27: worker-a:9100 5 rows 288 ms worker-b:9100 3 rows 288 ms | waited 288 ms
+[CLUSTER] layer 28: worker-a:9100 4 rows 33 ms worker-b:9100 4 rows 327 ms | waited 327 ms
+[CLUSTER] layer 29: worker-a:9100 6 rows 295 ms worker-b:9100 2 rows 294 ms | waited 295 ms
+[CLUSTER] layer 30: worker-a:9100 6 rows 86 ms worker-b:9100 2 rows 287 ms | waited 287 ms
+[CLUSTER] layer 31: worker-a:9100 3 rows 81 ms worker-b:9100 5 rows 603 ms | waited 603 ms
+[CLUSTER] layer 32: worker-a:9100 4 rows 43 ms worker-b:9100 4 rows 331 ms | waited 331 ms
+[CLUSTER] layer 33: worker-a:9100 6 rows 297 ms worker-b:9100 2 rows 297 ms | waited 297 ms
+[CLUSTER] layer 34: worker-a:9100 5 rows 70 ms worker-b:9100 3 rows 292 ms | waited 292 ms
+[CLUSTER] layer 35: worker-a:9100 5 rows 195 ms worker-b:9100 3 rows 194 ms | waited 195 ms
+[CLUSTER] layer 36: worker-a:9100 4 rows 128 ms worker-b:9100 4 rows 285 ms | waited 285 ms
+[CLUSTER] layer 37: worker-a:9100 3 rows 30 ms worker-b:9100 5 rows 546 ms | waited 546 ms
+[CLUSTER] layer 38: worker-a:9100 5 rows 105 ms worker-b:9100 3 rows 333 ms | waited 333 ms
+[CLUSTER] layer 39: worker-a:9100 6 rows 296 ms worker-b:9100 2 rows 296 ms | waited 296 ms
+[CLUSTER] layer 40: worker-a:9100 3 rows 20 ms worker-b:9100 5 rows 548 ms | waited 548 ms
+[CLUSTER] layer 41: worker-a:9100 2 rows 69 ms worker-b:9100 6 rows 556 ms | waited 556 ms
+[CLUSTER] layer 42: worker-a:9100 3 rows 36 ms worker-b:9100 5 rows 502 ms | waited 502 ms
+[CLUSTER] layer 43: worker-a:9100 4 rows 23 ms worker-b:9100 4 rows 356 ms | waited 356 ms
+[CLUSTER] layer 44: worker-a:9100 4 rows 31 ms worker-b:9100 4 rows 217 ms | waited 217 ms
+[STATS] 3461136 selections across 11968 distinct experts -> <model>/.coli_usage
+[CLUSTER] worker-a:9100: 84 requests, 42380 rows, 3515.6 ms mean reply
+[CLUSTER] worker-b:9100: 84 requests, 40276 rows, 3945.4 ms mean reply
+----- stdout
+teacher_forcing 154822 1588 6645 23511 369 264 501 714 315 8472 264 9020 315 18347 15534 320 1614 13 264 69878 16279 12639 13 8884 10647 2436 264 323 6203 11 6203 6203 6203 5611 1817 17481 7798 1817 3468 264 315 279 6203 11641 13 862 1828 69878 82 13 576 1246 304 553 3019 11 304 14386 4128 11 1246 264 3175 1196 374 911 11206 11206 374 1526 419 1849 11 1246 279 11206 22056 279 7162 7559 7162 11 1128 6896 11858 56818 504 13355 323 1181 11873 11 1246 279 6203 311 700 304 2176 11858 1573 894 11248 4041 4362 1182 1246 1246 279 1590 5780 979 279 1614 525 279 1091 279 3922 13 29620 7512 279 14166 4344 311 3931 279 4361 6248 30156 6193 30156 11 11827 279 3175 4680 3950 11 323 1977 1817 825 1977 1128 432 1035 6629 311 12112 432 6439 13 1128 1410 728 432 1102 9152 13 4686 835 13 3498 279 6193 374 374 10591 13 17353 553 264 2805 14301 498 5675 1410 1598 311 1449 279 501 315 504 2 3885 279 1614 7337 525 19479 19479 25 825 702 264 4937 36178 323 264 11641 13931 11 1008 1083 8472 279 6929 15713 11 264 74174 3538 13 279 279 1008 702 264 28294 36178 714 264 770 4303 653 13 81247 1246 315 697 2326 7337 803 311 387 279 17831 369 279 6193 11 81247
+ Explain
+decode 1 token in 14.6s = 0.069 tok/s (14.6 s/token)
+experts hits 0 miss 0 bytes 0
+
+===== chunk128-2
+2026-10-07T09:06:09Z chunk128-2 arm=B chunk=128 rc=0 wall=731s prefill 245 tokens in 583.4s tokens_md5=36662cee66d0 worker_mean_ms=3542.5/3693.6/
+----- stderr
+expert budget: 10.9 GB (33.4 total, 183.2 model, 4.0 margin, 13.9 available)
+experts: 14.2 MB slots, 18 per layer across 42 sparse layers (10.7 GB resident)
+[CLUSTER] coordinator connected to 2 expert worker(s) | routing worker-a:9100 52% / worker-b:9100 48% (COLI_CLUSTER_WEIGHTS)
+[USAGE] expert history: 3461136 selections (<model>/.coli_usage)
+GLM-5.3-Flash: 45 layers (34 KDA + 11 full) + 1 MTP, hidden 4096, vocab 154880
+  MoE      : 288 routed (top-8) + 1 shared, inter 2048, from layer 3, scale 2.50
+  KDA      : 64 heads x 128, conv 4, gate floor -5.0
+  MLA      : q_lora 1536, kv_lora 512, qk 256 (nope, NoPE), v 256, 64 heads
+  indexer  : top-2048, 32 heads x 128, kpool 4 (+tail)
+  mHC      : mult 4, 20 Sinkhorn iterations
+  vision   : yes
+  routed experts: 311.7 B parameters (175 GB at int4-g64)
+             24 blocks x 1024, 16 heads, patch 14, 448px, merge 2 -> 4096
+cache: 33.0 KB per token across 11 DSA layers (0.01 GB at 247 positions)
+[CLUSTER] layer 3: worker-a:9100 528 rows 8775 ms worker-b:9100 496 rows 13240 ms | waited 13240 ms
+[CLUSTER] layer 4: worker-a:9100 621 rows 10675 ms worker-b:9100 403 rows 11605 ms | waited 11605 ms
+[CLUSTER] layer 5: worker-a:9100 545 rows 7552 ms worker-b:9100 479 rows 7553 ms | waited 7553 ms
+[CLUSTER] layer 6: worker-a:9100 508 rows 5554 ms worker-b:9100 516 rows 5555 ms | waited 5555 ms
+[CLUSTER] layer 7: worker-a:9100 471 rows 4711 ms worker-b:9100 553 rows 4715 ms | waited 4715 ms
+[CLUSTER] layer 8: worker-a:9100 494 rows 5802 ms worker-b:9100 530 rows 5804 ms | waited 5804 ms
+[CLUSTER] layer 9: worker-a:9100 501 rows 6692 ms worker-b:9100 523 rows 6694 ms | waited 6694 ms
+[CLUSTER] layer 10: worker-a:9100 516 rows 5886 ms worker-b:9100 508 rows 5887 ms | waited 5887 ms
+[CLUSTER] layer 11: worker-a:9100 440 rows 4556 ms worker-b:9100 584 rows 5153 ms | waited 5153 ms
+[CLUSTER] layer 12: worker-a:9100 517 rows 5302 ms worker-b:9100 507 rows 5304 ms | waited 5304 ms
+[CLUSTER] layer 13: worker-a:9100 536 rows 5414 ms worker-b:9100 488 rows 5416 ms | waited 5416 ms
+[CLUSTER] layer 14: worker-a:9100 684 rows 5332 ms worker-b:9100 340 rows 5333 ms | waited 5333 ms
+[CLUSTER] layer 15: worker-a:9100 542 rows 5290 ms worker-b:9100 482 rows 5294 ms | waited 5294 ms
+[CLUSTER] layer 16: worker-a:9100 561 rows 5635 ms worker-b:9100 463 rows 7430 ms | waited 7430 ms
+[CLUSTER] layer 17: worker-a:9100 516 rows 5190 ms worker-b:9100 508 rows 5464 ms | waited 5464 ms
+[CLUSTER] layer 18: worker-a:9100 661 rows 4681 ms worker-b:9100 363 rows 4682 ms | waited 4682 ms
+[CLUSTER] layer 19: worker-a:9100 536 rows 4403 ms worker-b:9100 488 rows 4407 ms | waited 4407 ms
+[CLUSTER] layer 20: worker-a:9100 571 rows 4533 ms worker-b:9100 453 rows 4534 ms | waited 4534 ms
+[CLUSTER] layer 21: worker-a:9100 522 rows 4578 ms worker-b:9100 502 rows 4579 ms | waited 4579 ms
+[CLUSTER] layer 22: worker-a:9100 490 rows 4760 ms worker-b:9100 534 rows 4761 ms | waited 4761 ms
+[CLUSTER] layer 23: worker-a:9100 502 rows 4602 ms worker-b:9100 522 rows 4606 ms | waited 4606 ms
+[CLUSTER] layer 24: worker-a:9100 586 rows 5361 ms worker-b:9100 438 rows 5362 ms | waited 5362 ms
+[CLUSTER] layer 25: worker-a:9100 438 rows 4495 ms worker-b:9100 586 rows 4496 ms | waited 4496 ms
+[CLUSTER] layer 26: worker-a:9100 462 rows 4520 ms worker-b:9100 562 rows 4522 ms | waited 4522 ms
+[CLUSTER] layer 27: worker-a:9100 561 rows 4770 ms worker-b:9100 463 rows 4774 ms | waited 4774 ms
+[CLUSTER] layer 28: worker-a:9100 429 rows 5337 ms worker-b:9100 595 rows 5339 ms | waited 5339 ms
+[CLUSTER] layer 29: worker-a:9100 551 rows 5712 ms worker-b:9100 473 rows 5713 ms | waited 5713 ms
+[CLUSTER] layer 30: worker-a:9100 490 rows 5309 ms worker-b:9100 534 rows 5311 ms | waited 5311 ms
+[CLUSTER] layer 31: worker-a:9100 536 rows 5922 ms worker-b:9100 488 rows 5926 ms | waited 5926 ms
+[CLUSTER] layer 32: worker-a:9100 466 rows 5316 ms worker-b:9100 558 rows 5317 ms | waited 5317 ms
+[CLUSTER] layer 33: worker-a:9100 568 rows 6075 ms worker-b:9100 456 rows 6076 ms | waited 6076 ms
+[CLUSTER] layer 34: worker-a:9100 479 rows 4903 ms worker-b:9100 545 rows 4904 ms | waited 4904 ms
+[CLUSTER] layer 35: worker-a:9100 479 rows 5315 ms worker-b:9100 545 rows 5320 ms | waited 5320 ms
+[CLUSTER] layer 36: worker-a:9100 441 rows 5327 ms worker-b:9100 583 rows 5328 ms | waited 5328 ms
+[CLUSTER] layer 37: worker-a:9100 557 rows 5078 ms worker-b:9100 467 rows 5080 ms | waited 5080 ms
+[CLUSTER] layer 38: worker-a:9100 614 rows 4658 ms worker-b:9100 410 rows 4659 ms | waited 4659 ms
+[CLUSTER] layer 39: worker-a:9100 433 rows 4976 ms worker-b:9100 591 rows 4980 ms | waited 4980 ms
+[CLUSTER] layer 40: worker-a:9100 624 rows 5865 ms worker-b:9100 400 rows 5866 ms | waited 5866 ms
+[CLUSTER] layer 41: worker-a:9100 435 rows 4927 ms worker-b:9100 589 rows 4929 ms | waited 4929 ms
+[CLUSTER] layer 42: worker-a:9100 549 rows 5012 ms worker-b:9100 475 rows 5013 ms | waited 5013 ms
+[CLUSTER] layer 43: worker-a:9100 490 rows 2954 ms worker-b:9100 534 rows 4037 ms | waited 4037 ms
+[CLUSTER] layer 44: worker-a:9100 399 rows 1953 ms worker-b:9100 625 rows 4016 ms | waited 4016 ms
+[CLUSTER] layer 3: worker-a:9100 519 rows 7854 ms worker-b:9100 417 rows 7855 ms | waited 7855 ms
+[CLUSTER] layer 4: worker-a:9100 558 rows 8508 ms worker-b:9100 378 rows 8510 ms | waited 8510 ms
+[CLUSTER] layer 5: worker-a:9100 514 rows 8781 ms worker-b:9100 422 rows 8783 ms | waited 8783 ms
+[CLUSTER] layer 6: worker-a:9100 436 rows 7075 ms worker-b:9100 500 rows 7076 ms | waited 7076 ms
+[CLUSTER] layer 7: worker-a:9100 452 rows 5728 ms worker-b:9100 484 rows 5729 ms | waited 5729 ms
+[CLUSTER] layer 8: worker-a:9100 461 rows 5636 ms worker-b:9100 475 rows 5637 ms | waited 5637 ms
+[CLUSTER] layer 9: worker-a:9100 483 rows 5863 ms worker-b:9100 453 rows 5864 ms | waited 5864 ms
+[CLUSTER] layer 10: worker-a:9100 526 rows 5840 ms worker-b:9100 410 rows 5841 ms | waited 5841 ms
+[CLUSTER] layer 11: worker-a:9100 426 rows 5613 ms worker-b:9100 510 rows 5614 ms | waited 5614 ms
+[CLUSTER] layer 12: worker-a:9100 459 rows 4580 ms worker-b:9100 477 rows 4599 ms | waited 4599 ms
+[CLUSTER] layer 13: worker-a:9100 508 rows 6064 ms worker-b:9100 428 rows 6065 ms | waited 6065 ms
+[CLUSTER] layer 14: worker-a:9100 589 rows 5038 ms worker-b:9100 347 rows 5039 ms | waited 5039 ms
+[CLUSTER] layer 15: worker-a:9100 504 rows 5579 ms worker-b:9100 432 rows 5580 ms | waited 5580 ms
+[CLUSTER] layer 16: worker-a:9100 466 rows 4706 ms worker-b:9100 470 rows 5210 ms | waited 5210 ms
+[CLUSTER] layer 17: worker-a:9100 561 rows 4624 ms worker-b:9100 375 rows 5044 ms | waited 5044 ms
+[CLUSTER] layer 18: worker-a:9100 552 rows 4911 ms worker-b:9100 384 rows 4912 ms | waited 4912 ms
+[CLUSTER] layer 19: worker-a:9100 516 rows 4294 ms worker-b:9100 420 rows 4296 ms | waited 4296 ms
+[CLUSTER] layer 20: worker-a:9100 501 rows 4056 ms worker-b:9100 435 rows 4058 ms | waited 4058 ms
+[CLUSTER] layer 21: worker-a:9100 444 rows 4374 ms worker-b:9100 492 rows 4375 ms | waited 4375 ms
+[CLUSTER] layer 22: worker-a:9100 444 rows 3849 ms worker-b:9100 492 rows 3850 ms | waited 3850 ms
+[CLUSTER] layer 23: worker-a:9100 493 rows 6078 ms worker-b:9100 443 rows 6079 ms | waited 6079 ms
+[CLUSTER] layer 24: worker-a:9100 468 rows 6475 ms worker-b:9100 468 rows 6476 ms | waited 6476 ms
+[CLUSTER] layer 25: worker-a:9100 481 rows 5130 ms worker-b:9100 455 rows 5131 ms | waited 5131 ms
+[CLUSTER] layer 26: worker-a:9100 437 rows 4949 ms worker-b:9100 499 rows 4951 ms | waited 4951 ms
+[CLUSTER] layer 27: worker-a:9100 461 rows 4113 ms worker-b:9100 475 rows 4114 ms | waited 4114 ms
+[CLUSTER] layer 28: worker-a:9100 435 rows 4483 ms worker-b:9100 501 rows 4485 ms | waited 4485 ms
+[CLUSTER] layer 29: worker-a:9100 545 rows 5310 ms worker-b:9100 391 rows 5311 ms | waited 5311 ms
+[CLUSTER] layer 30: worker-a:9100 433 rows 5833 ms worker-b:9100 503 rows 5835 ms | waited 5835 ms
+[CLUSTER] layer 31: worker-a:9100 472 rows 5626 ms worker-b:9100 464 rows 5627 ms | waited 5627 ms
+[CLUSTER] layer 32: worker-a:9100 396 rows 5239 ms worker-b:9100 540 rows 5240 ms | waited 5240 ms
+[CLUSTER] layer 33: worker-a:9100 495 rows 4648 ms worker-b:9100 441 rows 4650 ms | waited 4650 ms
+[CLUSTER] layer 34: worker-a:9100 424 rows 4417 ms worker-b:9100 512 rows 4418 ms | waited 4418 ms
+[CLUSTER] layer 35: worker-a:9100 496 rows 5661 ms worker-b:9100 440 rows 5662 ms | waited 5662 ms
+[CLUSTER] layer 36: worker-a:9100 541 rows 5080 ms worker-b:9100 395 rows 5081 ms | waited 5081 ms
+[CLUSTER] layer 37: worker-a:9100 471 rows 4414 ms worker-b:9100 465 rows 4415 ms | waited 4415 ms
+[CLUSTER] layer 38: worker-a:9100 530 rows 4427 ms worker-b:9100 406 rows 4427 ms | waited 4427 ms
+[CLUSTER] layer 39: worker-a:9100 443 rows 4606 ms worker-b:9100 493 rows 4608 ms | waited 4608 ms
+[CLUSTER] layer 40: worker-a:9100 552 rows 5351 ms worker-b:9100 384 rows 5352 ms | waited 5352 ms
+[CLUSTER] layer 41: worker-a:9100 463 rows 4700 ms worker-b:9100 473 rows 4702 ms | waited 4702 ms
+[CLUSTER] layer 42: worker-a:9100 496 rows 4577 ms worker-b:9100 440 rows 4578 ms | waited 4578 ms
+[CLUSTER] layer 43: worker-a:9100 499 rows 2990 ms worker-b:9100 437 rows 3789 ms | waited 3789 ms
+[CLUSTER] layer 44: worker-a:9100 402 rows 1685 ms worker-b:9100 534 rows 4144 ms | waited 4144 ms
+load 137.0s, prefill 245 tokens in 583.4s
+prefill profile: attention 84.3s, ffn 487.0s (disk 0.0s), head 6.1s
+[glm53] 3 stop id(s) from generation_config.json
+[CLUSTER] layer 3: worker-a:9100 6 rows 229 ms worker-b:9100 2 rows 82 ms | waited 229 ms
+[CLUSTER] layer 4: worker-a:9100 5 rows 278 ms worker-b:9100 3 rows 278 ms | waited 278 ms
+[CLUSTER] layer 5: worker-a:9100 4 rows 238 ms worker-b:9100 4 rows 238 ms | waited 238 ms
+[CLUSTER] layer 6: worker-a:9100 4 rows 248 ms worker-b:9100 4 rows 248 ms | waited 248 ms
+[CLUSTER] layer 7: worker-a:9100 6 rows 188 ms worker-b:9100 2 rows 125 ms | waited 188 ms
+[CLUSTER] layer 8: worker-a:9100 5 rows 118 ms worker-b:9100 3 rows 118 ms | waited 118 ms
+[CLUSTER] layer 9: worker-a:9100 3 rows 84 ms worker-b:9100 5 rows 185 ms | waited 185 ms
+[CLUSTER] layer 10: worker-a:9100 4 rows 95 ms worker-b:9100 4 rows 146 ms | waited 146 ms
+[CLUSTER] layer 11: worker-a:9100 6 rows 104 ms worker-b:9100 2 rows 85 ms | waited 104 ms
+[CLUSTER] layer 12: worker-a:9100 2 rows 11 ms worker-b:9100 6 rows 253 ms | waited 253 ms
+[CLUSTER] layer 13: worker-a:9100 3 rows 31 ms worker-b:9100 5 rows 237 ms | waited 237 ms
+[CLUSTER] layer 14: worker-a:9100 6 rows 106 ms worker-b:9100 2 rows 106 ms | waited 106 ms
+[CLUSTER] layer 15: worker-a:9100 4 rows 19 ms worker-b:9100 4 rows 154 ms | waited 154 ms
+[CLUSTER] layer 16: worker-a:9100 3 rows 31 ms worker-b:9100 5 rows 234 ms | waited 234 ms
+[CLUSTER] layer 17: worker-a:9100 6 rows 41 ms worker-b:9100 2 rows 100 ms | waited 100 ms
+[CLUSTER] layer 18: worker-a:9100 4 rows 44 ms worker-b:9100 4 rows 279 ms | waited 279 ms
+[CLUSTER] layer 19: worker-a:9100 2 rows 17 ms worker-b:9100 6 rows 402 ms | waited 402 ms
+[CLUSTER] layer 20: worker-a:9100 5 rows 57 ms worker-b:9100 3 rows 135 ms | waited 135 ms
+[CLUSTER] layer 21: worker-a:9100 4 rows 37 ms worker-b:9100 4 rows 334 ms | waited 334 ms
+[CLUSTER] layer 22: worker-a:9100 6 rows 94 ms worker-b:9100 2 rows 94 ms | waited 94 ms
+[CLUSTER] layer 23: worker-a:9100 3 rows 29 ms worker-b:9100 5 rows 225 ms | waited 225 ms
+[CLUSTER] layer 24: worker-a:9100 3 rows 34 ms worker-b:9100 5 rows 219 ms | waited 219 ms
+[CLUSTER] layer 25: worker-a:9100 4 rows 46 ms worker-b:9100 4 rows 168 ms | waited 168 ms
+[CLUSTER] layer 26: worker-a:9100 3 rows 16 ms worker-b:9100 5 rows 234 ms | waited 234 ms
+[CLUSTER] layer 27: worker-a:9100 5 rows 136 ms worker-b:9100 3 rows 136 ms | waited 136 ms
+[CLUSTER] layer 28: worker-a:9100 4 rows 25 ms worker-b:9100 4 rows 154 ms | waited 154 ms
+[CLUSTER] layer 29: worker-a:9100 6 rows 88 ms worker-b:9100 2 rows 88 ms | waited 88 ms
+[CLUSTER] layer 30: worker-a:9100 6 rows 88 ms worker-b:9100 2 rows 87 ms | waited 88 ms
+[CLUSTER] layer 31: worker-a:9100 3 rows 76 ms worker-b:9100 5 rows 238 ms | waited 238 ms
+[CLUSTER] layer 32: worker-a:9100 4 rows 33 ms worker-b:9100 4 rows 177 ms | waited 177 ms
+[CLUSTER] layer 33: worker-a:9100 6 rows 62 ms worker-b:9100 2 rows 94 ms | waited 94 ms
+[CLUSTER] layer 34: worker-a:9100 5 rows 128 ms worker-b:9100 3 rows 128 ms | waited 128 ms
+[CLUSTER] layer 35: worker-a:9100 5 rows 66 ms worker-b:9100 3 rows 134 ms | waited 134 ms
+[CLUSTER] layer 36: worker-a:9100 4 rows 121 ms worker-b:9100 4 rows 121 ms | waited 121 ms
+[CLUSTER] layer 37: worker-a:9100 3 rows 221 ms worker-b:9100 5 rows 221 ms | waited 221 ms
+[CLUSTER] layer 38: worker-a:9100 5 rows 134 ms worker-b:9100 3 rows 134 ms | waited 134 ms
+[CLUSTER] layer 39: worker-a:9100 6 rows 111 ms worker-b:9100 2 rows 81 ms | waited 111 ms
+[CLUSTER] layer 40: worker-a:9100 3 rows 29 ms worker-b:9100 5 rows 165 ms | waited 165 ms
+[CLUSTER] layer 41: worker-a:9100 2 rows 20 ms worker-b:9100 6 rows 222 ms | waited 222 ms
+[CLUSTER] layer 42: worker-a:9100 3 rows 33 ms worker-b:9100 5 rows 232 ms | waited 232 ms
+[CLUSTER] layer 43: worker-a:9100 4 rows 154 ms worker-b:9100 4 rows 154 ms | waited 154 ms
+[CLUSTER] layer 44: worker-a:9100 4 rows 156 ms worker-b:9100 4 rows 156 ms | waited 156 ms
+[STATS] 3543792 selections across 11968 distinct experts -> <model>/.coli_usage
+[CLUSTER] worker-a:9100: 126 requests, 42380 rows, 3542.5 ms mean reply
+[CLUSTER] worker-b:9100: 126 requests, 40276 rows, 3693.6 ms mean reply
+----- stdout
+teacher_forcing 154822 1588 6645 23511 369 264 501 714 315 8472 264 9020 315 18347 15534 320 1614 13 264 69878 16279 12639 13 8884 10647 2436 264 323 6203 11 6203 6203 6203 5611 1817 17481 7798 1817 3468 264 315 279 6203 11641 13 862 1828 69878 82 13 576 1246 304 553 3019 11 304 14386 4128 11 1246 264 3175 1196 374 911 11206 11206 374 1526 419 1849 11 1246 279 11206 22056 279 7162 7559 7162 11 1128 6896 11858 56818 504 13355 323 1181 11873 11 1246 279 6203 311 700 304 2176 11858 1573 894 11248 4041 4362 1182 1246 1246 279 1590 5780 979 279 1614 525 279 1091 279 3922 13 29620 7512 279 14166 4344 311 3931 279 4361 6248 30156 6193 30156 11 11827 279 3175 4680 3950 11 323 1977 1817 825 1977 1128 432 1035 6629 311 12112 432 6439 13 1128 1410 728 432 1102 9152 13 4686 835 13 3498 279 6193 374 374 10591 13 17353 553 264 2805 14301 498 5675 1410 1598 311 1449 279 501 315 504 2 3885 279 1614 7337 525 19479 19479 25 825 702 264 4937 36178 323 264 11641 13931 11 1008 1083 8472 279 6929 15713 11 264 74174 3538 13 279 279 1008 702 264 28294 36178 714 264 770 4303 653 13 81247 1246 315 697 2326 7337 803 311 387 279 17831 369 279 6193 11 81247
+ Explain
+decode 1 token in 9.3s = 0.107 tok/s (9.3 s/token)
+experts hits 0 miss 0 bytes 0
+
+===== chunk256-2
+2026-10-07T09:16:22Z chunk256-2 arm=B chunk=256 rc=0 wall=613s prefill 245 tokens in 462.9s tokens_md5=36662cee66d0 worker_mean_ms=3670.5/3928.7/
+----- stderr
+expert budget: 10.9 GB (33.4 total, 183.2 model, 4.0 margin, 13.9 available)
+experts: 14.2 MB slots, 18 per layer across 42 sparse layers (10.7 GB resident)
+[CLUSTER] coordinator connected to 2 expert worker(s) | routing worker-a:9100 52% / worker-b:9100 48% (COLI_CLUSTER_WEIGHTS)
+[USAGE] expert history: 3543792 selections (<model>/.coli_usage)
+GLM-5.3-Flash: 45 layers (34 KDA + 11 full) + 1 MTP, hidden 4096, vocab 154880
+  MoE      : 288 routed (top-8) + 1 shared, inter 2048, from layer 3, scale 2.50
+  KDA      : 64 heads x 128, conv 4, gate floor -5.0
+  MLA      : q_lora 1536, kv_lora 512, qk 256 (nope, NoPE), v 256, 64 heads
+  indexer  : top-2048, 32 heads x 128, kpool 4 (+tail)
+  mHC      : mult 4, 20 Sinkhorn iterations
+  vision   : yes
+  routed experts: 311.7 B parameters (175 GB at int4-g64)
+             24 blocks x 1024, 16 heads, patch 14, 448px, merge 2 -> 4096
+cache: 33.0 KB per token across 11 DSA layers (0.01 GB at 247 positions)
+[CLUSTER] layer 3: worker-a:9100 1047 rows 11251 ms worker-b:9100 913 rows 16497 ms | waited 16497 ms
+[CLUSTER] layer 4: worker-a:9100 1179 rows 10981 ms worker-b:9100 781 rows 14331 ms | waited 14331 ms
+[CLUSTER] layer 5: worker-a:9100 1059 rows 8754 ms worker-b:9100 901 rows 8756 ms | waited 8756 ms
+[CLUSTER] layer 6: worker-a:9100 944 rows 7229 ms worker-b:9100 1016 rows 7232 ms | waited 7232 ms
+[CLUSTER] layer 7: worker-a:9100 923 rows 6328 ms worker-b:9100 1037 rows 7137 ms | waited 7137 ms
+[CLUSTER] layer 8: worker-a:9100 955 rows 7271 ms worker-b:9100 1005 rows 7273 ms | waited 7273 ms
+[CLUSTER] layer 9: worker-a:9100 984 rows 7120 ms worker-b:9100 976 rows 7122 ms | waited 7122 ms
+[CLUSTER] layer 10: worker-a:9100 1042 rows 7501 ms worker-b:9100 918 rows 7503 ms | waited 7503 ms
+[CLUSTER] layer 11: worker-a:9100 866 rows 7793 ms worker-b:9100 1094 rows 7802 ms | waited 7802 ms
+[CLUSTER] layer 12: worker-a:9100 976 rows 6716 ms worker-b:9100 984 rows 7148 ms | waited 7148 ms
+[CLUSTER] layer 13: worker-a:9100 1044 rows 8623 ms worker-b:9100 916 rows 8626 ms | waited 8626 ms
+[CLUSTER] layer 14: worker-a:9100 1273 rows 7287 ms worker-b:9100 687 rows 7289 ms | waited 7289 ms
+[CLUSTER] layer 15: worker-a:9100 1046 rows 7052 ms worker-b:9100 914 rows 7060 ms | waited 7060 ms
+[CLUSTER] layer 16: worker-a:9100 1027 rows 7863 ms worker-b:9100 933 rows 7865 ms | waited 7865 ms
+[CLUSTER] layer 17: worker-a:9100 1077 rows 7576 ms worker-b:9100 883 rows 7579 ms | waited 7579 ms
+[CLUSTER] layer 18: worker-a:9100 1213 rows 6424 ms worker-b:9100 747 rows 6426 ms | waited 6426 ms
+[CLUSTER] layer 19: worker-a:9100 1052 rows 6180 ms worker-b:9100 908 rows 6187 ms | waited 6187 ms
+[CLUSTER] layer 20: worker-a:9100 1072 rows 6981 ms worker-b:9100 888 rows 6989 ms | waited 6989 ms
+[CLUSTER] layer 21: worker-a:9100 966 rows 6196 ms worker-b:9100 994 rows 6199 ms | waited 6199 ms
+[CLUSTER] layer 22: worker-a:9100 934 rows 6752 ms worker-b:9100 1026 rows 6755 ms | waited 6755 ms
+[CLUSTER] layer 23: worker-a:9100 995 rows 6840 ms worker-b:9100 965 rows 6848 ms | waited 6848 ms
+[CLUSTER] layer 24: worker-a:9100 1054 rows 8508 ms worker-b:9100 906 rows 8510 ms | waited 8510 ms
+[CLUSTER] layer 25: worker-a:9100 919 rows 6209 ms worker-b:9100 1041 rows 6211 ms | waited 6211 ms
+[CLUSTER] layer 26: worker-a:9100 899 rows 7272 ms worker-b:9100 1061 rows 7275 ms | waited 7275 ms
+[CLUSTER] layer 27: worker-a:9100 1022 rows 6561 ms worker-b:9100 938 rows 6569 ms | waited 6569 ms
+[CLUSTER] layer 28: worker-a:9100 864 rows 6741 ms worker-b:9100 1096 rows 6744 ms | waited 6744 ms
+[CLUSTER] layer 29: worker-a:9100 1096 rows 6917 ms worker-b:9100 864 rows 6919 ms | waited 6919 ms
+[CLUSTER] layer 30: worker-a:9100 923 rows 7685 ms worker-b:9100 1037 rows 7687 ms | waited 7687 ms
+[CLUSTER] layer 31: worker-a:9100 1008 rows 9627 ms worker-b:9100 952 rows 9635 ms | waited 9635 ms
+[CLUSTER] layer 32: worker-a:9100 862 rows 6917 ms worker-b:9100 1098 rows 6919 ms | waited 6919 ms
+[CLUSTER] layer 33: worker-a:9100 1063 rows 6699 ms worker-b:9100 897 rows 6986 ms | waited 6986 ms
+[CLUSTER] layer 34: worker-a:9100 903 rows 6296 ms worker-b:9100 1057 rows 6299 ms | waited 6299 ms
+[CLUSTER] layer 35: worker-a:9100 975 rows 8665 ms worker-b:9100 985 rows 8674 ms | waited 8674 ms
+[CLUSTER] layer 36: worker-a:9100 982 rows 7065 ms worker-b:9100 978 rows 7129 ms | waited 7129 ms
+[CLUSTER] layer 37: worker-a:9100 1028 rows 7017 ms worker-b:9100 932 rows 7019 ms | waited 7019 ms
+[CLUSTER] layer 38: worker-a:9100 1144 rows 6347 ms worker-b:9100 816 rows 6349 ms | waited 6349 ms
+[CLUSTER] layer 39: worker-a:9100 876 rows 8322 ms worker-b:9100 1084 rows 8332 ms | waited 8332 ms
+[CLUSTER] layer 40: worker-a:9100 1176 rows 7593 ms worker-b:9100 784 rows 7695 ms | waited 7695 ms
+[CLUSTER] layer 41: worker-a:9100 898 rows 6539 ms worker-b:9100 1062 rows 7920 ms | waited 7920 ms
+[CLUSTER] layer 42: worker-a:9100 1045 rows 6739 ms worker-b:9100 915 rows 6741 ms | waited 6741 ms
+[CLUSTER] layer 43: worker-a:9100 989 rows 4605 ms worker-b:9100 971 rows 6864 ms | waited 6864 ms
+[CLUSTER] layer 44: worker-a:9100 801 rows 3251 ms worker-b:9100 1159 rows 7542 ms | waited 7542 ms
+load 139.6s, prefill 245 tokens in 462.9s
+prefill profile: attention 96.3s, ffn 353.4s (disk 0.0s), head 7.6s
+[glm53] 3 stop id(s) from generation_config.json
+[CLUSTER] layer 3: worker-a:9100 6 rows 327 ms worker-b:9100 2 rows 327 ms | waited 327 ms
+[CLUSTER] layer 4: worker-a:9100 5 rows 298 ms worker-b:9100 3 rows 298 ms | waited 298 ms
+[CLUSTER] layer 5: worker-a:9100 4 rows 236 ms worker-b:9100 4 rows 236 ms | waited 236 ms
+[CLUSTER] layer 6: worker-a:9100 4 rows 312 ms worker-b:9100 4 rows 312 ms | waited 312 ms
+[CLUSTER] layer 7: worker-a:9100 6 rows 192 ms worker-b:9100 2 rows 116 ms | waited 192 ms
+[CLUSTER] layer 8: worker-a:9100 5 rows 114 ms worker-b:9100 3 rows 114 ms | waited 114 ms
+[CLUSTER] layer 9: worker-a:9100 3 rows 82 ms worker-b:9100 5 rows 176 ms | waited 176 ms
+[CLUSTER] layer 10: worker-a:9100 4 rows 104 ms worker-b:9100 4 rows 155 ms | waited 155 ms
+[CLUSTER] layer 11: worker-a:9100 6 rows 106 ms worker-b:9100 2 rows 87 ms | waited 106 ms
+[CLUSTER] layer 12: worker-a:9100 2 rows 14 ms worker-b:9100 6 rows 255 ms | waited 255 ms
+[CLUSTER] layer 13: worker-a:9100 3 rows 85 ms worker-b:9100 5 rows 231 ms | waited 231 ms
+[CLUSTER] layer 14: worker-a:9100 6 rows 87 ms worker-b:9100 2 rows 87 ms | waited 87 ms
+[CLUSTER] layer 15: worker-a:9100 4 rows 149 ms worker-b:9100 4 rows 149 ms | waited 149 ms
+[CLUSTER] layer 16: worker-a:9100 3 rows 31 ms worker-b:9100 5 rows 216 ms | waited 216 ms
+[CLUSTER] layer 17: worker-a:9100 6 rows 108 ms worker-b:9100 2 rows 108 ms | waited 108 ms
+[CLUSTER] layer 18: worker-a:9100 4 rows 32 ms worker-b:9100 4 rows 162 ms | waited 162 ms
+[CLUSTER] layer 19: worker-a:9100 2 rows 15 ms worker-b:9100 6 rows 266 ms | waited 266 ms
+[CLUSTER] layer 20: worker-a:9100 5 rows 138 ms worker-b:9100 3 rows 138 ms | waited 138 ms
+[CLUSTER] layer 21: worker-a:9100 4 rows 33 ms worker-b:9100 4 rows 163 ms | waited 163 ms
+[CLUSTER] layer 22: worker-a:9100 6 rows 83 ms worker-b:9100 2 rows 83 ms | waited 83 ms
+[CLUSTER] layer 23: worker-a:9100 3 rows 15 ms worker-b:9100 5 rows 220 ms | waited 220 ms
+[CLUSTER] layer 24: worker-a:9100 3 rows 30 ms worker-b:9100 5 rows 221 ms | waited 221 ms
+[CLUSTER] layer 25: worker-a:9100 4 rows 32 ms worker-b:9100 4 rows 161 ms | waited 161 ms
+[CLUSTER] layer 26: worker-a:9100 3 rows 101 ms worker-b:9100 5 rows 230 ms | waited 230 ms
+[CLUSTER] layer 27: worker-a:9100 5 rows 48 ms worker-b:9100 3 rows 133 ms | waited 133 ms
+[CLUSTER] layer 28: worker-a:9100 4 rows 35 ms worker-b:9100 4 rows 153 ms | waited 153 ms
+[CLUSTER] layer 29: worker-a:9100 6 rows 87 ms worker-b:9100 2 rows 87 ms | waited 87 ms
+[CLUSTER] layer 30: worker-a:9100 6 rows 85 ms worker-b:9100 2 rows 79 ms | waited 85 ms
+[CLUSTER] layer 31: worker-a:9100 3 rows 77 ms worker-b:9100 5 rows 242 ms | waited 242 ms
+[CLUSTER] layer 32: worker-a:9100 4 rows 161 ms worker-b:9100 4 rows 161 ms | waited 161 ms
+[CLUSTER] layer 33: worker-a:9100 6 rows 82 ms worker-b:9100 2 rows 82 ms | waited 82 ms
+[CLUSTER] layer 34: worker-a:9100 5 rows 62 ms worker-b:9100 3 rows 130 ms | waited 130 ms
+[CLUSTER] layer 35: worker-a:9100 5 rows 138 ms worker-b:9100 3 rows 138 ms | waited 138 ms
+[CLUSTER] layer 36: worker-a:9100 4 rows 121 ms worker-b:9100 4 rows 210 ms | waited 210 ms
+[CLUSTER] layer 37: worker-a:9100 3 rows 32 ms worker-b:9100 5 rows 225 ms | waited 225 ms
+[CLUSTER] layer 38: worker-a:9100 5 rows 100 ms worker-b:9100 3 rows 120 ms | waited 120 ms
+[CLUSTER] layer 39: worker-a:9100 6 rows 102 ms worker-b:9100 2 rows 94 ms | waited 102 ms
+[CLUSTER] layer 40: worker-a:9100 3 rows 28 ms worker-b:9100 5 rows 237 ms | waited 237 ms
+[CLUSTER] layer 41: worker-a:9100 2 rows 75 ms worker-b:9100 6 rows 230 ms | waited 230 ms
+[CLUSTER] layer 42: worker-a:9100 3 rows 32 ms worker-b:9100 5 rows 229 ms | waited 229 ms
+[CLUSTER] layer 43: worker-a:9100 4 rows 27 ms worker-b:9100 4 rows 154 ms | waited 154 ms
+[CLUSTER] layer 44: worker-a:9100 4 rows 19 ms worker-b:9100 4 rows 157 ms | waited 157 ms
+[STATS] 3626448 selections across 11968 distinct experts -> <model>/.coli_usage
+[CLUSTER] worker-a:9100: 84 requests, 42380 rows, 3670.5 ms mean reply
+[CLUSTER] worker-b:9100: 84 requests, 40276 rows, 3928.7 ms mean reply
+----- stdout
+teacher_forcing 154822 1588 6645 23511 369 264 501 714 315 8472 264 9020 315 18347 15534 320 1614 13 264 69878 16279 12639 13 8884 10647 2436 264 323 6203 11 6203 6203 6203 5611 1817 17481 7798 1817 3468 264 315 279 6203 11641 13 862 1828 69878 82 13 576 1246 304 553 3019 11 304 14386 4128 11 1246 264 3175 1196 374 911 11206 11206 374 1526 419 1849 11 1246 279 11206 22056 279 7162 7559 7162 11 1128 6896 11858 56818 504 13355 323 1181 11873 11 1246 279 6203 311 700 304 2176 11858 1573 894 11248 4041 4362 1182 1246 1246 279 1590 5780 979 279 1614 525 279 1091 279 3922 13 29620 7512 279 14166 4344 311 3931 279 4361 6248 30156 6193 30156 11 11827 279 3175 4680 3950 11 323 1977 1817 825 1977 1128 432 1035 6629 311 12112 432 6439 13 1128 1410 728 432 1102 9152 13 4686 835 13 3498 279 6193 374 374 10591 13 17353 553 264 2805 14301 498 5675 1410 1598 311 1449 279 501 315 504 2 3885 279 1614 7337 525 19479 19479 25 825 702 264 4937 36178 323 264 11641 13931 11 1008 1083 8472 279 6929 15713 11 264 74174 3538 13 279 279 1008 702 264 28294 36178 714 264 770 4303 653 13 81247 1246 315 697 2326 7337 803 311 387 279 17831 369 279 6193 11 81247
+ Explain
+decode 1 token in 8.5s = 0.118 tok/s (8.5 s/token)
+experts hits 0 miss 0 bytes 0
+
+===== chunk128-3
+2026-10-07T09:29:06Z chunk128-3 arm=B chunk=128 rc=0 wall=764s prefill 245 tokens in 618.3s tokens_md5=36662cee66d0 worker_mean_ms=3596.8/4001.8/
+----- stderr
+expert budget: 10.8 GB (33.4 total, 183.2 model, 4.0 margin, 13.8 available)
+experts: 14.2 MB slots, 18 per layer across 42 sparse layers (10.7 GB resident)
+[CLUSTER] coordinator connected to 2 expert worker(s) | routing worker-a:9100 52% / worker-b:9100 48% (COLI_CLUSTER_WEIGHTS)
+[USAGE] expert history: 3626448 selections (<model>/.coli_usage)
+GLM-5.3-Flash: 45 layers (34 KDA + 11 full) + 1 MTP, hidden 4096, vocab 154880
+  MoE      : 288 routed (top-8) + 1 shared, inter 2048, from layer 3, scale 2.50
+  KDA      : 64 heads x 128, conv 4, gate floor -5.0
+  MLA      : q_lora 1536, kv_lora 512, qk 256 (nope, NoPE), v 256, 64 heads
+  indexer  : top-2048, 32 heads x 128, kpool 4 (+tail)
+  mHC      : mult 4, 20 Sinkhorn iterations
+  vision   : yes
+  routed experts: 311.7 B parameters (175 GB at int4-g64)
+             24 blocks x 1024, 16 heads, patch 14, 448px, merge 2 -> 4096
+cache: 33.0 KB per token across 11 DSA layers (0.01 GB at 247 positions)
+[CLUSTER] layer 3: worker-a:9100 528 rows 9900 ms worker-b:9100 496 rows 14494 ms | waited 14494 ms
+[CLUSTER] layer 4: worker-a:9100 621 rows 10665 ms worker-b:9100 403 rows 11112 ms | waited 11112 ms
+[CLUSTER] layer 5: worker-a:9100 545 rows 7576 ms worker-b:9100 479 rows 7577 ms | waited 7577 ms
+[CLUSTER] layer 6: worker-a:9100 508 rows 7394 ms worker-b:9100 516 rows 7396 ms | waited 7396 ms
+[CLUSTER] layer 7: worker-a:9100 471 rows 4720 ms worker-b:9100 553 rows 4763 ms | waited 4763 ms
+[CLUSTER] layer 8: worker-a:9100 494 rows 6719 ms worker-b:9100 530 rows 6720 ms | waited 6720 ms
+[CLUSTER] layer 9: worker-a:9100 501 rows 5754 ms worker-b:9100 523 rows 5755 ms | waited 5755 ms
+[CLUSTER] layer 10: worker-a:9100 516 rows 5874 ms worker-b:9100 508 rows 8223 ms | waited 8223 ms
+[CLUSTER] layer 11: worker-a:9100 440 rows 4609 ms worker-b:9100 584 rows 9499 ms | waited 9499 ms
+[CLUSTER] layer 12: worker-a:9100 517 rows 5286 ms worker-b:9100 507 rows 8494 ms | waited 8494 ms
+[CLUSTER] layer 13: worker-a:9100 536 rows 5447 ms worker-b:9100 488 rows 7436 ms | waited 7436 ms
+[CLUSTER] layer 14: worker-a:9100 684 rows 5434 ms worker-b:9100 340 rows 6582 ms | waited 6582 ms
+[CLUSTER] layer 15: worker-a:9100 542 rows 5319 ms worker-b:9100 482 rows 8401 ms | waited 8401 ms
+[CLUSTER] layer 16: worker-a:9100 561 rows 5661 ms worker-b:9100 463 rows 6954 ms | waited 6954 ms
+[CLUSTER] layer 17: worker-a:9100 516 rows 5109 ms worker-b:9100 508 rows 5110 ms | waited 5110 ms
+[CLUSTER] layer 18: worker-a:9100 661 rows 4675 ms worker-b:9100 363 rows 4676 ms | waited 4676 ms
+[CLUSTER] layer 19: worker-a:9100 536 rows 4482 ms worker-b:9100 488 rows 4486 ms | waited 4486 ms
+[CLUSTER] layer 20: worker-a:9100 571 rows 4566 ms worker-b:9100 453 rows 4567 ms | waited 4567 ms
+[CLUSTER] layer 21: worker-a:9100 522 rows 4604 ms worker-b:9100 502 rows 4606 ms | waited 4606 ms
+[CLUSTER] layer 22: worker-a:9100 490 rows 4844 ms worker-b:9100 534 rows 6598 ms | waited 6598 ms
+[CLUSTER] layer 23: worker-a:9100 502 rows 4604 ms worker-b:9100 522 rows 7160 ms | waited 7160 ms
+[CLUSTER] layer 24: worker-a:9100 586 rows 5404 ms worker-b:9100 438 rows 5405 ms | waited 5405 ms
+[CLUSTER] layer 25: worker-a:9100 438 rows 4486 ms worker-b:9100 586 rows 4488 ms | waited 4488 ms
+[CLUSTER] layer 26: worker-a:9100 462 rows 4601 ms worker-b:9100 562 rows 7171 ms | waited 7171 ms
+[CLUSTER] layer 27: worker-a:9100 561 rows 5702 ms worker-b:9100 463 rows 7885 ms | waited 7885 ms
+[CLUSTER] layer 28: worker-a:9100 429 rows 5359 ms worker-b:9100 595 rows 7585 ms | waited 7585 ms
+[CLUSTER] layer 29: worker-a:9100 551 rows 4993 ms worker-b:9100 473 rows 6212 ms | waited 6212 ms
+[CLUSTER] layer 30: worker-a:9100 490 rows 5304 ms worker-b:9100 534 rows 5306 ms | waited 5306 ms
+[CLUSTER] layer 31: worker-a:9100 536 rows 5952 ms worker-b:9100 488 rows 5956 ms | waited 5956 ms
+[CLUSTER] layer 32: worker-a:9100 466 rows 5333 ms worker-b:9100 558 rows 5334 ms | waited 5334 ms
+[CLUSTER] layer 33: worker-a:9100 568 rows 5221 ms worker-b:9100 456 rows 5223 ms | waited 5223 ms
+[CLUSTER] layer 34: worker-a:9100 479 rows 4905 ms worker-b:9100 545 rows 4907 ms | waited 4907 ms
+[CLUSTER] layer 35: worker-a:9100 479 rows 6285 ms worker-b:9100 545 rows 6290 ms | waited 6290 ms
+[CLUSTER] layer 36: worker-a:9100 441 rows 5308 ms worker-b:9100 583 rows 5309 ms | waited 5309 ms
+[CLUSTER] layer 37: worker-a:9100 557 rows 5132 ms worker-b:9100 467 rows 5133 ms | waited 5133 ms
+[CLUSTER] layer 38: worker-a:9100 614 rows 4640 ms worker-b:9100 410 rows 4642 ms | waited 4642 ms
+[CLUSTER] layer 39: worker-a:9100 433 rows 5717 ms worker-b:9100 591 rows 5722 ms | waited 5722 ms
+[CLUSTER] layer 40: worker-a:9100 624 rows 5903 ms worker-b:9100 400 rows 5904 ms | waited 5904 ms
+[CLUSTER] layer 41: worker-a:9100 435 rows 4943 ms worker-b:9100 589 rows 4945 ms | waited 4945 ms
+[CLUSTER] layer 42: worker-a:9100 549 rows 5016 ms worker-b:9100 475 rows 5017 ms | waited 5017 ms
+[CLUSTER] layer 43: worker-a:9100 490 rows 3812 ms worker-b:9100 534 rows 3914 ms | waited 3914 ms
+[CLUSTER] layer 44: worker-a:9100 399 rows 1802 ms worker-b:9100 625 rows 4248 ms | waited 4248 ms
+[CLUSTER] layer 3: worker-a:9100 519 rows 8056 ms worker-b:9100 417 rows 8058 ms | waited 8058 ms
+[CLUSTER] layer 4: worker-a:9100 558 rows 10403 ms worker-b:9100 378 rows 10404 ms | waited 10404 ms
+[CLUSTER] layer 5: worker-a:9100 514 rows 7757 ms worker-b:9100 422 rows 7758 ms | waited 7758 ms
+[CLUSTER] layer 6: worker-a:9100 436 rows 8896 ms worker-b:9100 500 rows 8897 ms | waited 8897 ms
+[CLUSTER] layer 7: worker-a:9100 452 rows 4957 ms worker-b:9100 484 rows 5853 ms | waited 5853 ms
+[CLUSTER] layer 8: worker-a:9100 461 rows 5690 ms worker-b:9100 475 rows 5691 ms | waited 5691 ms
+[CLUSTER] layer 9: worker-a:9100 483 rows 5774 ms worker-b:9100 453 rows 5775 ms | waited 5775 ms
+[CLUSTER] layer 10: worker-a:9100 526 rows 5757 ms worker-b:9100 410 rows 5759 ms | waited 5759 ms
+[CLUSTER] layer 11: worker-a:9100 426 rows 4502 ms worker-b:9100 510 rows 7329 ms | waited 7329 ms
+[CLUSTER] layer 12: worker-a:9100 459 rows 5519 ms worker-b:9100 477 rows 6006 ms | waited 6006 ms
+[CLUSTER] layer 13: worker-a:9100 508 rows 5197 ms worker-b:9100 428 rows 5198 ms | waited 5198 ms
+[CLUSTER] layer 14: worker-a:9100 589 rows 5034 ms worker-b:9100 347 rows 5035 ms | waited 5035 ms
+[CLUSTER] layer 15: worker-a:9100 504 rows 5375 ms worker-b:9100 432 rows 5376 ms | waited 5376 ms
+[CLUSTER] layer 16: worker-a:9100 466 rows 4765 ms worker-b:9100 470 rows 4766 ms | waited 4766 ms
+[CLUSTER] layer 17: worker-a:9100 561 rows 5646 ms worker-b:9100 375 rows 5647 ms | waited 5647 ms
+[CLUSTER] layer 18: worker-a:9100 552 rows 4033 ms worker-b:9100 384 rows 4034 ms | waited 4034 ms
+[CLUSTER] layer 19: worker-a:9100 516 rows 4196 ms worker-b:9100 420 rows 4197 ms | waited 4197 ms
+[CLUSTER] layer 20: worker-a:9100 501 rows 5060 ms worker-b:9100 435 rows 5061 ms | waited 5061 ms
+[CLUSTER] layer 21: worker-a:9100 444 rows 4293 ms worker-b:9100 492 rows 4294 ms | waited 4294 ms
+[CLUSTER] layer 22: worker-a:9100 444 rows 3870 ms worker-b:9100 492 rows 3871 ms | waited 3871 ms
+[CLUSTER] layer 23: worker-a:9100 493 rows 5132 ms worker-b:9100 443 rows 5134 ms | waited 5134 ms
+[CLUSTER] layer 24: worker-a:9100 468 rows 4692 ms worker-b:9100 468 rows 4693 ms | waited 4693 ms
+[CLUSTER] layer 25: worker-a:9100 481 rows 4254 ms worker-b:9100 455 rows 4899 ms | waited 4899 ms
+[CLUSTER] layer 26: worker-a:9100 437 rows 5068 ms worker-b:9100 499 rows 6347 ms | waited 6347 ms
+[CLUSTER] layer 27: worker-a:9100 461 rows 4137 ms worker-b:9100 475 rows 4139 ms | waited 4139 ms
+[CLUSTER] layer 28: worker-a:9100 435 rows 4478 ms worker-b:9100 501 rows 4480 ms | waited 4480 ms
+[CLUSTER] layer 29: worker-a:9100 545 rows 5308 ms worker-b:9100 391 rows 5310 ms | waited 5310 ms
+[CLUSTER] layer 30: worker-a:9100 433 rows 4933 ms worker-b:9100 503 rows 4935 ms | waited 4935 ms
+[CLUSTER] layer 31: worker-a:9100 472 rows 5609 ms worker-b:9100 464 rows 5610 ms | waited 5610 ms
+[CLUSTER] layer 32: worker-a:9100 396 rows 6216 ms worker-b:9100 540 rows 6217 ms | waited 6217 ms
+[CLUSTER] layer 33: worker-a:9100 495 rows 4618 ms worker-b:9100 441 rows 4620 ms | waited 4620 ms
+[CLUSTER] layer 34: worker-a:9100 424 rows 4437 ms worker-b:9100 512 rows 4438 ms | waited 4438 ms
+[CLUSTER] layer 35: worker-a:9100 496 rows 5802 ms worker-b:9100 440 rows 5803 ms | waited 5803 ms
+[CLUSTER] layer 36: worker-a:9100 541 rows 5050 ms worker-b:9100 395 rows 5052 ms | waited 5052 ms
+[CLUSTER] layer 37: worker-a:9100 471 rows 4520 ms worker-b:9100 465 rows 4521 ms | waited 4521 ms
+[CLUSTER] layer 38: worker-a:9100 530 rows 5344 ms worker-b:9100 406 rows 5345 ms | waited 5345 ms
+[CLUSTER] layer 39: worker-a:9100 443 rows 5546 ms worker-b:9100 493 rows 5547 ms | waited 5547 ms
+[CLUSTER] layer 40: worker-a:9100 552 rows 5302 ms worker-b:9100 384 rows 5303 ms | waited 5303 ms
+[CLUSTER] layer 41: worker-a:9100 463 rows 5650 ms worker-b:9100 473 rows 5652 ms | waited 5652 ms
+[CLUSTER] layer 42: worker-a:9100 496 rows 4579 ms worker-b:9100 440 rows 4580 ms | waited 4580 ms
+[CLUSTER] layer 43: worker-a:9100 499 rows 2840 ms worker-b:9100 437 rows 4025 ms | waited 4025 ms
+[CLUSTER] layer 44: worker-a:9100 402 rows 1700 ms worker-b:9100 534 rows 3693 ms | waited 3693 ms
+load 134.8s, prefill 245 tokens in 618.3s
+prefill profile: attention 82.5s, ffn 525.2s (disk 0.0s), head 5.2s
+[glm53] 3 stop id(s) from generation_config.json
+[CLUSTER] layer 3: worker-a:9100 6 rows 228 ms worker-b:9100 2 rows 86 ms | waited 228 ms
+[CLUSTER] layer 4: worker-a:9100 5 rows 286 ms worker-b:9100 3 rows 286 ms | waited 286 ms
+[CLUSTER] layer 5: worker-a:9100 4 rows 238 ms worker-b:9100 4 rows 238 ms | waited 238 ms
+[CLUSTER] layer 6: worker-a:9100 4 rows 251 ms worker-b:9100 4 rows 251 ms | waited 251 ms
+[CLUSTER] layer 7: worker-a:9100 6 rows 193 ms worker-b:9100 2 rows 116 ms | waited 193 ms
+[CLUSTER] layer 8: worker-a:9100 5 rows 119 ms worker-b:9100 3 rows 119 ms | waited 119 ms
+[CLUSTER] layer 9: worker-a:9100 3 rows 80 ms worker-b:9100 5 rows 239 ms | waited 239 ms
+[CLUSTER] layer 10: worker-a:9100 4 rows 105 ms worker-b:9100 4 rows 151 ms | waited 151 ms
+[CLUSTER] layer 11: worker-a:9100 6 rows 91 ms worker-b:9100 2 rows 91 ms | waited 91 ms
+[CLUSTER] layer 12: worker-a:9100 2 rows 11 ms worker-b:9100 6 rows 255 ms | waited 255 ms
+[CLUSTER] layer 13: worker-a:9100 3 rows 27 ms worker-b:9100 5 rows 231 ms | waited 231 ms
+[CLUSTER] layer 14: worker-a:9100 6 rows 85 ms worker-b:9100 2 rows 85 ms | waited 85 ms
+[CLUSTER] layer 15: worker-a:9100 4 rows 27 ms worker-b:9100 4 rows 146 ms | waited 146 ms
+[CLUSTER] layer 16: worker-a:9100 3 rows 32 ms worker-b:9100 5 rows 310 ms | waited 310 ms
+[CLUSTER] layer 17: worker-a:9100 6 rows 100 ms worker-b:9100 2 rows 100 ms | waited 100 ms
+[CLUSTER] layer 18: worker-a:9100 4 rows 31 ms worker-b:9100 4 rows 348 ms | waited 348 ms
+[CLUSTER] layer 19: worker-a:9100 2 rows 26 ms worker-b:9100 6 rows 331 ms | waited 331 ms
+[CLUSTER] layer 20: worker-a:9100 5 rows 137 ms worker-b:9100 3 rows 137 ms | waited 137 ms
+[CLUSTER] layer 21: worker-a:9100 4 rows 32 ms worker-b:9100 4 rows 158 ms | waited 158 ms
+[CLUSTER] layer 22: worker-a:9100 6 rows 80 ms worker-b:9100 2 rows 80 ms | waited 80 ms
+[CLUSTER] layer 23: worker-a:9100 3 rows 24 ms worker-b:9100 5 rows 209 ms | waited 209 ms
+[CLUSTER] layer 24: worker-a:9100 3 rows 29 ms worker-b:9100 5 rows 216 ms | waited 216 ms
+[CLUSTER] layer 25: worker-a:9100 4 rows 23 ms worker-b:9100 4 rows 158 ms | waited 158 ms
+[CLUSTER] layer 26: worker-a:9100 3 rows 28 ms worker-b:9100 5 rows 235 ms | waited 235 ms
+[CLUSTER] layer 27: worker-a:9100 5 rows 130 ms worker-b:9100 3 rows 130 ms | waited 130 ms
+[CLUSTER] layer 28: worker-a:9100 4 rows 150 ms worker-b:9100 4 rows 150 ms | waited 150 ms
+[CLUSTER] layer 29: worker-a:9100 6 rows 79 ms worker-b:9100 2 rows 78 ms | waited 79 ms
+[CLUSTER] layer 30: worker-a:9100 6 rows 89 ms worker-b:9100 2 rows 89 ms | waited 89 ms
+[CLUSTER] layer 31: worker-a:9100 3 rows 76 ms worker-b:9100 5 rows 228 ms | waited 228 ms
+[CLUSTER] layer 32: worker-a:9100 4 rows 39 ms worker-b:9100 4 rows 162 ms | waited 162 ms
+[CLUSTER] layer 33: worker-a:9100 6 rows 83 ms worker-b:9100 2 rows 83 ms | waited 83 ms
+[CLUSTER] layer 34: worker-a:9100 5 rows 65 ms worker-b:9100 3 rows 131 ms | waited 131 ms
+[CLUSTER] layer 35: worker-a:9100 5 rows 502 ms worker-b:9100 3 rows 502 ms | waited 502 ms
+[CLUSTER] layer 36: worker-a:9100 4 rows 118 ms worker-b:9100 4 rows 179 ms | waited 179 ms
+[CLUSTER] layer 37: worker-a:9100 3 rows 33 ms worker-b:9100 5 rows 230 ms | waited 230 ms
+[CLUSTER] layer 38: worker-a:9100 5 rows 42 ms worker-b:9100 3 rows 117 ms | waited 117 ms
+[CLUSTER] layer 39: worker-a:9100 6 rows 110 ms worker-b:9100 2 rows 84 ms | waited 110 ms
+[CLUSTER] layer 40: worker-a:9100 3 rows 26 ms worker-b:9100 5 rows 177 ms | waited 177 ms
+[CLUSTER] layer 41: worker-a:9100 2 rows 230 ms worker-b:9100 6 rows 230 ms | waited 230 ms
+[CLUSTER] layer 42: worker-a:9100 3 rows 32 ms worker-b:9100 5 rows 232 ms | waited 232 ms
+[CLUSTER] layer 43: worker-a:9100 4 rows 33 ms worker-b:9100 4 rows 136 ms | waited 136 ms
+[CLUSTER] layer 44: worker-a:9100 4 rows 25 ms worker-b:9100 4 rows 150 ms | waited 150 ms
+[STATS] 3709104 selections across 11968 distinct experts -> <model>/.coli_usage
+[CLUSTER] worker-a:9100: 126 requests, 42380 rows, 3596.8 ms mean reply
+[CLUSTER] worker-b:9100: 126 requests, 40276 rows, 4001.8 ms mean reply
+----- stdout
+teacher_forcing 154822 1588 6645 23511 369 264 501 714 315 8472 264 9020 315 18347 15534 320 1614 13 264 69878 16279 12639 13 8884 10647 2436 264 323 6203 11 6203 6203 6203 5611 1817 17481 7798 1817 3468 264 315 279 6203 11641 13 862 1828 69878 82 13 576 1246 304 553 3019 11 304 14386 4128 11 1246 264 3175 1196 374 911 11206 11206 374 1526 419 1849 11 1246 279 11206 22056 279 7162 7559 7162 11 1128 6896 11858 56818 504 13355 323 1181 11873 11 1246 279 6203 311 700 304 2176 11858 1573 894 11248 4041 4362 1182 1246 1246 279 1590 5780 979 279 1614 525 279 1091 279 3922 13 29620 7512 279 14166 4344 311 3931 279 4361 6248 30156 6193 30156 11 11827 279 3175 4680 3950 11 323 1977 1817 825 1977 1128 432 1035 6629 311 12112 432 6439 13 1128 1410 728 432 1102 9152 13 4686 835 13 3498 279 6193 374 374 10591 13 17353 553 264 2805 14301 498 5675 1410 1598 311 1449 279 501 315 504 2 3885 279 1614 7337 525 19479 19479 25 825 702 264 4937 36178 323 264 11641 13931 11 1008 1083 8472 279 6929 15713 11 264 74174 3538 13 279 279 1008 702 264 28294 36178 714 264 770 4303 653 13 81247 1246 315 697 2326 7337 803 311 387 279 17831 369 279 6193 11 81247
+ Explain
+decode 1 token in 8.5s = 0.118 tok/s (8.5 s/token)
+experts hits 0 miss 0 bytes 0
+
+===== chunk256-3
+2026-10-07T09:40:07Z chunk256-3 arm=B chunk=256 rc=0 wall=661s prefill 245 tokens in 453.6s tokens_md5=36662cee66d0 worker_mean_ms=3642.8/3975.9/
+----- stderr
+expert budget: 10.9 GB (33.4 total, 183.2 model, 4.0 margin, 13.9 available)
+experts: 14.2 MB slots, 18 per layer across 42 sparse layers (10.7 GB resident)
+[CLUSTER] coordinator connected to 2 expert worker(s) | routing worker-a:9100 52% / worker-b:9100 48% (COLI_CLUSTER_WEIGHTS)
+[USAGE] expert history: 3709104 selections (<model>/.coli_usage)
+GLM-5.3-Flash: 45 layers (34 KDA + 11 full) + 1 MTP, hidden 4096, vocab 154880
+  MoE      : 288 routed (top-8) + 1 shared, inter 2048, from layer 3, scale 2.50
+  KDA      : 64 heads x 128, conv 4, gate floor -5.0
+  MLA      : q_lora 1536, kv_lora 512, qk 256 (nope, NoPE), v 256, 64 heads
+  indexer  : top-2048, 32 heads x 128, kpool 4 (+tail)
+  mHC      : mult 4, 20 Sinkhorn iterations
+  vision   : yes
+  routed experts: 311.7 B parameters (175 GB at int4-g64)
+             24 blocks x 1024, 16 heads, patch 14, 448px, merge 2 -> 4096
+cache: 33.0 KB per token across 11 DSA layers (0.01 GB at 247 positions)
+[CLUSTER] layer 3: worker-a:9100 1047 rows 11389 ms worker-b:9100 913 rows 16931 ms | waited 16931 ms
+[CLUSTER] layer 4: worker-a:9100 1179 rows 10018 ms worker-b:9100 781 rows 13969 ms | waited 13969 ms
+[CLUSTER] layer 5: worker-a:9100 1059 rows 9753 ms worker-b:9100 901 rows 9755 ms | waited 9755 ms
+[CLUSTER] layer 6: worker-a:9100 944 rows 7201 ms worker-b:9100 1016 rows 7204 ms | waited 7204 ms
+[CLUSTER] layer 7: worker-a:9100 923 rows 6303 ms worker-b:9100 1037 rows 6312 ms | waited 6312 ms
+[CLUSTER] layer 8: worker-a:9100 955 rows 7227 ms worker-b:9100 1005 rows 7229 ms | waited 7229 ms
+[CLUSTER] layer 9: worker-a:9100 984 rows 7159 ms worker-b:9100 976 rows 7162 ms | waited 7162 ms
+[CLUSTER] layer 10: worker-a:9100 1042 rows 7497 ms worker-b:9100 918 rows 7499 ms | waited 7499 ms
+[CLUSTER] layer 11: worker-a:9100 866 rows 6985 ms worker-b:9100 1094 rows 7053 ms | waited 7053 ms
+[CLUSTER] layer 12: worker-a:9100 976 rows 6800 ms worker-b:9100 984 rows 7648 ms | waited 7648 ms
+[CLUSTER] layer 13: worker-a:9100 1044 rows 7832 ms worker-b:9100 916 rows 7833 ms | waited 7833 ms
+[CLUSTER] layer 14: worker-a:9100 1273 rows 7274 ms worker-b:9100 687 rows 7277 ms | waited 7277 ms
+[CLUSTER] layer 15: worker-a:9100 1046 rows 7078 ms worker-b:9100 914 rows 7086 ms | waited 7086 ms
+[CLUSTER] layer 16: worker-a:9100 1027 rows 6985 ms worker-b:9100 933 rows 6987 ms | waited 6987 ms
+[CLUSTER] layer 17: worker-a:9100 1077 rows 7326 ms worker-b:9100 883 rows 7328 ms | waited 7328 ms
+[CLUSTER] layer 18: worker-a:9100 1213 rows 6412 ms worker-b:9100 747 rows 6413 ms | waited 6413 ms
+[CLUSTER] layer 19: worker-a:9100 1052 rows 7188 ms worker-b:9100 908 rows 7195 ms | waited 7195 ms
+[CLUSTER] layer 20: worker-a:9100 1072 rows 6091 ms worker-b:9100 888 rows 6848 ms | waited 6848 ms
+[CLUSTER] layer 21: worker-a:9100 966 rows 6170 ms worker-b:9100 994 rows 8641 ms | waited 8641 ms
+[CLUSTER] layer 22: worker-a:9100 934 rows 5832 ms worker-b:9100 1026 rows 6478 ms | waited 6478 ms
+[CLUSTER] layer 23: worker-a:9100 995 rows 6184 ms worker-b:9100 965 rows 6192 ms | waited 6192 ms
+[CLUSTER] layer 24: worker-a:9100 1054 rows 9528 ms worker-b:9100 906 rows 9530 ms | waited 9530 ms
+[CLUSTER] layer 25: worker-a:9100 919 rows 6237 ms worker-b:9100 1041 rows 6240 ms | waited 6240 ms
+[CLUSTER] layer 26: worker-a:9100 899 rows 7396 ms worker-b:9100 1061 rows 7399 ms | waited 7399 ms
+[CLUSTER] layer 27: worker-a:9100 1022 rows 6530 ms worker-b:9100 938 rows 6537 ms | waited 6537 ms
+[CLUSTER] layer 28: worker-a:9100 864 rows 6765 ms worker-b:9100 1096 rows 6768 ms | waited 6768 ms
+[CLUSTER] layer 29: worker-a:9100 1096 rows 7851 ms worker-b:9100 864 rows 7853 ms | waited 7853 ms
+[CLUSTER] layer 30: worker-a:9100 923 rows 7745 ms worker-b:9100 1037 rows 7748 ms | waited 7748 ms
+[CLUSTER] layer 31: worker-a:9100 1008 rows 7737 ms worker-b:9100 952 rows 7744 ms | waited 7744 ms
+[CLUSTER] layer 32: worker-a:9100 862 rows 6955 ms worker-b:9100 1098 rows 6958 ms | waited 6958 ms
+[CLUSTER] layer 33: worker-a:9100 1063 rows 6871 ms worker-b:9100 897 rows 6873 ms | waited 6873 ms
+[CLUSTER] layer 34: worker-a:9100 903 rows 6256 ms worker-b:9100 1057 rows 6258 ms | waited 6258 ms
+[CLUSTER] layer 35: worker-a:9100 975 rows 6873 ms worker-b:9100 985 rows 6881 ms | waited 6881 ms
+[CLUSTER] layer 36: worker-a:9100 982 rows 7099 ms worker-b:9100 978 rows 7102 ms | waited 7102 ms
+[CLUSTER] layer 37: worker-a:9100 1028 rows 6836 ms worker-b:9100 932 rows 6838 ms | waited 6838 ms
+[CLUSTER] layer 38: worker-a:9100 1144 rows 6377 ms worker-b:9100 816 rows 6379 ms | waited 6379 ms
+[CLUSTER] layer 39: worker-a:9100 876 rows 6467 ms worker-b:9100 1084 rows 7281 ms | waited 7281 ms
+[CLUSTER] layer 40: worker-a:9100 1176 rows 8535 ms worker-b:9100 784 rows 9610 ms | waited 9610 ms
+[CLUSTER] layer 41: worker-a:9100 898 rows 6863 ms worker-b:9100 1062 rows 8966 ms | waited 8966 ms
+[CLUSTER] layer 42: worker-a:9100 1045 rows 7670 ms worker-b:9100 915 rows 7672 ms | waited 7672 ms
+[CLUSTER] layer 43: worker-a:9100 989 rows 4555 ms worker-b:9100 971 rows 5218 ms | waited 5218 ms
+[CLUSTER] layer 44: worker-a:9100 801 rows 4223 ms worker-b:9100 1159 rows 6442 ms | waited 6442 ms
+load 192.3s, prefill 245 tokens in 453.6s
+prefill profile: attention 92.1s, ffn 350.2s (disk 0.0s), head 5.9s
+[glm53] 3 stop id(s) from generation_config.json
+[CLUSTER] layer 3: worker-a:9100 6 rows 403 ms worker-b:9100 2 rows 403 ms | waited 403 ms
+[CLUSTER] layer 4: worker-a:9100 5 rows 378 ms worker-b:9100 3 rows 378 ms | waited 378 ms
+[CLUSTER] layer 5: worker-a:9100 4 rows 218 ms worker-b:9100 4 rows 247 ms | waited 247 ms
+[CLUSTER] layer 6: worker-a:9100 4 rows 315 ms worker-b:9100 4 rows 352 ms | waited 352 ms
+[CLUSTER] layer 7: worker-a:9100 6 rows 350 ms worker-b:9100 2 rows 350 ms | waited 350 ms
+[CLUSTER] layer 8: worker-a:9100 5 rows 320 ms worker-b:9100 3 rows 320 ms | waited 320 ms
+[CLUSTER] layer 9: worker-a:9100 3 rows 84 ms worker-b:9100 5 rows 586 ms | waited 586 ms
+[CLUSTER] layer 10: worker-a:9100 4 rows 113 ms worker-b:9100 4 rows 342 ms | waited 342 ms
+[CLUSTER] layer 11: worker-a:9100 6 rows 517 ms worker-b:9100 2 rows 517 ms | waited 517 ms
+[CLUSTER] layer 12: worker-a:9100 2 rows 12 ms worker-b:9100 6 rows 420 ms | waited 420 ms
+[CLUSTER] layer 13: worker-a:9100 3 rows 88 ms worker-b:9100 5 rows 555 ms | waited 555 ms
+[CLUSTER] layer 14: worker-a:9100 6 rows 443 ms worker-b:9100 2 rows 443 ms | waited 443 ms
+[CLUSTER] layer 15: worker-a:9100 4 rows 213 ms worker-b:9100 4 rows 213 ms | waited 213 ms
+[CLUSTER] layer 16: worker-a:9100 3 rows 28 ms worker-b:9100 5 rows 379 ms | waited 379 ms
+[CLUSTER] layer 17: worker-a:9100 6 rows 226 ms worker-b:9100 2 rows 226 ms | waited 226 ms
+[CLUSTER] layer 18: worker-a:9100 4 rows 35 ms worker-b:9100 4 rows 228 ms | waited 228 ms
+[CLUSTER] layer 19: worker-a:9100 2 rows 17 ms worker-b:9100 6 rows 359 ms | waited 359 ms
+[CLUSTER] layer 20: worker-a:9100 5 rows 221 ms worker-b:9100 3 rows 221 ms | waited 221 ms
+[CLUSTER] layer 21: worker-a:9100 4 rows 25 ms worker-b:9100 4 rows 233 ms | waited 233 ms
+[CLUSTER] layer 22: worker-a:9100 6 rows 207 ms worker-b:9100 2 rows 207 ms | waited 207 ms
+[CLUSTER] layer 23: worker-a:9100 3 rows 15 ms worker-b:9100 5 rows 371 ms | waited 371 ms
+[CLUSTER] layer 24: worker-a:9100 3 rows 31 ms worker-b:9100 5 rows 287 ms | waited 287 ms
+[CLUSTER] layer 25: worker-a:9100 4 rows 21 ms worker-b:9100 4 rows 156 ms | waited 156 ms
+[CLUSTER] layer 26: worker-a:9100 3 rows 99 ms worker-b:9100 5 rows 235 ms | waited 235 ms
+[CLUSTER] layer 27: worker-a:9100 5 rows 141 ms worker-b:9100 3 rows 141 ms | waited 141 ms
+[CLUSTER] layer 28: worker-a:9100 4 rows 20 ms worker-b:9100 4 rows 166 ms | waited 166 ms
+[CLUSTER] layer 29: worker-a:9100 6 rows 50 ms worker-b:9100 2 rows 96 ms | waited 96 ms
+[CLUSTER] layer 30: worker-a:9100 6 rows 89 ms worker-b:9100 2 rows 178 ms | waited 178 ms
+[CLUSTER] layer 31: worker-a:9100 3 rows 80 ms worker-b:9100 5 rows 413 ms | waited 413 ms
+[CLUSTER] layer 32: worker-a:9100 4 rows 38 ms worker-b:9100 4 rows 163 ms | waited 163 ms
+[CLUSTER] layer 33: worker-a:9100 6 rows 178 ms worker-b:9100 2 rows 178 ms | waited 178 ms
+[CLUSTER] layer 34: worker-a:9100 5 rows 47 ms worker-b:9100 3 rows 222 ms | waited 222 ms
+[CLUSTER] layer 35: worker-a:9100 5 rows 165 ms worker-b:9100 3 rows 165 ms | waited 165 ms
+[CLUSTER] layer 36: worker-a:9100 4 rows 135 ms worker-b:9100 4 rows 187 ms | waited 187 ms
+[CLUSTER] layer 37: worker-a:9100 3 rows 31 ms worker-b:9100 5 rows 501 ms | waited 501 ms
+[CLUSTER] layer 38: worker-a:9100 5 rows 104 ms worker-b:9100 3 rows 209 ms | waited 209 ms
+[CLUSTER] layer 39: worker-a:9100 6 rows 267 ms worker-b:9100 2 rows 267 ms | waited 267 ms
+[CLUSTER] layer 40: worker-a:9100 3 rows 35 ms worker-b:9100 5 rows 383 ms | waited 383 ms
+[CLUSTER] layer 41: worker-a:9100 2 rows 77 ms worker-b:9100 6 rows 352 ms | waited 352 ms
+[CLUSTER] layer 42: worker-a:9100 3 rows 32 ms worker-b:9100 5 rows 428 ms | waited 428 ms
+[CLUSTER] layer 43: worker-a:9100 4 rows 23 ms worker-b:9100 4 rows 227 ms | waited 227 ms
+[CLUSTER] layer 44: worker-a:9100 4 rows 30 ms worker-b:9100 4 rows 331 ms | waited 331 ms
+[STATS] 3791760 selections across 11968 distinct experts -> <model>/.coli_usage
+[CLUSTER] worker-a:9100: 84 requests, 42380 rows, 3642.8 ms mean reply
+[CLUSTER] worker-b:9100: 84 requests, 40276 rows, 3975.9 ms mean reply
+----- stdout
+teacher_forcing 154822 1588 6645 23511 369 264 501 714 315 8472 264 9020 315 18347 15534 320 1614 13 264 69878 16279 12639 13 8884 10647 2436 264 323 6203 11 6203 6203 6203 5611 1817 17481 7798 1817 3468 264 315 279 6203 11641 13 862 1828 69878 82 13 576 1246 304 553 3019 11 304 14386 4128 11 1246 264 3175 1196 374 911 11206 11206 374 1526 419 1849 11 1246 279 11206 22056 279 7162 7559 7162 11 1128 6896 11858 56818 504 13355 323 1181 11873 11 1246 279 6203 311 700 304 2176 11858 1573 894 11248 4041 4362 1182 1246 1246 279 1590 5780 979 279 1614 525 279 1091 279 3922 13 29620 7512 279 14166 4344 311 3931 279 4361 6248 30156 6193 30156 11 11827 279 3175 4680 3950 11 323 1977 1817 825 1977 1128 432 1035 6629 311 12112 432 6439 13 1128 1410 728 432 1102 9152 13 4686 835 13 3498 279 6193 374 374 10591 13 17353 553 264 2805 14301 498 5675 1410 1598 311 1449 279 501 315 504 2 3885 279 1614 7337 525 19479 19479 25 825 702 264 4937 36178 323 264 11641 13931 11 1008 1083 8472 279 6929 15713 11 264 74174 3538 13 279 279 1008 702 264 28294 36178 714 264 770 4303 653 13 81247 1246 315 697 2326 7337 803 311 387 279 17831 369 279 6193 11 81247
+ Explain
+decode 1 token in 13.4s = 0.075 tok/s (13.4 s/token)
+experts hits 0 miss 0 bytes 0

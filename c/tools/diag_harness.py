@@ -31,6 +31,11 @@ import os, sys, re, json, time, argparse, subprocess, signal, traceback
 from datetime import datetime
 from pathlib import Path
 
+try:
+    from tools.engine_environment import engine_environment
+except ModuleNotFoundError:              # direct execution from c/tools
+    from engine_environment import engine_environment
+
 # ---------------------------------------------------------------------------
 # PROMPT SUITE — curated across categories.  "expect" is a case-insensitive
 # substring checked against the generated text (None = coherence-only check).
@@ -185,7 +190,7 @@ class EngineRunner:
 
     def run_prompt(self, prompt, ngen=64, env_extra=None, log_name=None, cap=None):
         """Run the engine in PROMPT mode and return (stdout, stderr, returncode, elapsed)."""
-        env = dict(os.environ, SNAP=self.snap, PROMPT=prompt, NGEN=str(ngen))
+        env = engine_environment(SNAP=self.snap, PROMPT=prompt, NGEN=str(ngen))
         env.update(self.default_env)
         if env_extra: env.update(env_extra)
         env["TOKENS"] = "1"   # always capture token ids for reliable text extraction
@@ -194,7 +199,7 @@ class EngineRunner:
 
     def run_score(self, score_file, cap=None, env_extra=None, log_name=None):
         """Run the engine in SCORE (log-likelihood) mode."""
-        env = dict(os.environ, SNAP=self.snap, SCORE=score_file)
+        env = engine_environment(SNAP=self.snap, SCORE=score_file)
         env.update(self.default_env)
         if env_extra: env.update(env_extra)
         cmd = [self.glm, str(cap if cap is not None else self.default_cap)]
@@ -368,13 +373,17 @@ class DiagnosticHarness:
             text, method = recover_text(stdout, stderr, p["prompt"], self.tokenizer)
             is_rep, max_run = check_repetition(token_ids)
             expect_ok = check_expected(text, p.get("expect"))
-            # Verdict: pass if text is non-empty, no severe repetition, and (if factual) expected found
+            # Verdict: a completed engine, non-empty text, no severe repetition,
+            # and (if factual) the expected answer are all required.
             has_text = bool(text.strip())
-            ok = has_text and not is_rep
+            ok = rc == 0 and has_text and not is_rep
             if p.get("expect") and expect_ok is False: ok = False
             if ok: pass_count += 1
             # Diagnose failure mode for reporting
-            if not has_text:
+            if rc != 0:
+                fail_reason = ("engine timed out" if rc == -1 and "[TIMEOUT after " in stderr
+                               else f"engine returned rc={rc}")
+            elif not has_text:
                 fail_reason = "no tokens generated (immediate EOS)"
             elif is_rep:
                 fail_reason = f"repetition loop (max run={max_run})"
@@ -676,7 +685,7 @@ class DiagnosticHarness:
 def main():
     ap = argparse.ArgumentParser(description="Comprehensive model diagnostic harness for colibri GLM-5.2")
     ap.add_argument("--snap", required=True, help="model snapshot directory")
-    ap.add_argument("--glm", default=None, help="engine binary path (default: ./glm.exe or ./glm)")
+    ap.add_argument("--glm", default=None, help="engine binary path (default: auto-detect colibri/colibri.exe)")
     ap.add_argument("--phase", default="all",
                     choices=["all","system","smoke","diagnostic","quality","throughput"],
                     help="which test phase to run")
@@ -691,10 +700,19 @@ def main():
     a = ap.parse_args()
     # Auto-detect engine binary
     if a.glm is None:
-        for cand in ["./glm.exe", "./glm", "../glm.exe", os.path.join(os.path.dirname(__file__), "..", "glm.exe")]:
-            if os.path.exists(cand): a.glm = os.path.abspath(cand); break
+        directories = (Path.cwd(), Path.cwd().parent, Path(__file__).resolve().parent.parent)
+        names = (("colibri.exe", "colibri", "glm.exe", "glm") if sys.platform == "win32"
+                 else ("colibri", "colibri.exe", "glm", "glm.exe"))
+        for name in names:
+            for directory in directories:
+                candidate = directory / name
+                if candidate.is_file():
+                    a.glm = str(candidate.resolve())
+                    break
+            if a.glm is not None:
+                break
         if a.glm is None:
-            print("ERROR: could not find glm/glm.exe. Specify with --glm", file=sys.stderr); sys.exit(1)
+            print("ERROR: could not find colibri/colibri.exe. Specify with --glm", file=sys.stderr); sys.exit(1)
     if not os.path.isdir(a.snap):
         print(f"ERROR: snapshot dir does not exist: {a.snap}", file=sys.stderr); sys.exit(1)
     harness = DiagnosticHarness(a)

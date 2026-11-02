@@ -35,6 +35,10 @@ make metal-test           # standalone kernel/attention correctness vs CPU refer
 COLI_METAL=1 COLI_MODEL=/path/glm52_i4 ./coli chat --ram 96
 ```
 
+The release's `macos-arm64.tar.gz` has `colibri`, `inkling` and `kimi_k3` built
+with `METAL=1`: `COLI_METAL=1` (`K3_METAL=1` for Kimi K3) turns the backend on
+with nothing to build, and without it they run on the CPU as before.
+
 Measured on an M4 Max (128 GB, warm cache, MTP on): CPU 0.30 → Metal
 **0.42 tok/s (~1.4×)** (best config adds `DIRECT=1`; ~3× vs this machine's
 first cold run). An M5 Max with a 46.9 GB learned pin reached **2.06 tok/s**

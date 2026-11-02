@@ -1,0 +1,44 @@
+#version 450
+// Qwen-Image's VAE decoder on the chain (vk_chain.c, vkc_vae_*; qwenimage_vae_vk.h): the
+// two steps of its convolutions that are not a GEMM. Maps are channel-last, [H][W][C].
+// One thread per output element. The push constants: v[0] the mode, then
+//   C, H, W, up, Ho, Wo, y0, n, x_off, o_off, Co, dupC.
+//
+// mode 0, the 3x3 taps of a band of output rows (an im2col for vkc_matmul): output pixel
+//   p (row y0 + p / Wo, column p % Wo of the Ho x Wo map) gets its nine taps as 9*C
+//   floats ordered [kx][ky][c], the order qwenimage_vae.h permutes the weights to:
+//   o[o_off + p*9C + kx*3C + ky*C + c] = x[x_off + ((sy >> up)*W + (sx >> up))*C + c],
+//   sy = row + ky - 1, sx = column + kx - 1, zero outside the map (the conv's padding);
+//   up 1 reads x (H x W) nearest-upsampled to Ho x Wo = 2H x 2W.
+// mode 1, the DupUp3D shortcut of an upsampling block, added: for output pixel p of the
+//   band and channel o < Co, o[o_off + p*Co + o] += x[x_off + src*dupC + tab[o*4 + s]],
+//   src = (row >> 1)*(Wo >> 1) + (column >> 1), s = (row & 1)*2 + (column & 1).
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer XB { float x[]; };
+layout(std430, binding = 1) buffer OB { float o[]; };
+layout(std430, binding = 2) readonly buffer TB { int tab[]; };
+layout(push_constant) uniform P {
+    int mode, C, H, W, up, Ho, Wo, y0, n, x_off, o_off, Co, dupC;
+} p;
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u);
+    if (i >= p.n) return;
+    if (p.mode == 0) {
+        int C3 = 3 * p.C, C9 = 9 * p.C;
+        int px = i / C9, rem = i - px * C9;
+        int kx = rem / C3, r2 = rem - kx * C3, ky = r2 / p.C, c = r2 - ky * p.C;
+        int row = p.y0 + px / p.Wo, col = px - (px / p.Wo) * p.Wo;
+        int sy = row + ky - 1, sx = col + kx - 1;
+        float v = 0.0;
+        if (sy >= 0 && sy < p.Ho && sx >= 0 && sx < p.Wo)
+            v = x[p.x_off + ((sy >> p.up) * p.W + (sx >> p.up)) * p.C + c];
+        o[p.o_off + i] = v;
+    } else {
+        int px = i / p.Co, oc = i - px * p.Co;
+        int row = p.y0 + px / p.Wo, col = px - (px / p.Wo) * p.Wo;
+        int src = (row >> 1) * (p.Wo >> 1) + (col >> 1), s = (row & 1) * 2 + (col & 1);
+        o[p.o_off + i] += x[p.x_off + src * p.dupC + tab[oc * 4 + s]];
+    }
+}

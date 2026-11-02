@@ -1,0 +1,52 @@
+#version 450
+// Inkling's depthwise causal short convolution (vk_chain.c, vkc_sconv), and the scalar
+// multiply and divide its dense MLP and its logits take. In place on x.
+//   mode 0: one thread per channel c walks the S rows in order with the channel's ring
+//     of the last CK-1 inputs (it lives on the device across steps):
+//       acc = sum_{k < CK-1} w[c][k] * ring[k] + w[c][CK-1] * x[s][c]
+//       x[s][c] = acc + x[s][c]           (the residual inside the convolution)
+//     then the ring drops its oldest input and takes x[s][c] as it was. That is
+//     inkling.c's sconv_apply, the taps in its order, with no activation.
+//   mode 1: x[i] = x[i] * fc, i < n       (the dense MLP's global scale)
+//   mode 2: x[i] = x[i] / fc, i < n       (the logits' width multiplier)
+// x[x_off + s*x_row + c]; w[w_off + c*CK + k]; ring[ring_off + c*(CK-1) + k], oldest first.
+// Limits: CK <= 9.
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) buffer XB { float x[]; };
+layout(std430, binding = 1) readonly buffer WB { float w[]; };
+layout(std430, binding = 2) buffer RB { float ring[]; };
+
+layout(push_constant) uniform P {
+    int mode, S, C, CK;
+    int x_off, x_row, w_off, ring_off, n;
+    float fc;
+} p;
+
+void main() {
+    int c = int(gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 64u);
+    if (p.mode != 0) {
+        if (c >= p.n) return;
+        float v = x[p.x_off + c];
+        x[p.x_off + c] = p.mode == 1 ? v * p.fc : v / p.fc;
+        return;
+    }
+    if (c >= p.C) return;
+    int nh = p.CK - 1;
+    float hist[8];
+    for (int k = 0; k < 8; k++) hist[k] = k < nh ? ring[p.ring_off + c * nh + k] : 0.0;
+    int wb = p.w_off + c * p.CK;
+    float wl = w[wb + p.CK - 1];
+    for (int s = 0; s < p.S; s++) {
+        int xi = p.x_off + s * p.x_row + c;
+        float cur = x[xi];
+        float acc = 0.0;
+        /* constant trip counts: the ring stays in registers */
+        for (int k = 0; k < 8; k++) if (k < nh) acc += w[wb + k] * hist[k];
+        acc += wl * cur;
+        x[xi] = acc + cur;
+        for (int k = 0; k < 7; k++) if (k + 1 < nh) hist[k] = hist[k + 1];
+        for (int k = 0; k < 8; k++) if (k == nh - 1) hist[k] = cur;
+    }
+    for (int k = 0; k < 8; k++) if (k < nh) ring[p.ring_off + c * nh + k] = hist[k];
+}

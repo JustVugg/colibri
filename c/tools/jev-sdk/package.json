@@ -1,0 +1,8 @@
+{
+  "name": "colibri-jev-sdk-check",
+  "private": true,
+  "description": "TypeSafe's TypeScript SDK, pinned, for tests/test_jev_sdk.py (npm ci here, then make jev-sdk-check)",
+  "dependencies": {
+    "@typesafe-ai/sdk": "0.6.0"
+  }
+}

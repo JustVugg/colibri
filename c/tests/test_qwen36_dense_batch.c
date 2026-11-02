@@ -68,7 +68,7 @@ static void clear_qw(Layer *l) { qw_free(&l->sh_g); qw_free(&l->sh_u); qw_free(&
 static void shared_case(const char *format,int quantized) {
     enum { S=12,D=64,I=32 };
     Model m;memset(&m,0,sizeof(m));m.c.hidden=D;m.c.shared_inter=I;
-    Layer l;memset(&l,0,sizeof(l));
+    Layer l;memset(&l,0,sizeof(l));l.sh_I=I;   /* the layer's shared width, as model_init_range sets it */
     l.sh_g.w=falloc((int64_t)I*D);l.sh_u.w=falloc((int64_t)I*D);
     l.sh_d.w=falloc((int64_t)D*I);l.sh_gate=falloc(D);
     l.sh_g.I=D;l.sh_g.O=I; l.sh_u.I=D;l.sh_u.O=I; l.sh_d.I=I;l.sh_d.O=D;

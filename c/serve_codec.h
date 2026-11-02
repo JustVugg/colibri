@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "compat.h"
+#include "load_fail.h"   /* LOAD_FAIL kind=<kind> <detail>: the handshake that never reaches READY */
 
 /* Transport only: parse and emit frames. Admission, queueing, cancellation,
  * KV ownership, scheduling, and generation remain with each family engine. */
@@ -26,6 +27,13 @@ typedef enum {
      * vede come un comando che non sa trattare e lo rifiuta, che e' la risposta
      * giusta: meglio dire di no che accettare una foto e ignorarla. */
     COLI_SERVE_COMMAND_IMAGE,
+    /* DECIDE <id> <slot> <bytes>\n<payload>\n: one closed decision for a decision
+     * engine (docs/serve_protocol.md). The payload is a JSON record -- the state and
+     * the typed questions with their options in order -- and the answer comes back
+     * as one DECISION frame followed by DONE. An engine that does not decide never
+     * receives it: the gateway sends it only after the engine announced decide=1 in
+     * its CAPS line. */
+    COLI_SERVE_COMMAND_DECIDE,
 } ColiServeCommandKind;
 
 typedef enum {
@@ -150,6 +158,8 @@ static inline void coli_serve_classify_line(
         command->kind = COLI_SERVE_COMMAND_CANCEL;
     else if (name_size == 5 && !memcmp(name, "IMAGE", 5))
         command->kind = COLI_SERVE_COMMAND_IMAGE;
+    else if (name_size == 6 && !memcmp(name, "DECIDE", 6))
+        command->kind = COLI_SERVE_COMMAND_DECIDE;
     else
         return;
     while (*cursor == ' ' || *cursor == '\t') cursor++;
@@ -217,6 +227,7 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
     else if (!strcmp(fields[0], "STOP")) command->kind = COLI_SERVE_COMMAND_STOP;
     else if (!strcmp(fields[0], "CANCEL")) command->kind = COLI_SERVE_COMMAND_CANCEL;
     else if (!strcmp(fields[0], "IMAGE")) command->kind = COLI_SERVE_COMMAND_IMAGE;
+    else if (!strcmp(fields[0], "DECIDE")) command->kind = COLI_SERVE_COMMAND_DECIDE;
     else {
         free(line);
         return COLI_SERVE_READ_IGNORED;
@@ -245,6 +256,35 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
             !coli_serve_parse_i32(fields[4], &command->grid_w) ||
             command->payload_bytes > profile->max_payload_bytes ||
             command->grid_h < 1 || command->grid_w < 1) {
+            free(line);
+            return COLI_SERVE_READ_BAD_REQUEST;
+        }
+        free(line);
+        command->payload = (unsigned char *)allocate((size_t)command->payload_bytes + 1);
+        if (!command->payload) return COLI_SERVE_READ_NOMEM;
+        if (command->payload_bytes &&
+            fread(command->payload, 1, (size_t)command->payload_bytes, input)
+                != (size_t)command->payload_bytes) {
+            coli_serve_command_dispose(command);
+            return COLI_SERVE_READ_BAD_FRAME;
+        }
+        command->payload[command->payload_bytes] = 0;
+        int terminator = fgetc(input);
+        if (terminator != '\n' && !(terminator == '\r' && fgetc(input) == '\n')) {
+            coli_serve_command_dispose(command);
+            return COLI_SERVE_READ_BAD_FRAME;
+        }
+        return COLI_SERVE_READ_OK;
+    }
+    if (command->kind == COLI_SERVE_COMMAND_DECIDE) {
+        /* DECIDE <id> <slot> <bytes>\n<payload>\n. Same rule as IMAGE: the payload
+         * is consumed whenever the header parses, so an engine that cannot decide
+         * answers with an ERROR and the next frame still starts on a header. */
+        if (nfields != 4 ||
+            !coli_serve_parse_i32(fields[2], &command->slot) ||
+            !coli_serve_parse_u64(fields[3], &command->payload_bytes) ||
+            command->payload_bytes > profile->max_payload_bytes ||
+            command->slot < 0) {
             free(line);
             return COLI_SERVE_READ_BAD_REQUEST;
         }
@@ -358,12 +398,23 @@ static inline ColiServeReadResult coli_serve_read_command(
     return coli_serve_read_command_alloc(input, profile, command, malloc);
 }
 
-static inline int coli_serve_write_ready(FILE *output, double rss_gb)
+/* The handshake, with an optional CAPS line between READY and STAT: what the
+ * engine loaded, as "key=value ..." (today `vision=0|1`). It sits BEFORE the
+ * status line on purpose: the server reads it while it waits for STAT, so it
+ * knows what it serves before the first request arrives. NULL writes the
+ * handshake exactly as coli_serve_write_ready() always has. */
+static inline int coli_serve_write_ready_caps(FILE *output, double rss_gb, const char *caps)
 {
     if (fputs("\x01\x01READY\x01\x01\n", output) == EOF ||
+        (caps && fprintf(output, "CAPS %s\n", caps) < 0) ||
         fprintf(output, "STAT 0 0.0 0.0 %.2f 0 0\n", rss_gb) < 0)
         return 0;
     return fflush(output) == 0;
+}
+
+static inline int coli_serve_write_ready(FILE *output, double rss_gb)
+{
+    return coli_serve_write_ready_caps(output, rss_gb, NULL);
 }
 
 static inline int coli_serve_write_accept(FILE *output, const char *id, int prompt_tokens)
@@ -405,6 +456,19 @@ static inline int coli_serve_write_tool(
     FILE *output, const char *id, const void *data, size_t bytes)
 {
     if (fprintf(output, "TOOL %s %zu\n", id, bytes) < 0 ||
+        (bytes && fwrite(data, 1, bytes, output) != bytes) ||
+        fputc('\n', output) == EOF)
+        return 0;
+    return fflush(output) == 0;
+}
+
+/* A decision engine's answer to DECIDE: "DECISION <id> <n>\n<n bytes of JSON>\n",
+ * written once per request and followed by DONE. The JSON is the engine's; the
+ * transport only frames it. */
+static inline int coli_serve_write_decision(
+    FILE *output, const char *id, const void *data, size_t bytes)
+{
+    if (fprintf(output, "DECISION %s %zu\n", id, bytes) < 0 ||
         (bytes && fwrite(data, 1, bytes, output) != bytes) ||
         fputc('\n', output) == EOF)
         return 0;

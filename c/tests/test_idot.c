@@ -1,6 +1,6 @@
 /* Exactness test for the integer-dot kernels: dot_i8i8 and dot_i4i8 must return
  * EXACTLY the same value as a plain-C reference, whatever SIMD path was compiled
- * in (avx512-vnni / avx2 / neon / vsx / scalar). Integer arithmetic has no
+ * in (avx512-vnni / avx2 / ssse3 / neon / vsx / scalar). Integer arithmetic has no
  * rounding, so any mismatch is a kernel bug, not noise.
  *
  * Covers: odd sizes (scalar tail), sizes below one vector, the w=-128 edge

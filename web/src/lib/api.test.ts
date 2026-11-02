@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import {
-  askBrio, extractSSE, extractSSEEvents, generateImage, generatesImages, getHealth, getProfile,
+  askSystemOne, extractSSE, extractSSEEvents, generateImage, generatesImages, getHealth, getProfile,
   listModelInfo, serverEndpoint, streamChat, type GenerateImageOptions, type ImageProgress,
 } from "./api"
 
@@ -59,7 +59,7 @@ describe("chat request extensions", () => {
     headers: { "content-type": "text/event-stream" },
   })
 
-  async function requestBody(cacheSlot?: number) {
+  async function requestBody(cacheSlot?: number, compact?: boolean, maxTokens: number | null = 8) {
     const fetchMock = vi.fn().mockResolvedValue(completedStream())
     vi.stubGlobal("fetch", fetchMock)
     await streamChat({
@@ -68,9 +68,10 @@ describe("chat request extensions", () => {
       model: "test-model",
       messages: [],
       temperature: 0,
-      maxTokens: 8,
+      maxTokens: maxTokens ?? undefined,
       enableThinking: false,
       cacheSlot,
+      compact,
       signal: new AbortController().signal,
       onDelta: () => undefined,
     })
@@ -83,6 +84,75 @@ describe("chat request extensions", () => {
 
   it("sends cache_slot zero when colibrì advertises KV slots", async () => {
     expect(await requestBody(0)).toMatchObject({ cache_slot: 0 })
+  })
+
+  /* #382: no ceiling of the user's own leaves the server's, which on colibrì is the
+     context the engine holds; a fixed 4096 cut a reasoning model's turns short */
+  it("sends max_completion_tokens only when the user set one", async () => {
+    expect(await requestBody(undefined, undefined, 512)).toMatchObject({ max_completion_tokens: 512 })
+    expect(await requestBody(undefined, undefined, null)).not.toHaveProperty("max_completion_tokens")
+  })
+
+  it("asks a colibrì server for context compaction, and only a colibrì server", async () => {
+    expect(await requestBody(undefined, true)).toMatchObject({ context_compaction: "auto" })
+    expect(await requestBody()).not.toHaveProperty("context_compaction")
+  })
+})
+
+describe("reasoning in the history", () => {
+  /* #382: a past turn's reasoning goes back to a colibrì server, so a GLM prompt is what
+     the engine holds (its KV state reused, not prefilled again); never to another server */
+  async function sent(keepReasoning?: boolean) {
+    const fetchMock = vi.fn().mockResolvedValue(new Response("data: [DONE]\n\n", {
+      headers: { "content-type": "text/event-stream" },
+    }))
+    vi.stubGlobal("fetch", fetchMock)
+    await streamChat({
+      baseUrl: "http://localhost:8000/v1", apiKey: "", model: "test-model",
+      messages: [
+        { id: "u1", role: "user", content: "hi" },
+        { id: "a1", role: "assistant", content: "hello", reasoning: "the user greets me" },
+        { id: "a2", role: "assistant", content: "again", reasoning: "  " },
+        { id: "u2", role: "user", content: "and?", reasoning: "not a user field" },
+      ],
+      temperature: 0, maxTokens: 8, enableThinking: true, keepReasoning,
+      signal: new AbortController().signal, onDelta: () => undefined,
+    })
+    return (JSON.parse(fetchMock.mock.calls[0][1].body as string) as { messages: Record<string, unknown>[] }).messages
+  }
+
+  it("sends a past assistant turn's reasoning to a colibrì server", async () => {
+    const messages = await sent(true)
+    expect(messages[1]).toEqual({ role: "assistant", content: "hello", reasoning_content: "the user greets me" })
+    expect(messages[2]).not.toHaveProperty("reasoning_content")   // blank: nothing to keep
+    expect(messages[3]).not.toHaveProperty("reasoning_content")   // a user turn has none
+  })
+
+  it("keeps it from any other server", async () => {
+    for (const message of await sent()) expect(message).not.toHaveProperty("reasoning_content")
+  })
+})
+
+describe("context compaction", () => {
+  /* The gateway says, in a chunk before the text, that the turn ran on a summary of
+     the conversation's first messages; the page tells the user why. */
+  it("returns the compaction the stream reported", async () => {
+    const compaction = { summarized_messages: 6, summary: "the user listed topics" }
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(
+      'data: {"choices":[{"delta":{"role":"assistant","content":""}}]}\n\n'
+      + `data: ${JSON.stringify({ choices: [], compaction })}\n\n`
+      + 'data: {"choices":[{"delta":{"content":"answer"}}]}\n\n'
+      + "data: [DONE]\n\n",
+      { headers: { "content-type": "text/event-stream" } },
+    )))
+    const content: string[] = []
+    const result = await streamChat({
+      baseUrl: "http://localhost:8000/v1", apiKey: "", model: "test-model", messages: [],
+      temperature: 0, maxTokens: 8, enableThinking: false,
+      signal: new AbortController().signal, onDelta: (text) => content.push(text),
+    })
+    expect(result.compaction).toEqual(compaction)
+    expect(content).toEqual(["answer"])
   })
 })
 
@@ -119,34 +189,39 @@ describe("reasoning stream", () => {
   })
 })
 
-describe("askBrio", () => {
-  /* The options must travel as a field, never folded into the prompt: keeping
-     them out of the text is half of what the mode saves, and a refactor that
-     "helpfully" appended them would be invisible in the answer. */
-  it("sends the options as data and posts to the brio endpoint", async () => {
-    const seen: { url?: string; body?: unknown } = {}
+describe("askSystemOne", () => {
+  /* The options must travel as the labels of a `choice`, never folded into the
+     state: the gateway reads each one as the answer's continuation, and a
+     refactor that "helpfully" appended them to the text would be invisible in
+     the answer. */
+  it("asks one choice question on /v1/systemone and draws its probabilities", async () => {
+    const seen: { url?: string; body?: { state: string; pin_state?: boolean; questions: { q: { type: string; criteria: object } } } } = {}
     vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
       seen.url = url
       seen.body = JSON.parse(String(init.body))
       return new Response(JSON.stringify({
-        answer: "b", entropy: 0.5, normalize: "mean",
-        choices: [{ option: "b", p: 0.7, logprob: -1, mean_logprob: -1, tokens: 1 }],
-        usage: { prompt_tokens: 9, completion_tokens: 0, read_tokens: 2, total_tokens: 11 },
+        id: "req_1", model: "laya", provider: "colibri",
+        answers: { q: { type: "choice", choice: "b", probabilities: { a: 0.25, b: 0.75 }, confidence: 0.5 } },
+        usage: { input_tokens: 40, output_tokens: 3, cost: 0 },
       }), { status: 200, headers: { "Content-Type": "application/json" } })
     }))
-    const out = await askBrio("http://x/v1", "", "m", "state", "q?", ["a", "b"])
-    expect(seen.url).toBe("http://x/v1/brio")
-    expect(seen.body).toMatchObject({ model: "m", state: "state", question: "q?", options: ["a", "b"] })
+    const out = await askSystemOne("http://x/v1", "", "laya", "state", "q?", ["a", "b"], true)
+    expect(seen.url).toBe("http://x/v1/systemone")
+    expect(seen.body?.state).toBe("state")
+    expect(seen.body?.pin_state).toBe(true)
+    expect(seen.body?.questions.q).toEqual({ type: "choice", instructions: "q?", criteria: { a: null, b: null } })
     expect(out.answer).toBe("b")
-    expect(out.usage.completion_tokens).toBe(0)
+    expect(out.choices.map((c) => c.option)).toEqual(["b", "a"])
+    expect(out.entropy).toBeCloseTo(-(0.25 * Math.log(0.25) + 0.75 * Math.log(0.75)) / Math.log(2), 6)
+    expect(out.usage).toEqual({ input_tokens: 40, output_tokens: 3 })
   })
 
   it("surfaces the server's own message instead of a bare status", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(
-      JSON.stringify({ error: { message: "options must be a non-empty array" } }),
-      { status: 400, headers: { "Content-Type": "application/json" } })))
-    await expect(askBrio("http://x/v1", "", "m", "s", "q", ["a"]))
-      .rejects.toThrow("options must be a non-empty array")
+      JSON.stringify({ error: { message: "`questions.q.criteria` must be a non-empty object" } }),
+      { status: 422, headers: { "Content-Type": "application/json" } })))
+    await expect(askSystemOne("http://x/v1", "", "m", "s", "q", [], false))
+      .rejects.toThrow("must be a non-empty object")
   })
 })
 
@@ -353,3 +428,68 @@ describe("generateImage", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 })
+
+
+describe("multiline chat SSE data", () => {
+  it("assembles data lines in a frame before decoding its JSON", () => {
+    const parsed = extractSSE('data: {"choices": [\n' + 'data: {"delta":{"content":"hello"}}]}\n\n');
+    expect(parsed.data).toEqual(['{"choices": [\n{"delta":{"content":"hello"}}]}']);
+    expect(JSON.parse(parsed.data[0]).choices[0].delta.content).toBe("hello");
+  });
+  it("preserves data whitespace beyond the optional single separator space", () => {
+    expect(extractSSE("data:  leading\n\n").data).toEqual([" leading"]);
+  });
+});
+
+it("streams a chat completion whose JSON spans multiple SSE data lines", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(
+    'data: {"choices": [\n' + 'data: {"delta":{"content":"hello"}}]}\n\n' + 'data: [DONE]\n\n',
+    { headers: { "content-type": "text/event-stream" } },
+  )));
+  const deltas: string[] = [];
+  await streamChat({ baseUrl: "http://fixture.invalid/v1", apiKey: "", model: "fixture", messages: [],
+    temperature: 0, maxTokens: 8, enableThinking: false, signal: new AbortController().signal,
+    onDelta: text => deltas.push(text) });
+  expect(deltas).toEqual(["hello"]);
+});
+
+it("finishes chat at DONE without waiting for the backend to close its connection", async () => {
+  const reader = {
+    read: vi.fn().mockResolvedValueOnce({ value: new TextEncoder().encode("data: [DONE]\n\n"), done: false })
+      .mockRejectedValue(new Error("read after terminal marker")),
+    cancel: vi.fn().mockResolvedValue(undefined),
+  }
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, headers: new Headers(), body: { getReader: () => reader } }));
+  await expect(streamChat({ baseUrl: "http://fixture.invalid/v1", apiKey: "", model: "fixture", messages: [],
+    temperature: 0, maxTokens: 8, enableThinking: false, signal: new AbortController().signal,
+    onDelta: () => undefined })).resolves.toMatchObject({ finishReason: null });
+  expect(reader.read).toHaveBeenCalledTimes(1);
+  expect(reader.cancel).toHaveBeenCalledTimes(1);
+});
+
+it("cancels the chat body when processing a frame fails without masking that error", async () => {
+  const failure = new Error("delta handler failed")
+  const reader = {
+    read: vi.fn().mockResolvedValue({ value: new TextEncoder().encode('data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'), done: false }),
+    cancel: vi.fn().mockRejectedValue(new Error("cleanup failed")),
+  }
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, headers: new Headers(), body: { getReader: () => reader } }));
+  await expect(streamChat({ baseUrl: "http://fixture.invalid/v1", apiKey: "", model: "fixture", messages: [],
+    temperature: 0, maxTokens: 8, enableThinking: false, signal: new AbortController().signal,
+    onDelta: () => { throw failure } })).rejects.toBe(failure);
+  expect(reader.cancel).toHaveBeenCalledTimes(1);
+});
+
+it("ignores all frames after DONE in the same network chunk", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(
+    'data: {"choices":[{"delta":{"content":"hello"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\n'
+    + 'data: [DONE]\n\ndata: {"choices":[{"delta":{"content":"late"}}]}\n\ndata: malformed\n\n',
+    { headers: { "content-type": "text/event-stream" } },
+  )));
+  const deltas: string[] = [];
+  const result = await streamChat({ baseUrl: "http://fixture.invalid/v1", apiKey: "", model: "fixture", messages: [],
+    temperature: 0, maxTokens: 8, enableThinking: false, signal: new AbortController().signal,
+    onDelta: text => deltas.push(text) });
+  expect(deltas).toEqual(["hello"]);
+  expect(result.usage).toEqual({ prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 });
+});

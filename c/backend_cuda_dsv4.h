@@ -191,6 +191,9 @@ Dsv4CudaExpertSet *dsv4_cuda_expert_set_create(Dsv4CudaTensor *const *gate,Dsv4C
                                                 Dsv4CudaTensor *const *down,int count,
                                                 Dsv4CudaTensor *shared_gate,Dsv4CudaTensor *shared_up,
                                                 Dsv4CudaTensor *shared_down);
+int dsv4_cuda_expert_bank_slots(int experts);
+/* Device bytes one slot of an expert bank of this geometry takes. */
+long long dsv4_cuda_expert_bank_slot_bytes(int hidden,int intermediate);
 Dsv4CudaExpertSet *dsv4_cuda_expert_bank_create(int count,int hidden,int intermediate,int device,
                                                  Dsv4CudaTensor *shared_gate,Dsv4CudaTensor *shared_up,
                                                  Dsv4CudaTensor *shared_down);

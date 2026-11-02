@@ -1,0 +1,33 @@
+#version 450
+// The dense chain's RoPE (vk_chain.c, VKC_P_ROPE), in place, rotate-half form: for each
+// segment (a head of a row) and j < half,
+//   a = x[j], b = x[j + half];  x[j] = a*c - b*s;  x[j + half] = b*c + a*s
+// with (c, s) = cs[cs_off + row*cs_row + 2j], cs[... + 1]. The cosines and sines come
+// from the host, computed with the CPU's own cosf/sinf at the CPU's angles, so a
+// position far from 0 rotates exactly as on the CPU (a device sin of a large angle
+// need not), and M-RoPE's per-axis positions are just another table.
+// Segment g: row g / per_row, head j = g % per_row, at x_off + row*x_row + j*x_seg.
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer CS { float cs[]; };
+
+layout(push_constant) uniform P {
+    int nseg, per_row;
+    int x_off, x_row, x_seg;
+    int half_;
+    int cs_off, cs_row;
+} p;
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 64u);
+    if (gid >= p.nseg * p.half_) return;
+    int seg = gid / p.half_, j = gid - seg * p.half_;
+    int row = seg / p.per_row, hh = seg - row * p.per_row;
+    int base = p.x_off + row * p.x_row + hh * p.x_seg;
+    int cb = p.cs_off + row * p.cs_row + 2 * j;
+    float c = cs[cb], s = cs[cb + 1];
+    float a = x[base + j], b = x[base + j + p.half_];
+    x[base + j] = a * c - b * s;
+    x[base + j + p.half_] = b * c + a * s;
+}

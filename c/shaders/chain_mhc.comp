@@ -1,0 +1,118 @@
+#version 450
+// Manifold-constrained hyper-connections (mHC) on the dense chain (vk_chain.c,
+// VKC_P_MHC), hyper_connections.h's arithmetic for S rows of H residual streams of D
+// floats ([S][H*D]), and a clamped SwiGLU. Five modes:
+//
+// mode 0, the split: one workgroup per row s. r = 1 / sqrt(mean(x^2) + eps) over the
+// row's H*D stream values; the mix logits are mix[s][i] * r (mix = the raw products
+// hc_fn . x, from a matmul); then, by one thread in the CPU's order:
+//   pre[i]  = sigmoid(m[i] * scale[0] + base[i]) + hc_eps
+//   post[i] = 2 * sigmoid(m[H+i] * scale[1] + base[H+i])
+//   comb    = softmax per row of m[2H + row*H + col] * scale[2] + base[...], + hc_eps,
+//             then iters - 1 rounds of Sinkhorn (rows, then columns) after a first
+//             column normalization
+// into hp[s][0..H) pre, [H..2H) post, [2H..2H+H*H) comb. scale (3) and base (2H+H*H)
+// at prm_off in prm.
+// mode 1, collapse: y[s][d] = sum_i pre[i] * x[s][i*D + d], the streams in order.
+// mode 2, write back: y[s][j*D + d] = sum_i comb[i*H + j] * x[s][i*D + d] + post[j] * b[s][d]
+// mode 3, mean: y[s][d] = (sum_i x[s][i*D + d]) / H (the model's last collapse).
+// mode 4, clamped SwiGLU: y[i] = silu(min(a[i], lim)) * clamp(b[i], -lim, lim) over n
+//   values (GLM-5.3's dense MLPs and shared experts; lim from the config).
+// Offsets in floats; a row of x / y is x_row / y_row floats.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer XB { float x[]; };    // streams; 4: a
+layout(std430, binding = 1) readonly buffer MB { float mx[]; };   // 0: mix; 2: branch; 4: b
+layout(std430, binding = 2) buffer HB { float hp[]; };            // pre | post | comb per row
+layout(std430, binding = 3) readonly buffer PB { float prm[]; };  // 0: scale, base
+layout(std430, binding = 4) writeonly buffer YB { float y[]; };
+
+layout(push_constant) uniform P {
+    int mode, S, H, D, iters;
+    int x_off, x_row, m_off, m_row, hp_off, hp_row, y_off, y_row, prm_off, n;
+    float eps, hc_eps, lim;
+} p;
+
+shared float red[256];
+shared float ms[96];
+
+float sig(float v) {
+    if (v >= 0.0) { float d = exp(-v); return 1.0 / (1.0 + d); }
+    float g = exp(v);
+    return g / (1.0 + g);
+}
+
+void split() {
+    int s = int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x);
+    int H = p.H, HD = H * p.D, nm = (2 + H) * H;
+    int xb = p.x_off + s * p.x_row;
+    float a = 0.0;
+    for (int i = tid; i < HD; i += 256) { float v = x[xb + i]; a += v * v; }
+    red[tid] = a;
+    barrier();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        barrier();
+    }
+    float r = 1.0 / sqrt(red[0] / float(HD) + p.eps);
+    for (int i = tid; i < nm; i += 256) ms[i] = mx[p.m_off + s * p.m_row + i] * r;
+    barrier();
+    if (tid != 0) return;
+    int hb = p.hp_off + s * p.hp_row, pb = p.prm_off;
+    for (int i = 0; i < H; i++) {
+        hp[hb + i] = sig(ms[i] * prm[pb] + prm[pb + 3 + i]) + p.hc_eps;
+        hp[hb + H + i] = 2.0 * sig(ms[H + i] * prm[pb + 1] + prm[pb + 3 + H + i]);
+    }
+    int cb = hb + 2 * H, mo = 2 * H;
+    for (int row = 0; row < H; row++) {
+        float mxv = -3.0e38;
+        for (int col = 0; col < H; col++) {
+            float v = ms[mo + row * H + col] * prm[pb + 2] + prm[pb + 3 + mo + row * H + col];
+            hp[cb + row * H + col] = v;
+            if (v > mxv) mxv = v;
+        }
+        float sum = 0.0;
+        for (int col = 0; col < H; col++) { float v = exp(hp[cb + row * H + col] - mxv); hp[cb + row * H + col] = v; sum += v; }
+        for (int col = 0; col < H; col++) hp[cb + row * H + col] = hp[cb + row * H + col] / sum + p.hc_eps;
+    }
+    float sums[8];
+    for (int col = 0; col < H; col++) { float sm = 0.0; for (int row = 0; row < H; row++) sm += hp[cb + row * H + col]; sums[col] = sm; }
+    for (int row = 0; row < H; row++) for (int col = 0; col < H; col++) hp[cb + row * H + col] /= sums[col] + p.hc_eps;
+    for (int it = 1; it < p.iters; it++) {
+        for (int row = 0; row < H; row++) { float sm = 0.0; for (int col = 0; col < H; col++) sm += hp[cb + row * H + col]; sums[row] = sm; }
+        for (int row = 0; row < H; row++) for (int col = 0; col < H; col++) hp[cb + row * H + col] /= sums[row] + p.hc_eps;
+        for (int col = 0; col < H; col++) { float sm = 0.0; for (int row = 0; row < H; row++) sm += hp[cb + row * H + col]; sums[col] = sm; }
+        for (int row = 0; row < H; row++) for (int col = 0; col < H; col++) hp[cb + row * H + col] /= sums[col] + p.hc_eps;
+    }
+}
+
+void main() {
+    if (p.mode == 0) { split(); return; }
+    int i = int(gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u);
+    if (p.mode == 4) {
+        if (i >= p.n) return;
+        float g = x[p.x_off + i], u = mx[p.m_off + i];
+        g = g > p.lim ? p.lim : g;
+        u = u < -p.lim ? -p.lim : (u > p.lim ? p.lim : u);
+        y[p.y_off + i] = (g / (1.0 + exp(-g))) * u;
+        return;
+    }
+    int H = p.H, D = p.D;
+    if (p.mode == 2) {
+        if (i >= p.S * H * D) return;
+        int s = i / (H * D), r = i - s * H * D, j = r / D, d = r - j * D;
+        int xb = p.x_off + s * p.x_row, hb = p.hp_off + s * p.hp_row;
+        float v = 0.0;
+        for (int k = 0; k < H; k++) v += hp[hb + 2 * H + k * H + j] * x[xb + k * D + d];
+        v += hp[hb + H + j] * mx[p.m_off + s * p.m_row + d];
+        y[p.y_off + s * p.y_row + j * D + d] = v;
+        return;
+    }
+    if (i >= p.S * D) return;
+    int s = i / D, d = i - s * D;
+    int xb = p.x_off + s * p.x_row, hb = p.hp_off + s * p.hp_row;
+    float v = 0.0;
+    if (p.mode == 1) { for (int k = 0; k < H; k++) v += hp[hb + k] * x[xb + k * D + d]; }
+    else { for (int k = 0; k < H; k++) v += x[xb + k * D + d]; v = v / float(H); }
+    y[p.y_off + s * p.y_row + d] = v;
+}

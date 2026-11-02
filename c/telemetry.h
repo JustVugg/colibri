@@ -18,6 +18,12 @@ static int64_t expert_bytes_layer(Model *m, int layer){
     if(st_nbytes(&m->S,nm)<=0) return 0;
     for(int k=0;k<3;k++){
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight",layer,suf[k]);
+        const st_tensor *t=st_find(&m->S,nm);
+        if(t && st_is_ggml(t->dtype) && t->rank==2){   /* a GGUF's: as qt_from_disk holds it */
+            const int held=coli_ggml_held_type(st_ggml_type(t->dtype),t->shape[0],t->shape[1],"GLM_ILV16");
+            eb+=gq_row_bytes(held,t->shape[1])*t->shape[0];
+            continue;
+        }
         eb+=st_nbytes(&m->S,nm);
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight.qs",layer,suf[k]);
         int64_t q=st_nbytes(&m->S,nm); if(q>0) eb+=q;
@@ -193,8 +199,9 @@ static void tiers_emit(Model *m){
 #ifdef COLI_CUDA
     vram=m->gpu_expert_count; vram_gb=m->gpu_expert_bytes/1e9;
 #elif defined(COLI_VULKAN)
-    vram=g_vk_reg_n+g_vk_reg_n2;
-    int64_t bytes=0;
+    int vk_tier_n=vk_tier_resident_count(m);       /* the shared tier's residents, then dev2's */
+    vram=vk_tier_n+g_vk_reg_n2;
+    int64_t bytes=(int64_t)vk_tier_n*(int64_t)g_vkt.exp_bytes;
     if(g_vk_reg) for(int i=0;i<g_vk_reg_NL;i++) for(int e=0;e<g_vk_reg_E;e++){
         ColiVkTensor **slot=vk_reg_at(i,e);
         for(int j=0;j<3;j++) if(slot[j]) bytes+=(int64_t)coli_vk_tensor_bytes(slot[j]);
@@ -234,7 +241,7 @@ static void emap_emit(Model *m){
         for(int e=0;e<cols;e++){
             int tier=0;
 #ifdef COLI_VULKAN
-            if(vk_reg_served(i,e)) tier=2;
+            if(vkt_resident(i,e) || vk_reg_served(i,e)) tier=2;   /* on a Vulkan device */
 #endif
             ESlot *P=m->pin[i];
             for(int z=0;!tier&&z<m->npin[i];z++) if(P[z].eid==e){

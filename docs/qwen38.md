@@ -4,8 +4,9 @@
 [`Qwen/Qwen3.8-Flash-Next-FP8`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8)
 directly from the official safetensors shards. No conversion or second copy of
 the weights is required. The engine supports text and images through the
-checkpoint's vision encoder; see **Vision** below. It does not use the optional
-MTP layer.
+checkpoint's vision encoder; see **Vision** below. The checkpoint's MTP layer
+drafts tokens for speculative decoding, on by default (`Q38_MTP=0` turns it off); see
+[Speculative decoding with the MTP head](#speculative-decoding-with-the-mtp-head).
 
 The upstream language model has 125B ordinary parameters with 6B activated,
 plus a 51B hashed n-gram embedding. It has 48 layers arranged as 12 repetitions
@@ -118,7 +119,7 @@ prompt:
 | | |
 |---|---|
 | resident weights (native BF16) | 9.2 GiB, fixed |
-| routed-expert cache | 4.7 MiB per slot per layer over 48 layers: cap 16 is 3.5 GiB, cap 32 is 7.0 GiB, cap 64 is 14.1 GiB |
+| routed-expert cache | 4.7 MiB per slot per layer over 48 layers: cap 16 is 3.5 GiB, cap 32 is 7.0 GiB, cap 64 is 14.1 GiB (2.6 MiB with the [int4-g64 sidecar](#routed-experts-as-int4-g64): cap 64 is 7.9 GiB) |
 | FP8 scale bank | 28 MiB, fixed; every expert's block scales stay resident so a miss is one FP8 read |
 | context state | 54 KiB per token, allocated for the whole `Q38_MAXT` ceiling before `READY`: 432 MiB at the 8,192 default |
 | recurrent and PLE state, prefix snapshot, cached logits | 226 MiB, fixed |
@@ -157,6 +158,315 @@ when nothing is cached and roughly half that at the cap-32 hit rate, so at this
 cache size the engine spends about two thirds of every request waiting on the
 disk, and the planner labels cold expert reads as the expected bottleneck.
 
+## A long context
+
+The model reads up to 262,144 positions (`--ctx 262144`). Twelve of its 48 layers keep K and V
+(two heads of 256) and an index key of 128 per position: about 55 KB a position in float32, 14.5 GB
+at the full context. What a long context costs is what it takes from the experts' caches, so:
+
+- **K and V in float16** (`Q38_KV`, on when serving): the CUDA chain's mirrors take 2 bytes a value
+  instead of 4. At 262,144 positions the chain keeps 12.86 GiB instead of 19.23, and the card's
+  expert budget goes from 0.65 GB to 7.03 GB.
+- **The RAM plan prices one prompt segment, not the context**: serve reads a prompt in segments
+  (8,192 rows with a dense chain, 2,048 without; `COLI_PROMPT_SEGMENT`), so a forward's row buffers
+  hold one segment. The plan used to price the whole context as one forward: 38 GB at 262,144
+  positions, and no expert cache in RAM (`coli serve` started at 10 slots a layer).
+
+Qwen3.8-Flash-Next IQ2_XS on an RTX PRO 4000 (24 GB) with 62 GB of RAM, served on the CUDA chain, a
+452-token prompt and 128 tokens:
+
+| context | prompt | decode | RAM cache, slots a layer | card's expert budget |
+|---|---:|---:|---:|---:|
+| 65,536, before | 188 tok/s | 48.4 tok/s | 512 | 12.5 GB |
+| 131,072, before | 132 tok/s | 43.6 tok/s | 337 | 8.6 GB |
+| 262,144, before | 15.6 tok/s | 9.6 tok/s | 10 | 0.65 GB |
+| 262,144, the plan's segment | 84 tok/s | 21.9 tok/s | 490 | 0.65 GB |
+| 262,144, and K/V in float16 | 149 tok/s | 45.7 tok/s | 490 | 7.03 GB |
+| 65,536, 2.1.0 | 208 tok/s | 52.2 tok/s | 512 | 14.1 GB |
+| 131,072, 2.1.0 | 190 tok/s | 51.9 tok/s | 512 | 11.7 GB |
+| 262,144, 2.1.0 | 151 tok/s | 42.9 tok/s | 489 | 7.03 GB |
+
+The last three rows are v2.1.0 (`main` at 0a5504a1) measured again the same way, the better
+of two runs (`bench_serve.py`, a fresh 452-token prompt, then 128 streamed tokens; the
+request's HTTP included).
+
+## An agent's turns
+
+A model with recurrent layers continues only from a state it kept: the live state (where the last
+answer ended) or the prompt-end snapshot. A turn whose prompt leaves both earlier reads the whole
+conversation again. Hermes Agent (a 14,785-token prompt with its tools) did so at every turn, for two
+reasons, both answered in the engine:
+
+- **The answer comes back without its reasoning.** The model wrote `<think>` and a line break; the
+  next prompt renders that answer as `<think>`, two line breaks and `</think>`. The snapshot, taken
+  after `<think>`, missed by one token (14,809 of 14,810). It is now taken where the answer starts,
+  past `<|im_start|>assistant\n`, when only the answer's opening follows it.
+- **A short request between two turns** (Hermes asks for the conversation's title after the first)
+  took the only state there is. The conversation is now parked for it (`COLI_PARK`): its tokens,
+  its recurrent state and the K/V rows the request may write over, put back when the request ends.
+
+Qwen3.8-Flash-Next IQ2_XS on the CUDA chain, Hermes's second turn (14,810 tokens): 86 s before,
+4.9 s after (14,783 tokens reused, 27 read). `COLI_PREFIX_LOG=1` says, for a prompt that reuses
+nothing, how far it follows the live state and the snapshot and the text where it stops.
+
+The other engines that serve one conversation park it the same way (`park.h`): qwen36 (Qwen3.6,
+Flint, Muse Spark, Qwen3-Coder, LFM3), olmoe, colibri.c (GLM-5.2, Mistral-Large-4), deepseek_v4,
+deepseek_v41, kimi_k3, mimo and inkling. With the same agent's requests (its tools, a title request
+after the first turn), the second turn after the title: Qwen3.6-35B on the CPU 51.6 s before,
+3.3 s after; OLMoE-1B-7B on the CPU 39.9 s before, 6.5 s after, every answer identical to the same
+conversation without the title. OLMoE, attention alone, also resumes where a prompt leaves the
+held state (an answer sent back without its reasoning, a changed turn) instead of reading it all.
+
+## Routed experts as int4-g64
+
+Optional. Decode waits on routed experts: a miss is a disk read, and how many
+experts fit in the cache decides how often that happens.
+`tools/convert_qwen38_experts_int4.py` rewrites them as int4 with one f32 scale
+per 64 inputs into `<model>/experts-int4g64/`, next to the FP8 shards, which it
+only reads; qwen38 picks the directory up by itself.
+
+```sh
+python3 c/tools/convert_qwen38_experts_int4.py --model ~/Models/Qwen3.8-Flash-Next-FP8 --plan
+python3 c/tools/convert_qwen38_experts_int4.py --model ~/Models/Qwen3.8-Flash-Next-FP8
+```
+
+| | FP8 (release) | int4-g64 sidecar |
+|---|---|---|
+| bytes per expert | 4,915,200 (scales in the 28 MiB resident bank) | 2,764,800: codes 2,457,600, scales 307,200 |
+| experts per GiB of cache | 218 | 388 |
+| cap per GiB of cache, 48 layers | 4.5 | 8.1 |
+| all routed experts on disk | 120.8 GB | 68.0 GB, in addition to the FP8 shards |
+
+The values are the ones the engine computes from the release (e4m3 byte times
+its block's `weight_scale_inv`), quantized as `tools/convert_qwen36.py --ebits 4
+--gs 64` does: per 64 inputs, scale = absmax / 7, code = round half to even of
+w / scale, clamped to [-8, 7]. The codes are stored as v+8 in `expert_ffn.h`'s
+planar layout and multiplied by its f32 kernel, activations staying f32 as on
+the FP8 path. On synthetic Gaussian weights at the release's geometry the
+relative L2 error is 10.9% per matrix; the converter prints the mean and the
+worst per layer on the real weights, where it measured 11-12% per layer and
+17.5% for the worst single matrix.
+
+Measured on the release (Ryzen 7 PRO 8700GE, 16 threads, 61 GiB, NVMe; the
+same binary with `Q38_EXPERT_INT4=0` and `=1`, `OMP_NUM_THREADS=8`). Perplexity,
+teacher-forced over four 504-token chunks at cap 96:
+
+| chunk | FP8 | int4-g64 |
+|---|---|---|
+| 0 | 4.23 | 4.20 |
+| 1 | 11.64 | 11.74 |
+| 2 | 10.94 | 11.04 |
+| 3 | 16.04 | 16.97 |
+
+On average +0.017 nats per token. Three chunks move by under 1%; chunk 3 moves
+by 5.8%. Greedy answers stay on the same reasoning with a few words changed.
+
+Decode, 100 tokens of one prompt, the model's files dropped from the page cache
+before every run, load average under 2.5:
+
+| cap | FP8 | int4-g64 |
+|---|---|---|
+| 32 | 1.91 tok/s, 14.4 GB RSS, 45.8% hits | 2.87 tok/s, 11.6 GB, 46.4% |
+| 64 | 2.27 tok/s, 21.4 GB, 59.1% | 3.25 tok/s, 15.2 GB, 59.4% |
+| 96 | 2.56 tok/s, 28.5 GB, 68.0% | 3.55 tok/s, 19.2 GB, 67.8% |
+| 170 | | 3.99 tok/s, 28.0 GB, 79.2% |
+
+At the same cap int4 is 1.4-1.5x faster, because each miss reads 56% of the
+bytes and the routed-expert compute halves (55 to 31 ms per decode forward at
+cap 96). At the same RAM, FP8 at cap 96 (28.5 GB) against int4 at cap 170
+(28.0 GB), it is 1.56x faster: the RAM that held 96 experts per layer holds 170.
+
+The converter streams: one expert per worker in flight, so peak RAM is a few
+hundred MB for the writer (records queue there while the disk catches up; at
+most one layer, 1.4 GB) plus 0.11 GB per worker, whatever the model size. On a 12-thread laptop
+CPU (i7-1355U) and a synthetic snapshot of the release's expert geometry a
+layer is 22 s of compute with 12 workers; the disk sets the rest. It is
+resumable: a layer is written to a `.part` file and renamed when whole, and
+`index.json` lists the layers done, so a second run continues where the first
+stopped. A run against a snapshot whose `config.json` or expert shards changed
+is refused.
+
+Layout: one safetensors file per layer (`layer-NNN.safetensors`) and
+`index.json`. Every expert is one record, so a miss is one read:
+
+```
+gate codes U8 [I, H/2] | up codes U8 [I, H/2] | down codes U8 [H, I/2] |
+gate scales F32 [I, H/64] | up scales F32 [I, H/64] | down scales F32 [H, I/64]
+```
+
+named like the release's tensors (`...experts.E.gate_proj.weight`, and the same
+name plus `.qs` for its scales). The data region of each file starts on a
+4096-byte boundary; at the release's geometry a record is 675 pages, so every
+record is page aligned. `index.json` carries the format name and version, the
+geometry, the group size, the record size, the layers done and `complete`;
+the engine refuses a sidecar whose index or files disagree with `config.json`
+and skips (with a line on stderr) one still being written.
+
+`Q38_EXPERT_INT4=0` keeps the snapshot's FP8 experts; `=1` refuses to start
+without a complete sidecar. Every expert path reads the sidecar: the single LRU
+load, the parallel batch reads (`Q38_EXPERT_PARALLEL_READS`), the prefetch, the
+prefill batch and `COLI_MAP_EXPERTS=1`. The startup line names the expert
+representation, the bytes of one expert, what the cache costs full at the
+given cap, and how many experts per layer the RAM available at that moment
+would hold. `coli plan` and `--auto-tier` size the cache cap with the
+sidecar's records and plan no VRAM for them: the CUDA expert tier streams FP8
+experts only, and with int4 experts it stays off, trunk included. A build with
+Vulkan too (`VK=1 CUDA=1`, what `coli setup` builds on an NVIDIA card) hands the
+sidecar's experts (int4-g64 and the low-bit ones) to the Vulkan tier and its dense
+chain, on the same card, when `COLI_CUDA=1` and `COLI_VULKAN` is unset;
+`COLI_VULKAN=0` keeps them on the CPU. On an RTX PRO 4000 (24 GB) with 62 GB of
+RAM, the release with the int4-g64 sidecar (64 GiB of experts), a 215-token prompt
+and 128 tokens, runs 2 to 4: 100-102 / 23.7-24.9 tok/s (prefill / decode) with the
+handoff, as with `COLI_VULKAN=1`; 9-18 / 6.3-6.8 with the experts on the CPU; and
+7.2-7.4 / 3.1-3.2 with the snapshot's FP8 experts on the CUDA tier
+(`Q38_EXPERT_INT4=0`), where 3098 of them fit the card and the rest of the
+176 GB comes from the disk. The Segment and Edge adapters keep the snapshot's
+experts.
+
+`make -C c qwen38-tiny-int4-check` converts the FP8 tiny fixture (experts
+scaled by 3, so that they move the logits beyond the oracle's tolerance) and
+gates on the int4 matmul against a dequantized f32 reference, the converter's
+round trip against the FP8 source, the engine reproducing the float32
+reference of the dequantized sidecar through every expert path with the last
+logits identical to the bit across them, and the CUDA tier declining the int4
+experts on the fake backend.
+
+## Speculative decoding with the MTP head
+
+On by default from 1.13.0 when the checkpoint has it (`Q38_MTP=0` turns it off, and
+`Q38_MTP=1` refuses a checkpoint without it). The release carries one more decoder layer under
+`mtp.*` that reads the model's four hyper-connection streams at a position
+together with the next token's embedding and predicts the token after it.
+The engine loads it and decodes speculatively: after each token the head
+drafts the next one, and one forward over both (S=2) returns the logits of the
+first as a plain decode step would while it checks the draft. When the token
+picked from those logits equals the draft, the second row's logits answer the
+next step with no forward; when it does not, the second row is undone: the
+Gated DeltaNet and PLE state go back to a copy taken after the first row (a
+pointer swap, nothing is recomputed) and the attention, indexer and prefix
+records go back one position.
+
+Every row of the verify forward is computed as a decode step computes it, so
+the output is the output of plain decoding, token for token and logit for logit,
+greedy or sampled (a sampled token that happens to equal the draft is an
+accepted draft). The CUDA expert tier is the exception it already is: its float
+order follows which experts are resident when.
+
+The head is built only from blocks the engine already runs for its own layers:
+the decoder layer is a QSA attention layer with its indexer, gated residuals,
+the MoE with its shared expert, the head's own hyper-connection mixer and the
+shared `lm_head`. The tensors do not say how `pre_fc_norm_hidden` (4 x 2560
+wide) groups the model's four streams before `fc_hidden` maps each of them, so
+`Q38_MTP_WIRING` selects it (`c/qwen38_core.h`, "the MTP head"): `b`, the
+default, normalizes each stream on its own, the way the hyper-connection norms
+do; `a` normalizes the four streams as one vector and stays as a diagnostic.
+The output does not depend on the choice. The acceptance rate does, and on the
+release it picks `b`.
+
+Every run prints its line, and a served request prints one per turn, on stderr:
+
+```
+[qwen38 MTP] run: 1.94 tokens/forward (51 forwards per 99 tokens) | acceptance 94.1% (48/51 drafts) | wiring b
+```
+
+Tokens are the decode tokens after the prompt and forwards the forwards that
+produced them. The head's routed experts stay the snapshot's FP8 with or
+without the int4-g64 sidecar (one layer read for at most two rows per draft is
+a small share of the expert traffic); their cache holds `Q38_MTP_CAP` experts,
+by default the cap every layer has, or every expert of the head on an integrated GPU with
+32 or more compute units, the expert tier and the dense chain on
+([vulkan.md](vulkan.md#the-chain-on-a-radeon-780m)). The startup line prints what it costs.
+
+### Measured
+
+On the release with the int4-g64 sidecar (Ryzen 7 PRO 8700GE, 16 threads,
+61 GiB, NVMe; model files dropped from the page cache before every run, load
+average under 2, `OMP_NUM_THREADS=8`, 100 new tokens). Greedy output was
+byte-identical to MTP off in every run.
+
+| prompt, cap | wiring | acceptance | tokens/forward | tok/s |
+|---|---|---|---|---|
+| raw text prompt, cap 96 | MTP off | | | 3.57 |
+| | a | 92.2% (47/51) | 1.90 | 3.97 |
+| | **b** | **96.0% (48/50)** | **1.94** | **4.01 (+12%)** |
+| | c | 78.2% (43/55) | 1.77 | 3.76 |
+| chat-template coding prompt, cap 170 | MTP off | | | 4.15 |
+| | a | 84.9% (45/53) | 1.83 | 4.58 |
+| | **b** | **94.1% (48/51)** | **1.94** | **4.74 (+14%)** |
+| | c | 63.3% (38/60) | 1.62 | 4.21 |
+
+`c` was a third reading (the normalized streams averaged into one vector
+before a single `fc_hidden`). It came last on both prompts and was removed.
+The means of the head's norm weights are -0.76 (embedding), -0.33 (hidden) and
+3.79 (mixer), consistent with norms that scale by 1 + w like every other norm
+of the model.
+
+Nearly two tokens per forward gives only 12-14% more tokens per second here
+because the forward is not where the time goes. A verify forward feeds two
+tokens, and each token routes its own 10 experts per layer. Consecutive tokens
+share on average 3.2 of their 10 experts per layer (measured on a
+`ROUTE_TRACE` of 199 tokens), so a pair needs almost twice the experts of a
+single token. At cap 170 the cache missed 74 experts per token whether the
+tokens went one at a time or in accepted pairs. The disk reads for experts are
+therefore the same with MTP and without it. What MTP saves is the dense part
+of the forward, read once per forward instead of once per token: the trunk
+matrices, DeltaNet, attention and `lm_head`. Where the routed experts fit in
+RAM, those disk reads go away and the dense part is a larger share of each
+token, so the gain should be larger. That case has not been measured.
+
+### Deeper verifies and prompt lookup
+
+`Q38_MTP_DRAFTS` lets the head draft up to 3 tokens per verify: each draft past the
+first reads the head's own streams from the row before, with the draft just proposed.
+The verify copies the DeltaNet and PLE state after each of its rows but the last, so a
+rejection after row `k` restores the state after row `k`. `Q38_MTP_DRAFTS=0` lets a gate
+pick the depth per verify from the measured acceptance by position and the measured
+cost of a verify by its rows. Prompt lookup (on by default) adds drafts (up to 5, from
+the context's n-grams), and a verify carries whichever proposal is worth more. The
+output stays that of plain decoding. Measured on the release with the int4-g64 sidecar: 4.94 tok/s at two drafts against 4.71 at one and 4.12 without MTP on the CPU (2.75 tokens per forward), 4.55 against 4.39 and 3.91 with the Vulkan tier and chain on a Radeon 780M, so two drafts is the default (one on an integrated GPU with 32 or more compute units, the tier and the chain on). The details, the settings and the
+tests are in [speculative.md](speculative.md).
+
+`make -C c qwen38-tiny-mtp-check` adds a head with random weights under the
+release's names to the three tiny fixtures and gates on the head's draft
+logits against a float32 reference of both wirings
+(`c/tools/qwen38_mtp_ref.py`), and on byte-identical output with drafts and
+without them across caps, prefill batching, both trunk formats, BF16, FP8 and
+int4 experts, text and serve, with drafts all rejected, all accepted and
+alternating.
+
+## GPU: Vulkan expert tier
+
+In a `VK=1` build, `COLI_VULKAN=1` puts the trunk on the Vulkan device (as before)
+and the routed experts of the model's layers on the shared Vulkan expert tier
+(`c/vk_tier.c`, [vulkan.md](vulkan.md#the-routed-expert-tier-vk_tierc)): a cache of
+experts in device memory, filled at startup from `.coli_usage` (`coli setup` ships a
+starting one) and adapted while
+you chat, whose experts the device computes while the CPU computes the rest of the
+step. It takes every expert form this engine reads: the int4-g64 sidecar's planar
+records (as int4 groups of 64 on the device), the release's FP8 with the 128x128
+block-scale bank (fmt 12, the block scale repeated over its rows), BF16. Decode and
+prefill both use it; an MTP verify's two rows take the device's per-row route, so
+they get a decode step's bits; the MTP head's own layer goes on the tier as an extra
+layer on a discrete GPU (`COLI_VK_TIER_MTP`, [vulkan.md](vulkan.md#the-mtp-heads-layer-on-the-tier-coli_vk_tier_mtp)). Every
+expert's output joins its row in rank order, device or not.
+
+```bash
+make -C c qwen38 VK=1
+COLI_VULKAN=1 SNAP=<checkpoint> ./c/qwen38 96 8 prompt.txt    # experts; the trunk too on a discrete GPU
+COLI_VULKAN=1 COLI_VK_DENSE=0 ...                              # experts only, trunk on the CPU
+COLI_VULKAN=1 COLI_VK_DENSE=1 ...                              # trunk on the device on any GPU
+```
+
+On a GPU that shares the CPU's RAM (an integrated GPU, Lavapipe) the trunk stays on
+the CPU by default while the tier is on; the startup line says where it went and why.
+
+On an integrated Radeon 780M the tier with the trunk on the CPU decoded at
+3.80 tok/s against the CPU's 3.51 and reached the first token of a 512-token prompt
+in 38.3 s against 43.9 s; the trunk on the device cost more there than the tier
+gained. The budget, the knobs (`COLI_VK_TIER*`), those measurements and what they
+leave out are in [vulkan.md](vulkan.md#the-routed-expert-tier-vk_tierc). With
+`COLI_CUDA=1` as well, the CUDA tier below wins.
+
 ## GPU: CUDA VRAM expert tier
 
 With `CUDA=1` the engine links the same expert tier as Qwen3.6
@@ -189,18 +499,28 @@ native FP8 routed experts (`Q38_NATIVE_FP8=1`, the default) with every layer's
 block-scale bank resident; a checkpoint that falls back to the per-matrix
 scale loader stays on the CPU and says so.
 
+**The card's allowance.** `CUDA_EXPERT_GB` is what each card gives the tier,
+the dense trunk and, with the CUDA chain, the chain's own buffers, in GB. Unset,
+`0` or `auto`, it is the card's free memory less 1 GB; the start prints both,
+`[qtier] dev 0: <free> GB free, allowance <GB> GB`. `coli chat --vram <GB>`
+passes its number as `CUDA_EXPERT_GB`; `--gpu` alone leaves it to the engine.
+`COLI_VK_TIER_GB` is the Vulkan tier's and does not size this one.
+
 **What a VRAM budget buys.** The routing of Qwen3.8-Flash-Next has no hot set
 that carries over between prompts: the 1,400 experts (5.8 % of the model) that
 were hottest in one 100-token run covered a different prompt's routes at
 chance level (4.7 %; two cards, 2,800 experts: 9.3 % against 11.5 % chance;
 rank correlation of expert frequency per layer between the two runs -0.2). A
 heat file from an earlier run therefore does not help, and the engine does no
-warmstart. Inside a run the locality is strong -- on the route trace of a
-315-token prompt plus 100 generated tokens, an LRU of 32 slots per layer
-serves 55 % of decode routes, 64 serve 79 %, 128 serve 90 % -- so the tier
-earns its VRAM by promotion at touch time: with the RAM LRU at cap 128, one
-8 GB card served 45 % of decode routes from VRAM on the real checkpoint, two
-cards 59 %.
+warmstart of the fp8 tier. (A GGUF is another case: the tier holds its experts
+as the file has them and fills the card at the start, the history's most used
+first, `.coli_usage`; `COLI_CUDA_TIER_WARM=0` turns that off. See
+[gguf.md](gguf.md#what-the-engines-do-with-the-blocks).) Inside a run the
+locality is strong -- on the route trace of a 315-token prompt plus 100
+generated tokens, an LRU of 32 slots per layer serves 55 % of decode routes,
+64 serve 79 %, 128 serve 90 % -- so the tier earns its VRAM by promotion at
+touch time: with the RAM LRU at cap 128, one 8 GB card served 45 % of decode
+routes from VRAM on the real checkpoint, two cards 59 %.
 
 **VRAM per expert.** The tier charges what `cudaMalloc` takes, not the payload:
 an allocation above 1 MiB rounds up to a multiple of 2 MiB, so each 1.56 MiB
@@ -311,6 +631,135 @@ error, only wrong tokens, worse the more experts were resident. The dense
 path has its own buffers now ([qwen36-cuda-tier.md](qwen36-cuda-tier.md));
 qwen36 never called the dense path inside that window.
 
+### The DeltaNet layer on the card (`Q38_DN_GPU=1`)
+
+With the trunk in VRAM a DeltaNet layer still crosses the bus four times per
+decode token: the `dnqkv` and `dnz` results come down, the convolution, the
+recurrence and the gated norm run on the CPU, and the normed rows go back up
+for `dnout`. On qwen36 those round trips were 8 of 39 ms per token
+([qwen36-cuda-tier.md](qwen36-cuda-tier.md#the-deltanet-layer-on-the-card-q36_dn_gpu1));
+Qwen3.8 has 36 such layers of 48 value heads. `Q38_DN_GPU=1` keeps the layer on
+the card: for every DeltaNet layer whose `dnqkv`, `dnz` and `dnout` the placer
+put on one device, the conv ring, the recurrent state (48 x 128 x 128 f32, 3 MB
+per layer) and the conv/norm weights go there too, and a decode token runs the
+layer end to end in one device chain -- x up, the two in_proj GEMVs, causal
+conv + SiLU, per value head the L2 norms, the decay, the delta rule, the gated
+RMSNorm with `sigmoid(z)` (Qwen3.8's gate; Qwen3.6 uses `silu(z)`), the
+out_proj GEMV, out down. The two gates (`a`, `b`) stay on the CPU and travel as
+kernel parameters.
+
+The host arrays remain the state's owner: a prompt (`S > 1`), an MTP verify
+(`snap_after`: the CPU path takes the snapshot after its first row), a
+`--pin` snapshot and the prompt cache pull the state down first; a reset, a pin
+restore and a rejected draft's rollback invalidate the card's copy. A failing
+GPU step turns the layer off and the CPU continues from what the card holds.
+Opt-in; `tests/test_qwen38_dn_gpu.c` (`make qwen38-dn-gpu-check`) runs the tiny
+fixture's oracle with the layers on the fake card.
+
+### The chain on the card (`COLI_CUDA_CHAIN=1`)
+
+The CUDA twin of the Vulkan chain (`qwen38_chain.h`), on the same ops table qwen36's
+chain uses (`cuda_chain.h`, docs/qwen36-cuda-tier.md "The dense chain on the card"), in
+`qwen38_cuda_chain.h`. Per layer, one frame on the card: the previous block's MoE output
+joining the four hyper-connection streams (routed + sigmoid(gate) x shared, then
+hyper += inject x block), the gated residual's read (per-stream norm, the low-rank
+down/up pair, the stream mix, the inject weights), the gated attention with QSA (the
+index keys into the device cache, each completed block's pooled key computed once on
+the device, the indexer's top-k selection per query row, the attention over the listed
+positions with the output gate) or the Gated DeltaNet (the convolution with its ring,
+the recurrence with its state, the sigmoid-gated norm), the write-back, the second gated
+residual, the router logits; waited for. The host routes and runs the routed experts
+through the fp8 tier (`q38_moe_ex` routed only) and hands the sum up; the shared expert
+runs on the card meanwhile (frame A2). At the PLE layer the n-gram rows come from the
+host (disk reads, the history replayed as `q38_ple` does), the key and value projections,
+the gate and the dilated convolution with its ring run on the device. The last frame
+runs the final mixer and lm_head; the streams come back when the MTP head needs them.
+
+The matrices: the tier's int8 copies where the placer put them (`Q38_TRUNK_GPU`,
+`COLI_PLACE`); every other matrix of a layer, the final mixer and lm_head the chain
+uploads itself, the trunk's int8 rows when the CPU holds them (the same bits), else the
+BF16/F32 rows as f32. So the chain runs whatever the placement did; what it adds in VRAM
+are the small matrices the placer never sees (the gated residuals' low-rank pairs, the
+DeltaNet b/a rows, the PLE projections) and the state (the DeltaNet state and conv
+rings, the PLE ring, the K/V, index-key and pooled-key mirrors).
+
+State ownership as in qwen36's chain: the host's K/V and index caches canonical behind
+a watermark, the pooled block keys behind one of their own; the DeltaNet state, conv
+rings and PLE ring on the device while the chain runs, brought back before the host
+reads them (a pinned snapshot, the prefix cache) and pushed up after the host writes
+them (a reset as zeros, a restored snapshot as an upload). An MTP or prompt-lookup verify
+runs row-wise (the warp GEMV computes each row on its own: a decode step's bits) and
+copies the DeltaNet state, the conv rings and the PLE ring after each of its rows into a
+device slot; a rejected draft swaps slot r in (`q38cc_rollback`) as the CPU swaps its
+own. A lost device zeroes the state, rebuilds it on the CPU from the prefix record (the
+PLE history replayed) and runs there from then on. `Q38_DN_GPU`'s per-layer step is not
+set up beside the chain; `KV_SLOTS` > 1 keeps the chain off.
+
+**Measured** (RTX 3070 alone, the FP8 checkpoint, the trunk's 553 matrices as int8 in VRAM, the
+tier at 16 % hits behind it, the usual 49-token prompt, 100 new tokens, two runs each):
+
+| | TTFT | tok/s, the run | ms per token | resident-mm per forward | DeltaNet | QSA | PLE | lm_head | shared |
+|---|---|---|---|---|---|---|---|---|---|
+| `Q38_DN_GPU=1` (the per-layer step, #1870) | 19.0-19.1 s | 1.22 / 1.26 | 612-632 | 172 ms | 161 | 23 | 12 | 26 | 23 |
+| `COLI_CUDA_CHAIN=1` | 17.7-17.9 s | 1.41 / 1.43 | 526-535 | 74 ms (the chain waits 68) | in the chain | in the chain | in the chain | 10 | 0.4 |
+
+The chain takes the whole dense part at once (-15 % per token, 1.2 s off the first token);
+the token stays the experts': about 1 s of expert reads per forward (24,576 FP8 experts
+behind a 4 GiB trunk on 8 GB) and 290 ms of routed experts, which no chain touches. The
+chain uploads 174 MiB itself (the matrices the placer never sees) and holds 381 MiB of
+state (the K/V, index-key and pooled-key mirrors, the DeltaNet state, the PLE ring).
+
+**A long prompt layer by layer** (`q38cc_forward_lm`, `COLI_CUDA_CHAIN_LAYERWISE`). A
+prompt chunk copies every layer's host pool experts into VRAM before that layer's experts
+run (`q38cc_stage_from`), so a 4K-token prompt in 2048-row chunks copied each layer's pool
+experts twice. Where every layer runs its experts in the frame and a chunk stages them, a
+prompt of more chunks than one now runs layer by layer: each layer's chunks in order, its
+copy waited for at its first chunk and the next staged layer's started after its last (on
+the copy stream, beside the next frames), every row's streams kept on the device between
+layers. Each layer's chunk is a frame waited for, so the K/V rows and the routes' books
+come down a chunk at a time as before, and a chunk runs the same ops on the same rows.
+RTX PRO 4000 (PCIe gen 4 x8), Qwen3.8-Flash-Next IQ2_XS with the host pool, prompts of
+1K / 4K tokens: 321.3 / 309.0 -> 321.2 / 343.0 tok/s, the decode the same (43.6 tok/s).
+The Vulkan chain does the same (`q38c_forward_lm`, `COLI_VK_CHAIN_LAYERWISE`). A prompt longer
+than a segment (8192 rows) runs a segment at a time, so the rows' streams on the device stay
+bounded. The chain's VRAM reserve (`q38cc_reserve_bytes`) counts a segment's streams, a
+verify's copies of the DeltaNet state and the routed experts' scratch of a prompt chunk: with
+2048-row chunks it kept 3.21 GiB where the chain used 3.34-3.51, a verify's copies were refused
+and every verify ran on the CPU (decode 43.6 -> 20.4 tok/s in such a run).
+
+**A short prompt's pooled experts on the CPU** (`q38cc_pc_take`, `COLI_CUDA_CHAIN_POOL_CPU_ROWS`).
+The staging copies every pooled expert of a layer, routed or not: Qwen3.8-Flash-Next IQ2_XS
+on an RTX PRO 4000 copied 18 GB a chunk (1.8 s at 11.8 GB/s) for a prompt of 76 tokens as for
+one of 2048, while a 452-token prompt routes about 1,600 distinct pooled experts, 5.5 rows each.
+A prompt of one chunk now takes the decode table where that pays: the card computes its
+residents, the CPU the pooled slots grouped by expert (`q38cc_pool_groups`: an expert's rows
+through its matrices together, eight output rows at a time where the type has the kernel, the
+decode step's bits per slot), as a decode step's hybrid layers do. Where it pays is measured: at
+the pool's start a 256 MiB copy times the bus and the grouped kernel on four layers' pooled
+experts times a slot; a prompt goes to the CPU where its estimate (rows x top-k x layers x the
+pool's share of the routes x the time a slot) is at most 1.5 times the copy of what a chunk
+stages; after the first prompt the books' share and the prompts' own time a slot replace the
+history's and the probe's. The probe reads high (53 us a slot against 35-44 in the prompts) and
+the history's share too (12.6 % against about 5 %), so a session's first prompt of 700 to 2048
+rows stages as before and the next ones take the CPU. Measured, the served bench (the second of
+two fresh prompts):
+
+| prompt tokens | 76 | 452 | 1012 | 1512 | 1912 | 2612 (staged both) |
+|---|---|---|---|---|---|---|
+| staged, tok/s | 42.7 | 213-215 | 357-367 | 412 | 418 | 392 |
+| on the CPU, tok/s | 206-211 | 480-491 | 500-518 | 437 | 433-439 | 404 |
+
+The index keys of an attention layer now come down in one copy over the rows: a copy a row
+filled the driver's queue on a 1912-row prompt while a hybrid layer held the stream, and the
+host blocked there before serving it; the staged 2612-token prompt gains 3 % from it.
+
+`tests/test_qwen38_cuda_chain.c` (`make qwen38-cuda-chain-check`, in CI beside
+`qwen38-dn-gpu-check`) runs the tiny FP8 fixture's oracle on the fake tier with the
+chain's ops from the fake's host-side table: the chain on (8/8 tokens, cosine 0.99998), a
+frame that fails mid-run (the state rebuilt on the CPU, the run finishing there within
+the limits), and the per-matrix path. `tests/test_cuda_chain.cu` checks the QSA and PLE
+kernels on a real card against their references.
+
 ### The trunk on the CPU: int8 rows
 
 Without a GPU the same trunk is the decode's floor: 8 GiB of BF16 read on
@@ -319,7 +768,7 @@ trunk on the CPU as **int8 rows with one scale per row** (the format the
 tier uploads, so GPU or not the rows are the same bytes), releases the BF16
 copy once the rows exist, and multiplies with the integer kernels of
 `idot.h`: the activation is quantized to int8 once per row and meets the
-weights with maddubs / vpdpbusd (AVX2 / AVX-512 VNNI) or NEON dot products.
+weights with maddubs (SSSE3 / AVX2), vpdpbusd (AVX-512 VNNI) or NEON dot products.
 Decode and prefill take this path. Every matrix of at least
 `Q38_TRUNK_MIN_KB` (default 1 MiB) is in; the small ones stay BF16 because
 they cost nothing either way. `Q38_TRUNK_CPU_INT8=0` keeps the BF16 rows and
@@ -414,6 +863,10 @@ eviction. The gate checks both greedy token IDs and the final upstream logit
 vector, and runs both native-BF16 and expanded-FP32 resident modes at cache
 capacities one and four. CI repeats the capacity-one path under ASan and UBSan
 and verifies that a config/tensor shape disagreement is refused.
+`make -C c qwen38-tiny-int4-check` gates the optional int4-g64 experts (see
+[Routed experts as int4-g64](#routed-experts-as-int4-g64)), and
+`make -C c qwen38-tiny-mtp-check` the MTP head (see
+[Speculative decoding with the MTP head](#speculative-decoding-with-the-mtp-head)).
 
 ## Supported checkpoint layouts
 

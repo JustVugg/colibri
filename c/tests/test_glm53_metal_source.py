@@ -40,7 +40,8 @@ class Glm53MetalSourceTests(unittest.TestCase):
         start = MAKE.index("glm53$(EXE):")
         end = MAKE.index("kimi_k3$(EXE):", start)
         rule = MAKE[start:end]
-        self.assertIn("backend_metal.h", rule)
+        # backend_metal.h is no longer listed by hand: glm53.c includes it
+        # under COLI_METAL, so a METAL=1 build's glm53.d names it (#1741).
         self.assertIn("$(METAL_OBJ)", rule)
 
 

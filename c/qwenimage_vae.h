@@ -66,11 +66,13 @@ typedef struct {
     int cin, cout, k;       /* k = 1 or 3 */
     float *w, *b;           /* w: [cout][kx][ky][cin] */
     QiMat m;
+    void *vk; int bo;       /* qwenimage_vae_vk.h: the device's copy of w, b's place in its parameters */
 } QivConv;
 
 typedef struct {
     int cin, cout;
     float *g1, *g2;         /* RMS norm gammas, [cin] and [cout] */
+    int g1o, g2o;           /* their places in the device's parameters (qwenimage_vae_vk.h) */
     QivConv c1, c2, sc;     /* sc only when cin != cout */
 } QivRes;
 
@@ -92,6 +94,7 @@ typedef struct QiVae {
     int nblk;
     QivBlock blk[QIV_MAX_BLOCKS];
     float *g_out;
+    int g_outo;                 /* its place in the device's parameters */
     QivConv conv_out;
     size_t wbytes;              /* resident weight bytes */
     void (*progress)(void *ud, int step, int steps);
@@ -146,8 +149,8 @@ static float *qiv_read(shards *S, const char *name, int64_t numel, char *err, si
     return p;
 }
 
-static int qiv_load_conv(shards *S, QiVae *v, const char *pfx, int cin, int cout, int k,
-                         QivConv *c, char *err, size_t errn){
+static int qiv_load_conv(shards *S, size_t *wbytes, const char *pfx, int cin, int cout, int k, QivConv *c, char *err,
+                         size_t errn) {
     char nm[256];
     c->cin = cin; c->cout = cout; c->k = k;
     snprintf(nm, sizeof nm, "%s.weight", pfx);
@@ -168,27 +171,27 @@ static int qiv_load_conv(shards *S, QiVae *v, const char *pfx, int cin, int cout
     float *b = qiv_read(S, nm, cout, err, errn);
     if (!b) { free(w); return -1; }
     c->w = w; c->b = b;
-    c->m = (QiMat){ QI_F32, cout, cin * k * k, w, NULL };
-    v->wbytes += ((size_t)cout * cin * k * k + cout) * sizeof(float);
+    c->m = (QiMat){.fmt = QI_F32, .N = cout, .K = cin * k * k, .w = w};
+    *wbytes += ((size_t)cout * cin * k * k + cout) * sizeof(float);
     return 0;
 }
 
-static int qiv_load_res(shards *S, QiVae *v, const char *pfx, int cin, int cout, QivRes *r,
-                        char *err, size_t errn){
+static int qiv_load_res(shards *S, size_t *wbytes, const char *pfx, int cin, int cout, QivRes *r, char *err,
+                        size_t errn) {
     char nm[256];
     r->cin = cin; r->cout = cout;
     snprintf(nm, sizeof nm, "%s.norm1.gamma", pfx);
     if (!(r->g1 = qiv_read(S, nm, cin, err, errn))) return -1;
     snprintf(nm, sizeof nm, "%s.norm2.gamma", pfx);
     if (!(r->g2 = qiv_read(S, nm, cout, err, errn))) return -1;
-    v->wbytes += (size_t)(cin + cout) * sizeof(float);
+    *wbytes += (size_t)(cin + cout) * sizeof(float);
     snprintf(nm, sizeof nm, "%s.conv1", pfx);
-    if (qiv_load_conv(S, v, nm, cin, cout, 3, &r->c1, err, errn)) return -1;
+    if (qiv_load_conv(S, wbytes, nm, cin, cout, 3, &r->c1, err, errn)) return -1;
     snprintf(nm, sizeof nm, "%s.conv2", pfx);
-    if (qiv_load_conv(S, v, nm, cout, cout, 3, &r->c2, err, errn)) return -1;
+    if (qiv_load_conv(S, wbytes, nm, cout, cout, 3, &r->c2, err, errn)) return -1;
     if (cin != cout) {
         snprintf(nm, sizeof nm, "%s.conv_shortcut", pfx);
-        if (qiv_load_conv(S, v, nm, cin, cout, 1, &r->sc, err, errn)) return -1;
+        if (qiv_load_conv(S, wbytes, nm, cin, cout, 1, &r->sc, err, errn)) return -1;
     }
     return 0;
 }
@@ -299,15 +302,19 @@ static QiVae *qiv_load(const char *vae_dir){
     st_init(&S, vae_dir); have_s = 1;
     if (S.n == 0) { snprintf(err, sizeof err, "no safetensors in %.400s", vae_dir); goto fail; }
 
-    if (qiv_load_conv(&S, v, "post_quant_conv", v->z_dim, v->z_dim, 1, &v->pqc, err, sizeof err)) goto fail;
-    if (qiv_load_conv(&S, v, "decoder.conv_in", v->z_dim, dims[0], 3, &v->conv_in, err, sizeof err)) goto fail;
+    if (qiv_load_conv(&S, &v->wbytes, "post_quant_conv", v->z_dim, v->z_dim, 1, &v->pqc, err, sizeof err)) goto fail;
+    if (qiv_load_conv(&S, &v->wbytes, "decoder.conv_in", v->z_dim, dims[0], 3, &v->conv_in, err, sizeof err)) goto fail;
     for (int i = 0; i < 2; i++) {
         char p[128]; snprintf(p, sizeof p, "decoder.mid_block.resnets.%d", i);
-        if (qiv_load_res(&S, v, p, dims[0], dims[0], &v->mid[i], err, sizeof err)) goto fail;
+        if (qiv_load_res(&S, &v->wbytes, p, dims[0], dims[0], &v->mid[i], err, sizeof err)) goto fail;
     }
     if (!(v->attn_g = qiv_read(&S, "decoder.mid_block.attentions.0.norm.gamma", dims[0], err, sizeof err))) goto fail;
-    if (qiv_load_conv(&S, v, "decoder.mid_block.attentions.0.to_qkv", dims[0], 3 * dims[0], 1, &v->qkv, err, sizeof err)) goto fail;
-    if (qiv_load_conv(&S, v, "decoder.mid_block.attentions.0.proj", dims[0], dims[0], 1, &v->proj, err, sizeof err)) goto fail;
+    if (qiv_load_conv(&S, &v->wbytes, "decoder.mid_block.attentions.0.to_qkv", dims[0], 3 * dims[0], 1, &v->qkv, err,
+                      sizeof err))
+        goto fail;
+    if (qiv_load_conv(&S, &v->wbytes, "decoder.mid_block.attentions.0.proj", dims[0], dims[0], 1, &v->proj, err,
+                      sizeof err))
+        goto fail;
     v->scale = 1;
     v->nblk = nm;
     for (int i = 0; i < nm; i++) {
@@ -318,11 +325,11 @@ static QiVae *qiv_load(const char *vae_dir){
         b->nres = nrb + 1;
         for (int j = 0; j < b->nres; j++) {
             char p[128]; snprintf(p, sizeof p, "decoder.up_blocks.%d.resnets.%d", i, j);
-            if (qiv_load_res(&S, v, p, j ? b->cout : b->cin, b->cout, &b->res[j], err, sizeof err)) goto fail;
+            if (qiv_load_res(&S, &v->wbytes, p, j ? b->cout : b->cin, b->cout, &b->res[j], err, sizeof err)) goto fail;
         }
         if (b->up) {
             char p[128]; snprintf(p, sizeof p, "decoder.up_blocks.%d.upsampler.resample.1", i);
-            if (qiv_load_conv(&S, v, p, b->cout, b->cout, 3, &b->upc, err, sizeof err)) goto fail;
+            if (qiv_load_conv(&S, &v->wbytes, p, b->cout, b->cout, 3, &b->upc, err, sizeof err)) goto fail;
             if (!(b->dup = qiv_dup_table(b->cin, b->cout, b->ft))) {
                 snprintf(err, sizeof err, "up block %d: DupUp3D %d->%d channels is not a whole repeat", i, b->cin, b->cout);
                 goto fail;
@@ -331,7 +338,8 @@ static QiVae *qiv_load(const char *vae_dir){
         }
     }
     if (!(v->g_out = qiv_read(&S, "decoder.norm_out.gamma", dims[nm], err, sizeof err))) goto fail;
-    if (qiv_load_conv(&S, v, "decoder.conv_out", dims[nm], v->out_ch, 3, &v->conv_out, err, sizeof err)) goto fail;
+    if (qiv_load_conv(&S, &v->wbytes, "decoder.conv_out", dims[nm], v->out_ch, 3, &v->conv_out, err, sizeof err))
+        goto fail;
     v->wbytes += (size_t)(dims[0] + dims[nm]) * sizeof(float);
     if (v->out_ch != 4 && v->out_ch != 3) { snprintf(err, sizeof err, "out_channels=%d, expected 3 or 4", v->out_ch); goto fail; }
     st_destroy(&S);
@@ -488,8 +496,8 @@ static float *qiv_resnet(const QivRes *r, float *x, int H, int W, int keep){
 /* Mid-block attention, in place: x += proj(softmax(q k^T / sqrt(C)) v), one head,
  * every pixel attends to every pixel. Queries go in blocks so the score matrix
  * stays small at 2048x2048 (16384 tokens). */
-static int qiv_attention(const QiVae *v, float *x, int N){
-    const int C = v->qkv.cin;
+static int qiv_attention_core(const float *gamma, const QivConv *qkv_layer, const QivConv *proj, float *x, int N) {
+    const int C = qkv_layer->cin;
     const float scale = (float)sqrt((double)C);
     float *xn = qiv_alloc((size_t)N * C), *qkv = qiv_alloc((size_t)N * 3 * C);
     float *k = qiv_alloc((size_t)N * C), *vt = qiv_alloc((size_t)N * C);
@@ -498,14 +506,15 @@ static int qiv_attention(const QiVae *v, float *x, int N){
     int rc = -1;
     if (!xn || !qkv || !k || !vt || !S) goto out;
     #pragma omp parallel for schedule(static)
-    for (int p = 0; p < N; p++) qiv_norm_px(xn + (size_t)p * C, x + (size_t)p * C, C, v->attn_g, scale, 0);
-    qi_gemm(qkv, xn, N, &v->qkv.m, v->qkv.b);
-    #pragma omp parallel for schedule(static)
+    for (int p = 0; p < N; p++) qiv_norm_px(xn + (size_t)p * C, x + (size_t)p * C, C, gamma, scale, 0);
+    qi_gemm(qkv, xn, N, &qkv_layer->m, qkv_layer->b);
+#pragma omp parallel for schedule(static)
     for (int p = 0; p < N; p++) {
         memcpy(k + (size_t)p * C, qkv + (size_t)p * 3 * C + C, sizeof(float) * C);
         for (int c = 0; c < C; c++) vt[(size_t)c * N + p] = qkv[(size_t)p * 3 * C + 2 * C + c];
     }
-    const QiMat Km = { QI_F32, N, C, k, NULL }, Vm = { QI_F32, C, N, vt, NULL };
+    const QiMat Km = {.fmt = QI_F32, .N = N, .K = C, .w = k};
+    const QiMat Vm = {.fmt = QI_F32, .N = C, .K = N, .w = vt};
     const float isd = 1.f / scale;
     for (int i0 = 0; i0 < N; i0 += qb) {
         int m = N - i0 < qb ? N - i0 : qb;
@@ -521,13 +530,33 @@ static int qiv_attention(const QiVae *v, float *x, int N){
         }
         qi_gemm(xn + (size_t)i0 * C, S, m, &Vm, NULL);        /* xn is free again: reuse for O */
     }
-    qi_gemm(qkv, xn, N, &v->proj.m, v->proj.b);             /* qkv reused for proj(O) [N][C] */
-    #pragma omp parallel for schedule(static)
+    qi_gemm(qkv, xn, N, &proj->m, proj->b); /* qkv reused for proj(O) [N][C] */
+#pragma omp parallel for schedule(static)
     for (size_t i = 0; i < (size_t)N * C; i++) x[i] += qkv[i];
     rc = 0;
 out:
     free(xn); free(qkv); free(k); free(vt); free(S);
     return rc;
+}
+
+static int qiv_attention(const QiVae *v, float *x, int N) {
+    return qiv_attention_core(v->attn_g, &v->qkv, &v->proj, x, N);
+}
+
+/* conv_out's [HW][OC] to the picture: torch.clamp(-1, 1), then postprocess
+ * ((x*0.5 + 0.5).clamp(0, 1), *255 in float32, numpy round (half to even), uint8;
+ * x*0.5 is exact, so an FMA here rounds exactly like torch's two ops). */
+static void qiv_post(const float *o, size_t HW, int OC, uint8_t *rgba, float *out_f){
+    #pragma omp parallel for schedule(static)
+    for (size_t p = 0; p < HW; p++)
+        for (int c = 0; c < 4; c++) {
+            float f = c < OC ? o[p * OC + c] : 1.f;
+            f = f < -1.f ? -1.f : f > 1.f ? 1.f : f;
+            if (c < OC && out_f) out_f[(size_t)c * HW + p] = f;
+            float u = f * 0.5f + 0.5f;
+            u = u < 0.f ? 0.f : u > 1.f ? 1.f : u;
+            if (rgba) rgba[p * 4 + c] = (uint8_t)nearbyintf(u * 255.f);
+        }
 }
 
 /* z: normalized latents [h][w][z_dim] (the packed DiT output, token y*w + x).
@@ -600,19 +629,7 @@ static int qiv_decode(QiVae *v, const float *z, int h, int w, uint8_t *rgba, flo
         QivEpi ep; memset(&ep, 0, sizeof ep); ep.rel_x = 1;
         if (!o || qiv_conv3(&v->conv_out, x, H, W, v->g_out, 0, o, &ep)) { free(o); goto fail; }
         free(x); x = NULL;
-        #pragma omp parallel for schedule(static)
-        for (size_t p = 0; p < HW; p++)
-            for (int c = 0; c < 4; c++) {
-                float f = c < OC ? o[p * OC + c] : 1.f;
-                /* torch.clamp(-1, 1), then postprocess: (x*0.5 + 0.5).clamp(0, 1),
-                 * *255 in float32, numpy round (half to even), uint8. x*0.5 is
-                 * exact, so an FMA here rounds exactly like torch's two ops. */
-                f = f < -1.f ? -1.f : f > 1.f ? 1.f : f;
-                if (c < OC && out_f) out_f[(size_t)c * HW + p] = f;
-                float u = f * 0.5f + 0.5f;
-                u = u < 0.f ? 0.f : u > 1.f ? 1.f : u;
-                if (rgba) rgba[p * 4 + c] = (uint8_t)nearbyintf(u * 255.f);
-            }
+        qiv_post(o, HW, OC, rgba, out_f);
         free(o);
     }
     QIV_STAGE("conv_out");

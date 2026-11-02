@@ -1,0 +1,21 @@
+# qwen36 CUDA chain, the head's logits written on the card then copied to the host: the head's kernel alone on two rented machines (2026-10-27)
+# testa.cu (beside this file, sha256 8b9978950aab3ca105d767cf77f8c9c81f64930144cc4a4e8571740b84231b5b): the lm_head as the chain runs it, gemv_i8_rows<1,1> of
+# backend_cuda.cu at c1c06ac6 (a warp a row, x in shared memory) on 248320 x 2048 int8 rows in the device's memory; y into the device's
+# memory, then into page-locked host memory mapped into the device (ch->outd, as the chain did before this change), then into the device's
+# memory followed by a 1 MB copy to the host (what this change does). Best of 20, CUDA events. Built and run on each machine with:
+#   nvcc -O3 -arch=sm_120 testa.cu -o testa && ./testa
+# Both machines are Blackwell (sm_120) with the same driver and are listed with the same PCIe generation and lanes and about the same bandwidth.
+# The hosts' listings on Vast.ai say PCIe gen 5, 8 lanes, 26.9 GB/s (PRO 4000) and gen 5, 8 lanes, 27.3 GB/s (5090); nvidia-smi gives only the card's maximum (gen 5 x16) and the link in use was not recorded on either.
+# The output of each run, in full, with the sha256 of its log:
+
+===== RTX PRO 4000: Intel(R) Core(TM) Ultra 9 285K (24 CPUs, 36 MiB L3) + NVIDIA RTX PRO 4000 Blackwell (24467 MiB, sm_120) on a Pro WS W880-ACE SE board, 125 GiB; Ubuntu 24.04.1 LTS, Linux 6.8.0-146-generic x86_64, CUDA 12.8 (nvcc V12.8.93), driver 615.71.09, gcc (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0 (log sha256 4cd24b94ab4400c017b32f5c5f3c59649364d0d97eeadef5a30decff84b86565)
+y in the device's memory           0.829 ms  (614 GB/s of weights)
+y in mapped host memory (chain)    7.524 ms  (68 GB/s of weights)
+y in the device + 1 MB copy        0.879 ms  (578 GB/s of weights)
+err no error
+
+===== RTX 5090: AMD Ryzen 9 9900X 12-Core Processor (24 CPUs, 64 MiB L3) on a B850 AI TOP board, 125 GiB, driver 615.71.09, nvcc V12.8.93 (log sha256 9d9d16528cec77cbcd7439eac91f424950be1b221964b179df7f04a123ce80d0)
+y in the device's memory           0.304 ms  (1675 GB/s of weights)
+y in mapped host memory (chain)    0.311 ms  (1636 GB/s of weights)
+y in the device + 1 MB copy        0.343 ms  (1485 GB/s of weights)
+err no error

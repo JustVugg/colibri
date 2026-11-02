@@ -6,7 +6,8 @@ export interface ChatMessage {
   content: string
   /* Reasoning models stream their thinking on a separate delta field before
      the answer. Kept apart from `content` so it can be rendered as its own
-     block and excluded from what is sent back as conversation history. */
+     block, and sent back as reasoning_content only to a colibrì server
+     (StreamChatOptions.keepReasoning). */
   reasoning?: string
   /* Data URIs of the pictures attached to this turn. Kept on the message rather
      than on the draft, because the transcript is resent on every later turn and
@@ -72,6 +73,12 @@ export interface HealthResponse {
   /* Whether a message list ending on an assistant turn is continued rather than
      answered fresh (COLI_CONTINUE_ASSISTANT). Absent on older servers. */
   continue_assistant?: boolean
+  /* the server compacts a chat that outgrows the context when asked (context_compaction) */
+  context_compaction?: boolean
+  context_tokens?: number
+  /* the response ceiling a request is lowered to; without a ceiling of its own a
+     request gets this one: on colibrì the context the engine holds */
+  max_tokens?: number
 }
 
 export interface ProfileTurn {
@@ -97,11 +104,19 @@ export interface TokenUsage {
   total_tokens: number
 }
 
+/* The server ran the turn on a summary of the conversation's first messages, which
+   no longer fitted the model's context (context_compaction). */
+export interface Compaction {
+  summarized_messages: number
+  summary: string
+}
+
 export interface StreamChatResult {
   finishReason: string | null
   usage: TokenUsage | null
   requestId: string | null
   queueWaitMs: number | null
+  compaction: Compaction | null
 }
 
 export function endpoint(baseUrl: string, path: string) {
@@ -131,8 +146,10 @@ async function responseError(response: Response) {
 
 export interface ModelInfo {
   id: string
-  /* What a model does beyond chat. colibri marks an image model with
-     "image_generation": it answers /v1/images/generations and refuses chat. */
+  /* What a model does. colibri marks an image model with "image_generation"
+     (it answers /v1/images/generations and refuses chat), a language model
+     with "chat" and "systemone", and a decision model with "systemone" and
+     "decision" (it answers only POST /v1/systemone). */
   capabilities?: string[]
 }
 
@@ -166,15 +183,8 @@ export async function getProfile(baseUrl: string, apiKey = "", signal?: AbortSig
 }
 
 export function extractSSE(buffer: string) {
-  const frames = buffer.split(/\r?\n\r?\n/)
-  const rest = frames.pop() || ""
-  const data = frames.flatMap((frame) =>
-    frame
-      .split(/\r?\n/)
-      .filter((line) => line.startsWith("data:"))
-      .map((line) => line.slice(5).trimStart()),
-  )
-  return { data, rest }
+  const { events, rest } = extractSSEEvents(buffer)
+  return { data: events.map(event => event.data), rest }
 }
 
 export interface SSEEvent {
@@ -209,9 +219,18 @@ export interface StreamChatOptions {
   model: string
   messages: ChatMessage[]
   temperature: number
-  maxTokens: number
+  /* undefined: no max_completion_tokens at all, the server's own ceiling */
+  maxTokens?: number
   enableThinking: boolean
   cacheSlot?: number
+  /* ask the server to summarize a conversation that outgrows the context; only for a
+     colibrì server, since an OpenAI-compatible one may refuse a field it does not know */
+  compact?: boolean
+  /* send each past assistant turn's reasoning back (reasoning_content), colibrì only:
+     where the model's template keeps it (GLM) the prompt is then what the engine holds,
+     so it reuses that state instead of prefilling the turn again, and the model sees
+     what it thought (#382); a template that drops it drops it on the server */
+  keepReasoning?: boolean
   signal: AbortSignal
   onDelta: (text: string) => void
   onReasoning?: (text: string) => void
@@ -227,16 +246,22 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
       /* A turn with pictures goes out in the content-array form the API takes;
          a plain turn stays a string, so a text-only server sees exactly what it
          saw before this existed. */
-      messages: options.messages.map(({ role, content, images }) => images?.length
-        ? { role, content: [
-            ...(content ? [{ type: "text", text: content }] : []),
-            ...images.map(url => ({ type: "image_url", image_url: { url } })),
-          ] }
-        : { role, content }),
+      messages: options.messages.map(({ role, content, images, reasoning }) => ({
+        ...(images?.length
+          ? { role, content: [
+              ...(content ? [{ type: "text", text: content }] : []),
+              ...images.map(url => ({ type: "image_url", image_url: { url } })),
+            ] }
+          : { role, content }),
+        ...(options.keepReasoning && role === "assistant" && reasoning?.trim() ? { reasoning_content: reasoning } : {}),
+      })),
       temperature: options.temperature,
-      max_completion_tokens: options.maxTokens,
+      ...(options.maxTokens === undefined ? {} : { max_completion_tokens: options.maxTokens }),
       enable_thinking: options.enableThinking,
       ...(options.cacheSlot === undefined ? {} : { cache_slot: options.cacheSlot }),
+      /* A conversation longer than the context goes on, on a summary of its
+         first messages, instead of ending in "maximum context length". */
+      ...(options.compact ? { context_compaction: "auto" } : {}),
       stream: true,
       stream_options: { include_usage: true },
     }),
@@ -247,15 +272,19 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ""
+  let finished = false
   let finishReason: string | null = null
   let usage: TokenUsage | null = null
+  let compaction: Compaction | null = null
 
   const consume = (data: string) => {
-    if (data === "[DONE]") return
+    if (data === "[DONE]") { finished = true; return }
     const event = JSON.parse(data) as {
       choices?: Array<{ delta?: { content?: string; reasoning_content?: string }; finish_reason?: string | null }>
       usage?: TokenUsage | null
+      compaction?: Compaction
     }
+    if (event.compaction) compaction = event.compaction
     const choice = event.choices?.[0]
     const text = choice?.delta?.content
     if (text) options.onDelta(text)
@@ -265,14 +294,23 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
     if (event.usage) usage = event.usage
   }
 
-  while (true) {
-    const { value, done } = await reader.read()
-    buffer += decoder.decode(value, { stream: !done })
-    const parsed = extractSSE(buffer)
-    buffer = parsed.rest
-    parsed.data.forEach(consume)
-    if (done) break
+  try {
+    while (!finished) {
+      const { value, done } = await reader.read()
+      buffer += decoder.decode(value, { stream: !done })
+      const parsed = extractSSE(buffer)
+      buffer = parsed.rest
+      for (const data of parsed.data) {
+        consume(data)
+        if (finished) break
+      }
+      if (done) break
+    }
+  } catch (cause) {
+    reader.cancel().catch(() => undefined)
+    throw cause
   }
+  if (finished) reader.cancel().catch(() => undefined)
 
   const queueWaitHeader = response.headers.get("x-colibri-queue-wait-ms")
   const parsedQueueWait = queueWaitHeader === null ? null : Number(queueWaitHeader)
@@ -281,46 +319,71 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
     usage,
     requestId: response.headers.get("x-request-id"),
     queueWaitMs: parsedQueueWait !== null && Number.isFinite(parsedQueueWait) ? parsedQueueWait : null,
+    compaction,
   }
 }
 
-/* Modalita brio: il modello non genera, assegna una probabilita a ogni opzione
- * ammessa. Il ciclo (fotografia del prefisso condiviso, una lettura per
- * opzione, normalizzazione per lunghezza) sta nel gateway: qui si manda una
- * richiesta e si riceve una distribuzione. */
-export interface BrioChoice {
+/* System One mode: the model does not generate, it gives a probability to
+ * every allowed option. The loop (photographing the shared prefix, one read per
+ * option, the normalisation) lives in the gateway, behind POST /v1/systemone,
+ * the one decision API for language models and decision models alike: the
+ * page's question goes as one `choice` whose labels are the options, and the
+ * reply is drawn as bars. The entropy, normalised over the options, is
+ * computed here from the probabilities. */
+export interface DecisionChoice {
   option: string
   p: number
-  logprob: number
-  mean_logprob: number
-  tokens: number
 }
 
-export interface BrioResponse {
+export interface DecisionResponse {
   answer: string
   entropy: number
-  normalize: "mean" | "sum"
-  choices: BrioChoice[]
-  usage: { prompt_tokens: number; completion_tokens: number; read_tokens: number; total_tokens: number }
+  choices: DecisionChoice[]
+  /* input_tokens: the prompt read; output_tokens: the option tokens a language
+     model read (a decision model reads everything as input); nothing is generated */
+  usage: { input_tokens: number; output_tokens: number }
 }
 
-export async function askBrio(
+export async function askSystemOne(
   baseUrl: string,
   apiKey: string,
   model: string,
   state: string,
   question: string,
   options: string[],
+  pinState: boolean,
   signal?: AbortSignal,
-): Promise<BrioResponse> {
-  const response = await fetch(endpoint(baseUrl, "brio"), {
+): Promise<DecisionResponse> {
+  const response = await fetch(endpoint(baseUrl, "systemone"), {
     method: "POST",
     headers: headers(apiKey),
-    body: JSON.stringify({ model, state, question, options }),
+    body: JSON.stringify({
+      /* The page sends one question per request so each result can appear as it
+         arrives. A multi-question run asks the first request to photograph the
+         shared document; a one-question run preserves the server's heuristic. */
+      model, state, ...(pinState ? { pin_state: true } : {}),
+      questions: { q: { type: "choice", instructions: question, criteria: Object.fromEntries(options.map((o) => [o, null])) } },
+    }),
     signal,
   })
   if (!response.ok) throw new Error(await responseError(response))
-  return (await response.json()) as BrioResponse
+  const body = (await response.json()) as {
+    answers?: { q?: { choice?: string; probabilities?: Record<string, number> } }
+    usage?: { input_tokens?: number; output_tokens?: number }
+  }
+  const probabilities = body.answers?.q?.probabilities ?? {}
+  const choices = options
+    .map((option) => ({ option, p: probabilities[option] ?? 0 }))
+    .sort((a, b) => b.p - a.p)
+  const entropy = choices.length > 1
+    ? -choices.reduce((sum, c) => sum + (c.p > 0 ? c.p * Math.log(c.p) : 0), 0) / Math.log(choices.length)
+    : 0
+  return {
+    answer: body.answers?.q?.choice ?? choices[0]?.option ?? "",
+    entropy,
+    choices,
+    usage: { input_tokens: body.usage?.input_tokens ?? 0, output_tokens: body.usage?.output_tokens ?? 0 },
+  }
 }
 
 /* ---- text-to-image ----------------------------------------------------------

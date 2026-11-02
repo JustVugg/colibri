@@ -45,7 +45,9 @@ static const shape_case CASES[] = {
     {"[1]", "[null,1]", 0, 0, 0, 0, "data_offsets"},
     {"[1]", "[0.5,1]", 0, 0, 0, 0, "data_offsets"},
     {"[1]", "[-1,0]", 0, 0, 0, 0, "data_offsets"},
-    {"[1]", "[0,1e999]", 0, 0, 0, 0, "data_offsets"},
+    /* 1e999 is no finite number: the checked parser refuses the header itself,
+     * before any tensor is read (json.h), so the message names no tensor */
+    {"[1]", "[0,1e999]", 0, 0, 0, 0, "safetensors header is not a JSON object"},
     {"[1]", "[0,9223372036854775808]", 0, 0, 0, 0, "data_offsets"},
 };
 
@@ -154,7 +156,8 @@ int main(int argc, char **argv) {
             CHECK(error_bytes == 0);
         } else {
             CHECK(code == 1);
-            CHECK(strstr(error, "tensor 't'") != NULL);
+            if (strncmp(CASES[i].error_field, "safetensors header", 18))
+                CHECK(strstr(error, "tensor 't'") != NULL);
             CHECK(strstr(error, CASES[i].error_field) != NULL);
         }
     }

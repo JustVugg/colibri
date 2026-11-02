@@ -26,7 +26,7 @@ layout(std430, binding = 2) readonly buffer Sc { float scale[]; };
 layout(std430, binding = 3) writeonly buffer Y { float y[]; };
 
 layout(push_constant) uniform P {
-    int fmt;        // 1=int8, 2=int4, 4=grouped int4, 5=int3-g64
+    int fmt;        // 1=int8, 2=int4, 4=grouped int4, 5=int3-g64, 7=MXFP4, 10=f32, 11=bf16, 12=fp8-e4m3 grouped, 13=int8 grouped, 14=f16
     int S, I, O;
     int rowWords;   // uint32 words per weight row
     int gs;         // fmt=4 group size (multiple of 8; host gates otherwise)
@@ -54,6 +54,17 @@ float mx4(uint word, int lane) {
     const float lut[8] = float[8](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
     float v = lut[n & 7u];
     return (n & 8u) != 0u ? -v : v;
+}
+
+// fmt=12 fp8 e4m3 (OCP E4M3-FN, the CPU's E4M3_LUT): sign, 4-bit exponent with bias 7,
+// 3-bit mantissa, subnormals at exponent 0, NaN only at 0x7F/0xFF. Decoded arithmetically:
+// building the float from its bits would make subnormals that a GPU may flush to zero.
+float e4m3(uint word, int lane) {
+    uint b = (word >> (uint(lane) * 8u)) & 0xffu;
+    if ((b & 0x7fu) == 0x7fu) return uintBitsToFloat(0x7fc00000u);
+    uint e = (b >> 3) & 0xfu, m = b & 7u;
+    float v = e == 0u ? float(m) * 0.001953125 : ldexp(1.0 + float(m) * 0.125, int(e) - 7);
+    return (b & 0x80u) != 0u ? -v : v;
 }
 
 void main() {
@@ -84,6 +95,40 @@ void main() {
             } else for (int wi = lane; wi < words; wi += sgsize) {
                 uint pk = w[rowBase + uint(wi)]; int i0 = wi * 4;
                 for (int k = 0; k < 4; k++) { int i = i0 + k; if (i < p.I) sum += x[xoff + i] * i8(pk, k); }
+            }
+        } else if (p.fmt == 10) { // f32 weights, one per word: no dequant, no scale
+            for (int i = lane; i < p.I; i += sgsize)
+                sum += (staged ? xsh[i] : x[xoff + i]) * uintBitsToFloat(w[rowBase + uint(i)]);
+        } else if (p.fmt == 11) { // bf16 weights, two per word, LOW half = even column
+            int words = (p.I + 1) / 2;
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i0 = wi * 2;
+                sum += (staged ? xsh[i0] : x[xoff + i0]) * uintBitsToFloat((pk & 0xffffu) << 16);
+                if (i0 + 1 < p.I)
+                    sum += (staged ? xsh[i0 + 1] : x[xoff + i0 + 1]) * uintBitsToFloat(pk & 0xffff0000u);
+            }
+        } else if (p.fmt == 14) { // f16 weights, two per word, LOW half = even column
+            int words = (p.I + 1) / 2;
+            for (int wi = lane; wi < words; wi += sgsize) {
+                vec2 h = unpackHalf2x16(w[rowBase + uint(wi)]); int i0 = wi * 2;
+                sum += (staged ? xsh[i0] : x[xoff + i0]) * h.x;
+                if (i0 + 1 < p.I) sum += (staged ? xsh[i0 + 1] : x[xoff + i0 + 1]) * h.y;
+            }
+        } else if (p.fmt == 12 || p.fmt == 13) { // fp8 e4m3 / int8, 4 per word, one f32
+            // scale per gs inputs. gs % 4 == 0 (host-gated): a word never straddles a group.
+            int words = (p.I + 3) / 4, ng = (p.I + p.gs - 1) / p.gs;
+            uint sb = uint(o) * uint(ng);
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i0 = wi * 4;
+                float a = 0.0;
+                if (p.fmt == 12) {
+                    for (int k = 0; k < 4; k++) { int i = i0 + k;
+                        if (i < p.I) a += (staged ? xsh[i] : x[xoff + i]) * e4m3(pk, k); }
+                } else {
+                    for (int k = 0; k < 4; k++) { int i = i0 + k;
+                        if (i < p.I) a += (staged ? xsh[i] : x[xoff + i]) * i8(pk, k); }
+                }
+                sum += a * scale[sb + uint(i0 / p.gs)];
             }
         } else if (p.fmt == 5) { // int3-g64: lanes stride the 16-value LOW-PLANE words;
             // all 16 values of one low word share a group, so its scale multiplies the
@@ -135,6 +180,7 @@ void main() {
             }
         }
         float tot = subgroupAdd(sum);
-        if (lane == 0) y[s * p.O + o] = (p.fmt == 5 || p.fmt == 4 || p.fmt == 7) ? tot : tot * scale[o];
+        if (lane == 0) y[s * p.O + o] = (p.fmt == 5 || p.fmt == 4 || p.fmt == 7 || p.fmt == 10 || p.fmt == 11 || p.fmt == 12 || p.fmt == 13 || p.fmt == 14)
+                                        ? tot : tot * scale[o];
     }
 }

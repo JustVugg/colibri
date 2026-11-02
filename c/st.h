@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include "json.h"
 #include "compat.h"
+#include "load_fail.h"
 
 /* tetto sulla dimensione dell'header safetensors: gli header reali sono piccoli
  * (KB..pochi MB). Un file crafted che dichiara un hlen enorme causerebbe una
@@ -101,7 +102,7 @@ static int st_dtype_code(const char *s) {
      * st_read_raw after validating the packed geometry). Same rule as the fp8
      * codes above: a new number, read raw, refused by the float readers. */
     if (!strcmp(s, "I32") || !strcmp(s, "U32")) return 7;
-    fprintf(stderr, "unsupported dtype: %s\n", s); exit(1);
+    coli_load_fail(COLI_LOAD_FAIL_UNSUPPORTED, "unsupported dtype: %s", s);
 }
 
 /* Byte per elemento. UNICO posto che lo sa: prima la formula era ripetuta in tre
@@ -260,14 +261,68 @@ static void f16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
 }
 #endif
 
+/* ---- a shard's second descriptor: the reads that run together ----
+ * A shard is opened once and every thread preads that descriptor. On Windows a
+ * descriptor from open() is a synchronous handle, and the I/O manager serves
+ * one read at a time through it, whatever the thread count: the reads of an
+ * OpenMP team on one shard went to the drive in single file. So a shard may
+ * carry a second descriptor, opened for overlapped I/O (compat_open_overlapped;
+ * there is none elsewhere, where a positional pread already overlaps).
+ *
+ * The reader that finds the shard free takes it and reads through the first
+ * descriptor, exactly as before; a reader that finds it taken reads through the
+ * second. A lone reader therefore never leaves the path it always had -- an
+ * overlapped read is completed by another thread and costs a reader that is
+ * alone a wake-up it does not need -- and the readers of a team overlap.
+ *
+ * Indexed by fd, lock-free and static like the mappings further down, and for
+ * the same reason (st.h is also built without -pthread). A pair is set when
+ * its shard is opened and cleared when st.h closes it. */
+#define ST_MAX_PAIRED_FD 4096
+static int g_st_shard_ofd[ST_MAX_PAIRED_FD];             /* second descriptor + 1; 0 = none */
+static signed char g_st_shard_taken[ST_MAX_PAIRED_FD];
+
+/* Gives `fd` the second descriptor `ofd` (-1: none), closing the one it had. */
+static void st_shard_pair(int fd, int ofd) {
+    if (fd < 0 || fd >= ST_MAX_PAIRED_FD) { if (ofd >= 0) close(ofd); return; }
+    int old = __atomic_exchange_n(&g_st_shard_ofd[fd], ofd >= 0 ? ofd + 1 : 0, __ATOMIC_ACQ_REL) - 1;
+    if (old >= 0) close(old);
+}
+/* The descriptor this read goes through: `fd` itself if the shard was free
+ * (and is now taken), its second descriptor otherwise. */
+static int st_shard_enter(int fd) {
+    if (fd < 0 || fd >= ST_MAX_PAIRED_FD) return fd;
+    int ofd = __atomic_load_n(&g_st_shard_ofd[fd], __ATOMIC_ACQUIRE) - 1;
+    if (ofd < 0) return fd;
+    signed char unclaimed = 0;
+    return __atomic_compare_exchange_n(&g_st_shard_taken[fd], &unclaimed, (signed char)1,
+                                       0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) ? fd : ofd;
+}
+static void st_shard_leave(int fd, int via) {
+    if (via != fd || fd < 0 || fd >= ST_MAX_PAIRED_FD) return;
+    if (__atomic_load_n(&g_st_shard_ofd[fd], __ATOMIC_ACQUIRE))
+        __atomic_store_n(&g_st_shard_taken[fd], (signed char)0, __ATOMIC_RELEASE);
+}
+/* One pread of a shard, through whichever of its descriptors is this read's. */
+static ssize_t st_pread_once(int fd, void *buf, size_t n, int64_t off) {
+    int via = st_shard_enter(fd);
+    ssize_t r = pread(via, buf, n, (off_t)off);
+    int saved = errno;
+    st_shard_leave(fd, via);
+    errno = saved;
+    return r;
+}
+
 static int st_open_fd(shards *S, const char *path) {
     for (int i = 0; i < S->nfd; i++) if (!strcmp(S->paths[i], path)) return S->fds[i];
     int fd = open(path, COMPAT_O_RDONLY);
-    if (fd < 0) { perror(path); exit(1); }
+    if (fd < 0) coli_load_fail(coli_load_fail_kind_from_errno(errno), "%s: %s", path, strerror(errno));
     struct stat sb;
-    if (fstat(fd, &sb) != 0) { perror("fstat shard"); close(fd); exit(1); }
+    if (fstat(fd, &sb) != 0) { int saved = errno; close(fd);
+        coli_load_fail(coli_load_fail_kind_from_errno(saved), "fstat shard: %s", strerror(saved)); }
     S->paths[S->nfd] = strdup(path); S->fds[S->nfd] = fd;
     S->sizes[S->nfd] = (int64_t)sb.st_size;
+    st_shard_pair(fd, compat_open_overlapped(path));
 #ifdef O_DIRECT
     S->dfds[S->nfd] = open(path, COMPAT_O_RDONLY | O_DIRECT);   /* eager: lookup poi thread-safe */
 #elif defined(__APPLE__) || defined(_WIN32)
@@ -303,6 +358,23 @@ static int st_direct_fd_rep(shards *S, int fd, int rep) {
     int i = st_fidx(S, fd); return i < 0 ? -1 : S->mdfds[rep-1][i];
 }
 
+/* A file read without the kernel's readahead, on every drive that holds it (the primary and its
+ * mirrors registered so far). A GGUF keeps a layer's experts in three tensors, so an expert is
+ * three slices read apart through the page cache, and the readahead read past each one: on a
+ * two-NVMe md array with its 2 MiB readahead, Kimi K3 UD-IQ1_S read 17.3 GB a decoded token for
+ * 6.7 GB of experts (0.27 tok/s; 0.34 without it), GLM-5.2 UD-IQ1_S 6.2-6.6 GB for 3.6. A whole
+ * tensor's pread still reads its whole range, so loading the dense matrices does not change. */
+static void st_no_readahead(shards *S, int fd) {
+#if defined(POSIX_FADV_RANDOM) && !defined(_WIN32)
+    for (int r = 0; r <= S->nrep; r++) {
+        int f = st_fd_rep(S, fd, r);
+        if (f >= 0) posix_fadvise(f, 0, 0, POSIX_FADV_RANDOM);
+    }
+#else
+    (void)S; (void)fd;
+#endif
+}
+
 /* Registers <dir>/<basename> as read replica S->nrep+1 of every already-indexed
  * shard. A file is accepted ONLY if its size and safetensors header are
  * byte-identical to the primary: the data_offsets then match by construction,
@@ -313,7 +385,7 @@ static int st_direct_fd_rep(shards *S, int fd, int rep) {
  * .coli_kv keep deriving from the primary alone. */
 static void st_mirror_reset(shards *S) {           /* re-init: drop every replica */
     for (int r = 0; r < S->nrep; r++) for (int i = 0; i < S->nfd; i++) {
-        if (S->mfds[r][i] >= 0) close(S->mfds[r][i]);
+        if (S->mfds[r][i] >= 0) { st_shard_pair(S->mfds[r][i], -1); close(S->mfds[r][i]); }
         if (S->mdfds[r][i] >= 0) close(S->mdfds[r][i]);
     }
     memset(S->nmirror, 0, sizeof(S->nmirror));
@@ -353,6 +425,7 @@ static int st_mirror_add(shards *S, const char *dir) {
             close(mfd); continue;
         }
         S->mfds[r][i] = mfd;
+        st_shard_pair(mfd, compat_open_overlapped(mp));
 #ifdef O_DIRECT
         S->mdfds[r][i] = open(mp, COMPAT_O_RDONLY | O_DIRECT);
 #elif defined(__APPLE__) || defined(_WIN32)
@@ -386,17 +459,18 @@ static void st_pread_full(int fd, void *buf, int64_t n, int64_t off, const char 
     while (got < n) {
         int64_t want = n - got;
         if (want > (int64_t)ST_PREAD_CHUNK) want = ST_PREAD_CHUNK;
-        ssize_t r = pread(fd, p + got, (size_t)want, off + got);
+        ssize_t r = st_pread_once(fd, p + got, (size_t)want, off + got);
         if (r < 0) {
             if (errno == EINTR) continue;
-            fprintf(stderr, "%s: %s (off %lld, %lld/%lld bytes)\n", tag, strerror(errno),
-                    (long long)off, (long long)got, (long long)n);
-            exit(1);
+            int saved = errno;
+            coli_load_fail(coli_load_fail_kind_from_errno(saved),
+                           "%s: %s (off %lld, %lld/%lld bytes)", tag, strerror(saved),
+                           (long long)off, (long long)got, (long long)n);
         }
         if (r == 0) {
-            fprintf(stderr, "%s: short read at EOF (off %lld, %lld/%lld bytes) — truncated file?\n",
-                    tag, (long long)off, (long long)got, (long long)n);
-            exit(1);
+            coli_load_fail(COLI_LOAD_FAIL_FORMAT,
+                           "%s: short read at EOF (off %lld, %lld/%lld bytes) — truncated file?",
+                           tag, (long long)off, (long long)got, (long long)n);
         }
         got += r;
     }
@@ -454,7 +528,7 @@ static void st_fmt_stamp_ingest(shards *S, jval *root, const char *shard_path) {
         fprintf(stderr, "%s: __metadata__[\"colibri.fmt\"] is not a JSON string -- malformed stamp, refusing (untrusted container)\n",
                 shard_path); exit(1); }
     char *arena2 = NULL;
-    jval *inner = json_parse(stamp->str, &arena2);
+    jval *inner = json_parse_checked(stamp->str);
     if (!inner || inner->t != J_OBJ) {
         fprintf(stderr, "%s: __metadata__[\"colibri.fmt\"] does not parse as a JSON object -- malformed stamp, refusing (untrusted container)\n",
                 shard_path); exit(1); }
@@ -581,14 +655,14 @@ static void st_index_load(st_index *ix, const char *dir) {
     char *text = malloc((size_t)size + 1);
     if (!text || fread(text, 1, (size_t)size, f) != (size_t)size) { free(text); fclose(f); return; }
     text[size] = 0; fclose(f);
-    ix->root = json_parse(text, &ix->arena);
+    ix->root = memchr(text, 0, (size_t)size) ? NULL : json_parse_checked(text);
     free(text);
     jval *map = ix->root ? json_get(ix->root, "weight_map") : NULL;
     if (!map || map->t != J_OBJ) { json_free(ix->root); ix->root = NULL; free(ix->arena); ix->arena = NULL; return; }
     ix->map = map;
     ix->hcap = 1; while (ix->hcap < map->len * 2) ix->hcap <<= 1;
     ix->h = malloc((size_t)ix->hcap * sizeof(int));
-    if (!ix->h) { fprintf(stderr, "OOM indexing model.safetensors.index.json\n"); exit(1); }
+    if (!ix->h) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "OOM indexing model.safetensors.index.json");
     for (int i = 0; i < ix->hcap; i++) ix->h[i] = -1;
     for (int i = 0; i < map->len; i++) {
         uint64_t hh = st_hash(map->keys[i]) & (ix->hcap - 1);
@@ -620,7 +694,7 @@ static void st_index_free(st_index *ix) {
  * returns how many shards this dir contributed. */
 static void st_scan_dir(const char *dir, char files[][1024], int *nf, int *added) {
     DIR *d = opendir(dir); struct dirent *e;
-    if (!d) { perror(dir); exit(1); }
+    if (!d) coli_load_fail(coli_load_fail_kind_from_errno(errno), "%s: %s", dir, strerror(errno));
     int base_n = *nf;
     while ((e = readdir(d))) {
         const char *dot = strrchr(e->d_name, '.');
@@ -649,8 +723,14 @@ static void st_scan_dir(const char *dir, char files[][1024], int *nf, int *added
  * drive holds that shard, so concurrent expert loads parallelise across drives
  * and combined capacity is used. Scales to N drives. Metadata (config /
  * tokenizer / .coli_usage / .coli_kv) is read from snap_dir only. */
+#ifdef ST_GGUF
+static int st_init_gguf(shards *S, const char *snap_dir);   /* st_gguf.h: a gguf_import folder */
+#endif
 static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dirs) {
     memset(S, 0, sizeof(*S));
+#ifdef ST_GGUF
+    if (st_init_gguf(S, snap_dir)) return;
+#endif
     S->cap = 4096; S->t = calloc(S->cap, sizeof(st_tensor));
     /* Duplicate-tensor-name detector, indexed-shard scope.
      * st_find()/S->hidx (below) aren't built until every shard has been read, so a
@@ -713,17 +793,19 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
          * overflow (malloc(0) e poi hdr[hlen]=0 fuori limiti) o forzare una
          * malloc gigante. */
         if (fsz < 8 || hlen > (uint64_t)(fsz - 8) || hlen > (uint64_t)ST_MAX_HEADER) {
-            fprintf(stderr, "%s: bad safetensors header length %llu (file %lld bytes)\n",
-                    files[fi], (unsigned long long)hlen, (long long)fsz); exit(1); }
+            coli_load_fail(COLI_LOAD_FAIL_FORMAT, "%s: bad safetensors header length %llu (file %lld bytes)",
+                           files[fi], (unsigned long long)hlen, (long long)fsz); }
         char *hdr = malloc(hlen + 1);
-        if (!hdr) { perror("malloc safetensors header"); exit(1); }
+        if (!hdr) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "malloc safetensors header: %s", strerror(errno));
         st_pread_full(fd, hdr, (int64_t)hlen, 8, "pread hdr");
         hdr[hlen] = 0;
         int64_t data_start = 8 + (int64_t)hlen;
         char *arena = NULL;
-        jval *root = json_parse(hdr, &arena);
+        /* A partial object must not index weights or authorize an overlay.
+         * Header padding is JSON whitespace; embedded NUL is not padding. */
+        jval *root = memchr(hdr, 0, (size_t)hlen) ? NULL : json_parse_checked(hdr);
         if (!root || root->t != J_OBJ) {
-            fprintf(stderr, "%s: safetensors header is not a JSON object\n", files[fi]); exit(1); }
+            coli_load_fail(COLI_LOAD_FAIL_FORMAT, "%s: safetensors header is not a JSON object", files[fi]); }
         st_fmt_stamp_ingest(S, root, files[fi]);
         for (int i = 0; i < root->len; i++) {
             const char *name = root->keys[i];
@@ -888,7 +970,7 @@ static void st_destroy(shards *S) {
     if (!S) return;
     st_mirror_reset(S);
     for (int index = 0; index < S->nfd; index++) {
-        if (S->fds[index] >= 0) close(S->fds[index]);
+        if (S->fds[index] >= 0) { st_shard_pair(S->fds[index], -1); close(S->fds[index]); }
         if (S->dfds[index] >= 0 && S->dfds[index] != S->fds[index])
             close(S->dfds[index]);
         free(S->paths[index]);
@@ -1073,7 +1155,7 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
         fprintf(stderr, "%s: tensor '%s' shape/bytes mismatch (numel %lld, %lld bytes, dtype %d) — refusing (hostile or corrupt file)\n",
                 name, name, (long long)t->numel, (long long)t->nbytes, t->dtype); exit(1); }
     void *raw = malloc(t->nbytes);
-    if (!raw) { fprintf(stderr, "malloc %lld bytes for tensor %s failed\n", (long long)t->nbytes, name); exit(1); }
+    if (!raw) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "malloc %lld bytes for tensor %s failed", (long long)t->nbytes, name);
     st_pread_full(t->fd, raw, t->nbytes, t->off, "pread data");
     if (t->dtype == 2) {
         memcpy(out, raw, t->nbytes);
@@ -1158,7 +1240,7 @@ static int64_t st_read_scale_f32(shards *S, const char *name, float *out, int64_
         fprintf(stderr, "scale %s: F8_E8M0 numel %lld disagrees with %lld bytes\n",
                 name, (long long)t->numel, (long long)t->nbytes); exit(1); }
     uint8_t *raw = (uint8_t*)malloc((size_t)t->nbytes);
-    if (!raw) { fprintf(stderr, "malloc %lld bytes for scale %s failed\n", (long long)t->nbytes, name); exit(1); }
+    if (!raw) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "malloc %lld bytes for scale %s failed", (long long)t->nbytes, name);
     st_pread_full(t->fd, raw, t->nbytes, t->off, "pread ue8m0 scale");
     for (int64_t i = 0; i < t->numel; i++) out[i] = ue8m0_to_f32(raw[i]);
     free(raw);
@@ -1462,7 +1544,7 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
         fprintf(stderr, "slice %s byte arithmetic/destination is invalid — refusing\n", name); exit(1); }
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;
     void *raw = nb ? malloc((size_t)nb) : NULL;
-    if (nb && !raw) { fprintf(stderr, "malloc %lld bytes for slice %s failed\n", (long long)nb, name); exit(1); }
+    if (nb && !raw) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "malloc %lld bytes for slice %s failed", (long long)nb, name);
     if (nb) st_pread_full(t->fd, raw, nb, boff, "pread slice");   /* dev #331: chunked + EINTR + honest short-read */
     if (nb) {
         if (t->dtype == 2) memcpy(out, raw, (size_t)nb);
@@ -1472,5 +1554,9 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
     free(raw);
     if (drop && nb) posix_fadvise(t->fd, boff, nb, POSIX_FADV_DONTNEED);
 }
+
+#ifdef ST_GGUF
+#include "st_gguf.h"
+#endif
 
 #endif

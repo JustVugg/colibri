@@ -184,6 +184,34 @@ int main(void) {
     check(qt_place_of("lmhead", 0) == QT_PLACE_CPU && G.budget[0] == 64 * MiB, "no offers: nothing placed, full budget");
     qt_shutdown();
 
+    /* ---- 8. auto, two devices: a layer's dnout follows its dnproj ---- */
+    printf(" 8. auto, dnout follows dnproj\n");
+    fresh("", "0,1", 2, "0.0625");
+    qt_trunk_offer("lmhead", 0, 10 * MiB);          /* dev0: 54 left */
+    qt_trunk_offer("dnproj", 0, 20 * MiB);          /* most room -> dev1: 44 left */
+    qt_trunk_offer("dnout", 0, 2 * MiB);            /* greedy would say dev0 (54 > 44) */
+    qt_trunk_offer("dnout", 1, 2 * MiB);            /* layer 1 has no dnproj on a card: greedy */
+    check(start(8, 16, 4), "tier starts on two fake devices");
+    check(qt_place_of("dnproj", 0) == 1, "the projection went to the device with the most room");
+    check(qt_place_of("dnout", 0) == 1, "its out_proj followed it, so the whole layer can run on one card");
+    check(qt_place_of("dnout", 1) == 0, "an out_proj without a placed in_proj is still placed by room");
+    check(G.budget[1] == 64 * MiB - 22 * MiB && G.budget[0] == 64 * MiB - 12 * MiB, "both budgets charge what landed on them");
+    qt_shutdown();
+
+    /* ---- 9. experts=all keeps every card for the experts despite a reservation ---- */
+    printf(" 9. experts=all\n");
+    fresh("lmhead=0,dnproj=0", "0,1", 2, "0.0625");
+    qt_trunk_offer("lmhead", 0, 10 * MiB);
+    check(start(8, 16, 4), "tier starts with device 0 reserved for the trunk");
+    check(G.ndev == 1 && G.dev[0] == 1, "without experts=all the reserved card hands its experts to the other (#1361)");
+    qt_shutdown();
+    fresh("lmhead=0,dnproj=0,experts=all", "0,1", 2, "0.0625");
+    qt_trunk_offer("lmhead", 0, 10 * MiB);
+    check(start(8, 16, 4), "tier starts with experts=all");
+    check(G.ndev == 2, "experts=all: both cards keep their experts, the reserved one included");
+    check(qt_place_of("experts", 0) == QT_PLACE_ALL, "experts=all parses to the all marker");
+    qt_shutdown();
+
     if (fails) { printf("test_qwen36_tier_autoplace: %d failure(s)\n", fails); return 1; }
     printf("test_qwen36_tier_autoplace: ok\n");
     return 0;

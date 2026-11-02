@@ -55,12 +55,13 @@
 #include <string.h>
 #include <stdint.h>
 #include "compat.h"                    /* rename() -> MoveFileEx on Windows; see above */
+#include "own_file.h"                  /* the history may sit in a downloaded model dir */
 
 #define RT_FORMAT_VERSION 1
 #define RT_IKU1_MAGIC 0x31554B49u      /* "IKU1" — inkling.c's usage_save/pins_load */
 
 /* engines that write this format; the table exists so a mismatch names both sides */
-static const char *rt_engine_names[] = { "glm_moe_dsa", "inkling", "olmoe", "kimi_k3", "deepseek_v4", "qwen38", "glm53", NULL };
+static const char *rt_engine_names[] = { "glm_moe_dsa", "inkling", "olmoe", "kimi_k3", "deepseek_v4", "qwen38", "glm53", "qwen36", NULL };
 
 static uint32_t rt_hash(const char *s){        /* FNV-1a 32, stable across builds */
     uint32_t h = 2166136261u;
@@ -331,14 +332,16 @@ static void rt_decay(void){
     }
 }
 
+/* USAGE_SAVE=0 is a read-only run: the history is loaded but never written back (#1039).
+ * Answered here so every engine reads the switch the same way. */
+static int rt_save_enabled(void){
+    const char *sv = getenv("USAGE_SAVE");
+    return !(sv && atoi(sv)==0);
+}
+
 static int rt_save(const char *path, int quiet){
     if(!rt_c || !path || !*path) return 0;
-    /* USAGE_SAVE=0: read-only run — the history is loaded but never written back
-     * (#1039: benchmark loops must not skew the very profile they are measuring).
-     * Checked HERE so every engine honours the same switch with the same
-     * truthiness; a requested skip is a success, not a save failure. */
-    { const char *sv = getenv("USAGE_SAVE");
-      if(sv && atoi(sv)==0) return 1; }
+    if(!rt_save_enabled()) return 1;   /* a requested skip is a success, not a save failure */
     rt_decay();
     int64_t tot = 0, nz = 0;
     for(int i = 0; i <= rt_nl; i++){
@@ -360,7 +363,10 @@ static int rt_save(const char *path, int quiet){
         }
         return 0;
     }
-    FILE *f = fopen(tmp, "w");
+    /* Never through a link planted in the model dir. The temp name is ours, so whatever
+     * else sits there is removed (the link, never its target) and the open retried. */
+    FILE *f = coli_own_fopen(tmp, "w");
+    if(!f && (errno == ELOOP || errno == EINVAL) && remove(tmp) == 0) f = coli_own_fopen(tmp, "w");
     if(!f){ if(!quiet) perror(tmp); return 0; }
     /* An all-zero history stays a ZERO-BYTE file, the way it was before this header
      * existed. PIN=auto decides whether a history is usable by testing the file SIZE and
@@ -375,7 +381,11 @@ static int rt_save(const char *path, int quiet){
                 if(rt_c[i][e]) fprintf(f, "%d %d %u\n", i, e, rt_c[i][e]);
         }
     }
-    fclose(f);
+    /* Buffered writes may fail only during close (for example a full disk).
+     * Publish only a complete history, keeping the previous one on failure. */
+    int write_failed = ferror(f);
+    if(fclose(f) != 0) write_failed = 1;
+    if(write_failed){ remove(tmp); return 0; }
     if(rename(tmp, path) != 0) return 0;
     if(!quiet) fprintf(stderr, "[STATS] %lld selections across %lld distinct experts -> %s\n",
                        (long long)tot, (long long)nz, path);

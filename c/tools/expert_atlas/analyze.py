@@ -42,6 +42,8 @@ def main():
             if len(p) != 3:
                 continue
             l, e, n = int(p[0]), int(p[1]), int(p[2])
+            if l < 0:  # header record (route_trace.h), not an expert
+                continue
             run_counts[(cat, idx)][(l, e)] = n
             run_tot[(cat, idx)] += n
 

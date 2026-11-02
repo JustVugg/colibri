@@ -1,0 +1,283 @@
+#version 450
+// Cooperative-matrix twin of qmatmul_gemm.comp (VK_KHR_cooperative_matrix, 16x16x16
+// fp16 x fp16 -> fp32 per subgroup): the same y[s,o] = sum_i x[s,i] * dequant(W[o,i]),
+// for the formats whose decoded weights are fp16 values: 1, 2, 4, 5, 7 and 12, the
+// grouped ones with gs % BK == 0 (backend_vulkan.c routes the rest to the fp32 GEMM).
+// Nothing is rounded to fp16, and the result stays as close to fp32 as the fp32
+// GEMM's (the VK_TEST harness holds both to the same bound):
+//   - every decoded weight (int8, int4, int3, e2m1, e4m3) is exact in fp16, so the A
+//     operand carries no rounding; group and row scales stay fp32, outside the MMA;
+//   - each activation row arrives with a power of two rs[s] (written by the host after
+//     the S*I floats of x) that puts its largest |x| under 2^15; the scaled row is
+//     split into hi (its top 11 significant bits) and lo = x - hi, both exact in fp16
+//     but for lo's last bits, and the MMA runs on both (A*hi + A*lo);
+//   - every 16-input MMA product joins an fp32 accumulator with an fp32 add, times the
+//     group scale for the grouped formats.
+// A workgroup owns a BM-output x BN-row tile of y, each subgroup WM x WN of it in
+// 16 x 16 accumulators. Weights and activations are staged BK inputs at a time, the
+// next step's words fetched into registers before this step's MMAs.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(constant_id = 0) const int BM = 64;    // outputs per tile
+layout(constant_id = 1) const int BN = 64;    // activation rows per tile
+layout(constant_id = 2) const int WM = 32;    // outputs per subgroup, a multiple of 16
+layout(constant_id = 3) const int WN = 32;    // rows per subgroup, a multiple of 16
+layout(constant_id = 4) const int BK = 32;    // inputs per staged step, a multiple of 32
+layout(constant_id = 5) const int SG = 64;    // subgroup size the pipeline requires
+layout(local_size_x_id = 6) in;               // (BM/WM) * (BN/WN) * SG threads
+// Expert intermediates stay on the device. Compute their row scales here instead
+// of downloading them for the host to append scales to the activation buffer.
+layout(constant_id = 7) const int DEVICE_SCALE = 0;
+
+layout(std430, binding = 0) readonly buffer X  { float x[]; };   // x[S*I], then rs[S]
+// One view of the dynamic input binding, including under MoltenVK.
+layout(std430, binding = 1) readonly buffer W  { uint  w[]; };
+layout(std430, binding = 1) readonly buffer W2 { uvec2 w2[]; };
+layout(std430, binding = 2) readonly buffer Sc { float scale[]; };
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    int fmt;        // 1, 2, 4, 5, 7, 12
+    int S, I, O;
+    int rowWords;   // uint32 words per weight row
+    int gs;         // group size of fmt 4, 7 and 12 (a multiple of 32 here)
+} p;
+
+const int FM = WM / 16, FN = WN / 16;  // 16 x 16 accumulators per subgroup
+const int NW = (BM / WM) * (BN / WN);  // subgroups
+const int NT = NW * SG;
+const int WST = BK + 8;                // halves per staged row, 16 bytes of padding
+// floats per epilogue row. coopMatStore's stride must be a multiple of 16 bytes here
+// (VUID-RuntimeSpirv-OpCooperativeMatrixLoadKHR-08986: the lesser of 16 bytes and a
+// row's natural alignment, 64 bytes for 16 floats). The odd 17 it was broke that rule:
+// RADV took it, NVIDIA's driver returned garbage (black Qwen-Image pictures, #1908).
+// 20 (80 bytes) keeps the rows of a store off the same banks for 8 rows in a row.
+const int EST = 20;
+shared float16_t wsh[BM * WST];        // [o][i]: the MMA's A, row-major
+shared float16_t xhs[BN * WST];        // [s][i]: its B, column-major; hi part
+shared float16_t xls[BN * WST];        //                              lo part
+shared float ssh[BM];                  // the current group's scales
+shared float esh[NW * 16 * EST];       // per subgroup: one accumulator on its way to y
+shared uint xmag[DEVICE_SCALE != 0 ? NT : 1];
+shared float xscale[DEVICE_SCALE != 0 ? BN : 1];
+
+float row_scale(int s) {
+    return DEVICE_SCALE != 0 ? xscale[s % BN] : x[uint(p.S) * uint(p.I) + uint(s)];
+}
+
+void prepare_scales(int tid, int s0) {
+    const int lanes = max(1, NT / BN), rows = NT / lanes;
+    for (int first = 0; first < BN; first += rows) {
+        int r = first + tid / lanes, lane = tid % lanes, s = s0 + r;
+        uint m = 0u;
+        if (r < BN && s < p.S)
+            for (int i = lane; i < p.I; i += lanes)
+                m = max(m, floatBitsToUint(x[uint(s) * uint(p.I) + uint(i)]) & 0x7fffffffu);
+        xmag[tid] = m;
+        barrier();
+        if (lane == 0 && r < BN) {
+            for (int j = 1; j < lanes; j++) m = max(m, xmag[tid + j]);
+            int e = int(m >> 23) - 126;
+            if (m >= 0x7f800000u) e = 15;
+            e = max(e, -100);
+            xscale[r] = uintBitsToFloat(uint(15 - e + 127) << 23);
+        }
+        barrier();
+    }
+}
+
+#define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define MATA coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MATB coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+
+float i8(uint word, int lane) {
+    int b = int((word >> (uint(lane) * 8u)) & 0xffu);
+    if (b >= 128) b -= 256;
+    return float(b);
+}
+float i4(uint word, int lane) {
+    return float(int((word >> (uint(lane) * 4u)) & 0xfu) - 8);
+}
+float mx4(uint word, int lane) {     // e2m1, bit3 = sign (qmatmul.comp)
+    uint n = (word >> (uint(lane) * 4u)) & 0xfu;
+    const float lut[8] = float[8](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
+    float v = lut[n & 7u];
+    return (n & 8u) != 0u ? -v : v;
+}
+float e4m3(uint word, int lane) {    // OCP E4M3-FN, arithmetic decode (qmatmul.comp)
+    uint b = (word >> (uint(lane) * 8u)) & 0xffu;
+    if ((b & 0x7fu) == 0x7fu) return uintBitsToFloat(0x7fc00000u);
+    uint e = (b >> 3) & 0xfu, m = b & 7u;
+    float v = e == 0u ? float(m) * 0.001953125 : ldexp(1.0 + float(m) * 0.125, int(e) - 7);
+    return (b & 0x80u) != 0u ? -v : v;
+}
+
+// The words of weights k..k+7 of row o (k % 8 == 0, k < I), as qmatmul_gemm.comp's
+// fetch8 for these formats; no scale: it multiplies the MMA products instead.
+uvec2 fetch8(int o, int k) {
+    uint rb = uint(o) * uint(p.rowWords);
+    uvec2 r = uvec2(0u);
+    if (p.fmt == 1 || p.fmt == 12) {            // 4 bytes per word
+        if ((p.rowWords & 1) == 0) r = w2[(rb >> 1) + uint(k >> 3)];
+        else { r.x = w[rb + uint(k >> 2)]; if (k + 4 < p.I) r.y = w[rb + uint(k >> 2) + 1u]; }
+        if (k + 4 >= p.I) r.y = 0u;
+    } else if (p.fmt == 5) {                     // int3-g64: 16B low plane + 8B high plane
+        int g = k >> 6, j = k & 63;
+        r.x = w[rb + uint(g * 6 + (j >> 4))] >> uint((j & 15) * 2);
+        r.y = w[rb + uint(g * 6 + 4 + (j >> 5))] >> uint(j & 31);
+    } else r.x = w[rb + uint(k >> 3)];           // nibbles: 2, 4, 7
+    return r;
+}
+void decode8(uvec2 a, out vec4 lo, out vec4 hi) {
+    if (p.fmt == 1) {
+        lo = vec4(i8(a.x, 0), i8(a.x, 1), i8(a.x, 2), i8(a.x, 3));
+        hi = vec4(i8(a.y, 0), i8(a.y, 1), i8(a.y, 2), i8(a.y, 3));
+    } else if (p.fmt == 12) {
+        lo = vec4(e4m3(a.x, 0), e4m3(a.x, 1), e4m3(a.x, 2), e4m3(a.x, 3));
+        hi = vec4(e4m3(a.y, 0), e4m3(a.y, 1), e4m3(a.y, 2), e4m3(a.y, 3));
+    } else if (p.fmt == 5) {
+        float v[8];
+        [[unroll]] for (int t = 0; t < 8; t++)
+            v[t] = float(int(((a.x >> uint(2 * t)) & 3u) | (((a.y >> uint(t)) & 1u) << 2)) - 4);
+        lo = vec4(v[0], v[1], v[2], v[3]); hi = vec4(v[4], v[5], v[6], v[7]);
+    } else if (p.fmt == 7) {
+        lo = vec4(mx4(a.x, 0), mx4(a.x, 1), mx4(a.x, 2), mx4(a.x, 3));
+        hi = vec4(mx4(a.x, 4), mx4(a.x, 5), mx4(a.x, 6), mx4(a.x, 7));
+    } else {
+        lo = vec4(i4(a.x, 0), i4(a.x, 1), i4(a.x, 2), i4(a.x, 3));
+        hi = vec4(i4(a.x, 4), i4(a.x, 5), i4(a.x, 6), i4(a.x, 7));
+    }
+}
+
+const int WU = (BM * (BK / 8) + NT - 1) / NT;    // weight units per thread and step
+const int XU = (BN * (BK / 4) + NT - 1) / NT;    // activation quads per thread and step
+uvec2 rw[WU]; vec4 rx[XU];
+
+// Fetch step k0 into registers: zeros past O and I (finite after decode) and past S.
+void fetch_step(int tid, int o0, int s0, int k0) {
+    [[unroll]] for (int r = 0; r < WU; r++) {
+        int u = tid + r * NT, m = u / (BK / 8), k = k0 + (u % (BK / 8)) * 8;
+        rw[r] = uvec2(0u);
+        if (u < BM * (BK / 8) && o0 + m < p.O && k < p.I) rw[r] = fetch8(o0 + m, k);
+    }
+    [[unroll]] for (int r = 0; r < XU; r++) {
+        int u = tid + r * NT, s = s0 + u / (BK / 4), k = k0 + (u % (BK / 4)) * 4;
+        vec4 v = vec4(0.0);
+        if (u < BN * (BK / 4) && s < p.S && k < p.I) {
+            uint b = uint(s) * uint(p.I) + uint(k);
+            if ((p.I & 3) == 0) v = vec4(x[b], x[b + 1u], x[b + 2u], x[b + 3u]);
+            else {
+                v.x = x[b];
+                if (k + 1 < p.I) v.y = x[b + 1u];
+                if (k + 2 < p.I) v.z = x[b + 2u];
+                if (k + 3 < p.I) v.w = x[b + 3u];
+            }
+            v *= row_scale(s);
+        }
+        rx[r] = v;
+    }
+}
+
+void main() {
+    int tid = int(gl_LocalInvocationID.x);
+    int sg = int(gl_SubgroupID), lane = int(gl_SubgroupInvocationID);
+    int wm = sg % (BM / WM), wn = sg / (BM / WM);    // this subgroup's WM x WN
+    int o0 = int(gl_WorkGroupID.x) * BM, s0 = int(gl_WorkGroupID.y) * BN;
+    if (DEVICE_SCALE != 0) prepare_scales(tid, s0);
+    bool grouped = p.fmt != 1 && p.fmt != 2;
+    int gsz = p.fmt == 5 ? 64 : p.gs;                // a multiple of BK
+    int ng = grouped ? (p.I + gsz - 1) / gsz : 1;
+
+    ACC acc[FM][FN];   // fp32 sums; one declarator per line in this file: glslang drops
+                       // the matrix use from the second declarator of a list
+    [[unroll]] for (int i = 0; i < FM; i++)
+        [[unroll]] for (int j = 0; j < FN; j++) acc[i][j] = ACC(0.0);
+
+    fetch_step(tid, o0, s0, 0);
+    for (int k0 = 0; k0 < p.I; k0 += BK) {
+        // the fetched step into shared memory: weights as fp16, x as hi and lo
+        [[unroll]] for (int r = 0; r < WU; r++) {
+            int u = tid + r * NT;
+            if (u < BM * (BK / 8)) {
+                int base = (u / (BK / 8)) * WST + (u % (BK / 8)) * 8;
+                vec4 lo, hi;
+                decode8(rw[r], lo, hi);
+                f16vec4 a = f16vec4(lo), b = f16vec4(hi);
+                [[unroll]] for (int t = 0; t < 4; t++) { wsh[base + t] = a[t]; wsh[base + 4 + t] = b[t]; }
+            }
+        }
+        [[unroll]] for (int r = 0; r < XU; r++) {
+            int u = tid + r * NT;
+            if (u < BN * (BK / 4)) {
+                int base = (u / (BK / 4)) * WST + (u % (BK / 4)) * 4;
+                // hi keeps the top 11 significant bits by masking, not by an fp16 round
+                // trip: the compiler folds vec4(f16vec4(v)) back to v, which zeroed lo
+                // (measured on RADV: fp16-level error, 1000x the fp32 GEMM's). Both
+                // conversions below are then exact, but for lo's last bits.
+                vec4 h32 = uintBitsToFloat(floatBitsToUint(rx[r]) & 0xffffe000u);
+                f16vec4 hi = f16vec4(h32), lo = f16vec4(rx[r] - h32);
+                [[unroll]] for (int t = 0; t < 4; t++) { xhs[base + t] = hi[t]; xls[base + t] = lo[t]; }
+            }
+        }
+        // a new group starts at this step: its scales
+        if (grouped && k0 % gsz == 0)
+            for (int u = tid; u < BM; u += NT)
+                ssh[u] = o0 + u < p.O ? scale[uint(o0 + u) * uint(ng) + uint(k0 / gsz)] : 0.0;
+        barrier();
+        if (k0 + BK < p.I) fetch_step(tid, o0, s0, k0 + BK);
+        ACC sm[FM];         // grouped formats: a 16 x 16 tile whose row m is output m's
+        if (grouped)        // scale, a column-major load with stride 0
+            [[unroll]] for (int i = 0; i < FM; i++)
+                coopMatLoad(sm[i], ssh, uint(wm * WM + i * 16), 0u, gl_CooperativeMatrixLayoutColumnMajor);
+        [[unroll]] for (int kk = 0; kk < BK; kk += 16) {
+            if (k0 + kk < p.I) {
+                MATA a[FM];
+                MATB bh[FN];
+                MATB bl[FN];
+                [[unroll]] for (int i = 0; i < FM; i++)
+                    coopMatLoad(a[i], wsh, uint((wm * WM + i * 16) * WST + kk), uint(WST),
+                                gl_CooperativeMatrixLayoutRowMajor);
+                [[unroll]] for (int j = 0; j < FN; j++) {
+                    coopMatLoad(bh[j], xhs, uint((wn * WN + j * 16) * WST + kk), uint(WST),
+                                gl_CooperativeMatrixLayoutColumnMajor);
+                    coopMatLoad(bl[j], xls, uint((wn * WN + j * 16) * WST + kk), uint(WST),
+                                gl_CooperativeMatrixLayoutColumnMajor);
+                }
+                // Each 16-input product joins acc with an fp32 add (times the group scale
+                // for the grouped formats): the MMA accumulates with less than fp32's
+                // rounding, measured at 10x the fp32 GEMM's error when it summed 512
+                // inputs before a flush.
+                [[unroll]] for (int i = 0; i < FM; i++)
+                    [[unroll]] for (int j = 0; j < FN; j++) {
+                        ACC c = coopMatMulAdd(a[i], bh[j], ACC(0.0));
+                        c = coopMatMulAdd(a[i], bl[j], c);
+                        acc[i][j] = grouped ? acc[i][j] + c * sm[i] : acc[i][j] + c;
+                    }
+            }
+        }
+        barrier();
+    }
+
+    // Each accumulator through this subgroup's 16 x 17 tile: lane l takes output row
+    // l % 16 and every (SG/16)-th row of x from l / 16, times the per-row formats' scale
+    // and 1/rs[s], stores masked to O and S.
+    int eb = sg * 16 * EST, m = lane % 16;
+    [[unroll]] for (int i = 0; i < FM; i++) {
+        int o = o0 + wm * WM + i * 16 + m;
+        float sc = grouped || o >= p.O ? 1.0 : scale[o];
+        [[unroll]] for (int j = 0; j < FN; j++) {
+            coopMatStore(acc[i][j], esh, uint(eb), uint(EST), gl_CooperativeMatrixLayoutRowMajor);
+            subgroupMemoryBarrierShared(); subgroupBarrier();
+            [[unroll]] for (int t = 0; t < 256 / SG; t++) {
+                int n = lane / 16 + t * (SG / 16), s = s0 + wn * WN + j * 16 + n;
+                if (o < p.O && s < p.S)
+                    y[uint(s) * uint(p.O) + uint(o)] = esh[eb + m * EST + n] * sc / row_scale(s);
+            }
+            subgroupBarrier();
+        }
+    }
+}

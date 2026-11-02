@@ -20,6 +20,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <limits.h>
+#include <math.h>
 #include "json.h"
 #include "tok_unicode.h"
 #include "tok_unicode_o200k.h"
@@ -57,6 +58,8 @@ typedef struct {
     uint32_t byte2cp[256]; int byte2cp_len[256]; char byte2str[256][3];
     int16_t cp2byte[1024];
     int o200k;           /* pre_tokenizer regex family: 0 = cl100k (GLM), 1 = o200k (Inkling) */
+    int tekken;          /* 1 = Mistral's Tekken (tekken-num3, with o200k): no contractions on the
+                          * letter runs, numbers in groups of three counted from their end */
     int kimi;            /* 1 = Kimi (K3) family: o200k rules + a leading \p{Han}-run rule,
                           * Han excluded from the letter classes, no '/' tail in the punct rule */
     int gpt2;            /* 1 = GPT-2 family (OLMoE / GPT-NeoX): a bare ByteLevel pre_tokenizer
@@ -140,18 +143,32 @@ static void tok_free(Tok *T){
     memset(T,0,sizeof(*T));
 }
 
+/* Validate the JSON number before converting it: casting an infinite or
+ * out-of-range double to int is undefined, and fractional ids silently alias
+ * a different token. The same bound applies to vocabulary and added tokens. */
+static int tk_checked_id(const jval *value){
+    if(!value || value->t!=J_NUM || !isfinite(value->num) ||
+       value->num<0 || value->num>(1<<21) || value->num!=(double)(int)value->num){
+        fprintf(stderr,"tokenizer.json: token id must be an integer between 0 and %d\n",1<<21);
+        exit(1);
+    }
+    return (int)value->num;
+}
+
 static void tok_load(Tok *T, const char *path){
     memset(T,0,sizeof(*T));
     tk_build_bytemap(T);
     long fn; char *buf=tk_read_file(path,&fn);
-    char *arena=NULL; jval *root=json_parse(buf,&arena);
+    jval *root=memchr(buf,0,(size_t)fn) ? NULL : json_parse_checked(buf);
     free(buf);
-    (void)arena;
+    if(!root){ fprintf(stderr,"tokenizer.json: malformed JSON\n"); exit(1); }
     jval *model=json_get(root,"model");
     jval *vocab=json_get(model,"vocab");
     jval *merges=json_get(model,"merges");
     jval *added=json_get(root,"added_tokens");
-    if(!vocab){ fprintf(stderr,"tokenizer.json: missing model.vocab\n"); exit(1); }
+    if(!vocab || vocab->t!=J_OBJ){ fprintf(stderr,"tokenizer.json: model.vocab must be an object\n"); exit(1); }
+    if(merges && merges->t!=J_ARR){ fprintf(stderr,"tokenizer.json: model.merges must be an array\n"); exit(1); }
+    if(added && added->t!=J_ARR){ fprintf(stderr,"tokenizer.json: added_tokens must be an array\n"); exit(1); }
     if(!merges||merges->len==0){ T->rankbpe=1; merges=NULL; }
 
     /* id massimo per dimensionare id2str. Gli id vengono da un tokenizer.json di
@@ -159,15 +176,11 @@ static void tok_load(Tok *T, const char *path){
      * (OOB write) e un added_token privo di "id"/"content" darebbe NULL-deref. */
     int maxid=0;
     for(int i=0;i<vocab->len;i++){
-        if(vocab->kids[i]->t!=J_NUM){ fprintf(stderr,"tokenizer.json: non-numeric vocab id at %d\n",i); exit(1); }
-        int id=(int)vocab->kids[i]->num;
-        if(id<0){ fprintf(stderr,"tokenizer.json: negative vocab id %d\n",id); exit(1); }
+        int id=tk_checked_id(vocab->kids[i]);
         if(id>maxid)maxid=id; }
     if(added) for(int i=0;i<added->len;i++){
         jval *ji=json_get(added->kids[i],"id");
-        if(!ji||ji->t!=J_NUM){ fprintf(stderr,"tokenizer.json: added_token missing numeric id\n"); exit(1); }
-        int id=(int)ji->num;
-        if(id<0){ fprintf(stderr,"tokenizer.json: negative added id %d\n",id); exit(1); }
+        int id=tk_checked_id(ji);
         if(id>maxid)maxid=id; }
     /* an id near INT_MAX would overflow n_ids=maxid+1 (UB) and calloc multi-GB */
     if(maxid > (1<<21)){ fprintf(stderr,"tokenizer.json: implausible max vocab id %d\n",maxid); exit(1); }
@@ -238,6 +251,7 @@ static void tok_load(Tok *T, const char *path){
             jval *pat=json_get(ps->kids[i],"pattern");
             jval *rx=pat?json_get(pat,"Regex"):NULL;
             if(rx&&rx->t==J_STR&&strstr(rx->str,"\\p{Lu}")) T->o200k=1;
+            if(rx&&rx->t==J_STR&&strstr(rx->str,"\\p{N}{1,3}(?=(?:\\p{N}{3})*(?!\\p{N}))")) T->tekken=1;
             if(rx&&rx->t==J_STR&&strstr(rx->str,"\\p{Han}")) T->kimi=1;
             if(rx&&rx->t==J_STR&&strstr(rx->str,"|\\p{N}|")) T->ndig1=1;
             /* DeepSeek's third Split: ASCII punctuation takes the ASCII letters after
@@ -367,8 +381,10 @@ static int o2_contraction(const uint32_t *cp, int n, int k){
     }
     return k;
 }
-/* end (cp index) of branch A|B match at i, or -1 */
-static int o2_letters(const uint32_t *cp, int n, int i){
+/* end (cp index) of branch A|B match at i, or -1; contr 0: Tekken's, no contraction suffix */
+static int o2_letters_c(const uint32_t *cp, int n, int i, int contr);
+static int o2_letters(const uint32_t *cp, int n, int i){ return o2_letters_c(cp,n,i,1); }
+static int o2_letters_c(const uint32_t *cp, int n, int i, int contr){
     /* branch A, prefix greedy (taken first), then without prefix */
     for(int pfx=1; pfx>=0; pfx--){
         int j0=i;
@@ -381,7 +397,7 @@ static int o2_letters(const uint32_t *cp, int n, int i){
         for(int s=m1; s>=j0; s--){
             if(s<n && O2_S2(cp[s])){
                 int k=s+1; while(k<n && O2_S2(cp[k])) k++;
-                return o2_contraction(cp,n,k);
+                return contr ? o2_contraction(cp,n,k) : k;
             }
         }
     }
@@ -396,7 +412,7 @@ static int o2_letters(const uint32_t *cp, int n, int i){
         int m1=j0; while(m1<n && O2_S1(cp[m1])) m1++;
         if(m1>j0){
             int k=m1; while(k<n && O2_S2(cp[k])) k++;
-            return o2_contraction(cp,n,k);
+            return contr ? o2_contraction(cp,n,k) : k;
         }
     }
     return -1;
@@ -413,10 +429,13 @@ static void pretok_chunk_o200k(Tok *T, const unsigned char *p, int a, int b, int
         int start=i; uint32_t c=cp[i];
         /* A|B: letter runs with case-aware split + optional contraction */
         {
-            int e=o2_letters(cp,n,i);
+            int e=o2_letters_c(cp,n,i,!T->tekken);
             if(e>i){ i=e; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
         }
-        /* C: \p{N}{1,3} */
+        /* C: \p{N}{1,3}; Tekken's \p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N})): the run's first group takes
+         * what a multiple of three leaves, the rest go by three */
+        if(is_N(c) && T->tekken){ int r=0; while(i+r<n && is_N(cp[i+r])) r++;
+            int k=r%3 ? r%3 : 3; i+=k; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
         if(is_N(c)){ int j=i,k=0; while(j<n && is_N(cp[j]) && k<3){ j++; k++; } i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
         /* D: ' ?[^\s\p{L}\p{N}]+[\r\n/]*' */
         {

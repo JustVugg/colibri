@@ -1,0 +1,104 @@
+#version 450
+// Qwen3.8's per-layer n-gram embedding (PLE) on the device (vk_chain.c, VKC_P_PLE), the
+// part of qwen38_core.h's q38_ple that follows the key and value projections. The
+// n-gram table rows stay on the host; the chain uploads their rows and projects them.
+//
+// mode 0, the gate: one workgroup per (row s, stream k) = WorkGroupID.x = s*C + k, H
+// floats of each:
+//   kn = rms0(keys[s][k]), qn = rms0(hyper[s][k]) (zero-centred weights, slices k)
+//   dot = kn . qn / sqrt(H);  g = sigmoid(sign(dot) * sqrt(max(|dot|, 1e-6)))
+//   gated[s][k] = g * value[s];  normv[s][k] = rms0(gated[s][k]) with the conv norm
+// mode 1, the convolution: one thread per channel d < W = C*H, rows in order, with the
+// dilated ring (taps every ngram entries, (ck-1)*ngram of them, on the device):
+//   a = conv[d][ck-1] * normv[s][d] + sum_t conv[d][t] * ring[t*ngram]
+//   hyper[s][d] += gated[s][d] + silu(a);  the ring drops its oldest, takes normv[s][d]
+// snap_row >= 0 also writes the ring after that row to snap (MTP verify rollback).
+// prm: norm_key[W], norm_query[W], norm_conv[W].
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer KB { float keys[]; };
+layout(std430, binding = 1) buffer HB { float hyp[]; };
+layout(std430, binding = 2) readonly buffer VB { float val[]; };
+layout(std430, binding = 3) readonly buffer PB { float prm[]; };
+layout(std430, binding = 4) buffer GB { float gated[]; };
+layout(std430, binding = 5) buffer NB { float normv[]; };
+layout(std430, binding = 6) readonly buffer CB { float conv[]; };
+layout(std430, binding = 7) buffer RB { float ring[]; };
+
+layout(push_constant) uniform P {
+    int mode, S, C, H, CK, NG;
+    int keys_off, hyp_off, val_off;
+    int snap_row, snap_off;     // the snap ring sits in the ring buffer at snap_off
+    float eps;
+    int prm_off, conv_off, ring_off;
+} p;
+
+shared float r1[256];
+shared float r2[256];
+
+float sig(float x) { return 1.0 / (1.0 + exp(-x)); }
+
+void reduce2(int tid) {
+    barrier();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) { r1[tid] += r1[tid + off]; r2[tid] += r2[tid + off]; }
+        barrier();
+    }
+}
+
+void main() {
+    int W = p.C * p.H;
+    int tid = int(gl_LocalInvocationID.x);
+    if (p.mode == 0) {
+        int g = int(gl_WorkGroupID.x), s = g / p.C, k = g - s * p.C;
+        int kb = p.keys_off + s * W + k * p.H, hb = p.hyp_off + s * W + k * p.H, vb = p.val_off + s * p.H;
+        int wk = p.prm_off + k * p.H, wq = p.prm_off + W + k * p.H, wc = p.prm_off + 2 * W + k * p.H;
+        float a = 0.0, b = 0.0;
+        for (int d = tid; d < p.H; d += 256) { float u = keys[kb + d], v = hyp[hb + d]; a += u * u; b += v * v; }
+        r1[tid] = a; r2[tid] = b;
+        reduce2(tid);
+        float rk = 1.0 / sqrt(r1[0] / float(p.H) + p.eps), rq = 1.0 / sqrt(r2[0] / float(p.H) + p.eps);
+        barrier();
+        float dt = 0.0;
+        for (int d = tid; d < p.H; d += 256)
+            dt += (keys[kb + d] * rk * (1.0 + prm[wk + d])) * (hyp[hb + d] * rq * (1.0 + prm[wq + d]));
+        r1[tid] = dt; r2[tid] = 0.0;
+        reduce2(tid);
+        float dot = r1[0] / sqrt(float(p.H));
+        float shaped = sign(dot) * sqrt(max(abs(dot), 1e-6));
+        if (dot == 0.0) shaped = sqrt(1e-6);   /* copysign(x, +0) is +x */
+        float gt = sig(shaped);
+        barrier();
+        float c3 = 0.0;
+        for (int d = tid; d < p.H; d += 256) {
+            float u = gt * val[vb + d];
+            gated[s * W + k * p.H + d] = u;
+            c3 += u * u;
+        }
+        r1[tid] = c3; r2[tid] = 0.0;
+        reduce2(tid);
+        float rc = 1.0 / sqrt(r1[0] / float(p.H) + p.eps);
+        for (int d = tid; d < p.H; d += 256)
+            normv[s * W + k * p.H + d] = gated[s * W + k * p.H + d] * rc * (1.0 + prm[wc + d]);
+        return;
+    }
+    int d = int(gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u);
+    if (d >= W) return;
+    int SL = (p.CK - 1) * p.NG;
+    float rg[32];
+    for (int t = 0; t < 32; t++) rg[t] = t < SL ? ring[p.ring_off + d * SL + t] : 0.0;
+    int cw = p.conv_off + d * p.CK;
+    float wl = conv[cw + p.CK - 1];
+    for (int s = 0; s < p.S; s++) {
+        float nv = normv[s * W + d];
+        float a = wl * nv;
+        for (int t = 0; t < 31; t++)
+            if (t < p.CK - 1) a += conv[cw + t] * rg[t * p.NG < 32 ? t * p.NG : 0];
+        hyp[p.hyp_off + s * W + d] += gated[s * W + d] + a * sig(a);
+        for (int t = 0; t < 31; t++) if (t + 1 < SL) rg[t] = rg[t + 1];
+        for (int t = 0; t < 32; t++) if (t == SL - 1) rg[t] = nv;
+        if (s == p.snap_row)
+            for (int t = 0; t < 32; t++) if (t < SL) ring[p.snap_off + d * SL + t] = rg[t];
+    }
+    for (int t = 0; t < 32; t++) if (t < SL) ring[p.ring_off + d * SL + t] = rg[t];
+}

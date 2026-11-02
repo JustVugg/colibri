@@ -3,6 +3,9 @@
 colibri — tiny engine, immense model.
 Run GLM-5.2 (744B) locally on CPU with roughly 15-26 GB of RAM.
 
+  coli setup                one step: find the hardware, pick a model, build or fetch
+                            the engine, download, then start the dashboard
+  coli start / status / logs  start, inspect, or read the log of what setup configured
   coli chat                 interactive chat (loads the model once)
   coli serve                OpenAI-compatible HTTP API (persistent engine)
   coli run "prompt"         one-shot generation
@@ -24,7 +27,7 @@ Configuration through environment variables or flags (also valid after the subco
   --topp P           adaptive expert top-p             --topk N   fixed top-k
   --ngen N           maximum response tokens           --cap N    cache slots/layer
 """
-import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap, struct, shlex
+import os, sys, subprocess, argparse, json, math, time, signal, shutil, threading, re, codecs, tempfile, textwrap, struct, shlex
 
 # input() only gets line editing and UP/DOWN history once the readline module
 # has been LOADED — without it the terminal's arrow-key escape sequences are
@@ -189,6 +192,15 @@ def model_banner_line(model):
         return generic
     if is_image_model(model):
         return image_banner_line(model) or generic
+    if is_decision_model(model):
+        try:
+            resolved = resolve_model(model)
+            name, scale = display_for(resolved)
+            size = os.path.getsize(os.path.join(model, "model.safetensors"))
+        except (FamilyConfigError, UnknownFamilyError, OSError):
+            return generic
+        return " · ".join(bit for bit in (name, scale, "decision model",
+                                          f"{size/1e6:.0f} MB on disk" if size else "") if bit)
     try:
         with open(os.path.join(model, "config.json"), encoding="utf-8") as f:
             cfg = json.load(f)
@@ -252,6 +264,52 @@ def is_image_model(model):
         return is_image_model_dir(model)
     except (OSError, TypeError):
         return False
+
+def is_decision_model(model):
+    """A decision checkpoint (Laya: rl_agent_config.json, no root config.json;
+    GLiNER2.5-Decide: a GLiNER2 extractor config.json): served by coli serve /
+    coli web on POST /v1/systemone, never chatted with."""
+    try:
+        return resolve_model(model).descriptor.modality == "decision"
+    except (FamilyConfigError, UnknownFamilyError, OSError, TypeError, ValueError):
+        return False
+
+# What bounds the tokens a decision engine reads, and the variable that moves it.
+DECISION_LENGTH = {
+    "laya": ("at most its checkpoint's max_len per question", "COLI_LAYA_MAX_LEN"),
+    "gliner_decide": ("every question and the state in one sequence of at most 4096 tokens",
+                      "COLI_GLINER_MAX_LEN"),
+}
+
+def is_gliner_decide(model):
+    try:
+        return resolve_model(model).descriptor.id == "gliner_decide"
+    except (FamilyConfigError, UnknownFamilyError, OSError, TypeError, ValueError):
+        return False
+
+def decision_head_line(model, resolved):
+    """`coli info`'s line for a decision head over a chat model (Clef): what it
+    adds, and that the chat stays."""
+    from family_registry import decision_head_of
+    head = decision_head_of(resolved)
+    try:
+        with open(os.path.join(model, head.files[0]), encoding="utf-8") as f:
+            cfg = json.load(f)
+        shape = (f"{cfg.get('routing_layers')} routing + {cfg.get('layers')} decoder layers, "
+                 f"width {cfg.get('width')}")
+    except (OSError, ValueError, AttributeError):
+        shape = "head config unreadable"
+    return (f"{head.display_name} joint schema head ({shape}): POST /v1/systemone answers "
+            f"natively; chat, completions and messages work as on any {resolved.descriptor.id} model")
+
+def decision_refusal(family):
+    """What every chatting command says about a decision model, and where to go.
+    Laya ships a calibration; GLiNER2.5-Decide gives its classifier's softmax."""
+    answers = "calibrated probabilities" if family.id == "laya" else "a probability per option"
+    return (f"{C.yel}{family.display_name} is a decision model:{C.r} it answers typed questions "
+            f"(choice, score, noul) with {answers} and does not chat.\n"
+            f"  Start it with: coli serve --model <dir>   (or coli web for the dashboard)\n"
+            f"  then POST /v1/systemone (docs/systemone.md, \"Decision engines\")")
 
 def image_banner_line(model):
     """Banner line of an image model: name, what it does, bytes on disk. Sizes
@@ -411,7 +469,8 @@ def need_model(model, engine=None):
     # An image pipeline keeps its tokenizer in processor/, not at the root.
     require_model(model, file=None)
     tokenizer = "tokenizer.json"
-    if is_image_model(model):
+    if is_image_model(model) or is_decision_model(model):
+        # a decision checkpoint keeps it in tokenizer/ (Laya)
         try: tokenizer = resolve_model(model).descriptor.tokenizer_file
         except (FamilyConfigError, UnknownFamilyError): pass   # engine_for says why, below
     require_model(model, file=tokenizer)
@@ -432,6 +491,13 @@ def ngen_for(a, interactive=False, family=None):
         limits = family.limits
         return limits.interactive_max_output if interactive else limits.default_max_output
     return 16384 if interactive else 1024
+
+# The ceiling a served session (serve, web, chat) gives the gateway: --ngen, or 0 when
+# it is not given, which the gateway reads as the context the engine holds. A reasoning
+# model's turn is its reasoning plus its answer: any fixed number below the context cut
+# some of them short (#382), and the engines stop at the end of the context anyway.
+def serve_max_tokens(a):
+    return getattr(a, "ngen", None) or 0
 
 _PROFILE_CAP_ENV = "COLI_PROFILE_CAP"
 _PLAN_CAP_ENV = "COLI_PLAN_CAP"
@@ -485,6 +551,10 @@ def env_for_engine(a, arch, plan=None):
     if family.modality == "image" and getattr(a, "ctx", None):
         sys.exit(f"{C.yel}--ctx does not apply to {family.display_name}:{C.r} an image model has "
                  f"no context window (the prompt goes through its text encoder once)")
+    if family.modality == "decision" and getattr(a, "ctx", None):
+        reads, knob = DECISION_LENGTH.get(family.id, ("what its engine allows", "its engine's own variable"))
+        sys.exit(f"{C.yel}--ctx does not apply to {family.display_name}:{C.r} a decision model reads "
+                 f"{reads} ({knob} overrides it)")
     if getattr(a,"ram",0): explicit_env.add("RAM_GB")
     # OMP_NUM_THREADS for the sister engines that do not size their own team.
     #
@@ -508,8 +578,8 @@ def env_for_engine(a, arch, plan=None):
     # setdefault, so an explicit OMP_NUM_THREADS still wins.
     if not env.get("COLI_NO_OMP_TUNE"):
         if arch != "deepseek_v4":
-            from resource_plan import physical_cpu_count
-            env.setdefault("OMP_NUM_THREADS", str(physical_cpu_count()))
+            from resource_plan import team_cpu_count
+            env.setdefault("OMP_NUM_THREADS", str(team_cpu_count()))
         else:
             env.setdefault("OMP_WAIT_POLICY", "active")
             env.setdefault("GOMP_SPINCOUNT", "200000")
@@ -534,13 +604,16 @@ def env_for_engine(a, arch, plan=None):
         # legacy TEMP alias here also clobbered %TEMP% with "0.7" for every child
         # of the chat process on Windows — and olmoe never read COLI_TEMP, so the
         # ONLY working channel was a poisoned system variable (#509's exact shape).
-    # --ram reaches the engines that read it. kimi_k3 gained a RAM budget in
-    # #855; before that `grep -c RAM_GB c/kimi_k3.c` returned 0, so `coli chat
-    # --ram 242` on Kimi K3 set an environment variable nobody looked at and the
-    # user's session ran itself out of memory with the flag apparently set.
-    if arch in ("deepseek_v4", "deepseek_v41", "kimi", "glm53", "olmoe"):
+    # --ram reaches engines and gateway planners that consume RAM_GB. kimi_k3
+    # gained a RAM budget in #855; qwen36's gateway turns it into the positional
+    # cache cap, so it must receive the flag even though the engine gets that cap.
+    if arch in ("deepseek_v4", "deepseek_v41", "kimi", "glm53", "olmoe", "mimo", "qwen36"):
         if a.ram: env["RAM_GB"] = str(a.ram)
     if arch == "glm53":
+        # Expert workers: env_for() wires these for glm; glm53 goes through
+        # here, and without them `serve --cluster-workers` ran on one machine.
+        if getattr(a, "cluster_workers", None): env["CLUSTER_WORKERS"] = a.cluster_workers
+        if getattr(a, "cluster_coordinator", None): env["CLUSTER_COORDINATOR"] = a.cluster_coordinator
         # I densi vanno a int4 di default: sono 9,7 B parametri su 321, e in
         # BF16 sono 19 GB che nessuno recupera. Chi vuole la precisione piena
         # mette GLM53_BITS=32, e questo setdefault gli lascia la scelta.
@@ -613,9 +686,9 @@ def env_for_engine(a, arch, plan=None):
             sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} the engine binary is CPU-only")
         env["COLI_CUDA"] = "1"
         env["CUDA_EXPERT_GB"] = str(vram)
-    if getattr(a, "auto_tier", False) and family.modality == "image":
-        # The tier plan places experts and KV state; an image model has
-        # neither, and build_plan would stop on "no safetensors shards".
+    if getattr(a, "auto_tier", False) and family.modality in ("image", "decision"):
+        # The tier plan places experts and KV state; an image or decision model
+        # has neither, and build_plan would stop on "no safetensors shards".
         print(f"  {C.dim}[PLAN] --auto-tier has nothing to place for "
               f"{family.display_name}; coli plan shows its RAM{C.r}", file=sys.stderr)
     elif getattr(a, "auto_tier", False):
@@ -698,12 +771,18 @@ def dsv4_cuda_build_hint():
         return "make deepseek-v4 CUDA=1 (this binary is CPU-only)"
     return "the DeepSeek V4 CUDA tier is supported only on Linux and Windows"
 
+# Engines that implement EXPERT_WORKER / CLUSTER_WORKERS: colibri.c, glm53.c and
+# deepseek_v41.c. A worker serves the family it was built for: a deepseek_v41
+# coordinator talks to deepseek_v41 workers (COLIEX01), a GLM one to GLM workers,
+# a GLM-5.3 one to GLM-5.3 workers (COLIG53X).
+WORKER_FAMILIES = ("glm", "glm53", "deepseek_v41")
+
 def need_worker_model(model):
     require_model(model, file="config.json")
     family = resolve_model(model).descriptor
-    if family.id != "glm":
-        sys.exit(f"{C.yel}cluster expert workers currently support the GLM engine only;{C.r} "
-                 f"{family.display_name} models cannot serve experts")
+    if family.id not in WORKER_FAMILIES:
+        sys.exit(f"{C.yel}cluster expert workers currently support the GLM, GLM-5.3 and DeepSeek V4.1 "
+                 f"engines only;{C.r} {family.display_name} models cannot serve experts")
     engine = engine_for(model)
     require_model(model, file="config.json", engine=engine, target=family.build_target,
                   build=f"make -C c {family.build_target}")
@@ -749,8 +828,12 @@ def cuda_binary(engine=None):
     return False
 
 def resource_request(a, env):
-    family=resolve_model(a.model).descriptor if getattr(a,"model",None) else family_by_id("glm")
-    ctx=a.ctx or int(env.get(family.limits.context_env,family.limits.default_context))
+    from family_registry import default_context
+    resolved=resolve_model(a.model) if getattr(a,"model",None) else None
+    family=resolved.descriptor if resolved else family_by_id("glm")
+    # a Clef checkpoint plans for its own 16384 (family_registry.default_context)
+    fallback=default_context(resolved) if resolved else family.limits.default_context
+    ctx=a.ctx or int(env.get(family.limits.context_env,fallback))
     if ctx<1 or ctx>family.limits.max_context:
         raise ValueError(f"--ctx must be between 1 and {family.limits.max_context} "
                          f"for {family.display_name}")
@@ -873,8 +956,8 @@ def env_for(a):
     # setdefault, so an explicit OMP_NUM_THREADS still wins, and the whole
     # thing stays behind COLI_NO_OMP_TUNE like the rest of the OMP tuning.
     if not e.get("COLI_NO_OMP_TUNE"):
-        from resource_plan import physical_cpu_count
-        e.setdefault("OMP_NUM_THREADS", str(physical_cpu_count()))
+        from resource_plan import team_cpu_count
+        e.setdefault("OMP_NUM_THREADS", str(team_cpu_count()))
     if sys.platform == "win32":
         # COLI_NO_OMP_TUNE spegne SOLO il blocco OMP (stesso perimetro del
         # self-exec di glm.c; presence-based come nel motore: impostarla a
@@ -970,8 +1053,11 @@ def env_for(a):
         # engine's "CPU" rows were GPU-assisted). --gpu none remains the
         # canonical hard off-switch (works on every platform, also clears the
         # CUDA_* sizing vars).
+        # COLI_VULKAN=1 is a backend choice too (coli setup's, on a card the CUDA
+        # DLL does not run on): CUDA does not stack on it unasked.
         if (sys.platform == "win32" and a.gpu is None and not a.vram
-                and e.get("COLI_CUDA") != "0"):
+                and e.get("COLI_CUDA") != "0"
+                and str(e.get("COLI_VULKAN","")).strip() in ("","0")):
             if cuda_binary():
                 from resource_plan import (discover_gpus, plans_placement, build_plan,
                                            environment_for_plan, format_bytes)
@@ -1079,7 +1165,7 @@ class MDStream:
             if ch=="`":
                 self.icode=not self.icode
                 out.append(C.org if self.icode else C.r); i+=1; continue
-            if ch=="*":
+            if ch=="*" and not self.icode:
                 j=i
                 while j<len(txt) and txt[j]=="*": j+=1
                 if j-i>=2:               # **/***: grassetto on/off, gli asterischi spariscono
@@ -1207,6 +1293,18 @@ def stream_turn(p, sentinel, on_bytes):
             line=p.stdout.readline().decode("utf-8","replace").strip()   # STAT tok tps hit rss
             m=re.match(r"STAT (\S+) (\S+) (\S+) (\S+)", line)
             st={"tok":int(m.group(1)),"tps":float(m.group(2)),"hit":float(m.group(3)),"rss":float(m.group(4))} if m else {}
+            fields=line.split()
+            # STAT tok tps hit rss prompt_tokens 0 CONTEXT_EXCEEDED [cause]:
+            # the token sits at fields[7] (the PR's "7th token" counts past
+            # the STAT keyword).
+            if len(fields)>=8 and fields[7]=="CONTEXT_EXCEEDED":
+                # #2097: the legacy protocol has no ERROR frame; the engine
+                # refuses an over-context turn with an empty answer plus this
+                # token (and the cause as the next field: PROMPT_TOO_LONG,
+                # HISTORY_FULL, or RENDER_CLIPPED). The chat loop turns it
+                # into the message the user actually sees; older engines send
+                # no cause, hence True as the fallback.
+                st["context_exceeded"]=fields[8] if len(fields)>=9 else True
             if interrupted: st["interrupted"]=True
             return st
         if len(pend)>len(sentinel):
@@ -1240,8 +1338,11 @@ def cmd_info(a):
     if family is not None and family.modality == "image":
         info_image_model(a, family, row)
         return
+    if family is not None and family.modality == "decision":
+        info_decision_model(a, resolved, row)
+        return
     if os.path.exists(cfgp):
-        c=json.load(open(cfgp))
+        c=json.load(open(cfgp, encoding="utf-8"))
         # Multimodal wrappers such as Qwen3.8 keep the language architecture
         # below text_config.  The registry has already resolved that section;
         # using the root here produced a recognized family followed by four
@@ -1256,6 +1357,8 @@ def cmd_info(a):
         sts=[x for x in os.listdir(a.model) if x.endswith('.safetensors')]
         sz=sum(os.path.getsize(os.path.join(a.model,x)) for x in sts)
         row("shards", f"{len(sts)} files · {sz/1e9:.0f} GB on disk")
+        if resolved is not None and resolved.decision_head:
+            row("decision", decision_head_line(a.model, resolved))
     else:
         # No config.json means no family, and no family means no engine: say so
         # instead of letting the GLM default below stand in. A directory of shards
@@ -1335,6 +1438,77 @@ def info_image_model(a, family, row):
         else f"not built (make -C c {family.build_target})")
     print()
 
+def decision_weights(model):
+    """Parameters and bytes of a decision checkpoint, from its safetensors header."""
+    import struct
+    params = 0
+    with open(os.path.join(model, "model.safetensors"), "rb") as handle:
+        size = struct.unpack("<Q", handle.read(8))[0]
+        if size > 64 << 20:
+            raise ValueError("model.safetensors: implausible header size")
+        header = json.loads(handle.read(size))
+    for name, entry in header.items():
+        if name == "__metadata__" or not isinstance(entry, dict):
+            continue
+        count = 1
+        for dim in entry.get("shape", []):
+            count *= int(dim)
+        params += count
+    return params, os.path.getsize(os.path.join(model, "model.safetensors"))
+
+def info_decision_model(a, resolved, row):
+    """`coli info` for a decision model: the encoder, the head's budget, what it
+    serves, instead of layers and experts."""
+    family = resolved.descriptor
+    enc, cfg = resolved.family_config, resolved.config
+    name, scale = display_for(resolved)
+    row("model", a.model)
+    encoder = (f"{enc.get('model_type')} encoder, {enc.get('num_hidden_layers')} layer x "
+               f"{enc.get('hidden_size')}")
+    if family.id == "gliner_decide":
+        row("type", f"{name}{' · ' + scale if scale else ''} · decision model · {encoder} · "
+                    f"GLiNER2 {cfg.get('architecture') or 'span'} classification head")
+        max_len = os.environ.get("COLI_GLINER_MAX_LEN") or "4096"
+        row("budget", f"max_len {max_len} tokens per request: every question and the state "
+                      f"in one sequence (COLI_GLINER_MAX_LEN)")
+    else:
+        row("type", f"{name}{' · ' + scale if scale else ''} · decision model · {encoder} · "
+                    f"head {cfg.get('head_layers')} layer")
+        row("budget", f"max_len {cfg.get('max_len')} tokens per question, "
+                      f"head_max_len {cfg.get('head_max_len')} for the options")
+    try:
+        params, disk = decision_weights(a.model)
+        row("weights", f"{params/1e6:.0f}M params · {disk/1e6:.0f} MB on disk · "
+                       f"about {params*4/1e9:.1f} GB in RAM (f32)")
+    except (OSError, ValueError) as error:
+        row("weights", f"{C.yel}model.safetensors unreadable:{C.r} {error}")
+    row("use", "coli serve / coli web, then POST /v1/systemone (docs/systemone.md)")
+    engine=engine_for(a.model)
+    row("engine", "ready ✓" if os.path.exists(engine)
+        else f"not built (make -C c {family.build_target})")
+    print()
+
+def plan_decision_command(a):
+    """`coli plan` for a decision model: its weights in RAM, nothing that grows."""
+    if getattr(a, "ctx", 0):
+        sys.exit(f"{C.yel}--ctx does not apply to a decision model{C.r}")
+    try:
+        params, disk = decision_weights(a.model)
+    except (OSError, ValueError) as error:
+        sys.exit(f"{C.yel}cannot create resource plan:{C.r} {error}")
+    plan = {"model": os.path.abspath(a.model), "modality": "decision", "params": params,
+            "disk_bytes": disk, "ram_bytes": params * 4,
+            "note": "weights resident in f32; no KV cache, no experts, no VRAM tier"}
+    if a.json:
+        print(json.dumps(plan, indent=2)); return
+    banner("plan · RAM for a decision model", model=a.model)
+    print(f"  weights   {params/1e6:.0f}M params, {disk/1e6:.0f} MB on disk")
+    grows = ("activations that grow with the request's sequence (COLI_GLINER_MAX_LEN)"
+             if is_gliner_decide(a.model) else "activations of a few MB per question")
+    print(f"  RAM       about {params*4/1e9:.1f} GB (f32), plus {grows}")
+    print(f"  nothing grows with use: no KV cache, no experts to stream")
+    print()
+
 def plan_image_command(a):
     """`coli plan` for an image model: weights per component, two schedules."""
     from image_engine import plan_image_model, format_image_plan
@@ -1361,6 +1535,8 @@ def cmd_plan(a):
         sys.exit(f"{C.yel}no model directory given.{C.r}\n  {NO_MODEL_HINT}")
     if is_image_model(a.model):
         return plan_image_command(a)
+    if is_decision_model(a.model):
+        return plan_decision_command(a)
     try:
         ram,ctx,devices,vram=resource_request(a,os.environ)
         if ctx<1: raise ValueError("--ctx must be positive")
@@ -1410,6 +1586,11 @@ def cmd_doctor(a):
         report=run_image_doctor(a.model, engine)
         print(json.dumps(report,indent=2) if a.json else format_doctor(report))
         return exit_code(report)
+    if is_decision_model(a.model) and engine_error is None:
+        from doctor import run_decision_doctor
+        report=run_decision_doctor(a.model, engine)
+        print(json.dumps(report,indent=2) if a.json else format_doctor(report))
+        return exit_code(report)
     report=run_doctor(
         # engine_path was hardcoded to GLM, so `coli doctor` inspected colibri
         # no matter which model it was pointed at: a built kimi_k3/inkling was
@@ -1449,7 +1630,7 @@ def cmd_tune(a):
     # family it then mis-dispatched.
     family=resolve_model(a.model).descriptor
     arch=family.id
-    if family.modality=="image":
+    if family.modality in ("image","decision"):
         sys.exit(f"{C.yel}coli tune measures text engines;{C.r} {family.display_name} has no "
                  f"expert cache or decode loop to tune")
     if not family.has_gateway_adapter:
@@ -1507,6 +1688,73 @@ def cmd_tune(a):
               f"{100*a.min_gain:.1f}% gain and safety gates")
     print(f"  profile: {path}\n")
 
+def run_via_gateway(a, family, engine, prompt):
+    """coli run for a family the gateway drives (Qwen3.8 and the others without a one-shot
+    adapter, #2189): the private server coli chat starts, on a free port, one streamed
+    turn printed as it comes, then the server stopped."""
+    import socket, urllib.request, urllib.error
+    from family_registry import default_model_id
+    resolved=resolve_model(a.model); arch=family.id
+    model_id=default_model_id(resolved)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1",0)); port=probe.getsockname()[1]
+    base=f"http://127.0.0.1:{port}"
+    import openai_server
+    cmd=[sys.executable,openai_server.__file__,"--model",a.model,"--engine",engine,"--arch",arch,
+         "--model-id",model_id,"--host","127.0.0.1","--port",str(port),"--max-tokens",str(serve_max_tokens(a))]
+    if a.cap is not None: cmd+=["--cap",str(a.cap)]
+    p=subprocess.Popen(cmd,env=env_for_engine(a,arch))
+    try:
+        sp=Spinner(f"loading {model_id}…"); sp.start()
+        for _ in range(1800):
+            if p.poll() is not None:
+                sp.stop(); sys.exit(f"{model_id} server exited while loading")
+            if server_probe(base,timeout=1.0): break
+            time.sleep(1)
+        else:
+            sp.stop(); sys.exit(f"timed out loading {model_id}")
+        sp.stop()
+        request={"model":model_id,"messages":[{"role":"user","content":prompt}],"stream":True,
+                 "max_tokens":ngen_for(a,interactive=True,family=family)}
+        if getattr(a,"effort",None): request["reasoning_effort"]=a.effort
+        if getattr(a,"think",None) is not None: request["enable_thinking"]=a.think
+        elif arch in CHAT_THINK_OFF: request["enable_thinking"]=False
+        req=urllib.request.Request(base+"/v1/chat/completions",data=json.dumps(request).encode(),
+                                   headers={"Content-Type":"application/json"})
+        think_open=False
+        try:
+            with urllib.request.urlopen(req) as r:
+                for raw in r:
+                    line=raw.decode("utf-8","replace").strip()
+                    if not line.startswith("data: "): continue
+                    if line[6:]=="[DONE]": break
+                    try: ev=json.loads(line[6:])
+                    except ValueError: continue
+                    for ch in ev.get("choices",[]):
+                        d=ch.get("delta",{})
+                        rtxt=d.get("reasoning_content")
+                        if rtxt and os.environ.get("COLI_SHOW_THINK","1")!="0":
+                            if not think_open: think_open=True; sys.stdout.write(C.dim)
+                            sys.stdout.write(rtxt); sys.stdout.flush()
+                        txt=d.get("content")
+                        if txt:
+                            if think_open: think_open=False; sys.stdout.write(C.r+"\n")
+                            sys.stdout.write(txt); sys.stdout.flush()
+                else:
+                    sys.exit("\nthe server closed the generation stream before completion")
+        except KeyboardInterrupt:
+            pass
+        except urllib.error.HTTPError as e:
+            try: detail=json.loads(e.read().decode("utf-8","replace")).get("error",{}).get("message","")
+            except Exception: detail=""
+            sys.exit(f"\n{C.yel}the server rejected the request: HTTP {e.code}{C.r} {detail}")
+        sys.stdout.write((C.r if think_open else "")+"\n"); sys.stdout.flush()
+    finally:
+        if p.poll() is None:
+            p.terminate()
+            try: p.wait(timeout=10)
+            except subprocess.TimeoutExpired: p.kill()
+
 def cmd_run(a):
     need_model(a.model)
     family=resolve_model(a.model).descriptor
@@ -1517,7 +1765,11 @@ def cmd_run(a):
     banner("run", model=a.model)
     if family.modality=="image":
         return run_image(a, family, engine, prompt)
+    if family.modality=="decision":
+        sys.exit(decision_refusal(family))
     if not family.has_cli_adapter:
+        if family.has_gateway_adapter:
+            return run_via_gateway(a, family, engine, prompt)
         sys.exit(f"{C.yel}coli run is not wired for {family.display_name};{C.r} "
                  f"use coli chat or coli serve")
     if arch=="deepseek_v4":
@@ -1594,6 +1846,26 @@ def server_probe(base, api_key=None, timeout=1.5):
     except Exception:
         return None
 
+def server_restarting(base, api_key=None, timeout=1.5):
+    """Is the coli serve at `base` starting its engine again? Its /health answers 503
+    "restarting" while it does (openai_server.keep_engine, #2290): server_probe sees no
+    server then, and a chat must wait for this one rather than start a second."""
+    import urllib.request, urllib.error
+    req=urllib.request.Request(base.rstrip("/")+"/health")
+    if api_key: req.add_header("Authorization", f"Bearer {api_key}")
+    try:
+        urllib.request.urlopen(req, timeout=timeout).close()
+        return False
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code==503 and json.loads(e.read().decode("utf-8","replace")).get("status")=="restarting"
+        except Exception:
+            return False
+        finally:
+            e.close()
+    except Exception:
+        return False
+
 # ---- generation statistics for the chat footer (#1475) ----------------------
 # Measurement and rendering apart: gen_stats() counts (exact completion tokens
 # from the server's usage block when it sends one, the historical chars/4
@@ -1633,12 +1905,13 @@ def render_gen_stats(st, mode):
 # Stanno in un posto solo perche servono a tre cose che devono restare
 # d'accordo: il completamento col TAB, l'elenco di /help, e il controllo che
 # impedisce a un comando scritto male di partire come messaggio al modello.
-# Quest'ultimo e il motivo per cui esistono: prima "/brio merge" con una lettera
+# Quest'ultimo e il motivo per cui esistono: prima "/decide merge" con una lettera
 # sbagliata finiva dritto al modello, che rispondeva educatamente a una riga di
 # comando. Ogni forma si accetta sia con / sia con : -- i comandi storici usano
 # i due punti e non si toglie a nessuno l'abitudine.
 CHAT_COMMANDS = {
-    "brio":  "a | b | c   score the options instead of generating; no options returns to chat",
+    "file":   "PATH       a text file or a PDF, read here, its text sent with your next message",
+    "decide": "a | b | c  System One mode: score the options instead of generating; no options returns to chat",
     "reset": "            start the conversation again",
     "help":  "            this list",
     "quit":  "            leave (also :q)",
@@ -1650,6 +1923,13 @@ def chat_command(message):
     Il nome torna anche quando NON esiste: e il chiamante a decidere che farne,
     e deve poter distinguere "comando sbagliato" da "testo che comincia con /"."""
     if not message or message[0] not in "/:":
+        return None, None
+    # A picture's path is not a command. A file dragged into the terminal pastes
+    # "/home/me/photo.png" at the start of the line, and that line is a question
+    # about the picture; read as a command it got "comando sconosciuto" and the
+    # picture never left the prompt.
+    # The first word decides: "/save /tmp/x.png" is still the /save command.
+    if IMAGE_PATH.fullmatch(message.split()[0]):
         return None, None
     head, _, rest = message[1:].partition(" ")
     return head.strip().lower(), rest.strip()
@@ -1682,20 +1962,40 @@ def install_chat_completer(commands=None, arguments=None):
     readline.parse_and_bind("tab: complete")
     readline.set_completer(complete)
 
-def chat_brio(a, base, model_id, msgs, question, options, w):
-    """Un giro di modalita brio dalla TUI: una richiesta, una distribuzione.
+def conversation_state(msgs):
+    """The conversation so far as one text state, a "role: content" line per
+    message with text parts joined: what /decide sends as the context."""
+    lines=[]
+    for message in msgs:
+        if not isinstance(message, dict): continue
+        content=message.get("content")
+        if isinstance(content, list):
+            content="".join(part.get("text","") for part in content
+                            if isinstance(part, dict) and isinstance(part.get("text",""), str))
+        if content:
+            lines.append(f"{message.get('role','user')}: {content}")
+    return "\n".join(lines)
 
-    Il ciclo (fotografia del prefisso, una lettura per opzione, normalizzazione
-    per lunghezza) sta nel gateway, non qui: sono tre cose facili da sbagliare e
-    devono stare in un posto solo. Qui si manda la conversazione come contesto
-    e si disegnano le barre."""
+def decide_request(model_id, msgs, question, options):
+    """The POST /v1/systemone body of one /decide turn: the conversation as the
+    state, the question as one `choice` whose labels are the options."""
+    return {"model": model_id, "state": conversation_state(msgs),
+            "questions": {"decide": {"type": "choice", "instructions": question,
+                                     "criteria": {option: None for option in options}}}}
+
+def chat_brio(a, base, model_id, msgs, question, options, w):
+    """Un giro di modalita System One dalla TUI (/decide): una richiesta, una distribuzione.
+
+    Il ciclo (fotografia del prefisso, una lettura per opzione, normalizzazione)
+    sta nel gateway, non qui: sono tre cose facili da sbagliare e devono stare
+    in un posto solo. Qui si manda la conversazione come stato a
+    POST /v1/systemone, una domanda `choice`, e si disegnano le barre."""
     import urllib.request, urllib.error
-    body=json.dumps({"model":model_id,"messages":msgs,"question":question,
-                     "options":options}).encode()
-    req=urllib.request.Request(base.rstrip("/")+"/v1/brio", data=body,
+    body=json.dumps(decide_request(model_id, msgs, question, options)).encode()
+    req=urllib.request.Request(base.rstrip("/")+"/v1/systemone", data=body,
                                headers={"Content-Type":"application/json"})
     if a.api_key: req.add_header("Authorization", f"Bearer {a.api_key}")
-    print(f"\n  {C.teal}◆ brio{C.r}")
+    print(f"\n  {C.teal}◆ System One{C.r}")
     sp=Spinner("scoring…"); sp.start(); t0=time.time()
     try:
         with urllib.request.urlopen(req) as r:
@@ -1704,27 +2004,48 @@ def chat_brio(a, base, model_id, msgs, question, options, w):
         sp.stop()
         try: detail=json.loads(e.read().decode("utf-8","replace")).get("error",{}).get("message","")
         except Exception: detail=""
-        print(f"  {C.yel}[il server ha rifiutato: HTTP {e.code}{' — '+detail if detail else ''}]{C.r}\n")
+        print(f"  {C.yel}[il server ha rifiutato: HTTP {e.code}{': '+detail if detail else ''}]{C.r}\n")
         return
     except OSError as e:
         sp.stop(); print(f"  {C.yel}[server irraggiungibile: {e}]{C.r}\n"); return
     sp.stop()
+    answer=(out.get("answers") or {}).get("decide") or {}
+    probabilities=answer.get("probabilities") or {}
+    ranked=sorted(((option, float(probabilities.get(option, 0.0))) for option in options),
+                  key=lambda item: -item[1])
     bars=max(10, min(30, w-34))
-    for choice in out.get("choices", []):
-        p=choice.get("p",0.0); filled=int(round(p*bars))
-        colour=C.grn if choice["option"]==out.get("answer") else C.dgray
-        print(f"     {colour}{choice['option'][:22]:<22}{C.r} {colour}{'█'*filled}{C.r}"
-              f"{C.dgray}{'░'*(bars-filled)}{C.r} {p*100:5.1f}%"
-              f"  {C.dim}{choice.get('tokens',0)} tok{C.r}")
-    h=out.get("entropy",1.0)
+    for option, p in ranked:
+        filled=int(round(p*bars))
+        colour=C.grn if option==answer.get("choice") else C.dgray
+        print(f"     {colour}{option[:22]:<22}{C.r} {colour}{'█'*filled}{C.r}"
+              f"{C.dgray}{'░'*(bars-filled)}{C.r} {p*100:5.1f}%")
     # L'entropia e la parte che la generazione non sa dare: non "qual e la
-    # risposta" ma "quanto il modello sa di saperlo".
+    # risposta" ma "quanto il modello sa di saperlo". Normalizzata su log(n).
+    h=-sum(p*math.log(p) for _, p in ranked if p>0)/math.log(max(len(ranked),2))
     verdict=(f"{C.grn}sure{C.r}" if h<.4 else
              f"{C.yel}unsure{C.r}" if h<.8 else f"{C.yel}DOES NOT KNOW{C.r}")
     usage=out.get("usage",{})
-    print(f"     {C.b}→ {out.get('answer','?')}{C.r}  {C.dim}entropy {h:.3f}{C.r} ({verdict})")
-    print(f"  {C.dim}{time.time()-t0:.2f}s · {usage.get('read_tokens',0)} tokens read · "
-          f"{usage.get('completion_tokens',0)} generated{C.r}\n")
+    print(f"     {C.b}→ {answer.get('choice','?')}{C.r}  {C.dim}entropy {h:.3f}{C.r} ({verdict})")
+    print(f"  {C.dim}{time.time()-t0:.2f}s · {usage.get('input_tokens',0)} prompt tokens · "
+          f"{usage.get('output_tokens',0)} option tokens read · nothing generated{C.r}\n")
+
+# Families whose template thinks by default but that coli chat starts with thinking
+# OFF. On a model that streams its experts from disk at about 1 tok/s, the default
+# reasoning of MiMo-V2.6's template is minutes of tokens before the first word of the
+# answer, and a terminal that shows a spinner for that long looks hung. The API and
+# the web keep the template's default; here `--think` turns it on.
+CHAT_THINK_OFF = {"mimo"}
+
+def server_arch(base, api_key=None, timeout=1.5):
+    """The family a coli serve runs, from /health; None when it does not say."""
+    import urllib.request
+    try:
+        req=urllib.request.Request(base.rstrip("/")+"/health")
+        if api_key: req.add_header("Authorization", f"Bearer {api_key}")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8","replace")).get("arch")
+    except Exception:
+        return None
 
 def chat_attached(a, base, model_id):
     """The chat REPL over HTTP against a running `coli serve`.
@@ -1739,10 +2060,15 @@ def chat_attached(a, base, model_id):
     import urllib.request, urllib.error
     print(f"  {C.grn}✦ attached{C.r} {C.dim}to {base} · model {model_id} · the engine stays warm after you quit{C.r}")
     print(f"  {C.dim}type and press Enter · Ctrl-C stops the answer · :reset starts a new conversation · :q exits{C.r}")
-    print(f"  {C.dim}/ for commands · TAB completes · /brio puts the SAME model in brio mode{C.r}\n")
+    print(f"  {C.dim}/ for commands · TAB completes · /decide puts the SAME model in System One mode{C.r}\n")
     install_chat_completer()
+    arch=server_arch(base, getattr(a,"api_key",None))
+    if arch in CHAT_THINK_OFF and getattr(a,"think",None) is None:
+        print(f"  {C.dim}thinking is off here (--think turns it on){C.r}\n")
     msgs=[]
-    brio_options=[]          # non vuoto = modalita brio accesa
+    preload=chat_preload(a, base)  # --file, /file: documents' text, sent with the next message
+    compaction_seen=None     # the summary the server compacted this chat into, once said
+    brio_options=[]          # non vuoto = modalita System One accesa (/decide)
     w=term_w()-4
     while True:
         if TTY:
@@ -1765,22 +2091,29 @@ def chat_attached(a, base, model_id):
             chat_commands_help(); continue
         if name in ("quit",): break
         if name == "help": chat_commands_help(); continue
+        if name == "file":
+            if not rest: print(f"  {C.yel}  /file needs a path: /file ~/notes.txt{C.r}\n"); continue
+            block = read_document(rest, base)
+            if block is not None:
+                preload += ("\n\n" if preload else "") + block
+                print(f"  {C.dim}  it goes with your next message{C.r}\n")
+            continue
         if name == "reset":
-            msgs=[]; brio_options=[]
+            msgs=[]; brio_options=[]; compaction_seen=None; preload=""
             print(f"  {C.dim}✦ new conversation{C.r}\n"); continue
-        # ---- modalita brio -------------------------------------------------
+        # ---- modalita System One (/decide) ---------------------------------
         # Lo stesso modello con cui stai chattando smette di generare e comincia
         # a punteggiare: gli si danno le opzioni ammesse e lui dice quanto e
         # probabile ciascuna. La conversazione fin qui FA da contesto, quindi
-        # /brio a meta chat continua il discorso invece di ricominciarlo.
-        if name == "brio":
+        # /decide a meta chat continua il discorso invece di ricominciarlo.
+        if name == "decide":
             spec=rest
             if not spec:
                 if brio_options:
                     brio_options=[]
                     print(f"  {C.dim}✦ chat{C.r}\n")
                 else:
-                    print(f"  {C.yel}  /brio needs the options: /brio merge | request changes | close{C.r}\n")
+                    print(f"  {C.yel}  /decide needs the options: /decide merge | request changes | close{C.r}\n")
                 continue
             # dict.fromkeys deduplica tenendo l'ordine: il server rifiuta due
             # opzioni uguali con un 400, e "merge | merge | close" e' un refuso
@@ -1790,8 +2123,8 @@ def chat_attached(a, base, model_id):
                 brio_options=[]
                 print(f"  {C.yel}  at least two options are needed, separated by |{C.r}\n")
                 continue
-            print(f"  {C.grn}✦ brio{C.r} {C.dim}· {len(brio_options)} options · "
-                  f"the model stops generating and scores instead · /brio returns to chat{C.r}\n")
+            print(f"  {C.grn}✦ System One{C.r} {C.dim}· {len(brio_options)} options · "
+                  f"the model stops generating and scores instead · /decide returns to chat{C.r}\n")
             continue
         if brio_options:
             chat_brio(a, base, model_id, msgs, msg, brio_options, w)
@@ -1799,15 +2132,24 @@ def chat_attached(a, base, model_id):
         # --------------------------------------------------------------------
         payload = message_with_images(msg)
         if payload is None: continue          # percorso sbagliato: gia' detto
+        if preload:   # --file and /file: the documents go with this message
+            if isinstance(payload, str): payload = preload + "\n\n" + payload
+            else: payload = [{"type":"text","text":preload}] + payload
+            preload = ""
         msgs.append({"role":"user","content":payload})
         # Il livello di ragionamento e' una leva di tempo, non di gusto: su un
         # motore che streamma gli esperti da disco, "max" vuol dire centinaia
         # di token di riflessione prima della prima parola di risposta.
         request = {"model":model_id,"messages":msgs,"stream":True,
-                   "max_tokens":ngen_for(a,interactive=True),
+                   # a chat longer than the context goes on from a summary of its start
+                   "context_compaction":"auto",
                    "stream_options":{"include_usage":True}}   # exact completion_tokens in the last chunk
+        # without --ngen the server's own ceiling: the context it holds (serve_max_tokens)
+        if getattr(a,"ngen",None): request["max_tokens"]=a.ngen
         if getattr(a,"effort",None): request["reasoning_effort"]=a.effort
         if getattr(a,"think",None) is not None: request["enable_thinking"]=a.think
+        elif arch in CHAT_THINK_OFF:
+            request["enable_thinking"]=False   # --think turns it back on
         body=json.dumps(request).encode()
         req=urllib.request.Request(base.rstrip("/")+"/v1/chat/completions", data=body,
                                    headers={"Content-Type":"application/json"})
@@ -1815,7 +2157,7 @@ def chat_attached(a, base, model_id):
         print(f"\n  {C.teal}◆ colibri{C.r}")
         sp=Spinner("thinking…"); sp.start()
         md=MDStream("  "); reply=[]; first=True; t0=time.time(); interrupted=False; think_open=False
-        exact_tokens=None
+        exact_tokens=None; finish=None
         try:
             with urllib.request.urlopen(req) as r:
                 for raw in r:
@@ -1828,7 +2170,17 @@ def chat_attached(a, base, model_id):
                     usage=ev.get("usage")
                     if isinstance(usage,dict) and isinstance(usage.get("completion_tokens"),int):
                         exact_tokens=usage["completion_tokens"]
+                    compaction=ev.get("compaction")
+                    if (isinstance(compaction,dict)
+                            and compaction.get("summarized_messages")!=compaction_seen):
+                        # said when it happens: the turns after it run on the same summary
+                        compaction_seen=compaction.get("summarized_messages")
+                        sp.stop()
+                        print(f"  {C.dgray}✦ the first {compaction_seen} messages no longer fit the "
+                              f"model's context: the model now reads a summary of them{C.r}")
+                        sp=Spinner("thinking…"); sp.start()
                     for ch in ev.get("choices",[]):
+                        if ch.get("finish_reason"): finish=ch["finish_reason"]
                         d=ch.get("delta",{})
                         rtxt=d.get("reasoning_content")
                         if rtxt and os.environ.get("COLI_SHOW_THINK","1")=="0":
@@ -1882,8 +2234,12 @@ def chat_attached(a, base, model_id):
         else: msgs.pop()                              # turno vuoto: non sporcare la history
         el=time.time()-t0
         footer=render_gen_stats(gen_stats("".join(reply), el, exact_tokens, interrupted), chat_stats_mode(a))
-        if footer: print(f"\r  {C.dgray}└─ {footer}{C.r}\n")
-        else: print()
+        if footer: print(f"\r  {C.dgray}└─ {footer}{C.r}")
+        if finish=="length" and not interrupted:
+            # the turn hit the ceiling (--ngen) or filled the context, not its own end
+            print(f"  {C.yel}…cut off: the response reached "
+                  f"{'--ngen ('+str(a.ngen)+' tokens)' if getattr(a,'ngen',None) else 'the end of the context'}{C.r}")
+        print()
     print(f"  {C.dim}goodbye — the engine keeps running for the next chat 🐦{C.r}")
 
 def kv_resume_notice(model_dir):
@@ -1926,8 +2282,13 @@ IMAGE_SUFFIXES = (".png",".jpg",".jpeg",".webp",".bmp",".gif",".tif",".tiff")
 # da shlex, che in modalita' POSIX mangia le barre rovesciate e va in errore su
 # un apostrofo -- cioe' su una frase italiana su due.
 _ESTENSIONI = "|".join(suffix[1:] for suffix in IMAGE_SUFFIXES)
+# a drive with either slash (Python on MSYS2 and many Windows tools write C:/...), never a
+# letter or slash inside a word ("Nota:/tmp/x.png" is /tmp/x.png, "WebP/AVIF" is prose)
+_IMAGE_PATH_START = r"(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]|~?/|\./)"
 IMAGE_PATH = re.compile(
-    r"(?:[A-Za-z]:\\|~?/|\./)[^\"'<>|?*\n]*?\.(?:" + _ESTENSIONI + r")\b",
+    r'"' + _IMAGE_PATH_START + r'[^"\n]*\.(?:' + _ESTENSIONI + r')"'
+    + r"|'" + _IMAGE_PATH_START + r"[^'\n]*\.(?:" + _ESTENSIONI + r")'"
+    + r"|" + _IMAGE_PATH_START + r"[^\"'<>|?*\n]*?\.(?:" + _ESTENSIONI + r")\b",
     re.IGNORECASE)
 
 
@@ -1937,7 +2298,7 @@ def to_local_path(token):
     Un percorso Windows incollato da Esplora risorse dentro WSL indica un file
     che da qui si chiama /mnt/<lettera>/...: senza tradurlo non esiste."""
     token = token.strip().strip('"').strip("'")
-    if re.fullmatch(r"[A-Za-z]:\\.*", token, re.S):
+    if re.fullmatch(r"[A-Za-z]:[\\/].*", token, re.S):
         if sys.platform == "win32":
             return token
         return f"/mnt/{token[0].lower()}/" + token[2:].replace("\\", "/").lstrip("/")
@@ -1987,6 +2348,167 @@ def message_with_images(text):
         # COLI_IMAGE_ROOT, and a path sent by mistake would be refused.
         content.append({"type":"image_url","image_url":{"url":image_data_uri(path)}})
     return content
+
+# ---- documents in chat (#2431): /file PATH, and coli chat --file PATH ----------------
+#
+# A document goes to the model only when the user names it: `/file PATH` in the chat (it
+# goes with the next message) or `coli chat --file PATH` (with the first). A path is never
+# picked out of a message's text: text pasted from elsewhere would otherwise read a file
+# from this machine and send it to the server, which `--attach` can put on another host.
+# What is read is bounded and checked first: a regular file (a FIFO or a device would block
+# or never end), one of the text suffixes below or a PDF (a key or a dotfile has none of
+# them), at most DOC_MAX_BYTES on disk and DOC_MAX_CHARS of text, no NUL byte, the control
+# characters other than tab and newline taken out. A PDF is parsed by another process,
+# never this one: pdftotext (poppler) or pypdf in a child Python, from an empty temporary
+# directory (no module there for it to import), with a time limit, a memory limit where the
+# system has one, and its output read up to the bound; the path is absolute, so it can never
+# read as an option.
+DOCUMENT_SUFFIXES = (".txt", ".md", ".markdown", ".rst", ".csv", ".tsv", ".json", ".jsonl",
+                     ".log", ".xml", ".yaml", ".yml", ".tex", ".pdf")
+DOC_MAX_BYTES = 64 << 20          # a file, on disk
+DOC_MAX_CHARS = 2_000_000         # its text: about 500K tokens, past every context served
+DOC_PDF_SECONDS = 120
+DOC_PDF_MEMORY = 2 << 30          # the PDF reader's address space, where RLIMIT_AS exists
+_DOC_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+_PYPDF_CHILD = (
+    "import sys\n"
+    "from pypdf import PdfReader\n"
+    "left = int(sys.argv[2])\n"
+    "for page in PdfReader(sys.argv[1]).pages:\n"
+    "    t = (page.extract_text() or '') + '\\n\\n'\n"
+    "    sys.stdout.write(t[:left]); left -= len(t)\n"
+    "    if left <= 0: break\n")
+
+
+def printable_name(path):
+    """A file's name as the terminal may print it: control characters (an escape sequence
+    in a name would drive the terminal) shown as '?'."""
+    return _DOC_CONTROL.sub("?", os.path.basename(path)) or "?"
+
+
+def _run_bounded(cmd, cap):
+    """cmd's stdout, read up to cap bytes, from an empty temporary directory, under
+    DOC_PDF_SECONDS and, where sh has ulimit -v, DOC_PDF_MEMORY (set by a shell that then
+    execs cmd, its words passed as arguments, never as shell text; no preexec_fn, which is
+    not safe beside the chat's threads). (bytes, None) or (None, why)."""
+    sh = shutil.which("sh") if os.name == "posix" else None
+    if sh:
+        cmd = [sh, "-c", f'ulimit -v {DOC_PDF_MEMORY >> 10} 2>/dev/null; exec "$0" "$@"'] + list(cmd)
+    with tempfile.TemporaryDirectory(prefix="coli-doc-") as empty:
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                                 cwd=empty, start_new_session=os.name == "posix")
+        except OSError as error:
+            return None, str(error)
+        out = bytearray()
+        def pump():
+            while len(out) <= cap:
+                chunk = p.stdout.read(1 << 16)
+                if not chunk:
+                    break
+                out.extend(chunk)
+        reader = threading.Thread(target=pump, daemon=True)
+        reader.start()
+        reader.join(DOC_PDF_SECONDS)
+        if reader.is_alive() or len(out) > cap:
+            try:   # the reader and whatever it started: none may keep the pipe open
+                if os.name == "posix": os.killpg(p.pid, signal.SIGKILL)
+                else: p.kill()
+            except OSError:
+                pass
+            p.wait(); reader.join(5)
+            if not reader.is_alive(): p.stdout.close()
+            return None, (f"its text is past {DOC_MAX_CHARS:,} characters" if len(out) > cap
+                          else f"reading it took longer than {DOC_PDF_SECONDS} s")
+        code = p.wait(); p.stdout.close()
+        if code != 0:
+            return None, f"the PDF reader stopped (exit {code})"
+        return bytes(out), None
+
+
+def document_text(path):
+    """(text, None) for a document the user named, or (None, why); see the block above."""
+    import importlib.util, stat as stat_mod
+    path = os.path.abspath(path)
+    name = path.lower()
+    if not name.endswith(DOCUMENT_SUFFIXES):
+        return None, "not a text file or a PDF (" + ", ".join(DOCUMENT_SUFFIXES) + ")"
+    try:
+        st = os.stat(path)
+    except OSError as error:
+        return None, error.strerror or str(error)
+    if not stat_mod.S_ISREG(st.st_mode):
+        return None, "not a regular file"
+    if st.st_size > DOC_MAX_BYTES:
+        return None, f"{st.st_size:,} bytes, past the {DOC_MAX_BYTES >> 20} MiB a document may have"
+    if name.endswith(".pdf"):
+        cap = DOC_MAX_CHARS * 4   # UTF-8 bytes of at most that many characters
+        tool = shutil.which("pdftotext")
+        if tool:
+            raw, why = _run_bounded([tool, "-layout", "-enc", "UTF-8", path, "-"], cap)
+        elif importlib.util.find_spec("pypdf") is not None:
+            raw, why = _run_bounded([sys.executable, "-c", _PYPDF_CHILD, path, str(DOC_MAX_CHARS + 1)], cap)
+        else:
+            return None, ("reading a PDF needs pdftotext (poppler: apt install poppler-utils, "
+                          "brew install poppler) or pypdf (pip install pypdf)")
+        if raw is None:
+            return None, why
+        text = raw.decode("utf-8", "replace")
+        if not text.strip():
+            return None, "the PDF has no text layer (a scan: it needs OCR first)"
+    else:
+        try:
+            with open(path, "rb") as handle:
+                raw = handle.read(DOC_MAX_BYTES + 1)
+        except OSError as error:
+            return None, error.strerror or str(error)
+        if b"\0" in raw:
+            return None, "not a text file (it holds NUL bytes)"
+        text = raw.decode("utf-8", "replace")
+    if len(text) > DOC_MAX_CHARS:
+        return None, f"its text is past {DOC_MAX_CHARS:,} characters"
+    return _DOC_CONTROL.sub("", text), None
+
+
+def document_block(path, text):
+    name = printable_name(path)
+    return f"[file {name}]\n{text.rstrip()}\n[end of {name}]"
+
+
+def read_document(path, base=None, note=None):
+    """The block for a document the user named (`/file`, `--file`), after saying what was
+    read and, for a server not on this machine, where it goes. None after saying why not."""
+    note = note or print
+    local = to_local_path(path)
+    text, why = document_text(local)
+    if text is None:
+        note(f"  {C.yel}✗ {printable_name(local)}{C.r}: {why}")
+        return None
+    note(f"  {C.grn}✓ attached{C.r} {printable_name(local)} {C.dim}· {len(text):,} characters, "
+         f"about {len(text) // 4:,} tokens{C.r}")
+    if base and not is_local_base(base):
+        note(f"  {C.yel}  its text goes to {base}, a server on another machine{C.r}")
+    return document_block(local, text)
+
+
+def is_local_base(base):
+    """A server address on this machine (loopback names and addresses)."""
+    from urllib.parse import urlparse
+    host = (urlparse(base).hostname or "").lower()
+    return host in ("localhost", "::1") or host.startswith("127.")
+
+
+def chat_preload(a, base=None):
+    """`coli chat --file`'s documents as one text, which goes with the first message; a
+    file that cannot be read stops the chat before it starts."""
+    blocks = []
+    for path in getattr(a, "file", None) or []:
+        block = read_document(path, base)
+        if block is None:
+            sys.exit(f"--file {printable_name(path)}: not read (above)")
+        blocks.append(block)
+    return "\n\n".join(blocks)
+
 
 def image_data_uri(path):
     """base64 data: URI of a local image, MIME from the extension (PNG when unknown)."""
@@ -2508,6 +3030,71 @@ def server_model_entry(base, api_key=None, timeout=1.5):
     except Exception:
         return {}
 
+def tui_binary():
+    """colibri-tui next to coli (an archive, a source build), or in libexec (make install)."""
+    local = os.path.join(HERE, "colibri-tui" + _EXE)
+    return local if os.path.exists(local) else os.path.join(_LIBEXEC, "colibri-tui" + _EXE)
+
+def run_tui(a, base):
+    """The terminal interface against the server at `base`, until the user quits it. The key
+    travels in the environment, not on the command line, where `ps` would show it."""
+    env = dict(os.environ)
+    if getattr(a, "api_key", None): env["COLI_API_KEY"] = a.api_key
+    return subprocess.call([tui_binary(), "--server", base], env=env)
+
+def cmd_tui(a):
+    """`coli tui`: the TUI attached to a running coli serve (--attach, else localhost:8000), or to a
+    server it starts for --model and stops when the TUI quits. The server's output goes to a log:
+    on the terminal it would draw over the interface."""
+    if not os.path.exists(tui_binary()):
+        sys.exit(f"colibri-tui is not built: run `make -C c colibri-tui` (docs/tui.md)")
+    base = getattr(a, "attach", None) or "http://127.0.0.1:8000"
+    if not getattr(a, "no_attach", False):
+        mid = server_probe(base, getattr(a, "api_key", None))
+        if mid:
+            sys.exit(run_tui(a, base))
+        if getattr(a, "attach", None):
+            sys.exit(f"--attach: no coli serve answering at {base} (start one with: coli serve --model <dir>)")
+    if not a.model:
+        sys.exit("coli tui: no coli serve answers at http://127.0.0.1:8000. Start one "
+                 "(coli serve --model <dir>) or give the model here: coli tui --model <dir>")
+    need_model(a.model)
+    resolved = resolve_model(a.model); family = resolved.descriptor; arch = family.id
+    if not family.has_gateway_adapter:
+        sys.exit(f"{family.display_name}: gateway adapter is not wired")
+    if family.modality != "text":
+        sys.exit(f"{family.display_name} is not a text model: the TUI chats; use coli chat")
+    engine = engine_for(a.model)
+    need_model(a.model, engine)
+    from family_registry import default_model_id
+    model_id = default_model_id(resolved)
+    import openai_server
+    cmd = [sys.executable, openai_server.__file__, "--model", a.model, "--engine", engine, "--arch", arch,
+           "--model-id", model_id, "--host", "127.0.0.1", "--port", "8000", "--max-tokens", str(serve_max_tokens(a))]
+    if a.cap is not None: cmd += ["--cap", str(a.cap)]
+    if a.api_key: cmd += ["--api-key", a.api_key]
+    log_path = os.path.join(tempfile.gettempdir(), "colibri-tui-server.log")
+    with open(log_path, "w", encoding="utf-8") as log:
+        p = subprocess.Popen(cmd, env=env_for_engine(a, arch), stdout=log, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL)
+    try:
+        sp = Spinner(f"loading {model_id}…"); sp.start()
+        for _ in range(1800):
+            if p.poll() is not None:
+                sp.stop(); sys.exit(f"{model_id} server exited while loading: see {log_path}")
+            if server_probe("http://127.0.0.1:8000", a.api_key, timeout=1.0):
+                sp.stop()
+                code = run_tui(a, "http://127.0.0.1:8000")
+                print(f"  {C.dim}the server's log: {log_path}{C.r}")
+                sys.exit(code)
+            time.sleep(1)
+        sp.stop(); sys.exit(f"timed out loading {model_id}: see {log_path}")
+    finally:
+        if p.poll() is None:
+            p.terminate()
+            try: p.wait(timeout=10)
+            except subprocess.TimeoutExpired: p.kill()
+
 def cmd_chat(a):
     # ATTACH: a running `coli serve` beats a private engine every time — the load
     # (34-136 s) and the cache warmth survive between sessions. Explicit --attach
@@ -2516,6 +3103,13 @@ def cmd_chat(a):
     if not getattr(a,"no_attach",False):
         base=getattr(a,"attach",None) or "http://127.0.0.1:8000"
         mid=server_probe(base, getattr(a,"api_key",None))
+        if not mid and server_restarting(base, getattr(a,"api_key",None)):
+            sp=Spinner(f"{base} is starting its engine again…"); sp.start()
+            try:
+                while not mid and server_restarting(base, getattr(a,"api_key",None)):
+                    time.sleep(1); mid=server_probe(base, getattr(a,"api_key",None))
+            finally:
+                sp.stop()
         if mid:
             entry=server_model_entry(base, getattr(a,"api_key",None))
             serves_images="image_generation" in (entry.get("capabilities") or [])
@@ -2531,6 +3125,9 @@ def cmd_chat(a):
                                                      entry.get("image")), mid)
                     print(f"  {C.dim}goodbye: the engine keeps running for the next session{C.r}")
                     return
+                if "decision" in (entry.get("capabilities") or []):
+                    sys.exit(f"{C.yel}{base} serves {mid}, a decision model:{C.r} it does not chat. "
+                             f"POST /v1/systemone to it (docs/systemone.md)")
                 banner(f"chat · {mid} · attached")
                 chat_attached(a, base, mid); return
             print(f"  {C.dim}{base} serves {mid}, not an "
@@ -2542,6 +3139,8 @@ def cmd_chat(a):
     arch=family.id
     if not family.has_gateway_adapter:
         sys.exit(f"{family.display_name}: gateway adapter is not wired")
+    if family.modality=="decision":
+        sys.exit(decision_refusal(family))
     if family.modality=="image":
         engine=engine_for(a.model)
         need_model(a.model,engine)
@@ -2570,7 +3169,7 @@ def cmd_chat(a):
         cmd=[sys.executable,openai_server.__file__,"--model",a.model,
              "--engine",engine,"--arch",arch,"--model-id",model_id,
              "--host","127.0.0.1","--port","8000","--max-tokens",
-             str(ngen_for(a,interactive=True,family=family))]
+             str(serve_max_tokens(a))]
         if a.cap is not None: cmd+=["--cap",str(a.cap)]
         if a.api_key: cmd+=["--api-key",a.api_key]
         p=subprocess.Popen(cmd,env=env_for_engine(a,arch))
@@ -2668,6 +3267,7 @@ def cmd_chat(a):
                     print(f"  {C.dgray}{chunk}{C.r}")
     except Exception: pass
     print(f"  {C.dim}type and press Enter · Ctrl-C stops the answer · :more continues · :reset clears memory · :q exits{C.r}\n")
+    preload=chat_preload(a)
     w=term_w()-4
     try:
         while True:
@@ -2690,6 +3290,13 @@ def cmd_chat(a):
             if msg in (":piu",":più",":more",":continua"):
                 p.stdin.write(b"\x02MORE\n"); p.stdin.flush()
             else:
+                if msg.startswith(("/file ",":file ")):   # a document for the next message
+                    block=read_document(msg.split(None,1)[1])
+                    if block is not None:
+                        preload+=("\n\n" if preload else "")+block
+                        print(f"  {C.dim}  it goes with your next message{C.r}\n")
+                    continue
+                if preload: msg=preload+"\n\n"+msg; preload=""   # --file and /file: with this message
                 p.stdin.write((msg.replace("\n"," ")+"\n").encode()); p.stdin.flush()
             print(f"\n  {C.teal}◆ colibri{C.r}")
             dec=codecs.getincrementaldecoder("utf-8")("replace")
@@ -2717,6 +3324,23 @@ def cmd_chat(a):
             if not raw: md.close()
             sp2.stop()
             if st is None: engine_diag(p, errlog); break
+            if st.get("context_exceeded"):
+                # #2097: the turn was refused, not answered. An empty answer
+                # here used to read as the model going silent, with the reason
+                # only in the engine's stderr, which this client drains to a
+                # temporary log and never shows. Say why, and what fixes it.
+                cause=st["context_exceeded"]
+                if cause=="HISTORY_FULL":
+                    why="the conversation history no longer fits the context"
+                    hint="type :reset to clear it and continue"
+                elif cause=="RENDER_CLIPPED":
+                    why="the prompt text exceeded the 64KB render buffer and was clipped"
+                    hint="paste it in shorter chunks"
+                else:  # PROMPT_TOO_LONG, or an older engine with no cause token
+                    why="this turn does not fit the context"
+                    hint="shorten the prompt or raise CTX (:reset only clears history)"
+                print(f"  {C.yel}[context is full: {why}; {hint}]{C.r}\n")
+                continue
             el=time.time()-t0
             if st.get("tok") and chat_stats_mode(a) == "off":
                 if st.get("interrupted"): print(f"  {C.yel}⏹ interrupted; type :more to continue the response{C.r}")
@@ -2741,12 +3365,102 @@ def cmd_chat(a):
     print(f"  {C.teal}goodbye{C.r} {C.dim}— the hummingbird returns to its nest{C.r} 🐦\n")
 
 def serve_pidfile(port): return os.path.join(tempfile.gettempdir(), f"coli-serve-{port}.pid")
+def serve_stopfile(port): return os.path.join(tempfile.gettempdir(), f"coli-serve-{port}.stop")
+
+# A stop that needs no rights on the process (#2091). `coli stop` puts this file
+# next to the pidfile and the serve, which watches for it, ends itself the way
+# SIGTERM ends it (the engine drained, its heat saved). Ending a process from
+# outside needs rights on it: a serve started from an administrator console
+# cannot be ended from a normal prompt on Windows (TerminateProcess and taskkill
+# are both denied), and before this `coli stop` said "stopped" all the same.
+def _stop_file_is_ours(path):
+    """A stop request from this user. The temp folder is shared on POSIX, so a file
+    another user put there is not one (Windows gives every user a %TEMP% of its own)."""
+    try: st=os.stat(path)
+    except OSError: return False
+    return not hasattr(os,"getuid") or st.st_uid==os.getuid()
+
+def _stop_self():
+    """End this serve the way its signal handlers do (openai_server.serve): SIGBREAK on
+    Windows, where a SIGTERM sent with os.kill is TerminateProcess, SIGTERM elsewhere.
+    Before the handlers are in place the default action ends the process, a stop too."""
+    if sys.platform=="win32": signal.raise_signal(signal.SIGBREAK)
+    else: os.kill(os.getpid(),signal.SIGTERM)
+
+def _watch_stop_file(path, on_stop, interval=0.5, done=None):
+    """Thread body: when this user's stop request appears, consume it and stop; return
+    as soon as `done` (a threading.Event) is set, the serve having ended on its own."""
+    while not (done is not None and done.is_set()):
+        if os.path.exists(path) and _stop_file_is_ours(path):
+            try: os.unlink(path)
+            except OSError: pass
+            on_stop(); return
+        if done is not None: done.wait(interval)
+        else: time.sleep(interval)
+
+def _request_stop(port, wait=2.0):
+    """Ask the serve on `port` to stop itself; True once it took the request (the file
+    is gone), False when nothing consumed it within `wait` seconds (a serve from before
+    the request existed, or one that is hung)."""
+    path=serve_stopfile(port)
+    try:
+        with open(path,"w") as f: f.write(f"{os.getpid()}\n")
+    except OSError: return False
+    deadline=time.time()+wait
+    while time.time()<deadline:
+        if not os.path.exists(path): return True
+        time.sleep(0.1)
+    try: os.unlink(path)          # not taken: leave no request for a later serve
+    except OSError: pass
+    return False
+
+def _win_terminate(pid):
+    """TerminateProcess with the one right it needs. os.kill asks PROCESS_ALL_ACCESS,
+    which a process may refuse while it grants PROCESS_TERMINATE. None, or why not."""
+    import ctypes
+    from ctypes import wintypes
+    PROCESS_TERMINATE, ERROR_INVALID_PARAMETER = 0x0001, 87
+    k32=ctypes.WinDLL("kernel32",use_last_error=True)
+    k32.OpenProcess.restype=wintypes.HANDLE
+    k32.OpenProcess.argtypes=(wintypes.DWORD,wintypes.BOOL,wintypes.DWORD)
+    k32.TerminateProcess.argtypes=(wintypes.HANDLE,wintypes.UINT)
+    k32.CloseHandle.argtypes=(wintypes.HANDLE,)
+    handle=k32.OpenProcess(PROCESS_TERMINATE,False,pid)
+    if not handle:
+        err=ctypes.get_last_error()
+        return None if err==ERROR_INVALID_PARAMETER else f"{ctypes.FormatError(err).strip()} (WinError {err})"
+    try:
+        if k32.TerminateProcess(handle,1): return None
+        err=ctypes.get_last_error()
+        # an ended process whose object something still holds (a handle open
+        # anywhere) opens fine and then refuses the end with ERROR_ACCESS_DENIED
+        if not _pid_alive(pid): return None
+        return f"{ctypes.FormatError(err).strip()} (WinError {err})"
+    finally:
+        k32.CloseHandle(handle)
+
+def _terminate(pid):
+    """End `pid` now. None, or why it could not be ended. On Windows the least rights
+    first (_win_terminate), then taskkill, which ends the process tree."""
+    if sys.platform!="win32":
+        try: os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM)); return None
+        except ProcessLookupError: return None
+        except OSError as error: return str(error)
+    why=_win_terminate(pid)
+    if why is None: return None
+    try:
+        r=subprocess.run(["taskkill","/PID",str(pid),"/T","/F"],capture_output=True,text=True,timeout=30)
+    except (OSError,subprocess.SubprocessError) as error:
+        return f"{why}; taskkill: {error}"
+    if r.returncode==0: return None
+    return f"{why}; taskkill: {(r.stdout+r.stderr).strip() or f'exit {r.returncode}'}"
 
 def _serve_cmdline_matches_port(raw, port):
     argv=[part.decode("utf-8","replace") for part in raw.split(b"\0") if part]
     try: coli_i=next(i for i,arg in enumerate(argv) if os.path.basename(arg)=="coli")
     except StopIteration: return False
-    if coli_i+1>=len(argv) or argv[coli_i+1]!="serve":
+    # `coli web` is a serve too, and the one `coli start` runs
+    if coli_i+1>=len(argv) or argv[coli_i+1] not in ("serve","web"):
         return False
     configured=8000
     for i,arg in enumerate(argv[coli_i+2:], start=coli_i+2):
@@ -2770,6 +3484,15 @@ def _serve_engine_env(a, arch):
     env["COLI_SERVE_PORT"]=str(a.port)
     return env
 
+def serve_model_id(a):
+    """The API model id `coli serve` announces: --model-id if given, else the id of
+    what was actually loaded. A family can serve checkpoints of different size
+    (MiMo-V2.6 Flash and Pro, Qwen3.6 and Qwen3.8-27B), and the family's default
+    named the larger sibling as the smaller one. `coli chat` already asks the
+    registry the same way."""
+    from family_registry import default_model_id
+    return a.model_id or default_model_id(resolve_model(a.model))
+
 def cmd_serve(a):
     need_model(a.model)
     family=resolve_model(a.model).descriptor
@@ -2782,12 +3505,29 @@ def cmd_serve(a):
         sys.exit(f"{arch} currently supports at most {family.limits.max_kv_slots} KV slot(s)")
     # pidfile: cosi' `coli stop` spegne tutto con un comando, senza pkill a mano.
     # EN: pidfile so `coli stop` can shut everything down without manual pkill.
+    pidfile=serve_pidfile(a.port)
+    # A serve already on this port gets its pidfile back when this one ends (at once,
+    # the port being taken), or coli stop and coli status lose track of it.
     try:
-        with open(serve_pidfile(a.port),"w") as f: f.write(f"{os.getpid()} {a.model}\n")
+        with open(pidfile) as f: owner=f.read()
+        if not _pid_alive(int(owner.split()[0])): owner=None
+    except (OSError,ValueError,IndexError): owner=None
+    try:
+        with open(pidfile,"w") as f: f.write(f"{os.getpid()} {a.model}\n")
     except OSError: pass
+    # and the stop request `coli stop` leaves when it cannot end this process itself.
+    # The watcher ends with the serve: left running in a process that goes on (a test
+    # runner calling cmd_serve), a later `coli stop` of the same port would end that.
+    stopfile=serve_stopfile(a.port)
+    if _stop_file_is_ours(stopfile):           # one left from a stop that found no serve
+        try: os.unlink(stopfile)
+        except OSError: pass
+    served=threading.Event()
+    threading.Thread(target=_watch_stop_file,args=(stopfile,_stop_self),kwargs={"done":served},
+                     daemon=True,name="coli-stop-request").start()
     import openai_server
     openai_server.ARCH=arch
-    model_id=a.model_id or family.default_model_id
+    model_id=serve_model_id(a)
     try:
         if a.temp is not None: os.environ["COLI_TEMP"] = str(a.temp)
         env=_serve_engine_env(a,arch)
@@ -2802,13 +3542,34 @@ def cmd_serve(a):
             env["CLUSTER_WORKERS"] = ",".join(workers)
             print(f"  {C.dim}[CLUSTER] discovered {len(workers)} expert worker(s){C.r}", file=sys.stderr)
         openai_server.serve(a.model,a.host,a.port,model_id,a.api_key,
-              a.cap,ngen_for(a,interactive=True,family=family),engine,
+              a.cap,serve_max_tokens(a),engine,
               env,a.cors_origin,
               a.max_queue,a.queue_timeout,a.kv_slots,allowed_hosts=a.allowed_host,
               family=family)
     finally:
-        try: os.unlink(serve_pidfile(a.port))
+        served.set()
+        try:
+            with open(pidfile) as f: ours=f.read().split()[:1]==[str(os.getpid())]
+            if ours and owner:
+                with open(pidfile,"w") as f: f.write(owner)
+            elif ours: os.unlink(pidfile)
         except OSError: pass
+
+def _proc_state(pid):
+    """The state letter of `pid` (R, S, Z, ...), None when it cannot be read.
+    Linux: /proc/<pid>/stat, after the command name. Elsewhere (macOS, the BSDs:
+    no /proc) the first letter of `ps -o stat=`."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f: stat = f.read()
+        return stat[stat.rindex(b")") + 2:stat.rindex(b")") + 3].decode()
+    except (OSError, ValueError):
+        if os.path.isdir("/proc/self"): return None
+    try:
+        out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out[:1] or None
+
 
 def _pid_alive(pid):
     """Is `pid` a live process?
@@ -2821,8 +3582,12 @@ def _pid_alive(pid):
     were resident (#1049, reported with a reproduction on Windows 11 native).
     On win32 ask the OS directly instead."""
     if sys.platform != "win32":
-        try: os.kill(pid, 0); return True
+        try: os.kill(pid, 0)
         except OSError: return False
+        # A zombie answers kill(0) but is gone: it holds no memory, and only its
+        # parent can reap it, so cmd_stop's check that everything ended must not
+        # wait on it.
+        return _proc_state(pid) != "Z"
     import ctypes
     from ctypes import wintypes
     PROCESS_QUERY_LIMITED_INFORMATION, STILL_ACTIVE = 0x1000, 259
@@ -2852,14 +3617,19 @@ def cmd_cluster_worker(a):
     stop_heartbeat=threading.Event()
     if coordinator:
         from cluster import heartbeat, register
-        register(coordinator, {"node_id":node_id, "host":host, "port":a.port,
-                               "role":"expert", "layers":a.layers})
+        node={"node_id":node_id, "host":host, "port":a.port, "role":"expert", "layers":a.layers}
+        register(coordinator, node)
         def keep_registered():
             while not stop_heartbeat.wait(10):
                 try: heartbeat(coordinator, node_id)
-                except OSError: pass
+                except OSError:
+                    # a restarted coordinator has an empty registry and refuses the
+                    # heartbeat of a node it does not know: register again
+                    try: register(coordinator, node)
+                    except OSError: pass
         threading.Thread(target=keep_registered, name="colibri-cluster-heartbeat", daemon=True).start()
-    e=env_for(a)
+    glm53 = resolve_model(a.model).descriptor.id == "glm53"
+    e=env_for_engine(a,"glm53") if glm53 else env_for(a)
     e.update({"EXPERT_WORKER":"1", "CLUSTER_WORKER_PORT":str(a.port),
               "COLI_MMAP":os.environ.get("COLI_MMAP", "1")})
     print(f"  {C.dim}[CLUSTER] expert worker · {host}:{a.port} · layers {a.layers}{C.r}")
@@ -2870,6 +3640,12 @@ def cmd_cluster_worker(a):
         # could only ever start with an explicit --cap (#1452). Fallback 0 is
         # what the other GLM launch sites pass: the engine resolves its own cap
         # when the argument is zero.
+        if glm53:
+            # glm53 takes only the cache/layer cap positionally (every number
+            # is read as a cap), and the model from --model; its expert bits
+            # come from the checkpoint.
+            return subprocess.call([engine,str(cap_for_launch(a.cap,e,0)),
+                                    "--model",os.path.abspath(a.model)],env=e)
         return subprocess.call([engine,str(cap_for_launch(a.cap,e,0)),
                                 str(a.ebits),str(a.dbits)],env=e)
     finally:
@@ -2936,6 +3712,14 @@ def cmd_stop(a):
     real processes: the pidfile first, then /proc by cmdline/environ — only
     the requested port's tagged engine and matching `coli serve` wrapper."""
     banner("stop")
+    if a.port is None:
+        # Default 8000, or the port `coli setup` configured: the same server
+        # `coli start` launched is the one `coli stop` stops.
+        try:
+            from setup_flow import configured_port
+            a.port=configured_port(8000)
+        except Exception:
+            a.port=8000
     targets={}  # pid -> descrizione
     pf=serve_pidfile(a.port)
     try:
@@ -2962,25 +3746,75 @@ def cmd_stop(a):
     launchers = [pid for pid, d in targets.items() if d.startswith("coli serve")]
     strays   = [pid for pid, d in targets.items() if not d.startswith("coli serve")]
     deadline = time.time() + 30.0
-    for pid in launchers:
-        try: os.kill(pid, signal.SIGTERM)
-        except OSError: pass
+    # The serve's own stop first (_request_stop): it needs no rights on the process.
+    # On Windows a SIGTERM is TerminateProcess, no drain, so it is sent only to a
+    # serve that did not take the request; elsewhere SIGTERM is the same graceful
+    # stop and goes along with it.
+    asked = bool(launchers) and _request_stop(a.port)
+    if sys.platform != "win32" or not asked:
+        for pid in launchers:
+            try: os.kill(pid, signal.SIGTERM)
+            except OSError: pass
     while time.time() < deadline and any(_pid_alive(p) for p in launchers):
         time.sleep(0.25)
     for pid in strays:
         try: os.kill(pid, signal.SIGTERM)   # normally already gone with the launcher
         except OSError: pass
     time.sleep(2.0)
+    why = {}
     for pid in targets:
-        # signal.SIGKILL does not exist on win32 and AttributeError is not OSError,
-        # so the bare `except OSError` let it escape and abort the command AFTER
-        # the SIGTERMs above (#1049). Line 752 in this file already uses the
-        # getattr form; os.kill(SIGTERM) is TerminateProcess on Windows anyway.
-        try: os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM)); print(f"  {pid}: forced")
-        except OSError: pass       # gia' morto: bene
+        if not _pid_alive(pid): continue   # gia' morto: bene
+        error = _terminate(pid)
+        if error is None: print(f"  {pid}: forced")
+        else: why[pid] = error
+    deadline = time.time() + 10.0
+    while time.time() < deadline and any(_pid_alive(p) for p in targets):
+        time.sleep(0.25)
+    left = [pid for pid in targets if _pid_alive(pid)]
+    if left:
+        # Saying "stopped" here left a multi-GB engine running behind a message that
+        # it was gone (#2091): the failure is the answer.
+        for pid in left:
+            print(f"  {C.yel}could not stop {pid}{C.r} ({targets[pid]}): {why.get(pid, 'still running')}")
+        if why and sys.platform == "win32":
+            print("  it runs with more rights than this prompt (started from an administrator console?): "
+                  "run coli stop from a prompt like the one that started it")
+        sys.exit(1)
     try: os.unlink(pf)
     except OSError: pass
     print(f"  {C.grn}✓ stopped{C.r} — RAM released")
+
+def cmd_ui(a):
+    """the chat UI (ui/server.py) against a running gateway (`coli serve`), the browser
+    opened on it once it answers"""
+    cands = [os.path.join(HERE, "ui", "server.py"),
+             os.path.join(os.path.dirname(os.path.abspath(HERE)), "ui", "server.py")]
+    server = next((c for c in cands if os.path.exists(c)), None)
+    if server is None:
+        sys.exit(f"{C.yel}the chat UI is not in this tree{C.r} (ui/server.py next to coli or one level up)")
+    shown = "127.0.0.1" if a.host in ("0.0.0.0", "") else a.host
+    url = f"http://{shown}:{a.port}/"
+    print(f"  {C.dim}the chat UI on {url}, the gateway at {a.backend} "
+          f"(start it with  coli serve --model DIR  if it is not running){C.r}")
+    if not a.no_browser:
+        import threading, urllib.request, webbrowser
+        def opener():
+            for _ in range(150):
+                time.sleep(0.2)
+                try:
+                    urllib.request.urlopen(url, timeout=2); break
+                except OSError:
+                    continue
+            webbrowser.open(url)
+        threading.Thread(target=opener, daemon=True).start()
+    cmd = [sys.executable, server, "--host", a.host, "--port", str(a.port), "--backend", a.backend]
+    if a.models_backend: cmd += ["--models-backend", a.models_backend]
+    for d in a.models_dir or []: cmd += ["--models-dir", d]
+    if a.searx: cmd += ["--searx", a.searx]
+    try:
+        sys.exit(subprocess.call(cmd))
+    except KeyboardInterrupt:
+        sys.exit(0)
 
 def cmd_web(a):
     """serve + open the dashboard in the browser once the API answers."""
@@ -2993,7 +3827,9 @@ def cmd_web(a):
     if not os.path.exists(os.path.join(dist, "index.html")):
         print(f"{C.yel}web UI not built:{C.r} run  cd web && npm install && npm run build  first;")
         print("serving the API anyway (the dashboard will 404 until built).")
-    url = f"http://{a.host}:{a.port}/"
+    # A wildcard bind is not an address to connect to (Windows refuses 0.0.0.0).
+    shown = "127.0.0.1" if a.host in ("0.0.0.0", "") else a.host
+    url = f"http://{shown}:{a.port}/"
     if not getattr(a, "no_browser", False):
         import threading, urllib.request, webbrowser
         def opener():
@@ -3012,7 +3848,7 @@ def cmd_web(a):
             while True:
                 time.sleep(2); waited += 2
                 try:
-                    urllib.request.urlopen(f"http://{a.host}:{a.port}/health", timeout=5)
+                    urllib.request.urlopen(f"{url}health", timeout=5)
                 except OSError:
                     # Say something once, rather than looking hung. A 93-layer K3 load
                     # is 40+ minutes and the user has no way to tell waiting from stuck.
@@ -3139,6 +3975,31 @@ def convert_output_refusal(out_dir):
         return (head + f"\n  To convert shards already on disk, run the family's converter on them:\n"
                        f"      python3 tools/{family.converter} --indir {out_dir} --outdir <new dir>")
     return head + "\n  To convert into a fresh directory: coli convert --repo <hf repo> --model <new dir>"
+
+def cmd_import(a):
+    """A GGUF already on disk -> a colibri model directory, no re-quantization.
+
+    --mode link (default) writes config, tokenizer and a pointer: the weights
+    are read from the GGUF where it is. --mode copy also writes the colibri
+    container, experts packed one per aligned slot (one read each)."""
+    banner("import")
+    src = os.path.abspath(os.path.expanduser(a.gguf))
+    if not os.path.isfile(src):
+        sys.exit(f"{C.yel}no such file:{C.r} {src}")
+    out = a.out or (a.model if a.model else None)
+    if not out:
+        stem = os.path.basename(src)
+        stem = re.sub(r"-00001-of-\d{5}\.gguf$", "", stem)
+        stem = re.sub(r"\.gguf$", "", stem)
+        out = os.path.join(os.path.dirname(src), stem + ".colibri")
+    out = os.path.abspath(os.path.expanduser(out))
+    tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "gguf_import.py")
+    extra = ["--no-mtp"] if a.no_mtp else (["--mtp", os.path.abspath(os.path.expanduser(a.mtp))] if a.mtp else [])
+    rc = subprocess.call([sys.executable, tool, src, out, "--mode", a.mode] + extra)
+    if rc:
+        sys.exit(rc)
+    print(f"\n  {C.grn}ready{C.r}: coli chat --model {out}   (or coli serve / coli web)")
+
 
 def cmd_convert(a):
     banner("convert")
@@ -3331,15 +4192,25 @@ def main():
     pc.add_argument("--no-attach", action="store_true",
                     help="never auto-attach, always spawn a private engine")
     pc.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
+    pc.add_argument("--file", action="append", default=None, metavar="PATH",
+                    help="a text file or a PDF whose text goes with your first message (repeatable); "
+                         "in the chat, /file PATH does the same for the next one.")
     pc.add_argument("--stats", choices=list(CHAT_STATS_MODES), default=None,
                     help="generation statistics footer after each answer: full (tokens, seconds, tok/s), "
                          "compact (tokens, tok/s), off. Default from COLI_CHAT_STATS, else full. "
                          "Counts are exact when the server reports completion_tokens, ~estimated otherwise.")
+    pt=sub.add_parser("tui", parents=[common],
+                      help="the terminal interface (colibri-tui) on a running coli serve, or on one it starts for --model")
+    pt.add_argument("--attach", default=None, metavar="URL",
+                    help="the coli serve to use (default: http://127.0.0.1:8000 when it answers)")
+    pt.add_argument("--no-attach", action="store_true", help="always start a server for --model")
+    pt.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
     ps=sub.add_parser("serve", parents=[common])
     ps.add_argument("--host",default="127.0.0.1"); ps.add_argument("--port",type=int,default=8000)
     ps.add_argument("--model-id",default=os.environ.get("COLI_MODEL_ID"))
     ps.add_argument("--api-key",default=os.environ.get("COLI_API_KEY"))
-    ps.add_argument("--cors-origin",action="append",default=None)
+    ps.add_argument("--cors-origin",action="append",default=None,
+                    help="allowed browser origin, repeatable; plain values replace the default list, +ORIGIN adds to it")
     ps.add_argument("--max-queue",type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))
     ps.add_argument("--queue-timeout",type=float,default=float(os.environ.get("COLI_QUEUE_TIMEOUT","300")))
     ps.add_argument("--kv-slots",type=int,default=int(os.environ.get("COLI_KV_SLOTS","1")))
@@ -3361,12 +4232,15 @@ def main():
     pworker.add_argument("--layers",default="all",help="topology label, e.g. 0-37")
     pworker.add_argument("--ebits",type=int,default=8); pworker.add_argument("--dbits",type=int,default=8)
     pst=sub.add_parser("stop", parents=[common], help="shut down a running coli serve and its engine")
-    pst.add_argument("--port",type=int,default=8000); pst.add_argument("--dry-run",action="store_true")
+    pst.add_argument("--port",type=int,default=None,
+                     help="port of the server to stop (default 8000, or the one `coli setup` configured)")
+    pst.add_argument("--dry-run",action="store_true")
     pw=sub.add_parser("web", parents=[common], help="serve + open the dashboard in a browser")
     for arg,kw in (("--host",dict(default="127.0.0.1")),("--port",dict(type=int,default=8000)),
                    ("--model-id",dict(default=os.environ.get("COLI_MODEL_ID"))),
                    ("--api-key",dict(default=os.environ.get("COLI_API_KEY"))),
-                   ("--cors-origin",dict(action="append",default=None)),
+                   ("--cors-origin",dict(action="append",default=None,
+                                         help="allowed browser origin, repeatable; plain values replace the default list, +ORIGIN adds to it")),
                    ("--max-queue",dict(type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))),
                    ("--queue-timeout",dict(type=float,default=float(os.environ.get("COLI_QUEUE_TIMEOUT","300")))),
                    ("--kv-slots",dict(type=int,default=int(os.environ.get("COLI_KV_SLOTS","1")))),
@@ -3375,6 +4249,63 @@ def main():
                        help="additional Host header accepted by the DNS-rebinding guard; repeat as needed"))):
         pw.add_argument(arg,**kw)
     pw.add_argument("--no-browser",action="store_true",help="don't auto-open the browser")
+    pui=sub.add_parser("ui",help="the chat UI (ui/server.py) against a running coli serve")
+    pui.add_argument("--host",default="127.0.0.1"); pui.add_argument("--port",type=int,default=8790)
+    pui.add_argument("--backend",default=os.environ.get("COLIBRI_BACKEND","http://127.0.0.1:8000"),
+                     help="the gateway's address (coli serve's default)")
+    pui.add_argument("--models-backend",default=os.environ.get("COLIBRI_MODELS_BACKEND",""),
+                     help="the Models page's service on the engine's machine (python3 ui/models.py "
+                     "there), when the gateway is elsewhere; with a gateway on this machine it runs here")
+    pui.add_argument("--models-dir",action="append",default=[],metavar="DIR",
+                     help="where models are, for the Models page (default: the folder coli setup "
+                     "uses, ~/colibri-models)")
+    pui.add_argument("--searx",default=os.environ.get("COLIBRI_SEARX",""),
+                     help="a SearXNG instance for the chat's web search (default: DuckDuckGo's HTML results)")
+    pui.add_argument("--no-browser",action="store_true",help="don't open the browser")
+    # One-step setup (setup_flow.py). No `common` parent: --model here names a
+    # catalog entry, not a model directory, and nothing below loads an engine.
+    pset=sub.add_parser("setup",help="one step: detect hardware, pick a model, build or fetch "
+                        "the engine, download with resume, then start the dashboard")
+    pset.add_argument("--yes","-y",action="store_true",
+                      help="non-interactive: take the recommendation and every default")
+    pset.add_argument("--model",dest="pick",default=None,metavar="ID",
+                      help="catalog model to install (see --list); default: the recommendation")
+    pset.add_argument("--model-dir",default=None,metavar="DIR",
+                      help="use a model already on disk instead of downloading one")
+    pset.add_argument("--dir",default=None,metavar="DIR",
+                      help="folder for downloaded models (default ~/colibri-models)")
+    pset.add_argument("--backend",choices=("auto","cpu","vulkan","cuda"),default=None,
+                      help="engine build: auto (default) picks CUDA when the toolkit builds for the "
+                      "card, then Vulkan, then the CPU, and a build that fails falls back to the next")
+    pset.add_argument("--no-gpu",action="store_true",help="same as --backend cpu")
+    pset.add_argument("--host",default=None,help="address to serve on (default 127.0.0.1)")
+    pset.add_argument("--port",type=int,default=None,help="port to serve on (default 8000)")
+    pset.add_argument("--ctx",type=int,default=None,metavar="TOKENS",
+                      help="context the server starts with, kept for `coli start` (0: automatic, "
+                      "from the memory there is)")
+    pset.add_argument("--no-start",action="store_true",help="set up, but do not start the server")
+    pset.add_argument("--background",action="store_true",
+                      help="start the server in the background (log in the setup folder)")
+    pset.add_argument("--no-browser",action="store_true",help="do not open the browser")
+    pset.add_argument("--reconfigure",action="store_true",
+                      help="choose again even if a setup is already complete")
+    pset.add_argument("--list",action="store_true",help="list the catalog against this machine and exit")
+    pset.add_argument("--all",action="store_true",help="also show the models that do not fit")
+    pset.add_argument("--via-windows",choices=("auto","yes","no"),default="auto",
+                      help="WSL only: download through Windows' curl.exe (auto: when it measures faster)")
+    pset.add_argument("--no-verify",action="store_true",help="skip the checksum of downloaded files")
+    pset.add_argument("--json",action="store_true",
+                      help="machine-readable result; implies --yes and a background start")
+    pstart=sub.add_parser("start",help="start what `coli setup` configured")
+    pstart.add_argument("--background",action="store_true",help="run in the background")
+    pstart.add_argument("--no-browser",action="store_true",help="do not open the browser")
+    pstart.add_argument("--json",action="store_true",help="background start, JSON status out")
+    pstatus=sub.add_parser("status",help="what is set up, whether it runs, its URLs and speed")
+    pstatus.add_argument("--json",action="store_true")
+    plogs=sub.add_parser("logs",help="the last lines of the background server (or install) log")
+    plogs.add_argument("-n","--lines",type=int,default=100)
+    plogs.add_argument("--install",action="store_true",help="the install log instead of the server's")
+    sub.add_parser("mcp",help="Model Context Protocol server on stdio, for AI coding assistants")
     pb=sub.add_parser("bench", parents=[common]); pb.add_argument("tasks", nargs="*")
     pb.add_argument("--limit",type=int,default=40)
     if sys.platform == "win32":
@@ -3383,6 +4314,16 @@ def main():
         _cache_root = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
     _bench_cache = os.path.join(_cache_root, "colibri", "bench")
     pb.add_argument("--data",default=_bench_cache)
+    pim=sub.add_parser("import", parents=[common],
+                       help="use a GGUF you already have: make a colibri model directory from it")
+    pim.add_argument("gguf", help="the .gguf file (first part of a split model)")
+    pim.add_argument("--out", default=None, help="model directory to write (default: next to the GGUF, NAME.colibri)")
+    pim.add_argument("--mode", choices=("link", "copy"), default="link",
+                     help="link: read the GGUF in place (default); copy: write the colibri container too")
+    pim.add_argument("--mtp", default=None,
+                     help="Qwen3.8: the MTP head's GGUF (mtp-*.gguf); unset, one next to the model is found "
+                          "(its folder, the parent, an MTP/ folder)")
+    pim.add_argument("--no-mtp", action="store_true", help="Qwen3.8: decode without the MTP head")
     pc=sub.add_parser("convert", parents=[common])
     pc.add_argument("--repo",default=None,
                     help="HF repo to download and convert (default zai-org/GLM-5.2-FP8). "
@@ -3400,8 +4341,16 @@ def main():
     a=ap.parse_args()
     handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"mirror":cmd_mirror,
              "doctor":cmd_doctor,"tune":cmd_tune,
-             "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
-             "convert":cmd_convert,"web":cmd_web}.get(a.cmd)
+             "run":cmd_run,"chat":cmd_chat,"tui":cmd_tui,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
+             "convert":cmd_convert,"import":cmd_import,"web":cmd_web,"ui":cmd_ui}.get(a.cmd)
+    if a.cmd in ("setup","start","status","logs"):
+        import setup_flow
+        flow={"setup":setup_flow.cmd_setup,"start":setup_flow.cmd_start,
+              "status":setup_flow.cmd_status,"logs":setup_flow.cmd_logs}[a.cmd]
+        sys.exit(setup_flow.run(flow,a))
+    if a.cmd=="mcp":
+        import mcp_server
+        sys.exit(mcp_server.main())
     if a.cmd=="cluster":
         if a.cluster_cmd=="coordinator": handler=cmd_cluster_coordinator
         elif a.cluster_cmd=="worker": handler=cmd_cluster_worker

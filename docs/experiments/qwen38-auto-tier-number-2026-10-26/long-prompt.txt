@@ -1,0 +1,588 @@
+# --auto-tier and the qwen CUDA tier: a 1628-token prompt (2026-10-26)
+# a Colab L4 VM: 12 threads (nproc), 6 physical cores (the plan's OMP_NUM_THREADS), Intel(R) Xeon(R) CPU @ 2.20GHz (lscpu) + NVIDIA L4 (23034 MiB, 22564 MiB free, sm_89);
+#   53.0 GiB, no swap; the GGUF (74 GiB) does not fit it; Colab (Python 3.13.16), driver 580.82.07 (CUDA 13.0), nvcc V13.0.88.
+# Model: unsloth/Qwen3.8-Flash-Next-GGUF, UD-Q2_K_XL (its three files, sha256 not computed on the VM), imported with
+#   python3 tools/gguf_import.py <the first file> <model> --no-mtp.
+# Engine: origin/dev 77530b49, built once with: cd c && make qwen38 CUDA=1 CUDA_ARCH=sm_89. The change is in resource_plan.py only,
+#   so both sides run the same binary: A with the number dev's planner writes for this card
+#   (CUDA_EXPERT_GB=21.660, plan.txt), B without it (what this change writes).
+# History: history.usage.gz beside this file (gunzip to <history.usage>, sha256 8dc23b015a8080b48b2e7ef7878f51516ac64f481bd104bba56f96a021341459),
+#   written by a run of the prose prompt on another machine (134880 selections); USAGE_SAVE=0.
+# Each run, a new process: env COLI_CUDA=1 COLI_GPU=0 COLI_VULKAN=0 COLI_TEMP=0 USAGE_SAVE=0 OMP_NUM_THREADS=6 SNAP=<model> [CUDA_EXPERT_GB=21.660] N_NEW=64 COLI_USAGE=<history.usage> ./qwen38 128 8 <prompt>
+# Prompt, 1628 tokens (sha256 f3306e5f57ab2527735662aafb31c14e76d3b1a73cc86508b6ff020e43f4e4aa):
+#   It is a truth universally acknowledged, that a single man in possession of a good fortune, must be in want of a wife. However little known the feelings or views of such a man may be on his first entering a neighbourhood, this truth is so well fixed in the minds of the surrounding families, that he is considered the rightful property of some one or other of their daughters. "My dear Mr. Bennet," said his lady to him one day, "have you heard that Netherfield Park is let at last?" Mr. Bennet replied that he had not. "But it is," returned she; "for Mrs. Long has just been here, and she told me all about it." Mr. Bennet made no answer. "Do not you want to know who has taken it?" cried his wife, impatiently. "You want to tell me, and I have no objection to hearing it." [Illustration: "He came down to see the place" [Copyright 1894 by George Allen.]] This was invitation enough. "Why, my dear, you must know, Mrs. Long says that Netherfield is taken by a young man of large fortune from the north of England; that he came down on Monday in a chaise and four to see the place, and was so much delighted with it that he agreed with Mr. Morris immediately; that he is to take possession before Michaelmas, and some of his servants are to be in the house by the end of next week." "What is his name?" "Bingley." "Is he married or single?" "Oh, single, my dear, to be sure! A single man of large fortune; four or five thousand a year. What a fine thing for our girls!" "How so? how can it affect them?" "My dear Mr. Bennet," replied his wife, "how can you be so tiresome? You must know that I am thinking of his marrying one of them." "Is that his design in settling here?" "Design? Nonsense, how can you talk so! But it is very likely that he may fall in love with one of them, and therefore you must visit him as soon as he comes." "I see no occasion for that. You and the girls may go--or you may send them by themselves, which perhaps will be still better; for as you are as handsome as any of them, Mr. Bingley might like you the best of the party." "My dear, you flatter me. I certainly have had my share of beauty, but I do not pretend to be anything extraordinary now. When a woman has five grown-up daughters, she ought to give over thinking of her own beauty." "In such cases, a woman has not often much beauty to think of." "But, my dear, you must indeed go and see Mr. Bingley when he comes into the neighbourhood." "It is more than I engage for, I assure you." "But consider your daughters. Only think what an establishment it would be for one of them. Sir William and Lady Lucas are determined to go, merely on that account; for in general, you know, they visit no new comers. Indeed you must go, for it will be impossible for us to visit him, if you do not." "You are over scrupulous, surely. I dare say Mr. Bingley will be very glad to see you; and I will send a few lines by you to assure him of my hearty consent to his marrying whichever he chooses of the girls--though I must throw in a good word for my little Lizzy." "I desire you will do no such thing. Lizzy is not a bit better than the others: and I am sure she is not half so handsome as Jane, nor half so good-humoured as Lydia. But you are always giving her the preference." "They have none of them much to recommend them," replied he: "they are all silly and ignorant like other girls; but Lizzy has something more of quickness than her sisters." "Mr. Bennet, how can you abuse your own children in such a way? You take delight in vexing me. You have no compassion on my poor nerves." "You mistake me, my dear. I have a high respect for your nerves. They are my old friends. I have heard you mention them with consideration these twenty years at least." "Ah, you do not know what I suffer." "But I hope you will get over it, and live to see many young men of four thousand a year come into the neighbourhood." "It will be no use to us, if twenty such should come, since you will not visit them." "Depend upon it, my dear, that when there are twenty, I will visit them all." Mr. Bennet was so odd a mixture of quick parts, sarcastic humour, reserve, and caprice, that the experience of three-and-twenty years had been insufficient to make his wife understand his character. Her mind was less difficult to develope. She was a woman of mean understanding, little information, and uncertain temper. When she was discontented, she fancied herself nervous. The business of her life was to get her daughters married: its solace was visiting and news. [Illustration: M^{r.} & M^{rs.} Bennet [Copyright 1894 by George Allen.]] [Illustration: "I hope Mr. Bingley will like it" [Copyright 1894 by George Allen.]] CHAPTER II. [Illustration] Mr. Bennet was among the earliest of those who waited on Mr. Bingley. He had always intended to visit him, though to the last always assuring his wife that he should not go; and till the evening after the visit was paid she had no knowledge of it. It was then disclosed in the following manner. Observing his second daughter employed in trimming a hat, he suddenly addressed her with,-- "I hope Mr. Bingley will like it, Lizzy." "We are not in a way to know what Mr. Bingley likes," said her mother, resentfully, "since we are not to visit." "But you forget, mamma," said Elizabeth, "that we shall meet him at the assemblies, and that Mrs. Long has promised to introduce him." "I do not believe Mrs. Long will do any such thing. She has two nieces of her own. She is a selfish, hypocritical woman, and I have no opinion of her." "No more have I," said Mr. Bennet; "and I am glad to find that you do not depend on her serving you." Mrs. Bennet deigned not to make any reply; but, unable to contain herself, began scolding one of her daughters. "Don't keep coughing so, Kitty, for heaven's sake! Have a little compassion on my nerves. You tear them to pieces." "Kitty has no discretion in her coughs," said her father; "she times them ill." "I do not cough for my own amusement," replied Kitty, fretfully. "When is your next ball to be, Lizzy?" "To-morrow fortnight." "Ay, so it is," cried her mother, "and Mrs. Long does not come back till the day before; so, it will be impossible for her to introduce him, for she will not know him herself." "Then, my dear, you may have the advantage of your friend, and introduce Mr. Bingley to her." "Impossible, Mr. Bennet, impossible, when I am not acquainted with him myself; how can you be so teasing?" "I honour your circumspection. A fortnight's acquaintance is certainly very little. One cannot know what a man really is by the end of a fortnight.
+# Runs: the warm-up (not counted), then A B B A A B B A (A: with CUDA_EXPERT_GB=21.660, B: without).
+# Before each run, the warm-up's too, the file cache was evicted and the VM rested 60 s: /proc/sys/vm/drop_caches is
+#   read-only in Colab's container, so a child touched MemAvailable less 3 GiB of anonymous memory, then
+#   exited (each <run>_evict.log: free -b before and after, then the rest).
+
+===== 30_W_evict.log (sha256 938298ba0edde5e5a09d154420ad7b8999a2b50782d506ed9dc4eab11f6163ac)
+# free -b; python3 -c "import mmap,sys; n=int(sys.argv[1]); c=b'\x01'*(64<<20); m=mmap.mmap(-1,n); [m.write(c) for _ in range(n//len(c))]; print('touched',n)" 51809910784; free -b; sleep 60; echo rested 60 s
+# rc=0 elapsed=98.9s
+
+               total        used        free      shared  buff/cache   available
+Mem:     56863334400  1831354368 39223717888     4063232 16477319168 55031980032
+Swap:              0           0           0
+touched 51809910784
+               total        used        free      shared  buff/cache   available
+Mem:     56863334400  1835790336 54060425216     4239360  1636667392 55027544064
+Swap:              0           0           0
+rested 60 s
+
+===== 30_W.log (sha256 d930a29b35db7b2a23140c788a050eec2d7f727a06496bcdeadad836e6c88bc4)
+# cd /content/colibri/c && env COLI_CUDA=1 COLI_GPU=0 COLI_VULKAN=0 COLI_TEMP=0 USAGE_SAVE=0 OMP_NUM_THREADS=6 SNAP=/content/q38 CUDA_EXPERT_GB=21.660 N_NEW=64 COLI_USAGE=/content/storia timeout -k 10 1200 /content/qwen38-dev 128 8 /content/prompt-lungo.txt
+# rc=0 elapsed=699.1s
+
+[gguf] /content/q38-gguf/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf: 3 file(s), 1224 tensors, read in place (native ggml types, no conversion)
+== Qwen3.8-Flash-Next native text engine | cache=128/layer | CPU ==
+[tok] loaded 248320 base pieces + 33 added tokens (max id 248319) from /content/q38/tokenizer.json
+[enc] prompt tokens: 1628 | generating 64 new tokens
+[qwen38] native text weights: prefix=model, 48 layers, PLE=1, cache=128/layer, FP8=native, BF16=native (resident matrices 3.73 GiB)
+[qwen38] speculative decoding with the MTP head: off (the GGUF has none; tools/gguf_import.py --mtp names an mtp-*.gguf; Q38_MTP=0 silences this)
+[qtier] qwen38: 1.59 GiB kept for the CUDA chain (its mirrors at 8192 positions, its scratch and own matrices)
+[qtier] RAM holds 128 of 512 experts a layer: the tier copies each expert it takes as it passes
+[CUDA] device 0: NVIDIA L4, 23.7 GB VRAM, sm_89
+[qtier] dev 0: 21.8 GB free, allowance 21.7 GB
+[place] auto: dev 0 holds 4700.6 MB of trunk (lmhead yes, 0 dnproj layers), 17.07 GB left for experts
+[qtier] dev 0: budget 17.07 GB for experts (~8377 experts) after trunk
+[qtier] dev 0: the GGUF experts' arena, 8377 slots of 2.09 MB (17.07 GB)
+[qtier] CUDA VRAM expert tier active: 1 device(s), 2.09 MB/expert, copied as they pass
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[qtier] qwen38: the GGUF's experts on the CUDA tier as the file has them (RAM LRU 128/layer; experts go to VRAM as they get hot)
+[qtier] qwen38 trunk: 553 of 553 offered matrices resident (int8, a GGUF's blocks as they are; 3.00 GiB) in 1.8s; the rest answers from the CPU
+[qwen38] trunk: 60 matrices int8 on the CPU (0.08 GiB, 0.27 GiB of BF16 released) in 0.0s; Q38_TRUNK_CPU_INT8=0 keeps BF16
+[chain] qwen38: a decode step's routed experts in the frame (the tier's residents by address, format 100 (a GGUF's blocks, by layer), group 0; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen38: 48 layers on CUDA device 0 (12 QSA), the final mixer and lm_head too; 3.37 GiB of the tier's trunk, 174.2 MiB uploaded by the chain, 9.8 MiB of parameters
+[qwen38] routed experts: GGUF IQ2_XS/IQ2_XS/IQ4_NL (layer 0), 1.78 MiB per expert; cache 128/layer
+[USAGE] expert history: 134880 selections (/content/storia)
+[qtier] qwen38: warm start, 8377 of the GGUF's experts in VRAM, the history's most used first (.coli_usage) -- 66.4 s
+[chain] qwen38: host pool, 14840 of the 16199 experts the card leaves in 30.07 GiB of page-locked RAM the device reads over the bus, the history's most used first (17.5 s to allocate, 101.1 s to read; COLI_CUDA_CHAIN_POOL=0 off, COLI_CUDA_CHAIN_POOL_GB sets it)
+[chain] qwen38: a step's pooled experts copied to the device first (16 places, 33.2 MiB)
+[chain] qwen38: a prompt chunk's layer's pooled experts copied to the device while the layers before it run (246 places, 510.5 MiB; the most a layer has: 393)
+resident weights loaded in 12.4s | RSS after load: 34.33 GB
+Generated (64 new tokens):
+Text : [chain] qwen38: the routed experts' buffers or table refused; the host's step from here on
+ But[qwen38] decode rows' routed experts grouped by expert, one parallel region a layer (Q38_MOE_GROUPED=0: one expert at a time)
+ if we do not venture, somebody else will; and after all, Mrs. Long is a smooth-minded old lady, and she will have as good a chance of introducing him as you." Mrs. Bennet was quite disconcerted. She could not imagine how her friend Mrs. Long could have introduced Mr.
+TTFT: 461.38 s (time to first token)
+[qwen38 spec gate] run: T(1) 488.1 ms, rows 2:3.23, rho 1.89, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen38 lookup] run: 1.03 tokens/forward (61 forwards per 63 tokens) | acceptance 50.0% (2/4 drafts in 4 verifies) | gate on, 15 declined, 4 probes
+
+PEAK RSS: 45.41 GB
+[qtier] resident 8377/24576 experts | uploads 8462 | miss(CPU) 2670 | q_skips 0
+[qtier]   dev 0: hits 28530 | 773 tensors, 3.09 GB VRAM used (4.59 GB trunk + experts, budget 17.07 GB)
+[qtier] VRAM hit rate: 91.4 % | swaps 85 (85 in place)
+[qtier] group_stats: 661 calls, 4880 experts | h2d 0 ms, kernel 0 ms, d2h 0 ms
+Expert cache hit rate: 66.8% (hit=169584 miss=84401)
+Speed: 0.13 tok/s (495.7s for 64 tokens)
+[chain] qwen38: 62 forwards, 6306 frames (129812 ops, 50236 matmuls), 3383.8 ms waiting for the device, 483312.9 ms of routed experts on the host, 1126.7 MiB on the device; per decode step 20.41 ms waiting, 525.72 ms of experts (61 steps)
+
+===== 31_A1_evict.log (sha256 da85939b797a699c2f3e22069bcd41479ed62b18fa7d09d5d5f09f9d8cc1bc85)
+# free -b; python3 -c "import mmap,sys; n=int(sys.argv[1]); c=b'\x01'*(64<<20); m=mmap.mmap(-1,n); [m.write(c) for _ in range(n//len(c))]; print('touched',n)" 51821211648; free -b; sleep 60; echo rested 60 s
+# rc=0 elapsed=99.5s
+
+               total        used        free      shared  buff/cache   available
+Mem:     56863334400  1819123712 50142183424     4546560  5572042752 55044210688
+Swap:              0           0           0
+touched 51821211648
+               total        used        free      shared  buff/cache   available
+Mem:     56863334400  1821593600 54811795456     4636672   899547136 55041740800
+Swap:              0           0           0
+rested 60 s
+
+===== 31_A1.log (sha256 95cb9cb6a513ae8982766efb13057d6bd3210eb3d2530422c8b582bf48bd13d9)
+# cd /content/colibri/c && env COLI_CUDA=1 COLI_GPU=0 COLI_VULKAN=0 COLI_TEMP=0 USAGE_SAVE=0 OMP_NUM_THREADS=6 SNAP=/content/q38 CUDA_EXPERT_GB=21.660 N_NEW=64 COLI_USAGE=/content/storia timeout -k 10 1200 /content/qwen38-dev 128 8 /content/prompt-lungo.txt
+# rc=0 elapsed=694.3s
+
+[gguf] /content/q38-gguf/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf: 3 file(s), 1224 tensors, read in place (native ggml types, no conversion)
+== Qwen3.8-Flash-Next native text engine | cache=128/layer | CPU ==
+[tok] loaded 248320 base pieces + 33 added tokens (max id 248319) from /content/q38/tokenizer.json
+[enc] prompt tokens: 1628 | generating 64 new tokens
+[qwen38] native text weights: prefix=model, 48 layers, PLE=1, cache=128/layer, FP8=native, BF16=native (resident matrices 3.73 GiB)
+[qwen38] speculative decoding with the MTP head: off (the GGUF has none; tools/gguf_import.py --mtp names an mtp-*.gguf; Q38_MTP=0 silences this)
+[qtier] qwen38: 1.59 GiB kept for the CUDA chain (its mirrors at 8192 positions, its scratch and own matrices)
+[qtier] RAM holds 128 of 512 experts a layer: the tier copies each expert it takes as it passes
+[CUDA] device 0: NVIDIA L4, 23.7 GB VRAM, sm_89
+[qtier] dev 0: 21.8 GB free, allowance 21.7 GB
+[place] auto: dev 0 holds 4700.6 MB of trunk (lmhead yes, 0 dnproj layers), 17.07 GB left for experts
+[qtier] dev 0: budget 17.07 GB for experts (~8377 experts) after trunk
+[qtier] dev 0: the GGUF experts' arena, 8377 slots of 2.09 MB (17.07 GB)
+[qtier] CUDA VRAM expert tier active: 1 device(s), 2.09 MB/expert, copied as they pass
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[qtier] qwen38: the GGUF's experts on the CUDA tier as the file has them (RAM LRU 128/layer; experts go to VRAM as they get hot)
+[qtier] qwen38 trunk: 553 of 553 offered matrices resident (int8, a GGUF's blocks as they are; 3.00 GiB) in 1.8s; the rest answers from the CPU
+[qwen38] trunk: 60 matrices int8 on the CPU (0.08 GiB, 0.27 GiB of BF16 released) in 0.0s; Q38_TRUNK_CPU_INT8=0 keeps BF16
+[chain] qwen38: a decode step's routed experts in the frame (the tier's residents by address, format 100 (a GGUF's blocks, by layer), group 0; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen38: 48 layers on CUDA device 0 (12 QSA), the final mixer and lm_head too; 3.37 GiB of the tier's trunk, 174.2 MiB uploaded by the chain, 9.8 MiB of parameters
+[qwen38] routed experts: GGUF IQ2_XS/IQ2_XS/IQ4_NL (layer 0), 1.78 MiB per expert; cache 128/layer
+[USAGE] expert history: 134880 selections (/content/storia)
+[qtier] qwen38: warm start, 8377 of the GGUF's experts in VRAM, the history's most used first (.coli_usage) -- 70.1 s
+[chain] qwen38: host pool, 14843 of the 16199 experts the card leaves in 30.08 GiB of page-locked RAM the device reads over the bus, the history's most used first (17.5 s to allocate, 102.4 s to read; COLI_CUDA_CHAIN_POOL=0 off, COLI_CUDA_CHAIN_POOL_GB sets it)
+[chain] qwen38: a step's pooled experts copied to the device first (16 places, 33.2 MiB)
+[chain] qwen38: a prompt chunk's layer's pooled experts copied to the device while the layers before it run (246 places, 510.5 MiB; the most a layer has: 393)
+resident weights loaded in 12.5s | RSS after load: 34.33 GB
+Generated (64 new tokens):
+Text : [chain] qwen38: the routed experts' buffers or table refused; the host's step from here on
+ But[qwen38] decode rows' routed experts grouped by expert, one parallel region a layer (Q38_MOE_GROUPED=0: one expert at a time)
+ if we do not venture, somebody else will; and after all, Mrs. Long is a smooth-minded old lady, and she will have as good a chance of introducing him as you." Mrs. Bennet was quite disconcerted. She could not imagine how her friend Mrs. Long could have introduced Mr.
+TTFT: 451.20 s (time to first token)
+[qwen38 spec gate] run: T(1) 495.7 ms, rows 2:3.24, rho 1.93, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen38 lookup] run: 1.03 tokens/forward (61 forwards per 63 tokens) | acceptance 50.0% (2/4 drafts in 4 verifies) | gate on, 15 declined, 4 probes
+
+PEAK RSS: 45.42 GB
+[qtier] resident 8377/24576 experts | uploads 8462 | miss(CPU) 2670 | q_skips 0
+[qtier]   dev 0: hits 28530 | 773 tensors, 3.09 GB VRAM used (4.59 GB trunk + experts, budget 17.07 GB)
+[qtier] VRAM hit rate: 91.4 % | swaps 85 (85 in place)
+[qtier] group_stats: 661 calls, 4880 experts | h2d 0 ms, kernel 0 ms, d2h 0 ms
+Expert cache hit rate: 66.8% (hit=169584 miss=84401)
+Speed: 0.13 tok/s (485.9s for 64 tokens)
+[chain] qwen38: 62 forwards, 6306 frames (129812 ops, 50236 matmuls), 3379.6 ms waiting for the device, 473473.7 ms of routed experts on the host, 1126.7 MiB on the device; per decode step 20.34 ms waiting, 531.56 ms of experts (61 steps)
+
+===== 32_B1_evict.log (sha256 5f96a4e56fc2abdfe201b076cf47f1b4194207721ee85fe1581ba8a59e828802)
+# free -b; python3 -c "import mmap,sys; n=int(sys.argv[1]); c=b'\x01'*(64<<20); m=mmap.mmap(-1,n); [m.write(c) for _ in range(n//len(c))]; print('touched',n)" 51808067584; free -b; sleep 60; echo rested 60 s
+# rc=0 elapsed=99.6s
+
+               total        used        free      shared  buff/cache   available
+Mem:     56863334400  1826136064 50142646272     4870144  5565067264 55037198336
+Swap:              0           0           0
+touched 51808067584
+               total        used        free      shared  buff/cache   available
+Mem:     56863334400  1819811840 53059371008     4886528  2654007296 55043522560
+Swap:              0           0           0
+rested 60 s
+
+===== 32_B1.log (sha256 d64127e8a4bd0121fde4cdfa5d5cc000c55737e38d0e2611386b4bf7bcd76630)
+# cd /content/colibri/c && env COLI_CUDA=1 COLI_GPU=0 COLI_VULKAN=0 COLI_TEMP=0 USAGE_SAVE=0 OMP_NUM_THREADS=6 SNAP=/content/q38  N_NEW=64 COLI_USAGE=/content/storia timeout -k 10 1200 /content/qwen38-dev 128 8 /content/prompt-lungo.txt
+# rc=0 elapsed=246.6s
+
+[gguf] /content/q38-gguf/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf: 3 file(s), 1224 tensors, read in place (native ggml types, no conversion)
+== Qwen3.8-Flash-Next native text engine | cache=128/layer | CPU ==
+[tok] loaded 248320 base pieces + 33 added tokens (max id 248319) from /content/q38/tokenizer.json
+[enc] prompt tokens: 1628 | generating 64 new tokens
+[qwen38] native text weights: prefix=model, 48 layers, PLE=1, cache=128/layer, FP8=native, BF16=native (resident matrices 3.73 GiB)
+[qwen38] speculative decoding with the MTP head: off (the GGUF has none; tools/gguf_import.py --mtp names an mtp-*.gguf; Q38_MTP=0 silences this)
+[qtier] qwen38: 1.59 GiB kept for the CUDA chain (its mirrors at 8192 positions, its scratch and own matrices)
+[qtier] RAM holds 128 of 512 experts a layer: the tier copies each expert it takes as it passes
+[CUDA] device 0: NVIDIA L4, 23.7 GB VRAM, sm_89
+[qtier] dev 0: 21.8 GB free, allowance 20.8 GB
+[place] auto: dev 0 holds 4700.6 MB of trunk (lmhead yes, 0 dnproj layers), 16.25 GB left for experts
+[qtier] dev 0: budget 16.25 GB for experts (~7977 experts) after trunk
+[qtier] dev 0: the GGUF experts' arena, 7977 slots of 2.09 MB (16.25 GB)
+[qtier] CUDA VRAM expert tier active: 1 device(s), 2.09 MB/expert, copied as they pass
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[qtier] qwen38: the GGUF's experts on the CUDA tier as the file has them (RAM LRU 128/layer; experts go to VRAM as they get hot)
+[qtier] qwen38 trunk: 553 of 553 offered matrices resident (int8, a GGUF's blocks as they are; 3.00 GiB) in 1.8s; the rest answers from the CPU
+[qwen38] trunk: 60 matrices int8 on the CPU (0.08 GiB, 0.27 GiB of BF16 released) in 0.0s; Q38_TRUNK_CPU_INT8=0 keeps BF16
+[chain] qwen38: a decode step's routed experts in the frame (the tier's residents by address, format 100 (a GGUF's blocks, by layer), group 0; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen38: 48 layers on CUDA device 0 (12 QSA), the final mixer and lm_head too; 3.37 GiB of the tier's trunk, 174.2 MiB uploaded by the chain, 9.8 MiB of parameters
+[qwen38] routed experts: GGUF IQ2_XS/IQ2_XS/IQ4_NL (layer 0), 1.78 MiB per expert; cache 128/layer
+[USAGE] expert history: 134880 selections (/content/storia)
+[qtier] qwen38: warm start, 7977 of the GGUF's experts in VRAM, the history's most used first (.coli_usage) -- 62.1 s
+[chain] qwen38: host pool, 14839 of the 16599 experts the card leaves in 30.07 GiB of page-locked RAM the device reads over the bus, the history's most used first (17.5 s to allocate, 101.2 s to read; COLI_CUDA_CHAIN_POOL=0 off, COLI_CUDA_CHAIN_POOL_GB sets it)
+[chain] qwen38: a step's pooled experts copied to the device first (16 places, 33.2 MiB)
+[chain] qwen38: a prompt chunk's layer's pooled experts copied to the device while the layers before it run (246 places, 510.5 MiB; the most a layer has: 422)
+resident weights loaded in 12.7s | RSS after load: 34.33 GB
+Generated (64 new tokens):
+Text :  But[qwen38] decode rows' routed experts grouped by expert, one parallel region a layer (Q38_MOE_GROUPED=0: one expert at a time)
+ if we do not venture, somebody else will; and after all, Mrs. Long is a smooth, polite woman, and will be sure to do the thing properly." Mrs. Bennet was quite disconcerted. She could not understand her husband's raillery, and was obliged to have recourse to her usual
+TTFT: 44.37 s (time to first token)
+[qwen38 spec gate] run: T(1) 52.6 ms, rows 2:1.07 3:1.59, rho 0.17, acceptance by position 0.36 0.50 0.50 0.50 0.50
+[qwen38 lookup] run: 1.07 tokens/forward (59 forwards per 63 tokens) | acceptance 28.6% (4/14 drafts in 12 verifies) | gate on, 3 declined, 3 probes
+
+PEAK RSS: 35.93 GB
+[qtier] resident 7977/24576 experts | uploads 7977 | miss(CPU) 72034 | q_skips 0
+[qtier]   dev 0: hits 630486 | 773 tensors, 3.09 GB VRAM used (4.59 GB trunk + experts, budget 16.25 GB)
+[qtier] VRAM hit rate: 89.7 % | swaps 0 (0 in place)
+Expert cache hit rate: 68.7% (hit=21415 miss=9769)
+Speed: 1.35 tok/s (47.5s for 64 tokens)
+[chain] qwen38: 60 forwards, 123 frames (137248 ops, 48690 matmuls), 3553.7 ms waiting for the device, 23457.6 ms of routed experts on the host, 1310.7 MiB on the device; per decode step 3.85 ms waiting, 3.26 ms of experts (59 steps)
+[chain] qwen38: 2996 layer steps with the routed experts in the frame, 413 of them hybrid (121 slots on the host in 192.3 ms, 1560.3 ms waiting for the device's routes), 71913 slots from the host pool
+[chain] qwen38: 168 prompt layer steps staged the host pool's experts (83.61 GB copied over the bus)
+
+===== 33_B2_evict.log (sha256 043b541d568eb49e91c8181fd5bc22d0e25bc0c19fa4b8bbd14c9a281d0e5618)
+# free -b; python3 -c "import mmap,sys; n=int(sys.argv[1]); c=b'\x01'*(64<<20); m=mmap.mmap(-1,n); [m.write(c) for _ in range(n//len(c))]; print('touched',n)" 51826761728; free -b; sleep 60; echo rested 60 s
+# rc=0 elapsed=99.2s
+
+               total        used        free      shared  buff/cache   available
+Mem:     56863334400  1812873216 39910354944     5009408 15810117632 55050461184
+Swap:              0           0           0
+touched 51826761728
+               total        used        free      shared  buff/cache   available
+Mem:     56863334400  1819082752 52971102208     5025792  2743173120 55044251648
+Swap:              0           0           0
+rested 60 s
+
+===== 33_B2.log (sha256 1d34f72bf43266c4fccc0d10b0372adb8bc4ae00fb418e4c7c346c013836e40a)
+# cd /content/colibri/c && env COLI_CUDA=1 COLI_GPU=0 COLI_VULKAN=0 COLI_TEMP=0 USAGE_SAVE=0 OMP_NUM_THREADS=6 SNAP=/content/q38  N_NEW=64 COLI_USAGE=/content/storia timeout -k 10 1200 /content/qwen38-dev 128 8 /content/prompt-lungo.txt
+# rc=0 elapsed=248.8s
+
+[gguf] /content/q38-gguf/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf: 3 file(s), 1224 tensors, read in place (native ggml types, no conversion)
+== Qwen3.8-Flash-Next native text engine | cache=128/layer | CPU ==
+[tok] loaded 248320 base pieces + 33 added tokens (max id 248319) from /content/q38/tokenizer.json
+[enc] prompt tokens: 1628 | generating 64 new tokens
+[qwen38] native text weights: prefix=model, 48 layers, PLE=1, cache=128/layer, FP8=native, BF16=native (resident matrices 3.73 GiB)
+[qwen38] speculative decoding with the MTP head: off (the GGUF has none; tools/gguf_import.py --mtp names an mtp-*.gguf; Q38_MTP=0 silences this)
+[qtier] qwen38: 1.59 GiB kept for the CUDA chain (its mirrors at 8192 positions, its scratch and own matrices)
+[qtier] RAM holds 128 of 512 experts a layer: the tier copies each expert it takes as it passes
+[CUDA] device 0: NVIDIA L4, 23.7 GB VRAM, sm_89
+[qtier] dev 0: 21.8 GB free, allowance 20.8 GB
+[place] auto: dev 0 holds 4700.6 MB of trunk (lmhead yes, 0 dnproj layers), 16.25 GB left for experts
+[qtier] dev 0: budget 16.25 GB for experts (~7977 experts) after trunk
+[qtier] dev 0: the GGUF experts' arena, 7977 slots of 2.09 MB (16.25 GB)
+[qtier] CUDA VRAM expert tier active: 1 device(s), 2.09 MB/expert, copied as they pass
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[qtier] qwen38: the GGUF's experts on the CUDA tier as the file has them (RAM LRU 128/layer; experts go to VRAM as they get hot)
+[qtier] qwen38 trunk: 553 of 553 offered matrices resident (int8, a GGUF's blocks as they are; 3.00 GiB) in 1.8s; the rest answers from the CPU
+[qwen38] trunk: 60 matrices int8 on the CPU (0.08 GiB, 0.27 GiB of BF16 released) in 0.0s; Q38_TRUNK_CPU_INT8=0 keeps BF16
+[chain] qwen38: a decode step's routed experts in the frame (the tier's residents by address, format 100 (a GGUF's blocks, by layer), group 0; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen38: 48 layers on CUDA device 0 (12 QSA), the final mixer and lm_head too; 3.37 GiB of the tier's trunk, 174.2 MiB uploaded by the chain, 9.8 MiB of parameters
+[qwen38] routed experts: GGUF IQ2_XS/IQ2_XS/IQ4_NL (layer 0), 1.78 MiB per expert; cache 128/layer
+[USAGE] expert history: 134880 selections (/content/storia)
+[qtier] qwen38: warm start, 7977 of the GGUF's experts in VRAM, the history's most used first (.coli_usage) -- 63.9 s
+[chain] qwen38: host pool, 14855 of the 16599 experts the card leaves in 30.10 GiB of page-locked RAM the device reads over the bus, the history's most used first (17.6 s to allocate, 99.8 s to read; COLI_CUDA_CHAIN_POOL=0 off, COLI_CUDA_CHAIN_POOL_GB sets it)
+[chain] qwen38: a step's pooled experts copied to the device first (16 places, 33.2 MiB)
+[chain] qwen38: a prompt chunk's layer's pooled experts copied to the device while the layers before it run (246 places, 510.5 MiB; the most a layer has: 422)
+resident weights loaded in 12.3s | RSS after load: 34.35 GB
+Generated (64 new tokens):
+Text :  But[qwen38] decode rows' routed experts grouped by expert, one parallel region a layer (Q38_MOE_GROUPED=0: one expert at a time)
+ if we do not venture, somebody else will; and after all, Mrs. Long is a smooth, polite woman, and will be sure to do the thing properly." Mrs. Bennet was quite disconcerted. She could not understand her husband's raillery, and was obliged to have recourse to her usual
+TTFT: 46.46 s (time to first token)
+[qwen38 spec gate] run: T(1) 52.8 ms, rows 2:1.08 3:1.61, rho 0.19, acceptance by position 0.36 0.50 0.50 0.50 0.50
+[qwen38 lookup] run: 1.07 tokens/forward (59 forwards per 63 tokens) | acceptance 28.6% (4/14 drafts in 12 verifies) | gate on, 3 declined, 3 probes
+
+PEAK RSS: 35.97 GB
+[qtier] resident 7977/24576 experts | uploads 7977 | miss(CPU) 72033 | q_skips 0
+[qtier]   dev 0: hits 630487 | 773 tensors, 3.09 GB VRAM used (4.59 GB trunk + experts, budget 16.25 GB)
+[qtier] VRAM hit rate: 89.7 % | swaps 0 (0 in place)
+Expert cache hit rate: 68.7% (hit=21411 miss=9768)
+Speed: 1.29 tok/s (49.6s for 64 tokens)
+[chain] qwen38: 60 forwards, 123 frames (137248 ops, 48690 matmuls), 3554.9 ms waiting for the device, 26145.3 ms of routed experts on the host, 1310.7 MiB on the device; per decode step 3.89 ms waiting, 3.44 ms of experts (59 steps)
+[chain] qwen38: 2996 layer steps with the routed experts in the frame, 413 of them hybrid (115 slots on the host in 202.9 ms, 1562.0 ms waiting for the device's routes), 71918 slots from the host pool
+[chain] qwen38: 168 prompt layer steps staged the host pool's experts (83.61 GB copied over the bus)
+
+===== 34_A2_evict.log (sha256 8dab651ad43b033e4ff8171df4db4c7ae40f53cae96d3b5722576030bb89ed40)
+# free -b; python3 -c "import mmap,sys; n=int(sys.argv[1]); c=b'\x01'*(64<<20); m=mmap.mmap(-1,n); [m.write(c) for _ in range(n//len(c))]; print('touched',n)" 51812106240; free -b; sleep 60; echo rested 60 s
+# rc=0 elapsed=99.3s
+
+               total        used        free      shared  buff/cache   available
+Mem:     56863334400  1829421056 39892144128     5152768 15812018176 55033913344
+Swap:              0           0           0
+touched 51812106240
+               total        used        free      shared  buff/cache   available
+Mem:     56863334400  1821745152 53931376640     5165056  1788850176 55041589248
+Swap:              0           0           0
+rested 60 s
+
+===== 34_A2.log (sha256 e4b2fa42b661c89472ae2a4b6e1cdd35ff7cdd5033d15c7449b2c61af1704b4e)
+# cd /content/colibri/c && env COLI_CUDA=1 COLI_GPU=0 COLI_VULKAN=0 COLI_TEMP=0 USAGE_SAVE=0 OMP_NUM_THREADS=6 SNAP=/content/q38 CUDA_EXPERT_GB=21.660 N_NEW=64 COLI_USAGE=/content/storia timeout -k 10 1200 /content/qwen38-dev 128 8 /content/prompt-lungo.txt
+# rc=0 elapsed=690.7s
+
+[gguf] /content/q38-gguf/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf: 3 file(s), 1224 tensors, read in place (native ggml types, no conversion)
+== Qwen3.8-Flash-Next native text engine | cache=128/layer | CPU ==
+[tok] loaded 248320 base pieces + 33 added tokens (max id 248319) from /content/q38/tokenizer.json
+[enc] prompt tokens: 1628 | generating 64 new tokens
+[qwen38] native text weights: prefix=model, 48 layers, PLE=1, cache=128/layer, FP8=native, BF16=native (resident matrices 3.73 GiB)
+[qwen38] speculative decoding with the MTP head: off (the GGUF has none; tools/gguf_import.py --mtp names an mtp-*.gguf; Q38_MTP=0 silences this)
+[qtier] qwen38: 1.59 GiB kept for the CUDA chain (its mirrors at 8192 positions, its scratch and own matrices)
+[qtier] RAM holds 128 of 512 experts a layer: the tier copies each expert it takes as it passes
+[CUDA] device 0: NVIDIA L4, 23.7 GB VRAM, sm_89
+[qtier] dev 0: 21.8 GB free, allowance 21.7 GB
+[place] auto: dev 0 holds 4700.6 MB of trunk (lmhead yes, 0 dnproj layers), 17.07 GB left for experts
+[qtier] dev 0: budget 17.07 GB for experts (~8377 experts) after trunk
+[qtier] dev 0: the GGUF experts' arena, 8377 slots of 2.09 MB (17.07 GB)
+[qtier] CUDA VRAM expert tier active: 1 device(s), 2.09 MB/expert, copied as they pass
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[qtier] qwen38: the GGUF's experts on the CUDA tier as the file has them (RAM LRU 128/layer; experts go to VRAM as they get hot)
+[qtier] qwen38 trunk: 553 of 553 offered matrices resident (int8, a GGUF's blocks as they are; 3.00 GiB) in 1.8s; the rest answers from the CPU
+[qwen38] trunk: 60 matrices int8 on the CPU (0.08 GiB, 0.27 GiB of BF16 released) in 0.0s; Q38_TRUNK_CPU_INT8=0 keeps BF16
+[chain] qwen38: a decode step's routed experts in the frame (the tier's residents by address, format 100 (a GGUF's blocks, by layer), group 0; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen38: 48 layers on CUDA device 0 (12 QSA), the final mixer and lm_head too; 3.37 GiB of the tier's trunk, 174.2 MiB uploaded by the chain, 9.8 MiB of parameters
+[qwen38] routed experts: GGUF IQ2_XS/IQ2_XS/IQ4_NL (layer 0), 1.78 MiB per expert; cache 128/layer
+[USAGE] expert history: 134880 selections (/content/storia)
+[qtier] qwen38: warm start, 8377 of the GGUF's experts in VRAM, the history's most used first (.coli_usage) -- 68.7 s
+[chain] qwen38: host pool, 14847 of the 16199 experts the card leaves in 30.09 GiB of page-locked RAM the device reads over the bus, the history's most used first (17.5 s to allocate, 101.5 s to read; COLI_CUDA_CHAIN_POOL=0 off, COLI_CUDA_CHAIN_POOL_GB sets it)
+[chain] qwen38: a step's pooled experts copied to the device first (16 places, 33.2 MiB)
+[chain] qwen38: a prompt chunk's layer's pooled experts copied to the device while the layers before it run (246 places, 510.5 MiB; the most a layer has: 393)
+resident weights loaded in 12.8s | RSS after load: 34.34 GB
+Generated (64 new tokens):
+Text : [chain] qwen38: the routed experts' buffers or table refused; the host's step from here on
+ But[qwen38] decode rows' routed experts grouped by expert, one parallel region a layer (Q38_MOE_GROUPED=0: one expert at a time)
+ if we do not venture, somebody else will; and after all, Mrs. Long is a smooth-minded old lady, and she will have as good a chance of introducing him as you." Mrs. Bennet was quite disconcerted. She could not imagine how her friend Mrs. Long could have introduced Mr.
+TTFT: 449.44 s (time to first token)
+[qwen38 spec gate] run: T(1) 487.2 ms, rows 2:3.23, rho 1.83, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen38 lookup] run: 1.03 tokens/forward (61 forwards per 63 tokens) | acceptance 50.0% (2/4 drafts in 4 verifies) | gate on, 15 declined, 4 probes
+
+PEAK RSS: 45.42 GB
+[qtier] resident 8377/24576 experts | uploads 8462 | miss(CPU) 2670 | q_skips 0
+[qtier]   dev 0: hits 28530 | 773 tensors, 3.09 GB VRAM used (4.59 GB trunk + experts, budget 17.07 GB)
+[qtier] VRAM hit rate: 91.4 % | swaps 85 (85 in place)
+[qtier] group_stats: 661 calls, 4880 experts | h2d 0 ms, kernel 0 ms, d2h 0 ms
+Expert cache hit rate: 66.8% (hit=169584 miss=84401)
+Speed: 0.13 tok/s (484.2s for 64 tokens)
+[chain] qwen38: 62 forwards, 6306 frames (129812 ops, 50236 matmuls), 3380.8 ms waiting for the device, 472027.4 ms of routed experts on the host, 1126.7 MiB on the device; per decode step 20.41 ms waiting, 531.66 ms of experts (61 steps)
+
+===== 35_A3_evict.log (sha256 d3854e8465858adb7b897d4874ea9f1ca91d82b6e2b3bcfa3198dba665f9a900)
+# free -b; python3 -c "import mmap,sys; n=int(sys.argv[1]); c=b'\x01'*(64<<20); m=mmap.mmap(-1,n); [m.write(c) for _ in range(n//len(c))]; print('touched',n)" 51844653056; free -b; sleep 60; echo rested 60 s
+# rc=0 elapsed=99.2s
+
+               total        used        free      shared  buff/cache   available
+Mem:     56863334400  1798348800 49713000448     5472256  6022868992 55064985600
+Swap:              0           0           0
+touched 51844653056
+               total        used        free      shared  buff/cache   available
+Mem:     56863334400  1815277568 52819148800     5488640  2899390464 55048056832
+Swap:              0           0           0
+rested 60 s
+
+===== 35_A3.log (sha256 15fc6809334d32363a8dbf31a0497180556ad5f3216ab009b85518e430e322df)
+# cd /content/colibri/c && env COLI_CUDA=1 COLI_GPU=0 COLI_VULKAN=0 COLI_TEMP=0 USAGE_SAVE=0 OMP_NUM_THREADS=6 SNAP=/content/q38 CUDA_EXPERT_GB=21.660 N_NEW=64 COLI_USAGE=/content/storia timeout -k 10 1200 /content/qwen38-dev 128 8 /content/prompt-lungo.txt
+# rc=0 elapsed=692.8s
+
+[gguf] /content/q38-gguf/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf: 3 file(s), 1224 tensors, read in place (native ggml types, no conversion)
+== Qwen3.8-Flash-Next native text engine | cache=128/layer | CPU ==
+[tok] loaded 248320 base pieces + 33 added tokens (max id 248319) from /content/q38/tokenizer.json
+[enc] prompt tokens: 1628 | generating 64 new tokens
+[qwen38] native text weights: prefix=model, 48 layers, PLE=1, cache=128/layer, FP8=native, BF16=native (resident matrices 3.73 GiB)
+[qwen38] speculative decoding with the MTP head: off (the GGUF has none; tools/gguf_import.py --mtp names an mtp-*.gguf; Q38_MTP=0 silences this)
+[qtier] qwen38: 1.59 GiB kept for the CUDA chain (its mirrors at 8192 positions, its scratch and own matrices)
+[qtier] RAM holds 128 of 512 experts a layer: the tier copies each expert it takes as it passes
+[CUDA] device 0: NVIDIA L4, 23.7 GB VRAM, sm_89
+[qtier] dev 0: 21.8 GB free, allowance 21.7 GB
+[place] auto: dev 0 holds 4700.6 MB of trunk (lmhead yes, 0 dnproj layers), 17.07 GB left for experts
+[qtier] dev 0: budget 17.07 GB for experts (~8377 experts) after trunk
+[qtier] dev 0: the GGUF experts' arena, 8377 slots of 2.09 MB (17.07 GB)
+[qtier] CUDA VRAM expert tier active: 1 device(s), 2.09 MB/expert, copied as they pass
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[qtier] qwen38: the GGUF's experts on the CUDA tier as the file has them (RAM LRU 128/layer; experts go to VRAM as they get hot)
+[qtier] qwen38 trunk: 553 of 553 offered matrices resident (int8, a GGUF's blocks as they are; 3.00 GiB) in 1.8s; the rest answers from the CPU
+[qwen38] trunk: 60 matrices int8 on the CPU (0.08 GiB, 0.27 GiB of BF16 released) in 0.0s; Q38_TRUNK_CPU_INT8=0 keeps BF16
+[chain] qwen38: a decode step's routed experts in the frame (the tier's residents by address, format 100 (a GGUF's blocks, by layer), group 0; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen38: 48 layers on CUDA device 0 (12 QSA), the final mixer and lm_head too; 3.37 GiB of the tier's trunk, 174.2 MiB uploaded by the chain, 9.8 MiB of parameters
+[qwen38] routed experts: GGUF IQ2_XS/IQ2_XS/IQ4_NL (layer 0), 1.78 MiB per expert; cache 128/layer
+[USAGE] expert history: 134880 selections (/content/storia)
+[qtier] qwen38: warm start, 8377 of the GGUF's experts in VRAM, the history's most used first (.coli_usage) -- 64.0 s
+[chain] qwen38: host pool, 14843 of the 16199 experts the card leaves in 30.08 GiB of page-locked RAM the device reads over the bus, the history's most used first (17.6 s to allocate, 101.8 s to read; COLI_CUDA_CHAIN_POOL=0 off, COLI_CUDA_CHAIN_POOL_GB sets it)
+[chain] qwen38: a step's pooled experts copied to the device first (16 places, 33.2 MiB)
+[chain] qwen38: a prompt chunk's layer's pooled experts copied to the device while the layers before it run (246 places, 510.5 MiB; the most a layer has: 393)
+resident weights loaded in 12.7s | RSS after load: 34.34 GB
+Generated (64 new tokens):
+Text : [chain] qwen38: the routed experts' buffers or table refused; the host's step from here on
+ But[qwen38] decode rows' routed experts grouped by expert, one parallel region a layer (Q38_MOE_GROUPED=0: one expert at a time)
+ if we do not venture, somebody else will; and after all, Mrs. Long is a smooth-minded old lady, and she will have as good a chance of introducing him as you." Mrs. Bennet was quite disconcerted. She could not imagine how her friend Mrs. Long could have introduced Mr.
+TTFT: 455.84 s (time to first token)
+[qwen38 spec gate] run: T(1) 489.8 ms, rows 2:3.27, rho 1.89, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen38 lookup] run: 1.03 tokens/forward (61 forwards per 63 tokens) | acceptance 50.0% (2/4 drafts in 4 verifies) | gate on, 15 declined, 4 probes
+
+PEAK RSS: 45.42 GB
+[qtier] resident 8377/24576 experts | uploads 8462 | miss(CPU) 2670 | q_skips 0
+[qtier]   dev 0: hits 28530 | 773 tensors, 3.09 GB VRAM used (4.59 GB trunk + experts, budget 17.07 GB)
+[qtier] VRAM hit rate: 91.4 % | swaps 85 (85 in place)
+[qtier] group_stats: 661 calls, 4880 experts | h2d 0 ms, kernel 0 ms, d2h 0 ms
+Expert cache hit rate: 66.8% (hit=169584 miss=84401)
+Speed: 0.13 tok/s (490.6s for 64 tokens)
+[chain] qwen38: 62 forwards, 6306 frames (129812 ops, 50236 matmuls), 3374.9 ms waiting for the device, 478389.8 ms of routed experts on the host, 1126.7 MiB on the device; per decode step 20.29 ms waiting, 532.76 ms of experts (61 steps)
+
+===== 36_B3_evict.log (sha256 a1dc9a4912522ed83c2ddaeba174380671440ad3306834e2b7c0f4253331ce13)
+# free -b; python3 -c "import mmap,sys; n=int(sys.argv[1]); c=b'\x01'*(64<<20); m=mmap.mmap(-1,n); [m.write(c) for _ in range(n//len(c))]; print('touched',n)" 51826819072; free -b; sleep 60; echo rested 60 s
+# rc=0 elapsed=99.1s
+
+               total        used        free      shared  buff/cache   available
+Mem:     56863334400  1804849152 49764978688     5791744  5977001984 55058485248
+Swap:              0           0           0
+touched 51826819072
+               total        used        free      shared  buff/cache   available
+Mem:     56863334400  1829834752 52871839744     5808128  2832584704 55033499648
+Swap:              0           0           0
+rested 60 s
+
+===== 36_B3.log (sha256 ab4e160880c3b7ffe5d28192bc8de78da50b696275f464ca43fa868bbf4fd5d3)
+# cd /content/colibri/c && env COLI_CUDA=1 COLI_GPU=0 COLI_VULKAN=0 COLI_TEMP=0 USAGE_SAVE=0 OMP_NUM_THREADS=6 SNAP=/content/q38  N_NEW=64 COLI_USAGE=/content/storia timeout -k 10 1200 /content/qwen38-dev 128 8 /content/prompt-lungo.txt
+# rc=0 elapsed=248.6s
+
+[gguf] /content/q38-gguf/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf: 3 file(s), 1224 tensors, read in place (native ggml types, no conversion)
+== Qwen3.8-Flash-Next native text engine | cache=128/layer | CPU ==
+[tok] loaded 248320 base pieces + 33 added tokens (max id 248319) from /content/q38/tokenizer.json
+[enc] prompt tokens: 1628 | generating 64 new tokens
+[qwen38] native text weights: prefix=model, 48 layers, PLE=1, cache=128/layer, FP8=native, BF16=native (resident matrices 3.73 GiB)
+[qwen38] speculative decoding with the MTP head: off (the GGUF has none; tools/gguf_import.py --mtp names an mtp-*.gguf; Q38_MTP=0 silences this)
+[qtier] qwen38: 1.59 GiB kept for the CUDA chain (its mirrors at 8192 positions, its scratch and own matrices)
+[qtier] RAM holds 128 of 512 experts a layer: the tier copies each expert it takes as it passes
+[CUDA] device 0: NVIDIA L4, 23.7 GB VRAM, sm_89
+[qtier] dev 0: 21.8 GB free, allowance 20.8 GB
+[place] auto: dev 0 holds 4700.6 MB of trunk (lmhead yes, 0 dnproj layers), 16.25 GB left for experts
+[qtier] dev 0: budget 16.25 GB for experts (~7977 experts) after trunk
+[qtier] dev 0: the GGUF experts' arena, 7977 slots of 2.09 MB (16.25 GB)
+[qtier] CUDA VRAM expert tier active: 1 device(s), 2.09 MB/expert, copied as they pass
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[qtier] qwen38: the GGUF's experts on the CUDA tier as the file has them (RAM LRU 128/layer; experts go to VRAM as they get hot)
+[qtier] qwen38 trunk: 553 of 553 offered matrices resident (int8, a GGUF's blocks as they are; 3.00 GiB) in 1.8s; the rest answers from the CPU
+[qwen38] trunk: 60 matrices int8 on the CPU (0.08 GiB, 0.27 GiB of BF16 released) in 0.0s; Q38_TRUNK_CPU_INT8=0 keeps BF16
+[chain] qwen38: a decode step's routed experts in the frame (the tier's residents by address, format 100 (a GGUF's blocks, by layer), group 0; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen38: 48 layers on CUDA device 0 (12 QSA), the final mixer and lm_head too; 3.37 GiB of the tier's trunk, 174.2 MiB uploaded by the chain, 9.8 MiB of parameters
+[qwen38] routed experts: GGUF IQ2_XS/IQ2_XS/IQ4_NL (layer 0), 1.78 MiB per expert; cache 128/layer
+[USAGE] expert history: 134880 selections (/content/storia)
+[qtier] qwen38: warm start, 7977 of the GGUF's experts in VRAM, the history's most used first (.coli_usage) -- 60.9 s
+[chain] qwen38: host pool, 14854 of the 16599 experts the card leaves in 30.10 GiB of page-locked RAM the device reads over the bus, the history's most used first (17.6 s to allocate, 104.0 s to read; COLI_CUDA_CHAIN_POOL=0 off, COLI_CUDA_CHAIN_POOL_GB sets it)
+[chain] qwen38: a step's pooled experts copied to the device first (16 places, 33.2 MiB)
+[chain] qwen38: a prompt chunk's layer's pooled experts copied to the device while the layers before it run (246 places, 510.5 MiB; the most a layer has: 422)
+resident weights loaded in 12.7s | RSS after load: 34.35 GB
+Generated (64 new tokens):
+Text :  But[qwen38] decode rows' routed experts grouped by expert, one parallel region a layer (Q38_MOE_GROUPED=0: one expert at a time)
+ if we do not venture, somebody else will; and after all, Mrs. Long is a smooth, polite woman, and will be sure to do the thing properly." Mrs. Bennet was quite disconcerted. She could not understand her husband's raillery, and was obliged to have recourse to her usual
+TTFT: 44.74 s (time to first token)
+[qwen38 spec gate] run: T(1) 52.4 ms, rows 2:1.07 3:1.59, rho 0.17, acceptance by position 0.36 0.50 0.50 0.50 0.50
+[qwen38 lookup] run: 1.07 tokens/forward (59 forwards per 63 tokens) | acceptance 28.6% (4/14 drafts in 12 verifies) | gate on, 3 declined, 3 probes
+
+PEAK RSS: 35.96 GB
+[qtier] resident 7977/24576 experts | uploads 7977 | miss(CPU) 72033 | q_skips 0
+[qtier]   dev 0: hits 630487 | 773 tensors, 3.09 GB VRAM used (4.59 GB trunk + experts, budget 16.25 GB)
+[qtier] VRAM hit rate: 89.7 % | swaps 0 (0 in place)
+Expert cache hit rate: 68.7% (hit=21411 miss=9768)
+Speed: 1.34 tok/s (47.9s for 64 tokens)
+[chain] qwen38: 60 forwards, 123 frames (137248 ops, 48690 matmuls), 3547.9 ms waiting for the device, 24061.0 ms of routed experts on the host, 1310.7 MiB on the device; per decode step 3.78 ms waiting, 3.04 ms of experts (59 steps)
+[chain] qwen38: 2996 layer steps with the routed experts in the frame, 413 of them hybrid (115 slots on the host in 179.6 ms, 1559.6 ms waiting for the device's routes), 71918 slots from the host pool
+[chain] qwen38: 168 prompt layer steps staged the host pool's experts (83.61 GB copied over the bus)
+
+===== 37_B4_evict.log (sha256 e1c0f503084aafdb8e840ce66e1b67cda4131d8949f372f52a51250d641a6f14)
+# free -b; python3 -c "import mmap,sys; n=int(sys.argv[1]); c=b'\x01'*(64<<20); m=mmap.mmap(-1,n); [m.write(c) for _ in range(n//len(c))]; print('touched',n)" 51826606080; free -b; sleep 60; echo rested 60 s
+# rc=0 elapsed=99.7s
+
+               total        used        free      shared  buff/cache   available
+Mem:     56863334400  1817092096 39430193152     5935104 16287014912 55046242304
+Swap:              0           0           0
+touched 51826606080
+               total        used        free      shared  buff/cache   available
+Mem:     56863334400  1819922432 52771414016     5947392  2943221760 55043411968
+Swap:              0           0           0
+rested 60 s
+
+===== 37_B4.log (sha256 143c72d80298a51668606c9d71a7c088c89833eaa5effd9d8b64dbbe0c0847bd)
+# cd /content/colibri/c && env COLI_CUDA=1 COLI_GPU=0 COLI_VULKAN=0 COLI_TEMP=0 USAGE_SAVE=0 OMP_NUM_THREADS=6 SNAP=/content/q38  N_NEW=64 COLI_USAGE=/content/storia timeout -k 10 1200 /content/qwen38-dev 128 8 /content/prompt-lungo.txt
+# rc=0 elapsed=247.7s
+
+[gguf] /content/q38-gguf/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf: 3 file(s), 1224 tensors, read in place (native ggml types, no conversion)
+== Qwen3.8-Flash-Next native text engine | cache=128/layer | CPU ==
+[tok] loaded 248320 base pieces + 33 added tokens (max id 248319) from /content/q38/tokenizer.json
+[enc] prompt tokens: 1628 | generating 64 new tokens
+[qwen38] native text weights: prefix=model, 48 layers, PLE=1, cache=128/layer, FP8=native, BF16=native (resident matrices 3.73 GiB)
+[qwen38] speculative decoding with the MTP head: off (the GGUF has none; tools/gguf_import.py --mtp names an mtp-*.gguf; Q38_MTP=0 silences this)
+[qtier] qwen38: 1.59 GiB kept for the CUDA chain (its mirrors at 8192 positions, its scratch and own matrices)
+[qtier] RAM holds 128 of 512 experts a layer: the tier copies each expert it takes as it passes
+[CUDA] device 0: NVIDIA L4, 23.7 GB VRAM, sm_89
+[qtier] dev 0: 21.8 GB free, allowance 20.8 GB
+[place] auto: dev 0 holds 4700.6 MB of trunk (lmhead yes, 0 dnproj layers), 16.25 GB left for experts
+[qtier] dev 0: budget 16.25 GB for experts (~7977 experts) after trunk
+[qtier] dev 0: the GGUF experts' arena, 7977 slots of 2.09 MB (16.25 GB)
+[qtier] CUDA VRAM expert tier active: 1 device(s), 2.09 MB/expert, copied as they pass
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[qtier] qwen38: the GGUF's experts on the CUDA tier as the file has them (RAM LRU 128/layer; experts go to VRAM as they get hot)
+[qtier] qwen38 trunk: 553 of 553 offered matrices resident (int8, a GGUF's blocks as they are; 3.00 GiB) in 1.8s; the rest answers from the CPU
+[qwen38] trunk: 60 matrices int8 on the CPU (0.08 GiB, 0.27 GiB of BF16 released) in 0.0s; Q38_TRUNK_CPU_INT8=0 keeps BF16
+[chain] qwen38: a decode step's routed experts in the frame (the tier's residents by address, format 100 (a GGUF's blocks, by layer), group 0; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen38: 48 layers on CUDA device 0 (12 QSA), the final mixer and lm_head too; 3.37 GiB of the tier's trunk, 174.2 MiB uploaded by the chain, 9.8 MiB of parameters
+[qwen38] routed experts: GGUF IQ2_XS/IQ2_XS/IQ4_NL (layer 0), 1.78 MiB per expert; cache 128/layer
+[USAGE] expert history: 134880 selections (/content/storia)
+[qtier] qwen38: warm start, 7977 of the GGUF's experts in VRAM, the history's most used first (.coli_usage) -- 63.5 s
+[chain] qwen38: host pool, 14851 of the 16599 experts the card leaves in 30.10 GiB of page-locked RAM the device reads over the bus, the history's most used first (17.4 s to allocate, 98.6 s to read; COLI_CUDA_CHAIN_POOL=0 off, COLI_CUDA_CHAIN_POOL_GB sets it)
+[chain] qwen38: a step's pooled experts copied to the device first (16 places, 33.2 MiB)
+[chain] qwen38: a prompt chunk's layer's pooled experts copied to the device while the layers before it run (246 places, 510.5 MiB; the most a layer has: 422)
+resident weights loaded in 12.6s | RSS after load: 34.34 GB
+Generated (64 new tokens):
+Text :  But[qwen38] decode rows' routed experts grouped by expert, one parallel region a layer (Q38_MOE_GROUPED=0: one expert at a time)
+ if we do not venture, somebody else will; and after all, Mrs. Long is a smooth, polite woman, and will be sure to do the thing properly." Mrs. Bennet was quite disconcerted. She could not understand her husband's raillery, and was obliged to have recourse to her usual
+TTFT: 46.83 s (time to first token)
+[qwen38 spec gate] run: T(1) 53.3 ms, rows 2:1.07 3:1.60, rho 0.19, acceptance by position 0.36 0.50 0.50 0.50 0.50
+[qwen38 lookup] run: 1.07 tokens/forward (59 forwards per 63 tokens) | acceptance 28.6% (4/14 drafts in 12 verifies) | gate on, 3 declined, 3 probes
+
+PEAK RSS: 35.96 GB
+[qtier] resident 7977/24576 experts | uploads 7977 | miss(CPU) 72033 | q_skips 0
+[qtier]   dev 0: hits 630487 | 773 tensors, 3.09 GB VRAM used (4.59 GB trunk + experts, budget 16.25 GB)
+[qtier] VRAM hit rate: 89.7 % | swaps 0 (0 in place)
+Expert cache hit rate: 68.7% (hit=21411 miss=9768)
+Speed: 1.28 tok/s (50.0s for 64 tokens)
+[chain] qwen38: 60 forwards, 123 frames (137248 ops, 48690 matmuls), 3589.2 ms waiting for the device, 25870.8 ms of routed experts on the host, 1310.7 MiB on the device; per decode step 3.88 ms waiting, 3.56 ms of experts (59 steps)
+[chain] qwen38: 2996 layer steps with the routed experts in the frame, 413 of them hybrid (115 slots on the host in 210.3 ms, 1561.4 ms waiting for the device's routes), 71918 slots from the host pool
+[chain] qwen38: 168 prompt layer steps staged the host pool's experts (83.61 GB copied over the bus)
+
+===== 38_A4_evict.log (sha256 9048c25fa1e16fc3c264b7a59bf36498a3e47d369fd224b103562fb3952a8e62)
+# free -b; python3 -c "import mmap,sys; n=int(sys.argv[1]); c=b'\x01'*(64<<20); m=mmap.mmap(-1,n); [m.write(c) for _ in range(n//len(c))]; print('touched',n)" 51820253184; free -b; sleep 60; echo rested 60 s
+# rc=0 elapsed=99.4s
+
+               total        used        free      shared  buff/cache   available
+Mem:     56863334400  1813438464 39425261568     6074368 16295747584 55049895936
+Swap:              0           0           0
+touched 51820253184
+               total        used        free      shared  buff/cache   available
+Mem:     56863334400  1820749824 53293608960     6090752  2420072448 55042584576
+Swap:              0           0           0
+rested 60 s
+
+===== 38_A4.log (sha256 2fa0f36bf9b9bdbed6252b2b135b0590a125f94684c7acf37ed8efe22d551c06)
+# cd /content/colibri/c && env COLI_CUDA=1 COLI_GPU=0 COLI_VULKAN=0 COLI_TEMP=0 USAGE_SAVE=0 OMP_NUM_THREADS=6 SNAP=/content/q38 CUDA_EXPERT_GB=21.660 N_NEW=64 COLI_USAGE=/content/storia timeout -k 10 1200 /content/qwen38-dev 128 8 /content/prompt-lungo.txt
+# rc=0 elapsed=686.8s
+
+[gguf] /content/q38-gguf/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf: 3 file(s), 1224 tensors, read in place (native ggml types, no conversion)
+== Qwen3.8-Flash-Next native text engine | cache=128/layer | CPU ==
+[tok] loaded 248320 base pieces + 33 added tokens (max id 248319) from /content/q38/tokenizer.json
+[enc] prompt tokens: 1628 | generating 64 new tokens
+[qwen38] native text weights: prefix=model, 48 layers, PLE=1, cache=128/layer, FP8=native, BF16=native (resident matrices 3.73 GiB)
+[qwen38] speculative decoding with the MTP head: off (the GGUF has none; tools/gguf_import.py --mtp names an mtp-*.gguf; Q38_MTP=0 silences this)
+[qtier] qwen38: 1.59 GiB kept for the CUDA chain (its mirrors at 8192 positions, its scratch and own matrices)
+[qtier] RAM holds 128 of 512 experts a layer: the tier copies each expert it takes as it passes
+[CUDA] device 0: NVIDIA L4, 23.7 GB VRAM, sm_89
+[qtier] dev 0: 21.8 GB free, allowance 21.7 GB
+[place] auto: dev 0 holds 4700.6 MB of trunk (lmhead yes, 0 dnproj layers), 17.07 GB left for experts
+[qtier] dev 0: budget 17.07 GB for experts (~8377 experts) after trunk
+[qtier] dev 0: the GGUF experts' arena, 8377 slots of 2.09 MB (17.07 GB)
+[qtier] CUDA VRAM expert tier active: 1 device(s), 2.09 MB/expert, copied as they pass
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[qtier] qwen38: the GGUF's experts on the CUDA tier as the file has them (RAM LRU 128/layer; experts go to VRAM as they get hot)
+[qtier] qwen38 trunk: 553 of 553 offered matrices resident (int8, a GGUF's blocks as they are; 3.00 GiB) in 1.8s; the rest answers from the CPU
+[qwen38] trunk: 60 matrices int8 on the CPU (0.08 GiB, 0.27 GiB of BF16 released) in 0.0s; Q38_TRUNK_CPU_INT8=0 keeps BF16
+[chain] qwen38: a decode step's routed experts in the frame (the tier's residents by address, format 100 (a GGUF's blocks, by layer), group 0; COLI_CUDA_CHAIN_MOE=0: the host's step)
+[chain] qwen38: 48 layers on CUDA device 0 (12 QSA), the final mixer and lm_head too; 3.37 GiB of the tier's trunk, 174.2 MiB uploaded by the chain, 9.8 MiB of parameters
+[qwen38] routed experts: GGUF IQ2_XS/IQ2_XS/IQ4_NL (layer 0), 1.78 MiB per expert; cache 128/layer
+[USAGE] expert history: 134880 selections (/content/storia)
+[qtier] qwen38: warm start, 8377 of the GGUF's experts in VRAM, the history's most used first (.coli_usage) -- 67.7 s
+[chain] qwen38: host pool, 14852 of the 16199 experts the card leaves in 30.10 GiB of page-locked RAM the device reads over the bus, the history's most used first (17.5 s to allocate, 101.0 s to read; COLI_CUDA_CHAIN_POOL=0 off, COLI_CUDA_CHAIN_POOL_GB sets it)
+[chain] qwen38: a step's pooled experts copied to the device first (16 places, 33.2 MiB)
+[chain] qwen38: a prompt chunk's layer's pooled experts copied to the device while the layers before it run (246 places, 510.5 MiB; the most a layer has: 393)
+resident weights loaded in 12.6s | RSS after load: 34.35 GB
+Generated (64 new tokens):
+Text : [chain] qwen38: the routed experts' buffers or table refused; the host's step from here on
+ But[qwen38] decode rows' routed experts grouped by expert, one parallel region a layer (Q38_MOE_GROUPED=0: one expert at a time)
+ if we do not venture, somebody else will; and after all, Mrs. Long is a smooth-minded old lady, and she will have as good a chance of introducing him as you." Mrs. Bennet was quite disconcerted. She could not imagine how her friend Mrs. Long could have introduced Mr.
+TTFT: 447.94 s (time to first token)
+[qwen38 spec gate] run: T(1) 471.0 ms, rows 2:3.35, rho 1.91, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen38 lookup] run: 1.03 tokens/forward (61 forwards per 63 tokens) | acceptance 50.0% (2/4 drafts in 4 verifies) | gate on, 15 declined, 4 probes
+
+PEAK RSS: 45.43 GB
+[qtier] resident 8377/24576 experts | uploads 8462 | miss(CPU) 2670 | q_skips 0
+[qtier]   dev 0: hits 28530 | 773 tensors, 3.09 GB VRAM used (4.59 GB trunk + experts, budget 17.07 GB)
+[qtier] VRAM hit rate: 91.4 % | swaps 85 (85 in place)
+[qtier] group_stats: 661 calls, 4880 experts | h2d 0 ms, kernel 0 ms, d2h 0 ms
+Expert cache hit rate: 66.8% (hit=169584 miss=84401)
+Speed: 0.13 tok/s (482.0s for 64 tokens)
+[chain] qwen38: 62 forwards, 6306 frames (129812 ops, 50236 matmuls), 3387.0 ms waiting for the device, 470386.2 ms of routed experts on the host, 1126.7 MiB on the device; per decode step 20.43 ms waiting, 520.97 ms of experts (61 steps)
+
+===== summary
+30_W (A, warm-up, not counted): TTFT 461.38 s (3.53 prompt tok/s); the other 63 tokens in 34.3 s (the "Speed" line's seconds less TTFT); 483312.9 ms of routed experts on the host; PEAK RSS 45.41 GiB; the chain's 'the routed experts' buffers or table refused': yes; text sha256 dde186d66129579b5ffebb82d7faf3b5bc0a6ab542f3bb2eec54983a01327b47
+31_A1 (A): TTFT 451.2 s (3.61 prompt tok/s); the other 63 tokens in 34.7 s (the "Speed" line's seconds less TTFT); 473473.7 ms of routed experts on the host; PEAK RSS 45.42 GiB; the chain's 'the routed experts' buffers or table refused': yes; text sha256 dde186d66129579b5ffebb82d7faf3b5bc0a6ab542f3bb2eec54983a01327b47
+32_B1 (B): TTFT 44.37 s (36.69 prompt tok/s); the other 63 tokens in 3.1 s (the "Speed" line's seconds less TTFT); 23457.6 ms of routed experts on the host; PEAK RSS 35.93 GiB; the chain's 'the routed experts' buffers or table refused': no; text sha256 f32f497947775ab06fa336c02bc6d9d5d25357fdd523e6bdb4cc41cb25fe189d
+33_B2 (B): TTFT 46.46 s (35.04 prompt tok/s); the other 63 tokens in 3.1 s (the "Speed" line's seconds less TTFT); 26145.3 ms of routed experts on the host; PEAK RSS 35.97 GiB; the chain's 'the routed experts' buffers or table refused': no; text sha256 f32f497947775ab06fa336c02bc6d9d5d25357fdd523e6bdb4cc41cb25fe189d
+34_A2 (A): TTFT 449.44 s (3.62 prompt tok/s); the other 63 tokens in 34.8 s (the "Speed" line's seconds less TTFT); 472027.4 ms of routed experts on the host; PEAK RSS 45.42 GiB; the chain's 'the routed experts' buffers or table refused': yes; text sha256 dde186d66129579b5ffebb82d7faf3b5bc0a6ab542f3bb2eec54983a01327b47
+35_A3 (A): TTFT 455.84 s (3.57 prompt tok/s); the other 63 tokens in 34.8 s (the "Speed" line's seconds less TTFT); 478389.8 ms of routed experts on the host; PEAK RSS 45.42 GiB; the chain's 'the routed experts' buffers or table refused': yes; text sha256 dde186d66129579b5ffebb82d7faf3b5bc0a6ab542f3bb2eec54983a01327b47
+36_B3 (B): TTFT 44.74 s (36.39 prompt tok/s); the other 63 tokens in 3.2 s (the "Speed" line's seconds less TTFT); 24061.0 ms of routed experts on the host; PEAK RSS 35.96 GiB; the chain's 'the routed experts' buffers or table refused': no; text sha256 f32f497947775ab06fa336c02bc6d9d5d25357fdd523e6bdb4cc41cb25fe189d
+37_B4 (B): TTFT 46.83 s (34.76 prompt tok/s); the other 63 tokens in 3.2 s (the "Speed" line's seconds less TTFT); 25870.8 ms of routed experts on the host; PEAK RSS 35.96 GiB; the chain's 'the routed experts' buffers or table refused': no; text sha256 f32f497947775ab06fa336c02bc6d9d5d25357fdd523e6bdb4cc41cb25fe189d
+38_A4 (A): TTFT 447.94 s (3.63 prompt tok/s); the other 63 tokens in 34.1 s (the "Speed" line's seconds less TTFT); 470386.2 ms of routed experts on the host; PEAK RSS 45.43 GiB; the chain's 'the routed experts' buffers or table refused': yes; text sha256 dde186d66129579b5ffebb82d7faf3b5bc0a6ab542f3bb2eec54983a01327b47
+A TTFT s: 451.2, 449.44, 455.84, 447.94; median 450.32; min-max 447.94-455.84
+A prompt tok/s: 3.61, 3.62, 3.57, 3.63; median 3.615; min-max 3.57-3.63
+A seconds after the first token: 34.7, 34.8, 34.8, 34.1; median 34.75; min-max 34.1-34.8
+A ms of routed experts on the host: 473473.7, 472027.4, 478389.8, 470386.2; median 472750.55; min-max 470386.2-478389.8
+A PEAK RSS GiB: 45.42, 45.42, 45.42, 45.43; median 45.42; min-max 45.42-45.43
+B TTFT s: 44.37, 46.46, 44.74, 46.83; median 45.6; min-max 44.37-46.83
+B prompt tok/s: 36.69, 35.04, 36.39, 34.76; median 35.715; min-max 34.76-36.69
+B seconds after the first token: 3.1, 3.1, 3.2, 3.2; median 3.15; min-max 3.1-3.2
+B ms of routed experts on the host: 23457.6, 26145.3, 24061.0, 25870.8; median 24965.9; min-max 23457.6-26145.3
+B PEAK RSS GiB: 35.93, 35.97, 35.96, 35.96; median 35.96; min-max 35.93-35.97
+text: the same in all of A's 5 runs and in all of B's 5 runs (the warm-up's included, engine lines taken out); A's and B's texts have the same first 16 words

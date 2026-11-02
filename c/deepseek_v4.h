@@ -124,7 +124,7 @@ typedef struct {
  * uninterruptible as before. */
 typedef int (*ColiV4SessionAbortFn)(void *user_data);
 
-/* The numeric channel (SUBMIT logprobs=k, docs/brio.md): raw head scores,
+/* The numeric channel (SUBMIT logprobs=k, docs/systemone.md): raw head scores,
  * vocab_size floats, valid only for the duration of the callback. on_echo
  * fires once per prompt position whose predictor this call computed, with the
  * token that actually stands there; on_scores fires right before the on_token
@@ -154,6 +154,9 @@ typedef struct {
      * that token boundary during this prefill so later conversations that
      * share it start there. 0 = unknown. */
     size_t prefix_bytes;
+    /* Return after the prompt and its first token, the decoding's state kept in the
+     * session for coli_v4_sessions_step (a multiplexed serve, KV_SLOTS): no draft. */
+    int prefill_only;
 } ColiV4SessionGenerateOptions;
 
 typedef struct {
@@ -181,6 +184,11 @@ int coli_v4_session_generate(ColiV4Session *session,
                              ColiV4SessionTokenFn on_token, void *user_data,
                              ColiV4SessionGenerateStats *stats,
                              char *error, size_t error_size);
+
+/* One decode step of several sessions whose requests were started with prefill_only:
+ * each one's next token, as a row of one batch (a multiplexed serve, KV_SLOTS). */
+int coli_v4_sessions_step(ColiV4Session **sessions, int count,
+                          char *error, size_t error_size);
 
 int coli_v4_session_generated_text(const ColiV4Session *session,
                                    char *buffer, size_t buffer_size,

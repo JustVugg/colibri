@@ -14,17 +14,25 @@ byte-identical frames it produced before the channel existed. Chat is the mode
 everyone uses; the scoring channel is opt-in and must stay that way. The check
 is a byte diff of the frames, not a reading of the text.
 
-Runs against the CONVERTED tiny olmoe fixture, olmoe_tiny_c, that the
-`olmoe-tiny-check` CI job builds and runs this module on, so it needs no
-checkpoint. From c/:
+The scenarios are a contract, written once and run per engine:
+
+- OLMoE, against the CONVERTED tiny fixture olmoe_tiny_c that the
+  `olmoe-tiny-check` CI job builds and runs this module on. From c/:
 
     python3 tools/make_olmoe_tiny.py --output olmoe_tiny
     python3 tools/convert_olmoe_merged.py --model olmoe_tiny --out olmoe_tiny_c
     python3 tools/make_edge_tiny_tokenizer.py --vocab-size 128 olmoe_tiny_c
 
-olmoe_tiny is the HF source checkpoint the engine cannot load, and it has a
-config.json too: the guard below looks for the tokenizer, which only the
-converted fixture has, so a missing fixture skips instead of failing (#1742).
+  olmoe_tiny is the HF source checkpoint the engine cannot load, and it has a
+  config.json too: the guard below looks for the tokenizer, which only the
+  converted fixture has, so a missing fixture skips instead of failing (#1742).
+
+- MiMo-V2.6, against the tiny fixture of `make mimo-tiny-generate`, served
+  through tests/mimo_serve_fixture.py (a copy with a byte tokenizer). Its
+  windowed layers and its pictures have their own cases in
+  tests/test_mimo_prefix_serve.py.
+
+Neither needs a checkpoint, and an engine that is not built skips.
 """
 import json
 import os
@@ -33,6 +41,9 @@ import sys
 import unittest
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import mimo_serve_fixture  # noqa: E402
+
 HERE = Path(__file__).resolve().parent.parent
 ENGINE = HERE / ("olmoe.exe" if sys.platform == "win32" else "olmoe")
 FIXTURE = Path(os.environ.get("OLMOE_TINY", HERE / "olmoe_tiny_c"))
@@ -40,16 +51,20 @@ PROMPT = "Context: the release is late and the tests are red.\nQuestion: ship?\n
 OPTION = " no"
 
 
+def olmoe_engine():
+    return Engine(ENGINE, [], dict(SNAP=str(FIXTURE), SERVE="1",
+                                   TOK=str(FIXTURE / "tokenizer.json"),
+                                   COLI_NO_OMP_TUNE="1", OMP_NUM_THREADS="2"))
+
+
 class Engine:
     """One serve-mode engine, driven over the wire the gateway uses."""
 
-    def __init__(self):
-        env = dict(os.environ, SNAP=str(FIXTURE), SERVE="1",
-                   TOK=str(FIXTURE / "tokenizer.json"),
-                   COLI_NO_OMP_TUNE="1", OMP_NUM_THREADS="2")
-        self.p = subprocess.Popen([str(ENGINE)], env=env, stdin=subprocess.PIPE,
-                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                  bufsize=0)
+    def __init__(self, binary, argv, env):
+        env = dict(os.environ, **env)
+        self.p = subprocess.Popen([str(binary)] + [str(a) for a in argv], env=env,
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, bufsize=0)
         while True:
             line = self.readline()
             if line is None:
@@ -101,6 +116,7 @@ class Engine:
             pass
         self.p.terminate()
         self.p.wait(timeout=30)
+        self.p.stdout.close()
 
 
 def strip_volatile(frames):
@@ -110,14 +126,15 @@ def strip_volatile(frames):
             if not f.startswith(("STAT", "PROF", "DONE", "TIERS", "HWINFO", "EMAP", "HITS"))]
 
 
-@unittest.skipUnless((FIXTURE / "tokenizer.json").is_file(),
-                     "converted tiny olmoe fixture is absent: see the module "
-                     "docstring (make_olmoe_tiny.py, convert_olmoe_merged.py, "
-                     "make_edge_tiny_tokenizer.py)")
-@unittest.skipUnless(ENGINE.is_file(), "olmoe engine is not built")
-class BrioServe(unittest.TestCase):
+class BrioServeContract:
+    """The scenarios. Mix into a TestCase that provides engine(); deliberately not
+    a TestCase itself, or unittest would run them once more with no engine."""
+
+    def engine(self):   # pragma: no cover - overridden
+        raise NotImplementedError
+
     def test_a_snapshot_scores_exactly_like_a_cold_recompute(self):
-        warm = Engine()
+        warm = self.engine()
         try:
             _, prefix = warm.submit(1, PROMPT, 0, " logprobs=1 pin=1")
             _, pinned = warm.submit(2, PROMPT + OPTION, 0, " logprobs=1")
@@ -126,7 +143,7 @@ class BrioServe(unittest.TestCase):
         self.assertTrue(prefix, "the warm pass read nothing")
         tail_starts = max(prefix) + 1
 
-        cold = Engine()
+        cold = self.engine()
         try:
             _, fresh = cold.submit(1, PROMPT + OPTION, 0, " logprobs=1")
         finally:
@@ -170,7 +187,7 @@ class BrioServe(unittest.TestCase):
         cold recompute."""
         other = "Context: the invoice is overdue by ninety days.\nQuestion: escalate?\nAnswer:"
 
-        engine = Engine()
+        engine = self.engine()
         try:
             _, prefix = engine.submit(1, PROMPT, 0, " logprobs=1 pin=1")
             engine.submit(2, other, 4)          # overwrites the record with other ids
@@ -180,7 +197,7 @@ class BrioServe(unittest.TestCase):
         self.assertTrue(prefix, "the warm pass read nothing")
         tail_starts = max(prefix) + 1
 
-        cold = Engine()
+        cold = self.engine()
         try:
             _, fresh = cold.submit(1, PROMPT + OPTION, 0, " logprobs=1")
         finally:
@@ -199,7 +216,7 @@ class BrioServe(unittest.TestCase):
 
     def test_the_snapshot_only_reads_the_fresh_tail(self):
         """The point of the snapshot: the shared prefix is not read again."""
-        engine = Engine()
+        engine = self.engine()
         try:
             _, prefix = engine.submit(1, PROMPT, 0, " logprobs=1 pin=1")
             _, tail = engine.submit(2, PROMPT + OPTION, 0, " logprobs=1")
@@ -217,7 +234,7 @@ class BrioServe(unittest.TestCase):
         of every frame, so the same id has to be reused, and a second turn on a
         live engine would also start from a different cached state."""
         def frames_for(extension):
-            engine = Engine()
+            engine = self.engine()
             try:
                 frames, _ = engine.submit(1, PROMPT, 4, extension)
             finally:
@@ -244,7 +261,7 @@ class BrioServe(unittest.TestCase):
 
     def test_read_only_generates_nothing(self):
         """max_tokens=0 means read the prompt and stop: no DATA frame at all."""
-        engine = Engine()
+        engine = self.engine()
         try:
             frames, _ = engine.submit(1, PROMPT, 0, " logprobs=1")
         finally:
@@ -256,13 +273,31 @@ class BrioServe(unittest.TestCase):
 
     def test_read_only_needs_the_channel(self):
         """max_tokens=0 without logprobs stays a malformed request."""
-        engine = Engine()
+        engine = self.engine()
         try:
             frames, _ = engine.submit(1, PROMPT, 0)
         finally:
             engine.close()
         self.assertTrue([f for f in frames if f.startswith("ERROR")],
                         "max_tokens=0 was accepted without the logprobs channel")
+
+
+@unittest.skipUnless((FIXTURE / "tokenizer.json").is_file(),
+                     "converted tiny olmoe fixture is absent: see the module "
+                     "docstring (make_olmoe_tiny.py, convert_olmoe_merged.py, "
+                     "make_edge_tiny_tokenizer.py)")
+@unittest.skipUnless(ENGINE.is_file(), "olmoe engine is not built")
+class BrioServe(BrioServeContract, unittest.TestCase):
+    def engine(self):
+        return olmoe_engine()
+
+
+@unittest.skipUnless(mimo_serve_fixture.available(),
+                     "mimo is not built or the tiny MiMo fixture is absent "
+                     "(make mimo mimo-tiny-generate)")
+class MimoBrioServe(BrioServeContract, unittest.TestCase):
+    def engine(self):
+        return Engine(mimo_serve_fixture.ENGINE, ["8"], mimo_serve_fixture.engine_env())
 
 
 if __name__ == "__main__":

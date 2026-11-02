@@ -1,0 +1,107 @@
+{
+  "version": 1,
+  "hypothesis": "Writing the lm_head's 248320 logits in device memory and copying them to the host once, instead of storing a float a warp into mapped host memory, does not lower Qwen3.6's decode on an L4 with every expert in VRAM, with the same logits",
+  "commit": "c1c06ac6fcb32157e4da130fd96775a32a757052",
+  "model": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64",
+  "command": "cd c && make qwen36_tier.o backend_cuda.o cuda_chain.o cu_xb.o cu_tier.o CUDA=1 CUDA_ARCH=sm_89 && gcc -O3 -march=native -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_CUDA -I. ../docs/experiments/qwen36-cuda-lmhead-device-2026-10-27/bench.c qwen36_tier.o backend_cuda.o cuda_chain.o cu_xb.o cu_tier.o -o qwen36-bench -lm -fopenmp -pthread -L/usr/local/cuda/lib64 -Wl,-rpath,/usr/local/cuda/lib64 -lcudart -lcublasLt -lcublas -lstdc++; LD_LIBRARY_PATH=/usr/lib64-nvidia COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close ./qwen36-bench --model <model> --text <dir>/promessi_sposi.txt --lengths 64,512 --gen 32 --teacher --steps /content/misura/v1-runN.steps",
+  "prompt_hash": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "hardware": {
+    "cpu": "Intel(R) Xeon(R) CPU @ 2.20GHz (12 CPUs, 38.5 MiB L3) + NVIDIA L4 (23034 MiB, sm_89)",
+    "ram": "52 GiB",
+    "storage": "the model on the machine's local disk before the runs, then read once into the page cache",
+    "os": "Ubuntu 24.04.4 LTS, Linux 6.6.159+ x86_64, CUDA 13.0 (nvcc V13.0.88), driver 580.82.07, gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "prompt_tokens": 64,
+      "decode_steps": 32,
+      "engine_build": "c1c06ac6"
+    },
+    "samples": {
+      "tok_s": [
+        69.168,
+        69.179,
+        69.095,
+        69.199
+      ],
+      "decode_tok_s_after_512": [
+        68.052,
+        68.144,
+        68.121,
+        68.069
+      ],
+      "prompt_tok_s_64": [
+        677.38,
+        678.59,
+        679.38,
+        675.26
+      ],
+      "prompt_tok_s_512": [
+        1781.66,
+        1762.61,
+        1771.97,
+        1780.74
+      ]
+    },
+    "median_tok_s": 69.1735,
+    "quality": {
+      "method": "make -C c check (macOS arm64) and make -C c cuda-chain-check cuda-test CUDA=1 CUDA_ARCH=sm_89 pass; every run of both versions gives the same fingerprint of every logit and token (FNV-1a: 1837d0374f5820c3 at 64 tokens, 9a9da81aa38cc006 at 512) and the same teacher-forced nll (2.69849 and 2.94540)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-lmhead-device-2026-10-27/l4-normal.txt",
+      "sha256": "031eb6f705d4fbe7022ea911c215baa11d13f09c24921623e2df153e52c326c0"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "prompt_tokens": 64,
+      "decode_steps": 32,
+      "engine_build": "c1c06ac6 + this change"
+    },
+    "samples": {
+      "tok_s": [
+        68.712,
+        68.664,
+        68.685,
+        68.721
+      ],
+      "decode_tok_s_after_512": [
+        67.664,
+        67.592,
+        67.694,
+        67.509
+      ],
+      "prompt_tok_s_64": [
+        675.85,
+        675.78,
+        670.71,
+        674.69
+      ],
+      "prompt_tok_s_512": [
+        1783.64,
+        1820.18,
+        1816.16,
+        1797.03
+      ]
+    },
+    "median_tok_s": 68.6985,
+    "quality": {
+      "method": "make -C c check (macOS arm64) and make -C c cuda-chain-check cuda-test CUDA=1 CUDA_ARCH=sm_89 pass; every run of both versions gives the same fingerprint of every logit and token (FNV-1a: 1837d0374f5820c3 at 64 tokens, 9a9da81aa38cc006 at 512) and the same teacher-forced nll (2.69849 and 2.94540)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-lmhead-device-2026-10-27/l4-normal.txt",
+      "sha256": "031eb6f705d4fbe7022ea911c215baa11d13f09c24921623e2df153e52c326c0"
+    }
+  },
+  "outcome": "regression"
+}

@@ -155,10 +155,15 @@ QWEN38_27B = (
 )
 
 DENSE_MLP_KINDS = {"mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"}
+FLINT_KINDS = {"self_attn.softmax_offset"}   # Flint's sinks: no Qwen checkpoint has them
+# LFM3's layers (the converter renames its norms and MLP): no Qwen checkpoint has them
+LFM3_KINDS = {"operator_norm.weight", "post_operator_norm.weight", "ffn_norm.weight", "post_ffn_norm.weight",
+              "feed_forward.w1.weight", "feed_forward.w2.weight", "feed_forward.w3.weight", "conv.in_proj.weight",
+              "conv.conv.weight", "conv.out_proj.weight", "self_attn.gate_proj.weight"}
 
 
 def _concrete(names):
-    return [n.replace("N", "7") for n in names]
+    return [n.replace("mtp.layers.N.", "mtp.layers.0.").replace("N", "7") for n in names]
 
 
 def _collapsed(index_path):
@@ -205,22 +210,35 @@ class TensorKindsTest(unittest.TestCase):
         prefix = resolve_prefix(names)
         return prefix, [classify(n, prefix) for n in names]
 
+    def test_lfm3_names_are_placed(self):
+        # LiquidAI/LFM3-VL-2B's index: the text model under language_model, its final norm named
+        # embedding_norm, the vision tower and projector kept under their own names
+        p = "model.language_model."
+        self.assertEqual(resolve_prefix([p + "layers.0.conv.conv.weight"]), p)
+        for kind in LFM3_KINDS:
+            self.assertEqual(classify(f"{p}layers.3.{kind}", p), ("layer", 3, kind))
+        self.assertEqual(classify(p + "embedding_norm.weight", p), ("global", "embedding_norm.weight"))
+        self.assertEqual(classify(p + "embed_tokens.weight", p), ("global", "embed_tokens.weight"))
+        for name in ("model.vision_tower.layers.0.conv.in_proj.weight", "model.vision_tower.patchifier.weight",
+                     "model.multi_modal_projector.linear_1.weight"):
+            self.assertEqual(classify(name, p), ("lfm3_vision", name))
+
     def test_every_2p4t_tensor_is_placed(self):
         prefix, placed = self._classify_all(_concrete(QWEN38_2P4T))
         self.assertEqual(prefix, "model.")
         kinds = {p[0] for p in placed}
-        self.assertEqual(kinds, {"global", "layer", "skip"})
-        self.assertEqual({p[1] for p in placed if p[0] == "skip"}, {"mtp"})
+        self.assertEqual(kinds, {"global", "layer", "mtp"})
+        self.assertTrue(any(p[0] == "mtp" for p in placed))
         self.assertEqual({p[1] for p in placed if p[0] == "global"}, set(GLOBAL_KINDS))
         self.assertEqual({p[2] for p in placed if p[0] == "layer"},
-                         set(LAYER_KINDS) - DENSE_MLP_KINDS)
+                         set(LAYER_KINDS) - DENSE_MLP_KINDS - FLINT_KINDS - LFM3_KINDS)
 
     def test_every_27b_tensor_is_placed(self):
         """The dense checkpoint: the MoE kinds are absent, the dense MLP is placed, the
-        vision tower is converted (#1757) and the mtp head is skipped."""
+        vision tower is converted (#1757) and the mtp head is converted."""
         prefix, placed = self._classify_all(_concrete(QWEN38_27B))
         self.assertEqual(prefix, "model.language_model.")
-        self.assertEqual({p[1] for p in placed if p[0] == "skip"}, {"mtp"})
+        self.assertTrue(any(p[0] == "mtp" for p in placed))
         vision = [p[1] for p in placed if p[0] == "vision"]
         self.assertEqual(len(vision), 3)                       # the three listed kinds
         self.assertTrue(all(not v.startswith("visual.") for v in vision), vision)
@@ -231,11 +249,18 @@ class TensorKindsTest(unittest.TestCase):
     def test_every_35b_tensor_is_placed(self):
         prefix, placed = self._classify_all(_concrete(QWEN36_35B))
         self.assertEqual(prefix, "model.language_model.")
-        self.assertEqual({p[1] for p in placed if p[0] == "skip"}, {"mtp"})
+        self.assertTrue(any(p[0] == "mtp" for p in placed))
         self.assertTrue(any(p[0] == "vision" for p in placed))
         self.assertEqual(sum(p[0] == "layer" for p in placed),
                          sum(p[0] == "layer" for p in self._classify_all(
                              _concrete(QWEN38_2P4T))[1]))
+
+    def test_vision_tower_nested_under_the_language_model(self):
+        """Some finetune exports (llmfan46/Qwen3.6-35B-A3B-uncensored-heretic) put the
+        same tower under model.language_model.visual.; it is the vision tower too."""
+        self.assertEqual(classify("model.language_model.visual.blocks.0.attn.qkv.weight",
+                                  "model.language_model."),
+                         classify("model.visual.blocks.0.attn.qkv.weight", "model.language_model."))
 
     def test_tiny_fixture_per_expert_layout(self):
         prefix, placed = self._classify_all(_concrete(TINY_FIXTURE))
@@ -261,13 +286,15 @@ class TensorKindsTest(unittest.TestCase):
             "model.language_model.layers.0.mlp.gate.weight",  # wrong prefix for this call
             "audio.encoder.weight",
             "model.mtp.fc.weight",
+            "mtp.layers.1.self_attn.q_proj.weight",
+            "mtp.unknown.weight",
         ):
             with self.subTest(name=name):
                 with self.assertRaises(UnknownTensor):
                     classify(name, "model.")
 
-    def test_skip_groups_have_a_stated_reason(self):
-        self.assertTrue(skip_reason("mtp"))
+    def test_unknown_skip_groups(self):
+        self.assertEqual(skip_reason("mtp"), "")
         self.assertEqual(skip_reason("nope"), "")
 
     def test_layer_kinds_are_exact_suffixes(self):

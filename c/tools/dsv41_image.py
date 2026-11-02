@@ -28,7 +28,7 @@ def load_config(model_dir) -> dict:
     if model_dir:
         path = Path(model_dir) / "config.json"
         if path.is_file():
-            vision = json.loads(path.read_text()).get("vision_config") or {}
+            vision = json.loads(path.read_text(encoding="utf-8")).get("vision_config") or {}
             for key in DEFAULTS:
                 if key in vision:
                     settings[key] = vision[key]
@@ -85,7 +85,7 @@ def preprocess(source, model_dir=None, max_tokens=None):
         import numpy
         from PIL import Image, ImageOps
     except ImportError as exc:                                  # pragma: no cover
-        raise SystemExit(f"image input needs Pillow and numpy: {exc}")
+        raise ImportError(f"image input needs Pillow and numpy: {exc}") from exc   # not SystemExit: the gateway answers 400
     settings = load_config(model_dir)
     patch = int(settings["patch_size"])
     data = source if isinstance(source, (bytes, bytearray)) else Path(source).read_bytes()

@@ -10,9 +10,13 @@
  * oracle tokens/logits must still match exactly; the hit/miss counters pin
  * that residency was consulted anyway. Real-GPU parity is a hardware run.
  *
- * Needs ./qwen38_tiny_fp8 (make qwen38-tiny-fp8-generate). Include order as
- * in test_qwen36_tier_int8_engine.c: engine first, then the fake backend,
- * then the tier source, so the tier's statics (G, qs()) are readable here. */
+ * Needs ./qwen38_tiny_fp8 (make qwen38-tiny-fp8-generate). Given a snapshot
+ * converted to int4-g64 experts on argv (make qwen38-tiny-int4-check passes
+ * ./qwen38_tiny_int4), a third pass checks that the tier declines those
+ * experts -- it streams e4m3 bytes only -- and that the engine then computes
+ * them on the CPU and reproduces the int4 reference. Include order as in
+ * test_qwen36_tier_int8_engine.c: engine first, then the fake backend, then
+ * the tier source, so the tier's statics (G, qs()) are readable here. */
 #define main qwen38_main_unused
 #include "../qwen38.c"
 #undef main
@@ -34,7 +38,7 @@ static void tk(int ok, const char *what) {
     t_fails++;
 }
 
-int main(void) {
+int main(int argc, char **argv_in) {
     /* the fixture: 4 layers x 4 experts, hidden 32, inter 8, top-2, all
      * routed experts native e4m3 with one 128x128 block scale per matrix */
     setenv("SNAP", "./qwen38_tiny_fp8", 1);
@@ -112,6 +116,26 @@ int main(void) {
     tk(fake_uploads >= g_trunk_n, "one upload per placed matrix");
     qt_shutdown();
     tk(qt_dense_count() == 0, "dense handles released at shutdown");
+
+    if (argc > 1) {
+        /* Third pass: the int4-g64 sidecar. The tier must stay off -- no
+         * upload, no routed expert ever consulted -- and the CPU must answer
+         * every expert from the sidecar, matching the int4 reference. */
+        printf(" int4-g64 experts (%s)\n", argv_in[1]);
+        char ref[2048]; snprintf(ref, sizeof ref, "%s/ref_int4.json", argv_in[1]);
+        char *argv4[] = { (char *)"qwen38", (char *)"2", (char *)"8", ref };
+        setenv("SNAP", argv_in[1], 1);
+        setenv("Q38_EXPERT_INT4", "1", 1);
+        fake_uploads = 0; fake_dense_compute = 0;
+        unsigned long long before = G.miss; for (int i = 0; i < QT_MAX_DEV; i++) before += G.hits[i];
+        rc = qwen38_main_unused(4, argv4);
+        tk(rc == 0, "engine with int4 experts under COLI_CUDA=1 reproduces the int4 reference");
+        tk(!G.on && !G_fp8_stream, "the tier declined: it streams native FP8 experts only");
+        tk(fake_uploads == 0 && qt_dense_count() == 0, "nothing was uploaded, experts or trunk");
+        unsigned long long consulted = G.miss; for (int i = 0; i < QT_MAX_DEV; i++) consulted += G.hits[i];
+        tk(consulted == before, "qt_issue never took a routed expert off the CPU");
+        unsetenv("Q38_EXPERT_INT4");
+    }
 
     if (t_fails) { printf("test_qwen38_tier_engine: %d failure(s)\n", t_fails); return 1; }
     printf("test_qwen38_tier_engine: ok\n");

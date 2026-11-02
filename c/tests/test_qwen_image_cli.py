@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import struct
 import sys
 import tempfile
 import threading
@@ -20,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from qwen_image_fixture import (STUB, TENSORS, elements, expected_resident,  # noqa: E402
-                                make_fake_pipeline, stub_env)
+                                make_fake_pipeline, stub_env, write_safetensors)
 
 import image_engine  # noqa: E402
 from family_registry import (FamilyConfigError, UnknownFamilyError,  # noqa: E402
@@ -130,6 +131,11 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual(set(self.cli.IMAGE_CHAT_COMMANDS),
                          {"size", "steps", "seed", "render", "save", "help", "quit"})
         self.assertEqual(self.cli.chat_command("/size 1024x576"), ("size", "1024x576"))
+        # a picture's path at the start of a line is a message, not a command
+        self.assertEqual(self.cli.chat_command("/home/me/foto.png cosa vedi?"), (None, None))
+        self.assertEqual(self.cli.chat_command("~/Desktop/a.JPG"), (None, None))
+        self.assertEqual(self.cli.chat_command("/decide a | b"), ("decide", "a | b"))
+        self.assertEqual(self.cli.chat_command("/save /tmp/x/nome.png"), ("save", "/tmp/x/nome.png"))
 
 
 def run_coli(args, env, stdin=None, timeout=60):
@@ -184,6 +190,40 @@ class CommandsTest(unittest.TestCase):
         self.assertNotIn("experts", text.stdout)
         refused = run_coli(["plan", "--model", self.model, "--ctx", "4096"], self.env)
         self.assertNotEqual(refused.returncode, 0)
+
+    def test_plan_counts_vae_float_residency_for_bf16_checkpoint(self):
+        # qiv_read allocates numel * sizeof(float), then st_read_f32 converts
+        # the checkpoint dtype; compressed on-disk bytes are not residency.
+        vae = Path(self.model) / "vae" / "diffusion_pytorch_model.safetensors"
+        tensors = [(name, "BF16", shape) for name, _dtype, shape in TENSORS["vae"]]
+        write_safetensors(vae, tensors)
+        expected = sum(elements(shape) * 4 for _name, _dtype, shape in tensors)
+        result = run_coli(["plan", "--model", self.model, "--json"], self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plan = json.loads(result.stdout)
+        component = next(c for c in plan["components"] if c["name"] == "vae")
+        self.assertEqual(component["resident_bytes"], expected)
+        self.assertEqual(component["precision"], "f32")
+        self.assertEqual(component["dtypes"], ["BF16"])
+        self.assertEqual(plan["modes"]["resident"]["peak_bytes"],
+                         sum(c["resident_bytes"] for c in plan["components"]))
+
+    def test_doctor_reports_malformed_image_tensor_layouts(self):
+        path = Path(self.model) / "transformer" / "diffusion_pytorch_model.safetensors"
+        for header in ([], {"w": None},
+                       {"w": {"dtype": "F32", "shape": [-1], "data_offsets": [0, 4]}},
+                       {"w": {"dtype": "F32", "shape": [4], "data_offsets": [0, 16]}},
+                       {"w": {"dtype": [], "shape": [1], "data_offsets": [0, 4]}}):
+            with self.subTest(header=header):
+                raw = json.dumps(header).encode()
+                path.write_bytes(struct.pack("<Q", len(raw)) + raw + b"abcd")
+                result = run_coli(["doctor", "--model", self.model, "--json"], self.env)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                report = json.loads(result.stdout)
+                self.assertEqual(report["status"], "error")
+                self.assertTrue(any(c["id"] == "model.weights" and c["status"] == "fail"
+                                    for c in report["checks"]))
 
     def test_doctor_runs_the_image_checks(self):
         result = run_coli(["doctor", "--model", self.model, "--json"], self.env)
@@ -308,12 +348,29 @@ class CommandsTest(unittest.TestCase):
             with urlopen(req, timeout=30) as r:
                 self.assertEqual(json.loads(r.read())["colibri"]["width"], 256)
         finally:
+            stop_process_tree(process)
+
+
+def stop_process_tree(process):
+    """Stop the gateway and the engine it spawned. On POSIX the gateway handles
+    SIGTERM and closes its engine itself. On Windows terminate() is
+    TerminateProcess on the gateway alone: the engine survives, still holding
+    the inherited serve.log, and the temporary directory cannot be removed
+    (WinError 32 in tearDown). taskkill /T takes the whole tree."""
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
             process.terminate()
-            try:
-                process.wait(timeout=20)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+    else:
+        process.terminate()
+    try:
+        process.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
 
 
 if __name__ == "__main__":

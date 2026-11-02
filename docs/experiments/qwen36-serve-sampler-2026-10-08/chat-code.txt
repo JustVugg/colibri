@@ -1,0 +1,7 @@
+<|im_start|>user
+Write a Python function that returns the n-th Fibonacci number, with a short docstring.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+

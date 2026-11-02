@@ -1,0 +1,19 @@
+logits-it.f32 temperature 0.70 top_p 0.90: 0 of 100 draws not the most likely token; 0 differ, 0 of them two tokens of exactly the same probability
+logits-it.f32 temperature 0.60 top_p 0.95: 0 of 100 draws not the most likely token; 0 differ, 0 of them two tokens of exactly the same probability
+logits-it.f32 temperature 1.00 top_p 1.00: 0 of 100 draws not the most likely token; 0 differ, 0 of them two tokens of exactly the same probability
+logits-it.f32 temperature 1.50 top_p 0.95: 5 of 100 draws not the most likely token; 0 differ, 0 of them two tokens of exactly the same probability
+logits-it.f32 temperature 2.00 top_p 0.90: 66 of 100 draws not the most likely token; 5 differ, 5 of them two tokens of exactly the same probability
+logits-en.f32 temperature 0.70 top_p 0.90: 0 of 100 draws not the most likely token; 0 differ, 0 of them two tokens of exactly the same probability
+logits-en.f32 temperature 0.60 top_p 0.95: 0 of 100 draws not the most likely token; 0 differ, 0 of them two tokens of exactly the same probability
+logits-en.f32 temperature 1.00 top_p 1.00: 2 of 100 draws not the most likely token; 0 differ, 0 of them two tokens of exactly the same probability
+logits-en.f32 temperature 1.50 top_p 0.95: 30 of 100 draws not the most likely token; 0 differ, 0 of them two tokens of exactly the same probability
+logits-en.f32 temperature 2.00 top_p 0.90: 78 of 100 draws not the most likely token; 2 differ, 2 of them two tokens of exactly the same probability
+logits-code.f32 temperature 0.70 top_p 0.90: 0 of 100 draws not the most likely token; 0 differ, 0 of them two tokens of exactly the same probability
+logits-code.f32 temperature 0.60 top_p 0.95: 0 of 100 draws not the most likely token; 0 differ, 0 of them two tokens of exactly the same probability
+logits-code.f32 temperature 1.00 top_p 1.00: 0 of 100 draws not the most likely token; 0 differ, 0 of them two tokens of exactly the same probability
+logits-code.f32 temperature 1.50 top_p 0.95: 0 of 100 draws not the most likely token; 0 differ, 0 of them two tokens of exactly the same probability
+logits-code.f32 temperature 2.00 top_p 0.90: 51 of 100 draws not the most likely token; 2 differ, 2 of them two tokens of exactly the same probability
+reply-it.f32 temperature 0.70 top_p 0.90: 121 of 640 draws not the most likely token; 0 differ, 0 of them two tokens of exactly the same probability
+reply-en.f32 temperature 0.70 top_p 0.90: 90 of 640 draws not the most likely token; 0 differ, 0 of them two tokens of exactly the same probability
+reply-code.f32 temperature 0.70 top_p 0.90: 5 of 415 draws not the most likely token; 0 differ, 0 of them two tokens of exactly the same probability
+in all: 448 of 3195 draws not the most likely token; 9 differ, 9 of them two tokens of exactly the same probability

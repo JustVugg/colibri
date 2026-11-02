@@ -184,6 +184,80 @@ static void check_demand_joins_demand(void) {
     free_loader(&m);
 }
 
+/* The forward pass is multiplying with the only slot (cap 1) when the prefetcher
+ * comes up with another expert for the layer: the prefetch must leave the slot
+ * alone until expert_put, then may take it. Before the busy count it read the
+ * other expert into the slot under the forward pass's matmul. */
+static void check_prefetch_spares_busy(void) {
+    Model m; init_cache(&m, 8, 1);
+    m.c.inter = 4; m.c.hidden = 4;
+    m.is_queued = calloc(8, 1); m.is_pinned = calloc(8, 1);
+    g_io_loads = g_io_open = 0; g_io_release = 1;   /* no read is held */
+    g_test_expert_load = held_load;
+    Slot *e = NULL;
+    expert_get(&m, 0, 2, &e);
+    m.is_queued[6] = 1;
+    pilot_realload(&m, 0, 6);
+    CHECK(io_get(&g_io_loads) == 1 && e && e->eid == 2 && slot_indexed(&m, 0, 2) == e,
+          "the prefetch took the slot the forward pass was reading (%d reads)", io_get(&g_io_loads));
+    CHECK(m.is_queued[6] == 0, "the skipped prefetch stayed queued");
+    expert_put(e);
+    m.is_queued[6] = 1;
+    pilot_realload(&m, 0, 6);
+    CHECK(io_get(&g_io_loads) == 2 && slot_indexed(&m, 0, 6) == e,
+          "after expert_put the prefetch did not take the slot");
+    free_loader(&m);
+}
+
+/* kv_room_fit: the cache gives the KV its slots back.  Eight resident experts,
+ * expert e last used at clock 10 + e, expert 0 pinned; a room that holds the
+ * KV of 300 positions plus three and a half slots.  The cap must come down to
+ * three, the coldest unpinned experts must go (1..5), the survivors (0, 6, 7)
+ * must stay reachable through the index wherever the compaction moved them,
+ * and a room below one slot must still leave one: the pinned expert. */
+static void check_kv_room_gives_back_slots(void) {
+    Model m; init_cache(&m, 8, 8); LCache *lc = &m.cache[0];
+    m.c.hidden = 64; m.c.inter = 32; m.c.n_heads = 4; m.c.head_dim = 16;
+    for (int e = 0; e < 8; e++) {
+        Slot *s = &lc->slots[lc->n++];
+        slot_ensure_allocated(&m, s);
+        cache_publish(&m, 0, s, e);
+        s->used = 10 + (uint64_t)e;
+    }
+    lc->slots[0].pinned = 1;
+    int64_t slot = slot_bytes(&m.c);
+    m.room_bytes = kv_room_bytes(&m, 300) + 3 * slot + slot / 2;
+    kv_room_fit(&m, 300);
+    CHECK(lc->cap == 3 && lc->n == 3, "cap %d n %d after the KV took its room, expected 3 3",
+          lc->cap, lc->n);
+    CHECK(m.kv_room_t == 300, "the KV's reach was not recorded (%d)", m.kv_room_t);
+    for (int e = 0; e < 8; e++) {
+        int kept = e == 0 || e >= 6;
+        Slot *s = slot_indexed(&m, 0, e);
+        CHECK(kept ? s != NULL && s->eid == e && s->g != NULL : s == NULL,
+              "expert %d %s after the shrink", e, kept ? "is unreachable" : "survived");
+    }
+    for (int i = lc->n; i < 8; i++)
+        CHECK(lc->slots[i].g == NULL, "slot %d past the cap still holds weights", i);
+
+    kv_room_fit(&m, 300);   /* the KV reaches nothing new: nothing moves */
+    kv_room_fit(&m, 200);
+    CHECK(lc->cap == 3 && lc->n == 3, "a position already reached moved the cap to %d", lc->cap);
+
+    m.room_bytes = 1;       /* below one slot: the floor */
+    kv_room_fit(&m, 301);
+    CHECK(lc->cap == 1 && lc->n == 1 && slot_indexed(&m, 0, 0) == &lc->slots[0],
+          "cap %d n %d: the floor is one slot, the pinned expert's", lc->cap, lc->n);
+
+    m.room_bytes = 0;       /* an explicit cap shares nothing */
+    lc->cap = 8;
+    kv_room_fit(&m, 4000);
+    CHECK(lc->cap == 8 && lc->n == 1, "an explicit cap was changed to %d", lc->cap);
+
+    for (int i = 0; i < lc->n; i++) { free(lc->slots[i].g); free(lc->slots[i].gs); }
+    free_cache(&m);
+}
+
 int main(void) {
     Model m; init_cache(&m, 6, 2); LCache *lc = &m.cache[0]; lc->n = 2;
     cache_publish(&m, 0, &lc->slots[0], 1);
@@ -209,6 +283,8 @@ int main(void) {
     check_demand_joins_prefetch();
     check_prefetch_skips_demand();
     check_demand_joins_demand();
+    check_prefetch_spares_busy();
+    check_kv_room_gives_back_slots();
     if (failures) { fprintf(stderr,"olmoe cache index: %d failure(s)\n", failures); return 1; }
     puts("olmoe cache index: ok");
     return 0;

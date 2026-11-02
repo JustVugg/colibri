@@ -278,6 +278,28 @@ static void qi_gemm_act8(float *Y, int ldy, const float *X, int ldx, int M, cons
 #endif
 }
 
+/* qi_quantize_i8 of a bf16 matrix, row by row: bf16 to f32 is exact, so the rows and
+ * scales are qi_quantize_i8's of the f32 copy, without the copy (the loader's time and
+ * its biggest transient buffer). */
+static void qi_quantize_i8_bf16(const uint16_t *src, int N, int K, int8_t *q, float *sc){
+    #pragma omp parallel for schedule(static)
+    for (int n = 0; n < N; n++) {
+        const uint16_t *r = src + (int64_t)n * K;
+        float am = 0.f;
+        for (int k = 0; k < K; k++) { float x = qi_bf16(r[k]), a = x < 0 ? -x : x; if (a > am) am = a; }
+        float s = am > 1e-12f ? am / 127.f : 1.f, inv = 1.f / s;
+        sc[n] = s;
+        int8_t *d = q + (int64_t)n * K;
+        for (int k = 0; k < K; k++) {
+            float v = qi_bf16(r[k]) * inv;
+            int iv = (int)(v < 0 ? v - 0.5f : v + 0.5f);
+            if (iv > 127) iv = 127;
+            if (iv < -127) iv = -127;
+            d[k] = (int8_t)iv;
+        }
+    }
+}
+
 /* Per-row int8 quantization of an f32 matrix (max-abs / 127, round to nearest). */
 static void qi_quantize_i8(const float *src, int N, int K, int8_t *q, float *sc){
     #pragma omp parallel for schedule(static)

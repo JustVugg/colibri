@@ -89,6 +89,13 @@ GEOMETRIES = {
     # Qwen/Qwen3.8-2.4T-A95B, config.json: 92 layers / full_attention_interval 4
     # / 512 experts top-10 / 64:4 attention heads / 128:16 DeltaNet heads /
     # mtp_num_hidden_layers 1 / fused experts. Widths shrunk, ratios kept.
+    # GGUF oracle: every matrix row a whole number of 256-weight blocks, so the
+    # K and i-quant types apply to it, and 32 value : 16 key DeltaNet heads as
+    # in the 35B, so llama.cpp's value-head reorder is really exercised.
+    "gguf-256": dict(hidden=256, n_layers=8, q_heads=4, kv_heads=2, head_dim=64,
+                     rope_dim=16, n_experts=8, topk=2, inter=256,
+                     dn_key_heads=16, dn_value_heads=32,
+                     fused_experts=False, mtp=False),
     "qwen38-2p4t": dict(hidden=32, n_layers=92, q_heads=16, kv_heads=1, head_dim=16,
                         rope_dim=8, n_experts=512, topk=10, inter=16,
                         dn_key_heads=2, dn_value_heads=16,
@@ -100,6 +107,17 @@ GEOMETRIES = {
                              rope_dim=8, n_experts=0, topk=0, inter=128,
                              dn_key_heads=2, dn_value_heads=6,
                              fused_experts=False, mtp=False, dense=True),
+    # Qwen/Qwen3-Coder-30B-A3B-Instruct, config.json: Qwen3MoeForCausalLM (qwen3_moe),
+    # 48 attention layers (no DeltaNet), 32:4 heads of 128, 128 experts top-8,
+    # norm_topk_prob, no shared expert, full rotary, rope_theta 1e7, plain RMSNorm.
+    "qwen3-coder-30b": dict(hidden=64, n_layers=6, q_heads=8, kv_heads=1, head_dim=16,
+                            rope_dim=16, n_experts=16, topk=4, inter=32,
+                            fused_experts=False, mtp=False, plain_qwen3=True),
+    # Qwen/Qwen3-8B, config.json: Qwen3ForCausalLM (qwen3), the dense Qwen3: 36 attention
+    # layers, 32:8 heads of 128, one SwiGLU MLP per layer, full rotary, plain RMSNorm.
+    "qwen3-8b-dense": dict(hidden=64, n_layers=6, q_heads=8, kv_heads=2, head_dim=16,
+                           rope_dim=16, n_experts=0, topk=0, inter=128,
+                           fused_experts=False, mtp=False, plain_qwen3=True),
 }
 
 
@@ -109,7 +127,7 @@ def _rewrite_shard(out: Path, n_layers, fused_experts, mtp, hidden, seed):
     transformers saves routed experts one tensor per expert and never writes an
     mtp head. The real 35B and 2.4T checkpoints do the opposite on both counts,
     and those are the two paths the converter's tensor contract has to be seen
-    handling: splitting the fused tensor, and skipping mtp.* on purpose.
+    handling: splitting the fused tensor and carrying the MTP block.
     """
     from safetensors.torch import load_file, save_file
     path = out / "model.safetensors"
@@ -134,7 +152,7 @@ def _rewrite_shard(out: Path, n_layers, fused_experts, mtp, hidden, seed):
     if mtp:
         # One MTP layer shaped like the last transformer layer (an attention
         # layer, since (n_layers-1) % 4 == 3 for every geometry here), plus the
-        # four glue tensors the real checkpoints carry. Random, never read.
+        # four glue tensors the real checkpoints carry. Random, checked by qwen36_mtp_ref.py.
         g = torch.Generator().manual_seed(seed + 1)
         src = f"model.layers.{n_layers - 1}."
         for k in list(tens):
@@ -158,7 +176,7 @@ def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
           vocab=320, max_new=16, prompt_ids=None, emit_ref=None,
           ref_mode="attention_only", seed=20260817,
           dn_key_heads=None, dn_value_heads=None,
-          fused_experts=False, mtp=False, dense=False):
+          fused_experts=False, mtp=False, dense=False, plain_qwen3=False):
     if dn_key_heads is None:
         dn_key_heads = q_heads
     if dn_value_heads is None:
@@ -167,6 +185,12 @@ def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
     # three local draws passed, one CI draw failed at 11/16, with identical
     # code. A gate that reddens at random gets muted within a week.
     torch.manual_seed(seed)
+    if plain_qwen3:
+        model = _plain_qwen3(hidden, n_layers, q_heads, kv_heads, head_dim, n_experts,
+                             topk, inter, vocab)
+        return _save_and_reference(model, out, n_layers, max_new, prompt_ids, emit_ref,
+                                   "full", fused_experts, mtp, hidden, seed,
+                                   "qwen3_moe_tiny" if n_experts else "qwen3_tiny")
     ModelCls, ConfigCls = get_classes(dense)
     layer_types = ["full_attention" if i % 4 == 3 else "linear_attention"
                    for i in range(n_layers)]
@@ -209,6 +233,53 @@ def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
                 pass
 
     model = ModelCls(cfg)
+    return _save_and_reference(model, out, n_layers, max_new, prompt_ids, emit_ref,
+                               ref_mode, fused_experts, mtp, hidden, seed, "qwen36_tiny")
+
+
+def _plain_qwen3(hidden, n_layers, q_heads, kv_heads, head_dim, n_experts, topk, inter,
+                 vocab):
+    """Qwen3-MoE as transformers ships it (Qwen3MoeForCausalLM), or with no experts the
+    dense Qwen3 (Qwen3ForCausalLM, intermediate_size = inter). The RMSNorm weights
+    are drawn around 1 instead of left at 1, so a container that applied them as
+    zero-centered (1 + w), the Qwen3.5/3.6 convention, could not pass."""
+    import transformers
+    cls_name = "Qwen3MoeForCausalLM" if n_experts else "Qwen3ForCausalLM"
+    ModelCls = getattr(transformers, cls_name, None)
+    if ModelCls is None:
+        sys.exit(f"this transformers build has no {cls_name}")
+    ConfigCls = ModelCls.config_class
+    base = dict(
+        vocab_size=vocab, hidden_size=hidden, intermediate_size=hidden * 2,
+        num_hidden_layers=n_layers, num_attention_heads=q_heads,
+        num_key_value_heads=kv_heads, head_dim=head_dim, num_experts=n_experts,
+        num_experts_per_tok=topk, moe_intermediate_size=inter, norm_topk_prob=True,
+        decoder_sparse_step=1, mlp_only_layers=[], max_position_embeddings=512,
+        rms_norm_eps=1e-6, rope_theta=10000000.0, tie_word_embeddings=False,
+        attention_bias=False, use_sliding_window=False, hidden_act="silu",
+        rope_parameters={"rope_type": "default", "rope_theta": 10000000.0},
+        pad_token_id=0, bos_token_id=1, eos_token_id=vocab - 1)
+    if not n_experts:
+        for key in ("num_experts", "num_experts_per_tok", "moe_intermediate_size",
+                    "norm_topk_prob", "decoder_sparse_step", "mlp_only_layers"):
+            base.pop(key)
+        base["intermediate_size"] = inter
+    try:
+        cfg = ConfigCls(**base)
+    except TypeError:
+        import inspect
+        allowed = set(inspect.signature(ConfigCls.__init__).parameters) - {"self"}
+        cfg = ConfigCls(**{k: v for k, v in base.items() if k in allowed})
+    model = ModelCls(cfg)
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name.endswith("norm.weight"):
+                param.copy_(1.0 + 0.2 * torch.randn_like(param))
+    return model
+
+
+def _save_and_reference(model, out, n_layers, max_new, prompt_ids, emit_ref, ref_mode,
+                        fused_experts, mtp, hidden, seed, label):
     model.eval()
     out.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(out))
@@ -225,7 +296,7 @@ def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
         # script encodes a text prompt through AutoTokenizer.from_pretrained(),
         # and this fixture is synthetic: it has weights and no tokenizer. The
         # oracle script stays the tool for real checkpoints.
-        if ref_mode == "attention_only":
+        if ref_mode == "attention_only" and label == "qwen36_tiny":
             replaced = 0
             for i in range(n_layers):
                 if i % 4 != 3:
@@ -243,7 +314,7 @@ def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
                                      use_cache=True)
         full = out_ids[0].tolist()
         payload = {"prompt_ids": prompt_ids, "full_ids": full,
-                   "mode": ref_mode, "model": "qwen36_tiny"}
+                   "mode": ref_mode, "model": label}
         Path(emit_ref).write_text(json.dumps(payload, indent=2))
         print(f"ref.json -> {emit_ref}")
         print(f"  prompt_ids={prompt_ids}")
@@ -274,8 +345,11 @@ def main():
     # --hidden/--inter override the preset's toy widths (qwen36-35b: 64/32). The
     # shared expert kernel (expert_ffn.h) needs hidden and inter multiples of
     # 64: --inter 64 exercises it (the CI's A/B step does exactly that).
+    # --vocab 128: every id is an ASCII byte of the byte tokenizer tests/prefix_serve_harness.py
+    # gives a fixture without one, so a serve test can resend a reply as text and the
+    # engine reads back the very ids it generated (tests/spec_drafts_harness.py)
     for name in ("layers", "experts", "topk", "q-heads", "kv-heads", "hidden", "inter",
-                 "dn-key-heads", "dn-value-heads"):
+                 "dn-key-heads", "dn-value-heads", "vocab"):
         ap.add_argument(f"--{name}", type=int, default=None,
                         help=f"override the preset's {name.replace('-', '_')}")
     ap.add_argument("--fused-experts", action="store_true", default=None,
@@ -287,7 +361,7 @@ def main():
     for arg, key in (("layers", "n_layers"), ("experts", "n_experts"), ("topk", "topk"),
                      ("q_heads", "q_heads"), ("kv_heads", "kv_heads"), ("hidden", "hidden"),
                      ("inter", "inter"), ("dn_key_heads", "dn_key_heads"),
-                     ("dn_value_heads", "dn_value_heads"), ("fused_experts", "fused_experts"),
+                     ("dn_value_heads", "dn_value_heads"), ("vocab", "vocab"), ("fused_experts", "fused_experts"),
                      ("mtp", "mtp")):
         if getattr(args, arg) is not None:
             geo[key] = getattr(args, arg)

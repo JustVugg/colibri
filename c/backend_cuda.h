@@ -142,6 +142,59 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                             const void *weights, const float *scales,
                             int fmt, int I, int O, int device);
+
+/* Gated delta layer on the device (the linear-attention layers of Qwen3.6/3.8,
+ * Kimi K3's KDA, GLM-5.3-Flash). One object per layer holds the short-conv ring
+ * [conv_dim x (convk-1)], the recurrent state [vh x kdim x vdim], the conv and
+ * norm weights and the scratch for one token. coli_cuda_dn_step runs a whole
+ * decode step on the card: x (host) -> in_proj GEMV -> causal conv + SiLU ->
+ * per head L2 norm, decay, delta rule, gated RMSNorm -> out_proj GEMV -> out
+ * (host). Only x and out cross the bus; the state never does. Gates (egh =
+ * exp(g) per value head, beta) arrive by value. All optional in the DLL
+ * loader: a backend without them leaves the layer on the CPU. */
+typedef struct ColiCudaDn ColiCudaDn;
+COLI_CUDA_DLLEXPORT ColiCudaDn *coli_cuda_dn_create(int device, int vh, int vk, int kdim, int vdim,
+                            int conv_dim, int convk, int hidden,
+                            const float *conv_w, const float *norm_w, float eps, int gate_sigmoid);
+COLI_CUDA_DLLEXPORT void coli_cuda_dn_free(ColiCudaDn *d);
+COLI_CUDA_DLLEXPORT int  coli_cuda_dn_set_state(ColiCudaDn *d, const float *ring, const float *rec);  /* NULL = zero */
+COLI_CUDA_DLLEXPORT int  coli_cuda_dn_get_state(ColiCudaDn *d, float *ring, float *rec);
+/* proj: the in_proj rows. Fused qkv ++ z in one matrix (projz NULL, qwen36's
+ * dnproj) or qkv alone with z in projz (qwen38's dnqkv / dnz). gate_sigmoid at
+ * create: the gated RMSNorm multiplies by silu(z) (0, Qwen3.6) or sigmoid(z)
+ * (1, Qwen3.8). */
+COLI_CUDA_DLLEXPORT int  coli_cuda_dn_step(ColiCudaDn *d, ColiCudaTensor *proj, ColiCudaTensor *projz, ColiCudaTensor *outp,
+                            const float *x, float *out, const float *egh, const float *beta);
+/* Overwrite an uploaded tensor in place with new bytes of the same shape and
+ * format. The expert tier swaps residents, and every expert of a model has the
+ * same geometry, so the victim's device buffers can take the newcomer without
+ * the cudaFree + cudaMalloc pair, which synchronises the device under the
+ * async expert groups. Optional in the DLL loader: 0 from a backend that
+ * predates it (or on any failure), and the caller frees and uploads as before. */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_overwrite(ColiCudaTensor *tensor, const void *weights, const float *scales);
+/* Host memory the device copies from at the bus's full rate (the qwen36 tier's RAM cache,
+ * staged for a prompt chunk's experts): coli_cuda_host_register page-locks bytes at p
+ * (portable to every context), 0 on failure (the memory stays as it was);
+ * coli_cuda_host_unregister undoes it. coli_cuda_planar_rows: whether a prompt chunk's
+ * expert GEMMs on this device read int4 per 64 in expert_ffn.h's planar blocks
+ * (CcExpert.planar; the f16 GEMMs at D and I). Optional in the DLL loader: 0 from a backend
+ * that predates them, and the tier keeps the host's step. */
+COLI_CUDA_DLLEXPORT int coli_cuda_host_register(void *p, size_t bytes);
+COLI_CUDA_DLLEXPORT void coli_cuda_host_unregister(void *p);
+COLI_CUDA_DLLEXPORT int coli_cuda_planar_rows(int device, int D, int I);
+/* A GGUF's block formats (cuda_bd.cuh): fmt 100 + ggml type t, each row as the file stores
+ * it (no scale array: the scales are in the blocks), uploaded with coli_cuda_tensor_upload
+ * and computed by coli_cuda_matmul, coli_cuda_pipe_gemm and the dense chain's matmul (a
+ * speculative verify's rows sharing every weight load). The elements of a block of fmt, 0
+ * when the backend does not take it (a row's width must be a multiple of it and of 32).
+ * Optional in the DLL loader: 0 from a backend that predates it. */
+COLI_CUDA_DLLEXPORT int coli_cuda_block_elems(int fmt);
+/* A block-format tensor (fmt >= 100) in device memory the caller owns (dev, cap bytes: an
+ * arena's slot, at least O rows of the file's row padded to words), its rows uploaded from
+ * weights; coli_cuda_tensor_free leaves the memory. No cudaMalloc, so none of its rounding
+ * (a 576 KiB matrix took 1 MiB) and none of its synchronisation. Optional in the DLL loader. */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_at(ColiCudaTensor **tensor, void *dev, size_t cap, const void *weights,
+                                                   int fmt, int I, int O, int device);
 #ifdef COLI_ANS
 /* Experimental Linux-only GPU-resident entropy tier. The archive remains in
  * VRAM and is decoded into per-device scratch immediately before a grouped

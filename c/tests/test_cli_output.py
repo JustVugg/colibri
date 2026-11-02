@@ -297,9 +297,9 @@ class BannerModelLineTest(unittest.TestCase):
 
     def test_unknown_model_states_its_own_type(self):
         """No forcing into the roster: an unknown checkpoint speaks for itself."""
-        line = self.line({"model_type": "qwen3_moe", "num_hidden_layers": 48,
+        line = self.line({"model_type": "mixtral", "num_hidden_layers": 48,
                           "n_routed_experts": 128})
-        self.assertIn("qwen3_moe", line)
+        self.assertIn("mixtral", line)
         self.assertIn("48L x 128E", line)
         self.assertNotIn("GLM", line)
 
@@ -362,8 +362,9 @@ class OmpThreadsForEveryEngineTest(unittest.TestCase):
     """Launchers size shared engines; V4 delegates to its loader-aware runtime.
 
     #805's physical-core default still covers the memory-bound sister engines.
-    DeepSeek V4 instead reserves logical CPUs for its expert-loader workers in
-    v4_omp_reserve_loader_cpus(), unless the operator overrides or disables it.
+    DeepSeek V4 sizes its own team in v4_omp_reserve_loader_cpus() (the physical
+    cores with SMT, the loaders on the siblings; else the logical CPUs less its
+    expert-loader workers), unless the operator overrides or disables it.
     """
 
     @classmethod
@@ -378,7 +379,17 @@ class OmpThreadsForEveryEngineTest(unittest.TestCase):
                                      temp=None, cap=None)
 
     def test_other_engines_get_physical_cores(self):
-        with mock.patch("resource_plan.physical_cpu_count", return_value=6):
+        with mock.patch("resource_plan.physical_cpu_count", return_value=6), \
+             mock.patch("resource_plan.performance_core_count", return_value=None):
+            for arch in ("inkling", "kimi", "olmoe"):
+                with self.subTest(arch=arch):
+                    env = self.coli.env_for_engine(self.args(), arch)
+                    self.assertEqual(env.get("OMP_NUM_THREADS"), "6")
+
+    def test_a_hybrid_cpu_gets_its_performance_cores(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch("resource_plan.physical_cpu_count", return_value=14), \
+             mock.patch("resource_plan.performance_core_count", return_value=6):
             for arch in ("inkling", "kimi", "olmoe"):
                 with self.subTest(arch=arch):
                     env = self.coli.env_for_engine(self.args(), arch)
@@ -428,6 +439,75 @@ class OmpThreadsForEveryEngineTest(unittest.TestCase):
             vram_args = self.args();vram_args.gpu=None;vram_args.vram=4
             with self.assertRaisesRegex(SystemExit, "--vram needs the CUDA build"):
                 self.coli.env_for_engine(vram_args, "qwen38")
+
+
+class ServerRestartingTest(unittest.TestCase):
+    """#2290: a coli serve whose engine died answers /health 503 "restarting" while it
+    starts the engine again; coli chat waits for that server instead of starting a second."""
+
+    @classmethod
+    def setUpClass(cls):
+        loader = SourceFileLoader("coli_restart_under_test", str(CLI))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        cls.coli = importlib.util.module_from_spec(spec)
+        loader.exec_module(cls.coli)
+
+    def _health_server(self, code, status):
+        import http.server
+        import threading
+
+        class Health(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = json.dumps({"status": status}).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+        server = http.server.HTTPServer(("127.0.0.1", 0), Health)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_port}"
+
+    def test_only_a_503_restarting_counts(self):
+        for code, status, expected in ((503, "restarting", True), (503, "engine_down", False),
+                                       (200, "ok", False)):
+            with self.subTest(code=code, status=status):
+                self.assertIs(self.coli.server_restarting(self._health_server(code, status)),
+                              expected)
+        # nothing listening: no server, not a restarting one
+        import socket
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        self.assertFalse(self.coli.server_restarting(f"http://127.0.0.1:{port}", timeout=0.5))
+
+    def test_chat_waits_for_a_restarting_server_and_attaches(self):
+        coli = self.coli
+
+        class FakeSpinner:
+            def __init__(self, *_a, **_k):
+                pass
+            def start(self):
+                pass
+            def stop(self):
+                pass
+        args = types.SimpleNamespace(model=None, api_key=None, no_attach=False, attach=None)
+        with mock.patch.object(coli, "server_probe", side_effect=[None, None, "flint-colibri"]), \
+             mock.patch.object(coli, "server_restarting", side_effect=[True, True, True]), \
+             mock.patch.object(coli, "server_model_entry", return_value={}), \
+             mock.patch.object(coli, "banner"), \
+             mock.patch.object(coli, "chat_attached") as attached, \
+             mock.patch.object(coli, "Spinner", FakeSpinner), \
+             mock.patch.object(coli.time, "sleep"):
+            coli.cmd_chat(args)
+        attached.assert_called_once_with(args, "http://127.0.0.1:8000", "flint-colibri")
 
 
 class ContextFlagHonestyTest(unittest.TestCase):

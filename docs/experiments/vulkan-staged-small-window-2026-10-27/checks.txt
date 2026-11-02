@@ -1,0 +1,384 @@
+# The final code of the change, built and tested on a Colab L4 VM (2026-10-27)
+# Why: the A100 and L4 runs of runs.txt, p512.txt and l4.txt were made with the patch of sha256 116a9767d8666aaa4e5ac3eb5129d0540cfb2226e8e7050c654a4d6668fecff5.
+#   After them the change got a test knob (COLI_VK_WINDOW_ASK_MB: ask N MiB at most instead of 9/10 of the heap, so the real
+#   allocation loop runs on any device), two rows of the window case that use it, a comment, and vk_window_mapped(): when the
+#   probe keeps the mapped path it clears the uploader's state that place_decide had set for a staged card (shared, nfams, dev:
+#   without it the host pool's buffers were CONCURRENT and every submit on the main queue took a lock, a state no card had been
+#   in with a model, since none passed the probe). The A100 and the L4 take the other branch (staged), which that function does
+#   not touch. The checks that earlier ran on an earlier version (the counter-tests, vk-memtype-check, vk-chain-check) were not
+#   kept. This file has them for the final code. Questions, written before the runs:
+#   Q1 do the two new rows (a real probe of 1 GiB that the device gives; a real probe of 3 GiB under COLI_VK_DEVICE_CAP_MB=2048, refused at
+#      the third block) pass on Lavapipe and on the L4's own driver?
+#   Q2 do the counter-tests turn the test red where they should? c1 (u->on never set): rows 1 and 6; c2 (COLI_VK_STAGED=0 no longer
+#      skipping the probe): row 3; c3 (the loop no longer stops at a refusal): row 6.
+#   Q3 vk-memtype-check and vk-chain-check, origin/dev against the change: the same verdicts?
+#   Q4 does the final code start Qwen3.6 on the L4 as before (the probe's line, the staged path, a first token)?
+#   Q5 Qwen3.6 on the L4 with the probe passing (k9-mapped: COLI_VK_WINDOW_ASK_MB=1024 asks 1 GiB, the driver gives it, the weights
+#      stay mapped) and the tier held to COLI_VK_TIER_GB=2 so that the weights and the tier fit the 9.75 GiB window: does it start
+#      and generate the same text as origin/dev (never asked)? Is there a difference in speed or first token between the final
+#      code and the code before vk_window_mapped() (tree "old", final.patch)? e1..e6: dev2, win, old, dev2, win, old, each a new
+#      process, no history.
+# Hardware: a Colab L4 VM (NVIDIA L4, driver 580.82.07, 12 threads, 52 GiB of RAM); Lavapipe (Mesa) on the VM's CPU for k4.
+# Trees: /content/dev2 = origin/dev c1c06ac6fcb32157e4da130fd96775a32a757052; /content/win = the same plus final2.patch (the diff of
+#   c/backend_vulkan.c, c/tests/test_vk_tier.c, docs/ENVIRONMENT.md, docs/vulkan.md; its sha256 is at the end of this file);
+#   /content/old = the same plus final.patch (the change before vk_window_mapped(), checked in the same way on an earlier VM).
+#   "dev2" in the names is the origin/dev tree, not COLI_VK_DEV2.
+# Steps: k2-git, k3-build, k4-lava, k5-l4test, k6-contro (c0..c4), k7-checks (m1..m4), k8-engine, k9-mapped (e1..e6).
+# The committed diff of the four files (sha256 2aaa56eda94195bb228e643a51b4c4bd02809101d447117dd66fdbd168d33423) is not exactly the one
+#   tested here (final2.patch, sha256 dc0dbd0bf78af1c9fd2e9803c44bd7bb0de72c4915daa0b8f452cc24c0820951, at the end of this file): after a
+#   text review some comments and documentation lines were reworded. c/backend_vulkan.c with its comments removed is identical in the two
+#   (6588 lines each, compared by a script), c/tests/test_vk_tier.c is byte-identical; docs/vulkan.md and docs/ENVIRONMENT.md differ in
+#   wording. The tests were not run again on those lines.
+# Counter-tests: the code of /content/win/c/backend_vulkan.c broken by sed in the place named, the test rebuilt and run, the file
+#   restored from a copy (its sha256 is checked at the end of k6-contro.log).
+
+===== k2-git.log (sha256 e12e0cfd6f8fce889f1f22d49b1416e49056ab04c1ccdd829da5e73164114145): the patches applied to dev c1c06ac6 (win: final2.patch, old: final.patch) (whole log, except that the subject of the last line (a merge commit of origin/dev) is cut; the sha256 is of the log as it was)
+
+Note: switching to 'c1c06ac6fcb32157e4da130fd96775a32a757052'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+Note: switching to 'c1c06ac6fcb32157e4da130fd96775a32a757052'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+dc0dbd0bf78af1c9fd2e9803c44bd7bb0de72c4915daa0b8f452cc24c0820951  /content/final2.patch
+ c/backend_vulkan.c     | 88 ++++++++++++++++++++++++++++++++++++++++++++++----
+ c/tests/test_vk_tier.c | 40 +++++++++++++++++++++++
+ docs/ENVIRONMENT.md    |  4 ++-
+ docs/vulkan.md         | 30 +++++++++++++++++
+ 4 files changed, 155 insertions(+), 7 deletions(-)
+3d6730673766a054e5e01e25f15bb71df2fbdac799976454ac65a38c8b6be239  /content/final.patch
+ c/backend_vulkan.c     | 82 ++++++++++++++++++++++++++++++++++++++++++++++----
+ c/tests/test_vk_tier.c | 40 ++++++++++++++++++++++++
+ docs/ENVIRONMENT.md    |  4 ++-
+ docs/vulkan.md         | 30 ++++++++++++++++++
+ 4 files changed, 149 insertions(+), 7 deletions(-)
+c1c06ac6fcb32157e4da130fd96775a32a757052 (origin/dev; the subject of the commit is cut)
+
+
+===== k3-build.log (sha256 7ca3531eb01de697edd6f716875c66f7943e4731331e35cba909f62542be58d2): the build: warnings in the changed files, the binaries (whole log)
+
+warnings in the changed files: 0
+eb657effa4d8e3f84acfdca5f4582d125f1af708170c216178bd9f279eeb7344  /content/dev2/c/qwen36
+f52e96e09b6befe8c638e3de69bf09686fd8c4952f33bd1929d230ddaf3ad309  /content/win/c/qwen36
+8d9e9709e185a0793ee750be145927a365a8c3ff186539d4f60fa80a67f97e5c  /content/old/c/qwen36
+
+===== k4-lava.log (sha256 4a58a436bb888a4e76f39cd25a5fd76bd095894147c61a89405637aa8b448f76): vk-tier-check on Lavapipe (the VM's CPU), then the test with COLI_VK_HOST_VISIBLE_CAP_MB=246 (staged on its own: the rows that want the mapped path are skipped) (excerpt: the lines that answer the question; the whole log has the sha256 above)
+
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 54229 MiB heap) copied from host staging memory (type 0) on the main queue (the driver gave 0 of the 46 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_PROBE_MB))
+[VK] memory: mapped weights, the host-visible device-local memory gave the 97656 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_PROBE_MB)
+[VK] memory: mapped weights, the host-visible device-local memory gave the 1 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_ASK_MB)
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 54229 MiB heap) copied from host staging memory (type 0) on the main queue (the driver gave 2 of the 3 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_ASK_MB))
+window:
+  a window of 1 MiB: staged
+  a window of the whole heap and more: mapped
+  COLI_VK_STAGED=0 over a window of 1 MiB: mapped
+  COLI_VK_STAGED=1 over a window of the whole heap: staged
+  a real probe of 1 GiB, which the device gives: mapped
+  a real probe of 3 GiB under a device cap of 2 GiB, which refuses the third: staged
+PASS
+PASS
+== vk-tier-check rc=0
+window:
+  a window of 1 MiB: staged
+  a window of the whole heap and more: skipped, the device takes staged uploads
+  COLI_VK_STAGED=0 over a window of 1 MiB: mapped
+  COLI_VK_STAGED=1 over a window of the whole heap: staged
+  a real probe of 1 GiB, which the device gives: skipped, the device takes staged uploads
+  a real probe of 3 GiB under a device cap of 2 GiB, which refuses the third: staged
+PASS
+== staged form rc=0
+
+===== k5-l4test.log (sha256 ebc250bc4be3d337e2fe0fe8e7f85e81394f5dd59c6145e4f1135e2dd0c0afbe): test_vk_tier on the L4's own driver: the window case, rows 5 and 6 run the real loop (excerpt: the lines that answer the question; the whole log has the sha256 above)
+
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 23034 MiB heap) copied from host staging memory (type 2) on a transfer queue (the driver gave 9 of the 19 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 1.0 s)
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 23034 MiB heap) copied from host staging memory (type 2) on a transfer queue (the driver gave 0 of the 19 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_PROBE_MB))
+window:
+  a window of 1 MiB: staged
+[VK] memory: mapped weights, the host-visible device-local memory gave the 97656 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_PROBE_MB)
+  a window of the whole heap and more: mapped
+  COLI_VK_STAGED=0 over a window of 1 MiB: mapped
+  COLI_VK_STAGED=1 over a window of the whole heap: staged
+[VK] memory: mapped weights, the host-visible device-local memory gave the 1 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_ASK_MB)
+  a real probe of 1 GiB, which the device gives: mapped
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 23034 MiB heap) copied from host staging memory (type 2) on a transfer queue (the driver gave 2 of the 3 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 0.1 s (COLI_VK_WINDOW_ASK_MB))
+  a real probe of 3 GiB under a device cap of 2 GiB, which refuses the third: staged
+PASS
+== l4 test rc=0
+
+===== c0-base.log (sha256 1a907c79385a590f4b381b7f40d434a90c706b66af1735f84bd3ec575f551ddc): counter-test c0-base: the tree as it is: green (excerpt: the lines that answer the question; the whole log has the sha256 above)
+
+build rc=0
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 23034 MiB heap) copied from host staging memory (type 2) on a transfer queue (the driver gave 9 of the 19 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 1.0 s)
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 23034 MiB heap) copied from host staging memory (type 2) on a transfer queue (the driver gave 0 of the 19 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_PROBE_MB))
+window:
+  a window of 1 MiB: staged
+[VK] memory: mapped weights, the host-visible device-local memory gave the 97656 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_PROBE_MB)
+  a window of the whole heap and more: mapped
+  COLI_VK_STAGED=0 over a window of 1 MiB: mapped
+  COLI_VK_STAGED=1 over a window of the whole heap: staged
+[VK] memory: mapped weights, the host-visible device-local memory gave the 1 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_ASK_MB)
+  a real probe of 1 GiB, which the device gives: mapped
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 23034 MiB heap) copied from host staging memory (type 2) on a transfer queue (the driver gave 2 of the 3 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 0.1 s (COLI_VK_WINDOW_ASK_MB))
+  a real probe of 3 GiB under a device cap of 2 GiB, which refuses the third: staged
+PASS
+== test rc=0
+
+===== c1-noflip.log (sha256 1eeba8677478763e5b6c705c4fd12e4d8748a427758c566a4e585a546670dbae): counter-test c1-noflip: vk_window_decide never sets u->on (excerpt: the lines that answer the question; the whole log has the sha256 above)
+
+build rc=0
+window:
+FAIL tests/test_vk_tier.c:1630: window, a window of 1 MiB: the device is mapped, wanted staged
+  a window of 1 MiB: mapped
+[VK] memory: mapped weights, the host-visible device-local memory gave the 97656 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_PROBE_MB)
+  a window of the whole heap and more: mapped
+  COLI_VK_STAGED=0 over a window of 1 MiB: mapped
+  COLI_VK_STAGED=1 over a window of the whole heap: staged
+[VK] memory: mapped weights, the host-visible device-local memory gave the 1 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_ASK_MB)
+  a real probe of 1 GiB, which the device gives: mapped
+FAIL tests/test_vk_tier.c:1630: window, a real probe of 3 GiB under a device cap of 2 GiB, which refuses the third: the device is mapped, wanted staged
+  a real probe of 3 GiB under a device cap of 2 GiB, which refuses the third: mapped
+FAIL (2)
+== test rc=1
+
+===== c2-nostaged0.log (sha256 d54000cc3477d535d65628799afebcc1636c7c8ac5cc3ba7c80b79939526a761): counter-test c2-nostaged0: COLI_VK_STAGED=0 no longer skips the probe (excerpt: the lines that answer the question; the whole log has the sha256 above)
+
+build rc=0
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 23034 MiB heap) copied from host staging memory (type 2) on a transfer queue (the driver gave 9 of the 19 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 1.0 s)
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 23034 MiB heap) copied from host staging memory (type 2) on a transfer queue (the driver gave 0 of the 19 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_PROBE_MB))
+window:
+  a window of 1 MiB: staged
+[VK] memory: mapped weights, the host-visible device-local memory gave the 97656 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_PROBE_MB)
+  a window of the whole heap and more: mapped
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 23034 MiB heap) copied from host staging memory (type 2) on a transfer queue (the driver gave 0 of the 19 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_PROBE_MB))
+FAIL tests/test_vk_tier.c:1630: window, COLI_VK_STAGED=0 over a window of 1 MiB: the device is staged, wanted mapped
+  COLI_VK_STAGED=0 over a window of 1 MiB: staged
+  COLI_VK_STAGED=1 over a window of the whole heap: staged
+[VK] memory: mapped weights, the host-visible device-local memory gave the 1 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_ASK_MB)
+  a real probe of 1 GiB, which the device gives: mapped
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 23034 MiB heap) copied from host staging memory (type 2) on a transfer queue (the driver gave 2 of the 3 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 0.1 s (COLI_VK_WINDOW_ASK_MB))
+  a real probe of 3 GiB under a device cap of 2 GiB, which refuses the third: staged
+FAIL (1)
+== test rc=1
+
+===== c3-noloopbreak.log (sha256 f81a4e21f6152e683e140d1d142877fa07291d22ca70bda45d6cbc1cd9f956e8): counter-test c3-noloopbreak: the loop no longer stops at a refusal (excerpt: the lines that answer the question; the whole log has the sha256 above)
+
+build rc=0
+[VK] memory: mapped weights, the host-visible device-local memory gave the 19 GiB asked (9/10 of its heap, less if its budget leaves less), found in 7.1 s
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 23034 MiB heap) copied from host staging memory (type 2) on a transfer queue (the driver gave 0 of the 19 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_PROBE_MB))
+window:
+  a window of 1 MiB: staged
+[VK] memory: mapped weights, the host-visible device-local memory gave the 97656 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_PROBE_MB)
+  a window of the whole heap and more: mapped
+  COLI_VK_STAGED=0 over a window of 1 MiB: mapped
+  COLI_VK_STAGED=1 over a window of the whole heap: staged
+[VK] memory: mapped weights, the host-visible device-local memory gave the 1 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_ASK_MB)
+  a real probe of 1 GiB, which the device gives: mapped
+[VK] memory: mapped weights, the host-visible device-local memory gave the 3 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.1 s (COLI_VK_WINDOW_ASK_MB)
+FAIL tests/test_vk_tier.c:1630: window, a real probe of 3 GiB under a device cap of 2 GiB, which refuses the third: the device is mapped, wanted staged
+  a real probe of 3 GiB under a device cap of 2 GiB, which refuses the third: mapped
+FAIL (1)
+== test rc=1
+
+===== c4-base.log (sha256 26623b7ac6bc8184980d77477cbadbf812d2d10902a81ea111e073df064f6925): counter-test c4-base: the tree restored: green (excerpt: the lines that answer the question; the whole log has the sha256 above)
+
+build rc=0
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 23034 MiB heap) copied from host staging memory (type 2) on a transfer queue (the driver gave 9 of the 19 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 1.0 s)
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 23034 MiB heap) copied from host staging memory (type 2) on a transfer queue (the driver gave 0 of the 19 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_PROBE_MB))
+window:
+  a window of 1 MiB: staged
+[VK] memory: mapped weights, the host-visible device-local memory gave the 97656 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_PROBE_MB)
+  a window of the whole heap and more: mapped
+  COLI_VK_STAGED=0 over a window of 1 MiB: mapped
+  COLI_VK_STAGED=1 over a window of the whole heap: staged
+[VK] memory: mapped weights, the host-visible device-local memory gave the 1 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_ASK_MB)
+  a real probe of 1 GiB, which the device gives: mapped
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 23034 MiB heap) copied from host staging memory (type 2) on a transfer queue (the driver gave 2 of the 3 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 0.1 s (COLI_VK_WINDOW_ASK_MB))
+  a real probe of 3 GiB under a device cap of 2 GiB, which refuses the third: staged
+PASS
+== test rc=0
+
+===== k6-contro.log (sha256 543efa04c85efa3b2c48f4c15bb3445ff1ad24877b9f0d349e453735ba4ee7da): what the sed edits did and the restored file's sha256 (whole log)
+
+[03:18:15] c0-base: == test rc=0
+[03:18:47] c1-noflip: == test rc=1
+[03:19:22] c2-nostaged0: == test rc=1
+[03:20:01] c3-noloopbreak: == test rc=1
+[03:20:36] c4-base: == test rc=0
+305ae33c55c8a175e5371306281213ffe903b297ac40e340903fbbfd414fb4a9  backend_vulkan.c
+305ae33c55c8a175e5371306281213ffe903b297ac40e340903fbbfd414fb4a9  /content/bv.orig
+
+===== m1-mem-dev2.log (sha256 4e07a92e93e2969ea49fb81395ece712a4a82ef58255f6155ee1b92b1e3b2415): vk-memtype-check on origin/dev (excerpt: the lines that answer the question; the whole log has the sha256 above)
+
+== vk-memtype-check rc=0
+
+===== m2-mem-win.log (sha256 4e07a92e93e2969ea49fb81395ece712a4a82ef58255f6155ee1b92b1e3b2415): vk-memtype-check on the change (excerpt: the lines that answer the question; the whole log has the sha256 above)
+
+== vk-memtype-check rc=0
+
+===== m3-chain-dev2.log (sha256 40ea265e8d2321004d0c81ab74fff7da8088f1ad127ad5102eb7a411908c95ca): vk-chain-check on origin/dev (excerpt: the lines that answer the question; the whole log has the sha256 above)
+
+kda rows H 2 KD 128 S 37 flags 0: one row a call's bits
+kda rows H 3 KD 64 S 9 flags 0: one row a call's bits
+FAIL tests/test_vk_chain.c:1507: kda rows H 2 KD 128 S 40 flags 3: a block of rows differs from one row a call
+FAIL tests/test_vk_chain.c:1507: kda rows H 1 KD 32 S 17 flags 2: a block of rows differs from one row a call
+FAIL (2)
+== vk-chain-check rc=2
+
+===== m4-chain-win.log (sha256 ecee8f16ed4953768cc488c514339a2ecfc99b2d44c36330a4b8e0aac42fd635): vk-chain-check on the change (excerpt: the lines that answer the question; the whole log has the sha256 above)
+
+kda rows H 2 KD 128 S 37 flags 0: one row a call's bits
+kda rows H 3 KD 64 S 9 flags 0: one row a call's bits
+FAIL tests/test_vk_chain.c:1507: kda rows H 2 KD 128 S 40 flags 3: a block of rows differs from one row a call
+FAIL tests/test_vk_chain.c:1507: kda rows H 1 KD 32 S 17 flags 2: a block of rows differs from one row a call
+FAIL (2)
+== vk-chain-check rc=2
+
+===== k8-engine.log (sha256 86626ab33820273ec7fc20cc5d9782da0a45e8133745e79d010ffe5174c4022f): one engine run of the final code on the L4 (Qwen3.6, a prompt of 400 characters of plain text, 32 new tokens) (excerpt: the lines that answer the question; the whole log has the sha256 above)
+
+[enc] prompt tokens: 103 | generating 32 new tokens
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 23034 MiB heap) copied from host staging memory (type 2) on a transfer queue (the driver gave 9 of the 19 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 1.0 s)
+[VK] tier qwen36: warm start, 10240 experts in 29.3s (0 from the history, 10240 more to fill the device: every expert of the model)
+TTFT: 0.785 s (time to first token)
+Speed: 24.13 tok/s (1.3s for 32 tokens)
+	Maximum resident set size (kbytes): 5063764
+	Exit status: 0
+
+===== k9-mapped.log (sha256 4dc75d3c899b158931bb0cdd003e480816725ea10faf0bc106e96ae5f72d4c7b): Qwen3.6 on the L4, the probe passing (COLI_VK_WINDOW_ASK_MB=1024) or not asked (dev2), COLI_VK_TIER_GB=2: the runs in order (whole log)
+
+[03:26:45] e1-dev2: Speed: 8.76 tok/s (3.7s for 32 tokens) == rc=0
+[03:27:23] e2-win: Speed: 8.86 tok/s (3.6s for 32 tokens) == rc=0
+[03:27:53] e3-old: Speed: 8.93 tok/s (3.6s for 32 tokens) == rc=0
+[03:28:22] e4-dev2: Speed: 8.96 tok/s (3.6s for 32 tokens) == rc=0
+[03:28:52] e5-win: Speed: 8.98 tok/s (3.6s for 32 tokens) == rc=0
+[03:29:22] e6-old: Speed: 8.88 tok/s (3.6s for 32 tokens) == rc=0
+
+===== e1-dev2.log (sha256 c0c92b8ff3cf75cb8356d2964d1f34f37fa7ed3ca18fee3c430c406add600e34): e1-dev2: origin/dev, never asked (excerpt: the lines that answer the question; the whole log has the sha256 above)
+
+[VK] tier qwen36: on, NVIDIA L4, budget 2.00 GiB = 1144 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] tier qwen36: warm start, 10240 experts in 17.0s (0 from the history, 10240 more to fill the device: every expert of the model)
+TTFT: 1.185 s (time to first token)
+Speed: 8.76 tok/s (3.7s for 32 tokens)
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:35.15
+	Maximum resident set size (kbytes): 20969936
+	Exit status: 0
+== rc=0
+text generated (sha256 19fe5b30d5231a8dd5aa7940ae7bdeb0e2d90755e33aa2b06d6524e3c20a17f7):
+ccii, non sono i più gagliardi, nè i più
+arditi, nè i più fortunati, ma i più veri.
+
+  _
+
+===== e2-win.log (sha256 c198e24278e0a453b723ced4a03132c089db9bd70db47a7a5773bf53bb151298): e2-win: final code, the probe passes: mapped (excerpt: the lines that answer the question; the whole log has the sha256 above)
+
+[VK] memory: mapped weights, the host-visible device-local memory gave the 1 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_ASK_MB)
+[VK] tier qwen36: on, NVIDIA L4, budget 2.00 GiB = 1144 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] tier qwen36: warm start, 10240 experts in 21.4s (0 from the history, 10240 more to fill the device: every expert of the model)
+TTFT: 1.218 s (time to first token)
+Speed: 8.86 tok/s (3.6s for 32 tokens)
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:37.26
+	Maximum resident set size (kbytes): 20972200
+	Exit status: 0
+== rc=0
+text generated (sha256 19fe5b30d5231a8dd5aa7940ae7bdeb0e2d90755e33aa2b06d6524e3c20a17f7):
+ccii, non sono i più gagliardi, nè i più
+arditi, nè i più fortunati, ma i più veri.
+
+  _
+
+===== e3-old.log (sha256 0ccab6b06289e55ceb350ea6c78501385b057bfb6c6383e7cb4ffdda0e6bd35b): e3-old: the change before vk_window_mapped(), the probe passes: mapped (excerpt: the lines that answer the question; the whole log has the sha256 above)
+
+[VK] memory: mapped weights, the host-visible device-local memory gave the 1 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_ASK_MB)
+[VK] tier qwen36: on, NVIDIA L4, budget 2.00 GiB = 1144 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] tier qwen36: warm start, 10240 experts in 14.3s (0 from the history, 10240 more to fill the device: every expert of the model)
+TTFT: 1.190 s (time to first token)
+Speed: 8.93 tok/s (3.6s for 32 tokens)
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:30.38
+	Maximum resident set size (kbytes): 20997296
+	Exit status: 0
+== rc=0
+text generated (sha256 19fe5b30d5231a8dd5aa7940ae7bdeb0e2d90755e33aa2b06d6524e3c20a17f7):
+ccii, non sono i più gagliardi, nè i più
+arditi, nè i più fortunati, ma i più veri.
+
+  _
+
+===== e4-dev2.log (sha256 3ce97f3667f45a5f7b06d0c37be31657c852e2cb9417eeac59f4f7451a700cf4): e4-dev2: origin/dev again (excerpt: the lines that answer the question; the whole log has the sha256 above)
+
+[VK] tier qwen36: on, NVIDIA L4, budget 2.00 GiB = 1144 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] tier qwen36: warm start, 10240 experts in 13.8s (0 from the history, 10240 more to fill the device: every expert of the model)
+TTFT: 1.153 s (time to first token)
+Speed: 8.96 tok/s (3.6s for 32 tokens)
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:29.41
+	Maximum resident set size (kbytes): 20969440
+	Exit status: 0
+== rc=0
+text generated (sha256 19fe5b30d5231a8dd5aa7940ae7bdeb0e2d90755e33aa2b06d6524e3c20a17f7):
+ccii, non sono i più gagliardi, nè i più
+arditi, nè i più fortunati, ma i più veri.
+
+  _
+
+===== e5-win.log (sha256 a4eb4d3b910b13712ab01af34204b3d26bfa8117372e6337adbf0af1bd6327f8): e5-win: final code again (excerpt: the lines that answer the question; the whole log has the sha256 above)
+
+[VK] memory: mapped weights, the host-visible device-local memory gave the 1 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_ASK_MB)
+[VK] tier qwen36: on, NVIDIA L4, budget 2.00 GiB = 1144 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] tier qwen36: warm start, 10240 experts in 14.1s (0 from the history, 10240 more to fill the device: every expert of the model)
+TTFT: 1.131 s (time to first token)
+Speed: 8.98 tok/s (3.6s for 32 tokens)
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:29.80
+	Maximum resident set size (kbytes): 20972040
+	Exit status: 0
+== rc=0
+text generated (sha256 19fe5b30d5231a8dd5aa7940ae7bdeb0e2d90755e33aa2b06d6524e3c20a17f7):
+ccii, non sono i più gagliardi, nè i più
+arditi, nè i più fortunati, ma i più veri.
+
+  _
+
+===== e6-old.log (sha256 3d75d67215bff5e2ac8c1de44aec9ecc253c4abf6c1dd3fe9a08374f13bce2ae): e6-old: the change before vk_window_mapped() again (excerpt: the lines that answer the question; the whole log has the sha256 above)
+
+[VK] memory: mapped weights, the host-visible device-local memory gave the 1 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.0 s (COLI_VK_WINDOW_ASK_MB)
+[VK] tier qwen36: on, NVIDIA L4, budget 2.00 GiB = 1144 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] tier qwen36: warm start, 10240 experts in 14.2s (0 from the history, 10240 more to fill the device: every expert of the model)
+TTFT: 1.195 s (time to first token)
+Speed: 8.88 tok/s (3.6s for 32 tokens)
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:29.93
+	Maximum resident set size (kbytes): 20972904
+	Exit status: 0
+== rc=0
+text generated (sha256 19fe5b30d5231a8dd5aa7940ae7bdeb0e2d90755e33aa2b06d6524e3c20a17f7):
+ccii, non sono i più gagliardi, nè i più
+arditi, nè i più fortunati, ma i più veri.
+
+  _
+
+===== final2.patch (sha256 dc0dbd0bf78af1c9fd2e9803c44bd7bb0de72c4915daa0b8f452cc24c0820951): the diff of the four files the change touches, as applied on the VM
+

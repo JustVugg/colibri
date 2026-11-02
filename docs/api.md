@@ -22,17 +22,31 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ```
 
 Implemented endpoints are `GET /v1/models`, `GET /v1/models/{model}`,
-`POST /v1/chat/completions`, legacy `POST /v1/completions`, `POST /v1/brio`
-(closed-set scoring, [brio.md](brio.md)) and `POST /v1/systemone`, the
-request and reply of TypeSafe's Jev API served by the same channel. Chat and
+`POST /v1/chat/completions`, legacy `POST /v1/completions` and
+`POST /v1/systemone`, colibri's one decision API ([systemone.md](systemone.md)):
+the request and reply of TypeSafe's Jev API, scored by a language model through
+its logprob channel or answered natively by a decision model such as
+[Laya](laya.md),
+[GLiNER2.5-Decide](gliner_decide.md) or [Clef](clef.md). Chat and
 completion requests support JSON responses, SSE streaming, usage counts,
 `max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, and up to four
 custom `stop` sequences. `max_tokens` is a ceiling, not a target: when the
 prompt leaves less room than the budget asks for, every engine clamps the
 budget to what the context holds and the reply ends with `finish_reason:
 "length"`; only a prompt that does not fit is refused, with
-`context_length_exceeded` (#260, #1641). Stop sequences are removed from the response and end
-generation early in both JSON and streaming modes.
+`context_length_exceeded` (#260, #1641). A request without a budget gets the server's
+ceiling (`--max-tokens`, reported by `GET /health` as `max_tokens`); a chat server started by
+`coli serve`, `coli web` or `coli chat` without `--ngen` sets none, so a response may run to
+the end of the context: a reasoning model's turn is its reasoning plus its answer (#382).
+Stop sequences are removed from the response and end generation early in both JSON and
+streaming modes.
+
+On the GLM engine, legacy `POST /v1/completions` also accepts a non-empty
+`prompt` array of integer token IDs, for example `[12, 345, 6]`. The IDs go
+directly to the engine's pre-tokenized intake; they must be non-negative and
+within the model's vocabulary. An out-of-vocabulary ID receives a `prompt`
+400. Other engines currently reject token-ID prompts with a named 400, and
+batched prompts (arrays of strings or arrays of arrays) remain unsupported.
 
 A trailing `assistant` message *continues* that turn instead of starting a new
 one: the prompt ends inside it, which is the official template rendered with
@@ -98,14 +112,19 @@ below). Audio is accepted only by Inkling checkpoints with audio support. The
 default bind address is localhost; set `COLI_API_KEY` before exposing the
 server beyond the machine.
 
+Request bodies must fit within 4 MiB and the running Python JSON parser's
+limits. An integer or nesting depth the runtime cannot parse receives HTTP
+400 before engine work; the gateway preserves the runtime's limits.
+
 The hosted-platform bookkeeping fields `store`, `metadata`, `service_tier`,
 `user`, `safety_identifier`, `parallel_tool_calls`, `prompt_cache_key`,
 `verbosity`, `web_search_options`, `moderation`, and
 `stream_options.include_obfuscation` are accepted and intentionally ignored:
 they have no local equivalent and do not affect generation. Unsupported
 result-shaping requests are refused explicitly: `best_of` values above 1, a
-non-empty `logit_bias`, `suffix` infill, and audio output requested through
-`modalities`.
+non-empty `logit_bias`, and `suffix` infill. The optional `modalities` array
+accepts text output only; malformed values and requests for other output
+modalities receive a named 400 rather than silently returning text.
 
 ### `seed`
 
@@ -165,8 +184,9 @@ the argmax. Per-token values are printed by the engine to six decimal digits of 
 Non-finite values (a degenerate all-`-inf` logit row, say) serialize as JSON `null`, never
 a clamped number.
 
-These endpoints request the numeric per-token channel only from a glm engine; on every
-other engine the request returns a named 400 rather than being silently ignored. That is a
+These endpoints request the numeric per-token channel only from a glm or a MiMo engine,
+the two that read out every prompt position `echo` needs; on every other engine the
+request returns a named 400 rather than being silently ignored. That is a
 statement about what these endpoints request, and about nothing else.
 
 Known limitations, current build:
@@ -232,9 +252,11 @@ Known limitations, current build:
 | Engine | OpenAI `tools` | Anthropic `tool_use` | Native format |
 |---|---|---|---|
 | GLM-5.2 (`colibri`) | yes | yes | `<tool_call>` blocks |
+| GLM-5.3-Flash | yes | yes | `<tool_call>` blocks, with the 5.3 declaration block |
 | DeepSeek V4 | yes | yes | native DSML tool-call blocks |
 | Inkling | no | no | active tool declarations/choices return HTTP 400 |
 | Kimi K3 | yes | yes | native XTML `tools`/`call`/`argument` blocks (#1143) |
+| MiMo-V2.6 | yes | yes | native `<tools>` / `<tool_call>` blocks |
 | Qwen3.6 | yes | yes | native `<tool_call>`/`<tool_response>` blocks, the same XML-ish form as Qwen3.8 |
 | Qwen3.8-Flash-Next | yes | yes | native `<tool_call>`/`<tool_response>` blocks |
 | OLMoE | no | no | active tool declarations/choices return HTTP 400 |
@@ -246,6 +268,31 @@ modes into the active engine's native prompt and back into protocol responses.
 Protocol support does not guarantee that every quantized model emits valid
 tool syntax; `COLI_TOOL_SALVAGE=1` is an opt-in recovery path for malformed GLM
 int4 tool calls. DeepSeek V4 uses its strict native DSML parser instead.
+
+`tool_choice: "required"` is a prompt-level instruction, not a sampling
+constraint. Every renderer that offers a tool block appends the same one line to
+it, and no renderer filters tokens or forces the sampler, so a model that
+answers in prose anyway has done nothing the API said was impossible.
+Grammar forcing is not a remedy: that path feeds a draft the engine then
+verifies, so a schema the engine cannot compile costs the speedup and nothing
+else. An engine with no tool block to attach the instruction to (Inkling, OLMoE
+without `COLI_TOOL_FALLBACK=1`) answers HTTP 400 rather than accept the choice
+and ignore it.
+
+A forced choice, `tool_choice: {"type": "function", "function": {"name": …}}`,
+is applied per engine and the engines do not agree on how: some narrow the
+offered tools to the named one, some keep the full list and name the tool in
+prose instead, and some (Qwen3.6, Qwen3.8) do neither. Read the rendered prompt
+rather than assuming the request was honoured.
+
+For GLM calls that will execute tools, an OpenAI chat request may set
+`"strict_tool_calls": true`. This opt-in accepts only complete `<tool_call>`
+blocks whose function and arguments match the declared tool schema. It returns
+HTTP 502 with code `invalid_model_tool_call` for incomplete, duplicate, unknown,
+or invalid arguments and for a tool call cut off by the generation limit. It
+never recovers or salvages a malformed call. The default recovery behavior is
+unchanged. Strict mode currently requires `stream: false` and does not support
+`logprobs`; these combinations receive HTTP 400 before generation.
 
 When a reverse proxy or MagicDNS hostname preserves a public `Host` header,
 trust that exact hostname with repeatable `--allowed-host` options. The
@@ -281,6 +328,24 @@ An earlier pinned request keeps priority for its target; an earlier any-slot
 request keeps priority across all slots. A full waiting queue does not reject
 a request that can immediately take an unreserved free slot; the queue limit
 bounds waiting requests, independently of active capacity.
+
+### When the engine stops
+
+`coli serve` starts the engine again when it dies (a crash, the out-of-memory
+killer, a kill). While the new engine loads, `GET /health` answers 503 with
+`{"status": "restarting"}` and `Retry-After: 5`, and nothing is admitted: a
+request waits in the queue for the new engine, within `--queue-timeout`, rather
+than failing on the old one. A request the dead engine was answering fails with
+`engine_error` and frees its slot. A start that fails is tried again after 2 s,
+then twice as long each time, up to 60 s. The authenticated `/health` counts the
+restarts in `engine_restarts`, and the log names the cause:
+
+```
+[gateway] the engine stopped (colibri engine exited unexpectedly (killed by signal 9, SIGKILL, most often the out-of-memory killer)); starting it again
+[gateway] the engine is running again (restart 1)
+```
+
+`coli chat` waits for a restarting server instead of starting a second one.
 
 ## Prometheus metrics
 
@@ -325,7 +390,7 @@ user-visible answer text. Empty callbacks, ACCEPT frames, and SSE keepalives do
 not count. Calls that finish or fail without output add no first-output sample;
 a failure after output retains that sample. Engine-call duration includes callback
 processing and response writes during generation. One request can invoke the
-engine multiple times (for example Brio scoring), so these histogram counts are
+engine multiple times (for example System One scoring), so these histogram counts are
 engine calls, not HTTP request counts.
 
 These are gateway observations, not end-to-end client TTFT, per-token latency,
@@ -490,6 +555,16 @@ KV configuration actually allows. Tool calling in pi works on the engines in
 the [tool-calling matrix](#tool-calling-support) above; on unsupported engines
 pi's tool calls fail the same way any OpenAI `tools` request does.
 
+The same provider entry serves the other engines — swap the model `id` and
+`name` (`qwen3.6-colibri` for Qwen3.6, `deepseek-v4-flash-colibri` for DeepSeek
+V4 Flash; `coli status` prints the id of the running model). Serve with a
+context that fits pi's preamble plus the working set: pi sends its system
+prompt, tool catalog and project instructions — about 5,000 tokens — before the
+first user word, so start the server with e.g. `coli serve --ctx 32768` and set
+`contextWindow` to the same value. Measured with pi 1.4.0 against
+Qwen3.6-35B-A3B resident in RAM (Vulkan, Ryzen 9 9950X): the ~4,900-token
+preamble prefills in about 30 s, and follow-up turns reuse the cached prefix.
+
 **Continue, Cline / Roo, `llm`, the OpenAI SDKs, …** — set the provider's base
 URL to `http://localhost:8000/v1`, the model to `glm-5.2-colibri`, and any dummy
 key (`OPENAI_API_KEY` / `OPENAI_BASE_URL` for env-based tools).
@@ -513,6 +588,112 @@ key (`OPENAI_API_KEY` / `OPENAI_BASE_URL` for env-based tools).
 > API and mostly won't be worth the wait. If your client lets you trim or disable
 > its system preamble and tool catalog, do it.
 
+### Agents: Hermes Agent, OpenClaw, Cline
+
+These agents need room: Hermes Agent refuses a window below 64,000 tokens, and
+their first request alone is 5-14k tokens (a system prompt plus a few dozen tool
+schemas). A server whose context nobody set gives a chat model 65536 tokens
+whenever that fits in a quarter of the memory (more where a tenth allows it, see
+[below](#conversations-longer-than-the-context)), and `GET /v1/models` reports
+it as `context_length` and `max_model_len`. Hermes Agent reads it from there; for
+the others, put the same number in their configuration (`coli serve` prints it:
+`[gateway] 65536 tokens of context ...`). An agent that believes in a larger
+window than the server holds compacts too late and ends in
+`context_length_exceeded`.
+
+Measured on 2026-10-11 against Qwen3.6-35B-A3B (int4) on a Ryzen 7 PRO 8700GE,
+each agent asked to count the files in a directory with a tool:
+
+| Agent | First request | Tools sent | Result |
+|---|---|---|---|
+| Hermes Agent 0.19.0 | 13,753 tokens | 27 | `terminal` called, the right count |
+| OpenClaw 2026.10.1 | 10,855 tokens | 11 | `ls` called, the right count and the names |
+| Cline CLI 3.0.70 | 5,566 tokens | 25 | `run_commands` called, the right count, 2 minutes in all |
+
+The first request is the slow one: about 35 tokens a second of prefill on that
+machine, six and a half minutes for Hermes' 13,753 tokens, with a keepalive on
+the stream every 10 seconds so the client does not give up. The next turns
+reuse the prefix and prefill only what is new.
+
+**Hermes Agent** (`~/.hermes/config.yaml`):
+
+```yaml
+model:
+  default: qwen3.6            # the --model-id of coli serve
+  provider: custom
+  base_url: http://localhost:8000/v1
+  api_key: local
+```
+
+**OpenClaw** (`~/.openclaw/openclaw.json`; `contextWindow` is the server's
+`context_length`):
+
+```json
+{
+  "agents": { "defaults": { "model": { "primary": "colibri/qwen3.6" } } },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "colibri": {
+        "baseUrl": "http://localhost:8000/v1",
+        "apiKey": "sk-local",
+        "api": "openai-completions",
+        "timeoutSeconds": 3600,
+        "models": [{ "id": "qwen3.6", "name": "Qwen3.6 (colibri)", "reasoning": false,
+                     "input": ["text"], "contextWindow": 65536, "maxTokens": 8192 }]
+      }
+    }
+  }
+}
+```
+
+**Cline CLI**: `cline auth -p openai -b http://localhost:8000/v1 -k local -m qwen3.6`,
+then `cline "..."`. In the editor extension, choose the *OpenAI Compatible*
+provider with the same base URL and model, and set its context window to the
+server's `context_length`.
+
+## Conversations longer than the context
+
+A chat request may opt into context compaction with the extension field
+`"context_compaction": "auto"` (`"off"` is the default, the standard behavior;
+`COLI_COMPACT=1` on the server makes `auto` the default for every client). The
+dashboard and `coli chat` send it, so a conversation there never ends in
+`context_length_exceeded`:
+
+1. When the conversation does not fit the context, or leaves the answer less
+   room than it asks for (up to a quarter of the context), the server asks the
+   model itself to summarize the conversation before the new message. The
+   request to summarize comes after the history the engine already holds, so
+   only that request is prefilled.
+2. The turn then runs on the system message, with the summary appended to it,
+   and the last messages verbatim (about a quarter of the context, at least the
+   new message).
+3. The server keeps the summary, keyed by the messages it replaces. The client
+   keeps sending its whole history; every later turn finds the same summary and
+   renders the same prompt, so the engine's prefix reuse works as before until
+   the next compaction. A restarted server summarizes once more.
+
+The reply says what happened: a `compaction` object,
+`{"summarized_messages": 8, "summary": "..."}`, in the JSON response and in a
+stream chunk (empty `choices`) before the first token, and the header
+`x-colibri-compacted-messages`. Pictures in the summarized messages become
+`[image]`. A last message longer than the context alone is still refused with
+`context_length_exceeded`.
+
+The context itself: a server whose context variable nobody set (`--ctx`, or the
+family's `CTX`, `Q36_MAXT`, ...) picks the largest of 16384, 32768, 65536, 131072
+and 262144 tokens (up to the family's maximum) whose conversation state, for every
+KV slot, takes at most a quarter of the memory up to 65536 tokens and a tenth
+beyond (`RAM_GB` when set, the available memory otherwise), and the family's own
+default when even 16384 does not fit that. The larger share up to 64k is for
+coding agents, which do not run on less. DeepSeek V4.1 and MiMo, whose expert cache
+the plan sizes and which do not start without a slot a layer, count the prompt's
+workspace beside the state: V4.1 prefills a prompt in one forward (about 200 KB a
+token), so a 64 GB box gets 65536 tokens rather than the 262144 its 6.4 KB a token of
+state allowed, which left the cache nothing. The startup log says which
+(`[gateway] 65536 tokens of context ...`), and `GET /v1/models` reports it as
+`context_length` (and `max_model_len`), where agents read it.
+
 ## Isolated KV contexts
 
 `coli serve --kv-slots N` allocates up to 16 independent sequence contexts.
@@ -527,12 +708,27 @@ OpenAI clients omit it and keep the original slot 0 behavior.
 }
 ```
 
-Each slot owns its token history, compressed MLA/DSA KV memory, MTP window, and
-crash-safe persistence file (`.coli_kv`, `.coli_kv.1`, ...). The engine matches
-each request's tokenized prompt against the slot's history and reuses the common
-KV prefix, so stateless HTTP turns keep their cache across requests and even
-across engine restarts. Use `COLI_KV_SLOTS=N` as the environment equivalent.
-Start small: at the default 4096-token context, every slot costs hundreds of MB.
+Each slot owns its token history and its conversation's state: the KV cache, and
+on the engines that have them the DeltaNet, KDA and convolution states and the
+compressed DeepSeek attention. The engine matches each request's tokenized prompt
+against the slot's history and reuses the common prefix, so stateless HTTP turns
+keep their cache across requests. On GLM-5.2 each slot also has its MTP window and
+a crash-safe persistence file (`.coli_kv`, `.coli_kv.1`, ...), so the cache
+survives an engine restart too. Use `COLI_KV_SLOTS=N` as the environment
+equivalent. Start small: at the default 4096-token context, every slot costs
+hundreds of MB, and `coli plan` counts them.
+
+Every text engine serves the slots at the same time. Requests on different slots
+are decoded together: each step takes the next token of every active
+conversation as one batch, so the weights and the routed experts a step reads
+serve all of them, while each row's attention and recurrent state stay its own
+conversation's. A request gets the tokens it would get alone (greedy on the CPU,
+the same bytes; `tests/serve_mux_check.py` checks it on every engine). A prompt is
+prefilled when it arrives, between two steps. With more than one slot, the
+engines other than GLM-5.2 and GLM-5.3-Flash draft nothing (MTP, DSpark and
+prompt lookup follow one conversation), and their Vulkan dense chain, DeltaNet on
+the GPU and Metal paths stay off; the Vulkan expert tier serves every
+conversation's experts.
 
 ## Web dashboard
 
@@ -553,10 +749,10 @@ What you get is one workspace with a dock to switch page:
 
 - **Chat**: streaming answers, a reasoning toggle, image input where the engine
   supports it, the KV slot to answer in, and the conversation exported as a file;
-- **Brio**: closed-set answers. A document, a question and the only answers
+- **System One**: closed-set answers. A document, a question and the only answers
   allowed; the engine reads the probability of each answer, generates nothing,
   and reports an entropy that says when it is not sure. Same thing as
-  `POST /v1/brio` (see [brio.md](brio.md));
+  `POST /v1/systemone` (see [systemone.md](systemone.md));
 - **Brain**, two views. *Explore* draws the
   [measured expert atlas](https://github.com/JustVugg/colibri/issues/175) of GLM-5.2 as a cortex with ten regions to
   enter (publish `experts.json` from `tools/expert_atlas/analyze.py --web`).

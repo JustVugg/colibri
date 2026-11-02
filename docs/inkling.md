@@ -9,7 +9,7 @@ head are not loaded.
 
 ## Quickstart
 
-Pre-converted weights (int4 experts + bf16 residents, ~469 GiB):
+Pre-converted weights (int4 experts + bf16 residents, 514 GB as Hugging Face lists the repository):
 
 ```sh
 hf download nbeerbower/Inkling-colibri-int4 --local-dir ~/Models/inkling_i4
@@ -194,6 +194,34 @@ SNAP=~/Models/inkling_i4 ./c/inkling -f warmup_prompts.txt -n 32
 | `INK_SHARED_BATCH=0` | disable shared-expert prefill batching for a controlled A/B; positive values cap rows per chunk. The default uses up to 64 MiB of bounded scratch and never changes decode (`S=1`) |
 | `TOPP=<p>` | adaptive routing: keep routed experts up to cumulative weight `p`, drop the tail. **Trims the routing** — fewer experts read per token (the lever that matters on a disk-bound host), but a different computation from the declared top-k. Off by default; the run reports `[topp] … N/M routed used (X% trimmed)` so the trade is measurable. Same semantics as `TOPP` in `colibri.c` and `K3_TOPP` in `kimi_k3.c` |
 | First positional arg | expert-cache cap per layer (`0` = auto-size from free RAM) |
+
+## Vulkan: the routed experts on the GPU
+
+`make -C c inkling VK=1`, then `COLI_VULKAN=1`: the routed experts go to the shared
+Vulkan expert tier ([vulkan.md](vulkan.md#inkling-and-olmoe)), a cache of experts on
+the device that fills at startup from the history the cache warming above keeps
+(`SNAP/.coli_usage`, or `PIN=<path>`; the `ref.json` oracle reads none) and adapts
+while you chat. Every MoE layer sends the resident experts' (token, rank) pairs to the
+device as one batch while the CPU computes the rest and the shared experts, then adds
+every rank in routing order, so the sum's order does not depend on what was resident.
+
+- The experts go over as the cache holds them, nothing requantized: the int4
+  container (packed nibbles, one scale per row), the int8 container, the runtime
+  quantization (`bits` 2 to 8) and f32 (`bits=0`). The fused `gate_up` tensor is
+  read as two matrices, gate from row 0 and up from row I.
+- The dense matrices (attention, dense MLP, shared experts, lm_head) go to the
+  device in their RAM form, the `dense-int4g64/` container's int8 and int4-g64
+  included, except on a GPU that shares the CPU's RAM while the tier is on: there
+  they stay on the CPU unless `COLI_VK_DENSE=1`.
+- With the CUDA backend (`CUDA=1` and a device) or Metal on, the Vulkan tier stays
+  off: the other backend wins.
+- One line per run and serve turn, `[VK] tier inkling run: device N of M routed
+  experts ...`; the dashboard's expert map shows a device-resident expert as tier 2.
+  The knobs are `COLI_VK_TIER*` in [ENVIRONMENT.md](ENVIRONMENT.md#vulkan-any-gpu-with-a-vulkan-12-driver).
+
+Status: correct, not yet measured for speed. CI checks the tiny fixture on Lavapipe in
+every expert format above, under eviction, with a warm start and through serve, and
+again under ASan and UBSan; the 975B has not run on it.
 
 ## Performance (975B, Ryzen 9 7900 / 24t, 187 GB DDR5, RTX A6000, NVMe)
 

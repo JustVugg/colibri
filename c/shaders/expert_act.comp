@@ -1,0 +1,58 @@
+#version 450
+// The gated activation of a routed expert, element by element, for the route that
+// projects gate and up with the tiled GEMM (many rows per expert) instead of the
+// fused qmatmul_gate_up.comp: hid[i] = act(gate[i], up[i]) for i < n. The same
+// activations, clamps and formulas as that shader's epilogue, so a row computed
+// either way differs only in the projections' summation order:
+//   0  SwiGLU silu(g) * u, gate clamped from above and up to [-limit, limit] when limit > 0
+//   1  SiTU-GLU a*tanh(g/a)*sigmoid(g) * b*tanh(u/b)
+//   2  DeepSeek V4: gate and up rounded to bf16, then 0's clamps and g * sigmoid(g) * u
+//      in its CPU's form (act_v4, as in qmatmul_gate_up.comp)
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer G { float gate[]; };
+layout(std430, binding = 1) readonly buffer U { float up[]; };
+layout(std430, binding = 2) writeonly buffer H { float hid[]; };
+
+layout(push_constant) uniform P {
+    int n;          // elements: rows * moe_inter
+    int act;
+    float limit;    // act 0's clamp; 0 = none
+    float a, b;     // act 1's two bounds
+} p;
+
+// act 2, the same functions as qmatmul_gate_up.comp's
+float bf16r(float v) {
+    uint b = floatBitsToUint(v);
+    if ((b & 0x7f800000u) != 0x7f800000u) b += 0x7fffu + ((b >> 16) & 1u);
+    return uintBitsToFloat(b & 0xffff0000u);
+}
+float act_v4(float g, float u, float limit) {
+    g = bf16r(g); u = bf16r(u);
+    if (limit > 0.0) { g = min(g, limit); u = max(-limit, min(u, limit)); }
+    float s = g >= 0.0 ? 1.0 / (1.0 + exp(-g)) : exp(g) / (1.0 + exp(g));
+    return g * s * u;
+}
+
+// Below 2^-12 the cubic correction is below half an f32 ULP. Some drivers'
+// tanh lowering loses these values through cancellation around exp(0) == 1.
+float situ_tanh(float x) { return abs(x) < 0.000244140625 ? x : tanh(x); }
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x) + int(gl_GlobalInvocationID.y) * int(gl_NumWorkGroups.x) * 256;
+    if (i >= p.n) return;
+    float gt = gate[i], ut = up[i], h;
+    if (p.act == 1) {
+        h = p.a * situ_tanh(gt / p.a) * (1.0 / (1.0 + exp(-gt))) * (p.b * situ_tanh(ut / p.b));
+    } else if (p.act == 2) {
+        h = act_v4(gt, ut, p.limit);
+    } else {
+        if (p.limit > 0.0) {
+            if (gt > p.limit) gt = p.limit;
+            if (ut > p.limit) ut = p.limit;
+            if (ut < -p.limit) ut = -p.limit;
+        }
+        h = (gt / (1.0 + exp(-gt))) * ut;
+    }
+    hid[i] = h;
+}

@@ -13,7 +13,8 @@ class Glm53MetalRoutedSourceTests(unittest.TestCase):
         self.assertIn("metal_slot = g_metal_ready", SRC)
 
     def test_cpu_mmap_path_is_preserved(self):
-        self.assertIn("if (!metal_slot)", SRC)
+        # a GGUF layer whose experts are held interleaved owns its bytes too (!ilv)
+        self.assertRegex(SRC, r"if \(!metal_slot(\s*&&\s*!ilv)?\)")
         self.assertIn("st_map_shard_range", SRC)
         self.assertRegex(
             SRC,

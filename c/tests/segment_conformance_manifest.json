@@ -138,6 +138,21 @@
         "path": "tools/make_dsv41_tiny.py"
       },
       "real_adapter_required": true
+    },
+    {
+      "family_id": "mimo",
+      "state_schema": "fixture/mimo-kv-ring-sink-v1",
+      "state_components": [
+        "full_attention_kv",
+        "window_attention",
+        "attention_sink",
+        "vision"
+      ],
+      "oracle": {
+        "kind": "generated_tiny",
+        "path": "tools/make_mimo_tiny.py"
+      },
+      "real_adapter_required": true
     }
   ]
 }

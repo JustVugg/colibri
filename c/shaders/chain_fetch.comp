@@ -1,0 +1,52 @@
+#version 450
+// Copies of regions read by address into a bound buffer (vk_chain.c, vkc_fetch): a prompt
+// chunk's experts in the tier's host pool (system RAM the device reads over PCIe) into the
+// chain's staging in VRAM, a layer at a time, before the layer's grouped GEMMs read them
+// there (vk_dmoe.h). A GEMM reading the pool in place drew about 4 GB/s from the bus; this
+// keeps several 16-byte loads in flight a lane, as a copy wants.
+// Region r (reg[r], a uvec4): x, y the source's address (low, high word), z the first word
+// in dst, w the words. Workgroup (s, r) copies words s*SLICE .. of region r; 16-byte steps
+// where the source's address and the destination's word are 16-byte aligned, words else.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Src4 { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Src1 { uint v[]; };
+layout(std430, binding = 0) readonly buffer R { uvec4 reg[]; };
+layout(std430, binding = 1) writeonly buffer D4 { uvec4 d4[]; };
+layout(std430, binding = 1) writeonly buffer D1 { uint d1[]; };
+
+layout(push_constant) uniform P {
+    int first, n;   // regions first .. first + n - 1 of reg
+    int slice;      // words a workgroup (a multiple of 4 * 256 * 4)
+} p;
+
+void main() {
+    int r = int(gl_WorkGroupID.y);
+    if (r >= p.n) return;
+    uvec4 g = reg[p.first + r];
+    uint words = g.w, lo = gl_WorkGroupID.x * uint(p.slice);
+    if (lo >= words) return;
+    uint hi = min(words, lo + uint(p.slice)), dst = g.z, tid = gl_LocalInvocationID.x;
+    bool al = (g.x & 15u) == 0u && (dst & 3u) == 0u && (lo & 3u) == 0u;
+    if (al) {
+        Src4 s4 = Src4(g.xy);
+        uint q0 = lo >> 2, q1 = hi >> 2, d0 = dst >> 2;
+        // four steps in flight a lane: 256 lanes, 4 apart
+        for (uint q = q0 + tid; q < q1; q += 1024u) {
+            uint qa = q, qb = q + 256u, qc = q + 512u, qd = q + 768u;
+            uvec4 a = s4.v[qa];
+            uvec4 b = qb < q1 ? s4.v[qb] : uvec4(0u);
+            uvec4 c = qc < q1 ? s4.v[qc] : uvec4(0u);
+            uvec4 d = qd < q1 ? s4.v[qd] : uvec4(0u);
+            d4[d0 + qa] = a;
+            if (qb < q1) d4[d0 + qb] = b;
+            if (qc < q1) d4[d0 + qc] = c;
+            if (qd < q1) d4[d0 + qd] = d;
+        }
+        lo = q1 << 2;   // the words past the last whole step
+    }
+    Src1 s1 = Src1(g.xy);
+    for (uint i = lo + tid; i < hi; i += 256u) d1[dst + i] = s1.v[i];
+}

@@ -31,6 +31,11 @@ if not defined COLI_PY (
 if "%~1"=="" (
     echo colibri — run frontier models from your own storage.
     echo.
+    echo First time here? One command does everything: it checks this PC, picks a
+    echo model that fits, downloads it ^(rerun to resume^) and opens the browser:
+    echo.
+    echo     coli.cmd setup
+    echo.
     echo You are one argument away: this launcher needs a model directory.
     echo.
     echo     coli.cmd chat   --model D:\models\glm52_i4     interactive chat
@@ -39,18 +44,32 @@ if "%~1"=="" (
     echo     coli.cmd doctor --model D:\models\glm52_i4     check a model is usable
     echo     coli.cmd info                                  what this build supports
     echo.
-    echo The .exe files next to this script are the ENGINES. They are not meant
+    echo Once a model is set up, colibri-desktop.exe opens the chat in a window:
+    echo it starts the server by itself and stops it when you close the window.
+    echo.
+    echo The other .exe files next to this script are the ENGINES. They are not meant
     echo to be started directly: without a model they exit at once, which is why
     echo double-clicking one only flashes a window.
     echo.
     echo Getting a model, step by step:
     echo     https://github.com/JustVugg/colibri/blob/main/docs/quickstart.md
-    call :hold
+    call :offer_setup
     exit /b 0
 )
 
 %COLI_PY% "%COLI_HERE%coli" %*
 exit /b %ERRORLEVEL%
+
+rem Double-clicked from Explorer: offer the one-step setup instead of a window
+rem that only explains. A shell the user already had open just gets the text.
+:offer_setup
+echo %CMDCMDLINE% | find /i "/c" >nul || exit /b 0
+echo.
+choice /c SX /n /m "Press S to set up colibri now, or X to close this window: "
+if errorlevel 2 exit /b 0
+%COLI_PY% "%COLI_HERE%coli" setup
+pause
+exit /b 0
 
 rem Keep the window readable when this script was double-clicked from Explorer.
 rem cmd.exe leaves CMDCMDLINE containing /c when it was started to run us and

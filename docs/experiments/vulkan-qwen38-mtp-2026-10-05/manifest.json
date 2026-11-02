@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "hypothesis": "On the existing int4-g64 Qwen3.8 checkpoint, enabling three MTP drafts reduces prompt-plus-generation time for a code-edit request with an unchanged expert-tier configuration.",
+  "commit": "2f33f211ea6e28186d62cf9c00d511df826590a0",
+  "model": "Qwen3.8-Flash-Next native snapshot with existing experts-int4g64 sidecar; MTP experts remain native FP8; default CPU int8 trunk.",
+  "prompt_hash": "b840c508d4d473840929f53cc370614e1438c6d0fd5f9afc67176ce1d99dfc2f",
+  "history_hash": "d7d86f69d2c83d900c7d869b7a04e34be19a4f466eb40ec7c52deb70d50fc108",
+  "hardware": {
+    "cpu": "AMD Ryzen 7 PRO 8700GE w/ Radeon 780M Graphics",
+    "ram": "MemTotal:       64897288 kB",
+    "storage": "NAME    MODEL                        SIZE ROTA\nnvme0n1 SAMSUNG MZVL2512HCJQ-00B07 476.9G    0\nnvme1n1 SAMSUNG MZVL2512HCJQ-00B07 476.9G    0\next4 /dev/md2 rw,relatime,stripe=256\n",
+    "os": "Linux 7.0.0-22-generic; gcc (Ubuntu 15.2.0-16ubuntu1) 15.2.0; PRETTY_NAME=\"Ubuntu 26.04 LTS\"\nNAME=\"Ubuntu\"\nVERSION_ID=\"26.04\"\nVERSION=\"26.04 LTS (Resolute Raccoon)\"\nVERSION_CODENAME=resolute\nID=ubuntu\nID_LIKE=debian\nHOME_URL=\"https://www.ubuntu.com/\"\nSUPPORT_URL=\"https://help.ubuntu.com/\"\nBUG_REPORT_URL=\"https://bugs.launchpad.net/ubuntu/\"\nPRIVACY_POLICY_URL=\"https://www.ubuntu.com/legal/terms-and-policies/privacy-policy\"\nUBUNTU_CODENAME=resolute\nLOGO=ubuntu-logo\n\nGPU: AMD Radeon 780M Graphics (RADV PHOENIX), Vulkan; VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json"
+  },
+  "warmup_runs": 0,
+  "changed_variables": [
+    "Q38_MTP"
+  ],
+  "metric": "Engine-reported tok/s: 128 generated tokens divided by prompt (241 tokens) plus generation time, excluding model loading. Not steady decode throughput.",
+  "protocol": "Three runs per arm, alternating order A/B, B/A, A/B; eight threads and cap 170. Before each run decompress the attached history.usage.gz to COLI_USAGE, advise checkpoint file pages out using POSIX_FADV_DONTNEED, and wait for three idle checks five seconds apart (load average below 2, no other inference). Advisory eviction does not guarantee physically cold storage. No global page-cache flush.",
+  "command": "make -j4 -C c qwen38 VK=1\nenv OMP_NUM_THREADS=8 COLI_NO_OMP_TUNE=1 COLI_TIMERS=1 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json COLI_LOOKUP=0 Q38_MTP=0 COLI_VULKAN=1 COLI_VK_CHAIN=0 COLI_VK_DENSE=0 Q38_EXPERT_INT4=1 Q38_MTP_DRAFTS=3 SNAP=/root/colibri-test/models/qwen38-flash-next-fp8 COLI_USAGE=/root/colibri-test/colibri-pr-validation-20261005/results/q38-i4g64-mtp-baseline-1/run.usage N_NEW=128 /root/colibri-test/colibri-pr-validation-20261005/src/c/qwen38 170 8 /root/colibri-test/p4mtp/prompts/code.txt\nenv OMP_NUM_THREADS=8 COLI_NO_OMP_TUNE=1 COLI_TIMERS=1 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json COLI_LOOKUP=0 Q38_MTP=0 COLI_VULKAN=1 COLI_VK_CHAIN=0 COLI_VK_DENSE=0 Q38_EXPERT_INT4=1 Q38_MTP_DRAFTS=3 SNAP=/root/colibri-test/models/qwen38-flash-next-fp8 COLI_USAGE=/root/colibri-test/colibri-pr-validation-20261005/results/q38-i4g64-mtp-baseline-2/run.usage N_NEW=128 /root/colibri-test/colibri-pr-validation-20261005/src/c/qwen38 170 8 /root/colibri-test/p4mtp/prompts/code.txt\nenv OMP_NUM_THREADS=8 COLI_NO_OMP_TUNE=1 COLI_TIMERS=1 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json COLI_LOOKUP=0 Q38_MTP=0 COLI_VULKAN=1 COLI_VK_CHAIN=0 COLI_VK_DENSE=0 Q38_EXPERT_INT4=1 Q38_MTP_DRAFTS=3 SNAP=/root/colibri-test/models/qwen38-flash-next-fp8 COLI_USAGE=/root/colibri-test/colibri-pr-validation-20261005/results/q38-i4g64-mtp-baseline-3/run.usage N_NEW=128 /root/colibri-test/colibri-pr-validation-20261005/src/c/qwen38 170 8 /root/colibri-test/p4mtp/prompts/code.txt\nenv OMP_NUM_THREADS=8 COLI_NO_OMP_TUNE=1 COLI_TIMERS=1 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json COLI_LOOKUP=0 Q38_MTP=1 COLI_VULKAN=1 COLI_VK_CHAIN=0 COLI_VK_DENSE=0 Q38_EXPERT_INT4=1 Q38_MTP_DRAFTS=3 SNAP=/root/colibri-test/models/qwen38-flash-next-fp8 COLI_USAGE=/root/colibri-test/colibri-pr-validation-20261005/results/q38-i4g64-mtp-trial-1/run.usage N_NEW=128 /root/colibri-test/colibri-pr-validation-20261005/src/c/qwen38 170 8 /root/colibri-test/p4mtp/prompts/code.txt\nenv OMP_NUM_THREADS=8 COLI_NO_OMP_TUNE=1 COLI_TIMERS=1 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json COLI_LOOKUP=0 Q38_MTP=1 COLI_VULKAN=1 COLI_VK_CHAIN=0 COLI_VK_DENSE=0 Q38_EXPERT_INT4=1 Q38_MTP_DRAFTS=3 SNAP=/root/colibri-test/models/qwen38-flash-next-fp8 COLI_USAGE=/root/colibri-test/colibri-pr-validation-20261005/results/q38-i4g64-mtp-trial-2/run.usage N_NEW=128 /root/colibri-test/colibri-pr-validation-20261005/src/c/qwen38 170 8 /root/colibri-test/p4mtp/prompts/code.txt\nenv OMP_NUM_THREADS=8 COLI_NO_OMP_TUNE=1 COLI_TIMERS=1 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json COLI_LOOKUP=0 Q38_MTP=1 COLI_VULKAN=1 COLI_VK_CHAIN=0 COLI_VK_DENSE=0 Q38_EXPERT_INT4=1 Q38_MTP_DRAFTS=3 SNAP=/root/colibri-test/models/qwen38-flash-next-fp8 COLI_USAGE=/root/colibri-test/colibri-pr-validation-20261005/results/q38-i4g64-mtp-trial-3/run.usage N_NEW=128 /root/colibri-test/colibri-pr-validation-20261005/src/c/qwen38 170 8 /root/colibri-test/p4mtp/prompts/code.txt",
+  "baseline": {
+    "config": {
+      "OMP_NUM_THREADS": "8",
+      "COLI_NO_OMP_TUNE": "1",
+      "COLI_TIMERS": "1",
+      "VK_ICD_FILENAMES": "/usr/share/vulkan/icd.d/radeon_icd.json",
+      "COLI_LOOKUP": "0",
+      "Q38_MTP": "0",
+      "COLI_VULKAN": "1",
+      "COLI_VK_CHAIN": "0",
+      "COLI_VK_DENSE": "0",
+      "Q38_EXPERT_INT4": "1",
+      "Q38_MTP_DRAFTS": "3",
+      "SNAP": "/root/colibri-test/models/qwen38-flash-next-fp8",
+      "COLI_USAGE": "fresh decompressed copy of attached history.usage.gz",
+      "N_NEW": "128"
+    },
+    "samples": {
+      "tok_s": [
+        2.93,
+        2.93,
+        2.9
+      ]
+    },
+    "median_tok_s": 2.93,
+    "quality": {
+      "method": "All six generated texts are byte-identical; SHA-256 3ff36e598e3e0651a0c9349193df0c47804fbb8bbc54826ea935ec090bb52b9e",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/vulkan-qwen38-mtp-2026-10-05/baseline.json",
+      "sha256": "9cb9ab1dd599dee0540ad2a07aa31b7e9109524e96f49d9ec88eaf2fa9a8ab80"
+    }
+  },
+  "trial": {
+    "config": {
+      "OMP_NUM_THREADS": "8",
+      "COLI_NO_OMP_TUNE": "1",
+      "COLI_TIMERS": "1",
+      "VK_ICD_FILENAMES": "/usr/share/vulkan/icd.d/radeon_icd.json",
+      "COLI_LOOKUP": "0",
+      "Q38_MTP": "1",
+      "COLI_VULKAN": "1",
+      "COLI_VK_CHAIN": "0",
+      "COLI_VK_DENSE": "0",
+      "Q38_EXPERT_INT4": "1",
+      "Q38_MTP_DRAFTS": "3",
+      "SNAP": "/root/colibri-test/models/qwen38-flash-next-fp8",
+      "COLI_USAGE": "fresh decompressed copy of attached history.usage.gz",
+      "N_NEW": "128"
+    },
+    "samples": {
+      "tok_s": [
+        3.49,
+        3.5,
+        3.47
+      ]
+    },
+    "median_tok_s": 3.49,
+    "quality": {
+      "method": "All six generated texts are byte-identical; SHA-256 3ff36e598e3e0651a0c9349193df0c47804fbb8bbc54826ea935ec090bb52b9e",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/vulkan-qwen38-mtp-2026-10-05/trial.json",
+      "sha256": "496040ccc2209b2645cd75922a3069ffdc6e717bd5f7ef330b608041e6615aa6"
+    }
+  },
+  "outcome": "improvement",
+  "history_compression": "gzip; history_hash is SHA-256 of the decompressed bytes",
+  "prompt_encoding": "prompt.json text field, encoded as UTF-8; preserves the original trailing newlines"
+}

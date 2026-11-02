@@ -1,0 +1,212 @@
+# qwen36 CUDA chain, no promotion brake without a heat file: raw evidence (2026-10-26)
+# Why the change: dev's CLI (c/qwen36 256 4 <prompt>), the brake set by COLI_CUDA_CHAIN_PROMOTE_HITS, one
+#   process a run, COLI_TEMP=0 COLI_TIMERS=1 NOSTREAM=1 CUDA_EXPERT_GB=auto; the T4 with OMP at its 4 physical
+#   cores, the RTX 3070 with the owner's settings as rtx3070.txt (its command sets OMP_NUM_THREADS twice:
+#   the second, 12, is the one that counts). The heat file: one run on a 652-token question about MoE
+#   offloading writes it, frozen; every run that takes it starts from a fresh copy.
+#   S0  no heat file, a 41-token story: a first run, the bench, every new machine
+#   S1  the MoE heat, the story: a conversation away from the history
+#   S2  the MoE heat, the MoE question: the history fits it (the case the brake is for)
+#   each at 200 and 600 generated tokens: the brake at 75 (dev, the variable unset), 0, 0, 75, then 85 once.
+#   ms a token = step() total; decode hits = the tier's decode VRAM hit rate; text = sha256 of stdout.
+# Then the PR's CLI once a case on each card, the same way: the wiring, not a measure.
+#   prompts: story sha256 cb8b63fc451ed6dafa845ea65056000d32dd0c8132e1ee7c71a4cc50c259a297,
+#   MoE question sha256 9fa7345a67e6df7cdaf19385fd351051394332c94c733cdee04e86fba19109b4.
+
+===== phase 1, T4 (a Google Colab T4 high-RAM VM of the same shape as normal.txt's, an hour before it; 6605 experts on the card)
+# heat file heat_moe.bin sha256 c3d2c1f7905e2e27e6ee1b710dad7bd0c75abeadc35fa11216835463f0323027
+# command: cd colibri && COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_NUM_THREADS=4 OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close SNAP=q36 COLI_TEMP=0 COLI_TIMERS=1 NOSTREAM=1 N_NEW=200 colibri/c/qwen36 256 4 prompt/storia.txt
+| run | hits var | ms/token | tok/s | decode hits % | promoted | braked | staging ms | heat | text |
+|---|---|---|---|---|---|---|---|---|---|
+| 00-heat-moe | 75 (dev) | 24.6 | 31.52 | 77.7 | 216 | 145 | 112.9 | False | 740f7b97d44b84be |
+| S0-200-dev-1 | 75 (dev) | 24.3 | 34.57 | 78.0 | 188 | 152 | 103.7 | False | 514f6db2e33d2282 |
+| S0-200-0-2 | 0 | 22.6 | 36.71 | 85.7 | 787 | 0 | 313.9 | False | 514f6db2e33d2282 |
+| S0-200-0-3 | 0 | 22.6 | 36.73 | 85.7 | 787 | 0 | 318.5 | False | 514f6db2e33d2282 |
+| S0-200-dev-4 | 75 (dev) | 24.4 | 34.64 | 78.0 | 188 | 152 | 102.4 | False | 514f6db2e33d2282 |
+| S0-200-85-5 | 85 | 22.4 | 37.06 | 83.7 | 432 | 91 | 183.1 | False | 514f6db2e33d2282 |
+| S0-600-dev-1 | 75 (dev) | 23.7 | 39.37 | 78.8 | 188 | 552 | 100.3 | False | 4fa4679123909044 |
+| S0-600-0-2 | 0 | 19.6 | 46.90 | 93.9 | 1542 | 0 | 546.3 | False | 20011f82b03b8366 |
+| S0-600-0-3 | 0 | 19.8 | 46.38 | 93.9 | 1542 | 0 | 564.5 | False | 20011f82b03b8366 |
+| S0-600-dev-4 | 75 (dev) | 24.0 | 38.79 | 78.8 | 188 | 552 | 100.6 | False | 4fa4679123909044 |
+| S0-600-85-5 | 85 | 21.3 | 43.53 | 86.9 | 528 | 467 | 223.1 | False | b96b85f464d2cdcc |
+| S1-200-dev-1 | 75 (dev) | 22.3 | 37.56 | 81.1 | 240 | 139 | 119.4 | True | 514f6db2e33d2282 |
+| S1-200-0-2 | 0 | 21.4 | 39.05 | 88.2 | 701 | 0 | 274.0 | True | 47939c47fc8be7ac |
+| S1-200-0-3 | 0 | 21.4 | 39.07 | 88.2 | 701 | 0 | 275.7 | True | 47939c47fc8be7ac |
+| S1-200-dev-4 | 75 (dev) | 22.4 | 37.61 | 81.1 | 240 | 139 | 120.7 | True | 514f6db2e33d2282 |
+| S1-200-85-5 | 85 | 21.9 | 38.25 | 85.7 | 372 | 106 | 167.1 | True | 47939c47fc8be7ac |
+| S1-600-dev-1 | 75 (dev) | 21.0 | 44.14 | 84.8 | 240 | 539 | 123.0 | True | 09e62107d331979f |
+| S1-600-0-2 | 0 | 19.3 | 47.58 | 95.1 | 1113 | 0 | 431.9 | True | be203f00d988c9ae |
+| S1-600-0-3 | 0 | 19.4 | 47.42 | 95.1 | 1113 | 0 | 434.1 | True | be203f00d988c9ae |
+| S1-600-dev-4 | 75 (dev) | 20.9 | 44.28 | 84.8 | 240 | 539 | 121.7 | True | 09e62107d331979f |
+| S1-600-85-5 | 85 | 19.9 | 46.51 | 89.7 | 372 | 506 | 166.7 | True | 3a1883c90bd922c4 |
+| S2-200-dev-1 | 75 (dev) | 17.9 | 41.69 | 99.3 | 0 | 199 | 0.1 | True | 6ab62118260aab21 |
+| S2-200-0-2 | 0 | 18.3 | 40.97 | 99.2 | 182 | 0 | 94.5 | True | 6ab62118260aab21 |
+| S2-200-0-3 | 0 | 18.2 | 41.17 | 99.2 | 182 | 0 | 93.9 | True | 6ab62118260aab21 |
+| S2-200-dev-4 | 75 (dev) | 17.6 | 41.99 | 99.3 | 0 | 199 | 0.1 | True | 6ab62118260aab21 |
+| S2-200-85-5 | 85 | 17.6 | 42.07 | 99.3 | 0 | 199 | 0.1 | True | 6ab62118260aab21 |
+| S2-600-dev-1 | 75 (dev) | 18.0 | 49.29 | 98.0 | 0 | 599 | 0.3 | True | cd73aab08e1c5b40 |
+| S2-600-0-2 | 0 | 18.4 | 48.53 | 98.8 | 500 | 0 | 206.5 | True | cd73aab08e1c5b40 |
+| S2-600-0-3 | 0 | 18.3 | 48.64 | 98.8 | 500 | 0 | 204.4 | True | cd73aab08e1c5b40 |
+| S2-600-dev-4 | 75 (dev) | 18.1 | 48.98 | 98.0 | 0 | 599 | 0.2 | True | cd73aab08e1c5b40 |
+| S2-600-85-5 | 85 | 18.3 | 48.71 | 98.0 | 0 | 599 | 0.2 | True | cd73aab08e1c5b40 |
+# logs (paths relative to the machine's root dir), by their sha256:
+#   00-heat-moe.log 9a33f235fdf90d5e51e46d4cce0fbb42cde2c4e06e9bb46cad80baa59737b76c
+#   S0-200-0-2.log 462966dfa3d23acfba832c567b0324005ee656c2f887ef26ab5acd6d092311b9
+#   S0-200-0-3.log c0d1802f0899c1c610385b2dbbab564248603c79a538661e8cbaf81e45964a06
+#   S0-200-85-5.log 737aa38cff2d6b4622e7136209840c50d9cda2f2e64703d568aa3c0b3197d653
+#   S0-200-dev-1.log 33e04a4ef4a102220aba5125797664a0e619b308eae7a182906274c6c6d5c724
+#   S0-200-dev-4.log d8708916193443ff1abf3ff0e0435860c93fac3b5974f57ab9868cf4b442c31c
+#   S0-600-0-2.log b91b6ff0d9dec368fdc4d6806b5337158e3e0da92eb5b6fbd5d8ca9daf0f1c63
+#   S0-600-0-3.log d4be5d8c9bf7e4505ead2ca13e42016b8841ec5bfe85ef506b1957d2bb56bf60
+#   S0-600-85-5.log 12efbda298092a2084fe30aec144bb1ceeda080bd6a420e5ec3e0bf6b3cb7a31
+#   S0-600-dev-1.log dc148095bf399100c67ee1ec89e581db28ba68e44d073c2e6391a4d509f2991a
+#   S0-600-dev-4.log 19b9cb71124abb5d50c2f29a185e1ad0b246e3714cb9b207281fdaae52b4eb8a
+#   S1-200-0-2.log 51b245cc5d6bfcc46e3abde5ad6d309240e57220e9977da9e541bdb9e7c311e9
+#   S1-200-0-3.log 9f569d845db17233e00375438404d0379c866fe7152c168dc4f6ef220fd8595c
+#   S1-200-85-5.log 09834924a9e8bfa03a45ae7e224b95122aa7962ba21e32e620b69460f475f1c3
+#   S1-200-dev-1.log 8cfc71e4d1706f1f5ca5e720d1aea7ba41a6a01d9586b0c13fcd3175037f50fb
+#   S1-200-dev-4.log 94c70901632539f835cd9b70256caeebcafebd3bb32e533ba98290caad50b18f
+#   S1-600-0-2.log 2b469fa240eecdfe289d53ebc739e18a1a1cbd13c776d8ff6349a8302d9e01c8
+#   S1-600-0-3.log cfe59d7c0f320dc5fb0ea8d03739574a1bfe88e05b049ee58c7f247f6d4245b3
+#   S1-600-85-5.log fa49c7fa423855301a9ad6786a77251003fbb7e309e6b2cfba11b57db42b56e3
+#   S1-600-dev-1.log 28ed84457c529a113666e238589dc666c27ece55a40eb4c58ddd2b66931a5cef
+#   S1-600-dev-4.log 5db27ea0c3bca98d8be16498ee7976cfc906ea6a28594b50fe96b93dd86b8255
+#   S2-200-0-2.log ded52680bf69881d6ec05d207103490eb9f021715446225c9508896c15f2d1a3
+#   S2-200-0-3.log f37a402fe7666f0e53b0dccd9f83ec780d97bb46a4d3b83995d37fb50fe78e0c
+#   S2-200-85-5.log c5fff3c1d3ee9acfba39ac4c639e3b643c315aadaccc03bb9acdb895322740a7
+#   S2-200-dev-1.log aef3b67f807414ce51be1747248451ed8bf961313ab241b0ca6dc1875d995d93
+#   S2-200-dev-4.log 91ae6047d084a7cd6d22afc72c2a4b3100177cd3d87054745b175ba0e3489a6a
+#   S2-600-0-2.log 5f553f6c93bbdf28cd098560ff70934bdbde58b7d33df1a9530a87bacc4c0901
+#   S2-600-0-3.log 8a08b5be9c7b4a49f47a1f4e227c84cac2d8cdb7ff049e791a825ad37967d5d2
+#   S2-600-85-5.log 74924e756928e673799d4e56213d5d7d657fc98d90b154996e64e91c2ca15e6b
+#   S2-600-dev-1.log 689748606b35c2a1c198d612f98e16d63da45526ac8fea0ce3048c5bda48c719
+#   S2-600-dev-4.log 91f80644e063ebf514cd7ed766763f2b219c8329d269aaf08c5c374f5a248e07
+
+===== the PR's CLI, T4 (normal.txt's VM, before its runs)
+# S0-200: log sha256 2f0418e98a06544d7a8aed1291dc48d53faa86e983086d50b6b9ed689fd73709
+# rc=0
+text 514f6db2e33d2282
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 43.6 s
+[chain] qwen36: up to 4 experts a step promoted into the card by this conversation's routes, the coldest residents giving way, no brake (no heat file: the warm start's set is no conversation's) (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+[timers]   step() total: 22.6 ms/token (outside the phases: 22.6)
+[qtier] decode VRAM hit rate: 85.7 % (54585 hits, 9095 misses after the prefill)
+Speed: 36.63 tok/s (5.5s for 200 tokens)
+[chain] qwen36: 787 experts promoted into the card by this conversation's routes (783 landed), 0 steps braked; the table read whole 1 times, 1586 entries patched; 332.4 ms choosing and staging, 17.7 ms patching
+# S0-600: log sha256 f07f789b06fe48128f35e5872d6a9ee4dcbe969ec8551665f67b8331b11fedd1
+# rc=0
+text 20011f82b03b8366
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 17.6 s
+[chain] qwen36: up to 4 experts a step promoted into the card by this conversation's routes, the coldest residents giving way, no brake (no heat file: the warm start's set is no conversation's) (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+[timers]   step() total: 19.6 ms/token (outside the phases: 19.6)
+[qtier] decode VRAM hit rate: 93.9 % (179942 hits, 11738 misses after the prefill)
+Speed: 46.85 tok/s (12.8s for 600 tokens)
+[chain] qwen36: 1542 experts promoted into the card by this conversation's routes (1540 landed), 0 steps braked; the table read whole 1 times, 3154 entries patched; 635.3 ms choosing and staging, 42.6 ms patching
+# S2-200: log sha256 d043c3792752e3edadfe81282ca1c8d916e38395504361eb1ac985cd8035c754
+# rc=0
+text 6ab62118260aab21
+[qtier] HEAT_FILE loaded: fase3/cli/heat_run.bin
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 9.2 s
+[chain] qwen36: up to 4 experts a step promoted into the card by this conversation's routes, the coldest residents giving way, none while the last 64 steps hit 75 % or more (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+[timers]   step() total: 17.1 ms/token (outside the phases: 17.1)
+[qtier] decode VRAM hit rate: 99.3 % (63246 hits, 434 misses after the prefill)
+Speed: 43.29 tok/s (4.6s for 200 tokens)
+[chain] qwen36: 0 experts promoted into the card by this conversation's routes (0 landed), 199 steps braked; the table read whole 1 times, 0 entries patched; 0.1 ms choosing and staging, 2.7 ms patching
+
+===== phase 1, RTX 3070 (rtx3070.txt's machine, before its runs; 2654 experts on the card)
+# heat file heat_moe.bin sha256 939b3ad5c966c71ffe170df5d9580aa17b680cb38f4a8ea226d81dac3840659d
+# command: cd colibri && COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_NUM_THREADS=64 OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close SNAP=q36 COLI_TEMP=0 COLI_TIMERS=1 NOSTREAM=1 N_NEW=200 COLI_PLACE=auto COLI_TRUNK_PROBE=0 OMP_NUM_THREADS=12 colibri/c/qwen36 256 4 prompt/storia.txt
+| run | hits var | ms/token | tok/s | decode hits % | promoted | braked | staging ms | heat | text |
+|---|---|---|---|---|---|---|---|---|---|
+| 00-heat-moe | 75 (dev) | 18.6 | 43.43 | 53.7 | 796 | 0 | 181.3 | False | dcd1ce4a7a2cfbb9 |
+| S0-200-dev-1 | 75 (dev) | 17.4 | 47.71 | 59.6 | 796 | 0 | 178.2 | False | 36d9f3929d7312b7 |
+| S0-200-0-2 | 0 | 17.6 | 47.29 | 59.0 | 796 | 0 | 183.2 | False | 514f6db2e33d2282 |
+| S0-200-0-3 | 0 | 17.5 | 47.40 | 59.6 | 796 | 0 | 182.0 | False | 36d9f3929d7312b7 |
+| S0-200-dev-4 | 75 (dev) | 17.5 | 47.48 | 59.6 | 796 | 0 | 181.1 | False | 36d9f3929d7312b7 |
+| S0-200-85-5 | 85 | 17.5 | 47.45 | 59.6 | 796 | 0 | 179.8 | False | 36d9f3929d7312b7 |
+| S0-600-dev-1 | 75 (dev) | 14.7 | 62.32 | 72.9 | 1184 | 303 | 256.4 | False | 4bf6cdc1b7416bfc |
+| S0-600-0-2 | 0 | 14.5 | 63.35 | 76.7 | 1798 | 0 | 408.3 | False | c1219fd189b3dda4 |
+| S0-600-0-3 | 0 | 14.5 | 63.23 | 76.7 | 1798 | 0 | 409.8 | False | c1219fd189b3dda4 |
+| S0-600-dev-4 | 75 (dev) | 14.9 | 61.68 | 71.8 | 1132 | 316 | 249.2 | False | be0b7ec804be2589 |
+| S0-600-85-5 | 85 | 14.4 | 63.81 | 76.0 | 1615 | 192 | 334.4 | False | 1dcb8c35daa960e2 |
+| S1-200-dev-1 | 75 (dev) | 16.8 | 49.22 | 62.2 | 768 | 7 | 174.7 | True | 47939c47fc8be7ac |
+| S1-200-0-2 | 0 | 16.8 | 49.22 | 62.2 | 796 | 0 | 182.1 | True | 47939c47fc8be7ac |
+| S1-200-0-3 | 0 | 17.2 | 48.25 | 62.2 | 796 | 0 | 194.8 | True | 47939c47fc8be7ac |
+| S1-200-dev-4 | 75 (dev) | 17.2 | 48.30 | 61.9 | 796 | 0 | 195.2 | True | de5f8c3b34d76645 |
+| S1-200-85-5 | 85 | 17.1 | 48.55 | 62.2 | 796 | 0 | 193.1 | True | 47939c47fc8be7ac |
+| S1-600-dev-1 | 75 (dev) | 14.4 | 63.64 | 72.5 | 1048 | 337 | 228.4 | True | ba03505ec22772b8 |
+| S1-600-0-2 | 0 | 14.1 | 64.92 | 77.3 | 1424 | 0 | 365.9 | True | 9329e0d5fb7e4367 |
+| S1-600-0-3 | 0 | 14.2 | 64.64 | 77.3 | 1424 | 0 | 375.0 | True | 9329e0d5fb7e4367 |
+| S1-600-dev-4 | 75 (dev) | 14.7 | 62.69 | 72.5 | 1048 | 337 | 230.1 | True | ba03505ec22772b8 |
+| S1-600-85-5 | 85 | 14.2 | 64.55 | 76.8 | 1379 | 154 | 328.4 | True | ba03505ec22772b8 |
+| S2-200-dev-1 | 75 (dev) | 13.0 | 57.67 | 81.1 | 0 | 199 | 0.1 | True | a790063040d95e36 |
+| S2-200-0-2 | 0 | 13.9 | 54.95 | 81.0 | 412 | 0 | 151.3 | True | 740f7b97d44b84be |
+| S2-200-0-3 | 0 | 13.8 | 55.34 | 81.0 | 412 | 0 | 141.4 | True | 740f7b97d44b84be |
+| S2-200-dev-4 | 75 (dev) | 13.0 | 57.86 | 81.1 | 0 | 199 | 0.1 | True | a790063040d95e36 |
+| S2-200-85-5 | 85 | 13.9 | 54.87 | 81.1 | 412 | 12 | 143.9 | True | 740f7b97d44b84be |
+| S2-600-dev-1 | 75 (dev) | 13.9 | 64.84 | 78.1 | 469 | 465 | 131.6 | True | efed01f4957b13aa |
+| S2-600-0-2 | 0 | 13.7 | 65.49 | 79.5 | 720 | 0 | 308.6 | True | b5c849cf9b50571f |
+| S2-600-0-3 | 0 | 13.8 | 65.36 | 79.5 | 720 | 0 | 308.8 | True | b5c849cf9b50571f |
+| S2-600-dev-4 | 75 (dev) | 13.7 | 65.74 | 78.1 | 469 | 465 | 121.8 | True | efed01f4957b13aa |
+| S2-600-85-5 | 85 | 13.8 | 65.38 | 79.5 | 724 | 12 | 308.4 | True | b5c849cf9b50571f |
+# logs (paths relative to the machine's root dir), by their sha256:
+#   00-heat-moe.log 8ce381725213cec12c85f039bd5a6749fa2c1adabf394a9af073d7a2c037428e
+#   S0-200-0-2.log 4709f2d5312f3d4c226128273c31b6b770126c14886d3a1198777534a7f90a7f
+#   S0-200-0-3.log d0e5942aa5f4452f797ab5c4f861176222181c57b761261bd902b8984fb2f827
+#   S0-200-85-5.log 9ebb5a88de3239df06d726ab3a76ca480ee0cccbf94111c2ca88f5a29575fcb7
+#   S0-200-dev-1.log 87c8eb30b71d17c9a1191b568bec35be0f8c9cf4462ad05740401ddccc6b0feb
+#   S0-200-dev-4.log 0978aca8649e963ef82be2de51295b5e54c8be4eb945a0b357296aa91eeff535
+#   S0-600-0-2.log 52eaaa30dad89f0a860851f6a6df1ca45ae7e3ea282cc717037c801ed8aeb9e9
+#   S0-600-0-3.log 000a1b30287c69afd6e22c5e38b5c633d988a55fc5432ffa23e6612040144507
+#   S0-600-85-5.log 58323abe186f0a07d30e764148afe84533dd2473e429981270e61f8a60ce96bb
+#   S0-600-dev-1.log b2554bdc2a1055fbe3a4ad3ee55675a15c61e03bd08649eae044d31a14873d60
+#   S0-600-dev-4.log 80ccde56950152b4763eb6c4e7842bca875415ea9c5ae974160cd6d2ac3bdf85
+#   S1-200-0-2.log 28aa412265523fdd61986806fe507c7a2fb9c5868cf8d9845ef0c4d6e8e0e673
+#   S1-200-0-3.log 8aa4bf8160a7a0091f20034f442b4824ca8e2b0efd67ff015c923ef9082da5bf
+#   S1-200-85-5.log 96c6d4a64c7a8d5efff0457509a6003638d9cb6f9c8dcd3d806d25fbf0c4fb1a
+#   S1-200-dev-1.log d547bfec9531c9ee13706d31419f7c80caf82a0465f3a16708aa3605a2263610
+#   S1-200-dev-4.log 2ed653056d233c660749608dba7c294096ea333230a7fd121766dc1460e99d58
+#   S1-600-0-2.log 0e57c451dea024611940634e3710b3f2d22007c98a062ceda803e455fa34ef14
+#   S1-600-0-3.log d93f83e75f2504375c09ca771c521b802f23fa3a87e58efe94d5eb76ec765ee5
+#   S1-600-85-5.log a9e8822e91c3ea36a6e3b23af8dd18b07fe08384ac8d91719ab6adef0d7a5463
+#   S1-600-dev-1.log 8bdc4a2fc4826f96433f1a9c37aee0462b551284c77cc85cca546c07a42e0b4d
+#   S1-600-dev-4.log afa4ba1342989d5b62d7ce49567eed2acece04ec82295180b95fddabb2cf6fc9
+#   S2-200-0-2.log 93ebddf642e70f51ac51b650c0facbbdb308779a36ab7fd4c62fdb221566cb1b
+#   S2-200-0-3.log 8340d6d0137919eac5166d733e4aeca96f01254f1ba82c4f491e0b9b282e31f0
+#   S2-200-85-5.log 36f5b2ec2f66005250838f9b939456c5e14b5e3f8ebf374d6878b9d57cd298b7
+#   S2-200-dev-1.log fd60c1a822d20152b2d52df5ba693b7ade2090c9f3eca6805dbdd1989fbd8c4d
+#   S2-200-dev-4.log c0ea1941aec11a6d36fa9453fe65d06c20a9657af5ea9fa9c8f51a1fd5e1ced3
+#   S2-600-0-2.log 67b9270875a4114214378b91be851f8a2abe0c6ac87788ce9f76d55fb88d8597
+#   S2-600-0-3.log a52dfd95ee047294e6a6adf2f1da98836633c860a7f7b604218e62eb692656ae
+#   S2-600-85-5.log db28f254043761afbb0598800405c02ba2f60b803064d9095549fea6cfd4a2e2
+#   S2-600-dev-1.log d83b49b372ea2c8fe4e03b7597b444beca5ff0c15b262388f0980b7b483e97a6
+#   S2-600-dev-4.log 85406cc311c480fcfbf8d14d07f79dd4da14ebda5da77456b52ee9e2a3519fb4
+
+===== the PR's CLI, RTX 3070 (rtx3070.txt's machine, before its runs)
+# S0-200: log sha256 2a0fe2342ed08f60d8c4c11c349995ebd8ab604df822903303a3192baeaec5d3
+# rc=0
+text 36d9f3929d7312b7
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 2654 in VRAM -- 8.5 s
+[chain] qwen36: up to 4 experts a step promoted into the card by this conversation's routes, the coldest residents giving way, no brake (no heat file: the warm start's set is no conversation's) (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+[timers]   step() total: 17.6 ms/token (outside the phases: 17.6)
+[qtier] decode VRAM hit rate: 59.6 % (37947 hits, 25733 misses after the prefill)
+Speed: 47.19 tok/s (4.2s for 200 tokens)
+[chain] qwen36: 796 experts promoted into the card by this conversation's routes (792 landed), 0 steps braked; the table read whole 1 times, 1604 entries patched; 185.9 ms choosing and staging, 14.9 ms patching
+# S0-600: log sha256 c48d7f8dc1e8b90bc3c137682896db3d79ee994cfc59e5edc086e0152a5d9d5f
+# rc=0
+text c1219fd189b3dda4
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 2654 in VRAM -- 8.5 s
+[chain] qwen36: up to 4 experts a step promoted into the card by this conversation's routes, the coldest residents giving way, no brake (no heat file: the warm start's set is no conversation's) (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+[timers]   step() total: 14.5 ms/token (outside the phases: 14.5)
+[qtier] decode VRAM hit rate: 76.7 % (147063 hits, 44617 misses after the prefill)
+Speed: 63.18 tok/s (9.5s for 600 tokens)
+[chain] qwen36: 1798 experts promoted into the card by this conversation's routes (1796 landed), 0 steps braked; the table read whole 1 times, 3659 entries patched; 409.1 ms choosing and staging, 34.5 ms patching
+# S2-200: log sha256 2bc8b5ceea128f26567a3f7f185d04efe569384b291725b9022c59a781eb28fe
+# rc=0
+text a790063040d95e36
+[qtier] HEAT_FILE loaded: fase3/cli/heat_run.bin
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 2654 in VRAM -- 8.1 s
+[chain] qwen36: up to 4 experts a step promoted into the card by this conversation's routes, the coldest residents giving way, none while the last 64 steps hit 75 % or more (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)
+[timers]   step() total: 13.0 ms/token (outside the phases: 13.0)
+[qtier] decode VRAM hit rate: 81.1 % (51668 hits, 12012 misses after the prefill)
+Speed: 57.66 tok/s (3.5s for 200 tokens)
+[chain] qwen36: 0 experts promoted into the card by this conversation's routes (0 landed), 199 steps braked; the table read whole 1 times, 6 entries patched; 0.1 ms choosing and staging, 1.4 ms patching

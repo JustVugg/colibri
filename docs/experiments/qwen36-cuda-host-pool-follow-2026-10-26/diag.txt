@@ -1,0 +1,191 @@
+# qwen36 CUDA tier, the host pool following the card's residents: why, from diagnostic builds (2026-10-26)
+# The same Google Colab T4 high-RAM VM as normal.txt, after the runs. The bench leaves the engine without its
+# report, so two builds with diagnostic lines (the patches below, not part of this change) ran the measures'
+# commands once each:
+#   [t1d] at each switch between prompt chunks (more than 32 rows) and decode steps: the tier's epoch (each
+#         residency change moves it by one), the chain's layer steps (one for each layer a step runs in the
+#         chain's frame), the expert-row pairs the host computed there, the chain's promotions and the steps
+#         its brake held. A prompt of 32 rows or fewer counts as decode here (the chat's turns 2 and 4).
+#   [t1]  this change only: each follow, the chunk's rows, the experts that joined and left the pool, its ms.
+# Cases: pr-base (normal.txt's command), pr-agente and dev-agente (sessions.txt's agent), pr-chat (its chat).
+# The agent's turns from the [t1d] lines below: the residency changes while the turn's prompt ran (epoch at
+#   its 'decode' line less epoch at its 'chunk' line), and the share of the decode's routes the host computed
+#   (pairs / (layer steps * 8) from its 'decode' line to the next turn's 'chunk' line; every step one row):
+#   turn | origin/dev: changes, host share | this change: changes, host share
+#      1 |    0, 29.9 % |    0, 29.9 %
+#      2 |  112, 21.3 % |  114, 21.2 %
+#      3 |  240, 22.3 % |   34, 22.1 %
+#      4 |  134, 21.9 % |  136, 20.0 %
+#      5 |  121, 22.0 % |  122, 18.0 %
+#      6 |   72, 19.2 % |   72, 15.9 %
+#      7 |   28, 21.0 % |   16, 20.3 %
+
+===== diag-pr.patch, on this change (sha256 c4cf03d45b5dbe095a426f0f0203dedc9a1cdf6a9ee888fc5009c83765555fff)
+diff --git a/c/qwen36_cuda_chain.h b/c/qwen36_cuda_chain.h
+index 80536b77..bcf8eb31 100644
+--- a/c/qwen36_cuda_chain.h
++++ b/c/qwen36_cuda_chain.h
+@@ -1316,10 +1316,15 @@ static void q36cc_follow(Q36CChain *ch, int n) {
+     double th = tm_now(); int hj, hl;
+     if (qt_chain_host_follow(&hj, &hl)) { ch->hp_follows++; ch->hp_joined += (unsigned)hj; ch->hp_left += (unsigned)hl; ch->dm_stage_dirty = 1; }
+     ch->hp_ms += tm_now() - th;
++    fprintf(stderr, "[t1] follow: n=%d, %d joined, %d left, %.3f ms\n", n, hj, hl, tm_now() - th);
+ }
+ /* the step's buffers, and the table when the tier's residents moved (the tier held) */
+ static int q36cc_dm_begin(Q36CChain *ch, Model *m, int n) {
+     Cfg *c = &m->c; int L = c->n_layers, E = c->n_experts, K = c->topk, D = c->hidden, I = c->inter;
++    { static int big0 = -1; int big = n > Q36CC_STAGE_ROWS;
++      if (big != big0) fprintf(stderr, "[t1d] %s n=%d: epoch %u steps %llu pairs %llu promoted %llu braked %llu\n",
++                               big ? "chunk" : "decode", n, qt_chain_epoch(), ch->dm_steps, ch->dm_pairs, ch->dm_promoted, ch->pr_braked);
++      big0 = big; }
+     size_t r = (size_t)ch->rows, ne = (size_t)L * E, F = sizeof(float);
+     if (!ch->dm_host) {
+         ch->dm_host = malloc(ne * sizeof(CcExpert)); ch->dm_res = calloc(ne, 1); ch->dm_part = calloc(L, sizeof(int));
+
+===== diag-dev.patch, on origin/dev (sha256 c03af061910c6b30c200a34925c30456b2d2cc936492a8113c7ccb0a4126dea7)
+diff --git a/c/qwen36_cuda_chain.h b/c/qwen36_cuda_chain.h
+index dcde6e48..dec14ae8 100644
+--- a/c/qwen36_cuda_chain.h
++++ b/c/qwen36_cuda_chain.h
+@@ -1303,6 +1303,10 @@ static int q36cc_stage_table(Q36CChain *ch, Model *m) {
+ /* the step's buffers, and the table when the tier's residents moved (the tier held) */
+ static int q36cc_dm_begin(Q36CChain *ch, Model *m, int n) {
+     Cfg *c = &m->c; int L = c->n_layers, E = c->n_experts, K = c->topk, D = c->hidden, I = c->inter;
++    { static int big0 = -1; int big = n > Q36CC_STAGE_ROWS;
++      if (big != big0) fprintf(stderr, "[t1d] %s n=%d: epoch %u steps %llu pairs %llu promoted %llu braked %llu\n",
++                               big ? "chunk" : "decode", n, qt_chain_epoch(), ch->dm_steps, ch->dm_pairs, ch->dm_promoted, ch->pr_braked);
++      big0 = big; }
+     size_t r = (size_t)ch->rows, ne = (size_t)L * E, F = sizeof(float);
+     if (!ch->dm_host) {
+         ch->dm_host = malloc(ne * sizeof(CcExpert)); ch->dm_res = calloc(ne, 1); ch->dm_part = calloc(L, sizeof(int));
+
+===== pr-base
+----- pr-base.csv (sha256 f9489750b8566c1babd2b1cc6dd077c5c53f1cd2d383ef8ae7632348b9394dd5)
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.839,76.27,32,64.5,40.076,0,0.00,ffb816333a929871,5cb23346ab6be1d8,2.69296,0.469
+512,512,1.140,448.98,32,21.7,47.544,0,0.00,7d641cca01aa1fc1,7a8848450b863c49,2.93284,0.469
+----- pr-base.err (sha256 be111e1a6fd687760f66c262cea89b5336fdcd315e95e9d127ca204f420c2fdb), the diagnostic, turn, peak RSS and host pool lines
+[qtier] host pool: 3635 experts of the RAM cache page-locked for the device to copy a prompt chunk's experts from (COLI_CUDA_HOST_POOL=0 off)
+[t1d] chunk n=64: epoch 10240 steps 0 pairs 0 promoted 0 braked 0
+[t1d] decode n=1: epoch 10240 steps 40 pairs 0 promoted 0 braked 0
+[t1d] chunk n=512: epoch 10436 steps 1320 pairs 2320 promoted 96 braked 8
+[t1] follow: n=512, 98 joined, 98 left, 58.262 ms
+[t1d] decode n=1: epoch 10475 steps 1360 pairs 2320 promoted 96 braked 8
+[bench] peak RSS 19.47 GB
+[qtier] host pool: 3635 experts (5.99 GB of the RAM cache) page-locked for the device's copies
+----- pr-base.steps: sha256 46658af2e76b76efbe138737a6a28ab072b63eedd1d5412f5d7ffa06c711da4f
+
+===== pr-agente
+----- pr-agente.csv (sha256 d81702bbfe5ab421cb444f6b13e49da05eaf2b888730fafa75b8a15a09c5384f)
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+663,663,1.443,459.56,57,63.5,34.763,0,0.00,be02ae1c335d12d7,a9232a16bd227f2d,1.73837,0.737,0,720,19.43,0,1,0,1
+1954,1234,1.924,641.41,32,28.2,39.310,0,0.00,8f1ac4fa93f5e4c8,7d6e0f6d44b5cecc,0.02278,1.000,720,1986,19.59,32,1,1,0
+4248,2262,4.202,538.32,87,26.0,40.068,0,0.00,f65266b1a139b999,159540b062b93762,1.11908,0.713,1986,4335,19.68,0,1,0,1
+5741,1406,2.794,503.21,44,25.0,40.895,0,0.00,4089e0ab09a65613,23d625e741190180,0.22694,0.932,4335,5785,19.75,0,1,0,1
+7083,1298,3.059,424.34,54,28.9,41.381,0,0.00,b5323a108f247d20,24b73c35bded487b,1.08494,0.796,5785,7137,19.81,1,1,0,1
+8041,904,2.569,351.84,24,24.7,41.854,0,0.00,e46952704c12f61f,331c8c8593842500,0.28688,0.875,7137,8065,19.86,0,1,0,1
+8413,348,1.485,234.28,467,28.9,39.099,0,0.00,72873cd08aee0f0b,c005de8ea3c4e76e,0.84268,0.762,8065,8880,19.90,0,1,0,1
+8915,35,0.923,37.92,186,23.3,42.183,0,0.00,fbac4211eba2405b,1ac06551ca8a243e,0.88590,0.720,8880,9101,19.93,0,0,0,1
+----- pr-agente.err (sha256 784198d7ea6e9f835cf524a8b13121c8361495611d4617527d1852ab6c1bbbba), the diagnostic, turn, peak RSS and host pool lines
+[qtier] host pool: 3635 experts of the RAM cache page-locked for the device to copy a prompt chunk's experts from (COLI_CUDA_HOST_POOL=0 off)
+[t1d] chunk n=663: epoch 10240 steps 0 pairs 0 promoted 0 braked 0
+[t1] follow: n=663, 0 joined, 0 left, 0.078 ms
+[t1d] decode n=1: epoch 10240 steps 40 pairs 0 promoted 0 braked 0
+[bench] turn 1: prompt 663 tokens (0 reused, 663 read in 1.44 s), answer 57 tokens: first step 64 ms, then 34.76 tok/s; nll 1.7384, top1 0.737, greedy prefix 0 of 57, tool calls exact 0 of 1, stop yes; kv_len 720, peak RSS 19.43 GB
+[t1d] chunk n=1234: epoch 10700 steps 2320 pairs 5455 promoted 228 braked 0
+[t1] follow: n=1234, 232 joined, 228 left, 147.152 ms
+[t1d] decode n=1: epoch 10814 steps 2360 pairs 5455 promoted 228 braked 0
+[bench] turn 2: prompt 1954 tokens (720 reused, 1234 read in 1.92 s), answer 32 tokens: first step 28 ms, then 39.31 tok/s; nll 0.0228, top1 1.000, greedy prefix 32 of 32, tool calls exact 1 of 1, stop no; kv_len 1986, peak RSS 19.59 GB
+[t1d] chunk n=2048: epoch 11094 steps 3640 pairs 7626 promoted 344 braked 3
+[t1] follow: n=2048, 165 joined, 169 left, 99.080 ms
+[t1] follow: n=214, 25 joined, 0 left, 11.202 ms
+[t1d] decode n=1: epoch 11128 steps 3720 pairs 7626 promoted 344 braked 3
+[bench] turn 3: prompt 4248 tokens (1986 reused, 2262 read in 4.20 s), answer 87 tokens: first step 26 ms, then 40.07 tok/s; nll 1.1191, top1 0.713, greedy prefix 0 of 87, tool calls exact 0 of 1, stop yes; kv_len 4335, peak RSS 19.68 GB
+[t1d] chunk n=1406: epoch 11154 steps 7200 pairs 13792 promoted 344 braked 90
+[t1] follow: n=1406, 5 joined, 30 left, 8.916 ms
+[t1d] decode n=1: epoch 11290 steps 7240 pairs 13792 promoted 344 braked 90
+[bench] turn 4: prompt 5741 tokens (4335 reused, 1406 read in 2.79 s), answer 44 tokens: first step 25 ms, then 40.89 tok/s; nll 0.2269, top1 0.932, greedy prefix 0 of 44, tool calls exact 0 of 1, stop yes; kv_len 5785, peak RSS 19.75 GB
+[t1d] chunk n=1298: epoch 11336 steps 9000 pairs 16606 promoted 344 braked 134
+[t1] follow: n=1298, 51 joined, 51 left, 35.662 ms
+[t1d] decode n=1: epoch 11458 steps 9040 pairs 16606 promoted 344 braked 134
+[bench] turn 5: prompt 7083 tokens (5785 reused, 1298 read in 3.06 s), answer 54 tokens: first step 29 ms, then 41.38 tok/s; nll 1.0849, top1 0.796, greedy prefix 1 of 54, tool calls exact 0 of 1, stop yes; kv_len 7137, peak RSS 19.81 GB
+[t1d] chunk n=904: epoch 11506 steps 11200 pairs 19725 promoted 344 braked 188
+[t1] follow: n=904, 52 joined, 52 left, 33.716 ms
+[t1d] decode n=1: epoch 11578 steps 11240 pairs 19725 promoted 344 braked 188
+[bench] turn 6: prompt 8041 tokens (7137 reused, 904 read in 2.57 s), answer 24 tokens: first step 25 ms, then 41.85 tok/s; nll 0.2869, top1 0.875, greedy prefix 0 of 24, tool calls exact 0 of 1, stop yes; kv_len 8065, peak RSS 19.86 GB
+[t1d] chunk n=348: epoch 11622 steps 12200 pairs 20949 promoted 344 braked 212
+[t1] follow: n=348, 50 joined, 50 left, 29.681 ms
+[t1d] decode n=1: epoch 11638 steps 12240 pairs 20949 promoted 344 braked 212
+[bench] turn 7: prompt 8413 tokens (8065 reused, 348 read in 1.49 s), answer 467 tokens: first step 29 ms, then 39.10 tok/s; nll 0.8427, top1 0.762, greedy prefix 0 of 467, tool calls exact 0 of 1, stop yes; kv_len 8880, peak RSS 19.90 GB
+[t1d] chunk n=35: epoch 12100 steps 30920 pairs 51356 promoted 544 braked 629
+[t1d] decode n=1: epoch 12104 steps 30937 pairs 51356 promoted 544 braked 629
+[bench] turn 8: prompt 8915 tokens (8880 reused, 35 read in 0.92 s), answer 186 tokens: first step 23 ms, then 42.18 tok/s; nll 0.8859, top1 0.720, greedy prefix 0 of 186, tool calls exact 0 of 0, stop yes; kv_len 9101, peak RSS 19.93 GB
+[bench] peak RSS 19.93 GB
+[qtier] host pool: 3635 experts (5.99 GB of the RAM cache) page-locked for the device's copies
+----- pr-agente.steps: sha256 7733020147134a07931371367af9abcb5cbf455d8884ad6c1fd2d2da8262d027
+
+===== dev-agente
+----- dev-agente.csv (sha256 b2be5ca3039abdccfb1bf5557b678ee9cfe72c3d9007604cea9de1f5dd03cdfe)
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+663,663,1.417,467.88,57,62.5,35.357,0,0.00,be02ae1c335d12d7,a9232a16bd227f2d,1.73837,0.737,0,720,19.43,0,1,0,1
+1954,1234,6.721,183.60,32,27.9,39.495,0,0.00,04c44bfdd1ac239c,7d6e0f6d44b5cecc,0.02228,1.000,720,1986,19.60,32,1,1,0
+4248,2262,13.609,166.22,87,25.4,40.037,0,0.00,569b1f04bde4dd5d,159540b062b93762,1.11503,0.736,1986,4335,19.71,0,1,0,1
+5741,1406,8.198,171.51,44,25.7,39.320,0,0.00,fec70bafb35bee04,23d625e741190180,0.22366,0.932,4335,5785,19.74,0,1,0,1
+7083,1298,7.435,174.57,54,29.6,38.780,0,0.00,349ddde3ff5b1ea2,24b73c35bded487b,1.08878,0.796,5785,7137,19.80,1,1,0,1
+8041,904,5.486,164.78,24,26.6,39.559,0,0.00,22b5cd1eebc61c00,331c8c8593842500,0.29466,0.875,7137,8065,19.86,0,1,0,1
+8413,348,2.543,136.82,467,29.0,38.184,0,0.00,863d5703be895106,c005de8ea3c4e76e,0.84601,0.764,8065,8880,19.90,0,1,0,1
+8915,35,0.940,37.24,186,24.3,40.845,0,0.00,13ee16020a834195,1ac06551ca8a243e,0.88951,0.731,8880,9101,19.92,0,0,0,1
+----- dev-agente.err (sha256 29d2017e3027fd571f8a1046fba73e8dd37ed1c9396b81e6eaa5a57cf7231df2), the diagnostic, turn, peak RSS and host pool lines
+[qtier] host pool: 3635 experts of the RAM cache page-locked for the device to copy a prompt chunk's experts from (COLI_CUDA_HOST_POOL=0 off)
+[t1d] chunk n=663: epoch 10240 steps 0 pairs 0 promoted 0 braked 0
+[t1d] decode n=1: epoch 10240 steps 40 pairs 0 promoted 0 braked 0
+[bench] turn 1: prompt 663 tokens (0 reused, 663 read in 1.42 s), answer 57 tokens: first step 63 ms, then 35.36 tok/s; nll 1.7384, top1 0.737, greedy prefix 0 of 57, tool calls exact 0 of 1, stop yes; kv_len 720, peak RSS 19.43 GB
+[t1d] chunk n=1234: epoch 10700 steps 2320 pairs 5455 promoted 228 braked 0
+[t1d] decode n=1: epoch 10812 steps 2335 pairs 5455 promoted 228 braked 0
+[bench] turn 2: prompt 1954 tokens (720 reused, 1234 read in 6.72 s), answer 32 tokens: first step 28 ms, then 39.49 tok/s; nll 0.0223, top1 1.000, greedy prefix 32 of 32, tool calls exact 1 of 1, stop no; kv_len 1986, peak RSS 19.60 GB
+[t1d] chunk n=2048: epoch 11094 steps 3615 pairs 7640 promoted 344 braked 3
+[t1d] decode n=1: epoch 11334 steps 3645 pairs 7640 promoted 344 braked 3
+[bench] turn 3: prompt 4248 tokens (1986 reused, 2262 read in 13.61 s), answer 87 tokens: first step 25 ms, then 40.04 tok/s; nll 1.1150, top1 0.736, greedy prefix 0 of 87, tool calls exact 0 of 1, stop yes; kv_len 4335, peak RSS 19.71 GB
+[t1d] chunk n=1406: epoch 11386 steps 7125 pairs 13859 promoted 344 braked 90
+[t1d] decode n=1: epoch 11520 steps 7140 pairs 13859 promoted 344 braked 90
+[bench] turn 4: prompt 5741 tokens (4335 reused, 1406 read in 8.20 s), answer 44 tokens: first step 26 ms, then 39.32 tok/s; nll 0.2237, top1 0.932, greedy prefix 0 of 44, tool calls exact 0 of 1, stop yes; kv_len 5785, peak RSS 19.74 GB
+[t1d] chunk n=1298: epoch 11568 steps 8900 pairs 16944 promoted 344 braked 134
+[t1d] decode n=1: epoch 11689 steps 8916 pairs 16944 promoted 344 braked 134
+[bench] turn 5: prompt 7083 tokens (5785 reused, 1298 read in 7.44 s), answer 54 tokens: first step 30 ms, then 38.78 tok/s; nll 1.0888, top1 0.796, greedy prefix 1 of 54, tool calls exact 0 of 1, stop yes; kv_len 7137, peak RSS 19.80 GB
+[t1d] chunk n=904: epoch 11738 steps 11076 pairs 20753 promoted 344 braked 188
+[t1d] decode n=1: epoch 11810 steps 11092 pairs 20753 promoted 344 braked 188
+[bench] turn 6: prompt 8041 tokens (7137 reused, 904 read in 5.49 s), answer 24 tokens: first step 27 ms, then 39.56 tok/s; nll 0.2947, top1 0.875, greedy prefix 0 of 24, tool calls exact 0 of 1, stop yes; kv_len 8065, peak RSS 19.86 GB
+[t1d] chunk n=348: epoch 11854 steps 12052 pairs 22229 promoted 344 braked 212
+[t1d] decode n=1: epoch 11882 steps 12068 pairs 22229 promoted 344 braked 212
+[bench] turn 7: prompt 8413 tokens (8065 reused, 348 read in 2.54 s), answer 467 tokens: first step 29 ms, then 38.18 tok/s; nll 0.8460, top1 0.764, greedy prefix 0 of 467, tool calls exact 0 of 1, stop yes; kv_len 8880, peak RSS 19.90 GB
+[t1d] chunk n=35: epoch 12308 steps 30748 pairs 53682 promoted 520 braked 635
+[t1d] decode n=1: epoch 12312 steps 30764 pairs 53682 promoted 520 braked 635
+[bench] turn 8: prompt 8915 tokens (8880 reused, 35 read in 0.94 s), answer 186 tokens: first step 24 ms, then 40.85 tok/s; nll 0.8895, top1 0.731, greedy prefix 0 of 186, tool calls exact 0 of 0, stop yes; kv_len 9101, peak RSS 19.92 GB
+[bench] peak RSS 19.92 GB
+[qtier] host pool: 3635 experts (5.99 GB of the RAM cache) page-locked for the device's copies
+----- dev-agente.steps: sha256 2f5b715364d8aeaceeff2c4262b6910847b6613e5c60dbb183be09366dc729b7
+
+===== pr-chat
+----- pr-chat.csv (sha256 19424383b66bc8adcf76b07d36197e3e6455573efee3904cb2c9bdeba2593a5c)
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+38,38,0.841,45.18,256,63.3,42.004,0,0.00,a78495b62399806c,22216b578f19b9a6,1.38253,0.672,0,294,19.37,0,0,0,1
+321,27,0.484,55.80,489,26.1,42.438,0,0.00,c271462c3fe32fd6,4d025f2a5d326967,1.38959,0.628,294,810,19.40,2,0,0,0
+846,36,0.760,47.35,243,24.3,42.514,0,0.00,069340eea32b6c42,d016f9d61eb84ab2,1.27433,0.626,810,1089,19.42,0,0,0,1
+1120,31,0.550,56.32,315,21.6,45.325,0,0.00,6719f3fc3726a8a2,2f91aea627876859,1.12367,0.679,1089,1435,19.43,0,0,0,0
+1475,40,0.791,50.60,155,23.2,45.871,0,0.00,a4e546e8f3869e1a,fd3476fff1520e03,1.09032,0.671,1435,1630,19.45,7,0,0,0
+----- pr-chat.err (sha256 e951aa325aa95a28f47fe932cffda252c066d797bd87772eaa3f3c523864349e), the diagnostic, turn, peak RSS and host pool lines
+[qtier] host pool: 3635 experts of the RAM cache page-locked for the device to copy a prompt chunk's experts from (COLI_CUDA_HOST_POOL=0 off)
+[t1d] chunk n=38: epoch 10240 steps 0 pairs 0 promoted 0 braked 0
+[t1d] decode n=1: epoch 10240 steps 40 pairs 0 promoted 0 braked 0
+[bench] turn 1: prompt 38 tokens (0 reused, 38 read in 0.84 s), answer 256 tokens: first step 63 ms, then 42.00 tok/s; nll 1.3825, top1 0.672, greedy prefix 0 of 256, tool calls exact 0 of 0, stop yes; kv_len 294, peak RSS 19.37 GB
+[bench] turn 2: prompt 321 tokens (294 reused, 27 read in 0.48 s), answer 489 tokens: first step 26 ms, then 42.44 tok/s; nll 1.3896, top1 0.628, greedy prefix 2 of 489, tool calls exact 0 of 0, stop no; kv_len 810, peak RSS 19.40 GB
+[t1d] chunk n=36: epoch 10880 steps 29840 pairs 51054 promoted 272 braked 677
+[t1d] decode n=1: epoch 10884 steps 29854 pairs 51054 promoted 272 braked 677
+[bench] turn 3: prompt 846 tokens (810 reused, 36 read in 0.76 s), answer 243 tokens: first step 24 ms, then 42.51 tok/s; nll 1.2743, top1 0.626, greedy prefix 0 of 243, tool calls exact 0 of 0, stop yes; kv_len 1089, peak RSS 19.42 GB
+[bench] turn 4: prompt 1120 tokens (1089 reused, 31 read in 0.55 s), answer 315 tokens: first step 22 ms, then 45.33 tok/s; nll 1.1237, top1 0.679, greedy prefix 0 of 315, tool calls exact 0 of 0, stop no; kv_len 1435, peak RSS 19.43 GB
+[t1d] chunk n=40: epoch 10958 steps 52174 pairs 83534 promoted 272 braked 1235
+[t1d] decode n=1: epoch 10964 steps 52188 pairs 83534 promoted 272 braked 1235
+[bench] turn 5: prompt 1475 tokens (1435 reused, 40 read in 0.79 s), answer 155 tokens: first step 23 ms, then 45.87 tok/s; nll 1.0903, top1 0.671, greedy prefix 7 of 155, tool calls exact 0 of 0, stop no; kv_len 1630, peak RSS 19.45 GB
+[bench] peak RSS 19.45 GB
+[qtier] host pool: 3635 experts (5.99 GB of the RAM cache) page-locked for the device's copies
+----- pr-chat.steps: sha256 6cdeb5d90d8087ab198855879dcf8860443440f769d811529fda1b49db841fed

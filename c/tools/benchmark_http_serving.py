@@ -35,7 +35,7 @@ def endpoint(base_url):
 def load_workload(path):
     raw = Path(path).read_bytes()
     workload = []
-    for line in raw.decode("utf-8").splitlines():
+    for line in raw.decode("utf-8").split("\n"):
         if not line.strip():
             continue
         item = json.loads(line)
