@@ -9377,6 +9377,10 @@ class APIHandler(BaseHTTPRequestHandler):
                     echo=echo, display_k=display_k, prompt_echoes=prompt_echoes,
                     stop_spans=stop_filter.spans, content_spans=content_spans,
                     cache_slot=cache_slot)
+                if generation_stopped():
+                    # The API's stop filter can match in the final allowed token.
+                    # Its observed stop takes precedence over the raw engine cap.
+                    length_finish = "stop"
                 if chat and tools:
                     message = {"role": "assistant", "content": content or None, "refusal": None}
                     if reasoning:
@@ -9587,7 +9591,8 @@ class APIHandler(BaseHTTPRequestHandler):
                              "type": "function", "function": {"name": tc["function"]["name"],
                              "arguments": tc["function"]["arguments"]}}]},
                             "logprobs": None, "finish_reason": None}])
-                finish = "tool_calls" if calls else ("length" if stats["length_limited"] else "stop")
+                finish = "tool_calls" if calls else (
+                    "length" if stats["length_limited"] and not generation_stopped() else "stop")
             else:
                 if splitter is not None:                   # inkling content/marker splitter
                     content_split = splitter
@@ -9615,7 +9620,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 stop_filter.finish()
                 if content_split:
                     content_split.close()
-                finish = "length" if stats["length_limited"] else "stop"
+                finish = "length" if stats["length_limited"] and not stop_filter.stopped() else "stop"
             # generate() returned, so the prompt was ACCEPTed and start_stream() ran; guard anyway.
             start_stream()
             ka_stop.set()                          # generation done: stop the keepalive pump
