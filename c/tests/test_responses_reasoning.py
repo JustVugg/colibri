@@ -1,4 +1,4 @@
-"""Responses reasoning effort reaches the real chat gateway over HTTP."""
+"""Responses request settings reach the real chat gateway over HTTP."""
 import importlib.util
 import json
 import os
@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 C = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(C))
@@ -53,10 +54,12 @@ class ResponsesReasoningTest(unittest.TestCase):
         self.addCleanup(proxy.shutdown)
         return engine, "http://127.0.0.1:%d/v1/responses" % proxy.server_port
 
-    def request(self, endpoint, reasoning):
+    def request(self, endpoint, reasoning=None, text=None):
         body = {"input": "hello", "model": "test-model", "stream": False}
         if reasoning is not None:
             body["reasoning"] = reasoning
+        if text is not None:
+            body["text"] = text
         req = Request(endpoint, data=json.dumps(body).encode(), headers={
             "Content-Type": "application/json", "Authorization": "Bearer secret"})
         with urlopen(req, timeout=5) as response:
@@ -88,6 +91,45 @@ class ResponsesReasoningTest(unittest.TestCase):
             self.assertEqual(self.request(endpoint, None)["status"], "completed")
             self.assertEqual(render.call_args.args[1:3], (True, "high"))
 
+
+    def test_schema_format_preserves_metadata_in_the_chat_wrapper(self):
+        fmt = {"type": "json_schema", "name": "codex_output_schema", "strict": True,
+               "description": "Return a short answer", "schema": {"type": "object"}}
+        chat, _ = shim.to_chat({"input": "hello", "text": {"format": fmt}})
+        self.assertEqual(chat.get("response_format"), {"type": "json_schema",
+                         "json_schema": {k: v for k, v in fmt.items() if k != "type"}})
+        self.assertEqual(fmt["type"], "json_schema")
+
+    def test_missing_format_keeps_the_gateway_default(self):
+        for text in (None, {}, {"verbosity": "low"}):
+            with self.subTest(text=text):
+                chat, _ = shim.to_chat({"input": "hello", "text": text})
+                self.assertNotIn("response_format", chat)
+
+    def test_http_codex_schema_reaches_the_engine_grammar(self):
+        engine, endpoint = self.start_proxy()
+        schema = {"type": "object", "properties": {"answer": {"type": "string"}},
+                  "required": ["answer"], "additionalProperties": False}
+        fmt = {"type": "json_schema", "name": "codex_output_schema", "strict": True, "schema": schema}
+        with patch.object(gw, "ARCH", "glm"), patch.object(gw, "CHAT_FLAVOR", None):
+            self.assertEqual(self.request(endpoint, text={"format": fmt})["status"], "completed")
+            self.assertEqual(json.loads(engine.calls[0][5]), schema)
+
+    def test_http_json_object_and_text_preserve_the_gateway_grammar_behavior(self):
+        for kind, expected in (("json_object", gw.GENERIC_JSON_GBNF), ("text", None)):
+            with self.subTest(kind=kind):
+                engine, endpoint = self.start_proxy()
+                with patch.object(gw, "ARCH", "glm"), patch.object(gw, "CHAT_FLAVOR", None):
+                    self.assertEqual(self.request(endpoint, text={"format": {"type": kind}})["status"], "completed")
+                    self.assertEqual(engine.calls[0][5], expected)
+
+    def test_http_invalid_schema_reaches_gateway_validation_before_generation(self):
+        engine, endpoint = self.start_proxy()
+        with patch.object(gw, "ARCH", "glm"), patch.object(gw, "CHAT_FLAVOR", None):
+            with self.assertRaises(HTTPError) as caught:
+                self.request(endpoint, text={"format": {"type": "json_schema", "name": "invalid", "schema": []}})
+            self.assertEqual(caught.exception.code, 400)
+            self.assertEqual(engine.calls, [])
 
 if __name__ == "__main__":
     unittest.main()
