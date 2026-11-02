@@ -341,10 +341,10 @@ static int k3_chunk_rows(void){
  * that grow with the rows (coli_cuda.dll's input and output, the MLA core's, the routers')
  * stay within the 2-2.5 GiB the card has beside the 20 GiB of resident matrices. Measured
  * on the RTX 4090: a whole 4,096-row step's buffers did not fit (Windows paged the card's
- * memory to RAM, the GPU at 100% and the drives idle for minutes); a 2,637-row step left
- * about 0.6 GiB, these pieces about 0.8. Every kernel's row is its own, so the pieces give
- * the step's bytes. */
-#define K3_GPU_ROWS 2048
+ * memory to RAM, the GPU at 100% and the drives idle for minutes), and with 2,048-row
+ * pieces the desktop's 150 MB more slowed coli_cuda_k3.dll's dense calls 2-6x. Every
+ * kernel's row is its own, so the pieces give the step's bytes. */
+#define K3_GPU_ROWS 1024
 /* The activations and logits a step of k3_chunk_rows() rows holds at once, GB: 1.2 up to
  * 512 rows, then about 1.4 MB a row (the hidden rows and AttnRes blocks, a layer's
  * buffers, and the waves' inputs and outputs of 16 experts a row). */

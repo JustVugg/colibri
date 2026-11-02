@@ -256,8 +256,10 @@ teacher-forced logit streams at C=32 vs C=1 match exactly). Measured prefill:
 **A long prompt's CPU work** (the RTX 4090 machine, docs/experiments/kimi-k3-4090-2026-10-31:
 a 2,637-token prompt took 1,401 s in 512-token steps, 549 s on the CPU in steps of 2,048,
 137 s in one step of 4,096 with its experts, MLA attention and routers on the GPU (below:
-the CPU's bytes there too) and **113 s** with the card's own matrices in `quant_matmul_blocked`,
-the logits the same bytes; the drive with 61% of every layer's experts now reads 92% of the time). Each rewrite below keeps
+the CPU's bytes there too), 113 s with the card's own matrices in `quant_matmul_blocked` and
+**106.5 s** with the exact dense kernel's lanes in one thread (`k3_dense_b`), the logits the same
+bytes; the drive with 61% of every layer's experts reads 92% of the time; a 5,862-token prompt
+173 s in one step of 8,192). Each rewrite below keeps
 every row's and position's arithmetic:
 - the gated MLA's scores were one chain of 576 adds a position (GCC -O3 multiplies 16 at
   a time, then adds the products in order); `k3_mla_scores_g` keeps that arithmetic (an
@@ -276,10 +278,11 @@ every row's and position's arithmetic:
   once from RAM for all its rows (2,048 against 512: 5,784 -> 2,455 GB read for that
   prompt, 845 -> 697 s; a step of 4,096 or more reads nearly every expert, 1.4 TB: a
   5,862-token prompt 254 s in two steps of 4,096, 200 s in one of 8,192, the logits of every
-  position the same bytes). The GPU's calls take a step's rows 2,048 at a time
-  (`K3_GPU_ROWS`), so their device buffers fit beside the 20 GiB of resident matrices: a
-  whole 4,096-row step's did not (Windows moved the card's memory to RAM without an error,
-  minutes at 100% GPU with the drives idle);
+  position the same bytes). The GPU's calls take a step's rows 1,024 at a time
+  (`K3_GPU_ROWS`) and the MLA core's scores 128 MB, so their device buffers fit beside the
+  20 GiB of resident matrices: a whole 4,096-row step's did not (Windows moved the card's
+  memory to RAM without an error, minutes at 100% GPU with the drives idle), and with
+  2,048-row pieces 150 MB more of the desktop's slowed coli_cuda_k3.dll's calls 2-6x;
 - KDA's short convolutions and heads go over a step's tokens channel by channel and head
   by head (one parallel region each where there were four a token; `k3_kda_head` is the
   one head step both orders call, the conv's taps fused adds in order as compiled before);
@@ -463,7 +466,12 @@ way.
   itself; the weighted sums run as before, in the union's order.
 - **The dense matrices the GPU does not hold** (`k3cu_matmul`): `matmul_i4_grouped`'s
   lanes, group sums and fused scales, `matmul_q`'s lanes and scale; the shared experts as
-  one call (gate, up, SiTU, down: `k3cu_shared`).
+  one call (gate, up, SiTU, down: `k3cu_shared`). From 64 rows int4 groups of 64 take
+  `k3_dense_b`: a thread holds an output's 8 lanes for 4 rows by 6 outputs and runs them one
+  at a time, 0, 4, 2, 6, 1, 5, 3, 7, so each finished lane joins hsum256's tree at once (three
+  kept an output); a nibble's decode is one mask and one fused add. 13-15 TMAC/s against
+  k3_dense's 3.1-3.6 (`K3_GPU_DENSE_B=0`), the same bytes: the 2,637-token prompt's shared
+  experts 17.3 -> 10.5 s, its latent projections 5.6 -> 3.1 s.
 - **The gated MLA's attention core** (`k3cu_mla`): mla_forward's loop -- the absorbed
   query (fused, w_addrow's), the scores (products rounded, added in order from zero,
   then scaled), `softmax_` (its sum in order), the values (fused over the positions in
@@ -496,6 +504,7 @@ the RAM).
 | `K3_GPU_MIN_ROWS` | 32 | the rows a step needs for it (1 in tests: every step) |
 | `K3_GPU_CPU_WAVE` | 4 | the experts the CPU takes at a time beside the card |
 | `K3_GPU_PIN_GB` | 64 | the expert slots' pinned memory, GiB |
+| `K3_GPU_DENSE_B` | 1 | the dense matrices' and shared experts' int4 groups of 64 through `k3_dense_b` from 64 rows (0: `k3_dense`) |
 | `K3_READAHEAD_GB` | 20 with the card, else 0 | the read-ahead pool, counted in the RAM budget |
 
 ## Current limitations

@@ -257,6 +257,181 @@ __global__ void __launch_bounds__(256) k3_dense(int fmt, const uint8_t *__restri
     if (o < O && p0 + l < S) y[(size_t)(p0 + l) * O + o] = v;
 }
 
+// matmul_i4_grouped's arithmetic again for groups of 64, a thread's 8 lanes in its own registers
+// (k3_dense gives them to 8 threads and adds them with shuffles every group, its inputs one float
+// a load): thread (tr, to) takes rows 4 tr .. +3 of the block's 32 by outputs 6 to .. +5 of its
+// 192. In a group lane l's chain is columns l, l+8, .., l+56, fused in that order from +0; the
+// lanes go 0, 4, 2, 6, 1, 5, 3, 7, so each finished one joins hsum256's tree at once,
+// ((a0+a4)+(a2+a6)) + ((a1+a5)+(a3+a7)), three kept a pair; then the group's fmaf into the total.
+// Lane l's weight m is nibble l of the group's word m: (w & 15 << 4p) | 2^23 read as a float, one
+// fused add takes the place p and the 8 out, exactly. The block's rows of x go to shared memory by
+// column, 128 columns a stage, double-buffered. About 4x k3_dense's rate from 64 rows (13-15 T
+// multiply-adds a second at Kimi K3's shapes on an RTX 4090), the same bytes; K3_GPU_DENSE_B=0: k3_dense.
+#define KB_RS 4
+#define KB_RO 6
+#define KB_BR 32                    // rows a block
+#define KB_BO 192                   // outputs a block
+#define KB_SC 128                   // columns a stage
+#define KB_PAD 36                   // a column's 32 rows and 4 spare: 16-byte stores without conflicts
+#define KB_MINROWS 64               // fewer rows: k3_dense (too few blocks)
+template <int P>
+__device__ __forceinline__ float kb_nib(uint32_t w) {   // the offset nibble at place P (0..4) of w, less 8
+    const float mul = P == 0 ? 1.0f : P == 1 ? 0.0625f : P == 2 ? 0.00390625f : P == 3 ? 0.000244140625f : 1.52587890625e-05f;
+    const float add = P == 0 ? -8388616.0f : P == 1 ? -524296.0f : P == 2 ? -32776.0f : P == 3 ? -2056.0f : -136.0f;
+    return __fmaf_rn(__uint_as_float((w & (15u << (4 * P))) | 0x4B000000u), mul, add);
+}
+template <int L>
+__device__ __forceinline__ float kb_lane_w(uint32_t w) {   // lane L's nibble of a word
+    if (L <= 4) return kb_nib<L>(w);
+    else return kb_nib<L - 3>(w >> 12);
+}
+template <int L>
+__device__ __forceinline__ void kb_lane(const float (*sxc)[KB_PAD], int r0, const uint32_t (&W)[KB_RO][8],
+                                        float (&a)[KB_RS][KB_RO], int cbase) {
+#pragma unroll
+    for (int r = 0; r < KB_RS; r++)
+#pragma unroll
+        for (int j = 0; j < KB_RO; j++) a[r][j] = 0.0f;
+#pragma unroll
+    for (int m = 0; m < 8; m++) {
+        const float4 xv = *reinterpret_cast<const float4 *>(&sxc[cbase + L + 8 * m][r0]);
+        const float xr[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+        for (int j = 0; j < KB_RO; j++) {
+            const float wv = kb_lane_w<L>(W[j][m]);
+#pragma unroll
+            for (int r = 0; r < KB_RS; r++) a[r][j] = __fmaf_rn(xr[r], wv, a[r][j]);
+        }
+    }
+}
+__global__ void __launch_bounds__(256, 1) k3_dense_b(const uint8_t *__restrict__ w, const float *__restrict__ scale,
+                                                     const float *__restrict__ x, int S, int I, int O,
+                                                     float *__restrict__ y) {
+    __shared__ __align__(16) float sx[2][KB_SC][KB_PAD];
+    const int t = threadIdx.x, tr = t & 7, to = t >> 3;
+    const int s0 = blockIdx.y * KB_BR, ob = blockIdx.x * KB_BO + to * KB_RO, r0 = tr * KB_RS;
+    const int ng = I / 64;
+    float tot[KB_RS][KB_RO], s0v[KB_RS][KB_RO], s1v[KB_RS][KB_RO], s2v[KB_RS][KB_RO], a[KB_RS][KB_RO];
+#pragma unroll
+    for (int r = 0; r < KB_RS; r++)
+#pragma unroll
+        for (int j = 0; j < KB_RO; j++) tot[r][j] = 0.0f;
+    // staging: thread t loads column t & 127 of rows 16 (t >> 7) .. +15 (past S: the last row)
+    const int sc_c = t & 127, sc_r = (t >> 7) * 16;
+    float xs[16];
+    auto xload = [&](int k0) {
+#pragma unroll
+        for (int q = 0; q < 16; q++) {
+            const int row = s0 + sc_r + q, rr = row < S ? row : S - 1;
+            xs[q] = __ldg(x + (size_t)rr * I + k0 + sc_c);
+        }
+    };
+    auto xstore = [&](int b) {
+#pragma unroll
+        for (int q = 0; q < 4; q++)
+            *reinterpret_cast<float4 *>(&sx[b][sc_c][sc_r + 4 * q]) = make_float4(xs[4 * q], xs[4 * q + 1], xs[4 * q + 2], xs[4 * q + 3]);
+    };
+    const int nst = I / KB_SC;
+    xload(0); xstore(0);
+    if (nst > 1) xload(KB_SC);
+    __syncthreads();
+    const uint8_t *wrow[KB_RO];
+#pragma unroll
+    for (int j = 0; j < KB_RO; j++) { const int o = ob + j < O ? ob + j : O - 1; wrow[j] = w + (size_t)o * (I >> 1); }
+    for (int st = 0; st < nst; st++) {
+        const int b = st & 1;
+#pragma unroll 1
+        for (int gg = 0; gg < KB_SC / 64; gg++) {
+            const int g = st * (KB_SC / 64) + gg;
+            uint32_t W[KB_RO][8];
+#pragma unroll
+            for (int j = 0; j < KB_RO; j++) {
+                const uint4 u0 = __ldg(reinterpret_cast<const uint4 *>(wrow[j] + (size_t)g * 32));
+                const uint4 u1 = __ldg(reinterpret_cast<const uint4 *>(wrow[j] + (size_t)g * 32 + 16));
+                W[j][0] = u0.x; W[j][1] = u0.y; W[j][2] = u0.z; W[j][3] = u0.w;
+                W[j][4] = u1.x; W[j][5] = u1.y; W[j][6] = u1.z; W[j][7] = u1.w;
+            }
+            const float (*sxc)[KB_PAD] = sx[b];
+            const int cb = gg * 64;
+            kb_lane<0>(sxc, r0, W, a, cb);
+#pragma unroll
+            for (int r = 0; r < KB_RS; r++)
+#pragma unroll
+                for (int j = 0; j < KB_RO; j++) s0v[r][j] = a[r][j];
+            kb_lane<4>(sxc, r0, W, a, cb);
+#pragma unroll
+            for (int r = 0; r < KB_RS; r++)
+#pragma unroll
+                for (int j = 0; j < KB_RO; j++) s0v[r][j] = __fadd_rn(s0v[r][j], a[r][j]);
+            kb_lane<2>(sxc, r0, W, a, cb);
+#pragma unroll
+            for (int r = 0; r < KB_RS; r++)
+#pragma unroll
+                for (int j = 0; j < KB_RO; j++) s1v[r][j] = a[r][j];
+            kb_lane<6>(sxc, r0, W, a, cb);
+#pragma unroll
+            for (int r = 0; r < KB_RS; r++)
+#pragma unroll
+                for (int j = 0; j < KB_RO; j++) s0v[r][j] = __fadd_rn(s0v[r][j], __fadd_rn(s1v[r][j], a[r][j]));
+            kb_lane<1>(sxc, r0, W, a, cb);
+#pragma unroll
+            for (int r = 0; r < KB_RS; r++)
+#pragma unroll
+                for (int j = 0; j < KB_RO; j++) s1v[r][j] = a[r][j];
+            kb_lane<5>(sxc, r0, W, a, cb);
+#pragma unroll
+            for (int r = 0; r < KB_RS; r++)
+#pragma unroll
+                for (int j = 0; j < KB_RO; j++) s1v[r][j] = __fadd_rn(s1v[r][j], a[r][j]);
+            kb_lane<3>(sxc, r0, W, a, cb);
+#pragma unroll
+            for (int r = 0; r < KB_RS; r++)
+#pragma unroll
+                for (int j = 0; j < KB_RO; j++) s2v[r][j] = a[r][j];
+            kb_lane<7>(sxc, r0, W, a, cb);
+#pragma unroll
+            for (int j = 0; j < KB_RO; j++) {
+                const int o = ob + j < O ? ob + j : O - 1;
+                const float gsc = __ldg(scale + (size_t)o * ng + g);
+#pragma unroll
+                for (int r = 0; r < KB_RS; r++) {
+                    const float f = __fadd_rn(s1v[r][j], __fadd_rn(s2v[r][j], a[r][j]));
+                    tot[r][j] = __fmaf_rn(__fadd_rn(s0v[r][j], f), gsc, tot[r][j]);
+                }
+            }
+        }
+        if (st + 1 < nst) {
+            __syncthreads();
+            xstore(b ^ 1);
+            __syncthreads();
+            if (st + 2 < nst) xload((st + 2) * KB_SC);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < KB_RS; r++) {
+        const int row = s0 + r0 + r;
+        if (row >= S) continue;
+#pragma unroll
+        for (int j = 0; j < KB_RO; j++) if (ob + j < O) y[(size_t)row * O + ob + j] = tot[r][j];
+    }
+}
+static int kb_mode(void) {
+    static int m = -1;
+    if (m < 0) { const char *e = getenv("K3_GPU_DENSE_B"); m = !e || !*e || atoi(e) != 0; }
+    return m;
+}
+// y [r][O] = x [r][I] . W^T in the CPU's arithmetic on stream st: k3_dense_b where it was built for it
+static void k3_dense_launch(int fmt, const uint8_t *w, const float *s, const float *x, int r, int I, int O, int gs,
+                            float *y, cudaStream_t st) {
+    if (fmt == 4 && gs == 64 && I % KB_SC == 0 && r >= KB_MINROWS && kb_mode()) {
+        const dim3 g((unsigned)((O + KB_BO - 1) / KB_BO), (unsigned)((r + KB_BR - 1) / KB_BR));
+        k3_dense_b<<<g, 256, 0, st>>>(w, s, x, r, I, O, y);
+    } else {
+        const dim3 g((unsigned)((O + K3_TO - 1) / K3_TO), (unsigned)((r + K3_TP - 1) / K3_TP));
+        k3_dense<<<g, 256, 0, st>>>(fmt, w, s, x, r, I, O, gs, y);
+    }
+}
+
 // ---- a prompt step's gated MLA attention, mla_forward's loop -----------------------------------
 // For row tt (position pos0 + tt, nt = pos0 + tt + 1 positions) and head h, as the CPU does it:
 //   qabs[i] = sum over d < qk_nope, in order, fused: (kv_b scale of row rbase+d times q[d]) times
@@ -629,9 +804,8 @@ extern "C" int k3cu_matmul(int fmt, float *y, const float *x, const void *w, con
         !checked(cudaMemcpyAsync(mm_s, scale, sb, cudaMemcpyHostToDevice, s_mm), "dense scales")) return 0;
     for (int s0 = 0; s0 < S; s0 += R) {
         const int r = S - s0 < R ? S - s0 : R;
-        dim3 g((unsigned)((O + K3_TO - 1) / K3_TO), (unsigned)((r + K3_TP - 1) / K3_TP));
         if (!checked(cudaMemcpyAsync(mm_x, x + (size_t)s0 * I, (size_t)r * I * sizeof(float), cudaMemcpyHostToDevice, s_mm), "dense rows")) return 0;
-        k3_dense<<<g, 256, 0, s_mm>>>(fmt, mm_w, mm_s, mm_x, r, I, O, gs, mm_y);
+        k3_dense_launch(fmt, mm_w, mm_s, mm_x, r, I, O, gs, mm_y, s_mm);
         if (!checked(cudaGetLastError(), "dense kernel") ||
             !checked(cudaMemcpyAsync(y + (size_t)s0 * O, mm_y, (size_t)r * O * sizeof(float), cudaMemcpyDeviceToHost, s_mm), "dense outputs")) return 0;
     }
@@ -653,8 +827,8 @@ extern "C" int k3cu_mla(const float *Lc, const float *Rc, int N, int pos0, int C
     double t0 = now_s();
     const int qh = qn + qr, KD = kvl + qr, O = H * (qn + vh);
     if (!s_mla && !checked(cudaStreamCreateWithFlags(&s_mla, cudaStreamNonBlocking), "attention stream")) return 0;
-    /* rows a chunk: their scores within about 256 MB */
-    long long tq = (256ll << 20) / ((long long)H * N * 4);
+    /* rows a chunk: their scores within about 128 MB (the card has 2-2.5 GiB beside the resident matrices) */
+    long long tq = (128ll << 20) / ((long long)H * N * 4);
     const int TQ = tq < 1 ? 1 : tq > C ? C : (int)tq;
     if (!mm_room((void **)&ml_LR, &ml_LRc, (size_t)N * KD * 4) || !mm_room((void **)&ml_qv, &ml_qvc, (size_t)C * H * qh * 4) ||
         !mm_room((void **)&ml_gv, &ml_gvc, (size_t)C * H * vh * 4) || !mm_room((void **)&ml_w, &ml_wc, (size_t)O * kvl) ||
@@ -733,14 +907,12 @@ extern "C" int k3cu_shared(float *sd, const float *x, int S, int D, int I, const
         !mm_room((void **)&sh_u, &sh_uc, (size_t)R * I * 4) || !mm_room((void **)&sh_y, &sh_yc, (size_t)R * D * 4)) return 0;
     for (int s0 = 0; s0 < S; s0 += R) {
         const int r = S - s0 < R ? S - s0 : R;
-        const dim3 gI((unsigned)((I + K3_TO - 1) / K3_TO), (unsigned)((r + K3_TP - 1) / K3_TP)),
-                   gD((unsigned)((D + K3_TO - 1) / K3_TO), (unsigned)((r + K3_TP - 1) / K3_TP));
         const size_t n = (size_t)r * I;
         if (!checked(cudaMemcpyAsync(sh_x, x + (size_t)s0 * D, (size_t)r * D * 4, cudaMemcpyHostToDevice, s_mm), "shared rows")) return 0;
-        k3_dense<<<gI, 256, 0, s_mm>>>(4, sh_w[0], sh_s[0], sh_x, r, D, I, ggs, sh_g);
-        k3_dense<<<gI, 256, 0, s_mm>>>(4, sh_w[1], sh_s[1], sh_x, r, D, I, ggs, sh_u);
+        k3_dense_launch(4, sh_w[0], sh_s[0], sh_x, r, D, I, ggs, sh_g, s_mm);
+        k3_dense_launch(4, sh_w[1], sh_s[1], sh_x, r, D, I, ggs, sh_u, s_mm);
         k3_situ_rows<<<(unsigned)((n + 255) / 256), 256, 0, s_mm>>>(sh_g, sh_u, n, b1, b2);
-        k3_dense<<<gD, 256, 0, s_mm>>>(4, sh_w[2], sh_s[2], sh_g, r, I, D, dgs, sh_y);
+        k3_dense_launch(4, sh_w[2], sh_s[2], sh_g, r, I, D, dgs, sh_y, s_mm);
         if (!checked(cudaGetLastError(), "shared kernels") ||
             !checked(cudaMemcpyAsync(sd + (size_t)s0 * D, sh_y, (size_t)r * D * 4, cudaMemcpyDeviceToHost, s_mm), "shared outputs")) return 0;
     }

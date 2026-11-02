@@ -260,3 +260,36 @@ steps of 2,048, 4,096 and 8,192 the same logits, every GPU path forced).
 | `dec_cpu_*`, `dec_gpu_*` (`series_dec.sh`) | decode's routed experts on the GPU too (`K3_GPU_EXPERT_ROWS=1`, not kept) | 0.70 against 0.81-0.88 tok/s, the same text: the copies take the RAM the CPU's experts read (shared 157 -> 210 ms, waiting for reads 328 -> 430) |
 
 The launcher's default step is now 8,192.
+
+## The exact dense kernel's lanes in one thread (`raw/kb*`, `decr*`, 2026-11-01)
+
+coli_cuda_k3.dll's dense kernel for the matrices the card does not hold and the shared
+experts (`k3_dense`) gave an output's 8 lanes to 8 threads, added them with shuffles every
+group of 64 columns and read its inputs one float a load: 3.1-3.6 TMAC/s. `k3_dense_b` keeps
+the CPU's arithmetic (`matmul_i4_grouped`: 8 lanes of 8 fused adds a group, hsum256, fmaf a
+group) with a thread's 8 lanes in its own registers: 4 rows by 6 outputs a thread, the lanes
+run 0, 4, 2, 6, 1, 5, 3, 7 so each finished one joins hsum256's tree at once (three kept an
+output), nibble l of the group's word m decoded with one mask and one fused add, x staged by
+column 128 columns a stage (`bench_k3d.cu`).
+
+| run | what | result |
+|---|---|---:|
+| `bench_k3d.cu` | shared gate/up, shared down, latent down, latent up, a KDA projection; 1,024 rows | 14.3 -> 3.5, 12.5 -> 3.2, 7.3 -> 1.8, 7.3 -> 1.9, 25.0 -> 6.1 ms (13-15 TMAC/s); the same bytes; from 48 rows faster, at 32 even |
+| `tests/test_k3_cuda_experts.c` | k3cu_matmul and k3cu_shared against matmul_i4_grouped and k3_shared on the CPU, 300 and 1,030 rows, K3's shapes | 0 of 9.6 M outputs differ |
+| `kb_2637_logits`, `kb_5862_logits` | the logits of every position: 2,637 tokens against `long_ref`, 5,862 in a step of 8,192 against two of 4,096 with k3_dense | the same bytes |
+| `kb5862_kb_*`, `kb5862_old_*` (`series_kb.sh`) | A/B twice, `K3_GPU_DENSE_B=0` the old kernel, 5,862 tokens | **173.8, 172.7 s** against 195.4, 198.6 s: shared 35 -> 20 s, latent 12 -> 6 |
+| `kb2637_kb_*`, `kb2637_old_*` | the same at 2,637 tokens | 118.9, 118.3 against 170.7, 170.7 s: the card's memory short (below) |
+| `kb2637_res3`, `kb2637_res3b`, `kb5862_res3` | 3 GB left free beside the resident matrices (359 of them instead of 369) | 106.4, 106.5 s; 172.4 s; the dense calls 20 -> 5 s |
+| `decr2_*`, `decr3_*` (`series_res.sh`) | decode with 2 GB and 3 GB left free | 55.8, 55.9 against 56.2, 56.0 s for 45 tokens, the same text |
+| `kb4_2637_logits`, `kb4_2637_*`, `kb4_5862` (`series_kb4.sh`) | the GPU's calls 1,024 rows at a time, the MLA core's scores 128 MB, 2 GB left free (all 369 resident) | the same bytes as `long_ref`; **106.5, 106.5 s**; **173.1 s** |
+
+The 2,637-token A/B ran after the desktop compositor had grown from 1.6 to 1.7 GB of the
+card: coli_cuda_k3.dll's dense calls took 20 s (k3_dense_b) and 67 s (k3_dense) where they
+had taken 5 and 11, its buffers in RAM. Leaving 3 GB free fixed it but took 10 matrices off
+the card, and their arithmetic with them (the CPU's instead of quant_matmul's: not the
+reference's bytes); the GPU's calls in pieces of 1,024 rows and the MLA core's scores within
+128 MB free about 0.4 GB instead and keep every matrix where it was.
+
+Where the 106.5 s go now: attention 30.6 s (KDA 23.8: its resident matmuls 15.5, its CPU
+work 9.6; MLA 6.9), the MoE 72.1 s (routed experts 41.5, shared 10.5, latent 3.1, waiting for
+reads 8.8). C: is the floor: its share of a cold prompt's 1.4 TB takes about 100-108 s.

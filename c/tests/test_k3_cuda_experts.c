@@ -267,6 +267,8 @@ int main(int argc, char **argv){
     bad += check_dense(4, 1100, 1024, 96, 32);
     bad += check_dense(4, 9, 3584, 71, 128);
     bad += check_dense(4, 100, 7168, 64, 64);   /* 12 blocks of 8 rows and one of 4 */
+    bad += check_dense(4, 300, 7168, 200, 64);  /* k3_dense_b: 9 blocks of 32 rows and one of 12, 192 outputs and 8 */
+    bad += check_dense(4, 1030, 3584, 7168, 64);/* the latent's up: a 1024-row piece by k3_dense_b, 6 rows by k3_dense */
     bad += check_dense(1, 33, 7168, 100, 0);
     bad += check_dense(1, 1030, 512, 40, 0);
     bad += check_mla(96, 128, 64, 128, 512, 100, 40);
@@ -275,6 +277,7 @@ int main(int argc, char **argv){
     bad += check_router(70, 128, 13);
     bad += check_shared(40, 1024, 768, 2, 64);
     bad += check_shared(1030, 256, 128, 1, 32);
+    bad += check_shared(300, 7168, 3072, 2, 64);   /* Kimi K3's, through k3_dense_b */
     k3cu_report();
     printf(bad ? "FAILED\n" : "ok\n");
     return bad ? 1 : 0;
