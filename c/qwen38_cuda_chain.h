@@ -137,14 +137,17 @@ typedef struct {
 static Q38CChain *q38cc_of(Model *m) { return (Q38CChain *)m->cchain; }
 /* layer i is an attention layer: the MTP head's (i == c.layers) is */
 static int q38cc_attn_at(const Cfg *c, int i) { return i < c->layers ? c->is_attn[i] != 0 : 1; }
-/* the MTP head's layer beside the chain: the model has the head, Q38_MTP asks for its drafts
- * (unset, the engine turns it off beside the chain) and Q38_MTP_CHAIN=0 does not keep it on the CPU */
+/* the MTP head's layer beside the chain: the model has the head, Q38_MTP=0 does not turn it off and
+ * Q38_MTP_CHAIN=0 does not keep it on the CPU (unset, the engine keeps its drafts where the head's
+ * routed experts reached the card too: q38cc_head_on_card) */
 static int q38cc_mtp_planned(Model *m) {
     const char *e = getenv("Q38_MTP"), *k = getenv("Q38_MTP_CHAIN");
-    return m->mtp && e && *e && *e != '0' && !(k && *k == '0');
+    return m->mtp && !(e && *e == '0') && !(k && *k == '0');
 }
 static int q38cc_dm_able(Q38CChain *ch, Model *m);
 static int q38cc_head_card(Q38CChain *ch, Model *m);
+/* the MTP head's layer and its routed experts on the card (q38cc_head_card) */
+static int q38cc_head_on_card(Model *m) { Q38CChain *ch = q38cc_of(m); return ch && ch->ok && ch->mtp_on && ch->hd_tab; }
 static int g_cuda_chain = 0;     /* COLI_CUDA_CHAIN asked for it and the chain is up */
 static unsigned long long g_q38cc_mtp_rows;   /* the MTP head's rows the chain ran, every model (tests) */
 
@@ -2731,6 +2734,13 @@ static int q38cc_mtp_rows(Model *m, const float *streams, const int *next, int S
     float *emb = (float *)malloc((size_t)rows * (H + C) * sizeof(float)), *ones = emb ? emb + (size_t)rows * H : NULL;
     if (!emb || !q38cc_scratch(ch, m, rows) || (hidden && !cc_reserve(&ch->hypd, (size_t)rows * W * 4, CC_DOWN)) ||
         !cc_reserve(&ch->fin, (size_t)rows * H * 4, CC_UP) || !cc_reserve(&ch->ones, (size_t)rows * C * 4, CC_DEV)) { free(emb); return 0; }
+    /* the head's experts on the card (q38cc_head_card) for a prompt's rows too: their routes and
+     * the routed experts' scratch for `rows` (a prompt's head on the host's step took 100 ms of a
+     * 452-token prompt's 700 on an i5-13500) */
+    const size_t K = (size_t)c->topk;
+    const int card_ok = ch->hd_tab && cc_reserve(&ch->hd_ids, (size_t)rows * K * 4, CC_DEV) && cc_reserve(&ch->hd_w, (size_t)rows * K * 4, CC_DEV) &&
+                        cc_reserve(&ch->dm_hid, cc_moe_hid_floats(rows, (int)K, H, c->inter, E) * 4, CC_DEV) &&
+                        cc_reserve(&ch->dm_y, (size_t)rows * H * 4, CC_DEV);
     for (int k = 0; k < rows * C; k++) ones[k] = 1.f;
     /* the rows from pos_base on are rewritten: the mirror's watermarks behind them */
     if (ch->kv_valid[L] > pos_base) ch->kv_valid[L] = pos_base;
@@ -2758,7 +2768,7 @@ static int q38cc_mtp_rows(Model *m, const float *streams, const int *next, int S
                  cc_ew(ch->hyper, ch->ones, ch->blk, NULL, NULL, &add);
         ok = ok && q38cc_gr_read(ch, m, &l->attn_gr, ch->o_an[L], n, ch->inj_a) && q38cc_attention(ch, m, l, L, n, pb) &&
              q38cc_gr_apply(ch, m, ch->inj_a, n) && q38cc_gr_read(ch, m, &l->mlp_gr, ch->o_mn[L], n, ch->inj_m);
-        const int card = ch->hd_tab && ch->dm_hid && ch->dm_y && n <= Q38CC_DM_ROWS;   /* the head's experts on the card */
+        const int card = card_ok;   /* the head's experts on the card */
         const int hyb = !card && ch->hd_base && ch->srv && ch->dm_dfl && n <= Q38CC_DM_ROWS;   /* on the pool's server */
         if (card) {   /* routed, computed and summed on the card, in Q2_0 (q38cc_head_card) */
             CcRoute rp = {n, E, c->topk, 0, 0, E, 0, 0, 0, c->topk, 0, c->topk, 1, 1, c->norm_topk ? 1 : 0, 1.f, 1.f, 0.f};

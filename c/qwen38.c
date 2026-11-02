@@ -963,7 +963,11 @@ static int64_t q38_telemetry_init(const char *snap, const Model *m) {
  * on the host. */
 static void q38_vocab_decide(Model *m, const char *snap) {
     if (!m->mtp) return;
-    int top = q38_env_int_in_range("Q38_MTP_VOCAB", DRAFT_VOCAB_DEFAULT_TOP, 0, m->c.vocab);
+    int top0 = DRAFT_VOCAB_DEFAULT_TOP;
+#ifdef COLI_CUDA
+    if (q38cc_head_on_card(m)) top0 = DRAFT_VOCAB_CARD_TOP;   /* the list scored on the card: a longer one costs little there */
+#endif
+    int top = q38_env_int_in_range("Q38_MTP_VOCAB", top0 < m->c.vocab ? top0 : m->c.vocab, 0, m->c.vocab);
     if (!top || g_q38_mtp_dump) return;
     if (m->draft_codes) {
         fprintf(stderr, "[qwen38 MTP] draft vocabulary off: Q38_DRAFT_HEAD=int4 scores the whole "
@@ -1114,7 +1118,7 @@ static Q38Spec q38_spec_begin(Model *m, const int *prompt, int np) {
     sp.lk_force = q38_spec_force_mode("COLI_LOOKUP_FORCE", getenv("COLI_LOOKUP_FORCE"), Q38_SPEC_ROWS - 1, 1,
                                       &sp.lk_force_row);
     spec_gate_init(&sp.gate, !q38_env_bool("COLI_SPEC_GATE", 1));
-    sp.pstep = q38_env_bool("Q38_MTP_PSTEP", 0);   /* opt-in: measured 1-5% slower on the Vulkan chain at depth 2 */
+    sp.pstep = q38_env_bool("Q38_MTP_PSTEP", m->mtp_pstep);   /* off by default: measured 1-5% slower on the Vulkan chain at depth 2; on beside the CUDA chain's card head (q38_mtp_card_defaults) */
     if (sp.lookup && prompt && np > 0) {
         sp.hist_cap = np + 256;
         sp.hist = (int *)malloc((size_t)sp.hist_cap * sizeof(int));
@@ -2906,10 +2910,11 @@ int main(int argc, char **argv) {
      * save there (an RTX PRO 4000, Qwen3.8-Flash-Next IQ2_XS with the host pool: plain decode
      * 46-48 tok/s, the head's drafts 42.5-44.7, the prompt 180 against 150 tok/s as the head
      * reads every prompt row): unset, Q38_MTP leaves it off as beside the Vulkan chain. */
-    if (g_cuda_chain && m.mtp && !(getenv("Q38_MTP") && *getenv("Q38_MTP"))) {
+    if (g_cuda_chain && m.mtp && q38cc_head_on_card(&m)) q38_mtp_card_defaults(&m);
+    else if (g_cuda_chain && m.mtp && !(getenv("Q38_MTP") && *getenv("Q38_MTP"))) {
         m.mtp = 0;
-        fprintf(stderr, "[qwen38] speculative decoding with the MTP head: off (the CUDA chain runs every layer on the device; "
-                        "Q38_MTP=1 drafts, the head's layer on the device too unless Q38_MTP_CHAIN=0)\n");
+        fprintf(stderr, "[qwen38] speculative decoding with the MTP head: off (its routed experts did not reach the card; "
+                        "Q38_MTP=1 drafts anyway)\n");
     }
 #endif
     if(m.mtp&&getenv("Q38_MTP_DUMP")&&*getenv("Q38_MTP_DUMP")){

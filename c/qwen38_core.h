@@ -299,6 +299,7 @@ typedef struct {
      * its next token in mtp_pend_tok). */
     int mtp, mtp_wiring;
     int mtp_drafts;                   /* drafts per verify when Q38_MTP_DRAFTS is unset */
+    int mtp_pstep;                    /* the verify's depth from the drafts' probabilities when Q38_MTP_PSTEP is unset */
     size_t mtp_expert_bytes;          /* one routed expert of the head, gate, up and down (0 when fused) */
     char mtp_prefix[32];
     float *mtp_norm_emb, *mtp_norm_hid;
@@ -6173,6 +6174,22 @@ static void q38_mtp_igpu_defaults(Model *m){
     if(head->n||slots==head->cap)return;
     if(q38_cache_slots_set(head,slots)){fprintf(stderr,"OOM expert cache\n");exit(1);}
     fprintf(stderr,"[qwen38] MTP head expert cache %d (%s; Q38_MTP_CAP sets it)\n",slots,why);
+}
+
+/* The values for the MTP head beside the CUDA chain with its layer and its routed experts on the
+ * card (q38cc_head_card): three drafts a verify, the verify's depth from their probabilities (the
+ * gate's spec_gate_pick_p). A draft then costs 0.6 ms on the card where a verify row costs a few:
+ * Qwen3.8-Flash-Next IQ2_XS on an RTX PRO 4000, 512-token answers with the card's draft list
+ * (DRAFT_VOCAB_CARD_TOP), 74.1-74.8 tok/s against 67.9-68.4 by the gate's depth; the 128-token
+ * bench's answers 63.0-65.0 against 58.5-60.1 at two drafts. Q38_MTP_DRAFTS
+ * and Q38_MTP_PSTEP override them. */
+static void q38_mtp_card_defaults(Model *m){
+    const char *drafts=getenv("Q38_MTP_DRAFTS"),*pstep=getenv("Q38_MTP_PSTEP");
+    if(!(drafts&&*drafts))m->mtp_drafts=3;
+    if(!(pstep&&*pstep))m->mtp_pstep=1;
+    fprintf(stderr,"[qwen38] MTP drafts per verify %s, the verify's depth by their probabilities %s (the head on the card; "
+                   "Q38_MTP_DRAFTS, Q38_MTP_PSTEP set them)\n",drafts&&*drafts?drafts:"3",
+            pstep&&*pstep?pstep:"1");
 }
 
 static int q38_tm_enabled(void) {
