@@ -327,3 +327,44 @@ s on the card, 0.34 s a layer, nearly all of it the five quant_matmul_blocked pr
 (53 ms each at 5,862 rows); the MoE (97.7 s: routed experts 51.4 with 65.6 s of copying
 their bytes, shared experts 20.5) is now the prompt's larger part. The card's memory: peaks
 of 23.5-23.8 GB in both builds, the desktop's share varying by 0.3 GB.
+
+## The MoE step's copies and tail (`raw/moe_*`, `dn_*`, `pin_trace`, 2026-11-02)
+
+With KDA on the card the MoE was two thirds of the 5,862-token prompt (97.7 of 149.2 s), and
+the card copied its routed experts at 19.5 GB/s (65.6 s for 1.28 TB) where `pin_probe.cu`
+copies the same 17.5 MB from the same kind of memory at 26.2 GB/s one at a time and waited
+for, 26.8 back to back, 20.9 from ordinary memory. The experts came from pinned slots
+(`K3_PIN_TRACE`, a temporary trace: 20 chunks of 1 GiB in the first 3.6 s, the read-ahead
+pool's 1,139 slots, nothing refused; the cache's own slots are only used at decode). What
+slowed them was `k3_down`: it writes the experts' outputs straight into pinned host memory
+over PCIe, a warp 8 rows of 4 floats, 16-byte pieces (111 GB of them in the prompt).
+`zc_probe.cu`: beside such writes at 1.9 GB/s the copies ran at 20.0 GB/s, beside the same
+rate in whole 128-byte rows at 26.5. `k3_down` now gathers its block's 8 rows by 32 outputs
+in shared memory and a warp writes one row's 128 bytes: the same values.
+
+The main thread then held three serial passes over a step's rows: the experts' inputs
+quantized (`mxfp4_qx`, 4.8 s), their outputs' weighted sum (7.7 s: 1.2 GB a layer read on one
+thread, every token's row read and written once per expert) and the latent norm with the
+shared experts' add. The quantization goes 64 rows a task over every worker; the sum a token
+a worker, the token's pairs in the union's order -- j, then q: the union's heads are permuted
+with the ids after pfirst is assigned, so listing a token's pairs by their index e changed the
+tiny model's logits at every step; by j they are its bytes again.
+
+| run | what | result |
+|---|---|---:|
+| `pin_probe.cu` | cudaHostAlloc 1 GiB chunks; 17.5 MB copies | 64 GiB pinned in 5.6 s; 26.2 GB/s one at a time, 26.8 back to back, 20.9 from ordinary memory |
+| `zc_probe.cu` | the same copies beside a kernel writing to mapped pinned memory | none 25.8; k3_down's 16-byte pieces at 1.9 / 3.3 GB/s: 20.0 / 17.6; 128-byte rows at 1.9 / 3.7: 26.5 / 26.5 GB/s |
+| `dn_5862_a` | k3_down's rows whole | copies 65.6 -> 56.7 s (22.9 GB/s); 149.2 -> 140.8 s |
+| `dn_5862_t` | + timers | the weighted sums 7.7 s, the quantization 4.8 s |
+| `dn_5862_b` | + quantization over every worker, the sum by column slices | 132.2 s: 0.8 s and 4.8 s (each token's row still read and written once per expert) |
+| `dn_5862_c` | + the sum by token | 130.6 s: the sums 2.8 s |
+| `moe_2637_logits`, `moe_5862_logits` (`series_moe.sh`) | the logits of every position, against `long_ref` and `big6k_4096` | the same bytes |
+| `moe_5862_new*`, `moe_5862_old*` | A/B twice against fdcce1bc (`pre_moe/`) | **129.2, 130.4 s** against 147.4, 147.4 s: copies 65.2 -> 56.5 s, MoE 97 -> 78 s |
+| `moe_2637_new*`, `moe_2637_old*` | the same at 2,637 tokens | 106.1, 106.4 s against 105.9, 106.1 s: waiting for reads 25 -> 35 s |
+
+The 2,637-token prompt waits for C: as before. At 5,862 tokens a layer now takes about 1.35 s
+of compute against about 1.05 s of the drives' reads (C: busy 73% of the prompt): the routed
+experts' copies are 90% of the MoE's expert phase at 23 GB/s (the drives' DMA and the CPU share
+the RAM they are read from), and the rest is attention (KDA 25 s: its five quant_matmul_blocked
+projections; the MLA core 11.5 s at about 4 TMAC/s, where the card's FP32 allows several times
+that).

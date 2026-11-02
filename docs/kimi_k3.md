@@ -461,10 +461,12 @@ way.
   carry MinGW's bits in `k3_exact_tables.h` (`tools/k3_exact_tables.c` writes it and checks
   every one of the 2^32 floats; `tests/test_k3_cuda_experts.c --all-floats` runs the
   device's code on all of them). Then `mxfp4_qx`'s quantization and down, written straight
-  into one pinned buffer. A feeder thread hands the card every expert whose bytes are in
+  into one pinned buffer, a warp a row's 128 bytes (pieces of 16 bytes over PCIe slowed the
+  expert copies the other way from 26 to 20 GB/s). A feeder thread hands the card every expert whose bytes are in
   RAM as the reads bring them, frees its slot and queues the step's next read into it; the
   CPU computes the shared experts meanwhile, then waves of `K3_GPU_CPU_WAVE` experts
-  itself; the weighted sums run as before, in the union's order.
+  itself; the weighted sums run as before, in the union's order, a token a worker (its pairs
+  listed by j, then q: each element's adds in the one loop's order).
 - **The dense matrices the GPU does not hold** (`k3cu_matmul`): `matmul_i4_grouped`'s
   lanes, group sums and fused scales, `matmul_q`'s lanes and scale; the shared experts as
   one call (gate, up, SiTU, down: `k3cu_shared`). From 64 rows int4 groups of 64 take

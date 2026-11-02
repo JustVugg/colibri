@@ -192,7 +192,14 @@ __global__ void __launch_bounds__(256) k3_down(const uint8_t *__restrict__ w2p, 
         const float s = k3d_hsum8(a[p]);
         if (l == p) v = s;
     }
-    if (p0 + l < r) y[(size_t)(p0 + l) * LT + o] = v;
+    // y is the caller's pinned memory, written over PCIe: a warp writes one row's 32 outputs, 128
+    // bytes (8 rows of 4 floats a warp, 16-byte pieces, slowed the expert copies the other way
+    // from 26 to 20 GB/s)
+    __shared__ float sy[K3_TP][K3_TO];
+    sy[l][q] = v;
+    __syncthreads();
+    const int wr = threadIdx.x >> 5, j = threadIdx.x & 31;
+    if (p0 + wr < r) y[(size_t)(p0 + wr) * LT + blockIdx.x * K3_TO + j] = sy[wr][j];
 }
 
 // ---- the dense matrices the device does not hold, in the CPU's arithmetic ------------------------
@@ -645,7 +652,14 @@ extern "C" size_t k3cu_free_bytes(void) {
 }
 extern "C" void *k3cu_host_alloc(size_t bytes) {
     void *p = nullptr;
-    if (!ready || cudaHostAlloc(&p, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) { cudaGetLastError(); return nullptr; }
+    if (!ready) return nullptr;
+    const cudaError_t e = cudaHostAlloc(&p, bytes, cudaHostAllocMapped | cudaHostAllocPortable);
+    if (e != cudaSuccess) {
+        static int told;
+        if (!told++) fprintf(stderr, "[K3-CUDA] pinned memory: %.2f GB more refused (%s)\n", bytes / 1e9, cudaGetErrorString(e));
+        cudaGetLastError();
+        return nullptr;
+    }
     return p;
 }
 extern "C" void k3cu_host_free(void *p) { if (p) cudaFreeHost(p); }

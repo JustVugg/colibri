@@ -302,6 +302,7 @@ typedef struct {
     /* t_moe's parts: the router and the step's issue, the latent projections, the shared
      * experts, the routed experts' waves (t_eload is its waits) */
     double t_route, t_lat, t_shared, t_wave; uint64_t n_wave;
+    double t_qx, t_wsum;                  /* the waves' inputs quantized (and sent to the GPU), their weighted sums */
     double t_mla;                         /* t_attn's gated MLA layers (the rest: KDA's) */
     double t_mla_gpu;                     /* t_mla's attention cores on the GPU (k3cu_mla) */
     double t_kda_f32, t_kda_conv, t_kda_heads;   /* KDA's f32 projections, a step's conv and heads passes */
@@ -3860,7 +3861,11 @@ static void k3_waves_run(Model *m, int li, K3Waves *w, const float *Z, int strid
         XQ=k3_balloc_bytes((size_t)tot*LT); XS=k3_balloc_bytes((size_t)tot*gb1*sizeof(float));
         GQ=k3_balloc_bytes((size_t)tot*MI); GS=k3_balloc_bytes((size_t)tot*gb2*sizeof(float));
         if(!zq||!zs||!XQ||!XS||!GQ||!GS){ fprintf(stderr,"OOM expert inputs\n"); exit(1); }
-        mxfp4_qx(Z,maxt+1,LT,zq,zs);
+        double tq=now_s();
+        /* every row its own (mxfp4_qx's groups): 64 rows a task over every worker */
+        #pragma omp parallel for schedule(static) if(maxt+1>=128)
+        for(int s0=0;s0<maxt+1;s0+=64)
+            mxfp4_qx(Z+(size_t)s0*LT,maxt+1-s0<64?maxt+1-s0:64,LT,zq+(size_t)s0*LT,zs+(size_t)s0*gb1);
 #ifdef COLI_K3_CUDA
         if(g_k3g_on&&maxt+1>=g_k3g_min_rows&&k3g_begin(m,li,w,zq,zs,maxt+1)){ gpu=1; zq_gpu=zq; zs_gpu=zs; }
         if(!gpu)
@@ -3872,6 +3877,7 @@ static void k3_waves_run(Model *m, int li, K3Waves *w, const float *Z, int strid
             }
             k3_bfree(zq); k3_bfree(zs);
         }
+        m->t_qx+=now_s()-tq;
     } else {
         XF=k3_balloc((int64_t)tot*LT);
         for(int e=0;e<tot;e++) memcpy(XF+(size_t)e*LT,Z+(size_t)poslist[e]*LT,(size_t)LT*sizeof(float));
@@ -3911,15 +3917,34 @@ static void k3_waves_run(Model *m, int li, K3Waves *w, const float *Z, int strid
         k3_waves_take(m,li,w);   /* a step larger than the cache: the slots its computed experts freed */
     }
     if(idle) idle(ctx);   /* every expert was ready at once: nothing to hide it behind */
-    /* the weighted sum, in the union's order and each expert's rows in order, as before */
+    /* the weighted sum, in the union's order and each expert's rows in order, as before. A token
+     * meets each expert once, so its pairs listed in that order (j, then q: the heads were
+     * permuted with the ids, pfirst does not grow with j) add to its row as the one loop did: a
+     * worker a token, its row in cache while its experts' outputs go by once (a 5,862-row step's
+     * 1.2 GB took 84 ms on one thread) */
+    double tws=now_s();
     nu=w->nu;
-    for(int j=0;j<nu;j++)
-        for(int q=0;q<pcnt[j];q++){
-            int e=pfirst[j]+q;
-            float *ut=U+(int64_t)poslist[e]*stride, wk=wlist[e];
-            const float *yr=Y+(size_t)e*LT;
+    int nrow=0;
+    for(int e=0;e<tot;e++) if(poslist[e]>=nrow) nrow=poslist[e]+1;
+    int *ro=k3_balloc_bytes((size_t)(nrow+1)*sizeof(int)), *re=k3_balloc_bytes((size_t)(tot?tot:1)*sizeof(int));
+    if(!ro||!re){ fprintf(stderr,"OOM expert sums\n"); exit(1); }
+    memset(ro,0,(size_t)(nrow+1)*sizeof(int));
+    for(int e=0;e<tot;e++) ro[poslist[e]+1]++;
+    for(int t=0;t<nrow;t++) ro[t+1]+=ro[t];
+    for(int j=0;j<nu;j++)   /* ro[t] ends where ro[t+1] began */
+        for(int q=0;q<pcnt[j];q++){ const int e=pfirst[j]+q; re[ro[poslist[e]]++]=e; }
+    for(int t=nrow;t>0;t--) ro[t]=ro[t-1];
+    ro[0]=0;
+    #pragma omp parallel for schedule(static) if(tot>=256)
+    for(int t=0;t<nrow;t++){
+        float *ut=U+(int64_t)t*stride;
+        for(int k=ro[t];k<ro[t+1];k++){
+            const int e=re[k]; const float wk=wlist[e]; const float *yr=Y+(size_t)e*LT;
             for(int i=0;i<LT;i++) ut[i]+=wk*yr[i];
         }
+    }
+    k3_bfree(ro); k3_bfree(re);
+    m->t_wsum+=now_s()-tws;
     k3_bfree(XQ); k3_bfree(XS); k3_bfree(XF); k3_bfree(GQ); k3_bfree(GS); k3_bfree(G);
 #ifdef COLI_K3_CUDA
     if(Y!=g_k3g_Y)
@@ -4695,12 +4720,14 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
         sd=k3_moe_experts(m,o,li,x,z,C,keff,idxs,wsels,u);
     }
     double t3=now_s();
+    #pragma omp parallel for schedule(static) if(C>1)   /* a prompt step's rows over every worker */
     for(int t=0;t<C;t++)
         rmsnorm_(u+(int64_t)t*LT,u+(int64_t)t*LT,o->lat_norm,LT,c->eps);
     w_matmul(out,u,&o->lat_up,C);
     m->t_lat+=now_s()-t3;
     /* shared experts at full width (a tier step computed them while its batch ran) */
     if(!sd){ double t4=now_s(); sd=k3_shared(m,o,x,C); m->t_shared+=now_s()-t4; }
+    #pragma omp parallel for schedule(static) if(C>1)
     for(int64_t d=0;d<(int64_t)C*c->hidden;d++) out[d]+=sd[d];
     k3_bfree(sco);free(idxs);free(wsels);free(keff);
     k3_bfree(z);k3_bfree(u);free(sd);
@@ -6450,8 +6477,10 @@ int main(int argc, char **argv){
     if(g_lfp){ fclose(g_lfp); g_lfp=NULL; }
     fprintf(stderr,"\n[K3] prefill done in %.1fs (%.2f tok/s)\n",now_s()-t0,np/(now_s()-t0));
     fprintf(stderr,"[K3] the prompt: attention %.1fs (KDA %.1f, MLA %.1f), MoE %.1fs (router and reads issued %.1f, "
-            "latent %.1f, shared %.1f, routed experts computed %.1f, waiting for reads %.1f); %.0f GB read\n",
-            m.t_attn,m.t_attn-m.t_mla,m.t_mla,m.t_moe,m.t_route,m.t_lat,m.t_shared,m.t_wave,m.t_eload,m.ebytes/1e9);
+            "latent %.1f, shared %.1f, routed experts computed %.1f, waiting for reads %.1f, their inputs %.1f, "
+            "their sums %.1f); %.0f GB read\n",
+            m.t_attn,m.t_attn-m.t_mla,m.t_mla,m.t_moe,m.t_route,m.t_lat,m.t_shared,m.t_wave,m.t_eload,m.t_qx,m.t_wsum,
+            m.ebytes/1e9);
     fprintf(stderr,"[K3] the prompt's KDA on the CPU: f32 projections %.1fs, conv %.1fs, heads %.1fs; on the GPU %.1fs; "
             "%.0f page faults\n",m.t_kda_f32,m.t_kda_conv,m.t_kda_heads,m.t_kda_gpu,k3_page_faults()-pf0);
 #ifdef COLI_CUDA
