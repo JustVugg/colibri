@@ -3547,7 +3547,8 @@ __global__ static void __launch_bounds__(256) hcg2_dense_k(float *__restrict__ y
 static int hcm_type(int fmt, int I) {
     int tt = fmt - 100;
     if (tt == 8 || tt == 1 || tt == 30) return I % 32 ? 0 : tt;   /* Q8_0, F16, BF16 */
-    if (tt == 12 || tt == 13 || tt == 14 || tt == 22) return I % 256 ? 0 : tt;   /* 22 IQ2_S: the routed experts' only (hcm_moe) */
+    if (tt == 12 || tt == 13 || tt == 14 || tt == 21 || tt == 22 || tt == 23) return I % 256 ? 0 : tt;   /* 22 IQ2_S: the routed experts' only (hcm_moe) */
+    if (tt == 20) return I % 32 ? 0 : tt;   /* IQ4_NL */
     if (tt == 42) return I % 64 ? 0 : tt;   /* Q2_0: the routed experts' only */
     return 0;
 }
@@ -3625,6 +3626,20 @@ __device__ __forceinline__ void hcm_fetch(HcmRaw &w, const bd_u32 *__restrict__ 
         bd_u32 b = e0 >> 8, e = e0 & 255u, k0 = e >> 3, base = b * 82u;
         w.r[0] = __ldg(W + (base >> 2)); w.r[1] = __ldg(W + ((base + 2u + k0) >> 2)); w.r[2] = __ldg(W + ((base + 34u + k0) >> 2));
         w.r[3] = __ldg(W + ((base + 66u + (k0 >> 2)) >> 2)); w.r[4] = __ldg(W + ((base + 74u + (e >> 5)) >> 2));
+    } else if (T == 23) {   /* IQ4_XS: the scale and the scales' words, the group's 16 bytes of nibbles (8-byte aligned) */
+        bd_u32 b = e0 >> 8, base = b * 136u, q = base + 8u + 16u * ((e0 & 255u) >> 5);
+        uint2 h = __ldg(reinterpret_cast<const uint2 *>(W + (base >> 2)));
+        uint2 a = __ldg(reinterpret_cast<const uint2 *>(W + (q >> 2))), c = __ldg(reinterpret_cast<const uint2 *>(W + (q >> 2) + 2u));
+        w.r[0] = h.x; w.r[1] = h.y; w.r[2] = a.x; w.r[3] = a.y; w.r[4] = c.x; w.r[5] = c.y;
+    } else if (T == 20) {   /* IQ4_NL: the group's 16 bytes of nibbles (words around them), its scale */
+        bd_u32 b = e0 >> 5, base = b * 18u;
+        hcm_ld5(W, base + 2u, w.r);
+        w.r[5] = __ldg(W + (base >> 2));
+    } else if (T == 21) {   /* IQ3_S: the scale, four grid indices, their high bits, the signs, the group's scale nibble */
+        bd_u32 b = e0 >> 8, e = e0 & 255u, k0 = e >> 2, base = b * 110u, oi = base + 2u + k0;
+        w.r[0] = __ldg(W + (base >> 2)); w.r[1] = __ldg(W + (oi >> 2)); w.r[2] = (oi & 2u) ? __ldg(W + (oi >> 2) + 1u) : 0u;
+        w.r[3] = __ldg(W + ((base + 66u + (k0 >> 3)) >> 2)); w.r[4] = __ldg(W + ((base + 74u + (e >> 3)) >> 2));
+        w.r[5] = __ldg(W + ((base + 106u + (e >> 6)) >> 2));
     } else if (T == 42) {   /* Q2_0: the scale, the 16 weights' four bytes of 2-bit codes (two words where they straddle) */
         bd_u32 b = e0 >> 6, base = b * 18u, o = base + 2u + ((e0 & 63u) >> 2);
         w.r[0] = __ldg(W + (base >> 2)); w.r[1] = __ldg(W + (o >> 2)); w.r[2] = (o & 2u) ? __ldg(W + (o >> 2) + 1u) : 0u;
@@ -3649,6 +3664,36 @@ __device__ __forceinline__ void hcm_dec(const HcmRaw &w, bd_u32 e0, bd_u32 *out,
             const uint2 gr = __ldg(reinterpret_cast<const uint2 *>(tab + BDT_IQ2S) + idx);   /* the row in one load */
             bd_codes_h(bdi_neg(gr.x, sg) ^ 0x80808080u, off, s2, z2, out + 4 * ll);
             bd_codes_h(bdi_neg(gr.y, sg >> 4) ^ 0x80808080u, off, s2, z2, out + 4 * ll + 2);
+        }
+        return;
+    }
+    if (T == 23) {   /* IQ4_XS: the group's 6-bit scale less 32 times d, each nibble's kvalue (bdi_kv4) */
+        bd_u32 e = e0 & 255u, ib = e >> 5, sh = 4u * ((e >> 4) & 1u);
+        bd_u32 ls = ((((w.r[1] >> (8u * (ib >> 1))) & 255u) >> (4u * (ib & 1u))) & 15u) | (((w.r[0] >> (16u + 2u * ib)) & 3u) << 4);
+        __half2 off = __float2half2_rn(1152.f), s2 = __float2half2_rn(bd_h2f(w.r[0]) * (float)((int)ls - 32)), z2 = __float2half2_rn(0.f);
+        #pragma unroll
+        for (int k = 0; k < 4; k++) bd_codes_h((bd_u32)bdi_kv4(w.r[2 + k], (int)sh) ^ 0x80808080u, off, s2, z2, out + 2 * k);
+        return;
+    }
+    if (T == 20) {   /* IQ4_NL: each nibble's kvalue (bdi_kv4) times d */
+        bd_u32 b = e0 >> 5, base = b * 18u, o = base + 2u, sh = 4u * ((e0 >> 4) & 1u);
+        __half2 off = __float2half2_rn(1152.f), s2 = __float2half2_rn(bd_h2f(w.r[5] >> ((base & 2u) * 8u))), z2 = __float2half2_rn(0.f);
+        #pragma unroll
+        for (int k = 0; k < 4; k++)
+            bd_codes_h((bd_u32)bdi_kv4(__funnelshift_r(w.r[k], w.r[k + 1], (o & 2u) * 8u), (int)sh) ^ 0x80808080u, off, s2, z2, out + 2 * k);
+        return;
+    }
+    if (T == 21) {   /* IQ3_S: four grid rows of 4 (bytes 1..15, odd) with their signs, times d (1 + 2 s) */
+        bd_u32 b = e0 >> 8, e = e0 & 255u, k0 = e >> 2, base = b * 110u, oi = base + 2u + k0, oh = base + 66u + (k0 >> 3);
+        bd_u32 os = base + 74u + (e >> 3), oc = base + 106u + (e >> 6);
+        bd_u32 i4 = __funnelshift_r(w.r[1], w.r[2], (oi & 2u) * 8u), hb = ((w.r[3] >> ((oh & 3u) * 8u)) >> (k0 & 7u)) & 15u;
+        bd_u32 sg = w.r[4] >> ((os & 2u) * 8u), sc = (w.r[5] >> ((oc & 3u) * 8u)) >> (4u * ((e >> 5) & 1u));
+        float d = bd_h2f(w.r[0] >> ((base & 2u) * 8u)) * (float)(1u + 2u * (sc & 15u));
+        __half2 off = __float2half2_rn(1152.f), s2 = __float2half2_rn(d), z2 = __float2half2_rn(0.f);
+        #pragma unroll
+        for (int l = 0; l < 4; l++) {
+            bd_u32 idx = ((i4 >> (8 * l)) & 255u) | (((hb >> l) & 1u) << 8);
+            bd_codes_h(bdi_neg(__ldg(tab + BDT_IQ3S + idx), sg >> (4 * l)) ^ 0x80808080u, off, s2, z2, out + 2 * l);
         }
         return;
     }
@@ -3858,11 +3903,11 @@ __device__ __forceinline__ void hcm_body(const HcmArgs &A) {
 template<int T, int BM, int BN, bool GLU>
 __global__ static void __launch_bounds__(256, (HcmTile<BM, BN>::MINB)) hcm_dense_k(float *__restrict__ y, const __half *__restrict__ xh,
                                                                              const bd_u32 *__restrict__ w, const bd_u32 *__restrict__ wu,
-                                                                             int rw, int S, int I, int O, int kc) {
+                                                                             int rw, int S, int I, int O, int kc, const bd_u32 *__restrict__ tab) {
     COLI_PDL_WAIT();
     const int m0 = blockIdx.y * BM, kb0 = blockIdx.z * kc;
     HcmArgs A = {y + (size_t)blockIdx.z * S * O, O, nullptr, xh, I, nullptr, m0, S - m0 < BM ? S - m0 : BM, (int)blockIdx.x * BN, kb0,
-                 (I - kb0 < kc ? I - kb0 : kc) / HCM_BK, w, wu, rw, O, nullptr};
+                 (I - kb0 < kc ? I - kb0 : kc) / HCM_BK, w, wu, rw, O, tab};
     hcm_body<T, BM, BN, GLU>(A);
 }
 /* a split K's partial sums, in the order of the splits */
@@ -3877,7 +3922,7 @@ __global__ static void hcm_sum_k(float *__restrict__ y, const float *__restrict_
 #if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))   /* HIP has no carveout attribute; hcm_gemm is off there */
 template<int T, int BM, int BN, bool GLU = false>
 static void hcm_launch(dim3 g, cudaStream_t st, float *y, const __half *xh, const bd_u32 *w, int rw, int S, int I, int O, int kc,
-                       const bd_u32 *wu = nullptr) {
+                       const bd_u32 *wu = nullptr, const bd_u32 *tab = nullptr) {
     constexpr int smem = HcmTile<BM, BN>::SMEM;
     static unsigned set = 0;   /* the devices this kernel's attributes are on */
     int dev = 0;
@@ -3888,7 +3933,7 @@ static void hcm_launch(dim3 g, cudaStream_t st, float *y, const __half *xh, cons
         (void)cudaGetLastError();
         set |= 1u << dev;
     }
-    hcm_dense_k<T, BM, BN, GLU><<<g, 256, smem, st>>>(y, xh, w, wu, rw, S, I, O, kc);
+    hcm_dense_k<T, BM, BN, GLU><<<g, 256, smem, st>>>(y, xh, w, wu, rw, S, I, O, kc, tab);
 }
 #endif
 /* hcm_dense_k for a block tensor's S rows: the inputs in f16 (and a split K's partial sums) in
@@ -3908,6 +3953,7 @@ static int hcm_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float
     }
     int tt = hcm_type(t->fmt, t->I);
     if (tt == 22 || tt == 42) tt = 0;   /* the routed experts' types (hcm_moe): hcm_launch has no dense tiles of them */
+    if (tt == 21 && !bd_table(ctx)) tt = 0;   /* IQ3_S's grid: the decoders' table */
     if (!on || !tt || ctx->compute_major < 8 || S <= BD_GEMV_MAX_S) return 0;
     const int I = t->I, O = t->O, glu = tu != nullptr, OB = glu ? 2 * O : O;   /* OB: the blocks' weight rows */
     if (glu && (tu->fmt != t->fmt || tu->I != I || tu->O != O || tu->row_words != t->row_words || tu->device != t->device)) return 0;
@@ -3950,6 +3996,9 @@ static int hcm_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float
         case 8: hcm_launch<8, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv); break; \
         case 12: hcm_launch<12, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv); break; \
         case 13: hcm_launch<13, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv); break; \
+        case 23: hcm_launch<23, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv); break; \
+        case 20: hcm_launch<20, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv); break; \
+        case 21: hcm_launch<21, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv, bd_table(ctx)); break; \
         default: hcm_launch<14, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv); break; } } while (0)
     #define HCM_GO(BM_, BN_) do { if (glu) HCM_GO2(BM_, BN_, true); else HCM_GO2(BM_, BN_, false); } while (0)
     if (tile == 3) HCM_GO(256, 128); else if (tile == 2) HCM_GO(128, 256); else if (tile == 4) HCM_GO(64, 128); else HCM_GO(128, 128);
@@ -4781,7 +4830,7 @@ static int hcm_moe(DeviceContext *ctx, const CcExpert *tab, const float *x, floa
     const int fd = p->fmt_d ? p->fmt_d : p->fmt, tg = hcm_type(p->fmt, p->D), td = hcm_type(fd, p->I);
     if (!on || !ctx || ctx->compute_major < 8 || !tg || !td || p->D % 4 || p->I % 4 || p->x_row % 4) return 0;
     if (tg == 1 || tg == 30 || td == 1 || td == 30) return 0;   /* 16-bit experts: hcg's tiles (HCM_MOE's types below) */
-    if ((tg == 22 || td == 22) && !btab) return 0;   /* IQ2_S reads its grid from the decoders' table */
+    if ((tg == 22 || td == 22 || tg == 21 || td == 21) && !btab) return 0;   /* IQ2_S and IQ3_S read their grids from the decoders' table */
     const size_t rbg = bd_file_row_bytes(p->fmt, p->D), rbd = bd_file_row_bytes(fd, p->I);
     if (!rbg || !rbd || rbg % 4 || rbd % 4) return 0;
     const size_t A = (size_t)p->S * p->K, nx = (size_t)p->S * p->D, nh = A * p->I;
@@ -4795,6 +4844,8 @@ static int hcm_moe(DeviceContext *ctx, const CcExpert *tab, const float *x, floa
     #define HCM_MOE(K_, T_, ...) do { switch (T_) { \
         case 8: coli_launch(K_<8>, __VA_ARGS__); break;   case 12: coli_launch(K_<12>, __VA_ARGS__); break; \
         case 13: coli_launch(K_<13>, __VA_ARGS__); break; case 22: coli_launch(K_<22>, __VA_ARGS__); break; \
+        case 23: coli_launch(K_<23>, __VA_ARGS__); break; case 20: coli_launch(K_<20>, __VA_ARGS__); break; \
+        case 21: coli_launch(K_<21>, __VA_ARGS__); break; \
         case 42: coli_launch(K_<42>, __VA_ARGS__); break; default: coli_launch(K_<14>, __VA_ARGS__); break; } } while (0)
     HCM_MOE(hcm_moe_gu_k, tg, gg, 256, HcmTile<64, 128>::SMEM, st, tab, (const __half *)xh, hid, m, *p, rwg, btab);
     long long h4 = (long long)(nh / 4);
