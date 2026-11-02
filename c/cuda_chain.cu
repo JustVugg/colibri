@@ -361,6 +361,112 @@ __global__ static void __launch_bounds__(128) cc_attn_k(const float *__restrict_
         o[ob + d] = v;
     }
 }
+/* cc_attn_k for a prompt chunk's rows with a selection list (QSA), a block per (kv head, row):
+ * the G query heads of a kv head read the row's selected keys and values once for all of them,
+ * where a block per query head read them G times (Qwen3.8: 12, the keys from L2 every time).
+ * Each head's arithmetic is cc_attn_k's, in its order (the dot over d, the two trees, the
+ * values in position order), so its bits are the same. Grid: x = kv heads, y = rows. */
+template <int G, typename KT = float>
+__global__ static void __launch_bounds__(128) cc_attn_gk(const float *__restrict__ q, const KT *__restrict__ kc,
+        const KT *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, const int *__restrict__ sel, CcAttn p) {
+    COLI_PDL_WAIT();
+    __shared__ float qs[G][256];
+    __shared__ float pe[G][128];
+    __shared__ int   pt[128];
+    __shared__ float red[G][128];
+    const int kvh = blockIdx.x, s = blockIdx.y, tid = threadIdx.x, h0 = kvh * G;
+    #pragma unroll
+    for (int g = 0; g < G; g++) {
+        const int qb = p.q_off + s * p.q_row + (h0 + g) * p.q_seg;
+        for (int d = tid; d < p.hd; d += 128) qs[g][d] = q[qb + d];
+    }
+    int n = p.pos_base + s + 1;
+    bool list = false;
+    int lb = 0;
+    if (p.sel_row > 0) {
+        lb = p.sel_off + s * p.sel_row;
+        int c = sel[lb];
+        if (c >= 0) { n = c; list = true; }
+    }
+    __syncthreads();
+    float m[G], l[G], acc0[G], acc1[G];
+    #pragma unroll
+    for (int g = 0; g < G; g++) { m[g] = -3.0e38f; l[g] = 0.f; acc0[g] = 0.f; acc1[g] = 0.f; }
+    const int kbase = kvh * p.cap;
+    for (int t0 = 0; t0 < n; t0 += 128) {
+        const int i = t0 + tid;
+        float sv[G];
+        #pragma unroll
+        for (int g = 0; g < G; g++) sv[g] = -3.0e38f;
+        if (i < n) {
+            const int t = list ? sel[lb + 1 + i] : i;
+            pt[tid] = t;
+            const int kb = p.k_off + (kbase + t) * p.hd;
+            float a[G];
+            #pragma unroll
+            for (int g = 0; g < G; g++) a[g] = 0.f;
+            for (int d = 0; d < p.hd; d++) {
+                const float kv = cc_kvf(kc, kb + d);
+                #pragma unroll
+                for (int g = 0; g < G; g++) a[g] += qs[g][d] * kv;
+            }
+            #pragma unroll
+            for (int g = 0; g < G; g++) sv[g] = a[g] * p.scale;
+        }
+        #pragma unroll
+        for (int g = 0; g < G; g++) red[g][tid] = sv[g];
+        __syncthreads();
+        for (int off = 64; off > 0; off >>= 1) {
+            if (tid < off) {
+                #pragma unroll
+                for (int g = 0; g < G; g++) red[g][tid] = fmaxf(red[g][tid], red[g][tid + off]);
+            }
+            __syncthreads();
+        }
+        float mn[G];
+        #pragma unroll
+        for (int g = 0; g < G; g++) mn[g] = fmaxf(m[g], red[g][0]);
+        __syncthreads();
+        #pragma unroll
+        for (int g = 0; g < G; g++) { const float e = i < n ? expf(sv[g] - mn[g]) : 0.f; pe[g][tid] = e; red[g][tid] = e; }
+        __syncthreads();
+        for (int off = 64; off > 0; off >>= 1) {
+            if (tid < off) {
+                #pragma unroll
+                for (int g = 0; g < G; g++) red[g][tid] += red[g][tid + off];
+            }
+            __syncthreads();
+        }
+        #pragma unroll
+        for (int g = 0; g < G; g++) { const float corr = expf(m[g] - mn[g]); l[g] = l[g] * corr + red[g][0]; acc0[g] *= corr; acc1[g] *= corr; }
+        const int cnt = min(128, n - t0), d0 = tid, d1 = tid + 128;
+        for (int j = 0; j < cnt; j++) {
+            const int vb = p.v_off + (kbase + pt[j]) * p.hd;
+            const float v0 = d0 < p.hd ? cc_kvf(vc, vb + d0) : 0.f, v1 = d1 < p.hd ? cc_kvf(vc, vb + d1) : 0.f;
+            #pragma unroll
+            for (int g = 0; g < G; g++) {
+                const float w = pe[g][j];
+                if (d0 < p.hd) acc0[g] += w * v0;
+                if (d1 < p.hd) acc1[g] += w * v1;
+            }
+        }
+        #pragma unroll
+        for (int g = 0; g < G; g++) m[g] = mn[g];
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int g = 0; g < G; g++) {
+        const float inv = l[g] > 0.f ? 1.f / l[g] : 0.f;
+        const int h = h0 + g, ob = p.o_off + s * p.o_row + h * p.hd, gb = p.g_off + s * p.g_row + h * p.g_seg;
+        for (int k = 0; k < 2; k++) {
+            const int d = tid + 128 * k;
+            if (d >= p.hd) break;
+            float v = (k == 0 ? acc0[g] : acc1[g]) * inv;
+            if (p.has_gate) v *= 1.f / (1.f + expf(-gt[gb + d]));
+            o[ob + d] = v;
+        }
+    }
+}
 /* A prompt chunk's plain causal attention on the tensor cores (cc_attn with no selection
  * list, from COLI_CUDA_CHAIN_FLASH rows): chain_attn_flash.comp's way, WMMA f16 x f16 ->
  * f32. A block of 128 (four warps) takes 16 query rows: TPW = 16 / GQ tokens x the GQ query
@@ -2208,7 +2314,7 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
         return launched(c, "attn (tensor cores)");
     }
 #endif
-    (void)fl; (void)G;
+    (void)fl;
     /* a decode's or a verify's rows over many positions: split over them */
     static int dec = -1;
     if (dec < 0) { const char *e = getenv("COLI_CUDA_ATTN_DEC"); dec = !(e && *e == '0'); }
@@ -2257,6 +2363,18 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
                 fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), c->adec, *p, 1, nb, 0, nullptr, 0, 0, hc);
             return launched(c, "attn (positions in blocks)");
         }
+    }
+    /* a prompt chunk's rows with a selection list: a block per (kv head, row), cc_attn_gk, from
+     * COLI_CUDA_ATTN_GROUPED rows (32; 0 = never) */
+    static int gr = -1;
+    if (gr < 0) { const char *e = getenv("COLI_CUDA_ATTN_GROUPED"); gr = e && *e ? atoi(e) : 32; if (gr < 0) gr = 0; }
+    if (gr > 0 && p->sel_row > 0 && p->S >= gr && p->hd <= 256) {
+        dim3 gg((unsigned)p->KVH, (unsigned)p->S);
+        const int *sp = (const int *)sel->d;
+#define CC_ATTN_G(GG) case GG: coli_launch(cc_attn_gk<GG, KT>, gg, 128, 0, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), sp, *p); \
+                      return launched(c, "attn (a kv head's query heads a block)");
+        switch (G) { CC_ATTN_G(2) CC_ATTN_G(4) CC_ATTN_G(6) CC_ATTN_G(8) CC_ATTN_G(12) CC_ATTN_G(16) default: break; }
+#undef CC_ATTN_G
     }
     dim3 grid((unsigned)p->H, (unsigned)p->S);
     coli_launch(cc_attn_k<KT>, grid, 128, 0, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), sel ? (const int *)sel->d : nullptr, *p, 0, nullptr, 0, 0);

@@ -783,6 +783,34 @@ int main(void) {
         ck(T->begin() && T->write(sb, 0, sel.data(), sel.size() * 4) && T->attn(qb, kb, vb, ob, NULL, sb, &ps) && T->submit(1) && maxdiff(down(ob, o.size()).data(), ref.data(), o.size()) < 1e-4, "a selection list, one row causal, no gate");
         T->free(qb); T->free(kb); T->free(vb); T->free(ob); T->free(sb);
     }
+    {   /* a prompt chunk's rows with selection lists, a block per kv head (cc_attn_gk, from 32 rows): each
+         * row the bits of that row alone (cc_attn_k), Qwen3.8's QSA shape (24 / 2 heads of 256, the gate) */
+        const int H = 24, KV = 2, hd = 256, qdim = 2 * hd, cap = 1200, pos_base = 700, S = 40, NS = 400, SR = NS + 1;
+        std::vector<float> q = rnd((size_t)S * H * qdim, 61), kc = rnd((size_t)KV * cap * hd, 62), vc = rnd((size_t)KV * cap * hd, 63);
+        std::vector<int> sel((size_t)S * SR);
+        for (int r = 0; r < S; r++) {
+            const int vis = pos_base + r + 1, c = r == 3 ? -1 : r % 5 == 0 ? 97 : NS;
+            sel[(size_t)r * SR] = c;
+            for (int i = 0; i < NS; i++) sel[(size_t)r * SR + 1 + i] = (int)(((long long)r * 131 + (long long)i * 37) % vis);
+        }
+        CcAttn p = {S, H, KV, hd, pos_base, cap, 0, H * qdim, qdim, hd, H * qdim, qdim, 1, 0, H * hd, 0, SR, 1.f / sqrtf((float)hd), 0, 0};
+        std::vector<float> o((size_t)S * H * hd), ref = o;
+        ref_attn(q.data(), kc.data(), vc.data(), ref.data(), q.data(), sel.data(), &p);
+        CcBuf *qb = up(q), *kb = up(kc), *vb = up(vc), *ob = T->buf(o.size() * 4, CC_DEV), *sb = T->buf(sel.size() * 4, CC_DEV);
+        int ok = T->begin() && T->write(sb, 0, sel.data(), sel.size() * 4) && T->attn(qb, kb, vb, ob, qb, sb, &p) && T->submit(1);
+        std::vector<float> all = down(ob, o.size());
+        ck(ok && maxdiff(all.data(), ref.data(), o.size()) < 1e-4, "40 rows with selection lists, a block per kv head, against the reference");
+        CcBuf *o1 = T->buf((size_t)H * hd * 4, CC_DEV);
+        int same = 1;
+        for (int r = 0; r < S && same; r++) {
+            CcAttn p1 = p; p1.S = 1; p1.pos_base = pos_base + r; p1.q_off = r * p.q_row; p1.g_off = p.g_off + r * p.g_row; p1.o_off = 0; p1.sel_off = r * SR;
+            std::vector<float> one;
+            same = T->begin() && T->attn(qb, kb, vb, o1, qb, sb, &p1) && T->submit(1);
+            if (same) { one = down(o1, (size_t)H * hd); same = !memcmp(one.data(), all.data() + (size_t)r * H * hd, (size_t)H * hd * 4); }
+        }
+        ck(same, "each row the bits of that row alone (a block per query head)");
+        T->free(qb); T->free(kb); T->free(vb); T->free(ob); T->free(sb); T->free(o1);
+    }
     {   /* a decode's or a verify's rows over many positions: in blocks of positions (cc_attn_dec_k) */
         struct { int H, KV, hd, S, pos_base, cap, gate; } cs[] = {{16, 2, 256, 3, 2500, 3000, 1}, {4, 2, 32, 1, 140, 300, 1},
                                                                    {8, 8, 128, 4, 700, 800, 0}, {16, 2, 256, 6, 700, 800, 1},

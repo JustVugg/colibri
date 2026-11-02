@@ -35,6 +35,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   way (`COLI_VK_CHAIN_POOL_CPU_ROWS`): 452 tokens 206-207 -> 471-477, 1012 tokens 308-310 -> 476-482.
   An attention layer's index keys come down in one copy, not one a row (a staged 2612-token prompt
   +3 %).
+- **The CUDA chains' selection attention, a kv head's query heads a block** (`COLI_CUDA_ATTN_GROUPED`):
+  a prompt chunk's QSA rows read their selected keys and values once for the 12 query heads that share
+  them on Qwen3.8, not once a head, with each head's sums in the same order (the same bits). A
+  1012-token prompt on Qwen3.8-Flash-Next IQ2_XS 522-528 -> 641-645 tok/s, 452 tokens 493-504 ->
+  532-538; the decode untouched.
 
 ### Fixed
 
