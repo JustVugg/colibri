@@ -80,6 +80,7 @@ typedef struct {
      * dm_tabd that lacks them (dm_partd: a layer with any such slot); pc_*: the CPU's scratch */
     CcBuf *dm_tabd; int *dm_partd, pool_cpu, pc_cap; float *pc_gu, *pc_hh, *pc_dn;
     unsigned long long pc_pairs; double pc_ms;
+    struct Q38CCSrv *srv; unsigned long long sv_jobs, sv_slots, sv_ns;   /* the pool's server (q38cc_srv_*) and its books merged so far */
     /* pc_prompt: a short prompt's chunks take the decode table too, their pooled slots on the CPU
      * by expert (q38cc_pool_groups) instead of every pooled expert staged over the bus; pg_*: the
      * scratch (slots in expert order, their gathered rows, an activation per expert) */
@@ -1228,6 +1229,7 @@ static double q38cc_cpu_probe(Q38CChain *ch, Model *m, int i, const int *ex, int
     }
     return us;
 }
+static void q38cc_srv_up(Q38CChain *ch, Model *m);
 static void q38cc_pool_init(Model *m) {
     Q38CChain *ch = q38cc_of(m);
     const char *on = getenv("COLI_CUDA_CHAIN_POOL"), *gbs = getenv("COLI_CUDA_CHAIN_POOL_GB");
@@ -1361,6 +1363,7 @@ static void q38cc_pool_init(Model *m) {
         }
         g_q38cc_pg_team = ch->pc_team;
     }
+    if (ch->pool_cpu && fit > 0 && !ch->srv) q38cc_srv_up(ch, m);
     if (ch->pool_n == all && full)
         fprintf(stderr, "[chain] qwen38: host pool, every expert (the %d the card leaves and its own %d) in %.2f GiB of page-locked RAM "
                         "the device reads over the bus (%.1f s to allocate, %.1f s to read; COLI_CUDA_CHAIN_POOL=0 off)\n",
@@ -1834,6 +1837,312 @@ static int q38cc_dm_serve(Q38CChain *ch, Model *m, int i, int n, unsigned v) {
     ch->dm_hyb++; ch->dm_spin_ms += (t1 - t0) * 1e3; ch->dm_host_ms += (t2 - t1) * 1e3; ch->host_ms += (t2 - t1) * 1e3;
     return 1;
 }
+/* ---- the pool's server: a decode step's pooled slots on threads of their own ----------
+ * A decode step's hybrid layer had the recording thread, once it had recorded the layer
+ * after, spin for the layer's routes and then wake OpenMP's team for its few pooled slots (a
+ * sleeping team's wake, three barriers): 83-89 us a slot of 1.44 MiB on an i5-13500's six
+ * performance cores, the device waiting on it. The server's threads take a step's hybrid
+ * layers as jobs the recording thread posts (q38cc_srv_post): each waits for the device's
+ * word itself, takes the gate and up rows eight at a time, then (once every gate and up row
+ * is in) the down rows eight at a time for every slot, and writes those rows' sums where the
+ * device reads them; the thread that ends the last writes the host's word. They spin only
+ * while a forward is in flight (q38cc_srv_open to q38cc_srv_close) and sleep between
+ * forwards. Each slot's bits are q38cc_pool_pairs's: the same activations, the same eight-row
+ * kernels, a row's slots added in rank order from zero (q38cc_dm_serve's sum).
+ * A forward takes it with at most Q38CC_DM_ROWS rows when no layer can miss (every expert on
+ * the card or in the pool: the RAM cache's path stays the recording thread's).
+ * COLI_CUDA_CHAIN_SERVE_THREADS: its threads (q38cc_srv_threads; 0: the recording thread
+ * serves as before). With 16 an i5-13500 took 64-68 us a slot, with 20 105. */
+#include <pthread.h>
+#define Q38CC_SRV_MAX 64                     /* threads at most */
+#define Q38CC_SRV_RING 64                    /* a forward's jobs at most (its hybrid layers) */
+#define Q38CC_SRV_SLOTS (Q38CC_DM_ROWS * 32)
+#define Q38CC_SRV_GU 2                       /* gate/up chunks of eight rows a claim */
+#define Q38CC_SRV_DN 4                       /* down chunks a claim */
+typedef struct {
+    int layer, n, tg, td; unsigned v;
+    const int *ids; const float *w;          /* the layer's routes */
+    int cgu, gud, cdn, dnd;                  /* claims and the chunks done */
+    int xs[Q38CC_DM_ROWS], hs[Q38CC_SRV_SLOTS];   /* a row's and a slot's activation: 0 not made, 1 being made, 2 made */
+    long long t0;                            /* ns: the device's word first seen */
+} Q38CCJob;
+typedef struct Q38CCSrv Q38CCSrv;
+typedef const uint8_t *(*Q38CCWhere)(void *ctx, int k);
+struct Q38CCSrv {
+    int nt, H, I, K, E;
+    pthread_t th[Q38CC_SRV_MAX]; int started;
+    struct Q38CCSrvArg { Q38CCSrv *sv; int me; } arg[Q38CC_SRV_MAX];
+    pthread_mutex_t mx; pthread_cond_t cv;
+    int open, quit, abort_, err;
+    unsigned posted, seen[Q38CC_SRV_MAX];    /* jobs posted; each thread's next job */
+    Q38CCJob job[Q38CC_SRV_RING];
+    const volatile unsigned *dfl; volatile unsigned *hfl;   /* the device's word, the host's */
+    const float *x; float *out;              /* the input rows, the rows the device reads */
+    const uint8_t *res;                      /* [L * E]: 2 or more in the pool */
+    Q38CCWhere where; void *ctx;             /* an expert's place in the pool */
+    float *gu, *hh;                          /* [SLOTS][2I], [SLOTS][I] */
+    gq_act ax[Q38CC_DM_ROWS], ah[Q38CC_SRV_SLOTS];
+    unsigned long long jobs, slots, ns;      /* books (the last thread of a job) */
+};
+static inline void q38cc_relax(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#endif
+}
+static long long q38cc_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long long)t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+#define Q38CC_LD(p) __atomic_load_n(p, __ATOMIC_ACQUIRE)
+#define Q38CC_ST(p, v) __atomic_store_n(p, v, __ATOMIC_RELEASE)
+#define Q38CC_ADD(p, v) __atomic_fetch_add(p, v, __ATOMIC_ACQ_REL)
+/* an activation made once a job, by the first thread to need it */
+static int q38cc_srv_act(int *st, gq_act *a, const float *x, int I) {
+    int z = 0;
+    if (__atomic_compare_exchange_n(st, &z, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        const int bad = gq_act_set(a, x, 1, I) != 0;
+        Q38CC_ST(st, bad ? 3 : 2);
+        return !bad;
+    }
+    int s;
+    while ((s = Q38CC_LD(st)) == 1) q38cc_relax();
+    return s == 2;
+}
+static void q38cc_srv_fail(Q38CCSrv *sv, Q38CCJob *J, const char *why) {
+    if (!__atomic_exchange_n(&sv->err, 1, __ATOMIC_ACQ_REL))
+        fprintf(stderr, "[chain] qwen38: the pool's server: %s (layer %d)\n", why, J->layer);
+    Q38CC_ST(&sv->abort_, 1);
+    __sync_synchronize();
+    *sv->hfl = J->v;   /* the device goes on; the forward is the CPU's again (q38cc_srv_close) */
+    __sync_synchronize();
+}
+static void q38cc_srv_job(Q38CCSrv *sv, Q38CCJob *J) {
+    const int H = sv->H, I = sv->I, K = sv->K, E = sv->E, n = J->n, tg = J->tg, td = J->td;
+    if (Q38CC_LD(&sv->abort_)) return;
+    long long tw = 0;
+    for (unsigned long spin = 0; *sv->dfl < J->v; spin++) {
+        q38cc_relax();
+        if ((spin & 0xFFFu) == 0) {
+            if (Q38CC_LD(&sv->abort_)) return;
+            long long t = q38cc_ns();
+            if (!tw) tw = t;
+            else if (t - tw > 60000000000LL) { q38cc_srv_fail(sv, J, "the device did not reach the routes in 60 s"); return; }
+        }
+    }
+    long long z = 0, t0 = q38cc_ns();
+    __atomic_compare_exchange_n(&J->t0, &z, t0, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    /* the pooled slots, in rank order (every thread the same list) */
+    int pa[Q38CC_SRV_SLOTS], np = 0; const uint8_t *gp[Q38CC_SRV_SLOTS];
+    for (int a = 0; a < n * K; a++) {
+        const int e = J->ids[a];
+        if (e < 0 || e >= E || sv->res[(size_t)J->layer * E + e] < 2) continue;
+        if (!(gp[np] = sv->where(sv->ctx, J->layer * E + e))) { q38cc_srv_fail(sv, J, "an expert without a place in the pool"); return; }
+        pa[np++] = a;
+    }
+    const int64_t rg = gq_row_bytes(tg, H), rd = gq_row_bytes(td, I);
+    const size_t pg = Q38CC_PAD(rg * I);
+    const int cgu = (2 * I + 7) / 8, ngu = np * cgu, cdn = (H + 7) / 8, f8g = gq_f8_ok(tg, H), f8d = gq_f8_ok(td, I);
+    /* gate and up, eight rows a chunk */
+    for (;;) {
+        int c = Q38CC_ADD(&J->cgu, Q38CC_SRV_GU), c1 = c + Q38CC_SRV_GU < ngu ? c + Q38CC_SRV_GU : ngu, c0 = c;
+        if (c >= ngu) break;
+        for (; c < c1; c++) {
+            const int p = c / cgu, o0 = (c % cgu) * 8, o1 = o0 + 8 < 2 * I ? o0 + 8 : 2 * I, s = pa[p] / K;
+            if (!q38cc_srv_act(&J->xs[s], &sv->ax[s], sv->x + (size_t)s * H, H)) { q38cc_srv_fail(sv, J, "no memory for an activation"); return; }
+            float *y = sv->gu + (size_t)p * 2 * I;
+            if (o1 - o0 == 8 && (o1 <= I || o0 >= I) && f8g) {
+                const uint8_t *m = o0 < I ? gp[p] : gp[p] + pg; const int oo = o0 < I ? o0 : o0 - I;
+                gq_rows_f8(y + o0, 1, &sv->ax[s], m + (int64_t)oo * rg, rg, tg, H, 8);
+                continue;
+            }
+            for (int o = o0; o < o1; o++) {
+                const uint8_t *m = o < I ? gp[p] : gp[p] + pg; const int oo = o < I ? o : o - I;
+                gq_row_all(y + o, 1, &sv->ax[s], m + (int64_t)oo * rg, tg, H);
+            }
+        }
+        Q38CC_ADD(&J->gud, c1 - c0);
+    }
+    while (Q38CC_LD(&J->gud) < ngu) { q38cc_relax(); if (Q38CC_LD(&sv->abort_)) return; }
+    /* each slot's SwiGLU and activation, by whoever comes first */
+    for (int p = 0; p < np; p++) {
+        int st = 0;
+        if (!__atomic_compare_exchange_n(&J->hs[p], &st, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
+        const float *gg = sv->gu + (size_t)p * 2 * I, *uu = gg + I; float *h = sv->hh + (size_t)p * I;
+        for (int o = 0; o < I; o++) h[o] = gg[o] / (1.f + expf(-gg[o])) * uu[o];
+        Q38CC_ST(&J->hs[p], gq_act_set(&sv->ah[p], h, 1, I) ? 3 : 2);
+    }
+    for (int p = 0; p < np; p++) {
+        int st;
+        while ((st = Q38CC_LD(&J->hs[p])) == 1) q38cc_relax();
+        if (st != 2) { q38cc_srv_fail(sv, J, "no memory for an activation"); return; }
+    }
+    /* down, eight rows a chunk for every slot, and those rows' sums: a row's slots in rank order from zero */
+    float dl[Q38CC_SRV_SLOTS * 8];
+    for (;;) {
+        int c = Q38CC_ADD(&J->cdn, Q38CC_SRV_DN), c1 = c + Q38CC_SRV_DN < cdn ? c + Q38CC_SRV_DN : cdn, c0 = c;
+        if (c >= cdn) break;
+        for (; c < c1; c++) {
+            const int o0 = c * 8, o1 = o0 + 8 < H ? o0 + 8 : H, w8 = o1 - o0;
+            for (int p = 0; p < np; p++) {
+                const uint8_t *m = gp[p] + 2 * pg;
+                if (w8 == 8 && f8d) { gq_rows_f8(dl + p * 8, 1, &sv->ah[p], m + (int64_t)o0 * rd, rd, td, I, 8); continue; }
+                for (int o = o0; o < o1; o++) gq_row_all(dl + p * 8 + (o - o0), 1, &sv->ah[p], m + (int64_t)o * rd, td, I);
+            }
+            float ys[Q38CC_DM_ROWS][8];
+            memset(ys, 0, sizeof ys);
+            for (int p = 0; p < np; p++) {
+                const float wv = J->w[pa[p]]; float *y = ys[pa[p] / K]; const float *o = dl + p * 8;
+                for (int d = 0; d < w8; d++) y[d] += wv * o[d];
+            }
+            for (int s = 0; s < n; s++) memcpy(sv->out + (size_t)s * H + o0, ys[s], (size_t)w8 * sizeof(float));
+        }
+        __sync_synchronize();   /* the rows (write-combined memory) out before they count */
+        if (Q38CC_ADD(&J->dnd, c1 - c0) + (c1 - c0) == cdn) {   /* the last: the host's word */
+            *sv->hfl = J->v;
+            __sync_synchronize();
+            Q38CC_ADD(&sv->jobs, 1ULL);
+            if (np) {
+                Q38CC_ADD(&sv->slots, (unsigned long long)np);
+                Q38CC_ADD(&sv->ns, (unsigned long long)(q38cc_ns() - Q38CC_LD(&J->t0)));
+            }
+        }
+    }
+}
+static void *q38cc_srv_main(void *p) {
+    struct Q38CCSrvArg *a = (struct Q38CCSrvArg *)p; Q38CCSrv *sv = a->sv;
+    unsigned next = 0;   /* from the first job: a thread may start after it was posted */
+    for (;;) {
+        if (next < Q38CC_LD(&sv->posted)) {
+            q38cc_srv_job(sv, &sv->job[next % Q38CC_SRV_RING]);
+            Q38CC_ST(&sv->seen[a->me], ++next);
+            continue;
+        }
+        if (Q38CC_LD(&sv->quit)) break;
+        if (Q38CC_LD(&sv->open)) { q38cc_relax(); continue; }
+        pthread_mutex_lock(&sv->mx);
+        while (!sv->open && !sv->quit && next >= Q38CC_LD(&sv->posted)) pthread_cond_wait(&sv->cv, &sv->mx);
+        pthread_mutex_unlock(&sv->mx);
+    }
+    return NULL;
+}
+/* nt threads for experts of H by I, K slots a row, E a layer; NULL where it cannot */
+static void q38cc_srv_stop(Q38CCSrv *sv);
+static void q38cc_srv_free(Q38CCSrv *sv) {
+    for (int s = 0; s < Q38CC_DM_ROWS; s++) gq_act_free(&sv->ax[s]);
+    for (int p = 0; p < Q38CC_SRV_SLOTS; p++) gq_act_free(&sv->ah[p]);
+    free(sv->gu); free(sv->hh); free(sv);
+}
+static Q38CCSrv *q38cc_srv_start(int nt, int H, int I, int K, int E, Q38CCWhere where, void *ctx) {
+    if (nt <= 0 || K > 32) return NULL;
+    if (nt > Q38CC_SRV_MAX) nt = Q38CC_SRV_MAX;
+    Q38CCSrv *sv = (Q38CCSrv *)calloc(1, sizeof *sv);
+    if (!sv) return NULL;
+    sv->nt = nt; sv->H = H; sv->I = I; sv->K = K; sv->E = E; sv->where = where; sv->ctx = ctx;
+    sv->gu = (float *)malloc((size_t)Q38CC_SRV_SLOTS * 2 * I * sizeof(float));
+    sv->hh = (float *)malloc((size_t)Q38CC_SRV_SLOTS * I * sizeof(float));
+    int ok = sv->gu && sv->hh;
+    /* the activations' room before the forwards (no allocation while the device waits) */
+    float *zx = ok ? (float *)calloc((size_t)(H > I ? H : I), sizeof(float)) : NULL;
+    ok = ok && zx;
+    for (int s = 0; s < Q38CC_DM_ROWS && ok; s++) ok = gq_act_set(&sv->ax[s], zx, 1, H) == 0;
+    for (int p = 0; p < Q38CC_SRV_SLOTS && ok; p++) ok = gq_act_set(&sv->ah[p], zx, 1, I) == 0;
+    free(zx);
+    if (ok) { pthread_mutex_init(&sv->mx, NULL); pthread_cond_init(&sv->cv, NULL); }
+    for (int t = 0; t < nt && ok; t++) {
+        sv->arg[t] = (struct Q38CCSrvArg){sv, t};
+        if (pthread_create(&sv->th[t], NULL, q38cc_srv_main, &sv->arg[t]) != 0) break;
+        sv->started++;
+    }
+    if (!ok || sv->started < nt) {
+        if (ok) q38cc_srv_stop(sv);
+        else q38cc_srv_free(sv);
+        return NULL;
+    }
+    return sv;
+}
+static void q38cc_srv_stop(Q38CCSrv *sv) {
+    if (!sv) return;
+    pthread_mutex_lock(&sv->mx); Q38CC_ST(&sv->quit, 1); pthread_cond_broadcast(&sv->cv); pthread_mutex_unlock(&sv->mx);
+    for (int t = 0; t < sv->started; t++) pthread_join(sv->th[t], NULL);
+    pthread_mutex_destroy(&sv->mx); pthread_cond_destroy(&sv->cv);
+    q38cc_srv_free(sv);
+}
+/* a forward's jobs read these (the same buffers every layer) */
+static void q38cc_srv_open(Q38CCSrv *sv, const volatile unsigned *dfl, volatile unsigned *hfl, const float *x, float *out,
+                           const uint8_t *res) {
+    sv->dfl = dfl; sv->hfl = hfl; sv->x = x; sv->out = out; sv->res = res;
+    Q38CC_ST(&sv->abort_, 0); Q38CC_ST(&sv->err, 0);
+    pthread_mutex_lock(&sv->mx); Q38CC_ST(&sv->open, 1); pthread_cond_broadcast(&sv->cv); pthread_mutex_unlock(&sv->mx);
+}
+/* layer's pooled slots of a step of n rows, once the device's word reaches v */
+static void q38cc_srv_post(Q38CCSrv *sv, int layer, int n, unsigned v, int tg, int td, const int *ids, const float *w) {
+    unsigned k = sv->posted;
+    Q38CCJob *J = &sv->job[k % Q38CC_SRV_RING];
+    memset(J, 0, sizeof *J);
+    J->layer = layer; J->n = n; J->v = v; J->tg = tg; J->td = td; J->ids = ids; J->w = w;
+    Q38CC_ST(&sv->posted, k + 1);
+}
+/* the forward's end: every thread past every job (ok 0: they skip what is left and the host's
+ * word goes to vmax, the highest the frame waits for, so a device still running waits for
+ * nothing); 0 when a job failed */
+static int q38cc_srv_close(Q38CCSrv *sv, int ok, unsigned vmax) {
+    const unsigned k = Q38CC_LD(&sv->posted);
+    if (!ok) { Q38CC_ST(&sv->abort_, 1); __sync_synchronize(); *sv->hfl = vmax; __sync_synchronize(); }
+    long long t0 = q38cc_ns();
+    for (int t = 0; t < sv->started; t++)
+        for (unsigned long spin = 0; Q38CC_LD(&sv->seen[t]) < k; spin++) {
+            q38cc_relax();
+            if ((spin & 0xFFFu) == 0 && q38cc_ns() - t0 > 60000000000LL) {
+                fprintf(stderr, "[chain] qwen38: the pool's server: a thread did not end its jobs in 60 s\n");
+                Q38CC_ST(&sv->err, 1);
+                break;
+            }
+        }
+    Q38CC_ST(&sv->open, 0);
+    return !Q38CC_LD(&sv->err);
+}
+/* the chain's side of the server: an expert's place in the pool, the forwards that take it, the books */
+static const uint8_t *q38cc_srv_where(void *ctx, int k) { return (const uint8_t *)q38cc_pool_host((Q38CChain *)ctx, k); }
+/* COLI_CUDA_CHAIN_SERVE_THREADS, else the logical CPUs less four (the recording thread, the
+ * driver's, the system's), at most 16, none below two: on an i5-13500 (20 logical CPUs) a decode
+ * after a 452-token prompt took 49.7-50.2 tok/s on the recording thread, 52.4-52.7 with 12
+ * threads, 52.3-52.9 with 16 and 46.1-46.9 with 20 */
+static int q38cc_srv_threads(void) {
+    const char *e = getenv("COLI_CUDA_CHAIN_SERVE_THREADS");
+    if (e && *e) return atoi(e) > 0 ? atoi(e) : 0;
+#ifdef _OPENMP
+    const int n = omp_get_num_procs() - 4;
+    return n < 2 ? 0 : n > 16 ? 16 : n;
+#else
+    return 0;
+#endif
+}
+static void q38cc_srv_up(Q38CChain *ch, Model *m) {
+    const int nt = q38cc_srv_threads();
+    if (nt <= 0) return;
+    if (!(ch->srv = q38cc_srv_start(nt, m->c.hidden, m->c.inter, m->c.topk, m->c.experts, q38cc_srv_where, ch))) {
+        fprintf(stderr, "[chain] qwen38: the pool's server did not start; the recording thread serves a decode step's pooled experts\n");
+        return;
+    }
+    fprintf(stderr, "[chain] qwen38: the pool's server: %d threads for a decode step's pooled experts (COLI_CUDA_CHAIN_SERVE_THREADS=0: "
+                    "the recording thread's)\n", ch->srv->started);
+}
+static Q38CCSrv *q38cc_srv_of(Q38CChain *ch, Model *m, int n) {
+    if (!ch->srv || n > Q38CC_DM_ROWS || !q38cc_pc_step(ch, n) || m->c.layers > Q38CC_SRV_RING) return NULL;
+    for (int i = 0; i < m->c.layers; i++) if (ch->dm_part[i]) return NULL;   /* a layer that can miss */
+    return ch->srv;
+}
+static void q38cc_srv_books(Q38CChain *ch) {
+    Q38CCSrv *sv = ch->srv;
+    const unsigned long long j = Q38CC_LD(&sv->jobs), sl = Q38CC_LD(&sv->slots), ns = Q38CC_LD(&sv->ns);
+    const double ms = (double)(ns - ch->sv_ns) / 1e6;
+    ch->dm_hyb += j - ch->sv_jobs; ch->dm_pairs += sl - ch->sv_slots; ch->pc_pairs += sl - ch->sv_slots;
+    ch->pc_ms += ms; ch->dm_host_ms += ms; ch->host_ms += ms;
+    ch->sv_jobs = j; ch->sv_slots = sl; ch->sv_ns = ns;
+}
 /* after the frame: every layer's books from its ids, and the K/V rows */
 static void q38cc_dm_books(Q38CChain *ch, Model *m, int n, int pb) {
     Cfg *c = &m->c; int L = c->layers, K = c->topk;
@@ -1977,6 +2286,7 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
     int half = c->rotary_dim / 2;
     int snapped = 0;
     double w0 = ch->wait_ms, h0 = ch->host_ms;
+    Q38CCSrv *sv = NULL;   /* a decode step's pooled slots on the server's threads (q38cc_srv_of) */
     ch->pc_prompt = q38cc_pc_take(ch, m, S);   /* a short prompt's pooled experts on the CPU */
     if (S > Q38CC_DM_ROWS && ch->pool_of) { if (ch->pc_prompt) ch->pc_took++; else ch->pc_staged++; }
     if (S > rows && rows > Q38CC_DM_ROWS && E > 0 && ch->dm_on && q38cc_layer_major() && !want_streams && !mixed_h &&
@@ -2010,6 +2320,9 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
             q38cc_dm_end(ch); ch->dm_on = dm = 0;
         }
         if (dm) memset(ch->dm_ran, 0, (size_t)L);
+        if (dm && (sv = q38cc_srv_of(ch, m, n)))
+            q38cc_srv_open(sv, (const volatile unsigned *)cc_ptr(ch->dm_dfl), (volatile unsigned *)cc_ptr(ch->dm_hfl),
+                           (const float *)cc_ptr(ch->mixd), (float *)cc_ptr(ch->dm_hy), ch->dm_res);
         if (!q38cc_frame_begin(ch) || !cc_write(ch->hyper, 0, hyper_h + (size_t)c0 * W, (size_t)n * W * 4) ||
             !q38cc_push_state(ch, m, pb)) goto lost;
         if (dm && q38cc_dm_tab(ch, n) == ch->dm_tabb && !q38cc_stage_from(ch, m, 0)) goto lost;   /* the first staged layer's copy */
@@ -2028,6 +2341,12 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
                 unsigned v = 0;
                 ch->dm_ran[i] = 1;
                 ok = q38cc_dm_layer(ch, m, l, i, n, &v);
+                int fg, fd;
+                if (ok && v && sv && qt_chain_layer_format(i, &fg, &fd) && fg >= 100 && fd >= 100) {   /* the server's from here */
+                    const size_t io = (size_t)i * ch->rows * c->topk;
+                    q38cc_srv_post(sv, i, n, v, fg - 100, fd - 100, (const int *)cc_ptr(ch->dm_idsd) + io, (const float *)cc_ptr(ch->dm_wd) + io);
+                    v = 0;
+                }
                 if (ok && pend_v) ok = q38cc_dm_serve(ch, m, pend_i, n, pend_v);
                 pend_i = i; pend_v = v; routed = ch->dm_y; pending = 1;
                 continue;
@@ -2062,6 +2381,7 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
         ok = ok && cc_submit(0);
         if (ok && pend_v) ok = q38cc_dm_serve(ch, m, pend_i, n, pend_v);   /* the last hybrid layer's, the tail recorded */
         ok = ok && cc_finish();
+        if (sv) { ok = q38cc_srv_close(sv, ok, ch->dm_seq) && ok; q38cc_srv_books(ch); sv = NULL; }
         m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0; ch->wait_ms += (now_s() - t0) * 1e3;
         if (!ok) goto lost;
         if (dm) q38cc_dm_books(ch, m, n, pb);
@@ -2077,6 +2397,7 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
     if (S <= Q38_SPEC_ROWS) { ch->dec_n++; ch->dec_wait_ms += ch->wait_ms - w0; ch->dec_host_ms += ch->host_ms - h0; }   /* a decode step, or a verify's */
     return 1;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
+    if (sv) { q38cc_srv_close(sv, 0, ch->dm_seq); q38cc_srv_books(ch); }
     if (!cc_lost()) cc_finish();
     q38cc_dm_end(ch);
     q38cc_recover(m, pos_base);
@@ -2095,6 +2416,9 @@ static void q38cc_report(Model *m) {
         fprintf(stderr, "[chain] qwen38: %llu layer steps with the routed experts in the frame, %llu of them hybrid "
                         "(%llu slots on the host in %.1f ms, %.1f ms waiting for the device's routes), %llu slots from the host pool\n",
                 ch->dm_steps, ch->dm_hyb, ch->dm_pairs, ch->dm_host_ms, ch->dm_spin_ms, ch->pool_reads);
+    if (ch->srv && ch->sv_jobs)
+        fprintf(stderr, "[chain] qwen38: the pool's server (%d threads): %llu layer steps, %llu pooled slots in %.1f ms (%.1f us a slot)\n",
+                ch->srv->started, ch->sv_jobs, ch->sv_slots, ch->sv_ns / 1e6, ch->sv_slots ? ch->sv_ns / 1e3 / ch->sv_slots : 0.0);
     if (ch->pc_pairs)
         fprintf(stderr, "[chain] qwen38: %llu of a decode step's slots from the host pool on the CPU in %.1f ms (%.1f us a slot; "
                         "COLI_CUDA_CHAIN_POOL_READ=1: the device reads them over the bus)\n",

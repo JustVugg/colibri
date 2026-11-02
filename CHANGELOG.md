@@ -49,6 +49,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   the greedy answers to four prompts the same. The PLE rows go to the card once before the
   projections: they were read from host memory over the bus again for every output row (a decode
   step's key and value 424 and 408 us); decode 50.3-52.8 -> 52.5-54.5 tok/s.
+- **Qwen3.8's CUDA chain: a decode step's pooled experts on threads of their own**
+  (`COLI_CUDA_CHAIN_SERVE_THREADS`). The recording thread computed a hybrid layer's pooled slots
+  itself, through OpenMP's team (woken a layer at a time), once it had recorded the next layer. The
+  pool's server threads wait for the device's routes themselves, take the gate and up rows and then
+  the down rows eight at a time and write the rows' sums where the device reads them, the same bits.
+  Qwen3.8-Flash-Next IQ2_XS on an RTX PRO 4000 with an i5-13500, after a 452-token prompt, the
+  history held fixed: decode 49.7-50.2 -> 52.3-52.9 tok/s (16 threads, 64-68 us a slot against
+  83-89).
 
 ### Fixed
 

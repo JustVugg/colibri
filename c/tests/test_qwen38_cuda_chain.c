@@ -36,6 +36,8 @@ static void t_fill(int t, uint8_t *w, int rows, int cols) {
     for (size_t k = 0; k < nb; k++) { uint16_t h = t_f16(0.004f + (float)(t_rnd() % 1024) / 1024.f * 0.016f); memcpy(w + k * bb, &h, 2); }
 }
 /* a frame's books as q38cc_dm_books keeps them: its routes, miss of them read from the pool */
+struct SrvCtx { uint8_t *pool; size_t st; int ne; };
+static const uint8_t *t_srv_where(void *ctx, int k) { const struct SrvCtx *c = ctx; return c->pool + (size_t)(k % c->ne) * c->st; }
 static int brake_frame(Q38CChain *b, unsigned routes, unsigned miss) { b->routes += routes; b->pool_reads += miss; return q38cc_braked(b); }
 
 int main(void) {
@@ -175,6 +177,84 @@ int main(void) {
         tk(worst < 1e-3, "an expert of more rows: the unpack's arithmetic, within 1e-3 of the row's norm");
         for (int e = 0; e < NE; e++) { gq_act_free(&ax[e]); gq_act_free(&ah[e]); }
         free(pool); free(x); free(xg); free(gu); free(hh); free(dn1); free(dn2);
+    }
+
+    printf(" a decode step's pooled slots on the server's threads\n");
+    {   /* six experts as the pool holds them, three of them pooled (res 2 and 3), routes of eight
+         * slots a row with a slot off the table (-1); each job's rows against q38cc_dm_serve's: the
+         * slots through q38cc_pool_pairs, a row's added in rank order from zero */
+        enum { H = 512, I = 256, NE = 6, K = 8, L = 3, R = 5 };
+        const int tg = GQ_IQ2_S, td = GQ_Q2_0;
+        const int64_t rg = gq_row_bytes(tg, H), rd = gq_row_bytes(td, I);
+        const size_t pg = Q38CC_PAD(rg * I), st = 2 * pg + Q38CC_PAD(rd * H);
+        uint8_t *pool = (uint8_t *)calloc(NE, st);
+        for (int e = 0; e < NE && pool; e++) {
+            t_fill(tg, pool + e * st, I, H); t_fill(tg, pool + e * st + pg, I, H); t_fill(td, pool + e * st + 2 * pg, H, I);
+        }
+        struct SrvCtx sc = {pool, st, NE};
+        uint8_t res[L * NE];
+        for (int k = 0; k < L * NE; k++) res[k] = (uint8_t)(k % NE < 2 ? 1 : k % NE == 5 ? 3 : 2);
+        int ids[L][R * K]; float w[L][R * K];
+        float *x = falloc(R * H), *out = falloc(R * H), *want = falloc(R * H);
+        for (int k = 0; k < R * H; k++) x[k] = (float)(t_rnd() % 2001) / 1000.f - 1.f;
+        for (int i = 0; i < L; i++) for (int a = 0; a < R * K; a++) {
+            ids[i][a] = a % 7 == 6 ? -1 : (int)(t_rnd() % NE); w[i][a] = (float)(t_rnd() % 1000) / 1000.f;
+        }
+        for (int nt = 1; nt <= 4; nt += 3) {
+            Q38CCSrv *sv = pool ? q38cc_srv_start(nt, H, I, K, NE, t_srv_where, &sc) : NULL;
+            tk(sv && sv->started == nt, nt == 1 ? "the server: one thread up" : "the server: four threads up");
+            if (!sv) break;
+            volatile unsigned dfl = 0, hfl = 0;
+            int same = 1, slots = 0; unsigned v = 0;
+            q38cc_srv_open(sv, &dfl, &hfl, x, out, res);
+            for (int rep = 0; rep < 2; rep++) for (int i = 0; i < L; i++) {
+                const int n = rep ? R : 1;   /* a decode step's row, a verify's five */
+                q38cc_srv_post(sv, i, n, ++v, tg, td, ids[i], w[i]);
+                /* q38cc_dm_serve's arithmetic for the same slots */
+                const uint8_t *gp[R * K]; const float *xp[R * K]; int pa[R * K], np = 0;
+                for (int a = 0; a < n * K; a++) {
+                    const int e = ids[i][a];
+                    if (e < 0 || res[i * NE + e] < 2) continue;
+                    gp[np] = pool + e * st; xp[np] = x + (size_t)(a / K) * H; pa[np++] = a;
+                }
+                float *gu = falloc(R * K * 2 * I), *hh = falloc(R * K * I), *dn = falloc(R * K * H);
+                memset(want, 0, (size_t)R * H * sizeof(float));
+                if (!np || q38cc_pool_pairs(gp, xp, np, H, I, tg, td, gu, hh, dn))
+                    for (int p = 0; p < np; p++) {
+                        float *ys = want + (size_t)(pa[p] / K) * H; const float *o = dn + (size_t)p * H, wv = w[i][pa[p]];
+                        for (int d = 0; d < H; d++) ys[d] += wv * o[d];
+                    }
+                else same = 0;
+                free(gu); free(hh); free(dn);
+                slots += np;
+                dfl = v;   /* the device's routes */
+                for (long spin = 0; hfl < v && spin < 2000000000L; spin++) q38cc_relax();
+                if (hfl != v || memcmp(out, want, (size_t)n * H * sizeof(float))) {
+                    if (same) {
+                        double md = 0; int at = -1;
+                        for (int k = 0; k < n * H; k++) if (fabs((double)out[k] - want[k]) > md) { md = fabs((double)out[k] - want[k]); at = k; }
+                        printf("       layer %d rows %d: %d slots, word %u of %u, |d| %.3g at %d (%g against %g)\n", i, n, np, hfl, v, md, at,
+                               at >= 0 ? out[at] : 0.f, at >= 0 ? want[at] : 0.f);
+                    }
+                    same = 0;
+                }
+            }
+            tk(same, "each job's rows: q38cc_dm_serve's bits, decode and verify rows");
+            int cl = q38cc_srv_close(sv, 1, v);
+            if (!(cl && sv->jobs == 2 * L && (int)sv->slots == slots)) printf("       closed %d, jobs %llu, slots %llu of %d\n", cl, sv->jobs, sv->slots, slots);
+            tk(cl && sv->jobs == 2 * L && (int)sv->slots == slots, "the forward closed, its jobs and slots in the books");
+            q38cc_srv_open(sv, &dfl, &hfl, x, out, res);
+            q38cc_srv_post(sv, 0, 1, ++v, tg, td, ids[0], w[0]);
+            q38cc_srv_post(sv, 1, 1, ++v, tg, td, ids[1], w[1]);
+            tk(q38cc_srv_close(sv, 0, v) && hfl == v, "a failed frame: the jobs skipped, the host's word past them");
+            q38cc_srv_open(sv, &dfl, &hfl, x, out, res);
+            q38cc_srv_post(sv, 2, 1, ++v, tg, td, ids[2], w[2]);
+            dfl = v;
+            for (long spin = 0; hfl < v && spin < 2000000000L; spin++) q38cc_relax();
+            tk(q38cc_srv_close(sv, 1, v) && hfl == v, "and the next forward served");
+            q38cc_srv_stop(sv);
+        }
+        free(pool); free(x); free(out); free(want);
     }
 
     if (t_fails) { printf("test_qwen38_cuda_chain: %d failure(s)\n", t_fails); return 1; }
