@@ -124,6 +124,7 @@ class Events:
         self.msg = self.rsn = None
         self.calls, self.usage = {}, None
         self.incomplete_reason = None
+        self.error = None
 
     def ev(self, typ, **kw):
         kw = {"type": typ, "sequence_number": self.seq, **kw}
@@ -131,10 +132,14 @@ class Events:
         return "event: %s\ndata: %s\n\n" % (typ, json.dumps(kw))
 
     def response(self, status):
+        if status == "completed" and self.error:
+            status = "failed"
         if status == "completed" and self.incomplete_reason:
             status = "incomplete"
         r = {"id": self.rid, "object": "response", "created_at": int(time.time()), "status": status, "model": self.model,
              "output": list(self.items)}
+        if status == "failed":
+            r["error"] = self.error
         if status == "incomplete":
             r["incomplete_details"] = {"reason": self.incomplete_reason}
         if status in ("completed", "incomplete"):
@@ -162,7 +167,7 @@ class Events:
             return ""
         m, self.msg = self.msg, None
         part = {"type": "output_text", "text": m["text"], "annotations": []}
-        item = {"type": "message", "id": m["id"], "role": "assistant", "status": "incomplete" if self.incomplete_reason else "completed", "content": [part]}
+        item = {"type": "message", "id": m["id"], "role": "assistant", "status": "incomplete" if self.incomplete_reason or self.error else "completed", "content": [part]}
         self.items.append(item)
         return self.ev("response.output_text.done", item_id=m["id"], output_index=m["i"], content_index=0, text=m["text"]) + \
             self.ev("response.content_part.done", item_id=m["id"], output_index=m["i"], content_index=0, part=part) + \
@@ -228,7 +233,7 @@ class Events:
                 out.append(self.ev("response.custom_tool_call_input.delta", item_id=iid, output_index=i, delta=item["input"]))
                 out.append(self.ev("response.custom_tool_call_input.done", item_id=iid, output_index=i, input=item["input"]))
             else:
-                item = {"type": "function_call", "id": iid, "call_id": cid, "name": e["name"], "arguments": e["args"] or "{}", "status": "incomplete" if self.incomplete_reason else "completed"}
+                item = {"type": "function_call", "id": iid, "call_id": cid, "name": e["name"], "arguments": e["args"] or "{}", "status": "incomplete" if self.incomplete_reason or self.error else "completed"}
                 out.append(self.ev("response.output_item.added", output_index=i, item=dict(item, arguments="", status="in_progress")))
                 out.append(self.ev("response.function_call_arguments.delta", item_id=iid, output_index=i, delta=item["arguments"]))
                 out.append(self.ev("response.function_call_arguments.done", item_id=iid, output_index=i, arguments=item["arguments"]))
@@ -237,6 +242,27 @@ class Events:
         response = self.response("completed")
         out.append(self.ev("response." + response["status"], response=response))
         return "".join(out)
+
+
+def _chat_events(response):
+    """Complete SSE data events, including multiline fields and split reads."""
+    buf, data = b"", []
+    while True:
+        chunk = response.read1(65536)
+        if not chunk:
+            return
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            line = line.rstrip(b"\r")
+            if not line:
+                if data:
+                    yield b"\n".join(data)
+                    data = []
+                continue
+            field, _, value = line.partition(b":")
+            if field == b"data":
+                data.append(value[1:] if value.startswith(b" ") else value)
 
 
 def serve(h, backend):
@@ -279,24 +305,43 @@ def serve(h, backend):
             h.wfile.flush()
     try:
         send(ev.start())
-        buf = b""
-        while True:
-            chunk = resp.read1(65536)
-            if not chunk:
-                break
-            buf += chunk
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                line = line.strip()
-                if not line.startswith(b"data:"):
-                    continue
-                data = line[5:].strip()
-                if data == b"[DONE]":
-                    continue
-                try:
-                    send(ev.chunk(json.loads(data)))
-                except ValueError:
-                    continue
+        done = finished = False
+        try:
+            for data in _chat_events(resp):
+                if data.strip() == b"[DONE]":
+                    done = True
+                    break
+                chunk = json.loads(data)
+                if not isinstance(chunk, dict):
+                    raise ValueError("invalid upstream chat chunk")
+                if "error" in chunk:
+                    error = chunk["error"]
+                    message = error.get("message") if isinstance(error, dict) else None
+                    raise ValueError("upstream error: " + (message if isinstance(message, str) else "request failed"))
+                choices = chunk.get("choices") or []
+                if not isinstance(choices, list):
+                    raise ValueError("invalid upstream choices")
+                for choice in choices:
+                    if not isinstance(choice, dict):
+                        raise ValueError("invalid upstream choice")
+                    reason = choice.get("finish_reason")
+                    if reason is not None:
+                        if reason not in ("stop", "length", "tool_calls", "function_call", "content_filter"):
+                            raise ValueError("invalid upstream finish reason")
+                        finished = True
+                usage = chunk.get("usage")
+                if usage is not None:
+                    if not isinstance(usage, dict):
+                        raise ValueError("invalid upstream usage")
+                    for field in ("prompt_tokens", "completion_tokens"):
+                        count = usage.get(field)
+                        if count is not None and (type(count) is not int or count < 0):
+                            raise ValueError("invalid upstream " + field)
+                send(ev.chunk(chunk))
+            if not done or not finished:
+                raise ValueError("upstream stream ended before completion")
+        except (ValueError, TypeError, AttributeError, OSError, http.client.HTTPException) as error:
+            ev.error = {"code": "server_error", "message": str(error)}
         send(ev.finish())
         if streaming:
             h.wfile.write(b"0\r\n\r\n")
