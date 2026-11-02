@@ -3394,7 +3394,7 @@ static inline int hcg_bt_wf(int fmt) {
 template<int WF, int NW>
 __device__ __forceinline__ void hcg_tile(float *__restrict__ Y, int yld, const int *yr, const float *__restrict__ X, int xld, const int *xr,
                                          int M, const uint8_t *const *W, const float *const *sc, int gs, int N, int K, int n0,
-                                         int planar = 0) {
+                                         int planar = 0, int kb = 0, int ke = -1) {   /* [kb, ke): a split K's part (-1: K) */
 #if HCG_BODY
     using namespace nvcuda;
     constexpr int STG = (1 + NW) * TCG_BM * HCG_LDH * 2, EPI = NW * TCG_BM * (TCG_BN + 4) * 4;   /* bytes */
@@ -3407,15 +3407,16 @@ __device__ __forceinline__ void hcg_tile(float *__restrict__ Y, int yld, const i
     for (int w = 0; w < NW; w++) for (int j = 0; j < 2; j++) wmma::fill_fragment(acc[w][j], 0.f);
     int ng = WF == 4 ? (K + gs - 1) / gs : 1, n = n0 + (threadIdx.x >> 2);
     HcgW<WF> rw[NW]; float4 rx[4];
-    hcg_fetch_x(rx, X, xld, xr, M, 0);
+    if (ke < 0) ke = K;
+    hcg_fetch_x(rx, X, xld, xr, M, kb);
     #pragma unroll
-    for (int w = 0; w < NW; w++) hcg_fetch_w<WF>(rw[w], W[w], sc[w], gs, ng, n, N, 0, K, planar);
+    for (int w = 0; w < NW; w++) hcg_fetch_w<WF>(rw[w], W[w], sc[w], gs, ng, n, N, kb, K, planar);
     hcg_store_x(Xs, rx);
     #pragma unroll
     for (int w = 0; w < NW; w++) hcg_store_w<WF>(Ws[w], rw[w], planar);
     __syncthreads();
-    for (int k0 = 0; k0 < K; k0 += HCG_BK) {
-        bool next = k0 + HCG_BK < K;   /* block-uniform */
+    for (int k0 = kb; k0 < ke; k0 += HCG_BK) {
+        bool next = k0 + HCG_BK < ke;   /* block-uniform */
         if (next) {   /* in flight while the tensor cores work on this step */
             hcg_fetch_x(rx, X, xld, xr, M, k0 + HCG_BK);
             #pragma unroll
@@ -3463,18 +3464,20 @@ __device__ __forceinline__ void hcg_tile(float *__restrict__ Y, int yld, const i
     }
 #else
     (void)Y; (void)yld; (void)yr; (void)X; (void)xld; (void)xr; (void)M; (void)W; (void)sc; (void)gs; (void)N; (void)K; (void)n0; (void)planar;
+    (void)kb; (void)ke;
 #endif
 }
 template<int WF>
 __global__ static void __launch_bounds__(256) hcg_dense_k(float *__restrict__ y, const float *__restrict__ x, const uint8_t *__restrict__ w,
-                                                          const float *__restrict__ sc, int gs, int S, int I, int O) {
+                                                          const float *__restrict__ sc, int gs, int S, int I, int O, int kc) {
     COLI_PDL_WAIT();
     __shared__ int rows[TCG_BM];
     int m0 = blockIdx.y * TCG_BM, M = S - m0 < TCG_BM ? S - m0 : TCG_BM;
     if (threadIdx.x < TCG_BM) rows[threadIdx.x] = m0 + (threadIdx.x < M ? threadIdx.x : 0);
     __syncthreads();
     const uint8_t *W[1] = {w}; const float *Sc[1] = {sc};
-    hcg_tile<WF, 1>(y, O, rows, x, I, rows, M, W, Sc, gs, O, I, blockIdx.x * TCG_BN);
+    const int kb = (int)blockIdx.z * kc;   /* split K (hcg_split): this block's inputs, its partial sums at split z */
+    hcg_tile<WF, 1>(y + (size_t)blockIdx.z * S * O, O, rows, x, I, rows, M, W, Sc, gs, O, I, blockIdx.x * TCG_BN, 0, kb, I - kb < kc ? I : kb + kc);
 }
 /* A prompt chunk's rows of a block-format tensor through tiles four times hcg_tile's: 128 rows
  * x 128 outputs a block of 256 threads, K in steps of 64. Warp w: rows 64 (w & 1) .. + 63,
@@ -3487,7 +3490,7 @@ __global__ static void __launch_bounds__(256) hcg_dense_k(float *__restrict__ y,
 #define HCG2_BN 128
 template<int WF>
 __global__ static void __launch_bounds__(256) hcg2_dense_k(float *__restrict__ y, const float *__restrict__ x, const uint8_t *__restrict__ w,
-                                                           const float *__restrict__ sc, int gs, int S, int I, int O) {
+                                                           const float *__restrict__ sc, int gs, int S, int I, int O, int kc) {
     COLI_PDL_WAIT();
 #if HCG_BODY
     using namespace nvcuda;
@@ -3504,13 +3507,15 @@ __global__ static void __launch_bounds__(256) hcg2_dense_k(float *__restrict__ y
     for (int i = 0; i < 4; i++) for (int j = 0; j < 2; j++) wmma::fill_fragment(acc[i][j], 0.f);
     HcgW<WF> rw0, rw1; float4 rx0[4], rx1[4];
     const int M1 = M - 64;   /* the rows of the second half (<= 0: none) */
-    hcg_fetch_x(rx0, x, I, rows, M, 0); hcg_fetch_x(rx1, x, I, rows + 64, M1, 0);
-    hcg_fetch_w<WF>(rw0, w, sc, gs, 1, nt, O, 0, I, 0); hcg_fetch_w<WF>(rw1, w, sc, gs, 1, nt + 64, O, 0, I, 0);
+    const int kb = (int)blockIdx.z * kc, ke = I - kb < kc ? I : kb + kc;   /* split K (hcg_split): this block's inputs */
+    y += (size_t)blockIdx.z * S * O;   /* its partial sums */
+    hcg_fetch_x(rx0, x, I, rows, M, kb); hcg_fetch_x(rx1, x, I, rows + 64, M1, kb);
+    hcg_fetch_w<WF>(rw0, w, sc, gs, 1, nt, O, kb, I, 0); hcg_fetch_w<WF>(rw1, w, sc, gs, 1, nt + 64, O, kb, I, 0);
     hcg_store_x(Xs, rx0); hcg_store_x(Xs + 64, rx1);
     hcg_store_w<WF>(Ws, rw0, 0); hcg_store_w<WF>(Ws + 64, rw1, 0);
     __syncthreads();
-    for (int k0 = 0; k0 < I; k0 += HCG_BK) {
-        bool next = k0 + HCG_BK < I;   /* block-uniform */
+    for (int k0 = kb; k0 < ke; k0 += HCG_BK) {
+        bool next = k0 + HCG_BK < ke;   /* block-uniform */
         if (next) {   /* in flight while the tensor cores work on this step */
             hcg_fetch_x(rx0, x, I, rows, M, k0 + HCG_BK); hcg_fetch_x(rx1, x, I, rows + 64, M1, k0 + HCG_BK);
             hcg_fetch_w<WF>(rw0, w, sc, gs, 1, nt, O, k0 + HCG_BK, I, 0); hcg_fetch_w<WF>(rw1, w, sc, gs, 1, nt + 64, O, k0 + HCG_BK, I, 0);
@@ -3552,7 +3557,7 @@ __global__ static void __launch_bounds__(256) hcg2_dense_k(float *__restrict__ y
             __syncwarp();
         }
 #else
-    (void)y; (void)x; (void)w; (void)sc; (void)gs; (void)S; (void)I; (void)O;
+    (void)y; (void)x; (void)w; (void)sc; (void)gs; (void)S; (void)I; (void)O; (void)kc;
 #endif
 }
 /* the types hcm_dense_k takes, I a multiple of their block; 0 elsewhere (the other tiles) */
@@ -3851,6 +3856,36 @@ __global__ static void hcm_sum_k(float *__restrict__ y, const float *__restrict_
     for (int z = 1; z < ns; z++) v += p[(size_t)z * n + i];
     y[i] = v;
 }
+/* hcg_dense_k's and hcg2_dense_k's split K, as hcm_gemm's: a call with fewer blocks than the
+ * multiprocessors take (per_sm each) splits its inputs up to a wave, 512 inputs a split at
+ * least, at most 8, in whole blocks of 256 (a GGUF's super-block); the splits' partial sums
+ * in scratch, then hcm_sum_k. A narrow output over long rows was a few blocks down every
+ * input: Qwen3.8's hyper-connection read (10240 x 320, int8) at 235 rows, 20 blocks, 172 us
+ * on an RTX PRO 4000. COLI_CUDA_HCG_SPLIT=n: n splits always (1 none). */
+struct HcgPart { float *yp; void *scr; int ns, kc; };
+static HcgPart hcg_part(const DeviceContext *ctx, float *y, long long blocks, int per_sm, int S, int I, int O, int can, cudaStream_t st) {
+    static int force = -1;
+    if (force < 0) { const char *e = getenv("COLI_CUDA_HCG_SPLIT"); force = e && *e ? atoi(e) : 0; if (force < 0) force = 0; }
+    HcgPart h = {y, nullptr, 1, I};
+    const long long slots = (long long)ctx->sms * per_sm;
+    int ns = 1;
+    if (force > 0) ns = force;
+    else if (blocks < slots) { long long f = slots / blocks; ns = (int)(f < I / 512 ? f : I / 512); }
+    if (ns > 8) ns = 8;
+    if (!can || ns <= 1 || I < 512) return h;
+    int kc = ((I + ns - 1) / ns + 255) / 256 * 256;
+    if (kc >= I) return h;
+    ns = (I + kc - 1) / kc;
+    if (cudaMallocAsync(&h.scr, (size_t)ns * S * O * sizeof(float), st) != cudaSuccess) { (void)cudaGetLastError(); h.scr = nullptr; return h; }
+    h.yp = (float *)h.scr; h.ns = ns; h.kc = kc;
+    return h;
+}
+static void hcg_part_sum(const HcgPart &h, float *y, int S, int O, cudaStream_t st) {
+    if (h.ns <= 1) return;
+    const long long ny = (long long)S * O;
+    hcm_sum_k<<<(unsigned)((ny + 255) / 256), 256, 0, st>>>(y, h.yp, ny, h.ns);
+    (void)cudaFreeAsync(h.scr, st);
+}
 #if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))   /* HIP has no carveout attribute; hcm_gemm is off there */
 template<int T, int BM, int BN, bool GLU = false>
 static void hcm_launch(dim3 g, cudaStream_t st, float *y, const __half *xh, const bd_u32 *w, int rw, int S, int I, int O, int kc,
@@ -3958,10 +3993,16 @@ static int bd_tensor_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const
     if (big < 0) { const char *e = getenv("COLI_CUDA_BD_TILE2"); big = !(e && *e == '0'); }
     if (big && S > TCG_BM) {
         dim3 g2((unsigned)((t->O + HCG2_BN - 1) / HCG2_BN), (unsigned)((S + HCG2_BM - 1) / HCG2_BM));
-        HCG_BT_LAUNCH(hcg2_dense_k, t->fmt, g2, st, y, x, w, bt, t->fmt, S, t->I, t->O);
+        HcgPart h = hcg_part(ctx, y, (long long)g2.x * g2.y, 1, S, t->I, t->O, 1, st);   /* one block a multiprocessor */
+        g2.z = (unsigned)h.ns;
+        HCG_BT_LAUNCH(hcg2_dense_k, t->fmt, g2, st, h.yp, x, w, bt, t->fmt, S, t->I, t->O, h.kc);
+        hcg_part_sum(h, y, S, t->O, st);
         return cuda_ok(cudaGetLastError(), "block gemm launch");
     }
-    HCG_BT_LAUNCH(hcg_dense_k, t->fmt, g, st, y, x, w, bt, t->fmt, S, t->I, t->O);   /* a type's own tiles where one is built */
+    HcgPart h = hcg_part(ctx, y, (long long)g.x * g.y, 2, S, t->I, t->O, 1, st);
+    g.z = (unsigned)h.ns;
+    HCG_BT_LAUNCH(hcg_dense_k, t->fmt, g, st, h.yp, x, w, bt, t->fmt, S, t->I, t->O, h.kc);   /* a type's own tiles where one is built */
+    hcg_part_sum(h, y, S, t->O, st);
     return cuda_ok(cudaGetLastError(), "block gemm launch");
 }
 extern "C" int coli_cuda_host_register(void *p, size_t bytes) {
@@ -4376,9 +4417,13 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, cons
         (t->fmt == 1 || t->fmt == 2 || (t->fmt == 4 && t->gs >= 16 && t->gs % 16 == 0))) {
         dim3 g((unsigned)((t->O + TCG_BN - 1) / TCG_BN), (unsigned)((S + TCG_BM - 1) / TCG_BM));
         const uint8_t *w = (const uint8_t *)t->weights;
-        if (t->fmt == 1) coli_launch(hcg_dense_k<1>, g, 256, 0, st, y_dev, x_dev, w, t->scales, 0, S, t->I, t->O);
-        else if (t->fmt == 2) coli_launch(hcg_dense_k<2>, g, 256, 0, st, y_dev, x_dev, w, t->scales, 0, S, t->I, t->O);
-        else coli_launch(hcg_dense_k<4>, g, 256, 0, st, y_dev, x_dev, w, t->scales, t->gs, S, t->I, t->O);
+        /* split K where its splits keep whole groups: int8 and int4 rows' scale per row, int4's per gs inputs */
+        HcgPart h = hcg_part(ctx, y_dev, (long long)g.x * g.y, 2, S, t->I, t->O, t->fmt != 4 || 256 % t->gs == 0, st);
+        g.z = (unsigned)h.ns;
+        if (t->fmt == 1) coli_launch(hcg_dense_k<1>, g, 256, 0, st, h.yp, x_dev, w, t->scales, 0, S, t->I, t->O, h.kc);
+        else if (t->fmt == 2) coli_launch(hcg_dense_k<2>, g, 256, 0, st, h.yp, x_dev, w, t->scales, 0, S, t->I, t->O, h.kc);
+        else coli_launch(hcg_dense_k<4>, g, 256, 0, st, h.yp, x_dev, w, t->scales, t->gs, S, t->I, t->O, h.kc);
+        hcg_part_sum(h, y_dev, S, t->O, st);
         return cuda_ok(cudaGetLastError(), "chain tensor-core gemm launch");
     }
     /* TF32 (sm_80 and later), int8 and int4 rows */
