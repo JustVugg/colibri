@@ -35,6 +35,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1035,7 +1036,7 @@ class Cancelled(BaseException):
 
 
 def new_job(kind, title, **kw):
-    jid = "%x" % int(time.time() * 1000)
+    jid = uuid.uuid4().hex
     job = {"id": jid, "kind": kind, "title": title, "state": "queued", "done": 0, "total": 0, "rate": 0, "eta": None,
            "msg": "", "started": time.time(), "cancel": False, **kw}
     with _jlock:
