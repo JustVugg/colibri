@@ -1202,27 +1202,35 @@ def switch_model(path, force=False, tier=None):
     folder and environment) with --model changed; `tier` ram or gpu also turns the GPU off or
     on. A model that does not start brings the previous one back."""
     path = os.path.realpath(path)
-    if not os.path.isdir(path) or not under_roots(path):
+    if not os.path.isdir(path):
         raise ValueError("cartella del modello non valida")
-    old = gateway_proc()
-    answering = False
-    try:
-        gw_json("/health", timeout=3)
-        answering = True
-    except urllib.error.HTTPError:
-        answering = True
-    except (OSError, ValueError):
-        pass
-    if answering and old and not old["coli"]:
-        raise RuntimeError("la porta %d è di un altro processo (%d): non lo tocco" % (CFG.port, old["pid"]))
-    if answering and not old:
-        raise RuntimeError("non trovo il processo di coli serve sulla porta %d su questa macchina: fermalo e "
-                           "riavvialo con coli serve --model %s" % (CFG.port, path))
-    if answering and not force and not gw_idle():
-        raise RuntimeError("il motore sta rispondendo a una richiesta: riprova quando ha finito")
     if not _switching.acquire(blocking=False):
         raise RuntimeError("sto già cambiando modello: aspetta che finisca")
-    job = new_job("switch", os.path.basename(path), dest=path)
+    try:
+        # The current gateway and its health must belong to this admitted
+        # operation, not a snapshot from before another switch completed.
+        if not under_roots(path):
+            raise ValueError("cartella del modello non valida")
+        old = gateway_proc()
+        answering = False
+        try:
+            gw_json("/health", timeout=3)
+            answering = True
+        except urllib.error.HTTPError:
+            answering = True
+        except (OSError, ValueError):
+            pass
+        if answering and old and not old["coli"]:
+            raise RuntimeError("la porta %d è di un altro processo (%d): non lo tocco" % (CFG.port, old["pid"]))
+        if answering and not old:
+            raise RuntimeError("non trovo il processo di coli serve sulla porta %d su questa macchina: fermalo e "
+                               "riavvialo con coli serve --model %s" % (CFG.port, path))
+        if answering and not force and not gw_idle():
+            raise RuntimeError("il motore sta rispondendo a una richiesta: riprova quando ha finito")
+        job = new_job("switch", os.path.basename(path), dest=path)
+    except BaseException:
+        _switching.release()
+        raise
 
     def go():
         try:
@@ -1284,7 +1292,12 @@ def switch_model(path, force=False, tier=None):
             job.update(state="error", msg=str(e)[:400])
         finally:
             _switching.release()
-    threading.Thread(target=go, daemon=True).start()
+    try:
+        threading.Thread(target=go, daemon=True).start()
+    except BaseException as error:
+        job.update(state="error", msg=str(error)[:400])
+        _switching.release()
+        raise
     return job
 
 
