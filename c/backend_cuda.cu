@@ -4581,7 +4581,8 @@ __global__ static void moe_sum_k(const CcExpert *__restrict__ tab, const int *__
     COLI_PDL_WAIT();
     int s = blockIdx.y, d = blockIdx.x * 256 + threadIdx.x;
     if (d >= p.D) return;
-    size_t dn = (size_t)p.S * p.K * p.I;
+    size_t dn = (size_t)(p.lay_S > 0 ? p.lay_S : p.S) * p.K * p.I;   /* the layout's: lay_S rows (CcMoe) */
+    const int hs = p.lay_s0 + s;
     float v = p.h_off >= 0 ? hy[p.h_off + (size_t)s * p.D + d] : 0.f;
     /* eight slots a pass: their ids, then their table entries, then their rows, each a batch
      * of independent loads (slot by slot they were three dependent loads each); the sum keeps
@@ -4597,7 +4598,7 @@ __global__ static void moe_sum_k(const CcExpert *__restrict__ tab, const int *__
         #pragma unroll
         for (int j = 0; j < 8; j++) {
             wk[j] = on[j] ? w[p.w_off + s * p.w_row + k0 + j] : 0.f;
-            hk[j] = on[j] ? hid[dn + (size_t)(s * p.K + k0 + j) * p.D + d] : 0.f;
+            hk[j] = on[j] ? hid[dn + (size_t)(hs * p.K + k0 + j) * p.D + d] : 0.f;
         }
         #pragma unroll
         for (int j = 0; j < 8; j++) if (on[j]) v += wk[j] * hk[j];
@@ -4609,7 +4610,7 @@ __global__ static void moe_sum_k(const CcExpert *__restrict__ tab, const int *__
  * after the floats: cnt[E] base[E + 1] cur[E] ntile[1] te[T] tr[T] order[A] posof[A]. */
 struct MoeSort { int *cnt, *base, *cur, *ntile, *te, *tr, *order, *posof; int T; };
 static MoeSort moe_sort_of(float *hid, const CcMoe *p) {
-    size_t A = (size_t)p->S * p->K;
+    size_t A = (size_t)(p->lay_S > 0 ? p->lay_S : p->S) * p->K;
     int *q = reinterpret_cast<int *>(hid + A * (size_t)(p->I + p->D));
     MoeSort m;
     m.T = (int)((A + 63) / 64 + (size_t)(p->E < (int)A ? p->E : (int)A));
@@ -4689,10 +4690,10 @@ __global__ static void moe_rows_sum_k(const float *__restrict__ w, const float *
     COLI_PDL_WAIT();
     int s = blockIdx.y, d = blockIdx.x * 256 + threadIdx.x;
     if (d >= p.D) return;
-    const float *yd = hid + (size_t)p.S * p.K * p.I;
+    const float *yd = hid + (size_t)(p.lay_S > 0 ? p.lay_S : p.S) * p.K * p.I;   /* the layout's (CcMoe.lay_S) */
     float v = p.h_off >= 0 ? hy[p.h_off + (size_t)s * p.D + d] : 0.f;
     for (int k = 0; k < p.K; k++) {
-        int pos = m.posof[s * p.K + k];
+        int pos = m.posof[(p.lay_s0 + s) * p.K + k];
         if (pos >= 0) v += w[p.w_off + s * p.w_row + k] * yd[(size_t)pos * p.D + d];
     }
     y[p.y_off + (size_t)s * p.y_row + d] = v;
@@ -5240,6 +5241,8 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
                                    float *hid, float *y, const float *hy, const CcMoe *p, void *stream) {
     if (fault_injected()) return 0;
     if (!tab || !ids || !hid || !p || p->S < 1 || p->K < 1 || p->D < 32 || p->I < 32 || p->D % 32 || p->I % 32 || p->act) return 0;
+    const int LS = p->lay_S > 0 ? p->lay_S : p->S;   /* the rows hid's layout is for: a part 1's, its rows' sums' (CcMoe.lay_S) */
+    if (p->lay_S < 0 || p->lay_s0 < 0 || p->lay_s0 > LS - p->S || ((p->parts & 1) && (LS != p->S || p->lay_s0))) return 0;
     if (p->fmt >= 100) {   /* a GGUF's experts: a decode step's rows on the GEMV kernels, a prompt chunk's sorted through the f16 tiles */
         if (!moe_bd_ok(p) || p->D > MOE_DIM_MAX || p->I > MOE_DIM_MAX) return 0;
         DeviceContext *bc = find_ctx(device);
@@ -5248,7 +5251,7 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
         const bd_u32 *btab = bd_table(bc);
         static int tiles = -1;
         if (tiles < 0) { const char *e = getenv("COLI_CUDA_BD_TILES"); tiles = !(e && *e == '0'); }   /* 0: every row on the GEMV kernels */
-        int brows = tiles && btab && p->S > CC_MOE_FRAME_ROWS && p->E > 0 && p->E <= 4096 && hcg_ok(bc) && p->D % HCG_BK == 0 && p->I % HCG_BK == 0 &&
+        int brows = tiles && btab && LS > CC_MOE_FRAME_ROWS && p->E > 0 && p->E <= 4096 && hcg_ok(bc) && p->D % HCG_BK == 0 && p->I % HCG_BK == 0 &&
                     (!x || ((uintptr_t)(x + p->x_off) & 15) == 0) && p->x_row % 4 == 0;
         MoeSort bm = moe_sort_of(hid, p);
         if ((p->parts & 1) && (!x || !(brows ? moe_rows_bd_launch(bc, tab, x, ids, hid, bm, p, btab, bst) : moe_bd_launch(bc, tab, x, ids, hid, p, bst))))
@@ -5271,10 +5274,10 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
     /* a prompt chunk's rows through the tensor cores (sorted by expert), where the device and
      * the format have them; else, and for a decode step, the warp kernels per (row, slot) */
     /* f16 (sm_70 and later) where the widths are whole steps of 64, else TF32 (sm_80) */
-    int f16 = p->S > CC_MOE_FRAME_ROWS && p->E > 0 && p->E <= 4096 && hcg_ok(ctx) && p->D % HCG_BK == 0 && p->I % HCG_BK == 0 &&
+    int f16 = LS > CC_MOE_FRAME_ROWS && p->E > 0 && p->E <= 4096 && hcg_ok(ctx) && p->D % HCG_BK == 0 && p->I % HCG_BK == 0 &&
               (p->fmt == 1 || p->fmt == 2 || (p->fmt == 4 && p->gs >= 16 && p->gs % 16 == 0)) &&
               (!x || ((uintptr_t)(x + p->x_off) & 15) == 0) && p->x_row % 4 == 0;
-    int rows = f16 || (p->S > CC_MOE_FRAME_ROWS && p->E > 0 && p->E <= 4096 && tcg_ok(ctx) && p->D % TCG_BK == 0 && p->I % TCG_BK == 0 &&
+    int rows = f16 || (LS > CC_MOE_FRAME_ROWS && p->E > 0 && p->E <= 4096 && tcg_ok(ctx) && p->D % TCG_BK == 0 && p->I % TCG_BK == 0 &&
                (p->fmt == 1 || p->fmt == 2 || (p->fmt == 4 && p->gs >= TCG_BK && p->gs % TCG_BK == 0)) &&
                (!x || ((uintptr_t)(x + p->x_off) & 15) == 0) && p->x_row % 4 == 0);
     if (p->planar && !(f16 && p->fmt == 4 && p->gs == 64)) return 0;   /* planar entries: only the f16 GEMMs read them */

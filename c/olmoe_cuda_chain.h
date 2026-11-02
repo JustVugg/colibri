@@ -514,7 +514,7 @@ static int occ_layer(OccChain *ch, Model *m, int i, int n, int pb) {
          cc_matmul(ch->wo[i], ch->ctx, 0, ch->tmp, 0, n) && cc_ew(ch->x, ch->x, ch->tmp, NULL, NULL, &add);
     /* the router, its softmax and top-k (moe_routed's rules), the experts, the residual */
     CcRoute ro = {n, E, K, 0, 0, E, 0, 0, io, K, io, K, 1, 1, c->norm_topk ? 1 : 0, 1.f, 1.f, 0.f};
-    CcMoe mp = {n, K, D, c->inter, ch->fmt[i], 0, 0, 3, i * E, 0, D, io, K, io, K, 0, D, -1, E, 0, ch->fmt_d[i]};
+    CcMoe mp = {n, K, D, c->inter, ch->fmt[i], 0, 0, 3, i * E, 0, D, io, K, io, K, 0, D, -1, E, 0, ch->fmt_d[i], 0, 0};
     ok = ok && occ_norm(ch->x, 0, ch->prm, ch->o_post[i], ch->h2, 0, n, D, c->eps) &&
          cc_matmul(ch->wg[i], ch->h2, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->ids, ch->wt, &ro) &&
          cc_moe(ch->tab, ch->h2, ch->ids, ch->wt, ch->hid, ch->y, NULL, &mp) && cc_ew(ch->x, ch->x, ch->y, NULL, NULL, &add);

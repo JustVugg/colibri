@@ -153,6 +153,8 @@ typedef struct {
     int planar;   /* the table may hold CcExpert.planar entries: refused where the GEMMs cannot read them */
     int fmt_d;    /* fmt >= 100 (a GGUF's blocks, ggml type fmt - 100 for gate and up): down's,
                      0 = fmt's; a matrix's rows as the file has them, padded to words */
+    int lay_S, lay_s0;   /* parts 2 only: hid as a parts 1 of lay_S rows left it (0: S), this call's
+                            S rows its rows lay_s0.. (a prompt chunk's lanes sum their own rows) */
 } CcMoe;
 /* the ggml types cc_moe takes for a GGUF's experts (CcMoe.fmt >= 100: cuda_bd.cuh's integer step) */
 static inline int cc_moe_block_type(int t) {

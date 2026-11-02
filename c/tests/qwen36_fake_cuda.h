@@ -615,7 +615,9 @@ static int fcc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf
     fake_chain_ops++;
     const CcExpert *tb = (const CcExpert *)tab->d + p->t_off;
     const int *id = (const int *)ids->d;
-    float *hd = hid->d + (size_t)p->S * p->K * p->I;
+    const int LS = p->lay_S > 0 ? p->lay_S : p->S;   /* hid's layout's rows (CcMoe.lay_S) */
+    if (p->lay_s0 < 0 || p->lay_s0 > LS - p->S || ((p->parts & 1) && (LS != p->S || p->lay_s0))) return 0;
+    float *hd = hid->d + (size_t)LS * p->K * p->I;
     if (p->parts & 1) {
         if (!x) return 0;
         for (int s = 0; s < p->S; s++) {
@@ -646,7 +648,7 @@ static int fcc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf
                 int e = id[p->i_off + s * p->i_row + k];
                 if (e < 0 || e >= p->E || !tb[e].g) continue;
                 float wk = w->d[p->w_off + s * p->w_row + k];
-                const float *dn = hd + ((size_t)s * p->K + k) * p->D;
+                const float *dn = hd + ((size_t)(p->lay_s0 + s) * p->K + k) * p->D;
                 for (int d = 0; d < p->D; d++) yr[d] += wk * dn[d];
             }
         }
