@@ -22,6 +22,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 - **`/health` reports the NVIDIA cards** (`system.gpus`: use, memory, temperature, power, from
   `nvidia-smi` at most once a second), for the monitors.
 
+### Performance
+
+- **Qwen3.8's CUDA and Vulkan chains: a short prompt's host pool experts on the CPU.** A prompt chunk copied
+  every pooled expert of every layer over the bus, routed or not (18 GB for any prompt up to
+  2048 tokens on Qwen3.8-Flash-Next IQ2_XS with an RTX PRO 4000). A prompt of one chunk now has
+  the CPU compute its pooled slots, grouped by expert, while the card computes its own, where a
+  measure of the bus and of the CPU at startup says it is faster
+  (`COLI_CUDA_CHAIN_POOL_CPU_ROWS`, 0 off). 452 tokens 213-215 -> 480-491 tok/s, 1012 tokens
+  357-367 -> 500-518, 76 tokens 42.7 -> 206, 1912 tokens 418 -> 433-439; the decode the same (48.5
+  against 48.6 tok/s after the 1012-token prompt, the history held fixed). The Vulkan chain the same
+  way (`COLI_VK_CHAIN_POOL_CPU_ROWS`): 452 tokens 206-207 -> 471-477, 1012 tokens 308-310 -> 476-482.
+  An attention layer's index keys come down in one copy, not one a row (a staged 2612-token prompt
+  +3 %).
+
 ### Fixed
 
 - The chat page's first-run dialog waits for the models service to finish measuring the
