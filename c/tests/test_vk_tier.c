@@ -2641,6 +2641,12 @@ static unsigned long long after(const char *line, const char *key) {
     return p ? strtoull(p + strlen(key), NULL, 10) : ~0ull;
 }
 
+/* A device that stages its uploads (a card without Resizable BAR, COLI_VK_STAGED=1)
+ * imports no host pointers, so the compute site's zero-copy slab aliases cannot exist
+ * and the lever refuses whole (vk_tier.c's alias gate): its alias cases measure only
+ * what such a device can do -- the standing path, no aliases, no fallbacks counted. */
+static int host_imports(void) { return coli_vk_import_alignment() != 0; }
+
 /* ---- the compute site (COLI_VK_TIER_EXPERTS, CS-1b) -----------------------------
  * One decode token's routed experts as ONE expert-batch group issued at the finish
  * site: vkt_issue defers the S==1 step, vkt_issue_group submits the residents'
@@ -2759,6 +2765,7 @@ static void cs_report(const char *line, unsigned long long *g, unsigned long lon
 }
 static void cs_group_v4(int armed) {
     rng = 7;
+    if (armed && !host_imports()) armed = 0;   /* a staged device refuses the lever at init (vk_tier.c's alias gate); measure the standing path */
     VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
     model_make(f, f); g_act = VKT_ACT_SWIGLU_V4; g_limit = 10.0f;
     uint32_t hist[L][E], *rows[L];
@@ -2779,7 +2786,7 @@ static void cs_group_v4(int armed) {
     CHECK(n == 2, "cs v4: %d warm of 2 planned (%s)", n, armed ? "armed" : "unarmed");
     VktAliasSrc asrc[E]; void *slabs[E];
     for (int e = 0; e < E; e++) slabs[e] = NULL;
-    if (armed) for (int e = 2; e <= 4; e++)
+    if (armed && host_imports()) for (int e = 2; e <= 4; e++)
         CHECK(cs_alias_slab(0, e, &asrc[e], &slabs[e]), "cs v4: alias slab for expert %d", e);
     static const int routes[][K] = {{0, 1, 2}, {0, 1, 3}, {1, 2, 4}, {0, 2, 3}};
     float w[K] = {0.5f, 0.3f, 0.2f};
@@ -2804,7 +2811,7 @@ static void cs_group_v4(int armed) {
         printf("  cs v4 (unarmed): device %llu of %llu assignments, %llu aliased, worst %.2e\n",
                bk.dev, bk.routed, aliased, no_nan(worst));
     CHECK(bk.dev > 0, "cs v4 (%s): nothing ran on the device", armed ? "armed" : "unarmed");
-    if (armed)
+    if (armed && host_imports())
         CHECK(cg == 4 && cr == 6 && ca == 6 && cf == 0 && cx == 0,
               "cs v4 armed: the group did not engage (cs: %llu groups, %llu resident + %llu aliased, "
               "%llu fallback, %llu refusals)", cg, cr, ca, cf, cx);
@@ -2815,6 +2822,7 @@ static void cs_group_v4(int armed) {
     model_free();
 }
 static void cs_group_i8(int armed) {
+    if (armed && !host_imports()) armed = 0;   /* a staged device refuses the compute site at init; measure the standing path */
     rng = 7;
     VktFmt f = {VKT_SRC_I8_ROW, 0};
     model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
@@ -2865,6 +2873,7 @@ static void cs_group_i8(int armed) {
 static void cs_grow(void) {
     lever_pin_save();
     rng = 7;
+    int no_imports = !host_imports();
     VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
     model_make(f, f); g_act = VKT_ACT_SWIGLU_V4; g_limit = 10.0f;
     const double eb = (double)vkt_expert_bytes(H, F, f, f);
@@ -2893,7 +2902,7 @@ static void cs_grow(void) {
     CHECK(n == 2 && dg_res() == 2, "cs grow: %d warm of 2 planned", n);
     VktAliasSrc asrc[E]; void *slabs[E];
     for (int e = 0; e < E; e++) slabs[e] = NULL;
-    for (int e = 2; e <= 4; e++)
+    if (host_imports()) for (int e = 2; e <= 4; e++)
         CHECK(cs_alias_slab(0, e, &asrc[e], &slabs[e]), "cs grow: alias slab for expert %d", e);
     static const int routes[][K] = {{0, 1, 2}, {0, 1, 3}, {1, 2, 4}, {0, 2, 3}};
     float w[K] = {0.5f, 0.3f, 0.2f};
@@ -2902,10 +2911,10 @@ static void cs_grow(void) {
         VktAliasSrc src[K];
         for (int k = 0; k < K; k++) {
             int e = routes[t][k];
-            src[k] = e >= 2 ? asrc[e] : (VktAliasSrc){0};
+            src[k] = (!no_imports && e >= 2) ? asrc[e] : (VktAliasSrc){0};
         }
         vkt_begin_forward();
-        double r = cs_group_step(0, routes[t], w, src, 1, 10.0f, 1, &bk, &aliased);
+        double r = cs_group_step(0, routes[t], w, src, 1, 10.0f, no_imports ? 0 : 1, &bk, &aliased);
         if (!(r <= worst)) worst = r;
         vkt_settle();
     }
@@ -2913,10 +2922,10 @@ static void cs_grow(void) {
     const char *grow = strstr(line, "decode grow: ");
     printf("  cs grow (EXPERTS + DECODE_GROW): residents 2 -> %d, aliased %llu, worst %.2e, \"%s\"\n",
            dg_res(), aliased, no_nan(worst), grow ? grow : "no clause");
-    CHECK(dg_res() == 4, "cs grow: %d residents, not the warm 2 + 2", dg_res());
-    CHECK(vkt_resident(0, 2) && vkt_resident(0, 3), "cs grow: the hot aliases did not install");
-    CHECK(!vkt_resident(0, 4), "cs grow: a below-cutoff alias installed");
-    CHECK(strstr(line, "decode grow: 2 installed by decode-only rank (cutoff 30)"), "cs grow: the growth clause");
+    if (!no_imports) CHECK(dg_res() == 4, "cs grow: %d residents, not the warm 2 + 2", dg_res());
+    if (!no_imports) CHECK(vkt_resident(0, 2) && vkt_resident(0, 3), "cs grow: the hot aliases did not install");
+    if (!no_imports) CHECK(!vkt_resident(0, 4), "cs grow: a below-cutoff alias installed");
+    if (!no_imports) CHECK(strstr(line, "decode grow: 2 installed by decode-only rank (cutoff 30)"), "cs grow: the growth clause");
     CHECK(no_nan(worst) < 2e-2, "cs grow: rows off the reference (%.3g)", no_nan(worst));
     vkt_shutdown();
     for (int e = 0; e < E; e++) free(slabs[e]);
@@ -4598,10 +4607,18 @@ int main(int argc, char **argv) {
     printf("decode grow:\n"); decode_grow(dg_leg);
     printf("tier adaptive:\n"); tier_adaptive_case();
     printf("DeepSeek V4:\n"); v4_act();
-    printf("compute site:\n"); cs_group();
-    printf("compute site alias cache:\n"); cs_alias_cache();
-    printf("compute site VA reuse:\n"); cs_alias_va_reuse();
-    printf("compute site scan skip:\n"); cs_alias_scan_skip(dprof_leg);
+    /* The compute site's cases measure its zero-copy slab aliases, which exist only where
+     * the device imports host pointers. A device that stages its uploads (a card without
+     * Resizable BAR, COLI_VK_STAGED=1) makes vk_tier.c refuse the lever whole -- one named
+     * line, decode on the standing issue/join path -- so these cases do not apply there. */
+    if (host_imports()) {
+        printf("compute site:\n"); cs_group();
+        printf("compute site alias cache:\n"); cs_alias_cache();
+        printf("compute site VA reuse:\n"); cs_alias_va_reuse();
+        printf("compute site scan skip:\n"); cs_alias_scan_skip(dprof_leg);
+    } else {
+        printf("compute site: this device stages its uploads (no host imports) -- the lever refuses; the cases need aliases\n");
+    }
     printf("s1 GEMV:\n"); s1gemv_case(s1_leg);
     printf("stream:\n"); stream();
     printf("stream batch:\n"); stream_batch();

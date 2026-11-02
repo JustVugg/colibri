@@ -4611,6 +4611,15 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
             fprintf(stderr, VKT_TAG " tier %s: cs experts refused: the engine wires no finish-site group -- decode keeps the issue/join path\n", eng);
             T.csx = 0;
         }
+        /* the alias gate: the group's zero-copy entries ARE imports of the store's host
+         * slabs, and a device that stages its uploads (a card without Resizable BAR, or
+         * COLI_VK_STAGED=1) imports no host pointers at all -- the group would arm and
+         * then alias nothing (every entry a CPU fallback, a counted refusal a layer).
+         * Refuse the lever whole there (one line); decode keeps the issue/join path. */
+        if (T.csx && !coli_vk_import_alignment()) {
+            fprintf(stderr, VKT_TAG " tier %s: cs experts refused: the device stages its uploads (no host-pointer import) -- the zero-copy slab aliases cannot exist, decode keeps the issue/join path\n", eng);
+            T.csx = 0;
+        }
         if (T.csx != 1 && T.csx != 2) T.csx = 0;
         if (T.csx == 2 && !(T.dgrow && T.dgrow_head)) {
             fprintf(stderr, VKT_TAG " tier %s: COLI_VK_TIER_EXPERTS=2 is the growth composition and needs COLI_VK_TIER_DECODE_GROW_HEADROOM armed with it; the compute site stays off\n", eng);
