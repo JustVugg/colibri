@@ -16,4 +16,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build the CUDA image
-        run: docker build -t colibri:cuda-12.4 -f docker/Dockerfile.cuda .
+        run: docker build -t colibri:2.1.0-cuda-12.4 -f docker/Dockerfile.cuda .
