@@ -21,9 +21,11 @@ def read_run(path: Path) -> dict[tuple[int, int], int]:
         layer, expert, count = map(int, fields)
         if layer < 0:  # header record (route_trace.h), not an expert
             continue
+        if expert < 0 or count < 0:
+            raise ValueError(f"{path}:{lineno}: expert and count must be non-negative")
         counts[layer, expert] = count
-    if not counts:
-        raise ValueError(f"{path}: empty stats")
+    if not counts or not any(counts.values()):
+        raise ValueError(f"{path}: empty stats (no positive routing counts)")
     return counts
 
 
