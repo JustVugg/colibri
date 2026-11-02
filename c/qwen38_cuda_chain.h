@@ -94,6 +94,8 @@ typedef struct {
     CcBuf *qkv, *z, *ab, *cv, *dny, *lg, *gs, *us, *hs, *ds, *sgd;
     CcBuf *emb, *embd, *keys, *val, *gated, *normv;   /* emb: the PLE rows the host writes, embd: on the device */
     CcBuf *mixd, *lgd, *kvd, *outd, *hypd, *find, *routed, *cs, *pcs;
+    CcBuf *outdev, *gpick;   /* a greedy caller's logits on the card and their picks down (q38cc_greedy_ok) */
+    unsigned long long greedy_rows;
     CcBuf *gseg, *nseg;               /* a deep verify's PLE rows past its first copy (q38cc_ple) */
     /* the MTP head's layer (index c.layers) on the device (q38cc_mtp_rows): its norms in prm, the
      * embedding rows in (fin), a one per stream (ones), the rows and drafts it ran */
@@ -2913,10 +2915,24 @@ static int q38cc_chunk_lanes(Q38CChain *ch, Model *m, const int *ids, int c0, in
     return ok;
 }
 
+/* A caller that only wants each logit row's argmax (m->greedy_out: a greedy decode's verify or
+ * step) has the card pick them (cc_pick_rows) and copy down two words a row instead of the
+ * rows' 248,320 logits, which the host copied and scanned again (Qwen3.8-Flash-Next on an RTX
+ * PRO 4000: 4 MB a verify of four rows, then a row's copy and scan a token, 0.7-0.9 ms between
+ * a verify and the next draft). A decode step's or verify's rows of one chunk.
+ * COLI_CUDA_CHAIN_GREEDY_CARD=0: the logits down. */
+static int q38cc_greedy_ok(Model *m, int S, int nlogits) {
+    const char *e = getenv("COLI_CUDA_CHAIN_GREEDY_CARD");
+    const int on = !(e && *e == '0');
+    const Q38CChain *ch = g_cuda_chain ? q38cc_of(m) : NULL;
+    return on && m->greedy_out && ch && ch->ok && !ch->failed && S <= Q38_SPEC_ROWS && nlogits >= 1 && nlogits <= S &&
+           S <= q38cc_rows_env() && cc_pick_rows_ready();
+}
 /* Every layer for S rows. hyper_h: the rows' streams in, the final ones out when
  * want_streams; mixed_h (or NULL): every row's final mixed row, for the prefill
- * read-out; logit: the last nlogits rows' logits. 0 = not taken (nothing changed, or
- * the device was lost and the state rebuilt: the CPU runs the step), 1 = done. */
+ * read-out; logit: the last nlogits rows' logits (a greedy caller's picks instead, in
+ * m->greedy_out, q38cc_greedy_ok). 0 = not taken (nothing changed, or the device was lost
+ * and the state rebuilt: the CPU runs the step), 1 = done. */
 static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlogits, float *hyper_h,
                          int want_streams, float *mixed_h, float *logit) {
     if (!g_cuda_chain || m->mux_rows) return 0;
@@ -2935,10 +2951,16 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
         ch->failed = 1;
         return 0;
     }
+    Q38CCSrv *sv = NULL;   /* a decode step's pooled slots on the server's threads (q38cc_srv_of) */
+    const int greedy = !mixed_h && q38cc_greedy_ok(m, S, nlogits);   /* the rows' argmax only (q38_forward sized logit for it) */
+    if (greedy && (!cc_reserve(&ch->outdev, (size_t)nlogits * V * 4, CC_DEV) || !cc_reserve(&ch->gpick, (size_t)nlogits * 8, CC_DOWN))) {
+        if (cc_lost()) goto lost;
+        fprintf(stderr, "[chain] qwen38: device memory for a greedy step's logits refused; this step on the CPU\n");
+        return 0;
+    }
     int half = c->rotary_dim / 2;
     int snapped = 0;
     double w0 = ch->wait_ms, h0 = ch->host_ms;
-    Q38CCSrv *sv = NULL;   /* a decode step's pooled slots on the server's threads (q38cc_srv_of) */
     ch->pc_prompt = q38cc_pc_take(ch, m, S);   /* a short prompt's pooled experts on the CPU */
     if (S > Q38CC_DM_ROWS && ch->pool_of) { if (ch->pc_prompt) ch->pc_took++; else ch->pc_staged++; }
     if (S > rows && rows > Q38CC_DM_ROWS && E > 0 && ch->dm_on && q38cc_layer_major() && !want_streams && !mixed_h &&
@@ -3044,7 +3066,8 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
         if (ok && mixed_h) ok = cc_copy(ch->find, 0, ch->mixed, 0, (size_t)n * H);
         if (ok && need_final && lo_n > 0 && c0 + n > S - nlogits) {
             int dst = c0 + lo0 - (S - nlogits);
-            ok = cc_matmul(q38cc_t(ch, &m->lm_head), ch->mixed, (size_t)lo0 * H, ch->outd, (size_t)dst * V, lo_n);
+            ok = cc_matmul(q38cc_t(ch, &m->lm_head), ch->mixed, (size_t)lo0 * H, greedy ? ch->outdev : ch->outd, (size_t)dst * V, lo_n);
+            if (ok && greedy) ok = cc_pick_rows(ch->outdev, (size_t)dst * V, ch->gpick, V, lo_n);   /* one chunk: dst 0 */
         }
         double t0 = now_s();
         ok = ok && cc_submit(0);
@@ -3063,7 +3086,12 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
         ch->dn_where = Q38CC_DEV; ch->host_zero = 0;
     }
     q38cc_dm_end(ch);
-    memcpy(logit, cc_ptr(ch->outd), (size_t)nlogits * V * sizeof(float));
+    if (greedy) {
+        const int *pk = (const int *)cc_ptr(ch->gpick);
+        for (int r = 0; r < nlogits; r++) m->greedy_out[r] = pk[2 * r];
+        m->greedy_done = 1;
+        ch->greedy_rows += (unsigned long long)nlogits;
+    } else memcpy(logit, cc_ptr(ch->outd), (size_t)nlogits * V * sizeof(float));
     ch->snap_valid = snapped;
     ch->forwards++;
     if (S <= Q38_SPEC_ROWS) { ch->dec_n++; ch->dec_wait_ms += ch->wait_ms - w0; ch->dec_host_ms += ch->host_ms - h0; }   /* a decode step, or a verify's */
@@ -3266,4 +3294,5 @@ static void q38cc_report(Model *m) {
                         "%llu frames braked, %.1f %% of the routes on the card\n",
                 ch->promos, ch->promo_victims, ch->npend, ch->pr_braked,
                 ch->routes ? 100.0 * (double)(ch->routes - ch->pool_reads) / (double)ch->routes : 0.0);
+    if (ch->greedy_rows) fprintf(stderr, "[chain] qwen38: %llu greedy rows picked on the card, no logits down (COLI_CUDA_CHAIN_GREEDY_CARD=0: the logits)\n", ch->greedy_rows);
 }

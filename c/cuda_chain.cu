@@ -1560,9 +1560,11 @@ __global__ static void __launch_bounds__(256) cc_route_k(const float *__restrict
 __global__ static void cc_signal_k(volatile unsigned *f, unsigned v) { __threadfence_system(); *f = v; __threadfence_system(); }
 __global__ static void cc_wait_k(volatile unsigned *f, unsigned v) { while (*f < v) { } __threadfence_system(); }
 /* one block of 256, two passes: the argmax of n logits (lowest index on a tie) into word 0
- * of out and its softmax probability (terms within 20 of the maximum) into word 1 */
+ * of out and its softmax probability (terms within 20 of the maximum) into word 1; a block a
+ * row, the row's n logits and two words past the block before's (cc_pick_rows) */
 __global__ static void __launch_bounds__(256) cc_pick_k(const float *__restrict__ lg, void *__restrict__ out, int n) {
     COLI_PDL_WAIT();
+    lg += (size_t)blockIdx.x * n; out = (char *)out + (size_t)blockIdx.x * 8;
     __shared__ float rv[8];
     __shared__ int ri[8];
     int tid = threadIdx.x, lane = tid & 31, sg = tid >> 5;
@@ -2760,6 +2762,12 @@ static int cc_pick(CcBuf *logits, CcBuf *out, int n) {
     coli_launch(cc_pick_k, 1, 256, 0, c->stream, fp(logits), out->d, n);
     return launched(c, "pick");
 }
+static int cc_pick_rows(CcBuf *logits, size_t off, CcBuf *out, int n, int rows) {
+    CcCtx *c = live();
+    if (!c || !logits || !out || n < 1 || rows < 1 || (off + (size_t)rows * n) * 4 > logits->bytes || out->bytes < (size_t)rows * 8) return 0;
+    coli_launch(cc_pick_k, (unsigned)rows, 256, 0, c->stream, fp(logits) + off, out->d, n);
+    return launched(c, "pick rows");
+}
 static int cc_matmul_rows(ColiCudaTensor *t, CcBuf *ids, CcBuf *x, CcBuf *y, int n) {
     CcCtx *c = live();
     if (!c || !t || !ids || !x || !y || n < 1) return 0;
@@ -3142,5 +3150,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_lfm3,
     cc_matmul_glu,
     cc_addnorm,
+    cc_pick_rows,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

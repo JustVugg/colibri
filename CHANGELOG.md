@@ -24,6 +24,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **Qwen3.8's CUDA chain: a greedy answer's tokens picked on the card.** At temperature 0 and
+  without logprobs a decode step's or a verify's rows only need their argmax: the card picks
+  them (`pick_rows`, the lowest place on a tie as before) and two words a row come down, where
+  the host copied every row's 248,320 logits (4 MB a verify of four rows) and scanned each again
+  between a verify and the next draft. Qwen3.8-Flash-Next IQ2_XS on an RTX PRO 4000, MTP head on
+  the card, a 512-token answer served: 74.6-78.1 -> 78.3-82.4 tok/s. The text is the same.
+  `COLI_CUDA_CHAIN_GREEDY_CARD=0`: the logits down.
 - **Qwen3.8's promotion brake at 97 % (it was 90).** The CUDA chain stops promoting experts to the card while the last 64 frames found this share of their routes there. With the MTP head on the card, a verify's layer with a missing expert waits for the CPU, and at 90 those waits were what the brake kept. Qwen3.8-Flash-Next IQ2_XS on an RTX PRO 4000, served 512-token answers, six runs: 96.1-96.7 % of the routes on the card instead of 92-94 %, the wait 5.1 -> 1.9 ms a verify, decode 79.3 -> 82.4 tok/s, the first answer 75.1 -> 79.3, the prompt unchanged. `COLI_CUDA_CHAIN_PROMOTE_HITS=90` restores it.
 - **Qwen3.8 served on the CUDA chain: the state's copies off a prompt's first token.** A served
   prompt copied the DeltaNet state from the card before its first layer (so a stop could put it
