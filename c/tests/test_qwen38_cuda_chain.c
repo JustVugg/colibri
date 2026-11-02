@@ -240,6 +240,7 @@ int main(void) {
                 }
             }
             tk(same, "each job's rows: q38cc_dm_serve's bits, decode and verify rows");
+            tk(sv->groups < sv->slots, "a verify's slots of one expert went through its matrices together");
             int cl = q38cc_srv_close(sv, 1, v);
             if (!(cl && sv->jobs == 2 * L && (int)sv->slots == slots)) printf("       closed %d, jobs %llu, slots %llu of %d\n", cl, sv->jobs, sv->slots, slots);
             tk(cl && sv->jobs == 2 * L && (int)sv->slots == slots, "the forward closed, its jobs and slots in the books");

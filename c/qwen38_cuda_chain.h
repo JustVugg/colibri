@@ -1866,7 +1866,8 @@ typedef struct {
     int layer, n, tg, td; unsigned v;
     const int *ids; const float *w;          /* the layer's routes */
     int cgu, gud, cdn, dnd;                  /* claims and the chunks done */
-    int xs[Q38CC_DM_ROWS], hs[Q38CC_SRV_SLOTS];   /* a row's and a slot's activation: 0 not made, 1 being made, 2 made */
+    int xs[Q38CC_DM_ROWS];                   /* a row's activation: 0 not made, 1 being made, 2 made (3 failed) */
+    int gs[Q38CC_SRV_SLOTS], hs[Q38CC_SRV_SLOTS];   /* a group's input rows and its SwiGLU rows, the same states */
     long long t0;                            /* ns: the device's word first seen */
 } Q38CCJob;
 typedef struct Q38CCSrv Q38CCSrv;
@@ -1883,9 +1884,10 @@ struct Q38CCSrv {
     const float *x; float *out;              /* the input rows, the rows the device reads */
     const uint8_t *res;                      /* [L * E]: 2 or more in the pool */
     Q38CCWhere where; void *ctx;             /* an expert's place in the pool */
-    float *gu, *hh;                          /* [SLOTS][2I], [SLOTS][I] */
-    gq_act ax[Q38CC_DM_ROWS], ah[Q38CC_SRV_SLOTS];
-    unsigned long long jobs, slots, ns;      /* books (the last thread of a job) */
+    float *gu, *hh;                          /* [SLOTS][2I], [SLOTS][I]: a slot's at its place in group order */
+    gq_act ax[Q38CC_DM_ROWS];                /* a row's input */
+    gq_act gx[Q38CC_SRV_SLOTS], ah[Q38CC_SRV_SLOTS];   /* a group's input rows, its SwiGLU rows */
+    unsigned long long jobs, slots, groups, ns;   /* books (the last thread of a job) */
 };
 static inline void q38cc_relax(void) {
 #if defined(__x86_64__) || defined(__i386__)
@@ -1922,6 +1924,30 @@ static void q38cc_srv_fail(Q38CCSrv *sv, Q38CCJob *J, const char *why) {
     *sv->hfl = J->v;   /* the device goes on; the forward is the CPU's again (q38cc_srv_close) */
     __sync_synchronize();
 }
+/* a group's input rows: its slots' rows' activations copied (each made once a job, q38cc_srv_act) */
+static int q38cc_srv_gact(Q38CCSrv *sv, Q38CCJob *J, int q, const int *mem, int g, int K) {
+    int z = 0;
+    if (__atomic_compare_exchange_n(&J->gs[q], &z, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        gq_act *d = &sv->gx[q];
+        int bad = 0;
+        const int H = sv->H;
+        d->S = g; d->I = H;
+        for (int r = 0; r < g && !bad; r++) {
+            const int s = mem[r] / K;
+            if (!q38cc_srv_act(&J->xs[s], &sv->ax[s], sv->x + (size_t)s * H, H)) { bad = 1; break; }
+            const gq_act *a = &sv->ax[s];
+            memcpy(d->q + (int64_t)r * H, a->q, (size_t)H);
+            memcpy(d->d + (int64_t)r * (H / 32), a->d, (size_t)(H / 32) * sizeof(float));
+            memcpy(d->s + (int64_t)r * (H / 16), a->s, (size_t)(H / 16) * sizeof(int32_t));
+            memcpy(d->l4 + (int64_t)r * (H / 4), a->l4, (size_t)(H / 4) * sizeof(int32_t));
+        }
+        Q38CC_ST(&J->gs[q], bad ? 3 : 2);
+        return !bad;
+    }
+    int st;
+    while ((st = Q38CC_LD(&J->gs[q])) == 1) q38cc_relax();
+    return st == 2;
+}
 static void q38cc_srv_job(Q38CCSrv *sv, Q38CCJob *J) {
     const int H = sv->H, I = sv->I, K = sv->K, E = sv->E, n = J->n, tg = J->tg, td = J->td;
     if (Q38CC_LD(&sv->abort_)) return;
@@ -1937,67 +1963,83 @@ static void q38cc_srv_job(Q38CCSrv *sv, Q38CCJob *J) {
     }
     long long z = 0, t0 = q38cc_ns();
     __atomic_compare_exchange_n(&J->t0, &z, t0, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
-    /* the pooled slots, in rank order (every thread the same list) */
-    int pa[Q38CC_SRV_SLOTS], np = 0; const uint8_t *gp[Q38CC_SRV_SLOTS];
+    /* the pooled slots in rank order, and their groups (every thread the same): a verify's slots
+     * of one expert, up to GQ_FUSED_ROWS of them in rank order, go through its matrices together
+     * (gq_rows_f8 on up to that many rows gives each the bits of its row alone); a decode step's
+     * slot is a group of its own */
+    int pa[Q38CC_SRV_SLOTS], np = 0, ge[Q38CC_SRV_SLOTS], gn[Q38CC_SRV_SLOTS], g0[Q38CC_SRV_SLOTS + 1], at[Q38CC_SRV_SLOTS], ng = 0;
+    const uint8_t *gp[Q38CC_SRV_SLOTS];
+    int mem[Q38CC_SRV_SLOTS];   /* the groups' slots, group after group */
     for (int a = 0; a < n * K; a++) {
         const int e = J->ids[a];
         if (e < 0 || e >= E || sv->res[(size_t)J->layer * E + e] < 2) continue;
-        if (!(gp[np] = sv->where(sv->ctx, J->layer * E + e))) { q38cc_srv_fail(sv, J, "an expert without a place in the pool"); return; }
+        int q = -1;
+        for (int t = 0; t < ng && n > 1; t++) if (ge[t] == e && gn[t] < GQ_FUSED_ROWS) { q = t; break; }
+        if (q < 0) {
+            if (!(gp[ng] = sv->where(sv->ctx, J->layer * E + e))) { q38cc_srv_fail(sv, J, "an expert without a place in the pool"); return; }
+            q = ng++; ge[q] = e; gn[q] = 0;
+        }
+        at[np] = q * 8 + gn[q]++;   /* group and place in it, resolved to a slot's row below */
         pa[np++] = a;
     }
+    g0[0] = 0;
+    for (int q = 0; q < ng; q++) g0[q + 1] = g0[q] + gn[q];
+    for (int p = 0; p < np; p++) { const int q = at[p] / 8, r = at[p] % 8; at[p] = g0[q] + r; mem[at[p]] = pa[p]; }
     const int64_t rg = gq_row_bytes(tg, H), rd = gq_row_bytes(td, I);
     const size_t pg = Q38CC_PAD(rg * I);
-    const int cgu = (2 * I + 7) / 8, ngu = np * cgu, cdn = (H + 7) / 8, f8g = gq_f8_ok(tg, H), f8d = gq_f8_ok(td, I);
-    /* gate and up, eight rows a chunk */
+    const int cgu = (2 * I + 7) / 8, ngu = ng * cgu, cdn = (H + 7) / 8, f8g = gq_f8_ok(tg, H), f8d = gq_f8_ok(td, I);
+    /* gate and up, eight rows a chunk of a group */
     for (;;) {
         int c = Q38CC_ADD(&J->cgu, Q38CC_SRV_GU), c1 = c + Q38CC_SRV_GU < ngu ? c + Q38CC_SRV_GU : ngu, c0 = c;
         if (c >= ngu) break;
         for (; c < c1; c++) {
-            const int p = c / cgu, o0 = (c % cgu) * 8, o1 = o0 + 8 < 2 * I ? o0 + 8 : 2 * I, s = pa[p] / K;
-            if (!q38cc_srv_act(&J->xs[s], &sv->ax[s], sv->x + (size_t)s * H, H)) { q38cc_srv_fail(sv, J, "no memory for an activation"); return; }
-            float *y = sv->gu + (size_t)p * 2 * I;
+            const int q = c / cgu, o0 = (c % cgu) * 8, o1 = o0 + 8 < 2 * I ? o0 + 8 : 2 * I;
+            if (!q38cc_srv_gact(sv, J, q, mem + g0[q], gn[q], K)) { q38cc_srv_fail(sv, J, "no memory for an activation"); return; }
+            float *y = sv->gu + (size_t)g0[q] * 2 * I;
             if (o1 - o0 == 8 && (o1 <= I || o0 >= I) && f8g) {
-                const uint8_t *m = o0 < I ? gp[p] : gp[p] + pg; const int oo = o0 < I ? o0 : o0 - I;
-                gq_rows_f8(y + o0, 1, &sv->ax[s], m + (int64_t)oo * rg, rg, tg, H, 8);
+                const uint8_t *m = o0 < I ? gp[q] : gp[q] + pg; const int oo = o0 < I ? o0 : o0 - I;
+                gq_rows_f8(y + o0, 2 * I, &sv->gx[q], m + (int64_t)oo * rg, rg, tg, H, 8);
                 continue;
             }
             for (int o = o0; o < o1; o++) {
-                const uint8_t *m = o < I ? gp[p] : gp[p] + pg; const int oo = o < I ? o : o - I;
-                gq_row_all(y + o, 1, &sv->ax[s], m + (int64_t)oo * rg, tg, H);
+                const uint8_t *m = o < I ? gp[q] : gp[q] + pg; const int oo = o < I ? o : o - I;
+                gq_row_all(y + o, 2 * I, &sv->gx[q], m + (int64_t)oo * rg, tg, H);
             }
         }
         Q38CC_ADD(&J->gud, c1 - c0);
     }
     while (Q38CC_LD(&J->gud) < ngu) { q38cc_relax(); if (Q38CC_LD(&sv->abort_)) return; }
-    /* each slot's SwiGLU and activation, by whoever comes first */
-    for (int p = 0; p < np; p++) {
+    /* each group's SwiGLU rows and their activation, by whoever comes first */
+    for (int q = 0; q < ng; q++) {
         int st = 0;
-        if (!__atomic_compare_exchange_n(&J->hs[p], &st, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
-        const float *gg = sv->gu + (size_t)p * 2 * I, *uu = gg + I; float *h = sv->hh + (size_t)p * I;
-        for (int o = 0; o < I; o++) h[o] = gg[o] / (1.f + expf(-gg[o])) * uu[o];
-        Q38CC_ST(&J->hs[p], gq_act_set(&sv->ah[p], h, 1, I) ? 3 : 2);
+        if (!__atomic_compare_exchange_n(&J->hs[q], &st, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
+        for (int r = g0[q]; r < g0[q + 1]; r++) {
+            const float *gg = sv->gu + (size_t)r * 2 * I, *uu = gg + I; float *h = sv->hh + (size_t)r * I;
+            for (int o = 0; o < I; o++) h[o] = gg[o] / (1.f + expf(-gg[o])) * uu[o];
+        }
+        Q38CC_ST(&J->hs[q], gq_act_set(&sv->ah[q], sv->hh + (size_t)g0[q] * I, gn[q], I) ? 3 : 2);
     }
-    for (int p = 0; p < np; p++) {
+    for (int q = 0; q < ng; q++) {
         int st;
-        while ((st = Q38CC_LD(&J->hs[p])) == 1) q38cc_relax();
+        while ((st = Q38CC_LD(&J->hs[q])) == 1) q38cc_relax();
         if (st != 2) { q38cc_srv_fail(sv, J, "no memory for an activation"); return; }
     }
-    /* down, eight rows a chunk for every slot, and those rows' sums: a row's slots in rank order from zero */
+    /* down, eight rows a chunk for every group, and those rows' sums: a row's slots in rank order from zero */
     float dl[Q38CC_SRV_SLOTS * 8];
     for (;;) {
         int c = Q38CC_ADD(&J->cdn, Q38CC_SRV_DN), c1 = c + Q38CC_SRV_DN < cdn ? c + Q38CC_SRV_DN : cdn, c0 = c;
         if (c >= cdn) break;
         for (; c < c1; c++) {
             const int o0 = c * 8, o1 = o0 + 8 < H ? o0 + 8 : H, w8 = o1 - o0;
-            for (int p = 0; p < np; p++) {
-                const uint8_t *m = gp[p] + 2 * pg;
-                if (w8 == 8 && f8d) { gq_rows_f8(dl + p * 8, 1, &sv->ah[p], m + (int64_t)o0 * rd, rd, td, I, 8); continue; }
-                for (int o = o0; o < o1; o++) gq_row_all(dl + p * 8 + (o - o0), 1, &sv->ah[p], m + (int64_t)o * rd, td, I);
+            for (int q = 0; q < ng; q++) {
+                const uint8_t *m = gp[q] + 2 * pg;
+                if (w8 == 8 && f8d) { gq_rows_f8(dl + g0[q] * 8, 8, &sv->ah[q], m + (int64_t)o0 * rd, rd, td, I, 8); continue; }
+                for (int o = o0; o < o1; o++) gq_row_all(dl + g0[q] * 8 + (o - o0), 8, &sv->ah[q], m + (int64_t)o * rd, td, I);
             }
             float ys[Q38CC_DM_ROWS][8];
             memset(ys, 0, sizeof ys);
             for (int p = 0; p < np; p++) {
-                const float wv = J->w[pa[p]]; float *y = ys[pa[p] / K]; const float *o = dl + p * 8;
+                const float wv = J->w[pa[p]]; float *y = ys[pa[p] / K]; const float *o = dl + at[p] * 8;
                 for (int d = 0; d < w8; d++) y[d] += wv * o[d];
             }
             for (int s = 0; s < n; s++) memcpy(sv->out + (size_t)s * H + o0, ys[s], (size_t)w8 * sizeof(float));
@@ -2009,6 +2051,7 @@ static void q38cc_srv_job(Q38CCSrv *sv, Q38CCJob *J) {
             Q38CC_ADD(&sv->jobs, 1ULL);
             if (np) {
                 Q38CC_ADD(&sv->slots, (unsigned long long)np);
+                Q38CC_ADD(&sv->groups, (unsigned long long)ng);
                 Q38CC_ADD(&sv->ns, (unsigned long long)(q38cc_ns() - Q38CC_LD(&J->t0)));
             }
         }
@@ -2035,7 +2078,7 @@ static void *q38cc_srv_main(void *p) {
 static void q38cc_srv_stop(Q38CCSrv *sv);
 static void q38cc_srv_free(Q38CCSrv *sv) {
     for (int s = 0; s < Q38CC_DM_ROWS; s++) gq_act_free(&sv->ax[s]);
-    for (int p = 0; p < Q38CC_SRV_SLOTS; p++) gq_act_free(&sv->ah[p]);
+    for (int p = 0; p < Q38CC_SRV_SLOTS; p++) { gq_act_free(&sv->gx[p]); gq_act_free(&sv->ah[p]); }
     free(sv->gu); free(sv->hh); free(sv);
 }
 static Q38CCSrv *q38cc_srv_start(int nt, int H, int I, int K, int E, Q38CCWhere where, void *ctx) {
@@ -2048,10 +2091,11 @@ static Q38CCSrv *q38cc_srv_start(int nt, int H, int I, int K, int E, Q38CCWhere 
     sv->hh = (float *)malloc((size_t)Q38CC_SRV_SLOTS * I * sizeof(float));
     int ok = sv->gu && sv->hh;
     /* the activations' room before the forwards (no allocation while the device waits) */
-    float *zx = ok ? (float *)calloc((size_t)(H > I ? H : I), sizeof(float)) : NULL;
+    float *zx = ok ? (float *)calloc((size_t)GQ_FUSED_ROWS * (H > I ? H : I), sizeof(float)) : NULL;
     ok = ok && zx;
     for (int s = 0; s < Q38CC_DM_ROWS && ok; s++) ok = gq_act_set(&sv->ax[s], zx, 1, H) == 0;
-    for (int p = 0; p < Q38CC_SRV_SLOTS && ok; p++) ok = gq_act_set(&sv->ah[p], zx, 1, I) == 0;
+    for (int p = 0; p < Q38CC_SRV_SLOTS && ok; p++)
+        ok = gq_act_set(&sv->gx[p], zx, GQ_FUSED_ROWS, H) == 0 && gq_act_set(&sv->ah[p], zx, GQ_FUSED_ROWS, I) == 0;
     free(zx);
     if (ok) { pthread_mutex_init(&sv->mx, NULL); pthread_cond_init(&sv->cv, NULL); }
     for (int t = 0; t < nt && ok; t++) {
@@ -2420,8 +2464,9 @@ static void q38cc_report(Model *m) {
                         "(%llu slots on the host in %.1f ms, %.1f ms waiting for the device's routes), %llu slots from the host pool\n",
                 ch->dm_steps, ch->dm_hyb, ch->dm_pairs, ch->dm_host_ms, ch->dm_spin_ms, ch->pool_reads);
     if (ch->srv && ch->sv_jobs)
-        fprintf(stderr, "[chain] qwen38: the pool's server (%d threads): %llu layer steps, %llu pooled slots in %.1f ms (%.1f us a slot)\n",
-                ch->srv->started, ch->sv_jobs, ch->sv_slots, ch->sv_ns / 1e6, ch->sv_slots ? ch->sv_ns / 1e3 / ch->sv_slots : 0.0);
+        fprintf(stderr, "[chain] qwen38: the pool's server (%d threads): %llu layer steps, %llu pooled slots (%llu experts' groups) "
+                        "in %.1f ms (%.1f us a slot)\n", ch->srv->started, ch->sv_jobs, ch->sv_slots, (unsigned long long)Q38CC_LD(&ch->srv->groups),
+                ch->sv_ns / 1e6, ch->sv_slots ? ch->sv_ns / 1e3 / ch->sv_slots : 0.0);
     if (ch->pc_pairs)
         fprintf(stderr, "[chain] qwen38: %llu of a decode step's slots from the host pool on the CPU in %.1f ms (%.1f us a slot; "
                         "COLI_CUDA_CHAIN_POOL_READ=1: the device reads them over the bus)\n",
