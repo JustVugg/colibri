@@ -214,10 +214,10 @@ int main(void) {
             if (!sv) break;
             volatile unsigned dfl = 0, hfl = 0;
             int same = 1, slots = 0; unsigned v = 0;
-            q38cc_srv_open(sv, &dfl, &hfl, x, out, res);
+            q38cc_srv_open(sv, &dfl, &hfl, x, out);
             for (int rep = 0; rep < 2; rep++) for (int i = 0; i < L; i++) {
                 const int n = rep ? R : 1;   /* a decode step's row, a verify's five */
-                q38cc_srv_post(sv, i, n, ++v, tg, td, ids[i], w[i]);
+                q38cc_srv_post(sv, i, n, ++v, tg, td, ids[i], w[i], res + i * NE);
                 /* q38cc_dm_serve's arithmetic for the same slots */
                 const uint8_t *gp[R * K]; const float *xp[R * K]; int pa[R * K], np = 0;
                 for (int a = 0; a < n * K; a++) {
@@ -252,12 +252,12 @@ int main(void) {
             int cl = q38cc_srv_close(sv, 1, v);
             if (!(cl && sv->jobs == 2 * L && (int)sv->slots == slots)) printf("       closed %d, jobs %llu, slots %llu of %d\n", cl, sv->jobs, sv->slots, slots);
             tk(cl && sv->jobs == 2 * L && (int)sv->slots == slots, "the forward closed, its jobs and slots in the books");
-            q38cc_srv_open(sv, &dfl, &hfl, x, out, res);
-            q38cc_srv_post(sv, 0, 1, ++v, tg, td, ids[0], w[0]);
-            q38cc_srv_post(sv, 1, 1, ++v, tg, td, ids[1], w[1]);
+            q38cc_srv_open(sv, &dfl, &hfl, x, out);
+            q38cc_srv_post(sv, 0, 1, ++v, tg, td, ids[0], w[0], res + 0 * NE);
+            q38cc_srv_post(sv, 1, 1, ++v, tg, td, ids[1], w[1], res + 1 * NE);
             tk(q38cc_srv_close(sv, 0, v) && hfl == v, "a failed frame: the jobs skipped, the host's word past them");
-            q38cc_srv_open(sv, &dfl, &hfl, x, out, res);
-            q38cc_srv_post(sv, 2, 1, ++v, tg, td, ids[2], w[2]);
+            q38cc_srv_open(sv, &dfl, &hfl, x, out);
+            q38cc_srv_post(sv, 2, 1, ++v, tg, td, ids[2], w[2], res + 2 * NE);
             dfl = v;
             for (long spin = 0; hfl < v && spin < 2000000000L; spin++) q38cc_relax();
             tk(q38cc_srv_close(sv, 1, v) && hfl == v, "and the next forward served");

@@ -74,6 +74,11 @@ typedef struct {
     /* the MTP head's layer (index c.layers) on the device (q38cc_mtp_rows): its norms in prm, the
      * embedding rows in (fin), a one per stream (ones), the rows and drafts it ran */
     int mtp_on; size_t o_mtp_emb, o_mtp_hid, o_mtp_mix; CcBuf *fin, *ones;
+    /* the head's routed experts in RAM for the pool's server (q38cc_head_pool): gate, up and down of
+     * expert e at hd_base + e hd_stride, as the pool lays them; hd_k0 = layers x experts, the head's
+     * keys from there (q38cc_srv_where); hd_res: every one in the pool */
+    uint8_t *hd_base, *hd_res; size_t hd_stride; int hd_tg, hd_td, hd_k0;
+    CcBuf *hd_ids, *hd_w, *hd_idsd, *hd_wd; unsigned long long hd_rows;
     unsigned long long mtp_rows, drafts;
     float *host_routed, *host_emb;
     unsigned long long forwards, frames, fault_at, dec_n;
@@ -1285,6 +1290,7 @@ static double q38cc_cpu_probe(Q38CChain *ch, Model *m, int i, const int *ex, int
     return us;
 }
 static void q38cc_srv_up(Q38CChain *ch, Model *m);
+static void q38cc_head_pool(Q38CChain *ch, Model *m);
 static void q38cc_pool_init(Model *m) {
     Q38CChain *ch = q38cc_of(m);
     const char *on = getenv("COLI_CUDA_CHAIN_POOL"), *gbs = getenv("COLI_CUDA_CHAIN_POOL_GB");
@@ -1422,6 +1428,7 @@ static void q38cc_pool_init(Model *m) {
         g_q38cc_pg_team = ch->pc_team;
     }
     if (ch->pool_cpu && fit > 0 && !ch->srv) q38cc_srv_up(ch, m);
+    if (ch->srv) q38cc_head_pool(ch, m);
     if (ch->pool_n == all && full)
         fprintf(stderr, "[chain] qwen38: host pool, every expert (the %d the card leaves and its own %d) in %.2f GiB of page-locked RAM "
                         "the device reads over the bus (%.1f s to allocate, %.1f s to read; COLI_CUDA_CHAIN_POOL=0 off)\n",
@@ -1920,6 +1927,7 @@ static int q38cc_dm_serve(Q38CChain *ch, Model *m, int i, int n, unsigned v) {
 typedef struct {
     int layer, n, tg, td; unsigned v;
     const int *ids; const float *w;          /* the layer's routes */
+    const uint8_t *res;                      /* the layer's experts: 2 or more in the pool */
     int cgu, gud, cdn, dnd;                  /* claims and the chunks done */
     int xs[Q38CC_DM_ROWS];                   /* a row's activation: 0 not made, 1 being made, 2 made (3 failed) */
     int gs[Q38CC_SRV_SLOTS], hs[Q38CC_SRV_SLOTS];   /* a group's input rows and its SwiGLU rows, the same states */
@@ -1937,7 +1945,6 @@ struct Q38CCSrv {
     Q38CCJob job[Q38CC_SRV_RING];
     const volatile unsigned *dfl; volatile unsigned *hfl;   /* the device's word, the host's */
     const float *x; float *out;              /* the input rows, the rows the device reads */
-    const uint8_t *res;                      /* [L * E]: 2 or more in the pool */
     Q38CCWhere where; void *ctx;             /* an expert's place in the pool */
     float *gu, *hh;                          /* [SLOTS][2I], [SLOTS][I]: a slot's at its place in group order */
     gq_act ax[Q38CC_DM_ROWS];                /* a row's input */
@@ -2027,7 +2034,7 @@ static void q38cc_srv_job(Q38CCSrv *sv, Q38CCJob *J) {
     int mem[Q38CC_SRV_SLOTS];   /* the groups' slots, group after group */
     for (int a = 0; a < n * K; a++) {
         const int e = J->ids[a];
-        if (e < 0 || e >= E || sv->res[(size_t)J->layer * E + e] < 2) continue;
+        if (e < 0 || e >= E || J->res[e] < 2) continue;
         int q = -1;
         for (int t = 0; t < ng && n > 1; t++) if (ge[t] == e && gn[t] < GQ_FUSED_ROWS) { q = t; break; }
         if (q < 0) {
@@ -2173,18 +2180,19 @@ static void q38cc_srv_stop(Q38CCSrv *sv) {
     q38cc_srv_free(sv);
 }
 /* a forward's jobs read these (the same buffers every layer) */
-static void q38cc_srv_open(Q38CCSrv *sv, const volatile unsigned *dfl, volatile unsigned *hfl, const float *x, float *out,
-                           const uint8_t *res) {
-    sv->dfl = dfl; sv->hfl = hfl; sv->x = x; sv->out = out; sv->res = res;
+static void q38cc_srv_open(Q38CCSrv *sv, const volatile unsigned *dfl, volatile unsigned *hfl, const float *x, float *out) {
+    sv->dfl = dfl; sv->hfl = hfl; sv->x = x; sv->out = out;
     Q38CC_ST(&sv->abort_, 0); Q38CC_ST(&sv->err, 0);
     pthread_mutex_lock(&sv->mx); Q38CC_ST(&sv->open, 1); pthread_cond_broadcast(&sv->cv); pthread_mutex_unlock(&sv->mx);
 }
-/* layer's pooled slots of a step of n rows, once the device's word reaches v */
-static void q38cc_srv_post(Q38CCSrv *sv, int layer, int n, unsigned v, int tg, int td, const int *ids, const float *w) {
+/* layer's pooled slots of a step of n rows, once the device's word reaches v (res: the layer's
+ * experts, 2 or more where the pool holds them) */
+static void q38cc_srv_post(Q38CCSrv *sv, int layer, int n, unsigned v, int tg, int td, const int *ids, const float *w,
+                           const uint8_t *res) {
     unsigned k = sv->posted;
     Q38CCJob *J = &sv->job[k % Q38CC_SRV_RING];
     memset(J, 0, sizeof *J);
-    J->layer = layer; J->n = n; J->v = v; J->tg = tg; J->td = td; J->ids = ids; J->w = w;
+    J->layer = layer; J->n = n; J->v = v; J->tg = tg; J->td = td; J->ids = ids; J->w = w; J->res = res;
     Q38CC_ST(&sv->posted, k + 1);
 }
 /* the forward's end: every thread past every job (ok 0: they skip what is left and the host's
@@ -2207,7 +2215,11 @@ static int q38cc_srv_close(Q38CCSrv *sv, int ok, unsigned vmax) {
     return !Q38CC_LD(&sv->err);
 }
 /* the chain's side of the server: an expert's place in the pool, the forwards that take it, the books */
-static const uint8_t *q38cc_srv_where(void *ctx, int k) { return (const uint8_t *)q38cc_pool_host((Q38CChain *)ctx, k); }
+static const uint8_t *q38cc_srv_where(void *ctx, int k) {
+    Q38CChain *ch = (Q38CChain *)ctx;
+    if (ch->hd_base && k >= ch->hd_k0) return ch->hd_base + (size_t)(k - ch->hd_k0) * ch->hd_stride;   /* the MTP head's */
+    return (const uint8_t *)q38cc_pool_host(ch, k);
+}
 /* COLI_CUDA_CHAIN_SERVE_THREADS, else the logical CPUs less four (the recording thread, the
  * driver's, the system's), at most 16, none below two: on an i5-13500 (20 logical CPUs) a decode
  * after a 452-token prompt took 49.7-50.2 tok/s on the recording thread, 52.4-52.7 with 12
@@ -2231,6 +2243,46 @@ static void q38cc_srv_up(Q38CChain *ch, Model *m) {
     }
     fprintf(stderr, "[chain] qwen38: the pool's server: %d threads for a decode step's pooled experts (COLI_CUDA_CHAIN_SERVE_THREADS=0: "
                     "the recording thread's)\n", ch->srv->started);
+}
+/* The MTP head's routed experts for the pool's server: every one in RAM as the pool lays them out
+ * (gate, up and down at 0, Q38CC_PAD(gate), twice that), read once from the head's GGUF. A draft
+ * then routes on the device and the server computes its experts while the card runs the shared
+ * expert, in the frame (q38cc_mtp_rows), where the host's step computed them between two frames
+ * (3.8 ms a draft row on an i5-13500). COLI_CUDA_CHAIN_MTP_POOL=0: the host's step. */
+static void q38cc_head_pool(Q38CChain *ch, Model *m) {
+    const char *e = getenv("COLI_CUDA_CHAIN_MTP_POOL");
+    if ((e && *e == '0') || !ch->srv || !ch->mtp_on || !g_q38_gguf || ch->hd_base) return;
+    Cfg *c = &m->c; const int L = c->layers, E = c->experts, K = c->topk, H = c->hidden, I = c->inter;
+    const gguf_tensor *t[3]; q38_gg_expert_tensors(m, L, t);
+    const int tg = t[0]->type, td = t[2]->type;
+    if (t[1]->type != tg || !gq_f8_ok(tg, H) || !gq_f8_ok(td, I)) return;
+    const int64_t gb = gq_row_bytes(tg, H) * I, db = gq_row_bytes(td, I) * H;
+    const size_t stride = 2 * Q38CC_PAD(gb) + Q38CC_PAD(db);
+    double t0 = now_s();
+    uint8_t *base = (uint8_t *)malloc((size_t)E * stride);
+    if (!base) {
+        fprintf(stderr, "[chain] qwen38: no RAM for the MTP head's experts (%.2f GiB); its host step computes them\n", (double)E * stride / 1073741824.0);
+        return;
+    }
+    #pragma omp parallel for schedule(dynamic, 4)
+    for (int x = 0; x < E; x++) {
+        uint8_t *dst = base + (size_t)x * stride;
+        const int64_t eb[3] = {gb, gb, db}; const size_t off[3] = {0, Q38CC_PAD(gb), 2 * Q38CC_PAD(gb)};
+        for (int q = 0; q < 3; q++) q38_gg_read(t[q], dst + off[q], (int64_t)x * eb[q], eb[q]);
+    }
+    size_t r = (size_t)Q38CC_DM_ROWS;
+    if (!(ch->hd_res = malloc((size_t)E)) || !cc_reserve(&ch->hd_ids, r * K * 4, CC_DEV) || !cc_reserve(&ch->hd_w, r * K * 4, CC_DEV) ||
+        !cc_reserve(&ch->hd_idsd, r * K * 4, CC_DOWN) || !cc_reserve(&ch->hd_wd, r * K * 4, CC_DOWN)) {
+        free(base); free(ch->hd_res); ch->hd_res = NULL;
+        fprintf(stderr, "[chain] qwen38: the MTP head's routes found no room; its host step computes its experts\n");
+        return;
+    }
+    memset(ch->hd_res, 2, (size_t)E);
+    ch->hd_stride = stride; ch->hd_tg = tg; ch->hd_td = td; ch->hd_k0 = L * E;
+    __sync_synchronize();
+    ch->hd_base = base;
+    fprintf(stderr, "[chain] qwen38: the MTP head's %d routed experts (%s) in %.2f GiB of RAM for the pool's server, read in %.1f s "
+                    "(COLI_CUDA_CHAIN_MTP_POOL=0: the host's step)\n", E, gq_type_name(tg), (double)E * stride / 1073741824.0, now_s() - t0);
 }
 static Q38CCSrv *q38cc_srv_of(Q38CChain *ch, Model *m, int n) {
     if (!ch->srv || n > Q38CC_DM_ROWS || !q38cc_pc_step(ch, n) || m->c.layers > Q38CC_SRV_RING) return NULL;
@@ -2424,7 +2476,7 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
         if (dm) memset(ch->dm_ran, 0, (size_t)L);
         if (dm && (sv = q38cc_srv_of(ch, m, n)))
             q38cc_srv_open(sv, (const volatile unsigned *)cc_ptr(ch->dm_dfl), (volatile unsigned *)cc_ptr(ch->dm_hfl),
-                           (const float *)cc_ptr(ch->mixd), (float *)cc_ptr(ch->dm_hy), ch->dm_res);
+                           (const float *)cc_ptr(ch->mixd), (float *)cc_ptr(ch->dm_hy));
         if (!q38cc_frame_begin(ch) || !cc_write(ch->hyper, 0, hyper_h + (size_t)c0 * W, (size_t)n * W * 4) ||
             !q38cc_push_state(ch, m, pb)) goto lost;
         if (dm && q38cc_dm_tab(ch, n) == ch->dm_tabb && !q38cc_stage_from(ch, m, 0)) goto lost;   /* the first staged layer's copy */
@@ -2446,7 +2498,8 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
                 int fg, fd;
                 if (ok && v && sv && qt_chain_layer_format(i, &fg, &fd) && fg >= 100 && fd >= 100) {   /* the server's from here */
                     const size_t io = (size_t)i * ch->rows * c->topk;
-                    q38cc_srv_post(sv, i, n, v, fg - 100, fd - 100, (const int *)cc_ptr(ch->dm_idsd) + io, (const float *)cc_ptr(ch->dm_wd) + io);
+                    q38cc_srv_post(sv, i, n, v, fg - 100, fd - 100, (const int *)cc_ptr(ch->dm_idsd) + io, (const float *)cc_ptr(ch->dm_wd) + io,
+                                   ch->dm_res + (size_t)i * E);
                     v = 0;
                 }
                 if (ok && pend_v) ok = q38cc_dm_serve(ch, m, pend_i, n, pend_v);
@@ -2533,6 +2586,7 @@ static int q38cc_mtp_rows(Model *m, const float *streams, const int *next, int S
     Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, C = c->hc_count, E = c->experts, V = c->vocab, L = c->layers;
     int half = c->rotary_dim / 2, R = c->idx_ratio > 0 ? c->idx_ratio : 1;
     Layer *l = &m->L[L];
+    Q38CCSrv *sv = NULL;   /* the head's experts on the pool's server (q38cc_head_pool) */
     if (!q38cc_mirror(ch, m)) return 0;
     int CH = q38cc_rows_env(), rows = S < CH ? S : CH;
     float *emb = (float *)malloc((size_t)rows * (H + C) * sizeof(float)), *ones = emb ? emb + (size_t)rows * H : NULL;
@@ -2565,24 +2619,42 @@ static int q38cc_mtp_rows(Model *m, const float *streams, const int *next, int S
                  cc_ew(ch->hyper, ch->ones, ch->blk, NULL, NULL, &add);
         ok = ok && q38cc_gr_read(ch, m, &l->attn_gr, ch->o_an[L], n, ch->inj_a) && q38cc_attention(ch, m, l, L, n, pb) &&
              q38cc_gr_apply(ch, m, ch->inj_a, n) && q38cc_gr_read(ch, m, &l->mlp_gr, ch->o_mn[L], n, ch->inj_m);
-        /* the routed experts the host's step: the frame ends at the router (A1), the shared expert
-         * runs while the host routes them (A2) */
-        ok = ok && cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) &&
-             cc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && cc_copy(ch->mixd, 0, ch->mixed, 0, (size_t)n * H) && cc_submit(1);
-        if (!ok) goto lost;
-        q38cc_kv_down(ch, m, L, n, pb);
-        ok = q38cc_frame_begin(ch) && q38cc_shared(ch, m, l, L, n) && cc_submit(0);
-        double t1 = now_s();
-        q38_moe_ex(m, l, L, (const float *)cc_ptr(ch->mixd), n, ch->host_routed, (const float *)cc_ptr(ch->lgd), 1);
-        memcpy(cc_ptr(ch->routed), ch->host_routed, (size_t)n * H * sizeof(float));
-        ch->host_ms += (now_s() - t1) * 1e3;
-        ok = ok && q38cc_frame_begin(ch) && q38cc_moe_apply(ch, m, n, ch->routed);
+        const int hyb = ch->hd_base && ch->srv && ch->dm_dfl && n <= Q38CC_DM_ROWS;   /* the head's experts on the pool's server */
+        if (hyb) {   /* routed on the device, the server computes them while the card runs the shared expert, one frame */
+            CcRoute rp = {n, E, c->topk, 0, 0, E, 0, 0, 0, c->topk, 0, c->topk, 1, 1, c->norm_topk ? 1 : 0, 1.f, 1.f, 0.f};
+            const unsigned v = ++ch->dm_seq;
+            const size_t nk = (size_t)n * c->topk;
+            sv = ch->srv;
+            q38cc_srv_open(sv, (const volatile unsigned *)cc_ptr(ch->dm_dfl), (volatile unsigned *)cc_ptr(ch->dm_hfl),
+                           (const float *)cc_ptr(ch->mixd), (float *)cc_ptr(ch->dm_hy));
+            ok = ok && cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->hd_ids, ch->hd_w, &rp) &&
+                 cc_copy(ch->hd_idsd, 0, ch->hd_ids, 0, nk) && cc_copy(ch->hd_wd, 0, ch->hd_w, 0, nk) &&
+                 cc_copy(ch->mixd, 0, ch->mixed, 0, (size_t)n * H) && cc_signal(ch->dm_dfl, 0, v);
+            if (ok) q38cc_srv_post(sv, L, n, v, ch->hd_tg, ch->hd_td, (const int *)cc_ptr(ch->hd_idsd), (const float *)cc_ptr(ch->hd_wd), ch->hd_res);
+            ok = ok && q38cc_shared(ch, m, l, L, n) && cc_wait_host(ch->dm_hfl, 0, v) && q38cc_moe_apply(ch, m, n, ch->dm_hy);
+            ch->hd_rows += (unsigned long long)n;
+        } else {
+            /* the routed experts the host's step: the frame ends at the router (A1), the shared expert
+             * runs while the host routes them (A2) */
+            ok = ok && cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) &&
+                 cc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && cc_copy(ch->mixd, 0, ch->mixed, 0, (size_t)n * H) && cc_submit(1);
+            if (!ok) goto lost;
+            q38cc_kv_down(ch, m, L, n, pb);
+            ok = q38cc_frame_begin(ch) && q38cc_shared(ch, m, l, L, n) && cc_submit(0);
+            double t1 = now_s();
+            q38_moe_ex(m, l, L, (const float *)cc_ptr(ch->mixd), n, ch->host_routed, (const float *)cc_ptr(ch->lgd), 1);
+            memcpy(cc_ptr(ch->routed), ch->host_routed, (size_t)n * H * sizeof(float));
+            ch->host_ms += (now_s() - t1) * 1e3;
+            ok = ok && q38cc_frame_begin(ch) && q38cc_moe_apply(ch, m, n, ch->routed);
+        }
         if (ok && last && hidden) ok = cc_copy(ch->hypd, 0, ch->hyper, (size_t)(n - 1) * W, (size_t)W);
         if (ok && last && logit)
             ok = q38cc_gr_read(ch, m, &m->mtp_mixer, ch->o_mtp_mix, n, NULL) &&
                  cc_matmul(q38cc_t(ch, &m->lm_head), ch->mixed, (size_t)(n - 1) * H, ch->outd, 0, 1);
         ok = ok && cc_submit(1);
+        if (sv) { ok = q38cc_srv_close(sv, ok, ch->dm_seq) && ok; q38cc_srv_books(ch); sv = NULL; }
         if (!ok) goto lost;
+        if (hyb) q38cc_kv_down(ch, m, L, n, pb);
         if (settle) { ch->kv_valid[L] = pb + n; m->mtp_len = pb + n; }
         if (last && hidden) memcpy(hidden, cc_ptr(ch->hypd), (size_t)W * sizeof(float));
         if (last && logit) { memcpy(logit, cc_ptr(ch->outd), (size_t)V * sizeof(float)); ch->drafts++; }
@@ -2592,6 +2664,7 @@ static int q38cc_mtp_rows(Model *m, const float *streams, const int *next, int S
     return 1;
 lost:   /* a frame failed: the device is gone; the CPU takes over, the head too */
     free(emb);
+    if (sv) { q38cc_srv_close(sv, 0, ch->dm_seq); q38cc_srv_books(ch); }
     if (!cc_lost()) cc_finish();
     q38cc_recover(m, m->kv_len);
     return 0;
@@ -2608,6 +2681,7 @@ static void q38cc_report(Model *m) {
         fprintf(stderr, "[chain] qwen38: %llu layer steps with the routed experts in the frame, %llu of them hybrid "
                         "(%llu slots on the host in %.1f ms, %.1f ms waiting for the device's routes), %llu slots from the host pool\n",
                 ch->dm_steps, ch->dm_hyb, ch->dm_pairs, ch->dm_host_ms, ch->dm_spin_ms, ch->pool_reads);
+    if (ch->hd_rows) fprintf(stderr, "[chain] qwen38: %llu MTP head rows with their routed experts on the pool's server\n", ch->hd_rows);
     if (ch->srv && ch->sv_jobs)
         fprintf(stderr, "[chain] qwen38: the pool's server (%d threads): %llu layer steps, %llu pooled slots (%llu experts' groups) "
                         "in %.1f ms (%.1f us a slot)\n", ch->srv->started, ch->sv_jobs, ch->sv_slots, (unsigned long long)Q38CC_LD(&ch->srv->groups),
