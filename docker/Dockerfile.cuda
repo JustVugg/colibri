@@ -1,0 +1,35 @@
+# CUDA 12.4 Linux image. Build from the repository root:
+#   docker build -t colibri:cuda -f docker/Dockerfile.cuda .
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS build
+
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential make && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY c/ ./c/
+RUN make -C c colibri CUDA=1 CUDA_ARCH=sm_80
+
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        python3 libgomp1 && \
+    rm -rf /var/lib/apt/lists/* && \
+    useradd -m -u 1000 colibri
+
+WORKDIR /app
+COPY --from=build /src/c/colibri ./colibri
+COPY c/coli c/version.py c/openai_server.py c/v4_dsml.py c/v41_dsml.py c/family_registry.py c/resource_plan.py c/doctor.py c/autotune.py c/image_engine.py c/term_image.py ./
+COPY c/tools/ ./tools/
+
+ENV COLI_MODEL=/model \
+    COLI_ENGINE=/app/colibri \
+    COLI_DOCKER_GLM_ONLY=1 \
+    PYTHONUNBUFFERED=1
+VOLUME ["/model"]
+EXPOSE 5000
+
+USER colibri
+ENTRYPOINT ["python3", "/app/coli"]
+CMD ["info"]

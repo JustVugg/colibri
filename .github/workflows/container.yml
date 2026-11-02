@@ -1,0 +1,19 @@
+name: CUDA container
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+
+permissions:
+  contents: read
+
+jobs:
+  cuda-container:
+    name: Build CUDA 12.4 image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the CUDA image
+        run: docker build -t colibri:cuda-12.4 -f docker/Dockerfile.cuda .
