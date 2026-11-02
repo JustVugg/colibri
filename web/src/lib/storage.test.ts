@@ -33,3 +33,23 @@ describe("browser settings persistence", () => {
     expect(stored({ getItem: () => { throw new Error("denied") } }, "key", "fallback")).toBe("fallback")
   })
 })
+
+it.each(["colibri.baseUrl", "colibri.model"])("cleans a legacy credential even when writing %s exceeds quota", (failedKey) => {
+  const storage = memoryStorage({ "colibri.apiKey": "synthetic-legacy-value", "colibri.theme": "dark" });
+  const set = storage.setItem;
+  storage.setItem = (key, value) => {
+    if (key === failedKey) throw new DOMException("fixture quota reached", "QuotaExceededError");
+    set(key, value);
+  };
+  persistPublicSettings(storage, "https://fixture.invalid/v1", "fixture-model");
+  expect(storage.values.has("colibri.apiKey")).toBe(false);
+  expect(storage.values.get("colibri.theme")).toBe("dark");
+});
+
+it("preserves public preferences when legacy cleanup is unavailable", () => {
+  const storage = memoryStorage();
+  storage.removeItem = () => { throw new Error("fixture removal blocked") };
+  expect(() => persistPublicSettings(storage, "https://fixture.invalid/v1", "fixture-model")).not.toThrow();
+  expect(storage.values.get("colibri.baseUrl")).toBe("https://fixture.invalid/v1");
+  expect(storage.values.get("colibri.model")).toBe("fixture-model");
+});

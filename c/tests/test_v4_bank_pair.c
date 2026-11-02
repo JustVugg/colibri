@@ -44,6 +44,59 @@ int main(void) {
     CHECK(legacies == 1 && swaps == 60,
           "ascending walk: 1 bootstrap + 60 swaps, got %d + %d", legacies, swaps);
 
+    /* VRAM reserve sized from the bank, V4 geometry (hidden 4096, moe
+     * intermediate 2048): a slot is 12.75 MiB generic / 13.5 MiB DeepGEMM
+     * plus its 3 pointer-table entries (dsv4_cuda_expert_bank_slot_bytes),
+     * a decode mirror 12.75 MiB. */
+    const long long slot = 13369344LL + 48, slot_dg = 14155776LL + 48;
+    const long long mirror = 13369344LL;
+    const int many = 4096;
+    CHECK(coli_v4_mirror_reserve_mb(0, 1, mirror, many) == 600,
+          "no bank: the non-batch 600 MiB");
+    CHECK(coli_v4_mirror_reserve_mb(256 * slot, 0, mirror, many) == 600,
+          "no banks: headroom only");
+    CHECK(coli_v4_mirror_reserve_mb(256 * slot, 1, mirror, many) == 4681,
+          "256 generic: 600 + 3264 + 816 (+ table, rounded up), got %lld",
+          coli_v4_mirror_reserve_mb(256 * slot, 1, mirror, many));
+    CHECK(coli_v4_mirror_reserve_mb(256 * slot, 2, mirror, many) == 7945,
+          "256 generic, double: 600 + 6528 + 816, got %lld",
+          coli_v4_mirror_reserve_mb(256 * slot, 2, mirror, many));
+    CHECK(coli_v4_mirror_reserve_mb(132 * slot, 1, mirror, many) == 3100,
+          "132 (REAP) generic: 600 + 1683 + 816, got %lld",
+          coli_v4_mirror_reserve_mb(132 * slot, 1, mirror, many));
+    CHECK(coli_v4_mirror_reserve_mb(132 * slot, 2, mirror, many) == 4783,
+          "132 generic, double: 600 + 3366 + 816, got %lld",
+          coli_v4_mirror_reserve_mb(132 * slot, 2, mirror, many));
+    CHECK(coli_v4_mirror_reserve_mb(256 * slot_dg, 1, mirror, many) == 4873,
+          "256 DeepGEMM: 600 + 3456 + 816, got %lld",
+          coli_v4_mirror_reserve_mb(256 * slot_dg, 1, mirror, many));
+    CHECK(coli_v4_mirror_reserve_mb(256 * slot_dg, 2, mirror, many) == 8329,
+          "256 DeepGEMM, double: 600 + 6912 + 816, got %lld",
+          coli_v4_mirror_reserve_mb(256 * slot_dg, 2, mirror, many));
+    /* the guard probes free VRAM every COLI_V4_MIRROR_PROBE_EVERY misses:
+     * with the last probe just above the reserve, the growth until the next
+     * one must still leave the bank(s) and the headroom free */
+    for (int banks = 1; banks <= 2; banks++)
+        for (int slots = 1; slots <= 256; slots++) {
+            long long reserve =
+                coli_v4_mirror_reserve_mb(slots * slot, banks, mirror, many);
+            long long left = (reserve << 20) -
+                             (COLI_V4_MIRROR_PROBE_EVERY - 1) * mirror;
+            CHECK(left >= banks * slots * slot +
+                              (COLI_V4_RESERVE_HEADROOM_MB << 20),
+                  "%d bank(s) of %d slots not covered", banks, slots);
+        }
+    /* a card too small for the default keeps a working mirror set: below the
+     * minimum live count the default is only the headroom */
+    CHECK(COLI_V4_MIRROR_MIN_LIVE >= 8,
+          "minimum budget below the 8 live mirrors GPU decode needs");
+    CHECK(coli_v4_mirror_reserve_mb(256 * slot, 2, mirror,
+                                    COLI_V4_MIRROR_MIN_LIVE - 1) == 600,
+          "below the minimum budget: headroom only");
+    CHECK(coli_v4_mirror_reserve_mb(256 * slot, 2, mirror,
+                                    COLI_V4_MIRROR_MIN_LIVE) == 7945,
+          "at the minimum budget: the full reserve");
+
     if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
     printf("test_v4_bank_pair: ok\n");
     return 0;

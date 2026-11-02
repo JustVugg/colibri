@@ -99,6 +99,7 @@ static void build(Model *m) {
 }
 
 int main(void) {
+    setenv("Q36_KV", "f32", 1);   /* the KV state compared below as floats */
     setenv("COLI_CUDA", "1", 1); setenv("COLI_GPUS", "0", 1);
     setenv("QT_NO_WARMSTART", "1", 1); setenv("HEAT_FILE", "", 1);
     setenv("COLI_PLACE", "", 1);                    /* "" == unset == auto */
@@ -136,9 +137,10 @@ int main(void) {
     ck(qt_place_of("dnout", 0) == 0 && qt_place_of("attnproj", 1) == 0 && qt_place_of("shexp", 0) == 0,
        "every offered component placed on the one device with room");
     ck(qt_place_of("shexp", 1) == QT_PLACE_CPU, "the component never offered stays on the CPU");
-    double vram = 0;
-    int placed = trunk_place_dense(&m, &vram);
+    double vram = 0; int kinds[3];
+    int placed = trunk_place_dense(&m, &vram, kinds);
     ck(placed == 8, "eight matrices placed: dnout, q k v o, and the complete shared expert");
+    ck(kinds[0] == 1 && kinds[1] == 4 && kinds[2] == 3, "counted by kind: 1 dnout, 4 attnproj, 3 shexp (#2082)");
     ck(vram == (double)(qdw_bytes(&dn->dn_out) + want_attn + qdw_bytes(&dn->sh_g) + qdw_bytes(&dn->sh_u) + qdw_bytes(&dn->sh_d)),
        "placed bytes are the sum of the dense-i8 copies uploaded");
     ck(fake_uploads == 8, "one upload per placed matrix");
@@ -240,9 +242,10 @@ int main(void) {
             ck(finite && gap/scale<1e-4,"segmented attention outputs match full CPU prefill");
             gap=0; scale=1e-6; finite=1;
             for(int i=0;i<(S+1)*KVH*KD;i++){
-                finite &= isfinite(m.K[1][i]) && isfinite(m.V[1][i]);
-                gap=fmax(gap,fabs((double)m.K[1][i]-keys[i]));
-                gap=fmax(gap,fabs((double)m.V[1][i]-values[i]));
+                const float *K1=(const float *)m.K[1], *V1=(const float *)m.V[1];
+                finite &= isfinite(K1[i]) && isfinite(V1[i]);
+                gap=fmax(gap,fabs((double)K1[i]-keys[i]));
+                gap=fmax(gap,fabs((double)V1[i]-values[i]));
                 scale=fmax(scale,fmax(fabs(keys[i]),fabs(values[i])));
             }
             ck(finite && gap/scale<1e-4,"segmented attention preserves CPU-equivalent KV state");

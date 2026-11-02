@@ -293,11 +293,13 @@ ptl_family_qwen38_sanitize() {
   ptl_q38_san "partial qwen38 upload refused in layer 1" 1 COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:"$n" \
     COLI_VK_CHAIN_LAYERS=4 SNAP=qwen38_tiny -- 4 8 $T
   ptl_check_placed qwen38 san.log "asan partial qwen38 upload refused in layer 1"
-  # the device lost 10 frames before the end (a probe counts them), the host copies dropped
-  ptl_q38_run probe.log COLI_VK_DENSE_HOST=0 $P SNAP=qwen38_tiny -- 4 8 $T
+  # the device lost 10 frames before the end (a probe counts them), the host copies dropped;
+  # the frames of the host's routing (COLI_VK_CHAIN_MOE=0): with the routed experts in the
+  # frame a forward is one frame, too few to lose one 10 before the end
+  ptl_q38_run probe.log COLI_VK_CHAIN_MOE=0 COLI_VK_DENSE_HOST=0 $P SNAP=qwen38_tiny -- 4 8 $T
   n=$(sed -n "s/^\[VK\] qwen38 chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p" probe.log | tail -1)
   [ -n "$n" ] && [ "$n" -gt 10 ] || { cat probe.log; fail "asan partial qwen38: the probe reports no frames"; }
-  ptl_q38_san "partial qwen38 device lost, host copies dropped" 2 COLI_VK_CHAIN_FAULT=$((n - 10)) COLI_VK_DENSE_HOST=0 $P \
+  ptl_q38_san "partial qwen38 device lost, host copies dropped" 2 COLI_VK_CHAIN_MOE=0 COLI_VK_CHAIN_FAULT=$((n - 10)) COLI_VK_DENSE_HOST=0 $P \
     SNAP=qwen38_tiny -- 4 8 $T
   grep -q "rebuilding the state of [1-9]" san.log || { cat san.log; fail "asan partial qwen38 device lost: no state rebuilt"; }
   [ "$(dho_reloaded san.log)" -gt 0 ] || { cat san.log; fail "asan partial qwen38 device lost: nothing read back"; }

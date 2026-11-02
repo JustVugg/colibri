@@ -40,6 +40,8 @@ LAYER_KINDS = frozenset((
     "self_attn.o_proj.weight",
     "self_attn.q_norm.weight",
     "self_attn.k_norm.weight",
+    # Flint (RecursiveSI/flint): a learned sink logit per attention head
+    "self_attn.softmax_offset",
     # MoE block: router, shared expert, its gate
     "mlp.gate.weight",
     "mlp.shared_expert.gate_proj.weight",
@@ -53,6 +55,20 @@ LAYER_KINDS = frozenset((
     # routed experts, fused layout (real checkpoints): one tensor per layer
     "mlp.experts.gate_up_proj",
     "mlp.experts.down_proj",
+    # LFM3 (LiquidAI/LFM3-VL): the norms before and after each branch, the MLP, the short
+    # conv layers and the attention's gate per head (the converter renames the first two
+    # norms and the MLP to the names above)
+    "operator_norm.weight",
+    "post_operator_norm.weight",
+    "ffn_norm.weight",
+    "post_ffn_norm.weight",
+    "feed_forward.w1.weight",
+    "feed_forward.w2.weight",
+    "feed_forward.w3.weight",
+    "conv.in_proj.weight",
+    "conv.conv.weight",
+    "conv.out_proj.weight",
+    "self_attn.gate_proj.weight",
 ))
 
 # routed experts, per-expert layout (transformers save_pretrained on the
@@ -60,17 +76,22 @@ LAYER_KINDS = frozenset((
 _EXPERT_SEPARATE = re.compile(r"^mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
 
 GLOBAL_KINDS = frozenset(("embed_tokens.weight", "norm.weight", "lm_head.weight"))
+# LFM3's final norm, under its own name (the converter writes it as norm.weight)
+LFM3_GLOBAL_KINDS = frozenset(("embedding_norm.weight",))
 
 # Whole subtrees the engine does not implement. Skipped deliberately,
 # counted, and reported -- never silently.
-SKIP_PREFIXES = (
-    ("mtp.", "mtp", "multi-token-prediction head (mtp_num_hidden_layers); "
-                    "the engine predicts one token per step and never reads it"),
-)
+SKIP_PREFIXES = ()
+
+# LFM3-VL's tower and projector, run by the engine through lfm3_vision.h: copied under
+# their own names, placed as ("lfm3_vision", <the whole name>).
+LFM3_VISION_PREFIXES = ("model.vision_tower.", "model.multi_modal_projector.")
 
 # The vision tower, converted since #1757: the same ViT in Qwen3.5/3.6/3.8, run by
 # the engine through qwen38_vision.h. Placed as ("vision", <name after visual.>).
-VISION_PREFIXES = ("model.visual.", "visual.")
+# "model.language_model.visual.": the same tower, as some finetune exports
+# (llmfan46/Qwen3.6-35B-A3B-uncensored-heretic) nest it under the language model's prefix.
+VISION_PREFIXES = ("model.visual.", "visual.", "model.language_model.visual.")
 
 _LAYER = re.compile(r"^layers\.(\d+)\.(.+)$")
 
@@ -92,16 +113,29 @@ def classify(name, prefix):
          ("global", kind)            embed / final norm / lm_head
          ("layer", index, kind)      a tensor of transformer layer <index>
          ("vision", name)            the vision tower, name after "visual."
-         ("skip", group)             mtp, deliberately not converted
+         ("lfm3_vision", name)       LFM3-VL's tower or projector, the whole name
+         ("mtp", name)               checkpoint MTP tensor
        or raise UnknownTensor.
 
     ``kind`` for a layer is the suffix after ``layers.<i>.``; for the
     per-expert layout it is normalised to ``mlp.experts.<e>.<proj>.weight``
     so the converter can key on it.
     """
+    if name.startswith("mtp."):
+        rest = name[4:]
+        if rest in ("fc.weight", "norm.weight", "pre_fc_norm_embedding.weight", "pre_fc_norm_hidden.weight"):
+            return ("mtp", rest)
+        m = _LAYER.match(rest)
+        if m and int(m.group(1)) == 0 and not m.group(2).startswith("linear_attn."):
+            if m.group(2) in LAYER_KINDS or _EXPERT_SEPARATE.match(m.group(2)):
+                return ("mtp", rest)
+        raise UnknownTensor(name)
     for skip_prefix, group, _why in SKIP_PREFIXES:
         if name.startswith(skip_prefix):
             return ("skip", group)
+    for lfm3_prefix in LFM3_VISION_PREFIXES:
+        if name.startswith(lfm3_prefix):
+            return ("lfm3_vision", name)
     for vision_prefix in VISION_PREFIXES:
         if name.startswith(vision_prefix):
             return ("vision", name[len(vision_prefix):])
@@ -109,7 +143,7 @@ def classify(name, prefix):
         return ("global", "lm_head.weight")
     if name.startswith(prefix):
         rest = name[len(prefix):]
-        if rest in GLOBAL_KINDS:
+        if rest in GLOBAL_KINDS or rest in LFM3_GLOBAL_KINDS:
             return ("global", rest)
         m = _LAYER.match(rest)
         if m:

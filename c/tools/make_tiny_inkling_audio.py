@@ -55,7 +55,11 @@ def main():
         log_scaling_alpha=0.1,
         local_layer_ids=[0, 1, 2, 3, 4, 6, 7],
         dense_mlp_idx=2,
-        dense_intermediate_size=96,
+        # the config's own fields: intermediate_size is the dense MLP, moe_intermediate_size
+        # the experts. Not dense_intermediate_size, the checkpoints' alias: transformers
+        # 5.20 reads it as "intermediate_size is the experts' width" (#49416), and an
+        # unset intermediate_size then made every expert 24576 wide
+        intermediate_size=96,
         moe_intermediate_size=32,
         n_routed_experts=8,
         num_experts_per_tok=2,

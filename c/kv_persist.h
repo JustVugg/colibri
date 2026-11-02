@@ -11,20 +11,22 @@ static int g_kvsave=1;
 #define KV_MAGIC  "COLIKV1\0"                    /* v1: righe Lc/Rc f32 */
 #define KV_MAGIC2 "COLIKV2\0"                    /* v2 (KV8): righe fp8 e4m3 + scala f32 per riga */
 #define KV_MAGIC3 "COLIKV3\0"                    /* v3 (KV_TQ): righe PolarQuant + raggio f32 per riga (h[7]=bits) */
-static const char *kv_active_magic(void){ return g_tq?KV_MAGIC3 : g_kv8?KV_MAGIC2 : KV_MAGIC; }
+#define KV_MAGIC4 "COLIKV4\0"                    /* v4 (KV16): righe float16, nessuna scala */
+static const char *kv_active_magic(void){ return g_tq?KV_MAGIC3 : g_kv8?KV_MAGIC2 : g_kv16?KV_MAGIC4 : KV_MAGIC; }
 
 static void kv_hdr(Model *m, int32_t *h, int nrec){
     Cfg *c=&m->c; int nic=0;
     for(int i=0;i<c->n_layers;i++) if(m->Ic && m->Ic[i]) nic++;
     h[0]=c->n_layers; h[1]=c->kv_lora; h[2]=c->qk_rope;
     h[3]=m->has_dsa?c->index_hd:0; h[4]=nic; h[5]=c->vocab; h[6]=nrec;
-    h[7]=g_tq?((g_tq_codec<<8)|g_tq_bits):(g_kv8?1:0);   /* format tag: 0=f32, 1=kv8; TQ: codec<<8 | bit width */
+    h[7]=g_tq?((g_tq_codec<<8)|g_tq_bits):(g_kv8?1:g_kv16?2:0);   /* format tag: 0=f32, 1=kv8, 2=kv16; TQ: codec<<8 | bit width */
 }
 
 static int64_t kv_rec_bytes(Model *m){
     Cfg *c=&m->c;
     int64_t rec = 4 + (g_tq ? (int64_t)c->n_layers*(coli_kvq_row_bytes(c->kv_lora,g_tq_bits,g_tq_codec)+coli_kvq_row_bytes(c->qk_rope,g_tq_bits,g_tq_codec)+8)
                             : g_kv8 ? (int64_t)c->n_layers*(c->kv_lora+c->qk_rope+8)
+                            : g_kv16 ? (int64_t)c->n_layers*(c->kv_lora+c->qk_rope)*2
                             : (int64_t)c->n_layers*(c->kv_lora+c->qk_rope)*4);
     if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i]) rec+=(int64_t)c->index_hd*4;
     return rec;
@@ -130,6 +132,9 @@ static void kv_disk_append(Model *m, const int *hist, int len){
                 memcpy(b, &m->Lsc[i][p], 4); b+=4;
                 memcpy(b, coli_kv_row8(m->Rc8[i],p,c->qk_rope), (size_t)c->qk_rope); b+=c->qk_rope;
                 memcpy(b, &m->Rsc[i][p], 4); b+=4;
+            } else if(g_kv16){            /* v4: float16 rows as they sit in RAM */
+                memcpy(b, coli_kv_row8(m->Lc8[i],p,2*c->kv_lora), (size_t)c->kv_lora*2); b+=c->kv_lora*2;
+                memcpy(b, coli_kv_row8(m->Rc8[i],p,2*c->qk_rope), (size_t)c->qk_rope*2); b+=c->qk_rope*2;
             } else {
                 memcpy(b, m->Lc[i]+(int64_t)p*c->kv_lora, (size_t)c->kv_lora*4); b+=c->kv_lora*4;
                 memcpy(b, m->Rc[i]+(int64_t)p*c->qk_rope,(size_t)c->qk_rope*4); b+=c->qk_rope*4;
@@ -170,10 +175,10 @@ static int kv_disk_load(Model *m, int *hist, int maxctx){
     Cfg *c=&m->c;
     FILE *f=coli_own_fopen(k->disk_path,"rb"); if(!f) return 0;
     char mg[8]; int32_t h[8], w[8]; kv_hdr(m,w,0);
-    int dt=-1;                                        /* dtype del FILE: 0=f32 (v1), 1=fp8 (v2), 2=PolarQuant (v3) */
+    int dt=-1;                                        /* dtype del FILE: 0=f32 (v1), 1=fp8 (v2), 2=PolarQuant (v3), 3=float16 (v4) */
     if(fread(mg,1,8,f)==8){
         if(!memcmp(mg,KV_MAGIC,8)) dt=0; else if(!memcmp(mg,KV_MAGIC2,8)) dt=1;
-        else if(!memcmp(mg,KV_MAGIC3,8)) dt=2; }
+        else if(!memcmp(mg,KV_MAGIC3,8)) dt=2; else if(!memcmp(mg,KV_MAGIC4,8)) dt=3; }
     if(dt<0 || fread(h,4,8,f)!=8 ||
        h[0]!=w[0]||h[1]!=w[1]||h[2]!=w[2]||h[3]!=w[3]||h[4]!=w[4]||h[5]!=w[5]){
         fprintf(stderr,"[KV] ignoring .coli_kv from a different model or version\n"); fclose(f); return 0; }
@@ -182,6 +187,9 @@ static int kv_disk_load(Model *m, int *hist, int maxctx){
         fclose(f); return 0; }
     if(dt==2 && !g_tq){
         fprintf(stderr,"[KV] .coli_kv is PolarQuant (saved under KV_TQ): starting over (set KV_TQ to resume it)\n");
+        fclose(f); return 0; }
+    if(dt==3 && (g_kv8||g_tq)){
+        fprintf(stderr,"[KV] .coli_kv is float16 (KV16) and this run quantizes the KV (KV8, KV_TQ): starting over\n");
         fclose(f); return 0; }
     if(dt==2 && g_tq && h[7]!=((g_tq_codec<<8)|g_tq_bits)){   /* h[7] = codec<<8 | bit width */
         fprintf(stderr,"[KV] .coli_kv KV_TQ (codec %d, %d-bit) != current (codec %d, %d-bit): starting over\n",
@@ -194,9 +202,14 @@ static int kv_disk_load(Model *m, int *hist, int maxctx){
         fclose(f); return 0; }
     double t0=now_s();
     /* v1 f32 sotto KV8/KV_TQ: righe f32 lette in staging e quantizzate al volo */
-    float *stage = ((g_kv8||g_tq)&&dt==0) ? falloc(c->kv_lora>c->qk_rope?c->kv_lora:c->qk_rope) : NULL;
+    float *stage = (kv_coded()&&dt==0) || (!kv_coded()&&dt==3) ? falloc(c->kv_lora>c->qk_rope?c->kv_lora:c->qk_rope) : NULL;
+    uint16_t *stage16 = (!kv_coded()&&dt==3) ? malloc(sizeof(uint16_t)*(size_t)(c->kv_lora>c->qk_rope?c->kv_lora:c->qk_rope)) : NULL;
     for(int p=0;p<nrec;p++){
-        int32_t tk; if(fread(&tk,4,1,f)!=1){ nrec=p; break; } hist[p]=tk;
+        int32_t tk; if(fread(&tk,4,1,f)!=1){ nrec=p; break; }
+        if(tk<0 || tk>=c->vocab){
+            fprintf(stderr,"[KV] .coli_kv token id %d out of range at record %d: keeping the first %d\n",tk,p,p);
+            nrec=p; break; }
+        hist[p]=tk;
         for(int i=0;i<c->n_layers;i++){
             if(dt==2){                                /* v3: byte polari + raggio, gia' nel formato in RAM */
                 int lbb=coli_kvq_row_bytes(c->kv_lora,g_tq_bits,g_tq_codec), rbb=coli_kvq_row_bytes(c->qk_rope,g_tq_bits,g_tq_codec);
@@ -212,6 +225,19 @@ static int kv_disk_load(Model *m, int *hist, int maxctx){
                    fread(&m->Rsc[i][p], 4, 1, f)!=1){ nrec=p; goto out; }
                 kv8_sanitize_row(coli_kv_row8(m->Lc8[i],p,c->kv_lora), c->kv_lora, &m->Lsc[i][p]);
                 kv8_sanitize_row(coli_kv_row8(m->Rc8[i],p,c->qk_rope), c->qk_rope, &m->Rsc[i][p]);
+            } else if(dt==3 && g_kv16){                /* v4: float16, gia' nel formato in RAM */
+                if(fread(coli_kv_row8(m->Lc8[i],p,2*c->kv_lora), 2, c->kv_lora, f)!=(size_t)c->kv_lora ||
+                   fread(coli_kv_row8(m->Rc8[i],p,2*c->qk_rope), 2, c->qk_rope, f)!=(size_t)c->qk_rope){ nrec=p; goto out; }
+            } else if(dt==3){                          /* v4 under float32: widened, exact */
+                if(!stage16 || fread(stage16, 2, c->kv_lora, f)!=(size_t)c->kv_lora){ nrec=p; goto out; }
+                kv16_unpack(m->Lc[i]+(int64_t)p*c->kv_lora, stage16, c->kv_lora);
+                if(fread(stage16, 2, c->qk_rope, f)!=(size_t)c->qk_rope){ nrec=p; goto out; }
+                kv16_unpack(m->Rc[i]+(int64_t)p*c->qk_rope, stage16, c->qk_rope);
+            } else if(g_kv16){                         /* v1 f32 under KV16: to float16 */
+                if(fread(stage, 4, c->kv_lora, f)!=(size_t)c->kv_lora){ nrec=p; goto out; }
+                kv16_pack((uint16_t *)coli_kv_row8(m->Lc8[i],p,2*c->kv_lora), stage, c->kv_lora);
+                if(fread(stage, 4, c->qk_rope, f)!=(size_t)c->qk_rope){ nrec=p; goto out; }
+                kv16_pack((uint16_t *)coli_kv_row8(m->Rc8[i],p,2*c->qk_rope), stage, c->qk_rope);
             } else if(g_tq){                          /* v1 f32 sotto KV_TQ: PolarQuant al volo */
                 if(fread(stage, 4, c->kv_lora, f)!=(size_t)c->kv_lora){ nrec=p; goto out; }
                 m->Lsc[i][p]=coli_kvq_quant_row(stage, coli_kv_row8(m->Lc8[i],p,coli_kvq_row_bytes(c->kv_lora,g_tq_bits,g_tq_codec)), c->kv_lora, g_tq_bits, g_tq_codec);
@@ -231,17 +257,17 @@ static int kv_disk_load(Model *m, int *hist, int maxctx){
             if(fread(m->Ic[i]+(int64_t)p*c->index_hd, 4, c->index_hd, f)!=(size_t)c->index_hd){ nrec=p; goto out; }
     }
 out:
-    fclose(f); free(stage);
+    fclose(f); free(stage); free(stage16);
     if(nrec>0){
         if(m->has_mtp) m->kv_start[c->n_layers]=-1;
         fprintf(stderr,"[KV] resumed conversation from disk: %d tokens in %.1fs (no re-prefill)\n",
             nrec, now_s()-t0);
-        if((g_kv8||g_tq) && dt==0){
-            /* upgrade v1->v2/v3: il file f32 non puo' ricevere append quantizzati.
+        if((kv_coded() && dt==0) || (!kv_coded() && dt==3)){
+            /* upgrade v1->v2/v3/v4 (or v4->v1): the file cannot take appends in another format.
              * disk_nrec=0 e il file resta INTATTO: al primo append il magic lo riscrive. */
             k->disk_nrec=0;
-            fprintf(stderr,"[KV] f32 .coli_kv quantized in RAM; will be rewritten as %s at next save\n",
-                g_tq?"PolarQuant (v3)":"fp8 (v2)");
+            fprintf(stderr,"[KV] %s .coli_kv converted in RAM; will be rewritten as %s at next save\n",
+                dt==3?"float16":"f32", g_tq?"PolarQuant (v3)":g_kv8?"fp8 (v2)":g_kv16?"float16 (v4)":"f32 (v1)");
             return nrec;
         }
     }

@@ -123,20 +123,59 @@ static G53Chain *g53c_of(int d) { return d ? g_g53c2 : g_g53c; }
 static const char *g53c_name(const G53Chain *ch) { return ch && ch->d ? "glm53 dev2" : "glm53"; }
 static int g53c_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 
-/* A Mat's device copy (the per-matrix path's own, where it made one); f32 as fmt 10. The
- * second device's layers hold theirs there (g_g53c_dev at setup). */
+/* A GGUF matrix's device format: its blocks as the file has them (100 + the ggml type; the
+ * CPU's rows interleaved by 16 go back to the file's), where the backend has a block form
+ * for that type; -1 none. */
+static int g53c_gq_fmt(const Mat *w) {
+    if (w->fmt != G53_GGML || !w->q4 || w->rows < 1 || w->columns < 1) return -1;
+    const int b = gq_r16_base(w->gs), t = b >= 0 ? b : w->gs, be = coli_vk_block_elems(100 + t);
+    if (b >= 0 && w->rows % 16) return -1;   /* gq_r16_unpack gives whole groups back */
+    if (w->vk_hgemv) return 10;              /* the MLA's per-head matrices: dequantized, as floats */
+    return be > 0 && w->columns % be == 0 ? 100 + t : -1;
+}
+/* A Mat's device copy (the per-matrix path's own, where it made one); f32 as bf16 or f16 where
+ * that holds it exactly, else fmt 10; a GGUF's blocks as the file has them. The second
+ * device's layers hold theirs there (g_g53c_dev at setup). */
 static ColiVkTensor *g53c_tensor(const Mat *wc) {
     Mat *w = (Mat *)wc;
     if (w->vk) return (ColiVkTensor *)w->vk;
     int fmt; const void *p;
     switch (w->fmt) {
-    case 0: fmt = 10; p = w->f; break;
+    case 0:
+        if (!w->f || w->rows < 1 || w->columns < 1) return NULL;
+        return coli_vk_tensor_ensure_f32((ColiVkTensor **)&w->vk, w->f, w->columns, w->rows, g_g53c_dev) ? (ColiVkTensor *)w->vk : NULL;
     case 1: fmt = 1; p = w->q8; break;
     case 4: if (w->gs < 8 || w->gs % 8) return NULL; fmt = 4; p = w->q4; break;
+    case G53_GGML: {
+        int f = g53c_gq_fmt(w);
+        if (f < 0) return NULL;
+        const int b = gq_r16_base(w->gs), t = b >= 0 ? b : w->gs;
+        uint8_t *rows = NULL;   /* rows interleaved by 16 for the CPU: the file's back */
+        if (b >= 0) {
+            if (!(rows = malloc((size_t)gq_row_bytes(t, w->columns) * (size_t)w->rows))) return NULL;
+            gq_r16_unpack(w->gs, rows, w->q4, w->rows, w->columns);
+        }
+        if (f == 10) {   /* dequantized: the floats the CPU's rows hold */
+            const uint8_t *src = rows ? rows : w->q4;
+            const int64_t rb = gq_row_bytes(t, w->columns);
+            float *fl = malloc((size_t)w->rows * (size_t)w->columns * sizeof(float));
+            if (!fl) { free(rows); return NULL; }
+            for (int r = 0; r < w->rows; r++) gq_dequant_row(t, src + (int64_t)r * rb, fl + (size_t)r * w->columns, w->columns);
+            free(rows);
+            int ok = coli_vk_tensor_ensure_f32((ColiVkTensor **)&w->vk, fl, w->columns, w->rows, g_g53c_dev);
+            free(fl);
+            return ok ? (ColiVkTensor *)w->vk : NULL;
+        }
+        const void *src = rows ? (const void *)rows : (const void *)w->q4;
+        int ok = g_g53c_dev ? coli_vk_tensor_ensure2((ColiVkTensor **)&w->vk, src, NULL, f, w->columns, w->rows, 0)
+                            : coli_vk_tensor_ensure((ColiVkTensor **)&w->vk, src, NULL, f, w->columns, w->rows, 0);
+        free(rows);
+        return ok ? (ColiVkTensor *)w->vk : NULL;
+    }
     default: return NULL;
     }
     if (!p || w->rows < 1 || w->columns < 1) return NULL;
-    const float *sc = w->fmt ? w->s : NULL;
+    const float *sc = w->s;
     int gs = w->fmt == 4 ? w->gs : 0;
     return (g_g53c_dev ? coli_vk_tensor_ensure2((ColiVkTensor **)&w->vk, p, sc, fmt, w->columns, w->rows, gs)
                        : coli_vk_tensor_ensure((ColiVkTensor **)&w->vk, p, sc, fmt, w->columns, w->rows, gs)) ? (ColiVkTensor *)w->vk : NULL;
@@ -201,6 +240,12 @@ static void g53c_cpu_step(const GModel *m, const GSession *s, int start) {
     g53c_sync_host(m, s);
     for (int d = 0; d < 2; d++) { G53Chain *x = g53c_of(d); if (x && x->ok && x->owner == s) g53c_cpu_one(m, x, start); }
 }
+/* A forward of s from `start` stopped between layers (g_layer_halt): its chunk is thrown
+ * away, so nothing the devices hold from `start` on counts. The host's KDA state is not
+ * read back: forward_prefill puts back the copy it took when the chunk began. */
+static void g53c_halted(const GModel *m, const GSession *s, int start) {
+    for (int d = 0; d < 2; d++) { G53Chain *x = g53c_of(d); if (x && x->ok && x->owner == s) g53c_cpu_one(m, x, start); }
+}
 
 /* ---- setup ----------------------------------------------------------------------------- */
 /* g53c_tensor's backend format for w without uploading it (-1: no device form) and its
@@ -209,9 +254,10 @@ static int g53c_form(const Mat *w, int *gs) {
     *gs = 0;
     if (w->rows < 1 || w->columns < 1) return -1;
     switch (w->fmt) {
-    case 0: return w->f ? 10 : -1;
+    case 0: return w->f ? coli_vk_f32_fmt(w->f, (size_t)w->rows * w->columns) : -1;
     case 1: return w->q8 ? 1 : -1;
     case 4: if (w->gs < 8 || w->gs % 8 || !w->q4) return -1; *gs = w->gs; return 4;
+    case G53_GGML: return g53c_gq_fmt(w);
     default: return -1;
     }
 }
@@ -438,7 +484,7 @@ static int g53c_setup_dev(GModel *m, int d) {
         if (c->is_full[i])
             ch->mla[i] = (VkcMla){c->n_heads, c->qk_nope, 0, c->v_head, c->kv_lora, D, c->q_lora, c->eps,
                                   1.0f / sqrtf((float)c->qk_nope), VKC_ROPE_HALF, l->qa.vk, l->qb.vk, l->kva.vk, NULL,
-                                  l->kvb_kt.vk, l->kvb_v.vk, l->o.vk, ch->prm, ch->o_qn[i], ch->o_kn[i]};
+                                  l->kvb_kt.vk, l->kvb_v.vk, l->o.vk, ch->prm, ch->o_qn[i], ch->o_kn[i], 0};
         if (!d) g53_dho_drop_layer(m, i);   /* COLI_VK_DENSE_HOST: all of the layer is there, its host copies go */
         vkc_fit_mark(fit, i - lo);
     }
@@ -576,7 +622,7 @@ static int g53c_push(G53Chain *ch, const GModel *m, const GSession *s, int start
         int t0 = ch->kv_valid[i], n = start - t0;
         if (ch->pool_valid[i] > start / c->index_kpool) ch->pool_valid[i] = start / c->index_kpool;   /* rows from start change */
         if (ch->ks.on) {      /* the split: the window placed, its latent rows below start uploaded */
-            VkcKvPart pl = {1, K, ls->latent, 0, ch->kv[i].lat, 0};
+            VkcKvPart pl = {1, K, ls->latent, 0, ch->kv[i].lat, 0, 0};
             vkc_kv_place(&ch->ks, ch->mla_ord[i], start, n_rows);
             ok = vkc_kv_push(&ch->ks, ch->mla_ord[i], &pl, 1, start);
         }
@@ -731,7 +777,8 @@ static int g53c_prefill_rows(GModel *m, GSession *s, int n) {
 /* One chain's layers (lo..lo+n-1, on its device, current) for n rows of `streams` (the
  * session's positions start..), the streams after the last of them back into it. Returns
  * ch->n; 0 = not taken: memory refused (the streams untouched), or *lost = 1: a frame
- * failed (the device marked lost). */
+ * failed (the device marked lost); -1 = g_layer_halt stopped it between two layers (the
+ * device idle, the streams untouched). */
 static int g53c_forward_seg(GModel *m, GSession *s, G53Chain *ch, float *streams, int n, int start, int *lost) {
     *lost = 0;
     const Cfg *c = &m->c; int D = c->hidden, H = c->hc_mult, HD = H * D, lo = ch->lo, hi = lo + ch->n;
@@ -754,6 +801,14 @@ static int g53c_forward_seg(GModel *m, GSession *s, G53Chain *ch, float *streams
             goto lost;
         int ok = 1, pending = 0, pulled = lo;
         for (int i = lo; i < hi && ok; i++) {
+            /* between two layers, as run_layers on the CPU: not before the forward's first */
+            if (g_layer_halt && (i > lo || c0 > 0 || lo > 0) && g_layer_halt(g_layer_halt_arg)) {
+                if (!vkc_finish()) goto lost;
+                g_halted_at_layer = i;
+                g_halted_on_device = 1;
+                free(outs);
+                return -1;
+            }
             const GLayer *l = &m->layer[i];
             if (pending) {                       /* the FFN branch of the layer before: shared + routed, written back */
                 VkcEw add = {VKC_EW_ADD, nr * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
@@ -813,7 +868,8 @@ lost:   /* a frame failed: the device is gone (or would not take a command) */
  * device's after them) for n rows of `streams` (the session's positions start..), the
  * streams after the last of them back into it. Returns how many layers ran: L, or fewer
  * (run_layers goes on from there on the CPU); 0 = not taken: the CPU runs the layers
- * (streams as they came in). */
+ * (streams as they came in); -1 = stopped between layers (g53c_halted: the chunk is the
+ * caller's to throw away). */
 static int g53c_forward(GModel *m, GSession *s, float *streams, int n, int start) {
     G53Chain *ch = g_g53c, *ch2 = g_g53c2;
     if (!g_vk_chain || !ch || !ch->ok || ch->failed) return 0;
@@ -859,6 +915,7 @@ static int g53c_forward(GModel *m, GSession *s, float *streams, int n, int start
     if (keep) memcpy(keep, streams, (size_t)n * HD * sizeof(float));
     int lost = 0;
     int done = g53c_forward_seg(m, s, ch, streams, n, start, &lost);
+    if (done < 0) { free(keep); g53c_halted(m, s, start); return -1; }
     if (!done) {
         free(keep);
         if (lost) { g53c_recover(m, s, start, dev0, dev2, ch); return 0; }
@@ -870,6 +927,7 @@ static int g53c_forward(GModel *m, GSession *s, float *streams, int n, int start
     vkc_device(1);
     int done2 = g53c_forward_seg(m, s, ch2, streams, n, start, &lost);
     vkc_device(0);
+    if (done2 < 0) { free(keep); g53c_halted(m, s, start); return -1; }
     if (lost) {
         memcpy(streams, keep, (size_t)n * HD * sizeof(float));
         free(keep);

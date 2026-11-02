@@ -225,6 +225,28 @@ class BenchmarkTest(unittest.TestCase):
                                    row["first_output_seconds"] + row["dispatch_delay_seconds"])
         self.assertEqual(summary["arrival_timing"]["dispatch_delay_seconds"]["count"], 3)
 
+    def test_cli_preserves_unicode_separators_inside_jsonl_prompt_strings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workload = Path(directory) / "prompts.jsonl"
+            output = Path(directory) / "report.json"
+            command = [sys.executable, bench.__file__, "--base-url", self.url.rsplit("/", 1)[0],
+                       "--model", "fixture", "--workload", str(workload), "--output", str(output)]
+            for separator in ("\u0085", "\u2028", "\u2029"):
+                for newline in ("\n", "\r\n"):
+                    with self.subTest(separator=ord(separator), newline=repr(newline)):
+                        prompts = [{"messages": [{"role": "user", "content": "first" + separator + "second"}]},
+                                   {"messages": [{"role": "user", "content": "ordinary prompt"}]}]
+                        workload.write_bytes((newline.join(json.dumps(row, ensure_ascii=False)
+                                                           for row in prompts) + newline).encode("utf-8"))
+                        self.server.payloads.clear()
+                        result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        report = json.loads(output.read_text())
+                        self.assertEqual(report["config"]["workload_rows"], 2)
+                        self.assertEqual(report["summary"]["succeeded"], 2)
+                        self.assertEqual([row["messages"] for row in self.server.payloads],
+                                         [row["messages"] for row in prompts])
+
     def test_cli_warmup_is_separate_and_failure_skips_measurement(self):
         with tempfile.TemporaryDirectory() as directory:
             workload = Path(directory) / "prompts.jsonl"

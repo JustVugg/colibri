@@ -170,7 +170,7 @@ const id: Record<string, string> = {
   "topbar.tokPerSec": "{{n}} tok/s",
   "topbar.slot": "slot {{n}}",
   "topbar.truncated": "Terpotong",
-  "topbar.truncatedHelp": "Respons mencapai batas maksimum token output dan terpotong. Naikkan \"Maksimum token output\" untuk melihat jawaban lengkap.",
+  "topbar.truncatedHelp": "Respons mencapai batas output atau akhir konteks dan terpotong. Jika Anda menurunkan \"Maksimum token output\", naikkan lagi; jika tidak, lanjutkan responsnya.",
   "topbar.clear": "Bersihkan",
 
   // hero / empty state

@@ -1,5 +1,6 @@
 /* Separately rounded CPU oracle; real-model verification uses head_bf16_dot. */
 #include "../backend_cuda_dsv4.h"
+#include "dsv4_test_devices.h"
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -86,7 +87,8 @@ int main(int argc,char **argv) {
     puts("head CUDA oracle requires the AVX2 head contract");
     return 77;
 #else
-    int devices[] = {0, 5};
+    int devices[2];
+    dsv4_test_devices(devices);
     assert(dsv4_cuda_init(devices, 2));
     int shapes[][2] = {{32, 256}, {160, 4104}, {129280, 4096}};
     int shape_count = argc == 2 && !strcmp(argv[1], "--small") ? 2 : 3;

@@ -17,7 +17,7 @@
 set -u
 GLM="${1:-./glm}"
 REPS="${REPS:-3}"
-export TEMP=0 DRAFT=0
+export COLI_TEMP=0 TEMP=0 DRAFT=0
 [ -n "${PIPE:-}" ] && export COLI_CUDA_PIPE="$PIPE"
 
 SHORT_PROMPT="Explain why the sky is blue in simple terms."
@@ -35,7 +35,13 @@ scenario(){ # name prompt ngen
   local name=$1 prompt=$2 ngen=$3
   for r in $(seq 1 "$REPS"); do
     local log; log=$(mktemp)
-    NGEN=$ngen PROMPT="$prompt" "$GLM" 64 4 4 >"$log" 2>&1
+    local status=0
+    NGEN=$ngen PROMPT="$prompt" "$GLM" 64 4 4 >"$log" 2>&1 || status=$?
+    if [ "$status" -ne 0 ]; then
+      cat "$log" >&2
+      rm -f "$log"
+      return "$status"
+    fi
     local line; line=$(grep -aE "prefill .* decode .*tok/s" "$log" | tail -1)
     local head; head=$(grep -av "^\[" "$log" | grep -avE "PROFILE|PROFILO|ATTENTION|expert|CUDA|prefill|specul|^---|TOPP|stop|Motore|caricato|prompt:|token" \
                        | tail -1 | tr -d '\n' | cut -c1-48)
@@ -46,6 +52,6 @@ scenario(){ # name prompt ngen
 }
 
 echo "== bench_ux: reps=$REPS pipe=${COLI_CUDA_PIPE:-unset} $(date +%F' '%T) =="
-scenario chat     "$SHORT_PROMPT"   96
-scenario longdoc  "$LONGDOC_PROMPT" 96
+scenario chat     "$SHORT_PROMPT"   96 || exit $?
+scenario longdoc  "$LONGDOC_PROMPT" 96 || exit $?
 echo "== bench_ux done $(date +%T) =="

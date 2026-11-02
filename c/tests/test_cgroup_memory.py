@@ -356,48 +356,82 @@ class CgroupMemoryAdmissionTest(unittest.TestCase):
 
     # -- page cache is reclaimable headroom (A2) -----------------------------
 
-    def test_v2_inactive_file_cache_is_not_spent_budget(self):
-        # limit 12 MB, 9 MB charged of which 5 MB is clean file cache: the
-        # kernel reclaims that cache before enforcing the limit, so the working
-        # set is 4 MB and 8 MB remains -- not 3 MB.
+    def test_v2_file_cache_is_not_spent_budget(self):
+        # limit 12 MB, 9 MB charged of which 5 MB is clean file cache, 3 MB
+        # inactive and 2 MB active: the kernel reclaims both lists before
+        # enforcing the limit, so the working set is 4 MB and 8 MB remains --
+        # not 3 MB, nor the 6 MB that subtracting the inactive pages alone gives.
         self._standard_v2(member="/")
         self._write_v2(self.root, 12_000_000, 9_000_000)
         self.assertEqual(self._remaining(), 3_000_000)
+        self._write_stat(self.root, anon=4_000_000, file=5_000_000, inactive_file=3_000_000)
+        self.assertEqual(self._remaining(), 6_000_000)
         self._write_stat(
-            self.root, anon=4_000_000, file=5_000_000, inactive_file=5_000_000
+            self.root, anon=4_000_000, file=5_000_000,
+            inactive_file=3_000_000, active_file=2_000_000,
         )
         self.assertEqual(self._remaining(), 8_000_000)
         self.assertEqual(self._available(), 8_000_000)
 
-    def test_v1_subtracts_hierarchical_total_inactive_file_not_the_local_figure(self):
+    def test_active_file_cache_alone_is_not_spent_budget(self):
+        # A model read twice sits on the active list: 12 - (9 - 5) = 8 MB.
+        self._standard_v2(member="/")
+        self._write_v2(self.root, 12_000_000, 9_000_000)
+        self._write_stat(self.root, anon=4_000_000, file=5_000_000, active_file=5_000_000)
+        self.assertEqual(self._remaining(), 8_000_000)
+
+    def test_tmpfs_and_shared_memory_are_not_file_cache_room(self):
+        # `file` also counts tmpfs and shared memory, which the kernel keeps on
+        # the anon lists and cannot just drop: only the two file lists are
+        # room. 12 - (9 - 2 - 1) = 6 MB, not the 8 MB that subtracting `file`
+        # gives.
+        self._standard_v2(member="/")
+        self._write_v2(self.root, 12_000_000, 9_000_000)
+        self._write_stat(
+            self.root, anon=4_000_000, file=5_000_000, shmem=2_000_000,
+            inactive_file=2_000_000, active_file=1_000_000,
+        )
+        self.assertEqual(self._remaining(), 6_000_000)
+
+    def test_v1_subtracts_hierarchical_total_file_cache_not_the_local_figures(self):
         # usage_in_bytes is hierarchical, so it pairs with total_inactive_file
-        # (3 MB), not the cgroup-local inactive_file (1 MB): 10 - (8 - 3) = 5.
+        # and total_active_file (3 + 1 MB), not the cgroup-local inactive_file
+        # and active_file (1 + 2 MB): 10 - (8 - 4) = 6.
         self._membership("7:memory:/")
         self._mounts(self._mount_line(fs_type="cgroup", super_options="rw,memory"))
         self._write_v1(self.root, 10_000_000, 8_000_000)
         self._write_stat(
             self.root,
-            cache=3_000_000,
+            cache=4_000_000,
             inactive_file=1_000_000,
+            active_file=2_000_000,
             total_inactive_file=3_000_000,
+            total_active_file=1_000_000,
         )
-        self.assertEqual(self._remaining(), 5_000_000)
+        self.assertEqual(self._remaining(), 6_000_000)
 
-    def test_inactive_file_beyond_charged_usage_leaves_the_whole_limit(self):
+    def test_file_cache_beyond_charged_usage_leaves_the_whole_limit(self):
         self._standard_v2(member="/")
         self._write_v2(self.root, 12_000_000, 2_000_000)
         self._write_stat(self.root, inactive_file=5_000_000)
         self.assertEqual(self._remaining(), 12_000_000)
+        # neither list alone exceeds the usage, the two together do
+        self._write_stat(self.root, inactive_file=1_500_000, active_file=1_000_000)
+        self.assertEqual(self._remaining(), 12_000_000)
 
     def test_page_cache_is_subtracted_per_ancestor_level(self):
-        # Parent: 20 - (15 - 10) = 15 MB; leaf: 12 - 3 = 9 MB. Without the
+        # Parent: 20 - (15 - 6 - 4) = 15 MB; leaf: 12 - 3 = 9 MB. Without the
         # parent's statistics the parent would bind the result at 5 MB.
         self._standard_v2()
         self._write_v2(self.root / "tenant", 20_000_000, 15_000_000)
         self._write_v2(self.root / "tenant" / "job", 12_000_000, 3_000_000)
         self.assertEqual(self._remaining(), 5_000_000)
-        self._write_stat(self.root / "tenant", inactive_file=10_000_000)
+        self._write_stat(self.root / "tenant", inactive_file=6_000_000, active_file=4_000_000)
         self.assertEqual(self._remaining(), 9_000_000)
+        # A looser leaf lets the parent bind, so its two lists show:
+        # 20 - (15 - 6 - 4) = 15 MB; inactive alone gives 11, active alone 9.
+        self._write_v2(self.root / "tenant" / "job", 30_000_000, 3_000_000)
+        self.assertEqual(self._remaining(), 15_000_000)
 
     def test_memory_stat_without_the_key_subtracts_nothing(self):
         self._standard_v2(member="/")
@@ -415,6 +449,9 @@ class CgroupMemoryAdmissionTest(unittest.TestCase):
             "inactive_file 1 2\n",
             "inactive_file -1\n",
             "inactive_file 1\ninactive_file 2\n",
+            "active_file x\n",
+            "active_file 1\nactive_file 2\n",
+            f"active_file {_CGROUP_UINT64_MAX + 1}\n",
             "inactive_file 1\n\n",
             f"inactive_file {_CGROUP_UINT64_MAX + 1}\n",
             "inactive_file 1\n" + "x" * (64 * 1024),

@@ -76,7 +76,11 @@ export default function App() {
   const [imageModels, setImageModels] = useState<string[]>([])
   const [model, setModel] = useState(() => stored(localStorage, "colibri.model", "glm-5.2-colibri"))
   const [temperature, setTemperature] = useState(0.7)
-  const [maxTokens, setMaxTokens] = useState(4096)
+  /* null: the server's own ceiling (/health max_tokens; on colibrì the context the
+     engine holds), sent as no limit at all. A reasoning model's turn is its reasoning
+     plus its answer, and a fixed 4096 cut most of them short (#382). A number: the
+     user's own, up to that ceiling. */
+  const [maxTokens, setMaxTokens] = useState<number | null>(null)
   const [thinking, setThinking] = useState(false)
   const [cacheSlot, setCacheSlot] = useState(0)
   const [conversations, setConversations] = useState<Record<number, ChatMessage[]>>({ 0: [] })
@@ -117,8 +121,8 @@ export default function App() {
   const autoConnected = useRef(false)
   const abortRef = useRef<AbortController | null>(null)
   const probeRef = useRef<AbortController | null>(null)
-  const bottomRef = useRef<HTMLDivElement>(null)
   const conversationRef = useRef<HTMLDivElement>(null)
+  const followRef = useRef(true)   // the reader is at the bottom: a streaming answer keeps the view there
   const exportRef = useRef<HTMLDivElement>(null)
   const [atBottom, setAtBottom] = useState(true)
   const [exportOpen, setExportOpen] = useState(false)
@@ -183,15 +187,29 @@ export default function App() {
   useEffect(() => { setLastRun(null) }, [cacheSlot])
 
   // EFFECT #7
-  /* The view goes to the bottom when a turn is added (a sent message, a restored or
-     switched conversation), not with every streamed token: someone reading an earlier
-     part of the answer stays where they are. The button below the list goes down. */
-  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }) }, [messages.length, cacheSlot])
+  /* The view follows the conversation. A new turn (a sent message, a restored or switched
+     conversation) brings it to the bottom, and while an answer streams it stays at the
+     bottom as long as the reader is there. Scrolling up stops the following: the reader
+     stays where they are, whatever streams below, until they scroll back down or press
+     the button below the list. */
+  const toBottom = (smooth: boolean) => {
+    const box = conversationRef.current
+    if (!box) return
+    followRef.current = true
+    box.scrollTo({ top: box.scrollHeight, behavior: smooth ? "smooth" : "auto" })
+  }
+  useEffect(() => { toBottom(false) }, [messages.length, cacheSlot])
   const checkBottom = () => {
     const box = conversationRef.current
-    setAtBottom(!box || box.scrollHeight - box.scrollTop - box.clientHeight < 80)
+    const near = !box || box.scrollHeight - box.scrollTop - box.clientHeight < 80
+    followRef.current = near
+    setAtBottom(near)
   }
-  useEffect(checkBottom, [messages])
+  useEffect(() => {
+    const box = conversationRef.current
+    if (box && followRef.current) box.scrollTop = box.scrollHeight
+    else checkBottom()
+  }, [messages])
 
   // EFFECT #8
   useEffect(() => {
@@ -289,10 +307,11 @@ export default function App() {
         model,
         messages: chatTurns(payload),
         temperature,
-        maxTokens,
+        maxTokens: maxTokens ?? undefined,
         enableThinking: thinking,
         cacheSlot: supportsCacheSlots(health) ? cacheSlot : undefined,
         compact: supportsCompaction(health),
+        keepReasoning: supportsCompaction(health),
         signal: controller.signal,
         /* Reasoning tokens are tokens: they count toward the rate, and the
            first one is the real time-to-first-token. The answer's first token
@@ -493,7 +512,7 @@ export default function App() {
             {Array.from({ length: kvSlots }, (_, slot) => <option key={slot} value={slot}>{t("sidebar.sessionLabel", { slot: slot + 1 })}</option>)}
           </select><span className="field-help">{t("sidebar.kvSessionHelp")}</span></label> : null}
           <label><span className="label-line"><span>{t("sidebar.temperature")}</span><code>{temperature.toFixed(1)}</code></span><input id="temperature" className="range" type="range" min="0" max="2" step="0.1" value={temperature} onChange={(event) => setTemperature(Number(event.target.value))} /></label>
-          <label>{t("sidebar.maxTokens")}<Input id="max-tokens" type="number" min={1} max={32768} value={maxTokens} onChange={(event) => { const value = Number(event.target.value); if (Number.isFinite(value)) setMaxTokens(Math.min(32768, Math.max(1, Math.round(value)))) }} /></label>
+          <label>{t("sidebar.maxTokens")}<Input id="max-tokens" type="number" min={1} max={health?.max_tokens} value={maxTokens ?? health?.max_tokens ?? ""} onChange={(event) => { if (event.target.value === "") { setMaxTokens(null); return } const value = Number(event.target.value); if (!Number.isFinite(value)) return; const wanted = Math.max(1, Math.round(value)); setMaxTokens(health?.max_tokens && wanted >= health.max_tokens ? null : wanted) }} /></label>
           <button type="button" className={cn("toggle-row", thinking && "active")} aria-pressed={thinking} onClick={() => setThinking((value) => !value)}>
             <span><BrainCircuit className="size-4" /> {t("sidebar.reasoning")}</span><i><b /></i>
           </button>
@@ -602,10 +621,10 @@ export default function App() {
                 </details>
               : null}{item.content ? (item.role === "assistant" ? <Markdown text={item.content} /> : item.content) : <span className="typing" aria-label={t("ui.generating")}><i /><i /><i /></span>}</div>}
             {item.role === "assistant" && item.content && <div className="message-actions"><button className="icon-action" aria-label={t("ui.copy")} title={t("ui.copy")} onClick={() => void copyMessage(item)}><Copy /></button>{copied === item.id && <span role="status">{t("ui.copied")}</span>}{index === messages.length - 1 && !loading && !imageMode && <button className="icon-action" aria-label={t("ui.regenerate")} title={t("ui.regenerate")} onClick={() => { const retry = resendFrom(messages, index); if (retry) void send(retry.text, retry.previous, retry.pictures, false) }}><RefreshCw /></button>}{index === messages.length - 1 && !loading && !imageMode && supportsContinuation(health) && continuable(item) && <button className="icon-action" aria-label={t("ui.continue")} title={t("ui.continue")} onClick={() => void continueTurn()}><StepForward /></button>}</div>}
-          </article>)}<div ref={bottomRef} /></div>
+          </article>)}</div>
         </div>}
         <div className="composer-wrap">
-          {!empty && !atBottom && <button className="scroll-bottom" aria-label={t("chat.toBottom")} title={t("chat.toBottom")} onClick={() => bottomRef.current?.scrollIntoView({ behavior: "smooth" })}><ArrowDown /></button>}
+          {!empty && !atBottom && <button className="scroll-bottom" aria-label={t("chat.toBottom")} title={t("chat.toBottom")} onClick={() => toBottom(true)}><ArrowDown /></button>}
           {error && <div className="error-banner" role="alert">{t(error)}</div>}
           <form className={cn("composer", imageMode && "image-mode")} onSubmit={e => { e.preventDefault(); submit() }}
             onDragOver={e => { if (!imageMode && e.dataTransfer.types.includes("Files")) e.preventDefault() }}

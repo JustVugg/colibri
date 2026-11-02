@@ -40,6 +40,19 @@ class PlacementCrossvalTest(unittest.TestCase):
             MODULE.write_ranked(output, ranked)
             self.assertTrue(output.read_text().startswith("0 0 "))
 
+    def test_skips_history_header_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "alpha_0.txt"
+            path.write_text("-1 92 256\n-2 1 3815245270\n0 0 9\n0 1 1\n")
+            self.assertEqual(MODULE.read_run(path), {(0, 0): 9, (0, 1): 1})
+
+    def test_rejects_header_only_stats(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "alpha_0.txt"
+            path.write_text("-1 92 256\n-2 1 3815245270\n")
+            with self.assertRaises(ValueError):
+                MODULE.read_run(path)
+
     def test_rejects_empty_stats(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "alpha_0.txt"

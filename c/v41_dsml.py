@@ -144,8 +144,8 @@ def tools_from_openai_format(tools):
         function["name"] = _tool_name_for_encoding(function)
         namespace = function.pop("namespace", None)
         if isinstance(namespace, dict) and namespace.get("description"):
-            function["description"] = (
-                namespace["description"] + "\n" + (function.get("description") or ""))
+            function["description"] = "{}\n{}".format(
+                namespace["description"], function.get("description") or "")
         functions.append(function)
     return functions
 

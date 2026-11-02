@@ -1,0 +1,145 @@
+#version 450
+// chain_mla.comp's attention core (mode 0) for a decode's or a verify's few rows
+// (vk_chain.c, vkc_mla_core from VKC_MLA_DEC_MIN positions), the positions split into
+// blocks of L: chain_mla.comp gives a (head, row) one workgroup that walks every position
+// in turn, about twenty barriers a tile of 64 (an RTX PRO 4000, 64 heads of a 512-float
+// latent and a 64-float rope: 1.75 ms a layer at 2000 positions, 11 ms at 8000, as long
+// with 128 heads).
+//   mode 0: workgroup (head h, block b, row s): the block's positions (kv_start + t, or
+//           the row's selection list's entries b*L.., a negative entry skipped), their
+//           scores (a subgroup a position, its lanes over the latent and the rope), max m,
+//           sum l of exp(score - m) and acc[i] = sum exp(score - m) lat[t][i] into the
+//           scratch (m -3e38, l 0 for a block with no live position);
+//   mode 1: workgroup (head h, row s): the blocks joined, acc / l into clat (0 for a row
+//           with no position, as chain_mla.comp).
+// The bindings and push constants are chain_mla.comp's mode 0, plus the scratch at
+// binding 7 and mode, L, nb. Limits: K <= 1024, R <= 128.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer QA { float qa[]; };
+layout(std430, binding = 1) readonly buffer QR { float qrb[]; };
+layout(std430, binding = 2) readonly buffer LC { float lc[]; };
+layout(std430, binding = 3) readonly buffer RC { float rc[]; };
+layout(std430, binding = 4) readonly buffer SL { int sel[]; };
+layout(std430, binding = 5) writeonly buffer OB { float ob[]; };
+layout(std430, binding = 7) buffer XB { float xs[]; };   // per (row, head, block): m, l, acc[K]
+
+layout(push_constant) uniform P { int v[32]; } p;
+#define S_        p.v[1]
+#define H_        p.v[2]
+#define K_        p.v[3]
+#define R_        p.v[4]
+#define POS_BASE  p.v[5]
+#define KV_START  p.v[6]
+#define QA_OFF    p.v[7]
+#define QA_ROW    p.v[8]
+#define QA_SEG    p.v[9]
+#define QR_OFF    p.v[10]
+#define QR_ROW    p.v[11]
+#define QR_SEG    p.v[12]
+#define LAT_OFF   p.v[13]
+#define LAT_ROW   p.v[14]
+#define ROPE_OFF  p.v[15]
+#define ROPE_ROW  p.v[16]
+#define SEL_OFF   p.v[17]
+#define SEL_ROW   p.v[18]
+#define O_OFF     p.v[19]
+#define O_ROW     p.v[20]
+#define O_SEG     p.v[21]
+#define SCALE     intBitsToFloat(p.v[22])
+#define MODE      p.v[23]
+#define BL        p.v[24]
+#define NB        p.v[25]
+
+shared float qs[1024];
+shared float qrs[128];
+shared float sc[256];
+shared int   tp[256];
+shared float red[64];
+
+// row s's positions: the count, and whether they are a list
+int row_n(int s, out bool list, out int lb) {
+    int n = POS_BASE + s + 1 - KV_START;
+    list = false; lb = 0;
+    if (SEL_ROW > 0) {
+        lb = SEL_OFF + s * SEL_ROW;
+        int c = sel[lb];
+        if (c >= 0) { n = c; list = true; }
+    }
+    return n;
+}
+
+void main() {
+    int tid = int(gl_LocalInvocationID.x), sg = int(gl_SubgroupID), nsg = int(gl_NumSubgroups);
+    int lane = int(gl_SubgroupInvocationID), sgs = int(gl_SubgroupSize);
+    int h = int(gl_WorkGroupID.x), stride = K_ + 2;
+    if (MODE == 0) {
+        int b = int(gl_WorkGroupID.y), s = int(gl_WorkGroupID.z);
+        bool list; int lb;
+        int n = row_n(s, list, lb);
+        int t0 = b * BL, cnt = min(BL, n - t0);
+        int xo = ((s * H_ + h) * NB + b) * stride;
+        if (cnt <= 0) {   // past the row's positions: an empty block
+            if (tid == 0) { xs[xo] = -3.0e38; xs[xo + 1] = 0.0; }
+            for (int i = tid; i < K_; i += 256) xs[xo + 2 + i] = 0.0;
+            return;
+        }
+        int qb = QA_OFF + s * QA_ROW + h * QA_SEG, rb = QR_OFF + s * QR_ROW + h * QR_SEG;
+        for (int i = tid; i < K_; i += 256) qs[i] = qa[qb + i];
+        for (int i = tid; i < R_; i += 256) qrs[i] = qrb[rb + i];
+        if (tid < cnt) tp[tid] = list ? sel[lb + 1 + t0 + tid] : KV_START + t0 + tid;
+        barrier();
+        for (int j = sg; j < cnt; j += nsg) {
+            int t = tp[j];
+            float a = 0.0;
+            if (t >= 0) {
+                int lo = LAT_OFF + t * LAT_ROW, ro = ROPE_OFF + t * ROPE_ROW;
+                for (int i = lane; i < K_; i += sgs) a += qs[i] * lc[lo + i];
+                for (int i = lane; i < R_; i += sgs) a += qrs[i] * rc[ro + i];
+            }
+            float tot = subgroupAdd(a);
+            if (subgroupElect()) sc[j] = t >= 0 ? tot * SCALE : -3.0e38;
+        }
+        barrier();
+        float mx = -3.0e38;
+        for (int j = tid; j < cnt; j += 256) mx = max(mx, sc[j]);
+        mx = subgroupMax(mx);
+        if (subgroupElect()) red[sg] = mx;
+        barrier();
+        float m = red[0];
+        for (int g = 1; g < nsg; g++) m = max(m, red[g]);
+        barrier();
+        float e = 0.0;
+        for (int j = tid; j < cnt; j += 256) { float w = m > -1.0e38 && tp[j] >= 0 ? exp(sc[j] - m) : 0.0; sc[j] = w; e += w; }
+        e = subgroupAdd(e);
+        if (subgroupElect()) red[sg] = e;
+        barrier();
+        float l = 0.0;
+        for (int g = 0; g < nsg; g++) l += red[g];
+        for (int i = tid; i < K_; i += 256) {
+            float acc = 0.0;
+            for (int j = 0; j < cnt; j++) { int t = tp[j]; if (t >= 0) acc += sc[j] * lc[LAT_OFF + t * LAT_ROW + i]; }
+            xs[xo + 2 + i] = acc;
+        }
+        if (tid == 0) { xs[xo] = m; xs[xo + 1] = l; }
+        return;
+    }
+    // mode 1: the row's blocks joined
+    int s = int(gl_WorkGroupID.y);
+    bool list; int lb;
+    int n = row_n(s, list, lb), nbr = min(NB, (n + BL - 1) / BL);
+    int xo = (s * H_ + h) * NB * stride;
+    float M = -3.0e38;
+    for (int b = 0; b < nbr; b++) M = max(M, xs[xo + b * stride]);
+    float Lt = 0.0;
+    for (int b = 0; b < nbr; b++) Lt += xs[xo + b * stride + 1] * exp(xs[xo + b * stride] - M);
+    float inv = Lt > 0.0 ? 1.0 / Lt : 0.0;
+    int ob0 = O_OFF + s * O_ROW + h * O_SEG;
+    for (int i = tid; i < K_; i += 256) {
+        float v = 0.0;
+        for (int b = 0; b < nbr; b++) v += xs[xo + b * stride + 2 + i] * exp(xs[xo + b * stride] - M);
+        ob[ob0 + i] = v * inv;
+    }
+}

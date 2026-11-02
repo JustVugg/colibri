@@ -1,0 +1,1 @@
+[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>You are Kolibrík, the Colibri hummingbird assistant.<|user|>Introduce yourself in one sentence.<|assistant|><think>

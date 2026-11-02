@@ -252,8 +252,8 @@ ld2_colibri() {
       ${s% *} ${s#* } $X DSA_TOPK=4 TF=1 COLI_VK_CHAIN_ROWS=5 -- 64 16 16
   done
   ld2_mla colibri "ld2 colibri n-gram drafts" 2 3 $G DRAFT=3 -- 64 16 16
-  ld2_mla colibri "ld2 colibri MTP depth 2" 2 3 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json USAGE_SAVE=0 DRAFT=2 -- 64 16 16
-  ld2_mla colibri "ld2 colibri MTP with DSA top-4" 1 2 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json USAGE_SAVE=0 DSA_TOPK=4 -- 64 16 16
+  ld2_mla colibri "ld2 colibri MTP depth 2" 2 3 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json USAGE_SAVE=0 DRAFT=2 -- 64 16 16
+  ld2_mla colibri "ld2 colibri MTP with DSA top-4" 1 2 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json USAGE_SAVE=0 DSA_TOPK=4 -- 64 16 16
   ld2_mla colibri "ld2 colibri experts on both devices too" 2 3 $G COLI_VK_TIER_GB=0.00002 -- 64 16 16
   CHAINMODE=2 ld2_mla colibri "ld2 colibri prompts only, drafts" 2 3 $G DRAFT=3 -- 64 16 16
   ld2_mla colibri "ld2 colibri KV split on both" 2 3 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 $G DSA_TOPK=4 -- 64 16 16
@@ -263,7 +263,7 @@ ld2_colibri() {
   LD2_EXPECT=setup ld2_lost colibri "ld2 colibri second device lost at its setup" 2 2 1 $G -- 64 16 16
   LD2_EXPECT=again ld2_lost colibri "ld2 colibri second device lost in the prompt" 2 2 2 $G TF=1 -- 64 16 16
   LD2_EXPECT=again ld2_lost colibri "ld2 colibri second device lost mid-decode" 2 2 10 $G -- 64 16 16
-  LD2_EXPECT=again ld2_lost colibri "ld2 colibri second device lost with MTP" 2 2 10 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json \
+  LD2_EXPECT=again ld2_lost colibri "ld2 colibri second device lost with MTP" 2 2 10 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json \
     USAGE_SAVE=0 DRAFT=2 -- 64 16 16
   # serve sessions: pins, the prompt cache, the prefill read-out, two KV slots
   CHAIN_SERVE_EXPECT='colibri dev2 chain: [1-9][0-9]* forwards' CHAIN_SERVE_DIALECT=colibri \

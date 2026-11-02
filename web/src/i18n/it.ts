@@ -164,7 +164,7 @@ const it: Record<string, string> = {
   "topbar.slot": "slot {{n}}",
   "chat.compacted": "I primi {{n}} messaggi non entravano piu' nel contesto del modello: sono stati riassunti e la conversazione continua dal riassunto (passa il mouse per leggerlo).",
   "topbar.truncated": "Troncato",
-  "topbar.truncatedHelp": "La risposta ha raggiunto il limite di token di output ed e' stata tagliata. Aumenta \"Token di output massimi\" per vedere la risposta completa.",
+  "topbar.truncatedHelp": "La risposta ha raggiunto il limite di output o la fine del contesto ed e' stata tagliata. Se hai abbassato \"Token di output massimi\", alzalo; altrimenti continua la risposta.",
   "topbar.clear": "Pulisci",
 
   "hero.title": "MOTORE COLIBRÌ",

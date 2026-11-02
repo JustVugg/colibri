@@ -26,6 +26,13 @@
 #define COLI_QPACK_MAX_FILES 8192u
 #define COLI_QPACK_MAX_RANK 16u
 #define COLI_QPACK_MAX_EXPERT_STRIDE (1u << 30)
+/* A section name or dtype is graphic ASCII (0x21-0x7E) of at most this many
+ * bytes. The bytes are echoed into error strings and the inspector's listing,
+ * so anything else is a terminal escape delivered to whoever opens the
+ * container. Every derived name -- <module>.weight, .scales, .biases -- is
+ * exactly as long as the .weight section it derives from (module + 7), and
+ * the two name buffers below hold COLI_QPACK_MAX_NAME bytes plus the NUL. */
+#define COLI_QPACK_MAX_NAME 255u
 
 static int qpack_fail(char *error, size_t capacity, const char *format, ...) {
     if (error && capacity) {
@@ -118,12 +125,34 @@ static int qpack_json_u64(jval *value, uint64_t *output) {
     return 0;
 }
 
+static int qpack_key_order(const void *left, const void *right) {
+    return strcmp(*(const char *const *)left, *(const char *const *)right);
+}
+
+/* A repeated key in a JSON object.  The keys are sorted once and compared
+ * neighbour to neighbour: n log n comparisons where the pairwise scan this
+ * replaced took n^2 / 2 of them, and nothing bounds a root object's key count
+ * before this runs but the 16 MiB JSON cap, about 1.4 million short keys (a
+ * manifest root of 100,000 took 16 s of CPU pairwise; 1.4 million would be an
+ * hour, before the refusal).  If the pointer copy cannot be allocated the
+ * pairwise scan answers instead: memory changes the time, never the verdict. */
 static int qpack_object_has_duplicate_keys(jval *object) {
-    if (!object || object->t != J_OBJ) return 0;
-    for (int i = 0; i < object->len; i++)
-        for (int j = 0; j < i; j++)
-            if (strcmp(object->keys[i], object->keys[j]) == 0) return 1;
-    return 0;
+    if (!object || object->t != J_OBJ || object->len < 2) return 0;
+    const char **sorted =
+        (const char **)malloc((size_t)object->len * sizeof(*sorted));
+    if (!sorted) {
+        for (int i = 1; i < object->len; i++)
+            for (int j = 0; j < i; j++)
+                if (strcmp(object->keys[i], object->keys[j]) == 0) return 1;
+        return 0;
+    }
+    for (int i = 0; i < object->len; i++) sorted[i] = object->keys[i];
+    qsort(sorted, (size_t)object->len, sizeof(*sorted), qpack_key_order);
+    int duplicate = 0;
+    for (int i = 1; i < object->len && !duplicate; i++)
+        duplicate = strcmp(sorted[i - 1], sorted[i]) == 0;
+    free(sorted);
+    return duplicate;
 }
 
 static int qpack_dtype_size(const char *dtype, size_t *size) {
@@ -139,6 +168,23 @@ static int qpack_dtype_size(const char *dtype, size_t *size) {
         }
     }
     return -1;
+}
+
+/* Refused by index: the offending bytes are exactly what must not be printed. */
+static int qpack_check_token(const char *text, size_t index, const char *field,
+                             char *error, size_t error_capacity) {
+    for (size_t at = 0; text[at]; at++) {
+        unsigned char byte = (unsigned char)text[at];
+        if (at >= COLI_QPACK_MAX_NAME)
+            return qpack_fail(error, error_capacity,
+                              "section %zu %s is longer than %u bytes",
+                              index, field, COLI_QPACK_MAX_NAME);
+        if (byte < 0x21 || byte > 0x7E)
+            return qpack_fail(error, error_capacity,
+                              "section %zu %s is not printable ASCII",
+                              index, field);
+    }
+    return 0;
 }
 
 static void qpack_free_layout(ColiQpackLayout *layout) {
@@ -235,6 +281,12 @@ static int qpack_parse_layout(ColiQpackLayout *layout, const char *text,
             qpack_free_layout(layout);
             return qpack_fail(error, error_capacity,
                               "section %zu is invalid", i);
+        }
+        if (qpack_check_token(name->str, i, "name", error, error_capacity) ||
+            qpack_check_token(dtype->str, i, "dtype", error, error_capacity)) {
+            json_free(root);
+            qpack_free_layout(layout);
+            return -1;
         }
 
         ColiQpackSection *section = &layout->sections[i];
@@ -426,10 +478,15 @@ static int qpack_check_packed_widths(const ColiQpackLayout *layout,
             strcmp(weight->dtype, "U32") != 0)
             continue;
         int module_size = (int)(name_size - suffix_size);
-        char scales_name[256];
+        char scales_name[COLI_QPACK_MAX_NAME + 1];
         int count = snprintf(scales_name, sizeof(scales_name), "%.*s.scales",
                              module_size, weight->name);
-        if (count < 0 || (size_t)count >= sizeof(scales_name)) continue;
+        /* Unreachable while COLI_QPACK_MAX_NAME bounds every section name (a
+         * derived name is as long as the .weight it came from); refused rather
+         * than skipped so the promise above fails closed if the bound moves. */
+        if (count < 0 || (size_t)count >= sizeof(scales_name))
+            return qpack_fail(error, error_capacity,
+                              "section %zu name does not fit a derived name", i);
         const ColiQpackSection *scales = NULL;
         for (size_t j = 0; j < layout->section_count && !scales; j++)
             if (strcmp(layout->sections[j].name, scales_name) == 0)
@@ -659,7 +716,7 @@ int coli_qpack_read_expert(const ColiQpackReader *reader,
 static const ColiQpackSection *
 qpack_projection_section(const ColiQpackReader *reader,
                          const char *projection, const char *suffix) {
-    char name[256];
+    char name[COLI_QPACK_MAX_NAME + 1];
     int count = snprintf(name, sizeof(name), "%s.%s", projection, suffix);
     if (count < 0 || (size_t)count >= sizeof(name)) return NULL;
     return coli_qpack_find_section(reader, name);

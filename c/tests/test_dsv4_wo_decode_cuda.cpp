@@ -1,4 +1,5 @@
 #include "../backend_cuda_dsv4.h"
+#include "dsv4_test_devices.h"
 #include <cuda_runtime.h>
 #include <cassert>
 #include <bit>
@@ -17,7 +18,8 @@ static void round_bf16(std::vector<float> &values) {
 }
 
 int main() {
-    int devices[] = {0, 5};
+    int devices[2];
+    dsv4_test_devices(devices);
     assert(dsv4_cuda_init(devices, 2));
     assert(!dsv4_cuda_wo_decode(nullptr, nullptr, 1, nullptr, nullptr));
     for (int device : devices) for (int groups : {1, 8}) for (int format : {8, 9}) {
@@ -43,7 +45,7 @@ int main() {
         assert(!dsv4_cuda_wo_decode(wa, wb, rows + 1, actual.data(), x.data()));
         assert(!dsv4_cuda_wo_decode(wa, wa, groups, actual.data(), x.data()));
         assert(!dsv4_cuda_wo_decode(wa, wb, groups, nullptr, x.data()));
-        assert(dsv4_cuda_upload_fp8(&peer, b.data(), bs.data(), hidden, rows, device == 0 ? 5 : 0));
+        assert(dsv4_cuda_upload_fp8(&peer, b.data(), bs.data(), hidden, rows, device == devices[0] ? devices[1] : devices[0]));
         assert(cudaDeviceSynchronize() == cudaSuccess);
         assert(!dsv4_cuda_wo_decode(wa, peer, groups, actual.data(), x.data()));
         for (int trial = 0; trial < 3; trial++) {

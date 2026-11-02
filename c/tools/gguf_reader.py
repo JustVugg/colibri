@@ -59,6 +59,9 @@ GGML_TYPE_BF16 = 30
 GGML_TYPE_TQ1_0 = 34
 GGML_TYPE_TQ2_0 = 35
 GGML_TYPE_MXFP4 = 39
+GGML_TYPE_NVFP4 = 40
+GGML_TYPE_Q1_0 = 41
+GGML_TYPE_Q2_0 = 42
 
 GGML_TYPE_RAW = {
     GGML_TYPE_F32: ("F32", 4),
@@ -99,6 +102,9 @@ GGML_TYPE_BLOCK = {
     GGML_TYPE_TQ1_0: ("TQ1_0", 256, 54),
     GGML_TYPE_TQ2_0: ("TQ2_0", 256, 66),
     GGML_TYPE_MXFP4: ("MXFP4", 32, 17),
+    GGML_TYPE_NVFP4: ("NVFP4", 64, 36),     # the engine's ggml_quants.h tables, checked against gguf-py
+    GGML_TYPE_Q1_0: ("Q1_0", 128, 18),
+    GGML_TYPE_Q2_0: ("Q2_0", 64, 18),       # ISTA-DASLab's GSQ-RCO Qwen3.8 files: every routed expert
 }
 
 _GGML_TYPE_NAMES = {}
@@ -181,8 +187,12 @@ def _tensor_bytes(dims, ggml_type):
 
 
 class GGUFReader:
-    def __init__(self, path):
+    def __init__(self, path, header_only=False):
+        """header_only: the file is the header of a model fetched with tools/gguf_header.py
+        (GGUF_CHECK), so the tensor data is legitimately absent: offsets and sizes are still
+        parsed and checked, only "lies inside the file" is not."""
         self.path = path
+        self.header_only = header_only
         self.f = open(path, "rb")
         self.file_size = os.fstat(self.f.fileno()).st_size
         self.version = None
@@ -348,7 +358,7 @@ class GGUFReader:
                 raise GGUFError(
                     "%s: tensor %r: %s" % (self.path, tensor["name"], exc)) from exc
             absolute = self._data_base + tensor["offset"]
-            if absolute + nbytes > self.file_size:
+            if absolute + nbytes > self.file_size and not self.header_only:
                 raise GGUFError(
                     "%s: tensor %r range [%d, %d) exceeds file size %d"
                     % (self.path, tensor["name"], absolute,

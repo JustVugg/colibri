@@ -107,6 +107,12 @@ on a single short one. There is no int8 option: measured on the same 117
 questions, int8 weights changed 1 decision and int8 weights with int8
 activations changed 4, which is not a trade a decision model should make.
 
+**On a CUDA device** (a `CUDA=1` build, `coli serve --gpu` or `COLI_CUDA=1`): the encoder and
+the head run on the card, the matrices in f32 (docs/cuda.md "The decision engines"). An RTX
+PRO 4000 against its host's CPU (an i5-13500, 6 threads), requests of 12 questions over a
+1,700-character email (6,144 rows each): 0.69 s a request against 11.4-13.0 s, the CPU's
+decisions, every probability within 3.3e-6 of the CPU's.
+
 ## Knobs
 
 | variable | default | meaning |

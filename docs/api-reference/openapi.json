@@ -156,13 +156,18 @@
       "get": {
         "tags": ["Operations"],
         "summary": "Check server health",
-        "description": "Always returns liveness. Authenticated requests also receive scheduler, KV-slot, tier, and hardware details when available.",
+        "description": "Returns 200 while the engine runs, 503 while it is down. Authenticated requests also receive scheduler, KV-slot, engine-restart, tier, and hardware details when available.",
         "operationId": "getHealth",
         "security": [{}, { "bearerAuth": [] }, { "apiKeyAuth": [] }],
         "responses": {
           "200": {
             "description": "Server health",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Health" } } }
+          },
+          "503": {
+            "description": "The engine stopped. `restarting`: coli serve is starting it again, and requests wait in the queue for it; `engine_down`: nothing is starting it (an embedded server).",
+            "headers": { "Retry-After": { "schema": { "type": "string" } } },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EngineDown" } } }
           }
         }
       }
@@ -364,8 +369,16 @@
           "status": { "type": "string", "const": "ok" },
           "scheduler": { "type": "object", "additionalProperties": true },
           "kv_slots": { "type": "integer" },
+          "engine_restarts": { "type": "integer" },
           "tiers": { "type": "object", "additionalProperties": true },
           "hwinfo": { "type": "object", "additionalProperties": true }
+        }
+      },
+      "EngineDown": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "type": "string", "enum": ["restarting", "engine_down"] }
         }
       },
       "Experts": {

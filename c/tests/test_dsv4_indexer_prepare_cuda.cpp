@@ -1,4 +1,5 @@
 #include "../backend_cuda_dsv4.h"
+#include "dsv4_test_devices.h"
 #include "../native_quant.h"
 #include <cassert>
 #include <chrono>
@@ -9,7 +10,7 @@
 #include <vector>
 
 int main() {
-    int devices[]={0,5};assert(dsv4_cuda_init(devices,2));
+    int devices[2];dsv4_test_devices(devices);assert(dsv4_cuda_init(devices,2));
     constexpr int heads=64,hidden=4096;
     std::vector<uint16_t> weights(heads*hidden);
     std::vector<float> input(hidden),expected_w(heads),hw(heads);

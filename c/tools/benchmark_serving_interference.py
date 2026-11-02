@@ -10,6 +10,11 @@ import sys
 import threading
 import time
 
+try:
+    from tools.benchmark_process import close_engine
+except ModuleNotFoundError:              # direct execution from c/tools
+    from benchmark_process import close_engine
+
 
 def submit(proc, request_id, slot, prompt, max_tokens):
     body = prompt.encode()
@@ -126,6 +131,9 @@ def main():
                         "data": [],
                     }
                     phase = "treatment"
+                elif request_id == 2 and not long_submitted:
+                    raise RuntimeError("treatment completed with no output token; "
+                                       "interference could not be measured")
                 elif request_id == 2 and 3 in requests and "done" in requests[3]:
                     break
                 elif request_id == 3 and 2 in requests and "done" in requests[2]:
@@ -133,9 +141,7 @@ def main():
             elif line.startswith("ERROR "):
                 raise RuntimeError(line)
     finally:
-        if proc.stdin:
-            proc.stdin.close()
-        proc.wait(timeout=30)
+        close_engine(proc)
         thread.join(timeout=1)
 
     control_gaps = gaps(requests[1]["data"])
@@ -143,19 +149,20 @@ def main():
     summary = {
         "control": {
             "tokens": len(requests[1]["data"]),
-            "median_tbt_s": statistics.median(control_gaps),
-            "max_tbt_s": max(control_gaps),
+            "median_tbt_s": statistics.median(control_gaps) if control_gaps else None,
+            "max_tbt_s": max(control_gaps) if control_gaps else None,
             "total_s": requests[1]["done"] - requests[1]["submitted"],
         },
         "treatment": {
             "tokens": len(requests[2]["data"]),
-            "median_tbt_s": statistics.median(treatment_gaps),
-            "max_tbt_s": max(treatment_gaps),
+            "median_tbt_s": statistics.median(treatment_gaps) if treatment_gaps else None,
+            "max_tbt_s": max(treatment_gaps) if treatment_gaps else None,
             "total_s": requests[2]["done"] - requests[2]["submitted"],
         },
         "interfering_prefill": {
             "submit_to_accept_s": requests[3]["accepted"] - requests[3]["submitted"],
-            "ttft_s": requests[3]["data"][0] - requests[3]["submitted"],
+            "ttft_s": (requests[3]["data"][0] - requests[3]["submitted"]
+                       if requests[3]["data"] else None),
             "total_s": requests[3]["done"] - requests[3]["submitted"],
         },
         "prefill_events": [

@@ -159,6 +159,15 @@ class V4CliTest(unittest.TestCase):
         env = self.cli.env_for_engine(args, "kimi")
         self.assertNotIn("RAM_GB", env)
 
+    def test_qwen_ram_flag_reaches_gateway_planner(self):
+        """Qwen's gateway resolves RAM_GB into its positional expert-cache cap.
+        A launch budget must reach that planner even though the engine itself
+        receives the resolved cap rather than RAM_GB as its cache control."""
+        args = argparse.Namespace(ngen=8, temp=None, ram=6, ctx=0)
+        with mock.patch.dict(os.environ, {"RAM_GB": "12"}, clear=True):
+            env = self.cli.env_for_engine(args, "qwen36")
+        self.assertEqual(env["RAM_GB"], "6")
+
     def test_auto_tier_applies_saved_profile_to_sibling_engine(self):
         """#1196 saved sibling profiles, but only GLM's env_for() loaded them.
         A measured V4 lane winner must reach the real chat/serve child, while
@@ -243,6 +252,13 @@ class V4CliTest(unittest.TestCase):
         explicit = argparse.Namespace(ngen=300)
         self.assertEqual(self.cli.ngen_for(explicit), 300)
         self.assertEqual(self.cli.ngen_for(explicit, interactive=True), 300)
+
+    def test_served_sessions_leave_the_ceiling_to_the_context(self):
+        """#382: coli serve, web and chat hand the gateway 0 without --ngen, which it
+        reads as the context the engine holds; a reasoning model's turn is its reasoning
+        plus its answer, and the family's fixed 16384 (8192 for Qwen) cut some short."""
+        self.assertEqual(self.cli.serve_max_tokens(argparse.Namespace(ngen=None)), 0)
+        self.assertEqual(self.cli.serve_max_tokens(argparse.Namespace(ngen=300)), 300)
 
     def test_one_shot_env_still_carries_the_historic_ngen(self):
         """The default moved to None so the two cases can be told apart. These

@@ -723,3 +723,16 @@ translation unit are pending, with each window capped at 64 MiB. Excess hints,
 unavailable APIs and failed mappings are safely skipped; ordinary model reads
 still supply the weights. This applies to the common file-advice path used by
 the CPU and GPU engines and does not change their weight formats or arithmetic.
+
+## Expert reads
+
+A shard is opened once and every thread reads that descriptor. A descriptor
+from the C runtime's `open()` is a synchronous handle, and Windows serves one
+read at a time through it whatever the thread count, so each shard also gets a
+second descriptor opened with `FILE_FLAG_OVERLAPPED`. The reader that finds the
+shard free reads through the first descriptor, as before; a reader that finds
+it taken reads through the second, where any number of reads are in flight
+together. `pread` is still a blocking call; it waits for its own read. If the
+second descriptor cannot be opened the shard keeps the one it has, and its
+reads are serialized rather than refused. This changes when the bytes are
+read, never which bytes.

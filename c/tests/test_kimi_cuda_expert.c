@@ -2,9 +2,19 @@
 #define main kimi_main_unused
 #include "../kimi_k3.c"
 #undef main
+#include "../cu_tier_ops.h"   /* CuTierOps: the table this fake backend has none of */
 
 static int fused_ok, legacy_ok, fused_calls, legacy_calls;
 int coli_cuda_init(const int *devices, int n) { return 1; }
+/* no expert tier on this backend (cu_tier.c then stays off) and no block formats */
+const CuTierOps *coli_cuda_tier_ops(void) { return NULL; }
+int coli_cuda_block_elems(int fmt) { return 0; }
+/* the dense matrices' calls (cu_dense.h), never reached: the tier stays off */
+int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_bytes) { return 0; }
+int coli_cuda_device_at(int index) { return 0; }
+int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x, const void *weights, const float *scales,
+                     int fmt, int S, int I, int O, int device, int gs) { return 0; }
+void coli_cuda_tensor_free(ColiCudaTensor *tensor) {}
 int coli_cuda_expert_mxfp4(float *y, const float *x,
         const unsigned char *gw, const unsigned char *gs,
         const unsigned char *uw, const unsigned char *us,

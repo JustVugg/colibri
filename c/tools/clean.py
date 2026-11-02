@@ -25,6 +25,7 @@ FILES = [
     "glm53", "glm53.exe",
     "glm", "glm.exe",                       # pre-rename name of the colibri engine
     "iobench", "iobench.exe",
+    "qwen36-canonical", "qwen36-canonical.exe",
     "backend_cuda.o", "backend_loader.o", "qwen36_tier.o",
     # VK=1, XDNA=1 and METAL=1 (qwen36's qpack) objects. Left behind once
     # their .d is cleaned, an object would sit in the tree with no record of
@@ -38,12 +39,14 @@ FILES = [
     # hipcc emits an import library, export file and PDB alongside the DLL.
     "coli_hip.dll", "coli_hip.lib", "coli_hip.exp", "coli_hip.pdb",
     "tests/compat_prefetch_module.dll",
+    "libcoli_xdna.so",                      # `make xdna-helper` (Linux)
     "deepseek_v4", "deepseek_v4.exe", "deepseek_v4.cflags", "deepseek_v4.cudaflags",
     "deepseek_v41", "deepseek_v41.exe",
     "mimo", "mimo.exe",
     "qwenimage", "qwenimage.exe",
     "laya", "laya.exe",
     "gliner_decide", "gliner_decide.exe",
+    "colibri-tui", "colibri-tui.exe",
     "native_quant.o", "native_quant_parallel.o", "native_quant_dual.o",
     "native_quant_batch_avx512.o", "native_quant_fp4_rows16.o",
 ]
@@ -76,8 +79,8 @@ FILES = [
 # tools/ for the ctypes library; build/segment/ and build/ownership/ go as
 # whole directories below.
 ARTIFACT_GLOBS = ["tests/test_*", "tests/bench_*", "tests/fuzz_*",
-                  "tests/*_probe*", "COLI_V4_UNIT_*.o", "*.d", "tests/*.d",
-                  "tools/*.d",
+                  "tests/*_probe*", "tests/xdna_fake_helper*", "COLI_V4_UNIT_*.o",
+                  "*.d", "tests/*.d", "tools/*.d",
                   # helper objects the tests link (#1741), one unit per command
                   "tests/*.o"]
 KEEP_EXT = (".c", ".h", ".cc", ".cpp", ".cu", ".mm", ".py", ".txt", ".json",

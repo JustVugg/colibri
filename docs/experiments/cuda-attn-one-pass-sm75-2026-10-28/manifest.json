@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "hypothesis": "On a T4 (sm_75) the CUDA chain's prompt attention is cc_attn_fk, two passes over the keys, because cc_attn_f2 (one pass, online softmax, mma.sync m16n8k16) needs sm_80. Each m16n8k16 is two m16n8k8 with the same fragments, and at head dim 256 blocks of 16 keys fit the T4's 64 KiB of shared memory: one pass then reads a long prompt faster.",
+  "commit": "2e98175273386a32899e907ace17d17d758b7b49",
+  "model": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64",
+  "command": "bench.c built against c/ (make CUDA=1 CUDA_ARCH=sm_75, as bench build does); COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close ./qwen36-bench --model <model> --text promessi_sposi.txt --lengths 2048,3072,4096,5120,6144,7168,8192 --gen 128 --teacher",
+  "prompt_hash": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "hardware": {
+    "cpu": "Intel(R) Xeon(R) CPU @ 2.00GHz (4 cores / 8 threads, 38.5 MiB L3) + NVIDIA Tesla T4 (15360 MiB, sm_75, up to PCIe Gen3 x16)",
+    "ram": "51 GiB",
+    "storage": "Google Colab VM disk (the model downloaded to /content before the runs)",
+    "os": "Ubuntu 24.04.4 LTS (Google Colab, T4 high-RAM), CUDA 13.0 (nvcc V13.0.88), driver 580.82.07, gcc 13.3.0"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "heat_file": "none",
+      "scenario": "the 8192-token prompt of the ladder up (2048, 3072, ... 8192 in one process, each followed by 128 teacher-forced words)",
+      "tok_s": "prompt tokens / the prompt's seconds (bench's prefill_tps of the 8192 row)",
+      "engine_build": "origin/dev 2e981752"
+    },
+    "samples": {
+      "tok_s": [
+        188.46,
+        187.69,
+        188.69,
+        188.41
+      ],
+      "prefill_s_8192": [
+        43.469,
+        43.646,
+        43.416,
+        43.48
+      ],
+      "decode_tok_s_8192": [
+        47.363,
+        47.255,
+        47.459,
+        47.627
+      ],
+      "nll_8192": [
+        2.40718,
+        2.40718,
+        2.40718,
+        2.40718
+      ]
+    },
+    "median_tok_s": 188.435,
+    "quality": {
+      "method": "make -C c check (macOS arm64); on the T4, make -C c cuda-chain-check and make -C c cuda-test pass, and the chain's prompt rows fail against the reference with either m16n8k8 pair mutated (correctness.txt). The logits change, as cc_attn_f2's own comment says against cc_attn_fk (one pass sums in another order): every run of a version here has the same 8192-token fingerprint (a 6f65ef58272e05ec, b 5e5537ed77c416aa); over 1024 teacher-forced words after an 8192-token prompt b's nll is +0.12% (standard error 0.10%) and its top-1 0.3 points lower (standard error 0.3) (quality.txt)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/cuda-attn-one-pass-sm75-2026-10-28/ladder-up.txt",
+      "sha256": "2db3a180cf67c0fb64b9cf4c98130d5839c96600356e7645815c0ae4ae0e6929"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "heat_file": "none",
+      "scenario": "the 8192-token prompt of the ladder up (2048, 3072, ... 8192 in one process, each followed by 128 teacher-forced words)",
+      "tok_s": "prompt tokens / the prompt's seconds (bench's prefill_tps of the 8192 row)",
+      "engine_build": "origin/dev 2e981752 + this change (3655d4e8)"
+    },
+    "samples": {
+      "tok_s": [
+        211.75,
+        211.85,
+        212.23,
+        212.21
+      ],
+      "prefill_s_8192": [
+        38.688,
+        38.669,
+        38.599,
+        38.604
+      ],
+      "decode_tok_s_8192": [
+        47.374,
+        47.504,
+        47.477,
+        47.746
+      ],
+      "nll_8192": [
+        2.4112,
+        2.4112,
+        2.4112,
+        2.4112
+      ]
+    },
+    "median_tok_s": 212.03,
+    "quality": {
+      "method": "make -C c check (macOS arm64); on the T4, make -C c cuda-chain-check and make -C c cuda-test pass, and the chain's prompt rows fail against the reference with either m16n8k8 pair mutated (correctness.txt). The logits change, as cc_attn_f2's own comment says against cc_attn_fk (one pass sums in another order): every run of a version here has the same 8192-token fingerprint (a 6f65ef58272e05ec, b 5e5537ed77c416aa); over 1024 teacher-forced words after an 8192-token prompt b's nll is +0.12% (standard error 0.10%) and its top-1 0.3 points lower (standard error 0.3) (quality.txt)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/cuda-attn-one-pass-sm75-2026-10-28/ladder-up.txt",
+      "sha256": "2db3a180cf67c0fb64b9cf4c98130d5839c96600356e7645815c0ae4ae0e6929"
+    }
+  },
+  "outcome": "improvement"
+}

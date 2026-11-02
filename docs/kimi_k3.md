@@ -282,8 +282,12 @@ The device computes with f32 activations: its experts match `K3_IDOT=0`, the
 configuration of the vendor oracle, while the CPU's default kernel rounds
 activations to int8 per 32. With `K3_IDOT=0` a run with the tier gives the CPU's
 tokens on the tiny fixture and passes Moonshot's oracle, the eviction and warm-start
-cases included (`tests/vulkan_engines.sh kimi`). With `K3_CUDA=1` as well, CUDA
-wins and the Vulkan tier stays off. Each run and serve turn ends with
+cases included (`tests/vulkan_engines.sh kimi`). A build with both backends runs on
+Vulkan when CUDA was asked for (`K3_CUDA=1`, which `coli` sets for `COLI_CUDA=1`) and
+neither `COLI_VULKAN` nor `K3_VK` was set: the CUDA path uploads every routed expert's
+weights at every call (an MXFP4 expert of 7168 x 2048, 2.46 ms on an RTX PRO 4000, against
+72 us for the tier's resident ones) and keeps the dense matrices on the CPU. With
+`COLI_VULKAN=0` and `K3_CUDA=1`, CUDA wins and the Vulkan tier stays off. Each run and serve turn ends with
 `[VK] kimi_k3: N matmuls on the GPU` and the tier's `[VK] tier kimi_k3` line.
 
 The old switches still work, read as the shared tier's (an explicit shared one

@@ -245,7 +245,7 @@ ptl_family_glm() {
   make colibri glm53 VK=1
   ptl_glm_fixtures
   export OMP_NUM_THREADS=2 CAP_RAISE=0
-  local G="SNAP=glm_tiny REF=ref_glm.json" X="SNAP=glm_tiny_shx REF=ref_glm.json" T="SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json" k
+  local G="SNAP=glm_tiny REF=ref_glm.json" X="SNAP=glm_tiny_shx REF=ref_glm.json" T="COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json" k
   # ---- colibri: N forced, k = 0, 1, L/2, L-1, L, and every format
   for k in 0 1 2 4 5; do ptl_mla colibri "partial colibri COLI_VK_CHAIN_LAYERS=$k" $k $G -- 64 16 16; done
   ptl_mla colibri "partial colibri 8-bit trunk, 2 of 5 layers" 2 $G IDOT=0 -- 2 8 8
@@ -424,7 +424,7 @@ ptl_family_glm_sanitize() {
   ptl_mla_run ptl-probe.err colibri COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:1000000 COLI_VK_CHAIN_LAYERS=5 $G -- 64 16 16
   n=$(ptl_calc fault colibri ptl-probe.err 2)
   ptl_mla_san colibri "asan partial colibri an upload failing in layer 2" 2 COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:$n COLI_VK_CHAIN_LAYERS=5 $G ./colibri 64 16 16
-  ptl_mla_san colibri "asan partial colibri device only, MTP" 2 COLI_VK_CHAIN_LAYERS=2 COLI_VK_DENSE_HOST=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 ./colibri 64 16 16
+  ptl_mla_san colibri "asan partial colibri device only, MTP" 2 COLI_VK_CHAIN_LAYERS=2 COLI_VK_DENSE_HOST=0 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 ./colibri 64 16 16
   ptl_mla_san colibri "asan partial colibri the KV split" 3 COLI_VK_CHAIN_LAYERS=3 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 $G ./colibri 64 16 16
   ptl_mla_san colibri "asan partial colibri device lost" 2 COLI_VK_CHAIN_LAYERS=2 COLI_VK_CHAIN_FAULT=12 $G ./colibri 64 16 16
   ptl_mla_san glm53 "asan partial glm53 3 of 6 layers, chain chunks of 3" 3 COLI_VK_CHAIN_LAYERS=3 GLM53_BITS=4 COLI_VK_CHAIN_ROWS=3 ./glm53 $F --ids $ids --greedy 4

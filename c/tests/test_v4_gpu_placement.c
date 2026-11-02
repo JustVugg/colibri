@@ -69,6 +69,10 @@ int dsv4_cuda_init(const int *devices, int count) {
     return 1;
 }
 void dsv4_cuda_shutdown(void) { shutdowns++; }
+/* Backend entries dev gained after #1766's base (the bank-sized mirror reserve,
+ * the prefill bank's activations): this test never reaches them. */
+int dsv4_cuda_expert_bank_slots(int experts) { (void)experts; return 0; }
+long long dsv4_cuda_expert_bank_slot_bytes(int hidden, int intermediate) { (void)hidden; (void)intermediate; return 0; }
 int dsv4_cuda_device_unified(int device) { (void)device; return 0; }
 long long dsv4_cuda_mem_free_mb(int device) { free_queries[device]++; return device == low_memory_device ? 0 : 32000; }
 int dsv4_cuda_stream_drain(int device) { drained[device]++; return device != 3; }
@@ -513,6 +517,8 @@ int main(void) {
             view.gate.rows = view.up.rows = view.down.rows = 2;
             view.gate.columns = view.up.columns = view.down.columns = 2;
             view.gate.block_rows = view.up.block_rows = view.down.block_rows = 1;
+            view.gate.format = view.up.format = view.down.format =
+                COLI_TENSOR_FP4_NATIVE_BLOCK;   /* dev attaches native FP4 only */
             assert(coli_v4_gpu_expert_peek(&store, &view) == -1);
             assert(coli_v4_gpu_expert_attach_async(&store, &view) == 0);
             assert(((Dsv4CudaTensor *)view.gate.gpu)->device == engine->gpu.devices[owner]);

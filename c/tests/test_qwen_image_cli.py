@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import struct
 import sys
 import tempfile
 import threading
@@ -20,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from qwen_image_fixture import (STUB, TENSORS, elements, expected_resident,  # noqa: E402
-                                make_fake_pipeline, stub_env)
+                                make_fake_pipeline, stub_env, write_safetensors)
 
 import image_engine  # noqa: E402
 from family_registry import (FamilyConfigError, UnknownFamilyError,  # noqa: E402
@@ -189,6 +190,40 @@ class CommandsTest(unittest.TestCase):
         self.assertNotIn("experts", text.stdout)
         refused = run_coli(["plan", "--model", self.model, "--ctx", "4096"], self.env)
         self.assertNotEqual(refused.returncode, 0)
+
+    def test_plan_counts_vae_float_residency_for_bf16_checkpoint(self):
+        # qiv_read allocates numel * sizeof(float), then st_read_f32 converts
+        # the checkpoint dtype; compressed on-disk bytes are not residency.
+        vae = Path(self.model) / "vae" / "diffusion_pytorch_model.safetensors"
+        tensors = [(name, "BF16", shape) for name, _dtype, shape in TENSORS["vae"]]
+        write_safetensors(vae, tensors)
+        expected = sum(elements(shape) * 4 for _name, _dtype, shape in tensors)
+        result = run_coli(["plan", "--model", self.model, "--json"], self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plan = json.loads(result.stdout)
+        component = next(c for c in plan["components"] if c["name"] == "vae")
+        self.assertEqual(component["resident_bytes"], expected)
+        self.assertEqual(component["precision"], "f32")
+        self.assertEqual(component["dtypes"], ["BF16"])
+        self.assertEqual(plan["modes"]["resident"]["peak_bytes"],
+                         sum(c["resident_bytes"] for c in plan["components"]))
+
+    def test_doctor_reports_malformed_image_tensor_layouts(self):
+        path = Path(self.model) / "transformer" / "diffusion_pytorch_model.safetensors"
+        for header in ([], {"w": None},
+                       {"w": {"dtype": "F32", "shape": [-1], "data_offsets": [0, 4]}},
+                       {"w": {"dtype": "F32", "shape": [4], "data_offsets": [0, 16]}},
+                       {"w": {"dtype": [], "shape": [1], "data_offsets": [0, 4]}}):
+            with self.subTest(header=header):
+                raw = json.dumps(header).encode()
+                path.write_bytes(struct.pack("<Q", len(raw)) + raw + b"abcd")
+                result = run_coli(["doctor", "--model", self.model, "--json"], self.env)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                report = json.loads(result.stdout)
+                self.assertEqual(report["status"], "error")
+                self.assertTrue(any(c["id"] == "model.weights" and c["status"] == "fail"
+                                    for c in report["checks"]))
 
     def test_doctor_runs_the_image_checks(self):
         result = run_coli(["doctor", "--model", self.model, "--json"], self.env)
