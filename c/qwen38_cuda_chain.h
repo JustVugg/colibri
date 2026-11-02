@@ -65,7 +65,7 @@ typedef struct {
     CcBuf *hyper, *hn, *low, *mix, *mixed, *inj_a, *inj_m, *blk, *q, *k, *v, *ip, *ctx, *qsc, *sel;
     CcBuf *hyper_all;                          /* every row's streams through a prompt run layer by layer (q38cc_forward_lm) */
     CcBuf *qkv, *z, *ab, *cv, *dny, *lg, *gs, *us, *hs, *ds, *sgd;
-    CcBuf *emb, *keys, *val, *gated, *normv;
+    CcBuf *emb, *embd, *keys, *val, *gated, *normv;   /* emb: the PLE rows the host writes, embd: on the device */
     CcBuf *mixd, *lgd, *kvd, *outd, *hypd, *find, *routed, *cs, *pcs;
     CcBuf *gseg, *nseg;               /* a deep verify's PLE rows past its first copy (q38cc_ple) */
     float *host_routed, *host_emb;
@@ -291,7 +291,8 @@ static size_t q38cc_reserve_bytes(Model *m) {
     size_t W = c->hc_width, H = c->hidden, QH = c->q_heads, D = c->head_dim, V = (size_t)c->dn_vheads * c->dn_vdim, E = c->experts;
     size_t SI = c->shared_inter, ipw = (size_t)(c->idx_qheads + 1) * c->idx_dim, Ep = (size_t)c->ngram_heads * c->ngram_head_dim;
     size_t row = 7 * W + c->hc_rank + 6 * H + 2 * (size_t)c->hc_count + 3 * QH * D + 2 * kvo + ipw + 2 * nb + (size_t)q38cc_selrow(c) +
-                 2 * (size_t)c->dn_conv_dim + 2 * V + 2 * (size_t)c->dn_vheads + 2 * E + 3 * SI + Ep + (size_t)(c->rotary_dim > 0 ? c->rotary_dim : 2);
+                 2 * (size_t)c->dn_conv_dim + 2 * V + 2 * (size_t)c->dn_vheads + 2 * E + 3 * SI + 2 * Ep /* emb, embd */ +
+                 (size_t)(c->rotary_dim > 0 ? c->rotary_dim : 2);
     b += (size_t)q38cc_rows_env() * row * F + 2 * (size_t)c->vocab * F;
     /* a verify's copies of the DeltaNet state and rings (q38cc_spec_slots), the routed experts'
      * scratch for a prompt chunk (q38cc_dm_begin: their hidden rows, the sum, the routes), and a
@@ -312,8 +313,9 @@ static size_t q38cc_reserve_bytes(Model *m) {
             for (int j = 0; j < g_trunk_n && !offered; j++) offered = g_trunk[j].w == w[k] && !g_trunk[j].cpu_only;
             if (offered) continue;
             int gf = q38_cuda_gq_fmt(w[k]);
+            const int ple16 = (!strcmp(nm[k], "plekey") || !strcmp(nm[k], "plevalue")) && w[k]->kind == Q38_WEIGHT_BF16;   /* q38cc_tb */
             b += gf ? (size_t)w[k]->rows * (((size_t)gq_row_bytes(gf - 100, w[k]->cols) + 3) / 4 * 4)
-                    : (size_t)w[k]->rows * w[k]->cols * 4;   /* a small BF16/F32 matrix goes up as f32 */
+                    : (size_t)w[k]->rows * w[k]->cols * (ple16 ? 2 : 4);   /* a small BF16/F32 matrix goes up as f32 */
         }
         b += H * F;   /* the shared expert's gate row */
     }
@@ -392,6 +394,7 @@ static int q38cc_arena(Q38CChain *ch, Model *m) {
     return 1;
 }
 
+static ColiCudaTensor *q38cc_tb(Q38CChain *ch, Q38Weight *w);
 /* The chain on the device, at startup after the tier placed the trunk and the CPU
  * quantized its int8 rows: every layer's matrices on one device (the tier's or the
  * chain's own), the gate rows, the state, the parameters. NULL = the chain cannot run
@@ -435,7 +438,8 @@ static Q38CChain *q38cc_setup(Model *m, int mux_slots) {
     for (int i = 0; i < L; i++) {
         Q38Weight *w[Q38CC_MATS]; const char *nm[Q38CC_MATS]; int n = q38cc_mats(m, i, w, nm);
         for (int k = 0; k < n; k++) {
-            if (!q38cc_t(ch, w[k])) {
+            const int ple = !strcmp(nm[k], "plekey") || !strcmp(nm[k], "plevalue");   /* as BF16 rows (q38cc_tb) */
+            if (!(ple ? q38cc_tb(ch, w[k]) : q38cc_t(ch, w[k]))) {
                 fprintf(stderr, "[chain] qwen38: %s of layer %d did not reach device %d; the chain stays off\n", nm[k], i, ch->dev);
                 q38cc_free_own(ch, m);
                 return NULL;
@@ -512,7 +516,8 @@ static int q38cc_bufs(Q38CChain *ch, Model *m, int rows) {
              cc_reserve(&ch->mixd, r * H * F, CC_DOWN) && cc_reserve(&ch->lgd, r * E * F, CC_DOWN) &&
              cc_reserve(&ch->kvd, (size_t)(ch->n_attn ? ch->n_attn : 1) * q38cc_kv_stride(ch, c) * F, CC_DOWN) &&
              cc_reserve(&ch->outd, 2 * (size_t)c->vocab * F, CC_DOWN) && cc_reserve(&ch->routed, r * H * F, CC_UP) &&
-             cc_reserve(&ch->emb, r * Ep * F, CC_UP) && cc_reserve(&ch->cs, r * (c->rotary_dim > 0 ? c->rotary_dim : 2) * F, CC_UP) &&
+             cc_reserve(&ch->emb, r * Ep * F, CC_UP) && cc_reserve(&ch->embd, r * Ep * F, CC_DEV) &&
+             cc_reserve(&ch->cs, r * (c->rotary_dim > 0 ? c->rotary_dim : 2) * F, CC_UP) &&
              cc_reserve(&ch->pcs, (size_t)nbmax * (c->rotary_dim > 0 ? c->rotary_dim : 2) * F, CC_UP);
     /* a verify's PLE segments (q38cc_ple) here, not in the frame: growing a buffer there waits
      * for the stream, which a hybrid layer before it holds until the host serves it */
@@ -846,13 +851,33 @@ static void q38cc_ple_rows(Model *m, const int *ids, int c0, int n, float *emb) 
         }
     }
 }
+/* The PLE's key and value projections (BF16 in a GGUF) as BF16 rows, a GGUF's type 30, where the
+ * backend has its kernels: half the bytes of the f32 copy the chain uploaded before. A decode step
+ * reads them through the BF16 GEMV (each weight exact as a float); a prompt chunk's rows go through
+ * the f16 tiles (a BF16 weight of magnitude 2^-17 or more is exact in f16, 0.02 % of Qwen3.8's are
+ * smaller; the activations in f16 as the trunk's GGUF GEMMs take them), where the three-part TF32
+ * GEMM over the f32 copy took 140 ms of a 470-token prompt's 1,000 on an RTX PRO 4000.
+ * COLI_CUDA_CHAIN_PLE_BF16=0 keeps the f32 copy. */
+static ColiCudaTensor *q38cc_tb(Q38CChain *ch, Q38Weight *w) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_CHAIN_PLE_BF16"); on = !(e && *e == '0'); }
+    if (!on || !w || w->gpu || w->cc || w->q8 || !w->data || w->kind != Q38_WEIGHT_BF16 || w->cols % 32 ||
+        coli_cuda_block_elems(130) <= 0) return q38cc_t(ch, w);
+    ColiCudaTensor *t = NULL;
+    if (!coli_cuda_tensor_upload(&t, w->data, NULL, 130, w->cols, w->rows, ch->dev)) return q38cc_t(ch, w);
+    w->cc = t;
+    return t;
+}
 static int q38cc_ple(Q38CChain *ch, Model *m, int n, int c0, int ns) {
     Cfg *c = &m->c; Layer *l = &m->L[c->ple_layer];
     int W = c->hc_width, H = c->hidden, E = c->ngram_heads * c->ngram_head_dim;
     size_t pc = q38cc_ple_cells(c);
-    int ok = cc_write(ch->emb, 0, ch->host_emb, (size_t)n * E * 4) &&
-             cc_matmul(q38cc_t(ch, &l->ple_key), ch->emb, 0, ch->keys, 0, n) &&
-             cc_matmul(q38cc_t(ch, &l->ple_value), ch->emb, 0, ch->val, 0, n);
+    /* the rows to the device once: the projections read their input row again for every output
+     * row, which from the host's memory was over the bus every time (a decode step's key and value
+     * 424 and 408 us on an RTX PRO 4000, 124 and 32 GB/s) */
+    int ok = cc_write(ch->emb, 0, ch->host_emb, (size_t)n * E * 4) && cc_copy(ch->embd, 0, ch->emb, 0, (size_t)n * E) &&
+             cc_matmul(q38cc_tb(ch, &l->ple_key), ch->embd, 0, ch->keys, 0, n) &&
+             cc_matmul(q38cc_tb(ch, &l->ple_value), ch->embd, 0, ch->val, 0, n);
     CcPle g = {0, n, c->hc_count, H, c->ple_convk, c->ngram_size, 0, 0, 0, -1, 0, c->eps, (int)ch->o_ple, 0, 0};
     ok = ok && cc_ple(ch->keys, ch->hyper, ch->val, ch->prm, ch->gated, ch->normv, NULL, NULL, &g);
     if (ns <= 1) {

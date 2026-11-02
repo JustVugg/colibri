@@ -40,6 +40,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   them on Qwen3.8, not once a head, with each head's sums in the same order (the same bits). A
   1012-token prompt on Qwen3.8-Flash-Next IQ2_XS 522-528 -> 641-645 tok/s, 452 tokens 493-504 ->
   532-538; the decode untouched.
+- **Qwen3.8's CUDA chain: the PLE projections as BF16 rows** (`COLI_CUDA_CHAIN_PLE_BF16`): the
+  key and value projections, BF16 in the GGUF, went up as f32 and a prompt chunk took them through
+  the three-part TF32 GEMM (140 ms of a 470-token prompt's 1,000). They go up as BF16 rows, half the
+  bytes: a prompt chunk's through the f16 tiles, a decode step's through a BF16 GEMV that reads 16
+  bytes a lane (every CUDA BF16 row's GEMV takes it). Qwen3.8-Flash-Next IQ2_XS on an RTX PRO 4000,
+  with the grouped attention: 452 tokens 538-540 -> 639-656 tok/s, 1012 tokens 638-648 -> 772-805,
+  the greedy answers to four prompts the same. The PLE rows go to the card once before the
+  projections: they were read from host memory over the bus again for every output row (a decode
+  step's key and value 424 and 408 us); decode 50.3-52.8 -> 52.5-54.5 tok/s.
 
 ### Fixed
 

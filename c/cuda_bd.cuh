@@ -972,6 +972,51 @@ __global__ static void __launch_bounds__(256) bd_gemv_f_k(float *__restrict__ y,
     }
 }
 
+/* BF16 rows (fmt 130) for a decode step's or a verify's rows: a warp a row, each lane eight weights
+ * (16 bytes) a step, so a warp's loads cover 512 contiguous bytes; x read through the cache as two
+ * float4s a step, each weight exact as a float (a BF16 is a float's top half), the NR rows of x
+ * sharing every weight load. bd_gemv_f_k's form for BF16 (a 64-byte unit a lane, x from shared
+ * memory) ran a 10240 x 2560 matrix at about a third of the bus's rate on an RTX PRO 4000. */
+template<int NR>
+__global__ static void __launch_bounds__(256) bd_gemv_bf16_k(float *__restrict__ y, const float *__restrict__ x, const bd_u32 *__restrict__ W,
+        int I, int O, int rowWords, int S, int nr) {
+    COLI_PDL_WAIT();
+    const int s0 = (int)blockIdx.y * nr, nrow = min(nr, S - s0), lane = threadIdx.x & 31, warp = threadIdx.x >> 5, C = I / 8;
+    for (int o = (int)blockIdx.x * 8 + warp; o < O; o += (int)gridDim.x * 8) {
+        const uint4 *Wr = reinterpret_cast<const uint4 *>(W + (size_t)o * rowWords);
+        float acc[NR];
+        #pragma unroll
+        for (int r = 0; r < NR; r++) acc[r] = 0.f;
+        for (int c = lane; c < C; c += 32) {
+            const uint4 v = __ldg(Wr + c);
+            const float w0 = __uint_as_float(v.x << 16), w1 = __uint_as_float(v.x & 0xffff0000u), w2 = __uint_as_float(v.y << 16),
+                        w3 = __uint_as_float(v.y & 0xffff0000u), w4 = __uint_as_float(v.z << 16), w5 = __uint_as_float(v.z & 0xffff0000u),
+                        w6 = __uint_as_float(v.w << 16), w7 = __uint_as_float(v.w & 0xffff0000u);
+            #pragma unroll
+            for (int r = 0; r < NR; r++) if (r < nrow) {
+                const float4 *xr = reinterpret_cast<const float4 *>(x + (size_t)(s0 + r) * I) + 2 * c;
+                const float4 a = __ldg(xr), b = __ldg(xr + 1);
+                acc[r] += w0 * a.x + w1 * a.y + w2 * a.z + w3 * a.w + w4 * b.x + w5 * b.y + w6 * b.z + w7 * b.w;
+            }
+        }
+        #pragma unroll
+        for (int r = 0; r < NR; r++) if (r < nrow) {
+            float v = acc[r];
+            for (int off = 16; off > 0; off >>= 1) v += bd_shfl_xor(v, off);
+            if (lane == 0) y[(size_t)(s0 + r) * O + o] = v;
+        }
+    }
+}
+static int bd_gemv_bf16_launch(float *y, const float *x, const bd_u32 *W, int I, int O, int rowWords, int S, cudaStream_t st) {
+    if (I % 8 || (rowWords & 3) || ((uintptr_t)x & 15) || ((uintptr_t)W & 15)) return 0;
+    const int nr = S < BD_GEMV_NR ? S : BD_GEMV_NR;
+    int bx = (O + 7) / 8;
+    if (bx > 4 * BD_GEMV_BLOCKS) bx = 4 * BD_GEMV_BLOCKS;
+    dim3 g((unsigned)bx, (unsigned)((S + nr - 1) / nr));
+    if (nr > 1) coli_launch(bd_gemv_bf16_k<BD_GEMV_NR>, g, 256, 0, st, y, x, W, I, O, rowWords, S, nr);
+    else coli_launch(bd_gemv_bf16_k<1>, g, 256, 0, st, y, x, W, I, O, rowWords, S, 1);
+    return 1;
+}
 /* The launch for a block-format matrix (fmt 100 + t, rows of rowWords words at W, I a
  * multiple of 32 and of the type's block) on S rows of x: the integer form where the type
  * has one (each verify's rows a block, up to BD_GEMV_NR), else the float form. smem_max:
@@ -1041,6 +1086,7 @@ static int bd_gemv_launch(float *y, const float *x, const bd_u32 *W, const bd_u3
 #undef BD_I8_CASE
         default: break;
     }
+    if (!force_float && fmt == 130 && bd_gemv_bf16_launch(y, x, W, I, O, rowWords, S, st)) return 1;
     return bd_gemv_f_launch(y, x, W, tab, fmt, I, O, rowWords, S, smem_max, st);
 }
 #endif

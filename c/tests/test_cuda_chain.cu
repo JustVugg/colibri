@@ -669,6 +669,35 @@ int main(void) {
             ck(same, "and each of its three rows the one-row call's bits");
             coli_cuda_tensor_free(t4); T->free(xb4); T->free(yb4); T->free(yb1);
         }
+        {   /* BF16 rows (a GGUF's type 30, fmt 130): a decode step's and a verify's rows (bd_gemv_bf16_k, each row
+             * the one-row call's bits), and a prompt chunk's (the f16 tiles), against the CPU's dot of the same weights */
+            const int I6 = 2560, O6 = 1000, S6 = 5, S7 = 70;
+            std::vector<float> x6 = rnd((size_t)S7 * I6, 23), wf = rnd((size_t)I6 * O6, 24);
+            std::vector<uint16_t> wb16((size_t)I6 * O6);
+            for (size_t k = 0; k < wb16.size(); k++) { uint32_t u; memcpy(&u, &wf[k], 4); wb16[k] = (uint16_t)(u >> 16); u = (uint32_t)wb16[k] << 16; memcpy(&wf[k], &u, 4); }
+            std::vector<float> r6((size_t)S7 * O6);
+            for (int s = 0; s < S7; s++) for (int o = 0; o < O6; o++) {
+                double a = 0; for (int i = 0; i < I6; i++) a += (double)x6[(size_t)s * I6 + i] * wf[(size_t)o * I6 + i]; r6[(size_t)s * O6 + o] = (float)a;
+            }
+            double mx = 0; for (float v : r6) mx = fmax(mx, fabs(v));
+            ColiCudaTensor *t6 = NULL;
+            CcBuf *xb6 = T->buf((size_t)S7 * I6 * 4, CC_DEV), *yb6 = T->buf((size_t)S7 * O6 * 4, CC_DOWN), *yb7 = T->buf((size_t)O6 * 4, CC_DOWN);
+            int ok6 = xb6 && yb6 && yb7 && coli_cuda_tensor_upload(&t6, wb16.data(), NULL, 130, I6, O6, 0) && T->begin() &&
+                      T->write(xb6, 0, x6.data(), x6.size() * 4) && T->matmul(t6, xb6, 0, yb6, 0, S6) && T->submit(1);
+            ck(ok6 && maxdiff((const float *)T->ptr(yb6), r6.data(), (size_t)S6 * O6) < 1e-3, "BF16 rows, a verify's 5 rows: the CPU's dot");
+            int same = ok6;
+            std::vector<float> five((const float *)T->ptr(yb6), (const float *)T->ptr(yb6) + (size_t)S6 * O6);
+            for (int s = 0; s < S6 && same; s++)
+                same = T->begin() && T->matmul(t6, xb6, (size_t)s * I6, yb7, 0, 1) && T->submit(1) &&
+                       !memcmp(T->ptr(yb7), five.data() + (size_t)s * O6, (size_t)O6 * 4);
+            ck(same, "and each of its rows the one-row call's bits");
+            int ok7 = ok6 && T->begin() && T->matmul(t6, xb6, 0, yb6, 0, S7) && T->submit(1);
+            double e7 = ok7 ? maxdiff((const float *)T->ptr(yb6), r6.data(), r6.size()) / mx : 1;
+            if (e7 >= 2e-3) printf("  (prompt matmul BF16: relative error %.3g)\n", e7);
+            ck(ok7 && e7 < 2e-3, "BF16 rows, a prompt chunk's 70 (the f16 tiles)");
+            if (t6) coli_cuda_tensor_free(t6);
+            T->free(xb6); T->free(yb6); T->free(yb7);
+        }
         for (int shape = 0; shape < 3; shape++) {   /* and quant_matmul's bits (coli_cuda_matmul still runs it) */
             static const int sI[3] = {10240, 2048, 2048}, sO[3] = {4, 256, 1};
             const int I5 = sI[shape], O5 = sO[shape], S5 = 2;
@@ -1500,7 +1529,7 @@ int main(void) {
     printf("lost\n");
     {
         CcStats st; T->stats(&st);
-        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 21, "the counters saw the frames, ops and matmuls");
+        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 28, "the counters saw the frames, ops and matmuls");
         setenv("COLI_GPU_FAIL_AFTER", "0", 1);
         std::vector<float> w = rnd(64, 81), ones(8, 1.f);
         ColiCudaTensor *t = NULL;
