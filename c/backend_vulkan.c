@@ -23,6 +23,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#include "compat.h"   /* setenv/unsetenv, two views of one environment on Windows */
 #ifdef __linux__
 #include <unistd.h>
 #endif
@@ -279,6 +280,11 @@ struct ColiVkTensor {
     uint8_t *wmap, *smap;  /* mapped memory: the rows' and the scales' mapping (coli_vk_tensor_refill) */
     VkDeviceMemory imp;    /* coli_vk_tensor_import: the host memory its rows are read from, in place */
     struct ColiVkTensor *imp_next;   /* the live imports, freed at shutdown */
+    struct ColiVkSlab *slab;         /* coli_vk_tensor_alias: the imported slab its two records sit in */
+    struct ColiVkSlabReg *reg;       /* coli_vk_slabreg_alias (decode-path=fork): the registry slab its whole-buffer
+                                      * binding reads; the alias owns NOTHING (free(t) only, the fork's lifetime) */
+    size_t woff, soff;               /* the record's byte offsets in wbuf/sbuf: 0 for every own-buffer tensor,
+                                      * the registry alias's slab-relative window (the descriptor offset) */
     size_t wcap, scap;     /* the bytes its two ranges hold (tensor_alloc_pad: room for a bigger format) */
     size_t acct;           /* what tensor_alloc added to the pool's counters, taken back at the release */
     uint8_t wide;          /* a scale times the format's largest code passes f16 (scales_wide): off the cooperative-matrix GEMMs, which hold the weights in f16 */
@@ -301,6 +307,9 @@ struct ColiVkTensor {
 typedef struct {
     int on;                           /* staged uploads on this device */
     int later;                        /* mapped for now: staged if vk_window_decide finds the window small */
+    double shadow;                    /* the heap's free GB before the window probe asked for it: what the
+                                         driver owes the budget read once the probe's blocks are freed (-1:
+                                         nothing to wait for) */
     uint32_t mt_dev, mt_stage;        /* the device-local target type, the host staging type */
     VkDevice dev; VkQueue q; uint32_t fam; int shared;   /* shared: q is the main queue, locked */
     uint32_t fams[3], nfams;          /* the families that touch device-local tensors (CONCURRENT when > 1) */
@@ -677,6 +686,7 @@ static void vk_window_mapped(VkUp *u) {
  * COLI_VK_DEVICE_CAP_MB limits them (a capped device reads as a small window). */
 static void vk_window_decide(VkUp *u) {
     u->later = 0;   /* decided from here on */
+    u->shadow = -1;   /* nothing to wait for until the probe below asks for the window */
     VkPhysicalDeviceMemoryProperties m;
     vkGetPhysicalDeviceMemoryProperties(G.phys, &m);
     const uint32_t hi = m.memoryTypes[G.memtype].heapIndex;
@@ -692,10 +702,13 @@ static void vk_window_decide(VkUp *u) {
         VkPhysicalDeviceMemoryBudgetPropertiesEXT bud = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
         VkPhysicalDeviceMemoryProperties2 mp2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bud};
         vkGetPhysicalDeviceMemoryProperties2(G.phys, &mp2);
+        double free0 = bud.heapBudget[hi] > bud.heapUsage[hi]
+                     ? (double)(bud.heapBudget[hi] - bud.heapUsage[hi]) / 1e9 : 0;   /* GB, before the probe asks */
         if (bud.heapBudget[hi]) {
             const int room = bud.heapBudget[hi] > bud.heapUsage[hi] ? (int)((bud.heapBudget[hi] - bud.heapUsage[hi]) >> 30) : 0;
             if (room < want) want = room;
         }
+        u->shadow = free0 > 0 ? free0 : -1;   /* the wait below reads it back */
     }
 #endif
     int got = 0;
@@ -712,6 +725,39 @@ static void vk_window_decide(VkUp *u) {
         }
         for (int i = 0; i < got; i++) vkFreeMemory(G.dev, blk[i], NULL);
         ms = vk_now() - t0;
+        /* The probe's freed blocks stay on the driver's books a moment: RADV's
+         * VK_EXT_memory_budget read right after the free still counts them (measured:
+         * 13 GiB freed, the budget read 0.98 GB and gave the bytes back within
+         * ~0.3 s), and the first sizing read after init -- a dense chain's fit --
+         * would size a whole run from a window that is no longer held (the chain
+         * stayed off, the dense part fell to the CPU, prefill walked 128-row
+         * windows). Wait for the driver to read the bytes back before anything
+         * sizes itself from them, bounded: a co-tenant may have honestly taken
+         * them while the probe held its own, and then the wait ends having
+         * shadowed nothing. COLI_VK_WINDOW_PROBE_MB skips the allocations and
+         * this wait with them. */
+#ifdef VK_EXT_memory_budget
+        if (got > 0 && G.has_budget && u->shadow > 0) {
+            double tw = vk_now();
+            double f = 0;
+            for (;;) {
+                VkPhysicalDeviceMemoryBudgetPropertiesEXT bud = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+                VkPhysicalDeviceMemoryProperties2 mp2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bud};
+                vkGetPhysicalDeviceMemoryProperties2(G.phys, &mp2);
+                f = bud.heapBudget[hi] > bud.heapUsage[hi]
+                  ? (double)(bud.heapBudget[hi] - bud.heapUsage[hi]) / 1e9 : 0;
+                if (f + 0.0625 >= u->shadow || vk_now() - tw > 2000.0) break;
+                usleep(20000);
+            }
+            double waited = vk_now() - tw;
+            if (f + 0.0625 < u->shadow)
+                fprintf(stderr, "[VK] memory: the window probe freed %d GiB; the driver's budget still shows them after %.0f ms, proceeding\n",
+                        got, waited);
+            else
+                fprintf(stderr, "[VK] memory: the window probe freed %d GiB; the driver's budget read them back in %.0f ms\n",
+                        got, waited);
+        }
+#endif
     }
     free(blk);
     if (got >= want) {
@@ -935,12 +981,15 @@ static int rowwords(int fmt, int I) {
     return (int)((cpu_row_bytes(fmt, I) + 3) / 4);           // padded to uint32 (24|4: exact)
 }
 /* Scale floats per tensor: per-row formats carry O, int3-g64 carries O*ceil(I/64)
- * (one f32 per 64-input group). upload_tensor and tensor_free must agree on this. */
+ * (one f32 per 64-input group). upload_tensor and tensor_free must agree on this.
+ * fmt 15 (MXFP4 with packed ue8m0 scale bytes, 4 to a word: the pool's unit) counts the
+ * WORDS its O*ceil(I/gs) bytes take, so every *sizeof(float) below is its byte size. */
 static size_t scale_floats(int fmt, int I, int O, int gs) {
     if (fmt == 10 || fmt == 11 || fmt == 14 || bd_fmt(fmt)) return 1;    // unused by the shader; bound anyway
     if (fmt == 5) return (size_t)O * (((size_t)I + 63) / 64);
     if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13)
         return (size_t)O * (((size_t)I + gs - 1) / gs);   // per-group [O,ng]
+    if (fmt == 15) return ((size_t)O * (((size_t)I + gs - 1) / gs) + 3) / 4;
     return (size_t)O;
 }
 
@@ -1122,8 +1171,80 @@ static int coop_slot(int S) {
 static void vk_prof_paths(void);
 static int g_vk_prof;
 
+/* ---- the strict capability gate (COLI_VK_STRICT, backend_vulkan.h) ----------------
+ *
+ * Upstream degrades silently: a shader absent from the deployment, a fence wait that
+ * failed, a device lost mid-run each leave part of the model on the CPU with at most
+ * a passing line, and a failed tier looks like a slow one. COLI_VK_STRICT=1 turns
+ * the silent losses (COLI_VK_DEGRADE) into exit 70 naming the op, so a deployment or
+ * CI run says what it lost instead of quietly running without it. Refusals (the
+ * device never had the capability: a format, a tile — COLI_VK_REFUSE) and fallbacks
+ * (budget or policy — COLI_VK_FALLBACK) never abort; a refusal prints one line per
+ * op under strict. The knob unset or 0 keeps everything exactly as it was: the gate
+ * counts, prints nothing and changes no control flow. */
+static int g_strict = -1, g_strict_abort;
+static pthread_mutex_t g_degrade_mx = PTHREAD_MUTEX_INITIALIZER;
+static struct { const char *op; ColiVkClass cls; long events; } g_degrade[64];
+static int g_degrade_n;
+
+int coli_vk_strict(void) {
+    /* read once, like the file's other lazy knobs (the engine thread calls first) */
+    if (g_strict < 0) { const char *e = getenv("COLI_VK_STRICT"); g_strict = e && *e && !strcmp(e, "1"); }
+    return g_strict;
+}
+
+long coli_vk_degrade_events(void) {
+    long n = 0;
+    pthread_mutex_lock(&g_degrade_mx);
+    for (int k = 0; k < g_degrade_n; k++) if (g_degrade[k].cls != COLI_VK_REFUSE) n += g_degrade[k].events;
+    pthread_mutex_unlock(&g_degrade_mx);
+    return n;
+}
+
+static void vk_degrade_summary(void) {   /* strict only, on the exits that did not abort */
+    if (g_strict_abort) return;
+    long dg = 0, rf = 0;
+    pthread_mutex_lock(&g_degrade_mx);
+    for (int k = 0; k < g_degrade_n; k++)
+        if (g_degrade[k].cls == COLI_VK_REFUSE) rf += g_degrade[k].events;
+        else dg += g_degrade[k].events;
+    pthread_mutex_unlock(&g_degrade_mx);
+    fprintf(stderr, "[VK] strict: %ld degradations, %ld refusals\n", dg, rf);
+}
+
+void coli_vk_degrade(ColiVkClass cls, const char *op, const char *reason) {
+    int fresh = 0;
+    pthread_mutex_lock(&g_degrade_mx);
+    int k;
+    for (k = 0; k < g_degrade_n; k++) if (!strcmp(g_degrade[k].op, op)) break;
+    if (k == g_degrade_n && g_degrade_n < (int)(sizeof g_degrade / sizeof g_degrade[0])) {
+        g_degrade[g_degrade_n].op = op; g_degrade[g_degrade_n].cls = cls; g_degrade[g_degrade_n].events = 0;
+        k = g_degrade_n++;
+    }
+    if (k < g_degrade_n && ++g_degrade[k].events == 1) fresh = 1;
+    if (cls == COLI_VK_DEGRADE && coli_vk_strict()) {
+        fprintf(stderr, "[VK] strict: aborting, op=%s — %s\n", op, reason ? reason : "");
+        g_strict_abort = 1;
+        pthread_mutex_unlock(&g_degrade_mx);
+        exit(70);   /* the degradation already changed what the run computes; stop it there */
+    }
+    if (cls == COLI_VK_REFUSE && fresh && coli_vk_strict())
+        fprintf(stderr, "[VK] refused: %s — %s\n", op, reason ? reason : "");
+    pthread_mutex_unlock(&g_degrade_mx);
+}
+
+static void vk_strict_boot(void) {   /* one line per process, before any early return 0 */
+    static int once;
+    if (once) return;
+    once = 1;
+    if (!coli_vk_strict()) return;   /* unset or 0: not a byte of new output */
+    atexit(vk_degrade_summary);
+    fprintf(stderr, "[VK] strict: on (COLI_VK_STRICT) — a capability degradation aborts\n");
+}
+
 int coli_vk_init(const char *spv_path) {
     if (G.ready) return 1;
+    vk_strict_boot();
     if (!coli_vk_load()) return 0;
     up_fault_init();
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -1542,9 +1663,12 @@ int coli_vk_init(const char *spv_path) {
     }
 
     G.shader = load_spv(G.dev, spv_path);
-    if (!G.shader) return 0;
+    if (!G.shader) { coli_vk_degrade(COLI_VK_DEGRADE, "core shader", "qmatmul.spv absent or invalid"); return 0; }
     snprintf(G.spv_path, sizeof G.spv_path, "%s", spv_path);
-    if (!build_pipeline(G.dev, 4, sizeof(struct PC), G.shader, &G.dsl, &G.plyt, &G.pipe, &G.dpool, &G.dset)) return 0;
+    if (!build_pipeline(G.dev, 4, sizeof(struct PC), G.shader, &G.dsl, &G.plyt, &G.pipe, &G.dpool, &G.dset)) {
+        coli_vk_degrade(COLI_VK_DEGRADE, "core pipeline", "the core matmul pipeline did not build");
+        return 0;
+    }
 
     /* Optional tiled GEMMs: an absent shader or a tile the device cannot hold leaves
      * that slot empty; without the fp32 one every S stays on the GEMV. The cooperative-
@@ -1554,16 +1678,19 @@ int coli_vk_init(const char *spv_path) {
         VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(G.phys, &pp);
         char gm_path[512]; derive_sibling(spv_path, "_gemm.spv", gm_path, sizeof(gm_path));
         G.shader_gemm = load_spv(G.dev, gm_path);
+        if (!G.shader_gemm) coli_vk_degrade(COLI_VK_DEGRADE, "qmatmul_gemm.spv", "absent: the tiled GEMM stays off");
         const char *e = getenv("COLI_VK_GEMM_TILE");
         VkGemmTile u = {0, 0, 0, 0, 0, 0};
         int one = e && *e && sscanf(e, "%d,%d,%d,%d,%d,%d", &u.bm, &u.bn, &u.bk, &u.tm, &u.tn, &u.pf) >= 5 &&
                   gemm_tile_ok(u, &pp.limits);
-        if (e && *e && !one) fprintf(stderr, "[VK] COLI_VK_GEMM_TILE=%s rejected\n", e);
+        if (e && *e && !one) { fprintf(stderr, "[VK] COLI_VK_GEMM_TILE=%s rejected\n", e);
+                              coli_vk_degrade(COLI_VK_REFUSE, "COLI_VK_GEMM_TILE", e); }
         for (int k = 0; G.shader_gemm && k < (one ? 1 : VK_GEMM_SLOTS); k++) {
             VkGemmTile t = one ? u : gemm_tiles[k];
             if (gemm_tile_ok(t, &pp.limits)) gemm_pipeline(t, k);
         }
         if (G.shader_gemm && !G.pipe_gemm[0]) {
+            coli_vk_degrade(COLI_VK_REFUSE, "qmatmul_gemm.spv", "no built-in tile fits this device's limits: the tiled GEMM stays off");
             vkDestroyShaderModule(G.dev, G.shader_gemm, NULL); G.shader_gemm = VK_NULL_HANDLE;
             for (int k = 1; k < VK_GEMM_SLOTS; k++)
                 if (G.pipe_gemm[k]) { vkDestroyPipeline(G.dev, G.pipe_gemm[k], NULL); G.pipe_gemm[k] = VK_NULL_HANDLE; }
@@ -1571,11 +1698,13 @@ int coli_vk_init(const char *spv_path) {
         if (G.has_coop && G.pipe_gemm[0]) {
             char cm_path[512]; derive_sibling(spv_path, "_coop.spv", cm_path, sizeof(cm_path));
             G.shader_coop = load_spv(G.dev, cm_path);
+            if (!G.shader_coop) coli_vk_degrade(COLI_VK_DEGRADE, "qmatmul_coop.spv", "absent: the cooperative-matrix GEMM stays off");
             e = getenv("COLI_VK_COOP_TILE");
             VkCoopTile c = {0, 0, 0, 0, 0};
             one = e && *e && sscanf(e, "%d,%d,%d,%d,%d", &c.bm, &c.bn, &c.wm, &c.wn, &c.bk) == 5 &&
                   coop_tile_ok(c, &pp.limits);
-            if (e && *e && !one) fprintf(stderr, "[VK] COLI_VK_COOP_TILE=%s rejected\n", e);
+            if (e && *e && !one) { fprintf(stderr, "[VK] COLI_VK_COOP_TILE=%s rejected\n", e);
+                                  coli_vk_degrade(COLI_VK_REFUSE, "COLI_VK_COOP_TILE", e); }
             /* every slot shares BK: coop_fmt checks group sizes against it */
             for (int k = 0; G.shader_coop && k < (one ? 1 : VK_COOP_SLOTS); k++) {
                 VkCoopTile t = one ? c : coop_tiles[k];
@@ -1583,6 +1712,7 @@ int coli_vk_init(const char *spv_path) {
             }
         }
         if (!G.pipe_coop[0]) {
+            if (G.shader_coop) coli_vk_degrade(COLI_VK_REFUSE, "qmatmul_coop.spv", "no built-in tile fits this device's limits: the cooperative-matrix GEMM stays off");
             for (int k = 1; k < VK_COOP_SLOTS; k++)
                 if (G.pipe_coop[k]) { vkDestroyPipeline(G.dev, G.pipe_coop[k], NULL); G.pipe_coop[k] = VK_NULL_HANDLE; }
             if (G.shader_coop) vkDestroyShaderModule(G.dev, G.shader_coop, NULL);
@@ -1605,6 +1735,7 @@ int coli_vk_init(const char *spv_path) {
      * (single-matmul path keeps working). */
     char gu_path[512]; derive_sibling(spv_path, "_gate_up.spv", gu_path, sizeof(gu_path));
     G.shader_gu = load_spv(G.dev, gu_path);
+    if (!G.shader_gu) coli_vk_degrade(COLI_VK_DEGRADE, "qmatmul_gate_up.spv", "absent: fused MLP off");
     if (G.shader_gu && !build_pipeline(G.dev, 6, sizeof(struct PCGU), G.shader_gu, &G.dsl_gu, &G.plyt_gu, &G.pipe_gu, &G.dpool_gu, &G.dset_gu))
         return 0;
 
@@ -1613,6 +1744,7 @@ int coli_vk_init(const char *spv_path) {
      * (coli_vk_attn_qprep); absent -> callers keep the 3-submit path. */
     char nrm_path[512]; derive_dir_file(spv_path, "rmsnorm.spv", nrm_path, sizeof(nrm_path));
     G.shader_nrm = load_spv(G.dev, nrm_path);
+    if (!G.shader_nrm) coli_vk_degrade(COLI_VK_DEGRADE, "rmsnorm.spv", "absent: the 3-submit q-prep path stays");
     if (G.shader_nrm) {
         VkDescriptorPool np; VkDescriptorSet ns;
         if (!build_pipeline(G.dev, 3, sizeof(struct PCN), G.shader_nrm, &G.dsl_nrm, &G.plyt_nrm, &G.pipe_nrm, &np, &ns))
@@ -1629,6 +1761,7 @@ int coli_vk_init(const char *spv_path) {
     }
     char att_path[512]; derive_dir_file(spv_path, "attention_absorb.spv", att_path, sizeof(att_path));
     G.shader_att = load_spv(G.dev, att_path);
+    if (!G.shader_att) coli_vk_degrade(COLI_VK_DEGRADE, "attention_absorb.spv", "absent: absorbed attention stays off");
     if (G.shader_att && !build_pipeline(G.dev, 7, sizeof(struct PCAttn), G.shader_att, &G.dsl_att, &G.plyt_att, &G.pipe_att, &G.dpool_att, &G.dset_att))
         return 0;
 
@@ -2112,7 +2245,7 @@ static ColiVkTensor *tensor_alloc_pad(VkWPool *P, int fmt, int I, int O, int gs,
     ColiVkTensor *t = calloc(1, sizeof(*t));
     if (!t) return NULL;
     t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I);
-    t->gs = (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) ? gs : 0;
+    t->gs = (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13 || fmt == 15) ? gs : 0;
     t->dev = P->dev; t->pool = P;
     t->wbytes = (size_t)t->rowWords * 4 * (size_t)O;
     size_t sbytes = scale_floats(fmt, I, O, gs) * sizeof(float);
@@ -2150,7 +2283,7 @@ static ColiVkTensor *tensor_alloc(VkWPool *P, int fmt, int I, int O, int gs, voi
 }
 static int fmt_uploadable(int fmt, int gs) {
     return fmt == 1 || fmt == 2 || fmt == 5 || fmt == 10 || fmt == 11 || fmt == 14 || bd_fmt(fmt) ||   /* fmt=4/7: word-aligned groups only */
-           ((fmt == 4 || fmt == 7) && gs >= 8 && gs % 8 == 0) ||
+           ((fmt == 4 || fmt == 7 || fmt == 15) && gs >= 8 && gs % 8 == 0) ||
            ((fmt == 12 || fmt == 13) && gs >= 4 && gs % 4 == 0);           /* fp8 / int8: 4 per word */
 }
 
@@ -2169,6 +2302,9 @@ static void tensor_release(ColiVkTensor *t);
 static int upload_tensor_pool(VkWPool *P, ColiVkTensor **out, const void *weights, const float *scales,
                               int fmt, int I, int O, int gs) {
     if (*out) return (*out)->fmt == fmt && (*out)->I == I && (*out)->O == O;
+    /* fmt 15 (MXFP4 with packed ue8m0 scales) is the tier's form: its scales are bytes,
+     * uploaded by vk_tier.c's convert from the engine's ue8m0 store, not floats */
+    if (fmt == 15) return 0;
     if (!fmt_uploadable(fmt, gs)) return 0;
     if (pool_staged(P)) {   /* staged: the rows and the scales through the uploader */
         ColiVkTensor *t = tensor_alloc(P, fmt, I, O, gs, NULL, NULL);
@@ -2348,6 +2484,10 @@ void coli_vk_host_buffer_free(void *buf, void *mem, size_t bytes) {
 int coli_vk_tensor_import(ColiVkTensor **tensor, const void *weights, size_t alloc_bytes, const float *scales,
                           int fmt, int I, int O, int gs) {
     if (*tensor) return (*tensor)->fmt == fmt && (*tensor)->I == I && (*tensor)->O == O;
+    /* fmt 15 (MXFP4 with packed ue8m0 scales) is the tier's form, uploaded by vk_tier.c's
+     * convert (upload_tensor_pool's refusal): the import would stamp gs 0 and hand the
+     * shaders the scale bytes as floats */
+    if (fmt == 15) return 0;
 #ifdef VK_EXT_external_memory_host
     size_t al = coli_vk_import_alignment();
     if (!al || !fmt_uploadable(fmt, gs) || O < 1 || I < 1) return 0;
@@ -2406,6 +2546,547 @@ int coli_vk_tensor_import(ColiVkTensor **tensor, const void *weights, size_t all
     (void)tensor; (void)weights; (void)alloc_bytes; (void)scales; (void)fmt; (void)I; (void)O; (void)gs;
     return 0;
 #endif
+}
+
+/* ---- slabs imported once, aliased by many tensors (the compute-site lever) --------
+ * The expert store's slabs are the device's to read where they sit: ONE import of the
+ * pages (coli_vk_host_buffer's) serves every expert record a slab holds, and each
+ * record becomes a ColiVkTensor whose two buffers bind straight into the imported
+ * memory at its byte offsets -- fmt 15 included, whose packed ue8m0 scale bytes stay on
+ * the slab (the form coli_vk_tensor_import refuses above: it would hand the shaders
+ * those bytes as floats). Refcounted, so a slot's tensor geometry can come and go
+ * while the import lives; the engine drops the whole slab only at store destroy, with
+ * the device idle (the last unref frees the pages a submission may still be reading
+ * otherwise). The alias keeps the descriptors' whole-buffer bindings honest: each
+ * record is its own VkBuffer into the same VkDeviceMemory, as a pool range is its own. */
+struct ColiVkSlab {
+    const void *base;     /* the pages the import wrapped (offset 0 in its memory) */
+    const void *ptr;      /* the caller's slab, where its records start */
+    size_t bytes,         /* the imported size: whole import-alignment units */
+           user_bytes;    /* the caller's range inside those pages */
+    void *buf, *mem;      /* the import's buffer and memory */
+    long refs;
+    struct ColiVkSlab *next;
+};
+static struct { pthread_mutex_t mx; struct ColiVkSlab *live; int n; } g_slabs = {.mx = PTHREAD_MUTEX_INITIALIZER};
+/* ---- compute-site diagnostics (COLI_VK_CHAIN_DPROF=1 only) --------------------------
+ * The finish-site group's backend split: slab import create/hit, the aliased tensors'
+ * release (buffer destroys, the slab's unref-to-zero and its vkFreeMemory), and the xb
+ * batch's fence-wait/query-read CPU spans. All zero and untimed unless the gate is on;
+ * read once per report by vk_tier.c on the single-threaded engine path. */
+static int cs_dprof_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_CHAIN_DPROF"); on = e && *e && *e != '0' ? 1 : 0; }
+    return on;
+}
+static struct {
+    unsigned long long slab_creates, slab_hits;
+    double slab_create_ms, slab_hit_ms;   /* the import's wall by its outcome: the churn question's own split */
+    unsigned long long slab_zeros; double slab_zero_ms;
+    unsigned long long alias_buf_destroys; double alias_buf_destroy_ms;
+    unsigned long long xb_foreign_joins;  /* xb_join off the thread the fence/qread deltas assume (below) */
+} g_cs_diag;
+typedef struct { double fence_ms, qread_ms; unsigned long long fences, qreads; } XbCsDiag;
+/* The fence/qread deltas vk_tier.c brackets its joins with assume ONE thread joins:
+ * a join from another thread inside a bracket lands in this group's bucket. The
+ * first joiner (or the report's snapshotter) claims the thread; any other joiner
+ * counts here, and the report says the deltas are dirty. Zero on every run so far
+ * (the ring worker fills slots, the uploader promotes; neither joins a batch). */
+static pthread_t g_csd_thread;
+static int g_csd_thread_set;
+static void cs_diag_thread_check(void) {
+    if (!g_csd_thread_set) { g_csd_thread = pthread_self(); g_csd_thread_set = 1; }
+    else if (!pthread_equal(pthread_self(), g_csd_thread)) g_cs_diag.xb_foreign_joins++;
+}
+/* live slab imports bound: past COLI_VK_TIER_EXPERTS_IMPORT_CAP (default 1408, under
+ * the driver's maxMemoryAllocationCount) the import refuses -- the caller's experts
+ * run on the CPU, the lever's refusal ladder */
+static long slab_cap(void) {
+    static long cap;
+    if (!cap) {
+        const char *e = getenv("COLI_VK_TIER_EXPERTS_IMPORT_CAP");
+        cap = e && *e ? atol(e) : 1408;
+        if (cap < 0) cap = 0;
+    }
+    return cap;
+}
+int coli_vk_slab_cap(void) { return (int)slab_cap(); }   /* the tier's keepalive cache stays under the live-import cap */
+int coli_vk_slab_import(const void *slab, size_t bytes, ColiVkSlab **out) {
+    size_t al = coli_vk_import_alignment();
+    if (!al || !slab || !bytes || !out || !G.ready) return 0;
+    const void *base = (const void *)((uintptr_t)slab / al * al);
+    int cd = cs_dprof_on();
+    double t0 = cd ? vk_now() : 0;
+    pthread_mutex_lock(&g_slabs.mx);
+    for (ColiVkSlab *r = g_slabs.live; r; r = r->next)
+        if (r->base == base) {
+            /* the same pages: only the very range they were imported for (a store slot
+             * reused keeps its pointer and size; anything else sharing the page is a
+             * different slab the caller reallocated -- not ours to grow) */
+            int ok = r->ptr == slab && r->user_bytes == bytes;
+            if (ok) {
+                r->refs++; *out = r;
+                if (cd) { g_cs_diag.slab_hits++; g_cs_diag.slab_hit_ms += vk_now() - t0; }
+            }
+            pthread_mutex_unlock(&g_slabs.mx);
+            return ok;
+        }
+    if (g_slabs.n >= slab_cap()) { pthread_mutex_unlock(&g_slabs.mx); return 0; }
+    void *buf, *mem; size_t off;
+    int ok = coli_vk_host_buffer(slab, bytes, &buf, &mem, &off);
+    if (ok) {
+        ColiVkSlab *r = calloc(1, sizeof *r);
+        size_t sz = ((uintptr_t)slab + bytes + al - 1) / al * al - (uintptr_t)base;
+        if (r) {
+            r->base = base; r->ptr = slab; r->bytes = sz; r->user_bytes = bytes;
+            r->buf = buf; r->mem = mem; r->refs = 1;
+            r->next = g_slabs.live; g_slabs.live = r; g_slabs.n++;
+            if (cd) { g_cs_diag.slab_creates++; g_cs_diag.slab_create_ms += vk_now() - t0; }
+            *out = r;
+        } else {
+            coli_vk_host_buffer_free(buf, mem, sz);
+            ok = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_slabs.mx);
+    return ok;
+}
+void coli_vk_slab_unref(ColiVkSlab *r) {
+    if (!r) return;
+    pthread_mutex_lock(&g_slabs.mx);
+    if (--r->refs > 0) { pthread_mutex_unlock(&g_slabs.mx); return; }
+    for (ColiVkSlab **pp = &g_slabs.live; *pp; pp = &(*pp)->next)
+        if (*pp == r) { *pp = r->next; break; }
+    g_slabs.n--;
+    pthread_mutex_unlock(&g_slabs.mx);
+    if (G.ready) {
+        double t0 = cs_dprof_on() ? vk_now() : 0;
+        coli_vk_host_buffer_free(r->buf, r->mem, r->bytes);
+        if (cs_dprof_on()) { g_cs_diag.slab_zeros++; g_cs_diag.slab_zero_ms += vk_now() - t0; }
+    }
+    free(r);
+}
+void coli_vk_slab_ref(ColiVkSlab *r) {   /* one more keepalive reference (the tier's alias cache) */
+    if (!r) return;
+    pthread_mutex_lock(&g_slabs.mx);
+    r->refs++;
+    pthread_mutex_unlock(&g_slabs.mx);
+}
+size_t coli_vk_slab_bytes(const ColiVkSlab *r) { return r ? r->bytes : 0; }   /* the imported bytes a reference pins */
+/* The store's slot-free path names the pages that are going away (the tier's alias
+ * cache drops its holds first, vkt_slab_forget): every import still wrapping them is
+ * blinded to the dedup (base cleared), so a future import of the same address -- an
+ * allocator can return it for the same size, the same geometry -- builds a fresh
+ * import of the NEW pages instead of riding the stale record of the old ones. The
+ * record itself lives on until its last unref, as tensors still holding it may be
+ * reading it; only its identity in the dedup dies here. */
+void coli_vk_slab_forget(const void *slab) {
+    if (!slab) return;
+    pthread_mutex_lock(&g_slabs.mx);
+    for (ColiVkSlab *r = g_slabs.live; r; r = r->next)
+        if (r->ptr == slab) { r->ptr = NULL; r->base = NULL; }
+    pthread_mutex_unlock(&g_slabs.mx);
+}
+
+/* ---- the persistent slab registry (COLI_VK_V4_DECODE_PATH=fork) ---------------------
+ * The forked decode path's tensor lifetime: the expert store's slot slabs live in a
+ * small arena of large host-coherent system-RAM blocks, each slot ONE mapped STORAGE
+ * VkBuffer bound at its aligned offset, so an expert record's alias is three callocs
+ * and zero driver objects a token (coli_vk_slabreg_alias binds the slab's buffer whole
+ * and carries woff/soff on the tensor) -- where the import path re-imports the slot's
+ * malloc pages every token and mints 2 VkBuffers a matrix (slab_buf). Slab count is
+ * bounded by buffer objects, block count by the arena cap: the gap3 arena probe on the
+ * bench GPU (RX 6900 XT / RADV) verified 2000 x 12.8 MiB STORAGE(+SDA) slabs across
+ * 9 x 2 GiB mapped blocks, one dispatch over 6 of them byte-exact, and 1000
+ * dispatch+submit+fence cycles at 0.67-1.02x a small import's per-cycle -- and that
+ * past the reported heap (10+ x 2 GiB) vkAllocateMemory SUCCEEDS while every submit
+ * fails ("not enough memory"), so the arena is clamped to the room, never trusted to
+ * refuse. */
+struct ColiVkSlabReg {
+    void *host;              /* the slab's mapping: the store's slot pointer */
+    size_t bytes;            /* the caller's bytes at host (the slab's own, not the block's) */
+    VkBuffer buf;            /* the whole slab as one storage buffer (the alias binds it whole) */
+    void *blk;               /* the SlabRegBlock carrying it (void: block type is private) */
+    size_t off;              /* the slab's bind offset in that block's memory */
+    struct ColiVkSlabReg *next;
+};
+typedef struct SlabRegBlock {
+    VkDeviceMemory mem;
+    void *map;               /* mapped once, whole (HOST_COHERENT: no flushes) */
+    size_t used, cap;
+    struct SlabRegBlock *next;
+} SlabRegBlock;
+static struct {
+    pthread_mutex_t mx;
+    ColiVkSlabReg *live;
+    SlabRegBlock *blocks;
+    size_t bytes, cap;       /* live slab bytes, the arena's byte ceiling */
+    long block_mb;           /* the block size asked for (env), what the driver allows */
+    uint32_t memtype;
+    int state;               /* 0 unset, 1 armed, -1 refused (ladder: malloc path) */
+    int announced;           /* the ONE engaged line said (the store line or the first slab) */
+    unsigned long long nslabs, nblocks, nrefused;
+} g_slabreg = {.mx = PTHREAD_MUTEX_INITIALIZER};
+static size_t slabreg_heap_room(void) {
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(G.phys, &mp);
+    uint32_t hi = mp.memoryTypes[g_slabreg.memtype].heapIndex;
+    size_t room = coli_vk_tier_host_heap_room();   /* the budget's heapUsage already counts these blocks */
+    size_t size = (size_t)mp.memoryHeaps[hi].size;
+    if (!room || room > size) room = size;
+    return room - g_slabreg.bytes > room ? 0 : room - g_slabreg.bytes;
+}
+/* The fork lever's ONE engaged line. The store's plan line prints it when the probe
+ * ran at store open (the usual path, vkt_forkdec_store_line -- it carries the arena
+ * and slot plan beside the registry's own numbers); a first slab reaching the
+ * registry before that (no store line, tests) prints it here. Exactly one line per
+ * outcome: armed here or at the store line, refused in slabreg_arm, legacy at the
+ * lever's wanted() resolution (gap-wave4's boot contract). */
+static void slabreg_announce(void) {
+    if (g_slabreg.announced) return;
+    g_slabreg.announced = 1;
+    fprintf(stderr, "[VK] slab registry armed: block=%ldMiB cap=%.2fGiB memtype=%u%s\n",
+            g_slabreg.block_mb, g_slabreg.cap / 1073741824.0, g_slabreg.memtype,
+            G.has_bda ? " storage+device-address" : "");
+}
+static int slabreg_arm(void) {
+    if (g_slabreg.state) return g_slabreg.state > 0;
+    if (!G.ready) return 0;   /* not up yet: never memoize a pre-device read (the store line probes here) */
+    g_slabreg.state = -1;
+    const char *why = NULL;   /* the refusal's reason: the lever's ONE refused line (gap-wave4) */
+    if (G.memtype_sys < 0) why = "no coherent non-device-local system-RAM memory type (unified memory?)";
+    g_slabreg.memtype = (uint32_t)(G.memtype_sys >= 0 ? G.memtype_sys : 0);
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(G.phys, &mp);
+    VkMemoryPropertyFlags fl = G.memtype_sys >= 0 ? mp.memoryTypes[g_slabreg.memtype].propertyFlags : 0;
+    if (!why &&
+        (fl & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) !=
+        (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+        why = "the system-RAM type is not host-visible and coherent";
+    const char *bm = getenv("COLI_VK_V4_SLAB_BLOCK_MB");
+    long mb = bm && *bm ? atol(bm) : 2048;
+    if (mb < 16) mb = 16;
+    uint64_t max_alloc = 0;
+    {   /* maintenance4's maxMemoryAllocationSize where the device has it, else 4 GiB (the
+         * spec minimum every driver here reports; the clamp only ever tightens) */
+        VkPhysicalDeviceMaintenance4Properties m4 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &m4};
+        vkGetPhysicalDeviceProperties2(G.phys, &p2);
+        max_alloc = m4.maxBufferSize ? m4.maxBufferSize : (4ull << 30);
+    }
+    if ((uint64_t)mb << 20 > max_alloc) mb = (long)(max_alloc >> 20);
+    g_slabreg.block_mb = mb;
+    uint32_t hi = G.memtype_sys >= 0 ? mp.memoryTypes[g_slabreg.memtype].heapIndex : 0;
+    size_t room = why ? 0 : slabreg_heap_room();
+    size_t heap_frac = (size_t)mp.memoryHeaps[hi].size / 8 * 7;   /* never past 7/8 of the heap: the probe's overcommit */
+    if (room > heap_frac) room = heap_frac;
+    const char *ag = getenv("COLI_VK_V4_SLAB_ARENA_GB");
+    double gb = ag && *ag ? atof(ag) : 0;
+    if (gb > 0) { size_t want = (size_t)(gb * 1073741824.0); if (room > want) room = want; }
+    if (!why && room < (size_t)16 << 20)
+        why = "the system heap has no room for one minimum block (the budget's heapUsage already counts the arena)";
+    if (why) {
+        g_slabreg.cap = 0;
+        fprintf(stderr, "[VK] slab registry refused: %s -- decode-path=fork's slots keep the malloc/import path\n", why);
+        return 0;
+    }
+    g_slabreg.cap = room;
+    g_slabreg.state = 1;
+    return 1;
+}
+int coli_vk_slabreg_alloc(size_t bytes, void **host_out, ColiVkSlabReg **reg_out) {
+    if (!G.ready || !coli_vk_slabreg_wanted() || !bytes || !host_out || !reg_out) return 0;
+    *host_out = NULL; *reg_out = NULL;
+    pthread_mutex_lock(&g_slabreg.mx);
+    if (!slabreg_arm()) {   /* the memoized refusal lands BEFORE any driver object: a refusing
+                             * device (UMA, Lavapipe) pays no create/destroy pair a slot */
+        g_slabreg.nrefused++;   /* under the mutex: the counter is plain, not atomic */
+        pthread_mutex_unlock(&g_slabreg.mx);
+        return 0;
+    }
+    slabreg_announce();   /* no store line ran first (tests): the first slab says the engaged line */
+    pthread_mutex_unlock(&g_slabreg.mx);
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = bytes,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 (G.has_bda ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0),
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VkBuffer buf;
+    if (vkCreateBuffer(G.dev, &bi, NULL, &buf) != VK_SUCCESS) return 0;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(G.dev, buf, &req);
+    size_t align = req.alignment > 4096 ? (size_t)req.alignment : 4096;   /* 4096: the store's direct-I/O reads */
+    size_t need = ((size_t)req.size + align - 1) / align * align;
+    pthread_mutex_lock(&g_slabreg.mx);
+    if (g_slabreg.bytes + need > g_slabreg.cap) goto refuse;   /* the arena cap (ladder: fewer registry slots) */
+    SlabRegBlock *b = g_slabreg.blocks;
+    /* room at the BIND offset, not at b->used: the record binds at round_up(b->used, align),
+     * so a block must be walked past unless that rounded offset plus the (already
+     * align-rounded) need fits -- an unrounded test can bind past a block's cap by up to
+     * align-1 and then underflow cap-used for every later ask (latent with today's
+     * uniform alignments, reachable the day two buffer alignments share a block) */
+    while (b && ((b->used + align - 1) / align * align) + need > b->cap) b = b->next;
+    if (!b) {
+        size_t cap = (size_t)g_slabreg.block_mb << 20;
+        if (need > cap) cap = need;
+        if (g_slabreg.bytes + cap > g_slabreg.cap)   /* a last short block serves the room that is left */
+            cap = g_slabreg.cap - g_slabreg.bytes;
+        if (cap < need) goto refuse;
+        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = cap, .memoryTypeIndex = g_slabreg.memtype};
+        VkMemoryAllocateFlagsInfo afl = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+        if (G.has_bda) { afl.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT; ai.pNext = &afl; }
+        VkDeviceMemory mem;
+        if (vkAllocateMemory(G.dev, &ai, NULL, &mem) != VK_SUCCESS) goto refuse;
+        void *map = NULL;
+        if (vkMapMemory(G.dev, mem, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS) {
+            vkFreeMemory(G.dev, mem, NULL);
+            goto refuse;
+        }
+        b = calloc(1, sizeof *b);
+        if (!b) { vkUnmapMemory(G.dev, mem); vkFreeMemory(G.dev, mem, NULL); goto refuse; }
+        b->mem = mem; b->map = map; b->cap = cap;
+        b->next = g_slabreg.blocks; g_slabreg.blocks = b;
+        g_slabreg.nblocks++;
+    }
+    {
+        ColiVkSlabReg *r = calloc(1, sizeof *r);
+        if (!r) goto refuse;
+        r->off = (b->used + align - 1) / align * align;
+        if (vkBindBufferMemory(G.dev, buf, b->mem, r->off) != VK_SUCCESS) { free(r); goto refuse; }
+        r->host = (uint8_t *)b->map + r->off;
+        r->bytes = bytes;
+        r->buf = buf;
+        r->blk = b;
+        r->next = g_slabreg.live; g_slabreg.live = r;
+        b->used = r->off + need;
+        g_slabreg.bytes += need;
+        g_slabreg.nslabs++;
+        pthread_mutex_unlock(&g_slabreg.mx);
+        *host_out = r->host;
+        *reg_out = r;
+        return 1;
+    }
+refuse:
+    g_slabreg.nrefused++;   /* under the mutex: the counter is plain, not atomic */
+    pthread_mutex_unlock(&g_slabreg.mx);
+    vkDestroyBuffer(G.dev, buf, NULL);
+    return 0;
+}
+void coli_vk_slabreg_free(ColiVkSlabReg *r) {
+    if (!r) return;
+    pthread_mutex_lock(&g_slabreg.mx);
+    for (ColiVkSlabReg **pp = &g_slabreg.live; *pp; pp = &(*pp)->next)
+        if (*pp == r) { *pp = r->next; break; }
+    pthread_mutex_unlock(&g_slabreg.mx);
+    if (G.ready) vkDestroyBuffer(G.dev, r->buf, NULL);
+    free(r);   /* the block's space is not rewound: slabs free only at store destroy */
+}
+/* The lookup half of the fork's alias pair. THREAD DISCIPLINE: every registry touch --
+ * alloc at a store's slot open, free/reset at store destroy after vkt_slab_forget,
+ * lookup and the alias read below -- is the ENGINE thread, so the reg returned here
+ * stays live while the caller reads reg->host/buf/bytes unlocked (coli_vk_slabreg_free
+ * cannot run under it). A future cross-thread caller must take the registry's own
+ * mutex or refcount the record first. */
+int coli_vk_slabreg_lookup(const void *user, ColiVkSlabReg **reg_out, size_t *base_off) {
+    if (!user || !reg_out) return 0;
+    pthread_mutex_lock(&g_slabreg.mx);
+    for (ColiVkSlabReg *r = g_slabreg.live; r; r = r->next)
+        if ((const uint8_t *)user >= (const uint8_t *)r->host &&
+            (size_t)((const uint8_t *)user - (const uint8_t *)r->host) < r->bytes) {
+            if (base_off) *base_off = (size_t)((const uint8_t *)user - (const uint8_t *)r->host);
+            pthread_mutex_unlock(&g_slabreg.mx);
+            *reg_out = r;
+            return 1;
+        }
+    pthread_mutex_unlock(&g_slabreg.mx);
+    return 0;
+}
+size_t coli_vk_slabreg_bytes(void) {
+    pthread_mutex_lock(&g_slabreg.mx);
+    size_t b = g_slabreg.bytes;
+    pthread_mutex_unlock(&g_slabreg.mx);
+    return b;
+}
+int coli_vk_slabreg_wanted(void) {
+    static int w;
+    if (!w) {
+        /* gap-wave4: fork is the default decode path -- unset arms it, an explicit
+         * value always wins ("fork" on, anything else -- =0 included -- off), and
+         * COLI_VK_LEGACY=1 turns the unset default off (the one legacy line) */
+        const char *p = getenv("COLI_VK_V4_DECODE_PATH");
+        const char *lg = getenv("COLI_VK_LEGACY");
+        int legacy = lg && *lg && atoi(lg) != 0;
+        w = p && *p ? (!strcmp(p, "fork") ? 1 : -1) : (legacy ? -1 : 1);
+        if (w < 0 && legacy && !(p && *p))
+            fprintf(stderr, "[VK] tier: decode-path=fork legacy (COLI_VK_LEGACY=1) -- the slots keep the malloc/import path\n");
+    }
+    return w > 0;
+}
+int coli_vk_slabreg_status(long *block_mb, double *cap_gib) {
+    /* the probe, for the store's engagement line: arms the registry (memoizing its
+     * state, printing its refusal line on the way) and reports its block size and
+     * arena cap -- on success the CALLER owns the one engaged line, so the first
+     * slab's own announce stays quiet. 0 only when the device is not up yet
+     * (nothing memoized, no line, the first slab announces). */
+    if (block_mb) *block_mb = 0;
+    if (cap_gib) *cap_gib = 0;
+    if (!G.ready) return 0;
+    pthread_mutex_lock(&g_slabreg.mx);
+    int st = slabreg_arm() ? 1 : -1;
+    if (st > 0) {
+        g_slabreg.announced = 1;
+        if (block_mb) *block_mb = g_slabreg.block_mb;
+        if (cap_gib) *cap_gib = (double)g_slabreg.cap / 1073741824.0;
+    }
+    pthread_mutex_unlock(&g_slabreg.mx);
+    return st;
+}
+void coli_vk_slabreg_reset(void) {
+    pthread_mutex_lock(&g_slabreg.mx);
+    ColiVkSlabReg *r = g_slabreg.live;
+    while (r) { ColiVkSlabReg *n = r->next; if (G.ready) vkDestroyBuffer(G.dev, r->buf, NULL); free(r); r = n; }
+    g_slabreg.live = NULL;
+    SlabRegBlock *b = g_slabreg.blocks;
+    while (b) {
+        SlabRegBlock *n = b->next;
+        if (G.ready) { vkUnmapMemory(G.dev, b->mem); vkFreeMemory(G.dev, b->mem, NULL); }
+        free(b);
+        b = n;
+    }
+    g_slabreg.blocks = NULL;
+    g_slabreg.bytes = 0;
+    g_slabreg.state = 0;
+    g_slabreg.announced = 0;
+    pthread_mutex_unlock(&g_slabreg.mx);
+}
+/* The registry alias: the fork's coli_vk_tensor_alias over an arena slab -- the tensor
+ * binds its slab's ONE buffer whole (wbuf == sbuf), the record's woff/soff carried on
+ * the tensor as the descriptor offsets, pool NULL, slab NULL, reg the slab (free(t)
+ * owns nothing). Geometry/bounds/wide-verdict are coli_vk_tensor_alias_wide's rules
+ * verbatim, the import's slab_buf handles minus everything: 3 callocs, 0 driver
+ * objects. `user` is the caller's record base inside the slab (the store slot pointer
+ * the view served); wide < 0 scans the scale bytes through the slab's own mapping.
+ * reg's unlocked field reads are safe by coli_vk_slabreg_lookup's engine-thread
+ * discipline (its comment): the alias runs on the same thread, between the lookup
+ * and the store destroy that frees the record. */
+int coli_vk_slabreg_alias(const ColiVkSlabReg *reg, const void *user, size_t woff, size_t soff,
+                          int fmt, int I, int O, int gs, int wide, ColiVkTensor **tensor) {
+    if (*tensor) return (*tensor)->fmt == fmt && (*tensor)->I == I && (*tensor)->O == O;
+    if (!reg || !reg->host || !user || !(fmt == 7 || fmt == 15) || !fmt_uploadable(fmt, gs) || I < 1 || O < 1) return 0;
+    size_t rb = cpu_row_bytes(fmt, I);
+    if (rb != (size_t)rowwords(fmt, I) * 4) return 0;
+    size_t wbytes = rb * (size_t)O, sbytes = scale_floats(fmt, I, O, gs) * sizeof(float);
+    size_t base = (size_t)((const uint8_t *)user - (const uint8_t *)reg->host);
+    if (base > reg->bytes) return 0;
+    size_t wo = base + woff, so = base + soff;
+    if (wbytes > G.ssbo_range || wo > reg->bytes || wbytes > reg->bytes - wo ||
+        so > reg->bytes || sbytes > reg->bytes - so) return 0;
+    if (!G.ssbo_align || wo % G.ssbo_align || so % G.ssbo_align) return 0;   /* the descriptor offset's alignment */
+    ColiVkTensor *t = calloc(1, sizeof(*t));
+    if (!t) return 0;
+    t->wbuf = t->sbuf = reg->buf;   /* whole-buffer binding: the offsets ride the tensor */
+    t->woff = wo; t->soff = so;
+    t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I);
+    t->gs = (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13 || fmt == 15) ? gs : 0;
+    t->dev = 0; t->wbytes = wbytes;
+    t->pool = NULL; t->slab = NULL;
+    t->reg = (struct ColiVkSlabReg *)reg;
+    if (wide >= 0) t->wide = (uint8_t)(wide != 0);
+    else {
+        const uint8_t *sc = (const uint8_t *)reg->host + so;
+        if (fmt == 15) {
+            size_t nb = (size_t)O * (((size_t)I + gs - 1) / gs);
+            for (size_t i = 0; i < nb; i++)
+                if (sc[i] > 140) { t->wide = 1; break; }
+        } else t->wide = scales_wide(fmt, (const float *)sc, sbytes / 4);
+    }
+    __atomic_add_fetch(&g_import_bytes, wbytes, __ATOMIC_RELAXED);
+    *tensor = t;
+    return 1;
+}
+/* one record of the slab as a buffer bound into the imported memory at `off` bytes
+ * into the caller's slab: the descriptor paths bind their buffers whole (offset 0),
+ * so a record needs its own handle into the same pages, as a pool range has its own */
+static int slab_buf(ColiVkSlab *r, size_t off, size_t bytes, VkBuffer *out) {
+#ifdef VK_EXT_external_memory_host
+    VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = bytes,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VkBuffer b;
+    if (vkCreateBuffer(G.dev, &bi, NULL, &b) != VK_SUCCESS) return 0;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(G.dev, b, &req);
+    size_t boff = (size_t)((uintptr_t)r->ptr - (uintptr_t)r->base) + off;
+    if (boff % (req.alignment ? req.alignment : 1) || boff + req.size > r->bytes) {
+        vkDestroyBuffer(G.dev, b, NULL); return 0;
+    }
+    if (vkBindBufferMemory(G.dev, b, (VkDeviceMemory)r->mem, boff) != VK_SUCCESS) {
+        vkDestroyBuffer(G.dev, b, NULL); return 0;
+    }
+    *out = b;
+    return 1;
+#else
+    (void)r; (void)off; (void)bytes; (void)out;
+    return 0;
+#endif
+}
+int coli_vk_tensor_alias(ColiVkSlab *r, size_t woff, size_t soff, int fmt, int I, int O, int gs,
+                         ColiVkTensor **tensor) {
+    return coli_vk_tensor_alias_wide(r, woff, soff, fmt, I, O, gs, -1, tensor);
+}
+/* coli_vk_tensor_alias with the f16-range verdict supplied: wide < 0 the builder
+ * scans the slab's scale bytes itself (scales_wide's rule -- fmt 15: one ue8m0 byte
+ * a 32-group, O x ceil(I/gs) of them, the 786 KB-class pass a DeepSeek V4 expert's
+ * three tensors cost every build); 0/1 is a verdict the CALLER vouches for the exact
+ * bytes at [soff, soff+sbytes) -- the tier's alias cache records one per entry for
+ * the content it names, and skips the scan only when that same content is served
+ * again (same slab generation, same expert: the store's record bytes are fixed per
+ * (layer, expert)). A wrong verdict is silent wrong math, so the caller's bar is
+ * provable sameness, never plausibility. */
+int coli_vk_tensor_alias_wide(ColiVkSlab *r, size_t woff, size_t soff, int fmt, int I, int O, int gs,
+                              int wide, ColiVkTensor **tensor) {
+    if (*tensor) return (*tensor)->fmt == fmt && (*tensor)->I == I && (*tensor)->O == O;
+    /* the store's records: MXFP4 codes with their ue8m0 bytes (15) or f32 scales (7);
+     * the other formats' scale geometry is a pool's, not a slab's -- refused, the
+     * caller uploads a copy or computes on the CPU */
+    if (!r || !(fmt == 7 || fmt == 15) || !fmt_uploadable(fmt, gs) || I < 1 || O < 1) return 0;
+    size_t rb = cpu_row_bytes(fmt, I);
+    if (rb != (size_t)rowwords(fmt, I) * 4) return 0;          /* rows the shaders would read padded */
+    size_t wbytes = rb * (size_t)O, sbytes = scale_floats(fmt, I, O, gs) * sizeof(float);
+    if (wbytes > G.ssbo_range || woff > r->user_bytes || wbytes > r->user_bytes - woff ||
+        soff > r->user_bytes || sbytes > r->user_bytes - soff) return 0;
+    ColiVkTensor *t = calloc(1, sizeof(*t));
+    if (!t) return 0;
+    if (!slab_buf(r, woff, wbytes, &t->wbuf) || !slab_buf(r, soff, sbytes, &t->sbuf)) {
+        if (t->wbuf) vkDestroyBuffer(G.dev, t->wbuf, NULL);
+        free(t); return 0;
+    }
+    t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I);
+    t->gs = (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13 || fmt == 15) ? gs : 0;
+    t->dev = 0; t->wbytes = wbytes; t->slab = r;
+    t->pool = NULL;   /* outside every pool: the address-table routes (the grouped GEMV,
+                      * chain_moe's entries) read pool buffers by device address and stay
+                      * off an aliased record; the descriptor routes take it */
+    /* the cooperative-matrix GEMMs hold the dequantised weights in f16: a scale whose
+     * product with the format's largest code passes 65504 keeps the alias off them
+     * (scales_wide's rule, read off the slab itself -- a ue8m0 byte IS an exponent,
+     * and one past 140 is 2^13.4) */
+    if (wide >= 0) t->wide = (uint8_t)(wide != 0);   /* the caller's verdict for these exact bytes */
+    else {
+        const uint8_t *sc = (const uint8_t *)r->ptr + soff;
+        if (fmt == 15) {
+            size_t nb = (size_t)O * (((size_t)I + gs - 1) / gs);
+            for (size_t i = 0; i < nb; i++)
+                if (sc[i] > 140) { t->wide = 1; break; }
+        } else t->wide = scales_wide(fmt, (const float *)sc, sbytes / 4);
+    }
+    pthread_mutex_lock(&g_slabs.mx);
+    r->refs++;
+    pthread_mutex_unlock(&g_slabs.mx);
+    __atomic_add_fetch(&g_import_bytes, wbytes, __ATOMIC_RELAXED);
+    *tensor = t;
+    return 1;
 }
 
 /* Sync-path fence wait. A blocked vkWaitForFences pays a scheduler wake on
@@ -2471,7 +3152,10 @@ static void vk_prof_paths(void) {
 }
 
 /* Formats the cooperative-matrix GEMM takes: decoded weights exact in fp16, and group
- * boundaries on its staged steps (one group scale per step). */
+ * boundaries on its staged steps (one group scale per step). Not fmt 15: tier tensors
+ * never carry scales_wide's f16-range flag (their scales are bytes, not the floats it
+ * reads), so a packed scale past fp16's range would reach this GEMM unguarded -- the
+ * fp32 GEMM takes the form until a cooperative-matrix rig proves the packed decode. */
 static int coop_fmt(const ColiVkTensor *t) {
     int gs = t->fmt == 5 ? 64 : t->gs;
     return !t->wide && (t->fmt == 1 || t->fmt == 2 ||
@@ -2508,7 +3192,10 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
      * GEMVs are the expert batch's and the chain's (qmatmul_bd.spv, chain_gemv_bd.spv), and
      * qmatmul.spv read its rows as zeros, returning 1. The tensor stays up for those; the
      * caller's CPU path computes this one. */
-    if (bd_fmt(fmt)) return 0;
+    if (bd_fmt(fmt)) {
+        coli_vk_degrade(COLI_VK_REFUSE, "matmul", "a block-format matrix has no per-op shader: the CPU computes it");
+        return 0;
+    }
     ColiVkTensor *t = *tensor;
     /* VK_PROF=1: phase split of the dense per-call cost, printed every 8192 calls —
      * separates our code (memcpy/desc/record) from the driver (submit) and the GPU
@@ -2587,6 +3274,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
     VkResult wr = path ? vk_fence_wait_gemm(G.dev, G.fence) : vk_fence_wait(G.dev, G.fence);
     if (wr != VK_SUCCESS) {
         fprintf(stderr, "[VK] fence wait failed: %d — disabling GPU offload, staying on CPU\n", wr);
+        coli_vk_degrade(COLI_VK_DEGRADE, "matmul fence", "the wait failed: GPU offload disabled");
         G.ready = 0;
         return 0;
     }
@@ -2915,7 +3603,10 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     double vp0 = G.eg_prof ? vk_now() : 0;
     VKCHECK(vk_submit(0, G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
-    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) {
+        coli_vk_degrade(COLI_VK_DEGRADE, "gate_up fence", "the fused gate+up wait failed: GPU offload disabled");
+        G.ready = 0; return 0;
+    }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(hidden, G.h.ptr, hb);
     G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer/binding was clobbered */
@@ -3038,6 +3729,7 @@ int coli_vk_expert_group_take(float *y) {
     G.eg_inflight = 0;
     if (vk_fence_wait(G.dev, G.eg_fence) != VK_SUCCESS) {   /* no async_end: the group may still run */
         fprintf(stderr, "[VK] expert-group fence wait failed — disabling GPU offload\n");
+        coli_vk_degrade(COLI_VK_DEGRADE, "expert group fence", "the wait failed: GPU offload disabled");
         G.ready = 0; return 0;
     }
     async_end(0);
@@ -3120,6 +3812,7 @@ static uint32_t pool_memtype(const VkWPool *P) {
 static void up_lost(int dev) {
     fprintf(stderr, "[VK] %sstaged upload failed (%s: %d): the device is lost, disabling %s\n", dev ? "dev2 " : "",
             g_up[dev].what ? g_up[dev].what : "?", (int)g_up[dev].err, dev ? "dev2 offload" : "GPU offload");
+    coli_vk_degrade(COLI_VK_DEGRADE, dev ? "dev2 lost" : "device lost", "a staged upload's fence failed");
     /* another thread (the tier's uploader) may be the one that finds out */
     if (dev) __atomic_store_n(&G2.ready, 0, __ATOMIC_RELEASE); else __atomic_store_n(&G.ready, 0, __ATOMIC_RELEASE);
 }
@@ -3477,6 +4170,7 @@ int coli_vk_expert_group_take2(float *y) {
     G2.inflight = 0;
     if (vk_fence_wait(G2.dev, G2.fence) != VK_SUCCESS) {   /* no async_end: the group may still run */
         fprintf(stderr, "[VK] dev2 expert-group fence wait failed — disabling dev2 offload\n");
+        coli_vk_degrade(COLI_VK_DEGRADE, "dev2 expert group fence", "the wait failed: dev2 offload disabled");
         G2.ready = 0; return 0;
     }
     async_end(1);
@@ -3535,7 +4229,10 @@ static int pw_flush(void) {   /* send what is pending now, in a command buffer o
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     VKCHECK(vk_submit(0, G.queue, &si, G.fence), "queueSubmit");
-    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) {
+        coli_vk_degrade(COLI_VK_DEGRADE, "prefetch fence", "the prefetch writeback's wait failed: GPU offload disabled");
+        G.ready = 0; return 0;
+    }
     pw_done();
     return 1;
 }
@@ -3704,7 +4401,10 @@ int coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc,
     double vp0 = G.eg_prof ? vk_now() : 0;
     VKCHECK(vk_submit(0, G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
-    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) {
+        coli_vk_degrade(COLI_VK_DEGRADE, "kv mirror fence", "the submit's wait failed: GPU offload disabled");
+        G.ready = 0; return 0;
+    }
     pw_done();
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(ctx, G.y.ptr, cb);
@@ -3721,7 +4421,10 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
                         int fmt, const float *x, int S, int I, int grp) {
     if (!G.ready || S < 1) return 0;
     if (!upload_tensor(t1p, w1, s1, fmt, I, O1, grp) || !upload_tensor(t2p, w2, s2, fmt, I, O2, grp)) return 0;
-    if (bd_fmt(fmt)) return 0;   /* no block-format shader here (coli_vk_matmul) */
+    if (bd_fmt(fmt)) {   /* no block-format shader here (coli_vk_matmul) */
+        coli_vk_degrade(COLI_VK_REFUSE, "matmul pair", "a block-format matrix has no per-op shader: the CPU computes it");
+        return 0;
+    }
     ColiVkTensor *t1 = *t1p, *t2 = *t2p;
     size_t xb = (size_t)S * I * 4, yb1 = (size_t)S * O1 * 4, yb2 = (size_t)S * O2 * 4;
     if (!scratch_reserve(&G.x, xb) || !scratch_reserve_mt(&G.y, yb1, G.memtype_cached) ||
@@ -3765,7 +4468,10 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
     double vp0 = G.eg_prof ? vk_now() : 0;
     VKCHECK(vk_submit(0, G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
-    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) {
+        coli_vk_degrade(COLI_VK_DEGRADE, "kv mirror fence", "the submit's wait failed: GPU offload disabled");
+        G.ready = 0; return 0;
+    }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(y1, G.y.ptr, yb1);
     memcpy(y2, G.y2.ptr, yb2);
@@ -3873,7 +4579,10 @@ int coli_vk_attn_qprep(int layer,
     double vp0 = G.eg_prof ? vk_now() : 0;
     VKCHECK(vk_submit(0, G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
-    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) {
+        coli_vk_degrade(COLI_VK_DEGRADE, "kv mirror fence", "the submit's wait failed: GPU offload disabled");
+        G.ready = 0; return 0;
+    }
     pw_done();
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(q_out, G.y.ptr, qb_b);
@@ -3948,7 +4657,10 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
     double vp0 = G.eg_prof ? vk_now() : 0;
     VKCHECK(vk_submit(0, G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
-    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) {
+        coli_vk_degrade(COLI_VK_DEGRADE, "kv mirror fence", "the submit's wait failed: GPU offload disabled");
+        G.ready = 0; return 0;
+    }
     pw_done();
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(out, G.y.ptr, ob);
@@ -3963,6 +4675,28 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
  * reclaim the host struct and counters only. */
 static void tensor_release(ColiVkTensor *t) {
     VkWPool *P = t->pool;
+    if (t->reg) {   /* a registry slab's view (decode-path=fork): the fork's lifetime -- the alias
+                     * owns nothing, the registry holds the buffer and mapping for the store's own */
+        __atomic_sub_fetch(&g_import_bytes, t->wbytes, __ATOMIC_RELAXED);
+        free(t);
+        return;
+    }
+    if (t->slab) {   /* an aliased record of an imported slab: its two buffer handles and the slab's reference, no pool's */
+        ColiVkSlab *r = t->slab;
+        if (G.ready) {
+            double t0 = cs_dprof_on() ? vk_now() : 0;
+            if (t->wbuf) vkDestroyBuffer(G.dev, t->wbuf, NULL);
+            if (t->sbuf) vkDestroyBuffer(G.dev, t->sbuf, NULL);
+            if (cs_dprof_on()) {
+                g_cs_diag.alias_buf_destroys += (t->wbuf ? 1ull : 0ull) + (t->sbuf ? 1ull : 0ull);
+                g_cs_diag.alias_buf_destroy_ms += vk_now() - t0;
+            }
+        }
+        __atomic_sub_fetch(&g_import_bytes, t->wbytes, __ATOMIC_RELAXED);
+        free(t);
+        coli_vk_slab_unref(r);
+        return;
+    }
     if (t->imp) {   /* rows imported in place: their memory object, the scales' range */
         pthread_mutex_lock(&g_imports_mx);
         for (ColiVkTensor **pp = &g_imports; *pp; pp = &(*pp)->imp_next) if (*pp == t) { *pp = t->imp_next; break; }
@@ -4230,6 +4964,11 @@ typedef struct XbCtx {
     VkPipelineLayout pl6, pl4, pl3;
     VkPipeline p_gu, p_mv, p_act, p_mm[VK_GEMM_SLOTS], p_coop[VK_COOP_SLOTS];
     VkPipeline p_gu_bd, p_mv_bd;   /* the block formats' GEMVs (bd_shaders), NULL without them */
+    /* COLI_VK_V4_S1GEMV: the fork's dedicated fmt-15 S=1 GEMV (qmatmul_s1_mx.spv) on
+     * the down of a decode row -- optional at run time like the block pair, and armed
+     * only past xb_s1gemv_parity (the bitwise-vs-generic gate; s1_ok is that verdict) */
+    VkShaderModule sh_s1; VkPipeline p_s1; int s1_ok;
+    unsigned long long s1_gemvs;   /* down dispatches the dedicated GEMV took */
     VkPipeline p_mm_bd[64]; uint8_t mm_bd_tried[64];   /* their tiled GEMM (qmatmul_gemm_bd.spv), a pipeline per ggml type, made on first use */
     VkDescriptorPool *dpools; int ndpools;
     VkDescriptorPool act_pool; VkDescriptorSet act_set;
@@ -4243,6 +4982,7 @@ typedef struct XbCtx {
     size_t *yoff; int nrows, cyoff;
     unsigned long long batches, experts, rows, gemm_experts;
     double dev_ms;
+    XbCsDiag csd;                  /* COLI_VK_CHAIN_DPROF: fence-wait/query-read CPU spans */
     /* COLI_VK_ACT_SWIGLU_V4: expert_act_v4.spv between the activation and down, its
      * row weights in the x buffer after each expert's rows (xb_v4_init) */
     VkShaderModule sh_v4; VkDescriptorSetLayout dsl_v4; VkPipelineLayout pl_v4; VkPipeline p_v4;
@@ -4265,6 +5005,10 @@ typedef struct XbCtx {
     /* the block formats' grouped GEMM (qmatmul_grp_bd.comp: [0] down, [1] gate+up), a pipeline
      * per ggml type, made on first use; grp_bd: its shaders and the grouped sets are there */
     VkShaderModule sh_grp_bd[2]; VkPipeline p_grp_bd[2][64]; uint8_t grp_bd_tried[2][64]; int grp_bd;
+    /* the native MXFP4's grouped GEMM (qmatmul_grp_mx.comp: [0] down, [1] gate+up, no
+     * per-type variants — the group size rides the expert table); grp_mx: its shaders
+     * and the grouped sets are there */
+    VkShaderModule sh_grp_mx[2]; VkPipeline p_grp_mx[2]; uint8_t grp_mx_tried[2]; int grp_mx;
     VkPipeline p_grp[2]; VkDescriptorPool grp_pool; VkDescriptorSet grp_set[3][2];
     VkShaderModule sh_gv[2]; VkPipeline p_gv[2];   /* qmatmul_grp_gemv.comp: the same batches below grp_rows */
     XbBuf grp_it[3][2], grp_et[3][2], grp_map[3];
@@ -4273,10 +5017,10 @@ typedef struct XbCtx {
     unsigned long long grp_batches, gv_batches;
     /* chain_moe_gv.comp, the dense chain's decode experts, for the experts of a batch below
      * gemm_rows rows the grouped routes leave (xb_cgv_init, xb_cgv_record): a pipeline per
-     * format (1, 2, 4, 7) and pass (0 gate and up, 1 down), made on first use; per batch
+     * format (1, 2, 4, 7, 15) and pass (0 gate and up, 1 down), made on first use; per batch
      * that can be in flight a set, its rows' table indices and its experts' entries */
     VkShaderModule sh_cgv; VkDescriptorSetLayout dsl_cgv; VkPipelineLayout pl_cgv; VkDescriptorPool cgv_pool;
-    VkDescriptorSet cgv_set[3]; VkPipeline p_cgv[4][2]; int cgv_n[4][2];   /* the row width each was made for */
+    VkDescriptorSet cgv_set[3]; VkPipeline p_cgv[5][2]; int cgv_n[5][2];   /* the row width each was made for */
     XbBuf cgv_ids[3], cgv_tab[3];
     int cgv;
     unsigned long long cgv_batches;
@@ -4297,6 +5041,21 @@ typedef struct XbCtx {
         VkDescriptorPool pool; VkDescriptorSet set;
         unsigned long long steps, sums; double sum_ms;
     } st;
+    /* the decode group's row sum (COLI_VK_TIER_CS_DEVSUM): a tail dispatch riding the
+     * NEXT single batch's submit (armed by coli_vk_xb_sum_arm, read at that batch's join
+     * by coli_vk_xb_join_sum) that sums the batch's own y rows -- each bf16 rounded,
+     * added in row order, the finish site's host merge -- so one row reads back, not n.
+     * want: armed for the next issue (consumed by it); rec: the tail is recorded in that
+     * submit; done: it ran, the join hands dsum.out out beside the rows (still valid).
+     * tried: the pipeline is made once, on the first arm -- apart from the grouped
+     * route's init, which a card without its route never reaches. */
+    struct {
+        int want, n, rec, done, tried;
+        XbBuf off, out;
+        VkShaderModule sh; VkDescriptorSetLayout dsl; VkPipelineLayout pl; VkPipeline pipe;
+        VkDescriptorPool pool; VkDescriptorSet set;
+        unsigned long long sums; double sum_ms;
+    } dsum;
 } XbCtx;
 static XbCtx g_xb[2];
 static int xb_dev_ready(const XbCtx *X) { return X->d ? G2.ready : G.ready; }
@@ -4328,17 +5087,19 @@ static int xb_buf(XbCtx *X, XbBuf *b, size_t region, uint32_t memtype, int map) 
  * buffers' regions; the offsets come at bind time. */
 static void xb_write_sets(ColiVkExpert *e) {
     XbCtx *X = e->X;
+    /* the weight/scale offsets are the tensor's own: 0 for every own-buffer tensor, the
+     * registry alias's whole-buffer window (decode-path=fork) -- wbuf/sbuf bind whole */
     VkDescriptorBufferInfo gu[6] = {
-        {X->x.buf, 0, X->x.region}, {e->g->wbuf, 0, VK_WHOLE_SIZE}, {sbuf_of(e->g), 0, VK_WHOLE_SIZE},
-        {e->u->wbuf, 0, VK_WHOLE_SIZE}, {sbuf_of(e->u), 0, VK_WHOLE_SIZE}, {X->h.buf, 0, X->h.region}};
+        {X->x.buf, 0, X->x.region}, {e->g->wbuf, e->g->woff, VK_WHOLE_SIZE}, {sbuf_of(e->g), e->g->soff, VK_WHOLE_SIZE},
+        {e->u->wbuf, e->u->woff, VK_WHOLE_SIZE}, {sbuf_of(e->u), e->u->soff, VK_WHOLE_SIZE}, {X->h.buf, 0, X->h.region}};
     VkDescriptorBufferInfo dn[4] = {
-        {X->h.buf, 0, X->h.region}, {e->d->wbuf, 0, VK_WHOLE_SIZE}, {sbuf_of(e->d), 0, VK_WHOLE_SIZE},
+        {X->h.buf, 0, X->h.region}, {e->d->wbuf, e->d->woff, VK_WHOLE_SIZE}, {sbuf_of(e->d), e->d->soff, VK_WHOLE_SIZE},
         {X->y.buf, 0, X->y.region}};
     VkDescriptorBufferInfo mg[4] = {
-        {X->x.buf, 0, X->x.region}, {e->g->wbuf, 0, VK_WHOLE_SIZE}, {sbuf_of(e->g), 0, VK_WHOLE_SIZE},
+        {X->x.buf, 0, X->x.region}, {e->g->wbuf, e->g->woff, VK_WHOLE_SIZE}, {sbuf_of(e->g), e->g->soff, VK_WHOLE_SIZE},
         {X->g.buf, 0, X->g.region}};
     VkDescriptorBufferInfo mu[4] = {
-        {X->x.buf, 0, X->x.region}, {e->u->wbuf, 0, VK_WHOLE_SIZE}, {sbuf_of(e->u), 0, VK_WHOLE_SIZE},
+        {X->x.buf, 0, X->x.region}, {e->u->wbuf, e->u->woff, VK_WHOLE_SIZE}, {sbuf_of(e->u), e->u->soff, VK_WHOLE_SIZE},
         {X->u.buf, 0, X->u.region}};
     VkWriteDescriptorSet w[18]; int n = 0;
     struct { VkDescriptorSet set; VkDescriptorBufferInfo *bi; int nb, d0, d1; } sets[4] = {
@@ -4412,7 +5173,11 @@ static int xb_reserve(XbCtx *X, size_t xr, size_t ir, size_t yr) {
                 (double)(nx + 3 * ni + ny) * 2 / 1048576.0,
                 back ? "this step's experts on the CPU (the batch keeps its scratch)"
                      : X->d ? "the second device stops" : "the tier stops");
-        if (!back) { X->ready = 0; return 0; }
+        if (!back) {
+            coli_vk_degrade(COLI_VK_DEGRADE, X->d ? "dev2 expert batch scratch" : "expert batch scratch",
+                            "the scratch failed: the tier stops");
+            X->ready = 0; return 0;
+        }
         ok = 0;
     }
     for (ColiVkExpert *e = X->live; e; e = e->next) xb_write_sets(e);
@@ -4713,6 +5478,44 @@ static VkPipeline xb_grp_bd_pipe(XbCtx *X, int v, int t) {
     return X->p_grp_bd[v][t];
 }
 
+/* The native MXFP4's grouped GEMM (qmatmul_grp_mx.spv, qmatmul_grp_gate_up_mx.spv): the
+ * tier's fmt 7 experts in one dispatch over the batch — the GGUF blocks' shape (mode 3)
+ * with the GEMV's decode, for the checkpoints whose only group route was the GEMV (mode 2,
+ * a row a time) and the per-expert ops. COLI_VK_XB_GROUPED_MX=0 keeps those routes. */
+static void xb_grp_mx_init(XbCtx *X) {
+    const char *e = getenv("COLI_VK_XB_GROUPED_MX");
+    if (X->d || !G.has_bda || (e && *e == '0')) return;
+    VkPhysicalDeviceProperties lp; vkGetPhysicalDeviceProperties(X->phys, &lp);
+    if (lp.limits.maxComputeSharedMemorySize < 26214) return;   /* wg4/wu4 + xs4, both variants */
+    const char *nm[2] = {"qmatmul_grp_mx.spv", "qmatmul_grp_gate_up_mx.spv"};
+    for (int v = 0; v < 2; v++) {
+        char path[1100];
+        derive_dir_file(X->spv, nm[v], path, sizeof path);
+        if (!(X->sh_grp_mx[v] = load_spv(X->dev, path))) return;
+    }
+    if (!X->pl_grp && !xb_layout(X, 5, 0u, sizeof(struct PCGRP), &X->dsl_grp, &X->pl_grp)) return;
+    if (!X->grp_pool) {
+        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 30};
+        VkDescriptorPoolCreateInfo dp = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .maxSets = 6, .poolSizeCount = 1, .pPoolSizes = &ps};
+        if (vkCreateDescriptorPool(X->dev, &dp, NULL, &X->grp_pool) != VK_SUCCESS) { X->grp_pool = VK_NULL_HANDLE; return; }
+        VkDescriptorSetLayout l6[6] = {X->dsl_grp, X->dsl_grp, X->dsl_grp, X->dsl_grp, X->dsl_grp, X->dsl_grp};
+        VkDescriptorSetAllocateInfo da = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = X->grp_pool, .descriptorSetCount = 6, .pSetLayouts = l6};
+        if (vkAllocateDescriptorSets(X->dev, &da, &X->grp_set[0][0]) != VK_SUCCESS) return;
+    }
+    X->grp_mx = 1;
+}
+/* its pipeline for v (0 down, 1 gate+up), made on first use */
+static VkPipeline xb_grp_mx_pipe(XbCtx *X, int v) {
+    if (!X->grp_mx) return VK_NULL_HANDLE;
+    if (!X->grp_mx_tried[v]) {
+        X->grp_mx_tried[v] = 1;
+        if (!xb_pipeline(X, X->sh_grp_mx[v], X->pl_grp, NULL, &X->p_grp_mx[v])) X->p_grp_mx[v] = VK_NULL_HANDLE;
+    }
+    return X->p_grp_mx[v];
+}
+
 /* chain_moe_gv.comp in the expert batch (the shader beside the main one): the dense chain's
  * decode kernel for a batch's small experts, a row a pair (K 1), so a row's bits there are
  * the chain's (a prompt chunk's experts through the tier, its next tokens through the chain,
@@ -4722,7 +5525,7 @@ static VkPipeline xb_grp_bd_pipe(XbCtx *X, int v, int t) {
  * a GEMV of 8 outputs a workgroup each. COLI_VK_XB_GEMV=0 keeps those. */
 static void xb_barrier(VkCommandBuffer c);
 struct PCCGV { int mode, S, K, D, I, act; float limit, a, b; int t_off, x_off, x_row, i_off, i_row, lpr, tiles, y_off, y_row; };
-static int cgv_fi(int fmt) { return fmt == 1 ? 1 : fmt == 2 ? 2 : fmt == 4 ? 3 : fmt == 7 ? 4 : 0; }
+static int cgv_fi(int fmt) { return fmt == 1 ? 1 : fmt == 2 ? 2 : fmt == 4 ? 3 : fmt == 7 ? 4 : fmt == 15 ? 5 : 0; }
 static void xb_cgv_init(XbCtx *X) {
     const char *e = getenv("COLI_VK_XB_GEMV");
     if (X->d || !G.has_bda || (e && *e == '0')) return;
@@ -4769,7 +5572,7 @@ static int xb_cgv_takes(XbCtx *X, const ColiVkExpert *e, int rows, int v4) {
     const ColiVkTensor *t[3] = {e->g, e->u, e->d};
     for (int k = 0; k < 3; k++) {
         int f = t[k]->fmt;
-        if (!cgv_fi(f) || t[k]->rowWords % 4 || (f == 4 && (t[k]->gs < 8 || t[k]->gs % 8)) || (f == 7 && t[k]->gs % 32)) return 0;
+        if (!cgv_fi(f) || t[k]->rowWords % 4 || (f == 4 && (t[k]->gs < 8 || t[k]->gs % 8)) || ((f == 7 || f == 15) && t[k]->gs % 32)) return 0;
     }
     if (e->u->fmt != e->g->fmt || e->u->gs != e->g->gs || e->u->rowWords != e->g->rowWords) return 0;
     uint32_t ent[COLI_VK_XB_ENTRY];
@@ -4968,6 +5771,117 @@ static int xb_cbd_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *
     return 1;
 }
 
+/* COLI_VK_V4_S1GEMV's pick for one down GEMV (the fork's ds4vk_expert_s1gemv_pick):
+ * the dedicated pipeline only for a single row over a staged input (I <= 6144, % 8,
+ * matching xsh) of fmt 15 with 8-aligned groups, and only on a context whose parity
+ * gate passed. g_s1_forced is the tests' in-process override (-1 the lever's own
+ * state), the fork's force hook: a static env cache would poison the switching. */
+static int g_s1_forced = -1;
+static VkPipeline xb_s1gemv_pick(const XbCtx *X, const ColiVkTensor *t, int rows) {
+    if (g_s1_forced == 0) return X->p_mv;
+    if (!X->p_s1 || !X->s1_ok || rows != 1 || t->fmt != 15 || t->I > 6144 ||
+        (t->I & 7) || t->rowWords != t->I >> 3 || !t->gs || (t->gs & 7)) return X->p_mv;
+    return X->p_s1;
+}
+/* The S=1 kernel's parity leg, run once at the lever's arm before anything may take
+ * the pipeline: the same random fmt-15 weights through the generic qmatmul dispatch
+ * and the dedicated GEMV, bit for bit (the fork's test-vk-dsv4-experts discipline).
+ * The scale bytes cycle through every ue8m0 code, 0 and 0xff included. Two geometries,
+ * both ends of the pick's range (I <= 6144 a multiple of 8, gs a multiple of 8): the
+ * fork's own 2048/gs-32 shape and the top I=6144 with gs=64, which fills the shader's
+ * xsh[6144] staging exactly -- a mismatch at either destroys the pipeline. 1 = exact;
+ * on the first differing row it says which and returns 0. */
+static int xb_s1gemv_parity_leg(XbCtx *X, int PI, int PO, int PGS) {
+    const int rw = PI >> 3, ng = PI / PGS;
+    XbBuf bx, bw, bs, by[2];
+    memset(&bx, 0, sizeof bx); memset(&bw, 0, sizeof bw); memset(&bs, 0, sizeof bs);
+    memset(by, 0, sizeof by);
+    VkDescriptorPool dp = VK_NULL_HANDLE;
+    VkDescriptorSet sets[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    int ok = 0;
+    if (!xb_buf(X, &bx, (size_t)PI * 4, X->mt_host, 1) ||
+        !xb_buf(X, &bw, (size_t)PO * rw * 4, X->mt_host, 1) ||
+        !xb_buf(X, &bs, (size_t)PO * ng, X->mt_host, 1) ||
+        !xb_buf(X, &by[0], (size_t)PO * 4, X->mt_cached, 1) ||
+        !xb_buf(X, &by[1], (size_t)PO * 4, X->mt_cached, 1)) goto out;
+    {   /* a fixed pattern: reproducible from the stderr line alone */
+        uint32_t r = 0x1234567u;
+        float *x = bx.ptr; uint32_t *w = bw.ptr; uint8_t *sc = bs.ptr;
+        for (int i = 0; i < PI; i++) { r = r * 1664525u + 1013904223u; x[i] = (float)(int)(r >> 20) * (1.f / 2048.f) - 1.f; }
+        for (int i = 0; i < PO * rw; i++) { r = r * 1664525u + 1013904223u; w[i] = r; }
+        for (int i = 0; i < PO * ng; i++) sc[i] = (uint8_t)(i * 7 + 13);
+        memset(by[0].ptr, 0, (size_t)PO * 4); memset(by[1].ptr, 0, (size_t)PO * 4);
+    }
+    {   /* two sets off the batch's own dsl4: same X/W/Sc, Y each its own */
+        VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 4}};
+        VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .maxSets = 2, .poolSizeCount = 2, .pPoolSizes = ps};
+        if (vkCreateDescriptorPool(X->dev, &dpi, NULL, &dp) != VK_SUCCESS) goto out;
+        VkDescriptorSetLayout ls[2] = {X->dsl4, X->dsl4};
+        VkDescriptorSetAllocateInfo dai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = dp, .descriptorSetCount = 2, .pSetLayouts = ls};
+        if (vkAllocateDescriptorSets(X->dev, &dai, sets) != VK_SUCCESS) goto out;
+        for (int s = 0; s < 2; s++) {
+            VkDescriptorBufferInfo bi[4] = {{bx.buf, 0, bx.region}, {bw.buf, 0, bw.region},
+                                            {bs.buf, 0, bs.region}, {by[s].buf, 0, by[s].region}};
+            VkWriteDescriptorSet w[4];
+            for (int b = 0; b < 4; b++)
+                w[b] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = sets[s],
+                    .dstBinding = (uint32_t)b, .descriptorCount = 1,
+                    .descriptorType = (b == 0 || b == 3) ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
+                                                          : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                    .pBufferInfo = &bi[b]};
+            vkUpdateDescriptorSets(X->dev, 4, w, 0, NULL);
+        }
+    }
+    {   /* the generic dispatch exactly as the batch records it, then the dedicated one */
+        if (vkResetCommandBuffer(X->cmd, 0) != VK_SUCCESS) goto out;
+        VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+        if (vkBeginCommandBuffer(X->cmd, &bi) != VK_SUCCESS) goto out;
+        struct PC pc = {15, 1, PI, PO, rw, PGS};
+        uint32_t dyn[2] = {0, 0};
+        vkCmdBindPipeline(X->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->p_mv);
+        vkCmdBindDescriptorSets(X->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->pl4, 0, 1, &sets[0], 2, dyn);
+        vkCmdPushConstants(X->cmd, X->pl4, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+        vkCmdDispatch(X->cmd, (uint32_t)((PO + 7) / 8), 1, 1);
+        xb_barrier(X->cmd);
+        vkCmdBindPipeline(X->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->p_s1);
+        vkCmdBindDescriptorSets(X->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->pl4, 0, 1, &sets[1], 2, dyn);
+        vkCmdPushConstants(X->cmd, X->pl4, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+        vkCmdDispatch(X->cmd, (uint32_t)((PI + 7) / 8), 1, 1);
+        VkMemoryBarrier hb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
+        vkCmdPipelineBarrier(X->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                             0, 1, &hb, 0, NULL, 0, NULL);
+        if (vkEndCommandBuffer(X->cmd) != VK_SUCCESS) goto out;
+        VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &X->cmd};
+        if (vkResetFences(X->dev, 1, &X->fence) != VK_SUCCESS ||
+            vk_submit(X->d, X->q, &si, X->fence) != VK_SUCCESS ||
+            vkWaitForFences(X->dev, 1, &X->fence, VK_TRUE, ~(uint64_t)0) != VK_SUCCESS) goto out;
+    }
+    ok = !memcmp(by[0].ptr, by[1].ptr, (size_t)PO * 4);
+    if (!ok)
+        for (int o = 0; o < PO; o++)
+            if (memcmp((const uint8_t *)by[0].ptr + (size_t)o * 4, (const uint8_t *)by[1].ptr + (size_t)o * 4, 4)) {
+                float ya, yb2; memcpy(&ya, (const uint8_t *)by[0].ptr + (size_t)o * 4, 4);
+                memcpy(&yb2, (const uint8_t *)by[1].ptr + (size_t)o * 4, 4);
+                fprintf(stderr, "[VK] tier s1gemv: parity row %d of %d: generic %.9g, dedicated %.9g\n",
+                        o, PO, ya, yb2);
+                break;
+            }
+out:
+    if (dp) vkDestroyDescriptorPool(X->dev, dp, NULL);
+    for (int s = 0; s < 2; s++)
+        if (by[s].buf) { vkDestroyBuffer(X->dev, by[s].buf, NULL); vkFreeMemory(X->dev, by[s].mem, NULL); }
+    if (bs.buf) { vkDestroyBuffer(X->dev, bs.buf, NULL); vkFreeMemory(X->dev, bs.mem, NULL); }
+    if (bw.buf) { vkDestroyBuffer(X->dev, bw.buf, NULL); vkFreeMemory(X->dev, bw.mem, NULL); }
+    if (bx.buf) { vkDestroyBuffer(X->dev, bx.buf, NULL); vkFreeMemory(X->dev, bx.mem, NULL); }
+    return ok;
+}
+static int xb_s1gemv_parity(XbCtx *X) {
+    return xb_s1gemv_parity_leg(X, 2048, 256, 32) && xb_s1gemv_parity_leg(X, 6144, 256, 64);
+}
 static int xb_init(XbCtx *X, int d, int D, int I, int act, float limit, float a, float b) {
     if (X->ready) {   /* the activation rides the push constants; the geometry changes
                        * only while no expert is allocated (scratch grows by bytes) */
@@ -5024,12 +5938,29 @@ static int xb_init(XbCtx *X, int d, int D, int I, int act, float limit, float a,
             if (!xb_pipeline(X, X->sh_mm, X->pl4, &si, &X->p_mm[k])) X->p_mm[k] = VK_NULL_HANDLE;
         }
     }
+    /* COLI_VK_TIER_GEMM_ROWS: the unset default 4 is the measured crossover on this
+     * class of cards (RDNA2, no cooperative matrices; below it the grouped GEMV's rows
+     * win, above it the tiles' weight reuse does), gated on the GEMM route's pipelines
+     * exactly as before; `=N` pins N rows, 0 keeps the per-row GEMV, and COLI_VK_LEGACY=1
+     * turns an unset env back to the base's 16. The lever's ONE [VK] line (said once a
+     * run; a set env stays silent) */
     const char *e = getenv("COLI_VK_TIER_GEMM_ROWS");
-    X->gemm_rows = X->p_mm[0] && X->p_act ? (e && *e ? atoi(e) : 16) : 0;
+    X->gemm_rows = X->p_mm[0] && X->p_act ? coli_vk_env_def("COLI_VK_TIER_GEMM_ROWS", 4, 16) : 0;
     if (X->gemm_rows < 0) X->gemm_rows = 0;
+    if (X->p_mm[0] && X->p_act && !(e && *e)) {
+        static int said;
+        if (!said) {
+            said = 1;
+            if (coli_vk_legacy())
+                fprintf(stderr, "[VK] tier: grouped GEMM rows: legacy (COLI_VK_LEGACY=1) -- %d rows\n", X->gemm_rows);
+            else
+                fprintf(stderr, "[VK] tier: grouped GEMM from %d rows (unset; the measured crossover)\n", X->gemm_rows);
+        }
+    }
     xb_coop_init(X);
     xb_grp_init(X);
     xb_grp_bd_init(X);
+    xb_grp_mx_init(X);
     xb_cgv_init(X);
     xb_cbd_init(X);
     VkCommandPoolCreateInfo cp = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -5055,6 +5986,32 @@ static int xb_init(XbCtx *X, int d, int D, int I, int act, float limit, float a,
     /* a first scratch for 64 rows of 16 experts; grows with the first prefill */
     if (!xb_reserve(X, 64 * (size_t)D * 4 + 16 * X->align, 64 * (size_t)I * 4 + 16 * X->align,
                     64 * (size_t)D * 4 + 16 * X->align)) return 0;
+    {   /* COLI_VK_V4_S1GEMV: the fork's dedicated fmt-15 S=1 GEMV on the down of a decode
+         * row. The default since gap-wave4: unset arms it behind the parity leg (a
+         * mismatch destroys the pipeline so nothing can take it, and the generic form
+         * stays -- one line each way); =0 keeps the generic form, and COLI_VK_LEGACY=1
+         * turns the unset default off with the lever's one legacy line. */
+        const char *s1 = getenv("COLI_VK_V4_S1GEMV");
+        if (coli_vk_env_int("COLI_VK_V4_S1GEMV", 1)) {
+            char s1_path[1100];
+            derive_dir_file(X->spv, "qmatmul_s1_mx.spv", s1_path, sizeof s1_path);
+            X->sh_s1 = load_spv(X->dev, s1_path);
+            if (X->sh_s1 && xb_pipeline(X, X->sh_s1, X->pl4, NULL, &X->p_s1) && xb_s1gemv_parity(X)) {
+                X->s1_ok = 1;
+                fprintf(stderr, "[VK] tier s1gemv: qmatmul_s1_mx armed%s (down of S=1 rows, parity vs qmatmul exact)\n",
+                        X->d ? " dev2" : "");
+            } else {
+                if (X->p_s1) {
+                    vkDestroyPipeline(X->dev, X->p_s1, NULL);
+                    fprintf(stderr, "[VK] tier s1gemv: parity vs qmatmul NOT exact -- the generic GEMV stays%s\n",
+                            X->d ? " (dev2)" : "");
+                } else fprintf(stderr, "[VK] tier s1gemv: qmatmul_s1_mx.spv absent or invalid -- the generic GEMV stays%s\n",
+                               X->d ? " (dev2)" : "");
+                X->p_s1 = VK_NULL_HANDLE;
+            }
+        } else if (coli_vk_legacy() && !(s1 && *s1))
+            fprintf(stderr, "[VK] tier s1gemv: legacy (COLI_VK_LEGACY=1) -- the generic GEMV\n");
+    }
     if (act == COLI_VK_ACT_SWIGLU_V4 && !xb_v4_init(X)) return 0;
     X->ready = 1;
     return 1;
@@ -5215,6 +6172,29 @@ static int xb_grp_ok(const XbCtx *X, ColiVkExpert *const *ex, const int *rows, i
         }
         if (ok && xb_grp_bd_pipe((XbCtx *)X, 1, tg - 100) && xb_grp_bd_pipe((XbCtx *)X, 0, td - 100)) return 3;
     }
+    /* mode 4: the tier's native MXFP4 experts (fmt 7, its packed-scales twin 15), one
+     * layer's types, a big step (total >= grp_rows): the GEMV (mode 2) keeps the small
+     * ones below the threshold, the per-expert ops had these. One group a 32-input half:
+     * gs % 32 == 0; the whole batch one format (the shader reads its scales by the
+     * expert table's fmt entry). I % gs == 0 both builds (gate/up over D with g->gs,
+     * down over I with d->gs): the shader's scale index o*ng + k/gs floors ng = I/gs,
+     * so an input dim that is not a whole number of groups reads one scale word past
+     * the row's entries (native tensors are gs 32 with I % 64 == 0 -- the gate closes
+     * the hypothetical tail, it moves nothing today). */
+    if (X->grp_mx && total >= X->grp_rows && X->act == COLI_VK_ACT_SWIGLU && dr % X->align == 0 && ir % X->align == 0 &&
+        D % 64 == 0 && I % 64 == 0 && count > 0 &&
+        (ex[0]->g->fmt == 7 || ex[0]->g->fmt == 15) && ex[0]->d->fmt == ex[0]->g->fmt &&
+        ex[0]->g->gs >= 32 && ex[0]->g->gs % 32 == 0 && ex[0]->d->gs >= 32 && ex[0]->d->gs % 32 == 0 &&
+        D % ex[0]->g->gs == 0 && I % ex[0]->d->gs == 0) {
+        int ok = 1;
+        for (int c = 0; c < count && ok; c++) {
+            const ColiVkTensor *t[3] = {ex[c]->g, ex[c]->u, ex[c]->d};
+            for (int k = 0; k < 3; k++)
+                ok = ok && !t[k]->dev && t[k]->pool && t[k]->fmt == ex[0]->g->fmt && t[k]->rowWords % 4 == 0 &&
+                     t[k]->gs == (k < 2 ? ex[0]->g->gs : ex[0]->d->gs);
+        }
+        if (ok && xb_grp_mx_pipe((XbCtx *)X, 1) && xb_grp_mx_pipe((XbCtx *)X, 0)) return 4;
+    }
     if (!X->grp_rows || dr % X->align || ir % X->align) return 0;
     int mode = total >= X->grp_rows ? 1 : X->p_gv[0] ? 2 : 0;
     /* the grouped GEMV also computes SiTU and MXFP4 (Kimi K3, MiMo, DeepSeek V4.1): on a Radeon
@@ -5225,9 +6205,9 @@ static int xb_grp_ok(const XbCtx *X, ColiVkExpert *const *ex, const int *rows, i
     for (int c = 0; c < count; c++) {
         const ColiVkTensor *t[3] = {ex[c]->g, ex[c]->u, ex[c]->d};
         for (int k = 0; k < 3; k++) {
-            int f = t[k]->fmt;   /* MXFP4 (7) in the GEMV only */
-            if (t[k]->dev || !t[k]->pool || !(f == 1 || f == 2 || f == 4 || (f == 7 && mode == 2)) || t[k]->rowWords % 4 ||
-                ((f == 4 || f == 7) && (t[k]->gs < 8 || t[k]->gs % (mode == 2 ? 32 : 8)))) return 0;
+            int f = t[k]->fmt;   /* MXFP4 (7, and 15 packed) in the GEMV only */
+            if (t[k]->dev || !t[k]->pool || !(f == 1 || f == 2 || f == 4 || ((f == 7 || f == 15) && mode == 2)) || t[k]->rowWords % 4 ||
+                ((f == 4 || f == 7 || f == 15) && (t[k]->gs < 8 || t[k]->gs % (mode == 2 ? 32 : 8)))) return 0;
         }
         if (ex[c]->u->fmt != ex[c]->g->fmt || ex[c]->u->gs != ex[c]->g->gs) return 0;
     }
@@ -5251,9 +6231,9 @@ static int xb_grp_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *
      * of one (expert, block) adjacent, so workgroups in flight share weights */
     /* the GEMV's items: (expert, row, XB_GV_RPW outputs) */
     /* mode 3 (the block formats'): 32 rows, 64 outputs of the down and 32 of gate+up */
-    const int tm = mode == 1 ? (X->grp_q ? 32 : 16 * XB_GRP_TT) : mode == 3 ? 32 : 1;
-    const int bov[2] = {mode == 1 ? (X->grp_q ? 64 : 128) : mode == 3 ? 64 : XB_GV_RPW,
-                        mode == 1 ? (X->grp_q ? 32 : 128) : mode == 3 ? 32 : XB_GV_RPW};
+    const int tm = mode == 1 ? (X->grp_q ? 32 : 16 * XB_GRP_TT) : (mode == 3 || mode == 4) ? 32 : 1;
+    const int bov[2] = {mode == 1 ? (X->grp_q ? 64 : 128) : (mode == 3 || mode == 4) ? 64 : XB_GV_RPW,
+                        mode == 1 ? (X->grp_q ? 32 : 128) : (mode == 3 || mode == 4) ? 32 : XB_GV_RPW};
     int nit[2] = {0, 0};
     for (int c = 0; c < count; c++) {
         int nt = (rows[c] + tm - 1) / tm;
@@ -5284,7 +6264,7 @@ static int xb_grp_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *
             for (int ob = 0; ob < (O + bo - 1) / bo; ob++)
                 for (int t0 = 0; t0 < rows[c]; t0 += tm) {
                     /* the GEMM takes a block index, the GEMV its first output */
-                    uint32_t q[4] = {(uint32_t)c, (uint32_t)t0, (uint32_t)(mode == 1 || mode == 3 ? ob : ob * bo), 1};
+                    uint32_t q[4] = {(uint32_t)c, (uint32_t)t0, (uint32_t)(mode == 1 || mode == 3 || mode == 4 ? ob : ob * bo), 1};
                     memcpy(it + (size_t)n * 4, q, sizeof q); n++;
                 }
         }
@@ -5309,7 +6289,8 @@ static int xb_grp_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *
                 .dstBinding = (uint32_t)b, .descriptorCount = 1,
                 .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[b]};
         vkUpdateDescriptorSets(X->dev, 5, w, 0, NULL);
-        VkPipeline gp = mode == 3 ? xb_grp_bd_pipe(X, v, (v ? ex[0]->g : ex[0]->d)->fmt - 100) : mode == 1 ? X->p_grp[v] : X->p_gv[v];
+        VkPipeline gp = mode == 3 ? xb_grp_bd_pipe(X, v, (v ? ex[0]->g : ex[0]->d)->fmt - 100) :
+                        mode == 4 ? xb_grp_mx_pipe(X, v) : mode == 1 ? X->p_grp[v] : X->p_gv[v];
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gp);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->pl_grp, 0, 1, &X->grp_set[slot][v], 0, NULL);
         for (int i0n = 0; i0n < nit[v]; i0n += 65535) {   /* the grid's x limit every device has */
@@ -5319,7 +6300,7 @@ static int xb_grp_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *
         }
         if (!step) xb_barrier(cmd);
     }
-    if (mode == 1) X->grp_batches++; else X->gv_batches++;
+    if (mode == 1 || mode == 4) X->grp_batches++; else X->gv_batches++;
     return 1;
 }
 /* Record one batch laid out at off[] (its x rows already written) into cmd, with its
@@ -5327,7 +6308,7 @@ static int xb_grp_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *
  * *ngemm: how many experts took the GEMM route. 0 = nothing was submitted. */
 static int xb_record_submit(XbCtx *X, VkCommandBuffer cmd, VkFence fence, VkQueryPool qp, ColiVkExpert *const *ex,
                             const int *rows, int count, const size_t *off, int v4, int *ngemm_out,
-                            int slot, size_t x0, size_t i0, size_t y0, const int *amap) {
+                            int slot, size_t x0, size_t i0, size_t y0, const int *amap, int tail) {
     const int D = X->D, I = X->I;
     const size_t a = X->align, dr = (size_t)D * 4;
     if (vkResetCommandBuffer(cmd, 0) != VK_SUCCESS) return 0;
@@ -5447,18 +6428,32 @@ static int xb_record_submit(XbCtx *X, VkCommandBuffer cmd, VkFence fence, VkQuer
             int k = route[c], gemm = k >= 0;
             int bm = 8, bn = 1;
             if (k == XB_ROUTE_CGV) continue;   /* down on the chain's kernel already */
-            VkPipeline pipe = gemm ? xb_mm_pipeline(X, e->d, rows[c], k, &bm, &bn, &cooperative) : bd_fmt(e->d->fmt) ? X->p_mv_bd : X->p_mv;
+            VkPipeline pipe = gemm ? xb_mm_pipeline(X, e->d, rows[c], k, &bm, &bn, &cooperative)
+                                   : bd_fmt(e->d->fmt) ? X->p_mv_bd : xb_s1gemv_pick(X, e->d, rows[c]);
             if (pipe != bound) { vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe); bound = pipe; }
             uint32_t dyn[2] = {(uint32_t)off[3 * c + 1], (uint32_t)off[3 * c + 2]};
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->pl4, 0, 1, &e->s_dn, 2, dyn);
             struct PC pc = {e->d->fmt, rows[c], I, D, e->d->rowWords, e->d->gs};
             vkCmdPushConstants(cmd, X->pl4, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-            if (gemm) {
+            if (pipe == X->p_s1) {   /* the dedicated GEMV: S=1 by the pick, rows in x alone */
+                vkCmdDispatch(cmd, (uint32_t)((I + 7) / 8), 1, 1);
+                X->s1_gemvs++;
+            } else if (gemm) {
                 vkCmdDispatch(cmd, (uint32_t)((D + bm - 1) / bm), (uint32_t)((rows[c] + bn - 1) / bn), 1);
             } else vkCmdDispatch(cmd, (uint32_t)((D + 7) / 8), (uint32_t)rows[c], 1);
         }
     }
 recorded:
+    if (tail) {   /* COLI_VK_TIER_CS_DEVSUM: the decode group's row sum rides the batch's own submit, one fence for both */
+        VkMemoryBarrier tb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &tb, 0, NULL, 0, NULL);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->dsum.pipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->dsum.pl, 0, 1, &X->dsum.set, 0, NULL);
+        int pc[2] = {X->dsum.n, D};
+        vkCmdPushConstants(cmd, X->dsum.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+        vkCmdDispatch(cmd, (uint32_t)((D + 255) / 256), 1, 1);
+    }
     /* the host reads y after the fence */
     VkMemoryBarrier hb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
@@ -5471,6 +6466,7 @@ recorded:
     if (vk_submit(X->d, X->q, &si, fence) != VK_SUCCESS) {
         fprintf(stderr, "[VK] %sexpert batch: submit failed, %s\n", X->d ? "dev2 " : "",
                 X->d ? "the second device stops" : "the tier stops");
+        coli_vk_degrade(COLI_VK_DEGRADE, "expert batch submit", "the submit failed: the tier stops");
         X->ready = 0; return 0;
     }
     *ngemm_out = ngemm;
@@ -5483,6 +6479,10 @@ static int xb_busy(XbCtx *X) { return X->inflight || X->sub[0].inflight || X->su
 static int xb_issue(XbCtx *X, ColiVkExpert *const *ex, const int *rows, int count, const float *const *xrows,
                     const float *wrows) {
     if (!X->ready || xb_busy(X) || count < 1) return 0;
+    /* the tail sum's arm is consumed by THIS issue, success or failure: nothing after
+     * it may carry a stale arm (coli_vk_xb_sum_arm armed it for this group alone) */
+    int tail = X->dsum.want;
+    X->dsum.want = X->dsum.rec = X->dsum.done = 0;
     const size_t a = X->align, dr = (size_t)X->D * 4;
     /* COLI_VK_ACT_SWIGLU_V4: each expert's row weights follow its x rows */
     const int v4 = X->act == COLI_VK_ACT_SWIGLU_V4 && X->p_v4;
@@ -5511,10 +6511,25 @@ static int xb_issue(XbCtx *X, ColiVkExpert *const *ex, const int *rows, int coun
         }
     free(first);
     X->nrows = total;
+    if (tail && (!X->dsum.pipe || total != X->dsum.n)) tail = 0;   /* a refused arm: the join's row path */
+    if (tail) {   /* the tail's row table: y's offsets in floats, its descriptors over the scratch as it is now */
+        uint32_t *ro = X->dsum.off.ptr;
+        for (int j = 0; j < total; j++) ro[j] = (uint32_t)(X->yoff[j] >> 2);
+        VkDescriptorBufferInfo bi[3] = {{X->y.buf, 0, X->y.region}, {X->dsum.off.buf, 0, (size_t)total * 4},
+                                        {X->dsum.out.buf, 0, (size_t)X->D * 4}};
+        VkWriteDescriptorSet wr[3];
+        for (int b = 0; b < 3; b++)
+            wr[b] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = X->dsum.set,
+                .dstBinding = (uint32_t)b, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pBufferInfo = &bi[b]};
+        vkUpdateDescriptorSets(X->dev, 3, wr, 0, NULL);
+        X->dsum.rec = 1;
+    }
     int ngemm = 0;
-    int ok = xb_record_submit(X, X->cmd, X->fence, X->qpool, ex, rows, count, off, v4, &ngemm, 0, 0, 0, 0, NULL);
+    int ok = xb_record_submit(X, X->cmd, X->fence, X->qpool, ex, rows, count, off, v4, &ngemm, 0, 0, 0, 0, NULL, tail);
     free(off);
     if (!ok) return 0;
+    X->dsum.done = tail;
     X->inflight = 1; async_begin(X->d);
     X->batches++; X->experts += (unsigned long long)count; X->rows += (unsigned long long)total;
     X->gemm_experts += (unsigned long long)ngemm;
@@ -5543,31 +6558,54 @@ static int dev2_fault(void) {
     fprintf(stderr, "[VK] COLI_VK_DEV2_FAULT: batch #%ld on the second device fails\n", at);
     return 1;
 }
-static int xb_join(XbCtx *X, const float **yrows, double *device_ms) {
+/* xb_join; when the batch carried the tail sum (coli_vk_xb_sum_arm, COLI_VK_TIER_CS_DEVSUM)
+ * *sum = its ONE merged row beside the rows (still handed out: the tail only adds a
+ * dispatch, the y rows it read stay valid until the next issue); *sum = NULL and the
+ * rows alone on every other join. The sum's own device time is inside the batch's
+ * timestamp span (the dispatch rides its submit). */
+static int xb_join2(XbCtx *X, const float **yrows, const float **sum, double *device_ms) {
+    if (sum) *sum = NULL;
     if (!X->inflight) return 0;
     X->inflight = 0;
+    int cd = cs_dprof_on();
+    if (cd) cs_diag_thread_check();   /* the fence/qread delta brackets assume this one thread */
+    double t0 = cd ? vk_now() : 0;
     VkResult r = !X->d && wait_fault() ? VK_TIMEOUT : vk_fence_wait(X->dev, X->fence);
+    if (cd) { X->csd.fence_ms += vk_now() - t0; X->csd.fences++; }
     if (r == VK_SUCCESS && X->d && dev2_fault()) r = VK_ERROR_DEVICE_LOST;
     if (r != VK_SUCCESS) {   /* no async_end: the batch may still run */
         fprintf(stderr, "[VK] %sexpert batch: fence wait failed (%d), %s\n", X->d ? "dev2 " : "", r,
                 X->d ? "the second device stops" : "the tier stops");
+        coli_vk_degrade(COLI_VK_DEGRADE, "expert batch fence", "the batch's wait failed: the tier stops");
         X->ready = 0;
         if (X->d) __atomic_store_n(&G2.ready, 0, __ATOMIC_RELEASE);   /* lost: nothing else runs there */
+        X->dsum.done = X->dsum.want = X->dsum.rec = 0;
         return 0;
     }
     async_end(X->d);
     double ms = 0;
     if (X->has_ts) {
         uint64_t ts[2];
-        if (vkGetQueryPoolResults(X->dev, X->qpool, 0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+        double t1 = cd ? vk_now() : 0;
+        VkResult qr = vkGetQueryPoolResults(X->dev, X->qpool, 0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT);
+        if (cd) { X->csd.qread_ms += vk_now() - t1; X->csd.qreads++; }
+        if (qr == VK_SUCCESS) {
             uint64_t mask = X->ts_bits >= 64 ? ~0ull : ((1ull << X->ts_bits) - 1);
             ms = (double)((ts[1] - ts[0]) & mask) * X->ts_period / 1e6;
         }
     }
     X->dev_ms += ms;
     if (device_ms) *device_ms = ms;
+    if (sum && X->dsum.done) {   /* the tail ran: one merged row back, its rows beside it */
+        *sum = X->dsum.out.ptr;
+        X->dsum.sums++; X->dsum.done = 0;
+    }
+    X->dsum.want = X->dsum.rec = 0;
     for (int j = 0; j < X->nrows; j++) yrows[j] = (const float *)((const uint8_t *)X->y.ptr + X->yoff[j]);
     return 1;
+}
+static int xb_join(XbCtx *X, const float **yrows, double *device_ms) {
+    return xb_join2(X, yrows, NULL, device_ms);
 }
 int coli_vk_xb_join(const float **yrows, double *device_ms) { return xb_join(&g_xb[0], yrows, device_ms); }
 int coli_vk_xb_join_dev(int dev, const float **yrows, double *device_ms) {
@@ -5585,10 +6623,36 @@ static void xb_stats(const XbCtx *X, ColiVkXbStats *st) {
     st->sub_gemm = X->sub_gemm; st->sub_ms = X->sub_ms;
     st->cooperative_matmuls = X->cooperative_matmuls; st->grouped_batches = X->grp_batches; st->gemv_batches = X->gv_batches;
     st->chain_gemv_batches = X->cgv_batches + X->cbd_batches;
+    st->s1_gemvs = X->s1_gemvs;
 }
 void coli_vk_xb_stats(ColiVkXbStats *st) { xb_stats(&g_xb[0], st); }
+/* COLI_VK_V4_S1GEMV's state on a device (0 primary, 1 the second): 1 the dedicated
+ * fmt-15 S=1 GEMV armed past its parity leg, 0 the generic form (lever off, shader
+ * absent, or the leg refused). coli_vk_xb_s1gemv_force overrides the pick for tests
+ * in-process (0 off, 1 on where armed, -1 the lever's own state). */
+int coli_vk_xb_s1gemv_armed(int dev) {
+    return dev == 0 || dev == 1 ? g_xb[dev].s1_ok && g_xb[dev].p_s1 != VK_NULL_HANDLE : 0;
+}
+void coli_vk_xb_s1gemv_force(int v) { g_s1_forced = v; }
 void coli_vk_xb_stats_dev(int dev, ColiVkXbStats *st) {
     if (dev == 0 || dev == 1) xb_stats(&g_xb[dev], st); else memset(st, 0, sizeof(*st));
+}
+void coli_vk_cs_diag(ColiVkCsDiag *out) {
+    memset(out, 0, sizeof *out);
+    if (cs_dprof_on()) cs_diag_thread_check();   /* the snapshotter claims the delta thread too */
+    out->slab_creates = g_cs_diag.slab_creates;
+    out->slab_hits = g_cs_diag.slab_hits;
+    out->slab_create_ms = g_cs_diag.slab_create_ms;
+    out->slab_hit_ms = g_cs_diag.slab_hit_ms;
+    out->slab_zeros = g_cs_diag.slab_zeros;
+    out->slab_zero_ms = g_cs_diag.slab_zero_ms;
+    out->alias_buf_destroys = g_cs_diag.alias_buf_destroys;
+    out->alias_buf_destroy_ms = g_cs_diag.alias_buf_destroy_ms;
+    out->xb_foreign_joins = g_cs_diag.xb_foreign_joins;
+    for (int d = 0; d < 2; d++) {
+        out->xb_fence_ms[d] = g_xb[d].csd.fence_ms; out->xb_fences[d] = g_xb[d].csd.fences;
+        out->xb_qread_ms[d] = g_xb[d].csd.qread_ms; out->xb_qreads[d] = g_xb[d].csd.qreads;
+    }
 }
 
 /* ---- sub-batches: a big prefill step as several batches, two in flight ----------------
@@ -5715,7 +6779,7 @@ int coli_vk_xb_sub_issue(int h, ColiVkExpert *const *ex, const int *rows, int co
     free(first);
     X->sub[h].nrows = total;
     int ngemm = 0;
-    int ok = xb_record_submit(X, X->sub[h].cmd, X->sub[h].fence, X->sub[h].qp, ex, rows, count, off, v4, &ngemm, 1 + h, x0, i0, y0, NULL);
+    int ok = xb_record_submit(X, X->sub[h].cmd, X->sub[h].fence, X->sub[h].qp, ex, rows, count, off, v4, &ngemm, 1 + h, x0, i0, y0, NULL, 0);
     free(off);
     if (!ok) return 0;
     X->sub[h].inflight = 1; async_begin(X->d);
@@ -5731,6 +6795,7 @@ int coli_vk_xb_sub_join(int h, float *const *yout, double *device_ms) {
     VkResult r = wait_fault() ? VK_TIMEOUT : vk_fence_wait_gemm(X->dev, X->sub[h].fence);
     if (r != VK_SUCCESS) {   /* no async_end: the batch may still run */
         fprintf(stderr, "[VK] expert batch: fence wait failed (%d), the tier stops\n", r);
+        coli_vk_degrade(COLI_VK_DEGRADE, "expert batch fence", "the sub-batch's wait failed: the tier stops");
         X->ready = 0; return 0;
     }
     async_end(X->d);
@@ -5770,6 +6835,51 @@ static int st_buf(XbCtx *X, XbBuf *b, size_t bytes, uint32_t memtype) {
     b->region = r;
     return 1;
 }
+/* the decode group's tail-sum pipeline (expert_sum_dec.spv), made on the first arm:
+ * shader, layout, pipeline, one set of three storage buffers. 0 (once, never retried):
+ * the shader is absent or the device refused -- the group keeps the join's row path. */
+static int xb_dsum_init(XbCtx *X) {
+    if (X->dsum.tried) return X->dsum.pipe != VK_NULL_HANDLE;
+    X->dsum.tried = 1;
+    char ds[1100];
+    derive_dir_file(X->spv, "expert_sum_dec.spv", ds, sizeof ds);
+    if (!(X->dsum.sh = load_spv(X->dev, ds)) ||
+        !xb_layout(X, 3, 0u, 2 * sizeof(int), &X->dsum.dsl, &X->dsum.pl) ||
+        !xb_pipeline(X, X->dsum.sh, X->dsum.pl, NULL, &X->dsum.pipe)) { X->dsum.pipe = VK_NULL_HANDLE; return 0; }
+    VkDescriptorPoolSize ps3 = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
+    VkDescriptorPoolCreateInfo dp3 = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps3};
+    if (vkCreateDescriptorPool(X->dev, &dp3, NULL, &X->dsum.pool) != VK_SUCCESS) {
+        X->dsum.pool = VK_NULL_HANDLE; X->dsum.pipe = VK_NULL_HANDLE; return 0;
+    }
+    VkDescriptorSetAllocateInfo da3 = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = X->dsum.pool, .descriptorSetCount = 1, .pSetLayouts = &X->dsum.dsl};
+    if (vkAllocateDescriptorSets(X->dev, &da3, &X->dsum.set) != VK_SUCCESS) {
+        vkDestroyDescriptorPool(X->dev, X->dsum.pool, NULL);
+        X->dsum.pool = VK_NULL_HANDLE; X->dsum.set = VK_NULL_HANDLE; X->dsum.pipe = VK_NULL_HANDLE;
+        return 0;
+    }
+    return 1;
+}
+/* COLI_VK_TIER_CS_DEVSUM: arm the NEXT single batch's submit on the primary device
+ * with the tail dispatch that sums its n rows on the device (expert_sum_dec.spv) -- the
+ * finish site's host merge (each row bf16 rounded, added in row order) done on the
+ * device, one row back instead of n. The arm is consumed by that issue whatever it
+ * does (a refused tail leaves the join's row path, the rows always valid); 0: the
+ * pipeline, the scratch or the row count refused. */
+int coli_vk_xb_sum_arm(int n) {
+    XbCtx *X = &g_xb[0];
+    if (!X->ready || xb_busy(X) || n < 1 || !xb_dsum_init(X)) return 0;
+    if (!st_buf(X, &X->dsum.off, (size_t)n * 4, X->mt_host) ||
+        !st_buf(X, &X->dsum.out, (size_t)X->D * 4, X->mt_cached)) return 0;
+    X->dsum.n = n;
+    X->dsum.want = 1;
+    return 1;
+}
+/* the armed join: xb_join's contract and, when the tail ran, its one merged row */
+int coli_vk_xb_join_sum(const float **yrows, const float **sum, double *device_ms) {
+    return xb_join2(&g_xb[0], yrows, sum, device_ms);
+}
 float *coli_vk_xb_step_begin(int S, int K, const float *x) {
     XbCtx *X = &g_xb[0];
     if (!X->ready || !X->st.pipe || !X->grp_rows || xb_busy(X) || S < 1 || K < 1) return NULL;
@@ -5808,7 +6918,7 @@ int coli_vk_xb_sub_issue_step(int h, ColiVkExpert *const *ex, const int *rows, i
     X->sub[h].nrows = 0;   /* the rows are in ys already: nothing to copy at the join */
     int ngemm = 0;
     int ok = xb_record_submit(X, X->sub[h].cmd, X->sub[h].fence, X->sub[h].qp, ex, rows, count, off, 0, &ngemm,
-                              1 + h, x0, i0, y0, assign);
+                              1 + h, x0, i0, y0, assign, 0);
     free(off);
     if (!ok) return 0;
     X->sub[h].inflight = 1; async_begin(X->d);
@@ -5852,7 +6962,9 @@ const float *coli_vk_xb_step_sum(const float *w, const uint8_t *use, double *dev
     async_begin(X->d);
     VkResult r = vk_fence_wait_gemm(X->dev, X->fence);
     if (r != VK_SUCCESS) {   /* no async_end: the sum may still run */
-        fprintf(stderr, "[VK] expert batch: the step's sum failed (%d)\n", r); X->ready = 0; return NULL;
+        fprintf(stderr, "[VK] expert batch: the step's sum failed (%d)\n", r);
+        coli_vk_degrade(COLI_VK_DEGRADE, "expert batch sum", "the step's sum failed: the tier stops");
+        X->ready = 0; return NULL;
     }
     async_end(X->d);
     double ms = 0;
@@ -5889,8 +7001,9 @@ static void xb_shutdown(XbCtx *X) {
         if (X->sh_grp_bd[v]) vkDestroyShaderModule(X->dev, X->sh_grp_bd[v], NULL);
     }
     if (X->grp_pool) vkDestroyDescriptorPool(X->dev, X->grp_pool, NULL);
-    XbBuf *sb[8] = {&X->st.xt, &X->st.ys, &X->st.out, &X->st.w, &X->st.use, &X->grp_map[0], &X->grp_map[1], &X->grp_map[2]};
-    for (int k = 0; k < 8; k++) if (sb[k]->buf) { vkDestroyBuffer(X->dev, sb[k]->buf, NULL); vkFreeMemory(X->dev, sb[k]->mem, NULL); }
+    XbBuf *sb[10] = {&X->st.xt, &X->st.ys, &X->st.out, &X->st.w, &X->st.use, &X->grp_map[0], &X->grp_map[1], &X->grp_map[2],
+                     &X->dsum.off, &X->dsum.out};
+    for (int k = 0; k < 10; k++) if (sb[k]->buf) { vkDestroyBuffer(X->dev, sb[k]->buf, NULL); vkFreeMemory(X->dev, sb[k]->mem, NULL); }
     for (int k = 0; k < 15; k++) {
         XbBuf *cb = k < 3 ? &X->cgv_ids[k] : k < 6 ? &X->cgv_tab[k - 3] : k < 9 ? &X->cbd_ids[k - 6] : k < 12 ? &X->cbd_tab[k - 9] : &X->cbd_h[k - 12];
         if (cb->buf) { vkDestroyBuffer(X->dev, cb->buf, NULL); vkFreeMemory(X->dev, cb->mem, NULL); }
@@ -5900,11 +7013,16 @@ static void xb_shutdown(XbCtx *X) {
     if (X->st.pool) vkDestroyDescriptorPool(X->dev, X->st.pool, NULL);
     if (X->st.pl) vkDestroyPipelineLayout(X->dev, X->st.pl, NULL);
     if (X->st.dsl) vkDestroyDescriptorSetLayout(X->dev, X->st.dsl, NULL);
+    if (X->dsum.pipe) vkDestroyPipeline(X->dev, X->dsum.pipe, NULL);
+    if (X->dsum.sh) vkDestroyShaderModule(X->dev, X->dsum.sh, NULL);
+    if (X->dsum.pool) vkDestroyDescriptorPool(X->dev, X->dsum.pool, NULL);
+    if (X->dsum.pl) vkDestroyPipelineLayout(X->dev, X->dsum.pl, NULL);
+    if (X->dsum.dsl) vkDestroyDescriptorSetLayout(X->dev, X->dsum.dsl, NULL);
     for (int v = 0; v < 2; v++) {
         if (X->p_gv[v]) vkDestroyPipeline(X->dev, X->p_gv[v], NULL);
         if (X->sh_gv[v]) vkDestroyShaderModule(X->dev, X->sh_gv[v], NULL);
     }
-    for (int f = 0; f < 4; f++) for (int v = 0; v < 2; v++) if (X->p_cgv[f][v]) vkDestroyPipeline(X->dev, X->p_cgv[f][v], NULL);
+    for (int f = 0; f < 5; f++) for (int v = 0; v < 2; v++) if (X->p_cgv[f][v]) vkDestroyPipeline(X->dev, X->p_cgv[f][v], NULL);
     for (int k = 0; k < X->cbd_np; k++) if (X->cbd_p[k].p) vkDestroyPipeline(X->dev, X->cbd_p[k].p, NULL);
     if (X->sh_cbd) vkDestroyShaderModule(X->dev, X->sh_cbd, NULL);
     if (X->pl_cbd) vkDestroyPipelineLayout(X->dev, X->pl_cbd, NULL);
@@ -5928,8 +7046,10 @@ static void xb_shutdown(XbCtx *X) {
     if (X->sh_mm) vkDestroyShaderModule(X->dev, X->sh_mm, NULL);
     if (X->p_gu_bd) vkDestroyPipeline(X->dev, X->p_gu_bd, NULL);
     if (X->p_mv_bd) vkDestroyPipeline(X->dev, X->p_mv_bd, NULL);
+    if (X->p_s1) vkDestroyPipeline(X->dev, X->p_s1, NULL);
     if (X->sh_gu_bd) vkDestroyShaderModule(X->dev, X->sh_gu_bd, NULL);
     if (X->sh_mv_bd) vkDestroyShaderModule(X->dev, X->sh_mv_bd, NULL);
+    if (X->sh_s1) vkDestroyShaderModule(X->dev, X->sh_s1, NULL);
     for (int t = 0; t < 64; t++) if (X->p_mm_bd[t]) vkDestroyPipeline(X->dev, X->p_mm_bd[t], NULL);
     if (X->sh_mm_bd) vkDestroyShaderModule(X->dev, X->sh_mm_bd, NULL);
     for (int k = 0; k < VK_COOP_SLOTS; k++) if (X->p_coop[k]) vkDestroyPipeline(X->dev, X->p_coop[k], NULL);
@@ -5958,7 +7078,12 @@ static void xb_shutdown(XbCtx *X) {
  * calls this; the pool's lock is the only shared state it touches. */
 int coli_vk_tier_tensor_pad(int dev, ColiVkTensor **t, int fmt, int I, int O, int gs, size_t pad_w, size_t pad_s,
                             uint8_t **rows, size_t *stride, float **scales) {
-    if ((dev == 1 ? !G2.ready : !G.ready) || !fmt_uploadable(fmt, gs) || (dev == 2 && !coli_vk_tier_host_pool())) return 0;
+    if (dev == 1 ? !G2.ready : !G.ready) return 0;
+    if (!fmt_uploadable(fmt, gs)) {
+        coli_vk_degrade(COLI_VK_REFUSE, "fmt_uploadable", "the format has no device form");
+        return 0;
+    }
+    if (dev == 2 && !coli_vk_tier_host_pool()) return 0;
     void *w, *s;
     ColiVkTensor *n = tensor_alloc_pad(dev == 2 ? &g_hpool : dev == 1 ? &g_tpool2 : &g_tpool, fmt, I, O, gs, pad_w, pad_s, &w, &s);
     if (!n) return 0;
@@ -5970,7 +7095,7 @@ int coli_vk_tier_tensor_dev(int dev, ColiVkTensor **t, int fmt, int I, int O, in
     return coli_vk_tier_tensor_pad(dev, t, fmt, I, O, gs, 0, 0, rows, stride, scales);
 }
 size_t coli_vk_tensor_alloc_bytes(int fmt, int I, int O, int gs, size_t *scale_bytes) {
-    if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) { if (gs < 1) return 0; } else gs = 0;
+    if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13 || fmt == 15) { if (gs < 1) return 0; } else gs = 0;
     if (scale_bytes) *scale_bytes = scale_floats(fmt, I, O, gs) * sizeof(float);
     return (size_t)rowwords(fmt, I) * 4 * (size_t)O;
 }
@@ -5980,7 +7105,11 @@ int coli_vk_tier_tensor(ColiVkTensor **t, int fmt, int I, int O, int gs,
 }
 int coli_vk_tier_tensor_extra(ColiVkTensor **t, int fmt, int I, int O, int gs,
                               uint8_t **rows, size_t *stride, float **scales) {
-    if (!G.ready || !fmt_uploadable(fmt, gs)) return 0;
+    if (!G.ready) return 0;
+    if (!fmt_uploadable(fmt, gs)) {
+        coli_vk_degrade(COLI_VK_REFUSE, "fmt_uploadable", "the format has no device form");
+        return 0;
+    }
     void *w, *s;
     ColiVkTensor *n = tensor_alloc(&g_xpool, fmt, I, O, gs, &w, &s);
     if (!n) return 0;
@@ -6137,7 +7266,7 @@ int coli_vk_tensor_refill(ColiVkTensor *t, uint8_t **rows, size_t *stride, float
 int coli_vk_tensor_refill_as(ColiVkTensor *t, int fmt, int I, int O, int gs,
                              uint8_t **rows, size_t *stride, float **scales) {
     if (!G.ready || !t || t->pool != &g_tpool) return 0;
-    if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) { if (gs < 1) return 0; } else gs = 0;
+    if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13 || fmt == 15) { if (gs < 1) return 0; } else gs = 0;
     if (t->fmt != fmt || t->I != I || t->O != O || t->gs != gs) {
         if (!fmt_uploadable(fmt, gs) || bd_fmt(fmt) != bd_fmt(t->fmt)) return 0;   /* its sets name the table or its scales */
         size_t wb = (size_t)rowwords(fmt, I) * 4 * (size_t)O, sb = scale_floats(fmt, I, O, gs) * sizeof(float);
@@ -6173,7 +7302,7 @@ int coli_vk_set_vq2_books(const int8_t *a, const int8_t *b) {
     return built && !same ? -1 : 0;
 }
 size_t coli_vk_tensor_payload(int fmt, int I, int O, int gs) {
-    if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) { if (gs < 1) return 0; } else gs = 0;
+    if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13 || fmt == 15) { if (gs < 1) return 0; } else gs = 0;
     return (size_t)rowwords(fmt, I) * 4 * (size_t)O + scale_floats(fmt, I, O, gs) * sizeof(float);
 }
 size_t coli_vk_buffer_alignment(void) { return G.buf_align ? G.buf_align : 256; }
@@ -6296,6 +7425,7 @@ void coli_vk_shutdown(void) {
     g_async_inflight[0] = 0;   /* idle after vkDeviceWaitIdle: the deferred frees run now */
     tensor_reap(0);
     bdtab_free(0);
+    coli_vk_slabreg_reset();   /* the registry's slabs and arena blocks (the store freed its slots first) */
     pthread_mutex_lock(&g_imports_mx);   /* imported rows: their memory objects go before the device */
     for (ColiVkTensor *t = g_imports; t; t = t->imp_next) {
         vkDestroyBuffer(G.dev, t->wbuf, NULL); vkFreeMemory(G.dev, t->imp, NULL);
@@ -6356,7 +7486,10 @@ int coli_vk_tensor_info(const ColiVkTensor *t, ColiVkTensorInfo *o) {
     return 1;
 }
 /* A fence the chain waited on failed: the device is gone, everyone falls back. */
-void coli_vk_mark_lost(void) { G.ready = 0; }
+void coli_vk_mark_lost(void) {
+    coli_vk_degrade(COLI_VK_DEGRADE, "device lost", "a fence the chain waited on failed: GPU offload disabled");
+    G.ready = 0;
+}
 
 /* ---- the dense chain on either device (vk_chain.c keeps a context per device) --------
  * d = 0 is the primary device, what the calls without _dev answer; d = 1 is COLI_VK_DEV2's
@@ -6378,7 +7511,15 @@ int coli_vk_core_dev(int d, ColiVkCore *o) {
     return 1;
 }
 int coli_vk_available_dev(int d) { return d == 1 ? G2.ready : G.ready; }
-void coli_vk_mark_lost_dev(int d) { if (d == 1) G2.ready = 0; else G.ready = 0; }
+void coli_vk_mark_lost_dev(int d) {
+    if (d == 1) {
+        coli_vk_degrade(COLI_VK_DEGRADE, "dev2 lost", "a fence the chain waited on failed: dev2's experts go back to the CPU");
+        G2.ready = 0;
+    } else {
+        coli_vk_degrade(COLI_VK_DEGRADE, "device lost", "a fence the chain waited on failed: GPU offload disabled");
+        G.ready = 0;
+    }
+}
 int coli_vk_queue_submit_dev(int d, void *queue, const void *submit_info, void *fence) {
     return (int)vk_submit(d == 1 ? 1 : 0, (VkQueue)queue, (const VkSubmitInfo *)submit_info, (VkFence)fence);
 }
@@ -6440,10 +7581,11 @@ static size_t ref_rowbytes(int fmt, int I) {
     return fmt == 1 || fmt == 12 || fmt == 13 ? (size_t)I : fmt == 5 ? (size_t)((I + 63) / 64) * 24
          : fmt == 10 ? (size_t)I * 4 : fmt == 11 || fmt == 14 ? (size_t)I * 2 : (size_t)(I + 1) / 2;
 }
-static size_t ref_scales(int fmt, int I, int O) {   // scale COUNT (per-group for fmt 4/5)
+static size_t ref_scales(int fmt, int I, int O) {   // scale COUNT (per-group for fmt 4/5; fmt 15: ue8m0 BYTES)
     if (fmt == 10 || fmt == 11 || fmt == 14) return 1;
     if (fmt == 5) return (size_t)O * (size_t)((I + 63) / 64);
     if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) return (size_t)O * (size_t)((I + g_ref_gs - 1) / g_ref_gs);
+    if (fmt == 15) return (size_t)O * (size_t)((I + g_ref_gs - 1) / g_ref_gs);
     return (size_t)O;
 }
 static float deq(const uint8_t *row, int fmt, int i) {
@@ -6464,22 +7606,26 @@ static float deq(const uint8_t *row, int fmt, int i) {
         unsigned u = ((lo[j >> 2] >> ((j & 3) * 2)) & 3u) | (((hi[j >> 3] >> (j & 7)) & 1u) << 2);
         return (float)((int)u - 4); }
     uint8_t v = row[i >> 1]; int nib = (i & 1) ? (v >> 4) : (v & 15);
-    if (fmt == 7) { static const float e2m1[8] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6};   /* MXFP4 */
+    if (fmt == 7 || fmt == 15) { static const float e2m1[8] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6};   /* MXFP4 */
                     return (nib & 8) ? -e2m1[nib & 7] : e2m1[nib & 7]; }
     return (float)(nib - 8);
 }
 
+static float ref_scale(const float *sc, size_t at, int fmt) {   /* fmt 15: a ue8m0 byte, its float the exponent */
+    if (fmt == 15) { uint32_t u = (uint32_t)((const uint8_t *)sc)[at] << 23; float f; memcpy(&f, &u, 4); return f; }
+    return sc[at];
+}
 static void cpu_ref(float *y, const float *x, const uint8_t *w, const float *sc,
                     int fmt, int S, int I, int O) {
     size_t rb = ref_rowbytes(fmt, I);
-    int gw2 = (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) ? g_ref_gs : 64, ng = (I + gw2 - 1) / gw2;
+    int gw2 = (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13 || fmt == 15) ? g_ref_gs : 64, ng = (I + gw2 - 1) / gw2;
     for (int s = 0; s < S; s++) for (int o = 0; o < O; o++) {
         double sum = 0; const uint8_t *row = w + (size_t)o * rb;
-        if (fmt == 5 || fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) {   // per-group scales fold inside the sum
+        if (fmt == 5 || fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13 || fmt == 15) {   // per-group scales fold inside the sum
             for (int g = 0; g < ng; g++) {
                 double a = 0; int end = (g + 1) * gw2 < I ? (g + 1) * gw2 : I;
                 for (int i = g * gw2; i < end; i++) a += x[s * I + i] * deq(row, fmt, i);
-                sum += a * sc[(size_t)o * ng + g];
+                sum += a * ref_scale(sc, (size_t)o * ng + g, fmt);
             }
             y[s * O + o] = (float)sum;
         } else {
@@ -6538,6 +7684,8 @@ static void case_fill(int fmt, int S, int I, int O, float **x, uint8_t **w, floa
             memcpy(*w + i * 2, &h, 2);
         }
     for (size_t o = 0; o < nsc; o++) (*sc)[o] = 0.01f + (rand() % 100) / 10000.0f;
+    if (fmt == 15)      /* ue8m0 exponents, the band real MXFP4 data quantises to */
+        for (size_t o = 0; o < nsc; o++) ((uint8_t *)*sc)[o] = (uint8_t)(118 + rand() % 4);
 }
 
 static int run_case(int fmt, int S, int I, int O, int iters) {
@@ -7127,6 +8275,7 @@ static void bench_import(void) {
         free(w); free(w0); free(x); free(sc); free(y);
     }
 }
+static int run_xbatch_alias(void);   /* an import case: runs in run_late_cases, past the compared digest */
 static int run_late_cases(void) {
     if (getenv("COLI_VK_TEST_IMPORT_BENCH") && atoi(getenv("COLI_VK_TEST_IMPORT_BENCH"))) bench_import();
     uint64_t keep = g_digest;
@@ -7144,6 +8293,36 @@ static int run_late_cases(void) {
     bad |= run_import_case(10, 3, 1024, 100);
     bad |= run_import_case(14, 1, 4096, 257);
     bad |= run_import_case(14, 96, 4096, 257);
+    {   /* fmt 15 is the tier's form (its scales ue8m0 bytes, uploaded by vk_tier.c's
+         * convert): the plain upload and the import both refuse it -- either would hand
+         * the shaders the bytes as float scales, the import also a tensor of gs 0 */
+        float *x, *sc; uint8_t *w; case_fill(15, 1, 512, 512, &x, &w, &sc);
+        ColiVkTensor *t = NULL;
+        int up = coli_vk_tensor_ensure(&t, w, sc, 15, 512, 512, 32);
+        if (up) { coli_vk_tensor_free(t); t = NULL; }
+        int im = 0;
+        size_t al = coli_vk_import_alignment();
+        if (al) {   /* a device that can import: the refusal is fmt 15's, not the gate's */
+            size_t bytes = ref_rowbytes(15, 512) * 512, sz = (bytes + al - 1) / al * al;
+            void *host = NULL;
+            if (!posix_memalign(&host, al, sz)) {
+                t = NULL;
+                im = coli_vk_tensor_import(&t, host, sz, sc, 15, 512, 512, 32);
+                free(host);
+            }
+        }
+        if (up || im) { printf("fmt 15: upload %d, import %d -- the tier's form must be refused\n", up, im); bad = 1; }
+        coli_vk_tensor_free(t);
+        free(x); free(w); free(sc);
+    }
+    /* The aliased slab records last, with the import cases: like them they alias host
+     * memory the device imports (VK_EXT_external_memory_host), which staged uploads have
+     * none of, and the case says so and skips there. Past the compared digest that skip
+     * is quiet: inside the digest's cases it shifted the shared rand() stream (the case
+     * draws its weights only when it runs), so every case after it -- the absorb core,
+     * the pair -- digested different inputs mapped than staged, and the staged leg's
+     * digest compare failed (bucket G of PR #2539's census). */
+    bad |= run_xbatch_alias();   /* the compute-site lever's zero-copy experts */
     printf("f16 and import digest %016llx\n", (unsigned long long)g_digest);
     g_digest = keep;
     return bad;
@@ -7160,7 +8339,7 @@ static double xref_dot(const float *x, const uint8_t *row, const float *sc, int 
     for (int k = 0; k < ng; k++) {
         double a = 0; int end = (k + 1) * g < I ? (k + 1) * g : I;
         for (int i = k * g; i < end; i++) a += x[i] * deq(row, fmt, i);
-        sum += a * sc[(size_t)o * ng + k];
+        sum += a * ref_scale(sc, (size_t)o * ng + k, fmt);
     }
     return sum;
 }
@@ -7183,7 +8362,12 @@ static int xmat_make(XMat *m, int fmt, int I, int O, int gs) {
     if (!coli_vk_tier_tensor(&m->t, fmt, I, O, gs, &rows, &stride, &scales)) return 0;
     size_t rb = coli_vk_tensor_row_bytes(fmt, I), ns = coli_vk_tensor_scale_count(fmt, I, O, gs);
     for (int o = 0; o < O; o++) memcpy(rows + (size_t)o * stride, m->w + (size_t)o * rb, rb);
-    if (fmt == 10 || fmt == 11) scales[0] = 1.0f; else memcpy(scales, m->s, ns * sizeof(float));
+    if (fmt == 10 || fmt == 11) scales[0] = 1.0f;
+    else if (fmt == 15) {   /* ue8m0 bytes, padded to the words the pool counts */
+        size_t nb = (size_t)O * (((size_t)I + gs - 1) / gs);
+        memcpy(scales, m->s, nb);
+        memset((uint8_t *)scales + nb, 0, ns * 4 - nb);
+    } else memcpy(scales, m->s, ns * sizeof(float));
     return coli_vk_tensor_commit(&m->t, 1);
 }
 static void xmat_drop(XMat *m) { free(m->w); free(m->s); m->w = NULL; m->s = NULL; }
@@ -7273,8 +8457,8 @@ static int run_xbatch(int fmt, int dfmt, int gs, int D, int I, int act, float li
     /* the small experts on the chain's decode kernel (xb_cgv_record) where no grouped route
      * takes the batches: the first one's beside the GEMMs, the two after it whole */
     unsigned long long cgv = g_xb[0].cgv_batches - cgv_before;
-    int cf = (fmt == 1 || fmt == 2 || (fmt == 4 && gs % 8 == 0) || (fmt == 7 && gs % 32 == 0)) &&
-             (dfmt == 1 || dfmt == 2 || (dfmt == 4 && gs % 8 == 0) || (dfmt == 7 && gs % 32 == 0)) && D % 32 == 0 && I % 32 == 0;
+    int cf = (fmt == 1 || fmt == 2 || (fmt == 4 && gs % 8 == 0) || ((fmt == 7 || fmt == 15) && gs % 32 == 0)) &&
+             (dfmt == 1 || dfmt == 2 || (dfmt == 4 && gs % 8 == 0) || ((dfmt == 7 || dfmt == 15) && gs % 32 == 0)) && D % 32 == 0 && I % 32 == 0;
     int cgv_want = g_xb[0].cgv && !g_xb[0].grp_rows && cf && (act == COLI_VK_ACT_SWIGLU || act == COLI_VK_ACT_SITU);
     printf("xbatch fmt=%d/%d gs=%d D=%d I=%d %s, rows %d/%d/%d/%d/%d (GEMM from %d, %llu cooperative matmuls, %llu on chain_moe_gv) | maxrel=%.3g | row bits independent of the batch: %s | device %.3f ms\n",
            fmt, dfmt, gs, D, I, an, rows[0], rows[1], rows[2], rows[3], rows[4], g_xb[0].gemm_rows,
@@ -7283,6 +8467,105 @@ static int run_xbatch(int fmt, int dfmt, int gs, int D, int I, int act, float li
     if (maxrel > 3e-3 || !same) bad = 1;
     for (int c = 0; c < K; c++) { coli_vk_xb_expert_free(ex[c]); xmat_drop(&mg[c]); xmat_drop(&mu[c]); xmat_drop(&md[c]); }
     free(x); free(ref); free(hid); free(xr); free(yr); free(y1);
+    return bad;
+}
+
+/* fmt 15 (MXFP4, packed ue8m0 scale bytes) against fmt 7 (the same codes, the scales
+ * expanded to floats): the tier's packed resident form computes the SAME BITS as the
+ * f32-scale form -- the round trip ue8m0 -> f32 (the byte's exponent into the float's
+ * exponent field) -> the shader's decode is the identity, so every consumer that reads
+ * the packed bytes must land on the floats' values exactly. One set of codes and scale
+ * bytes drives both forms (different data would make any comparison meaningless), the
+ * rows below and above the GEMM threshold, and the double reference checks the values
+ * themselves. */
+static int run_xbatch_mx_pack(void) {
+    enum { K = 4 };
+    const int D = 320, I = 160, gs = 32, rows[K] = {1, 3, 2, 20};
+    if (!coli_vk_xb_init(D, I, COLI_VK_ACT_SWIGLU, 0.f, 0.f, 0.f)) { printf("mx pack: no batch\n"); return 1; }
+    int total = 0; for (int c = 0; c < K; c++) total += rows[c];
+    float *x = malloc((size_t)total * D * 4);
+    const float **xr = malloc((size_t)total * sizeof(*xr)), **yr = malloc((size_t)total * sizeof(*yr));
+    for (int i = 0; i < total * D; i++) x[i] = (float)((rand() % 200 - 100) / 100.0);
+    for (int j = 0; j < total; j++) xr[j] = x + (size_t)j * D;
+    /* the shared data: codes and ue8m0 bytes per expert, and their float expansion */
+    uint8_t *cw[K][3], *e8[K][3]; float *f32[K][3];
+    int Iin[3] = {D, D, I}, O[3] = {I, I, D};
+    for (int c = 0; c < K; c++)
+        for (int k = 0; k < 3; k++) {
+            float *xs, *e8f; uint8_t *w;
+            int keep = g_ref_gs; g_ref_gs = gs;
+            case_fill(15, 1, Iin[k], O[k], &xs, &w, &e8f);
+            g_ref_gs = keep;
+            free(xs);
+            size_t nb = (size_t)O[k] * (((size_t)Iin[k] + gs - 1) / gs);
+            cw[c][k] = w; e8[c][k] = (uint8_t *)e8f;
+            f32[c][k] = malloc(nb * 4);
+            for (size_t j = 0; j < nb; j++) f32[c][k][j] = ref_scale((const float *)e8[c][k], j, 15);
+        }
+    int bad = 0;
+    float *y0 = malloc((size_t)total * D * 4), *ref = malloc((size_t)total * D * 4), *hid = malloc((size_t)I * 4);
+    size_t grb = (size_t)(D + 1) / 2, drb = (size_t)(I + 1) / 2;
+    for (int j = 0, c = 0, r = 0; j < total; j++, r++) {
+        if (r == rows[c]) { c++; r = 0; }
+        const float *xs = x + (size_t)j * D;
+        for (int o = 0; o < I; o++) {
+            float g = (float)xref_dot(xs, cw[c][0] + (size_t)o * grb, (const float *)e8[c][0], o, 15, D, gs);
+            float u = (float)xref_dot(xs, cw[c][1] + (size_t)o * grb, (const float *)e8[c][1], o, 15, D, gs);
+            hid[o] = xref_act(g, u, COLI_VK_ACT_SWIGLU, 0.f, 4.f, 25.f);
+        }
+        for (int d = 0; d < D; d++) ref[(size_t)j * D + d] = (float)xref_dot(hid, cw[c][2] + (size_t)d * drb, (const float *)e8[c][2], d, 15, I, gs);
+    }
+    for (int form = 0; form < 2 && !bad; form++) {
+        int fmt = form ? 15 : 7;
+        ColiVkExpert *ex[K]; int n = 0;
+        for (int c = 0; c < K; c++) {
+            ColiVkTensor *t[3] = {NULL, NULL, NULL};
+            for (int k = 0; k < 3; k++) {
+                size_t nb = (size_t)O[k] * (((size_t)Iin[k] + gs - 1) / gs);
+                size_t ns = coli_vk_tensor_scale_count(fmt, Iin[k], O[k], gs);
+                uint8_t *rws; size_t stride; float *scl;
+                size_t rb = (size_t)(Iin[k] + 1) / 2;
+                int ok = coli_vk_tier_tensor(&t[k], fmt, Iin[k], O[k], gs, &rws, &stride, &scl) == 1;
+                for (int o = 0; ok && o < O[k]; o++) memcpy(rws + (size_t)o * stride, cw[c][k] + (size_t)o * rb, rb);
+                if (ok) {
+                    if (fmt == 7) { memcpy(scl, f32[c][k], ns * 4); }
+                    else { memcpy(scl, e8[c][k], nb); memset((uint8_t *)scl + nb, 0, ns * 4 - nb); }
+                    ok = coli_vk_tensor_commit(&t[k], 1) == 1;
+                }
+                if (!ok) { printf("mx pack: tensor %d of expert %d failed (fmt %d)\n", k, c, fmt); bad = 1; break; }
+            }
+            if (bad) { for (int j = 0; j < 3; j++) if (t[j]) coli_vk_tensor_free(t[j]); break; }
+            if (!(ex[c] = coli_vk_xb_expert(t[0], t[1], t[2]))) { printf("mx pack: no sets\n"); bad = 1; break; }
+            n = c + 1;
+        }
+        if (!bad && (!coli_vk_xb_issue(ex, rows, n, xr) || !coli_vk_xb_join(yr, NULL))) { printf("mx pack: issue/join failed (fmt %d)\n", fmt); bad = 1; }
+        for (int j = 0; !bad && j < total; j++) digest(yr[j], (size_t)D * 4);
+        if (!bad && form == 0)
+            for (int j = 0; j < total; j++) memcpy(y0 + (size_t)j * D, yr[j], (size_t)D * 4);
+        if (!bad && form == 1)
+            for (int j = 0; j < total; j++)
+                if (memcmp(y0 + (size_t)j * D, yr[j], (size_t)D * 4)) { printf("mx pack: row %d's bits differ between fmt 7 and fmt 15\n", j); bad = 1; break; }
+        for (int c = 0; c < n; c++) coli_vk_xb_expert_free(ex[c]);
+    }
+    /* the reference against the packed form's own rows (yr still holds the last join's) */
+    double maxrel = 0;
+    for (int jj = 0; jj < total; jj++) {
+        double scale = 0;
+        for (int d = 0; d < D; d++) if (fabs(ref[(size_t)jj * D + d]) > scale) scale = fabs(ref[(size_t)jj * D + d]);
+        for (int d = 0; d < D; d++) {
+            double r = ref[(size_t)jj * D + d], e = fabs(yr[jj][d] - r);
+            if (!isfinite(yr[jj][d])) { bad = 1; break; }
+            if (scale == 0) { if (yr[jj][d] != 0) bad = 1; continue; }
+            double rel = e / (fabs(r) > 1e-2 * scale ? fabs(r) : 1e-2 * scale);
+            if (rel > maxrel) maxrel = rel;
+        }
+    }
+    printf("xbatch mx pack: fmt 15's %d rows (routes as fmt 7's) %s fmt 7's bits, worst relative error %.2e against the double reference\n",
+           total, bad ? "DIFFER from" : "identical to", maxrel);
+    if (maxrel > 3e-3) bad = 1;
+    for (int c = 0; c < K; c++) for (int k = 0; k < 3; k++) { free(cw[c][k]); free(e8[c][k]); free(f32[c][k]); }
+    free(x); free(xr); free(yr); free(y0); free(ref); free(hid);
+    xb_shutdown(&g_xb[0]);
     return bad;
 }
 
@@ -7493,6 +8776,158 @@ static int run_xbatch_v4(void) {
     return bad;
 }
 
+/* The compute-site lever's aliased expert (specs/CS-expert-compute-site.md §2.2, its
+ * §4.2 unit bar): a host slab imported once (VK_EXT_external_memory_host), every
+ * record a tensor whose codes AND packed ue8m0 scale bytes the expert batch reads in
+ * place -- fmt 15, the form coli_vk_tensor_import refuses. At the MODEL's decode
+ * geometry (DeepSeek V4's 4096/2048, its own activation):
+ *   - bit for bit the f32-scale fmt 7 form of the same codes and scales in the tier
+ *     pool (run_xbatch_mx_pack's class): a wrong scale stride off the imported pages,
+ *     or a record read at another record's offset, cannot pass it -- the fmt-15 P0's
+ *     stride lesson gated at the geometry that reaches it;
+ *   - against the double reference with the CPU kernel's roundings: worst row
+ *     < 2e-2 raw, and most rows bit-identical once BOTH sides are rounded to bf16
+ *     (rows_same*2 > the rows) -- the VKT_ACT_SWIGLU_V4 tolerance class,
+ *     c/tests/test_vk_tier.c's v4 case; at D=4096 the raw f32 row and the double
+ *     reference differ in their last bits, the kernel's roundings are what they share.
+ * Two experts, so the second's records sit at other slab offsets than the first's;
+ * skips (PASS, one line) where the device imports no host memory: a capability the
+ * driver may not have, the refusal the lever's ladder lives with. */
+static int run_xbatch_alias(void) {
+    enum { D = 4096, I = 2048, gsz = 32, K = 2 };
+    static const int rows[K] = {1, 3};
+    const int Iin[3] = {D, D, I}, Ou[3] = {I, I, D};
+    if (!coli_vk_import_alignment()) { printf("xbatch alias: the device imports no host memory (skipped)\n"); return 0; }
+    if (!coli_vk_xb_init(D, I, COLI_VK_ACT_SWIGLU_V4, 0.f, 0.f, 0.f)) {
+        printf("xbatch alias: no pass (expert_act_v4.spv missing?)\n"); return 1;
+    }
+    int total = 0; for (int c = 0; c < K; c++) total += rows[c];
+    size_t ibefore = coli_vk_imported_bytes();
+    /* the shared data (codes, ue8m0 bytes, their f32 expansion) and the slab's layout:
+     * every record 4 KiB in, so any bind alignment a driver asks of a buffer holds */
+    uint8_t *cw[K][3], *e8[K][3]; float *f32s[K][3];
+    size_t grb = (size_t)(D + 1) / 2, drb = (size_t)(I + 1) / 2, woff[K][3], soff[K][3], cap = 0;
+    for (int c = 0; c < K; c++)
+        for (int k = 0; k < 3; k++) {
+            float *xs, *e8f; uint8_t *w;
+            int keep = g_ref_gs; g_ref_gs = gsz;
+            case_fill(15, 1, Iin[k], Ou[k], &xs, &w, &e8f);
+            g_ref_gs = keep;
+            free(xs);
+            size_t rb = (size_t)(Iin[k] + 1) / 2, wb = rb * (size_t)Ou[k];
+            size_t nb = (size_t)Ou[k] * (((size_t)Iin[k] + gsz - 1) / gsz), sb = (nb + 3) / 4 * 4;
+            cw[c][k] = w; e8[c][k] = (uint8_t *)e8f;
+            f32s[c][k] = malloc(nb * 4);
+            for (size_t j = 0; j < nb; j++) f32s[c][k][j] = ref_scale((const float *)e8[c][k], j, 15);
+            woff[c][k] = (cap + 4095) / 4096 * 4096; cap = woff[c][k] + wb;
+            soff[c][k] = (cap + 4095) / 4096 * 4096; cap = soff[c][k] + sb;
+        }
+    cap = (cap + 4095) / 4096 * 4096;
+    uint8_t *slab = NULL;
+    int bad = posix_memalign((void **)&slab, 4096, cap) != 0 || !slab;
+    if (!bad) {
+        memset(slab, 0, cap);   /* the scale records' word pad past their bytes, as the store's */
+        for (int c = 0; c < K; c++)
+            for (int k = 0; k < 3; k++) {
+                size_t rb = (size_t)(Iin[k] + 1) / 2;
+                size_t nb = (size_t)Ou[k] * (((size_t)Iin[k] + gsz - 1) / gsz);
+                memcpy(slab + woff[c][k], cw[c][k], rb * (size_t)Ou[k]);
+                memcpy(slab + soff[c][k], e8[c][k], nb);
+            }
+    }
+    /* the input rows E4M3-exact (eighths), as the engine rounds x before the group */
+    float *x = malloc((size_t)total * D * 4), wt[] = {1.0f, 0.75f, 1.5f, 0.3f};
+    const float **xr = malloc((size_t)total * sizeof(*xr)), **yr = malloc((size_t)total * sizeof(*yr));
+    for (int i = 0; i < total * D; i++) x[i] = (float)((i % 7) - 3) * 0.125f;
+    for (int j = 0; j < total; j++) xr[j] = x + (size_t)j * D;
+    float *y0 = malloc((size_t)total * D * 4), *ref = malloc((size_t)total * D * 4), *hid = malloc((size_t)I * 4);
+    ColiVkSlab *sr = NULL;
+    double dms = 0;
+    if (!bad && !coli_vk_slab_import(slab, cap, &sr)) { printf("xbatch alias: the slab import refused\n"); bad = 1; }
+    /* the reference once, both forms must agree with it: gate and up in double, the
+     * V4 roundings (bf16, route weight, bf16, E4M3 per 128), down in double */
+    for (int j = 0, c = 0, r = 0; !bad && j < total; j++, r++) {
+        if (r == rows[c]) { c++; r = 0; }
+        const float *xs = x + (size_t)j * D;
+        for (int o = 0; o < I; o++) {
+            double gd = xref_dot(xs, cw[c][0] + (size_t)o * grb, (const float *)e8[c][0], o, 15, D, gsz);
+            double ud = xref_dot(xs, cw[c][1] + (size_t)o * grb, (const float *)e8[c][1], o, 15, D, gsz);
+            float g = v4r_bf16((float)gd), u = v4r_bf16((float)ud);
+            float sg = g >= 0.0f ? 1.0f / (1.0f + expf(-g)) : expf(g) / (1.0f + expf(g));
+            hid[o] = v4r_bf16(g * sg * u * wt[j % 4]);
+        }
+        v4r_qdq(hid, I);
+        for (int d = 0; d < D; d++)
+            ref[(size_t)j * D + d] = (float)xref_dot(hid, cw[c][2] + (size_t)d * drb, (const float *)e8[c][2], d, 15, I, gsz);
+    }
+    /* form 0: the f32-scale fmt 7 in the tier pool; form 1: the fmt 15 records aliased
+     * over the imported slab -- the same codes and scale values, so the same bits */
+    int same = 1;   /* fmt 7's pool form vs the slab alias: the same bits, or a nameable row */
+    for (int form = 0; !bad && form < 2; form++) {
+        int fmt = form ? 15 : 7;
+        ColiVkExpert *ex[K] = {NULL, NULL};
+        for (int c = 0; !bad && c < K; c++) {
+            ColiVkTensor *t[3] = {NULL, NULL, NULL};
+            int ok = 1;
+            for (int k = 0; ok && k < 3; k++) {
+                if (fmt == 7) {
+                    uint8_t *rws; size_t stride; float *sc;
+                    size_t rb = (size_t)(Iin[k] + 1) / 2;
+                    size_t nb = (size_t)Ou[k] * (((size_t)Iin[k] + gsz - 1) / gsz);
+                    ok = coli_vk_tier_tensor(&t[k], 7, Iin[k], Ou[k], gsz, &rws, &stride, &sc) == 1;
+                    for (int o = 0; ok && o < Ou[k]; o++) memcpy(rws + (size_t)o * stride, cw[c][k] + (size_t)o * rb, rb);
+                    if (ok) { memcpy(sc, f32s[c][k], nb * 4); ok = coli_vk_tensor_commit(&t[k], 1) == 1; }
+                } else ok = coli_vk_tensor_alias(sr, woff[c][k], soff[c][k], 15, Iin[k], Ou[k], gsz, &t[k]) == 1;
+            }
+            if (!ok) { printf("xbatch alias: tensor of expert %d failed (fmt %d)\n", c, fmt); bad = 1; }
+            for (int k = 0; k < 3; k++) if (t[k] && !(ex[c] = NULL, 1)) {}
+            if (!bad && !(ex[c] = coli_vk_xb_expert(t[0], t[1], t[2]))) { printf("xbatch alias: no sets\n"); bad = 1; }
+        }
+        if (!bad && (!coli_vk_xb_issue_w(ex, rows, K, xr, wt) || !coli_vk_xb_join(yr, &dms))) {
+            printf("xbatch alias: issue/join failed (fmt %d)\n", fmt); bad = 1;
+        }
+        for (int j = 0; !bad && j < total; j++) digest(yr[j], (size_t)D * 4);
+        if (!bad && form == 0)
+            for (int j = 0; j < total; j++) memcpy(y0 + (size_t)j * D, yr[j], (size_t)D * 4);
+        if (!bad && form == 1)
+            for (int j = 0; j < total; j++)
+                if (memcmp(y0 + (size_t)j * D, yr[j], (size_t)D * 4)) {
+                    printf("xbatch alias: row %d's bits differ between fmt 7's pool form and the slab alias\n", j); bad = 1; same = 0; break;
+                }
+        for (int c = 0; c < K; c++) if (ex[c]) coli_vk_xb_expert_free(ex[c]);   /* the tensors with it */
+    }
+    /* the alias form's own rows against the reference (NaN-safe: a non-finite row is
+     * a failure outright, never a quiet worst). Rows counted bit-identical rounded
+     * to bf16 on BOTH sides, v4r_bf16 the kernel's own rounding: at this depth the
+     * raw f32 row and the double reference differ in their last bits, the V4 class
+     * (test_vk_tier's v4 case) rounds what the two share out of them */
+    unsigned long long rows_same = 0; double worst = 0;
+    for (int j = 0; !bad && j < total; j++) {
+        double scale = 0;
+        int rs = 1;
+        for (int d = 0; d < D; d++) if (fabs(ref[(size_t)j * D + d]) > scale) scale = fabs(ref[(size_t)j * D + d]);
+        for (int d = 0; d < D; d++) {
+            double r = ref[(size_t)j * D + d], e = fabs(yr[j][d] - r);
+            if (!isfinite(yr[j][d])) { bad = 1; break; }
+            if (v4r_bf16(yr[j][d]) != v4r_bf16((float)r)) rs = 0;
+            if (scale == 0) { if (yr[j][d] != 0) bad = 1; continue; }
+            double rel = e / (fabs(r) > 1e-2 * scale ? fabs(r) : 1e-2 * scale);
+            if (rel > worst) worst = rel;
+        }
+        rows_same += rs;
+    }
+    if (!bad && (worst > 2e-2 || rows_same * 2 < (unsigned long long)total)) bad = 1;
+    if (sr) coli_vk_slab_unref(sr);
+    if (!bad && coli_vk_imported_bytes() != ibefore) { printf("xbatch alias: the slab's pages did not return\n"); bad = 1; }
+    printf("xbatch alias: fmt 15 over an imported slab, D=%d I=%d gs=%d, %.2f MiB a group: %s fmt 7's bits, "
+           "%llu of %d rows bit-identical to the reference (bf16-rounded), worst row %.2e, device %.3f ms\n",
+           D, I, gsz, (double)cap / 1048576.0, same ? "identical to" : "DIFFERENT from", rows_same, total, worst, dms);
+    for (int c = 0; c < K; c++) for (int k = 0; k < 3; k++) { free(cw[c][k]); free(e8[c][k]); free(f32s[c][k]); }
+    free(slab); free(x); free(xr); free(yr); free(y0); free(ref); free(hid);
+    xb_shutdown(&g_xb[0]);
+    return bad;
+}
+
 /* Every format through the batch, both routes, the two activations, a hidden size
  * past the gate_up staging array, odd widths and a down format other than gate/up's. */
 static int run_xbatch_all(void) {
@@ -7511,6 +8946,9 @@ static int run_xbatch_all(void) {
     bad |= run_xbatch(10, 1, 64, 320, 160, COLI_VK_ACT_SWIGLU, 0.f);     /* fp32 gate/up, cooperative down */
     bad |= run_xbatch(4, 4, 64, 320, 160, COLI_VK_ACT_SWIGLU, 0.7f);     /* the clamped SwiGLU */
     bad |= run_xbatch(7, 7, 32, 320, 160, COLI_VK_ACT_SITU, 0.f);        /* SiTU-GLU on MXFP4 */
+    bad |= run_xbatch(15, 15, 32, 320, 160, COLI_VK_ACT_SWIGLU, 0.f);    /* its packed-scales twin */
+    bad |= run_xbatch(15, 15, 32, 320, 160, COLI_VK_ACT_SITU, 0.f);
+    bad |= run_xbatch_mx_pack();   /* fmt 15's rows bit for bit fmt 7's, the same codes and scales */
     xb_shutdown(&g_xb[0]);
     /* odd widths: D, I not multiples of the groups, offsets past odd row sizes */
     if (!coli_vk_xb_init(200, 72, COLI_VK_ACT_SWIGLU, 0.f, 0.f, 0.f)) return 1;

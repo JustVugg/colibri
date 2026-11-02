@@ -23,6 +23,12 @@ layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer X  { float x[]; };
 layout(std430, binding = 1) readonly buffer W  { uint  w[]; };   // row o at o*rowWords
 layout(std430, binding = 2) readonly buffer Sc { float scale[]; };
+// fmt 15 (MXFP4 with packed ue8m0 scale bytes, 4 to a word): a byte's float is its
+// exponent into the float's exponent field — the same bits the f32-scale form (7) holds
+float msc15(uint b) {
+    uint w = floatBitsToUint(scale[b >> 2u]);
+    return uintBitsToFloat(uint(bitfieldExtract(w, int((b & 3u) * 8u), 8)) << 23);
+}
 layout(std430, binding = 3) writeonly buffer Y { float y[]; };
 
 layout(push_constant) uniform P {
@@ -151,7 +157,7 @@ void main() {
                 }
                 sum += a * scale[sb + uint(g)];
             }
-        } else if (p.fmt == 4 || p.fmt == 7) { // grouped int4 (#298 semantics) or MXFP4:
+        } else if (p.fmt == 4 || p.fmt == 7 || p.fmt == 15) { // grouped int4 (#298 semantics) or MXFP4:
             // nibble decode, one scale per gs inputs — gs % 8 == 0 (host-gated), so a
             // packed word never straddles a group and its scale multiplies the 8-wide
             // partial. Per-row scale must NOT run.
@@ -167,7 +173,7 @@ void main() {
                     for (int k = 0; k < 8; k++) { int i = i0 + k;
                         if (i < p.I) a += (staged ? xsh[i] : x[xoff + i]) * mx4(pk, k); }
                 }
-                sum += a * scale[sb + uint(i0 / p.gs)];
+                sum += p.fmt == 15 ? a * msc15(sb + uint(i0 / p.gs)) : a * scale[sb + uint(i0 / p.gs)];
             }
         } else { // int4
             int words = (p.I + 7) / 8;
@@ -180,7 +186,7 @@ void main() {
             }
         }
         float tot = subgroupAdd(sum);
-        if (lane == 0) y[s * p.O + o] = (p.fmt == 5 || p.fmt == 4 || p.fmt == 7 || p.fmt == 10 || p.fmt == 11 || p.fmt == 12 || p.fmt == 13 || p.fmt == 14)
+        if (lane == 0) y[s * p.O + o] = (p.fmt == 5 || p.fmt == 4 || p.fmt == 7 || p.fmt == 10 || p.fmt == 11 || p.fmt == 12 || p.fmt == 13 || p.fmt == 14 || p.fmt == 15)
                                         ? tot : tot * scale[o];
     }
 }

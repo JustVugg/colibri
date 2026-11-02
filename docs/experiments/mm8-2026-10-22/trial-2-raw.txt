@@ -1,0 +1,63 @@
+[test] CPU: 12th Gen Intel(R) Core(TM) i9-12900K, 24 threads, AVX-512 no
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] ready: AMD Radeon RX 6900 XT (RADV NAVI21), compute qfam 0, memtype 3, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096
+bench mm8 [32768 x  1024] S 128: GEMV    241.0 GMAC/s
+  f         2450.0 unsplit,   3100.8 split k 1
+  m         3547.6 unsplit,   2679.9 split k 2
+  s         3341.6 unsplit,   3283.7 split k 1
+  m16       3757.2 unsplit,   2734.4 split k 2
+  f64       1524.6 unsplit,   1520.3 split k 1
+  ftm4       331.4 unsplit,    300.0 split k 1
+  ftn4      1982.9 unsplit,   2785.6 split k 1
+  mwm4      3711.1 unsplit,   2938.6 split k 2
+  mbn128    2771.1 unsplit,   2668.0 split k 4
+bench mm8 [ 4096 x  8192] S 128: GEMV    186.2 GMAC/s
+  f         3040.0 unsplit,   3739.4 split k 8
+  m         2760.8 unsplit,   3972.7 split k 8
+  s         2402.6 unsplit,   2815.2 split k 4
+  m16       2462.3 unsplit,   3180.8 split k 8
+  f64       2264.4 unsplit,   2853.5 split k 8
+  ftm4      3268.7 unsplit,   3939.5 split k 8
+  ftn4      3308.8 unsplit,   3930.9 split k 8
+  mwm4      2971.3 unsplit,   4221.9 split k 8
+  mbn128    1897.7 unsplit,   3599.4 split k 8
+bench mm8 [ 1024 x  4096] S 128: GEMV    208.4 GMAC/s
+  f          943.3 unsplit,   2346.2 split k 8
+  m          695.4 unsplit,   2056.1 split k 8
+  s          883.6 unsplit,   2284.1 split k 8
+  m16        792.4 unsplit,   2571.6 split k 8
+  f64       1146.9 unsplit,   1969.5 split k 8
+  ftm4      1184.8 unsplit,   2680.1 split k 8
+  ftn4      1200.4 unsplit,   2872.6 split k 8
+  mwm4       922.5 unsplit,   2555.0 split k 8
+  mbn128     526.9 unsplit,   2670.1 split k 8
+bench mm8 [  512 x  4096] S 128: GEMV    240.3 GMAC/s
+  f          471.2 unsplit,   1800.8 split k 8
+  m          351.7 unsplit,   1622.8 split k 8
+  s          436.2 unsplit,   1705.8 split k 8
+  m16        379.6 unsplit,   1665.2 split k 8
+  f64        541.3 unsplit,   1554.5 split k 8
+  ftm4       568.9 unsplit,   1943.2 split k 8
+  ftn4       569.1 unsplit,   2120.2 split k 8
+  mwm4       441.6 unsplit,   2024.9 split k 8
+  mbn128     256.8 unsplit,   1561.8 split k 8
+bench mm8 [ 2048 x  4096] S 128: GEMV    217.8 GMAC/s
+  f         1844.7 unsplit,   2733.8 split k 8
+  m         1440.9 unsplit,   3051.6 split k 8
+  s         1722.6 unsplit,   2913.9 split k 8
+  m16       1651.1 unsplit,   3374.2 split k 8
+  f64       2271.7 unsplit,   2420.0 split k 8
+  ftm4      2251.5 unsplit,   3284.1 split k 8
+  ftn4      2215.1 unsplit,   3390.9 split k 8
+  mwm4      1664.8 unsplit,   3362.8 split k 8
+  mbn128    1015.0 unsplit,   3093.5 split k 8
+bench mm8 [ 4096 x  2048] S 128: GEMV    207.3 GMAC/s
+  f         2599.5 unsplit,   2747.9 split k 8
+  m         2318.6 unsplit,   2878.5 split k 8
+  s         2428.6 unsplit,   2655.4 split k 4
+  m16       2261.3 unsplit,   3286.3 split k 8
+  f64       2074.7 unsplit,   2370.1 split k 8
+  ftm4      2856.3 unsplit,   2849.7 split k 8
+  ftn4      2860.6 unsplit,   3068.1 split k 8
+  mwm4      2531.9 unsplit,   3212.3 split k 8
+  mbn128    1762.9 unsplit,   2785.7 split k 8

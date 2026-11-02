@@ -1,0 +1,30 @@
+The mm8 bench (COLI_VK_CHAIN_BENCH=mm8, tests/test_vk_chain.c bench_mm8) after the
+review fixes: the ping-pong staging budget halved to the NDBUF=2 requirement (m, f64,
+mwm4 and mbn128 now double-buffer on this device's 64 KiB shared memory too), every
+number below from the three trial-*-raw.txt logs beside this file. Per shape: the
+fmt-12 GEMV the default keeps (COLI_VK_MM8=0), then the best tile of the table at the
+split-K auto rule (COLI_VK_MM8=1, COLI_VK_MM8_SPLITK unset) and the same tile unsplit;
+medians of three trials, GMAC/s of S*O*I MACs a dispatch (best of 6, S 128, the fork's
+six real projection shapes O x I). The full per-tile tables are in the raw logs.
+
+shape (O x I)      GEMV   best tile, split auto   tile   unsplit   xGEMV
+  512 x 4096       241.1                  2106.7   ftn4      573.9    8.7
+ 1024 x 4096       194.8                  2845.2   ftn4     1174.7   14.6
+ 2048 x 4096       217.3                  3390.9   ftn4     2271.3   15.6
+ 4096 x 2048       210.4                  3286.3    m16     2860.6   15.6
+ 4096 x 8192       184.9                  4183.2   mwm4     3308.8   22.6
+32768 x 1024       241.0                  3409.5      s     3757.2   14.1
+geometric mean     214.5                  3130.3            2350.9   14.6
+
+The one changed variable is COLI_VK_MM8 (0 against 1, split-K auto in both); the
+tok_s samples of manifest.json carry the geometric means over the six shapes (the
+validator's fixed key), per trial:
+
+trial            GEMV tok_s (=geomean GMAC/s)   mm8 tok_s
+1                          214.5                  3116.0
+2                          216.0                  3130.3
+3                          214.1                  3131.2
+
+Every tile of the table returns the f tile's bits on this device (vk-chain-check's
+mm8 tiles arm: 9 variants, bitwise), and the fp64/e4m3 envelope of every shape stays
+under 1e-6; the raw logs' first lines carry the CPU and device the runs saw.

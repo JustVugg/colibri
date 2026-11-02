@@ -27,6 +27,16 @@ layout(std430, binding = 2) readonly buffer SG { float gscale[]; };
 layout(std430, binding = 3) readonly buffer WU { uint  wu[]; };   // up weights
 layout(std430, binding = 4) readonly buffer SU { float uscale[]; };
 layout(std430, binding = 5) writeonly buffer H { float hid[]; };
+// fmt 15 (MXFP4 with packed ue8m0 scale bytes, 4 to a word): a byte's float is its
+// exponent into the float's exponent field — the same bits the f32-scale form (7) holds
+float gsc15(uint b) {
+    uint w = floatBitsToUint(gscale[b >> 2u]);
+    return uintBitsToFloat(uint(bitfieldExtract(w, int((b & 3u) * 8u), 8)) << 23);
+}
+float usc15(uint b) {
+    uint w = floatBitsToUint(uscale[b >> 2u]);
+    return uintBitsToFloat(uint(bitfieldExtract(w, int((b & 3u) * 8u), 8)) << 23);
+}
 
 layout(push_constant) uniform P {
     int fmt;        // see above
@@ -128,7 +138,7 @@ void main() {
                 g += ga * gscale[sb + uint(gi)];
                 u += ua * uscale[sb + uint(gi)];
             }
-        } else if (p.fmt == 4 || p.fmt == 7) { // grouped int4 / MXFP4: per-word group scale (gs%8==0)
+        } else if (p.fmt == 4 || p.fmt == 7 || p.fmt == 15) { // grouped int4 / MXFP4: per-word group scale (gs%8==0)
             int words = (p.I + 7) / 8, ng = (p.I + p.gs - 1) / p.gs;
             uint sb = uint(o) * uint(ng);
             for (int wi = lane; wi < words; wi += sgsize) {
@@ -140,7 +150,8 @@ void main() {
                     for (int k = 0; k < 8; k++) { int i = i0 + k; if (i < p.I) { float a = xv(i); ga += a * mx4(gp, k); ua += a * mx4(upk, k); } }
                 }
                 uint si = sb + uint(i0 / p.gs);
-                g += ga * gscale[si]; u += ua * uscale[si];
+                if (p.fmt == 15) { g += ga * gsc15(si); u += ua * usc15(si); }
+                else { g += ga * gscale[si]; u += ua * uscale[si]; }
             }
         } else if (p.fmt == 12 || p.fmt == 13) { // fp8 e4m3 / int8, one scale per gs inputs (gs%4==0)
             int words = (p.I + 3) / 4, ng = (p.I + p.gs - 1) / p.gs;

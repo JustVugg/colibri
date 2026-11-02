@@ -31,6 +31,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 - Qwen3.8-Flash-Next's long-context table measured again on 2.1.0: 65,536 tokens 208 / 52.2
   tok/s, 131,072 190 / 51.9, 262,144 151 / 42.9 (prompt / decode).
+### Vulkan
+
+- **DeepSeek V4/V4.1 performance levers, default-on and probe-gated** (five levers beside
+  the tier's packed fmt-15, plus the measured prefill shape self-tuned at defaults):
+  on an RX 6900 XT with DeepSeek-V4-Flash, a 2,515-token prompt and 64 tokens, the
+  no-configuration defaults reach the first token in 145.8 s (median, n=3) at 0.973 tok/s
+  decode against the `COLI_VK_LEGACY=1` base's 254.0 s / 0.679 — TTFT -42.6 %, decode
+  +43.3 %, every defaults rep above every base rep. Every lever arms behind its own
+  capability probe and refuses with one named stderr line (the registry refuses unified
+  memory before allocating; the S=1 GEMV arms only behind a bit-exact parity leg; the
+  flash tile is LDS-gated); the window probe waits out the driver's freed-block shadow
+  (today's tip strands at 9/43 layers beside a co-tenant without it); `COLI_VK_STRICT=1`
+  turns silent degradation fatal; `COLI_VK_LEGACY=1` restores the base byte-for-byte.
+  Evidence: `docs/experiments/` packs with a validated manifest.
 
 ## [2.1.0] - 2026-10-31
 

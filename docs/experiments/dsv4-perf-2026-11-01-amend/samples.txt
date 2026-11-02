@@ -1,0 +1,123 @@
+The amended-tip reproduction (2026-11-01, 18:04–20:09):
+12 legs, all GREEN, zero gate-skips, zero device-losts (legacy-r3's
+first attempt was killed by an external timeout 14 min 19 s in — rc=143,
+PARSE-FAIL — and its recorded retry, GREEN via -r2, is the leg of record;
+both raw logs ship). PR binary /tmp/bench-amend/c @ f06f9630 (fresh build,
+sha256 0e820833a162e16d7f430673957a50538c1c989a3f94578f87f5e633dbcccb14);
+base binary /root/audit-wt/base-tests/c @ d67ebd8b (the audit's build, not
+rebuilt, sha256 cad05bb456dc3b66b53bdf973815402295c386da1e0d26036bd0f7c3bd397800).
+Driver bench-amend-driver.sh (this directory, verbatim; the 2026-10-31
+audit2 driver.sh with only BENCH/RUN/PR paths changed) over the harness copy
+bench-amend-run.sh (verbatim; the audit2 run-audit.sh with only OUT=
+changed); the whole session, every launch, gate decision, parse line and
+mem peak is in window.raw.txt. Every number below is recomputable from the
+raw logs beside this file: ttft and wall from each log's own lines
+(`timing time_to_first_token=…s after_first=…s`, `TUNE decode: 64 tokens in
+…s`), decode = 63/(wall − ttft), the harness parse convention (identical to
+the audit2 and gap4 records'); the after_first cross-check column differs
+from wall − ttft only by the timing line's rounding (<= 0.027 s every leg).
+
+leg (raw file)          arm / binary / env                 ttft s   decode tok/s   wall s   after_first s   mem peak
+legacy-r1.raw.txt       LEGACY  PR  COLI_VK_LEGACY=1       248.161      0.8350     323.612       75.427       15.81 GiB
+legacy-r2.raw.txt       LEGACY  PR  COLI_VK_LEGACY=1       258.334      0.6839     350.446       92.089       15.37 GiB
+legacy-r3.raw.txt       LEGACY  PR  COLI_VK_LEGACY=1       269.972      0.6898     361.299       91.303       15.33 GiB
+defaults-r1.raw.txt     defaults PR  (env-free)            245.870      0.9259     313.914       68.019        2.42 GiB
+defaults-r2.raw.txt     defaults PR  (env-free)            259.386      0.8663     332.113       72.704        2.31 GiB
+defaults-r3.raw.txt     defaults PR  (env-free)            269.755      0.8786     341.457       71.677        2.42 GiB
+oneline-r1.raw.txt      oneline PR  PROFILE=RDNA2 HOST_GB=2 147.327     0.8085     225.246       77.896        2.30 GiB
+oneline-r2.raw.txt      oneline PR  PROFILE=RDNA2 HOST_GB=2 151.606     0.9265     219.603       67.973        2.26 GiB
+oneline-r3.raw.txt      oneline PR  PROFILE=RDNA2 HOST_GB=2 159.439     0.8887     230.326       70.863        2.24 GiB
+uvk-r1.raw.txt          base    BASE d67ebd8b (env-free)   503.724      0.8005     582.423       78.672       16.18 GiB
+uvk-r2.raw.txt          base    BASE d67ebd8b (env-free)   432.921      0.5503     547.399      114.453       16.19 GiB
+mm8-r1.raw.txt          mm8 opt-in PR  oneline + MM8_NDBUF=2 150.492    0.9115     219.607       69.091        2.27 GiB
+
+legacy-r3.raw.txt is the recorded retry audit2-legacy-r3-r2 (launch 19:58:29,
+rc=0); the killed first attempt ships verbatim beside it as
+legacy-r3-attempt1.raw.txt (launch 19:44:10, rc=143 at 14:19 elapsed after a
+mid-prompt device loss — `queue submit failed (-4): the device is lost` and
+the CPU fallback lines in that log — PARSE-FAIL, no timing lines).
+
+(63/after_first — the decode rate over the log's own after-first span — agrees
+with the quoted decode to <= 0.0004 tok/s on every leg, e.g. legacy-r3
+63/91.303 = 0.6900 vs 0.6898, mm8-r1 63/69.091 = 0.9118 vs 0.9115.)
+
+mem peaks from window.raw.txt (the per-leg VmHWM sampler; this session it
+caught every leg, including both base legs at 16.18/16.19 GiB — audit2's D2
+sampler miss did not recur). The host-RAM drop 15.81 -> ~2.3 GiB is again the
+forked decode path's slab registry (LEGACY keeps the malloc/import path).
+
+arm (n)            decode med (range)      ttft med s (range)       wall med s
+legacy (3)         0.6898 (0.6839–0.8350)  258.334 (248.161–269.972)  350.446
+defaults (3)       0.8786 (0.8663–0.9259)  259.386 (245.870–269.755)  332.113
+oneline (3)        0.8887 (0.8085–0.9265)  151.606 (147.327–159.439)  225.246
+uvk / base (2)     0.6754 (0.5503–0.8005)  468.322 (432.921–503.724)  564.911
+mm8 opt-in (1)     0.9115                  150.492                  219.607
+
+The amended-tip deltas, recomputed exactly from the medians above (audit2's
+2026-10-31 reference values in brackets — same rig, same regime, same
+protocol):
+
+  defaults vs LEGACY, decode med/med:   0.8786 / 0.6898  = +27.37%  [audit2
+      +14.65%; per-rep +10.9 / +26.7 / +27.4%] — TTFT +0.4% [−0.8%] (parity)
+  oneline vs LEGACY, ttft med/med:      151.606 / 258.334 = −41.31%  [audit2
+      −38.58%; per-rep −40.6 / −41.3 / −40.9%], decode +28.8% [+13.1%]
+  oneline vs defaults, ttft med/med:    151.606 / 259.386 = −41.55%  [audit2
+      −38.06%], decode +1.1% [−1.4%] (parity kept)
+  oneline vs fresh base (uvk), decode:  0.8887 / 0.6754  = +31.58%  [audit2
+      +71.79%], ttft −67.63% [−63.27%] — the base arm moved between sessions
+      (chain 2/43 this session vs audit2's 9/43; see below)
+  mm8 opt-in vs oneline (n=1):          decode +2.6%, ttft −0.7%  [audit2
+      +7.4%, +4.0%]
+
+The within-tree claims reproduced at the amended tip, a touch wider than
+audit2's: LEGACY ran 0.68–0.84 this session (its noisiest arm again, host-path
+decode), defaults 0.87–0.93, so the defaults-vs-LEGACY decode delta landed at
++27.4% med/med between audit2's +14.7% and the gap4 record's +41.8%; the
+one-line TTFT cut deepened to −41.3% [audit2 −38.6%, first audit −37%, PR
+title −45%] with decode parity kept. The base arm is a cross-session
+reference, not a within-tree comparison: the same d67ebd8b binary that fit
+9/43 chain layers beside audit2's co-tenant fit only 2/43 this session (the
+13.28 GiB fmt-7 expert tier takes the budget first; window.raw.txt and both
+uvk logs carry `chain: 2 of 43 layers`), which is why its decode spread runs
+0.5503–0.8005 and its medians straddle LEGACY's. The PR's claims rest on the
+within-tree arms; the PR's window probe restores 43/43 in every PR leg here.
+
+n disclosure: legacy 3, defaults 3, oneline 3, uvk (base) 2, mm8 1. The uvk
+legs were scheduled into reps 1–2; mm8 is the optional tail leg, n=1 by
+design. legacy-r3 is the one retry of the session (external-timeout kill of
+the first attempt, disclosed above); every other leg ran green on its first
+attempt. The killed attempt's log ships but is not a sample.
+
+Regime (every leg, from bench-amend-driver.sh / window.raw.txt):
+VRAM_MAX_USED_MB=3584 RAM_GB=16 COLI_BENCH_MEMORY_GB=24, OMP 16, the same
+2,515-token prompt_2k, 64 decode tokens, .coli_usage state snapshotted per
+leg, legs interleaved R=1..3 with per-rep shuffle, pre-leg VRAM gate (7x10 s:
+band <= 64 MiB, max <= 3544 MiB, avail >= 2 GiB), one -r2 retry per failed
+leg; launch under the GPU lock flock /tmp/gpu.lock (applied at launch, not
+in the shipped driver).
+
+Quality gates (this record at f06f9630): fresh build make -j18 VK=1
+deepseek_v4 rc=0, 99 coli_vk symbols (preflight nm check at every driver
+start); every shipped leg rc=0 with its boot lines in-tree. No fresh
+make check ran this session — the audit2 gate matrix (make check VK=1 green
+2,787 OK, skipped 322; vk-tier-check incl. the COLI_VK_LEGACY=1 leg,
+vk-chain-check, vk-memtype-check, vk-strict-check incl. LEGACY == base
+byte-identity, tiny-fixture stdout md5s) ran at cb0a0a91 on 2026-10-31, and
+the only engine change cb0a0a91 -> f06f9630 is 9ba76c9e (COLI_VK_CHAIN_MM8_NDBUF:
+a set env gets one boot line, =1 rejected, the registry refusal moved before
+vkCreateBuffer; an unset env stays byte-silent and the arming path is
+byte-identical) plus CI/docs/packaging. This session's legs witness both
+sides: every arm that never sets the env (legacy/defaults/oneline/uvk) logs
+zero mm8-ndbuf lines, and mm8-r1 carries `mm8 ndbuf: ping-pong armed
+(COLI_VK_CHAIN_MM8_NDBUF=2, spec 11)` rc=0. python3 c/experiment_manifest.py
+passes this record's manifest.json (baseline/trial are the n=3 legacy/
+defaults arms; oneline/uvk/mm8 are the disclosed extra arms).
+
+Boot-line cross-checks in the raw logs: every PR leg "the window probe freed
+13 GiB; the driver's budget read them back in 181/201/221 ms" and chain
+"43 of 43 layers"; LEGACY legs carry "legacy (COLI_VK_LEGACY=1)" per lever
+and "FA refused: legacy"; defaults/oneline/mm8 carry "decode-path=fork …
+engaged", "s1gemv … armed", "cs experts armed", "FA engaged", "decode grow
+armed"; oneline/mm8 add "profile: RDNA2 -> ttft (prompt 2515 tokens >= 1000
+…)" and 2048-row prompt chunks; the base legs carry fmt 7, chain "2 of 43",
+no probe wait.

@@ -11,8 +11,9 @@
 // partial sums joined with clustered subgroup adds. A row's arithmetic does not depend
 // on the batch around it.
 // Formats: 1 int8 and 2 int4 with a scale per row, 4 int4 and 7 MXFP4 (e2m1 nibbles in
-// int4's order, qmatmul.comp's mx4) with a scale per gs inputs.
-// Host: I % 32 == 0, I <= 8192, rowWords % 4 == 0; fmt 4 and 7: gs % 32 == 0.
+// int4's order, qmatmul.comp's mx4) with a scale per gs inputs, 15 MXFP4's packed-scales
+// twin (a ue8m0 byte a group, group_scale8 below).
+// Host: I % 32 == 0, I <= 8192, rowWords % 4 == 0; fmt 4, 7 and 15: gs % 32 == 0.
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_clustered : require
@@ -88,6 +89,14 @@ float situ_tanh(float x) { return abs(x) < 0.000244140625 ? x : tanh(x); }   // 
 float group_scale(SRef sc, uint o, uint ng, uint j, uint gs, bool ok, bool pair_scale) {
     return ok ? sc.v[o * ng + (j * 32u) / gs] : 0.0;
 }
+// fmt 15: the scale a ue8m0 byte, 4 to a word; its float is the exponent into the
+// float's exponent field — the same bits the f32-scale form (7) holds expanded
+float group_scale8(SRef sc, uint o, uint ng, uint j, uint gs, bool ok) {
+    if (!ok) return 0.0;
+    uint b = o * ng + (j * 32u) / gs;
+    uint w = floatBitsToUint(sc.v[b >> 2u]);
+    return uintBitsToFloat(uint(bitfieldExtract(w, int((b & 3u) * 8u), 8)) << 23);
+}
 
 // One matrix, one RPS block of output rows. The word-major inner loop shares each
 // input pair across the RPS rows.
@@ -111,6 +120,7 @@ void matrix_block(WRef4 w, SRef sc, int fmt, uint rowWords, uint gs, uint ng,
             bool ok = t * rg < remaining && q < RW && o < uint(p.O);
             s[t] = 1.0;
             if (fmt == 4 || fmt == 7) s[t] = group_scale(sc, o, ng, j, gs, ok, pair_scale);
+            else if (fmt == 15) s[t] = group_scale8(sc, o, ng, j, gs, ok);
         }
         [[unroll]] for (uint k = 0u; k < MAXNR; k++) if (k < nr) {
             float d[RPS];
@@ -124,7 +134,7 @@ void matrix_block(WRef4 w, SRef sc, int fmt, uint rowWords, uint gs, uint ng,
                         d[t] = h == 0u ? z : d[t] + z;
                     }
                 }
-            } else if (fmt == 7) {
+            } else if (fmt == 7 || fmt == 15) {
                 uint x0 = k * I4 + j * 8u;
                 [[unroll]] for (uint h = 0u; h < 4u; h++) {
                     vec4 a = xsh[x0 + h * 2u], b = xsh[x0 + h * 2u + 1u];
@@ -151,7 +161,7 @@ void matrix_block(WRef4 w, SRef sc, int fmt, uint rowWords, uint gs, uint ng,
         bool writer = jj == 0u && t * rg < remaining && q < RW && o < uint(p.O);
         // One per-row scale load, only in the lane which writes the result.
         float s = 1.0;
-        if (writer && fmt != 4 && fmt != 7) s = sc.v[o];
+        if (writer && fmt != 4 && fmt != 7 && fmt != 15) s = sc.v[o];   /* 15's scales are groups (bytes), never a row's */
         [[unroll]] for (uint k = 0u; k < MAXNR; k++) if (k < nr)
             acc[t * MAXNR + k] = red(acc[t * MAXNR + k], lpr) * s;
     }

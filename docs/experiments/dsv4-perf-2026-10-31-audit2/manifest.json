@@ -1,0 +1,182 @@
+{
+ "version": 1,
+ "hypothesis": "An independent fresh-build re-run of the PR's headline comparison: inside the opt-in COLI_VULKAN=1 backend, the five default-on probe-gated levers (COLI_VK_TIER_EXPERTS, COLI_VK_V4_DECODE_PATH=fork, COLI_VK_V4_S1GEMV, COLI_VK_TIER_DECODE_GROW, COLI_VK_CHAIN_ATTN_FA) lift DeepSeek V4 decode over the COLI_VK_LEGACY=1 hatch arm at roughly equal TTFT, and the one-line stage shape (COLI_VK_PROFILE=RDNA2 + COLI_VK_TIER_HOST_GB=2) cuts TTFT by a further ~38% at decode parity — direction of the PR's claims on a fresh session, with magnitudes re-measured",
+ "commit": "cb0a0a91771c72dab6822eebb2e0fa648c499022",
+ "model": "DeepSeek-V4-Flash, 160 GB on-disk checkpoint (/root/Projects/colibri-v4-docker/models/DeepSeek-V4-Flash), .coli_usage/.coli_mfu snapshots restored before every leg; no other model",
+ "command": "driver.sh (this directory, verbatim) over run-audit.sh (this directory, verbatim — the imp3-stack bench/up2276/run-arm2276.sh with only OUT= changed): legs interleaved R=1..3 with per-rep shuffle, pre-leg VRAM gate (7x10 s: band<=64 MiB, max<=3544 MiB, avail>=2 GiB), one retry per failed leg; per leg systemd-run scope MemoryMax=22G, COLI_TEMP=0 KVSAVE=0 V4_PREFIX_CKPT=0 COLI_VULKAN=1 COLI_V4_PREWARM=0 OMP_NUM_THREADS=16 OMP_PROC_BIND=close OMP_PLACES=cores, --prompt-file prompt_2k --max-tokens 64 --memory-gb 16; PR binary /root/audit-wt/pr-bench/c @ cb0a0a91, base binary /root/audit-wt/base-tests/c @ d67ebd8b2b89ebc2102b9bd3665e7c2a7f3fc30f",
+ "prompt_hash": "sha256:2e06e22974e445d49e623405d10b4f065bcb88369f63aeff8c9cba0aa904cc3d (bench/prompt_2k.txt, 8,944 bytes, the campaign's fixed 2,515-token prompt; v4_tokens prompt=2515 generated=64 in every raw log)",
+ "hardware": {
+  "cpu": "12th Gen Intel Core i9-12900K, 18 cores seen by the scheduler ([OMP] effective team size 16, bound close/cores)",
+  "ram": "38 GiB DDR5",
+  "storage": "NVMe (Crucial P5 2TB), f2fs root; the model on the same root",
+  "os": "Arch Linux, kernel 7.1.11, gcc 16.2.1, Vulkan 1.4.357 (Mesa RADV 26.2.1); the device: AMD Radeon RX 6900 XT (RADV NAVI21, RDNA2, no cooperative matrices, 64 KiB shared memory a workgroup), with a display co-tenant at ~1.4-2.0 GiB VRAM (each leg's gate record and vram0= stamp, inside the 3584 MiB ceiling by design)"
+ },
+ "warmup_runs": 0,
+ "changed_variables": [
+  "COLI_VK_LEGACY"
+ ],
+ "baseline": {
+  "config": {
+   "COLI_VK_LEGACY": "1 (the aggregate hatch: every default-on lever off; proven byte-equal to all-levers-=0 and to the upstream base by c/tests/vulkan_strict.sh)",
+   "COLI_VK_PROFILE": "unset",
+   "COLI_VK_TIER_HOST_GB": "unset",
+   "REGIME": "VRAM_MAX_USED_MB=3584 RAM_GB=16 COLI_BENCH_MEMORY_GB=24, prompt_2k 2,515 tokens, 64 decode tokens",
+   "BUILD": "make -j18 VK=1 deepseek_v4, /root/audit-wt/pr-bench/c @ cb0a0a91 (99 coli_vk symbols)"
+  },
+  "samples": {
+   "tok_s": [
+    0.7882,
+    0.8708,
+    0.6208
+   ],
+   "ttft_s": [
+    253.953,
+    252.481,
+    261.163
+   ],
+   "wall_s": [
+    333.877,
+    324.826,
+    362.648
+   ],
+   "raw": [
+    "legacy-r1.raw.txt",
+    "legacy-r2.raw.txt",
+    "legacy-r3.raw.txt"
+   ]
+  },
+  "median_tok_s": 0.7882,
+  "quality": {
+   "method": "make check VK=1 at cb0a0a91 green (rc 0, 2,787 tests, OK skipped=322) and the VK gate suite green — vk-tier-check (9 legs incl. the COLI_VK_LEGACY=1 leg), vk-chain-check, vk-memtype-check, vk-strict-check incl. the LEGACY=1 == upstream-base byte-identity case, tiny oracle; every shipped leg rc=0 with its boot lines in-tree (43/43 chain layers, every lever's 'legacy (COLI_VK_LEGACY=1)' line, FA refused: legacy)",
+   "passed": true
+  },
+  "evidence": {
+   "uri": "docs/experiments/dsv4-perf-2026-10-31-audit2/ (legacy-r{1,2,3}.raw.txt verbatim from /root/audit-wt/bench/audit2-legacy-r{1,2,3}.log; window.raw.txt carries the session's own parse lines; sha256 below covers the twelve leg raw logs in name order)",
+   "sha256": "1c9b60c3e2b2858f63c210ce97a312d1400d528768b24ad02697755c01919170"
+  }
+ },
+ "trial": {
+  "config": {
+   "COLI_VK_LEGACY": "unset (the five default-on levers armed: TIER_EXPERTS, V4_DECODE_PATH=fork, V4_S1GEMV, TIER_DECODE_GROW, CHAIN_ATTN_FA; one boot line per lever in each raw log)",
+   "COLI_VK_PROFILE": "unset",
+   "COLI_VK_TIER_HOST_GB": "unset",
+   "REGIME": "VRAM_MAX_USED_MB=3584 RAM_GB=16 COLI_BENCH_MEMORY_GB=24, prompt_2k 2,515 tokens, 64 decode tokens",
+   "BUILD": "make -j18 VK=1 deepseek_v4, /root/audit-wt/pr-bench/c @ cb0a0a91 (99 coli_vk symbols)"
+  },
+  "samples": {
+   "tok_s": [
+    0.8987,
+    0.9037,
+    0.9193
+   ],
+   "ttft_s": [
+    260.897,
+    245.498,
+    251.805
+   ],
+   "wall_s": [
+    330.998,
+    315.215,
+    320.339
+   ],
+   "raw": [
+    "defaults-r1.raw.txt",
+    "defaults-r2.raw.txt",
+    "defaults-r3.raw.txt"
+   ]
+  },
+  "median_tok_s": 0.9037,
+  "quality": {
+   "method": "the same gates as the baseline arm at cb0a0a91, plus the tiny-fixture byte-equivalence legs (stdout md5 identical across base / LEGACY=1 / defaults: cf882339…, 81aaba18…, 6b7d7ac0…); every shipped leg rc=0 with its boot lines in-tree (43/43 chain layers, decode-path=fork arena=13.39GiB engaged, s1gemv armed, cs experts armed, FA engaged, decode grow armed, probe wait 181 ms)",
+   "passed": true
+  },
+  "evidence": {
+   "uri": "docs/experiments/dsv4-perf-2026-10-31-audit2/ (defaults-r{1,2,3}.raw.txt verbatim from /root/audit-wt/bench/audit2-defaults-r{1,2,3}.log; window.raw.txt carries the session's own parse lines; sha256 below covers the twelve leg raw logs in name order)",
+   "sha256": "1c9b60c3e2b2858f63c210ce97a312d1400d528768b24ad02697755c01919170"
+  }
+ },
+ "outcome": "improvement",
+ "session": {
+  "date": "2026-10-31",
+  "window": "17:42-19:16 AEDT, 12 legs scheduled, 12 GREEN, 0 SKIPPED-GATE, 0 device-lost — every launch, gate decision, parse line and mem peak in window.raw.txt (verbatim from /root/audit-wt/bench/window.log)",
+  "driver": "driver.sh (verbatim); harness run-audit.sh (verbatim); the audit report's session record is reports/06-bench-report.md on the audit worktree"
+ },
+ "arms": {
+  "legacy": {
+   "env": "COLI_VK_LEGACY=1",
+   "legs": ["legacy-r1.raw.txt", "legacy-r2.raw.txt", "legacy-r3.raw.txt"],
+   "n": 3,
+   "decode_toks": [0.7882, 0.8708, 0.6208],
+   "ttft_s": [253.953, 252.481, 261.163],
+   "wall_s": [333.877, 324.826, 362.648],
+   "decode_median": 0.7882,
+   "ttft_median_s": 253.953,
+   "mem_peak_gib": [15.8, 15.8, 15.8],
+   "notes": "the noisiest arm (host-path decode; spread 0.62-0.87)"
+  },
+  "defaults": {
+   "env": "(none — env-free, the levers' defaults)",
+   "legs": ["defaults-r1.raw.txt", "defaults-r2.raw.txt", "defaults-r3.raw.txt"],
+   "n": 3,
+   "decode_toks": [0.8987, 0.9037, 0.9193],
+   "ttft_s": [260.897, 245.498, 251.805],
+   "wall_s": [330.998, 315.215, 320.339],
+   "decode_median": 0.9037,
+   "ttft_median_s": 251.805,
+   "mem_peak_gib": [2.42, 2.42, 2.41],
+   "notes": "host RAM 15.80 -> 2.4 GiB (the slab registry); tight spread 0.899-0.919"
+  },
+  "oneline": {
+   "env": "COLI_VK_PROFILE=RDNA2 COLI_VK_TIER_HOST_GB=2 over the defaults (the PR's one-line recommended shape)",
+   "legs": ["oneline-r1.raw.txt", "oneline-r2.raw.txt", "oneline-r3.raw.txt"],
+   "n": 3,
+   "decode_toks": [0.8911, 0.933, 0.874],
+   "ttft_s": [149.08, 155.972, 160.839],
+   "wall_s": [219.779, 223.494, 232.923],
+   "decode_median": 0.8911,
+   "ttft_median_s": 155.972,
+   "mem_peak_gib": [2.3, 2.24, 2.27],
+   "notes": "profile: RDNA2 -> ttft (prompt 2515 >= 1000): 2048-row prompt chunks, MM8 on at the ttft stage; the further TTFT lever, decode parity kept"
+  },
+  "upstream_base": {
+   "env": "(none — env-free on the base binary, upstream's own engine)",
+   "legs": ["uvk-r1.raw.txt", "uvk-r2.raw.txt"],
+   "n": 2,
+   "decode_toks": [0.5239, 0.5135],
+   "ttft_s": [414.88, 434.471],
+   "wall_s": [535.135, 557.156],
+   "decode_median": 0.5187,
+   "ttft_median_s": 424.675,
+   "mem_peak_gib": null,
+   "notes": "fresh d67ebd8b maps the 13 GiB host-visible weights onto the device budget before the chain fit -> chain 9/43 layers, fmt-7 tier of 842 experts in 13.33 GiB, decode 0.52 @ ~420-435 s TTFT — an upstream-side change vs the PR's cited gap4-uvk-r3 base leg (0.7291 @ 263.635, 43/43; docs/experiments/dsv4-perf-2026-10-30-gap4/); the PR's window probe is what restores 43/43 in every PR leg here. First two attempts failed instantly (a concurrent base-tree make check had wiped the binary; window.raw.txt rc=NA) and both re-ran GREEN in driver pass 2 on the relinked binary (md5 8b29e19b7b4bdc09b86a55d160eaaf77). mem-peak sampler missed both legs (report D2)"
+  },
+  "mm8_optin": {
+   "env": "COLI_VK_PROFILE=RDNA2 COLI_VK_TIER_HOST_GB=2 COLI_VK_CHAIN_MM8_NDBUF=2 (the optional tail leg)",
+   "legs": ["mm8-r1.raw.txt"],
+   "n": 1,
+   "decode_toks": [0.957],
+   "ttft_s": [162.178],
+   "wall_s": [228.009],
+   "decode_median": 0.957,
+   "ttft_median_s": 162.178,
+   "mem_peak_gib": [2.28],
+   "notes": "best decode of the session (+7.4% vs oneline, ttft +4.0%); n=1 by design, no statistics; the knob ships opt-in (the gap4 mm8 record: docs/experiments/mm8-2026-10-22/)"
+  }
+ },
+ "n_disclosure": {
+  "legacy": 3,
+  "defaults": 3,
+  "oneline": 3,
+  "upstream_base": 2,
+  "mm8_optin": 1,
+  "note": "baseline/trial meet the validator's >=3-sample floor; the base arm ran n=2 (scheduled into reps 1-2) and mm8 is the optional n=1 tail — both disclosed, all reps shipped"
+ },
+ "deltas_measured": {
+  "defaults_vs_legacy_decode_med_med": "+14.65% (0.9037 vs 0.7882; the report's '+14.7%'; per-rep +14.0/+3.8/+48.1%), TTFT -0.8% (parity)",
+  "oneline_vs_legacy_ttft_med_med": "-38.58% (155.972 vs 253.953 s; the report's '-38.5%'; per-rep -41.3/-38.2/-38.4%), decode +13.1%",
+  "oneline_vs_defaults_ttft_med_med": "-38.06% (the report's '-38.0%'), decode -1.4% (parity kept)",
+  "oneline_vs_fresh_base": "decode +71.79% (0.8911 vs 0.5187; the report's '+71.7%'), TTFT -63.27% (155.972 vs 424.675 s; the report's '-63.3%')",
+  "vs_the_pr_quoted_numbers": "the gap4 record's +41.8% med/med reproduced in direction every rep but at +14.7% this session (LEGACY faster than its gap4 band, defaults a touch slower); the one-line TTFT -38.5% sits at the first audit's -37%, short of the PR title's -45% — both records shipped: docs/experiments/dsv4-perf-2026-10-30-gap4/"
+ },
+ "validator_note": "python3 c/experiment_manifest.py passes this manifest (baseline = the n=3 LEGACY arm, trial = the n=3 defaults arm, one changed variable COLI_VK_LEGACY, medians derived from the shipped samples, hashed evidence, passing gates); the oneline / upstream-base / mm8 arms are disclosed extensions beyond the validated pair"
+}

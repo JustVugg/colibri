@@ -17,6 +17,7 @@
 #include "native_quant_fp4_rows16.h"
 #define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
 #include "st.h"
+#include "vk_tier.h"   /* the routed-expert tier's own types (VktAliasSrc: the compute-site group's aliased source) */
 
 #include "ggml_view.h"   /* the FP8 and FP4 entries hand a GGUF matrix to coli_ggml_matmul */
 
@@ -738,6 +739,24 @@ int coli_deepseek_v4_expert_store_open_base(
  * Alternative registered ExpertStore backends safely ignore the request. */
 void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer);
 
+/* The decode-only popularity table (mfu_table.h, the fork's .coli_mfu; S-store
+ * map §5b). Record one ROUTED selection of a decode/spec token -- the token
+ * path calls it for every selection it was handed, device-served and CPU
+ * alike; the batch (prefill) path never records. The merged .coli_usage books
+ * (rt_count, pin ranking, HITS heat) are untouched by this path.
+ *
+ * decode_phase marks which population a store lookup belongs to: the token
+ * path sets 1 around its lookups, the batch path 0, so stats.requests_decode /
+ * hits_decode (hit_rate_d) count decode-only store traffic. Both are no-ops on
+ * a registered non-hot ExpertStore backend. */
+void coli_v4_expert_store_mfu_record(ColiExpertStore *store, ColiExpertKey key);
+void coli_v4_expert_store_decode_phase(ColiExpertStore *store, int decode);
+/* CS-1b (COLI_VK_TIER_EXPERTS): the slab a leased view reads and its bytes -- the hot
+ * store's own slot buffer, one record wide, the alias import's range. NULL when the
+ * view is not this store's slot lease (a foreign backend's, or the base store a
+ * segment adapter opens): the caller refuses the alias and computes on the CPU. */
+const void *coli_v4_expert_store_view_slab(ColiExpertStore *store, const ColiExpertView *view,
+                                           size_t *bytes);
 /* The CUDA expert bank (COLI_CUDA_MOE_BATCH=1 prefill) reads through
  * lookup_uncounted, a lookup that leaves the routing books alone, and keeps the
  * books for one chunk's routing on `layer` (`count` expert ids, each token's
@@ -772,14 +791,33 @@ extern void (*coli_v4_expert_store_ram_gave)(void);
  *   join   the taken rows, f32 (the caller rounds each to bf16); 0 = recompute
  *          them on the CPU;
  *   note   an expert the CPU computed, as the store lent it (rows16 or not);
- *   routed a routing the device served: counted as a store lookup counts one. */
+ *   routed a routing the device served: counted as a store lookup counts one;
+ *   bank   the VRAM bank's refill (COLI_VK_TIER_BANK_LAYER), post-router pre-issue:
+ *          the routed ids of the banked layer's step, whatever serves them;
+ *   issue_group  COLI_VK_TIER_EXPERTS (CS-1b), NULL unless the Vulkan tier armed it:
+ *          called at the token's finish site after an issue that marked every valid
+ *          selection taken and submitted nothing -- ONE expert-batch group (the
+ *          residents' cached handles beside aliased store slabs) whose taken[] on
+ *          return names the sites; 0 = every selection the CPU's;
+ *   cs_served    whether the tier would mark (layer, expert) taken at a decode issue
+ *          with no read (a resident's cached ColiVkExpert handle): the pilot's skip
+ *          test, exactly the CS issue path's own. */
 typedef struct {
     ColiExpertStore *store;
     int (*issue)(int layer, const float *x, int S, int K, const int *idx, const float *w,
                  uint8_t *taken);
     int (*join)(const float **rows);
+    /* COLI_VK_TIER_CS_DEVSUM (the Vulkan CS tier's own, NULL everywhere else): join's
+     * contract and, when the group carried the device-sum tail, *sum its ONE merged
+     * row (each row bf16 rounded, added in rank order -- the finish site's host merge,
+     * bit-for-bit) beside the rows, which stay valid; *sum = NULL on every other join. */
+    int (*join_merged)(const float **rows, const float **sum);
     void (*note)(const ColiExpertView *view);
     void (*routed)(ColiExpertKey key);
+    void (*bank)(int layer, const int *idx, int n);
+    int (*issue_group)(int layer, const float *x, int S, int K, const int *idx, const float *w,
+                       const VktAliasSrc *src, uint8_t *taken);
+    int (*cs_served)(int layer, int expert);
 } ColiV4VkTier;
 extern const ColiV4VkTier *coli_v4_vk_tier;
 
@@ -792,8 +830,19 @@ extern const ColiV4VkTier *coli_v4_vk_tier;
  * in EMAP. */
 void coli_v4_expert_store_note_routed(ColiExpertStore *store, ColiExpertKey key);
 uint32_t *const *coli_v4_expert_store_history(ColiExpertStore *store);
+/* The decode-only popularity table as [layers][experts] rows (the .coli_mfu class):
+ * the rank the Vulkan tier's decode growth installs by. NULL where the engine's
+ * geometry is not the fork table's. */
+uint32_t *const *coli_v4_expert_store_mfu_history(ColiExpertStore *store);
 int coli_v4_expert_store_in_ram(ColiExpertStore *store, ColiExpertKey key);
 uint64_t coli_v4_expert_store_record_bytes(ColiExpertStore *store);
+/* COLI_VK_CHAIN_DPROF (deepseek_v4.c's BLOCK_HYBRID unit): the CS decode settle's
+ * own byte books -- windows measured, the loader reads inside them (ram-hit vs
+ * disk, disk bytes), and the alias sources' slab bytes. Zero unless the gate is on. */
+int v4_cs_dprof(void);
+extern unsigned long long g_v4_cs_win, g_v4_cs_win_ram, g_v4_cs_win_disk, g_v4_cs_win_disk_b;
+extern unsigned long long g_v4_cs_src_n;
+extern double g_v4_cs_src_b;
 /* A GGUF store's experts at `layer` (st_gguf.h): 1 with the ggml types of gate (w1), up
  * (w3) and down (w2) as the file has them, *mx = 1 when the store lays them out as the
  * checkpoint's FP4 (all three MXFP4); 0 for a checkpoint's store, -1 without one. */
@@ -803,6 +852,35 @@ int coli_v4_expert_store_read_private(ColiExpertStore *store, ColiExpertKey key,
 extern int (*coli_v4_expert_store_device_tier)(int layer, int expert);
 
 #endif /* COLI_VULKAN || COLI_CUDA */
+
+/* COLI_VK_TIER_PILOT (the store unit's decode read-ahead, the fork's prefetch_hash_body
+ * class): at a chain host-step the NEXT hash layer's routed selection is already known --
+ * ffn.gate.tid2eid is keyed by token id alone, no route compute -- so its store reads can
+ * go out a full layer early and land under the attention device time. The pilot reads are
+ * warm-only (lookup + release on a reader pool of its own; the slot stays resident, the
+ * MoE entry's own lookup then hits RAM, and the hot store's single-flight load coalesces
+ * one that comes while the pilot's read is still on disk -- one read either way). All
+ * bookkeeping a demand lookup does (usage, history, rt_count, ehit, the request/hit/miss
+ * stats) is skipped on the pilot's threads, so a misprediction costs a slot, never a
+ * placement decision. Outside the tier guard above: the pilot lives in the store unit,
+ * which every build compiles. v4_pilot_classify is the DPROF-only marker at the loader's
+ * preload (hit/late/unpredicted); v4_pilot_quiesce drains at the hot store's own destroy,
+ * before its no-active-leases assert, so no caller needs to drain first and the units
+ * that destroy a store (RUNTIME, the tools) keep no reference to it -- the ownership
+ * test links RUNTIME without the store unit; v4_pilot_report prints the pilot's own DPROF
+ * line. Unset: wanted() is 0, fire does nothing, zero cost. */
+int v4_pilot_wanted(void);
+int v4_pilot_depth(void);
+void v4_pilot_fire(ColiExpertStore *store, int layer, int token, int topk,
+                   const int64_t *tid2eid, int n_experts, int vocab_size);
+void v4_pilot_classify(int layer, int expert);
+void v4_pilot_quiesce(void);
+void v4_pilot_report(void);
+/* The tier's setup (the generate unit, inside the guard above) sets this so the pilot
+ * skips the experts whose cached device handles serve them with no read -- a pilot read
+ * of one of those would be pure disk traffic. NULL (no tier, the unit tests): nothing
+ * is skipped. */
+extern int (*v4_pilot_tier_served)(ColiExpertStore *store, int layer, int expert);
 #ifdef COLI_VULKAN
 /* The dense chain (deepseek_v4_chain.h, COLI_VK_CHAIN): a layer's attention state as its
  * units keep it, so the chain can mirror it on the device and write back what a forward
@@ -976,6 +1054,10 @@ typedef struct {
     int pin_slots_per_layer;
     uint64_t repin_interval;
     uint64_t dspark_reserve_bytes;
+    /* The store's RAM plan, for the Vulkan tier's host pool (vk_tier.h): the
+     * budget the planner resolved and what it projects to hold at capacity. */
+    uint64_t ram_budget_bytes;
+    uint64_t ram_planned_bytes;
 } ColiDeepSeekV4RuntimeOptions;
 
 enum { COLI_V4_RESIDENT_MAX_LAYERS = 128 };
@@ -1195,6 +1277,12 @@ struct ColiV4Session {
      * from that position instead of re-prefilling it. */
     kv_prefix fed;
     int prefix_reused;   /* reuse length of the request in flight, for stats */
+    /* The previous fresh prompt of THIS session (per-slot under KV_SLOTS):
+     * the checkpoint plan's longest-common-prefix runs against it. Global
+     * state would compare another slot's prompt — wrong lineage, wrong
+     * "already captured" verdict (D4: kv-slots and the cold tier coexist). */
+    int *ckpt_prev_ids;
+    int ckpt_prev_len;
     uint64_t spec_attempts;
     uint64_t spec_drafted;
     uint64_t spec_accepted;
@@ -1276,6 +1364,17 @@ int coli_v4_test_force_streaming_direct(ColiExpertStore *store);
 
 ColiV4Session *coli_v4_test_session_bare_create(ColiV4Engine *engine);
 void coli_v4_test_session_bare_destroy(ColiV4Session *session);
+/* COLI_VK_TIER_PILOT's hooks (the store unit's reader pool): fire and quiesce
+ * directly (the chain's A1 submit is the engine's site), the DPROF counters the
+ * pilot's own line prints (which: 0 issued, 1 skip_served, 2 dropped, 3 landed,
+ * 4 failed, 5 hit, 6 late, 7 miss; -1 the pool's started flag), and an env-cache
+ * reset so a leg can arm the lever after earlier legs cached it off (the
+ * counters and the issued-set reset with it). */
+void coli_v4_test_pilot_fire(ColiExpertStore *store, int layer, int token, int topk,
+                             const int64_t *tid2eid, int n_experts, int vocab_size);
+void coli_v4_test_pilot_quiesce(void);
+unsigned long long coli_v4_test_pilot_stat(int which);
+void coli_v4_test_pilot_env_reset(void);
 #endif /* COLI_V4_TEST_HOOKS */
 
 #endif /* COLIBRI_DEEPSEEK_V4_INTERNAL_H */

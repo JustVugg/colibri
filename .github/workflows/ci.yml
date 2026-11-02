@@ -174,6 +174,27 @@ jobs:
         run: |
           cd c
           make vk-memtype-check VK=1
+      - name: The strict capability gate (degradations fatal, refusals not)
+        env:
+          # The script picks no ICD itself, so name the software device the
+          # job installed above, as the Initialise step does for its own run.
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+        run: |
+          cd c
+          # tests/vulkan_strict.sh through its make target: what a silent
+          # degradation costs under COLI_VK_STRICT=1 (exit 70 naming the op),
+          # what it must not cost (a format with no device form is refused and
+          # the run continues -- Lavapipe refuses plenty), and that
+          # COLI_VK_LEGACY=1 reproduces the five default levers at =0 byte for
+          # byte. The tier and chain binaries are already built by the legs
+          # above; this adds only the degrade helper's small compile.
+          make vk-strict-check VK=1 > vk-strict.log 2>&1 || {
+            cat vk-strict.log; echo "FAIL: the strict capability gate"; exit 1; }
+          # The script skips itself (exit 0) on a host with no Vulkan device,
+          # so a runner whose Lavapipe stops loading would leave a green job
+          # over a gate that never ran. The PASS line is the gate.
+          grep -qx "PASS: strict gate" vk-strict.log || {
+            cat vk-strict.log; echo "FAIL: the strict gate produced no PASS line"; exit 1; }
 
   # Every engine with a Vulkan hook, run twice on its tiny fixture: on the CPU and on
   # Lavapipe, with the same snapshot and settings. The gate is the CPU's tokens (and

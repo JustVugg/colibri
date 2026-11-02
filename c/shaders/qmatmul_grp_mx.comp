@@ -1,0 +1,173 @@
+#version 450
+// The expert batch's grouped GEMM for MXFP4 (fmt 7, and its packed-scales twin 15)
+// experts (backend_vulkan.c, xb_grp_record mode 4): one dispatch covers every expert of a
+// batch, qmatmul_grp.comp's items and expert table, the weights the tier's native tensors
+// (uint words of 8 e2m1 nibbles, a float scale a 32-input group — fmt 15: a ue8m0 byte,
+// read by the expert's table entry) read by address; float arithmetic, no matrix
+// units, any subgroup size — the shape of qmatmul_grp_bd.comp (the GGUF blocks') with the
+// decode of qmatmul_grp_gemv.comp (its MXFP4 path), for the native checkpoints the GEMV
+// only served a row at a time.
+//   y[s,o]   = sum_i x[s,i] * w[o,i]                                       (default)
+//   hid[s,o] = silu(gate[s,o]) * up[s,o], clamped as expert_act.comp's act 0  (-DGATE_UP)
+// A workgroup of 256 takes an item: 32 rows of one expert and BO outputs (32 with GATE_UP,
+// its two matrices, else 64), through the input in steps of 64: 128 threads decode the
+// step's 64 weights of 32 (GATE_UP: 32 of the gate's and 32 of the up's) rows — one uvec4
+// a thread, its 32 nibbles and the group's one scale (gs a multiple of 32: a half-step
+// never spans two groups) — into shared memory, the other 128 stage the 32 rows' 64 inputs;
+// then each thread accumulates one output against 4 rows (GATE_UP, for both matrices) or 8
+// from vec4 reads, rows 68 floats apart (the 8 lanes of a phase on 8 bank groups).
+// Host gates: I % 64 == 0, D % 64 == 0, gs % 32 == 0, rowWords % 4 == 0 and every expert
+// of the batch in fmt 7 or fmt 15, one format (one layer's).
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer WRef4 { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer SRef { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer BRef { uint v[]; };   // fmt 15's packed scale words
+layout(std430, binding = 0) readonly buffer X  { vec4 x4[]; };     // packed rows of all experts
+layout(std430, binding = 1) readonly buffer IT { uvec4 items[]; };  // (expert, first row, output block, -)
+layout(std430, binding = 2) readonly buffer ET { uint etab[]; };    // 16 uints per expert (qmatmul_grp.comp's)
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };      // packed output rows
+layout(std430, binding = 4) readonly buffer AM { int amap[]; };     // kgat > 0: qmatmul_grp.comp's
+layout(push_constant) uniform P { int I, O; float limit; int ibase; int kgat; int rpw; int act; float a, b; } p;
+
+#define TM 32u
+#define TK 64u
+#define BO 64u
+#ifdef GATE_UP
+#undef BO
+#define BO 32u
+#endif
+#define LDK 68u
+#define LDV (LDK / 4u)
+shared vec4 wg4[BO * LDV];         // the block's decoded rows (the gate's with GATE_UP)
+#ifdef GATE_UP
+shared vec4 wu4[BO * LDV];         // and the up's
+#endif
+shared vec4 xs4[TM * LDV];         // the 32 rows' inputs
+
+// MXFP4: e2m1 code n (bit 3 the sign) is (0, 0.5, 1, 1.5, 2, 3, 4, 6)[n & 7], twice those
+// packed as nibbles in one constant — qmatmul_grp_gemv.comp's e2, a word its dmx halves
+float e2(uint n) {
+    float v = float((0xC8643210u >> ((n & 7u) * 4u)) & 15u) * 0.5;
+    return (n & 8u) != 0u ? -v : v;
+}
+// fmt 15: the scales are ue8m0 bytes, 4 to a word (the table's fmt entry says which); a
+// byte's float is its exponent into the float's exponent field -- 2^(e-127) exactly, the
+// same bits the f32-scale form (fmt 7) holds after the host's ue8m0 -> f32 expansion
+float msc(uint fmt, SRef sf, BRef sb, uint b) {
+    if (fmt == 15u) {
+        uint w = sb.v[b >> 2u];
+        return uintBitsToFloat(uint(bitfieldExtract(w, int((b & 3u) * 8u), 8)) << 23);
+    }
+    return sf.v[b];
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uvec4 it = items[uint(p.ibase) + gl_WorkGroupID.x];
+    uint eb = it.x * 16u;
+    uint S = etab[eb + 8u], xoff = etab[eb + 9u], rowWords = etab[eb + 11u],
+         gs = max(etab[eb + 12u], 32u);
+    uint ef = etab[eb + 10u];   /* the expert's format: 7 f32 scales, 15 packed ue8m0 bytes */
+    uint I = uint(p.I), ng = I / gs, rw4 = rowWords / 4u;
+    uint s0 = it.y, o0 = it.z * BO, O = uint(p.O);
+#ifdef GATE_UP
+    WRef4 gw = WRef4(uvec2(etab[eb + 0u], etab[eb + 1u]));
+    SRef  gs_ = SRef(uvec2(etab[eb + 2u], etab[eb + 3u]));
+    BRef  gb_ = BRef(uvec2(etab[eb + 2u], etab[eb + 3u]));
+    WRef4 uw = WRef4(uvec2(etab[eb + 4u], etab[eb + 5u]));
+    SRef  us_ = SRef(uvec2(etab[eb + 6u], etab[eb + 7u]));
+    BRef  ub_ = BRef(uvec2(etab[eb + 6u], etab[eb + 7u]));
+    uint ty = tid / 8u, tx = tid % 8u;    // output o0 + ty, rows s0 + tx + 8j
+    vec4 ag[4], au[4];
+    [[unroll]] for (int j = 0; j < 4; j++) { ag[j] = vec4(0.0); au[j] = vec4(0.0); }
+#else
+    WRef4 dw = WRef4(uvec2(etab[eb + 0u], etab[eb + 1u]));
+    SRef  ds_ = SRef(uvec2(etab[eb + 2u], etab[eb + 3u]));
+    BRef  db_ = BRef(uvec2(etab[eb + 2u], etab[eb + 3u]));
+    uint ty = tid / 4u, tx = tid % 4u;    // output o0 + ty, rows s0 + tx + 4j
+    vec4 ac[8];
+    [[unroll]] for (int j = 0; j < 8; j++) ac[j] = vec4(0.0);
+#endif
+    for (uint k0 = 0u; k0 < I; k0 += TK) {
+        barrier();
+        if (tid < 128u) {   // decode: (matrix,) row, which of the step's two 32-input halves
+#ifdef GATE_UP
+            uint m = tid >> 6;          // 0 the gate's, 1 the up's
+            uint r = (tid >> 1) & 31u, h = tid & 1u;
+            WRef4 w = m != 0u ? uw : gw;
+            SRef sc = m != 0u ? us_ : gs_;
+            BRef sb = m != 0u ? ub_ : gb_;
+#else
+            uint r = tid >> 1, h = tid & 1u;
+            WRef4 w = dw;
+            SRef sc = ds_;
+            BRef sb = db_;
+#endif
+            uint o = min(o0 + r, O - 1u);
+            /* one half's 32 inputs: one uvec4 of weights, one scale (gs % 32 == 0 keeps a
+             * half inside a group; the group index is the element's, both multiples of 32) */
+            uvec4 wv = w.v[o * rw4 + k0 / 32u + h];
+            float s = msc(ef, sc, sb, o * ng + (k0 + h * 32u) / gs);
+            vec4 d[8];
+            [[unroll]] for (uint j = 0u; j < 4u; j++) {
+                uint wd = wv[j];
+                d[2u * j]      = vec4(e2(wd), e2(wd >> 4u), e2(wd >> 8u), e2(wd >> 12u)) * s;
+                d[2u * j + 1u] = vec4(e2(wd >> 16u), e2(wd >> 20u), e2(wd >> 24u), e2(wd >> 28u)) * s;
+            }
+            [[unroll]] for (uint j = 0u; j < 8u; j++)
+#ifdef GATE_UP
+                if (m != 0u) wu4[r * LDV + h * 8u + j] = d[j];
+                else wg4[r * LDV + h * 8u + j] = d[j];
+#else
+                wg4[r * LDV + h * 8u + j] = d[j];
+#endif
+        } else {            // the rows' inputs: 32 x 64 values, 16 a thread
+            for (uint e = tid - 128u; e < TM * TK / 4u; e += 128u) {
+                uint r = e / (TK / 4u), c4 = e - r * (TK / 4u);
+                bool ok = s0 + r < S;
+                uint xr = xoff + s0 + min(r, S - 1u - s0);
+#ifdef GATE_UP
+                if (p.kgat > 0) xr = uint(amap[xr]) / uint(p.kgat);
+#endif
+                xs4[r * LDV + c4] = ok ? x4[(xr * I + k0) / 4u + c4] : vec4(0.0);
+            }
+        }
+        barrier();
+        [[unroll]] for (uint k4 = 0u; k4 < TK / 4u; k4++) {
+#ifdef GATE_UP
+            vec4 wg = wg4[ty * LDV + k4], wu = wu4[ty * LDV + k4];
+            [[unroll]] for (int j = 0; j < 4; j++) {
+                vec4 xv = xs4[(tx + 8u * uint(j)) * LDV + k4];
+                ag[j] += wg * xv; au[j] += wu * xv;
+            }
+#else
+            vec4 w = wg4[ty * LDV + k4];
+            [[unroll]] for (int j = 0; j < 8; j++) ac[j] += w * xs4[(tx + 4u * uint(j)) * LDV + k4];
+#endif
+        }
+    }
+    uint o = o0 + ty;
+    if (o >= O) return;
+#ifdef GATE_UP
+    [[unroll]] for (int j = 0; j < 4; j++) {
+        uint s = s0 + tx + 8u * uint(j);
+        if (s >= S) continue;
+        float g = (ag[j].x + ag[j].y) + (ag[j].z + ag[j].w), u = (au[j].x + au[j].y) + (au[j].z + au[j].w);
+        if (p.limit > 0.0) { if (g > p.limit) g = p.limit; if (u > p.limit) u = p.limit; if (u < -p.limit) u = -p.limit; }
+        y[(xoff + s) * O + o] = (g / (1.0 + exp(-g))) * u;
+    }
+#else
+    [[unroll]] for (int j = 0; j < 8; j++) {
+        uint s = s0 + tx + 4u * uint(j);
+        if (s >= S) continue;
+        uint yr = xoff + s;
+        if (p.kgat > 0) yr = uint(amap[yr]);
+        y[yr * O + o] = (ac[j].x + ac[j].y) + (ac[j].z + ac[j].w);
+    }
+#endif
+}

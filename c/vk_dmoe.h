@@ -147,6 +147,46 @@ static int vkc_dmoe_wanted(void) {
     if (on < 0) { const char *e = getenv("COLI_VK_CHAIN_MOE"); on = !(e && *e == '0'); }
     return on;
 }
+/* COLI_VK_DMOE: an engine's opt-in single-layer arm of this (scaffolding for a
+ * measurement: one layer, the decode path) -- the one layer whose routed experts run
+ * in the frame. A layer index >= 1 arms layer n; 0, unset or anything else is off, the
+ * host's step as before. Distinct from COLI_VK_CHAIN_MOE, which the engines that follow
+ * this header default on. */
+static int vkc_dmoe_layer_parse(const char *v) {
+    int n = v && *v ? atoi(v) : 0;
+    return n > 0 ? n : 0;
+}
+static int vkc_dmoe_layer_env(void) {
+    static int n = -1;
+    if (n < 0) n = vkc_dmoe_layer_parse(getenv("COLI_VK_DMOE"));
+    return n;
+}
+/* COLI_VK_DMOE=all -- the multi-layer form (the layer-outer loop's arm): every layer of
+ * the engine's chain in one prepare (lo..L, vk_dmoe.h's own range support), the per-layer
+ * decline staying the engine's (its mask knows the hash layers and the gates). S1's arm
+ * holds exactly one layer for the run; this is the lo..L form the reorder drives. */
+static int vkc_dmoe_all_env(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_DMOE"); on = e && !strcmp(e, "all"); }
+    return on;
+}
+/* COLI_VK_DMOE_ROWS_MAX=R: the amdgpu boundary as a cap -- at most R of a prompt chunk's
+ * rows per submission, vkc_submit(0) + vkc_begin between the groups (the
+ * vkc_layer_recorded pattern). A whole chunk's grouped GEMMs are seconds of GPU work in
+ * one submission at 2048 rows (K1: ~2-4 s of it hard-recovers on amdgpu; the same load
+ * passes split 8 layers a frame; U \u00a72: the armed chunk's 3.75 GiB of reads lost the
+ * device), and the compute reads VRAM at ~0.1 s a layer-visit -- so R near 512 keeps a
+ * frame in the ~1 s class. 0 (the default): the whole chunk in one submission, the bits
+ * and frames of today. */
+static int vkc_dmoe_rows_max_parse(const char *v) {
+    int r = v && *v ? atoi(v) : 0;
+    return r > 0 ? r : 0;
+}
+static int vkc_dmoe_rows_max(void) {
+    static int r = -1;
+    if (r < 0) r = vkc_dmoe_rows_max_parse(getenv("COLI_VK_DMOE_ROWS_MAX"));
+    return r;
+}
 static int vkc_dmoe_hyb_gated(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_VK_HYBRID_GATE"); on = !(e && *e == '0'); }
@@ -690,11 +730,24 @@ static int vkc_dmoe_layer(VkcDmoe *d, int layer, int n, VkcBuf *lg, VkcBuf *bias
          * two were even (104-114 against 109-120). */
         int stg = d->stg_on && d->frn[i] > 0, have = stg && d->stg_layer == layer;
         m.floats = vkt_host_pool_on() && !(d->stg_on && d->full[i]);   /* staged: VRAM, the matrix units' GEMMs */
-        if (!vkc_route(lg, bias, d->rid, d->rwt, &r)) return 0;
-        /* the layer's host pool experts into stg: after the layer before is done reading it,
-         * before this one's GEMMs read it (both by address, so the barriers are ours) */
-        if (stg && !have && !(vkc_barrier() && vkc_fetch(d->fr, d->fro[i], d->frn[i], d->frmax[i], d->stg) && vkc_barrier())) return 0;
-        if (!vkc_moe_rows(x, d->rid, d->rwt, d->stg_on ? d->tabs : d->tab, &d->rows, d->y, &m)) return 0;
+        /* COLI_VK_DMOE_ROWS_MAX's frame split (vkc_dmoe_rows_max above): each group routes
+         * its own rows and computes them into its own slice of y -- the buffers are the
+         * chunk's (vkc_dmoe_prepare sized them), the groups disjoint, so at equal rows the
+         * split computes what the whole chunk does (the unit's split-vs-unsplit seam). */
+        const int rmax = vkc_dmoe_rows_max();
+        for (int off = 0, first = 1; off < n; first = 0, off += rmax > 0 ? rmax : n) {
+            int gn = n - off < rmax || rmax <= 0 ? n - off : rmax;
+            VkcRoute rg = r; VkcMoe mg = m;
+            rg.S = gn; rg.l_off = off * d->E; rg.i_off = io + off * d->K; rg.w_off = off * d->K;
+            mg.S = gn; mg.x_off = off * mp->D; mg.i_off = io + off * d->K; mg.w_off = off * d->K; mg.y_off = off * mp->D;
+            if (!first && !(vkc_submit(0) && vkc_begin())) return 0;   /* a frame per group: no submission carries the whole chunk */
+            if (!vkc_route(lg, bias, d->rid, d->rwt, &rg)) return 0;
+            /* the layer's host pool experts into stg: once, after the layer before is done reading it,
+             * before this one's GEMMs read it (both by address, so the barriers are ours); skipped
+             * when stg still holds this layer's copies (stg_reused) */
+            if (first && stg && !have && !(vkc_barrier() && vkc_fetch(d->fr, d->fro[i], d->frn[i], d->frmax[i], d->stg) && vkc_barrier())) return 0;
+            if (!vkc_moe_rows(x, d->rid, d->rwt, d->stg_on ? d->tabs : d->tab, &d->rows, d->y, &mg)) return 0;
+        }
         if (stg && have) d->stg_reused++;
         else if (stg) { d->keep_valid = 0; d->stg_steps++; for (int k = 0; k < d->frn[i]; k++) d->stg_bytes += 4.0 * d->frh[4 * (d->fro[i] + k) + 3]; }
         d->stg_layer = stg ? layer : -1;

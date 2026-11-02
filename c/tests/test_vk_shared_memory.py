@@ -35,6 +35,25 @@ CHECKED_BY_HOST = {
     "qmatmul_grp_gate_up_bd.spv": ("backend_vulkan.c", "GRP_BD_SHARED"),
 }
 
+# The flash-attention tile family (COLI_VK_CHAIN_ATTN_FA: chain_dsv4_fa.comp's four
+# builds; the gather needs no Workgroup storage) is the one family above the 32 KiB
+# floor whose degradation is the spec's own rather than a host constant: a pipeline
+# that declares more shared memory than the device's maxComputeSharedMemorySize is
+# invalid, so vkCreateComputePipelines refuses it (spec-required) and vk_chain.c's
+# fa4_pipe takes that refusal as the lever's per-pipeline degrade ("the tile's
+# pipelines did not load" -> mode 0, the lever's one boot line -- never a device
+# loss as chain_gemv2's was). Budgets: a 64 KiB-LDS device (AMD, Intel) runs both
+# tiles; a 48 KiB device (NVIDIA Pascal/Turing) runs the 42,080 B decode twin only
+# while the 54,464 B prefill tile's creation fails and prefill stays mode 0; a
+# <=32 KiB device (MoltenVK, Lavapipe) compiles neither and everything is mode 0.
+# The table pins each build's bytes: a retile that changes them must update it.
+FA_PIPELINE_CREATE_REFUSAL = {
+    "chain_dsv4_fa.spv": 54464,
+    "chain_dsv4_fa_f16.spv": 54464,
+    "chain_dsv4_fa_dec.spv": 42080,
+    "chain_dsv4_fa_dec_f16.spv": 42080,
+}
+
 OP_TYPE_INT, OP_TYPE_FLOAT, OP_TYPE_VECTOR, OP_TYPE_MATRIX = 21, 22, 23, 24
 OP_TYPE_ARRAY, OP_TYPE_STRUCT, OP_TYPE_POINTER = 28, 30, 32
 OP_CONSTANT, OP_SPEC_CONSTANT, OP_SPEC_CONSTANT_OP, OP_VARIABLE = 43, 50, 52, 59
@@ -96,6 +115,11 @@ class SharedMemoryTest(unittest.TestCase):
         over = []
         for path in modules:
             fixed = sum(n for n, spec in workgroup(path) if not spec)
+            if path.name in FA_PIPELINE_CREATE_REFUSAL:
+                self.assertEqual(fixed, FA_PIPELINE_CREATE_REFUSAL[path.name],
+                                 f"{path.name}: the FA carve-out table is stale -- "
+                                 f"a retile changed the build's shared arrays")
+                continue
             if fixed > SMALLEST_DEVICE and path.name not in CHECKED_BY_HOST:
                 over.append(f"{path.name}: {fixed} bytes of fixed-size shared memory")
         self.assertEqual(over, [], "size these from maxComputeSharedMemorySize with a specialization "

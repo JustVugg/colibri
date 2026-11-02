@@ -1,0 +1,101 @@
+#version 450
+/* Dedicated S=1 fmt=15 (MXFP4 codes, packed ue8m0 scales) GEMV -- the decode
+ * expert batch's down matmul of a single row (COLI_VK_V4_S1GEMV, the fork's
+ * qmatmul_s1_fp4.comp ported near-verbatim; the fork runs it as its decode group's
+ * per-expert S=1 matmul, fork backend_vulkan.c ds4vk_expert_s1gemv_pick).
+ *
+ * qmatmul.comp's fmt=15 branch already runs a subgroup-per-row GEMV at S=1, but
+ * pays per-element costs the dedicated form drops:
+ *   - the e2m1 nibble decode went through a data-dependent const-array LUT gather
+ *     (mx4's lut[8]) -- the exact pattern measured catastrophic for e4m3 on RADV
+ *     (qmatmul.comp's header); every e2m1 value is a dyadic rational, so the
+ *     arithmetic decode below is bit-identical to the LUT;
+ *   - the fmt/S dispatch chain and the per-element `i < I` bounds checks (I % 8
+ *     is host-gated at the pick, so words*8 == I exactly);
+ *   - the S-stride on x/y (S == 1 here by construction).
+ *
+ * BITWISE contract vs the generic dispatch (xb_s1gemv_parity asserts it on the
+ * live device before the lever may arm anything -- the fork's own discipline, its
+ * test-vk-dsv4-experts): the lane->word assignment (`wi = lane; wi += sgsize`),
+ * the within-word k order, the per-word expression `sum += a * sc` with `a` the
+ * k-ordered 8-wide partial, and the single fp32 subgroupAdd are VERBATIM the
+ * generic fmt=15 branch's. The word-partial grouping (not the fork's per-element
+ * x*w*sc) is load-bearing: msc15(0) is +0.0, and the zero-sign of `a*0.0` is a
+ * bit the two groupings can split. x is ALWAYS staged (the pick refuses I > 6144,
+ * matching xsh).
+ *
+ * Deltas from the fork's kernel: fmt 15's scale decode is msc15 (byte<<23) --
+ * the port's packed-scales form; the fork's e8m0_to_f32 maps byte 0 -> 2^-127 and
+ * 0xff -> NaN where this port's maps them to +0.0 and +Inf, and parity here is
+ * against THIS port's generic form; no woff/soff push constants (the port's alias
+ * records bind offset-baked buffers, so row 0 is word 0); the push constants keep
+ * struct PC's six ints (qmatmul.comp's layout, the pipeline layout the batch
+ * already binds its down sets with). */
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer X  { float x[]; };
+layout(std430, binding = 1) readonly buffer W  { uint  w[]; };     // row o at o*rowWords
+layout(std430, binding = 2) readonly buffer Sc { float scale[]; }; // 4 packed ue8m0 bytes/word
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    int fmt;        // ignored (15 by construction)
+    int S;          // ignored (1 by construction)
+    int I, O;
+    int rowWords;   // uint32 words per weight row (I/8)
+    int gs;         // group size (32 at the real geometry; multiple of 8, host-gated)
+} p;
+
+/* fmt 15's packed ue8m0 byte for global group index gi (scale[] is word-addressed,
+ * 4 codes per word) -- verbatim qmatmul.comp's msc15: a byte's float is its
+ * exponent into the float's exponent field. */
+float msc15(uint gi) {
+    uint w = floatBitsToUint(scale[gi >> 2u]);
+    return uintBitsToFloat(uint(bitfieldExtract(w, int((gi & 3u) * 8u), 8)) << 23);
+}
+/* e2m1 arithmetic decode, built from bits (NOT ldexp -- its exp2 lowering is
+ * 1/4-rate on RDNA2; the fork's note): normal codes f32 bits = ((126 + e) << 23)
+ * | (mant << 22) with e = m>>1 >= 1; the two subnormals (m < 2) are 0.0 and 0.5. */
+float mx4a(uint word, int nib) {
+    uint n = (word >> (uint(nib) * 4u)) & 0xfu;
+    uint m = n & 7u;
+    uint bits = ((126u + (m >> 1u)) << 23u) | ((m & 1u) << 22u);
+    float v = (m < 2u) ? (0.5f * float(m)) : uintBitsToFloat(bits);
+    return (n & 8u) != 0u ? -v : v;
+}
+
+shared float xsh[6144];
+
+void main() {
+    int tid = int(gl_LocalInvocationID.x);
+    int nth = int(gl_WorkGroupSize.x);
+
+    // Stage x[:] into shared once; every row this workgroup computes reuses it.
+    for (int i = tid; i < p.I; i += nth) xsh[i] = x[i];
+    barrier();
+
+    int sg      = int(gl_SubgroupID);
+    int lane    = int(gl_SubgroupInvocationID);
+    int sgsize  = int(gl_SubgroupSize);
+    int nsg     = nth / sgsize;                      // subgroups (= rows) per workgroup
+    int stride  = int(gl_NumWorkGroups.x) * nsg;     // grid-stride over output rows
+
+    int words = p.I >> 3;                    // I % 8 == 0 (host-gated)
+    int ng    = (p.I + p.gs - 1) / p.gs;     // scale groups per row
+
+    for (int o = int(gl_WorkGroupID.x) * nsg + sg; o < p.O; o += stride) {
+        uint rowBase = uint(o) * uint(p.rowWords);
+        uint sb = uint(o) * uint(ng);
+        float sum = 0.0;
+        for (int wi = lane; wi < words; wi += sgsize) {
+            uint pk = w[rowBase + uint(wi)]; int i0 = wi * 8;
+            float a = 0.0;
+            for (int k = 0; k < 8; k++) { int i = i0 + k;
+                a += xsh[i] * mx4a(pk, k); }
+            sum += a * msc15(sb + uint(i0 / p.gs));  /* an 8-wide word never straddles a group */
+        }
+        float tot = subgroupAdd(sum);
+        if (lane == 0) y[o] = tot;   /* fmt 15: per-group scales, no row scale */
+    }
+}

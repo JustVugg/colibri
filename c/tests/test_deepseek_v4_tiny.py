@@ -13,6 +13,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+EXPECT_STDERR: str | None = None   # --expect-stderr: every target run must print this (the engagement-line gate)
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import openai_server
 
@@ -36,6 +38,10 @@ def run(
         raise AssertionError(
             f"{label} failed with exit code {result.returncode}\n"
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    if EXPECT_STDERR and not re.search(EXPECT_STDERR, result.stderr):
+        raise AssertionError(
+            f"{label}: the engagement line /{EXPECT_STDERR}/ is missing from stderr:\n{result.stderr}"
         )
     return result
 
@@ -347,7 +353,16 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--fixture", type=Path, required=True)
+    parser.add_argument(
+        "--expect-stderr",
+        default=None,
+        help="a regex every target run's stderr must carry (the engagement-line gate, "
+        "COLI_VK_V4_DECODE_PATH=fork's precedent: the pilot leg's asserted line)",
+    )
     args = parser.parse_args()
+
+    global EXPECT_STDERR
+    EXPECT_STDERR = args.expect_stderr
 
     binary = args.binary.resolve()
     fixture = args.fixture.resolve()

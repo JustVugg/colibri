@@ -1,0 +1,207 @@
+#version 450
+// The single-token mHC pair on the dense chain (vk_chain.c, COLI_VK_CHAIN_MHC_S1):
+// the fork's mhc_dec_pre.comp / mhc_dec_post.comp (d11fba5b, its Level-1 decode
+// fusion) on chain_mhc's own buffers and offsets, for one row of H <= 8 streams of
+// D floats. At S = 1 the standing chain is six dispatches a site -- the fn matmul,
+// chain_mhc SPLIT, COLLAPSE, a bf16 round, chain_norm, another bf16 round -- plus
+// POST and a round on the way out; this file is the fork's finding that the whole
+// pre tail is one 256-thread workgroup and the post one thread an output, the
+// dispatch count the multi-dispatch form pays at one row being exactly what the
+// fork measured regressing its own 3-dispatch chain (0.315 -> 1.161 ms/call).
+//
+// mode 0, the pre (ONE workgroup): RMS-inverse over the H*D streams -> Sinkhorn ->
+// collapse -> branch RMSNorm -> bf16, into hp ([H pre][H post][H*H comb], the same
+// layout chain_mhc's SPLIT leaves, so a later standing POST can consume it) and y
+// (the normed collapsed row, bf16-rounded as the standing chain's last round leaves
+// it). phase 1 and phase 3 are the fork's 256-lane trees; phase 2 replays
+// mhc_sinkhorn's exchange order serially on lane 0 (a fixed serial order needs no
+// mid-chain barriers, so the workgroup never enters non-uniform control flow).
+// mode 1, the post: y[j*D + d] = (sum_i comb[i*H+j] * x[i*D+d]) + post[j] * m[d],
+// one thread an output, the bf16 round folded -- the standing mode 2 plus its
+// separate round dispatch, the comb accumulation in the same ascending order.
+//
+// Numerics (D11's thresholded class, never bit-identical to the standing chain):
+// the sigmoid/softmax affine and the collapse products are fused single-rounding
+// fmas where the standing shaders make two roundings, the pre's mix*r product is
+// rounded once on both sides, the reductions are strided fma trees against the
+// standing shaders' strided adds, and the branch norm multiplies in the other
+// order ((x*inv)*w against (x*w)*r) -- the fork's own fused kernels' arithmetic
+// kept verbatim (it measured 1.6e-6 post / comb exact / 1.65e-3 normalized against
+// its CPU reference; the fork's exp/sigmoid branch choice is the same as chain_mhc's
+// sig()). The RMS inverse is the fork's special reciprocal (nan/0/inf preserved)
+// where the standing shaders take a plain 1/sqrt: the two differ only off the
+// finite range. H <= 8 streams and D <= 4096 (the collapsed rows stage in LDS,
+// the fork's own cap); anything else the host refuses and the standing chain runs.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer XB { float x[];  };   // mode 0: the streams; 1: the same
+layout(std430, binding = 1) readonly  buffer MB { float m[];  };   // mode 0: the fn matmul's mixes; 1: the branch
+layout(std430, binding = 2)          buffer HB { float hp[]; };    // pre | post | comb, chain_mhc's layout
+layout(std430, binding = 3) readonly  buffer PB { float prm[]; };  // scale[3] base[...] at hc_off, the norm weight at n_off
+layout(std430, binding = 4) writeonly buffer YB { float y[];  };   // mode 0: the normed row; 1: the written-back streams
+
+layout(push_constant) uniform P {
+    int mode, H, D, iters;
+    int x_off, m_off, hp_off, y_off;
+    int hc_off, n_off;
+    float eps, hc_eps, n_eps;
+} p;
+
+const int HMAX = 8;      // streams (chain_mhc's own cap)
+const int DMAX = 4096;   // the collapsed rows, LDS-staged (the fork's HMAX)
+
+shared float g_part[256];   // the reduction tree (the fork's mhc_rmsnorm pattern)
+shared float s_inv;         // phase 1 -> phase 2, then phase 3's own, broadcast
+shared float s_pre[HMAX];   // phase 2 -> phase 3
+shared float s_x[DMAX];     // the collapsed (bf16-rounded) row
+
+float sigmoid(float v) {   /* chain_mhc.comp's sig, the fork's ds4vk_sigmoid */
+    if (v >= 0.0f) { float decay = exp(-v); return 1.0f / (1.0f + decay); }
+    float growth = exp(v);
+    return growth / (1.0f + growth);
+}
+/* the fork's ds4vk_bf16 (glue1/mhc_post's bf16r): round half to even on the 16-bit
+ * boundary, inf/nan through */
+float bf16r(float v) {
+    uint u = floatBitsToUint(v);
+    if ((u & 0x7f800000u) != 0x7f800000u) u += 0x7fffu + ((u >> 16) & 1u);
+    u &= 0xffff0000u;
+    return uintBitsToFloat(u);
+}
+/* mhc_rmsnorm.comp's special reciprocal: nan, zero and inf preserved */
+float recip_special(float s) {
+    if (isnan(s)) return s;
+    if (s == 0.0f) return uintBitsToFloat(0x7f800000u | (floatBitsToUint(s) & 0x80000000u));
+    if (isinf(s)) return uintBitsToFloat(floatBitsToUint(s) & 0x80000000u);
+    return 1.0f / s;
+}
+
+void dec_pre() {
+    int H = p.H, D = p.D, HD = H * D;
+    uint lid = gl_LocalInvocationID.x;
+    int xb = p.x_off, mo = p.m_off, hb = p.hp_off, pb = p.hc_off;
+
+    /* ---- phase 1: the RMS inverse over the H*D streams (the fork's fold_inv body) ---- */
+    float part = 0.0;
+    for (int i = int(lid); i < HD; i += 256) {
+        float xi = x[xb + i];
+        part = fma(xi, xi, part);
+    }
+    g_part[lid] = part;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) g_part[lid] = g_part[lid] + g_part[lid + s];
+        barrier();
+    }
+    if (lid == 0u) {
+        float mean = g_part[0] / float(HD);   /* H*D a power of two at the model: exact */
+        s_inv = recip_special(sqrt(mean + p.eps));
+    }
+    barrier();
+    float iv = s_inv;
+
+    /* ---- phase 2: the Sinkhorn, serially on lane 0 in mhc_sinkhorn's statement order
+     * (the fork's dec_pre body). The affine's mix*r product rounds once, then one fused
+     * scale-mul + base-add fma; the post scale is mHC's 2.0. ---- */
+    if (lid == 0u) {
+        float s0 = prm[pb], s1 = prm[pb + 1], s2 = prm[pb + 2];
+        float pre_v[HMAX], post_v[HMAX], comb_v[HMAX * HMAX];
+        for (int i = 0; i < H; i++) {
+            float t0 = m[mo + i] * iv;
+            pre_v[i] = sigmoid(fma(t0, s0, prm[pb + 3 + i])) + p.hc_eps;
+        }
+        for (int i = 0; i < H; i++) {
+            float t0 = m[mo + H + i] * iv;
+            post_v[i] = 2.0f * sigmoid(fma(t0, s1, prm[pb + 3 + H + i]));
+        }
+        for (int r = 0; r < H; r++)
+            for (int c = 0; c < H; c++)
+                comb_v[r * H + c] = fma(m[mo + 2 * H + r * H + c] * iv, s2, prm[pb + 3 + 2 * H + r * H + c]);
+        for (int r = 0; r < H; r++) {           /* the row softmax, + hc_eps after the divide */
+            int r0 = r * H;
+            float mxv = -3.0e38;
+            for (int c = 0; c < H; c++) if (comb_v[r0 + c] > mxv) mxv = comb_v[r0 + c];
+            for (int c = 0; c < H; c++) comb_v[r0 + c] = exp(comb_v[r0 + c] - mxv);
+            precise float rs = comb_v[r0];
+            for (int c = 1; c < H; c++) rs = rs + comb_v[r0 + c];
+            for (int c = 0; c < H; c++) comb_v[r0 + c] = comb_v[r0 + c] / rs + p.hc_eps;
+        }
+        for (int c = 0; c < H; c++) {           /* one column normalize, hc_eps on the sum */
+            precise float cs = comb_v[c];
+            for (int r = 1; r < H; r++) cs = cs + comb_v[r * H + c];
+            for (int r = 0; r < H; r++) comb_v[r * H + c] = comb_v[r * H + c] / (cs + p.hc_eps);
+        }
+        for (int it = 1; it < p.iters; it++) {
+            for (int r = 0; r < H; r++) {       /* row normalize */
+                int r0 = r * H;
+                precise float rr = comb_v[r0];
+                for (int c = 1; c < H; c++) rr = rr + comb_v[r0 + c];
+                for (int c = 0; c < H; c++) comb_v[r0 + c] = comb_v[r0 + c] / (rr + p.hc_eps);
+            }
+            for (int c = 0; c < H; c++) {       /* column normalize */
+                precise float cc = comb_v[c];
+                for (int r = 1; r < H; r++) cc = cc + comb_v[r * H + c];
+                for (int r = 0; r < H; r++) comb_v[r * H + c] = comb_v[r * H + c] / (cc + p.hc_eps);
+            }
+        }
+        /* the port's hp layout -- [pre H][post H][comb H*H] -- and the phase-3 broadcast */
+        for (int i = 0; i < H; i++) { hp[hb + i] = pre_v[i]; s_pre[i] = pre_v[i]; }
+        for (int i = 0; i < H; i++) hp[hb + H + i] = post_v[i];
+        for (int i = 0; i < H * H; i++) hp[hb + 2 * H + i] = comb_v[i];
+    }
+    barrier();
+
+    /* ---- phase 3: the collapse and the branch RMSNorm (the fork's fold_collapse body,
+     * the collapsed row staged in LDS instead of a global round trip) ---- */
+    for (int d = int(lid); d < D; d += 256) {
+        float v = 0.0f;
+        for (int i = 0; i < H; i++) v = fma(s_pre[i], x[xb + i * D + d], v);
+        s_x[d] = bf16r(v);
+    }
+    barrier();
+    float part2 = 0.0;
+    for (int d = int(lid); d < D; d += 256) {
+        float xd = s_x[d];
+        part2 = fma(xd, xd, part2);
+    }
+    g_part[lid] = part2;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) g_part[lid] = g_part[lid] + g_part[lid + s];
+        barrier();
+    }
+    if (lid == 0u) {
+        float mean = g_part[0] / float(D);
+        s_inv = recip_special(sqrt(mean + p.n_eps));
+    }
+    barrier();
+    float inv2 = s_inv;
+    for (int d = int(lid); d < D; d += 256) {
+        float v0 = s_x[d] * inv2;
+        float v1 = v0 * prm[p.n_off + d];
+        y[p.y_off + d] = bf16r(v1);
+    }
+}
+
+void dec_post() {
+    int H = p.H, D = p.D;
+    int idx = int(gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u);
+    if (idx >= H * D) return;
+    int j = idx / D, d = idx - j * D;
+    int xb = p.x_off, mo = p.m_off, hb = p.hp_off;
+    /* the deployed loop's sequential comb accumulation -- each product and each add
+     * separately rounded (precise pins the two-rounding form), the post term one
+     * fused fma, the fork's dec_post body verbatim */
+    precise float v = 0.0;
+    for (int i = 0; i < H; i++) {
+        precise float c = hp[hb + 2 * H + i * H + j] * x[xb + i * D + d];
+        v = v + c;
+    }
+    v = fma(hp[hb + H + j], m[mo + d], v);
+    y[p.y_off + j * D + d] = bf16r(v);
+}
+
+void main() {
+    if (p.mode == 0) dec_pre();
+    else dec_post();
+}

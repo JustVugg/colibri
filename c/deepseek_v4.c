@@ -1784,8 +1784,10 @@ int coli_v4_expert_store_open_planned(
     }
     plan.expert_cache_bytes = (uint64_t)slots * per_slot;
     runtime->target_expert_cache_bytes = plan.expert_cache_bytes;
-    plan.projected_bytes = fixed + dense_bytes +
+    runtime->ram_budget_bytes = plan.planner_available_bytes;   /* the tier's host pool takes */
+    runtime->ram_planned_bytes = fixed + dense_bytes +          /* what this leaves unclaimed */
         plan.expert_cache_bytes + (resident_head ? head_bytes : 0);
+    plan.projected_bytes = runtime->ram_planned_bytes;
     if (resident_head && coli_v4_head_cache_load(
             engine, engine->target_index, error, error_size)) return -1;
     if (device_bytes)
@@ -5050,11 +5052,128 @@ int coli_v4_route_bf16_logits(float *weights, int *indices, const float *hidden,
                               int topk, float route_scale, const float *logits);
 #endif
 
+/* ---- CS-0: the per-expert CPU-cost probe (specs/CS-expert-compute-site.md §7) --
+ * COLI_V4_EXPERT_PROBE=1, instrument only. The decode window's serial expert
+ * loop costs ~4.4 ms an expert here against the fork's 1-2 ms for byte-identical
+ * kernels (the why-faster audits' anomaly), and the probe decomposes it before
+ * the compute site moves: every coli_v4_expert_forward_ref call of the serial
+ * loops timed and bucketed by the view's layout (the rows16 repack vs the native
+ * block_rows==1 reference matvec) and by its own lookup's cost (a warm RAM hit
+ * fills a view in microseconds, a joined miss spent the page cache or the disk
+ * in milliseconds: 0.5 ms separates the classes), the read-wait tail from the
+ * slide-join's last finish to the loop's entry timed per layer-token beside them.
+ * Default off: nothing runs, nothing prints, the output is unchanged. */
+#ifdef _OPENMP
+#include <omp.h>                                  /* the probe's team-size print */
+#endif
+static double v4_now_mono(void);
+typedef struct { float us; unsigned char rows16, miss, layer; } V4EprobeSample;
+static struct {
+    int on;                  /* 2 armed, 1 read and off, 0 unread */
+    double last_finish;      /* the slide-join's last profiled_expert_load_finish */
+    int have_finish;
+    double tail_s;           /* that finish -> the serial loop's entry, a layer-token's */
+    unsigned long long tails;
+    V4EprobeSample *s;
+    size_t n, cap;
+    double *view_ms;         /* each view's own lookup ms, the slide-join's order */
+    int view_n;
+} g_v4_eprobe;
+static int v4_eprobe_on(void) {
+    if (!g_v4_eprobe.on) {
+        const char *e = getenv("COLI_V4_EXPERT_PROBE");
+        g_v4_eprobe.on = e && *e && *e != '0' ? 2 : 1;
+    }
+    return g_v4_eprobe.on == 2;
+}
+static double v4_eprobe_t0(void) { return g_v4_eprobe.on == 2 ? v4_now_mono() : 0.0; }
+static void v4_eprobe_stamp_finish(void) {   /* the slide-join's last finish of a step */
+    if (g_v4_eprobe.on == 2) { g_v4_eprobe.last_finish = v4_now_mono(); g_v4_eprobe.have_finish = 1; }
+}
+static void v4_eprobe_loop_entry(void) {      /* the serial loop starts: the read tail ends */
+    if (!v4_eprobe_on() || !g_v4_eprobe.have_finish) return;
+    g_v4_eprobe.tail_s += v4_now_mono() - g_v4_eprobe.last_finish;
+    g_v4_eprobe.tails++;
+    g_v4_eprobe.have_finish = 0;
+}
+static void v4_eprobe_view(int i, double lookup_s) {   /* the slide-join fills view i */
+    if (!v4_eprobe_on() || lookup_s <= 0.0) return;
+    if (i >= g_v4_eprobe.view_n) {
+        double *v = realloc(g_v4_eprobe.view_ms, ((size_t)i + 1) * sizeof(*v));
+        if (!v) return;
+        g_v4_eprobe.view_ms = v;
+        g_v4_eprobe.view_n = i + 1;
+    }
+    g_v4_eprobe.view_ms[i] = lookup_s * 1e3;
+}
+static void v4_eprobe_call(double t0, const ColiExpertView *view, int layer, int i) {
+    if (t0 <= 0.0) return;
+    if (g_v4_eprobe.n == g_v4_eprobe.cap) {
+        size_t cap = g_v4_eprobe.cap ? g_v4_eprobe.cap * 2 : 1024;
+        V4EprobeSample *s = realloc(g_v4_eprobe.s, cap * sizeof(*s));
+        if (!s) return;
+        g_v4_eprobe.s = s;
+        g_v4_eprobe.cap = cap;
+    }
+    double ms = i >= 0 && i < g_v4_eprobe.view_n ? g_v4_eprobe.view_ms[i] : 0.0;
+    g_v4_eprobe.s[g_v4_eprobe.n++] = (V4EprobeSample){(float)((v4_now_mono() - t0) * 1e6),
+        (unsigned char)(view->gate.block_rows == 16), (unsigned char)(ms > 0.5), (unsigned char)layer};
+}
+
+static int v4_eprobe_us_cmp(const void *a, const void *b) {
+    float x = ((const V4EprobeSample *)a)->us, y = ((const V4EprobeSample *)b)->us;
+    return x < y ? -1 : x > y;
+}
+
+void coli_v4_expert_probe_report(void) {   /* the tier's run line's neighbour (v4_vk_close); exported across the amalgam's units */
+    if (!v4_eprobe_on() || (!g_v4_eprobe.n && !g_v4_eprobe.tails)) return;
+    double total_us = 0;
+    for (size_t i = 0; i < g_v4_eprobe.n; i++) total_us += g_v4_eprobe.s[i].us;
+    fprintf(stderr, "[VK] deepseek_v4 expert probe: %llu CPU experts in %llu layer-tokens "
+                    "(omp team %d): compute %.0f us an expert, %.1f ms a layer-token, "
+                    "read tail %.1f ms a layer-token (miss: lookup > 0.5 ms)\n",
+            (unsigned long long)g_v4_eprobe.n, g_v4_eprobe.tails, omp_get_max_threads(),
+            g_v4_eprobe.n ? total_us / (double)g_v4_eprobe.n : 0.0,
+            g_v4_eprobe.tails ? total_us / 1e3 / (double)g_v4_eprobe.tails : 0.0,
+            g_v4_eprobe.tails ? g_v4_eprobe.tail_s * 1e3 / (double)g_v4_eprobe.tails : 0.0);
+    V4EprobeSample *t = malloc((g_v4_eprobe.n ? g_v4_eprobe.n : 1) * sizeof(*t));
+    if (!t) return;
+    static const char *names[4] = {"native hit", "native miss", "rows16 hit", "rows16 miss"};
+    for (int b = 0; b < 4; b++) {
+        int m = 0;
+        for (size_t i = 0; i < g_v4_eprobe.n; i++)
+            if ((g_v4_eprobe.s[i].rows16 ? 2 : 0) + g_v4_eprobe.s[i].miss == b) t[m++] = g_v4_eprobe.s[i];
+        if (!m) continue;
+        qsort(t, (size_t)m, sizeof(*t), v4_eprobe_us_cmp);
+        fprintf(stderr, "  %s: n %d, P50 %.0f us, P90 %.0f us, max %.0f us\n", names[b], m,
+                t[m / 2].us, t[(m * 9) / 10].us, (double)t[m - 1].us);
+    }
+    {   /* the slowest layers by mean: the per-layer bucket the spec asks for */
+        double sum[256] = {0};
+        unsigned cnt[256] = {0};
+        for (size_t i = 0; i < g_v4_eprobe.n; i++)
+            if (g_v4_eprobe.s[i].layer < 255) { sum[g_v4_eprobe.s[i].layer] += g_v4_eprobe.s[i].us; cnt[g_v4_eprobe.s[i].layer]++; }
+        for (int pick = 0; pick < 3; pick++) {
+            int worst = -1;
+            double best = 0;
+            for (int l = 0; l < 256; l++)
+                if (cnt[l] >= 8 && sum[l] / cnt[l] > best) { best = sum[l] / cnt[l]; worst = l; }
+            if (worst < 0) break;
+            fprintf(stderr, "  layer %d: %u experts, mean %.0f us\n", worst, cnt[worst], best);
+            cnt[worst] = 0;
+        }
+    }
+    free(t);
+    free(g_v4_eprobe.s); g_v4_eprobe.s = NULL; g_v4_eprobe.n = g_v4_eprobe.cap = 0;
+    free(g_v4_eprobe.view_ms); g_v4_eprobe.view_ms = NULL; g_v4_eprobe.view_n = 0;
+}
+
 typedef struct {
     ColiExpertStore *store;
     ColiExpertKey key;
     ColiExpertView view;
     int result;
+    double probe_s;   /* CS-0: the view's own lookup, the provenance bucket */
 } ExpertLoadJob;
 
 #ifdef COLI_V4_EXPERIMENTAL_PREFETCH
@@ -5071,7 +5190,9 @@ static int expert_prefetch_enabled(void) {
 
 static void *expert_load_worker(void *argument) {
     ExpertLoadJob *job = argument;
+    double p0 = v4_eprobe_t0();   /* CS-0: this view's own lookup cost */
     job->result = coli_expert_lookup(job->store, job->key, &job->view);
+    if (p0 > 0.0) job->probe_s = v4_now_mono() - p0;
     return NULL;
 }
 
@@ -5421,6 +5542,7 @@ static int profiled_expert_load_finish(ExpertLoadHandle *handle) {
     double waited = v4_wait_clock();
     int result = expert_load_finish(handle);
     coli_v4_expert_store_add_wait(handle->wait_store, v4_wait_clock() - waited);
+    v4_eprobe_stamp_finish();   /* CS-0: the slide-join's last finish, the read tail's start */
 #ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     coli_v4_block_profile_add(COLI_V4_BLOCK_PROFILE_LOADER_WAIT,
                               coli_v4_block_profile_now() - began);
@@ -5452,6 +5574,36 @@ unsigned long long g_v4_hyb_upload_n, g_v4_hyb_skip_n;
 #endif
 
 #if (defined(COLI_VULKAN) || defined(COLI_CUDA)) && defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
+/* COLI_VK_CHAIN_DPROF (decode settle bytes, gap-wave1 inventory gap 2 / open item O1):
+ * the loader's read pass between the CS deferral and the finish-site group is the
+ * settle bucket's own work. These snapshot the store's cache counters around that
+ * window (its stats op, the same lock the lookups hold), so the reads that settled
+ * the deferred bytes split ram-hit (a slot the cache already held: no bytes moved)
+ * from disk (a record read into one), and the alias sources count the slab bytes the
+ * group's aliases stand on -- the 2.67 GiB/token vs 0.78 GB/tok read-parity question.
+ * All zero and untouched unless the gate is on. */
+int v4_cs_dprof(void);
+unsigned long long g_v4_cs_win, g_v4_cs_win_ram, g_v4_cs_win_disk, g_v4_cs_win_disk_b;
+unsigned long long g_v4_cs_src_n;
+double g_v4_cs_src_b;
+int v4_cs_dprof(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_CHAIN_DPROF"); on = e && *e && *e != '0' ? 1 : 0; }
+    return on;
+}
+static ColiExpertStoreStats g_v4_cs_snap;
+static void v4_cs_settle_open(ColiExpertStore *store) {
+    if (store && store->ops && store->ops->stats) store->ops->stats(store, &g_v4_cs_snap);
+}
+static void v4_cs_settle_close(ColiExpertStore *store) {
+    ColiExpertStoreStats st;
+    if (!store || !store->ops || !store->ops->stats) return;
+    store->ops->stats(store, &st);
+    g_v4_cs_win++;
+    g_v4_cs_win_ram += st.hits - g_v4_cs_snap.hits;
+    g_v4_cs_win_disk += st.misses - g_v4_cs_snap.misses;
+    g_v4_cs_win_disk_b += st.bytes_read - g_v4_cs_snap.bytes_read;
+}
 /* ---- the Vulkan routed-expert tier (vk_tier.c) in the MoE ------------------------
  * coli_v4_vk_tier (deepseek_v4_internal.h) is set when COLI_VULKAN=1 started the
  * tier. A step then hands the device its routed experts first, rows rounded to E4M3
@@ -5482,6 +5634,10 @@ static float *v4_vk_round_rows(const float *x, int rows, int d) {
 typedef struct {
     int on;              /* the tier saw this step: the CPU's experts go to it as notes */
     int n, full, joined; /* n: how many the device took */
+    int cs;              /* COLI_VK_TIER_EXPERTS: the tier deferred the whole selection --
+                         * the ONE group (residents' handles + aliased slabs) issues at the
+                         * finish site, after the loader's slide-join settled the bytes */
+    float *xq;           /* the E4M3-rounded row the group computes from (cs: kept until the join) */
     int *ids;            /* the full selection, ascending, and its weights */
     float *w;
     uint8_t *taken;
@@ -5492,20 +5648,34 @@ static void v4_vk_token_issue(V4VkToken *vk, ColiExpertStore *store, int layer,
                               float *expert_weights, int *selected) {
     memset(vk, 0, sizeof(*vk));
     const ColiV4VkTier *tier = coli_v4_vk_tier;
-    if (!tier || tier->store != store || *selected < 1) return;
-    int full = *selected;
+    /* S-store map §5b: this seam is decode (and the MTP/spec drafts, which run
+     * the same S=1 path) -- every ROUTED selection of the token counts in the
+     * mfu table and the store's decode-only hit counters, whichever side
+     * computes it. Before the tier check: a CPU-only run still counts. */
+    int routed = *selected > 0 ? *selected : 0;
+    coli_v4_expert_store_decode_phase(store, 1);
+    for (int k = 0; k < routed; k++)
+        coli_v4_expert_store_mfu_record(store, (ColiExpertKey){layer, expert_ids[k]});
+    if (!tier || tier->store != store || routed < 1) return;
+    if (tier->bank) tier->bank(layer, expert_ids, routed);   /* COLI_VK_TIER_BANK_LAYER: the bank refills before the issue */
+    int full = routed;
     float *xq = v4_vk_round_rows(input, 1, d);
     int *ids = malloc((size_t)full * sizeof(*ids));
     float *w = malloc((size_t)full * sizeof(*w));
     uint8_t *taken = malloc((size_t)full);
     if (!xq || !ids || !w || !taken) { free(xq); free(ids); free(w); free(taken); return; }
     int n = tier->issue(layer, xq, 1, full, expert_ids, expert_weights, taken);
-    free(xq);
+    int cs = tier->issue_group && n > 0;   /* the deferral: the whole selection is the finish-site group's */
+    if (cs && v4_cs_dprof()) v4_cs_settle_open(store);   /* DPROF: the settle window opens with the deferral (the loader reads below) */
+    if (!cs) free(xq);
     memcpy(ids, expert_ids, (size_t)full * sizeof(*ids));
     memcpy(w, expert_weights, (size_t)full * sizeof(*w));
     int cpu = 0;
     for (int k = 0; k < full; k++) {
         if (taken[k]) {
+            /* a routing the device served is counted as a store lookup counts one --
+             * there no loader read of it happens; the deferred group's other selections
+             * are all loader reads below, and the read itself counts them */
             if (tier->routed) tier->routed((ColiExpertKey){layer, ids[k]});
             continue;
         }
@@ -5515,6 +5685,43 @@ static void v4_vk_token_issue(V4VkToken *vk, ColiExpertStore *store, int layer,
     }
     *selected = cpu;
     vk->on = 1; vk->n = n > 0 ? n : 0; vk->full = full; vk->ids = ids; vk->w = w; vk->taken = taken;
+    vk->cs = cs;
+    if (cs) vk->xq = xq;
+}
+
+/* One selection's alias source (COLI_VK_TIER_EXPERTS): the view's three matrices as
+ * byte offsets into the store slot's slab, geometry beside them. slab stays NULL when
+ * the view cannot alias -- a packed (rows16) or foreign-layout record, or a lease the
+ * store will not name -- and that expert computes on the CPU, the refusal ladder. */
+static void v4_vk_alias_src(ColiExpertStore *store, const ColiExpertView *view, VktAliasSrc *s) {
+    memset(s, 0, sizeof(*s));
+    if (!view || !view->lease) return;
+    const ColiTensorView *m[3] = {&view->gate, &view->up, &view->down};
+    for (int t = 0; t < 3; t++)
+        if (m[t]->block_rows != 1 || m[t]->format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
+            (m[t]->scale_format != COLI_SCALE_UE8M0 && m[t]->scale_format != COLI_SCALE_F32) ||
+            !m[t]->data || !m[t]->scales || m[t]->rows < 1 || m[t]->columns < 1) return;
+    for (int t = 1; t < 3; t++)
+        if (m[t]->block_columns != m[0]->block_columns ||
+            m[t]->scale_format != m[0]->scale_format) return;
+    size_t bytes = 0;
+    const unsigned char *slab = coli_v4_expert_store_view_slab(store, view, &bytes);
+    if (!slab || !bytes || !m[0]->block_columns) return;
+    for (int t = 0; t < 3; t++) {
+        const unsigned char *wd = m[t]->data, *sd = m[t]->scales;
+        if (wd < slab || sd < slab) return;
+        size_t wo = (size_t)(wd - slab), so = (size_t)(sd - slab);
+        if (wo >= bytes || so >= bytes) return;
+        s->woff[t] = wo;
+        s->soff[t] = so;
+        s->I[t] = (int)m[t]->columns;
+        s->O[t] = (int)m[t]->rows;
+    }
+    s->slab = slab;
+    s->bytes = bytes;
+    s->fmt = m[0]->scale_format == COLI_SCALE_UE8M0 ? 15 : 7;
+    s->gs = (int)m[0]->block_columns;
+    if (v4_cs_dprof()) { g_v4_cs_src_n++; g_v4_cs_src_b += (double)bytes; }   /* DPROF: the slab bytes this alias stands on */
 }
 
 /* The CPU's experts (views[0..cpu), weights beside them), the device's join, and
@@ -5525,21 +5732,80 @@ static int v4_vk_token_finish(V4VkToken *vk, float *output, ColiExpertStore *sto
                               int cpu, const float *input, const float *shared_output,
                               int d, float limit) {
     const ColiV4VkTier *tier = coli_v4_vk_tier;
+    if (vk->cs && v4_cs_dprof()) v4_cs_settle_close(store);   /* DPROF: the settle window closes at the group's build (the tier's own settle bucket) */
     float *rows = malloc(((size_t)cpu + 1) * d * sizeof(*rows));
     const float **dev = malloc((size_t)vk->full * sizeof(*dev));
     int result = rows && dev ? 0 : moe_fail("layer %d: out of memory for the device's experts", layer);
-    for (int c = 0; !result && c < cpu; c++) {
+    v4_eprobe_loop_entry();   /* CS-0: the read tail ends where the serial loop begins */
+    /* CS-1b: `read` names the selections the loader read (the ones the deferral left
+     * the CPU at the issue: every expert whose bytes the group's aliases need); the
+     * group below rewrites taken[] to the real sites and `read` keeps the views' map */
+    uint8_t *read = NULL;
+    if (!result && vk->cs) {
+        read = malloc((size_t)vk->full);
+        if (!read)
+            result = moe_fail("layer %d: out of memory for the device expert group", layer);
+        else
+            for (int k = 0; k < vk->full; k++) read[k] = !vk->taken[k];
+    }
+    if (!result && vk->cs && tier && tier->issue_group) {
+        /* the compute site is HERE -- ONE expert-batch group for every routed selection
+         * of the layer-token: the tier's residents from their cached handles, everyone
+         * else as zero-copy aliases of the store slot's imported slab (the bytes the
+         * loader just settled). taken[] comes back naming the sites; a refused alias
+         * degrades that expert to the CPU loop below (never dropped), and a group that
+         * flew not at all does the same for the whole selection. */
+        VktAliasSrc *src = malloc((size_t)vk->full * sizeof(*src));
+        if (!src)
+            result = moe_fail("layer %d: out of memory for the device expert group", layer);
+        else {
+            for (int k = 0, c = 0; k < vk->full; k++)
+                if (read[k]) v4_vk_alias_src(store, &views[c++], &src[k]);
+                else memset(&src[k], 0, sizeof(src[k]));   /* a resident: its handle serves it */
+            int took = tier->issue_group(layer, vk->xq, 1, vk->full, vk->ids, vk->w,
+                                         src, vk->taken);
+            free(src);
+            if (took > 0) vk->n = took;
+            else {
+                /* nothing flew: the issue's marking back (the residents stay the
+                 * device's in name), so the join below finds nothing in flight, fails,
+                 * and its redo loop recomputes them from the store -- the standing
+                 * degrade path, nothing dropped */
+                for (int k = 0; k < vk->full; k++) vk->taken[k] = !read[k];
+                vk->n = vk->full;
+            }
+        }
+    }
+    for (int c = 0, k = 0; !result && (vk->cs ? k < vk->full : c < cpu); k++) {
+        if (vk->cs && (!read || !read[k] || vk->taken[k])) continue;   /* the group has it (resident or aliased) */
+        double e0 = v4_eprobe_t0();   /* CS-0: the serial loop's per-expert cost */
         result = coli_v4_expert_forward_ref(rows + (size_t)c * d, &views[c], input,
                                             weights_cpu[c], limit);
+        v4_eprobe_call(e0, &views[c], layer, c);
         if (!result && tier && tier->note) tier->note(&views[c]);
+        c++;
     }
-    int joined = !vk->n || (dev && tier && tier->join(dev));
+    free(read);
+    /* COLI_VK_TIER_CS_DEVSUM: a whole-flying group may carry a device-merged row (its
+     * k rows summed there, each bf16 rounded in rank order -- the loop below's own
+     * semantics, bit-for-bit); the join hands it out beside the rows. */
+    const float *dsum = NULL;
+    int joined = !vk->n || (dev && tier && tier->join_merged ? tier->join_merged(dev, &dsum)
+                                                             : (dev && tier && tier->join(dev)));
+    if (dsum) {   /* the merged row stands for every taken k: the group flew whole (no
+                  * row below was computed) and this add is that loop, collapsed */
+        int whole = 1;
+        for (int k = 0; k < vk->full; k++) whole &= vk->taken[k] != 0;
+        if (!whole) dsum = NULL;   /* cannot happen (the tail only flies on a whole group); never merge it wrong */
+    }
     vk->joined = 1;
     float *redo = joined ? NULL : malloc((size_t)d * sizeof(*redo));
     if (!result && !joined && !redo)
         result = moe_fail("layer %d: out of memory recomputing the device's experts", layer);
     if (!result) memset(output, 0, (size_t)d * sizeof(*output));
-    for (int k = 0, c = 0; !result && k < vk->full; k++) {
+    if (!result && joined && dsum) {
+        for (int i = 0; i < d; i++) output[i] += dsum[i];   /* ONE row, not k: the merge already happened on the device */
+    } else for (int k = 0, c = 0; !result && k < vk->full; k++) {
         if (!vk->taken[k]) {
             const float *src = rows + (size_t)c++ * d;
             for (int i = 0; i < d; i++) output[i] += src[i];
@@ -5572,7 +5838,7 @@ static void v4_vk_token_free(V4VkToken *vk) {
         if (dev) coli_v4_vk_tier->join(dev);
         free(dev);
     }
-    free(vk->ids); free(vk->w); free(vk->taken);
+    free(vk->ids); free(vk->w); free(vk->taken); free(vk->xq);
     memset(vk, 0, sizeof(*vk));
 }
 #endif
@@ -5718,6 +5984,7 @@ static int moe_token_pipeline(float *output,
         int preload = selected < dual_loader_lanes()
             ? selected : dual_loader_lanes();
         for (int i = 0; i < preload; i++) {
+            v4_pilot_classify(weights->plan.layer, expert_ids[i]);   /* DPROF: the pilot's hit/late/unpredicted split (a rows-1 selection is whole here) */
             jobs[i].store = store;
             jobs[i].key = (ColiExpertKey){weights->plan.layer, expert_ids[i]};
             jobs[i].result = -1;
@@ -5784,6 +6051,7 @@ static int moe_token_pipeline(float *output,
                 break;
             }
             views[current] = jobs[slot].view;
+            v4_eprobe_view(current, jobs[slot].probe_s);   /* CS-0: the view's own lookup cost */
 #ifdef COLI_V4_GPU_TIER
             if (store->gpu) {
                 if (coli_v4_hybrid_enabled())
@@ -6040,10 +6308,13 @@ static int moe_token_pipeline(float *output,
                                             shared_output, d, config->swiglu_limit);
         } else {
 #endif
+        v4_eprobe_loop_entry();   /* CS-0: the read tail ends where the serial loop begins */
         for (int current = 0; !result && current < selected; current++) {
+            double e0 = v4_eprobe_t0();   /* CS-0: the serial loop's per-expert cost */
             if (!result) result = coli_v4_expert_forward_ref(
                 expert_output, &views[current], input,
                 expert_weights[current], config->swiglu_limit);
+            v4_eprobe_call(e0, &views[current], weights->plan.layer, current);
             if (!result)
                 for (int i = 0; i < d; i++) output[i] += expert_output[i];
         }
@@ -6068,6 +6339,7 @@ static int moe_token_pipeline(float *output,
     v4_vk_token_free(&vk_step);
 #endif
 #else
+    v4_eprobe_loop_entry();   /* CS-0: the read tail ends where the serial loop begins */
     for (int current = 0; current < selected && loader_active; current++) {
         if (profiled_expert_load_finish(&loader) != 0) {
             result = moe_fail("layer %d: the read of expert %d did not complete",
@@ -6081,6 +6353,7 @@ static int moe_token_pipeline(float *output,
             break;
         }
         ColiExpertView expert = job.view;
+        v4_eprobe_view(current, job.probe_s);   /* CS-0: the view's own lookup cost */
 #ifdef COLI_V4_GPU_TIER
         if (store->gpu) coli_v4_gpu_expert_attach(store, &expert);
 #endif
@@ -6099,10 +6372,12 @@ static int moe_token_pipeline(float *output,
         }
         if (!result) {
             double mm0 = v4_now_mono();
+            double e0 = v4_eprobe_t0();   /* CS-0: the serial loop's per-expert cost */
             result = coli_v4_expert_forward_ref(
                 expert_output, &expert, input, expert_weights[current],
                 config->swiglu_limit);
             coli_v4_expert_store_add_matmul(store, v4_now_mono() - mm0);
+            v4_eprobe_call(e0, &expert, weights->plan.layer, current);
         }
         coli_expert_release(store, &expert);
         if (!result)
@@ -6379,8 +6654,12 @@ static void v4_vk_batch_issue(V4VkBatch *vk, ColiExpertStore *store, int layer,
                               unsigned char *used) {
     memset(vk, 0, sizeof(*vk));
     const ColiV4VkTier *tier = coli_v4_vk_tier;
+    /* The prefill union: never decode -- its store lookups leave the
+     * decode-only counters, and it never records in the mfu table. */
+    coli_v4_expert_store_decode_phase(store, 0);
     if (!tier || tier->store != store) return;
     size_t routes = (size_t)batch * topk;
+    if (tier->bank && routes) tier->bank(layer, indices, (int)routes);   /* COLI_VK_TIER_BANK_LAYER: the bank refills before the issue */
     float *xq = v4_vk_round_rows(inputs, batch, d);
     uint8_t *taken = malloc(routes);
     float *contrib = malloc(routes * d * sizeof(*contrib));
@@ -8420,6 +8699,14 @@ failed:
  * banner says so below at store creation. */
 #include "route_trace.h"
 
+/* The decode-only popularity table (the fork's mfu_table.c, lifted as-is —
+ * S-store map §5b). Included inside THIS unit only, like route_trace.h: the
+ * amalgam builds one object per COLI_V4_UNIT_*, the static inline mfu_record
+ * must have a single owner, and the hot store is the unit that loads, counts
+ * and saves the table (<model>/.coli_mfu). The token path records through the
+ * exported coli_v4_expert_store_mfu_record, so no other unit needs the type. */
+#include "mfu_table.h"
+
 
 #ifdef COLI_V4_EXPERIMENTAL_PREFETCH_BATCH
 int coli_st_prefetch_many(
@@ -8472,6 +8759,7 @@ typedef struct {
     uint64_t used;
     unsigned char *slab;
     int aligned_slab;
+    void *vk_reg;            /* decode-path=fork: the registry slab behind `slab` (NULL: malloc/posix_memalign) */
     int lru_previous;
     int lru_next;
     unsigned char in_lru;
@@ -8511,6 +8799,8 @@ typedef struct {
                         * (#1852): coli_v4_expert_store_add_wait */
     uint8_t *ehit;     /* layers*experts_per_layer: experts routed in the current turn */
     uint8_t *eheat;    /* layers*experts_per_layer: cumulative routing selections, capped 63 */
+    int decode_phase;  /* the token path holds 1, the batch (prefill) path 0: gates
+                        * the decode-only requests_decode/hits_decode counters */
 } V4ExpertStoreState;
 
 static int set_error(char *error, size_t size, const char *format, ...) {
@@ -8903,7 +9193,11 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
             return -1;
         }
         if (!slot->slab) {
-            slot->slab = malloc((size_t)state->record_bytes);
+            /* decode-path=fork (COLI_VK_V4_DECODE_PATH=fork): the registry's arena slab
+             * when armed -- mapped GPU-visible pages, one STORAGE VkBuffer, the store's
+             * own lifetime; any refusal is the ladder, this slot keeps the malloc path */
+            if (!vkt_slabreg_slot((size_t)state->record_bytes, (void **)&slot->slab, &slot->vk_reg))
+                slot->slab = malloc((size_t)state->record_bytes);
             if (!slot->slab) {
                 pthread_mutex_unlock(&state->mutex);
                 memset(view, 0, sizeof(*view));
@@ -9121,16 +9415,34 @@ static void stats(const ColiExpertStore *store, ColiExpertStoreStats *output) {
 
 static void destroy(ColiExpertStore *store) {
     if (!store) return;
+    /* COLI_VK_TIER_PILOT's warm reads must drop their leases first: the drain
+     * lives at the destroy that owns the no-active-leases invariant (the assert
+     * below), so every path that frees the hot store -- the engine's, the tools',
+     * a test's -- drains, and no other unit needs the pilot's symbols (the
+     * ownership test links RUNTIME without this one, so its engine destroy must
+     * not reference them; the pilot leases through this store only). */
+    v4_pilot_quiesce();
     V4ExpertStoreState *state = store->state;
     if (state) {
         assert(state->active_leases == 0 && "destroy with active expert leases");
-        for (int i = 0; i < state->layers * state->slots_per_layer; i++)
+        for (int i = 0; i < state->layers * state->slots_per_layer; i++) {
+            /* the tier's alias holds on these pages go before the pages do, so a
+             * later slab at this address cannot hit the stale import (vkt_slab_forget,
+             * the VA-reuse guard); no lease is live here, so nothing reads them. Not
+             * XT(): xtier.h sits below, and every slab import there is belongs to the
+             * Vulkan tier (a CUDA tier's imports refuse -- its cache walks empty) */
+            vkt_slab_forget(state->slots[i].slab);
+            /* a registry slot's pages are the arena's own (decode-path=fork): the slab's
+             * buffer handle goes back to the registry, never free()/compat_aligned_free */
+            if (state->slots[i].vk_reg)
+                vkt_slabreg_slot_free(state->slots[i].vk_reg, state->slots[i].slab);
             /* aligned_slab means posix_memalign, which on Windows is
              * _aligned_malloc and must not reach free(). */
-            if (state->slots[i].aligned_slab)
+            else if (state->slots[i].aligned_slab)
                 compat_aligned_free(state->slots[i].slab);
             else
                 free(state->slots[i].slab);
+        }
         pthread_cond_destroy(&state->load_ready);
         pthread_mutex_destroy(&state->mutex);
         coli_st_index_close(state->index);
@@ -9269,6 +9581,11 @@ int coli_deepseek_v4_expert_store_open(
         state->slot_by_expert[i] = -1;
     state->stats.capacity_bytes = (uint64_t)state->layers *
                                   state->slots_per_layer * state->record_bytes;
+    /* decode-path=fork: the arm's one engagement line over the plan just sized (the
+     * registry's own boot line names its block size and cap at the first slab); the
+     * slot count and cache_bytes derive exactly as before, the arena only re-homes them */
+    vkt_forkdec_store_line(state->layers * state->slots_per_layer,
+                           (size_t)state->record_bytes + 8192u);
     store->ops = &operations;
     store->state = state;
     *output = store;
@@ -9304,6 +9621,20 @@ fail:
 typedef struct V4HotPolicy {
     ColiExpertStore *store;
     int pin_count;
+    /* pin_stride: the pins[] row stride = pin_count + frozen_count. The usage
+     * pins keep their exact semantics (merged .coli_usage history, repin
+     * cadence, ramp); the frozen section (COLI_V4_FROZEN_PCT) is ranked by the
+     * decode-only mfu table and sits beside them in the same victim-exempt,
+     * rows16-packing set (hot_is_pinned), so no new victim selector exists. */
+    int pin_stride;
+    int frozen_count;   /* per-layer frozen section size; 0 = today's exact policy */
+    MfuTable mfu;       /* the decode-only popularity table (mfu_table.h): ranks the
+                         * frozen section and the prewarm seed; the fork's .coli_mfu */
+    int mfu_seeded;     /* the loaded table has at least one count: a seed exists */
+    int mfu_dirty;      /* a decode selection was recorded since load: save at destroy */
+    char *mfu_path;     /* <model>/.coli_mfu */
+    uint32_t **mfu_rows; /* the table as [layers][experts] rows for the device tier's
+                          * decode growth (coli_v4_expert_store_mfu_history), built once */
     uint64_t repin_interval;
     uint64_t *usage;
     uint64_t *layer_requests;
@@ -9332,6 +9663,18 @@ static double hot_now(void) {
 static char *hot_history_path(const char *model_dir) {
     if (!model_dir) return NULL;
     const char suffix[] = "/.coli_usage";
+    size_t length = strlen(model_dir) + sizeof(suffix);
+    char *path = malloc(length);
+    if (path) snprintf(path, length, "%s%s", model_dir, suffix);
+    return path;
+}
+
+/* The mfu table's own file, never merged into .coli_usage (the fork's rule:
+ * decode-only popularity is a different population than the merged usage
+ * history, and the fork's .coli_mfu is directly readable by this store). */
+static char *hot_mfu_path(const char *model_dir) {
+    if (!model_dir) return NULL;
+    const char suffix[] = "/.coli_mfu";
     size_t length = strlen(model_dir) + sizeof(suffix);
     char *path = malloc(length);
     if (path) snprintf(path, length, "%s%s", model_dir, suffix);
@@ -9408,7 +9751,7 @@ static V4HotPolicy *hot_find(ColiExpertStore *store) {
 #endif
 
 static int hot_is_pinned(const V4HotPolicy *policy, int layer, int expert) {
-    if (!policy || policy->pin_count < 1 || layer < 0 || expert < 0) return 0;
+    if (!policy || policy->pin_stride < 1 || layer < 0 || expert < 0) return 0;
     int active = policy->pin_count;
 #if COLI_V4_PIN_RAMP_REQUESTS > 0
     if (!policy->history_seeded && active > 4) {
@@ -9418,9 +9761,16 @@ static int hot_is_pinned(const V4HotPolicy *policy, int layer, int expert) {
             ? active : 4 + (int)grown;
     }
 #endif
-    const int *pins = policy->pins + (size_t)layer * policy->pin_count;
+    const int *pins = policy->pins + (size_t)layer * policy->pin_stride;
     for (int i = 0; i < active; i++)
         if (pins[i] == expert) return 1;
+    /* The frozen section (COLI_V4_FROZEN_PCT) rides the same exemption in
+     * every victim selector and the rows16 packing gate: it is history-seeded
+     * at open, so the usage pins' ramp must not gate it. -1 (no K-th expert in
+     * the mfu history yet) never matches. */
+    const int *frozen = pins + policy->pin_count;
+    for (int i = 0; i < policy->frozen_count; i++)
+        if (frozen[i] == expert) return 1;
     return 0;
 }
 
@@ -9748,6 +10098,13 @@ static int hot_rows16_wanted(void) {
     if (rows16 < 0) {
         const char *env = getenv("COLI_V4_ROWS16");
         rows16 = !(env && *env == '0');
+        /* CS-1b: while the compute-site arm is on, the store never packs -- an aliased
+         * view of a repacked slab would read garbage (the alias-layout hazard), so the
+         * arm carries the COLI_V4_ROWS16=0 valve's rule at launch; the armed leg loses
+         * the rows16 kernel's speed on the CPU fallback and the prefill host-MoE, a
+         * priced cost, not a silent one. The arm reads with the default-on policy
+         * (gap-wave4): unset EXPERTS is 1, =0 and COLI_VK_LEGACY=1 leave it off */
+        if (coli_vk_env_int("COLI_VK_TIER_EXPERTS", 1) > 0) rows16 = 0;
     }
     return rows16;
 }
@@ -9863,7 +10220,7 @@ static void hot_repin_locked(V4HotPolicy *policy, V4ExpertStoreState *state,
     if (!policy || policy->pin_count < 1) return;
     uint64_t *usage = policy->usage +
         (size_t)layer * state->experts_per_layer;
-    int *pins = policy->pins + (size_t)layer * policy->pin_count;
+    int *pins = policy->pins + (size_t)layer * policy->pin_stride;
     for (int rank = 0; rank < policy->pin_count; rank++) {
         int best = -1;
         for (int expert = 0; expert < state->experts_per_layer; expert++) {
@@ -9892,6 +10249,50 @@ static void hot_repin_locked(V4HotPolicy *policy, V4ExpertStoreState *state,
         policy->layer_requests[layer] % decay_interval == 0)
         for (int expert = 0; expert < state->experts_per_layer; expert++)
             usage[expert] = (usage[expert] + 1) / 2;
+}
+
+/* The frozen MFU section (S-store map §5a): rank each layer's experts by the
+ * decode-only mfu table and write the top frozen_count beside the usage pins,
+ * in the same pins[] row. Victim exemption, the pool borrow guard and the
+ * rows16 packing gate all read hot_is_pinned, so the section is frozen without
+ * a new victim selector; the re-touch below keeps already-resident members at
+ * their partition's recency head exactly like hot_repin_locked, so the MRU
+ * tail left beside them serves recency. state->mutex held; same callers and
+ * cadence as hot_repin_locked. Ranks re-derive from live counts, and counts
+ * only grow, so there is no demote/ping-pong step here. */
+static void hot_freeze_locked(V4HotPolicy *policy, V4ExpertStoreState *state,
+                              int layer) {
+    if (!policy || policy->frozen_count < 1 || layer < 0 ||
+        layer >= state->layers || layer >= MFU_NUM_LAYERS) return;
+    const uint32_t *ref =
+        policy->mfu.counts + (size_t)layer * MFU_EXPERTS_PER_LAYER;
+    int limit = state->experts_per_layer < MFU_EXPERTS_PER_LAYER
+        ? state->experts_per_layer : MFU_EXPERTS_PER_LAYER;
+    int *frozen = policy->pins + (size_t)layer * policy->pin_stride +
+                  policy->pin_count;
+    for (int rank = 0; rank < policy->frozen_count; rank++) {
+        int best = -1;
+        for (int expert = 0; expert < limit; expert++) {
+            int already = 0;
+            for (int prior = 0; prior < rank; prior++)
+                if (frozen[prior] == expert) { already = 1; break; }
+            if (!already && ref[expert] &&
+                (best < 0 || ref[expert] > ref[best] ||
+                 (ref[expert] == ref[best] && expert < best)))
+                best = expert;
+        }
+        frozen[rank] = best;   /* -1: the history has no rank-K expert yet */
+    }
+    for (int rank = 0; rank < policy->frozen_count; rank++) {
+        int expert = frozen[rank];
+        if (expert < 0) continue;
+        V4ExpertSlot *slot = indexed_expert_slot(
+            state, (ColiExpertKey){layer, expert});
+        if (slot && slot->slab && slot->expert == expert) {
+            slot->used = ++state->clock;
+            touch_lru_slot(state, slot);
+        }
+    }
 }
 
 /* Return the exact oldest unreferenced, non-pinned slot.  The fallback is the
@@ -9981,11 +10382,19 @@ static V4ExpertSlot *hot_oldest_pool_victim(
     return last_resort;
 }
 
+/* Set on the decode read-ahead pilot's reader threads only (COLI_VK_TIER_PILOT,
+ * below): their lookups warm slots -- every bookkeeping a demand lookup does
+ * (usage, history, pins' repin cadence, rt_count, ehit/eheat, the request/hit/miss
+ * stats and their decode mirrors) is skipped where this is set, exactly as the
+ * prewarm fill skips it, so a warm read never moves a placement decision or a
+ * persisted history. Zero on every other thread: byte-identical books. */
+static __thread int v4_store_pilot_lookup;
+
 /* state->mutex held. The books one routing of `key` keeps: the pin ranking's
  * usage and its per-layer request clock (the pin ramp, the repin cadence, the
  * usage decay), the dashboard's HITS and heat, and the .coli_usage history.
- * Every lookup_hot counts one; so do the routings computed elsewhere
- * (coli_v4_expert_store_note_routed, coli_v4_expert_store_note_union). */
+ * Every hot_lookup with counted counts one; so do the routings computed
+ * elsewhere (coli_v4_expert_store_note_routed, coli_v4_expert_store_note_union). */
 static void hot_count_locked(V4HotPolicy *policy, V4ExpertStoreState *state,
                              ColiExpertKey key) {
     size_t index = (size_t)key.layer * state->experts_per_layer + key.expert;
@@ -9997,13 +10406,16 @@ static void hot_count_locked(V4HotPolicy *policy, V4ExpertStoreState *state,
     rt_count(key.layer, &key.expert, 1);   /* selection history, shared format (#700) */
     uint64_t layer_requests = ++policy->layer_requests[key.layer];
     if (policy->repin_interval &&
-        layer_requests % policy->repin_interval == 0)
+        layer_requests % policy->repin_interval == 0) {
         hot_repin_locked(policy, state, key.layer);
+        hot_freeze_locked(policy, state, key.layer);   /* the MFU table's frozen tail (COLI_VK_TIER_PILOT's books) */
+    }
 }
 
 /* policy: hot_find(store). counted = 0: a read whose routing the caller
- * counts itself (coli_v4_expert_store_lookup_uncounted); the lookup is
- * otherwise the same, its request, hit and miss counters included. */
+ * counts itself (coli_v4_expert_store_lookup_uncounted), or the pilot's warm
+ * read (v4_store_pilot_lookup skips every counter, counted included); the
+ * lookup is otherwise the same. */
 static int hot_lookup(ColiExpertStore *store, V4HotPolicy *policy,
                       ColiExpertKey key, ColiExpertView *view, int counted) {
     if (!store || !store->state || !view) {
@@ -10017,8 +10429,9 @@ static int hot_lookup(ColiExpertStore *store, V4HotPolicy *policy,
         return -1;
     }
     pthread_mutex_lock(&state->mutex);
-    if (!policy->warming) {   /* the fill before the first request is not a use */
+    if (!policy->warming && !v4_store_pilot_lookup) {   /* the fill before the first request is not a use; neither is the pilot's warm read (COLI_VK_TIER_PILOT) */
     state->stats.requests++;
+    if (state->decode_phase) state->stats.requests_decode++;
     if (counted) hot_count_locked(policy, state, key);
     /* ESPERIMENTO LOCALE (replay policy cache): sequenza ordinata delle
      * richieste come le vede la cache, hit e miss. V4_REPLAY_TRACE=<path>. */
@@ -10029,7 +10442,8 @@ static int hot_lookup(ColiExpertStore *store, V4HotPolicy *policy,
             if (rp) replay_fp = fopen(rp, "w"); }
         if (replay_fp) fprintf(replay_fp, "%d %d\n", key.layer, key.expert);
     }
-    }   /* !warming; hot_count_locked repins */
+    }   /* !warming && !pilot; hot_count_locked repins and freezes */
+
 
     V4ExpertSlot *slot;
 retry_lookup:
@@ -10037,7 +10451,11 @@ retry_lookup:
     if (slot && slot->slab && slot->expert == key.expert) {
         slot->references++;
         state->active_leases++;
-        slot->used = ++state->clock; state->stats.hits++;
+        slot->used = ++state->clock;
+        if (!v4_store_pilot_lookup) {   /* the pilot warms the slot; the demand read counts */
+            state->stats.hits++;
+            if (state->decode_phase) state->stats.hits_decode++;
+        }
         touch_lru_slot(state, slot);
         if (hot_is_pinned(policy, key.layer, key.expert) && !store->gpu)
             hot_pack_slot_locked(policy, state, record, slot);
@@ -10077,11 +10495,15 @@ retry_lookup:
     }
     if (!slot->slab) {
         size_t capacity = (size_t)state->record_bytes + 8192u;
-        if (posix_memalign((void **)&slot->slab, 4096, capacity)) {
-            slot->slab = NULL;
-            pthread_mutex_unlock(&state->mutex);
-            memset(view, 0, sizeof(*view));
-            return -1;
+        /* decode-path=fork: the registry slab is 4096-aligned by construction (the
+         * direct window's rule holds); a refusal keeps this slot on posix_memalign */
+        if (!vkt_slabreg_slot(capacity, (void **)&slot->slab, &slot->vk_reg)) {
+            if (posix_memalign((void **)&slot->slab, 4096, capacity)) {
+                slot->slab = NULL;
+                pthread_mutex_unlock(&state->mutex);
+                memset(view, 0, sizeof(*view));
+                return -1;
+            }
         }
         slot->aligned_slab = 1;
         mark_slot_allocated(state, slot_partition(state, slot), slot);
@@ -10133,7 +10555,9 @@ retry_lookup:
     slot->expert = key.expert; slot->loading_expert = -1;
     slot->used = ++state->clock;
     touch_lru_slot(state, slot);
-    state->stats.misses++; state->stats.bytes_read += record->record_bytes;
+    if (!v4_store_pilot_lookup) {   /* a pilot read is a warm fill, not a demand miss */
+        state->stats.misses++; state->stats.bytes_read += record->record_bytes;
+    }
     hot_pack_slot_commit(policy, state, record, slot, v4_pack_buf);
     v4_pack_buf = NULL;
     memset(view, 0, sizeof(*view)); view->key = key;
@@ -10143,6 +10567,268 @@ retry_lookup:
     view->lease = slot;
     pthread_cond_broadcast(&state->load_ready);
     pthread_mutex_unlock(&state->mutex); return 0;
+}
+
+/* ---- the decode read-ahead pilot (COLI_VK_TIER_PILOT) ----------------------------
+ * The fork fired the NEXT hash-router layer's expert reads at the layer boundary
+ * (its prefetch_hash_body): ffn.gate.tid2eid is keyed by token id alone, so a
+ * layer's whole routed selection is known before that layer runs -- no route
+ * compute, no hidden state. The port's decode reads issue at the MoE entry
+ * instead, and their disk misses settle on the wall (the CS settle bucket); the
+ * pilot moves them one layer early: at layer i's host-step (the chain's A1
+ * submit, the device starting on layer i's attention) the chain calls
+ * v4_pilot_fire for layer i+COLI_VK_TIER_PILOT_DEPTH's selections of this unit's
+ * tokens, and the reads run here on a small pool of the pilot's own -- never the
+ * loader lanes, whose slots the entry's slide-join owns between a fire and the
+ * drain (a pilot job parked on one would deadlock the preload loop).
+ *
+ * Warm-only, harmless by construction: each read is a plain store lookup whose
+ * lease drops the moment it lands, the slot stays resident, and the MoE entry's
+ * own lookup finds it in RAM -- or, if the pilot's read is still on disk,
+ * lookup_hot's single-flight wait coalesces onto it (one read either way, never
+ * two slabs). A misprediction (the tier served the expert from a cached handle,
+ * the slot was evicted before the entry, or the prediction was never demanded)
+ * costs one slot in that layer's own partition -- victim policy and pins stay
+ * the store's -- and nothing else: the pilot threads set v4_store_pilot_lookup,
+ * so no usage, history, rt_count or stats move (a warm read never shifts a
+ * placement decision, whose residency is the one thing that can flip a token).
+ * Non-hash target layers and depths past the chain's layers fire nothing, the
+ * fork's fallback. */
+enum { V4_PILOT_LANES = 2, V4_PILOT_QUEUE = 32, V4_PILOT_TRACK = 64 };
+enum { V4_PILOT_PENDING = 1, V4_PILOT_READING = 2, V4_PILOT_LANDED = 3 };
+
+typedef struct {
+    ColiExpertKey key;
+    int state;   /* PENDING/READING (the entry's read coalesces) /LANDED */
+} V4PilotTrack;
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t work;   /* a queued key wakes a reader */
+    pthread_cond_t idle;   /* the queue is empty and no reader is mid-lookup */
+    pthread_t threads[V4_PILOT_LANES];
+    int lanes;             /* readers that started; 0 = the pool never came up */
+    int stop;
+    ColiExpertStore *store;   /* the pool is bound to one store; a rebind drains first */
+    ColiExpertKey queue[V4_PILOT_QUEUE];
+    int qh, qn;
+    int reading;           /* readers between the pop and the landed mark */
+    V4PilotTrack track[V4_PILOT_TRACK];   /* the issued set, a ring: classify reads it */
+    int th;
+    /* DPROF (COLI_VK_CHAIN_DPROF): predictions issued, tier-served skips, queue
+     * drops, reads landed, their read wall, and the entry's split of its loader
+     * reads into pilot-hit / pilot-in-flight (late) / unpredicted. */
+    unsigned long long issued, skip_served, dropped, landed, failed;
+    unsigned long long hit, late, miss;
+    double read_ms;
+} V4Pilot;
+
+static V4Pilot g_v4_pilot = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .work = PTHREAD_COND_INITIALIZER,
+    .idle = PTHREAD_COND_INITIALIZER,
+};
+/* Set once the pool is up, read lock-free by the classify marker: unset or no
+ * fire yet and the pilot costs every caller one relaxed load. */
+static int g_v4_pilot_started;
+
+int (*v4_pilot_tier_served)(ColiExpertStore *store, int layer, int expert);
+
+/* the env caches (read once); the test hook resets them so a leg can arm the
+ * lever after earlier legs cached it off */
+static int g_v4_pilot_on = -1, g_v4_pilot_depth_cache = -1, g_v4_pilot_dprof_cache = -1;
+static void v4_pilot_env_cache_reset(void) {
+    g_v4_pilot_on = g_v4_pilot_depth_cache = g_v4_pilot_dprof_cache = -1;
+}
+
+int v4_pilot_wanted(void) {
+    if (g_v4_pilot_on < 0) {
+        const char *e = getenv("COLI_VK_TIER_PILOT");
+        g_v4_pilot_on = e && *e && *e != '0' ? 1 : 0;
+    }
+    return g_v4_pilot_on;
+}
+
+int v4_pilot_depth(void) {
+    if (g_v4_pilot_depth_cache < 0) {
+        const char *e = getenv("COLI_VK_TIER_PILOT_DEPTH");
+        long n = e && *e ? strtol(e, NULL, 10) : 1;
+        if (n < 1) n = 1;
+        if (n > 8) n = 8;   /* the chain's layer count bounds the useful span */
+        g_v4_pilot_depth_cache = (int)n;
+    }
+    return g_v4_pilot_depth_cache;
+}
+
+/* The DPROF gate is the campaign's one knob (COLI_VK_CHAIN_DPROF), cached here
+ * for this unit's own counters -- the same env the tier's cs lines read. */
+static int v4_pilot_dprof(void) {
+    if (g_v4_pilot_dprof_cache < 0) {
+        const char *e = getenv("COLI_VK_CHAIN_DPROF");
+        g_v4_pilot_dprof_cache = e && *e && *e != '0' ? 1 : 0;
+    }
+    return g_v4_pilot_dprof_cache;
+}
+
+static void v4_pilot_track_mark(ColiExpertKey key, int state) {
+    /* called under the pool mutex */
+    for (int i = 0; i < V4_PILOT_TRACK; i++)
+        if (g_v4_pilot.track[i].key.layer == key.layer &&
+            g_v4_pilot.track[i].key.expert == key.expert) {
+            g_v4_pilot.track[i].state = state;
+            return;
+        }
+}
+
+static void *v4_pilot_reader(void *unused) {
+    (void)unused;
+    v4_store_pilot_lookup = 1;   /* this thread's lookups warm, they never count */
+    pthread_mutex_lock(&g_v4_pilot.mutex);
+    for (;;) {
+        while (!g_v4_pilot.qn && !g_v4_pilot.stop)
+            pthread_cond_wait(&g_v4_pilot.work, &g_v4_pilot.mutex);
+        if (g_v4_pilot.stop && !g_v4_pilot.qn) break;
+        ColiExpertKey key = g_v4_pilot.queue[g_v4_pilot.qh];
+        g_v4_pilot.qh = (g_v4_pilot.qh + 1) % V4_PILOT_QUEUE;
+        g_v4_pilot.qn--;
+        g_v4_pilot.reading++;
+        v4_pilot_track_mark(key, V4_PILOT_READING);
+        ColiExpertStore *store = g_v4_pilot.store;
+        int dprof = v4_pilot_dprof();
+        struct timespec t0, t1;
+        if (dprof) clock_gettime(CLOCK_MONOTONIC, &t0);
+        pthread_mutex_unlock(&g_v4_pilot.mutex);
+        ColiExpertView view;
+        int ok = coli_expert_lookup(store, key, &view) == 0;
+        if (ok) coli_expert_release(store, &view);   /* warm-only: the slot stays */
+        pthread_mutex_lock(&g_v4_pilot.mutex);
+        if (dprof) {
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            g_v4_pilot.read_ms += (double)(t1.tv_sec - t0.tv_sec) * 1e3 +
+                                  (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+            if (ok) g_v4_pilot.landed++;
+            else g_v4_pilot.failed++;
+        }
+        v4_pilot_track_mark(key, ok ? V4_PILOT_LANDED : V4_PILOT_PENDING);
+        g_v4_pilot.reading--;
+        if (!g_v4_pilot.qn && !g_v4_pilot.reading)
+            pthread_cond_broadcast(&g_v4_pilot.idle);
+    }
+    pthread_mutex_unlock(&g_v4_pilot.mutex);
+    return NULL;
+}
+
+static void v4_pilot_shutdown(void) {
+    pthread_mutex_lock(&g_v4_pilot.mutex);
+    g_v4_pilot.stop = 1;
+    pthread_cond_broadcast(&g_v4_pilot.work);
+    pthread_mutex_unlock(&g_v4_pilot.mutex);
+    for (int i = 0; i < g_v4_pilot.lanes; i++)
+        pthread_join(g_v4_pilot.threads[i], NULL);
+    g_v4_pilot.lanes = 0;
+}
+
+/* Bring the pool up on the first fire (and rebind it, drained, if another
+ * store's forward fires it -- one engine a process in practice, the two chains
+ * of a dev2 setup sharing the one store). */
+static void v4_pilot_pool_start(ColiExpertStore *store) {
+    pthread_mutex_lock(&g_v4_pilot.mutex);
+    if (g_v4_pilot.store != store) {
+        while (g_v4_pilot.qn || g_v4_pilot.reading)
+            pthread_cond_wait(&g_v4_pilot.idle, &g_v4_pilot.mutex);
+        g_v4_pilot.store = store;
+    }
+    if (!g_v4_pilot.lanes && !g_v4_pilot.stop) {
+        for (int i = 0; i < V4_PILOT_LANES; i++)
+            if (pthread_create(&g_v4_pilot.threads[i], NULL,
+                               v4_pilot_reader, NULL) == 0)
+                g_v4_pilot.lanes++;
+        if (g_v4_pilot.lanes) {
+            atexit(v4_pilot_shutdown);
+            __atomic_store_n(&g_v4_pilot_started, 1, __ATOMIC_RELEASE);
+        }
+    }
+    pthread_mutex_unlock(&g_v4_pilot.mutex);
+}
+
+void v4_pilot_quiesce(void) {
+    if (!__atomic_load_n(&g_v4_pilot_started, __ATOMIC_RELAXED)) return;
+    pthread_mutex_lock(&g_v4_pilot.mutex);
+    while (g_v4_pilot.qn || g_v4_pilot.reading)
+        pthread_cond_wait(&g_v4_pilot.idle, &g_v4_pilot.mutex);
+    pthread_mutex_unlock(&g_v4_pilot.mutex);
+}
+
+void v4_pilot_fire(ColiExpertStore *store, int layer, int token, int topk,
+                   const int64_t *tid2eid, int n_experts, int vocab_size) {
+    if (!v4_pilot_wanted() || !store || !tid2eid || topk < 1 || n_experts < 1 ||
+        layer < 0 || token < 0 || token >= vocab_size)
+        return;
+    v4_pilot_pool_start(store);
+    pthread_mutex_lock(&g_v4_pilot.mutex);
+    if (!g_v4_pilot.lanes) {   /* the pool never came up: current behaviour */
+        pthread_mutex_unlock(&g_v4_pilot.mutex);
+        return;
+    }
+    int dprof = v4_pilot_dprof();
+    for (int rank = 0; rank < topk; rank++) {
+        int64_t id = tid2eid[(size_t)token * topk + rank];
+        if (id < 0 || id >= n_experts) continue;
+        ColiExpertKey key = {layer, (int)id};
+        if (v4_pilot_tier_served && v4_pilot_tier_served(store, layer, (int)id)) {
+            if (dprof) g_v4_pilot.skip_served++;   /* the handle serves it: no read to warm */
+            continue;
+        }
+        int queued = 0;
+        for (int i = 0; i < g_v4_pilot.qn; i++)   /* one read a key: re-fires ride the first */
+            if (g_v4_pilot.queue[(g_v4_pilot.qh + i) % V4_PILOT_QUEUE].layer == layer &&
+                g_v4_pilot.queue[(g_v4_pilot.qh + i) % V4_PILOT_QUEUE].expert == (int)id)
+                { queued = 1; break; }
+        if (queued) continue;
+        if (g_v4_pilot.qn >= V4_PILOT_QUEUE) {
+            if (dprof) g_v4_pilot.dropped++;   /* a full queue is a late prediction, not a loss */
+            continue;
+        }
+        g_v4_pilot.queue[(g_v4_pilot.qh + g_v4_pilot.qn) % V4_PILOT_QUEUE] = key;
+        g_v4_pilot.qn++;
+        g_v4_pilot.track[g_v4_pilot.th] = (V4PilotTrack){key, V4_PILOT_PENDING};
+        g_v4_pilot.th = (g_v4_pilot.th + 1) % V4_PILOT_TRACK;
+        if (dprof) g_v4_pilot.issued++;
+        pthread_cond_signal(&g_v4_pilot.work);
+    }
+    pthread_mutex_unlock(&g_v4_pilot.mutex);
+}
+
+void v4_pilot_classify(int layer, int expert) {
+    if (!__atomic_load_n(&g_v4_pilot_started, __ATOMIC_RELAXED) ||
+        !v4_pilot_dprof())
+        return;
+    pthread_mutex_lock(&g_v4_pilot.mutex);
+    int state = 0;
+    for (int i = 0; i < V4_PILOT_TRACK; i++)
+        if (g_v4_pilot.track[i].key.layer == layer &&
+            g_v4_pilot.track[i].key.expert == expert) {
+            state = g_v4_pilot.track[i].state;
+            break;
+        }
+    if (state == V4_PILOT_LANDED) g_v4_pilot.hit++;      /* the entry's read is a RAM hit */
+    else if (state) g_v4_pilot.late++;                   /* in flight: the entry coalesces on it */
+    else g_v4_pilot.miss++;                              /* no prediction: a cold read as today */
+    pthread_mutex_unlock(&g_v4_pilot.mutex);
+}
+
+void v4_pilot_report(void) {
+    if (!v4_pilot_dprof()) return;
+    pthread_mutex_lock(&g_v4_pilot.mutex);
+    unsigned long long issued = g_v4_pilot.issued;
+    if (issued || g_v4_pilot.hit || g_v4_pilot.late || g_v4_pilot.miss)
+        fprintf(stderr, "v4_cs pilot dprof: %llu predictions issued (%llu tier-served "
+                        "skipped, %llu dropped), %llu landed (%.1f ms reads, %llu failed); "
+                        "entry reads %llu hit + %llu late + %llu unpredicted\n",
+                issued, g_v4_pilot.skip_served, g_v4_pilot.dropped,
+                g_v4_pilot.landed, g_v4_pilot.read_ms, g_v4_pilot.failed,
+                g_v4_pilot.hit, g_v4_pilot.late, g_v4_pilot.miss);
+    pthread_mutex_unlock(&g_v4_pilot.mutex);
 }
 
 static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
@@ -10161,6 +10847,46 @@ int coli_v4_test_expert_slot_index(ColiExpertStore *store, ColiExpertKey key) {
     int result = slot ? (int)(slot - state->slots) : -1;
     pthread_mutex_unlock(&state->mutex);
     return result;
+}
+
+/* COLI_VK_TIER_PILOT's own hooks (tests): fire/quiesce direct (the chain's A1
+ * submit is the engine's site), the counters the DPROF line prints, and an
+ * env-cache reset so a test can arm the lever after earlier legs cached it off.
+ * stat: 0 issued, 1 skip_served, 2 dropped, 3 landed, 4 failed, 5 hit, 6 late,
+ * 7 miss; -1 the pool's started flag. */
+void coli_v4_test_pilot_fire(ColiExpertStore *store, int layer, int token, int topk,
+                             const int64_t *tid2eid, int n_experts, int vocab_size) {
+    v4_pilot_fire(store, layer, token, topk, tid2eid, n_experts, vocab_size);
+}
+void coli_v4_test_pilot_quiesce(void) { v4_pilot_quiesce(); }
+unsigned long long coli_v4_test_pilot_stat(int which) {
+    if (which < 0) return (unsigned long long)__atomic_load_n(
+        &g_v4_pilot_started, __ATOMIC_RELAXED);
+    pthread_mutex_lock(&g_v4_pilot.mutex);
+    unsigned long long value =
+        which == 0 ? g_v4_pilot.issued :
+        which == 1 ? g_v4_pilot.skip_served :
+        which == 2 ? g_v4_pilot.dropped :
+        which == 3 ? g_v4_pilot.landed :
+        which == 4 ? g_v4_pilot.failed :
+        which == 5 ? g_v4_pilot.hit :
+        which == 6 ? g_v4_pilot.late :
+        which == 7 ? g_v4_pilot.miss : 0;
+    pthread_mutex_unlock(&g_v4_pilot.mutex);
+    return value;
+}
+void coli_v4_test_pilot_env_reset(void) {
+    /* the wanted/depth/dprof caches re-read on the next call; the pool, if a
+     * earlier leg started it, keeps its readers (they only read keys handed
+     * them, and a later fire rebinds the store after draining) */
+    pthread_mutex_lock(&g_v4_pilot.mutex);
+    g_v4_pilot.issued = g_v4_pilot.skip_served = g_v4_pilot.dropped = 0;
+    g_v4_pilot.landed = g_v4_pilot.failed = 0;
+    g_v4_pilot.hit = g_v4_pilot.late = g_v4_pilot.miss = 0;
+    g_v4_pilot.read_ms = 0.0;
+    memset(g_v4_pilot.track, 0, sizeof g_v4_pilot.track);
+    pthread_mutex_unlock(&g_v4_pilot.mutex);
+    v4_pilot_env_cache_reset();
 }
 
 int coli_v4_test_expert_books(ColiExpertStore *store, int layer,
@@ -10305,6 +11031,52 @@ void coli_v4_expert_store_note_union(ColiExpertStore *store, int layer,
 int (*coli_v4_expert_store_ram_first)(int layer, int expert);   /* exclusive RAM/VRAM: NULL unless a Vulkan tier sets it */
 void (*coli_v4_expert_store_ram_gave)(void);
 
+/* The decode-only popularity table's engine seam (S-store map §5b). The token
+ * path (v4_vk_token_issue -- decode and MTP/spec drafts) records every ROUTED
+ * selection it was handed, device-served and CPU-computed alike; the batch
+ * path (v4_vk_batch_issue, the prefill union) never records. One record per
+ * (token, rank), the fork's counting unit. Deliberately NOT inside note_routed
+ * or lookup_hot: those serve both phases and must keep the merged .coli_usage
+ * books exactly as they were. */
+void coli_v4_expert_store_mfu_record(ColiExpertStore *store, ColiExpertKey key) {
+    if (!store || !store->state) return;
+    V4HotPolicy *policy = hot_find(store);
+    if (!policy || !get_record(store->state, key) ||
+        key.layer >= MFU_NUM_LAYERS || key.expert >= MFU_EXPERTS_PER_LAYER)
+        return;
+    mfu_record(&policy->mfu, key.layer, key.expert);
+    policy->mfu_dirty = 1;
+}
+
+/* Which population a store lookup belongs to (hit_rate_d): the token path sets
+ * 1 before its lookups, the batch path 0. lookup_hot reads it under
+ * state->mutex, so the plain int write takes the same lock. */
+void coli_v4_expert_store_decode_phase(ColiExpertStore *store, int decode) {
+    if (!store || !store->state || !hot_find(store)) return;
+    V4ExpertStoreState *state = store->state;
+    pthread_mutex_lock(&state->mutex);
+    state->decode_phase = decode ? 1 : 0;
+    pthread_mutex_unlock(&state->mutex);
+}
+
+/* The slab a leased view reads and its bytes (deepseek_v4_internal.h, CS-1b): the
+ * hot store's own slot state, a property of the store rather than of the device
+ * tier that aliases it, so it is defined in every build -- the forkdec gate's
+ * no-device leg (tests/test_deepseek_v4 forkdec) reads it in the plain one --
+ * beside ram_first/ram_gave above, not in the tier's block below. */
+const void *coli_v4_expert_store_view_slab(ColiExpertStore *store, const ColiExpertView *view,
+                                           size_t *bytes) {
+    if (bytes) *bytes = 0;
+    if (!store || !store->state || !view || !view->lease || !hot_find(store)) return NULL;
+    V4ExpertStoreState *state = store->state;
+    V4ExpertSlot *slot = view->lease;
+    /* the slot this lease names holds the view's own expert: a stale or foreign lease
+     * would alias the wrong pages, so only an exact match serves */
+    if (!slot->slab || !state->record_bytes || slot->expert != view->key.expert) return NULL;
+    *bytes = (size_t)state->record_bytes;
+    return slot->slab;
+}
+
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
 /* The Vulkan routed-expert tier's side of the store (deepseek_v4_internal.h). A
  * routing the device served never comes through lookup_hot, so it is counted here
@@ -10326,6 +11098,26 @@ void coli_v4_expert_store_note_routed(ColiExpertStore *store, ColiExpertKey key)
 
 uint32_t *const *coli_v4_expert_store_history(ColiExpertStore *store) {
     return store && hot_find(store) ? rt_counts_all() : NULL;
+}
+
+/* The decode-only popularity table as [layers][experts] rows over the same store's
+ * flat counts -- the .coli_mfu class the Vulkan tier's decode growth ranks its
+ * installs by (VktConfig.decode_heat, COLI_VK_TIER_DECODE_GROW). NULL unless the
+ * engine's geometry is exactly the table's (256 experts a layer, at most 43 layers).
+ * The rows point into the policy's table and live until the store closes. */
+uint32_t *const *coli_v4_expert_store_mfu_history(ColiExpertStore *store) {
+    V4HotPolicy *policy = store ? hot_find(store) : NULL;
+    V4ExpertStoreState *state = store ? store->state : NULL;
+    if (!policy || !state || state->experts_per_layer != MFU_EXPERTS_PER_LAYER ||
+        state->layers > MFU_NUM_LAYERS || state->layers < 1)
+        return NULL;
+    if (!policy->mfu_rows) {
+        policy->mfu_rows = malloc((size_t)state->layers * sizeof(*policy->mfu_rows));
+        if (policy->mfu_rows)
+            for (int l = 0; l < state->layers; l++)
+                policy->mfu_rows[l] = policy->mfu.counts + (size_t)l * MFU_EXPERTS_PER_LAYER;
+    }
+    return policy->mfu_rows;
 }
 
 int coli_v4_expert_store_in_ram(ColiExpertStore *store, ColiExpertKey key) {
@@ -10387,6 +11179,18 @@ static void destroy_hot(ColiExpertStore *store) {
     pthread_mutex_unlock(&hot_policies_mutex);
     if (policy) {
         hot_usage_save(policy, store ? store->state : NULL);
+        /* The mfu table follows the fork's rule, not .coli_usage's: saved at
+         * destroy whenever a decode selection was recorded, regardless of any
+         * knob -- COLI_V4_FROZEN_PCT=0 and COLI_V4_PREWARM=0 still persist,
+         * because the file is the next run's seed and this counter's
+         * provenance, not a usage trace. A run that recorded nothing (cold,
+         * prefill-only, CPU-only without the token seam) leaves no file. */
+        if (policy->mfu_dirty && policy->mfu_path) {
+            if (mfu_save(&policy->mfu, policy->mfu_path))
+                fprintf(stderr, "v4_mfu warning=cannot-save-history path=%s\n",
+                        policy->mfu_path);
+            policy->mfu_dirty = 0;
+        }
         fprintf(stderr, "v4_rows16 packed_slots=%llu\n",
                 (unsigned long long)policy->packed_slots);
         fprintf(stderr,
@@ -10401,6 +11205,8 @@ static void destroy_hot(ColiExpertStore *store) {
                 (unsigned long long)__atomic_load_n(
                     &v4_direct_payload_bytes, __ATOMIC_RELAXED));
         free(policy->history_path);
+        free(policy->mfu_path);
+        free(policy->mfu_rows);
         free(policy->packed); free(policy->pins);
         free(policy->layer_requests); free(policy->usage); free(policy);
     }
@@ -10430,9 +11236,9 @@ int coli_v4_expert_store_prewarm(ColiExpertStore *store) {
     int per_layer = state->slots_per_layer < experts
         ? state->slots_per_layer : experts;
     int every = per_layer >= experts;
-    if (!every && !policy->history_total) {
+    if (!every && !policy->history_total && !policy->mfu_seeded) {
         fprintf(stderr, "[v4] expert cache: %d of %d experts per layer fit and no "
-                "usage history says which, so it fills as experts are used\n",
+                "usage or decode history says which, so it fills as experts are used\n",
                 per_layer, experts);
         return 0;
     }
@@ -10440,14 +11246,39 @@ int coli_v4_expert_store_prewarm(ColiExpertStore *store) {
     int *order = every ? NULL : malloc((size_t)experts * sizeof(*order));
     if (!keys || (!every && !order)) { free(keys); free(order); return -1; }
     size_t count = 0;
+    int ranked_by_mfu = 0;   /* some layer ranked by the mfu table: re-stamp after */
     for (int layer = 0; layer < layers; layer++) {
         if (every) {
             for (int expert = 0; expert < experts; expert++)
                 keys[count++] = (ColiExpertKey){layer, expert};
             continue;
         }
-        /* the per_layer most selected, ties to the lower id; never selected ones stay out */
+        /* the per_layer most selected, ties to the lower id; never selected ones stay out.
+         * S-store map §5c-seed: a layer with decode-only mfu history ranks by it
+         * (the fork's .coli_mfu -- capacity plus a warm seed is the load-bearing
+         * half of its hit rate); a layer without keeps the merged usage history.
+         * One source per layer: the two tables count different populations and
+         * their raw counts must not be compared. */
         const uint64_t *use = policy->usage + (size_t)layer * experts;
+        uint64_t *mfu_seed = NULL;
+        if (layer < MFU_NUM_LAYERS) {
+            const uint32_t *ref =
+                policy->mfu.counts + (size_t)layer * MFU_EXPERTS_PER_LAYER;
+            int limit = experts < MFU_EXPERTS_PER_LAYER
+                ? experts : MFU_EXPERTS_PER_LAYER;
+            int any = 0;
+            for (int expert = 0; expert < limit; expert++)
+                if (ref[expert]) { any = 1; break; }
+            if (any) {
+                mfu_seed = malloc((size_t)experts * sizeof(*mfu_seed));
+                if (mfu_seed) {
+                    for (int expert = 0; expert < experts; expert++)
+                        mfu_seed[expert] = expert < limit ? ref[expert] : 0;
+                    use = mfu_seed;
+                    ranked_by_mfu = 1;
+                }
+            }
+        }
         for (int expert = 0; expert < experts; expert++) order[expert] = expert;
         for (int rank = 0; rank < per_layer; rank++) {
             int best = rank;
@@ -10457,6 +11288,7 @@ int coli_v4_expert_store_prewarm(ColiExpertStore *store) {
             if (!use[chosen]) break;
             keys[count++] = (ColiExpertKey){layer, chosen};
         }
+        free(mfu_seed);
     }
     free(order);
     if (!count) { free(keys); return 0; }
@@ -10502,14 +11334,29 @@ int coli_v4_expert_store_prewarm(ColiExpertStore *store) {
         }
     }
     policy->warming = 0;
-    free(keys);
 
     pthread_mutex_lock(&state->mutex);
     uint64_t resident = state->stats.resident_bytes;
     state->stats = before;
     state->stats.resident_bytes = resident;
     state->disk_sec = disk_before;
+    /* The mfu-ranked fill reads in rank order, so without this the hottest
+     * seeds are each partition's OLDEST entries and the first misses evict
+     * exactly them (the fork measured pool=0 disk=283 at layer 0 with a fully
+     * warm pool from this; fork deepseek_v4.c:15990-16000 re-stamps for the
+     * same reason). Re-stamp in reverse rank order so popularity order is
+     * recency order and the coldest seed is the first to go. A usage-ranked
+     * fill keeps today's ordering. */
+    if (!every && ranked_by_mfu)
+        for (size_t i = count; i > 0; i--) {
+            V4ExpertSlot *slot = indexed_expert_slot(state, keys[i - 1]);
+            if (slot && slot->slab && slot->expert == keys[i - 1].expert) {
+                slot->used = ++state->clock;
+                touch_lru_slot(state, slot);
+            }
+        }
     pthread_mutex_unlock(&state->mutex);
+    free(keys);
     double seconds = hot_now() - began;
     fprintf(stderr, "[v4] expert cache: %zu experts, %.1f GiB, read in %.1f s (%.2f GiB/s)\n",
             done, (double)resident / 1073741824.0, seconds,
@@ -10561,9 +11408,28 @@ int COLI_V4_ROWS16_STORE_OPEN(
     int pin_count = requested > (uint64_t)maximum_pins
         ? maximum_pins : (int)requested;
     if (pin_count < 0) pin_count = 0;
+    /* The frozen MFU section (S-store map §5a): COLI_V4_FROZEN_PCT percent of
+     * the layer's slots, a victim-exempt set ranked by the decode-only mfu
+     * table instead of the merged usage history. Its cap is the layer's own
+     * spare slots (slots_per_layer - minimum_slots), NOT the usage pins'
+     * COLI_V4_MAX_PIN_SLOTS_PER_LAYER: 100% must be able to lift past 16
+     * (48 slots -> 42 frozen, the 6-slot decode reserve and the pool borrow
+     * stay intact). Default 0 = today's exact policy. */
+    int spare_slots = state->slots_per_layer - minimum_slots;
+    int frozen_count = 0;
+    const char *frozen_env = getenv("COLI_V4_FROZEN_PCT");
+    if (frozen_env && *frozen_env) {
+        long pct = strtol(frozen_env, NULL, 10);
+        if (pct > 0) {
+            long want = (long)state->slots_per_layer * pct / 100;
+            if (want > (long)spare_slots) want = spare_slots;
+            frozen_count = want > 0 ? (int)want : 0;
+        }
+    }
+    int pin_stride = pin_count + frozen_count;
     V4HotPolicy *policy = calloc(1, sizeof(*policy));
     size_t records = (size_t)state->layers * state->experts_per_layer;
-    size_t pins = (size_t)state->layers * (pin_count ? pin_count : 1);
+    size_t pins = (size_t)state->layers * (pin_stride ? pin_stride : 1);
     size_t slots = (size_t)state->layers * state->slots_per_layer;
     if (policy) policy->usage = calloc(records, sizeof(*policy->usage));
     if (policy) policy->layer_requests = calloc(
@@ -10580,8 +11446,11 @@ int COLI_V4_ROWS16_STORE_OPEN(
     }
     for (size_t i = 0; i < pins; i++) policy->pins[i] = -1;
     policy->store = *output; policy->pin_count = pin_count;
+    policy->pin_stride = pin_stride; policy->frozen_count = frozen_count;
     policy->keep_free = options->keep_free_bytes;
     policy->history_path = hot_history_path(options->model_dir);
+    mfu_init(&policy->mfu);
+    policy->mfu_path = hot_mfu_path(options->model_dir);
     policy->repin_interval = options->repin_interval
         ? options->repin_interval : (uint64_t)minimum_slots;
     if (!policy->repin_interval) policy->repin_interval = 1;
@@ -10600,13 +11469,29 @@ int COLI_V4_ROWS16_STORE_OPEN(
             for (int layer = 0; layer < state->layers; layer++)
                 hot_repin_locked(policy, state, layer);
     }
+    /* The mfu table loads whatever the phase -- the seed (prewarm ranking) and
+     * the frozen section need it with COLI_V4_FROZEN_PCT=0 too. A missing or
+     * corrupt file is a cold start (mfu_load leaves the zeroed table). */
+    if (policy->mfu_path &&
+        mfu_load(&policy->mfu, policy->mfu_path) == 0) {
+        if (policy->mfu.total_accesses)
+            fprintf(stderr, "v4_mfu history=%s selections=%llu\n",
+                    policy->mfu_path,
+                    (unsigned long long)policy->mfu.total_accesses);
+        for (size_t i = 0; i < MFU_NUM_EXPERTS && !policy->mfu_seeded; i++)
+            if (policy->mfu.counts[i]) policy->mfu_seeded = 1;
+    }
+    if (policy->frozen_count > 0)
+        for (int layer = 0; layer < state->layers; layer++)
+            hot_freeze_locked(policy, state, layer);
     pthread_mutex_lock(&hot_policies_mutex);
     policy->next = hot_policies; hot_policies = policy;
     pthread_mutex_unlock(&hot_policies_mutex);
     (*output)->ops = &hot_operations;
     fprintf(stderr,
-            "v4_hot_policy pin_slots_per_layer=%d repin_interval=%llu "
-            "mode=resident-ram rows16=hot-pins\n", pin_count,
+            "v4_hot_policy pin_slots_per_layer=%d frozen_per_layer=%d "
+            "repin_interval=%llu "
+            "mode=resident-ram rows16=hot-pins\n", pin_count, frozen_count,
             (unsigned long long)policy->repin_interval);
     /* COLI_V4_PREWARM=1 fills the cache here, in any run; unset, a serve fills it
      * before READY (v4_serve_main) and a one-shot run leaves it to the misses. */
@@ -11336,8 +12221,9 @@ void coli_v4_engine_destroy(ColiV4Engine *engine) {
     free(engine->head_cache.data);
     engine->head_cache.data = NULL;
     if (engine->owns_experts && engine->experts && engine->experts->ops &&
-        engine->experts->ops->destroy)
+        engine->experts->ops->destroy) {
         engine->experts->ops->destroy(engine->experts);
+    }
     engine->experts = NULL;
     if (engine->owns_index && engine->target_index) {
 #ifdef COLI_V4_TEST_HOOKS
@@ -14049,8 +14935,41 @@ static int v4_vkt_issue(int layer, const float *x, int S, int K, const int *idx,
     if (!v4_vkt_thread()) { memset(taken, 0, (size_t)S * K); return 0; }
     return XT(issue_w)(layer, x, S, K, idx, w, taken);
 }
+#ifdef COLI_VULKAN
+/* COLI_VK_TIER_EXPERTS (CS-1b): the finish-site group, the engine-thread seam -- the
+ * Vulkan tier's own lever; the CUDA tier keeps the issue/join path it has. */
+static int v4_vkt_issue_group(int layer, const float *x, int S, int K, const int *idx,
+                              const float *w, const VktAliasSrc *src, uint8_t *taken) {
+    if (g_xt_cuda || !v4_vkt_thread()) return 0;
+    return vkt_issue_group(layer, x, S, K, idx, w, src, taken);
+}
+/* COLI_VK_TIER_CS_DEVSUM: the finish-site join that may hand back the device-merged
+ * row; the rows stay valid beside it (the standing merge path is the fallback). */
+static int v4_vkt_join_merged(const float **rows, const float **sum) {
+    return vkt_join_merged(rows, sum);
+}
+#endif
+/* COLI_VK_TIER_PILOT's binding (the store unit's reader pool asks through the
+ * pointer): only this store's tier, and only its cached handles. */
+static int v4_vkt_pilot_served(ColiExpertStore *store, int layer, int expert) {
+    return g_v4_vkt.store == store && g_v4_vkt.cs_served &&
+           g_v4_vkt.cs_served(layer, expert);
+}
 static int v4_vkt_join(const float **rows) { return XT(join)(rows); }
 static void v4_vkt_routed(ColiExpertKey key) { coli_v4_expert_store_note_routed(g_v4_vkt.store, key); }
+/* The pilot's skip test, the CS issue path's own taken rule (a resident's cached
+ * ColiVkExpert handle: no read): reads those selections would warm nothing the
+ * entry ever reads. */
+static int v4_vkt_cs_served(int layer, int expert) {
+    return XT(cs_served)(layer, expert);
+}
+/* The VRAM bank's refill (COLI_VK_TIER_BANK_LAYER), the engine-thread seam: the routed
+ * ids of the step about to issue, post-router pre-issue -- the bank fills its missing
+ * experts before the tier serves the step (vk_tier.h's vkt_bank_fill). */
+static void v4_vkt_bank(int layer, const int *idx, int n) {
+    if (!v4_vkt_thread()) return;
+    XT(bank_fill)(layer, idx, n);
+}
 static int v4_vkt_in_ram(void *ctx, int layer, int expert) {
     return coli_v4_expert_store_in_ram((ColiExpertStore *)ctx, (ColiExpertKey){layer, expert});
 }
@@ -14125,24 +15044,281 @@ static void v4_vkt_note(const ColiExpertView *view) {
 
 /* The tier's streaming (a big prompt chunk's cold experts on the device): an expert as
  * the store leases it (its RAM cache, else the disk), a pinned rows16 one unpacked to
- * rows as v4_vkt_note does, held until the tier has copied it. */
-typedef struct { ColiExpertView view; unsigned char *buffer; } V4VkHold;
-static int v4_vkt_load(void *ctx, int layer, int expert, VktExpertSrc *src, void **h) {
-    ColiExpertStore *store = ctx;
-    if (!v4_vkt_thread()) return 0;
-    V4VkHold *hold = calloc(1, sizeof *hold);
-    if (!hold) return 0;
-    if (coli_expert_lookup(store, (ColiExpertKey){layer, expert}, &hold->view)) { free(hold); return 0; }
-    if (v4_vkt_rows(&hold->view, src, &hold->buffer)) { coli_expert_release(store, &hold->view); free(hold); return 0; }
-    *h = hold;
-    return 1;
+ * rows as v4_vkt_note does, held until the tier has copied it.
+ *
+ * The bypass (COLI_VK_TIER_STREAM_BYPASS=1, the S1+S2 pair): a cold expert is read
+ * straight from the disk into a bounded stage pool -- coli_v4_expert_store_read_private,
+ * the warm start's reader, which touches no lease, no LRU slot and no store counter --
+ * instead of through a lease, whose every fill evicts a slot of the store's cache that
+ * the decode hot set or the rows16 pins could have kept (the stream reads ~192 GiB of
+ * one-shot experts a run through it). An expert the store already holds is still leased
+ * (the RAM read is cheaper than the disk, and the hit keeps counting), and note_routed
+ * keeps the .coli_usage history whatever loaded the expert -- only a fill's own lookup
+ * is spared, and a routing's count was always the one that mattered. The pool is
+ * COLI_VK_TIER_STREAM_DEPTH stages of 16 MiB (8 by default), 4096-aligned, made once and
+ * kept for the process; the engine thread
+ * alone hands buffers out (vkt_issue and vkt_stream_prefetch both fill on it) and
+ * release hands them back, so there is no lock. Without the flag the engine wires no
+ * load_batch and every fill leases exactly as before. Only BC_STREAM fills ever come
+ * through here: residents are never loaded, the warm start goes through vkt_put, and
+ * the CPU path leases on its own. */
+typedef struct { ColiExpertView view; unsigned char *buffer; int stage; int ring; } V4VkHold;
+enum { V4_VKT_STAGE_N = 8, V4_VKT_STAGE_CAP = 16u << 20 };
+/* COLI_VK_TIER_STREAM_DEPTH (default 8, 1..64): the stage pools' depth -- stages of
+ * V4_VKT_STAGE_CAP each, and the read queue's width with them, toward the fork's qd16
+ * ring class. Host RAM only: the device ring's width stays the tier's stream slots'
+ * (COLI_VK_TIER_STREAM_SLOTS stays authoritative for the device budget -- a deeper pool
+ * reads wider, it never holds more experts on the device than the slots have places),
+ * and the fill groups that drain it stay 64-wide at most (vk_tier.c's arrays). */
+static int v4_vkt_depth(void) {
+    static int n = -1;
+    if (n < 0) {
+        const char *d = getenv("COLI_VK_TIER_STREAM_DEPTH");
+        n = d && *d ? atoi(d) : V4_VKT_STAGE_N;
+        if (n < 1) n = 1;
+        if (n > 64) n = 64;
+    }
+    return n;
 }
+static unsigned char **v4_vkt_stage;
+static unsigned char *v4_vkt_stage_busy;
+static int v4_vkt_stage_n;   /* the pool's width (v4_vkt_depth()), set when the pool is made */
+static int v4_vkt_stage_state;   /* 0 not made, 1 ready, -1 unusable (record or memory) */
+static int v4_vkt_bypass;
+static int v4_vkt_stage_init(ColiExpertStore *store) {
+    if (v4_vkt_stage_state) return v4_vkt_stage_state > 0;
+    v4_vkt_stage_state = -1;
+    uint64_t record = coli_v4_expert_store_record_bytes(store);
+    if (!record || record + 8192u > V4_VKT_STAGE_CAP) {   /* the read's O_DIRECT window wants the record and a page of slack */
+        fprintf(stderr, "%s tier deepseek_v4: an expert's %.1f MiB does not fit a %d MiB stage; "
+                "the stream's fills take the store's lease as before\n",
+                XT_TAG, record / 1048576.0, V4_VKT_STAGE_CAP >> 20);
+        return 0;
+    }
+    const int n = v4_vkt_depth();
+    v4_vkt_stage = calloc((size_t)n, sizeof *v4_vkt_stage);
+    v4_vkt_stage_busy = calloc((size_t)n, 1);
+    if (v4_vkt_stage && v4_vkt_stage_busy) {
+        int i;
+        for (i = 0; i < n; i++)
+            if (posix_memalign((void **)&v4_vkt_stage[i], 4096, V4_VKT_STAGE_CAP)) break;
+        if (i >= n) {
+            v4_vkt_stage_n = n;
+            v4_vkt_stage_state = 1;
+            return 1;
+        }
+        while (i > 0) compat_aligned_free(v4_vkt_stage[--i]);
+    }
+    free(v4_vkt_stage); free(v4_vkt_stage_busy);
+    v4_vkt_stage = NULL; v4_vkt_stage_busy = NULL;
+    fprintf(stderr, "%s tier deepseek_v4: no memory for the %d x %d MiB stage pool; "
+                    "the stream's fills take the store's lease as before\n",
+            XT_TAG, n, V4_VKT_STAGE_CAP >> 20);
+    return 0;
+}
+static int v4_vkt_stage_take(void) {
+    for (int i = 0; i < v4_vkt_stage_n; i++)
+        if (!v4_vkt_stage_busy[i]) { v4_vkt_stage_busy[i] = 1; return i; }
+    return -1;
+}
+static void v4_vkt_ring_stage_back(int stage);   /* the ring's own pool, below: a ring hold's release frees it (PW-B2) */
 static void v4_vkt_unhold(void *ctx, void *h) {
     V4VkHold *hold = h;
     if (!hold) return;
-    coli_expert_release((ColiExpertStore *)ctx, &hold->view);
+    /* A hold's stage indexes the pool that handed it out, and the two pools are never
+     * shared (the engine's is handed out on the engine thread alone, the ring's on the
+     * worker alone). Freeing the wrong one leaks the ring's pool after its first job --
+     * every job after filled nothing -- and falsely frees an engine stage a concurrent
+     * engine fill may be reading into. */
+    if (hold->ring) v4_vkt_ring_stage_back(hold->stage);
+    else if (hold->stage >= 0) v4_vkt_stage_busy[hold->stage] = 0;   /* the engine pool's buffer back */
+    else coli_expert_release((ColiExpertStore *)ctx, &hold->view);
     free(hold->buffer); free(hold);
 }
+/* One expert for a stream fill: `stage` is a pool buffer this call owns (marked busy,
+ * handed back on every way out) or -1 for the store's lease. A bypass read that fails
+ * falls back to the lease, so a fill never fails while the store could still serve it.
+ * Called on the engine thread, or a load_batch worker whose lease is the prewarm's
+ * parallel lookup: the store holds no lock over its disk read. */
+static int v4_vkt_load_one(ColiExpertStore *store, int layer, int expert,
+                           VktExpertSrc *src, void **h, int stage) {
+    V4VkHold *hold = calloc(1, sizeof *hold);
+    if (!hold) { if (stage >= 0) v4_vkt_stage_busy[stage] = 0; return 0; }
+    if (stage >= 0) {
+        if (!coli_v4_expert_store_read_private(store, (ColiExpertKey){layer, expert},
+                                               v4_vkt_stage[stage], &hold->view) &&
+            !v4_vkt_rows(&hold->view, src, &hold->buffer)) {
+            hold->stage = stage;
+            *h = hold;
+            return 1;
+        }
+        free(hold->buffer);
+        v4_vkt_stage_busy[stage] = 0;
+    }
+    hold->stage = -1;
+    if (coli_expert_lookup(store, (ColiExpertKey){layer, expert}, &hold->view)) { free(hold); return 0; }
+    if (v4_vkt_rows(&hold->view, src, &hold->buffer)) {
+        coli_expert_release(store, &hold->view);
+        free(hold);
+        return 0;
+    }
+    *h = hold;
+    return 1;
+}
+static int v4_vkt_load(void *ctx, int layer, int expert, VktExpertSrc *src, void **h) {
+    if (!v4_vkt_thread()) return 0;
+    ColiExpertStore *store = ctx;
+    int stage = v4_vkt_bypass && v4_vkt_stage_init(store) &&
+                !coli_v4_expert_store_in_ram(store, (ColiExpertKey){layer, expert})
+                ? v4_vkt_stage_take() : -1;
+    return v4_vkt_load_one(store, layer, expert, src, h, stage);
+}
+/* The group reader (vk_tier.h's load_batch): up to the stage pool's depth
+ * (COLI_VK_TIER_STREAM_DEPTH) experts a call -- the
+ * pool bounds the bypassing reads, and with them the leases -- each expert read by its
+ * own thread, a cold one into its own stage buffer and one the store holds leased (the
+ * warm start and the prewarm read this way; cold disk reads want the queue depth).
+ * Returns the leading count it loaded; the tier uploads and releases those before
+ * asking for the rest, which is what returns the buffers to the pool. */
+static int v4_vkt_load_batch(void *ctx, int layer, const int *eids, int n,
+                             VktExpertSrc *srcs, void **hs) {
+    if (!v4_vkt_thread()) return 0;
+    ColiExpertStore *store = ctx;
+    if (n > 64) n = 64;
+    if (n < 1) return 0;
+    int plan, st[64];
+    if (v4_vkt_bypass && v4_vkt_stage_init(store)) {
+        int free_n = 0;
+        for (int i = 0; i < v4_vkt_stage_n; i++) free_n += !v4_vkt_stage_busy[i];
+        plan = 0;
+        for (int i = 0; i < n && plan < v4_vkt_stage_n; i++) {
+            int stage = -1;
+            if (!coli_v4_expert_store_in_ram(store, (ColiExpertKey){layer, eids[i]})) {
+                if (!free_n) break;   /* the pool bounds the batch; the rest come next call */
+                stage = v4_vkt_stage_take();
+                if (stage < 0) break;
+                free_n--;
+            }
+            st[plan++] = stage;
+        }
+    } else {   /* no stage pool: every read leases, the batch's width only */
+        plan = n;
+        for (int i = 0; i < plan; i++) st[i] = -1;
+    }
+    if (!plan) return 0;
+    void *hh[64];
+    unsigned char ok[64];
+    #pragma omp parallel for schedule(dynamic, 1) if (plan > 1) \
+            num_threads(plan > v4_vkt_stage_n && v4_vkt_stage_n > 0 ? v4_vkt_stage_n : plan)
+    for (int i = 0; i < plan; i++) {
+        void *h = NULL;
+        ok[i] = (unsigned char)v4_vkt_load_one(store, layer, eids[i], &srcs[i], &h, st[i]);
+        hh[i] = h;
+    }
+    int got = 0;
+    while (got < plan && ok[got]) got++;
+    for (int i = 0; i < plan; i++) {
+        if (i < got) hs[i] = hh[i];
+        else if (hh[i]) v4_vkt_unhold(store, hh[i]);          /* a hold made past a failure */
+        else if (st[i] >= 0) v4_vkt_stage_busy[st[i]] = 0;     /* a buffer nothing was read into */
+    }
+    return got;
+}
+
+/* The stream ring's reader (COLI_VK_TIER_STREAM_RING, the fork's v4_ram_worker class):
+ * v4_vkt_load_batch's shape, called by the tier's ring worker instead of the engine
+ * thread -- so no v4_vkt_thread() gate, no lease fallback, and a stage pool of the
+ * ring's own: the engine's pool above is handed out on the engine thread alone, and
+ * this one on the worker alone (the busy flags and the take below never race, which
+ * is the whole difference from a shared pool). An expert the store already holds in
+ * RAM stops the prefix -- the tier's plan asks in_ram and leaves those out, and one
+ * that slips through stays to the engine's inline fill at the step, like a failed
+ * read: the partial ring is profit, the inline path is the fallback. The buffers are
+ * made once and kept for the process, like the engine's own. */
+static unsigned char **v4_vkt_ring_stage;
+static unsigned char *v4_vkt_ring_stage_busy;
+static int v4_vkt_ring_stage_n;   /* the ring pool's width (v4_vkt_depth()), set when the pool is made */
+static void v4_vkt_ring_stage_back(int stage) {
+    if (stage >= 0 && stage < v4_vkt_ring_stage_n) v4_vkt_ring_stage_busy[stage] = 0;
+}
+static int v4_vkt_ring_stage_state;
+static int v4_vkt_ring_stage_init(ColiExpertStore *store) {
+    if (v4_vkt_ring_stage_state) return v4_vkt_ring_stage_state > 0;
+    v4_vkt_ring_stage_state = -1;
+    uint64_t record = coli_v4_expert_store_record_bytes(store);
+    if (!record || record + 8192u > V4_VKT_STAGE_CAP) {
+        fprintf(stderr, "%s tier deepseek_v4: an expert's %.1f MiB does not fit a %d MiB ring stage; "
+                        "the ring's reads stay with the engine's fills\n",
+                XT_TAG, record / 1048576.0, V4_VKT_STAGE_CAP >> 20);
+        return 0;
+    }
+    const int n = v4_vkt_depth();
+    v4_vkt_ring_stage = calloc((size_t)n, sizeof *v4_vkt_ring_stage);
+    v4_vkt_ring_stage_busy = calloc((size_t)n, 1);
+    if (v4_vkt_ring_stage && v4_vkt_ring_stage_busy) {
+        int i;
+        for (i = 0; i < n; i++)
+            if (posix_memalign((void **)&v4_vkt_ring_stage[i], 4096, V4_VKT_STAGE_CAP)) break;
+        if (i >= n) {
+            v4_vkt_ring_stage_n = n;
+            v4_vkt_ring_stage_state = 1;
+            return 1;
+        }
+        while (i > 0) compat_aligned_free(v4_vkt_ring_stage[--i]);
+    }
+    free(v4_vkt_ring_stage); free(v4_vkt_ring_stage_busy);
+    v4_vkt_ring_stage = NULL; v4_vkt_ring_stage_busy = NULL;
+    fprintf(stderr, "%s tier deepseek_v4: no memory for the ring's %d x %d MiB stage pool; "
+                    "the ring's reads stay with the engine's fills\n",
+            XT_TAG, n, V4_VKT_STAGE_CAP >> 20);
+    return 0;
+}
+static int v4_vkt_ring_batch(void *ctx, int layer, const int *eids, int n,
+                             VktExpertSrc *srcs, void **hs) {
+    ColiExpertStore *store = ctx;
+    if (n > 64) n = 64;
+    if (n < 1 || !v4_vkt_ring_stage_init(store)) return 0;
+    int st[64], plan = 0;
+    for (int i = 0; i < n && plan < v4_vkt_ring_stage_n; i++) {
+        if (coli_v4_expert_store_in_ram(store, (ColiExpertKey){layer, eids[i]})) break;
+        int stage = -1;
+        for (int j = 0; j < v4_vkt_ring_stage_n; j++)
+            if (!v4_vkt_ring_stage_busy[j]) { v4_vkt_ring_stage_busy[j] = 1; stage = j; break; }
+        if (stage < 0) break;   /* the pool bounds the batch; the rest come next call */
+        st[plan++] = stage;
+    }
+    if (!plan) return 0;
+    void *hh[64];
+    unsigned char ok[64];
+    #pragma omp parallel for schedule(dynamic, 1) if (plan > 1) \
+            num_threads(plan > v4_vkt_ring_stage_n ? v4_vkt_ring_stage_n : plan)
+    for (int i = 0; i < plan; i++) {
+        V4VkHold *hold = calloc(1, sizeof *hold);
+        ok[i] = 0; hh[i] = NULL;
+        if (!hold) { v4_vkt_ring_stage_busy[st[i]] = 0; continue; }
+        if (!coli_v4_expert_store_read_private(store, (ColiExpertKey){layer, eids[i]},
+                                               v4_vkt_ring_stage[st[i]], &hold->view) &&
+            !v4_vkt_rows(&hold->view, &srcs[i], &hold->buffer)) {
+            hold->stage = st[i];
+            hold->ring = 1;   /* its release frees the ring's pool, not the engine's (v4_vkt_unhold) */
+            hh[i] = hold;
+            ok[i] = 1;
+        } else {
+            free(hold->buffer);
+            free(hold);
+            v4_vkt_ring_stage_busy[st[i]] = 0;
+        }
+    }
+    int got = 0;
+    while (got < plan && ok[got]) got++;
+    for (int i = 0; i < plan; i++) {
+        if (i < got) hs[i] = hh[i];
+        else if (hh[i]) v4_vkt_unhold(store, hh[i]);          /* a hold made past a failure */
+        else if (st[i] >= 0) v4_vkt_ring_stage_busy[st[i]] = 0;   /* a buffer nothing was read into */
+    }
+    return got;
+}
+
 /* The state the serve's sessions allocate after the tier starts, every slot at the
  * context: the window and compressed KV and the indexer's keys (as the RAM plan's
  * context_bytes counts them), and the prompt's two arrays of hyper-connection streams,
@@ -14225,6 +15401,19 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
         fprintf(stderr, ")\n");
         if (!mixed) { free(lgu); free(ldn); lgu = ldn = NULL; }
     }
+    /* COLI_VK_TIER_STREAM_BYPASS: 1 reads the stream's fills past the cache
+     * (v4_vkt_load_batch). The default since the self-tuning defaults -- an unset env
+     * arms the bypass reader (numerics-neutral, only which cache sees the bytes
+     * differs); =0 the per-lever hatch, and COLI_VK_LEGACY=1 turns an unset env back
+     * to the base's off */
+    const char *bpe = getenv("COLI_VK_TIER_STREAM_BYPASS");
+    int bypass_set = bpe && *bpe;
+    v4_vkt_bypass = coli_vk_env_def("COLI_VK_TIER_STREAM_BYPASS", 1, 0) != 0;
+    /* .stage stays unset on purpose (R-l1's OPEN-4): the staging carve it would enable is
+     * doubly gated on block formats -- the tier's `blocks` scan and vkc_stage_sizes,
+     * which returns 0 for fmt 7 -- and this model's experts are all MXFP4 (fmt 7), so it
+     * would be a no-op that still carved device budget for staging nothing. A V4 whose
+     * experts are block formats (a GGUF conversion) is the shape that wants it. */
     VktConfig vc = {.engine = "deepseek_v4", .layers = c->num_hidden_layers,
                     .experts = c->n_routed_experts, .hidden = c->hidden_size,
                     .inter = c->moe_intermediate_size, .topk = c->num_experts_per_tok,
@@ -14236,9 +15425,29 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
                     .ram_later = v4_state_later(engine),
                     /* what the device has still to take: matrices placed already
                      * (the dense weights on the device only) are in its usage */
-                    .dense_bytes = v4_tier_dense_bytes(engine),
+                    /* what the device has still to take: matrices placed already
+                     * (the dense weights on the device only) are in its usage */
+                    .dense_bytes = v4_tier_dense_bytes(engine),   /* a chain placed all it places; a GGUF's dense on the CUDA tier (cu_dense.h) */
+                    /* the store's RAM plan: the pool takes what it leaves beside the expert
+                     * cache at capacity, the dense weights in RAM and the head */
+                    .ram_planned = engine->runtime.ram_budget_bytes && engine->runtime.ram_planned_bytes,
+                    .ram_budget = (size_t)engine->runtime.ram_budget_bytes,
+                    .ram_spare = engine->runtime.ram_budget_bytes > engine->runtime.ram_planned_bytes
+                        ? (size_t)(engine->runtime.ram_budget_bytes - engine->runtime.ram_planned_bytes) : 0,
                     .in_ram = v4_vkt_in_ram, .ram_ctx = store,
-                    .load = v4_vkt_load, .release = v4_vkt_unhold, .load_ctx = store};
+                    .load = v4_vkt_load, .release = v4_vkt_unhold, .load_ctx = store,
+                    .load_batch = v4_vkt_bypass ? v4_vkt_load_batch : NULL,
+                    /* the ring's reader: the Vulkan backend's commit is any-thread; the CUDA
+                     * tier keeps its fills on the engine thread as before (no armed ring) */
+                    .ring_batch = v4_vkt_bypass && !xt_cuda() ? v4_vkt_ring_batch : NULL,
+                    /* CS-1b: this engine wires the finish-site group (v4_vkt_issue_group
+                     * below), so the tier may defer a decode step to it */
+                    .cs_finish = 1};
+    /* COLI_VK_TIER_DECODE_GROW's rank: the decode-only counts (.coli_mfu), handed over
+     * as rows only where the engine's geometry is the fork table's own (the check is
+     * the store unit's, which owns the table's macros); the tier keeps its copy and
+     * never asks again */
+    vc.decode_heat = coli_v4_expert_store_mfu_history(store);
     /* The device goes before the drivers unload, after the tier's teardown (atexit runs
      * last-registered first), and whether or not the tier starts: XT(init) makes the
      * expert batch's pipelines before it can refuse (no room). */
@@ -14247,7 +15456,23 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
     free(lgu); free(ldn);   /* read during XT(init) only */
     if (!tier_on) return;
     atexit(XT(shutdown));
-    g_v4_vkt = (ColiV4VkTier){store, v4_vkt_issue, v4_vkt_join, v4_vkt_note, v4_vkt_routed};
+    if (v4_vkt_bypass) {   /* the effective depth at boot: the env's, both pools' */
+        int depth = v4_vkt_depth();
+        fprintf(stderr, "%s tier deepseek_v4: the stream's fills read past the expert cache "
+                "(%d stages of %d MiB, groups of %d in parallel; COLI_VK_TIER_STREAM_BYPASS%s)%s\n",
+                XT_TAG, depth, V4_VKT_STAGE_CAP >> 20, depth,
+                bypass_set ? "" : " (unset -- the default reader)",
+                depth != V4_VKT_STAGE_N ?
+                " -- COLI_VK_TIER_STREAM_DEPTH: host read depth only, the device ring's width stays COLI_VK_TIER_STREAM_SLOTS'" : "");
+    }
+    g_v4_vkt = (ColiV4VkTier){store, v4_vkt_issue, v4_vkt_join, NULL, v4_vkt_note, v4_vkt_routed, v4_vkt_bank, NULL, v4_vkt_cs_served};
+    v4_pilot_tier_served = v4_vkt_pilot_served;   /* COLI_VK_TIER_PILOT: the tier's residents are not the pilot's to warm */
+#ifdef COLI_VULKAN
+    if (!xt_cuda() && vkt_cs_armed()) {
+        g_v4_vkt.issue_group = v4_vkt_issue_group;   /* CS-1b: only an armed Vulkan tier defers; every other link keeps today's path whole */
+        g_v4_vkt.join_merged = v4_vkt_join_merged;   /* CS_DEVSUM: the tier decides per group whether a merged row exists */
+    }
+#endif
     int all = c->num_hidden_layers * c->n_routed_experts;
     int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));
     const char *warm = getenv("COLI_VK_TIER_WARM");   /* 0: no warm start, the tier fills as experts pass by */
@@ -14283,9 +15508,28 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
 
 /* The tier's line for a run or a serve turn: RAM hits and disk loads from the
  * store's counters over the same span. */
+static const char *v4_cs_bytes(double b, char *buf, size_t n) {   /* the settle line's own units */
+    if (b >= 1073741824.0) snprintf(buf, n, "%.2f GiB", b / 1073741824.0);
+    else if (b >= 1048576.0) snprintf(buf, n, "%.1f MiB", b / 1048576.0);
+    else snprintf(buf, n, "%.1f KiB", b / 1024.0);
+    return buf;
+}
 static void v4_vk_tier_report(const char *scope, unsigned long long hits,
                               unsigned long long misses) {
-    if (coli_v4_vk_tier) XT(report)(scope, hits, misses);
+    if (!coli_v4_vk_tier) return;
+    XT(report)(scope, hits, misses);
+    if (v4_cs_dprof() && g_v4_cs_win) {   /* DPROF: the decode settle's bytes, beside the tier's own cs lines */
+        char hd[32], hr[32], ha[32], hc[32];
+        uint64_t rec = coli_v4_expert_store_record_bytes(coli_v4_vk_tier->store);
+        fprintf(stderr, "v4_cs settle dprof: %llu windows, %llu loader reads (%llu ram-hit + %llu disk; "
+                        "%s read off disk, %s ram-served), %llu alias sources over %s (%s a record)\n",
+                g_v4_cs_win, g_v4_cs_win_ram + g_v4_cs_win_disk, g_v4_cs_win_ram, g_v4_cs_win_disk,
+                v4_cs_bytes((double)g_v4_cs_win_disk_b, hd, sizeof hd),
+                v4_cs_bytes((double)g_v4_cs_win_ram * (double)rec, hr, sizeof hr),
+                g_v4_cs_src_n, v4_cs_bytes(g_v4_cs_src_b, ha, sizeof ha),
+                v4_cs_bytes((double)rec, hc, sizeof hc));
+    }
+    v4_pilot_report();   /* DPROF: the read-ahead pilot's own line, the settle bucket's other side */
 }
 #endif /* COLI_VULKAN || COLI_CUDA */
 
@@ -14598,6 +15842,8 @@ static void v4_vk_hooks(void) {
 
 /* Once, at the end: what ran on the device, then the device copies go before the
  * engine frees the weights they mirror. */
+void coli_v4_expert_probe_report(void);   /* CS-0: BLOCK_HYBRID's probe prints at this unit's close */
+
 static void v4_vk_close(void) {
 #ifdef COLI_CUDA
     v4_cu_close();
@@ -14610,6 +15856,7 @@ static void v4_vk_close(void) {
         ColiExpertStore *store = coli_v4_vk_tier->store;
         if (store && store->ops && store->ops->stats) store->ops->stats(store, &st);
         v4_vk_tier_report("run", (unsigned long long)st.hits, (unsigned long long)st.misses);
+        coli_v4_expert_probe_report();   /* CS-0: the per-expert probe's line, beside the tier's (BLOCK_HYBRID's) */
         coli_v4_vk_tier = NULL;
         coli_v4_expert_store_device_tier = NULL;
         coli_v4_expert_store_ram_first = NULL;
@@ -14670,6 +15917,11 @@ static float head_bf16_dot(const uint16_t *weight, const float *hidden,
  * reports per-turn deltas. Timing only: no numeric path changes. */
 static double g_v4_prof_block_s = 0.0, g_v4_prof_head_s = 0.0;
 static long long g_v4_prof_forwards = 0;
+/* COLI_VK_CHAIN_DPROF's window on the CLI side: the block time of the one-row forwards
+ * alone (target_token, the decode steps), so wall - block at the bench line is the
+ * head/sampling/generate-glue pool, not the prompt's forward */
+static double g_v4_prof_dblock_s = 0.0;
+static long long g_v4_prof_dfwd = 0;
 static double spec_now(void);   /* defined with the speculative-decode helpers below */
 
 static int head_argmax_impl(ColiV4Engine *engine, const float *hidden,
@@ -15332,8 +16584,11 @@ static int target_token(ColiV4Engine *engine, float **state_ptr, float **next_pt
     double t0 = spec_now();
     int result = target_token_impl(engine, state_ptr, next_ptr, attention, index, config,
                                    experts, token, position, error, error_size);
-    g_v4_prof_block_s += spec_now() - t0;
+    double dt = spec_now() - t0;
+    g_v4_prof_block_s += dt;
+    g_v4_prof_dblock_s += dt;   /* a one-row forward: a decode step (DPROF's window) */
     g_v4_prof_forwards += 1;
+    g_v4_prof_dfwd += 1;
     return result;
 }
 static int target_token_impl(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
@@ -15423,11 +16678,22 @@ static ColiExpertStoreStats stats_subtract(ColiExpertStoreStats end,
     delta.misses -= begin.misses; delta.prefetched -= begin.prefetched;
     delta.prefetch_hits -= begin.prefetch_hits;
     delta.bytes_read -= begin.bytes_read;
+    delta.requests_decode -= begin.requests_decode;
+    delta.hits_decode -= begin.hits_decode;
     return delta;
 }
 
 static double stats_hit_rate(ColiExpertStoreStats stats) {
     return stats.requests ? 100.0 * stats.hits / stats.requests : 0.0;
+}
+
+/* hit_rate_d: the decode-only view (S-store map §5b) -- the number the store
+ * campaign's verdict is pre-registered on, comparable with an engine whose
+ * prefill never touches the store. Zero when the token seam never ran (a
+ * CPU-only or prefill-only build): it is a counter, not a behaviour. */
+static double stats_hit_rate_decode(ColiExpertStoreStats stats) {
+    return stats.requests_decode
+        ? 100.0 * stats.hits_decode / stats.requests_decode : 0.0;
 }
 
 #ifdef COLI_V4_EXPERIMENTAL_STATE_HASH
@@ -15671,6 +16937,8 @@ static void session_free_buffers(ColiV4Session *session) {
     free(session->state); session->state = NULL;
     free(session->generated); session->generated = NULL;
     free(session->prompt_ids); session->prompt_ids = NULL;
+    free(session->ckpt_prev_ids); session->ckpt_prev_ids = NULL;
+    session->ckpt_prev_len = 0;
 }
 
 static void session_free_attention(ColiV4Session *session) {
@@ -15856,23 +17124,51 @@ static int v4_ngram_draft(const int *prompt, int prompt_count,
     return 0;
 }
 
-/* ---- System-prefix checkpoints (V4_PREFIX_CKPT=0 disables) ----
+/* ---- KV cold tier: boundary checkpoints, disk as the system of record
+ * (V4_PREFIX_CKPT=0 disables) ----
  *
  * The window state cannot rewind, so cross-conversation reuse needs a
  * snapshot taken AT the shared boundary. The boundary is discovered, not
- * declared: the longest common prefix of two successive fresh prompts is the
- * stable system prefix (opencode: system + tool block, identical across
- * sessions). LRU slots (V4_PREFIX_CKPT_SLOTS, default 4), in-memory only;
- * each holds the full per-layer attention snapshot (~250 MB for a 2k-window
- * model, growing with context) plus the prefix ids.
+ * declared: the gateway hint (where the rendered system turn ends), the
+ * longest common prefix of two successive fresh prompts, and every prompt
+ * end — an agent's next turn re-renders the assistant reply (tool calls,
+ * stripped reasoning), so strict-prefix session reuse fails at the reply
+ * boundary and without the prompt-end snapshot the whole conversation
+ * re-prefilled (measured: opencode turn 2 = 677 s for 66 new tokens).
  *
- * Two kinds share the slots. PLAN captures are the discovered system prefix.
- * PROMPT-END captures are taken after every prefill at prompt_count: an
- * agent's next turn re-renders the assistant reply (tool calls, stripped
- * reasoning), so strict-prefix session reuse fails at the reply boundary and
- * without this snapshot the whole conversation re-prefilled (measured:
- * opencode turn 2 = 677 s for 66 new tokens). Eviction takes the LRU
- * prompt-end slot first so the system prefix survives a long session. */
+ * Two backends behind one interface (v4_ckpt_restore/store/have dispatch on
+ * V4_PREFIX_CKPT_DISK): 0 keeps the legacy in-memory pool of resident
+ * snapshots (V4PrefixCkpt below, V4_PREFIX_CKPT_SLOTS slots, ~250 MB each —
+ * verbatim v1 behaviour); 1/2 route to the disk catalog, where payloads
+ * live in <model>/.coli_ckpt/ as content-addressed files and RAM holds only
+ * the catalog of token ids (4 B/token) so matching a prompt never touches
+ * disk. Disk 1 persists system-prefix captures, 2 also prompt-end captures.
+ *
+ * Granularity: entries restore only at their own boundary. A prompt forked
+ * to an earlier conversation point restores from the deepest RETAINED
+ * boundary at or before the fork; the window ring and the compressor's
+ * recurrent state make partial rewind of a longer entry impossible by
+ * construction — the same invariant kv_prefix_reuse encodes.
+ * V4_PREFIX_CKPT_SLOTS bounds the retained prompt-end entries and
+ * V4_PREFIX_CKPT_DISK_GB the payload bytes (LRU, system prefixes pinned up
+ * to a cap), which bounds the retained fork depth per lineage. */
+#ifdef _WIN32
+#include <direct.h>
+#include <sys/stat.h>
+#include <process.h>
+#define v4_ckpt_mkdir(p) _mkdir(p)
+#define v4_ckpt_pid() _getpid()
+#else
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <dirent.h>
+#include <unistd.h>
+#define v4_ckpt_mkdir(p) mkdir((p), 0755)
+#define v4_ckpt_pid() getpid()
+#endif
+#include "own_file.h"      /* the checkpoints sit in a downloaded model dir */
+
+/* ---- In-memory backend (V4_PREFIX_CKPT_DISK=0): the v1 slot pool ---- */
 typedef struct {
     int *ids;
     int len;
@@ -15896,27 +17192,48 @@ static int v4_ckpt_slot_count(void) {
     return count;
 }
 
-/* ---- On-disk checkpoint slots: <model>/.coli_ckpt/ckpt_<fingerprint>_<n>.bin
- * The in-memory slots die with the process; the shared system prefix would
- * then cost a full ~minutes prefill again on the first turn after every serve
- * restart. Prefix (plan/hint) captures are persisted by default; prompt-end
- * captures too with V4_PREFIX_CKPT_DISK=2 (one write per request);
- * V4_PREFIX_CKPT_DISK=0 disables. Loaded lazily on the first generate; a
- * config fingerprint (layers, window, head dims, topk) guards mismatches. */
-#ifdef _WIN32
-#include <direct.h>
-#define v4_ckpt_mkdir(p) _mkdir(p)
-#else
-#include <sys/stat.h>
-#define v4_ckpt_mkdir(p) mkdir((p), 0755)
-#endif
-#include "own_file.h"      /* the checkpoints sit in a downloaded model dir */
-static void v4_ckpt_slot_free(V4PrefixCkpt *slot);
+/* ---- Disk backend: content-addressed catalog + per-entry files ---- */
+typedef struct {
+    int *ids;        /* token ids of the captured boundary (RAM, 4 B/token) */
+    int len;
+    int kind;        /* 0 = system prefix (pinned in GC up to a cap), 1 = prompt end */
+    uint64_t bytes;  /* file size (feeds the payload-byte budget) */
+    uint64_t used;   /* LRU clock */
+    int verified;    /* 0 = unchecked, 1 = crc ok, 2 = too large to crc */
+    char file[64];   /* content-addressed name inside v4_ckpt_dir */
+} V4CkptEntry;
+static V4CkptEntry *v4_ckpt_cat;
+static int v4_ckpt_cat_n;
+static int v4_ckpt_cat_cap;
+static uint64_t v4_ckpt_cat_bytes;   /* sum of entry->bytes (payload budget) */
+static uint64_t v4_ckpt_ids_bytes;   /* sum of entry ids RAM (catalog cap) */
 static char v4_ckpt_dir[1024];
 static uint32_t v4_ckpt_fingerprint;
+static uint32_t v4_ckpt_fingerprint_v1;   /* the v1 slot-mirror files' fp */
 static int v4_ckpt_disk_mode = -1;
-static int v4_ckpt_disk_loaded;
+static int v4_ckpt_disk_scanned;
+static int v4_ckpt_prompt_end_cap_cache = -1;
+static uint64_t v4_ckpt_disk_budget_cache;
+static int v4_ckpt_disk_budget_read;
+static int v4_ckpt_legacy_import = -1;
 
+static void v4_ckpt_slot_free(V4PrefixCkpt *slot);
+
+static int v4_ckpt_min_tokens(void) {
+    static int minimum = -1;
+    if (minimum < 0) {
+        const char *setting = getenv("V4_PREFIX_CKPT");
+        if (setting && atoi(setting) == 0) { minimum = 0; return 0; }
+        setting = getenv("V4_PREFIX_CKPT_MIN");
+        minimum = setting ? atoi(setting) : 512;
+        if (minimum < 64) minimum = 64;
+    }
+    return minimum;
+}
+
+/* 0 = tier off; 1 (default) = catalog backend, system-prefix captures
+ * persisted; 2 = also persist prompt-end captures (one write per request);
+ * the value never selects the memory backend — only 0 does. */
 static int v4_ckpt_disk_wanted(void) {
     if (v4_ckpt_disk_mode < 0) {
         const char *setting = getenv("V4_PREFIX_CKPT_DISK");
@@ -15925,6 +17242,207 @@ static int v4_ckpt_disk_wanted(void) {
     return v4_ckpt_disk_mode;
 }
 
+/* Max retained prompt-end entries in the catalog (LRU; system prefixes are
+ * pinned up to v4_ckpt_pin_cap()). V4_PREFIX_CKPT_SLOTS also names the
+ * memory backend's slot count, so the knob keeps one meaning: a bound on
+ * retained entries. */
+static int v4_ckpt_prompt_end_cap(void) {
+    if (v4_ckpt_prompt_end_cap_cache < 0) {
+        const char *setting = getenv("V4_PREFIX_CKPT_SLOTS");
+        v4_ckpt_prompt_end_cap_cache = setting ? atoi(setting) : 4;
+        if (v4_ckpt_prompt_end_cap_cache < 1)
+            v4_ckpt_prompt_end_cap_cache = 1;
+        if (v4_ckpt_prompt_end_cap_cache > 4096)
+            v4_ckpt_prompt_end_cap_cache = 4096;
+    }
+    return v4_ckpt_prompt_end_cap_cache;
+}
+
+/* Total payload-byte budget for the catalog (system prefixes included in the
+ * sum). 0 = unlimited. The catalog's ids RAM is capped at budget/8 (see
+ * v4_ckpt_gc) so thousands of long entries cannot eat the RAM the tier
+ * exists to return to the expert pool. */
+static uint64_t v4_ckpt_disk_budget(void) {
+    if (!v4_ckpt_disk_budget_read) {
+        const char *setting = getenv("V4_PREFIX_CKPT_DISK_GB");
+        v4_ckpt_disk_budget_cache =
+            setting ? (uint64_t)(atof(setting) * 1073741824.0)
+                    : 8ull << 30;
+        v4_ckpt_disk_budget_read = 1;
+    }
+    return v4_ckpt_disk_budget_cache;
+}
+
+/* V4_PREFIX_CKPT_LEGACY_IMPORT=1: convert v1 slot-mirror files
+ * (ckpt_<fp>_<n>.bin) to the v3 format instead of ignoring them. */
+static int v4_ckpt_legacy_import_wanted(void) {
+    if (v4_ckpt_legacy_import < 0) {
+        const char *setting = getenv("V4_PREFIX_CKPT_LEGACY_IMPORT");
+        v4_ckpt_legacy_import = setting ? atoi(setting) : 0;
+    }
+    return v4_ckpt_legacy_import;
+}
+
+/* Pinned system prefixes above this count become evictable under budget
+ * pressure: the fork pinned all of them, so a fleet of agents could pin the
+ * whole byte budget and starve prompt-ends — the thrash the tier exists to
+ * prevent. No new knob: one pinned prefix per mux slot, else 4. */
+static int v4_ckpt_pin_cap(void) {
+    return g_v4_mux_slots > 1 ? g_v4_mux_slots : 4;
+}
+
+static uint64_t v4_ckpt_ids_hash(const int *ids, int len) {
+    uint64_t h = 1469598103934665603ull;
+    for (int i = 0; i < len; i++) {
+        uint32_t v = (uint32_t)ids[i];
+        for (int b = 0; b < 4; b++) {
+            h ^= (v >> (8 * b)) & 0xffu;
+            h *= 1099511628211ull;
+        }
+    }
+    return h;
+}
+
+static void v4_ckpt_entry_file(char *out, size_t size, const int *ids,
+                               int len) {
+    snprintf(out, size, "kv_%08x_%016llx.bin", v4_ckpt_fingerprint,
+             (unsigned long long)v4_ckpt_ids_hash(ids, len));
+}
+
+static void v4_ckpt_catalog_clear(void) {
+    for (int i = 0; i < v4_ckpt_cat_n; i++) free(v4_ckpt_cat[i].ids);
+    v4_ckpt_cat_n = 0;
+    v4_ckpt_cat_bytes = 0;
+    v4_ckpt_ids_bytes = 0;
+}
+
+/* Insert or refresh (same ids + kind). Returns the row index, -1 on
+ * allocation failure (the capture is then simply lost — an optimisation
+ * must never fail a turn). */
+static int v4_ckpt_catalog_add(const int *ids, int len, int kind,
+                               uint64_t bytes, const char *file) {
+    if (!ids || len < 1) return -1;
+    for (int i = 0; i < v4_ckpt_cat_n; i++) {
+        if (v4_ckpt_cat[i].len == len && v4_ckpt_cat[i].kind == kind &&
+            !memcmp(v4_ckpt_cat[i].ids, ids, (size_t)len * sizeof(int))) {
+            v4_ckpt_cat_bytes -= v4_ckpt_cat[i].bytes;
+            v4_ckpt_ids_bytes -= (uint64_t)v4_ckpt_cat[i].len * sizeof(int);
+            if (bytes) v4_ckpt_cat[i].bytes = bytes;
+            v4_ckpt_cat_bytes += v4_ckpt_cat[i].bytes;
+            v4_ckpt_ids_bytes += (uint64_t)v4_ckpt_cat[i].len * sizeof(int);
+            v4_ckpt_cat[i].used = ++v4_ckpt_clock;
+            if (file && *file)
+                snprintf(v4_ckpt_cat[i].file, sizeof(v4_ckpt_cat[i].file),
+                         "%s", file);
+            return i;
+        }
+    }
+    if (v4_ckpt_cat_n == v4_ckpt_cat_cap) {
+        int cap = v4_ckpt_cat_cap ? v4_ckpt_cat_cap * 2 : 16;
+        V4CkptEntry *grown =
+            realloc(v4_ckpt_cat, (size_t)cap * sizeof(*grown));
+        if (!grown) return -1;
+        v4_ckpt_cat = grown;
+        v4_ckpt_cat_cap = cap;
+    }
+    V4CkptEntry *e = &v4_ckpt_cat[v4_ckpt_cat_n];
+    memset(e, 0, sizeof(*e));
+    e->ids = malloc((size_t)len * sizeof(int));
+    if (!e->ids) return -1;
+    memcpy(e->ids, ids, (size_t)len * sizeof(int));
+    e->len = len;
+    e->kind = kind;
+    e->bytes = bytes;
+    e->used = ++v4_ckpt_clock;
+    if (file && *file)
+        snprintf(e->file, sizeof(e->file), "%s", file);
+    v4_ckpt_cat_bytes += bytes;
+    v4_ckpt_ids_bytes += (uint64_t)len * sizeof(int);
+    return v4_ckpt_cat_n++;
+}
+
+static void v4_ckpt_catalog_drop(int index) {
+    if (index < 0 || index >= v4_ckpt_cat_n) return;
+    V4CkptEntry *e = &v4_ckpt_cat[index];
+    v4_ckpt_cat_bytes -= e->bytes;
+    v4_ckpt_ids_bytes -= (uint64_t)e->len * sizeof(int);
+    free(e->ids);
+    *e = v4_ckpt_cat[--v4_ckpt_cat_n];   /* swap-remove; order is LRU-clock */
+}
+
+/* LRU-evict entries (files included) until the caps hold. Prompt-ends go
+ * first; system prefixes are pinned up to v4_ckpt_pin_cap() rows, beyond
+ * that the LRU prefix is evictable — otherwise a fleet could pin the whole
+ * byte budget and starve the prompt-ends. The ids-RAM cap (budget/8) uses
+ * the same loop: 4096 entries x 100k-token ids is 1.6 GB of catalog. */
+static void v4_ckpt_gc(void) {
+    int evicted = 0;
+    for (;;) {
+        uint64_t budget = v4_ckpt_disk_budget();
+        uint64_t ids_cap = budget ? budget / 8 : 0;
+        int prompt_ends = 0, prefixes = 0;
+        for (int i = 0; i < v4_ckpt_cat_n; i++)
+            v4_ckpt_cat[i].kind == 1 ? prompt_ends++ : prefixes++;
+        int over = prompt_ends > v4_ckpt_prompt_end_cap() ||
+                   (budget && v4_ckpt_cat_bytes > budget) ||
+                   (ids_cap && v4_ckpt_ids_bytes > ids_cap);
+        if (!over) break;
+        int victim = -1;
+        for (int i = 0; i < v4_ckpt_cat_n; i++)
+            if (v4_ckpt_cat[i].kind == 1 &&
+                (victim < 0 ||
+                 v4_ckpt_cat[i].used < v4_ckpt_cat[victim].used))
+                victim = i;
+        if (victim < 0 && prefixes > v4_ckpt_pin_cap())
+            for (int i = 0; i < v4_ckpt_cat_n; i++)
+                if (v4_ckpt_cat[i].kind == 0 &&
+                    (victim < 0 ||
+                     v4_ckpt_cat[i].used < v4_ckpt_cat[victim].used))
+                    victim = i;
+        if (victim < 0) break;   /* only pinned entries left */
+        if (v4_ckpt_cat[victim].file[0] && v4_ckpt_dir[0] &&
+            v4_ckpt_dir[0] != '-') {
+            char path[1200];
+            snprintf(path, sizeof(path), "%s/%s", v4_ckpt_dir,
+                     v4_ckpt_cat[victim].file);
+            remove(path);
+        }
+        v4_ckpt_catalog_drop(victim);
+        evicted++;
+    }
+    if (evicted)
+        fprintf(stderr, "v4_ckpt gc evicted=%d entries=%d bytes=%.2fGiB\n",
+                evicted, v4_ckpt_cat_n, v4_ckpt_cat_bytes / 1073741824.0);
+}
+
+/* CRC-32C (Castagnoli) over the payload: a torn file truncated exactly at a
+ * layer boundary (snapshots carry no per-layer length) or a stale tail is
+ * otherwise indistinguishable from a good one. */
+static uint32_t v4_ckpt_crc32c(uint32_t crc, const void *data, size_t bytes) {
+    static uint32_t table[256];
+    static int ready;
+    if (!ready) {
+        for (int i = 0; i < 256; i++) {
+            uint32_t c = (uint32_t)i;
+            for (int k = 0; k < 8; k++)
+                c = (c & 1u) ? 0x82f63b78u ^ (c >> 1) : c >> 1;
+            table[i] = c;
+        }
+        ready = 1;
+    }
+    const uint8_t *p = (const uint8_t *)data;
+    crc = ~crc;
+    while (bytes--)
+        crc = table[(crc ^ *p++) & 0xffu] ^ (crc >> 8);
+    return ~crc;
+}
+
+/* Config geometry + KV-relevant config + MODEL IDENTITY (shard count and
+ * per-shard size/mtime). A config-only fingerprint would happily restore
+ * KV built from a different weights revision with identical geometry — the
+ * silent-misread failure class kv_persist.h guards against with its
+ * per-format magics. The v1 fingerprint (the seven config ints alone) is
+ * kept for the opt-in legacy import: it names the files v1 wrote. */
 static void v4_ckpt_disk_init(ColiV4Session *session) {
     if (v4_ckpt_dir[0] || !session || !session->engine) return;
     const char *model = coli_v4_engine_target_model_dir(session->engine);
@@ -15941,99 +17459,247 @@ static void v4_ckpt_disk_init(ColiV4Session *session) {
     uint32_t h = 2166136261u;
     int fields[] = {c->num_hidden_layers, c->hidden_size, c->head_dim,
                     c->index_head_dim, c->index_topk, c->index_n_heads,
-                    c->hc_mult};
+                    c->hc_mult, c->sliding_window};
     for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
         h ^= (uint32_t)fields[i]; h *= 16777619u;
     }
-    v4_ckpt_fingerprint = h;
-}
-
-static void v4_ckpt_disk_path(char *out, size_t size, int index) {
-    snprintf(out, size, "%s/ckpt_%08x_%d.bin", v4_ckpt_dir, v4_ckpt_fingerprint, index);
-}
-
-/* Write slot i to disk (its file index = slot index; overwrite in place via
- * temp + rename so a crash never leaves a torn file). */
-static void v4_ckpt_disk_write(int i) {
-    if (v4_ckpt_dir[0] == '-' || !v4_ckpt_dir[0]) return;
-    V4PrefixCkpt *slot = &v4_ckpt_slots[i];
-    if (!slot->ids) return;
-    char path[1200], tmp[1240];
-    v4_ckpt_disk_path(path, sizeof(path), i);
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-    FILE *f = coli_own_fopen(tmp, "wb");
-    if (!f) {
-        v4_ckpt_mkdir(v4_ckpt_dir);
-        f = coli_own_fopen(tmp, "wb");
-        if (!f) return;
-    }
-    static const char magic[9] = "COLIV4CK";
-    int32_t head[4] = {1, slot->kind, slot->len, slot->layers};
-    int ok = fwrite(magic, 8, 1, f) == 1 &&
-             fwrite(&v4_ckpt_fingerprint, sizeof(v4_ckpt_fingerprint), 1, f) == 1 &&
-             fwrite(head, sizeof(head), 1, f) == 1 &&
-             fwrite(slot->ids, sizeof(int), (size_t)slot->len, f) == (size_t)slot->len;
-    for (int layer = 0; ok && layer < slot->layers; layer++)
-        ok = coli_v4_attention_snapshot_write(slot->snapshots[layer], f) == 0;
-    ok = ok && fclose(f) == 0;
-    if (!ok) { fclose(f); remove(tmp); return; }
-    remove(path);
-    if (rename(tmp, path)) { remove(tmp); return; }
-    fprintf(stderr, "v4_ckpt disk write %s=%d\n", slot->kind ? "prompt_end" : "prefix", slot->len);
-}
-
-/* Load every readable file into empty slots (once per process). */
-static void v4_ckpt_disk_load(void) {
-    if (v4_ckpt_disk_loaded || v4_ckpt_dir[0] == '-' || !v4_ckpt_dir[0]) return;
-    v4_ckpt_disk_loaded = 1;
-    for (int i = 0; i < v4_ckpt_slot_count(); i++) {
-        if (v4_ckpt_slots[i].ids) continue;
-        char path[1200];
-        v4_ckpt_disk_path(path, sizeof(path), i);
-        FILE *f = coli_own_fopen(path, "rb");
-        if (!f) continue;
-        char magic[8]; uint32_t fp = 0; int32_t head[4];
-        V4PrefixCkpt *slot = &v4_ckpt_slots[i];
-        int ok = fread(magic, 8, 1, f) == 1 && !memcmp(magic, "COLIV4CK", 8) &&
-                 fread(&fp, sizeof(fp), 1, f) == 1 && fp == v4_ckpt_fingerprint &&
-                 fread(head, sizeof(head), 1, f) == 1 && head[0] == 1 &&
-                 head[2] > 0 && head[2] < (1 << 22) && head[3] > 0 && head[3] <= 256;
-        if (ok) {
-            slot->kind = head[1]; slot->len = head[2]; slot->layers = head[3];
-            slot->ids = malloc((size_t)slot->len * sizeof(int));
-            slot->snapshots = calloc((size_t)slot->layers, sizeof(*slot->snapshots));
-            ok = slot->ids && slot->snapshots &&
-                 fread(slot->ids, sizeof(int), (size_t)slot->len, f) == (size_t)slot->len;
-            for (int layer = 0; ok && layer < slot->layers; layer++)
-                ok = coli_v4_attention_snapshot_read(f, &slot->snapshots[layer]) == 0;
+    ColiSafetensorsIndex *index = coli_v4_engine_target_index(session->engine);
+    if (index) {
+        size_t shards = coli_st_shard_count(index);
+        h ^= (uint32_t)shards; h *= 16777619u;
+        for (size_t i = 0; i < shards; i++) {
+            struct stat st;
+            if (stat(coli_st_shard_path(index, (int)i), &st)) continue;
+            h ^= (uint32_t)st.st_size; h *= 16777619u;
+            h ^= (uint32_t)((uint64_t)st.st_size >> 32); h *= 16777619u;
+            h ^= (uint32_t)st.st_mtime; h *= 16777619u;
         }
-        fclose(f);
-        if (!ok) { v4_ckpt_slot_free(slot); remove(path); continue; }
-        slot->used = ++v4_ckpt_clock;
-        fprintf(stderr, "v4_ckpt disk load %s=%d\n", slot->kind ? "prompt_end" : "prefix", slot->len);
     }
+    v4_ckpt_fingerprint = h;
+    uint32_t v1 = 2166136261u;
+    int v1_fields[] = {c->num_hidden_layers, c->hidden_size, c->head_dim,
+                       c->index_head_dim, c->index_topk, c->index_n_heads,
+                       c->hc_mult};
+    for (size_t i = 0; i < sizeof(v1_fields) / sizeof(v1_fields[0]); i++) {
+        v1 ^= (uint32_t)v1_fields[i]; v1 *= 16777619u;
+    }
+    v4_ckpt_fingerprint_v1 = v1;
 }
 
+/* COLIV4C3 header, 36 bytes before the ids:
+ *   char magic[8]="COLIV4C3"; uint32 fp;
+ *   int32 h[6]={3,kind,len,layers,payload_bytes,crc};
+ *   int32 ids[len]; <layers x snapshot payload>
+ * Not COLIV4C2: that fork format's header is 4 words followed by ids and its
+ * fingerprint input set differs, so its files can never match ours — a
+ * distinct magic turns "silently misparsed" into "cleanly skipped". */
+enum { V4_CKPT_HEAD_BYTES = 8 + 4 + 6 * 4 };
+
+/* Opt-in conversion of a v1 slot-mirror file (ckpt_<fp>_<n>.bin): validate
+ * its header against the v1 fingerprint, then write the content-addressed
+ * v3 twin with the payload copied byte-for-byte. The v1 file is removed
+ * only after the rename; nothing else in the scan ever removes a ckpt_*. */
+static void v4_ckpt_import_legacy(const char *dir, const char *name,
+                                  uint64_t bytes) {
+    char path[1200], out[1200], tmp[1280];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    FILE *f = coli_own_fopen(path, "rb");
+    if (!f) return;
+    char magic[8]; uint32_t fp = 0; int32_t head[4];
+    int ok = fread(magic, 8, 1, f) == 1 && !memcmp(magic, "COLIV4CK", 8) &&
+             fread(&fp, sizeof(fp), 1, f) == 1 &&
+             fp == v4_ckpt_fingerprint_v1 &&
+             fread(head, sizeof(head), 1, f) == 1 && head[0] == 1 &&
+             (head[1] == 0 || head[1] == 1) &&
+             head[2] > 0 && head[2] < (1 << 22) &&
+             head[3] > 0 && head[3] <= 256;
+    int *ids = ok ? malloc((size_t)head[2] * sizeof(int)) : NULL;
+    ok = ids &&
+         fread(ids, sizeof(int), (size_t)head[2], f) == (size_t)head[2];
+    uint64_t payload = bytes - 8 - 4 - 16 - (uint64_t)head[2] * sizeof(int);
+    ok = ok && bytes > 8 + 4 + 16 + (uint64_t)head[2] * sizeof(int);
+    uint64_t payload_total = payload;   /* the copy loop consumes `payload` */
+    char file[64] = "";
+    FILE *w = NULL;
+    if (ok) {
+        v4_ckpt_entry_file(file, sizeof(file), ids, head[2]);
+        snprintf(out, sizeof(out), "%s/%s", dir, file);
+        /* Idempotent: a v3 twin already there means this file was imported
+         * by an earlier run — the conversion is done, drop the mirror. */
+        struct stat st;
+        if (stat(out, &st) == 0) {
+            fclose(f); free(ids); remove(path);
+            fprintf(stderr, "v4_ckpt legacy import done %s\n", name);
+            return;
+        }
+        snprintf(tmp, sizeof(tmp), "%s.%d.tmp", out, v4_ckpt_pid());
+        w = coli_own_fopen(tmp, "wb");
+        if (!w) { v4_ckpt_mkdir(dir); w = coli_own_fopen(tmp, "wb"); }
+    }
+    if (w) {
+        static const char magic3[9] = "COLIV4C3";
+        int32_t head3[6] = {3, head[1], head[2], head[3], 0, 0};
+        ok = fwrite(magic3, 8, 1, w) == 1 &&
+             fwrite(&v4_ckpt_fingerprint, 4, 1, w) == 1 &&
+             fwrite(head3, sizeof(head3), 1, w) == 1 &&
+             fwrite(ids, sizeof(int), (size_t)head[2], w) == (size_t)head[2];
+        uint32_t crc = 0;
+        uint8_t buf[65536];
+        while (ok && payload) {
+            size_t chunk = payload > sizeof(buf) ? sizeof(buf) : (size_t)payload;
+            if (fread(buf, 1, chunk, f) != chunk ||
+                fwrite(buf, 1, chunk, w) != chunk) { ok = 0; break; }
+            crc = v4_ckpt_crc32c(crc, buf, chunk);
+            payload -= chunk;
+        }
+        if (ok) {
+            int32_t patched[2] = {(int32_t)(bytes - 8 - 4 - 16 -
+                                            (uint64_t)head[2] * sizeof(int)),
+                                  (int32_t)crc};
+            ok = fseek(w, 8 + 4 + 4 * 4, SEEK_SET) == 0 &&
+                 fwrite(patched, 4, 2, w) == 2;
+        }
+        if (ok) ok = fclose(w) == 0;
+        else { fclose(w); remove(tmp); }
+    } else ok = 0;
+    fclose(f);
+    if (ok && rename(tmp, out)) { remove(tmp); ok = 0; }
+    if (ok) {
+        remove(path);
+        v4_ckpt_catalog_add(ids, head[2], head[1],
+                            (uint64_t)V4_CKPT_HEAD_BYTES +
+                                (uint64_t)head[2] * sizeof(int) + payload_total,
+                            file);
+        v4_ckpt_gc();
+        fprintf(stderr, "v4_ckpt legacy import %s -> %s\n", name, file);
+    }
+    free(ids);
+}
+
+/* Count of files left in place on purpose (legacy ckpt_*, foreign magic,
+ * fingerprint mismatch): logged once per scan, never matched, never
+ * removed — a downloaded model directory is not ours to clean. */
+static int v4_ckpt_scan_left;
+
+/* One directory entry: add catalog rows for our kv_* files, count or
+ * import legacy ones. Shared by the POSIX and Windows scan arms so the two
+ * differ only in enumeration. */
+static void v4_ckpt_scan_one(const char *name, uint64_t bytes) {
+    if (!strncmp(name, "ckpt_", 5)) {
+        if (v4_ckpt_legacy_import_wanted())
+            v4_ckpt_import_legacy(v4_ckpt_dir, name, bytes);
+        else
+            v4_ckpt_scan_left++;
+        return;
+    }
+    if (strncmp(name, "kv_", 3) != 0 || strlen(name) >= 64) return;
+    char path[1200];
+    snprintf(path, sizeof(path), "%s/%s", v4_ckpt_dir, name);
+    FILE *f = coli_own_fopen(path, "rb");
+    if (!f) return;
+    char magic[8]; uint32_t fp = 0; int32_t head[6];
+    int ok = fread(magic, 8, 1, f) == 1;
+    if (!ok || memcmp(magic, "COLIV4C3", 8)) {
+        /* Foreign format (fork COLIV4C2 and anything else): never matched. */
+        fclose(f); v4_ckpt_scan_left++; return;
+    }
+    ok = fread(&fp, sizeof(fp), 1, f) == 1;
+    if (!ok || fp != v4_ckpt_fingerprint) {
+        /* Another build's files on a shared model dir: left alone. */
+        fclose(f); v4_ckpt_scan_left++; return;
+    }
+    ok = fread(head, sizeof(head), 1, f) == 1 && head[0] == 3 &&
+         (head[1] == 0 || head[1] == 1) &&
+         head[2] > 0 && head[2] < (1 << 22) &&
+         head[3] > 0 && head[3] <= 256 && head[4] > 0;
+    int *ids = ok ? malloc((size_t)head[2] * sizeof(int)) : NULL;
+    ok = ids &&
+         fread(ids, sizeof(int), (size_t)head[2], f) == (size_t)head[2] &&
+         bytes == (uint64_t)V4_CKPT_HEAD_BYTES +
+                     (uint64_t)head[2] * sizeof(int) + (uint64_t)(uint32_t)head[4];
+    fclose(f);
+    if (!ok || v4_ckpt_catalog_add(ids, head[2], head[1], bytes, name) < 0) {
+        /* Our magic, our fingerprint, but torn: a regenerable cache. */
+        remove(path);
+    } else {
+        fprintf(stderr, "v4_ckpt disk load %s=%d\n",
+                head[1] ? "prompt_end" : "prefix", head[2]);
+    }
+    free(ids);
+}
+
+/* Populate the catalog from the directory (once per process): header + ids
+ * only — payloads are never read at scan time. */
+static void v4_ckpt_disk_scan(void) {
+    if (v4_ckpt_disk_scanned) return;
+    v4_ckpt_disk_scanned = 1;
+    if (v4_ckpt_dir[0] == '-' || !v4_ckpt_dir[0]) return;
+    v4_ckpt_scan_left = 0;
+#ifdef _WIN32
+    char pattern[1100];
+    snprintf(pattern, sizeof(pattern), "%s\\*", v4_ckpt_dir);
+    WIN32_FIND_DATAA found;
+    HANDLE find = FindFirstFileA(pattern, &found);
+    if (find == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!strcmp(found.cFileName, ".") || !strcmp(found.cFileName, ".."))
+            continue;
+        uint64_t bytes = ((uint64_t)found.nFileSizeHigh << 32) |
+                         (uint64_t)found.nFileSizeLow;
+        v4_ckpt_scan_one(found.cFileName, bytes);
+    } while (FindNextFileA(find, &found));
+    FindClose(find);
+#else
+    DIR *dir = opendir(v4_ckpt_dir);
+    if (!dir) return;
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
+            continue;
+        char path[1200];
+        snprintf(path, sizeof(path), "%s/%s", v4_ckpt_dir, entry->d_name);
+        struct stat st;
+        uint64_t bytes =
+            stat(path, &st) == 0 ? (uint64_t)st.st_size : 0;
+        v4_ckpt_scan_one(entry->d_name, bytes);
+    }
+    closedir(dir);
+#endif
+    if (v4_ckpt_scan_left)
+        fprintf(stderr, "v4_ckpt disk legacy=%d unrecognised (left in place)\n",
+                v4_ckpt_scan_left);
+}
+
+/* Dispatched on the backend: the catalog when disk is on, the v1 slot pool
+ * when V4_PREFIX_CKPT_DISK=0. */
 static int v4_ckpt_have(const int *ids, int len) {
+    if (v4_ckpt_disk_wanted()) {
+        for (int i = 0; i < v4_ckpt_cat_n; i++)
+            if (v4_ckpt_cat[i].len == len &&
+                !memcmp(v4_ckpt_cat[i].ids, ids, (size_t)len * sizeof(int)))
+                return 1;
+        return 0;
+    }
     for (int i = 0; i < v4_ckpt_slot_count(); i++)
         if (v4_ckpt_slots[i].ids && v4_ckpt_slots[i].len == len &&
             !memcmp(v4_ckpt_slots[i].ids, ids, (size_t)len * sizeof(int)))
             return 1;
     return 0;
 }
-static int *v4_ckpt_prev_ids;
-static int v4_ckpt_prev_len;
 
-static int v4_ckpt_min_tokens(void) {
-    static int minimum = -1;
-    if (minimum < 0) {
-        const char *setting = getenv("V4_PREFIX_CKPT");
-        if (setting && atoi(setting) == 0) { minimum = 0; return 0; }
-        setting = getenv("V4_PREFIX_CKPT_MIN");
-        minimum = setting ? atoi(setting) : 512;
-        if (minimum < 64) minimum = 64;
+/* Pure predicate: the longest stored boundary that is an exact prefix of
+ * ids[0..count), strictly shorter than count (restore refuses to rewind; a
+ * fork AT a boundary extends it, one inside an entry cannot truncate it). */
+static int v4_ckpt_best_match(const int *ids, int count) {
+    if (!ids || count < 1 || !v4_ckpt_min_tokens()) return 0;
+    int best_len = 0;
+    for (int i = 0; i < v4_ckpt_cat_n; i++) {
+        V4CkptEntry *e = &v4_ckpt_cat[i];
+        if (e->len <= best_len || e->len >= count) continue;
+        if (memcmp(e->ids, ids, (size_t)e->len * sizeof(int))) continue;
+        best_len = e->len;
     }
-    return minimum;
+    return best_len;
 }
 
 static void v4_ckpt_slot_free(V4PrefixCkpt *slot) {
@@ -16046,10 +17712,9 @@ static void v4_ckpt_slot_free(V4PrefixCkpt *slot) {
     memset(slot, 0, sizeof(*slot));
 }
 
-/* Longest stored prefix of these ids restored into the session; 0 = none. */
-static int v4_ckpt_restore(ColiV4Session *session, int prompt_count) {
-    if (!v4_ckpt_min_tokens()) return 0;
-    if (v4_ckpt_disk_wanted()) { v4_ckpt_disk_init(session); v4_ckpt_disk_load(); }
+/* ---- Memory backend: the v1 bodies, verbatim ---- */
+
+static int v4_ckpt_mem_restore(ColiV4Session *session, int prompt_count) {
     int layers = session->config.num_hidden_layers;
     int best = -1, best_len = 0;
     for (int i = 0; i < v4_ckpt_slot_count(); i++) {
@@ -16097,35 +17762,7 @@ static int v4_ckpt_restore(ColiV4Session *session, int prompt_count) {
     return best_len;
 }
 
-/* Absolute position to snapshot at during this fresh prefill, or 0. */
-static int v4_ckpt_plan(const int *ids, int count) {
-    int minimum = v4_ckpt_min_tokens();
-    int plan = 0;
-    if (minimum && v4_ckpt_prev_ids) {
-        int limit = v4_ckpt_prev_len < count ? v4_ckpt_prev_len : count;
-        if (limit >= count) limit = count - 1;   /* never checkpoint the whole prompt */
-        int lcp = 0;
-        while (lcp < limit && v4_ckpt_prev_ids[lcp] == ids[lcp]) lcp++;
-        if (lcp > count - 8) lcp = 0;   /* a tiny tail would prefill at
-                                          * per-token speed; resume covers
-                                          * identical-prompt retries anyway */
-        if (lcp >= minimum) {
-            plan = lcp;
-            if (v4_ckpt_have(ids, plan)) plan = 0;   /* already captured */
-        }
-    }
-    free(v4_ckpt_prev_ids);
-    v4_ckpt_prev_ids = malloc((size_t)count * sizeof(int));
-    if (v4_ckpt_prev_ids) {
-        memcpy(v4_ckpt_prev_ids, ids, (size_t)count * sizeof(int));
-        v4_ckpt_prev_len = count;
-    } else {
-        v4_ckpt_prev_len = 0;
-    }
-    return plan;
-}
-
-static void v4_ckpt_store(ColiV4Session *session, int len, int kind) {
+static void v4_ckpt_mem_store(ColiV4Session *session, int len, int kind) {
     int layers = session->config.num_hidden_layers;
     int slots = v4_ckpt_slot_count();
     /* Victim: an empty slot, else the LRU prompt-end slot, else the LRU
@@ -16157,19 +17794,6 @@ static void v4_ckpt_store(ColiV4Session *session, int len, int kind) {
     slot->kind = kind;
     fprintf(stderr, "v4_ckpt store %s=%d\n",
             kind ? "prompt_end" : "prefix", len);
-    int disk = v4_ckpt_disk_wanted();
-    if (disk && (kind == 0 || disk >= 2)) {
-        v4_ckpt_disk_init(session);
-        v4_ckpt_disk_write(victim);
-    } else if (disk) {
-        /* This slot's file (if any) now describes a different capture. */
-        char path[1200];
-        v4_ckpt_disk_init(session);
-        if (v4_ckpt_dir[0] && v4_ckpt_dir[0] != '-') {
-            v4_ckpt_disk_path(path, sizeof(path), victim);
-            remove(path);
-        }
-    }
 }
 
 /* A short request between two turns of the session's conversation (park.h's conditions):
@@ -16214,6 +17838,319 @@ static void v4_unpark(ColiV4Session *session) {
     memset(&g_v4_park, 0, sizeof g_v4_park);
 }
 
+/* ---- Disk backend: streaming write/restore, one layer at a time ---- */
+
+/* Lazy payload check, once per entry before its first restore: header vs
+ * the catalog row, then a CRC over the payload (skipped above 256 MiB —
+ * verified=2 — where a full read pass would cost more than the restore it
+ * guards). Failure drops the row; the file is removed only when it is still
+ * ours (our magic and fingerprint) — a file another build owns is left in
+ * place and merely never matched. */
+static int v4_ckpt_verify(const char *path, V4CkptEntry *entry) {
+    if (entry->verified) return 0;
+    int ok = 0, ours = 0;
+    FILE *f = coli_own_fopen(path, "rb");
+    char magic[8]; uint32_t fp = 0; int32_t head[6];
+    if (f) {
+        ours = fread(magic, 8, 1, f) == 1 && !memcmp(magic, "COLIV4C3", 8) &&
+               fread(&fp, sizeof(fp), 1, f) == 1 &&
+               fp == v4_ckpt_fingerprint;
+        if (ours) {
+            ok = fread(head, sizeof(head), 1, f) == 1 && head[0] == 3 &&
+                 head[1] == entry->kind && head[2] == entry->len &&
+                 head[3] > 0 && head[4] > 0 &&
+                 (uint64_t)V4_CKPT_HEAD_BYTES +
+                         (uint64_t)entry->len * sizeof(int) +
+                         (uint64_t)(uint32_t)head[4] == entry->bytes;
+            if (ok && entry->bytes > (256ull << 20)) {
+                entry->verified = 2;
+            } else if (ok &&
+                       fseek(f, (long)(V4_CKPT_HEAD_BYTES +
+                                       (size_t)entry->len * sizeof(int)),
+                             SEEK_SET) == 0) {
+                uint32_t crc = 0;
+                uint8_t buf[65536];
+                uint64_t left = (uint64_t)(uint32_t)head[4];
+                while (left) {
+                    size_t chunk =
+                        left > sizeof(buf) ? sizeof(buf) : (size_t)left;
+                    if (fread(buf, 1, chunk, f) != chunk) { ok = 0; break; }
+                    crc = v4_ckpt_crc32c(crc, buf, chunk);
+                    left -= chunk;
+                }
+                if (ok && (uint32_t)head[5] != crc) ok = 0;
+                if (ok) entry->verified = 1;
+            } else if (ok) {
+                ok = 0;   /* seek into the payload failed */
+            }
+        }
+    }
+    if (f) fclose(f);
+    if (ok) return 0;
+    if (ours) remove(path);
+    v4_ckpt_catalog_drop((int)(entry - v4_ckpt_cat));
+    return -1;
+}
+
+/* Stream the capture to disk one layer at a time: peak RAM is a single
+ * layer's snapshot, not the per-layer set. The temp name carries the pid so
+ * two processes on one model dir cannot clobber an in-flight write; temp +
+ * rename so a crash never leaves a torn file under the content-addressed
+ * name. payload_bytes and crc are patched into the header by seeking back
+ * in the tmp file after the streaming write (the CRC reads back what the
+ * page cache still holds — no second data pass over the layers themselves;
+ * the stream is w+b for exactly that read-back). Returns the file size, 0 on
+ * failure. */
+static uint64_t v4_ckpt_disk_write(ColiV4Session *session, int len,
+                                   int kind, const char *file) {
+    char path[1200], tmp[1280];
+    snprintf(path, sizeof(path), "%s/%s", v4_ckpt_dir, file);
+    snprintf(tmp, sizeof(tmp), "%s.%d.tmp", path, v4_ckpt_pid());
+    FILE *f = coli_own_fopen(tmp, "w+b");
+    if (!f) {
+        v4_ckpt_mkdir(v4_ckpt_dir);
+        f = coli_own_fopen(tmp, "w+b");
+        if (!f) return 0;
+    }
+    static const char magic[9] = "COLIV4C3";
+    int layers = session->config.num_hidden_layers;
+    int32_t head[6] = {3, kind, len, layers, 0, 0};
+    long payload_start = -1, payload_end = -1;
+    int ok = fwrite(magic, 8, 1, f) == 1 &&
+             fwrite(&v4_ckpt_fingerprint, sizeof(v4_ckpt_fingerprint), 1, f) == 1 &&
+             fwrite(head, sizeof(head), 1, f) == 1 &&
+             fwrite(session->prompt_ids, sizeof(int), (size_t)len, f) ==
+                 (size_t)len &&
+             (payload_start = ftell(f)) >= 0;
+    for (int layer = 0; ok && layer < layers; layer++) {
+        ColiV4AttentionSnapshot *snap = NULL;
+        ok = coli_v4_attention_snapshot_create(session->attention[layer],
+                                               &snap) == 0 &&
+             coli_v4_attention_snapshot_write(snap, f) == 0;
+        coli_v4_attention_snapshot_destroy(snap);
+    }
+    if (ok) ok = (payload_end = ftell(f)) >= 0;
+    if (ok) {
+        uint64_t payload = (uint64_t)(payload_end - payload_start);
+        uint32_t crc = 0;
+        if (fseek(f, payload_start, SEEK_SET) == 0) {
+            uint8_t buf[65536];
+            uint64_t left = payload;
+            while (ok && left) {
+                size_t chunk = left > sizeof(buf) ? sizeof(buf) : (size_t)left;
+                ok = fread(buf, 1, chunk, f) == chunk;
+                if (ok) crc = v4_ckpt_crc32c(crc, buf, chunk);
+                left -= chunk;
+            }
+        } else ok = 0;
+        if (ok) {
+            int32_t patched[2] = {(int32_t)payload, (int32_t)crc};
+            ok = fseek(f, 8 + 4 + 4 * 4, SEEK_SET) == 0 &&
+                 fwrite(patched, 4, 2, f) == 2;
+        }
+    }
+    if (ok) ok = fclose(f) == 0;
+    else { fclose(f); remove(tmp); return 0; }
+    remove(path);
+    if (rename(tmp, path)) { remove(tmp); return 0; }
+    struct stat st;
+    return stat(path, &st) == 0 ? (uint64_t)st.st_size
+                                : (uint64_t)len * sizeof(int) + 36;
+}
+
+static void v4_ckpt_disk_store(ColiV4Session *session, int len, int kind) {
+    if (!v4_ckpt_min_tokens() || len < v4_ckpt_min_tokens()) return;
+    int disk = v4_ckpt_disk_wanted();
+    /* Disk is the system of record: without persistence a capture dies with
+     * the process and is worth nothing, so unpersisted kinds are skipped
+     * outright (disk=1 keeps the prefix-only mode of the v1 default). */
+    if (!disk || (kind != 0 && disk < 2)) return;
+    v4_ckpt_disk_init(session);
+    v4_ckpt_disk_scan();
+    if (v4_ckpt_dir[0] == '-' || !v4_ckpt_dir[0]) return;
+    if (v4_ckpt_have(session->prompt_ids, len)) return;
+    char file[64];
+    v4_ckpt_entry_file(file, sizeof(file), session->prompt_ids, len);
+    uint64_t bytes = v4_ckpt_disk_write(session, len, kind, file);
+    if (!bytes) return;
+    int row = v4_ckpt_catalog_add(session->prompt_ids, len, kind, bytes, file);
+    if (row < 0) return;
+    v4_ckpt_cat[row].verified = 1;   /* just wrote it */
+    v4_ckpt_gc();
+    fprintf(stderr, "v4_ckpt store %s=%d bytes=%.2fMiB\n",
+            kind ? "prompt_end" : "prefix", len, bytes / 1048576.0);
+}
+
+/* Longest stored boundary of these ids restored into the session; 0 = none
+ * (the caller full-resets — the unchanged contract; a partially streamed
+ * restore is harmless for the same reason). */
+static int v4_ckpt_disk_restore(ColiV4Session *session, int prompt_count) {
+    int layers = session->config.num_hidden_layers;
+    int best_len = v4_ckpt_best_match(session->prompt_ids, prompt_count);
+    int best = -1;
+    if (best_len) {
+        for (int i = 0; i < v4_ckpt_cat_n && best < 0; i++)
+            if (v4_ckpt_cat[i].len == best_len &&
+                !memcmp(v4_ckpt_cat[i].ids, session->prompt_ids,
+                        (size_t)best_len * sizeof(int)))
+                best = i;
+    }
+    if (best < 0) return 0;
+    char path[1200];
+    snprintf(path, sizeof(path), "%s/%s", v4_ckpt_dir, v4_ckpt_cat[best].file);
+    if (v4_ckpt_verify(path, &v4_ckpt_cat[best])) return 0;   /* row gone */
+    FILE *f = coli_own_fopen(path, "rb");
+    if (!f) { v4_ckpt_catalog_drop(best); return 0; }
+    /* Validate the file against the catalog row before touching state. */
+    char magic[8]; uint32_t fp = 0; int32_t head[6];
+    int ours = fread(magic, 8, 1, f) == 1 && !memcmp(magic, "COLIV4C3", 8) &&
+               fread(&fp, sizeof(fp), 1, f) == 1 &&
+               fp == v4_ckpt_fingerprint;
+    int ok = ours &&
+             fread(head, sizeof(head), 1, f) == 1 && head[0] == 3 &&
+             head[1] == v4_ckpt_cat[best].kind &&
+             head[2] == best_len && head[3] == layers &&
+             fseek(f, (long)((size_t)best_len * sizeof(int)), SEEK_CUR) == 0;
+    if (!ok) {
+        fclose(f);
+        v4_ckpt_catalog_drop(best);
+        if (ours) remove(path);
+        return 0;
+    }
+#ifdef COLI_V4_GPU_TIER
+    coli_v4_gpu_kv_cache_invalidate_all();
+#endif
+    /* A fresh process has never attended: the per-layer compressor/indexer
+     * objects do not exist yet, and each layer's weights must be loaded
+     * once to prepare the state. Skip the whole sweep when the session has
+     * already fed positions (fed.len > 0 means every compressed layer was
+     * prepared by that prefill) — under interleaved traffic restore runs at
+     * tool-call cadence and the sweep re-reads every layer's weights for
+     * nothing. */
+    int need_prepare = session->fed.len == 0;
+    if (need_prepare) {
+        ColiV4Engine *engine = session->engine;
+        const ColiSafetensorsIndex *index = coli_v4_engine_target_index(engine);
+        char perr[256];
+        for (int layer = 0; layer < layers; layer++) {
+            ColiDeepSeekV4LayerWeights lw;
+            if (coli_v4_layer_load(engine, &lw, &session->config, index, layer,
+                                   perr, sizeof(perr))) { fclose(f); return 0; }
+            int rc = coli_v4_window_attention_prepare(
+                session->attention[layer], &lw, &session->config, perr, sizeof(perr));
+            coli_v4_layer_free(engine, &lw);
+            if (rc) { fclose(f); return 0; }
+        }
+    }
+    /* Stream layer-by-layer: read one snapshot, restore it, free it. */
+    for (int layer = 0; ok && layer < layers; layer++) {
+        ColiV4AttentionSnapshot *snap = NULL;
+        ok = coli_v4_attention_snapshot_read(f, &snap) == 0 &&
+             coli_v4_attention_snapshot_restore(session->attention[layer],
+                                                snap) == 0;
+        coli_v4_attention_snapshot_destroy(snap);
+    }
+    fclose(f);
+    if (!ok) {
+        /* Torn or incompatible payload: drop the entry so it regenerates. */
+        remove(path);
+        v4_ckpt_catalog_drop(best);
+        fprintf(stderr, "v4_ckpt restore failed len=%d (dropped)\n", best_len);
+        return 0;
+    }
+#ifdef COLI_VULKAN
+    v4c_reset();   /* a snapshot from another history: the chain's copies go */
+#endif
+    kv_prefix_clear(&session->fed);
+    kv_prefix_record(&session->fed, v4_ckpt_cat[best].ids, 0, best_len);
+    v4_ckpt_cat[best].used = ++v4_ckpt_clock;
+    fprintf(stderr, "v4_ckpt hit prefix=%d\n", best_len);
+    return best_len;
+}
+
+/* ---- Backend dispatch ---- */
+
+static int v4_ckpt_restore(ColiV4Session *session, int prompt_count) {
+    if (!v4_ckpt_min_tokens()) return 0;
+    /* The slots first: a pin's capture is there whatever its length (upstream's
+     * contract — a pinned prompt is short by nature and never length-gated),
+     * and the cold tier's catalog below keeps its own gates. */
+    int reuse = v4_ckpt_mem_restore(session, prompt_count);
+    if (reuse) return reuse;
+    if (v4_ckpt_disk_wanted()) {
+        v4_ckpt_disk_init(session);
+        v4_ckpt_disk_scan();
+        return v4_ckpt_disk_restore(session, prompt_count);
+    }
+    return 0;
+}
+
+static void v4_ckpt_store(ColiV4Session *session, int len, int kind) {
+    if (v4_ckpt_disk_wanted()) {
+        v4_ckpt_disk_store(session, len, kind);
+        return;
+    }
+    v4_ckpt_mem_store(session, len, kind);
+}
+
+/* ---- Capture planning (pure probe + recording side effect) ---- */
+
+/* The pure LCP probe (restore/admission predict from it; calling the full
+ * plan early would advance the previous-prompt record and kill the real
+ * capture). Per SESSION: under KV_SLOTS>1 a process-global record would run
+ * the LCP against another slot's prompt — wrong lineage, wrong
+ * "already captured" verdict (D4: both serving models). */
+static int v4_ckpt_plan_probe(const ColiV4Session *session,
+                              const int *ids, int count) {
+    int minimum = v4_ckpt_min_tokens();
+    if (!minimum || !session || !session->ckpt_prev_ids) return 0;
+    int limit = session->ckpt_prev_len < count ? session->ckpt_prev_len : count;
+    if (limit >= count) limit = count - 1;   /* never checkpoint the whole prompt */
+    int lcp = 0;
+    while (lcp < limit && session->ckpt_prev_ids[lcp] == ids[lcp]) lcp++;
+    if (lcp > count - 8) lcp = 0;   /* a tiny tail would prefill at
+                                      * per-token speed; resume covers
+                                      * identical-prompt retries anyway */
+    if (lcp >= minimum && !v4_ckpt_have(ids, lcp)) return lcp;
+    return 0;
+}
+
+static int v4_ckpt_plan(ColiV4Session *session, const int *ids, int count) {
+    int plan = v4_ckpt_plan_probe(session, ids, count);
+    free(session->ckpt_prev_ids);
+    session->ckpt_prev_ids = malloc((size_t)count * sizeof(int));
+    if (session->ckpt_prev_ids) {
+        memcpy(session->ckpt_prev_ids, ids, (size_t)count * sizeof(int));
+        session->ckpt_prev_len = count;
+    } else {
+        session->ckpt_prev_len = 0;
+    }
+    return plan;
+}
+
+/* Pure hint validation, factored out of the generate path so prediction and
+ * capture share one implementation. The gateway's prefix hint is a byte
+ * offset; tokenize that substring and accept it only when its ids are an
+ * exact token prefix of the prompt, long enough, and not already captured.
+ * 0 = no hint capture. */
+static int v4_ckpt_hint_len(ColiV4Session *session, const char *prompt,
+                            size_t prompt_length, size_t prefix_bytes,
+                            int prompt_count, int reuse) {
+    if (!session || !prompt || !prefix_bytes || !v4_ckpt_min_tokens() ||
+        prefix_bytes >= prompt_length || prompt_count < 1)
+        return 0;
+    int cap = prompt_count + 16;
+    int *pids = malloc((size_t)cap * sizeof(*pids));
+    if (!pids) return 0;
+    int pn = tok_encode(&session->tokenizer, prompt, (int)prefix_bytes,
+                        pids, cap);
+    int ok = pn >= v4_ckpt_min_tokens() && pn > reuse &&
+             pn < prompt_count - 8 &&
+             !memcmp(pids, session->prompt_ids, (size_t)pn * sizeof(int)) &&
+             !v4_ckpt_have(session->prompt_ids, pn);
+    free(pids);
+    return ok ? pn : 0;
+}
 static int session_generate_impl(ColiV4Session *session,
                                  const char *prompt, size_t prompt_length,
                                  const ColiV4SessionGenerateOptions *options,
@@ -16311,26 +18248,20 @@ static int session_generate_impl(ColiV4Session *session,
         if (coli_v4_full_dspark_wanted) v4_ds_reset_history();
         /* Plan a capture: the longest common prefix of two successive fresh
          * prompts IS the stable system prefix. Snapshot there mid-prefill. */
-        ckpt_at = v4_ckpt_plan(session->prompt_ids, prompt_count);
+        ckpt_at = v4_ckpt_plan(session, session->prompt_ids, prompt_count);
     }
     /* GATEWAY PREFIX HINT: the client-side renderer knows where the system
      * turn ends, so the first request of the first conversation can already
      * capture the shared prefix instead of waiting for a second fresh prompt
-     * to reveal it. The hint is a byte offset; tokenize that substring and
-     * accept it only when its ids are an exact token prefix of the prompt
-     * (template markers make that the normal case). Never overrides a plan
+     * to reveal it. The factored pure predicate validates the hint (byte
+     * offset -> ids that must be an exact token prefix of the prompt;
+     * template markers make that the normal case). Never overrides a plan
      * that is already set. */
-    if (!ckpt_at && options->prefix_bytes && v4_ckpt_min_tokens() &&
-        options->prefix_bytes < prompt_length) {
-        int cap = prompt_count + 16;
-        int *pids = malloc((size_t)cap * sizeof(*pids));
-        int pn = pids ? tok_encode(&session->tokenizer, prompt,
-                                   options->prefix_bytes, pids, cap) : 0;
-        if (pn >= v4_ckpt_min_tokens() && pn > reuse && pn < prompt_count - 8 &&
-            !memcmp(pids, session->prompt_ids, (size_t)pn * sizeof(int)) &&
-            !v4_ckpt_have(session->prompt_ids, pn))
-            ckpt_at = pn;
-        free(pids);
+    if (!ckpt_at && options->prefix_bytes) {
+        int hint = v4_ckpt_hint_len(session, prompt, prompt_length,
+                                    options->prefix_bytes, prompt_count,
+                                    reuse);
+        if (hint > 0) ckpt_at = hint;
         if (ckpt_at && getenv("V4_PREFIX_LOG"))
             fprintf(stderr, "[PREFIX] hint boundary at %d tokens\n", ckpt_at);
     }
@@ -16408,6 +18339,17 @@ static int session_generate_impl(ColiV4Session *session,
             seg = ckpt_at - done_upto;
         if (options->should_abort &&
             options->should_abort(options->abort_user_data)) {
+            /* Cold-tier demote (interleaved traffic): fed covers
+             * [0, done_upto) and the attention state matches it exactly
+             * here (segments are atomic), so an identical retry arriving
+             * NEXT would resume live — but under agent interleaving another
+             * lineage's request resets this state first. Persist the
+             * boundary so the retry restores from disk instead of restarting
+             * a multi-minute prefill. */
+            if (done_upto >= v4_ckpt_min_tokens() &&
+                v4_ckpt_disk_wanted() >= 2 &&
+                !v4_ckpt_have(session->prompt_ids, done_upto))
+                v4_ckpt_store(session, done_upto, 1);
             /* Keep what completed: fed already describes [0, done_upto), so
              * an identical retry resumes here instead of restarting. Worst
              * cancel latency is one atomic segment. */
@@ -16512,8 +18454,10 @@ static int session_generate_impl(ColiV4Session *session,
         } else {
             session->pin_len = 0;        /* an optimisation, never an error */
         }
-        if (v4_ckpt_min_tokens() && !v4_ckpt_have(session->prompt_ids, prompt_count))
-            v4_ckpt_store(session, prompt_count, 1);
+        if (v4_ckpt_min_tokens() && !v4_ckpt_have(session->prompt_ids, prompt_count)) {
+            v4_ckpt_store(session, prompt_count, 1);      /* the cold tier, its own gates */
+            v4_ckpt_mem_store(session, prompt_count, 1);  /* a pin's slot: any length, upstream's contract */
+        }
     }
     /* The prompt is in the attention state from here on; record it before the
      * decode loop so a failure mid-generation still leaves fed describing what
@@ -18344,12 +20288,14 @@ int main(int argc, char **argv) {
     experts->ops->stats(experts, &stats_end);
     fprintf(stderr, "v4_tokens prompt=%d generated=%d total=%d "
            "expert_requests=%llu hits=%llu misses=%llu hit_rate=%.3f "
+           "hit_rate_d=%.3f "
            "bytes=%llu target_only=%d\n",
            gen_stats.prompt_tokens, gen_stats.generated_tokens,
            gen_stats.prompt_tokens + gen_stats.generated_tokens,
            (unsigned long long)stats_end.requests,
            (unsigned long long)stats_end.hits,
            (unsigned long long)stats_end.misses, stats_hit_rate(stats_end),
+           stats_hit_rate_decode(stats_end),
            (unsigned long long)stats_end.bytes_read, target_only);
     /* One line, every engine, one format: `coli tune` sweeps scheduling knobs and
      * needs tokens-and-elapsed to compare candidates. Before this only colibri
@@ -18378,6 +20324,36 @@ int main(int argc, char **argv) {
     if (out_len) fwrite(out_text, 1, out_len, stderr);
     fprintf(stderr, "\ntiming time_to_first_token=%.3fs after_first=%.3fs\n",
            gen_stats.time_to_first_token_sec, gen_stats.decode_sec);
+#ifdef COLI_VULKAN
+    /* COLI_VK_CHAIN_DPROF (G1's slice S0): the decode window's spans, per token -- the
+     * wall from the timing line's after_first, the block the one-row forwards spent in
+     * target_token, the head head_argmax; other = wall - block - head is the sampling /
+     * generate-glue pool, and block - (the chain's decode wait + the host MoE) the forward
+     * glue (the chain's line splits that further, by role). */
+    if (vkc_dprof() && gen_stats.generated_tokens > 0) {
+        double tok = (double)gen_stats.generated_tokens;
+        double wall = gen_stats.decode_sec * 1e3 / tok, block = g_v4_prof_dblock_s * 1e3 / tok,
+               head = g_v4_prof_head_s * 1e3 / tok;
+        fprintf(stderr, "v4_dprof decode: %d tokens (%lld one-row forwards), wall %.1f ms/tok, "
+                        "block %.1f ms/tok, head %.1f ms/tok, other %.1f ms/tok (wall - block - head)\n",
+                gen_stats.generated_tokens, g_v4_prof_dfwd, wall, block, head, wall - block - head);
+    }
+    /* COLI_VK_CHAIN_DPROF (OB0's S0): the prompt window's spans against the timing line's
+     * TTFT wall -- the chunk windows are the chain's share of it, and their split (the
+     * chain's prompt line at close, the tier's prompt dprof) is what every later stage's
+     * bar is expressed against. The primary device's: it owns the prompt. */
+    if (vkc_dprof()) {
+        int was = vkc_device(0);
+        VkcStats pst; vkc_stats(&pst);
+        if (pst.p_fwd)
+            fprintf(stderr, "v4_dprof prompt: %llu chunk windows, %.1f s of the %.1f s to the first token: "
+                            "host-MoE %.1f s, staging-upload %.1f s, dense A1 %.1f s, tail %.1f s\n",
+                    pst.p_fwd, pst.p_wall_ms / 1e3, gen_stats.time_to_first_token_sec,
+                    pst.p_host_ms[VKC_R_MOEH] / 1e3, pst.p_host_ms[VKC_R_STAGE] / 1e3,
+                    pst.p_host_ms[VKC_R_A1] / 1e3, pst.p_host_ms[VKC_R_TAIL] / 1e3);
+        vkc_device(was);
+    }
+#endif
 
     /* Alias session buffers for optional record-oracle path.
      * cleanup must destroy the session and must not free these aliases. */
@@ -18789,6 +20765,7 @@ typedef struct {
     unsigned references;
     uint64_t used;
     unsigned char *slab;
+    void *vk_reg;            /* decode-path=fork: the registry slab behind `slab` (NULL: malloc) */
 } V4ExpertSlot;
 
 typedef struct {
@@ -18988,7 +20965,10 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
             return -1;
         }
         if (!slot->slab) {
-            slot->slab = malloc((size_t)state->record_bytes);
+            /* decode-path=fork: the registry's arena slab when armed (see the base
+             * store's lookup); a refusal keeps this slot's malloc path */
+            if (!vkt_slabreg_slot((size_t)state->record_bytes, (void **)&slot->slab, &slot->vk_reg))
+                slot->slab = malloc((size_t)state->record_bytes);
             if (!slot->slab) {
                 pthread_mutex_unlock(&state->mutex);
                 memset(view, 0, sizeof(*view));
@@ -19209,11 +21189,21 @@ static void destroy(ColiExpertStore *store) {
     V4ExpertStoreState *state = store->state;
     if (state) {
         assert(state->active_leases == 0 && "destroy with active expert leases");
-        for (int i = 0; i < state->layers * state->slots_per_layer; i++)
-            free(state->slots[i].slab);   /* this store allocates slabs with
+        for (int i = 0; i < state->layers * state->slots_per_layer; i++) {
+            /* the tier's alias holds go first even here (vkt_slab_forget): this
+             * store's slots never alias (view_slab serves the hot store only),
+             * but the guard costs one empty walk */
+            vkt_slab_forget(state->slots[i].slab);
+            /* a registry slot (decode-path=fork) returns its buffer handle; the rest
+             * is this store's own malloc, exactly as the comment below says */
+            if (state->slots[i].vk_reg)
+                vkt_slabreg_slot_free(state->slots[i].vk_reg, state->slots[i].slab);
+            else
+                free(state->slots[i].slab);   /* this store allocates slabs with
                                            * malloc only; the aligned path and
                                            * its compat_aligned_free live in the
                                            * hot rows16 store above. */
+        }
         pthread_mutex_destroy(&state->mutex);
         coli_st_index_close(state->index);
         free(state->records);
@@ -19299,6 +21289,9 @@ int coli_deepseek_v4_expert_store_open(
     }
     state->stats.capacity_bytes = (uint64_t)state->layers *
                                   state->slots_per_layer * state->record_bytes;
+    /* decode-path=fork: the engagement line (this store's slab is the bare record) */
+    vkt_forkdec_store_line(state->layers * state->slots_per_layer,
+                           (size_t)state->record_bytes);
     store->ops = &operations;
     store->state = state;
     *output = store;

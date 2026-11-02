@@ -1,0 +1,41 @@
+#version 450
+// The KV_F16 read-side mirror's builder (vk_chain.c, COLI_VK_CHAIN_ATTN_FA=1): one
+// dispatch before chain_dsv4_fa's f16 builds, converting every window-ring row and
+// compressed-pool row of the call to f16 (round to nearest even) into the scratch those
+// kernels read — the fork's COLI_DSV4_VK_KV_F16 storage class (sparse_attn_fa_f16,
+// d11fba5b) on this port's fp32 stores. The fork's writers stored fp16 directly; this
+// port's ring and pool are written by device copies (vkc_copy_regions / the compressor's
+// own output), so the mirror is rebuilt per attention instead: the lists' union is the
+// whole ring and pool at every real shape (a decode row's list is the window plus the
+// top-k selection), and the FA that follows reads only rows this pass wrote, so the
+// scratch needs no life beyond the dispatch and nothing permanent joins the device
+// books. Numerics: fp16's 11-bit significand holds the bf16/e4m3/e2m1-rounded values
+// these rows are exactly, in the normal range -- the dims the chain pre-rounds
+// (v4c_round covers hd - rd and D - rd). The rd rope-tail dims keep raw fp32, so their
+// fp16 round is lossy and rides the FA's thresholded envelope (pre-registered there),
+// never an exactness claim.
+//
+// Bindings: 1 the ring (fp32), 2 the pool (fp32), 5 the mirror (f16). The mirror keeps
+// the entry encoding: row e < nwin is the ring's slot e, row e >= nwin the pool's row
+// e - nwin — chain_dsv4_fa's kv_load indexes it by the entry unchanged.
+// Push constants: chain_dsv4's int v[32], the same slots mode 0 fills (only the ring
+// and pool offsets and nwin are read; v[17] the mirror's rows).
+// Dispatch: rows * hd/4 threads, one vec4 each.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 1) readonly buffer Win { vec4 wv[]; };   // the ring [nwin*hd/4]
+layout(std430, binding = 2) readonly buffer Cp  { vec4 cpv[]; };  // the pool [rows*hd/4]
+layout(std430, binding = 5) buffer Mir { f16vec4 mv[]; };         // [rows*hd/4]
+
+layout(push_constant) uniform P { int v[32]; } pc;
+
+void main() {
+    int hd = pc.v[3], nwin = pc.v[7];
+    int vec = hd >> 2;
+    int t = int(gl_GlobalInvocationID.x);
+    if (t >= pc.v[17] * vec) return;
+    int r = t / vec, u = t - r * vec;
+    vec4 s = r < nwin ? wv[(pc.v[8] >> 2) + r * vec + u] : cpv[(pc.v[9] >> 2) + (r - nwin) * vec + u];
+    mv[t] = f16vec4(s);
+}

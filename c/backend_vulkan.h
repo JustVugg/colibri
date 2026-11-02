@@ -3,10 +3,15 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "vk_policy.h"   /* the default-on levers' env resolution (COLI_VK_LEGACY, coli_vk_env_int) */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* The default-on policy itself lives in vk_policy.h (the inline pair above this
+ * comment's include): the measured levers arm behind their own probes, an explicit
+ * env always wins, COLI_VK_LEGACY=1 is the upstream-base hatch. */
 
 /* Opaque persistent device copy of one resident quantized tensor,
  * mirroring backend_cuda.h. On Strix Halo the "upload" writes into
@@ -120,6 +125,72 @@ size_t coli_vk_import_alignment(void);
 int    coli_vk_host_buffer(const void *ptr, size_t bytes, void **buf, void **mem, size_t *off);
 void   coli_vk_host_buffer_free(void *buf, void *mem, size_t bytes);
 size_t coli_vk_imported_bytes(void);
+/* A slab of host memory imported once for many zero-copy tensors over it (the
+ * compute-site lever's aliased experts, specs/CS-expert-compute-site.md §2.2): the
+ * pages around [slab, slab + bytes) become one imported buffer (as
+ * coli_vk_host_buffer's) and every expert record in it a tensor at its byte
+ * offsets. Re-importing the same pages at the same address and size returns the
+ * same object with another reference (a store slot reused keeps its import);
+ * the last coli_vk_slab_unref frees the pages, after every submission that read
+ * them. Live slab imports are capped at COLI_VK_TIER_EXPERTS_IMPORT_CAP (default
+ * 1408, the driver's memory-allocation-count headroom class); at the cap, or on
+ * any refusal, the import returns 0 and the caller computes on the CPU. */
+typedef struct ColiVkSlab ColiVkSlab;
+int  coli_vk_slab_import(const void *slab, size_t bytes, ColiVkSlab **out);
+void coli_vk_slab_unref(ColiVkSlab *slab);
+void coli_vk_slab_ref(ColiVkSlab *slab);   /* one more keepalive reference (the tier's alias cache) */
+size_t coli_vk_slab_bytes(const ColiVkSlab *slab);   /* the imported bytes the reference pins */
+int  coli_vk_slab_cap(void);               /* the live-import cap (COLI_VK_TIER_EXPERTS_IMPORT_CAP) */
+void coli_vk_slab_forget(const void *slab);   /* the store's slot-free path: blind the dedup to these pages (VA reuse) */
+/* A tensor whose weights AND scales are records of an imported slab, read in
+ * place: woff the first weight row's byte in the slab, soff the scales' (fmt 15:
+ * the packed ue8m0 bytes, their word pad past the end never read -- exactly the
+ * store's record; fmt 7: the f32 scales). fmt 15 is the form
+ * coli_vk_tensor_import refuses (it would copy the scale bytes into the pool as
+ * floats): the alias reads them straight off the slab, the layout the fmt-15
+ * device readers already decode. The offsets must satisfy the device's buffer
+ * bind alignment (page-aligned records do) and both records must sit inside the
+ * slab's bytes; the aliased tensor takes a reference on the slab, so the pages
+ * live until coli_vk_tensor_free. 0 = refused: the caller falls back to the CPU
+ * (or uploads a copy). */
+int  coli_vk_tensor_alias(ColiVkSlab *slab, size_t woff, size_t soff, int fmt, int I, int O, int gs,
+                          ColiVkTensor **tensor);
+/* the same alias with the f16-range verdict (tensor.wide) supplied by the caller:
+ * wide < 0 scans the slab's scale bytes (every build pays O x ceil(I/gs) bytes a
+ * tensor); 0/1 is vouched for the exact bytes at [soff, soff+sbytes) -- the tier's
+ * alias cache records one per entry for the content it served last and skips the
+ * scan only when the SAME content is aliased again (same slab address generation
+ * and the same expert: the store's record bytes are fixed per (layer, expert)).
+ * A stale verdict is silent wrong math -- the bar for passing one is provable
+ * sameness of the bytes, never plausibility. */
+int  coli_vk_tensor_alias_wide(ColiVkSlab *slab, size_t woff, size_t soff, int fmt, int I, int O, int gs,
+                               int wide, ColiVkTensor **tensor);
+
+/* The persistent slab registry (COLI_VK_V4_DECODE_PATH=fork, the forked decode path):
+ * store slots carved out of a small number of large HOST_VISIBLE|HOST_COHERENT
+ * NON-device-local arena blocks (COLI_VK_V4_SLAB_BLOCK_MB, default 2048 MiB, clamped
+ * to the driver's maxMemoryAllocationSize and the heap's room), each slab ONE mapped
+ * STORAGE VkBuffer bound at its offset in its block, HOST_COHERENT-only (no coherent
+ * host-visible type: alloc refuses, the caller keeps its malloc path). The arena's
+ * bytes are capped (COLI_VK_V4_SLAB_ARENA_GB; else the heap's room) -- a driver can
+ * OVERCOMMIT its host heap (allocs succeed, then every submit fails: the gap3 arena
+ * probe, 10x2GiB over a 19.46 GiB heap on RADV), so the registry never asks past the
+ * room it can see. coli_vk_slabreg_alias is the fork's tensor lifetime over it
+ * (fork backend_vulkan.c:1818-1841): the tensor binds its slab's buffer WHOLE with
+ * the record's woff/soff carried on the tensor, pool NULL, slab NULL -- 3 callocs,
+ * 0 driver objects, freed by free(t) (the registry owns every object). The engine
+ * routes its expert-store slot slabs here only under the arm; every refusal is the
+ * ladder: that slot keeps the malloc/import path, never an error. */
+typedef struct ColiVkSlabReg ColiVkSlabReg;
+int  coli_vk_slabreg_alloc(size_t bytes, void **host_out, ColiVkSlabReg **reg_out);
+void coli_vk_slabreg_free(ColiVkSlabReg *reg);
+int  coli_vk_slabreg_alias(const ColiVkSlabReg *reg, const void *user, size_t woff, size_t soff,
+                           int fmt, int I, int O, int gs, int wide, ColiVkTensor **tensor);
+int  coli_vk_slabreg_lookup(const void *user, ColiVkSlabReg **reg_out, size_t *base_off);
+size_t coli_vk_slabreg_bytes(void);       /* the registry's live bytes (books) */
+int  coli_vk_slabreg_wanted(void);         /* the lever's resolution (env once): fork default-on, =0 off, LEGACY off */
+int  coli_vk_slabreg_status(long *block_mb, double *cap_gib);   /* arms (the probe) and reports: 1 armed, -1 refused (its one line), 0 device not up */
+void coli_vk_slabreg_reset(void);          /* shutdown: buffers, mappings, blocks */
 
 /* SECOND DEVICE (COLI_VK_DEV2): a self-contained context on another Vulkan GPU that
  * hosts ONLY tier experts and runs ONLY the async expert-group path. devidx: -1 =
@@ -343,8 +414,31 @@ typedef struct {
     unsigned long long sub_batches, sub_experts, sub_rows, sub_gemm;   /* coli_vk_xb_sub_* */
     double sub_ms;
     unsigned long long cooperative_matmuls; /* all projections, including sub-batches */
+    unsigned long long s1_gemvs;            /* down GEMVs the dedicated S=1 kernel took (COLI_VK_V4_S1GEMV) */
 } ColiVkXbStats;
 void coli_vk_xb_stats(ColiVkXbStats *st);
+/* COLI_VK_V4_S1GEMV's state on a device (0 primary, 1 the second): 1 the fork's
+ * dedicated fmt-15 S=1 GEMV (qmatmul_s1_mx.spv, the fork's qmatmul_s1_fp4.comp)
+ * armed past its bitwise parity leg against the generic qmatmul dispatch, 0 the
+ * generic form (lever off, shader absent or the leg refused). The force hook
+ * overrides the pick for tests in-process (0 off, 1 on where armed, -1 the
+ * lever's own state); the arm itself is fixed at the batch's init. */
+int  coli_vk_xb_s1gemv_armed(int dev);
+void coli_vk_xb_s1gemv_force(int v);
+/* COLI_VK_CHAIN_DPROF (diagnostics only): the compute-site (COLI_VK_TIER_EXPERTS)
+ * group's backend split, accumulated by backend_vulkan.c and read once per report by
+ * vk_tier.c. Every field is zero and no timer is taken unless the env gate is on;
+ * xb_*_ms/fence/qread are per device (0 primary, 1 COLI_VK_DEV2's). */
+typedef struct {
+    unsigned long long slab_creates, slab_hits;      /* unique slab import: new vs reused */
+    double slab_create_ms, slab_hit_ms;              /* the import's wall by outcome: new (pages pinned) vs reused */
+    double xb_fence_ms[2]; unsigned long long xb_fences[2];   /* the xb batch's fence-wait CPU span */
+    double xb_qread_ms[2]; unsigned long long xb_qreads[2];   /* its query-pool-result read span */
+    unsigned long long slab_zeros; double slab_zero_ms;       /* slab unref-to-zero, and its vkFreeMemory span */
+    unsigned long long alias_buf_destroys; double alias_buf_destroy_ms; /* aliased tensors' buffer destroys */
+    unsigned long long xb_foreign_joins;            /* xb_join off the thread the fence/qread deltas assume */
+} ColiVkCsDiag;
+void coli_vk_cs_diag(ColiVkCsDiag *out);
 /* A big step's whole-step buffers on the primary device (the grouped GEMM): the step's
  * S token rows x[S*D] uploaded once; returns its S*K output rows (s*K + k, host-readable)
  * or NULL when the device cannot (the tier then packs and copies as before). Sub-batches
@@ -357,6 +451,15 @@ int   coli_vk_xb_sub_issue_step(int h, ColiVkExpert *const *ex, const int *rows,
                                 const float *wrows);   /* wrows: as coli_vk_xb_sub_issue's (a batch off the grouped route) */
 const float *coli_vk_xb_step_sum(const float *w, const uint8_t *use, double *device_ms);
 void  coli_vk_xb_step_end(void);
+/* The decode group's row sum (COLI_VK_TIER_CS_DEVSUM): arm the NEXT single batch's
+ * submit on the primary device with a tail dispatch (expert_sum_dec.spv) that sums its
+ * n rows on the device -- each bf16 rounded, added in row order, the finish site's host
+ * merge (deepseek_v4.c) -- so its join reads ONE row back, not n. The arm is consumed
+ * by that issue whatever it does; a refused one (no pipeline, no scratch) leaves the
+ * join's row path. coli_vk_xb_join_sum is that join: the rows as coli_vk_xb_join gives
+ * them and, when the tail ran, *sum its merged row (else *sum NULL). */
+int   coli_vk_xb_sum_arm(int n);
+int   coli_vk_xb_join_sum(const float **yrows, const float **sum, double *device_ms);
 /* Sub-batches, for a prefill step too big for one batch (vk_tier.c's streaming): batch k
  * of a step goes to half k % 2 of the scratch, so two run at once and the host fills one
  * while the device computes the other. _reserve sizes each half for a batch of up to
@@ -528,6 +631,17 @@ int  coli_vk_core(ColiVkCore *out);
 /* A resident tensor's buffers (VkBuffer as void *) and layout; 0 for a COLI_VK_DEV2 one. */
 typedef struct { void *wbuf, *sbuf; int fmt, I, O, rowWords, gs; int wide; } ColiVkTensorInfo;   /* wide: off the f16 cooperative-matrix GEMMs */
 int  coli_vk_tensor_info(const ColiVkTensor *t, ColiVkTensorInfo *out);
+/* The strict capability gate (COLI_VK_STRICT=1, docs/vulkan.md). Every point that
+ * would silently leave the GPU off — a shader absent from the deployment, a fence
+ * wait that failed, the device lost mid-run — reports through coli_vk_degrade.
+ * COLI_VK_DEGRADE is a capability the run had and silently loses: under strict it
+ * aborts (exit 70) naming the op. COLI_VK_REFUSE (the device never had it: a
+ * format, a tile) and COLI_VK_FALLBACK (budget, policy) never abort. Unset or 0:
+ * counters only, behaviour byte-identical. */
+typedef enum { COLI_VK_REFUSE = 0, COLI_VK_DEGRADE = 1, COLI_VK_FALLBACK = 2 } ColiVkClass;
+void coli_vk_degrade(ColiVkClass cls, const char *op, const char *reason);
+long coli_vk_degrade_events(void);   /* tests: degradation events so far, refusals excluded */
+int  coli_vk_strict(void);           /* COLI_VK_STRICT=1 */
 /* The chain's fence wait failed: the device is lost, the backend stops. */
 void coli_vk_mark_lost(void);
 /* vkQueueSubmit(queue, 1, submit_info, fence) as the backend submits (a VkResult): the

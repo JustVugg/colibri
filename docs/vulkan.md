@@ -119,6 +119,44 @@ tier warms from the same history a RAM pin would, so the pin's RAM is better
 spent on the adaptive LRU cache. Keep `PIN` set so AUTOPIN does not re-pin from
 history.
 
+### Strict degradation mode (`COLI_VK_STRICT`)
+
+The backend degrades silently by design: any capability it needs and does not
+find — a shader missing from the deployment's `COLI_VK_SHADERS`, a fence wait that
+failed, a device lost mid-run — leaves that piece on the CPU, and a failed tier
+looks exactly like a slow one. `COLI_VK_STRICT=1` (unset or `0` by default, byte-
+identical either way) turns the silent losses into an abort:
+
+```
+[VK] strict: on (COLI_VK_STRICT) — a capability degradation aborts
+[VK] strict: aborting, op=qmatmul_gate_up.spv — absent: fused MLP off
+```
+
+then `exit(70)`, so a deployment or CI run names what it lost instead of quietly
+running without it. Every degradation point funnels through one helper
+(`coli_vk_degrade`) with three classes:
+
+- **degradation** — a capability the run *had* and silently loses: an optional
+  shader absent from the deployment, a fence wait that failed anywhere (the dense
+  matmul, the KV mirror's submits, an expert batch), `coli_vk_mark_lost` — the one
+  funnel every engine's chain uses when its device stops answering. Strict aborts
+  here, one `op=` line, immediately: the degradation has already changed what the
+  run computes.
+- **refusal** — the device never had it: a format with no device form, a
+  `COLI_VK_GEMM_TILE` the device cannot hold. These are legitimate answers, not
+  failures; strict continues, at most one `[VK] refused:` line per op.
+- **fallback** — budget and policy (the tier's memory, staged uploads): counted,
+  never fatal, never a line.
+
+Strict therefore passes on modest hardware: Lavapipe has no cooperative matrices
+and small shared memory, and neither is a degradation — `make vk-strict-check
+VK=1` runs the whole tier and chain suites under strict on it (and skips itself,
+exit 0, where there is no Vulkan device or the build is `VK=0`). What it does
+catch is a deployment that shipped half the shaders, or a driver that started
+losing fences mid-run. `tests/vulkan_strict.sh` is the same cases one by one
+(`bash tests/vulkan_strict.sh`); `tests/test_vk_degrade.c` unit-tests the helper
+itself with no device.
+
 ## The other engines
 
 Every engine links the same backend in a `VK=1` build (`make <engine> VK=1`;
@@ -159,7 +197,7 @@ the shared expert tier ([below](#the-routed-expert-tier-vk_tierc)).
 | kimi_k3 (Kimi K3) | the shared experts' matrices (one row at a time: decode); routed experts on the expert tier | shared experts int8 rows, int4-g64, f32 (`K3_BITS`); experts MXFP4 with ue8m0 scales (fmt 7), SiTU-GLU in the latent space | KDA, MLA, the latent projections, router, head, prefill's shared experts, the experts the tier does not hold |
 | mimo | trunk and vision tower; routed experts on the expert tier | native fp8/bf16, int8, f32 (`MIMO_DENSE_BITS`); experts MXFP4 with e8m0 scales (fmt 7) | router, the experts the tier does not hold |
 | deepseek_v41 | the trunk, vision included; routed experts on the expert tier | fp8 in 32x32 ue8m0 tiles, bf16; experts MXFP4 (fp4, a ue8m0 scale per 32) | the DSpark stages (their experts on the tier on a discrete GPU), the experts the tier does not hold |
-| deepseek_v4 | resident dense layers, head, router, compressors; routed experts on the expert tier | fp8 in 128x128 blocks, bf16; experts MXFP4 (fp4, a ue8m0 scale per 32) with [an activation of its own](#deepseek-v4s-activation) | the indexer's `weights_proj`, DSpark stages, the `--oracle` path's dense layers, the experts the tier does not hold |
+| deepseek_v4 | resident dense layers, head, router, compressors; routed experts on the expert tier — by default a decode's routed experts also compute on the device (the finish-site group) and the sparse attention takes the flash-attention tile ([the performance levers](#performance-levers-default-on-probe-gated)) | fp8 in 128x128 blocks, bf16; experts MXFP4 (fp4, a ue8m0 scale per 32) with [an activation of its own](#deepseek-v4s-activation) | the indexer's `weights_proj`, DSpark stages, the `--oracle` path's dense layers, the experts the tier does not hold |
 | glm53 (GLM-5.3 Flash) | the resident matrices (an f32 checkpoint's experts among them); the streaming container's routed experts on the expert tier | int8 and int4-g64 (`GLM53_BITS`); experts int4-gs64 | f32 matrices (`GLM53_BITS=32`), the streamed experts the tier does not hold, all of them when `swiglu_limit` is 0 |
 | qwenimage | the DiT: every block of a step on the chain (`qwenimage_chain.h`), or its matrices one by one | int8, bf16, f32 (`COLI_IMG_BITS`) | text encoder, VAE |
 | laya (Laya) | the whole forward: encoder and decision head layers ([below](#the-decision-engines)); with `COLI_VK_CHAIN=0` their matrices | f16 (fmt 14, the release's F16 values), f32 | the scorer and the act head on the marker rows, the tokenizer |
@@ -579,7 +617,7 @@ order its CPU-only run does, and keeps a history for the warm start where it has
 | kimi_k3 (Kimi K3) | the checkpoint's MXFP4 with ue8m0 scales `MXFP4_E8M0` 32 (fmt 7): gate `w1`, up `w3`, down `w2`, in the latent space | SiTU-GLU (`VKT_ACT_SITU`) | `COLI_USAGE` (default `<snap>/.coli_usage`) | [Kimi K3 and MiMo](#kimi-k3-and-mimo) |
 | mimo (MiMo-V2.6 Flash and Pro) | the release's MXFP4 `MXFP4_E8M0` 32 (fmt 7); a GGUF's other block types as the file has them (100 + the ggml type), each layer its own | SwiGLU | `COLI_USAGE` (default `<snap>/.coli_usage`) | [Kimi K3 and MiMo](#kimi-k3-and-mimo) |
 | deepseek_v41 (DeepSeek V4.1 Flash) | MXFP4 `MXFP4_E8M0` 32 (fmt 7), as the checkpoint stores it | SwiGLU with `swiglu_limit` | `COLI_USAGE` (default `<snap>/.coli_usage`), kept only while the tier is on | the backbone's layers; the DSpark stages, with caches of their own, are extra layers ([below](#the-mtp-heads-layer-on-the-tier-coli_vk_tier_mtp)) |
-| deepseek_v4 (DeepSeek V4 Flash) | MXFP4 `MXFP4_E8M0` 32 (fmt 7); pinned experts unpacked from rows16 | `VKT_ACT_SWIGLU_V4` | the store's own `<model>/.coli_usage` | [DeepSeek V4's activation](#deepseek-v4s-activation) |
+| deepseek_v4 (DeepSeek V4 Flash) | MXFP4 `MXFP4_E8M0` 32, packed by default (fmt 15 — `COLI_VK_TIER_FMT15=0` keeps the f32-scale fmt 7; the packing is exact); while `COLI_VK_TIER_EXPERTS` is armed (the default) the store never rows16-packs, so no pinned expert needs unpacking (`COLI_VK_LEGACY=1` restores the repack) | `VKT_ACT_SWIGLU_V4` | the store's own `<model>/.coli_usage` | [DeepSeek V4's activation](#deepseek-v4s-activation) |
 | colibri (GLM-5.2) | `F32` (fmt 10), int8 `I8_ROW` (fmt 1), int4 per row `I4U_PAIRS_ROW` (fmt 2), int4-gs `I4U_PAIRS_GS` (fmt 4), int3-g64 `I3_G64` (fmt 5); down may have its own | SwiGLU | `<snap>/.coli_usage` | [GLM-5.2 and GLM-5.3 Flash](#glm-52-and-glm-53-flash-on-the-tier) |
 | glm53 (GLM-5.3 Flash) | the streaming container's int4-gs64 `I4U_PAIRS_GS` 64 (fmt 4) | SwiGLU with `swiglu_limit`, run only above 0 | `COLI_USAGE` (default `<snap>/.coli_usage`) | [GLM-5.2 and GLM-5.3 Flash](#glm-52-and-glm-53-flash-on-the-tier) |
 
@@ -807,6 +845,95 @@ head with f32 and 4-bit experts at two drafts, and its default; `deepseek` V4.1'
 DSpark stages at three forced acceptances, the default at five. Each must give the CPU's
 tokens and serve experts of the extra layers from the device; the sanitizer families run
 one of each.
+
+### The prefill bank (`COLI_VK_TIER_BANK_LAYER`)
+
+The tier's stream slots and one layer's experts are the same bytes doing the same job — a
+per-layer window of expert weights the device reads while a prompt's chunks cross the
+layer. `COLI_VK_TIER_BANK_LAYER=n` exchanges them: layer n's experts are planned whole to
+the device, pinned for the bank's tenure, and the **stream slot budget is carved by the
+bank's bytes** — at DeepSeek V4's scale 256 slots ≈ 3.75 GiB for 256 MXFP4 experts, the
+boot line ledgering `bank=layer 26, 256 experts (3.75 GiB), the stream slots' budget 256
+-> 2`. Two laws hold by construction:
+
+- **The carve law**: the bank and the slot budget never add, and a resident keeps its
+  place. The bank takes the slots' bytes, never the residents' — the measured answer to
+  the silent-take class (`98fcee51`: a device pin that quietly ate the streaming budget
+  halved prefetch and doubled TTFT). A tier whose slots cannot become the bank (fewer
+  slots than the layer has experts, streaming off, or a budget that cannot hold the bank
+  beside the pins and two residents) declines with one line and plans the history's, as
+  before — the operator's `COLI_VK_TIER_STREAM_SLOTS` sizes the slots.
+- **The boundary law**: the carve leaves the chunk-outer staging capacity it replaced,
+  which is the point — the bank answers the same bytes with residency (compute reads
+  VRAM) where the slots answered them with staging (183 GiB of one-shot uploads over a
+  prompt at the standing arm). `COLI_VK_DMOE_ROWS_MAX` (its own row in
+  ENVIRONMENT.md) is the companion cap that keeps each submission under the amdgpu
+  hard-recovery boundary while the banked layer's grouped GEMMs read VRAM.
+
+Because banked experts are ordinary residents, everything downstream is already landed:
+`vkt_dev_table` counts them (the dmoe gate opens with zero new gate code), the host step
+serves them, and the in-frame `COLI_VK_DMOE` path computes them. What the bank adds is
+**tenure discipline**: a per-layer validity bitmap with at-most-once refill — at the
+routed step (post-router, pre-issue) the missing set (routed, not yet valid) loads
+through the engine's bypass group reader (`COLI_VK_TIER_STREAM_BYPASS`'s reader: no
+lease, no cache slot) and uploads sequential into the bank's places, each expert at most
+once per tenure; a failed read is never re-tried, the CPU serves it, and a step of
+another layer is not the bank's. The explicit `vkt_bank_switch` seam moves the bank to
+another layer — the bitmap clears, the old layer's device copies free at a quiescent
+point (their entries publish with the epoch, exactly as a promotion's victim frees do),
+and the new layer's routed experts refill under the same at-most-once rule — the fork's
+own switch discipline, so a rotation never re-reads what a tenure already read. The
+engine's step never switches: this port's chunk-outer order visits every layer each
+chunk, and a bank that followed the visit order would thrash a place a layer — the
+rotation waits for the layer-outer reorder that will drive it. The unit gate covers the
+switch both ways (the 2-layer case), the carve's ledger line, and every decline path.
+
+### The layer-outer prompt loop (`COLI_VK_CHAIN_ORDER=layer`)
+
+The chunk-outer loop — a chunk of rows through every layer, then the next chunk — is the
+order the streaming window was built for: every layer's cold experts stage once a chunk,
+reuse distance 43 layers, the slots turning over the whole prompt. `COLI_VK_CHAIN_ORDER=
+layer` is the fork's own prefill order instead: **every chunk of the prompt crosses one
+layer before the next layer begins**, so whatever residency serves a layer serves its
+whole tenure. That is the regime the bank was designed for and the chunk leg measured
+the absence of (AA: with the bank carved, chunk-outer order still needed the slots for
+the other 42 layers every chunk — slots 256→0, the streaming fell to direct disk reads,
+TTFT ×3.2); layer-outer makes the bank's rotation the streaming: `vkt_bank_switch` at
+each layer head, over the quiescent tail the layer before left, then one fill per tenure
+(at most once an expert) and every chunk of the layer computes from VRAM. Without the
+bank the same reorder turns the stream slots themselves into a per-layer window — reuse
+distance 43 → 0, the experts a layer reads staged once, not once a chunk.
+
+What makes it legal is that a layer's pass is self-contained. A layer reads its own
+attention state — its window ring, compressed rows, compressor ring and indexer keys —
+which the chunk order lowers into the device mirrors at the prompt's first chunk and this
+order lowers at **the layer's own head**, against a snapshot of the rings taken before
+the first layer's pass (a later layer's mirrors still hold the state the snapshot
+describes while the live `slot_pos` has followed the earlier layers' chunks); and it
+reads the streams the layer before left, which stay resident for the whole prompt
+(`ch->xall`, one upload, one download — each layer-chunk unit copies its rows in and out
+of the chunk's scratch, so the scratch is still the chunk's). The chunks' lists and RoPE
+tables live side by side on the device — a later layer's unit reads the chunk it is
+visiting, not the last one built (`V4cFwd.lbase`/`csW`/`csC`). The unit itself is the
+chunk path's layer body verbatim: the same frames, the same per-row GEMV batches, the
+FFN join of the unit before deferred to the next unit's head exactly as the chunk path
+defers it across the layer boundary — so at `COLI_VK_CHAIN_GEMM_ROWS=0` the reorder is
+bit-neutral by construction (verified bit-equal against the chunk order at the tiny
+gate, multi-chunk, multi-layer), and at `-1` the cut sequence is pinned identical per
+row (the same `v4c_chunk_rows` for every layer), leaving only a serving-path arm
+(`COLI_VK_DMOE=all`, the composed fold's arm) able to move a row's bits — the
+thresholded class, gated by the oracle.
+
+Two disciplines of the chunk path become per-layer: the tier's books (`vkt_dev_count`)
+and DSpark's taps read host-mapped memory, so they drain at the loop's wait points — a
+host-step unit's A1 wait, the split's copy-back, each layer tail's submit — where the
+frames that wrote them are through (a tap is read from `xall`, the joined rows' home,
+never off the scratch the next unit's load takes); and each layer tail submits and waits
+(the bank's switch needs a quiet device — nothing reads the old layer's experts when the
+bitmap clears). The reorder is armed for prompts of more than one chunk only and needs
+the prompt's streams, lists and tables beside the chunk's scratch; a prompt they do not
+fit runs in the chunk order with one line saying so. The default (`chunk`, or unset)
+runs today's loop untouched — byte-identical by construction.
 
 ### A second device (`COLI_VK_DEV2`)
 
@@ -2426,7 +2553,13 @@ the matrix units, for the grouped GEMM); `COLI_VK_BDA=0` still opens it without.
 
 **Hybrid steps: the host pool's experts on the CPU.** The tier's host pool holds the
 experts the card has no room for in system RAM, which the device reads over PCIe: 10 to
-11 GB/s on an RTX PRO 4000 at PCIe 4.0 x8, at any size (`COLI_VK_BENCH_HOST`). With
+11 GB/s on an RTX PRO 4000 at PCIe 4.0 x8, at any size (`COLI_VK_BENCH_HOST`). Its size
+comes from the engine's RAM plan — the room that plan leaves beside its expert cache at
+capacity, its dense weights in RAM, its head and its KV/workspace reserves
+(`COLI_VK_TIER_HOST_GB` overrides it, `COLI_VK_TIER_HOST=0` turns it off); an engine
+without a plan falls back to `MemAvailable` less 4 GiB and its own cache growth — and
+colibri's plan spends its whole budget by construction, so its pool needs
+`COLI_VK_TIER_HOST_GB` to come on at all. With
 Qwen3.8 Next IQ2_XS on that card about 7% of a decode step's pairs and 11% of a 3-row
 verify's come from there, and each layer that has one waits for it: skipping them
 (wrong tokens, the right times) took decode from 38.5 to 50.1 tok/s and an MTP verify's
@@ -3467,6 +3600,23 @@ real (tests; a device with a host-visible device-local type that is not staged a
 and when the type gives what was asked, the line starts `[VK] memory: mapped weights, the host-visible
 device-local memory gave the N GiB asked`.
 
+**The probe's shadow, and the wait that clears it.** RADV still counts the probe's freed blocks in
+`VK_EXT_memory_budget` for a fraction of a second after they go back, so anything that sizes itself from the
+heap's budget right after the boot can read that shadow as taken (on the bench card a dense chain's fit read
+0.67 GiB free of a 14.7 GiB heap). When the probe allocated, `vk_window_decide` therefore records the heap's
+free before the probe and, once the blocks go back, polls the budget every 20 ms until the free returns to
+that pre-probe reading within 62.5 MB (0.0625 GB), bounded at 2 s (a co-tenant may have honestly taken the bytes; then it
+proceeds and says so), and prints exactly one line either way:
+
+```
+[VK] memory: the window probe freed 13 GiB; the driver's budget read them back in 201 ms
+```
+
+(or "…still shows them after 2000 ms, proceeding"; the 20 ms poll quantizes the number, so boots of the same
+session can read a few ms apart). The wait is boot-timing only — no sizing decision reads the poll's state —
+and it is skipped when the probe made no allocations (`COLI_VK_WINDOW_PROBE_MB` answered it without asking) or
+when the extension is absent.
+
 **What moves where, staged:**
 
 | Data | Mapped path | Staged |
@@ -3975,6 +4125,41 @@ and is not verified. The rows cross through host memory once per forward, chunk 
   during shutdown; set `VK_LAYER_SYNCVAL_SUBMIT_TIME_VALIDATION=false`, or
   read stdout through a pty, since the crash lands in an `atexit` handler
   before stdio flushes.
+
+## Performance levers (default-on, probe-gated)
+
+Inside the opt-in `COLI_VULKAN=1` backend, five performance levers are **on by
+default, each behind its own capability probe**, beside the tier's packed fmt-15:
+a probe that refuses leaves the standing upstream path running — never an abort —
+and each lever prints exactly one boot line (`engaged`, `refused:<reason>` or
+`legacy`), so nothing engages or declines silently.
+
+| Lever | Default | Gate | On refusal | Off |
+|---|---|---|---|---|
+| `COLI_VK_TIER_EXPERTS` | `1` | No hardware probe of its own (the tier on, the xb group ready); `=2` (composed with the growth) needs `COLI_VK_TIER_DECODE_GROW` + `_HEADROOM` | The composition declines with one line, the compute site stays off (decode's routed experts keep the CPU loop) | `=0`; `COLI_VK_LEGACY=1` |
+| `COLI_VK_V4_DECODE_PATH` | `fork` (unset → on) | Memory-type probe: a coherent non-device-local system-RAM type (refuses unified memory — iGPU, Lavapipe), heap room for one 16 MiB block, the arena at most 7/8 of the heap, the block clamped to `maxMemoryAllocationSize`; also needs `COLI_VK_TIER_EXPERTS=1` | `slab registry refused: <why>` — the store's slots keep the malloc/import path | Any value ≠ `fork` (incl. `=0`); `COLI_VK_LEGACY=1` |
+| `COLI_VK_V4_S1GEMV` | `1` | Per-device bit-exact parity leg (`xb_s1gemv_parity`: I=2048/gs=32 and I=6144/gs=64, bitwise vs the generic `qmatmul`), then the shader and pipeline must load; any mismatch destroys the pipeline | `parity vs qmatmul NOT exact` (or the shader absent) — the generic GEMV stays | `=0`; `COLI_VK_LEGACY=1` |
+| `COLI_VK_TIER_DECODE_GROW` (+`_HEADROOM`, default 1) | `1` | Free-VRAM floor: `VK_EXT_memory_budget` budget less usage (`COLI_VK_TIER_FREE_MB` overrides the reading, tests) less `_RESERVE_GB` (0.5); needs the engine's decode-only heat table | A decline line, the warm set stands | `=0`; `COLI_VK_LEGACY=1` |
+| `COLI_VK_CHAIN_ATTN_FA` | `1` (f16 mirror; `2` the fp32 tile) | Shape gate (head dim 512, heads % 8, offsets and strides % 4) and an LDS/pipeline gate: 64 KiB-LDS cards compile both tiles, 48 KiB only the decode twin, ≤ 32 KiB neither; the f16 mirror's scratch and gather pipeline must load, else the fp32 tile | `attention FA refused: <why> -- mode 0` (the first event wins, later dispatches quiet) | `=0`; `COLI_VK_LEGACY=1` |
+| `COLI_VK_TIER_FMT15` | on (packed fmt 15) | No probe — the packing is exact by construction (12.75 vs 15.0 MiB a DeepSeek V4 expert, +17.6% capacity); the CUDA tier keeps fmt 7 | none (no boot line at all) | `=0` restores fmt 7; **`COLI_VK_LEGACY` does not cover it** |
+
+`COLI_VK_LEGACY=1` is the upstream-base hatch: it turns every **unset** lever of
+the five probed ones above back to the base's behaviour, one `legacy` line a lever
+(an explicitly set lever wins over the hatch). **`COLI_VK_TIER_FMT15` sits
+outside it** — `LEGACY=1` does not restore fmt 7 (the packing is lossless, so
+outputs are unaffected either way). `tests/vulkan_strict.sh`'s hatch case
+byte-compares `COLI_VK_LEGACY=1` against every lever at `=0`.
+
+Beside the probed levers, the **measured prefill shape is the default** (the
+self-tuning defaults): mm8 follows the rows rule, the chain's rows pin follows
+the backend's rule, the tier's grouped GEMM from 4 rows, stream slots derived
+from the fit (a quarter of the raw expert places, 64..4096), and the bypass
+reader on. No env is needed to carry the measured shape: every knob keeps its own
+env var (`ENVIRONMENT.md`'s rows), and `COLI_VK_LEGACY=1` restores the base
+(each knob at its own old number, not 0).
+
+Every knob, sub-knob and boot line of the levers has its full row in
+[ENVIRONMENT.md](ENVIRONMENT.md).
 
 ## Measured performance (AMD RX 9070, RDNA4, RADV/Mesa 26.1)
 

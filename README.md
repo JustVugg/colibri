@@ -215,7 +215,7 @@ a fast NVMe drive helps most)
 | Model | `--model` | Download | RAM | GPU | Measured |
 |---|---|---|---|---|---|
 | DeepSeek V4 Flash REAP 150B: 132 of the 256 experts | `deepseek-v4-flash-reap` | 85 GB | 16 / 32 GB | CUDA, Vulkan | |
-| **DeepSeek V4 Flash** (284B): tools | `deepseek-v4-flash` | 167 GB | 16 / 32 GB | CUDA, Vulkan | 0.93 tok/s with 32 GB (Ryzen 7 5800X), 1.24 with 63 GB (Ryzen 9 5950X), CPU only; 1.5-1.6 with CUDA (RTX 5080, 32 GB, two NVMe) |
+| **DeepSeek V4 Flash** (284B): tools | `deepseek-v4-flash` | 167 GB | 16 / 32 GB | CUDA, Vulkan | 0.93 tok/s with 32 GB (Ryzen 7 5800X), 1.24 with 63 GB (Ryzen 9 5950X), CPU only; 1.5-1.6 with CUDA (RTX 5080, 32 GB, two NVMe); 0.95-0.97 with the default-on Vulkan levers on an RX 6900 XT (`COLI_VK_TIER_EXPERTS`, `COLI_VK_V4_DECODE_PATH=fork`, `COLI_VK_V4_S1GEMV`, `COLI_VK_TIER_DECODE_GROW`, `COLI_VK_CHAIN_ATTN_FA`, fmt-15) against 0.65-0.71 at `COLI_VK_LEGACY=1`: +36-48% decode per rep, med/med +41.8%; with no env set, the self-tuning defaults take the 2,515-token prompt's first token from 259.4 s to 145.8 s (-43.8%), `COLI_VK_LEGACY=1` the base |
 | **MiMo-V2.6 Flash** (309B): vision and tools | `mimo-v2.6-flash` | 172 GB | 32 / 52 GB | Vulkan | 2.34-3.37 tok/s (A, CPU) |
 | **Qwen3.8-Flash-Next** (125B + 51B n-gram): vision and tools | `qwen38-flash-next` | 186 GB | 24 / 32 GB | CUDA, Vulkan (integrated too) | 1.91-2.56 tok/s with 32-96 experts per layer; 3.99 with the optional int4 experts (A, CPU) |
 | **GLM-5.2** (744B): the reference model, with the MTP head | `glm-5.2` | 429 GB | 16 / 24 GB | CUDA, Vulkan | 0.05-0.1 tok/s cold on a 25 GB laptop; 1.83 on a 128 GB Ryzen AI Max+ 395; 9.0-9.2 on 6x RTX 5090 |

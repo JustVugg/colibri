@@ -97,6 +97,12 @@ typedef struct {
     int    (*xb_sub_busy)(int h);
     int    (*xb_sub_copy)(int h, ColiVkTensor *const *dst, ColiVkTensor *const *src, int n);
     void   (*xb_sub_copy_drop)(void);
+    /* the decode group's tail sum (COLI_VK_TIER_CS_DEVSUM, backend_vulkan.c's
+     * coli_vk_xb_sum_arm/join_sum): declined here (NULL) -- the CS arm is the Vulkan
+     * tier's own, so a CUDA tier never arms the tail. Appended: the CUDA table's
+     * positional initializer zeroes the tail. */
+    int    (*xb_sum_arm)(int n);
+    int    (*xb_join_sum)(const float **yrows, const float **sum, double *device_ms);
 } CuTierOps;
 
 /* The table. Its calls need the CUDA device open (coli_cuda_init first): available() says

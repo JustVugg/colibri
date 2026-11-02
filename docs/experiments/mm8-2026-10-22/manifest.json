@@ -1,0 +1,123 @@
+{
+ "version": 1,
+ "hypothesis": "DeepSeek V4's fp8 dense projections on the per-row fmt-12 GEMV leave most of a device without cooperative matrices idle during prefill; the tiled weight-stationary mm8 kernel (qmatmul_mm8.spv: the weights staged once a tile, the group scale folded at staging, one fp32 accumulator an output over ascending k, split-K where the tile grid would starve) multiplies their throughput without touching any default path (COLI_VK_MM8 stays 0).",
+ "commit": "7bbad9e2db87299a51564912722a46dc743f04cc",
+ "model": "Synthetic fp8 matrices (e4m3 weights, one power-of-two f32 scale a row a 128-input group, x on the e4m3 grid) in DeepSeek V4 Flash's six real projection shapes O x I (32768x1024, 4096x8192, 1024x4096, 512x4096, 2048x4096, 4096x2048); no checkpoint",
+ "command": "make -f Makefile VK=1 ARCH=native -j16, then in c/: three runs of COLI_VK_CHAIN_BENCH=mm8 ./tests/test_vk_chain shaders/qmatmul.spv (one trial-N-raw.txt each), S 128, every tile of the table forced in turn; the trial arm is the best tile at the split-K auto rule (COLI_VK_MM8=1, COLI_VK_MM8_SPLITK unset), the baseline the fmt-12 GEMV the knob off keeps (COLI_VK_MM8=0), both under the rows policy the engine's default pins (vkc_gemm_rows 0); tok_s is the validator's fixed key and carries each trial's geometric mean of the six shapes' GMAC/s, the per-shape medians in gmac_s_by_shape and in samples.txt",
+ "prompt_hash": "sha256: no prompt; the bench's deterministic synthetic data (tests/test_vk_chain.c's own rng)",
+ "hardware": {
+  "cpu": "12th Gen Intel Core i9-12900K, 24 threads (8 performance + 8 efficiency)",
+  "ram": "38 GiB DDR5",
+  "storage": "NVMe (Crucial P5 2TB), f2fs root",
+  "os": "Arch Linux, kernel 7.1.11, gcc 16.2.1, Vulkan 1.4 (Mesa RADV 26.2.1); the device: AMD Radeon RX 6900 XT (RADV NAVI21, RDNA2, no cooperative matrices, 64 KiB shared memory a workgroup)"
+ },
+ "warmup_runs": 0,
+ "changed_variables": [
+  "COLI_VK_MM8"
+ ],
+ "baseline": {
+  "config": {
+   "COLI_VK_MM8": "0",
+   "COLI_VK_MM8_SPLITK": "auto (unset)",
+   "COLI_VK_CHAIN_GEMM_ROWS": "0 (vkc_gemm_rows(0), the engine's default pin)",
+   "S": "128",
+   "BUILD": "make -f Makefile VK=1 ARCH=native"
+  },
+  "samples": {
+   "tok_s": [
+    214.5,
+    216.0,
+    214.1
+   ],
+   "gmac_s_by_shape_median": {
+    "512x4096": 241.1,
+    "1024x4096": 194.8,
+    "2048x4096": 217.3,
+    "4096x2048": 210.4,
+    "4096x8192": 184.9,
+    "32768x1024": 241.0
+   }
+  },
+  "median_tok_s": 214.5,
+  "quality": {
+   "method": "make vk-chain-check green on this device at this commit: the GEMV is the default's byte-for-byte path (mm8 arms assert the knob off leaves the dispatch counter alone), so the baseline needs no separate oracle",
+   "passed": true
+  },
+  "evidence": {
+   "uri": "docs/experiments/mm8-2026-10-22/ (three trial-*-raw.txt bench logs, samples.txt, sha256sums.txt; the sha256 covers the three raw logs in name order)",
+   "sha256": "eb5a63263ca5a2a29d55d68a711241acdff3ece8434444326c52b5ba441df845"
+  }
+ },
+ "trial": {
+  "config": {
+   "COLI_VK_MM8": "1",
+   "COLI_VK_MM8_SPLITK": "auto (unset)",
+   "COLI_VK_CHAIN_GEMM_ROWS": "0 (vkc_gemm_rows(0), the engine's default pin)",
+   "S": "128",
+   "BUILD": "make -f Makefile VK=1 ARCH=native"
+  },
+  "samples": {
+   "tok_s": [
+    3116.0,
+    3130.3,
+    3131.2
+   ],
+   "gmac_s_by_shape_median": {
+    "512x4096": 2106.7,
+    "1024x4096": 2845.2,
+    "2048x4096": 3390.9,
+    "4096x2048": 3286.3,
+    "4096x8192": 4183.2,
+    "32768x1024": 3409.5
+   }
+  },
+  "median_tok_s": 3130.3,
+  "quality": {
+   "method": "make vk-chain-check green on this device at this commit: the fp64/e4m3 envelope under 1e-6 on every shape x S 2-128, every tile of the table byte-identical to the frozen f tile (test_mm8_tiles: 9 variants bitwise), the mm8 dispatch counter asserted per run, and the -1 rows-policy arm (a verify's vkc_gemm_rows(0) pin keeps the GEMV)",
+   "passed": true
+  },
+  "evidence": {
+   "uri": "docs/experiments/mm8-2026-10-22/ (three trial-*-raw.txt bench logs, samples.txt, sha256sums.txt; the sha256 covers the three raw logs in name order)",
+   "sha256": "eb5a63263ca5a2a29d55d68a711241acdff3ece8434444326c52b5ba441df845"
+  }
+ },
+ "outcome": "improvement",
+ "engine_arm": {
+  "date": "2026-10-22",
+  "command": "bench/up2276/run-arm2276.sh (2,515-token prompt / 64 decode tokens, 28 GiB plan, .coli_usage snapshots restored, arms interleaved, vram0 floor guard clean at ~575 MiB)",
+  "baseline_defaults": {
+   "ttft_s": [
+    257.706,
+    261.636
+   ],
+   "decode_toks": [
+    0.5858,
+    0.6016
+   ],
+   "wall_s": [
+    365.247,
+    366.357
+   ],
+   "chain_device_wait_s": 40.6
+  },
+  "mm8_on": {
+   "ttft_s": [
+    239.813,
+    229.523
+   ],
+   "decode_toks": [
+    0.612,
+    0.6076
+   ],
+   "wall_s": [
+    342.76,
+    333.218
+   ],
+   "chain_device_wait_s": [
+    26.7,
+    26.2
+   ]
+  },
+  "notes": "the 273.7 first mm8-on arm ran beside ~2.1 GiB of another process's VRAM (device-wide budget query shrinks the expert tier); annotated in its log, excluded; the runner now refuses such arms (vram0= stamp)"
+ }
+}
