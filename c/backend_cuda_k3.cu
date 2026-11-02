@@ -25,6 +25,7 @@
 #include "backend_cuda_k3.h"
 #include "k3_exact.h"
 #include "k3_exact_tables.h"
+#include "qmb_kernel.cuh"   // quant_matmul_blocked: the KDA layer's projections on coli_cuda.dll's matrices
 
 #define K3_TP 8       // rows a block: one an output's lane
 #define K3_TO 32      // outputs a block: a group of 32, so the block quantizes what it computes
@@ -548,19 +549,23 @@ __global__ void k3_mla_out(const float *__restrict__ clat, const float *__restri
     }
 }
 
-// ---- the router (k3_router_scores, router16) -------------------------------------------------
-// An output is 32 lanes, lane j fusing x[i+j] times the bf16 weight widened for i = 0, 32, ...,
-// then halved: a[j] += a[j+16], += a[j+8], ... += a[j+1] (MATMUL_F32_LANES, matmul_f32.h). Lane j
-// is a warp's lane j; the halving is shfl_down's. A block: 8 outputs (a warp each) over K3R_RT
-// rows, their x in shared memory K3R_KC columns at a time.
+// ---- the router (k3_router_scores, router16) and the f32 matrices (matmul_f32.h's matmul) -------
+// An output is 32 lanes, lane j fusing x[i+j] times the weight (bf16 widened, or f32) for i = 0, 32,
+// ..., then halved: a[j] += a[j+16], += a[j+8], ... += a[j+1] (MATMUL_F32_LANES, matmul_f32.h); a
+// lane past the last column adds nothing, as in dot_f32_lanes' last round. Lane j is a warp's lane
+// j; the halving is shfl_down's. A block: 8 outputs (a warp each) over K3R_RT rows, their x in
+// shared memory K3R_KC columns at a time.
 #define K3R_RT 32
 #define K3R_KC 256
-__global__ void __launch_bounds__(256) k3_router(const uint16_t *__restrict__ w, const float *__restrict__ x,
-                                                 int C, int D, int E, float *__restrict__ sco) {
+__device__ __forceinline__ float k3d_wval(uint16_t w) { return __uint_as_float((uint32_t)w << 16); }
+__device__ __forceinline__ float k3d_wval(float w) { return w; }
+template <typename WT>
+__global__ void __launch_bounds__(256) k3_lanes32(const WT *__restrict__ w, const float *__restrict__ x,
+                                                  int C, int D, int E, float *__restrict__ sco) {
     __shared__ float xs[K3R_RT * K3R_KC];
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
     const int e = blockIdx.x * 8 + wp, ec = e < E ? e : E - 1, p0 = blockIdx.y * K3R_RT;
-    const uint16_t *wr = w + (size_t)ec * D;
+    const WT *wr = w + (size_t)ec * D;
     float acc[K3R_RT];
 #pragma unroll
     for (int r = 0; r < K3R_RT; r++) acc[r] = 0.0f;
@@ -573,7 +578,8 @@ __global__ void __launch_bounds__(256) k3_router(const uint16_t *__restrict__ w,
         }
         __syncthreads();
         for (int i = 0; i < kn; i += 32) {
-            const float wv = __uint_as_float((uint32_t)wr[k0 + i + lane] << 16);
+            if (i + lane >= kn) break;
+            const float wv = k3d_wval(wr[k0 + i + lane]);
 #pragma unroll
             for (int r = 0; r < K3R_RT; r++) acc[r] = __fmaf_rn(xs[r * K3R_KC + i + lane], wv, acc[r]);
         }
@@ -814,10 +820,27 @@ extern "C" int k3cu_matmul(int fmt, float *y, const float *x, const void *w, con
     return 1;
 }
 
+// The buffers of the layer calls that never run at once (the MLA core, the KDA layer: the engine's
+// one thread, each call done when it returns): one device allocation carved per call, as large as
+// the largest call has needed, so the KDA layer's pieces take no memory past what the MLA core
+// already held (about 460 MB; the card has 2-2.5 GiB beside the resident matrices).
+static char *ar_mem; static size_t ar_cap;
+static int ar_carve(void **const *ptr, const size_t *bytes, int n) {
+    size_t tot = 0;
+    for (int i = 0; i < n; i++) tot += (bytes[i] + 255) & ~(size_t)255;
+    if (tot > ar_cap) {
+        cudaFree(ar_mem); ar_mem = nullptr; ar_cap = 0;
+        if (!checked(cudaMalloc(&ar_mem, tot), "layer buffers")) return 0;
+        ar_cap = tot;
+    }
+    size_t at = 0;
+    for (int i = 0; i < n; i++) { *ptr[i] = ar_mem + at; at += (bytes[i] + 255) & ~(size_t)255; }
+    return 1;
+}
+
 // A prompt step's MLA attention core (k3cu_mla, backend_cuda_k3.h)
 static cudaStream_t s_mla;
 static float *ml_LR, *ml_qv, *ml_gv, *ml_s, *ml_Q, *ml_S, *ml_cl, *ml_ctx; static int8_t *ml_w;
-static size_t ml_LRc, ml_qvc, ml_gvc, ml_sc, ml_Qc, ml_Sc, ml_clc, ml_ctxc, ml_wc;
 static unsigned long long n_mla, n_mla_rows; static double t_mla;
 extern "C" int k3cu_mla(const float *Lc, const float *Rc, int N, int pos0, int C, const float *qv, const float *gv,
                         const int8_t *kvb, const float *kvbs, int H, int qn, int qr, int vh, int kvl, float scale,
@@ -830,11 +853,11 @@ extern "C" int k3cu_mla(const float *Lc, const float *Rc, int N, int pos0, int C
     /* rows a chunk: their scores within about 128 MB (the card has 2-2.5 GiB beside the resident matrices) */
     long long tq = (128ll << 20) / ((long long)H * N * 4);
     const int TQ = tq < 1 ? 1 : tq > C ? C : (int)tq;
-    if (!mm_room((void **)&ml_LR, &ml_LRc, (size_t)N * KD * 4) || !mm_room((void **)&ml_qv, &ml_qvc, (size_t)C * H * qh * 4) ||
-        !mm_room((void **)&ml_gv, &ml_gvc, (size_t)C * H * vh * 4) || !mm_room((void **)&ml_w, &ml_wc, (size_t)O * kvl) ||
-        !mm_room((void **)&ml_s, &ml_sc, (size_t)O * 4) || !mm_room((void **)&ml_Q, &ml_Qc, (size_t)TQ * H * KD * 4) ||
-        !mm_room((void **)&ml_S, &ml_Sc, (size_t)TQ * H * N * 4) || !mm_room((void **)&ml_cl, &ml_clc, (size_t)TQ * H * kvl * 4) ||
-        !mm_room((void **)&ml_ctx, &ml_ctxc, (size_t)C * H * vh * 4)) return 0;
+    void **const mp[9] = {(void **)&ml_LR, (void **)&ml_qv, (void **)&ml_gv, (void **)&ml_w, (void **)&ml_s,
+                          (void **)&ml_Q, (void **)&ml_S, (void **)&ml_cl, (void **)&ml_ctx};
+    const size_t mb[9] = {(size_t)N * KD * 4, (size_t)C * H * qh * 4, (size_t)C * H * vh * 4, (size_t)O * kvl, (size_t)O * 4,
+                          (size_t)TQ * H * KD * 4, (size_t)TQ * H * N * 4, (size_t)TQ * H * kvl * 4, (size_t)C * H * vh * 4};
+    if (!ar_carve(mp, mb, 9)) return 0;
     cudaStream_t st = s_mla;
     if (!checked(cudaMemcpy2DAsync(ml_LR, (size_t)KD * 4, Lc, (size_t)kvl * 4, (size_t)kvl * 4, (size_t)N, cudaMemcpyHostToDevice, st), "attention cache") ||
         (qr && !checked(cudaMemcpy2DAsync(ml_LR + kvl, (size_t)KD * 4, Rc, (size_t)qr * 4, (size_t)qr * 4, (size_t)N, cudaMemcpyHostToDevice, st), "attention cache")) ||
@@ -871,7 +894,7 @@ extern "C" int k3cu_router(float *sco, const float *x, const uint16_t *w, int C,
     dim3 g((unsigned)((E + 7) / 8), (unsigned)((C + K3R_RT - 1) / K3R_RT));
     if (!checked(cudaMemcpyAsync(rt_w, w, (size_t)E * D * 2, cudaMemcpyHostToDevice, s_mm), "router") ||
         !checked(cudaMemcpyAsync(rt_x, x, (size_t)C * D * 4, cudaMemcpyHostToDevice, s_mm), "router rows")) return 0;
-    k3_router<<<g, 256, 0, s_mm>>>(rt_w, rt_x, C, D, E, rt_s);
+    k3_lanes32<uint16_t><<<g, 256, 0, s_mm>>>(rt_w, rt_x, C, D, E, rt_s);
     if (!checked(cudaGetLastError(), "router kernel") ||
         !checked(cudaMemcpyAsync(sco, rt_s, (size_t)C * E * 4, cudaMemcpyDeviceToHost, s_mm), "router scores") ||
         !checked(cudaStreamSynchronize(s_mm), "router")) return 0;
@@ -921,14 +944,253 @@ extern "C" int k3cu_shared(float *sd, const float *x, int S, int D, int I, const
     return 1;
 }
 
+// ---- a prompt step's KDA layer (k3cu_kda): kda_forward's by-step path to the bit ---------------
+// The conv: channel d of q, k or v (c = which P + d) keeps the window of its K latest inputs (the
+// step's before it in win, [3][P][K]); a row shifts it and takes the row's input, its K taps fused
+// into +0 in order, then SiLU as exp_f8's path computes it, x / (1 + exp_f(-x)). In place; the
+// window goes back to win.
+template <int K>
+__global__ void __launch_bounds__(256) k3_kda_conv(float *__restrict__ q, float *__restrict__ k, float *__restrict__ v,
+                                                   float *__restrict__ win, const float *__restrict__ taps, int R, int P) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= 3 * P) return;
+    const int which = c / P, d = c - which * P;
+    float *val = (which == 0 ? q : which == 1 ? k : v) + d;
+    float w[K], tp[K];
+#pragma unroll
+    for (int j = 0; j < K; j++) { w[j] = win[(size_t)c * K + j]; tp[j] = taps[(size_t)c * K + j]; }
+    for (int t = 0; t < R; t++) {
+#pragma unroll
+        for (int j = 0; j < K - 1; j++) w[j] = w[j + 1];
+        w[K - 1] = val[(size_t)t * P];
+        float acc = 0.0f;
+#pragma unroll
+        for (int j = 0; j < K; j++) acc = __fmaf_rn(tp[j], w[j], acc);
+        val[(size_t)t * P] = __fdiv_rn(acc, __fadd_rn(1.0f, k3d_expf(-acc)));
+    }
+#pragma unroll
+    for (int j = 0; j < K; j++) win[(size_t)c * K + j] = w[j];
+}
+// A head's row (i = t H + h): the squares of q and of k rounded and added in order from 0 (GCC's
+// in-order reduction of k3_kda_head's loop), 1 / sqrt(sum + 1e-6); beta = sigmoidf_(b).
+__global__ void k3_kda_norms(const float *__restrict__ q, const float *__restrict__ k, const float *__restrict__ b,
+                             int n, int hd, float *__restrict__ rq, float *__restrict__ rk, float *__restrict__ beta) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float *qh = q + (size_t)i * hd, *kh = k + (size_t)i * hd;
+    float sq = 0.0f, sk = 0.0f;
+    for (int e = 0; e < hd; e++) {
+        sq = __fadd_rn(sq, __fmul_rn(qh[e], qh[e]));
+        sk = __fadd_rn(sk, __fmul_rn(kh[e], kh[e]));
+    }
+    rq[i] = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(sq, 1e-6f)));
+    rk[i] = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(sk, 1e-6f)));
+    beta[i] = __fdiv_rn(1.0f, __fadd_rn(1.0f, k3d_expf(-b[i])));
+}
+// In place: q (q r_q) qscale, k r_k, and the decay alpha = exp_f(lb / (1 + exp_f(-(A_h (graw + dt)))))
+// in g (k3_kda_head's exp_f8 loop)
+__global__ void k3_kda_prep(float *__restrict__ q, float *__restrict__ k, float *__restrict__ g,
+                            const float *__restrict__ rq, const float *__restrict__ rk, const float *__restrict__ A,
+                            const float *__restrict__ dt, size_t n, int H, int hd, float qscale, float lb) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const size_t th = i / hd;
+    const int h = (int)(th % H), p = (int)(i % ((size_t)H * hd));
+    q[i] = __fmul_rn(__fmul_rn(q[i], rq[th]), qscale);
+    k[i] = __fmul_rn(k[i], rk[th]);
+    const float z = __fadd_rn(g[i], dt[p]);
+    const float s = __fdiv_rn(1.0f, __fadd_rn(1.0f, k3d_expf(-__fmul_rn(A[h], z))));
+    g[i] = k3d_expf(__fmul_rn(lb, s));
+}
+// The recurrence: block h, thread j owns column j of the head's state S [HD][HD] in registers. A row:
+// row kk times alpha[kk], kS fusing k[kk] times it in kk's order from 0; vt = (v - kS) beta; row kk
+// plus k[kk] vt fused, oh fusing q[kk] times it in kk's order from 0 (k3_kda_head's two sweeps).
+// oh replaces v. The rows' q, k and alpha come KR_T at a time through shared memory.
+#define KR_T 8
+template <int HD>
+__global__ void __launch_bounds__(HD) k3_kda_rec(float *__restrict__ state, const float *__restrict__ qn,
+                                                 const float *__restrict__ kn, const float *__restrict__ al,
+                                                 float *__restrict__ v, const float *__restrict__ beta, int R, int H) {
+    __shared__ __align__(16) float sq[KR_T][HD], sk[KR_T][HD], sa[KR_T][HD];
+    __shared__ float sb[KR_T];
+    const int h = blockIdx.x, j = threadIdx.x, P = H * HD;
+    float *S = state + (size_t)h * HD * HD + j;
+    float s[HD];
+#pragma unroll
+    for (int kk = 0; kk < HD; kk++) s[kk] = S[(size_t)kk * HD];
+    for (int t0 = 0; t0 < R; t0 += KR_T) {
+        const int n = R - t0 < KR_T ? R - t0 : KR_T;
+        __syncthreads();
+        for (int tt = 0; tt < n; tt++) {
+            const size_t src = (size_t)(t0 + tt) * P + (size_t)h * HD + j;
+            sq[tt][j] = qn[src]; sk[tt][j] = kn[src]; sa[tt][j] = al[src];
+        }
+        if (j < n) sb[j] = beta[(size_t)(t0 + j) * H + h];
+        __syncthreads();
+        for (int tt = 0; tt < n; tt++) {
+            float kS = 0.0f;
+#pragma unroll
+            for (int kk = 0; kk < HD; kk++) { s[kk] = __fmul_rn(s[kk], sa[tt][kk]); kS = __fmaf_rn(sk[tt][kk], s[kk], kS); }
+            const size_t iv = (size_t)(t0 + tt) * P + (size_t)h * HD + j;
+            const float vt = __fmul_rn(__fsub_rn(v[iv], kS), sb[tt]);
+            float oh = 0.0f;
+#pragma unroll
+            for (int kk = 0; kk < HD; kk++) { s[kk] = __fmaf_rn(sk[tt][kk], vt, s[kk]); oh = __fmaf_rn(sq[tt][kk], s[kk], oh); }
+            v[iv] = oh;
+        }
+    }
+#pragma unroll
+    for (int kk = 0; kk < HD; kk++) S[(size_t)kk * HD] = s[kk];
+}
+// A head's row: 1 / sqrtf((float)(sum of oh^2 in double, in order) / hd) + eps) (the per-head RMSNorm)
+__global__ void k3_kda_rms(const float *__restrict__ oh, int n, int hd, float eps, float *__restrict__ rr) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float *o = oh + (size_t)i * hd;
+    double ms = 0.0;
+    for (int e = 0; e < hd; e++) { const double d = (double)o[e]; ms = __dadd_rn(ms, __dmul_rn(d, d)); }
+    rr[i] = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__double2float_rn(__ddiv_rn(ms, (double)hd)), eps)));
+}
+// In place in g: ((oh r) onw) sigmoidf_(g), the gated heads o_proj takes
+__global__ void k3_kda_gate(const float *__restrict__ oh, float *__restrict__ g, const float *__restrict__ rr,
+                            const float *__restrict__ onw, size_t n, int hd) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float sg = __fdiv_rn(1.0f, __fadd_rn(1.0f, k3d_expf(-g[i])));
+    g[i] = __fmul_rn(__fmul_rn(__fmul_rn(oh[i], rr[i / hd]), onw[i % hd]), sg);
+}
+
+#define KD_ROWS 512   // rows a piece (K3_GPU_KDA_ROWS)
+static cudaStream_t s_kda;
+static unsigned long long n_kda, n_kda_rows; static double t_kda;
+static int kd_rows(void) {
+    static int r = -1;
+    if (r < 0) { const char *e = getenv("K3_GPU_KDA_ROWS"); r = e && atoi(e) > 0 ? atoi(e) : KD_ROWS; r = (r + 7) / 8 * 8; }
+    return r;
+}
+// a projection on coli_cuda.dll's copy: quant_matmul_blocked's shapes
+static int kd_dev_ok(const K3cuProj *p, int I, int O) {
+    return p->w && p->s && (p->fmt == 1 || (p->fmt == 4 && p->gs == 64)) && (I == 7168 || I == 12288) && O % QMB_RO == 0;
+}
+static void kd_mm(const K3cuProj *p, float *y, const float *xb, int r, int I, int O, cudaStream_t st) {
+    const dim3 grid((unsigned)(O / QMB_RO), (unsigned)((r + QMB_RS - 1) / QMB_RS));
+    const uint8_t *w = static_cast<const uint8_t *>(p->w);
+    if (p->fmt == 4 && I == 7168) quant_matmul_blocked<4, 7168><<<grid, 256, 0, st>>>(y, xb, w, p->s, r, O);
+    else if (p->fmt == 4) quant_matmul_blocked<4, 12288><<<grid, 256, 0, st>>>(y, xb, w, p->s, r, O);
+    else if (I == 7168) quant_matmul_blocked<1, 7168><<<grid, 256, 0, st>>>(y, xb, w, p->s, r, O);
+    else quant_matmul_blocked<1, 12288><<<grid, 256, 0, st>>>(y, xb, w, p->s, r, O);
+}
+static void kd_block(float *xb, const float *x, int r, int I, cudaStream_t st) {
+    const long long n = (long long)((r + QMB_RS - 1) / QMB_RS) * I;
+    qmb_rows<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(xb, x, r, I, n);
+}
+template <int HD>
+static void kd_rec(float *st8, const float *q, const float *k, const float *a, float *v, const float *b, int r, int H, cudaStream_t s) {
+    k3_kda_rec<HD><<<H, HD, 0, s>>>(st8, q, k, a, v, b, r, H);
+}
+static int kd_conv(int K, float *q, float *k, float *v, float *win, const float *taps, int r, int P, cudaStream_t st) {
+    const unsigned g = (unsigned)((3 * P + 255) / 256);
+    switch (K) {
+    case 1: k3_kda_conv<1><<<g, 256, 0, st>>>(q, k, v, win, taps, r, P); return 1;
+    case 2: k3_kda_conv<2><<<g, 256, 0, st>>>(q, k, v, win, taps, r, P); return 1;
+    case 3: k3_kda_conv<3><<<g, 256, 0, st>>>(q, k, v, win, taps, r, P); return 1;
+    case 4: k3_kda_conv<4><<<g, 256, 0, st>>>(q, k, v, win, taps, r, P); return 1;
+    case 5: k3_kda_conv<5><<<g, 256, 0, st>>>(q, k, v, win, taps, r, P); return 1;
+    case 6: k3_kda_conv<6><<<g, 256, 0, st>>>(q, k, v, win, taps, r, P); return 1;
+    case 7: k3_kda_conv<7><<<g, 256, 0, st>>>(q, k, v, win, taps, r, P); return 1;
+    }
+    return 0;
+}
+extern "C" int k3cu_kda(const K3cuKda *a, const float *x, float *out) {
+    if (!ready || failed || !a || !x || !on_device()) return 0;
+    const int C = a->C, D = a->D, H = a->H, hd = a->hd, K = a->K, P = H * hd;
+    if (C < 1 || D < 1 || H < 1 || K < 1 || K > 7 || !(hd == 16 || hd == 32 || hd == 64 || hd == 128) ||
+        !a->fa || !a->fb || !a->bp || !a->A || !a->dt || !a->onw || !a->state) return 0;
+    const K3cuProj *pr[4] = {&a->q, &a->k, &a->v, &a->g};
+    int dev_in = 0;
+    for (int i = 0; i < 4; i++) {
+        if (pr[i]->w ? !kd_dev_ok(pr[i], D, P) : !pr[i]->y) return 0;
+        dev_in |= pr[i]->w != nullptr;
+    }
+    if (a->o.w ? !kd_dev_ok(&a->o, P, D) || !out : !a->o.y) return 0;
+    for (int w = 0; w < 3; w++) if (!a->taps[w] || !a->win[w]) return 0;
+    double t0 = now_s();
+    if (!s_kda && !checked(cudaStreamCreateWithFlags(&s_kda, cudaStreamNonBlocking), "KDA stream")) return 0;
+    cudaStream_t st = s_kda;
+    const int R = C < kd_rows() ? C : kd_rows(), RB = (R + QMB_RS - 1) / QMB_RS * QMB_RS;
+    const size_t PK = (size_t)P * K;
+    // the layer's constants: fa, fb, bp, A, dt, onw, the q, k, v taps; its state: S, the q, k, v windows
+    const size_t nfa = (size_t)hd * D, nfb = (size_t)P * hd, nbp = (size_t)H * D;
+    const size_t ncon = nfa + nfb + nbp + H + P + hd + 3 * PK, nst = (size_t)H * hd * hd + 3 * PK;
+    float *dx, *dxb, *dq, *dk, *dv, *da, *dc, *ds, *dsm;
+    void **const kp[9] = {(void **)&dx, (void **)&dxb, (void **)&dq, (void **)&dk, (void **)&dv, (void **)&da,
+                          (void **)&dc, (void **)&ds, (void **)&dsm};
+    const size_t kb[9] = {(size_t)R * D * 4, (size_t)RB * D * 4, (size_t)RB * P * 4, (size_t)R * P * 4, (size_t)R * P * 4,
+                          (size_t)R * P * 4, ncon * 4, nst * 4, ((size_t)R * hd + 4 * (size_t)R * H) * 4};
+    if (!ar_carve(kp, kb, 9)) return 0;
+    float *cfa = dc, *cfb = cfa + nfa, *cbp = cfb + nfb, *cA = cbp + nbp, *cdt = cA + H, *conw = cdt + P, *ctap = conw + hd;
+    float *sS = ds, *swin = ds + (size_t)H * hd * hd;
+    float *t1 = dsm, *br = t1 + (size_t)R * hd, *rq = br + (size_t)R * H, *rk = rq + (size_t)R * H, *be = rk + (size_t)R * H;
+    const struct { float *d; const float *h; size_t n; } up[10] = {
+        {cfa, a->fa, nfa}, {cfb, a->fb, nfb}, {cbp, a->bp, nbp}, {cA, a->A, (size_t)H}, {cdt, a->dt, (size_t)P},
+        {conw, a->onw, (size_t)hd}, {ctap, a->taps[0], PK}, {ctap + PK, a->taps[1], PK}, {ctap + 2 * PK, a->taps[2], PK},
+        {sS, a->state, (size_t)H * hd * hd}};
+    for (int i = 0; i < 10; i++)
+        if (!checked(cudaMemcpyAsync(up[i].d, up[i].h, up[i].n * 4, cudaMemcpyHostToDevice, st), "KDA constants")) return 0;
+    for (int w = 0; w < 3; w++)
+        if (!checked(cudaMemcpyAsync(swin + w * PK, a->win[w], PK * 4, cudaMemcpyHostToDevice, st), "KDA windows")) return 0;
+    float *dqkv[3] = {dq, dk, dv};
+    for (int s0 = 0; s0 < C; s0 += R) {
+        const int r = C - s0 < R ? C - s0 : R;
+        const size_t rp = (size_t)r * P;
+        const unsigned grh = (unsigned)((r * H + 255) / 256), grp = (unsigned)((rp + 255) / 256);
+        if (!checked(cudaMemcpyAsync(dx, x + (size_t)s0 * D, (size_t)r * D * 4, cudaMemcpyHostToDevice, st), "KDA rows")) return 0;
+        if (dev_in) kd_block(dxb, dx, r, D, st);
+        for (int i = 0; i < 3; i++) {
+            if (pr[i]->w) kd_mm(pr[i], dqkv[i], dxb, r, D, P, st);
+            else if (!checked(cudaMemcpyAsync(dqkv[i], pr[i]->y + (size_t)s0 * P, rp * 4, cudaMemcpyHostToDevice, st), "KDA projections")) return 0;
+        }
+        kd_conv(K, dq, dk, dv, swin, ctap, r, P, st);
+        k3_lanes32<float><<<dim3((unsigned)((hd + 7) / 8), (unsigned)((r + K3R_RT - 1) / K3R_RT)), 256, 0, st>>>(cfa, dx, r, D, hd, t1);
+        k3_lanes32<float><<<dim3((unsigned)((P + 7) / 8), (unsigned)((r + K3R_RT - 1) / K3R_RT)), 256, 0, st>>>(cfb, t1, r, hd, P, da);
+        k3_lanes32<float><<<dim3((unsigned)((H + 7) / 8), (unsigned)((r + K3R_RT - 1) / K3R_RT)), 256, 0, st>>>(cbp, dx, r, D, H, br);
+        k3_kda_norms<<<grh, 256, 0, st>>>(dq, dk, br, r * H, hd, rq, rk, be);
+        k3_kda_prep<<<grp, 256, 0, st>>>(dq, dk, da, rq, rk, cA, cdt, rp, H, hd, a->qscale, a->gate_lb);
+        if (hd == 128) kd_rec<128>(sS, dq, dk, da, dv, be, r, H, st);
+        else if (hd == 64) kd_rec<64>(sS, dq, dk, da, dv, be, r, H, st);
+        else if (hd == 32) kd_rec<32>(sS, dq, dk, da, dv, be, r, H, st);
+        else kd_rec<16>(sS, dq, dk, da, dv, be, r, H, st);
+        k3_kda_rms<<<grh, 256, 0, st>>>(dv, r * H, hd, a->eps, rq);
+        if (a->g.w) kd_mm(&a->g, dk, dxb, r, D, P, st);
+        else if (!checked(cudaMemcpyAsync(dk, a->g.y + (size_t)s0 * P, rp * 4, cudaMemcpyHostToDevice, st), "KDA gate")) return 0;
+        k3_kda_gate<<<grp, 256, 0, st>>>(dv, dk, rq, conw, rp, hd);
+        if (!checked(cudaGetLastError(), "KDA kernels")) return 0;
+        if (a->o.w) {
+            kd_block(dq, dk, r, P, st);
+            kd_mm(&a->o, dx, dq, r, P, D, st);
+            if (!checked(cudaGetLastError(), "KDA output") ||
+                !checked(cudaMemcpyAsync(out + (size_t)s0 * D, dx, (size_t)r * D * 4, cudaMemcpyDeviceToHost, st), "KDA output")) return 0;
+        } else if (!checked(cudaMemcpyAsync(a->o.y + (size_t)s0 * P, dk, rp * 4, cudaMemcpyDeviceToHost, st), "KDA heads")) return 0;
+    }
+    if (!checked(cudaStreamSynchronize(st), "KDA")) return 0;   // every piece done: the host state may change now
+    if (!checked(cudaMemcpyAsync(a->state, sS, (size_t)H * hd * hd * 4, cudaMemcpyDeviceToHost, st), "KDA state")) return 0;
+    for (int w = 0; w < 3; w++)
+        if (!checked(cudaMemcpyAsync(a->win[w], swin + w * PK, PK * 4, cudaMemcpyDeviceToHost, st), "KDA windows")) return 0;
+    if (!checked(cudaStreamSynchronize(st), "KDA")) return 0;
+    n_kda++; n_kda_rows += (unsigned long long)C; t_kda += now_s() - t0;
+    return 1;
+}
+
 extern "C" void k3cu_report(void) {
-    if (!ready || !n_steps) return;
-    fprintf(stderr, "[K3-CUDA] experts: %llu steps, %llu experts, %llu rows on the GPU; copying their bytes %.1fs, waiting for slots %.1fs%s\n",
-            n_steps, n_experts, n_rows, t_copy, t_wait, failed ? "; the device failed" : "");
+    if (!ready) return;
+    if (n_steps)
+        fprintf(stderr, "[K3-CUDA] experts: %llu steps, %llu experts, %llu rows on the GPU; copying their bytes %.1fs, waiting for slots %.1fs%s\n",
+                n_steps, n_experts, n_rows, t_copy, t_wait, failed ? "; the device failed" : "");
     if (n_mm) fprintf(stderr, "[K3-CUDA] the dense matrices the GPU does not hold: %llu matmuls, %llu rows, %.1fs\n", n_mm, n_mm_rows, t_mm);
     if (n_mla) fprintf(stderr, "[K3-CUDA] the gated MLA's attention: %llu layer steps, %llu rows, %.1fs\n", n_mla, n_mla_rows, t_mla);
     if (n_rt) fprintf(stderr, "[K3-CUDA] the routers: %llu steps, %.1fs\n", n_rt, t_rt);
     if (n_sh) fprintf(stderr, "[K3-CUDA] the shared experts: %llu steps, %.1fs\n", n_sh, t_sh);
+    if (n_kda) fprintf(stderr, "[K3-CUDA] the KDA layers: %llu layer steps, %llu rows, %.1fs\n", n_kda, n_kda_rows, t_kda);
 }
 
 extern "C" void k3cu_shutdown(void) {
@@ -938,7 +1200,9 @@ extern "C" void k3cu_shutdown(void) {
     cudaFree(d_zq); cudaFree(d_zs); d_zq = nullptr; d_zs = nullptr; zq_cap = zs_cap = 0;
     cudaFree(mm_w); cudaFree(mm_s); cudaFree(mm_x); cudaFree(mm_y); mm_w = nullptr; mm_s = mm_x = mm_y = nullptr;
     mm_wcap = mm_scap = mm_xcap = mm_ycap = 0;
+    cudaFree(ar_mem); ar_mem = nullptr; ar_cap = 0;
     if (s_mm) { cudaStreamDestroy(s_mm); s_mm = nullptr; }
+    if (s_kda) { cudaStreamDestroy(s_kda); s_kda = nullptr; }
     for (int b = 0; b < K3_SLOTS; b++) { cudaStreamDestroy(S[b].s); cudaEventDestroy(S[b].done); }
     cudaStreamDestroy(s_copy); cudaEventDestroy(e_copied);
     ready = 0;

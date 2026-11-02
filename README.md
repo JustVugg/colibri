@@ -158,10 +158,11 @@ token before any cache hit, at 16.9 GB/s with both drives reading at once
 ([the plan, the other K3 engines and what was taken from them](docs/kimi_k3-4090.md)).
 Measured on the real model ([docs/experiments/kimi-k3-4090-2026-10-31](docs/experiments/kimi-k3-4090-2026-10-31/README.md)):
 **0.80 tokens a second** (the first engine here 0.56), a 44 s start (161), a 35-token prompt
-in 33 s (57), a **2,637-token prompt in 106.5 s** (1,401 s with the first CPU kernels, 549 s
+in 33 s (57), a **2,637-token prompt in 106 s** (1,401 s with the first CPU kernels, 549 s
 with the faster ones, 137 s with its experts, MLA attention and routers on the GPU in the
-CPU's arithmetic, to the bit; its dense kernels now 2-4x sooner, the same bytes) and a
-5,862-token one in 173 s (254 s in steps of 4,096); 60.5% of the experts a token asks for are found in RAM. Every step
+CPU's arithmetic, to the bit; its dense kernels now 2-4x sooner, the same bytes; now its
+drive's reads are the floor) and a **5,862-token one in 149 s** (254 s in steps of 4,096, 173 s
+before the KDA layers went whole to the GPU); 60.5% of the experts a token asks for are found in RAM. Every step
 gives the logits of the one before it, byte for byte:
 
 - `c\tools\download_kimi_k3_4090.ps1` fetches the checkpoint and cuts every MoE layer's
@@ -196,12 +197,13 @@ gives the logits of the one before it, byte for byte:
 прихода данных, роутеры в BF16, крупнейшие плотные матрицы (20 ГиБ) на GPU, «снимки»
 состояния на каждом ходе для агентов. Промпт считается на GPU (`coli_cuda_k3.dll`) в той же
 арифметике, что и на CPU, до бита: эксперты по мере чтения (dp4a; exp и tanh дают биты MinGW,
-проверено на всех 2^32 float), остальные плотные матрицы, внимание MLA, общие эксперты и
+проверено на всех 2^32 float), остальные плотные матрицы, слои KDA, внимание MLA, общие эксперты и
 роутеры; пул 20 ГБ читает эксперты следующего слоя, пока считается текущий, промпт идёт
 шагами по 8192 токена (до 16384), каждый читает эксперт один раз. Запуск: `c\tools\start_kimi_k3_4090.ps1`.
 Замеры на настоящей модели: **0,80 токена/с** (первая версия — 0,56), запуск 44 с (было 161),
 промпт из 35 токенов за 33 с (57); 60,5% экспертов находятся в ОЗУ, **промпт из 2637 токенов —
-106,5 с** (было 1401, затем 549 на CPU и 137 на GPU), из 5862 токенов — 173 с (было 254), логиты
+106 с** (было 1401, затем 549 на CPU и 137 на GPU; теперь его предел — чтение с диска),
+**из 5862 токенов — 149 с** (было 254, затем 173 до переноса слоёв KDA на GPU целиком), логиты
 те же байт в байт. Подробно: [docs/kimi_k3-4090.md](docs/kimi_k3-4090.md).
 
 </details>

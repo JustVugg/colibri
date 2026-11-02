@@ -66,6 +66,29 @@ K3CU_API int k3cu_router(float *sco, const float *x, const uint16_t *w, int C, i
 K3CU_API int k3cu_shared(float *sd, const float *x, int S, int D, int I, const uint8_t *gq, const float *gs,
                          const uint8_t *uq, const float *us, int ggs, const uint8_t *dq, const float *ds, int dgs,
                          float b1, float b2);
+/* A prompt step's KDA layer, kda_forward's by-step path to the bit, rows in pieces on the device:
+ * the projections q, k, v and g of x [C][D], the conv (taps [P][K], windows [P][K] updated), the
+ * f32 projections fa [hd][D], fb [P][hd], bp [H][D] (matmul_f32.h's lanes), k3_kda_head's norms,
+ * decay (A [H], dt [P]), recurrence (state [H][hd][hd] updated) and gated RMSNorm (onw [hd]),
+ * then o_proj into out [C][D]; P = H hd. A projection whose w is set runs on coli_cuda.dll's copy
+ * of the matrix (coli_cuda_tensor_dev_ptrs: quant_matmul_blocked, w_matmul's bytes on the card);
+ * one without it is the caller's: q, k, v and g hand their outputs [C][P] in y, and o takes the
+ * gated heads [C][P] into its y (then out is untouched). 0 when it cannot (the CPU's; the state
+ * and windows untouched). */
+typedef struct {
+    const void *w;         /* the device copy's weights, or NULL */
+    const float *s;        /* its scales */
+    int fmt, gs;           /* 1 int8 rows, 4 int4 in groups of gs (64) */
+    float *y;              /* w NULL: the caller's outputs (q, k, v, g) or the gated heads (o) */
+} K3cuProj;
+typedef struct {
+    int C, D, H, hd, K;
+    float qscale, gate_lb, eps;
+    K3cuProj q, k, v, g, o;
+    const float *fa, *fb, *bp, *A, *dt, *onw, *taps[3];
+    float *state, *win[3];
+} K3cuKda;
+K3CU_API int k3cu_kda(const K3cuKda *a, const float *x, float *out);
 K3CU_API void k3cu_report(void);
 K3CU_API void k3cu_shutdown(void);
 #ifdef __cplusplus

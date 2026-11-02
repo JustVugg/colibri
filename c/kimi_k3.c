@@ -305,6 +305,7 @@ typedef struct {
     double t_mla;                         /* t_attn's gated MLA layers (the rest: KDA's) */
     double t_mla_gpu;                     /* t_mla's attention cores on the GPU (k3cu_mla) */
     double t_kda_f32, t_kda_conv, t_kda_heads;   /* KDA's f32 projections, a step's conv and heads passes */
+    double t_kda_gpu;                     /* KDA layer steps on the GPU (k3cu_kda), their CPU matmuls too */
     double *t_wait_li; uint64_t *n_dem_li;  /* K3_WAIT_LAYERS: a decode's waits and demand reads, by layer */
     /* K3_PREFETCH: the next MoE layer's experts predicted after a decode step's attention
      * (k3_prefetch): the rows a prediction waits for, the layer it is for, what it marked */
@@ -2071,11 +2072,58 @@ static __attribute__((noinline)) void k3_kda_head(Model *m, const Kda *a, int li
 #endif
     for(int vv=v0;vv<hd;vv++) dst[vv]=oh[vv]*r*a->onw[vv]*sigmoidf_(gpt[(int64_t)h*hd+vv]);
 }
+#ifdef COLI_K3_CUDA
+/* A prompt step's KDA layer on the GPU (k3cu_kda), the by-step path's bytes below: a projection
+ * the card holds runs there on coli_cuda.dll's copy in the kernel w_matmul gets for it
+ * (quant_matmul_blocked, qmb_kernel.cuh), the others here as w_matmul computes them; the conv,
+ * the f32 projections, the heads and o_proj on the card in pieces of rows, the state and the
+ * windows back in the model's memory at the end. 0: the CPU's. K3_GPU_KDA=0: always the CPU's. */
+static int g_k3_kda_gpu=-1;
+static int k3_kda_gpu(Model *m, Kda *a, int li, const float *x, int C, float *out){
+    const Cfg *c=&m->c;
+    const int P=c->kda_proj, H=c->kda_heads, hd=c->kda_hd;
+    if(g_k3_kda_gpu<0){ const char *e=getenv("K3_GPU_KDA"); g_k3_kda_gpu=!e||!*e||atoi(e)!=0; }
+    if(!g_k3_kda_gpu||k3_omp_in_par()||!m->kstate[li]) return 0;
+    double t0=now_s();
+    K3cuKda d; memset(&d,0,sizeof d);
+    d.C=C; d.D=c->hidden; d.H=H; d.hd=hd; d.K=c->conv_k;
+    d.qscale=1.f/sqrtf((float)hd); d.gate_lb=c->gate_lb; d.eps=c->eps;
+    d.fa=a->fa; d.fb=a->fb; d.bp=a->bp; d.A=a->A; d.dt=a->dt; d.onw=a->onw;
+    d.taps[0]=a->conv_q; d.taps[1]=a->conv_k; d.taps[2]=a->conv_v;
+    d.state=m->kstate[li]; d.win[0]=m->cwq[li]; d.win[1]=m->cwk[li]; d.win[2]=m->cwv[li];
+    W *ws[5]={&a->q,&a->k,&a->v,&a->g,&a->o}; K3cuProj *ps[5]={&d.q,&d.k,&d.v,&d.g,&d.o};
+    float *host[5]={0};
+    for(int i=0;i<5;i++){
+        W *w=ws[i]; K3cuProj *p=ps[i];
+#ifdef COLI_CUDA
+        if(w->cuda&&g_k3_cuda_dense){   /* the card's copy, in quant_matmul_blocked's shapes */
+            const void *dw=NULL; const float *dsc=NULL; int gs=0;
+            const int f=coli_cuda_tensor_dev_ptrs((ColiCudaTensor*)w->cuda,&dw,&dsc,&gs), I=i<4?c->hidden:P, O=i<4?P:c->hidden;
+            if((f==1||(f==4&&gs==64))&&w->I==I&&w->O==O&&(I==7168||I==12288)&&O%16==0){
+                p->w=dw; p->s=dsc; p->fmt=f; p->gs=gs; continue;
+            }
+        }
+#endif
+        host[i]=k3_balloc((int64_t)C*P); p->y=host[i];
+        if(i<4) w_matmul(host[i],x,w,C);
+    }
+    int ok=k3cu_kda(&d,x,out);
+    if(ok&&host[4]) w_matmul(out,host[4],&a->o,C);
+    for(int i=0;i<5;i++) k3_bfree(host[i]);
+    if(ok) m->t_kda_gpu+=now_s()-t0;
+    else{ fprintf(stderr,"[K3-CUDA] a KDA layer failed on the GPU: the CPU computes them from here\n"); g_k3_kda_gpu=0; }
+    return ok;
+}
+#endif
 static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float *out){
     Cfg *c=&m->c; Kda *a=&l->a;
     int P=c->kda_proj, H=c->kda_heads, hd=c->kda_hd, K=c->conv_k;
     { static int once=0; if(li==0 && !once){ once=1;
         fprintf(stderr,"[KDA] L%d metal=%d P=%d H=%d hd=%d K=%d\n", li, g_k3_metal, P, H, hd, K); } }
+#ifdef COLI_K3_CUDA
+    /* a prompt step of one sequence (the by-step path's case below) on the GPU */
+    if(C>1&&!m->mux_rows&&K<=7&&g_k3g_on&&C>=g_k3g_min_rows&&!g_k3_dfp&&k3_kda_gpu(m,a,li,x,C,out)) return;
+#endif
     float *q=k3_balloc((int64_t)C*P), *k=k3_balloc((int64_t)C*P), *v=k3_balloc((int64_t)C*P);
     float *gp=k3_balloc((int64_t)C*P), *on=k3_balloc((int64_t)C*P);
     float *t1=k3_balloc((int64_t)C*c->kda_hd), *graw=k3_balloc((int64_t)C*P), *braw=k3_balloc((int64_t)C*H);
@@ -6404,8 +6452,8 @@ int main(int argc, char **argv){
     fprintf(stderr,"[K3] the prompt: attention %.1fs (KDA %.1f, MLA %.1f), MoE %.1fs (router and reads issued %.1f, "
             "latent %.1f, shared %.1f, routed experts computed %.1f, waiting for reads %.1f); %.0f GB read\n",
             m.t_attn,m.t_attn-m.t_mla,m.t_mla,m.t_moe,m.t_route,m.t_lat,m.t_shared,m.t_wave,m.t_eload,m.ebytes/1e9);
-    fprintf(stderr,"[K3] the prompt's KDA on the CPU: f32 projections %.1fs, conv %.1fs, heads %.1fs; "
-            "%.0f page faults\n",m.t_kda_f32,m.t_kda_conv,m.t_kda_heads,k3_page_faults()-pf0);
+    fprintf(stderr,"[K3] the prompt's KDA on the CPU: f32 projections %.1fs, conv %.1fs, heads %.1fs; on the GPU %.1fs; "
+            "%.0f page faults\n",m.t_kda_f32,m.t_kda_conv,m.t_kda_heads,m.t_kda_gpu,k3_page_faults()-pf0);
 #ifdef COLI_CUDA
     k3_cuda_report("prompt");
 #endif

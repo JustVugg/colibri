@@ -293,3 +293,37 @@ reference's bytes); the GPU's calls in pieces of 1,024 rows and the MLA core's s
 Where the 106.5 s go now: attention 30.6 s (KDA 23.8: its resident matmuls 15.5, its CPU
 work 9.6; MLA 6.9), the MoE 72.1 s (routed experts 41.5, shared 10.5, latent 3.1, waiting for
 reads 8.8). C: is the floor: its share of a cold prompt's 1.4 TB takes about 100-108 s.
+
+## The KDA layer on the card (`raw/kda_*`, 2026-11-02)
+
+A prompt step's 69 KDA layers ran their five projections on the card (coli_cuda.dll: each
+call uploading the layer's input and downloading its 12,288 outputs a row) and the rest on
+the CPU: the f32 projections (fa, fb, bp), the short convolutions and the heads (norms,
+decay, recurrence, gated RMSNorm), 9.6 s of the 2,637-token prompt and 20 s of the
+5,862-token one. `k3cu_kda` (coli_cuda_k3.dll) now takes the whole layer in pieces of 512
+rows: the input goes up once, the four projections the card holds run there on
+coli_cuda.dll's own copies (`coli_cuda_tensor_dev_ptrs`) in the kernel w_matmul got for them
+(`quant_matmul_blocked`, now `qmb_kernel.cuh`, compiled into both DLLs), then the conv, the
+f32 projections (matmul_f32.h's 32 lanes, the router's kernel with f32 weights), the norms
+(the squares rounded and added in order: GCC's in-order reduction of k3_kda_head's loop, read
+in its .s), the decay through k3_exact.h's exp_f, the recurrence (a thread a column of the
+head's state, in registers; the two sweeps' fused adds in k3_kda_head's order), the per-head
+RMSNorm (its sum in double, in order) and the gate, and o_proj; the output comes back, and
+the state and conv windows at the end of the layer. A projection the card does not hold is
+computed as before and handed in. The KDA pieces and the MLA core share one device buffer
+(they never run at once), so the card holds no more than before.
+
+| run | what | result |
+|---|---|---:|
+| `tests/test_k3_cuda_experts.c --kda` | kda_forward through k3cu_kda against its by-step path on the CPU: the tiny model's shapes, K3's with every projection on the card (1,100 rows: 3 pieces), K3's with k and o on the card | 0 of 12.2 M outputs, 0 of the state and windows differ |
+| `k3tiny.sh`, `k3tiny_big.sh` | the tiny model at steps of 1 to 8,192 (`K3_GPU_MIN_ROWS=1`) | the same logits as the build before; 40-token decode the same |
+| `kda_2637_logits`, `kda_5862_logits` (`series_kda.sh`) | the logits of every position: 2,637 tokens against `long_ref`, 5,862 against `big6k_4096` | the same bytes |
+| `kda_2637_new*`, `kda_2637_old*` | A/B twice, the build before in `pre_kda/` | **105.5, 106.0 s** against 106.6, 106.6 s: KDA 24 -> 11.8 s, waiting for reads 7 -> 20-24 s |
+| `kda_5862_new`, `kda_5862_old` | the same at 5,862 tokens | **149.2 s** against 173.7 s: KDA 50.4 -> 25.2 s |
+
+The 2,637-token prompt waits for C: as before (its 1.4 TB of reads take about 100-108 s):
+the 12 s the layers saved went into waiting for reads. At 5,862 tokens the layers take 23.3
+s on the card, 0.34 s a layer, nearly all of it the five quant_matmul_blocked projections
+(53 ms each at 5,862 rows); the MoE (97.7 s: routed experts 51.4 with 65.6 s of copying
+their bytes, shared experts 20.5) is now the prompt's larger part. The card's memory: peaks
+of 23.5-23.8 GB in both builds, the desktop's share varying by 0.3 GB.

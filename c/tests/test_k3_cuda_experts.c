@@ -255,9 +255,89 @@ static int check_shared(int C, int D, int MI, int ns, int gs){
     return !ok || diff;
 }
 
+/* 7. A prompt step's KDA layer: kda_forward through k3cu_kda against its by-step path on the
+ *    CPU, the output, the recurrent state and the conv windows the same bytes. The projections
+ *    in the mask `card` (1 q, 2 k, 4 v, 8 g, 16 o) go to coli_cuda.dll first: the CPU path then
+ *    multiplies them there (w_matmul), the GPU path on that copy in its own kernel; the others
+ *    stay the host's. Rows in several of k3cu_kda's pieces. */
+static int g_cuda_up = -1;
+static void kda_rand(float *p, size_t n, float s){ for(size_t i = 0; i < n; i++) p[i] = rndf() * s; }
+static int check_kda(int C, int D, int H, int hd, int K, int card){
+    const int P = H * hd;
+    Model *m = calloc(1, sizeof(Model));
+    Layer *l = calloc(1, sizeof(Layer));
+    m->c.hidden = D; m->c.kda_heads = H; m->c.kda_hd = hd; m->c.kda_proj = P; m->c.conv_k = K;
+    m->c.gate_lb = -5.0f; m->c.eps = 1e-5f;
+    l->kda = 1;
+    Kda *a = &l->a;
+    W *ws[5] = {&a->q, &a->k, &a->v, &a->g, &a->o};
+    for(int i = 0; i < 5; i++){ const int I = i < 4 ? D : P; rand_i4(ws[i], i < 4 ? P : D, I, I < 64 ? I : 64); }
+    a->fa = malloc((size_t)hd * D * 4); a->fb = malloc((size_t)P * hd * 4); a->bp = malloc((size_t)H * D * 4);
+    a->conv_q = malloc((size_t)P * K * 4); a->conv_k = malloc((size_t)P * K * 4); a->conv_v = malloc((size_t)P * K * 4);
+    a->dt = malloc((size_t)P * 4); a->A = malloc((size_t)H * 4); a->onw = malloc((size_t)hd * 4);
+    kda_rand(a->fa, (size_t)hd * D, 0.02f); kda_rand(a->fb, (size_t)P * hd, 0.2f); kda_rand(a->bp, (size_t)H * D, 0.02f);
+    kda_rand(a->conv_q, (size_t)P * K, 0.5f); kda_rand(a->conv_k, (size_t)P * K, 0.5f); kda_rand(a->conv_v, (size_t)P * K, 0.5f);
+    kda_rand(a->dt, (size_t)P, 0.5f);
+    for(int h = 0; h < H; h++) a->A[h] = 1.0f + 0.25f * rndf();
+    for(int e = 0; e < hd; e++) a->onw[e] = 1.0f + 0.1f * rndf();
+    float *kst = malloc((size_t)H * hd * hd * 4), *win[3], *st0 = malloc((size_t)H * hd * hd * 4), *w0[3], *stc = malloc((size_t)H * hd * hd * 4), *wc[3];
+    kda_rand(st0, (size_t)H * hd * hd, 0.1f);
+    for(int w = 0; w < 3; w++){
+        win[w] = malloc((size_t)P * K * 4); w0[w] = malloc((size_t)P * K * 4); wc[w] = malloc((size_t)P * K * 4);
+        kda_rand(w0[w], (size_t)P * K, 1.0f);
+    }
+    m->kstate = &kst; m->cwq = &win[0]; m->cwk = &win[1]; m->cwv = &win[2];
+    float *x = malloc((size_t)C * D * 4), *oc = malloc((size_t)C * D * 4), *og = malloc((size_t)C * D * 4);
+    kda_rand(x, (size_t)C * D, 1.0f);
+    int up = 1;
+    if(card){
+        if(g_cuda_up < 0){ int dev = 0; g_cuda_up = coli_cuda_init(&dev, 1) ? 1 : 0; g_k3_cuda_dev = 0; }
+        if(!g_cuda_up){ printf("KDA: no coli_cuda.dll: the card's projections skipped\n"); card = 0; }
+        for(int i = 0; i < 5 && card; i++)
+            if(card >> i & 1)
+                up &= coli_cuda_tensor_upload_g((ColiCudaTensor **)&ws[i]->cuda, ws[i]->q4, ws[i]->s, 4, ws[i]->I, ws[i]->O, 0, 64);
+        g_k3_cuda_dense = card != 0;
+    }
+    /* the CPU's: the by-step path */
+    memcpy(kst, st0, (size_t)H * hd * hd * 4);
+    for(int w = 0; w < 3; w++) memcpy(win[w], w0[w], (size_t)P * K * 4);
+    g_k3_kda_gpu = 0; g_k3g_on = 0;
+    kda_forward(m, l, 0, x, C, oc);
+    memcpy(stc, kst, (size_t)H * hd * hd * 4);
+    for(int w = 0; w < 3; w++) memcpy(wc[w], win[w], (size_t)P * K * 4);
+    /* the GPU's */
+    memcpy(kst, st0, (size_t)H * hd * hd * 4);
+    for(int w = 0; w < 3; w++) memcpy(win[w], w0[w], (size_t)P * K * 4);
+    g_k3_kda_gpu = 1; g_k3g_on = 1; m->t_kda_gpu = 0;
+    memset(og, 0xff, (size_t)C * D * 4);
+    kda_forward(m, l, 0, x, C, og);
+    const int ran = m->t_kda_gpu > 0;
+    g_k3g_on = 0; g_k3_cuda_dense = 0;
+    size_t dout = 0, dst = 0, dwin = 0, first = (size_t)-1;
+    for(size_t i = 0; i < (size_t)C * D; i++) if(memcmp(oc + i, og + i, 4)){ if(first == (size_t)-1) first = i; dout++; }
+    for(size_t i = 0; i < (size_t)H * hd * hd; i++) if(memcmp(stc + i, kst + i, 4)) dst++;
+    for(int w = 0; w < 3; w++) for(size_t i = 0; i < (size_t)P * K; i++) if(memcmp(wc[w] + i, win[w] + i, 4)) dwin++;
+    if(dout) printf("  output %zu: CPU %a, device %a\n", first, oc[first], og[first]);
+    printf("KDA %d heads of %d, %d columns, conv %d, card's projections 0x%02x, %d rows: %s%zu of %zu outputs, %zu of %zu state, "
+           "%zu of %zu window values differ\n", H, hd, D, K, card, C, ran && up ? "" : "FAILED to run on the GPU; ",
+           dout, (size_t)C * D, dst, (size_t)H * hd * hd, dwin, (size_t)3 * P * K);
+    for(int i = 0; i < 5; i++){ if(ws[i]->cuda) coli_cuda_tensor_free((ColiCudaTensor *)ws[i]->cuda); free(ws[i]->q4); free(ws[i]->s); }
+    free(a->fa); free(a->fb); free(a->bp); free(a->conv_q); free(a->conv_k); free(a->conv_v); free(a->dt); free(a->A); free(a->onw);
+    free(kst); free(st0); free(stc);
+    for(int w = 0; w < 3; w++){ free(win[w]); free(w0[w]); free(wc[w]); }
+    free(x); free(oc); free(og); free(l); free(m);
+    return !ran || !up || dout || dst || dwin;
+}
+
 int main(int argc, char **argv){
     int all = argc > 1 && !strcmp(argv[1], "--all-floats");
     if(!k3cu_init(0)){ printf("no CUDA device or coli_cuda_k3.dll: skipped\n"); return 0; }
+    if(argc > 1 && !strcmp(argv[1], "--kda")){   /* the KDA layer's cases alone */
+        int bad = check_kda(40, 128, 2, 16, 4, 0) + check_kda(1100, 7168, 96, 128, 4, 0x1f) + check_kda(600, 7168, 96, 128, 4, 0x12);
+        k3cu_report();
+        printf(bad ? "FAILED\n" : "ok\n");
+        return bad ? 1 : 0;
+    }
     int bad = check_exact(all);
     const int real[] = { 1, 9, 64, 300, 1100, 2, 17, 8, 33, 5, 3 };
     bad += check_experts(3584, 3072, 4.0f, 25.0f, real, (int)(sizeof real / sizeof real[0]));
@@ -278,6 +358,9 @@ int main(int argc, char **argv){
     bad += check_shared(40, 1024, 768, 2, 64);
     bad += check_shared(1030, 256, 128, 1, 32);
     bad += check_shared(300, 7168, 3072, 2, 64);   /* Kimi K3's, through k3_dense_b */
+    bad += check_kda(40, 128, 2, 16, 4, 0);         /* the tiny model's shapes, every projection the host's */
+    bad += check_kda(1100, 7168, 96, 128, 4, 0x1f); /* Kimi K3's, every projection on the card: 3 pieces */
+    bad += check_kda(600, 7168, 96, 128, 4, 0x12);  /* k and o on the card, q, v and g the host's */
     k3cu_report();
     printf(bad ? "FAILED\n" : "ok\n");
     return bad ? 1 : 0;

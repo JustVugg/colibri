@@ -1032,7 +1032,7 @@ backend_xdna.o: backend_xdna.c .build-config
 # shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a
 # "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
 # __declspec(dllexport) so the 15 API symbols are exported.
-cuda-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h
+cuda-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h qmb_kernel.cuh
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	# The banner is localized ("for x64" / "per x64" / "pour x64"): match the arch token only (#1531).
@@ -1062,7 +1062,7 @@ cuda-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda.h cuda_chain.h cu_
 # survives. No path is hardcoded — see the HIP SDK contract above.
 #
 #   make hip-dll HIP_DLL=1 HIP_SDK_ROOT=<sdk> HIP_ARCH=gfx1151
-hip-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h backend_gpu_compat.h
+hip-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h backend_gpu_compat.h qmb_kernel.cuh
 	@test -x "$(HIPCC)" || command -v "$(HIPCC)" >/dev/null 2>&1 || { echo "hipcc not found at \"$(HIPCC)\": set HIP_SDK_ROOT=<path>, HIP_BIN_DIR=<path> or HIPCC=<path>" >&2; exit 1; }
 	@test -d "$(HIP_INCLUDE_DIR)" || { echo "HIP include dir not found: \"$(HIP_INCLUDE_DIR)\" — set HIP_INCLUDE_DIR=<path>" >&2; exit 1; }
 	@test -f "$(HIP_INCLUDE_DIR)/hip/hip_runtime.h" || { echo "hip/hip_runtime.h missing under \"$(HIP_INCLUDE_DIR)\" — set HIP_INCLUDE_DIR=<path>" >&2; exit 1; }
@@ -1081,7 +1081,7 @@ backend_cuda_ink.o: backend_cuda_ink.cu backend_cuda_ink.h .build-config
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_ink.cu -o $@
 
-backend_cuda.o: backend_cuda.cu backend_cuda.h cuda_bd.cuh cuda_chain.h fp8_format.h backend_gpu_compat.h .build-config
+backend_cuda.o: backend_cuda.cu backend_cuda.h cuda_bd.cuh qmb_kernel.cuh cuda_chain.h fp8_format.h backend_gpu_compat.h .build-config
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) -c backend_cuda.cu -o $@
 
@@ -2120,7 +2120,7 @@ tests/test_k3_mla_scores$(EXE): tests/test_k3_mla_scores.c kimi_k3.c $(VK_OBJ)
 
 # coli_cuda_k3.dll against kimi_k3.c, bit for bit (skipped without the DLL or a device)
 tests/test_k3_cuda_experts$(EXE): tests/test_k3_cuda_experts.c kimi_k3.c backend_cuda_k3_loader.c backend_cuda_k3.h $(CUDA_OBJ) $(VK_OBJ)
-	$(CC) $(CFLAGS) $< backend_cuda_k3_loader.c $(CUDA_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) $(K3_CUDA_FLAGS) $< backend_cuda_k3_loader.c $(CUDA_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_k3_mmap$(EXE): tests/test_k3_mmap.c kimi_k3.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)

@@ -414,7 +414,8 @@ int4 projection takes 0.06 ms a decode row against 0.90 ms on 16 Zen 4 cores, th
 163840 x 7168 int8 head 1.2 ms against 18.4 (`tests/bench_k3_cuda_dense.c`; one row runs
 `quant_matvec_warp`, quant_matmul's sums and tree a warp an output, so its bytes).
 `kv_b` stays on the CPU (the MLA absorb reads its rows), and so do the routers and
-KDA's small f32 projections, so the routing is the CPU's arithmetic on its input. The
+KDA's small f32 projections, so the routing is the CPU's arithmetic on its input (a prompt
+step with `coli_cuda_k3.dll` multiplies them on the card in that same arithmetic, below). The
 routers stay in the checkpoint's BF16 (`Moe.router16`): `k3_dot_bf16w` widens each weight
 to its f32 in the f32 kernel's 32 lanes, fused adds and halving tree, so the scores are
 the f32 copy's bits (the tiny model's logits, routers stored as BF16 or as the same values
@@ -479,10 +480,23 @@ way.
   every output adds its terms in order. It grows with the square of the context.
 - **The routers** (`k3cu_router`): the bf16 router's 32 lanes and halving tree, a warp an
   output.
+- **The KDA layers** (`k3cu_kda`): kda_forward's by-step path in pieces of
+  `K3_GPU_KDA_ROWS` (512) rows, the layer's input up once and its output back. The
+  projections the card holds run on coli_cuda.dll's own copies (`coli_cuda_tensor_dev_ptrs`)
+  in the kernel `w_matmul` gets for them there (`quant_matmul_blocked`, `qmb_kernel.cuh`,
+  compiled into both DLLs), the others are computed as before and handed in; then the conv
+  (its taps fused in order, SiLU through exp_f), the f32 projections (matmul_f32.h's 32 lanes),
+  k3_kda_head's norms (the squares rounded and added in order, GCC's in-order reduction),
+  decay, recurrence (a thread a column of the head's state, in registers, the two sweeps'
+  fused adds in order) and gated RMSNorm (its sum in double), and o_proj. The state and the
+  conv windows go back to the model's memory at the end of the layer. The pieces share one
+  device buffer with the MLA core, which never runs at the same time. A 5,862-token prompt
+  173.7 -> 149.2 s on the RTX 4090 (KDA 50.4 -> 25.2 s); `K3_GPU_KDA=0` keeps the layers on
+  the CPU.
 
-The rest of a prompt step stays on the CPU, faster too: KDA's gates, output gate and the
-conv's SiLU 8 at a time through `exp_f8` (exp_f's bits), and the routing's rows over every
-worker (the same picks). `tests/test_k3_cuda_experts.c` checks every kernel against the
+The rest of a prompt step stays on the CPU, faster too: the conv's and gates' exp_f 8 at a
+time through `exp_f8` where KDA runs there (decode, `K3_GPU_KDA=0`), and the routing's rows
+over every worker (the same picks). `tests/test_k3_cuda_experts.c` checks every kernel against the
 code it replaces, byte for byte; the tiny model's logits at steps of 1 to 2,048 (with
 `K3_GPU_MIN_ROWS=1`, every step on the card) and the real model's are the CPU build's.
 
@@ -505,6 +519,8 @@ the RAM).
 | `K3_GPU_CPU_WAVE` | 4 | the experts the CPU takes at a time beside the card |
 | `K3_GPU_PIN_GB` | 64 | the expert slots' pinned memory, GiB |
 | `K3_GPU_DENSE_B` | 1 | the dense matrices' and shared experts' int4 groups of 64 through `k3_dense_b` from 64 rows (0: `k3_dense`) |
+| `K3_GPU_KDA` | 1 | a prompt step's KDA layers on the card, `k3cu_kda` (0: the CPU's) |
+| `K3_GPU_KDA_ROWS` | 512 | the rows of a KDA layer's piece on the card |
 | `K3_READAHEAD_GB` | 20 with the card, else 0 | the read-ahead pool, counted in the RAM budget |
 
 ## Current limitations

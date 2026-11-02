@@ -127,6 +127,8 @@ typedef size_t         (*fn_tensor_bytes)(const ColiCudaTensor *tensor);
 typedef size_t         (*fn_tensor_vram)(const ColiCudaTensor *tensor);
 typedef size_t         (*fn_alloc_footprint)(size_t bytes);
 typedef int            (*fn_tensor_device)(const ColiCudaTensor *tensor);
+typedef int            (*fn_tensor_dev_ptrs)(const ColiCudaTensor *tensor, const void **weights,
+                                             const float **scales, int *gs);
 
 /* --- #111 GPU resident pipeline additions (matched to backend_cuda.h) --- */
 
@@ -213,6 +215,7 @@ static struct {
     fn_tensor_vram     tensor_vram;
     fn_alloc_footprint alloc_footprint;
     fn_tensor_device   tensor_device;
+    fn_tensor_dev_ptrs tensor_dev_ptrs;   /* optional: Kimi K3's KDA layer in coli_cuda_k3.dll */
 
     fn_attention_absorb_batch attention_absorb_batch;
     fn_attention_absorb_batch_dev attention_absorb_batch_dev;
@@ -1472,6 +1475,7 @@ static int coli_cuda_load(void){
     RESOLVE_OPT(fp8_set_lut, fn_fp8_set_lut)
     RESOLVE(matmul,         fn_matmul)
     RESOLVE_OPT(matmul_tiled,   fn_matmul)   /* Kimi K3's prompt rows; an older DLL: the plain matmul */
+    RESOLVE_OPT(tensor_dev_ptrs, fn_tensor_dev_ptrs)   /* an older DLL: Kimi K3's KDA stays off the GPU */
     /* Kimi K3's MXFP4 expert matmul. Optional: a DLL built before it exports
      * nothing by this name, and the wrapper's 0 is the engine's own "fall back
      * to CPU" result, so an older DLL still serves GLM and Qwen3.6 (#1405). */
@@ -1765,6 +1769,12 @@ int coli_cuda_expert_mxfp4(float *y, const float *x,
 
 void coli_cuda_tensor_free(ColiCudaTensor *tensor){
     if(g_cuda.available && g_cuda.tensor_free) g_cuda.tensor_free(tensor);
+}
+
+int coli_cuda_tensor_dev_ptrs(const ColiCudaTensor *tensor, const void **weights,
+                              const float **scales, int *gs){
+    if(!g_cuda.available || !g_cuda.tensor_dev_ptrs) return -1;
+    return g_cuda.tensor_dev_ptrs(tensor, weights, scales, gs);
 }
 
 size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor){

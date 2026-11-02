@@ -506,6 +506,8 @@ Read **only** by `c/kimi_k3.c`. The K3 engine has its own loader, cache and quan
 | `K3_GPU_MIN_ROWS` | `32` | The prompt rows a step needs before the card takes its parts (`1` in tests). |
 | `K3_GPU_CPU_WAVE` | `4` | Experts the CPU computes at a time beside the card. |
 | `K3_GPU_DENSE_B` | `1` | A prompt step's dense matrices the card does not hold and its shared experts, int4 groups of 64 from 64 rows: `k3_dense_b` (an output's 8 lanes in one thread, 4 rows by 6 outputs; the CPU's bytes, about 4x `k3_dense`). `0`: `k3_dense`. |
+| `K3_GPU_KDA` | `1` | A prompt step's KDA layers on the card (`k3cu_kda`): the projections `K3_CUDA_DENSE` placed on coli_cuda.dll's copies in the same kernel, the conv, f32 projections, norms, recurrence and gated RMSNorm in the CPU's arithmetic, o_proj; the state and conv windows back at the end of the layer. The same bytes. `0`: the CPU's. |
+| `K3_GPU_KDA_ROWS` | `512` | The rows of a KDA layer's piece on the card (a multiple of 8). The pieces share one device buffer with the MLA core. |
 | `K3_GPU_PIN_GB` | `64` | Pinned memory for the expert cache's slots, GiB (the card copies from it without the driver's staging copy; Windows takes VRAM for pinned memory past about half the RAM). |
 | `K3_READAHEAD_GB` | `20` with the card, else `0` | A large prompt step's read-ahead pool: the next MoE layer's experts read while this one computes. Counted in the RAM budget before the expert cache. |
 | `K3_DIRECT` | `1` (on) | Use `O_DIRECT`/unbuffered reads for expert loads. `=0` for buffered. |
