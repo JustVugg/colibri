@@ -434,6 +434,7 @@ int main(void) {
         check_moe(pairs[i][0], pairs[i][1], 3, 8, 16, 1024, 768);
         check_moe(pairs[i][0], pairs[i][1], 40, 8, 16, 1024, 768);
     }
+    for (int g : {22, 16, 29}) for (int S : {2, 4}) check_moe(g, 42, S, 10, 24, 2560, 640);   /* Qwen3.8-Flash-Next IQ2_XS's experts, a verify's rows */
     if (bench) {
         printf("BENCH (rows of x: 1 2 3 4)\n");
         const int bt[] = {12, 14, 8, 17, 22, 16, 21, 23, 11, 10};

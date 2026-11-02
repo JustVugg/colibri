@@ -87,12 +87,12 @@ __device__ __forceinline__ void bdx_u4(const BdX &X, int r, int k, int *w) {
     uint4 v = X.q[r * X.qr + bd_x4(k)];
     w[0] = (int)v.x; w[1] = (int)v.y; w[2] = (int)v.z; w[3] = (int)v.w;
 }
-/* block b (32 inputs) of row r of x as gq_quant_act_ref quantizes it, into BdX's layout at q,
- * dx and xs (shared or global memory) */
-__device__ __forceinline__ void bdx_quant_block(const float *__restrict__ x, int I, int r, int b, uint4 *q, float *dx, int *xs) {
+/* block b (32 inputs) of a row of I inputs at xr as gq_quant_act_ref quantizes it, into BdX's
+ * layout at q, dx and xs (shared or global memory) as row r */
+__device__ __forceinline__ void bdx_quant_block(const float *__restrict__ xr, int I, int r, int b, uint4 *q, float *dx, int *xs) {
     int nb = I / 32, qr = bd_xq_row(I);
     {
-        const float4 *src = reinterpret_cast<const float4 *>(x + (size_t)r * I + 32 * b);
+        const float4 *src = reinterpret_cast<const float4 *>(xr + 32 * b);
         float v[32], amax = 0.f;
         #pragma unroll
         for (int j = 0; j < 8; j++) {
@@ -126,16 +126,22 @@ __device__ __forceinline__ void bdx_quant_block(const float *__restrict__ x, int
  * at q (BdX's layout); the block syncs after */
 __device__ __forceinline__ void bdx_quant(const float *__restrict__ x, int nrow, int I, uint4 *q, float *dx, int *xs) {
     int nb = I / 32;
-    for (int k = threadIdx.x; k < nrow * nb; k += blockDim.x) bdx_quant_block(x, I, k / nb, k % nb, q, dx, xs);
+    for (int k = threadIdx.x; k < nrow * nb; k += blockDim.x) bdx_quant_block(x + (size_t)(k / nb) * I, I, k / nb, k % nb, q, dx, xs);
 }
 /* every row of x (S rows of I inputs) quantized once, into global memory in BdX's layout, for the
  * GEMV's blocks to read (bd_gemv_i8_k with gq): each block quantized the rows itself, which for
  * a wide row cost more than its weights (an IQ4_XS 2048 x 8192 at two rows: 44 against 28 us
  * for 8192 x 2048). The same quantization, the same bits. */
-__global__ static void __launch_bounds__(256) bdx_quant_k(const float *__restrict__ x, int S, int I, uint4 *q, float *dx, int *xs) {
-    COLI_PDL_WAIT();
+__global__ static void __launch_bounds__(256) bdx_quant_k(const float *__restrict__ x, int S, int I, uint4 *q, float *dx, int *xs, int xr) {
+    COLI_PDL_WAIT();   /* xr: x's row stride in floats (I: its rows packed) */
     int nb = I / 32, k = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    if (k < S * nb) bdx_quant_block(x, I, k / nb, k % nb, q, dx, xs);
+    if (k < S * nb) bdx_quant_block(x + (size_t)(k / nb) * xr, I, k / nb, k % nb, q, dx, xs);
+}
+/* bdx_quant_k's launch: S rows of I inputs (row stride xr) into the global form at gq (bd_x_bytes(I, S)) */
+static inline void bdx_quant_launch(const float *x, int S, int I, int xr, uint4 *gq, cudaStream_t st) {
+    const int nq = S * (I / 32);
+    float *dx = (float *)(gq + (size_t)S * bd_xq_row(I));
+    coli_launch(bdx_quant_k, dim3((unsigned)((nq + 255) / 256)), 256, 0, st, x, S, I, gq, dx, (int *)(dx + (size_t)S * (I / 32)), xr);
 }
 
 /* 0xFF in each byte whose bit (of the low four) is set: those bytes are negated */
@@ -1148,9 +1154,7 @@ static int bd_gemv_i8_launch(float *y, const float *x, const bd_u32 *W, const bd
     if (bd_gemv_preq(I, nr, bx, block_bytes)) {
         gq = (const uint4 *)bd_xq_scratch(st, bd_x_bytes(I, S));
         if (gq) {
-            const int nq = S * (I / 32);
-            coli_launch(bdx_quant_k, dim3((unsigned)((nq + 255) / 256)), 256, 0, st, x, S, I, (uint4 *)gq,
-                        (float *)(gq + (size_t)S * bd_xq_row(I)), (int *)((float *)(gq + (size_t)S * bd_xq_row(I)) + (size_t)S * (I / 32)));
+            bdx_quant_launch(x, S, I, I, (uint4 *)gq, st);
             sm = (size_t)bd_tab_words(T) * 4;   /* the tables alone */
         }
     }
