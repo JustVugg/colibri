@@ -1798,6 +1798,35 @@ static int cc_finish(void) {
 }
 
 /* ---- transfers ------------------------------------------------------------------ */
+/* A copy of up to CC_COPY_K_MAX bytes by a kernel, mapped host memory on either side or none:
+ * cudaMemcpyAsync takes a copy engine, and a frame's small copies waited there behind the
+ * megabytes of the experts the chain promotes (cc_host_up) on another stream (Qwen3.8 on an RTX
+ * PRO 4000: a draft's first kernel up to 12.5 ms late). The same floats; COLI_CUDA_COPY_K=0 keeps
+ * the engine. Regions of a copy the same way (cc_regions_k), up to CC_REG_K a launch. */
+#define CC_COPY_K_MAX ((size_t)1 << 20)
+__global__ static void cc_copy_k(float *__restrict__ d, const float *__restrict__ s, long long n) {
+    COLI_PDL_WAIT();
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x, st = (long long)gridDim.x * blockDim.x;
+    if ((((uintptr_t)d | (uintptr_t)s) & 15) == 0) {
+        long long n4 = n / 4;
+        for (long long k = i; k < n4; k += st) reinterpret_cast<float4 *>(d)[k] = reinterpret_cast<const float4 *>(s)[k];
+        for (long long k = n4 * 4 + i; k < n; k += st) d[k] = s[k];
+    } else
+        for (long long k = i; k < n; k += st) d[k] = s[k];
+}
+#define CC_REG_K 128
+typedef struct { unsigned n, d[CC_REG_K], s[CC_REG_K], len[CC_REG_K]; } CcRegK;   /* offsets and counts in floats */
+__global__ static void cc_regions_k(float *__restrict__ d, const float *__restrict__ s, CcRegK r) {
+    COLI_PDL_WAIT();
+    const unsigned i = blockIdx.x;
+    if (i >= r.n) return;
+    for (unsigned j = threadIdx.x; j < r.len[i]; j += blockDim.x) d[r.d[i] + j] = s[r.s[i] + j];
+}
+static int cc_copy_k_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_COPY_K"); on = !(e && *e == '0'); }
+    return on;
+}
 static int cc_copy(CcBuf *dst, size_t doff, CcBuf *src, size_t soff, size_t n) {
     CcCtx *c = live();
     if (!c || !dst || !src) return 0;
@@ -1807,6 +1836,13 @@ static int cc_copy(CcBuf *dst, size_t doff, CcBuf *src, size_t soff, size_t n) {
     g_st.ops++;
     if (dst->kind != CC_DEV) g_st.bytes_down += n * 4;
     if (src->kind != CC_DEV) g_st.bytes_up += n * 4;
+    if (n * 4 <= CC_COPY_K_MAX && cc_copy_k_on()) {
+        size_t blocks = (n / 4 + 255) / 256;
+        if (blocks < 1) blocks = 1;
+        if (blocks > 256) blocks = 256;
+        coli_launch(cc_copy_k, dim3((unsigned)blocks), 256, 0, c->stream, dst->d + doff, src->d + soff, (long long)n);
+        return launched(c, "copy (kernel)");
+    }
     return cc_ok(c, cudaMemcpyAsync(dst->d + doff, src->d + soff, n * 4, cudaMemcpyDefault, c->stream), "copy");
 }
 static int cc_zero(CcBuf *dst, size_t off, size_t n) {
@@ -1875,6 +1911,18 @@ static int cc_copy_regions(CcBuf *dst, CcBuf *src, const CcRegion *r, int n) {
     if (!c || !dst || !src || (n > 0 && !r)) return 0;
     for (int i = 0; i < n; i++)
         if ((r[i].dst + r[i].n) * 4 > dst->bytes || (r[i].src + r[i].n) * 4 > src->bytes) return 0;
+    int small = n > 0 && cc_copy_k_on();
+    for (int i = 0; i < n && small; i++) small = r[i].n * 4 <= CC_COPY_K_MAX && r[i].dst + r[i].n < (1ull << 32) && r[i].src + r[i].n < (1ull << 32);
+    if (small && !(n >= 2 && dst != src && cc_grid_run(r, n) == n)) {   /* scattered regions: a block each, by kernel */
+        for (int i = 0; i < n; i += CC_REG_K) {
+            CcRegK k; k.n = (unsigned)(n - i < CC_REG_K ? n - i : CC_REG_K);
+            for (unsigned j = 0; j < k.n; j++) { k.d[j] = (unsigned)r[i + j].dst; k.s[j] = (unsigned)r[i + j].src; k.len[j] = (unsigned)r[i + j].n; }
+            coli_launch(cc_regions_k, dim3(k.n), 128, 0, c->stream, dst->d, src->d, k);
+            if (!launched(c, "copy regions (kernel)")) return 0;
+        }
+        g_st.ops++;
+        return 1;
+    }
     CcGrid g;
     const int grids = dst != src && dst->d && src->d;
     for (int i = 0; i < n; ) {
