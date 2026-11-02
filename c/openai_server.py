@@ -1947,7 +1947,8 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
             raise APIError(400, "System message must be at the beginning.",
                            f"messages.{index}.role")
         raw = message.get("content")
-        text = content_text(raw, f"messages.{index}.content").strip() if raw is not None else ""
+        raw_text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        text = raw_text.strip()
         if not add_generation_prompt and role == "assistant" and index == len(messages) - 1:
             # Continued turn: the template gives a post-query assistant turn a <think></think>
             # block, then the model resumes the content. Match it, minus the terminator/cue.
@@ -1994,7 +1995,7 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
                 rendered = text
             calls = message.get("tool_calls")
             if calls:
-                rendered += _qwen_tool_calls(calls, bool(text.strip()), index)
+                rendered += _qwen_tool_calls(calls, raw_text, index)
             parts.append(f"<|im_start|>assistant\n{rendered}<|im_end|>\n")
             continue
         parts.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
@@ -2029,7 +2030,7 @@ def _qwen_tool_block(tools):
     return "".join(lines)
 
 
-def _qwen_tool_calls(tool_calls, has_content, index):
+def _qwen_tool_calls(tool_calls, content, index):
     """Render assistant tool_calls. The template separates the FIRST call from
     preceding content with a blank line only when that content is non-empty, and
     every later call with a single newline; getting that wrong changes the prompt
@@ -2049,7 +2050,13 @@ def _qwen_tool_calls(tool_calls, has_content, index):
         if not isinstance(name, str) or not name:
             raise APIError(400, "`function.name` must be a non-empty string.",
                            f"messages.{index}.tool_calls.{position}.function.name")
-        lead = ("\n\n" if has_content else "") if position == 0 else "\n"
+        lead = "\n"
+        if position == 0:
+            # Streaming clients can echo the model's original separator.
+            lead = "\n\n" if content.strip() else ""
+            # With multiple calls, the parser folds inter-call whitespace into content.
+            if len(tool_calls) == 1 and lead and content.endswith("\n") and not content.endswith("\n\n"):
+                lead = "\n"
         out.append(f"{lead}<tool_call>\n<function={name}>\n")
         args = fn.get("arguments", "")
         if isinstance(args, str) and args:
@@ -3315,8 +3322,8 @@ def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, to
             raise APIError(400, "System message must be at the beginning.",
                            f"messages.{index}.role")
         raw = message.get("content")
-        text = (content_text(raw, f"messages.{index}.content").strip()
-                if raw is not None else "")
+        raw_text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        text = raw_text.strip()
         if role == "tool":
             # Consecutive tool results share ONE user turn: the opening tag is
             # written only when the previous message was not a tool, and the
@@ -3343,7 +3350,7 @@ def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, to
             calls = message.get("tool_calls")
             rendered = f"<think>\n{reasoning.strip()}\n</think>\n\n{text}"
             if calls:
-                rendered += _qwen_tool_calls(calls, bool(text.strip()), index)
+                rendered += _qwen_tool_calls(calls, raw_text, index)
             # A continued turn is the last message rendered open: no <|im_end|>, no cue.
             terminator = "" if (not add_generation_prompt and index == len(messages) - 1) \
                 else "<|im_end|>\n"
