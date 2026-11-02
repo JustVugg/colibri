@@ -492,6 +492,15 @@ way.
   step goes in chunks of up to 256 rows whose scores fit in 128 MB, a chunk's rows going up
   and its outputs down while the next one computes. It grows with the square of the
   context: at 5,862 tokens 4.0 s, 11.6 s in the 64-by-64 tiles of 4 by 4 a thread before.
+- **The gated MLA layers whole** (`k3cu_mla_layer`) in those chunks: x up, then qa, its
+  RMSNorm (its squares summed in double in order, as `rmsnorm_`) and qb, kva into the cache
+  rows (RMSNorm on the latent, the rope part as it is, written back to the model's cache),
+  the gate, the core and o_proj, the output down. A matrix the card holds runs on
+  coli_cuda.dll's copy in the kernel `w_matmul` gets for it there (`quant_matmul_blocked`),
+  the others from their host weights in `k3cu_matmul`'s kernels; where a held matrix has no
+  `quant_matmul_blocked` shape, or `K3_GPU_MLA=0`, the layer goes call by call around the
+  core as before, every matrix's input up and output back. At 5,862 tokens the layers 11.2
+  -> 9.0 s (the prompt 122.2 -> 121.0 s), at 2,637 tokens 4.5 -> 3.2 s (C:'s reads its floor).
 - **The routers** (`k3cu_router`): the bf16 router's 32 lanes and halving tree, a warp an
   output.
 - **The KDA layers** (`k3cu_kda`): kda_forward's by-step path in pieces of
@@ -534,6 +543,7 @@ the RAM).
 | `K3_GPU_PIN_GB` | 64 | the expert slots' pinned memory, GiB |
 | `K3_GPU_DENSE_B` | 1 | the dense matrices' and shared experts' int4 groups of 64 through `k3_dense_b` from 64 rows (0: `k3_dense`) |
 | `K3_GPU_KDA` | 1 | a prompt step's KDA layers on the card, `k3cu_kda` (0: the CPU's) |
+| `K3_GPU_MLA` | 1 | a prompt step's gated MLA layers whole on the card, `k3cu_mla_layer` (0: call by call around the core) |
 | `K3_GPU_KDA_ROWS` | 512 | the rows of a KDA layer's piece on the card |
 | `K3_READAHEAD_GB` | 20 with the card, else 0 | the read-ahead pool, counted in the RAM budget |
 

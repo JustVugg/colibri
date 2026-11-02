@@ -25,6 +25,7 @@ static int (*p_router)(float *, const float *, const uint16_t *, int, int, int);
 static int (*p_shared)(float *, const float *, int, int, int, const uint8_t *, const float *, const uint8_t *,
                        const float *, int, const uint8_t *, const float *, int, float, float);
 static int (*p_kda)(const K3cuKda *, const float *, float *);   /* optional: an older DLL lacks it */
+static int (*p_mla_layer)(const K3cuMlaLayer *, const float *, float *);   /* optional too */
 static void (*p_report)(void), (*p_shutdown)(void);
 
 int k3cu_init(int device) {
@@ -50,6 +51,7 @@ int k3cu_init(int device) {
     BIND(moe_begin); BIND(moe_expert); BIND(moe_poll); BIND(moe_wait); BIND(moe_end); BIND(matmul); BIND(mla); BIND(router); BIND(shared); BIND(report); BIND(shutdown);
 #undef BIND
     { FARPROC fn = GetProcAddress(h, "k3cu_kda"); if (fn) memcpy(&p_kda, &fn, sizeof fn); }   /* NULL: KDA on the CPU */
+    { FARPROC fn = GetProcAddress(h, "k3cu_mla_layer"); if (fn) memcpy(&p_mla_layer, &fn, sizeof fn); }   /* NULL: call by call */
     module = h;
     return p_init(device);
 }
@@ -82,5 +84,6 @@ int k3cu_shared(float *sd, const float *x, int S, int D, int I, const uint8_t *g
     return module ? p_shared(sd, x, S, D, I, gq, gs, uq, us, ggs, dq, ds, dgs, b1, b2) : 0;
 }
 int k3cu_kda(const K3cuKda *a, const float *x, float *out) { return module && p_kda ? p_kda(a, x, out) : 0; }
+int k3cu_mla_layer(const K3cuMlaLayer *a, const float *x, float *out) { return module && p_mla_layer ? p_mla_layer(a, x, out) : 0; }
 void k3cu_report(void) { if (module) p_report(); }
 void k3cu_shutdown(void) { if (module) p_shutdown(); }

@@ -161,9 +161,10 @@ Measured on the real model ([docs/experiments/kimi-k3-4090-2026-10-31](docs/expe
 in 33 s (57), a **2,637-token prompt in 106 s** (1,401 s with the first CPU kernels, 549 s
 with the faster ones, 137 s with its experts, MLA attention and routers on the GPU in the
 CPU's arithmetic, to the bit; its dense kernels now 2-4x sooner, the same bytes; now its
-drive's reads are the floor) and a **5,862-token one in 123 s** (254 s in steps of 4,096, 173 s
+drive's reads are the floor) and a **5,862-token one in 121 s** (254 s in steps of 4,096, 173 s
 before the KDA layers went whole to the GPU, 147 s before the MoE's tail went over every
-worker, 132 s before the MLA core's 128-by-128 tiles); 60.5% of the experts a token asks for are found in RAM. Every step
+worker, 132 s before the MLA core's 128-by-128 tiles and its layers whole on the GPU); 60.5%
+of the experts a token asks for are found in RAM. Every step
 gives the logits of the one before it, byte for byte:
 
 - `c\tools\download_kimi_k3_4090.ps1` fetches the checkpoint and cuts every MoE layer's
@@ -204,8 +205,9 @@ gives the logits of the one before it, byte for byte:
 Замеры на настоящей модели: **0,80 токена/с** (первая версия — 0,56), запуск 44 с (было 161),
 промпт из 35 токенов за 33 с (57); 60,5% экспертов находятся в ОЗУ, **промпт из 2637 токенов —
 106 с** (было 1401, затем 549 на CPU и 137 на GPU; теперь его предел — чтение с диска),
-**из 5862 токенов — 123 с** (было 254, затем 173 до переноса слоёв KDA на GPU целиком, 147 до
-распараллеливания хвоста MoE и 132 до тайлов 128×128 в ядре внимания MLA), логиты
+**из 5862 токенов — 121 с** (было 254, затем 173 до переноса слоёв KDA на GPU целиком, 147 до
+распараллеливания хвоста MoE и 132 до тайлов 128×128 в ядре внимания MLA и слоёв MLA на GPU
+целиком), логиты
 те же байт в байт. Подробно: [docs/kimi_k3-4090.md](docs/kimi_k3-4090.md).
 
 </details>

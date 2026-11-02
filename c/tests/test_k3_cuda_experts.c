@@ -332,11 +332,98 @@ static int check_kda(int C, int D, int H, int hd, int K, int card){
     return !ran || !up || dout || dst || dwin;
 }
 
+/* 7. A prompt step's gated MLA layer whole: mla_forward through k3cu_mla_layer against its
+ *    call-by-call path (the CPU's core, w_matmul's matrices): the output and the cache rows it
+ *    writes the same bytes. The matrices in the mask `card` (1 qa, 2 qb, 4 kva, 8 g, 16 o) go to
+ *    coli_cuda.dll first; i4 makes g and o int4 in groups of 64 (else int8 rows, as qa, qb, kva
+ *    and kv_b). `want`: whether the layer path takes the step (not with qb on the card: no
+ *    quant_matmul_blocked shape, the call-by-call path's bytes still). */
+static void rand_i8(W *w, int O, int I){
+    memset(w, 0, sizeof *w);
+    w->fmt = 1; w->O = O; w->I = I;
+    w->q8 = malloc((size_t)O * I); w->s = malloc((size_t)O * sizeof(float));
+    for(size_t i = 0; i < (size_t)O * I; i++){ int v = (int)(rnd32() >> 24) - 128; w->q8[i] = (int8_t)(v < -127 ? -127 : v); }
+    for(int r = 0; r < O; r++) w->s[r] = 0.0004f * (1.0f + 0.1f * rndf());
+}
+static int check_mla_layer(int C, int pos0, int D, int H, int qn, int qr, int vh, int kvl, int ql, int card, int i4, int want){
+    const int N = pos0 + C, qh = qn + qr, KD = kvl + qr;
+    Model *m = calloc(1, sizeof(Model));
+    Layer *l = calloc(1, sizeof(Layer));
+    Cfg *c = &m->c;
+    c->hidden = D; c->n_heads = H; c->qk_nope = qn; c->qk_rope = qr; c->qk_head = qh; c->v_head = vh; c->kv_lora = kvl;
+    c->q_lora = ql; c->eps = 1e-5f; c->attn_scale = 1.0f / sqrtf((float)qh);
+    Mla *a = &l->m;
+    rand_i8(&a->qa, ql, D); rand_i8(&a->qb, H * qh, ql); rand_i8(&a->kva, KD, D); rand_i8(&a->kvb, H * (qn + vh), kvl);
+    if(i4){ rand_i4(&a->g, H * vh, D, 64); rand_i4(&a->o, D, H * vh, 64); }
+    else { rand_i8(&a->g, H * vh, D); rand_i8(&a->o, D, H * vh); }
+    a->qa_ln = malloc((size_t)ql * 4); a->kva_ln = malloc((size_t)kvl * 4);
+    for(int i = 0; i < ql; i++) a->qa_ln[i] = 1.0f + 0.1f * rndf();
+    for(int i = 0; i < kvl; i++) a->kva_ln[i] = 1.0f + 0.1f * rndf();
+    const size_t nl = (size_t)N * kvl, nr = (size_t)N * (qr ? qr : 1);
+    float *Lc = malloc(nl * 4), *Rc = malloc(nr * 4), *L0 = malloc(nl * 4), *R0 = malloc(nr * 4), *Lg = malloc(nl * 4), *Rg = malloc(nr * 4);
+    for(size_t i = 0; i < nl; i++) L0[i] = i < (size_t)pos0 * kvl ? rndf() : -1.0f;   /* the steps before; this one's rows written */
+    for(size_t i = 0; i < nr; i++) R0[i] = i < (size_t)pos0 * qr ? rndf() : -1.0f;
+    m->Lc = &Lc; m->Rc = &Rc;
+    float *x = malloc((size_t)C * D * 4), *oc = malloc((size_t)C * D * 4), *og = malloc((size_t)C * D * 4);
+    for(size_t i = 0; i < (size_t)C * D; i++) x[i] = rndf();
+    W *ws[5] = {&a->qa, &a->qb, &a->kva, &a->g, &a->o};
+    int up = 1;
+    if(card){
+        if(g_cuda_up < 0){ int dev = 0; g_cuda_up = coli_cuda_init(&dev, 1) ? 1 : 0; g_k3_cuda_dev = 0; }
+        if(!g_cuda_up){ printf("MLA layer: no coli_cuda.dll: the card's matrices skipped\n"); card = 0; }
+        for(int i = 0; i < 5 && card; i++)
+            if(card >> i & 1)
+                up &= ws[i]->fmt == 4 ? coli_cuda_tensor_upload_g((ColiCudaTensor **)&ws[i]->cuda, ws[i]->q4, ws[i]->s, 4, ws[i]->I, ws[i]->O, 0, 64)
+                                      : coli_cuda_tensor_upload_g((ColiCudaTensor **)&ws[i]->cuda, ws[i]->q8, ws[i]->s, 1, ws[i]->I, ws[i]->O, 0, 0);
+        g_k3_cuda_dense = card != 0;
+    }
+    /* the call-by-call path, its core the CPU's */
+    memcpy(Lc, L0, nl * 4); memcpy(Rc, R0, nr * 4);
+    g_k3_mla_gpu = 0; g_k3g_on = 0;
+    mla_forward(m, l, 0, x, pos0, C, oc);
+    memcpy(Lg, Lc, nl * 4); memcpy(Rg, Rc, nr * 4);
+    /* the layer path */
+    memcpy(Lc, L0, nl * 4); memcpy(Rc, R0, nr * 4);
+    const int min_rows = g_k3g_min_rows;
+    g_k3_mla_gpu = 1; g_k3g_on = 1; g_k3g_min_rows = 1;
+    const unsigned long long before = g_k3_mla_layers;
+    memset(og, 0xff, (size_t)C * D * 4);
+    mla_forward(m, l, 0, x, pos0, C, og);
+    const int ran = g_k3_mla_layers > before;
+    g_k3g_on = 0; g_k3_cuda_dense = 0; g_k3g_min_rows = min_rows;
+    size_t dout = 0, dl = 0, dr = 0, first = (size_t)-1;
+    for(size_t i = 0; i < (size_t)C * D; i++) if(memcmp(oc + i, og + i, 4)){ if(first == (size_t)-1) first = i; dout++; }
+    for(size_t i = 0; i < nl; i++) if(memcmp(Lg + i, Lc + i, 4)) dl++;
+    for(size_t i = 0; i < nr; i++) if(memcmp(Rg + i, Rc + i, 4)) dr++;
+    if(dout) printf("  output %zu: CPU %a, device %a\n", first, oc[first], og[first]);
+    printf("MLA layer %d heads (%d+%d, v %d, latent %d, q %d), %d columns, card's 0x%02x%s, rows %d..%d: %s%zu of %zu outputs, "
+           "%zu of %zu cache values differ\n", H, qn, qr, vh, kvl, ql, D, card, i4 ? " (g, o int4)" : "", pos0, N - 1,
+           !up ? "FAILED to upload; " : ran != want ? (want ? "FAILED to run on the GPU; " : "RAN where it should not; ") : "",
+           dout, (size_t)C * D, dl + dr, nl + (size_t)N * qr);
+    for(int i = 0; i < 5; i++){ if(ws[i]->cuda) coli_cuda_tensor_free((ColiCudaTensor *)ws[i]->cuda); free(ws[i]->q8); free(ws[i]->q4); free(ws[i]->s); }
+    free(a->kvb.q8); free(a->kvb.s); free(a->qa_ln); free(a->kva_ln);
+    free(Lc); free(Rc); free(L0); free(R0); free(Lg); free(Rg); free(x); free(oc); free(og); free(l); free(m);
+    return !up || ran != want || dout || dl || dr;
+}
+int mla_layers(void){
+    return check_mla_layer(300, 200, 7168, 96, 128, 64, 128, 512, 1536, 8 | 16, 0, 1)   /* g and o on the card: K3's own */
+         + check_mla_layer(40, 0, 7168, 96, 128, 64, 128, 512, 1536, 0, 1, 1)          /* every matrix the host's */
+         + check_mla_layer(130, 3000, 7168, 96, 128, 64, 128, 512, 1536, 1 | 4 | 8 | 16, 1, 1)   /* chunks cut by their scores */
+         + check_mla_layer(50, 10, 7168, 96, 128, 64, 128, 512, 1536, 2 | 8 | 16, 0, 0)     /* qb on the card: call by call */
+         + check_mla_layer(600, 50, 128, 8, 16, 8, 16, 32, 64, 0, 0, 1);                 /* the tiny model's shapes, 3 chunks */
+}
+
 int main(int argc, char **argv){
     int all = argc > 1 && !strcmp(argv[1], "--all-floats");
     if(!k3cu_init(0)){ printf("no CUDA device or coli_cuda_k3.dll: skipped\n"); return 0; }
     if(argc > 1 && !strcmp(argv[1], "--kda")){   /* the KDA layer's cases alone */
         int bad = check_kda(40, 128, 2, 16, 4, 0) + check_kda(1100, 7168, 96, 128, 4, 0x1f) + check_kda(600, 7168, 96, 128, 4, 0x12);
+        k3cu_report();
+        printf(bad ? "FAILED\n" : "ok\n");
+        return bad ? 1 : 0;
+    }
+    if(argc > 1 && !strcmp(argv[1], "--mla")){   /* the MLA layer's cases alone */
+        int bad = mla_layers();
         k3cu_report();
         printf(bad ? "FAILED\n" : "ok\n");
         return bad ? 1 : 0;
@@ -368,6 +455,7 @@ int main(int argc, char **argv){
     bad += check_kda(40, 128, 2, 16, 4, 0);         /* the tiny model's shapes, every projection the host's */
     bad += check_kda(1100, 7168, 96, 128, 4, 0x1f); /* Kimi K3's, every projection on the card: 3 pieces */
     bad += check_kda(600, 7168, 96, 128, 4, 0x12);  /* k and o on the card, q, v and g the host's */
+    bad += mla_layers();
     k3cu_report();
     printf(bad ? "FAILED\n" : "ok\n");
     return bad ? 1 : 0;

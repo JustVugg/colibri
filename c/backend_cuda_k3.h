@@ -90,6 +90,27 @@ typedef struct {
     float *state, *win[3];
 } K3cuKda;
 K3CU_API int k3cu_kda(const K3cuKda *a, const float *x, float *out);
+/* A prompt step's gated MLA layer whole, mla_forward's bytes: x [C][D] up a chunk at a time, then
+ * qa, its RMSNorm (qa_ln) and qb, kva into the cache rows pos0.. (RMSNorm by kva_ln on the
+ * latent, the rope part as it is), the gate, k3cu_mla's core over the rows before (Lc/Rc rows
+ * 0..pos0-1 read, pos0..pos0+C-1 written back) and o_proj into out [C][D]. A matrix whose w is
+ * set runs on coli_cuda.dll's copy (quant_matmul_blocked's shapes, w_matmul's bytes on the card);
+ * one with hw runs from the host's weights in the CPU's arithmetic (k3cu_matmul's). 0 when it
+ * cannot (the caller's call-by-call path, which writes the cache rows again). */
+typedef struct {
+    const void *w; const float *s;     /* the device copy's weights and scales, or NULL */
+    const void *hw; const float *hs;   /* else the host's */
+    int fmt, gs;                       /* 1 int8 rows, 4 int4 in groups of gs */
+} K3cuMat;
+typedef struct {
+    int C, D, H, qn, qr, vh, kvl, ql, pos0;   /* ql: qa's width (q_lora) */
+    float scale, eps;
+    K3cuMat qa, qb, kva, g, o;
+    const float *qa_ln, *kva_ln;
+    const int8_t *kvb; const float *kvbs;     /* kv_b's int8 rows [H*(qn+vh)][kvl] and their scales */
+    float *Lc, *Rc;                           /* the layer's cache, [pos0+C][kvl] and [pos0+C][qr] */
+} K3cuMlaLayer;
+K3CU_API int k3cu_mla_layer(const K3cuMlaLayer *a, const float *x, float *out);
 K3CU_API void k3cu_report(void);
 K3CU_API void k3cu_shutdown(void);
 #ifdef __cplusplus

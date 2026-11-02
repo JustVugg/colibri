@@ -1083,6 +1083,40 @@ static int ml_chunk(long long first, int n, int H) {   // the rows of the chunk 
     while (r > 1 && (long long)r * H * ml_ld(first + r) * 4 > ML_SCORES) r = r * 7 / 8;
     return r;
 }
+// the largest chunk's rows, scores and score blocks' maxima over a step of C rows from pos0
+static void ml_plan(int pos0, int C, int H, size_t *rmax, size_t *smax, size_t *pmax) {
+    *rmax = *smax = *pmax = 1;
+    for (int c0 = 0, r; c0 < C; c0 += r) {
+        r = ml_chunk(pos0 + c0, C - c0, H);
+        const long long n = pos0 + c0 + r;
+        const size_t s = (size_t)r * H * ml_ld(n), p = (size_t)r * H * ((n + MG_T - 1) / MG_T);
+        if ((size_t)r > *rmax) *rmax = (size_t)r;
+        if (s > *smax) *smax = s;
+        if (p > *pmax) *pmax = p;
+    }
+}
+static int ml_streams(void) {
+    if (!s_mla && (!checked(cudaStreamCreateWithFlags(&s_mla, cudaStreamNonBlocking), "attention stream") ||
+                   !checked(cudaStreamCreateWithFlags(&s_mlc, cudaStreamNonBlocking), "attention stream"))) return 0;
+    for (int b = 0; b < 2; b++)
+        if (!ml_up[b] && (!checked(cudaEventCreateWithFlags(&ml_up[b], cudaEventDisableTiming), "attention events") ||
+                          !checked(cudaEventCreateWithFlags(&ml_done[b], cudaEventDisableTiming), "attention events"))) return 0;
+    return 1;
+}
+// a chunk's core on st: rows of q [rows][H][qn+qr] and gate [rows][H][vh] at positions first.., the
+// cache LR [first+rows][kvl+qr] -> ctx [rows][H][vh]
+static void ml_core(const float *LR, const int8_t *w, const float *s, float *Q, float *S, float *pm, float *sm, float *cl,
+                    const float *qv, const float *gv, float *ctx, int rows, int first, int H, int qn, int qr, int vh, int kvl,
+                    float scale, cudaStream_t st) {
+    const int M = rows * H, Nc = first + rows, KD = kvl + qr, ldS = ml_ld(Nc), ldp = (Nc + MG_T - 1) / MG_T;
+    const unsigned rt = (unsigned)((rows + MG_T - 1) / MG_T), mt = (unsigned)((M + MG_T - 1) / MG_T);
+    const unsigned it = (unsigned)((kvl + MG_T - 1) / MG_T), dt = (unsigned)((vh + MG_T - 1) / MG_T);
+    k3_mla_q<<<dim3(it, rt, (unsigned)H), 256, 0, st>>>(qv, rows, H, qn, qr, vh, kvl, w, s, Q);
+    k3_mla_scores<<<dim3((unsigned)ldp, mt), 256, 0, st>>>(Q, LR, M, Nc, KD, H, first, scale, S, ldS, pm, ldp);
+    k3_mla_soft<<<(unsigned)((M + MS_R - 1) / MS_R), 256, 0, st>>>(S, ldS, pm, ldp, M, H, first, sm);
+    k3_mla_clat<<<dim3(it, mt), 256, 0, st>>>(S, ldS, sm, LR, M, Nc, KD, kvl, H, first, cl);
+    k3_mla_out<<<dim3(dt, rt, (unsigned)H), 256, 0, st>>>(cl, gv, rows, H, qn, vh, kvl, w, s, ctx);
+}
 extern "C" int k3cu_mla(const float *Lc, const float *Rc, int N, int pos0, int C, const float *qv, const float *gv,
                         const int8_t *kvb, const float *kvbs, int H, int qn, int qr, int vh, int kvl, float scale,
                         float *ctx) {
@@ -1090,19 +1124,9 @@ extern "C" int k3cu_mla(const float *Lc, const float *Rc, int N, int pos0, int C
         kvl < 8 || kvl % MG_K || qn < MG_K || qn % MG_K || qr % MG_K || vh < 1 || (qr && !Rc) || !on_device()) return 0;
     double t0 = now_s();
     const int qh = qn + qr, KD = kvl + qr, O = H * (qn + vh);
-    if (!s_mla && (!checked(cudaStreamCreateWithFlags(&s_mla, cudaStreamNonBlocking), "attention stream") ||
-                   !checked(cudaStreamCreateWithFlags(&s_mlc, cudaStreamNonBlocking), "attention stream"))) return 0;
-    for (int b = 0; b < 2; b++)
-        if (!ml_up[b] && (!checked(cudaEventCreateWithFlags(&ml_up[b], cudaEventDisableTiming), "attention events") ||
-                          !checked(cudaEventCreateWithFlags(&ml_done[b], cudaEventDisableTiming), "attention events"))) return 0;
-    size_t rmax = 1, smax = 1, pmax = 1;   // the largest chunk's rows, scores and blocks' maxima
-    for (int c0 = 0, r; c0 < C; c0 += r) {
-        r = ml_chunk(pos0 + c0, C - c0, H);
-        const long long n = pos0 + c0 + r;
-        rmax = (size_t)r > rmax ? (size_t)r : rmax;
-        smax = (size_t)r * H * ml_ld(n) > smax ? (size_t)r * H * ml_ld(n) : smax;
-        pmax = (size_t)r * H * ((n + MG_T - 1) / MG_T) > pmax ? (size_t)r * H * ((n + MG_T - 1) / MG_T) : pmax;
-    }
+    if (!ml_streams()) return 0;
+    size_t rmax, smax, pmax;
+    ml_plan(pos0, C, H, &rmax, &smax, &pmax);
     void **const mp[13] = {(void **)&ml_LR, (void **)&ml_w, (void **)&ml_s, (void **)&ml_Q, (void **)&ml_S, (void **)&ml_pm,
                            (void **)&ml_sm, (void **)&ml_cl, (void **)&ml_qv[0], (void **)&ml_qv[1], (void **)&ml_gv[0],
                            (void **)&ml_gv[1], (void **)&ml_ctx[0]};
@@ -1116,22 +1140,17 @@ extern "C" int k3cu_mla(const float *Lc, const float *Rc, int N, int pos0, int C
         (qr && !checked(cudaMemcpy2DAsync(ml_LR + kvl, (size_t)KD * 4, Rc, (size_t)qr * 4, (size_t)qr * 4, (size_t)N, cudaMemcpyHostToDevice, st), "attention cache")) ||
         !checked(cudaMemcpyAsync(ml_w, kvb, (size_t)O * kvl, cudaMemcpyHostToDevice, st), "kv_b") ||
         !checked(cudaMemcpyAsync(ml_s, kvbs, (size_t)O * 4, cudaMemcpyHostToDevice, st), "kv_b")) return 0;
-    const unsigned it = (unsigned)((kvl + MG_T - 1) / MG_T), dt = (unsigned)((vh + MG_T - 1) / MG_T);
     int pc0 = 0, prows = 0, b = 0;   // the chunk before, its outputs still on the card
     for (int c0 = 0, rows; c0 < C; c0 += rows, b ^= 1) {
         rows = ml_chunk(pos0 + c0, C - c0, H);
-        const int M = rows * H, first = pos0 + c0, Nc = first + rows, ldS = ml_ld(Nc), ldp = (Nc + MG_T - 1) / MG_T;
-        const unsigned rt = (unsigned)((rows + MG_T - 1) / MG_T), mt = (unsigned)((M + MG_T - 1) / MG_T);
+        const int M = rows * H;
         // buffer b's last chunk is done and its outputs down: the host waited for them
         if (!checked(cudaMemcpyAsync(ml_qv[b], qv + (size_t)c0 * H * qh, (size_t)M * qh * 4, cudaMemcpyHostToDevice, sc), "attention rows") ||
             !checked(cudaMemcpyAsync(ml_gv[b], gv + (size_t)c0 * H * vh, (size_t)M * vh * 4, cudaMemcpyHostToDevice, sc), "attention rows") ||
             !checked(cudaEventRecord(ml_up[b], sc), "attention rows") || !checked(cudaStreamWaitEvent(st, ml_up[b], 0), "attention rows"))
             return 0;
-        k3_mla_q<<<dim3(it, rt, (unsigned)H), 256, 0, st>>>(ml_qv[b], rows, H, qn, qr, vh, kvl, ml_w, ml_s, ml_Q);
-        k3_mla_scores<<<dim3((unsigned)ldp, mt), 256, 0, st>>>(ml_Q, ml_LR, M, Nc, KD, H, first, scale, ml_S, ldS, ml_pm, ldp);
-        k3_mla_soft<<<(unsigned)((M + MS_R - 1) / MS_R), 256, 0, st>>>(ml_S, ldS, ml_pm, ldp, M, H, first, ml_sm);
-        k3_mla_clat<<<dim3(it, mt), 256, 0, st>>>(ml_S, ldS, ml_sm, ml_LR, M, Nc, KD, kvl, H, first, ml_cl);
-        k3_mla_out<<<dim3(dt, rt, (unsigned)H), 256, 0, st>>>(ml_cl, ml_gv[b], rows, H, qn, vh, kvl, ml_w, ml_s, ml_ctx[b]);
+        ml_core(ml_LR, ml_w, ml_s, ml_Q, ml_S, ml_pm, ml_sm, ml_cl, ml_qv[b], ml_gv[b], ml_ctx[b], rows, pos0 + c0, H, qn, qr, vh,
+                kvl, scale, st);
         if (!checked(cudaGetLastError(), "attention kernels") || !checked(cudaEventRecord(ml_done[b], st), "attention kernels")) return 0;
         if (prows && (!checked(cudaStreamWaitEvent(sc, ml_done[b ^ 1], 0), "attention outputs") ||
                       !checked(cudaMemcpyAsync(ctx + (size_t)pc0 * H * vh, ml_ctx[b ^ 1], (size_t)prows * H * vh * 4,
@@ -1445,6 +1464,123 @@ extern "C" int k3cu_kda(const K3cuKda *a, const float *x, float *out) {
     return 1;
 }
 
+// ---- a prompt step's gated MLA layer whole (k3cu_mla_layer, backend_cuda_k3.h) -----------------------
+// rmsnorm_ of every row (n columns, rows ld apart) into y (ldy apart; in place allowed): the squares
+// summed in double in order (each product exact), 1 / sqrtf((float)(sum / n) + eps), then (x r) w
+__global__ void k3_rms_rows(const float *x, int n, int ld, const float *__restrict__ w, float eps, float *y, int ldy) {
+    __shared__ float rs;
+    const float *xr = x + (size_t)blockIdx.x * ld;
+    if (threadIdx.x == 0) {
+        double ms = 0.0;
+        for (int i = 0; i < n; i++) { const double d = (double)xr[i]; ms = __dadd_rn(ms, __dmul_rn(d, d)); }
+        rs = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__double2float_rn(__ddiv_rn(ms, (double)n)), eps)));
+    }
+    __syncthreads();
+    const float r = rs;
+    float *yr = y + (size_t)blockIdx.x * ldy;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) yr[i] = __fmul_rn(__fmul_rn(xr[i], r), w[i]);
+}
+// a layer's matrix: coli_cuda.dll's copy (quant_matmul_blocked on its input blocked 8 rows a column) or
+// the host's weights, uploaded once a step (k3cu_matmul's kernels: the CPU's arithmetic)
+static int ml_mat_ok(const K3cuMat *m, int I, int O) {
+    if (m->w) { const K3cuProj p = {m->w, m->s, m->fmt, m->gs, nullptr}; return kd_dev_ok(&p, I, O); }
+    if (!m->hw || !m->hs || I < 8) return 0;
+    return m->fmt == 4 ? m->gs >= 16 && !(m->gs % 16) && !(I % m->gs) && !(K3_KC % m->gs) : m->fmt == 1 && !(I % 8);
+}
+static size_t ml_wbytes(const K3cuMat *m, int I, int O) { return m->w ? 0 : m->fmt == 4 ? (size_t)O * (I / 2) : (size_t)O * I; }
+static size_t ml_sbytes(const K3cuMat *m, int I, int O) { return m->w ? 0 : (size_t)O * (m->fmt == 4 ? I / m->gs : 1) * 4; }
+static void ml_mm(const K3cuMat *m, const uint8_t *dw, const float *ds, float *y, const float *x, const float *xb, int r, int I,
+                  int O, cudaStream_t st) {
+    if (m->w) { const K3cuProj p = {m->w, m->s, m->fmt, m->gs, nullptr}; kd_mm(&p, y, xb, r, I, O, st); }
+    else k3_dense_launch(m->fmt, dw, ds, x, r, I, O, m->gs, y, st);
+}
+// a chunk's outputs and cache rows down to the host once its kernels are done (the host waits: pageable memory)
+static int ml_down(const K3cuMlaLayer *a, float *out, const float *LR, const float *dout, cudaEvent_t done, int c0, int rows) {
+    const int D = a->D, kvl = a->kvl, qr = a->qr, KD = kvl + qr, first = a->pos0 + c0;
+    cudaStream_t sc = s_mlc;
+    return checked(cudaStreamWaitEvent(sc, done, 0), "MLA outputs") &&
+           checked(cudaMemcpyAsync(out + (size_t)c0 * D, dout, (size_t)rows * D * 4, cudaMemcpyDeviceToHost, sc), "MLA outputs") &&
+           checked(cudaMemcpy2DAsync(a->Lc + (size_t)first * kvl, (size_t)kvl * 4, LR + (size_t)first * KD, (size_t)KD * 4,
+                                     (size_t)kvl * 4, (size_t)rows, cudaMemcpyDeviceToHost, sc), "MLA cache") &&
+           (!qr || checked(cudaMemcpy2DAsync(a->Rc + (size_t)first * qr, (size_t)qr * 4, LR + (size_t)first * KD + kvl,
+                                             (size_t)KD * 4, (size_t)qr * 4, (size_t)rows, cudaMemcpyDeviceToHost, sc), "MLA cache"));
+}
+static unsigned long long n_mll, n_mll_rows; static double t_mll;
+extern "C" int k3cu_mla_layer(const K3cuMlaLayer *a, const float *x, float *out) {
+    if (!ready || failed || !a || !x || !out || !on_device()) return 0;
+    const int C = a->C, D = a->D, H = a->H, qn = a->qn, qr = a->qr, vh = a->vh, kvl = a->kvl, ql = a->ql, pos0 = a->pos0;
+    const int qh = qn + qr, KD = kvl + qr, OQ = H * qh, P = H * vh, OK = H * (qn + vh), N = pos0 + C;
+    const K3cuMat *mats[5] = {&a->qa, &a->qb, &a->kva, &a->g, &a->o};
+    const int mI[5] = {D, ql, D, D, P}, mO[5] = {ql, OQ, KD, P, D};
+    if (C < 1 || D < 8 || H < 1 || pos0 < 0 || kvl < 8 || kvl % MG_K || qn < MG_K || qn % MG_K || qr % MG_K || vh < 1 ||
+        ql < 8 || !a->qa_ln || !a->kva_ln || !a->kvb || !a->kvbs || !a->Lc || (qr && !a->Rc)) return 0;
+    for (int i = 0; i < 5; i++) if (!ml_mat_ok(mats[i], mI[i], mO[i])) return 0;
+    double t0 = now_s();
+    if (!ml_streams()) return 0;
+    size_t rmax, smax, pmax;
+    ml_plan(pos0, C, H, &rmax, &smax, &pmax);
+    const size_t RB = (rmax + QMB_RS - 1) / QMB_RS * QMB_RS;
+    uint8_t *dw[5]; float *dsc[5];
+    float *LR, *ks, *ln, *dx[2], *dxb, *dqa, *dqab, *dqv, *dckv, *dgv, *dctx, *dctxb, *dout[2], *Q, *S, *pm, *sm, *cl;
+    int8_t *kw;
+    void **mp[32]; size_t mb[32]; int nb = 0;
+#define ML_BUF(p, b) (mp[nb] = (void **)&(p), mb[nb++] = (b))
+    ML_BUF(LR, (size_t)N * KD * 4); ML_BUF(kw, (size_t)OK * kvl); ML_BUF(ks, (size_t)OK * 4); ML_BUF(ln, (size_t)(ql + kvl) * 4);
+    for (int i = 0; i < 5; i++) { ML_BUF(dw[i], ml_wbytes(mats[i], mI[i], mO[i])); ML_BUF(dsc[i], ml_sbytes(mats[i], mI[i], mO[i])); }
+    ML_BUF(dx[0], rmax * D * 4); ML_BUF(dx[1], rmax * D * 4); ML_BUF(dxb, RB * D * 4);
+    ML_BUF(dqa, rmax * ql * 4); ML_BUF(dqab, a->qb.w ? RB * ql * 4 : 0);
+    ML_BUF(dqv, rmax * OQ * 4); ML_BUF(dckv, rmax * KD * 4); ML_BUF(dgv, rmax * P * 4); ML_BUF(dctx, rmax * P * 4);
+    ML_BUF(dctxb, a->o.w ? RB * P * 4 : 0); ML_BUF(dout[0], rmax * D * 4); ML_BUF(dout[1], rmax * D * 4);
+    ML_BUF(Q, rmax * H * KD * 4); ML_BUF(S, smax * 4); ML_BUF(pm, pmax * 4); ML_BUF(sm, rmax * H * 4); ML_BUF(cl, rmax * H * kvl * 4);
+#undef ML_BUF
+    if (!ar_carve(mp, mb, nb)) return 0;
+    cudaStream_t st = s_mla, sc = s_mlc;
+    float *lnq = ln, *lnk = ln + ql;
+    int ok = checked(cudaMemcpyAsync(kw, a->kvb, (size_t)OK * kvl, cudaMemcpyHostToDevice, st), "kv_b") &&
+             checked(cudaMemcpyAsync(ks, a->kvbs, (size_t)OK * 4, cudaMemcpyHostToDevice, st), "kv_b") &&
+             checked(cudaMemcpyAsync(lnq, a->qa_ln, (size_t)ql * 4, cudaMemcpyHostToDevice, st), "MLA norms") &&
+             checked(cudaMemcpyAsync(lnk, a->kva_ln, (size_t)kvl * 4, cudaMemcpyHostToDevice, st), "MLA norms");
+    for (int i = 0; i < 5 && ok; i++)
+        if (!mats[i]->w)
+            ok = checked(cudaMemcpyAsync(dw[i], mats[i]->hw, ml_wbytes(mats[i], mI[i], mO[i]), cudaMemcpyHostToDevice, st), "MLA weights") &&
+                 checked(cudaMemcpyAsync(dsc[i], mats[i]->hs, ml_sbytes(mats[i], mI[i], mO[i]), cudaMemcpyHostToDevice, st), "MLA weights");
+    if (ok && pos0 > 0)   // the cache rows of the steps before
+        ok = checked(cudaMemcpy2DAsync(LR, (size_t)KD * 4, a->Lc, (size_t)kvl * 4, (size_t)kvl * 4, (size_t)pos0, cudaMemcpyHostToDevice, st),
+                     "MLA cache") &&
+             (!qr || checked(cudaMemcpy2DAsync(LR + kvl, (size_t)KD * 4, a->Rc, (size_t)qr * 4, (size_t)qr * 4, (size_t)pos0,
+                                               cudaMemcpyHostToDevice, st), "MLA cache"));
+    if (!ok) return 0;
+    const int xblk = a->qa.w || a->kva.w || a->g.w;   // a card's matrix reads x: x blocked too
+    int pc0 = 0, prows = 0, b = 0;   // the chunk before, its outputs still on the card
+    for (int c0 = 0, rows; c0 < C; c0 += rows, b ^= 1) {
+        rows = ml_chunk(pos0 + c0, C - c0, H);
+        const int first = pos0 + c0;
+        // buffer b's last chunk is done and its outputs down: the host waited for them
+        if (!checked(cudaMemcpyAsync(dx[b], x + (size_t)c0 * D, (size_t)rows * D * 4, cudaMemcpyHostToDevice, sc), "MLA rows") ||
+            !checked(cudaEventRecord(ml_up[b], sc), "MLA rows") || !checked(cudaStreamWaitEvent(st, ml_up[b], 0), "MLA rows")) return 0;
+        if (xblk) kd_block(dxb, dx[b], rows, D, st);
+        ml_mm(&a->qa, dw[0], dsc[0], dqa, dx[b], dxb, rows, D, ql, st);
+        k3_rms_rows<<<rows, 256, 0, st>>>(dqa, ql, ql, lnq, a->eps, dqa, ql);
+        if (a->qb.w) kd_block(dqab, dqa, rows, ql, st);
+        ml_mm(&a->qb, dw[1], dsc[1], dqv, dqa, dqab, rows, ql, OQ, st);
+        ml_mm(&a->kva, dw[2], dsc[2], dckv, dx[b], dxb, rows, D, KD, st);
+        k3_rms_rows<<<rows, 256, 0, st>>>(dckv, kvl, KD, lnk, a->eps, LR + (size_t)first * KD, KD);
+        if (qr && !checked(cudaMemcpy2DAsync(LR + (size_t)first * KD + kvl, (size_t)KD * 4, dckv + kvl, (size_t)KD * 4, (size_t)qr * 4,
+                                             (size_t)rows, cudaMemcpyDeviceToDevice, st), "MLA cache")) return 0;
+        ml_mm(&a->g, dw[3], dsc[3], dgv, dx[b], dxb, rows, D, P, st);
+        ml_core(LR, kw, ks, Q, S, pm, sm, cl, dqv, dgv, dctx, rows, first, H, qn, qr, vh, kvl, a->scale, st);
+        if (a->o.w) kd_block(dctxb, dctx, rows, P, st);
+        ml_mm(&a->o, dw[4], dsc[4], dout[b], dctx, dctxb, rows, P, D, st);
+        if (!checked(cudaGetLastError(), "MLA kernels") || !checked(cudaEventRecord(ml_done[b], st), "MLA kernels")) return 0;
+        if (prows && !ml_down(a, out, LR, dout[b ^ 1], ml_done[b ^ 1], pc0, prows)) return 0;
+        pc0 = c0; prows = rows;
+    }
+    if (!ml_down(a, out, LR, dout[b ^ 1], ml_done[b ^ 1], pc0, prows) || !checked(cudaStreamSynchronize(sc), "MLA layer") ||
+        !checked(cudaStreamSynchronize(st), "MLA layer")) return 0;
+    n_mll++; n_mll_rows += (unsigned long long)C; t_mll += now_s() - t0;
+    return 1;
+}
+
 extern "C" void k3cu_report(void) {
     if (!ready) return;
     if (n_steps)
@@ -1452,6 +1588,7 @@ extern "C" void k3cu_report(void) {
                 n_steps, n_experts, n_rows, t_copy, t_wait, failed ? "; the device failed" : "");
     if (n_mm) fprintf(stderr, "[K3-CUDA] the dense matrices the GPU does not hold: %llu matmuls, %llu rows, %.1fs\n", n_mm, n_mm_rows, t_mm);
     if (n_mla) fprintf(stderr, "[K3-CUDA] the gated MLA's attention: %llu layer steps, %llu rows, %.1fs\n", n_mla, n_mla_rows, t_mla);
+    if (n_mll) fprintf(stderr, "[K3-CUDA] the gated MLA layers: %llu layer steps, %llu rows, %.1fs\n", n_mll, n_mll_rows, t_mll);
     if (n_rt) fprintf(stderr, "[K3-CUDA] the routers: %llu steps, %.1fs\n", n_rt, t_rt);
     if (n_sh) fprintf(stderr, "[K3-CUDA] the shared experts: %llu steps, %.1fs\n", n_sh, t_sh);
     if (n_kda) fprintf(stderr, "[K3-CUDA] the KDA layers: %llu layer steps, %llu rows, %.1fs\n", n_kda, n_kda_rows, t_kda);

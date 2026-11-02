@@ -2452,8 +2452,55 @@ static void k3_mla_scores_g(float *sc, const float *qab, const float *const *qrp
     for(int g=0;g<nh;g++)
         k3_mla_scores(sc+(int64_t)g*nt,qab+(int64_t)g*kvl,qrps[g],Lc_,Rc_,nt,kvl,qr,scale);
 }
+#ifdef COLI_K3_CUDA
+/* A prompt step's gated MLA layer on the GPU (k3cu_mla_layer), the call-by-call path's bytes
+ * below: a matrix the card holds runs there on coli_cuda.dll's copy in the kernel w_matmul gets
+ * for it (quant_matmul_blocked), the others from their host weights in k3cu_matmul's kernels (the
+ * CPU's arithmetic); the norms, the cache rows (written back) and the core on the card, a chunk
+ * of rows at a time. 0: the call-by-call path. K3_GPU_MLA=0: always that. */
+static int g_k3_mla_gpu=-1;
+static unsigned long long g_k3_mla_layers;   /* layer steps it took */
+static int k3_mla_gpu(Model *m, Mla *a, int li, const float *x, int pos0, int C, float *out){
+    const Cfg *c=&m->c;
+    if(g_k3_mla_gpu<0){ const char *e=getenv("K3_GPU_MLA"); g_k3_mla_gpu=!e||!*e||atoi(e)!=0; }
+    if(!g_k3_mla_gpu||k3_omp_in_par()||a->kvb.fmt!=1||!a->kvb.q8||!a->kvb.s) return 0;
+#ifdef COLI_CUDA
+    if(g_cud.on) return 0;   /* the CUDA tier's matrices: its own kernels */
+#endif
+    double t0=now_s();
+    K3cuMlaLayer d; memset(&d,0,sizeof d);
+    d.C=C; d.D=c->hidden; d.H=c->n_heads; d.qn=c->qk_nope; d.qr=c->qk_rope; d.vh=c->v_head; d.kvl=c->kv_lora;
+    d.ql=c->q_lora; d.pos0=pos0; d.scale=c->attn_scale; d.eps=c->eps;
+    d.qa_ln=a->qa_ln; d.kva_ln=a->kva_ln; d.kvb=a->kvb.q8; d.kvbs=a->kvb.s; d.Lc=m->Lc[li]; d.Rc=m->Rc[li];
+    W *ws[5]={&a->qa,&a->qb,&a->kva,&a->g,&a->o}; K3cuMat *ps[5]={&d.qa,&d.qb,&d.kva,&d.g,&d.o};
+    for(int i=0;i<5;i++){
+        W *w=ws[i]; K3cuMat *p=ps[i];
+#ifdef COLI_CUDA
+        if(w->cuda&&g_k3_cuda_dense){   /* the card's copy (the DLL takes quant_matmul_blocked's shapes) */
+            const void *dw=NULL; const float *dsc=NULL; int gs=0;
+            const int f=coli_cuda_tensor_dev_ptrs((ColiCudaTensor*)w->cuda,&dw,&dsc,&gs);
+            if(f!=1&&f!=4) return 0;
+            p->w=dw; p->s=dsc; p->fmt=f; p->gs=gs;
+            continue;
+        }
+        if(w->cuda_gone) return 0;
+#endif
+        if((w->fmt!=1&&w->fmt!=4)||!w->s) return 0;
+        p->hw=w->fmt==4?(const void*)w->q4:(const void*)w->q8; p->hs=w->s; p->fmt=w->fmt; p->gs=w->gs;
+        if(!p->hw) return 0;
+    }
+    const int ok=k3cu_mla_layer(&d,x,out);
+    if(ok){ m->t_mla_gpu+=now_s()-t0; g_k3_mla_layers++; }
+    return ok;
+}
+#endif
     static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, int C, float *out){
     Cfg *c=&m->c; Mla *a=&l->m;
+#ifdef COLI_K3_CUDA
+    /* a prompt step of one sequence (the GPU core's case below) on the GPU, the layer whole */
+    if(!m->mux_rows&&g_k3g_on&&C>=g_k3g_min_rows&&!(c->index_hd>0&&c->idx_type[li]&&k3_dsa_indexer_on())&&
+       k3_mla_gpu(m,a,li,x,pos0,C,out)) return;
+#endif
     int H=c->n_heads, qh=c->qk_head, vh=c->v_head, kvl=c->kv_lora, qr=c->qk_rope;
     float *qa=k3_balloc((int64_t)C*c->q_lora), *qv=k3_balloc((int64_t)C*H*qh);
     float *ckv=k3_balloc((int64_t)C*(kvl+qr));

@@ -425,3 +425,28 @@ their loads (multiplies instead) moved them.
 The 2,637-token prompt waits for C: as before: the 3 s attention saved went into waiting for
 reads. At 5,862 tokens attention is now 35.7 s (KDA 24.5, the MLA layers 11.2 with their core
 4.0) and the MoE 79 s; a layer's compute is still above the drives' 1.05 s of reads.
+
+## The MLA layers whole on the card (`raw/mll_*`, 2026-11-03)
+
+With the core at 4.0 s the gated MLA layers still took 11.2 s of the 5,862-token prompt:
+around the core every matrix went call by call -- qa, qb and kva through `k3cu_matmul` (the
+host's weights up every call, `k3_dense`), the gate and o_proj on coli_cuda.dll's resident
+copies -- each call's input up and output back, about 2.4 GB a layer, and the norms and the
+cache rows on the CPU. `k3cu_mla_layer` takes the layer in the core's chunks: x up, qa, its
+RMSNorm (`k3_rms_rows`: the squares summed in double in order on one thread, rmsnorm_'s
+arithmetic), qb, kva into the cache rows (the latent's RMSNorm, the rope part as it is), the
+gate, the core, o_proj, then the output and the cache rows down; the held matrices on
+coli_cuda.dll's copies in quant_matmul_blocked, the others from their host weights, uploaded
+once a step. A layer's traffic is now x and its output once, about 0.35 GB at 5,862 rows.
+
+| run | what | result |
+|---|---|---:|
+| `tests/test_k3_cuda_experts.c --mla` | mla_forward through k3cu_mla_layer against its call-by-call path: K3's shapes with g and o on the card (int8), every matrix the host's (g, o int4), qa, kva, g and o on the card at rows 3,000.. (chunks cut by their scores), qb on the card (refused: call by call), the tiny model's shapes in 3 chunks | 0 of the outputs and cache values differ |
+| `k3tiny.sh`, `k3tiny_big2.sh` | the tiny model (every matrix held, none in quant_matmul_blocked's shapes: call by call) | the same logits as 04623a27 |
+| `k3tiny_big3.sh`, `K3_CUDA_DENSE=0` | every matrix the host's: the layer path at steps of 2,048, 4,096 and 8,192 (12, 8 and 4 layer steps) | the same logits as 04623a27 at every position |
+| `mll_*_logits` (`series_mll.sh`) | both long prompts' logits at every position | the same bytes |
+| `mll_5862_*`, `mll_2637_*` | A/B against the same build with `K3_GPU_MLA=0` | 5,862 tokens **120.5, 121.4 s** against 122.4, 121.9 s: the MLA layers 11.1-11.2 -> 9.0-9.1 s, the host-weight matmuls 284 -> 213 calls; 2,637 tokens 106.3 against 106.3 s (MLA 4.5 -> 3.2 s, waiting for reads 39.3 -> 41.1 s) |
+
+Of the layers' 9.0 s at 5,862 tokens the core is 4.0, the held gate and o_proj about 2.5
+(quant_matmul_blocked, about 10 TMAC/s) and qa, qb and kva about 1.8 (k3_dense's int8 lanes,
+about 3.3 TMAC/s).
