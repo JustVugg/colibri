@@ -526,6 +526,8 @@ static void test_gpu_prefix(ColiV4Engine *engine, ColiExpertStore *store) {
         view.gate.rows = view.up.rows = view.down.rows = 2;
         view.gate.columns = view.up.columns = view.down.columns = 2;
         view.gate.block_rows = view.up.block_rows = view.down.block_rows = 1;
+        view.gate.format = view.up.format = view.down.format =
+            COLI_TENSOR_FP4_NATIVE_BLOCK;   /* dev attaches native FP4 only */
         int attached = coli_v4_gpu_expert_attach_async(store, &view) == 0 && view.gate.gpu;
         assert(attached == (layer < 10));
         if (attached) assert(((Dsv4CudaTensor *)view.gate.gpu)->device ==
