@@ -956,15 +956,15 @@ def main():
         if _pool is not None:
             _pool.close(); _pool.join()
         if skipped: print(f"[RESUME] {skipped} shard(s) already done in {a.outdir}, skipped")
-        # metadati per la conversione principale: gli stessi quattro file del download
+        # metadati per la conversione principale: gli stessi file del download
         # path — senza tokenizer.json chat/serve non partono. I passaggi mtp/idx vanno
         # nella stessa outdir di un container gia' completo di metadati.
-        # EN: metadata for the main pass: the same four files as the download path —
+        # EN: metadata for the main pass: the same metadata files as the download path —
         # EN: chat/serve won't start without tokenizer.json. The mtp/idx passes target
         # EN: an outdir whose container already has its metadata.
         if not a.mtp and not a.indexer:
             copied, missing = [], []
-            for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"] + \
+            for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json", "chat_template.jinja"] + \
                       (["processor_config.json"] if ML4 else []):
                 src = os.path.join(a.indir, fn)
                 if os.path.exists(src): shutil.copy(src, a.outdir); copied.append(fn)
@@ -1212,7 +1212,7 @@ def main():
     if not shards:
         print("ERROR: no .safetensors shards found in this repository.", flush=True)
         return
-    for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"] + \
+    for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json", "chat_template.jinja"] + \
               (["processor_config.json"] if ML4 else []):
         try: shutil.copy(hf_hub_download(a.repo, fn, local_dir=a.outdir+"/_meta"), a.outdir)
         except Exception: pass
