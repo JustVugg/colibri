@@ -1,4 +1,5 @@
 #include "../backend_cuda_dsv4.h"
+#include "dsv4_test_devices.h"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -40,7 +41,7 @@ static void reference(float *out, const float *q, const float *past,
     }
 }
 int main() {
-    int devices[] = {0, 5}; assert(dsv4_cuda_init(devices, 2));
+    int devices[2]; dsv4_test_devices(devices); assert(dsv4_cuda_init(devices, 2));
     double worst = 0;
     for (int device : devices) for (int dim : {32, 128, 512})
     for (int heads : {1, 64}) for (int pn : {0, 8, 128}) {
