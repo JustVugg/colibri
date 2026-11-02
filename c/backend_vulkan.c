@@ -8275,6 +8275,7 @@ static void bench_import(void) {
         free(w); free(w0); free(x); free(sc); free(y);
     }
 }
+static int run_xbatch_alias(void);   /* an import case: runs in run_late_cases, past the compared digest */
 static int run_late_cases(void) {
     if (getenv("COLI_VK_TEST_IMPORT_BENCH") && atoi(getenv("COLI_VK_TEST_IMPORT_BENCH"))) bench_import();
     uint64_t keep = g_digest;
@@ -8314,6 +8315,14 @@ static int run_late_cases(void) {
         coli_vk_tensor_free(t);
         free(x); free(w); free(sc);
     }
+    /* The aliased slab records last, with the import cases: like them they alias host
+     * memory the device imports (VK_EXT_external_memory_host), which staged uploads have
+     * none of, and the case says so and skips there. Past the compared digest that skip
+     * is quiet: inside the digest's cases it shifted the shared rand() stream (the case
+     * draws its weights only when it runs), so every case after it -- the absorb core,
+     * the pair -- digested different inputs mapped than staged, and the staged leg's
+     * digest compare failed (bucket G of PR #2539's census). */
+    bad |= run_xbatch_alias();   /* the compute-site lever's zero-copy experts */
     printf("f16 and import digest %016llx\n", (unsigned long long)g_digest);
     g_digest = keep;
     return bad;
@@ -8951,7 +8960,6 @@ static int run_xbatch_all(void) {
     bad |= run_xbatch(4, 4, 64, 6400, 64, COLI_VK_ACT_SWIGLU, 0.f);
     xb_shutdown(&g_xb[0]);
     bad |= run_xbatch_v4();   /* DeepSeek V4's activation, bit for bit */
-    bad |= run_xbatch_alias();   /* the aliased slab records, the compute-site lever's zero-copy experts */
     return bad;
 }
 
