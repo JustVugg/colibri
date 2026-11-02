@@ -35,9 +35,11 @@
  *
  * Header-only, all static, pure compute: no Model, no I/O, no allocation
  * beyond what the caller hands in. AVX2/FMA, AVX-VNNI or AVX512-VNNI where built,
- * with a scalar fallback that defines the numerics every SIMD path must
- * reproduce (f32 paths: same per-lane accumulation order; i8 paths: exact
- * integer sums, so identical by construction). */
+ * an SSE2 i8 kernel where AVX2+FMA are not, with a scalar fallback that defines
+ * the numerics every SIMD path must reproduce (f32 paths: same per-lane
+ * accumulation order; i8 paths: exact integer sums and the same fmaf per lane
+ * and block, so identical by construction; the SSE2 one makes that fmaf in
+ * double, see its comment). */
 #ifndef COLI_EXPERT_FFN_H
 #define COLI_EXPERT_FFN_H
 
@@ -269,6 +271,112 @@ static inline float xf_dot_i8_avx2(const uint8_t *w, const float *sc, const int8
 }
 #endif /* AVX2 */
 
+/* ---- SSE2 i8 kernel (PMADDWD, exact fmaf emulation) -----------------------
+ * Builds without AVX2+FMA on x86-64 (no -mavx2 -mfma: Ivy Bridge, Sandy Bridge, a
+ * plain -march=x86-64): the numbers of xf_dot_i8_ref, bit for bit, at SSE2.
+ *
+ * The integer part. A block's nibbles are widened to int16 (0..15) and meet the
+ * activations through PMADDWD, int16 x int16 pairs summed into int32. The int8
+ * activations are widened by unpacking them into the HIGH byte of each int16
+ * (x << 8, no sign-extension instruction); every product is then 256 times the
+ * true one, so the 4-element lane sums come out x256 and one arithmetic shift
+ * by 8 is exact. Worst case |x| = 128: 15 * 32768 per product, 8 per lane,
+ * 3.9e6 < 2^31. A lane l = 0..7 sums elements 4l..4l+3 and 32+4l..32+4l+3 of the
+ * block, as in xf_dot_i8_ref.
+ *
+ * The float part. The reference ends every lane of every block with
+ * fmaf(lane, sc, acc): a correctly rounded float result of lane*sc + acc, which
+ * without hardware FMA is a libm call that spends most of the row's time in
+ * fenv. Here it is made exactly, two lanes to an SSE register, in double:
+ *   - lane*sc is exact in a double (|lane| < 2^14, sc has 24 bits: 38 bits);
+ *   - s = p + acc and the exact error e of that sum (Knuth's TwoSum);
+ *   - the exact sum p + acc is rounded TO ODD at double precision, which is
+ *     s itself if e == 0, else the neighbour of the exact value that has an odd
+ *     last bit: s | 1 when e has the sign of s (the exact value is farther from
+ *     zero than s), (s - 1) | 1 when it is nearer (integers on the bit patterns);
+ *   - rounding to odd at 53 bits and then to nearest-even at 24 is the
+ *     correctly rounded float result (Boldo and Melquiond, Theorem 3: at least
+ *     two extra precision bits and two extra bits below the smallest float
+ *     subnormal). Both a float*float product (at most 48 significant bits) and
+ *     the TwoSum residual fit exactly in double, without double overflow or
+ *     underflow. This includes the correction product sc*xsum, not just lanes.
+ *     The result is the one fmaf returns, subnormal results and ties included.
+ * Between blocks the accumulators stay doubles holding exact float values. The
+ * order of every operation is the reference's: eight lane accumulators, the
+ * correction sum_g fmaf(sc, xsum, .) in block order, xf_hsum8_scalar's tree,
+ * (hsum - 8 corr) * sx. Only a non-finite sc or xsum can differ (the NaN payload
+ * and sign, not that the result is a NaN); real scales and sums are finite.
+ * No hardware FMA, no -ffast-math, no libm call. Needs round-to-nearest with
+ * gradual underflow; dispatch falls back for other MXCSR modes. Do not select
+ * this emulation when the compiler can contract its TwoSum operations into FMA.
+ * See Boldo and Melquiond, doi:10.1109/TC.2007.70819. */
+#if !defined(XF_HAVE_AVX2) && !defined(__FMA__) && !defined(__FAST_MATH__) && defined(__SSE2__) && (defined(__x86_64__) || defined(__SSE2_MATH__))
+#define XF_HAVE_SSE2_INT16 1
+
+/* fmaf(a, b, c) in both lanes: p = a*b EXACT in double (the caller's guarantee),
+ * c a float held in a double; the result is the float fmaf returns, held in a double */
+static inline __m128d xf_fmaf2_sse2(__m128d p, __m128d c) {
+    const __m128d sign = _mm_set1_pd(-0.0);
+    __m128d s  = _mm_add_pd(p, c);
+    __m128d bb = _mm_sub_pd(s, p);
+    __m128d e  = _mm_add_pd(_mm_sub_pd(p, _mm_sub_pd(s, bb)), _mm_sub_pd(c, bb));
+    __m128i m  = _mm_castpd_si128(_mm_cmplt_pd(_mm_setzero_pd(), _mm_andnot_pd(sign, e)));    /* |e| > 0 (false for NaN) */
+    __m128i nearer = _mm_srai_epi32(_mm_castpd_si128(_mm_xor_pd(e, s)), 31);                  /* sign(e) != sign(s), high dwords */
+    nearer = _mm_shuffle_epi32(nearer, _MM_SHUFFLE(3, 3, 1, 1));
+    __m128i si = _mm_add_epi64(_mm_castpd_si128(s), _mm_and_si128(nearer, m));                /* s - 1 when nearer and inexact */
+    si = _mm_or_si128(si, _mm_and_si128(m, _mm_set_epi32(0, 1, 0, 1)));                       /* | 1 when inexact */
+    return _mm_cvtps_pd(_mm_cvtpd_ps(_mm_castsi128_pd(si)));
+}
+
+/* x[0..7] of an activation block as int16, each in the high byte: x * 256 */
+static inline __m128i xf_x8_hi_sse2(const int8_t *p) {
+    return _mm_unpacklo_epi8(_mm_setzero_si128(), _mm_loadl_epi64((const __m128i *)p));
+}
+/* eight int32 lane sums of a block from the pair sums (times 256) of its four 8-byte groups */
+static inline void xf_lanes_sse2(__m128i q0, __m128i q1, __m128i q2, __m128i q3, __m128i *l03, __m128i *l47) {
+    __m128 a = _mm_castsi128_ps(q0), b = _mm_castsi128_ps(q1), c = _mm_castsi128_ps(q2), d = _mm_castsi128_ps(q3);
+    *l03 = _mm_srai_epi32(_mm_add_epi32(_mm_castps_si128(_mm_shuffle_ps(a, b, _MM_SHUFFLE(2, 0, 2, 0))),
+                                        _mm_castps_si128(_mm_shuffle_ps(a, b, _MM_SHUFFLE(3, 1, 3, 1)))), 8);
+    *l47 = _mm_srai_epi32(_mm_add_epi32(_mm_castps_si128(_mm_shuffle_ps(c, d, _MM_SHUFFLE(2, 0, 2, 0))),
+                                        _mm_castps_si128(_mm_shuffle_ps(c, d, _MM_SHUFFLE(3, 1, 3, 1)))), 8);
+}
+
+static inline float xf_dot_i8_sse2_int16(const uint8_t *w, const float *sc, const int8_t *xq, const float *xsum, float sx, int I) {
+    const int ng = I / XF_BLOCK;
+    const __m128i m4 = _mm_set1_epi8(0x0F), zero = _mm_setzero_si128();
+    __m128d a01 = _mm_setzero_pd(), a23 = a01, a45 = a01, a67 = a01, cr = a01;   /* lanes 0..7 and the correction */
+
+    for (int g = 0; g < ng; g++) {
+        const uint8_t *blk = w + (size_t)g * XF_BLOCK_BYTES;
+        const int8_t *xb = xq + (size_t)g * XF_BLOCK;
+        const __m128i b0 = _mm_loadu_si128((const __m128i *)blk), b1 = _mm_loadu_si128((const __m128i *)(blk + 16));
+        const __m128i lo0 = _mm_and_si128(b0, m4), lo1 = _mm_and_si128(b1, m4);                       /* elements 0..15, 16..31 */
+        const __m128i hi0 = _mm_and_si128(_mm_srli_epi16(b0, 4), m4), hi1 = _mm_and_si128(_mm_srli_epi16(b1, 4), m4);   /* 32..47, 48..63 */
+        __m128i q0 = _mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi8(lo0, zero), xf_x8_hi_sse2(xb)),
+                                   _mm_madd_epi16(_mm_unpacklo_epi8(hi0, zero), xf_x8_hi_sse2(xb + 32)));
+        __m128i q1 = _mm_add_epi32(_mm_madd_epi16(_mm_unpackhi_epi8(lo0, zero), xf_x8_hi_sse2(xb + 8)),
+                                   _mm_madd_epi16(_mm_unpackhi_epi8(hi0, zero), xf_x8_hi_sse2(xb + 40)));
+        __m128i q2 = _mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi8(lo1, zero), xf_x8_hi_sse2(xb + 16)),
+                                   _mm_madd_epi16(_mm_unpacklo_epi8(hi1, zero), xf_x8_hi_sse2(xb + 48)));
+        __m128i q3 = _mm_add_epi32(_mm_madd_epi16(_mm_unpackhi_epi8(lo1, zero), xf_x8_hi_sse2(xb + 24)),
+                                   _mm_madd_epi16(_mm_unpackhi_epi8(hi1, zero), xf_x8_hi_sse2(xb + 56)));
+        __m128i l03, l47;
+        xf_lanes_sse2(q0, q1, q2, q3, &l03, &l47);
+
+        const __m128d s = _mm_set1_pd((double)sc[g]);
+        a01 = xf_fmaf2_sse2(_mm_mul_pd(_mm_cvtepi32_pd(l03), s), a01);
+        a23 = xf_fmaf2_sse2(_mm_mul_pd(_mm_cvtepi32_pd(_mm_shuffle_epi32(l03, _MM_SHUFFLE(1, 0, 3, 2))), s), a23);
+        a45 = xf_fmaf2_sse2(_mm_mul_pd(_mm_cvtepi32_pd(l47), s), a45);
+        a67 = xf_fmaf2_sse2(_mm_mul_pd(_mm_cvtepi32_pd(_mm_shuffle_epi32(l47, _MM_SHUFFLE(1, 0, 3, 2))), s), a67);
+        cr  = xf_fmaf2_sse2(_mm_mul_pd(s, _mm_set1_pd((double)xsum[g])), cr);
+    }
+    float acc[8];
+    _mm_storeu_ps(acc,     _mm_movelh_ps(_mm_cvtpd_ps(a01), _mm_cvtpd_ps(a23)));
+    _mm_storeu_ps(acc + 4, _mm_movelh_ps(_mm_cvtpd_ps(a45), _mm_cvtpd_ps(a67)));
+    return (xf_hsum8_scalar(acc) - 8.f * _mm_cvtss_f32(_mm_cvtpd_ps(cr))) * sx;
+}
+#endif /* SSE2 i8 */
+
 /* ---- dispatch -------------------------------------------------------------- */
 
 static inline float xf_dot_f32(const uint8_t *w, const float *sc, const float *x, int I) {
@@ -327,6 +435,12 @@ static inline void xf_dot_f32_rows(float *y, int ystride, const uint8_t *w, cons
 static inline float xf_dot_i8(const uint8_t *w, const float *sc, const int8_t *xq, const float *xsum, float sx, int I) {
 #ifdef XF_HAVE_AVX2
     return xf_dot_i8_avx2(w, sc, xq, xsum, sx, I);
+#elif defined(XF_HAVE_SSE2_INT16)
+    /* RC (rounding control), FTZ (flush to zero), DAZ (denormals are zero).
+     * Preserve the reference's behavior outside the emulation's assumptions. */
+    if (_mm_getcsr() & (_MM_ROUND_MASK | _MM_FLUSH_ZERO_MASK | 0x0040))
+        return xf_dot_i8_ref(w, sc, xq, xsum, sx, I);
+    return xf_dot_i8_sse2_int16(w, sc, xq, xsum, sx, I);
 #else
     return xf_dot_i8_ref(w, sc, xq, xsum, sx, I);
 #endif
@@ -374,7 +488,7 @@ static inline void xf_dot_i8_rows(float *y, int ystride, const uint8_t *w, const
     }
 #else
     for (int r = 0; r < n; r++)
-        y[(size_t)r * ystride] = xf_dot_i8_ref(w, sc, xq + (size_t)r * I, xsum + (size_t)r * (I / XF_BLOCK), sx[r], I);
+        y[(size_t)r * ystride] = xf_dot_i8(w, sc, xq + (size_t)r * I, xsum + (size_t)r * (I / XF_BLOCK), sx[r], I);
 #endif
 }
 

@@ -428,3 +428,68 @@ describe("generateImage", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 })
+
+
+describe("multiline chat SSE data", () => {
+  it("assembles data lines in a frame before decoding its JSON", () => {
+    const parsed = extractSSE('data: {"choices": [\n' + 'data: {"delta":{"content":"hello"}}]}\n\n');
+    expect(parsed.data).toEqual(['{"choices": [\n{"delta":{"content":"hello"}}]}']);
+    expect(JSON.parse(parsed.data[0]).choices[0].delta.content).toBe("hello");
+  });
+  it("preserves data whitespace beyond the optional single separator space", () => {
+    expect(extractSSE("data:  leading\n\n").data).toEqual([" leading"]);
+  });
+});
+
+it("streams a chat completion whose JSON spans multiple SSE data lines", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(
+    'data: {"choices": [\n' + 'data: {"delta":{"content":"hello"}}]}\n\n' + 'data: [DONE]\n\n',
+    { headers: { "content-type": "text/event-stream" } },
+  )));
+  const deltas: string[] = [];
+  await streamChat({ baseUrl: "http://fixture.invalid/v1", apiKey: "", model: "fixture", messages: [],
+    temperature: 0, maxTokens: 8, enableThinking: false, signal: new AbortController().signal,
+    onDelta: text => deltas.push(text) });
+  expect(deltas).toEqual(["hello"]);
+});
+
+it("finishes chat at DONE without waiting for the backend to close its connection", async () => {
+  const reader = {
+    read: vi.fn().mockResolvedValueOnce({ value: new TextEncoder().encode("data: [DONE]\n\n"), done: false })
+      .mockRejectedValue(new Error("read after terminal marker")),
+    cancel: vi.fn().mockResolvedValue(undefined),
+  }
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, headers: new Headers(), body: { getReader: () => reader } }));
+  await expect(streamChat({ baseUrl: "http://fixture.invalid/v1", apiKey: "", model: "fixture", messages: [],
+    temperature: 0, maxTokens: 8, enableThinking: false, signal: new AbortController().signal,
+    onDelta: () => undefined })).resolves.toMatchObject({ finishReason: null });
+  expect(reader.read).toHaveBeenCalledTimes(1);
+  expect(reader.cancel).toHaveBeenCalledTimes(1);
+});
+
+it("cancels the chat body when processing a frame fails without masking that error", async () => {
+  const failure = new Error("delta handler failed")
+  const reader = {
+    read: vi.fn().mockResolvedValue({ value: new TextEncoder().encode('data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'), done: false }),
+    cancel: vi.fn().mockRejectedValue(new Error("cleanup failed")),
+  }
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, headers: new Headers(), body: { getReader: () => reader } }));
+  await expect(streamChat({ baseUrl: "http://fixture.invalid/v1", apiKey: "", model: "fixture", messages: [],
+    temperature: 0, maxTokens: 8, enableThinking: false, signal: new AbortController().signal,
+    onDelta: () => { throw failure } })).rejects.toBe(failure);
+  expect(reader.cancel).toHaveBeenCalledTimes(1);
+});
+
+it("ignores all frames after DONE in the same network chunk", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(
+    'data: {"choices":[{"delta":{"content":"hello"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\n'
+    + 'data: [DONE]\n\ndata: {"choices":[{"delta":{"content":"late"}}]}\n\ndata: malformed\n\n',
+    { headers: { "content-type": "text/event-stream" } },
+  )));
+  const deltas: string[] = [];
+  const result = await streamChat({ baseUrl: "http://fixture.invalid/v1", apiKey: "", model: "fixture", messages: [],
+    temperature: 0, maxTokens: 8, enableThinking: false, signal: new AbortController().signal,
+    onDelta: text => deltas.push(text) });
+  expect(deltas).toEqual(["hello"]);
+  expect(result.usage).toEqual({ prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 });
+});

@@ -93,6 +93,14 @@ def list_repo_files(repo, revision="main", *, include=(), exclude=(), token=None
     opener = opener or urllib.request.urlopen
     url = (f"{base or endpoint()}/api/models/{repo}/tree/{urllib.parse.quote(revision, safe='')}"
            "?recursive=true")
+    def origin(value):
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+        if port is None:
+            port = {"http": 80, "https": 443}.get(parsed.scheme.lower())
+        return parsed.scheme.lower(), (parsed.hostname or "").lower(), port
+
+    listing_origin = origin(url)
     files = []
     seen = 0
     while url:
@@ -124,7 +132,16 @@ def list_repo_files(repo, revision="main", *, include=(), exclude=(), token=None
                           "git_oid": None if lfs else entry.get("oid")})
         seen += 1
         match = re.search(r'<([^>]+)>;\s*rel="next"', link)
-        url = match.group(1) if match else None
+        try:
+            next_url = urllib.parse.urljoin(url, match.group(1)) if match else None
+            if next_url:
+                target = urllib.parse.urlsplit(next_url)
+                if (origin(next_url) != listing_origin or target.username is not None
+                        or target.password is not None):
+                    raise ValueError("origin mismatch")
+        except ValueError:
+            raise DownloadError(f"{repo}: pagination link changes the listing origin") from None
+        url = next_url
         if seen > 1000:
             raise DownloadError(f"{repo}: listing does not end")
     return files
@@ -204,9 +221,14 @@ def download_file(url, dest, spec, *, token=None, progress=None, opener=None,
             with opener(_request(url, token, headers), timeout=timeout) as response:
                 status = getattr(response, "status", None) or response.getcode()
                 if have and status == 206:
-                    start = _content_range_start(response.headers.get("Content-Range"))
-                    if start is not None and start != have:
-                        raise DownloadError(f"server resumed at byte {start}, expected {have}")
+                    value = response.headers.get("Content-Range") or ""
+                    match = re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+)", value)
+                    if not match:
+                        raise DownloadError("server returned an invalid Content-Range for resume")
+                    start, end, total = map(int, match.groups())
+                    if start != have or not start <= end < size or total != size:
+                        raise DownloadError(f"server returned Content-Range {value!r}; "
+                                            f"expected byte {have} of {size}")
                 elif have:
                     # 200 to a ranged request: the server sent the whole file.
                     have = 0

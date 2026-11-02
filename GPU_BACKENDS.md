@@ -193,9 +193,10 @@ model semantics, routing, expert identity, weight ownership, scheduling and
 fallback; the lane executes one already-selected, already-qualified operation
 family and nothing else. Nothing about it is required to build or run Colibri.
 
-It is **Windows-only**, **off by default**, and **explicitly requested**. The
-qualified operations run in BF16, which is not the arithmetic the normal path
-uses, so output may differ.
+It runs on **Windows and Linux**, is **off by default**, and is **explicitly
+requested**. The qualified operations run in BF16, which is not the arithmetic
+the normal path uses, so output may differ. On Linux the helper is
+`libcoli_xdna.so` (`make -C c xdna-helper`, see [docs/xdna.md](docs/xdna.md#linux)).
 
 ### What is optional, and how
 
@@ -205,7 +206,7 @@ uses, so output may differ.
 | does the default build need an XDNA SDK? | **no** |
 | does a machine need an NPU? | **no** — absence is a normal machine, not an error |
 | does the default path use the lane? | **no** — it is never enabled by discovery |
-| where does XRT live? | only inside an optional native helper, `coli_xdna.dll` |
+| where does XRT live? | only inside an optional native helper, `coli_xdna.dll` (Linux: `libcoli_xdna.so`) |
 | how is the helper reached? | resolved at runtime by absolute path beside the executable |
 
 `c/backend_xdna.h` and `c/backend_xdna.c` are the host-side owners, and they

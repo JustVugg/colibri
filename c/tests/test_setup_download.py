@@ -453,6 +453,96 @@ class DownloadTest(unittest.TestCase):
             with mock.patch.dict(os.environ, env, clear=True):
                 self.assertEqual(setup_download.hf_token(), "hf_from_file")
 
+    def test_resumed_206_requires_a_matching_content_range(self):
+        import io
+        class Response(io.BytesIO):
+            status = 206
+            def __init__(self, content_range):
+                super().__init__(b"def")
+                self.headers = ({"Content-Range": content_range}
+                                if content_range is not None else {})
+        dest = os.path.join(self.dst, "range.bin")
+        os.makedirs(self.dst)
+        for header in (None, "invalid", "bytes 3-5/7", "bytes 3-2/6",
+                       "bytes 3-6/6", "bytes 2-4/6"):
+            with self.subTest(header=header):
+                Path(dest + ".part").write_bytes(b"abc")
+                with self.assertRaises(setup_download.DownloadError):
+                    setup_download.download_file(
+                        "https://example.test/file", dest, {"size": 6},
+                        opener=lambda *a, **k: Response(header), retries=0)
+                self.assertFalse(Path(dest).exists())
+                self.assertEqual(Path(dest + ".part").read_bytes(), b"abc")
+        Path(dest + ".part").write_bytes(b"abc")
+        setup_download.download_file(
+            "https://example.test/file", dest, {"size": 6},
+            opener=lambda *a, **k: Response("bytes 3-5/6"), retries=0)
+        self.assertEqual(Path(dest).read_bytes(), b"abcdef")
+
+
+    def test_listing_pagination_resolves_relative_links(self):
+        import io
+        import json
+        class Response(io.BytesIO):
+            def __init__(self, entries, link=None):
+                super().__init__(json.dumps(entries).encode())
+                self.headers = {"Link": link} if link else {}
+        seen = []
+        def opener(request, **kwargs):
+            seen.append(request.full_url)
+            if len(seen) == 1:
+                return Response([], '<?cursor=next>; rel="next"')
+            self.assertEqual(request.full_url,
+                             "https://example.test/api/models/test/repo/tree/main?cursor=next")
+            return Response([{"type": "file", "path": "config.json", "size": 2}])
+        files = setup_download.list_repo_files("test/repo", base="https://example.test",
+                                               opener=opener)
+        self.assertEqual([f["path"] for f in files], ["config.json"])
+
+    def test_listing_pagination_accepts_equivalent_origin_spellings(self):
+        import io
+        for base, target in (("https://example.test", "https://EXAMPLE.test:443/page"),
+                             ("http://example.test", "http://EXAMPLE.test:80/page")):
+            with self.subTest(target=target):
+                first = io.BytesIO(b"[]")
+                first.headers = {"Link": f'<{target}>; rel="next"'}
+                last = io.BytesIO(b"[]")
+                last.headers = {}
+                opener = mock.Mock(side_effect=[first, last])
+                self.assertEqual(setup_download.list_repo_files(
+                    "test/repo", base=base, opener=opener), [])
+                self.assertEqual(opener.call_count, 2)
+
+    def test_listing_pagination_rejects_changed_ports_and_userinfo(self):
+        import io
+        for target in ("https://example.test:444/page", "https://user@example.test/page",
+                       "http://example.test/page", "https://example.test:invalid/page",
+                       "https://example.test:0/page", "https://[invalid/page"):
+            with self.subTest(target=target):
+                first = io.BytesIO(b"[]")
+                first.headers = {"Link": f'<{target}>; rel="next"'}
+                opener = mock.Mock(return_value=first)
+                with self.assertRaisesRegex(setup_download.DownloadError, "origin"):
+                    setup_download.list_repo_files("test/repo", base="https://example.test",
+                                                   opener=opener, token="test-token")
+                self.assertEqual(opener.call_count, 1)
+
+    def test_listing_rejects_cross_origin_pagination_before_sending_token(self):
+        import io
+        class Response(io.BytesIO):
+            headers = {"Link": '<https://other.test/page>; rel="next"'}
+            def __init__(self):
+                super().__init__(b"[]")
+        def response(request, **kwargs):
+            self.assertEqual(request.host, "example.test",
+                             "pagination must not send credentials to another origin")
+            return Response()
+        opener = mock.Mock(side_effect=response)
+        with self.assertRaisesRegex(setup_download.DownloadError, "origin"):
+            setup_download.list_repo_files("test/repo", base="https://example.test",
+                                           token="test-token", opener=opener)
+        self.assertEqual(opener.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

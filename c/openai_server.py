@@ -447,7 +447,7 @@ def _fallback_tool_calls(tool_calls, index):
         if isinstance(args, str):
             try:
                 args = json.loads(args) if args else {}
-            except (json.JSONDecodeError, TypeError, ValueError):
+            except (TypeError, ValueError, RecursionError):
                 raise APIError(400, "`function.arguments` must be a JSON object.",
                                f"messages.{index}.tool_calls.{position}.function.arguments")
         if args and not isinstance(args, dict):
@@ -1365,6 +1365,22 @@ def decode_wav_mono16k(data, param):
             if len(body) < 16:
                 raise APIError(400, "WAV fmt chunk is too short.", param, "invalid_value")
             fmt = _struct.unpack_from("<HHIIHH", body, 0)
+            if fmt[0] == 0xFFFE:      # WAVE_FORMAT_EXTENSIBLE identifies encoding by GUID.
+                if len(body) < 40:
+                    raise APIError(400, "WAV extensible fmt chunk is too short.", param, "invalid_value")
+                extension_size = _struct.unpack_from("<H", body, 16)[0]
+                if extension_size < 22 or 18 + extension_size > len(body):
+                    raise APIError(400, "WAV extensible fmt has an invalid extension size.",
+                                   param, "invalid_value")
+                guid = body[24:40]
+                guid_tail = bytes.fromhex("00001000800000aa00389b71")
+                if guid == b"\x01\0\0\0" + guid_tail:
+                    fmt = (1,) + fmt[1:]
+                elif guid == b"\x03\0\0\0" + guid_tail:
+                    fmt = (3,) + fmt[1:]
+                else:
+                    raise APIError(400, "Unsupported WAV extensible subformat; use PCM16 or float32.",
+                                   param, "invalid_value")
         elif cid == b"data":
             raw = body
         pos += 8 + size + pad
@@ -1376,8 +1392,6 @@ def decode_wav_mono16k(data, param):
     audio_format, channels, rate, _, _, bits = fmt
     if channels == 0:
         raise APIError(400, "WAV channel count must be positive.", param, "invalid_value")
-    if audio_format == 0xFFFE:      # WAVE_FORMAT_EXTENSIBLE: trust the bit width
-        audio_format = 3 if bits == 32 else 1
     if rate != AUDIO_SAMPLE_RATE:
         raise APIError(400, f"Audio must be {AUDIO_SAMPLE_RATE} Hz (got {rate}). "
                             "Resample at the capture edge.", param, "invalid_value")
@@ -1392,6 +1406,8 @@ def decode_wav_mono16k(data, param):
     else:
         raise APIError(400, f"Unsupported WAV encoding (format {audio_format}, {bits}-bit); "
                             "use PCM16 or float32.", param, "invalid_value")
+    if not np.isfinite(samples).all():
+        raise APIError(400, "WAV samples must be finite numbers.", param, "invalid_value")
     if channels > 1:
         samples = samples.reshape(-1, channels).mean(axis=1)
     return samples
@@ -1481,7 +1497,9 @@ def _k3_parse_arguments(raw):
     skip()
     if idx >= len(s) or s[idx] != "{": return None
     idx += 1; skip()
-    if idx < len(s) and s[idx] == "}": return []
+    if idx < len(s) and s[idx] == "}":
+        idx += 1; skip()
+        return [] if idx == len(s) else None
     out = []
     try:
         while True:
@@ -1497,7 +1515,7 @@ def _k3_parse_arguments(raw):
             skip()
             if idx >= len(s): return None
             c = s[idx]; idx += 1; skip()
-            if c == "}": return out
+            if c == "}": return out if idx == len(s) else None
             if c != ",": return None
     except (json.JSONDecodeError, ValueError):
         return None
@@ -2037,7 +2055,7 @@ def _qwen_tool_calls(tool_calls, has_content, index):
         if isinstance(args, str) and args:
             try:
                 args = json.loads(args)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, RecursionError):
                 raise APIError(400, "`function.arguments` must be a JSON object.",
                                f"messages.{index}.tool_calls.{position}.function.arguments")
         if isinstance(args, dict):
@@ -2825,7 +2843,7 @@ def render_chat_qwen3_coder(messages, tools=None, tool_choice=None, add_generati
                 if isinstance(args, str):
                     try:
                         args = json.loads(args) if args.strip() else {}
-                    except ValueError:
+                    except (ValueError, RecursionError):
                         raise APIError(400, "`function.arguments` must be a JSON object.",
                                        f"{where}.function.arguments")
                 if not isinstance(args, dict):
@@ -3063,7 +3081,7 @@ def _mimo_tool_calls(calls, index):
             if isinstance(args, str) and args.strip():
                 try:
                     args = json.loads(args)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, RecursionError):
                     raise APIError(400, "`function.arguments` must be a JSON object.",
                                    f"{where}.function.arguments")
             if isinstance(args, dict):
@@ -3169,39 +3187,52 @@ def _parse_mimo_tool_calls(reply, tools, track_spans):
     def make_call(name, body):
         args = {}
         found = MIMO_PARAM_RE.findall(body)
-        for key, raw in found:
-            key = key.strip()
-            if raw.startswith("\n"):
-                raw = raw[1:]
-            if raw.endswith("\n"):
-                raw = raw[:-1]
-            declared = (schema.get(name) or {}).get(key) or {}
-            kind = declared.get("type") if isinstance(declared, dict) else None
-            args[key] = _coerce_arg(raw, kind if isinstance(kind, str) else None) \
-                if kind not in (None, "string") else raw
-        if not found and body.strip():
-            try:
+        if found and MIMO_PARAM_RE.sub("", body).strip():
+            return None
+        try:
+            for key, raw in found:
+                key = key.strip()
+                if key in args:
+                    return None
+                if raw.startswith("\n"):
+                    raw = raw[1:]
+                if raw.endswith("\n"):
+                    raw = raw[:-1]
+                declared = (schema.get(name) or {}).get(key) or {}
+                args[key] = _qwen_argument(raw, declared)
+            if not found and body.strip():
                 parsed = json.loads(body)
-                if isinstance(parsed, dict):
-                    args = parsed
-            except (TypeError, ValueError):
-                pass
+                if not isinstance(parsed, dict):
+                    return None
+                args = parsed
+            # Python accepts NaN/Infinity in JSON; these are not JSON arguments.
+            arguments = json.dumps(args, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError, RecursionError):
+            return None
         return {"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
-                "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
+                "function": {"name": name, "arguments": arguments}}
 
     text = reply or ""
     matches = list(MIMO_CALL_RE.finditer(text))
-    calls = [make_call(m.group(1).strip(), m.group(2)) for m in matches]
+    accepted = []
+    calls = []
+    for match in matches:
+        call = make_call(match.group(1).strip(), match.group(2))
+        if call is not None:
+            calls.append(call)
+            accepted.append(match)
     if not calls and tools and ("<tool_call>" in text or "<function=" in text):
         sys.stderr.write("[api] mimo tool markers present but no call parsed -- "
                          "possibly truncated or mangled output\n")
         sys.stderr.flush()
     if not track_spans:
-        return MIMO_CALL_RE.sub("", text).strip(), calls, None, None
-    # The same two deletions as the line above -- every call block, then the surrounding
+        for match in reversed(accepted):
+            text = text[:match.start()] + text[match.end():]
+        return text.strip(), calls, None, None
+    # The same two deletions as the line above -- accepted call blocks, then surrounding
     # whitespace -- found as ranges, so logprobs.content can describe the content returned
     # rather than the raw reply with the call syntax in it.
-    content, box_map = _apply_cuts(text, [(m.start(), m.end()) for m in matches])
+    content, box_map = _apply_cuts(text, [(m.start(), m.end()) for m in accepted])
     head = len(content) - len(content.lstrip())
     kept = len(content.strip())
     content, step = _apply_cuts(content, [(0, head), (head + kept, len(content))])
@@ -3519,7 +3550,7 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
                 if isinstance(args, str):
                     try:
                         args = json.loads(args)
-                    except (json.JSONDecodeError, TypeError):
+                    except (TypeError, ValueError, RecursionError):
                         args = {}
                 if not isinstance(args, dict):
                     # `arguments` that is valid JSON but not an object ("[1,2]",
@@ -3959,7 +3990,7 @@ def _glm53_tool_calls(calls):
         if isinstance(arguments, str):
             try:
                 arguments = json.loads(arguments)
-            except ValueError:
+            except (ValueError, RecursionError):
                 arguments = {}
         if not isinstance(arguments, dict):
             arguments = {}                        # same gap as render_chat above
@@ -5063,6 +5094,9 @@ def anthropic_to_openai(body):
                                    f"{where}.signature")
                 reasoning.append(block["thinking"])
             elif kind == "tool_use":
+                if role != "assistant":
+                    raise APIError(400, "`tool_use` blocks are valid only in assistant messages.",
+                                   where, "unsupported_content_type")
                 name = block.get("name")
                 if not isinstance(name, str) or not name:
                     raise APIError(400, "`tool_use` blocks require a string `name`.", f"{where}.name")
@@ -5076,6 +5110,9 @@ def anthropic_to_openai(body):
                               "function": {"name": name,
                                            "arguments": json.dumps(arguments, ensure_ascii=False)}})
             elif kind == "tool_result":
+                if role != "user":
+                    raise APIError(400, "`tool_result` blocks are valid only in user messages.",
+                                   where, "unsupported_content_type")
                 pictures = []
                 results.append({"role": "tool",
                                 "tool_call_id": block.get("tool_use_id") or "",
