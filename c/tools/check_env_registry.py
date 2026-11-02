@@ -22,7 +22,13 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 C_DIR = os.path.dirname(HERE)
 
-GETENV = re.compile(r'\b(?:q38_env_bool|(?:compat_)?getenv(?:_utf8)?)\s*\(\s*"([A-Z0-9_]+)"')
+# getenv() and the engines' wrappers that take the literal name first (mimo's
+# env_int, qwen38's q38_env_*, vk_tier's env_gb, ...). A new wrapper goes here,
+# or the names it reads look unread.
+READERS = ("getenv", "compat_getenv", "compat_getenv_utf8", "getenv_utf8",
+           "q38_env_bool", "q38_env_int_in_range", "q38_env_positive_int",
+           "env_int", "env_gb", "vkc_kv_env", "coli_env_on", "coli_omp_env_on")
+GETENV = re.compile(r'\b(?:%s)\s*\(\s*"([A-Z0-9_]+)"' % "|".join(READERS))
 # Consume literals and comments before looking for calls. This is a lexical
 # scan of literal names, not a C preprocessor or dynamic-name evaluator.
 SOURCE_TOKEN = re.compile(

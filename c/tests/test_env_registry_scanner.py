@@ -20,10 +20,10 @@ class RegistryScannerTest(unittest.TestCase):
     def test_calls_across_lines_and_whitespace(self):
         (self.root / "engine.c").write_text(
             'getenv (\n "COLI_A");\nq38_env_bool(\n "Q38_B");\n'
-            'compat_getenv_utf8("COLI_C");\n')
+            'compat_getenv_utf8("COLI_C");\nenv_int("MIMO_D", 0);\n')
         self.assertEqual(registry.scan_sources(), {
             "COLI_A": ["engine.c:1"], "Q38_B": ["engine.c:3"],
-            "COLI_C": ["engine.c:5"]})
+            "COLI_C": ["engine.c:5"], "MIMO_D": ["engine.c:6"]})
 
     def test_comments_and_strings_are_not_calls(self):
         (self.root / "engine.c").write_text(

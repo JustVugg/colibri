@@ -3,7 +3,7 @@
 
 int main(void) {
     const unsigned short engines[] = {CE_COLIBRI, CE_KIMI, CE_INKLING, CE_OLMOE,
-        CE_DSV4, CE_QWEN, CE_GLM53, CE_QWEN38, CE_DSV41, CE_QWENIMAGE};
+        CE_DSV4, CE_QWEN, CE_GLM53, CE_QWEN38, CE_DSV41, CE_QWENIMAGE, CE_MIMO, CE_LAYA, CE_GLINER};
     for (unsigned i = 0; i < sizeof(engines) / sizeof(engines[0]); ++i) {
         assert(coli_env_find("COLI_ENV_STRICT")->engines & engines[i]);
         assert(coli_env_find("COLI_ENV_DUMP")->engines & engines[i]);
@@ -17,6 +17,11 @@ int main(void) {
     assert(coli_env_find("COLI_PLACE")->engines == (CE_QWEN | CE_QWEN38));
     assert(coli_env_find("CACHE_ROUTE")->engines & CE_QWEN);
     assert(coli_env_find("SNAP")->engines & CE_DSV41);
+    assert(coli_env_find("MIMO_CAP")->engines == CE_MIMO);   /* read through mimo.c's env_int() */
+    assert(coli_env_find("SNAP")->engines & CE_MIMO);
+    assert(coli_env_is_ours("MIMO_CA"));
+    assert(coli_env_find("COLI_LAYA_MAX_LEN")->engines == CE_LAYA);
+    assert(coli_env_find("COLI_TUI_SIXEL")->engines == 0);   /* a tool's, no engine warns */
     assert(coli_env_is_ours("V41_DSPAR"));
     assert(!strcmp(coli_env_suggest("V41_DSPAR"), "V41_DSPARK"));
     assert(!coli_env_find("V41_DSPAR"));
