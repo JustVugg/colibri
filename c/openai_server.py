@@ -2610,7 +2610,12 @@ def _muse_value(raw, schema):
         # the template writes None as `null`, and every string as is
         return None if raw == "null" and "null" in kinds else raw
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        # Python accepts NaN, Infinity and overflowing JSON exponents, also
+        # inside containers. Tool arguments must remain JSON; use the same
+        # text fallback as any other value that cannot be read as JSON.
+        json.dumps(parsed, allow_nan=False)
+        return parsed
     except ValueError:
         return raw
 
