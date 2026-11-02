@@ -59,7 +59,7 @@ __host__ __device__ constexpr int bd_grid_base(int t) {
     return t == 22 ? BDT_IQ2S : t == 21 ? BDT_IQ3S : t == 17 ? BDT_IQ2XS : t == 18 ? BDT_IQ3XXS : BDT_IQ2XXS;
 }
 __host__ __device__ constexpr int bd_ks_words(int t) { return t == 16 || t == 17 || t == 18 ? 128 : 0; }
-__host__ __device__ constexpr int bd_kv_words(int t) { return t == 20 || t == 23 ? 16 : 0; }
+__host__ __device__ constexpr int bd_kv_words(int t) { return 0; }   /* IQ4's values in registers (bdi_kv4) */
 __host__ __device__ constexpr int bd_tab_words(int t) { return (bd_grid_words(t) + bd_ks_words(t) + bd_kv_words(t) + 3) & ~3; }
 
 struct BdTabs { const bd_u32 *grid, *ks; const int *kvt; const bd_u32 *tab; };
@@ -126,10 +126,22 @@ __device__ __forceinline__ void bdx_quant(const float *__restrict__ x, int nrow,
 /* 0xFF in each byte whose bit (of the low four) is set: those bytes are negated */
 __device__ __forceinline__ bd_u32 bdi_smask(bd_u32 b4) { return ((b4 * 0x00204081u) & 0x01010101u) * 0xFFu; }
 __device__ __forceinline__ bd_u32 bdi_neg(bd_u32 g, bd_u32 b4) { bd_u32 m = bdi_smask(b4 & 15u); return (g ^ m) + (m & 0x01010101u); }
-/* four kvalues (IQ4) of the nibbles at bit sh of each byte of w, as packed int8 */
-__device__ __forceinline__ int bdi_kv4(const int *kvt, bd_u32 w, int sh) {
-    return (int)(((bd_u32)kvt[(w >> sh) & 15u] & 255u) | (((bd_u32)kvt[(w >> (sh + 8)) & 15u] & 255u) << 8) |
-                 (((bd_u32)kvt[(w >> (sh + 16)) & 15u] & 255u) << 16) | (((bd_u32)kvt[(w >> (sh + 24)) & 15u] & 255u) << 24));
+/* IQ4's sixteen values (GGML_KVALUES_IQ4NL) as int8, four a word, values 0..3 in the first */
+#define BD_KV4_0 0xBFAD9881u   /* -127 -104 -83 -65 */
+#define BD_KV4_1 0xF6EADDCFu   /*  -49  -35 -22 -10 */
+#define BD_KV4_2 0x26190D01u   /*    1   13  25  38 */
+#define BD_KV4_3 0x71594535u   /*   53   69  89 113 */
+/* four kvalues (IQ4) of the nibbles at bit sh of each byte of w, as packed int8: each nibble's
+ * low three bits pick its value among the lower eight and among the upper eight (__byte_perm on
+ * the words above, no table in memory), its fourth bit which of the two. The kernel spent its
+ * time on the four table reads a word (an IQ4_XS GEMV at 54-83 % of the SM's issue, 26-44 % of
+ * the DRAM's bandwidth, an RTX PRO 4000); the values are the table's. */
+__device__ __forceinline__ int bdi_kv4(bd_u32 w, int sh) {
+    const bd_u32 v = (w >> sh) & 0x0F0F0F0Fu, x = v & 0x07070707u, y = x | (x >> 4);
+    const bd_u32 sel = __byte_perm(y, 0u, 0x0020u);   /* nibble i: index i's low three bits */
+    const bd_u32 lo = __byte_perm(BD_KV4_0, BD_KV4_1, sel), hi = __byte_perm(BD_KV4_2, BD_KV4_3, sel);
+    const bd_u32 m = ((v >> 3) & 0x01010101u) * 0xFFu;   /* 0xFF in each byte whose index is 8 or more */
+    return (int)((lo & ~m) | (hi & m));
 }
 /* Q4_K / Q5_K: byte j of the block's 12 scale bytes (words 1..3), the 6-bit scale and min of group g */
 __device__ __forceinline__ bd_u32 bdi_kb(uint4 hd, bd_u32 j) { bd_u32 w = j < 4u ? hd.y : j < 8u ? hd.z : hd.w; return (w >> (8u * (j & 3u))) & 255u; }
@@ -337,7 +349,7 @@ __device__ __forceinline__ void bdi_step(const bd_u32 *__restrict__ W, bd_u32 q,
         #pragma unroll
         for (int k = 0; k < 4; k++) {
             bd_u32 wd = T == 20 ? bd_ldu(W, qa + 4u * k) : bd_w(W, (qa >> 2) + (bd_u32)k);
-            w[k] = bdi_kv4(tb.kvt, wd, 0); w[k + 4] = bdi_kv4(tb.kvt, wd, 4);
+            w[k] = bdi_kv4(wd, 0); w[k + 4] = bdi_kv4(wd, 4);
         }
     } else if (T == 21) {   /* IQ3_S: 8 chunks of 4 weights, a grid row each, its signs */
         bd_u32 b = q >> 3, ib = q & 7u, base = b * 110u;
