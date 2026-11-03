@@ -502,4 +502,79 @@ of 65 slots a layer instead of 78) left them from position 1,226 on (top token a
 KL max 0.50). The same configuration again (`hl_2637_none2`) and 9372715b in it (`hl_2637_none_old`)
 gave the CPU's bytes. That run had put 10,189 experts on the CPU (7,858 and 8,132 in the other
 two) and taken 6 more from the read-ahead pool: a timing-dependent fault in the MoE step's reads,
-slots or waves, outside the code changed here; not reproduced, open.
+slots or waves, outside the code changed here; not reproduced, open (the next section).
+
+## The rare fault, hunted (`raw/ck_*`, `mx_*`, `hc_*`, `pd_*`, `pn_*`, 2026-11-03)
+
+`hl_2637_none`'s divergence did not come back in 22 runs of its configuration. Hunting it found a
+different fault in the same reads -- a prompt that hangs when a drive falls behind -- now fixed.
+
+- **A debug mode**, `K3_CHECK` (`docs/ENVIRONMENT.md`): a sampled hash of each expert's bytes (a
+  word of every 4 KiB page) as its read lands, checked again when the card or a CPU wave takes the
+  expert and when it is done with it; a step's output rows filled with a canary first, checked
+  before the sums; the waves' x87 and SSE control words. `K3_CHECK_DUMP`: per layer every row's
+  hashes at seven points (attention, the MoE's input, latent, routed sum, shared experts, output,
+  the layer's output) and every pair's output with its expert, row and who computed it.
+  `ckdiff.py` gives the first layer, record and rows where two runs' dumps part, and for the pairs
+  whether the CPU or the card computed them in each.
+- **The configuration again** (2,637 tokens at the launcher's 8,192 step, every matrix the host's;
+  `series_ck.sh`, `series_mix.sh`, `series_pair.sh`): every run the CPU's bytes, the dumps the same
+  record for record, no finding; with the same numbers a 3 GB read-ahead pool (most experts misses,
+  the cache's 75 slots reused within every step), CPU waves of one expert, one reader a drive, and
+  the default profile's run just before, as in the parent's series (its logits file still being
+  written). 10,189 experts on the CPU was no outlier: 5,632 to 12,852 here, every run exact.
+- **What the bad run shows**: its logits part at 1,226 already by 0.12 rms (KL 0.003), most at
+  1,227-1,235 (0.32, KL up to 0.32), then about 0.2 to the end: one perturbation, carried along by
+  the recurrent state. Its 6 experts more from the pool came after it (the routing past 1,226).
+  1,226 is no piece's edge (the MLA core's chunks start at 0, 256, .., 1,024, 1,280, 1,504; KDA's
+  pieces are 512 rows, the dense matrices' 1,024). It and its exact rerun ran one build (05:34);
+  the edits after them touched only decode kernels, which no prompt call reaches. Its one
+  outlier: waiting for reads 37.0 s, against 27.8-31.0 in every other run of the configuration.
+- **The machine**: the card's memory runs at 12,101 MHz (its stock maximum 10,501), the core at
+  2,925 MHz; the RAM is 4 x 48 GB DDR5 (JEDEC 4,800) at 5,400 MT/s, two DIMMs a channel; no ECC.
+  `vramtest.cu` (18 GiB for 300 s: 2,342 passes of write, read-and-invert, read, 135 TB read, and
+  pinned copies both ways), `ramtest.c` (150 GiB for 600 s, 49 passes) and `k3stress.c` (the real
+  `k3_wave` and `k3cu_moe_*` over K3's shapes, repeated on the CPU and the card at once for 300 s:
+  1,542 and 14,194 repeats against the first result, bit for bit): no error.
+- **Read for races, none found**: the claims, `avail` and the slots' publication between the
+  feeder and the waves, `busy` and the pool's drop and refill, the reader queues,
+  `k3cu_moe_expert`'s copy before its kernels and its device slots, `k3_down`'s rows,
+  `k3_dense_b`/`k3_dense_b8`'s staging, the KDA recurrence and conv, the MLA core's and layer's two
+  streams and two buffers, `mg_run`, `k3_mla_soft`, `omp_spin.c`'s fork, join and dynamic loops,
+  `exp_f`'s x87 stack. The canaries also show the card's writes into pinned memory reaching the
+  CPU's caches.
+
+**The hang.** A run with its reads slowed (`K3_IO_DELAY_US=1500`, about 15 ms on Windows' timer)
+stopped at layer 65 with nothing on stderr, and so did d5e9925c's build (`raw/mx_5_iod.bt`,
+`raw/hc_prod.bt`): the feeder thread inside `exit`, in `k3_io_stop` waiting for `g_io.mx` --
+which it held itself, having called `exit` from `k3_io_submit`'s "reader queue overflow" -- and
+the readers and the main thread waiting on it. C:'s prefetch queue held 4,096 entries (tail less
+head) while 508 of its demands waited; D:'s held 6. A read ahead that a step asks for moves to the
+demands (`k3_io_promote`) and leaves a hole where it was; a reader passes a hole only when it
+gets there, and it does not get there while its drive has demands waiting. The holes counted
+against `K3_IOQ` though the queue never held more than the pool's 1,139 reads: a drive that falls
+behind for a few dozen layers fills it with them, and the next read ahead exits -- into a
+deadlock, since `exit` runs `k3_io_stop` (atexit) before it flushes stderr. Now a full queue is
+compacted first (its reads moved up over the holes, their slots' positions with them), the exit
+lets go of the mutex, a promotion stays where it is when the demands are full, and `k3_io_stop`
+does not join the thread that calls it. `hc_fix`: the same slowed reads end with the CPU's bytes
+(448 s, waiting 345 s: C: at about a quarter of its rate).
+
+| run | what | result |
+|---|---|---:|
+| `ck_1`..`ck_12` | the configuration, `K3_CHECK` and its dump | the CPU's bytes, 153.2-155.1 s; no finding (`ck_1`, `ck_2`: the FPU check counted MXCSR's sticky flags, masked since) |
+| `mx_1_ra3` | + `K3_READAHEAD_GB=3` | the CPU's bytes; 171.0 s, waiting 45.0 s, 9,198 experts on the CPU |
+| `mx_2_as`, `mx_4_as` | as `ck_*` (`mx_4` beside `k3stress`) | the CPU's bytes (`mx_4`: 188.3 s, 12,852 on the CPU) |
+| `mx_3_wave1` | + `K3_GPU_CPU_WAVE=1` | the CPU's bytes; 162.0 s |
+| `mx_5_iod`, `hc_prod` | + `K3_IO_DELAY_US=1500`: this build, d5e9925c's | hung at layer 65 (`raw/*.bt`) |
+| `hc_fix` | the same, with the fix | the CPU's bytes; 448.0 s, waiting 344.6 s |
+| `pd_1`..`pd_5` | the default profile (the card's matrices), with the fix | the CPU's bytes, 109.2-109.3 s |
+| `pn_1`..`pn_5` | at once after each `pd`: the configuration with the fix (`pn_1`, `pn_3`, `pn_5`: `K3_IO_PER_DRIVE=1`) | the CPU's bytes; 153.3-153.4 s, one reader a drive 172.1-172.4 s (waiting 56 s); no finding |
+| `vramtest`, `ramtest`, `k3stress` | the card's memory, the RAM, the expert kernels at their clocks | no error (`raw/vramtest_18g_300s.txt`, `ramtest_150g_600s.txt`, `k3stress_300s.txt`) |
+
+Open: the divergence. It has come up once in 25 runs of this configuration (the parent's three
+and these 22), as a perturbation at one row (1,226), and the bad run's only measurable difference
+was slower reads. Runs that check logits with `K3_CHECK=1
+K3_CHECK_DUMP=<file>` locate it if it returns: `ckdiff.py` against a good run's dump names the
+layer, the rows and the experts (and who computed them), and the slot checks say whether an
+expert's bytes changed between its read and its use.

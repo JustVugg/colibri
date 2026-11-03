@@ -1,0 +1,2 @@
+8 experts, 2047 pairs at 3584x3072; 300 s of the CPU's k3_wave on 16 threads beside the GPU's kernels
+CPU: 1542 iterations, 0 outputs differed; GPU: 14194 iterations, 0 outputs differed

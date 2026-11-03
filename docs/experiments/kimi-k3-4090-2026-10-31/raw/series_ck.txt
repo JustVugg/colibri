@@ -1,0 +1,29 @@
+ck_1: the CPU's bytes | [K3-CHECK] the prompt: 603252 findings | 67628 of the prompt's routed experts on the GPU, 11571 on the CPU; 20 GiB of the | 154.1s (17.11 tok/s)
+ck_2: the CPU's bytes | [K3-CHECK] the prompt: 595296 findings | 67798 of the prompt's routed experts on the GPU, 11401 on the CPU; 20 GiB of the | 155.1s (17.00 tok/s)
+ck_3: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 67439 of the prompt's routed experts on the GPU, 11760 on the CPU; 20 GiB of the | 153.9s (17.14 tok/s)
+ck_4: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 67694 of the prompt's routed experts on the GPU, 11505 on the CPU; 20 GiB of the | 153.7s (17.15 tok/s)
+ck_5: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 67666 of the prompt's routed experts on the GPU, 11533 on the CPU; 20 GiB of the | 153.8s (17.15 tok/s)
+ck_6: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 67636 of the prompt's routed experts on the GPU, 11563 on the CPU; 20 GiB of the | 154.0s (17.12 tok/s)
+ck_7: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 67584 of the prompt's routed experts on the GPU, 11615 on the CPU; 20 GiB of the | 153.4s (17.19 tok/s)
+ck_8: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 67627 of the prompt's routed experts on the GPU, 11572 on the CPU; 20 GiB of the | 153.2s (17.21 tok/s)
+ck_9: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 67649 of the prompt's routed experts on the GPU, 11550 on the CPU; 20 GiB of the | 153.5s (17.18 tok/s)
+ck_10: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 67713 of the prompt's routed experts on the GPU, 11486 on the CPU; 20 GiB of the | 153.4s (17.20 tok/s)
+series ck 3..10 done
+ck_11: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 67476 of the prompt's routed experts on the GPU, 11723 on the CPU; 20 GiB of the | 154.7s (17.04 tok/s)
+mx_1_ra3: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 70001 of the prompt's routed experts on the GPU, 9198 on the CPU; 64 GiB of the  | 171.0s (15.42 tok/s)
+mx_2_as: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 67587 of the prompt's routed experts on the GPU, 11612 on the CPU; 20 GiB of the | 155.0s (17.01 tok/s)
+mx_3_wave1: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 68264 of the prompt's routed experts on the GPU, 10935 on the CPU; 20 GiB of the | 162.0s (16.28 tok/s)
+mx_4_as: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 66347 of the prompt's routed experts on the GPU, 12852 on the CPU; 20 GiB of the | 188.3s (14.00 tok/s)
+hc_prod: HUNG after 600 s (1 threads in k3_io_stop) |  |  |  | 
+hc_fix: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 448.0s (5.89 tok/s) | waiting for reads 344.6 | 
+pd_1: the CPU's bytes |  | 70097 of the prompt's routed experts on the GPU, 9102 on the CPU; 20 GiB of the  | 109.3s (24.12 tok/s) | waiting for reads 46.5
+pn_1_r1: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 69397 of the prompt's routed experts on the GPU, 9802 on the CPU; 20 GiB of the  | 172.1s (15.32 tok/s) | waiting for reads 56.0
+pd_2: the CPU's bytes |  | 70058 of the prompt's routed experts on the GPU, 9141 on the CPU; 20 GiB of the  | 109.2s (24.15 tok/s) | waiting for reads 46.4
+pn_2: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 67703 of the prompt's routed experts on the GPU, 11496 on the CPU; 20 GiB of the | 153.4s (17.19 tok/s) | waiting for reads 30.4
+pd_3: the CPU's bytes |  | 69962 of the prompt's routed experts on the GPU, 9237 on the CPU; 20 GiB of the  | 109.2s (24.15 tok/s) | waiting for reads 46.5
+pn_3_r1: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 69474 of the prompt's routed experts on the GPU, 9725 on the CPU; 20 GiB of the  | 172.2s (15.31 tok/s) | waiting for reads 56.2
+pd_4: the CPU's bytes |  | 69925 of the prompt's routed experts on the GPU, 9274 on the CPU; 20 GiB of the  | 109.2s (24.16 tok/s) | waiting for reads 46.4
+pn_4: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 67650 of the prompt's routed experts on the GPU, 11549 on the CPU; 20 GiB of the | 153.3s (17.20 tok/s) | waiting for reads 29.8
+pd_5: the CPU's bytes |  | 70049 of the prompt's routed experts on the GPU, 9150 on the CPU; 20 GiB of the  | 109.2s (24.15 tok/s) | waiting for reads 46.5
+pn_5_r1: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 69479 of the prompt's routed experts on the GPU, 9720 on the CPU; 20 GiB of the  | 172.4s (15.30 tok/s) | waiting for reads 56.2
+series pair 1..5 done

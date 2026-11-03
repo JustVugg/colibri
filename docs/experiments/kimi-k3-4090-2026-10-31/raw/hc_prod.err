@@ -1,0 +1,25 @@
+[SPLIT] +D:\AI\Models\Kimi-K3 -> 92 shard(s)
+[SPLIT] model across 2 dir(s): 188 shard(s) total (primary C:\AI\Kimi-K3 -> 96 shard(s)), no duplication
+[OMP] spinning team: 16 threads spin 2000 us between regions (COLI_OMP_SPIN_US; COLI_OMP_SPIN=0: libgomp's team)
+[K3] loaded layer 1/93 (0.7s, RSS 1.6 GB)
+[K3] loaded layer 9/93 (3.8s, RSS 3.8 GB)
+[K3] loaded layer 17/93 (6.8s, RSS 6.6 GB)
+[K3] loaded layer 25/93 (10.1s, RSS 9.2 GB)
+[K3] loaded layer 33/93 (13.3s, RSS 12.1 GB)
+[K3] loaded layer 41/93 (16.3s, RSS 14.9 GB)
+[K3] loaded layer 49/93 (19.6s, RSS 17.5 GB)
+[K3] loaded layer 57/93 (22.9s, RSS 20.3 GB)
+[K3] loaded layer 65/93 (26.2s, RSS 23.1 GB)
+[K3] loaded layer 73/93 (29.7s, RSS 25.8 GB)
+[K3] loaded layer 81/93 (33.3s, RSS 28.6 GB)
+[K3] loaded layer 89/93 (36.8s, RSS 31.3 GB)
+[K3-CUDA] experts: a prompt step's routed experts (steps of 32 rows or more) on GPU 0 beside the CPU, the CPU's bytes (K3_GPU_EXPERTS=0: the CPU's alone)
+[K3][RAM_GB=174.0] resident 34.0 GB + reserve 34.9 GB (page cache 2.5, activations 12.0, read-ahead 20.0, KV 24x8192 0.5, checkpoints 0 0.0) -> 105.1 GB for experts; cache 619->65/layer (17.5 MB/slot, 92 layers; projected peak 173.9 GB)
+[K3] K3_EXPERT_GB=1000 does not fit alongside the 34.0 GB already resident. It is a request, not a reservation.
+[K3] init done in 39.5s | 93 layers | expert cache 65/layer (17.5 MB/slot) | RSS 34.0 GB
+[USAGE] expert history: 68851328 selections (C:\AI\Kimi-K3/.coli_usage)
+[K3] tokenizer.json loaded (family=kimi)
+[K3] prompt: 2637 tokens | ngen 0 | temp 0.00
+[KDA] L0 metal=0 P=12288 H=96 hd=128 K=4
+[K3-PATH] L0 attn=KDA metal=0
+rc=1 wall=607s

@@ -1,0 +1,2 @@
+18 GiB of VRAM under test for 300 s
+2342 passes in 300 s, 3.39e+13 word reads: 0 wrong after a write, 0 wrong on the read-and-invert; copies through pinned memory: 0 wrong words

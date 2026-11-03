@@ -526,6 +526,8 @@ Read **only** by `c/kimi_k3.c`. The K3 engine has its own loader, cache and quan
 | `K3_CHAT_IDS` | unset | Print the chat-template token ids for the built prompt, then continue. |
 | `K3_TRACE` | unset | Write a routing trace to `K3_TRACE=<file>`. |
 | `K3_LOGITS` | unset | Write per-step logits to `K3_LOGITS=<file>`. |
+| `K3_CHECK` | `0` (off) | Debugging a prompt step's routed experts: a sampled hash of an expert's bytes as its read lands, checked when the card or a CPU wave takes it and when done with it; the pairs' output rows filled with a canary before the step and checked before the weighted sums; the x87 and SSE control words in the CPU's waves. Every finding on stderr (`[K3-CHECK]`), a count at the prompt's end. The same bytes. |
+| `K3_CHECK_DUMP` | unset | With `K3_CHECK` (it turns it on): per layer the hashes of every row's attention output, MoE input, latent, routed sum, shared experts, MoE output and layer output, and of every pair's output row with its expert, row and who computed it (CPU or card), into this file. Two runs' files compare record by record (`docs/experiments/kimi-k3-4090-2026-10-31/ckdiff.py`): the first layer and rows where they part. |
 | `K3_X0` | unset | Read input rows `[T, hidden]` as f32 from this file, bypassing the embedding — for feeding activations captured elsewhere. |
 
 ## Inkling engine (`inkling`)
