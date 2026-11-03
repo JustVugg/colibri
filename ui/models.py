@@ -1154,7 +1154,11 @@ def stop_gateway(p, job):
     job.update(state="stopping", msg="fermo il server attuale")
     os.kill(p["pid"], signal.SIGTERM)
     for _ in range(60):
-        if not os.path.exists("/proc/%d" % p["pid"]):
+        try:
+            reaped, _ = os.waitpid(p["pid"], os.WNOHANG)
+        except ChildProcessError:
+            reaped = 0
+        if reaped == p["pid"] or not os.path.exists("/proc/%d" % p["pid"]):
             break
         time.sleep(1)
     else:
