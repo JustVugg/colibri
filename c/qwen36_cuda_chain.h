@@ -1383,6 +1383,9 @@ static void q36cc_promote(Q36CChain *ch, Model *m, int rows) {
     }
     QtPromo pr[Q36CC_PROMO_SLOTS];
     int n = qt_chain_promote(max, pr);
+    /* the step's copies in one call (cc_host_up_many), its pending pairs from p0 on one ticket */
+    void *ud[6 * Q36CC_PROMO_SLOTS]; const void *us[6 * Q36CC_PROMO_SLOTS]; size_t ub[6 * Q36CC_PROMO_SLOTS];
+    int nu = 0, p0 = ch->pr_npend;
     for (int k = 0; k < n; k++) {
         QtPromo *q = &pr[k];
         int slot = -1;
@@ -1394,16 +1397,20 @@ static void q36cc_promote(Q36CChain *ch, Model *m, int rows) {
         }
         char *st = (char *)cc_ptr(ch->pr_buf) + (size_t)slot * ch->pr_stride, *sc = st + 3 * q->mb;
         qt_chain_promote_stage(st, q);
-        unsigned tk = 0;
-        if (!cc_host_up((void *)wg, st, q->mb, &tk) || !cc_host_up((void *)wu, st + q->mb, q->mb, &tk) || !cc_host_up((void *)wd, st + 2 * q->mb, q->mb, &tk) ||
-            !cc_host_up((void *)sg, sc, q->sb_gu, &tk) || !cc_host_up((void *)su, sc + q->sb_gu, q->sb_gu, &tk) || !cc_host_up((void *)sd, sc + 2 * q->sb_gu, q->sb_d, &tk)) {
-            qt_chain_promote_done(q->ci, q->vi, 0);   /* the victim's buffers hold neither now */
-            continue;
-        }
+        void *dd[6] = {(void *)wg, (void *)wu, (void *)wd, (void *)sg, (void *)su, (void *)sd};
+        const void *ss[6] = {st, st + q->mb, st + 2 * q->mb, sc, sc + q->sb_gu, sc + 2 * q->sb_gu};
+        const size_t bb[6] = {q->mb, q->mb, q->mb, q->sb_gu, q->sb_gu, q->sb_d};
+        for (int j = 0; j < 6; j++) { ud[nu] = dd[j]; us[nu] = ss[j]; ub[nu++] = bb[j]; }
         ch->pr_busy[slot] = 1;
         ch->pr_pend[ch->pr_npend].ci = q->ci; ch->pr_pend[ch->pr_npend].vi = q->vi; ch->pr_pend[ch->pr_npend].slot = slot;
-        ch->pr_pend[ch->pr_npend].tk = tk; ch->pr_npend++;
+        ch->pr_pend[ch->pr_npend].tk = 0; ch->pr_npend++;
         ch->dm_promoted++;
+    }
+    unsigned tk = 0;
+    if (nu && cc_host_up_many(ud, us, ub, nu, &tk)) for (int p = p0; p < ch->pr_npend; p++) ch->pr_pend[p].tk = tk;
+    else if (nu) {   /* refused: the victims' buffers hold neither now */
+        for (int p = p0; p < ch->pr_npend; p++) { qt_chain_promote_done(ch->pr_pend[p].ci, ch->pr_pend[p].vi, 0); ch->pr_busy[ch->pr_pend[p].slot] = 0; ch->dm_promoted--; }
+        ch->pr_npend = p0;
     }
     ch->promo_ms += tm_now() - t0;
 }
