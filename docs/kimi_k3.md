@@ -259,7 +259,7 @@ a 2,637-token prompt took 1,401 s in 512-token steps, 549 s on the CPU in steps 
 the CPU's bytes there too), 113 s with the card's own matrices in `quant_matmul_blocked` and
 **106.5 s** with the exact dense kernel's lanes in one thread (`k3_dense_b`), the logits the same
 bytes; the drive with 61% of every layer's experts reads 92% of the time; a 5,862-token prompt
-173 s in one step of 8,192). Each rewrite below keeps
+173 s in one step of 8,192 then, 111 s with the layers and the card's matrices below). Each rewrite below keeps
 every row's and position's arithmetic:
 - the gated MLA's scores were one chain of 576 adds a position (GCC -O3 multiplies 16 at
   a time, then adds the products in order); `k3_mla_scores_g` keeps that arithmetic (an
@@ -405,15 +405,19 @@ matrices that are not routed experts on the card with `K3_CUDA_DENSE=1`: the hea
 the gated MLA's `o_proj` and gate, KDA's projections, then smaller ones, in the int8
 rows and int4 groups `K3_BITS` made, until `K3_CUDA_DENSE_GB` (20) or the card's free
 memory less `K3_CUDA_RESERVE_GB` (2) is used. `w_matmul` runs a placed matrix there
-for every row count: one row through `coli_cuda_matmul`, a prompt step's rows through
-`coli_cuda_matmul_tiled` (the same bytes, about 4x sooner at 32 or 512 rows; at the trunk's
-shapes `quant_matmul_blocked`, 16 outputs by 8 rows a thread, another 2-3x: the 2,637-token
-prompt's 369 calls 32.6 -> 15.6 s, `COLI_CUDA_QMB=0` the 8 by 8 tiles again). Every token reads all of these matrices (about 35 GiB at the
+for every row count. With `coli_cuda_k3.dll` beside the engine (a `CUDA_DLL=1` build's)
+that is the CPU's arithmetic, `k3cu_matmul_dev` (below): from 64 rows `k3_dense_b` and
+`k3_dense_b8`, up to 4 rows (a decode step) `k3_mv4` and `k3_mv8`, `k3_dense` between,
+and only the int8 rows and int4 groups those kernels take go up (all of K3's at the default
+bits). Without it, coli_cuda.dll's own kernels: one row through `coli_cuda_matmul`
+(`quant_matvec_warp`), a prompt step's rows through `coli_cuda_matmul_tiled` (at the
+trunk's shapes `quant_matmul_blocked`, 16 outputs by 8 rows a thread), quant_matmul's
+sums. Every token reads all of these matrices (about 35 GiB at the
 default bits), so on a machine whose RAM bandwidth is shared with the experts' reads
 this takes the largest part of the dense work off it: on an RTX 4090 a 12288 x 7168
-int4 projection takes 0.06 ms a decode row against 0.90 ms on 16 Zen 4 cores, the
-163840 x 7168 int8 head 1.2 ms against 18.4 (`tests/bench_k3_cuda_dense.c`; one row runs
-`quant_matvec_warp`, quant_matmul's sums and tree a warp an output, so its bytes).
+int4 projection takes 0.05 ms a decode row against 0.90 ms on 16 Zen 4 cores, the
+163840 x 7168 int8 head 1.2 ms against 18.4 (a whole call with its copies; a decode
+token's 369 held matrices about 24 ms, 24-29 in coli_cuda.dll's kernels).
 `kv_b` stays on the CPU (the MLA absorb reads its rows), and so do the routers and
 KDA's small f32 projections, so the routing is the CPU's arithmetic on its input (a prompt
 step with `coli_cuda_k3.dll` multiplies them on the card in that same arithmetic, below). The
@@ -423,10 +427,14 @@ the f32 copy's bits (the tiny model's logits, routers stored as BF16 or as the s
 in F32: the same bytes) from half the RAM: a decode token reads every router twice (the
 routing and the next layer's prediction), 2.4 GB less a token, 94 -> 58 ms on the 4090.
 
-The products are the CPU's, summed in f32 in another order: not the CPU's bytes, as
-with every GPU backend. On the tiny fixture the argmax is the CPU's at all 70 prompt
-positions and 24 generated tokens are the same, max KL 4e-12 at the default bits and
-8e-7 at `K3_BITS=32`. `K3_CUDA_RELEASE_HOST=1` frees the placed matrices' host
+With `coli_cuda_k3.dll` these are the CPU's bytes: matmul_q's and matmul_i4_grouped's
+lanes, sums and roundings, so the GPU's logits are the CPU build's (Kimi K3's 2,637- and
+5,862-token prompts at every position against runs on the CPU alone, 35 tokens fed one a step
+through the decode kernels, 48 tokens of text: the same bytes). coli_cuda.dll's own kernels
+add the same products in another order, which a long prompt carries a long way (routing flips,
+the recurrent state): against the CPU's logits the top token at 5-6% of the positions, KL 0.014
+on average; the prompts' own perplexity 13.01 against 13.09 and 10.53 against 10.56, within 1-1.6
+standard errors (`docs/experiments/kimi-k3-4090-2026-10-31`). `K3_CUDA_RELEASE_HOST=1` frees the placed matrices' host
 copies before the expert cache is sized, so the cache gets that RAM; if a GPU call
 fails, the CPU computes every matrix from then on, reading a released one back from
 the checkpoint (`COLI_GPU_FAIL_AFTER=N` tests it: the same tokens).
@@ -480,7 +488,15 @@ way.
   at a time, 0, 4, 2, 6, 1, 5, 3, 7, so each finished lane joins hsum256's tree at once (three
   kept an output); a nibble's decode is one mask and one fused add. 13-15 TMAC/s against
   k3_dense's 3.1-3.6 (`K3_GPU_DENSE_B=0`), the same bytes: the 2,637-token prompt's shared
-  experts 17.3 -> 10.5 s, its latent projections 5.6 -> 3.1 s.
+  experts 17.3 -> 10.5 s, its latent projections 5.6 -> 3.1 s. Int8 rows take `k3_dense_b8`
+  from 64 rows: a thread holds all 8 lanes of 4 rows by 4 outputs (matmul_q's lanes run the
+  whole row), 16 weights a load, a weight's decode one byte permute and one add. Up to 4 rows
+  (a decode step) `k3_mv4` and `k3_mv8`: an output's 8 lanes on 8 threads that load the same
+  16 bytes, the group's or the row's tree by shuffles.
+- **The dense matrices the card holds** (`k3cu_matmul_dev`, every row count `w_matmul` asks
+  for, a decode step's one too): the same kernels on coli_cuda.dll's copies
+  (`coli_cuda_tensor_dev_ptrs`; its upload flips each int4 nibble's top bit, the kernels flip
+  it back as the words come in), so the CPU's bytes there as well.
 - **The gated MLA's attention core** (`k3cu_mla`): mla_forward's loop -- the absorbed
   query (fused, w_addrow's), the scores (products rounded, added in order from zero,
   then scaled), `softmax_` (its sum in order), the values (fused over the positions in
@@ -496,18 +512,16 @@ way.
   RMSNorm (its squares summed in double in order, as `rmsnorm_`) and qb, kva into the cache
   rows (RMSNorm on the latent, the rope part as it is, written back to the model's cache),
   the gate, the core and o_proj, the output down. A matrix the card holds runs on
-  coli_cuda.dll's copy in the kernel `w_matmul` gets for it there (`quant_matmul_blocked`),
-  the others from their host weights in `k3cu_matmul`'s kernels; where a held matrix has no
-  `quant_matmul_blocked` shape, or `K3_GPU_MLA=0`, the layer goes call by call around the
-  core as before, every matrix's input up and output back. At 5,862 tokens the layers 11.2
+  coli_cuda.dll's copy, the others from their host weights, all in `k3cu_matmul`'s kernels;
+  with `K3_GPU_MLA=0` the layer goes call by call around the core as before, every matrix's
+  input up and output back. At 5,862 tokens the layers 11.2
   -> 9.0 s (the prompt 122.2 -> 121.0 s), at 2,637 tokens 4.5 -> 3.2 s (C:'s reads its floor).
 - **The routers** (`k3cu_router`): the bf16 router's 32 lanes and halving tree, a warp an
   output.
 - **The KDA layers** (`k3cu_kda`): kda_forward's by-step path in pieces of
   `K3_GPU_KDA_ROWS` (512) rows, the layer's input up once and its output back. The
   projections the card holds run on coli_cuda.dll's own copies (`coli_cuda_tensor_dev_ptrs`)
-  in the kernel `w_matmul` gets for them there (`quant_matmul_blocked`, `qmb_kernel.cuh`,
-  compiled into both DLLs), the others are computed as before and handed in; then the conv
+  in `k3cu_matmul_dev`'s kernels, the others are computed as before and handed in; then the conv
   (its taps fused in order, SiLU through exp_f), the f32 projections (matmul_f32.h's 32 lanes),
   k3_kda_head's norms (the squares rounded and added in order, GCC's in-order reduction),
   decay, recurrence (a thread a column of the head's state, in registers, the two sweeps'
@@ -541,7 +555,7 @@ the RAM).
 | `K3_GPU_MIN_ROWS` | 32 | the rows a step needs for it (1 in tests: every step) |
 | `K3_GPU_CPU_WAVE` | 4 | the experts the CPU takes at a time beside the card |
 | `K3_GPU_PIN_GB` | 64 | the expert slots' pinned memory, GiB |
-| `K3_GPU_DENSE_B` | 1 | the dense matrices' and shared experts' int4 groups of 64 through `k3_dense_b` from 64 rows (0: `k3_dense`) |
+| `K3_GPU_DENSE_B` | 1 | the dense matrices' and shared experts' int4 groups of 64 through `k3_dense_b` and int8 rows through `k3_dense_b8` from 64 rows, `k3_mv4`/`k3_mv8` up to 4 (0: `k3_dense`) |
 | `K3_GPU_KDA` | 1 | a prompt step's KDA layers on the card, `k3cu_kda` (0: the CPU's) |
 | `K3_GPU_MLA` | 1 | a prompt step's gated MLA layers whole on the card, `k3cu_mla_layer` (0: call by call around the core) |
 | `K3_GPU_KDA_ROWS` | 512 | the rows of a KDA layer's piece on the card |

@@ -264,6 +264,35 @@ static int check_shared(int C, int D, int MI, int ns, int gs){
  *    multiplies them there (w_matmul), the GPU path on that copy in its own kernel; the others
  *    stay the host's. Rows in several of k3cu_kda's pieces. */
 static int g_cuda_up = -1;
+/* 3b. The same on coli_cuda.dll's copy of the matrix (its int4 nibbles flipped), k3cu_matmul_dev: a
+ *     decode step's 1 to 4 rows (k3_mv4, k3_mv8), a few more (k3_dense), a prompt's (k3_dense_b,
+ *     k3_dense_b8), pieces cut short by K3_MMBYTES; every output matmul_i4_grouped's or matmul_q's bytes. */
+static int check_dense_dev(int fmt, int S, int I, int O, int gs){
+    if(g_cuda_up < 0){ int dev = 0; g_cuda_up = coli_cuda_init(&dev, 1) ? 1 : 0; }
+    if(!g_cuda_up){ printf("dense on the card: no coli_cuda.dll: skipped\n"); return 0; }
+    size_t wb = fmt == 4 ? (size_t)O * (I / 2) : (size_t)O * I, ns = fmt == 4 ? (size_t)O * (I / gs) : (size_t)O;
+    uint8_t *w = malloc(wb); float *sc = malloc(ns * sizeof(float));
+    float *x = malloc((size_t)S * I * sizeof(float)), *yc = malloc((size_t)S * O * sizeof(float)), *yg = malloc((size_t)S * O * sizeof(float));
+    for(size_t i = 0; i < wb; i++) w[i] = (uint8_t)(rnd32() >> 24);
+    for(size_t i = 0; i < ns; i++) sc[i] = rndf() * 0.01f;
+    for(size_t i = 0; i < (size_t)S * I; i++) x[i] = rndf();
+    if(fmt == 4) matmul_i4_grouped(yc, x, w, sc, S, I, O, gs);
+    else matmul_q(yc, x, (const int8_t *)w, sc, S, I, O);
+    memset(yg, 0xff, (size_t)S * O * sizeof(float));
+    ColiCudaTensor *t = NULL;
+    const void *dw = NULL; const float *ds = NULL; int tgs = 0;
+    int ok = coli_cuda_tensor_upload_g(&t, w, sc, fmt, I, O, 0, fmt == 4 ? gs : 0) &&
+             coli_cuda_tensor_dev_ptrs(t, &dw, &ds, &tgs) == fmt && k3cu_matmul_dev(fmt, yg, x, dw, ds, S, I, O, tgs);
+    size_t diff = 0, first = (size_t)-1;
+    for(size_t i = 0; i < (size_t)S * O; i++) if(memcmp(yc + i, yg + i, 4)){ if(first == (size_t)-1) first = i; diff++; }
+    if(diff) printf("  output %zu: CPU %a, device %a\n", first, yc[first], yg[first]);
+    printf("dense on the card %s %dx%d%s%s, %d rows: %s%zu of %zu differ\n", fmt == 4 ? "int4" : "int8", O, I,
+           fmt == 4 ? ", groups of " : "", fmt == 4 ? (gs == 64 ? "64" : gs == 32 ? "32" : "128") : "", S,
+           ok ? "" : "FAILED to run; ", diff, (size_t)S * O);
+    if(t) coli_cuda_tensor_free(t);
+    free(w); free(sc); free(x); free(yc); free(yg);
+    return !ok || diff;
+}
 static void kda_rand(float *p, size_t n, float s){ for(size_t i = 0; i < n; i++) p[i] = rndf() * s; }
 static int check_kda(int C, int D, int H, int hd, int K, int card){
     const int P = H * hd;
@@ -299,23 +328,23 @@ static int check_kda(int C, int D, int H, int hd, int K, int card){
         for(int i = 0; i < 5 && card; i++)
             if(card >> i & 1)
                 up &= coli_cuda_tensor_upload_g((ColiCudaTensor **)&ws[i]->cuda, ws[i]->q4, ws[i]->s, 4, ws[i]->I, ws[i]->O, 0, 64);
-        g_k3_cuda_dense = card != 0;
+        g_k3_cuda_exact = 1;
     }
-    /* the CPU's: the by-step path */
+    /* the CPU's: the by-step path, every projection the host's */
     memcpy(kst, st0, (size_t)H * hd * hd * 4);
     for(int w = 0; w < 3; w++) memcpy(win[w], w0[w], (size_t)P * K * 4);
-    g_k3_kda_gpu = 0; g_k3g_on = 0;
+    g_k3_kda_gpu = 0; g_k3g_on = 0; g_k3_cuda_dense = 0;
     kda_forward(m, l, 0, x, C, oc);
     memcpy(stc, kst, (size_t)H * hd * hd * 4);
     for(int w = 0; w < 3; w++) memcpy(wc[w], win[w], (size_t)P * K * 4);
-    /* the GPU's */
+    /* the GPU's, the card's projections there */
     memcpy(kst, st0, (size_t)H * hd * hd * 4);
     for(int w = 0; w < 3; w++) memcpy(win[w], w0[w], (size_t)P * K * 4);
-    g_k3_kda_gpu = 1; g_k3g_on = 1; m->t_kda_gpu = 0;
+    g_k3_kda_gpu = 1; g_k3g_on = 1; m->t_kda_gpu = 0; g_k3_cuda_dense = card != 0;
     memset(og, 0xff, (size_t)C * D * 4);
     kda_forward(m, l, 0, x, C, og);
     const int ran = m->t_kda_gpu > 0;
-    g_k3g_on = 0; g_k3_cuda_dense = 0;
+    g_k3g_on = 0;
     size_t dout = 0, dst = 0, dwin = 0, first = (size_t)-1;
     for(size_t i = 0; i < (size_t)C * D; i++) if(memcmp(oc + i, og + i, 4)){ if(first == (size_t)-1) first = i; dout++; }
     for(size_t i = 0; i < (size_t)H * hd * hd; i++) if(memcmp(stc + i, kst + i, 4)) dst++;
@@ -324,6 +353,19 @@ static int check_kda(int C, int D, int H, int hd, int K, int card){
     printf("KDA %d heads of %d, %d columns, conv %d, card's projections 0x%02x, %d rows: %s%zu of %zu outputs, %zu of %zu state, "
            "%zu of %zu window values differ\n", H, hd, D, K, card, C, ran && up ? "" : "FAILED to run on the GPU; ",
            dout, (size_t)C * D, dst, (size_t)H * hd * hd, dwin, (size_t)3 * P * K);
+    if(card){   /* the by-step path with the card's projections: w_matmul's k3cu_matmul_dev */
+        memcpy(kst, st0, (size_t)H * hd * hd * 4);
+        for(int w = 0; w < 3; w++) memcpy(win[w], w0[w], (size_t)P * K * 4);
+        g_k3_kda_gpu = 0;
+        memset(og, 0xff, (size_t)C * D * 4);
+        kda_forward(m, l, 0, x, C, og);
+        size_t d2 = 0;
+        for(size_t i = 0; i < (size_t)C * D; i++) d2 += memcmp(oc + i, og + i, 4) != 0;
+        for(size_t i = 0; i < (size_t)H * hd * hd; i++) d2 += memcmp(stc + i, kst + i, 4) != 0;
+        printf("KDA by step, the card's projections 0x%02x, %d rows: %zu of the outputs and state differ\n", card, C, d2);
+        dout += d2;
+    }
+    g_k3_cuda_dense = 0;
     for(int i = 0; i < 5; i++){ if(ws[i]->cuda) coli_cuda_tensor_free((ColiCudaTensor *)ws[i]->cuda); free(ws[i]->q4); free(ws[i]->s); }
     free(a->fa); free(a->fb); free(a->bp); free(a->conv_q); free(a->conv_k); free(a->conv_v); free(a->dt); free(a->A); free(a->onw);
     free(kst); free(st0); free(stc);
@@ -375,26 +417,39 @@ static int check_mla_layer(int C, int pos0, int D, int H, int qn, int qr, int vh
             if(card >> i & 1)
                 up &= ws[i]->fmt == 4 ? coli_cuda_tensor_upload_g((ColiCudaTensor **)&ws[i]->cuda, ws[i]->q4, ws[i]->s, 4, ws[i]->I, ws[i]->O, 0, 64)
                                       : coli_cuda_tensor_upload_g((ColiCudaTensor **)&ws[i]->cuda, ws[i]->q8, ws[i]->s, 1, ws[i]->I, ws[i]->O, 0, 0);
-        g_k3_cuda_dense = card != 0;
+        g_k3_cuda_exact = 1;
     }
-    /* the call-by-call path, its core the CPU's */
+    /* the call-by-call path, its core and every matrix the CPU's */
     memcpy(Lc, L0, nl * 4); memcpy(Rc, R0, nr * 4);
-    g_k3_mla_gpu = 0; g_k3g_on = 0;
+    g_k3_mla_gpu = 0; g_k3g_on = 0; g_k3_cuda_dense = 0;
     mla_forward(m, l, 0, x, pos0, C, oc);
     memcpy(Lg, Lc, nl * 4); memcpy(Rg, Rc, nr * 4);
-    /* the layer path */
+    /* the layer path, the card's matrices there */
     memcpy(Lc, L0, nl * 4); memcpy(Rc, R0, nr * 4);
     const int min_rows = g_k3g_min_rows;
-    g_k3_mla_gpu = 1; g_k3g_on = 1; g_k3g_min_rows = 1;
+    g_k3_mla_gpu = 1; g_k3g_on = 1; g_k3g_min_rows = 1; g_k3_cuda_dense = card != 0;
     const unsigned long long before = g_k3_mla_layers;
     memset(og, 0xff, (size_t)C * D * 4);
     mla_forward(m, l, 0, x, pos0, C, og);
     const int ran = g_k3_mla_layers > before;
-    g_k3g_on = 0; g_k3_cuda_dense = 0; g_k3g_min_rows = min_rows;
+    g_k3g_on = 0; g_k3g_min_rows = min_rows;
     size_t dout = 0, dl = 0, dr = 0, first = (size_t)-1;
     for(size_t i = 0; i < (size_t)C * D; i++) if(memcmp(oc + i, og + i, 4)){ if(first == (size_t)-1) first = i; dout++; }
     for(size_t i = 0; i < nl; i++) if(memcmp(Lg + i, Lc + i, 4)) dl++;
     for(size_t i = 0; i < nr; i++) if(memcmp(Rg + i, Rc + i, 4)) dr++;
+    if(card){   /* call by call with the card's matrices: w_matmul's k3cu_matmul_dev */
+        memcpy(Lc, L0, nl * 4); memcpy(Rc, R0, nr * 4);
+        g_k3_mla_gpu = 0;
+        float *o2 = malloc((size_t)C * D * 4);
+        mla_forward(m, l, 0, x, pos0, C, o2);
+        size_t d2 = 0;
+        for(size_t i = 0; i < (size_t)C * D; i++) d2 += memcmp(oc + i, o2 + i, 4) != 0;
+        for(size_t i = 0; i < nl; i++) d2 += memcmp(Lg + i, Lc + i, 4) != 0;
+        printf("MLA call by call, the card's 0x%02x, rows %d..%d: %zu of the outputs and cache values differ\n", card, pos0, N - 1, d2);
+        dout += d2;
+        free(o2);
+    }
+    g_k3_cuda_dense = 0;
     if(dout) printf("  output %zu: CPU %a, device %a\n", first, oc[first], og[first]);
     printf("MLA layer %d heads (%d+%d, v %d, latent %d, q %d), %d columns, card's 0x%02x%s, rows %d..%d: %s%zu of %zu outputs, "
            "%zu of %zu cache values differ\n", H, qn, qr, vh, kvl, ql, D, card, i4 ? " (g, o int4)" : "", pos0, N - 1,
@@ -405,11 +460,24 @@ static int check_mla_layer(int C, int pos0, int D, int H, int qn, int qr, int vh
     free(Lc); free(Rc); free(L0); free(R0); free(Lg); free(Rg); free(x); free(oc); free(og); free(l); free(m);
     return !up || ran != want || dout || dl || dr;
 }
+int dense_dev(void){
+    int bad = 0;
+    const int rows[] = { 1, 2, 3, 4, 5, 37, 64, 300, 1030 };
+    for(int i = 0; i < 9; i++) bad += check_dense_dev(4, rows[i], 7168, 200, 64) + check_dense_dev(1, rows[i], 7168, 200, 0);
+    bad += check_dense_dev(4, 1, 12288, 72, 64) + check_dense_dev(4, 300, 12288, 72, 64);   /* KDA's o_proj */
+    bad += check_dense_dev(1, 1, 12288, 100, 0) + check_dense_dev(1, 260, 12288, 100, 0);  /* MLA's o_proj */
+    bad += check_dense_dev(1, 300, 1536, 300, 0);   /* qb */
+    bad += check_dense_dev(4, 70, 1024, 96, 32) + check_dense_dev(4, 1, 1024, 96, 32);     /* groups of 32: k3_dense */
+    bad += check_dense_dev(1, 100, 1040, 50, 0) + check_dense_dev(1, 1, 1032, 50, 0);      /* widths k3_dense_b8 and k3_mv8 leave to k3_dense */
+    bad += check_dense_dev(1, 1100, 7168, 60000, 0);   /* pieces of 998 rows (K3_MMBYTES), the head's case */
+    return bad;
+}
 int mla_layers(void){
     return check_mla_layer(300, 200, 7168, 96, 128, 64, 128, 512, 1536, 8 | 16, 0, 1)   /* g and o on the card: K3's own */
          + check_mla_layer(40, 0, 7168, 96, 128, 64, 128, 512, 1536, 0, 1, 1)          /* every matrix the host's */
          + check_mla_layer(130, 3000, 7168, 96, 128, 64, 128, 512, 1536, 1 | 4 | 8 | 16, 1, 1)   /* chunks cut by their scores */
-         + check_mla_layer(50, 10, 7168, 96, 128, 64, 128, 512, 1536, 2 | 8 | 16, 0, 0)     /* qb on the card: call by call */
+         + check_mla_layer(50, 10, 7168, 96, 128, 64, 128, 512, 1536, 2 | 8 | 16, 0, 1)     /* qb on the card too */
+         + check_mla_layer(3, 20, 7168, 96, 128, 64, 128, 512, 1536, 1 | 2 | 4 | 8 | 16, 0, 1)   /* 3 rows: every matrix k3_mv8's */
          + check_mla_layer(600, 50, 128, 8, 16, 8, 16, 32, 64, 0, 0, 1);                 /* the tiny model's shapes, 3 chunks */
 }
 
@@ -418,6 +486,12 @@ int main(int argc, char **argv){
     if(!k3cu_init(0)){ printf("no CUDA device or coli_cuda_k3.dll: skipped\n"); return 0; }
     if(argc > 1 && !strcmp(argv[1], "--kda")){   /* the KDA layer's cases alone */
         int bad = check_kda(40, 128, 2, 16, 4, 0) + check_kda(1100, 7168, 96, 128, 4, 0x1f) + check_kda(600, 7168, 96, 128, 4, 0x12);
+        k3cu_report();
+        printf(bad ? "FAILED\n" : "ok\n");
+        return bad ? 1 : 0;
+    }
+    if(argc > 1 && !strcmp(argv[1], "--dev")){   /* coli_cuda.dll's matrices alone */
+        int bad = dense_dev();
         k3cu_report();
         printf(bad ? "FAILED\n" : "ok\n");
         return bad ? 1 : 0;
@@ -440,7 +514,12 @@ int main(int argc, char **argv){
     bad += check_dense(4, 300, 7168, 200, 64);  /* k3_dense_b: 9 blocks of 32 rows and one of 12, 192 outputs and 8 */
     bad += check_dense(4, 1030, 3584, 7168, 64);/* the latent's up: a 1024-row piece by k3_dense_b, 6 rows by k3_dense */
     bad += check_dense(1, 33, 7168, 100, 0);
-    bad += check_dense(1, 1030, 512, 40, 0);
+    bad += check_dense(1, 1030, 512, 40, 0);    /* k3_dense_b8: a 1024-row piece; 6 rows by k3_dense */
+    bad += check_dense(4, 1, 7168, 300, 64);    /* k3_mv4 */
+    bad += check_dense(4, 3, 3584, 70, 64);
+    bad += check_dense(1, 1, 7168, 300, 0);     /* k3_mv8 */
+    bad += check_dense(1, 4, 1536, 70, 0);
+    bad += dense_dev();
     bad += check_mla(96, 128, 64, 128, 512, 100, 40);
     bad += check_mla(96, 128, 64, 128, 512, 1000, 300);   /* two chunks of rows, the scores' blocks past nt skipped */
     bad += check_mla(96, 128, 64, 128, 512, 3000, 200);   /* chunks cut to their scores' 128 MB */

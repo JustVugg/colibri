@@ -1989,7 +1989,7 @@ __global__ static void __launch_bounds__(256) quant_matmul_tiled(float *y, const
     }
 }
 
-/* quant_matmul_blocked and qmb_rows (qmb_kernel.cuh, shared with coli_cuda_k3.dll): quant_matmul_tiled's
+/* quant_matmul_blocked and qmb_rows (qmb_kernel.cuh): quant_matmul_tiled's
  * bytes register-blocked for a prompt step at Kimi K3's trunk shapes. */
 #include "qmb_kernel.cuh"
 static int qmb_mode(void) {
@@ -2214,9 +2214,10 @@ extern "C" int coli_cuda_matmul_tiled(ColiCudaTensor **tensor,
     return 1;
 }
 
-/* A tensor's device copy, for another module's kernels on the same device (Kimi K3's KDA
- * layer in coli_cuda_k3.dll runs qmb_kernel.cuh's quant_matmul_blocked on it): its weights,
- * its scales and their group size. Returns its format, -1 when it has no plain copy. */
+/* A tensor's device copy, for another module's kernels on the same device (coli_cuda_k3.dll
+ * runs Kimi K3's matrices on it in the CPU's arithmetic): its weights (int4 nibbles flipped,
+ * as the upload leaves them), its scales and their group size. Returns its format, -1 when
+ * it has no plain copy. */
 extern "C" int coli_cuda_tensor_dev_ptrs(const ColiCudaTensor *tensor, const void **weights,
                                          const float **scales, int *gs) {
     if (!tensor || !tensor->weights) return -1;

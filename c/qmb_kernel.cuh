@@ -1,7 +1,5 @@
-/* qmb_kernel.cuh -- quant_matmul_blocked and its input copy, in one place for the two
- * modules that run it: coli_cuda.dll (backend_cuda.cu, coli_cuda_matmul_tiled) and
- * coli_cuda_k3.dll (backend_cuda_k3.cu, Kimi K3's KDA layer on the matrices coli_cuda.dll
- * holds), so both give the same bytes. Include it once per translation unit. */
+/* qmb_kernel.cuh -- quant_matmul_blocked and its input copy, for coli_cuda.dll
+ * (backend_cuda.cu, coli_cuda_matmul_tiled). Include it once per translation unit. */
 #ifndef QMB_KERNEL_CUH
 #define QMB_KERNEL_CUH
 #include <cstdint>

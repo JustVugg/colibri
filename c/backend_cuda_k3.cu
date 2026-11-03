@@ -25,7 +25,6 @@
 #include "backend_cuda_k3.h"
 #include "k3_exact.h"
 #include "k3_exact_tables.h"
-#include "qmb_kernel.cuh"   // quant_matmul_blocked: the KDA layer's projections on coli_cuda.dll's matrices
 
 #define K3_TP 8       // rows a block: one an output's lane
 #define K3_TO 32      // outputs a block: a group of 32, so the block quantizes what it computes
@@ -272,11 +271,12 @@ __global__ void __launch_bounds__(256) k3_down(const uint8_t *__restrict__ w2p, 
 // weight (its nibble less 8) and then x[i+8+l] times its weight, for each 16 columns, fused; the
 // group's hsum256 times its scale fused into the total (fmaf). matmul_q (fmt 1): 8 lanes summing
 // x[i+l] times the int8 weight, fused, over the whole row; hsum256 times the row's scale. Lane l
-// is thread l of the output's 8, as for the experts; x comes in chunks of K3_KC columns.
+// is thread l of the output's 8, as for the experts; x comes in chunks of K3_KC columns. fl 0x88:
+// int4 bytes as coli_cuda.dll's upload leaves them (each nibble's top bit flipped, two's complement).
 #define K3_KC 512
 __global__ void __launch_bounds__(256) k3_dense(int fmt, const uint8_t *__restrict__ w, const float *__restrict__ scale,
                                                 const float *__restrict__ x, int S, int I, int O, int gs,
-                                                float *__restrict__ y) {
+                                                float *__restrict__ y, int fl) {
     __shared__ float sx[K3_TP * K3_KC];
     const int l = threadIdx.x & 7, q = threadIdx.x >> 3;
     const int o = blockIdx.x * K3_TO + q, p0 = blockIdx.y * K3_TP, oc = o < O ? o : O - 1;
@@ -300,7 +300,7 @@ __global__ void __launch_bounds__(256) k3_dense(int fmt, const uint8_t *__restri
                 for (int p = 0; p < K3_TP; p++) acc[p] = 0.0f;
                 for (int i = base; i < base + gs; i += 16) {
                     const int e0 = k0 + i + l, e1 = e0 + 8;
-                    const uint8_t b0 = w4[e0 >> 1], b1 = w4[e1 >> 1];
+                    const uint8_t b0 = w4[e0 >> 1] ^ fl, b1 = w4[e1 >> 1] ^ fl;
                     const float v0 = (float)((int)((e0 & 1) ? b0 >> 4 : b0 & 15) - 8);
                     const float v1 = (float)((int)((e1 & 1) ? b1 >> 4 : b1 & 15) - 8);
 #pragma unroll
@@ -340,6 +340,7 @@ __global__ void __launch_bounds__(256) k3_dense(int fmt, const uint8_t *__restri
 // fused add takes the place p and the 8 out, exactly. The block's rows of x go to shared memory by
 // column, 128 columns a stage, double-buffered. About 4x k3_dense's rate from 64 rows (13-15 T
 // multiply-adds a second at Kimi K3's shapes on an RTX 4090), the same bytes; K3_GPU_DENSE_B=0: k3_dense.
+// F: coli_cuda.dll's copy (its nibbles flipped back as the words come in).
 #define KB_RS 4
 #define KB_RO 6
 #define KB_BR 32                    // rows a block
@@ -377,6 +378,7 @@ __device__ __forceinline__ void kb_lane(const float (*sxc)[KB_PAD], int r0, cons
         }
     }
 }
+template <int F>
 __global__ void __launch_bounds__(256, 1) k3_dense_b(const uint8_t *__restrict__ w, const float *__restrict__ scale,
                                                      const float *__restrict__ x, int S, int I, int O,
                                                      float *__restrict__ y) {
@@ -423,6 +425,9 @@ __global__ void __launch_bounds__(256, 1) k3_dense_b(const uint8_t *__restrict__
                 const uint4 u1 = __ldg(reinterpret_cast<const uint4 *>(wrow[j] + (size_t)g * 32 + 16));
                 W[j][0] = u0.x; W[j][1] = u0.y; W[j][2] = u0.z; W[j][3] = u0.w;
                 W[j][4] = u1.x; W[j][5] = u1.y; W[j][6] = u1.z; W[j][7] = u1.w;
+                if (F)
+#pragma unroll
+                    for (int m = 0; m < 8; m++) W[j][m] ^= 0x88888888u;
             }
             const float (*sxc)[KB_PAD] = sx[b];
             const int cb = gg * 64;
@@ -488,20 +493,236 @@ __global__ void __launch_bounds__(256, 1) k3_dense_b(const uint8_t *__restrict__
         for (int j = 0; j < KB_RO; j++) if (ob + j < O) y[(size_t)row * O + ob + j] = tot[r][j];
     }
 }
+// matmul_q's arithmetic for several rows: output o's lane l sums columns l, l+8, l+16, .. of the whole
+// row, fused from +0; then hsum256's tree ((a0+a4)+(a2+a6)) + ((a1+a5)+(a3+a7)) times the row's scale.
+// Thread (tr, to): rows 4 tr .. +3 of the block's 32 by outputs 4 to .. +3 of its 128, the 8 lanes of
+// each in its own registers (128 sums); 16 weights a load, each made a float by one byte permute and
+// one add: (b ^ 0x80) under 2^23's exponent, less 2^23 + 128. x staged as k3_dense_b stages it.
+#define K8_RO 4
+#define K8_BO 128                   // outputs a block
+__device__ __forceinline__ float k8_val(uint32_t w, int b) {   // byte b of w (^ 0x80 already) as the int8 it was
+    return __fadd_rn(__uint_as_float(__byte_perm(w, 0x4B000000u, 0x7440u | (unsigned)b)), -8388736.0f);
+}
+__global__ void __launch_bounds__(256, 1) k3_dense_b8(const int8_t *__restrict__ w, const float *__restrict__ scale,
+                                                      const float *__restrict__ x, int S, int I, int O,
+                                                      float *__restrict__ y) {
+    __shared__ __align__(16) float sx[2][KB_SC][KB_PAD];
+    const int t = threadIdx.x, tr = t & 7, to = t >> 3;
+    const int s0 = blockIdx.y * KB_BR, ob = blockIdx.x * K8_BO + to * K8_RO, r0 = tr * KB_RS;
+    float a[8][KB_RS][K8_RO];
+#pragma unroll
+    for (int l = 0; l < 8; l++)
+#pragma unroll
+        for (int r = 0; r < KB_RS; r++)
+#pragma unroll
+            for (int j = 0; j < K8_RO; j++) a[l][r][j] = 0.0f;
+    const int sc_c = t & 127, sc_r = (t >> 7) * 16;
+    float xs[16];
+    auto xload = [&](int k0) {
+#pragma unroll
+        for (int q = 0; q < 16; q++) {
+            const int row = s0 + sc_r + q, rr = row < S ? row : S - 1;
+            xs[q] = __ldg(x + (size_t)rr * I + k0 + sc_c);
+        }
+    };
+    auto xstore = [&](int b) {
+#pragma unroll
+        for (int q = 0; q < 4; q++)
+            *reinterpret_cast<float4 *>(&sx[b][sc_c][sc_r + 4 * q]) = make_float4(xs[4 * q], xs[4 * q + 1], xs[4 * q + 2], xs[4 * q + 3]);
+    };
+    const int nst = I / KB_SC;
+    xload(0); xstore(0);
+    if (nst > 1) xload(KB_SC);
+    __syncthreads();
+    const int8_t *wrow[K8_RO];
+#pragma unroll
+    for (int j = 0; j < K8_RO; j++) { const int o = ob + j < O ? ob + j : O - 1; wrow[j] = w + (size_t)o * I; }
+    for (int st = 0; st < nst; st++) {
+        const float (*sxc)[KB_PAD] = sx[st & 1];
+#pragma unroll 1
+        for (int c = 0; c < KB_SC; c += 16) {
+            uint32_t W[K8_RO][4];
+#pragma unroll
+            for (int j = 0; j < K8_RO; j++) {
+                const uint4 u = __ldg(reinterpret_cast<const uint4 *>(wrow[j] + (size_t)st * KB_SC + c));
+                W[j][0] = u.x ^ 0x80808080u; W[j][1] = u.y ^ 0x80808080u; W[j][2] = u.z ^ 0x80808080u; W[j][3] = u.w ^ 0x80808080u;
+            }
+#pragma unroll
+            for (int k = 0; k < 16; k++) {   // column c + k, lane k & 7
+                const float4 xv = *reinterpret_cast<const float4 *>(&sxc[c + k][r0]);
+                const float xr[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+                for (int j = 0; j < K8_RO; j++) {
+                    const float wv = k8_val(W[j][k >> 2], k & 3);
+#pragma unroll
+                    for (int r = 0; r < KB_RS; r++) a[k & 7][r][j] = __fmaf_rn(xr[r], wv, a[k & 7][r][j]);
+                }
+            }
+        }
+        if (st + 1 < nst) {
+            __syncthreads();
+            xstore((st & 1) ^ 1);
+            __syncthreads();
+            if (st + 2 < nst) xload((st + 2) * KB_SC);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < K8_RO; j++) {
+        const int o = ob + j;
+        const float sc = __ldg(scale + (o < O ? o : O - 1));
+#pragma unroll
+        for (int r = 0; r < KB_RS; r++) {
+            const int row = s0 + r0 + r;
+            const float v = __fadd_rn(__fadd_rn(__fadd_rn(a[0][r][j], a[4][r][j]), __fadd_rn(a[2][r][j], a[6][r][j])),
+                                      __fadd_rn(__fadd_rn(a[1][r][j], a[5][r][j]), __fadd_rn(a[3][r][j], a[7][r][j])));
+            if (row < S && o < O) y[(size_t)row * O + o] = __fmul_rn(v, sc);
+        }
+    }
+}
+
+// A decode step's matrices (1 to 4 rows).
+// int4 in groups of 64 (matmul_i4_grouped), a row at a time: thread t of a block takes the groups t, t + 256,
+// .. of its MV_OB outputs four outputs a task (a warp 32 groups side by side, 1 KB of weights a load per
+// output; the group's 64 inputs loaded once for the four: a load an output made L1 the limit), their weights
+// and scales first; a group's 8 lanes in its registers (lane l: columns 8m + l, fused from +0; kb_lane_w's
+// decode), hsum256's tree into shared memory beside the group's scale; then a thread an output adds the
+// groups into the total in their order, each fused with its scale.
+#define MV_OB 8                     // outputs a block
+__device__ __forceinline__ float kb_lane_v(uint32_t w, int l) {   // nibble l of w less 8 (l known once unrolled)
+    switch (l) {
+    case 0: return kb_lane_w<0>(w);
+    case 1: return kb_lane_w<1>(w);
+    case 2: return kb_lane_w<2>(w);
+    case 3: return kb_lane_w<3>(w);
+    case 4: return kb_lane_w<4>(w);
+    case 5: return kb_lane_w<5>(w);
+    case 6: return kb_lane_w<6>(w);
+    default: return kb_lane_w<7>(w);
+    }
+}
+template <int F>
+__global__ void __launch_bounds__(256) k3_mv4(const uint8_t *__restrict__ w, const float *__restrict__ scale,
+                                                const float *__restrict__ x, int I, int O, float *__restrict__ y) {
+    extern __shared__ float mv_gs[];   // [MV_OB][ng | 1] the groups' sums, then their scales
+    const int ng = I >> 6, ld = ng | 1, o0 = blockIdx.x * MV_OB, nt = (MV_OB / 4) * ng;
+    float *gsum = mv_gs, *gsc = mv_gs + MV_OB * ld;
+    for (int k = threadIdx.x; k < nt; k += blockDim.x) {
+        const int jq = k / ng, g = k - jq * ng;
+        uint4 u[4][2];
+        float s4[4];
+#pragma unroll
+        for (int q = 0; q < 4; q++) {
+            const int o = o0 + 4 * jq + q < O ? o0 + 4 * jq + q : O - 1;
+            const uint4 *wp = reinterpret_cast<const uint4 *>(w + (size_t)o * (I >> 1)) + 2 * g;
+            u[q][0] = __ldg(wp); u[q][1] = __ldg(wp + 1);
+            s4[q] = __ldg(scale + (size_t)o * ng + g);
+        }
+        float xv[64];
+        const float4 *xp = reinterpret_cast<const float4 *>(x + 64 * g);
+#pragma unroll
+        for (int c = 0; c < 16; c++) {
+            const float4 p = __ldg(xp + c);
+            xv[4 * c] = p.x; xv[4 * c + 1] = p.y; xv[4 * c + 2] = p.z; xv[4 * c + 3] = p.w;
+        }
+#pragma unroll
+        for (int q = 0; q < 4; q++) {
+            const uint32_t W[8] = {u[q][0].x, u[q][0].y, u[q][0].z, u[q][0].w, u[q][1].x, u[q][1].y, u[q][1].z, u[q][1].w};
+            float a[8];
+#pragma unroll
+            for (int l = 0; l < 8; l++) a[l] = 0.0f;
+#pragma unroll
+            for (int m = 0; m < 8; m++) {
+                const uint32_t wm = F ? W[m] ^ 0x88888888u : W[m];
+#pragma unroll
+                for (int l = 0; l < 8; l++) a[l] = __fmaf_rn(xv[8 * m + l], kb_lane_v(wm, l), a[l]);
+            }
+            const int j = 4 * jq + q;
+            gsum[j * ld + g] = __fadd_rn(__fadd_rn(__fadd_rn(a[0], a[4]), __fadd_rn(a[2], a[6])),
+                                         __fadd_rn(__fadd_rn(a[1], a[5]), __fadd_rn(a[3], a[7])));
+            gsc[j * ld + g] = s4[q];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < MV_OB) {
+        const int j = threadIdx.x, o = o0 + j;
+        if (o < O) {
+            const float *gp = gsum + j * ld, *sp = gsc + j * ld;
+            float tot = 0.0f;
+#pragma unroll 8
+            for (int g = 0; g < ng; g++) tot = __fmaf_rn(gp[g], sp[g], tot);
+            y[o] = tot;
+        }
+    }
+}
+// int8 rows (matmul_q): an output's 8 lanes on 8 threads (its chains run the whole row: no other split),
+// 4 outputs a warp. The warp brings 128 bytes of each of its rows at a time into its own shared memory, a
+// thread 16 bytes of its row (512 distinct bytes a load; the next chunk's in flight meanwhile), and lane l
+// reads its columns 128c + 8k + l from there in order; then the tree by shuffles, times the row's scale.
+#define MV8_LD 36                   // a row's 32 words and 4 spare: 16-byte stores, the 4 rows in other banks
+template <int R>
+__global__ void __launch_bounds__(256) k3_mv8(const int8_t *__restrict__ w, const float *__restrict__ scale,
+                                              const float *__restrict__ x, int I, int O, float *__restrict__ y) {
+    __shared__ __align__(16) uint32_t ws[8][2][4][MV8_LD];   // [warp][buffer][its row][word]
+    const int l = threadIdx.x & 7, q = (threadIdx.x >> 3) & 3, wi = threadIdx.x >> 5, hi = l >> 2, b = l & 3;
+    const int o = blockIdx.x * 32 + (threadIdx.x >> 3), oc = o < O ? o : O - 1, nc = I >> 7;
+    const uint4 *wr = reinterpret_cast<const uint4 *>(w + (size_t)oc * I) + l;
+    const float *xl = x + l;
+    float a[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) a[r] = 0.0f;
+    uint4 u = __ldg(wr);
+    for (int c = 0; c < nc; c++) {
+        uint32_t *buf = ws[wi][c & 1][q];
+        *reinterpret_cast<uint4 *>(buf + 4 * l) = u;
+        if (c + 1 < nc) u = __ldg(wr + 8 * (c + 1));
+        __syncwarp();
+#pragma unroll
+        for (int k = 0; k < 16; k++) {   // column 128c + 8k + l: word 2k + hi, byte b
+            const float v = k8_val(buf[2 * k + hi] ^ 0x80808080u, b);
+#pragma unroll
+            for (int r = 0; r < R; r++) a[r] = __fmaf_rn(__ldg(xl + (size_t)r * I + 128 * c + 8 * k), v, a[r]);
+        }
+    }
+    const float sc = __ldg(scale + oc);
+    float v = 0.0f;
+#pragma unroll
+    for (int r = 0; r < R; r++) { const float s = __fmul_rn(k3d_hsum8(a[r]), sc); if (l == r) v = s; }
+    if (o < O && l < R) y[(size_t)l * O + o] = v;
+}
 static int kb_mode(void) {
     static int m = -1;
     if (m < 0) { const char *e = getenv("K3_GPU_DENSE_B"); m = !e || !*e || atoi(e) != 0; }
     return m;
 }
-// y [r][O] = x [r][I] . W^T in the CPU's arithmetic on stream st: k3_dense_b where it was built for it
+template <int R>
+static void k3_mv_launch(int fmt, const uint8_t *w, const float *s, const float *x, int I, int O, float *y, int flip,
+                         cudaStream_t st) {
+    if (fmt == 1) { k3_mv8<R><<<(unsigned)((O + 31) / 32), 256, 0, st>>>(reinterpret_cast<const int8_t *>(w), s, x, I, O, y); return; }
+    const unsigned g = (unsigned)((O + MV_OB - 1) / MV_OB);
+    const size_t sm = (size_t)2 * MV_OB * ((I >> 6) | 1) * sizeof(float);
+    for (int r = 0; r < R; r++)   // a row at a time: the weights read again, still sooner than more rows a thread
+        if (flip) k3_mv4<1><<<g, 256, sm, st>>>(w, s, x + (size_t)r * I, I, O, y + (size_t)r * O);
+        else k3_mv4<0><<<g, 256, sm, st>>>(w, s, x + (size_t)r * I, I, O, y + (size_t)r * O);
+}
+// y [r][O] = x [r][I] . W^T in the CPU's arithmetic on stream st: k3_dense_b (int4 in groups of 64) and
+// k3_dense_b8 (int8 rows) from 64 rows, k3_mv4 and k3_mv8 up to 4, k3_dense else. flip: coli_cuda.dll's
+// copy of the matrix (its int4 nibbles flipped).
 static void k3_dense_launch(int fmt, const uint8_t *w, const float *s, const float *x, int r, int I, int O, int gs,
-                            float *y, cudaStream_t st) {
-    if (fmt == 4 && gs == 64 && I % KB_SC == 0 && r >= KB_MINROWS && kb_mode()) {
-        const dim3 g((unsigned)((O + KB_BO - 1) / KB_BO), (unsigned)((r + KB_BR - 1) / KB_BR));
-        k3_dense_b<<<g, 256, 0, st>>>(w, s, x, r, I, O, y);
+                            float *y, cudaStream_t st, int flip = 0) {
+    const int mv = fmt == 1 ? I % 128 == 0 : gs == 64 && I % 64 == 0 && (size_t)2 * MV_OB * ((I >> 6) | 1) * 4 <= 48 * 1024;
+    if ((fmt == 1 || gs == 64) && I % KB_SC == 0 && r >= KB_MINROWS && kb_mode()) {
+        const unsigned rb = (unsigned)((r + KB_BR - 1) / KB_BR);
+        if (fmt == 1) k3_dense_b8<<<dim3((unsigned)((O + K8_BO - 1) / K8_BO), rb), 256, 0, st>>>(reinterpret_cast<const int8_t *>(w), s, x, r, I, O, y);
+        else if (flip) k3_dense_b<1><<<dim3((unsigned)((O + KB_BO - 1) / KB_BO), rb), 256, 0, st>>>(w, s, x, r, I, O, y);
+        else k3_dense_b<0><<<dim3((unsigned)((O + KB_BO - 1) / KB_BO), rb), 256, 0, st>>>(w, s, x, r, I, O, y);
+    } else if (r <= 4 && mv && kb_mode()) {
+        if (r == 1) k3_mv_launch<1>(fmt, w, s, x, I, O, y, flip, st);
+        else if (r == 2) k3_mv_launch<2>(fmt, w, s, x, I, O, y, flip, st);
+        else if (r == 3) k3_mv_launch<3>(fmt, w, s, x, I, O, y, flip, st);
+        else k3_mv_launch<4>(fmt, w, s, x, I, O, y, flip, st);
     } else {
         const dim3 g((unsigned)((O + K3_TO - 1) / K3_TO), (unsigned)((r + K3_TP - 1) / K3_TP));
-        k3_dense<<<g, 256, 0, st>>>(fmt, w, s, x, r, I, O, gs, y);
+        k3_dense<<<g, 256, 0, st>>>(fmt, w, s, x, r, I, O, gs, y, fmt == 4 && flip ? 0x88 : 0);
     }
 }
 
@@ -1067,6 +1288,37 @@ static int ar_carve(void **const *ptr, const size_t *bytes, int n) {
     return 1;
 }
 
+// k3cu_matmul's arithmetic on coli_cuda.dll's copy of a matrix (backend_cuda_k3.h), host memory in and
+// out, through the layer calls' buffers: rows K3_MMROWS at a time, fewer where a piece's rows and
+// outputs would pass K3_MMBYTES (the head's 163,840 outputs).
+#define K3_MMBYTES (256ll << 20)
+static unsigned long long n_mmd, n_mmd_rows; static double t_mmd;
+extern "C" int k3cu_matmul_dev(int fmt, float *y, const float *x, const void *w, const float *scale,
+                               int S, int I, int O, int gs) {
+    if (!ready || failed || !y || !x || !w || !scale || S < 1 || I < 8 || O < 1 || !on_device()) return 0;
+    if (fmt == 4 ? (gs < 16 || gs % 16 || I % gs || K3_KC % gs) : fmt != 1 || I % 8) return 0;
+    double t0 = now_s();
+    if (!s_mm && !checked(cudaStreamCreateWithFlags(&s_mm, cudaStreamNonBlocking), "dense stream")) return 0;
+    long long R = K3_MMBYTES / (((long long)I + O) * 4);
+    if (R > K3_MMROWS) R = K3_MMROWS;
+    if (R > S) R = S;
+    if (R < 1) R = 1;
+    float *dx, *dy;
+    void **const kp[2] = {(void **)&dx, (void **)&dy};
+    const size_t kb[2] = {(size_t)R * I * 4, (size_t)R * O * 4};
+    if (!ar_carve(kp, kb, 2)) return 0;
+    for (int s0 = 0; s0 < S; s0 += (int)R) {
+        const int r = S - s0 < R ? S - s0 : (int)R;
+        if (!checked(cudaMemcpyAsync(dx, x + (size_t)s0 * I, (size_t)r * I * 4, cudaMemcpyHostToDevice, s_mm), "dense rows")) return 0;
+        k3_dense_launch(fmt, static_cast<const uint8_t *>(w), scale, dx, r, I, O, gs, dy, s_mm, 1);
+        if (!checked(cudaGetLastError(), "dense kernel") ||
+            !checked(cudaMemcpyAsync(y + (size_t)s0 * O, dy, (size_t)r * O * 4, cudaMemcpyDeviceToHost, s_mm), "dense outputs")) return 0;
+    }
+    if (!checked(cudaStreamSynchronize(s_mm), "dense")) return 0;
+    n_mmd++; n_mmd_rows += (unsigned long long)S; t_mmd += now_s() - t0;
+    return 1;
+}
+
 // A prompt step's MLA attention core (k3cu_mla, backend_cuda_k3.h): the step's rows in chunks of
 // at most ML_ROWS whose scores fit in ML_SCORES bytes (the card has 2-2.5 GiB beside the resident
 // matrices), each chunk's positions up to its own last row's. A chunk's q and gate rows go up on
@@ -1351,21 +1603,14 @@ static int kd_rows(void) {
     if (r < 0) { const char *e = getenv("K3_GPU_KDA_ROWS"); r = e && atoi(e) > 0 ? atoi(e) : KD_ROWS; r = (r + 7) / 8 * 8; }
     return r;
 }
-// a projection on coli_cuda.dll's copy: quant_matmul_blocked's shapes
-static int kd_dev_ok(const K3cuProj *p, int I, int O) {
-    return p->w && p->s && (p->fmt == 1 || (p->fmt == 4 && p->gs == 64)) && (I == 7168 || I == 12288) && O % QMB_RO == 0;
+// the shapes k3_dense_launch takes: int4 in groups of 16 to K3_KC, int8 rows of a multiple of 8
+static int kd_shape_ok(int fmt, int I, int gs) {
+    return fmt == 4 ? gs >= 16 && !(gs % 16) && !(I % gs) && !(K3_KC % gs) : fmt == 1 && I >= 8 && !(I % 8);
 }
-static void kd_mm(const K3cuProj *p, float *y, const float *xb, int r, int I, int O, cudaStream_t st) {
-    const dim3 grid((unsigned)(O / QMB_RO), (unsigned)((r + QMB_RS - 1) / QMB_RS));
-    const uint8_t *w = static_cast<const uint8_t *>(p->w);
-    if (p->fmt == 4 && I == 7168) quant_matmul_blocked<4, 7168><<<grid, 256, 0, st>>>(y, xb, w, p->s, r, O);
-    else if (p->fmt == 4) quant_matmul_blocked<4, 12288><<<grid, 256, 0, st>>>(y, xb, w, p->s, r, O);
-    else if (I == 7168) quant_matmul_blocked<1, 7168><<<grid, 256, 0, st>>>(y, xb, w, p->s, r, O);
-    else quant_matmul_blocked<1, 12288><<<grid, 256, 0, st>>>(y, xb, w, p->s, r, O);
-}
-static void kd_block(float *xb, const float *x, int r, int I, cudaStream_t st) {
-    const long long n = (long long)((r + QMB_RS - 1) / QMB_RS) * I;
-    qmb_rows<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(xb, x, r, I, n);
+// a projection on coli_cuda.dll's copy, in the CPU's arithmetic (its int4 nibbles flipped back)
+static int kd_dev_ok(const K3cuProj *p, int I, int O) { return p->w && p->s && O > 0 && kd_shape_ok(p->fmt, I, p->gs); }
+static void kd_mm(const K3cuProj *p, float *y, const float *x, int r, int I, int O, cudaStream_t st) {
+    k3_dense_launch(p->fmt, static_cast<const uint8_t *>(p->w), p->s, x, r, I, O, p->gs, y, st, 1);
 }
 template <int HD>
 static void kd_rec(float *st8, const float *q, const float *k, const float *a, float *v, const float *b, int r, int H, cudaStream_t s) {
@@ -1390,27 +1635,24 @@ extern "C" int k3cu_kda(const K3cuKda *a, const float *x, float *out) {
     if (C < 1 || D < 1 || H < 1 || K < 1 || K > 7 || !(hd == 16 || hd == 32 || hd == 64 || hd == 128) ||
         !a->fa || !a->fb || !a->bp || !a->A || !a->dt || !a->onw || !a->state) return 0;
     const K3cuProj *pr[4] = {&a->q, &a->k, &a->v, &a->g};
-    int dev_in = 0;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 4; i++)
         if (pr[i]->w ? !kd_dev_ok(pr[i], D, P) : !pr[i]->y) return 0;
-        dev_in |= pr[i]->w != nullptr;
-    }
     if (a->o.w ? !kd_dev_ok(&a->o, P, D) || !out : !a->o.y) return 0;
     for (int w = 0; w < 3; w++) if (!a->taps[w] || !a->win[w]) return 0;
     double t0 = now_s();
     if (!s_kda && !checked(cudaStreamCreateWithFlags(&s_kda, cudaStreamNonBlocking), "KDA stream")) return 0;
     cudaStream_t st = s_kda;
-    const int R = C < kd_rows() ? C : kd_rows(), RB = (R + QMB_RS - 1) / QMB_RS * QMB_RS;
+    const int R = C < kd_rows() ? C : kd_rows();
     const size_t PK = (size_t)P * K;
     // the layer's constants: fa, fb, bp, A, dt, onw, the q, k, v taps; its state: S, the q, k, v windows
     const size_t nfa = (size_t)hd * D, nfb = (size_t)P * hd, nbp = (size_t)H * D;
     const size_t ncon = nfa + nfb + nbp + H + P + hd + 3 * PK, nst = (size_t)H * hd * hd + 3 * PK;
-    float *dx, *dxb, *dq, *dk, *dv, *da, *dc, *ds, *dsm;
-    void **const kp[9] = {(void **)&dx, (void **)&dxb, (void **)&dq, (void **)&dk, (void **)&dv, (void **)&da,
-                          (void **)&dc, (void **)&ds, (void **)&dsm};
-    const size_t kb[9] = {(size_t)R * D * 4, (size_t)RB * D * 4, (size_t)RB * P * 4, (size_t)R * P * 4, (size_t)R * P * 4,
-                          (size_t)R * P * 4, ncon * 4, nst * 4, ((size_t)R * hd + 4 * (size_t)R * H) * 4};
-    if (!ar_carve(kp, kb, 9)) return 0;
+    float *dx, *dq, *dk, *dv, *da, *dc, *ds, *dsm;
+    void **const kp[8] = {(void **)&dx, (void **)&dq, (void **)&dk, (void **)&dv, (void **)&da, (void **)&dc, (void **)&ds,
+                          (void **)&dsm};
+    const size_t kb[8] = {(size_t)R * D * 4, (size_t)R * P * 4, (size_t)R * P * 4, (size_t)R * P * 4, (size_t)R * P * 4,
+                          ncon * 4, nst * 4, ((size_t)R * hd + 4 * (size_t)R * H) * 4};
+    if (!ar_carve(kp, kb, 8)) return 0;
     float *cfa = dc, *cfb = cfa + nfa, *cbp = cfb + nfb, *cA = cbp + nbp, *cdt = cA + H, *conw = cdt + P, *ctap = conw + hd;
     float *sS = ds, *swin = ds + (size_t)H * hd * hd;
     float *t1 = dsm, *br = t1 + (size_t)R * hd, *rq = br + (size_t)R * H, *rk = rq + (size_t)R * H, *be = rk + (size_t)R * H;
@@ -1428,9 +1670,8 @@ extern "C" int k3cu_kda(const K3cuKda *a, const float *x, float *out) {
         const size_t rp = (size_t)r * P;
         const unsigned grh = (unsigned)((r * H + 255) / 256), grp = (unsigned)((rp + 255) / 256);
         if (!checked(cudaMemcpyAsync(dx, x + (size_t)s0 * D, (size_t)r * D * 4, cudaMemcpyHostToDevice, st), "KDA rows")) return 0;
-        if (dev_in) kd_block(dxb, dx, r, D, st);
         for (int i = 0; i < 3; i++) {
-            if (pr[i]->w) kd_mm(pr[i], dqkv[i], dxb, r, D, P, st);
+            if (pr[i]->w) kd_mm(pr[i], dqkv[i], dx, r, D, P, st);
             else if (!checked(cudaMemcpyAsync(dqkv[i], pr[i]->y + (size_t)s0 * P, rp * 4, cudaMemcpyHostToDevice, st), "KDA projections")) return 0;
         }
         kd_conv(K, dq, dk, dv, swin, ctap, r, P, st);
@@ -1444,13 +1685,12 @@ extern "C" int k3cu_kda(const K3cuKda *a, const float *x, float *out) {
         else if (hd == 32) kd_rec<32>(sS, dq, dk, da, dv, be, r, H, st);
         else kd_rec<16>(sS, dq, dk, da, dv, be, r, H, st);
         k3_kda_rms<<<grh, 256, 0, st>>>(dv, r * H, hd, a->eps, rq);
-        if (a->g.w) kd_mm(&a->g, dk, dxb, r, D, P, st);
+        if (a->g.w) kd_mm(&a->g, dk, dx, r, D, P, st);
         else if (!checked(cudaMemcpyAsync(dk, a->g.y + (size_t)s0 * P, rp * 4, cudaMemcpyHostToDevice, st), "KDA gate")) return 0;
         k3_kda_gate<<<grp, 256, 0, st>>>(dv, dk, rq, conw, rp, hd);
         if (!checked(cudaGetLastError(), "KDA kernels")) return 0;
         if (a->o.w) {
-            kd_block(dq, dk, r, P, st);
-            kd_mm(&a->o, dx, dq, r, P, D, st);
+            kd_mm(&a->o, dx, dk, r, P, D, st);
             if (!checked(cudaGetLastError(), "KDA output") ||
                 !checked(cudaMemcpyAsync(out + (size_t)s0 * D, dx, (size_t)r * D * 4, cudaMemcpyDeviceToHost, st), "KDA output")) return 0;
         } else if (!checked(cudaMemcpyAsync(a->o.y + (size_t)s0 * P, dk, rp * 4, cudaMemcpyDeviceToHost, st), "KDA heads")) return 0;
@@ -1480,18 +1720,16 @@ __global__ void k3_rms_rows(const float *x, int n, int ld, const float *__restri
     float *yr = y + (size_t)blockIdx.x * ldy;
     for (int i = threadIdx.x; i < n; i += blockDim.x) yr[i] = __fmul_rn(__fmul_rn(xr[i], r), w[i]);
 }
-// a layer's matrix: coli_cuda.dll's copy (quant_matmul_blocked on its input blocked 8 rows a column) or
-// the host's weights, uploaded once a step (k3cu_matmul's kernels: the CPU's arithmetic)
+// a layer's matrix, in the CPU's arithmetic (k3cu_matmul's kernels): coli_cuda.dll's copy or the host's
+// weights, uploaded once a step
 static int ml_mat_ok(const K3cuMat *m, int I, int O) {
-    if (m->w) { const K3cuProj p = {m->w, m->s, m->fmt, m->gs, nullptr}; return kd_dev_ok(&p, I, O); }
-    if (!m->hw || !m->hs || I < 8) return 0;
-    return m->fmt == 4 ? m->gs >= 16 && !(m->gs % 16) && !(I % m->gs) && !(K3_KC % m->gs) : m->fmt == 1 && !(I % 8);
+    return (m->w ? m->s != nullptr : m->hw && m->hs) && O > 0 && kd_shape_ok(m->fmt, I, m->gs);
 }
 static size_t ml_wbytes(const K3cuMat *m, int I, int O) { return m->w ? 0 : m->fmt == 4 ? (size_t)O * (I / 2) : (size_t)O * I; }
 static size_t ml_sbytes(const K3cuMat *m, int I, int O) { return m->w ? 0 : (size_t)O * (m->fmt == 4 ? I / m->gs : 1) * 4; }
-static void ml_mm(const K3cuMat *m, const uint8_t *dw, const float *ds, float *y, const float *x, const float *xb, int r, int I,
-                  int O, cudaStream_t st) {
-    if (m->w) { const K3cuProj p = {m->w, m->s, m->fmt, m->gs, nullptr}; kd_mm(&p, y, xb, r, I, O, st); }
+static void ml_mm(const K3cuMat *m, const uint8_t *dw, const float *ds, float *y, const float *x, int r, int I, int O,
+                  cudaStream_t st) {
+    if (m->w) k3_dense_launch(m->fmt, static_cast<const uint8_t *>(m->w), m->s, x, r, I, O, m->gs, y, st, 1);
     else k3_dense_launch(m->fmt, dw, ds, x, r, I, O, m->gs, y, st);
 }
 // a chunk's outputs and cache rows down to the host once its kernels are done (the host waits: pageable memory)
@@ -1519,18 +1757,16 @@ extern "C" int k3cu_mla_layer(const K3cuMlaLayer *a, const float *x, float *out)
     if (!ml_streams()) return 0;
     size_t rmax, smax, pmax;
     ml_plan(pos0, C, H, &rmax, &smax, &pmax);
-    const size_t RB = (rmax + QMB_RS - 1) / QMB_RS * QMB_RS;
     uint8_t *dw[5]; float *dsc[5];
-    float *LR, *ks, *ln, *dx[2], *dxb, *dqa, *dqab, *dqv, *dckv, *dgv, *dctx, *dctxb, *dout[2], *Q, *S, *pm, *sm, *cl;
+    float *LR, *ks, *ln, *dx[2], *dqa, *dqv, *dckv, *dgv, *dctx, *dout[2], *Q, *S, *pm, *sm, *cl;
     int8_t *kw;
     void **mp[32]; size_t mb[32]; int nb = 0;
 #define ML_BUF(p, b) (mp[nb] = (void **)&(p), mb[nb++] = (b))
     ML_BUF(LR, (size_t)N * KD * 4); ML_BUF(kw, (size_t)OK * kvl); ML_BUF(ks, (size_t)OK * 4); ML_BUF(ln, (size_t)(ql + kvl) * 4);
     for (int i = 0; i < 5; i++) { ML_BUF(dw[i], ml_wbytes(mats[i], mI[i], mO[i])); ML_BUF(dsc[i], ml_sbytes(mats[i], mI[i], mO[i])); }
-    ML_BUF(dx[0], rmax * D * 4); ML_BUF(dx[1], rmax * D * 4); ML_BUF(dxb, RB * D * 4);
-    ML_BUF(dqa, rmax * ql * 4); ML_BUF(dqab, a->qb.w ? RB * ql * 4 : 0);
+    ML_BUF(dx[0], rmax * D * 4); ML_BUF(dx[1], rmax * D * 4); ML_BUF(dqa, rmax * ql * 4);
     ML_BUF(dqv, rmax * OQ * 4); ML_BUF(dckv, rmax * KD * 4); ML_BUF(dgv, rmax * P * 4); ML_BUF(dctx, rmax * P * 4);
-    ML_BUF(dctxb, a->o.w ? RB * P * 4 : 0); ML_BUF(dout[0], rmax * D * 4); ML_BUF(dout[1], rmax * D * 4);
+    ML_BUF(dout[0], rmax * D * 4); ML_BUF(dout[1], rmax * D * 4);
     ML_BUF(Q, rmax * H * KD * 4); ML_BUF(S, smax * 4); ML_BUF(pm, pmax * 4); ML_BUF(sm, rmax * H * 4); ML_BUF(cl, rmax * H * kvl * 4);
 #undef ML_BUF
     if (!ar_carve(mp, mb, nb)) return 0;
@@ -1550,7 +1786,6 @@ extern "C" int k3cu_mla_layer(const K3cuMlaLayer *a, const float *x, float *out)
              (!qr || checked(cudaMemcpy2DAsync(LR + kvl, (size_t)KD * 4, a->Rc, (size_t)qr * 4, (size_t)qr * 4, (size_t)pos0,
                                                cudaMemcpyHostToDevice, st), "MLA cache"));
     if (!ok) return 0;
-    const int xblk = a->qa.w || a->kva.w || a->g.w;   // a card's matrix reads x: x blocked too
     int pc0 = 0, prows = 0, b = 0;   // the chunk before, its outputs still on the card
     for (int c0 = 0, rows; c0 < C; c0 += rows, b ^= 1) {
         rows = ml_chunk(pos0 + c0, C - c0, H);
@@ -1558,19 +1793,16 @@ extern "C" int k3cu_mla_layer(const K3cuMlaLayer *a, const float *x, float *out)
         // buffer b's last chunk is done and its outputs down: the host waited for them
         if (!checked(cudaMemcpyAsync(dx[b], x + (size_t)c0 * D, (size_t)rows * D * 4, cudaMemcpyHostToDevice, sc), "MLA rows") ||
             !checked(cudaEventRecord(ml_up[b], sc), "MLA rows") || !checked(cudaStreamWaitEvent(st, ml_up[b], 0), "MLA rows")) return 0;
-        if (xblk) kd_block(dxb, dx[b], rows, D, st);
-        ml_mm(&a->qa, dw[0], dsc[0], dqa, dx[b], dxb, rows, D, ql, st);
+        ml_mm(&a->qa, dw[0], dsc[0], dqa, dx[b], rows, D, ql, st);
         k3_rms_rows<<<rows, 256, 0, st>>>(dqa, ql, ql, lnq, a->eps, dqa, ql);
-        if (a->qb.w) kd_block(dqab, dqa, rows, ql, st);
-        ml_mm(&a->qb, dw[1], dsc[1], dqv, dqa, dqab, rows, ql, OQ, st);
-        ml_mm(&a->kva, dw[2], dsc[2], dckv, dx[b], dxb, rows, D, KD, st);
+        ml_mm(&a->qb, dw[1], dsc[1], dqv, dqa, rows, ql, OQ, st);
+        ml_mm(&a->kva, dw[2], dsc[2], dckv, dx[b], rows, D, KD, st);
         k3_rms_rows<<<rows, 256, 0, st>>>(dckv, kvl, KD, lnk, a->eps, LR + (size_t)first * KD, KD);
         if (qr && !checked(cudaMemcpy2DAsync(LR + (size_t)first * KD + kvl, (size_t)KD * 4, dckv + kvl, (size_t)KD * 4, (size_t)qr * 4,
                                              (size_t)rows, cudaMemcpyDeviceToDevice, st), "MLA cache")) return 0;
-        ml_mm(&a->g, dw[3], dsc[3], dgv, dx[b], dxb, rows, D, P, st);
+        ml_mm(&a->g, dw[3], dsc[3], dgv, dx[b], rows, D, P, st);
         ml_core(LR, kw, ks, Q, S, pm, sm, cl, dqv, dgv, dctx, rows, first, H, qn, qr, vh, kvl, a->scale, st);
-        if (a->o.w) kd_block(dctxb, dctx, rows, P, st);
-        ml_mm(&a->o, dw[4], dsc[4], dout[b], dctx, dctxb, rows, P, D, st);
+        ml_mm(&a->o, dw[4], dsc[4], dout[b], dctx, rows, P, D, st);
         if (!checked(cudaGetLastError(), "MLA kernels") || !checked(cudaEventRecord(ml_done[b], st), "MLA kernels")) return 0;
         if (prows && !ml_down(a, out, LR, dout[b ^ 1], ml_done[b ^ 1], pc0, prows)) return 0;
         pc0 = c0; prows = rows;
@@ -1587,6 +1819,7 @@ extern "C" void k3cu_report(void) {
         fprintf(stderr, "[K3-CUDA] experts: %llu steps, %llu experts, %llu rows on the GPU; copying their bytes %.1fs, waiting for slots %.1fs%s\n",
                 n_steps, n_experts, n_rows, t_copy, t_wait, failed ? "; the device failed" : "");
     if (n_mm) fprintf(stderr, "[K3-CUDA] the dense matrices the GPU does not hold: %llu matmuls, %llu rows, %.1fs\n", n_mm, n_mm_rows, t_mm);
+    if (n_mmd) fprintf(stderr, "[K3-CUDA] the dense matrices the GPU holds, one by one: %llu matmuls, %llu rows, %.1fs\n", n_mmd, n_mmd_rows, t_mmd);
     if (n_mla) fprintf(stderr, "[K3-CUDA] the gated MLA's attention: %llu layer steps, %llu rows, %.1fs\n", n_mla, n_mla_rows, t_mla);
     if (n_mll) fprintf(stderr, "[K3-CUDA] the gated MLA layers: %llu layer steps, %llu rows, %.1fs\n", n_mll, n_mll_rows, t_mll);
     if (n_rt) fprintf(stderr, "[K3-CUDA] the routers: %llu steps, %.1fs\n", n_rt, t_rt);

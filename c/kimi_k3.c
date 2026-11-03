@@ -656,8 +656,9 @@ static int kimima_forward_metal(Model *m, Layer *l, int li, const float *x, int 
 }
 #endif
 #ifdef COLI_CUDA
-/* K3_CUDA_DENSE (k3_cuda_dense_place, after w_load): the placed matrices' state */
-static int g_k3_cuda_dense=0, g_k3_cuda_dev=0;
+/* K3_CUDA_DENSE (k3_cuda_dense_place, after w_load): the placed matrices' state; g_k3_cuda_exact:
+ * coli_cuda_k3.dll computes them (the CPU's arithmetic), else coli_cuda.dll's own kernels */
+static int g_k3_cuda_dense=0, g_k3_cuda_dev=0, g_k3_cuda_exact=0;
 static uint64_t g_k3_cuda_calls;
 static double g_k3_cuda_ms;
 static void k3_cuda_restore(W *w);
@@ -716,16 +717,24 @@ static double k3_ra_gb(void){
 static void w_matmul(float *y, const float *x, const W *w, int S){
 #ifdef COLI_CUDA
     if(w->cuda&&g_k3_cuda_dense&&!k3_omp_in_par()){
-        const void *src=w->fmt==1?(const void*)w->q8 : w->fmt==4?(const void*)w->q4 : (const void*)w->f;
         double t0=now_s();
-        /* several rows (a prompt step): the tiled kernel, the same bytes about 4x sooner */
-        int (*mm)(ColiCudaTensor**,float*,const float*,const void*,const float*,int,int,int,int,int,int)
-            = S>1?coli_cuda_matmul_tiled:coli_cuda_matmul;
         int ok=1;
-        for(int s0=0;s0<S&&ok;s0+=K3_GPU_ROWS){
-            const int n=S-s0<K3_GPU_ROWS?S-s0:K3_GPU_ROWS;
-            ok=mm((ColiCudaTensor**)&((W*)w)->cuda,y+(int64_t)s0*w->O,x+(int64_t)s0*w->I,src,w->s,k3_cuda_fmt(w),
-                  n,w->I,w->O,g_k3_cuda_dev,w->fmt==4?w->gs:0);
+#ifdef COLI_K3_CUDA
+        if(g_k3_cuda_exact){   /* the CPU's arithmetic on the card's copy: the CPU's bytes */
+            const void *dw=NULL; const float *dsc=NULL; int gs=0;
+            ok=coli_cuda_tensor_dev_ptrs((ColiCudaTensor*)w->cuda,&dw,&dsc,&gs)==w->fmt&&
+               k3cu_matmul_dev(w->fmt,y,x,dw,dsc,S,w->I,w->O,gs);
+        } else
+#endif
+        {   /* coli_cuda.dll's kernels; several rows (a prompt step): the tiled one, the same bytes about 4x sooner */
+            const void *src=w->fmt==1?(const void*)w->q8 : w->fmt==4?(const void*)w->q4 : (const void*)w->f;
+            int (*mm)(ColiCudaTensor**,float*,const float*,const void*,const float*,int,int,int,int,int,int)
+                = S>1?coli_cuda_matmul_tiled:coli_cuda_matmul;
+            for(int s0=0;s0<S&&ok;s0+=K3_GPU_ROWS){
+                const int n=S-s0<K3_GPU_ROWS?S-s0:K3_GPU_ROWS;
+                ok=mm((ColiCudaTensor**)&((W*)w)->cuda,y+(int64_t)s0*w->O,x+(int64_t)s0*w->I,src,w->s,k3_cuda_fmt(w),
+                      n,w->I,w->O,g_k3_cuda_dev,w->fmt==4?w->gs:0);
+            }
         }
         if(ok){
             g_k3_cuda_calls++; g_k3_cuda_ms+=(now_s()-t0)*1e3;
@@ -1046,8 +1055,11 @@ static float *f32_load(Model *m, const char *name, int64_t want){
  * matrix there for every row count, a decode step's and a prompt chunk's, from the layer
  * loop's thread (the one CUDA context). kv_b stays (the MLA absorb reads its rows) and
  * so do the f32 routers and KDA's small f32 projections (the routing stays the CPU's
- * arithmetic on its input). The products are the CPU's, summed in f32 in another order
- * by coli_cuda.dll's quant_matmul: not the CPU's bytes, as with every GPU backend.
+ * arithmetic on its input). With coli_cuda_k3.dll (a CUDA build's) every placed matrix
+ * runs there in the CPU's arithmetic (k3cu_matmul_dev and the layer calls: the same lanes,
+ * sums and roundings as matmul_q and matmul_i4_grouped), so the CPU's bytes, and only the
+ * int8 rows and int4 groups those kernels take go up; without it coli_cuda.dll's own
+ * kernels, whose sums run in another order (not the CPU's bytes).
  * K3_CUDA_RELEASE_HOST=1 frees a placed matrix's host copy, before the expert cache is
  * sized, so the cache gets that RAM; if a GPU call fails, the CPU computes every matrix
  * from then on, reading a released one back from the checkpoint as it needs it. */
@@ -1094,6 +1106,9 @@ static void k3_cuda_dense_place(Model *m){
         fprintf(stderr,"[K3-CUDA] no CUDA device (coli_cuda.dll beside the engine?): the dense matrices stay on the CPU\n");
         return;
     }
+#ifdef COLI_K3_CUDA
+    g_k3_cuda_exact=k3cu_init(g_k3_cuda_dev);
+#endif
     double want=getenv("K3_CUDA_DENSE_GB")?atof(getenv("K3_CUDA_DENSE_GB")):20.0;
     double reserve=getenv("K3_CUDA_RESERVE_GB")?atof(getenv("K3_CUDA_RESERVE_GB")):2.0;
     int release=getenv("K3_CUDA_RELEASE_HOST")&&atoi(getenv("K3_CUDA_RELEASE_HOST"));
@@ -1112,6 +1127,7 @@ static void k3_cuda_dense_place(Model *m){
         size_t b=k3_w_nbytes(w);
         int fmt=k3_cuda_fmt(w);
         if(!b||fmt<0||w->mapped||(!w->f&&!w->q8&&!w->q4)) continue;
+        if(g_k3_cuda_exact&&(fmt==4?w->gs<16||w->gs%16||w->I%w->gs||512%w->gs:fmt!=1||w->I%8)) continue;   /* k3cu_matmul_dev's shapes */
         tried++; all+=b;
         if(used+b>budget) continue;              /* a smaller one may still fit */
         const void *src=fmt==1?(const void*)w->q8 : fmt==4?(const void*)w->q4 : (const void*)w->f;
@@ -1134,7 +1150,10 @@ static void k3_cuda_dense_place(Model *m){
     g_k3_cuda_dense=1; g_k3_cuda_model=m; g_k3_cuda_released=freed;
     fprintf(stderr,"[K3-CUDA] dense: %d of %d matrices on GPU %d, %.2f of %.2f GiB (budget %.2f GiB, %.2f free)%s\n",
             placed,tried,g_k3_cuda_dev,used/1073741824.0,all/1073741824.0,budget/1073741824.0,fr/1073741824.0,
-            release?"; their host copies released":"");
+            g_k3_cuda_exact?(release?"; their host copies released; the CPU's arithmetic there (coli_cuda_k3.dll)"
+                                     :"; the CPU's arithmetic there (coli_cuda_k3.dll)")
+                           :(release?"; their host copies released; coli_cuda.dll's kernels there, not the CPU's bytes"
+                                     :"; coli_cuda.dll's kernels there, not the CPU's bytes"));
 }
 static void k3_cuda_report(const char *scope){
     if(!g_k3_cuda_calls) return;
@@ -2076,8 +2095,8 @@ static __attribute__((noinline)) void k3_kda_head(Model *m, const Kda *a, int li
 }
 #ifdef COLI_K3_CUDA
 /* A prompt step's KDA layer on the GPU (k3cu_kda), the by-step path's bytes below: a projection
- * the card holds runs there on coli_cuda.dll's copy in the kernel w_matmul gets for it
- * (quant_matmul_blocked, qmb_kernel.cuh), the others here as w_matmul computes them; the conv,
+ * the card holds runs there on coli_cuda.dll's copy in the CPU's arithmetic (w_matmul's
+ * k3cu_matmul_dev), the others here as w_matmul computes them; the conv,
  * the f32 projections, the heads and o_proj on the card in pieces of rows, the state and the
  * windows back in the model's memory at the end. 0: the CPU's. K3_GPU_KDA=0: always the CPU's. */
 static int g_k3_kda_gpu=-1;
@@ -2098,12 +2117,10 @@ static int k3_kda_gpu(Model *m, Kda *a, int li, const float *x, int C, float *ou
     for(int i=0;i<5;i++){
         W *w=ws[i]; K3cuProj *p=ps[i];
 #ifdef COLI_CUDA
-        if(w->cuda&&g_k3_cuda_dense){   /* the card's copy, in quant_matmul_blocked's shapes */
+        if(w->cuda&&g_k3_cuda_dense&&g_k3_cuda_exact){   /* the card's copy */
             const void *dw=NULL; const float *dsc=NULL; int gs=0;
             const int f=coli_cuda_tensor_dev_ptrs((ColiCudaTensor*)w->cuda,&dw,&dsc,&gs), I=i<4?c->hidden:P, O=i<4?P:c->hidden;
-            if((f==1||(f==4&&gs==64))&&w->I==I&&w->O==O&&(I==7168||I==12288)&&O%16==0){
-                p->w=dw; p->s=dsc; p->fmt=f; p->gs=gs; continue;
-            }
+            if(f==w->fmt&&w->I==I&&w->O==O){ p->w=dw; p->s=dsc; p->fmt=f; p->gs=gs; continue; }
         }
 #endif
         host[i]=k3_balloc((int64_t)C*P); p->y=host[i];
@@ -2454,10 +2471,10 @@ static void k3_mla_scores_g(float *sc, const float *qab, const float *const *qrp
 }
 #ifdef COLI_K3_CUDA
 /* A prompt step's gated MLA layer on the GPU (k3cu_mla_layer), the call-by-call path's bytes
- * below: a matrix the card holds runs there on coli_cuda.dll's copy in the kernel w_matmul gets
- * for it (quant_matmul_blocked), the others from their host weights in k3cu_matmul's kernels (the
- * CPU's arithmetic); the norms, the cache rows (written back) and the core on the card, a chunk
- * of rows at a time. 0: the call-by-call path. K3_GPU_MLA=0: always that. */
+ * below: a matrix the card holds runs there on coli_cuda.dll's copy, the others from their host
+ * weights, both in the CPU's arithmetic (k3cu_matmul_dev's and k3cu_matmul's kernels); the norms,
+ * the cache rows (written back) and the core on the card, a chunk of rows at a time. 0: the
+ * call-by-call path. K3_GPU_MLA=0: always that. */
 static int g_k3_mla_gpu=-1;
 static unsigned long long g_k3_mla_layers;   /* layer steps it took */
 static int k3_mla_gpu(Model *m, Mla *a, int li, const float *x, int pos0, int C, float *out){
@@ -2476,10 +2493,10 @@ static int k3_mla_gpu(Model *m, Mla *a, int li, const float *x, int pos0, int C,
     for(int i=0;i<5;i++){
         W *w=ws[i]; K3cuMat *p=ps[i];
 #ifdef COLI_CUDA
-        if(w->cuda&&g_k3_cuda_dense){   /* the card's copy (the DLL takes quant_matmul_blocked's shapes) */
+        if(w->cuda&&g_k3_cuda_dense){   /* the card's copy */
             const void *dw=NULL; const float *dsc=NULL; int gs=0;
             const int f=coli_cuda_tensor_dev_ptrs((ColiCudaTensor*)w->cuda,&dw,&dsc,&gs);
-            if(f!=1&&f!=4) return 0;
+            if(!g_k3_cuda_exact||f!=w->fmt) return 0;
             p->w=dw; p->s=dsc; p->fmt=f; p->gs=gs;
             continue;
         }

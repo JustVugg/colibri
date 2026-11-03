@@ -450,3 +450,56 @@ once a step. A layer's traffic is now x and its output once, about 0.35 GB at 5,
 Of the layers' 9.0 s at 5,862 tokens the core is 4.0, the held gate and o_proj about 2.5
 (quant_matmul_blocked, about 10 TMAC/s) and qa, qb and kva about 1.8 (k3_dense's int8 lanes,
 about 3.3 TMAC/s).
+
+## The card's matrices in the CPU's arithmetic (`raw/hl_*`, `h2_*`, 2026-11-03)
+
+The 369 matrices `K3_CUDA_DENSE` puts on the card (the head, the dense layer's FFN, the gated
+MLA's gate and o_proj, 317 of KDA's 345 projections: 20 GiB) ran in coli_cuda.dll's kernels,
+the CPU's products summed in quant_matmul's order (256 chains an output, then a fixed tree), so
+the GPU's logits were not the CPU build's. coli_cuda_k3.dll now computes them on coli_cuda.dll's
+copies in the CPU's arithmetic: `k3_dense_b` (int4 groups of 64; the copy's nibbles, flipped by
+its upload, flipped back as the words come in) and the new `k3_dense_b8` (int8 rows: all 8 of
+matmul_q's lanes in a thread for 4 rows by 4 outputs, a weight a byte permute and an add) from
+64 rows, `k3_dense` below, and for a decode step `k3_mv4` and `k3_mv8`. `w_matmul` reaches them
+through `k3cu_matmul_dev`; the KDA and MLA layers take the copies in the same kernels (no blocked
+copy of their inputs any more). Only the int8 rows and int4 groups those kernels take go up.
+
+| run | what | result |
+|---|---|---:|
+| `tests/test_k3_cuda_experts.c --dev` | `k3cu_matmul_dev` against matmul_i4_grouped and matmul_q: 1, 2, 3, 4, 5, 37, 64, 300 and 1,030 rows at 7,168 columns, KDA's and MLA's o_proj at 1 and 260-300, qb, groups of 32, widths the fast kernels leave to `k3_dense`, 1,100 rows by 60,000 outputs (pieces cut by `K3_MMBYTES`) | 0 of 66.5M outputs differ |
+| `--kda`, `--mla`, the whole test | the KDA and MLA layers with the card's matrices, on the card and by step or call by call, against the CPU with every matrix the host's | 0 differ |
+| `k3tiny_held.sh` | the tiny model, 6,000 ids at steps of 2,048, 4,096 and 8,192: every matrix on the card (now also in the layer paths), none there, the CPU alone; 40 tokens of decode | the same bytes |
+| `hl_*_logits`, `hl_*_cpu`, `h2_2637_logits` | Kimi K3, both long prompts at the launcher's step: the matrices on the card against the CPU alone (664.8 s and 1,666.9 s with no GPU path) | the same bytes at every position |
+| `h2_short_held1`, `h2_short_cpu` | the 35-token chat prompt one token a step (every position through the decode kernels) against the CPU alone, then 48 tokens | the same bytes at every position; the same text |
+| `hl_5862_*`, `h2_5862_*` | A/B against 9372715b | **111.1, 111.1, 115.0 s** against 118.9, 119.2, 123.0 s: the KDA layers 21.7-21.9 -> 15.2-15.3 s, the MLA layers 8.8 -> 8.1-8.2 s, the dense layer's FFN and the head 1.4 -> 0.5 s |
+| `hl_2637_*` | the same at 2,637 tokens | 105.5 against 106.0 s (C:'s reads) |
+| `h2_dec_*` | 48 tokens of decode | 0.87, 0.87 against 0.86, 0.87 tok/s; the card's matrices 1.7 against 1.9 s a run (about 37 against 41 ms a token); every run the CPU's text |
+
+`bench_b8.cu` (the kernels alone, T multiply-adds a second, 256 to 1,024 rows): `k3_dense_b8`
+10.9-11.2 at MLA's gate (quant_matmul_blocked 7.4-7.9), 12.2-13.9 at its o_proj (8.9), 12.6-14.6 at
+qb; `k3_dense_b` on the card's copies 14.6-14.9 at KDA's q (9.0), 11.8-13.9 at its o_proj (9.5-10.2).
+`bench_k3_mv.c` (a whole call with its copies): a decode row 0.05 ms at KDA's q (0.05-0.07 in
+coli_cuda.dll's `quant_matvec_warp`), 0.10-0.11 at MLA's gate and o_proj, 1.2 at the head; a
+token's held matrices 24 ms against 24-29. The first decode kernels gave an output's 8 lanes to 8
+threads that loaded the same 16 bytes: 4 loads in flight, 3.4 s a run against 1.9 (`hl_dec_*`:
+0.79 against 0.81 tok/s); now `k3_mv4` takes 64-column groups a thread, four outputs a task (its
+x loads were L1's limit with one), the sums and scales in shared memory, then each output's chain
+in order, and `k3_mv8` brings 128 bytes of each of a warp's 4 rows into shared memory a thread 16
+distinct bytes at a time.
+
+The new logits against the old references (`logit_diff.py`): no position the same bytes; the top
+token differs at 149 of 2,637 and 320 of 5,862 positions, KL mean 0.014, max 0.71 and 1.16 --
+rounding differences of about 1e-7 that routing flips and the recurrent state carry along a
+long prompt. The prompts' own next tokens (`ppl.py`, teacher-forced): perplexity 13.094 against
+13.014 at 2,637 tokens and 10.557 against 10.534 at 5,862, the old order 0.006 and 0.002 nats
+lower, 1.6 and 0.9 standard errors of the positions' differences, which split 1,327 to 1,309 and
+2,968 to 2,893: no difference the measurement resolves. (For an int8 row of 7,168 columns
+quant_matmul's 256 chains of 28 and its tree round less than matmul_q's 8 chains of 896:
+typically about 5e-7 against 2e-6 of an output; the int8 weights themselves are about 1e-3 off.)
+
+One run did not give the CPU's bytes: `hl_2637_none` (every matrix the host's, so an expert cache
+of 65 slots a layer instead of 78) left them from position 1,226 on (top token at 76 positions,
+KL max 0.50). The same configuration again (`hl_2637_none2`) and 9372715b in it (`hl_2637_none_old`)
+gave the CPU's bytes. That run had put 10,189 experts on the CPU (7,858 and 8,132 in the other
+two) and taken 6 more from the read-ahead pool: a timing-dependent fault in the MoE step's reads,
+slots or waves, outside the code changed here; not reproduced, open.

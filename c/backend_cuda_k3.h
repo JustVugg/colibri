@@ -50,6 +50,11 @@ K3CU_API int k3cu_moe_end(void);
  * int8 rows (matmul_q; a scale a row). Host memory in and out; 0 when it cannot (the CPU's). */
 K3CU_API int k3cu_matmul(int fmt, float *y, const float *x, const void *w, const float *scale,
                          int S, int I, int O, int gs);
+/* The same for a matrix coli_cuda.dll holds: w and scale its device copy's
+ * (coli_cuda_tensor_dev_ptrs), the int4 nibbles flipped as its upload leaves them; k3cu_matmul's
+ * bytes for every S, a decode step's 1 row too. Host memory in and out; 0 when it cannot. */
+K3CU_API int k3cu_matmul_dev(int fmt, float *y, const float *x, const void *w, const float *scale,
+                             int S, int I, int O, int gs);
 /* A prompt step's gated MLA attention core, mla_forward's loop to the bit: rows pos0..pos0+C-1
  * of a layer whose cache holds N = pos0 + C positions (Lc [N][kvl], Rc [N][qr]); qv [C][H][qn+qr]
  * (qb's output), gv [C][H][vh] (the gate's, before its sigmoid), kv_b int8 rows
@@ -72,14 +77,14 @@ K3CU_API int k3cu_shared(float *sd, const float *x, int S, int D, int I, const u
  * f32 projections fa [hd][D], fb [P][hd], bp [H][D] (matmul_f32.h's lanes), k3_kda_head's norms,
  * decay (A [H], dt [P]), recurrence (state [H][hd][hd] updated) and gated RMSNorm (onw [hd]),
  * then o_proj into out [C][D]; P = H hd. A projection whose w is set runs on coli_cuda.dll's copy
- * of the matrix (coli_cuda_tensor_dev_ptrs: quant_matmul_blocked, w_matmul's bytes on the card);
+ * of the matrix (coli_cuda_tensor_dev_ptrs) in the CPU's arithmetic, k3cu_matmul_dev's bytes;
  * one without it is the caller's: q, k, v and g hand their outputs [C][P] in y, and o takes the
  * gated heads [C][P] into its y (then out is untouched). 0 when it cannot (the CPU's; the state
  * and windows untouched). */
 typedef struct {
     const void *w;         /* the device copy's weights, or NULL */
     const float *s;        /* its scales */
-    int fmt, gs;           /* 1 int8 rows, 4 int4 in groups of gs (64) */
+    int fmt, gs;           /* 1 int8 rows, 4 int4 in groups of gs */
     float *y;              /* w NULL: the caller's outputs (q, k, v, g) or the gated heads (o) */
 } K3cuProj;
 typedef struct {
@@ -94,9 +99,9 @@ K3CU_API int k3cu_kda(const K3cuKda *a, const float *x, float *out);
  * qa, its RMSNorm (qa_ln) and qb, kva into the cache rows pos0.. (RMSNorm by kva_ln on the
  * latent, the rope part as it is), the gate, k3cu_mla's core over the rows before (Lc/Rc rows
  * 0..pos0-1 read, pos0..pos0+C-1 written back) and o_proj into out [C][D]. A matrix whose w is
- * set runs on coli_cuda.dll's copy (quant_matmul_blocked's shapes, w_matmul's bytes on the card);
- * one with hw runs from the host's weights in the CPU's arithmetic (k3cu_matmul's). 0 when it
- * cannot (the caller's call-by-call path, which writes the cache rows again). */
+ * set runs on coli_cuda.dll's copy, one with hw from the host's weights, both in the CPU's
+ * arithmetic (k3cu_matmul_dev's and k3cu_matmul's bytes). 0 when it cannot (the caller's
+ * call-by-call path, which writes the cache rows again). */
 typedef struct {
     const void *w; const float *s;     /* the device copy's weights and scales, or NULL */
     const void *hw; const float *hs;   /* else the host's */

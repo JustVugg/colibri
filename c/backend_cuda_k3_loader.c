@@ -26,6 +26,7 @@ static int (*p_shared)(float *, const float *, int, int, int, const uint8_t *, c
                        const float *, int, const uint8_t *, const float *, int, float, float);
 static int (*p_kda)(const K3cuKda *, const float *, float *);   /* optional: an older DLL lacks it */
 static int (*p_mla_layer)(const K3cuMlaLayer *, const float *, float *);   /* optional too */
+static int (*p_matmul_dev)(int, float *, const float *, const void *, const float *, int, int, int, int);   /* and this */
 static void (*p_report)(void), (*p_shutdown)(void);
 
 int k3cu_init(int device) {
@@ -52,6 +53,7 @@ int k3cu_init(int device) {
 #undef BIND
     { FARPROC fn = GetProcAddress(h, "k3cu_kda"); if (fn) memcpy(&p_kda, &fn, sizeof fn); }   /* NULL: KDA on the CPU */
     { FARPROC fn = GetProcAddress(h, "k3cu_mla_layer"); if (fn) memcpy(&p_mla_layer, &fn, sizeof fn); }   /* NULL: call by call */
+    { FARPROC fn = GetProcAddress(h, "k3cu_matmul_dev"); if (fn) memcpy(&p_matmul_dev, &fn, sizeof fn); }   /* NULL: coli_cuda.dll's kernels */
     module = h;
     return p_init(device);
 }
@@ -71,6 +73,9 @@ int k3cu_moe_wait(void) { return module ? p_moe_wait() : -1; }
 int k3cu_moe_end(void) { return module ? p_moe_end() : 0; }
 int k3cu_matmul(int fmt, float *y, const float *x, const void *w, const float *scale, int S, int I, int O, int gs) {
     return module ? p_matmul(fmt, y, x, w, scale, S, I, O, gs) : 0;
+}
+int k3cu_matmul_dev(int fmt, float *y, const float *x, const void *w, const float *scale, int S, int I, int O, int gs) {
+    return module && p_matmul_dev ? p_matmul_dev(fmt, y, x, w, scale, S, I, O, gs) : 0;
 }
 int k3cu_mla(const float *Lc, const float *Rc, int N, int pos0, int C, const float *qv, const float *gv,
              const int8_t *kvb, const float *kvbs, int H, int qn, int qr, int vh, int kvl, float scale, float *ctx) {

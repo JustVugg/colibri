@@ -248,10 +248,10 @@ COLI_CUDA_DLLEXPORT int coli_cuda_matmul_tiled(ColiCudaTensor **tensor,
                      const void *weights, const float *scales,
                      int fmt, int S, int I, int O, int device, int gs);
 
-/* A tensor's device copy for another module's kernels on the same device (Kimi K3's KDA
- * layer in coli_cuda_k3.dll: quant_matmul_blocked, qmb_kernel.cuh, on the matrices this
- * DLL holds): its weights, scales and group size; returns its format, -1 when it has no
- * plain device copy. An older DLL without it: the loader returns -1. */
+/* A tensor's device copy for another module's kernels on the same device (coli_cuda_k3.dll:
+ * Kimi K3's matrices this DLL holds, in the CPU's arithmetic): its weights (int4 nibbles
+ * flipped, as the upload leaves them), scales and group size; returns its format, -1 when
+ * it has no plain device copy. An older DLL without it: the loader returns -1. */
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_dev_ptrs(const ColiCudaTensor *tensor, const void **weights,
                      const float **scales, int *gs);
 

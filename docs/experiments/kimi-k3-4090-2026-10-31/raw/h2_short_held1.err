@@ -1,0 +1,50 @@
+[CUDA] device 0: NVIDIA GeForce RTX 4090, 25.8 GB VRAM, sm_89
+[SPLIT] +D:\AI\Models\Kimi-K3 -> 92 shard(s)
+[SPLIT] model across 2 dir(s): 188 shard(s) total (primary C:\AI\Kimi-K3 -> 96 shard(s)), no duplication
+[OMP] spinning team: 16 threads spin 2000 us between regions (COLI_OMP_SPIN_US; COLI_OMP_SPIN=0: libgomp's team)
+[K3] loaded layer 1/93 (0.7s, RSS 1.7 GB)
+[K3] loaded layer 9/93 (4.6s, RSS 3.7 GB)
+[K3] loaded layer 17/93 (8.8s, RSS 6.5 GB)
+[K3] loaded layer 25/93 (13.0s, RSS 9.2 GB)
+[K3] loaded layer 33/93 (17.1s, RSS 12.0 GB)
+[K3] loaded layer 41/93 (21.3s, RSS 14.8 GB)
+[K3] loaded layer 49/93 (25.5s, RSS 17.5 GB)
+[K3] loaded layer 57/93 (29.6s, RSS 20.3 GB)
+[K3] loaded layer 65/93 (33.8s, RSS 23.1 GB)
+[K3] loaded layer 73/93 (38.0s, RSS 25.8 GB)
+[K3] loaded layer 81/93 (42.2s, RSS 28.6 GB)
+[K3] loaded layer 89/93 (46.5s, RSS 31.3 GB)
+[K3-CUDA] dense: 369 of 929 matrices on GPU 0, 20.00 of 31.15 GiB (budget 20.00 GiB, 22.49 free); their host copies released; the CPU's arithmetic there (coli_cuda_k3.dll)
+[K3-CUDA] experts: a prompt step's routed experts (steps of 32 rows or more) on GPU 0 beside the CPU, the CPU's bytes (K3_GPU_EXPERTS=0: the CPU's alone)
+[K3][RAM_GB=174.0] resident 12.5 GB + reserve 24.2 GB (page cache 2.5, activations 1.2, read-ahead 20.0, KV 24x8192 0.5, checkpoints 0 0.0) -> 137.3 GB for experts; cache 619->85/layer (17.5 MB/slot, 92 layers; projected peak 173.9 GB)
+[K3] K3_EXPERT_GB=1000 does not fit alongside the 12.5 GB already resident. It is a request, not a reservation.
+[K3] init done in 52.2s | 93 layers | expert cache 85/layer (17.5 MB/slot) | RSS 34.0 GB
+[USAGE] expert history: 68851328 selections (C:\AI\Kimi-K3/.coli_usage)
+[K3] tokenizer.json loaded (family=kimi)
+[K3] prompt: 35 tokens | ngen 48 | temp 0.00
+[DBG] step_chunk pos=0 C=1 metal=0
+[KDA] L0 metal=0 P=12288 H=96 hd=128 K=4
+[K3-FMT] L0 KDA: q.fmt=4 gs=64 k.fmt=4 gs=64 v.fmt=4 gs=64 g.fmt=4 gs=64
+[K3-PATH] L0 attn=KDA metal=0
+[K3] expert readers: 4 on 2 device(s)
+[K3-FMT] L3 MLA: qa.fmt=1 gs=0 qb.fmt=1 gs=0 kva.fmt=1 gs=0
+[K3-CUDA] the dense matrices the GPU holds, one by one: 12915 matmuls, 12915 rows, 4.9s
+[K3] prefill 1/35 (3.9s)[K3] prefill 2/35 (8.9s)[K3] prefill 3/35 (12.9s)[K3] prefill 4/35 (14.9s)[K3] prefill 5/35 (16.6s)[K3] prefill 6/35 (18.4s)[K3] prefill 7/35 (20.1s)[K3] prefill 8/35 (21.4s)[K3] prefill 9/35 (22.6s)[K3] prefill 10/35 (23.8s)[K3] prefill 11/35 (24.8s)[K3] prefill 12/35 (26.1s)[K3] prefill 13/35 (27.2s)[K3] prefill 14/35 (28.5s)[K3] prefill 15/35 (29.5s)[K3] prefill 16/35 (30.6s)[K3] prefill 17/35 (31.7s)[K3] prefill 18/35 (32.8s)[K3] prefill 19/35 (33.9s)[K3] prefill 20/35 (34.9s)[K3] prefill 21/35 (35.8s)[K3] prefill 22/35 (36.9s)[K3] prefill 23/35 (38.0s)[K3] prefill 24/35 (39.3s)[K3] prefill 25/35 (40.4s)[K3] prefill 26/35 (41.6s)[K3] prefill 27/35 (42.7s)[K3] prefill 28/35 (43.8s)[K3] prefill 29/35 (44.9s)[K3] prefill 30/35 (46.0s)[K3] prefill 31/35 (46.9s)[K3] prefill 32/35 (47.9s)[K3] prefill 33/35 (48.9s)[K3] prefill 34/35 (49.9s)[K3] prefill 35/35 (50.9s)
+[K3] prefill done in 50.9s (0.69 tok/s)
+[K3] the prompt: attention 7.9s (KDA 5.9, MLA 2.0), MoE 42.6s (router and reads issued 1.9, latent 2.2, shared 5.7, routed experts computed 18.7, waiting for reads 13.8, their inputs 0.1, their sums 0.0); 443 GB read
+[K3] the prompt's KDA on the CPU: f32 projections 0.6s, conv 0.0s, heads 0.0s; on the GPU 0.0s; 33735962 page faults
+[K3-CUDA] dense (prompt): 12915 matmuls on the GPU, 4.9s
+  [tok 8: 1.1s/tok, hit 79%, 534.2 GB read]
+  [tok 16: 1.1s/tok, hit 79%, 636.1 GB read]
+  [tok 24: 1.1s/tok, hit 79%, 736.4 GB read]
+  [tok 32: 1.1s/tok, hit 79%, 841.2 GB read]
+  [tok 40: 1.1s/tok, hit 79%, 946.0 GB read]
+
+[K3] eos
+
+[K3] decode 45 tokens in 50.4s (0.89 tok/s) | expert hit 78.8% (91603/116288) | 999.2 GB streamed
+[K3] time: attn 13.4s moe 87.0s (eload 23.3s) head 0.1s | RSS 142.2 GB
+[K3] a decode token: 1119 ms -- attention 122, MoE 987 (router and reads issued 53, latent 58, shared 146, routed experts computed 514, waiting for reads 211), head 1; 12.4 GB read
+[K3] prefetch (run): 34589 experts read ahead, 22654 used, 11935 not (2330 of them cancelled unread); 58.3% of the routed experts were predicted; predicting took 2.1s
+[K3-CUDA] dense (run): 29151 matmuls on the GPU, 6.5s
+rc=0 wall=163s
