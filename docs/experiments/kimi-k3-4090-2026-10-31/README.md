@@ -647,3 +647,20 @@ and its drives are now near their floor too. The shared experts' call, 18 s of i
 routed experts' copies: alone at a layer's 5,862 rows it is 10% sooner with the new kernels, in the
 prompt it is not measurably so. The KDA layers' pieces go up and come back on their kernels' stream
 as well.
+
+## The drives' shares: a long prompt against decode (`raw/tl_*`, `h2_dec_*`, 2026-11-03)
+
+Each MoE shard is cut 61.4% to C: and 38.6% to D: (`k3_download.py`'s weights 10.4 and 6.55, the
+drives' rates read alone). The monitor's samples (2 s each) during the runs above give the rates
+while the drives work beside the rest of the engine:
+
+| phase | C: busy | C: while busy | D: busy | D: while busy | the share that would balance them |
+|---|---:|---:|---:|---:|---:|
+| a long prompt (`tl_2637_logits`, `tl_5862_*`, `kr_5862_512_1`) | 90% or more in 39 of 40-41 samples | 7.9-8.2 GB/s | the same in 28-30 | 5.3-5.6 GB/s | 59.7% on C: |
+| decode, 45-48 tokens (`tl_dec_*`, `h2_dec_*`) | 74-79% | 8.0-8.4 GB/s | 74-80% | 4.9-5.6 GB/s | about 61% on C: |
+
+A cut at 59.7% would take about 3 s off a long cold prompt (C: reads 865 instead of 888 GB) and
+put 4.4% more of every decode token's reads on D:, which decode already keeps as busy as C:, while
+decode waits for reads about 330 ms of its 1.24 s a token: at a few hundred tokens a reply that can
+cost more than the prompt saves. The shares stay as they are; a third drive or a faster one is
+what would lower the long prompt's floor.
