@@ -5936,7 +5936,7 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
     int room=more-1;
     if(room>Q38_SPEC_ROWS-1)room=Q38_SPEC_ROWS-1;
     if(pos+room>=m->kv_cap)room=m->kv_cap-1-pos;
-    int d[Q38_SPEC_ROWS],k=0,src=SPEC_SRC_MTP;
+    int d[Q38_SPEC_ROWS],k=0,src=SPEC_SRC_MTP,made=0;   /* made: the head's drafts before a trim */
     double t_verify=0.0;   /* when the verify's cost began (0: at its forward) */
     int head_ready=sp->on&&m->mtp_pend_n&&m->mtp_len+m->mtp_pend_n==pos;
     if(room>0&&(head_ready||sp->lookup)){
@@ -5986,6 +5986,7 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
                 spec_gate_draft_cost(&sp->gate,SPEC_SRC_MTP,now_s()-t0);
             }
             free(hidden);
+            made=k;
             /* the depth this step's drafts are worth, from their probabilities (DeepSeek's
              * confidence-scheduled verification): the drafts past it go unverified.
              * The first stays (the head pass that made it is a plain step's too). */
@@ -6014,6 +6015,15 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
     if(!t_verify)t_verify=now_s();
     if(m->mtp&&src!=SPEC_SRC_MTP&&m->mtp_pend_n&&m->mtp_len+m->mtp_pend_n==pos)
         q38_mtp_take_pending(m,tok,NULL,NULL);
+    /* the rows no draft above asked for, asked together: the head's last draft's (known only as
+     * the verify starts; a trim leaves one asked for), a lookup proposal's every row's. The
+     * verify's reads (q38_ple_prefetch) then wait for one round of the disk, not one a thread:
+     * Qwen3.8-Flash-Next's rows of a verify 827 -> 267 us on an i5-13500's NVMe */
+    {
+        int seq[Q38_SPEC_ROWS];seq[0]=tok;memcpy(seq+1,d,(size_t)k*sizeof(int));
+        int from=src!=SPEC_SRC_MTP?0:made==k?k:k+1;
+        q38_ple_advise(m,seq,k+1,from);
+    }
     int S=k+1;
     sp->ids[0]=tok;memcpy(sp->ids+1,d,(size_t)k*sizeof(int));
     float *streams=NULL;
