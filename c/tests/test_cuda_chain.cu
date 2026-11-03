@@ -1405,6 +1405,35 @@ int main(void) {
             T->free(ib); T->free(xb); T->free(yb);
         }
     }
+    {   /* a GGUF's blocks (Q8_0, fmt 108): each listed row the bits the whole GEMV gives it, an id past
+         * the matrix -inf (an MTP head's draft list scored from a block lm_head) */
+        const int I = 2560, O = 3000, n = 211, rb = I / 32 * 34;
+        std::vector<uint8_t> w8((size_t)O * rb);
+        unsigned sq = 7;
+        static const uint16_t scl[3] = {0x2400, 0x2800, 0x2C00};   /* 1/64, 1/32, 1/16 as float16 */
+        for (int o = 0; o < O; o++)
+            for (int b = 0; b < I / 32; b++) {
+                uint8_t *blk = w8.data() + (size_t)o * rb + (size_t)b * 34;
+                memcpy(blk, &scl[(o + b) % 3], 2);
+                for (int k = 0; k < 32; k++) blk[2 + k] = (uint8_t)(int8_t)(frand(&sq) * 120);
+            }
+        std::vector<float> x = rnd((size_t)I, 150);
+        std::vector<int> ids((size_t)n);
+        for (int j = 0; j < n; j++) ids[j] = j == 17 ? O + 5 : (j * 13 + 3) % O;
+        ColiCudaTensor *t = NULL;
+        CcBuf *ib = T->buf((size_t)n * 4, CC_DEV), *xb = up(x), *yb = T->buf((size_t)n * 4, CC_DEV), *fb = T->buf((size_t)O * 4, CC_DEV);
+        int ok = T->matmul_rows && coli_cuda_tensor_upload(&t, w8.data(), NULL, 108, I, O, 0) && ib && xb && yb && fb && T->begin() &&
+                 T->write(ib, 0, ids.data(), (size_t)n * 4) && T->matmul_rows(t, ib, xb, yb, n) && T->matmul(t, xb, 0, fb, 0, 1) && T->submit(1);
+        std::vector<float> got = down(yb, (size_t)n), full = down(fb, (size_t)O);
+        int same = ok;
+        for (int j = 0; j < n && same; j++) {
+            const float wnt = ids[j] < O ? full[ids[j]] : -INFINITY;
+            same = !memcmp(&got[j], &wnt, 4);
+        }
+        ck(same, "matmul_rows fmt 108 (Q8_0 blocks): each listed row the whole GEMV's bits, an id past the matrix -inf");
+        if (t) coli_cuda_tensor_free(t);
+        T->free(ib); T->free(xb); T->free(yb); T->free(fb);
+    }
     printf("the decision engines' encoders\n");
     if (!T->enc_rel || T->size < offsetof(ColiCudaChainOps, enc_rel) + sizeof T->enc_rel) ck(0, "the table has the encoder ops");
     else {
@@ -1529,7 +1558,7 @@ int main(void) {
     printf("lost\n");
     {
         CcStats st; T->stats(&st);
-        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 28, "the counters saw the frames, ops and matmuls");
+        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 30, "the counters saw the frames, ops and matmuls");
         setenv("COLI_GPU_FAIL_AFTER", "0", 1);
         std::vector<float> w = rnd(64, 81), ones(8, 1.f);
         ColiCudaTensor *t = NULL;

@@ -299,6 +299,7 @@ typedef struct {
      * its next token in mtp_pend_tok). */
     int mtp, mtp_wiring;
     int mtp_drafts;                   /* drafts per verify when Q38_MTP_DRAFTS is unset */
+    int mtp_pstep;                    /* the verify's depth from the drafts' probabilities when Q38_MTP_PSTEP is unset */
     size_t mtp_expert_bytes;          /* one routed expert of the head, gate, up and down (0 when fused) */
     char mtp_prefix[32];
     float *mtp_norm_emb, *mtp_norm_hid;
@@ -3785,6 +3786,11 @@ static int q38c_mtp_rows(Model *m,const float *streams,const int *next,int S,int
                          float *hidden,int settle);   /* qwen38_chain.h: the head's layer on the device */
 static void q38c_mtp_host(Model *m,int pos);
 #endif
+#ifdef COLI_CUDA
+static int q38cc_mtp_rows(Model *m,const float *streams,const int *next,int S,int pos_base,float *logit,
+                          float *hidden,int settle,int *pick,float *pick_p);   /* qwen38_cuda_chain.h: the head's layer on the card */
+static void q38cc_mtp_host(Model *m,int pos);
+#endif
 static void q38_draft_logits(Model *m,float *logit,const float *x) {
     const int V=m->lm_head.rows,H=m->lm_head.cols;
 #ifdef COLI_VULKAN
@@ -5540,6 +5546,7 @@ static int q38_mtp_best_token(Model *m,const float *mixed) {
 #ifdef COLI_VULKAN
     if(g_vk_chain)v=NULL;   /* the chain's device scores the whole vocabulary (q38c_draft_logits): the list is for the CPU */
 #endif
+    if(v&&!m->lm_head.q8)v=NULL;   /* the list was made for the CUDA chain's card: the CPU scores the whole vocabulary */
     int pick;
     if(v){
         float *score=falloc(v->list_n);
@@ -5600,6 +5607,22 @@ static void q38_mtp_rows(Model *m,const float *streams,const int *next,int S,int
     free(logit);
     if(ran)return;
     q38c_mtp_host(m,pos_base);   /* the head's rows from here are the host's: the device's mirror behind them */
+#endif
+#ifdef COLI_CUDA
+    {   /* the CUDA chain runs the head's layer */
+        float *lc=draft?falloc(c->vocab):NULL;
+        int pk=-1;float pp=0.f;
+        int rc=q38cc_mtp_rows(m,streams,next,S,pos_base,lc,hidden,1,draft&&!g_q38_mtp_dump?&pk:NULL,&pp);
+        if(rc==2&&draft){*draft=pk;m->mtp_p=pp;}   /* the draft list scored on the card */
+        else if(rc&&draft){
+            *draft=q38_argmax(lc,c->vocab);
+            m->mtp_p=q38_draft_p(lc,c->vocab,*draft);
+            if(g_q38_mtp_dump)q38_mtp_dump_record(m,lc,(Q38MtpDumpRow){pos_base+S-1,next[S-1]});
+        }
+        free(lc);
+        if(rc)return;
+        q38cc_mtp_host(m,pos_base);
+    }
 #endif
     int cap=q38_bounded_prefill_rows(S,0,(uint64_t)(3*W+2*H+C)*sizeof(float));
     float *hyper=falloc((int64_t)cap*W),*mixed=falloc((int64_t)cap*H);
@@ -5675,6 +5698,17 @@ static int q38_mtp_draft_more(Model *m,float *hidden,int tok,int row) {
         if(q38c_mtp_rows(m,hidden,&tok,1,row,lo,hidden,0)){int d=q38_argmax(lo,c->vocab);m->mtp_p=q38_draft_p(lo,c->vocab,d);free(lo);return d;}
         free(lo);
         q38c_mtp_host(m,row);
+    }
+#endif
+#ifdef COLI_CUDA
+    {   /* the CUDA chain runs the head's layer: its tail row at `row`, hidden in and out */
+        float *lo=falloc(c->vocab);
+        int pk=-1;float pp=0.f;
+        int rc=q38cc_mtp_rows(m,hidden,&tok,1,row,lo,hidden,0,&pk,&pp);
+        if(rc==2){m->mtp_p=pp;free(lo);return pk;}   /* the draft list scored on the card */
+        if(rc){int d=q38_argmax(lo,c->vocab);m->mtp_p=q38_draft_p(lo,c->vocab,d);free(lo);return d;}
+        free(lo);
+        q38cc_mtp_host(m,row);
     }
 #endif
     float *hyper=falloc(W),*mixed=falloc(H),*inject=falloc(C),*block=falloc(H);
@@ -6140,6 +6174,22 @@ static void q38_mtp_igpu_defaults(Model *m){
     if(head->n||slots==head->cap)return;
     if(q38_cache_slots_set(head,slots)){fprintf(stderr,"OOM expert cache\n");exit(1);}
     fprintf(stderr,"[qwen38] MTP head expert cache %d (%s; Q38_MTP_CAP sets it)\n",slots,why);
+}
+
+/* The values for the MTP head beside the CUDA chain with its layer and its routed experts on the
+ * card (q38cc_head_card): three drafts a verify, the verify's depth from their probabilities (the
+ * gate's spec_gate_pick_p). A draft then costs 0.6 ms on the card where a verify row costs a few:
+ * Qwen3.8-Flash-Next IQ2_XS on an RTX PRO 4000, 512-token answers with the card's draft list
+ * (DRAFT_VOCAB_CARD_TOP), 74.1-74.8 tok/s against 67.9-68.4 by the gate's depth; the 128-token
+ * bench's answers 63.0-65.0 against 58.5-60.1 at two drafts. Q38_MTP_DRAFTS
+ * and Q38_MTP_PSTEP override them. */
+static void q38_mtp_card_defaults(Model *m){
+    const char *drafts=getenv("Q38_MTP_DRAFTS"),*pstep=getenv("Q38_MTP_PSTEP");
+    if(!(drafts&&*drafts))m->mtp_drafts=3;
+    if(!(pstep&&*pstep))m->mtp_pstep=1;
+    fprintf(stderr,"[qwen38] MTP drafts per verify %s, the verify's depth by their probabilities %s (the head on the card; "
+                   "Q38_MTP_DRAFTS, Q38_MTP_PSTEP set them)\n",drafts&&*drafts?drafts:"3",
+            pstep&&*pstep?pstep:"1");
 }
 
 static int q38_tm_enabled(void) {

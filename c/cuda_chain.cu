@@ -30,6 +30,7 @@
 extern "C" int coli_cuda_tensor_shape(const ColiCudaTensor *t, int *fmt, int *I, int *O);
 extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream);
 extern "C" int coli_cuda_tensor_glu_async(ColiCudaTensor *tg, ColiCudaTensor *tu, float *y_dev, const float *x_dev, int S, void *stream);
+extern "C" int coli_cuda_tensor_gemv_rows_async(ColiCudaTensor *t, const int *ids_dev, float *y_dev, const float *x_dev, int n, void *stream);
 /* and the routed experts' kernels (cc_moe), on the same terms, and a resident tensor's device copy */
 extern "C" int coli_cuda_tensor_dev(const ColiCudaTensor *t, const void **w, const float **sc, int *gs);
 extern "C" int coli_cuda_moe_stage(int device, void *stage, size_t slot_bytes, int slots);
@@ -2713,9 +2714,14 @@ static int cc_matmul_rows(ColiCudaTensor *t, CcBuf *ids, CcBuf *x, CcBuf *y, int
     CcCtx *c = live();
     if (!c || !t || !ids || !x || !y || n < 1) return 0;
     int fmt, I, O; const void *w = nullptr; const float *sc = nullptr;
-    if (!coli_cuda_tensor_shape(t, &fmt, &I, &O) || coli_cuda_tensor_device(t) != c->device || (fmt != 0 && fmt != 1)) return 0;
-    if (!coli_cuda_tensor_dev(t, &w, &sc, nullptr) || (fmt == 1 && !sc)) return 0;
+    if (!coli_cuda_tensor_shape(t, &fmt, &I, &O) || coli_cuda_tensor_device(t) != c->device || (fmt != 0 && fmt != 1 && fmt < 100)) return 0;
     if ((size_t)I * 4 > x->bytes || (size_t)n * 4 > ids->bytes || (size_t)n * 4 > y->bytes) return 0;
+    if (fmt >= 100) {   /* a GGUF's blocks: the whole GEMV's bits for each listed row (backend_cuda.cu) */
+        g_st.matmuls++;
+        if (!coli_cuda_tensor_gemv_rows_async(t, (const int *)ids->d, fpw(y), fp(x), n, (void *)c->stream)) return 0;
+        return launched(c, "matmul_rows");
+    }
+    if (!coli_cuda_tensor_dev(t, &w, &sc, nullptr) || (fmt == 1 && !sc)) return 0;
     g_st.matmuls++;
     unsigned grid = grid1((size_t)n, 8);
     if (fmt == 1 && I % 16 == 0 && I <= 12288) {

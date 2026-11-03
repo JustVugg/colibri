@@ -99,11 +99,19 @@ int main(void) {
     setenv("Q38_MTP_FORCE", "reject", 1);
     argv[3] = (char *)"./qwen38_tiny_fp8_mtp/ref.json";
     setenv("COLI_CUDA_CHAIN", "1", 1);
-    fake_chain_frames = 0; fake_chain_fail_at = 0; fake_dn_snapshots = 0;
+    fake_chain_frames = 0; fake_chain_fail_at = 0; fake_dn_snapshots = 0; g_q38cc_mtp_rows = 0;
     rc = qwen38_main_unused(4, argv);
     tk(rc == 0, "rejected MTP drafts roll back and remain within the oracle's limits");
     tk(fake_chain_frames > 8, "rejected MTP verification ran through chain frames");
     tk(fake_dn_snapshots > 0, "MTP verification wrote DeltaNet chain snapshots");
+    tk(g_q38cc_mtp_rows > 0, "the MTP head's layer ran on the card");
+    qt_shutdown();
+    printf(" the MTP head on the CPU beside the chain (Q38_MTP_CHAIN=0)\n");
+    setenv("Q38_MTP_CHAIN", "0", 1);
+    fake_chain_frames = 0; g_q38cc_mtp_rows = 0;
+    rc = qwen38_main_unused(4, argv);
+    tk(rc == 0 && g_q38cc_mtp_rows == 0, "the head on the CPU, the drafts within the oracle's limits");
+    unsetenv("Q38_MTP_CHAIN");
     unsetenv("Q38_MTP_FORCE");
     setenv("Q38_MTP", "0", 1);
     qt_shutdown();
@@ -206,10 +214,10 @@ int main(void) {
             if (!sv) break;
             volatile unsigned dfl = 0, hfl = 0;
             int same = 1, slots = 0; unsigned v = 0;
-            q38cc_srv_open(sv, &dfl, &hfl, x, out, res);
+            q38cc_srv_open(sv, &dfl, &hfl, x, out);
             for (int rep = 0; rep < 2; rep++) for (int i = 0; i < L; i++) {
                 const int n = rep ? R : 1;   /* a decode step's row, a verify's five */
-                q38cc_srv_post(sv, i, n, ++v, tg, td, ids[i], w[i]);
+                q38cc_srv_post(sv, i, n, ++v, tg, td, ids[i], w[i], res + i * NE);
                 /* q38cc_dm_serve's arithmetic for the same slots */
                 const uint8_t *gp[R * K]; const float *xp[R * K]; int pa[R * K], np = 0;
                 for (int a = 0; a < n * K; a++) {
@@ -244,18 +252,54 @@ int main(void) {
             int cl = q38cc_srv_close(sv, 1, v);
             if (!(cl && sv->jobs == 2 * L && (int)sv->slots == slots)) printf("       closed %d, jobs %llu, slots %llu of %d\n", cl, sv->jobs, sv->slots, slots);
             tk(cl && sv->jobs == 2 * L && (int)sv->slots == slots, "the forward closed, its jobs and slots in the books");
-            q38cc_srv_open(sv, &dfl, &hfl, x, out, res);
-            q38cc_srv_post(sv, 0, 1, ++v, tg, td, ids[0], w[0]);
-            q38cc_srv_post(sv, 1, 1, ++v, tg, td, ids[1], w[1]);
+            q38cc_srv_open(sv, &dfl, &hfl, x, out);
+            q38cc_srv_post(sv, 0, 1, ++v, tg, td, ids[0], w[0], res + 0 * NE);
+            q38cc_srv_post(sv, 1, 1, ++v, tg, td, ids[1], w[1], res + 1 * NE);
             tk(q38cc_srv_close(sv, 0, v) && hfl == v, "a failed frame: the jobs skipped, the host's word past them");
-            q38cc_srv_open(sv, &dfl, &hfl, x, out, res);
-            q38cc_srv_post(sv, 2, 1, ++v, tg, td, ids[2], w[2]);
+            q38cc_srv_open(sv, &dfl, &hfl, x, out);
+            q38cc_srv_post(sv, 2, 1, ++v, tg, td, ids[2], w[2], res + 2 * NE);
             dfl = v;
             for (long spin = 0; hfl < v && spin < 2000000000L; spin++) q38cc_relax();
             tk(q38cc_srv_close(sv, 1, v) && hfl == v, "and the next forward served");
             q38cc_srv_stop(sv);
         }
         free(pool); free(x); free(out); free(want);
+    }
+
+    printf(" the MTP head's experts in Q2_0 for the card (q38cc_q2_0_block)\n");
+    {   /* blocks of weights as gq_blk_q2_0 decodes them back: within the 2-bit grid's error, which
+         * on Gaussian weights is about 0.41 of their RMS; zeros stay zeros, a flat block is exact on
+         * either sign (the grid's 2 or its -1) */
+        float x[64], y[64]; uint8_t b[18];
+        double err = 0, mag = 0, worst = 0;
+        for (int t = 0; t < 400; t++) {
+            const float sc = 0.001f + (float)(t_rnd() % 1000) / 1000.f * 0.05f, skew = (t & 1) ? 1.f : -1.f;
+            double e = 0, m = 0;
+            for (int j = 0; j < 64; j++) {
+                float g = 0.f;
+                for (int k = 0; k < 6; k++) g += (float)(t_rnd() % 10000) / 10000.f - 0.5f;
+                x[j] = sc * g + (j == t % 64 ? skew * 3.f * sc : 0.f);   /* one weight well out on one side */
+            }
+            q38cc_q2_0_block(x, b);
+            if (gq_dequant_row(GQ_Q2_0, b, y, 64)) { worst = 1e9; break; }
+            for (int j = 0; j < 64; j++) { e += (double)(x[j] - y[j]) * (x[j] - y[j]); m += (double)x[j] * x[j]; }
+            err += e; mag += m;
+            if (e / m > worst) worst = e / m;
+        }
+        tk(sqrt(err / mag) < 0.45 && sqrt(worst) < 0.6, "random blocks within the grid's error");
+        for (int j = 0; j < 64; j++) x[j] = 0.f;
+        q38cc_q2_0_block(x, b);
+        int zero = !gq_dequant_row(GQ_Q2_0, b, y, 64);
+        for (int j = 0; j < 64; j++) zero = zero && y[j] == 0.f;
+        tk(zero, "a block of zeros decodes to zeros");
+        int flat = 1;
+        for (int s = -1; s <= 1; s += 2) {
+            for (int j = 0; j < 64; j++) x[j] = s * 0.0123f;
+            q38cc_q2_0_block(x, b);
+            flat = flat && !gq_dequant_row(GQ_Q2_0, b, y, 64);
+            for (int j = 0; j < 64; j++) flat = flat && fabsf(y[j] - x[j]) <= 1e-3f * 0.0123f;
+        }
+        tk(flat, "a flat block, positive or negative, decodes to itself");
     }
 
     if (t_fails) { printf("test_qwen38_cuda_chain: %d failure(s)\n", t_fails); return 1; }

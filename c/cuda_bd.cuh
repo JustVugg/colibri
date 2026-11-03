@@ -902,6 +902,38 @@ __global__ static void __launch_bounds__(256) bd_gemv_i8_k(float *__restrict__ y
     }
 }
 
+/* bd_gemv_i8_k's arithmetic for one row of x over a list of the matrix's rows (a draft's
+ * vocabulary): y[j] = row ids[j] . x, each sum the bits the whole GEMV gives that row (the same
+ * quantized x, lanes a row and steps); -inf for an id out of range */
+template <int T>
+__global__ static void __launch_bounds__(256) bd_gemv_rows_i8_k(float *__restrict__ y, const float *__restrict__ x, const bd_u32 *__restrict__ W,
+        const bd_u32 *__restrict__ tab, const int *__restrict__ ids, int I, int O, int rowWords, int n, int lpr) {
+    COLI_PDL_WAIT();
+    extern __shared__ uint4 bd_sm4[];
+    constexpr int TW = bd_tab_words(T);
+    BdTabs tb = bd_tables_fill<T>(reinterpret_cast<bd_u32 *>(bd_sm4), tab);
+    int nb = I / 32, qr = bd_xq_row(I);
+    uint4 *xq = bd_sm4 + TW / 4;
+    float *dx = reinterpret_cast<float *>(xq + qr);
+    int *xs = reinterpret_cast<int *>(dx + nb);
+    bdx_quant(x, 1, I, xq, dx, xs);
+    __syncthreads();
+    BdX X = {xq, dx, xs, qr, nb};
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    int rps = 32 / lpr, sub = lane / lpr, ln = lane % lpr;
+    int stride = (int)gridDim.x * 8 * rps, steps = I / 32;
+    for (int j0 = ((int)blockIdx.x * 8 + warp) * rps; j0 < n; j0 += stride) {   /* uniform in the warp */
+        int j = j0 + sub, o = j < n ? ids[j] : -1;
+        bool live = o >= 0 && o < O;
+        const bd_u32 *Wr = W + (size_t)(live ? o : 0) * rowWords;
+        float acc[1] = {0.f};
+        if (live) for (int q = ln; q < steps; q += lpr) bdi_step<T, 1>(Wr, (bd_u32)q, X, 1, tb, acc);
+        float v = acc[0];
+        for (int off = lpr / 2; off > 0; off >>= 1) v += bd_shfl_xor(v, off);
+        if (ln == 0 && j < n) y[j] = live ? v : -INFINITY;
+    }
+}
+
 /* The float form for every block type (bdf_decode): x as floats in shared memory (float4s
  * with gx4's padding), a warp a row, a 32-weight unit a lane, decoded once for the nr rows. */
 __host__ __device__ inline size_t bd_gemv_f_smem(int I, int nr) { return (size_t)nr * (size_t)(bd_x4(I / 4) + 1) * 16; }
@@ -1050,6 +1082,18 @@ static int bd_gemv_i8_launch(float *y, const float *x, const bd_u32 *W, const bd
     }
     return 1;
 }
+template <int T>
+static int bd_gemv_rows_i8_launch(float *y, const float *x, const bd_u32 *W, const bd_u32 *tab, const int *ids, int I, int O, int rowWords,
+                                  int n, size_t smem_max, cudaStream_t st) {
+    size_t sm = bd_gemv_i8_smem(T, I, 1);
+    if (sm > smem_max) return 0;
+    int lpr = bd_lpr(I), rows_b = 256 / lpr, bx = (n + rows_b - 1) / rows_b;
+    if (bx > BD_GEMV_BLOCKS) bx = BD_GEMV_BLOCKS;
+    static unsigned raised;
+    bd_smem_raise((const void *)bd_gemv_rows_i8_k<T>, sm, smem_max, &raised);
+    coli_launch(bd_gemv_rows_i8_k<T>, dim3((unsigned)bx), 256, sm, st, y, x, W, tab, ids, I, O, rowWords, n, lpr);
+    return 1;
+}
 static int bd_gemv_f_launch(float *y, const float *x, const bd_u32 *W, const bd_u32 *tab, int fmt, int I, int O, int rowWords, int S,
                             size_t smem_max, cudaStream_t st) {
     int nr = S < BD_GEMV_NR ? S : BD_GEMV_NR;
@@ -1075,6 +1119,19 @@ static inline int bd_fmt_ok(int fmt) {
     if (fmt < 101 || fmt >= 143) return 0;
     int t = fmt - 100;
     return BD_BLK[t] >= 32;
+}
+/* the rows ids[0..n) of a block-format matrix against one row of x (bd_gemv_rows_i8_k): the types
+ * with the integer form; 0 for the others */
+static int bd_gemv_rows_launch(float *y, const float *x, const bd_u32 *W, const bd_u32 *tab, const int *ids, int fmt, int I, int O,
+                               int rowWords, int n, size_t smem_max, cudaStream_t st) {
+    if (!bd_fmt_ok(fmt) || I % 32 || I % BD_BLK[fmt - 100]) return 0;
+    switch (fmt - 100) {
+#define BD_R8_CASE(t) case t: return bd_gemv_rows_i8_launch<t>(y, x, W, tab, ids, I, O, rowWords, n, smem_max, st);
+        BD_R8_CASE(8) BD_R8_CASE(10) BD_R8_CASE(11) BD_R8_CASE(12) BD_R8_CASE(13) BD_R8_CASE(14) BD_R8_CASE(16) BD_R8_CASE(17)
+        BD_R8_CASE(18) BD_R8_CASE(19) BD_R8_CASE(20) BD_R8_CASE(21) BD_R8_CASE(22) BD_R8_CASE(23) BD_R8_CASE(29) BD_R8_CASE(42)
+#undef BD_R8_CASE
+        default: return 0;
+    }
 }
 static int bd_gemv_launch(float *y, const float *x, const bd_u32 *W, const bd_u32 *tab, int fmt, int I, int O, int rowWords, int S,
                           size_t smem_max, int force_float, cudaStream_t st) {
