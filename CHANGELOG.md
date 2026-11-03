@@ -86,6 +86,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **`tools/convert_fp8_to_int4.py`: the token as an unredirected header.** Its downloads set `HF_TOKEN` as a plain urllib header, which urllib copies into a redirect's request; it now goes as `setup_download.py` sends it, to the hub only. `tests/test_convert_hf_token.py` checks it.
 - The chat page's first-run dialog waits for the models service to finish measuring the
   machine; on a fresh state it showed "- GB di RAM" and no model that fits.
 
