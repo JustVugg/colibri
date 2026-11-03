@@ -431,11 +431,11 @@ tests/test_dsv4_quant_cuda: tests/test_dsv4_quant_cuda.cu \
 		-L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/lib64/stubs -lcudart -lcuda -lcublasLt
 
 tests/test_dsv4_resident_route: tests/test_dsv4_resident_route.cpp \
-		backend_cuda_dsv4.h dsv4_test_devices.h backend_cuda_dsv4.o
+		backend_cuda_dsv4.h tests/dsv4_test_devices.h backend_cuda_dsv4.o
 	$(CXX) -O3 -std=c++20 $(V4_DEEPGEMM_FLAGS) $< backend_cuda_dsv4.o -o $@ $(LDFLAGS)
 
 tests/test_dsv4_resident_indexer: tests/test_dsv4_resident_indexer.cpp \
-		backend_cuda_dsv4.h dsv4_test_devices.h backend_cuda_dsv4.o
+		backend_cuda_dsv4.h tests/dsv4_test_devices.h backend_cuda_dsv4.o
 	$(CXX) -O3 -std=c++20 $(V4_DEEPGEMM_FLAGS) $< backend_cuda_dsv4.o -o $@ $(LDFLAGS)
 
 DSV4_TEST_DEVICES ?= 0,1
