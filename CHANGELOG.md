@@ -24,6 +24,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **Qwen3.8's promotion brake at 97 % (it was 90).** The CUDA chain stops promoting experts to the card while the last 64 frames found this share of their routes there. With the MTP head on the card, a verify's layer with a missing expert waits for the CPU, and at 90 those waits were what the brake kept. Qwen3.8-Flash-Next IQ2_XS on an RTX PRO 4000, served 512-token answers, six runs: 96.1-96.7 % of the routes on the card instead of 92-94 %, the wait 5.1 -> 1.9 ms a verify, decode 79.3 -> 82.4 tok/s, the first answer 75.1 -> 79.3, the prompt unchanged. `COLI_CUDA_CHAIN_PROMOTE_HITS=90` restores it.
 - **Qwen3.8 served on the CUDA chain: the state's copies off a prompt's first token.** A served
   prompt copied the DeltaNet state from the card before its first layer (so a stop could put it
   back) and again after its last (the prompt-end snapshot), 118 MB each way read layer by layer

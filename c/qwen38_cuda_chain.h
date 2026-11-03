@@ -1164,15 +1164,20 @@ static int q38cc_pool_entry(Q38CChain *ch, Model *m, int i, int k, CcExpert *x) 
  * forward: 95%). COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set, =n sets the rate.
  * The brake, like qwen36's (the same knob) but over every frame, a prompt chunk weighing its
  * rows (qwen36's window leaves those out): where the last Q38CC_PROMO_WIN frames found at least
- * COLI_CUDA_CHAIN_PROMOTE_HITS percent (90) of their routes on the card, the frame promotes
+ * COLI_CUDA_CHAIN_PROMOTE_HITS percent (97) of their routes on the card, the frame promotes
  * nothing -- a conversation the history fits pays for every swap (the newcomer's bytes on the
  * bus, a resident the history still routes to back to the pool) and gains little. 0 brakes
  * never. UD-Q2_K_XL on an RTX PRO 4000, 128 tokens, 32 a forward without the brake against 128
  * with it: code after a prose history 30.5 -> 42.2 tok/s (58% of its routes on the card),
  * with the MTP head 30.7 -> 39.9; the prose that wrote the history 52.1 -> 52.7 (98%, the
- * brake held in every frame; 128 without it: 51.9 -> 48.8). */
+ * brake held in every frame; 128 without it: 51.9 -> 48.8). It was 90: a verify's layer whose
+ * experts miss waits for the CPU's slots, and with the MTP head on the card those waits were
+ * what the brake kept (Qwen3.8-Flash-Next IQ2_XS, RTX PRO 4000, served 512-token answers, six
+ * runs: 92-94% of the routes on the card at 90, 96.1-96.7% at 97; the card's wait for the CPU
+ * 5.1 -> 1.9 ms a verify; decode 79.3 -> 82.4 tok/s, the first answer 75.1 -> 79.3; without the
+ * brake 81.5, the prompt 3% slower). */
 #define Q38CC_PROMOTE 128
-#define Q38CC_PROMO_HITS 90
+#define Q38CC_PROMO_HITS 97
 #define Q38CC_DECAY 1024
 static int q38cc_promote_rate(void) { const char *e = getenv("COLI_CUDA_CHAIN_PROMOTE"); return e && *e ? atoi(e) : Q38CC_PROMOTE; }
 static int q38cc_promote_hits(void) {
