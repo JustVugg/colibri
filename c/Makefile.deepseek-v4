@@ -426,7 +426,7 @@ tests/test_dsv4_multigpu_cuda: tests/test_dsv4_multigpu_cuda.c \
 	$(CC) $(CFLAGS) $< backend_cuda_dsv4.o -o $@ $(LDFLAGS)
 
 tests/test_dsv4_quant_cuda: tests/test_dsv4_quant_cuda.cu \
-		backend_cuda_dsv4_quant.cuh backend_cuda_dsv4.h dsv4_test_devices.h backend_cuda_dsv4.o
+		backend_cuda_dsv4_quant.cuh backend_cuda_dsv4.h tests/dsv4_test_devices.h backend_cuda_dsv4.o
 	$(NVCC) $(V4_NVCCFLAGS) $< backend_cuda_dsv4.o -o $@ \
 		-L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/lib64/stubs -lcudart -lcuda -lcublasLt
 
