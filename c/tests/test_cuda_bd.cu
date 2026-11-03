@@ -346,6 +346,23 @@ static void check_moe(int tg, int td, int S, int K, int E, int D, int I) {
         if (hp) cudaFreeHost(hp);
         cudaFree(stg); cudaFree(dtab2); free(htab); free(y2);
     }
+    /* a prompt chunk's two lanes (CcMoe.lay_S): the sums of its first third of rows and of the
+     * rest apart, over the parts 1 above (one call for the chunk's rows), each the chunk's bits */
+    if (ok && S > 8) {
+        const int r0 = S / 3;
+        float *dy2 = NULL, *y2 = (float *)malloc((size_t)S * D * 4);
+        CcMoe la = mp, lb = mp;
+        la.parts = lb.parts = 2; la.S = r0; la.lay_S = lb.lay_S = S; lb.S = S - r0; lb.lay_s0 = r0;
+        lb.i_off = r0 * K; lb.w_off = r0 * K; lb.y_off = r0 * D;
+        int lok = y2 && cudaMalloc(&dy2, (size_t)S * D * 4) == cudaSuccess && coli_cuda_moe_async(0, dtab, NULL, di, dw, dh, dy2, NULL, &la, NULL) &&
+                  coli_cuda_moe_async(0, dtab, NULL, di, dw, dh, dy2, NULL, &lb, NULL) && cudaDeviceSynchronize() == cudaSuccess &&
+                  cudaMemcpy(y2, dy2, (size_t)S * D * 4, cudaMemcpyDeviceToHost) == cudaSuccess && !memcmp(y2, y, (size_t)S * D * 4);
+        CcMoe bad = mp; bad.lay_S = S + 4;   /* a parts 1 over another layout: refused */
+        lok = lok && !coli_cuda_moe_async(0, dtab, dx_, di, dw, dh, dy2, NULL, &bad, NULL);
+        if (!lok) { printf("FAIL moe %s/%s S %d: the lanes' sums (lay_S) differ from the chunk's\n", ref_name(tg), ref_name(td), S); fails++; }
+        else printf("moe %-7s/%-7s S %d: two lanes' sums over the chunk's parts 1, the chunk's bits\n", ref_name(tg), ref_name(td), S);
+        cudaFree(dy2); free(y2);
+    }
     /* the tier's expert groups (coli_cuda_expert_group: the frame's kernels, a row a slot, K 1)
      * on row 0's experts, each expert's down output against the CPU's integer form */
     if (ok && S == 1) {

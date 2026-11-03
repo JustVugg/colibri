@@ -2885,6 +2885,17 @@ static void q38_ple_prefetch(Model *m,const int *ids,int S) {
 
     int64_t total=(int64_t)S*c->ngram_heads;
     volatile int failed=0;
+    /* Every row asked of the OS first (gguf_advise), then read: read one by one, as many were in
+     * flight as the team has threads, and a prompt's rows mostly come from the disk (the GGUF's
+     * table is 28.8 GB for Qwen3.8-Flash-Next; a 470-token prompt's 6,941 rows of 90 bytes took
+     * 95 ms on six threads of an i5-13500 from its NVMe, asked first 6-16 ms). A decode step's or
+     * a verify's rows were asked as their tokens came (q38_ple_advise). */
+    if(m->ple_gg&&S>Q38_SPEC_ROWS&&q38_env_bool("Q38_PLE_ADVISE",1)){
+        const gguf_tensor *t=m->ple_gg; const int64_t rb=gq_row_bytes(t->type,c->ngram_head_dim);
+        #pragma omp parallel for schedule(static)
+        for(int64_t i=0;i<total;i++)
+            if(rows[i]>=0&&rows[i]<t->ne[1]) gguf_advise(q38_gg_ctx_of(t),t,rows[i]*rb,rb);
+    }
     #pragma omp parallel for schedule(static)
     for(int64_t i=0;i<total;i++){
         if(failed) continue;

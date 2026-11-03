@@ -2570,7 +2570,9 @@ static int cc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf 
     if (!c || !tab || !ids || !hid || !p || p->parts < 1 || p->parts > 3 || p->S < 1 || p->K < 1) return 0;
     if ((p->parts & 1) && !x) return 0;
     if ((p->parts & 2) && (!w || !y || (p->h_off >= 0 && !hy))) return 0;
-    if (cc_moe_hid_floats(p->S, p->K, p->D, p->I, p->E) * 4 > hid->bytes || (p->S > CC_MOE_FRAME_ROWS && p->E < 1)) return 0;
+    const int LS = p->lay_S > 0 ? p->lay_S : p->S;
+    if (p->lay_S < 0 || p->lay_s0 < 0 || p->lay_s0 > LS - p->S || ((p->parts & 1) && (LS != p->S || p->lay_s0))) return 0;
+    if (cc_moe_hid_floats(LS, p->K, p->D, p->I, p->E) * 4 > hid->bytes || (LS > CC_MOE_FRAME_ROWS && p->E < 1)) return 0;
     g_st.ops++;
     if (!coli_cuda_moe_async(c->device, (const CcExpert *)tab->d, fp(x), (const int *)ids->d, fp(w), fpw(hid), fpw(y), fp(hy), p,
                              (void *)c->stream)) { c->lost = 1; return 0; }

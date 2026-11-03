@@ -1221,7 +1221,7 @@ int main(void) {
             CcBuf *yb = T->buf(((size_t)S * D + 8) * 4, CC_DEV), *hyb = up(hy, CC_UP);
             int ok = tb && pb && T->begin() && T->write(tb, 0, tab.data(), tab.size() * sizeof(CcExpert)) && T->write(pb, 0, part.data(), part.size() * sizeof(CcExpert)) &&
                      T->write(ib, 0, ids.data(), ids.size() * 4) && T->submit(1);
-            CcMoe m = {S, K, D, I, fmt, gs, 0, 3, 2, 4, D, 0, K, 0, K, 8, D, -1, E, 0};
+            CcMoe m = {S, K, D, I, fmt, gs, 0, 3, 2, 4, D, 0, K, 0, K, 8, D, -1, E, 0, 0, 0, 0};
             ok = ok && T->begin() && T->moe(tb, xb, ib, wb, hb, yb, NULL, &m) && T->submit(1);
             std::vector<float> y = down(yb, (size_t)S * D + 8);
             double scale = 0; for (float v : ref_full) scale = fmax(scale, fabs(v));
@@ -1247,7 +1247,7 @@ int main(void) {
                 double sc2 = 0; for (float v : rf) sc2 = fmax(sc2, fabs(v));
                 CcBuf *x2b = up(x2), *i2b = T->buf(ids2.size() * 4, CC_DEV), *w2b = up(w2), *h2b = T->buf(cc_moe_hid_floats(S2, K, D, I, E) * 4, CC_DEV);
                 CcBuf *y2b = T->buf((size_t)S2 * D * 4, CC_DEV), *hy2b = up(hy2, CC_UP);
-                CcMoe m2 = {S2, K, D, I, fmt, gs, 0, 3, 2, 0, D, 0, K, 0, K, 0, D, -1, E, 0};
+                CcMoe m2 = {S2, K, D, I, fmt, gs, 0, 3, 2, 0, D, 0, K, 0, K, 0, D, -1, E, 0, 0, 0, 0};
                 int ok2 = T->begin() && T->write(i2b, 0, ids2.data(), ids2.size() * 4) && T->moe(tb, x2b, i2b, w2b, h2b, y2b, NULL, &m2) && T->submit(1);
                 double ef = ok2 ? maxdiff(down(y2b, (size_t)S2 * D).data(), rf.data(), (size_t)S2 * D) / sc2 : 1;
                 CcMoe a2 = m2, b2 = m2; a2.parts = 1; b2.parts = 2; b2.h_off = 0;
@@ -1256,6 +1256,22 @@ int main(void) {
                 if (ef >= 2e-3 || ep >= 2e-3) printf("  (prompt rows fmt %d: relative errors %.3g, %.3g)\n", fmt, ef, ep);
                 ck(ok2 && ef < 2e-3, "forty rows: the slots sorted by expert, their GEMMs, the sum in rank order");
                 ck(okp && ep < 2e-3, "forty rows, two experts the host's: its rows plus the device's slots");
+                {   /* a prompt chunk's two lanes (CcMoe.lay_S): the forty rows' parts 1 above, then the sums of
+                     * rows 0..15 and 16..39 apart over that layout, each with its own rows' offsets */
+                    std::vector<float> yall = down(y2b, (size_t)S2 * D);
+                    const int r0 = 16;
+                    CcMoe la = b2, lb = b2;
+                    la.S = r0; la.lay_S = S2;
+                    lb.S = S2 - r0; lb.lay_S = S2; lb.lay_s0 = r0; lb.i_off = r0 * K; lb.w_off = r0 * K; lb.y_off = r0 * D; lb.h_off = r0 * D;
+                    CcBuf *y3b = T->buf((size_t)S2 * D * 4, CC_DEV);
+                    int okl = okp && y3b && T->begin() && T->moe(pb, x2b, i2b, w2b, h2b, y3b, hy2b, &la) && T->moe(pb, x2b, i2b, w2b, h2b, y3b, hy2b, &lb) && T->submit(1);
+                    std::vector<float> yl = okl ? down(y3b, (size_t)S2 * D) : std::vector<float>();
+                    ck(okl && !memcmp(yl.data(), yall.data(), (size_t)S2 * D * 4), "a chunk's two lanes' sums over one parts 1 of its rows: the chunk's sum's bits");
+                    CcMoe bad = a2; bad.lay_S = S2 + 8;   /* a parts 1 has its own layout */
+                    CcMoe past = lb; past.lay_s0 = r0 + 1;   /* rows past the layout's */
+                    int refused = T->begin() && !T->moe(pb, x2b, i2b, w2b, h2b, y3b, hy2b, &bad) && !T->moe(pb, x2b, i2b, w2b, h2b, y3b, hy2b, &past) && T->submit(1);
+                    ck(refused, "a parts 1 over another layout, and rows past the layout's, refused");
+                }
                 if (fmt == 4) {   /* experts 1 and 5 in planar blocks in host memory (the tier's RAM cache), read over the bus */
                     std::vector<CcExpert> tp = tab;
                     std::vector<void *> hosts;

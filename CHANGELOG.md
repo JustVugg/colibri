@@ -24,6 +24,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **Qwen3.8 served on the CUDA chain: the state's copies off a prompt's first token.** A served
+  prompt copied the DeltaNet state from the card before its first layer (so a stop could put it
+  back) and again after its last (the prompt-end snapshot), 118 MB each way read layer by layer
+  and copied twice: 10 and 25 ms of a 470-token prompt. A prompt the chain takes in one chunk
+  needs no copy to come back to (a stop finds it before it starts or not at all), and the
+  snapshot is copied down by the stream into mapped memory without waiting, taken from there
+  when a later request needs it. Served on an RTX PRO 4000: 452-token prompts 682-702 -> 744-757
+  tok/s, 92 tokens 297-324 -> 327-367.
+- **Qwen3.8's CUDA chain: a prompt in two lanes, the CPU's pool slots beside the card's work.**
+  A prompt chunk with the host pool on the CPU left the card waiting at every layer while the
+  CPU computed the layer's pooled slots. A chunk of 384 rows or more now runs as two lanes, its
+  two halves a layer apart: the card runs one lane's layer while the CPU computes the other's
+  slots. The card's slots of a layer are one call for both lanes, and each layer's pooled
+  experts that the first lane routes at least twice go over the bus for the card while the
+  second lane runs, so the CPU keeps the experts with few slots. The chain's prompt GEMMs on the
+  f16 tiles split their inputs when a call has few blocks, and a prompt's PLE rows are asked of
+  the disk together. Qwen3.8-Flash-Next IQ2_XS on an RTX PRO 4000 with an i5-13500, served:
+  452-token prompts 585-615 -> 685-704 tok/s, 1512 tokens 644-647 (staged) -> 959-966, the
+  decode the same (`COLI_CUDA_CHAIN_LANES`, `COLI_CUDA_CHAIN_LANE_STAGE`, `COLI_CUDA_HCG_SPLIT`,
+  `Q38_PLE_ADVISE`).
 - **Qwen3.8's CUDA and Vulkan chains: a short prompt's host pool experts on the CPU.** A prompt chunk copied
   every pooled expert of every layer over the bus, routed or not (18 GB for any prompt up to
   2048 tokens on Qwen3.8-Flash-Next IQ2_XS with an RTX PRO 4000). A prompt of one chunk now has
