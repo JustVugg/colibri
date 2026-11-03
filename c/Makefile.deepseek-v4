@@ -305,7 +305,7 @@ $(V4_CUDA_FLAGS_STAMP): FORCE
 	fi
 
 .PHONY: deepseek-v4 deepseek-v4-objs deepseek-v4-clean deepseek-v4-test-objs \
-	deepseek-v4-test-registry print-v4-objs FORCE
+	deepseek-v4-test-registry dsv4-cuda-tests print-v4-objs FORCE
 deepseek-v4: $(V4_BINARY)
 
 # Build just the amalgamation unit + registry objects (no link). External
@@ -424,6 +424,36 @@ tests/test_dsv4_compressor_state_cuda: tests/test_dsv4_compressor_state_cuda.c \
 tests/test_dsv4_multigpu_cuda: tests/test_dsv4_multigpu_cuda.c \
 		backend_cuda_dsv4.h deepseek_v4_gpu_devices.h backend_cuda_dsv4.o
 	$(CC) $(CFLAGS) $< backend_cuda_dsv4.o -o $@ $(LDFLAGS)
+
+tests/test_dsv4_quant_cuda: tests/test_dsv4_quant_cuda.cu \
+		backend_cuda_dsv4_quant.cuh backend_cuda_dsv4.h dsv4_test_devices.h backend_cuda_dsv4.o
+	$(NVCC) $(V4_NVCCFLAGS) $< backend_cuda_dsv4.o -o $@ \
+		-L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/lib64/stubs -lcudart -lcuda -lcublasLt
+
+tests/test_dsv4_resident_route: tests/test_dsv4_resident_route.cpp \
+		backend_cuda_dsv4.h dsv4_test_devices.h backend_cuda_dsv4.o
+	$(CXX) -O3 -std=c++20 $(V4_DEEPGEMM_FLAGS) $< backend_cuda_dsv4.o -o $@ $(LDFLAGS)
+
+tests/test_dsv4_resident_indexer: tests/test_dsv4_resident_indexer.cpp \
+		backend_cuda_dsv4.h dsv4_test_devices.h backend_cuda_dsv4.o
+	$(CXX) -O3 -std=c++20 $(V4_DEEPGEMM_FLAGS) $< backend_cuda_dsv4.o -o $@ $(LDFLAGS)
+
+DSV4_TEST_DEVICES ?= 0,1
+DSV4_CUDA_TESTS := tests/test_dsv4_head_cuda tests/test_dsv4_wo_decode_cuda \
+	tests/test_dsv4_compressor_cuda tests/test_dsv4_compressor_state_cuda \
+	tests/test_dsv4_indexer_prepare_cuda tests/test_dsv4_multigpu_cuda \
+	tests/test_dsv4_quant_cuda tests/test_dsv4_resident_route tests/test_dsv4_resident_indexer
+
+# All nine CUDA unit tests on two devices. A GPU is required (CI has none);
+# set DSV4_TEST_DEVICES="a,b" to pick the ordinals, e.g. 2,3.
+dsv4-cuda-tests: $(DSV4_CUDA_TESTS)
+	@set -e; for t in $(DSV4_CUDA_TESTS); do \
+		echo "== $$t"; \
+		case $$t in \
+		*multigpu*) DSV4_TEST_DEVICES=$(DSV4_TEST_DEVICES) ./$$t $(DSV4_TEST_DEVICES) ;; \
+		*) DSV4_TEST_DEVICES=$(DSV4_TEST_DEVICES) ./$$t ;; \
+		esac; \
+	done
 endif
 endif
 
@@ -434,5 +464,6 @@ deepseek-v4-clean:
 		$(V4_SERVE_TEST) tests/test_dsv4_multigpu_cuda \
 		tests/test_dsv4_compressor_cuda tests/test_dsv4_compressor_state_cuda \
 		tests/test_dsv4_indexer_prepare_cuda tests/test_dsv4_wo_decode_cuda tests/test_dsv4_head_cuda \
+		tests/test_dsv4_quant_cuda tests/test_dsv4_resident_route tests/test_dsv4_resident_indexer \
 		test_expert_store_registry $(V4_FLAGS_STAMP) \
 		$(V4_CUDA_FLAGS_STAMP) backend_vulkan_v4.o vk_tier_v4.o vk_chain_v4.o
