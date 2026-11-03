@@ -166,20 +166,22 @@ static void check(int t, int I, int O, int bench) {
         if (ct) coli_cuda_tensor_free(ct);
         free(packed);
     }
-    /* a verify's rows together: the rows alone's bits; x quantized by each block and once for
-     * all of them (bdx_quant_k) alike */
-    for (int pq = 0; pq < 2 && ok && bdi_has(t); pq++) {
-        g_bd_preq_force = pq;
+    /* a verify's rows together: the rows alone's bits; x quantized by each block, once for all of
+     * them (bdx_quant_k) and read from global memory, and once and copied into each block's shared
+     * memory (bd_gemv_xs: three rows or more, where x fits) alike */
+    static const char *const how[3] = {"by each block", "once", "once, in shared memory"};
+    for (int pq = 0; pq < 3 && ok && bdi_has(t); pq++) {
+        g_bd_preq_force = pq > 0; g_bd_xs_force = pq == 2;
         for (int S = 1; S <= SM && ok; S++) {
             cudaMemset(yd, 0, (size_t)SM * O * 4);
             int okl = bd_gemv_launch(yd, xd, wd, g_tab, fmt, I, O, rw, S, g_smem, 0, 0) && cudaDeviceSynchronize() == cudaSuccess;
             cudaMemcpy(got, yd, (size_t)S * O * 4, cudaMemcpyDeviceToHost);
             if (!okl || memcmp(got, one, (size_t)S * O * 4)) {
-                printf("FAIL %s [%d x %d]: %d rows (x quantized %s) differ from the rows alone\n", ref_name(t), O, I, S, pq ? "once" : "by each block");
+                printf("FAIL %s [%d x %d]: %d rows (x quantized %s) differ from the rows alone\n", ref_name(t), O, I, S, how[pq]);
                 fails++;
             }
         }
-        g_bd_preq_force = -1;
+        g_bd_preq_force = -1; g_bd_xs_force = -1;
     }
     for (int S = 2; S <= SM && ok && !bdi_has(t); S++) {
         cudaMemset(yd, 0, (size_t)SM * O * 4);

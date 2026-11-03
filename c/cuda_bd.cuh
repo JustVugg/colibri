@@ -899,7 +899,9 @@ __host__ __device__ inline int bd_lpr(int I) { int steps = I / 32, l = 1; while 
 /* the integer form's shared bytes for type T and nr rows of I inputs */
 __host__ __device__ inline size_t bd_gemv_i8_smem(int T, int I, int nr) { return (size_t)bd_tab_words(T) * 4 + bd_x_bytes(I, nr); }
 
-template <int T, int NR, bool GQ = false>   /* GQ: x quantized once in global memory at gq (bdx_quant_k) */
+/* GQ: x quantized once in global memory at gq (bdx_quant_k); XS: the block's rows of it copied into shared
+ * memory first, so the steps read x there and not beside the weights (bd_gemv_xs) */
+template <int T, int NR, bool GQ = false, bool XS = false>
 __global__ static void __launch_bounds__(256) bd_gemv_i8_k(float *__restrict__ y, const float *__restrict__ x, const bd_u32 *__restrict__ W,
         const bd_u32 *__restrict__ tab, int I, int O, int rowWords, int S, int nr, int lpr, const uint4 *__restrict__ gq) {
     COLI_PDL_WAIT();
@@ -909,7 +911,18 @@ __global__ static void __launch_bounds__(256) bd_gemv_i8_k(float *__restrict__ y
     int s0 = (int)blockIdx.y * nr, nrow = min(nr, S - s0);
     int nb = I / 32, qr = bd_xq_row(I);
     BdX X;
-    if (GQ) {   /* x quantized once for every block (bdx_quant_k): S rows, then their scales, then their sums */
+    if (GQ && XS) {
+        const float *gdx = reinterpret_cast<const float *>(gq + (size_t)S * qr);
+        const int *gxs = reinterpret_cast<const int *>(gdx + (size_t)S * nb);
+        uint4 *xq = bd_sm4 + TW / 4;   /* bdx_quant's layout for nr rows (bd_gemv_i8_smem) */
+        float *dx = reinterpret_cast<float *>(xq + nr * qr);
+        int *xs = reinterpret_cast<int *>(dx + nr * nb);
+        for (int i = (int)threadIdx.x; i < nrow * qr; i += 256) xq[i] = gq[(size_t)s0 * qr + i];
+        for (int i = (int)threadIdx.x; i < nrow * nb; i += 256) dx[i] = gdx[(size_t)s0 * nb + i];
+        for (int i = (int)threadIdx.x; i < nrow * 2 * nb; i += 256) xs[i] = gxs[(size_t)s0 * 2 * nb + i];
+        __syncthreads();
+        X = {xq, dx, xs, qr, nb};
+    } else if (GQ) {   /* x quantized once for every block (bdx_quant_k): S rows, then their scales, then their sums */
         const float *gdx = reinterpret_cast<const float *>(gq + (size_t)S * qr);
         const int *gxs = reinterpret_cast<const int *>(gdx + (size_t)S * nb);
         X = {gq + (size_t)s0 * qr, gdx + (size_t)s0 * nb, gxs + (size_t)s0 * 2 * nb, qr, nb};
@@ -1139,6 +1152,19 @@ static int bd_gemv_preq(int I, int nr, int bx, size_t block_bytes) {
     if (mode >= 0) return mode;
     return bx >= 64 && (size_t)nr * I * 4 * 2 >= block_bytes;
 }
+/* a verify's rows of x quantized once (bd_gemv_preq) and copied into each block's shared memory: three
+ * rows or more, of at most 16 KiB. The steps read x from global memory beside the weights otherwise, and
+ * a lane waited for both (an RTX PRO 4000, tests/test_cuda_bd.cu with BENCH=1, four rows: IQ4_XS
+ * 10240 x 2560 306 -> 323 GB/s, IQ3_S 245 -> 278, Q6_K 2560 x 2560 215 -> 245; two rows as before;
+ * IQ4_XS 2560 x 6144, 34 KiB of x, 249 -> 239, so not there; Q4_K and Q5_K, whose steps read x their
+ * own way, 1-2 % slower, so not them). The bits are the same. COLI_CUDA_BD_XSM=0 never. */
+static int g_bd_xs_force = -1;   /* tests: 0 never, 1 wherever x fits, over the environment */
+static int bd_gemv_xs(int I, int nr) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_BD_XSM"); on = !(e && *e == '0'); }
+    if (g_bd_xs_force >= 0) return g_bd_xs_force && nr > 1;
+    return on && nr >= 3 && bd_x_bytes(I, nr) <= 16384;
+}
 template <int T>
 static int bd_gemv_i8_launch(float *y, const float *x, const bd_u32 *W, const bd_u32 *tab, int I, int O, int rowWords, int S,
                              size_t smem_max, cudaStream_t st) {
@@ -1158,7 +1184,12 @@ static int bd_gemv_i8_launch(float *y, const float *x, const bd_u32 *W, const bd
             sm = (size_t)bd_tab_words(T) * 4;   /* the tables alone */
         }
     }
-    if (gq && nr > 1) coli_launch(bd_gemv_i8_k<T, BD_GEMV_NR, true>, g, 256, sm, st, y, x, W, tab, I, O, rowWords, S, nr, lpr, gq);
+    if (gq && nr > 1 && T != 12 && T != 13 && bd_gemv_xs(I, nr) && bd_gemv_i8_smem(T, I, nr) <= smem_max) {   /* Q4_K, Q5_K: no gain */
+        const size_t sx = bd_gemv_i8_smem(T, I, nr);
+        static unsigned raised;
+        bd_smem_raise((const void *)bd_gemv_i8_k<T, BD_GEMV_NR, true, true>, sx, smem_max, &raised);
+        coli_launch(bd_gemv_i8_k<T, BD_GEMV_NR, true, true>, g, 256, sx, st, y, x, W, tab, I, O, rowWords, S, nr, lpr, gq);
+    } else if (gq && nr > 1) coli_launch(bd_gemv_i8_k<T, BD_GEMV_NR, true>, g, 256, sm, st, y, x, W, tab, I, O, rowWords, S, nr, lpr, gq);
     else if (gq) coli_launch(bd_gemv_i8_k<T, 1, true>, g, 256, sm, st, y, x, W, tab, I, O, rowWords, S, 1, lpr, gq);
     else if (nr > 1) {
         static unsigned raised;   /* past 48 KiB a kernel asks for it, once a device */
