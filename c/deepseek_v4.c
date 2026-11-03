@@ -12142,10 +12142,24 @@ void coli_v4_gpu_head_upload(ColiV4Engine *engine) {
      * always pinning the head to device 0. */
     int count = engine->gpu.device_count > 0 ? engine->gpu.device_count : 1;
     int first = engine->gpu.device_count > 0 ? engine->gpu.devices[0] : engine->gpu.device;
+    const char *forced_setting = getenv("DSV4_CUDA_HEAD_DEVICE");
+    int forced = forced_setting && *forced_setting ? atoi(forced_setting) : -1;
+    int order[COLI_V4_GPU_MAX_DEVICES], n = 0;
+    if (forced >= 0) {
+        for (int i = 0; i < count; i++) {
+            int d = engine->gpu.device_count > 0 ? engine->gpu.devices[i] : engine->gpu.device;
+            if (d == forced) { order[n++] = d; break; }
+        }
+    }
+    for (int i = count - 1; i >= 0; i--) {
+        int d = engine->gpu.device_count > 0 ? engine->gpu.devices[i] : engine->gpu.device;
+        if (d == forced) continue;
+        order[n++] = d;
+    }
     Dsv4CudaTensor *head = NULL;
     int device = -1;
-    for (int i = count - 1; i >= 0; i--) {
-        int candidate = engine->gpu.device_count > 0 ? engine->gpu.devices[i] : engine->gpu.device;
+    for (int k = 0; k < n; k++) {
+        int candidate = order[k];
         if (dsv4_cuda_mem_free_mb(candidate) < reserve + need) continue;
         if (dsv4_cuda_upload_head_exact(&head, (const uint16_t *)engine->head_cache.data,
                                         rows, cols, candidate)) {
