@@ -1952,13 +1952,26 @@ static void expert_fetch(Model *m, const char *kind, int layer,
         }
     }
     double started = now_s();
-    int threads = expert_read_depth();
-    if (threads > total) threads = total;
+    const int depth = expert_read_depth();
+    const int threads = depth < total ? depth : total;
     uint64_t bytes = 0;
+    int next_read = 0;
 #if defined(_OPENMP)
-    #pragma omp parallel for schedule(dynamic, 1) num_threads(threads) reduction(+:bytes)
+    /* Run at the default team width: a narrower region makes libgomp retire and respawn pool
+     * threads on every call. Only `threads` of the team read; the counter hands out the work. */
+    const int team = depth > omp_get_max_threads() ? depth : omp_get_max_threads();
+    #pragma omp parallel num_threads(team) reduction(+:bytes)
 #endif
-    for (int i = 0; i < total; i++) {
+    {
+#if defined(_OPENMP)
+    const int tid = omp_get_thread_num();
+#else
+    const int tid = 0;
+#endif
+    if (tid < threads)
+    for (;;) {
+        const int i = __atomic_fetch_add(&next_read, 1, __ATOMIC_RELAXED);
+        if (i >= total) break;
         const ExpertRead *r = &list[i];
         int64_t pad = r->t->off % ST_DIRECT_ALIGN;
         if (r->gx_layer >= 0 && v41_gx_conv(m, r->gx_layer, r->part / 2)) {
@@ -1989,6 +2002,7 @@ static void expert_fetch(Model *m, const char *kind, int layer,
         __atomic_fetch_add(&g_mir_bytes[rep], (uint64_t)r->t->nbytes, __ATOMIC_RELAXED);
         __atomic_fetch_add(&g_mir_nread[rep], 1, __ATOMIC_RELAXED);
         bytes += (uint64_t)r->t->nbytes;
+    }
     }
     /* Publish the payload pointers only now. A slot that advertises an expert has
      * to address that expert, and until the read landed the window base was the
