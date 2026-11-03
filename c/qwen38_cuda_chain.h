@@ -67,6 +67,7 @@ typedef struct {
     int dn_where, host_zero, snap_valid;
     CcBuf *hyper, *hn, *low, *mix, *mixed, *inj_a, *inj_m, *blk, *q, *k, *v, *ip, *ctx, *qsc, *sel;
     CcBuf *hyper_all;                          /* every row's streams through a prompt run layer by layer (q38cc_forward_lm) */
+    CcBuf *hyper_up, *ones_at; int ones_n;     /* a step's streams on their way in (q38cc_hyper_in); the rows of ones written in ones_at */
     CcBuf *qkv, *z, *ab, *cv, *dny, *lg, *gs, *us, *hs, *ds, *sgd;
     CcBuf *emb, *embd, *keys, *val, *gated, *normv;   /* emb: the PLE rows the host writes, embd: on the device */
     CcBuf *mixd, *lgd, *kvd, *outd, *hypd, *find, *routed, *cs, *pcs;
@@ -91,6 +92,7 @@ typedef struct {
     unsigned dm_epoch, dm_seq;
     CcExpert *dm_host; uint8_t *dm_res, *dm_ran, *dm_dev; int *dm_part;   /* dm_ran: the step's layers that ran so */
     CcBuf *dm_ids, *dm_w, *dm_idsd, *dm_wd, *dm_hid, *dm_y, *dm_hy, *dm_dfl, *dm_hfl, *dm_tab;
+    CcBuf *dm_tabu, *dm_tabdu;   /* dm_tab and dm_tabd in mapped memory: a settle's changed entries copied from there (q38cc_promote_settle) */
     /* pool_cpu: a decode step's pooled experts on the CPU (q38cc_dm_serve), from the decode table
      * dm_tabd that lacks them (dm_partd: a layer with any such slot); pc_*: the CPU's scratch */
     CcBuf *dm_tabd; int *dm_partd, pool_cpu, pc_cap; float *pc_gu, *pc_hh, *pc_dn;
@@ -1169,13 +1171,25 @@ static int q38cc_promote_settle(Q38CChain *ch, Model *m) {
     if (!ch->nchg) return 1;
     int ok = cc_begin();
     static const CcExpert none;
-    for (int j = 0; j < ch->nchg && ok; j++) {
-        const int k = ch->chg[j];
-        ok = cc_write(ch->dm_tab, (size_t)k * (sizeof(CcExpert) / 4), &ch->dm_host[k], sizeof(CcExpert));   /* offsets in floats */
-        /* the decode table: a slot back in the pool is the CPU's (pool_cpu) */
-        if (ok && ch->pool_cpu && ch->dm_tabd)
-            ok = cc_write(ch->dm_tabd, (size_t)k * (sizeof(CcExpert) / 4), ch->dm_res[k] >= 2 ? &none : &ch->dm_host[k], sizeof(CcExpert));
-    }
+    const size_t F = sizeof(CcExpert) / 4;   /* offsets in floats */
+    const int tabd = ch->pool_cpu && ch->dm_tabd;   /* the decode table: a slot back in the pool is the CPU's (pool_cpu) */
+    CcRegion *rg = ch->dm_tabu && (!tabd || ch->dm_tabdu) ? (CcRegion *)malloc((size_t)ch->nchg * sizeof *rg) : NULL;
+    if (rg) {   /* the entries into the mapped copies, then a kernel copies them over: no copy engine (cc_copy_regions) */
+        CcExpert *tu = (CcExpert *)cc_ptr(ch->dm_tabu), *tdu = tabd ? (CcExpert *)cc_ptr(ch->dm_tabdu) : NULL;
+        for (int j = 0; j < ch->nchg; j++) {
+            const int k = ch->chg[j];
+            tu[k] = ch->dm_host[k];
+            if (tdu) tdu[k] = ch->dm_res[k] >= 2 ? none : ch->dm_host[k];
+            rg[j] = (CcRegion){(size_t)k * F, (size_t)k * F, F};
+        }
+        ok = ok && cc_copy_regions(ch->dm_tab, ch->dm_tabu, rg, ch->nchg) && (!tdu || cc_copy_regions(ch->dm_tabd, ch->dm_tabdu, rg, ch->nchg));
+        free(rg);
+    } else
+        for (int j = 0; j < ch->nchg && ok; j++) {
+            const int k = ch->chg[j];
+            ok = cc_write(ch->dm_tab, (size_t)k * F, &ch->dm_host[k], sizeof(CcExpert));
+            if (ok && tabd) ok = cc_write(ch->dm_tabd, (size_t)k * F, ch->dm_res[k] >= 2 ? &none : &ch->dm_host[k], sizeof(CcExpert));
+        }
     ok = ok && cc_submit(1);
     if (ch->pool_cpu && ch->dm_tabd)   /* the changed layers' CPU slots */
         for (int j = 0; j < ch->nchg; j++) {
@@ -1559,6 +1573,12 @@ static int q38cc_dm_begin(Q38CChain *ch, Model *m, int n) {
         }
     }
     int wok = cc_begin() && cc_write(ch->dm_tab, 0, ch->dm_host, ne * sizeof(CcExpert)) && (!td || cc_write(ch->dm_tabd, 0, td, ne * sizeof(CcExpert))) && cc_submit(1);
+    /* the mapped copies a settle's changes go through (q38cc_promote_settle); without them it writes each entry */
+    if (wok && ch->own && cc_reserve(&ch->dm_tabu, ne * sizeof(CcExpert), CC_UP)) {
+        memcpy(cc_ptr(ch->dm_tabu), ch->dm_host, ne * sizeof(CcExpert));
+        if (td && cc_reserve(&ch->dm_tabdu, ne * sizeof(CcExpert), CC_UP)) memcpy(cc_ptr(ch->dm_tabdu), td, ne * sizeof(CcExpert));
+        else if (td) { cc_free(ch->dm_tabu); ch->dm_tabu = NULL; }
+    }
     free(td);
     if (!wok) return 0;
     if (ch->dm_stage && cc_fetch_ready() && !q38cc_stage_table(ch, m)) {
@@ -2443,6 +2463,18 @@ static void q38cc_dm_books(Q38CChain *ch, Model *m, int n, int pb) {
     }
     if (ch->own && ch->promo_rate > 0) q38cc_promote_books(ch, m, n);
 }
+/* n rows of streams into hyper: a decode step's, a verify's or a draft's through mapped memory and a
+ * copy kernel (cc_copy), not the copy engine, where they waited behind the megabytes of the experts
+ * the chain promotes (cc_host_up: a draft's frame up to 12.5 ms late on an RTX PRO 4000); a
+ * prompt chunk's through the engine. The frames before have finished: the mapped rows are free. */
+static int q38cc_hyper_in(Q38CChain *ch, const float *h, int n, int W) {
+    const size_t b = (size_t)n * W * 4;
+    if (n <= Q38CC_DM_ROWS && cc_reserve(&ch->hyper_up, (size_t)Q38CC_DM_ROWS * W * 4, CC_UP)) {
+        memcpy(cc_ptr(ch->hyper_up), h, b);
+        return cc_copy(ch->hyper, 0, ch->hyper_up, 0, (size_t)n * W);
+    }
+    return cc_write(ch->hyper, 0, h, b);
+}
 static int q38cc_frame_begin(Q38CChain *ch) {
     ch->frames++;
     if (ch->fault_at && ch->frames == ch->fault_at) { fprintf(stderr, "[chain] qwen38: fault injected at frame %llu\n", ch->frames); return 0; }
@@ -2607,7 +2639,7 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
         if (dm && (sv = q38cc_srv_of(ch, m, n)))
             q38cc_srv_open(sv, (const volatile unsigned *)cc_ptr(ch->dm_dfl), (volatile unsigned *)cc_ptr(ch->dm_hfl),
                            (const float *)cc_ptr(ch->mixd), (float *)cc_ptr(ch->dm_hy));
-        if (!q38cc_frame_begin(ch) || !cc_write(ch->hyper, 0, hyper_h + (size_t)c0 * W, (size_t)n * W * 4) ||
+        if (!q38cc_frame_begin(ch) || !q38cc_hyper_in(ch, hyper_h + (size_t)c0 * W, n, W) ||
             !q38cc_push_state(ch, m, pb)) goto lost;
         if (dm && q38cc_dm_tab(ch, n) == ch->dm_tabb && !q38cc_stage_from(ch, m, 0)) goto lost;   /* the first staged layer's copy */
         int ok = 1, pending = 0, pend_i = -1;   /* pend_i: the hybrid layer the host serves after recording the next */
@@ -2665,7 +2697,10 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
         double t0 = now_s();
         ok = ok && cc_submit(0);
         if (ok && pend_v) ok = q38cc_dm_serve(ch, m, pend_i, n, pend_v);   /* the last hybrid layer's, the tail recorded */
-        ok = ok && cc_finish();
+        /* a decode step's or a verify's frame, waited for alone: cc_finish waits for the copy stream too,
+         * the experts the chain promotes, which land on their own (q38cc_promote_settle); a prompt
+         * chunk's, everything (its stagings) */
+        ok = ok && (n > Q38CC_DM_ROWS ? cc_finish() : cc_submit(1));
         if (sv) { ok = q38cc_srv_close(sv, ok, ch->dm_seq) && ok; q38cc_srv_books(ch); sv = NULL; }
         m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0; ch->wait_ms += (now_s() - t0) * 1e3;
         if (!ok) goto lost;
@@ -2734,6 +2769,7 @@ static int q38cc_mtp_rows(Model *m, const float *streams, const int *next, int S
     float *emb = (float *)malloc((size_t)rows * (H + C) * sizeof(float)), *ones = emb ? emb + (size_t)rows * H : NULL;
     if (!emb || !q38cc_scratch(ch, m, rows) || (hidden && !cc_reserve(&ch->hypd, (size_t)rows * W * 4, CC_DOWN)) ||
         !cc_reserve(&ch->fin, (size_t)rows * H * 4, CC_UP) || !cc_reserve(&ch->ones, (size_t)rows * C * 4, CC_DEV)) { free(emb); return 0; }
+    if (ch->ones != ch->ones_at) { ch->ones_at = ch->ones; ch->ones_n = 0; }   /* a new buffer: its ones to write */
     /* the head's experts on the card (q38cc_head_card) for a prompt's rows too: their routes and
      * the routed experts' scratch for `rows` (a prompt's head on the host's step took 100 ms of a
      * 452-token prompt's 700 on an i5-13500) */
@@ -2756,8 +2792,9 @@ static int q38cc_mtp_rows(Model *m, const float *streams, const int *next, int S
                 cs[(s * half + j) * 2] = cosf(ang); cs[(s * half + j) * 2 + 1] = sinf(ang);
             }
         }
-        if (!q38cc_frame_begin(ch) || !cc_write(ch->hyper, 0, streams + (size_t)base * W, (size_t)n * W * 4) ||
-            !cc_write(ch->ones, 0, ones, (size_t)n * C * 4) || !q38cc_push_kv(ch, m, L, pb)) goto lost;
+        if (!q38cc_frame_begin(ch) || !q38cc_hyper_in(ch, streams + (size_t)base * W, n, W) ||
+            (n > ch->ones_n && !cc_write(ch->ones, 0, ones, (size_t)n * C * 4)) || !q38cc_push_kv(ch, m, L, pb)) goto lost;
+        if (n > ch->ones_n) ch->ones_n = n;   /* ones are ones: written once for as many rows */
         CcNorm en = {n, H, 1, 0, H, H, 0, H, H, (int)ch->o_mtp_emb, 0, CC_NORM_ADD1, c->eps, 1.f};
         CcNorm hn = m->mtp_wiring == Q38_MTP_WHOLE_NORM
                         ? (CcNorm){n, W, 1, 0, W, W, 0, W, W, (int)ch->o_mtp_hid, 0, CC_NORM_ADD1, c->eps, 1.f}

@@ -545,6 +545,25 @@ int main(void) {
         ck(T->reserve(&r, 64, CC_DEV) && T->bytes(r) >= 64 && T->reserve(&r, 32, CC_DEV) && T->bytes(r) >= 64 && T->reserve(&r, 4096, CC_DEV) && T->bytes(r) >= 4096, "reserve grows, never shrinks");
         T->free(d); T->free(u); T->free(dn); T->free(d2); T->free(r);
     }
+    {   /* copies of up to 1 MiB by a kernel (cc_copy_k: no copy engine), past it by the engine, at
+         * offsets 16-byte aligned or not; scattered regions out of mapped memory by a kernel too */
+        const size_t N = ((size_t)1 << 18) + 1000;
+        std::vector<float> a = rnd(N, 71);
+        CcBuf *u = T->buf(N * 4, CC_UP), *d = T->buf(N * 4, CC_DEV), *dn = T->buf(N * 4, CC_DOWN), *d3 = T->buf(4096 * 4, CC_DEV);
+        int ok = u && d && dn && d3;
+        if (ok) memcpy(T->ptr(u), a.data(), N * 4);
+        ok = ok && T->begin() && T->copy(d, 0, u, 0, N) && T->copy(dn, 3, d, 5, 777) && T->copy(dn, 1000, d, 1000, (size_t)1 << 18) && T->submit(1);
+        int same = ok;
+        for (size_t i = 0; i < 777 && same; i++) same = ((const float *)T->ptr(dn))[3 + i] == a[5 + i];
+        for (size_t i = 0; i < ((size_t)1 << 18) && same; i++) same = ((const float *)T->ptr(dn))[1000 + i] == a[1000 + i];
+        ck(same, "1 MiB + 4000 bytes by the engine, 777 floats unaligned and 1 MiB by the kernel");
+        CcRegion rg[3] = {{7, 33, 5}, {200, 1, 13}, {50, 900, 3}};
+        std::vector<float> want(4096, 0.f);
+        for (auto &x : rg) memcpy(want.data() + x.dst, a.data() + x.src, x.n * 4);
+        ck(ok && T->begin() && T->zero(d3, 0, 4096) && T->copy_regions(d3, u, rg, 3) && T->submit(1) &&
+           maxdiff(down(d3, 4096).data(), want.data(), 4096) == 0, "scattered regions out of mapped memory");
+        T->free(u); T->free(d); T->free(dn); T->free(d3);
+    }
     {   /* K rows into a head-major cache: a region per row and head, one kernel for the grid
          * (two regions or more, from a decode step's KV heads up to a prompt chunk); off the
          * grid, the copies as before */

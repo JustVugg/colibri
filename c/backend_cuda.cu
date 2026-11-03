@@ -1347,6 +1347,18 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
         if(!cuda_ok(cudaStreamCreateWithFlags(&ctx->stream,cudaStreamNonBlocking),"stream creation")){
             coli_cuda_shutdown();return 0;
         }
+#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))
+        {   /* the scratch the kernels take with cudaMallocAsync stays in the device's pool up to 64 MiB:
+             * with the default threshold of 0 every synchronization handed it back and the next
+             * allocation went to the driver again (300 us between two MTP drafts on an RTX PRO 4000) */
+            cudaMemPool_t pool;
+            if(cudaDeviceGetDefaultMemPool(&pool,device)==cudaSuccess){
+                uint64_t keep=64ull<<20;
+                (void)cudaMemPoolSetAttribute(pool,cudaMemPoolAttrReleaseThreshold,&keep);
+            }
+            (void)cudaGetLastError();
+        }
+#endif
 #ifdef COLI_ANS
         if(std::getenv("CUDA_RAW_EXPERTS")){
             ctx->ans_scratch = new dietgpu::StackDeviceMemory(device, 1ull << 30);
