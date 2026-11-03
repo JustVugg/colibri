@@ -1885,6 +1885,47 @@ static int expert_direct(void) {
     return on != 0;
 }
 
+/* Scratch for a GGUF expert matrix the slot holds in another form. A `static __thread` buffer
+ * here leaked once per retired OpenMP worker (docs/experiments/dsv41-read-team-2026-11-03.md);
+ * this capped shared pool reuses buffers whatever the threads do. Over the cap, a returned
+ * buffer is freed. */
+#define V41_SCRATCH_POOL 64
+static pthread_mutex_t g_scratch_mx = PTHREAD_MUTEX_INITIALIZER;
+static struct { uint8_t *p; int64_t n; } g_scratch[V41_SCRATCH_POOL];
+static int g_scratch_cnt;
+
+static uint8_t *scratch_get(int64_t need, int64_t *got) {
+    uint8_t *recycled = NULL, *traded = NULL;
+    pthread_mutex_lock(&g_scratch_mx);
+    for (int i = 0; i < g_scratch_cnt; i++)
+        if (g_scratch[i].n >= need) {   /* first fit */
+            recycled = g_scratch[i].p; *got = g_scratch[i].n;
+            g_scratch[i] = g_scratch[--g_scratch_cnt];
+            break;
+        }
+    if (!recycled && g_scratch_cnt > 0) {   /* all too small: trade one in rather than keep both */
+        traded = g_scratch[--g_scratch_cnt].p;
+    }
+    pthread_mutex_unlock(&g_scratch_mx);
+    if (traded) compat_aligned_free(traded);    /* the unmap stays out of the lock */
+    if (recycled) return recycled;
+    uint8_t *p = NULL;
+    if (posix_memalign((void **)&p, ST_DIRECT_ALIGN, (size_t)need)) {
+        fprintf(stderr, "OOM reading a GGUF expert\n"); exit(1); }
+    *got = need;
+    return p;
+}
+
+static void scratch_put(uint8_t *p, int64_t n) {
+    pthread_mutex_lock(&g_scratch_mx);
+    if (g_scratch_cnt < V41_SCRATCH_POOL) {
+        g_scratch[g_scratch_cnt].p = p; g_scratch[g_scratch_cnt].n = n; g_scratch_cnt++;
+        p = NULL;
+    }
+    pthread_mutex_unlock(&g_scratch_mx);
+    if (p) compat_aligned_free(p);
+}
+
 /* Read `n` reserved experts at once. The slot ids are stamped only after every
  * read has landed, so a slot never advertises an expert it does not yet hold. */
 static void expert_fetch(Model *m, const char *kind, int layer,
@@ -1921,16 +1962,10 @@ static void expert_fetch(Model *m, const char *kind, int layer,
         const ExpertRead *r = &list[i];
         int64_t pad = r->t->off % ST_DIRECT_ALIGN;
         if (r->gx_layer >= 0 && v41_gx_conv(m, r->gx_layer, r->part / 2)) {
-            /* A GGUF matrix the slot holds in another form: read into a buffer of this
-             * thread's, then interleaved by 16 rows or laid out as FP4 and scales. */
-            static __thread uint8_t *raw; static __thread int64_t raw_n;
-            const int64_t need = r->t->nbytes + 2 * ST_DIRECT_ALIGN;
-            if (raw_n < need) {
-                compat_aligned_free(raw); raw = NULL; raw_n = 0;
-                if (posix_memalign((void **)&raw, ST_DIRECT_ALIGN, (size_t)need)) {
-                    fprintf(stderr, "OOM reading a GGUF expert\n"); exit(1); }
-                raw_n = need;
-            }
+            /* A GGUF matrix the slot holds in another form: read into a pooled scratch
+             * buffer, then interleaved by 16 rows or laid out as FP4 and scales. */
+            int64_t raw_n = 0;
+            uint8_t *raw = scratch_get(r->t->nbytes + 2 * ST_DIRECT_ALIGN, &raw_n);
             st_read_range_rep(&m->S, r->t->fd, r->rep, r->t->off, r->t->nbytes, raw + pad,
                               r->t->nbytes, 1, expert_direct(), "pread expert");
             const int k = r->part / 2, held = m->gx_h[3 * r->gx_layer + k];
@@ -1939,6 +1974,7 @@ static void expert_fetch(Model *m, const char *kind, int layer,
             if (held < 0) coli_mxfp4_unblock(r->slot->base[r->part + 1], r->slot->base[r->part], raw + pad,
                                              shape[0] * shape[1] / 32);
             else gq_r16_pack(held, r->slot->base[r->part], raw + pad, (int)shape[0], (int)shape[1]);
+            scratch_put(raw, raw_n);
         } else
         /* The payload pointer carries the slack st_read_range_rep needs to read
          * from the enclosing block boundary, so an O_DIRECT transfer lands the
