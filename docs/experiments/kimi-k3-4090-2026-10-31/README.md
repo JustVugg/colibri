@@ -506,7 +506,7 @@ slots or waves, outside the code changed here; not reproduced, open (the next se
 
 ## The rare fault, hunted (`raw/ck_*`, `mx_*`, `hc_*`, `pd_*`, `pn_*`, 2026-11-03)
 
-`hl_2637_none`'s divergence did not come back in 22 runs of its configuration. Hunting it found a
+`hl_2637_none`'s divergence did not come back in 32 runs of its configuration. Hunting it found a
 different fault in the same reads -- a prompt that hangs when a drive falls behind -- now fixed.
 
 - **A debug mode**, `K3_CHECK` (`docs/ENVIRONMENT.md`): a sampled hash of each expert's bytes (a
@@ -563,6 +563,7 @@ does not join the thread that calls it. `hc_fix`: the same slowed reads end with
 | run | what | result |
 |---|---|---:|
 | `ck_1`..`ck_12` | the configuration, `K3_CHECK` and its dump | the CPU's bytes, 153.2-155.1 s; no finding (`ck_1`, `ck_2`: the FPU check counted MXCSR's sticky flags, masked since) |
+| `ck_13`..`ck_22` | the same with the fix (the committed build) | the CPU's bytes, 153.0-154.6 s; no finding |
 | `mx_1_ra3` | + `K3_READAHEAD_GB=3` | the CPU's bytes; 171.0 s, waiting 45.0 s, 9,198 experts on the CPU |
 | `mx_2_as`, `mx_4_as` | as `ck_*` (`mx_4` beside `k3stress`) | the CPU's bytes (`mx_4`: 188.3 s, 12,852 on the CPU) |
 | `mx_3_wave1` | + `K3_GPU_CPU_WAVE=1` | the CPU's bytes; 162.0 s |
@@ -572,8 +573,8 @@ does not join the thread that calls it. `hc_fix`: the same slowed reads end with
 | `pn_1`..`pn_5` | at once after each `pd`: the configuration with the fix (`pn_1`, `pn_3`, `pn_5`: `K3_IO_PER_DRIVE=1`) | the CPU's bytes; 153.3-153.4 s, one reader a drive 172.1-172.4 s (waiting 56 s); no finding |
 | `vramtest`, `ramtest`, `k3stress` | the card's memory, the RAM, the expert kernels at their clocks | no error (`raw/vramtest_18g_300s.txt`, `ramtest_150g_600s.txt`, `k3stress_300s.txt`) |
 
-Open: the divergence. It has come up once in 25 runs of this configuration (the parent's three
-and these 22), as a perturbation at one row (1,226), and the bad run's only measurable difference
+Open: the divergence. It has come up once in 35 runs of this configuration (the parent's three
+and these 32), as a perturbation at one row (1,226), and the bad run's only measurable difference
 was slower reads. Runs that check logits with `K3_CHECK=1
 K3_CHECK_DUMP=<file>` locate it if it returns: `ckdiff.py` against a good run's dump names the
 layer, the rows and the experts (and who computed them), and the slot checks say whether an

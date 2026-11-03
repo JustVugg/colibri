@@ -27,3 +27,14 @@ pn_4: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 67650
 pd_5: the CPU's bytes |  | 70049 of the prompt's routed experts on the GPU, 9150 on the CPU; 20 GiB of the  | 109.2s (24.15 tok/s) | waiting for reads 46.5
 pn_5_r1: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 69479 of the prompt's routed experts on the GPU, 9720 on the CPU; 20 GiB of the  | 172.4s (15.30 tok/s) | waiting for reads 56.2
 series pair 1..5 done
+ck_13: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 67621 of the prompt's routed experts on the GPU, 11578 on the CPU; 20 GiB of the | 153.3s (17.20 tok/s)
+ck_14: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 67631 of the prompt's routed experts on the GPU, 11568 on the CPU; 20 GiB of the | 153.1s (17.23 tok/s)
+ck_15: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 67652 of the prompt's routed experts on the GPU, 11547 on the CPU; 20 GiB of the | 153.2s (17.21 tok/s)
+ck_16: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 67719 of the prompt's routed experts on the GPU, 11480 on the CPU; 20 GiB of the | 153.4s (17.19 tok/s)
+ck_17: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 67721 of the prompt's routed experts on the GPU, 11478 on the CPU; 20 GiB of the | 153.0s (17.23 tok/s)
+ck_18: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 67572 of the prompt's routed experts on the GPU, 11627 on the CPU; 20 GiB of the | 154.3s (17.09 tok/s)
+ck_19: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 67551 of the prompt's routed experts on the GPU, 11648 on the CPU; 20 GiB of the | 154.6s (17.06 tok/s)
+ck_20: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 67789 of the prompt's routed experts on the GPU, 11410 on the CPU; 20 GiB of the | 154.2s (17.10 tok/s)
+ck_21: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 67431 of the prompt's routed experts on the GPU, 11768 on the CPU; 20 GiB of the | 153.5s (17.17 tok/s)
+ck_22: the CPU's bytes | [K3-CHECK] the prompt: 0 findings (FPU words: 0) | 67390 of the prompt's routed experts on the GPU, 11809 on the CPU; 20 GiB of the | 153.7s (17.15 tok/s)
+series ck 13..22 done
