@@ -866,9 +866,11 @@ __host__ __device__ inline int bd_lpr(int I) { int steps = I / 32, l = 1; while 
 /* the integer form's shared bytes for type T and nr rows of I inputs */
 __host__ __device__ inline size_t bd_gemv_i8_smem(int T, int I, int nr) { return (size_t)bd_tab_words(T) * 4 + bd_x_bytes(I, nr); }
 
-template <int T, int NR>
+/* GLU: a SwiGLU's gate and up in one pass, y = silu(x W^T) * (x Wu^T) for Wu of W's type and shape:
+ * each sum the bits of its own GEMV, the product CC_EW_SWIGLU's (a decode step's shared expert) */
+template <int T, int NR, bool GLU = false>
 __global__ static void __launch_bounds__(256) bd_gemv_i8_k(float *__restrict__ y, const float *__restrict__ x, const bd_u32 *__restrict__ W,
-        const bd_u32 *__restrict__ tab, int I, int O, int rowWords, int S, int nr, int lpr) {
+        const bd_u32 *__restrict__ tab, int I, int O, int rowWords, int S, int nr, int lpr, const bd_u32 *__restrict__ Wu) {
     COLI_PDL_WAIT();
     extern __shared__ uint4 bd_sm4[];
     constexpr int TW = bd_tab_words(T);
@@ -888,16 +890,20 @@ __global__ static void __launch_bounds__(256) bd_gemv_i8_k(float *__restrict__ y
     for (int o0 = ((int)blockIdx.x * 8 + warp) * rps; o0 < O; o0 += stride) {
         int o = o0 + sub;
         bool live = o < O;
-        const bd_u32 *Wr = W + (size_t)(live ? o : O - 1) * rowWords;
-        float acc[NR];
+        const size_t ro = (size_t)(live ? o : O - 1) * rowWords;
+        float acc[NR], au[NR];
         #pragma unroll
-        for (int r = 0; r < NR; r++) acc[r] = 0.f;
-        if (live) for (int q = ln; q < steps; q += lpr) bdi_step<T, NR>(Wr, (bd_u32)q, X, nrow, tb, acc);
+        for (int r = 0; r < NR; r++) { acc[r] = 0.f; au[r] = 0.f; }
+        if (live)
+            for (int q = ln; q < steps; q += lpr) {
+                bdi_step<T, NR>(W + ro, (bd_u32)q, X, nrow, tb, acc);
+                if (GLU) bdi_step<T, NR>(Wu + ro, (bd_u32)q, X, nrow, tb, au);
+            }
         #pragma unroll
         for (int r = 0; r < NR; r++) if (r < nrow) {
-            float v = acc[r];
-            for (int off = lpr / 2; off > 0; off >>= 1) v += bd_shfl_xor(v, off);
-            if (ln == 0 && live) y[(size_t)(s0 + r) * O + o] = v;
+            float v = acc[r], u = au[r];
+            for (int off = lpr / 2; off > 0; off >>= 1) { v += bd_shfl_xor(v, off); if (GLU) u += bd_shfl_xor(u, off); }
+            if (ln == 0 && live) y[(size_t)(s0 + r) * O + o] = GLU ? (v / (1.f + expf(-v))) * u : v;
         }
     }
 }
@@ -1063,7 +1069,7 @@ static inline void bd_smem_raise(const void *k, size_t sm, size_t smem_max, unsi
 }
 template <int T>
 static int bd_gemv_i8_launch(float *y, const float *x, const bd_u32 *W, const bd_u32 *tab, int I, int O, int rowWords, int S,
-                             size_t smem_max, cudaStream_t st) {
+                             size_t smem_max, cudaStream_t st, const bd_u32 *Wu = nullptr) {
     int nr = S < BD_GEMV_NR ? S : BD_GEMV_NR;
     while (nr > 1 && bd_gemv_i8_smem(T, I, nr) > smem_max) nr--;
     size_t sm = bd_gemv_i8_smem(T, I, nr);
@@ -1071,14 +1077,22 @@ static int bd_gemv_i8_launch(float *y, const float *x, const bd_u32 *W, const bd
     int lpr = bd_lpr(I), rows_b = 256 / lpr, bx = (O + rows_b - 1) / rows_b;
     if (bx > BD_GEMV_BLOCKS) bx = BD_GEMV_BLOCKS;
     dim3 g((unsigned)bx, (unsigned)((S + nr - 1) / nr));
-    if (nr > 1) {
+    if (Wu && nr > 1) {
+        static unsigned raised;
+        bd_smem_raise((const void *)bd_gemv_i8_k<T, BD_GEMV_NR, true>, sm, smem_max, &raised);
+        coli_launch(bd_gemv_i8_k<T, BD_GEMV_NR, true>, g, 256, sm, st, y, x, W, tab, I, O, rowWords, S, nr, lpr, Wu);
+    } else if (Wu) {
+        static unsigned raised;
+        bd_smem_raise((const void *)bd_gemv_i8_k<T, 1, true>, sm, smem_max, &raised);
+        coli_launch(bd_gemv_i8_k<T, 1, true>, g, 256, sm, st, y, x, W, tab, I, O, rowWords, S, 1, lpr, Wu);
+    } else if (nr > 1) {
         static unsigned raised;   /* past 48 KiB a kernel asks for it, once a device */
         bd_smem_raise((const void *)bd_gemv_i8_k<T, BD_GEMV_NR>, sm, smem_max, &raised);
-        coli_launch(bd_gemv_i8_k<T, BD_GEMV_NR>, g, 256, sm, st, y, x, W, tab, I, O, rowWords, S, nr, lpr);
+        coli_launch(bd_gemv_i8_k<T, BD_GEMV_NR>, g, 256, sm, st, y, x, W, tab, I, O, rowWords, S, nr, lpr, (const bd_u32 *)nullptr);
     } else {
         static unsigned raised;
         bd_smem_raise((const void *)bd_gemv_i8_k<T, 1>, sm, smem_max, &raised);
-        coli_launch(bd_gemv_i8_k<T, 1>, g, 256, sm, st, y, x, W, tab, I, O, rowWords, S, 1, lpr);
+        coli_launch(bd_gemv_i8_k<T, 1>, g, 256, sm, st, y, x, W, tab, I, O, rowWords, S, 1, lpr, (const bd_u32 *)nullptr);
     }
     return 1;
 }
@@ -1130,6 +1144,19 @@ static int bd_gemv_rows_launch(float *y, const float *x, const bd_u32 *W, const 
         BD_R8_CASE(8) BD_R8_CASE(10) BD_R8_CASE(11) BD_R8_CASE(12) BD_R8_CASE(13) BD_R8_CASE(14) BD_R8_CASE(16) BD_R8_CASE(17)
         BD_R8_CASE(18) BD_R8_CASE(19) BD_R8_CASE(20) BD_R8_CASE(21) BD_R8_CASE(22) BD_R8_CASE(23) BD_R8_CASE(29) BD_R8_CASE(42)
 #undef BD_R8_CASE
+        default: return 0;
+    }
+}
+/* y = silu(x Wg^T) * (x Wu^T) for up to BD_GEMV_MAX_S rows, Wg and Wu of one type and shape (bd_gemv_i8_k's
+ * GLU): the types with the integer form; 0 for the others (the caller's two GEMVs and its SwiGLU then) */
+static int bd_glu_launch(float *y, const float *x, const bd_u32 *Wg, const bd_u32 *Wu, const bd_u32 *tab, int fmt, int I, int O,
+                         int rowWords, int S, size_t smem_max, cudaStream_t st) {
+    if (!bd_fmt_ok(fmt) || I % 32 || I % BD_BLK[fmt - 100] || !Wu) return 0;
+    switch (fmt - 100) {
+#define BD_G8_CASE(t) case t: return bd_gemv_i8_launch<t>(y, x, Wg, tab, I, O, rowWords, S, smem_max, st, Wu);
+        BD_G8_CASE(8) BD_G8_CASE(10) BD_G8_CASE(11) BD_G8_CASE(12) BD_G8_CASE(13) BD_G8_CASE(14) BD_G8_CASE(16) BD_G8_CASE(17)
+        BD_G8_CASE(18) BD_G8_CASE(19) BD_G8_CASE(20) BD_G8_CASE(21) BD_G8_CASE(22) BD_G8_CASE(23) BD_G8_CASE(29) BD_G8_CASE(42)
+#undef BD_G8_CASE
         default: return 0;
     }
 }

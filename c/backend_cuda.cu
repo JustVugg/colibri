@@ -4303,15 +4303,27 @@ static int f32_gemm_launch(DeviceContext *ctx, float *y, const float *x, const f
 }
 /* y[S, O] = silu(x Wg^T) * (x Wu^T) for two GGUF block tensors of one type and shape, in one
  * hcm_dense_k pass (a prompt chunk's rows of a SwiGLU MLP: the gate's and the up's outputs never
- * leave the multiprocessor). 0: not taken here (another type, a decode step's rows, GQ_EXACT),
- * the caller's two GEMMs and its CC_EW_SWIGLU do it. COLI_CUDA_GLU=0 never. */
+ * leave the multiprocessor); a decode step's rows (BD_GEMV_MAX_S at most) in one GEMV pass
+ * (bd_gemv_i8_k's GLU: the bits of the two GEMVs and CC_EW_SWIGLU, three kernels into one).
+ * 0: not taken here (another type, GQ_EXACT), the caller's two GEMMs and its CC_EW_SWIGLU do it.
+ * COLI_CUDA_GLU=0 never. */
 extern "C" int coli_cuda_tensor_glu_async(ColiCudaTensor *tg, ColiCudaTensor *tu, float *y_dev, const float *x_dev, int S, void *stream) {
-    static int on = -1;
+    static int on = -1, dec = -1;
     if (on < 0) {
         const char *e = getenv("COLI_CUDA_GLU"), *f = getenv("COLI_CUDA_BD_FLOAT"), *q = getenv("GQ_EXACT"), *b = getenv("COLI_CUDA_BD_TILES");
-        on = !(e && *e == '0') && !(f && *f == '1') && !(q && *q == '1') && !(b && *b == '0');
+        dec = !(e && *e == '0') && !(f && *f == '1') && !(q && *q == '1');
+        on = dec && !(b && *b == '0');
     }
-    if (!on || fault_injected() || !tg || !tu || !y_dev || !x_dev || S <= BD_GEMV_MAX_S || tg->fmt < 100 || ((uintptr_t)x_dev & 15)) return 0;
+    if (fault_injected() || !tg || !tu || !y_dev || !x_dev || S < 1 || tg->fmt < 100 || ((uintptr_t)x_dev & 15)) return 0;
+    if (S <= BD_GEMV_MAX_S) {
+        if (!dec || tu->fmt != tg->fmt || tu->I != tg->I || tu->O != tg->O || tu->row_words != tg->row_words || tu->device != tg->device) return 0;
+        DeviceContext *bc = find_ctx(tg->device);
+        const bd_u32 *tab = select_ctx(bc) ? bd_table(bc) : nullptr;
+        if (!tab || !bd_glu_launch(y_dev, x_dev, (const bd_u32 *)tg->weights, (const bd_u32 *)tu->weights, tab, tg->fmt, tg->I, tg->O,
+                                   tg->row_words, S, bc->smem_optin, (cudaStream_t)stream)) return 0;
+        return cuda_ok(cudaGetLastError(), "block glu launch");
+    }
+    if (!on) return 0;
     DeviceContext *ctx = find_ctx(tg->device);
     if (!select_ctx(ctx) || !bd_table(ctx)) return 0;
     return hcm_gemm(ctx, tg, y_dev, x_dev, S, (cudaStream_t)stream, tu);

@@ -24,6 +24,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **A decode step's shared expert in one GEMV pass on CUDA.** The gate and up of a SwiGLU of one GGUF type, the rows of a decode step or a verify, now go through one kernel that writes silu(gate) * up, the bits of the two GEMVs and the elementwise product (three kernels into one). Qwen3.6-35B-A3B Q4_K_M on an RTX PRO 4000, 400-token answers, three runs: 104.4-104.8 -> 105.9-106.3 tok/s. Qwen3.8's chain takes it too where its shared expert's gate and up share a type (half of Qwen3.8-Flash-Next IQ2_XS's layers). `COLI_CUDA_GLU=0` turns it off.
 - **Qwen3.8's CUDA and Vulkan chains: a short prompt's host pool experts on the CPU.** A prompt chunk copied
   every pooled expert of every layer over the bus, routed or not (18 GB for any prompt up to
   2048 tokens on Qwen3.8-Flash-Next IQ2_XS with an RTX PRO 4000). A prompt of one chunk now has

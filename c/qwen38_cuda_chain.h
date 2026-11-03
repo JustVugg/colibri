@@ -992,9 +992,10 @@ static int q38cc_ple(Q38CChain *ch, Model *m, int n, int c0, int ns) {
 static int q38cc_shared(Q38CChain *ch, Model *m, Layer *l, int i, int n) {
     Cfg *c = &m->c; int SI = c->shared_inter;
     CcEw sw = {CC_EW_SWIGLU, n * SI, SI, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
-    return cc_matmul(q38cc_t(ch, &l->sh_g), ch->mixed, 0, ch->gs, 0, n) && cc_matmul(q38cc_t(ch, &l->sh_u), ch->mixed, 0, ch->us, 0, n) &&
-           cc_ew(ch->hs, ch->gs, ch->us, NULL, NULL, &sw) && cc_matmul(q38cc_t(ch, &l->sh_d), ch->hs, 0, ch->ds, 0, n) &&
-           cc_matmul(ch->t_sg[i], ch->mixed, 0, ch->sgd, 0, n);
+    const int glu = cc_matmul_glu(q38cc_t(ch, &l->sh_g), q38cc_t(ch, &l->sh_u), ch->mixed, ch->hs, n);   /* the gate's and up's sums in one pass */
+    return (glu > 0 || (glu < 0 && cc_matmul(q38cc_t(ch, &l->sh_g), ch->mixed, 0, ch->gs, 0, n) &&
+                        cc_matmul(q38cc_t(ch, &l->sh_u), ch->mixed, 0, ch->us, 0, n) && cc_ew(ch->hs, ch->gs, ch->us, NULL, NULL, &sw))) &&
+           cc_matmul(q38cc_t(ch, &l->sh_d), ch->hs, 0, ch->ds, 0, n) && cc_matmul(ch->t_sg[i], ch->mixed, 0, ch->sgd, 0, n);
 }
 /* block = routed + sigmoid(gate) * shared (q38_moe's out), then hyper += inject x block */
 static int q38cc_moe_apply(Q38CChain *ch, Model *m, int n, CcBuf *routed) {
