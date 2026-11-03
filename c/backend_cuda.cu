@@ -3864,6 +3864,11 @@ __global__ static void hcm_sum_k(float *__restrict__ y, const float *__restrict_
  * on an RTX PRO 4000. COLI_CUDA_HCG_SPLIT=n: n splits always (1 none). */
 struct HcgPart { float *yp; void *scr; int ns, kc; };
 static HcgPart hcg_part(const DeviceContext *ctx, float *y, long long blocks, int per_sm, int S, int I, int O, int can, cudaStream_t st) {
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)   /* the f16 tiles are off there (hcg_ok) */
+    (void)ctx; (void)blocks; (void)per_sm; (void)S; (void)O; (void)can; (void)st;
+    HcgPart h = {y, nullptr, 1, I};
+    return h;
+#else
     static int force = -1;
     if (force < 0) { const char *e = getenv("COLI_CUDA_HCG_SPLIT"); force = e && *e ? atoi(e) : 0; if (force < 0) force = 0; }
     HcgPart h = {y, nullptr, 1, I};
@@ -3879,12 +3884,17 @@ static HcgPart hcg_part(const DeviceContext *ctx, float *y, long long blocks, in
     if (cudaMallocAsync(&h.scr, (size_t)ns * S * O * sizeof(float), st) != cudaSuccess) { (void)cudaGetLastError(); h.scr = nullptr; return h; }
     h.yp = (float *)h.scr; h.ns = ns; h.kc = kc;
     return h;
+#endif
 }
 static void hcg_part_sum(const HcgPart &h, float *y, int S, int O, cudaStream_t st) {
     if (h.ns <= 1) return;
+#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))
     const long long ny = (long long)S * O;
     hcm_sum_k<<<(unsigned)((ny + 255) / 256), 256, 0, st>>>(y, h.yp, ny, h.ns);
     (void)cudaFreeAsync(h.scr, st);
+#else
+    (void)y; (void)S; (void)O; (void)st;
+#endif
 }
 #if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))   /* HIP has no carveout attribute; hcm_gemm is off there */
 template<int T, int BM, int BN, bool GLU = false>
