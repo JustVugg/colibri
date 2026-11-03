@@ -1,0 +1,98 @@
+tl_2637_logits: 109.3s (24.13 tok/s)
+[K3-CUDA] the dense matrices the GPU does not hold: 213 matmuls, 561681 rows, 3.4s
+[K3-CUDA] the dense matrices the GPU holds, one by one: 2640 matmuls, 10548 rows, 3.5s
+[K3-CUDA] the gated MLA layers: 24 layer steps, 63288 rows, 2.0s
+[K3-CUDA] the shared experts: 92 steps, 9.7s
+[K3-CUDA] the KDA layers: 69 layer steps, 181953 rows, 6.5s
+[K3] the prompt: attention 9.4s (KDA 7.4, MLA 2.0), MoE 92.4s (router and reads issued 1.7, latent 2.6, shared 9.7, routed experts computed 27.8, waiting for reads 47.9, their inputs 0.4, their sums 1.3); 1446 GB read
+[K3-CUDA] dense (prompt): 2640 matmuls on the GPU, 3.5s
+[K3] decode 0 tokens in 0.0s (0.00 tok/s) | expert hit 0.0% (0/79199) | 1446.5 GB streamed
+[K3-CUDA] dense (run): 2640 matmuls on the GPU, 3.5s
+rc=0 wall=157s
+2637, the new tile kernels vs the CPU alone: every position's logits identical (1728184320 bytes)
+tl_5862_logits: 118.3s (49.57 tok/s)
+[K3-CUDA] the dense matrices the GPU does not hold: 213 matmuls, 1248606 rows, 7.9s
+[K3-CUDA] the dense matrices the GPU holds, one by one: 5865 matmuls, 23448 rows, 7.5s
+[K3-CUDA] the gated MLA layers: 24 layer steps, 140688 rows, 6.9s
+[K3-CUDA] the shared experts: 92 steps, 18.1s
+[K3-CUDA] the KDA layers: 69 layer steps, 404478 rows, 13.9s
+[K3] the prompt: attention 22.6s (KDA 15.7, MLA 6.9), MoE 79.6s (router and reads issued 3.5, latent 6.3, shared 18.1, routed experts computed 44.8, waiting for reads 0.9, their inputs 0.9, their sums 2.9); 1446 GB read
+[K3-CUDA] dense (prompt): 5865 matmuls on the GPU, 7.5s
+[K3] decode 0 tokens in 0.0s (0.00 tok/s) | expert hit 0.0% (0/81278) | 1446.5 GB streamed
+[K3-CUDA] dense (run): 5865 matmuls on the GPU, 7.5s
+rc=0 wall=169s
+5862, the new tile kernels vs the CPU alone: every position's logits identical (3841720320 bytes)
+tl_5862_new1: 110.6s (53.00 tok/s)
+[K3-CUDA] the dense matrices the GPU does not hold: 213 matmuls, 1248606 rows, 6.6s
+[K3-CUDA] the dense matrices the GPU holds, one by one: 4 matmuls, 17587 rows, 0.5s
+[K3-CUDA] the gated MLA layers: 24 layer steps, 140688 rows, 6.7s
+[K3-CUDA] the shared experts: 92 steps, 18.0s
+[K3-CUDA] the KDA layers: 69 layer steps, 404478 rows, 13.7s
+[K3] the prompt: attention 22.2s (KDA 15.5, MLA 6.7), MoE 80.1s (router and reads issued 3.7, latent 5.0, shared 18.0, routed experts computed 42.3, waiting for reads 5.3, their inputs 0.8, their sums 2.8); 1446 GB read
+[K3-CUDA] dense (prompt): 4 matmuls on the GPU, 0.5s
+[K3] decode 1 tokens in 5.0s (0.20 tok/s) | expert hit 1.0% (840/82750) | 1475.2 GB streamed
+[K3] a decode token: 5003 ms -- attention 1775, MoE 3217 (router and reads issued 53, latent 70, shared 166, routed experts computed 568, waiting for reads 2353), head 1; 28.7 GB read
+[K3-CUDA] dense (run): 373 matmuls on the GPU, 2.1s
+rc=0 wall=168s
+tl_5862_old1: 112.5s (52.12 tok/s)
+[K3-CUDA] the dense matrices the GPU does not hold: 213 matmuls, 1248606 rows, 8.2s
+[K3-CUDA] the dense matrices the GPU holds, one by one: 4 matmuls, 17587 rows, 0.6s
+[K3-CUDA] the gated MLA layers: 24 layer steps, 140688 rows, 8.2s
+[K3-CUDA] the shared experts: 92 steps, 18.5s
+[K3-CUDA] the KDA layers: 69 layer steps, 404478 rows, 15.1s
+[K3] the prompt: attention 25.2s (KDA 17.0, MLA 8.2), MoE 79.2s (router and reads issued 3.4, latent 6.5, shared 18.5, routed experts computed 44.0, waiting for reads 0.9, their inputs 0.8, their sums 2.8); 1446 GB read
+[K3-CUDA] dense (prompt): 4 matmuls on the GPU, 0.6s
+[K3] decode 1 tokens in 4.0s (0.25 tok/s) | expert hit 1.0% (838/82750) | 1475.2 GB streamed
+[K3] a decode token: 3979 ms -- attention 1274, MoE 2694 (router and reads issued 53, latent 66, shared 168, routed experts computed 567, waiting for reads 1833), head 1; 28.8 GB read
+[K3-CUDA] dense (run): 373 matmuls on the GPU, 1.6s
+rc=0 wall=167s
+tl_5862_new2: 108.8s (53.86 tok/s)
+[K3-CUDA] the dense matrices the GPU does not hold: 213 matmuls, 1248606 rows, 6.6s
+[K3-CUDA] the dense matrices the GPU holds, one by one: 4 matmuls, 17587 rows, 0.5s
+[K3-CUDA] the gated MLA layers: 24 layer steps, 140688 rows, 6.7s
+[K3-CUDA] the shared experts: 92 steps, 18.0s
+[K3-CUDA] the KDA layers: 69 layer steps, 404478 rows, 13.7s
+[K3] the prompt: attention 22.3s (KDA 15.5, MLA 6.7), MoE 78.3s (router and reads issued 3.4, latent 5.1, shared 18.0, routed experts computed 42.8, waiting for reads 3.1, their inputs 0.8, their sums 2.8); 1446 GB read
+[K3-CUDA] dense (prompt): 4 matmuls on the GPU, 0.5s
+[K3] decode 1 tokens in 4.6s (0.22 tok/s) | expert hit 1.0% (840/82750) | 1475.3 GB streamed
+[K3] a decode token: 4595 ms -- attention 1855, MoE 2728 (router and reads issued 57, latent 74, shared 175, routed experts computed 601, waiting for reads 1815), head 1; 28.8 GB read
+[K3-CUDA] dense (run): 373 matmuls on the GPU, 2.1s
+rc=0 wall=166s
+tl_5862_old2: 111.2s (52.71 tok/s)
+[K3-CUDA] the dense matrices the GPU does not hold: 213 matmuls, 1248606 rows, 7.0s
+[K3-CUDA] the dense matrices the GPU holds, one by one: 4 matmuls, 17587 rows, 0.5s
+[K3-CUDA] the gated MLA layers: 24 layer steps, 140688 rows, 8.2s
+[K3-CUDA] the shared experts: 92 steps, 18.7s
+[K3-CUDA] the KDA layers: 69 layer steps, 404478 rows, 15.1s
+[K3] the prompt: attention 25.2s (KDA 17.0, MLA 8.2), MoE 77.8s (router and reads issued 3.4, latent 5.4, shared 18.7, routed experts computed 43.8, waiting for reads 0.8, their inputs 0.8, their sums 2.8); 1446 GB read
+[K3-CUDA] dense (prompt): 4 matmuls on the GPU, 0.5s
+[K3] decode 1 tokens in 4.6s (0.22 tok/s) | expert hit 1.0% (839/82750) | 1475.3 GB streamed
+[K3] a decode token: 4575 ms -- attention 1778, MoE 2786 (router and reads issued 56, latent 71, shared 174, routed experts computed 599, waiting for reads 1879), head 1; 28.8 GB read
+[K3-CUDA] dense (run): 373 matmuls on the GPU, 2.1s
+rc=0 wall=168s
+tl_dec_new1: 32.9s (1.07 tok/s)
+[K3-CUDA] the dense matrices the GPU does not hold: 213 matmuls, 7455 rows, 1.0s
+[K3-CUDA] the dense matrices the GPU holds, one by one: 4 matmuls, 106 rows, 0.0s
+[K3-CUDA] the gated MLA layers: 24 layer steps, 840 rows, 0.2s
+[K3-CUDA] the shared experts: 92 steps, 2.4s
+[K3-CUDA] the KDA layers: 69 layer steps, 2415 rows, 0.6s
+[K3] the prompt: attention 1.0s (KDA 0.8, MLA 0.2), MoE 31.8s (router and reads issued 0.2, latent 0.8, shared 2.4, routed experts computed 1.1, waiting for reads 26.3, their inputs 0.1, their sums 0.0); 326 GB read
+[K3-CUDA] dense (prompt): 4 matmuls on the GPU, 0.0s
+[K3] decode 45 tokens in 55.6s (0.81 tok/s) | expert hit 60.1% (50058/83322) | 915.8 GB streamed
+[K3] a decode token: 1236 ms -- attention 119, MoE 1106 (router and reads issued 51, latent 63, shared 160, routed experts computed 496, waiting for reads 330), head 1; 13.1 GB read
+[K3-CUDA] dense (run): 16240 matmuls on the GPU, 1.6s
+rc=0 wall=142s
+tl_dec_old1: 32.2s (1.09 tok/s)
+[K3-CUDA] the dense matrices the GPU does not hold: 213 matmuls, 7455 rows, 0.8s
+[K3-CUDA] the dense matrices the GPU holds, one by one: 4 matmuls, 106 rows, 0.0s
+[K3-CUDA] the gated MLA layers: 24 layer steps, 840 rows, 0.2s
+[K3-CUDA] the shared experts: 92 steps, 2.3s
+[K3-CUDA] the KDA layers: 69 layer steps, 2415 rows, 0.6s
+[K3] the prompt: attention 1.0s (KDA 0.8, MLA 0.2), MoE 31.2s (router and reads issued 0.2, latent 0.6, shared 2.3, routed experts computed 1.1, waiting for reads 25.8, their inputs 0.1, their sums 0.0); 326 GB read
+[K3-CUDA] dense (prompt): 4 matmuls on the GPU, 0.0s
+[K3] decode 45 tokens in 55.7s (0.81 tok/s) | expert hit 60.1% (50070/83322) | 915.9 GB streamed
+[K3] a decode token: 1238 ms -- attention 120, MoE 1107 (router and reads issued 51, latent 63, shared 160, routed experts computed 496, waiting for reads 332), head 1; 13.1 GB read
+[K3-CUDA] dense (run): 16240 matmuls on the GPU, 1.6s
+rc=0 wall=141s
+tl_dec_new1: the CPU's text
+tl_dec_old1: the CPU's text

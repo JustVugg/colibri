@@ -1,0 +1,41 @@
+kr_5862_1024_1: 109.3s (53.64 tok/s)
+[K3-CUDA] the dense matrices the GPU does not hold: 213 matmuls, 1248606 rows, 6.9s
+[K3-CUDA] the gated MLA layers: 24 layer steps, 140688 rows, 7.0s
+[K3-CUDA] the shared experts: 92 steps, 18.2s
+[K3-CUDA] the KDA layers: 69 layer steps, 404478 rows, 13.8s
+[K3] the prompt: attention 22.6s (KDA 15.7, MLA 7.0), MoE 78.3s (router and reads issued 3.5, latent 5.3, shared 18.2, routed experts computed 43.9, waiting for reads 1.6, their inputs 0.8, their sums 2.8); 1446 GB read
+rc=0 wall=167s
+peak GPU memory 23387 MiB
+kr_5862_512_1: 109.0s (53.80 tok/s)
+[K3-CUDA] the dense matrices the GPU does not hold: 213 matmuls, 1248606 rows, 6.8s
+[K3-CUDA] the gated MLA layers: 24 layer steps, 140688 rows, 6.8s
+[K3-CUDA] the shared experts: 92 steps, 18.0s
+[K3-CUDA] the KDA layers: 69 layer steps, 404478 rows, 14.0s
+[K3] the prompt: attention 22.7s (KDA 15.9, MLA 6.8), MoE 78.0s (router and reads issued 3.4, latent 5.2, shared 18.0, routed experts computed 44.2, waiting for reads 1.3, their inputs 0.8, their sums 2.8); 1446 GB read
+rc=0 wall=167s
+peak GPU memory 23387 MiB
+kr_5862_1024_2: 108.6s (53.96 tok/s)
+[K3-CUDA] the dense matrices the GPU does not hold: 213 matmuls, 1248606 rows, 6.6s
+[K3-CUDA] the gated MLA layers: 24 layer steps, 140688 rows, 6.7s
+[K3-CUDA] the shared experts: 92 steps, 18.0s
+[K3-CUDA] the KDA layers: 69 layer steps, 404478 rows, 13.4s
+[K3] the prompt: attention 22.0s (KDA 15.2, MLA 6.7), MoE 78.4s (router and reads issued 3.4, latent 5.1, shared 18.0, routed experts computed 42.7, waiting for reads 3.5, their inputs 0.8, their sums 2.8); 1446 GB read
+rc=0 wall=165s
+peak GPU memory 23348 MiB
+kr_5862_512_2: 109.3s (53.63 tok/s)
+[K3-CUDA] the dense matrices the GPU does not hold: 213 matmuls, 1248606 rows, 7.3s
+[K3-CUDA] the gated MLA layers: 24 layer steps, 140688 rows, 6.7s
+[K3-CUDA] the shared experts: 92 steps, 18.0s
+[K3-CUDA] the KDA layers: 69 layer steps, 404478 rows, 13.7s
+[K3] the prompt: attention 22.3s (KDA 15.6, MLA 6.7), MoE 78.8s (router and reads issued 3.4, latent 5.7, shared 18.0, routed experts computed 43.6, waiting for reads 2.3, their inputs 0.8, their sums 2.8); 1446 GB read
+rc=0 wall=166s
+peak GPU memory 23352 MiB
+kr_5862_logits: 116.9s (50.13 tok/s)
+[K3-CUDA] the dense matrices the GPU does not hold: 213 matmuls, 1248606 rows, 6.7s
+[K3-CUDA] the gated MLA layers: 24 layer steps, 140688 rows, 6.8s
+[K3-CUDA] the shared experts: 92 steps, 18.1s
+[K3-CUDA] the KDA layers: 69 layer steps, 404478 rows, 13.6s
+[K3] the prompt: attention 22.2s (KDA 15.5, MLA 6.8), MoE 78.3s (router and reads issued 3.4, latent 5.1, shared 18.1, routed experts computed 43.3, waiting for reads 2.8, their inputs 0.8, their sums 2.8); 1446 GB read
+rc=0 wall=167s
+peak GPU memory 23352 MiB
+5862, KDA pieces of 1,024 rows vs the CPU alone: every position's logits identical (3841720320 bytes)

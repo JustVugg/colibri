@@ -579,3 +579,71 @@ was slower reads. Runs that check logits with `K3_CHECK=1
 K3_CHECK_DUMP=<file>` locate it if it returns: `ckdiff.py` against a good run's dump names the
 layer, the rows and the experts (and who computed them), and the slot checks say whether an
 expert's bytes changed between its read and its use.
+
+## The tile kernels' weights decoded once a block (`raw/tl_*`, `kr_*`, 2026-11-03)
+
+`k3_dense_b` (int4 groups of 64) and `k3_dense_b8` (int8 rows) -- every prompt step's dense
+matrices: KDA's five projections, the shared experts, the latent projections, the gated MLA's gate,
+o_proj, qa, qb and kva, the head -- ran 13-15 and 11-14 T multiply-adds a second: each thread decoded
+its own weights from global memory for its 4 rows, two instructions a weight beside 4 fused adds.
+Their successors decode a stage's 64 columns of weights once a block into shared memory as floats and
+bring the block's rows of x there by column, the next stage's going up while this one's products run
+(two buffers, a barrier a stage):
+
+- `k3_dense_s4` (int4): a thread all 8 lanes of 4 rows by 8 outputs, lane by lane in hsum256's order
+  with three partial sums kept, as before; a lane's step one 16-byte load of x (4 rows) and two of
+  weights (8 outputs) for 32 fused adds; 64 rows by 128 outputs a block.
+- `k3_dense_o8` (int8): 8 threads a tile of 8 rows by 16 outputs, thread l lane l over the whole row,
+  hsum256's tree by xor shuffles 4, 2, 1 at the end; a step two loads of x and four of weights for
+  128 fused adds; 32 rows by 128 outputs a block.
+
+Row quad q of column c sits at q ^ (c & 7), and o8's output quads likewise, so a step's loads and a
+staging store's spread over the banks. What bounds them, by probes (`mio_probe.cu`, `lds_probe.cu`;
+the card's counters need an administrator's setting): a warp's shared-memory load takes 2 cycles of
+the SM's pipe at any width, 4 bytes a thread or 16, when it reads at most 256 distinct bytes (4 cycles
+at 512), and a shuffle takes 2 as well, against 4 warp instructions of FFMA a cycle. The int4 kernel's
+3 loads a 32-FMA step keep that pipe 75% busy before any staging, and its tile is as large as 255
+registers allow with five sets (the lane, three partial sums, the total); handing the lanes to more
+threads pays the tree's exchange on the same pipe: a quad of threads with two lanes each, an 8-by-8
+tile and the tree by shuffles (`bench_q.cu`) ran 15-17 T. `bench_s.cu`'s timing variants (wrong
+outputs): the int4 kernel 21.5 T, 25 without the staging, 22.6 without the barrier; int8 24, 28 and
+25; the int4 staging spread between the lanes spilled registers (8.5 T).
+
+`bench_tiles.cu`, the kernels alone at Kimi K3's shapes (the best of 3 runs of 20 launches, the old
+kernels copied beside them), T multiply-adds a second, old -> new; every output the old kernels' bytes:
+
+| matrix | 64 rows | 230 | 256 | 512 | 1,024 |
+|---|---:|---:|---:|---:|---:|
+| KDA q/k/v/g 12288 x 7168 int4, the card's copy | 12.7 -> 15.1 | 12.4 -> 20.3 | 14.3 -> 17.1 | 14.3 -> 18.6 | 14.3 -> 21.1 |
+| KDA o_proj 7168 x 12288 int4, the card's copy | 8.4 -> 10.6 | 10.4 -> 14.9 | 11.4 -> 17.2 | 13.6 -> 15.6 | 13.6 -> 20.9 |
+| shared gate/up 12288 x 7168 int4 | 15.0 -> 18.6 | 13.5 -> 15.8 | 14.4 -> 16.8 | 14.6 -> 19.7 | 14.6 -> 21.4 |
+| shared down 7168 x 12288 int4 | 8.7 -> 10.8 | 10.7 -> 15.3 | 11.8 -> 17.1 | 13.9 -> 16.0 | 14.1 -> 20.5 |
+| latent down 3584 x 7168 int4 | 4.5 -> 5.5 | 8.0 -> 14.3 | 8.9 -> 15.8 | 11.9 -> 17.1 | 13.9 -> 16.4 |
+| latent up 7168 x 3584 int4 | 8.7 -> 10.7 | 10.7 -> 15.7 | 11.9 -> 17.3 | 13.8 -> 15.6 | 13.9 -> 17.9 |
+| MLA gate 12288 x 7168 int8 | 10.5 -> 16.1 | 10.0 -> 16.6 | 10.9 -> 18.6 | 10.9 -> 21.3 | 11.0 -> 22.1 |
+| MLA o_proj 7168 x 12288 int8 | 11.9 -> 17.2 | 10.6 -> 15.1 | 11.7 -> 16.8 | 13.5 -> 19.7 | 13.5 -> 22.4 |
+| MLA qb 18432 x 1536 int8 | 10.4 -> 14.8 | 13.2 -> 20.7 | 14.1 -> 23.4 | 14.8 -> 20.7 | 14.7 -> 18.8 |
+| MLA qa 1536 x 7168 int8 | 3.0 -> 5.2 | 10.7 -> 18.5 | 11.9 -> 20.5 | 10.4 -> 16.8 | 15.0 -> 24.9 |
+| MLA kva 576 x 7168 int8 | 1.1 -> 2.0 | 4.1 -> 7.0 | 4.5 -> 7.8 | 9.0 -> 15.6 | 7.9 -> 12.4 |
+
+A grid fills the card's 128 SMs (one block each) in whole waves only at some row counts: KDA's o_proj
+at its 512-row pieces is 448 blocks, three and a half waves.
+
+| run | what | result |
+|---|---|---:|
+| `tests/test_k3_cuda_experts.c`, the whole test | every dense case on the host's matrices and the card's copies (new cases: one stage, 25 stages, outputs 128 + 4 and not a multiple of 4), the KDA and MLA layers, the shared experts | 0 differ |
+| `k3tiny_held.sh`, `k3tiny.sh` | the tiny model: every matrix on the card, none there and the CPU alone at steps of 2,048 to 8,192, 40 tokens of decode; against HEAD's logits | the same bytes |
+| `tl_2637_logits`, `tl_5862_logits` | both long prompts' logits at every position against the CPU alone (`long_cpu`, `big6k_cpu`) | the same bytes |
+| `tl_5862_new*`, `tl_5862_old*` (`series_tiles.sh`) | A/B twice against 254338ab (`pre_tiles/`) | **110.6, 108.8 s** against 112.5, 111.2 s: the KDA layers 15.1 -> 13.7 s, the MLA layers 8.2 -> 6.7 s, the shared experts 18.5-18.7 -> 18.0 s, the dense matrices the GPU does not hold (the latent projections) 7.0-8.2 -> 6.6 s |
+| `tl_dec_new1`, `tl_dec_old1` | 48 tokens of decode (its kernels unchanged) | 0.81 against 0.81 tok/s, both the CPU's text |
+| `kr_5862_1024_*`, `kr_5862_512_*` (`series_kdarows.sh`) | KDA's pieces of 1,024 rows (`K3_GPU_KDA_ROWS=1024`) against the default 512, alternated | 109.3, 108.6 s against 109.0, 109.3 s (the KDA layers 13.8, 13.4 against 14.0, 13.7 s): no difference to keep; the default stays 512 |
+| `kr_5862_logits` | the same with 1,024-row pieces, logits at every position | the CPU alone's bytes |
+| `bench_shared.c` | `k3cu_shared` alone, 5,862 rows (one layer's call with its copies), this DLL against 254338ab's | 125.5-128.0 against 138.2-139.9 ms; in the prompt the call takes about 196 ms a layer with either |
+
+The prompt gained less than the kernels. At 5,862 tokens the attention's 3 s went partly into
+waiting for reads (0.8-0.9 -> 3.1-5.3 s): this prompt reads the 1,446 GB the 2,637-token one does,
+and its drives are now near their floor too. The shared experts' call, 18 s of it, moves its weights
+(148 MB a layer) and its rows up and down from pageable memory on its kernels' own stream, beside the
+routed experts' copies: alone at a layer's 5,862 rows it is 10% sooner with the new kernels, in the
+prompt it is not measurably so. The KDA layers' pieces go up and come back on their kernels' stream
+as well.

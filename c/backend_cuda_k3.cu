@@ -330,24 +330,9 @@ __global__ void __launch_bounds__(256) k3_dense(int fmt, const uint8_t *__restri
     if (o < O && p0 + l < S) y[(size_t)(p0 + l) * O + o] = v;
 }
 
-// matmul_i4_grouped's arithmetic again for groups of 64, a thread's 8 lanes in its own registers
-// (k3_dense gives them to 8 threads and adds them with shuffles every group, its inputs one float
-// a load): thread (tr, to) takes rows 4 tr .. +3 of the block's 32 by outputs 6 to .. +5 of its
-// 192. In a group lane l's chain is columns l, l+8, .., l+56, fused in that order from +0; the
-// lanes go 0, 4, 2, 6, 1, 5, 3, 7, so each finished one joins hsum256's tree at once,
-// ((a0+a4)+(a2+a6)) + ((a1+a5)+(a3+a7)), three kept a pair; then the group's fmaf into the total.
-// Lane l's weight m is nibble l of the group's word m: (w & 15 << 4p) | 2^23 read as a float, one
-// fused add takes the place p and the 8 out, exactly. The block's rows of x go to shared memory by
-// column, 128 columns a stage, double-buffered. About 4x k3_dense's rate from 64 rows (13-15 T
-// multiply-adds a second at Kimi K3's shapes on an RTX 4090), the same bytes; K3_GPU_DENSE_B=0: k3_dense.
-// F: coli_cuda.dll's copy (its nibbles flipped back as the words come in).
-#define KB_RS 4
-#define KB_RO 6
-#define KB_BR 32                    // rows a block
-#define KB_BO 192                   // outputs a block
-#define KB_SC 128                   // columns a stage
-#define KB_PAD 36                   // a column's 32 rows and 4 spare: 16-byte stores without conflicts
-#define KB_MINROWS 64               // fewer rows: k3_dense (too few blocks)
+// The weights as floats, exactly. matmul_i4_grouped's lane l of a group's word m is nibble l of the
+// word: (w & 15 << 4p) | 2^23 read as a float, one fused add takes the place p and the 8 out.
+// matmul_q's byte b: (b ^ 0x80) under 2^23's exponent, less 2^23 + 128.
 template <int P>
 __device__ __forceinline__ float kb_nib(uint32_t w) {   // the offset nibble at place P (0..4) of w, less 8
     const float mul = P == 0 ? 1.0f : P == 1 ? 0.0625f : P == 2 ? 0.00390625f : P == 3 ? 0.000244140625f : 1.52587890625e-05f;
@@ -359,235 +344,6 @@ __device__ __forceinline__ float kb_lane_w(uint32_t w) {   // lane L's nibble of
     if (L <= 4) return kb_nib<L>(w);
     else return kb_nib<L - 3>(w >> 12);
 }
-template <int L>
-__device__ __forceinline__ void kb_lane(const float (*sxc)[KB_PAD], int r0, const uint32_t (&W)[KB_RO][8],
-                                        float (&a)[KB_RS][KB_RO], int cbase) {
-#pragma unroll
-    for (int r = 0; r < KB_RS; r++)
-#pragma unroll
-        for (int j = 0; j < KB_RO; j++) a[r][j] = 0.0f;
-#pragma unroll
-    for (int m = 0; m < 8; m++) {
-        const float4 xv = *reinterpret_cast<const float4 *>(&sxc[cbase + L + 8 * m][r0]);
-        const float xr[4] = {xv.x, xv.y, xv.z, xv.w};
-#pragma unroll
-        for (int j = 0; j < KB_RO; j++) {
-            const float wv = kb_lane_w<L>(W[j][m]);
-#pragma unroll
-            for (int r = 0; r < KB_RS; r++) a[r][j] = __fmaf_rn(xr[r], wv, a[r][j]);
-        }
-    }
-}
-template <int F>
-__global__ void __launch_bounds__(256, 1) k3_dense_b(const uint8_t *__restrict__ w, const float *__restrict__ scale,
-                                                     const float *__restrict__ x, int S, int I, int O,
-                                                     float *__restrict__ y) {
-    __shared__ __align__(16) float sx[2][KB_SC][KB_PAD];
-    const int t = threadIdx.x, tr = t & 7, to = t >> 3;
-    const int s0 = blockIdx.y * KB_BR, ob = blockIdx.x * KB_BO + to * KB_RO, r0 = tr * KB_RS;
-    const int ng = I / 64;
-    float tot[KB_RS][KB_RO], s0v[KB_RS][KB_RO], s1v[KB_RS][KB_RO], s2v[KB_RS][KB_RO], a[KB_RS][KB_RO];
-#pragma unroll
-    for (int r = 0; r < KB_RS; r++)
-#pragma unroll
-        for (int j = 0; j < KB_RO; j++) tot[r][j] = 0.0f;
-    // staging: thread t loads column t & 127 of rows 16 (t >> 7) .. +15 (past S: the last row)
-    const int sc_c = t & 127, sc_r = (t >> 7) * 16;
-    float xs[16];
-    auto xload = [&](int k0) {
-#pragma unroll
-        for (int q = 0; q < 16; q++) {
-            const int row = s0 + sc_r + q, rr = row < S ? row : S - 1;
-            xs[q] = __ldg(x + (size_t)rr * I + k0 + sc_c);
-        }
-    };
-    auto xstore = [&](int b) {
-#pragma unroll
-        for (int q = 0; q < 4; q++)
-            *reinterpret_cast<float4 *>(&sx[b][sc_c][sc_r + 4 * q]) = make_float4(xs[4 * q], xs[4 * q + 1], xs[4 * q + 2], xs[4 * q + 3]);
-    };
-    const int nst = I / KB_SC;
-    xload(0); xstore(0);
-    if (nst > 1) xload(KB_SC);
-    __syncthreads();
-    const uint8_t *wrow[KB_RO];
-#pragma unroll
-    for (int j = 0; j < KB_RO; j++) { const int o = ob + j < O ? ob + j : O - 1; wrow[j] = w + (size_t)o * (I >> 1); }
-    for (int st = 0; st < nst; st++) {
-        const int b = st & 1;
-#pragma unroll 1
-        for (int gg = 0; gg < KB_SC / 64; gg++) {
-            const int g = st * (KB_SC / 64) + gg;
-            uint32_t W[KB_RO][8];
-#pragma unroll
-            for (int j = 0; j < KB_RO; j++) {
-                const uint4 u0 = __ldg(reinterpret_cast<const uint4 *>(wrow[j] + (size_t)g * 32));
-                const uint4 u1 = __ldg(reinterpret_cast<const uint4 *>(wrow[j] + (size_t)g * 32 + 16));
-                W[j][0] = u0.x; W[j][1] = u0.y; W[j][2] = u0.z; W[j][3] = u0.w;
-                W[j][4] = u1.x; W[j][5] = u1.y; W[j][6] = u1.z; W[j][7] = u1.w;
-                if (F)
-#pragma unroll
-                    for (int m = 0; m < 8; m++) W[j][m] ^= 0x88888888u;
-            }
-            const float (*sxc)[KB_PAD] = sx[b];
-            const int cb = gg * 64;
-            kb_lane<0>(sxc, r0, W, a, cb);
-#pragma unroll
-            for (int r = 0; r < KB_RS; r++)
-#pragma unroll
-                for (int j = 0; j < KB_RO; j++) s0v[r][j] = a[r][j];
-            kb_lane<4>(sxc, r0, W, a, cb);
-#pragma unroll
-            for (int r = 0; r < KB_RS; r++)
-#pragma unroll
-                for (int j = 0; j < KB_RO; j++) s0v[r][j] = __fadd_rn(s0v[r][j], a[r][j]);
-            kb_lane<2>(sxc, r0, W, a, cb);
-#pragma unroll
-            for (int r = 0; r < KB_RS; r++)
-#pragma unroll
-                for (int j = 0; j < KB_RO; j++) s1v[r][j] = a[r][j];
-            kb_lane<6>(sxc, r0, W, a, cb);
-#pragma unroll
-            for (int r = 0; r < KB_RS; r++)
-#pragma unroll
-                for (int j = 0; j < KB_RO; j++) s0v[r][j] = __fadd_rn(s0v[r][j], __fadd_rn(s1v[r][j], a[r][j]));
-            kb_lane<1>(sxc, r0, W, a, cb);
-#pragma unroll
-            for (int r = 0; r < KB_RS; r++)
-#pragma unroll
-                for (int j = 0; j < KB_RO; j++) s1v[r][j] = a[r][j];
-            kb_lane<5>(sxc, r0, W, a, cb);
-#pragma unroll
-            for (int r = 0; r < KB_RS; r++)
-#pragma unroll
-                for (int j = 0; j < KB_RO; j++) s1v[r][j] = __fadd_rn(s1v[r][j], a[r][j]);
-            kb_lane<3>(sxc, r0, W, a, cb);
-#pragma unroll
-            for (int r = 0; r < KB_RS; r++)
-#pragma unroll
-                for (int j = 0; j < KB_RO; j++) s2v[r][j] = a[r][j];
-            kb_lane<7>(sxc, r0, W, a, cb);
-#pragma unroll
-            for (int j = 0; j < KB_RO; j++) {
-                const int o = ob + j < O ? ob + j : O - 1;
-                const float gsc = __ldg(scale + (size_t)o * ng + g);
-#pragma unroll
-                for (int r = 0; r < KB_RS; r++) {
-                    const float f = __fadd_rn(s1v[r][j], __fadd_rn(s2v[r][j], a[r][j]));
-                    tot[r][j] = __fmaf_rn(__fadd_rn(s0v[r][j], f), gsc, tot[r][j]);
-                }
-            }
-        }
-        if (st + 1 < nst) {
-            __syncthreads();
-            xstore(b ^ 1);
-            __syncthreads();
-            if (st + 2 < nst) xload((st + 2) * KB_SC);
-        }
-    }
-#pragma unroll
-    for (int r = 0; r < KB_RS; r++) {
-        const int row = s0 + r0 + r;
-        if (row >= S) continue;
-#pragma unroll
-        for (int j = 0; j < KB_RO; j++) if (ob + j < O) y[(size_t)row * O + ob + j] = tot[r][j];
-    }
-}
-// matmul_q's arithmetic for several rows: output o's lane l sums columns l, l+8, l+16, .. of the whole
-// row, fused from +0; then hsum256's tree ((a0+a4)+(a2+a6)) + ((a1+a5)+(a3+a7)) times the row's scale.
-// Thread (tr, to): rows 4 tr .. +3 of the block's 32 by outputs 4 to .. +3 of its 128, the 8 lanes of
-// each in its own registers (128 sums); 16 weights a load, each made a float by one byte permute and
-// one add: (b ^ 0x80) under 2^23's exponent, less 2^23 + 128. x staged as k3_dense_b stages it.
-#define K8_RO 4
-#define K8_BO 128                   // outputs a block
-__device__ __forceinline__ float k8_val(uint32_t w, int b) {   // byte b of w (^ 0x80 already) as the int8 it was
-    return __fadd_rn(__uint_as_float(__byte_perm(w, 0x4B000000u, 0x7440u | (unsigned)b)), -8388736.0f);
-}
-__global__ void __launch_bounds__(256, 1) k3_dense_b8(const int8_t *__restrict__ w, const float *__restrict__ scale,
-                                                      const float *__restrict__ x, int S, int I, int O,
-                                                      float *__restrict__ y) {
-    __shared__ __align__(16) float sx[2][KB_SC][KB_PAD];
-    const int t = threadIdx.x, tr = t & 7, to = t >> 3;
-    const int s0 = blockIdx.y * KB_BR, ob = blockIdx.x * K8_BO + to * K8_RO, r0 = tr * KB_RS;
-    float a[8][KB_RS][K8_RO];
-#pragma unroll
-    for (int l = 0; l < 8; l++)
-#pragma unroll
-        for (int r = 0; r < KB_RS; r++)
-#pragma unroll
-            for (int j = 0; j < K8_RO; j++) a[l][r][j] = 0.0f;
-    const int sc_c = t & 127, sc_r = (t >> 7) * 16;
-    float xs[16];
-    auto xload = [&](int k0) {
-#pragma unroll
-        for (int q = 0; q < 16; q++) {
-            const int row = s0 + sc_r + q, rr = row < S ? row : S - 1;
-            xs[q] = __ldg(x + (size_t)rr * I + k0 + sc_c);
-        }
-    };
-    auto xstore = [&](int b) {
-#pragma unroll
-        for (int q = 0; q < 4; q++)
-            *reinterpret_cast<float4 *>(&sx[b][sc_c][sc_r + 4 * q]) = make_float4(xs[4 * q], xs[4 * q + 1], xs[4 * q + 2], xs[4 * q + 3]);
-    };
-    const int nst = I / KB_SC;
-    xload(0); xstore(0);
-    if (nst > 1) xload(KB_SC);
-    __syncthreads();
-    const int8_t *wrow[K8_RO];
-#pragma unroll
-    for (int j = 0; j < K8_RO; j++) { const int o = ob + j < O ? ob + j : O - 1; wrow[j] = w + (size_t)o * I; }
-    for (int st = 0; st < nst; st++) {
-        const float (*sxc)[KB_PAD] = sx[st & 1];
-#pragma unroll 1
-        for (int c = 0; c < KB_SC; c += 16) {
-            uint32_t W[K8_RO][4];
-#pragma unroll
-            for (int j = 0; j < K8_RO; j++) {
-                const uint4 u = __ldg(reinterpret_cast<const uint4 *>(wrow[j] + (size_t)st * KB_SC + c));
-                W[j][0] = u.x ^ 0x80808080u; W[j][1] = u.y ^ 0x80808080u; W[j][2] = u.z ^ 0x80808080u; W[j][3] = u.w ^ 0x80808080u;
-            }
-#pragma unroll
-            for (int k = 0; k < 16; k++) {   // column c + k, lane k & 7
-                const float4 xv = *reinterpret_cast<const float4 *>(&sxc[c + k][r0]);
-                const float xr[4] = {xv.x, xv.y, xv.z, xv.w};
-#pragma unroll
-                for (int j = 0; j < K8_RO; j++) {
-                    const float wv = k8_val(W[j][k >> 2], k & 3);
-#pragma unroll
-                    for (int r = 0; r < KB_RS; r++) a[k & 7][r][j] = __fmaf_rn(xr[r], wv, a[k & 7][r][j]);
-                }
-            }
-        }
-        if (st + 1 < nst) {
-            __syncthreads();
-            xstore((st & 1) ^ 1);
-            __syncthreads();
-            if (st + 2 < nst) xload((st + 2) * KB_SC);
-        }
-    }
-#pragma unroll
-    for (int j = 0; j < K8_RO; j++) {
-        const int o = ob + j;
-        const float sc = __ldg(scale + (o < O ? o : O - 1));
-#pragma unroll
-        for (int r = 0; r < KB_RS; r++) {
-            const int row = s0 + r0 + r;
-            const float v = __fadd_rn(__fadd_rn(__fadd_rn(a[0][r][j], a[4][r][j]), __fadd_rn(a[2][r][j], a[6][r][j])),
-                                      __fadd_rn(__fadd_rn(a[1][r][j], a[5][r][j]), __fadd_rn(a[3][r][j], a[7][r][j])));
-            if (row < S && o < O) y[(size_t)row * O + o] = __fmul_rn(v, sc);
-        }
-    }
-}
-
-// A decode step's matrices (1 to 4 rows).
-// int4 in groups of 64 (matmul_i4_grouped), a row at a time: thread t of a block takes the groups t, t + 256,
-// .. of its MV_OB outputs four outputs a task (a warp 32 groups side by side, 1 KB of weights a load per
-// output; the group's 64 inputs loaded once for the four: a load an output made L1 the limit), their weights
-// and scales first; a group's 8 lanes in its registers (lane l: columns 8m + l, fused from +0; kb_lane_w's
-// decode), hsum256's tree into shared memory beside the group's scale; then a thread an output adds the
-// groups into the total in their order, each fused with its scale.
-#define MV_OB 8                     // outputs a block
 __device__ __forceinline__ float kb_lane_v(uint32_t w, int l) {   // nibble l of w less 8 (l known once unrolled)
     switch (l) {
     case 0: return kb_lane_w<0>(w);
@@ -600,6 +356,273 @@ __device__ __forceinline__ float kb_lane_v(uint32_t w, int l) {   // nibble l of
     default: return kb_lane_w<7>(w);
     }
 }
+__device__ __forceinline__ float k8_val(uint32_t w, int b) {   // byte b of w (^ 0x80 already) as the int8 it was
+    return __fadd_rn(__uint_as_float(__byte_perm(w, 0x4B000000u, 0x7440u | (unsigned)b)), -8388736.0f);
+}
+
+// The tile kernels, from KT_MINROWS rows. A block decodes a stage's 64 columns of weights once into shared
+// memory as floats, and brings its rows of x there by column; the next stage's go up while this one's
+// products run (two buffers, a barrier a stage). The card's shared-memory pipe takes a load of any width
+// in 2 of its cycles (one of 512 distinct bytes in 4), so a thread's tile is as large as its registers
+// allow and its operands are 16-byte loads that 4 or 8 threads share. Row quad q of column c sits at
+// q ^ (c & 7), and k3_dense_o8's output quad f at f ^ (c & 7): a step's loads and a staging store's
+// spread over the banks. Their predecessors k3_dense_b and k3_dense_b8 decoded each thread's own weights
+// from global memory (two instructions a weight for 4 rows): 13-15 and 11-14 T multiply-adds a second
+// against 16-21 and 17-23 at Kimi K3's shapes on an RTX 4090 from 256 rows (bench_tiles.cu), the same bytes.
+#define KT_SC 64                    // columns a stage (int4: a group)
+#define KT_MINROWS 64               // fewer rows: k3_dense (too few blocks)
+// matmul_i4_grouped's arithmetic for groups of 64 (k3_dense_s4): thread (rg, og) takes rows 4 rg .. +3 of
+// the block's 64 by outputs 8 og .. +7 of its 128, all 8 lanes of each in its own registers. In a group
+// lane l's chain is columns l, l+8, .., l+56, fused in that order from +0; the lanes go 0, 4, 2, 6, 1, 5,
+// 3, 7, so each finished one joins hsum256's tree at once, ((a0+a4)+(a2+a6)) + ((a1+a5)+(a3+a7)), three
+// partial sums kept; then the group's fmaf into the total. A lane's step: one load of x (4 rows), two of
+// weights (8 outputs), 32 fused adds. F: coli_cuda.dll's copy (its nibbles flipped back as they come in).
+#define K4_BR 64                    // rows a block
+#define K4_BO 128                   // outputs a block
+#define K4_SMEM ((2 * KT_SC * K4_BR + 2 * KT_SC * K4_BO + 2 * K4_BO) * 4)
+template <int L>
+__device__ __forceinline__ void k4_lane(const float *bx, const float *bw, int rg, int og, float (&a)[4][8]) {
+    const float *xp = bx + L * K4_BR + 4 * (rg ^ L), *wp = bw + L * K4_BO + 8 * og;
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+#pragma unroll
+        for (int j = 0; j < 8; j++) a[i][j] = 0.0f;
+#pragma unroll
+    for (int m = 0; m < 8; m++) {   // column 8m + L
+        const float4 xv = *reinterpret_cast<const float4 *>(xp + m * 8 * K4_BR);
+        const float4 w0 = *reinterpret_cast<const float4 *>(wp + m * 8 * K4_BO);
+        const float4 w1 = *reinterpret_cast<const float4 *>(wp + m * 8 * K4_BO + 4);
+        const float xr[4] = {xv.x, xv.y, xv.z, xv.w}, wr[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+#pragma unroll
+            for (int j = 0; j < 8; j++) a[i][j] = __fmaf_rn(xr[i], wr[j], a[i][j]);
+    }
+}
+template <int F>
+__global__ void __launch_bounds__(256, 1) k3_dense_s4(const uint8_t *__restrict__ w, const float *__restrict__ scale,
+                                                     const float *__restrict__ x, int S, int I, int O, float *__restrict__ y) {
+    extern __shared__ __align__(16) float k4_sm[];
+    float *const sx = k4_sm;                          // [2][KT_SC][K4_BR]: a column's rows
+    float *const sw = sx + 2 * KT_SC * K4_BR;         // [2][KT_SC][K4_BO]: a column's outputs
+    float *const ss = sw + 2 * KT_SC * K4_BO;         // [2][K4_BO]: the group's scales
+    const int t = threadIdx.x, wp = t >> 5, ln = t & 31;
+    const int rg = 8 * (wp >> 2) + (ln & 7), og = 4 * (wp & 3) + (ln >> 3);
+    const int s0 = blockIdx.x * K4_BR, o0 = blockIdx.y * K4_BO, nst = I / KT_SC, ng = I / 64;
+    // the staging: x column xc of rows 16 xq .. +15; word m of outputs 4u .. 4u+3; thread t < 128 output t's
+    // scale. Rows past S read row S - 1, outputs past O output O - 1 (not stored).
+    const int xc = t & 63, xq = t >> 6, xl = xc & 7, xr0 = s0 + 16 * xq, xlast = S - 1 - xr0;
+    const int u = 8 * (wp & 3) + (ln & 7), m = 4 * (wp >> 2) + (ln >> 3), wlast = O - 1 - (o0 + 4 * u);
+    const float *xb = x + (size_t)xr0 * I + xc;
+    const uint8_t *wb = w + (size_t)(o0 + 4 * u) * (I / 2) + 4 * m;
+    const float *sb = scale + (size_t)(o0 + t < O ? o0 + t : O - 1) * ng;
+    float xv[16], sv = 0.0f;
+    uint32_t wv[4];
+    auto load = [&](int st) {
+#pragma unroll
+        for (int i = 0; i < 16; i++) xv[i] = __ldg(xb + (size_t)(i < xlast ? i : xlast) * I + st * KT_SC);
+#pragma unroll
+        for (int k = 0; k < 4; k++)
+            wv[k] = __ldg(reinterpret_cast<const uint32_t *>(wb + (size_t)(k < wlast ? k : wlast) * (I / 2) + st * 32));
+        if (t < K4_BO) sv = __ldg(sb + st);
+    };
+    auto store = [&](int b) {
+        float *bx = sx + b * KT_SC * K4_BR, *bw = sw + b * KT_SC * K4_BO;
+#pragma unroll
+        for (int h = 0; h < 4; h++)
+            *reinterpret_cast<float4 *>(bx + xc * K4_BR + 4 * ((4 * xq + h) ^ xl)) = make_float4(xv[4 * h], xv[4 * h + 1], xv[4 * h + 2], xv[4 * h + 3]);
+#pragma unroll
+        for (int l = 0; l < 8; l++) {
+            float v[4];
+#pragma unroll
+            for (int k = 0; k < 4; k++) v[k] = kb_lane_v(F ? wv[k] ^ 0x88888888u : wv[k], l);
+            *reinterpret_cast<float4 *>(bw + (8 * m + l) * K4_BO + 4 * u) = make_float4(v[0], v[1], v[2], v[3]);
+        }
+        if (t < K4_BO) ss[b * K4_BO + t] = sv;
+    };
+    float tot[4][8], s0v[4][8], s1v[4][8], s2v[4][8], a[4][8];
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+#pragma unroll
+        for (int j = 0; j < 8; j++) tot[i][j] = 0.0f;
+    load(0); store(0); load(nst > 1 ? 1 : 0);
+    __syncthreads();
+#pragma unroll 1
+    for (int st = 0; st < nst; st++) {
+        const int b = st & 1;
+        const float *bx = sx + b * KT_SC * K4_BR, *bw = sw + b * KT_SC * K4_BO;
+        k4_lane<0>(bx, bw, rg, og, s0v);
+        k4_lane<4>(bx, bw, rg, og, a);
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+#pragma unroll
+            for (int j = 0; j < 8; j++) s0v[i][j] = __fadd_rn(s0v[i][j], a[i][j]);
+        k4_lane<2>(bx, bw, rg, og, s1v);
+        k4_lane<6>(bx, bw, rg, og, a);
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+#pragma unroll
+            for (int j = 0; j < 8; j++) s0v[i][j] = __fadd_rn(s0v[i][j], __fadd_rn(s1v[i][j], a[i][j]));
+        // the next stage into the other buffer (its bytes loaded a stage ago), the one after into registers
+        // (past the last: the last again, not used)
+        store(b ^ 1);
+        load(st + 2 < nst ? st + 2 : nst - 1);
+        k4_lane<1>(bx, bw, rg, og, s1v);
+        k4_lane<5>(bx, bw, rg, og, a);
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+#pragma unroll
+            for (int j = 0; j < 8; j++) s1v[i][j] = __fadd_rn(s1v[i][j], a[i][j]);
+        k4_lane<3>(bx, bw, rg, og, s2v);
+        k4_lane<7>(bx, bw, rg, og, a);
+        const float4 g0 = *reinterpret_cast<const float4 *>(ss + b * K4_BO + 8 * og), g1 = *reinterpret_cast<const float4 *>(ss + b * K4_BO + 8 * og + 4);
+        const float g[8] = {g0.x, g0.y, g0.z, g0.w, g1.x, g1.y, g1.z, g1.w};
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+                tot[i][j] = __fmaf_rn(__fadd_rn(s0v[i][j], __fadd_rn(s1v[i][j], __fadd_rn(s2v[i][j], a[i][j]))), g[j], tot[i][j]);
+        __syncthreads();
+    }
+    const int oo = o0 + 8 * og;   // O a multiple of 4: each quad of outputs whole or past O
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int row = s0 + 4 * rg + i;
+        if (row >= S) continue;
+        if (oo < O) *reinterpret_cast<float4 *>(y + (size_t)row * O + oo) = make_float4(tot[i][0], tot[i][1], tot[i][2], tot[i][3]);
+        if (oo + 4 < O) *reinterpret_cast<float4 *>(y + (size_t)row * O + oo + 4) = make_float4(tot[i][4], tot[i][5], tot[i][6], tot[i][7]);
+    }
+}
+// matmul_q's arithmetic (k3_dense_o8): 8 threads a tile of 8 rows by 16 outputs, thread l of them lane l
+// (columns l, l+8, .. of the whole row, fused in that order from +0) for all 128 in its registers; at the
+// end hsum256's tree by xor shuffles 4, 2, 1, each keeping half of what is left (the rows, then the
+// outputs twice), times the row's scale. A lane's step: two loads of x (8 rows), four of weights (16
+// outputs), 128 fused adds. A warp's 4 tiles: 2 of rows by 2 of outputs; the block's 32 rows by 128.
+#define K8_BR 32                    // rows a block
+#define K8_BO 128                   // outputs a block
+#define K8_SMEM ((2 * KT_SC * K8_BR + 2 * KT_SC * K8_BO) * 4)
+__global__ void __launch_bounds__(256, 1) k3_dense_o8(const int8_t *__restrict__ w, const float *__restrict__ scale,
+                                                     const float *__restrict__ x, int S, int I, int O, float *__restrict__ y) {
+    extern __shared__ __align__(16) float k8_sm[];
+    float *const sx = k8_sm;                          // [2][KT_SC][K8_BR]: a column's rows
+    float *const sw = sx + 2 * KT_SC * K8_BR;         // [2][KT_SC][K8_BO]: a column's outputs
+    const int t = threadIdx.x, wp = t >> 5, ln = t & 31;
+    const int L = ln & 7, tl = ln >> 3;
+    const int r8 = 16 * (wp >> 2) + 8 * (tl >> 1), o16 = 32 * (wp & 3) + 16 * (tl & 1);   // the tile's rows, outputs
+    const int s0 = blockIdx.x * K8_BR, o0 = blockIdx.y * K8_BO, nst = I / KT_SC;
+    const int xa0 = 4 * ((r8 / 4) ^ L), xa1 = 4 * ((r8 / 4 + 1) ^ L);
+    int wa[4];
+#pragma unroll
+    for (int j = 0; j < 4; j++) wa[j] = 4 * ((o16 / 4 + j) ^ L);
+    // the staging: x column xc of rows 8 xq .. +7; bytes 8m .. 8m+7 of outputs 4u .. 4u+3
+    const int xc = t & 63, xq = t >> 6, xl = xc & 7;
+    int xo[8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) { int r = s0 + 8 * xq + i; r = r < S ? r : S - 1; xo[i] = r * I + xc; }
+    const int u = 8 * (wp & 3) + (ln & 7), m = 4 * (wp >> 2) + (ln >> 3);
+    const int8_t *wq[4];
+#pragma unroll
+    for (int k = 0; k < 4; k++) { int o = o0 + 4 * u + k; o = o < O ? o : O - 1; wq[k] = w + (size_t)o * I + 8 * m; }
+    float xv[8];
+    uint32_t wv[8];
+    auto load = [&](int st) {
+#pragma unroll
+        for (int i = 0; i < 8; i++) xv[i] = __ldg(x + xo[i] + st * KT_SC);
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const uint2 q = __ldg(reinterpret_cast<const uint2 *>(wq[k] + (size_t)st * KT_SC));
+            wv[2 * k] = q.x ^ 0x80808080u; wv[2 * k + 1] = q.y ^ 0x80808080u;
+        }
+    };
+    auto store = [&](int b) {
+        float *bx = sx + b * KT_SC * K8_BR, *bw = sw + b * KT_SC * K8_BO;
+        *reinterpret_cast<float4 *>(bx + xc * K8_BR + 4 * ((2 * xq) ^ xl)) = make_float4(xv[0], xv[1], xv[2], xv[3]);
+        *reinterpret_cast<float4 *>(bx + xc * K8_BR + 4 * ((2 * xq + 1) ^ xl)) = make_float4(xv[4], xv[5], xv[6], xv[7]);
+#pragma unroll
+        for (int l = 0; l < 8; l++) {
+            float v[4];
+#pragma unroll
+            for (int k = 0; k < 4; k++) v[k] = k8_val(wv[2 * k + (l >> 2)], l & 3);
+            *reinterpret_cast<float4 *>(bw + (8 * m + l) * K8_BO + 4 * (u ^ l)) = make_float4(v[0], v[1], v[2], v[3]);
+        }
+    };
+    float a[8][16];
+#pragma unroll
+    for (int i = 0; i < 8; i++)
+#pragma unroll
+        for (int j = 0; j < 16; j++) a[i][j] = 0.0f;
+    load(0); store(0); load(nst > 1 ? 1 : 0);
+    __syncthreads();
+#pragma unroll 1
+    for (int st = 0; st < nst; st++) {
+        const int b = st & 1;
+        const float *bx = sx + b * KT_SC * K8_BR + L * K8_BR, *bw = sw + b * KT_SC * K8_BO + L * K8_BO;
+#pragma unroll
+        for (int mm = 0; mm < 8; mm++) {   // column 8 mm + L
+            const float4 x0 = *reinterpret_cast<const float4 *>(bx + mm * 8 * K8_BR + xa0);
+            const float4 x1 = *reinterpret_cast<const float4 *>(bx + mm * 8 * K8_BR + xa1);
+            float wr[16];
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const float4 w4 = *reinterpret_cast<const float4 *>(bw + mm * 8 * K8_BO + wa[j]);
+                wr[4 * j] = w4.x; wr[4 * j + 1] = w4.y; wr[4 * j + 2] = w4.z; wr[4 * j + 3] = w4.w;
+            }
+            const float xr[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+#pragma unroll
+            for (int i = 0; i < 8; i++)
+#pragma unroll
+                for (int j = 0; j < 16; j++) a[i][j] = __fmaf_rn(xr[i], wr[j], a[i][j]);
+            if (mm == 3) {   // the next stage into the other buffer, the one after into registers
+                store(b ^ 1);
+                load(st + 2 < nst ? st + 2 : nst - 1);
+            }
+        }
+        __syncthreads();
+    }
+    // hsum256: xor 4 pairs lanes l and l ^ 4 (each keeps 4 of the 8 rows), xor 2 then 1 (8 of the 16
+    // outputs, then 4); lane l ends with rows r8 + 4 k4 + i, outputs o16 + 8 k2 + 4 k1 + j
+    const int k4 = (L >> 2) & 1, k2 = (L >> 1) & 1, k1 = L & 1;
+    float h1[4][16];
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+#pragma unroll
+        for (int j = 0; j < 16; j++)
+            h1[i][j] = __fadd_rn(k4 ? a[i + 4][j] : a[i][j], __shfl_xor_sync(0xffffffffu, k4 ? a[i][j] : a[i + 4][j], 4));
+    float h2[4][8];
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+            h2[i][j] = __fadd_rn(k2 ? h1[i][j + 8] : h1[i][j], __shfl_xor_sync(0xffffffffu, k2 ? h1[i][j] : h1[i][j + 8], 2));
+    float h3[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+#pragma unroll
+        for (int j = 0; j < 4; j++)
+            h3[i][j] = __fadd_rn(k1 ? h2[i][j + 4] : h2[i][j], __shfl_xor_sync(0xffffffffu, k1 ? h2[i][j] : h2[i][j + 4], 1));
+    const int oo = o0 + o16 + 8 * k2 + 4 * k1;
+    if (oo < O) {
+        float sc[4];
+#pragma unroll
+        for (int j = 0; j < 4; j++) sc[j] = __ldg(scale + oo + j);
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const int row = s0 + r8 + 4 * k4 + i;
+            if (row < S)
+                *reinterpret_cast<float4 *>(y + (size_t)row * O + oo) =
+                    make_float4(__fmul_rn(h3[i][0], sc[0]), __fmul_rn(h3[i][1], sc[1]), __fmul_rn(h3[i][2], sc[2]), __fmul_rn(h3[i][3], sc[3]));
+        }
+    }
+}
+
+// A decode step's matrices (1 to 4 rows).
+// int4 in groups of 64 (matmul_i4_grouped), a row at a time: thread t of a block takes the groups t, t + 256,
+// .. of its MV_OB outputs four outputs a task (a warp 32 groups side by side, 1 KB of weights a load per
+// output; the group's 64 inputs loaded once for the four: a load an output made L1 the limit), their weights
+// and scales first; a group's 8 lanes in its registers (lane l: columns 8m + l, fused from +0; kb_lane_w's
+// decode), hsum256's tree into shared memory beside the group's scale; then a thread an output adds the
+// groups into the total in their order, each fused with its scale.
+#define MV_OB 8                     // outputs a block
 template <int F>
 __global__ void __launch_bounds__(256) k3_mv4(const uint8_t *__restrict__ w, const float *__restrict__ scale,
                                                 const float *__restrict__ x, int I, int O, float *__restrict__ y) {
@@ -704,17 +727,32 @@ static void k3_mv_launch(int fmt, const uint8_t *w, const float *s, const float 
         if (flip) k3_mv4<1><<<g, 256, sm, st>>>(w, s, x + (size_t)r * I, I, O, y + (size_t)r * O);
         else k3_mv4<0><<<g, 256, sm, st>>>(w, s, x + (size_t)r * I, I, O, y + (size_t)r * O);
 }
-// y [r][O] = x [r][I] . W^T in the CPU's arithmetic on stream st: k3_dense_b (int4 in groups of 64) and
-// k3_dense_b8 (int8 rows) from 64 rows, k3_mv4 and k3_mv8 up to 4, k3_dense else. flip: coli_cuda.dll's
+// the tile kernels' shared memory past 48 KB, asked for once (0: refused, k3_dense instead)
+static int kt_attr(void) {
+    static int ok = -1;
+    if (ok < 0) {
+        ok = cudaFuncSetAttribute(k3_dense_s4<0>, cudaFuncAttributeMaxDynamicSharedMemorySize, K4_SMEM) == cudaSuccess &&
+             cudaFuncSetAttribute(k3_dense_s4<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, K4_SMEM) == cudaSuccess &&
+             cudaFuncSetAttribute(k3_dense_o8, cudaFuncAttributeMaxDynamicSharedMemorySize, K8_SMEM) == cudaSuccess;
+        if (!ok) cudaGetLastError();
+    }
+    return ok;
+}
+// y [r][O] = x [r][I] . W^T in the CPU's arithmetic on stream st: k3_dense_s4 (int4 in groups of 64) and
+// k3_dense_o8 (int8 rows) from 64 rows, k3_mv4 and k3_mv8 up to 4, k3_dense else. flip: coli_cuda.dll's
 // copy of the matrix (its int4 nibbles flipped).
 static void k3_dense_launch(int fmt, const uint8_t *w, const float *s, const float *x, int r, int I, int O, int gs,
                             float *y, cudaStream_t st, int flip = 0) {
     const int mv = fmt == 1 ? I % 128 == 0 : gs == 64 && I % 64 == 0 && (size_t)2 * MV_OB * ((I >> 6) | 1) * 4 <= 48 * 1024;
-    if ((fmt == 1 || gs == 64) && I % KB_SC == 0 && r >= KB_MINROWS && kb_mode()) {
-        const unsigned rb = (unsigned)((r + KB_BR - 1) / KB_BR);
-        if (fmt == 1) k3_dense_b8<<<dim3((unsigned)((O + K8_BO - 1) / K8_BO), rb), 256, 0, st>>>(reinterpret_cast<const int8_t *>(w), s, x, r, I, O, y);
-        else if (flip) k3_dense_b<1><<<dim3((unsigned)((O + KB_BO - 1) / KB_BO), rb), 256, 0, st>>>(w, s, x, r, I, O, y);
-        else k3_dense_b<0><<<dim3((unsigned)((O + KB_BO - 1) / KB_BO), rb), 256, 0, st>>>(w, s, x, r, I, O, y);
+    if ((fmt == 1 || gs == 64) && I % KT_SC == 0 && O % 4 == 0 && r >= KT_MINROWS && kb_mode() && kt_attr()) {
+        if (fmt == 1)
+            k3_dense_o8<<<dim3((unsigned)((r + K8_BR - 1) / K8_BR), (unsigned)((O + K8_BO - 1) / K8_BO)), 256, K8_SMEM, st>>>(
+                reinterpret_cast<const int8_t *>(w), s, x, r, I, O, y);
+        else {
+            const dim3 g((unsigned)((r + K4_BR - 1) / K4_BR), (unsigned)((O + K4_BO - 1) / K4_BO));
+            if (flip) k3_dense_s4<1><<<g, 256, K4_SMEM, st>>>(w, s, x, r, I, O, y);
+            else k3_dense_s4<0><<<g, 256, K4_SMEM, st>>>(w, s, x, r, I, O, y);
+        }
     } else if (r <= 4 && mv && kb_mode()) {
         if (r == 1) k3_mv_launch<1>(fmt, w, s, x, I, O, y, flip, st);
         else if (r == 2) k3_mv_launch<2>(fmt, w, s, x, I, O, y, flip, st);

@@ -161,10 +161,11 @@ Measured on the real model ([docs/experiments/kimi-k3-4090-2026-10-31](docs/expe
 in 33 s (57), a **2,637-token prompt in 106 s** (1,401 s with the first CPU kernels, 549 s
 with the faster ones, 137 s with its experts, MLA attention and routers on the GPU in the
 CPU's arithmetic, to the bit; its dense kernels now 2-4x sooner, the same bytes; now its
-drive's reads are the floor) and a **5,862-token one in 111 s** (254 s in steps of 4,096, 173 s
+drive's reads are the floor) and a **5,862-token one in 110 s** (254 s in steps of 4,096, 173 s
 before the KDA layers went whole to the GPU, 147 s before the MoE's tail went over every
 worker, 132 s before the MLA core's 128-by-128 tiles and its layers whole on the GPU, 119 s
-before the card's matrices went over to the CPU's arithmetic); 60.5% of the experts a token
+before the card's matrices went over to the CPU's arithmetic, 112 s before its tile kernels
+decoded each weight once a block; its drives' reads now near the floor too); 60.5% of the experts a token
 asks for are found in RAM. Every step gave the logits of the one before it, byte for byte, and
 now the GPU's logits are the CPU build's, byte for byte:
 

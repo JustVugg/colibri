@@ -1,0 +1,7 @@
+k3cu_shared alone (bench_shared.c), 5,862 and 1,024 rows, this build (new) against 254338ab (old), alternated:
+new: k3cu_shared 5862 rows: 125.5 ms (best of 3 after a warm-up)
+old: k3cu_shared 5862 rows: 139.9 ms (best of 3 after a warm-up)
+new: k3cu_shared 5862 rows: 128.0 ms (best of 3 after a warm-up)
+old: k3cu_shared 5862 rows: 138.2 ms (best of 3 after a warm-up)
+new 1024: k3cu_shared 1024 rows: 27.6 ms (best of 3 after a warm-up)
+old 1024: k3cu_shared 1024 rows: 29.4 ms (best of 3 after a warm-up)

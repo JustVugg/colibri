@@ -1,0 +1,88 @@
+[CUDA] device 0: NVIDIA GeForce RTX 4090, 25.8 GB VRAM, sm_89
+[KDA] L0 metal=0 P=32 H=2 hd=16 K=4
+[K3-FMT] L0 KDA: q.fmt=4 gs=64 k.fmt=4 gs=64 v.fmt=4 gs=64 g.fmt=4 gs=64
+exp_f, tanhf and exp_f's fallback on the device: 12282 floats each (every 4099th), 0 differ
+experts 3584x3072 (SiTU 4, 25): 11 experts, 1542 pairs, 5526528 outputs: 0 differ
+experts 64x32 (SiTU 1, 1): 5 experts, 65 pairs, 4160 outputs: 0 differ
+dense int4 200x7168, groups of 64, 37 rows: 0 of 7400 differ
+dense int4 96x1024, groups of 32, 1100 rows: 0 of 105600 differ
+dense int4 71x3584, groups of 128, 9 rows: 0 of 639 differ
+dense int4 64x7168, groups of 64, 100 rows: 0 of 6400 differ
+dense int4 200x7168, groups of 64, 300 rows: 0 of 60000 differ
+dense int4 7168x3584, groups of 64, 1030 rows: 0 of 7383040 differ
+dense int4 96x64, groups of 64, 100 rows: 0 of 9600 differ
+dense int4 132x1024, groups of 64, 70 rows: 0 of 9240 differ
+dense int4 70x7168, groups of 64, 100 rows: 0 of 7000 differ
+dense int8 100x7168, 33 rows: 0 of 3300 differ
+dense int8 40x512, 1030 rows: 0 of 41200 differ
+dense int8 52x576, 200 rows: 0 of 10400 differ
+dense int8 40x64, 70 rows: 0 of 2800 differ
+dense int4 300x7168, groups of 64, 1 rows: 0 of 300 differ
+dense int4 70x3584, groups of 64, 3 rows: 0 of 210 differ
+dense int8 300x7168, 1 rows: 0 of 300 differ
+dense int8 70x1536, 4 rows: 0 of 280 differ
+dense on the card int4 200x7168, groups of 64, 1 rows: 0 of 200 differ
+dense on the card int8 200x7168, 1 rows: 0 of 200 differ
+dense on the card int4 200x7168, groups of 64, 2 rows: 0 of 400 differ
+dense on the card int8 200x7168, 2 rows: 0 of 400 differ
+dense on the card int4 200x7168, groups of 64, 3 rows: 0 of 600 differ
+dense on the card int8 200x7168, 3 rows: 0 of 600 differ
+dense on the card int4 200x7168, groups of 64, 4 rows: 0 of 800 differ
+dense on the card int8 200x7168, 4 rows: 0 of 800 differ
+dense on the card int4 200x7168, groups of 64, 5 rows: 0 of 1000 differ
+dense on the card int8 200x7168, 5 rows: 0 of 1000 differ
+dense on the card int4 200x7168, groups of 64, 37 rows: 0 of 7400 differ
+dense on the card int8 200x7168, 37 rows: 0 of 7400 differ
+dense on the card int4 200x7168, groups of 64, 64 rows: 0 of 12800 differ
+dense on the card int8 200x7168, 64 rows: 0 of 12800 differ
+dense on the card int4 200x7168, groups of 64, 300 rows: 0 of 60000 differ
+dense on the card int8 200x7168, 300 rows: 0 of 60000 differ
+dense on the card int4 200x7168, groups of 64, 1030 rows: 0 of 206000 differ
+dense on the card int8 200x7168, 1030 rows: 0 of 206000 differ
+dense on the card int4 72x12288, groups of 64, 1 rows: 0 of 72 differ
+dense on the card int4 72x12288, groups of 64, 300 rows: 0 of 21600 differ
+dense on the card int8 100x12288, 1 rows: 0 of 100 differ
+dense on the card int8 100x12288, 260 rows: 0 of 26000 differ
+dense on the card int8 300x1536, 300 rows: 0 of 90000 differ
+dense on the card int4 96x1024, groups of 32, 70 rows: 0 of 6720 differ
+dense on the card int4 96x1024, groups of 32, 1 rows: 0 of 96 differ
+dense on the card int8 50x1040, 100 rows: 0 of 5000 differ
+dense on the card int8 50x1032, 1 rows: 0 of 50 differ
+dense on the card int4 136x1600, groups of 64, 130 rows: 0 of 17680 differ
+dense on the card int8 60000x7168, 1100 rows: 0 of 66000000 differ
+MLA 96 heads (128+64, v 128, latent 512), rows 100..139: 0 of 491520 differ
+MLA 96 heads (128+64, v 128, latent 512), rows 1000..1299: 0 of 3686400 differ
+MLA 96 heads (128+64, v 128, latent 512), rows 3000..3199: 0 of 2457600 differ
+MLA 8 heads (16+8, v 16, latent 32), rows 0..36: 0 of 4736 differ
+MLA 8 heads (16+8, v 16, latent 32), rows 50..649: 0 of 76800 differ
+MLA 5 heads (24+8, v 40, latent 64), rows 7..306: 0 of 60000 differ
+router 896 experts x 7168, 37 rows: 0 of 33152 differ
+router 13 experts x 128, 70 rows: 0 of 910 differ
+shared experts 1024x1536 (2 of 768), 40 rows: 0 of 40960 differ
+shared experts 256x128 (1 of 128), 1030 rows: 0 of 263680 differ
+shared experts 7168x6144 (2 of 3072), 300 rows: 0 of 2150400 differ
+KDA 2 heads of 16, 128 columns, conv 4, card's projections 0x00, 40 rows: 0 of 5120 outputs, 0 of 512 state, 0 of 384 window values differ
+KDA 96 heads of 128, 7168 columns, conv 4, card's projections 0x1f, 1100 rows: 0 of 7884800 outputs, 0 of 1572864 state[K3-FMT] L0 MLA: qa.fmt=1 gs=0 qb.fmt=1 gs=0 kva.fmt=1 gs=0
+[K3-CUDA] experts: 2 steps, 16 experts, 1607 rows on the GPU; copying their bytes 0.0s, waiting for slots 0.0s
+[K3-CUDA] the dense matrices the GPU does not hold: 25 matmuls, 6188 rows, 0.0s
+[K3-CUDA] the dense matrices the GPU holds, one by one: 50 matmuls, 13141 rows, 0.1s
+[K3-CUDA] the gated MLA's attention: 6 layer steps, 1477 rows, 0.0s
+[K3-CUDA] the gated MLA layers: 6 layer steps, 1123 rows, 0.0s
+[K3-CUDA] the routers: 2 steps, 0.0s
+[K3-CUDA] the shared experts: 3 steps, 0.0s
+[K3-CUDA] the KDA layers: 3 layer steps, 1740 rows, 0.1s
+, 0 of 147456 window values differ
+KDA by step, the card's projections 0x1f, 1100 rows: 0 of the outputs and state differ
+KDA 96 heads of 128, 7168 columns, conv 4, card's projections 0x12, 600 rows: 0 of 4300800 outputs, 0 of 1572864 state, 0 of 147456 window values differ
+KDA by step, the card's projections 0x12, 600 rows: 0 of the outputs and state differ
+MLA call by call, the card's 0x18, rows 200..499: 0 of the outputs and cache values differ
+MLA layer 96 heads (128+64, v 128, latent 512, q 1536), 7168 columns, card's 0x18, rows 200..499: 0 of 2150400 outputs, 0 of 288000 cache values differ
+MLA layer 96 heads (128+64, v 128, latent 512, q 1536), 7168 columns, card's 0x00 (g, o int4), rows 0..39: 0 of 286720 outputs, 0 of 23040 cache values differ
+MLA call by call, the card's 0x1d, rows 3000..3129: 0 of the outputs and cache values differ
+MLA layer 96 heads (128+64, v 128, latent 512, q 1536), 7168 columns, card's 0x1d (g, o int4), rows 3000..3129: 0 of 931840 outputs, 0 of 1802880 cache values differ
+MLA call by call, the card's 0x1a, rows 10..59: 0 of the outputs and cache values differ
+MLA layer 96 heads (128+64, v 128, latent 512, q 1536), 7168 columns, card's 0x1a, rows 10..59: 0 of 358400 outputs, 0 of 34560 cache values differ
+MLA call by call, the card's 0x1f, rows 20..22: 0 of the outputs and cache values differ
+MLA layer 96 heads (128+64, v 128, latent 512, q 1536), 7168 columns, card's 0x1f, rows 20..22: 0 of 21504 outputs, 0 of 13248 cache values differ
+MLA layer 8 heads (16+8, v 16, latent 32, q 64), 128 columns, card's 0x00, rows 50..649: 0 of 76800 outputs, 0 of 26000 cache values differ
+ok

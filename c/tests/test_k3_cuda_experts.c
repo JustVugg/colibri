@@ -265,8 +265,8 @@ static int check_shared(int C, int D, int MI, int ns, int gs){
  *    stay the host's. Rows in several of k3cu_kda's pieces. */
 static int g_cuda_up = -1;
 /* 3b. The same on coli_cuda.dll's copy of the matrix (its int4 nibbles flipped), k3cu_matmul_dev: a
- *     decode step's 1 to 4 rows (k3_mv4, k3_mv8), a few more (k3_dense), a prompt's (k3_dense_b,
- *     k3_dense_b8), pieces cut short by K3_MMBYTES; every output matmul_i4_grouped's or matmul_q's bytes. */
+ *     decode step's 1 to 4 rows (k3_mv4, k3_mv8), a few more (k3_dense), a prompt's (k3_dense_s4,
+ *     k3_dense_o8), pieces cut short by K3_MMBYTES; every output matmul_i4_grouped's or matmul_q's bytes. */
 static int check_dense_dev(int fmt, int S, int I, int O, int gs){
     if(g_cuda_up < 0){ int dev = 0; g_cuda_up = coli_cuda_init(&dev, 1) ? 1 : 0; }
     if(!g_cuda_up){ printf("dense on the card: no coli_cuda.dll: skipped\n"); return 0; }
@@ -468,7 +468,8 @@ int dense_dev(void){
     bad += check_dense_dev(1, 1, 12288, 100, 0) + check_dense_dev(1, 260, 12288, 100, 0);  /* MLA's o_proj */
     bad += check_dense_dev(1, 300, 1536, 300, 0);   /* qb */
     bad += check_dense_dev(4, 70, 1024, 96, 32) + check_dense_dev(4, 1, 1024, 96, 32);     /* groups of 32: k3_dense */
-    bad += check_dense_dev(1, 100, 1040, 50, 0) + check_dense_dev(1, 1, 1032, 50, 0);      /* widths k3_dense_b8 and k3_mv8 leave to k3_dense */
+    bad += check_dense_dev(1, 100, 1040, 50, 0) + check_dense_dev(1, 1, 1032, 50, 0);      /* widths k3_dense_o8 and k3_mv8 leave to k3_dense */
+    bad += check_dense_dev(4, 130, 1600, 136, 64);   /* k3_dense_s4: 25 stages, 2 rows past two blocks, 8 outputs past one */
     bad += check_dense_dev(1, 1100, 7168, 60000, 0);   /* pieces of 998 rows (K3_MMBYTES), the head's case */
     return bad;
 }
@@ -510,11 +511,16 @@ int main(int argc, char **argv){
     bad += check_dense(4, 37, 7168, 200, 64);
     bad += check_dense(4, 1100, 1024, 96, 32);
     bad += check_dense(4, 9, 3584, 71, 128);
-    bad += check_dense(4, 100, 7168, 64, 64);   /* 12 blocks of 8 rows and one of 4 */
-    bad += check_dense(4, 300, 7168, 200, 64);  /* k3_dense_b: 9 blocks of 32 rows and one of 12, 192 outputs and 8 */
-    bad += check_dense(4, 1030, 3584, 7168, 64);/* the latent's up: a 1024-row piece by k3_dense_b, 6 rows by k3_dense */
+    bad += check_dense(4, 100, 7168, 64, 64);   /* half a block of outputs; rows 64 and 36 */
+    bad += check_dense(4, 300, 7168, 200, 64);  /* k3_dense_s4: 4 blocks of 64 rows and one of 44, 128 outputs and 72 */
+    bad += check_dense(4, 1030, 3584, 7168, 64);/* the latent's up: a 1024-row piece by k3_dense_s4, 6 rows by k3_dense */
+    bad += check_dense(4, 100, 64, 96, 64);     /* one group: one stage */
+    bad += check_dense(4, 70, 1024, 132, 64);   /* the second block's outputs 128..131: half a thread's 8 */
+    bad += check_dense(4, 100, 7168, 70, 64);   /* outputs not a multiple of 4: k3_dense */
     bad += check_dense(1, 33, 7168, 100, 0);
-    bad += check_dense(1, 1030, 512, 40, 0);    /* k3_dense_b8: a 1024-row piece; 6 rows by k3_dense */
+    bad += check_dense(1, 1030, 512, 40, 0);    /* k3_dense_o8: a 1024-row piece; 6 rows by k3_dense */
+    bad += check_dense(1, 200, 576, 52, 0);     /* 9 stages, 6 blocks of 32 rows and one of 8 */
+    bad += check_dense(1, 70, 64, 40, 0);       /* one stage */
     bad += check_dense(4, 1, 7168, 300, 64);    /* k3_mv4 */
     bad += check_dense(4, 3, 3584, 70, 64);
     bad += check_dense(1, 1, 7168, 300, 0);     /* k3_mv8 */
@@ -530,7 +536,7 @@ int main(int argc, char **argv){
     bad += check_router(70, 128, 13);
     bad += check_shared(40, 1024, 768, 2, 64);
     bad += check_shared(1030, 256, 128, 1, 32);
-    bad += check_shared(300, 7168, 3072, 2, 64);   /* Kimi K3's, through k3_dense_b */
+    bad += check_shared(300, 7168, 3072, 2, 64);   /* Kimi K3's, through k3_dense_s4 */
     bad += check_kda(40, 128, 2, 16, 4, 0);         /* the tiny model's shapes, every projection the host's */
     bad += check_kda(1100, 7168, 96, 128, 4, 0x1f); /* Kimi K3's, every projection on the card: 3 pieces */
     bad += check_kda(600, 7168, 96, 128, 4, 0x12);  /* k and o on the card, q, v and g the host's */
