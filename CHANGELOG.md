@@ -122,6 +122,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Qwen3.8 with a card on an ARM host (DGX Spark, GH200, Jetson): the build.** The CUDA chain
+  groups a verify's pooled slots of one expert by `GQ_FUSED_ROWS`, which only the x86 AVX2
+  kernels defined, so `qwen38` with `CUDA=1` did not compile without them. Every build has it
+  now (the paths without those kernels give a row its own bits as well), and CI compiles the
+  CUDA engines' host side without AVX2 (`make cuda-host-syntax`).
 - **The UI's coding agents with the UI on Windows itself** (`coli ui` from a Windows prompt, the
   desktop window). The agents of WSL were never looked for there, and every folder was "not
   found" (its check asked `wslpath`, which Windows has not). They are now found and opened
