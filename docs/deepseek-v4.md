@@ -37,7 +37,8 @@ unit.
 
 - Production code is in `c/deepseek_v4.c` (amalgamated units); the public
   engine/session API is `c/deepseek_v4.h`. The CUDA tier is
-  `c/backend_cuda_dsv4.cu` (+ `backend_loader_dsv4.c` on Windows).
+  `c/backend_cuda_dsv4.cu` (built as `coli_gpu_dsv4.so` and loaded by
+  `backend_loader_dsv4.c` on POSIX HIP, as a DLL on Windows).
 - Official sharded safetensors checkpoints load through shared `st.h`;
   standard MXFP4 matmul uses shared `quant.h`.
 - Unified `c/coli` routes `run`, `chat`, `serve`, and `web` to V4; `serve` is
@@ -149,6 +150,19 @@ try `_dg` first, ask it whether device 0 fits (`dsv4_cuda_backend_arch_ok`),
 otherwise load the generic DLL; `COLI_DSV4_DLL=<file name>` forces one. The
 start-up banner names the choice: `[DSV4 CUDA] backend=coli_cuda_dsv4_dg.dll
 (deepgemm-sm120)`. Deploy = `deepseek_v4.exe` + both DLLs next to it.
+
+### Linux HIP tier
+
+```bash
+cd c
+make deepseek-v4 HIP=1 HIP_ARCH=gfx1102 ROCM_HOME=/usr ROCM_LIBDIR=/usr/lib64
+```
+
+This builds the engine plus `coli_gpu_dsv4.so` beside it. The host has no
+`libamdhip64` in `DT_NEEDED` (`ldd deepseek_v4` is clean), so a machine
+without ROCm still starts on the CPU; `--backend auto` loads the .so on first
+use, `--backend hip` requires it, and a missing .so leaves the CPU path. A
+`VK=1` build in the same command carries both AMD backends in one binary.
 
 ### Linux CUDA tier
 
