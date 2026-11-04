@@ -7,6 +7,8 @@ go to the model as a function of one string argument, "input", and come back as
 custom_tool_call items; hosted tools (web search, image generation) are left out. Reasoning
 items Codex sends back are not part of a chat history and are dropped."""
 import http.client, json, time, uuid
+import select, socket, threading
+from contextlib import contextmanager
 
 MAX_BODY = 32 << 20
 
@@ -230,6 +232,47 @@ class Events:
         return "".join(out)
 
 
+@contextmanager
+def _cancel_on_disconnect(h, conn):
+    # Capture the connected socket: getresponse may clear conn.sock for a
+    # Connection: close response while its file still owns this same descriptor.
+    upstream = conn.sock
+    stopped, disconnected = threading.Event(), threading.Event()
+
+    def watch():
+        while not stopped.wait(0.05):
+            try:
+                readable, _, _ = select.select([h.connection], [], [], 0)
+                if not readable:
+                    continue
+                if h.connection.recv(1, socket.MSG_PEEK) == b"":
+                    # FIN closes only the peer's write side. It may still be
+                    # reading its response; do not cancel that valid request.
+                    return
+                continue
+            except ConnectionResetError:
+                disconnected.set()
+            except (OSError, ValueError):
+                return
+            try:
+                upstream.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            return
+
+    watcher = threading.Thread(target=watch, name="responses-disconnect", daemon=True)
+    watcher.start()
+    try:
+        yield disconnected
+    except (OSError, http.client.HTTPException):
+        if not disconnected.is_set():
+            raise
+    finally:
+        stopped.set()
+        conn.close()
+        watcher.join()
+
+
 def serve(h, backend):
     """POST /v1/responses on handler h, against the colibri gateway at `backend` (a parsed URL)"""
     n = int(h.headers.get("Content-Length") or 0)
@@ -246,63 +289,71 @@ def serve(h, backend):
     conn = http.client.HTTPConnection(backend.hostname, backend.port or 80, timeout=3600)
     try:
         conn.request("POST", "/v1/chat/completions", body=json.dumps(chat), headers=headers)
-        resp = conn.getresponse()
     except OSError as e:
         conn.close()
         return _err(h, 502, "colibri non risponde su %s: %s" % (backend.netloc, e))
-    if resp.status != 200:
-        msg = resp.read().decode("utf-8", "replace")[:2000]
-        conn.close()
-        return _err(h, resp.status, msg)
-    ev = Events(body.get("model") or chat.get("model") or "colibri", custom)
-    streaming = body.get("stream", False)
-    if streaming:
-        h.send_response(200)
-        h.send_header("Content-Type", "text/event-stream")
-        h.send_header("Cache-Control", "no-store")
-        h.send_header("Transfer-Encoding", "chunked")
-        h.end_headers()
+    with _cancel_on_disconnect(h, conn) as disconnected:
+        try:
+            resp = conn.getresponse()
+        except OSError as e:
+            if disconnected.is_set():
+                return
+            return _err(h, 502, "colibri non risponde su %s: %s" % (backend.netloc, e))
+        try:
+            if resp.status != 200:
+                msg = resp.read().decode("utf-8", "replace")[:2000]
+                if not disconnected.is_set():
+                    return _err(h, resp.status, msg)
+                return
+            ev = Events(body.get("model") or chat.get("model") or "colibri", custom)
+            streaming = body.get("stream", False)
 
-    def send(s):
-        if streaming and s:
-            b = s.encode()
-            h.wfile.write(b"%x\r\n%s\r\n" % (len(b), b))
-            h.wfile.flush()
-    try:
-        send(ev.start())
-        buf = b""
-        while True:
-            chunk = resp.read1(65536)
-            if not chunk:
-                break
-            buf += chunk
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                line = line.strip()
-                if not line.startswith(b"data:"):
-                    continue
-                data = line[5:].strip()
-                if data == b"[DONE]":
-                    continue
-                try:
-                    send(ev.chunk(json.loads(data)))
-                except ValueError:
-                    continue
-        send(ev.finish())
-        if streaming:
-            h.wfile.write(b"0\r\n\r\n")
-            h.wfile.flush()
-        else:
-            out = json.dumps(ev.response("completed")).encode()
-            h.send_response(200)
-            h.send_header("Content-Type", "application/json")
-            h.send_header("Content-Length", str(len(out)))
-            h.end_headers()
-            h.wfile.write(out)
-    except (BrokenPipeError, ConnectionResetError):
-        pass   # Codex went away: closing upstream stops the engine
-    finally:
-        conn.close()
+            def send(s):
+                if streaming and s:
+                    b = s.encode()
+                    h.wfile.write(b"%x\r\n%s\r\n" % (len(b), b))
+                    h.wfile.flush()
+            try:
+                if streaming:
+                    h.send_response(200)
+                    h.send_header("Content-Type", "text/event-stream")
+                    h.send_header("Cache-Control", "no-store")
+                    h.send_header("Transfer-Encoding", "chunked")
+                    h.end_headers()
+                send(ev.start())
+                buf = b""
+                while True:
+                    chunk = resp.read1(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        line = line.strip()
+                        if not line.startswith(b"data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == b"[DONE]":
+                            continue
+                        try:
+                            send(ev.chunk(json.loads(data)))
+                        except ValueError:
+                            continue
+                send(ev.finish())
+                if streaming:
+                    h.wfile.write(b"0\r\n\r\n")
+                    h.wfile.flush()
+                else:
+                    out = json.dumps(ev.response("completed")).encode()
+                    h.send_response(200)
+                    h.send_header("Content-Type", "application/json")
+                    h.send_header("Content-Length", str(len(out)))
+                    h.end_headers()
+                    h.wfile.write(out)
+            except (BrokenPipeError, ConnectionResetError):
+                pass   # Codex went away: closing upstream stops the engine
+        finally:
+            resp.close()
 
 
 def _err(h, code, msg):
