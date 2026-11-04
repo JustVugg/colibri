@@ -2489,11 +2489,16 @@ static int attention_token_impl(float *output,
         coli_bf16_round_array(rope, (size_t)rope_dim);
     }
 
+    int output_done = 0;
+#ifdef COLI_V4_GPU_TIER
+    if (!result && !coli_v4_gpu_wo_decode(&wo_a, &wo_b, output, attended, groups))
+        output_done = 1;
+#endif
     int heads_per_group = heads / groups;
     int group_width = heads_per_group * head_dim;
     int scale_columns = (group_width + 127) / 128;
     int scale_rows_per_group = (o_rank + 127) / 128;
-    if (!result) {
+    if (!result && !output_done) {
 #ifdef COLI_V4_GPU_TIER
         if (wo_a.gpu) {
             result = coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups);
@@ -2521,9 +2526,9 @@ static int attention_token_impl(float *output,
                                          attended + (size_t)group * group_width);
         }
     }
-    if (!result) coli_bf16_round_array(oa, (size_t)groups * o_rank);
-    if (!result) result = coli_fp8_matvec_ref(output, &wo_b, oa);
-    if (!result) coli_bf16_round_array(output, (size_t)hidden);
+    if (!result && !output_done) coli_bf16_round_array(oa, (size_t)groups * o_rank);
+    if (!result && !output_done) result = coli_fp8_matvec_ref(output, &wo_b, oa);
+    if (!result && !output_done) coli_bf16_round_array(output, (size_t)hidden);
 
     free(compressed_indices);
     free(sines); free(cosines); free(norm_weight); free(oa);
@@ -2935,11 +2940,16 @@ static int attention_token_impl(float *output,
         coli_bf16_round_array(rope, (size_t)rope_dim);
     }
 
+    int output_done = 0;
+#ifdef COLI_V4_GPU_TIER
+    if (!result && !coli_v4_gpu_wo_decode(&wo_a, &wo_b, output, attended, groups))
+        output_done = 1;
+#endif
     int heads_per_group = heads / groups;
     int group_width = heads_per_group * head_dim;
     int scale_columns = (group_width + 127) / 128;
     int scale_rows_per_group = (o_rank + 127) / 128;
-    if (!result) {
+    if (!result && !output_done) {
 #ifdef COLI_V4_GPU_TIER
         if (wo_a.gpu) {
             result = coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups);
@@ -2967,9 +2977,9 @@ static int attention_token_impl(float *output,
                                          attended + (size_t)group * group_width);
         }
     }
-    if (!result) coli_bf16_round_array(oa, (size_t)groups * o_rank);
-    if (!result) result = coli_fp8_matvec_ref(output, &wo_b, oa);
-    if (!result) coli_bf16_round_array(output, (size_t)hidden);
+    if (!result && !output_done) coli_bf16_round_array(oa, (size_t)groups * o_rank);
+    if (!result && !output_done) result = coli_fp8_matvec_ref(output, &wo_b, oa);
+    if (!result && !output_done) coli_bf16_round_array(output, (size_t)hidden);
 
     free(compressed_indices);
     free(sines); free(cosines); free(norm_weight); free(oa);
@@ -8291,11 +8301,16 @@ static int attention_token_impl(float *output,
         coli_bf16_round_array(rope, (size_t)rope_dim);
     }
 
+    int output_done = 0;
+#ifdef COLI_V4_GPU_TIER
+    if (!result && !coli_v4_gpu_wo_decode(&wo_a, &wo_b, output, attended, groups))
+        output_done = 1;
+#endif
     int heads_per_group = heads / groups;
     int group_width = heads_per_group * head_dim;
     int scale_columns = (group_width + 127) / 128;
     int scale_rows_per_group = (o_rank + 127) / 128;
-    if (!result) {
+    if (!result && !output_done) {
 #ifdef COLI_V4_GPU_TIER
         if (wo_a.gpu) {
             result = coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups);
@@ -8323,9 +8338,9 @@ static int attention_token_impl(float *output,
                                          attended + (size_t)group * group_width);
         }
     }
-    if (!result) coli_bf16_round_array(oa, (size_t)groups * o_rank);
-    if (!result) result = coli_fp8_matvec_ref(output, &wo_b, oa);
-    if (!result) coli_bf16_round_array(output, (size_t)hidden);
+    if (!result && !output_done) coli_bf16_round_array(oa, (size_t)groups * o_rank);
+    if (!result && !output_done) result = coli_fp8_matvec_ref(output, &wo_b, oa);
+    if (!result && !output_done) coli_bf16_round_array(output, (size_t)hidden);
 
     free(compressed_indices);
     free(sines); free(cosines); free(norm_weight); free(oa);
@@ -12103,6 +12118,13 @@ int coli_v4_gpu_fp8_matvec(const ColiTensorView *w, float *output,
     Dsv4CudaTensor *tensor = (Dsv4CudaTensor *)w->gpu;
     if (!tensor) return -1;
     return dsv4_cuda_matvec(tensor, output, (float *)input) ? 0 : -1;
+}
+
+int coli_v4_gpu_wo_decode(const ColiTensorView *a, const ColiTensorView *b,
+                           float *output, const float *input, int groups) {
+    const char *enabled = getenv("DSV4_CUDA_WO_DECODE");
+    if ((enabled && !atoi(enabled)) || !a->gpu || !b->gpu) return -1;
+    return dsv4_cuda_wo_decode(a->gpu, b->gpu, groups, output, input) ? 0 : -1;
 }
 
 int coli_v4_gpu_matvec_grouped(const ColiTensorView *w, float *output,

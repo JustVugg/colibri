@@ -93,6 +93,10 @@ int dsv4_cuda_final_argmax(const Dsv4CudaActivation *residual,Dsv4CudaTensor *fn
                            Dsv4CudaTensor *base,Dsv4CudaTensor *norm,Dsv4CudaTensor *head,
                            int M,int H,float eps,float pre_eps,int *id,float *value);
 int dsv4_cuda_matvec_grouped(Dsv4CudaTensor *t,float *y,const float *x,int groups);
+/* Decode wo_a -> BF16 -> wo_b -> BF16, preserving raw-input matvec arithmetic.
+ * Unlike dsv4_cuda_wo, this does not FP8-quantize the intermediate activation. */
+int dsv4_cuda_wo_decode(Dsv4CudaTensor *wa,Dsv4CudaTensor *wb,int groups,
+                        float *out,const float *context);
 int dsv4_cuda_expert_group(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,
                            Dsv4CudaTensor *const *down,const float *weights,int count,
                            float limit,float *y,const float *x);
