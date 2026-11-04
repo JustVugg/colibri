@@ -64,6 +64,14 @@ int dsv4_cuda_upload_fp8_ref(Dsv4CudaTensor **tensor,const uint8_t *w,
                             const float *scales,int rows,int cols,int packed_rows8,int device);
 int dsv4_cuda_fp8_ref_matmul_resident(Dsv4CudaTensor *tensor,const float *x,
                                      int tokens,float *y);
+/* Resident BF16 compressor pair; decode preserves sequential fused sums. */
+int dsv4_cuda_upload_compressor(Dsv4CudaTensor **tensor,const uint16_t *w,
+                                int rows,int cols,int device);
+int dsv4_cuda_compressor_project(Dsv4CudaTensor *kv,Dsv4CudaTensor *gate,
+                                 const float *x,float *values,float *scores);
+/* In-place post-RoPE Hadamard/FP4 queries plus resident BF16 head weights. */
+int dsv4_cuda_indexer_prepare(Dsv4CudaTensor *weights,const float *input,
+                              float *queries,float *head_weights,int dimension);
 /* Build/GPU compatibility (loader DLL selection). */
 int dsv4_cuda_backend_arch_ok(int device);
 const char *dsv4_cuda_backend_name(void);
