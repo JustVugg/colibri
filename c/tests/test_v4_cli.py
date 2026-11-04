@@ -143,6 +143,15 @@ class V4CliTest(unittest.TestCase):
         self.assertEqual(env["RAM_GB"], "96")
         self.assertEqual(env["CTX"], "4096")
 
+    def test_loader_backend_marks_a_native_v4_build_gpu_capable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = Path(directory) / "deepseek_v4"
+            engine.write_bytes(b"")
+            (Path(directory) / "coli_gpu_dsv4.so").write_bytes(b"")
+            with mock.patch.object(self.cli, "engine_for", return_value=str(engine)), \
+                 mock.patch.object(self.cli.sys, "platform", "linux"):
+                self.assertTrue(self.cli.dsv4_cuda_available("model"))
+
     def test_native_v4_serve_flags_are_forwarded(self):
         args = argparse.Namespace(gpu="none", vram=5, workload="prefill",
                                   backend="vulkan")

@@ -784,6 +784,14 @@ def dsv4_cuda_available(model=None):
         return any(os.path.exists(os.path.join(os.path.dirname(eng), name))
                    for name in ("coli_cuda_dsv4_dg.dll", "coli_cuda_dsv4.dll"))
     if sys.platform == "linux" and os.path.exists(eng):
+        # S4 POSIX loader: the engine no longer links the runtime directly,
+        # so ldd alone reports a valid HIP build as CPU-only. The backend
+        # shared object next to the engine is the build marker; keep the ldd
+        # fallback for direct-linked builds.
+        engine_dir = os.path.dirname(eng)
+        if any(os.path.exists(os.path.join(engine_dir, name))
+               for name in ("coli_gpu_dsv4.so", "coli_gpu_dsv4_dg.so")):
+            return True
         try:
             linked = subprocess.run(["ldd", eng], capture_output=True, text=True, timeout=3)
             # The native V4 tier links libcudart on NVIDIA and libamdhip64 on
