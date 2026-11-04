@@ -2092,6 +2092,9 @@ tests/edge_runtime_nocuda.o: edge_runtime.c .build-config
 tests/test_qwen38_config$(EXE): tests/test_qwen38_config.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+tests/test_qwen38_ple_gguf$(EXE): tests/test_qwen38_ple_gguf.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_dsv41_serve_budget$(EXE): tests/test_dsv41_serve_budget.c deepseek_v41.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
