@@ -143,10 +143,12 @@ class V4CliTest(unittest.TestCase):
         self.assertEqual(env["CTX"], "4096")
 
     def test_native_v4_serve_flags_are_forwarded(self):
-        args = argparse.Namespace(gpu="none", vram=8, workload="prefill")
+        args = argparse.Namespace(gpu="none", vram=8, workload="prefill",
+                                  backend="vulkan")
         self.assertEqual(
             self.cli.dsv4_engine_args(args, "deepseek_v4"),
-            ["--gpu", "none", "--vram", "8", "--workload", "prefill"],
+            ["--gpu", "none", "--vram", "8", "--workload", "prefill",
+             "--backend", "vulkan"],
         )
         self.assertEqual(self.cli.dsv4_engine_args(args, "qwen36"), [])
 
@@ -160,13 +162,15 @@ class V4CliTest(unittest.TestCase):
         self.assertEqual(env["COLI_CUDA"], "1")
         self.assertNotIn("CUDA_EXPERT_GB", env)
 
-    def test_workload_is_refused_for_a_non_native_engine(self):
-        args = argparse.Namespace(
-            ngen=8, temp=None, ram=0, ctx=0, model="models/kimi",
-            gpu=None, vram=0, workload="prefill",
-        )
-        with self.assertRaisesRegex(SystemExit, "--workload applies"):
-            self.cli.env_for_engine(args, "kimi")
+    def test_workload_or_backend_is_refused_for_a_non_native_engine(self):
+        for key, value in (("workload", "prefill"), ("backend", "vulkan")):
+            args = argparse.Namespace(
+                ngen=8, temp=None, ram=0, ctx=0, model="models/kimi",
+                gpu=None, vram=0, workload=None, backend=None,
+            )
+            setattr(args, key, value)
+            with self.assertRaisesRegex(SystemExit, "--workload/--backend"):
+                self.cli.env_for_engine(args, "kimi")
 
     def test_kimi_engine_environment_forwards_ram(self):
         """#855: `--ram` reached the environment for deepseek_v4 only, so on Kimi

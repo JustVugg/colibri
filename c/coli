@@ -560,11 +560,13 @@ def dsv4_engine_args(a, arch):
         args += ["--vram", str(a.vram)]
     if getattr(a, "workload", None):
         args += ["--workload", a.workload]
+    if getattr(a, "backend", None):
+        args += ["--backend", a.backend]
     return args
 
 def reject_foreign_workload(a, arch):
-    if getattr(a, "workload", None) and arch != "deepseek_v4":
-        sys.exit(f"{C.yel}--workload applies to the native deepseek_v4 engine only{C.r}")
+    if (getattr(a, "workload", None) or getattr(a, "backend", None)) and arch != "deepseek_v4":
+        sys.exit(f"{C.yel}--workload/--backend apply to the native deepseek_v4 engine only{C.r}")
 
 def env_for_engine(a, arch, plan=None):
     reject_foreign_workload(a, arch)
@@ -4146,6 +4148,8 @@ def main():
     common.add_argument("--vram",type=float,default=0,help="total VRAM budget in GB (0=auto)")
     common.add_argument("--workload",choices=("auto","decode","prefill"),default=None,
                         help="deepseek_v4: placement phase (default: auto by request)")
+    common.add_argument("--backend",choices=("auto","hip","vulkan","cpu"),default=None,
+                        help="deepseek_v4: device backend (default: auto; HIP first, Vulkan fallback)")
     common.add_argument("--policy",choices=("quality","balanced","experimental-fast"),
                         default=os.environ.get("COLI_POLICY","quality"),
                         help="resource policy (explicit --topk/--topp overrides warn and proceed)")

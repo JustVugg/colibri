@@ -204,7 +204,11 @@ target (answers end at EOS; an oversized ceiling is clamped to the context
 with a stderr note). `CTX`/`--ctx` sets the context window.
 
 The engine's own CLI is the control plane now: `--gpu auto|none|N`,
-`--vram GiB` and `--workload auto|decode|prefill` feed one placement plan.
+`--vram GiB`, `--workload auto|decode|prefill` and `--backend auto|hip|vulkan|cpu`
+feed one placement plan. A `VK=1 HIP=1` build carries both AMD paths in one
+binary: `auto` tries HIP first and falls back to Vulkan when the HIP runtime
+cannot initialize, an explicit `hip` does not fall back, and `--gpu none`
+disables both.
 `coli run`, `coli chat` and `coli serve` forward those three flags to the
 native engine (`openai_server.Engine` appends them to the engine argv), so a
 served process obeys the same budget instead of translating `--vram` into the

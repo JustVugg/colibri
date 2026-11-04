@@ -11399,6 +11399,9 @@ int coli_v4_engine_open(ColiV4Engine **output,
     engine->gpu.request_device = options->gpu_device;
     engine->gpu.request_workload = options->gpu_workload;
     engine->gpu.request_workload_set = options->gpu_workload_set;
+    engine->gpu.request_backend = options->gpu_backend;
+    if (options->gpu_backend == COLI_V4_GPU_BACKEND_CPU)
+        engine->gpu.request_off = 1;
     engine->gpu.request_budget_bytes = (long long)options->gpu_budget_bytes;
 
     /* Set owns_* immediately after each acquire so destroy cleans partial opens. */
@@ -11577,6 +11580,17 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     engine->gpu.enabled = 0;
     engine->gpu.device = 0;
     if (!v4_gpu_wanted(engine)) return 0;
+    if (engine->gpu.request_backend == COLI_V4_GPU_BACKEND_VULKAN) {
+#ifdef COLI_VULKAN
+        setenv("COLI_VULKAN", "1", 1);
+        return 0;
+#else
+        fprintf(stderr, "v4_gpu warning=vulkan-not-built; continuing-CPU\n");
+        return 0;
+#endif
+    }
+    if (engine->gpu.request_backend == COLI_V4_GPU_BACKEND_HIP)
+        setenv("COLI_VULKAN", "0", 1);
 #ifdef COLI_VULKAN
     {   /* This path mirrors native FP4 experts and FP8 and bf16 matrices only
          * (v4_gpu_expert_attach_cached_ex): a GGUF's experts and dense part stayed on the CPU
@@ -11601,6 +11615,17 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
                      ? engine->gpu.request_device
                      : (device_setting ? atoi(device_setting) : 0);
     if (!dsv4_cuda_init(&device, 1)) {
+#ifdef COLI_VULKAN
+        if (engine->gpu.request_backend == COLI_V4_GPU_BACKEND_AUTO) {
+            const char *vk = getenv("COLI_VULKAN");
+            if (!vk || *vk != '0') {
+                setenv("COLI_VULKAN", "1", 1);
+                fprintf(stderr, "v4_gpu warning=hip-unavailable; "
+                                "falling-back-to-vulkan\n");
+                return 0;
+            }
+        }
+#endif
         fprintf(stderr, "v4_gpu warning=backend-unavailable; continuing-CPU\n");
         return 0;
     }
@@ -15062,6 +15087,7 @@ static void v4_cu_close(void) {
 
 static void v4_vk_open(const ColiV4Engine *engine) {
 #ifdef COLI_VULKAN
+    if (engine->gpu.request_off) return;
     v4_vk_device_open(engine);      /* opened already when the RAM plan asked */
     g_v4_vk_engine = engine;
     ColiV4Engine *mut = (ColiV4Engine *)engine;
@@ -15977,6 +16003,7 @@ typedef struct {
     double vram_gib;
     int workload;
     int workload_set;
+    int backend;
     ColiDeepSeekV4PromptMode prompt_mode;
 } V4CliOptions;
 
@@ -15990,6 +16017,7 @@ static void v4_cli_usage(FILE *stream, const char *program) {
         "  --gpu auto|none|N    device tier: auto (default), none, or ordinal\n"
         "  --vram GiB           total VRAM budget for dense, bank and mirrors\n"
         "  --workload MODE      auto|decode|prefill (default: auto; decode/prefill pin the phase)\n"
+        "  --backend MODE       auto|hip|vulkan|cpu (default: auto; HIP first, Vulkan fallback)\n"
         "  --prompt-file PATH   read UTF-8 prompt from file (avoids argv encoding issues)\n"
         "  --system TEXT        optional system message\n"
         "  --thinking           enable the official V4 thinking prefix\n"
@@ -16111,6 +16139,17 @@ static int v4_cli_parse(int argc, char **argv, V4CliOptions *options) {
             else if (!strcmp(argv[i], "prefill")) options->workload = 2;
             else return -1;
             options->workload_set = 1;
+        } else if (!strcmp(option, "--backend")) {
+            if (++i == argc) return -1;
+            if (!strcmp(argv[i], "auto")) options->backend = COLI_V4_GPU_BACKEND_AUTO;
+            else if (!strcmp(argv[i], "hip")) options->backend = COLI_V4_GPU_BACKEND_HIP;
+            else if (!strcmp(argv[i], "vulkan")) options->backend = COLI_V4_GPU_BACKEND_VULKAN;
+            else if (!strcmp(argv[i], "cpu")) options->backend = COLI_V4_GPU_BACKEND_CPU;
+            else return -1;
+            if (options->backend == COLI_V4_GPU_BACKEND_CPU)
+                options->gpu_off = 1;
+            else if (!options->gpu_off)
+                options->gpu_off = 0;
         } else if (!strcmp(option, "--prompt-file")) {
             if (++i == argc || !argv[i][0]) return -1;
             options->prompt_file = argv[i];
@@ -18470,9 +18509,9 @@ static void v4_serve_mux(ColiV4Engine *engine, ColiV4Session **sessions, int n) 
 }
 
 /* Serve mode keeps the model from SNAP and the cap as argv[1]; the placement
- * flags are the same three the text CLI accepts. They are parsed here rather
- * than read from the environment so `coli serve --vram/--gpu/--workload`
- * reaches the native engine instead of being a silent no-op. */
+ * flags are the same four the text CLI accepts. They are parsed here rather
+ * than read from the environment so `coli serve --vram/--gpu/--workload/
+ * --backend` reaches the native engine instead of being a silent no-op. */
 static int v4_serve_options(int argc, char **argv, ColiV4EngineOpenOptions *options) {
     for (int i = 2; i < argc; i++) {
         const char *option = argv[i];
@@ -18510,6 +18549,17 @@ static int v4_serve_options(int argc, char **argv, ColiV4EngineOpenOptions *opti
             else if (!strcmp(argv[i], "prefill")) options->gpu_workload = 2;
             else return -1;
             options->gpu_workload_set = 1;
+        } else if (!strcmp(option, "--backend")) {
+            if (++i == argc) return -1;
+            if (!strcmp(argv[i], "auto")) options->gpu_backend = COLI_V4_GPU_BACKEND_AUTO;
+            else if (!strcmp(argv[i], "hip")) options->gpu_backend = COLI_V4_GPU_BACKEND_HIP;
+            else if (!strcmp(argv[i], "vulkan")) options->gpu_backend = COLI_V4_GPU_BACKEND_VULKAN;
+            else if (!strcmp(argv[i], "cpu")) options->gpu_backend = COLI_V4_GPU_BACKEND_CPU;
+            else return -1;
+            if (options->gpu_backend == COLI_V4_GPU_BACKEND_CPU)
+                options->gpu_off = 1;
+            else if (!options->gpu_off)
+                options->gpu_off = 0;
         } else {
             return -1;
         }
@@ -18549,7 +18599,8 @@ static int v4_serve_main(int argc, char **argv) {
     };
     if (v4_serve_options(argc, argv, &open_options)) {
         fprintf(stderr, "usage: %s CAP [--gpu auto|none|N] [--vram GiB] "
-                        "[--workload auto|decode|prefill]\n",
+                        "[--workload auto|decode|prefill] "
+                        "[--backend auto|hip|vulkan|cpu]\n",
                 argc ? argv[0] : "deepseek-v4");
         return 2;
     }
@@ -18808,6 +18859,7 @@ int main(int argc, char **argv) {
                                 ? cli.workload
                                 : (cli.max_new_tokens <= 1 ? 2 : 1),
             .gpu_workload_set = cli.workload_set,
+            .gpu_backend = cli.backend,
         };
         if (cli.memory_gib > 0.0)
             open_opts.memory_limit_bytes =

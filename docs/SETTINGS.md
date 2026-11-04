@@ -55,6 +55,7 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `--gpu` | `None` | `COLI_GPU(S)` | `auto`, `none`, or a device list like `0,1`. |
 | `--vram` | `0` (auto) | native V4 argv / `CUDA_EXPERT_GB` elsewhere | Total VRAM budget in GB. The native DeepSeek V4 engine gets it as `--vram`; other CUDA engines map it to `CUDA_EXPERT_GB`. |
 | `--workload` | unset (auto) | native V4 argv | `auto`, `decode` or `prefill`: placement phase for the native DeepSeek V4 engine; an explicit value pins the phase. |
+| `--backend` | unset (auto) | native V4 argv | `auto`, `hip`, `vulkan` or `cpu`: device backend. `auto` prefers HIP and falls back to Vulkan; an explicit `hip` never falls back; `--gpu none` still means CPU. |
 | `--auto-tier` | off | resource plan | Automatically apply the RAM/VRAM placement plan. |
 | `--no-tune-profile` | off | profile loader | Ignore a saved measured profile. |
 | `--think` / `--no-think` | the model's default | `enable_thinking` in the chat request | Whether the model reasons before answering. Off, the prompt closes the reasoning block and the answer starts at the first word. |

@@ -1154,6 +1154,7 @@ struct ColiV4Engine {
         int request_device;
         int request_workload;
         int request_workload_set;
+        int request_backend;
         long long request_budget_bytes;
         int plan_valid;
         int plan_dense;

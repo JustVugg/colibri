@@ -94,7 +94,15 @@ typedef struct {
     uint64_t gpu_budget_bytes;      /* 0 => free VRAM at open */
     int gpu_workload;               /* V4GpuWorkload: 0 auto, 1 decode, 2 prefill */
     int gpu_workload_set;           /* nonzero: the workload is forced, no phase switch */
+    int gpu_backend;                /* COLI_V4_GPU_BACKEND_*: auto, hip, vulkan, cpu */
 } ColiV4EngineOpenOptions;
+
+enum {
+    COLI_V4_GPU_BACKEND_AUTO = 0,
+    COLI_V4_GPU_BACKEND_HIP = 1,
+    COLI_V4_GPU_BACKEND_VULKAN = 2,
+    COLI_V4_GPU_BACKEND_CPU = 3,
+};
 
 typedef struct {
     uint64_t projected_bytes;

@@ -10504,6 +10504,8 @@ def main():
                         help="deepseek_v4: total VRAM budget in GiB (0=auto)")
     parser.add_argument("--workload", choices=("auto", "decode", "prefill"), default=None,
                         help="deepseek_v4: placement phase (default: auto)")
+    parser.add_argument("--backend", choices=("auto", "hip", "vulkan", "cpu"), default=None,
+                        help="deepseek_v4: device backend (default: auto; HIP first, Vulkan fallback)")
     parser.add_argument("--allowed-host", action="append",
         default=[h.strip() for h in os.environ.get("COLI_ALLOWED_HOSTS", "").split(",") if h.strip()],
         help="additional Host header value accepted by the DNS-rebinding guard "
@@ -10530,8 +10532,10 @@ def main():
         engine_args += ["--vram", str(args.vram)]
     if args.workload:
         engine_args += ["--workload", args.workload]
+    if args.backend:
+        engine_args += ["--backend", args.backend]
     if engine_args and family.id != "deepseek_v4":
-        parser.error("--gpu/--vram/--workload apply to the native deepseek_v4 engine")
+        parser.error("--gpu/--vram/--workload/--backend apply to the native deepseek_v4 engine")
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
           max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots,
