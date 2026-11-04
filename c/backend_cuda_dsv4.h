@@ -60,6 +60,10 @@ int dsv4_cuda_indexer_score_batch(int device,const float *queries,const float *k
 int dsv4_cuda_fp8_ref_matmul(int device,const uint8_t *w,const float *bscale,
                              int rows,int cols,int packed_rows8,const float *x,
                              int tokens,float *y);
+int dsv4_cuda_upload_fp8_ref(Dsv4CudaTensor **tensor,const uint8_t *w,
+                            const float *scales,int rows,int cols,int packed_rows8,int device);
+int dsv4_cuda_fp8_ref_matmul_resident(Dsv4CudaTensor *tensor,const float *x,
+                                     int tokens,float *y);
 /* Build/GPU compatibility (loader DLL selection). */
 int dsv4_cuda_backend_arch_ok(int device);
 const char *dsv4_cuda_backend_name(void);
