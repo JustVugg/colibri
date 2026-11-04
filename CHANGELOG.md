@@ -114,6 +114,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **The UI's coding agents with the UI on Windows itself** (`coli ui` from a Windows prompt, the
+  desktop window). The agents of WSL were never looked for there, and every folder was "not
+  found" (its check asked `wslpath`, which Windows has not). They are now found and opened
+  through `wsl.exe` in its default distribution, the folder handed to the agent as WSL has it,
+  its files written through the distribution's share; where WSL does not reach the colibri
+  server on 127.0.0.1 (WSL's network without `networkingMode=mirrored`) the page says so
+  before any window. An agent an installer left as an alias (Claude Code's `~/.claude/local`)
+  is found too.
 - **`tools/convert_fp8_to_int4.py`: the token as an unredirected header.** Its downloads set `HF_TOKEN` as a plain urllib header, which urllib copies into a redirect's request; it now goes as `setup_download.py` sends it, to the hub only. `tests/test_convert_hf_token.py` checks it.
 - The chat page's first-run dialog waits for the models service to finish measuring the
   machine; on a fresh state it showed "- GB di RAM" and no model that fits.
