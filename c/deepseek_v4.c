@@ -9738,6 +9738,14 @@ static int hot_pack_matrix(ColiTensorView *view, unsigned char *scratch) {
 }
 
 /* state->mutex is held and the slot has at least one reference. */
+/* Set once the native CUDA/HIP expert mirror is live. rows16 packs the same
+ * hot experts the mirror wants; a packed view has block_rows=16 and the mirror
+ * refuses it (v4_gpu_expert_attach_cached_ex). Mirror wins: the CPU keeps the
+ * reference layout, the device gets the hits. */
+#ifdef COLI_V4_GPU_TIER
+extern int g_v4_gpu_mirror_on;
+#endif
+
 /* COLI_V4_ROWS16=0: never repack hot experts into the rows16 layout, so
  * every expert runs the reference matvec. The rows16 kernel accumulates in a
  * different order (not bitwise the reference), which makes greedy text depend
@@ -9745,6 +9753,9 @@ static int hot_pack_matrix(ColiTensorView *view, unsigned char *scratch) {
  * numerics comparisons (measured 2026-08-15). */
 static int hot_rows16_wanted(void) {
     static int rows16 = -1;
+#ifdef COLI_V4_GPU_TIER
+    if (g_v4_gpu_mirror_on) return 0;
+#endif
     if (rows16 < 0) {
         const char *env = getenv("COLI_V4_ROWS16");
         rows16 = !(env && *env == '0');
@@ -11520,6 +11531,9 @@ static void v4_gpu_mirror_reserve_size(const ColiDeepSeekV4Config *config,
                                        int bank_possible);
 static long long v4_gpu_mirror_reserve_mb(int live);
 static long long v4_gpu_mirror_reserve_margin_mb(int live);
+static int v4_gpu_dense_wanted(void);
+
+int g_v4_gpu_mirror_on;   /* defined in the GPU unit, read by the expert store */
 
 int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     if (!engine) return -1;
@@ -11564,6 +11578,7 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     engine->gpu.enabled = 1;
     engine->gpu.device = device;
     g_v4_gpu_open_device = device;
+    g_v4_gpu_mirror_on = 1;
     v4_gpu_mirror_reserve_size(&engine->config,
                                !coli_v4_index_gguf(engine->target_index));
     /* Routed-expert fp4 mirror cache hangs off the expert store; attach it at
@@ -11583,7 +11598,8 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     if (engine->experts && !engine->experts->gpu)
         engine->experts->gpu =
             v4_gpu_expert_mirrors_create(device, mirror_suggested);
-    fprintf(stderr, "v4_gpu tier=dense-matvec device=%d\n", device);
+    fprintf(stderr, "v4_gpu tier=%s device=%d\n",
+            v4_gpu_dense_wanted() ? "dense-matvec" : "expert-mirror", device);
     return 0;
 }
 
@@ -11818,18 +11834,42 @@ static void *v4_gpu_upload_gate_bias(ColiDeepSeekV4LayerWeights *weights,
     return tensor;
 }
 
+/* COLI_V4_DENSE_PLACE=ram keeps every dense/attention mirror on the CPU and
+ * frees the 6.2 GiB the native tier otherwise uploads; the device is then the
+ * routed-expert mirror/bank only. Default gpu (the 16 GB row in the docs).
+ * Vendor-neutral on purpose: one switch, one meaning, no CUDA spelling. */
+static int v4_gpu_dense_wanted(void) {
+    static int place = -1;
+    if (place < 0) {
+        const char *env = getenv("COLI_V4_DENSE_PLACE");
+        place = !(env && !strcmp(env, "ram"));
+    }
+    return place;
+}
+
 int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
                              ColiDeepSeekV4LayerWeights *weights) {
     if (!engine || !weights || !engine->gpu.enabled) return 0;
+    int dense = v4_gpu_dense_wanted();
+    /* Dense in RAM still uploads the shared experts when the prefill bank is
+     * asked for: dsv4_cuda_expert_bank_create takes them as its gate/up/down
+     * operands, and without them the bank refuses with "no shared-expert
+     * mirrors". Attention, router and the dense matvecs stay on the CPU. */
+    if (!dense && !coli_v4_gpu_moe_batch_wanted()) return 0;
     if (layer < 0 || layer >= COLI_V4_RESIDENT_MAX_LAYERS) return 0;
     if (engine->gpu.layer_ready[layer]) return 0;
-    static const char *const tensors[] = {
+    static const char *const dense_tensors[] = {
         "attn.wq_a", "attn.wq_b", "attn.wkv", "attn.wo_a", "attn.wo_b",
         "ffn.shared_experts.w1", "ffn.shared_experts.w2", "ffn.shared_experts.w3"
     };
+    static const char *const shared_tensors[] = {
+        "ffn.shared_experts.w1", "ffn.shared_experts.w2", "ffn.shared_experts.w3"
+    };
+    const char *const *tensors = dense ? dense_tensors : shared_tensors;
+    size_t n_tensors = dense ? sizeof(dense_tensors) / sizeof(dense_tensors[0]) : 3;
     long long bytes = 0;
     struct timespec _ts0; clock_gettime(CLOCK_MONOTONIC, &_ts0);
-    for (size_t i = 0; i < sizeof(tensors) / sizeof(tensors[0]); i++) {
+    for (size_t i = 0; i < n_tensors; i++) {
         /* With the batched attention path enabled, wo_a goes up as fp8-bf16
          * (fmt 9): the batched attention-output DeepGEMM needs the per-group
          * scale packing that format carries. Off by default so the decode
@@ -11844,6 +11884,7 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
             continue;
         }
     }
+    if (!dense) goto done;
     /* Compressor / indexer-compressor projection mirrors for the batched
      * attention path (COLI_CUDA_ATTN_BATCH=1). Missing tensors (layers
      * without compression) simply leave the mirror NULL. */
@@ -11919,6 +11960,7 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
         dsv4_cuda_tensor_free((Dsv4CudaTensor *)bias);
         bias = NULL;
     }
+done:
     engine->gpu.layer_ready[layer] = 1;
     engine->gpu.uploaded_bytes += bytes;
     struct timespec _ts1; clock_gettime(CLOCK_MONOTONIC, &_ts1);

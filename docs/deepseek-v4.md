@@ -556,7 +556,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_PREFIX_LOG` | log hint boundary / reuse decisions |
 | `V4_IDX_BATCH` (1) | batched indexer selection in prefill; `0` = legacy per-token |
 | `V4_IDX_IDENTITY` (0) | `1` = skip indexer scoring when every candidate fits under `index_topk` (index order instead of upstream's score order; ~8 % faster prefill, changes rounding) |
-| `COLI_V4_ROWS16` (1) | `0` = never repack hot experts into the rows16 layout (reference matvec for all; numerics comparisons) |
+| `COLI_V4_ROWS16` (1) | `0` = never repack hot experts into the rows16 layout (reference matvec for all; numerics comparisons). With the native GPU expert mirror live, rows16 repacking turns itself off: the mirror needs `block_rows=1` |
+| `COLI_V4_DENSE_PLACE` (gpu) | `ram` = keep the dense/attention mirrors on the CPU; frees ~6.2 GiB for the expert mirror. Measured on 8 GB: ttft 6.10 s, 0.65 tok/s vs 9.50 s, 0.42 with dense on the GPU. `COLI_CUDA_MOE_BATCH` then reports `no shared-expert mirrors` and stays off |
 | `CTX` (4096) / `NGEN` | context window / generation ceiling (CLI + serve) |
 
 **Experts / I/O**
