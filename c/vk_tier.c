@@ -4767,7 +4767,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         {
             const char *gre = getenv("COLI_VK_TIER_GEMM_ROWS");
             if (T.st_ok && slots >= 2 && fit <= 2 && !(gre && *gre) && T.gemm_rows > 0 && T.gemm_rows < 16) {
-                fprintf(stderr, VKT_TAG " tier: grouped GEMM rows: the budget holds only the streaming least (%d residents beside %d slots) -- the derived crossover stands down, %d rows\n",
+                fprintf(stderr, VKT_TAG " tier: grouped GEMM rows: the budget holds only the streaming least (%lld residents beside %d slots) -- the derived crossover stands down, %d rows\n",
                         fit, slots, 16);
                 T.gemm_rows = 16;
             }
