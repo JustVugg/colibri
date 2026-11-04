@@ -108,6 +108,18 @@ int main(void) {
               r.workload, 256);
     }
 
+    {   /* An automatic budget leaves the system safety reserve. */
+        V4GpuPlanRequest r = request(8 * GIB, V4_GPU_WORKLOAD_DECODE, 132);
+        V4GpuPlan p;
+        r.budget_bytes = 0;
+        r.safety_bytes = V4_GPU_PLAN_DEFAULT_SAFETY_BYTES;
+        p = v4_gpu_plan_decide(&r);
+        check(p.used_bytes <= r.free_bytes - r.safety_bytes,
+              "auto budget leaves safety", 8, r.workload, 132);
+        check(p.mirror_slots > 0, "auto safety still has mirrors", 8,
+              r.workload, 132);
+    }
+
     {   /* A budget above free VRAM is clamped to the card. */
         V4GpuPlanRequest r = request(8 * GIB, V4_GPU_WORKLOAD_DECODE, 132);
         r.budget_bytes = 64 * GIB;

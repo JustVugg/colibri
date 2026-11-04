@@ -30,6 +30,7 @@ typedef struct {
     int workload;            /* V4GpuWorkload */
     long long budget_bytes;  /* user budget; 0 = use free_bytes */
     long long free_bytes;    /* device free at open */
+    long long safety_bytes;  /* system reserve taken from an automatic budget */
     long long dense_bytes;   /* all dense/attention mirrors, shared included */
     long long shared_bytes;  /* shared experts alone, all layers */
     long long bank_bytes;    /* full routed-expert bank, all slots */
@@ -52,6 +53,7 @@ typedef struct {
 
 #define V4_GPU_PLAN_MIN_MIRRORS 8
 #define V4_GPU_PLAN_HEADROOM_BYTES (256LL << 20)
+#define V4_GPU_PLAN_DEFAULT_SAFETY_BYTES (512LL << 20)
 #define V4_GPU_PLAN_DENSE_DECODE_MIN_BUDGET (10LL << 30)
 
 static inline long long v4_gpu_plan_mirror_bytes(const V4GpuPlanRequest *r) {
@@ -81,9 +83,19 @@ static inline V4GpuPlan v4_gpu_plan_decide(const V4GpuPlanRequest *request) {
     plan.phase = phase;
 
     /* The physical card is a hard ceiling: a user budget above free VRAM
-     * would make the allocator promise memory that is not there. */
+     * would make the allocator promise memory that is not there. An
+     * automatic budget also leaves the system safety reserve: the driver,
+     * the compositor and other processes are not part of the model plan.
+     * vLLM ships the same idea as gpu_memory_utilization=0.9; colibri's
+     * resource planner keeps 2 GiB for the general CUDA path. The native
+     * engine keeps 512 MiB here, enough for the driver/context without
+     * throwing away a mirror-heavy 8 GB plan. */
     budget = request->budget_bytes > 0 ? request->budget_bytes
                                        : request->free_bytes;
+    if (request->budget_bytes <= 0 && request->safety_bytes > 0) {
+        budget -= request->safety_bytes;
+        if (budget < 0) budget = 0;
+    }
     if (request->free_bytes > 0 && budget > request->free_bytes)
         budget = request->free_bytes;
     reserve = (request->kv_bytes > 0 ? request->kv_bytes : 0) +

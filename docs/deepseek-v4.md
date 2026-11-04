@@ -208,8 +208,12 @@ The engine's own CLI is the control plane now: `--gpu auto|none|N`,
 The planner gets the model geometry, the real free VRAM and the workload and
 returns which tiers live on the device plus the mirror capacity; `--vram` is
 the total budget for dense, shared experts, the prefill bank and mirrors, and
-`--gpu none` really turns the native tier off. The environment variables below
-are debug overrides of that plan, not the user contract.
+`--gpu none` really turns the native tier off. An automatic budget keeps
+512 MiB of system reserve (vLLM's `gpu_memory_utilization=0.9` and colibri's
+2 GiB general CUDA reserve are the same idea); an explicit `--vram` is used
+as given and clamped to free VRAM. Measured on 8 GB: 1955-token prefill
+215.6 s against 363.4 s on the CPU (1.69x), peak 6.97 GiB. The environment
+variables below are debug overrides of that plan, not the user contract.
 
 What the knobs do (full table in [Environment reference](#environment-reference-v4-engine)):
 `COLI_CUDA_ATTN_BATCH=1` puts the batched prefill attention block on the GPU
