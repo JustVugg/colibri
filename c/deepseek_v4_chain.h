@@ -1703,19 +1703,20 @@ static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr,
     }
     /* every matrix on the per-row GEMV: a row's bits do not depend on the chunk it sits
      * in (a prompt, a verify, a decode step, a prefix reused or computed cold), as on the
-     * CPU, whose batched and per-token kernels give the same bits. The default since
-     * the self-tuning defaults: an unset env is `-1`, the backend's generic fill rule
-     * (its `gemm_min_s`) -- prompts only, for a verify's rows and every decode step the
-     * pin below stays 0 and keeps the GEMV's bits, as deepseek_v41's chain keeps a
-     * verify's rows on the decode step's. Measured on the RX 6900 XT, a
-     * 2,515-token prompt's first token 189.6 s -> 152.1 s; the GEMM is the resident-matrix
-     * path's row-canonical class, so a prompt row's bits can then depend on how the
-     * prompt is chunked. `0` keeps the position-independent bits (the per-lever hatch
-     * and COLI_VK_LEGACY=1's base), `N` uses the GEMM from N rows, and a negative `N`
-     * reads as -1. */
+     * CPU, whose batched and per-token kernels give the same bits. The default: an unset
+     * env is `0` -- the contract above is the tested standing (tests/vulkan_engines.sh's
+     * v4_chain_same holds the chain against itself at COLI_VK_CHAIN_ROWS=1, which
+     * deepseek_v4_tiny_w4's compressor pools across a row that moved). `-1` is the
+     * backend's generic fill rule (its `gemm_min_s`) -- prompts only, a verify's rows and
+     * every decode step keep the GEMV through the pin below, as deepseek_v41's chain keeps
+     * a verify's rows on the decode step's. Measured on the RX 6900 XT, a 2,515-token
+     * prompt's first token 189.6 s -> 152.1 s; the GEMM is the resident-matrix path's
+     * row-canonical class, so a prompt row's bits can then depend on how the prompt is
+     * chunked, which is why it is the opt-in hatch and not the default. `N` uses the GEMM
+     * from N rows, and a negative `N` reads as -1. */
     static int gemm_rows = -2;
     if (gemm_rows == -2)
-        gemm_rows = coli_vk_env_def("COLI_VK_CHAIN_GEMM_ROWS", -1, 0);
+        gemm_rows = coli_vk_env_def("COLI_VK_CHAIN_GEMM_ROWS", 0, 0);
     vkc_gemm_rows(prompt ? gemm_rows : 0);   /* a verify's rows get a decode step's bits */
     static int ident = -1;
     if (ident < 0) { const char *e = getenv("V4_IDX_IDENTITY"); ident = e && *e == '1'; }
