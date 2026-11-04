@@ -1,4 +1,17 @@
-export type ChatRole = "system" | "user" | "assistant"
+export type ChatRole = "system" | "user" | "assistant" | "tool"
+
+/* One call the model asked for, in OpenAI's tool_calls shape: `arguments` is the
+   JSON text the model wrote, parsed only by whoever runs the tool. */
+export interface ToolCall {
+  id: string
+  name: string
+  arguments: string
+}
+
+export interface ToolSpec {
+  type: "function"
+  function: { name: string; description: string; parameters: Record<string, unknown> }
+}
 
 export interface ChatMessage {
   id: string
@@ -27,6 +40,14 @@ export interface ChatMessage {
   /* The picture of an image turn: the request while it runs, then the result.
      `url` appears only once the image is finished. */
   generated?: GeneratedImage
+  /* An assistant turn that asked for tools, and the role "tool" turns that answer
+     it: both are sent back on the next request, so the model reads what it asked
+     for and what came back. `toolLabel` is the line the page shows for a result;
+     it is never sent. */
+  toolCalls?: ToolCall[]
+  toolCallId?: string
+  toolName?: string
+  toolLabel?: string
 }
 
 interface OpenAIError {
@@ -79,6 +100,8 @@ export interface HealthResponse {
   /* the response ceiling a request is lowered to; without a ceiling of its own a
      request gets this one: on colibrì the context the engine holds */
   max_tokens?: number
+  /* POST /fs/* reads, writes and runs in a folder for this page (COLI_FILE_TOOLS=1) */
+  file_tools?: boolean
 }
 
 export interface ProfileTurn {
@@ -117,6 +140,8 @@ export interface StreamChatResult {
   requestId: string | null
   queueWaitMs: number | null
   compaction: Compaction | null
+  /* the calls the model made this generation, in order; empty when it only answered */
+  toolCalls: ToolCall[]
 }
 
 export function endpoint(baseUrl: string, path: string) {
@@ -231,6 +256,9 @@ export interface StreamChatOptions {
      so it reuses that state instead of prefilling the turn again, and the model sees
      what it thought (#382); a template that drops it drops it on the server */
   keepReasoning?: boolean
+  /* OpenAI tools, offered with tool_choice "auto": the gateway renders them in the
+     model's own format and returns its calls as tool_calls (docs/api.md) */
+  tools?: ToolSpec[]
   signal: AbortSignal
   onDelta: (text: string) => void
   onReasoning?: (text: string) => void
@@ -246,7 +274,7 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
       /* A turn with pictures goes out in the content-array form the API takes;
          a plain turn stays a string, so a text-only server sees exactly what it
          saw before this existed. */
-      messages: options.messages.map(({ role, content, images, reasoning }) => ({
+      messages: options.messages.map(({ role, content, images, reasoning, toolCalls, toolCallId, toolName }) => ({
         ...(images?.length
           ? { role, content: [
               ...(content ? [{ type: "text", text: content }] : []),
@@ -254,7 +282,11 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
             ] }
           : { role, content }),
         ...(options.keepReasoning && role === "assistant" && reasoning?.trim() ? { reasoning_content: reasoning } : {}),
+        ...(toolCalls?.length ? { tool_calls: toolCalls.map(({ id, name, arguments: args }) =>
+          ({ id, type: "function", function: { name, arguments: args } })) } : {}),
+        ...(role === "tool" ? { tool_call_id: toolCallId, name: toolName } : {}),
       })),
+      ...(options.tools?.length ? { tools: options.tools, tool_choice: "auto" } : {}),
       temperature: options.temperature,
       ...(options.maxTokens === undefined ? {} : { max_completion_tokens: options.maxTokens }),
       enable_thinking: options.enableThinking,
@@ -276,11 +308,15 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
   let finishReason: string | null = null
   let usage: TokenUsage | null = null
   let compaction: Compaction | null = null
+  const toolCalls: ToolCall[] = []
 
   const consume = (data: string) => {
     if (data === "[DONE]") { finished = true; return }
     const event = JSON.parse(data) as {
-      choices?: Array<{ delta?: { content?: string; reasoning_content?: string }; finish_reason?: string | null }>
+      choices?: Array<{ delta?: {
+        content?: string; reasoning_content?: string
+        tool_calls?: Array<{ index?: number; id?: string; function?: { name?: string; arguments?: string } }>
+      }; finish_reason?: string | null }>
       usage?: TokenUsage | null
       compaction?: Compaction
     }
@@ -290,6 +326,14 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
     if (text) options.onDelta(text)
     const reasoning = choice?.delta?.reasoning_content
     if (reasoning) options.onReasoning?.(reasoning)
+    /* a call arrives in pieces keyed by index: the id and name once, the arguments in chunks */
+    for (const piece of choice?.delta?.tool_calls ?? []) {
+      const at = piece.index ?? toolCalls.length
+      const call = toolCalls[at] ??= { id: "", name: "", arguments: "" }
+      if (piece.id) call.id = piece.id
+      if (piece.function?.name) call.name += piece.function.name
+      if (piece.function?.arguments) call.arguments += piece.function.arguments
+    }
     if (choice?.finish_reason) finishReason = choice.finish_reason
     if (event.usage) usage = event.usage
   }
@@ -320,6 +364,7 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
     requestId: response.headers.get("x-request-id"),
     queueWaitMs: parsedQueueWait !== null && Number.isFinite(parsedQueueWait) ? parsedQueueWait : null,
     compaction,
+    toolCalls: toolCalls.filter((call) => call?.name).map((call, at) => ({ ...call, id: call.id || `call_${at}` })),
   }
 }
 

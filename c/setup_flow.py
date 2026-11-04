@@ -2235,7 +2235,14 @@ def _recommend_for(hw, explicit_dir):
                                    machine=hw["os"].get("machine"), downloaded=downloaded)
 
 
+def _files_for_this_run(a):
+    """--files 1 lets the dashboard read, write and run (COLI_FILE_TOOLS, file_tools.py)
+    for the server this command starts; not kept for the next start, so 0 when absent."""
+    os.environ["COLI_FILE_TOOLS"] = "1" if getattr(a, "files", 0) == 1 else "0"
+
+
 def _finish(ui, cfg, a):
+    _files_for_this_run(a)
     if a.json:
         result = {"config": cfg, "config_path": config_path()}
         if not a.no_start:
@@ -2267,6 +2274,7 @@ def cmd_start(a):
     if reason:
         cfg = use_cuda(cfg, reason, out=say)
     refresh_configured(cfg, out=say)
+    _files_for_this_run(a)
     if getattr(a, "json", False):
         print(json.dumps(start_server(cfg, background=True, open_browser=not a.no_browser,
                                       out=lambda *_: None), indent=2))

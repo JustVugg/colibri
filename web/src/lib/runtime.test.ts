@@ -1,7 +1,16 @@
 import { describe, expect, it } from "vitest"
 
 import type { HealthResponse } from "./api"
-import { activeRequests, supportsCacheSlots, supportsCompaction, supportsContinuation } from "./runtime"
+import { activeRequests, supportsCacheSlots, supportsCompaction, supportsContinuation, supportsFileTools } from "./runtime"
+
+describe("file tools", () => {
+  it("only when the gateway says so", () => {
+    expect(supportsFileTools({ status: "ok", file_tools: true })).toBe(true)
+    expect(supportsFileTools({ status: "ok", file_tools: false })).toBe(false)
+    expect(supportsFileTools({ status: "ok" })).toBe(false)
+    expect(supportsFileTools(null)).toBe(false)
+  })
+})
 
 const healthWithActive = (active: boolean | number): HealthResponse => ({
   status: "ok",

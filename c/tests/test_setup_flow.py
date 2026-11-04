@@ -2414,5 +2414,41 @@ class PortFreeTest(unittest.TestCase):
             server.close()
         self.assertTrue(setup_flow.port_free("127.0.0.1", free_port()))
 
+
+class FilesSwitchTest(unittest.TestCase):
+    """--files on setup and start: COLI_FILE_TOOLS for the server this run starts, 0 when absent."""
+
+    def started_with(self, files, exported=None):
+        seen = {}
+        def fake_start(cfg, **kw):
+            seen["env"] = os.environ.get("COLI_FILE_TOOLS")
+            return 0
+        a = argparse.Namespace(json=False, no_start=False, background=False, no_browser=True)
+        if files is not None:
+            a.files = files
+        env = {} if exported is None else {"COLI_FILE_TOOLS": exported}
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(setup_flow, "start_server", fake_start):
+            if exported is None:
+                os.environ.pop("COLI_FILE_TOOLS", None)
+            setup_flow._finish(mock.Mock(), {}, a)
+        return seen["env"]
+
+    def test_one_turns_the_file_tools_on(self):
+        self.assertEqual(self.started_with(1), "1")
+
+    def test_absent_or_zero_is_off_even_if_exported(self):
+        self.assertEqual(self.started_with(None), "0")
+        self.assertEqual(self.started_with(0, exported="1"), "0")
+
+    def test_the_flag_parses_on_setup_and_start(self):
+        coli = C_DIR / "coli"
+        for sub in ("setup", "start"):
+            with self.subTest(sub=sub):
+                out = subprocess.run([sys.executable, str(coli), sub, "--files", "2"],
+                                     capture_output=True, text=True, timeout=60)
+                self.assertNotEqual(out.returncode, 0)
+                self.assertIn("--files", out.stderr)
+
 if __name__ == "__main__":
     unittest.main()

@@ -36,7 +36,7 @@ export interface ChatLabels {
 export function chatMarkdown(messages: ChatMessage[], model: string, when: Date, labels: ChatLabels): string {
   const parts = [`# colibrì: ${model}`, when.toLocaleString()]
   for (const item of messages) {
-    if (item.role === "system") continue
+    if (item.role === "system" || item.role === "tool") continue
     const lines = [`## ${item.role === "user" ? labels.user : labels.assistant}`]
     const pictures = (item.images?.length ?? 0) + (item.generated?.url ? 1 : 0)
     for (let n = 1; n <= pictures; n++) lines.push(`[${labels.image} ${n}]`)

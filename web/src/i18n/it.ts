@@ -156,6 +156,10 @@ const it: Record<string, string> = {
   "sidebar.temperature": "Temperatura",
   "sidebar.maxTokens": "Token di output massimi",
   "sidebar.reasoning": "Ragionamento",
+  "files.chip": "File",
+  "files.chipHelp": "Il modello legge, scrive, modifica ed elenca file ed esegue comandi nella cartella di lavoro. Ogni scrittura e ogni comando li approvi tu.",
+  "files.folder": "Cartella di lavoro",
+  "files.folderHelp": "Dove gli strumenti per i file leggono, scrivono ed eseguono. Vuota: la tua cartella home.",
   "sidebar.transport": "Trasporto compatibile OpenAI",
 
   "topbar.activeModel": "MODELLO ATTIVO",

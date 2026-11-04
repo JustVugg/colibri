@@ -25,6 +25,7 @@ import uuid
 import v4_dsml                      # vendored DeepSeek V4 DSML reference primitives
 import v41_dsml                     # ...and V4.1's, whose tag names differ by a space
 import image_engine                 # the qwenimage serve protocol, PNG and request rules
+import file_tools                   # the dashboard's file tools, POST /fs/* (COLI_FILE_TOOLS=1)
 from family_registry import (FamilyConfigError, UnknownFamilyError, family_by_id,
                              display_for, family_ids, resolve_model)
 from family_registry import default_model_id as registry_default_model_id
@@ -2874,6 +2875,12 @@ def render_chat_qwen3_coder(messages, tools=None, tool_choice=None, add_generati
 QWEN_CALL_RE = re.compile(
     r"<tool_call>\s*<function=([^>\n]+)>\s*(.*?)</function>\s*</tool_call>", re.S)
 QWEN_FUNCTION_RE = re.compile(r"<function=([^>\n]+)>\s*(.*?)</function>", re.S)
+# A bare block as the int4 Qwen3-Coder container writes it: the opening <tool_call>
+# lost, the closing one kept right after </function>.
+QWEN_BARE_CALL_RE = re.compile(r"<function=([^>\n]+)>\s*(.*?)</function>(?:\s*</tool_call>)?", re.S)
+# The same block with its closer required, and no other block inside its body.
+QWEN_CLOSED_BARE_RE = re.compile(
+    r"<function=([^>\n]+)>\s*((?:(?!<function=).)*?)</function>\s*</tool_call>", re.S)
 QWEN_PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n(.*?)\n</parameter>", re.S)
 
 
@@ -2961,13 +2968,23 @@ def parse_qwen_tool_calls(reply, tools=None, *, strip_text=True):
     matches = list(QWEN_CALL_RE.finditer(reply))
     recovered = False
     if not matches and tools and "<tool_call>" not in reply:
-        # Some quantized checkpoints omit just the outer wrapper. Recover only a
-        # reply made entirely of complete function blocks: quoted examples or a
+        # Some quantized checkpoints omit just the outer wrapper, or only its
+        # opening tag. Recover only a reply made entirely of complete function
+        # blocks, each optionally closed by </tool_call>: quoted examples or a
         # marker mentioned in prose must never turn into an executable call.
-        inner = list(QWEN_FUNCTION_RE.finditer(reply))
-        if inner and not QWEN_FUNCTION_RE.sub("", reply).strip():
+        inner = list(QWEN_BARE_CALL_RE.finditer(reply))
+        if inner and not QWEN_BARE_CALL_RE.sub("", reply).strip():
             matches = inner
             recovered = True
+        else:
+            # Prose before the calls, as the full form allows and the tool rules
+            # invite ("reasoning ... BEFORE the function call"), when every block
+            # kept its </tool_call> and nothing follows the last one.
+            closed = list(QWEN_CLOSED_BARE_RE.finditer(reply))
+            if (closed and "<function=" not in reply[:closed[0].start()]
+                    and not QWEN_CLOSED_BARE_RE.sub("", reply[closed[0].start():]).strip()):
+                matches = closed
+                recovered = True
     calls = []
     text_parts = []
     end = 0
@@ -8438,6 +8455,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     payload["continue_assistant"] = os.environ.get("COLI_CONTINUE_ASSISTANT", "1") != "0" and ARCH in CONTINUATION_FAMILIES
                     # chat requests may send context_compaction; the context they fit in
                     payload["context_compaction"] = True
+                    # the dashboard may read, write and run in a folder (POST /fs/*, COLI_FILE_TOOLS=1)
+                    payload["file_tools"] = file_tools.ENABLED
                     if getattr(self.server, "context_limit", None):
                         payload["context_tokens"] = self.server.context_limit
                     # the response ceiling a request is lowered to: a client's default
@@ -8534,6 +8553,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.log_error("request read deadline exceeded")
                 return
             path = urlsplit(self.path).path
+            if path.startswith("/fs/"):
+                self.file_tool(path[len("/fs/"):], body, request_id)
+                return
             # A client written for Jev sends "jev-latest": on that route the
             # served model answers whatever name was asked for.
             if path != "/v1/systemone":
@@ -8573,6 +8595,25 @@ class APIHandler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
+    def file_tool(self, action, body, request_id):
+        """POST /fs/read|write|edit|list|run: the dashboard's file tools (file_tools.py). Absent
+        unless COLI_FILE_TOOLS=1. Beyond the Host guard and the API key that do_POST already
+        applied: only a peer on this machine (a --host 0.0.0.0 bind must not turn a forged
+        Host header into a shell), only a JSON body, and only this server's own page as
+        Origin, whatever --cors-origin allows for the API."""
+        if not file_tools.ENABLED or action not in file_tools.ACTIONS:
+            raise APIError(404, "Not found.", None, "not_found")
+        origin = self.headers.get("Origin")
+        if (self.client_address[0] not in file_tools.LOOPBACK
+                or not (self.headers.get("Content-Type") or "").startswith("application/json")
+                or (origin is not None and origin != "http://" + self.headers.get("Host", ""))):
+            raise APIError(403, "The file tools answer only this server's own page on this machine.",
+                           None, "forbidden")
+        try:
+            result = file_tools.ACTIONS[action](body)
+        except (OSError, ValueError) as error:
+            raise APIError(400, f"{type(error).__name__}: {error}", None, "file_tool_error")
+        self.send_json(200, result, request_id)
 
     # ---------------------------------------------------------------- il canale di scoring
     #

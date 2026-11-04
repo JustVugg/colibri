@@ -156,6 +156,62 @@ describe("context compaction", () => {
   })
 })
 
+describe("tool calls", () => {
+  /* The gateway returns a model's calls in OpenAI's streamed shape whatever its
+     native format: the id and name once, the arguments in pieces, keyed by index. */
+  const toolStream = () => new Response(
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"read_file","arguments":""}}]}}]}\n\n'
+    + 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"path\\":"}}]}}]}\n\n'
+    + 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"a.py\\"}"}}]}}]}\n\n'
+    + 'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+    + "data: [DONE]\n\n",
+    { headers: { "content-type": "text/event-stream" } },
+  )
+  const tools = [{ type: "function" as const, function: { name: "read_file", description: "read", parameters: {} } }]
+
+  it("assembles the streamed pieces into whole calls", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(toolStream()))
+    const result = await streamChat({
+      baseUrl: "http://localhost:8000/v1", apiKey: "", model: "test-model", messages: [], tools,
+      temperature: 0, enableThinking: false, signal: new AbortController().signal, onDelta: () => undefined,
+    })
+    expect(result.toolCalls).toEqual([{ id: "call_a", name: "read_file", arguments: '{"path":"a.py"}' }])
+    expect(result.finishReason).toBe("tool_calls")
+  })
+
+  it("offers the tools and sends calls and results back in the OpenAI shape", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response("data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } }))
+    vi.stubGlobal("fetch", fetchMock)
+    const call = { id: "call_a", name: "read_file", arguments: '{"path":"a.py"}' }
+    await streamChat({
+      baseUrl: "http://localhost:8000/v1", apiKey: "", model: "test-model", tools,
+      messages: [
+        { id: "1", role: "assistant", content: "", toolCalls: [call] },
+        { id: "2", role: "tool", content: "print(1)", toolCallId: "call_a", toolName: "read_file", toolLabel: "read_file a.py" },
+      ],
+      temperature: 0, enableThinking: false, signal: new AbortController().signal, onDelta: () => undefined,
+    })
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body)
+    expect(body.tools).toEqual(tools)
+    expect(body.tool_choice).toBe("auto")
+    expect(body.messages).toEqual([
+      { role: "assistant", content: "", tool_calls: [{ id: "call_a", type: "function", function: { name: "read_file", arguments: '{"path":"a.py"}' } }] },
+      { role: "tool", content: "print(1)", tool_call_id: "call_a", name: "read_file" },
+    ])
+  })
+
+  it("sends no tools when none are offered", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response("data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } }))
+    vi.stubGlobal("fetch", fetchMock)
+    await streamChat({
+      baseUrl: "http://localhost:8000/v1", apiKey: "", model: "test-model", messages: [],
+      temperature: 0, enableThinking: false, signal: new AbortController().signal, onDelta: () => undefined,
+    })
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body)
+    expect("tools" in body || "tool_choice" in body).toBe(false)
+  })
+})
+
 describe("reasoning stream", () => {
   /* The server puts thinking on delta.reasoning_content (openai_server.py,
      22 call sites). #1148 / #1153 / #1156 taught the dashboard to read that
