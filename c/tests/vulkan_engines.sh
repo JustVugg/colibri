@@ -1873,6 +1873,19 @@ qwen36_gguf_chain_gates() {
     { cat vk.log; fail "chain qwen36 GGUF hybrid: the probe did not see the frame pass the event"; }
   grep -q "hybrid layer steps (frames A/B/C, by timelines), [1-9]" vk.log ||
     { cat vk.log; fail "chain qwen36 GGUF hybrid: the steps stayed on the events the frame does not wait for"; }
+  # AMD's own driver leaves the events off unprobed (#2583: a Radeon RX 9060 XT on it answered in
+  # loops with them and soundly without; COLI_VK_TEST_AMD_OWN=1 takes any driver for it): the
+  # steps on the timelines with the CPU's tokens, and COLI_VK_HYBRID_EVENTS=1 the events again
+  CPUENV=GQ_EXACT=1 dmoe_gate qwen36 "chain qwen36 GGUF hybrid, AMD's own driver" all GQ_EXACT=1 \
+    COLI_VK_TIER_GB=0.0004 COLI_VK_TIER_HOST=1 COLI_VK_TEST_AMD_OWN=1 SNAP=qwen36_gguf_tiny -- 8 8 qwen36_gguf_tiny/ref.json
+  grep -q "the hybrid steps run on the timelines on AMD's own driver" vk.log ||
+    { cat vk.log; fail "chain qwen36 GGUF hybrid: AMD's own driver kept the events"; }
+  grep -q "hybrid layer steps (frames A/B/C, by timelines), [1-9]" vk.log ||
+    { cat vk.log; fail "chain qwen36 GGUF hybrid: no step on the timelines on AMD's own driver"; }
+  CPUENV=GQ_EXACT=1 dmoe_gate qwen36 "chain qwen36 GGUF hybrid, AMD's own driver, the events asked for" all GQ_EXACT=1 \
+    COLI_VK_TIER_GB=0.0004 COLI_VK_TIER_HOST=1 COLI_VK_TEST_AMD_OWN=1 COLI_VK_HYBRID_EVENTS=1 SNAP=qwen36_gguf_tiny -- 8 8 qwen36_gguf_tiny/ref.json
+  grep -q "hybrid layer steps (in the frame, on events), [1-9]" vk.log ||
+    { cat vk.log; fail "chain qwen36 GGUF hybrid: COLI_VK_HYBRID_EVENTS=1 did not bring the events back"; }
   # the host pool within the driver's heap for it (#2314: Windows leaves about half the RAM,
   # and the blocks past it were refused): a heap whose room past the 2 GiB the staging keeps
   # holds a few experts, the pool takes those, the engine's cache keeps the rest (and so the
