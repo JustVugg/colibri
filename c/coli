@@ -1701,6 +1701,7 @@ def cmd_tune(a):
             profile_dir=a.profile_dir,
             prompts=prompts,
             explicit_resources=explicit_resources,
+            engine_args=dsv4_engine_args(a,arch),
             progress=lambda message: print(f"  {C.dim}· {message}{C.r}",flush=True),
         )
     except (OSError,ValueError,RuntimeError,subprocess.SubprocessError) as error:

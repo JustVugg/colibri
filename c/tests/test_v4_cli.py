@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -143,11 +144,11 @@ class V4CliTest(unittest.TestCase):
         self.assertEqual(env["CTX"], "4096")
 
     def test_native_v4_serve_flags_are_forwarded(self):
-        args = argparse.Namespace(gpu="none", vram=8, workload="prefill",
+        args = argparse.Namespace(gpu="none", vram=5, workload="prefill",
                                   backend="vulkan")
         self.assertEqual(
             self.cli.dsv4_engine_args(args, "deepseek_v4"),
-            ["--gpu", "none", "--vram", "8", "--workload", "prefill",
+            ["--gpu", "none", "--vram", "5", "--workload", "prefill",
              "--backend", "vulkan"],
         )
         self.assertEqual(self.cli.dsv4_engine_args(args, "qwen36"), [])
@@ -155,7 +156,7 @@ class V4CliTest(unittest.TestCase):
     def test_v4_vram_does_not_become_the_gguf_budget(self):
         args = argparse.Namespace(
             ngen=8, temp=None, ram=0, ctx=0, model="models/v4",
-            gpu=None, vram=8, workload=None,
+            gpu=None, vram=5, workload=None,
         )
         with mock.patch.object(self.cli, "dsv4_cuda_available", return_value=True):
             env = self.cli.env_for_engine(args, "deepseek_v4")
@@ -369,6 +370,43 @@ class V4CliTest(unittest.TestCase):
             self.assertEqual(captured["command"][at + 1], "32.000")
         finally:
             directory.cleanup()
+
+    def test_tune_forwards_native_v4_placement_to_every_engine_launch(self):
+        args = argparse.Namespace(
+            model="model", tokens=4, timeout=5, min_gain=0.03,
+            repeats=1, prompt="prompt", rotate_prompt=None, ram=0, ctx=0,
+            gpu=None, vram=5, policy="quality", kv_slots=1, cap=None,
+            profile_dir="/tmp", workload="decode", backend="hip",
+        )
+        family = types.SimpleNamespace(
+            id="deepseek_v4", modality="text", has_gateway_adapter=True,
+            display_name="DeepSeek V4",
+        )
+        captured = {}
+
+        def fake_run_tune(*call_args, **call_kwargs):
+            captured.update(call_kwargs)
+            return {"accepted": False}, "/tmp/profile.json"
+
+        with mock.patch.object(self.cli, "need_model"), \
+             mock.patch.object(self.cli, "resolve_model",
+                               return_value=types.SimpleNamespace(descriptor=family)), \
+             mock.patch.object(self.cli, "engine_for",
+                               return_value="/engines/deepseek_v4"), \
+             mock.patch.object(self.cli, "resource_request",
+                               return_value=(0, 4096, None, 5)), \
+             mock.patch("resource_plan.build_plan",
+                               return_value={"tiers": {"ram": {"cache_slots_per_layer": 16}}}), \
+             mock.patch.object(self.cli, "env_for_engine", return_value={}), \
+             mock.patch.object(self.cli, "operator_cap", return_value=None), \
+             mock.patch.object(self.cli, "banner"), \
+             mock.patch.object(self.cli, "tuning_replay_prompt",
+                               side_effect=lambda _family, prompt: prompt), \
+             mock.patch("autotune.run_tune", side_effect=fake_run_tune):
+            self.cli.cmd_tune(args)
+
+        self.assertEqual(captured["engine_args"],
+                         ["--vram", "5", "--workload", "decode", "--backend", "hip"])
 
     def test_openai_renderer_uses_native_v4_multiturn_template(self):
         import openai_server

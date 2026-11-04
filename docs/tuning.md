@@ -158,6 +158,9 @@ V4 receives a whole-process `RAM_GB` ceiling; Kimi receives `K3_EXPERT_GB` under
 its unchanged whole-process ceiling. The sweep never changes weights,
 quantization, router decisions, `TOPK`, `TOPP`, or sampling. Add repeatable
 `--rotate-prompt` options to replace the secondary built-in workload prompt.
+On native V4 the placement flags (`--gpu`, `--vram`, `--workload`, `--backend`)
+are passed to every tuning engine launch, so the measured profile belongs to the
+same VRAM budget the plan resolved.
 
 A candidate is saved only when median throughput improves by at least 3% while
 expert hit rate remains within 0.5 percentage points and reported TTFT/p99
