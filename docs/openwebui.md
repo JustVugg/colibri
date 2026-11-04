@@ -56,6 +56,7 @@ go in `~/.local/share/colibri/gateway.json` (`--config` for another path):
       "params": "125B",
       "ctx": 16384,
       "kv_slots": 1,
+      "think": "low",
       "args": ["--cap", "8"],
       "env": {"COLI_VULKAN": "1", "Q38_EXPERT_INT4": "1"}
     }
@@ -68,7 +69,11 @@ context the serve starts with (`--ctx`; unset, the serve takes what the RAM allo
 on a 94 GB box was 65536 tokens and 7 GB of state taken from Qwen3.8's host pool),
 `kv_slots` the conversations served at once (`--kv-slots`, the gateway's `--kv-slots` when
 unset), `args` extra `coli serve` arguments, `env` the environment of that engine (added
-to the gateway's own). Qwen3.8 wants `"kv_slots": 1`: with two slots the engine keeps its
+to the gateway's own). `think` is the model's thinking when a request says nothing about it (Open WebUI sends no
+`think` unless its reasoning toggle is used): `"low"`, `"medium"`, `"high"`, `true` or
+`false`; a request's own `think` wins. Without it Qwen3.8 follows its template and thinks
+at the highest effort on every question (one answer in a test ran to 5930 tokens);
+`"think": "low"` keeps the reasoning short. Qwen3.8 wants `"kv_slots": 1`: with two slots the engine keeps its
 Vulkan dense chain off (one conversation's state on the device), and decode fell from 15
 to 6 tok/s on the RTX 3070; Qwen3.6's chain serves two slots. `default` is the model loaded at
 start (`--no-preload` skips that) and the one used when a request names none. Models

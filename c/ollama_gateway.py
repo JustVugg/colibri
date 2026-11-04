@@ -166,6 +166,23 @@ def ollama_options_to_openai(options, dropped=None):
     return out
 
 
+THINK_VALUES = (True, False, "low", "medium", "high")
+
+
+def apply_think_default(body, default):
+    """A model's `think` from gateway.json, for a request that says nothing about thinking.
+    Qwen3.8's template thinks at xhigh unless told otherwise, and Open WebUI tells nothing:
+    `"think": "low"` in the model's entry keeps its answers short; `false` turns it off.
+    An explicit `think` in the request always wins."""
+    if default is None or not isinstance(body, dict) or body.get("think") is not None:
+        return body
+    if default not in THINK_VALUES:
+        raise GatewayError(500, f"gateway.json: think must be true, false, \"low\", \"medium\" or \"high\", not {default!r}")
+    body = dict(body)
+    body["think"] = default
+    return body
+
+
 def ollama_chat_to_openai(body, model_id):
     """POST /api/chat's body as POST /v1/chat/completions' body. `model_id` is the id the
     child serves (the request's name may be an alias). Returns (openai_body, dropped_options)."""
@@ -639,7 +656,7 @@ class ModelRegistry:
                              "digest": "sha256:" + hashlib.sha256(path.encode()).hexdigest(),
                              "args": list(spec.get("args") or []), "env": dict(spec.get("env") or {}),
                              "context_length": spec.get("ctx"), "kv_slots": spec.get("kv_slots"),
-                             "license": spec.get("license", "")}
+                             "think": spec.get("think"), "license": spec.get("license", "")}
         self.entries = entries
         self.aliases = {}
         for name, spec in cfg_models.items():
@@ -1180,6 +1197,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         m.ensure(entry)
         load_seconds = time.time() - t_load if time.time() - t_load > 0.5 else 0.0
         model_id = m.current
+        body = apply_think_default(body, entry.get("think"))
         if generate:
             req, raw, dropped = ollama_generate_to_openai(body, model_id)
             cpath = "/v1/completions" if raw else "/v1/chat/completions"
