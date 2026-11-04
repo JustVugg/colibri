@@ -337,6 +337,11 @@ GPU fill branch and the CPU branch using bandwidths measured at runtime, and
 `COLI_CUDA_MOE_DOUBLE=1` (on top of `COLI_CUDA_MOE_BATCH=1`) prefetches the next
 layer's full expert set into a second VRAM bank while the current layer
 computes, falling back to the single bank when VRAM is short.
+On the 8 GB RX 7600M XT (gfx1102), 16 greedy tokens at `RAM_GB=36`, hybrid was
+not a win: `--vram 5` matched the first run and gained 15% only on the warmed
+second (2.25 → 2.60 tok/s), while `--vram 6/7` were slower with hybrid on
+(2.22 → 2.11 and 2.21 → 1.98 tok/s); output was identical. It therefore stays
+off by default.
 
 ### Expert-pruned checkpoints (REAP) and the generic kernels
 
