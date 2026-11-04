@@ -1093,8 +1093,10 @@ int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
 int coli_v4_gpu_expert_attach(ColiExpertStore *store, ColiExpertView *view);
 /* lookup-only twin: reports residency, never uploads (hybrid q* split) */
 int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view);
-/* DSV4_HYBRID=1 gate plus its cross-unit counters/EMAs: defined in the block
- * unit, read by the serve unit's per-turn stderr line. */
+/* The plan's decode split (V4GpuPlan.hybrid) plus its cross-unit
+ * counters/EMAs: defined in the block unit, read by the serve unit's
+ * per-turn stderr line. */
+extern int g_v4_gpu_plan_hybrid;
 int coli_v4_hybrid_enabled(void);
 /* async attach (enqueue only; drain closes the pipeline before compute) */
 int coli_v4_gpu_expert_attach_async(ColiExpertStore *store,

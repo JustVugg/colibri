@@ -52,6 +52,10 @@ static void check_plan(const V4GpuPlanRequest *r, const V4GpuPlan *p,
     snprintf(what, sizeof(what), "%s: mirrors zero or >= 8", label);
     check(p->mirror_slots == 0 || p->mirror_slots >= V4_GPU_PLAN_MIN_MIRRORS,
           what, (int)(r->budget_bytes / GIB), r->workload, r->n_experts);
+    snprintf(what, sizeof(what), "%s: hybrid only on a live decode cache", label);
+    check(p->hybrid == (r->workload == V4_GPU_WORKLOAD_DECODE &&
+                        p->mirror_slots >= V4_GPU_PLAN_MIN_MIRRORS),
+          what, (int)(r->budget_bytes / GIB), r->workload, r->n_experts);
 }
 
 int main(void) {

@@ -5429,19 +5429,16 @@ static int profiled_expert_load_finish(ExpertLoadHandle *handle) {
 }
 
 #ifdef COLI_V4_GPU_TIER
-/* DSV4_HYBRID=1 (opt-in): on a decode miss, split the missing experts between
- * a PCIe-fill set (upload, compute on GPU with the residents) and a host set
- * (compute on CPU) instead of today's all-or-nothing, sized by the q* policy
- * in deepseek_v4_hybrid.h from live bandwidth EMAs. Off by default until the
- * split is validated on real GPUs; when off, the engine byte-for-byte keeps
- * its historical behaviour. */
+/* On a decode miss, split the missing experts between a PCIe-fill set
+ * (upload, compute on GPU with the residents) and a host set (compute on CPU)
+ * instead of all-or-nothing, sized by the q* policy in deepseek_v4_hybrid.h
+ * from live bandwidth EMAs. The split is decided by V4GpuPlan.hybrid (one plan
+ * for every VRAM tier), not by an environment switch. The planner sets it for
+ * a GPU decode plan with a live mirror cache; prefill and CPU plans leave it
+ * off. */
+int g_v4_gpu_plan_hybrid = -1;
 int coli_v4_hybrid_enabled(void) {
-    static int on = -1;
-    if (on < 0) {
-        const char *setting = getenv("DSV4_HYBRID");
-        on = setting && atoi(setting) != 0;
-    }
-    return on;
+    return g_v4_gpu_plan_hybrid > 0;
 }
 /* Non-static on purpose: the serve unit prints these counters, and under the
  * per-unit amalgam build that is a different object file. */
@@ -11708,6 +11705,7 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
         engine->gpu.plan_mirror_slots = active.mirror_slots;
         engine->gpu.plan_reserve_bytes = active.reserve_bytes;
         g_v4_gpu_plan_bank = active.bank;
+        g_v4_gpu_plan_hybrid = active.hybrid;
         g_v4_gpu_plan_reserve_mb = active.reserve_bytes >> 20;
         if (!getenv("COLI_CUDA_ATTN_BATCH"))
             coli_v4_gpu_attn_default = active.attn;
@@ -12167,6 +12165,7 @@ static void v4_gpu_apply_plan(ColiV4Engine *engine, const V4GpuPlan *plan) {
     engine->gpu.plan_mirror_slots = plan->mirror_slots;
     engine->gpu.plan_reserve_bytes = plan->reserve_bytes;
     g_v4_gpu_plan_bank = plan->bank;
+    g_v4_gpu_plan_hybrid = plan->hybrid;
     g_v4_gpu_plan_reserve_mb = plan->reserve_bytes >> 20;
     if (!getenv("COLI_CUDA_ATTN_BATCH"))
         coli_v4_gpu_attn_default = plan->attn;

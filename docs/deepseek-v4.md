@@ -331,17 +331,13 @@ first request runs at the warm speed instead of climbing as the cache fills one
 miss at a time (#2109), and the start takes as long as the disk needs to read
 the cache. `COLI_V4_PREWARM=0` starts with it empty.
 
-Two opt-in GPU levers are looking for community numbers, both default off and
-byte-identical when unset: `DSV4_HYBRID=1` splits VRAM-tier misses between the
-GPU fill branch and the CPU branch using bandwidths measured at runtime, and
-`COLI_CUDA_MOE_DOUBLE=1` (on top of `COLI_CUDA_MOE_BATCH=1`) prefetches the next
-layer's full expert set into a second VRAM bank while the current layer
-computes, falling back to the single bank when VRAM is short.
-On the 8 GB RX 7600M XT (gfx1102), 16 greedy tokens at `RAM_GB=36`, hybrid was
-not a win: `--vram 5` matched the first run and gained 15% only on the warmed
-second (2.25 → 2.60 tok/s), while `--vram 6/7` were slower with hybrid on
-(2.22 → 2.11 and 2.21 → 1.98 tok/s); output was identical. It therefore stays
-off by default.
+The decode split is part of the VRAM plan (`V4GpuPlan.hybrid`), not an
+environment switch: a GPU decode plan with a live mirror cache splits VRAM-tier
+misses between the GPU fill branch and the CPU branch using bandwidths measured
+at runtime; prefill and CPU plans leave it off. `COLI_CUDA_MOE_DOUBLE=1` (on top
+of `COLI_CUDA_MOE_BATCH=1`) prefetches the next layer's full expert set into a
+second VRAM bank while the current layer computes, falling back to the single
+bank when VRAM is short.
 
 ### Expert-pruned checkpoints (REAP) and the generic kernels
 

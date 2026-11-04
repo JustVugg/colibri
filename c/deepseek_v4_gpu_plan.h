@@ -46,6 +46,7 @@ typedef struct {
     int bank;                /* prefill bank enabled */
     int attn;                /* batched prefill attention on the device */
     int mirror_slots;        /* decode mirror cache capacity */
+    int hybrid;              /* decode: split misses between upload and host */
     long long reserve_bytes; /* KV + allocator headroom, kept out of tiers */
     long long used_bytes;    /* dense + shared + bank + mirrors + reserve */
     int phase;               /* the workload the plan was built for */
@@ -72,6 +73,7 @@ static inline V4GpuPlan v4_gpu_plan_decide(const V4GpuPlanRequest *request) {
     plan.bank = 0;
     plan.attn = 0;
     plan.mirror_slots = 0;
+    plan.hybrid = 0;
     plan.reserve_bytes = 0;
     plan.used_bytes = 0;
     plan.phase = V4_GPU_WORKLOAD_DECODE;
@@ -185,6 +187,11 @@ static inline V4GpuPlan v4_gpu_plan_decide(const V4GpuPlanRequest *request) {
         if (plan.mirror_slots < V4_GPU_PLAN_MIN_MIRRORS) plan.mirror_slots = 0;
         plan.used_bytes = reserve + (long long)plan.mirror_slots * mirror;
     }
+    /* The decode split is part of the placement decision, not a switch: a
+     * GPU decode plan with a live mirror set uses it; prefill and a CPU plan
+     * do not. This keeps the choice in one place for every VRAM size. */
+    plan.hybrid = phase == V4_GPU_WORKLOAD_DECODE &&
+                  plan.mirror_slots >= V4_GPU_PLAN_MIN_MIRRORS;
     return plan;
 }
 
