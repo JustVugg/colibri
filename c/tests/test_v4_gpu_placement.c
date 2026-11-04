@@ -28,7 +28,6 @@ int dsv4_cuda_device_unified(int device) { (void)device; return 0; }
 int dsv4_cuda_expert_bank_slots(int experts) { (void)experts; return 0; }
 long long dsv4_cuda_expert_bank_slot_bytes(int hidden, int intermediate) { (void)hidden; (void)intermediate; return 0; }
 void dsv4_cuda_activation_free(Dsv4CudaActivation *a) { (void)a; }
-void dsv4_cuda_expert_set_free(Dsv4CudaExpertSet *set) { (void)set; }
 long long dsv4_cuda_mem_free_mb(int device) { free_queries[device]++; return device == low_memory_device ? 0 : 32000; }
 int dsv4_cuda_stream_drain(int device) { drained[device]++; return device != 3; }
 void dsv4_cuda_tensor_free(Dsv4CudaTensor *t) { if (t) { live_tensors--; free(t); } }

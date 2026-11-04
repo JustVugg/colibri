@@ -5718,8 +5718,19 @@ static int moe_token_pipeline(float *output,
                               const ColiDeepSeekV4Config *config,
                               ColiExpertStore *store,
                               const float *input, int token) {
+    moe_reason_clear();
 #ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     double profile_moe_began = coli_v4_block_profile_now();
+#endif
+#if defined(COLI_V4_GPU_TIER) && !defined(COLI_V4_DISABLE_BF16_ROUTE)
+    int device_moe = coli_v4_gpu_resident_route(output, weights, config, store, input, token);
+    if (device_moe) {
+#ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
+        coli_v4_block_profile_add(COLI_V4_BLOCK_PROFILE_MOE_TOTAL,
+                                  coli_v4_block_profile_now() - profile_moe_began);
+#endif
+        return device_moe > 0 ? 0 : moe_fail("resident device routing failed");
+    }
 #endif
     int d = config->hidden_size;
     int n = config->n_routed_experts;
@@ -5758,7 +5769,6 @@ static int moe_token_pipeline(float *output,
 #endif
     const int64_t *table = value(weights, "ffn.gate.tid2eid", NULL);
     const float *bias = value(weights, "ffn.gate.bias", NULL);
-    moe_reason_clear();
     int result = token < 0 || token >= config->vocab_size;
     if (result) moe_fail("layer %d: token %d is outside the vocabulary of %d",
                          weights->plan.layer, token, config->vocab_size);
@@ -12297,6 +12307,8 @@ struct V4GpuExpertMirrorCache {
     int device;
     int first_layer, end_layer;
     int experts_per_layer; /* nonzero: immutable, directly indexed resident table */
+    Dsv4CudaExpertSet **route_sets; /* borrowed weights, owned descriptor tables */
+    int route_announced;
     long long last_free_mb;
     unsigned probes;
     struct V4GpuExpertMirrorCache *next;
@@ -12330,6 +12342,11 @@ static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create(int device,
 static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache) {
     if (!cache) return;
     v4_gpu_expert_mirrors_free(cache->next);
+    if (cache->route_sets) {
+        for (int i = 0; i < cache->end_layer - cache->first_layer; i++)
+            dsv4_cuda_expert_set_free(cache->route_sets[i]);
+        free(cache->route_sets);
+    }
     for (int i = 0; i < cache->count; i++) {
         if (cache->entries[i].gate)
             dsv4_cuda_tensor_free(cache->entries[i].gate);
@@ -12798,6 +12815,96 @@ int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view) {
     }
     pthread_mutex_unlock(&cache->mutex);
     return -1;
+}
+
+/* Reuse resident device weights before starting any host expert loads.
+ * Hold the cache lock through the synchronous kernel so refill cannot
+ * invalidate a selected tensor. A partial hit leaves the normal loader intact. */
+int coli_v4_gpu_moe_resident(ColiExpertStore *store, int layer,
+    const int *ids, const float *weights, int count,
+    void *shared_gate, void *shared_up, void *shared_down,
+    float limit, float *output, const float *input) {
+    V4GpuExpertMirrorCache *cache = v4_gpu_expert_cache(store, layer);
+    if (!cache || count < 1 || count > 16 || !ids || !weights ||
+        !shared_gate || !shared_up || !shared_down || !output || !input)
+        return cache && cache->experts_per_layer ? -1 : 0;
+    Dsv4CudaTensor *gates[16], *ups[16], *downs[16];
+    pthread_mutex_lock(&cache->mutex);
+    for (int k = 0; k < count; k++) {
+        V4GpuExpertMirror *entry = v4_gpu_expert_find(cache, layer, ids[k]);
+        if (!entry || !entry->gate || !entry->up || !entry->down) {
+            pthread_mutex_unlock(&cache->mutex);
+            return cache->experts_per_layer ? -1 : 0;
+        }
+        gates[k] = entry->gate;
+        ups[k] = entry->up;
+        downs[k] = entry->down;
+        entry->clock = ++cache->clock;
+    }
+    int ok = dsv4_cuda_moe(gates, ups, downs, weights, count,
+        shared_gate, shared_up, shared_down, limit, output, input);
+    pthread_mutex_unlock(&cache->mutex);
+    /* Older backends may decline fusion; let the existing loader/group
+     * fallback handle that case, including overwriting any partial output. */
+    return ok ? 1 : cache->experts_per_layer ? -1 : 0;
+}
+
+/* Keep routing, sorted expert descriptors and MoE on the same device stream. */
+int coli_v4_gpu_resident_route(float *output,
+    const ColiDeepSeekV4LayerWeights *weights, const ColiDeepSeekV4Config *config,
+    ColiExpertStore *store, const float *input, int token) {
+    const char *setting = getenv("DSV4_CUDA_RESIDENT_ROUTE");
+    if ((setting && !atoi(setting)) || !weights || !config || !output || !input)
+        return 0;
+    const char *batched = getenv("DSV4_CUDA_BATCHED");
+    if (batched && !atoi(batched)) return 0;
+    V4GpuExpertMirrorCache *cache = v4_gpu_expert_cache(store, weights->plan.layer);
+    if (!cache || cache->experts_per_layer != 256 || config->num_experts_per_tok != 6)
+        return 0;
+    if (token < 0 || token >= config->vocab_size) return -1;
+    Dsv4CudaTensor *gate = coli_v4_layer_gpu(weights, "ffn.gate");
+    Dsv4CudaTensor *bias = coli_v4_layer_gpu(weights, "ffn.gate.bias");
+    Dsv4CudaTensor *sg = coli_v4_layer_gpu(weights, "ffn.shared_experts.w1");
+    Dsv4CudaTensor *su = coli_v4_layer_gpu(weights, "ffn.shared_experts.w3");
+    Dsv4CudaTensor *sd = coli_v4_layer_gpu(weights, "ffn.shared_experts.w2");
+    if (!gate || !sg || !su || !sd) return 0;
+    int fixed[6], *forced = NULL;
+    if (weights->plan.uses_hash_router) {
+        char key[96];
+        snprintf(key, sizeof(key), "layers.%d.ffn.gate.tid2eid", weights->plan.layer);
+        const int64_t *map = coli_v4_layer_data(weights, key, NULL);
+        if (!map) return -1;
+        for (int k = 0; k < 6; k++) {
+            int64_t id = map[(size_t)token * 6 + k];
+            if (id < 0 || id >= 256) return -1;
+            fixed[k] = (int)id;
+        }
+        forced = fixed;
+    } else if (!bias) return 0;
+    int layer = weights->plan.layer - cache->first_layer;
+    pthread_mutex_lock(&cache->mutex);
+    if (!cache->route_sets)
+        cache->route_sets = calloc((size_t)(cache->end_layer - cache->first_layer),
+                                   sizeof(*cache->route_sets));
+    if (!cache->route_sets) { pthread_mutex_unlock(&cache->mutex); return -1; }
+    if (!cache->route_sets[layer]) {
+        Dsv4CudaTensor *g[256], *u[256], *d[256];
+        for (int e = 0; e < 256; e++) {
+            V4GpuExpertMirror *entry = v4_gpu_expert_find(cache, weights->plan.layer, e);
+            g[e] = entry->gate; u[e] = entry->up; d[e] = entry->down;
+        }
+        cache->route_sets[layer] = dsv4_cuda_expert_set_create(g, u, d, 256, sg, su, sd);
+    }
+    int ok = cache->route_sets[layer] && dsv4_cuda_resident_route_moe(
+        cache->route_sets[layer], gate, bias, forced, config->routed_scaling_factor,
+        config->swiglu_limit, output, input);
+    if (ok && !cache->route_announced) {
+        fprintf(stderr, "v4_gpu resident-route=on device=%d\n", cache->device);
+        cache->route_announced = 1;
+    }
+    pthread_mutex_unlock(&cache->mutex);
+    /* An older DLL can decline the new optional entry point. */
+    return ok ? 1 : 0;
 }
 
 int coli_v4_gpu_dspark_expert_attach(void *cache, ColiExpertView *view) {
