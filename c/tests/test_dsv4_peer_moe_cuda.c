@@ -17,6 +17,13 @@
  * fallback could reach), and an all-on-primary call right after gives the
  * reference bytes (no stale error left behind).
  *
+ * ":sticky" injects the kind of error a real fault on the peer leaves (a
+ * launch failure, sticky for the process's CUDA: the F18 probe showed a
+ * __trap() on the peer takes device 0's context with it). The backend then
+ * latches CUDA off for the whole process: the failing call is refused,
+ * dsv4_cuda_lost turns 1, and every call after it, all-on-primary ones too,
+ * is refused without touching CUDA, so the engine takes its host paths.
+ *
  * The backend reads those variables once per process, so the test re-runs
  * itself once per scenario ("--child <name>"). Needs two devices with peer
  * access both ways (skips otherwise): DSV4_CUDA_DEVICE and
@@ -79,19 +86,27 @@ static int child(const char *mode){
         if(bad||!dsv4_cuda_peer_healthy(q))return 5;
         printf("%s (peer compute %s): all %d on-peer masks bit-identical to all-on-primary\n",mode,compute?"on":"off",1<<E);
     }else{
-        /* soft: the 3rd peer pass fails, the peer still answers; lost: the 1st one, the peer counts as lost */
-        int soft=!strcmp(mode,"soft");
+        /* soft: the 3rd peer pass fails, the peer still answers; lost: the 1st one, the peer counts as lost;
+         * sticky: the 1st one, with a sticky error */
+        int soft=!strcmp(mode,"soft"),stk=!strcmp(mode,"sticky");
         if(!compute){printf("SKIP: peer compute is off for devices %d and %d (DSV4_CUDA_BATCHED=0, or different SM versions)\n",p,q);dsv4_cuda_shutdown();return SKIP;}
         if(soft){for(int m=1;m<=2;m++){MASK(m);if(!dsv4_cuda_moe(g,u,d,wt,E,sg,su,sd,10.f,got,x)||!SAME()){fprintf(stderr,"soft: pass %d before the fault differs\n",m);return 6;}}}
         int fm=soft?0x2d:0x01;MASK(fm);memset(got,0,sizeof got);
         int r=dsv4_cuda_moe(g,u,d,wt,E,sg,su,sd,10.f,got,x);
         if(soft&&(!r||!SAME())){fprintf(stderr,"soft: the failing call returned %d, output %s all-on-primary\n",r,SAME()?"equal to":"differs from");return 6;}
-        if(!soft&&r){fprintf(stderr,"lost: the failing call claimed success\n");return 6;}
+        if(!soft&&r){fprintf(stderr,"%s: the failing call claimed success\n",mode);return 6;}
+        if(dsv4_cuda_lost()!=stk){fprintf(stderr,"%s: dsv4_cuda_lost() is %d after the fault (want %d)\n",mode,dsv4_cuda_lost(),stk);return 7;}
         if(dsv4_cuda_peer_healthy(q)||dsv4_cuda_peer_compute(p,q)||dsv4_cuda_peer_access(p,q)){
             fprintf(stderr,"%s: after the fault: healthy %d, compute %d, access %d (want 0 0 0)\n",mode,dsv4_cuda_peer_healthy(q),dsv4_cuda_peer_compute(p,q),dsv4_cuda_peer_access(p,q));return 7;}
         MASK(0x05);if(dsv4_cuda_moe(g,u,d,wt,E,sg,su,sd,10.f,got,x)){fprintf(stderr,"%s: a latched peer's tensors were used\n",mode);return 8;}
         if(dsv4_cuda_expert_group(gQ,uQ,dQ,wt,E,10.f,got,x)){fprintf(stderr,"%s: the expert group ran on the latched peer\n",mode);return 8;}
         if(dsv4_cuda_matvec_grouped(gQ[0],got,x,1)){fprintf(stderr,"%s: a matvec ran on the latched peer\n",mode);return 8;}
+        if(stk){
+            if(dsv4_cuda_moe(gP,uP,dP,wt,E,sg,su,sd,10.f,got,x)||dsv4_cuda_expert_group(gP,uP,dP,wt,E,10.f,got,x)||
+               dsv4_cuda_matvec_grouped(gP[0],got,x,1)||dsv4_cuda_mem_free_mb(p)>=0){fprintf(stderr,"sticky: a call on the primary ran after CUDA was lost\n");return 9;}
+            printf("sticky: failing call refused; CUDA lost for the process, every later call refused (host paths)\n");
+            dsv4_cuda_shutdown();return 0;
+        }
         memset(got,0,sizeof got);if(!dsv4_cuda_moe(gP,uP,dP,wt,E,sg,su,sd,10.f,got,x)||!SAME()){fprintf(stderr,"%s: all-on-primary after the latch differs\n",mode);return 9;}
         if(!dsv4_cuda_expert_group(gP,uP,dP,wt,E,10.f,got,x)){fprintf(stderr,"%s: the expert group on the primary failed after the latch\n",mode);return 9;}
         if(!dsv4_cuda_matvec_grouped(gP[0],got,x,1)){fprintf(stderr,"%s: a matvec on the primary failed after the latch\n",mode);return 9;}
@@ -104,7 +119,7 @@ static int child(const char *mode){
 int main(int argc,char **argv){
     if(argc>2&&!strcmp(argv[1],"--child"))return child(argv[2]);
     static const struct { const char *mode,*compute,*fault; int latch; } runs[]={
-        {"compute",NULL,NULL,0},{"inplace","0",NULL,0},{"soft",NULL,"3",1},{"lost",NULL,"1:lost",1}};
+        {"compute",NULL,NULL,0},{"inplace","0",NULL,0},{"soft",NULL,"3",1},{"lost",NULL,"1:lost",1},{"sticky",NULL,"1:sticky",1}};
     /* the context only loads the kernels this test launches */
     if(!getenv("CUDA_MODULE_LOADING"))env_set("CUDA_MODULE_LOADING","LAZY");
     for(size_t k=0;k<sizeof runs/sizeof*runs;k++){
@@ -117,7 +132,7 @@ int main(int argc,char **argv){
         if(st==SKIP){const char*why=strstr(out,"SKIP");printf("  %s: %s",runs[k].mode,why?why:"SKIP\n");if(k==0){puts("dsv4 peer MoE: SKIP");return 0;}continue;}
         int latches=0;for(const char*s=out;(s=strstr(s,"latched off"))!=NULL;s++)latches++;
         if(st||latches!=runs[k].latch){fprintf(stderr,"%s: status %d, %d latch line(s) (want %d):\n%s",runs[k].mode,st,latches,runs[k].latch,out);return 1;}
-        for(char*line=out,*nl;*line;line=nl?nl+1:line+strlen(line)){nl=strchr(line,'\n');if(nl)*nl=0;if(strstr(line,"latched off")||strstr(line,"bit-identical")||strstr(line,"refused"))printf("  %s\n",line);}
+        for(char*line=out,*nl;*line;line=nl?nl+1:line+strlen(line)){nl=strchr(line,'\n');if(nl)*nl=0;if(strstr(line,"latched off")||strstr(line,"bit-identical")||strstr(line,"refused")||strstr(line,"lost for this process"))printf("  %s\n",line);}
     }
     puts("dsv4 peer MoE: OK");return 0;
 }
