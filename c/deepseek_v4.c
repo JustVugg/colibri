@@ -2516,12 +2516,14 @@ static int attention_token_impl(float *output,
     int scale_columns = (group_width + 127) / 128;
     int scale_rows_per_group = (o_rank + 127) / 128;
     if (!result) {
+        int grouped_on_gpu = 0;
 #ifdef COLI_V4_GPU_TIER
-        if (wo_a.gpu) {
-            result = coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups);
-        } else
+        /* A refusal (CUDA lost after a sticky fault, F18) falls through to
+         * the CPU groups below, like coli_fp8_matvec_ref's own fallback. */
+        grouped_on_gpu = wo_a.gpu &&
+            coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups) == 0;
 #endif
-        for (int group = 0; group < groups; group++) {
+        for (int group = 0; !grouped_on_gpu && group < groups; group++) {
             ColiTensorView group_view = wo_a;
             group_view.rows = o_rank;
             group_view.columns = group_width;
@@ -2962,12 +2964,14 @@ static int attention_token_impl(float *output,
     int scale_columns = (group_width + 127) / 128;
     int scale_rows_per_group = (o_rank + 127) / 128;
     if (!result) {
+        int grouped_on_gpu = 0;
 #ifdef COLI_V4_GPU_TIER
-        if (wo_a.gpu) {
-            result = coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups);
-        } else
+        /* A refusal (CUDA lost after a sticky fault, F18) falls through to
+         * the CPU groups below, like coli_fp8_matvec_ref's own fallback. */
+        grouped_on_gpu = wo_a.gpu &&
+            coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups) == 0;
 #endif
-        for (int group = 0; group < groups; group++) {
+        for (int group = 0; !grouped_on_gpu && group < groups; group++) {
             ColiTensorView group_view = wo_a;
             group_view.rows = o_rank;
             group_view.columns = group_width;
@@ -5109,20 +5113,28 @@ static int block_token_impl(float *output_hc,
         return set_error(error, error_size, "out of memory in block");
     }
     memcpy(residual, input_hc, hd * sizeof(*residual));
+    /* the stage that failed, for the error (the request's only report) */
+    const char *stage = "attention hyper-connection";
+    if (error && error_size) error[0] = 0;
     int result = normalized_hc_pre(reduced, post, comb, normalized, input_hc,
                                    weights, config, "attn", "attn_norm.weight");
+    if (!result) stage = "attention";
     if (!result) result = attention
         ? coli_v4_attention_window_token_ref(branch, attention, weights, config,
                                              normalized, position, error, error_size)
         : coli_v4_attention_token_ref(branch, weights, config, normalized,
                                       position, error, error_size);
+    if (!result) stage = "attention hyper-connection post";
     if (!result) result = coli_v4_hc_post(state, branch, residual, post, comb, hc, d);
     if (!result) coli_bf16_round_array(state, hd);
 
     if (!result) memcpy(residual, state, hd * sizeof(*residual));
+    if (!result) stage = "FFN hyper-connection";
     if (!result) result = normalized_hc_pre(reduced, post, comb, normalized, state,
                                             weights, config, "ffn", "ffn_norm.weight");
+    if (!result) stage = "MoE";
     if (!result) result = moe_token(branch, weights, config, experts, normalized, token);
+    if (!result) stage = "FFN hyper-connection post";
     if (!result) result = coli_v4_hc_post(output_hc, branch, residual, post, comb, hc, d);
     if (!result) coli_bf16_round_array(output_hc, hd);
 
@@ -5132,7 +5144,14 @@ static int block_token_impl(float *output_hc,
     if (moe_reason()[0])
         return set_error(error, error_size, "block computation failed in MoE: %s",
                          moe_reason());
-    return set_error(error, error_size, "block computation failed");
+    if (error && error_size && error[0]) {
+        char inner[256];
+        snprintf(inner, sizeof inner, "%s", error);
+        return set_error(error, error_size, "block computation failed in %s, layer %d: %s",
+                         stage, weights->plan.layer, inner);
+    }
+    return set_error(error, error_size, "block computation failed in %s, layer %d",
+                     stage, weights->plan.layer);
 }
 
 int coli_v4_block_token_ref(float *output_hc,
@@ -6164,6 +6183,7 @@ static int moe_token_pipeline(float *output,
                 downs[i] = views[i].down.gpu;
             }
             int peer_up = coli_v4_gpu_peer_pool_up();
+            extern int dsv4_cuda_lost(void);
             if (moe_ok) {
                 extern int dsv4_cuda_moe(
                     void *const *gate, void *const *up, void *const *down,
@@ -6174,15 +6194,16 @@ static int moe_token_pipeline(float *output,
                     selected, sg, su, sd, config->swiglu_limit,
                     expert_output, input)) moe_ok = 0;
             }
-            if (!moe_ok && peer_up && !coli_v4_gpu_peer_pool_up()) {
+            if (!moe_ok && ((peer_up && !coli_v4_gpu_peer_pool_up()) || dsv4_cuda_lost())) {
                 /* The peer GPU failed under this call and its memory is no
                  * longer read (when it still could be, dsv4_cuda_moe already
-                 * recomputed those experts on the primary and succeeded):
-                 * compute the routed experts from host data on the CPU, as
-                 * the path without GPU compute does. Its mirrors are misses
-                 * from the next lookup on. The views drop their mirror
-                 * handles: coli_v4_expert_forward_ref would otherwise hand
-                 * the peer's back to the backend's matvec. */
+                 * recomputed those experts on the primary and succeeded), or
+                 * a sticky fault took CUDA itself (dsv4_cuda_lost): compute
+                 * the routed experts from host data on the CPU, as the path
+                 * without GPU compute does. Their mirrors are misses from
+                 * the next lookup on. The views drop their mirror handles:
+                 * coli_v4_expert_forward_ref would otherwise hand them back
+                 * to the backend's matvec. */
                 result = v4_views_fetch_host(store, views, leased, selected,
                                              weights->plan.layer, fetch,
                                              jobs, loaders, loader_active, dec);
@@ -6474,26 +6495,34 @@ static int block_token_pipeline(float *output_hc,
     }
 #define DP_MARK(acc) do { if (dprof) { clock_gettime(CLOCK_MONOTONIC, &dp1); acc += (dp1.tv_sec - dp0.tv_sec) + (dp1.tv_nsec - dp0.tv_nsec) * 1e-9; dp0 = dp1; } } while (0)
     if (dprof) clock_gettime(CLOCK_MONOTONIC, &dp0);
+    /* the stage that failed, for the error (the request's only report) */
+    const char *stage = "attention hyper-connection";
+    if (error && error_size) error[0] = 0;
     int result = normalized_hc_pre(reduced, post, comb, normalized, input_hc,
                                    weights, config, "attn", "attn_norm.weight");
     DP_MARK(dp_hc);
+    if (!result) stage = "attention";
     if (!result) result = attention
         ? coli_v4_attention_window_token_ref(branch, attention, weights, config,
                                              normalized, position, error, error_size)
         : coli_v4_attention_token_ref(branch, weights, config, normalized,
                                       position, error, error_size);
     DP_MARK(dp_attn);
+    if (!result) stage = "attention hyper-connection post";
     if (!result) result = coli_v4_hc_post(state, branch, residual,
                                           post, comb, hc, d);
     if (!result) coli_bf16_round_array(state, hd);
     if (!result) memcpy(residual, state, hd * sizeof(*residual));
+    if (!result) stage = "FFN hyper-connection";
     if (!result) result = normalized_hc_pre(reduced, post, comb, normalized, state,
                                             weights, config, "ffn",
                                             "ffn_norm.weight");
     DP_MARK(dp_hc);
+    if (!result) stage = "MoE";
     if (!result) result = moe_token_pipeline(branch, weights, config, experts,
                                              normalized, token);
     DP_MARK(dp_moe);
+    if (!result) stage = "FFN hyper-connection post";
     if (!result) result = coli_v4_hc_post(output_hc, branch, residual,
                                           post, comb, hc, d);
     if (!result) coli_bf16_round_array(output_hc, hd);
@@ -6506,7 +6535,14 @@ static int block_token_pipeline(float *output_hc,
     if (moe_reason()[0])
         return set_error(error, error_size, "block computation failed in MoE: %s",
                          moe_reason());
-    return set_error(error, error_size, "block computation failed");
+    if (error && error_size && error[0]) {
+        char inner[256];
+        snprintf(inner, sizeof inner, "%s", error);
+        return set_error(error, error_size, "block computation failed in %s, layer %d: %s",
+                         stage, weights->plan.layer, inner);
+    }
+    return set_error(error, error_size, "block computation failed in %s, layer %d",
+                     stage, weights->plan.layer);
 }
 
 int coli_v4_block_token_ref(float *output_hc,
@@ -8515,12 +8551,14 @@ static int attention_token_impl(float *output,
     int scale_columns = (group_width + 127) / 128;
     int scale_rows_per_group = (o_rank + 127) / 128;
     if (!result) {
+        int grouped_on_gpu = 0;
 #ifdef COLI_V4_GPU_TIER
-        if (wo_a.gpu) {
-            result = coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups);
-        } else
+        /* A refusal (CUDA lost after a sticky fault, F18) falls through to
+         * the CPU groups below, like coli_fp8_matvec_ref's own fallback. */
+        grouped_on_gpu = wo_a.gpu &&
+            coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups) == 0;
 #endif
-        for (int group = 0; group < groups; group++) {
+        for (int group = 0; !grouped_on_gpu && group < groups; group++) {
             ColiTensorView group_view = wo_a;
             group_view.rows = o_rank;
             group_view.columns = group_width;
@@ -12741,7 +12779,7 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
 static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
                                             ColiExpertView *view, int sync,
                                             int grow_only) {
-    if (!cache || !view) return -1;
+    if (!cache || !view || dsv4_cuda_lost()) return -1;   /* no mirror after a sticky CUDA fault */
     if (view->gate.block_rows != 1 || view->up.block_rows != 1 ||
         view->down.block_rows != 1)
         return -1;
@@ -13089,7 +13127,9 @@ int coli_v4_gpu_expert_drain(ColiExpertStore *store) {
  * peer pool only on a primary miss. */
 int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view) {
     V4GpuExpertMirrorCache *peer = v4_peer_pool();   /* the only read here */
-    if (!store || !view || !store->gpu) return -1;
+    /* after a sticky CUDA fault no mirror is readable: every expert is a miss
+     * and the token takes host copies (dsv4_cuda_lost) */
+    if (!store || !view || !store->gpu || dsv4_cuda_lost()) return -1;
     if (v4_mirror_peek_cache((V4GpuExpertMirrorCache *)store->gpu, view) == 0)
         return 0;
     return v4_mirror_peek_cache(peer, view);
