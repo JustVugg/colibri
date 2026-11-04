@@ -122,6 +122,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Qwen3.8: memory that grew with every answer** (#2592). The expert loader reads a batch of
+  missing experts in parallel (on by default) with a team as large as the batch, and libgomp
+  ends the threads a smaller team leaves out and starts new ones for a larger. Each read
+  buffer was a thread's own (`static __thread`, an expert record each) and stayed behind
+  with the thread that ended: on Qwen3.8-Flash-Next IQ2_XS on the CPU, 3.4 GiB over a
+  512-token answer at 48 slots a layer, 3.5 GiB at 96, until the system ran out. The batch
+  now runs on the default team and the buffers go with their thread; the resident memory
+  stops at the expert cache (+3.33 GiB at 48 slots, +6.65 at 96) and the answers are the same.
+  With a card (CUDA, RTX PRO 4000) the threads it no longer starts at every batch count too:
+  decode 10.8 to 11.3 tok/s before, 14.7 to 15.3 now, the first token 6.0 s before, 4.9 now.
 - **Qwen3.8 with a card on an ARM host (DGX Spark, GH200, Jetson): the build.** The CUDA chain
   groups a verify's pooled slots of one expert by `GQ_FUSED_ROWS`, which only the x86 AVX2
   kernels defined, so `qwen38` with `CUDA=1` did not compile without them. Every build has it
