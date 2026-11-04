@@ -582,6 +582,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_CUDA_VRAM_RESERVE_MB` (600; with the bank 600 + the bank, x2 with `COLI_CUDA_MOE_DOUBLE=1`, + 64 mirrors, logged as `v4_gpu mirror-reserve=`) | VRAM kept free on each device while mirrors grow (bank + attention buffers; the default only from 32 live mirrors on, see [VRAM budget](#vram-budget-and-per-card-settings)); an explicit value is used as given |
 | `DSV4_CUDA_RESIDENT_RESERVE_MB` (2800, min 256) | VRAM kept free while resident experts preload and the exact head uploads; separate from the mirror-growth reserve above |
 | `DSV4_CUDA_RESIDENT_EXPERTS` (auto) | `auto` loads every routed expert when the budget fits and keeps the LRU cache on a budget refusal; `1` requires residency (a budget refusal or hard failure rejects engine open); `0` keeps the cache |
+| `DSV4_CUDA_RESIDENT_ROUTE` (1) | device-side routing/MoE for a complete 256-expert table; `0` host routing |
+| `DSV4_CUDA_BATCHED` (1) | batched BF16 routing path; `0` legacy |
 | `V4_MTP_GPU_MIRRORS` (16) | separate mirror cache for the MTP drafter |
 | `DSV4_CUDA_PIN_HOST` (1, `.cu`) | page-lock expert-cache slabs for DMA uploads |
 | `DSV4_CUDA_MOE_GROUPED` (1, `.cu`) | expert-grouped MoE GEMM rows; `0` = legacy replicated |
@@ -782,3 +784,25 @@ On six RTX 5090 GPUs, a short 64-token test measured 6.155 token/s median
 Preloading took about 73 seconds and increased total cold-process latency.
 See the [full report and raw results](experiments/dsv4-full-resident-2026-09-27.md)
 for the scope, startup cost, and remaining validation limits.
+
+### Device-resident routing (default with full residency)
+
+For the supported 256-expert/top-6 profile, the resident table also owns a small
+borrowed-weight CUDA descriptor table per layer. Routing, ascending expert-ID
+ordering, descriptor selection and MoE now execute on one device stream: there
+is one activation upload and one result download, without copying top-k results
+back to the host. The existing BF16 rounding and expert accumulation order are
+preserved; no extra input quantization is introduced.
+
+`DSV4_CUDA_RESIDENT_ROUTE=0` selects the previous host-routed path. The default
+uses device routing when the complete table exists. An older Windows DLL can
+decline the optional new entry point and retain the original path. Explicit
+`DSV4_CUDA_BATCHED=0` and builds disabling BF16 routing retain their original
+execution paths. Attention, mHC, layer boundaries and the output head are not
+made device-only by this change.
+
+The [device-routing validation](experiments/dsv4-device-route-2026-09-27.md)
+covers exact kernel parity, six-device default selection, single-device budget
+fallback, and the remaining Attention bottleneck. Measured short-request decode
+remains around 6.1–6.2 token/s; the route-only comparison is too small to claim a
+stable throughput gain.
