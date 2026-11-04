@@ -4505,13 +4505,20 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     ColiVkXbStats xs0; coli_vk_xb_stats(&xs0);
     const char *se0 = getenv("COLI_VK_TIER_STREAM");
     int can_stream = !(se0 && *se0 == '0') && T.c.load && T.c.release && xs0.gemm_rows > 0;
-    if (fit_raw < 4 && fit < all && can_stream && T.exp_bytes && !T.xmax && room >= 4.0 * (double)T.exp_bytes) {
+    /* the least is four experts of bytes, but the pool's block is page-rounded down
+     * (backend_vulkan.c: pool_suballoc's (limit - total) & ~4095): 4 x 26112 B = 102.0 KiB
+     * floors to 100 KiB and the fourth expert's upload is refused. Round the least up to
+     * the pool's page so the block holds the four the streaming path plans. */
+    double least_bl = 0;
+    if (T.exp_bytes)
+        least_bl = (double)((((size_t)(4.0 * (double)T.exp_bytes)) + 4095) & ~(size_t)4095);
+    if (fit_raw < 4 && fit < all && can_stream && T.exp_bytes && !T.xmax && room >= least_bl) {
         /* fewer experts than streaming's least (two residents, two staging slots), with the
          * device's room for that least: stream every cold expert through it, the budget
          * raised to it (#2183: a budget below one expert, set so that a test streams; below
          * two it turned the tier off, below four it left the cold experts on the CPU) */
         char hb[32], hn[32];
-        double least = 4.0 * (double)T.exp_bytes;
+        double least = least_bl;
         fprintf(stderr, VKT_TAG " tier %s: the budget (%s) holds fewer experts than streaming needs; %s for two residents "
                         "and two staging slots, every other expert streamed\n",
                 eng, human(want, hb, sizeof hb), human(least, hn, sizeof hn));
