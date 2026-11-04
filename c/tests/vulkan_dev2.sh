@@ -75,7 +75,14 @@ d2_case() {
     # fill in one order (the other engines do not read it). Measured on a desktop with
     # six busy loops beside it: balanced, 19 runs in 20 passed idle; balance off, 38 in 40
     # under load; both, 40 in 40, 3 copies given up in every run.
-    excl)   D2_SMALL=1; x=(COLI_VK_EXPERTS2=${D2_E2:-8} COLI_VK_TIER_BALANCE=0 V4_LOADER_LANES=1) ;;
+    excl)   D2_SMALL=1; x=(COLI_VK_EXPERTS2=${D2_E2:-8} COLI_VK_TIER_BALANCE=0 V4_LOADER_LANES=1)
+            # deepseek_v4 pins the standing issue/join path this case measures: the
+            # compute-site lever (the default where the engine wires its finish-site
+            # group, as deepseek_v4 does) computes decode's routed group on the device
+            # through zero-copy store-slab aliases, and within this two-slot case the RAM
+            # cache then never gives up a device expert's copy (the lever's own coverage
+            # is the compute-site cases of test_vk_tier)
+            [ "$eng" = deepseek_v4 ] && x+=(COLI_VK_TIER_EXPERTS=0) ;;
     noexcl) D2_SMALL=1; x=(COLI_VK_EXPERTS2=${D2_E2:-8} COLI_VK_TIER_EXCLUSIVE=0 COLI_VK_TIER_BALANCE=0 V4_LOADER_LANES=1) ;;
   esac
   $run cpu.tok cpu.log "$@"
