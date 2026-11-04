@@ -476,8 +476,9 @@ jobs:
           cache-dependency-path: ${{ matrix.req }}
       - name: Install the Vulkan toolchain, Lavapipe and the fixture dependencies
         run: |
-          # hard limits around apt (.github/scripts/apt-install.sh): see the vulkan job
-          bash .github/scripts/apt-install.sh libvulkan-dev glslc mesa-vulkan-drivers
+          # hard limits around apt (.github/scripts/apt-install.sh): see the vulkan job.
+          # vulkan-validationlayers: sync_gate's synchronization check (vulkan_engines.sh)
+          bash .github/scripts/apt-install.sh libvulkan-dev glslc mesa-vulkan-drivers vulkan-validationlayers
           pip install -r ${{ matrix.req }} ${{ matrix.extra }}
       - name: The pinned TypeScript SDK
         if: ${{ matrix.npm }}

@@ -504,6 +504,7 @@ static uint32_t kc_shared_limit(void) {
 #ifndef VKC_SANITIZED
 #define VKC_SANITIZED 0
 #endif
+static void ev_setup(void);
 int vkc_init(void) {
     if (KC.ready) return !KC.lost;
     if (!coli_vk_core_dev(g_kd, &KC.core)) return 0;
@@ -730,6 +731,7 @@ int vkc_init(void) {
     KC.ready = 1;
     KC.dummy = vkc_buf(256, VKC_DEV);
     if (!KC.dummy) { KC.ready = 0; return 0; }
+    ev_setup();
     return 1;
 }
 
@@ -2012,6 +2014,65 @@ static int ev_init(void) {
     return 1;
 }
 int vkc_ev_ready(void) { return ev_init(); }
+/* COLI_VK_TEST_EV_NOWAIT=1 (tests): a frame does not wait for the host's event, as a driver
+ * that lets it through: the probe must see it and the steps leave the events */
+static int ev_nowait(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("COLI_VK_TEST_EV_NOWAIT"); v = e && *e == '1'; }
+    return v;
+}
+/* Does a frame that waits for a host-set event really wait? A hybrid step's frame waits for
+ * the event the host sets once its experts are done, while that frame runs. The specification
+ * now asks for an event set before the frame that waits for it is submitted
+ * (VUID-vkSetEvent-event-09543), so a driver may let the frame through: the step's sum then
+ * reads the host's rows before the host wrote them, and the answers fall into loops (#2583: a
+ * Radeon RX 9060 XT on AMD's own driver; an RTX PRO 4000 made to skip the wait answered the
+ * same way). The probe, once, before any step: a frame writes 1, waits for the event, writes 2;
+ * the host sees the 1, waits 20 ms, and must still find the 1 before it sets the event. A
+ * frame that never starts in 2 s counts as a frame that does not wait. 0: the steps run on
+ * the timelines instead (vkc_ev_ready 0, COLI_VK_HYBRID_EVENTS=0's frames). */
+static int ev_probe(void) {
+    if (KC.cur >= 0 || KC.lost) return 0;
+    VkcBuf *b = vkc_buf(256, VKC_DOWN);
+    volatile uint32_t *v = b ? (volatile uint32_t *)vkc_ptr(b) : NULL;
+    if (!v) { if (b) vkc_free(b); return 0; }
+    v[0] = 0;
+    if (!vkc_begin()) { vkc_free(b); return 0; }
+    VkcFrame *f = open_frame();
+    VkMemoryBarrier toh = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                           .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+    VkMemoryBarrier fromh = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+                             .dstAccessMask = ALL_RW};   /* the steps' own wait (vkc_ev_wait), stages and all */
+    vkCmdFillBuffer(f->cmd, b->buf, b->r.off, 4, 1);
+    vkCmdPipelineBarrier(f->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &toh, 0, NULL, 0, NULL);
+    if (!ev_nowait()) vkCmdWaitEvents(f->cmd, 1, &g_ev.h[0], VK_PIPELINE_STAGE_HOST_BIT, ALL_STAGES, 1, &fromh, 0, NULL, 0, NULL);
+    vkCmdFillBuffer(f->cmd, b->buf, b->r.off, 4, 2);
+    const unsigned long long serial = KC.serial;
+    if (!vkc_submit(0)) { vkSetEvent(KC.dev, g_ev.h[0]); vkc_free(b); return 0; }
+    double t0 = vkc_now_ms();   /* spun, once: no sleep that every platform has */
+    while (v[0] == 0 && vkc_now_ms() - t0 < 2000.0) {}
+    const uint32_t started = v[0];
+    for (t0 = vkc_now_ms(); started == 1 && vkc_now_ms() - t0 < 20.0; ) {}
+    const uint32_t held = v[0];
+    vkSetEvent(KC.dev, g_ev.h[0]);
+    const int done = vkc_wait_serial(serial);
+    const uint32_t after = v[0];
+    vkResetEvent(KC.dev, g_ev.h[0]);
+    vkc_free(b);
+    const int ok = done && started == 1 && held == 1 && after == 2;
+    if (!ok)
+        fprintf(stderr, "[VK] chain: this driver does not hold a frame at an event the host sets while it runs "
+                "(the probe: started %u, after 20 ms %u, at the end %u); the hybrid steps run on the timelines\n",
+                started, held, after);
+    return ok;
+}
+/* the hybrid steps' events, made and probed at the primary device's vkc_init, where no frame
+ * is open: a probe that fails leaves them off for the run (COLI_VK_HYBRID_EVENTS=0 skips both) */
+static void ev_setup(void) {
+    const char *e = getenv("COLI_VK_HYBRID_EVENTS");
+    if (g_kd || (e && *e == '0') || !ev_init()) return;
+    if (!ev_probe()) g_ev.on = 0;
+}
 /* step g's slot, its events reset once the frame that used them last is done */
 static int ev_slot(uint64_t g) {
     int k = (int)(g % VKC_EV_RING);
@@ -2026,11 +2087,15 @@ int vkc_ev_signal(uint64_t g) {
     if (!f || KC.lost || !ev_init()) return 0;
     int k = ev_slot(g);
     if (k < 0) return 0;
-    /* everything before it done and visible to the host, then the event */
+    /* everything before it done and visible to the host, then the event. The barrier's second
+     * scope holds the device's stages too: the event's first scope (its stages) chains onto it,
+     * so the event comes after the writes are made available, and the device's work after it
+     * comes after them as well, which track_reset counts on. The event's own stages may not
+     * hold HOST (VUID-vkCmdSetEvent-stageMask-01149). */
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-                          .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
-    vkCmdPipelineBarrier(f->cmd, ALL_STAGES, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
-    vkCmdSetEvent(f->cmd, g_ev.g[k], ALL_STAGES | VK_PIPELINE_STAGE_HOST_BIT);
+                          .dstAccessMask = VK_ACCESS_HOST_READ_BIT | ALL_RW};
+    vkCmdPipelineBarrier(f->cmd, ALL_STAGES, ALL_STAGES | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    vkCmdSetEvent(f->cmd, g_ev.g[k], ALL_STAGES);
     KC.st.barriers++;
     track_reset();
     g_ev.serial[k] = KC.serial;
@@ -2043,10 +2108,14 @@ int vkc_ev_wait(uint64_t g) {
     if (k < 0) return 0;
     if (KC.prof) prof_mark(f, PK_EW);   /* the gap to the next mark is the wait: PK_WAIT's */
     VkMemoryBarrier hb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT, .dstAccessMask = ALL_RW};
-    vkCmdWaitEvents(f->cmd, 1, &g_ev.h[k], VK_PIPELINE_STAGE_HOST_BIT, ALL_STAGES, 1, &hb, 0, NULL, 0, NULL);
+    if (!ev_nowait()) vkCmdWaitEvents(f->cmd, 1, &g_ev.h[k], VK_PIPELINE_STAGE_HOST_BIT, ALL_STAGES, 1, &hb, 0, NULL, 0, NULL);
     if (KC.prof) prof_mark(f, PK_WAIT);
     KC.st.barriers++;
-    track_reset();
+    /* The wait orders the host's writes before what follows, not the device's own work before
+     * it (a host-set event's first scope is the host's): the tracker keeps what that work
+     * wrote, and the next op that reads it gets its barrier. Reset here, the step's sum read
+     * the experts' rows with none (the validation layer's synchronization check: a
+     * read-after-write hazard every hybrid step; #2583). */
     g_ev.serial[k] = KC.serial;
     return 1;
 }
