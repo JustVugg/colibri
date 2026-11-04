@@ -7,6 +7,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **Watts and joules per token on the Profiling page** (`c/power.py`): with
+  [joules](https://pypi.org/project/landauer-gap/) installed next to the gateway
+  (`pip install landauer-gap`), `/power` gives the machine's draw per device (NVIDIA, AMD and
+  Intel GPUs, the CPU, Macs) and each `/profile` turn carries `energy_j`, what the devices used
+  over it; the page shows the watts and the last turn's joules per token. Optional: without
+  joules nothing runs and the page is as before. The meters start on the first `/power`.
 - **The terminal UI, `coli tui`** (`c/tui.c`, `make colibri-tui`): the chat in a terminal, one
   C file with no libraries, a client of `coli serve`. The conversations, the answer streamed
   with its reasoning folded, the monitor (Overview and Profiling, as on the chat page, plus the

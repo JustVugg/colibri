@@ -492,7 +492,9 @@ amber when used in this answer.</em></p>
 reads a pull request that breaks a cache's size limit: <strong>request changes at 81%</strong>, entropy 0.56 (unsure), 98 tokens read, 0 generated.</em></p>
 
 The **Profiling** page shows where each turn spends its time, phase by phase,
-with the last 30 turns as a trend.
+with the last 30 turns as a trend. With [joules](https://pypi.org/project/landauer-gap/)
+installed next to the gateway (`pip install landauer-gap`) it also shows the
+machine's watts and the last turn's joules per token.
 
 ### The terminal UI
 
