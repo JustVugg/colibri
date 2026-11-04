@@ -4,6 +4,7 @@
 #include <cuda_profiler_api.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include "backend_cuda_dsv4_quant.cuh"
 #if !defined(COLI_DSV4_NO_TC)
 #include <cublasLt.h>
 #endif
@@ -12,6 +13,7 @@
 #include <cstring>
 #include <climits>
 #include <algorithm>
+#include <cfloat>
 #include <vector>
 #ifndef _WIN32
 #include <unistd.h>
@@ -115,11 +117,7 @@ static int buf(void **p,size_t *cap,size_t n){if(*cap>=n)return 1;if(*p)cudaFree
 
 __constant__ float e8_table[256];
 __global__ void set_decode_state(int*state,int token,int position){if(!threadIdx.x){state[0]=token;state[1]=position;}}
-__device__ float e4m3(uint8_t b){int sign=b>>7,e=(b>>3)&15,m=b&7;float v;
-    if(!e)v=ldexpf((float)m,-9);else if(e==15)v=m==7?NAN:ldexpf(1.f+m/8.f,8);else v=ldexpf(1.f+m/8.f,e-7);
-    return sign?-v:v;}
 __device__ float e8(uint8_t b){return e8_table[b];}
-__device__ float f4(uint8_t q){const float a[8]={0,.5f,1,1.5f,2,3,4,6};return q&8?-a[q&7]:a[q];}
 template<int F> __global__ void mv(const uint8_t *w,const uint8_t *sc,const float *x,float *y,int O,int I,int groups){
     int o=blockIdx.x;if(o>=O)return;float sum=0;
     const float *xi=x+(long long)(o/(O/groups))*I;for(int i=threadIdx.x;i<I;i+=blockDim.x){float v;
@@ -346,7 +344,6 @@ static void run_mm_batch(Dsv4CudaTensor*t,const float*x,float*y,int T,cudaStream
 }
 #endif
 __device__ int tc_sf_off(int outer,int inner,int sf_inner_dim){int base=((inner/4)*4+(outer/128)*sf_inner_dim)*128,o=outer&127;return base+(o%32)*16+(o/32)*4+(inner&3);}
-__device__ uint8_t e4m3_code(float x){int best=0;float bd=INFINITY;for(int v=0;v<255;v++){float z=e4m3((uint8_t)v),d=fabsf(z-x);if(d<bd||(d==bd&&!(v&1)&&(best&1))){bd=d;best=v;}}return (uint8_t)best;}
 __global__ void tc_expand(const uint8_t*q4,const uint8_t*src,uint8_t*q8,uint8_t*dst,int O,int I){
     const uint8_t lut[16]={0x00,0x30,0x38,0x3c,0x40,0x44,0x48,0x4c,0x80,0xb0,0xb8,0xbc,0xc0,0xc4,0xc8,0xcc};long long n=(long long)O*I;
     for(long long p=(long long)blockIdx.x*blockDim.x+threadIdx.x;p<n;p+=(long long)gridDim.x*blockDim.x){uint8_t b=q4[p>>1];q8[p]=lut[(p&1)?b>>4:b&15];}
@@ -396,8 +393,6 @@ __global__ void expert_act_grouped(float *a,const float *g,const float *u,const 
     int p=blockIdx.x*blockDim.x+threadIdx.x;if(p<rows*n){int row=p/n;float gg=fminf(__bfloat162float(__float2bfloat16(g[p])),limit);
         float uu=fmaxf(-limit,fminf(__bfloat162float(__float2bfloat16(u[p])),limit));
         a[p]=__bfloat162float(__float2bfloat16(weight[row]*(gg/(1.f+expf(-gg)))*uu));}}
-__device__ float e4m3_round(float x){int best=0;float bd=INFINITY;for(int v=0;v<255;v++){float q=e4m3((uint8_t)v);if(isnan(q))continue;
-    float d=fabsf(q-x);if(d<bd||(d==bd&&!(v&1)&&(best&1))){bd=d;best=v;}}return e4m3((uint8_t)best);}
 __global__ void fp8_sim(float *x,int rows,int n){int row=blockIdx.x/((n+127)/128),b=blockIdx.x%((n+127)/128),i=b*128+threadIdx.x;if(row>=rows)return;
     float v=i<n?fabsf(x[(long long)row*n+i]):0.f;__shared__ float mx[128];mx[threadIdx.x]=v;__syncthreads();
     for(int k=64;k;k>>=1){if(threadIdx.x<k&&mx[threadIdx.x+k]>mx[threadIdx.x])mx[threadIdx.x]=mx[threadIdx.x+k];__syncthreads();}
@@ -852,6 +847,19 @@ static float *g_kv_ring[DSV4_KV_CACHE_LAYERS];
 static int g_kv_ring_rows[DSV4_KV_CACHE_LAYERS];
 static float *g_kv_comp[DSV4_KV_CACHE_LAYERS];
 static int g_kv_comp_cap[DSV4_KV_CACHE_LAYERS];
+static int g_kv_device[DSV4_KV_CACHE_LAYERS];
+
+/* A KV ring/comp buffer belongs to one device; refuse a different owner
+ * instead of writing through a pointer allocated on another device. */
+static int kv_device_ok(int layer, int device) {
+    if ((g_kv_ring[layer] || g_kv_comp[layer]) && g_kv_device[layer] != device) {
+        fprintf(stderr, "[DSV4 CUDA] kv layer %d is on device %d, not %d; refusing append\n",
+                layer, g_kv_device[layer], device);
+        return 0;
+    }
+    return 1;
+}
+
 
 /* Which GPUs this build's kernels can run on. The DeepGEMM build carries
  * sm_120a-only block-scaled MMA kernels. The generic build is a portable fat
@@ -917,6 +925,8 @@ extern "C" int dsv4_cuda_kv_ring_append(int device,int layer,const float*rows,
     Dev*c=ctx(device);
     if(!c||layer<0||layer>=DSV4_KV_CACHE_LAYERS||!rows||start_pos<0||count<1||
        window<1||dim<1||!ok(cudaSetDevice(device),"select kv ring device"))return 0;
+    if(!kv_device_ok(layer,device))return 0;
+    g_kv_device[layer]=device;
     if(g_kv_ring[layer]&&g_kv_ring_rows[layer]!=window){cudaFree(g_kv_ring[layer]);g_kv_ring[layer]=NULL;}
     if(!g_kv_ring[layer]){
         if(!alloc_ok(cudaMalloc((void**)&g_kv_ring[layer],(size_t)window*dim*4),"kv ring allocation"))return 0;
@@ -938,6 +948,8 @@ extern "C" int dsv4_cuda_kv_comp_append(int device,int layer,const float*rows,
     Dev*c=ctx(device);
     if(!c||layer<0||layer>=DSV4_KV_CACHE_LAYERS||!rows||start_idx<0||count<1||dim<1||
        !ok(cudaSetDevice(device),"select kv comp device"))return 0;
+    if(!kv_device_ok(layer,device))return 0;
+    g_kv_device[layer]=device;
     int need=start_idx+count;
     if(g_kv_comp_cap[layer]<need){
         int cap=g_kv_comp_cap[layer]?g_kv_comp_cap[layer]:512;
@@ -1132,6 +1144,32 @@ __global__ void indexer_score_kernel(float*scores,const float*queries,const floa
     scores[(long long)t*count+c]=score;
 }
 
+/* Naruto's indexer tiles keys transposed and splits work across heads.
+ * Store individual head terms here, then fold them in the original order. */
+__global__ void indexer_score_heads(float *scores,const float *queries,const float *keys,
+        const float *head_w,const int *counts,int heads,int dim,int count){
+    constexpr int tile=8;
+    int candidate=blockIdx.x*tile+threadIdx.x%tile,head=threadIdx.x/tile,t=blockIdx.y;
+    extern __shared__ float scratch[];
+    float *ks=scratch,*partial=ks+dim*(tile+1);
+    for(int i=threadIdx.x;i<dim*tile;i+=blockDim.x){
+        int row=i/dim,col=i%dim,idx=blockIdx.x*tile+row;
+        ks[col*(tile+1)+row]=idx<count?keys[(long long)idx*dim+col]:0.f;
+    }
+    __syncthreads();
+    float dot=0.f;
+    if(candidate<count&&candidate<counts[t]){
+        const float *q=queries+((long long)t*heads+head)*dim;
+        for(int d=0;d<dim;d++)dot=__fadd_rn(dot,__fmul_rn(q[d],ks[d*(tile+1)+threadIdx.x%tile]));
+    }
+    partial[head*tile+threadIdx.x%tile]=__fmul_rn(fmaxf(dot,0.f),head_w[(long long)t*heads+head]);
+    __syncthreads();
+    if(head==0&&candidate<count){
+        float score=0.f;
+        if(candidate<counts[t])for(int h=0;h<heads;h++)score=__fadd_rn(score,partial[h*tile+threadIdx.x%tile]);
+        scores[(long long)t*count+candidate]=score;
+    }
+}
 extern "C" int dsv4_cuda_indexer_score_batch(int device,const float*queries,const float*keys,
         const float*head_w,const int*counts,int tokens,int heads,int dim,int count,
         float*scores){
@@ -1148,9 +1186,16 @@ extern "C" int dsv4_cuda_indexer_score_batch(int device,const float*queries,cons
        !ok(cudaMemcpyAsync(c->p3,keys,kb,cudaMemcpyHostToDevice,c->stream),"indexer key upload")||
        !ok(cudaMemcpyAsync(c->aux1,head_w,wb,cudaMemcpyHostToDevice,c->stream),"indexer head weight upload")||
        !ok(cudaMemcpyAsync(c->aux2,counts,cb,cudaMemcpyHostToDevice,c->stream),"indexer count upload"))return 0;
-    if(sm>48*1024&&cudaFuncSetAttribute(indexer_score_kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sm)!=cudaSuccess)return 0;
-    indexer_score_kernel<<<dim3((count+127)/128,tokens),128,sm,c->stream>>>(
-        c->p4,c->p2,c->p3,c->aux1,(int*)c->aux2,heads,dim,count);
+    const char *parallel=getenv("DSV4_CUDA_INDEXER_HEADS");
+    if((!parallel||atoi(parallel))&&heads<=128&&dim<=512){
+        size_t shared=(size_t)(dim*9+heads*8)*4;
+        indexer_score_heads<<<dim3((count+7)/8,tokens),heads*8,shared,c->stream>>>(
+            c->p4,c->p2,c->p3,c->aux1,(int*)c->aux2,heads,dim,count);
+    }else{
+        if(sm>48*1024&&cudaFuncSetAttribute(indexer_score_kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sm)!=cudaSuccess)return 0;
+        indexer_score_kernel<<<dim3((count+127)/128,tokens),128,sm,c->stream>>>(
+            c->p4,c->p2,c->p3,c->aux1,(int*)c->aux2,heads,dim,count);
+    }
     return ok(cudaGetLastError(),"indexer score launch")&&
            ok(cudaMemcpyAsync(scores,c->p4,sb,cudaMemcpyDeviceToHost,c->stream),"indexer score download")&&
            ok(cudaStreamSynchronize(c->stream),"indexer score sync");
@@ -1164,12 +1209,7 @@ extern "C" int dsv4_cuda_indexer_score_batch(int device,const float*queries,cons
  * One thread per (row, token); tokens are the fast dimension so the 64
  * threads of a token block broadcast-read the same weight bytes. */
 __device__ __forceinline__ float e4m3_dev(uint8_t b){
-    int s=b>>7,e=(b>>3)&15,m=b&7;
-    float v;
-    if(e==15&&m==7)v=__int_as_float(0x7fc00000);          /* nan */
-    else if(e==0)v=ldexpf((float)m/8.f,-6);
-    else v=ldexpf(1.f+(float)m/8.f,e-7);
-    return s?-v:v;
+    return e4m3(b);
 }
 __global__ void fp8_ref_matmul_kernel(float*y,const uint8_t*w,const float*bscale,
         const float*x,int rows,int cols,int tokens){
@@ -1210,6 +1250,23 @@ __global__ void fp8_ref_matmul_rows8_kernel(float*y,const uint8_t*w,const float*
         }
     }
     y[(long long)t*rows+o]=sum;
+}
+
+extern "C" int dsv4_cuda_fp8_ref_matmul_resident(Dsv4CudaTensor*t,const float*x,int tokens,float*y){
+    Dev*c=t?ctx(t->device):nullptr;
+    if(!c||!x||!y||tokens<1||tokens>1024||(t->fmt!=10&&t->fmt!=11))return 0;
+    size_t xb=(size_t)tokens*t->I*sizeof(float),yb=(size_t)tokens*t->O*sizeof(float);
+    if(!ok(cudaSetDevice(t->device),"select resident fp8 ref device")||
+       !buf((void**)&c->p2,&c->p2cap,xb)||!buf((void**)&c->p4,&c->p4cap,yb)||
+       !ok(cudaMemcpyAsync(c->p2,x,xb,cudaMemcpyHostToDevice,c->stream),"resident fp8 ref activation upload"))return 0;
+    int threads=tokens<32?32:((tokens+31)/32)*32;
+    if(t->fmt==11)
+        fp8_ref_matmul_rows8_kernel<<<t->O,threads,0,c->stream>>>(c->p4,(const uint8_t*)t->w,(const float*)t->scale,c->p2,t->O,t->I,tokens);
+    else
+        fp8_ref_matmul_kernel<<<t->O,threads,0,c->stream>>>(c->p4,(const uint8_t*)t->w,(const float*)t->scale,c->p2,t->O,t->I,tokens);
+    return ok(cudaGetLastError(),"resident fp8 ref launch")&&
+           ok(cudaMemcpyAsync(y,c->p4,yb,cudaMemcpyDeviceToHost,c->stream),"resident fp8 ref download")&&
+           ok(cudaStreamSynchronize(c->stream),"resident fp8 ref sync");
 }
 
 extern "C" int dsv4_cuda_fp8_ref_matmul(int device,const uint8_t*w,const float*bscale,
@@ -1307,6 +1364,84 @@ __global__ void mm_bf16_batch(const __nv_bfloat16*w,const float*x,float*y,int O,
         #pragma unroll
         for(int t=0;t<16;t++)s[t][threadIdx.x]+=s[t][threadIdx.x+n];}__syncthreads();}
     if(!threadIdx.x)for(int t=0;t<tcount;t++)y[(long long)(tbase+t)*O+o]=s[t][0];
+}
+/* One lane owns one output row, preserving the decode reference's column
+ * order and fused fp32 accumulation. Rows32 packing coalesces weight reads. */
+__global__ void compressor_project_exact(const __nv_bfloat16 *kv,const __nv_bfloat16 *gate,
+                                         const float *x,float *out,int O,int I){
+    int row=blockIdx.x*32+threadIdx.x;
+    const __nv_bfloat16 *w=blockIdx.y?gate:kv;
+    float sum=0.f;
+    for(int i=0;i<I;i++)
+        sum=__fmaf_rn(__bfloat162float(w[((long long)blockIdx.x*I+i)*32+threadIdx.x]),x[i],sum);
+    out[(long long)blockIdx.y*O+row]=sum;
+}
+__global__ void indexer_head_project(const __nv_bfloat16 *w,const float *x,float *out,int I,float scale){
+    int row=blockIdx.x*32+threadIdx.x;float sum=0.f;
+    /* Unlike the compressor pair, the reference indexer head projection
+     * rounds the product before adding it to the sequential accumulator. */
+    for(int i=0;i<I;i++)sum=__fadd_rn(sum,__fmul_rn(__bfloat162float(w[((long long)blockIdx.x*I+i)*32+threadIdx.x]),x[i]));
+    out[row]=__fmul_rn(sum,scale);
+}
+/* Keep the CPU butterfly order and its FP4 tie rule (first code wins). */
+__global__ void indexer_hadamard_fp4(float *q,int dim,float norm){
+    extern __shared__ float values[];
+    int d=threadIdx.x;float v=q[(long long)blockIdx.x*dim+d];values[d]=v;
+    __syncthreads();
+    for(int width=1;width<dim;width*=2){
+        float peer=values[d^width];v=values[d];
+        v=(d&width)?__fsub_rn(peer,v):__fadd_rn(v,peer);
+        __syncthreads();values[d]=v;__syncthreads();
+    }
+    v=__bfloat162float(__float2bfloat16(__fmul_rn(v,norm)));
+    float mx=fabsf(v);
+    for(int offset=16;offset;offset>>=1)mx=fmaxf(mx,__shfl_xor_sync(0xffffffff,mx,offset));
+    mx=fmaxf(mx,6.f*0x1p-126f);
+    int exponent;float fraction=frexpf(__fdiv_rn(mx,6.f),&exponent);
+    if(fraction==.5f)--exponent;
+    exponent=max(-127,min(127,exponent));float scale=ldexpf(1.f,exponent);
+    float x=fmaxf(-6.f,fminf(6.f,__fdiv_rn(v,scale)));
+    int best=0;float distance=fabsf(x);
+    #pragma unroll
+    for(int code=1;code<16;code++){float candidate=fabsf(__fsub_rn(x,f4(code)));if(candidate<distance){best=code;distance=candidate;}}
+    q[(long long)blockIdx.x*dim+d]=__bfloat162float(__float2bfloat16(__fmul_rn(f4(best),scale)));
+}
+extern "C" int dsv4_cuda_indexer_prepare(Dsv4CudaTensor *weights,const float *input,
+                                         float *queries,float *head_weights,int dim){
+    Dev *c=weights?ctx(weights->device):nullptr;
+    if(!c||!input||!queries||!head_weights||weights->fmt!=16||!weights->bf16_cache||
+       weights->O%32||dim<32||dim>512||(dim&(dim-1))||
+       !ok(cudaSetDevice(weights->device),"select indexer prepare device"))return 0;
+    int heads=weights->O;size_t xb=(size_t)weights->I*4,qb=(size_t)heads*dim*4,wb=(size_t)heads*4;
+    if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,wb)||
+       !buf((void**)&c->p1,&c->p1cap,qb))return 0;
+    if(!ok(cudaMemcpyAsync(c->dx,input,xb,cudaMemcpyHostToDevice,c->stream),"indexer hidden upload")||
+       !ok(cudaMemcpyAsync(c->p1,queries,qb,cudaMemcpyHostToDevice,c->stream),"indexer prepare upload"))return 0;
+    indexer_head_project<<<heads/32,32,0,c->stream>>>((const __nv_bfloat16*)weights->bf16_cache,c->dx,c->dy,weights->I,1.f/sqrtf((float)(heads*dim)));
+    indexer_hadamard_fp4<<<heads,dim,dim*4,c->stream>>>(c->p1,dim,1.f/sqrtf((float)dim));
+    int good=ok(cudaGetLastError(),"indexer prepare launch")&&
+        ok(cudaMemcpyAsync(queries,c->p1,qb,cudaMemcpyDeviceToHost,c->stream),"indexer prepare download")&&
+        ok(cudaMemcpyAsync(head_weights,c->dy,wb,cudaMemcpyDeviceToHost,c->stream),"indexer head weights download");
+    int synced=ok(cudaStreamSynchronize(c->stream),"indexer prepare sync");return good&&synced;
+}
+extern "C" int dsv4_cuda_compressor_project(Dsv4CudaTensor *kv,Dsv4CudaTensor *gate,
+                                            const float *x,float *v,float *scores){
+    Dev *c=kv?ctx(kv->device):nullptr;
+    if(!c||!gate||!x||!v||!scores||kv->fmt!=16||gate->fmt!=16||
+       kv->device!=gate->device||kv->O!=gate->O||kv->I!=gate->I||
+       !kv->bf16_cache||!gate->bf16_cache||kv->O%32||
+       !ok(cudaSetDevice(kv->device),"select compressor device"))return 0;
+    size_t xb=(size_t)kv->I*4,yb=(size_t)kv->O*4;
+    if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,2*yb))return 0;
+    if(!ok(cudaMemcpyAsync(c->dx,x,xb,cudaMemcpyHostToDevice,c->stream),"compressor input upload"))return 0;
+    compressor_project_exact<<<dim3(kv->O/32,2),32,0,c->stream>>>(
+        (const __nv_bfloat16*)kv->bf16_cache,(const __nv_bfloat16*)gate->bf16_cache,c->dx,c->dy,kv->O,kv->I);
+    int good=ok(cudaGetLastError(),"compressor projection launch")&&
+        ok(cudaMemcpyAsync(v,c->dy,yb,cudaMemcpyDeviceToHost,c->stream),"compressor values download")&&
+        ok(cudaMemcpyAsync(scores,c->dy+kv->O,yb,cudaMemcpyDeviceToHost,c->stream),"compressor scores download");
+    /* Drain any issued download before the caller overwrites CPU state on fallback. */
+    int synced=ok(cudaStreamSynchronize(c->stream),"compressor projection sync");
+    return good&&synced;
 }
 extern "C" int dsv4_cuda_matmul_bf16_batch(Dsv4CudaTensor*t,const float*x,int tokens,float*y){
     Dev*c=t?ctx(t->device):nullptr;
@@ -1577,6 +1712,10 @@ static int upload(Dsv4CudaTensor **pt,const void *w,size_t wb,const uint8_t *sc,
 #endif
     *pt=t;return 1;}
 extern "C" int dsv4_cuda_upload_fp8(Dsv4CudaTensor **t,const uint8_t*w,const uint8_t*s,int O,int I,int d){return upload(t,w,(size_t)O*I,s,(size_t)((O+127)/128)*((I+127)/128),O,I,d,8);}
+extern "C" int dsv4_cuda_upload_fp8_ref(Dsv4CudaTensor **t,const uint8_t*w,const float*s,int O,int I,int packed,int d){
+    if(!t||!w||!s||O<1||I<1||I%128||(packed!=0&&packed!=1)||(packed&&O%8))return 0;
+    return upload(t,w,(size_t)O*I,(const uint8_t*)s,(size_t)((O+127)/128)*(I/128)*sizeof(float),O,I,d,packed?11:10);
+}
 extern "C" int dsv4_cuda_upload_fp8_bf16(Dsv4CudaTensor **t,const uint8_t*w,const uint8_t*s,int O,int I,int d){return upload(t,w,(size_t)O*I,s,(size_t)((O+127)/128)*((I+127)/128),O,I,d,9);}
 extern "C" int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t,const uint8_t*w,const uint8_t*s,int O,int I,int d){if(!upload(t,w,(size_t)O*I/2,s,(size_t)O*I/32,O,I,d,4))return 0;
     return 1;}
@@ -1598,6 +1737,138 @@ extern "C" int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t,const uint8_t*w,con
     return 1;
 }
 extern "C" int dsv4_cuda_upload_bf16(Dsv4CudaTensor **t,const uint16_t*w,int O,int I,int d){return upload(t,w,(size_t)O*I*2,nullptr,0,O,I,d,16);}
+__global__ void pack_bf16_rows32(uint16_t *out,const uint16_t *in,int O,int I){
+    long long p=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+    if(p<(long long)O*I){int lane=p%32,col=(p/32)%I,row=(p/(32LL*I))*32+lane;out[p]=in[(long long)row*I+col];}
+}
+extern "C" int dsv4_cuda_upload_compressor(Dsv4CudaTensor **pt,const uint16_t *w,int O,int I,int device){
+    if(!pt||!w||O<1||I<1||O%32)return 0;
+    if(*pt)return (*pt)->fmt==16&&(*pt)->bf16_cache&&(*pt)->O==O&&(*pt)->I==I&&(*pt)->device==device;
+    Dsv4CudaTensor *t=nullptr;
+    if(!dsv4_cuda_upload_bf16(&t,w,O,I,device))return 0;
+    Dev *c=ctx(device);size_t bytes=(size_t)O*I*2;
+    /* upload() uses the default stream; packing runs on a nonblocking stream. */
+    if(!ok(cudaStreamSynchronize(nullptr),"compressor source upload sync")||
+       !ok(cudaMalloc(&t->bf16_cache,bytes),"compressor packed allocation")){dsv4_cuda_tensor_free(t);return 0;}
+    pack_bf16_rows32<<<((long long)O*I+255)/256,256,0,c->stream>>>((uint16_t*)t->bf16_cache,(const uint16_t*)t->w,O,I);
+    if(!ok(cudaGetLastError(),"compressor packing launch")||!ok(cudaStreamSynchronize(c->stream),"compressor packing sync")){dsv4_cuda_tensor_free(t);return 0;}
+    const char *verify=getenv("DSV4_IDX_VERIFY");
+    if(verify&&*verify&&*verify!='0'){
+        std::vector<uint16_t> packed((size_t)O*I);
+        if(!ok(cudaMemcpy(packed.data(),t->bf16_cache,bytes,cudaMemcpyDeviceToHost),"packed verification download")){dsv4_cuda_tensor_free(t);return 0;}
+        for(int row=0;row<O;row++)for(int col=0;col<I;col++)
+            if(packed[((size_t)(row/32)*I+col)*32+row%32]!=w[(size_t)row*I+col]){
+                fprintf(stderr,"packed verification mismatch device=%d O=%d I=%d row=%d col=%d\n",device,O,I,row,col);
+                dsv4_cuda_tensor_free(t);return 0;
+            }
+    }
+    t->bytes+=bytes;*pt=t;return 1;
+}
+
+extern "C" int dsv4_cuda_upload_head_exact(Dsv4CudaTensor **pt,const uint16_t *w,int O,int I,int device){
+    if(!pt||*pt||I<1||I%8)return 0;
+    Dsv4CudaTensor *t=nullptr;
+    if(!dsv4_cuda_upload_compressor(&t,w,O,I,device))return 0;
+    // The head only consumes the packed copy; discard the upload source.
+    if(!ok(cudaFree(t->w),"head source release")){dsv4_cuda_tensor_free(t);return 0;}
+    t->w=t->bf16_cache;t->bf16_cache=nullptr;t->fmt=12;t->bytes=(long long)O*I*2;
+    *pt=t;return 1;
+}
+__global__ void head_scores_exact(const __nv_bfloat16 *w,const float *x,float *out,int O,int I){
+    int row=blockIdx.x*blockDim.x+threadIdx.x;if(row>=O)return;
+    float sum=0.f;long long base=(long long)(row/32)*I*32+row%32;
+    for(int i=0;i<I;i++)sum=__fadd_rn(sum,__fmul_rn(__bfloat162float(w[base+(long long)i*32]),x[i]));
+    out[row]=sum;
+}
+extern "C" int dsv4_cuda_head_scores_exact(Dsv4CudaTensor *t,const float *input,float *scores){
+    Dev *c=t?ctx(t->device):nullptr;
+    if(!c||t->fmt!=12||!input||!scores||!ok(cudaSetDevice(t->device),"select head device"))return 0;
+    size_t xb=(size_t)t->I*sizeof(float),yb=(size_t)t->O*sizeof(float);
+    if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,yb))return 0;
+    int success=ok(cudaMemcpyAsync(c->dx,input,xb,cudaMemcpyHostToDevice,c->stream),"head input upload");
+    if(success){
+        head_scores_exact<<<(t->O+127)/128,128,0,c->stream>>>((__nv_bfloat16*)t->w,c->dx,c->dy,t->O,t->I);
+        success=ok(cudaGetLastError(),"head scores launch")&&
+            ok(cudaMemcpyAsync(scores,c->dy,yb,cudaMemcpyDeviceToHost,c->stream),"head scores download");
+    }
+    int drained=ok(cudaStreamSynchronize(c->stream),"head scores sync");
+    return success&&drained;
+}
+
+// Four independent sums reuse each weight without changing column order.
+__global__ void head_scores_batch_exact(const __nv_bfloat16 *w,const float *x,float *out,int O,int I,int batch){
+    int row=blockIdx.x*blockDim.x+threadIdx.x,first=blockIdx.y*4;
+    if(row>=O)return;
+    float sums[4]={0.f,0.f,0.f,0.f};
+    long long base=(long long)(row/32)*I*32+row%32;
+    for(int i=0;i<I;i++){
+        float weight=__bfloat162float(w[base+(long long)i*32]);
+        #pragma unroll
+        for(int j=0;j<4;j++)if(first+j<batch)
+            sums[j]=__fadd_rn(sums[j],__fmul_rn(weight,x[(size_t)(first+j)*I+i]));
+    }
+    #pragma unroll
+    for(int j=0;j<4;j++)if(first+j<batch)out[(size_t)(first+j)*O+row]=sums[j];
+}
+
+__global__ void head_first_argmax(const float *scores,int vocab,int *ids,float *values){
+    __shared__ float maxima[256];
+    __shared__ int winners[256];
+    int lane=threadIdx.x,winner=-1;
+    float maximum=-FLT_MAX;
+    for(int row=lane;row<vocab;row+=blockDim.x){
+        float value=scores[(size_t)blockIdx.x*vocab+row];
+        if(value>maximum){maximum=value;winner=row;}
+    }
+    maxima[lane]=maximum;winners[lane]=winner;
+    __syncthreads();
+    for(int stride=128;stride;stride/=2){
+        if(lane<stride){
+            float other=maxima[lane+stride];int id=winners[lane+stride];
+            if(id>=0&&(other>maxima[lane]||
+               (other==maxima[lane]&&(winners[lane]<0||id<winners[lane])))){
+                maxima[lane]=other;winners[lane]=id;
+            }
+        }
+        __syncthreads();
+    }
+    if(!lane){ids[blockIdx.x]=winners[0];values[blockIdx.x]=maxima[0];}
+}
+
+static int head_batch_exact(Dsv4CudaTensor *t,const float *input,int batch,
+                            float *scores,int *ids,float *values){
+    if(!t||t->fmt!=12||!input||batch<1||batch>128||
+       (!scores&&(!ids||!values)))return 0;
+    Dev *c=ctx(t->device);
+    if(!c||!ok(cudaSetDevice(t->device),"select batched head device"))return 0;
+    size_t xb=(size_t)batch*t->I*sizeof(float),yb=(size_t)batch*t->O*sizeof(float);
+    if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,yb))return 0;
+    if(!scores&&(!buf((void**)&c->p1,&c->p1cap,(size_t)batch*sizeof(int))||
+                !buf((void**)&c->p2,&c->p2cap,(size_t)batch*sizeof(float))))return 0;
+    int success=ok(cudaMemcpyAsync(c->dx,input,xb,cudaMemcpyHostToDevice,c->stream),"batch head input upload");
+    if(success){
+        head_scores_batch_exact<<<dim3((t->O+127)/128,(batch+3)/4),128,0,c->stream>>>(
+            (const __nv_bfloat16*)t->w,c->dx,c->dy,t->O,t->I,batch);
+        success=ok(cudaGetLastError(),"batch head scores launch");
+    }
+    if(success&&scores)
+        success=ok(cudaMemcpyAsync(scores,c->dy,yb,cudaMemcpyDeviceToHost,c->stream),"batch head scores download");
+    else if(success){
+        head_first_argmax<<<batch,256,0,c->stream>>>(c->dy,t->O,(int*)c->p1,c->p2);
+        success=ok(cudaGetLastError(),"batch head argmax launch")&&
+            ok(cudaMemcpyAsync(ids,c->p1,(size_t)batch*sizeof(int),cudaMemcpyDeviceToHost,c->stream),"batch head ids download")&&
+            ok(cudaMemcpyAsync(values,c->p2,(size_t)batch*sizeof(float),cudaMemcpyDeviceToHost,c->stream),"batch head values download");
+    }
+    int drained=ok(cudaStreamSynchronize(c->stream),"batch head drain");
+    return success&&drained;
+}
+extern "C" int dsv4_cuda_head_scores_batch_exact(Dsv4CudaTensor *t,const float *input,int batch,float *scores){
+    return scores&&head_batch_exact(t,input,batch,scores,nullptr,nullptr);
+}
+extern "C" int dsv4_cuda_head_argmax_batch_exact(Dsv4CudaTensor *t,const float *input,int batch,int *ids,float *values){
+    return head_batch_exact(t,input,batch,nullptr,ids,values);
+}
+
 extern "C" int dsv4_cuda_upload_f32(Dsv4CudaTensor **t,const float*w,int O,int I,int d){return upload(t,w,(size_t)O*I*4,nullptr,0,O,I,d,32);}
 extern "C" int dsv4_cuda_mhc_pre(const Dsv4CudaActivation*r,Dsv4CudaTensor*fn,Dsv4CudaTensor*scale,Dsv4CudaTensor*base,int M,int H,float rms_eps,float pre_eps,float sink_eps,float post_mult,int sink_iters,Dsv4CudaActivation*state,Dsv4CudaActivation*input){
     int N=2*M+M*M,MH=M*H;Dev*c=r?ctx(r->device):nullptr;if(!c||!fn||!scale||!base||!state||!input||fn->fmt!=32||scale->fmt!=32||base->fmt!=32||fn->device!=r->device||scale->device!=r->device||base->device!=r->device||state->device!=r->device||input->device!=r->device||r->elements<MH||fn->O!=N||fn->I!=MH||scale->O*scale->I<3||base->O*base->I<N||state->elements<M+M*M+M||input->elements<H||!ok(cudaSetDevice(r->device),"select mHC device")||!buf((void**)&c->p1,&c->p1cap,(size_t)N*4))return 0;
@@ -1941,6 +2212,28 @@ extern "C" int dsv4_cuda_matvec_grouped(Dsv4CudaTensor *t,float *y,const float*x
     else if(t->fmt==32)mv_f32<<<t->O,256,0,c->stream>>>((float*)t->w,c->dx,c->dy,t->O,t->I);
     else mv_bf16<<<t->O,256,0,c->stream>>>((__nv_bfloat16*)t->w,c->dx,c->dy,t->O,t->I);
     return ok(cudaGetLastError(),"matvec launch")&&ok(cudaMemcpyAsync(y,c->dy,yb,cudaMemcpyDeviceToHost,c->stream),"result download")&&ok(cudaStreamSynchronize(c->stream),"matvec sync");}
+extern "C" int dsv4_cuda_wo_decode(Dsv4CudaTensor *wa,Dsv4CudaTensor *wb,int groups,float *out,const float *context){
+    Dev *c=wa?ctx(wa->device):nullptr;
+    if(!c||!wb||!out||!context||groups<1||wa->O<1||wa->I<1||wb->O<1||wa->O%groups||
+       (wa->fmt!=8&&wa->fmt!=9)||wb->fmt!=8||wb->device!=wa->device||wb->I!=wa->O||
+       !ok(cudaSetDevice(wa->device),"select decode output device"))return 0;
+    size_t cb=(size_t)wa->I*groups*sizeof(float),rb=(size_t)wa->O*sizeof(float),hb=(size_t)wb->O*sizeof(float);
+    if(!buf((void**)&c->dx,&c->xcap,cb)||!buf((void**)&c->p1,&c->p1cap,rb)||
+       !buf((void**)&c->dy,&c->ycap,hb))return 0;
+    int success=ok(cudaMemcpyAsync(c->dx,context,cb,cudaMemcpyHostToDevice,c->stream),"decode output upload");
+    if(success){
+        if(wa->fmt==9)run_mv<9>((uint8_t*)wa->w,wa->scale,c->dx,c->p1,wa->O,wa->I,groups,c->stream);
+        else run_mv<8>((uint8_t*)wa->w,wa->scale,c->dx,c->p1,wa->O,wa->I,groups,c->stream);
+        bf16_round<<<(wa->O+255)/256,256,0,c->stream>>>(c->p1,wa->O);
+        run_mv<8>((uint8_t*)wb->w,wb->scale,c->p1,c->dy,wb->O,wb->I,1,c->stream);
+        bf16_round<<<(wb->O+255)/256,256,0,c->stream>>>(c->dy,wb->O);
+        success=ok(cudaGetLastError(),"decode output launch")&&
+            ok(cudaMemcpyAsync(out,c->dy,hb,cudaMemcpyDeviceToHost,c->stream),"decode output download");
+    }
+    // Drain even on failure before the caller reuses host input/output in fallback.
+    int drained=ok(cudaStreamSynchronize(c->stream),"decode output sync");
+    return success&&drained;
+}
 extern "C" int dsv4_cuda_matvec(Dsv4CudaTensor*t,float*y,const float*x){return dsv4_cuda_matvec_grouped(t,y,x,1);}
 extern "C" int dsv4_cuda_matmul_batch(Dsv4CudaTensor*t,const Dsv4CudaActivation*input,int tokens,Dsv4CudaActivation*output){
     Dev*c=t?ctx(t->device):nullptr;if(!c||!input||!output||tokens<1||input->device!=t->device||output->device!=t->device||
@@ -2492,6 +2785,46 @@ extern "C" int dsv4_cuda_expert_set_upload_hash(Dsv4CudaExpertSet*set,const int6
     Dev*hc=ctx(set->device);if(!hc||!ok(cudaMalloc(&set->hash,bytes),"hash router allocation")||!h2d(hc,set->hash,map,bytes,"hash router upload"))return 0;
     set->vocab=vocab;set->topk=topk;return 1;
 }
+/* The host-routed resident path's exact operation/rounding order, with routes
+ * and descriptors retained on device. One activation upload and one download. */
+extern "C" int dsv4_cuda_resident_route_moe(Dsv4CudaExpertSet *set,
+        Dsv4CudaTensor *gate,Dsv4CudaTensor *bias,const int *fixed,
+        float scale,float limit,float *out,const float *in){
+    Dev *c=set?ctx(set->device):nullptr;
+    if(!c||!gate||!in||!out||set->count!=256||!set->table||!set->sg||!set->su||!set->sd||
+       gate->device!=set->device||gate->fmt!=32||gate->O!=256||gate->I!=set->H||
+       (bias&&(bias->device!=set->device||bias->fmt!=32||bias->O*bias->I<256)))return 0;
+    if(fixed)for(int k=0;k<6;k++)if(fixed[k]<0||fixed[k]>=256)return 0;
+    if(!ok(cudaSetDevice(set->device),"select resident route device"))return 0;
+    int H=set->H,I=set->I,K=6;size_t hb=(size_t)H*4,ib=(size_t)K*I*4;
+    if(!buf((void**)&c->dx,&c->xcap,hb)||!buf((void**)&c->dy,&c->ycap,H>256?hb:256*4)||
+       !buf((void**)&c->p1,&c->p1cap,ib)||!buf((void**)&c->p2,&c->p2cap,ib)||
+       !buf((void**)&c->p3,&c->p3cap,ib)||!buf((void**)&c->p4,&c->p4cap,(size_t)K*H*4)||
+       !buf((void**)&c->mvdesc,&c->mvdesccap,(size_t)3*K*sizeof(MvDesc))||
+       !buf((void**)&c->expert_weights,&c->expert_weightscap,K*sizeof(float))||
+       !buf((void**)&c->expert_ids,&c->expert_idcap,K*sizeof(int))||
+       !ok(cudaMemcpyAsync(c->dx,in,hb,cudaMemcpyHostToDevice,c->stream),"resident MoE input"))return 0;
+    mv_f32<<<256,256,0,c->stream>>>((float*)gate->w,c->dx,c->dy,256,H);
+    if(fixed&&!ok(cudaMemcpyAsync(c->expert_ids,fixed,K*sizeof(int),cudaMemcpyHostToDevice,c->stream),"resident fixed routes"))return 0;
+    route_top6<<<1,32,0,c->stream>>>(c->expert_ids,c->expert_weights,bias?(float*)bias->w:nullptr,c->dy,fixed!=nullptr,scale);
+    sort_routes6<<<1,1,0,c->stream>>>(c->expert_ids,c->expert_weights);
+    build_moe_desc<<<1,K,0,c->stream>>>(c->mvdesc,set->table,c->expert_ids,c->dx,c->p1,c->p2,c->p3,c->p4,K,256,H,I);
+    mv_fp4_grouped<4><<<dim3((I+3)/4,2*K),256,0,c->stream>>>(c->mvdesc,2*K,I,H);
+    expert_act_grouped<<<(K*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,c->expert_weights,limit,K,I);
+    fp8_sim<<<K*((I+127)/128),128,0,c->stream>>>(c->p3,K,I);
+    mv_fp4_grouped<4><<<dim3((H+3)/4,K),256,0,c->stream>>>(c->mvdesc+2*K,K,H,I);
+    expert_reduce<<<(H+255)/256,256,0,c->stream>>>(c->dy,c->p4,K,H);
+    run_mv<8>((uint8_t*)set->sg->w,set->sg->scale,c->dx,c->p1,I,H,1,c->stream);
+    run_mv<8>((uint8_t*)set->su->w,set->su->scale,c->dx,c->p2,I,H,1,c->stream);
+    expert_act<<<(I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,1.f,limit,I);
+    fp8_sim<<<(I+127)/128,128,0,c->stream>>>(c->p3,1,I);
+    run_mv<8>((uint8_t*)set->sd->w,set->sd->scale,c->p3,c->p4,H,I,1,c->stream);
+    moe_combine<<<(H+255)/256,256,0,c->stream>>>(c->dy,c->p4,H);
+    return ok(cudaGetLastError(),"resident MoE launch")&&
+        ok(cudaMemcpyAsync(out,c->dy,hb,cudaMemcpyDeviceToHost,c->stream),"resident MoE output")&&
+        ok(cudaStreamSynchronize(c->stream),"resident MoE sync");
+}
+
 extern "C" int dsv4_cuda_route_moe(const Dsv4CudaActivation*input,Dsv4CudaTensor*gate,Dsv4CudaTensor*bias,
         int token,float scale,Dsv4CudaExpertSet*set,float limit,Dsv4CudaActivation*output){
     Dev*c=input?ctx(input->device):nullptr;if(!c||!gate||!set||!output||set->device!=input->device||output->device!=input->device||
