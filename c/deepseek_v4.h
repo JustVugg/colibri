@@ -93,6 +93,7 @@ typedef struct {
     int gpu_device_set;             /* 1 => gpu_device is explicit */
     uint64_t gpu_budget_bytes;      /* 0 => free VRAM at open */
     int gpu_workload;               /* V4GpuWorkload: 0 auto, 1 decode, 2 prefill */
+    int gpu_workload_set;           /* nonzero: the workload is forced, no phase switch */
 } ColiV4EngineOpenOptions;
 
 typedef struct {

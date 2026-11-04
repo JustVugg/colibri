@@ -205,6 +205,11 @@ with a stderr note). `CTX`/`--ctx` sets the context window.
 
 The engine's own CLI is the control plane now: `--gpu auto|none|N`,
 `--vram GiB` and `--workload auto|decode|prefill` feed one placement plan.
+`coli run`, `coli chat` and `coli serve` forward those three flags to the
+native engine (`openai_server.Engine` appends them to the engine argv), so a
+served process obeys the same budget instead of translating `--vram` into the
+GGUF-only `CUDA_EXPERT_GB`. An explicit `--workload` also pins the phase: no
+prefill/decode switch, so `decode` keeps dense in RAM even for a long prompt.
 The planner gets the model geometry, the real free VRAM and the workload and
 returns which tiers live on the device plus the mirror capacity; `--vram` is
 the total budget for dense, shared experts, the prefill bank and mirrors, and
@@ -583,7 +588,6 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_IDX_BATCH` (1) | batched indexer selection in prefill; `0` = legacy per-token |
 | `V4_IDX_IDENTITY` (0) | `1` = skip indexer scoring when every candidate fits under `index_topk` (index order instead of upstream's score order; ~8 % faster prefill, changes rounding) |
 | `COLI_V4_ROWS16` (1) | `0` = never repack hot experts into the rows16 layout (reference matvec for all; numerics comparisons). With the native GPU expert mirror live, rows16 repacking turns itself off: the mirror needs `block_rows=1` |
-| `COLI_V4_DENSE_PLACE` (plan; debug) | unset = the placement plan decides; `ram` forces dense/attention to the CPU (debug override). On 8 GB decode the plan already chooses RAM: ~590 mirrors, 0.65–0.78 tok/s |
 | `CTX` (4096) / `NGEN` | context window / generation ceiling (CLI + serve) |
 
 **Experts / I/O**

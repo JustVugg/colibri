@@ -11398,6 +11398,7 @@ int coli_v4_engine_open(ColiV4Engine **output,
     engine->gpu.request_device_set = options->gpu_device_set;
     engine->gpu.request_device = options->gpu_device;
     engine->gpu.request_workload = options->gpu_workload;
+    engine->gpu.request_workload_set = options->gpu_workload_set;
     engine->gpu.request_budget_bytes = (long long)options->gpu_budget_bytes;
 
     /* Set owns_* immediately after each acquire so destroy cleans partial opens. */
@@ -11953,19 +11954,13 @@ static void *v4_gpu_upload_gate_bias(ColiDeepSeekV4LayerWeights *weights,
     return tensor;
 }
 
-/* COLI_V4_DENSE_PLACE=ram keeps every dense/attention mirror on the CPU and
- * frees the 6.2 GiB the native tier otherwise uploads; the device is then the
- * routed-expert mirror/bank only. Default gpu (the 16 GB row in the docs).
- * Vendor-neutral on purpose: one switch, one meaning, no CUDA spelling. */
+/* The placement plan decides whether the dense/attention mirrors live on the
+ * device; there is no second switch for it. Without a plan the historical
+ * default (dense on the device) stands. */
 static int v4_gpu_dense_wanted(const ColiV4Engine *engine) {
-    const char *env = getenv("COLI_V4_DENSE_PLACE");
-    if (env)
-        return strcmp(env, "ram") != 0;   /* debug override, not the contract */
     if (engine && engine->gpu.plan_valid)
         return engine->gpu.plan_dense;
-    static int place = -1;
-    if (place < 0) place = 1;
-    return place;
+    return 1;
 }
 
 int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
@@ -12160,6 +12155,14 @@ void coli_v4_gpu_phase_begin(ColiV4Engine *engine, int prefill,
                              int fresh_tokens) {
     struct timespec phase_t0, phase_t1;
     if (!engine || !engine->gpu.enabled || !engine->gpu.plan_valid) return;
+    if (engine->gpu.request_workload_set) {
+        if (prefill &&
+            engine->gpu.request_workload == V4_GPU_WORKLOAD_DECODE)
+            return;
+        if (!prefill &&
+            engine->gpu.request_workload == V4_GPU_WORKLOAD_PREFILL)
+            return;
+    }
     clock_gettime(CLOCK_MONOTONIC, &phase_t0);
     if (prefill) {
         if (fresh_tokens < V4_GPU_PLAN_PREFILL_MIN_TOKENS) return;
@@ -15973,6 +15976,7 @@ typedef struct {
     int gpu_device_set;
     double vram_gib;
     int workload;
+    int workload_set;
     ColiDeepSeekV4PromptMode prompt_mode;
 } V4CliOptions;
 
@@ -15985,7 +15989,7 @@ static void v4_cli_usage(FILE *stream, const char *program) {
         "  --memory-gb GiB      cap this process; otherwise use available RAM\n"
         "  --gpu auto|none|N    device tier: auto (default), none, or ordinal\n"
         "  --vram GiB           total VRAM budget for dense, bank and mirrors\n"
-        "  --workload MODE      auto|decode|prefill (default: auto)\n"
+        "  --workload MODE      auto|decode|prefill (default: auto; decode/prefill pin the phase)\n"
         "  --prompt-file PATH   read UTF-8 prompt from file (avoids argv encoding issues)\n"
         "  --system TEXT        optional system message\n"
         "  --thinking           enable the official V4 thinking prefix\n"
@@ -16106,6 +16110,7 @@ static int v4_cli_parse(int argc, char **argv, V4CliOptions *options) {
             else if (!strcmp(argv[i], "decode")) options->workload = 1;
             else if (!strcmp(argv[i], "prefill")) options->workload = 2;
             else return -1;
+            options->workload_set = 1;
         } else if (!strcmp(option, "--prompt-file")) {
             if (++i == argc || !argv[i][0]) return -1;
             options->prompt_file = argv[i];
@@ -18464,7 +18469,55 @@ static void v4_serve_mux(ColiV4Engine *engine, ColiV4Session **sessions, int n) 
     free(row_slot); free(rows); free(requests);
 }
 
-static int v4_serve_main(void) {
+/* Serve mode keeps the model from SNAP and the cap as argv[1]; the placement
+ * flags are the same three the text CLI accepts. They are parsed here rather
+ * than read from the environment so `coli serve --vram/--gpu/--workload`
+ * reaches the native engine instead of being a silent no-op. */
+static int v4_serve_options(int argc, char **argv, ColiV4EngineOpenOptions *options) {
+    for (int i = 2; i < argc; i++) {
+        const char *option = argv[i];
+        if (!strcmp(option, "--gpu")) {
+            if (++i == argc || !argv[i][0]) return -1;
+            if (!strcmp(argv[i], "none")) {
+                options->gpu_off = 1;
+                options->gpu_device_set = 0;
+            } else if (!strcmp(argv[i], "auto")) {
+                options->gpu_off = 0;
+                options->gpu_device_set = 0;
+            } else {
+                char *end = NULL;
+                long device = strtol(argv[i], &end, 10);
+                if (end == argv[i] || *end || device < 0 || device > 64)
+                    return -1;
+                options->gpu_off = 0;
+                options->gpu_device = (int)device;
+                options->gpu_device_set = 1;
+            }
+        } else if (!strcmp(option, "--vram")) {
+            char *end = NULL;
+            double gib;
+            if (++i == argc) return -1;
+            gib = strtod(argv[i], &end);
+            if (!argv[i][0] || end == argv[i] || *end ||
+                gib < 0.0 || gib > 1048576.0)
+                return -1;
+            options->gpu_budget_bytes =
+                gib > 0.0 ? (uint64_t)(gib * 1073741824.0) : 0;
+        } else if (!strcmp(option, "--workload")) {
+            if (++i == argc) return -1;
+            if (!strcmp(argv[i], "auto")) options->gpu_workload = 0;
+            else if (!strcmp(argv[i], "decode")) options->gpu_workload = 1;
+            else if (!strcmp(argv[i], "prefill")) options->gpu_workload = 2;
+            else return -1;
+            options->gpu_workload_set = 1;
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int v4_serve_main(int argc, char **argv) {
     const char *model_dir = getenv("SNAP");
     if (!model_dir || !*model_dir) {
         fprintf(stderr, "set SNAP=<DeepSeek V4 model directory>\n");
@@ -18494,6 +18547,12 @@ static int v4_serve_main(void) {
         .pin_slots_per_layer = -1,
         .no_dspark = n > 1,   /* several conversations: nothing drafts */
     };
+    if (v4_serve_options(argc, argv, &open_options)) {
+        fprintf(stderr, "usage: %s CAP [--gpu auto|none|N] [--vram GiB] "
+                        "[--workload auto|decode|prefill]\n",
+                argc ? argv[0] : "deepseek-v4");
+        return 2;
+    }
     const char *ram = getenv("RAM_GB");
     if (ram && atof(ram) > 0.0)
         open_options.memory_limit_bytes =
@@ -18690,7 +18749,7 @@ int main(int argc, char **argv) {
                 omp_get_max_threads());
 #endif
     if (getenv("SERVE") && getenv("SERVE")[0] == '1')
-        return v4_serve_main();
+        return v4_serve_main(argc, argv);
     double process_started = spec_now();
     int result = 1;
     V4CliOptions cli;
@@ -18748,6 +18807,7 @@ int main(int argc, char **argv) {
             .gpu_workload = cli.workload
                                 ? cli.workload
                                 : (cli.max_new_tokens <= 1 ? 2 : 1),
+            .gpu_workload_set = cli.workload_set,
         };
         if (cli.memory_gib > 0.0)
             open_opts.memory_limit_bytes =

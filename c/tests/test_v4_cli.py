@@ -142,6 +142,32 @@ class V4CliTest(unittest.TestCase):
         self.assertEqual(env["RAM_GB"], "96")
         self.assertEqual(env["CTX"], "4096")
 
+    def test_native_v4_serve_flags_are_forwarded(self):
+        args = argparse.Namespace(gpu="none", vram=8, workload="prefill")
+        self.assertEqual(
+            self.cli.dsv4_engine_args(args, "deepseek_v4"),
+            ["--gpu", "none", "--vram", "8", "--workload", "prefill"],
+        )
+        self.assertEqual(self.cli.dsv4_engine_args(args, "qwen36"), [])
+
+    def test_v4_vram_does_not_become_the_gguf_budget(self):
+        args = argparse.Namespace(
+            ngen=8, temp=None, ram=0, ctx=0, model="models/v4",
+            gpu=None, vram=8, workload=None,
+        )
+        with mock.patch.object(self.cli, "dsv4_cuda_available", return_value=True):
+            env = self.cli.env_for_engine(args, "deepseek_v4")
+        self.assertEqual(env["COLI_CUDA"], "1")
+        self.assertNotIn("CUDA_EXPERT_GB", env)
+
+    def test_workload_is_refused_for_a_non_native_engine(self):
+        args = argparse.Namespace(
+            ngen=8, temp=None, ram=0, ctx=0, model="models/kimi",
+            gpu=None, vram=0, workload="prefill",
+        )
+        with self.assertRaisesRegex(SystemExit, "--workload applies"):
+            self.cli.env_for_engine(args, "kimi")
+
     def test_kimi_engine_environment_forwards_ram(self):
         """#855: `--ram` reached the environment for deepseek_v4 only, so on Kimi
         K3 it was set and never read -- the flag a user reaches for to bound

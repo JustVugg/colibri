@@ -6872,7 +6872,7 @@ class Engine:
     # main() below, so programmatic callers that never pass cap get the same
     # auto behavior as the CLI; an explicit int (0 included) is verbatim.
     def __init__(self, executable, model, cap=None, max_tokens=1024, env=None, kv_slots=1,
-                 family=None):
+                 family=None, engine_args=None):
         if family is None:
             # Protocol unit tests and embedders may use a synthetic model name.
             # Real launcher/server entry points resolve strictly before this
@@ -6928,8 +6928,9 @@ class Engine:
         # not reach the engine — the C runtime's default would kill it
         # before its stdin-EOF teardown (atexit -> HEAT_FILE save) can run.
         spawn_flags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+        command = [str(executable), str(resolved_cap)] + list(engine_args or [])
         self.process = subprocess.Popen(
-            [str(executable), str(resolved_cap)], env=child_env,
+            command, env=child_env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
             creationflags=spawn_flags,
         )
@@ -10346,7 +10347,8 @@ def keep_engine(server, start, stopping, watch=ENGINE_WATCH_S, delays=ENGINE_RES
 
 def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
           cap=None, max_tokens=1024, engine=None, env=None, cors_origins=None,
-          max_queue=8, queue_timeout=300, kv_slots=1, allowed_hosts=(), family=None):
+          max_queue=8, queue_timeout=300, kv_slots=1, allowed_hosts=(), family=None,
+          engine_args=None):
     if not 0 <= max_tokens:
         raise ValueError("max_tokens cannot be negative (0: the context the engine holds)")
     if not 1 <= port <= 65535:
@@ -10413,7 +10415,8 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
                 # takes the engine down with this server, however the server ends.
                 image._win_job = _win_kill_on_close_job(getattr(image.process, "pid", None))
                 return image
-            return Engine(engine,model,cap,max_tokens,env,kv_slots,family)
+            return Engine(engine,model,cap,max_tokens,env,kv_slots,family,
+                          engine_args=engine_args)
 
         if family.modality == "image":
             runtime = start_engine()
@@ -10495,6 +10498,12 @@ def main():
     parser.add_argument("--queue-timeout", type=float,
                         default=float(os.environ.get("COLI_QUEUE_TIMEOUT", "300")))
     parser.add_argument("--kv-slots", type=int, default=int(os.environ.get("COLI_KV_SLOTS", "1")))
+    parser.add_argument("--gpu", default=None,
+                        help="deepseek_v4: auto, none, or a device ordinal")
+    parser.add_argument("--vram", type=float, default=0,
+                        help="deepseek_v4: total VRAM budget in GiB (0=auto)")
+    parser.add_argument("--workload", choices=("auto", "decode", "prefill"), default=None,
+                        help="deepseek_v4: placement phase (default: auto)")
     parser.add_argument("--allowed-host", action="append",
         default=[h.strip() for h in os.environ.get("COLI_ALLOWED_HOSTS", "").split(",") if h.strip()],
         help="additional Host header value accepted by the DNS-rebinding guard "
@@ -10514,10 +10523,19 @@ def main():
         args.engine = str(default_engine(family))
     if args.model_id is None:
         args.model_id = registry_default_model_id(resolved)
+    engine_args = []
+    if args.gpu is not None:
+        engine_args += ["--gpu", args.gpu]
+    if args.vram:
+        engine_args += ["--vram", str(args.vram)]
+    if args.workload:
+        engine_args += ["--workload", args.workload]
+    if engine_args and family.id != "deepseek_v4":
+        parser.error("--gpu/--vram/--workload apply to the native deepseek_v4 engine")
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
           max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots,
-          allowed_hosts=args.allowed_host,family=family)
+          allowed_hosts=args.allowed_host,family=family,engine_args=engine_args)
 
 
 if __name__ == "__main__":

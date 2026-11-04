@@ -540,7 +540,34 @@ def operator_cap(a, arch):
         cap=0
     return cap if cap else None
 
+def dsv4_engine_args(a, arch):
+    """Placement flags for the native DeepSeek V4 engine.
+
+    The GGUF launcher turns --vram into CUDA_EXPERT_GB, which the native V4
+    engine does not read; serve/chat used to lose both --gpu and --vram the
+    same way. The native engine takes them as its own argv, so hand them over
+    explicitly. Only the first device is meaningful: the native tier is
+    single-device.
+    """
+    if arch != "deepseek_v4":
+        return []
+    args = []
+    gpu = getattr(a, "gpu", None)
+    if gpu is not None:
+        value = gpu if gpu in ("none", "auto") else gpu.split(",")[0]
+        args += ["--gpu", value]
+    if getattr(a, "vram", 0):
+        args += ["--vram", str(a.vram)]
+    if getattr(a, "workload", None):
+        args += ["--workload", a.workload]
+    return args
+
+def reject_foreign_workload(a, arch):
+    if getattr(a, "workload", None) and arch != "deepseek_v4":
+        sys.exit(f"{C.yel}--workload applies to the native deepseek_v4 engine only{C.r}")
+
 def env_for_engine(a, arch, plan=None):
+    reject_foreign_workload(a, arch)
     if arch == "glm":
         return env_for(a)
     explicit_env = set(os.environ)
@@ -685,7 +712,8 @@ def env_for_engine(a, arch, plan=None):
         elif not cuda_binary(engine_for_gpu_check(a)):
             sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} the engine binary is CPU-only")
         env["COLI_CUDA"] = "1"
-        env["CUDA_EXPERT_GB"] = str(vram)
+        if arch != "deepseek_v4":
+            env["CUDA_EXPERT_GB"] = str(vram)
     if getattr(a, "auto_tier", False) and family.modality in ("image", "decision"):
         # The tier plan places experts and KV state; an image or decision model
         # has neither, and build_plan would stop on "no safetensors shards".
@@ -1705,6 +1733,7 @@ def run_via_gateway(a, family, engine, prompt):
     cmd=[sys.executable,openai_server.__file__,"--model",a.model,"--engine",engine,"--arch",arch,
          "--model-id",model_id,"--host","127.0.0.1","--port",str(port),"--max-tokens",str(serve_max_tokens(a))]
     if a.cap is not None: cmd+=["--cap",str(a.cap)]
+    cmd += dsv4_engine_args(a,arch)
     p=subprocess.Popen(cmd,env=env_for_engine(a,arch))
     try:
         sp=Spinner(f"loading {model_id}…"); sp.start()
@@ -1761,6 +1790,7 @@ def cmd_run(a):
     need_model(a.model)
     family=resolve_model(a.model).descriptor
     arch=family.id
+    reject_foreign_workload(a, arch)
     engine=engine_for(a.model)
     need_model(a.model,engine)
     prompt=" ".join(a.prompt) if a.prompt else sys.exit('usage: coli run "your prompt"')
@@ -1789,11 +1819,7 @@ def cmd_run(a):
             else:
                 cmd.append(prompt)
             cmd += ["--max-tokens",str(ngen_for(a,interactive=True,family=family))]
-            if a.gpu is not None:
-                gpu_value = a.gpu if a.gpu in ("none", "auto") else a.gpu.split(",")[0]
-                cmd += ["--gpu", gpu_value]
-            if a.vram:
-                cmd += ["--vram", str(a.vram)]
+            cmd += dsv4_engine_args(a, arch)
             try: memory_gb=float(e.get("RAM_GB","0"))
             except (TypeError,ValueError): memory_gb=0.0
             if memory_gb>0: cmd += ["--memory-gb",str(e["RAM_GB"])]
@@ -3144,6 +3170,7 @@ def cmd_chat(a):
     need_model(a.model)
     resolved=resolve_model(a.model); family=resolved.descriptor
     arch=family.id
+    reject_foreign_workload(a, arch)
     if not family.has_gateway_adapter:
         sys.exit(f"{family.display_name}: gateway adapter is not wired")
     if family.modality=="decision":
@@ -3179,6 +3206,7 @@ def cmd_chat(a):
              str(serve_max_tokens(a))]
         if a.cap is not None: cmd+=["--cap",str(a.cap)]
         if a.api_key: cmd+=["--api-key",a.api_key]
+        cmd += dsv4_engine_args(a,arch)
         p=subprocess.Popen(cmd,env=env_for_engine(a,arch))
         try:
             sp=Spinner(f"loading {model_id}…"); sp.start()
@@ -3552,7 +3580,7 @@ def cmd_serve(a):
               a.cap,serve_max_tokens(a),engine,
               env,a.cors_origin,
               a.max_queue,a.queue_timeout,a.kv_slots,allowed_hosts=a.allowed_host,
-              family=family)
+              family=family, engine_args=dsv4_engine_args(a,arch))
     finally:
         served.set()
         try:
@@ -4116,6 +4144,8 @@ def main():
     common.add_argument("--ctx",type=int,default=0)
     common.add_argument("--gpu",default=None,help="auto, none, or a device list such as 0,1")
     common.add_argument("--vram",type=float,default=0,help="total VRAM budget in GB (0=auto)")
+    common.add_argument("--workload",choices=("auto","decode","prefill"),default=None,
+                        help="deepseek_v4: placement phase (default: auto by request)")
     common.add_argument("--policy",choices=("quality","balanced","experimental-fast"),
                         default=os.environ.get("COLI_POLICY","quality"),
                         help="resource policy (explicit --topk/--topp overrides warn and proceed)")
