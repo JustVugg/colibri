@@ -4129,6 +4129,98 @@ __global__ static void __launch_bounds__(256) gemv_i8_rows(float *__restrict__ y
         if (lane == 0) y[(size_t)r * O + o] = a * sc[o];
     }
 }
+/* gemv_i8_rows' arithmetic, four outputs a warp: a lane's slice of each row of x (shared memory)
+ * loaded once for the four weight rows it meets, where gemv_i8_rows loaded it again for every
+ * output (at a verify's four rows the loads of x, not the weights, set the time: a 10240 x 320
+ * matrix 15 us, 218 GB/s, on an RTX PRO 4000). Each output's sums in gemv_i8_rows' lanes and
+ * order, so its bits. Optionally over a split of the inputs (kz splits of kc, blockIdx.y): the
+ * partial sums into part[(z * S + s) * O + o], gemv_i8_sk_sum adding them in order and scaling;
+ * kz 1: y scaled here. The split follows the matrix's shape alone (gemv_i8_sk_splits), so a
+ * verify's rows keep a decode step's bits. */
+#define GEMV_I8_OPW 4
+template<int NR>
+__global__ static void __launch_bounds__(256) gemv_i8_w4(float *__restrict__ y, float *__restrict__ part, const float *__restrict__ x,
+        const int8_t *__restrict__ w, const float *__restrict__ sc, int I, int O, int S, int nr, int kc) {
+    COLI_PDL_WAIT();
+    extern __shared__ float4 xs4[];
+    const int z = (int)blockIdx.y, k0 = z * kc, kn = min(kc, I - k0), s0 = (int)blockIdx.z * nr, nrow = min(nr, S - s0);
+    const int K4 = kn / 4, XR = gx4(K4) + 1;
+    for (int k = threadIdx.x; k < nrow * K4; k += 256) {
+        int r = k / K4, kk = k - r * K4;
+        xs4[r * XR + gx4(kk)] = reinterpret_cast<const float4 *>(x + (size_t)(s0 + r) * I + k0)[kk];
+    }
+    __syncthreads();
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, o0 = ((int)blockIdx.x * GEMV_I8_ROWS + warp) * GEMV_I8_OPW;
+    if (o0 >= O) return;
+    const int8_t *row[GEMV_I8_OPW];
+    #pragma unroll
+    for (int q = 0; q < GEMV_I8_OPW; q++) row[q] = w + (size_t)(o0 + q < O ? o0 + q : o0) * I + k0;
+    float acc[GEMV_I8_OPW][NR];
+    #pragma unroll
+    for (int q = 0; q < GEMV_I8_OPW; q++)
+        #pragma unroll
+        for (int r = 0; r < NR; r++) acc[q][r] = 0.f;
+    for (int i0 = lane * 16; i0 < kn; i0 += 32 * 16) {
+        const int k4 = i0 / 4;
+        float4 xq[NR][4];
+        #pragma unroll
+        for (int r = 0; r < NR; r++) if (r < nrow) {
+            #pragma unroll
+            for (int j = 0; j < 4; j++) xq[r][j] = xs4[r * XR + gx4(k4 + j)];
+        }
+        #pragma unroll
+        for (int q = 0; q < GEMV_I8_OPW; q++) {
+            int4 v = *reinterpret_cast<const int4 *>(row[q] + i0);
+            const int8_t *b = reinterpret_cast<const int8_t *>(&v);
+            float wf[16];
+            #pragma unroll
+            for (int k = 0; k < 16; k++) wf[k] = (float)b[k];
+            #pragma unroll
+            for (int r = 0; r < NR; r++) if (r < nrow) {
+                const float *xv = reinterpret_cast<const float *>(xq[r]);
+                #pragma unroll
+                for (int k = 0; k < 16; k++) acc[q][r] += xv[k] * wf[k];
+            }
+        }
+    }
+    #pragma unroll
+    for (int q = 0; q < GEMV_I8_OPW; q++)
+        #pragma unroll
+        for (int r = 0; r < NR; r++) if (r < nrow) {
+            float a = acc[q][r];
+            for (int off = 16; off > 0; off >>= 1) a += f8_shfl_down(a, off);
+            const int o = o0 + q;
+            if (lane == 0 && o < O) {
+                if (part) part[((size_t)z * S + s0 + r) * O + o] = a;
+                else y[(size_t)(s0 + r) * O + o] = a * sc[o];
+            }
+        }
+}
+__global__ static void gemv_i8_sk_sum(float *__restrict__ y, const float *__restrict__ part, const float *__restrict__ sc, int O, int S, int ks) {
+    COLI_PDL_WAIT();
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= S * O) return;
+    float a = part[i];
+    for (int z = 1; z < ks; z++) a += part[(size_t)z * S * O + i];
+    y[i] = a * sc[i % O];
+}
+/* the splits of an int8 matrix's inputs (gemv_i8_w4): until its blocks (of 32 outputs) fill the
+ * multiprocessors twice, whole steps of 512, from 2048 inputs (Qwen3.8's hyper-connection read:
+ * 10240 inputs, 320 outputs, 10 blocks). COLI_CUDA_GEMV_SK=0: none. */
+static int gemv_i8_sk_splits(const DeviceContext *ctx, int I, unsigned bx) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_GEMV_SK"); on = !(e && *e == '0'); }
+    if (!on || bx >= 2u * (unsigned)ctx->sms || I < 2048 || I % 512) return 1;
+    int ks = (int)((2u * (unsigned)ctx->sms + bx - 1) / bx);
+    if (ks > I / 512) ks = I / 512;
+    return ks < 2 ? 1 : ks;
+}
+/* COLI_CUDA_GEMV_W4=0: gemv_i8_rows, an output a warp */
+static int gemv_i8_w4_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_GEMV_W4"); on = !(e && *e == '0'); }
+    return on;
+}
 /* COLI_CUDA_GEMV_NR=1: a verify's rows a block each, as before */
 static int gemv_i8_nr_on(void) {
     static int on = -1;
@@ -4410,6 +4502,29 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, cons
         size_t prow = (size_t)(gx4(t->I / 4) + 1) * 16;   /* a padded row's bytes */
         /* a verify's rows share each weight load where the matrix has the blocks to fill the
          * device without its rows and shared memory holds them padded */
+        if (gemv_i8_w4_on() && t->I >= 2048 && (size_t)t->O * t->I >= ((size_t)1 << 21)) {   /* long rows: four outputs a warp
+                                                                               * (gemv_i8_w4), the inputs split where the outputs are
+                                                                               * few; a smaller matrix's blocks are too few for it
+                                                                               * (512 x 2560: 3.1 -> 4.0 us) */
+            const unsigned bw = (unsigned)((t->O + GEMV_I8_ROWS * GEMV_I8_OPW - 1) / (GEMV_I8_ROWS * GEMV_I8_OPW));
+            const int ks = gemv_i8_sk_splits(ctx, t->I, bw);
+            int kc = ks > 1 ? ((t->I + ks - 1) / ks + 511) / 512 * 512 : t->I, kz = (t->I + kc - 1) / kc;
+            int sr = S < GEMV_I8_NR ? S : GEMV_I8_NR;
+            size_t xrow = (size_t)(gx4(kc / 4) + 1) * 16;
+            while (sr > 1 && sr * xrow > 48 * 1024) sr--;
+            void *part = NULL;
+            if (sr * xrow <= 48 * 1024 && (kz == 1 || cudaMallocAsync(&part, (size_t)kz * S * t->O * sizeof(float), st) == cudaSuccess)) {
+                dim3 g(bw, (unsigned)kz, (unsigned)((S + sr - 1) / sr));
+                if (sr == 1) coli_launch(gemv_i8_w4<1>, g, 256, xrow, st, y_dev, (float *)part, x_dev, w, t->scales, t->I, t->O, S, 1, kc);
+                else coli_launch(gemv_i8_w4<GEMV_I8_NR>, g, 256, sr * xrow, st, y_dev, (float *)part, x_dev, w, t->scales, t->I, t->O, S, sr, kc);
+                if (part) {
+                    coli_launch(gemv_i8_sk_sum, dim3((unsigned)((S * t->O + 255) / 256)), 256, 0, st, y_dev, (const float *)part, t->scales, t->O, S, kz);
+                    (void)cudaFreeAsync(part, st);
+                }
+                return cuda_ok(cudaGetLastError(), "chain gemv launch (four outputs a warp)");
+            }
+            (void)cudaGetLastError();
+        }
         int nr = S > 1 && bx >= 64 && gemv_i8_nr_on() ? (S < GEMV_I8_NR ? S : GEMV_I8_NR) : 1;
         while (nr > 1 && nr * prow > 48 * 1024) nr--;
         if (nr > 1)

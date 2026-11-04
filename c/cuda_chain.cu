@@ -2044,16 +2044,21 @@ template <typename KT = float>
 __global__ static void __launch_bounds__(256) cc_attn_dec_k(const float *__restrict__ q, const KT *__restrict__ kc,
         const KT *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, float *__restrict__ xs,
         CcAttn p, int mode, int nb, int win = 0, const float *__restrict__ snk = nullptr, int sink_off = 0, int ring = 0,
-        int hc = 0) {   /* hc: the blocks' rule's heads (cc_attn_dec_len), 0 = H */
+        int hc = 0,   /* hc: the blocks' rule's heads (cc_attn_dec_len), 0 = H */
+        const int *__restrict__ sel = nullptr) {   /* sel: the rows' selection lists (CcAttn.sel_row), as cc_attn_k reads them */
     COLI_PDL_WAIT();
     __shared__ float qs[256];
     __shared__ float sc[256];
+    __shared__ int pt[256];
     __shared__ float red[8];
     int tid = threadIdx.x, wp = tid >> 5, lane = tid & 31, h = blockIdx.x, hd = p.hd, stride = hd + 2;
     if (hc < 1) hc = p.H;
     if (mode == 0) {
         int b = blockIdx.y, s = blockIdx.z, kvh = h / (p.H / p.KVH);
-        int n = p.pos_base + s + 1, first = win > 0 && n > win ? n - win : 0;   /* a window: its last win positions */
+        int n = p.pos_base + s + 1, lb = 0;
+        bool list = false;
+        if (sel && p.sel_row > 0) { lb = p.sel_off + s * p.sel_row; int c = sel[lb]; if (c >= 0) { n = c; list = true; } }
+        int first = !list && win > 0 && n > win ? n - win : 0;   /* a window: its last win positions */
         int L = cc_attn_dec_len(n - first, hc), t0 = first + b * L, cnt = min(L, n - t0);
         size_t xo = ((size_t)(s * p.H + h) * nb + b) * stride;
         if (cnt <= 0) {   /* past the row's positions: an empty block */
@@ -2065,8 +2070,10 @@ __global__ static void __launch_bounds__(256) cc_attn_dec_k(const float *__restr
         for (int d = tid; d < hd; d += 256) qs[d] = q[qb + d];
         __syncthreads();
         int kbase = kvh * p.cap;
+        for (int j = tid; j < cnt; j += 256) { int t = list ? sel[lb + 1 + t0 + j] : t0 + j; pt[j] = ring ? t % ring : t; }
+        __syncthreads();
         for (int j = wp; j < cnt; j += 8) {
-            const KT *kr = kc + p.k_off + (size_t)(kbase + (ring ? (t0 + j) % ring : t0 + j)) * hd;
+            const KT *kr = kc + p.k_off + (size_t)(kbase + pt[j]) * hd;
             float a = 0.f;
             for (int d = lane; d < hd; d += 32) a += qs[d] * cc_kvf(kr, d);
             for (int m = 16; m > 0; m >>= 1) a += cc_shfl_xor(a, m);
@@ -2090,7 +2097,7 @@ __global__ static void __launch_bounds__(256) cc_attn_dec_k(const float *__restr
         for (int g = 0; g < 8; g++) l += red[g];
         for (int d = tid; d < hd; d += 256) {
             float acc = 0.f;
-            for (int j = 0; j < cnt; j++) acc += sc[j] * cc_kvf(vc, p.v_off + (size_t)(kbase + (ring ? (t0 + j) % ring : t0 + j)) * hd + d);
+            for (int j = 0; j < cnt; j++) acc += sc[j] * cc_kvf(vc, p.v_off + (size_t)(kbase + pt[j]) * hd + d);
             xs[xo + 2 + d] = acc;
         }
         if (tid == 0) { xs[xo] = M; xs[xo + 1] = l; }
@@ -2101,7 +2108,10 @@ __global__ static void __launch_bounds__(256) cc_attn_dec_k(const float *__restr
      * sc (not a weight a value, each thread's loads one after the other); the sums over the
      * blocks in block order, l's by thread 0 from sc, the values' loads four at a time, so the
      * bits are a weight a value's (chain_attn_dec.comp's mode 1). hd <= 256 (qs) */
-    int s = blockIdx.y, n = p.pos_base + s + 1, first = win > 0 && n > win ? n - win : 0;
+    int s = blockIdx.y, n = p.pos_base + s + 1;
+    bool list = false;
+    if (sel && p.sel_row > 0) { int c = sel[p.sel_off + s * p.sel_row]; if (c >= 0) { n = c; list = true; } }
+    int first = !list && win > 0 && n > win ? n - win : 0;
     int L = cc_attn_dec_len(n - first, hc), nbr = (n - first + L - 1) / L;
     size_t xo = (size_t)(s * p.H + h) * nb * stride;
     float mm = -3.0e38f;
@@ -2377,22 +2387,37 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
 #if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
     fk = fl > 0 && c->major >= 7 && 16 % G == 0 && (p->hd == 64 || p->hd == 128 || p->hd == 256);
 #endif
-    if (dec && fk && p->S <= CC_ATTN_DEC_ROWS && p->sel_row <= 0 && last >= CC_ATTN_DEC_MIN) {
+    /* a selection list's rows too (Qwen3.8's QSA: 24 heads of a verify's rows, cc_attn_k's block
+     * a (head, row) walking up to its budget's positions, 104-144 us a layer on an RTX PRO 4000);
+     * their bits then are not those the same rows get in a prompt chunk (cc_attn_gk, cc_attn_k's).
+     * COLI_CUDA_ATTN_DEC_SEL=0 keeps cc_attn_k for them (read each call) */
+    const int *sp = sel ? (const int *)sel->d : nullptr;
+    int lists = 0;
+    if (p->sel_row > 0) { const char *e = getenv("COLI_CUDA_ATTN_DEC_SEL"); lists = !(e && *e == '0') && sp; }
+    if (dec && (p->sel_row <= 0 ? fk : lists) && p->S <= CC_ATTN_DEC_ROWS && last >= CC_ATTN_DEC_MIN) {
         /* each row as a decode step of it alone: its own blocks of positions (cc_attn_dec_len),
          * and the rows whose positions are fewer than CC_ATTN_DEC_MIN through cc_attn_k */
         int k = CC_ATTN_DEC_MIN - (p->pos_base + 1);
         if (k > 0) {
             CcAttn a = *p; a.S = k;
-            coli_launch(cc_attn_k<KT>, dim3((unsigned)p->H, (unsigned)k), 128, 0, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), nullptr, a, 0, nullptr, 0, 0);
+            coli_launch(cc_attn_k<KT>, dim3((unsigned)p->H, (unsigned)k), 128, 0, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), sp, a, 0, nullptr, 0, 0);
             if (!launched(c, "attn")) return 0;
             CcAttn b = *p; b.S -= k; b.pos_base += k; b.q_off += k * p->q_row; b.o_off += k * p->o_row; b.g_off += k * p->g_row;
+            if (b.sel_row > 0) b.sel_off += k * p->sel_row;
             return cc_attn_t<KT>(q, kc, vc, o, gate, sel, &b);
         }
         /* a KV head's query heads a block where cc_attn_decg_k takes them (offsets of whole float4s):
          * its rule counts four blocks a KV head */
-        int gq = p->k_off % 4 == 0 && p->v_off % 4 == 0 ? cc_decg_heads(G, p->hd) : 0, hc = gq ? 4 * p->KVH : p->H, nb = 1;
+        int gq = p->sel_row <= 0 && p->k_off % 4 == 0 && p->v_off % 4 == 0 ? cc_decg_heads(G, p->hd) : 0, hc = gq ? 4 * p->KVH : p->H, nb = 1;
         for (int r = 0; r < p->S; r++) {
             int n = p->pos_base + r + 1, L = cc_attn_dec_len(n, hc), m = (n + L - 1) / L;
+            if (p->sel_row > 0) {   /* a list's length is the device's: the most blocks any length up to the row's can take
+                                     * (a row without a list, -1, its causal positions: m above) */
+                int nl = n < p->sel_row - 1 ? n : p->sel_row - 1, F = 1024 / hc > 1 ? 1024 / hc : 1, a = (nl + 63) / 64;
+                int ml = a < F ? a : F;
+                if ((nl + 255) / 256 > ml) ml = (nl + 255) / 256;
+                if (ml > m) m = ml;
+            }
             if (m > nb) nb = m;
         }
         size_t need = (size_t)p->S * p->H * nb * (p->hd + 2) * sizeof(float);
@@ -2409,9 +2434,9 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
         if (c->adec) {
             if (gq) cc_decg_launch(c, gq, fp(q), kvp<KT>(kc), kvp<KT>(vc), c->adec, *p, nb, 0, 0, hc);
             else coli_launch(cc_attn_dec_k<KT>, dim3((unsigned)p->H, (unsigned)nb, (unsigned)p->S), 256, 0, c->stream, 
-                fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), c->adec, *p, 0, nb, 0, nullptr, 0, 0, 0);
+                fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), c->adec, *p, 0, nb, 0, nullptr, 0, 0, 0, lists ? sp : nullptr);
             coli_launch(cc_attn_dec_k<KT>, dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream, 
-                fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), c->adec, *p, 1, nb, 0, nullptr, 0, 0, hc);
+                fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), c->adec, *p, 1, nb, 0, nullptr, 0, 0, hc, lists ? sp : nullptr);
             return launched(c, "attn (positions in blocks)");
         }
     }
@@ -2421,7 +2446,6 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
     if (gr < 0) { const char *e = getenv("COLI_CUDA_ATTN_GROUPED"); gr = e && *e ? atoi(e) : 32; if (gr < 0) gr = 0; }
     if (gr > 0 && p->sel_row > 0 && p->S >= gr && p->hd <= 256) {
         dim3 gg((unsigned)p->KVH, (unsigned)p->S);
-        const int *sp = (const int *)sel->d;
 #define CC_ATTN_G(GG) case GG: coli_launch(cc_attn_gk<GG, KT>, gg, 128, 0, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), sp, *p); \
                       return launched(c, "attn (a kv head's query heads a block)");
         switch (G) { CC_ATTN_G(2) CC_ATTN_G(4) CC_ATTN_G(6) CC_ATTN_G(8) CC_ATTN_G(12) CC_ATTN_G(16) default: break; }
@@ -2735,9 +2759,9 @@ static int cc_attn_w2_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, C
         if (c->adec) {
             if (gq) cc_decg_launch(c, gq, fp(q), kvp<KT>(kc), kvp<KT>(vc), c->adec, *p, nb, win, ring, hc);
             else coli_launch(cc_attn_dec_k<KT>, dim3((unsigned)p->H, (unsigned)nb, (unsigned)p->S), 256, 0, c->stream, 
-                fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), c->adec, *p, 0, nb, win, sk, so, ring, 0);
+                fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), c->adec, *p, 0, nb, win, sk, so, ring, 0, nullptr);
             coli_launch(cc_attn_dec_k<KT>, dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream, 
-                fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), c->adec, *p, 1, nb, win, sk, so, ring, hc);
+                fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), c->adec, *p, 1, nb, win, sk, so, ring, hc, nullptr);
             return launched(c, "attn (positions in blocks, window, sinks)");
         }
     }

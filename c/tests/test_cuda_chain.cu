@@ -628,6 +628,30 @@ int main(void) {
             for (int r = 0; r < S; r++) { T->begin(); T->matmul(t, xb, 7 + (size_t)r * I, yb, 0, 1); T->submit(1); std::vector<float> yr = down(yb, O); memcpy(&one[(size_t)r * O], yr.data(), O * 4); }
             ck(maxdiff(y.data() + 3, one.data(), (size_t)S * O) == 0, "three rows at once are bit for bit the three one-row calls");
         }
+        {   /* few outputs of long int8 rows (Qwen3.8's hyper-connection read, 10240 x 320): the inputs split
+             * (gemv_i8_sk), a verify's four rows each the bits of its one-row call, and the CPU's dot */
+            const int I5 = 10240, O5 = 320, S5 = 4;
+            std::vector<int8_t> q5((size_t)I5 * O5); for (auto &v : q5) v = (int8_t)(frand(&s) * 60);
+            std::vector<float> sc5(O5), x5 = rnd((size_t)S5 * I5, 19), r5((size_t)S5 * O5);
+            for (int o = 0; o < O5; o++) sc5[o] = 0.01f + 0.001f * (o % 7);
+            for (int r = 0; r < S5; r++) for (int o = 0; o < O5; o++) {
+                double a = 0; for (int i = 0; i < I5; i++) a += (double)x5[(size_t)r * I5 + i] * q5[(size_t)o * I5 + i]; r5[(size_t)r * O5 + o] = (float)(a * sc5[o]);
+            }
+            ColiCudaTensor *t5 = NULL;
+            CcBuf *x5b = up(x5), *y5b = T->buf((size_t)S5 * O5 * 4, CC_DEV), *y1b = T->buf((size_t)O5 * 4, CC_DEV);
+            int ok5 = coli_cuda_tensor_upload(&t5, q5.data(), sc5.data(), 1, I5, O5, 0) && T->begin() && T->matmul(t5, x5b, 0, y5b, 0, S5) && T->submit(1);
+            std::vector<float> all5 = ok5 ? down(y5b, (size_t)S5 * O5) : std::vector<float>();
+            double mx5 = 0; for (float v : r5) mx5 = fmax(mx5, fabs(v));
+            ck(ok5 && maxdiff(all5.data(), r5.data(), r5.size()) < 1e-4 * mx5, "few outputs of long int8 rows, four rows: the CPU's dot");
+            int same5 = ok5;
+            for (int r = 0; r < S5 && same5; r++) {
+                same5 = T->begin() && T->matmul(t5, x5b, (size_t)r * I5, y1b, 0, 1) && T->submit(1);
+                if (same5) same5 = !memcmp(down(y1b, O5).data(), all5.data() + (size_t)r * O5, (size_t)O5 * 4);
+            }
+            ck(same5, "and each row the bits of its one-row call");
+            if (t5) coli_cuda_tensor_free(t5);
+            T->free(x5b); T->free(y5b); T->free(y1b);
+        }
         {   /* a width the warp GEMV does not take (not a multiple of 16): the block kernel */
             const int I2 = 100; std::vector<int8_t> q2((size_t)I2 * O); for (auto &v : q2) v = (int8_t)(frand(&s) * 60);
             std::vector<float> x2 = rnd(I2, 13), ref2(O);
@@ -850,13 +874,29 @@ int main(void) {
         ck(ok && maxdiff(all.data(), ref.data(), o.size()) < 1e-4, "40 rows with selection lists, a block per kv head, against the reference");
         CcBuf *o1 = T->buf((size_t)H * hd * 4, CC_DEV);
         int same = 1;
+        setenv("COLI_CUDA_ATTN_DEC_SEL", "0", 1);   /* a row alone through cc_attn_k */
         for (int r = 0; r < S && same; r++) {
             CcAttn p1 = p; p1.S = 1; p1.pos_base = pos_base + r; p1.q_off = r * p.q_row; p1.g_off = p.g_off + r * p.g_row; p1.o_off = 0; p1.sel_off = r * SR;
             std::vector<float> one;
             same = T->begin() && T->attn(qb, kb, vb, o1, qb, sb, &p1) && T->submit(1);
             if (same) { one = down(o1, (size_t)H * hd); same = !memcmp(one.data(), all.data() + (size_t)r * H * hd, (size_t)H * hd * 4); }
         }
-        ck(same, "each row the bits of that row alone (a block per query head)");
+        unsetenv("COLI_CUDA_ATTN_DEC_SEL");
+        ck(same, "each row the bits of that row alone (a block per query head, COLI_CUDA_ATTN_DEC_SEL=0)");
+        /* a verify's rows with their lists in blocks of positions (cc_attn_dec_k): 1 to 4 rows from row 3 on
+         * (row 3 without a list: its causal positions; row 5's list 97 long, the others 400), against the reference */
+        double worst = 0;
+        int okd = 1;
+        for (int S2 = 1; S2 <= 4 && okd; S2++) {
+            CcAttn p2 = p; p2.S = S2; p2.pos_base = pos_base + 3; p2.q_off = 3 * p.q_row; p2.g_off = p.g_off + 3 * p.g_row; p2.o_off = 0;
+            p2.sel_off = 3 * SR;
+            CcBuf *o2 = T->buf((size_t)S2 * H * hd * 4, CC_DEV);
+            okd = o2 && T->begin() && T->attn(qb, kb, vb, o2, qb, sb, &p2) && T->submit(1);
+            std::vector<float> got = okd ? down(o2, (size_t)S2 * H * hd) : std::vector<float>();
+            if (okd) { double d = maxdiff(got.data(), ref.data() + (size_t)3 * H * hd, (size_t)S2 * H * hd); if (d > worst) worst = d; }
+            T->free(o2);
+        }
+        ck(okd && worst < 1e-4, "a verify's rows with selection lists in blocks of positions, against the reference");
         T->free(qb); T->free(kb); T->free(vb); T->free(ob); T->free(sb); T->free(o1);
     }
     {   /* a decode's or a verify's rows over many positions: in blocks of positions (cc_attn_dec_k) */
@@ -1620,7 +1660,7 @@ int main(void) {
     printf("lost\n");
     {
         CcStats st; T->stats(&st);
-        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 30, "the counters saw the frames, ops and matmuls");
+        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 35, "the counters saw the frames, ops and matmuls");
         setenv("COLI_GPU_FAIL_AFTER", "0", 1);
         std::vector<float> w = rnd(64, 81), ones(8, 1.f);
         ColiCudaTensor *t = NULL;
