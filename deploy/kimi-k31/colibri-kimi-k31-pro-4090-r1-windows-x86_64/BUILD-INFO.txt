@@ -1,0 +1,19 @@
+Kimi K3.1 Pro on the RTX 4090 beside MiMo-V2.6-Pro (release mimo-pro-4090-r7), 2026-11-04
+Release kimi-k31-pro-4090-r1: kimi-k3-4090-r1 with the Kimi launchers, the downloader (tools/k3_download.py:
+default repo moonshotai/Kimi-K3.1-Pro, k3_layout.json's repo checked) and the setup catalog (kimi-k3.1-pro)
+for moonshotai/Kimi-K3.1-Pro, which has Kimi K3's architecture and tensors. Every binary below is kimi-k3-4090-r1's.
+
+coli_cuda_k3.dll: commit 506379bc (main): the prompt's tile kernels decode their weights once a block (k3_dense_s4, k3_dense_o8), the same bytes: a 5,862-token prompt 111.9 -> 109.7 s
+kimi_k3.exe: commit 254338ab06091de447c792569580a2b585378088 (main; kimi_k3.c unchanged since): the card's matrices in the CPU's arithmetic, a drive that falls behind no longer hangs a prompt
+coli_cuda.dll, mimo.exe, coli and its Python modules: commit 9372715b0c0709cb848830d5abf7d82535507be5 (main; their sources unchanged since but for comments)
+kimi_k3.exe: mingw32-make -C c kimi_k3 CUDA_DLL=1 ARCH=native VK=0 (needs AVX-512: Zen 4 or newer)
+coli_cuda.dll: c\build_cuda.bat, coli_cuda_k3.dll: c\build_k3_cuda.bat (sm_89, the CUDA runtime linked statically)
+mimo.exe: mingw32-make -C c mimo CUDA_DLL=1 ARCH=native VK=0 (the tiny MiMo model's logits are r7's)
+coli_cuda_mimo.dll: release mimo-pro-4090-r7, commit 1dc7f0376a6d3f32d5d2e664dc32ca9dc856b552 (its source unchanged since)
+Checked before the install: tests\test_k3_cuda_experts.exe; the tiny model with every matrix on the card, none there and on the CPU alone; the 2,637-token prompt's logits at every position against a run with no GPU path.
+
+b0f3eded5a5598674170b45f3a46482b7dc2c651d742f0824420bac3f1d1c654  kimi_k3.exe
+89b0924d5e6138822d955a171c03773c3c00be4fcab4a738186778dbad60ac12  coli_cuda_k3.dll
+0ae7268206e60c340c3b9faf3675a1d727580565ebd8fc69b187a4b48d3cccbc  coli_cuda.dll
+d430b118907deee2db401cde118b29f3907e205744531d64c8bbf52209e511c9  mimo.exe
+16d2f3423238f30532d98293c3449564411d9e78bf4a692bc178ea257edbb120  coli_cuda_mimo.dll

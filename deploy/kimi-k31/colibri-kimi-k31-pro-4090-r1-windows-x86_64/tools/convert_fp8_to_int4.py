@@ -1,0 +1,1292 @@
+"""
+Convertitore GLM-5.2-FP8 -> nostro container int4 (STADIO B).
+
+Strategia DISK-SAFE (richiesta dell'utente): scarica UNO shard (~5 GB), lo converte in
+int4, lo CANCELLA, passa al prossimo. Il disco non si riempie mai: picco = 1 shard + l'output
+int4 che cresce fino a ~372 GB. Controllo di spazio che si ferma se manca margine.
+
+Cosa fa per ogni tensore:
+  - pesi FP8 (e4m3) con `*.weight_scale_inv`  -> dequant a blocchi 128x128 -> f32
+  - pesi BF16 (norme/embed/lm_head/...)        -> f32
+  poi:
+  - attn/mlp/shared/expert/embed/lm_head -> QUANTIZZATO int4 (o int8) con la STESSA matematica
+    del motore C (np.rint = lrintf, stesse soglie, stesso packing dei nibble) -> token identici
+  - norme / router (mlp.gate.weight) / bias / e_score_correction_bias -> tenuti F32
+  - indexer DSA / layer MTP (78) / shared_head / eh_proj / *norm dell'indexer -> SALTATI
+
+Output: una dir di safetensors leggibile dal motore C (per ogni peso quantizzato: `nome` U8 =
+dati impacchettati, `nome.qs` F32 = scale per riga).
+
+USO:
+  # test locale (oracolo tiny, niente download): converte una dir gia' presente
+  python3 tools/convert_fp8_to_int4.py --indir glm_tiny --outdir glm_tiny_i4 --ebits 4 --io-bits 4
+  # selftest del dequant fp8 (richiede torch)
+  python3 tools/convert_fp8_to_int4.py --selftest
+  # reale: scarica+converte+cancella shard per shard
+  python3 tools/convert_fp8_to_int4.py --repo zai-org/GLM-5.2-FP8 --outdir /path/to/glm52_i4
+"""
+import os, sys, glob, json, re, shutil, argparse, threading
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ml4_mmproj  # noqa: E402  (Mistral-Large-4's vision tower)
+
+
+_positioned_write_lock = threading.Lock()
+
+
+# ---------- guardia di famiglia (#1304) ----------
+# Questo convertitore serve UNA famiglia: GLM-5.2. Ma `coli convert` accetta
+# qualunque --repo, e in una settimana due utenti gli hanno dato Qwen3.8:
+# i tensori BF16 che non riconosce come esperti GLM passano upcastati a f32,
+# ogni shard raddoppia, e #1304 si e' fermato a 424 GB scritti su 360 di
+# sorgente. Il controllo del model_type costa 5 KB di config.json e va fatto
+# PRIMA del primo shard, non dopo il disco pieno.
+#
+# I due insiemi qui sotto sono copie di family_registry.py, e una copia che
+# diverge e' esattamente il difetto che questa guardia cura: il test
+# tests/test_convert_guard.py li confronta col registry e fallisce alla prima
+# famiglia aggiunta o rinominata.
+GLM52_MODEL_TYPES = {"glm_moe_dsa", "glm5_moe", "glm"}
+ML4_MODEL_TYPES = {"mistral_large4"}   # the registry's glm family too: the same engine
+# Mistral-Large-4 (mistralai/Mistral-Large-4-1T-A52B): its FP8 release in Mistral's own names
+# (consolidated-*.safetensors), read through ml4_name into the names colibri.c reads; set from
+# the checkpoint's config.json (model_type mistral_large4)
+ML4 = False
+# its vision tower: each shard's tower tensors kept here (tools/ml4_mmproj.py stash) and written
+# as mmproj.gguf at the end of the main pass; None in the --mtp/--indexer passes
+ML4_STASH = None
+ML4_LAYER = (   # the part after layers.N., Mistral's -> the engine's (the first that fits)
+    ("attention_norm.weight", "input_layernorm.weight"), ("ffn_norm.weight", "post_attention_layernorm.weight"),
+    ("attention.indexer.ssmax_scaling.s", "self_attn.indexer.softmax_scaling.scale"),
+    ("attention.indexer.ssmax_scaling.b", "self_attn.indexer.softmax_scaling.bias"),
+    ("attention.indexer.", "self_attn.indexer."),
+    ("attention.ssmax_scaling.s", "self_attn.softmax_scaling.scale"),
+    ("attention.ssmax_scaling.b", "self_attn.softmax_scaling.bias"),
+    ("attention.wq.", "self_attn.q_proj."), ("attention.wkv_a_with_mqa.", "self_attn.kv_a_proj_with_mqa."),
+    ("attention.kv_a_norm.", "self_attn.kv_a_layernorm."), ("attention.wkv_b.", "self_attn.kv_b_proj."),
+    ("attention.wo.", "self_attn.o_proj."),
+    ("feed_forward.w1.", "mlp.gate_proj."), ("feed_forward.w2.", "mlp.down_proj."), ("feed_forward.w3.", "mlp.up_proj."),
+    ("gate.weight", "mlp.gate.weight"),
+    ("shared_experts.w1.", "mlp.shared_experts.gate_proj."), ("shared_experts.w2.", "mlp.shared_experts.down_proj."),
+    ("shared_experts.w3.", "mlp.shared_experts.up_proj."),
+)
+ML4_GLOBAL = {"tok_embeddings.weight": "model.embed_tokens.weight", "norm.weight": "model.norm.weight",
+              "output.weight": "lm_head.weight", "lerope.alpha": "model.rotary_emb.freq_factors"}
+ML4_EXPERT = re.compile(r"^experts\.(\d+)\.w([123])\.(.+)$")
+
+
+def ml4_name(name):
+    """A Mistral-Large-4 tensor's name in the engine's, or None (the DSpark draft head; the
+    vision tower and its projector go to mmproj.gguf, tools/ml4_mmproj.py). w1 is the gate, w3 the up and w2 the
+    down projection: checked against the published Q8_0 GGUF's ffn_gate_exps on layer 1's
+    expert 0 (correlation 0.99998 for w1 as gate, 0.004 as up)."""
+    if name in ML4_GLOBAL:
+        return ML4_GLOBAL[name]
+    m = re.match(r"^layers\.(\d+)\.(.+)$", name)
+    if not m:
+        return None
+    rest = m.group(2)
+    e = ML4_EXPERT.match(rest)
+    if e:
+        proj = {"1": "gate_proj", "2": "down_proj", "3": "up_proj"}[e.group(2)]
+        return f"model.layers.{m.group(1)}.mlp.experts.{e.group(1)}.{proj}.{e.group(3)}"
+    for theirs, ours in ML4_LAYER:
+        if rest == theirs or (theirs.endswith(".") and rest.startswith(theirs)):
+            return f"model.layers.{m.group(1)}." + ours + rest[len(theirs):]
+    return None
+
+
+def ml4_engine_config(cfg):
+    """The checkpoint's config.json (text_config inside) as the flat one colibri.c's load_cfg
+    reads, the keys gguf_import writes for a Mistral-Large-4 GGUF."""
+    t = cfg.get("text_config", cfg)
+    rope = dict(t.get("rope_parameters") or {})
+    rope.setdefault("rope_type", "default")
+    n = int(t["num_hidden_layers"])
+    return {
+        "architectures": ["MistralLarge4ForCausalLM"], "model_type": "mistral_large4",
+        "vocab_size": int(t["vocab_size"]), "hidden_size": int(t["hidden_size"]),
+        "intermediate_size": int(t["intermediate_size"]), "moe_intermediate_size": int(t["moe_intermediate_size"]),
+        "num_hidden_layers": n, "num_attention_heads": int(t["num_attention_heads"]),
+        "num_key_value_heads": int(t.get("num_key_value_heads", t["num_attention_heads"])),
+        "n_routed_experts": int(t["n_routed_experts"]), "num_experts_per_tok": int(t["num_experts_per_tok"]),
+        "n_shared_experts": int(t.get("n_shared_experts", 1)), "first_k_dense_replace": int(t.get("first_k_dense_replace", 0)),
+        "q_lora_rank": 0, "kv_lora_rank": int(t["kv_lora_rank"]),
+        "qk_nope_head_dim": int(t["qk_nope_head_dim"]), "qk_rope_head_dim": int(t["qk_rope_head_dim"]),
+        "v_head_dim": int(t["v_head_dim"]), "n_group": int(t.get("n_group", 1)), "topk_group": int(t.get("topk_group", 1)),
+        "scoring_func": "softmax", "norm_topk_prob": True,
+        "routed_scaling_factor": float(t.get("routed_scaling_factor", 1.0)),
+        "rms_norm_eps": float(t.get("rms_norm_eps", 1e-5)), "indexer_norm_eps": 1e-6,
+        "rope_parameters": rope, "max_position_embeddings": int(t.get("max_position_embeddings", 1048576)),
+        "index_topk": int(t["index_topk"]), "index_n_heads": int(t["index_n_heads"]), "index_head_dim": int(t["index_head_dim"]),
+        "indexer_types": list(t["indexer_types"])[:n], "no_rope_layers": list(t["no_rope_layers"])[:n],
+        "kv_source_layers": list(t["kv_source_layers"])[:n],
+        "final_logit_softcapping": float(t.get("final_logit_softcapping") or 0.0),
+        "tie_word_embeddings": bool(cfg.get("tie_word_embeddings", t.get("tie_word_embeddings", False))),
+        "bos_token_id": t.get("bos_token_id", 1), "eos_token_id": t.get("eos_token_id", 2),
+    }
+OTHER_FAMILY_PATHS = {
+    "glm5_next":       "GLM-5.3-Flash: use tools/convert_glm53.py",
+    "glm5_next_text":  "GLM-5.3-Flash: use tools/convert_glm53.py",
+    "qwen4_exp":       "Qwen3.8-Flash-Next is NOT converted by this tool: download the "
+                       "official FP8 checkpoint (Qwen/Qwen3.8-Flash-Next-FP8) and run it "
+                       "directly, optionally adding int4-g64 experts with "
+                       "tools/convert_qwen38_experts_int4.py; see docs/qwen38.md",
+    "qwen4_exp_text":  "Qwen3.8-Flash-Next is NOT converted by this tool: download the "
+                       "official FP8 checkpoint (Qwen/Qwen3.8-Flash-Next-FP8) and run it "
+                       "directly, optionally adding int4-g64 experts with "
+                       "tools/convert_qwen38_experts_int4.py; see docs/qwen38.md",
+    "qwen3_5_moe":     "Qwen3.6: use tools/convert_qwen36.py",
+    "qwen3_5_moe_text":"Qwen3.6: use tools/convert_qwen36.py",
+    "qwen3_5":         "Qwen3.8-27B (dense): use tools/convert_qwen36.py, see docs/qwen36.md",
+    "qwen3_5_text":    "Qwen3.8-27B (dense): use tools/convert_qwen36.py, see docs/qwen36.md",
+    "qwen3_moe":       "Qwen3-Coder-30B-A3B: use tools/convert_qwen36.py, see docs/qwen36.md",
+    "flint":           "Flint: use tools/convert_qwen36.py, or run one of its GGUFs (coli import), see docs/gguf.md",
+    "lfm3":            "LFM3-VL: use tools/convert_qwen36.py, or run one of its GGUFs (coli import), see docs/qwen36.md",
+    "lfm3_vl":         "LFM3-VL: use tools/convert_qwen36.py, or run one of its GGUFs (coli import), see docs/qwen36.md",
+    "muse_spark":      "Muse Spark Open is NOT converted by this tool: run one of its GGUFs (coli import), see docs/gguf.md",
+    "qwen3":           "Qwen3 (dense) is NOT converted by this tool: the qwen36 engine runs its "
+                       "GGUF as the file has it (coli import), see docs/gguf.md",
+    "inkling_mm_model":"Inkling: use tools/convert_inkling_int4.py",
+    "inkling":         "Inkling: use tools/convert_inkling_int4.py",
+    "olmoe":           "OLMoE: use tools/convert_olmoe.py",
+    "kimi_k3":         "Kimi K3: see docs/kimi_k3.md for its container pipeline",
+    "kimi_linear":     "Kimi K3: see docs/kimi_k3.md for its container pipeline",
+    "deepseek_v4":     "DeepSeek V4: see docs/deepseek-v4.md, section Download",
+    "deepseek_v41":    "DeepSeek V4.1: no conversion needed -- its experts already ship fp4 and its dense fp8; run tools/prepare_dsv41.py once, see docs/deepseek-v41.md",
+    "deepseek_v41_text": "DeepSeek V4.1: no conversion needed -- see docs/deepseek-v41.md",
+    "mimo_v2":         "MiMo-V2.6 is NOT converted: its experts already ship MXFP4 and its "
+                       "dense FP8/BF16, and the engine reads the release as downloaded; "
+                       "see docs/mimo.md",
+    "qwenimage21pipeline": "Qwen-Image-2.1 is NOT converted: the image engine reads the "
+                           "diffusers checkpoint as downloaded; see docs/qwen-image.md",
+    "laya_modernbert": "Laya is NOT converted: the decision engine reads the release "
+                       "as downloaded; see docs/laya.md",
+    "gliner2_span_deberta-v2": "GLiNER2.5-Decide is NOT converted: the decision engine reads "
+                               "the release as downloaded; see docs/gliner_decide.md",
+}
+# A config.json whose model_type is not the registry's key for its family: a
+# GLiNER2 checkpoint says "extractor" (or "gliner2") for every architecture and
+# encoder, and the registry names it by both (family_registry._resolve_gliner2_checkpoint).
+CONFIG_MODEL_TYPE_ALIASES = {"extractor": "gliner2_span_deberta-v2", "gliner2": "gliner2_span_deberta-v2"}
+
+
+def check_model_family(config, where):
+    """Ferma il convertitore su un checkpoint che non e' GLM-5.2.
+
+    `config` e' il config.json del checkpoint gia' parsato; `where` dice al
+    messaggio da dove viene (un path o un repo id). Ritorna in silenzio per
+    GLM-5.2; esce con indicazione per-famiglia per tutto il resto.
+    """
+    global ML4
+    model_type = config.get("model_type")
+    if not isinstance(model_type, str) or not model_type:
+        raise SystemExit(f"ERROR: {where}: config.json has no usable model_type; "
+                         "refusing to guess. This converter is for GLM-5.2 only.")
+    if model_type in GLM52_MODEL_TYPES:
+        return
+    if model_type in ML4_MODEL_TYPES:   # its FP8 release, in Mistral's own names
+        ML4 = True
+        return
+    hint = OTHER_FAMILY_PATHS.get(CONFIG_MODEL_TYPE_ALIASES.get(model_type, model_type))
+    if hint:
+        raise SystemExit(f"ERROR: {where} is '{model_type}', not GLM-5.2.\n"
+                         f"  This converter would silently upcast most of its "
+                         f"tensors and roughly double the size (#1304).\n  {hint}")
+    raise SystemExit(f"ERROR: {where} is '{model_type}', which this converter does "
+                     f"not know. It converts GLM-5.2 only; other families have "
+                     f"their own tools under c/tools/, and Qwen3.8 needs none.")
+
+
+
+def _save_file_atomic(save_file, tensors, destination, **kwargs):
+    destination = os.fspath(destination)
+    temporary = destination + ".tmp"
+    try:
+        os.remove(temporary)
+    except FileNotFoundError:
+        pass
+    try:
+        save_file(tensors, temporary, **kwargs)
+        os.replace(temporary, destination)
+    finally:
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+
+
+def _positioned_write(fd, data, offset):
+    remaining = memoryview(data)
+    pwrite = getattr(os, "pwrite", None)
+    if pwrite is not None:
+        while remaining:
+            written = pwrite(fd, remaining, offset)
+            if written == 0:
+                raise OSError("pwrite returned zero bytes")
+            remaining = remaining[written:]
+            offset += written
+        return
+
+    with _positioned_write_lock:
+        os.lseek(fd, offset, os.SEEK_SET)
+        while remaining:
+            written = os.write(fd, remaining)
+            if written == 0:
+                raise OSError("write returned zero bytes")
+            remaining = remaining[written:]
+
+
+# ---------- quantizzazione: identica al C (glm.c) ----------
+def quant_int8(w, bits):                       # w: [O,I] f32 -> (qbytes U8 [O*I], scale f32 [O])
+    qmax = (1 << (bits - 1)) - 1
+    amax = np.abs(w).max(axis=1, keepdims=True)
+    s = np.maximum(amax / qmax, 1e-8)
+    q = np.clip(np.rint(w / s), -qmax - 1, qmax).astype(np.int8)
+    return q.reshape(-1).view(np.uint8).copy(), s[:, 0].astype(np.float32)
+
+def quant_int4(w, bits):                        # -> (qbytes U8 [O*ceil(I/2)], scale f32 [O])
+    O, I = w.shape
+    qmax = (1 << (bits - 1)) - 1
+    amax = np.abs(w).max(axis=1, keepdims=True)
+    s = np.maximum(amax / qmax, 1e-8)
+    q = np.clip(np.rint(w / s), -8, qmax).astype(np.int32)  # nibble [-8,7]
+    rb = (I + 1) // 2
+    out = np.zeros((O, rb), np.uint8)
+    v0 = (q[:, 0::2] + 8).astype(np.uint8)
+    out[:, :v0.shape[1]] = v0
+    if I > 1:
+        v1 = (q[:, 1::2] + 8).astype(np.uint8)
+        out[:, :v1.shape[1]] |= (v1 << 4)
+    return out.reshape(-1), s[:, 0].astype(np.float32)
+
+def quant_int4_grouped(w, bits, gs=128):
+    """Group-scaled int4: one scale per group of `gs` elements along the input dim.
+    Drastically reduces quantization error vs per-row scaling — matches the FP8
+    source's 128x128 block-scale granularity. Output layout:
+      qbytes: same packed nibble format as quant_int4
+      scales: f32 [O * ngroups] where ngroups = ceil(I/gs), laid out as
+              s[o * ngroups + g] = scale for row o, group g.
+    The engine detects this format (fmt=4) by checking the .qs array size."""
+    O, I = w.shape
+    qmax = (1 << (bits - 1)) - 1
+    ngroups = (I + gs - 1) // gs
+    # pad I to a multiple of gs for clean reshape, then trim
+    Ipad = ngroups * gs
+    wpad = np.zeros((O, Ipad), np.float32)
+    wpad[:, :I] = w
+    wr = wpad.reshape(O, ngroups, gs)                     # [O, ngroups, gs]
+    amax = np.abs(wr).max(axis=2, keepdims=True)          # [O, ngroups, 1]
+    s = np.maximum(amax / qmax, 1e-8)                     # [O, ngroups, 1]
+    q = np.clip(np.rint(wr / s), -8, qmax).astype(np.int32)  # [O, ngroups, gs]
+    q = q.reshape(O, Ipad)[:, :I]                         # trim padding -> [O, I]
+    # pack nibbles (identical to quant_int4)
+    rb = (I + 1) // 2
+    out = np.zeros((O, rb), np.uint8)
+    v0 = (q[:, 0::2] + 8).astype(np.uint8)
+    out[:, :v0.shape[1]] = v0
+    if I > 1:
+        v1 = (q[:, 1::2] + 8).astype(np.uint8)
+        out[:, :v1.shape[1]] |= (v1 << 4)
+    # scales: flatten [O, ngroups] -> [O * ngroups]
+    s_flat = s[:, :, 0].astype(np.float32).reshape(-1)
+    return out.reshape(-1), s_flat
+
+def quant_int3_g64(w, bits=3, group=64):        # -> (qbytes U8 [O*ceil(I/64)*24], scales f32 [O*ceil(I/64)])
+    """int3 with PER-GROUP scales (fmt=5 in colibri.c): per 64-input group, symmetric absmax
+    (qmax=3, clamp [-4,3], stored v+4), packed as 16B low plane (2 bits/val, int2 layout)
+    + 8B high plane (1 bit/val). Same math as quant_ablation._quant_last_dim(bits=3,
+    group=64) (#132), here with real packing. 3.5 bits/weight effective."""
+    O, I = w.shape
+    ng = (I + group - 1) // group
+    pad = ng * group - I
+    wp = np.pad(w, ((0, 0), (0, pad))) if pad else w
+    g = wp.reshape(O, ng, group)
+    amax = np.abs(g).max(axis=2, keepdims=True)
+    s = np.maximum(amax / 3.0, 1e-8)
+    q = (np.clip(np.rint(g / s), -4, 3).astype(np.int32) + 4).astype(np.uint8)  # 0..7
+    if pad: q[:, -1, group - pad:] = 4                                          # pad packs as 0 after -4
+    lo = np.zeros((O, ng, 16), np.uint8)
+    for k in range(4):
+        lo |= ((q[:, :, k::4] & 3) << (k * 2)).astype(np.uint8)
+    hi = np.zeros((O, ng, 8), np.uint8)
+    for b in range(8):
+        hi |= (((q[:, :, b::8] >> 2) & 1) << b).astype(np.uint8)
+    out = np.concatenate([lo, hi], axis=2)                                      # [O, ng, 24]
+    return out.reshape(-1), s[:, :, 0].astype(np.float32).reshape(-1)
+
+E8 = "e8"                                       # CLI/bits-plumbing marker for fmt=6 (not a bit width)
+
+def quant_e8(w):                                # -> (qbytes U8 [O*ceil(I/256)*98], tag f32 [1])
+    """E8/IQ3 lattice (fmt=6 in colibri.c, #452): rotate the rows first (W@Q,
+    block-diagonal FWHT with regenerated signs — iq3_pack.rotate_rows mirrors
+    quant.h e8_rot_rows), then pack with the iq3 codec: 98B per 256 weights,
+    3.0625 bpw, every scale in-block. The .qs companion is a single float,
+    the engine's fmt=6 discriminator — not a scale."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import iq3_pack
+    O, I = w.shape
+    if I % 256:
+        raise SystemExit(f"e8: input dim {I} is not a multiple of 256")
+    packed = iq3_pack.encode(iq3_pack.rotate_rows(np.asarray(w, dtype=np.float32)))
+    return packed.reshape(-1), np.array([6.0], dtype=np.float32)
+
+def quant_int2(w, bits):                        # -> (qbytes U8 [O*ceil(I/4)], scale f32 [O]); 4/byte
+    O, I = w.shape
+    qmax = (1 << (bits - 1)) - 1                 # bits=2 -> qmax=1, valori [-2,1]
+    amax = np.abs(w).max(axis=1, keepdims=True)
+    s = np.maximum(amax / qmax, 1e-8)
+    q = np.clip(np.rint(w / s), -2, qmax).astype(np.int32)
+    rb = (I + 3) // 4
+    out = np.zeros((O, rb), np.uint8)
+    for k in range(4):                           # impacchetta 4 valori per byte (identico a pack_int2 in C)
+        vk = q[:, k::4]
+        out[:, :vk.shape[1]] |= ((vk + 2).astype(np.uint8) << (k * 2))
+    return out.reshape(-1), s[:, 0].astype(np.float32)
+
+# ---------- NVFP4 (modelopt) : LUT e2m1 ----------
+# FP4 e2m1 = 1 sign + 2 exp + 1 mantissa. 16 codici, magnitudini {0,.5,1,1.5,2,3,4,6}.
+# Bit 3 = segno. Ordine impacchettato (compressed_tensors/vLLM): nibble BASSO = elemento
+# pari, nibble ALTO = elemento dispari. LUT verificata 1:1 con ml_dtypes.float4_e2m1fn.
+# EN: FP4 e2m1 = 1 sign + 2 exp + 1 mantissa. 16 codes, magnitudes {0,.5,1,1.5,2,3,4,6}.
+# EN: bit 3 = sign. Packed order (compressed_tensors/vLLM): LOW nibble = even element,
+# EN: HIGH nibble = odd element. LUT verified 1:1 against ml_dtypes.float4_e2m1fn.
+_E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+         -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+
+# ---------- classificazione dei tensori ----------
+def layer_idx(name):
+    p = name.split(".")
+    if len(p) > 2 and p[0] == "model" and p[1] == "layers":
+        try: return int(p[2])
+        except ValueError: return -1
+    return -1
+
+def classify(name, n_layers, keep_mtp=False, keep_idx=False):
+    if name.endswith("_scale_inv"): return "consumed"   # FP8 base: gestito col suo peso
+    if ML4:   # Mistral-Large-4: its indexer and SSMax in the main pass, q_proj with the attention
+        if name.endswith(".qscale_weight"): return "consumed"
+        if name == "model.rotary_emb.freq_factors": return "f32"
+        if name.endswith("q_proj.weight"): return "attn"
+        if "indexer" in name or "softmax_scaling" in name:
+            return "f32" if not name.endswith(".weight") or name.endswith("norm.weight") else "q"
+    # NVFP4 (modelopt): i sidecar delle scale sono consumati insieme al loro U8 .weight.
+    # EN: NVFP4 (modelopt): scale sidecars are consumed together with their U8 .weight.
+    if name.endswith((".weight_scale", ".weight_scale_2", ".input_scale")): return "consumed"
+    li = layer_idx(name)
+    if keep_idx:
+        # modalita' --indexer: SOLO i pesi del DSA lightning indexer dei layer principali
+        if li < 0 or li >= n_layers or "indexer" not in name: return "skip"
+        if name.endswith("norm.weight"): return "f32"
+        return "q"                                       # int8 consigliato (--ebits 8): pesi di scoring
+    if keep_mtp:
+        if li != n_layers: return "skip"                 # solo il layer MTP
+        if "indexer" in name: return "skip"              # il DSA indexer resta un no-op
+    else:
+        if li >= n_layers: return "skip"                 # layer MTP (78)
+        if any(k in name for k in ["indexer", "indexers_proj", "eh_proj",
+                                    "enorm", "hnorm", "shared_head"]): return "skip"
+    if name.endswith("e_score_correction_bias"): return "f32"
+    if name.endswith("mlp.gate.weight"): return "f32"    # router (NON gate_proj)
+    if name.endswith("norm.weight") or name == "model.norm.weight": return "f32"
+    if name in ("model.embed_tokens.weight", "lm_head.weight"): return "io"
+    if ".mlp.experts." in name and name.endswith(".weight"): return "x"  # expert ROUTED (streaming)
+    # Split resident weights by type for mixed-precision control:
+    #   "sh" = shared expert (fires on every token, highest sensitivity)
+    #   "o"  = o_proj attention (reconstructs output, biggest attn tensor)
+    #   "kvb" = kv_b_proj (reconstructs KV cache on every decode step)
+    #   "attn" = other attention projections (q_a, q_b, kv_a)
+    #   "dmlp" = dense MLP (first 3 layers)
+    if "shared_experts" in name: return "sh"
+    if name.endswith("o_proj.weight"): return "o"
+    if name.endswith("kv_b_proj.weight"): return "kvb"
+    if any(name.endswith(k) for k in ("q_a_proj.weight", "q_b_proj.weight",
+                                       "kv_a_proj_with_mqa.weight")): return "attn"
+    if any(name.endswith(k) for k in ("mlp.gate_proj.weight", "mlp.up_proj.weight",
+                                       "mlp.down_proj.weight")): return "dmlp"
+    if name.endswith(".weight"): return "q"              # fallback: other resident weights
+    return "f32"
+
+# ---------- dequant NVFP4 (modelopt) di UN tensore expert -> f32 [O,I] ----------
+def dequant_nvfp4(f, name):
+    """NVFP4 di NVIDIA modelopt (quant_algo=NVFP4, quant_method=modelopt).
+      - `name`               U8   [O, I/2]  : due nibble e2m1 per byte lungo la dim di
+                                              contrazione (input); pari=nibble basso, dispari=alto.
+      - `name.weight_scale`  F8_E4M3 [O, I/16] : scala per-BLOCCO di 16 elementi (group_size=16),
+                                              lungo la dim di input. Decodifica f8e4m3 -> f32.
+      - `name.weight_scale_2` F32 []        : scala GLOBALE per-tensore, ~amax/(6*448) (piccola).
+    Dequant (convenzione modelopt = MOLTIPLICA, NON dividere):
+        W[o,i] = e2m1_lut[nibble] * f8_block_scale[o, i//16] * weight_scale_2
+    FOOTGUN: llm-compressor/compressed-tensors memorizza il RECIPROCO (global grande) e DIVIDE;
+    modelopt memorizza il valore piccolo e MOLTIPLICA. Questo checkpoint e' modelopt -> moltiplica.
+    EN: NVIDIA modelopt NVFP4. LOW nibble=even elem, HIGH=odd. weight_scale = per-16-block FP8
+    EN: (group_size 16) along the input dim; weight_scale_2 = per-tensor global FP32 (~amax/2688,
+    EN: small). Dequant MULTIPLIES both scales. FOOTGUN: llm-compressor stores the reciprocal
+    EN: (large global) and DIVIDES; modelopt stores the small value and MULTIPLIES."""
+    import torch
+    GS = 16                                                       # NVFP4: block scale ogni 16 elementi
+    packed = f.get_tensor(name)                                    # uint8 [O, I/2]
+    bscale = f.get_tensor(name + "_scale").to(torch.float32)        # [O, ceil(I/16)] da f8e4m3
+    gscale = f.get_tensor(name + "_scale_2").to(torch.float32)      # scalare per-tensore
+    O, Ih = packed.shape; I = Ih * 2
+    # Convenzione: modelopt memorizza il global PICCOLO e MOLTIPLICA. Se e' >=1 e'
+    # quasi certamente il reciproco di compressed-tensors (che DIVIDE) -> ci fermiamo
+    # invece di corrompere silenziosamente ogni tensore. EN: guard modelopt-vs-CT.
+    assert float(gscale) < 1.0, (
+        f"{name}: weight_scale_2={float(gscale):.4g} >= 1 sembra il reciproco "
+        "(compressed-tensors, che DIVIDE); questo path assume modelopt (MOLTIPLICA)")
+    # Il layout deve essere lo scale per-blocco piatto di modelopt: una colonna ogni
+    # 16 elementi di input (niente swizzle cutlass/TensorRT). Verifichiamo, non deduciamo:
+    # dedurre gs = I // ncol misallinea in silenzio su layout paddati/swizzati.
+    nb = (I + GS - 1) // GS
+    assert bscale.shape[1] == nb, (
+        f"{name}: weight_scale ha {bscale.shape[1]} colonne, attese {nb} = ceil({I}/{GS}); "
+        "layout scale inatteso (swizzled/paddato?), rifiuto per non corrompere")
+    lut = torch.tensor(_E2M1, dtype=torch.float32)
+    nib = torch.empty((O, I), dtype=torch.long)
+    nib[:, 0::2] = (packed & 0x0F).to(torch.long)                  # elemento pari = nibble basso
+    nib[:, 1::2] = ((packed >> 4) & 0x0F).to(torch.long)           # elemento dispari = nibble alto
+    w4 = lut[nib]                                                  # [O, I] valori e2m1
+    sc = bscale.repeat_interleave(GS, dim=1)[:, :I]               # blocco parziale di coda: slice a I
+    return (w4 * sc * gscale).numpy()
+
+# ---------- dequant di un tensore (nvfp4 / fp8+scale a blocchi / bf16 / f32) ----------
+def dequant(f, name, keys):
+    import torch
+    sl = f.get_slice(name); dt = sl.get_dtype()
+    # NVFP4 (modelopt): pesi expert U8 con sidecar `.weight_scale`. In questo checkpoint gli
+    # UNICI tensori U8 sono gli expert NVFP4, ma richiediamo comunque il sidecar (keys e'
+    # obbligatorio: senza, un qualunque U8 verrebbe decodificato come NVFP4).
+    # EN: NVFP4 expert weights are U8 with a `.weight_scale` sidecar; require the sidecar.
+    if dt in ("U8", "uint8") and (name + "_scale") in keys:
+        return dequant_nvfp4(f, name)
+    if dt in ("F8_E4M3", "float8_e4m3fn"):
+        w = f.get_tensor(name).to(torch.float32)
+        qs = name[:-len("weight")] + "qscale_weight" if name.endswith("weight") else None
+        if (name + "_scale_inv") not in keys and qs in keys:
+            # Mistral-Large-4: qscale_weight [ceil(O/128), ceil(I/128)], MULTIPLIED (checked on
+            # layer 1's expert 0 against the published Q8_0 GGUF: max error 0.0039 of its range)
+            sc = f.get_tensor(qs).to(torch.float32)
+        else:
+            sc = f.get_tensor(name + "_scale_inv").to(torch.float32)   # [ceil(O/128),ceil(I/128)]
+        O, I = w.shape
+        sc = sc.repeat_interleave(128, 0).repeat_interleave(128, 1)[:O, :I]
+        return (w * sc).numpy()
+    return f.get_tensor(name).to(torch.float32).numpy()
+
+# Per-projection bit overrides for ROUTED experts (gate_proj/up_proj/down_proj), set from
+# --up-bits/--gate-bits/--down-bits in main(). Empty = uniform xbits. Motivated by the
+# measured result that up_proj tolerates int3-g64 at ~zero quality cost while int2 craters
+# (OLMoE ablation, PR #168 comment): up-only int3 drops ~8% of expert bytes for free.
+# NB: the resume manifests (check_or_record_params and the --indir progress file) already
+# record dict(PROJ_BITS) — this global is the definition those sites depend on.
+PROJ_BITS = {}
+
+# Rows per quantization block. Every non-E8 format here carries per-row scales (or
+# per-group scales along I), so rows never interact and blocking is BIT-IDENTICAL to
+# quantizing the whole tensor — it only caps the peak of the quantizer's full-size
+# temporaries. That matters on small hosts: embed/lm_head at [154880, 6144] is 3.8 GB
+# as f32, and abs/divide/rint/clip each materialise another copy (~15 GB peak) on a
+# box with 13 GB free. E8 is excluded — it is already blocked inside iq3_pack.encode,
+# and its ".qs" companion is a single format tag, not a per-row scale.
+QUANT_ROWS = int(os.environ.get("COLI_QUANT_ROWS", "8192"))
+
+def _rowwise(fn, w, *args):
+    O = w.shape[0]
+    if O <= QUANT_ROWS:
+        return fn(w, *args)
+    qs, ss = [], []
+    for r0 in range(0, O, QUANT_ROWS):
+        q, s = fn(w[r0:r0 + QUANT_ROWS], *args)
+        qs.append(q); ss.append(s)
+    return np.concatenate(qs), np.concatenate(ss)
+
+E8_JOBS = 1                                     # --jobs: parallel e8 encodes per shard
+
+def _e8_job(item):
+    name, w = item
+    q, s = quant_e8(w)
+    return name, q, s
+
+def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
+                  keep_mtp=False, keep_idx=False, group_size=0, bits_map=None):
+    from safetensors import safe_open
+    e8_jobs = []                                # deferred: encoded in a pool after the scan
+    vision = {}                                 # Mistral-Large-4's tower tensors, as they are
+    with safe_open(path, framework="pt") as f:
+        keys = set(f.keys())
+        for src in f.keys():
+            name = src
+            if ML4 and ml4_mmproj.is_vision(src):
+                if ML4_STASH: vision[src] = ml4_mmproj.raw(f, src)
+                continue
+            if ML4:   # Mistral's names -> the engine's; the draft head not here
+                name = ml4_name(src)
+                if name is None or src.endswith(".qscale_weight"): continue
+            kind = classify(name, n_layers, keep_mtp, keep_idx)
+            if kind in ("skip", "consumed"): continue
+            w = dequant(f, src, keys)
+            if ML4 and name == "model.rotary_emb.freq_factors":
+                w = np.exp(-w.astype(np.float64))   # the GGUF's rope_freqs: exp(-alpha), what colibri.c divides by
+            if kind == "f32":
+                out_dict[name] = w.astype(np.float32)
+            else:
+                # Resolve bits for this tensor type: use bits_map override if provided,
+                # otherwise fall back to the classic ebits/xbits/io_bits scheme.
+                if bits_map and kind in bits_map:
+                    bits = bits_map[kind]
+                else:
+                    bits = io_bits if kind == "io" else xbits if kind == "x" else ebits
+                # Any unknown kind that fell through classify as "q"
+                if bits_map and kind not in bits_map and kind not in ("io", "x", "sh", "o", "kvb", "attn", "dmlp"):
+                    bits = ebits
+                # Per-projection override for routed experts, applied on top of the type-level bits.
+                if kind == "x" and PROJ_BITS:          # e.g. up_proj -> 3 (int3-g64) while gate/down stay 4
+                    for proj, pb in PROJ_BITS.items():
+                        if f".{proj}.weight" in name: bits = pb; break
+                if w.ndim != 2:        # es. bias 1D non previsto come 'q' -> tienilo f32
+                    out_dict[name] = w.astype(np.float32); continue
+                if bits == E8:
+                    # fmt=6 E8/IQ3 — routed-expert projections only, enforced in main().
+                    # Already row-blocked inside iq3_pack.encode. The python codec is
+                    # slow (~5.5s per expert matrix), so encodes are deferred and run
+                    # across a process pool after the shard scan (--jobs).
+                    e8_jobs.append((name, w))
+                    continue
+                elif bits == 3:
+                    # int3-g64 (fmt=5): inherently group-64, distinct from grouped-int4.
+                    q, s = _rowwise(quant_int3_g64, w)
+                elif group_size > 0 and bits <= 4:
+                    q, s = _rowwise(quant_int4_grouped, w, bits, group_size)
+                else:
+                    q, s = _rowwise(quant_int2 if bits <= 2 else
+                                    quant_int4 if bits <= 4 else quant_int8, w, bits)
+                out_dict[name] = q
+                out_dict[name + ".qs"] = s
+    if vision:
+        ml4_mmproj.stash(ML4_STASH, os.path.splitext(os.path.basename(path))[0], vision)
+    if e8_jobs:
+        if E8_JOBS > 1:
+            from multiprocessing import get_context
+            with get_context("spawn").Pool(E8_JOBS) as pool:   # spawn: safe after BLAS threads
+                for name, q, s in pool.imap(_e8_job, e8_jobs, chunksize=1):
+                    out_dict[name] = q; out_dict[name + ".qs"] = s
+        else:
+            for item in e8_jobs:
+                name, q, s = _e8_job(item)
+                out_dict[name] = q; out_dict[name + ".qs"] = s
+
+def free_gb(p): return shutil.disk_usage(p).free / 1e9
+
+
+def ml4_write_config(outdir):
+    """Mistral-Large-4: the checkpoint's config.json kept as config.hf.json, the engine's flat
+    one in its place; its chat template beside them when the release ships one."""
+    path = os.path.join(outdir, "config.json")
+    if not os.path.exists(path):
+        return
+    cfg = json.load(open(path))
+    if cfg.get("model_type") != "mistral_large4" or "text_config" not in cfg:
+        return
+    shutil.copy(path, os.path.join(outdir, "config.hf.json"))
+    with open(path, "w") as fh:
+        json.dump(ml4_engine_config(cfg), fh, indent=1)
+    print(f"[ML4] config.json: the engine's (Mistral-Large-4, {cfg['text_config']['num_hidden_layers']} layers); "
+          "the release's as config.hf.json")
+
+def _shard_already_done(done, key, outdir):
+    # Mirror of the --indir resume check: None = never seen, "" = seen/empty, name = emitted.
+    prev = done.get(key)
+    return prev is not None and (prev == "" or os.path.exists(os.path.join(outdir, prev)))
+
+def _init_worker(proj_bits, ml4=False, ml4_stash=None):
+    # Restore per-projection expert-bit overrides in each worker: the "spawn" start method
+    # (macOS default) re-imports this module fresh, losing the PROJ_BITS main() populated
+    # (and the Mistral-Large-4 switches check_model_family set).
+    global PROJ_BITS, ML4, ML4_STASH
+    PROJ_BITS = proj_bits; ML4 = ml4; ML4_STASH = ml4_stash
+
+def _convert_one(args):
+    # Convert one shard in a worker; the main process writes the result, so shard numbering
+    # and the atomic manifest stay serial and identical to --workers 1.
+    i, sp, n_layers, ebits, io_bits, xbits, keep_mtp, keep_idx, group_size, bits_map = args
+    out = {}
+    convert_shard(sp, out, n_layers, ebits, io_bits, xbits,
+                  keep_mtp=keep_mtp, keep_idx=keep_idx,
+                  group_size=group_size, bits_map=bits_map)
+    return i, out
+
+def check_or_record_params(outdir, prefix, params):
+    """#383-class guard, mirrored onto the --repo download loops from the --indir
+    path's resume manifest (below): a resumed run with DIFFERENT conversion
+    parameters (bits, group size, PROJ_BITS, ...) must not silently mix bit-widths
+    across shards in the same outdir -- the #355 failure mode (a second pass with
+    changed flags overwriting/interleaving with a finished container in silence).
+    Unlike the --indir manifest this doesn't need to track per-shard completion:
+    the --repo loops already do that via out-NNNNN.safetensors existence, since
+    shard index maps directly to output filename there. Only whether the params
+    used SO FAR match this run's needs checking. Returns False (caller should
+    abort) on a mismatch, True otherwise; records params on first use."""
+    path = os.path.join(outdir, f".{prefix}params.json")
+    if os.path.exists(path):
+        try: prev = json.loads(open(path).read())
+        except (OSError, ValueError): prev = None
+        if prev is not None and prev != params:
+            print(f"ERROR: {path} records a conversion with {prev};\n"
+                  f"       this run uses {params}. Refusing to mix conversions in the "
+                  f"same outdir — use a fresh --outdir (or delete {path} and the "
+                  f"{prefix}*.safetensors shards to redo).")
+            return False
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f: json.dump(params, f, indent=1)   # atomic write, same reasoning as the --indir manifest
+    os.replace(tmp, path)
+    return True
+
+def _bits(v):                                   # "e8" -> fmt=6 marker; anything else an int width
+    return E8 if v == E8 else int(v)
+
+def source_label(a):
+    if a.selftest or a.selftest_nvfp4:
+        return "selftest"
+    if a.indir:
+        return "local " + a.indir
+    if a.repo:
+        return "download " + a.repo
+    raise SystemExit("one of --indir or --repo is required")
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--repo", default=None)
+    ap.add_argument("--indir", default=None)
+    ap.add_argument("--outdir", required=False)
+    ap.add_argument("--ebits", type=int, default=None)   # bit residenti (default 4; 8 per --mtp/--indexer)
+    ap.add_argument("--io-bits", type=int, default=8)    # bit di embed/lm_head
+    ap.add_argument("--xbits", type=_bits, default=None) # bit degli expert ROUTED (streaming), o "e8" (fmt=6); default=ebits
+    # Mixed-precision: per-tensor-type bit overrides. Default = ebits (all same).
+    # Set these higher to protect sensitive tensors from quantization error.
+    ap.add_argument("--shared-bits", type=int, default=None,
+        help="bits for shared expert (fires on every token, highest sensitivity). Default=ebits")
+    ap.add_argument("--o-bits", type=int, default=None,
+        help="bits for o_proj attention (reconstructs output, biggest attn tensor). Default=ebits")
+    ap.add_argument("--kvb-bits", type=int, default=None,
+        help="bits for kv_b_proj (reconstructs KV cache on every decode). Default=ebits")
+    ap.add_argument("--attn-bits", type=int, default=None,
+        help="bits for other attention projections (q_a, q_b, kv_a). Default=ebits")
+    ap.add_argument("--dmlp-bits", type=int, default=None,
+        help="bits for dense MLP (first 3 layers). Default=ebits")
+    ap.add_argument("--group-size", type=int, default=64,
+        # gs64 is the community-validated default (#225 root cause, #455 5/5-clean
+        # verification, ablation #453: per-row int4 costs -9.3pp mean acc_norm vs
+        # -2.2..-3.4pp for group-scaled). Per-row remains available as an explicit
+        # opt-out; the resume manifest (check_or_record_params) refuses to mix the
+        # two in one outdir, so a resumed pre-default conversion aborts loudly
+        # instead of interleaving formats (#355-class).
+        help="group size for int4 scales: 64=one scale per 64 elements (default, "
+             "much better quality), 0=per-row (legacy; costs ~9pp on quality "
+             "benchmarks and is the #455 non-termination trigger)")
+    # Per-projection bit overrides for routed experts (orthogonal to the type-level flags above).
+    ap.add_argument("--up-bits", type=_bits, default=None,
+        help="bits for up_proj in routed experts (e.g. 3 = int3-g64). Default=xbits")
+    ap.add_argument("--gate-bits", type=_bits, default=None,
+        help="bits for gate_proj in routed experts. Default=xbits")
+    ap.add_argument("--down-bits", type=_bits, default=None,
+        help="bits for down_proj in routed experts. Default=xbits")
+    ap.add_argument("--n-layers", type=int, default=78)
+    ap.add_argument("--min-free-gb", type=float, default=20.0)
+    ap.add_argument("--workers", type=int, default=1,
+                    help="Parallel worker processes for the local --indir conversion "
+                         "(default 1 = serial, unchanged). >1 converts already-local shards "
+                         "concurrently; the main process still writes and checkpoints in "
+                         "shard order, so output and out-NNNNN numbering are identical. "
+                         "No effect on the --repo disk-safe path.")
+    ap.add_argument("--jobs", type=int, default=1,
+        help="parallel worker processes for the e8 encode WITHIN a shard (the python codec "
+             "is ~5.5s per expert matrix single-threaded; other quant modes are fast and "
+             "stay serial). Works on both --indir and the --repo disk-safe path. "
+             "Untested in combination with --workers>1; use one or the other.")
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--selftest-nvfp4", action="store_true",
+        help="unit-test del dequant NVFP4 (LUT e2m1 + round-trip), nessun download / no network")
+    ap.add_argument("--mtp", action="store_true",
+        help="download and convert ONLY the MTP head (model.layers.<n_layers>.*) -> out-mtp-*.safetensors")
+    ap.add_argument("--indexer", action="store_true",
+        help="extract ONLY the DSA lightning-indexer weights -> out-idx-*.safetensors. WARNING: "
+             "indexer tensors are spread across nearly every shard, so this re-downloads the whole "
+             "repository (~756 GB of traffic) to retain only a few GB. Resumable per shard. "
+             "Recommended: --ebits 8.")
+    a = ap.parse_args()
+    global E8_JOBS, ML4_STASH
+    E8_JOBS = max(1, a.jobs)
+    if a.ebits is None:
+        # testa MTP a int4 = acceptance ~0-4% (misurato, issue #8): il draft sbaglia sempre
+        # e la speculazione non parte mai. A int8: 39-59%, 2.2-2.8 token/forward.
+        a.ebits = 8 if (a.mtp or a.indexer) else 4
+    if a.mtp and a.ebits < 8 and a.group_size <= 0:
+        # Non solo lossy: eh_proj ha ~20-30x di asimmetria di scala fra le due meta' di
+        # colonna, quindi l'int4 per-riga (UNA scala per riga) arrotonda a ZERO l'intera
+        # meta' embedding -> il draft non vede il token -> acceptance ~0% (issue #8).
+        # EN: not merely lossy: eh_proj has ~20-30x column-scale asymmetry, so per-row
+        # EN: int4 rounds its ENTIRE embedding half to exact zeros -> the draft cannot
+        # EN: see the input token -> ~0% acceptance (issue #8). A container converted
+        # EN: this way is repairable in place with tools/repair_mtp_int8.py.
+        print(f"WARNING: --mtp with --ebits {a.ebits} and per-row scales ZEROES eh_proj's "
+              "embedding half -> MTP acceptance ~0% (issue #8). Use the default --ebits 8, "
+              "or drop --group-size 0 to get the group-scaled default.")
+    if a.xbits is None: a.xbits = a.ebits
+    for proj, val in (("gate_proj", a.gate_bits), ("up_proj", a.up_bits), ("down_proj", a.down_bits)):
+        if val is not None: PROJ_BITS[proj] = val
+    if PROJ_BITS:
+        print(f"[per-projection expert bits] {PROJ_BITS} (others -> xbits={a.xbits})")
+    # fmt=6 is all-or-nothing across the three expert projections: gate and up
+    # share one rotated input row in the engine (the placement rule in quant.h),
+    # so a mixed layout would need two gather buffers for zero measured benefit.
+    eff = [PROJ_BITS.get(p, a.xbits) for p in ("gate_proj", "up_proj", "down_proj")]
+    if any(b == E8 for b in eff) and not all(b == E8 for b in eff):
+        raise SystemExit(f"e8 covers all three expert projections or none (got {eff}); "
+                         "use --xbits e8, or none of the e8 flags")
+
+    # Build per-type bits map. If a type-specific arg is set, use it; otherwise the
+    # converter falls back to ebits for that type.
+    bits_map = {}
+    if a.shared_bits is not None: bits_map["sh"] = a.shared_bits
+    if a.o_bits is not None:      bits_map["o"] = a.o_bits
+    if a.kvb_bits is not None:    bits_map["kvb"] = a.kvb_bits
+    if a.attn_bits is not None:   bits_map["attn"] = a.attn_bits
+    if a.dmlp_bits is not None:   bits_map["dmlp"] = a.dmlp_bits
+    if bits_map:
+        print(f"[MIXED] precision map: " + ", ".join(f"{k}={v}bit" for k,v in sorted(bits_map.items())))
+
+    # Il PIANO risolto, PRIMA di toccare qualunque cosa (#383): --mtp/--indexer cambiano il
+    # default di ebits a 8 (testa int4 = acceptance ~0%, issue #8) e il ramo grouped e'
+    # gated su bits<=4 — combinazioni sorprendenti devono mostrarsi al secondo 1 di un job
+    # da ore, non nel size-check dopo. EN: print the RESOLVED plan before doing anything.
+    mode = "MTP head only" if a.mtp else "DSA indexer only" if a.indexer else "main model"
+    grp = f"grouped gs={a.group_size} (fmt=4)" if (a.group_size and a.ebits <= 4) else \
+          (f"PER-ROW (grouped branch needs bits<=4; ebits={a.ebits} disables it)" if a.group_size else "per-row")
+    print(f"[PLAN] mode: {mode} | source: {source_label(a)} | "
+          f"experts {a.ebits}-bit, embed/lm_head {a.io_bits}-bit, x {a.xbits}-bit | {grp}")
+
+    if a.selftest_nvfp4:
+        import torch
+        # 1) LUT e2m1: i 16 codici devono decodificare esattamente ai valori attesi.
+        lut = torch.tensor(_E2M1, dtype=torch.float32)
+        expect = [0.0,0.5,1.0,1.5,2.0,3.0,4.0,6.0,-0.0,-0.5,-1.0,-1.5,-2.0,-3.0,-4.0,-6.0]
+        assert lut.tolist() == expect, "LUT e2m1 errata"
+        print("[nvfp4] LUT e2m1: 16/16 codici OK")
+        # 2) round-trip: costruisco un tensore ai SOLI valori rappresentabili (scala nota per
+        #    blocco+globale), impacchetto come modelopt, poi dequant deve tornare ESATTO.
+        import numpy as np, io
+        from safetensors.torch import save as st_save
+        from safetensors import safe_open
+        rng = np.random.default_rng(0); O, I, GS = 8, 64, 16
+        codes = rng.integers(0, 16, size=(O, I)).astype(np.uint8)   # nibble e2m1 casuali
+        w4 = np.array(_E2M1, np.float32)[codes]                      # [O,I]
+        # scale per-blocco (rappresentabili in f8e4m3) + globale piccola (stile modelopt)
+        blk = rng.choice([0.5,1.0,2.0,4.0,8.0], size=(O, I//GS)).astype(np.float32)
+        gscale = np.float32(3.9e-5)
+        W = w4 * np.repeat(blk, GS, axis=1) * gscale                 # riferimento esatto
+        # impacchetto: pari->nibble basso, dispari->alto
+        packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).astype(np.uint8)
+        import ml_dtypes  # solo per il test: encode f8e4m3 delle scale di blocco
+        tens = {name: torch.from_numpy(arr) for name, arr in {
+            "w.weight": packed,
+            "w.weight_scale": blk.astype(ml_dtypes.float8_e4m3fn).view(np.uint8),  # placeholder
+        }.items()}
+        # torch non ha un costruttore da bytes f8: passo via file safetensors scritto a mano.
+        # piu' semplice: uso direttamente dequant_nvfp4 su un finto 'f' in-memory.
+        class _F:
+            def __init__(s, d): s.d = d
+            def get_tensor(s, n): return s.d[n]
+            def get_slice(s, n): return None
+        blk_f8 = blk.astype(ml_dtypes.float8_e4m3fn)                 # quantizza le scale a f8
+        f = _F({"w.weight": torch.from_numpy(packed),
+                "w.weight_scale": torch.from_numpy(blk_f8.view(np.uint8)).view(torch.float8_e4m3fn),
+                "w.weight_scale_2": torch.tensor(gscale)})
+        got = dequant_nvfp4(f, "w.weight")
+        # riferimento con scale gia' quantizzate a f8 (per confronto esatto)
+        Wq = w4 * np.repeat(blk_f8.astype(np.float32), GS, axis=1) * gscale
+        maxerr = float(np.abs(got - Wq).max())
+        print(f"[nvfp4] round-trip encode->dequant: max abs err = {maxerr:.3e} "
+              f"({'OK' if maxerr < 1e-9 else 'FAIL'})")
+        assert maxerr < 1e-9
+        # 3) requant colibri int4 su valori dequantati -> errore piccolo atteso
+        q, s = quant_int4(got.astype(np.float32), 4)
+        rb = (I + 1)//2; qb = q.reshape(O, rb)
+        lo = (qb & 0x0F).astype(np.int32) - 8; hi = ((qb >> 4) & 0x0F).astype(np.int32) - 8
+        deq = np.empty((O, I), np.float32); deq[:, 0::2] = lo; deq[:, 1::2] = hi[:, :I-I//2]
+        deq = deq * s[:, None]
+        rel = np.abs(deq - got).mean() / (np.abs(got).mean() + 1e-12)
+        # Informativo, NON un test di uguaglianza: requantizzare int4 per-riga dati che
+        # spaziano 16x per il block-scale costa ~0.17 di errore relativo di suo. La soglia
+        # larga becca solo una corruzione grossolana, non e' un bound di precisione.
+        # EN: informational — per-row int4 requant of 16x-block-range data inherently ~0.17.
+        print(f"[nvfp4] dequant->colibri int4->dequant: errore rel medio = {rel:.4f} "
+              f"(atteso ~0.17; {'OK' if rel < 0.30 else 'ANOMALO'})")
+        assert rel < 0.30, f"requant rel err {rel:.3f} troppo alto: dequant probabilmente corrotto"
+        print("[nvfp4] SELFTEST OK")
+        return
+
+    if a.selftest:
+        import torch
+        w = (torch.randn(256, 256) * 0.3)
+        O, I = w.shape; bs = 128
+        sc = torch.zeros(O // bs, I // bs)
+        for bi in range(O // bs):
+            for bj in range(I // bs):
+                blk = w[bi*bs:(bi+1)*bs, bj*bs:(bj+1)*bs]
+                sc[bi, bj] = blk.abs().max() / 448.0
+        q = (w / sc.repeat_interleave(bs,0).repeat_interleave(bs,1)).to(torch.float8_e4m3fn)
+        deq = (q.to(torch.float32) * sc.repeat_interleave(bs,0).repeat_interleave(bs,1))
+        rel = (deq - w).abs().mean() / w.abs().mean()
+        print(f"[selftest fp8 block-dequant] mean relative error = {rel:.4f}  "
+              f"({'OK' if rel < 0.05 else 'HIGH'})")
+        return
+
+    os.makedirs(a.outdir, exist_ok=True)
+    if a.indir:    # conversione locale (test)
+        cfg_path = os.path.join(a.indir, "config.json")
+        if os.path.exists(cfg_path):
+            with open(cfg_path) as fh:
+                check_model_family(json.load(fh), a.indir)
+        # niente config.json: fixture sintetiche (glm_tiny) -- si procede come sempre
+        shards = sorted(glob.glob(os.path.join(a.indir, "*.safetensors")))
+        from safetensors.numpy import save_file
+        # #383: se l'indice c'e', i passaggi --mtp/--indexer convertono SOLO gli shard
+        # che contengono i tensori richiesti (3 invece di scandire tutti i 141 — ogni
+        # scansione a vuoto apre comunque uno shard da 5 GB). Senza indice: scansione
+        # completa come prima.
+        # EN: #383: when the index is present, the --mtp/--indexer passes convert ONLY
+        # the shards that hold the requested tensors (3 instead of scanning all 141 —
+        # every empty scan still opens a 5 GB shard). Without the index: full scan as
+        # before.
+        if a.mtp or a.indexer:
+            idxp = os.path.join(a.indir, "model.safetensors.index.json")
+            if os.path.exists(idxp):
+                wmap = json.load(open(idxp))["weight_map"]
+                if a.mtp:
+                    want = {v for k, v in wmap.items() if k.startswith(f"model.layers.{a.n_layers}.")}
+                else:
+                    want = {v for k, v in wmap.items() if "indexer" in k and 0 <= layer_idx(k) < a.n_layers}
+                keep = [sp for sp in shards if os.path.basename(sp) in want]
+                print(f"[PLAN] index: {len(keep)}/{len(shards)} local shard(s) hold the requested tensors")
+                shards = keep
+        # BUG #355: questo ramo ignorava --mtp/--indexer. Con --mtp scriveva
+        # out-NNNNN (gli STESSI nomi di una conversione normale) in ebits=8 e
+        # keep_mtp=False -> il "secondo passaggio MTP" nella stessa outdir
+        # SOVRASCRIVEVA il container gia' finito con una riconversione int8
+        # completa, in silenzio (137/141 shard distrutti prima di accorgersene).
+        # Ora il ramo locale rispecchia il download path: prefisso corretto,
+        # flag passate, shard vuoti saltati.
+        prefix = "out-mtp-" if a.mtp else "out-idx-" if a.indexer else "out-"
+        # RIPRESA (#383): i nomi out-NNNNN contano gli shard EMESSI, non l'indice di
+        # input (gli shard senza tensori rilevanti non producono file), quindi "il
+        # file esiste" non basta per saltare il lavoro gia' fatto. Un manifest
+        # sidecar ricorda input -> output (o "vuoto") e con quali parametri: la
+        # ripresa salta solo cio' che combacia, e parametri diversi sulla stessa
+        # outdir vengono rifiutati invece di mescolare container (il modo #355).
+        # EN: RESUME (#383): out-NNNNN names count EMITTED shards, not the input
+        # EN: index (shards with no relevant tensors emit no file), so "the file
+        # EN: exists" is not enough to skip completed work. A sidecar manifest
+        # EN: records input -> output (or "empty") plus the conversion parameters:
+        # EN: resume skips only what matches, and different parameters on the same
+        # EN: outdir are refused instead of mixing containers (the #355 failure mode).
+        params = {"ebits": a.ebits, "io_bits": a.io_bits, "xbits": a.xbits,
+                  "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map,
+                  "proj_bits": dict(PROJ_BITS)}
+        prog_path = os.path.join(a.outdir, f".{prefix}progress.json")
+        prog = {}
+        if os.path.exists(prog_path):
+            try: prog = json.loads(open(prog_path).read())
+            except (OSError, ValueError): prog = {}
+            if prog and prog.get("params") != params:
+                print(f"ERROR: {prog_path} records a conversion with {prog.get('params')};\n"
+                      f"       this run uses {params}. Refusing to mix conversions in the same "
+                      f"outdir — use a fresh --outdir (or delete the manifest and the "
+                      f"{prefix}*.safetensors shards to redo).")
+                return
+        done = prog.setdefault("shards", {}); prog["params"] = params
+        if ML4 and not a.mtp and not a.indexer: ML4_STASH = os.path.join(a.outdir, "_mmproj")
+        n = 0; fresh = 0; skipped = 0
+        import time as _t
+        t_start = _t.time()
+        # --workers > 1: shards are already local, so convert them concurrently. Writing and
+        # the manifest stay in THIS process, walked in shard order, so output bytes and the
+        # out-NNNNN numbering match the serial path exactly. workers == 1 = original path.
+        _pool = _result_it = None
+        if a.workers and a.workers > 1:
+            from multiprocessing import Pool
+            _pending = [(i, sp, a.n_layers, a.ebits, a.io_bits, a.xbits,
+                         a.mtp, a.indexer, a.group_size, bits_map)
+                        for i, sp in enumerate(shards)
+                        if not _shard_already_done(done, os.path.basename(sp), a.outdir)]
+            _pool = Pool(a.workers, initializer=_init_worker, initargs=(dict(PROJ_BITS), ML4, ML4_STASH))
+            _result_it = iter(_pool.imap(_convert_one, _pending))
+        for i, sp in enumerate(shards):
+            key = os.path.basename(sp)
+            prev = done.get(key)                          # None = mai visto; "" = visto, vuoto; nome = emesso
+            if prev is not None and (prev == "" or os.path.exists(os.path.join(a.outdir, prev))):
+                if prev: n += 1
+                skipped += 1
+                continue
+            # Progress + ETA: the local pass can run for days on a big model (E8 on
+            # GLM-5.2 is ~50 h split across workers), and without this the loop is
+            # silent until it finishes. flush because stdout is a redirected file.
+            eta = ""
+            if fresh:
+                per = (_t.time() - t_start) / fresh
+                eta = f", ETA {per * (len(shards) - i) / 3600:.1f} h"
+            print(f"[{i + 1}/{len(shards)}] {key} ({free_gb(a.outdir):.0f} GB free{eta})", flush=True)
+            if _result_it is not None:
+                _ri, out = next(_result_it)               # parallel: converted by a worker, in shard order
+            else:
+                out = {}
+                convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits,
+                              keep_mtp=a.mtp, keep_idx=a.indexer,
+                              group_size=a.group_size, bits_map=bits_map)
+            if not out:                                   # shard senza MTP/idx: niente file (come il download path)
+                done[key] = ""
+            else:
+                name = f"{prefix}{n:05d}.safetensors"
+                _save_file_atomic(save_file, out, os.path.join(a.outdir, name))
+                done[key] = name; n += 1; fresh += 1
+            tmp_prog = prog_path + ".tmp"                 # scrittura atomica: una ripresa non vede mai un manifest mezzo scritto
+            with open(tmp_prog, "w") as f: json.dump(prog, f, indent=1)   # EN: atomic write: a resume never sees a half-written manifest
+            os.replace(tmp_prog, prog_path)
+        if _pool is not None:
+            _pool.close(); _pool.join()
+        if skipped: print(f"[RESUME] {skipped} shard(s) already done in {a.outdir}, skipped")
+        # metadati per la conversione principale: gli stessi quattro file del download
+        # path — senza tokenizer.json chat/serve non partono. I passaggi mtp/idx vanno
+        # nella stessa outdir di un container gia' completo di metadati.
+        # EN: metadata for the main pass: the same four files as the download path —
+        # EN: chat/serve won't start without tokenizer.json. The mtp/idx passes target
+        # EN: an outdir whose container already has its metadata.
+        if not a.mtp and not a.indexer:
+            copied, missing = [], []
+            for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"] + \
+                      (["processor_config.json"] if ML4 else []):
+                src = os.path.join(a.indir, fn)
+                if os.path.exists(src): shutil.copy(src, a.outdir); copied.append(fn)
+                else: missing.append(fn)
+            if ML4: ml4_write_config(a.outdir); ml4_mmproj.finish(a.outdir, a.indir)
+            print(f"[META] copied from {a.indir}: {', '.join(copied) if copied else 'nothing'}")
+            if missing:
+                print(f"[META] WARNING: not found in {a.indir}: {', '.join(missing)}"
+                      + (" — chat/serve need tokenizer.json" if "tokenizer.json" in missing else ""))
+        tag = "MTP" if a.mtp else "indexer" if a.indexer else "main"
+        print(f"converted {fresh} {tag} shard(s), {n} in container -> {a.outdir} ({prefix}NNNNN)")
+        return
+
+    # reale: scarica shard per shard, converte, cancella
+    # EN: real: download shard by shard, convert, delete
+    #
+    # ROBUSTEZZA RETE: timeout brevi sulle read cosi' un download appeso FALLISCE invece
+    # di restare fermo per sempre. 8s, non 30: "timeout" = ZERO byte ricevuti in quella
+    # finestra; su un transfer vivo i chunk arrivano di continuo, quindi 8s e' sicuro e
+    # uno stallo costa 8s invece di 30.
+    # EN: NETWORK ROBUSTNESS: short read timeouts so a hung download FAILS instead of
+    # EN: sitting there forever. 8s, not 30: a "timeout" means ZERO bytes received in that
+    # EN: window; a live transfer delivers chunks constantly, so 8s is safe and a stall
+    # EN: costs 8s instead of 30.
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "8")
+    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "15")
+    # log con timestamp: i messaggi "Trying to resume" di hf_hub diventano databili.
+    # EN: timestamped logs: hf_hub's "Trying to resume" messages become datable.
+    import logging
+    logging.basicConfig(format="%(asctime)s %(name)s: %(message)s", datefmt="%H:%M:%S")
+    # hf_xet si blocca quando la rete si riavvia (connessioni zombie senza timeout):
+    # forza la via HTTP classica, che curl ha dimostrato funzionare. (misurato 2026-07-02)
+    # EN: hf_xet hangs when the network restarts (zombie connections with no timeout):
+    # EN: force the classic HTTP path, which curl proved works (measured 2026-07-02).
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")   # =0 per riabilitare xet / to re-enable xet
+    from huggingface_hub import HfApi, hf_hub_download
+
+    # La guardia va qui: config.json pesa 5 KB e decide se i prossimi 300 GB
+    # hanno senso. Se il repo non ha config.json si procede con un avviso, per
+    # non rompere mirror atipici: il fallimento utile e' sul model_type
+    # sbagliato, non sulla rete.
+    try:
+        with open(hf_hub_download(a.repo, "config.json")) as fh:
+            check_model_family(json.load(fh), a.repo)
+    except SystemExit:
+        raise
+    except Exception as problem:
+        print(f"WARNING: could not read {a.repo}/config.json ({problem}); "
+              "proceeding without the family check.")
+
+    # lock anti-doppione: DUE convertitori sulla stessa outdir si corrompono a vicenda.
+    # EN: anti-duplicate lock: TWO converters on the same outdir corrupt each other.
+    # fcntl is Unix-only; on Windows use msvcrt or skip locking.
+    lock = open(os.path.join(a.outdir, ".convert.lock"), "w")
+    try:
+        import fcntl
+        try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("ERROR: another converter is already using this output directory. Exiting."); return
+    except ImportError:
+        try:
+            import msvcrt
+            try: msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                print("ERROR: another converter is already using this output directory. Exiting."); return
+        except ImportError:
+            pass  # no locking available — single-user converter, acceptable
+
+    # dimensioni note dei file, riempite dopo repo_info: il downloader multi-stream le usa
+    # per calcolare i confini dei segmenti e per sapere quando un file e' completo.
+    # EN: known file sizes, filled after repo_info: the multi-stream downloader uses them
+    # EN: to compute segment boundaries and to know when a file is complete.
+    SIZES = {}
+
+    def download_retry(repo, fn, dest, tries=999):
+        """Downloader multi-stream con resume via Range. Apre N segmenti concorrenti
+        (default 2, COLI_DL_STREAMS per cambiarli) e salva lo stato per-segmento in un
+        sidecar .seg -> NESSUN byte perso comunque muoia la connessione. Un singolo stream
+        HF e' limitato a ~2 MB/s (misurato); 2 stream ~ raddoppiano il throughput senza
+        saturare una linea domestica. File piccoli, COLI_DL_STREAMS=1 o un vecchio .part
+        legacy -> percorso a stream singolo (_download_single).
+        EN: multi-stream Range-resume downloader. Opens N concurrent segments (default 2,
+        EN: COLI_DL_STREAMS to change) and saves per-segment state in a .seg sidecar -> NO
+        EN: byte is lost however the connection dies. A single HF stream is paced at
+        EN: ~2 MB/s (measured); 2 streams roughly double throughput without saturating a
+        EN: home line. Small files, COLI_DL_STREAMS=1 or a legacy .part -> single-stream
+        EN: path (_download_single)."""
+        import time as _t, threading, urllib.request, urllib.error
+        url = f"https://huggingface.co/{repo}/resolve/main/{fn}"
+        out = os.path.join(dest, fn); part = out + ".part"; side = part + ".seg"
+        os.makedirs(dest, exist_ok=True)
+        expected = SIZES.get(fn)
+        if os.path.exists(out) and (expected is None or os.path.getsize(out) == expected):
+            return out
+        NS = max(1, min(8, int(os.environ.get("COLI_DL_STREAMS", "2"))))
+        # un .part senza sidecar l'ha scritto una versione precedente a stream singolo.
+        # EN: a .part without a sidecar was written by an older single-stream version.
+        legacy = os.path.exists(part) and not os.path.exists(side)
+        if expected is None or expected < (256 << 20) or NS == 1 or legacy:
+            return _download_single(url, fn, out, part, expected)
+        # ---- multi-stream ----
+        segs = [(expected * t // NS, expected * (t + 1) // NS) for t in range(NS)]
+        done = [0] * NS
+        # riprendi lo stato dei segmenti se il sidecar combacia (stesso N, stessa size).
+        # EN: resume per-segment progress if the sidecar matches (same N, same size).
+        if os.path.exists(side):
+            try:
+                st = json.loads(open(side).read())
+                if st.get("n") == NS and st.get("size") == expected: done = st["done"]
+            except Exception: pass
+        if not os.path.exists(part):
+            with open(part, "wb") as f: f.truncate(expected)   # file sparse / sparse file
+        flags = os.O_WRONLY | getattr(os, "O_BINARY", 0)
+        fd = os.open(part, flags)
+        t0 = _t.time(); nres = [0]; log_lock = threading.Lock(); stopfail = []
+        def worker(t):
+            s0, s1 = segs[t]
+            while done[t] < s1 - s0 and not stopfail:
+                pos = s0 + done[t]
+                _hdrs = {"User-Agent": "colibri-convert", "Range": f"bytes={pos}-{s1-1}"}
+                if os.environ.get("HF_TOKEN"): _hdrs["Authorization"] = f"Bearer {os.environ['HF_TOKEN']}"
+                req = urllib.request.Request(url, headers=_hdrs)
+                try:
+                    with urllib.request.urlopen(req, timeout=8) as r:
+                        if r.status != 206:               # Range ignorato: multi-stream impossibile
+                            stopfail.append(t); return    # EN: Range ignored: multi-stream impossible
+                        while done[t] < s1 - s0:
+                            chunk = r.read(1 << 20)
+                            if not chunk: break
+                            rem = (s1 - s0) - done[t]     # mai oltre il segmento / never past the segment
+                            if len(chunk) > rem: chunk = chunk[:rem]
+                            _positioned_write(fd, chunk, s0 + done[t])
+                            done[t] += len(chunk)
+                except KeyboardInterrupt: raise
+                except Exception as ex:
+                    with log_lock:
+                        nres[0] += 1
+                        print(f"    [dl] s{t}: {type(ex).__name__} at {(s0+done[t])/1e9:.2f} GB: "
+                              f"resuming (#{nres[0]})", flush=True)
+                    _t.sleep(min(15, 1 + nres[0] // NS))
+        th = [threading.Thread(target=worker, args=(t,), daemon=True) for t in range(NS)]
+        for x in th: x.start()
+        print(f"    [dl {_t.strftime('%H:%M:%S')}] connected: {NS} streams, "
+              f"{sum(done)/1e9:.2f} of {expected/1e9:.2f} GB", flush=True)
+        mark = sum(done); tmark = t0
+        while any(x.is_alive() for x in th):
+            _t.sleep(5)
+            have = sum(done)
+            tmpside = side + ".tmp"                       # checkpoint atomico / atomic checkpoint
+            open(tmpside, "w").write(json.dumps({"n": NS, "size": expected, "done": list(done)}))
+            os.replace(tmpside, side)
+            now = _t.time()
+            if now - tmark >= 30:
+                print(f"    [dl {_t.strftime('%H:%M:%S')}] {have/1e9:5.2f} GB "
+                      f"({(have-mark)/max(now-tmark,1e-9)/1e6:5.1f} MB/s, {NS} stream)", flush=True)
+                mark = have; tmark = now
+        os.close(fd)
+        if stopfail:                                      # il server non onora il Range: fallback
+            for f2 in (part, side):                       # EN: server won't honor Range: fall back
+                if os.path.exists(f2): os.remove(f2)
+            return _download_single(url, fn, out, part, expected)
+        assert sum(done) == expected
+        if os.path.exists(side): os.remove(side)
+        os.replace(part, out)
+        dt = max(_t.time() - t0, 1e-9)
+        print(f"    [dl] {fn}: {expected/1e9:.2f} GB in {dt/60:.1f} min "
+              f"({expected/dt/1e6:.1f} MB/s avg, {NS} streams, {nres[0]} resumes)", flush=True)
+        return out
+
+    def _download_single(url, fn, out, part, expected):
+        """Percorso a stream singolo con resume via Range (file piccoli / .part legacy /
+        COLI_DL_STREAMS=1). Un EOF corto ma pulito conta come ripresa; se non arriva
+        NESSUN byte nuovo, backoff invece di girare a vuoto.
+        EN: single-stream path with Range resume (small files / legacy .part /
+        EN: COLI_DL_STREAMS=1). A clean short EOF counts as a resume; if NO new byte
+        EN: arrives, back off instead of spinning."""
+        import time as _t, urllib.request, urllib.error
+        t0 = _t.time(); nres = 0; mark = 0; tmark = t0
+        while True:
+            have = os.path.getsize(part) if os.path.exists(part) else 0
+            if expected is not None and have >= expected: break
+            have0 = have
+            req = urllib.request.Request(url, headers={"User-Agent": "colibri-convert"})
+            if have: req.add_header("Range", f"bytes={have}-")
+            if os.environ.get("HF_TOKEN"): req.add_header("Authorization", f"Bearer {os.environ['HF_TOKEN']}")
+            try:
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    if have and r.status == 200:          # server ha ignorato il Range: riparti pulito
+                        have = 0                          # EN: server ignored Range: restart clean
+                    if expected is None:
+                        cl = r.headers.get("Content-Length")
+                        if cl: expected = have + int(cl)
+                    if have == 0 or nres:                 # segnale di vita subito / immediate sign of life
+                        print(f"    [dl {_t.strftime('%H:%M:%S')}] connected"
+                              f"{f' @ {have/1e9:.2f} GB' if have else ''}"
+                              f"{f' of {expected/1e9:.2f} GB' if expected else ''}", flush=True)
+                    with open(part, "ab" if have else "wb") as f:
+                        if not have: f.truncate(0)
+                        while True:
+                            chunk = r.read(1 << 20)
+                            if not chunk: break
+                            f.write(chunk); have += len(chunk)
+                            if have - mark >= 512 * 1024 * 1024 or _t.time() - tmark >= 30:
+                                now = _t.time()
+                                print(f"    [dl {_t.strftime('%H:%M:%S')}] {have/1e9:5.2f} GB "
+                                      f"({(have-mark)/max(now-tmark,1e-9)/1e6:5.1f} MB/s)", flush=True)
+                                mark = have; tmark = now
+                if expected is None: break                # lunghezza ignota: passata singola / unknown length
+                if have < expected:                       # EOF corto ma pulito: conta come ripresa
+                    nres += 1                             # EN: clean short EOF: counts as a resume
+                    if have == have0: _t.sleep(min(15, 1 + nres))   # zero progresso -> backoff / zero progress -> back off
+            except KeyboardInterrupt: raise
+            except urllib.error.HTTPError as ex:
+                if ex.code == 416: break                  # gia' completo / already complete
+                nres += 1
+                print(f"    [dl] HTTP {ex.code} at {have/1e9:.2f} GB: resuming (#{nres})", flush=True)
+                _t.sleep(min(15, 1 + nres))
+            except Exception as ex:
+                nres += 1
+                print(f"    [dl] {type(ex).__name__} at {have/1e9:.2f} GB: resuming (#{nres})", flush=True)
+                _t.sleep(min(15, 1 + nres))
+        os.replace(part, out)
+        dt = max(_t.time() - t0, 1e-9); sz = os.path.getsize(out)
+        print(f"    [dl] {fn}: {sz/1e9:.2f} GB in {dt/60:.1f} min "
+              f"({sz/dt/1e6:.1f} MB/s avg, {nres} resumes)", flush=True)
+        return out
+
+    from safetensors.numpy import save_file
+    import time as _t
+    info = None
+    for att in range(10):
+        try:
+            info = HfApi().repo_info(a.repo, files_metadata=True)
+            # dimensioni note dallo store: abilitano il download multi-stream a segmenti.
+            # EN: sizes known from the store: enable segmented multi-stream download.
+            SIZES.update({s.rfilename: s.size for s in info.siblings if s.size})
+            break
+        except KeyboardInterrupt: raise
+        except Exception as ex:
+            w = min(60, 5*(att+1)); print(f"repo_info failed ({type(ex).__name__}); retrying in {w}s", flush=True); _t.sleep(w)
+    if info is None:
+        print("ERROR: could not reach the repository after 10 retries. Check your network and repo name.", flush=True)
+        return
+    shards = sorted(s.rfilename for s in info.siblings if s.rfilename.endswith(".safetensors"))
+    if not shards:
+        print("ERROR: no .safetensors shards found in this repository.", flush=True)
+        return
+    for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"] + \
+              (["processor_config.json"] if ML4 else []):
+        try: shutil.copy(hf_hub_download(a.repo, fn, local_dir=a.outdir+"/_meta"), a.outdir)
+        except Exception: pass
+    if ML4: ml4_write_config(a.outdir)
+    tmp = os.path.join(a.outdir, "_inflight"); os.makedirs(tmp, exist_ok=True)
+    if a.mtp:
+        params = {"ebits": a.ebits, "io_bits": a.io_bits, "xbits": a.xbits,
+                  "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map,
+                  "proj_bits": dict(PROJ_BITS)}
+        if not check_or_record_params(a.outdir, "out-mtp-", params): return
+        import urllib.request
+        idx = json.loads(urllib.request.urlopen(
+            f"https://huggingface.co/{a.repo}/resolve/main/model.safetensors.index.json", timeout=30).read())["weight_map"]
+        pref = f"model.layers.{a.n_layers}."
+        mtp_shards = sorted(set(v for k, v in idx.items() if k.startswith(pref)))
+        print(f"[MTP] head at layer {a.n_layers}: {len(mtp_shards)} shards to process: {mtp_shards}")
+        for i, sh in enumerate(mtp_shards):
+            outp = os.path.join(a.outdir, f"out-mtp-{i:05d}.safetensors")
+            if os.path.exists(outp): print(f"[MTP] {outp} already done"); continue
+            print(f"[MTP {i+1}/{len(mtp_shards)}] downloading {sh}...", flush=True)
+            p = download_retry(a.repo, sh, tmp)
+            out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_mtp=True, group_size=a.group_size, bits_map=bits_map)
+            _save_file_atomic(save_file, out, outp)
+            os.remove(p)
+            for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
+                if os.path.isfile(blob): os.remove(blob)
+            print(f"    -> {os.path.basename(outp)} ({os.path.getsize(outp)/1e9:.2f} GB, {len(out)} tensors)", flush=True)
+        shutil.rmtree(tmp, ignore_errors=True); print("[MTP] DONE."); return
+    if a.indexer:
+        params = {"ebits": a.ebits, "io_bits": a.io_bits, "xbits": a.xbits,
+                  "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map,
+                  "proj_bits": dict(PROJ_BITS)}
+        if not check_or_record_params(a.outdir, "out-idx-", params): return
+        import urllib.request
+        idx = json.loads(urllib.request.urlopen(
+            f"https://huggingface.co/{a.repo}/resolve/main/model.safetensors.index.json", timeout=30).read())["weight_map"]
+        idx_shards = sorted(set(v for k, v in idx.items()
+                                if "indexer" in k and 0 <= layer_idx(k) < a.n_layers))
+        tot_gb = len(idx_shards) * 5.4
+        print(f"[IDX] indexer weights across {len(idx_shards)} shards (~{tot_gb:.0f} GB total download, resumable)")
+        for i, sh in enumerate(idx_shards):
+            outp = os.path.join(a.outdir, f"out-idx-{i:05d}.safetensors")
+            if os.path.exists(outp): continue             # gia' fatto -> ripartibile
+            print(f"[IDX {i+1}/{len(idx_shards)}] downloading {sh}...", flush=True)
+            p = download_retry(a.repo, sh, tmp)
+            out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_idx=True, group_size=a.group_size, bits_map=bits_map)
+            if out: _save_file_atomic(save_file, out, outp)
+            os.remove(p)
+            for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
+                if os.path.isfile(blob): os.remove(blob)
+            print(f"    -> {os.path.basename(outp)} ({len(out)} tensors)", flush=True)
+        shutil.rmtree(tmp, ignore_errors=True); print("[IDX] DONE."); return
+    params = {"ebits": a.ebits, "io_bits": a.io_bits, "xbits": a.xbits,
+              "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map,
+              "proj_bits": dict(PROJ_BITS)}
+    if not check_or_record_params(a.outdir, "out-", params): return
+    if ML4: ML4_STASH = os.path.join(a.outdir, "_mmproj")
+    for i, sh in enumerate(shards):
+        if free_gb(a.outdir) < a.min_free_gb:
+            print(f"STOP: free space is below {a.min_free_gb} GB. Free space and rerun to resume."); break
+        outp = os.path.join(a.outdir, f"out-{i:05d}.safetensors")
+        if os.path.exists(outp): continue                 # gia' fatto -> ripartibile
+        print(f"[{i+1}/{len(shards)}] downloading {sh} ({free_gb(a.outdir):.0f} GB free)...", flush=True)
+        p = download_retry(a.repo, sh, tmp)
+        out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, group_size=a.group_size, bits_map=bits_map)
+        _save_file_atomic(save_file, out, outp)
+        os.remove(p)                                       # <-- cancella subito lo shard fp8
+        for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
+            if os.path.isfile(blob): os.remove(blob)
+        print(f"    -> {os.path.basename(outp)} ({os.path.getsize(outp)/1e9:.2f} GB)", flush=True)
+    shutil.rmtree(tmp, ignore_errors=True)
+    print("DONE." if i == len(shards)-1 else "INTERRUPTED (rerun to resume).")
+    if ML4 and all(os.path.exists(os.path.join(a.outdir, f"out-{j:05d}.safetensors")) for j in range(len(shards))):
+        ml4_mmproj.finish(a.outdir, a.repo)
+
+if __name__ == "__main__":
+    main()

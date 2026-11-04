@@ -1,0 +1,2 @@
+# Release trees unpacked as published: keep every byte (CRLF files, binaries) as is.
+* -text
