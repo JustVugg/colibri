@@ -826,7 +826,7 @@ kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
 		--fixture ./kimi_k3_tiny
 
 .PHONY: deepseek-v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
-	deepseek-v4-tiny-check deepseek-v4-clean
+	deepseek-v4-tiny-check deepseek-v4-gpu-plan-check deepseek-v4-clean
 ifeq ($(COLI_V4_SUPPORTED),1)
 # Every shader the other engines build (VK_SPV, empty without VK=1): backend_vulkan.c
 # looks for them at run time and goes without one that is not there, and
@@ -846,7 +846,13 @@ deepseek-v4-tiny-generate:
 	$(PYTHON) tools/make_deepseek_v4_tiny.py \
 		--output ./deepseek_v4_tiny --force
 
-deepseek-v4-tiny-check: deepseek-v4-tiny-generate
+# Pure placement table: no GPU, no model, no env. Runs on every supported host.
+deepseek-v4-gpu-plan-check:
+	$(CC) -std=c11 -O2 -Wall -Wextra -I. tests/test_v4_gpu_plan.c \
+		-o tests/test_v4_gpu_plan
+	./tests/test_v4_gpu_plan
+
+deepseek-v4-tiny-check: deepseek-v4-tiny-generate deepseek-v4-gpu-plan-check
 	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(if $(strip $(ARCH)),$(ARCH),$(PORTABLE_ARCH)) deepseek-v4
 	$(PYTHON) tests/test_deepseek_v4_tiny.py \

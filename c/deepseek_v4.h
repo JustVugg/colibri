@@ -85,6 +85,14 @@ typedef struct {
     int pin_slots_per_layer;        /* -1 => auto */
     uint64_t repin_interval;        /* 0 => auto */
     int no_dspark;                  /* disable speculative draft/verification */
+    /* GPU placement request. Zero-initialized callers keep the historical
+     * behaviour: the native tier is on when the build has a backend, the
+     * device is selected by DSV4_CUDA_DEVICE and the budget is free VRAM. */
+    int gpu_off;                    /* 1 => --gpu none: no device tier */
+    int gpu_device;                 /* device ordinal when gpu_device_set */
+    int gpu_device_set;             /* 1 => gpu_device is explicit */
+    uint64_t gpu_budget_bytes;      /* 0 => free VRAM at open */
+    int gpu_workload;               /* V4GpuWorkload: 0 auto, 1 decode, 2 prefill */
 } ColiV4EngineOpenOptions;
 
 typedef struct {
