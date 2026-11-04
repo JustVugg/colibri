@@ -4090,7 +4090,8 @@ static int qwen38_edge_engine_open(
     capabilities->struct_size=sizeof(*capabilities);
     capabilities->abi_version=COLI_EDGE_ABI_VERSION;
     capabilities->flags=COLI_EDGE_CAP_TOKENIZE|COLI_EDGE_CAP_DETOKENIZE|
-                        COLI_EDGE_CAP_GREEDY|COLI_EDGE_CAP_CPU;
+                        COLI_EDGE_CAP_GREEDY|COLI_EDGE_CAP_LOGITS|
+                        COLI_EDGE_CAP_CPU;
     coli_edge_capability_string(capabilities->engine_id,
                                 sizeof(capabilities->engine_id),"qwen38");
     coli_edge_capability_string(
@@ -4248,6 +4249,32 @@ static int qwen38_edge_select(void *engine_impl,
     return 0;
 }
 
+static int qwen38_edge_logits(void *engine_impl,
+                              const ColiEdgeLogitsRequest *request,
+                              char *error,size_t error_size) {
+    Qwen38EdgeEngine *engine=(Qwen38EdgeEngine*)engine_impl;
+    Cfg *config=&engine->model.c;
+    float *hidden=(float*)malloc((size_t)config->hidden*sizeof(*hidden));
+    if(!hidden)
+        return coli_edge_adapter_error(error,error_size,
+                                       "out of memory running Qwen3.8 head");
+    const float *input=(const float*)request->input;
+    for(uint32_t row=0;row<request->rows;row++) {
+        if(request->should_cancel&&
+           request->should_cancel(request->cancel_user_data)) {
+            free(hidden);
+            return coli_edge_adapter_error(error,error_size,
+                                           "Qwen3.8 Edge logits cancelled");
+        }
+        q38_gr_read(&engine->model,&engine->model.final_gr,
+                    input+(size_t)row*config->hc_width,1,hidden,NULL);
+        q38_weight_matmul(request->logits+(size_t)row*config->vocab,hidden,
+                          &engine->model.lm_head,1,config->hidden,config->vocab);
+    }
+    free(hidden);
+    return 0;
+}
+
 static const ColiEdgeAdapter qwen38_edge_adapter={
     .struct_size = sizeof(ColiEdgeAdapter),
     .abi_version = COLI_EDGE_ABI_VERSION,
@@ -4258,6 +4285,7 @@ static const ColiEdgeAdapter qwen38_edge_adapter={
     .detokenize = qwen38_edge_detokenize,
     .embed = qwen38_edge_embed,
     .select = qwen38_edge_select,
+    .logits = qwen38_edge_logits,
     .reserved_fn = {0}
 };
 
