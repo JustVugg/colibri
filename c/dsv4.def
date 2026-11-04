@@ -50,6 +50,8 @@ EXPORTS
     dsv4_cuda_fp8_ref_matmul
     dsv4_cuda_proj_batch
     dsv4_cuda_proj_batch_release
+    dsv4_cuda_upload_fp8_ref
+    dsv4_cuda_fp8_ref_matmul_resident
     dsv4_cuda_tensor_refill_fp4
     dsv4_cuda_backend_arch_ok
     dsv4_cuda_backend_name
