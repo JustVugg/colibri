@@ -1090,6 +1090,18 @@ int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
 int coli_v4_gpu_expert_attach(ColiExpertStore *store, ColiExpertView *view);
 /* lookup-only twin: reports residency, never uploads (hybrid q* split) */
 int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view);
+/* Preload: 0 ready, 1 insufficient budget/unsupported tier, -1 load failure. */
+/* Resident experts: 0 = done (or a budget fallback under auto), -1 = a hard
+ * failure the engine must reject. */
+int coli_v4_gpu_experts_init(ColiV4Engine *engine, char *error, size_t error_size);
+int coli_v4_gpu_experts_preload(ColiV4Engine *engine, char *error, size_t size);
+int coli_v4_gpu_experts_resident(ColiExpertStore *store, int layer);
+/* 1: completed; 0: use normal loader; -1: immutable resident table failed.
+ * Does not acquire host leases or upload weights. */
+int coli_v4_gpu_moe_resident(ColiExpertStore *store, int layer,
+    const int *ids, const float *weights, int count,
+    void *shared_gate, void *shared_up, void *shared_down,
+    float limit, float *output, const float *input);
 /* DSV4_HYBRID=1 gate plus its cross-unit counters/EMAs: defined in the block
  * unit, read by the serve unit's per-turn stderr line. */
 int coli_v4_hybrid_enabled(void);
