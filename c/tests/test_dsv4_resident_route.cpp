@@ -1,4 +1,5 @@
 #include "../backend_cuda_dsv4.h"
+#include "dsv4_test_devices.h"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -8,11 +9,8 @@
 #include <vector>
 
 int main() {
-    /* The routed-route kernels need two devices; tests/dsv4_test_devices.h
-     * arrives with the kernel-test target, so read the same variable here. */
-    int devices[2] = {0, 1};
-    if (const char *csv = getenv("DSV4_TEST_DEVICES"))
-        sscanf(csv, "%d,%d", &devices[0], &devices[1]);
+    int devices[2];
+    dsv4_test_devices(devices);
     assert(dsv4_cuda_init(devices, 2));
     constexpr int H = 128, I = 128, E = 256;
     for (int device : devices) {

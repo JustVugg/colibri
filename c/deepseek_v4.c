@@ -11703,6 +11703,7 @@ int coli_v4_engine_open(ColiV4Engine **output,
 #endif
 #ifdef COLI_V4_GPU_TIER
     if (coli_v4_gpu_experts_init(engine, error, error_size)) goto fail;
+    coli_v4_gpu_head_upload(engine);
 #endif
     *output = engine;
     return 0;
@@ -11882,6 +11883,8 @@ void coli_v4_gpu_engine_close(ColiV4Engine *engine) {
         engine->gpu.dspark_mirrors = NULL;
     }
     v4_gpu_route_scratch_clear();
+    dsv4_cuda_tensor_free((Dsv4CudaTensor *)engine->gpu.head);
+    engine->gpu.head = NULL;
     dsv4_cuda_shutdown();
     engine->gpu.enabled = 0;
     engine->gpu.uploaded_bytes = 0;
@@ -12251,6 +12254,90 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
     return 0;
 }
 
+/* VRAM kept free while resident experts preload and the exact head uploads.
+ * This is deliberately separate from DSV4_CUDA_VRAM_RESERVE_MB: that one is
+ * the decode mirror cache's bank-aware growth reserve, while the preload needs
+ * room for the whole expert table and its packing copy. */
+static long long v4_gpu_resident_reserve_mb(void) {
+    const char *setting = getenv("DSV4_CUDA_RESIDENT_RESERVE_MB");
+    long long reserve = setting ? atoll(setting) : 2800;
+    return reserve < 256 ? 256 : reserve;
+}
+
+void coli_v4_gpu_head_upload(ColiV4Engine *engine) {
+#if defined(__AVX2__)
+    const char *enabled = getenv("DSV4_CUDA_HEAD");
+    if (!engine || !engine->gpu.enabled || engine->gpu.head ||
+        !engine->head_cache.data || (enabled && !atoi(enabled))) return;
+    int rows = engine->config.vocab_size, cols = engine->config.hidden_size;
+    if (rows < 1 || rows % 32 || cols < 1 || cols % 8 ||
+        engine->head_cache.bytes != (uint64_t)rows * cols * 2) return;
+    long long reserve = v4_gpu_resident_reserve_mb();
+    long long need = ((long long)rows * cols * 4 + 1048575) / 1048576;
+    /* After expert preloading: never displace complete banks to fit the head.
+     * Packing temporarily needs both copies; final residency retains one.
+     * Prefer the owning (last) device, then any other with room, rather than
+     * always pinning the head to device 0. */
+    int count = engine->gpu.device_count > 0 ? engine->gpu.device_count : 1;
+    int first = engine->gpu.device_count > 0 ? engine->gpu.devices[0] : engine->gpu.device;
+    const char *forced_setting = getenv("DSV4_CUDA_HEAD_DEVICE");
+    int forced = forced_setting && *forced_setting ? atoi(forced_setting) : -1;
+    int order[COLI_V4_GPU_MAX_DEVICES], n = 0;
+    if (forced >= 0) {
+        for (int i = 0; i < count; i++) {
+            int d = engine->gpu.device_count > 0 ? engine->gpu.devices[i] : engine->gpu.device;
+            if (d == forced) { order[n++] = d; break; }
+        }
+    }
+    for (int i = count - 1; i >= 0; i--) {
+        int d = engine->gpu.device_count > 0 ? engine->gpu.devices[i] : engine->gpu.device;
+        if (d == forced) continue;
+        order[n++] = d;
+    }
+    Dsv4CudaTensor *head = NULL;
+    int device = -1;
+    for (int k = 0; k < n; k++) {
+        int candidate = order[k];
+        if (dsv4_cuda_mem_free_mb(candidate) < reserve + need) continue;
+        if (dsv4_cuda_upload_head_exact(&head, (const uint16_t *)engine->head_cache.data,
+                                        rows, cols, candidate)) {
+            device = candidate;
+            break;
+        }
+        if (head) {
+            dsv4_cuda_tensor_free(head);
+            head = NULL;
+        }
+    }
+    if (!head) {
+        fprintf(stderr, "v4_gpu head=cpu-fallback device=%d free-MiB=%lld need-MiB=%lld reserve-MiB=%lld\n",
+                first, dsv4_cuda_mem_free_mb(first), need, reserve);
+        return;
+    }
+    engine->gpu.head = head;
+    long long bytes = dsv4_cuda_tensor_bytes(head);
+    engine->gpu.uploaded_bytes += bytes;
+    fprintf(stderr, "v4_gpu head=resident device=%d bytes=%lld arithmetic=separate-mul-add\n", device, bytes);
+#else
+    (void)engine;
+#endif
+}
+
+int coli_v4_gpu_head_scores(ColiV4Engine *engine,const float *input,float *scores) {
+    if (!engine || !engine->gpu.enabled || !engine->gpu.head) return -1;
+    return dsv4_cuda_head_scores_exact(engine->gpu.head, input, scores) ? 0 : -1;
+}
+
+int coli_v4_gpu_head_batch(ColiV4Engine *engine,const float *input,int batch,
+                           float *scores,int *ids,float *values) {
+    const char *enabled = getenv("DSV4_CUDA_HEAD_BATCH");
+    if ((enabled && !atoi(enabled)) || !engine || !engine->gpu.enabled ||
+        !engine->gpu.head || !input || batch < 1 || batch > 128) return -1;
+    if (scores)
+        return dsv4_cuda_head_scores_batch_exact(engine->gpu.head, input, batch, scores) ? 0 : -1;
+    return dsv4_cuda_head_argmax_batch_exact(engine->gpu.head, input, batch, ids, values) ? 0 : -1;
+}
+
 int coli_v4_gpu_fp8_matvec(const ColiTensorView *w, float *output,
                            const float *input) {
     Dsv4CudaTensor *tensor = (Dsv4CudaTensor *)w->gpu;
@@ -12570,16 +12657,6 @@ static int v4_gpu_experts_load(V4GpuExpertMirrorCache *cache,
     }
     cache->experts_per_layer = experts;
     return 0;
-}
-
-/* VRAM kept free while resident experts preload. This is deliberately
- * separate from DSV4_CUDA_VRAM_RESERVE_MB: that one is the decode mirror
- * cache's bank-aware growth reserve, while the preload needs room for the
- * whole expert table and its packing copy. */
-static long long v4_gpu_resident_reserve_mb(void) {
-    const char *setting = getenv("DSV4_CUDA_RESIDENT_RESERVE_MB");
-    long long reserve = setting ? atoll(setting) : 2800;
-    return reserve < 256 ? 256 : reserve;
 }
 
 int coli_v4_gpu_experts_init(ColiV4Engine *engine, char *error, size_t error_size) {
@@ -15475,20 +15552,33 @@ static int head_scores_impl(ColiV4Engine *engine, const float *hidden,
      * Each row retains the same scalar accumulation order and the final scan
      * retains vocabulary order, so logits/tie-breaking do not change. */
     if (resident) {
+        int gpu_done = 0;
+#ifdef COLI_V4_GPU_TIER
+        gpu_done = !coli_v4_gpu_head_scores(engine, hidden, scores);
+        const char *verify = getenv("DSV4_HEAD_VERIFY");
+        if (gpu_done && (!verify || !atoi(verify))) {
+            V4_DUMP_LOGITS(scores, (size_t)vocab);
+            return 0;
+        }
+#endif
 #ifdef COLI_VULKAN
-        if (coli_v4_vk_matmul &&
+        if (!gpu_done && coli_v4_vk_matmul &&
             coli_v4_vk_matmul(11, resident, NULL, 0, vocab, d, scores, hidden, 1) == 0) {
             V4_DUMP_LOGITS(scores, (size_t)vocab);
             return 0;
         }
 #endif
-        #pragma omp parallel for schedule(static)
+        int mismatches = 0;
+        #pragma omp parallel for schedule(static) reduction(+:mismatches)
         for (int row = 0; row < vocab; row++) {
             const uint16_t *weight = resident + (size_t)row * d;
-            scores[row] = head_bf16_dot(weight, hidden, d);
+            float value = head_bf16_dot(weight, hidden, d);
+            if (gpu_done) mismatches += memcmp(&value, scores + row, sizeof(value)) != 0;
+            else scores[row] = value;
         }
+        if (gpu_done) fprintf(stderr, "headverify rows=%d mismatches=%d\n", vocab, mismatches);
         V4_DUMP_LOGITS(scores, (size_t)vocab);
-        return 0;
+        return mismatches ? -1 : 0;
     }
     /* Low-memory fallback: stream small row tiles exactly as before. */
     enum { ROWS = 64 };
@@ -15550,14 +15640,14 @@ static int head_scores(ColiV4Engine *engine, const float *hidden,
     g_v4_prof_head_s += spec_now() - t0;
     return result;
 }
-static int head_argmax_batch(ColiV4Engine *engine, const float *hidden,
+static int head_argmax_batch_impl(ColiV4Engine *engine, const float *hidden,
                              const ColiSafetensorsIndex *index,
                              const ColiDeepSeekV4Config *config, int batch,
                              int *best_tokens, float *best_logits) {
     if (!engine || !hidden || !index || !config || batch < 1 ||
         !best_tokens || !best_logits) return -1;
     if (batch == 1)
-        return head_argmax(engine, hidden, index, config, best_tokens,
+        return head_argmax_impl(engine, hidden, index, config, best_tokens,
                            best_logits);
     const ColiSafetensorsTensor *head = coli_st_find(index, "head.weight");
     int d = config->hidden_size, vocab = config->vocab_size;
@@ -15570,48 +15660,81 @@ static int head_argmax_batch(ColiV4Engine *engine, const float *hidden,
         free(scores);
         return result ? -1 : 0;
     }
-    if (!head || head->dtype != COLI_ST_BF16) return -1;
+    if (!head || head->dtype != COLI_ST_BF16 || d < 1 || vocab < 1) return -1;
     int shard = coli_st_tensor_shard(index, head);
     const uint16_t *resident = coli_v4_head_cache_data(
         engine, shard, (uint64_t)head->off,
         (size_t)vocab * d * sizeof(uint16_t));
     if (!resident) {
         for (int item = 0; item < batch; item++)
-            if (head_argmax(engine, hidden + (size_t)item * d, index, config,
+            if (head_argmax_impl(engine, hidden + (size_t)item * d, index, config,
                             &best_tokens[item], &best_logits[item])) return -1;
         return 0;
     }
+#ifdef COLI_V4_GPU_TIER
+    const char *verify = getenv("DSV4_HEAD_VERIFY");
+    int verifying = verify && atoi(verify);
+    if (!verifying && !coli_v4_gpu_head_batch(engine, hidden, batch, NULL,
+                                              best_tokens, best_logits)) {
+        for (int item = 0; item < batch; item++)
+            if (best_tokens[item] < 0) return -1;
+        return 0;
+    }
+#endif
     float *scores = malloc((size_t)vocab * batch * sizeof(*scores));
     if (!scores) return -1;
+    int gpu_done = 0, mismatches = 0;
+#ifdef COLI_V4_GPU_TIER
+    if (verifying)
+        gpu_done = !coli_v4_gpu_head_batch(engine, hidden, batch, scores, NULL, NULL);
+#endif
 #ifdef COLI_VULKAN
     /* scores is [batch][vocab], which is the device's y[S, O]. */
-    int on_device = coli_v4_vk_matmul &&
+    int on_device = !gpu_done && coli_v4_vk_matmul &&
                     coli_v4_vk_matmul(11, resident, NULL, 0, vocab, d, scores,
                                       hidden, batch) == 0;
     if (!on_device)
 #endif
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) reduction(+:mismatches)
     for (int row = 0; row < vocab; row++) {
         const uint16_t *weight = resident + (size_t)row * d;
-        for (int item = 0; item < batch; item++)
-            scores[(size_t)item * vocab + row] = head_bf16_dot(
+        for (int item = 0; item < batch; item++) {
+            float value = head_bf16_dot(
                 weight, hidden + (size_t)item * d, d);
+            float *score = scores + (size_t)item * vocab + row;
+            if (gpu_done) mismatches += memcmp(&value, score, sizeof(value)) != 0;
+            else *score = value;
+        }
     }
+    if (gpu_done) fprintf(stderr, "headverify batch=%d rows=%d mismatches=%d\n", batch, vocab, mismatches);
     V4_DUMP_LOGITS(scores, (size_t)batch * vocab);
-    for (int item = 0; item < batch; item++) {
-        int winner = -1;
-        float maximum = -FLT_MAX;
-        const float *item_scores = scores + (size_t)item * vocab;
-        for (int row = 0; row < vocab; row++)
-            if (item_scores[row] > maximum) {
-                maximum = item_scores[row];
-                winner = row;
-            }
-        best_tokens[item] = winner;
-        best_logits[item] = maximum;
+    int result = mismatches ? -1 : 0;
+    for (int item = 0; !result && item < batch; item++)
+        result = head_scores_argmax(scores + (size_t)item * vocab, vocab,
+                                    best_tokens + item, best_logits + item);
+#ifdef COLI_V4_GPU_TIER
+    if (!result && gpu_done) {
+        int ids[128]; float values[128];
+        result = coli_v4_gpu_head_batch(engine, hidden, batch, NULL, ids, values);
+        for (int item = 0; !result && item < batch; item++)
+            if (ids[item] != best_tokens[item] ||
+                memcmp(values + item, best_logits + item, sizeof(float))) result = -1;
+        fprintf(stderr, "headverify batch=%d compact=%s\n", batch, result ? "failed" : "exact");
     }
+#endif
     free(scores);
-    return 0;
+    return result;
+}
+
+static int head_argmax_batch(ColiV4Engine *engine, const float *hidden,
+                             const ColiSafetensorsIndex *index,
+                             const ColiDeepSeekV4Config *config, int batch,
+                             int *best_tokens, float *best_logits) {
+    double t0 = spec_now();
+    int result = head_argmax_batch_impl(engine, hidden, index, config, batch,
+                                       best_tokens, best_logits);
+    g_v4_prof_head_s += spec_now() - t0;
+    return result;
 }
 
 static int dspark_markov_argmax(const ColiV4Engine *engine, int token,

@@ -18,6 +18,8 @@ class GpuPlacementTests(unittest.TestCase):
         source = Path(__file__).with_suffix(".c")
         with tempfile.TemporaryDirectory() as tmp:
             binary = str(Path(tmp) / "gpu-placement")
+            if "avx2" in Path("/proc/cpuinfo").read_text():
+                cc += ["-mavx2"]
             subprocess.run(cc + ["-D_GNU_SOURCE", "-O1", "-ffunction-sections",
                                  "-fdata-sections", str(source), "-Wl,--gc-sections",
                                  "-pthread", "-lm", "-o", binary], check=True,

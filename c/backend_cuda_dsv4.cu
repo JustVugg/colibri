@@ -5,13 +5,15 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include "backend_cuda_dsv4_quant.cuh"
-#if !defined(COLI_DSV4_NO_TC)#include <cublasLt.h>
+#if !defined(COLI_DSV4_NO_TC)
+#include <cublasLt.h>
 #endif
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <climits>
 #include <algorithm>
+#include <cfloat>
 #include <vector>
 #ifndef _WIN32
 #include <unistd.h>
@@ -1881,6 +1883,110 @@ extern "C" int dsv4_cuda_upload_compressor(Dsv4CudaTensor **pt,const uint16_t *w
             }
     }
     t->bytes+=bytes;*pt=t;return 1;
+}
+
+extern "C" int dsv4_cuda_upload_head_exact(Dsv4CudaTensor **pt,const uint16_t *w,int O,int I,int device){
+    if(!pt||*pt||I<1||I%8)return 0;
+    Dsv4CudaTensor *t=nullptr;
+    if(!dsv4_cuda_upload_compressor(&t,w,O,I,device))return 0;
+    // The head only consumes the packed copy; discard the upload source.
+    if(!ok(cudaFree(t->w),"head source release")){dsv4_cuda_tensor_free(t);return 0;}
+    t->w=t->bf16_cache;t->bf16_cache=nullptr;t->fmt=12;t->bytes=(long long)O*I*2;
+    *pt=t;return 1;
+}
+__global__ void head_scores_exact(const __nv_bfloat16 *w,const float *x,float *out,int O,int I){
+    int row=blockIdx.x*blockDim.x+threadIdx.x;if(row>=O)return;
+    float sum=0.f;long long base=(long long)(row/32)*I*32+row%32;
+    for(int i=0;i<I;i++)sum=__fadd_rn(sum,__fmul_rn(__bfloat162float(w[base+(long long)i*32]),x[i]));
+    out[row]=sum;
+}
+extern "C" int dsv4_cuda_head_scores_exact(Dsv4CudaTensor *t,const float *input,float *scores){
+    Dev *c=t?ctx(t->device):nullptr;
+    if(!c||t->fmt!=12||!input||!scores||!ok(cudaSetDevice(t->device),"select head device"))return 0;
+    size_t xb=(size_t)t->I*sizeof(float),yb=(size_t)t->O*sizeof(float);
+    if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,yb))return 0;
+    int success=ok(cudaMemcpyAsync(c->dx,input,xb,cudaMemcpyHostToDevice,c->stream),"head input upload");
+    if(success){
+        head_scores_exact<<<(t->O+127)/128,128,0,c->stream>>>((__nv_bfloat16*)t->w,c->dx,c->dy,t->O,t->I);
+        success=ok(cudaGetLastError(),"head scores launch")&&
+            ok(cudaMemcpyAsync(scores,c->dy,yb,cudaMemcpyDeviceToHost,c->stream),"head scores download");
+    }
+    int drained=ok(cudaStreamSynchronize(c->stream),"head scores sync");
+    return success&&drained;
+}
+
+// Four independent sums reuse each weight without changing column order.
+__global__ void head_scores_batch_exact(const __nv_bfloat16 *w,const float *x,float *out,int O,int I,int batch){
+    int row=blockIdx.x*blockDim.x+threadIdx.x,first=blockIdx.y*4;
+    if(row>=O)return;
+    float sums[4]={0.f,0.f,0.f,0.f};
+    long long base=(long long)(row/32)*I*32+row%32;
+    for(int i=0;i<I;i++){
+        float weight=__bfloat162float(w[base+(long long)i*32]);
+        #pragma unroll
+        for(int j=0;j<4;j++)if(first+j<batch)
+            sums[j]=__fadd_rn(sums[j],__fmul_rn(weight,x[(size_t)(first+j)*I+i]));
+    }
+    #pragma unroll
+    for(int j=0;j<4;j++)if(first+j<batch)out[(size_t)(first+j)*O+row]=sums[j];
+}
+
+__global__ void head_first_argmax(const float *scores,int vocab,int *ids,float *values){
+    __shared__ float maxima[256];
+    __shared__ int winners[256];
+    int lane=threadIdx.x,winner=-1;
+    float maximum=-FLT_MAX;
+    for(int row=lane;row<vocab;row+=blockDim.x){
+        float value=scores[(size_t)blockIdx.x*vocab+row];
+        if(value>maximum){maximum=value;winner=row;}
+    }
+    maxima[lane]=maximum;winners[lane]=winner;
+    __syncthreads();
+    for(int stride=128;stride;stride/=2){
+        if(lane<stride){
+            float other=maxima[lane+stride];int id=winners[lane+stride];
+            if(id>=0&&(other>maxima[lane]||
+               (other==maxima[lane]&&(winners[lane]<0||id<winners[lane])))){
+                maxima[lane]=other;winners[lane]=id;
+            }
+        }
+        __syncthreads();
+    }
+    if(!lane){ids[blockIdx.x]=winners[0];values[blockIdx.x]=maxima[0];}
+}
+
+static int head_batch_exact(Dsv4CudaTensor *t,const float *input,int batch,
+                            float *scores,int *ids,float *values){
+    if(!t||t->fmt!=12||!input||batch<1||batch>128||
+       (!scores&&(!ids||!values)))return 0;
+    Dev *c=ctx(t->device);
+    if(!c||!ok(cudaSetDevice(t->device),"select batched head device"))return 0;
+    size_t xb=(size_t)batch*t->I*sizeof(float),yb=(size_t)batch*t->O*sizeof(float);
+    if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,yb))return 0;
+    if(!scores&&(!buf((void**)&c->p1,&c->p1cap,(size_t)batch*sizeof(int))||
+                !buf((void**)&c->p2,&c->p2cap,(size_t)batch*sizeof(float))))return 0;
+    int success=ok(cudaMemcpyAsync(c->dx,input,xb,cudaMemcpyHostToDevice,c->stream),"batch head input upload");
+    if(success){
+        head_scores_batch_exact<<<dim3((t->O+127)/128,(batch+3)/4),128,0,c->stream>>>(
+            (const __nv_bfloat16*)t->w,c->dx,c->dy,t->O,t->I,batch);
+        success=ok(cudaGetLastError(),"batch head scores launch");
+    }
+    if(success&&scores)
+        success=ok(cudaMemcpyAsync(scores,c->dy,yb,cudaMemcpyDeviceToHost,c->stream),"batch head scores download");
+    else if(success){
+        head_first_argmax<<<batch,256,0,c->stream>>>(c->dy,t->O,(int*)c->p1,c->p2);
+        success=ok(cudaGetLastError(),"batch head argmax launch")&&
+            ok(cudaMemcpyAsync(ids,c->p1,(size_t)batch*sizeof(int),cudaMemcpyDeviceToHost,c->stream),"batch head ids download")&&
+            ok(cudaMemcpyAsync(values,c->p2,(size_t)batch*sizeof(float),cudaMemcpyDeviceToHost,c->stream),"batch head values download");
+    }
+    int drained=ok(cudaStreamSynchronize(c->stream),"batch head drain");
+    return success&&drained;
+}
+extern "C" int dsv4_cuda_head_scores_batch_exact(Dsv4CudaTensor *t,const float *input,int batch,float *scores){
+    return scores&&head_batch_exact(t,input,batch,scores,nullptr,nullptr);
+}
+extern "C" int dsv4_cuda_head_argmax_batch_exact(Dsv4CudaTensor *t,const float *input,int batch,int *ids,float *values){
+    return head_batch_exact(t,input,batch,nullptr,ids,values);
 }
 
 extern "C" int dsv4_cuda_upload_f32(Dsv4CudaTensor **t,const float*w,int O,int I,int d){return upload(t,w,(size_t)O*I*4,nullptr,0,O,I,d,32);}

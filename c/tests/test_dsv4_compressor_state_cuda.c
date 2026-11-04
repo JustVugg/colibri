@@ -5,6 +5,7 @@
 #endif
 #include "../deepseek_v4.c"
 #include "../backend_cuda_dsv4.h"
+#include "dsv4_test_devices.h"
 #include <assert.h>
 
 static int use_gpu, fail_after_values;
@@ -75,7 +76,7 @@ static void check(int device,int ratio,int dim,int rotate) {
     printf("device=%d ratio=%d dim=%d indexer=%d state/output/reset/partial-failure exact\n",device,ratio,dim,rotate);
 }
 int main(void) {
-    int devices[]={0,5};assert(dsv4_cuda_init(devices,2));
+    int devices[2];dsv4_test_devices(devices);assert(dsv4_cuda_init(devices,2));
     for(int i=0;i<2;i++) {check(devices[i],4,512,0);check(devices[i],128,512,0);check(devices[i],4,128,1);}
     dsv4_cuda_shutdown();
 }

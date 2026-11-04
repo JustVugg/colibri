@@ -1,4 +1,5 @@
 #include "../backend_cuda_dsv4.h"
+#include "dsv4_test_devices.h"
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -12,7 +13,7 @@ static float decode(uint16_t v) {
 }
 
 int main() {
-    int devices[]={0,5};
+    int devices[2];dsv4_test_devices(devices);
     assert(dsv4_cuda_init(devices,2));
     for(int device:devices) for(int rows:{256,512,1024}) for(int cols:{4096,4103}) {
         std::vector<uint16_t> w(rows*cols), g(rows*cols);

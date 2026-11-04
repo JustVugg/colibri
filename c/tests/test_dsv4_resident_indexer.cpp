@@ -1,4 +1,5 @@
 #include "../backend_cuda_dsv4.h"
+#include "dsv4_test_devices.h"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -6,7 +7,8 @@
 #include <vector>
 
 int main() {
-    int devices[] = {0, 5};
+    int devices[2];
+    dsv4_test_devices(devices);
     assert(dsv4_cuda_init(devices, 2));
     constexpr int R = 256, C = 256;
     for (int device : devices) for (int packed : {0, 1}) {
