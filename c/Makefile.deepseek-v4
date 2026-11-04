@@ -201,6 +201,8 @@ V4_DEEPGEMM_FLAGS += -DCOLI_DSV4_NO_TC
 endif
 V4_NVCCFLAGS = -O3 -std=c++20 --expt-relaxed-constexpr --expt-extended-lambda -Xcompiler=-fPIC \
                $(V4_CUDA_GENCODE) $(V4_DEEPGEMM_FLAGS)
+V4_GPUCC = $(NVCC)
+V4_GPUFLAGS = $(V4_NVCCFLAGS)
 CFLAGS += -DCOLI_V4_GPU_TIER
 V4_WIN_EXTRA_OBJS += backend_cuda_dsv4.o
 # libcuda (driver API, TMA descriptors) is linked from the toolkit stubs: the
@@ -210,6 +212,22 @@ V4_WIN_EXTRA_OBJS += backend_cuda_dsv4.o
 LDFLAGS += -L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/lib64/stubs -Wl,-rpath,$(CUDA_HOME)/lib64 \
            -lcudart -lcuda -lcublasLt -lstdc++
 endif
+endif
+
+# ---- Linux HIP tier (opt-in): HIP=1 -----------------------------------------
+# The same backend_cuda_dsv4.cu, compiled by hipcc. The generic CUDA/HIP
+# objects (backend_cuda.o, cuda_chain.o, cu_xb.o, cu_tier.o) come from the
+# parent Makefile via V4_CUT_OBJS. NO_TC is implied: cuBLASLt and DeepGEMM are
+# NVIDIA-only paths, and the HIP arm uses the generic kernels.
+HIP ?= 0
+ifeq ($(HIP),1)
+HIP_ARCH ?= native
+V4_GPUCC = hipcc
+V4_GPUFLAGS = -O3 -std=c++20 --offload-arch=$(HIP_ARCH) \
+              -DCOLI_DSV4_NO_TC -D_GNU_SOURCE -fPIC
+CFLAGS += -DCOLI_V4_GPU_TIER
+V4_WIN_EXTRA_OBJS += backend_cuda_dsv4.o
+LDFLAGS += -lamdhip64 -lstdc++
 endif
 
 # ---- Vulkan (opt-in): VK=1 ---------------------------------------------------
@@ -227,7 +245,11 @@ endif
 V4_CUT_OBJS ?=
 ifneq ($(strip $(V4_CUT_OBJS)),)
 CFLAGS += -DCOLI_CUDA
+ifeq ($(HIP),1)
+LDFLAGS += -lamdhip64
+else
 LDFLAGS += -lcublas
+endif
 endif
 VK ?= 0
 GLSLC ?= glslc
@@ -296,7 +318,7 @@ FORCE:
 # a dry run (make -n) or a clean writes nothing: the file is only touched by the
 # recipe, and only when the command really changed.
 V4_CUDA_FLAGS_STAMP = deepseek_v4.cudaflags
-V4_TRACK_CUDA_FLAGS = $(subst ','\'',$(NVCC) $(V4_NVCCFLAGS))
+V4_TRACK_CUDA_FLAGS = $(subst ','\'',$(V4_GPUCC) $(V4_GPUFLAGS))
 $(V4_CUDA_FLAGS_STAMP): FORCE
 	@flags='$(V4_TRACK_CUDA_FLAGS)'; \
 	if test x"$$flags" != x"`cat $@ 2>/dev/null`"; then \
@@ -377,7 +399,7 @@ backend_loader_dsv4.o: backend_loader_dsv4.c backend_cuda_dsv4.h $(V4_FLAGS_STAM
 # Linux/macOS CUDA=1: the tier compiled straight into the engine.
 backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h $(V4_DEEPGEMM_DEP) \
 	$(V4_CUDA_FLAGS_STAMP)
-	"$(NVCC)" $(V4_NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
+	"$(V4_GPUCC)" $(V4_GPUFLAGS) -c backend_cuda_dsv4.cu -o $@
 
 ifneq ($(DEEPGEMM_STAMP),)
 $(DEEPGEMM_STAMP):

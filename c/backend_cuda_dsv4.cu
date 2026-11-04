@@ -1,9 +1,11 @@
 #include "backend_cuda_dsv4.h"
+#include "backend_gpu_compat.h"
 #include <chrono>
-#include <cuda_runtime.h>
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIP__)
 #include <cuda_profiler_api.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#endif
 #if !defined(COLI_DSV4_NO_TC)
 #include <cublasLt.h>
 #endif
