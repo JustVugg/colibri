@@ -1095,7 +1095,13 @@ PY
   # the host pool (a budget of three experts on the device, the rest in system RAM the
   # device reads): the CPU computes its experts' pairs in place with the device's
   # roundings (the hybrid), here in the float form (GQ_EXACT=1)
-  v4_tier "the host pool, its pairs on the CPU" deepseek_v4_tiny_t long COLI_VK_TIER_HOST=1 COLI_VK_TIER_GB=0.00009 GQ_EXACT=1
+  # COLI_VK_TIER_EXPERTS=0 pins the standing hybrid path this case measures: the
+  # compute-site lever (the default where the engine wires its finish-site group, as
+  # deepseek_v4 does) computes decode's routed experts on the device through zero-copy
+  # store-slab aliases instead -- no CPU pair ever runs, and the hybrid clause this
+  # case greps never prints (the lever's own coverage is the compute-site cases of
+  # test_vk_tier)
+  v4_tier "the host pool, its pairs on the CPU" deepseek_v4_tiny_t long COLI_VK_TIER_HOST=1 COLI_VK_TIER_GB=0.00009 GQ_EXACT=1 COLI_VK_TIER_EXPERTS=0
   grep -q "host pool pairs computed by the CPU in place" v4-vk.err || { grep '\[VK\] tier' v4-vk.err; fail "deepseek_v4 tier the host pool: no pair on the CPU"; }
   # A served prompt with every routed expert on the device (warm start from the CPU
   # run's history): its per-position logprob echoes against the CPU's. Measured on
