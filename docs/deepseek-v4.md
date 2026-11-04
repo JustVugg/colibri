@@ -212,7 +212,15 @@ the total budget for dense, shared experts, the prefill bank and mirrors, and
 512 MiB of system reserve (vLLM's `gpu_memory_utilization=0.9` and colibri's
 2 GiB general CUDA reserve are the same idea); an explicit `--vram` is used
 as given and clamped to free VRAM. Measured on 8 GB: 1955-token prefill
-215.6 s against 363.4 s on the CPU (1.69x), peak 6.97 GiB. The environment
+215.6 s against 363.4 s on the CPU (1.69x), peak 6.97 GiB.
+
+On 8 GB the two phases cannot both be resident, so the engine keeps both
+shapes from the same budget and switches at the boundary. A prompt of at
+least 64 fresh tokens uploads dense+attention (clearing the decode mirrors),
+runs the prefill, then releases dense and lets the mirror cache refill for
+decode; a shorter prompt keeps the decode shape (dense in RAM, more mirrors)
+because the 6.2 GiB upload would cost more than it saves. The switch is logged
+as `v4_gpu phase=prefill ...` / `v4_gpu phase=decode ...`. The environment
 variables below are debug overrides of that plan, not the user contract.
 
 What the knobs do (full table in [Environment reference](#environment-reference-v4-engine)):

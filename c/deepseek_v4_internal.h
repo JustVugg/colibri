@@ -6,6 +6,7 @@
  * External callers should use deepseek_v4.h (engine / config / prompt).
  */
 #include "deepseek_v4.h"
+#include "deepseek_v4_gpu_plan.h"
 
 #include <stdio.h>
 #include "tensor.h"
@@ -1031,6 +1032,8 @@ int coli_v4_gpu_sparse_attention_batch_cached_idx(
     int comp_limit, int heads, int head_dim, int batch);
 int coli_v4_gpu_moe_batch_wanted(void);
 void coli_v4_gpu_moe_batch_release(void);
+void coli_v4_gpu_phase_begin(ColiV4Engine *engine, int prefill,
+                             int fresh_tokens);
 void coli_v4_gpu_moe_batch_hint(int total_fresh_tokens);
 void coli_v4_gpu_moe_batch_prefill(int prefill);
 int coli_v4_gpu_moe_batch_union(float *outputs,
@@ -1158,6 +1161,12 @@ struct ColiV4Engine {
         int plan_attn;
         int plan_mirror_slots;
         long long plan_reserve_bytes;
+        /* Both phases, decided once at open; phase_begin moves the active
+         * fields between them. */
+        V4GpuPlan plan_decode;
+        V4GpuPlan plan_prefill;
+        long long plan_budget_bytes;
+        long long plan_free_bytes;
         /* Optional opaque V4GpuExpertMirrorCache* for the dspark/MTP draft
          * experts (separate bounded LRU; see dspark_mirrors_ensure). NULL
          * unless V4_MTP_GPU=1 and the tier opened successfully. */

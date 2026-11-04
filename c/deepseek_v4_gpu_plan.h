@@ -55,6 +55,7 @@ typedef struct {
 #define V4_GPU_PLAN_HEADROOM_BYTES (256LL << 20)
 #define V4_GPU_PLAN_DEFAULT_SAFETY_BYTES (512LL << 20)
 #define V4_GPU_PLAN_DENSE_DECODE_MIN_BUDGET (10LL << 30)
+#define V4_GPU_PLAN_PREFILL_MIN_TOKENS 64
 
 static inline long long v4_gpu_plan_mirror_bytes(const V4GpuPlanRequest *r) {
     return r->mirror_bytes > 0 ? r->mirror_bytes : (12LL << 20) + (3LL << 19);
