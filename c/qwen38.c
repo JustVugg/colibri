@@ -1190,10 +1190,13 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     Q38Spec *sp = &g_q38_run_spec;
     if (m->draft_vocab) draft_vocab_begin(m->draft_vocab, prompt, np, 0);
     *sp = q38_spec_begin(m, prompt, np);   /* Q38_MTP=1, COLI_LOOKUP=1: drafts, every token still the argmax below */
-    int len = np;
+    int len = np, picked = -1;
     for (int s = 0; s < n_new; s++) {
-        int best = 0; float bv = logit[0];
-        for (int i = 1; i < c->vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
+        int best = picked;   /* the step's own pick (greedy), else the scan */
+        if (best < 0) {
+            best = 0; float bv = logit[0];
+            for (int i = 1; i < c->vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
+        }
         if (s == 0 && g_ttft < 0) g_ttft = now_s() - g_gen_t0;   /* record TTFT */
         if (g_stream) { stream_token(best); fflush(stdout); }
         if (s == n_new - 1) {
@@ -1208,7 +1211,10 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
         }
         free(logit); out[len++] = best;
         if (m->draft_vocab) draft_vocab_count_token(m->draft_vocab, best);
+        /* the steps' own picks (greedy), the last token's logits kept: a verify that reaches it has them */
+        sp->greedy = !g_capture_last_logit || n_new - 1 - s > Q38_SPEC_ROWS;
         logit = q38_spec_step(m, sp, best, len - 1, n_new - 1 - s);
+        picked = logit ? sp->next_tok : -1;
     }
     q38_spec_end(m, sp);
 }
@@ -2346,6 +2352,8 @@ static int serve_one_turn(Model *m, ServeReq *q){
     /* Q38_MTP=1: the head drafts and a verify forward checks it; every token
      * is still sampled from the exact logits below, greedy or not. */
     Q38Spec spec=q38_spec_begin(m,ids,np);
+    spec.greedy=q->temp<=0.f&&q->logprobs<=0;   /* every pick the argmax and nothing else read: a step's pick may come without its logits */
+    int picked=-1;
     double first_token_at=0.0,last_token_at=0.0;
     unsigned char sbuf[16]; int sbn=0;
     for(int s=0;s<q->max_tok;s++){
@@ -2356,7 +2364,7 @@ static int serve_one_turn(Model *m, ServeReq *q){
             if(control==3)cancelled=1;
         }
         if(cancelled||stopped)break;
-        int tk = serve_sample(lo, m->c.vocab, q->temp, q->top_p);
+        int tk = picked>=0 ? picked : serve_sample(lo, m->c.vocab, q->temp, q->top_p);
         char lptail[1024]; lptail[0]=0;
         if(q->logprobs>0) coli_logprob_tail(lptail,sizeof lptail,lo,m->c.vocab,tk,q->logprobs);
         free(lo); lo=NULL;
@@ -2391,6 +2399,7 @@ static int serve_one_turn(Model *m, ServeReq *q){
         if(s == q->max_tok - 1) break;
         if(m->draft_vocab)draft_vocab_count_token(m->draft_vocab,tk);
         lo = q38_spec_step(m, &spec, tk, np+s, q->max_tok-1-s);
+        picked = lo ? spec.next_tok : -1;
     }
     q38_spec_end(m, &spec);
     /* I vettori dell'immagine valgono per QUESTO turno soltanto: lasciarli

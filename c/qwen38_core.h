@@ -284,6 +284,7 @@ typedef struct {
      * pezzo senza che niente protesti. */
     /* PLE prefetto: le righe gia' lette per il chunk in corso, o NULL. */
     float *ple_pref; int ple_pref_rows;
+    int *greedy_out, greedy_done;  /* a greedy verify's or step's argmax per logit row, the CUDA chain's (q38cc_greedy_ok): no logits then */
     Q38Vision vis;
     int vis_ready;
     float *vis_rows;
@@ -5306,7 +5307,9 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
     /* COLI_CUDA_CHAIN: the same on the CUDA device (qwen38_cuda_chain.h), every layer */
     if(g_cuda_chain&&!chain_logit){
         int echo=g_echo_k>0&&g_echo_id&&S>1;
-        chain_logit=falloc((int64_t)nlogits*c->vocab);
+        m->greedy_done=0;
+        /* a greedy caller's rows picked on the card (q38cc_greedy_ok): no logits come down */
+        chain_logit=falloc(!echo&&q38cc_greedy_ok(m,S,nlogits)?1:(int64_t)nlogits*c->vocab);
         int took=q38cc_forward(m,ids,S,pos_base,nlogits,hyper,streams!=NULL,echo?mixed:NULL,chain_logit);
         if(took){
             free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;   /* consumed, as q38_layer_forward does */
@@ -5818,6 +5821,13 @@ typedef struct {
     uint64_t lk_drafts, lk_accepted, lk_verifies;  /* prompt lookup's */
     uint64_t depth_prop[Q38_SPEC_ROWS], depth_hit[Q38_SPEC_ROWS];   /* MTP drafts by position */
     int ended_ahead;             /* the generation ended with a verify's rows unconsumed (undone) */
+    /* greedy: the caller's pick is the argmax of the logits q38_spec_step returns, and it reads
+     * nothing else of them (temperature 0, no logprobs): the step may then return a buffer
+     * without them, its pick in next_tok (the CUDA chain picks a verify's rows on the card,
+     * q38cc_greedy_ok, and the host copies and scans none); next_tok -1: the logits are there.
+     * ahead_tok: a greedy verify's picks past its first row (its ahead_logit NULL) */
+    int greedy, next_tok;
+    int ahead_tok[Q38_SPEC_ROWS];
 } Q38Spec;
 
 /* Copy slots for a verify of up to rows+1 rows: allocated the first time they are
@@ -5929,13 +5939,15 @@ static void q38_spec_hist_push(Q38Spec *sp,int tok,int pos) {
 static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
     Cfg *c=&m->c; int V=c->vocab;
     sp->tokens++;
+    sp->next_tok=-1;
     q38_spec_hist_push(sp,tok,pos);
     if(sp->ahead_n){
         int i=sp->ahead_i;
         if(tok==sp->ids[i]&&pos==sp->ahead_pos+i&&sp->force!='r'){
-            /* draft i stands: its row's logits answer, with no forward */
-            float *logit=falloc(V);
-            memcpy(logit,sp->ahead_logit+(int64_t)(i-1)*V,(size_t)V*sizeof(float));
+            /* draft i stands: its row's logits answer, with no forward (a greedy verify's: its pick) */
+            float *logit=falloc(sp->ahead_logit?V:1);
+            if(sp->ahead_logit)memcpy(logit,sp->ahead_logit+(int64_t)(i-1)*V,(size_t)V*sizeof(float));
+            else sp->next_tok=sp->ahead_tok[i-1];
             if(sp->ahead_src==SPEC_SRC_MTP){sp->accepted++;sp->depth_hit[i-1]++;}
             else sp->lk_accepted++;
             if(++sp->ahead_i==sp->ahead_n)q38_spec_settle(m,sp,sp->ahead_n,0);
@@ -6017,7 +6029,10 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
     if(!k){
         sp->forwards++;
         double t0=now_s();
+        if(sp->greedy){m->greedy_out=&sp->next_tok;m->greedy_done=0;}
         float *logit=step(m,&tok,1,pos);
+        m->greedy_out=NULL;
+        if(sp->greedy&&logit&&!m->greedy_done)sp->next_tok=argmax_first(logit,V);
         spec_gate_forward(&sp->gate,1,now_s()-t0);
         return logit;
     }
@@ -6039,7 +6054,11 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
     sp->ids[0]=tok;memcpy(sp->ids+1,d,(size_t)k*sizeof(int));
     float *streams=NULL;
     m->snap_rows=k;g_q38_rowwise=1;
+    int picks[Q38_SPEC_ROWS];
+    if(sp->greedy){m->greedy_out=picks;m->greedy_done=0;}
     float *logit=q38_forward(m,sp->ids,S,pos,S,m->mtp?&streams:NULL);
+    m->greedy_out=NULL;
+    if(sp->greedy&&logit&&!m->greedy_done)for(int r=0;r<S;r++)picks[r]=argmax_first(logit+(int64_t)r*V,V);
     spec_gate_forward(&sp->gate,S,now_s()-t_verify);
     m->snap_rows=0;g_q38_rowwise=0;
     sp->forwards++;
@@ -6049,8 +6068,11 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
     } else {sp->lk_drafts+=(uint64_t)k;sp->lk_verifies++;}
     sp->ahead_n=S;sp->ahead_i=1;sp->ahead_pos=pos;sp->ahead_src=src;
     sp->head_ok=m->mtp&&m->mtp_len==pos&&streams;
-    sp->ahead_logit=falloc((int64_t)k*V);
-    memcpy(sp->ahead_logit,logit+V,(size_t)k*V*sizeof(float));
+    if(sp->greedy){sp->next_tok=picks[0];memcpy(sp->ahead_tok,picks+1,(size_t)k*sizeof(int));}
+    else{
+        sp->ahead_logit=falloc((int64_t)k*V);
+        memcpy(sp->ahead_logit,logit+V,(size_t)k*V*sizeof(float));
+    }
     sp->ahead_streams=streams;
     return logit;
 }

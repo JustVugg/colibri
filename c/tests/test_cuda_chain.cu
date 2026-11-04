@@ -1409,6 +1409,33 @@ int main(void) {
         ck(!T->pick(lb, small, V) && !T->pick(lb, pb, V + 1), "pick past its buffers refused");
         T->free(lb); T->free(pb); T->free(small);
     }
+    printf("pick_rows\n");
+    {
+        const int V = 248320, R = 4, off = 3;   /* rows from float off: a buffer's rows past the first */
+        std::vector<float> lg = rnd((size_t)(off + R * V), 93, 10.f);
+        lg[off + 173421] = 22.f; lg[off + V + 9] = 30.f; lg[off + 2 * V + 248319] = 25.f;
+        lg[off + 3 * V + 5000] = 28.f; lg[off + 3 * V + 4000] = 28.f;   /* a tie: the lower place */
+        int ids_ref[R]; float p_ref[R];
+        for (int r = 0; r < R; r++) {
+            const float *x = lg.data() + off + (size_t)r * V;
+            int best = 0;
+            for (int i = 1; i < V; i++) if (x[i] > x[best]) best = i;
+            double z = 0.0;
+            for (int i = 0; i < V; i++) if (x[i] - x[best] > -20.f) z += expf(x[i] - x[best]);
+            ids_ref[r] = best; p_ref[r] = (float)(1.0 / z);
+        }
+        CcBuf *lb = up(lg), *pb = T->buf(8 * R, CC_DOWN), *small = T->buf(8 * R - 8, CC_DOWN);
+        int ok = T->size >= offsetof(ColiCudaChainOps, pick_rows) + sizeof T->pick_rows && T->pick_rows &&
+                 T->begin() && T->pick_rows(lb, off, pb, V, R) && T->submit(1);
+        const void *pk = T->ptr(pb);
+        int same = ok && pk;
+        for (int r = 0; same && r < R; r++)
+            same = ((const int *)pk)[2 * r] == ids_ref[r] && fabsf(((const float *)pk)[2 * r + 1] - p_ref[r]) <= 1e-5f * p_ref[r];
+        ck(same, "four rows of 248320 logits from an offset: each row's argmax (the lower place on a tie) and probability, pick's");
+        ck(ok && ids_ref[3] == 4000, "the tie row's reference is the lower place");
+        ck(ok && !T->pick_rows(lb, off, small, V, R) && !T->pick_rows(lb, off + 1, pb, V, R), "pick_rows past its buffers refused");
+        T->free(lb); T->free(pb); T->free(small);
+    }
     printf("matmul_rows\n");
     {
         for (int c = 0; c < 3; c++) {

@@ -681,6 +681,23 @@ static int fcc_pick(CcBuf *logits, CcBuf *out, int n) {
     out->d[1] = z > 0.f ? 1.f / z : 0.f;
     return 1;
 }
+static int fake_pick_rows;   /* rows pick_rows answered */
+static int fcc_pick_rows(CcBuf *logits, size_t off, CcBuf *out, int n, int rows) {
+    if (!fcc_ready() || !logits || !out || n < 1 || rows < 1 || (off + (size_t)rows * n) * 4 > logits->bytes ||
+        out->bytes < (size_t)rows * 8) return 0;
+    fake_chain_ops++;
+    for (int r = 0; r < rows; r++) {
+        const float *lg = logits->d + off + (size_t)r * n;
+        int best = 0;
+        for (int i = 1; i < n; i++) if (lg[i] > lg[best]) best = i;
+        float z = 0.f, mx = lg[best];
+        for (int i = 0; i < n; i++) if (lg[i] - mx > -20.f) z += expf(lg[i] - mx);
+        ((int *)out->d)[2 * r] = best;
+        out->d[2 * r + 1] = z > 0.f ? 1.f / z : 0.f;
+    }
+    fake_pick_rows += rows;
+    return 1;
+}
 static int fcc_matmul_rows(ColiCudaTensor *t, CcBuf *ids, CcBuf *x, CcBuf *y, int n) {
     if (!fcc_ready() || !t || !ids || !x || !y || n < 1 || !t->w || (t->fmt != 0 && t->fmt != 1)) return 0;
     if ((size_t)t->I * 4 > x->bytes || (size_t)n * 4 > ids->bytes || (size_t)n * 4 > y->bytes) return 0;
@@ -712,6 +729,10 @@ static ColiCudaChainOps fake_chain_table = {
     fcc_route, fcc_moe, fcc_signal, fcc_wait_host, fcc_tensor_dev,   /* past CC_OPS_BASE_SIZE unless a test raises size */
     NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     fcc_pick, fcc_matmul_rows,
+    NULL, NULL, NULL, NULL,                          /* kvh .. copy_regions_h */
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL,        /* the encoders' */
+    NULL, NULL, NULL,                                /* lfm3, matmul_glu, addnorm */
+    fcc_pick_rows,
 };
 static int fake_chain_absent;   /* 1: a backend without the chain (an older DLL) */
 const ColiCudaChainOps *coli_cuda_chain_ops(void) { return fake_chain_absent ? NULL : &fake_chain_table; }

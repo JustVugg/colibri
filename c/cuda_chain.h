@@ -325,6 +325,10 @@ typedef struct ColiCudaChainOps {
      * few rows: the caller's two matmuls and CC_EW_SWIGLU), 0 a failure */
     int  (*matmul_glu)(ColiCudaTensor *wg, ColiCudaTensor *wu, CcBuf *x, CcBuf *y, int S);
     int  (*addnorm)(CcBuf *x, CcBuf *t, CcBuf *w, CcBuf *y, const CcAddNorm *p);
+    /* pick_rows: pick's argmax and probability for each of `rows` rows of n logits from float
+     * off of `logits`, row r's into words 2r and 2r + 1 of `out`: a greedy decode step's or
+     * verify's tokens without the vocabulary's logits down */
+    int  (*pick_rows)(CcBuf *logits, size_t off, CcBuf *out, int n, int rows);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -430,6 +434,13 @@ static inline int cc_pick_ready(void) {
 }
 static inline int cc_pick(CcBuf *logits, CcBuf *out, int n) {
     return cc_pick_ready() ? cc_ops()->pick(logits, out, n) : 0;
+}
+static inline int cc_pick_rows_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, pick_rows) + sizeof t->pick_rows && t->pick_rows;
+}
+static inline int cc_pick_rows(CcBuf *logits, size_t off, CcBuf *out, int n, int rows) {
+    return cc_pick_rows_ready() ? cc_ops()->pick_rows(logits, off, out, n, rows) : 0;
 }
 static inline int cc_matmul_rows_ready(void) {
     const ColiCudaChainOps *t = cc_ops();
