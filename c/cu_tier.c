@@ -165,6 +165,10 @@ static const CuTierOps *cut_ops(void) {
 #define coli_vk_slab_bytes(...) (0)
 #define coli_vk_slab_cap() (0)
 #define coli_vk_slab_forget(...) ((void)0)
+/* the compute site's alias gate asks the capability itself (vk_tier.c: the device must
+ * import host pointers for the store's slabs to alias); a CUDA backend imports none, so
+ * it reads the same "no imports" the slab calls above answer and the gate refuses */
+#define coli_vk_import_alignment() (0)
 /* the forked decode path's registry is the Vulkan backend's own (coli_vk_slabreg_*,
  * backend_vulkan.c); a CUDA backend has no such registry, so every call declines and
  * the store's slots keep the malloc path, the CS alias the import branch (itself
