@@ -9,6 +9,9 @@ rows of every forward, the prompt's and every decode step's after it; the run wi
 must write the bytes of the run without it (V41_PREFILL_TAIL=0), and a tail one row shorter
 (V41_PREFILL_TAIL=14) must not, which says the tail ran and that 15 is the shortest exact one.
 
+CI also runs it on a fixture built with --index-sources 1,3, the release's layout: there layer
+4 has no indexer and reads layer 3's index list, which the tail has to carry across the cut.
+
 On the Vulkan chain (DSV41_CHAIN=1, a VK=1 build: the deepseek-chain family runs it on
 Lavapipe) the same comparison runs with the chain on and chunks of 16 rows.
 """
