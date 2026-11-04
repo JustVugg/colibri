@@ -219,6 +219,7 @@ typedef long long       (*fn_expert_bank_slot_bytes)(int hidden, int intermediat
 typedef int             (*fn_peer_access)(int a, int b);
 typedef int             (*fn_peer_probe)(int device, int peer, char *why, int why_size);
 typedef int             (*fn_peer_compute)(int device, int peer);
+typedef void            (*fn_peer_best_effort)(int on);
 typedef int             (*fn_peer_healthy)(int device);
 typedef int             (*fn_lost)(void);
 typedef Dsv4CudaExpertSet *(*fn_expert_bank_create)(int count, int hidden, int intermediate, int device,
@@ -357,6 +358,7 @@ static struct {
     fn_peer_access peer_access; /* optional (older DLLs: no peer mirror pool) */
     fn_peer_probe peer_probe;   /* optional (older DLLs: no peer mirror pool) */
     fn_peer_compute peer_compute; /* optional (older DLLs: reported as in-place reads) */
+    fn_peer_best_effort peer_best_effort; /* optional (older DLLs: strict) */
     fn_peer_healthy peer_healthy; /* optional (older DLLs: never latch a peer off) */
     fn_lost lost;                 /* optional (older DLLs: never latch CUDA off) */
     fn_expert_bank_upload expert_bank_upload;
@@ -574,6 +576,7 @@ static int dsv4_cuda_resolve(const char *dllname){
     g_dsv4.peer_access = (fn_peer_access)GetProcAddress(g_dsv4.dll, "dsv4_cuda_peer_access");
     g_dsv4.peer_probe = (fn_peer_probe)GetProcAddress(g_dsv4.dll, "dsv4_cuda_peer_probe");
     g_dsv4.peer_compute = (fn_peer_compute)GetProcAddress(g_dsv4.dll, "dsv4_cuda_peer_compute");
+    g_dsv4.peer_best_effort = (fn_peer_best_effort)GetProcAddress(g_dsv4.dll, "dsv4_cuda_set_peer_best_effort");
     g_dsv4.peer_healthy = (fn_peer_healthy)GetProcAddress(g_dsv4.dll, "dsv4_cuda_peer_healthy");
     g_dsv4.lost = (fn_lost)GetProcAddress(g_dsv4.dll, "dsv4_cuda_lost");
     g_dsv4.backend_name = (fn_backend_name)GetProcAddress(g_dsv4.dll, "dsv4_cuda_backend_name");
@@ -1063,6 +1066,10 @@ int dsv4_cuda_peer_probe(int device, int peer, char *why, int why_size){
 
 int dsv4_cuda_peer_compute(int device, int peer){
     return g_dsv4.available && g_dsv4.peer_compute ? g_dsv4.peer_compute(device, peer) : 0;
+}
+
+void dsv4_cuda_set_peer_best_effort(int on){
+    if(g_dsv4.available && g_dsv4.peer_best_effort) g_dsv4.peer_best_effort(on);
 }
 
 int dsv4_cuda_peer_healthy(int device){

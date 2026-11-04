@@ -45,7 +45,8 @@ class V4PeerInitSourceTest(unittest.TestCase):
         self.assertLess(hybrid, capacity)
         self.assertLess(capacity, probe)
         self.assertLess(probe, pair)
-        self.assertEqual(body.count("dsv4_cuda_init("), 2)
+        self.assertEqual(body.count("dsv4_cuda_init("), 3)
+        self.assertIn("dsv4_cuda_init(engine->gpu.devices, count)", body)
         self.assertIn("int ndevices = 1;", body)
         self.assertEqual(body.count("ndevices = 2;"), 1)
 
@@ -58,17 +59,22 @@ class V4PeerInitSourceTest(unittest.TestCase):
 
     def test_unset_peer_keeps_the_single_init(self):
         body = self.open_body()
-        self.assertIn('int peer = peer_setting && *peer_setting ? atoi(peer_setting) : -1;', body)
+        self.assertIn('int peer = -1;', body)
+        self.assertIn('peer = peer_setting && *peer_setting ? atoi(peer_setting) : -1;', body)
         self.assertIn("if (peer >= 0) {", body)
-        self.assertIn("if (ndevices == 1 && !dsv4_cuda_init(&device, 1)) {", body)
+        self.assertIn("if (count == 1 && ndevices == 1 && !dsv4_cuda_init(&device, 1)) {", body)
 
     def test_init_failures_release_and_clear(self):
         init = function_body(self.backend, 'extern "C" int dsv4_cuda_init(const int *dev,int n){',
                              "\n    return 1;}")
         # the only plain refusal is the argument check (and CUDA lost to a sticky fault), before any device work
-        self.assertEqual(init.count("return 0;"), 1)
-        self.assertTrue(init.startswith('extern "C" int dsv4_cuda_init(const int *dev,int n){if(n<1||n>16||g_cuda_lost)return 0;'))
-        self.assertGreaterEqual(init.count("return init_fail("), 5)
+        # three pre-init refusals: arguments, a device that will not validate,
+        # and a duplicate ordinal. Everything after that goes through init_fail.
+        self.assertEqual(init.count("return 0;"), 3)
+        self.assertTrue(init.startswith('extern "C" int dsv4_cuda_init(const int *dev,int n){if(!dev||n<1||n>16||g_cuda_lost||ng)return 0;'))
+        self.assertGreaterEqual(init.count("return init_fail("), 3)
+        self.assertIn("peer query %d -> %d unavailable", init)
+        self.assertIn("peer access %d -> %d unavailable", init)
         # the slot's device is known before its first resource is created
         self.assertLess(init.index("g[i].id=dev[i];"), init.index("cudaStreamCreateWithFlags"))
         fail = function_body(self.backend, "static int init_fail(", "return 0;}")
@@ -79,7 +85,10 @@ class V4PeerInitSourceTest(unittest.TestCase):
         self.assertLess(release_at, reset_at)
         self.assertLess(reset_at, fail.index("cudaGetLastError();"))
         self.assertEqual(init.count("return init_fail(dev,n,"), init.count("return init_fail("))
-        self.assertIn('extern "C" void dsv4_cuda_shutdown(void){dev_release(ng);}', self.backend)
+        shutdown = function_body(self.backend, "extern \"C\" void dsv4_cuda_shutdown(void){", "dev_release(ng);}")
+        self.assertIn("g_kv_ring[layer]", shutdown)
+        self.assertIn("g_kv_comp[layer]", shutdown)
+        self.assertIn("dev_release(ng);", self.backend)
         release = function_body(self.backend, "static void dev_release(int n){",
                                 "memset(g_peer,0,sizeof g_peer);}")
         for freed in ("cudaFree(g[i].decode_state)", "tc_dev_free(&g[i])",

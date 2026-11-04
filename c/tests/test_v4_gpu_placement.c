@@ -24,10 +24,26 @@ int dsv4_cuda_init(const int *devices, int count) {
     return 1;
 }
 void dsv4_cuda_shutdown(void) { shutdowns++; }
-int dsv4_cuda_device_unified(int device) { (void)device; return 0; }
+int dsv4_cuda_peer_access(int a, int b) { (void)a; (void)b; return 0; }
+void dsv4_cuda_set_peer_best_effort(int on) { (void)on; }
+int dsv4_cuda_peer_compute(int a, int b) { (void)a; (void)b; return 0; }
+int dsv4_cuda_peer_healthy(int device) { (void)device; return 1; }
+int dsv4_cuda_peer_probe(int device, int peer, char *why, int why_size) {
+    (void)device; (void)peer;
+    if (why && why_size) why[0] = 0;
+    return 0;
+}
+int dsv4_cuda_lost(void) { return 0; }
+int coli_v4_hybrid_enabled(void) { return 0; }
+int coli_v4_gpu_resident_first(void) { return 0; }
+void (*coli_v4_expert_store_vram_held)(ColiExpertStore *store, int layer,
+                                       unsigned char *held, int experts);
+/* Backend entries dev gained after #1766's base (the bank-sized mirror reserve,
+ * the prefill bank's activations): this test never reaches them. */
 int dsv4_cuda_expert_bank_slots(int experts) { (void)experts; return 0; }
 long long dsv4_cuda_expert_bank_slot_bytes(int hidden, int intermediate) { (void)hidden; (void)intermediate; return 0; }
 void dsv4_cuda_activation_free(Dsv4CudaActivation *a) { (void)a; }
+int dsv4_cuda_device_unified(int device) { (void)device; return 0; }
 long long dsv4_cuda_mem_free_mb(int device) { free_queries[device]++; return device == low_memory_device ? 0 : 32000; }
 int dsv4_cuda_stream_drain(int device) { drained[device]++; return device != 3; }
 void dsv4_cuda_tensor_free(Dsv4CudaTensor *t) { if (t) { live_tensors--; free(t); } }
@@ -271,6 +287,10 @@ static void test_preload(void) {
     low_memory_device = 3;
     assert(coli_v4_gpu_experts_preload(engine, error, sizeof(error)) == 1);
     assert(store.gpu == original && lookups == 0 && !live_tensors);
+    setenv("DSV4_CUDA_RESIDENT_EXPERTS", "auto", 1);
+    assert(coli_v4_gpu_experts_init(engine, error, sizeof(error)) == 0);
+    assert(store.gpu == original && lookups == 0 && !live_tensors && !error[0]);
+    unsetenv("DSV4_CUDA_RESIDENT_EXPERTS");
     low_memory_device = -1;
     upload_fail_after = 20; /* fail on the second device after publishing none */
     setenv("DSV4_CUDA_RESIDENT_EXPERTS", "auto", 1);

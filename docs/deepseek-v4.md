@@ -627,6 +627,18 @@ still occur before a GPU cache hit, so RAM budget and disk traffic still matter.
 Do not interpret aggregate VRAM occupancy as a throughput or numerical-parity
 claim. Validate representative prompts against the single-device configuration.
 
+Peer access is best-effort: if the driver cannot enable it for a pair, startup
+logs the reason and continues, because contiguous layer placement does not
+require P2P. A build with `COLI_DSV4_NCCL` initializes NCCL only for six devices
+(the EP2 path); other counts do not need it. The exact head goes to the owning
+(last) device with room, then any other device, then the CPU. A GGUF keeps its
+dense matrices on device 0; `DSV4_CUDA_DEVICES` splits only the layer/expert
+tier for a GGUF.
+
+Each layer's KV ring and compressed-KV buffer are tied to their device; an
+append from a different device is refused, so restart the engine after changing
+the list.
+
 Linux backend lifecycle check (requires at least two GPUs; exercises all listed
 devices, duplicate-list refusal, active-context protection, and reopen with a
 different KV owner). Run the whole CUDA unit set with:
@@ -708,8 +720,21 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `COLI_CUDA_ATTN_BATCH` (0; 1 for a GGUF on the CUDA expert tier) | `1` = GPU batched prefill attention block + GPU decode attention/indexer; unset, it is on for a GGUF whose dense matrices the CUDA expert tier's device holds (`COLI_CUDA=1`, `COLI_CUDA_DENSE`), `0` keeps it on the CPU |
 | `COLI_CUDA_MOE_BATCH` (0) | `1` = prefill MoE on the transient VRAM expert bank |
 | `COLI_CUDA_MOE_BATCH_MIN` (256) | min fresh tokens to engage the bank |
-| `DSV4_CUDA_EXPERT_MIRRORS` (4096) | upper bound on decode VRAM expert mirrors (12.75 MiB each); free VRAM sizes the cache at run time; minimum 8 (a smaller cache mirrors nothing) |
-| `DSV4_CUDA_VRAM_RESERVE_MB` (600; with the bank 600 + the bank, ×2 with `COLI_CUDA_MOE_DOUBLE=1`, + 64 mirrors, logged as `v4_gpu mirror-reserve=`) | VRAM kept free while mirrors grow (bank + attention buffers; the default only from 32 live mirrors on, see [VRAM budget](#vram-budget-and-per-card-settings)); an explicit value is used as given and, from 8 live mirrors on, kept free between free-VRAM probes |
+| `DSV4_CUDA_EXPERT_MIRRORS` (4096) | per-device upper bound on decode VRAM expert mirrors (12.75 MiB each); each device's free VRAM sizes its cache at run time; minimum 8 (a smaller cache mirrors nothing) |
+| `DSV4_CUDA_VRAM_RESERVE_MB` (600; with the bank 600 + the bank, ×2 with `COLI_CUDA_MOE_DOUBLE=1`, + 64 mirrors, logged as `v4_gpu mirror-reserve=`) | VRAM kept free on each device while **decode mirrors grow** (bank + attention buffers; the default only from 32 live mirrors on, see [VRAM budget](#vram-budget-and-per-card-settings)); an explicit value is used as given and, from 8 live mirrors on, kept free between free-VRAM probes. Mirror growth only — the resident preload and head use `DSV4_CUDA_RESIDENT_RESERVE_MB` |
+| `DSV4_CUDA_RESIDENT_RESERVE_MB` (2800, min 256) | VRAM kept free while resident experts preload and the exact head uploads; separate from the mirror-growth reserve above |
+| `DSV4_CUDA_RESIDENT_EXPERTS` (auto) | `auto` loads every routed expert when the budget fits and keeps the LRU cache on a budget refusal; `1` requires residency (a budget refusal or hard failure rejects engine open); `0` keeps the cache |
+| `DSV4_CUDA_HEAD` (1) | exact vocabulary head on the GPU; `0` keeps it on the CPU |
+| `DSV4_CUDA_HEAD_DEVICE` (unset) | exact-head device: unset tries the owning (last) device with room, then any other; set an ordinal to try that device first |
+| `DSV4_CUDA_HEAD_BATCH` (1) | batched exact head; `0` per-token |
+| `DSV4_HEAD_VERIFY` (0) | `1` checks the batched head against the per-token path (diagnostic) |
+| `DSV4_CUDA_RESIDENT_INDEXER` (1) | upload indexer query weights once per layer; `0` per call |
+| `DSV4_CUDA_INDEXER_HEADS` (1) | indexer score heads on the device; `0` the block kernel |
+| `DSV4_CUDA_INDEXER_PREP` (1) | indexer preparation on the device; `0` host path |
+| `DSV4_CUDA_WO_DECODE` (1) | output projection's decode intermediates on the device; `0` host |
+| `DSV4_CUDA_COMPRESSOR` (1) | compressor projection on the device; `0` host |
+| `DSV4_CUDA_RESIDENT_ROUTE` (1) | device-side routing/MoE for a complete 256-expert table; `0` host routing |
+| `DSV4_CUDA_BATCHED` (1) | batched BF16 routing path; `0` legacy |
 | `V4_MTP_GPU_MIRRORS` (16) | separate mirror cache for the MTP drafter |
 | `DSV4_CUDA_PIN_HOST` (1, `.cu`) | page-lock expert-cache slabs for DMA uploads |
 | `DSV4_CUDA_MOE_GROUPED` (1, `.cu`) | expert-grouped MoE GEMM rows; `0` = legacy replicated |
@@ -897,12 +922,15 @@ and expert, following Naruto's prebuilt device expert-table approach. Target
 experts are never evicted; MTP experts retain their separate cache.
 
 The loader uploads dense mirrors first, checks every device's available VRAM
-against its complete expert footprint plus `DSV4_CUDA_VRAM_RESERVE_MB` (default
-2800 MiB, minimum 256 MiB), then uploads experts. The setting overrides the LRU
-mirror capacity: the table has exactly one slot per assigned expert. A failed
-host lookup, unsupported tensor layout or upload aborts engine open and releases
-partial allocations. Budget rejection is fatal only in explicitly required mode. Publication occurs only when all cards
-have completed loading. A resident execution failure is reported rather than
+against its complete expert footprint plus `DSV4_CUDA_RESIDENT_RESERVE_MB`
+(default 2800 MiB, minimum 256 MiB), then uploads experts. That reserve is
+separate from `DSV4_CUDA_VRAM_RESERVE_MB`, which sizes the decode mirror cache's
+bank-aware growth guard. The resident reserve overrides the LRU mirror capacity:
+the table has exactly one slot per assigned expert. A failed host lookup,
+unsupported tensor layout or upload aborts engine open and releases partial
+allocations; in `auto` those hard failures still reject the engine, while a
+budget refusal keeps the cache. Publication occurs only when all cards have
+completed loading. A resident execution failure is reported rather than
 silently loading experts on the CPU.
 
 Prefill currently uses the per-token GPU MoE pipeline with these same tables,
@@ -917,6 +945,14 @@ On six RTX 5090 GPUs, a short 64-token test measured 6.155 token/s median
 Preloading took about 73 seconds and increased total cold-process latency.
 See the [full report and raw results](experiments/dsv4-full-resident-2026-09-27.md)
 for the scope, startup cost, and remaining validation limits.
+
+On 24 GB cards the complete table can exceed the budget. Measured at the
+2026-11-03 head on two RTX 3090s (500/450 W), both the full 256-expert model and
+the 150B REAP checkpoint logged `resident-experts=cache-fallback` at
+`free≈16.6 GiB reserve=2800 MiB`; the gains there are kernel-side. REAP decoded
+1.22x one GPU and 1.54x two GPUs against dev one GPU; the full model 1.19x and
+~1.36x; long-prompt TTFT 0.89x. The exact head (`DSV4_CUDA_HEAD`) goes to the
+owning (last) device with room, then any other device, then the CPU.
 
 ### Device-resident routing (default with full residency)
 

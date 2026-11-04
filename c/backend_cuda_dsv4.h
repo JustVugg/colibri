@@ -218,6 +218,9 @@ int dsv4_cuda_expert_bank_slots(int experts);
 /* Device bytes one slot of an expert bank of this geometry takes. */
 long long dsv4_cuda_expert_bank_slot_bytes(int hidden,int intermediate);
 int dsv4_cuda_peer_access(int a,int b);
+/* 1 around the layer-split init: P2P is optional there. 0 (default) keeps
+ * dsv4_cuda_init strict for the peer mirror pool. */
+void dsv4_cuda_set_peer_best_effort(int on);
 /* Before dsv4_cuda_init: can `peer` carry `device`'s peer mirror pool (both
  * visible and distinct, the peer not latched off by dsv4_cuda_peer_healthy,
  * both of an architecture and with a kernel image this build runs -- the

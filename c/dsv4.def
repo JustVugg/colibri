@@ -76,6 +76,7 @@ EXPORTS
     dsv4_cuda_peer_access
     dsv4_cuda_peer_probe
     dsv4_cuda_peer_compute
+    dsv4_cuda_set_peer_best_effort
     dsv4_cuda_peer_healthy
     dsv4_cuda_lost
     dsv4_cuda_expert_bank_upload

@@ -1073,6 +1073,11 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
                                 ColiExpertStore *store,
                                 const float *inputs, const int *tokens,
                                 int batch);
+/* Resident experts: 0 = done (or a budget fallback under auto), -1 = a hard
+ * failure the engine must reject. */
+int coli_v4_gpu_experts_init(ColiV4Engine *engine, char *error, size_t error_size);
+int coli_v4_gpu_experts_preload(ColiV4Engine *engine, char *error, size_t size);
+int coli_v4_gpu_experts_resident(ColiExpertStore *store, int layer);
 void coli_v4_gpu_head_upload(ColiV4Engine *engine);
 int coli_v4_gpu_head_scores(ColiV4Engine *engine,const float *input,float *scores);
 int coli_v4_gpu_head_batch(ColiV4Engine *engine,const float *input,int batch,
