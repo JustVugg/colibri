@@ -25,10 +25,20 @@ static int close_enough(const float *got, const float *want, int n) {
     return 1;
 }
 
-static int relative_rms(const float *got,const float *want,int n,float limit){
+static float relative_rms_value(const float *got,const float *want,int n){
     double err=0,ref=0; for(int i=0;i<n;i++){double d=got[i]-want[i];err+=d*d;ref+=(double)want[i]*want[i];}
-    float r=(float)std::sqrt(err/(ref+1e-20));
+    return (float)std::sqrt(err/(ref+1e-20));
+}
+/* T6_VERBOSE=1 prints the measured distance to the double reference even when it
+ * passes. A pass/fail alone cannot answer "which of two kernels is closer", and
+ * that is the only question worth asking when they disagree on an argmax. */
+static int relative_rms_named(const char *what,const float *got,const float *want,int n,float limit){
+    float r=relative_rms_value(got,want,n);
+    if(std::getenv("T6_VERBOSE")) std::fprintf(stderr,"[T6] %-22s relative_rms=%.3e (limit %.1e)\n",what,r,limit);
     if(r>limit){std::fprintf(stderr,"relative RMS %.5f exceeds %.5f\n",r,limit);return 0;} return 1;
+}
+static int relative_rms(const float *got,const float *want,int n,float limit){
+    return relative_rms_named("(unnamed)",got,want,n,limit);
 }
 
 /* ---- fmt=6 (E8/IQ3) --------------------------------------------------------
@@ -135,7 +145,17 @@ static int test_fmt6(int dev) {
         for (int j = 0; j < 4; j++) grid[i][j] = (uint8_t)((i*4 + j) % 17);
     if (!coli_cuda_e8_set_grid(grid)) { std::fprintf(stderr,"e8 grid upload failed\n"); return 0; }
 
-    const int I = 256, O = 128, S = 2;
+    /* Widths are overridable so this oracle -- double accumulation, the same
+     * t6_rot/t6_signs the device mirrors -- can be pointed at a model's REAL
+     * decode shape. It matters for the fmt=6 kernels: at I=256 a dot product is
+     * 8 sub-blocks, so every accumulation order rounds the same way and two
+     * kernels that disagree on a 6144-term sum still both pass here. GLM-5.2:
+     *   T6_I=6144 T6_O=2048 T6_S=1 ./backend_cuda_test
+     * Run it once per COLI_E8_WARP setting to compare the two kernel families
+     * against the double reference -- never against each other. */
+    const int I = std::getenv("T6_I") ? std::atoi(std::getenv("T6_I")) : 256,
+              O = std::getenv("T6_O") ? std::atoi(std::getenv("T6_O")) : 128,
+              S = std::getenv("T6_S") ? std::atoi(std::getenv("T6_S")) : 2;
     int nb = (I + T6_QK - 1) / T6_QK;
     uint8_t *q = (uint8_t*)std::malloc((size_t)O*nb*T6_BB);
     t6_fill(q, I, O);
@@ -157,7 +177,7 @@ static int test_fmt6(int dev) {
     ColiCudaTensor *t6 = nullptr;
     int ok = coli_cuda_matmul(&t6, got, x, q, nullptr, 6, S, I, O, dev, 0);
     if (!ok) { std::fprintf(stderr,"fmt=6 matmul rejected\n"); return 0; }
-    if (!relative_rms(got, want, S*O, 1e-4f)) { std::fprintf(stderr,"fmt=6 matmul mismatch\n"); return 0; }
+    if (!relative_rms_named("fmt6 matmul",got, want, S*O, 1e-4f)) { std::fprintf(stderr,"fmt=6 matmul mismatch\n"); return 0; }
 
     /* --- expert MLP: gate/up, silu, the device-side down rotation, down ---
      * The caller owns the gate/up input rotation (once per layer), so x goes in
@@ -204,14 +224,14 @@ static int test_fmt6(int dev) {
     if (!coli_cuda_expert_mlp(tg6,tu6,td6,got_e,x,S)) {
         std::fprintf(stderr,"fmt=6 expert_mlp rejected\n"); return 0;
     }
-    if (!relative_rms(got_e, want_e, S*I, 2e-4f)) {
+    if (!relative_rms_named("fmt6 expert_mlp",got_e, want_e, S*I, 2e-4f)) {
         std::fprintf(stderr,"fmt=6 expert_mlp mismatch (device-side rotation?)\n"); return 0;
     }
     ColiCudaTensor *eg6[2]={tg6,tg6},*eu6[2]={tu6,tu6},*ed6[2]={td6,td6};
     int erows[2]={1,1};
     float *group_e=(float*)std::malloc((size_t)S*I*sizeof(float));
     if (!coli_cuda_expert_group(eg6,eu6,ed6,erows,2,group_e,x) ||
-        !relative_rms(group_e,want_e,S*I,2e-4f)) {
+        !relative_rms_named("fmt6 expert_group",group_e,want_e,S*I,2e-4f)) {
         std::fprintf(stderr,"fmt=6 expert_group mismatch\n"); return 0;
     }
 
