@@ -1833,7 +1833,7 @@ qwen36_gguf_chain_gates() {
   # CPU computes those experts: no layer's routed experts all in the frame)
   CPUENV=GQ_EXACT=1 dmoe_gate qwen36 "chain qwen36 GGUF, the host pool within the driver's heap" none GQ_EXACT=1 COLI_VK_TIER_GB=0.0004 \
     COLI_VK_TIER_HOST=1 COLI_VK_TIER_HOST_HEAP_GB=2.001 SNAP=qwen36_gguf_tiny -- 8 8 qwen36_gguf_tiny/ref.json
-  grep -q "host pool on, [1-9].*not all of them: the driver's heap for it leaves" vk.log || { cat vk.log; fail "chain qwen36 GGUF: the host pool past the driver's heap"; }
+  grep -q "host pool on, [1-9].*not all of them; the driver's heap for it leaves" vk.log || { cat vk.log; fail "chain qwen36 GGUF: the host pool past the driver's heap"; }
 }
 # Flint (two dense layers before the experts' ones, sliding-window layers, sinks) in serve
 # mode, the chain against the CPU frame for frame. A dense layer's K/V rows reach the
