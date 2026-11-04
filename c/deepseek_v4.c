@@ -11541,6 +11541,8 @@ static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache);
 static void v4_gpu_expert_mirrors_clear(V4GpuExpertMirrorCache *cache);
 static void v4_gpu_expert_mirrors_set_limit(V4GpuExpertMirrorCache *cache,
                                             int limit);
+static void v4_gpu_expert_mirrors_set_dims(V4GpuExpertMirrorCache *cache,
+                                           int n_layers, int n_experts);
 static void v4_gpu_dense_release(ColiV4Engine *engine);
 static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                                           ColiExpertView *view, int sync);
@@ -11658,6 +11660,7 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
             plan_budget = free_bytes;
         engine->gpu.plan_budget_bytes = plan_budget;
         engine->gpu.plan_free_bytes = free_bytes;
+        dsv4_cuda_budget_set(device, plan_budget);
         /* Both phases are decided once. On 8 GB they differ: prefill puts
          * dense+attention on the card, decode keeps dense in RAM and spends
          * the VRAM on mirrors. */
@@ -11715,10 +11718,15 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
                                             : V4_GPU_PLAN_MIN_MIRRORS);
     }
     g_v4_gpu_mirror_on = engine->experts && engine->experts->gpu ? 1 : 0;
-    if (engine->experts && engine->experts->gpu)
-        v4_gpu_expert_mirrors_set_limit(
-            (V4GpuExpertMirrorCache *)engine->experts->gpu,
+    if (engine->experts && engine->experts->gpu) {
+        V4GpuExpertMirrorCache *cache =
+            (V4GpuExpertMirrorCache *)engine->experts->gpu;
+        v4_gpu_expert_mirrors_set_dims(cache,
+            engine->config.num_hidden_layers,
+            engine->config.n_routed_experts);
+        v4_gpu_expert_mirrors_set_limit(cache,
             engine->gpu.plan_mirror_slots);
+    }
     fprintf(stderr, "v4_gpu tier=%s device=%d\n",
             v4_gpu_dense_wanted(engine) ? "dense-matvec" : "expert-mirror",
             device);
@@ -12160,8 +12168,9 @@ void coli_v4_gpu_phase_begin(ColiV4Engine *engine, int prefill,
             clock_gettime(CLOCK_MONOTONIC, &phase_t1);
             fprintf(stderr,
                     "v4_gpu phase=prefill tokens=%d dense=1 active "
-                    "switch=%.3fs\n",
+                    "used=%lldMiB switch=%.3fs\n",
                     fresh_tokens,
+                    dsv4_cuda_budget_used(engine->gpu.device) >> 20,
                     (phase_t1.tv_sec - phase_t0.tv_sec) +
                         (phase_t1.tv_nsec - phase_t0.tv_nsec) * 1e-9);
             return;
@@ -12180,10 +12189,11 @@ void coli_v4_gpu_phase_begin(ColiV4Engine *engine, int prefill,
         clock_gettime(CLOCK_MONOTONIC, &phase_t1);
         fprintf(stderr,
                 "v4_gpu phase=prefill tokens=%d dense=%d attn=%d bank=%d "
-                "mirrors=%d switch=%.3fs\n",
+                "mirrors=%d used=%lldMiB switch=%.3fs\n",
                 fresh_tokens, engine->gpu.plan_dense,
                 engine->gpu.plan_attn, engine->gpu.plan_bank,
                 engine->gpu.plan_mirror_slots,
+                dsv4_cuda_budget_used(engine->gpu.device) >> 20,
                 (phase_t1.tv_sec - phase_t0.tv_sec) +
                     (phase_t1.tv_nsec - phase_t0.tv_nsec) * 1e-9);
     } else {
@@ -12191,7 +12201,10 @@ void coli_v4_gpu_phase_begin(ColiV4Engine *engine, int prefill,
         if (engine->gpu.plan_dense || engine->gpu.plan_shared) {
             v4_gpu_dense_release(engine);
             clock_gettime(CLOCK_MONOTONIC, &phase_t1);
-            fprintf(stderr, "v4_gpu phase=decode released dense switch=%.3fs\n",
+            fprintf(stderr,
+                    "v4_gpu phase=decode released dense used=%lldMiB "
+                    "switch=%.3fs\n",
+                    dsv4_cuda_budget_used(engine->gpu.device) >> 20,
                     (phase_t1.tv_sec - phase_t0.tv_sec) +
                         (phase_t1.tv_nsec - phase_t0.tv_nsec) * 1e-9);
         }
@@ -12289,7 +12302,7 @@ int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
  * The 256-expert bank is fp4 in the same packed-nibble + per-row UE8M0
  * layout the backend dsv4_cuda_matvec_grouped expects, so an expert's gate /
  * up / down views can be uploaded byte-for-byte on first use and reused for
- * every token that routes to it. A small LRU cache keyed by (layer, expert)
+ * every token that routes to it. An SLRU cache keyed by (layer, expert)
  * hangs off ColiExpertStore.gpu, created at engine open and torn down in
  * engine close (before the store itself is destroyed). Only block_rows==1
  * views are attached; rows16-packed slots stay on the CPU kernel. */
@@ -12310,6 +12323,20 @@ struct V4GpuExpertMirrorCache {
     uint64_t clock;
     int device;
     pthread_mutex_t mutex;
+    /* SLRU over slots. slot_map is [n_layers][n_experts] -> slot; the two
+     * segments are probation (0) and protected (1), as in llama.cpp's
+     * llama-moe-cache.cpp. seen/seen_gen keep the current request's experts
+     * out of victim selection. NULL when dims were not set: linear fallback. */
+    int n_layers, n_experts;
+    int *slot_map;
+    int *key_of;
+    int *prev, *next;
+    int head[2], tail[2];
+    unsigned char *is_protected;
+    int n_protected;
+    uint32_t *seen;
+    uint32_t seen_gen;
+    int last_layer;
 };
 
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
@@ -12336,6 +12363,127 @@ static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create(int device,
     return v4_gpu_expert_mirrors_create_capacity(device, capacity);
 }
 
+static void v4_gpu_expert_mirrors_slru_reset(
+        V4GpuExpertMirrorCache *cache) {
+    cache->count = 0;
+    cache->clock = 0;
+    cache->last_layer = -1;
+    cache->n_protected = 0;
+    cache->seen_gen = 1;
+    if (!cache->slot_map) return;
+    for (int i = 0; i < cache->n_layers * cache->n_experts; i++)
+        cache->slot_map[i] = -1;
+    for (int s = 0; s < cache->capacity; s++) {
+        cache->key_of[s] = -1;
+        cache->prev[s] = s - 1;
+        cache->next[s] = s + 1 < cache->capacity ? s + 1 : -1;
+        cache->is_protected[s] = 0;
+    }
+    cache->head[0] = cache->capacity > 0 ? 0 : -1;
+    cache->tail[0] = cache->capacity > 0 ? cache->capacity - 1 : -1;
+    cache->head[1] = cache->tail[1] = -1;
+    memset(cache->seen, 0, (size_t)cache->n_experts * sizeof(*cache->seen));
+}
+
+static void v4_gpu_expert_mirrors_set_dims(V4GpuExpertMirrorCache *cache,
+                                           int n_layers, int n_experts) {
+    if (!cache || n_layers < 1 || n_experts < 1) return;
+    free(cache->slot_map); free(cache->key_of);
+    free(cache->prev); free(cache->next);
+    free(cache->is_protected); free(cache->seen);
+    cache->slot_map = NULL; cache->key_of = NULL;
+    cache->prev = cache->next = NULL;
+    cache->is_protected = NULL; cache->seen = NULL;
+    cache->n_layers = n_layers; cache->n_experts = n_experts;
+    cache->slot_map = malloc((size_t)n_layers * n_experts *
+                             sizeof(*cache->slot_map));
+    cache->key_of = malloc((size_t)cache->capacity * sizeof(*cache->key_of));
+    cache->prev = malloc((size_t)cache->capacity * sizeof(*cache->prev));
+    cache->next = malloc((size_t)cache->capacity * sizeof(*cache->next));
+    cache->is_protected = malloc((size_t)cache->capacity *
+                                 sizeof(*cache->is_protected));
+    cache->seen = calloc((size_t)n_experts, sizeof(*cache->seen));
+    if (!cache->slot_map || !cache->key_of || !cache->prev || !cache->next ||
+        !cache->is_protected || !cache->seen) {
+        free(cache->slot_map); free(cache->key_of);
+        free(cache->prev); free(cache->next);
+        free(cache->is_protected); free(cache->seen);
+        cache->slot_map = NULL; cache->key_of = NULL;
+        cache->prev = cache->next = NULL;
+        cache->is_protected = NULL; cache->seen = NULL;
+        return;
+    }
+    v4_gpu_expert_mirrors_slru_reset(cache);
+}
+
+static void v4_gpu_expert_mirrors_slru_move(
+        V4GpuExpertMirrorCache *cache, int slot, int protect) {
+    int from = cache->is_protected[slot];
+    if (from == protect && slot == cache->tail[from]) return;
+    if (cache->prev[slot] >= 0)
+        cache->next[cache->prev[slot]] = cache->next[slot];
+    else
+        cache->head[from] = cache->next[slot];
+    if (cache->next[slot] >= 0)
+        cache->prev[cache->next[slot]] = cache->prev[slot];
+    else
+        cache->tail[from] = cache->prev[slot];
+    cache->prev[slot] = cache->tail[protect];
+    cache->next[slot] = -1;
+    if (cache->tail[protect] >= 0)
+        cache->next[cache->tail[protect]] = slot;
+    else
+        cache->head[protect] = slot;
+    cache->tail[protect] = slot;
+    cache->is_protected[slot] = (unsigned char)protect;
+    cache->n_protected += protect - from;
+}
+
+static void v4_gpu_expert_mirrors_slru_touch(
+        V4GpuExpertMirrorCache *cache, int slot) {
+    v4_gpu_expert_mirrors_slru_move(cache, slot, 1);
+    if (cache->n_protected > cache->limit / 2 && cache->head[1] >= 0)
+        v4_gpu_expert_mirrors_slru_move(cache, cache->head[1], 0);
+}
+
+static void v4_gpu_expert_mirrors_slru_note_layer(
+        V4GpuExpertMirrorCache *cache, int layer) {
+    if (!cache->seen) return;
+    if (cache->last_layer >= 0 && layer < cache->last_layer) {
+        if (++cache->seen_gen == 0) {
+            memset(cache->seen, 0,
+                   (size_t)cache->n_experts * sizeof(*cache->seen));
+            cache->seen_gen = 1;
+        }
+    }
+    cache->last_layer = layer;
+}
+
+static int v4_gpu_expert_mirrors_slru_victim(
+        V4GpuExpertMirrorCache *cache, int layer) {
+    for (int segment = 0; segment < 2; segment++) {
+        for (int slot = cache->head[segment]; slot >= 0;
+             slot = cache->next[slot]) {
+            if (slot >= cache->limit || slot >= cache->count) continue;
+            int key = cache->key_of[slot];
+            if (key < 0) return slot;
+            if (key / cache->n_experts == layer) continue;
+            if (cache->seen[key % cache->n_experts] == cache->seen_gen)
+                continue;
+            return slot;
+        }
+    }
+    return -1;
+}
+
+static void v4_gpu_expert_mirrors_slru_clear_slot(
+        V4GpuExpertMirrorCache *cache, int slot) {
+    int key = cache->key_of[slot];
+    if (key >= 0 && cache->slot_map)
+        cache->slot_map[key] = -1;
+    cache->key_of[slot] = -1;
+}
+
 static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache) {
     if (!cache) return;
     for (int i = 0; i < cache->count; i++) {
@@ -12348,6 +12496,9 @@ static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache) {
     }
     pthread_mutex_destroy(&cache->mutex);
     free(cache->entries);
+    free(cache->slot_map); free(cache->key_of);
+    free(cache->prev); free(cache->next);
+    free(cache->is_protected); free(cache->seen);
     free(cache);
 }
 
@@ -12365,8 +12516,7 @@ static void v4_gpu_expert_mirrors_clear(V4GpuExpertMirrorCache *cache) {
             dsv4_cuda_tensor_free(cache->entries[i].down);
         memset(&cache->entries[i], 0, sizeof(cache->entries[i]));
     }
-    cache->count = 0;
-    cache->clock = 0;
+    v4_gpu_expert_mirrors_slru_reset(cache);
     pthread_mutex_unlock(&cache->mutex);
 }
 
@@ -12395,14 +12545,47 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
      * garbage). Below 8 entries, stay on the CPU. */
     if (cache->limit < 8) return -1;
     pthread_mutex_lock(&cache->mutex);
-    int found = -1;
+    int key = -1, found = -1;
+    int layer = view->key.layer, expert = view->key.expert;
+    if (cache->slot_map && layer >= 0 && layer < cache->n_layers &&
+        expert >= 0 && expert < cache->n_experts) {
+        key = layer * cache->n_experts + expert;
+        v4_gpu_expert_mirrors_slru_note_layer(cache, layer);
+        cache->seen[expert] = cache->seen_gen;
+        found = cache->slot_map[key];
+        if (found >= 0 && found < cache->capacity &&
+            cache->entries[found].layer == layer &&
+            cache->entries[found].expert == expert &&
+            cache->entries[found].gate && cache->entries[found].up &&
+            cache->entries[found].down) {
+            v4_gpu_expert_mirrors_slru_touch(cache, found);
+            cache->entries[found].clock = ++cache->clock;
+            view->gate.gpu = cache->entries[found].gate;
+            view->up.gpu = cache->entries[found].up;
+            view->down.gpu = cache->entries[found].down;
+            pthread_mutex_unlock(&cache->mutex);
+            return 0;
+        }
+        found = -1;
+    }
+    /* Dimension-less caches (or a stale map) fall back to the old scan. */
     for (int i = 0; i < cache->count; i++) {
-        if (cache->entries[i].layer == view->key.layer &&
-            cache->entries[i].expert == view->key.expert &&
+        if (cache->entries[i].layer == layer &&
+            cache->entries[i].expert == expert &&
             cache->entries[i].gate && cache->entries[i].up &&
             cache->entries[i].down) {
             found = i;
-            break;
+            if (cache->slot_map && key >= 0) {
+                cache->key_of[found] = key;
+                cache->slot_map[key] = found;
+                v4_gpu_expert_mirrors_slru_touch(cache, found);
+            }
+            cache->entries[found].clock = ++cache->clock;
+            view->gate.gpu = cache->entries[found].gate;
+            view->up.gpu = cache->entries[found].up;
+            view->down.gpu = cache->entries[found].down;
+            pthread_mutex_unlock(&cache->mutex);
+            return 0;
         }
     }
     if (found < 0) {
@@ -12499,10 +12682,19 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
         }
         int appended = 0;   /* a new slot, not a recycled one (grown_bytes) */
         if (!grow || cache->count >= cache->limit) {
-            found = 0;
-            for (int i = 1; i < cache->count; i++)
-                if (cache->entries[i].clock < cache->entries[found].clock)
-                    found = i;
+            if (cache->slot_map) {
+                found = v4_gpu_expert_mirrors_slru_victim(cache, layer);
+                if (found < 0) {
+                    pthread_mutex_unlock(&cache->mutex);
+                    return -1;
+                }
+                v4_gpu_expert_mirrors_slru_clear_slot(cache, found);
+            } else {
+                found = 0;
+                for (int i = 1; i < cache->count; i++)
+                    if (cache->entries[i].clock < cache->entries[found].clock)
+                        found = i;
+            }
             /* RECYCLE IN PLACE: every routed expert has the same shape, so
              * refill the victim's device buffers (pinned DMA) instead of
              * cudaFree + cudaMalloc + pageable copy x3 — at long context
@@ -12528,6 +12720,12 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                 cache->entries[found].layer = view->key.layer;
                 cache->entries[found].expert = view->key.expert;
                 cache->entries[found].clock = ++cache->clock;
+                if (cache->slot_map && key >= 0) {
+                    cache->key_of[found] = key;
+                    cache->slot_map[key] = found;
+                    cache->seen[expert] = cache->seen_gen;
+                    v4_gpu_expert_mirrors_slru_move(cache, found, 0);
+                }
                 view->gate.gpu = cache->entries[found].gate;
                 view->up.gpu = cache->entries[found].up;
                 view->down.gpu = cache->entries[found].down;
@@ -12584,10 +12782,14 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
              * uploaded again), or win the LRU pick and make the recycle
              * allocate on the full card again. The card counts as full
              * until the next probe. */
-            if (found == cache->count - 1)
+            if (cache->slot_map) {
+                v4_gpu_expert_mirrors_slru_clear_slot(cache, found);
+                if (appended) cache->count--;
+            } else if (found == cache->count - 1) {
                 cache->count--;
-            else
+            } else {
                 cache->entries[found] = cache->entries[--cache->count];
+            }
             last_free_mb = 0;
             upload_failed = 1;
             grown_bytes = 0;
@@ -12598,6 +12800,12 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
         cache->entries[found].gate = gate;
         cache->entries[found].up = up;
         cache->entries[found].down = down;
+        if (cache->slot_map && key >= 0) {
+            cache->key_of[found] = key;
+            cache->slot_map[key] = found;
+            cache->seen[expert] = cache->seen_gen;
+            v4_gpu_expert_mirrors_slru_move(cache, found, 0);
+        }
     }
     cache->entries[found].clock = ++cache->clock;
     view->gate.gpu = cache->entries[found].gate;
@@ -12633,7 +12841,7 @@ int coli_v4_gpu_expert_drain(ColiExpertStore *store) {
 }
 
 /* Lookup-only twin of attach: report whether {layer, expert} is already
- * mirrored, touching its LRU stamp, but NEVER uploading on a miss. The
+ * mirrored, touching its SLRU stamp, but NEVER uploading on a miss. The
  * hybrid decode split peeks the whole token first and decides its uploads
  * afterwards with the q* policy, instead of paying a blocking PCIe copy per
  * miss the moment it is discovered. */
@@ -12676,6 +12884,9 @@ int coli_v4_gpu_dspark_mirrors_ensure(ColiV4Engine *engine) {
     engine->gpu.dspark_mirrors =
         v4_gpu_expert_mirrors_create_capacity(engine->gpu.device, capacity);
     if (!engine->gpu.dspark_mirrors) return -1;
+    v4_gpu_expert_mirrors_set_dims(
+        (V4GpuExpertMirrorCache *)engine->gpu.dspark_mirrors,
+        engine->config.num_hidden_layers, engine->config.n_routed_experts);
     fprintf(stderr, "v4_gpu dspark-mirrors device=%d cap=%d\n",
             engine->gpu.device, capacity);
     return 0;

@@ -220,8 +220,14 @@ least 64 fresh tokens uploads dense+attention (clearing the decode mirrors),
 runs the prefill, then releases dense and lets the mirror cache refill for
 decode; a shorter prompt keeps the decode shape (dense in RAM, more mirrors)
 because the 6.2 GiB upload would cost more than it saves. The switch is logged
-as `v4_gpu phase=prefill ...` / `v4_gpu phase=decode ...`. The environment
-variables below are debug overrides of that plan, not the user contract.
+as `v4_gpu phase=prefill ...` / `v4_gpu phase=decode ...`. Every long-lived
+device object (dense/shared tensor, expert bank, KV cache, activation) is
+charged to the same plan budget by the backend, so `used` in those logs is the
+allocator's total, not a sum of estimates. The routed-expert mirror is an SLRU
+(probation + protected, as in llama.cpp's `llama-moe-cache.cpp`): a hit is
+promoted, a miss evicts the coldest probation slot, and experts selected by the
+current request are skipped. The environment variables below are debug
+overrides of that plan, not the user contract.
 
 What the knobs do (full table in [Environment reference](#environment-reference-v4-engine)):
 `COLI_CUDA_ATTN_BATCH=1` puts the batched prefill attention block on the GPU
@@ -276,7 +282,7 @@ to the CPU union). An explicit `DSV4_CUDA_VRAM_RESERVE_MB` is used as given.
 | VRAM | dense mirrors | prefill bank | recommended env | expected |
 |---|---|---|---|---|
 | 6 GB | no (6.3 GB does not fit) | yes (3.2 GiB) | `CUDA_DENSE=0 COLI_CUDA_MOE_BATCH=1 COLI_CUDA_ATTN_BATCH=0` | GPU MoE prefill (generic kernels on non-RTX50), CPU attention/decode; ~90 mirrors between prefills |
-| 8 GB | prefill: yes; decode: no | no (~0.9 GiB left) | `--vram 8 --workload prefill` for prefill; default plan for decode | prefill dense + batched attention (~222 s / 1955 tokens); decode dense in RAM, ~590 mirrors, 0.65–0.78 tok/s |
+| 8 GB | prefill: yes; decode: no | no (~0.9 GiB left) | `--vram 8 --workload prefill` for prefill; default plan for decode | prefill dense + batched attention (213 s / 1955 tokens); decode dense in RAM, ~530–549 mirrors, ~0.7 tok/s |
 | 10–12 GB | yes | 12 GB: yes (tight); 10 GB: only a pruned checkpoint's smaller bank on generic builds | `CUDA_DENSE=1 COLI_CUDA_ATTN_BATCH=1 COLI_CUDA_MOE_BATCH=1` | full GPU prefill; 12 GB: the 32-mirror minimum beside a 256-expert bank's reserve (~350 mirrors with `COLI_CUDA_MOE_BATCH=0`), ~150 beside a 132-expert one; 10 GB: the 32-mirror minimum beside a 132-expert bank (256 experts: `COLI_CUDA_MOE_BATCH=0`, ~190 mirrors) |
 | 16 GB (this box) | yes | yes | the canonical line above (mirror cap can be left unset) | ~330 mirrors; the numbers in this document predate the bank-sized reserve (the fixed 2800 MiB default left more mirrors, but too little room for the bank once decode had filled the card) |
 | 24 GB | yes | yes | canonical | ~1 000 mirrors (~9 %) |
