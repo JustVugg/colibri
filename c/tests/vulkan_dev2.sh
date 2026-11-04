@@ -314,6 +314,10 @@ family_dev2_sanitize() {
       local D2_X=1 D2_SMALL=0
       case $k in big) x=COLI_VK_TIER_GEMM_ROWS=2; D2_X=4 ;; evict) x=COLI_VK_EXPERTS2=2 ;; fault) x=COLI_VK_DEV2_FAULT=2 ;;
                   excl) x="COLI_VK_EXPERTS2=8 COLI_VK_TIER_BALANCE=0 V4_LOADER_LANES=1"; D2_SMALL=1 ;; *) x=D2=1 ;; esac   # see d2_case's excl (#1987)
+      # deepseek_v4 pins the standing issue/join path here as in d2_case's excl: the
+      # compute-site lever computes decode's routed group on the device and the RAM cache
+      # never gives up a device expert's copy within this two-slot case
+      [ "$k" = excl ] && [ "$eng" = deepseek_v4 ] && x="$x COLI_VK_TIER_EXPERTS=0"
       local A=(ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
                OMP_NUM_THREADS=2 $x COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 COLI_VK_DEV2=0)
       local D2_HIST=0
