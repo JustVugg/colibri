@@ -1862,6 +1862,17 @@ qwen36_gguf_chain_gates() {
   sync_gate qwen36 "chain qwen36 GGUF hybrid, synchronization" GQ_EXACT=1 COLI_VK_TIER_GB=0.0004 \
     COLI_VK_TIER_HOST=1 SNAP=qwen36_gguf_tiny -- 8 8 qwen36_gguf_tiny/ref.json
   grep -q "hybrid layer steps (in the frame, on events), [1-9]" vk.log || { cat vk.log; fail "chain qwen36 GGUF hybrid, synchronization: no step on events"; }
+  # a driver that lets a frame through the event the host sets while it runs (#2583: the
+  # specification wants it set before the frame is submitted, VUID-vkSetEvent-event-09543, and a
+  # Radeon on AMD's own driver answered in loops): COLI_VK_TEST_EV_NOWAIT=1 drops the waits, the
+  # probe at the chain's start sees it, and the steps run on the timelines with the CPU's tokens.
+  # Without the probe the same run reads the host's rows before they are written (other tokens).
+  CPUENV=GQ_EXACT=1 dmoe_gate qwen36 "chain qwen36 GGUF hybrid, a driver that does not hold the frame" all GQ_EXACT=1 \
+    COLI_VK_TIER_GB=0.0004 COLI_VK_TIER_HOST=1 COLI_VK_TEST_EV_NOWAIT=1 SNAP=qwen36_gguf_tiny -- 8 8 qwen36_gguf_tiny/ref.json
+  grep -q "does not hold a frame at an event the host sets while it runs" vk.log ||
+    { cat vk.log; fail "chain qwen36 GGUF hybrid: the probe did not see the frame pass the event"; }
+  grep -q "hybrid layer steps (frames A/B/C, by timelines), [1-9]" vk.log ||
+    { cat vk.log; fail "chain qwen36 GGUF hybrid: the steps stayed on the events the frame does not wait for"; }
   # the host pool within the driver's heap for it (#2314: Windows leaves about half the RAM,
   # and the blocks past it were refused): a heap whose room past the 2 GiB the staging keeps
   # holds a few experts, the pool takes those, the engine's cache keeps the rest (and so the
