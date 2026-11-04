@@ -720,6 +720,50 @@ verify's copies of the DeltaNet state and the routed experts' scratch of a promp
 2048-row chunks it kept 3.21 GiB where the chain used 3.34-3.51, a verify's copies were refused
 and every verify ran on the CPU (decode 43.6 -> 20.4 tok/s in such a run).
 
+**A prompt's FP8 experts on the card** (`q38cc_forward_f8`, `Q38_PROMPT_GPU`; kernels in
+`cuda_q38_moe.cu`). The release's block-FP8 experts have no step in the frame (`cc_moe` takes
+them a GEMV at a time, not in the CPU's arithmetic), so a prompt's routed experts were the
+host's, chunk by chunk: 67 s of a 72 s TTFT for 3,763 tokens on an RTX 4090 with a Ryzen 9
+7950X3D. A prompt of 64 rows or more (`Q38_PROMPT_GPU_MIN`) now runs layer by layer in
+segments of 4096 rows (`Q38_PROMPT_GPU_ROWS`, whole chunks), and each layer's experts run once
+a segment on the card: the host routes the segment's rows from the device's logits with the
+grouped path's code (`q38_route_rows`), gives each expert's assignments places side by side,
+and the chain's `q38_moe` runs every expert's rows -- the tier's residents where they are (the
+tier held for the prompt), the others copied from the RAM cache on the copy stream into a ring
+of 64 slots, half of it a launch, the next launch's copies going up while one computes -- then
+`q38_sum` adds every row's experts in rank order. The kernels are `q38_fp8_rows`' arithmetic to
+the bit (a thread per lane of a 128-column block's eight, hsum256's tree as xor shuffles, the
+block scale fused in double, exp_f's sigmoid as Kimi K3's exact kernels compute it), so the
+routed sums, the streams and the logits are the host experts' bytes; the shared expert, the
+combine and the residual stay the chain's ops, chunk by chunk.
+
+The copies are most of the time (one pass over every routed expert a segment: ~99 GB for
+3,763 tokens). A pageable copy of the cache's older slots went up at 7-8 GB/s (the driver's
+copy on one CPU thread, slow over pages Windows' aging left unreferenced; 16 once their pages
+were touched) and a page-locked one at 25.5, so the slots are page-locked as they are first
+copied (`Q38_PROMPT_GPU_PIN_GB`, 48: with the cache at 120 GB of 192, locks stalled past ~56
+GiB; a stall of 400 ms ends the locking) and the rest touched on every thread first
+(`Q38_PROMPT_GPU_TOUCH`). The FP8 tier now keeps the chain's own memory out of its allowance
+(`qt_reserve(q38cc_reserve_bytes)`, the prompt's ~1 GiB of buffers counted in): without it a
+served conversation that warmed the tier left the card at 23.9 of 24 GB, WDDM paged, and a
+3,763-token prompt took 126 s.
+
+| RTX 4090, every expert in RAM | host experts | on the card |
+|---|---|---|
+| 56-token prompt, TTFT | 1.64 s | 1.82 s |
+| 150 tokens | 4.16 s | 2.61 s |
+| 1,628 tokens (MTP on) | 38.2 s | 10.0 s |
+| 3,763 tokens | 74.0 s | 10.1 s (2.6 s of it the first page locks) |
+| served, the tier warm, MTP on: 1,678 / 3,813 tokens | | 8.6 / 13.2 s (the request) |
+| decode, 150-token prompt, 128 tokens, MTP off / on | 8.96 / 9.5 tok/s before | 9.22 / 10.60 tok/s |
+
+Checked: the logits' bytes equal `Q38_PROMPT_GPU=0`'s for 150 and 3,763 tokens (one segment and
+two), for 1,628 tokens with the MTP head's streams, and in serve mode four prompts' logits,
+streams and mixed rows hash the same (`Q38CC_OUT_HASH=1`), the tier's residents among them and a
+cache of 122 experts a layer read from the disks. `tests/test_cuda_q38_moe.cu` (`make
+cuda-q38-moe-check`) checks the kernels on a card against the CPU's arithmetic, bit for bit.
+`Q38_PROMPT_GPU_PROF=1` prints each layer's times.
+
 `tests/test_qwen38_cuda_chain.c` (`make qwen38-cuda-chain-check`, in CI beside
 `qwen38-dn-gpu-check`) runs the tiny FP8 fixture's oracle on the fake tier with the
 chain's ops from the fake's host-side table: the chain on (8/8 tokens, cosine 0.99998), a

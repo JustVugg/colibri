@@ -2914,6 +2914,7 @@ int main(int argc, char **argv) {
     }
     q38_vocab_decide(&m, snap);   /* the draft list or the whole vocabulary, before COLI_VK_DENSE_HOST releases the lm_head rows */
     q38_expert_report(&m, cap);         /* expert format, bytes per expert, what the cache costs */
+    q38_preload_experts(&m);            /* Q38_PRELOAD=1: every expert in RAM now (the MTP head's once it stays attached) */
 #ifdef COLI_VULKAN
     /* After the trunk is int8: those rows upload at their first matmul. No
      * device (or COLI_VULKAN unset) leaves g_vk_ready 0, the CPU path. */
@@ -3984,7 +3985,7 @@ static int qwen38_edge_engine_open(
     model->native_fp8=q38_env_bool("Q38_NATIVE_FP8",1);
     q38_load_cfg(&model->c,options->model_dir);
     q38_validate_cfg(&model->c);
-    st_init(&model->S,options->model_dir);
+    st_init_multi(&model->S,options->model_dir,getenv("Q38_DIRS"));
     if(st_has(&model->S,"model.language_model.embed_tokens.weight"))
         snprintf(model->prefix,sizeof model->prefix,"model.language_model");
     else if(st_has(&model->S,"model.embed_tokens.weight"))

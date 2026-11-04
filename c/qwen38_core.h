@@ -155,6 +155,9 @@ typedef enum {
     Q38_TM_DN_RECUR,               /* inside deltanet: conv, recurrence, gated norm (no weights) */
     Q38_TM_DN_SNAP,                /* inside deltanet: a verify's per-row state copies */
     Q38_TM_LM_DRAFT,               /* the MTP head's lm-head (its drafts), apart from lm-head */
+    Q38_TM_TIER_ISSUE,             /* the CUDA tier: a layer's resident experts handed to the card */
+    Q38_TM_TIER_TAKE,              /* ... their rows collected (waiting for the card included) */
+    Q38_TM_TIER_NOTE,              /* ... the CPU's experts noted (heat, promotion copies) */
     Q38_TM_COUNT
 } Q38Timer;
 
@@ -558,6 +561,38 @@ static void q38_matmul_fp8_vec(float *y,const float *x,const uint8_t *q8,
                 }
             }
             for(int r=0;r<ns;r++)y[(int64_t)(s0+r)*O+o]=(float)a[r];
+        }
+    }
+}
+/* Rows [r0,r1) of an FP8 matrix (O x I) for n activation rows xr[a], into y[a*ys + o]:
+ * the grouped decode's kernel (q38_rows). Each row's arithmetic is the one above -- a
+ * block's eight lanes fused in order, hsum256, the block scale in double -- so a row's
+ * bits do not depend on n or on which rows share the call; a weight row is decoded once
+ * for up to Q38_FP8_ROWS activation rows. */
+static void q38_fp8_rows(float *y,int ys,const uint8_t *q8,const float *bscale,int I,
+                         int r0,int r1,const float *const *xr,int n) {
+    const int64_t nblkI=fp8_nblk(I);
+    for(int o=r0;o<r1;o++){
+        const uint8_t *w=q8+(int64_t)o*I;
+        const float *scl=bscale+((int64_t)o/FP8_BLOCK)*nblkI;
+        for(int a0=0;a0<n;a0+=Q38_FP8_ROWS){
+            const int na=n-a0<Q38_FP8_ROWS?n-a0:Q38_FP8_ROWS;
+            double a[Q38_FP8_ROWS]={0};
+            for(int64_t bi=0;bi*FP8_BLOCK<I;bi++){
+                int base=(int)(bi*FP8_BLOCK),blen=I-base<FP8_BLOCK?I-base:FP8_BLOCK,i=0;
+                __m256 acc[Q38_FP8_ROWS];
+                for(int r=0;r<na;r++)acc[r]=_mm256_setzero_ps();
+                for(;i+8<=blen;i+=8){
+                    const __m256 wv=e4m3_decode8(w+base+i);
+                    for(int r=0;r<na;r++)acc[r]=_mm256_fmadd_ps(wv,_mm256_loadu_ps(xr[a0+r]+base+i),acc[r]);
+                }
+                for(int r=0;r<na;r++){
+                    float part=hsum256(acc[r]);
+                    for(int k=i;k<blen;k++)part+=e4m3_decode(w[base+k])*xr[a0+r][base+k];
+                    a[r]+=(double)part*scl[bi];
+                }
+            }
+            for(int r=0;r<na;r++)y[(int64_t)(a0+r)*ys+o]=(float)a[r];
         }
     }
 }
@@ -1746,7 +1781,7 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
         snprintf(m->prefix,sizeof m->prefix,"model");
         m->expert_prefetch=0;   /* it reads safetensors ranges; the parallel batch reads the GGUF's */
     } else {
-        st_init(&m->S,snap);
+        st_init_multi(&m->S,snap,getenv("Q38_DIRS"));   /* Q38_DIRS: shard folders on other drives */
         if(st_has(&m->S,"model.language_model.embed_tokens.weight")) snprintf(m->prefix,sizeof m->prefix,"model.language_model");
         else if(st_has(&m->S,"model.embed_tokens.weight")) snprintf(m->prefix,sizeof m->prefix,"model");
         else {fprintf(stderr,"checkpoint has no Qwen4-Exp text embedding\n");exit(1);}
@@ -2774,6 +2809,36 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
     }
     free(jobs);
     return 1;
+}
+
+/* Q38_PRELOAD=1: every routed expert into its RAM slot at load, a layer at a time through
+ * the batch loader's parallel reads, when every layer's cache holds all its experts (cap >=
+ * the experts; the MTP head's layer too when it is attached). A checkpoint laid out by
+ * tools/q38_download.py keeps part of every layer's experts on every drive, so the drives
+ * read together. No decode step or prompt chunk waits on a read after it. */
+static void q38_preload_experts(Model *m) {
+    const char *on=getenv("Q38_PRELOAD");
+    if(!(on&&on[0]=='1'))return;
+    const Cfg *c=&m->c;const int E=c->experts,layers=c->layers+(m->mtp?1:0);
+    for(int l=0;l<layers;l++)
+        if(m->cache[l].cap<E){
+            fprintf(stderr,"[qwen38] Q38_PRELOAD: layer %d's cache holds %d of its %d experts; none preloaded\n",
+                    l,m->cache[l].cap,E);
+            return;
+        }
+    int *ids=(int*)malloc((size_t)E*sizeof(int));Slot **got=(Slot**)malloc((size_t)E*sizeof(Slot*));
+    if(!ids||!got){fprintf(stderr,"OOM expert preload\n");exit(1);}
+    for(int e=0;e<E;e++)ids[e]=e;
+    const uint64_t hits=m->hits,miss=m->miss;const double t0=now_s();
+    for(int l=0;l<layers;l++)
+        if(!q38_expert_get_batch(m,l,ids,E,got))
+            for(int e=0;e<E;e++)q38_expert_get(m,l,e);
+    const double s=now_s()-t0,gb=(double)layers*E*3.0*c->hidden*c->inter/1e9;
+    m->hits=hits;m->miss=miss;   /* the run's hit rate counts its own routes */
+    if(m->ehit)for(int l=0;l<c->layers;l++)memset(m->ehit[l],0,(size_t)E);
+    fprintf(stderr,"[qwen38] preloaded %d experts of %d layers (%.1f GB) in %.1f s, %.1f GB/s (Q38_PRELOAD=1)\n",
+            layers*E,layers,gb,s,s>0?gb/s:0.0);
+    free(ids);free(got);
 }
 
 static void q38_ple_row(Model *m,int64_t row,float *out) {
@@ -3965,6 +4030,7 @@ static void q38_tier_warm(Model *m,int hist) {
 #ifdef COLI_CUDA
 static size_t q38cc_reserve_bytes(Model *m);   /* qwen38_cuda_chain.h */
 static int q38cc_env_on(void);
+static int q38cc_f8_wanted(Model *m);
 #endif
 static void q38_tier_start(Model *m,int cap) {
     const char *on=getenv("COLI_CUDA");
@@ -4036,9 +4102,25 @@ static void q38_tier_start(Model *m,int cap) {
             return;
         }
     q38_trunk_offer_all(m);                        /* sizes only; the placer decides in qt_init */
+#ifdef COLI_CUDA
+    /* the CUDA chain's own device memory (COLI_CUDA_CHAIN=1) kept out of the tier's allowance
+     * (qt_reserve, as qwen36's): its K/V mirrors, scratch, own matrices and a long prompt's routed
+     * experts' buffers. Without it the chain's buffers came on top of a card the experts had filled
+     * once a conversation warmed the tier (served, 65536 positions: 23.9 of 24 GB used, WDDM paging,
+     * a 3,763-token prompt 126 s instead of 10) */
+    if(q38cc_env_on()){
+        size_t rb=q38cc_reserve_bytes(m);
+        qt_reserve(rb);
+        fprintf(stderr,"[qtier] qwen38: %.2f GiB kept for the CUDA chain (its mirrors at %d positions, its scratch and own "
+                       "matrices%s)\n",rb/1073741824.0,m->kv_cap>0?m->kv_cap:m->max_t>0?m->max_t:qwen38_max_ctx(),
+                q38cc_f8_wanted(m)?", a long prompt's routed experts":"");
+    }
+#endif
     if(qt_init_fp8(c->layers,c->experts,c->hidden,c->inter,cap,c->topk,E4M3_LUT)){
         atexit(qt_shutdown);
         fprintf(stderr,"[qtier] qwen38: fp8 expert tier on (RAM LRU %d/layer stays; experts stream to VRAM as they get hot)\n",cap);
+        /* a cache of every expert never recycles a slot: the tier uploads from the slots */
+        if(cap>=c->experts&&!q38_layer_int4(m,0))qt_source_stable(1);
         q38_trunk_place_all(m);
         /* Q38_DN_GPU=1: where dnqkv, dnz and dnout of a DeltaNet layer all sit
          * on one card, the conv ring, the recurrence and the gated norm go there
@@ -4378,6 +4460,9 @@ enum { Q38_ROWS_NONE = 0, Q38_ROWS_F32 = 1, Q38_ROWS_X2 = 2, Q38_ROWS_GQ = 3 };
  * at all (GQ_EXACT=1's float path among them) */
 static int q38_rows_kind(const Q38Weight *w) {
     if(!w->data||w->q4||w->q8||w->gpu||w->act2)return Q38_ROWS_NONE;
+#ifdef __AVX2__
+    if(w->kind==Q38_WEIGHT_FP8&&w->scales&&q38_fp8_vector_on())return Q38_ROWS_F32;   /* q38_fp8_rows */
+#endif
     if(w->kind==Q38_WEIGHT_INT4G64&&w->r16)return Q38_ROWS_GQ;   /* xf16 rows take gq_act */
     if(w->kind==Q38_WEIGHT_INT4G64&&w->scales)return Q38_ROWS_F32;
     if((w->kind==Q38_WEIGHT_LOWBIT16||(w->kind==Q38_WEIGHT_VQ2&&w->vqb))&&w->r16)return Q38_ROWS_GQ;   /* xl16 / vq2r16 rows take gq_act */
@@ -4391,6 +4476,9 @@ static int q38_rows_kind(const Q38Weight *w) {
  * xq/dx the int8-per-32 ones ([n][I], [n][I/32]), ga the GGUF types' (n rows) */
 static void q38_rows(float *y,int ys,const Q38Weight *w,int I,int r0,int r1,
                      const float *const *xr,const int8_t *xq,const float *dx,const gq_act *ga,int n) {
+#ifdef __AVX2__
+    if(w->kind==Q38_WEIGHT_FP8){q38_fp8_rows(y,ys,(const uint8_t*)w->data,w->scales,I,r0,r1,xr,n);return;}
+#endif
 #ifdef XF16_ON
     if(w->kind==Q38_WEIGHT_INT4G64&&w->r16){q38_xf16_rows(y,ys,w,ga,r0,r1,n);return;}   /* whole groups, as below */
 #endif
@@ -4484,6 +4572,27 @@ static void q38_rows(float *y,int ys,const Q38Weight *w,int I,int r0,int r1,
             else  x2_dot(y+(int64_t)a0*ys+o,ys,code,q,w->scales[o],xq+(size_t)a0*I,dx+(size_t)a0*ng,I,k);
         }
 }
+/* The grouped path's routes for S rows of router logits (logits: S x E, left holding their
+ * exponentials): each row's softmax numerators from its maximum, the K largest (the lower expert
+ * on a tie, rt_router_pick's fallback for none), their gates over the top-k's sum (norm_topk) or
+ * every expert's, rank order into idx and gates (S*K each); rt_route's books with rows row0 + s.
+ * The CUDA chain's prompt experts route through it too (q38cc_f8_layer), so both pick the same.
+ * Each row on its own (a prompt's rows on every thread: 3,763 rows a layer took 6.6 s of a 22 s
+ * TTFT on one), the books after, in row order. */
+static void q38_route_rows(Model *m,int layer,float *logits,int S,int row0,int *idx,float *gates) {
+    const Cfg *c=&m->c;const int E=c->experts,K=c->topk;
+    #pragma omp parallel for schedule(static) if(S>=64)
+    for(int s=0;s<S;s++){
+        float *lg=logits+(int64_t)s*E;
+        float mx=lg[0];for(int e=1;e<E;e++)if(lg[e]>mx)mx=lg[e];
+        double all=0;for(int e=0;e<E;e++){lg[e]=expf(lg[e]-mx);all+=lg[e];}
+        int *ix=idx+(int64_t)s*K;float val[Q38_MAX_TOPK];
+        for(int z=0;z<K;z++){int best=-1;float bv=-1.f;for(int e=0;e<E;e++){int used=0;for(int j=0;j<z;j++)if(ix[j]==e)used=1;if(!used&&lg[e]>bv){bv=lg[e];best=e;}}ix[z]=rt_router_pick(best,z,E,layer);val[z]=lg[ix[z]];}
+        double top=0;for(int z=0;z<K;z++)top+=val[z];double den=c->norm_topk?top:all;
+        for(int z=0;z<K;z++)gates[s*K+z]=(float)(val[z]/den);
+    }
+    for(int s=0;s<S;s++)rt_route(layer,row0+s,idx+(int64_t)s*K,gates+(int64_t)s*K,K);
+}
 /* idx_in, gates_in (S*K each, rank order) and dev_in (S*K flags): the routes a CUDA chain
  * made on its device and the slots it computes there (cuda_chain's hybrid layer): out gets
  * the rest, routed_only, with no router, no history and no tier group here. NULL: the
@@ -4494,14 +4603,22 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
     static int on=-1;
     if(on<0){const char *e=getenv("Q38_MOE_GROUPED");on=!(e&&e[0]=='0');}
     Cfg *c=&m->c;const int H=c->hidden,E=c->experts,K=c->topk,I=c->inter,SI=c->shared_inter;
-    if(!on||S<1||S>Q38_GROUPED_ROWS||!(q38_layer_int4(m,layer)||g_q38_gguf)||H%32||I%32)return 0;
+    int fp8=0;   /* the release's block-FP8 experts: q38_fp8_rows */
+#ifdef __AVX2__
+    fp8=m->native_fp8&&q38_fp8_vector_on();
+#endif
+    if(!on||S<1||S>Q38_GROUPED_ROWS||!(q38_layer_int4(m,layer)||g_q38_gguf||fp8)||H%32||I%32)return 0;
     /* every distinct expert of the rows in the cache at once, or the per-expert paths */
     if((S*K<E?S*K:E)>m->cache[layer].cap)return 0;   /* at most E distinct, however many rows */
     /* the device tiers take experts per row; the statistics hooks keep the loop's order. The
      * CUDA tier: a decode row's residents go to the device (qt_issue) and the rest are
      * grouped here, as without it; more rows keep the loop. */
     int cuda=qt_ready()&&layer<c->layers;
-    if((vkt_ready()&&layer<vkt_layers())||(cuda&&S>1&&!idx_in))return 0;
+    /* the CUDA tier takes up to 32 assignments in one group (qt_issue_rows: an MTP verify's
+     * rows); a few rows more keep the decode loop, which issues row by row, and a prompt's
+     * chunk runs here on the CPU alone */
+    const int dev_rows=cuda&&!idx_in&&S*K<=32;
+    if((vkt_ready()&&layer<vkt_layers())||(cuda&&!idx_in&&!dev_rows&&S<=8))return 0;
     if(g_q38_act||g_q38_dump||g_q38_cov)return 0;
     const int np=S*K;
     /* scratch: routes, then per assignment in grouped order its input and outputs */
@@ -4523,20 +4640,13 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
     if(idx_in){memcpy(idx,idx_in,(size_t)np*sizeof(int));memcpy(gates,gates_in,(size_t)np*sizeof(float));}
     else if(logits_in)memcpy(logits,logits_in,(size_t)S*E*sizeof(float));
     else q38_dense_matmul(m,logits,x,&l->router,S,H,E);
-    for(int s=0;s<S&&!idx_in;s++){
-        float *lg=logits+(int64_t)s*E;
-        float mx=lg[0];for(int e=1;e<E;e++)if(lg[e]>mx)mx=lg[e];
-        double all=0;for(int e=0;e<E;e++){lg[e]=expf(lg[e]-mx);all+=lg[e];}
-        int *ix=idx+(int64_t)s*K;float val[Q38_MAX_TOPK];
-        for(int z=0;z<K;z++){int best=-1;float bv=-1.f;for(int e=0;e<E;e++){int used=0;for(int j=0;j<z;j++)if(ix[j]==e)used=1;if(!used&&lg[e]>bv){bv=lg[e];best=e;}}ix[z]=rt_router_pick(best,z,E,layer);val[z]=lg[ix[z]];}
-        double top=0;for(int z=0;z<K;z++)top+=val[z];double den=c->norm_topk?top:all;
-        for(int z=0;z<K;z++)gates[s*K+z]=(float)(val[z]/den);
-        rt_route(layer,row0+s,ix,gates+(int64_t)s*K,K);
-    }
+    if(!idx_in)q38_route_rows(m,layer,logits,S,row0,idx,gates);
     /* the CUDA tier's residents of the row run on the device from here on (qt_take adds them
      * after the CPU's, as the loop does); the rest are this function's */
-    uint32_t qmask=cuda&&!idx_in?qt_issue(layer,idx,K,x):0;
-    for(int i=0;i<np;i++)ondev[i]=idx_in?dev_in[i]:(uint8_t)((qmask>>i)&1u);
+    double tier_started=now_s();
+    uint32_t qmask=dev_rows?qt_issue_rows(layer,idx,S,K,x):0;
+    if(dev_rows)q38_tm_add(m,Q38_TM_TIER_ISSUE,tier_started);
+    for(int i=0;i<np;i++)ondev[i]=idx_in?dev_in[i]:(uint8_t)(i<32&&((qmask>>i)&1u));
     /* the distinct experts in first-seen order and each one's assignments, grouped */
     int nu=0,nc=0;   /* nc: the assignments computed here */
     for(int i=0;i<np;i++){
@@ -4658,9 +4768,13 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
                        "(Q38_MOE_GROUPED=0: one expert at a time)\n");
     }
     /* the tier promotes what the CPU computed (it copies the rows before qt_note returns) */
-    if(cuda&&loaded)for(int j=0;j<nu;j++)q38_tier_note(layer,uniq[j],slot[j]);
-    /* each row: its experts' outputs in rank order (the CPU's, then the device's: qt_take),
-     * then the shared expert */
+    tier_started=now_s();
+    if(cuda&&loaded&&(dev_rows||idx_in)){   /* a prompt's chunk is not noted, as q38_moe_prefill's */
+        for(int j=0;j<nu;j++)q38_tier_note(layer,uniq[j],slot[j]);
+        q38_tm_add(m,Q38_TM_TIER_NOTE,tier_started);
+    }
+    /* each row: its experts' outputs in rank order (the CPU's, then the device's: qt_take,
+     * every row's at once), then the shared expert */
     for(int s=0;s<S;s++){
         float *ys=out+(int64_t)s*H;memset(ys,0,(size_t)H*sizeof(float));
         for(int z=0;z<K;z++){
@@ -4668,11 +4782,16 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
             const float g=gates[s*K+z];const float *e=eo+(int64_t)pos[s*K+z]*H;
             for(int d=0;d<H;d++)ys[d]+=g*e[d];
         }
-        if(cuda&&!idx_in&&!qt_take(qmask,gates+(int64_t)s*K,K,ys)){
-            fprintf(stderr,"qwen38: CUDA expert collection failed at layer %d; stopping inference\n",layer);
-            exit(1);
-        }
-        if(!routed_only)for(int d=0;d<H;d++)ys[d]+=sgate[s]*shared[(int64_t)s*H+d];
+    }
+    tier_started=now_s();
+    if(dev_rows&&!qt_take_rows(qmask,gates,S,K,out)){
+        fprintf(stderr,"qwen38: CUDA expert collection failed at layer %d; stopping inference\n",layer);
+        exit(1);
+    }
+    if(dev_rows)q38_tm_add(m,Q38_TM_TIER_TAKE,tier_started);
+    if(!routed_only)for(int s=0;s<S;s++){
+        float *ys=out+(int64_t)s*H;
+        for(int d=0;d<H;d++)ys[d]+=sgate[s]*shared[(int64_t)s*H+d];
     }
     rt_trace_end();
     free(logits);free(gates);free(sg);free(su);free(sh);free(shared);free(sgate);
@@ -6153,7 +6272,7 @@ static void q38_tm_report_bank(const Q38Timers *timers,const char *scope) {
     static const char *names[Q38_TM_COUNT]={
         "expert-read","fp8-expand","routed-expert","shared-expert",
         "resident-mm","deltanet","qsa-index","qsa-attn","ple","lm-head",
-        "dn-recur","dn-snap","lm-draft"
+        "dn-recur","dn-snap","lm-draft","tier-issue","tier-take","tier-note"
     };
     double per=timers->forwards?1000.0/timers->forwards:0.0;
     fprintf(stderr,"[qwen38 timers] %s: %llu forwards\n",scope,
@@ -6212,6 +6331,9 @@ static void q38_layer_free(Layer *l) {
 static void q38_model_free(Model *m) {
     if(!m) return;
     q38_tstats_write();g_q38_tstats_path[0]=0;   /* Q38_TRUNK_STATS: while the sums still exist */
+#ifdef COLI_CUDA
+    q38cc_f8_unpin(m);   /* the RAM cache's slots a long prompt page-locked, before they are freed */
+#endif
     kv_prefix_free(&m->kvp);
     int rows=q38_layer_rows(m);
     for(int i=0;i<rows;i++) {

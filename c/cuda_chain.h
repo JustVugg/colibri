@@ -168,6 +168,15 @@ static inline size_t cc_moe_hid_floats(int S, int K, int D, int I, int E) {
     if (S > CC_MOE_FRAME_ROWS) n += 3 * (size_t)E + 2 + 2 * ((A + 63) / 64 + (size_t)(E < (int)A ? E : (int)A)) + 2 * A;
     return n;
 }
+/* Qwen3.8's routed experts for a prompt's rows, in its CPU's arithmetic (q38_moe, q38_sum;
+ * cuda_q38_moe.cu): an expert's three e4m3 matrices on the device as its checkpoint has them
+ * (gate and up [I][D], down [D][I], row-major; a float scale per 128 x 128 block,
+ * [ceil(rows/128)][ceil(cols/128)]) and its assignments: places p0 .. p0 + n - 1 of the step's
+ * expert order, in tiles of CC_Q38_TILE from tile t0 of the launch. D and I multiples of 128.
+ * hp0: the place h's first row holds (a launch's places from hp0 on: h holds just those). */
+#define CC_Q38_TILE 32
+typedef struct { const void *g, *u, *d; const float *gs, *us, *ds; int p0, n, t0, pad; } CcQ38Exp;
+typedef struct { int ntab, ntiles, D, I, hp0, pad; } CcQ38Moe;
 /* one copy over n regions (a KV row per head, say); offsets and counts in floats */
 typedef struct { size_t dst, src, n; } CcRegion;
 /* a fetch's region: bytes of page-locked host memory at src into a DEV buffer at byte dst */
@@ -323,6 +332,15 @@ typedef struct ColiCudaChainOps {
      * few rows: the caller's two matmuls and CC_EW_SWIGLU), 0 a failure */
     int  (*matmul_glu)(ColiCudaTensor *wg, ColiCudaTensor *wu, CcBuf *x, CcBuf *y, int S);
     int  (*addnorm)(CcBuf *x, CcBuf *t, CcBuf *w, CcBuf *y, const CcAddNorm *p);
+    /* Qwen3.8's prompt experts (CcQ38Exp above), the CPU's bits: q38_moe runs the ntab experts
+     * of the table at float offset tab_off of tab (a DEV buffer the host wrote: sizeof(CcQ38Exp)
+     * / 4 floats an entry, tab_off even) over their assignments, gate and up of x's rows (D
+     * floats each; rows: an assignment's row of x, ints by place) into h (I floats a place from
+     * p->hp0 on: silu(gate) * up), then down into out (D floats a place). q38_sum: S rows of y from float
+     * offset y_off (D floats each) = row s's K assignments (pos: their places, ints, -1 none)
+     * times gates, fused in rank order from +0 */
+    int  (*q38_moe)(CcBuf *x, CcBuf *rows, CcBuf *tab, size_t tab_off, const CcQ38Moe *p, CcBuf *h, CcBuf *out);
+    int  (*q38_sum)(CcBuf *out, CcBuf *pos, CcBuf *gates, int S, int K, int D, CcBuf *y, size_t y_off);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -333,9 +351,11 @@ COLI_CUDA_DLLEXPORT const ColiCudaChainOps *coli_cuda_chain_ops(void);
 
 /* ---- the engine's calls, through the table ----------------------------------- */
 #ifndef COLI_CUDA_CHAIN_NO_WRAPPERS
+/* asked again until a backend answers with its table: an engine may size its device memory before
+ * the tier's coli_cuda_init loads the backend (qwen38's FP8 tier), and that NULL is not the run's */
 static inline const ColiCudaChainOps *cc_ops(void) {
-    static const ColiCudaChainOps *t; static int asked;
-    if (!asked) { asked = 1; t = coli_cuda_chain_ops(); if (t && t->size < CC_OPS_BASE_SIZE) t = NULL; }
+    static const ColiCudaChainOps *t;
+    if (!t) { const ColiCudaChainOps *o = coli_cuda_chain_ops(); if (o && o->size >= CC_OPS_BASE_SIZE) t = o; }
     return t;
 }
 static inline int cc_available(void) { return cc_ops() != NULL; }
@@ -471,6 +491,16 @@ static inline int cc_matmul_glu(ColiCudaTensor *wg, ColiCudaTensor *wu, CcBuf *x
     const ColiCudaChainOps *t = cc_ops();
     if (!(t && t->size >= offsetof(ColiCudaChainOps, matmul_glu) + sizeof t->matmul_glu && t->matmul_glu)) return -1;
     return t->matmul_glu(wg, wu, x, y, S);
+}
+static inline int cc_q38_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, q38_sum) + sizeof t->q38_sum && t->q38_moe && t->q38_sum;
+}
+static inline int cc_q38_moe(CcBuf *x, CcBuf *rows, CcBuf *tab, size_t tab_off, const CcQ38Moe *p, CcBuf *h, CcBuf *out) {
+    return cc_q38_ready() ? cc_ops()->q38_moe(x, rows, tab, tab_off, p, h, out) : 0;
+}
+static inline int cc_q38_sum(CcBuf *out, CcBuf *pos, CcBuf *gates, int S, int K, int D, CcBuf *y, size_t y_off) {
+    return cc_q38_ready() ? cc_ops()->q38_sum(out, pos, gates, S, K, D, y, y_off) : 0;
 }
 #endif
 

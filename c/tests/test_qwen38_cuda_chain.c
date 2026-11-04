@@ -17,6 +17,7 @@
 #ifdef _WIN32
 #undef setenv
 #undef unsetenv
+#define setenv(name, value, overwrite) _putenv_s(name, value)
 #define unsetenv(name) _putenv_s(name, "")
 #endif
 

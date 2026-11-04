@@ -59,7 +59,7 @@ static struct {
     pthread_t th;
     int th_stop, waiters;
     /* upload ring with staging copies */
-    struct { int layer, eid; uint8_t *w; float *s; int v_layer, v_eid; } q[QT_QCAP];
+    struct { int layer, eid; uint8_t *w; float *s; int v_layer, v_eid, borrowed; } q[QT_QCAP];   /* borrowed: w and s are the engine's (qt_source_stable) */
     int qh, qt_, qn;
     int inflight;   /* enqueued and not yet resident. qn frees the ring slot at
                      * dequeue, BEFORE the backend copies anything, so "queue
@@ -108,9 +108,11 @@ static void wait_take_locked(void){
 
 static QSlot *qs(int layer, int eid){ return &G.slot[(size_t)layer*G.ne + eid]; }
 /* G.mx held: every change of residency goes through here (qt_chain_epoch) */
+static void cold_heat_lower(const QSlot *s);   /* below, beside G_cold_heat */
 static void res_set(QSlot *s, int r){
     if(s->resident==r) return;
     s->resident=(uint8_t)r; G.epoch++;
+    if(r) cold_heat_lower(s);
     if(G.chg_on){ if(G.chg_n<QT_CHG_CAP) G.chg[G.chg_n++]=(int)(s-G.slot); else G.chg_over=1; }
 }
 /* Expert homes. Default: expert eid lives on device index eid % ndev in every
@@ -128,7 +130,19 @@ static void evict_note_locked(int gi);
  * while the bytes pass by. Before, qwen36 refused the tier outright below full
  * residency, and a 32 GB box with a 4 GB card ran the CPU alone (#2090). */
 static int G_stream;
+static int G_stable_src;   /* qt_source_stable: the slots qt_note points at are never recycled */
+void qt_source_stable(int on){ G_stable_src=on?1:0; }
 static uint32_t G_cold_heat[QT_MAX_DEV];   /* copy mode: the coldest resident's heat a device (UINT32_MAX: none), each tick */
+/* A resident colder than its device's bar lowers it, so between two ticks the bar is never
+ * above the coldest resident's heat (heats only rise there; the decay runs at a tick, before
+ * the bar is taken). stream_promote_locked turns an expert away with the bar alone when even
+ * the bar is too warm for it, instead of scanning every slot for the coldest: on Qwen3.8
+ * that scan (24,576 slots, about 150 CPU experts a token) was 31 ms of a 88 ms decode step. */
+static void cold_heat_lower(const QSlot *s){
+    if(!G_stream) return;
+    const int i=(int)(s-G.slot), hd=home2(i/G.ne,i%G.ne);
+    if(s->heat<G_cold_heat[hd]) G_cold_heat[hd]=s->heat;
+}
 /* No expert format the tier takes (the mixed layout, int8 with grouped scales,
  * experts=cpu): the devices still take the dense trunk, which is read on every
  * token. Before, each of these switched the trunk off as well. */
@@ -344,7 +358,7 @@ static void *uploader(void *arg){
         if(G.th_stop && G.qn==0){ pthread_mutex_unlock(&G.mx); return NULL; }
         int layer=G.q[G.qh].layer, eid=G.q[G.qh].eid;
         int vl=G.q[G.qh].v_layer, ve=G.q[G.qh].v_eid;
-        uint8_t *w=G.q[G.qh].w; float *sc=G.q[G.qh].s;
+        uint8_t *w=G.q[G.qh].w; float *sc=G.q[G.qh].s; const int borrowed=G.q[G.qh].borrowed;
         G.qh=(G.qh+1)%QT_QCAP; G.qn--;
         pthread_cond_broadcast(&G.cv_take);          /* queue space available */
         /* staging layout: three matrices of mb bytes each; int4 packed = half a
@@ -375,7 +389,7 @@ static void *uploader(void *arg){
                 res_set(v,1); qs(layer,eid)->queued=0; G.inflight--;
                 if(aslot>=0) v->aslot=aslot+1;   /* the victim keeps its slot */
                 pthread_cond_broadcast(&G.cv_take);
-                pthread_mutex_unlock(&G.mx); free(w); free(sc); continue;
+                pthread_mutex_unlock(&G.mx); if(!borrowed){ free(w); free(sc); } continue;
             }
             ColiCudaTensor *a=v->tg,*b=v->tu,*ct=v->td;
             v->tg=v->tu=v->td=NULL;
@@ -442,7 +456,7 @@ static void *uploader(void *arg){
                   && coli_cuda_tensor_upload(&td, w+2*mb, sd, 2, G.Ih, G.D,  dv);
             }
         }
-        free(w); free(sc);
+        if(!borrowed){ free(w); free(sc); }
         if(!ok){
             if(tg) coli_cuda_tensor_free(tg);
             if(tu) coli_cuda_tensor_free(tu);
@@ -1746,14 +1760,21 @@ static int enqueue_locked(int layer,int eid,int v_layer,int v_eid,int reserved){
     if(G.qn>=QT_QCAP){ G.q_full_skips++; return 0; }
     int hd=home2(layer,eid);
     if(!reserved && v_eid<0 && G.used[hd]+qt_ebytes(layer)>G.budget[hd]) return 0;
-    /* staging: three matrices (int8/fp8 a byte an element, a GGUF's the file's rows), their scales */
-    uint8_t *w=malloc(2*qt_mb_gu(layer)+qt_mb_d(layer)); float *sc=malloc((2*G.sc_gu+G.sc_d+1)*sizeof(float));
-    if(!w||!sc){ free(w); free(sc); return 0; }
+    /* staging: three matrices (int8/fp8 a byte an element, a GGUF's the file's rows), their scales.
+     * An engine whose RAM slots stay put (qt_source_stable) and hold an fp8 expert as staging
+     * would -- gate | up | down, the scales back to back -- lends the slot instead: no 4.7 MiB
+     * allocation and copy under the lock for every expert the tier takes. */
+    const size_t mg=qt_mb_gu(layer);
+    const int borrow=G_stable_src && G.wfmt==8 && s->u4==s->g4+mg && s->d4==s->g4+2*mg &&
+                     s->us==s->gs+G.sc_gu && s->ds==s->gs+2*G.sc_gu;
+    uint8_t *w=borrow?(uint8_t*)s->g4:malloc(2*mg+qt_mb_d(layer));
+    float *sc=borrow?(float*)s->gs:malloc((2*G.sc_gu+G.sc_d+1)*sizeof(float));
+    if(!w||!sc){ if(!borrow){ free(w); free(sc); } return 0; }
     if(!reserved && v_eid<0) G.used[hd]+=qt_ebytes(layer);
     s->queued=1;
-    stage(w,sc,layer,s->g4,s->u4,s->d4,s->gs,s->us,s->ds);
+    if(!borrow) stage(w,sc,layer,s->g4,s->u4,s->d4,s->gs,s->us,s->ds);
     G.q[G.qt_].layer=layer; G.q[G.qt_].eid=eid; G.q[G.qt_].w=w; G.q[G.qt_].s=sc;
-    G.q[G.qt_].v_layer=v_layer; G.q[G.qt_].v_eid=v_eid;
+    G.q[G.qt_].v_layer=v_layer; G.q[G.qt_].v_eid=v_eid; G.q[G.qt_].borrowed=borrow;
     G.qt_=(G.qt_+1)%QT_QCAP; G.qn++; G.inflight++;
     pthread_cond_signal(&G.cv);
     return 1;
@@ -1776,6 +1797,7 @@ static void stream_promote_locked(int layer,int eid){
     if(s->resident||s->queued) return;
     int hd=home2(layer,eid);
     if(G.used[hd]+qt_ebytes(layer)<=G.budget[hd]){ enqueue_locked(layer,eid,-1,-1,0); return; }
+    if(!tier_should_promote(s->heat,G_cold_heat[hd])) return;   /* no resident is colder than the bar */
     size_t n=(size_t)G.nl*G.ne; int cold=-1; uint32_t ch=0;
     for(size_t i=0;i<n;i++){
         QSlot *c=&G.slot[i];
@@ -2096,15 +2118,15 @@ static void qt_lfru_tick_locked(void){
     if(G_chain_own) return;   /* the chain's to move */
     size_t n=(size_t)G.nl*G.ne;
     G.tick++;
-    if(G_stream){   /* copy mode: qt_note_wanted's bar */
+    if(!(G.tick%1024))
+        for(size_t i=0;i<n;i++) G.slot[i].heat=tier_decay_value(G.slot[i].heat);
+    if(G_stream){   /* copy mode: qt_note_wanted's and stream_promote_locked's bar, after the decay */
         for(int di=0;di<G.ndev;di++) G_cold_heat[di]=0xFFFFFFFFu;
         for(size_t i=0;i<n;i++){
             QSlot *s=&G.slot[i]; int di=home2((int)(i/G.ne),(int)(i%G.ne));
             if(s->resident && !s->queued && s->heat<G_cold_heat[di]) G_cold_heat[di]=s->heat;
         }
     }
-    if(!(G.tick%1024))
-        for(size_t i=0;i<n;i++) G.slot[i].heat=tier_decay_value(G.slot[i].heat);
     if(!(G.tick%QT_CONV_DECAY))
         for(size_t i=0;i<n;i++) G.slot[i].conv>>=1;
     replan_drain_locked(QT_REPLAN_PER_TICK);              /* pending re-plan pairs, a few per token */
@@ -2133,8 +2155,10 @@ static void qt_lfru_tick_locked(void){
     }
 }
 
-uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
-    if(!G.on||K>QT_MAX_ROWS||G_chain_own) return 0;
+uint32_t qt_issue(int layer,const int *eids,int K,const float *x){ return qt_issue_rows(layer,eids,1,K,x); }
+uint32_t qt_issue_rows(int layer,const int *eids,int S,int K0,const float *x){
+    const int K=S*K0;   /* every row's ids; id k's input is row k/K0 */
+    if(!G.on||S<1||K>QT_MAX_ROWS||G_chain_own) return 0;
     uint32_t mask=0;
     ColiCudaTensor *tg[QT_MAX_DEV][QT_MAX_ROWS],*tu[QT_MAX_DEV][QT_MAX_ROWS],*td[QT_MAX_DEV][QT_MAX_ROWS];
     static int rows[QT_MAX_ROWS]={0};
@@ -2151,7 +2175,7 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
      * meet a swap parked on issue_open. */
     if(G_upload_sync) while(G.inflight>0 && !G.th_stop) wait_take_locked();
     if(G.th_stop){ pthread_mutex_unlock(&G.mx); return 0; }
-    if(layer==0) qt_lfru_tick_locked();
+    if(layer==0) for(int r=0;r<S;r++) qt_lfru_tick_locked();   /* a tick a row, as an issue a row ticked */
     G.issue_open=1;
     for(int k=0;k<K;k++){
         QSlot *s=qs(layer,eids[k]);
@@ -2172,7 +2196,7 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
         int c=G.is_cnt[di];
         if(!c) continue;
         float *xr=G.is_x + (size_t)di*QT_MAX_ROWS*G.D;     /* per-device input block */
-        for(int j=0;j<c;j++) memcpy(xr+(size_t)j*G.D, x, (size_t)G.D*sizeof(float));
+        for(int j=0;j<c;j++) memcpy(xr+(size_t)j*G.D, x+(size_t)(G.is_k[di][j]/K0)*G.D, (size_t)G.D*sizeof(float));
         if(!coli_cuda_expert_group_issue(tg[di],tu[di],td[di],rows,c,xr)){
             /* issue failed -> hand these k back to the CPU */
             for(int j=0;j<c;j++) mask &= ~(1u<<G.is_k[di][j]);
@@ -2209,6 +2233,36 @@ int qt_take_scaled(uint32_t mask,const float *val,int K,float *out,const float *
                 continue;
             }
             for(int d=0;d<G.D;d++) out[d]+=w*row[d];
+        }
+        G.is_cnt[di]=0;
+    }
+    pthread_mutex_lock(&G.mx);
+    G.issue_open=0;
+    pthread_cond_broadcast(&G.cv_take);
+    pthread_mutex_unlock(&G.mx);
+    return ok;
+}
+
+/* qt_take for the ids of qt_issue_rows: entry k is row k/K0's, added to out + (k/K0)*hidden
+ * with weight val[k]; a row's entries arrive in rank order, device by device, as qt_take's */
+int qt_take_rows(uint32_t mask,const float *val,int S,int K0,float *out){
+    if(S<=1) return qt_take(mask,val,K0,out);
+    if(!G.on) return mask==0;
+    const float *result[QT_MAX_DEV]={0};
+    int ok=1;
+    if(mask) for(int di=0;di<G.ndev;di++){
+        if(!G.is_cnt[di]) continue;
+        result[di]=coli_cuda_expert_group_take(G.dev[di]);
+        if(!result[di]){
+            fprintf(stderr,"[qtier] dev %d: expert group result unavailable\n",G.dev[di]);
+            ok=0;
+        }
+    }
+    for(int di=0;di<G.ndev;di++){
+        if(ok && result[di]) for(int j=0;j<G.is_cnt[di];j++){
+            const int k=G.is_k[di][j]; const float w=val[k];
+            const float *row=result[di]+(size_t)j*G.D; float *o=out+(size_t)(k/K0)*G.D;
+            for(int d=0;d<G.D;d++) o[d]+=w*row[d];
         }
         G.is_cnt[di]=0;
     }
@@ -2320,7 +2374,7 @@ void qt_shutdown(void){
     G.issue_open=0;
     memset(G.is_cnt,0,sizeof G.is_cnt);
     G.on=0;
-    G_fp8_stream=0; G_stream=0; G_trunk_only=0; G_src_planar=0;
+    G_fp8_stream=0; G_stream=0; G_stable_src=0; G_trunk_only=0; G_src_planar=0;
     G_host_on=-1; G_host_n=G_host_bytes=0;
     coli_cuda_shutdown();
 }

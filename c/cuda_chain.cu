@@ -35,6 +35,11 @@ extern "C" int coli_cuda_tensor_dev(const ColiCudaTensor *t, const void **w, con
 extern "C" int coli_cuda_moe_stage(int device, void *stage, size_t slot_bytes, int slots);
 extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float *x, const int *ids, const float *w,
                                    float *hid, float *y, const float *hy, const CcMoe *p, void *stream);
+/* Qwen3.8's prompt experts in its CPU's arithmetic (cuda_q38_moe.cu; not in a HIP build) */
+extern "C" int coli_cuda_q38_moe(const float *x, const int *rows, const CcQ38Exp *tab, const CcQ38Moe *p,
+                                 float *h, float *out, void *stream);
+extern "C" int coli_cuda_q38_sum(const float *out, const int *pos, const float *gates, int S, int K, int D, float *y,
+                                 void *stream);
 
 struct CcBuf { int kind, dev; size_t bytes; float *d; void *h; };
 
@@ -2941,6 +2946,35 @@ static int cc_enc_rel(CcBuf *x, CcBuf *pt, CcBuf *y, const CcEncRel *p) {
     coli_launch(cc_enc_rel_k, g, 256, 0, c->stream, fp(x), fp(pt), fpw(y), *p);
     return launched(c, "encoder relative products");
 }
+/* Qwen3.8's prompt experts (cuda_chain.h's q38_moe and q38_sum): the shapes checked here, the
+ * table's places by the caller (h and out hold every place it names). CUDA only: the kernels'
+ * lanes are a 32-thread warp's (HIP's table has none, cc_q38_ready says so) */
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+#define CC_Q38_OPS cc_q38_moe, cc_q38_sum
+static int cc_q38_moe(CcBuf *x, CcBuf *rows, CcBuf *tab, size_t tab_off, const CcQ38Moe *p, CcBuf *h, CcBuf *out) {
+    CcCtx *c = live();
+    if (!c || !x || !rows || !tab || !p || !h || !out || tab->kind != CC_DEV || p->ntab < 1 || p->ntiles < 1 ||
+        p->D < 128 || p->I < 128 || p->D % 128 || p->I % 128 || tab_off % 2 ||
+        tab_off * 4 + (size_t)p->ntab * sizeof(CcQ38Exp) > tab->bytes) return 0;
+    g_st.ops += 2;
+    if (!coli_cuda_q38_moe(fp(x), (const int *)rows->d, (const CcQ38Exp *)(tab->d + tab_off), p, fpw(h), fpw(out),
+                           (void *)c->stream)) { c->lost = 1; return 0; }
+    return 1;
+}
+static int cc_q38_sum(CcBuf *out, CcBuf *pos, CcBuf *gates, int S, int K, int D, CcBuf *y, size_t y_off) {
+    CcCtx *c = live();
+    if (!c || !out || !pos || !gates || !y || S < 1 || K < 1 || D < 1 || (size_t)S * K * 4 > pos->bytes ||
+        (size_t)S * K * 4 > gates->bytes || (y_off + (size_t)S * D) * 4 > y->bytes) return 0;
+    g_st.ops++;
+    if (!coli_cuda_q38_sum(fp(out), (const int *)pos->d, fp(gates), S, K, D, fpw(y) + y_off, (void *)c->stream)) {
+        c->lost = 1;
+        return 0;
+    }
+    return 1;
+}
+#else
+#define CC_Q38_OPS nullptr, nullptr
+#endif
 static const ColiCudaChainOps g_cc_ops = {
     sizeof(ColiCudaChainOps),
     cc_init, cc_ready, cc_lost_, cc_shutdown, cc_device, cc_device_now,
@@ -2968,5 +3002,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_lfm3,
     cc_matmul_glu,
     cc_addnorm,
+    CC_Q38_OPS,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

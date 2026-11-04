@@ -611,7 +611,7 @@ $(error choose CUDA=1 or HIP=1, not both)
 endif
 CFLAGS   += -DCOLI_CUDA
 LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lcublasLt -lcublas -lstdc++
-CUDA_OBJ  = backend_cuda.o cuda_chain.o cu_xb.o cu_tier.o
+CUDA_OBJ  = backend_cuda.o cuda_chain.o cuda_q38_moe.o cu_xb.o cu_tier.o
 INK_CUDA_OBJ = backend_cuda_ink.o
 ifeq ($(COLI_ANS),1)
 ifeq ($(strip $(DIETGPU_ROOT)),)
@@ -1032,14 +1032,14 @@ backend_xdna.o: backend_xdna.c .build-config
 # shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a
 # "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
 # __declspec(dllexport) so the 15 API symbols are exported.
-cuda-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h qmb_kernel.cuh
+cuda-dll: backend_cuda.cu cuda_chain.cu cuda_q38_moe.cu cu_xb.cu backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h qmb_kernel.cuh k3_exact.h k3_exact_tables.h
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	# The banner is localized ("for x64" / "per x64" / "pour x64"): match the arch token only (#1531).
 	@cl 2>&1 | grep -qE "x64|AMD64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
 		-L"$(CUDA_HOME)/lib/x64" -lcudart \
-		backend_cuda.cu cuda_chain.cu cu_xb.cu -o coli_cuda.dll
+		backend_cuda.cu cuda_chain.cu cuda_q38_moe.cu cu_xb.cu -o coli_cuda.dll
 
 # Windows HIP DLL: the AMD sibling of cuda-dll above. hipcc compiles the SAME
 # backend_cuda.cu (through backend_gpu_compat.h) into coli_hip.dll, exporting
@@ -1090,6 +1090,11 @@ backend_cuda.o: backend_cuda.cu backend_cuda.h cuda_bd.cuh qmb_kernel.cuh cuda_c
 cuda_chain.o: cuda_chain.cu cuda_chain.h backend_cuda.h backend_gpu_compat.h .build-config
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) -c cuda_chain.cu -o $@
+
+# Qwen3.8's prompt experts in its CPU's arithmetic: the chain's q38_moe and q38_sum (CUDA only)
+cuda_q38_moe.o: cuda_q38_moe.cu cuda_chain.h backend_cuda.h k3_exact.h k3_exact_tables.h .build-config
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) -c cuda_q38_moe.cu -o $@
 
 # The routed-expert tier on a CUDA device: vk_tier.c's logic (cu_tier.c compiles it again,
 # cu_tier.h) over the device side in cu_xb.cu (cu_tier_ops.h).
@@ -1346,10 +1351,17 @@ tests/test_dsv4_mhc$(EXE): tests/test_dsv4_mhc.c
 tests/test_dsv4_quant$(EXE): tests/test_dsv4_quant.c
 	$(CC) $(CFLAGS) tests/test_dsv4_quant.c -o tests/test_dsv4_quant$(EXE) $(LDFLAGS)
 # convenience alias: kernel correctness on AMD (same test, hipcc toolchain)
-# The dense chain's ops against their CPU references, on a real device (cuda_chain.cu).
+# The dense chain's ops against their CPU references, on a real device (cuda_chain.cu; its table
+# names cuda_q38_moe.cu's two entries, which an HIP build compiles empty).
 cuda-chain-check: backend_cuda.o cuda_chain.o
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_chain.cu -o cuda_chain_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu cuda_q38_moe.cu tests/test_cuda_chain.cu -o cuda_chain_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./cuda_chain_test$(EXE)
+
+# Qwen3.8's prompt experts (cuda_q38_moe.cu: the chain's q38_moe and q38_sum) against the CPU's
+# arithmetic, bit for bit, on a real device (CUDA only).
+cuda-q38-moe-check: cuda_q38_moe.cu tests/test_cuda_q38_moe.cu cuda_chain.h k3_exact.h k3_exact_tables.h
+	"$(GPUCC)" $(GPUFLAGS) cuda_q38_moe.cu tests/test_cuda_q38_moe.cu -o cuda_q38_moe_test$(EXE) $(GPU_TEST_LIBS)
+	./cuda_q38_moe_test$(EXE)
 
 hip-test:
 	$(MAKE) cuda-test HIP=1
@@ -1357,7 +1369,8 @@ hip-test:
 # CI: compile the backend and its test binary WITHOUT executing them (for
 # runners with the toolchain but no GPU). Pass CUDA_ARCH/HIP=1+HIP_ARCH.
 gpu-compile: backend_cuda.o cuda_chain.o
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_chain.cu -o cuda_chain_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu cuda_q38_moe.cu tests/test_cuda_chain.cu -o cuda_chain_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) cuda_q38_moe.cu tests/test_cuda_q38_moe.cu -o cuda_q38_moe_test$(EXE) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_absorb_determinism.cu -o absorb_determinism_test$(EXE) $(GPU_TEST_LIBS)

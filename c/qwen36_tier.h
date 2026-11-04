@@ -178,6 +178,10 @@ void qt_shutdown(void);
 void qt_note(int layer, int eid,
              const uint8_t *g4, const uint8_t *u4, const uint8_t *d4,
              const float *gs, const float *us, const float *ds);
+/* The engine's RAM slots stay put for the run (its cache holds every expert of every layer):
+ * the tier then uploads an fp8 expert from the slot it was noted in instead of copying it
+ * aside first (qt_note no longer allocates and copies 4.7 MiB under its lock). */
+void qt_source_stable(int on);
 
 /* Launch the GPU groups for the resident subset of the K selected experts
  * (async, all devices in parallel). Returns a bitmask of the k handled by
@@ -191,6 +195,12 @@ int qt_take(uint32_t mask, const float *val, int K, float *out);
 /* qt_take with Muse Spark's norm on every expert's row first: out += w * row*s / rms(row*s),
  * eps inside the root (the CPU path's products, in its order) */
 int qt_take_scaled(uint32_t mask, const float *val, int K, float *out, const float *s, float eps);
+/* qt_issue for S rows of K routed ids each, S*K <= 32 (an MTP verify): id s*K+z takes
+ * x + s*hidden as its input, and bit s*K+z of the mask says the device computes it; one
+ * group for every row. qt_take_rows then adds val[s*K+z] * y into out + s*hidden, each
+ * row's in rank order as qt_take adds one row's. */
+uint32_t qt_issue_rows(int layer, const int *eids, int S, int K, const float *x);
+int qt_take_rows(uint32_t mask, const float *val, int S, int K, float *out);
 
 /* Warmstart: plan the full fill set (heat order, budget reserved), then any
  * number of loader threads may call qt_note_planned per planned expert. */
@@ -361,6 +371,9 @@ static inline void qt_note(int a,int b,const uint8_t*c,const uint8_t*d,const uin
 static inline uint32_t qt_issue(int a,const int*b,int c,const float*d){(void)a;(void)b;(void)c;(void)d;return 0;}
 static inline int qt_take(uint32_t a,const float*b,int c,float*d){(void)b;(void)c;(void)d;return a==0;}
 static inline int qt_take_scaled(uint32_t a,const float*b,int c,float*d,const float*s,float e){(void)b;(void)c;(void)d;(void)s;(void)e;return a==0;}
+static inline uint32_t qt_issue_rows(int a,const int*b,int c,int k,const float*d){(void)a;(void)b;(void)c;(void)k;(void)d;return 0;}
+static inline void qt_source_stable(int a){(void)a;}
+static inline int qt_take_rows(uint32_t a,const float*b,int c,int k,float*d){(void)b;(void)c;(void)k;(void)d;return a==0;}
 static inline int  qt_plan_fill(int*a,int*b,int c){(void)a;(void)b;(void)c;return 0;}
 static inline void qt_layer_off(int a){(void)a;}
 static inline void qt_note_planned(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}

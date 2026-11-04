@@ -1599,6 +1599,7 @@ FAMILIES = (
         display_name="Qwen3.8-Flash-Next",
         display_scale="176B",
         engine_artifact="qwen38",
+        split_dirs_env="Q38_DIRS",
         engine_aliases=(),
         engine_group="qwen38",
         internal_arch="qwen38",
