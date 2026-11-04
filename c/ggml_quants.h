@@ -1389,6 +1389,10 @@ static inline int gq_tbuf(int I) {
     }
     return gq_tcap >= I;
 }
+/* activation rows a fused kernel takes at once; from there one unpack shared by all is cheaper.
+ * Every build has it: the paths without the fused kernels give a row the bits of its row alone
+ * as well, and the CUDA chains group a verify's rows by it (an ARM host with a card) */
+#define GQ_FUSED_ROWS 4
 /* one output row of W against every activation row */
 #if defined(__AVX2__) && defined(__FMA__)
 /* The 32-element block types without the unpack (Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL,
@@ -1405,7 +1409,6 @@ static inline __m256i gq_bits32(uint32_t bits) {   /* byte i: 0xFF when bit i is
 }
 #define GQ_HSUM8(v) ({ __m128 h_ = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1)); \
     h_ = _mm_add_ps(h_, _mm_movehl_ps(h_, h_)); h_ = _mm_add_ss(h_, _mm_movehdup_ps(h_)); _mm_cvtss_f32(h_); })
-#define GQ_FUSED_ROWS 4   /* activation rows a fused kernel takes at once; from there one unpack shared by all is cheaper */
 /* S (1..GQ_FUSED_ROWS) activation rows of one weight row: y[s * ystride]. A block is
  * decoded once and multiplied into every row, each row with its own accumulator and
  * the operations it has alone, so a row's bits do not depend on S. */

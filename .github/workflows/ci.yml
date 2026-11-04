@@ -21,6 +21,8 @@ jobs:
         run: cd c && make colibri inkling
       - name: C test suite
         run: cd c && make test-c
+      - name: The CUDA engines' host side without AVX2 (as an ARM host with a card builds it)
+        run: cd c && make cuda-host-syntax ARCH=x86-64
 
   # Every engine, on every platform a release archive is built for. Before this,
   # CI built colibri + inkling on Linux only and kimi_k3 on nothing -- so the fact
