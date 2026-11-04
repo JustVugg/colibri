@@ -228,14 +228,7 @@ and the rest as decode expert mirrors at **12.75 MiB each** (gate, up and
 down in fp4 with their scales).
 `DSV4_CUDA_EXPERT_MIRRORS` is only an upper bound (default 4096): the cache
 grows while at least `DSV4_CUDA_VRAM_RESERVE_MB` stays free, so free VRAM
-sizes it at run time — you normally do not need to set it. Free VRAM is
-re-read every 64 mirror misses; in between, an explicit reserve and the 600 MiB
-headroom also count the mirrors grown since the last reading, so the cache
-stops at the reserve instead of up to 64 mirrors (~800 MiB) past it, where the
-compressed-KV buffer and the prefill's attention buffers no longer fit and
-their layers' attention falls back to the CPU (`[DSV4 CUDA] kv comp
-allocation: out of memory`). The bank-sized default below already carries
-those 64 mirrors as margin, so its decisions do not change. Decode is
+sizes it at run time — you normally do not need to set it. Decode is
 disk-bound, so more mirrors help in proportion to the hit rate they add
 (~11 000 experts total; 600 mirrors ≈ 5 %); more RAM (`--ram`) buys more than
 more VRAM.
@@ -252,6 +245,15 @@ builds, 4873 on DeepGEMM and 3100 for a 132-expert checkpoint (7945, 8329 and
 Below 32 live mirrors the default keeps only 600 MiB free, so a card too small
 for the bank still decodes from a working mirror set (the bank then falls back
 to the CPU union). An explicit `DSV4_CUDA_VRAM_RESERVE_MB` is used as given.
+It and the 600 MiB default without the bank carry no probe margin, so from 8
+live mirrors on the cache counts the mirrors it has added since the last read
+of free VRAM against that read and stops at the reserve instead of
+overshooting it by up to 64 mirrors. The first 8 may still overshoot it by
+about 100 MiB, so a reserve just under the free VRAM leaves a mirror set the
+cache can recycle. The bank-sized default already counts those 64 mirrors in
+its reserve; below 32 live mirrors it may still grow up to 64 mirrors past its
+600 MiB between two reads. A failed mirror upload counts as a full card until
+the next read.
 
 | VRAM | dense mirrors | prefill bank | recommended env | expected |
 |---|---|---|---|---|
@@ -536,8 +538,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `COLI_CUDA_ATTN_BATCH` (0; 1 for a GGUF on the CUDA expert tier) | `1` = GPU batched prefill attention block + GPU decode attention/indexer; unset, it is on for a GGUF whose dense matrices the CUDA expert tier's device holds (`COLI_CUDA=1`, `COLI_CUDA_DENSE`), `0` keeps it on the CPU |
 | `COLI_CUDA_MOE_BATCH` (0) | `1` = prefill MoE on the transient VRAM expert bank |
 | `COLI_CUDA_MOE_BATCH_MIN` (256) | min fresh tokens to engage the bank |
-| `DSV4_CUDA_EXPERT_MIRRORS` (4096) | upper bound on decode VRAM expert mirrors (12.75 MiB each); free VRAM sizes the cache at run time |
-| `DSV4_CUDA_VRAM_RESERVE_MB` (600; with the bank 600 + the bank, ×2 with `COLI_CUDA_MOE_DOUBLE=1`, + 64 mirrors, logged as `v4_gpu mirror-reserve=`) | VRAM kept free while mirrors grow (bank + attention buffers; the default only from 32 live mirrors on, see [VRAM budget](#vram-budget-and-per-card-settings)); an explicit value is used as given |
+| `DSV4_CUDA_EXPERT_MIRRORS` (4096) | upper bound on decode VRAM expert mirrors (12.75 MiB each); free VRAM sizes the cache at run time; minimum 8 (a smaller cache mirrors nothing) |
+| `DSV4_CUDA_VRAM_RESERVE_MB` (600; with the bank 600 + the bank, ×2 with `COLI_CUDA_MOE_DOUBLE=1`, + 64 mirrors, logged as `v4_gpu mirror-reserve=`) | VRAM kept free while mirrors grow (bank + attention buffers; the default only from 32 live mirrors on, see [VRAM budget](#vram-budget-and-per-card-settings)); an explicit value is used as given and, from 8 live mirrors on, kept free between free-VRAM probes |
 | `V4_MTP_GPU_MIRRORS` (16) | separate mirror cache for the MTP drafter |
 | `DSV4_CUDA_PIN_HOST` (1, `.cu`) | page-lock expert-cache slabs for DMA uploads |
 | `DSV4_CUDA_MOE_GROUPED` (1, `.cu`) | expert-grouped MoE GEMM rows; `0` = legacy replicated |
