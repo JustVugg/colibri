@@ -580,6 +580,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `COLI_CUDA_MOE_BATCH_MIN` (256) | min fresh tokens to engage the bank |
 | `DSV4_CUDA_EXPERT_MIRRORS` (4096) | per-device upper bound on decode VRAM expert mirrors (12.75 MiB each); each device's free VRAM sizes its cache at run time |
 | `DSV4_CUDA_VRAM_RESERVE_MB` (600; with the bank 600 + the bank, x2 with `COLI_CUDA_MOE_DOUBLE=1`, + 64 mirrors, logged as `v4_gpu mirror-reserve=`) | VRAM kept free on each device while mirrors grow (bank + attention buffers; the default only from 32 live mirrors on, see [VRAM budget](#vram-budget-and-per-card-settings)); an explicit value is used as given |
+| `DSV4_CUDA_RESIDENT_RESERVE_MB` (2800, min 256) | VRAM kept free while resident experts preload and the exact head uploads; separate from the mirror-growth reserve above |
+| `DSV4_CUDA_RESIDENT_EXPERTS` (auto) | `auto` loads every routed expert when the budget fits and keeps the LRU cache on a budget refusal; `1` requires residency (a budget refusal or hard failure rejects engine open); `0` keeps the cache |
 | `V4_MTP_GPU_MIRRORS` (16) | separate mirror cache for the MTP drafter |
 | `DSV4_CUDA_PIN_HOST` (1, `.cu`) | page-lock expert-cache slabs for DMA uploads |
 | `DSV4_CUDA_MOE_GROUPED` (1, `.cu`) | expert-grouped MoE GEMM rows; `0` = legacy replicated |
@@ -724,3 +726,59 @@ disabled.
 - Linux CUDA tier: measure on a native Linux box (WSL2 verified), POSIX host pinning.
 - Tensor/expert parallel execution within a layer (not provided by layer placement).
 - Shared replacements for the two temporary private quant paths (rows16 cache).
+
+### Resident decode experts
+
+The CUDA decode pipeline checks the owning device's expert cache before starting
+host expert loaders. If every routed expert and the shared expert are mirrored,
+it runs the fused MoE directly from those device weights. The cache mutex stays
+held until the synchronous backend returns, preventing refill/eviction of the
+selected buffers. Partial or incomplete residency and declined fusion use the
+existing loader/group fallback. Shared expert bindings use w1 (gate), w3 (up),
+and w2 (down).
+
+This adapts Naruto's resident expert-table execution approach
+(`core/model/deepseek_v4_moe.cc`, `DeviceRoutedExpertsInvocation`, revision
+6634772) to Colibri's existing CUDA mirrors. It does not import Naruto's TP2,
+EP2, SM121 kernels, or graph runtime. Cold loads and partial-hit tokens still
+use host expert storage; this is not full model preloading.
+
+Validation covers six-device cache ownership, full/partial/incomplete residency,
+locking through compute, backend-decline fallback, and CPU compilation. The subsequent
+[six-RTX-5090 test](experiments/dsv4-resident-2026-09-27.md) measured about 3.8%
+median decode improvement against an otherwise identical fused-path control.
+Its output matches that control, but differs from the original unfused baseline;
+this is not a claim of numerical equivalence or general model-quality validation.
+
+### Full routed-expert residency (automatic)
+
+With the CUDA build, the engine automatically loads every target routed expert
+onto its layer's owning device when the resident runtime tier and per-device
+VRAM budgets allow it. `DSV4_CUDA_RESIDENT_EXPERTS=auto` is the default; `0`
+keeps the LRU cache, and `1` requires full residency or rejects engine open.
+Insufficient VRAM or an unsupported tier in automatic mode retains the cache
+path and logs the reason. Other loading failures still reject engine open. The immutable table is indexed directly by layer
+and expert, following Naruto's prebuilt device expert-table approach. Target
+experts are never evicted; MTP experts retain their separate cache.
+
+The loader uploads dense mirrors first, checks every device's available VRAM
+against its complete expert footprint plus `DSV4_CUDA_VRAM_RESERVE_MB` (default
+2800 MiB, minimum 256 MiB), then uploads experts. The setting overrides the LRU
+mirror capacity: the table has exactly one slot per assigned expert. A failed
+host lookup, unsupported tensor layout or upload aborts engine open and releases
+partial allocations. Budget rejection is fatal only in explicitly required mode. Publication occurs only when all cards
+have completed loading. A resident execution failure is reported rather than
+silently loading experts on the CPU.
+
+Prefill currently uses the per-token GPU MoE pipeline with these same tables,
+not the CPU expert union or a duplicate streaming expert bank. This removes
+expert host reads after preload but does not implement batched resident MoE,
+TP/EP, device-only activations, or SM120 MMA kernels. Startup reads the complete
+expert set; cold-start latency and steady-state decode must be measured
+separately. Host expert-cache memory is still governed by the existing budget.
+
+On six RTX 5090 GPUs, a short 64-token test measured 6.155 token/s median
+(three runs) versus 2.149 with the option off (one run), with identical output.
+Preloading took about 73 seconds and increased total cold-process latency.
+See the [full report and raw results](experiments/dsv4-full-resident-2026-09-27.md)
+for the scope, startup cost, and remaining validation limits.
