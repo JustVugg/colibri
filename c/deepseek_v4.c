@@ -5066,6 +5066,20 @@ static int expert_prefetch_enabled(void) {
     }
     return enabled;
 }
+
+/* Tell the store which experts of `layer` it is about to be asked for:
+ * expert_ids[pick[i]] (expert_ids[i] without pick), count of them. */
+static void v4_expert_prefetch(ColiExpertStore *store, int layer,
+                               const int *expert_ids, const int *pick,
+                               int count) {
+    if (count < 1 || !expert_prefetch_enabled() || !store->ops->prefetch) return;
+    ColiExpertKey *keys = malloc((size_t)count * sizeof(*keys));
+    if (!keys) return;
+    for (int i = 0; i < count; i++)
+        keys[i] = (ColiExpertKey){layer, expert_ids[pick ? pick[i] : i]};
+    store->ops->prefetch(store, keys, (size_t)count);
+    free(keys);
+}
 #endif
 
 
@@ -5577,7 +5591,50 @@ static void v4_vk_token_free(V4VkToken *vk) {
 }
 #endif
 
+/* Decode MoE counters (V4_SERVE_STATS_LOG; deepseek_v4_internal.h). */
+int g_v4_dec_counting;
+unsigned long long g_v4_dec_calls, g_v4_dec_uploads;
+double g_v4_dec_total_s, g_v4_dec_fetch_s, g_v4_dec_attach_s, g_v4_dec_gpu_s;
+unsigned long long g_v4_gpu_first_hits, g_v4_dec_store_fetches;
+
+#ifdef COLI_V4_GPU_TIER
+/* VRAM-first decode (V4_GPU_RESIDENT_FIRST=1): a routed expert already
+ * mirrored in VRAM is computed from the mirror without asking the expert
+ * store. The store still records the routing (coli_v4_expert_store_note_vram)
+ * and its RAM pin ranking leaves mirrored experts out
+ * (coli_v4_expert_store_vram_held), so their RAM slots age out of the LRU and
+ * the RAM tier holds experts that are not in VRAM: VRAM mirrors ADD to the
+ * cache instead of duplicating RAM residents. */
+int coli_v4_gpu_resident_first(void) {
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
+    static int on = -1;
+    if (on < 0) {
+        const char *setting = getenv("V4_GPU_RESIDENT_FIRST");
+        on = setting && atoi(setting) != 0;
+    }
+    return on;
+#else
+    /* only the dual-loader pipeline has VRAM-first lookups: without it every
+     * routed expert is still looked up, so its RAM pins must stay */
+    return 0;
+#endif
+}
+#endif
+
+#ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
+/* Hand `key` to loader lane `slot`; its job reads -1 until the lane has run. */
+static int v4_lane_start(ExpertLoadJob *jobs, ExpertLoadHandle *loaders,
+                         int *loader_active, int slot, ColiExpertStore *store,
+                         ColiExpertKey key) {
+    memset(&jobs[slot], 0, sizeof(jobs[slot]));
+    jobs[slot].store = store;
+    jobs[slot].key = key;
+    jobs[slot].result = -1;
+    if (profiled_expert_load_start(&loaders[slot], &jobs[slot]) != 0) return -1;
+    loader_active[slot] = 1;
+    return 0;
+}
+
 /* Finish every lane still reading and give back what it leased. Every exit of
  * a fetch pass runs this, errors included: a lane left running would write
  * its result into the caller's jobs[] after that frame is gone. */
@@ -5593,6 +5650,67 @@ static void v4_lanes_finish(ColiExpertStore *store, ExpertLoadJob *jobs,
 }
 #endif
 
+#if defined(COLI_V4_GPU_TIER) && defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
+/* A mirror-only view (leased[i] == 0: VRAM-first computed it from its mirror)
+ * has no host data. Fetch those experts from the store through the loader
+ * lanes, like the misses: preload up to dual_loader_lanes() reads, finish
+ * them in order, start the next one in the freed lane, and finish every lane
+ * on every exit. Their GPU handles are kept, so every CPU path sees complete
+ * views. fetch is scratch for the view indices; the lanes are idle on entry
+ * and again on return. */
+static int v4_views_fetch_host(ColiExpertStore *store, ColiExpertView *views,
+                               unsigned char *leased, int selected, int layer,
+                               int *fetch, ExpertLoadJob *jobs,
+                               ExpertLoadHandle *loaders, int *loader_active,
+                               int dec) {
+    int lanes = dual_loader_lanes(), nlazy = 0, result = 0;
+    for (int i = 0; i < selected; i++)
+        if (!leased[i]) fetch[nlazy++] = i;
+    if (dec) g_v4_dec_store_fetches += (unsigned long long)nlazy;
+    for (int f = 0; f < nlazy && f < lanes; f++)
+        if (v4_lane_start(jobs, loaders, loader_active, f, store,
+                          views[fetch[f]].key) != 0) {
+            result = moe_fail("layer %d: could not start reading expert %d",
+                              layer, views[fetch[f]].key.expert);
+            break;
+        }
+    for (int f = 0; !result && f < nlazy; f++) {
+        int current = fetch[f];
+        int slot = f % lanes;
+        double fw0 = v4_wait_clock();
+        int finish_failed = !loader_active[slot] ||
+            profiled_expert_load_finish(&loaders[slot]) != 0;
+        if (dec) g_v4_dec_fetch_s += v4_wait_clock() - fw0;
+        if (finish_failed) {
+            result = moe_fail("layer %d: the read of expert %d did not complete",
+                              layer, jobs[slot].key.expert);
+            break;
+        }
+        loader_active[slot] = 0;
+        if (jobs[slot].result) {
+            result = moe_fail("layer %d: reading expert %d from the expert store failed",
+                              layer, jobs[slot].key.expert);
+            break;
+        }
+        /* the host data, the mirror kept */
+        void *g = views[current].gate.gpu, *u = views[current].up.gpu;
+        void *dn = views[current].down.gpu;
+        views[current] = jobs[slot].view;
+        views[current].gate.gpu = g; views[current].up.gpu = u;
+        views[current].down.gpu = dn;
+        leased[current] = 1;
+        int next = f + lanes;
+        if (next < nlazy &&
+            v4_lane_start(jobs, loaders, loader_active, slot, store,
+                          views[fetch[next]].key) != 0)
+            result = moe_fail("layer %d: could not start reading expert %d",
+                              layer, views[fetch[next]].key.expert);
+    }
+    v4_lanes_finish(store, jobs, loaders, loader_active);
+    return result;
+}
+#endif
+
 static int moe_token_pipeline(float *output,
                               const ColiDeepSeekV4LayerWeights *weights,
                               const ColiDeepSeekV4Config *config,
@@ -5600,6 +5718,11 @@ static int moe_token_pipeline(float *output,
                               const float *input, int token) {
 #ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     double profile_moe_began = coli_v4_block_profile_now();
+#endif
+#ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
+    /* decode MoE counters (deepseek_v4_internal.h): the routing included */
+    int dec = g_v4_dec_counting;
+    double dec_t0 = v4_wait_clock();
 #endif
     int d = config->hidden_size;
     int n = config->n_routed_experts;
@@ -5697,16 +5820,10 @@ static int moe_token_pipeline(float *output,
                           expert_ids, expert_weights, &selected);
 #endif
 
-#ifdef COLI_V4_EXPERIMENTAL_PREFETCH
-    if (!result && expert_prefetch_enabled() && store->ops->prefetch) {
-        ColiExpertKey *keys = malloc((size_t)selected * sizeof(*keys));
-        if (keys) {
-            for (int i = 0; i < selected; i++)
-                keys[i] = (ColiExpertKey){weights->plan.layer, expert_ids[i]};
-            store->ops->prefetch(store, keys, (size_t)selected);
-            free(keys);
-        }
-    }
+#if defined(COLI_V4_EXPERIMENTAL_PREFETCH) && \
+    !defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
+    if (!result)
+        v4_expert_prefetch(store, weights->plan.layer, expert_ids, NULL, selected);
 #endif
 
 
@@ -5714,19 +5831,46 @@ static int moe_token_pipeline(float *output,
     ExpertLoadJob jobs[DUAL_EXPERT_LOADER_MAX] = {{0}};
     ExpertLoadHandle loaders[DUAL_EXPERT_LOADER_MAX] = {{0}};
     int loader_active[DUAL_EXPERT_LOADER_MAX] = {0};
+    /* views[i] belongs to expert_ids[i]; fetch[] lists the experts the store
+     * must provide (all of them unless VRAM-first finds mirrors); leased[i]
+     * marks views holding a store lease, the only ones released at the end. */
+    int alloc_n = selected ? selected : 1;
+    ColiExpertView *views = malloc((size_t)alloc_n * sizeof(*views));
+    unsigned char *leased = calloc((size_t)alloc_n, 1);
+    int *fetch = malloc((size_t)alloc_n * sizeof(*fetch));
+    int nfetch = 0;
+    if (!result && (!views || !leased || !fetch))
+        result = moe_fail("layer %d: out of memory for %d expert views",
+                          weights->plan.layer, selected);
     if (!result) {
-        int preload = selected < dual_loader_lanes()
-            ? selected : dual_loader_lanes();
-        for (int i = 0; i < preload; i++) {
-            jobs[i].store = store;
-            jobs[i].key = (ColiExpertKey){weights->plan.layer, expert_ids[i]};
-            jobs[i].result = -1;
-            if (profiled_expert_load_start(&loaders[i], &jobs[i]) != 0) {
+        memset(views, 0, (size_t)alloc_n * sizeof(*views));
+#ifdef COLI_V4_GPU_TIER
+        int first = store->gpu && coli_v4_gpu_resident_first() &&
+                    !coli_v4_hybrid_enabled();
+#endif
+        for (int i = 0; i < selected; i++) {
+            views[i].key = (ColiExpertKey){weights->plan.layer, expert_ids[i]};
+#ifdef COLI_V4_GPU_TIER
+            if (first && coli_v4_gpu_expert_peek(store, &views[i]) == 0)
+                continue;
+            views[i].gate.gpu = views[i].up.gpu = views[i].down.gpu = NULL;
+#endif
+            fetch[nfetch++] = i;
+        }
+        if (dec) g_v4_dec_store_fetches += (unsigned long long)nfetch;
+#ifdef COLI_V4_EXPERIMENTAL_PREFETCH
+        /* only what the store will be asked for: a mirrored expert is not */
+        v4_expert_prefetch(store, weights->plan.layer, expert_ids, fetch, nfetch);
+#endif
+        int preload = nfetch < dual_loader_lanes()
+            ? nfetch : dual_loader_lanes();
+        for (int f = 0; f < preload; f++) {
+            if (v4_lane_start(jobs, loaders, loader_active, f, store,
+                              views[fetch[f]].key) != 0) {
                 result = moe_fail("layer %d: could not start reading expert %d",
-                                  weights->plan.layer, expert_ids[i]);
+                                  weights->plan.layer, expert_ids[fetch[f]]);
                 break;
             }
-            loader_active[i] = 1;
         }
     }
 #else
@@ -5757,22 +5901,21 @@ static int moe_token_pipeline(float *output,
     if (!result) memset(output, 0, (size_t)d * sizeof(*output));
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
-    /* Zeroed up front: every exit releases the views below, and one that
-     * fails before the fetch pass fills them must find no lease there. */
-    ColiExpertView *views = calloc((size_t)(selected ? selected : 1), sizeof(*views));
 #ifdef COLI_V4_GPU_TIER
     int gpu_compute = 0;
 #endif
-    if (!views) result = moe_fail("layer %d: out of memory for %d expert views",
-                                  weights->plan.layer, selected);
     if (!result) {
 #ifdef COLI_V4_GPU_TIER
         gpu_compute = selected > 0;   /* none left (a tier took them all): the CPU adds the shared expert */
 #endif
-        for (int current = 0; !result && current < selected; current++) {
-            int slot = current % dual_loader_lanes();
-            if (!loader_active[slot] ||
-                profiled_expert_load_finish(&loaders[slot]) != 0) {
+        for (int f = 0; !result && f < nfetch; f++) {
+            int current = fetch[f];
+            int slot = f % dual_loader_lanes();
+            double fw0 = v4_wait_clock();
+            int finish_failed = !loader_active[slot] ||
+                profiled_expert_load_finish(&loaders[slot]) != 0;
+            if (dec) g_v4_dec_fetch_s += v4_wait_clock() - fw0;
+            if (finish_failed) {
                 result = moe_fail("layer %d: the read of expert %d did not complete",
                                   weights->plan.layer, jobs[slot].key.expert);
                 break;
@@ -5784,14 +5927,22 @@ static int moe_token_pipeline(float *output,
                 break;
             }
             views[current] = jobs[slot].view;
+            leased[current] = 1;
 #ifdef COLI_V4_GPU_TIER
             if (store->gpu) {
                 if (coli_v4_hybrid_enabled())
                     /* peek only: uploads are decided once the token's full
                      * miss count is known, by the q* pass below */
                     coli_v4_gpu_expert_peek(store, &views[current]);
-                else
+                else {
+                    double at0 = v4_wait_clock();
+                    unsigned long long uploads = coli_v4_gpu_expert_uploads();
                     coli_v4_gpu_expert_attach(store, &views[current]);
+                    if (dec) {
+                        g_v4_dec_attach_s += v4_wait_clock() - at0;
+                        g_v4_dec_uploads += coli_v4_gpu_expert_uploads() - uploads;
+                    }
+                }
             }
 #endif
 #ifdef COLI_V4_GPU_TIER
@@ -5800,24 +5951,22 @@ static int moe_token_pipeline(float *output,
                 gpu_compute = 0;
 #endif
 
-            int next = current + dual_loader_lanes();
-            if (next < selected) {
-                memset(&jobs[slot], 0, sizeof(jobs[slot]));
-                jobs[slot].store = store;
-                jobs[slot].key = (ColiExpertKey){weights->plan.layer,
-                                                expert_ids[next]};
-                jobs[slot].result = -1;
-                if (profiled_expert_load_start(&loaders[slot],
-                                               &jobs[slot]) != 0)
-                    result = moe_fail("layer %d: could not start reading expert %d",
-                                      weights->plan.layer, expert_ids[next]);
-                else
-                    loader_active[slot] = 1;
-            }
+            int next = f + dual_loader_lanes();
+            if (next < nfetch &&
+                v4_lane_start(jobs, loaders, loader_active, slot, store,
+                              views[fetch[next]].key) != 0)
+                result = moe_fail("layer %d: could not start reading expert %d",
+                                  weights->plan.layer, expert_ids[fetch[next]]);
         }
     }
     v4_lanes_finish(store, jobs, loaders, loader_active);
 #ifdef COLI_V4_GPU_TIER
+    /* If the token cannot take the fused GPU path after all (an attach
+     * failed), its mirror-only views need their host data now. */
+    if (!result && !gpu_compute)
+        result = v4_views_fetch_host(store, views, leased, selected,
+                                     weights->plan.layer, fetch, jobs,
+                                     loaders, loader_active, dec);
     int hybrid_gpu_count = 0;
     int hybrid_pending_drain = 0;   /* async DMA enqueued, not yet drained */
     int hybrid_uploads = 0;
@@ -5877,6 +6026,7 @@ static int moe_token_pipeline(float *output,
             gpu_compute = 1;    /* every expert made it: use the fused path */
     }
     if (!result && gpu_compute && store->gpu) {
+        double gpu_t0 = v4_wait_clock();
         void *sg = coli_v4_layer_gpu(weights, "ffn.shared_experts.w1");
         void *su = coli_v4_layer_gpu(weights, "ffn.shared_experts.w3");
         void *sd = coli_v4_layer_gpu(weights, "ffn.shared_experts.w2");
@@ -5924,6 +6074,7 @@ static int moe_token_pipeline(float *output,
                     output[i] = coli_bf16_round(expert_output[i]);
         }
         free(gates); free(ups); free(downs);
+        if (dec) g_v4_dec_gpu_s += v4_wait_clock() - gpu_t0;
     } else if (!result && hybrid_gpu_count > 0 && store->gpu) {
         /* Hybrid split: the GPU computes the resident subset as one weighted
          * group while the CPU computes the rest; the two partial sums merge
@@ -6060,10 +6211,27 @@ static int moe_token_pipeline(float *output,
      * copies read from. (The fused kernels sync internally, so this is only
      * ever a wait on already-finished work — never a correctness gamble.) */
     if (hybrid_pending_drain) coli_v4_gpu_expert_drain(store);
+    /* A view still without a lease was computed from VRAM (VRAM-first): its
+     * routing never reached the store, which counts it here, once per
+     * token-layer (fetch[] is free again: it carries the expert ids). */
+    if (!result) {
+        int nvram = 0;
+        for (int i = 0; i < selected; i++)
+            if (!leased[i]) fetch[nvram++] = expert_ids[i];
+        if (nvram)
+            coli_v4_expert_store_note_vram(store, weights->plan.layer, fetch, nvram);
+        if (dec) g_v4_gpu_first_hits += (unsigned long long)nvram;
+    }
 #endif
-    for (int current = 0; views && current < selected; current++)
-        coli_expert_release(store, &views[current]);
-    free(views);
+    if (views)
+        for (int current = 0; current < selected; current++)
+            if (leased && leased[current])
+                coli_expert_release(store, &views[current]);
+    free(views); free(leased); free(fetch);
+    if (dec) {
+        g_v4_dec_total_s += v4_wait_clock() - dec_t0;
+        g_v4_dec_calls++;
+    }
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
     v4_vk_token_free(&vk_step);
 #endif
@@ -9864,19 +10032,29 @@ static void hot_repin_locked(V4HotPolicy *policy, V4ExpertStoreState *state,
     uint64_t *usage = policy->usage +
         (size_t)layer * state->experts_per_layer;
     int *pins = policy->pins + (size_t)layer * policy->pin_count;
+    /* VRAM-first decode computes a mirrored expert without asking the store:
+     * its RAM slot is left out of the ranking, so it is neither pinned nor
+     * refreshed here and ages out of the LRU (coli_v4_expert_store_vram_held;
+     * on allocation failure, rank as before). */
+    unsigned char *in_vram = NULL;
+    if (coli_v4_expert_store_vram_held &&
+        (in_vram = calloc((size_t)state->experts_per_layer, 1)))
+        coli_v4_expert_store_vram_held(policy->store, layer, in_vram,
+                                       state->experts_per_layer);
     for (int rank = 0; rank < policy->pin_count; rank++) {
         int best = -1;
         for (int expert = 0; expert < state->experts_per_layer; expert++) {
             int already = 0;
             for (int prior = 0; prior < rank; prior++)
                 if (pins[prior] == expert) { already = 1; break; }
-            if (!already && usage[expert] &&
+            if (!already && usage[expert] && !(in_vram && in_vram[expert]) &&
                 (best < 0 || usage[expert] > usage[best] ||
                  (usage[expert] == usage[best] && expert < best)))
                 best = expert;
         }
         pins[rank] = best;
     }
+    free(in_vram);
     for (int rank = 0; rank < policy->pin_count; rank++) {
         int expert = pins[rank];
         if (expert < 0) continue;
@@ -9981,19 +10159,29 @@ static V4ExpertSlot *hot_oldest_pool_victim(
     return last_resort;
 }
 
+/* state->mutex held. The dashboard's view of one routing of the expert at
+ * `index` (layer * experts_per_layer + expert): its HITS for the turn and its
+ * heat, capped at 63. Every routing the store records keeps it, one that
+ * hot_count_locked counts and one VRAM-first decode served from a mirror
+ * (coli_v4_expert_store_note_vram) alike. */
+static void hot_heat_locked(V4ExpertStoreState *state, size_t index) {
+    if (!state->ehit) return;
+    state->ehit[index] = 1;
+    if (state->eheat && state->eheat[index] < 63) state->eheat[index]++;
+}
+
 /* state->mutex held. The books one routing of `key` keeps: the pin ranking's
  * usage and its per-layer request clock (the pin ramp, the repin cadence, the
  * usage decay), the dashboard's HITS and heat, and the .coli_usage history.
  * Every lookup_hot counts one; so do the routings computed elsewhere
- * (coli_v4_expert_store_note_routed, coli_v4_expert_store_note_union). */
+ * (coli_v4_expert_store_note_routed, coli_v4_expert_store_note_union). A
+ * routing VRAM-first decode serves from a mirror keeps only the HITS, heat and
+ * history (coli_v4_expert_store_note_vram). */
 static void hot_count_locked(V4HotPolicy *policy, V4ExpertStoreState *state,
                              ColiExpertKey key) {
     size_t index = (size_t)key.layer * state->experts_per_layer + key.expert;
     policy->usage[index]++;
-    if (state->ehit) {
-        state->ehit[index] = 1;
-        if (state->eheat && state->eheat[index] < 63) state->eheat[index]++;
-    }
+    hot_heat_locked(state, index);
     rt_count(key.layer, &key.expert, 1);   /* selection history, shared format (#700) */
     uint64_t layer_requests = ++policy->layer_requests[key.layer];
     if (policy->repin_interval &&
@@ -10188,6 +10376,17 @@ int coli_v4_test_expert_books(ColiExpertStore *store, int layer,
     return policy->pin_count;
 }
 
+/* 1 when the hot policy pins {layer, expert} in RAM now, -1 without one. */
+int coli_v4_test_expert_pinned(ColiExpertStore *store, ColiExpertKey key) {
+    V4HotPolicy *policy = store && store->state ? hot_find(store) : NULL;
+    if (!policy) return -1;
+    V4ExpertStoreState *state = store->state;
+    pthread_mutex_lock(&state->mutex);
+    int pinned = hot_is_pinned(policy, key.layer, key.expert);
+    pthread_mutex_unlock(&state->mutex);
+    return pinned;
+}
+
 void coli_v4_test_reset_direct_io_stats(void) {
     __atomic_store_n(&v4_direct_reads, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&v4_direct_flock_reads, 0, __ATOMIC_RELAXED);
@@ -10304,6 +10503,36 @@ void coli_v4_expert_store_note_union(ColiExpertStore *store, int layer,
 
 int (*coli_v4_expert_store_ram_first)(int layer, int expert);   /* exclusive RAM/VRAM: NULL unless a Vulkan tier sets it */
 void (*coli_v4_expert_store_ram_gave)(void);
+/* VRAM-first decode (deepseek_v4_internal.h): NULL unless the CUDA tier sets it */
+void (*coli_v4_expert_store_vram_held)(ColiExpertStore *store, int layer,
+                                       unsigned char *held, int experts);
+
+/* The routings VRAM-first decode served from VRAM, one call per token-layer.
+ * They keep the HITS, heat and history a lookup keeps (hot_heat_locked,
+ * rt_count), so the dashboard and the saved history see every routing. The
+ * rest of hot_count_locked's books, usage and layer_requests, is left alone
+ * so that the experts decode computes from VRAM neither rank nor pace the RAM
+ * pins (a pin would hold a RAM slot decode never reads); the request, hit and
+ * miss counters describe the RAM cache's traffic and are not touched either.
+ * A batched prefill keeps the full books for every routed expert, the books
+ * a CPU-union prefill leaves decode: the expert union's lookups and the GPU
+ * bank's note_union count each one, and neither reads the mirrors. With
+ * V4_EXPERT_UNION=0 a chunk the bank does not take runs token by token
+ * through moe_token_pipeline, so its mirrored experts are counted here, as
+ * in decode. */
+void coli_v4_expert_store_note_vram(ColiExpertStore *store, int layer,
+                                    const int *experts, int count) {
+    if (!store || !store->state || !experts || count < 1 || !hot_find(store)) return;
+    V4ExpertStoreState *state = store->state;
+    if (layer < 0 || layer >= state->layers) return;
+    pthread_mutex_lock(&state->mutex);
+    for (int i = 0; i < count; i++)
+        if (experts[i] >= 0 && experts[i] < state->experts_per_layer)
+            hot_heat_locked(state, (size_t)layer * state->experts_per_layer +
+                                   experts[i]);
+    rt_count(layer, experts, count);   /* skips ids outside the layer */
+    pthread_mutex_unlock(&state->mutex);
+}
 
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
 /* The Vulkan routed-expert tier's side of the store (deepseek_v4_internal.h). A
@@ -11509,6 +11738,8 @@ static int v4_gpu_wanted(void) {
 }
 
 typedef struct V4GpuExpertMirrorCache V4GpuExpertMirrorCache;
+static void v4_gpu_expert_vram_held(ColiExpertStore *store, int layer,
+                                    unsigned char *held, int experts);
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
     int device, int capacity);
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create(int device,
@@ -11583,6 +11814,11 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     if (engine->experts && !engine->experts->gpu)
         engine->experts->gpu =
             v4_gpu_expert_mirrors_create(device, mirror_suggested);
+    /* VRAM-first decode never asks the store for a mirrored expert: its RAM
+     * pin ranking leaves them out. */
+    if (engine->experts && engine->experts->gpu &&
+        coli_v4_gpu_resident_first() && !coli_v4_hybrid_enabled())
+        coli_v4_expert_store_vram_held = v4_gpu_expert_vram_held;
     fprintf(stderr, "v4_gpu tier=dense-matvec device=%d\n", device);
     return 0;
 }
@@ -11607,6 +11843,7 @@ void coli_v4_gpu_engine_close(ColiV4Engine *engine) {
         }
         engine->gpu.layer_ready[layer] = 0;
     }
+    coli_v4_expert_store_vram_held = NULL;   /* it scans the caches freed here */
     if (engine->experts && engine->experts->gpu) {
         v4_gpu_expert_mirrors_free(
             (V4GpuExpertMirrorCache *)engine->experts->gpu);
@@ -12040,6 +12277,12 @@ struct V4GpuExpertMirrorCache {
     int device;
     pthread_mutex_t mutex;
 };
+/* Mirror uploads, every cache (coli_v4_gpu_expert_uploads). Uploads happen on
+ * the generation thread only. */
+static unsigned long long g_v4_mirror_uploads;
+unsigned long long coli_v4_gpu_expert_uploads(void) {
+    return g_v4_mirror_uploads;
+}
 
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
     int device, int capacity) {
@@ -12227,6 +12470,7 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                 cache->entries[found].layer = view->key.layer;
                 cache->entries[found].expert = view->key.expert;
                 cache->entries[found].clock = ++cache->clock;
+                g_v4_mirror_uploads++;
                 view->gate.gpu = cache->entries[found].gate;
                 view->up.gpu = cache->entries[found].up;
                 view->down.gpu = cache->entries[found].down;
@@ -12297,6 +12541,7 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
         cache->entries[found].gate = gate;
         cache->entries[found].up = up;
         cache->entries[found].down = down;
+        g_v4_mirror_uploads++;
     }
     cache->entries[found].clock = ++cache->clock;
     view->gate.gpu = cache->entries[found].gate;
@@ -12304,6 +12549,25 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
     view->down.gpu = cache->entries[found].down;
     pthread_mutex_unlock(&cache->mutex);
     return 0;
+}
+
+/* coli_v4_expert_store_vram_held (VRAM-first decode): the experts of `layer`
+ * with a live mirror in the store's cache. It runs on any thread that looks
+ * an expert up, with the store's lock held, and takes only the cache's own
+ * lock; nothing that holds it calls the store. */
+static void v4_gpu_expert_vram_held(ColiExpertStore *store, int layer,
+                                    unsigned char *held, int experts) {
+    if (!store || !store->gpu || !held) return;
+    V4GpuExpertMirrorCache *cache = (V4GpuExpertMirrorCache *)store->gpu;
+    pthread_mutex_lock(&cache->mutex);
+    for (int i = 0; i < cache->count; i++) {
+        const V4GpuExpertMirror *entry = &cache->entries[i];
+        if (entry->layer == layer && entry->expert >= 0 &&
+            entry->expert < experts &&
+            entry->gate && entry->up && entry->down)
+            held[entry->expert] = 1;
+    }
+    pthread_mutex_unlock(&cache->mutex);
 }
 
 int coli_v4_gpu_expert_attach(ColiExpertStore *store, ColiExpertView *view) {
@@ -15330,8 +15594,10 @@ static int target_token(ColiV4Engine *engine, float **state_ptr, float **next_pt
                         ColiExpertStore *experts, int token, int position,
                         char *error, size_t error_size) {
     double t0 = spec_now();
+    g_v4_dec_counting = 1;   /* the decode MoE counters: decode forwards only */
     int result = target_token_impl(engine, state_ptr, next_ptr, attention, index, config,
                                    experts, token, position, error, error_size);
+    g_v4_dec_counting = 0;
     g_v4_prof_block_s += spec_now() - t0;
     g_v4_prof_forwards += 1;
     return result;
@@ -17718,6 +17984,34 @@ static void v4_serve_finish(ColiV4Engine *engine, ColiV4Session *session,
      * they exceeded the wall on a cold tiny run (0.073 s of disk in a 0.034 s turn). */
     double attention_s = (g_v4_prof_block_s - marks->block) - expert_matmul_s - expert_wait_s;
     if (attention_s < 0.0) attention_s = 0.0;
+    {   /* V4_SERVE_STATS_LOG=1: the turn's DONE/PROF numbers on stderr too (the
+         * gateway consumes stdout), for decode benchmarking from the serve log.
+         * v4_dec_moe: process totals of the single-token decode MoE
+         * (deepseek_v4_internal.h). v4_serve_turn: decode_s and tok_s are the
+         * decode's, hit% and the expert and attention seconds the whole turn's,
+         * prefill included (as DONE/PROF), and *_total are process totals of
+         * the decode experts computed from VRAM without a store lookup
+         * (V4_GPU_RESIDENT_FIRST) and of those fetched from the store. */
+        static int stats_log = -1;
+        if (stats_log < 0) {
+            const char *setting = getenv("V4_SERVE_STATS_LOG");
+            stats_log = setting && atoi(setting) > 0;
+        }
+        if (stats_log)
+            fprintf(stderr, "v4_dec_moe calls=%llu total_s=%.2f fetch_wait_s=%.2f "
+                    "attach_s=%.2f uploads=%llu gpu_s=%.2f (cumulative)\n",
+                    g_v4_dec_calls, g_v4_dec_total_s, g_v4_dec_fetch_s,
+                    g_v4_dec_attach_s, g_v4_dec_uploads, g_v4_dec_gpu_s);
+        if (stats_log)
+            fprintf(stderr, "v4_serve_turn prompt=%d completion=%d decode_s=%.2f "
+                    "tok_s=%.3f hit=%.1f%% expert_disk_s=%.2f expert_wait_s=%.2f "
+                    "expert_matmul_s=%.2f attention_s=%.2f rss_gb=%.1f "
+                    "vram_first_hits_total=%llu store_fetches_total=%llu\n",
+                    prompt_tokens, completion, decode,
+                    decode > 0.0 ? completion / decode : 0.0, hit_rate,
+                    expert_disk_s, expert_wait_s, expert_matmul_s, attention_s,
+                    v4_serve_rss_gb(), g_v4_gpu_first_hits, g_v4_dec_store_fetches);
+    }
     v4_prof_emit(elapsed, prompt_tokens, completion,
                  expert_disk_s, expert_wait_s, expert_matmul_s, attention_s,
                  g_v4_prof_head_s - marks->head, g_v4_prof_forwards - marks->forwards);
