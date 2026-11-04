@@ -2026,11 +2026,15 @@ int vkc_ev_signal(uint64_t g) {
     if (!f || KC.lost || !ev_init()) return 0;
     int k = ev_slot(g);
     if (k < 0) return 0;
-    /* everything before it done and visible to the host, then the event */
+    /* everything before it done and visible to the host, then the event. The barrier's second
+     * scope holds the device's stages too: the event's first scope (its stages) chains onto it,
+     * so the event comes after the writes are made available, and the device's work after it
+     * comes after them as well, which track_reset counts on. The event's own stages may not
+     * hold HOST (VUID-vkCmdSetEvent-stageMask-01149). */
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-                          .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
-    vkCmdPipelineBarrier(f->cmd, ALL_STAGES, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
-    vkCmdSetEvent(f->cmd, g_ev.g[k], ALL_STAGES | VK_PIPELINE_STAGE_HOST_BIT);
+                          .dstAccessMask = VK_ACCESS_HOST_READ_BIT | ALL_RW};
+    vkCmdPipelineBarrier(f->cmd, ALL_STAGES, ALL_STAGES | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    vkCmdSetEvent(f->cmd, g_ev.g[k], ALL_STAGES);
     KC.st.barriers++;
     track_reset();
     g_ev.serial[k] = KC.serial;
@@ -2046,7 +2050,11 @@ int vkc_ev_wait(uint64_t g) {
     vkCmdWaitEvents(f->cmd, 1, &g_ev.h[k], VK_PIPELINE_STAGE_HOST_BIT, ALL_STAGES, 1, &hb, 0, NULL, 0, NULL);
     if (KC.prof) prof_mark(f, PK_WAIT);
     KC.st.barriers++;
-    track_reset();
+    /* The wait orders the host's writes before what follows, not the device's own work before
+     * it (a host-set event's first scope is the host's): the tracker keeps what that work
+     * wrote, and the next op that reads it gets its barrier. Reset here, the step's sum read
+     * the experts' rows with none (the validation layer's synchronization check: a
+     * read-after-write hazard every hybrid step; #2583). */
     g_ev.serial[k] = KC.serial;
     return 1;
 }

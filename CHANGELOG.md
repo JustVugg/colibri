@@ -127,6 +127,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   kernels defined, so `qwen38` with `CUDA=1` did not compile without them. Every build has it
   now (the paths without those kernels give a row its own bits as well), and CI compiles the
   CUDA engines' host side without AVX2 (`make cuda-host-syntax`).
+- **Vulkan: the hybrid steps' barriers** (#2583). With experts in the host pool, a decode step's
+  pool experts are computed by the CPU inside the chain's frame (qwen36, qwen38, OLMoE), the
+  device waiting on an event for them. The step's sum then read the device's experts' rows
+  with no barrier after the dispatch that wrote them, and the event's stage mask held a stage
+  the specification forbids there. The validation layer's synchronization check found both
+  at every hybrid step; an NVIDIA card and Lavapipe hid them, and on a Radeon RX 9060 XT with
+  every expert of Qwen3.6-35B resident the answers fell into repetition after a few requests.
+  The barriers now order the device's own work around the event, and CI runs the hybrid case
+  under that check (`sync_gate`, `vulkan-validationlayers`).
 - **The UI's coding agents with the UI on Windows itself** (`coli ui` from a Windows prompt, the
   desktop window). The agents of WSL were never looked for there, and every folder was "not
   found" (its check asked `wslpath`, which Windows has not). They are now found and opened
