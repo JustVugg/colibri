@@ -72,6 +72,19 @@ class TranslateRequests(unittest.TestCase):
         with self.assertRaises(gw.GatewayError):
             gw.ollama_chat_to_openai({"messages": [], "think": "yes"}, "m")
 
+    def test_think_default_from_the_model_entry(self):
+        body = {"messages": [{"role": "user", "content": "hi"}]}
+        self.assertEqual(gw.apply_think_default(body, "low")["think"], "low")
+        self.assertNotIn("think", body)                      # the request's body is left as it was
+        self.assertIs(gw.apply_think_default(body, None), body)
+        self.assertFalse(gw.apply_think_default(body, False)["think"])
+        self.assertTrue(gw.apply_think_default({"messages": [], "think": True}, "low")["think"])   # explicit wins
+        self.assertFalse(gw.apply_think_default({"messages": [], "think": False}, "low")["think"])
+        with self.assertRaises(gw.GatewayError):
+            gw.apply_think_default(body, "xhigh")
+        req, _ = gw.ollama_chat_to_openai(gw.apply_think_default(body, "low"), "m")
+        self.assertEqual((req["enable_thinking"], req["reasoning_effort"]), (True, "low"))
+
     def test_generate(self):
         req, raw, _ = gw.ollama_generate_to_openai({"prompt": "Say hi", "system": "Be brief", "stream": False}, "m")
         self.assertFalse(raw)
