@@ -9,7 +9,7 @@ RUN apt-get update && \
 
 WORKDIR /src
 COPY c/ ./c/
-RUN make -C c colibri CUDA=1 CUDA_ARCH=sm_80
+RUN make -C c inkling CUDA=1 CUDA_ARCH=sm_89
 
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 RUN apt-get update && \
@@ -19,13 +19,12 @@ RUN apt-get update && \
     useradd -m -u 1000 colibri
 
 WORKDIR /app
-COPY --from=build /src/c/colibri ./colibri
+COPY --from=build /src/c/inkling ./inkling
 COPY c/coli c/version.py c/openai_server.py c/v4_dsml.py c/v41_dsml.py c/family_registry.py c/resource_plan.py c/doctor.py c/autotune.py c/image_engine.py c/term_image.py ./
 COPY c/tools/ ./tools/
 
 ENV COLI_MODEL=/model \
-    COLI_ENGINE=/app/colibri \
-    COLI_DOCKER_GLM_ONLY=1 \
+    COLI_ENGINE=/app/inkling \
     PYTHONUNBUFFERED=1
 VOLUME ["/model"]
 EXPOSE 5000
