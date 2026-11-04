@@ -81,7 +81,16 @@ class WindowsHost(unittest.TestCase):
         self.assertIn("non esiste", msg)
 
 
-@unittest.skipUnless(shutil.which("bash"), "bash")
+def _bash_major():
+    """bash's major version, 0 without bash; aliases are read through BASH_ALIASES, bash 4 on
+    (WSL's distributions have 5; macOS's /bin/bash is 3.2)"""
+    if not shutil.which("bash"):
+        return 0
+    out = subprocess.run(["bash", "-c", "echo ${BASH_VERSINFO[0]}"], capture_output=True, text=True, timeout=30).stdout
+    return int(out.strip() or 0)
+
+
+@unittest.skipUnless(os.name != "nt" and _bash_major() >= 4, "WSL's side: bash 4 or later")
 class WslFind(unittest.TestCase):
     def test_an_alias_to_an_installed_program_counts(self):
         with tempfile.TemporaryDirectory() as home:
