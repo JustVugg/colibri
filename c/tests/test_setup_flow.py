@@ -2362,6 +2362,24 @@ class WindowsToolchainTests(unittest.TestCase):
     def test_msys2_build_packages_include_libgomp(self):
         self.assertIn("mingw-w64-ucrt-x86_64-libgomp", setup_flow.PACKAGES["msys2"][1]["build"])
 
+    def fake_gcc(self, answer):
+        """A stand-in gcc whose -print-file-name=libgomp.a says `answer`."""
+        path = os.path.join(self.tmp.name, "fake-gcc-" + str(abs(hash(answer))))
+        with open(path, "w") as f:
+            f.write(f'#!/bin/sh\necho "{answer}"\n')
+        os.chmod(path, 0o755)
+        return path
+
+    @unittest.skipIf(sys.platform == "win32", "the stand-in compiler is a shell script")
+    def test_a_gcc_without_libgomp_a_is_noticed(self):
+        # gcc 16 on MSYS2 has no libgomp.a until its libgomp package is installed (#2612);
+        # -print-file-name then echoes the bare name back.
+        self.assertTrue(setup_flow._cc_lacks_static_openmp(self.fake_gcc("libgomp.a")))
+        self.assertFalse(setup_flow._cc_lacks_static_openmp(self.fake_gcc("/ucrt64/lib/libgomp.a")))
+
+    def test_a_compiler_that_cannot_be_asked_is_not_blamed(self):
+        self.assertFalse(setup_flow._cc_lacks_static_openmp(os.path.join(self.tmp.name, "no-such-gcc")))
+
 
 
 class PortFreeTest(unittest.TestCase):
