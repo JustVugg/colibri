@@ -19,8 +19,8 @@
  * blocks keep it); a field at any even byte comes from one word or two (bd_ldu). */
 #ifndef CUDA_BD_CUH
 #define CUDA_BD_CUH
+#include <mutex>   /* bd_xq_scratch's lock, under hipcc as well */
 #if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))
-#include <mutex>
 #include <cuda_fp16.h>   /* HIP: hip_fp16.h, through backend_gpu_compat.h */
 #endif
 #include "blockdec_host.h"
