@@ -20,6 +20,7 @@
 #include "spec_draft.h"   /* prompt-lookup drafts and the gate that decides when drafting pays */
 #include "draft_vocab.h"  /* the tokens the MTP head scores for a draft (Q38_MTP_VOCAB) */
 #include "expert_ffn.h"   /* the int4-g64 routed experts (experts-int4g64/ sidecar) run through its f32 kernel */
+#include "fma_compat.h"   /* coli_fmaf: fmaf where the CPU fuses, else a vectorizable exact product (#2606) */
 #include "int2_g32.h"     /* the int2-g32 routed experts (experts-int2g32/ sidecar) */
 #include "lowbit_g16.h"   /* the int2-g16 and int3-g16 routed experts (experts-int2g16/, experts-int3g16/) */
 #include "vq2_g32.h"     /* the vq2 routed experts: two-stage vector codes (experts-vq2g32/) */
@@ -473,7 +474,7 @@ static inline __attribute__((always_inline)) void q38_bf16_rows(float *y,int ys,
     }
     for(int s=0;s<S;s++){
         float a=xf_hsum8(acc[s]);
-        for(int k=i;k<I;k++)a=fmaf(x[(int64_t)s*I+k],bf16_to_f32(w[k]),a);
+        for(int k=i;k<I;k++)a=coli_fmaf(x[(int64_t)s*I+k],bf16_to_f32(w[k]),a);
         y[(int64_t)s*ys]=a;
     }
 }
@@ -598,7 +599,7 @@ static void q38_matmul_int4g64(float *y,const float *x,const uint8_t *codes,
             float tail=0.f;
             for(int i=body;i<I;i++)
                 tail+=(float)((int)((w[i>>1]>>((i&1)*4))&15)-8)*xs[i];
-            y[(int64_t)s*O+o]=fmaf(tail,sc[groups-1],y[(int64_t)s*O+o]);
+            y[(int64_t)s*O+o]=coli_fmaf(tail,sc[groups-1],y[(int64_t)s*O+o]);
         }
     }
     free(xs_rows);
@@ -3220,14 +3221,14 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
                 for(int value=0;value<VD;value++)previous[value]=0.f;
                 for(int d=0;d<KD;d++){
                     float *row=state+(int64_t)d*VD;const float kd=kh[d];
-                    for(int value=0;value<VD;value++){row[value]*=alpha;previous[value]=fmaf(kd,row[value],previous[value]);}
+                    for(int value=0;value<VD;value++){row[value]*=alpha;previous[value]=coli_fmaf(kd,row[value],previous[value]);}
                 }
                 for(int value=0;value<VD;value++){delta[value]=(vh[value]-previous[value])*beta;current[value]=0.f;}
                 for(int d=0;d<KD;d++){
                     float *row=state+(int64_t)d*VD;const float kd=kh[d],qd=qh[d];
                     for(int value=0;value<VD;value++){
-                        row[value]=fmaf(kd,delta[value],row[value]);
-                        current[value]=fmaf(qd,row[value],current[value]);
+                        row[value]=coli_fmaf(kd,delta[value],row[value]);
+                        current[value]=coli_fmaf(qd,row[value],current[value]);
                     }
                 }
                 if(snap_rec)memcpy(snap_rec+(int64_t)h*KD*VD,state,(size_t)KD*VD*sizeof(float));
@@ -3257,10 +3258,10 @@ static inline float q38_dot8(const float *a,const float *b,int n){
     float l[8];_mm256_storeu_ps(l,acc);
 #else
     float l[8]={0,0,0,0,0,0,0,0};int i=0;
-    for(;i+8<=n;i+=8)for(int k=0;k<8;k++)l[k]=fmaf(a[i+k],b[i+k],l[k]);
+    for(;i+8<=n;i+=8)for(int k=0;k<8;k++)l[k]=coli_fmaf(a[i+k],b[i+k],l[k]);
 #endif
     float r=((l[0]+l[4])+(l[2]+l[6]))+((l[1]+l[5])+(l[3]+l[7]));
-    for(;i<n;i++)r=fmaf(a[i],b[i],r);
+    for(;i<n;i++)r=coli_fmaf(a[i],b[i],r);
     return r;
 }
 /* q38_dot8 of four rows of q (qstride apart) against one row b, each with q38_dot8's own
@@ -3279,7 +3280,7 @@ static inline void q38_dot8_x4(float *out,const float *q,int64_t qstride,const f
     for(int g=0;g<4;g++){
         float l[8];_mm256_storeu_ps(l,acc[g]);
         float r=((l[0]+l[4])+(l[2]+l[6]))+((l[1]+l[5])+(l[3]+l[7]));
-        for(int k=i;k<n;k++)r=fmaf(qr[g][k],b[k],r);
+        for(int k=i;k<n;k++)r=coli_fmaf(qr[g][k],b[k],r);
         out[g]=r;
     }
 #else
@@ -4520,7 +4521,7 @@ static void q38_rows(float *y,int ys,const Q38Weight *w,int I,int r0,int r1,
                 const float *xs=xr[a];
                 float tail=0.f;
                 for(int i=body;i<I;i++)tail+=(float)((int)((wr[i>>1]>>((i&1)*4))&15)-8)*xs[i];
-                y[(int64_t)a*ys+o]=fmaf(tail,sc[groups-1],y[(int64_t)a*ys+o]);
+                y[(int64_t)a*ys+o]=coli_fmaf(tail,sc[groups-1],y[(int64_t)a*ys+o]);
             }
         }
         return;

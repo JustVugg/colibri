@@ -171,6 +171,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   UD-Q4_K_XL 43 Q5_1. Both are now on the card as the CPU's integer form computes them.
   UD-IQ2_XS on an RTX PRO 4000: decode 8.3-8.6 -> 51.7-68.2 tok/s, a 585-token prompt
   24.6-25.1 -> 206-325 tok/s.
+- **Qwen3.8 on a CPU without FMA: the DeltaNet recurrence 4x faster** (#2606). Its fused
+  multiply-adds (`fmaf`) are one instruction where the CPU fuses (FMA3, arm64) and a call into
+  libm for every element where it does not (Sandy and Ivy Bridge, the x86-64 baseline), which
+  no loop vectorizes and glibc computes in software: a Xeon E5-2690 v1 spent 898 ms of a 1248 ms
+  forward there. `coli_fmaf` (`fma_compat.h`) is `fmaf` where the CPU fuses, the same
+  instructions, and elsewhere the product in double and the sum rounded to float, which AVX
+  vectorizes. Built for Sandy Bridge with glibc's software `fmaf`, Qwen3.8 IQ2_XS: the recurrence
+  208 -> 52 ms a forward, the same perplexity (2.2402 nats a token over 258 tokens); the planar
+  expert kernel's f32 mode (`QWEN_EXPERT_ACT=f32`) on Qwen3.6 0.59 -> 2.9 tok/s.
 - **Qwen3.8: memory that grew with every answer** (#2592). The expert loader reads a batch of
   missing experts in parallel (on by default) with a team as large as the batch, and libgomp
   ends the threads a smaller team leaves out and starts new ones for a larger. Each read
