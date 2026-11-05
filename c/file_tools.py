@@ -39,7 +39,10 @@ def read(folder, path):
     p = _path(folder, path)
     with open(p, encoding="utf-8", errors="replace") as f:
         text = f.read(MAX_READ + 1)
-    return {"path": p, "text": _cut(text, MAX_READ)}
+    if len(text) > MAX_READ:   # only the first MAX_READ characters were read: say how big the file is
+        text = text[:MAX_READ] + "\n[... cut: showing the first %d characters of a %d-byte file]" % (
+            MAX_READ, os.path.getsize(p))
+    return {"path": p, "text": text}
 
 
 def write(folder, path, content):

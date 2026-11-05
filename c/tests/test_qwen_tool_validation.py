@@ -58,7 +58,11 @@ class QwenToolValidationTest(unittest.TestCase):
                       CALL + "\n</tool_call>\n</tool_call>",
                       "Example: " + CALL + "\n</tool_call>\n</tool_call>",
                       CALL.replace("edit>", "undeclared>") + "\n</tool_call>",
-                      "Example: " + CALL.replace("edit>", "undeclared>") + "\n</tool_call>"):
+                      "Example: " + CALL.replace("edit>", "undeclared>") + "\n</tool_call>",
+                      # PR #2582 review: a quoted </function> inside a value must not be
+                      # stretched over to the last closer (the echo of a file's text)
+                      CALL.replace("a.py\n</parameter>", "a.py </function> tail\n</parameter>") + "</tool_call>",
+                      "Example: " + CALL.replace("a.py\n</parameter>", "a.py </function> tail\n</parameter>") + "</tool_call>"):
             with self.subTest(reply=reply):
                 self.assertEqual(parse_qwen_tool_calls(reply, TOOLS), (reply, []))
 

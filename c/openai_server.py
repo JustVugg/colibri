@@ -2878,9 +2878,11 @@ QWEN_FUNCTION_RE = re.compile(r"<function=([^>\n]+)>\s*(.*?)</function>", re.S)
 # A bare block as the int4 Qwen3-Coder container writes it: the opening <tool_call>
 # lost, the closing one kept right after </function>.
 QWEN_BARE_CALL_RE = re.compile(r"<function=([^>\n]+)>\s*(.*?)</function>(?:\s*</tool_call>)?", re.S)
-# The same block with its closer required, and no other block inside its body.
+# The same block with its closer required. Its body stops at the first </function>
+# and holds no other block: stretching past a quoted </function> to a later closer
+# would turn echoed text (a file the model read) into a call.
 QWEN_CLOSED_BARE_RE = re.compile(
-    r"<function=([^>\n]+)>\s*((?:(?!<function=).)*?)</function>\s*</tool_call>", re.S)
+    r"<function=([^>\n]+)>\s*((?:(?!<function=|</function>).)*?)</function>\s*</tool_call>", re.S)
 QWEN_PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n(.*?)\n</parameter>", re.S)
 
 

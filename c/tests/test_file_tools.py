@@ -83,6 +83,12 @@ class FileToolsTest(unittest.TestCase):
         self.assertEqual(self.status("edit", path="a.py", old_text="", new_text="v = 2"), 400)
         self.assertEqual(self.fs("read", path="a.py")["text"], "v = 1\nv = 1\n")
 
+    def test_a_long_read_says_how_much_was_cut(self):
+        self.fs("write", path="big.txt", content="a" * (file_tools.MAX_READ + 100_000))
+        text = self.fs("read", path="big.txt")["text"]
+        self.assertEqual(len(text.split("\n")[0]), file_tools.MAX_READ)
+        self.assertIn("first %d characters of a %d-byte file" % (file_tools.MAX_READ, file_tools.MAX_READ + 100_000), text)
+
     def test_off_by_default(self):
         file_tools.ENABLED = False
         self.assertEqual(self.status("read", path="a.txt"), 404)
