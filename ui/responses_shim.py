@@ -107,6 +107,9 @@ def to_chat(body):
         chat["tools"] = tools
     if body.get("tool_choice") in ("auto", "none", "required"):
         chat["tool_choice"] = body["tool_choice"]
+    choice = body.get("tool_choice")
+    if isinstance(choice, dict) and choice.get("type") in ("function", "custom") and choice.get("name"):
+        chat["tool_choice"] = {"type": "function", "function": {"name": choice["name"]}}
     if body.get("parallel_tool_calls") is not None:
         chat["parallel_tool_calls"] = bool(body["parallel_tool_calls"])
     for a, b in (("max_output_tokens", "max_tokens"), ("temperature", "temperature"), ("top_p", "top_p")):
