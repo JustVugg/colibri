@@ -2662,10 +2662,8 @@ static int cc_fetch_done(void) {
     if (!c || !c->cs_ok) return 0;
     return cc_ok(c, cudaEventRecord(c->ev_free, c->stream), "fetch done");
 }
-static int cc_host_up(void *dst, const void *src, size_t bytes, unsigned *ticket) {
-    CcCtx *c = live();
-    if (!c || !dst || !src || !ticket) return 0;
-    if (!cc_copy_stream(c)) return 0;
+/* host_up's events: the frame's point a copy waits for, the ring of marks */
+static int cc_up_events(CcCtx *c) {
     if (!c->up_made) {
         if (cudaEventCreateWithFlags(&c->up_after, cudaEventDisableTiming) != cudaSuccess) return cc_ok(c, cudaErrorMemoryAllocation, "host up event");
         for (int i = 0; i < CC_UP_MARKS; i++)
@@ -2676,6 +2674,12 @@ static int cc_host_up(void *dst, const void *src, size_t bytes, unsigned *ticket
             }
         c->up_made = 1;
     }
+    return 1;
+}
+static int cc_host_up(void *dst, const void *src, size_t bytes, unsigned *ticket) {
+    CcCtx *c = live();
+    if (!c || !dst || !src || !ticket) return 0;
+    if (!cc_copy_stream(c) || !cc_up_events(c)) return 0;
     unsigned t = ++c->up_seq;
     cudaEvent_t ev = c->up_ev[t % CC_UP_MARKS];
     if (t > CC_UP_MARKS && !cc_ok(c, cudaEventSynchronize(ev), "host up ring")) return 0;   /* the mark it reuses landed */
@@ -2684,6 +2688,49 @@ static int cc_host_up(void *dst, const void *src, size_t bytes, unsigned *ticket
         !cc_ok(c, cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, c->cs), "host up") ||
         !cc_ok(c, cudaEventRecord(ev, c->cs), "host up mark")) return 0;
     g_st.bytes_up += bytes;
+    *ticket = t;
+    return 1;
+}
+/* host_up for n copies: one wait for the frame, one call for the copies (cudaMemcpyBatchAsync,
+ * CUDA 12.8 on; COLI_CUDA_UP_BATCH=0 or an older runtime: one cudaMemcpyAsync a copy), one mark.
+ * Qwen3.8-Flash-Next's promotions on an RTX PRO 4000, three copies an expert and 20-30 experts
+ * after a verify, took 0.3 ms of runtime calls on the host between the verify and the next draft */
+static int cc_up_batch_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_UP_BATCH"); on = !(e && *e == '0'); }
+    return on;
+}
+static int cc_host_up_n(void *const *dst, const void *const *src, const size_t *bytes, int n, unsigned *ticket) {
+    CcCtx *c = live();
+    if (!c || !dst || !src || !bytes || n < 1 || !ticket) return 0;
+    for (int i = 0; i < n; i++) if (!dst[i] || !src[i]) return 0;
+    if (!cc_copy_stream(c) || !cc_up_events(c)) return 0;
+    unsigned t = ++c->up_seq;
+    cudaEvent_t ev = c->up_ev[t % CC_UP_MARKS];
+    if (t > CC_UP_MARKS && !cc_ok(c, cudaEventSynchronize(ev), "host up ring")) return 0;   /* the mark it reuses landed */
+    if (!cc_ok(c, cudaEventRecord(c->up_after, c->stream), "host up after") ||
+        !cc_ok(c, cudaStreamWaitEvent(c->cs, c->up_after, 0), "host up wait")) return 0;
+    int sent = 0;
+#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+    if (n > 1 && cc_up_batch_on()) {
+        cudaMemcpyAttributes at;
+        memset(&at, 0, sizeof at);
+        at.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+        size_t ai = 0;
+#if CUDART_VERSION >= 13000
+        cudaError_t e = cudaMemcpyBatchAsync(dst, src, bytes, (size_t)n, &at, &ai, 1, c->cs);
+#else
+        size_t fail = 0;
+        cudaError_t e = cudaMemcpyBatchAsync((void **)dst, (void **)src, (size_t *)bytes, (size_t)n, &at, &ai, 1, &fail, c->cs);
+#endif
+        if (e == cudaSuccess) sent = 1;
+        else (void)cudaGetLastError();   /* one by one below (a copy the batch made is made again, the same bytes) */
+    }
+#endif
+    for (int i = 0; i < n && !sent; i++)
+        if (!cc_ok(c, cudaMemcpyAsync(dst[i], src[i], bytes[i], cudaMemcpyHostToDevice, c->cs), "host up")) return 0;
+    if (!cc_ok(c, cudaEventRecord(ev, c->cs), "host up mark")) return 0;
+    for (int i = 0; i < n; i++) g_st.bytes_up += bytes[i];
     *ticket = t;
     return 1;
 }
@@ -3175,5 +3222,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_matmul_glu,
     cc_addnorm,
     cc_pick_rows,
+    cc_host_up_n,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

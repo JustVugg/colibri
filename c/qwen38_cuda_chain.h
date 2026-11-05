@@ -1287,6 +1287,22 @@ static int q38cc_promote_settle(Q38CChain *ch, Model *m) {
     ch->nchg = 0; ch->stage_dirty = 1;
     return ok;
 }
+/* the promotions' copies gathered so far in one call (cc_host_up_many, Q38CC_UP_BATCH experts at
+ * most): the pending entries from b0 on take its ticket; refused, their slots are nobody's again
+ * (their bytes undefined) and their experts the pool's. 1 sent */
+#define Q38CC_UP_BATCH 64
+static int q38cc_up_flush(Q38CChain *ch, void **ud, const void **us, const size_t *ub, int *nu, int b0) {
+    if (!*nu) return 1;
+    unsigned tk = 0;
+    const int ok = cc_host_up_many(ud, us, ub, *nu, &tk);
+    *nu = 0;
+    if (ok) { for (int p = b0; p < ch->npend; p++) ch->pend[p].ticket = tk; return 1; }
+    for (int p = b0; p < ch->npend; p++) {
+        ch->owner[ch->pend[p].slot] = -1; ch->busy[ch->pend[p].slot] = 0; ch->dm_res[ch->pend[p].k] = 2; ch->promos--;
+    }
+    ch->npend = b0;
+    return 0;
+}
 /* after a frame: this conversation's routes, and the promotions they earn */
 static void q38cc_promote_books(Q38CChain *ch, Model *m, int n) {
     Cfg *c = &m->c; int L = c->layers, E = c->experts, K = c->topk;
@@ -1302,7 +1318,8 @@ static void q38cc_promote_books(Q38CChain *ch, Model *m, int n) {
         for (size_t j = 0; j < (size_t)L * E; j++) ch->heat[j] >>= 1;
     }
     if (q38cc_braked(ch)) return;
-    int done = 0;
+    int done = 0, nu = 0, b0 = ch->npend;   /* nu: the copies gathered for one call, from pending entry b0 */
+    void *ud[3 * Q38CC_UP_BATCH]; const void *us[3 * Q38CC_UP_BATCH]; size_t ub[3 * Q38CC_UP_BATCH];
     for (int i = 0; i < L && done < ch->promo_rate; i++) {
         if (!ch->dm_ran[i]) continue;
         const int *ids = (const int *)cc_ptr(ch->dm_idsd) + (size_t)i * ch->rows * K;
@@ -1329,7 +1346,7 @@ static void q38cc_promote_books(Q38CChain *ch, Model *m, int n) {
             if (ch->npend == ch->cpend) {
                 int cap = ch->cpend ? 2 * ch->cpend : 64;
                 struct Q38CCPend *np = (struct Q38CCPend *)realloc(ch->pend, (size_t)cap * sizeof *np);
-                if (!np) return;
+                if (!np) { q38cc_up_flush(ch, ud, us, ub, &nu, b0); return; }
                 ch->pend = np; ch->cpend = cap;
             }
             if (v >= 0) {   /* the victim to the pool, its entry rewritten before the next frame */
@@ -1339,17 +1356,19 @@ static void q38cc_promote_books(Q38CChain *ch, Model *m, int n) {
                 ch->promo_victims++;
             }
             char *dst = ch->ar_base + (size_t)s * ch->ar_slot;
-            unsigned tk = 0;
-            if (!cc_host_up(dst, src, (size_t)gb, &tk) || !cc_host_up(dst + ch->ar_off_u, src + Q38CC_PAD(gb), (size_t)gb, &tk) ||
-                !cc_host_up(dst + ch->ar_off_d, src + 2 * Q38CC_PAD(gb), (size_t)db, &tk)) {
-                ch->owner[s] = -1;   /* the slot's bytes undefined now: nobody's */
-                return;
-            }
+            ud[nu] = dst; us[nu] = src; ub[nu++] = (size_t)gb;   /* gate, up and down, sent together below */
+            ud[nu] = dst + ch->ar_off_u; us[nu] = src + Q38CC_PAD(gb); ub[nu++] = (size_t)gb;
+            ud[nu] = dst + ch->ar_off_d; us[nu] = src + 2 * Q38CC_PAD(gb); ub[nu++] = (size_t)db;
             ch->owner[s] = k; ch->busy[s] = 1; ch->dm_res[k] = 3;
-            ch->pend[ch->npend++] = (struct Q38CCPend){k, s, tk};
+            ch->pend[ch->npend++] = (struct Q38CCPend){k, s, 0};
             ch->promos++; done++;
+            if (nu == 3 * Q38CC_UP_BATCH) {
+                if (!q38cc_up_flush(ch, ud, us, ub, &nu, b0)) return;
+                b0 = ch->npend;
+            }
         }
     }
+    q38cc_up_flush(ch, ud, us, ub, &nu, b0);
     #undef Q38CC_HIST
 }
 typedef struct { int i, e; uint32_t n; } Q38CCHot;

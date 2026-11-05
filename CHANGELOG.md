@@ -24,6 +24,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **The CUDA chains' promotions in one call a frame.** An expert promoted to the card went over the
+  bus in three copies (Qwen3.6's six), each `cc_host_up` five calls of the runtime (a mark's wait,
+  the frame's event, the copy stream's wait on it, the copy, its mark): 20-30 experts after a
+  Qwen3.8-Flash-Next verify took 0.3 ms of the host between the verify and the next draft on an
+  RTX PRO 4000. The frame's copies now go in one `host_up_n` call (`cudaMemcpyBatchAsync` from CUDA
+  12.8, else a copy at a time) with one wait for the frame and one ticket: 303 -> 87 us of runtime
+  calls in that gap. `COLI_CUDA_UP_BATCH=0`: a `cudaMemcpyAsync` a copy, still one ticket.
 - **CUDA decode: a selection list's attention split over its positions, int8 rows four outputs a
   warp.** A decode step's or a verify's rows with a selection list per row (Qwen3.8's QSA) went
   through one block per (head, row) walking every selected position; they now take the blocks
