@@ -25,6 +25,7 @@ import uuid
 import v4_dsml                      # vendored DeepSeek V4 DSML reference primitives
 import v41_dsml                     # ...and V4.1's, whose tag names differ by a space
 import image_engine                 # the qwenimage serve protocol, PNG and request rules
+import power                        # the machine's watts and each turn's joules, when joules is installed
 from family_registry import (FamilyConfigError, UnknownFamilyError, family_by_id,
                              display_for, family_ids, resolve_model)
 from family_registry import default_model_id as registry_default_model_id
@@ -7373,6 +7374,12 @@ class Engine:
                         turn["cluster_transfer_s"] = float(fields[10])
                         turn["cluster_tx_bytes"] = int(fields[11])
                         turn["cluster_rx_bytes"] = int(fields[12])
+                    try:   # what the devices used over the turn, once a page has asked for /power
+                        energy = power.energy_since(turn["wall_s"])
+                    except Exception:   # noqa: BLE001 - a meter that failed: the turn keeps its timings
+                        energy = None
+                    if energy is not None:
+                        turn["energy_j"] = round(energy, 1)
                     self.profile.append(turn)
                     self.profile_seq += 1
                 elif kind == "TIERS" and len(fields) >= 6:
@@ -8542,6 +8549,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 if self._is_authed() and eng:
                     payload["seq"] = getattr(eng, "profile_seq", 0)
                     payload["turns"] = list(getattr(eng, "profile", ()) or ())
+                self.send_json(200, payload, request_id)
+                return
+            if path == "/power":
+                # this machine's watts from joules, when it is installed (c/power.py); the
+                # first request starts the meters. Gated like /profile: it says how busy the box is.
+                payload = power.reading() if self._is_authed() else power._unavailable("unauthorized")
                 self.send_json(200, payload, request_id)
                 return
             if self.serve_static(path):
