@@ -210,15 +210,23 @@ static void check(int t, int I, int O, int bench) {
         cudaMalloc(&ud, (size_t)O * rw * 4); cudaMalloc(&gd, (size_t)SM * O * 4); cudaMalloc(&vd, (size_t)SM * O * 4);
         cudaMemcpy(ud, wu, (size_t)O * rw * 4, cudaMemcpyHostToDevice);
         float *want = (float *)malloc((size_t)SM * O * 4);
-        for (int S = 1; S <= SM; S++) {
-            cudaMemset(yd, 0, (size_t)SM * O * 4);
-            int okg = bd_gemv_launch(gd, xd, wd, g_tab, fmt, I, O, rw, S, g_smem, 0, 0) && bd_gemv_launch(vd, xd, ud, g_tab, fmt, I, O, rw, S, g_smem, 0, 0);
-            if (okg) swiglu_ref_k<<<(S * O + 255) / 256, 256>>>(gd, gd, vd, S * O);
-            okg = okg && bd_glu_launch(yd, xd, wd, ud, g_tab, fmt, I, O, rw, S, g_smem, 0) && cudaDeviceSynchronize() == cudaSuccess;
-            cudaMemcpy(want, gd, (size_t)S * O * 4, cudaMemcpyDeviceToHost);
-            cudaMemcpy(got, yd, (size_t)S * O * 4, cudaMemcpyDeviceToHost);
-            if (!okg || memcmp(got, want, (size_t)S * O * 4)) { printf("FAIL %s [%d x %d]: the gate and up of %d rows in one pass differ\n", ref_name(t), O, I, S); fails++; }
+        /* x in each of its forms, as the verify's rows above: the one pass's bits in all of them */
+        for (int pq = 0; pq < 3; pq++) {
+            g_bd_preq_force = pq > 0; g_bd_xs_force = pq == 2;
+            for (int S = 1; S <= SM; S++) {
+                cudaMemset(yd, 0, (size_t)SM * O * 4);
+                int okg = bd_gemv_launch(gd, xd, wd, g_tab, fmt, I, O, rw, S, g_smem, 0, 0) && bd_gemv_launch(vd, xd, ud, g_tab, fmt, I, O, rw, S, g_smem, 0, 0);
+                if (okg) swiglu_ref_k<<<(S * O + 255) / 256, 256>>>(gd, gd, vd, S * O);
+                okg = okg && bd_glu_launch(yd, xd, wd, ud, g_tab, fmt, I, O, rw, S, g_smem, 0) && cudaDeviceSynchronize() == cudaSuccess;
+                cudaMemcpy(want, gd, (size_t)S * O * 4, cudaMemcpyDeviceToHost);
+                cudaMemcpy(got, yd, (size_t)S * O * 4, cudaMemcpyDeviceToHost);
+                if (!okg || memcmp(got, want, (size_t)S * O * 4)) {
+                    printf("FAIL %s [%d x %d]: the gate and up of %d rows in one pass (x quantized %s) differ\n", ref_name(t), O, I, S, how[pq]);
+                    fails++;
+                }
+            }
         }
+        g_bd_preq_force = -1; g_bd_xs_force = -1;
         g_glu++;
         free(want); free(wu); cudaFree(ud); cudaFree(gd); cudaFree(vd);
     }
