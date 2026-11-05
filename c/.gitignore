@@ -77,3 +77,5 @@ tests/xdna_fail_fixtures/
 tests/xdna_physical_probe
 tests/xdna_fake_helper*.so
 libcoli_xdna.so
+# The native V4 HIP/CUDA backend library (Linux), loaded with dlopen
+coli_gpu_dsv4.so
