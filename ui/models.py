@@ -40,8 +40,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _UP = os.path.dirname(HERE)
-# the release archive keeps coli next to ui/, a source checkout keeps it in c/
-COLI_DIR = _UP if os.path.isfile(os.path.join(_UP, "coli")) else os.path.join(_UP, "c")
+# Support modules sit next to ui/ in an archive or libexec installation,
+# and in c/ in a source checkout. An installed launcher lives in bin/.
+COLI_DIR = _UP if os.path.isfile(os.path.join(_UP, "setup_flow.py")) else os.path.join(_UP, "c")
+COLI = os.path.join(COLI_DIR, "coli")
+if not os.path.isfile(COLI):
+    COLI = os.path.join(os.path.dirname(os.path.dirname(COLI_DIR)), "bin", "coli")
 sys.path.insert(0, COLI_DIR)
 import setup_catalog  # noqa: E402
 import setup_download  # noqa: E402
@@ -1132,7 +1136,7 @@ def start_gguf_download(repo, stem):
     job = new_job("download", "%s %s" % (repo.split("/")[-1], v["quant"]), repo=repo, dest=out)
 
     def after(j):
-        r = subprocess.run([sys.executable, os.path.join(COLI_DIR, "coli"), "import", os.path.join(dest, v["files"][0]["path"]),
+        r = subprocess.run([sys.executable, COLI, "import", os.path.join(dest, v["files"][0]["path"]),
                             "--out", out, "--mode", "link"], capture_output=True, text=True, cwd=COLI_DIR)
         if r.returncode:
             raise RuntimeError("coli import: %s" % (r.stderr or r.stdout)[-400:])
@@ -1260,7 +1264,7 @@ def switch_model(path, force=False, tier=None):
                 at = argv.index("serve") + 1
                 argv = argv[:at] + ["--model", path] + _without(argv[at:], ("--model",))
             else:
-                argv = [sys.executable, os.path.join(COLI_DIR, "coli"), "serve", "--model", path,
+                argv = [sys.executable, COLI, "serve", "--model", path,
                         "--host", CFG.host, "--port", str(CFG.port)]
                 cwd, env = COLI_DIR, dict(os.environ)
             if tier == "ram":
