@@ -1260,16 +1260,17 @@ static void q38c_dmoe_done(Q38Chain *ch, Model *m, int from, int to, int n, int 
  * chunk is a frame of its own, waited for: the host's tables it writes (RoPE's angles, the
  * PLE rows, the pooled keys' angles) and its K/V rows down are a chunk's as before, and each
  * chunk gets the bits it gets chunk by chunk (the same ops on the same rows, the MoE's sum
- * added at the layer's end rather than the next one's start). Not taken with a verify's
- * copies, a split KV mirror, a partial chain or the streams wanted back.
+ * added at the layer's end rather than the next one's start). The rows' final streams, where
+ * the caller wants them (an MTP head's prefill), come back as chunk by chunk, each chunk's after
+ * the last layer. Not taken with a verify's copies, a split KV mirror or a partial chain.
  * Taken where the host pool's experts stage (a GGUF's block types: vk_dmoe.h); without
  * staging a chunk reads them over the bus either way. COLI_VK_CHAIN_LAYERWISE=0 keeps
  * the chunks, =1 takes it without staging too (tests). */
 static int q38c_lm_layers(Model *m, Q38Chain *ch, const int *ids, int S, int pos_base, int nlogits,
-                          const float *hyper_h, int rows, const float *cs_all);
+                          float *hyper_h, int want_streams, int rows, const float *cs_all);
 /* 1 done, 0 declined before any layer ran (the chunks then, in the frame begun here), -1 lost */
 static int q38c_forward_lm(Model *m, Q38Chain *ch, const int *ids, int S, int pos_base, int nlogits,
-                           const float *hyper_h, float *logit, int rows) {
+                           float *hyper_h, int want_streams, float *logit, int rows) {
     Cfg *c = &m->c; int W = c->hc_width, lo = ch->lo, hi = lo + ch->nl, V = c->vocab;
     int half = c->rotary_dim / 2;
     if (!vkc_begin() || !vkc_dmoe_upload(&ch->dm)) return -1;
@@ -1283,7 +1284,7 @@ static int q38c_forward_lm(Model *m, Q38Chain *ch, const int *ids, int S, int po
         float ang = (float)(pos_base + r) / powf(c->theta, (float)(2 * j) / c->rotary_dim);
         cs_all[((size_t)r * half + j) * 2] = cosf(ang); cs_all[((size_t)r * half + j) * 2 + 1] = sinf(ang);
     }
-    int r = q38c_lm_layers(m, ch, ids, S, pos_base, nlogits, hyper_h, rows, cs_all);
+    int r = q38c_lm_layers(m, ch, ids, S, pos_base, nlogits, hyper_h, want_streams, rows, cs_all);
     free(cs_all);
     if (r <= 0 || r == 2) return r;
     memcpy(logit, vkc_ptr(ch->outd), (size_t)nlogits * V * sizeof(float));
@@ -1292,7 +1293,7 @@ static int q38c_forward_lm(Model *m, Q38Chain *ch, const int *ids, int S, int po
 }
 /* q38c_forward_lm's layers: 1 done, -1 lost */
 static int q38c_lm_layers(Model *m, Q38Chain *ch, const int *ids, int S, int pos_base, int nlogits,
-                          const float *hyper_h, int rows, const float *cs_all) {
+                          float *hyper_h, int want_streams, int rows, const float *cs_all) {
     Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, lo = ch->lo, hi = lo + ch->nl, V = c->vocab, E = c->experts;
     int half = c->rotary_dim / 2;
     const int SEG = (q38c_lm_rows() / rows > 0 ? q38c_lm_rows() / rows : 1) * rows;
@@ -1332,6 +1333,7 @@ static int q38c_lm_layers(Model *m, Q38Chain *ch, const int *ids, int S, int pos
                     ok = vkc_begin() && vkc_dmoe_upload(&ch->dm) && q38c_moe_apply(ch, m, n, ch->routed);
                 }
                 ok = ok && vkc_copy(ch->hyper_all, (size_t)(c0 - g0) * W, ch->hyper, 0, (size_t)n * W);
+                if (ok && want_streams && i == hi - 1) ok = vkc_copy(ch->hypd, 0, ch->hyper, 0, (size_t)n * W);   /* q38c_forward reserved it */
                 /* after the last layer, the head on this chunk's share of the last nlogits rows */
                 int lo0 = S - nlogits > c0 ? S - nlogits - c0 : 0, lo_n = n - lo0;
                 if (ok && i == hi - 1 && lo0 < n && c0 + n > S - nlogits) {
@@ -1343,6 +1345,7 @@ static int q38c_lm_layers(Model *m, Q38Chain *ch, const int *ids, int S, int pos
                 ok = ok && vkc_submit(1);
                 m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0;
                 if (!ok) return -1;
+                if (want_streams && i == hi - 1) memcpy(hyper_h + (size_t)c0 * W, vkc_ptr(ch->hypd), (size_t)n * W * 4);   /* the frame is done */
                 if (dl) q38c_dmoe_done(ch, m, i, i + 1, n, pb);
                 if (c->is_attn[i]) { ch->kv_valid[i] = pb + n; vkc_kv_done(&ch->ks, ch->attn_ord[i], pb + n); }
                 ch->dn_where = Q38C_DEV; ch->host_zero = 0;
@@ -1385,9 +1388,9 @@ static int q38c_forward_seg(Model *m, Q38Chain *ch, const int *ids, int S, int p
     int half = c->rotary_dim / 2;
     vkc_gemm_rows(g_q38_rowwise ? 0 : -1);   /* a verify's rows get a decode step's bits */
     int snapped = 0, dmoe = q38c_dmoe(ch, m, rows, S);
-    if (dmoe && S > rows && q38c_layer_major() && ch->head && !want_streams && !mixed_h && !ch->ks.on &&
+    if (dmoe && S > rows && q38c_layer_major() && ch->head && !mixed_h && !ch->ks.on &&
         m->snap_rows <= 0 && vkt_host_pool_on() && !ch->dm.pc_prompt) {
-        int r = q38c_forward_lm(m, ch, ids, S, pos_base, nlogits, hyper_h, logit, rows);
+        int r = q38c_forward_lm(m, ch, ids, S, pos_base, nlogits, hyper_h, want_streams, logit, rows);
         if (r < 0) goto lost;
         if (r == 2) { vkc_gemm_rows(-1); return 0; }   /* stopped: not taken */
         if (r > 0) { ch->snap_valid = 0; vkc_gemm_rows(-1); ch->forwards++; return 1; }

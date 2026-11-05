@@ -2093,6 +2093,16 @@ family_qwen_chain() {
   for fx in qwen38_tiny_mtp qwen38_tiny_fp8_mtp qwen38_tiny_int4_mtp; do for f in "" reject accept mixed; do
     chain_gate qwen38 "chain qwen38 MTP $fx ${f:-drafting}" 1 OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=$f SNAP=$fx -- 2 8 $fx/ref.json
   done; done
+  # a prompt layer by layer with the MTP head, which wants the rows' final streams back: the
+  # logits and the head's drafts (made from those streams) of the same prompt chunk by chunk
+  V38LWM="OMP_NUM_THREADS=2 COLI_VK_TIER_HOST=1 COLI_VK_TIER_GB=0.00005 COLI_VK_CHAIN_ROWS=3 Q38_MTP=1 SNAP=qwen38_tiny_mtp"
+  chain_gate qwen38 "chain qwen38 MTP, a prompt layer by layer" 1 $V38LWM COLI_VK_CHAIN_LAYERWISE=1 -- 2 8 qwen38_tiny_mtp/ref.json
+  grep -q "prompts layer by layer" vk.log || { cat vk.log; fail "chain qwen38 MTP, a prompt layer by layer: it ran chunk by chunk"; }
+  cp vk.f32 lw.f32; grep -a "^\[qwen38 MTP\] .*acceptance" vk.log > lw.mtp
+  [ -s lw.mtp ] || { cat vk.log; fail "chain qwen38 MTP, a prompt layer by layer: no MTP report"; }
+  chain_gate qwen38 "chain qwen38 MTP, the same prompt chunk by chunk" 1 $V38LWM COLI_VK_CHAIN_LAYERWISE=0 -- 2 8 qwen38_tiny_mtp/ref.json
+  cmp -s lw.f32 vk.f32 || fail "chain qwen38 MTP, a prompt layer by layer: other logits than chunk by chunk"
+  grep -a "^\[qwen38 MTP\] .*acceptance" vk.log | cmp -s - lw.mtp || { cat lw.mtp; fail "chain qwen38 MTP, a prompt layer by layer: other drafts than chunk by chunk"; }
   # the device lost mid-decode, once between steps and once inside an MTP verify
   dmoe_gate qwen38 "chain qwen38 the routed experts in the frame" all OMP_NUM_THREADS=2 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
   dmoe_gate qwen38 "chain qwen38 the host's routing (COLI_VK_CHAIN_MOE=0)" none COLI_VK_CHAIN_MOE=0 OMP_NUM_THREADS=2 \

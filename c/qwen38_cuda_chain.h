@@ -1305,19 +1305,30 @@ static int q38cc_up_flush(Q38CChain *ch, void **ud, const void **us, const size_
     return 0;
 }
 /* after a frame: this conversation's routes, and the promotions they earn */
+/* the promotions' heat: layer i's routes of n rows (its ids in dm_idsd), then n rows' tick */
+static void q38cc_heat_layer(Q38CChain *ch, Model *m, int i, int n) {
+    const int E = m->c.experts, K = m->c.topk;
+    const int *ids = (const int *)cc_ptr(ch->dm_idsd) + (size_t)i * ch->rows * K;
+    for (int a = 0; a < n * K; a++) if (ids[a] >= 0 && ids[a] < E && ch->heat[(size_t)i * E + ids[a]] < 0xFFFFFFFFu) ch->heat[(size_t)i * E + ids[a]]++;
+}
+static void q38cc_heat_tick(Q38CChain *ch, Model *m, int n) {
+    if ((ch->heat_tick += (uint32_t)n) >= Q38CC_DECAY) {
+        ch->heat_tick = 0;
+        for (size_t j = 0; j < (size_t)m->c.layers * m->c.experts; j++) ch->heat[j] >>= 1;
+    }
+}
+static void q38cc_promote_pick(Q38CChain *ch, Model *m, int n);
 static void q38cc_promote_books(Q38CChain *ch, Model *m, int n) {
+    for (int i = 0; i < m->c.layers; i++) if (ch->dm_ran[i]) q38cc_heat_layer(ch, m, i, n);
+    q38cc_heat_tick(ch, m, n);
+    q38cc_promote_pick(ch, m, n);
+}
+/* the promotions from the routes of n rows each layer that ran has in dm_idsd: up to promo_rate
+ * of the pool's experts they route to, hotter than the coldest of 64 slots drawn */
+static void q38cc_promote_pick(Q38CChain *ch, Model *m, int n) {
     Cfg *c = &m->c; int L = c->layers, E = c->experts, K = c->topk;
     uint32_t **hist = rt_counts_all();
     #define Q38CC_HIST(j) (hist && hist[(j) / E] ? hist[(j) / E][(j) % E] : 0u)
-    for (int i = 0; i < L; i++) {
-        if (!ch->dm_ran[i]) continue;
-        const int *ids = (const int *)cc_ptr(ch->dm_idsd) + (size_t)i * ch->rows * K;
-        for (int a = 0; a < n * K; a++) if (ids[a] >= 0 && ids[a] < E && ch->heat[(size_t)i * E + ids[a]] < 0xFFFFFFFFu) ch->heat[(size_t)i * E + ids[a]]++;
-    }
-    if ((ch->heat_tick += (uint32_t)n) >= Q38CC_DECAY) {
-        ch->heat_tick = 0;
-        for (size_t j = 0; j < (size_t)L * E; j++) ch->heat[j] >>= 1;
-    }
     if (q38cc_braked(ch)) return;
     int done = 0, nu = 0, b0 = ch->npend;   /* nu: the copies gathered for one call, from pending entry b0 */
     void *ud[3 * Q38CC_UP_BATCH]; const void *us[3 * Q38CC_UP_BATCH]; size_t ub[3 * Q38CC_UP_BATCH];
@@ -2638,8 +2649,15 @@ static int q38cc_frame_begin(Q38CChain *ch) {
  * at its first chunk and the next staged layer's copy started after its last, every row's
  * streams on the device between layers (hyper_all), each layer's chunk a frame waited for
  * (the host's tables it writes and its K/V rows down are a chunk's, each chunk the bits it
- * gets chunk by chunk). The promotions' books wait for the decode. COLI_CUDA_CHAIN_LAYERWISE:
- * 0 chunk by chunk. */
+ * gets chunk by chunk). The promotions' heat counts each layer's chunks as they run, and their
+ * picks run at the end, one a chunk from each layer's last chunk's routes, as chunk by chunk
+ * they ran after each chunk: without them the decode after a 4220-token prompt (Qwen3.8-Flash-
+ * Next IQ2_XS, an RTX PRO 4000) ran at 63.3 tok/s against 69.2 chunk by chunk, with them at
+ * 67.6 and 68.2 against 66.2 and 67.5. A caller that wants the rows' final streams (an MTP
+ * head's prefill: want_streams) gets them as the chunk path gives them, each chunk's after the
+ * last layer; such a prompt ran chunk by chunk, every chunk staging every layer again: 56 GB
+ * over the bus for that prompt with its MTP head, 19 GB layer by layer.
+ * COLI_CUDA_CHAIN_LAYERWISE: 0 chunk by chunk. */
 /* layer i's routed experts for one chunk of a prompt run layer by layer: wait for the layer's
  * copy at its first chunk (first), start the next staged layer's after its last (last) */
 static int q38cc_dm_layer_lm(Q38CChain *ch, Model *m, Layer *l, int i, int n, int first, int last) {
@@ -2661,13 +2679,14 @@ static int q38cc_dm_layer_lm(Q38CChain *ch, Model *m, Layer *l, int i, int n, in
 }
 /* 1 done, 0 declined before any layer ran, -1 lost */
 static int q38cc_forward_lm(Model *m, Q38CChain *ch, const int *ids, int S, int pos_base, int nlogits,
-                            const float *hyper_h, float *logit, int rows) {
+                            float *hyper_h, int want_streams, float *logit, int rows) {
     Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, L = c->layers, E = c->experts, V = c->vocab, K = c->topk;
     int half = c->rotary_dim / 2;
     if (!q38cc_dm_begin(ch, m, rows)) return cc_lost() ? -1 : 0;
     if (q38cc_dm_tab(ch, rows) != ch->dm_tabb) return 0;   /* nothing stages: the chunks read it either way */
     for (int i = 0; i < L; i++) if (ch->dm_part[i]) return 0;   /* a hybrid layer: the chunks' host steps */
     const int SEG = (q38cc_lm_rows() / rows > 0 ? q38cc_lm_rows() / rows : 1) * rows, seg = S < SEG ? S : SEG;
+    int nlast = 0;   /* the rows of the last chunk: each layer's routes in dm_idsd are its */
     if (!cc_reserve(&ch->hyper_all, (size_t)seg * W * 4, CC_DEV)) return 0;
     float *cs_all = half ? malloc((size_t)S * half * 2 * sizeof(float)) : NULL;   /* every row's angles, once */
     if (half && !cs_all) return 0;
@@ -2696,6 +2715,7 @@ static int q38cc_forward_lm(Model *m, Q38CChain *ch, const int *ids, int S, int 
                 ok = ok && q38cc_gr_read(ch, m, &l->mlp_gr, ch->o_mn[i], n, ch->inj_m);
                 ok = ok && q38cc_dm_layer_lm(ch, m, l, i, n, c0 == g0, c0 + n >= g0 + gn) && q38cc_moe_apply(ch, m, n, ch->dm_y);
                 ok = ok && cc_copy(ch->hyper_all, (size_t)(c0 - g0) * W, ch->hyper, 0, (size_t)n * W);
+                if (ok && want_streams && i == L - 1) ok = cc_copy(ch->hypd, 0, ch->hyper, 0, (size_t)n * W);   /* q38cc_forward reserved it */
                 int lo0 = S - nlogits > c0 ? S - nlogits - c0 : 0, lo_n = n - lo0;
                 if (ok && i == L - 1 && lo0 < n && c0 + n > S - nlogits) {
                     int dst = c0 + lo0 - (S - nlogits);
@@ -2706,6 +2726,7 @@ static int q38cc_forward_lm(Model *m, Q38CChain *ch, const int *ids, int S, int 
                 ok = ok && cc_submit(1);   /* the frame's stream: the next staged layer's copy goes on beside the next frames */
                 m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0; ch->wait_ms += (now_s() - t0) * 1e3;
                 if (!ok) { free(cs_all); return -1; }
+                if (want_streams && i == L - 1) memcpy(hyper_h + (size_t)c0 * W, cc_ptr(ch->hypd), (size_t)n * W * 4);   /* the frame is done */
                 /* layer i's books for these rows (q38cc_dm_books' for one layer) */
                 q38cc_kv_down(ch, m, i, n, pb);
                 const int *idv = (const int *)cc_ptr(ch->dm_idsd) + (size_t)i * ch->rows * K;
@@ -2715,6 +2736,8 @@ static int q38cc_forward_lm(Model *m, Q38CChain *ch, const int *ids, int S, int 
                     ch->routes++;
                     if (ch->dm_res[(size_t)i * E + idv[j]] >= 2) ch->pool_reads++;
                 }
+                if (ch->own && ch->promo_rate > 0) { q38cc_heat_layer(ch, m, i, n); if (i == L - 1) q38cc_heat_tick(ch, m, n); }
+                if (i == L - 1) nlast = n;
                 if (c->is_attn[i]) ch->kv_valid[i] = pb + n;
                 ch->dn_where = Q38CC_DEV; ch->host_zero = 0;
             }
@@ -2722,6 +2745,10 @@ static int q38cc_forward_lm(Model *m, Q38CChain *ch, const int *ids, int S, int 
     }
     free(cs_all);
     if (!cc_finish()) return -1;
+    if (ch->own && ch->promo_rate > 0 && nlast > 0) {   /* the picks chunk by chunk ran after each chunk */
+        memset(ch->dm_ran, 1, (size_t)L);
+        for (int k = 0; k < (S + rows - 1) / rows; k++) q38cc_promote_pick(ch, m, nlast);
+    }
     memcpy(logit, cc_ptr(ch->outd), (size_t)nlogits * V * sizeof(float));
     ch->lm_forwards++;
     return 1;
@@ -2983,9 +3010,9 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
     double w0 = ch->wait_ms, h0 = ch->host_ms;
     ch->pc_prompt = q38cc_pc_take(ch, m, S);   /* a short prompt's pooled experts on the CPU */
     if (S > Q38CC_DM_ROWS && ch->pool_of) { if (ch->pc_prompt) ch->pc_took++; else ch->pc_staged++; }
-    if (S > rows && rows > Q38CC_DM_ROWS && E > 0 && ch->dm_on && q38cc_layer_major() && !want_streams && !mixed_h &&
+    if (S > rows && rows > Q38CC_DM_ROWS && E > 0 && ch->dm_on && q38cc_layer_major() && !mixed_h &&
         m->snap_rows <= 0) {
-        int r = q38cc_forward_lm(m, ch, ids, S, pos_base, nlogits, hyper_h, logit, rows);
+        int r = q38cc_forward_lm(m, ch, ids, S, pos_base, nlogits, hyper_h, want_streams, logit, rows);
         if (r < 0) goto lost;
         if (r == 2) { q38cc_dm_end(ch); return 0; }   /* stopped: not taken */
         if (r > 0) { q38cc_dm_end(ch); ch->snap_valid = 0; ch->forwards++; return 1; }
