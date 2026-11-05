@@ -7,6 +7,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **A start profile for a model's first answers** (`tools/usage_start_profile.py`): forty
+  ordinary prompts through `coli serve`, their expert history and draft counts written beside
+  the model as `.coli_usage.start` and `.coli_vocab.start`. Every engine with an expert history
+  starts from the first where it has no history of its own (Qwen3.8 from the draft counts too),
+  so its warm start puts on the device the experts ordinary text routes to (`COLI_USAGE_START`,
+  `COLI_VOCAB_START`). Qwen3.8-Flash-Next IQ2_XS on an RTX PRO
+  4000, the first answer after the start: its first 32 tokens 36.5-38.7 -> 60.7-63.2 tok/s.
 - **The terminal UI, `coli tui`** (`c/tui.c`, `make colibri-tui`): the chat in a terminal, one
   C file with no libraries, a client of `coli serve`. The conversations, the answer streamed
   with its reasoning folded, the monitor (Overview and Profiling, as on the chat page, plus the

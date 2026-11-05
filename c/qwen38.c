@@ -1009,9 +1009,18 @@ static void q38_vocab_init(const char *snap, Model *m) {
         draft_vocab_totals(v, &tokens, &distinct);
         fprintf(stderr, "counts from %s (%.0f tokens, %d distinct)\n", v->path, tokens, distinct);
         break;
-    case DRAFT_VOCAB_NO_FILE:
-        fprintf(stderr, "no counts file at %s yet\n", v->path);
+    case DRAFT_VOCAB_NO_FILE: {   /* the model's start profile's counts, if it ships one; the counts go to v->path */
+        char *start = q38_state_path(snap, "COLI_VOCAB_START", ".coli_vocab.start"), *own = v->path;
+        v->path = start;
+        DraftVocabLoad r = draft_vocab_read(v);
+        v->path = own; v->records = 0;
+        if (r == DRAFT_VOCAB_LOADED || r == DRAFT_VOCAB_DAMAGED) {
+            draft_vocab_totals(v, &tokens, &distinct);
+            fprintf(stderr, "no counts file at %s yet: the start profile's (%s, %.0f tokens, %d distinct)\n", own, start, tokens, distinct);
+        } else fprintf(stderr, "no counts file at %s yet\n", own);
+        free(start);
         break;
+    }
     case DRAFT_VOCAB_NOT_COUNTS:
         fprintf(stderr, "%s cannot be read as a counts file\n", v->path);
         break;
