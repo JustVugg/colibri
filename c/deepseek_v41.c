@@ -3697,6 +3697,39 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
     }
 }
 
+/* The rows a block of positions will look up asked of the OS before engram_row reads them
+ * (POSIX_FADV_WILLNEED), those the cache does not hold: engram_row reads a missing row with one
+ * pread and waits for it, so a prompt's rows came from the disk one at a time. Nothing on
+ * Windows. */
+static void engram_advise(const EngramTable *t, int64_t id, int head_dim) {
+#if defined(POSIX_FADV_WILLNEED) && !defined(_WIN32)
+    if (id < 0 || id >= t->rows) return;   /* engram_row reports it */
+    int slot = (int)((uint64_t)(id * 0x9E3779B97F4A7C15ull) >> 40) & t->mask;
+    for (int probe = 0; probe < 4; probe++) if (t->key[(slot + probe) & t->mask] == id) return;
+    int groups = head_dim / 32;
+    if (t->gt >= 0) (void)posix_fadvise(t->fd_w, (off_t)(t->off_w + id * t->rb), (off_t)t->rb, POSIX_FADV_WILLNEED);
+    else if (t->inline_scales)
+        (void)posix_fadvise(t->fd_w, (off_t)(t->off_w + id * (head_dim + groups)), (off_t)(head_dim + groups), POSIX_FADV_WILLNEED);
+    else {
+        (void)posix_fadvise(t->fd_w, (off_t)(t->off_w + id * head_dim), (off_t)head_dim, POSIX_FADV_WILLNEED);
+        (void)posix_fadvise(t->fd_s, (off_t)(t->off_s + id * groups), (off_t)groups, POSIX_FADV_WILLNEED);
+    }
+#else
+    (void)t; (void)id; (void)head_dim;
+#endif
+}
+/* engram_advise for every row of positions pos .. pos + n - 1 of a table (V41_ENGRAM_ADVISE=0: none) */
+static void engram_advise_rows(const Engram *e, int table, int pos, int n) {
+    static int on = -1;
+    if (on < 0) { const char *v = getenv("V41_ENGRAM_ADVISE"); on = !(v && *v == '0'); }
+    if (!on || n < 2) return;   /* a decode step's few rows: as they come */
+    int64_t ids[V41_MAX_NGRAM * V41_MAX_EHEADS];
+    for (int r = 0; r < n; r++) {
+        engram_hash(e, table, pos + r, ids);
+        for (int col = 0; col < e->cols; col++) engram_advise(&e->table[table], ids[col], e->head_dim);
+    }
+}
+
 static void moe_run(Model *m, int layer, const float *x, int n, float *out) {
     moe_run_at(m, &m->L[layer], &m->cache[layer], "layers", layer,
                m->c.n_routed, m->c.n_activated, x, n, out, 1);
@@ -3722,6 +3755,7 @@ static void engram_run(Model *m, int layer, float *h, int n, int start_pos) {
     int64_t ids[V41_MAX_NGRAM * V41_MAX_EHEADS];
     for (int t0 = 0; t0 < n; t0 += chunk) {
         int rows_here = n - t0 < chunk ? n - t0 : chunk;
+        engram_advise_rows(e, table, start_pos + t0, rows_here);
         for (int r = 0; r < rows_here; r++) {
             engram_hash(e, table, start_pos + t0 + r, ids);
             for (int col = 0; col < e->cols; col++) {

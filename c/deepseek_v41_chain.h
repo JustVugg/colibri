@@ -954,6 +954,7 @@ static int v41c_engram(V41Chain *ch, Model *m, int i, int nr, int pb, float *row
     int table = l->engram_index, width = e->cols * e->head_dim, H = c->hc_mult, D = c->dim;
     int64_t ids[V41_MAX_NGRAM * V41_MAX_EHEADS];
     double t0 = now_s();
+    engram_advise_rows(e, table, pb, nr);
     for (int r = 0; r < nr; r++) {
         engram_hash(e, table, pb + r, ids);
         for (int col = 0; col < e->cols; col++)

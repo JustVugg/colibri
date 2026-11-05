@@ -84,6 +84,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   dense and routed: Qwen3.8's trunk matrices of those types, 913-986 tok/s.
 - **CUDA GEMVs of a GGUF's blocks, a decode step's and a verify's rows.** IQ4_NL and IQ4_XS take their values by byte permutes instead of table reads (Qwen3.8's IQ4_XS lm_head at two rows 845 -> 713 us on an RTX PRO 4000); a wide row's x is quantized once for all the GEMV's blocks instead of by each (IQ4_XS 2048 x 8192 at two rows 44 -> 28 us, `COLI_CUDA_BD_PREQ`), and from three rows on each block copies its rows of it into shared memory, where the steps read it instead of beside the weights (four rows: IQ4_XS 10240 x 2560 306 -> 323 GB/s, IQ3_S 244 -> 277, Q6_K 216 -> 246; Qwen3.8-Flash-Next's trunk 6.93 -> 6.55 ms a verify, `COLI_CUDA_BD_XSM`). The bits are the same.
 - **A decode step's shared expert in one GEMV pass on CUDA.** The gate and up of a SwiGLU of one GGUF type, the rows of a decode step or a verify, now go through one kernel that writes silu(gate) * up, the bits of the two GEMVs and the elementwise product (three kernels into one). Qwen3.6-35B-A3B Q4_K_M on an RTX PRO 4000, 400-token answers, three runs: 104.4-104.8 -> 105.9-106.3 tok/s. Qwen3.8's chain takes it too where its shared expert's gate and up share a type (half of Qwen3.8-Flash-Next IQ2_XS's layers). `COLI_CUDA_GLU=0` turns it off.
+- **DeepSeek V4.1: a prompt's engram rows asked of the disk together.** The rows the engram
+  cache did not hold came one pread at a time; a block's rows are now asked of the OS first, then
+  read. DeepSeek-V4.1-Flash UD-IQ1_S on an RTX PRO 4000, a 444-token served prompt: 28.7-28.8 ->
+  32.4-32.7 tok/s (`V41_ENGRAM_ADVISE`).
 - **Qwen3.8's CUDA and Vulkan chains: a short prompt's host pool experts on the CPU.** A prompt chunk copied
   every pooled expert of every layer over the bus, routed or not (18 GB for any prompt up to
   2048 tokens on Qwen3.8-Flash-Next IQ2_XS with an RTX PRO 4000). A prompt of one chunk now has
