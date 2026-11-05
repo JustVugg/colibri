@@ -1343,6 +1343,22 @@ dsv4-cuda-test: tests/test_dsv4_dense_batch_cuda.c tests/test_dsv4_attention_bat
 	$(CC) $(CFLAGS) tests/test_dsv4_generic_bitwise_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_generic_bitwise_cuda_test$(EXE) $(LDFLAGS)
 	./dsv4_generic_bitwise_cuda_test$(EXE)
 
+# V4_SPARSE_FAST: the decode step of the cached sparse attention (plain and indexed) with
+# the switch off and on, in two processes (it is read once), compared byte for byte; then
+# V4_SPARSE_VERIFY=1, which runs both kernels in one process and returns the old output.
+# Needs a GPU. Windows: coli_cuda_dsv4.dll of this tree beside the binary (make
+# cuda-dsv4-dll); elsewhere the backend objects ($(DSV4_CUDA_OBJ)).
+.PHONY: dsv4-sparse-fast-test
+dsv4-sparse-fast-test: tests/test_dsv4_sparse_fast_cuda.c backend_cuda_dsv4.h $(if $(IS_WIN),,$(DSV4_CUDA_OBJ))
+	$(CC) $(CFLAGS) tests/test_dsv4_sparse_fast_cuda.c $(if $(IS_WIN),backend_loader_dsv4.c,$(DSV4_CUDA_OBJ)) \
+		-o dsv4_sparse_fast_cuda_test$(EXE) $(LDFLAGS)
+	V4_SPARSE_FAST=0 ./dsv4_sparse_fast_cuda_test$(EXE) dsv4_sparse_fast_test_old.bin
+	V4_SPARSE_FAST=1 ./dsv4_sparse_fast_cuda_test$(EXE) dsv4_sparse_fast_test_new.bin
+	cmp dsv4_sparse_fast_test_old.bin dsv4_sparse_fast_test_new.bin
+	V4_SPARSE_FAST=1 V4_SPARSE_VERIFY=1 ./dsv4_sparse_fast_cuda_test$(EXE) dsv4_sparse_fast_test_verify.bin
+	cmp dsv4_sparse_fast_test_old.bin dsv4_sparse_fast_test_verify.bin
+	@echo "dsv4 sparse fast: old and fast kernels bit-identical"
+
 # Pure-CPU unit tests for the two headers the kernels consume. No GPU, no model.
 tests/test_dsv4_mhc$(EXE): tests/test_dsv4_mhc.c
 	$(CC) $(CFLAGS) tests/test_dsv4_mhc.c -o tests/test_dsv4_mhc$(EXE) $(LDFLAGS)

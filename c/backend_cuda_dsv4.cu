@@ -62,6 +62,8 @@ struct Dev { int id,sms; cudaStream_t stream,aux; cudaEvent_t ready,fork,join;fl
     MvDesc *mvdesc;size_t mvdesccap;float *expert_weights;size_t expert_weightscap;int *expert_ids;size_t expert_idcap;
     int *emaj;size_t emajcap;float *emv1,*emv2,*emv4;size_t emv1cap,emv2cap,emv4cap;unsigned long long *emcount; /* expert-major MoE */
     float *mmv;size_t mmvcap;unsigned long long *mmvcount; /* DSV4_MM_WARP_VERIFY */
+    float *sa_score,*sa_w,*sa_den,*sa_out;long long *sa_rows; /* V4_SPARSE_FAST */
+    size_t sa_score_cap,sa_w_cap,sa_den_cap,sa_out_cap,sa_rows_cap;
 #if COLI_DSV4_TC
     cublasLtHandle_t lt;TcPlan plans[2];
 #endif
@@ -968,6 +970,15 @@ __global__ void sparse_attn_batch_cached_kernel(float*out,const float*q,const fl
     }
 }
 
+/* V4_SPARSE_FAST (decode, tokens == 1): defined after the indexed kernel below. */
+struct SaOld{float*out;const float*q;const float*win;const float*chunk;const float*comp;
+    const float*sink;const int*meta;const int*sel;int selstride,abs_base,chunk_start,window,heads,dim;float scale;size_t sm;};
+static int sa_fast_decode(Dev*c,int layer,const int*dsel,const int*meta,int abs_base,int chunk_start,
+        int window,int heads,int dim,float scale,float*out,size_t qb,
+        void(*old_launch)(Dev*,void*),void*old_arg);
+static void sa_old_plain(Dev*c,void*p);
+static void sa_old_idx(Dev*c,void*p);
+
 extern "C" int dsv4_cuda_sparse_attn_batch_cached(int device,int layer,const float*q,
         const float*chunk,int chunk_start,const float*sinks,const int*meta,int abs_base,
         int comp_limit,int heads,int dim,int tokens,float scale,float*out){
@@ -993,6 +1004,12 @@ extern "C" int dsv4_cuda_sparse_attn_batch_cached(int device,int layer,const flo
        !ok(cudaMemcpyAsync(c->p3,chunk,cb,cudaMemcpyHostToDevice,c->stream),"cached attention chunk upload")||
        !ok(cudaMemcpyAsync(c->aux1,sinks,sb,cudaMemcpyHostToDevice,c->stream),"cached attention sink upload")||
        !ok(cudaMemcpyAsync(c->aux2,meta,mb,cudaMemcpyHostToDevice,c->stream),"cached attention meta upload"))return 0;
+    if(tokens==1){
+        SaOld a={c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,nullptr,0,
+                 abs_base,chunk_start,window,heads,dim,scale,sm};
+        int r=sa_fast_decode(c,layer,nullptr,meta,abs_base,chunk_start,window,heads,dim,scale,out,qb,sa_old_plain,&a);
+        if(r)return r>0;
+    }
     sparse_attn_batch_cached_kernel<<<dim3(heads,tokens),256,sm,c->stream>>>(
         c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,
         abs_base,chunk_start,window,heads,dim,scale);
@@ -1067,6 +1084,12 @@ extern "C" int dsv4_cuda_sparse_attn_batch_cached_idx(int device,int layer,const
        !ok(cudaMemcpyAsync(c->aux1,sinks,sb,cudaMemcpyHostToDevice,c->stream),"cached idx attention sink upload")||
        !ok(cudaMemcpyAsync(c->aux2,meta,mb,cudaMemcpyHostToDevice,c->stream),"cached idx attention meta upload")||
        !ok(cudaMemcpyAsync(c->aux3,sel,ib,cudaMemcpyHostToDevice,c->stream),"cached idx attention index upload"))return 0;
+    if(tokens==1){
+        SaOld a={c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,(int*)c->aux3,selstride,
+                 abs_base,chunk_start,window,heads,dim,scale,sm};
+        int r=sa_fast_decode(c,layer,(int*)c->aux3,meta,abs_base,chunk_start,window,heads,dim,scale,out,qb,sa_old_idx,&a);
+        if(r)return r>0;
+    }
     sparse_attn_batch_cached_idx_kernel<<<dim3(heads,tokens),256,sm,c->stream>>>(
         c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,(int*)c->aux3,
         selstride,abs_base,chunk_start,window,heads,dim,scale);
@@ -1074,6 +1097,198 @@ extern "C" int dsv4_cuda_sparse_attn_batch_cached_idx(int device,int layer,const
            ok(cudaMemcpyAsync(out,c->p4,qb,cudaMemcpyDeviceToHost,c->stream),"cached idx attention download")&&
            ok(cudaStreamSynchronize(c->stream),"cached idx sparse attention sync");
 }
+
+/* ---- V4_SPARSE_FAST (opt-in): the decode step (tokens == 1) of both cached sparse
+ * attention wrappers in three wider kernels, bitwise equal to the kernels above.
+ * Those kernels, as nvcc compiles them by default (FMA contraction on), compute:
+ *  - score of (head, item): lane l runs z = fma(q[d], v[d], z) over d = l, l+32, ...
+ *    in order, then the __shfl_down tree (16, 8, 4, 2, 1) with plain adds, then z*scale;
+ *  - softmax: the max (exact in any order); a_i = expf(score_i - m); the denominator
+ *    starts at expf(sink - m) and adds a_0, a_1, ... in item order on one thread; the
+ *    stored weight is bf16(a_i);
+ *  - output dim d: sum = fma(w_i, v_i[d], sum) over the items in order (window items,
+ *    then compressed items), then bf16(sum / den).
+ * The replica spells each step with __fmaf_rn / __fadd_rn / __fmul_rn / __fdiv_rn in
+ * the same operand order. The old kernels run one block per head, the softmax on one
+ * thread of it and the output over every item per dim; these spread items and heads
+ * over more blocks and compute each row's address once.
+ * V4_SPARSE_VERIFY=1 runs both and byte-compares the outputs (the old one is returned;
+ * mismatches are counted on stderr). Shapes other than dim 512 and heads % 8 == 0 keep
+ * the old kernels. */
+static int sa_env(int *cache,const char *name){
+    if(*cache<0){const char*e=getenv(name);*cache=e&&*e&&atoi(e)!=0;}
+    return *cache;
+}
+static int sa_fast_on(void){static int v=-1;return sa_env(&v,"V4_SPARSE_FAST");}
+static int sa_verify_on(void){static int v=-1;return sa_env(&v,"V4_SPARSE_VERIFY");}
+enum { SA_DJ = 16, SA_HG = 8, SA_ITEMS = 32, SA_HB = 8, SA_DT = 128, SA_TILE = 1024 };
+static long long g_sa_checks,g_sa_bad;
+/* Row of item i as an element offset: >= 0 is a window-ring row or (high bit set) a
+ * compressed row; -1 - k is row k of this step's chunk. */
+__device__ __forceinline__ long long sa_row(int i,int wo,int wn,const int*sel,int abs_base,
+        int chunk_start,int window,int dim){
+    if(i<wn){int ap=abs_base+wo+i;
+        if(ap>=chunk_start)return -1-(long long)(ap-chunk_start);
+        return (long long)(ap%window)*dim;}
+    int o=sel?sel[i-wn]:i-wn;
+    return ((long long)1<<62)|((long long)o*dim);
+}
+__device__ __forceinline__ float sa_load(long long r,int d,const float*win,
+        const float*comp,const float*chunk,int dim){
+    if(r<0)return chunk[(-1-r)*dim+d];
+    if(r&((long long)1<<62))return comp[(r&~((long long)1<<62))+d];
+    return win[r+d];
+}
+__global__ void sa_rows_kernel(long long*rows,const int*sel,int wo,int wn,int total,int abs_base,
+        int chunk_start,int window,int dim){
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<total)rows[i]=sa_row(i,wo,wn,sel,abs_base,chunk_start,window,dim);
+}
+/* grid (ceil(total/SA_ITEMS), heads/SA_HG), 256 threads; dim == 32*SA_DJ. */
+__global__ void sa_fast_scores(float*score,const float*q,const long long*rows,
+        const float*win,const float*comp,const float*chunk,int total,int dim,float scale){
+    __shared__ float qs[SA_HG*32*SA_DJ];
+    int h0=blockIdx.y*SA_HG;
+    for(int i=threadIdx.x;i<SA_HG*dim;i+=blockDim.x)qs[i]=q[(long long)h0*dim+i];
+    __syncthreads();
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    for(int k=warp;k<SA_ITEMS;k+=blockDim.x/32){
+        int item=blockIdx.x*SA_ITEMS+k;
+        if(item>=total)break;
+        long long r=rows[item];
+        float v[SA_DJ];
+#pragma unroll
+        for(int j=0;j<SA_DJ;j++)v[j]=sa_load(r,lane+32*j,win,comp,chunk,dim);
+#pragma unroll
+        for(int hh=0;hh<SA_HG;hh++){
+            const float*qh=qs+hh*dim;
+            float z=0;
+#pragma unroll
+            for(int j=0;j<SA_DJ;j++)z=__fmaf_rn(qh[lane+32*j],v[j],z);
+            for(int n=16;n;n>>=1)z=__fadd_rn(z,__shfl_down_sync(0xffffffff,z,n));
+            if(!lane)score[(long long)(h0+hh)*total+item]=__fmul_rn(z,scale);
+        }
+    }
+}
+/* grid heads, 256 threads; dynamic smem total floats. Writes w = bf16(a) and den. */
+__global__ void sa_fast_softmax(float*w,float*den,const float*score,const float*sink,int total){
+    extern __shared__ float a[];
+    __shared__ float red[256];
+    int h=blockIdx.x;
+    const float*s=score+(long long)h*total;
+    float m=-INFINITY;
+    for(int i=threadIdx.x;i<total;i+=blockDim.x)m=fmaxf(m,s[i]);
+    red[threadIdx.x]=m;__syncthreads();
+    for(int n=blockDim.x/2;n;n>>=1){if(threadIdx.x<n)red[threadIdx.x]=fmaxf(red[threadIdx.x],red[threadIdx.x+n]);__syncthreads();}
+    m=red[0];
+    for(int i=threadIdx.x;i<total;i+=blockDim.x){float e=expf(s[i]-m);a[i]=e;
+        w[(long long)h*total+i]=__bfloat162float(__float2bfloat16(e));}
+    __syncthreads();
+    if(!threadIdx.x){float d0=expf(sink[h]-m);for(int i=0;i<total;i++)d0=__fadd_rn(d0,a[i]);den[h]=d0;}
+}
+/* grid (dim/SA_DT, heads/SA_HB), SA_DT threads; items in tiles of SA_TILE. */
+__global__ void sa_fast_out(float*out,const float*w,const float*den,const long long*rows,
+        const float*win,const float*comp,const float*chunk,int total,int dim){
+    __shared__ float ws[SA_HB*SA_TILE];
+    __shared__ long long rs[SA_TILE];
+    int d=blockIdx.x*SA_DT+threadIdx.x,h0=blockIdx.y*SA_HB;
+    float sum[SA_HB];
+#pragma unroll
+    for(int hh=0;hh<SA_HB;hh++)sum[hh]=0;
+    for(int base=0;base<total;base+=SA_TILE){
+        int n=total-base<SA_TILE?total-base:SA_TILE;
+        __syncthreads();
+        for(int i=threadIdx.x;i<n;i+=blockDim.x){
+            rs[i]=rows[base+i];
+#pragma unroll
+            for(int hh=0;hh<SA_HB;hh++)ws[hh*SA_TILE+i]=w[(long long)(h0+hh)*total+base+i];
+        }
+        __syncthreads();
+        if(d<dim){
+            int i=0;
+            for(;i+4<=n;i+=4){
+                float v0=sa_load(rs[i],d,win,comp,chunk,dim),v1=sa_load(rs[i+1],d,win,comp,chunk,dim),
+                      v2=sa_load(rs[i+2],d,win,comp,chunk,dim),v3=sa_load(rs[i+3],d,win,comp,chunk,dim);
+#pragma unroll
+                for(int hh=0;hh<SA_HB;hh++){
+                    const float*wh=ws+hh*SA_TILE+i;
+                    float acc=sum[hh];
+                    acc=__fmaf_rn(wh[0],v0,acc);acc=__fmaf_rn(wh[1],v1,acc);
+                    acc=__fmaf_rn(wh[2],v2,acc);acc=__fmaf_rn(wh[3],v3,acc);
+                    sum[hh]=acc;
+                }
+            }
+            for(;i<n;i++){
+                float v=sa_load(rs[i],d,win,comp,chunk,dim);
+#pragma unroll
+                for(int hh=0;hh<SA_HB;hh++)sum[hh]=__fmaf_rn(ws[hh*SA_TILE+i],v,sum[hh]);
+            }
+        }
+    }
+    if(d<dim){
+#pragma unroll
+        for(int hh=0;hh<SA_HB;hh++)
+            out[(long long)(h0+hh)*dim+d]=__bfloat162float(__float2bfloat16(__fdiv_rn(sum[hh],den[h0+hh])));
+    }
+}
+/* The fast path on c->stream: device q, chunk, sinks and sel (or null) are already
+ * uploaded; output into dout. Returns 0 for an unsupported shape (old kernel runs). */
+static int sa_fast_launch(Dev*c,int layer,const float*dq,const float*dchunk,const float*dsinks,
+        const int*dsel,int wo,int wn,int cn,int abs_base,
+        int chunk_start,int window,int heads,int dim,float scale,float*dout){
+    int total=wn+cn;
+    if(dim!=32*SA_DJ||heads%SA_HG||heads%SA_HB||dim%SA_DT||total<1||(size_t)total*4>96*1024)return 0;
+    size_t sb=(size_t)heads*total*4;
+    if(!buf((void**)&c->sa_score,&c->sa_score_cap,sb)||!buf((void**)&c->sa_w,&c->sa_w_cap,sb)||
+       !buf((void**)&c->sa_den,&c->sa_den_cap,(size_t)heads*4)||
+       !buf((void**)&c->sa_rows,&c->sa_rows_cap,(size_t)total*sizeof(long long)))return 0;
+    size_t sm=(size_t)total*4;
+    if(sm>48*1024&&cudaFuncSetAttribute(sa_fast_softmax,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sm)!=cudaSuccess){
+        cudaGetLastError();return 0;}
+    sa_rows_kernel<<<(total+255)/256,256,0,c->stream>>>(c->sa_rows,dsel,wo,wn,total,abs_base,chunk_start,window,dim);
+    sa_fast_scores<<<dim3((total+SA_ITEMS-1)/SA_ITEMS,heads/SA_HG),256,0,c->stream>>>(
+        c->sa_score,dq,c->sa_rows,g_kv_ring[layer],g_kv_comp[layer],dchunk,total,dim,scale);
+    sa_fast_softmax<<<heads,256,sm,c->stream>>>(c->sa_w,c->sa_den,c->sa_score,dsinks,total);
+    sa_fast_out<<<dim3(dim/SA_DT,heads/SA_HB),SA_DT,0,c->stream>>>(
+        dout,c->sa_w,c->sa_den,c->sa_rows,g_kv_ring[layer],g_kv_comp[layer],dchunk,total,dim);
+    return ok(cudaGetLastError(),"fast sparse attention launch");
+}
+/* Fast path for both wrappers (tokens == 1, uploads queued). 1: the output is in `out`
+ * and the stream synced; 0: run the old kernel; -1: a CUDA error. */
+static int sa_fast_decode(Dev*c,int layer,const int*dsel,const int*meta,int abs_base,int chunk_start,
+        int window,int heads,int dim,float scale,float*out,size_t qb,
+        void(*old_launch)(Dev*,void*),void*old_arg){
+    if(!sa_fast_on())return 0;
+    int verify=sa_verify_on();
+    if(verify&&!buf((void**)&c->sa_out,&c->sa_out_cap,qb))return 0;
+    float*dout=verify?c->sa_out:c->p4;
+    if(!sa_fast_launch(c,layer,c->p2,c->p3,c->aux1,dsel,meta[0],meta[1],meta[2],abs_base,chunk_start,
+                       window,heads,dim,scale,dout))
+        return 0;
+    if(!verify)
+        return ok(cudaMemcpyAsync(out,c->p4,qb,cudaMemcpyDeviceToHost,c->stream),"fast attention download")&&
+               ok(cudaStreamSynchronize(c->stream),"fast sparse attention sync")?1:-1;
+    old_launch(c,old_arg);
+    float*hfast=(float*)malloc(qb);
+    int okk=hfast&&ok(cudaGetLastError(),"verify old sparse launch")&&
+            ok(cudaMemcpyAsync(out,c->p4,qb,cudaMemcpyDeviceToHost,c->stream),"verify old download")&&
+            ok(cudaMemcpyAsync(hfast,c->sa_out,qb,cudaMemcpyDeviceToHost,c->stream),"verify fast download")&&
+            ok(cudaStreamSynchronize(c->stream),"verify sparse sync");
+    if(!okk){free(hfast);return -1;}
+    g_sa_checks++;
+    int same=memcmp(out,hfast,qb)==0;
+    free(hfast);
+    if(!same&&++g_sa_bad<=16)fprintf(stderr,"v4_sparse_verify MISMATCH layer=%d total=%d\n",layer,meta[1]+meta[2]);
+    if(g_sa_checks%2048==0||(!same&&g_sa_bad<=1))
+        fprintf(stderr,"v4_sparse_verify checks=%lld mismatches=%lld\n",g_sa_checks,g_sa_bad);
+    return 1;
+}
+static void sa_old_plain(Dev*c,void*p){SaOld*a=(SaOld*)p;
+    sparse_attn_batch_cached_kernel<<<dim3(a->heads,1),256,a->sm,c->stream>>>(a->out,a->q,a->win,a->chunk,a->comp,
+        a->sink,a->meta,a->abs_base,a->chunk_start,a->window,a->heads,a->dim,a->scale);}
+static void sa_old_idx(Dev*c,void*p){SaOld*a=(SaOld*)p;
+    sparse_attn_batch_cached_idx_kernel<<<dim3(a->heads,1),256,a->sm,c->stream>>>(a->out,a->q,a->win,a->chunk,a->comp,
+        a->sink,a->meta,a->sel,a->selstride,a->abs_base,a->chunk_start,a->window,a->heads,a->dim,a->scale);}
 
 /* Batched indexer scoring for prefill. One thread per (token, candidate):
  * score = sum_h relu(q_h . k) * w_h with the SAME sequential fp32 order as the
@@ -1405,6 +1620,7 @@ extern "C" void dsv4_cuda_shutdown(void){
     }
     for(int i=0;i<ng;i++){cudaSetDevice(g[i].id);if(g[i].dx)cudaFree(g[i].dx);if(g[i].dy)cudaFree(g[i].dy);if(g[i].p1)cudaFree(g[i].p1);if(g[i].p2)cudaFree(g[i].p2);if(g[i].p3)cudaFree(g[i].p3);if(g[i].p4)cudaFree(g[i].p4);if(g[i].aux1)cudaFree(g[i].aux1);if(g[i].aux2)cudaFree(g[i].aux2);if(g[i].aux3)cudaFree(g[i].aux3);if(g[i].mvdesc)cudaFree(g[i].mvdesc);if(g[i].expert_weights)cudaFree(g[i].expert_weights);if(g[i].expert_ids)cudaFree(g[i].expert_ids);if(g[i].tcw)cudaFree(g[i].tcw);if(g[i].tcs)cudaFree(g[i].tcs);if(g[i].tcx)cudaFree(g[i].tcx);if(g[i].tcxs)cudaFree(g[i].tcxs);if(g[i].tc_workspace)cudaFree(g[i].tc_workspace);
         if(g[i].emaj)cudaFree(g[i].emaj);if(g[i].emv1)cudaFree(g[i].emv1);if(g[i].emv2)cudaFree(g[i].emv2);if(g[i].emv4)cudaFree(g[i].emv4);if(g[i].emcount)cudaFree(g[i].emcount);if(g[i].mmv)cudaFree(g[i].mmv);if(g[i].mmvcount)cudaFree(g[i].mmvcount);
+        if(g[i].sa_score)cudaFree(g[i].sa_score);if(g[i].sa_w)cudaFree(g[i].sa_w);if(g[i].sa_den)cudaFree(g[i].sa_den);if(g[i].sa_out)cudaFree(g[i].sa_out);if(g[i].sa_rows)cudaFree(g[i].sa_rows);
 #ifdef COLI_DSV4_DEEPGEMM
         if(g[i].dga1)cudaFree(g[i].dga1);if(g[i].dga2)cudaFree(g[i].dga2);if(g[i].dgsfa1)cudaFree(g[i].dgsfa1);if(g[i].dgsfa2)cudaFree(g[i].dgsfa2);if(g[i].dglayout)cudaFree(g[i].dglayout);if(g[i].dgrowmap)cudaFree(g[i].dgrowmap);if(g[i].dgmm1)cudaFree(g[i].dgmm1);if(g[i].dgmm2)cudaFree(g[i].dgmm2);if(g[i].dgref)cudaFree(g[i].dgref);if(g[i].dgdensews)cudaFree(g[i].dgdensews);
 #endif
