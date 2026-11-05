@@ -83,8 +83,9 @@ export default function App() {
      user's own, up to that ceiling. */
   const [maxTokens, setMaxTokens] = useState<number | null>(null)
   const [thinking, setThinking] = useState(false)
-  /* the file tools: on for this page only when the gateway offers them (/health file_tools) */
-  const [filesOn, setFilesOn] = useState(() => stored(localStorage, "colibri.fileTools", "") === "1")
+  /* the file tools: the server's --files 1 (/health file_tools) is the switch, so the chip
+     starts on in every page; a click turns them off for this page only, never remembered */
+  const [filesOn, setFilesOn] = useState(true)
   const [workFolder, setWorkFolder] = useState(() => stored(localStorage, "colibri.workFolder", ""))
   const [cacheSlot, setCacheSlot] = useState(0)
   const [conversations, setConversations] = useState<Record<number, ChatMessage[]>>({ 0: [] })
@@ -152,8 +153,8 @@ export default function App() {
     try { localStorage.setItem("colibri.imageSize", sizeKey(imageSize)); localStorage.setItem("colibri.imageSteps", String(imageSteps)) } catch { /* restricted storage mode */ }
   }, [imageSize, imageSteps])
   useEffect(() => {
-    try { localStorage.setItem("colibri.fileTools", filesOn ? "1" : "0"); localStorage.setItem("colibri.workFolder", workFolder) } catch { /* restricted storage mode */ }
-  }, [filesOn, workFolder])
+    try { localStorage.removeItem("colibri.fileTools"); localStorage.setItem("colibri.workFolder", workFolder) } catch { /* restricted storage mode */ }
+  }, [workFolder])
 
   // EFFECT #2
   useEffect(() => {
@@ -301,7 +302,9 @@ export default function App() {
      every round's request: they sit at the top of the prompt, so dropping them
      would make the server read the whole conversation again. Not on a continued
      turn, whose bubble already holds text the model did not write in a round. */
-  const runStream = async (payload: ChatMessage[], targetId: string, round = 0): Promise<void> => {
+  /* `folder` is the working folder this turn's tools use: change_dir moves it for the
+     calls after it, in this round and the next, and in Settings for later turns. */
+  const runStream = async (payload: ChatMessage[], targetId: string, round = 0, folder = workFolder): Promise<void> => {
     const tools = filesOn && supportsFileTools(health) && !payload.some((item) => item.id === targetId)
     let text = "", thought = ""
     setError("")
@@ -321,7 +324,7 @@ export default function App() {
         baseUrl,
         apiKey,
         model,
-        messages: tools ? [message("system", fileToolsSystem(workFolder)), ...chatTurns(payload)] : chatTurns(payload),
+        messages: tools ? [message("system", fileToolsSystem()), ...chatTurns(payload)] : chatTurns(payload),
         tools: tools ? FILE_TOOLS : undefined,
         temperature,
         maxTokens: maxTokens ?? undefined,
@@ -373,15 +376,16 @@ export default function App() {
         const answers: ChatMessage[] = []
         for (const call of result.toolCalls) {
           const done = round < FILE_TOOL_ROUNDS
-            ? await runFileTool(call, { baseUrl, apiKey, folder: workFolder, signal: controller.signal, approve: (question) => window.confirm(question) })
+            ? await runFileTool(call, { baseUrl, apiKey, folder, signal: controller.signal, approve: (question) => window.confirm(question) })
             : { content: "Tool limit reached for this answer: stop now and say what you did and what is left.", label: `${call.name} · limit` }
+          if ("folder" in done && done.folder) { folder = done.folder; setWorkFolder(done.folder) }
           const answer: ChatMessage = { ...message("tool", done.content), toolCallId: call.id, toolName: call.name, toolLabel: done.label }
           answers.push(answer)
           updateMessages((current) => [...current, answer])
         }
         const next = message("assistant", "")
         updateMessages((current) => [...current, next])
-        await runStream([...payload, asked, ...answers], next.id, round + 1)
+        await runStream([...payload, asked, ...answers], next.id, round + 1, folder)
         return
       }
     } catch (cause) {
@@ -648,7 +652,7 @@ export default function App() {
       : <section className={cn("chat-view", empty && "empty")} hidden={view === "brio"}>
         {empty ? <div className="welcome-brand"><Brand word /></div> : <div className="conversation" role="log" aria-label={t("nav.chat")} ref={conversationRef} onScroll={checkBottom}>
           <div className="message-list">{messages.map((item, index) => item.role === "tool"
-            ? <div key={item.id} className="tool-step"><Wrench /><span>{item.toolLabel || item.toolName}</span></div>
+            ? <details key={item.id} className="tool-step"><summary><Wrench /><span>{item.toolLabel || item.toolName}</span></summary><pre>{item.content}</pre></details>
             : <article key={item.id} className={cn("message", item.role)}>
             {item.role !== "user" && <div className="assistant-brand"><Brand /><span>colibrì</span></div>}
             {item.images?.length ? <div className="message-images">{item.images.map((url, at) =>

@@ -8598,7 +8598,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 pass
 
     def file_tool(self, action, body, request_id):
-        """POST /fs/read|write|edit|list|run: the dashboard's file tools (file_tools.py). Absent
+        """POST /fs/read|write|edit|list|cd|run: the dashboard's file tools (file_tools.py). Absent
         unless COLI_FILE_TOOLS=1. Beyond the Host guard and the API key that do_POST already
         applied: only a peer on this machine (a --host 0.0.0.0 bind must not turn a forged
         Host header into a shell), only a JSON body, and only this server's own page as

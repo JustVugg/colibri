@@ -8,8 +8,8 @@ import { serverEndpoint, type ToolCall, type ToolSpec } from "./api"
 
 export const FILE_TOOL_ROUNDS = 25
 
-const ACTIONS: Record<string, "read" | "write" | "edit" | "list" | "run"> = {
-  read_file: "read", write_file: "write", edit_file: "edit", list_dir: "list", run_command: "run",
+const ACTIONS: Record<string, "read" | "write" | "edit" | "list" | "cd" | "run"> = {
+  read_file: "read", write_file: "write", edit_file: "edit", list_dir: "list", change_dir: "cd", run_command: "run",
 }
 
 const fn = (name: string, description: string, properties: Record<string, { type: string; description: string }>) =>
@@ -24,13 +24,21 @@ export const FILE_TOOLS: ToolSpec[] = [
     { path: { type: "string", description: "the file to change" }, old_text: { type: "string", description: "the exact text to replace, as it is in the file" }, new_text: { type: "string", description: "the text to put in its place" } }),
   fn("list_dir", "List a folder: one name a line, folders end with /.",
     { path: { type: "string", description: "the folder, . for the working folder" } }),
+  fn("change_dir", "Change the working folder, like cd: every later tool runs there until it changes again. Use it whenever the user asks to cd or to go to a folder.",
+    { path: { type: "string", description: "the folder to go to, absolute or relative to the working folder" } }),
   fn("run_command", "Run a shell command in the working folder: its exit code and output (stdout and stderr), at most 120 s, no input.",
     { command: { type: "string", description: "the shell command" } }),
 ]
 
-export function fileToolsSystem(folder: string): string {
-  return `You can work on the user's files. The working folder is ${folder.trim() || "the user's home folder (~)"}: ` +
-    "read_file, write_file and list_dir take paths relative to it, and run_command runs a shell command there. " +
+/* The same text in every request: it sits at the top of the prompt, so naming the working
+   folder here would change the prompt after each change_dir and make the server read the
+   whole conversation again. The folder is in each tool's result instead. */
+export function fileToolsSystem(): string {
+  return "You can work on the user's files, in a working folder: read_file, write_file, edit_file and list_dir " +
+    "take paths relative to it, and run_command runs a shell command there. Each tool's result names the folder " +
+    "it used; list_dir . shows where you are. " +
+    "A cd inside run_command does not last; to change the working folder call change_dir. " +
+    "Never say you changed folder, listed, read or ran something unless the tool did it in this turn. " +
     "Read a file before you change it. To change part of a file use edit_file; " +
     "use write_file only for a new file or to replace a whole file. " +
     "Only write the content the user asked for: a file asked for without content is created empty. " +
@@ -43,6 +51,8 @@ export interface FileToolResult {
   content: string
   /* the line the page shows: "write_file src/a.py", "run_command make · exit 0" */
   label: string
+  /* change_dir: the new working folder, absolute, as the gateway checked it */
+  folder?: string
 }
 
 function parseArgs(call: ToolCall): Record<string, unknown> {
@@ -97,8 +107,9 @@ export async function runFileTool(call: ToolCall, options: RunFileToolOptions): 
     if (action === "edit") return { content: `Edited ${body.path}: ${body.removed} lines replaced by ${body.added}`, label: `${label} · −${body.removed} +${body.added}` }
     if (action === "list") {
       const entries = (body.entries as string[]) || []
-      return { content: `${body.path}\n${entries.join("\n")}${body.more ? `\n[${body.more} more]` : ""}`, label }
+      return { content: `${body.path}\n${entries.join("\n")}${body.more ? `\n[${body.more} more]` : ""}`, label: `${label} · ${body.path}` }
     }
+    if (action === "cd") return { content: `The working folder is now ${body.path}`, label: `${label} · ${body.path}`, folder: String(body.path) }
     const exit = body.exit ?? "timeout"
     return { content: `exit ${exit} in ${body.cwd}\n${body.output}`, label: `${label} · exit ${exit}` }
   } catch (cause) {

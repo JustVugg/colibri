@@ -89,6 +89,15 @@ class FileToolsTest(unittest.TestCase):
         self.assertEqual(len(text.split("\n")[0]), file_tools.MAX_READ)
         self.assertIn("first %d characters of a %d-byte file" % (file_tools.MAX_READ, file_tools.MAX_READ + 100_000), text)
 
+    def test_cd_returns_the_folder_and_refuses_a_missing_one(self):
+        d = self.folder.name
+        os.makedirs(os.path.join(d, "bin"))
+        self.assertEqual(self.fs("cd", path="bin")["path"], os.path.join(os.path.abspath(d), "bin"))
+        self.assertEqual(self.fs("cd", path=d)["path"], os.path.abspath(d))
+        self.assertEqual(self.status("cd", path="nope"), 400)
+        self.fs("write", path="f.txt", content="x")
+        self.assertEqual(self.status("cd", path="f.txt"), 400)
+
     def test_off_by_default(self):
         file_tools.ENABLED = False
         self.assertEqual(self.status("read", path="a.txt"), 404)

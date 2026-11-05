@@ -1,6 +1,6 @@
-"""The dashboard's file tools: read, write, edit and list files and run a command, as the user
+"""The dashboard's file tools: read, write, edit and list files, change folder and run a command, as the user
 who runs the gateway, in the working folder the page names. The gateway answers them on
-POST /fs/read, /fs/write, /fs/edit, /fs/list and /fs/run, only with COLI_FILE_TOOLS=1, only to its own
+POST /fs/read, /fs/write, /fs/edit, /fs/list, /fs/cd and /fs/run, only with COLI_FILE_TOOLS=1, only to its own
 page and only from this machine (openai_server.py, file_tool). The page asks the user before
 every write and every command. Standard library only.
 
@@ -74,6 +74,15 @@ def edit(folder, path, old_text, new_text):
     return {"path": p, "removed": old_text.count("\n") + 1, "added": new_text.count("\n") + 1 if new_text else 0}
 
 
+def cd(folder, path):
+    """The folder later tools run in, as `cd` would make it: checked to exist, returned
+    absolute. Nothing is changed here; the page keeps the folder and sends it with each call."""
+    p = _path(folder, path)
+    if not os.path.isdir(p):
+        raise ValueError("no such folder: %s" % p)
+    return {"path": p}
+
+
 def listdir(folder, path):
     p = _path(folder, path or ".")
     names = sorted(os.listdir(p))
@@ -101,5 +110,6 @@ ACTIONS = {
     "write": lambda b: write(b.get("folder"), b.get("path"), b.get("content")),
     "edit": lambda b: edit(b.get("folder"), b.get("path"), b.get("old_text"), b.get("new_text")),
     "list": lambda b: listdir(b.get("folder"), b.get("path")),
+    "cd": lambda b: cd(b.get("folder"), b.get("path")),
     "run": lambda b: run(b.get("folder"), b.get("command")),
 }

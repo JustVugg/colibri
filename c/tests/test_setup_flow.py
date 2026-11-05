@@ -2441,6 +2441,28 @@ class FilesSwitchTest(unittest.TestCase):
         self.assertEqual(self.started_with(None), "0")
         self.assertEqual(self.started_with(0, exported="1"), "0")
 
+    def test_both_spellings_reach_the_server(self):
+        """--files 1 and --files=1 through coli's own parser, on setup and start,
+        to the variable the server it starts gets."""
+        coli = C_DIR / "coli"
+        probe = ("import os,runpy,sys\n"
+                 "import setup_flow\n"
+                 "def stop(cfg, **kw):\n"
+                 "    print('COLI_FILE_TOOLS=' + os.environ.get('COLI_FILE_TOOLS', '')); sys.exit(0)\n"
+                 "setup_flow.start_server = stop\n"
+                 "setup_flow.load_config = lambda: {'ok': 1}\n"
+                 "setup_flow.config_ready = lambda cfg: True\n"
+                 "setup_flow.cuda_unused = lambda cfg: None\n"
+                 "setup_flow.refresh_configured = lambda cfg, out=None: None\n"
+                 "sys.argv = [sys.argv[1]] + sys.argv[2:]\n"
+                 "runpy.run_path(sys.argv[0], run_name='__main__')\n")
+        for args, want in ((["--files", "1"], "1"), (["--files=1"], "1"), (["--files=0"], "0"), ([], "0")):
+            with self.subTest(args=args):
+                out = subprocess.run([sys.executable, "-c", probe, str(coli), "start", "--no-browser", *args],
+                                     capture_output=True, text=True, timeout=60, cwd=str(C_DIR),
+                                     env=dict(os.environ, PYTHONPATH=str(C_DIR)))
+                self.assertIn("COLI_FILE_TOOLS=" + want, out.stdout, out.stderr[-500:])
+
     def test_the_flag_parses_on_setup_and_start(self):
         coli = C_DIR / "coli"
         for sub in ("setup", "start"):

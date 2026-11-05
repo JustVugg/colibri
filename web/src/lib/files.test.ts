@@ -10,11 +10,35 @@ const options = (approve = () => true) => ({
 const call = (name: string, args: Record<string, unknown>) => ({ id: "c", name, arguments: JSON.stringify(args) })
 
 describe("file tools", () => {
-  it("offers five tools, each with its required arguments", () => {
+  it("offers six tools, each with its required arguments", () => {
     expect(FILE_TOOLS.map((tool) => [tool.function.name, tool.function.parameters.required])).toEqual([
       ["read_file", ["path"]], ["write_file", ["path", "content"]], ["edit_file", ["path", "old_text", "new_text"]],
-      ["list_dir", ["path"]], ["run_command", ["command"]],
+      ["list_dir", ["path"]], ["change_dir", ["path"]], ["run_command", ["command"]],
     ])
+  })
+
+  it("change_dir goes to /fs/cd without asking and returns the checked folder", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ path: "/home/u/bin" })))
+    vi.stubGlobal("fetch", fetchMock)
+    const ask = vi.fn(() => true)
+    const result = await runFileTool(call("change_dir", { path: "bin" }), options(ask))
+    expect(ask).not.toHaveBeenCalled()
+    expect(fetchMock.mock.calls[0][0]).toBe("http://127.0.0.1:8000/fs/cd")
+    expect(result).toEqual({ content: "The working folder is now /home/u/bin", label: "change_dir bin · /home/u/bin", folder: "/home/u/bin" })
+  })
+
+  it("a listing names the folder it really listed", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ path: "/home/u", entries: ["a", "b/"], more: 0 }))))
+    const result = await runFileTool(call("list_dir", { path: "." }), options())
+    expect(result).toEqual({ content: "/home/u\na\nb/", label: "list_dir . · /home/u" })
+  })
+
+  it("a missing folder is an error the model reads, and the folder does not move", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(
+      JSON.stringify({ error: { message: "ValueError: no such folder: /home/u/nope" } }), { status: 400 })))
+    const result = await runFileTool(call("change_dir", { path: "nope" }), options())
+    expect(result.content).toBe("Error: ValueError: no such folder: /home/u/nope")
+    expect(result.folder).toBeUndefined()
   })
 
   it("asks before a write, an edit and a command, never before a read or a list", () => {
