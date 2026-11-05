@@ -1825,6 +1825,51 @@ extern "C" int dsv4_cuda_matvec_grouped(Dsv4CudaTensor *t,float *y,const float*x
     else mv_bf16<<<t->O,256,0,c->stream>>>((__nv_bfloat16*)t->w,c->dx,c->dy,t->O,t->I);
     return ok(cudaGetLastError(),"matvec launch")&&ok(cudaMemcpyAsync(y,c->dy,yb,cudaMemcpyDeviceToHost,c->stream),"result download")&&ok(cudaStreamSynchronize(c->stream),"matvec sync");}
 extern "C" int dsv4_cuda_matvec(Dsv4CudaTensor*t,float*y,const float*x){return dsv4_cuda_matvec_grouped(t,y,x,1);}
+/* V4_ATTN_BATCH_PROJ (optional export): up to 6 decode fp8 matvecs over the same input x
+ * in ONE device round trip: one x upload, one run_mv<8> per tensor (the kernel
+ * dsv4_cuda_matvec uses, groups=1), one D2H of all outputs into stage (output i at
+ * the sum of rows[0..i-1]), one sync. Each output is therefore bit-identical to the
+ * per-call dsv4_cuda_matvec. Refuses (0) anything else; the caller then runs the
+ * per-call path. Output buffers are per device (index = position in g). */
+static float *pj_out[16];static size_t pj_cap[16];
+extern "C" int dsv4_cuda_proj_batch(int n,Dsv4CudaTensor*const*t,const int*rows,const float*x,float*stage){
+    if(n<1||n>6||!t||!rows||!x||!stage||!t[0])return 0;
+    int d=t[0]->device,I=t[0]->I;size_t total=0;
+    if(I<1)return 0;
+    for(int i=0;i<n;i++){
+        if(!t[i]||t[i]->device!=d||t[i]->I!=I||t[i]->O!=rows[i]||rows[i]<1||t[i]->fmt!=8)return 0;
+        total+=(size_t)rows[i];
+    }
+    Dev*c=ctx(d);if(!c||!ok(cudaSetDevice(d),"select proj batch device"))return 0;
+    int gi=(int)(c-g);
+    size_t need=total*sizeof(float);
+    if(pj_cap[gi]<need){
+        if(pj_out[gi]&&!ok(cudaFree(pj_out[gi]),"proj batch free"))return 0;
+        pj_out[gi]=nullptr;pj_cap[gi]=0;
+        if(!alloc_ok(cudaMalloc((void**)&pj_out[gi],need),"proj batch buffer"))return 0;
+        pj_cap[gi]=need;
+    }
+    float *out=pj_out[gi];
+    if(!buf((void**)&c->dx,&c->xcap,(size_t)I*sizeof(float)))return 0;
+    int good=ok(cudaMemcpyAsync(c->dx,x,(size_t)I*sizeof(float),cudaMemcpyHostToDevice,c->stream),"proj batch upload");
+    size_t off=0;
+    for(int i=0;good&&i<n;i++){
+        run_mv<8>((uint8_t*)t[i]->w,t[i]->scale,c->dx,out+off,t[i]->O,I,1,c->stream);
+        off+=(size_t)rows[i];
+    }
+    good=good&&ok(cudaGetLastError(),"proj batch launch")&&
+         ok(cudaMemcpyAsync(stage,out,need,cudaMemcpyDeviceToHost,c->stream),"proj batch download");
+    int drained=ok(cudaStreamSynchronize(c->stream),"proj batch sync");
+    return good&&drained;
+}
+/* Engine close: frees the per-device proj batch output buffers (each on its own device). */
+extern "C" void dsv4_cuda_proj_batch_release(void){
+    for(int i=0;i<16;i++){
+        if(!pj_out[i])continue;
+        cudaSetDevice(g[i].id);cudaFree(pj_out[i]);
+        pj_out[i]=nullptr;pj_cap[i]=0;
+    }
+}
 extern "C" int dsv4_cuda_matmul_batch(Dsv4CudaTensor*t,const Dsv4CudaActivation*input,int tokens,Dsv4CudaActivation*output){
     Dev*c=t?ctx(t->device):nullptr;if(!c||!input||!output||tokens<1||input->device!=t->device||output->device!=t->device||
        input->elements<(long long)tokens*t->I||output->elements<(long long)tokens*t->O||!ok(cudaSetDevice(t->device),"select batched dense device"))return 0;

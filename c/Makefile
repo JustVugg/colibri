@@ -1343,6 +1343,16 @@ dsv4-cuda-test: tests/test_dsv4_dense_batch_cuda.c tests/test_dsv4_attention_bat
 	$(CC) $(CFLAGS) tests/test_dsv4_generic_bitwise_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_generic_bitwise_cuda_test$(EXE) $(LDFLAGS)
 	./dsv4_generic_bitwise_cuda_test$(EXE)
 
+# V4_ATTN_BATCH_PROJ: dsv4_cuda_proj_batch against per-call matvec, bit for bit (needs a GPU).
+# Windows: the DLL is loaded at run time and must sit next to the test binary (make
+# cuda-dsv4-dll first). On Linux build with CUDA=1: it links backend_cuda_dsv4.o, like
+# dsv4-cuda-test.
+.PHONY: dsv4-proj-batch-test
+dsv4-proj-batch-test: tests/test_dsv4_proj_batch_cuda.c backend_cuda_dsv4.h $(if $(IS_WIN),backend_loader_dsv4.c,$(DSV4_CUDA_OBJ))
+	$(CC) $(CFLAGS) -ffp-contract=off tests/test_dsv4_proj_batch_cuda.c $(if $(IS_WIN),backend_loader_dsv4.c,$(DSV4_CUDA_OBJ)) \
+		-o dsv4_proj_batch_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_proj_batch_cuda_test$(EXE)
+
 # Pure-CPU unit tests for the two headers the kernels consume. No GPU, no model.
 tests/test_dsv4_mhc$(EXE): tests/test_dsv4_mhc.c
 	$(CC) $(CFLAGS) tests/test_dsv4_mhc.c -o tests/test_dsv4_mhc$(EXE) $(LDFLAGS)
