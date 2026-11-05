@@ -2907,6 +2907,7 @@ int main(int argc, char **argv) {
                         "the head would run on the CPU; Q38_MTP=1 drafts)\n");
     }
 #endif
+    q38_tier_warmstart(&m);             /* pre-fill VRAM with hot experts before the first prompt */
     if(m.mtp&&getenv("Q38_MTP_DUMP")&&*getenv("Q38_MTP_DUMP")){
         g_q38_mtp_dump=fopen(getenv("Q38_MTP_DUMP"),"wb");
         if(!g_q38_mtp_dump){perror(getenv("Q38_MTP_DUMP"));return 1;}

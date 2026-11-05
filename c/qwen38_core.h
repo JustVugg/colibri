@@ -4063,6 +4063,54 @@ static void q38_tier_start(Model *m,int cap) {
     }
 }
 
+static void q38_slot_free(Slot *s) {
+    if(!s)return;
+    q38_weight_free(&s->gate);
+    q38_weight_free(&s->up);
+    q38_weight_free(&s->down);
+    free(s->fp8_slab);
+    free(s->int4_slab);
+    free(s->t8);
+    free(s->t8s);
+    memset(s,0,sizeof(*s));
+}
+
+static void q38_tier_warmstart(Model *m) {
+    if(!qt_ready()) return;
+    const char *nws = getenv("QT_NO_WARMSTART");
+    if(nws && *nws == '1') return;
+    double t0 = now_s();
+    int cap_total = m->c.layers * m->c.experts;
+    int *wpl = (int*)malloc((size_t)cap_total * sizeof(int));
+    int *wpe = (int*)malloc((size_t)cap_total * sizeof(int));
+    if(!wpl || !wpe){ free(wpl); free(wpe); return; }
+    int wn = qt_plan_fill(wpl, wpe, cap_total);
+    if(wn <= 0){ free(wpl); free(wpe); return; }
+    fprintf(stderr, "[qtier] warmstart (parallel): loading %d hot experts into VRAM...\n", wn);
+    #pragma omp parallel
+    {
+        Slot tmp; memset(&tmp, 0, sizeof tmp);
+        #pragma omp for schedule(dynamic, 4)
+        for (int i = 0; i < wn; i++) {
+            int l = wpl[i], e = wpe[i];
+            q38_load_expert(m, l, e, &tmp);
+            if (tmp.gate.kind == Q38_WEIGHT_INT4G64) {
+                qt_note_planned(l, e, (const uint8_t*)tmp.gate.data, (const uint8_t*)tmp.up.data,
+                                (const uint8_t*)tmp.down.data, tmp.gate.scales, tmp.up.scales, tmp.down.scales);
+            } else if (tmp.gate.data && tmp.up.data && tmp.down.data && tmp.gate.scales) {
+                qt_note_planned(l, e, (const uint8_t*)tmp.gate.data, (const uint8_t*)tmp.up.data,
+                                (const uint8_t*)tmp.down.data, tmp.gate.scales, tmp.up.scales, tmp.down.scales);
+            } else {
+                qt_note_planned(l, e, NULL, NULL, NULL, NULL, NULL, NULL);
+            }
+        }
+        q38_slot_free(&tmp);
+    }
+    qt_fill_wait();
+    free(wpl); free(wpe);
+    fprintf(stderr, "[qtier] warmstart done: %d experts resident in VRAM -- %.1f s\n", wn, now_s() - t0);
+}
+
 /* ---- Vulkan routed-expert tier (vk_tier.c) -------------------------------------
  * The tier computes the resident experts of a step on the device while the CPU
  * computes the rest; every expert's output then joins the row in rank order, the
@@ -5094,9 +5142,13 @@ static void q38_moe_ex(Model *m,Layer *l,int layer,const float *x,int S,float *o
             S-=base;
         }
     }
-    /* An MTP verify on the CUDA tier routes row by row as decode does, so
-     * the tier's resident experts serve it (the batched path is CPU only). */
-    if(S<=1||!m->prefill_batch||(g_q38_rowwise&&qt_ready()&&layer<m->c.layers))
+    /* If the CUDA expert tier is active, route row by row so the tier's
+     * resident experts on the GPU serve the prompt directly. The batched path
+     * is CPU only and thrashes disk/RAM on long prompts. */
+    int use_tier = qt_ready() && layer < m->c.layers;
+    const char *prw = getenv("Q38_TIER_PREFILL_ROWWISE");
+    if (prw && *prw == '0') use_tier = 0;
+    if(S<=1||!m->prefill_batch||use_tier||(g_q38_rowwise&&qt_ready()&&layer<m->c.layers))
         q38_moe_decode_ex(m,l,layer,x,S,out,logits_in,routed_only);
     else q38_moe_prefill(m,l,layer,x,S,out,logits_in,routed_only);
 }
