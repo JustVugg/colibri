@@ -11521,6 +11521,22 @@ static void v4_gpu_mirror_reserve_size(const ColiDeepSeekV4Config *config,
 static long long v4_gpu_mirror_reserve_mb(int live);
 static long long v4_gpu_mirror_reserve_margin_mb(int live);
 
+/* Retained router input per device (V4_GPU_ROUTE_REUSE=1). Single generation
+ * thread, matching the backend's per-device scratch contract. */
+#define V4_GPU_ROUTE_MAX_DEV 16
+static struct V4GpuRouteScratch {
+    Dsv4CudaActivation *input;
+    long long capacity;
+} v4_gpu_route_scratch[V4_GPU_ROUTE_MAX_DEV];
+
+static void v4_gpu_route_scratch_clear(void) {
+    for (int device = 0; device < V4_GPU_ROUTE_MAX_DEV; device++) {
+        if (v4_gpu_route_scratch[device].input)
+            dsv4_cuda_activation_free(v4_gpu_route_scratch[device].input);
+        v4_gpu_route_scratch[device] = (struct V4GpuRouteScratch){0};
+    }
+}
+
 int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     if (!engine) return -1;
     engine->gpu.enabled = 0;
@@ -11617,6 +11633,7 @@ void coli_v4_gpu_engine_close(ColiV4Engine *engine) {
             (V4GpuExpertMirrorCache *)engine->gpu.dspark_mirrors);
         engine->gpu.dspark_mirrors = NULL;
     }
+    v4_gpu_route_scratch_clear();
     dsv4_cuda_shutdown();
     engine->gpu.enabled = 0;
     engine->gpu.uploaded_bytes = 0;
@@ -11999,14 +12016,37 @@ int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
     if (!gate || (bias && !bias_t)) return -1;
     int device = dsv4_cuda_tensor_device(gate);
     if (device < 0) return -1;
-    Dsv4CudaActivation *act = dsv4_cuda_activation_create(device, dimension);
+    /* V4_GPU_ROUTE_REUSE=1: one retained input buffer per device, grown on demand,
+     * instead of a cudaMalloc/cudaFree pair per call. Opt-in: default is the old path. */
+    const char *reuse_env = getenv("V4_GPU_ROUTE_REUSE");
+    int reuse = reuse_env && atoi(reuse_env) != 0 && device < V4_GPU_ROUTE_MAX_DEV;
+    Dsv4CudaActivation *act = NULL;
+    if (reuse) {
+        /* the retained capacity may exceed this call's logical input: refuse a gate
+         * wider than the input, or the backend would read past what was uploaded */
+        if (dsv4_cuda_tensor_bytes(gate) > (long long)256 * dimension * (long long)sizeof(float))
+            return -1;
+        struct V4GpuRouteScratch *scratch = v4_gpu_route_scratch + device;
+        if (scratch->capacity < dimension) {
+            if (scratch->input) dsv4_cuda_activation_free(scratch->input);
+            scratch->input = dsv4_cuda_activation_create(device, dimension);
+            scratch->capacity = scratch->input ? dimension : 0;
+        }
+        act = scratch->input;
+    } else {
+        act = dsv4_cuda_activation_create(device, dimension);
+    }
     if (!act) return -1;
     int ok = dsv4_cuda_activation_upload(act, input, dimension);
     int ids[6];
     float wts[6];
     if (ok) ok = dsv4_cuda_route(act, gate, bias ? bias_t : NULL,
                                  forced_indices, route_scale, ids, wts);
-    dsv4_cuda_activation_free(act);
+    if (!reuse) {
+        dsv4_cuda_activation_free(act);
+    } else if (!ok) {
+        dsv4_cuda_activation_sync(act);   /* drain queued work before the next reuse */
+    }
     if (!ok) return -1;
     for (int k = 0; k < topk; k++) {
         indices[k] = ids[k];
