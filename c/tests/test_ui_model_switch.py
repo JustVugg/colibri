@@ -29,16 +29,26 @@ models = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(models)
 import family_registry
 
+# The stand-in binds without HTTPServer's server_bind, which resolves the host's name
+# (socket.getfqdn) and is the one call here that waits on something outside the process:
+# on the macOS runner the child stayed silent through the whole wait. If it stalls anyway,
+# faulthandler writes its stack to stderr before the test gives up, and the failure shows it.
 CHILD = r'''
 from http.server import BaseHTTPRequestHandler,HTTPServer
-import json,sys
+import faulthandler,json,socketserver,sys
+faulthandler.dump_traceback_later(20)
 class Handler(BaseHTTPRequestHandler):
  def do_GET(self):
   data=json.dumps({'status':'ok','scheduler':{'active':0,'queued':0}}).encode()
   self.send_response(200);self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
  def log_message(self,*args):pass
-server=HTTPServer(('127.0.0.1',int(sys.argv[1])),Handler)
+class Server(HTTPServer):
+ def server_bind(self):
+  socketserver.TCPServer.server_bind(self)
+  self.server_name,self.server_port='127.0.0.1',self.server_address[1]
+server=Server(('127.0.0.1',int(sys.argv[1])),Handler)
 print(server.server_port,flush=True)
+faulthandler.cancel_dump_traceback_later()
 server.serve_forever()
 '''
 
@@ -165,9 +175,12 @@ class ModelSwitchTests(unittest.TestCase):
         self.owned[process.pid] = process
         if fail:
             return process, None
-        # 30 s: a loaded runner's cold interpreter took more than 3 (macOS, the suite's other jobs
-        # beside it); select returns as soon as the port is written
-        self.assertTrue(select.select([process.stdout], [], [], 30)[0], 'fixture did not bind its port')
+        # select returns as soon as the port is written; 30 s leaves the child's own stack dump
+        # (at 20 s) time to land in stderr
+        if not select.select([process.stdout], [], [], 30)[0]:
+            process.kill()
+            _, err = process.communicate(timeout=5)
+            self.fail('fixture did not bind its port; its stderr:\n' + err.decode('utf-8', 'replace')[-4000:])
         line = process.stdout.readline()
         self.assertTrue(line, 'owned HTTP stand-in exited without a port')
         return process, int(line)
