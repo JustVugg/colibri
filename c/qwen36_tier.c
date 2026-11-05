@@ -160,7 +160,7 @@ static size_t qt_pad256(size_t b){ return (b + 255) / 256 * 256; }
  * of the largest layer's left Flint UD-Q3_K_XL's average expert 18 % of it unused, UD-Q4_K_XL's
  * 28 % (2.45 MB slots for 1.91 MB): on an RTX PRO 4000 the card held 8140 of its 12032 experts.
  * The budget counts each expert at its slot (qt_ebytes); a swap pairs slots of one size. The
- * qwen38 chain reads the arena as slots of one size (qt_chain_arena): it does not ask for it. */
+ * qwen38 chain takes the arena over by qt_chain_arena_exact and pairs its promotions by size class. */
 static int G_exact_want, G_exact;
 static size_t *G_lsl, *G_lou, *G_lod, G_lsl_min, G_abump;
 static int *G_lcls, G_ncls;                 /* a layer's size class, of G_ncls */
@@ -1694,6 +1694,13 @@ uint64_t qt_chain_promoted(void){ return G.on ? G.promo_done : 0; }
 int qt_chain_arena(void **base,size_t *slot,size_t *off_u,size_t *off_d,int *nslots){
     if(!G.on || G.ndev!=1 || G.wfmt!=QT_GGUF || !G_arena_on || !G_arena[0] || G_exact) return 0;   /* slots of one size only */
     *base=G_arena[0]; *slot=G_aslot; *off_u=G_aoff_u; *off_d=G_aoff_d; *nslots=G_aslots[0];
+    return 1;
+}
+int qt_chain_arena_exact(QtChainArena *a){
+    if(!G.on || G.ndev!=1 || G.wfmt!=QT_GGUF || !G_arena_on || !G_arena[0] || !G_exact || !a) return 0;
+    a->base=G_arena[0]; a->bytes=(size_t)G_aslots[0]*256u; a->bump=G_abump; a->nl=G.nl; a->ncls=G_ncls;
+    a->lsl=G_lsl; a->lou=G_lou; a->lod=G_lod; a->lcls=G_lcls;
+    a->cfree=(const size_t *const *)G_cfree; a->cnfree=G_cnfree;
     return 1;
 }
 int qt_chain_slot(int layer,int eid){

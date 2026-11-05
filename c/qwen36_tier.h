@@ -88,8 +88,8 @@ void qt_experts_withdraw(const char *why);
  * router, b|a and gate rows), kept out of the automatic allowance. Call before qt_init. */
 void qt_reserve(size_t bytes);
 void qt_reserve_short(size_t bytes, size_t experts);   /* out of the expert budget only when fewer than `experts` fit */
-/* A GGUF's arena slots at each layer's own size (one device; not for a chain that reads the arena
- * as slots of one size, qt_chain_arena). Call before qt_init_gguf. */
+/* A GGUF's arena slots at each layer's own size (one device; a chain takes them over through
+ * qt_chain_arena_exact, not qt_chain_arena). Call before qt_init_gguf. */
 void qt_gguf_exact_slots(int on);
 
 /* DeltaNet input projections, qkv ++ z fused into one resident tensor per
@@ -253,6 +253,16 @@ int  qt_chain_format(int *fmt, int *gs);
 int  qt_chain_layer_format(int layer, int *fmt, int *fmt_d);
 /* a GGUF's arena for a chain that moves the experts itself (qwen36_tier.c's comment) */
 int  qt_chain_arena(void **base, size_t *slot, size_t *off_u, size_t *off_d, int *nslots);
+/* the exact arena (qt_gguf_exact_slots) for such a chain: one allocation of `bytes`, `bump` of them
+ * carved into the residents' slots and the freed ones (qt_chain_slot: a resident's offset in
+ * 256-byte units); each layer's slot bytes, gate/up/down offsets in it and size class, a class's
+ * freed slots (byte offsets). 0: not that arena */
+typedef struct {
+    void *base; size_t bytes, bump; int nl, ncls;
+    const size_t *lsl, *lou, *lod; const int *lcls;
+    const size_t *const *cfree; const int *cnfree;
+} QtChainArena;
+int  qt_chain_arena_exact(QtChainArena *a);
 int  qt_chain_slot(int layer, int eid);
 void qt_chain_own(void);
 /* copy mode: 1 when a qt_note of the expert now would copy it (convert the bytes only then);
@@ -335,6 +345,9 @@ static inline void qt_chain_count(int a,const int*b,int c){(void)a;(void)b;(void
 static inline int  qt_chain_format(int*a,int*b){(void)a;(void)b;return 0;}
 static inline int  qt_chain_layer_format(int a,int*b,int*c){(void)a;(void)b;(void)c;return 0;}
 static inline int  qt_chain_arena(void**a,size_t*b,size_t*c,size_t*d,int*e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
+typedef struct { void *base; size_t bytes, bump; int nl, ncls; const size_t *lsl, *lou, *lod; const int *lcls;
+                 const size_t *const *cfree; const int *cnfree; } QtChainArena;
+static inline int  qt_chain_arena_exact(QtChainArena*a){(void)a;return 0;}
 static inline int  qt_chain_slot(int a,int b){(void)a;(void)b;return -1;}
 static inline void qt_chain_own(void){}
 static inline void qt_heat_order(uint32_t*const*a,int b,int c){(void)a;(void)b;(void)c;}
