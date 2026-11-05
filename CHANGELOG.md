@@ -67,6 +67,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   452-token prompts 585-615 -> 685-704 tok/s, 1512 tokens 644-647 (staged) -> 959-966, the
   decode the same (`COLI_CUDA_CHAIN_LANES`, `COLI_CUDA_CHAIN_LANE_STAGE`, `COLI_CUDA_HCG_SPLIT`,
   `Q38_PLE_ADVISE`).
+- **CUDA: a prompt's IQ2_S and Q2_0 routed experts through the `mma.sync` tiles.** A GGUF's
+  routed experts of these types went through the older f16 tiles, which decode the weights into
+  shared memory as their words come in: Qwen3.8-Flash-Next IQ2_XS (IQ2_S gate and up, Q2_0
+  down) took 4.52 ms a layer for a 470-row prompt chunk on an RTX PRO 4000, 30 GB/s of the
+  88 experts it read. They now take the tiles the K-quants have (the loads apart from the
+  decoding, a step ahead): 3.43 ms a layer, and the engine's 470-token prompts 751-819 ->
+  881-922 tok/s (with the two-lane prompt chunks). IQ4_XS, IQ4_NL and IQ3_S take them too,
+  dense and routed: Qwen3.8's trunk matrices of those types, 913-986 tok/s.
 - **CUDA GEMVs of a GGUF's blocks, a decode step's and a verify's rows.** IQ4_NL and IQ4_XS take their values by byte permutes instead of table reads (Qwen3.8's IQ4_XS lm_head at two rows 845 -> 713 us on an RTX PRO 4000); a wide row's x is quantized once for all the GEMV's blocks instead of by each (IQ4_XS 2048 x 8192 at two rows 44 -> 28 us, `COLI_CUDA_BD_PREQ`), and from three rows on each block copies its rows of it into shared memory, where the steps read it instead of beside the weights (four rows: IQ4_XS 10240 x 2560 306 -> 323 GB/s, IQ3_S 244 -> 277, Q6_K 216 -> 246; Qwen3.8-Flash-Next's trunk 6.93 -> 6.55 ms a verify, `COLI_CUDA_BD_XSM`). The bits are the same.
 - **A decode step's shared expert in one GEMV pass on CUDA.** The gate and up of a SwiGLU of one GGUF type, the rows of a decode step or a verify, now go through one kernel that writes silu(gate) * up, the bits of the two GEMVs and the elementwise product (three kernels into one). Qwen3.6-35B-A3B Q4_K_M on an RTX PRO 4000, 400-token answers, three runs: 104.4-104.8 -> 105.9-106.3 tok/s. Qwen3.8's chain takes it too where its shared expert's gate and up share a type (half of Qwen3.8-Flash-Next IQ2_XS's layers). `COLI_CUDA_GLU=0` turns it off.
 - **Qwen3.8's CUDA and Vulkan chains: a short prompt's host pool experts on the CPU.** A prompt chunk copied
