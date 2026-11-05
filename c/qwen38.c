@@ -2150,6 +2150,55 @@ static int q38_answer_start(const int *ids,int np){
         if(!memcmp(ids+j,seq,(size_t)n*sizeof(int)))return j+n<np?j+n:-1;
     return -1;
 }
+/* An agent's conversations begin with the same long system prompt (Hermes: 14,500 tokens of
+ * instructions and tools) and part right after its end. The live state and the prompt-end
+ * snapshot run past that point, so every new conversation read the whole system prompt again
+ * (25-30 s on Qwen3.8-Flash-Next IQ2_XS). A prompt whose first message is a system prompt of
+ * COLI_HEAD_PIN_MIN tokens or more (1024 unset, 0 none) leaves a pin where it ends, in the pool
+ * the client's pins use: the next prompt with that system prompt restores the deepest pin it
+ * extends (coli_pin_best, the rows checked by kv_prefix_holds) and reads only what follows.
+ * Q38_HEAD_PIN_MARKS="open|close" sets the message's markers (a byte tokenizer's tests). */
+static int q38_head_pin_min(void){
+    static int n=-2;
+    if(n==-2){const char *e=getenv("COLI_HEAD_PIN_MIN");n=e&&*e?atoi(e):1024;if(n<0)n=0;}
+    return n;
+}
+/* where the first message ends when it is such a system prompt and something follows it; -1 otherwise */
+static int q38_head_end(const int *ids,int np){
+    static int *op=NULL,*cl=NULL,no=-1,nc=-1;
+    if(no<0){
+        no=nc=0;
+        const char *o="<|im_start|>system\n",*c="<|im_end|>\n",*e=getenv("Q38_HEAD_PIN_MARKS"),*bar=e?strchr(e,'|'):NULL;
+        char ob[64],cb[64];
+        if(bar&&bar>e&&bar[1]&&(size_t)(bar-e)<sizeof ob&&strlen(bar+1)<sizeof cb){
+            memcpy(ob,e,(size_t)(bar-e));ob[bar-e]=0;snprintf(cb,sizeof cb,"%s",bar+1);o=ob;c=cb;
+        }
+        if(g_tok){encode_text_n(o,strlen(o),&op,&no);encode_text_n(c,strlen(c),&cl,&nc);}
+    }
+    const int least=q38_head_pin_min();
+    if(least<=0||no<=0||nc<=0||!ids||np<no+nc||memcmp(ids,op,(size_t)no*sizeof(int)))return -1;
+    for(int j=no;j+nc<=np;j++)
+        if(!memcmp(ids+j,cl,(size_t)nc*sizeof(int)))return j+nc>=least&&j+nc<np?j+nc:-1;
+    return -1;
+}
+static int q38_head_pinned(const int *ids,int h){
+    for(int s=0;s<g_q38_pins.n;s++){
+        const ColiPin *k=&g_q38_pins.slot[s];
+        if(k->len==h&&k->ids&&k->state&&!memcmp(k->ids,ids,(size_t)h*sizeof(int)))return 1;
+    }
+    return 0;
+}
+static void q38_head_pin(Model *m,const int *ids,int h,const float *lo){
+    coli_pin_pool_init(&g_q38_pins,m->c.vocab);
+    ColiPin *k=coli_pin_store(&g_q38_pins,ids,h,lo);
+    if(!k)return;
+    Q38PinState *st=(Q38PinState*)k->state;
+    if(q38_pin_state_copy(m,&st,1)){
+        k->state=st;
+        if(getenv("COLI_PREFIX_LOG"))fprintf(stderr,"[PREFIX] the %d-token system prompt pinned\n",h);
+    }else k->len=0;   /* no state, no pin */
+}
+
 /* The prompt [from, np) in two stretches when the answer's opening follows its last turn: the
  * prompt-end snapshot is taken where the answer starts, not after the opening. A client that
  * sends an answer back without its reasoning renders "<think>" with what follows otherwise
@@ -2157,6 +2206,14 @@ static int q38_answer_start(const int *ids,int np){
  * 14,809 tokens again. *snapped: 1 when the snapshot was taken here. */
 static float *q38_serve_prefill_at(Model *m,const int *ids,int from,int np,ColiPromptBreak *ctl,int snap_ok,int *snapped){
     *snapped=0;
+    const int h=snap_ok?q38_head_end(ids,np):-1;
+    if(h>from&&!q38_head_pinned(ids,h)){   /* the system prompt first, its pin, then the rest */
+        float *lo=q38_serve_prefill(m,ids,from,h,ctl);
+        if(!lo)return NULL;
+        q38_head_pin(m,ids,h,lo);
+        free(lo);
+        from=h;
+    }
     const int a=snap_ok?q38_answer_start(ids,np):-1;
     if(a<=from)return q38_serve_prefill(m,ids,from,np,ctl);
     float *lo=q38_serve_prefill(m,ids,from,a,ctl);

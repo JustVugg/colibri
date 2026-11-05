@@ -88,6 +88,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   cache did not hold came one pread at a time; a block's rows are now asked of the OS first, then
   read. DeepSeek-V4.1-Flash UD-IQ1_S on an RTX PRO 4000, a 444-token served prompt: 28.7-28.8 ->
   32.4-32.7 tok/s (`V41_ENGRAM_ADVISE`).
+- **Qwen3.8: a new conversation with a known system prompt reads only its own text.** An agent's conversations begin with the same long system prompt (Hermes: 14,500 tokens of instructions and tools) and part right after it; the live state and the prompt-end snapshot run past that point, so every new conversation read the whole system prompt again (25-30 s on Qwen3.8-Flash-Next IQ2_XS). A prompt whose first message is a system prompt of `COLI_HEAD_PIN_MIN` tokens or more (1024) now leaves a pin at its end, in the pool the client's pins use, and the next conversation with it restores that pin.
 - **Qwen3.8's CUDA and Vulkan chains: a short prompt's host pool experts on the CPU.** A prompt chunk copied
   every pooled expert of every layer over the bus, routed or not (18 GB for any prompt up to
   2048 tokens on Qwen3.8-Flash-Next IQ2_XS with an RTX PRO 4000). A prompt of one chunk now has
