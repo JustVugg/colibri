@@ -133,6 +133,9 @@ class FamilyDescriptor:
     has_gateway_adapter: bool = False
     has_cli_adapter: bool = False
     tune_prompt_template: str = "{prompt}"
+    # `coli tune` renders its prompts through the gateway (openai_server.tune_chat_prompt)
+    # instead of tune_prompt_template: the family's checkpoints ship different templates
+    tune_renders_chat: bool = False
     # The environment variable the engine reads for extra shard folders, a model
     # split across drives (st_init_multi: the shards of every listed folder, by
     # file name). The launcher looks there too before it calls a model incomplete
@@ -1589,8 +1592,10 @@ FAMILIES = (
         # the answer. False gives the user "use coli chat or coli serve", which
         # is true and actionable; chat/serve/web all work through the gateway.
         has_cli_adapter=False,
-        tune_prompt_template=(
-            "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n"),
+        # Qwen3.6, Qwen3-Coder, Flint, Muse Spark, LFM3 and the dense Qwen3 each ship their
+        # own template (detect_chat_flavor): one fixed form put Qwen3-Coder, which has no
+        # thinking mode, after an open <think>, and it answered nothing (#2590)
+        tune_renders_chat=True,
     ),
     FamilyDescriptor(
         id="qwen38",

@@ -609,6 +609,32 @@ int main(void) {
         ck(ok && maxdiff(down(db, n).data(), b.data(), n) == 0, "host_up: the bytes where they were sent");
         T->free(db); T->free(hb2);
     }
+    if (T->size >= offsetof(ColiCudaChainOps, host_up_n) + sizeof T->host_up_n && T->host_up_n) {
+        /* host_up_n: 96 pieces of a page-locked buffer, sizes 4 bytes to 11 KiB and apart, to places of a device
+         * buffer in another order, one call and one ticket; after a zero the frame recorded first */
+        const int np = 96; const size_t n = 1 << 18;
+        std::vector<float> b = rnd(n, 43);
+        CcBuf *db = T->buf(n * 4, CC_DEV), *hb2 = T->buf(n * 4, CC_UP);
+        int ok = db && hb2;
+        if (ok) memcpy(T->ptr(hb2), b.data(), n * 4);
+        float *dd = ok ? (float *)T->dev_addr(db) : NULL;
+        void *dst[np]; const void *src[np]; size_t by[np];
+        std::vector<float> want(n, 0.f);
+        for (int i = 0; i < np && ok; i++) {   /* piece i: floats [2730 i, +len) of the host buffer to the place of piece np-1-i */
+            const size_t len = 1 + (size_t)(i * 97) % 2730, from = (size_t)i * 2730, to = (size_t)(np - 1 - i) * 2730;
+            dst[i] = dd + to; src[i] = (const float *)T->ptr(hb2) + from; by[i] = len * 4;
+            for (size_t j = 0; j < len; j++) want[to + j] = b[from + j];
+        }
+        unsigned t = 0;
+        ok = ok && T->begin() && T->zero(db, 0, n) && T->host_up_n(dst, src, by, np, &t) && T->submit(1);
+        int landed = 0;
+        auto t0 = std::chrono::steady_clock::now();
+        while (ok && !landed && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) landed = T->host_up_done(t);
+        ck(ok && landed, "host_up_n: 96 copies in one call, their one ticket landed");
+        ck(ok && landed && maxdiff(down(db, n).data(), want.data(), n) == 0, "host_up_n: each piece where it was sent, after the frame's zero");
+        ck(!T->host_up_n(dst, src, by, 0, &t) && !T->host_up_n(NULL, src, by, 1, &t), "host_up_n: no copies, or none to, refused");
+        T->free(db); T->free(hb2);
+    }
     printf("matmul\n");
     {
         const int I = 96, O = 40, S = 3; unsigned s = 5;

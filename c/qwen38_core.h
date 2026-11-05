@@ -247,6 +247,7 @@ typedef struct {
     Layer *L;
     LCache *cache;
     uint8_t **ehit;                    /* experts routed this turn, for HITS (dashboard Brain) */
+    uint8_t *estep;                    /* experts routed since the last HITL frame (live map), layers*experts */
     Q38ExpertScaleCache *expert_scales;
     Q38Int4Experts *x4;                /* routed experts from experts-int4g64/, NULL = the snapshot's own */
     uint64_t clock, hits, miss;
@@ -2459,6 +2460,38 @@ static int q38_lb_r16(const Model *m) {
 /* One read per miss, into the slot's own slab; with COLI_MAP_EXPERTS=1 the
  * slot points into the mapped file instead, as the FP8 path does. Safe from
  * the parallel batch loader: every job owns a distinct slot. */
+/* A loader thread's read buffer, freed when the thread ends. A `static __thread` pointer
+ * outlived its thread: libgomp ends the threads a smaller team leaves out and starts new
+ * ones for a larger, and each new one took a buffer of its own (an int4-g64 record is
+ * 2.6 MiB) that the one it replaced never gave back (#2592). */
+enum { Q38_SCRATCH_INT4, Q38_SCRATCH_GGUF, Q38_SCRATCH_N };
+typedef struct { uint8_t *p[Q38_SCRATCH_N]; int64_t cap[Q38_SCRATCH_N]; } Q38Scratch;
+static pthread_key_t g_q38_scratch_key;
+static pthread_once_t g_q38_scratch_once = PTHREAD_ONCE_INIT;
+static void q38_scratch_free(void *v) {
+    Q38Scratch *s = (Q38Scratch *)v;
+    for (int i = 0; i < Q38_SCRATCH_N; i++) free(s->p[i]);
+    free(s);
+}
+static void q38_scratch_key(void) {
+    if (pthread_key_create(&g_q38_scratch_key, q38_scratch_free)) { fprintf(stderr, "Qwen3.8: no thread key for the read buffers\n"); exit(1); }
+}
+static uint8_t *q38_scratch(int which, int64_t bytes) {
+    pthread_once(&g_q38_scratch_once, q38_scratch_key);
+    Q38Scratch *s = (Q38Scratch *)pthread_getspecific(g_q38_scratch_key);
+    if (!s) {
+        s = (Q38Scratch *)calloc(1, sizeof *s);
+        if (!s || pthread_setspecific(g_q38_scratch_key, s)) { fprintf(stderr, "OOM expert read buffer\n"); exit(1); }
+    }
+    if (s->cap[which] < bytes) {
+        free(s->p[which]);
+        s->p[which] = (uint8_t *)malloc((size_t)bytes);
+        if (!s->p[which]) { fprintf(stderr, "OOM expert read buffer\n"); exit(1); }
+        s->cap[which] = bytes;
+    }
+    return s->p[which];
+}
+
 static void q38_load_int4_record(Model *m,int layer,int expert,Slot *slot) {
     Q38Int4Experts *x=m->x4;
     int fd=x->fd[layer];int64_t off=x->off[(int64_t)layer*m->c.experts+expert];
@@ -2475,9 +2508,7 @@ static void q38_load_int4_record(Model *m,int layer,int expert,Slot *slot) {
     }
     const int lr=q38_lb_r16(m);
     if(lr){   /* int2/int3-g16, vq2, int4-g64: read beside, interleave into the slot (each loader thread its buffer) */
-        static __thread uint8_t *raw; static __thread int64_t cap;
-        if(cap<x->record_bytes){free(raw);raw=(uint8_t*)malloc((size_t)x->record_bytes);cap=raw?x->record_bytes:0;
-                                if(!raw){fprintf(stderr,"OOM int4 expert record\n");exit(1);}}
+        uint8_t *raw=q38_scratch(Q38_SCRATCH_INT4,x->record_bytes);
         st_read_range_raw_cap(&x->S,fd,off,x->record_bytes,raw,x->record_bytes,1,"pread Qwen3.8 int4 expert");
         q38_bind_int4_record(m,slot,raw);   /* the three matrices' fields, then their interleaved form */
         Q38Weight *dst[3]={&slot->gate,&slot->up,&slot->down}; uint8_t *o=(uint8_t*)slot->int4_slab;
@@ -2531,8 +2562,7 @@ static void q38_gg_read_expert(Model *m,const gguf_tensor *const t[3],int eid,Sl
             w->kind=Q38_WEIGHT_GGML;w->gq_type=st;w->rows=os[k];w->cols=is[k];w->elements=(int64_t)os[k]*is[k];w->owns_data=1;
         }
         if(st!=t[k]->type){   /* read beside, interleave into the slot (each loader thread its buffer) */
-            static __thread uint8_t *raw; static __thread int64_t cap;
-            if(cap<eb){free(raw);raw=(uint8_t*)malloc((size_t)eb);cap=raw?eb:0;if(!raw){fprintf(stderr,"OOM GGUF expert\n");exit(1);}}
+            uint8_t *raw=q38_scratch(Q38_SCRATCH_GGUF,eb);
             q38_gg_read(t[k],raw,(int64_t)eid*eb,eb);
             gq_r16_pack(st,(uint8_t*)w->data,raw,os[k],is[k]);
             continue;
@@ -2601,11 +2631,17 @@ static void q38_ehit_mark(Model *m,int layer,int eid) {
         if(!ehit){
             ehit=(uint8_t**)calloc((size_t)c->layers,sizeof(uint8_t*));
             for(int i=0;i<c->layers;i++)ehit[i]=(uint8_t*)calloc((size_t)c->experts,1);
+            /* published before ehit, so a thread that sees ehit sees estep too */
+            __atomic_store_n(&m->estep,(uint8_t*)calloc((size_t)c->layers*c->experts,1),__ATOMIC_RELEASE);
             __atomic_store_n(&m->ehit,ehit,__ATOMIC_RELEASE);
         }
         pthread_mutex_unlock(&g_q38_ehit_mx);
     }
-    if(layer>=0&&layer<c->layers&&eid>=0&&eid<c->experts)ehit[layer][eid]=1;
+    if(layer>=0&&layer<c->layers&&eid>=0&&eid<c->experts){
+        ehit[layer][eid]=1;
+        uint8_t *es=__atomic_load_n(&m->estep,__ATOMIC_ACQUIRE);
+        if(es)es[(size_t)layer*c->experts+eid]=1;
+    }
 }
 /* The slot a full layer cache gives up: the least recently used outside `protect`
  * (NULL: none protected), and before it the least recently used of those whose expert
@@ -2750,14 +2786,10 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
     }
     free(protected_slots);
     if(job_count){
-        int workers=job_count;
-#ifdef _OPENMP
-        int thread_limit=omp_get_max_threads();if(workers>thread_limit)workers=thread_limit;
-#else
-        (void)workers;   /* only the pragma below reads it, and that is gone without OpenMP */
-#endif
         double started=now_s();
-        #pragma omp parallel for schedule(static) num_threads(workers) if(job_count>1)
+        /* the default team, whatever the jobs: one as large as the jobs changed size from
+         * batch to batch, and libgomp ended and started threads at each change (#2592) */
+        #pragma omp parallel for schedule(static) if(job_count>1)
         for(int job=0;job<job_count;job++){
             if(gg)q38_gg_read_expert(m,ggt,jobs[job].expert,jobs[job].slot);
             else if(x4)q38_load_int4_record(m,layer,jobs[job].expert,jobs[job].slot);

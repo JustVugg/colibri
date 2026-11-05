@@ -1646,7 +1646,11 @@ def cmd_tune(a):
     raw_prompts=[a.prompt,*(a.rotate_prompt or [_TUNE_ROTATION_PROMPT])]
     if len(set(raw_prompts)) < 2:
         sys.exit(f"{C.yel}tuning rotation needs at least two distinct prompts{C.r}")
-    prompts=[tuning_replay_prompt(family,item) for item in raw_prompts]
+    if family.tune_renders_chat:   # the checkpoint's own template, as coli serve renders it
+        from openai_server import tune_chat_prompt
+        prompts=[tune_chat_prompt(a.model,item) for item in raw_prompts]
+    else:
+        prompts=[tuning_replay_prompt(family,item) for item in raw_prompts]
     prompt=prompts[0]
     banner("tune · measured execution profile", model=a.model)
     if arch=="glm":

@@ -9,7 +9,9 @@
  *     the CPU's integer form, a row and a verify's; with some of them in page-locked host
  *     memory (a host pool), read over the bus or staged, the same bits;
  *   - the backend's path: coli_cuda_tensor_upload of the file's rows (padded to words on the
- *     device where a row is not), the dense chain's matmul, the same bits as the kernel's.
+ *     device where a row is not), the dense chain's matmul, the same bits as the kernel's;
+ *   - a SwiGLU's gate and up of a decode step's rows in one pass (bd_glu_launch), the bits of the
+ *     two GEMVs and the elementwise product.
  * BENCH=1 also times the GEMV at a few shapes, 1 to 4 rows. Build from c/:
  *   gcc -O2 -c tests/cuda_bd_ref.c -o tests/cuda_bd_ref.o
  *   nvcc -O2 -std=c++17 -arch=native tests/test_cuda_bd.cu tests/cuda_bd_ref.o -o tests/test_cuda_bd */
@@ -64,6 +66,12 @@ static void bd_fix(int t, uint8_t *b) {
 
 static bd_u32 *g_tab;
 static size_t g_smem;
+static int g_glu;   /* types and shapes whose gate and up went through bd_glu_launch */
+/* silu(g) * u as CC_EW_SWIGLU (cuda_chain.cu's cc_ew_k) has it */
+__global__ static void swiglu_ref_k(float *y, const float *g, const float *u, int n) {
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) { float a = g[i]; y[i] = (a / (1.f + expf(-a))) * u[i]; }
+}
 
 /* type t at I inputs, O rows: the rows against the CPU, a verify's rows against the rows alone */
 static void check(int t, int I, int O, int bench) {
@@ -166,12 +174,61 @@ static void check(int t, int I, int O, int bench) {
         if (ct) coli_cuda_tensor_free(ct);
         free(packed);
     }
-    /* a verify's rows together: the rows alone's bits */
-    for (int S = 2; S <= SM && ok; S++) {
+    /* a verify's rows together: the rows alone's bits; x quantized by each block, once for all of
+     * them (bdx_quant_k) and read from global memory, and once and copied into each block's shared
+     * memory (bd_gemv_xs: three rows or more, where x fits) alike */
+    static const char *const how[3] = {"by each block", "once", "once, in shared memory"};
+    for (int pq = 0; pq < 3 && ok && bdi_has(t); pq++) {
+        g_bd_preq_force = pq > 0; g_bd_xs_force = pq == 2;
+        for (int S = 1; S <= SM && ok; S++) {
+            cudaMemset(yd, 0, (size_t)SM * O * 4);
+            int okl = bd_gemv_launch(yd, xd, wd, g_tab, fmt, I, O, rw, S, g_smem, 0, 0) && cudaDeviceSynchronize() == cudaSuccess;
+            cudaMemcpy(got, yd, (size_t)S * O * 4, cudaMemcpyDeviceToHost);
+            if (!okl || memcmp(got, one, (size_t)S * O * 4)) {
+                printf("FAIL %s [%d x %d]: %d rows (x quantized %s) differ from the rows alone\n", ref_name(t), O, I, S, how[pq]);
+                fails++;
+            }
+        }
+        g_bd_preq_force = -1; g_bd_xs_force = -1;
+    }
+    for (int S = 2; S <= SM && ok && !bdi_has(t); S++) {
         cudaMemset(yd, 0, (size_t)SM * O * 4);
         int okl = bd_gemv_launch(yd, xd, wd, g_tab, fmt, I, O, rw, S, g_smem, 0, 0) && cudaDeviceSynchronize() == cudaSuccess;
         cudaMemcpy(got, yd, (size_t)S * O * 4, cudaMemcpyDeviceToHost);
         if (!okl || memcmp(got, one, (size_t)S * O * 4)) { printf("FAIL %s [%d x %d]: %d rows differ from the rows alone\n", ref_name(t), O, I, S); fails++; }
+    }
+    /* a SwiGLU's gate and up in one pass (bd_glu_launch: a decode step's shared expert), 1 to 4
+     * rows: the bits of the two GEMVs and CC_EW_SWIGLU's product */
+    if (ok && bdi_has(t)) {
+        uint8_t *wu = (uint8_t *)calloc((size_t)O, (size_t)rw * 4);
+        for (int o = 0; o < O; o++) {
+            uint8_t *r = wu + (size_t)o * rw * 4;
+            for (long i = 0; i < rb; i++) r[i] = (uint8_t)rnd();
+            for (long k = 0; k + bb <= rb; k += bb) bd_fix(t, r + k);
+        }
+        bd_u32 *ud; float *gd, *vd;
+        cudaMalloc(&ud, (size_t)O * rw * 4); cudaMalloc(&gd, (size_t)SM * O * 4); cudaMalloc(&vd, (size_t)SM * O * 4);
+        cudaMemcpy(ud, wu, (size_t)O * rw * 4, cudaMemcpyHostToDevice);
+        float *want = (float *)malloc((size_t)SM * O * 4);
+        /* x in each of its forms, as the verify's rows above: the one pass's bits in all of them */
+        for (int pq = 0; pq < 3; pq++) {
+            g_bd_preq_force = pq > 0; g_bd_xs_force = pq == 2;
+            for (int S = 1; S <= SM; S++) {
+                cudaMemset(yd, 0, (size_t)SM * O * 4);
+                int okg = bd_gemv_launch(gd, xd, wd, g_tab, fmt, I, O, rw, S, g_smem, 0, 0) && bd_gemv_launch(vd, xd, ud, g_tab, fmt, I, O, rw, S, g_smem, 0, 0);
+                if (okg) swiglu_ref_k<<<(S * O + 255) / 256, 256>>>(gd, gd, vd, S * O);
+                okg = okg && bd_glu_launch(yd, xd, wd, ud, g_tab, fmt, I, O, rw, S, g_smem, 0) && cudaDeviceSynchronize() == cudaSuccess;
+                cudaMemcpy(want, gd, (size_t)S * O * 4, cudaMemcpyDeviceToHost);
+                cudaMemcpy(got, yd, (size_t)S * O * 4, cudaMemcpyDeviceToHost);
+                if (!okg || memcmp(got, want, (size_t)S * O * 4)) {
+                    printf("FAIL %s [%d x %d]: the gate and up of %d rows in one pass (x quantized %s) differ\n", ref_name(t), O, I, S, how[pq]);
+                    fails++;
+                }
+            }
+        }
+        g_bd_preq_force = -1; g_bd_xs_force = -1;
+        g_glu++;
+        free(want); free(wu); cudaFree(ud); cudaFree(gd); cudaFree(vd);
     }
     if (bench) {
         /* copies of the matrix past the card's L2 (BENCH_MB, default 256), read in turn: a
@@ -430,13 +487,15 @@ int main(void) {
     }
     for (size_t i = 0; i < sizeof types / sizeof *types; i++)
         for (size_t k = 0; k < sizeof shapes / sizeof *shapes; k++) check(types[i], shapes[k][0], shapes[k][1], 0);
+    printf("glu: %d types and shapes, gate and up of 1 to 4 rows in one pass, the bits of the two GEMVs and the SwiGLU\n", g_glu);
     /* the routed experts: the commonest pairs of the published files, one row and a verify's */
-    const int pairs[][2] = {{12, 14}, {16, 18}, {17, 17}, {22, 23}, {11, 13}, {10, 12}, {19, 29}, {21, 20}, {8, 8}, {42, 42}};
+    const int pairs[][2] = {{12, 14}, {16, 18}, {17, 17}, {22, 23}, {11, 13}, {10, 12}, {19, 29}, {21, 20}, {8, 8}, {42, 42}, {22, 42}, {22, 8}};
     for (size_t i = 0; i < sizeof pairs / sizeof *pairs; i++) {
         check_moe(pairs[i][0], pairs[i][1], 1, 8, 16, 2048, 512);
         check_moe(pairs[i][0], pairs[i][1], 3, 8, 16, 1024, 768);
         check_moe(pairs[i][0], pairs[i][1], 40, 8, 16, 1024, 768);
     }
+    for (int g : {22, 16, 29}) for (int S : {2, 4}) check_moe(g, 42, S, 10, 24, 2560, 640);   /* Qwen3.8-Flash-Next IQ2_XS's experts, a verify's rows */
     if (bench) {
         printf("BENCH (rows of x: 1 2 3 4)\n");
         const int bt[] = {12, 14, 8, 17, 22, 16, 21, 23, 11, 10};

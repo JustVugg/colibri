@@ -4768,6 +4768,42 @@ def resolve_generation_prompt(messages, body):
     return False
 
 
+def default_reasoning_effort():
+    """The reasoning_effort of a chat request that names neither reasoning_effort nor
+    enable_thinking: Qwen3.8's and Muse Spark's templates think at xhigh unless told,
+    MiMo-V2.6's and LFM3's think too; the other families keep the older opt-in default
+    (none), which COLI_THINK=1 turns on for all of them."""
+    if chat_flavor() in ("qwen38", "muse"):
+        return "xhigh"
+    if ARCH == "mimo" or chat_flavor() == "lfm3" or os.environ.get("COLI_THINK", "0") == "1":
+        return "high"
+    return None
+
+
+def template_thinks():
+    """False for the templates with no thinking mode at all: Qwen3-Coder's (no <think>
+    anywhere) and OLMoE's (enable_thinking accepted but unused)."""
+    return not (ARCH == "olmoe" or chat_flavor() == "qwen3_coder")
+
+
+def tune_chat_prompt(model, text):
+    """TEXT as one user message, rendered as this gateway renders a chat request for MODEL
+    that sets nothing else: the checkpoint's own template (detect_chat_flavor) and its
+    default reasoning. `coli tune` measures with it, so the request it times is the one
+    `coli serve` is sent. A family-wide template opened <think> for every qwen36
+    checkpoint, and Qwen3-Coder, which has no thinking mode, ended its turn on the first
+    token there: no decode speed, and the tune failed (#2590). Qwen3.6 with thinking off
+    gets the template's pre-closed block, a state it was trained on (the bare
+    `assistant\n` is not, render_chat_qwen). Sets ARCH and CHAT_FLAVOR as a server does."""
+    global ARCH, CHAT_FLAVOR
+    family = resolve_model(model).descriptor
+    ARCH = family.id
+    CHAT_FLAVOR = detect_chat_flavor(family.id, model)
+    effort = default_reasoning_effort()
+    thinking = effort not in (None, "none") and template_thinks()
+    return render_chat_for_arch([{"role": "user", "content": text}], thinking, effort)
+
+
 def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                          tool_choice=None, audio_out=None, add_generation_prompt=True,
                          preserve_thinking=False):
@@ -9675,17 +9711,11 @@ class APIHandler(BaseHTTPRequestHandler):
         # nor enable_thinking (a global switch, like the old server's --think). An explicit
         # client value always wins. Default off => exact OpenAI-standard behavior.
         if reasoning_effort is None and "enable_thinking" not in body:
-            # Qwen3.8's official template defaults to enabled xhigh thinking;
-            # preserve the older opt-in default for the other families.
-            if chat_flavor() in ("qwen38", "muse"):   # Muse Spark's template: xhigh unless told
-                reasoning_effort = "xhigh"
-            elif ARCH == "mimo" or chat_flavor() == "lfm3" or os.environ.get("COLI_THINK", "0") == "1":
-                # MiMo-V2.6's and LFM3's templates think unless told not to (enable_thinking false)
-                reasoning_effort = "high"
+            reasoning_effort = default_reasoning_effort()
         enable_thinking = body.get("enable_thinking", reasoning_effort not in (None, "none"))
         if not isinstance(enable_thinking, bool):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
-        if (ARCH == "olmoe" or chat_flavor() == "qwen3_coder") and enable_thinking:
+        if not template_thinks() and enable_thinking:
             # Qwen3-Coder's template has no thinking mode either (no <think> anywhere).
             # OLMoE's template has no thinking mode (render_chat_olmoe: "accepted
             # but unused"), so the engine never emits <think>/</think>. Left on,
