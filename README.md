@@ -124,6 +124,7 @@ Options go after `./start-here.sh` or `START-HERE.bat`:
 | `--backend vulkan`, `cuda` or `cpu` | choose the engine build yourself; `--no-gpu` is `--backend cpu` |
 | `--model-dir DIR` | use a model you already downloaded |
 | `--reconfigure` | choose another model |
+| `--files 1` | let the dashboard's chat read, write, edit and list files and run commands, for this start only ([api.md](docs/api.md#file-tools)); default `0` |
 
 What each step does, in detail: [docs/quickstart.md](docs/quickstart.md#the-one-step-way).
 

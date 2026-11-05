@@ -18,3 +18,8 @@ export function supportsCompaction(health: HealthResponse | null): boolean {
 export function supportsContinuation(health: HealthResponse | null): boolean {
   return health?.continue_assistant === true
 }
+
+/* The gateway runs this page's file tools (COLI_FILE_TOOLS=1). Off unless it says so. */
+export function supportsFileTools(health: HealthResponse | null): boolean {
+  return health?.file_tools === true
+}

@@ -162,6 +162,10 @@ const en: Record<string, string> = {
   "sidebar.temperature": "Temperature",
   "sidebar.maxTokens": "Max output tokens",
   "sidebar.reasoning": "Reasoning",
+  "files.chip": "Files",
+  "files.chipHelp": "Let the model read, write, edit and list files and run commands in the working folder. You approve every write and command.",
+  "files.folder": "Working folder",
+  "files.folderHelp": "Where the file tools read, write and run. Empty: your home folder.",
   "sidebar.transport": "OpenAI-compatible transport",
 
   // top bar

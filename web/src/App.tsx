@@ -25,7 +25,7 @@ import {
   SlidersHorizontal,
   Timer,
   Trash2,
-  Zap, ImagePlus, Camera, Grid3x3, Palette, FileText} from "lucide-react"
+  Zap, ImagePlus, Camera, Grid3x3, Palette, FileText, FolderCog, Wrench} from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -40,7 +40,8 @@ import {
   presetOf, randomSeed, sizeKey, validSide, type ImageSize,
 } from "@/lib/images"
 import { chatMarkdown, exportName, resendFrom } from "@/lib/chat"
-import { activeRequests, supportsCacheSlots, supportsCompaction, supportsContinuation } from "@/lib/runtime"
+import { FILE_TOOLS, FILE_TOOL_ROUNDS, fileToolsSystem, runFileTool } from "@/lib/files"
+import { activeRequests, supportsCacheSlots, supportsCompaction, supportsContinuation, supportsFileTools } from "@/lib/runtime"
 import Brio from "./Brio"
 import { BrainWorkspace } from "./BrainWorkspace"
 import { Brand } from "./components/Brand"
@@ -82,6 +83,10 @@ export default function App() {
      user's own, up to that ceiling. */
   const [maxTokens, setMaxTokens] = useState<number | null>(null)
   const [thinking, setThinking] = useState(false)
+  /* the file tools: the server's --files 1 (/health file_tools) is the switch, so the chip
+     starts on in every page; a click turns them off for this page only, never remembered */
+  const [filesOn, setFilesOn] = useState(true)
+  const [workFolder, setWorkFolder] = useState(() => stored(localStorage, "colibri.workFolder", ""))
   const [cacheSlot, setCacheSlot] = useState(0)
   const [conversations, setConversations] = useState<Record<number, ChatMessage[]>>({ 0: [] })
   const [health, setHealth] = useState<HealthResponse | null>(null)
@@ -147,6 +152,9 @@ export default function App() {
   useEffect(() => {
     try { localStorage.setItem("colibri.imageSize", sizeKey(imageSize)); localStorage.setItem("colibri.imageSteps", String(imageSteps)) } catch { /* restricted storage mode */ }
   }, [imageSize, imageSteps])
+  useEffect(() => {
+    try { localStorage.removeItem("colibri.fileTools"); localStorage.setItem("colibri.workFolder", workFolder) } catch { /* restricted storage mode */ }
+  }, [workFolder])
 
   // EFFECT #2
   useEffect(() => {
@@ -287,7 +295,18 @@ export default function App() {
      the turn is a fresh answer (send) or a continued one (continueTurn). The only
      difference between the two callers is what they put in `payload` and which
      bubble they stream into; everything below is identical, so it lives here. */
-  const runStream = async (payload: ChatMessage[], targetId: string) => {
+  /* With the file tools on, a generation that ends in tool calls is not the end of
+     the turn: each call runs (writes and commands only after the user says yes),
+     its result joins the transcript as a role "tool" turn, and the next round
+     streams into a new assistant bubble, up to FILE_TOOL_ROUNDS. The tools stay in
+     every round's request: they sit at the top of the prompt, so dropping them
+     would make the server read the whole conversation again. Not on a continued
+     turn, whose bubble already holds text the model did not write in a round. */
+  /* `folder` is the working folder this turn's tools use: change_dir moves it for the
+     calls after it, in this round and the next, and in Settings for later turns. */
+  const runStream = async (payload: ChatMessage[], targetId: string, round = 0, folder = workFolder): Promise<void> => {
+    const tools = filesOn && supportsFileTools(health) && !payload.some((item) => item.id === targetId)
+    let text = "", thought = ""
     setError("")
     setLoading(true)
     setStreamStart(null)
@@ -305,7 +324,8 @@ export default function App() {
         baseUrl,
         apiKey,
         model,
-        messages: chatTurns(payload),
+        messages: tools ? [message("system", fileToolsSystem()), ...chatTurns(payload)] : chatTurns(payload),
+        tools: tools ? FILE_TOOLS : undefined,
         temperature,
         maxTokens: maxTokens ?? undefined,
         enableThinking: thinking,
@@ -322,6 +342,7 @@ export default function App() {
           setTokenCount(count)
           const since = (performance.now() - decodeStart) / 1000
           if (count > 1 && since > 0.2) setTokPerSec((count - 1) / since)
+          thought += delta
           updateMessages((current) => appendDelta(current, targetId, "reasoning", delta))
         },
         onDelta: (delta) => {
@@ -334,6 +355,7 @@ export default function App() {
              instead of showing what the engine is doing now. */
           const since = (performance.now() - decodeStart) / 1000
           if (count > 1 && since > 0.2) setTokPerSec((count - 1) / since)
+          text += delta
           updateMessages((current) => appendDelta(current, targetId, "content", delta))
         },
       })
@@ -348,6 +370,24 @@ export default function App() {
       setLastRun(result)
       updateMessages((current) => setFinish(current, targetId, result.finishReason))
       setConnected(true)
+      if (tools && result.toolCalls.length && round <= FILE_TOOL_ROUNDS) {
+        const asked: ChatMessage = { id: targetId, role: "assistant", content: text, ...(thought ? { reasoning: thought } : {}), toolCalls: result.toolCalls }
+        updateMessages((current) => current.map((item) => item.id === targetId ? { ...item, toolCalls: result.toolCalls } : item))
+        const answers: ChatMessage[] = []
+        for (const call of result.toolCalls) {
+          const done = round < FILE_TOOL_ROUNDS
+            ? await runFileTool(call, { baseUrl, apiKey, folder, signal: controller.signal, approve: (question) => window.confirm(question) })
+            : { content: "Tool limit reached for this answer: stop now and say what you did and what is left.", label: `${call.name} · limit` }
+          if ("folder" in done && done.folder) { folder = done.folder; setWorkFolder(done.folder) }
+          const answer: ChatMessage = { ...message("tool", done.content), toolCallId: call.id, toolName: call.name, toolLabel: done.label }
+          answers.push(answer)
+          updateMessages((current) => [...current, answer])
+        }
+        const next = message("assistant", "")
+        updateMessages((current) => [...current, next])
+        await runStream([...payload, asked, ...answers], next.id, round + 1, folder)
+        return
+      }
     } catch (cause) {
       /* Drop the target bubble only if it is empty -- a first turn that never got
          a token. A continued turn already carries the client's opening, so the
@@ -516,6 +556,7 @@ export default function App() {
           <button type="button" className={cn("toggle-row", thinking && "active")} aria-pressed={thinking} onClick={() => setThinking((value) => !value)}>
             <span><BrainCircuit className="size-4" /> {t("sidebar.reasoning")}</span><i><b /></i>
           </button>
+          {supportsFileTools(health) && <label>{t("files.folder")}<Input id="work-folder" value={workFolder} placeholder="~" spellCheck={false} onChange={(event) => setWorkFolder(event.target.value)} /><span className="field-help">{t("files.folderHelp")}</span></label>}
           </>}
         </section></fieldset>)
   const runtimeControls = (<><section className="side-section runtime-section" aria-live="polite">
@@ -610,7 +651,9 @@ export default function App() {
       : view === "profiling" ? <section className="profiling-workspace"><header className="page-heading"><span>COLIBRI / ENGINE</span><h1>Profiling</h1></header>{metrics}<Profiling baseUrl={baseUrl} apiKey={apiKey} connected={connected} /></section>
       : <section className={cn("chat-view", empty && "empty")} hidden={view === "brio"}>
         {empty ? <div className="welcome-brand"><Brand word /></div> : <div className="conversation" role="log" aria-label={t("nav.chat")} ref={conversationRef} onScroll={checkBottom}>
-          <div className="message-list">{messages.map((item, index) => <article key={item.id} className={cn("message", item.role)}>
+          <div className="message-list">{messages.map((item, index) => item.role === "tool"
+            ? <details key={item.id} className="tool-step"><summary><Wrench /><span>{item.toolLabel || item.toolName}</span></summary><pre>{item.content}</pre></details>
+            : <article key={item.id} className={cn("message", item.role)}>
             {item.role !== "user" && <div className="assistant-brand"><Brand /><span>colibrì</span></div>}
             {item.images?.length ? <div className="message-images">{item.images.map((url, at) =>
               <img key={at} src={url} alt={t("ui.attachedImage", { n: at + 1 })} />)}</div> : null}
@@ -619,7 +662,9 @@ export default function App() {
                   <summary>{t("sidebar.reasoning")}</summary>
                   <div className="reasoning-body">{item.reasoning}</div>
                 </details>
-              : null}{item.content ? (item.role === "assistant" ? <Markdown text={item.content} /> : item.content) : <span className="typing" aria-label={t("ui.generating")}><i /><i /><i /></span>}</div>}
+              : null}{item.content ? (item.role === "assistant" ? <Markdown text={item.content} /> : item.content) : item.toolCalls?.length ? null : <span className="typing" aria-label={t("ui.generating")}><i /><i /><i /></span>}
+              {/* still generating after its text: the gateway holds a tool call back until it is whole */}
+              {item.content && loading && index === messages.length - 1 && item.role === "assistant" ? <span className="typing" aria-label={t("ui.generating")}><i /><i /><i /></span> : null}</div>}
             {item.role === "assistant" && item.content && <div className="message-actions"><button className="icon-action" aria-label={t("ui.copy")} title={t("ui.copy")} onClick={() => void copyMessage(item)}><Copy /></button>{copied === item.id && <span role="status">{t("ui.copied")}</span>}{index === messages.length - 1 && !loading && !imageMode && <button className="icon-action" aria-label={t("ui.regenerate")} title={t("ui.regenerate")} onClick={() => { const retry = resendFrom(messages, index); if (retry) void send(retry.text, retry.previous, retry.pictures, false) }}><RefreshCw /></button>}{index === messages.length - 1 && !loading && !imageMode && supportsContinuation(health) && continuable(item) && <button className="icon-action" aria-label={t("ui.continue")} title={t("ui.continue")} onClick={() => void continueTurn()}><StepForward /></button>}</div>}
           </article>)}</div>
         </div>}
@@ -645,6 +690,7 @@ export default function App() {
               <button type="button" className="attach-chip" aria-label={t("ui.attachImage")} title={t("ui.attachImage")}
                 onClick={() => fileRef.current?.click()}><ImagePlus /></button>
               <button type="button" className="reasoning-chip" aria-pressed={thinking} onClick={() => setThinking(value => !value)}><BrainCircuit />{t("sidebar.reasoning")}</button>
+              {supportsFileTools(health) && <button type="button" className="reasoning-chip" aria-pressed={filesOn} title={t("files.chipHelp")} onClick={() => setFilesOn(value => !value)}><FolderCog />{t("files.chip")}</button>}
               <button type="button" className="slot-chip" onClick={() => openSettings("model")}><Database />{t("topbar.slot", { n: cacheSlot + 1 })}</button>
               </>}
               {loading ? <button type="button" className="send-button" aria-label={imageMode ? t("image.cancel") : t("chat.stop")} onClick={() => abortRef.current?.abort()}><CircleStop /></button> : <button type="submit" className="send-button" aria-label={imageMode ? t("image.generate") : t("chat.send")} disabled={!canSend}><ArrowUp /></button>}

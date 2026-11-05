@@ -29,6 +29,43 @@ class QwenToolValidationTest(unittest.TestCase):
                     self.assertEqual(json.loads(call["function"]["arguments"]),
                                      {"path": "a.py", "edits": [{"line": 1}], "dry_run": True})
 
+    def test_a_lost_opening_tag_with_its_closer_kept_recovers(self):
+        """The int4 Qwen3-Coder container drops <tool_call> but writes </tool_call>:
+        a reply that is only such blocks is a call, the stray closer included."""
+        for reply in (CALL + "\n</tool_call>", CALL + "</tool_call>\n",
+                      CALL + "\n</tool_call>\n" + CALL + "\n</tool_call>"):
+            with self.subTest(reply=reply):
+                text, calls = parse_qwen_tool_calls(reply, TOOLS)
+                self.assertEqual(text, "")
+                self.assertEqual(len(calls), reply.count("<function="))
+
+    def test_prose_then_calls_closed_by_their_kept_closer_recover(self):
+        """Prose before a call is allowed in the full form, and the model's tool rules
+        allow reasoning before the call: with the closer kept, the same holds when only
+        the opening tag was lost. The prose stays the reply's text."""
+        prose = "I'll check the file first:\n\n"
+        for reply in (prose + CALL + "\n</tool_call>", prose + CALL + "\n</tool_call>\n" + CALL + "</tool_call>\n"):
+            with self.subTest(reply=reply):
+                text, calls = parse_qwen_tool_calls(reply, TOOLS)
+                self.assertEqual(text, prose.strip())
+                self.assertEqual(len(calls), reply.count("<function="))
+
+    def test_a_kept_closer_does_not_make_prose_a_call(self):
+        for reply in ("Example: " + CALL, CALL + "\n</tool_call> is an example",
+                      "Example: " + CALL + "\n</tool_call> and more prose",
+                      "Example: " + CALL + "\n" + CALL + "\n</tool_call>",
+                      "```xml\n" + CALL + "\n</tool_call>\n```",
+                      CALL + "\n</tool_call>\n</tool_call>",
+                      "Example: " + CALL + "\n</tool_call>\n</tool_call>",
+                      CALL.replace("edit>", "undeclared>") + "\n</tool_call>",
+                      "Example: " + CALL.replace("edit>", "undeclared>") + "\n</tool_call>",
+                      # PR #2582 review: a quoted </function> inside a value must not be
+                      # stretched over to the last closer (the echo of a file's text)
+                      CALL.replace("a.py\n</parameter>", "a.py </function> tail\n</parameter>") + "</tool_call>",
+                      "Example: " + CALL.replace("a.py\n</parameter>", "a.py </function> tail\n</parameter>") + "</tool_call>"):
+            with self.subTest(reply=reply):
+                self.assertEqual(parse_qwen_tool_calls(reply, TOOLS), (reply, []))
+
     def test_untrusted_or_incomplete_arguments_are_not_calls(self):
         for broken in (CALL.replace("edit>", "undeclared>"),
                        CALL.replace('<parameter=edits>\n[{"line": 1}]\n</parameter>\n', ''),
@@ -87,7 +124,8 @@ class QwenToolValidationTest(unittest.TestCase):
     def test_stream_release_and_recovery_at_every_split(self):
         examples = (CALL, "<tool_call>" + CALL + "</tool_call>", "Example: " + CALL,
                     "```xml\n" + CALL + "\n```", CALL + " is an example",
-                    CALL.replace("edit>", "undeclared>"))
+                    CALL.replace("edit>", "undeclared>"), CALL + "\n</tool_call>",
+                    "Example:" + CALL + "\n</tool_call>", "Example: " + CALL + "\n</tool_call> and more")
         for reply in examples:
             expected, calls = parse_qwen_tool_calls(reply, TOOLS)
             for split in range(1, len(reply)):
