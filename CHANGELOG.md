@@ -37,6 +37,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **Qwen3.8: a long prompt layer by layer with the MTP head too** (CUDA and Vulkan chains). A prompt of
+  several chunks runs layer by layer, each layer's host pool experts staged once for all its chunks, but
+  not when the caller wanted the rows' final streams back, and the MTP head's prefill always does: with
+  the head (on by default where the file has it) every chunk staged every layer again. The layer-by-layer
+  path now gives the streams back as the chunks do, and picks the promotions at the prompt's end as the
+  chunks did after each one. Qwen3.8-Flash-Next IQ2_XS with its MTP head on an RTX PRO 4000, two serves a
+  side: a 4220-token prompt 580-583 -> 798-807 tok/s on CUDA (56 GB -> 19 GB over the bus), 154-173 ->
+  305-308 on Vulkan, a 585-token one 115-134 -> 193-196 on Vulkan; the same text, the decode after it
+  and in the turns after the same.
 - **The CUDA chains' promotions in one call a frame.** An expert promoted to the card went over the
   bus in three copies (Qwen3.6's six), each `cc_host_up` five calls of the runtime (a mark's wait,
   the frame's event, the copy stream's wait on it, the copy, its mark): 20-30 experts after a
