@@ -1924,6 +1924,30 @@ static void serve_hits(Model *m){
     printf("HITS %d %d %s\n",rows,E,hex); fflush(stdout); free(hex); free(bm);
 }
 
+/* HITL: the experts routed since the previous frame, written after every token the decode
+ * loop emits, so the chat page and the dashboard light them up while the answer is being
+ * written (openai_server.py's /experts?since=N). Each index is layer*experts+expert as four
+ * hex digits; nothing is written when nothing was routed (the later tokens of an MTP step
+ * share its forward). The per-turn HITS frame is unaffected. COLI_HITS_LIVE=0 turns it off. */
+static void serve_hits_live(Model *m){
+    static int enabled=-1;
+    if(enabled<0){const char *e=getenv("COLI_HITS_LIVE");enabled=!(e&&*e&&atoi(e)==0);}
+    uint8_t *es=m->estep;
+    if(!enabled||!es)return;
+    const Cfg *c=&m->c; size_t n=(size_t)c->layers*c->experts, k=0;
+    for(size_t i=0;i<n;i++)k+=es[i]!=0;
+    if(!k||n>65536)return;
+    char *line=(char*)malloc(k*4+8); size_t w=0;
+    if(!line)return;
+    memcpy(line,"HITL ",5); w=5;
+    for(size_t i=0;i<n;i++)if(es[i]){
+        es[i]=0;
+        for(int s=12;s>=0;s-=4)line[w++]="0123456789abcdef"[(i>>s)&15];
+    }
+    line[w++]=10;
+    fwrite(line,1,w,stdout); fflush(stdout); free(line);
+}
+
 /* The generation budget a request gets. max_tokens is a CEILING, not a
  * target (#260/#382, the rule GLM and DeepSeek V4 already apply): the prompt
  * must fit with room for one token (none for a read-only logprobs request,
@@ -2393,6 +2417,7 @@ static int serve_one_turn(Model *m, ServeReq *q){
         if(q->logprobs>0) serve_data_lp(q->id,(char*)chunk,chunk_n,lptail);
         else if(chunk_n>0) serve_data(q->id,(char*)chunk,chunk_n);
         free(chunk);free(token);
+        serve_hits_live(m);
         gen++;
         while(!input_eof&&coli_stdin_readable()){
             int control=serve_read_req(stdin,stdout,NULL,q->id);
@@ -2567,6 +2592,7 @@ static int q38_mux_pick(Model *m,Q38MuxReq *r,const int *eos_ids,int n_eos,int *
     if(r->q.logprobs>0)serve_data_lp(r->q.id,(char*)chunk,chunk_n,lptail);
     else if(chunk_n>0)serve_data(r->q.id,(char*)chunk,chunk_n);
     free(chunk);free(token);
+    serve_hits_live(m);
     r->gen++;
     /* the next logits are not needed after the last requested token (serve_one) */
     if(r->gen>=r->q.max_tok){q38_mux_finish(m,r);return 0;}

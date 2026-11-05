@@ -247,6 +247,7 @@ typedef struct {
     Layer *L;
     LCache *cache;
     uint8_t **ehit;                    /* experts routed this turn, for HITS (dashboard Brain) */
+    uint8_t *estep;                    /* experts routed since the last HITL frame (live map), layers*experts */
     Q38ExpertScaleCache *expert_scales;
     Q38Int4Experts *x4;                /* routed experts from experts-int4g64/, NULL = the snapshot's own */
     uint64_t clock, hits, miss;
@@ -2601,11 +2602,17 @@ static void q38_ehit_mark(Model *m,int layer,int eid) {
         if(!ehit){
             ehit=(uint8_t**)calloc((size_t)c->layers,sizeof(uint8_t*));
             for(int i=0;i<c->layers;i++)ehit[i]=(uint8_t*)calloc((size_t)c->experts,1);
+            /* published before ehit, so a thread that sees ehit sees estep too */
+            __atomic_store_n(&m->estep,(uint8_t*)calloc((size_t)c->layers*c->experts,1),__ATOMIC_RELEASE);
             __atomic_store_n(&m->ehit,ehit,__ATOMIC_RELEASE);
         }
         pthread_mutex_unlock(&g_q38_ehit_mx);
     }
-    if(layer>=0&&layer<c->layers&&eid>=0&&eid<c->experts)ehit[layer][eid]=1;
+    if(layer>=0&&layer<c->layers&&eid>=0&&eid<c->experts){
+        ehit[layer][eid]=1;
+        uint8_t *es=__atomic_load_n(&m->estep,__ATOMIC_ACQUIRE);
+        if(es)es[(size_t)layer*c->experts+eid]=1;
+    }
 }
 /* The slot a full layer cache gives up: the least recently used outside `protect`
  * (NULL: none protected), and before it the least recently used of those whose expert
