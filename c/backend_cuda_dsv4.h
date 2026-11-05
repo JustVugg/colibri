@@ -21,6 +21,13 @@ int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t,const uint8_t *w,const uint8_t *scal
 int dsv4_cuda_upload_bf16(Dsv4CudaTensor **t,const uint16_t *w,int O,int I,int device);
 /* Same-shape in-place refill of an fp4 mirror (no realloc); sync=1 drains. */
 int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t,const uint8_t *w,const uint8_t *scale,int O,int I,int sync);
+/* V4_COPY_WORKER (optional exports, see dsv4.def): the same refill posted to the
+ * backend's copy worker. Returns 1 posted, 0 error, 2 refused by max_pending_bytes
+ * (0 = unbounded). The host slabs must stay valid until a launch or
+ * dsv4_cuda_copy_drain (which returns 1 when the copy stream is idle). */
+int dsv4_cuda_copy_async_available(void);
+int dsv4_cuda_tensor_refill_fp4_async(Dsv4CudaTensor *t,const uint8_t *w,const uint8_t *scale,int O,int I,long long max_pending_bytes);
+int dsv4_cuda_copy_drain(int device);
 int dsv4_cuda_upload_f32(Dsv4CudaTensor **t,const float *w,int O,int I,int device);
 int dsv4_cuda_matvec(Dsv4CudaTensor *t,float *y,const float *x);
 int dsv4_cuda_matmul_batch(Dsv4CudaTensor *t,const Dsv4CudaActivation *input,

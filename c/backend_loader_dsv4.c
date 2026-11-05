@@ -169,6 +169,11 @@ typedef int             (*fn_fp8_ref_matmul)(int device, const uint8_t *w, const
                                              int tokens, float *y);
 typedef int             (*fn_tensor_refill_fp4)(Dsv4CudaTensor *t, const uint8_t *w, const uint8_t *scale,
                                                 int O, int I, int sync);
+/* optional (V4_COPY_WORKER): older DLLs lack these and the attach stays synchronous */
+typedef int             (*fn_tensor_refill_fp4_async)(Dsv4CudaTensor *t, const uint8_t *w, const uint8_t *scale,
+                                                      int O, int I, long long max_pending_bytes);
+typedef int             (*fn_copy_async_available)(void);
+typedef int             (*fn_copy_drain)(int device);
 typedef int             (*fn_backend_arch_ok)(int device);
 typedef const char     *(*fn_backend_name)(void);
 typedef long long       (*fn_mem_free_mb)(int device);
@@ -311,6 +316,9 @@ static struct {
     fn_indexer_score_batch indexer_score_batch;
     fn_fp8_ref_matmul fp8_ref_matmul;
     fn_tensor_refill_fp4 tensor_refill_fp4;
+    fn_tensor_refill_fp4_async tensor_refill_fp4_async; /* optional (V4_COPY_WORKER) */
+    fn_copy_async_available copy_async_available;       /* optional */
+    fn_copy_drain copy_drain;                           /* optional */
     fn_backend_arch_ok backend_arch_ok;   /* optional */
     fn_backend_name backend_name;         /* optional */
     char loaded_name[64];
@@ -490,6 +498,13 @@ static int dsv4_cuda_resolve(const char *dllname){
     RESOLVE(indexer_score_batch, fn_indexer_score_batch);
     RESOLVE(fp8_ref_matmul, fn_fp8_ref_matmul);
     RESOLVE(tensor_refill_fp4, fn_tensor_refill_fp4);
+    /* optional (V4_COPY_WORKER): an older DLL without them keeps the synchronous attach */
+    _Pragma("GCC diagnostic push")
+    _Pragma("GCC diagnostic ignored \"-Wcast-function-type\"")
+    g_dsv4.tensor_refill_fp4_async = (fn_tensor_refill_fp4_async)GetProcAddress(g_dsv4.dll, "dsv4_cuda_tensor_refill_fp4_async");
+    g_dsv4.copy_async_available = (fn_copy_async_available)GetProcAddress(g_dsv4.dll, "dsv4_cuda_copy_async_available");
+    g_dsv4.copy_drain = (fn_copy_drain)GetProcAddress(g_dsv4.dll, "dsv4_cuda_copy_drain");
+    _Pragma("GCC diagnostic pop")
     RESOLVE(mem_free_mb, fn_mem_free_mb);
     RESOLVE(kv_ring_append, fn_kv_ring_append);
     RESOLVE(kv_comp_append, fn_kv_comp_append);
@@ -859,6 +874,22 @@ int dsv4_cuda_fp8_ref_matmul(int device, const uint8_t *w, const float *bscale,
 int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t, const uint8_t *w, const uint8_t *scale, int O, int I, int sync){
     if(!g_dsv4.available) return 0;
     return g_dsv4.tensor_refill_fp4(t, w, scale, O, I, sync);
+}
+
+/* No copy worker without the DLL export: the caller keeps the synchronous attach. */
+int dsv4_cuda_copy_async_available(void){
+    return g_dsv4.available && g_dsv4.copy_async_available && g_dsv4.copy_async_available();
+}
+
+int dsv4_cuda_tensor_refill_fp4_async(Dsv4CudaTensor *t, const uint8_t *w, const uint8_t *scale, int O, int I, long long max_pending_bytes){
+    if(!g_dsv4.available || !g_dsv4.tensor_refill_fp4_async) return 0;
+    return g_dsv4.tensor_refill_fp4_async(t, w, scale, O, I, max_pending_bytes);
+}
+
+/* Nothing can be pending without the worker, so the drain trivially succeeds. */
+int dsv4_cuda_copy_drain(int device){
+    if(!g_dsv4.available || !g_dsv4.copy_drain) return 1;
+    return g_dsv4.copy_drain(device);
 }
 
 int dsv4_cuda_backend_arch_ok(int device){

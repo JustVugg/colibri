@@ -1169,6 +1169,14 @@ cuda-dsv4-dg-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def $(DEEPGEMM_S
 dsv4-cuda-loader-test: tests/test_dsv4_decode_cuda.c backend_loader_dsv4.c backend_cuda_dsv4.h
 	$(CC) $(CFLAGS) tests/test_dsv4_decode_cuda.c backend_loader_dsv4.c -o dsv4_decode_loader_test$(EXE)
 	./dsv4_decode_loader_test$(EXE)
+
+# V4_COPY_WORKER ordering/exactness through the runtime loader (Windows: the DLL
+# is loaded beside the test; the dsv4-cuda-test target above needs DSV4_CUDA_OBJ).
+.PHONY: dsv4-copy-worker-loader-test
+dsv4-copy-worker-loader-test: tests/test_dsv4_copy_worker_cuda.c backend_loader_dsv4.c backend_cuda_dsv4.h
+	$(CC) $(CFLAGS) tests/test_dsv4_copy_worker_cuda.c backend_loader_dsv4.c -o dsv4_copy_worker_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_copy_worker_cuda_test$(EXE)
+
 backend_metal.o: backend_metal.mm backend_metal.h affine_quant.h
 	$(METALXX) -c backend_metal.mm -o $@
 
@@ -1331,9 +1339,11 @@ cuda-test: tests/test_mxfp4_expert_cuda.cu backend_cuda.cu backend_cuda.h fp8_fo
 # variants (expert-major vs per-route MoE, warp vs block dense batch) against
 # each other bit for bit. Needs a GPU, so CI runs none of it; it does not
 # build these tests either, only backend_cuda_dsv4.cu itself.
-dsv4-cuda-test: tests/test_dsv4_dense_batch_cuda.c tests/test_dsv4_attention_batch_cuda.c tests/test_dsv4_moe_batch_cuda.c tests/test_dsv4_generic_bitwise_cuda.c tests/test_dsv4_bank_bytes_cuda.c backend_cuda_dsv4.h $(DSV4_CUDA_OBJ)
+dsv4-cuda-test: tests/test_dsv4_dense_batch_cuda.c tests/test_dsv4_attention_batch_cuda.c tests/test_dsv4_moe_batch_cuda.c tests/test_dsv4_generic_bitwise_cuda.c tests/test_dsv4_bank_bytes_cuda.c tests/test_dsv4_copy_worker_cuda.c backend_cuda_dsv4.h $(DSV4_CUDA_OBJ)
 	$(CC) $(CFLAGS) tests/test_dsv4_bank_bytes_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_bank_bytes_cuda_test$(EXE) $(LDFLAGS)
 	./dsv4_bank_bytes_cuda_test$(EXE)
+	$(CC) $(CFLAGS) tests/test_dsv4_copy_worker_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_copy_worker_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_copy_worker_cuda_test$(EXE)
 	$(CC) $(CFLAGS) tests/test_dsv4_dense_batch_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_cuda_test$(EXE) $(LDFLAGS)
 	./dsv4_cuda_test$(EXE)
 	$(CC) $(CFLAGS) tests/test_dsv4_attention_batch_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_attention_cuda_test$(EXE) $(LDFLAGS)

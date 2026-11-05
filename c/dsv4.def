@@ -49,6 +49,9 @@ EXPORTS
     dsv4_cuda_indexer_score_batch
     dsv4_cuda_fp8_ref_matmul
     dsv4_cuda_tensor_refill_fp4
+    dsv4_cuda_tensor_refill_fp4_async
+    dsv4_cuda_copy_async_available
+    dsv4_cuda_copy_drain
     dsv4_cuda_backend_arch_ok
     dsv4_cuda_backend_name
     dsv4_cuda_kv_ring_append

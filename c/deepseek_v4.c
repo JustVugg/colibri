@@ -12066,6 +12066,9 @@ static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create(int device,
 
 static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache) {
     if (!cache) return;
+    /* a posted copy-worker refill may still write these mirrors: finish it first
+     * (returns at once when nothing was posted, or without the backend export) */
+    (void)dsv4_cuda_copy_drain(cache->device);
     for (int i = 0; i < cache->count; i++) {
         if (cache->entries[i].gate)
             dsv4_cuda_tensor_free(cache->entries[i].gate);
@@ -12077,6 +12080,67 @@ static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache) {
     pthread_mutex_destroy(&cache->mutex);
     free(cache->entries);
     free(cache);
+}
+
+/* V4_COPY_WORKER=1 (needs the optional backend exports; off by default): an
+ * async attach (sync=0) posts its recycled mirror's three fp4 refills to the
+ * backend copy worker instead of copying on the calling thread. The backend
+ * orders each copy after the last MoE that read the mirror and orders every
+ * later expert launch after the copies, so the bytes, the kernels and the
+ * outputs do not change. The host slabs of the view must stay valid until a
+ * launch of that expert or coli_v4_gpu_expert_drain has passed. */
+static int coli_v4_copy_worker_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("V4_COPY_WORKER");
+        enabled = setting && atoi(setting) != 0 && dsv4_cuda_copy_async_available();
+        if (setting && atoi(setting) != 0 && !enabled)
+            fprintf(stderr, "[v4_copy] V4_COPY_WORKER needs the copy worker in the "
+                            "backend DLL; staying on the synchronous attach\n");
+    }
+    return enabled;
+}
+
+/* Posts the three fp4 refills of view into the mirror's existing buffers.
+ * Returns 1 when all three are posted. If one fails after the first was queued,
+ * the copy queue is drained before returning, so the caller may free the three
+ * tensors (queued copies write into them). */
+static int v4_fp4_post3(int device, Dsv4CudaTensor *gate, Dsv4CudaTensor *up,
+                        Dsv4CudaTensor *down, const ColiExpertView *view) {
+    int r = dsv4_cuda_tensor_refill_fp4_async(
+        gate, (const uint8_t *)view->gate.data, (const uint8_t *)view->gate.scales,
+        (int)view->gate.rows, (int)view->gate.columns, 0);
+    if (r != 1) return 0;
+    r = dsv4_cuda_tensor_refill_fp4_async(
+        up, (const uint8_t *)view->up.data, (const uint8_t *)view->up.scales,
+        (int)view->up.rows, (int)view->up.columns, 0);
+    if (r != 1) {
+        (void)dsv4_cuda_copy_drain(device);
+        return 0;
+    }
+    r = dsv4_cuda_tensor_refill_fp4_async(
+        down, (const uint8_t *)view->down.data, (const uint8_t *)view->down.scales,
+        (int)view->down.rows, (int)view->down.columns, 0);
+    if (r != 1) {
+        (void)dsv4_cuda_copy_drain(device);
+        return 0;
+    }
+    return 1;
+}
+
+/* The synchronous twin of v4_fp4_post3 (same bytes, sync on the last copy). */
+static int v4_fp4_refill3(int device, Dsv4CudaTensor *gate, Dsv4CudaTensor *up,
+                          Dsv4CudaTensor *down, const ColiExpertView *view, int sync) {
+    (void)device;
+    return dsv4_cuda_tensor_refill_fp4(
+               gate, (const uint8_t *)view->gate.data, (const uint8_t *)view->gate.scales,
+               (int)view->gate.rows, (int)view->gate.columns, 0) &&
+           dsv4_cuda_tensor_refill_fp4(
+               up, (const uint8_t *)view->up.data, (const uint8_t *)view->up.scales,
+               (int)view->up.rows, (int)view->up.columns, 0) &&
+           dsv4_cuda_tensor_refill_fp4(
+               down, (const uint8_t *)view->down.data, (const uint8_t *)view->down.scales,
+               (int)view->down.rows, (int)view->down.columns, sync);
 }
 
 static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
@@ -12212,18 +12276,12 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                 view->gate.data && view->gate.scales &&
                 view->up.data && view->up.scales &&
                 view->down.data && view->down.scales &&
-                dsv4_cuda_tensor_refill_fp4(
-                    cache->entries[found].gate, (const uint8_t *)view->gate.data,
-                    (const uint8_t *)view->gate.scales, (int)view->gate.rows,
-                    (int)view->gate.columns, 0) &&
-                dsv4_cuda_tensor_refill_fp4(
-                    cache->entries[found].up, (const uint8_t *)view->up.data,
-                    (const uint8_t *)view->up.scales, (int)view->up.rows,
-                    (int)view->up.columns, 0) &&
-                dsv4_cuda_tensor_refill_fp4(
-                    cache->entries[found].down, (const uint8_t *)view->down.data,
-                    (const uint8_t *)view->down.scales, (int)view->down.rows,
-                    (int)view->down.columns, sync)) {
+                (sync == 0 && coli_v4_copy_worker_enabled()
+                     ? v4_fp4_post3(cache->device, cache->entries[found].gate,
+                                    cache->entries[found].up, cache->entries[found].down, view)
+                     : v4_fp4_refill3(cache->device, cache->entries[found].gate,
+                                      cache->entries[found].up, cache->entries[found].down,
+                                      view, sync))) {
                 cache->entries[found].layer = view->key.layer;
                 cache->entries[found].expert = view->key.expert;
                 cache->entries[found].clock = ++cache->clock;
@@ -12233,6 +12291,8 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                 pthread_mutex_unlock(&cache->mutex);
                 return 0;
             }
+            /* an earlier posted refill of this slot may still be queued */
+            (void)dsv4_cuda_copy_drain(cache->device);
             if (cache->entries[found].gate)
                 dsv4_cuda_tensor_free(cache->entries[found].gate);
             if (cache->entries[found].up)
@@ -12328,6 +12388,8 @@ extern int dsv4_cuda_stream_drain(int device);
 int coli_v4_gpu_expert_drain(ColiExpertStore *store) {
     if (!store || !store->gpu) return 0;
     V4GpuExpertMirrorCache *cache = (V4GpuExpertMirrorCache *)store->gpu;
+    /* posted copy-worker refills read host slabs: drain them before any release */
+    if (!dsv4_cuda_copy_drain(cache->device)) return -1;
     return dsv4_cuda_stream_drain(cache->device) ? 0 : -1;
 }
 
