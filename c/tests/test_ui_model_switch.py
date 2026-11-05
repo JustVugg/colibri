@@ -165,7 +165,9 @@ class ModelSwitchTests(unittest.TestCase):
         self.owned[process.pid] = process
         if fail:
             return process, None
-        self.assertTrue(select.select([process.stdout], [], [], 3)[0], 'fixture did not bind its port')
+        # 30 s: a loaded runner's cold interpreter took more than 3 (macOS, the suite's other jobs
+        # beside it); select returns as soon as the port is written
+        self.assertTrue(select.select([process.stdout], [], [], 30)[0], 'fixture did not bind its port')
         line = process.stdout.readline()
         self.assertTrue(line, 'owned HTTP stand-in exited without a port')
         return process, int(line)
