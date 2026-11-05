@@ -112,6 +112,15 @@ def to_chat(body):
         chat["tool_choice"] = {"type": "function", "function": {"name": choice["name"]}}
     if body.get("parallel_tool_calls") is not None:
         chat["parallel_tool_calls"] = bool(body["parallel_tool_calls"])
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning.get("effort") is not None:
+        chat["reasoning_effort"] = reasoning["effort"]
+    text = body.get("text")
+    fmt = text.get("format") if isinstance(text, dict) else None
+    if fmt is not None:
+        chat["response_format"] = ({"type": "json_schema", "json_schema": {
+            k: v for k, v in fmt.items() if k != "type"}}
+            if isinstance(fmt, dict) and fmt.get("type") == "json_schema" else fmt)
     for a, b in (("max_output_tokens", "max_tokens"), ("temperature", "temperature"), ("top_p", "top_p")):
         if body.get(a) is not None:
             chat[b] = body[a]
