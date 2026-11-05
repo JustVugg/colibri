@@ -893,8 +893,9 @@ class Puller:
                                      stderr=subprocess.STDOUT, cwd=os.path.dirname(os.path.abspath(self.coli)))
             last = None
             out_tail = []
-            threading.Thread(target=lambda: [out_tail.append(l) for l in iter(child.stdout.readline, b"")],
-                             daemon=True).start()
+            reader = threading.Thread(target=lambda: [out_tail.append(l) for l in iter(child.stdout.readline, b"")],
+                                      daemon=True)
+            reader.start()
             while child.poll() is None:
                 time.sleep(0.2)
                 try:
@@ -909,6 +910,8 @@ class Puller:
                         emit(line); last = line
                 elif st.get("phase") in ("build", "starting", "ready") and last != st.get("phase"):
                     emit({"status": f"{st.get('phase')}"}); last = st.get("phase")
+            reader.join(timeout=5)
+            child.stdout.close()
             if child.returncode != 0:
                 tail = b"".join(out_tail[-12:]).decode("utf-8", "replace").strip()
                 raise GatewayError(500, f"coli setup failed ({child.returncode}): {tail[-800:]}")
