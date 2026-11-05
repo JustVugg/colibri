@@ -146,7 +146,7 @@ class InstalledRuntime(unittest.TestCase):
                      "--port", str(port), "--backend", "http://192.0.2.1:8000"],
                     cwd=root, env=env, stdout=log, stderr=log, start_new_session=True)
                 try:
-                    # Cold Python startup on the macOS runner can be slow.
+                    # Allow for slow UI startup on shared CI runners.
                     # A loopback check must also ignore any inherited proxy.
                     deadline = time.monotonic() + 60
                     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))

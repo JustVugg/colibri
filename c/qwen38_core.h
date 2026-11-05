@@ -1496,6 +1496,8 @@ static void q38_load_ple(Model *m,Layer *l) {
                      (kv->atype==GGUF_T_I64||kv->atype==GGUF_T_U64),"GGUF: %s missing or not %d 64-bit integers",keys[b],counts[b]);
             memcpy(dsts[b],kv->arr,(size_t)counts[b]*8);
         }
+        Q38_NEED(!gguf_find(&g_q38gg,"per_layer_token_embd.scale"),
+                 "GGUF carries per_layer_token_embd.scale; the PLE reader applies no weight scale");
         const gguf_tensor *t=gguf_mark(&g_q38gg,"per_layer_token_embd.weight");
         Q38_NEED(t&&t->ne[0]==c->ngram_head_dim&&t->ne[2]*t->ne[3]==1,"GGUF: per_layer_token_embd missing or not rows of %d",c->ngram_head_dim);
         m->ple_gg=t; m->ple_part_count=1; m->ple_part_start[0]=0; m->ple_part_start[1]=t->ne[1];

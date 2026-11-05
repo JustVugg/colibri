@@ -35,6 +35,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1039,7 +1040,7 @@ class Cancelled(BaseException):
 
 
 def new_job(kind, title, **kw):
-    jid = "%x" % int(time.time() * 1000)
+    jid = uuid.uuid4().hex
     job = {"id": jid, "kind": kind, "title": title, "state": "queued", "done": 0, "total": 0, "rate": 0, "eta": None,
            "msg": "", "started": time.time(), "cancel": False, **kw}
     with _jlock:
@@ -1071,11 +1072,15 @@ def run_download(job, repo, revision, files, dest, after=None):
                 raise Cancelled()
             now = time.time()
             job["done"], job["file"] = ev["done"], ev["file"]
+            # `done` includes bytes already on disk. `fresh` is this run only,
+            # so a resume does not report the whole model as one second of speed.
+            fresh = ev.get("fresh", ev["done"])
             if now - mark[0] >= 1.0:
-                rate = (ev["done"] - mark[1]) / (now - mark[0])
+                gained = max(0, fresh - mark[1])
+                rate = gained / (now - mark[0])
                 job["rate"] = rate if not job["rate"] else 0.7 * job["rate"] + 0.3 * rate
                 job["eta"] = (total - ev["done"]) / job["rate"] if job["rate"] > 0 else None
-                mark[0], mark[1] = now, ev["done"]
+                mark[0], mark[1] = now, fresh
         setup_download.download_repo(repo, revision, dest, files, token=setup_download.hf_token(), progress=progress)
         job["done"] = total
         if after:
@@ -1158,7 +1163,11 @@ def stop_gateway(p, job):
     job.update(state="stopping", msg="fermo il server attuale")
     os.kill(p["pid"], signal.SIGTERM)
     for _ in range(60):
-        if not os.path.exists("/proc/%d" % p["pid"]):
+        try:
+            reaped, _ = os.waitpid(p["pid"], os.WNOHANG)
+        except ChildProcessError:
+            reaped = 0
+        if reaped == p["pid"] or not os.path.exists("/proc/%d" % p["pid"]):
             break
         time.sleep(1)
     else:
@@ -1206,27 +1215,35 @@ def switch_model(path, force=False, tier=None):
     folder and environment) with --model changed; `tier` ram or gpu also turns the GPU off or
     on. A model that does not start brings the previous one back."""
     path = os.path.realpath(path)
-    if not os.path.isdir(path) or not under_roots(path):
+    if not os.path.isdir(path):
         raise ValueError("cartella del modello non valida")
-    old = gateway_proc()
-    answering = False
-    try:
-        gw_json("/health", timeout=3)
-        answering = True
-    except urllib.error.HTTPError:
-        answering = True
-    except (OSError, ValueError):
-        pass
-    if answering and old and not old["coli"]:
-        raise RuntimeError("la porta %d è di un altro processo (%d): non lo tocco" % (CFG.port, old["pid"]))
-    if answering and not old:
-        raise RuntimeError("non trovo il processo di coli serve sulla porta %d su questa macchina: fermalo e "
-                           "riavvialo con coli serve --model %s" % (CFG.port, path))
-    if answering and not force and not gw_idle():
-        raise RuntimeError("il motore sta rispondendo a una richiesta: riprova quando ha finito")
     if not _switching.acquire(blocking=False):
         raise RuntimeError("sto già cambiando modello: aspetta che finisca")
-    job = new_job("switch", os.path.basename(path), dest=path)
+    try:
+        # The current gateway and its health must belong to this admitted
+        # operation, not a snapshot from before another switch completed.
+        if not under_roots(path):
+            raise ValueError("cartella del modello non valida")
+        old = gateway_proc()
+        answering = False
+        try:
+            gw_json("/health", timeout=3)
+            answering = True
+        except urllib.error.HTTPError:
+            answering = True
+        except (OSError, ValueError):
+            pass
+        if answering and old and not old["coli"]:
+            raise RuntimeError("la porta %d è di un altro processo (%d): non lo tocco" % (CFG.port, old["pid"]))
+        if answering and not old:
+            raise RuntimeError("non trovo il processo di coli serve sulla porta %d su questa macchina: fermalo e "
+                               "riavvialo con coli serve --model %s" % (CFG.port, path))
+        if answering and not force and not gw_idle():
+            raise RuntimeError("il motore sta rispondendo a una richiesta: riprova quando ha finito")
+        job = new_job("switch", os.path.basename(path), dest=path)
+    except BaseException:
+        _switching.release()
+        raise
 
     def go():
         try:
@@ -1288,7 +1305,12 @@ def switch_model(path, force=False, tier=None):
             job.update(state="error", msg=str(e)[:400])
         finally:
             _switching.release()
-    threading.Thread(target=go, daemon=True).start()
+    try:
+        threading.Thread(target=go, daemon=True).start()
+    except BaseException as error:
+        job.update(state="error", msg=str(error)[:400])
+        _switching.release()
+        raise
     return job
 
 

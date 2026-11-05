@@ -1775,13 +1775,30 @@ def download_model(ui, entry, model_dir, *, via_windows="auto", verify=True, ext
     if have:
         ui.say(f"  resuming: {human_size(have)} of {human_size(total)} already here")
     started = time.time()
-    first = {"done": None}
+    # (time, bytes received this run). `done` counts everything on disk, so the
+    # percentage stays the fraction of the model that is here. Speed uses
+    # `fresh` only: a resume checks the files already present before any new
+    # bytes arrive, and those bytes are not transfer speed. While that check
+    # reports fresh == 0 the window slides forward, so its time is not part of
+    # the rate either.
+    samples = [(started, 0)]
+    window = 10.0
 
     def progress(event):
-        if first["done"] is None:
-            first["done"] = event["done"]
-        elapsed = max(time.time() - started, 1e-3)
-        rate = (event["done"] - first["done"]) / elapsed
+        now = time.time()
+        fresh = max(0, event.get("fresh", 0))
+        if fresh < samples[-1][1]:
+            samples[:] = [(now, fresh)]
+        elif fresh == 0:
+            samples[:] = [(now, 0)]
+        else:
+            samples.append((now, fresh))
+            cutoff = now - window
+            while len(samples) > 2 and samples[1][0] <= cutoff:
+                samples.pop(0)
+        span = samples[-1][0] - samples[0][0]
+        gained = samples[-1][1] - samples[0][1]
+        rate = gained / span if span >= 0.5 and gained > 0 else 0.0
         eta = (event["total"] - event["done"]) / rate if rate > 0 else None
         pct = 100.0 * event["done"] / event["total"] if event["total"] else 100.0
         width = 24

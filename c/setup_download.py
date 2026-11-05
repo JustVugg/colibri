@@ -195,8 +195,9 @@ def _content_range_start(value):
 def download_file(url, dest, spec, *, token=None, progress=None, opener=None,
                   retries=5, timeout=60, verify=True, backoff=(1, 2, 4, 8, 15)):
     """Fetch one file to `dest`, resuming `dest.part`. Returns "present" when it
-    was already complete, "downloaded" otherwise. `progress(done, total)` is
-    called as bytes land."""
+    was already complete, "downloaded" otherwise. `progress(done, total, fresh)`
+    is called as bytes land: `done` is the file offset, `fresh` is how many of
+    those bytes were received in this call (the prefix already on disk is not)."""
     opener = opener or urllib.request.urlopen
     size = int(spec["size"])
     if (os.path.exists(dest) and os.path.getsize(dest) == size
@@ -211,6 +212,7 @@ def download_file(url, dest, spec, *, token=None, progress=None, opener=None,
     if size == 0:
         with open(part, "wb"):
             pass
+    kept = have
     hasher, expected = _hasher(spec) if verify else (None, None)
     if hasher is not None and have:
         _feed_prefix(hasher, part, have)
@@ -232,6 +234,7 @@ def download_file(url, dest, spec, *, token=None, progress=None, opener=None,
                 elif have:
                     # 200 to a ranged request: the server sent the whole file.
                     have = 0
+                    kept = 0
                     hasher, expected = _hasher(spec) if verify else (None, None)
                 with open(part, "ab" if have else "wb") as out:
                     while True:
@@ -243,7 +246,7 @@ def download_file(url, dest, spec, *, token=None, progress=None, opener=None,
                             hasher.update(block)
                         have += len(block)
                         if progress:
-                            progress(have, size)
+                            progress(have, size, max(0, have - kept))
                         if have > size:
                             break
             if have < size:
@@ -369,11 +372,18 @@ def download_file_windows(url, dest, spec, curl, *, token=None, progress=None, v
         return "present"
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
     part = dest + ".part"
-    if os.path.exists(part) and os.path.getsize(part) > size:
+    prefix = os.path.getsize(part) if os.path.exists(part) else 0
+    if prefix > size:
         os.remove(part)
+        prefix = 0
     if size == 0:
         with open(part, "wb"):
             pass
+
+    def report(got):
+        if progress:
+            progress(got, size, max(0, got - prefix))
+
     if not (os.path.exists(part) and os.path.getsize(part) == size):
         target = wsl_windows_path(part)
         if not target:
@@ -386,15 +396,15 @@ def download_file_windows(url, dest, spec, curl, *, token=None, progress=None, v
                 subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=errors) as process:
             while process.poll() is None:
                 time.sleep(1.0)
-                if progress and os.path.exists(part):
-                    progress(os.path.getsize(part), size)
+                if os.path.exists(part):
+                    report(os.path.getsize(part))
             errors.seek(0)
             err = errors.read()
         if process.returncode != 0 and not (os.path.exists(part) and os.path.getsize(part) == size):
             raise DownloadError(f"curl.exe failed ({process.returncode}): {err.strip()[:200]} "
                                 "(rerun to continue)")
-    if progress:
-        progress(os.path.getsize(part), size)
+    if os.path.exists(part):
+        report(os.path.getsize(part))
     if os.path.getsize(part) != size or (verify and not verify_file(part, spec)):
         os.remove(part)
         raise DownloadError(f"{os.path.basename(dest)}: size or checksum mismatch after curl.exe; "
@@ -473,8 +483,11 @@ def download_repo(repo, revision, model_dir, files, *, token=None, progress=None
                   base=None, opener=None, curl=None, retries=5, verify=True, extra_dirs=()):
     """Every listed file into model_dir, small files first (so config.json and the
     tokenizer are there early), then the shards by size. `progress(event)` gets
-    dicts with file, file_done, file_total, done, total. A shard already whole in
-    one of extra_dirs (a model split across drives) is not fetched again."""
+    dicts with file, file_done, file_total, done, total, and fresh. `done` is the
+    bytes of the model already accounted for, including files that were here
+    before this call; `fresh` is only what the network delivered this call.
+    A shard already whole in one of extra_dirs (a model split across drives) is
+    not fetched again."""
     os.makedirs(model_dir, exist_ok=True)
     files = sorted(files, key=lambda spec: (spec["size"] > (64 << 20), spec["size"], spec["path"]))
     manifest = {"repo": repo, "revision": revision, "complete": False,
@@ -482,21 +495,37 @@ def download_repo(repo, revision, model_dir, files, *, token=None, progress=None
     _write_manifest(model_dir, manifest)
     total = sum(int(s["size"]) for s in files)
     done_before = 0
+    session_before = 0
     for spec in files:
         dest = safe_join(model_dir, spec["path"])
+        size = int(spec["size"])
+        part = dest + ".part"
+        located = locate(model_dir, spec, extra_dirs)
+        if located:
+            kept = size
+        elif os.path.exists(part):
+            kept = min(os.path.getsize(part), size)
+        else:
+            kept = 0
+        reported = {"fresh": None}
 
-        def on_bytes(have, size, _spec=spec, _base=done_before):
+        def on_bytes(have, size, fresh=None, _spec=spec, _base=done_before,
+                     _session=session_before, _kept=kept, _reported=reported):
+            if fresh is None:
+                fresh = _reported["fresh"] if _reported["fresh"] is not None else max(0, have - _kept)
+            else:
+                _reported["fresh"] = fresh
             if progress:
                 progress({"file": _spec["path"], "file_done": have, "file_total": size,
-                          "done": _base + have, "total": total})
+                          "done": _base + have, "total": total, "fresh": _session + fresh})
 
-        found = locate(model_dir, spec, extra_dirs) if extra_dirs else None
+        found = located if extra_dirs else None
         if found and found != dest:
             if verify and not verify_file(found, spec):
                 raise DownloadError(f"{found}: checksum mismatch for the requested revision; "
                                     "replace the shard on the split drive and rerun")
-            done_before += int(spec["size"])
-            on_bytes(int(spec["size"]), int(spec["size"]))
+            done_before += size
+            on_bytes(size, size, 0)
             continue
         url = file_url(repo, revision, spec["path"], base)
         if curl:
@@ -504,8 +533,10 @@ def download_repo(repo, revision, model_dir, files, *, token=None, progress=None
         else:
             download_file(url, dest, spec, token=token, progress=on_bytes, opener=opener,
                           retries=retries, verify=verify)
-        done_before += int(spec["size"])
-        on_bytes(int(spec["size"]), int(spec["size"]))
+        gained = reported["fresh"] if reported["fresh"] is not None else max(0, size - kept)
+        session_before += gained
+        done_before += size
+        on_bytes(size, size, gained)
     manifest["complete"] = True
     manifest["completed"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     _write_manifest(model_dir, manifest)

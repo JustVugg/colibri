@@ -1798,6 +1798,10 @@ memInfo.free:                     23.50 GB (97%)
         text = format_plan(plan)
         self.assertIn("next actions:", text)
         self.assertIn("coli tune --model <model>", text)
+        action = plan["next_actions"][0]
+        self.assertIn('iobench "<model-shard>" 19 64 8 1', action["command"])
+        self.assertIn(action["command"], text)
+        self.assertIn("existing model weight file of at least 38 MiB", text)
 
     def test_trusted_storage_probe_removes_probe_action(self):
         info = analyze_model(self.model)
