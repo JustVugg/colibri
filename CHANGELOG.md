@@ -38,6 +38,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   RTX PRO 4000. The frame's copies now go in one `host_up_n` call (`cudaMemcpyBatchAsync` from CUDA
   12.8, else a copy at a time) with one wait for the frame and one ticket: 303 -> 87 us of runtime
   calls in that gap. `COLI_CUDA_UP_BATCH=0`: a `cudaMemcpyAsync` a copy, still one ticket.
+- **qwen36: a retry, an edited answer and a client gone mid-prompt no longer read the whole
+  conversation again** (#2589). Three of every four layers are DeltaNet, whose recurrence
+  cannot step back, so a request that does not extend the held state started from its first
+  token: a retry of a cancelled reply (the state holds the reply's first tokens too), a last
+  answer edited or rendered otherwise, a prompt a client left while it was read (the engine
+  zeroed everything). qwen36 now keeps the state its last chat prompt read to its end left, as
+  qwen38 does (`COLI_PROMPT_SNAPSHOT`, `KV_SLOTS=1`): the retry reads nothing, the edited
+  answer reads from the last prompt's end, the stopped read keeps that end for the next request.
 - **CUDA decode: a selection list's attention split over its positions, int8 rows four outputs a
   warp.** A decode step's or a verify's rows with a selection list per row (Qwen3.8's QSA) went
   through one block per (head, row) walking every selected position; they now take the blocks
