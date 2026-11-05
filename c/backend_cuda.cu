@@ -3565,7 +3565,9 @@ static int hcm_type(int fmt, int I) {
     int tt = fmt - 100;
     if (tt == 8 || tt == 1 || tt == 30) return I % 32 ? 0 : tt;   /* Q8_0, F16, BF16 */
     if (tt == 12 || tt == 13 || tt == 14 || tt == 21 || tt == 22 || tt == 23) return I % 256 ? 0 : tt;   /* 22 IQ2_S: the routed experts' only (hcm_moe) */
+    if (tt == 16 || tt == 17 || tt == 18) return I % 256 ? 0 : tt;   /* IQ2_XXS, IQ2_XS, IQ3_XXS: the routed experts' only */
     if (tt == 20) return I % 32 ? 0 : tt;   /* IQ4_NL */
+    if (tt == 6 || tt == 7) return I % 32 ? 0 : tt;   /* Q5_0, Q5_1: the routed experts' only */
     if (tt == 42) return I % 64 ? 0 : tt;   /* Q2_0: the routed experts' only */
     return 0;
 }
@@ -3660,6 +3662,22 @@ __device__ __forceinline__ void hcm_fetch(HcmRaw &w, const bd_u32 *__restrict__ 
     } else if (T == 42) {   /* Q2_0: the scale, the 16 weights' four bytes of 2-bit codes (two words where they straddle) */
         bd_u32 b = e0 >> 6, base = b * 18u, o = base + 2u + ((e0 & 63u) >> 2);
         w.r[0] = __ldg(W + (base >> 2)); w.r[1] = __ldg(W + (o >> 2)); w.r[2] = (o & 2u) ? __ldg(W + (o >> 2) + 1u) : 0u;
+    } else if (T == 16) {   /* IQ2_XXS: the scale, the sub-block's 8 bytes (four grid indices, then four ksigns indices and its scale) */
+        bd_u32 b = e0 >> 8, base = b * 66u, o = base + 2u + 8u * ((e0 & 255u) >> 5);
+        w.r[0] = __ldg(W + (base >> 2)); w.r[1] = __ldg(W + (o >> 2)); w.r[2] = __ldg(W + (o >> 2) + 1u);
+        w.r[3] = (o & 2u) ? __ldg(W + (o >> 2) + 2u) : 0u;
+    } else if (T == 17) {   /* IQ2_XS: the scale, the two chunks' 16-bit grid and ksigns indices, their scale byte */
+        bd_u32 b = e0 >> 8, e = e0 & 255u, base = b * 74u, o = base + 2u + 2u * (e >> 3), oc = base + 66u + (e >> 5);
+        w.r[0] = __ldg(W + (base >> 2)); w.r[1] = __ldg(W + (o >> 2)); w.r[2] = (o & 2u) ? __ldg(W + (o >> 2) + 1u) : 0u;
+        w.r[3] = __ldg(W + (oc >> 2));
+    } else if (T == 18) {   /* IQ3_XXS: the scale, the chunks' four grid indices, the sub-block's word of ksigns indices and scale */
+        bd_u32 b = e0 >> 8, e = e0 & 255u, ib = e >> 5, base = b * 98u, o = base + 2u + 8u * ib + 2u * ((e & 31u) >> 3), oa = base + 66u + 4u * ib;
+        w.r[0] = __ldg(W + (base >> 2)); w.r[1] = __ldg(W + (o >> 2)); w.r[2] = (o & 2u) ? __ldg(W + (o >> 2) + 1u) : 0u;
+        w.r[3] = __ldg(W + (oa >> 2)); w.r[4] = (oa & 2u) ? __ldg(W + (oa >> 2) + 1u) : 0u;
+    } else if (T == 6 || T == 7) {   /* Q5_0, Q5_1: the block's 16 bytes of nibbles (words around them), its scale (and min), its high bits */
+        bd_u32 b = e0 >> 5, base = b * (T == 6 ? 22u : 24u), oh = base + (T == 6 ? 2u : 4u);
+        hcm_ld5(W, oh + 4u, w.r);
+        w.r[5] = __ldg(W + (base >> 2)); w.r[6] = __ldg(W + (oh >> 2)); w.r[7] = (oh & 2u) ? __ldg(W + (oh >> 2) + 1u) : 0u;
     } else {   /* Q8_0 */
         bd_u32 b = e0 >> 5, base = b * 34u;
         hcm_ld5(W, base + 2u + 16u * ((e0 >> 4) & 1u), w.r);
@@ -3711,6 +3729,58 @@ __device__ __forceinline__ void hcm_dec(const HcmRaw &w, bd_u32 e0, bd_u32 *out,
         for (int l = 0; l < 4; l++) {
             bd_u32 idx = ((i4 >> (8 * l)) & 255u) | (((hb >> l) & 1u) << 8);
             bd_codes_h(bdi_neg(__ldg(tab + BDT_IQ3S + idx), sg >> (4 * l)) ^ 0x80808080u, off, s2, z2, out + 2 * l);
+        }
+        return;
+    }
+    if (T == 16 || T == 17) {   /* IQ2_XXS, IQ2_XS: two chunks of 8, each a grid row with its ksigns, times d (0.5 + s) / 4 */
+        bd_u32 b = e0 >> 8, e = e0 & 255u, base = b * (T == 16 ? 66u : 74u), q, sc, l0;
+        if (T == 16) {   /* the sub-block's grid indices (a byte each) and its word of four 7-bit ksigns indices, the scale on top */
+            bd_u32 o = base + 2u + 8u * (e >> 5);
+            q = __funnelshift_r(w.r[1], w.r[2], (o & 2u) * 8u); sc = __funnelshift_r(w.r[2], w.r[3], (o & 2u) * 8u);
+            l0 = (e & 31u) >> 3;
+        } else {         /* the two chunks' 16-bit words (a 9-bit grid index, a 7-bit ksigns index), the scale nibble */
+            bd_u32 o = base + 2u + 2u * (e >> 3), oc = base + 66u + (e >> 5);
+            q = __funnelshift_r(w.r[1], w.r[2], (o & 2u) * 8u); sc = w.r[3] >> ((oc & 3u) * 8u + 4u * ((e >> 4) & 1u));
+            l0 = 0u;
+        }
+        float d = bd_h2f(w.r[0] >> ((base & 2u) * 8u)) * (0.5f + (float)(T == 16 ? sc >> 28 : sc & 15u)) * 0.25f;
+        __half2 off = __float2half2_rn(1152.f), s2 = __float2half2_rn(d), z2 = __float2half2_rn(0.f);
+        #pragma unroll
+        for (int ll = 0; ll < 2; ll++) {
+            bd_u32 l = l0 + (bd_u32)ll, gi, si;
+            if (T == 16) { gi = BDT_IQ2XXS / 2u + ((q >> (8u * l)) & 255u); si = (sc >> (7u * l)) & 127u; }
+            else { bd_u32 qv = (q >> (16 * ll)) & 0xffffu; gi = BDT_IQ2XS / 2u + (qv & 511u); si = qv >> 9; }
+            const uint2 gr = __ldg(reinterpret_cast<const uint2 *>(tab) + gi);   /* the row in one load */
+            const bd_u32 sg = __ldg(tab + BDT_KSIGNS + si);
+            bd_codes_h(bdi_neg(gr.x, sg) ^ 0x80808080u, off, s2, z2, out + 4 * ll);
+            bd_codes_h(bdi_neg(gr.y, sg >> 4) ^ 0x80808080u, off, s2, z2, out + 4 * ll + 2);
+        }
+        return;
+    }
+    if (T == 18) {   /* IQ3_XXS: two chunks of 8, each two grid rows of 4 with its ksigns, times d (0.5 + s) / 2 */
+        bd_u32 b = e0 >> 8, e = e0 & 255u, ib = e >> 5, l0 = (e & 31u) >> 3, base = b * 98u;
+        bd_u32 o = base + 2u + 8u * ib + 2u * l0, oa = base + 66u + 4u * ib;
+        bd_u32 qw = __funnelshift_r(w.r[1], w.r[2], (o & 2u) * 8u), a = __funnelshift_r(w.r[3], w.r[4], (oa & 2u) * 8u);
+        float d = bd_h2f(w.r[0] >> ((base & 2u) * 8u)) * (0.5f + (float)(a >> 28)) * 0.5f;
+        __half2 off = __float2half2_rn(1152.f), s2 = __float2half2_rn(d), z2 = __float2half2_rn(0.f);
+        #pragma unroll
+        for (int ll = 0; ll < 2; ll++) {
+            const bd_u32 l = l0 + (bd_u32)ll, sg = __ldg(tab + BDT_KSIGNS + ((a >> (7u * l)) & 127u));
+            const bd_u32 g0 = __ldg(tab + BDT_IQ3XXS + ((qw >> (16 * ll)) & 255u)), g1 = __ldg(tab + BDT_IQ3XXS + ((qw >> (16 * ll + 8)) & 255u));
+            bd_codes_h(bdi_neg(g0, sg) ^ 0x80808080u, off, s2, z2, out + 4 * ll);
+            bd_codes_h(bdi_neg(g1, sg >> 4) ^ 0x80808080u, off, s2, z2, out + 4 * ll + 2);
+        }
+        return;
+    }
+    if (T == 6 || T == 7) {   /* Q5_0, Q5_1: a nibble and a high bit each, less 16 then times d (Q5_0), times d plus m (Q5_1) */
+        bd_u32 b = e0 >> 5, base = b * (T == 6 ? 22u : 24u), oh = base + (T == 6 ? 2u : 4u), o = oh + 4u, hf = (e0 >> 4) & 1u;
+        bd_u32 qh = __funnelshift_r(w.r[6], w.r[7], (oh & 2u) * 8u) >> (16u * hf), dm = w.r[5] >> ((base & 2u) * 8u);
+        __half2 off = __float2half2_rn(T == 6 ? 1040.f : 1024.f), s2 = __float2half2_rn(bd_h2f(dm)),
+                m2 = __float2half2_rn(T == 6 ? 0.f : bd_h2f(dm >> 16));
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            bd_u32 h4 = (qh >> (4u * k)) & 15u, hb = ((h4 & 1u) << 4) | ((h4 & 2u) << 11) | ((h4 & 4u) << 18) | ((h4 & 8u) << 25);
+            bd_codes_h(((__funnelshift_r(w.r[k], w.r[k + 1], (o & 2u) * 8u) >> (4u * hf)) & 0x0F0F0F0Fu) | hb, off, s2, m2, out + 2 * k);
         }
         return;
     }
@@ -4009,7 +4079,7 @@ static int hcm_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float
         e = getenv("COLI_CUDA_HCM_SPLIT"); fsplit = e ? atoi(e) : 0;    /* this split always */
     }
     int tt = hcm_type(t->fmt, t->I);
-    if (tt == 22 || tt == 42) tt = 0;   /* the routed experts' types (hcm_moe): hcm_launch has no dense tiles of them */
+    if (tt == 22 || tt == 42 || tt == 16 || tt == 17 || tt == 18 || tt == 6 || tt == 7) tt = 0;   /* the routed experts' types (hcm_moe): hcm_launch has no dense tiles of them */
     if (tt == 21 && !bd_table(ctx)) tt = 0;   /* IQ3_S's grid: the decoders' table */
     if (!on || !tt || ctx->compute_major < 8 || S <= BD_GEMV_MAX_S) return 0;
     const int I = t->I, O = t->O, glu = tu != nullptr, OB = glu ? 2 * O : O;   /* OB: the blocks' weight rows */
@@ -5025,7 +5095,8 @@ static int hcm_moe(DeviceContext *ctx, const CcExpert *tab, const float *x, floa
     const int fd = p->fmt_d ? p->fmt_d : p->fmt, tg = hcm_type(p->fmt, p->D), td = hcm_type(fd, p->I);
     if (!on || !ctx || ctx->compute_major < 8 || !tg || !td || p->D % 4 || p->I % 4 || p->x_row % 4) return 0;
     if (tg == 1 || tg == 30 || td == 1 || td == 30) return 0;   /* 16-bit experts: hcg's tiles (HCM_MOE's types below) */
-    if ((tg == 22 || td == 22 || tg == 21 || td == 21) && !btab) return 0;   /* IQ2_S and IQ3_S read their grids from the decoders' table */
+    if ((tg == 22 || td == 22 || tg == 21 || td == 21 || tg == 16 || td == 16 || tg == 17 || td == 17 || tg == 18 || td == 18) && !btab)
+        return 0;   /* IQ2_S, IQ3_S, IQ2_XXS, IQ2_XS and IQ3_XXS read their grids (and ksigns) from the decoders' table */
     const size_t rbg = bd_file_row_bytes(p->fmt, p->D), rbd = bd_file_row_bytes(fd, p->I);
     if (!rbg || !rbd || rbg % 4 || rbd % 4) return 0;
     const size_t A = (size_t)p->S * p->K, nx = (size_t)p->S * p->D, nh = A * p->I;
@@ -5040,7 +5111,9 @@ static int hcm_moe(DeviceContext *ctx, const CcExpert *tab, const float *x, floa
         case 8: coli_launch(K_<8>, __VA_ARGS__); break;   case 12: coli_launch(K_<12>, __VA_ARGS__); break; \
         case 13: coli_launch(K_<13>, __VA_ARGS__); break; case 22: coli_launch(K_<22>, __VA_ARGS__); break; \
         case 23: coli_launch(K_<23>, __VA_ARGS__); break; case 20: coli_launch(K_<20>, __VA_ARGS__); break; \
-        case 21: coli_launch(K_<21>, __VA_ARGS__); break; \
+        case 21: coli_launch(K_<21>, __VA_ARGS__); break; case 16: coli_launch(K_<16>, __VA_ARGS__); break; \
+        case 17: coli_launch(K_<17>, __VA_ARGS__); break; case 6: coli_launch(K_<6>, __VA_ARGS__); break; \
+        case 7: coli_launch(K_<7>, __VA_ARGS__); break; case 18: coli_launch(K_<18>, __VA_ARGS__); break; \
         case 42: coli_launch(K_<42>, __VA_ARGS__); break; default: coli_launch(K_<14>, __VA_ARGS__); break; } } while (0)
     HCM_MOE(hcm_moe_gu_k, tg, gg, 256, HcmTile<64, 128>::SMEM, st, tab, (const __half *)xh, hid, m, *p, rwg, btab);
     long long h4 = (long long)(nh / 4);

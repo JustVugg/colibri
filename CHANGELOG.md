@@ -37,6 +37,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **CUDA: a prompt's IQ2_XXS, IQ2_XS, IQ3_XXS, Q5_0 and Q5_1 routed experts on the mma.sync
+  tiles.** A layer whose gate or down type had no decoder in the f16 tiles fell back to hcg_tile's
+  for its prompt chunks. unsloth's Dynamic V3.1 Qwen3.8 files put IQ2_XXS or IQ2_XS gates on up to
+  36 of their 48 layers (UD-IQ1_S), IQ3_XXS gates on up to 38 (UD-Q3_K_XL) and Q5_0 downs on up to
+  33 (UD-IQ4_XS). UD-IQ1_M on an RTX PRO 4000: a 4220-token prompt 756-769 -> 837-839 tok/s.
 - **Qwen3.8: a long prompt layer by layer with the MTP head too** (CUDA and Vulkan chains). A prompt of
   several chunks runs layer by layer, each layer's host pool experts staged once for all its chunks, but
   not when the caller wanted the rows' final streams back, and the MTP head's prefill always does: with

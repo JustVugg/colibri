@@ -43,7 +43,11 @@ static void bd_fix(int t, uint8_t *b) {
 #define F16AT(o) do { b[o] = 0x00; b[(o) + 1] = (uint8_t)(0x24 + rnd() % 3); } while (0)
     switch (t) {
     case 12: case 13: F16AT(0); F16AT(2); break;   /* Q4_K, Q5_K */
-    case 3: case 7: F16AT(0); F16AT(2); break;     /* Q4_1, Q5_1 */
+    case 3: F16AT(0); F16AT(2); break;             /* Q4_1 */
+    /* Q5_1: its min -16 d, as a quantizer sets it for a block about zero (its least weight). A random
+     * positive one made every weight of a block positive, and 40 rows of {Q5_1, Q5_1} through the f16
+     * tiles came 0.0195 off (0.0121 with the min's sign alone), through hcg's tiles and hcm's alike */
+    case 7: F16AT(0); b[2] = 0x00; b[3] = (uint8_t)(0x80 | (b[1] + 0x10)); break;
     case 10: F16AT(80); F16AT(82); break;          /* Q2_K */
     case 11: F16AT(108); break;                    /* Q3_K */
     case 14: F16AT(208); break;                    /* Q6_K */
@@ -490,9 +494,11 @@ int main(void) {
     printf("glu: %d types and shapes, gate and up of 1 to 4 rows in one pass, the bits of the two GEMVs and the SwiGLU\n", g_glu);
     /* the routed experts: the commonest pairs of the published files, one row and a verify's */
     /* {22, 6} and {12, 7}: unsloth's Dynamic V3.1 Qwen3.8 files, IQ2_S gate and up with a Q5_0 down (UD-IQ2_XS),
-     * Q4_K with Q5_1 (UD-Q4_K_XL) */
+     * Q4_K with Q5_1 (UD-Q4_K_XL); {16, 42}, {16, 20} and {17, 42}: their IQ2_XXS and IQ2_XS layers (UD-IQ1_M,
+     * UD-Q2_0, UD-IQ2_XS); {18, 20}, {18, 6} and {23, 6}: their IQ3_XXS and IQ4_XS layers (UD-Q2_K_XL, UD-IQ3_XXS,
+     * UD-Q3_K_XL, UD-IQ4_XS) */
     const int pairs[][2] = {{12, 14}, {16, 18}, {17, 17}, {22, 23}, {11, 13}, {10, 12}, {19, 29}, {21, 20}, {8, 8}, {42, 42}, {22, 42}, {22, 8},
-                            {22, 6}, {12, 7}, {6, 6}};
+                            {22, 6}, {12, 7}, {6, 6}, {16, 42}, {17, 42}, {16, 20}, {17, 16}, {7, 7}, {18, 20}, {18, 6}, {23, 6}};
     for (size_t i = 0; i < sizeof pairs / sizeof *pairs; i++) {
         check_moe(pairs[i][0], pairs[i][1], 1, 8, 16, 2048, 512);
         check_moe(pairs[i][0], pairs[i][1], 3, 8, 16, 1024, 768);
