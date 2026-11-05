@@ -253,23 +253,46 @@ static void qi_gemm_act8(float *Y, int ldy, const float *X, int ldx, int M, cons
         for (int k = K; k < Kp; k++) d[k] = 128;
     }
     const int nblocks = (N + QI_NR - 1) / QI_NR, mblocks = (M + QI_MC - 1) / QI_MC;
+    /* The packed panel depends on the weights only, so hoist it out of the
+     * m-loop when there are enough n-panels to keep every thread busy. A narrow
+     * N keeps the (n-panel, m-block) tiles, whose redundancy buys parallelism. */
+    int want = 1;
+#ifdef _OPENMP
+    want = omp_get_max_threads();
+#endif
     #pragma omp parallel
     {
         int8_t *panel = (int8_t *)malloc((size_t)Kp * QI_NR);
         int32_t wsum[QI_NR];
         if (!panel) { fprintf(stderr, "OOM qi_gemm_act8 panel\n"); exit(1); }
-        #pragma omp for schedule(dynamic, 1) collapse(2)
-        for (int nb = 0; nb < nblocks; nb++)
-            for (int mb = 0; mb < mblocks; mb++) {
+        if (nblocks >= 2 * want) {
+            #pragma omp for schedule(dynamic, 1)
+            for (int nb = 0; nb < nblocks; nb++) {
                 int n0 = nb * QI_NR, nr = N - n0 < QI_NR ? N - n0 : QI_NR;
-                int m0 = mb * QI_MC, mc = M - m0 < QI_MC ? M - m0 : QI_MC;
                 qi_pack_w8(panel, wsum, W, n0, nr, Kp);
-                for (int i = 0; i < mc; i += QI_MR) {
-                    int mr = mc - i < QI_MR ? mc - i : QI_MR;
-                    qi_kernel8(Y + (int64_t)(m0 + i) * ldy + n0, ldy, xq + (int64_t)(m0 + i) * Kp, Kp,
-                               panel, wsum, sx + m0 + i, W->sc + n0, mr, nr, bias ? bias + n0 : NULL);
+                for (int mb = 0; mb < mblocks; mb++) {
+                    int m0 = mb * QI_MC, mc = M - m0 < QI_MC ? M - m0 : QI_MC;
+                    for (int i = 0; i < mc; i += QI_MR) {
+                        int mr = mc - i < QI_MR ? mc - i : QI_MR;
+                        qi_kernel8(Y + (int64_t)(m0 + i) * ldy + n0, ldy, xq + (int64_t)(m0 + i) * Kp, Kp,
+                                   panel, wsum, sx + m0 + i, W->sc + n0, mr, nr, bias ? bias + n0 : NULL);
+                    }
                 }
             }
+        } else {
+            #pragma omp for schedule(dynamic, 1) collapse(2)
+            for (int nb = 0; nb < nblocks; nb++)
+                for (int mb = 0; mb < mblocks; mb++) {
+                    int n0 = nb * QI_NR, nr = N - n0 < QI_NR ? N - n0 : QI_NR;
+                    int m0 = mb * QI_MC, mc = M - m0 < QI_MC ? M - m0 : QI_MC;
+                    qi_pack_w8(panel, wsum, W, n0, nr, Kp);
+                    for (int i = 0; i < mc; i += QI_MR) {
+                        int mr = mc - i < QI_MR ? mc - i : QI_MR;
+                        qi_kernel8(Y + (int64_t)(m0 + i) * ldy + n0, ldy, xq + (int64_t)(m0 + i) * Kp, Kp,
+                                   panel, wsum, sx + m0 + i, W->sc + n0, mr, nr, bias ? bias + n0 : NULL);
+                    }
+                }
+        }
         free(panel);
     }
     free(xq); free(sx);

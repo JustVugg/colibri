@@ -25,6 +25,7 @@ import uuid
 import v4_dsml                      # vendored DeepSeek V4 DSML reference primitives
 import v41_dsml                     # ...and V4.1's, whose tag names differ by a space
 import image_engine                 # the qwenimage serve protocol, PNG and request rules
+import power                        # the machine's watts and each turn's joules, when joules is installed
 from family_registry import (FamilyConfigError, UnknownFamilyError, family_by_id,
                              display_for, family_ids, resolve_model)
 from family_registry import default_model_id as registry_default_model_id
@@ -2610,7 +2611,12 @@ def _muse_value(raw, schema):
         # the template writes None as `null`, and every string as is
         return None if raw == "null" and "null" in kinds else raw
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        # Python accepts NaN, Infinity and overflowing JSON exponents, also
+        # inside containers. Tool arguments must remain JSON; use the same
+        # text fallback as any other value that cannot be read as JSON.
+        json.dumps(parsed, allow_nan=False)
+        return parsed
     except ValueError:
         return raw
 
@@ -2834,6 +2840,17 @@ def render_chat_qwen3_coder(messages, tools=None, tool_choice=None, add_generati
             parts.append("<|im_start|>assistant")
             if text.strip():
                 parts.append("\n" + text.strip() + "\n")
+            # The template puts a blank line between the text and the first call, but the
+            # model does not always write one: Qwen3-Coder-30B-A3B often ends its text with a
+            # single newline and opens <tool_call> straight after. The reply's content keeps
+            # that newline, so a client that sends it back untrimmed is sending the turn as
+            # generated. Rendering the template's blank line instead makes the history differ
+            # from the engine's state by one token, and prefix reuse -- all or nothing --
+            # misses: the whole conversation is read again, every such turn (measured with
+            # COLI_PREFIX_LOG=1: held ".\n<tool_call>", rendered ".\n\n<tool_call>"; a
+            # 2,400-token agent turn went from ~5 s to ~100 s). A trimmed or blank-line content
+            # renders as the template does.
+            single = text.strip() and text.endswith("\n") and not text.endswith("\n\n")
             for position, call in enumerate(calls):
                 where = f"messages.{index}.tool_calls.{position}"
                 fn = call.get("function", call) if isinstance(call, dict) else None
@@ -2849,7 +2866,8 @@ def render_chat_qwen3_coder(messages, tools=None, tool_choice=None, add_generati
                 if not isinstance(args, dict):
                     raise APIError(400, "`function.arguments` must be a JSON object.",
                                    f"{where}.function.arguments")
-                parts.append(f"\n<tool_call>\n<function={fn['name']}>\n")
+                lead = "" if position == 0 and single else "\n"
+                parts.append(f"{lead}<tool_call>\n<function={fn['name']}>\n")
                 for key, value in args.items():
                     shown = (json.dumps(value, ensure_ascii=False)
                              if isinstance(value, (dict, list, tuple)) else _jinja_string(value))
@@ -7356,6 +7374,12 @@ class Engine:
                         turn["cluster_transfer_s"] = float(fields[10])
                         turn["cluster_tx_bytes"] = int(fields[11])
                         turn["cluster_rx_bytes"] = int(fields[12])
+                    try:   # what the devices used over the turn, once a page has asked for /power
+                        energy = power.energy_since(turn["wall_s"])
+                    except Exception:   # noqa: BLE001 - a meter that failed: the turn keeps its timings
+                        energy = None
+                    if energy is not None:
+                        turn["energy_j"] = round(energy, 1)
                     self.profile.append(turn)
                     self.profile_seq += 1
                 elif kind == "TIERS" and len(fields) >= 6:
@@ -8525,6 +8549,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 if self._is_authed() and eng:
                     payload["seq"] = getattr(eng, "profile_seq", 0)
                     payload["turns"] = list(getattr(eng, "profile", ()) or ())
+                self.send_json(200, payload, request_id)
+                return
+            if path == "/power":
+                # this machine's watts from joules, when it is installed (c/power.py); the
+                # first request starts the meters. Gated like /profile: it says how busy the box is.
+                payload = power.reading() if self._is_authed() else power._unavailable("unauthorized")
                 self.send_json(200, payload, request_id)
                 return
             if self.serve_static(path):
