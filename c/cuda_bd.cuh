@@ -7,12 +7,12 @@
  *     and code sums: IEEE division, rounding to nearest even), each 32-weight step decoded
  *     to int8 once and dotted with up to NR rows of x in packed 4 x 8 products (dp4a), per
  *     group dx * (sw * sum(w8 * xq) - mw * xs). The same integers and scales as the CPU's:
- *     the two differ only in the order of the float sums. Types 8 Q8_0, 10 Q2_K, 11 Q3_K,
- *     12 Q4_K, 13 Q5_K, 14 Q6_K, 16 IQ2_XXS, 17 IQ2_XS, 18 IQ3_XXS, 19 IQ1_S, 20 IQ4_NL,
- *     21 IQ3_S, 22 IQ2_S, 23 IQ4_XS, 29 IQ1_M, 42 Q2_0 (bdi_has).
+ *     the two differ only in the order of the float sums. Types 6 Q5_0, 7 Q5_1, 8 Q8_0,
+ *     10 Q2_K, 11 Q3_K, 12 Q4_K, 13 Q5_K, 14 Q6_K, 16 IQ2_XXS, 17 IQ2_XS, 18 IQ3_XXS,
+ *     19 IQ1_S, 20 IQ4_NL, 21 IQ3_S, 22 IQ2_S, 23 IQ4_XS, 29 IQ1_M, 42 Q2_0 (bdi_has).
  *   - bdf_decode: shaders/blockdec.glsl's general path, every block type, a 32-weight unit
  *     as int weights with a scale and a min per 16, in floats (the other types: Q4_0, Q4_1,
- *     Q5_0, Q5_1, TQ1_0, TQ2_0, MXFP4, NVFP4, Q1_0).
+ *     TQ1_0, TQ2_0, MXFP4, NVFP4, Q1_0).
  *   - F16 (101) and BF16 (130): units of 32 values (64 bytes) read as floats by the float
  *     GEMV, bd_dec16h and bd_dec16 (blockdec_host.h's blocks of 32).
  * A row's words: W (32-bit, 16-byte aligned rows for Q4_K and Q5_K, whose 144- and 176-byte
@@ -51,7 +51,7 @@ __device__ __forceinline__ int bd_dp4a(int a, int b, int c) {
 
 /* 1 for the types with an integer step (bdi_step) */
 __host__ __device__ constexpr bool bdi_has(int t) {
-    return t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 18 || t == 19 || t == 20 ||
+    return t == 6 || t == 7 || t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 18 || t == 19 || t == 20 ||
            t == 21 || t == 22 || t == 23 || t == 29 || t == 42;
 }
 /* the type's tables in shared memory, in words: its grid, ksigns, kvalues */
@@ -351,9 +351,24 @@ __device__ __forceinline__ void bdi_step(const bd_u32 *__restrict__ W, bd_u32 q,
         }
         return;
     }
-    /* the types with one scale a step: the codes' dot (less a sum of x for Q2_0) times it */
-    int sub = 0;   /* Q2_0: the codes' offset of 1 */
-    if (T == 8) {   /* Q8_0: the step is the block */
+    /* the types with one scale a step: the codes' dot (less a sum of x for Q2_0 and Q5_0) times
+     * it, plus Q5_1's min times the sum of x */
+    int sub = 0;   /* the codes' offset: Q2_0's 1, Q5_0's 16 */
+    float mq = 0.f;   /* Q5_1's min */
+    if (T == 6 || T == 7) {   /* Q5_0 / Q5_1 (the step is the block): codes 0..31, four bits in qs (weights j and
+                               * 16 + j in byte j), the fifth in qh; Q5_0's weight is code - 16, Q5_1's d * code + m */
+        bd_u32 base = q * (T == 6 ? 22u : 24u), at = T == 6 ? 2u : 4u;
+        bd_u32 qh = bd_ldu(W, base + at);
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            bd_u32 qs = bd_ldu(W, base + at + 4u + 4u * k);
+            bd_u32 hl = qh >> (4u * k), hh = qh >> (16u + 4u * k);
+            w[k] = (int)((qs & 0x0F0F0F0Fu) | ((hl & 1u) << 4) | ((hl & 2u) << 11) | ((hl & 4u) << 18) | ((hl & 8u) << 25));
+            w[k + 4] = (int)(((qs >> 4) & 0x0F0F0F0Fu) | ((hh & 1u) << 4) | ((hh & 2u) << 11) | ((hh & 4u) << 18) | ((hh & 8u) << 25));
+        }
+        dq = bd_f16at(W, base);
+        if (T == 6) sub = 16; else mq = bd_f16at(W, base + 2u);
+    } else if (T == 8) {   /* Q8_0: the step is the block */
         bd_u32 base = q * 34u;
         #pragma unroll
         for (int k = 0; k < 8; k++) w[k] = (int)bd_ldu(W, base + 2u + 4u * k);
@@ -420,7 +435,11 @@ __device__ __forceinline__ void bdi_step(const bd_u32 *__restrict__ W, bd_u32 q,
         int s = 0;
         #pragma unroll
         for (int k = 0; k < 8; k++) s = bd_dp4a(w[k], xw[k], s);
-        if (sub) { const int *xs = X.xs + r * 2 * X.nb; s -= xs[2u * q] + xs[2u * q + 1u]; }
+        if (sub || T == 7) {
+            const int *xs = X.xs + r * 2 * X.nb; int sx = xs[2u * q] + xs[2u * q + 1u];
+            s -= sub * sx;
+            if (T == 7) { acc[r] += X.dx[r * X.nb + q] * (dq * (float)s + mq * (float)sx); continue; }
+        }
         acc[r] += X.dx[r * X.nb + q] * dq * (float)s;
     }
 }
@@ -1260,7 +1279,7 @@ static int bd_gemv_rows_launch(float *y, const float *x, const bd_u32 *W, const 
     if (!bd_fmt_ok(fmt) || I % 32 || I % BD_BLK[fmt - 100]) return 0;
     switch (fmt - 100) {
 #define BD_R8_CASE(t) case t: return bd_gemv_rows_i8_launch<t>(y, x, W, tab, ids, I, O, rowWords, n, smem_max, st);
-        BD_R8_CASE(8) BD_R8_CASE(10) BD_R8_CASE(11) BD_R8_CASE(12) BD_R8_CASE(13) BD_R8_CASE(14) BD_R8_CASE(16) BD_R8_CASE(17)
+        BD_R8_CASE(6) BD_R8_CASE(7) BD_R8_CASE(8) BD_R8_CASE(10) BD_R8_CASE(11) BD_R8_CASE(12) BD_R8_CASE(13) BD_R8_CASE(14) BD_R8_CASE(16) BD_R8_CASE(17)
         BD_R8_CASE(18) BD_R8_CASE(19) BD_R8_CASE(20) BD_R8_CASE(21) BD_R8_CASE(22) BD_R8_CASE(23) BD_R8_CASE(29) BD_R8_CASE(42)
 #undef BD_R8_CASE
         default: return 0;
@@ -1273,7 +1292,7 @@ static int bd_glu_launch(float *y, const float *x, const bd_u32 *Wg, const bd_u3
     if (!bd_fmt_ok(fmt) || I % 32 || I % BD_BLK[fmt - 100] || !Wu) return 0;
     switch (fmt - 100) {
 #define BD_G8_CASE(t) case t: return bd_gemv_i8_launch<t>(y, x, Wg, tab, I, O, rowWords, S, smem_max, st, Wu);
-        BD_G8_CASE(8) BD_G8_CASE(10) BD_G8_CASE(11) BD_G8_CASE(12) BD_G8_CASE(13) BD_G8_CASE(14) BD_G8_CASE(16) BD_G8_CASE(17)
+        BD_G8_CASE(6) BD_G8_CASE(7) BD_G8_CASE(8) BD_G8_CASE(10) BD_G8_CASE(11) BD_G8_CASE(12) BD_G8_CASE(13) BD_G8_CASE(14) BD_G8_CASE(16) BD_G8_CASE(17)
         BD_G8_CASE(18) BD_G8_CASE(19) BD_G8_CASE(20) BD_G8_CASE(21) BD_G8_CASE(22) BD_G8_CASE(23) BD_G8_CASE(29) BD_G8_CASE(42)
 #undef BD_G8_CASE
         default: return 0;
@@ -1284,7 +1303,7 @@ static int bd_gemv_launch(float *y, const float *x, const bd_u32 *W, const bd_u3
     if (!bd_fmt_ok(fmt) || I % 32 || I % BD_BLK[fmt - 100]) return 0;
     if (!force_float) switch (fmt - 100) {
 #define BD_I8_CASE(t) case t: return bd_gemv_i8_launch<t>(y, x, W, tab, I, O, rowWords, S, smem_max, st);
-        BD_I8_CASE(8) BD_I8_CASE(10) BD_I8_CASE(11) BD_I8_CASE(12) BD_I8_CASE(13) BD_I8_CASE(14) BD_I8_CASE(16) BD_I8_CASE(17)
+        BD_I8_CASE(6) BD_I8_CASE(7) BD_I8_CASE(8) BD_I8_CASE(10) BD_I8_CASE(11) BD_I8_CASE(12) BD_I8_CASE(13) BD_I8_CASE(14) BD_I8_CASE(16) BD_I8_CASE(17)
         BD_I8_CASE(18) BD_I8_CASE(19) BD_I8_CASE(20) BD_I8_CASE(21) BD_I8_CASE(22) BD_I8_CASE(23) BD_I8_CASE(29) BD_I8_CASE(42)
 #undef BD_I8_CASE
         default: break;

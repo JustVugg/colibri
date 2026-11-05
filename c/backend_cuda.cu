@@ -5407,7 +5407,7 @@ static int moe_bd_dn_launch(const CcExpert *tab, const int *ids, float *hid, con
     coli_launch(moe_bd_dn_k<TD>, dim3(gx, gy), 256, sm, st, tab, ids, hid, *p, lpr, tiles, rw, btab, stg, sslot);
     return 1;
 }
-#define BD_MOE_TYPES(X) X(8) X(10) X(11) X(12) X(13) X(14) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(29) X(42)
+#define BD_MOE_TYPES(X) X(6) X(7) X(8) X(10) X(11) X(12) X(13) X(14) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(29) X(42)
 /* 1 = both types have an integer step and the widths whole blocks of them */
 static int moe_bd_ok(const CcMoe *p) {
     int tg = p->fmt - 100, td = (p->fmt_d ? p->fmt_d : p->fmt) - 100;
