@@ -22,7 +22,7 @@ PRELUDE = r"""
 #include <mutex>
 #include <thread>
 #include <vector>
-struct Slab { const void *base; size_t len; id<MTLBuffer> buf; };
+struct Slab { void *base; size_t len; id<MTLBuffer> buf; };
 static std::mutex g_slab_mtx;
 static std::vector<Slab> g_slabs;
 """
@@ -43,10 +43,11 @@ int main() {
       g_slabs.push_back({mem,4096,b});
     }
     uint64_t addr=123;
-    if (resolve((char *)mem+4096,&addr)!=nil || addr!=123) return 3;
-    if (resolve((void *)0x1,&addr)!=nil || addr!=123) return 4;
-    id<MTLBuffer> held=resolve((char *)mem+37,&addr);
-    if (!held || addr!=(uint64_t)[held gpuAddress]+37) return 5;
+    if (resolve((char *)mem+4096,1,&addr)!=nil || addr!=123) return 3;
+    if (resolve((char *)mem+4090,7,&addr)!=nil || addr!=123) return 4;
+    if (resolve((void *)0x1,1,&addr)!=nil || addr!=123) return 5;
+    id<MTLBuffer> held=resolve((char *)mem+37,4096-37,&addr);
+    if (!held || addr!=(uint64_t)[held gpuAddress]+37) return 6;
     {
       std::lock_guard<std::mutex> lk(g_slab_mtx);
       g_slabs.clear();
@@ -56,11 +57,11 @@ int main() {
     id<MTLCommandQueue> queue=[dev newCommandQueue];
     id<MTLCommandBuffer> cb=[queue commandBuffer];
     id<MTLBlitCommandEncoder> enc=[cb blitCommandEncoder];
-    if (!dst || !queue || !cb || !enc) return 6;
+    if (!dst || !queue || !cb || !enc) return 7;
     [enc copyFromBuffer:held sourceOffset:0 toBuffer:dst destinationOffset:0 size:4096];
     [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
-    if ([cb status]!=MTLCommandBufferStatusCompleted) return 7;
-    if (memcmp([dst contents],mem,4096)!=0) return 8;
+    if ([cb status]!=MTLCommandBufferStatusCompleted) return 8;
+    if (memcmp([dst contents],mem,4096)!=0) return 9;
 
     std::atomic<bool> finished{false};
     std::atomic<int> failures{0};
@@ -85,7 +86,7 @@ int main() {
         uint64_t count=0;
         while (!finished || count<1200) {
           uint64_t got=0;
-          id<MTLBuffer> found=resolve((char *)mem+43,&got);
+          id<MTLBuffer> found=resolve((char *)mem+43,4096-43,&got);
           if (found && got!=(uint64_t)[found gpuAddress]+43) failures++;
           count++;
         }
@@ -94,15 +95,16 @@ int main() {
     });
     writer.join();
     for(auto &t:readers) t.join();
-    if (failures!=0 || reads<4800) return 9;
+    if (failures!=0 || reads<4800) return 10;
     // A fictitious base near UINTPTR_MAX proves subtraction-based bounds
     // checking avoids b+len wraparound; no invalid pointer is dereferenced.
     uintptr_t fake=UINTPTR_MAX-32u;
     { std::lock_guard<std::mutex> lk(g_slab_mtx);
-      g_slabs.push_back({(void *)fake,128,b}); }
-    if (resolve((void *)(fake-1),&addr)!=nil) return 10;
-    id<MTLBuffer> edge=resolve((void *)(fake+17u),&addr);
-    if (!edge || addr!=(uint64_t)[edge gpuAddress]+17u) return 11;
+      g_slabs.push_back({(void *)fake,16,b}); }
+    if (resolve((void *)(fake-1),1,&addr)!=nil) return 11;
+    if (resolve((void *)(fake+7u),10,&addr)!=nil) return 12;
+    id<MTLBuffer> edge=resolve((void *)(fake+7u),9,&addr);
+    if (!edge || addr!=(uint64_t)[edge gpuAddress]+7u) return 13;
     { std::lock_guard<std::mutex> lk(g_slab_mtx); g_slabs.clear(); }
     printf("PASS real Metal: blit-after-unregister, 1500 re-registers, %llu queries, high-address bounds\n",
            (unsigned long long)reads.load());

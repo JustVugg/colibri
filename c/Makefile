@@ -1176,6 +1176,13 @@ metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h affine_
 	$(METALXX) tests/test_backend_metal.mm backend_metal.mm -framework Metal -framework Foundation -o backend_metal_test
 	./backend_metal_test
 
+.PHONY: iq2-xxs-metal-test
+iq2-xxs-metal-test: backend_metal.o tests/test_iq2_xxs_metal.c ggml_quants.h
+	@test "$(METAL)" = "1" || { echo "usage: make iq2-xxs-metal-test METAL=1" >&2; false; }
+	$(CC) $(CFLAGS) tests/test_iq2_xxs_metal.c backend_metal.o -o iq2_xxs_metal_test $(LDFLAGS)
+	./iq2_xxs_metal_test
+	$(RM) iq2_xxs_metal_test
+
 # GLM-5.3 Metal correctness oracles. These exercise the clamped SwiGLU
 
 # primitive and the complete routed gate/up/SwiGLU/down/scatter MoE block

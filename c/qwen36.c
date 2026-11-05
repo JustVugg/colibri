@@ -92,6 +92,22 @@ static int qwen36_max_ctx(void) {
 #include "affine_quant.h"  /* MLX affine dense triples in model.safetensors */
 #ifdef COLI_METAL
 #include "backend_metal.h" /* coli_metal_init: affine pipelines for the store */
+static pthread_once_t g_iq2_metal_once = PTHREAD_ONCE_INIT;
+static int g_iq2_metal_ready;
+static void q36_iq2_metal_init_once(void) {
+    const char *e = getenv("COLI_METAL_IQ2_XXS");
+    if (e && *e && *e != '0') g_iq2_metal_ready = coli_metal_init();
+    if (e && *e && *e != '0' && !g_iq2_metal_ready)
+        fprintf(stderr, "[qwen36] native IQ2_XXS Metal unavailable; using CPU\n");
+}
+static int q36_iq2_metal_enabled(void) {
+    const char *e = getenv("COLI_METAL_IQ2_XXS");
+    if (!e || !*e || *e == '0') return 0;
+    pthread_once(&g_iq2_metal_once, q36_iq2_metal_init_once);
+    return g_iq2_metal_ready;
+}
+#else
+static int q36_iq2_metal_enabled(void) { return 0; }
 #endif
 #include "qwen36_embedding.h"     /* the embedding rows read in place from the checkpoint */
 #include "qwen36_dense_file.h"    /* canonical.qc: the INT8 dense matrices, converted once */
@@ -129,6 +145,34 @@ static void q36_wfree(void *p){
      * after int4 packing, so its matching release must follow that choice. */
     if (q36_waligned()) compat_aligned_free(p);
     else free(p);
+}
+static uint8_t *q36_iq2_gq_alloc(size_t bytes, size_t *registered_len) {
+    if (registered_len) *registered_len=0;
+#ifdef COLI_METAL
+    if (q36_iq2_metal_enabled()) {
+        const size_t page=16384;
+        if (bytes>SIZE_MAX-(page-1)) return NULL;
+        size_t len=(bytes+page-1)&~(page-1);
+        void *p=NULL;
+        if (posix_memalign(&p,page,len?len:page)) return (uint8_t *)malloc(bytes);
+        memset(p,0,len?len:page);
+        coli_metal_register(p,len?len:page);
+        if (registered_len) *registered_len=len?len:page;
+        return (uint8_t *)p;
+    }
+#else
+    (void)registered_len;
+#endif
+    return (uint8_t *)malloc(bytes);
+}
+static void q36_iq2_gq_free(void *p, size_t registered_len) {
+    if (!p) return;
+#ifdef COLI_METAL
+    if (registered_len) coli_metal_unregister(p);
+#else
+    (void)registered_len;
+#endif
+    free(p);
 }
 #include "gguf.h"          /* SNAP=model.gguf: read a GGUF in place, ggml weight types natively */
 /* GGUF mode (SNAP names a .gguf). The file is llama.cpp's conversion of the
@@ -1125,14 +1169,25 @@ typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; fl
                  void *vk; int vk_off; uint16_t *h;
                  char *vk_name; const char *vk_tag; int vk_quant, vk_fmt, vk_gone, vk_imported;
                  uint8_t *gq; int gq_type; float gs; int wf16;
-                 int q8r16; } QW;   /* q8r16: q's rows interleaved by 16 (idot.h i8r16_*, q36_trunk_q8_interleave) */
+                 int q8r16;
+#ifdef COLI_METAL
+                 size_t gq_metal_len; ColiMetalTensor *iq2_metal;
+#endif
+                 } QW;   /* q8r16: q's rows interleaved by 16 (idot.h i8r16_*, q36_trunk_q8_interleave) */
 static void qw_free(QW *w) {
 #ifdef COLI_VULKAN
     if (w->vk) coli_vk_tensor_free((ColiVkTensor *)w->vk);
     w->vk = NULL; w->vk_off = 0; w->vk_imported = 0;
     free(w->vk_name); w->vk_name = NULL; w->vk_gone = 0;
 #endif
-    free((void*)w->w); q36_wfree(w->q); free(w->sc); free(w->q4); free(w->sg); q36_wfree(w->h); free(w->gq);
+    free((void*)w->w); q36_wfree(w->q); free(w->sc); free(w->q4); free(w->sg); q36_wfree(w->h);
+#ifdef COLI_METAL
+    if (w->iq2_metal) coli_metal_tensor_free(w->iq2_metal);
+    q36_iq2_gq_free(w->gq,w->gq_metal_len);
+    w->iq2_metal=NULL; w->gq_metal_len=0;
+#else
+    free(w->gq);
+#endif
     w->w = NULL; w->q = NULL; w->sc = NULL; w->q4 = NULL; w->sg = NULL; w->ng = 0; w->h = NULL; w->gq = NULL;
 }
 
@@ -1175,6 +1230,7 @@ typedef struct {
 typedef struct { int eid; int pinned; int is_int4; int8_t *g, *u, *d; uint8_t *g4, *u4, *d4; uint8_t *pw; float *gs, *us, *ds; uint64_t used;
                  unsigned busy; /* callers computing from this slot (expert_hold): never evicted */
                  uint8_t *gqe;  /* GGUF mode: the expert, [gate | up | down] in their held types (GqExp hg/hu/hd) */
+                 size_t gqe_metal_len;
                  int8_t *t8; float *t8s; int t8_eid;   /* GGUF mode, the Vulkan tier: gqe as int8 with one scale per 32 weights (gq_slot_i8),
                                                           or as the file's rows when gqe holds them interleaved (vk_slot_src), for expert t8_eid - 1 */ } Slot;
 /* GGUF mode: where layer L's experts live. The three fused tensors hold
@@ -2154,11 +2210,44 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
     }
 }
 
-static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O){
+#ifdef COLI_METAL
+static int q36_iq2_xxs_metal_try(float *y, const float *x, const uint8_t *W,
+                                 int t, int S, int I, int O, ColiMetalTensor **tensor) {
+    if (t!=GQ_IQ2_XXS || S!=1 || !q36_iq2_metal_enabled() || !gq_int_ok(t,I)) return 0;
+    gq_act a; memset(&a,0,sizeof a);
+    if (gq_act_set(&a,x,S,I)) { gq_act_free(&a); return 0; }
+    int done=coli_metal_iq2_xxs_gemv(tensor,y,a.q,a.d,W,I,O);
+    gq_act_free(&a);
+    return done;
+}
+static int q36_iq2_xxs_metal_try_act(float *y, const uint8_t *W, int t,
+                                     const gq_act *a, int O) {
+    return t==GQ_IQ2_XXS && a && a->S==1 && q36_iq2_metal_enabled() &&
+           gq_int_ok(t,a->I) &&
+           coli_metal_iq2_xxs_gemv(NULL,y,a->q,a->d,W,a->I,O);
+}
+static int q36_iq2_xxs_metal_try2_act(float *y1, const uint8_t *W1, int t1,
+                                      float *y2, const uint8_t *W2, int t2,
+                                      const gq_act *a, int O) {
+    if (t1!=GQ_IQ2_XXS || t2!=GQ_IQ2_XXS || !a || a->S!=1 ||
+        !q36_iq2_metal_enabled() || !gq_int_ok(t1,a->I) || !gq_int_ok(t2,a->I))
+        return 0;
+    if (!coli_metal_iq2_xxs_gemv(NULL,y1,a->q,a->d,W1,a->I,O)) return 0;
+    return coli_metal_iq2_xxs_gemv(NULL,y2,a->q,a->d,W2,a->I,O);
+}
+#endif
+
+static void matmul_d(float *y, const float *x, QW *w, int S, int I, int O){
 #ifdef COLI_QWEN_BATCH_TEST
     g_qwen_matmul_d_calls++;
 #endif
     if (w->gq) {
+#ifdef COLI_METAL
+        if (q36_iq2_xxs_metal_try(y,x,w->gq,w->gq_type,S,I,O,&w->iq2_metal)) {
+            if (w->gs != 1.f) for (int o=0;o<O;o++) y[o] *= w->gs;
+            return;
+        }
+#endif
         if (gq_matmul(y, x, w->gq, w->gq_type, S, I, O)) {
             fprintf(stderr, "qwen36: GGUF matrix of type %s is not supported\n", gq_type_name(w->gq_type)); exit(1);
         }
@@ -2959,6 +3048,9 @@ static float *load_t_n(Model *m, const char *name, int64_t want) {
  * does. Only the CPU reads these copies: the Vulkan tier and the dense chain get
  * the file's rows back (vk_slot_src, vk_qw_tensor), CUDA takes no GGUF. */
 static int q36_gq_held(int type, int rows, int cols) {
+#ifdef COLI_METAL
+    if (type==GQ_IQ2_XXS && q36_iq2_metal_enabled()) return type;
+#endif
 #ifdef GQ_R16_ON
     static int on = -1;
     if (on < 0) { const char *e = getenv("Q36_ILV16"); on = !(e && !strcmp(e, "0")) && !gq_exact_mode(); }
@@ -3166,7 +3258,13 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
         if (!gq_blk_decoder(t->type)) { fprintf(stderr, "GGUF %s: type %s is not supported\n", t->name, gq_type_name(t->type)); exit(1); }
         if (!gg_scale(t, 1, &out->gs)) out->gs = 1.f;
         if (g_gguf_dry) { out->gq_type = t->type; return; }
-        out->gq = malloc((size_t)t->nbytes); out->gq_type = t->type;
+#ifdef COLI_METAL
+        if (t->type==GQ_IQ2_XXS)
+            out->gq=q36_iq2_gq_alloc((size_t)t->nbytes,&out->gq_metal_len);
+        else
+#endif
+            out->gq = malloc((size_t)t->nbytes);
+        out->gq_type = t->type;
         if (!out->gq || gguf_read(&g_gg, t, out->gq, 0, t->nbytes)) { fprintf(stderr, "GGUF %s: read failed\n", t->name); exit(1); }
         if (rheads) q36_rope_unpermute(out->gq, (size_t)gq_row_bytes(t->type, I), rheads, O / rheads);
         const int ht = q36_gq_held(t->type, O, I);
@@ -3176,7 +3274,12 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
             if (!h) { fprintf(stderr, "OOM GGUF %s\n", t->name); exit(1); }
             #pragma omp parallel for schedule(static)
             for (int g = 0; g < O / 16; g++) gq_r16_pack(ht, h + (int64_t)g * 16 * hb, out->gq + (int64_t)g * 16 * rb, 16, I);
-            free(out->gq); out->gq = h; out->gq_type = ht;
+#ifdef COLI_METAL
+            q36_iq2_gq_free(out->gq,out->gq_metal_len); out->gq_metal_len=0;
+#else
+            free(out->gq);
+#endif
+            out->gq = h; out->gq_type = ht;
         }
         return;
     }
@@ -4277,11 +4380,20 @@ static int qwen36_cap_for_ram(double resident_gb, double avail_gb, double ram_gb
     return derived;
 }
 
+static void slot_gqe_free(Slot *s) {
+    if (!s || !s->gqe) return;
+    q36_iq2_gq_free(s->gqe,s->gqe_metal_len);
+    s->gqe=NULL; s->gqe_metal_len=0;
+}
+
 static void slot_ensure_allocated(Model *m, Slot *s) {
     if (s->g || s->pw || s->gqe) return;
     Cfg *c = &m->c;
     if (g_gguf) {
-        s->gqe = malloc((size_t)m->gqe_max);
+        if (q36_iq2_metal_enabled())
+            s->gqe=q36_iq2_gq_alloc((size_t)m->gqe_max,&s->gqe_metal_len);
+        else
+            s->gqe = malloc((size_t)m->gqe_max);
         if (!s->gqe) { fprintf(stderr, "Error: OOM allocating slot weights\n"); exit(1); }
         s->pinned = 0; s->is_int4 = 0; s->g = s->u = s->d = NULL; s->g4 = s->u4 = s->d4 = NULL; s->pw = NULL;
         return;
@@ -5450,11 +5562,20 @@ static void moe_vk_gq_cpu(Model *m, int layer, const float *x, int S, const int 
         if (idx[i] < 0 || !want[i]) continue;
         const float *xs = x + (int64_t)(i / K) * D; float *y = ctb + (int64_t)i * D;
         Slot *e = expert_hold(m, layer, idx[i]);
-        gq_matmul(G, xs, e->gqe, gx->hg, 1, D, I);
-        gq_matmul(U, xs, e->gqe + gx->hb_g, gx->hu, 1, D, I);
+#ifdef COLI_METAL
+        if (!q36_iq2_xxs_metal_try(G,xs,e->gqe,gx->hg,1,D,I,NULL))
+#endif
+            gq_matmul(G, xs, e->gqe, gx->hg, 1, D, I);
+#ifdef COLI_METAL
+        if (!q36_iq2_xxs_metal_try(U,xs,e->gqe + gx->hb_g,gx->hu,1,D,I,NULL))
+#endif
+            gq_matmul(U, xs, e->gqe + gx->hb_g, gx->hu, 1, D, I);
         float sg = gx->sg ? gx->sg[idx[i]] : 1.f, su = gx->su ? gx->su[idx[i]] : 1.f;
         for (int j = 0; j < I; j++) { float gv = G[j] * sg; G[j] = (gv / (1.f + expf(-gv))) * (U[j] * su); }
-        gq_matmul(y, G, e->gqe + gx->hb_g + gx->hb_u, gx->hd, 1, I, D);
+#ifdef COLI_METAL
+        if (!q36_iq2_xxs_metal_try(y,G,e->gqe + gx->hb_g + gx->hb_u,gx->hd,1,I,D,NULL))
+#endif
+            gq_matmul(y, G, e->gqe + gx->hb_g + gx->hb_u, gx->hd, 1, I, D);
         if (gx->sd) for (int d = 0; d < D; d++) y[d] *= gx->sd[idx[i]];
         if (vkt_wants(layer, idx[i])) { VktExpertSrc vs = vk_slot_src(m, layer, e); vkt_note(layer, idx[i], &vs); }
         slot_release(e);
@@ -5564,12 +5685,24 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
     if (gq_act_set(pax, x, 1, D)) return -1;
     const int64_t rbg = gq_row_bytes(gx->hg, D), rbu = gq_row_bytes(gx->hu, D), rbd = gq_row_bytes(gx->hd, I);
     const int gI = I / u, gD = D / u;
+#ifdef COLI_METAL
+    int metal_gu = gx->hg==GQ_IQ2_XXS && gx->hu==GQ_IQ2_XXS && q36_iq2_metal_enabled();
+    if (metal_gu) {
+        for (int k = 0; k < n; k++) {
+            float *g = GU + (int64_t)k * 2 * I, *up = g + I;
+            if (!q36_iq2_xxs_metal_try2_act(g,sl[k]->gqe,gx->hg,up,sl[k]->gqe+gx->hb_g,gx->hu,pax,I))
+                gq_matmul2_act(g,sl[k]->gqe,gx->hg,up,sl[k]->gqe+gx->hb_g,gx->hu,pax,I);
+        }
+    } else
+#endif
+    {
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < n * 2 * gI; r++) {
         int k = r / (2 * gI), rr = (r % (2 * gI)) * u;
         const uint8_t *base = sl[k]->gqe;
         if (rr < I) gq_rows_u(GU + (int64_t)k * 2 * I + rr, u, pax, base + (int64_t)rr * rbg, gx->hg, D);
         else        gq_rows_u(GU + (int64_t)k * 2 * I + rr, u, pax, base + gx->hb_g + (int64_t)(rr - I) * rbu, gx->hu, D);
+    }
     }
     for (int k = 0; k < n; k++) {
         float *g = GU + (int64_t)k * 2 * I, *u = g + I; float *h = H + (int64_t)k * I;
@@ -5578,12 +5711,29 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
         for (int i = 0; i < I; i++) { float gv = g[i]; h[i] = (gv / (1.f + expf(-gv))) * u[i]; }
     }
     if (gq_act_set(pah, H, n, I)) return -1;   /* row k of ah is expert k's hidden */
+#ifdef COLI_METAL
+    int metal_down = gx->hd==GQ_IQ2_XXS && q36_iq2_metal_enabled();
+    if (metal_down) {
+        for (int k = 0; k < n; k++) {
+            gq_act one = *pah;
+            one.S=1; one.q=pah->q+(int64_t)k*I; one.d=pah->d+(int64_t)k*(I/32);
+            one.s=pah->s+(int64_t)k*(I/16);
+            one.l4=pah->l4?pah->l4+(int64_t)k*(I/4):NULL;
+            float *yk=Y+(int64_t)k*D;
+            const uint8_t *W=sl[k]->gqe+gx->hb_g+gx->hb_u;
+            if (!q36_iq2_xxs_metal_try_act(yk,W,gx->hd,&one,D))
+                gq_matmul_act(yk,&one,W,gx->hd,D);
+        }
+    } else
+#endif
+    {
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < n * gD; r++) {
         int k = r / gD, o = (r % gD) * u;
         gq_act one = *pah; one.S = 1; one.q = pah->q + (int64_t)k * I; one.d = pah->d + (int64_t)k * (I / 32); one.s = pah->s + (int64_t)k * (I / 16);
         one.l4 = pah->l4 ? pah->l4 + (int64_t)k * (I / 4) : NULL;
         gq_rows_u(Y + (int64_t)k * D + o, u, &one, sl[k]->gqe + gx->hb_g + gx->hb_u + (int64_t)o * rbd, gx->hd, I);
+    }
     }
     /* accumulate in expert-id order, as the general path does: same sums, same bits */
     int ord[64]; for (int k = 0; k < n; k++) ord[k] = k;
@@ -5616,8 +5766,12 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
         const int *tl = tok + cnt[e]; const float *wl = wt + cnt[e];
         Slot *sl; expert_get(m, layer, e, &sl);
         for (int r = 0; r < n; r++) memcpy(X + (int64_t)r * D, x + (int64_t)tl[r] * D, sizeof(float) * (size_t)D);
-        if (gq_int_ok(gx->hg, D) && gq_int_ok(gx->hu, D) && !gq_act_set(&act, X, n, D))
-            gq_matmul2_act(G, sl->gqe, gx->hg, U, sl->gqe + gx->hb_g, gx->hu, &act, I);   /* x quantized once */
+        if (gq_int_ok(gx->hg, D) && gq_int_ok(gx->hu, D) && !gq_act_set(&act, X, n, D)) {
+#ifdef COLI_METAL
+            if (!q36_iq2_xxs_metal_try2_act(G,sl->gqe,gx->hg,U,sl->gqe+gx->hb_g,gx->hu,&act,I))
+#endif
+                gq_matmul2_act(G, sl->gqe, gx->hg, U, sl->gqe + gx->hb_g, gx->hu, &act, I);   /* x quantized once */
+        }
         else {
             gq_matmul(G, X, sl->gqe, gx->hg, n, D, I);
             gq_matmul(U, X, sl->gqe + gx->hb_g, gx->hu, n, D, I);
@@ -9043,7 +9197,7 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
                 qt_note_planned(wpl[i], wpe[i], wg, wu, wd, tmp.gs, tmp.us, tmp.ds);
             }
             free(tmp.pw); free(tmp.g); free(tmp.gs); free(tmp.g4); free(tmp.u4); free(tmp.d4);
-            free(tmp.gqe); free(tmp.t8);
+            slot_gqe_free(&tmp); free(tmp.t8);
         }
         qt_fill_wait();
         free(wpl); free(wpe);
@@ -9331,7 +9485,7 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
             VktExpertSrc src = vk_slot_src(m, pl[i], &tmp);
             vkt_put(pl[i], pe[i], &src);
             free(tmp.pw); free(tmp.g); free(tmp.gs); free(tmp.g4); free(tmp.u4); free(tmp.d4);
-            free(tmp.gqe); free(tmp.t8); free(tmp.t8s);
+            slot_gqe_free(&tmp); free(tmp.t8); free(tmp.t8s);
         }
         vkt_put_done();
         vkt_warm_report("qwen36", n, now_s() - t0);
@@ -10076,7 +10230,7 @@ static void qwen36_segment_model_destroy(Qwen36SegmentEngine *engine) {
         for (int slot = 0; slot < cache->n; slot++) {
             free(cache->slots[slot].g);
             free(cache->slots[slot].pw);
-            free(cache->slots[slot].gqe); free(cache->slots[slot].t8); free(cache->slots[slot].t8s);
+            slot_gqe_free(&cache->slots[slot]); free(cache->slots[slot].t8); free(cache->slots[slot].t8s);
             free(cache->slots[slot].gs);
             free(cache->slots[slot].g4);
             free(cache->slots[slot].u4);

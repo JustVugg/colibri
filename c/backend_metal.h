@@ -74,6 +74,29 @@ int coli_metal_matmul(ColiMetalTensor **tensor,
                       const void *weights, const float *scales,
                       int fmt, int S, int I, int O, int gs);
 
+/* Native GGUF IQ2_XXS decode GEMV. `xq` and `dx` are Colibri's already-quantized
+ * activation codes and 32-element scales; the weight bytes remain the native
+ * 66-byte-per-256-element GGUF blocks. Returns 0 for safe CPU fallback. */
+int coli_metal_iq2_xxs_gemv(ColiMetalTensor **tensor, float *y,
+                            const int8_t *xq, const float *dx,
+                            const void *weights, int I, int O);
+typedef struct {
+  uint64_t total_ns;
+  uint64_t weight_resolve_ns;
+  uint64_t weight_copy_ns;
+  uint64_t scratch_allocation_ns;
+  uint64_t activation_copy_ns;
+  uint64_t encode_submit_wait_ns;
+  uint64_t gpu_execution_ns;
+  uint64_t output_copy_ns;
+} ColiMetalIq2Timing;
+/* Profiling variant of the same synchronous call. Timing fields are nanoseconds;
+ * gpu_execution_ns is Metal's GPUStartTime..GPUEndTime interval. */
+int coli_metal_iq2_xxs_gemv_profile(ColiMetalTensor **tensor, float *y,
+                                    const int8_t *xq, const float *dx,
+                                    const void *weights, int I, int O,
+                                    ColiMetalIq2Timing *timing);
+
 /* Returns whether a validated MLX affine descriptor and batch fit the Metal
  * shader's uint32 indexing ABI.  This predicate is portable and does not query
  * hardware; coli_metal_affine_available() additionally requires initialized
