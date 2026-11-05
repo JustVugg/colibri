@@ -100,6 +100,7 @@ def reference(template_text, *, messages, tools=None, reasoning_effort=None,
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--template", type=Path, required=True)
+    parser.add_argument("--full-model", action="store_true", help="Check the full GLM-5.3 template on the glm engine")
     arguments = parser.parse_args()
 
     if not arguments.template.exists():
@@ -115,7 +116,8 @@ def main() -> int:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import openai_server
 
-    openai_server.ARCH = "glm53"
+    openai_server.ARCH = "glm" if arguments.full_model else "glm53"
+    openai_server.CHAT_FLAVOR = "glm53_full" if arguments.full_model else None
     template_text = arguments.template.read_text(encoding="utf-8")
     checked = 0
     for name, case in CASES.items():
