@@ -2066,11 +2066,37 @@ static int ev_probe(void) {
                 started, held, after);
     return ok;
 }
+/* AMD's own driver (COLI_VK_TEST_AMD_OWN=1 in tests: any driver) */
+static int ev_amd_own(VkPhysicalDeviceDriverProperties *dp) {
+    const char *t = getenv("COLI_VK_TEST_AMD_OWN");
+    VkPhysicalDeviceProperties pp;
+    vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
+    if (pp.apiVersion < VK_API_VERSION_1_2) return t && *t == '1';
+    VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = dp};
+    vkGetPhysicalDeviceProperties2((VkPhysicalDevice)KC.core.phys, &p2);
+    return dp->driverID == VK_DRIVER_ID_AMD_PROPRIETARY || (t && *t == '1');
+}
 /* the hybrid steps' events, made and probed at the primary device's vkc_init, where no frame
- * is open: a probe that fails leaves them off for the run (COLI_VK_HYBRID_EVENTS=0 skips both) */
+ * is open: a probe that fails leaves them off for the run (COLI_VK_HYBRID_EVENTS=0 skips both).
+ * AMD's own driver leaves them off by default, unprobed. A Radeon RX 9060 XT on it (26.10.44,
+ * Windows, Qwen3.6 with every expert resident) answered in loops with them, and soundly with
+ * COLI_VK_HYBRID_EVENTS=0, where the gate measured the timelines' steps slower than the
+ * device's own reads of the host pool and kept those (#2583). The probe checks that a frame
+ * waits; a driver whose frame waits and still reads the host's rows as they were before the
+ * host wrote them would pass it, and only that card can tell the two apart.
+ * COLI_VK_HYBRID_EVENTS=1 tries the events there, the probe still deciding. */
 static void ev_setup(void) {
     const char *e = getenv("COLI_VK_HYBRID_EVENTS");
-    if (g_kd || (e && *e == '0') || !ev_init()) return;
+    if (g_kd || (e && *e == '0')) return;
+    VkPhysicalDeviceDriverProperties dp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    if (!(e && *e == '1') && ev_amd_own(&dp)) {
+        g_ev.tried = 1;   /* ev_init: off for the run */
+        fprintf(stderr, "[VK] chain: the hybrid steps run on the timelines on AMD's own driver (%s %s: with the host's "
+                "events a Radeon answered in loops, #2583); COLI_VK_HYBRID_EVENTS=1 tries the events\n",
+                dp.driverName[0] ? dp.driverName : "this driver", dp.driverInfo);
+        return;
+    }
+    if (!ev_init()) return;
     if (!ev_probe()) g_ev.on = 0;
 }
 /* step g's slot, its events reset once the frame that used them last is done */

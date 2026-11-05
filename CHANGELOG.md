@@ -137,12 +137,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   speeds that only loops reach). The chain now probes the wait once at its start (a frame
   writes, waits, writes again; the host checks the second write has not happened 20 ms on) and,
   where the frame does not hold, runs the steps on the timelines instead, which the
-  specification allows; a device that holds keeps the events and its speed. Two barriers of
+  specification allows; a device that holds keeps the events and its speed. AMD's own driver
+  leaves the events off without the probe: on that Radeon the steps on events answered in loops
+  and `COLI_VK_HYBRID_EVENTS=0` answered soundly, while a frame that waits and still reads the
+  host's rows as they were before would pass the probe (`COLI_VK_HYBRID_EVENTS=1` tries them
+  there, the probe deciding). Two barriers of
   the same steps were wrong as well (the sum read the device's rows with none after the
   dispatch that wrote them, and the event's stage mask held a stage the specification forbids
   there). CI runs the steps under the validation layer's synchronization check (`sync_gate`)
   and with the wait dropped (`COLI_VK_TEST_EV_NOWAIT=1`: the probe must see it, the tokens stay
-  the CPU's).
+  the CPU's), and as AMD's own driver (`COLI_VK_TEST_AMD_OWN=1`: the timelines, the CPU's tokens).
 - **The UI's coding agents with the UI on Windows itself** (`coli ui` from a Windows prompt, the
   desktop window). The agents of WSL were never looked for there, and every folder was "not
   found" (its check asked `wslpath`, which Windows has not). They are now found and opened
