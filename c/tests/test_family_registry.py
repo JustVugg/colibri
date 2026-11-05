@@ -1145,11 +1145,9 @@ class FamilyRegistryTest(unittest.TestCase):
             "inkling": "<|user|>hello {world}<|assistant|>",
             "kimi": "K3CHAT1\nM user 13\nhello {world}G 0\n\n",
             "olmoe": "<|user|>\nhello {world}\n<|assistant|>\n",
-            # Qwen3.6's generation prompt MUST open <think>: the model was
-            # never trained on the bare "assistant\\n" state and greedy argmax
-            # there lands on an EOS special (measured gen=0).
-            "qwen36": "<|im_start|>user\nhello {world}<|im_end|>\n"
-                      "<|im_start|>assistant\n<think>\n",
+            # qwen36's checkpoints ship different templates: `coli tune` renders
+            # through the gateway (tune_renders_chat, tests/test_tune_chat_prompt.py)
+            "qwen36": "hello {world}",
             "qwen38": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully "
                       "through the task, validate key assumptions, consider plausible alternatives, "
                       "and prioritize correctness, consistency, and clarity in the final answer."
