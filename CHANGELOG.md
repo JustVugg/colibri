@@ -51,6 +51,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   only: the tier on its own (`COLI_CUDA_CHAIN=0`) swaps an expert only for one of its size, and its
   decode came 5-12% slower, so it keeps one size there unless `COLI_CUDA_EXACT_SLOTS=1`.
   `COLI_CUDA_EXACT_SLOTS=0` and `COLI_CUDA_CHAIN_POOL_EXACT=0` restore the largest layer's slot.
+- **Qwen3.8 on the CUDA chain: a prompt's staging sized by the expert budget.** A long prompt's
+  layer copies its experts that are off the card into a staging buffer of 512 MiB, which held 246
+  to 411 of a UD-IQ2_XS layer's on a 24 GB card; the rest the kernels read over the bus at a third
+  of its rate. Where the tier sizes the expert budget it now gives the staging what the largest
+  layer's experts off the card would take, a fifth more, at most a sixteenth of the budget and
+  never under the 512 MiB (`qt_reserve_stage`; `COLI_CUDA_CHAIN_PROMPT_STAGE_MB` sets it by hand).
+  UD-IQ2_XS on an RTX PRO 4000 with the exact slots, a 4220-token prompt: 318-371 tok/s with 512
+  MiB, 719-729 with 800 (826 the rule's), 726-728 with 1100; the decode the same with 800 and 2-4
+  tok/s down with 1100.
 - **Qwen3.8: a long prompt layer by layer with the MTP head too** (CUDA and Vulkan chains). A prompt of
   several chunks runs layer by layer, each layer's host pool experts staged once for all its chunks, but
   not when the caller wanted the rows' final streams back, and the MTP head's prefill always does: with

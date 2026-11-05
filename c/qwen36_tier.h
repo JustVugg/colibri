@@ -88,6 +88,10 @@ void qt_experts_withdraw(const char *why);
  * router, b|a and gate rows), kept out of the automatic allowance. Call before qt_init. */
 void qt_reserve(size_t bytes);
 void qt_reserve_short(size_t bytes, size_t experts);   /* out of the expert budget only when fewer than `experts` fit */
+/* a chain's prompt staging past the `base` bytes of its reserve, toward `full` (qwen36_tier.c's
+ * rule); qt_stage_extra: the bytes the budget gave it. Call before qt_init_gguf. */
+void   qt_reserve_stage(size_t base, size_t full);
+size_t qt_stage_extra(void);
 /* A GGUF's arena slots at each layer's own size (one device; a chain takes them over through
  * qt_chain_arena_exact, not qt_chain_arena). Call before qt_init_gguf. */
 void qt_gguf_exact_slots(int on);
@@ -315,6 +319,8 @@ static inline void qt_trunk_withdraw(const char*a){(void)a;}
 static inline void qt_experts_withdraw(const char*a){(void)a;}
 static inline void qt_reserve(size_t b){(void)b;}
 static inline void qt_reserve_short(size_t b,size_t e){(void)b;(void)e;}
+static inline void qt_reserve_stage(size_t a,size_t b){(void)a;(void)b;}
+static inline size_t qt_stage_extra(void){return 0;}
 static inline void qt_gguf_exact_slots(int on){(void)on;}
 static inline int  qt_dnproj_init(int a,const int8_t*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dnproj_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}

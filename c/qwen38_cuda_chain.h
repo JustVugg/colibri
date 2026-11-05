@@ -322,7 +322,15 @@ static int q38cc_mats(Model *m, int i, Q38Weight **w, const char **nm) {
 /* an expert's place in the host pool and the stagings (gate, up and down each from a 256-byte
  * boundary), from the GGUF's tensors (before the tier knows them); 0: not a GGUF */
 #define Q38CC_PAD(b) (((size_t)(b) + 255) / 256 * 256)
-#define Q38CC_PROMPT_STAGE (512u << 20)   /* a prompt chunk's staging of a layer's pooled experts, bytes at most */
+/* a prompt chunk's staging of a layer's pooled experts, bytes at most: 512 MiB of the chain's reserve
+ * and what the expert budget gives it past them (qt_reserve_stage); COLI_CUDA_CHAIN_PROMPT_STAGE_MB
+ * sets it, none from the budget then */
+static size_t q38cc_stage_mb_env(void) {
+    static long v = -1;
+    if (v < 0) { const char *e = getenv("COLI_CUDA_CHAIN_PROMPT_STAGE_MB"); v = e && atol(e) > 0 ? atol(e) : 0; }
+    return (size_t)v << 20;
+}
+#define Q38CC_PROMPT_STAGE (q38cc_stage_mb_env() ? q38cc_stage_mb_env() : (size_t)512 << 20)
 static size_t q38cc_gguf_stride(Model *m) {
     Cfg *c = &m->c; size_t st = 0;
     if (!g_q38_gguf || c->experts <= 0) return 0;
@@ -1655,10 +1663,12 @@ static void q38cc_pool_init(Model *m) {
     ch->pool_cpu = !(pr && *pr == '1');
     ch->dm_read = 0;   /* the table again, with the pool */
     /* a prompt chunk's staging: the most pooled experts any layer has, within Q38CC_PROMPT_STAGE
-     * (the chain's reserve counted it); a layer's past it are read where they are */
+     * (the chain's reserve counted it) and what the expert budget gave it past that
+     * (qt_stage_extra); a layer's past it are read where they are */
     int hmax = 0;
     for (int i = 0, k = 0; i < L; i++) { int h = 0; while (k < (int)fit && hot[k].i == i) { h++; k++; } if (h > hmax) hmax = h; }
-    int pcap = (int)(Q38CC_PROMPT_STAGE / stride);
+    const size_t stage_max = Q38CC_PROMPT_STAGE + qt_stage_extra();
+    int pcap = (int)(stage_max / stride);
     if (pcap > hmax) pcap = hmax;
     size_t sbytes = (size_t)pcap * stride;
     if (lst) {   /* places at each layer's size: as many bytes as the layer that wants most has, within the same */
@@ -1668,7 +1678,7 @@ static void q38cc_pool_init(Model *m) {
             size_t b = (size_t)h * lst[i];
             if (b > sbytes) sbytes = b;
         }
-        if (sbytes > Q38CC_PROMPT_STAGE) sbytes = Q38CC_PROMPT_STAGE;
+        if (sbytes > stage_max) sbytes = stage_max;
         pcap = hmax;
     }
     if (pcap > 0 && sbytes > 0 && (ch->dm_stage = cc_buf(sbytes, CC_DEV))) { ch->dm_stage_cap = pcap; ch->dm_stage_size = sbytes; }

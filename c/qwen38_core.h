@@ -4037,6 +4037,7 @@ static void q38_tier_warm(Model *m,int hist) {
 }
 #ifdef COLI_CUDA
 static size_t q38cc_reserve_bytes(Model *m);   /* qwen38_cuda_chain.h */
+static size_t q38cc_stage_mb_env(void); static size_t q38cc_prompt_stage_bytes(Model *m); static size_t q38cc_gguf_stride(Model *m);
 static int q38cc_env_on(void);
 #endif
 static void q38_tier_start(Model *m,int cap) {
@@ -4064,6 +4065,7 @@ static void q38_tier_start(Model *m,int cap) {
         if(ok&&q38cc_env_on()){
             size_t rb=q38cc_reserve_bytes(m);
             qt_trunk_offer("chain",0,rb);
+            if(!q38cc_stage_mb_env())qt_reserve_stage(q38cc_prompt_stage_bytes(m),(size_t)c->experts*q38cc_gguf_stride(m));
             fprintf(stderr,"[qtier] qwen38: %.2f GiB kept for the CUDA chain (its mirrors at %d positions, its scratch and own matrices)\n",
                     rb/1073741824.0,m->kv_cap>0?m->kv_cap:m->max_t>0?m->max_t:qwen38_max_ctx());
         }
