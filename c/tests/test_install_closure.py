@@ -121,6 +121,7 @@ class InstalledRuntime(unittest.TestCase):
                 self.assertEqual(installed.read_bytes(), asset.read_bytes())
             env = {k: v for k, v in os.environ.items()
                    if k not in ("PYTHONPATH", "COLI_ENGINE", "COLI_MODEL")}
+            env["PYTHONUNBUFFERED"] = "1"
             for module in ("server.py", "models.py"):
                 result = subprocess.run(
                     [sys.executable, str(libexec / "ui" / module), "--help"],
@@ -145,17 +146,23 @@ class InstalledRuntime(unittest.TestCase):
                      "--port", str(port), "--backend", "http://192.0.2.1:8000"],
                     cwd=root, env=env, stdout=log, stderr=log, start_new_session=True)
                 try:
-                    deadline = time.monotonic() + 15
+                    # Cold Python startup on the macOS runner can be slow.
+                    # A loopback check must also ignore any inherited proxy.
+                    deadline = time.monotonic() + 60
+                    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
                     page = None
+                    last_error = None
                     while time.monotonic() < deadline and process.poll() is None:
                         try:
-                            with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=1) as response:
+                            with opener.open(f"http://127.0.0.1:{port}/", timeout=1) as response:
                                 page = response.read()
                             break
-                        except urllib.error.URLError:
+                        except urllib.error.URLError as error:
+                            last_error = str(error)
                             time.sleep(0.05)
                     log.seek(0)
-                    self.assertIsNotNone(page, log.read())
+                    self.assertIsNotNone(page, f"UI returncode={process.poll()}, "
+                                         f"last HTTP error={last_error}\n{log.read()}")
                     self.assertEqual(page, (HERE.parent / "ui" / "index.html").read_bytes())
                 finally:
                     # coli launches a Python UI child; stop the whole test
