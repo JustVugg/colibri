@@ -64,6 +64,7 @@ jobs:
           install: >-
             make
             mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-libgomp
             mingw-w64-ucrt-x86_64-python
       - name: make check
         run: make -C c check

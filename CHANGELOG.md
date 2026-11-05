@@ -5,6 +5,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **#2612**: on MSYS2 UCRT64 with gcc 16, the static OpenMP library (`libgomp.a`)
+  now comes from its own package, so a fresh install failed at the link with
+  `cannot find -lgomp`. `make` warns up front and names
+  `mingw-w64-ucrt-x86_64-libgomp`; `setup.sh` probes the way the Makefile links
+  (`-static`) and names the right package; `coli setup` treats a gcc without
+  `libgomp.a` as "build packages missing"; the Windows and quickstart docs and the
+  CI/release MSYS2 install lists now include the package.
+
 ## [2.1.0] - 2026-10-31
 
 387 pull requests since v2.0.0, 208 of them from 35 contributors. GGUF files run
