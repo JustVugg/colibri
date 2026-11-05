@@ -489,7 +489,10 @@ int main(void) {
         for (size_t k = 0; k < sizeof shapes / sizeof *shapes; k++) check(types[i], shapes[k][0], shapes[k][1], 0);
     printf("glu: %d types and shapes, gate and up of 1 to 4 rows in one pass, the bits of the two GEMVs and the SwiGLU\n", g_glu);
     /* the routed experts: the commonest pairs of the published files, one row and a verify's */
-    const int pairs[][2] = {{12, 14}, {16, 18}, {17, 17}, {22, 23}, {11, 13}, {10, 12}, {19, 29}, {21, 20}, {8, 8}, {42, 42}, {22, 42}, {22, 8}};
+    /* {22, 6} and {12, 7}: unsloth's Dynamic V3.1 Qwen3.8 files, IQ2_S gate and up with a Q5_0 down (UD-IQ2_XS),
+     * Q4_K with Q5_1 (UD-Q4_K_XL) */
+    const int pairs[][2] = {{12, 14}, {16, 18}, {17, 17}, {22, 23}, {11, 13}, {10, 12}, {19, 29}, {21, 20}, {8, 8}, {42, 42}, {22, 42}, {22, 8},
+                            {22, 6}, {12, 7}, {6, 6}};
     for (size_t i = 0; i < sizeof pairs / sizeof *pairs; i++) {
         check_moe(pairs[i][0], pairs[i][1], 1, 8, 16, 2048, 512);
         check_moe(pairs[i][0], pairs[i][1], 3, 8, 16, 1024, 768);
