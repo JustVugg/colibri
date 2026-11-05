@@ -165,6 +165,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **CUDA: unsloth's Dynamic GGUFs with Q5_0 or Q5_1 experts kept every expert on the CPU.**
+  The tier's integer step had neither type, and one such tensor left the whole tier off:
+  Qwen3.8-Flash-Next UD-IQ2_XS has one Q5_0 down, UD-Q2_K_XL one, UD-Q3_K_XL 20, UD-IQ4_XS 33,
+  UD-Q4_K_XL 43 Q5_1. Both are now on the card as the CPU's integer form computes them.
+  UD-IQ2_XS on an RTX PRO 4000: decode 8.3-8.6 -> 51.7-68.2 tok/s, a 585-token prompt
+  24.6-25.1 -> 206-325 tok/s.
 - **Qwen3.8: memory that grew with every answer** (#2592). The expert loader reads a batch of
   missing experts in parallel (on by default) with a team as large as the batch, and libgomp
   ends the threads a smaller team leaves out and starts new ones for a larger. Each read
