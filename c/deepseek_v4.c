@@ -12004,16 +12004,11 @@ int coli_v4_gpu_fp8_matmul_batch(const ColiTensorView *w, float *outputs,
     return 0;
 }
 
-int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
-                      const ColiDeepSeekV4LayerWeights *weights,
-                      const float *bias, const int *forced_indices,
-                      int experts, int dimension, int topk, float route_scale) {
-    if (!route_weights || !indices || !input || !weights) return -1;
-    /* The backend route kernel is hardwired to 256 experts / top-k 6. */
-    if (experts != 256 || topk != 6 || dimension < 1) return -1;
-    Dsv4CudaTensor *gate = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn.gate");
-    Dsv4CudaTensor *bias_t = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn.gate.bias");
-    if (!gate || (bias && !bias_t)) return -1;
+/* The route on resolved gate / bias tensors (bias may be NULL). Shared by
+ * coli_v4_gpu_route and the test hooks, so the test drives the same code. */
+static int v4_gpu_route_mirrors(float *route_weights, int *indices, const float *input,
+                                Dsv4CudaTensor *gate, Dsv4CudaTensor *bias_t,
+                                const int *forced_indices, int dimension, float route_scale) {
     int device = dsv4_cuda_tensor_device(gate);
     if (device < 0) return -1;
     /* V4_GPU_ROUTE_REUSE=1: one retained input buffer per device, grown on demand,
@@ -12040,7 +12035,7 @@ int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
     int ok = dsv4_cuda_activation_upload(act, input, dimension);
     int ids[6];
     float wts[6];
-    if (ok) ok = dsv4_cuda_route(act, gate, bias ? bias_t : NULL,
+    if (ok) ok = dsv4_cuda_route(act, gate, bias_t,
                                  forced_indices, route_scale, ids, wts);
     if (!reuse) {
         dsv4_cuda_activation_free(act);
@@ -12048,12 +12043,39 @@ int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
         dsv4_cuda_activation_sync(act);   /* drain queued work before the next reuse */
     }
     if (!ok) return -1;
-    for (int k = 0; k < topk; k++) {
+    for (int k = 0; k < 6; k++) {
         indices[k] = ids[k];
         route_weights[k] = wts[k];
     }
     return 0;
 }
+
+int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
+                      const ColiDeepSeekV4LayerWeights *weights,
+                      const float *bias, const int *forced_indices,
+                      int experts, int dimension, int topk, float route_scale) {
+    if (!route_weights || !indices || !input || !weights) return -1;
+    /* The backend route kernel is hardwired to 256 experts / top-k 6. */
+    if (experts != 256 || topk != 6 || dimension < 1) return -1;
+    Dsv4CudaTensor *gate = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn.gate");
+    Dsv4CudaTensor *bias_t = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn.gate.bias");
+    if (!gate || (bias && !bias_t)) return -1;
+    return v4_gpu_route_mirrors(route_weights, indices, input, gate,
+                                bias ? bias_t : NULL, forced_indices, dimension, route_scale);
+}
+
+#ifdef COLI_V4_TEST_HOOKS
+int coli_v4_test_gpu_route_mirrors(float *route_weights, int *indices, const float *input,
+                                   void *gate, void *bias, const int *forced_indices,
+                                   int dimension, float route_scale) {
+    return v4_gpu_route_mirrors(route_weights, indices, input, (Dsv4CudaTensor *)gate,
+                                (Dsv4CudaTensor *)bias, forced_indices, dimension, route_scale);
+}
+void coli_v4_test_gpu_route_scratch_clear(void) { v4_gpu_route_scratch_clear(); }
+long long coli_v4_test_gpu_route_scratch_capacity(int device) {
+    return device >= 0 && device < V4_GPU_ROUTE_MAX_DEV ? v4_gpu_route_scratch[device].capacity : 0;
+}
+#endif
 
 /* ---- routed-expert fp4 mirrors ---------------------------------------
  * The 256-expert bank is fp4 in the same packed-nibble + per-row UE8M0
