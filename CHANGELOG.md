@@ -235,6 +235,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **`chat_template_kwargs` reaches the chat template** (`coli serve`). Many OpenAI-compatible
+  clients turn a Qwen model's thinking off with `"chat_template_kwargs": {"enable_thinking":
+  false}`, and the gateway ignored the field: a Qwen3.8 request that asked for no thinking this
+  way reasoned at xhigh, its prompt 40 tokens longer. `enable_thinking`, `preserve_thinking` and
+  `reasoning_effort` there now count as they do at the top of the request, where the request
+  does not set them itself, with the same checks; a `chat_template_kwargs` that is not an object
+  gets a 400.
 - **CUDA: unsloth's Dynamic GGUFs with Q5_0 or Q5_1 experts kept every expert on the CPU.**
   The tier's integer step had neither type, and one such tensor left the whole tier off:
   Qwen3.8-Flash-Next UD-IQ2_XS has one Q5_0 down, UD-Q2_K_XL one, UD-Q3_K_XL 20, UD-IQ4_XS 33,
