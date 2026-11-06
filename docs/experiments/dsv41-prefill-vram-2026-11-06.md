@@ -331,7 +331,7 @@ orphans killed in between:
 | `bash c/tests/vulkan_engines.sh deepseek-chain` | 36 OK, 1 FAIL (environmental) |
 | `bash c/tests/vulkan_engines.sh prefill-deepseek` | 2 OK, 1 FAIL (environmental) |
 | `make -C c vk-chain-check VK=1` | PASS |
-| `make -C c test` | test-c ALL PASS (0 failures); test-python 3019 tests, 0 failures, 358 skipped |
+| `make -C c test` | test-c ALL PASS (0 failures); test-python 3227 tests, 294 skipped, 2 FAIL (both environmental) |
 
 The five failures are the known environmental set — identical before this wave's commits,
 reproduced twice on this box: "deepseek_v4 session: no matmul ran on the device" and "chain
@@ -342,7 +342,14 @@ deepseek_v41 staged: logits" (max |logit diff| 3.22e-02 at both commits), and th
 
 The first run of `make -C c test` on the merge reported 3227 tests, 294 skipped and 7
 failures: the five `test_context_compaction` ones §9 describes, plus the two environmental
-`test_harness_builds_without_warnings` cases. The table above is the run after `05d9b979`.
+`test_harness_builds_without_warnings` cases. The table above is the last run, on the tree
+this record is committed with.
+
+That target's own totals move between runs on this box: 3227 tests / 294 skipped, then
+3019 / 358, then 3227 / 294 again. The two 3227 runs are on either side of `05d9b979`,
+whose only change is one test method's expected values, so the movement is in the suite's
+own discovery and skips (what the gate's earlier families leave on disk), not in the
+change — worth knowing before a count is read as a regression.
 
 ## 12. Reproduce
 
