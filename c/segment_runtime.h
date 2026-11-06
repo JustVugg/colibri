@@ -42,6 +42,8 @@ enum {
     COLI_SEGMENT_CAP_TOKEN_IDS = UINT64_C(1) << 0,
     COLI_SEGMENT_CAP_SNAPSHOT = UINT64_C(1) << 1,
     COLI_SEGMENT_CAP_RANGE_NATIVE = UINT64_C(1) << 2,
+    /* Multiple live sessions per engine, not a promise of concurrent calls.
+     * Without this bit the runtime permits one live session at a time. */
     COLI_SEGMENT_CAP_MULTI_SESSION = UINT64_C(1) << 3,
     COLI_SEGMENT_CAP_CPU = UINT64_C(1) << 8,
     COLI_SEGMENT_CAP_CUDA = UINT64_C(1) << 9,
@@ -166,7 +168,10 @@ int coli_segment_engine_open(const char *engine_id,
 int coli_segment_engine_capabilities(const ColiSegmentEngine *engine,
                                      ColiSegmentCapabilities *capabilities,
                                      char *error, size_t error_size);
-/* Refuses to close an engine while sessions are alive. */
+/* Refuses to close an engine while sessions are alive. Engine/session lifecycle
+ * calls require caller serialization; a successful close invalidates the handle.
+ * Serialize operations on each session. Adapter-specific synchronization governs
+ * concurrent execution on distinct sessions; MULTI_SESSION alone does not. */
 int coli_segment_engine_close(ColiSegmentEngine *engine,
                               char *error, size_t error_size);
 
