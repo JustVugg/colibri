@@ -2937,6 +2937,27 @@ tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c sse41_kernels.h deepseek_
 	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS $< $(V4_TEST_LINK_OBJS) \
 		-o $@ -pthread $(LDFLAGS)
 
+# Real-DLL gate for the GPU router's retained input buffer (V4_GPU_ROUTE_REUSE=1):
+# bit-exact against the per-call path. Windows only: it needs a GPU and the
+# coli_cuda_dsv4.dll of this tree beside the binary (make cuda-dsv4-dll first), so it
+# is a named target, not a tests/test_* rule that `check` would pick up. The GPU unit
+# with the test hooks, COLI_V4_UNIT_GPU_HOOK.o (Makefile.deepseek-v4), replaces
+# COLI_V4_UNIT_GPU.o for this binary only.
+ifneq ($(IS_WIN),)
+.PHONY: dsv4-route-scratch-test
+dsv4-route-scratch-test: tests/test_v4_route_scratch_cuda.c Makefile.deepseek-v4.units Makefile.deepseek-v4
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4-test-objs \
+		COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
+		COLI_V4_UNIT_ROUTE_BF16.o COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o \
+		COLI_V4_UNIT_NATIVE_QUANT.o COLI_V4_UNIT_NATIVE_QUANT_DUAL.o COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o \
+		COLI_V4_UNIT_EXPERT_ROWS16.o $(V4_HOT_TEST_OBJ) $(V4_BATCH_TEST_OBJ) \
+		backend_loader_dsv4.o COLI_V4_UNIT_GPU_HOOK.o
+	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS $< $(filter-out COLI_V4_UNIT_GPU.o,$(V4_TEST_LINK_OBJS)) \
+		COLI_V4_UNIT_GPU_HOOK.o -o dsv4_route_scratch_cuda_test$(EXE) -pthread $(LDFLAGS)
+	./dsv4_route_scratch_cuda_test$(EXE) 0
+	./dsv4_route_scratch_cuda_test$(EXE) 1
+endif
+
 V4_OWN_DIR = build/ownership
 V4_OWN_CFLAGS = $(CFLAGS) -DCOLI_V4_TEST_HOOKS
 V4_OWNERSHIP_OBJS = \
