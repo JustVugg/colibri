@@ -5308,8 +5308,12 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
      * id dei token soltanto, e i due layer che le precedono danno il tempo di
      * farle arrivare dal disco. */
     q38_ple_prefetch(m,ids,S);
-    for(int s=0;s<S;s++){
+    for(int s=0;s<S;s++)
         if(ids[s]<0||ids[s]>=c->vocab){fprintf(stderr,"token id %d outside vocabulary\n",ids[s]);exit(1);}
+    /* a prompt's rows on the team: a 4180-token prompt's embedding rows and their copies into the
+     * streams' fresh pages (171 MB of Qwen3.8-Flash-Next) took 40 ms on one core */
+    #pragma omp parallel for schedule(static) if(S>=64)
+    for(int s=0;s<S;s++){
         float *e=hyper+(int64_t)s*W;
         q38_embed_row(m,ids[s],pos_base+s,e);
         for(int b=1;b<C;b++)memcpy(e+(int64_t)b*H,e,(size_t)H*sizeof(float));

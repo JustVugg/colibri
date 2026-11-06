@@ -4753,6 +4753,21 @@ extern "C" int coli_cuda_tensor_dev(const ColiCudaTensor *t, const void **w, con
     return 1;
 }
 
+/* This file's kernels are one module, which the runtime loads at the first launch of any of
+ * them (lazy loading, CUDA 11.7 on): for the dense chain that is a prompt's first tile, 17 ms
+ * inside a server's first long prompt on an RTX PRO 4000. A kernel's attributes asked for on the
+ * current device load the module there now (cuda_chain.cu's cc_preload, before the first request). */
+extern "C" int coli_cuda_load_module(void) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+    return 1;
+#else
+    cudaFuncAttributes fa;
+    const int ok = cudaFuncGetAttributes(&fa, (const void *)hcm_half_k) == cudaSuccess;
+    (void)cudaGetLastError();
+    return ok;
+#endif
+}
+
 /* The dense chain's routed experts (cuda_chain.cu: cc_moe; cuda_chain.h: CcMoe): every
  * (row, slot) pair of a decode step whose expert the table holds, gate and up, then down,
  * each a warp per output row (MOE_RPW rows a warp, eight warps a block, the pair's input

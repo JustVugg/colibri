@@ -773,16 +773,23 @@ static void q38cc_sync_host(Model *m) {
  * after the prompt's last frame came to 25 ms before its first token (a 470-token prompt of
  * Qwen3.8-Flash-Next on an RTX PRO 4000: 36 layers' states, 118 MB, read one by one, then
  * copied again into the cache). 0: not taken (the host's copy then). */
+/* a snapshot's floats: every DeltaNet layer's state and conv ring, then the PLE ring */
+static size_t q38cc_snap_floats(const Q38CChain *ch, const Model *m) {
+    const Cfg *c = &m->c;
+    const size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
+    size_t total = ch->ple_ring && m->PLE_conv_state ? q38cc_ple_cells(c) : 0;
+    for (int i = 0; i < c->layers; i++) if (!c->is_attn[i]) total += nr + nc;
+    return total;
+}
 static int q38cc_snap_down(Model *m) {
     Q38CChain *ch = g_cuda_chain ? q38cc_of(m) : NULL;
     if (!ch || !ch->ok || ch->failed || ch->dn_where != Q38CC_DEV) return 0;
     Cfg *c = &m->c;
     const size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
     const size_t np = ch->ple_ring && m->PLE_conv_state ? q38cc_ple_cells(c) : 0;
-    size_t total = np, o = 0;
-    for (int i = 0; i < c->layers; i++) if (!c->is_attn[i]) total += nr + nc;
+    size_t o = 0;
     ch->ps_valid = 0;
-    if (!cc_reserve(&ch->ps, total * 4, CC_DOWN)) return 0;
+    if (!cc_reserve(&ch->ps, q38cc_snap_floats(ch, m) * 4, CC_DOWN)) return 0;
     int ok = cc_begin();
     for (int i = 0; i < c->layers && ok; i++) {
         if (c->is_attn[i]) continue;
@@ -1774,19 +1781,26 @@ static int q38cc_dm_able(Q38CChain *ch, Model *m) {
 }
 static int q38cc_stage_table(Q38CChain *ch, Model *m);
 /* the step's buffers, and the table when the tier's residents moved (the tier held) */
-static int q38cc_dm_begin(Q38CChain *ch, Model *m, int n) {
+/* the routed experts' scratch for ch->rows rows: their routes up and down, their hidden rows and
+ * sum, the experts' table */
+static int q38cc_dm_bufs(Q38CChain *ch, Model *m) {
     Cfg *c = &m->c; int L = c->layers, E = c->experts, K = c->topk, D = c->hidden, I = c->inter;
     size_t r = (size_t)ch->rows, ne = (size_t)L * E, F = sizeof(float);
+    return cc_reserve(&ch->dm_ids, (size_t)L * r * K * 4, CC_DEV) && cc_reserve(&ch->dm_w, (size_t)L * r * K * F, CC_DEV) &&
+           cc_reserve(&ch->dm_idsd, (size_t)L * r * K * 4, CC_DOWN) && cc_reserve(&ch->dm_wd, (size_t)L * r * K * F, CC_DOWN) &&
+           cc_reserve(&ch->dm_hid, cc_moe_hid_floats((int)r, K, D, I, E) * F, CC_DEV) && cc_reserve(&ch->dm_y, r * D * F, CC_DEV) &&
+           cc_reserve(&ch->dm_hy, r * D * F, CC_UP) && cc_reserve(&ch->dm_dfl, 64, CC_DOWN) && cc_reserve(&ch->dm_hfl, 64, CC_UP) &&
+           cc_reserve(&ch->dm_tab, ne * sizeof(CcExpert), CC_DEV);
+}
+static int q38cc_dm_begin(Q38CChain *ch, Model *m, int n) {
+    Cfg *c = &m->c; int L = c->layers, E = c->experts, K = c->topk;
+    size_t ne = (size_t)L * E;
     if (!ch->dm_host) {
         ch->dm_host = malloc(ne * sizeof(CcExpert)); ch->dm_res = calloc(ne, 1); ch->dm_part = calloc(L, sizeof(int));
         ch->dm_ran = calloc(L, 1); ch->dm_dev = malloc((size_t)Q38CC_DM_ROWS * K); ch->dm_partd = calloc(L, sizeof(int));
         if (!ch->dm_host || !ch->dm_res || !ch->dm_part || !ch->dm_ran || !ch->dm_dev || !ch->dm_partd) return 0;
     }
-    if (!cc_reserve(&ch->dm_ids, (size_t)L * r * K * 4, CC_DEV) || !cc_reserve(&ch->dm_w, (size_t)L * r * K * F, CC_DEV) ||
-        !cc_reserve(&ch->dm_idsd, (size_t)L * r * K * 4, CC_DOWN) || !cc_reserve(&ch->dm_wd, (size_t)L * r * K * F, CC_DOWN) ||
-        !cc_reserve(&ch->dm_hid, cc_moe_hid_floats((int)r, K, D, I, E) * F, CC_DEV) || !cc_reserve(&ch->dm_y, r * D * F, CC_DEV) ||
-        !cc_reserve(&ch->dm_hy, r * D * F, CC_UP) || !cc_reserve(&ch->dm_dfl, 64, CC_DOWN) || !cc_reserve(&ch->dm_hfl, 64, CC_UP) ||
-        !cc_reserve(&ch->dm_tab, ne * sizeof(CcExpert), CC_DEV)) return 0;
+    if (!q38cc_dm_bufs(ch, m)) return 0;
     if (ch->pool_cpu && ch->pool_of && !cc_reserve(&ch->dm_tabd, ne * sizeof(CcExpert), CC_DEV)) ch->pool_cpu = 0;
     if (!ch->dm_held) { qt_chain_hold(1); ch->dm_held = 1; }
     if (ch->own && ch->dm_read) {   /* the chain's slots: the newcomers landed, the entries rewritten, then the frame */
@@ -3139,6 +3153,28 @@ static int q38cc_greedy_ok(Model *m, int S, int nlogits) {
     const Q38CChain *ch = g_cuda_chain ? q38cc_of(m) : NULL;
     return on && m->greedy_out && ch && ch->ok && !ch->failed && S <= Q38_SPEC_ROWS && nlogits >= 1 && nlogits <= S &&
            S <= q38cc_rows_env() && cc_pick_rows_ready();
+}
+/* A server's first long prompt grew the chain's buffers to a chunk's rows on its way: page-locked
+ * host memory at 0.2 ms a MB (the K/V rows down, 122 MB, the streams down, 84 MB, a prompt-end
+ * snapshot, 118 MB), and a growth frees the buffer it replaces, which waits for the stream (the
+ * MTP head's ones: 32 ms of queued work). With the backend's module, which the runtime loads at the
+ * first tile, a 4180-token prompt's first token came 0.25-0.3 s later as a server's first request
+ * than as its second (unsloth UD-Q2_0 on an RTX PRO 4000). They are reserved before the first
+ * request instead, at the sizes that prompt leaves, inside what q38cc_reserve_bytes kept for them. */
+static void q38cc_prewarm(Model *m) {
+    Q38CChain *ch = g_cuda_chain ? q38cc_of(m) : NULL;
+    if (!ch || !ch->ok || ch->failed || cc_lost()) return;
+    Cfg *c = &m->c; const int CH = q38cc_rows_env(), W = c->hc_width, H = c->hidden, C = c->hc_count;
+    const double t0 = now_s();
+    int ok = q38cc_mirror(ch, m) && q38cc_scratch(ch, m, CH);
+    if (ok && m->mtp) ok = cc_reserve(&ch->hypd, (size_t)CH * W * 4, CC_DOWN);   /* q38cc_forward's want_streams */
+    if (ok && ch->dm_on && c->experts > 0) ok = q38cc_dm_bufs(ch, m);
+    if (ok && ch->mtp_on && m->mtp) ok = cc_reserve(&ch->fin, (size_t)CH * H * 4, CC_UP) && cc_reserve(&ch->ones, (size_t)CH * C * 4, CC_DEV);
+    if (ok) ok = cc_reserve(&ch->ps, q38cc_snap_floats(ch, m) * 4, CC_DOWN);
+    const int loaded = ok && cc_preload();
+    if (!ok) { fprintf(stderr, "[chain] qwen38: a chunk's buffers not reserved before the first request; its prompt grows them\n"); return; }
+    fprintf(stderr, "[chain] qwen38: a %d-row chunk's buffers reserved%s before the first request (%.0f ms)\n", CH,
+            loaded ? " and the backend's kernels loaded" : "", (now_s() - t0) * 1e3);
 }
 /* Every layer for S rows. hyper_h: the rows' streams in, the final ones out when
  * want_streams; mixed_h (or NULL): every row's final mixed row, for the prefill
