@@ -56,11 +56,16 @@ This measures adapter overhead only, not model throughput or disk performance.
 
 - Keep the remaining GLM header/control codec work tracked in #2654.
 - Establish an owning store lifecycle, including teardown with active leases,
-  before extracting common Engine/Session construction or a backend factory.
+  before changing common construction or introducing a backend factory.
+- Reuse the existing `segment_runtime.h/.c` engine/session boundary and real
+  family adapters. Its live-session close guard and snapshot capabilities already
+  exist; ordinary CLI/serve integration and capability-contract gaps still need
+  work. The ten-family conformance fixtures are synthetic state-topology tests,
+  not proof of real-model acceptance.
 - Keep native GGML and R16 layout identity explicit in any new backend adapter.
 - Require separate hardware acceptance before migrating the GPU expert tier.
 - Retain family-specific KV/recurrent state and unsupported snapshot/prefix
-  operations explicitly when defining future session adapters.
+  operations explicitly when extending the existing session adapters.
 
 ## Local evidence for this change
 
