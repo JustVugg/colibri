@@ -194,7 +194,7 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
 {
     char *line;
     size_t count = 0;
-    char *fields[10];
+    char *fields[12];   /* command + eight positional fields + three extension keys */
     int nfields = 0;
 
     if (!input || !profile || !command) return COLI_SERVE_READ_BAD_FRAME;
@@ -333,6 +333,7 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
         if (strchr(fields[f], '=')) { positional = f; break; }
     command->logprobs = 0;
     command->pin = 0;
+    int token_ids = 0;
     if (positional < nfields) {
         char ext[128]; size_t used = 0; ext[0] = 0;
         for (int f = positional; f < nfields; f++) {
@@ -348,6 +349,7 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
             if (!coli_submit_ext(ext, &tmp)) { free(line); return COLI_SERVE_READ_BAD_REQUEST; }
             command->logprobs = tmp.logprobs;
             command->pin = tmp.pin;
+            token_ids = tmp.tok_ids;
         }
     }
     if (positional < minimum_fields || positional > maximum_fields ||
@@ -399,6 +401,15 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
         return COLI_SERVE_READ_BAD_FRAME;
     }
     command->payload[payload_bytes] = 0;
+    /* Shared-reader consumers tokenize text; none implements ids=1. Consume a
+     * well-framed body before refusing it so callers that continue do not read
+     * its bytes as commands. Keep the request ID for their error response.
+     * GLM's numeric-header reader implements token IDs separately. */
+    if (token_ids) {
+        free(command->payload);
+        command->payload = NULL;
+        return COLI_SERVE_READ_BAD_REQUEST;
+    }
     return COLI_SERVE_READ_OK;
 }
 

@@ -45,13 +45,14 @@ static void test_submit_shapes_and_controls(void)
     free(request.prompt); fclose(input); fclose(output);
 
     static const char extended[] =
-        "SUBMIT ext 0 3 4 0 1 4 2\nabcWXYZ\n";
+        "SUBMIT ext 0 3 4 0 1 4 2 logprobs=2 pin=1\nabcWXYZ\n";
     input = bytes_input(extended, sizeof(extended) - 1);
     output = tmpfile(); assert(output); binary_stream(output);
     memset(&request, 0, sizeof(request));
     assert(v4_serve_read_request(input, output, &request, NULL) == 2);
     assert(request.prompt_bytes == 3 && request.extension_bytes == 4);
     assert(request.prefix_bytes == 2 && memcmp(request.prompt, "abc", 3) == 0);
+    assert(request.logprobs == 2 && request.pin == 1);
     assert(memcmp(request.prompt + request.prompt_bytes + 1, "WXYZ", 4) == 0);
     assert(fgetc(input) == EOF);
     free(request.prompt); fclose(input); fclose(output);

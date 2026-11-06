@@ -97,3 +97,18 @@ continue are followed by another control frame to verify stream alignment.
 These synthetic tests do not exercise active-request STOP/CANCEL effects or
 model inference. Full header/control migration and hardware acceptance remain
 open; this is not a completed GLM migration.
+
+## Shared-reader extension contract
+
+The shared reader accepts up to eight positional fields plus the command and
+three extension keys. This preserves V4's extension/prefix hint together with
+`logprobs` and `pin`, including an explicit `ids=0`. Its current consumers do not
+implement pretokenized input: a valid `ids=1` frame is consumed and refused with
+BAD_REQUEST rather than silently tokenizing the decimal IDs as text. GLM's
+separate numeric-header path continues to implement `ids=1`. A future unified
+header migration must carry that capability explicitly.
+
+Regression tests reproduce both defects on the previous implementation and
+check the shared reader, V4 request fields, OLMoE queue rejection, Qwen3.8
+control-frame alignment and GLM's retained token-ID intake. This does not fix
+all malformed-header recovery policies, which remain family-specific.
