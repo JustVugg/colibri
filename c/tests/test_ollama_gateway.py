@@ -294,6 +294,31 @@ class GatewayAttached(unittest.TestCase):
         with urlopen(req, timeout=10) as r:
             self.assertEqual(json.loads(r.read().decode())["status"], "ok")
 
+    def test_openai_routes_resolve_the_model(self):
+        """An OpenAI client names the model as Ollama's clients do: aliases and :latest resolve,
+        the engine gets the id it serves, an unknown name is OpenAI's 404."""
+        st, reply = self._post("/v1/chat/completions", {"model": "test-model:latest", "stream": False,
+                                                        "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(st, 200, reply)
+        self.assertEqual(reply["model"], "test-model")
+        self.assertEqual(reply["choices"][0]["message"]["content"], "Hello")
+        st, reply = self._post("/v1/chat/completions", {"model": "nope", "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(st, 404)
+        self.assertEqual(reply["error"]["code"], "model_not_found")
+        st, models = self._get("/v1/models/test-model:latest")
+        self.assertEqual(models["id"], "test-model")
+        st, body = self._get("/v1/models")
+        self.assertEqual([m["id"] for m in body["data"]], ["test-model"])
+
+    def test_think_default_openai(self):
+        body = {"messages": []}
+        self.assertEqual(gw.apply_think_default_openai(body, "low"), {"messages": [], "enable_thinking": True, "reasoning_effort": "low"})
+        self.assertEqual(gw.apply_think_default_openai(body, False), {"messages": [], "enable_thinking": False, "reasoning_effort": "none"})
+        self.assertEqual(gw.apply_think_default_openai(body, True), {"messages": [], "enable_thinking": True})
+        self.assertIs(gw.apply_think_default_openai(body, None), body)
+        explicit = {"messages": [], "reasoning_effort": "none"}
+        self.assertIs(gw.apply_think_default_openai(explicit, "low"), explicit)
+
     def test_unknown_model(self):
         st, body = self._post("/api/chat", {"model": "other", "messages": [{"role": "user", "content": "hi"}], "stream": False})
         self.assertEqual(st, 404)

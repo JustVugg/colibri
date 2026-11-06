@@ -94,6 +94,11 @@ Open WebUI's local embeddings (document upload, web search) do not go to Ollama 
 default, and the gateway answers `/api/embed` with 501: keep the embedding setting on
 its default (sentence-transformers inside Open WebUI) or point it at another engine.
 
+Clients on other machines need the gateway on the LAN interface, as Ollama with
+`OLLAMA_HOST=0.0.0.0`: `--host 0.0.0.0` wants `--api-key` (Open WebUI sends it as the
+Ollama connection's key, OpenAI clients as the bearer token) or `COLI_ALLOW_INSECURE_BIND=1`
+for a network that is trusted as a whole.
+
 A docker Open WebUI needs the gateway reachable from the container: `--network host`
 with `OLLAMA_BASE_URL=http://127.0.0.1:11434`, or a bridge network with
 `OLLAMA_BASE_URL=http://host.docker.internal:11434` and the gateway bound to that
@@ -117,6 +122,11 @@ connection's key, or `COLI_ALLOW_INSECURE_BIND=1`).
 | `/api/delete` | removes a model directory under `--models-dir` (nothing elsewhere) |
 | `/api/embed`, `/api/embeddings`, `/api/create`, `/api/copy`, `/api/push` | 501 with a line saying so |
 | `/v1/*`, `/health`, `/` | passed through to the engine unchanged |
+
+OpenAI clients get the same: `/v1/models` lists every model of the gateway, and a
+`/v1/chat/completions` (`/v1/completions`, `/v1/messages`, `/v1/responses`) names its
+model by any of the gateway's names, which loads it before the request goes to the
+engine. A client with the engine's address and model id works as before.
 
 `GET /api/gateway` is the gateway's own state (model loaded, loading, failed, pulling).
 `/api/version` says `0.12.0-colibri`: Open WebUI reads the leading numbers for its
