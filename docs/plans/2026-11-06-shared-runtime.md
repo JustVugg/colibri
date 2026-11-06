@@ -20,7 +20,7 @@ same kind of sequence state.
 | Shared serving transport | `serve_codec.h` used by OLMoE, Kimi K3, DeepSeek V4 and Inkling; #1087, #1090, #1096, #1116 | GLM mux still owns most framing. Later families need their own coverage audit. |
 | ExpertStore | `expert_store.h` defines views and leases; production consumers remain V4-specific | Demonstrate the seam with a second family before designing a common factory. |
 | Backend factory | `expert_store_registry.h` accepts V4 engine/config/options | This is a V4 extension seam, not a model-independent registry. |
-| Engine/Session | V4 has its own lifecycle and other families own their state | Defer common adapters until the previous seams survive multiple consumers. |
+| Engine/Session | `segment_runtime.h/.c` already provide opaque engine/session handles, live-session close protection and capability checks; real family adapters exist | Reuse this layer-segment runtime, which is separate from ordinary CLI/serve, and audit its capability/lifecycle contracts before broader integration. |
 
 ## Ordered delivery
 
@@ -50,7 +50,8 @@ slice does not complete the migration or establish real-model GPU parity.
 
 ### 2. ExpertStore with a second production consumer
 
-Start by auditing OLMoE's existing `expert_get`/`expert_put`, busy-slot ownership,
+The CPU view/lease adapter is proposed separately in #2655. Continue auditing
+OLMoE's existing `expert_get`/`expert_put`, busy-slot ownership,
 prefetch eviction protection, row-int8 weights, native GGUF blocks and CPU
 interleaved rows. Add baseline lease/eviction and output tests before adapting
 one path. Do not label repacked bytes as ordinary GGUF tensor views.
@@ -68,10 +69,17 @@ require separate hardware acceptance before being claimed migrated.
 
 ### 3. Engine/Session adapters
 
-Only then define a small host lifecycle contract around existing families.
-Engine owns weights and stores; sessions own family-specific state and must be
-destroyed first. Unsupported prefix/snapshot operations must be explicit.
-Test two families with different state layouts before adding another abstraction.
+Use the existing `segment_runtime.h/.c` rather than introducing a competing
+engine/session framework. It already wraps family adapters, refuses engine close
+with live sessions, and exposes explicit snapshot support. Its conformance
+fixtures cover ten state topologies; fixture coverage is distinct from real
+adapter/model acceptance. Ordinary CLI/serve paths do not use it yet.
+
+Audit capabilities and lifetime rules at this boundary, then establish which
+serve responsibilities can reuse it without forcing layer-segment semantics on
+full generation. Engine owns weights and stores; sessions retain family-specific
+state and must be destroyed first. Store ownership in ordinary family serving
+remains separate work. Unsupported prefix/snapshot operations stay explicit.
 
 ## Delivered slices
 
