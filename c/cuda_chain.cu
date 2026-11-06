@@ -50,6 +50,7 @@ struct CcCtx {
     int f2_big;  /* cc_attn_f2's head dim 256 (66 KiB of shared memory): 1 allowed, -1 refused, 0 not asked */
     int f2_big_h;   /* the same for its float16 cache's kernel */
     int f2_mid, f2_mid_h;   /* the same for head dim 256's blocks of 16 keys (49.5 KiB: a T4 gives 64) */
+    int f2_b3[2], f2_m3[2];   /* the same for its three-warp kernels (12 query heads a kv head), [float16 cache] */
     cudaStream_t stream;
     cudaEvent_t ev; int ev_ok, ev_pending;
     /* staging (cc_fetch): the copy stream, its copies' event and the buffer's last reader's */
@@ -703,7 +704,7 @@ static constexpr size_t cc_f2_smem_bytes() { return ((size_t)2 * BC * (HD + 8) +
 template<int HD, int NW, int BC, bool QREG, typename KT = float>
 __global__ static void __launch_bounds__(32 * NW) cc_attn_f2(const float *__restrict__ q, const KT *__restrict__ kc,
         const KT *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, CcAttn p, int GQ,
-        int win, const float *__restrict__ snk, int sink_off, int ring) {
+        int win, const float *__restrict__ snk, int sink_off, int ring, const int *__restrict__ sel_) {
     COLI_PDL_WAIT();
 #if CC_F2_BODY
     constexpr int LD = HD + 8, BR = 16 * NW, NT = 32 * NW, NKT = BC / 8, NDT = HD / 8, KS = HD / 16;
@@ -740,9 +741,48 @@ __global__ static void __launch_bounds__(32 * NW) cc_attn_f2(const float *__rest
     float oa[NDT][4];
     #pragma unroll
     for (int dt = 0; dt < NDT; dt++) oa[dt][0] = oa[dt][1] = oa[dt][2] = oa[dt][3] = 0.f;
+    /* sel (QSA): each token's list of positions in ascending order (CcAttn.sel_off, sel_row: its
+     * count, -1 none, then the positions); a key block's mask a token (smk, bit i: key k0 + i) from
+     * the part of the list the block covers (scur, the list's next entry); a block no token of the
+     * block selects from is skipped */
+    const int *sel = BC <= 32 ? sel_ : nullptr;   /* a token's mask of a key block is a word: blocks of 32 keys or fewer */
+    __shared__ unsigned smk[64];
+    __shared__ int scur[64], slen[64];
+    const int wt0 = (warp * 16) / GQ, wt1 = (warp * 16 + 15) / GQ;   /* the warp's rows' tokens, of the block's */
+    if (sel) {
+        for (int j = tid; j < TPB; j += NT) {
+            const int tk = t0 + j;
+            slen[j] = tk < S ? sel[p.sel_off + (size_t)tk * p.sel_row] : 0; scur[j] = 0;
+        }
+        __syncthreads();
+    }
     const int kb_lo = win > 0 && pb + t0 - win + 1 > 0 ? (pb + t0 - win + 1) / BC : 0, kb_hi = (pb + tlast) / BC;
     for (int kb = kb_lo; kb <= kb_hi; kb++) {
         const int k0 = kb * BC;
+        if (sel) {
+            for (int j = warp; j < TPB; j += NW) {
+                const int n = slen[j], cur = scur[j];
+                unsigned mk = 0u;
+                if (n < 0) mk = BC >= 32 ? 0xFFFFFFFFu : ((1u << (BC & 31)) - 1u);   /* no list: every position */
+                else {
+                    const int e = cur + lane;
+                    const int pos = e < n ? sel[p.sel_off + (size_t)(t0 + j) * p.sel_row + 1 + e] : 0x7fffffff;
+                    const bool in = pos >= k0 && pos < k0 + BC;
+                    unsigned bit = in ? 1u << (pos - k0) : 0u;
+                    #pragma unroll
+                    for (int off = 16; off > 0; off >>= 1) bit |= __shfl_xor_sync(0xffffffffu, bit, off);
+                    mk = bit;
+                    const unsigned cnt = __popc(__ballot_sync(0xffffffffu, in));
+                    if (lane == 0) scur[j] = cur + (int)cnt;
+                }
+                if (lane == 0) smk[j] = mk;
+            }
+            __syncthreads();
+            unsigned any = 0u;
+            for (int j = 0; j < TPB; j++) any |= smk[j];
+            if (!any) { __syncthreads(); continue; }   /* every thread read the same masks: none of the block's tokens
+                                                        * selects a key here (the masks are written again next block) */
+        }
         for (int e = tid; e < BC * HD / 4; e += NT) {   /* K and V of keys k0 .. k0 + BC - 1, zero past nt */
             int kl = e / (HD / 4), d = (e - kl * (HD / 4)) * 4, key = k0 + kl;
             float4 kv = make_float4(0.f, 0.f, 0.f, 0.f), vv = kv;
@@ -756,8 +796,10 @@ __global__ static void __launch_bounds__(32 * NW) cc_attn_f2(const float *__rest
         }
         __syncthreads();
         /* none of this warp's rows sees a key of the block: past its last row, or before its
-         * first row's window */
-        if (k0 <= whi && (win <= 0 || k0 + BC - 1 + win > wlo)) {
+         * first row's window, or none of its tokens selects one */
+        unsigned wsel = sel ? 0u : 1u;
+        if (sel) for (int j = wt0; j <= wt1 && j < TPB; j++) wsel |= smk[j];
+        if (k0 <= whi && (win <= 0 || k0 + BC - 1 + win > wlo) && wsel) {
             float sc[NKT][4];
             #pragma unroll
             for (int j = 0; j < NKT; j++) sc[j][0] = sc[j][1] = sc[j][2] = sc[j][3] = 0.f;
@@ -776,15 +818,17 @@ __global__ static void __launch_bounds__(32 * NW) cc_attn_f2(const float *__rest
             }
             /* the masks only where a row's position or window cuts the block */
             const bool edge = !(k0 + BC - 1 <= wlo && (win <= 0 || k0 + win > whi));
+            const int j0 = r0 / GQ < TPB ? r0 / GQ : TPB - 1, j1 = r1 / GQ < TPB ? r1 / GQ : TPB - 1;
+            const unsigned mk0 = sel ? smk[j0] : 0xFFFFFFFFu, mk1 = sel ? smk[j1] : 0xFFFFFFFFu;
             float x0 = -1e30f, x1 = -1e30f;
             #pragma unroll
             for (int j = 0; j < NKT; j++)
                 #pragma unroll
                 for (int u = 0; u < 2; u++) {
-                    if (edge) {
-                        int key = k0 + j * 8 + tig * 2 + u;
-                        if (key > qp0 || (win > 0 && key + win <= qp0)) sc[j][u] = -1e30f;
-                        if (key > qp1 || (win > 0 && key + win <= qp1)) sc[j][2 + u] = -1e30f;
+                    if (edge || sel) {
+                        int key = k0 + j * 8 + tig * 2 + u, kl = j * 8 + tig * 2 + u;
+                        if (key > qp0 || (win > 0 && key + win <= qp0) || !((mk0 >> kl) & 1u)) sc[j][u] = -1e30f;
+                        if (key > qp1 || (win > 0 && key + win <= qp1) || !((mk1 >> kl) & 1u)) sc[j][2 + u] = -1e30f;
                     }
                     x0 = fmaxf(x0, sc[j][u]); x1 = fmaxf(x1, sc[j][2 + u]);
                 }
@@ -838,50 +882,59 @@ __global__ static void __launch_bounds__(32 * NW) cc_attn_f2(const float *__rest
 #if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)   /* the opt-in limit's attribute is CUDA's */
 /* cc_attn_f2 at head dim 256 with blocks of BC keys (1: launched); ok says whether the card gives
  * its shared memory, asked once: 1 allowed, -1 refused, 0 not asked */
-template <int BC, typename KT>
+template <int BC, typename KT, int NW = 4>
 static int cc_f2_256(CcCtx *c, int &ok, dim3 fg, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, const CcAttn *p,
-                     int G, int win, const float *sk, int so, int ring) {
-    const size_t sm = cc_f2_smem_bytes<256, 4, BC, false>();
+                     int G, int win, const float *sk, int so, int ring, const int *sel) {
+    const size_t sm = cc_f2_smem_bytes<256, NW, BC, false>();
     if (!ok) {
         int optin = 0;
         ok = cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, c->device) == cudaSuccess &&
              (size_t)optin >= sm &&
-             cudaFuncSetAttribute(cc_attn_f2<256, 4, BC, false, KT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm) == cudaSuccess
+             cudaFuncSetAttribute(cc_attn_f2<256, NW, BC, false, KT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm) == cudaSuccess
              ? 1 : -1;
         (void)cudaGetLastError();
     }
     if (ok < 0) return 0;
-    coli_launch(cc_attn_f2<256, 4, BC, false, KT>, fg, 128, sm, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
+    coli_launch(cc_attn_f2<256, NW, BC, false, KT>, fg, 32 * NW, sm, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so,
+                ring, sel);
     return 1;
 }
 #endif
 /* cc_attn_f2 for a prompt chunk where it applies (1: launched): sm_75 and later, head dim 64,
- * 128 or 256, the query heads of a kv head dividing 64, rows and caches at float4 offsets;
- * COLI_CUDA_CHAIN_FLASH2=0 keeps cc_attn_fk */
+ * 128 or 256, the query heads of a kv head dividing 64 (head dim 256: or 48, three warps a block:
+ * Qwen3.8's 12), rows and caches at float4 offsets; sel, a selection list a row (QSA; NULL none,
+ * head dim 256 only). COLI_CUDA_CHAIN_FLASH2=0 keeps cc_attn_fk */
 template <typename KT>
 static int cc_attn_f2_go(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, const CcAttn *p, int G,
-                         int win, const float *sk, int so, int ring) {
+                         int win, const float *sk, int so, int ring, const int *sel = nullptr) {
 #if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_CUDA_CHAIN_FLASH2"); on = !(e && *e == '0'); }
-    if (!on || c->major * 10 + c->minor < 75 || 64 % G || (p->hd != 64 && p->hd != 128 && p->hd != 256) ||
+    if (!on || c->major * 10 + c->minor < 75 || (p->hd != 64 && p->hd != 128 && p->hd != 256) ||
         (p->q_off | p->q_row | p->q_seg | p->k_off | p->v_off) % 4) return 0;
+    if (p->hd == 256 && 64 % G && 48 % G == 0 && sel) {   /* three warps: 48 rows, 48 / G tokens a block (a selection list's) */
+        dim3 f3((unsigned)((p->S + 48 / G - 1) / (48 / G)), (unsigned)p->KVH);
+        const int h = sizeof(KT) == 2;
+        return cc_f2_256<32, KT, 3>(c, c->f2_b3[h], f3, q, kc, vc, o, gate, p, G, win, sk, so, ring, sel) ||
+               cc_f2_256<16, KT, 3>(c, c->f2_m3[h], f3, q, kc, vc, o, gate, p, G, win, sk, so, ring, sel);
+    }
+    if (64 % G || (sel && p->hd != 256)) return 0;
     dim3 fg((unsigned)((p->S + 64 / G - 1) / (64 / G)), (unsigned)p->KVH);
     if (p->hd == 64) {
         coli_launch(cc_attn_f2<64, 4, 64, true, KT>, fg, 128, cc_f2_smem_bytes<64, 4, 64, true>(), c->stream, 
-            fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
+            fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring, (const int *)nullptr);
     } else if (p->hd == 128) {
         coli_launch(cc_attn_f2<128, 4, 64, true, KT>, fg, 128, cc_f2_smem_bytes<128, 4, 64, true>(), c->stream, 
-            fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
+            fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring, (const int *)nullptr);
     } else {   /* blocks of 32 keys where the card gives 66 KiB, else of 16 (49.5 KiB: a T4 gives 64) */
         int &big = sizeof(KT) == 2 ? c->f2_big_h : c->f2_big;   /* a float16 cache's kernels are other functions */
         int &mid = sizeof(KT) == 2 ? c->f2_mid_h : c->f2_mid;
-        if (!cc_f2_256<32, KT>(c, big, fg, q, kc, vc, o, gate, p, G, win, sk, so, ring) &&
-            !cc_f2_256<16, KT>(c, mid, fg, q, kc, vc, o, gate, p, G, win, sk, so, ring)) return 0;
+        if (!cc_f2_256<32, KT>(c, big, fg, q, kc, vc, o, gate, p, G, win, sk, so, ring, sel) &&
+            !cc_f2_256<16, KT>(c, mid, fg, q, kc, vc, o, gate, p, G, win, sk, so, ring, sel)) return 0;
     }
     return 1;
 #else
-    (void)c; (void)q; (void)kc; (void)vc; (void)o; (void)gate; (void)p; (void)G; (void)win; (void)sk; (void)so; (void)ring;
+    (void)c; (void)q; (void)kc; (void)vc; (void)o; (void)gate; (void)p; (void)G; (void)win; (void)sk; (void)so; (void)ring; (void)sel;
     return 0;
 #endif
 }
@@ -2533,6 +2586,16 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
             return launched(c, "attn (positions in blocks)");
         }
     }
+    /* a prompt chunk's rows with a selection list on the tensor cores (cc_attn_f2 with sel, head dim
+     * 256), from COLI_CUDA_CHAIN_FLASH rows: the lists' positions ascending, as cc_qsa writes them.
+     * cc_attn_gk took 15.9 ms of a 2048-row chunk of Qwen3.8's on an RTX PRO 4000 (CUDA cores, f32).
+     * COLI_CUDA_ATTN_SEL_TC=0 keeps cc_attn_gk below. Not bit-identical to it (f16 operands, one pass) */
+    int stc = 1;   /* read each call, as COLI_CUDA_ATTN_DEC_SEL */
+    { const char *e = getenv("COLI_CUDA_ATTN_SEL_TC"); stc = !(e && *e == '0'); }
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+    if (stc && fl > 0 && p->S >= fl && p->sel_row > 0 && p->hd == 256 && cc_attn_f2_go<KT>(c, q, kc, vc, o, gate, p, G, 0, nullptr, 0, 0, sp))
+        return launched(c, "attn (tensor cores, a selection list)");
+#endif
     /* a prompt chunk's rows with a selection list: a block per (kv head, row), cc_attn_gk, from
      * COLI_CUDA_ATTN_GROUPED rows (32; 0 = never) */
     static int gr = -1;

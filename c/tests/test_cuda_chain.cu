@@ -907,6 +907,7 @@ int main(void) {
         std::vector<float> o((size_t)S * H * hd), ref = o;
         ref_attn(q.data(), kc.data(), vc.data(), ref.data(), q.data(), sel.data(), &p);
         CcBuf *qb = up(q), *kb = up(kc), *vb = up(vc), *ob = T->buf(o.size() * 4, CC_DEV), *sb = T->buf(sel.size() * 4, CC_DEV);
+        setenv("COLI_CUDA_ATTN_SEL_TC", "0", 1);   /* cc_attn_gk: these lists are in no order, with repeats */
         int ok = T->begin() && T->write(sb, 0, sel.data(), sel.size() * 4) && T->attn(qb, kb, vb, ob, qb, sb, &p) && T->submit(1);
         std::vector<float> all = down(ob, o.size());
         ck(ok && maxdiff(all.data(), ref.data(), o.size()) < 1e-4, "40 rows with selection lists, a block per kv head, against the reference");
@@ -935,7 +936,37 @@ int main(void) {
             T->free(o2);
         }
         ck(okd && worst < 1e-4, "a verify's rows with selection lists in blocks of positions, against the reference");
+        unsetenv("COLI_CUDA_ATTN_SEL_TC");
         T->free(qb); T->free(kb); T->free(vb); T->free(ob); T->free(sb); T->free(o1);
+    }
+    {   /* a prompt chunk's rows with selection lists on the tensor cores (cc_attn_f2 with them, three warps
+         * for 12 query heads a kv head): lists in ascending order as cc_qsa writes them, blocks of four
+         * positions and the row's own last ones, a row without a list, short lists, key blocks no row of a
+         * block selects, 41 rows (a block of tokens cut short); against the reference, f16's error */
+        const int H = 24, KV = 2, hd = 256, qdim = 2 * hd, cap = 1600, pos_base = 1100, S = 41, NS = 520, SR = NS + 1;
+        std::vector<float> q = rnd((size_t)S * H * qdim, 71), kc = rnd((size_t)KV * cap * hd, 72), vc = rnd((size_t)KV * cap * hd, 73);
+        std::vector<int> sel((size_t)S * SR, 0);
+        for (int r = 0; r < S; r++) {
+            const int vis = pos_base + r + 1;
+            if (r == 5) { sel[(size_t)r * SR] = -1; continue; }   /* no list: every position up to the row's */
+            std::vector<int> pos;
+            const int want = r % 7 == 0 ? 37 : NS - 8;
+            for (int b = 0; b * 4 < vis - 4 && (int)pos.size() + 4 <= want; b++)   /* blocks of 4, two in five, more near the end */
+                if ((b * 2654435761u + (unsigned)r * 40503u) % 5 < 2 || b * 4 > vis - 200)
+                    for (int i = 0; i < 4; i++) pos.push_back(b * 4 + i);
+            for (int t = (vis - 4) / 4 * 4; t < vis && (int)pos.size() < want; t++) if (pos.empty() || t > pos.back()) pos.push_back(t);
+            sel[(size_t)r * SR] = (int)pos.size();
+            for (size_t i = 0; i < pos.size(); i++) sel[(size_t)r * SR + 1 + i] = pos[i];
+        }
+        CcAttn p = {S, H, KV, hd, pos_base, cap, 0, H * qdim, qdim, hd, H * qdim, qdim, 1, 0, H * hd, 0, SR, 1.f / sqrtf((float)hd), 0, 0};
+        std::vector<float> ref((size_t)S * H * hd);
+        ref_attn(q.data(), kc.data(), vc.data(), ref.data(), q.data(), sel.data(), &p);
+        CcBuf *qb = up(q), *kb = up(kc), *vb = up(vc), *ob = T->buf(ref.size() * 4, CC_DEV), *sb = T->buf(sel.size() * 4, CC_DEV);
+        int ok = qb && kb && vb && ob && sb && T->begin() && T->write(sb, 0, sel.data(), sel.size() * 4) && T->attn(qb, kb, vb, ob, qb, sb, &p) && T->submit(1);
+        const double d = ok ? maxdiff(down(ob, ref.size()).data(), ref.data(), ref.size()) : 1;
+        char what[160]; snprintf(what, sizeof what, "41 rows with ascending selection lists on the tensor cores, against the reference (|d| %.1e)", d);
+        ck(ok && d < 4e-3, what);
+        T->free(qb); T->free(kb); T->free(vb); T->free(ob); T->free(sb);
     }
     {   /* a decode's or a verify's rows over many positions: in blocks of positions (cc_attn_dec_k) */
         struct { int H, KV, hd, S, pos_base, cap, gate; } cs[] = {{16, 2, 256, 3, 2500, 3000, 1}, {4, 2, 32, 1, 140, 300, 1},
