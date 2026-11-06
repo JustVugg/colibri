@@ -1,4 +1,8 @@
 #include "backend_cuda_dsv4.h"
+/* Internal definitions compile on Windows too; these are not DLL exports. */
+extern "C" {
+#include "backend_cuda_dsv4_target.h"
+}
 #include <chrono>
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
