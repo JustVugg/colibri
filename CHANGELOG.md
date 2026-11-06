@@ -37,6 +37,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **Qwen3.8: a long prompt layer by layer with the MTP head too** (CUDA and Vulkan chains). A prompt of
+  several chunks runs layer by layer, each layer's host pool experts staged once for all its chunks, but
+  not when the caller wanted the rows' final streams back, and the MTP head's prefill always does: with
+  the head (on by default where the file has it) every chunk staged every layer again. The layer-by-layer
+  path now gives the streams back as the chunks do, and picks the promotions at the prompt's end as the
+  chunks did after each one. Qwen3.8-Flash-Next IQ2_XS with its MTP head on an RTX PRO 4000, two serves a
+  side: a 4220-token prompt 580-583 -> 798-807 tok/s on CUDA (56 GB -> 19 GB over the bus), 154-173 ->
+  305-308 on Vulkan, a 585-token one 115-134 -> 193-196 on Vulkan; the same text, the decode after it
+  and in the turns after the same.
 - **The CUDA chains' promotions in one call a frame.** An expert promoted to the card went over the
   bus in three copies (Qwen3.6's six), each `cc_host_up` five calls of the runtime (a mark's wait,
   the frame's event, the copy stream's wait on it, the copy, its mark): 20-30 experts after a
@@ -165,6 +174,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **CUDA: unsloth's Dynamic GGUFs with Q5_0 or Q5_1 experts kept every expert on the CPU.**
+  The tier's integer step had neither type, and one such tensor left the whole tier off:
+  Qwen3.8-Flash-Next UD-IQ2_XS has one Q5_0 down, UD-Q2_K_XL one, UD-Q3_K_XL 20, UD-IQ4_XS 33,
+  UD-Q4_K_XL 43 Q5_1. Both are now on the card as the CPU's integer form computes them.
+  UD-IQ2_XS on an RTX PRO 4000: decode 8.3-8.6 -> 51.7-68.2 tok/s, a 585-token prompt
+  24.6-25.1 -> 206-325 tok/s.
+- **Qwen3.8 on a CPU without FMA: the DeltaNet recurrence 4x faster** (#2606). Its fused
+  multiply-adds (`fmaf`) are one instruction where the CPU fuses (FMA3, arm64) and a call into
+  libm for every element where it does not (Sandy and Ivy Bridge, the x86-64 baseline), which
+  no loop vectorizes and glibc computes in software: a Xeon E5-2690 v1 spent 898 ms of a 1248 ms
+  forward there. `coli_fmaf` (`fma_compat.h`) is `fmaf` where the CPU fuses, the same
+  instructions, and elsewhere the product in double and the sum rounded to float, which AVX
+  vectorizes. Built for Sandy Bridge with glibc's software `fmaf`, Qwen3.8 IQ2_XS: the recurrence
+  208 -> 52 ms a forward, the same perplexity (2.2402 nats a token over 258 tokens); the planar
+  expert kernel's f32 mode (`QWEN_EXPERT_ACT=f32`) on Qwen3.6 0.59 -> 2.9 tok/s.
 - **Qwen3.8: memory that grew with every answer** (#2592). The expert loader reads a batch of
   missing experts in parallel (on by default) with a team as large as the batch, and libgomp
   ends the threads a smaller team leaves out and starts new ones for a larger. Each read

@@ -158,7 +158,7 @@ typedef struct {
 } CcMoe;
 /* the ggml types cc_moe takes for a GGUF's experts (CcMoe.fmt >= 100: cuda_bd.cuh's integer step) */
 static inline int cc_moe_block_type(int t) {
-    return t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 18 || t == 19 || t == 20 ||
+    return t == 6 || t == 7 || t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 18 || t == 19 || t == 20 ||
            t == 21 || t == 22 || t == 23 || t == 29 || t == 42;
 }
 /* More rows than this (a prompt chunk): the slots sorted by expert and each expert's rows
