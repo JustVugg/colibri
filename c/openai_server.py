@@ -7078,9 +7078,11 @@ class _Pending:
     keeps holding it until the engine says the turn is over. Dropping the entry instead
     would free the admission while the engine is still generating, and the next request
     would submit into a pipe nobody is reading."""
-    __slots__ = ("events", "logprob_channel", "failed")
+    __slots__ = ("events", "logprob_channel", "failed", "started_at", "cancel_at")
 
     def __init__(self, logprob_channel=False):
+        self.started_at = time.monotonic()
+        self.cancel_at = None
         self.events = queue.Queue()
         self.logprob_channel = logprob_channel
         self.failed = None
@@ -7130,6 +7132,12 @@ class Engine:
         self.supports_tok_ids = (arch == "glm")
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
+        self.request_timeout = float(child_env.get("COLI_ENGINE_REQUEST_TIMEOUT", "1800"))
+        self.cancel_timeout = float(child_env.get("COLI_ENGINE_CANCEL_TIMEOUT", "30"))
+        if any(not math.isfinite(value) or value <= 0
+               for value in (self.request_timeout, self.cancel_timeout)):
+            raise ValueError("engine request and cancel timeouts must be finite and positive")
+        self._stall_error = None
         tune_child_env(child_env, arch)
         decision_head_env(child_env, model)
         # before the cap: the RAM plan reserves the context it is given
@@ -7236,6 +7244,36 @@ class Engine:
         request fails, so an engine whose process outlived its reader counts as gone too."""
         return not self.closed and self.dispatcher_error is None and self.process.poll() is None
 
+    def stalled_reason(self):
+        """Hard request limits, independent of stdout and potentially blocked pipe writes."""
+        with self.pending_lock:
+            if self._stall_error is not None:
+                return self._stall_error
+            now = time.monotonic()
+            for request_id, entry in self.pending.items():
+                if entry.cancel_at is not None and now - entry.cancel_at >= self.cancel_timeout:
+                    self._stall_error = f"engine cancellation timed out for request {request_id}"
+                elif now - entry.started_at >= self.request_timeout:
+                    self._stall_error = f"engine execution timed out for request {request_id}"
+                if self._stall_error is not None:
+                    return self._stall_error
+        return None
+
+    def abort_stalled(self, reason):
+        """Do not admit work on a replacement until the old process is reaped."""
+        with self.pending_lock:
+            self.closed = True
+        if self.process.poll() is None:
+            try:
+                self.process.kill()
+                self.process.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+        if self.process.poll() is None:
+            return False
+        self._fail_pending(RuntimeError(reason))
+        return True
+
     @staticmethod
     def _stats(fields):
         if len(fields) < 5 or fields[0] != "STAT":
@@ -7272,6 +7310,11 @@ class Engine:
         silent connection close instead of the 500 engine_error the failure
         actually is. _write_all's own RuntimeError is already the named
         error this raises for an OSError, so it is re-raised as-is."""
+        if frame in ("CANCEL", "STOP"):
+            with self.pending_lock:
+                entry = self.pending.get(request_id)
+                if entry is not None and entry.cancel_at is None:
+                    entry.cancel_at = time.monotonic()
         try:
             with self.write_lock:
                 _write_all(self.process.stdin, data, frame)
@@ -10534,9 +10577,15 @@ def keep_engine(server, start, stopping, watch=ENGINE_WATCH_S, delays=ENGINE_RES
     is set; serve() runs it on its own thread."""
     while not stopping.wait(watch):
         dead = server.engine
-        if engine_alive(dead):
+        stalled = getattr(dead, "stalled_reason", lambda: None)()
+        if not stalled and engine_alive(dead):
             continue
         server.scheduler.pause()
+        if stalled:
+            print(f"[gateway] {stalled}; retiring the engine", file=sys.stderr)
+            if not dead.abort_stalled(stalled):
+                continue  # retry reaping; never load a second engine over a live one
+
         if stopping.wait(grace):
             return
         cause = (getattr(dead, "dispatcher_error", None) or getattr(dead, "dead", None)
