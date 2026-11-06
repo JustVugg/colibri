@@ -302,3 +302,13 @@ python tools/benchmark_cuda_fixture.py --model /nvme/colibri-bench-medium --gpu 
 The 313M-parameter fixture has random weights and is not a language model. It
 preserves the real MLA/MoE/streaming shapes to compare CPU streaming, dense-only
 CUDA, CPU hot-store, and CUDA hot-expert execution with identical replay tokens.
+
+### Direct DeepSeek V4 builds and older toolkits
+
+`make -C c -f Makefile.deepseek-v4 deepseek-v4 CUDA=1` checks the selected
+`NVCC` toolkit version before compiling the cuBLASLt block-scaling path.
+That path requires CUDA 12.8 or newer. An older or unrecognized version stops
+with a diagnostic; it does not silently change the requested configuration.
+Use a compatible toolkit, or explicitly pass `NO_TC=1` to compile the generic
+path without that check. GPU architecture support and the separate DeepGEMM
+requirements still apply. CPU-only builds do not probe CUDA.
