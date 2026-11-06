@@ -427,6 +427,31 @@ class PullWithFakeSetup(unittest.TestCase):
         self.assertIn("not in colibri's catalog", json.loads(text)["error"])
 
 
+class ConfigReload(unittest.TestCase):
+    def test_an_edited_gateway_json_is_taken_on_refresh(self):
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="coli-gw-cfg-")
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        model = os.path.join(tmp, "m"); os.makedirs(model)
+        with open(os.path.join(model, "config.json"), "w") as f:
+            json.dump({}, f)
+        cfg = os.path.join(tmp, "gateway.json")
+        def write(ctx, think):
+            with open(cfg, "w") as f:
+                json.dump({"models": {"m": {"path": model, "ctx": ctx, "think": think, "aliases": ["mm"]}}}, f)
+        write(16384, "low")
+        reg = gw.ModelRegistry(None, [], gw.load_gateway_config(cfg), config_path=cfg)
+        self.assertEqual((reg.entries["m"]["context_length"], reg.entries["m"]["think"]), (16384, "low"))
+        write(65536, False)
+        reg.refresh()
+        self.assertEqual((reg.entries["m"]["context_length"], reg.entries["m"]["think"]), (65536, False))
+        self.assertIs(reg.resolve("mm"), reg.entries["m"])
+        with open(cfg, "w") as f:
+            f.write("{ broken")
+        reg.refresh()                     # a broken file: the last good config stays
+        self.assertEqual(reg.entries["m"]["context_length"], 65536)
+
+
 class ModelFiles(unittest.TestCase):
     """What /api/tags says about a folder: the converter's meta file, a GGUF's type, a sidecar."""
 

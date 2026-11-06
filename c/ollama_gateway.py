@@ -641,15 +641,29 @@ class ModelRegistry:
     model `args` and `env` for coli serve). Names are what /api/tags lists; a request may
     say `name`, `name:latest` or an alias."""
 
-    def __init__(self, models_dir, extra=(), config=None):
+    def __init__(self, models_dir, extra=(), config=None, config_path=None):
         self.models_dir = models_dir
         self.extra = list(extra)
         self.config = config or {}
+        self.config_path = config_path   # set, gateway.json is read again on every refresh
         self.entries = {}
         self.aliases = {}
         self.refresh()
 
+    @staticmethod
+    def _spec_fields(spec):
+        """What a model's gateway.json entry says: the fields that may change while the gateway runs
+        (an edited ctx or think is taken by the next load, no restart of the gateway)."""
+        return {"params": spec.get("params"), "args": list(spec.get("args") or []), "env": dict(spec.get("env") or {}),
+                "context_length": spec.get("ctx"), "kv_slots": spec.get("kv_slots"), "think": spec.get("think"),
+                "license": spec.get("license", "")}
+
     def refresh(self):
+        if self.config_path:
+            try:
+                self.config = load_gateway_config(self.config_path)
+            except (OSError, ValueError) as error:
+                print(f"[gateway] {self.config_path}: {error}; the last good one stays", file=sys.stderr, flush=True)
         found = {}
         if self.models_dir and os.path.isdir(self.models_dir):
             for name in sorted(os.listdir(self.models_dir)):
@@ -669,17 +683,14 @@ class ModelRegistry:
         entries = {n: e for n, e in self.entries.items() if e.get("pinned")}   # an attached engine's, kept
         for name, path in found.items():
             old = self.entries.get(name)
+            spec = cfg_models.get(name) if isinstance(cfg_models.get(name), dict) else {}
             if old and old["path"] == path:
+                old.update(self._spec_fields(spec))
                 entries[name] = old
                 continue
-            spec = cfg_models.get(name) if isinstance(cfg_models.get(name), dict) else {}
             entries[name] = {"name": name, "path": path, "family": _family_of(path), "format": _model_format(path),
-                             "quant": _model_quant(path), "params": spec.get("params"),
-                             "size": None, "modified_at": self._mtime(path),
-                             "digest": "sha256:" + hashlib.sha256(path.encode()).hexdigest(),
-                             "args": list(spec.get("args") or []), "env": dict(spec.get("env") or {}),
-                             "context_length": spec.get("ctx"), "kv_slots": spec.get("kv_slots"),
-                             "think": spec.get("think"), "license": spec.get("license", "")}
+                             "quant": _model_quant(path), "size": None, "modified_at": self._mtime(path),
+                             "digest": "sha256:" + hashlib.sha256(path.encode()).hexdigest(), **self._spec_fields(spec)}
         self.entries = entries
         self.aliases = {}
         for name, spec in cfg_models.items():
@@ -1388,7 +1399,7 @@ def main(argv=None):
     if a.host not in ("127.0.0.1", "localhost", "::1") and not a.api_key and os.environ.get("COLI_ALLOW_INSECURE_BIND") != "1":
         sys.exit("refusing to bind beyond localhost without --api-key (COLI_ALLOW_INSECURE_BIND=1 overrides)")
     config = load_gateway_config(a.config)
-    registry = ModelRegistry(a.models_dir, a.model, config)
+    registry = ModelRegistry(a.models_dir, a.model, config, config_path=a.config)
     default_model = a.default_model or config.get("default")
     if a.engine_url and a.engine_model and registry.resolve(a.engine_model) is None:
         registry.entries[a.engine_model] = {"name": a.engine_model, "path": "", "family": "", "format": "colibri",
