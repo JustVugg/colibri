@@ -1,0 +1,129 @@
+{
+ "version": 1,
+ "hypothesis": "On AArch64 the int8 activation expert dot in expert_ffn.h ran the scalar reference; an SDOT kernel with the same lane order and fma tree should cut expert compute and decode time on an M1 Air while keeping the generated text identical.",
+ "commit": "b591acb1a10add75a76453c46cc9e85c63bfdca4",
+ "model": "Qwen3.6-35B-A3B, int4 gs64 experts (qwen36 container), 23.03 GB, HF Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64",
+ "command": "baseline: git worktree at 5cfb55bd, trial: b591acb1; make -C c qwen36 OMPDIR=$HOME/libomp-static (clang -O3 -Xclang -fopenmp); per run: env -u OMP_NUM_THREADS -u OMP_DYNAMIC SNAP=$HOME/models/qwen36_i4_gs64 N_NEW=16 COLI_TIMERS=1 /usr/bin/time -l ./qwen36 2 4 prompt.txt; order base x3, trial x3, trial x3, base x3",
+ "prompt_hash": "sha256:d60d053cb72669c52612562f6384819d2c3e4c823bafe14fabba79dbeed512a5",
+ "hardware": {
+  "cpu": "Apple M1 (MacBookAir10,1), 4 performance + 4 efficiency cores, 4 OpenMP threads, FEAT_DotProd",
+  "ram": "8 GB unified memory",
+  "storage": "APPLE SSD AP0256Q, 251 GB, APFS, internal",
+  "os": "macOS 27.0 (26A428), Apple clang 21.0.0, Homebrew libomp 23.1.5 (static), AC power"
+ },
+ "warmup_runs": 0,
+ "changed_variables": [
+  "expert_ffn_arm64"
+ ],
+ "baseline": {
+  "config": {
+   "EXPERT_CACHE": "2 slots/layer",
+   "THREADS": "4",
+   "N_NEW": "16",
+   "PROMPT": "The three primary colors are",
+   "COLI_TIMERS": "1",
+   "BUILD": "clang -O3 -Xclang -fopenmp, flags of make qwen36, static libomp 23.1.5",
+   "expert_ffn_arm64": "scalar reference (5cfb55bd)"
+  },
+  "samples": {
+   "tok_s": [
+    1.441060621,
+    1.432938479,
+    1.52145248,
+    1.496856601,
+    1.507083291,
+    1.53123724
+   ],
+   "ttft_s": [
+    3.891,
+    3.932,
+    3.741,
+    5.079,
+    3.747,
+    3.704
+   ],
+   "expert_compute_ms_per_token": [
+    414.66,
+    414.92,
+    411.25,
+    417.27,
+    411.62,
+    411.77
+   ],
+   "expert_fetch_ms_per_token": [
+    196.66,
+    195.68,
+    177.73,
+    180.31,
+    179.52,
+    178.21
+   ],
+   "binary_sha256": "6c6153f8fb3f8818c443ccf4fc14ac63077ca4f25a72f639d315d6a3ea997c1f"
+  },
+  "median_tok_s": 1.501969946,
+  "quality": {
+   "method": "tests/test_expert_ffn bit-exact (baseline path: scalar); generated 16-token text byte-identical in all 12 runs",
+   "passed": true
+  },
+  "evidence": {
+   "uri": "docs/experiments/qwen36-neon-sdot-2026-11-06/baseline.txt",
+   "sha256": "051a86405c29c0041ae909681584b55d7b4dff5e136b26168e279c40804d6852"
+  }
+ },
+ "trial": {
+  "config": {
+   "EXPERT_CACHE": "2 slots/layer",
+   "THREADS": "4",
+   "N_NEW": "16",
+   "PROMPT": "The three primary colors are",
+   "COLI_TIMERS": "1",
+   "BUILD": "clang -O3 -Xclang -fopenmp, flags of make qwen36, static libomp 23.1.5",
+   "expert_ffn_arm64": "SDOT kernel (b591acb1)"
+  },
+  "samples": {
+   "tok_s": [
+    3.597985128,
+    3.600576092,
+    3.474635163,
+    3.785966683,
+    3.605769231,
+    3.703703704
+   ],
+   "ttft_s": [
+    1.831,
+    1.834,
+    1.783,
+    1.838,
+    1.84,
+    1.95
+   ],
+   "expert_compute_ms_per_token": [
+    31.92,
+    32.08,
+    29.04,
+    31.17,
+    32.06,
+    30.73
+   ],
+   "expert_fetch_ms_per_token": [
+    179.25,
+    178.48,
+    188.66,
+    170.62,
+    185.44,
+    172.27
+   ],
+   "binary_sha256": "e1e25f96bd1b37f6bd62e6f1496c6ebbc918604ca292fe4ebaf7e78231e06660"
+  },
+  "median_tok_s": 3.603172661,
+  "quality": {
+   "method": "tests/test_expert_ffn bit-exact (trial path: NEON dotprod); generated 16-token text byte-identical in all 12 runs",
+   "passed": true
+  },
+  "evidence": {
+   "uri": "docs/experiments/qwen36-neon-sdot-2026-11-06/trial.txt",
+   "sha256": "beffcf26abeca55313e29874d5267f9e488a1a3d3b061f680fc70b28ee6bda5d"
+  }
+ },
+ "outcome": "improvement"
+}
