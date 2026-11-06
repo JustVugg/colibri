@@ -37,6 +37,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **DeepSeek V4.1 on the Vulkan chain: a GGUF's wo_a as its output groups' GEMMs.** The
+  chain multiplied a GGUF's wo_a with the per-head reader, which has no block form: the matrix
+  went to the device as floats (8192 x 4096 a layer of V4.1-Flash, 128 MiB, 5 GiB over its 40
+  layers) and each row of a prompt chunk read all of it again. Its eight output groups now go
+  up as matrices of their own in the file's blocks, as wo_b does: a chunk's rows go to
+  group-major order on the device, a GEMM a group, and back; a decode row multiplies its
+  groups' slices in place (`COLI_VK_V41_WOA=0`: the reader). unsloth's UD-IQ1_S on an RTX PRO
+  4000: the chain's matrices 9.45 -> 5.42 GiB, the room going to resident experts; a 4104-token
+  prompt's 44.9 s of device time in wo_a gone, the prompt 27.8 -> 39.3 tok/s; the decode
+  5.40-5.42 -> 5.96-6.10 tok/s.
 - **CUDA chain: a hyper-connection read's up projection and mix in one pass.** Qwen3.8's gated
   residuals read the four streams through a low-rank mix: the up projection's products (four times
   the hidden size a row, 84 MB a 2048-row chunk) went to memory and the mix read them back with the

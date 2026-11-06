@@ -280,6 +280,31 @@ static ColiVkTensor *v41c_wb(const WB *w) {
 
 /* wo_a for the per-head reader (vkc_mla_hgemv): a GGUF's in the reader's form */
 static ColiVkTensor *v41c_w8h(const W8 *w) { return w->gx ? v41c_gq(w->q, w->gt, w->O, w->I, 1) : v41c_w8(w); }
+/* A GGUF's wo_a as its output groups' GEMMs, each group's rows in the file's blocks (as wo_b
+ * goes up), not the per-head reader's floats: the reader takes every row of a prompt chunk
+ * through the whole matrix again (8192 x 4096 floats a layer of V4.1-Flash, 128 MiB, 40
+ * layers 5 GiB of the device), a GEMM reads each tile once for all the chunk's rows.
+ * COLI_VK_V41_WOA=0: the per-head reader. */
+#define V41C_OG_MAX 64
+static int v41c_woa_groups(const W8 *w, int og, int ol) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_V41_WOA"); on = !(e && *e == '0'); }
+    return on && w->gx && w->q && og >= 1 && og <= V41C_OG_MAX && ol % 16 == 0 && w->O == og * ol &&
+           v41c_gq_fmt(w->gt, w->I, 0) >= 0;
+}
+static const uint8_t *v41c_woa_rows(const W8 *w, int g, int ol) {   /* group g's first row (16-row interleave kept) */
+    const int64_t rb = gq_row_bytes(w->gt, w->I);   /* an interleaved type's: 16 of them step a group */
+    return rb > 0 ? w->q + (size_t)g * ol * (size_t)rb : NULL;
+}
+static ColiVkTensor *v41c_woa_group(const W8 *w, int g, int ol) {
+    const uint8_t *q = v41c_woa_rows(w, g, ol);
+    return q ? v41c_gq(q, w->gt, ol, w->I, 0) : NULL;
+}
+static int v41c_woa_up(const W8 *w, int og, int ol) {
+    if (!v41c_woa_groups(w, og, ol)) return v41c_w8h(w) != NULL;
+    for (int g = 0; g < og; g++) if (!v41c_woa_group(w, g, ol)) return 0;
+    return 1;
+}
 
 /* ---- the host's writes: the device's copies follow ------------------------------------- */
 static void v41c_lower_one(Model *m, V41Chain *ch, int pos) {
@@ -392,7 +417,10 @@ static size_t v41c_layer_bytes(const Model *m, int i, int rows, int dho, int vie
     const Layer *l = m->gguf && m->L ? &m->L[i] : NULL;
     T(10, H * D, nm, 0); T(10, H * D, nm, 0);                          /* the mHC mix matrices */
     T8(&l->wq_a, D, QL, 0); T8(&l->wq_b, QL, nh * hd, 0); T8(&l->wkv, D, hd, 0);
-    T8(&l->wo_a, nh * hd / og, og * ol, 1);                            /* wo_a whole, the chain's */
+    if (l && v41c_woa_groups(&l->wo_a, og, ol)) {                     /* wo_a's groups in the file's blocks */
+        int f_ = v41c_gq_fmt(l->wo_a.gt, nh * hd / og, 0);
+        for (int g = 0; g < og; g++) T(f_, nh * hd / og, ol, 0);
+    } else T8(&l->wo_a, nh * hd / og, og * ol, 1);                     /* wo_a whole, the chain's */
     for (int g = 0; views && g < og; g++) T(12, nh * hd / og, ol, FP8_TILE);   /* and per group, the per-matrix path's */
     T8(&l->wo_b, og * ol, D, 0);
     T8(&l->sh_w1, D, c->moe_inter, 0); T8(&l->sh_w3, D, c->moe_inter, 0); T8(&l->sh_w2, c->moe_inter, D, 0);
@@ -518,7 +546,7 @@ static int v41c_layer_up(V41Chain *ch, Model *m, int i, const char **why) {
     Cfg *c = &m->c; Layer *l = &m->L[i];
     int r = c->compress_ratio[i];
     *why = "a matrix the device refused";
-    int ok = v41c_w8(&l->wq_a) && v41c_w8(&l->wq_b) && v41c_w8(&l->wkv) && v41c_w8h(&l->wo_a) && v41c_w8(&l->wo_b) &&
+    int ok = v41c_w8(&l->wq_a) && v41c_w8(&l->wq_b) && v41c_w8(&l->wkv) && v41c_woa_up(&l->wo_a, c->o_groups, c->o_lora) && v41c_w8(&l->wo_b) &&
              v41c_w8(&l->sh_w1) && v41c_w8(&l->sh_w3) && v41c_w8(&l->sh_w2);
     if (ok && c->kv_source[i]) ok = v41c_wb(&l->comp_wkv) && (r <= 1 || v41c_wb(&l->comp_wgate)) && v41c_wb(&l->idx_wk);
     if (ok && c->index_source[i] && r > 0) ok = v41c_w8(&l->idx_wq_b) && v41c_wb(&l->idx_wproj);
@@ -539,6 +567,8 @@ static void v41c_layer_free(V41Chain *ch, Model *m, int i) {
     const WB *wb[] = {&l->comp_wkv, &l->comp_wgate, &l->idx_wk, &l->idx_wproj};
     if (ch->d) {   /* the second device's own copies */
         for (size_t k = 0; k < sizeof w8 / sizeof *w8; k++) v41c_d2_forget(w8[k]->q);
+        for (int g = 1; g < m->c.o_groups && v41c_woa_groups(&l->wo_a, m->c.o_groups, m->c.o_lora); g++)
+            v41c_d2_forget(v41c_woa_rows(&l->wo_a, g, m->c.o_lora));
         for (size_t k = 0; k < sizeof wb / sizeof *wb; k++) v41c_d2_forget(wb[k]->gx ? (const void *)wb[k]->g : (const void *)wb[k]->w);
         return;
     }
@@ -852,6 +882,37 @@ typedef struct {
 
 /* attention_run for nr rows on the device: the projections, the window ring, the
  * compressor, the indexer, the sparse attention and the output projection, into ch->br */
+/* wo_a: heads [nr][og x pg] -> grp [nr][og x ol]. Its groups' GEMMs (v41c_woa_groups): one
+ * row reads its groups' slices in place; more rows go to group-major order first (q, free
+ * after the attention), each group's GEMM writes [nr][ol] into heads, and the rows come back
+ * in grp's order. Else the per-head reader. */
+static int v41c_wo_a(V41Chain *ch, Model *m, Layer *l, int nr, const VkcHgemv *g) {
+    const Cfg *c = &m->c; const W8 *w = &l->wo_a;
+    const int og = c->o_groups, ol = c->o_lora, pg = w->I;
+    if (!v41c_woa_groups(w, og, ol) || og * pg != c->n_heads * c->head_dim)
+        return vkc_mla_hgemv(v41c_w8h(w), ch->heads, ch->grp, NULL, g);
+    ColiVkTensor *t[V41C_OG_MAX];
+    for (int k = 0; k < og; k++) if (!(t[k] = v41c_woa_group(w, k, ol))) return 0;
+    int ok = 1;
+    if (nr == 1) {
+        for (int k = 0; ok && k < og; k++) ok = vkc_matmul(t[k], ch->heads, (size_t)k * pg, ch->grp, (size_t)k * ol, 1);
+        return ok;
+    }
+    static VkcRegion *rg; static int crg;
+    const int n = nr * og;
+    if (n > crg) {
+        VkcRegion *nrg = realloc(rg, (size_t)n * sizeof *rg);
+        if (!nrg) return 0;
+        rg = nrg; crg = n;
+    }
+    for (int s = 0; s < nr; s++)
+        for (int k = 0; k < og; k++) rg[s * og + k] = (VkcRegion){(size_t)k * nr * pg + (size_t)s * pg, (size_t)s * og * pg + (size_t)k * pg, (size_t)pg};
+    ok = vkc_copy_regions(ch->q, ch->heads, rg, n);
+    for (int k = 0; ok && k < og; k++) ok = vkc_matmul(t[k], ch->q, (size_t)k * nr * pg, ch->heads, (size_t)k * nr * ol, nr);
+    for (int s = 0; s < nr; s++)
+        for (int k = 0; k < og; k++) rg[s * og + k] = (VkcRegion){(size_t)s * og * ol + (size_t)k * ol, (size_t)k * nr * ol + (size_t)s * ol, (size_t)ol};
+    return ok && vkc_copy_regions(ch->grp, ch->heads, rg, n);
+}
 static int v41c_attention(V41Chain *ch, Model *m, int i, const V41Fwd *f) {
     Cfg *c = &m->c; Layer *l = &m->L[i];
     int hd = c->head_dim, nh = c->n_heads, rd = c->rope_dim, QL = c->q_lora, r = c->compress_ratio[i];
@@ -936,7 +997,7 @@ static int v41c_attention(V41Chain *ch, Model *m, int i, const V41Fwd *f) {
     } else ok = vkc_dsv4_attn(ch->q, ch->win[i], r > 0 ? ch->ckv[c->index_owner[i]] : NULL, ch->list, ch->prm, ch->heads, &a);
     return ok &&
            v41c_rope(ch, m, ch->heads, nr * nh, nh, hd - rd, qrow, hd, tcs, rd, 1) &&
-           vkc_mla_hgemv(v41c_w8h(&l->wo_a), ch->heads, ch->grp, NULL, &g) &&
+           v41c_wo_a(ch, m, l, nr, &g) &&
            vkc_matmul(v41c_w8(&l->wo_b), ch->grp, 0, ch->br, 0, nr);
 }
 
