@@ -533,8 +533,8 @@ What that leaves the tier is smaller than the window itself. On the 16 GiB card 
 was measured on, the driver's budget exposes about 90% of the heap (13.3 of 14.4 GiB),
 the trunk holds 7.62 GiB once placed, and the window asks the remaining 5 GiB; the
 tier's own sizing then sets aside its 1 GiB reserve, the ~1.4 GiB of bf16 dense tail
-still to be uploaded lazily, and the 64 streaming slots (~1.35 GiB), leaving a 3.28 GiB
-resident budget — 83 experts of 21.1 MiB — beside a trunk the whole prompt pays for on
+still to be uploaded lazily, and the 64 streaming slots (~1.35 GiB), leaving a 3.31 GiB
+resident budget — 84 experts of 21.1 MiB — beside a trunk the whole prompt pays for on
 every token. `COLI_VK_TIER_RESERVE_GB=0` and `COLI_VK_TIER_HOST` trade that back.
 
 ## Reusing a turn, and why it is asked for rather than assumed
