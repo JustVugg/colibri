@@ -172,6 +172,10 @@ int coli_segment_session_create(ColiSegmentEngine *engine,
         !options->context_tokens ||
         options->context_tokens > engine->context_tokens)
         return set_error(error, error_size, "invalid segment session options");
+    if (engine->active_sessions &&
+        !(engine->capabilities.flags & COLI_SEGMENT_CAP_MULTI_SESSION))
+        return set_error(error, error_size,
+                         "segment engine does not support multiple live sessions");
     ColiSegmentSession *created =
         (ColiSegmentSession *)calloc(1, sizeof(*created));
     if (!created)
