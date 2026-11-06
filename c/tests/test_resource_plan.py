@@ -223,6 +223,53 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertEqual(automatic, 128)
         self.assertEqual(cap_for_arch("deepseek_v41", 4, {"RAM_GB": "12"}, self.model), 4)
 
+    def test_v41_long_context_still_plans_a_feasible_ram_cache(self):
+        """Track C regression: at --ram 28 a long ctx must keep >0 RAM expert slots.
+
+        deepseek_v41 prefill reads a prompt in bounded chunks (default 1280 rows), so
+        the planner prices the forward workspace at one chunk, not the whole context.
+        Pricing the full context made the --ram 28 / --ctx 131072 / 262144 plan come
+        out with a zero-byte expert cache and cap_for_arch() hard-failed with "RAM
+        budget cannot hold one expert slot per layer". The workspace must stay bounded
+        as the context grows so a feasible, honestly-admissive plan emerges instead.
+        """
+        from openai_server import cap_for_arch
+        from family_registry import planner_geometry
+
+        (self.model / "config.json").write_text(json.dumps({
+            "model_type": "deepseek_v41", "num_hidden_layers": 2,
+            "n_routed_experts": 128, "hidden_size": 128, "head_dim": 64,
+            "window_size": 8, "index_head_dim": 32, "hc_mult": 4,
+            "compress_ratios": [0, 2], "kv_source_layers": [1],
+        }))
+        write_shard(self.model / "model.safetensors", [
+            ("embed.weight", GB),
+            *[(f"layers.{layer}.ffn.experts.{expert}.w1.weight", 16 * 1024**2)
+              for layer in range(2) for expert in range(128)],
+        ])
+        with mock.patch("resource_plan.memory_available") as memory:
+            memory.return_value = 32 * GB
+            from resource_plan import build_plan
+            from family_registry import resolve_model
+            resolved = resolve_model(self.model)
+            short = planner_geometry(resolved, 16384)
+            long_ = planner_geometry(resolved, 262144)
+            # A chunk-bounded forward: more context grows the resident K/V, but the
+            # per-chunk workspace must not balloon with it.
+            self.assertLess(long_.workspace_bytes, 64 * (1024**2))
+            self.assertLess(long_.workspace_bytes - short.workspace_bytes, 8 * (1024**2))
+            # The failure itself: every tier must keep a positive expert cache.
+            for ctx in (131072, 262144):
+                cap = cap_for_arch("deepseek_v41", None, {"RAM_GB": "28"}, self.model)
+                self.assertGreaterEqual(cap, 1)
+                plan = build_plan(self.model, ram_gb=28.0, context=ctx,
+                                  available_memory=32 * GB, available_disk=100 * GB,
+                                  gpus=[], cpu_sockets=1)
+                self.assertGreaterEqual(
+                    plan["tiers"]["ram"]["cache_slots_per_layer"], 1)
+                self.assertFalse([w for w in plan["warnings"]
+                                  if "cannot hold one expert slot" in w])
+
     def test_sibling_plan_advises_no_colibri_knob(self):
         other = tempfile.TemporaryDirectory()
         self.addCleanup(other.cleanup)

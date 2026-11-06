@@ -906,8 +906,11 @@ def _dsv41_geometry(config, context, _model_dir):
     Counting them as resident would tell a user with 128 GB that this model
     cannot be served, which is the opposite of true.
 
-    Workspace mirrors forward()'s per-chunk buffers: hc_mult residual copies
-    plus the sublayer scratch, at batch == context.
+    Workspace mirrors forward()'s per-chunk buffers: hc_mult residual copies plus
+    the sublayer scratch, at one prompt chunk rather than the whole context
+    (deepseek_v41.c prefill reads a prompt in chunks, default 1280 rows;
+    COLI_VK_CHAIN_ROWS / COLI_PROMPT_SEGMENT set the chunk size). Pricing the
+    full context over-reserves RAM and starves the experts at long ctx.
     """
     section = config.get("text_config", config)
     layers = _required_int(section, "num_hidden_layers", "deepseek_v41")
@@ -943,7 +946,24 @@ def _dsv41_geometry(config, context, _model_dir):
         compressed = (context + ratio - 1) // ratio
         state += compressed * (head_dim + index_hd) * 4
 
-    workspace = (context * hc_mult * hidden * 2 + context * hidden * 2 + hidden) * 4
+    # Price the workspace at one prompt chunk, not the whole context (deepseek_v41.c
+    # prefill: default 1280 rows; COLI_VK_CHAIN_ROWS and COLI_PROMPT_SEGMENT change
+    # the chunk size, matching the qwen38 convention). Full-context workspace
+    # starves the RAM expert cache at long ctx even though serve never holds those
+    # buffers at once.
+    try:
+        _chunk = int(os.environ.get("COLI_PROMPT_SEGMENT", "") or 0)
+    except (TypeError, ValueError):
+        _chunk = 0
+    if _chunk < 1:
+        try:
+            _chunk = int(os.environ.get("COLI_VK_CHAIN_ROWS", "") or 0)
+        except (TypeError, ValueError):
+            _chunk = 0
+        if _chunk < 1:
+            _chunk = 1280
+    ws_rows = min(context, _chunk)
+    workspace = (ws_rows * hc_mult * hidden * 2 + ws_rows * hidden * 2 + hidden) * 4
     return PlannerGeometry(state, fixed, workspace, experts)
 
 
