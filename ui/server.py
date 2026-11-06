@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import agents, responses_shim, web   # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PROXIED = ("/v1/", "/health", "/profile", "/experts")
+PROXIED = ("/v1/", "/health", "/profile", "/experts", "/power")
 MODELS = "/models/"   # the Models page: what fits this machine, search, download and switch models
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization", "proxy-authenticate", "host", "content-length"}
 

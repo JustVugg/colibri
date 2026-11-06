@@ -153,10 +153,12 @@ typedef struct {
     int planar;   /* the table may hold CcExpert.planar entries: refused where the GEMMs cannot read them */
     int fmt_d;    /* fmt >= 100 (a GGUF's blocks, ggml type fmt - 100 for gate and up): down's,
                      0 = fmt's; a matrix's rows as the file has them, padded to words */
+    int lay_S, lay_s0;   /* parts 2 only: hid as a parts 1 of lay_S rows left it (0: S), this call's
+                            S rows its rows lay_s0.. (a prompt chunk's lanes sum their own rows) */
 } CcMoe;
 /* the ggml types cc_moe takes for a GGUF's experts (CcMoe.fmt >= 100: cuda_bd.cuh's integer step) */
 static inline int cc_moe_block_type(int t) {
-    return t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 18 || t == 19 || t == 20 ||
+    return t == 6 || t == 7 || t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 18 || t == 19 || t == 20 ||
            t == 21 || t == 22 || t == 23 || t == 29 || t == 42;
 }
 /* More rows than this (a prompt chunk): the slots sorted by expert and each expert's rows
@@ -323,6 +325,17 @@ typedef struct ColiCudaChainOps {
      * few rows: the caller's two matmuls and CC_EW_SWIGLU), 0 a failure */
     int  (*matmul_glu)(ColiCudaTensor *wg, ColiCudaTensor *wu, CcBuf *x, CcBuf *y, int S);
     int  (*addnorm)(CcBuf *x, CcBuf *t, CcBuf *w, CcBuf *y, const CcAddNorm *p);
+    /* pick_rows: pick's argmax and probability for each of `rows` rows of n logits from float
+     * off of `logits`, row r's into words 2r and 2r + 1 of `out`: a greedy decode step's or
+     * verify's tokens without the vocabulary's logits down */
+    int  (*pick_rows)(CcBuf *logits, size_t off, CcBuf *out, int n, int rows);
+    /* host_up_n: n copies as host_up's (dst[i] <- src[i], bytes[i]), once the frame's ops recorded
+     * so far are done, in one call (cudaMemcpyBatchAsync where the runtime has it) with one ticket
+     * for them all: a frame's promotions, where host_up took five calls of the runtime a copy */
+    int  (*host_up_n)(void *const *dst, const void *const *src, const size_t *bytes, int n, unsigned *ticket);
+    /* preload: the chain's and the backend's kernels loaded on the chain's device (the runtime
+     * loads a module at the first launch of one of its kernels otherwise); 1 done */
+    int  (*preload)(void);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -383,6 +396,21 @@ static inline const void *cc_dev_addr(const CcBuf *b) { return cc_fetch_ready() 
 static inline int cc_host_up_ready(void) { const ColiCudaChainOps *t = cc_ops(); return t && t->size >= offsetof(ColiCudaChainOps, host_up_done) + sizeof t->host_up_done; }
 static inline int cc_host_up(void *dst, const void *src, size_t bytes, unsigned *ticket) { return cc_host_up_ready() ? cc_ops()->host_up(dst, src, bytes, ticket) : 0; }
 static inline int cc_host_up_done(unsigned ticket) { return cc_host_up_ready() ? cc_ops()->host_up_done(ticket) : 0; }
+/* n host_up copies, one ticket for them all: host_up_n where the backend has it, else one host_up a
+ * copy (the last one's ticket covers the others: they land in order). 0: refused, maybe after some */
+static inline int cc_host_up_many(void *const *dst, const void *const *src, const size_t *bytes, int n, unsigned *ticket) {
+    const ColiCudaChainOps *t = cc_ops();
+    if (n < 1) return 0;
+    if (t && t->size >= offsetof(ColiCudaChainOps, host_up_n) + sizeof t->host_up_n && t->host_up_n) return t->host_up_n(dst, src, bytes, n, ticket);
+    for (int i = 0; i < n; i++) if (!cc_host_up(dst[i], src[i], bytes[i], ticket)) return 0;
+    return 1;
+}
+/* the chain's and the backend's kernels loaded now where the backend can (an older one loads them
+ * at their first launch) */
+static inline int cc_preload(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, preload) + sizeof t->preload && t->preload ? t->preload() : 0;
+}
 static inline int cc_moe_stage_ready(void) { const ColiCudaChainOps *t = cc_ops(); return t && t->size >= offsetof(ColiCudaChainOps, moe_stage) + sizeof t->moe_stage; }
 static inline int cc_moe_stage(CcBuf *b, size_t slot_bytes, int slots) { return cc_moe_stage_ready() ? cc_ops()->moe_stage(b, slot_bytes, slots) : 0; }
 static inline int cc_attn_w_ready(void) { const ColiCudaChainOps *t = cc_ops(); return t && t->size >= offsetof(ColiCudaChainOps, attn_w) + sizeof t->attn_w; }
@@ -428,6 +456,13 @@ static inline int cc_pick_ready(void) {
 }
 static inline int cc_pick(CcBuf *logits, CcBuf *out, int n) {
     return cc_pick_ready() ? cc_ops()->pick(logits, out, n) : 0;
+}
+static inline int cc_pick_rows_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, pick_rows) + sizeof t->pick_rows && t->pick_rows;
+}
+static inline int cc_pick_rows(CcBuf *logits, size_t off, CcBuf *out, int n, int rows) {
+    return cc_pick_rows_ready() ? cc_ops()->pick_rows(logits, off, out, n, rows) : 0;
 }
 static inline int cc_matmul_rows_ready(void) {
     const ColiCudaChainOps *t = cc_ops();

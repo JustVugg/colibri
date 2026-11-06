@@ -21,6 +21,8 @@ jobs:
         run: cd c && make colibri inkling
       - name: C test suite
         run: cd c && make test-c
+      - name: The CUDA engines' host side without AVX2 (as an ARM host with a card builds it)
+        run: cd c && make cuda-host-syntax ARCH=x86-64
 
   # Every engine, on every platform a release archive is built for. Before this,
   # CI built colibri + inkling on Linux only and kimi_k3 on nothing -- so the fact
@@ -474,8 +476,9 @@ jobs:
           cache-dependency-path: ${{ matrix.req }}
       - name: Install the Vulkan toolchain, Lavapipe and the fixture dependencies
         run: |
-          # hard limits around apt (.github/scripts/apt-install.sh): see the vulkan job
-          bash .github/scripts/apt-install.sh libvulkan-dev glslc mesa-vulkan-drivers
+          # hard limits around apt (.github/scripts/apt-install.sh): see the vulkan job.
+          # vulkan-validationlayers: sync_gate's synchronization check (vulkan_engines.sh)
+          bash .github/scripts/apt-install.sh libvulkan-dev glslc mesa-vulkan-drivers vulkan-validationlayers
           pip install -r ${{ matrix.req }} ${{ matrix.extra }}
       - name: The pinned TypeScript SDK
         if: ${{ matrix.npm }}
@@ -1002,7 +1005,8 @@ jobs:
           # engine, so rebuild the normal one first.
           make clean >/dev/null 2>&1 || true
           make qwen36
-          QWEN36_TINY=qwen36_tiny_c python3 -m unittest -v tests.test_qwen36_prefix_serve tests.test_qwen36_text_stops
+          QWEN36_TINY=qwen36_tiny_c QWEN3_CODER_TINY=qwen3_coder_tiny_c \
+            python3 -m unittest -v tests.test_qwen36_prefix_serve tests.test_qwen36_text_stops
           make tests/test_qwen36_prefill_control
           for dense in 0 1; do
             for cap in 1 8; do

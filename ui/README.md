@@ -32,7 +32,9 @@ and when the page stops a request the upstream connection closes, which stops th
 - **System One**: a decision with a probability, `POST /v1/systemone`.
 - **Coding agents** (Settings, "Agents"): Pi, Codex, Claude Code, opencode, OpenClaw and
   Hermes, found on this machine and opened in a new terminal window already pointed at
-  colibri, through their own options and environment (Windows and WSL for now). Codex speaks
+  colibri, through their own options and environment (Windows and WSL, with the UI in WSL or
+  on Windows itself; from Windows, a WSL agent needs WSL to reach the server on 127.0.0.1,
+  `networkingMode=mirrored`). Codex speaks
   only the Responses API: `responses_shim.py` translates it to the gateway's chat API.
 - **Web search**: the chat can search and read pages before it answers (`web.py`): results
   from a SearXNG instance when `coli ui --searx URL` names one, else DuckDuckGo's plain HTML

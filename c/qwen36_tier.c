@@ -160,7 +160,7 @@ static size_t qt_pad256(size_t b){ return (b + 255) / 256 * 256; }
  * of the largest layer's left Flint UD-Q3_K_XL's average expert 18 % of it unused, UD-Q4_K_XL's
  * 28 % (2.45 MB slots for 1.91 MB): on an RTX PRO 4000 the card held 8140 of its 12032 experts.
  * The budget counts each expert at its slot (qt_ebytes); a swap pairs slots of one size. The
- * qwen38 chain reads the arena as slots of one size (qt_chain_arena): it does not ask for it. */
+ * qwen38 chain takes the arena over by qt_chain_arena_exact and pairs its promotions by size class. */
 static int G_exact_want, G_exact;
 static size_t *G_lsl, *G_lou, *G_lod, G_lsl_min, G_abump;
 static int *G_lcls, G_ncls;                 /* a layer's size class, of G_ncls */
@@ -702,6 +702,15 @@ void qt_reserve(size_t bytes){ G_reserve = bytes; }
  * the card would hold memory for nothing) */
 static size_t G_reserve_short, G_short_experts;
 void qt_reserve_short(size_t bytes, size_t experts){ G_reserve_short = bytes; G_short_experts = experts; }
+/* qt_reserve_stage: the qwen38 chain's prompt staging past the `base` bytes its own reserve holds,
+ * toward `full` (every expert of its largest layer): what the layer's experts off the card would
+ * take, a fifth more for a layer the card holds fewer of than the average, at most a sixteenth of
+ * the expert budget (one device). Unsloth's UD-IQ2_XS on an RTX PRO 4000 (13.95 GB of experts): a
+ * 4220-token prompt 318-371 tok/s with 512 MiB, 719-729 with 800 and 726-728 with 1100, its decode
+ * the same with 800 and 2-4 tok/s down with 1100 (the card's 8647 experts 8471 and 8313) */
+static size_t G_stage_base, G_stage_full, G_stage_extra;
+void qt_reserve_stage(size_t base, size_t full){ G_stage_base = base; G_stage_full = full; G_stage_extra = 0; }
+size_t qt_stage_extra(void){ return G_stage_extra; }
 void qt_experts_withdraw(const char *why){
     const char *bg = getenv("CUDA_EXPERT_GB");
     if(!G.on || G_trunk_only || (bg && strcmp(bg,"auto") && atof(bg) > 0)) return;
@@ -1190,6 +1199,20 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
             G.budget[i] = G.budget[i] > G_reserve_short ? G.budget[i] - G_reserve_short : 0;
             fprintf(stderr,"[qtier] dev %d: %.2f GB kept for a prompt chunk's experts from the host pool (fewer than all %zu fit)\n",
                     G.dev[i], G_reserve_short/1073741824.0, G_short_experts);
+        }
+        G_stage_extra = 0;
+        if(G_stage_full > G_stage_base && G.ndev == 1 && G.budget[i] && per && G.nl > 0 && G.ne > 0){
+            double all = (double)per * G.nl * G.ne, on = (double)G.budget[i] / all;
+            if(on > 1) on = 1;
+            size_t want = (size_t)((double)G_stage_full * (1.0 - on) * 1.2), cap = G.budget[i] / 16;
+            if(want > G_stage_full) want = G_stage_full;
+            if(want > cap) want = cap;
+            if(want > G_stage_base){
+                G_stage_extra = (want - G_stage_base + 255) / 256 * 256;
+                G.budget[i] -= G_stage_extra;
+                fprintf(stderr,"[qtier] dev %d: %.0f MiB more for a prompt's staging of the experts off the card (%.0f MiB in all; a layer's every expert %.0f MiB)\n",
+                        G.dev[i], G_stage_extra/1048576.0, (G_stage_base+G_stage_extra)/1048576.0, G_stage_full/1048576.0);
+            }
         }
         fprintf(stderr,"[qtier] dev %d: budget %.2f GB for experts (~%zu experts)%s\n",
                 G.dev[i], G.budget[i]/1073741824.0, G.budget[i]/per,
@@ -1694,6 +1717,13 @@ uint64_t qt_chain_promoted(void){ return G.on ? G.promo_done : 0; }
 int qt_chain_arena(void **base,size_t *slot,size_t *off_u,size_t *off_d,int *nslots){
     if(!G.on || G.ndev!=1 || G.wfmt!=QT_GGUF || !G_arena_on || !G_arena[0] || G_exact) return 0;   /* slots of one size only */
     *base=G_arena[0]; *slot=G_aslot; *off_u=G_aoff_u; *off_d=G_aoff_d; *nslots=G_aslots[0];
+    return 1;
+}
+int qt_chain_arena_exact(QtChainArena *a){
+    if(!G.on || G.ndev!=1 || G.wfmt!=QT_GGUF || !G_arena_on || !G_arena[0] || !G_exact || !a) return 0;
+    a->base=G_arena[0]; a->bytes=(size_t)G_aslots[0]*256u; a->bump=G_abump; a->nl=G.nl; a->ncls=G_ncls;
+    a->lsl=G_lsl; a->lou=G_lou; a->lod=G_lod; a->lcls=G_lcls;
+    a->cfree=(const size_t *const *)G_cfree; a->cnfree=G_cnfree;
     return 1;
 }
 int qt_chain_slot(int layer,int eid){
