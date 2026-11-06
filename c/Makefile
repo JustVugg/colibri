@@ -3219,7 +3219,7 @@ tests/test_k3_fill_budget$(EXE): tests/test_k3_fill_budget.c
 tests/test_v4_gpu_devices$(EXE): tests/test_v4_gpu_devices.c
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_v4_bank_pair$(EXE): tests/test_v4_bank_pair.c deepseek_v4_bank_pair.h
+tests/test_v4_bank_pair$(EXE): tests/test_v4_bank_pair.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # v4_topk_desc (indexer top-k, V4_IDX_FAST) against the qsort ranking. Pure CPU.
