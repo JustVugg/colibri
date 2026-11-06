@@ -3933,6 +3933,28 @@ class HTTPTest(unittest.TestCase):
                 self.assertEqual(response.status, 200)
         self.assertEqual(self.engine.calls[-1][0], render_chat_qwen38(history, True, "xhigh"))
 
+    def test_chat_template_kwargs_reach_the_template(self):
+        """Many OpenAI-compatible clients turn a Qwen model's thinking off with
+        chat_template_kwargs; it was ignored, and Qwen3.8 reasoned at xhigh. The body's own
+        key still wins, and a chat_template_kwargs that is not an object is refused."""
+        history = [{"role": "user", "content": "Capital of France?"}]
+        off = {"chat_template_kwargs": {"enable_thinking": False}}
+        cases = ((off, render_chat_qwen38(history, False, None)),
+                 (dict(off, enable_thinking=True), render_chat_qwen38(history, True, "xhigh")),
+                 ({"chat_template_kwargs": {"reasoning_effort": "low"}}, render_chat_qwen38(history, True, "low")))
+        with patch("openai_server.ARCH", "qwen36"), patch("openai_server.CHAT_FLAVOR", "qwen38"):
+            for extra, expected in cases:
+                with self.subTest(extra=extra):
+                    with self.request("/v1/chat/completions", {
+                            "model": "test-model", "messages": history, **extra}) as response:
+                        self.assertEqual(response.status, 200)
+                    self.assertEqual(self.engine.calls[-1][0], expected)
+            with self.assertRaises(HTTPError) as caught:
+                self.request("/v1/chat/completions", {
+                    "model": "test-model", "messages": history, "chat_template_kwargs": [1]})
+            self.addCleanup(caught.exception.close)
+            self.assertEqual(caught.exception.code, 400)
+
     def test_a_well_formed_forced_tool_choice_still_runs(self):
         """The read above must not change the shape clients actually send."""
         with self.request("/v1/chat/completions", {

@@ -12394,6 +12394,16 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
     return 0;
 }
 
+/* VRAM kept free while resident experts preload and the exact head uploads.
+ * This is deliberately separate from DSV4_CUDA_VRAM_RESERVE_MB: that one is
+ * the decode mirror cache's bank-aware growth reserve, while the preload needs
+ * room for the whole expert table and its packing copy. */
+static long long v4_gpu_resident_reserve_mb(void) {
+    const char *setting = getenv("DSV4_CUDA_RESIDENT_RESERVE_MB");
+    long long reserve = setting ? atoll(setting) : 2800;
+    return reserve < 256 ? 256 : reserve;
+}
+
 void coli_v4_gpu_head_upload(ColiV4Engine *engine) {
 #if defined(__AVX2__)
     const char *enabled = getenv("DSV4_CUDA_HEAD");
@@ -12402,19 +12412,46 @@ void coli_v4_gpu_head_upload(ColiV4Engine *engine) {
     int rows = engine->config.vocab_size, cols = engine->config.hidden_size;
     if (rows < 1 || rows % 32 || cols < 1 || cols % 8 ||
         engine->head_cache.bytes != (uint64_t)rows * cols * 2) return;
-    const char *setting = getenv("DSV4_CUDA_VRAM_RESERVE_MB");
-    long long reserve = setting ? atoll(setting) : 2800;
-    if (reserve < 256) reserve = 256;
+    long long reserve = v4_gpu_resident_reserve_mb();
     long long need = ((long long)rows * cols * 4 + 1048575) / 1048576;
     /* After expert preloading: never displace complete banks to fit the head.
-     * Packing temporarily needs both copies; final residency retains one. */
-    int device = engine->gpu.device;
-    long long free_mb = dsv4_cuda_mem_free_mb(device);
+     * Packing temporarily needs both copies; final residency retains one.
+     * Prefer the owning (last) device, then any other with room, rather than
+     * always pinning the head to device 0. */
+    int count = engine->gpu.device_count > 0 ? engine->gpu.device_count : 1;
+    int first = engine->gpu.device_count > 0 ? engine->gpu.devices[0] : engine->gpu.device;
+    const char *forced_setting = getenv("DSV4_CUDA_HEAD_DEVICE");
+    int forced = forced_setting && *forced_setting ? atoi(forced_setting) : -1;
+    int order[COLI_V4_GPU_MAX_DEVICES], n = 0;
+    if (forced >= 0) {
+        for (int i = 0; i < count; i++) {
+            int d = engine->gpu.device_count > 0 ? engine->gpu.devices[i] : engine->gpu.device;
+            if (d == forced) { order[n++] = d; break; }
+        }
+    }
+    for (int i = count - 1; i >= 0; i--) {
+        int d = engine->gpu.device_count > 0 ? engine->gpu.devices[i] : engine->gpu.device;
+        if (d == forced) continue;
+        order[n++] = d;
+    }
     Dsv4CudaTensor *head = NULL;
-    if (free_mb < reserve + need || !dsv4_cuda_upload_head_exact(
-            &head, (const uint16_t *)engine->head_cache.data, rows, cols, device)) {
+    int device = -1;
+    for (int k = 0; k < n; k++) {
+        int candidate = order[k];
+        if (dsv4_cuda_mem_free_mb(candidate) < reserve + need) continue;
+        if (dsv4_cuda_upload_head_exact(&head, (const uint16_t *)engine->head_cache.data,
+                                        rows, cols, candidate)) {
+            device = candidate;
+            break;
+        }
+        if (head) {
+            dsv4_cuda_tensor_free(head);
+            head = NULL;
+        }
+    }
+    if (!head) {
         fprintf(stderr, "v4_gpu head=cpu-fallback device=%d free-MiB=%lld need-MiB=%lld reserve-MiB=%lld\n",
-                device, free_mb, need, reserve);
+                first, dsv4_cuda_mem_free_mb(first), need, reserve);
         return;
     }
     engine->gpu.head = head;
@@ -12627,6 +12664,7 @@ int coli_v4_gpu_expert_layer_owned(ColiExpertStore *store, int layer) {
 
 static V4GpuExpertMirror *v4_gpu_expert_find(V4GpuExpertMirrorCache *cache,
                                              int layer, int expert) {
+    if (!cache) return NULL;
     if (cache->experts_per_layer) {
         if (layer < cache->first_layer || layer >= cache->end_layer ||
             expert < 0 || expert >= cache->experts_per_layer) return NULL;
@@ -12684,11 +12722,17 @@ int coli_v4_gpu_experts_init(ColiV4Engine *engine, char *error, size_t error_siz
     int resident_auto = !resident_experts || strcmp(resident_experts, "auto") == 0;
     if (resident_auto || atoi(resident_experts)) {
         int preload = coli_v4_gpu_experts_preload(engine, error, error_size);
-        if (preload && !resident_auto) return -1;
-        if (preload && engine->gpu.enabled)
-            fprintf(stderr, "v4_gpu resident-experts=cache-fallback (%s)\n",
-                    error && error_size ? error : "insufficient budget");
-        if (preload && error && error_size) error[0] = '\0';
+        /* preload < 0 is a hard load failure (missing shared mirror, layer
+         * load, allocation or table load): reject the engine even under auto.
+         * preload > 0 is only a budget refusal, where auto keeps the cache. */
+        if (preload < 0) return -1;
+        if (preload > 0) {
+            if (!resident_auto) return -1;
+            if (engine->gpu.enabled)
+                fprintf(stderr, "v4_gpu resident-experts=cache-fallback (%s)\n",
+                        error && error_size ? error : "insufficient budget");
+            if (error && error_size) error[0] = '\0';
+        }
     }
     return 0;
 }
@@ -12716,9 +12760,7 @@ int coli_v4_gpu_experts_preload(ColiV4Engine *engine, char *error, size_t size) 
             !coli_v4_layer_gpu(&weights, "ffn.shared_experts.w3") ||
             !coli_v4_layer_gpu(&weights, "ffn.shared_experts.w2")) return -1;
     }
-    const char *setting = getenv("DSV4_CUDA_VRAM_RESERVE_MB");
-    long long reserve = setting ? atoll(setting) : 2800;
-    if (reserve < 256) reserve = 256;
+    long long reserve = v4_gpu_resident_reserve_mb();
     uint64_t bytes = (uint64_t)hidden * intermediate * 3 / 32 * 17;
     V4GpuExpertMirrorCache *head = NULL, **tail = &head;
     for (int i = 0; i < engine->gpu.device_count; i++) {
@@ -13120,6 +13162,12 @@ static int v4_gpu_resident_route_batch(float *output,
         Dsv4CudaTensor *g[256], *u[256], *d[256];
         for (int e = 0; e < 256; e++) {
             V4GpuExpertMirror *entry = v4_gpu_expert_find(cache, weights->plan.layer, e);
+            if (!entry || !entry->gate || !entry->up || !entry->down) {
+                pthread_mutex_unlock(&cache->mutex);
+                fprintf(stderr, "v4_gpu resident-route: incomplete expert %d at layer %d\n",
+                        e, weights->plan.layer);
+                return -1;
+            }
             g[e] = entry->gate; u[e] = entry->up; d[e] = entry->down;
         }
         cache->route_sets[layer] = dsv4_cuda_expert_set_create(g, u, d, 256, sg, su, sd);
@@ -15315,6 +15363,13 @@ static void v4_cu_open(const ColiV4Engine *engine) {
     if (coli_v4_vk_tier || !(cu && atoi(cu)) || !engine->experts ||
         (engine->experts->gpu && !coli_v4_index_gguf(engine->target_index))) return;
     int dev = 0;
+    if (coli_v4_index_gguf(engine->target_index)) {
+        const char *dense_devices = getenv("DSV4_CUDA_DEVICES");
+        int dense_list[COLI_V4_GPU_MAX_DEVICES];
+        if (dense_devices && coli_v4_gpu_devices_parse(dense_devices, dense_list) > 1)
+            fprintf(stderr, "[CUDA] deepseek_v4: a GGUF keeps its dense matrices on device 0; "
+                            "DSV4_CUDA_DEVICES does not spread them\n");
+    }
     if (!coli_cuda_init(&dev, 1)) {
         fprintf(stderr, "[CUDA] deepseek_v4: no CUDA device, the experts stay on the CPU\n");
         return;

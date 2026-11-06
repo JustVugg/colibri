@@ -1360,6 +1360,14 @@ cuda-chain-check: backend_cuda.o cuda_chain.o
 hip-test:
 	$(MAKE) cuda-test HIP=1
 
+# The C side of the engines built with -DCOLI_CUDA, no toolkit needed: their CUDA chains'
+# host code. An ARM host with a card (DGX Spark, GH200, Jetson) builds it without the x86
+# SIMD kernels, so a name those alone define breaks only there; CI runs this at
+# ARCH=x86-64 (no AVX2) to see it on an x86 runner.
+CUDA_HOST_SRC = qwen38.c qwen36.c olmoe.c qwen36_tier.c backend_loader.c
+cuda-host-syntax:
+	for f in $(CUDA_HOST_SRC); do $(CC) $(filter-out -MMD -MP,$(CFLAGS)) -fsyntax-only -DCOLI_CUDA $$f || exit 1; done
+
 # CI: compile the backend and its test binary WITHOUT executing them (for
 # runners with the toolchain but no GPU). Pass CUDA_ARCH/HIP=1+HIP_ARCH.
 gpu-compile: backend_cuda.o cuda_chain.o
@@ -2094,10 +2102,16 @@ tests/edge_runtime_nocuda.o: edge_runtime.c .build-config
 tests/test_qwen38_config$(EXE): tests/test_qwen38_config.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+tests/test_qwen38_ple_gguf$(EXE): tests/test_qwen38_ple_gguf.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_dsv41_serve_budget$(EXE): tests/test_dsv41_serve_budget.c deepseek_v41.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_dsv41_untrusted_load$(EXE): tests/test_dsv41_untrusted_load.c deepseek_v41.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_dsv41_scratch_pool$(EXE): tests/test_dsv41_scratch_pool.c deepseek_v41.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_idot$(EXE): tests/test_qwen38_idot.c qwen38.c $(VK_OBJ)
@@ -3415,7 +3429,7 @@ install: colibri-tui$(EXE) colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE)
 	$(INSTALL) -m 644 family_registry.py resource_plan.py doctor.py autotune.py \
 		openai_server.py cluster.py v4_dsml.py v41_dsml.py version.py \
 		image_engine.py term_image.py setup_flow.py setup_hw.py setup_catalog.py \
-		setup_download.py mcp_server.py $(DESTDIR)$(LIBEXECDIR)/
+		setup_download.py mcp_server.py power.py $(DESTDIR)$(LIBEXECDIR)/
 	$(INSTALL) -m 644 tools/*.py $(DESTDIR)$(LIBEXECDIR)/tools/
 	@# The dashboard is an optional build artifact (cd web && npm run build), so install
 	@# it only when it exists. It goes NEXT TO openai_server.py, which probes ./web/dist.

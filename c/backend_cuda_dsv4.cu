@@ -1,4 +1,8 @@
 #include "backend_cuda_dsv4.h"
+/* Internal definitions compile on Windows too; these are not DLL exports. */
+extern "C" {
+#include "backend_cuda_dsv4_target.h"
+}
 #include <chrono>
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
@@ -823,6 +827,17 @@ static float *g_kv_comp[DSV4_KV_CACHE_LAYERS];
 static int g_kv_comp_cap[DSV4_KV_CACHE_LAYERS];
 static int g_kv_device[DSV4_KV_CACHE_LAYERS];
 
+/* A KV ring/comp buffer belongs to one device; refuse a different owner
+ * instead of writing through a pointer allocated on another device. */
+static int kv_device_ok(int layer, int device) {
+    if ((g_kv_ring[layer] || g_kv_comp[layer]) && g_kv_device[layer] != device) {
+        fprintf(stderr, "[DSV4 CUDA] kv layer %d is on device %d, not %d; refusing append\n",
+                layer, g_kv_device[layer], device);
+        return 0;
+    }
+    return 1;
+}
+
 /* Which GPUs this build's kernels can run on. The DeepGEMM build carries
  * sm_120a-only block-scaled MMA kernels. The generic build is a portable fat
  * binary of plain CUDA kernels (fp32 compute from fp8/fp4 decode); the engine's
@@ -886,6 +901,7 @@ extern "C" int dsv4_cuda_kv_ring_append(int device,int layer,const float*rows,
     Dev*c=ctx(device);
     if(!c||layer<0||layer>=DSV4_KV_CACHE_LAYERS||!rows||start_pos<0||count<1||
        window<1||dim<1||!ok(cudaSetDevice(device),"select kv ring device"))return 0;
+    if(!kv_device_ok(layer,device))return 0;
     g_kv_device[layer]=device;
     if(g_kv_ring[layer]&&g_kv_ring_rows[layer]!=window){cudaFree(g_kv_ring[layer]);g_kv_ring[layer]=NULL;}
     if(!g_kv_ring[layer]){
@@ -908,6 +924,7 @@ extern "C" int dsv4_cuda_kv_comp_append(int device,int layer,const float*rows,
     Dev*c=ctx(device);
     if(!c||layer<0||layer>=DSV4_KV_CACHE_LAYERS||!rows||start_idx<0||count<1||dim<1||
        !ok(cudaSetDevice(device),"select kv comp device"))return 0;
+    if(!kv_device_ok(layer,device))return 0;
     g_kv_device[layer]=device;
     int need=start_idx+count;
     if(g_kv_comp_cap[layer]<need){
@@ -1597,7 +1614,22 @@ extern "C" int dsv4_cuda_init(const int *dev,int n){if(!dev||n<1||n>16||ng)retur
             cudaGetLastError();return 0;}
         for(int j=0;j<i;j++)if(dev[j]==dev[i])return 0;
     }
-    float scale[256];for(int b=0;b<256;b++)scale[b]=b?ldexpf(1.f,b-127):ldexpf(1.f,-127);for(int i=0;i<n;i++){cudaDeviceProp p{};g[i].id=dev[i];ng=i+1;if(!ok(cudaSetDevice(dev[i]),"select device")||!ok(cudaMemcpyToSymbol(e8_table,scale,sizeof(scale)),"scale table upload")||!ok(cudaGetDeviceProperties(&p,dev[i]),"device properties")||!ok(cudaStreamCreateWithFlags(&g[i].stream,cudaStreamNonBlocking),"stream")||!ok(cudaStreamCreateWithFlags(&g[i].aux,cudaStreamNonBlocking),"aux stream")||!ok(cudaEventCreateWithFlags(&g[i].ready,cudaEventDisableTiming),"device event")||!ok(cudaEventCreateWithFlags(&g[i].fork,cudaEventDisableTiming),"fork event")||!ok(cudaEventCreateWithFlags(&g[i].join,cudaEventDisableTiming),"join event")||!tc_dev_init(&g[i])||!ok(cudaMalloc(&g[i].decode_state,2*sizeof(int)),"decode state allocation"))goto fail;g[i].sms=p.multiProcessorCount;fprintf(stderr,"[DSV4 CUDA] device %d: %s %.1f GB sm_%d%d\n",dev[i],p.name,p.totalGlobalMem/1e9,p.major,p.minor);}for(int i=0;i<n;i++)for(int j=0;j<n;j++)if(i!=j){int can=0;if(!ok(cudaDeviceCanAccessPeer(&can,dev[i],dev[j]),"peer query"))goto fail;if(can){if(!ok(cudaSetDevice(dev[i]),"select peer device"))goto fail;cudaError_t e=cudaDeviceEnablePeerAccess(dev[j],0);if(e!=cudaSuccess&&e!=cudaErrorPeerAccessAlreadyEnabled){ok(e,"enable peer access");goto fail;}}}
+    float scale[256];for(int b=0;b<256;b++)scale[b]=b?ldexpf(1.f,b-127):ldexpf(1.f,-127);for(int i=0;i<n;i++){cudaDeviceProp p{};g[i].id=dev[i];ng=i+1;if(!ok(cudaSetDevice(dev[i]),"select device")||!ok(cudaMemcpyToSymbol(e8_table,scale,sizeof(scale)),"scale table upload")||!ok(cudaGetDeviceProperties(&p,dev[i]),"device properties")||!ok(cudaStreamCreateWithFlags(&g[i].stream,cudaStreamNonBlocking),"stream")||!ok(cudaStreamCreateWithFlags(&g[i].aux,cudaStreamNonBlocking),"aux stream")||!ok(cudaEventCreateWithFlags(&g[i].ready,cudaEventDisableTiming),"device event")||!ok(cudaEventCreateWithFlags(&g[i].fork,cudaEventDisableTiming),"fork event")||!ok(cudaEventCreateWithFlags(&g[i].join,cudaEventDisableTiming),"join event")||!tc_dev_init(&g[i])||!ok(cudaMalloc(&g[i].decode_state,2*sizeof(int)),"decode state allocation"))goto fail;g[i].sms=p.multiProcessorCount;fprintf(stderr,"[DSV4 CUDA] device %d: %s %.1f GB sm_%d%d\n",dev[i],p.name,p.totalGlobalMem/1e9,p.major,p.minor);}for(int i=0;i<n;i++)for(int j=0;j<n;j++)if(i!=j){
+    int can=0;
+    cudaError_t q=cudaDeviceCanAccessPeer(&can,dev[i],dev[j]);
+    if(q!=cudaSuccess){
+        const char*why=cudaGetErrorString(q);cudaGetLastError();
+        fprintf(stderr,"[DSV4 CUDA] peer query %d -> %d unavailable (%s); continuing without peer access\n",dev[i],dev[j],why);
+        continue;
+    }
+    if(!can)continue;
+    if(!ok(cudaSetDevice(dev[i]),"select peer device"))goto fail;
+    cudaError_t e=cudaDeviceEnablePeerAccess(dev[j],0);
+    if(e!=cudaSuccess&&e!=cudaErrorPeerAccessAlreadyEnabled){
+        const char*why=cudaGetErrorString(e);cudaGetLastError();
+        fprintf(stderr,"[DSV4 CUDA] peer access %d -> %d unavailable (%s); continuing without it\n",dev[i],dev[j],why);
+    }
+}
 #ifdef COLI_DSV4_NCCL
     if(n==6)for(int pair=0;pair<3;pair++){int ids[2]={dev[2*pair],dev[2*pair+1]};ncclComm_t comm[2];if(!nok(ncclCommInitAll(comm,2,ids),"EP2 communicator init"))goto fail;g[2*pair].ep_comm=comm[0];g[2*pair+1].ep_comm=comm[1];}
 #endif

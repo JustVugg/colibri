@@ -153,6 +153,34 @@ class Qwen38PrefixServeTest(PromptCancelContract, unittest.TestCase):
         self.assertEqual((total, source), (len(second), "the live state"), log)
         self.assertGreater(n, len(self.OPENING), "the parked conversation's answer was read again\n" + log)
 
+    # a system prompt of the fixture's bytes, its markers set by Q38_HEAD_PIN_MARKS
+    SYSTEM = b"(" + b"12+34=46; 7*8=56; 9-3=6; 5*5=25; 3+3=6; " * 2 + b")"
+    HEAD_PIN = {"COLI_HEAD_PIN_MIN": "8", "Q38_HEAD_PIN_MARKS": "(|)"}
+
+    def test_a_new_conversation_reuses_the_system_prompt(self):
+        """An agent's conversations share a long system prompt and part right after it (Hermes:
+        14,500 tokens, read again for every new conversation). The first leaves a pin at the
+        system prompt's end; the second restores it, reads only its own text and answers as a
+        cold engine does."""
+        with mock.patch.dict(os.environ, self.HEAD_PIN):
+            warm = self.spawn()
+        first, second = self.SYSTEM + b"1+1=", self.SYSTEM + b"2+2="
+        warm.ask("1", first, max_tok=8)
+        got = warm.ask("2", second, max_tok=8)
+        log = warm.close()
+        self.assertIn("[PREFIX] the %d-token system prompt pinned" % len(self.SYSTEM), log)
+        self.assertEqual(self.reuses(log)[-1], (len(self.SYSTEM), len(second), "a pin"), log)
+        self.assertEqual(got, self.cold(second), "the conversation answered otherwise from the system prompt's pin")
+
+    def test_no_system_prompt_pin_when_off(self):
+        with mock.patch.dict(os.environ, dict(self.HEAD_PIN, COLI_HEAD_PIN_MIN="0")):
+            warm = self.spawn()
+        warm.ask("1", self.SYSTEM + b"1+1=", max_tok=8)
+        warm.ask("2", self.SYSTEM + b"2+2=", max_tok=8)
+        log = warm.close()
+        self.assertNotIn("system prompt pinned", log)
+        self.assertNotIn("from a pin", log)
+
     def test_a_diverging_prompt_starts_over(self):
         warm = self.spawn()
         warm.ask("1", self.OPENING, max_tok=8)

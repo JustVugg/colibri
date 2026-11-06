@@ -377,6 +377,14 @@ by default the cap every layer has, or every expert of the head on an integrated
 32 or more compute units, the expert tier and the dense chain on
 ([vulkan.md](vulkan.md#the-chain-on-a-radeon-780m)). The startup line prints what it costs.
 
+Beside the CUDA chain the head's layer runs on the card (`Q38_MTP_CHAIN`) and its routed
+experts too, quantized at the start from the head's Q8_0 file to Q2_0 (0.66 GiB for 512,
+`COLI_CUDA_CHAIN_MTP_CARD`): a draft costs 0.6 ms of the card, and its list of tokens is scored
+on the card from the lm_head's rows there. Where they reach the card the head drafts by default,
+three drafts a verify cut by their probabilities over a list of 64,000 tokens; where they do not
+it stays off unless `Q38_MTP=1` asks for it. Qwen3.8-Flash-Next IQ2_XS on an RTX PRO 4000, served,
+512-token answers: 53.3-54.0 tok/s without the head, 71.7-72.3 with it.
+
 ### Measured
 
 On the release with the int4-g64 sidecar (Ryzen 7 PRO 8700GE, 16 threads,

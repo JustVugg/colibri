@@ -86,7 +86,10 @@ int main(int argc, char **argv){
     int shapes[][3] = { {1,1,1}, {5,17,33}, {6,16,256}, {7,31,257}, {64,48,300}, {193,40,520}, {13,100,64} };
     for (unsigned i = 0; i < sizeof shapes / sizeof shapes[0]; i++)
         for (int fmt = 0; fmt < 3; fmt++) ok &= check(shapes[i][0], shapes[i][1], shapes[i][2], fmt, i & 1);
-    int act_shapes[][3] = { {1,1,1}, {7,31,257}, {6,16,256}, {193,40,522}, {13,100,64} };
+    /* The last three are wide in N with multiple m-blocks: they exercise the
+     * hoisted-pack path, including a ragged n-panel tail. */
+    int act_shapes[][3] = { {1,1,1}, {7,31,257}, {6,16,256}, {193,40,522}, {13,100,64},
+                            {193,2065,260}, {385,4096,130}, {201,3073,130} };
     for (unsigned i = 0; i < sizeof act_shapes / sizeof act_shapes[0]; i++) ok &= check_act8(act_shapes[i][0], act_shapes[i][1], act_shapes[i][2]);
     printf(ok ? "qi_gemm: all ok\n" : "qi_gemm: FAILED\n");
     return !ok;
