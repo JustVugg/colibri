@@ -802,3 +802,22 @@ Word, OpenDocument, PowerPoint, web pages, text) read into the message, web
 search, the expert map, the monitor with each turn's profile, System One
 (`POST /v1/systemone`, see [systemone.md](systemone.md)), the Models page and
 coding agents. What it does and how: [ui/README.md](../ui/README.md).
+
+## Unresponsive text engines
+
+The gateway watchdog also bounds requests handled by the text/decision engine
+protocol. `COLI_ENGINE_REQUEST_TIMEOUT` is a hard execution deadline in seconds
+(default `1800`), measured from registration with the engine, including pipe
+submission and prefill. It is not an idle-output timer: long, healthy generations
+must use a larger value. Queue waiting is governed separately by `--queue-timeout`.
+`COLI_ENGINE_CANCEL_TIMEOUT` bounds the wait for a terminal frame after CANCEL or
+STOP (default `30` seconds). Both settings must be finite positive numbers.
+
+On expiry, admission pauses and the old process is killed and reaped before a
+replacement is loaded. All requests on that process fail; they are not replayed.
+The old pinned-prefix state is discarded. While recovery is pending, health is
+unavailable and queued clients retain their ordinary queue timeout. If the OS
+cannot reap the process, admission stays paused and the watchdog retries; it does
+not load another engine over the live one. These limits require the watchdog
+started by `coli serve`; they do not cover the separate image-engine protocol or
+initial model loading.
