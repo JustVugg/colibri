@@ -829,6 +829,19 @@ static float *g_kv_ring[DSV4_KV_CACHE_LAYERS];
 static int g_kv_ring_rows[DSV4_KV_CACHE_LAYERS];
 static float *g_kv_comp[DSV4_KV_CACHE_LAYERS];
 static int g_kv_comp_cap[DSV4_KV_CACHE_LAYERS];
+static int g_kv_device[DSV4_KV_CACHE_LAYERS];
+
+/* A KV ring/comp buffer belongs to one device; refuse a different owner
+ * instead of writing through a pointer allocated on another device. */
+static int kv_device_ok(int layer, int device) {
+    if ((g_kv_ring[layer] || g_kv_comp[layer]) && g_kv_device[layer] != device) {
+        fprintf(stderr, "[DSV4 CUDA] kv layer %d is on device %d, not %d; refusing append\n",
+                layer, g_kv_device[layer], device);
+        return 0;
+    }
+    return 1;
+}
+
 
 /* Which GPUs this build's kernels can run on. The DeepGEMM build carries
  * sm_120a-only block-scaled MMA kernels. The generic build is a portable fat
@@ -893,6 +906,8 @@ extern "C" int dsv4_cuda_kv_ring_append(int device,int layer,const float*rows,
     Dev*c=ctx(device);
     if(!c||layer<0||layer>=DSV4_KV_CACHE_LAYERS||!rows||start_pos<0||count<1||
        window<1||dim<1||!ok(cudaSetDevice(device),"select kv ring device"))return 0;
+    if(!kv_device_ok(layer,device))return 0;
+    g_kv_device[layer]=device;
     if(g_kv_ring[layer]&&g_kv_ring_rows[layer]!=window){cudaFree(g_kv_ring[layer]);g_kv_ring[layer]=NULL;}
     if(!g_kv_ring[layer]){
         if(!alloc_ok(cudaMalloc((void**)&g_kv_ring[layer],(size_t)window*dim*4),"kv ring allocation"))return 0;
@@ -914,6 +929,8 @@ extern "C" int dsv4_cuda_kv_comp_append(int device,int layer,const float*rows,
     Dev*c=ctx(device);
     if(!c||layer<0||layer>=DSV4_KV_CACHE_LAYERS||!rows||start_idx<0||count<1||dim<1||
        !ok(cudaSetDevice(device),"select kv comp device"))return 0;
+    if(!kv_device_ok(layer,device))return 0;
+    g_kv_device[layer]=device;
     int need=start_idx+count;
     if(g_kv_comp_cap[layer]<need){
         int cap=g_kv_comp_cap[layer]?g_kv_comp_cap[layer]:512;
@@ -1602,9 +1619,18 @@ static int tc_dev_init(Dev*c){return bok(cublasLtCreate(&c->lt),"cuBLASLt create
 #else
 static int tc_dev_init(Dev*){return 1;}
 #endif
-extern "C" int dsv4_cuda_init(const int *dev,int n){if(n<1||n>16)return 0;float scale[256];for(int b=0;b<256;b++)scale[b]=b?ldexpf(1.f,b-127):ldexpf(1.f,-127);ng=0;for(int i=0;i<n;i++){cudaDeviceProp p{};if(!ok(cudaSetDevice(dev[i]),"select device")||!ok(cudaMemcpyToSymbol(e8_table,scale,sizeof(scale)),"scale table upload")||!ok(cudaGetDeviceProperties(&p,dev[i]),"device properties")||!ok(cudaStreamCreateWithFlags(&g[i].stream,cudaStreamNonBlocking),"stream")||!ok(cudaStreamCreateWithFlags(&g[i].aux,cudaStreamNonBlocking),"aux stream")||!ok(cudaEventCreateWithFlags(&g[i].ready,cudaEventDisableTiming),"device event")||!ok(cudaEventCreateWithFlags(&g[i].fork,cudaEventDisableTiming),"fork event")||!ok(cudaEventCreateWithFlags(&g[i].join,cudaEventDisableTiming),"join event")||!tc_dev_init(&g[i])||!ok(cudaMalloc(&g[i].decode_state,2*sizeof(int)),"decode state allocation"))return 0;g[i].id=dev[i];g[i].sms=p.multiProcessorCount;ng++;fprintf(stderr,"[DSV4 CUDA] device %d: %s %.1f GB sm_%d%d\n",dev[i],p.name,p.totalGlobalMem/1e9,p.major,p.minor);}for(int i=0;i<n;i++)for(int j=0;j<n;j++)if(i!=j){int can=0;if(!ok(cudaDeviceCanAccessPeer(&can,dev[i],dev[j]),"peer query"))return 0;if(can){if(!ok(cudaSetDevice(dev[i]),"select peer device"))return 0;cudaError_t e=cudaDeviceEnablePeerAccess(dev[j],0);if(e!=cudaSuccess&&e!=cudaErrorPeerAccessAlreadyEnabled)return ok(e,"enable peer access");}}
+extern "C" int dsv4_cuda_init(const int *dev,int n){if(!dev||n<1||n>16||ng)return 0;
+    for(int i=0;i<n;i++){
+        cudaDeviceProp p{};
+        /* name the refused device, and leave no stale error for the caller's next call */
+        if(!ok(cudaGetDeviceProperties(&p,dev[i]),"validate device")){
+            if(n>1)fprintf(stderr,"[DSV4 CUDA] device %d did not initialise\n",dev[i]);
+            cudaGetLastError();return 0;}
+        for(int j=0;j<i;j++)if(dev[j]==dev[i])return 0;
+    }
+    float scale[256];for(int b=0;b<256;b++)scale[b]=b?ldexpf(1.f,b-127):ldexpf(1.f,-127);ng=0;for(int i=0;i<n;i++){cudaDeviceProp p{};if(!ok(cudaSetDevice(dev[i]),"select device")||!ok(cudaMemcpyToSymbol(e8_table,scale,sizeof(scale)),"scale table upload")||!ok(cudaGetDeviceProperties(&p,dev[i]),"device properties")||!ok(cudaStreamCreateWithFlags(&g[i].stream,cudaStreamNonBlocking),"stream")||!ok(cudaStreamCreateWithFlags(&g[i].aux,cudaStreamNonBlocking),"aux stream")||!ok(cudaEventCreateWithFlags(&g[i].ready,cudaEventDisableTiming),"device event")||!ok(cudaEventCreateWithFlags(&g[i].fork,cudaEventDisableTiming),"fork event")||!ok(cudaEventCreateWithFlags(&g[i].join,cudaEventDisableTiming),"join event")||!tc_dev_init(&g[i])||!ok(cudaMalloc(&g[i].decode_state,2*sizeof(int)),"decode state allocation"))return 0;g[i].id=dev[i];g[i].sms=p.multiProcessorCount;ng++;fprintf(stderr,"[DSV4 CUDA] device %d: %s %.1f GB sm_%d%d\n",dev[i],p.name,p.totalGlobalMem/1e9,p.major,p.minor);}for(int i=0;i<n;i++)for(int j=0;j<n;j++)if(i!=j){int can=0;if(!ok(cudaDeviceCanAccessPeer(&can,dev[i],dev[j]),"peer query"))return 0;if(can){if(!ok(cudaSetDevice(dev[i]),"select peer device"))return 0;cudaError_t e=cudaDeviceEnablePeerAccess(dev[j],0);if(e!=cudaSuccess&&e!=cudaErrorPeerAccessAlreadyEnabled)return ok(e,"enable peer access");}}
 #ifdef COLI_DSV4_NCCL
-    if(n==6)for(int pair=0;pair<3;pair++){int ids[2]={dev[2*pair],dev[2*pair+1]};ncclComm_t comm[2];if(!nok(ncclCommInitAll(comm,2,ids),"EP2 communicator init"))return 0;g[2*pair].ep_comm=comm[0];g[2*pair+1].ep_comm=comm[1];}
+    if(n==6)for(int pair=0;pair<3;pair++){int ids[2]={dev[2*pair],dev[2*pair+1]};ncclComm_t comm[2];if(!nok(ncclCommInitAll(comm,2,ids),"EP2 communicator init"))goto fail;g[2*pair].ep_comm=comm[0];g[2*pair+1].ep_comm=comm[1];}
 #endif
     return 1;}
 #if COLI_DSV4_TC
@@ -1614,6 +1640,14 @@ static void tc_dev_free(Dev*c){for(int p=0;p<2;p++)plan_free(&c->plans[p]);if(c-
 static void tc_dev_free(Dev*){}
 #endif
 extern "C" void dsv4_cuda_shutdown(void){
+    for(int layer=0;layer<DSV4_KV_CACHE_LAYERS;layer++){
+        if(!g_kv_ring[layer]&&!g_kv_comp[layer])continue;
+        cudaSetDevice(g_kv_device[layer]);
+        if(g_kv_ring[layer])cudaFree(g_kv_ring[layer]);
+        if(g_kv_comp[layer])cudaFree(g_kv_comp[layer]);
+        g_kv_ring[layer]=g_kv_comp[layer]=nullptr;
+        g_kv_ring_rows[layer]=g_kv_comp_cap[layer]=0;
+    }
     for(int i=0;i<ng;i++){cudaSetDevice(g[i].id);if(g[i].decode_state)cudaFree(g[i].decode_state);
 #ifdef COLI_DSV4_NCCL
         if(g[i].ep_comm)ncclCommDestroy(g[i].ep_comm);
@@ -2675,6 +2709,46 @@ extern "C" int dsv4_cuda_expert_set_upload_hash(Dsv4CudaExpertSet*set,const int6
     Dev*hc=ctx(set->device);if(!hc||!ok(cudaMalloc(&set->hash,bytes),"hash router allocation")||!h2d(hc,set->hash,map,bytes,"hash router upload"))return 0;
     set->vocab=vocab;set->topk=topk;return 1;
 }
+/* The host-routed resident path's exact operation/rounding order, with routes
+ * and descriptors retained on device. One activation upload and one download. */
+extern "C" int dsv4_cuda_resident_route_moe(Dsv4CudaExpertSet *set,
+        Dsv4CudaTensor *gate,Dsv4CudaTensor *bias,const int *fixed,
+        float scale,float limit,float *out,const float *in){
+    Dev *c=set?ctx(set->device):nullptr;
+    if(!c||!gate||!in||!out||set->count!=256||!set->table||!set->sg||!set->su||!set->sd||
+       gate->device!=set->device||gate->fmt!=32||gate->O!=256||gate->I!=set->H||
+       (bias&&(bias->device!=set->device||bias->fmt!=32||bias->O*bias->I<256)))return 0;
+    if(fixed)for(int k=0;k<6;k++)if(fixed[k]<0||fixed[k]>=256)return 0;
+    if(!ok(cudaSetDevice(set->device),"select resident route device"))return 0;
+    int H=set->H,I=set->I,K=6;size_t hb=(size_t)H*4,ib=(size_t)K*I*4;
+    if(!buf((void**)&c->dx,&c->xcap,hb)||!buf((void**)&c->dy,&c->ycap,H>256?hb:256*4)||
+       !buf((void**)&c->p1,&c->p1cap,ib)||!buf((void**)&c->p2,&c->p2cap,ib)||
+       !buf((void**)&c->p3,&c->p3cap,ib)||!buf((void**)&c->p4,&c->p4cap,(size_t)K*H*4)||
+       !buf((void**)&c->mvdesc,&c->mvdesccap,(size_t)3*K*sizeof(MvDesc))||
+       !buf((void**)&c->expert_weights,&c->expert_weightscap,K*sizeof(float))||
+       !buf((void**)&c->expert_ids,&c->expert_idcap,K*sizeof(int))||
+       !ok(cudaMemcpyAsync(c->dx,in,hb,cudaMemcpyHostToDevice,c->stream),"resident MoE input"))return 0;
+    mv_f32<<<256,256,0,c->stream>>>((float*)gate->w,c->dx,c->dy,256,H);
+    if(fixed&&!ok(cudaMemcpyAsync(c->expert_ids,fixed,K*sizeof(int),cudaMemcpyHostToDevice,c->stream),"resident fixed routes"))return 0;
+    route_top6_serial<<<1,1,0,c->stream>>>(c->expert_ids,c->expert_weights,bias?(float*)bias->w:nullptr,c->dy,fixed!=nullptr,scale);
+    sort_routes6<<<1,1,0,c->stream>>>(c->expert_ids,c->expert_weights);
+    build_moe_desc<<<1,K,0,c->stream>>>(c->mvdesc,set->table,c->expert_ids,c->dx,c->p1,c->p2,c->p3,c->p4,K,256,H,I);
+    mv_fp4_grouped<4><<<dim3((I+3)/4,2*K),256,0,c->stream>>>(c->mvdesc,2*K,I,H);
+    expert_act_grouped<<<(K*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,c->expert_weights,limit,K,I);
+    fp8_sim<<<K*((I+127)/128),128,0,c->stream>>>(c->p3,K,I);
+    mv_fp4_grouped<4><<<dim3((H+3)/4,K),256,0,c->stream>>>(c->mvdesc+2*K,K,H,I);
+    expert_reduce<<<(H+255)/256,256,0,c->stream>>>(c->dy,c->p4,K,H);
+    run_mv<8>((uint8_t*)set->sg->w,set->sg->scale,c->dx,c->p1,I,H,1,c->stream);
+    run_mv<8>((uint8_t*)set->su->w,set->su->scale,c->dx,c->p2,I,H,1,c->stream);
+    expert_act<<<(I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,1.f,limit,I);
+    fp8_sim<<<(I+127)/128,128,0,c->stream>>>(c->p3,1,I);
+    run_mv<8>((uint8_t*)set->sd->w,set->sd->scale,c->p3,c->p4,H,I,1,c->stream);
+    moe_combine<<<(H+255)/256,256,0,c->stream>>>(c->dy,c->p4,H);
+    return ok(cudaGetLastError(),"resident MoE launch")&&
+        ok(cudaMemcpyAsync(out,c->dy,hb,cudaMemcpyDeviceToHost,c->stream),"resident MoE output")&&
+        ok(cudaStreamSynchronize(c->stream),"resident MoE sync");
+}
+
 extern "C" int dsv4_cuda_route_moe(const Dsv4CudaActivation*input,Dsv4CudaTensor*gate,Dsv4CudaTensor*bias,
         int token,float scale,Dsv4CudaExpertSet*set,float limit,Dsv4CudaActivation*output){
     Dev*c=input?ctx(input->device):nullptr;if(!c||!gate||!set||!output||set->device!=input->device||output->device!=input->device||
