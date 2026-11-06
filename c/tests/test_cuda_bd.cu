@@ -465,7 +465,10 @@ static void check_moe(int tg, int td, int S, int K, int E, int D, int I) {
 
 /* BENCH_MOE: a prompt chunk's routed experts through the f16 tiles, timed: E experts of tg/tg/td with
  * random blocks, S rows of K distinct routes, parts 1 and 2 (the tiles and the sum), ms a call */
-static void bench_moe(int tg, int td, int S, int K, int E, int D, int I, int reps) {
+static void check_ok(int ok, const char *what) { if (ok) printf("  %s\n", what); else { printf("FAIL %s\n", what); fails++; } }
+/* check: no timing; the rows through coli_cuda_moe_cols_async at slices of 128, 896 and all of D
+ * outputs against one coli_cuda_moe_async of parts 3, to the bit */
+static void bench_moe(int tg, int td, int S, int K, int E, int D, int I, int reps, int check = 0) {
     long rg = ref_row_bytes(tg, D), rd = ref_row_bytes(td, I);
     if (rg <= 0 || rd <= 0) return;
     int bg = ref_block_bytes(tg), bdb = ref_block_bytes(td);
@@ -503,6 +506,32 @@ static void bench_moe(int tg, int td, int S, int K, int E, int D, int I, int rep
     CcMoe mp = {};
     mp.S = S; mp.K = K; mp.D = D; mp.I = I; mp.fmt = 100 + tg; mp.fmt_d = 100 + td; mp.parts = 3; mp.E = E;
     mp.x_row = D; mp.i_row = K; mp.w_row = K; mp.y_row = D; mp.h_off = -1;
+    if (check) {
+        std::vector<float> ref((size_t)S * D), got((size_t)S * D);
+        ok = ok && coli_cuda_moe_async(0, dtab, dx_, di, dw, dh, dy, NULL, &mp, NULL) && cudaDeviceSynchronize() == cudaSuccess &&
+             cudaMemcpy(ref.data(), dy, ref.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+        const int cl[3] = {128, 896, (D + 127) / 128 * 128};
+        for (int c = 0; c < 3 && ok; c++) {
+            const size_t need = cc_moe_hid_floats(S, K, cl[c] < D ? cl[c] : D, I, E);
+            int r = need <= hf ? 1 : -2;
+            cudaMemset(dy, 0xff, (size_t)S * D * 4);
+            if (r == 1) r = coli_cuda_moe_cols_async(0, dtab, dx_, di, dw, dh, dy, &mp, cl[c], NULL);
+            ok = r == 1 && cudaDeviceSynchronize() == cudaSuccess && cudaMemcpy(got.data(), dy, got.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+            int same = ok && !memcmp(got.data(), ref.data(), got.size() * 4);
+            char what[160];
+            snprintf(what, sizeof what, "moe %s/%s S %d K %d E %d [%d x %d]: down by %d outputs, the bits of one call", ref_name(tg), ref_name(td),
+                     S, K, E, D, I, cl[c]);
+            check_ok(same, what);
+        }
+        CcMoe few = mp; few.S = CC_MOE_FRAME_ROWS; few.h_off = 0;
+        check_ok(coli_cuda_moe_cols_async(0, dtab, dx_, di, dw, dh, dy, &few, 128, NULL) == -1, "moe_cols: host rows or a decode step's rows not taken");
+        few.h_off = -1; few.S = S;
+        check_ok(coli_cuda_moe_cols_async(0, dtab, dx_, di, dw, dh, dy, &few, 100, NULL) == -1, "moe_cols: a slice not of 128s not taken");
+        cudaFree(dtab); cudaFree(dx_); cudaFree(dw); cudaFree(dy); cudaFree(dh); cudaFree(di);
+        for (int i = 0; i < 3 * E; i++) if (tt[i]) coli_cuda_tensor_free(tt[i]);
+        free(tt); free(tab); free(G); free(U); free(Dn); free(x); free(w); free(ids);
+        return;
+    }
     cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
     for (int r = 0; r < 2 && ok; r++) ok = coli_cuda_moe_async(0, dtab, dx_, di, dw, dh, dy, NULL, &mp, NULL);
     ok = ok && cudaDeviceSynchronize() == cudaSuccess;
@@ -574,6 +603,9 @@ int main(void) {
         check_moe(pairs[i][0], pairs[i][1], 40, 8, 16, 1024, 768);
     }
     for (int g : {22, 16, 29}) for (int S : {2, 4}) check_moe(g, 42, S, 10, 24, 2560, 640);   /* Qwen3.8-Flash-Next IQ2_XS's experts, a verify's rows */
+    /* a prompt's rows of a layer in one call, down by slices (coli_cuda_moe_cols_async): Qwen3.8's shape, 40 experts,
+     * the 64-row tiles (S 100) and the 128-row ones (S 2100), against one call of every output */
+    for (int g : {42, 16}) for (int S : {100, 2100}) bench_moe(g, 42, S, 10, 40, 2560, 640, 0, 1);
     if (bench) {
         printf("BENCH (rows of x: 1 2 3 4)\n");
         const int bt[] = {12, 14, 8, 17, 22, 16, 21, 23, 11, 10};
