@@ -160,14 +160,19 @@ class ChatContextTest(unittest.TestCase):
         self.assertEqual(gateway.chat_context_env(env, family, self.model), 12000)
 
     def test_a_cache_the_plan_sizes_keeps_room_for_the_prompt(self):
-        # V4.1's state is 6.4 KB a token, its prompt's workspace 200 KB: the state alone
-        # took 131072 tokens on 16 GB and 262144 on 64 GB, where the plan then reserved
-        # 53.7 GB of workspace and gave the expert cache no slot (the server refused to
-        # start). Counted together: 16384 (3.5 GB), 65536 (13.8 GB of a quarter of 64 GB),
-        # and 131072 (27.7 GB, a tenth) only from 277 GB.
+        # V4.1's state is 6.4 KB a token; its prompt's workspace is priced at one prompt
+        # chunk (200 KiB a row of 1280 rows = 0.25 GB), because the prefill reads a prompt
+        # in bounded chunks and never holds the whole context's buffers at once. So the
+        # state decides and the workspace is a constant: 65536 on 8 GB (0.7 GB, inside
+        # the quarter share that applies up to 64k tokens -- 131072's 1.1 GB would be
+        # 13.8% and the share above 64k is a tenth), 131072 on 16 GB (1.1 GB, 6.9%), and
+        # the ladder's 262144 ceiling from 64 GB (2.0 GB, 3.1%). Priced at the whole
+        # context the same table read 16384 (16 GB) / 65536 (64 GB) / 131072 (512 GB):
+        # at 262144 tokens the plan reserved 53.7 GB of workspace, gave the expert cache
+        # no slot, and the server refused to start.
         (Path(self.tmp.name) / "config.json").write_text(json.dumps(DSV41_FLASH_CONFIG))
-        for available, expected in ((8 * GB, None), (16 * GB, 16384), (64 * GB, 65536),
-                                    (256 * GB, 65536), (512 * GB, 131072),
+        for available, expected in ((8 * GB, 65536), (16 * GB, 131072), (64 * GB, 262144),
+                                    (256 * GB, 262144), (512 * GB, 262144),
                                     (1024 * GB, 262144)):
             with self.subTest(gb=available / GB):
                 context, why = chat_context(self.model, {}, available=available)
