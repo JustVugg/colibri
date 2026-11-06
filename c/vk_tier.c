@@ -2649,10 +2649,24 @@ static void d2_init(long long fit0, long long all, int act) {
  * what RAM has free less 4 GiB (the engine's own growth, the page cache the loads go
  * through), at most what the devices leave; COLI_VK_TIER_HOST_GB sets it and
  * COLI_VK_TIER_HOST=0 turns it off. COLI_VK_TIER_HOST=1 turns it on where the device
- * shares the host's RAM too (tests: the same memory, the paths of a card). */
+ * shares the host's RAM too (tests: the same memory, the paths of a card), and on a
+ * trunk-first card (coli_vk_window_trunk_first_on) whose window holds the tier beside
+ * the trunk, where it is off by default: a mirror of the experts in GTT-imported RAM is
+ * a second copy of what the engine's cache keeps. */
 static void host_init(long long all) {
     const char *e = getenv("COLI_VK_TIER_HOST"), *g = getenv("COLI_VK_TIER_HOST_GB");
     if ((e && *e == '0') || (T.uma && !(e && !strcmp(e, "1"))) || !T.excl || !T.exp_bytes || !coli_vk_tier_host_pool()) return;
+    /* Trunk-first placement (deepseek_v41, coli_vk_window_trunk_first): the dense trunk went up before the
+     * window was asked and the ask kept the mapped path, so the tier runs inside what the heap leaves beside
+     * it. A host pool next to that holds a second copy of every expert the device's memory leaves, in system
+     * RAM the GTT imports, while the engine's own RAM cache already holds those experts once: on such a card
+     * the pool stays off unless it is asked for, and the tier's misses read the engine's cache and the disk. */
+    if (coli_vk_window_trunk_first_on() && !(e && !strcmp(e, "1")) && !(g && *g)) {
+        fprintf(stderr, VKT_TAG " tier %s: host pool off, the tier inside the mapped window beside the trunk; the experts "
+                        "it leaves come from the engine's RAM cache (COLI_VK_TIER_HOST=1 or COLI_VK_TIER_HOST_GB turns it on)\n",
+                T.engine);
+        return;
+    }
     long long left = all - T.dmax[0] - T.dmax[1];
     if (left <= 0) return;
     const double GiB = 1073741824.0;

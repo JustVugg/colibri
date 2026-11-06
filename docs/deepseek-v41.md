@@ -502,6 +502,41 @@ Off by default on an integrated GPU (not measured on a V4.1 checkpoint); on the 
 fixtures every configuration gives the CPU's tokens (`tests/vulkan_engines.sh
 deepseek-chain`, `deepseek-chain-sanitize`).
 
+### Trunk-first placement (a discrete card with Resizable BAR)
+
+On a discrete card whose host-visible device-local heap covers its memory (Resizable
+BAR), the engine places the **trunk first** and sizes everything else around it:
+
+1. the device opens, and the chain fit runs before anything is allocated — it reads the
+   device's real free memory, so every layer that fits goes up (the trunk of the Flash
+   checkpoint, 40 layers of fp8/bf16 matrices plus the chain's fixed buffers, held about
+   7.6 GiB of the heap once placed);
+2. the trunk is placed as the layers are read, its host copies given back
+   (`COLI_VK_DENSE_HOST`'s auto rule), and only then is the mapped-weights window asked:
+   the heap less what the trunk took and `COLI_VK_FREE_RESERVE_GB` (1 GiB), not 9/10 of
+   the heap. A driver that refuses what is left beside the trunk takes the staged path
+   for what follows, as a card without a window does; `COLI_VK_STAGED=1` still forces it;
+3. the expert tier sizes itself from what the device has left less
+   `COLI_VK_TIER_RESERVE_GB` (1 GiB) and the dense weights still to come — inside the
+   window, beside the trunk — and its **host pool stays off**: a mirror of the experts in
+   system RAM the GTT imports would double what the engine's own RAM cache holds.
+   `COLI_VK_TIER_HOST=1` or `COLI_VK_TIER_HOST_GB` turns it back on, and `COLI_VK_TIER_GB`
+   still caps the tier.
+
+The order matters because the window's probe allocates 1 GiB blocks and frees them, and
+a driver that reports the budget only once they are back shows the fit a few hundred
+MiB — which left the whole trunk on the CPU while the tier filled the window and an
+823-expert mirror of it sat in system RAM. The `[VK] memory: mapped weights` line says
+what was asked and why; other engines keep the order they had.
+
+What that leaves the tier is smaller than the window itself. On the 16 GiB card this
+was measured on, the driver's budget exposes about 90% of the heap (13.3 of 14.4 GiB),
+the trunk holds 7.62 GiB once placed, and the window asks the remaining 5 GiB; the
+tier's own sizing then sets aside its 1 GiB reserve, the ~1.4 GiB of bf16 dense tail
+still to be uploaded lazily, and the 64 streaming slots (~1.35 GiB), leaving a 3.28 GiB
+resident budget — 83 experts of 21.1 MiB — beside a trunk the whole prompt pays for on
+every token. `COLI_VK_TIER_RESERVE_GB=0` and `COLI_VK_TIER_HOST` trade that back.
+
 ## Reusing a turn, and why it is asked for rather than assumed
 
 A chat client resends the whole conversation every turn. Every other engine in
