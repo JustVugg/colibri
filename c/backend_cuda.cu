@@ -2621,7 +2621,10 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
     }
     if(any_e8&&!all_e8) return 0;
     if(any_f8&&!all_f8) return 0;   /* mixed FP8: no homogeneous kernel, sync path has the per-expert loop */
-    if(total>8) return 0;                       /* decode-scale only */
+    /* Decode scale: the qwen36 tier issues one group per device per token, up to its
+     * QT_MAX_ROWS (32) rows, i.e. a model's top-k when every routed expert is resident
+     * on one card (Qwen3.8 routes 10). Above 32 the caller keeps the CPU path. */
+    if(total>32) return 0;
     DeviceContext *ctx=find_ctx(device); if(!ctx||ctx->group_pending||!select_ctx(ctx)) return 0;
     if(!prepare_group_weights(ctx,gates,ups,downs,count,host)) return 0;
     size_t xb=(size_t)total*D*sizeof(float), ib=(size_t)total*I*sizeof(float);
@@ -2648,7 +2651,10 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
          * sync dispatch, silu fused in the dual epilogue. */
         f8_group_launch(ctx,(GroupDesc*)ctx->group_desc,I,D,max_rows,count);
     }else if(group_moe_ok(host,count,total,D,I)){
-        if(!group_moe_launch(ctx,device,host,count,rows,total,D,I,0))return 0;
+        /* pin 1: the warp kernels at any row count, so 9..32 rows give the bits of the
+         * same experts issued 8 rows at a time (the tensor-core family past
+         * CC_MOE_FRAME_ROWS is for prompt chunks, not a decode step). */
+        if(!group_moe_launch(ctx,device,host,count,rows,total,D,I,1))return 0;
     }else if(all_s4&&(!getenv("COLI_CUDA_W4_PACKED")||atoi(getenv("COLI_CUDA_W4_PACKED")))){
         GroupDesc *dev=(GroupDesc*)ctx->group_desc;
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count);
