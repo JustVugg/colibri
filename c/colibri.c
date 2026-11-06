@@ -80,6 +80,7 @@
 #include "lora.h"                                 /* ADAPTER=<dir>: LoRA residual on frozen base */
 #include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
 #include "decode_batch.h"
+#include "serve_codec.h"
 #include "pin_pool.h"   /* piu scatti annidati dello stato */
 #include "park.h"       /* a short request keeps the one slot's conversation aside (COLI_PARK) */
 #include "prompt_break.h"   /* a served prompt that a STOP or CANCEL stops between two layers */
@@ -11162,14 +11163,15 @@ static int logprob_tail(char *dst, size_t cap, const float *lo, int V, int token
  * paired with requests that never opt in, so it never sees the extended form. */
 static void mux_data(Tok *T, unsigned long long id, int token,
                      const float *lo, int V, int topk){
-    char out[256]; int n=tok_decode(T,&token,1,out,sizeof(out));
+    char out[256], request_id[32], tail[1024];
+    int n=tok_decode(T,&token,1,out,sizeof(out));
+    snprintf(request_id,sizeof(request_id),"%llu",id);
+    const char *numeric=NULL;
     if(topk>0 && lo){
-        char tail[1024]; logprob_tail(tail,sizeof(tail),lo,V,token,topk);
-        printf("DATA %llu %d%s\n",id,n,tail);
-    } else
-        printf("DATA %llu %d\n",id,n);
-    if(n>0) fwrite(out,1,(size_t)n,stdout); putchar('\n');
-    fflush(stdout);
+        logprob_tail(tail,sizeof(tail),lo,V,token,topk);
+        numeric=tail;
+    }
+    coli_serve_write_data_lp(stdout,request_id,out,(size_t)n,numeric);
 }
 
 /* Echoed-prompt read-out frame (U7a, opt-in only): "ECHO <id> <n> <pos> <lp>
@@ -11179,11 +11181,11 @@ static void mux_data(Tok *T, unsigned long long id, int token,
  * the request set SUBMIT logprobs=k, so an old server can never receive one. */
 static void mux_echo(Tok *T, unsigned long long id, int pos, int token,
                      const float *lo, int V, int topk){
-    char out[256]; int n=tok_decode(T,&token,1,out,sizeof(out));
-    char tail[1024]; logprob_tail(tail,sizeof(tail),lo,V,token,topk);
-    printf("ECHO %llu %d %d%s\n",id,n,pos,tail);
-    if(n>0) fwrite(out,1,(size_t)n,stdout); putchar('\n');
-    fflush(stdout);
+    char out[256], request_id[32], tail[1024];
+    int n=tok_decode(T,&token,1,out,sizeof(out));
+    snprintf(request_id,sizeof(request_id),"%llu",id);
+    logprob_tail(tail,sizeof(tail),lo,V,token,topk);
+    coli_serve_write_echo_lp(stdout,request_id,out,(size_t)n,pos,tail);
 }
 
 /* Opt-in prefill read-out (U7a, SUBMIT logprobs=k): one full-prompt forward

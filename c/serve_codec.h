@@ -448,6 +448,19 @@ static inline int coli_serve_write_data_lp(
     return fflush(output) == 0;
 }
 
+/* Prompt read-out keeps the token position before the family-computed numeric
+ * tail. Token decoding and logprob arithmetic remain with the engine. */
+static inline int coli_serve_write_echo_lp(
+    FILE *output, const char *id, const void *data, size_t bytes,
+    int position, const char *tail)
+{
+    if (fprintf(output, "ECHO %s %zu %d%s\n", id, bytes, position, tail ? tail : "") < 0 ||
+        (bytes && fwrite(data, 1, bytes, output) != bytes) ||
+        fputc('\n', output) == EOF)
+        return 0;
+    return fflush(output) == 0;
+}
+
 /* Engine-authenticated structured tool output. The payload is opaque to this
  * transport; the gateway applies the active family parser. A zero-byte frame
  * declares the sideband authoritative for the request, so ordinary DATA that
