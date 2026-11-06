@@ -576,20 +576,27 @@ int vkc_situ(VkcBuf *g, VkcBuf *u, VkcBuf *y, const VkcSitu *p);
  *                     out[pos / ratio]. ring: (1 + overlap) * ratio kv rows of P at
  *                     ring_off, then as many score rows.
  *   vkc_dsv4_score    the indexer's scores: row s (position pos_base + s) scores columns
- *                     j < lens = (pos + 1) / ratio (and mask[mask_off + s*mask_row + j] != 0
- *                     when mask_row > 0) as sum_h [dot > 0] dot * hw_h * wscale, dot = q_h .
+ *                     j < lens = (pos + 1) / ratio (and, when mask_row > 0, column j of the
+ *                     candidate mask set) as sum_h [dot > 0] dot * hw_h * wscale, dot = q_h .
  *                     key[j]; every other j < width scores -inf; into sc[sc_off + s*sc_row
  *                     + j]. IH <= 4096; IH <= 64 and IH*ID <= 4096 stage the queries in
  *                     shared memory, larger ones read them from memory (the same sums).
  *   vkc_dsv4_cand     the candidate blocks: per row, each block's best score, the block of
  *                     column lens - 1 pinned, then the best min(topb, blocks) blocks (the
- *                     lower on a tie), mask 1 on their columns. At most 4096 blocks.
+ *                     lower on a tie), their columns kept whole and every other column
+ *                     below width cleared. At most 4096 blocks.
  *   vkc_dsv4_topk     per row the min(topk, finite scores) largest, ties to the lower
  *                     column, as base + j into the list, ascending (order 0) or by rank
  *                     (order 1); -1 in the rest of the topk slots. topk <= 4096 for order 1.
  *   vkc_dsv4_engram   the engram gate: per (stream c, row s) the stream gains
  *                     sigmoid(signed sqrt(x . (qw * kw * key) * rms(x)^-1 * rms(key)^-1 /
  *                     sqrt(D))) * value; kv[s] = H keys of D, then the value.
+ *
+ * The candidate mask is one bit a column, not a word: a mask row's stride is mask_row
+ * *words* of 32 columns (mask_off and s*mask_row alike), column j being bit j & 31 of the
+ * word at (j >> 5). It is an int32 buffer of S * mask_row words, read by score and
+ * written by cand, and a row carries a mask only where mask_row > 0 says so (the index
+ * sources before the candidate one pass 0).
  * Offsets and strides in floats; lists and masks are int32 buffers. */
 int vkc_dsv4_ready(void);
 typedef struct { int S, H, hd, cnt, l_off, l_row, nwin, w_off, c_off, q_off, q_row, o_off, o_row, sink_off, flags;
@@ -601,9 +608,9 @@ typedef struct { int S, pos_base, ratio, P, D, overlap, kv_off, kv_row, sc_off, 
                  ring_off; } VkcDsComp;
 int vkc_dsv4_compress(VkcBuf *kv, VkcBuf *sc, VkcBuf *ring, VkcBuf *prm, VkcBuf *out, const VkcDsComp *p);
 typedef struct { int S, pos_base, ratio, IH, ID, width, q_off, q_row, w_off, w_row, k_off, k_row, mask_row, sc_row;
-                 float wscale; int sc_off, mask_off; } VkcDsScore;
+                 float wscale; int sc_off, mask_off; } VkcDsScore;   /* mask_row: words a row (32 columns each) */
 int vkc_dsv4_score(VkcBuf *iq, VkcBuf *hw, VkcBuf *keys, VkcBuf *mask, VkcBuf *sc, const VkcDsScore *p);
-typedef struct { int S, pos_base, ratio, width, block, topb, sc_row, mask_row; } VkcDsCand;
+typedef struct { int S, pos_base, ratio, width, block, topb, sc_row, mask_row; } VkcDsCand;   /* mask_row: words a row */
 int vkc_dsv4_cand(VkcBuf *sc, VkcBuf *mask, const VkcDsCand *p);
 typedef struct { int S, width, topk, sc_row, l_off, l_row, base, order; } VkcDsTopk;
 int vkc_dsv4_topk(VkcBuf *sc, VkcBuf *list, const VkcDsTopk *p);

@@ -2171,31 +2171,32 @@ static void test_ds_index(int S, int pos_base, int ratio, int IH, int ID, int to
         ds_topk_ref(ref + s * scrow, width, topk, base, order, lst + s * lrow + 2);
         ds_topk_ref(refm + s * scrow, width, topk, base, order, lstm + s * lrow + 2);
     }
+    const int mwords = (width + 31) / 32;   /* the candidate mask: one bit a column */
     VkcBuf *qb = up(q, (size_t)S * qrow + 1), *kb = up(k, (size_t)width * krow + 3), *wb = up(w, (size_t)S * wrow + 2);
-    VkcBuf *scb = vkc_buf((size_t)S * scrow * 4, VKC_DEV), *mb = vkc_buf((size_t)S * scrow * 4, VKC_DEV);
+    VkcBuf *scb = vkc_buf((size_t)S * scrow * 4, VKC_DEV), *mb = vkc_buf((size_t)S * mwords * 4, VKC_DEV);
     VkcBuf *lb = vkc_buf((size_t)S * lrow * 4, VKC_DEV), *lb2 = vkc_buf((size_t)S * lrow * 4, VKC_DEV), *scb2 = vkc_buf((size_t)S * scrow * 4, VKC_DEV);
     VkcDsScore sp = {S, pos_base, ratio, IH, ID, width, 1, qrow, 2, wrow, 3, krow, 0, scrow, wscale, 0, 0};
-    VkcDsCand cp = {S, pos_base, ratio, width, block, topb, scrow, scrow};
+    VkcDsCand cp = {S, pos_base, ratio, width, block, topb, scrow, mwords};
     VkcDsTopk tp = {S, width, topk, scrow, 2, lrow, base, order};
-    VkcDsScore sm = sp; sm.mask_row = scrow;
+    VkcDsScore sm = sp; sm.mask_row = mwords;
     vkc_begin();
     int ok = vkc_dsv4_score(qb, wb, kb, NULL, scb, &sp) && vkc_dsv4_cand(scb, mb, &cp) && vkc_dsv4_topk(scb, lb, &tp);
     if (S > 1)   /* the masked scores one row at a time, at offsets (a speculative step's rows read different keys) */
         for (int s = 0; s < S && ok; s++) {
             VkcDsScore r1 = sm; r1.S = 1; r1.pos_base = pos_base + s; r1.q_off = 1 + s * qrow; r1.w_off = 2 + s * wrow;
-            r1.sc_off = s * scrow; r1.mask_off = s * scrow;
+            r1.sc_off = s * scrow; r1.mask_off = s * mwords;
             ok = vkc_dsv4_score(qb, wb, kb, mb, scb2, &r1);
         }
     else ok = ok && vkc_dsv4_score(qb, wb, kb, mb, scb2, &sm);
     ok = ok && vkc_dsv4_topk(scb2, lb2, &tp);
     vkc_submit(1);
     float *gs = down(scb, 0, (size_t)S * scrow);
-    int *gm = (int *)down(mb, 0, (size_t)S * scrow), *gl = (int *)down(lb, 0, (size_t)S * lrow), *gl2 = (int *)down(lb2, 0, (size_t)S * lrow);
+    int *gm = (int *)down(mb, 0, (size_t)S * mwords), *gl = (int *)down(lb, 0, (size_t)S * lrow), *gl2 = (int *)down(lb2, 0, (size_t)S * lrow);
     int same_sc = 1, same_m = 1, same_l = 1, same_l2 = 1;
     for (int s = 0; s < S; s++) {
         for (int j = 0; j < width; j++) {
             same_sc &= gs[s * scrow + j] == ref[s * scrow + j];
-            same_m &= gm[s * scrow + j] == keep[s * scrow + j];
+            same_m &= (int)(((unsigned)gm[s * mwords + (j >> 5)] >> (j & 31)) & 1u) == keep[s * scrow + j];
         }
         for (int t = 0; t < topk; t++) { same_l &= gl[s * lrow + 2 + t] == lst[s * lrow + 2 + t]; same_l2 &= gl2[s * lrow + 2 + t] == lstm[s * lrow + 2 + t]; }
     }

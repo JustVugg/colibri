@@ -537,7 +537,8 @@ still to be uploaded lazily, and the streaming slots (48, ~1 GiB: measured, each
 saving goes back to the residents), leaving a ~3.4 GiB budget — 107 experts of 21.1 MiB —
 beside a trunk the whole prompt pays for on every token. `COLI_VK_TIER_RESERVE_GB=0` and
 `COLI_VK_TIER_HOST` trade that back. The ledger below shows where it ends up, and the
-2.1 GiB the trunk still uploads after that fit (embedding, routers, the DSpark stages).
+2.1 GiB the trunk still uploads after that fit (the lm head, the 40 routers, the DSpark
+stages: the token embedding is never on the device, see below).
 
 ### Where the VRAM goes at a turn's end
 
@@ -564,10 +565,22 @@ What it showed on the 16 GiB card, a 2-turn run with a 2600-word prompt:
 - **The audit's unattributed 2.14 GiB on a short-prompt run is not the tier.** On that
   arm the tier's pools do not move after the warm start: the growth from the post-load
   line (`device memory held 8187281408 B`, 7.63 GiB) to the turn's end is 1262.5 MiB of
-  token embedding (129280 x 5120 bf16) + 150 MiB of the 40 routers + 673 MiB of the
+  the **lm head** (129280 x 5120 bf16) + 150 MiB of the 40 routers + 673 MiB of the
   DSpark stages' matrices, all uploaded by the *first forward* and counted by neither the
   chain's `dev_bytes` nor the tier's budget; 52 MiB is the KV mirrors. The weight pool
   holds 9608.2 MiB of rows at the turn's end against the 7523.0 MiB the setup places.
+  The commit that added this line called the 1262.5 MiB the "token embedding"; that was
+  wrong and the correction is worth keeping, because it is a lever that does not exist.
+  The embedding has always lived on the **host**: `tie_word_embeddings` is false on this
+  checkpoint, the embedding and the head are two different `129280 x 5120` bf16 tensors,
+  and the embedding's only reader is `wb_row_f32` (`c/deepseek_v41.c`), which copies the
+  rows a step needs into the host's rows -- decode reads one row a token, a chunk reads a
+  row a position. A run instrumented at its first forward (every device upload printed)
+  shows `head.weight` going up as the 1262.5 MiB item and the embedding never touching
+  the device at all: the head is what the logits GEMV runs on the device, 662 million
+  multiply-adds a token, so it is hot and it stays. The routers' 150 MiB are the same
+  kind of item (a per-layer GEMV every forward). What is left of that 2.1 GiB is the
+  DSpark stages' 673 MiB, used whenever the draft head runs.
 - **The streaming slots cost one 256 MiB block, not 1.35 GiB.** The tier splits its
   budget between residents and slots (`fit = fit_raw - slots`), so shrinking the slot
   set does not by itself free anything: 64 slots and 91 residents fill the same 13 pool
@@ -582,6 +595,31 @@ What it showed on the 16 GiB card, a 2-turn run with a 2600-word prompt:
   was freed. Read `process` for the engine, not the card. (On a prompt small enough not
   to press on the ceiling — the 11-token one — the two agree: peak = `process` + 2.49
   GiB of desktop.)
+- **The candidate mask is one bit a column now, and the chunk it allows is twice as
+  tall.** The indexer's scores and its candidate mask are quadratic in the prompt (a row
+  of a chunk scores every compressed column below the prompt's end), and the mask was an
+  fp32 word a column that only ever meant "kept" or "not" -- read as `!= 0` by the score
+  kernel, by the host, and by the CPU's layers after a partial chain. `vkc_dsv4_cand`
+  writes it as a bit now (`c/shaders/chain_dsv4.comp`, modes 3/4/9/10), so a row costs
+  `4E` bytes of scores plus `E/8` of mask instead of `8E`, and the chunk's quadratic cap
+  (`v41c_forward_seg`) keeps the same 256 MiB pair budget for 1.94x the rows: at a
+  20000-position prompt a chunk was 1677 rows and is 3253, and the row cost the chunk
+  sizing prints fell from 181 to 105 KiB on the tiny fixture (the real checkpoint at
+  E=3107: 1293 to 1281 KiB a row). Nothing selects differently: the picked blocks are
+  still kept whole, and the same bits come out (`tests/test_vk_chain.c`'s indexer case
+  compares the mask column for column, through the single-row and the grid kernels).
+- **The per-layer drain is not what the chain waits for.** The audit's R4 asked for the
+  `vkc_finish()` once a layer (`c/deepseek_v41_chain.h`, after the attention frame) to
+  wait only the frames the host reads. Measured with both halves timed separately, a
+  1280-row chunk spends 28095 ms waiting for the frame it reads and **0.5 ms** waiting
+  for the rest: two frames are in flight at a time, and a single queue runs submissions
+  in order (every frame starts with a barrier on everything submitted before it), so the
+  frame holding the previous layer's shared expert is always through before this
+  layer's attention starts. The change was implemented, measured at 0.5 ms a chunk and
+  dropped: the wait that remains is the attention itself, which the host needs (the
+  routed experts' norm and, at the candidate layer, the mask). R4's own estimate
+  (2-8 ms a chunk) is right; nothing 60-second-sized hides in the drain -- the device is
+  idle during `moe_run_at` instead, and that is the pipelining the chain does not do.
 - **Streaming a cold expert pays from two rows, not sixteen.** `COLI_VK_TIER_STREAM_MIN`
   is 2 now, from a measurement of one 21.1 MiB expert (`COLI_VK_CHAIN_BENCH=xbrows`): a
   device step costs 0.12 ms at 1 row, 0.40 at 4 and 0.76 at 16 (the tiled GEMM from

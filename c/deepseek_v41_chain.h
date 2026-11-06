@@ -120,10 +120,17 @@ static int v41c_rows(void) {
 }
 /* v41c_res counts instead of reserving while g_v41c_count >= 0 (the chunk's sizing) */
 static long long g_v41c_count = -1;
+/* the quadratic cap on the chunk (v41c_forward_seg) said its line once */
+static int g_v41c_cap_said;
 static int v41c_res(VkcBuf **b, size_t floats, int kind) {
     if (g_v41c_count >= 0) { g_v41c_count += (long long)(floats ? floats : 1) * (long long)sizeof(float); return 1; }
     return vkc_reserve(b, (floats ? floats : 1) * sizeof(float), kind);
 }
+/* The candidate mask's words a row: one bit a column (vk_chain.h, vkc_dsv4_cand), read
+ * back by the host and by the index sources after the candidate one; the scores stay
+ * fp32. `wcap` columns a row is the forward's end position, so the pair is quadratic in
+ * the prompt and the mask was most of it (4 bytes a column). */
+static size_t v41c_mask_words(size_t wcap) { return (wcap + 31) / 32; }
 
 /* The second device's copies, by host pointer (the per-matrix path's map is the
  * primary's): an open table, grown at half full. */
@@ -791,7 +798,7 @@ static int v41c_scratch(V41Chain *ch, Model *m, int rows, int ctx) {
              v41c_res(&ch->grp, r * c->o_groups * c->o_lora, VKC_DEV) && v41c_res(&ch->br, r * D, VKC_DEV) &&
              v41c_res(&ch->craw, r * hd, VKC_DEV) && v41c_res(&ch->cscr, r * hd, VKC_DEV) &&
              v41c_res(&ch->iq, r * IH * ID, VKC_DEV) && v41c_res(&ch->ihw, r * IH, VKC_DEV) &&
-             v41c_res(&ch->isc, r * ch->wcap, VKC_DEV) && v41c_res(&ch->mask, r * ch->wcap, VKC_DEV) &&
+             v41c_res(&ch->isc, r * ch->wcap, VKC_DEV) && v41c_res(&ch->mask, r * v41c_mask_words(ch->wcap), VKC_DEV) &&
              v41c_res(&ch->list, r * (ch->W + ch->K), VKC_DEV) &&
              v41c_res(&ch->cs, (r + ch->rmax) * 2 * c->rope_dim, VKC_DEV) && v41c_res(&ch->erows, r * ew, VKC_DEV) &&
              v41c_res(&ch->ekv, r * (size_t)D * (H + 1), VKC_DEV) && v41c_res(&ch->gs, r * c->moe_inter, VKC_DEV) &&
@@ -901,7 +908,7 @@ static int v41c_attention(V41Chain *ch, Model *m, int i, const V41Fwd *f) {
     }
     if (ok && r > 0 && c->index_source[i]) {                        /* the indexer: this layer's selection */
         int IH = c->index_n_heads, ID = c->index_head_dim, width = (pb + nr) / r, cs = c->candidate_source;
-        int cand = v41c_cand_on(c), mrow = cand && cs < i ? (int)ch->wcap : 0;
+        int cand = v41c_cand_on(c), mrow = cand && cs < i ? (int)v41c_mask_words(ch->wcap) : 0;
         float wscale = (1.0f / sqrtf((float)ID)) * (1.0f / sqrtf((float)IH));
         ok = vkc_matmul(v41c_w8(&l->idx_wq_b), ch->qr, 0, ch->iq, 0, nr) &&
              v41c_rope(ch, m, ch->iq, nr * IH, IH, ID - rd, IH * ID, ID, tcs, rd, 0) &&
@@ -911,11 +918,12 @@ static int v41c_attention(V41Chain *ch, Model *m, int i, const V41Fwd *f) {
         for (int s = 1; s < nr; s++) same &= kl[s] == kl[0];
         for (int s = 0; ok && s < nr; s += same ? nr : 1) {
             VkcDsScore sp = {same ? nr : 1, pb + s, r, IH, ID, width, s * IH * ID, IH * ID, s * IH, IH, 0, ID, mrow,
-                             (int)ch->wcap, wscale, s * (int)ch->wcap, s * mrow};
+                             (int)ch->wcap, wscale, s * (int)ch->wcap, s * mrow};   /* mrow: mask words a row */
             ok = vkc_dsv4_score(ch->iq, ch->ihw, ch->ikey[kl[s]], ch->mask, ch->isc, &sp);
         }
         if (ok && cand && cs == i) {
-            VkcDsCand cp = {nr, pb, r, width, c->candidate_block_size, c->candidate_topk_blocks, (int)ch->wcap, (int)ch->wcap};
+            VkcDsCand cp = {nr, pb, r, width, c->candidate_block_size, c->candidate_topk_blocks, (int)ch->wcap,
+                            (int)v41c_mask_words(ch->wcap)};
             ok = vkc_dsv4_cand(ch->isc, ch->mask, &cp);
         }
         VkcDsTopk tp = {nr, width, ch->K, (int)ch->wcap, ch->W, LR, ch->Wd, 0};
@@ -989,7 +997,23 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
         return 0;
     }
     int CH = v41c_chunk_rows(ch, m, E), rows;
-    { int64_t lim = ((int64_t)32 << 20) / (E > 1 ? E : 1); if (lim < CH) CH = lim < 1 ? 1 : (int)lim; }
+    /* The indexer's scores and mask are quadratic in the prompt: a row costs 4E bytes of
+     * scores and E/8 of the packed mask, so the two together keep to the 256 MiB they took
+     * as 32M/E rows of fp32 scores and mask (v41c_scratch), and the mask being a bit a
+     * column is what lets twice the rows into it. */
+    {
+        int64_t per_row = 4 * (int64_t)E + (int64_t)v41c_mask_words((size_t)E) * 4;
+        int64_t lim = ((int64_t)256 << 20) / (per_row > 0 ? per_row : 1);
+        if (lim < CH) {
+            CH = lim < 1 ? 1 : (int)lim;
+            if (!g_v41c_cap_said) {
+                g_v41c_cap_said = 1;
+                fprintf(stderr, "[VK] %s chain: a prompt of %d positions caps a chunk at %d rows (%.1f KiB a row of scores and "
+                                "packed candidate mask, %.0f MiB of 256; COLI_VK_CHAIN_ROWS sets it)\n",
+                        nmc, E, CH, per_row / 1024.0, (double)lim * per_row / 1048576.0);
+            }
+        }
+    }
     if (ch->ks.on) {   /* a chunk's new compressed rows fit the split's window */
         int mx = ch->rmin == 1 ? ch->ks.chunk : (ch->ks.chunk - 1) * ch->rmin;
         if (CH > mx) CH = mx < 1 ? 1 : mx;
@@ -1082,7 +1106,7 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
         if (r > 1) { pn += (size_t)2 * r * hd; if (spec) { f.praw[i] = pn; pn += (size_t)2 * n * hd; } }
     }
     ok = ok && pc && v41c_scratch(ch, m, rows, E) && v41c_res(&ch->pull, pn, VKC_DOWN) && (!T || m->main_hidden) &&
-         (!cand_out || v41c_res(&ch->cmd, (size_t)rows * ch->wcap, VKC_DOWN)) &&
+         (!cand_out || v41c_res(&ch->cmd, (size_t)rows * v41c_mask_words(ch->wcap), VKC_DOWN)) &&
          (list_out < 0 || v41c_res(&ch->ld, (size_t)rows * LR, VKC_DOWN));
     if (!ok) {
         fprintf(stderr, "[VK] %s chain: device memory for %d rows at %d positions refused; the CPU runs the layers\n", nmc, rows, E);
@@ -1206,7 +1230,8 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
                  v41c_attention(ch, m, i, &f) && v41c_post(ch, m, ch->hpa, nr) &&
                  v41c_pre(ch, m, ch->fnf[i], ch->o_hcf[i], ch->hpf, ch->hpa, ch->o_fn[i], nr) &&
                  vkc_copy(ch->h2d, 0, ch->nrm, 0, (size_t)nr * D) &&
-                 (!cand_out || i != cs || vkc_copy(ch->cmd, 0, ch->mask, 0, (size_t)nr * ch->wcap)) && vkc_submit(0);   /* A1 */
+                 (!cand_out || i != cs || vkc_copy(ch->cmd, 0, ch->mask, 0, (size_t)nr * v41c_mask_words(ch->wcap))) &&
+                 vkc_submit(0);   /* A1 */
             /* while it runs, the tier loads the experts this layer will likely stream (a
              * big prompt chunk only) */
             if (ok) vkt_stream_prefetch(i, nr);
@@ -1219,10 +1244,12 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
             }
             if (cand_out && i == cs) {                     /* the candidate source's mask, for the CPU's readers */
                 const int32_t *mk = (const int32_t *)vkc_ptr(ch->cmd);
-                int wc = (pb + nr) / c->compress_ratio[cs], wh = m->candidate_width;
+                int wc = (pb + nr) / c->compress_ratio[cs], wh = m->candidate_width, mw = (int)v41c_mask_words(ch->wcap);
                 for (int s = 0; s < nr; s++) {
                     uint8_t *keep = m->candidates + (size_t)(c0 + s) * wh;
-                    for (int j = 0; j < wh; j++) keep[j] = j < wc && mk[(size_t)s * ch->wcap + j] != 0;
+                    const int32_t *row = mk + (size_t)s * mw;
+                    for (int j = 0; j < wh; j++)
+                        keep[j] = j < wc && ((uint32_t)row[j >> 5] >> (uint32_t)(j & 31)) & 1u;
                 }
             }
             /* A2: the shared expert, while the host computes the routed experts */

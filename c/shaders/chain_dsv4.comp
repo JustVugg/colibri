@@ -28,15 +28,19 @@
 //   the first. The ring: kv rows at ring_off, score rows after them ((1+overlap)*ratio
 //   rows of P each).
 // mode 3, the indexer's scores (deepseek_v41.c indexer_run): one workgroup per row s,
-//   position pos = pos_base + s, lens = (pos + 1) / ratio. For j < width: j < lens (and
-//   mask[mask_off + s*mask_row + j] != 0 when mask_row > 0) scores sum_h [dot > 0] dot *
-//   w_h, dot = q_h . key[j] (k_off + j*k_row), w_h = hw[w_off + s*w_row + h] * wscale; any
-//   other j scores -inf. Into sc[sc_off + s*sc_row + j]. Limits: IH <= 64, IH*ID <= 4096.
+//   position pos = pos_base + s, lens = (pos + 1) / ratio. For j < width: j < lens (and,
+//   when mask_row > 0, column j of the candidate mask set: one bit a column, bit j & 31 of
+//   the int at mask_off + s*mask_row + (j >> 5), the row's stride in words) scores
+//   sum_h [dot > 0] dot * w_h, dot = q_h . key[j] (k_off + j*k_row), w_h =
+//   hw[w_off + s*w_row + h] * wscale; any other j scores -inf. Into sc[sc_off + s*sc_row
+//   + j]. Limits: IH <= 64, IH*ID <= 4096.
 // mode 4, the candidate blocks (model.py select_candidate_blocks): one workgroup per row
 //   s: the best score of each block of `block` columns of the row's first `width`, the
 //   block holding column lens - 1 pinned (+inf), then min(topb, blocks) times the best
-//   block above -inf (the lower block on a tie), each kept whole: mask[s*mask_row + j] =
-//   1 for its columns, 0 elsewhere. Limit: 4096 blocks.
+//   block above -inf (the lower block on a tie), each kept whole: column j of the mask is
+//   set for the chosen blocks' columns, cleared for every column below `width` -- one bit
+//   a column, bit j & 31 of the int at s*mask_row + (j >> 5) (the row's stride in words,
+//   the columns above `width` in the last word written 0). Limit: 4096 blocks.
 // mode 5, the top-k: one workgroup per row s: keep = min(topk, the scores above -inf);
 //   the keep largest, ties to the lower column (the CPU's selection), written as base + j
 //   to list[l_off + s*l_row + k], k < keep, in ascending column order (order 0) or by
@@ -70,17 +74,17 @@
 // mode 9, mode 3 for queries above 4096 floats (DeepSeek V4's 64 heads of 128): the
 //   queries read from memory instead of staged, the sums in mode 3's order (the same
 //   bits). Limit: IH <= 4096.
-// Offsets and strides in floats (ints for lists and masks).
+// Offsets and strides in floats (ints for lists, words for the packed candidate mask).
 #extension GL_KHR_shader_subgroup_basic : enable
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer B0 { float b0[]; };   // q, kv rows, iq, scores, engram kv
 layout(std430, binding = 1) readonly buffer B1 { float b1[]; };   // window ring, score rows, hw, prm
 layout(std430, binding = 2) readonly buffer B2 { float b2[]; };   // compressed rows, index keys
-layout(std430, binding = 3) readonly buffer L3 { int l3[]; };     // attention list, score mask
+layout(std430, binding = 3) readonly buffer L3 { int l3[]; };     // attention list, score mask (packed bits)
 layout(std430, binding = 4) readonly buffer B4 { float b4[]; };   // sinks, ape, cos/sin
 layout(std430, binding = 5) buffer Y5 { float y5[]; };            // outputs (in place for 1, 6)
-layout(std430, binding = 6) buffer I6 { int i6[]; };              // top-k list, candidate mask
+layout(std430, binding = 6) buffer I6 { int i6[]; };              // top-k list, candidate mask (packed bits)
 layout(std430, binding = 7) buffer R7 { float r7[]; };            // the compressor's ring
 
 layout(push_constant) uniform P { int v[32]; } p;
@@ -89,9 +93,14 @@ layout(push_constant) uniform P { int v[32]; } p;
 shared float sm[4160];
 shared float red[256];
 shared uint cnt[256];
+shared uint schosen[129];   // mode 4: the blocks picked, one bit each (<= 4096 blocks)
 
 #define NEG_INF uintBitsToFloat(0xff800000u)
 #define POS_INF uintBitsToFloat(0x7f800000u)
+
+// mode 3/9/10: is column j of the candidate mask row at mb (stride mr words) set? One bit a
+// column, and mr <= 0 when the row has no mask (an index source before the candidate one).
+bool mbit(int mb, int mr, int j) { return mr <= 0 || ((uint(l3[mb + (j >> 5)]) >> uint(j & 31)) & 1u) != 0u; }
 
 float bf16r(float f) {   // round to nearest even, as coli_bf16_round
     uint u = floatBitsToUint(f);
@@ -271,7 +280,7 @@ void score() {
     barrier();
     for (int j = tid; j < width; j += 256) {
         float v = NEG_INF;
-        if (j < lens && (mr <= 0 || l3[mb + j] != 0)) {
+        if (j < lens && mbit(mb, mr, j)) {
             int kb = ko + j * kr;
             float tot = 0.0;
             for (int h = 0; h < IH; h++) {
@@ -290,13 +299,14 @@ void candidates() {
     int s = int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x);
     int pos = p.v[2] + s, lens = (pos + 1) / p.v[3];
     int width = p.v[4], blk = p.v[5], topb = p.v[6], sb = s * p.v[7], mb = s * p.v[8];
-    int blocks = (width + blk - 1) / blk;
+    int blocks = (width + blk - 1) / blk, words = (width + 31) >> 5;
     for (int b = tid; b < blocks; b += 256) {
         float top = NEG_INF;
         for (int i = b * blk; i < (b + 1) * blk && i < width; i++) { float v = b0[sb + i]; if (v > top) top = v; }
         sm[b] = top;
     }
-    for (int i = tid; i < width; i += 256) i6[mb + i] = 0;
+    for (int w = tid; w < words; w += 256) i6[mb + w] = 0;
+    for (int w = tid; w < (blocks + 31) >> 5; w += 256) schosen[w] = 0u;
     memoryBarrierBuffer();
     barrier();
     // C's (lens - 1) / block, which truncates toward zero
@@ -326,9 +336,18 @@ void candidates() {
         barrier();
         if (chosen == 0x7fffffffu) break;
         int cb = int(chosen);
-        for (int i = cb * blk + tid; i < (cb + 1) * blk && i < width; i += 256) i6[mb + i] = 1;
-        if (tid == 0) sm[cb] = NEG_INF;
+        if (tid == 0) { schosen[cb >> 5] |= 1u << uint(cb & 31); sm[cb] = NEG_INF; }
         barrier();
+    }
+    /* the row's words: column c is kept when its block was picked (each kept whole) */
+    barrier();
+    for (int w = tid; w < words; w += 256) {
+        uint v = 0u;
+        for (int t = 0; t < 32; t++) {
+            int c = (w << 5) + t;
+            if (c < width && ((schosen[(c / blk) >> 5] >> uint((c / blk) & 31)) & 1u) != 0u) v |= 1u << uint(t);
+        }
+        i6[mb + w] = int(v);
     }
 }
 
@@ -430,7 +449,7 @@ void score_wide() {
     barrier();
     for (int j = tid; j < width; j += 256) {
         float v = NEG_INF;
-        if (j < lens && (mr <= 0 || l3[mb + j] != 0)) {
+        if (j < lens && mbit(mb, mr, j)) {
             int kb = ko + j * kr;
             float tot = 0.0;
             for (int h = 0; h < IH; h++) {
@@ -465,7 +484,7 @@ void score_grid() {
     for (int h = tid; h < IH; h += 256) sm[wo + h] = b1[wb + h] * wscale;
     barrier();
     int jj = tid / IH, h = tid - jj * IH, j = j0 + jj;
-    if (jj < P && j < width && j < lens && (mr <= 0 || l3[mb + j] != 0)) {
+    if (jj < P && j < width && j < lens && mbit(mb, mr, j)) {
         int kb = ko + j * kr;
         float d = 0.0;
         if (sh) for (int i = 0; i < ID; i++) d += sm[h * ID + i] * b2[kb + i];
@@ -476,7 +495,7 @@ void score_grid() {
     int jt = j0 + tid;
     if (tid < P && jt < width) {
         float v = NEG_INF;
-        if (jt < lens && (mr <= 0 || l3[mb + jt] != 0)) {
+        if (jt < lens && mbit(mb, mr, jt)) {
             float tot = 0.0;
             for (int g = 0; g < IH; g++) { float d = red[tid * IH + g]; if (d > 0.0) tot += d * sm[wo + g]; }
             v = tot;

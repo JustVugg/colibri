@@ -3791,8 +3791,9 @@ int vkc_dsv4_score(VkcBuf *iq, VkcBuf *hw, VkcBuf *keys, VkcBuf *mask, VkcBuf *s
     return dsv4_rec(PK_DSA, wide ? 9 : 3, p, sizeof *p, bd, 6, (uint32_t)p->S, 1);
 }
 int vkc_dsv4_cand(VkcBuf *sc, VkcBuf *mask, const VkcDsCand *p) {
+    /* the mask is one bit a column: mask_row is the row's stride in words */
     if (p->S < 1 || p->S > 65535 || p->block < 1 || p->ratio < 1 || p->width < 0 ||
-        (p->width + p->block - 1) / p->block > 4096 || p->mask_row < p->width) return 0;
+        (p->width + p->block - 1) / p->block > 4096 || p->mask_row < (p->width + 31) / 32) return 0;
     VkcBind bd[7] = {B(sc, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(mask, 1)};
     return dsv4_rec(PK_DSA, 4, p, sizeof *p, bd, 7, (uint32_t)p->S, 1);
 }
