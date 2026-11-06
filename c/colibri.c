@@ -80,6 +80,7 @@
 #include "lora.h"                                 /* ADAPTER=<dir>: LoRA residual on frozen base */
 #include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
 #include "decode_batch.h"
+#include "serve_codec.h"
 #include "pin_pool.h"   /* piu scatti annidati dello stato */
 #include "park.h"       /* a short request keeps the one slot's conversation aside (COLI_PARK) */
 #include "prompt_break.h"   /* a served prompt that a STOP or CANCEL stops between two layers */
@@ -11162,14 +11163,15 @@ static int logprob_tail(char *dst, size_t cap, const float *lo, int V, int token
  * paired with requests that never opt in, so it never sees the extended form. */
 static void mux_data(Tok *T, unsigned long long id, int token,
                      const float *lo, int V, int topk){
-    char out[256]; int n=tok_decode(T,&token,1,out,sizeof(out));
+    char out[256], request_id[32], tail[1024];
+    int n=tok_decode(T,&token,1,out,sizeof(out));
+    snprintf(request_id,sizeof(request_id),"%llu",id);
+    const char *numeric=NULL;
     if(topk>0 && lo){
-        char tail[1024]; logprob_tail(tail,sizeof(tail),lo,V,token,topk);
-        printf("DATA %llu %d%s\n",id,n,tail);
-    } else
-        printf("DATA %llu %d\n",id,n);
-    if(n>0) fwrite(out,1,(size_t)n,stdout); putchar('\n');
-    fflush(stdout);
+        logprob_tail(tail,sizeof(tail),lo,V,token,topk);
+        numeric=tail;
+    }
+    coli_serve_write_data_lp(stdout,request_id,out,(size_t)n,numeric);
 }
 
 /* Echoed-prompt read-out frame (U7a, opt-in only): "ECHO <id> <n> <pos> <lp>
@@ -11179,11 +11181,11 @@ static void mux_data(Tok *T, unsigned long long id, int token,
  * the request set SUBMIT logprobs=k, so an old server can never receive one. */
 static void mux_echo(Tok *T, unsigned long long id, int pos, int token,
                      const float *lo, int V, int topk){
-    char out[256]; int n=tok_decode(T,&token,1,out,sizeof(out));
-    char tail[1024]; logprob_tail(tail,sizeof(tail),lo,V,token,topk);
-    printf("ECHO %llu %d %d%s\n",id,n,pos,tail);
-    if(n>0) fwrite(out,1,(size_t)n,stdout); putchar('\n');
-    fflush(stdout);
+    char out[256], request_id[32], tail[1024];
+    int n=tok_decode(T,&token,1,out,sizeof(out));
+    snprintf(request_id,sizeof(request_id),"%llu",id);
+    logprob_tail(tail,sizeof(tail),lo,V,token,topk);
+    coli_serve_write_echo_lp(stdout,request_id,out,(size_t)n,pos,tail);
 }
 
 /* Opt-in prefill read-out (U7a, SUBMIT logprobs=k): one full-prompt forward
@@ -11535,21 +11537,21 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     }
     char *raw=malloc((size_t)sub.bytes+1);
     if(!raw){ fprintf(stderr,"OOM multiplex payload\n"); exit(1); }
-    if(fread(raw,1,(size_t)sub.bytes,stdin)!=(size_t)sub.bytes){ free(raw); free(line); return -1; }
     char *gtxt=NULL;                     /* optional per-request grammar/schema text */
     if(sub.gbytes){
         gtxt=malloc((size_t)sub.gbytes+1);
         if(!gtxt){ fprintf(stderr,"OOM multiplex payload\n"); exit(1); }
-        if(fread(gtxt,1,(size_t)sub.gbytes,stdin)!=(size_t)sub.gbytes){
-            free(gtxt); free(raw); free(line); return -1; }
-        gtxt[sub.gbytes]=0;
     }
-    int delim=fgetc(stdin);
-    if(delim!='\n'){
-        printf("ERROR %llu BAD_FRAME\n",sub.id); fflush(stdout);
+    ColiServeReadResult body=coli_serve_read_submit_body(
+        stdin,raw,(size_t)sub.bytes,gtxt,(size_t)sub.gbytes,1);
+    if(body!=COLI_SERVE_READ_OK){
+        if(body==COLI_SERVE_READ_BAD_FRAME){
+            printf("ERROR %llu BAD_FRAME\n",sub.id); fflush(stdout);
+        }
         free(gtxt); free(raw); free(line); return -1;
     }
     raw[sub.bytes]=0;
+    if(gtxt) gtxt[sub.gbytes]=0;
     if(sub.slot>=nctx || memchr(raw,0,(size_t)sub.bytes)){
         printf("ERROR %llu BAD_REQUEST\n",sub.id); fflush(stdout); free(gtxt); free(raw); free(line); return 0;
     }
