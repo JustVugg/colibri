@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import {
-  askSystemOne, extractSSE, extractSSEEvents, generateImage, generatesImages, getHealth, getProfile,
+  askSystemOne, extractSSE, extractSSEEvents, generateImage, generatesImages, getHealth, getPower, getProfile, powerByKind,
   listModelInfo, serverEndpoint, streamChat, type GenerateImageOptions, type ImageProgress,
 } from "./api"
 
@@ -51,6 +51,29 @@ describe("runtime API", () => {
 
     await expect(getProfile("http://localhost:8000/v1/")).resolves.toEqual({ seq: 1, turns: [turn] })
     expect(fetchMock).toHaveBeenCalledWith("http://localhost:8000/profile", expect.anything())
+  })
+
+  it("reads the power draw next to the OpenAI v1 prefix, and a server without /power is no power", async () => {
+    const power = { available: true, watts: 460, energy_j: 920, devices: [{ name: "GPU 0 NVIDIA H200", kind: "gpu", watts: 400 }] }
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(power)))
+    vi.stubGlobal("fetch", fetchMock)
+
+    await expect(getPower("http://localhost:8000/v1/", "secret")).resolves.toEqual(power)
+    expect(fetchMock).toHaveBeenCalledWith("http://localhost:8000/power", expect.objectContaining({
+      headers: expect.objectContaining({ Authorization: "Bearer secret" }),
+    }))
+
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("not found", { status: 404, statusText: "Not Found" })))
+    await expect(getPower("http://localhost:8000/v1/")).resolves.toEqual({ available: false, reason: "404 Not Found" })
+  })
+
+  it("sums the watts by kind of device, the GPUs first", () => {
+    expect(powerByKind({ available: true, devices: [
+      { name: "CPU package 0", kind: "cpu", watts: 61.4 },
+      { name: "GPU 0 NVIDIA H200", kind: "gpu", watts: 400.2 },
+      { name: "GPU 1 NVIDIA H200", kind: "gpu", watts: 380.1 },
+      { name: "DRAM 0", kind: "dram", watts: null },
+    ] })).toBe("GPU 780 · CPU 61")
   })
 })
 

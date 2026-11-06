@@ -1248,10 +1248,21 @@ rans: $(RANSLIB)
 $(RANSLIB): tools/rans_ctypes.c
 	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
 
-cuda-test: tests/test_mxfp4_expert_cuda.cu backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_cuda_init_failure.cu
+# coli_cuda_expert_group_issue past 8 rows (the qwen36 tier's per-device group, up to
+# 32 rows): one 32-row issue, four 8-row issues and the pinned synchronous group must
+# give the same bits, per format. Needs a GPU; also run by cuda-test.
+.PHONY: expert-group-rows-test
+expert-group-rows-test: tests/test_expert_group_rows_cuda.cu backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_expert_group_rows_cuda.cu -o expert_group_rows_test$(EXE) $(GPU_TEST_LIBS)
+	./expert_group_rows_test$(EXE)
+
+cuda-test: tests/test_mxfp4_expert_cuda.cu backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_cuda_init_failure.cu tests/test_expert_group_rows_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./backend_cuda_test$(EXE)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_expert_group_rows_cuda.cu -o expert_group_rows_test$(EXE) $(GPU_TEST_LIBS)
+	./expert_group_rows_test$(EXE)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_init_failure.cu -o cuda_init_failure_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./cuda_init_failure_test$(EXE)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE) $(GPU_TEST_LIBS)
@@ -1355,6 +1366,44 @@ dsv4-cuda-test: tests/test_dsv4_dense_batch_cuda.c tests/test_dsv4_attention_bat
 	$(CC) $(CFLAGS) tests/test_dsv4_generic_bitwise_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_generic_bitwise_cuda_test$(EXE) $(LDFLAGS)
 	./dsv4_generic_bitwise_cuda_test$(EXE)
 
+# DSV4_CUDA_MOE_FUSED6 gate: the decode MoE's launch sequence and the fused cooperative
+# kernel on the same inputs, bit for bit (needs a GPU with cooperative launch). The test
+# is linked with backend_cuda_dsv4.cu itself, so it and the backend share one C runtime:
+# the switch is read with getenv on every call. Windows: run from a vcvars64 shell.
+.PHONY: dsv4-fused6-test
+dsv4-fused6-test: tests/test_dsv4_fused6_cuda.cu backend_cuda_dsv4.cu backend_cuda_dsv4.h
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) $(DSV4_DLL_TC) --expt-relaxed-constexpr --expt-extended-lambda \
+		$(if $(IS_WIN),-Xcompiler=/Zc:preprocessor -L"$(CUDA_HOME)/lib/x64") \
+		tests/test_dsv4_fused6_cuda.cu backend_cuda_dsv4.cu -o dsv4_fused6_cuda_test$(EXE) $(DSV4_DLL_LIBS)
+	./dsv4_fused6_cuda_test$(EXE)
+
+# V4_SPARSE_FAST: the decode step of the cached sparse attention (plain and indexed) with
+# the switch off and on, in two processes (it is read once), compared byte for byte; then
+# V4_SPARSE_VERIFY=1, which runs both kernels in one process and returns the old output.
+# Needs a GPU. Windows: coli_cuda_dsv4.dll of this tree beside the binary (make
+# cuda-dsv4-dll); elsewhere the backend objects ($(DSV4_CUDA_OBJ)).
+.PHONY: dsv4-sparse-fast-test
+dsv4-sparse-fast-test: tests/test_dsv4_sparse_fast_cuda.c backend_cuda_dsv4.h $(if $(IS_WIN),,$(DSV4_CUDA_OBJ))
+	$(CC) $(CFLAGS) tests/test_dsv4_sparse_fast_cuda.c $(if $(IS_WIN),backend_loader_dsv4.c,$(DSV4_CUDA_OBJ)) \
+		-o dsv4_sparse_fast_cuda_test$(EXE) $(LDFLAGS)
+	V4_SPARSE_FAST=0 ./dsv4_sparse_fast_cuda_test$(EXE) dsv4_sparse_fast_test_old.bin
+	V4_SPARSE_FAST=1 ./dsv4_sparse_fast_cuda_test$(EXE) dsv4_sparse_fast_test_new.bin
+	cmp dsv4_sparse_fast_test_old.bin dsv4_sparse_fast_test_new.bin
+	V4_SPARSE_FAST=1 V4_SPARSE_VERIFY=1 ./dsv4_sparse_fast_cuda_test$(EXE) dsv4_sparse_fast_test_verify.bin
+	cmp dsv4_sparse_fast_test_old.bin dsv4_sparse_fast_test_verify.bin
+	@echo "dsv4 sparse fast: old and fast kernels bit-identical"
+
+# V4_ATTN_BATCH_PROJ: dsv4_cuda_proj_batch against per-call matvec, bit for bit (needs a GPU).
+# Windows: the DLL is loaded at run time and must sit next to the test binary (make
+# cuda-dsv4-dll first). On Linux build with CUDA=1: it links backend_cuda_dsv4.o, like
+# dsv4-cuda-test.
+.PHONY: dsv4-proj-batch-test
+dsv4-proj-batch-test: tests/test_dsv4_proj_batch_cuda.c backend_cuda_dsv4.h $(if $(IS_WIN),backend_loader_dsv4.c,$(DSV4_CUDA_OBJ))
+	$(CC) $(CFLAGS) -ffp-contract=off tests/test_dsv4_proj_batch_cuda.c $(if $(IS_WIN),backend_loader_dsv4.c,$(DSV4_CUDA_OBJ)) \
+		-o dsv4_proj_batch_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_proj_batch_cuda_test$(EXE)
+
 # Pure-CPU unit tests for the two headers the kernels consume. No GPU, no model.
 tests/test_dsv4_mhc$(EXE): tests/test_dsv4_mhc.c
 	$(CC) $(CFLAGS) tests/test_dsv4_mhc.c -o tests/test_dsv4_mhc$(EXE) $(LDFLAGS)
@@ -1369,6 +1418,14 @@ cuda-chain-check: backend_cuda.o cuda_chain.o
 
 hip-test:
 	$(MAKE) cuda-test HIP=1
+
+# The C side of the engines built with -DCOLI_CUDA, no toolkit needed: their CUDA chains'
+# host code. An ARM host with a card (DGX Spark, GH200, Jetson) builds it without the x86
+# SIMD kernels, so a name those alone define breaks only there; CI runs this at
+# ARCH=x86-64 (no AVX2) to see it on an x86 runner.
+CUDA_HOST_SRC = qwen38.c qwen36.c olmoe.c qwen36_tier.c backend_loader.c
+cuda-host-syntax:
+	for f in $(CUDA_HOST_SRC); do $(CC) $(filter-out -MMD -MP,$(CFLAGS)) -fsyntax-only -DCOLI_CUDA $$f || exit 1; done
 
 # CI: compile the backend and its test binary WITHOUT executing them (for
 # runners with the toolchain but no GPU). Pass CUDA_ARCH/HIP=1+HIP_ARCH.
@@ -2104,10 +2161,16 @@ tests/edge_runtime_nocuda.o: edge_runtime.c .build-config
 tests/test_qwen38_config$(EXE): tests/test_qwen38_config.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+tests/test_qwen38_ple_gguf$(EXE): tests/test_qwen38_ple_gguf.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_dsv41_serve_budget$(EXE): tests/test_dsv41_serve_budget.c deepseek_v41.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_dsv41_untrusted_load$(EXE): tests/test_dsv41_untrusted_load.c deepseek_v41.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_dsv41_scratch_pool$(EXE): tests/test_dsv41_scratch_pool.c deepseek_v41.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_idot$(EXE): tests/test_qwen38_idot.c qwen38.c $(VK_OBJ)
@@ -2896,6 +2959,27 @@ tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c sse41_kernels.h deepseek_
 	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS $< $(V4_TEST_LINK_OBJS) \
 		-o $@ -pthread $(LDFLAGS)
 
+# Real-DLL gate for the GPU router's retained input buffer (V4_GPU_ROUTE_REUSE=1):
+# bit-exact against the per-call path. Windows only: it needs a GPU and the
+# coli_cuda_dsv4.dll of this tree beside the binary (make cuda-dsv4-dll first), so it
+# is a named target, not a tests/test_* rule that `check` would pick up. The GPU unit
+# with the test hooks, COLI_V4_UNIT_GPU_HOOK.o (Makefile.deepseek-v4), replaces
+# COLI_V4_UNIT_GPU.o for this binary only.
+ifneq ($(IS_WIN),)
+.PHONY: dsv4-route-scratch-test
+dsv4-route-scratch-test: tests/test_v4_route_scratch_cuda.c Makefile.deepseek-v4.units Makefile.deepseek-v4
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4-test-objs \
+		COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
+		COLI_V4_UNIT_ROUTE_BF16.o COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o \
+		COLI_V4_UNIT_NATIVE_QUANT.o COLI_V4_UNIT_NATIVE_QUANT_DUAL.o COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o \
+		COLI_V4_UNIT_EXPERT_ROWS16.o $(V4_HOT_TEST_OBJ) $(V4_BATCH_TEST_OBJ) \
+		backend_loader_dsv4.o COLI_V4_UNIT_GPU_HOOK.o
+	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS $< $(filter-out COLI_V4_UNIT_GPU.o,$(V4_TEST_LINK_OBJS)) \
+		COLI_V4_UNIT_GPU_HOOK.o -o dsv4_route_scratch_cuda_test$(EXE) -pthread $(LDFLAGS)
+	./dsv4_route_scratch_cuda_test$(EXE) 0
+	./dsv4_route_scratch_cuda_test$(EXE) 1
+endif
+
 V4_OWN_DIR = build/ownership
 V4_OWN_CFLAGS = $(CFLAGS) -DCOLI_V4_TEST_HOOKS
 V4_OWNERSHIP_OBJS = \
@@ -3146,6 +3230,10 @@ tests/test_v4_gpu_devices$(EXE): tests/test_v4_gpu_devices.c deepseek_v4_gpu_dev
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_v4_bank_pair$(EXE): tests/test_v4_bank_pair.c deepseek_v4_bank_pair.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# v4_topk_desc (indexer top-k, V4_IDX_FAST) against the qsort ranking. Pure CPU.
+tests/test_v4_topk$(EXE): tests/test_v4_topk.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_ram_clamp$(EXE): tests/test_ram_clamp.c colibri.c $(VK_OBJ)
@@ -3421,7 +3509,7 @@ install: colibri-tui$(EXE) colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE)
 	$(INSTALL) -m 644 family_registry.py resource_plan.py doctor.py autotune.py \
 		openai_server.py cluster.py v4_dsml.py v41_dsml.py version.py \
 		image_engine.py term_image.py setup_flow.py setup_hw.py setup_catalog.py \
-		setup_download.py mcp_server.py $(DESTDIR)$(LIBEXECDIR)/
+		setup_download.py mcp_server.py power.py $(DESTDIR)$(LIBEXECDIR)/
 	$(INSTALL) -m 644 tools/*.py $(DESTDIR)$(LIBEXECDIR)/tools/
 	@# The dashboard is an optional build artifact (cd web && npm run build), so install
 	@# it only when it exists. It goes NEXT TO openai_server.py, which probes ./web/dist.

@@ -112,6 +112,22 @@ int main(void) {
     rc = qwen38_main_unused(4, argv);
     tk(rc == 0 && g_q38cc_mtp_rows == 0, "the head on the CPU, the drafts within the oracle's limits");
     unsetenv("Q38_MTP_CHAIN");
+    qt_shutdown();
+    printf(" a greedy run's verify rows picked on the card\n");
+    const size_t size0 = fake_chain_table.size;
+    fake_chain_table.size = sizeof fake_chain_table;   /* pick_rows offered */
+    setenv("Q38_MTP_FORCE", "accept", 1);
+    fake_chain_frames = 0; fake_pick_rows = 0;
+    rc = qwen38_main_unused(4, argv);
+    tk(rc == 0, "the drafts the card picked stand, within the oracle's limits");
+    tk(fake_pick_rows > 1, "a verify's rows picked on the card, no logits down");
+    qt_shutdown();
+    setenv("COLI_CUDA_CHAIN_GREEDY_CARD", "0", 1);
+    fake_pick_rows = 0;
+    rc = qwen38_main_unused(4, argv);
+    tk(rc == 0 && fake_pick_rows == 0, "COLI_CUDA_CHAIN_GREEDY_CARD=0: the logits down, the same tokens");
+    unsetenv("COLI_CUDA_CHAIN_GREEDY_CARD");
+    fake_chain_table.size = size0;
     unsetenv("Q38_MTP_FORCE");
     setenv("Q38_MTP", "0", 1);
     qt_shutdown();

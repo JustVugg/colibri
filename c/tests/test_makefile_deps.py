@@ -45,6 +45,7 @@ import shlex
 import shutil
 import subprocess
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from family_registry import FAMILIES
@@ -114,8 +115,12 @@ def _make_vars(*names):
     """Makefile variables as make expands them, {name: words}, in one call."""
     # `make --eval` needs GNU Make 3.82; macOS ships 3.81, which does read an
     # extra makefile from stdin.
+    # -j1: under `make -j check` the jobs come from MAKEFLAGS, and GNU Make 4.4's
+    # jobserver is a named fifo the child reaches; the print-NAME echoes then run
+    # at once, a long line (AUTODEP_DEPS, 9 KB) goes out in pieces and a short
+    # one lands inside it, its name lost (CI: "no source found in its rule").
     with _build_config_kept():
-        proc = subprocess.run([MAKE, "-s", "--no-print-directory", "-f", "Makefile",
+        proc = subprocess.run([MAKE, "-s", "-j1", "--no-print-directory", "-f", "Makefile",
                                "-f", "-", *(f"print-{n}" for n in names)], cwd=C_DIR,
                               text=True, input="print-%: ; @echo $*=$($*)\n",
                               capture_output=True, timeout=300)
@@ -138,6 +143,14 @@ RULE_LINE_RE = re.compile(r"(?m)^([^\s#:=][^:=\n]*?):(?![=:])(.*)$")
 VAR_RE = re.compile(r"\$\(([A-Za-z0-9_]+)\)")
 
 
+def _rule_lines():
+    """(target side, rest) of each rule line, and the variables its targets name."""
+    # `$(foreach b,...,$(eval ...))` lines generate rules; they are not rules.
+    lines = [(t, r) for t, r in RULE_LINE_RE.findall(_joined_makefile())
+             if not re.search(r"\$\([a-z-]+ ", t)]
+    return lines, sorted({v for target, _ in lines for v in VAR_RE.findall(target)})
+
+
 def _rules_by_target():
     """Each rule's prerequisites as written, keyed by the file make builds.
 
@@ -147,10 +160,7 @@ def _rules_by_target():
     static pattern rule gives its prerequisites to each object it names. The
     prerequisites keep their spelling: a hand-listed header is a plain word.
     """
-    # `$(foreach b,...,$(eval ...))` lines generate rules; they are not rules.
-    lines = [(t, r) for t, r in RULE_LINE_RE.findall(_joined_makefile())
-             if not re.search(r"\$\([a-z-]+ ", t)]
-    names = sorted({v for target, _ in lines for v in VAR_RE.findall(target)})
+    lines, names = _rule_lines()
     values = _make_vars(*names)
     rules = {}
     for target, rest in lines:
@@ -271,6 +281,22 @@ class EngineListTest(unittest.TestCase):
                     family.build_target, rules,
                     f"{family.id}: registered family whose build target is not "
                     f"a checkable `{family.build_target}$(EXE):` rule")
+
+
+@unittest.skipUnless(MAKE, "make is not installed")
+class MakeVarsTest(unittest.TestCase):
+    def test_a_parallel_make_prints_every_variable_whole(self):
+        """The variables the rule parse reads, as one serial make has them, with
+        MAKEFLAGS asking for jobs as `make -j check` hands them down. Bite: drop
+        the -j1 of _make_vars; the 9 KB AUTODEP_DEPS line and the short lines
+        printed beside it interleave, and a name goes missing within a few calls."""
+        names = _rule_lines()[1]
+        self.assertIn("AUTODEP_DEPS", names)
+        with mock.patch.dict(os.environ, {"MAKEFLAGS": "-j16"}):
+            first = _make_vars(*names)
+            self.assertEqual(sorted(first), sorted(names))
+            for _ in range(30):
+                self.assertEqual(_make_vars(*names), first)
 
 
 @unittest.skipUnless(MAKE, "make is not installed")

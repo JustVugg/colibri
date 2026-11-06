@@ -161,6 +161,9 @@ typedef int             (*fn_sparse_attn_batch_cached_idx)(int device, int layer
                                                             const int *sel, int selstride,
                                                             int abs_base, int comp_limit, int heads,
                                                             int dim, int tokens, float scale, float *out);
+typedef int             (*fn_proj_batch)(int n, Dsv4CudaTensor *const *t, const int *rows,
+                                         const float *x, float *stage);
+typedef void            (*fn_proj_batch_release)(void);
 typedef int             (*fn_indexer_score_batch)(int device, const float *queries, const float *keys,
                                                   const float *head_w, const int *counts, int tokens,
                                                   int heads, int dim, int count, float *scores);
@@ -325,6 +328,8 @@ static struct {
     fn_sparse_attn_batch_cached sparse_attn_batch_cached;
     fn_sparse_attn_batch_cached_idx sparse_attn_batch_cached_idx;
     fn_indexer_score_batch indexer_score_batch;
+    fn_proj_batch proj_batch;                       /* optional (V4_ATTN_BATCH_PROJ, older DLLs: 0) */
+    fn_proj_batch_release proj_batch_release;       /* optional */
     fn_fp8_ref_matmul fp8_ref_matmul;
     fn_indexer_prepare indexer_prepare;
     fn_upload_compressor upload_compressor;
@@ -580,6 +585,12 @@ static int dsv4_cuda_resolve(const char *dllname){
     g_dsv4.peer_healthy = (fn_peer_healthy)GetProcAddress(g_dsv4.dll, "dsv4_cuda_peer_healthy");
     g_dsv4.lost = (fn_lost)GetProcAddress(g_dsv4.dll, "dsv4_cuda_lost");
     g_dsv4.backend_name = (fn_backend_name)GetProcAddress(g_dsv4.dll, "dsv4_cuda_backend_name");
+    g_dsv4.proj_batch = (fn_proj_batch)GetProcAddress(g_dsv4.dll, "dsv4_cuda_proj_batch");
+    g_dsv4.proj_batch_release = (fn_proj_batch_release)GetProcAddress(g_dsv4.dll, "dsv4_cuda_proj_batch_release");
+    if (!g_dsv4.proj_batch || !g_dsv4.proj_batch_release) {
+        g_dsv4.proj_batch = NULL;
+        g_dsv4.proj_batch_release = NULL;
+    }
     _Pragma("GCC diagnostic pop")
     return 1;
 }
@@ -897,6 +908,16 @@ int dsv4_cuda_indexer_score_batch(int device, const float *queries, const float 
     if(!g_dsv4.available) return 0;
     return g_dsv4.indexer_score_batch(device, queries, keys, head_w, counts, tokens,
                                       heads, dim, count, scores);
+}
+
+int dsv4_cuda_proj_batch(int n, Dsv4CudaTensor *const *t, const int *rows,
+                         const float *x, float *stage){
+    if(!g_dsv4.available || !g_dsv4.proj_batch) return 0;
+    return g_dsv4.proj_batch(n, t, rows, x, stage);
+}
+
+void dsv4_cuda_proj_batch_release(void){
+    if(g_dsv4.available && g_dsv4.proj_batch_release) g_dsv4.proj_batch_release();
 }
 
 int dsv4_cuda_fp8_ref_matmul(int device, const uint8_t *w, const float *bscale,

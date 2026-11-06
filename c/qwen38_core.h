@@ -20,6 +20,7 @@
 #include "spec_draft.h"   /* prompt-lookup drafts and the gate that decides when drafting pays */
 #include "draft_vocab.h"  /* the tokens the MTP head scores for a draft (Q38_MTP_VOCAB) */
 #include "expert_ffn.h"   /* the int4-g64 routed experts (experts-int4g64/ sidecar) run through its f32 kernel */
+#include "fma_compat.h"   /* coli_fmaf: fmaf where the CPU fuses, else a vectorizable exact product (#2606) */
 #include "int2_g32.h"     /* the int2-g32 routed experts (experts-int2g32/ sidecar) */
 #include "lowbit_g16.h"   /* the int2-g16 and int3-g16 routed experts (experts-int2g16/, experts-int3g16/) */
 #include "vq2_g32.h"     /* the vq2 routed experts: two-stage vector codes (experts-vq2g32/) */
@@ -247,6 +248,7 @@ typedef struct {
     Layer *L;
     LCache *cache;
     uint8_t **ehit;                    /* experts routed this turn, for HITS (dashboard Brain) */
+    uint8_t *estep;                    /* experts routed since the last HITL frame (live map), layers*experts */
     Q38ExpertScaleCache *expert_scales;
     Q38Int4Experts *x4;                /* routed experts from experts-int4g64/, NULL = the snapshot's own */
     uint64_t clock, hits, miss;
@@ -284,6 +286,7 @@ typedef struct {
      * pezzo senza che niente protesti. */
     /* PLE prefetto: le righe gia' lette per il chunk in corso, o NULL. */
     float *ple_pref; int ple_pref_rows;
+    int *greedy_out, greedy_done;  /* a greedy verify's or step's argmax per logit row, the CUDA chain's (q38cc_greedy_ok): no logits then */
     Q38Vision vis;
     int vis_ready;
     float *vis_rows;
@@ -471,7 +474,7 @@ static inline __attribute__((always_inline)) void q38_bf16_rows(float *y,int ys,
     }
     for(int s=0;s<S;s++){
         float a=xf_hsum8(acc[s]);
-        for(int k=i;k<I;k++)a=fmaf(x[(int64_t)s*I+k],bf16_to_f32(w[k]),a);
+        for(int k=i;k<I;k++)a=coli_fmaf(x[(int64_t)s*I+k],bf16_to_f32(w[k]),a);
         y[(int64_t)s*ys]=a;
     }
 }
@@ -596,7 +599,7 @@ static void q38_matmul_int4g64(float *y,const float *x,const uint8_t *codes,
             float tail=0.f;
             for(int i=body;i<I;i++)
                 tail+=(float)((int)((w[i>>1]>>((i&1)*4))&15)-8)*xs[i];
-            y[(int64_t)s*O+o]=fmaf(tail,sc[groups-1],y[(int64_t)s*O+o]);
+            y[(int64_t)s*O+o]=coli_fmaf(tail,sc[groups-1],y[(int64_t)s*O+o]);
         }
     }
     free(xs_rows);
@@ -1494,6 +1497,8 @@ static void q38_load_ple(Model *m,Layer *l) {
                      (kv->atype==GGUF_T_I64||kv->atype==GGUF_T_U64),"GGUF: %s missing or not %d 64-bit integers",keys[b],counts[b]);
             memcpy(dsts[b],kv->arr,(size_t)counts[b]*8);
         }
+        Q38_NEED(!gguf_find(&g_q38gg,"per_layer_token_embd.scale"),
+                 "GGUF carries per_layer_token_embd.scale; the PLE reader applies no weight scale");
         const gguf_tensor *t=gguf_mark(&g_q38gg,"per_layer_token_embd.weight");
         Q38_NEED(t&&t->ne[0]==c->ngram_head_dim&&t->ne[2]*t->ne[3]==1,"GGUF: per_layer_token_embd missing or not rows of %d",c->ngram_head_dim);
         m->ple_gg=t; m->ple_part_count=1; m->ple_part_start[0]=0; m->ple_part_start[1]=t->ne[1];
@@ -2458,6 +2463,38 @@ static int q38_lb_r16(const Model *m) {
 /* One read per miss, into the slot's own slab; with COLI_MAP_EXPERTS=1 the
  * slot points into the mapped file instead, as the FP8 path does. Safe from
  * the parallel batch loader: every job owns a distinct slot. */
+/* A loader thread's read buffer, freed when the thread ends. A `static __thread` pointer
+ * outlived its thread: libgomp ends the threads a smaller team leaves out and starts new
+ * ones for a larger, and each new one took a buffer of its own (an int4-g64 record is
+ * 2.6 MiB) that the one it replaced never gave back (#2592). */
+enum { Q38_SCRATCH_INT4, Q38_SCRATCH_GGUF, Q38_SCRATCH_N };
+typedef struct { uint8_t *p[Q38_SCRATCH_N]; int64_t cap[Q38_SCRATCH_N]; } Q38Scratch;
+static pthread_key_t g_q38_scratch_key;
+static pthread_once_t g_q38_scratch_once = PTHREAD_ONCE_INIT;
+static void q38_scratch_free(void *v) {
+    Q38Scratch *s = (Q38Scratch *)v;
+    for (int i = 0; i < Q38_SCRATCH_N; i++) free(s->p[i]);
+    free(s);
+}
+static void q38_scratch_key(void) {
+    if (pthread_key_create(&g_q38_scratch_key, q38_scratch_free)) { fprintf(stderr, "Qwen3.8: no thread key for the read buffers\n"); exit(1); }
+}
+static uint8_t *q38_scratch(int which, int64_t bytes) {
+    pthread_once(&g_q38_scratch_once, q38_scratch_key);
+    Q38Scratch *s = (Q38Scratch *)pthread_getspecific(g_q38_scratch_key);
+    if (!s) {
+        s = (Q38Scratch *)calloc(1, sizeof *s);
+        if (!s || pthread_setspecific(g_q38_scratch_key, s)) { fprintf(stderr, "OOM expert read buffer\n"); exit(1); }
+    }
+    if (s->cap[which] < bytes) {
+        free(s->p[which]);
+        s->p[which] = (uint8_t *)malloc((size_t)bytes);
+        if (!s->p[which]) { fprintf(stderr, "OOM expert read buffer\n"); exit(1); }
+        s->cap[which] = bytes;
+    }
+    return s->p[which];
+}
+
 static void q38_load_int4_record(Model *m,int layer,int expert,Slot *slot) {
     Q38Int4Experts *x=m->x4;
     int fd=x->fd[layer];int64_t off=x->off[(int64_t)layer*m->c.experts+expert];
@@ -2474,9 +2511,7 @@ static void q38_load_int4_record(Model *m,int layer,int expert,Slot *slot) {
     }
     const int lr=q38_lb_r16(m);
     if(lr){   /* int2/int3-g16, vq2, int4-g64: read beside, interleave into the slot (each loader thread its buffer) */
-        static __thread uint8_t *raw; static __thread int64_t cap;
-        if(cap<x->record_bytes){free(raw);raw=(uint8_t*)malloc((size_t)x->record_bytes);cap=raw?x->record_bytes:0;
-                                if(!raw){fprintf(stderr,"OOM int4 expert record\n");exit(1);}}
+        uint8_t *raw=q38_scratch(Q38_SCRATCH_INT4,x->record_bytes);
         st_read_range_raw_cap(&x->S,fd,off,x->record_bytes,raw,x->record_bytes,1,"pread Qwen3.8 int4 expert");
         q38_bind_int4_record(m,slot,raw);   /* the three matrices' fields, then their interleaved form */
         Q38Weight *dst[3]={&slot->gate,&slot->up,&slot->down}; uint8_t *o=(uint8_t*)slot->int4_slab;
@@ -2530,8 +2565,7 @@ static void q38_gg_read_expert(Model *m,const gguf_tensor *const t[3],int eid,Sl
             w->kind=Q38_WEIGHT_GGML;w->gq_type=st;w->rows=os[k];w->cols=is[k];w->elements=(int64_t)os[k]*is[k];w->owns_data=1;
         }
         if(st!=t[k]->type){   /* read beside, interleave into the slot (each loader thread its buffer) */
-            static __thread uint8_t *raw; static __thread int64_t cap;
-            if(cap<eb){free(raw);raw=(uint8_t*)malloc((size_t)eb);cap=raw?eb:0;if(!raw){fprintf(stderr,"OOM GGUF expert\n");exit(1);}}
+            uint8_t *raw=q38_scratch(Q38_SCRATCH_GGUF,eb);
             q38_gg_read(t[k],raw,(int64_t)eid*eb,eb);
             gq_r16_pack(st,(uint8_t*)w->data,raw,os[k],is[k]);
             continue;
@@ -2600,11 +2634,17 @@ static void q38_ehit_mark(Model *m,int layer,int eid) {
         if(!ehit){
             ehit=(uint8_t**)calloc((size_t)c->layers,sizeof(uint8_t*));
             for(int i=0;i<c->layers;i++)ehit[i]=(uint8_t*)calloc((size_t)c->experts,1);
+            /* published before ehit, so a thread that sees ehit sees estep too */
+            __atomic_store_n(&m->estep,(uint8_t*)calloc((size_t)c->layers*c->experts,1),__ATOMIC_RELEASE);
             __atomic_store_n(&m->ehit,ehit,__ATOMIC_RELEASE);
         }
         pthread_mutex_unlock(&g_q38_ehit_mx);
     }
-    if(layer>=0&&layer<c->layers&&eid>=0&&eid<c->experts)ehit[layer][eid]=1;
+    if(layer>=0&&layer<c->layers&&eid>=0&&eid<c->experts){
+        ehit[layer][eid]=1;
+        uint8_t *es=__atomic_load_n(&m->estep,__ATOMIC_ACQUIRE);
+        if(es)es[(size_t)layer*c->experts+eid]=1;
+    }
 }
 /* The slot a full layer cache gives up: the least recently used outside `protect`
  * (NULL: none protected), and before it the least recently used of those whose expert
@@ -2749,14 +2789,10 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
     }
     free(protected_slots);
     if(job_count){
-        int workers=job_count;
-#ifdef _OPENMP
-        int thread_limit=omp_get_max_threads();if(workers>thread_limit)workers=thread_limit;
-#else
-        (void)workers;   /* only the pragma below reads it, and that is gone without OpenMP */
-#endif
         double started=now_s();
-        #pragma omp parallel for schedule(static) num_threads(workers) if(job_count>1)
+        /* the default team, whatever the jobs: one as large as the jobs changed size from
+         * batch to batch, and libgomp ended and started threads at each change (#2592) */
+        #pragma omp parallel for schedule(static) if(job_count>1)
         for(int job=0;job<job_count;job++){
             if(gg)q38_gg_read_expert(m,ggt,jobs[job].expert,jobs[job].slot);
             else if(x4)q38_load_int4_record(m,layer,jobs[job].expert,jobs[job].slot);
@@ -3185,14 +3221,14 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
                 for(int value=0;value<VD;value++)previous[value]=0.f;
                 for(int d=0;d<KD;d++){
                     float *row=state+(int64_t)d*VD;const float kd=kh[d];
-                    for(int value=0;value<VD;value++){row[value]*=alpha;previous[value]=fmaf(kd,row[value],previous[value]);}
+                    for(int value=0;value<VD;value++){row[value]*=alpha;previous[value]=coli_fmaf(kd,row[value],previous[value]);}
                 }
                 for(int value=0;value<VD;value++){delta[value]=(vh[value]-previous[value])*beta;current[value]=0.f;}
                 for(int d=0;d<KD;d++){
                     float *row=state+(int64_t)d*VD;const float kd=kh[d],qd=qh[d];
                     for(int value=0;value<VD;value++){
-                        row[value]=fmaf(kd,delta[value],row[value]);
-                        current[value]=fmaf(qd,row[value],current[value]);
+                        row[value]=coli_fmaf(kd,delta[value],row[value]);
+                        current[value]=coli_fmaf(qd,row[value],current[value]);
                     }
                 }
                 if(snap_rec)memcpy(snap_rec+(int64_t)h*KD*VD,state,(size_t)KD*VD*sizeof(float));
@@ -3222,10 +3258,10 @@ static inline float q38_dot8(const float *a,const float *b,int n){
     float l[8];_mm256_storeu_ps(l,acc);
 #else
     float l[8]={0,0,0,0,0,0,0,0};int i=0;
-    for(;i+8<=n;i+=8)for(int k=0;k<8;k++)l[k]=fmaf(a[i+k],b[i+k],l[k]);
+    for(;i+8<=n;i+=8)for(int k=0;k<8;k++)l[k]=coli_fmaf(a[i+k],b[i+k],l[k]);
 #endif
     float r=((l[0]+l[4])+(l[2]+l[6]))+((l[1]+l[5])+(l[3]+l[7]));
-    for(;i<n;i++)r=fmaf(a[i],b[i],r);
+    for(;i<n;i++)r=coli_fmaf(a[i],b[i],r);
     return r;
 }
 /* q38_dot8 of four rows of q (qstride apart) against one row b, each with q38_dot8's own
@@ -3244,7 +3280,7 @@ static inline void q38_dot8_x4(float *out,const float *q,int64_t qstride,const f
     for(int g=0;g<4;g++){
         float l[8];_mm256_storeu_ps(l,acc[g]);
         float r=((l[0]+l[4])+(l[2]+l[6]))+((l[1]+l[5])+(l[3]+l[7]));
-        for(int k=i;k<n;k++)r=fmaf(qr[g][k],b[k],r);
+        for(int k=i;k<n;k++)r=coli_fmaf(qr[g][k],b[k],r);
         out[g]=r;
     }
 #else
@@ -4001,6 +4037,7 @@ static void q38_tier_warm(Model *m,int hist) {
 }
 #ifdef COLI_CUDA
 static size_t q38cc_reserve_bytes(Model *m);   /* qwen38_cuda_chain.h */
+static size_t q38cc_stage_mb_env(void); static size_t q38cc_prompt_stage_bytes(Model *m); static size_t q38cc_gguf_stride(Model *m);
 static int q38cc_env_on(void);
 #endif
 static void q38_tier_start(Model *m,int cap) {
@@ -4028,9 +4065,17 @@ static void q38_tier_start(Model *m,int cap) {
         if(ok&&q38cc_env_on()){
             size_t rb=q38cc_reserve_bytes(m);
             qt_trunk_offer("chain",0,rb);
+            if(!q38cc_stage_mb_env())qt_reserve_stage(q38cc_prompt_stage_bytes(m),(size_t)c->experts*q38cc_gguf_stride(m));
             fprintf(stderr,"[qtier] qwen38: %.2f GiB kept for the CUDA chain (its mirrors at %d positions, its scratch and own matrices)\n",
                     rb/1073741824.0,m->kv_cap>0?m->kv_cap:m->max_t>0?m->max_t:qwen38_max_ctx());
         }
+        /* each expert in a slot of its own layer's size (one device), the chain's promotions too
+         * (qt_chain_arena_exact): unsloth's UD-IQ2_XS mixes layers of 1.45 to 2.09 MB experts, and
+         * slots of the largest held a fifth fewer. With the chain only: the tier on its own swaps an
+         * expert only for one of its size, and on UD-IQ2_XS its decode came 5-12% slower (8.5-9.3
+         * against 8.9-10.0 tok/s) with 11424 experts on the card against 9029.
+         * COLI_CUDA_EXACT_SLOTS=1: there too, =0: the largest's for all */
+        { const char *xs=getenv("COLI_CUDA_EXACT_SLOTS"); qt_gguf_exact_slots(xs&&*xs ? *xs!='0' : q38cc_env_on()); }
         if(ok&&qt_init_gguf(L,c->experts,c->hidden,c->inter,cap,c->topk,tg,td,bg,bd,1)){
             atexit(qt_shutdown); g_q38_gguf_tier=1;
             fprintf(stderr,"[qtier] qwen38: the GGUF's experts on the CUDA tier as the file has them (RAM LRU %d/layer; experts go to VRAM as they get hot)\n",cap);
@@ -4485,7 +4530,7 @@ static void q38_rows(float *y,int ys,const Q38Weight *w,int I,int r0,int r1,
                 const float *xs=xr[a];
                 float tail=0.f;
                 for(int i=body;i<I;i++)tail+=(float)((int)((wr[i>>1]>>((i&1)*4))&15)-8)*xs[i];
-                y[(int64_t)a*ys+o]=fmaf(tail,sc[groups-1],y[(int64_t)a*ys+o]);
+                y[(int64_t)a*ys+o]=coli_fmaf(tail,sc[groups-1],y[(int64_t)a*ys+o]);
             }
         }
         return;
@@ -5263,8 +5308,12 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
      * id dei token soltanto, e i due layer che le precedono danno il tempo di
      * farle arrivare dal disco. */
     q38_ple_prefetch(m,ids,S);
-    for(int s=0;s<S;s++){
+    for(int s=0;s<S;s++)
         if(ids[s]<0||ids[s]>=c->vocab){fprintf(stderr,"token id %d outside vocabulary\n",ids[s]);exit(1);}
+    /* a prompt's rows on the team: a 4180-token prompt's embedding rows and their copies into the
+     * streams' fresh pages (171 MB of Qwen3.8-Flash-Next) took 40 ms on one core */
+    #pragma omp parallel for schedule(static) if(S>=64)
+    for(int s=0;s<S;s++){
         float *e=hyper+(int64_t)s*W;
         q38_embed_row(m,ids[s],pos_base+s,e);
         for(int b=1;b<C;b++)memcpy(e+(int64_t)b*H,e,(size_t)H*sizeof(float));
@@ -5306,7 +5355,9 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
     /* COLI_CUDA_CHAIN: the same on the CUDA device (qwen38_cuda_chain.h), every layer */
     if(g_cuda_chain&&!chain_logit){
         int echo=g_echo_k>0&&g_echo_id&&S>1;
-        chain_logit=falloc((int64_t)nlogits*c->vocab);
+        m->greedy_done=0;
+        /* a greedy caller's rows picked on the card (q38cc_greedy_ok): no logits come down */
+        chain_logit=falloc(!echo&&q38cc_greedy_ok(m,S,nlogits)?1:(int64_t)nlogits*c->vocab);
         int took=q38cc_forward(m,ids,S,pos_base,nlogits,hyper,streams!=NULL,echo?mixed:NULL,chain_logit);
         if(took){
             free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;   /* consumed, as q38_layer_forward does */
@@ -5818,6 +5869,13 @@ typedef struct {
     uint64_t lk_drafts, lk_accepted, lk_verifies;  /* prompt lookup's */
     uint64_t depth_prop[Q38_SPEC_ROWS], depth_hit[Q38_SPEC_ROWS];   /* MTP drafts by position */
     int ended_ahead;             /* the generation ended with a verify's rows unconsumed (undone) */
+    /* greedy: the caller's pick is the argmax of the logits q38_spec_step returns, and it reads
+     * nothing else of them (temperature 0, no logprobs): the step may then return a buffer
+     * without them, its pick in next_tok (the CUDA chain picks a verify's rows on the card,
+     * q38cc_greedy_ok, and the host copies and scans none); next_tok -1: the logits are there.
+     * ahead_tok: a greedy verify's picks past its first row (its ahead_logit NULL) */
+    int greedy, next_tok;
+    int ahead_tok[Q38_SPEC_ROWS];
 } Q38Spec;
 
 /* Copy slots for a verify of up to rows+1 rows: allocated the first time they are
@@ -5929,13 +5987,15 @@ static void q38_spec_hist_push(Q38Spec *sp,int tok,int pos) {
 static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
     Cfg *c=&m->c; int V=c->vocab;
     sp->tokens++;
+    sp->next_tok=-1;
     q38_spec_hist_push(sp,tok,pos);
     if(sp->ahead_n){
         int i=sp->ahead_i;
         if(tok==sp->ids[i]&&pos==sp->ahead_pos+i&&sp->force!='r'){
-            /* draft i stands: its row's logits answer, with no forward */
-            float *logit=falloc(V);
-            memcpy(logit,sp->ahead_logit+(int64_t)(i-1)*V,(size_t)V*sizeof(float));
+            /* draft i stands: its row's logits answer, with no forward (a greedy verify's: its pick) */
+            float *logit=falloc(sp->ahead_logit?V:1);
+            if(sp->ahead_logit)memcpy(logit,sp->ahead_logit+(int64_t)(i-1)*V,(size_t)V*sizeof(float));
+            else sp->next_tok=sp->ahead_tok[i-1];
             if(sp->ahead_src==SPEC_SRC_MTP){sp->accepted++;sp->depth_hit[i-1]++;}
             else sp->lk_accepted++;
             if(++sp->ahead_i==sp->ahead_n)q38_spec_settle(m,sp,sp->ahead_n,0);
@@ -6017,7 +6077,10 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
     if(!k){
         sp->forwards++;
         double t0=now_s();
+        if(sp->greedy){m->greedy_out=&sp->next_tok;m->greedy_done=0;}
         float *logit=step(m,&tok,1,pos);
+        m->greedy_out=NULL;
+        if(sp->greedy&&logit&&!m->greedy_done)sp->next_tok=argmax_first(logit,V);
         spec_gate_forward(&sp->gate,1,now_s()-t0);
         return logit;
     }
@@ -6039,7 +6102,11 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
     sp->ids[0]=tok;memcpy(sp->ids+1,d,(size_t)k*sizeof(int));
     float *streams=NULL;
     m->snap_rows=k;g_q38_rowwise=1;
+    int picks[Q38_SPEC_ROWS];
+    if(sp->greedy){m->greedy_out=picks;m->greedy_done=0;}
     float *logit=q38_forward(m,sp->ids,S,pos,S,m->mtp?&streams:NULL);
+    m->greedy_out=NULL;
+    if(sp->greedy&&logit&&!m->greedy_done)for(int r=0;r<S;r++)picks[r]=argmax_first(logit+(int64_t)r*V,V);
     spec_gate_forward(&sp->gate,S,now_s()-t_verify);
     m->snap_rows=0;g_q38_rowwise=0;
     sp->forwards++;
@@ -6049,8 +6116,11 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
     } else {sp->lk_drafts+=(uint64_t)k;sp->lk_verifies++;}
     sp->ahead_n=S;sp->ahead_i=1;sp->ahead_pos=pos;sp->ahead_src=src;
     sp->head_ok=m->mtp&&m->mtp_len==pos&&streams;
-    sp->ahead_logit=falloc((int64_t)k*V);
-    memcpy(sp->ahead_logit,logit+V,(size_t)k*V*sizeof(float));
+    if(sp->greedy){sp->next_tok=picks[0];memcpy(sp->ahead_tok,picks+1,(size_t)k*sizeof(int));}
+    else{
+        sp->ahead_logit=falloc((int64_t)k*V);
+        memcpy(sp->ahead_logit,logit+V,(size_t)k*V*sizeof(float));
+    }
     sp->ahead_streams=streams;
     return logit;
 }

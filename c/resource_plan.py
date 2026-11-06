@@ -3273,8 +3273,10 @@ def _next_actions(bottleneck_class, projected_hit, probe_state, probe_gbs,
             actions.append({
                 "id": "measure-storage",
                 "priority": "required",
-                "reason": "cold experts remain on disk and no trusted storage probe is available",
-                "command": "make -C c iobench && ./c/iobench",
+                "reason": ("cold experts remain on disk and no trusted storage probe is available; "
+                           "from a source checkout, replace <model-shard> with an existing "
+                           "model weight file of at least 38 MiB on the model drive"),
+                "command": 'make -C c iobench && ./c/iobench "<model-shard>" 19 64 8 1',
             })
         actions.append({
             "id": "measure-residency",

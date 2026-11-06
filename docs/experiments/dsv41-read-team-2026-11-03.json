@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "hypothesis": "expert_fetch asks for min(read depth, tensors to read) threads while every other region runs at the full team width, so on layers with few missed experts libgomp retires and recreates pool threads; running the region at the team width, with a counter keeping the concurrent readers at the depth, removes that churn and raises decode throughput",
+  "commit": "39a682c9a1196a4ac915d08c41557a4a6b02ffc9",
+  "model": "DeepSeek-V4.1-Flash-1017, Unsloth UD-Q2_K_XL GGUF (7 parts, 311 GiB), read in place through coli import --mode link",
+  "command": "coli serve --model <import dir> --ram 18 --gpu 0 --ctx 4096 --no-think --kv-slots 1 --model-id colibri; client posts decode_c (128 tokens, temperature 0, stream) as the fourth request of a fresh server; make -C c deepseek_v41 CUDA=1 CUDA_ARCH=native",
+  "prompt_hash": "705e99d68b8ff129773a64fc44d72f6586e7b7c5ed1face3018cffe990d7abc9",
+  "hardware": {
+    "cpu": "Intel Core i7-13700KF, 16 cores / 24 threads, OMP_NUM_THREADS=8 (P-core count, set by coli)",
+    "ram": "31 GiB, 8 GiB swap file",
+    "storage": "Samsung 990 PRO 1 TB NVMe, ext4 (rw,relatime), model on the same drive",
+    "os": "Ubuntu 24.04.4, kernel 7.0.0-38, gcc 13.3.0, CUDA 13.2, NVIDIA driver 580.126.20, RTX 4070 Ti 12 GB"
+  },
+  "warmup_runs": 3,
+  "changed_variables": [
+    "expert_fetch_team"
+  ],
+  "baseline": {
+    "config": {
+      "expert_fetch_team": "min(read depth, tensors to read)",
+      "scratch": "pool",
+      "V41_READ_DEPTH": 8,
+      "ram_gb": 18,
+      "ctx": 4096
+    },
+    "samples": {
+      "tok_s": [
+        1.81,
+        1.81,
+        1.81
+      ]
+    },
+    "median_tok_s": 1.81,
+    "quality": {
+      "method": "CPU greedy full-text SHA-256 on 3 prompts identical to the original engine (X_fix2 vs X_base1); decode_c text identical in all six CUDA runs",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/dsv41-read-team-2026-11-03-raw.txt",
+      "sha256": "885f71cda38f2a44ddc803c1ccd99f3778ee1fca9bff55d572331a97ba640e45"
+    }
+  },
+  "trial": {
+    "config": {
+      "expert_fetch_team": "team width, counter-capped at the read depth",
+      "scratch": "pool",
+      "V41_READ_DEPTH": 8,
+      "ram_gb": 18,
+      "ctx": 4096
+    },
+    "samples": {
+      "tok_s": [
+        2.04,
+        2.04,
+        2.05
+      ]
+    },
+    "median_tok_s": 2.04,
+    "quality": {
+      "method": "CPU greedy full-text SHA-256 on 3 prompts identical to the original engine (X_c vs X_base1); V4.1 fixtures token-exact at cap 1, 2, 8 and the 40-token prompt",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/dsv41-read-team-2026-11-03-raw.txt",
+      "sha256": "885f71cda38f2a44ddc803c1ccd99f3778ee1fca9bff55d572331a97ba640e45"
+    }
+  },
+  "outcome": "improvement"
+}

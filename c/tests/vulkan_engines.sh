@@ -1765,6 +1765,36 @@ dmoe_gate() {
   echo "OK $tag: ${n:-0} layer steps with the routed experts in the frame (${c:-0} a prompt chunk's), ${h:-?} ms of routed experts on the host"
 }
 
+# sync_gate <engine> <tag> <env...> -- <argv...>: the chain's run under the Khronos validation
+# layer with its synchronization check (vulkan-validationlayers; said and skipped without it):
+# a hazard, or an event or barrier the specification forbids, fails. Lavapipe runs every
+# command in order and an NVIDIA card waits around an event, so neither shows a barrier that
+# is missing; the check sees it on any device (#2583: a hybrid step's sum read the experts'
+# rows with none, and a Radeon RX 9060 XT's answers fell into repetition). The device's
+# objects left at exit (VUID-vkDestroyDevice-device-05137) are not what it is for. Nor is
+# VUID-vkSetEvent-event-09543 (layers from 1.4 on), counted and said but not failed: the
+# specification now wants a host's event set before the frame that waits on it is submitted,
+# and a hybrid step sets it from the CPU while the frame runs, by design; a timeline
+# semaphore between two submits is the form it allows, a change of the chain's frames.
+sync_gate() {
+  local eng=$1 tag=$2; shift 2
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  rm -f chain.usage
+  env "${envs[@]}" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_LOADER_DEBUG=layer \
+    VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true VK_KHRONOS_VALIDATION_REPORT_FLAGS=error \
+    VK_KHRONOS_VALIDATION_DUPLICATE_MESSAGE_LIMIT=100000 \
+    COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 ./"$eng" "$@" > vk.log 2>&1 || true
+  if ! grep -aq "Loading layer library libVkLayer_khronos_validation" vk.log; then
+    echo "SKIP $tag: no Khronos validation layer (apt install vulkan-validationlayers)"; return 0
+  fi
+  local bad known
+  known="^VUID-vkDestroyDevice-device-05137$|^VUID-vkSetEvent-event-09543$"
+  bad=$(grep -aoE "SYNC-HAZARD-[A-Z_-]+|VUID-[A-Za-z0-9_-]+" vk.log | grep -vE "$known" | sort | uniq -c || true)
+  [ -z "$bad" ] || { grep -aE "SYNC-HAZARD-|Hazard |VUID-" vk.log | grep -vE "vkDestroyDevice|VUID-vkSetEvent-event-09543" | head -20 || true; echo "$bad"; fail "$tag: the validation layer's synchronization check"; }
+  local late; late=$(grep -ac "VUID-vkSetEvent-event-09543" vk.log || true)
+  echo "OK $tag: no synchronization error (${late:-0} host event sets while their frame is pending, VUID-vkSetEvent-event-09543)"
+}
+
 # lost_gate <engine> <tag> <frame> <env...> -- <argv...>: the device "lost" at the given
 # chain frame (COLI_VK_CHAIN_FAULT); the engine rebuilds the recurrent state on the CPU
 # from the prefix record and continues there: the CPU run's tokens all the same.
@@ -1827,6 +1857,35 @@ qwen36_gguf_chain_gates() {
   grep -q "host pool on, [1-9].* of RAM left for the KV and state the engine allocates later" vk.log ||
     { cat vk.log; fail "chain qwen36 GGUF hybrid: the host pool left no room for the KV cache"; }
   grep -q "hybrid layer steps\( ([^)]*)\)\{0,1\}, [1-9][0-9]* host pool pairs on the CPU" vk.log || { cat vk.log; fail "chain qwen36 GGUF hybrid: no pair on the CPU"; }
+  # the same steps under the validation layer: the events' barriers (vk_chain.c vkc_ev_signal,
+  # vkc_ev_wait) order the device's work around the host's
+  sync_gate qwen36 "chain qwen36 GGUF hybrid, synchronization" GQ_EXACT=1 COLI_VK_TIER_GB=0.0004 \
+    COLI_VK_TIER_HOST=1 SNAP=qwen36_gguf_tiny -- 8 8 qwen36_gguf_tiny/ref.json
+  grep -q "hybrid layer steps (in the frame, on events), [1-9]" vk.log || { cat vk.log; fail "chain qwen36 GGUF hybrid, synchronization: no step on events"; }
+  # a driver that lets a frame through the event the host sets while it runs (#2583: the
+  # specification wants it set before the frame is submitted, VUID-vkSetEvent-event-09543, and a
+  # Radeon on AMD's own driver answered in loops): COLI_VK_TEST_EV_NOWAIT=1 drops the waits, the
+  # probe at the chain's start sees it, and the steps run on the timelines with the CPU's tokens.
+  # Without the probe the same run reads the host's rows before they are written (other tokens).
+  CPUENV=GQ_EXACT=1 dmoe_gate qwen36 "chain qwen36 GGUF hybrid, a driver that does not hold the frame" all GQ_EXACT=1 \
+    COLI_VK_TIER_GB=0.0004 COLI_VK_TIER_HOST=1 COLI_VK_TEST_EV_NOWAIT=1 SNAP=qwen36_gguf_tiny -- 8 8 qwen36_gguf_tiny/ref.json
+  grep -q "does not hold a frame at an event the host sets while it runs" vk.log ||
+    { cat vk.log; fail "chain qwen36 GGUF hybrid: the probe did not see the frame pass the event"; }
+  grep -q "hybrid layer steps (frames A/B/C, by timelines), [1-9]" vk.log ||
+    { cat vk.log; fail "chain qwen36 GGUF hybrid: the steps stayed on the events the frame does not wait for"; }
+  # AMD's own driver leaves the events off unprobed (#2583: a Radeon RX 9060 XT on it answered in
+  # loops with them and soundly without; COLI_VK_TEST_AMD_OWN=1 takes any driver for it): the
+  # steps on the timelines with the CPU's tokens, and COLI_VK_HYBRID_EVENTS=1 the events again
+  CPUENV=GQ_EXACT=1 dmoe_gate qwen36 "chain qwen36 GGUF hybrid, AMD's own driver" all GQ_EXACT=1 \
+    COLI_VK_TIER_GB=0.0004 COLI_VK_TIER_HOST=1 COLI_VK_TEST_AMD_OWN=1 SNAP=qwen36_gguf_tiny -- 8 8 qwen36_gguf_tiny/ref.json
+  grep -q "the hybrid steps run on the timelines on AMD's own driver" vk.log ||
+    { cat vk.log; fail "chain qwen36 GGUF hybrid: AMD's own driver kept the events"; }
+  grep -q "hybrid layer steps (frames A/B/C, by timelines), [1-9]" vk.log ||
+    { cat vk.log; fail "chain qwen36 GGUF hybrid: no step on the timelines on AMD's own driver"; }
+  CPUENV=GQ_EXACT=1 dmoe_gate qwen36 "chain qwen36 GGUF hybrid, AMD's own driver, the events asked for" all GQ_EXACT=1 \
+    COLI_VK_TIER_GB=0.0004 COLI_VK_TIER_HOST=1 COLI_VK_TEST_AMD_OWN=1 COLI_VK_HYBRID_EVENTS=1 SNAP=qwen36_gguf_tiny -- 8 8 qwen36_gguf_tiny/ref.json
+  grep -q "hybrid layer steps (in the frame, on events), [1-9]" vk.log ||
+    { cat vk.log; fail "chain qwen36 GGUF hybrid: COLI_VK_HYBRID_EVENTS=1 did not bring the events back"; }
   # the host pool within the driver's heap for it (#2314: Windows leaves about half the RAM,
   # and the blocks past it were refused): a heap whose room past the 2 GiB the staging keeps
   # holds a few experts, the pool takes those, the engine's cache keeps the rest (and so the
@@ -2034,6 +2093,16 @@ family_qwen_chain() {
   for fx in qwen38_tiny_mtp qwen38_tiny_fp8_mtp qwen38_tiny_int4_mtp; do for f in "" reject accept mixed; do
     chain_gate qwen38 "chain qwen38 MTP $fx ${f:-drafting}" 1 OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=$f SNAP=$fx -- 2 8 $fx/ref.json
   done; done
+  # a prompt layer by layer with the MTP head, which wants the rows' final streams back: the
+  # logits and the head's drafts (made from those streams) of the same prompt chunk by chunk
+  V38LWM="OMP_NUM_THREADS=2 COLI_VK_TIER_HOST=1 COLI_VK_TIER_GB=0.00005 COLI_VK_CHAIN_ROWS=3 Q38_MTP=1 SNAP=qwen38_tiny_mtp"
+  chain_gate qwen38 "chain qwen38 MTP, a prompt layer by layer" 1 $V38LWM COLI_VK_CHAIN_LAYERWISE=1 -- 2 8 qwen38_tiny_mtp/ref.json
+  grep -q "prompts layer by layer" vk.log || { cat vk.log; fail "chain qwen38 MTP, a prompt layer by layer: it ran chunk by chunk"; }
+  cp vk.f32 lw.f32; grep -a "^\[qwen38 MTP\] .*acceptance" vk.log > lw.mtp
+  [ -s lw.mtp ] || { cat vk.log; fail "chain qwen38 MTP, a prompt layer by layer: no MTP report"; }
+  chain_gate qwen38 "chain qwen38 MTP, the same prompt chunk by chunk" 1 $V38LWM COLI_VK_CHAIN_LAYERWISE=0 -- 2 8 qwen38_tiny_mtp/ref.json
+  cmp -s lw.f32 vk.f32 || fail "chain qwen38 MTP, a prompt layer by layer: other logits than chunk by chunk"
+  grep -a "^\[qwen38 MTP\] .*acceptance" vk.log | cmp -s - lw.mtp || { cat lw.mtp; fail "chain qwen38 MTP, a prompt layer by layer: other drafts than chunk by chunk"; }
   # the device lost mid-decode, once between steps and once inside an MTP verify
   dmoe_gate qwen38 "chain qwen38 the routed experts in the frame" all OMP_NUM_THREADS=2 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
   dmoe_gate qwen38 "chain qwen38 the host's routing (COLI_VK_CHAIN_MOE=0)" none COLI_VK_CHAIN_MOE=0 OMP_NUM_THREADS=2 \
