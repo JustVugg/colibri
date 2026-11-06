@@ -50,6 +50,34 @@
 #define Q36_SPEC_SNAPS (Q36_SPEC_ROWS - 1)
 static int g_q36_rowwise;   /* set for a speculative verify: its rows must get a decode step's bits (q36_spec_step) */
 
+#define Q36_PERF_PHASES 5
+enum {
+    Q36_PERF_DECODE,
+    Q36_PERF_MTP_FEED,
+    Q36_PERF_MTP_DRAFT,
+    Q36_PERF_VERIFY,
+    Q36_PERF_OTHER
+};
+static int g_q36_perf_enabled;
+static int g_q36_perf_initialized;
+static int g_q36_perf_phase = Q36_PERF_OTHER;
+static unsigned long long g_q36_iq2_metal[Q36_PERF_PHASES];
+static unsigned long long g_q36_iq2_fallback[Q36_PERF_PHASES];
+static void q36_perf_init(void) {
+    if (g_q36_perf_initialized) return;
+    const char *e = getenv("Q36_PERF_STATS");
+    g_q36_perf_enabled = e && *e && *e != '0';
+    g_q36_perf_initialized = 1;
+}
+static void q36_perf_phase(int phase) {
+    if (g_q36_perf_enabled) g_q36_perf_phase = phase;
+}
+static void q36_perf_iq2(int metal) {
+    if (!g_q36_perf_enabled) return;
+    unsigned long long *n = metal ? &g_q36_iq2_metal[g_q36_perf_phase]
+                                  : &g_q36_iq2_fallback[g_q36_perf_phase];
+    __sync_fetch_and_add(n, 1ULL);
+}
 /* Effective ceiling: Q36_MAXT if set and sane, the conservative default
  * otherwise; never above the hard limit. */
 /* A Clef checkpoint raises the default to its own input budget, 16384 (clef_head.h):
@@ -92,6 +120,22 @@ static int qwen36_max_ctx(void) {
 #include "affine_quant.h"  /* MLX affine dense triples in model.safetensors */
 #ifdef COLI_METAL
 #include "backend_metal.h" /* coli_metal_init: affine pipelines for the store */
+static pthread_once_t g_iq2_metal_once = PTHREAD_ONCE_INIT;
+static int g_iq2_metal_ready;
+static void q36_iq2_metal_init_once(void) {
+    const char *e = getenv("COLI_METAL_IQ2_XXS");
+    if (e && *e && *e != '0') g_iq2_metal_ready = coli_metal_init();
+    if (e && *e && *e != '0' && !g_iq2_metal_ready)
+        fprintf(stderr, "[qwen36] native IQ2_XXS Metal unavailable; using CPU\n");
+}
+static int q36_iq2_metal_enabled(void) {
+    const char *e = getenv("COLI_METAL_IQ2_XXS");
+    if (!e || !*e || *e == '0') return 0;
+    pthread_once(&g_iq2_metal_once, q36_iq2_metal_init_once);
+    return g_iq2_metal_ready;
+}
+#else
+static int q36_iq2_metal_enabled(void) { return 0; }
 #endif
 #include "qwen36_embedding.h"     /* the embedding rows read in place from the checkpoint */
 #include "qwen36_dense_file.h"    /* canonical.qc: the INT8 dense matrices, converted once */
@@ -129,6 +173,34 @@ static void q36_wfree(void *p){
      * after int4 packing, so its matching release must follow that choice. */
     if (q36_waligned()) compat_aligned_free(p);
     else free(p);
+}
+static uint8_t *q36_iq2_gq_alloc(size_t bytes, size_t *registered_len) {
+    if (registered_len) *registered_len=0;
+#ifdef COLI_METAL
+    if (q36_iq2_metal_enabled()) {
+        const size_t page=16384;
+        if (bytes>SIZE_MAX-(page-1)) return NULL;
+        size_t len=(bytes+page-1)&~(page-1);
+        void *p=NULL;
+        if (posix_memalign(&p,page,len?len:page)) return (uint8_t *)malloc(bytes);
+        memset(p,0,len?len:page);
+        coli_metal_register(p,len?len:page);
+        if (registered_len) *registered_len=len?len:page;
+        return (uint8_t *)p;
+    }
+#else
+    (void)registered_len;
+#endif
+    return (uint8_t *)malloc(bytes);
+}
+static void q36_iq2_gq_free(void *p, size_t registered_len) {
+    if (!p) return;
+#ifdef COLI_METAL
+    if (registered_len) coli_metal_unregister(p);
+#else
+    (void)registered_len;
+#endif
+    free(p);
 }
 #include "gguf.h"          /* SNAP=model.gguf: read a GGUF in place, ggml weight types natively */
 /* GGUF mode (SNAP names a .gguf). The file is llama.cpp's conversion of the
@@ -1125,14 +1197,25 @@ typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; fl
                  void *vk; int vk_off; uint16_t *h;
                  char *vk_name; const char *vk_tag; int vk_quant, vk_fmt, vk_gone, vk_imported;
                  uint8_t *gq; int gq_type; float gs; int wf16;
-                 int q8r16; } QW;   /* q8r16: q's rows interleaved by 16 (idot.h i8r16_*, q36_trunk_q8_interleave) */
+                 int q8r16;
+#ifdef COLI_METAL
+                 size_t gq_metal_len; ColiMetalTensor *iq2_metal;
+#endif
+                 } QW;   /* q8r16: q's rows interleaved by 16 (idot.h i8r16_*, q36_trunk_q8_interleave) */
 static void qw_free(QW *w) {
 #ifdef COLI_VULKAN
     if (w->vk) coli_vk_tensor_free((ColiVkTensor *)w->vk);
     w->vk = NULL; w->vk_off = 0; w->vk_imported = 0;
     free(w->vk_name); w->vk_name = NULL; w->vk_gone = 0;
 #endif
-    free((void*)w->w); q36_wfree(w->q); free(w->sc); free(w->q4); free(w->sg); q36_wfree(w->h); free(w->gq);
+    free((void*)w->w); q36_wfree(w->q); free(w->sc); free(w->q4); free(w->sg); q36_wfree(w->h);
+#ifdef COLI_METAL
+    if (w->iq2_metal) coli_metal_tensor_free(w->iq2_metal);
+    q36_iq2_gq_free(w->gq,w->gq_metal_len);
+    w->iq2_metal=NULL; w->gq_metal_len=0;
+#else
+    free(w->gq);
+#endif
     w->w = NULL; w->q = NULL; w->sc = NULL; w->q4 = NULL; w->sg = NULL; w->ng = 0; w->h = NULL; w->gq = NULL;
 }
 
@@ -1175,6 +1258,7 @@ typedef struct {
 typedef struct { int eid; int pinned; int is_int4; int8_t *g, *u, *d; uint8_t *g4, *u4, *d4; uint8_t *pw; float *gs, *us, *ds; uint64_t used;
                  unsigned busy; /* callers computing from this slot (expert_hold): never evicted */
                  uint8_t *gqe;  /* GGUF mode: the expert, [gate | up | down] in their held types (GqExp hg/hu/hd) */
+                 size_t gqe_metal_len;
                  int8_t *t8; float *t8s; int t8_eid;   /* GGUF mode, the Vulkan tier: gqe as int8 with one scale per 32 weights (gq_slot_i8),
                                                           or as the file's rows when gqe holds them interleaved (vk_slot_src), for expert t8_eid - 1 */ } Slot;
 /* GGUF mode: where layer L's experts live. The three fused tensors hold
@@ -2154,11 +2238,54 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
     }
 }
 
-static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O){
+#ifdef COLI_METAL
+static void q36_perf_iq2_fallback(int type) {
+    if (type == GQ_IQ2_XXS) q36_perf_iq2(0);
+}
+static int q36_iq2_xxs_metal_try(float *y, const float *x, const uint8_t *W,
+                                 int t, int S, int I, int O, ColiMetalTensor **tensor) {
+    if (t!=GQ_IQ2_XXS || S!=1 || !q36_iq2_metal_enabled() || !gq_int_ok(t,I)) return 0;
+    gq_act a; memset(&a,0,sizeof a);
+    if (gq_act_set(&a,x,S,I)) { gq_act_free(&a); return 0; }
+    int done=coli_metal_iq2_xxs_gemv(tensor,y,a.q,a.d,W,I,O);
+    gq_act_free(&a);
+    if (done) q36_perf_iq2(1);
+    return done;
+}
+static int q36_iq2_xxs_metal_try_act(float *y, const uint8_t *W, int t,
+                                     const gq_act *a, int O) {
+    int done = t==GQ_IQ2_XXS && a && a->S==1 && q36_iq2_metal_enabled() &&
+               gq_int_ok(t,a->I) &&
+               coli_metal_iq2_xxs_gemv(NULL,y,a->q,a->d,W,a->I,O);
+    if (done) q36_perf_iq2(1);
+    return done;
+}
+static int q36_iq2_xxs_metal_try2_act(float *y1, const uint8_t *W1, int t1,
+                                      float *y2, const uint8_t *W2, int t2,
+                                      const gq_act *a, int O) {
+    if (t1!=GQ_IQ2_XXS || t2!=GQ_IQ2_XXS || !a || a->S!=1 ||
+        !q36_iq2_metal_enabled() || !gq_int_ok(t1,a->I) || !gq_int_ok(t2,a->I))
+        return 0;
+    if (!coli_metal_iq2_xxs_gemv(NULL,y1,a->q,a->d,W1,a->I,O)) return 0;
+    q36_perf_iq2(1);
+    int done = coli_metal_iq2_xxs_gemv(NULL,y2,a->q,a->d,W2,a->I,O);
+    if (done) q36_perf_iq2(1);
+    return done;
+}
+#endif
+
+static void matmul_d(float *y, const float *x, QW *w, int S, int I, int O){
 #ifdef COLI_QWEN_BATCH_TEST
     g_qwen_matmul_d_calls++;
 #endif
     if (w->gq) {
+#ifdef COLI_METAL
+        if (q36_iq2_xxs_metal_try(y,x,w->gq,w->gq_type,S,I,O,&w->iq2_metal)) {
+            if (w->gs != 1.f) for (int o=0;o<O;o++) y[o] *= w->gs;
+            return;
+        }
+#endif
+        if (w->gq_type == GQ_IQ2_XXS) q36_perf_iq2(0);
         if (gq_matmul(y, x, w->gq, w->gq_type, S, I, O)) {
             fprintf(stderr, "qwen36: GGUF matrix of type %s is not supported\n", gq_type_name(w->gq_type)); exit(1);
         }
@@ -2959,6 +3086,9 @@ static float *load_t_n(Model *m, const char *name, int64_t want) {
  * does. Only the CPU reads these copies: the Vulkan tier and the dense chain get
  * the file's rows back (vk_slot_src, vk_qw_tensor), CUDA takes no GGUF. */
 static int q36_gq_held(int type, int rows, int cols) {
+#ifdef COLI_METAL
+    if (type==GQ_IQ2_XXS && q36_iq2_metal_enabled()) return type;
+#endif
 #ifdef GQ_R16_ON
     static int on = -1;
     if (on < 0) { const char *e = getenv("Q36_ILV16"); on = !(e && !strcmp(e, "0")) && !gq_exact_mode(); }
@@ -3166,7 +3296,13 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
         if (!gq_blk_decoder(t->type)) { fprintf(stderr, "GGUF %s: type %s is not supported\n", t->name, gq_type_name(t->type)); exit(1); }
         if (!gg_scale(t, 1, &out->gs)) out->gs = 1.f;
         if (g_gguf_dry) { out->gq_type = t->type; return; }
-        out->gq = malloc((size_t)t->nbytes); out->gq_type = t->type;
+#ifdef COLI_METAL
+        if (t->type==GQ_IQ2_XXS)
+            out->gq=q36_iq2_gq_alloc((size_t)t->nbytes,&out->gq_metal_len);
+        else
+#endif
+            out->gq = malloc((size_t)t->nbytes);
+        out->gq_type = t->type;
         if (!out->gq || gguf_read(&g_gg, t, out->gq, 0, t->nbytes)) { fprintf(stderr, "GGUF %s: read failed\n", t->name); exit(1); }
         if (rheads) q36_rope_unpermute(out->gq, (size_t)gq_row_bytes(t->type, I), rheads, O / rheads);
         const int ht = q36_gq_held(t->type, O, I);
@@ -3176,7 +3312,12 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
             if (!h) { fprintf(stderr, "OOM GGUF %s\n", t->name); exit(1); }
             #pragma omp parallel for schedule(static)
             for (int g = 0; g < O / 16; g++) gq_r16_pack(ht, h + (int64_t)g * 16 * hb, out->gq + (int64_t)g * 16 * rb, 16, I);
-            free(out->gq); out->gq = h; out->gq_type = ht;
+#ifdef COLI_METAL
+            q36_iq2_gq_free(out->gq,out->gq_metal_len); out->gq_metal_len=0;
+#else
+            free(out->gq);
+#endif
+            out->gq = h; out->gq_type = ht;
         }
         return;
     }
@@ -4277,11 +4418,20 @@ static int qwen36_cap_for_ram(double resident_gb, double avail_gb, double ram_gb
     return derived;
 }
 
+static void slot_gqe_free(Slot *s) {
+    if (!s || !s->gqe) return;
+    q36_iq2_gq_free(s->gqe,s->gqe_metal_len);
+    s->gqe=NULL; s->gqe_metal_len=0;
+}
+
 static void slot_ensure_allocated(Model *m, Slot *s) {
     if (s->g || s->pw || s->gqe) return;
     Cfg *c = &m->c;
     if (g_gguf) {
-        s->gqe = malloc((size_t)m->gqe_max);
+        if (q36_iq2_metal_enabled())
+            s->gqe=q36_iq2_gq_alloc((size_t)m->gqe_max,&s->gqe_metal_len);
+        else
+            s->gqe = malloc((size_t)m->gqe_max);
         if (!s->gqe) { fprintf(stderr, "Error: OOM allocating slot weights\n"); exit(1); }
         s->pinned = 0; s->is_int4 = 0; s->g = s->u = s->d = NULL; s->g4 = s->u4 = s->d4 = NULL; s->pw = NULL;
         return;
@@ -5450,11 +5600,32 @@ static void moe_vk_gq_cpu(Model *m, int layer, const float *x, int S, const int 
         if (idx[i] < 0 || !want[i]) continue;
         const float *xs = x + (int64_t)(i / K) * D; float *y = ctb + (int64_t)i * D;
         Slot *e = expert_hold(m, layer, idx[i]);
+#ifdef COLI_METAL
+        if (!q36_iq2_xxs_metal_try(G,xs,e->gqe,gx->hg,1,D,I,NULL)) {
+            q36_perf_iq2_fallback(gx->hg);
+            gq_matmul(G, xs, e->gqe, gx->hg, 1, D, I);
+        }
+#else
         gq_matmul(G, xs, e->gqe, gx->hg, 1, D, I);
+#endif
+#ifdef COLI_METAL
+        if (!q36_iq2_xxs_metal_try(U,xs,e->gqe + gx->hb_g,gx->hu,1,D,I,NULL)) {
+            q36_perf_iq2_fallback(gx->hu);
+            gq_matmul(U, xs, e->gqe + gx->hb_g, gx->hu, 1, D, I);
+        }
+#else
         gq_matmul(U, xs, e->gqe + gx->hb_g, gx->hu, 1, D, I);
+#endif
         float sg = gx->sg ? gx->sg[idx[i]] : 1.f, su = gx->su ? gx->su[idx[i]] : 1.f;
         for (int j = 0; j < I; j++) { float gv = G[j] * sg; G[j] = (gv / (1.f + expf(-gv))) * (U[j] * su); }
+#ifdef COLI_METAL
+        if (!q36_iq2_xxs_metal_try(y,G,e->gqe + gx->hb_g + gx->hb_u,gx->hd,1,I,D,NULL)) {
+            q36_perf_iq2_fallback(gx->hd);
+            gq_matmul(y, G, e->gqe + gx->hb_g + gx->hb_u, gx->hd, 1, I, D);
+        }
+#else
         gq_matmul(y, G, e->gqe + gx->hb_g + gx->hb_u, gx->hd, 1, I, D);
+#endif
         if (gx->sd) for (int d = 0; d < D; d++) y[d] *= gx->sd[idx[i]];
         if (vkt_wants(layer, idx[i])) { VktExpertSrc vs = vk_slot_src(m, layer, e); vkt_note(layer, idx[i], &vs); }
         slot_release(e);
@@ -5564,12 +5735,24 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
     if (gq_act_set(pax, x, 1, D)) return -1;
     const int64_t rbg = gq_row_bytes(gx->hg, D), rbu = gq_row_bytes(gx->hu, D), rbd = gq_row_bytes(gx->hd, I);
     const int gI = I / u, gD = D / u;
+#ifdef COLI_METAL
+    int metal_gu = gx->hg==GQ_IQ2_XXS && gx->hu==GQ_IQ2_XXS && q36_iq2_metal_enabled();
+    if (metal_gu) {
+        for (int k = 0; k < n; k++) {
+            float *g = GU + (int64_t)k * 2 * I, *up = g + I;
+            if (!q36_iq2_xxs_metal_try2_act(g,sl[k]->gqe,gx->hg,up,sl[k]->gqe+gx->hb_g,gx->hu,pax,I))
+                gq_matmul2_act(g,sl[k]->gqe,gx->hg,up,sl[k]->gqe+gx->hb_g,gx->hu,pax,I);
+        }
+    } else
+#endif
+    {
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < n * 2 * gI; r++) {
         int k = r / (2 * gI), rr = (r % (2 * gI)) * u;
         const uint8_t *base = sl[k]->gqe;
         if (rr < I) gq_rows_u(GU + (int64_t)k * 2 * I + rr, u, pax, base + (int64_t)rr * rbg, gx->hg, D);
         else        gq_rows_u(GU + (int64_t)k * 2 * I + rr, u, pax, base + gx->hb_g + (int64_t)(rr - I) * rbu, gx->hu, D);
+    }
     }
     for (int k = 0; k < n; k++) {
         float *g = GU + (int64_t)k * 2 * I, *u = g + I; float *h = H + (int64_t)k * I;
@@ -5578,12 +5761,29 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
         for (int i = 0; i < I; i++) { float gv = g[i]; h[i] = (gv / (1.f + expf(-gv))) * u[i]; }
     }
     if (gq_act_set(pah, H, n, I)) return -1;   /* row k of ah is expert k's hidden */
+#ifdef COLI_METAL
+    int metal_down = gx->hd==GQ_IQ2_XXS && q36_iq2_metal_enabled();
+    if (metal_down) {
+        for (int k = 0; k < n; k++) {
+            gq_act one = *pah;
+            one.S=1; one.q=pah->q+(int64_t)k*I; one.d=pah->d+(int64_t)k*(I/32);
+            one.s=pah->s+(int64_t)k*(I/16);
+            one.l4=pah->l4?pah->l4+(int64_t)k*(I/4):NULL;
+            float *yk=Y+(int64_t)k*D;
+            const uint8_t *W=sl[k]->gqe+gx->hb_g+gx->hb_u;
+            if (!q36_iq2_xxs_metal_try_act(yk,W,gx->hd,&one,D))
+                gq_matmul_act(yk,&one,W,gx->hd,D);
+        }
+    } else
+#endif
+    {
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < n * gD; r++) {
         int k = r / gD, o = (r % gD) * u;
         gq_act one = *pah; one.S = 1; one.q = pah->q + (int64_t)k * I; one.d = pah->d + (int64_t)k * (I / 32); one.s = pah->s + (int64_t)k * (I / 16);
         one.l4 = pah->l4 ? pah->l4 + (int64_t)k * (I / 4) : NULL;
         gq_rows_u(Y + (int64_t)k * D + o, u, &one, sl[k]->gqe + gx->hb_g + gx->hb_u + (int64_t)o * rbd, gx->hd, I);
+    }
     }
     /* accumulate in expert-id order, as the general path does: same sums, same bits */
     int ord[64]; for (int k = 0; k < n; k++) ord[k] = k;
@@ -5616,8 +5816,12 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
         const int *tl = tok + cnt[e]; const float *wl = wt + cnt[e];
         Slot *sl; expert_get(m, layer, e, &sl);
         for (int r = 0; r < n; r++) memcpy(X + (int64_t)r * D, x + (int64_t)tl[r] * D, sizeof(float) * (size_t)D);
-        if (gq_int_ok(gx->hg, D) && gq_int_ok(gx->hu, D) && !gq_act_set(&act, X, n, D))
-            gq_matmul2_act(G, sl->gqe, gx->hg, U, sl->gqe + gx->hb_g, gx->hu, &act, I);   /* x quantized once */
+        if (gq_int_ok(gx->hg, D) && gq_int_ok(gx->hu, D) && !gq_act_set(&act, X, n, D)) {
+#ifdef COLI_METAL
+            if (!q36_iq2_xxs_metal_try2_act(G,sl->gqe,gx->hg,U,sl->gqe+gx->hb_g,gx->hu,&act,I))
+#endif
+                gq_matmul2_act(G, sl->gqe, gx->hg, U, sl->gqe + gx->hb_g, gx->hu, &act, I);   /* x quantized once */
+        }
         else {
             gq_matmul(G, X, sl->gqe, gx->hg, n, D, I);
             gq_matmul(U, X, sl->gqe + gx->hb_g, gx->hu, n, D, I);
@@ -7671,6 +7875,11 @@ typedef struct {
     int mtp_pstep;               /* Q36_MTP_PSTEP: the verify's depth from the drafts' own probabilities */
     float ahead_p[Q36_SPEC_ROWS];/* those probabilities, for the gate once the verify is judged */
     uint64_t mtp_drafts, mtp_accepted;
+    uint64_t mtp_proposed, mtp_verified_drafts, mtp_verifies, ordinary_forwards, verify_rows;
+    double mtp_draft_s, verify_s;
+    unsigned long long iq2_metal_start[Q36_PERF_PHASES], iq2_fallback_start[Q36_PERF_PHASES];
+    unsigned long long mtp_rows_start, mtp_kv_rows_start;
+    double mtp_ms_start, mtp_kv_ms_start;
     int force, force_row;        /* COLI_LOOKUP_FORCE (tests): the oracle's tokens as the proposal */
     int *hist, hist_n, hist_cap; /* the tokens fed so far and the one about to be: what lookup searches */
     SpecGate gate;
@@ -7696,6 +7905,14 @@ static int q36_spec_force_mode(const char *v, int *row) {
 
 static void q36_spec_begin(Model *m, Q36Spec *sp, const int *prompt, int np) {
     memset(sp, 0, sizeof *sp);
+    q36_perf_init();
+    q36_perf_phase(Q36_PERF_DECODE);
+    for (int i = 0; i < Q36_PERF_PHASES; i++) {
+        sp->iq2_metal_start[i] = __sync_fetch_and_add(&g_q36_iq2_metal[i], 0ULL);
+        sp->iq2_fallback_start[i] = __sync_fetch_and_add(&g_q36_iq2_fallback[i], 0ULL);
+    }
+    sp->mtp_rows_start = g_q36_mtp.rows; sp->mtp_ms_start = g_q36_mtp.ms;
+    sp->mtp_kv_rows_start = g_q36_mtp.kv_rows; sp->mtp_kv_ms_start = g_q36_mtp.kv_ms;
     const char *e = getenv("COLI_LOOKUP");
     /* on by default, always gated (docs/speculative.md): COLI_LOOKUP=0 turns it off */
     int asked = e && *e == '1';
@@ -7835,6 +8052,7 @@ static int q36_mtp_depth(Q36Spec *sp, int room, double *value) {
  * returned buffer is the caller's (it may hold more rows past the first vocab). */
 static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
     Cfg *c = &m->c; int V = c->vocab;
+    q36_perf_phase(Q36_PERF_DECODE);
     sp->tokens++;
     q36_spec_hist_push(sp, tok, pos);
     if (sp->mtp) q36_mtp_vocab_step(tok);
@@ -7875,7 +8093,10 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
         if (k) {
             float *hd = falloc(c->hidden);
             t_verify = now_s();
+            double draft_start = now_s();
+            q36_perf_phase(Q36_PERF_MTP_DRAFT);
             d[0] = q36_mtp_draft(m, tok, pos, hd);
+            sp->mtp_proposed++;
             sp->ahead_p[0] = g_q36_mtp.last_p;
             double t_first = now_s();
             static float pmin = -1.f;
@@ -7888,6 +8109,7 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
                      !spec_gate_deeper_p(&sp->gate, SPEC_SRC_MTP, j, sp->ahead_p))) { k = j; break; }
                 double t1 = now_s();
                 d[j] = q36_mtp_draft_more(m, hd, d[j - 1], pos + j);
+                sp->mtp_proposed++;
                 sp->ahead_p[j] = g_q36_mtp.last_p;
                 spec_gate_draft_cost(&sp->gate, SPEC_SRC_MTP, now_s() - t1);
             }
@@ -7909,11 +8131,14 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
                     if (t >= 0) d[j - 1] = t;
                 }
             }
+            sp->mtp_draft_s += now_s() - draft_start;
+            q36_perf_phase(Q36_PERF_DECODE);
             src = SPEC_SRC_MTP;
         }
     }
     if (!k) {
         sp->forwards++;
+        sp->ordinary_forwards++;
         double t0 = now_s();
         float *logit = step(m, &tok, 1, pos);
         spec_gate_forward(&sp->gate, 1, now_s() - t0);
@@ -7923,11 +8148,20 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
     sp->ids[0] = tok; memcpy(sp->ids + 1, d, (size_t)k * sizeof(int));
     m->snap_rows = k; g_q36_rowwise = 1;
     double t0 = t_verify ? t_verify : now_s();
+    double verify_start = now_s();
+    q36_perf_phase(Q36_PERF_VERIFY);
     float *logit = step_ex(m, sp->ids, S, pos, S);
+    sp->verify_s += now_s() - verify_start;
+    sp->verify_rows += (uint64_t)S;
     spec_gate_forward(&sp->gate, S, now_s() - t0);
     m->snap_rows = 0; g_q36_rowwise = 0;
     sp->forwards++; sp->verifies++;
-    if (src == SPEC_SRC_MTP) sp->mtp_drafts += (uint64_t)k; else sp->drafts += (uint64_t)k;
+    if (src == SPEC_SRC_MTP) {
+        sp->mtp_drafts += (uint64_t)k;
+        sp->mtp_verified_drafts += (uint64_t)k;
+        sp->mtp_verifies++;
+    } else sp->drafts += (uint64_t)k;
+    q36_perf_phase(Q36_PERF_DECODE);
     sp->ahead_n = S; sp->ahead_i = 1; sp->ahead_pos = pos; sp->ahead_src = src;
     sp->ahead_logit = falloc((int64_t)k * V);
     memcpy(sp->ahead_logit, logit + V, (size_t)k * V * sizeof(float));
@@ -7941,12 +8175,49 @@ static void q36_spec_end(Model *m, Q36Spec *sp) {
 }
 
 static void q36_spec_report(const Q36Spec *sp, const char *scope) {
-    if (sp->mtp_drafts) {
+    if (g_q36_perf_enabled) {
+        const uint64_t verified = sp->mtp_verified_drafts;
+        const double accepted_pct = verified ? 100.0 * (double)sp->mtp_accepted / (double)verified : 0.0;
+        const double accepted_per_verify = sp->mtp_verifies
+            ? (double)sp->mtp_accepted / (double)sp->mtp_verifies : 0.0;
+        fprintf(stderr,
+                "[qwen36 phase2] %s: MTP proposed %llu, verified %llu, accepted %llu "
+                "(%.1f%% of verified; %.2f accepted/MTP verify) | "
+                "verify forwards %llu (%llu rows, %.2f target rows/s), "
+                "MTP verifies %llu, ordinary decode forwards %llu | "
+                "draft %.3f s (%.2f proposed/s), verify %.3f s\n",
+                scope, (unsigned long long)sp->mtp_proposed, (unsigned long long)verified,
+                (unsigned long long)sp->mtp_accepted, accepted_pct, accepted_per_verify,
+                (unsigned long long)sp->verifies, (unsigned long long)sp->verify_rows,
+                sp->verify_s > 0.0 ? (double)sp->verify_rows / sp->verify_s : 0.0,
+                (unsigned long long)sp->mtp_verifies,
+                (unsigned long long)sp->ordinary_forwards, sp->mtp_draft_s,
+                sp->mtp_draft_s > 0.0 ? (double)sp->mtp_proposed / sp->mtp_draft_s : 0.0,
+                sp->verify_s);
+        fprintf(stderr,
+                "[qwen36 phase2] %s: MTP head %.3f s/%llu rows, feed K/V %.3f s/%llu rows\n",
+                scope, g_q36_mtp.ms - sp->mtp_ms_start,
+                (unsigned long long)(g_q36_mtp.rows - sp->mtp_rows_start),
+                g_q36_mtp.kv_ms - sp->mtp_kv_ms_start,
+                (unsigned long long)(g_q36_mtp.kv_rows - sp->mtp_kv_rows_start));
+        fprintf(stderr, "[qwen36 phase2] %s: IQ2_XXS GEMV Metal/CPU fallback by phase",
+                scope);
+        for (int i = 0; i < Q36_PERF_PHASES; i++) {
+            unsigned long long metal = __sync_fetch_and_add(&g_q36_iq2_metal[i], 0ULL) -
+                                       sp->iq2_metal_start[i];
+            unsigned long long fallback = __sync_fetch_and_add(&g_q36_iq2_fallback[i], 0ULL) -
+                                          sp->iq2_fallback_start[i];
+            if (metal || fallback)
+                fprintf(stderr, " %d:%llu/%llu", i, metal, fallback);
+        }
+        fprintf(stderr, " (phase index: decode=0 feed=1 draft=2 verify=3 other=4)\n");
+    }
+    if (sp->mtp_proposed || sp->mtp_drafts) {
         char g[384]; spec_gate_describe(&sp->gate, SPEC_SRC_MTP, g, sizeof g);
         fprintf(stderr, "[qwen36 mtp] %s: %.2f tokens/forward (%llu forwards per %llu tokens) | acceptance %.1f%% (%llu/%llu drafts) | gate %s\n", scope,
                 sp->forwards ? (double)sp->tokens / sp->forwards : 0.0,
                 (unsigned long long)sp->forwards, (unsigned long long)sp->tokens,
-                100.0 * sp->mtp_accepted / sp->mtp_drafts, (unsigned long long)sp->mtp_accepted,
+                sp->mtp_drafts ? 100.0 * sp->mtp_accepted / sp->mtp_drafts : 0.0, (unsigned long long)sp->mtp_accepted,
                 (unsigned long long)sp->mtp_drafts, g);
         q36_mtp_report();
     }
@@ -9223,7 +9494,7 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
                 qt_note_planned(wpl[i], wpe[i], wg, wu, wd, tmp.gs, tmp.us, tmp.ds);
             }
             free(tmp.pw); free(tmp.g); free(tmp.gs); free(tmp.g4); free(tmp.u4); free(tmp.d4);
-            free(tmp.gqe); free(tmp.t8);
+            slot_gqe_free(&tmp); free(tmp.t8);
         }
         qt_fill_wait();
         free(wpl); free(wpe);
@@ -9511,7 +9782,7 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
             VktExpertSrc src = vk_slot_src(m, pl[i], &tmp);
             vkt_put(pl[i], pe[i], &src);
             free(tmp.pw); free(tmp.g); free(tmp.gs); free(tmp.g4); free(tmp.u4); free(tmp.d4);
-            free(tmp.gqe); free(tmp.t8); free(tmp.t8s);
+            slot_gqe_free(&tmp); free(tmp.t8); free(tmp.t8s);
         }
         vkt_put_done();
         vkt_warm_report("qwen36", n, now_s() - t0);
@@ -10256,7 +10527,7 @@ static void qwen36_segment_model_destroy(Qwen36SegmentEngine *engine) {
         for (int slot = 0; slot < cache->n; slot++) {
             free(cache->slots[slot].g);
             free(cache->slots[slot].pw);
-            free(cache->slots[slot].gqe); free(cache->slots[slot].t8); free(cache->slots[slot].t8s);
+            slot_gqe_free(&cache->slots[slot]); free(cache->slots[slot].t8); free(cache->slots[slot].t8s);
             free(cache->slots[slot].gs);
             free(cache->slots[slot].g4);
             free(cache->slots[slot].u4);

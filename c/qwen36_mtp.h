@@ -678,12 +678,16 @@ static void q36_mtp_rows(Model *m, const int *tok, const float *hid, int R, int 
 static void q36_mtp_feed_rows(Model *m, const int *ids, int S, int pos_base, const float *hid);
 static void q36_mtp_feed(Model *m, const int *ids, int S, int pos_base, const float *res) {
     Q36Mtp *p = &g_q36_mtp; int D = m->c.hidden;
-    if (!p->on || S < 1 || !q36_mtp_kv(m)) return;
+    if (!p->on || S < 1) return;
+    int previous_phase = g_q36_perf_phase;
+    q36_perf_phase(Q36_PERF_MTP_FEED);
+    if (!q36_mtp_kv(m)) { q36_perf_phase(previous_phase); return; }
     float *hid = falloc((int64_t)S * D);   /* h_p: the model's output, after its final norm */
     #pragma omp parallel for schedule(static) if(S > 8)
     for (int s = 0; s < S; s++) rmsnorm_row(hid + (int64_t)s * D, res + (int64_t)s * D, m->final_norm, D, m->c.eps);
     q36_mtp_feed_rows(m, ids, S, pos_base, hid);
     free(hid);
+    q36_perf_phase(previous_phase);
 }
 static void q36_mtp_feed_rows(Model *m, const int *ids, int S, int pos_base, const float *hid) {
     Q36Mtp *p = &g_q36_mtp; int D = m->c.hidden;
