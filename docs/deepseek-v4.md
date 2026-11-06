@@ -37,7 +37,8 @@ unit.
 
 - Production code is in `c/deepseek_v4.c` (amalgamated units); the public
   engine/session API is `c/deepseek_v4.h`. The CUDA tier is
-  `c/backend_cuda_dsv4.cu` (+ `backend_loader_dsv4.c` on Windows).
+  `c/backend_cuda_dsv4.cu` (built as `coli_gpu_dsv4.so` and loaded by
+  `backend_loader_dsv4.c` on POSIX HIP, as a DLL on Windows).
 - Official sharded safetensors checkpoints load through shared `st.h`;
   standard MXFP4 matmul uses shared `quant.h`.
 - Unified `c/coli` routes `run`, `chat`, `serve`, and `web` to V4; `serve` is
@@ -150,6 +151,19 @@ otherwise load the generic DLL; `COLI_DSV4_DLL=<file name>` forces one. The
 start-up banner names the choice: `[DSV4 CUDA] backend=coli_cuda_dsv4_dg.dll
 (deepgemm-sm120)`. Deploy = `deepseek_v4.exe` + both DLLs next to it.
 
+### Linux HIP tier
+
+```bash
+cd c
+make deepseek-v4 HIP=1 HIP_ARCH=gfx1102 ROCM_HOME=/usr ROCM_LIBDIR=/usr/lib64
+```
+
+This builds the engine plus `coli_gpu_dsv4.so` beside it. The host has no
+`libamdhip64` in `DT_NEEDED` (`ldd deepseek_v4` is clean), so a machine
+without ROCm still starts on the CPU; `--backend auto` loads the .so on first
+use, `--backend hip` requires it, and a missing .so leaves the CPU path. A
+`VK=1` build in the same command carries both AMD backends in one binary.
+
 ### Linux CUDA tier
 
 ```bash
@@ -202,6 +216,41 @@ outside ASCII (Chinese, accented letters) does not survive the command line of
 the engine run by hand: give it with `--prompt-file <UTF-8 file>`. `--ngen` is a ceiling, not a
 target (answers end at EOS; an oversized ceiling is clamped to the context
 with a stderr note). `CTX`/`--ctx` sets the context window.
+
+The engine's own CLI is the control plane now: `--gpu auto|none|N`,
+`--vram GiB`, `--workload auto|decode|prefill` and `--backend auto|hip|vulkan|cpu`
+feed one placement plan. A `VK=1 HIP=1` build carries both AMD paths in one
+binary: `auto` tries HIP first and falls back to Vulkan when the HIP runtime
+cannot initialize, an explicit `hip` does not fall back, and `--gpu none`
+disables both.
+`coli run`, `coli chat` and `coli serve` forward those three flags to the
+native engine (`openai_server.Engine` appends them to the engine argv), so a
+served process obeys the same budget instead of translating `--vram` into the
+GGUF-only `CUDA_EXPERT_GB`. An explicit `--workload` also pins the phase: no
+prefill/decode switch, so `decode` keeps dense in RAM even for a long prompt.
+The planner gets the model geometry, the real free VRAM and the workload and
+returns which tiers live on the device plus the mirror capacity; `--vram` is
+the total budget for dense, shared experts, the prefill bank and mirrors, and
+`--gpu none` really turns the native tier off. An automatic budget keeps
+512 MiB of system reserve (vLLM's `gpu_memory_utilization=0.9` and colibri's
+2 GiB general CUDA reserve are the same idea); an explicit `--vram` is used
+as given and clamped to free VRAM. Measured on 8 GB: 1955-token prefill
+215.6 s against 363.4 s on the CPU (1.69x), peak 6.97 GiB.
+
+On 8 GB the two phases cannot both be resident, so the engine keeps both
+shapes from the same budget and switches at the boundary. A prompt of at
+least 64 fresh tokens uploads dense+attention (clearing the decode mirrors),
+runs the prefill, then releases dense and lets the mirror cache refill for
+decode; a shorter prompt keeps the decode shape (dense in RAM, more mirrors)
+because the 6.2 GiB upload would cost more than it saves. The switch is logged
+as `v4_gpu phase=prefill ...` / `v4_gpu phase=decode ...`. Every long-lived
+device object (dense/shared tensor, expert bank, KV cache, activation) is
+charged to the same plan budget by the backend, so `used` in those logs is the
+allocator's total, not a sum of estimates. The routed-expert mirror is an SLRU
+(probation + protected, as in llama.cpp's `llama-moe-cache.cpp`): a hit is
+promoted, a miss evicts the coldest probation slot, and experts selected by the
+current request are skipped. The environment variables below are debug
+overrides of that plan, not the user contract.
 
 What the knobs do (full table in [Environment reference](#environment-reference-v4-engine)):
 `COLI_CUDA_ATTN_BATCH=1` puts the batched prefill attention block on the GPU
@@ -256,7 +305,7 @@ to the CPU union). An explicit `DSV4_CUDA_VRAM_RESERVE_MB` is used as given.
 | VRAM | dense mirrors | prefill bank | recommended env | expected |
 |---|---|---|---|---|
 | 6 GB | no (6.3 GB does not fit) | yes (3.2 GiB) | `CUDA_DENSE=0 COLI_CUDA_MOE_BATCH=1 COLI_CUDA_ATTN_BATCH=0` | GPU MoE prefill (generic kernels on non-RTX50), CPU attention/decode; ~90 mirrors between prefills |
-| 8 GB | yes | no (~0.9 GiB left) | `CUDA_DENSE=1 COLI_CUDA_ATTN_BATCH=1 COLI_CUDA_MOE_BATCH=0` | GPU attention + GPU decode dense; MoE prefill on the CPU union; ~25 mirrors |
+| 8 GB | prefill: yes; decode: no | no (~0.9 GiB left) | `--vram 8 --workload prefill` for prefill; default plan for decode | prefill dense + batched attention (213 s / 1955 tokens); decode dense in RAM, ~530–549 mirrors, ~0.7 tok/s |
 | 10–12 GB | yes | 12 GB: yes (tight); 10 GB: only a pruned checkpoint's smaller bank on generic builds | `CUDA_DENSE=1 COLI_CUDA_ATTN_BATCH=1 COLI_CUDA_MOE_BATCH=1` | full GPU prefill; 12 GB: the 32-mirror minimum beside a 256-expert bank's reserve (~350 mirrors with `COLI_CUDA_MOE_BATCH=0`), ~150 beside a 132-expert one; 10 GB: the 32-mirror minimum beside a 132-expert bank (256 experts: `COLI_CUDA_MOE_BATCH=0`, ~190 mirrors) |
 | 16 GB (this box) | yes | yes | the canonical line above (mirror cap can be left unset) | ~330 mirrors; the numbers in this document predate the bank-sized reserve (the fixed 2800 MiB default left more mirrors, but too little room for the bank once decode had filled the card) |
 | 24 GB | yes | yes | canonical | ~1 000 mirrors (~9 %) |
@@ -282,12 +331,13 @@ first request runs at the warm speed instead of climbing as the cache fills one
 miss at a time (#2109), and the start takes as long as the disk needs to read
 the cache. `COLI_V4_PREWARM=0` starts with it empty.
 
-Two opt-in GPU levers are looking for community numbers, both default off and
-byte-identical when unset: `DSV4_HYBRID=1` splits VRAM-tier misses between the
-GPU fill branch and the CPU branch using bandwidths measured at runtime, and
-`COLI_CUDA_MOE_DOUBLE=1` (on top of `COLI_CUDA_MOE_BATCH=1`) prefetches the next
-layer's full expert set into a second VRAM bank while the current layer
-computes, falling back to the single bank when VRAM is short.
+The decode split is part of the VRAM plan (`V4GpuPlan.hybrid`), not an
+environment switch: a GPU decode plan with a live mirror cache splits VRAM-tier
+misses between the GPU fill branch and the CPU branch using bandwidths measured
+at runtime; prefill and CPU plans leave it off. `COLI_CUDA_MOE_DOUBLE=1` (on top
+of `COLI_CUDA_MOE_BATCH=1`) prefetches the next layer's full expert set into a
+second VRAM bank while the current layer computes, falling back to the single
+bank when VRAM is short.
 
 ### Expert-pruned checkpoints (REAP) and the generic kernels
 
@@ -534,7 +584,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_CUDA_DEVICE` (0) | CUDA device ordinal |
 | `COLI_DSV4_DLL` | Windows: force a backend DLL file name (loader) |
 | `COLI_CUDA_ATTN_BATCH` (0; 1 for a GGUF on the CUDA expert tier) | `1` = GPU batched prefill attention block + GPU decode attention/indexer; unset, it is on for a GGUF whose dense matrices the CUDA expert tier's device holds (`COLI_CUDA=1`, `COLI_CUDA_DENSE`), `0` keeps it on the CPU |
-| `COLI_CUDA_MOE_BATCH` (0) | `1` = prefill MoE on the transient VRAM expert bank |
+| `COLI_CUDA_MOE_BATCH` (plan) | unset = the placement plan enables the transient VRAM expert bank when it fits; `1`/`0` is a debug override |
 | `COLI_CUDA_MOE_BATCH_MIN` (256) | min fresh tokens to engage the bank |
 | `DSV4_CUDA_EXPERT_MIRRORS` (4096) | upper bound on decode VRAM expert mirrors (12.75 MiB each); free VRAM sizes the cache at run time |
 | `DSV4_CUDA_VRAM_RESERVE_MB` (600; with the bank 600 + the bank, ×2 with `COLI_CUDA_MOE_DOUBLE=1`, + 64 mirrors, logged as `v4_gpu mirror-reserve=`) | VRAM kept free while mirrors grow (bank + attention buffers; the default only from 32 live mirrors on, see [VRAM budget](#vram-budget-and-per-card-settings)); an explicit value is used as given |
@@ -556,7 +606,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_PREFIX_LOG` | log hint boundary / reuse decisions |
 | `V4_IDX_BATCH` (1) | batched indexer selection in prefill; `0` = legacy per-token |
 | `V4_IDX_IDENTITY` (0) | `1` = skip indexer scoring when every candidate fits under `index_topk` (index order instead of upstream's score order; ~8 % faster prefill, changes rounding) |
-| `COLI_V4_ROWS16` (1) | `0` = never repack hot experts into the rows16 layout (reference matvec for all; numerics comparisons) |
+| `COLI_V4_ROWS16` (1) | `0` = never repack hot experts into the rows16 layout (reference matvec for all; numerics comparisons). With the native GPU expert mirror live, rows16 repacking turns itself off: the mirror needs `block_rows=1` |
 | `CTX` (4096) / `NGEN` | context window / generation ceiling (CLI + serve) |
 
 **Experts / I/O**

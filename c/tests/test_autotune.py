@@ -272,9 +272,10 @@ class FakeServeEngine:
     cap_ttft = {}
 
     def __init__(self, executable, model, cap, max_tokens, env, kv_slots,
-                 family):
+                 family, engine_args=None):
         FakeServeEngine.launches.append(
-            {"cap": cap, "env": dict(env), "family": family})
+            {"cap": cap, "env": dict(env), "family": family,
+             "engine_args": list(engine_args or [])})
         self.env = env
         self.cap = cap
         self.prompts = []
@@ -351,6 +352,14 @@ class ServeTuneTest(unittest.TestCase):
         self.assertEqual(len(FakeServeEngine.launches), 4)
         self.assertEqual(FakeServeEngine.sessions,
                          [["prompt-a", "prompt-b"]] * 4)
+
+    def test_engine_args_reach_every_launch(self):
+        FakeServeEngine.reset()
+        args = ["--vram", "5", "--backend", "hip", "--workload", "decode"]
+        self.run_serve_tune(engine_args=args)
+        self.assertTrue(FakeServeEngine.launches)
+        for launch in FakeServeEngine.launches:
+            self.assertEqual(launch["engine_args"], args)
 
     def test_sibling_tune_with_a_gpu_and_two_sockets_launches_only_omp(self):
         FakeServeEngine.reset()

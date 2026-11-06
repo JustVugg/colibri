@@ -5429,19 +5429,16 @@ static int profiled_expert_load_finish(ExpertLoadHandle *handle) {
 }
 
 #ifdef COLI_V4_GPU_TIER
-/* DSV4_HYBRID=1 (opt-in): on a decode miss, split the missing experts between
- * a PCIe-fill set (upload, compute on GPU with the residents) and a host set
- * (compute on CPU) instead of today's all-or-nothing, sized by the q* policy
- * in deepseek_v4_hybrid.h from live bandwidth EMAs. Off by default until the
- * split is validated on real GPUs; when off, the engine byte-for-byte keeps
- * its historical behaviour. */
+/* On a decode miss, split the missing experts between a PCIe-fill set
+ * (upload, compute on GPU with the residents) and a host set (compute on CPU)
+ * instead of all-or-nothing, sized by the q* policy in deepseek_v4_hybrid.h
+ * from live bandwidth EMAs. The split is decided by V4GpuPlan.hybrid (one plan
+ * for every VRAM tier), not by an environment switch. The planner sets it for
+ * a GPU decode plan with a live mirror cache; prefill and CPU plans leave it
+ * off. */
+int g_v4_gpu_plan_hybrid = -1;
 int coli_v4_hybrid_enabled(void) {
-    static int on = -1;
-    if (on < 0) {
-        const char *setting = getenv("DSV4_HYBRID");
-        on = setting && atoi(setting) != 0;
-    }
-    return on;
+    return g_v4_gpu_plan_hybrid > 0;
 }
 /* Non-static on purpose: the serve unit prints these counters, and under the
  * per-unit amalgam build that is a different object file. */
@@ -9738,6 +9735,14 @@ static int hot_pack_matrix(ColiTensorView *view, unsigned char *scratch) {
 }
 
 /* state->mutex is held and the slot has at least one reference. */
+/* Set once the native CUDA/HIP expert mirror is live. rows16 packs the same
+ * hot experts the mirror wants; a packed view has block_rows=16 and the mirror
+ * refuses it (v4_gpu_expert_attach_cached_ex). Mirror wins: the CPU keeps the
+ * reference layout, the device gets the hits. */
+#ifdef COLI_V4_GPU_TIER
+extern int g_v4_gpu_mirror_on;
+#endif
+
 /* COLI_V4_ROWS16=0: never repack hot experts into the rows16 layout, so
  * every expert runs the reference matvec. The rows16 kernel accumulates in a
  * different order (not bitwise the reference), which makes greedy text depend
@@ -9745,6 +9750,9 @@ static int hot_pack_matrix(ColiTensorView *view, unsigned char *scratch) {
  * numerics comparisons (measured 2026-08-15). */
 static int hot_rows16_wanted(void) {
     static int rows16 = -1;
+#ifdef COLI_V4_GPU_TIER
+    if (g_v4_gpu_mirror_on) return 0;
+#endif
     if (rows16 < 0) {
         const char *env = getenv("COLI_V4_ROWS16");
         rows16 = !(env && *env == '0');
@@ -11383,6 +11391,15 @@ int coli_v4_engine_open(ColiV4Engine **output,
         options->context_tokens > 0 ? options->context_tokens : 4096;
     engine->runtime.repin_interval = options->repin_interval;
     engine->runtime.pin_slots_per_layer = options->pin_slots_per_layer;
+    engine->gpu.request_off = options->gpu_off;
+    engine->gpu.request_device_set = options->gpu_device_set;
+    engine->gpu.request_device = options->gpu_device;
+    engine->gpu.request_workload = options->gpu_workload;
+    engine->gpu.request_workload_set = options->gpu_workload_set;
+    engine->gpu.request_backend = options->gpu_backend;
+    if (options->gpu_backend == COLI_V4_GPU_BACKEND_CPU)
+        engine->gpu.request_off = 1;
+    engine->gpu.request_budget_bytes = (long long)options->gpu_budget_bytes;
 
     /* Set owns_* immediately after each acquire so destroy cleans partial opens. */
     if (coli_v4_config_load(&engine->config, engine->runtime.target_model_dir,
@@ -11493,6 +11510,7 @@ fail:
 #include "deepseek_v4_internal.h"
 #include "backend_cuda_dsv4.h"
 #include "deepseek_v4_bank_pair.h"
+#include "deepseek_v4_gpu_plan.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -11502,11 +11520,18 @@ fail:
  * batched attention's helpers take it where a layer has no FP8 mirror to find it by (a GGUF) */
 static int g_v4_gpu_open_device = -1;
 
-static int v4_gpu_wanted(void) {
+static int v4_gpu_wanted(const ColiV4Engine *engine) {
+    if (engine && engine->gpu.request_off) return 0;
     const char *setting = getenv("DSV4_CUDA");
     if (setting && atoi(setting) == 0) return 0;
     return 1;
 }
+
+/* Plan globals: the bank and reserve paths live in functions that do not
+ * carry the engine pointer, the same process has one engine. */
+static int g_v4_gpu_plan_bank = -1;
+static long long g_v4_gpu_plan_reserve_mb = -1;
+extern int coli_v4_gpu_attn_default;
 
 typedef struct V4GpuExpertMirrorCache V4GpuExpertMirrorCache;
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
@@ -11514,18 +11539,55 @@ static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create(int device,
                                                             int suggested);
 static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache);
+static void v4_gpu_expert_mirrors_clear(V4GpuExpertMirrorCache *cache);
+static void v4_gpu_expert_mirrors_set_limit(V4GpuExpertMirrorCache *cache,
+                                            int limit);
+static void v4_gpu_expert_mirrors_set_dims(V4GpuExpertMirrorCache *cache,
+                                           int n_layers, int n_experts);
+static void v4_gpu_dense_release(ColiV4Engine *engine);
 static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                                           ColiExpertView *view, int sync);
 static void v4_gpu_mirror_reserve_size(const ColiDeepSeekV4Config *config,
                                        int bank_possible);
 static long long v4_gpu_mirror_reserve_mb(int live);
 static long long v4_gpu_mirror_reserve_margin_mb(int live);
+static int v4_gpu_dense_wanted(const ColiV4Engine *engine);
+
+int g_v4_gpu_mirror_on;   /* defined in the GPU unit, read by the expert store */
+
+/* Dense/attention bytes from the layer plans, not from runtime state: the
+ * planner runs before the resident layers have been loaded, so
+ * dense_resident.total_bytes is still zero here. */
+static long long v4_gpu_dense_bytes_estimate(const ColiV4Engine *engine) {
+    long long total = 0;
+    if (!engine) return 0;
+    for (int layer = 0; layer < engine->config.num_hidden_layers; layer++) {
+        ColiDeepSeekV4LayerPlan plan;
+        if (coli_v4_layer_plan(&plan, &engine->config, layer, NULL, 0))
+            return 0;
+        for (size_t i = 0; i < plan.tensor_count; i++)
+            if (coli_v4_dense_device_only_tensor(&plan.tensors[i]))
+                total += (long long)coli_v4_dense_tensor_bytes(&plan.tensors[i]);
+    }
+    return total;
+}
 
 int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     if (!engine) return -1;
     engine->gpu.enabled = 0;
     engine->gpu.device = 0;
-    if (!v4_gpu_wanted()) return 0;
+    if (!v4_gpu_wanted(engine)) return 0;
+    if (engine->gpu.request_backend == COLI_V4_GPU_BACKEND_VULKAN) {
+#ifdef COLI_VULKAN
+        setenv("COLI_VULKAN", "1", 1);
+        return 0;
+#else
+        fprintf(stderr, "v4_gpu warning=vulkan-not-built; continuing-CPU\n");
+        return 0;
+#endif
+    }
+    if (engine->gpu.request_backend == COLI_V4_GPU_BACKEND_HIP)
+        setenv("COLI_VULKAN", "0", 1);
 #ifdef COLI_VULKAN
     {   /* This path mirrors native FP4 experts and FP8 and bf16 matrices only
          * (v4_gpu_expert_attach_cached_ex): a GGUF's experts and dense part stayed on the CPU
@@ -11546,8 +11608,21 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     }
 #endif
     const char *device_setting = getenv("DSV4_CUDA_DEVICE");
-    int device = device_setting ? atoi(device_setting) : 0;
+    int device = engine->gpu.request_device_set
+                     ? engine->gpu.request_device
+                     : (device_setting ? atoi(device_setting) : 0);
     if (!dsv4_cuda_init(&device, 1)) {
+#ifdef COLI_VULKAN
+        if (engine->gpu.request_backend == COLI_V4_GPU_BACKEND_AUTO) {
+            const char *vk = getenv("COLI_VULKAN");
+            if (!vk || *vk != '0') {
+                setenv("COLI_VULKAN", "1", 1);
+                fprintf(stderr, "v4_gpu warning=hip-unavailable; "
+                                "falling-back-to-vulkan\n");
+                return 0;
+            }
+        }
+#endif
         fprintf(stderr, "v4_gpu warning=backend-unavailable; continuing-CPU\n");
         return 0;
     }
@@ -11564,26 +11639,121 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     engine->gpu.enabled = 1;
     engine->gpu.device = device;
     g_v4_gpu_open_device = device;
-    v4_gpu_mirror_reserve_size(&engine->config,
-                               !coli_v4_index_gguf(engine->target_index));
-    /* Routed-expert fp4 mirror cache hangs off the expert store; attach it at
-     * open so moe_token_pipeline can mirror expert weights on demand. Default
-     * capacity covers the pinned (hot) experts per layer so autopin never
-     * forces a mirror eviction mid-generation; override with
-     * DSV4_CUDA_EXPERT_MIRRORS. */
-    int mirror_suggested = engine->config.num_hidden_layers *
-                           COLI_V4_MAX_PIN_SLOTS_PER_LAYER;
-    if (mirror_suggested < 128) mirror_suggested = 128;
-    if (mirror_suggested > 2048) mirror_suggested = 2048;
-    /* The cache grows only while the VRAM reserve stays free (growth guard
-     * in v4_gpu_expert_attach_cached), so the capacity is an upper bound
-     * that free VRAM sizes at run time; a generous default lets bigger cards
-     * fill up. A mirror is 12.75 MiB (gate, up, down: fp4 + UE8M0 scales). */
-    mirror_suggested = 4096;
-    if (engine->experts && !engine->experts->gpu)
-        engine->experts->gpu =
-            v4_gpu_expert_mirrors_create(device, mirror_suggested);
-    fprintf(stderr, "v4_gpu tier=dense-matvec device=%d\n", device);
+    /* One plan for every VRAM tier. Dense, shared, bank and mirror are no
+     * longer independent switches: the planner gets the geometry, the real
+     * free VRAM and the workload and returns what fits. */
+    {
+        long long free_bytes = dsv4_cuda_mem_free_mb(device) * (1LL << 20);
+        long long hidden = engine->config.hidden_size;
+        long long intermediate = engine->config.moe_intermediate_size;
+        long long layers = engine->config.num_hidden_layers;
+        long long dense_bytes = v4_gpu_dense_bytes_estimate(engine);
+        if (dense_bytes <= 0)
+            dense_bytes = (long long)engine->dense_resident.total_bytes;
+        long long shared_bytes = layers * (3 * hidden * intermediate +
+                                           3 * hidden * intermediate / 32);
+        long long bank_bytes = dsv4_cuda_expert_bank_slots(
+                                   engine->config.n_routed_experts) *
+                               dsv4_cuda_expert_bank_slot_bytes(
+                                   (int)hidden, (int)intermediate);
+        long long mirror_bytes = 3 * (intermediate * hidden / 2 +
+                                      intermediate * hidden / 32);
+        long long kv_bytes = (long long)engine->runtime.context_tokens *
+                                 (128LL << 10) + (128LL << 20);
+        V4GpuPlanRequest request;
+        V4GpuPlan active;
+        long long plan_budget;
+        int phase;
+        memset(&request, 0, sizeof(request));
+        request.backend_ok = 1;
+        request.budget_bytes = engine->gpu.request_budget_bytes;
+        request.free_bytes = free_bytes;
+        request.dense_bytes = dense_bytes;
+        request.shared_bytes = shared_bytes;
+        request.bank_bytes = bank_bytes;
+        request.kv_bytes = kv_bytes;
+        request.mirror_bytes = mirror_bytes;
+        request.n_experts = engine->config.n_routed_experts;
+        request.safety_bytes = V4_GPU_PLAN_DEFAULT_SAFETY_BYTES;
+        plan_budget = request.budget_bytes > 0
+                          ? request.budget_bytes
+                          : free_bytes - request.safety_bytes;
+        if (plan_budget < 0) plan_budget = 0;
+        if (free_bytes > 0 && plan_budget > free_bytes)
+            plan_budget = free_bytes;
+        engine->gpu.plan_budget_bytes = plan_budget;
+        engine->gpu.plan_free_bytes = free_bytes;
+        dsv4_cuda_budget_set(device, plan_budget);
+        /* Both phases are decided once. On 8 GB they differ: prefill puts
+         * dense+attention on the card, decode keeps dense in RAM and spends
+         * the VRAM on mirrors. */
+        request.workload = V4_GPU_WORKLOAD_DECODE;
+        engine->gpu.plan_decode = v4_gpu_plan_decide(&request);
+        request.workload = V4_GPU_WORKLOAD_PREFILL;
+        engine->gpu.plan_prefill = v4_gpu_plan_decide(&request);
+        phase = engine->gpu.request_workload == V4_GPU_WORKLOAD_PREFILL
+                    ? V4_GPU_WORKLOAD_PREFILL
+                    : V4_GPU_WORKLOAD_DECODE;
+        active = phase == V4_GPU_WORKLOAD_PREFILL
+                     ? engine->gpu.plan_prefill
+                     : engine->gpu.plan_decode;
+        engine->gpu.plan_valid = 1;
+        engine->gpu.plan_dense = active.dense;
+        engine->gpu.plan_shared = active.shared;
+        engine->gpu.plan_bank = active.bank;
+        engine->gpu.plan_attn = active.attn;
+        engine->gpu.plan_mirror_slots = active.mirror_slots;
+        engine->gpu.plan_reserve_bytes = active.reserve_bytes;
+        g_v4_gpu_plan_bank = active.bank;
+        g_v4_gpu_plan_hybrid = active.hybrid;
+        g_v4_gpu_plan_reserve_mb = active.reserve_bytes >> 20;
+        if (!getenv("COLI_CUDA_ATTN_BATCH"))
+            coli_v4_gpu_attn_default = active.attn;
+        fprintf(stderr,
+                "v4_gpu plan device=%d budget=%lldMiB free=%lldMiB "
+                "decode={dense=%d attn=%d bank=%d mirrors=%d} "
+                "prefill={dense=%d attn=%d bank=%d mirrors=%d}\n",
+                device, plan_budget >> 20, free_bytes >> 20,
+                engine->gpu.plan_decode.dense,
+                engine->gpu.plan_decode.attn,
+                engine->gpu.plan_decode.bank,
+                engine->gpu.plan_decode.mirror_slots,
+                engine->gpu.plan_prefill.dense,
+                engine->gpu.plan_prefill.attn,
+                engine->gpu.plan_prefill.bank,
+                engine->gpu.plan_prefill.mirror_slots);
+    }
+    if (!engine->gpu.plan_valid)
+        v4_gpu_mirror_reserve_size(&engine->config,
+                                   !coli_v4_index_gguf(engine->target_index));
+    /* Routed-expert fp4 mirror cache hangs off the expert store. Its array
+     * is sized for the larger phase; the active limit is the current plan's
+     * mirror count. An explicit DSV4_CUDA_EXPERT_MIRRORS is a debug override. */
+    {
+        int mirror_capacity = engine->gpu.plan_decode.mirror_slots;
+        if (engine->gpu.plan_prefill.mirror_slots > mirror_capacity)
+            mirror_capacity = engine->gpu.plan_prefill.mirror_slots;
+        if (mirror_capacity < V4_GPU_PLAN_MIN_MIRRORS)
+            mirror_capacity = 0;
+        if (engine->experts && !engine->experts->gpu &&
+            (mirror_capacity > 0 || getenv("DSV4_CUDA_EXPERT_MIRRORS")))
+            engine->experts->gpu = v4_gpu_expert_mirrors_create(
+                device, mirror_capacity > 0 ? mirror_capacity
+                                            : V4_GPU_PLAN_MIN_MIRRORS);
+    }
+    g_v4_gpu_mirror_on = engine->experts && engine->experts->gpu ? 1 : 0;
+    if (engine->experts && engine->experts->gpu) {
+        V4GpuExpertMirrorCache *cache =
+            (V4GpuExpertMirrorCache *)engine->experts->gpu;
+        v4_gpu_expert_mirrors_set_dims(cache,
+            engine->config.num_hidden_layers,
+            engine->config.n_routed_experts);
+        v4_gpu_expert_mirrors_set_limit(cache,
+            engine->gpu.plan_mirror_slots);
+    }
+    fprintf(stderr, "v4_gpu tier=%s device=%d\n",
+            v4_gpu_dense_wanted(engine) ? "dense-matvec" : "expert-mirror",
+            device);
     return 0;
 }
 
@@ -11595,18 +11765,7 @@ void coli_v4_gpu_engine_close(ColiV4Engine *engine) {
      * banks. Callers outside generate() (oracle, teacher forcing, Segment
      * runs) never release them themselves. */
     coli_v4_gpu_moe_batch_release();
-    for (int layer = 0; layer < COLI_V4_RESIDENT_MAX_LAYERS; layer++) {
-        if (!engine->gpu.layer_ready[layer]) continue;
-        ColiDeepSeekV4LayerWeights *weights =
-            &engine->dense_resident.layers[layer];
-        for (size_t i = 0; i < weights->plan.tensor_count; i++) {
-            if (weights->gpu[i]) {
-                dsv4_cuda_tensor_free((Dsv4CudaTensor *)weights->gpu[i]);
-                weights->gpu[i] = NULL;
-            }
-        }
-        engine->gpu.layer_ready[layer] = 0;
-    }
+    v4_gpu_dense_release(engine);
     if (engine->experts && engine->experts->gpu) {
         v4_gpu_expert_mirrors_free(
             (V4GpuExpertMirrorCache *)engine->experts->gpu);
@@ -11818,18 +11977,38 @@ static void *v4_gpu_upload_gate_bias(ColiDeepSeekV4LayerWeights *weights,
     return tensor;
 }
 
+/* The placement plan decides whether the dense/attention mirrors live on the
+ * device; there is no second switch for it. Without a plan the historical
+ * default (dense on the device) stands. */
+static int v4_gpu_dense_wanted(const ColiV4Engine *engine) {
+    if (engine && engine->gpu.plan_valid)
+        return engine->gpu.plan_dense;
+    return 1;
+}
+
 int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
                              ColiDeepSeekV4LayerWeights *weights) {
     if (!engine || !weights || !engine->gpu.enabled) return 0;
+    int dense = v4_gpu_dense_wanted(engine);
+    /* Dense in RAM still uploads the shared experts when the prefill bank is
+     * asked for: dsv4_cuda_expert_bank_create takes them as its gate/up/down
+     * operands, and without them the bank refuses with "no shared-expert
+     * mirrors". Attention, router and the dense matvecs stay on the CPU. */
+    if (!dense && !coli_v4_gpu_moe_batch_wanted()) return 0;
     if (layer < 0 || layer >= COLI_V4_RESIDENT_MAX_LAYERS) return 0;
     if (engine->gpu.layer_ready[layer]) return 0;
-    static const char *const tensors[] = {
+    static const char *const dense_tensors[] = {
         "attn.wq_a", "attn.wq_b", "attn.wkv", "attn.wo_a", "attn.wo_b",
         "ffn.shared_experts.w1", "ffn.shared_experts.w2", "ffn.shared_experts.w3"
     };
+    static const char *const shared_tensors[] = {
+        "ffn.shared_experts.w1", "ffn.shared_experts.w2", "ffn.shared_experts.w3"
+    };
+    const char *const *tensors = dense ? dense_tensors : shared_tensors;
+    size_t n_tensors = dense ? sizeof(dense_tensors) / sizeof(dense_tensors[0]) : 3;
     long long bytes = 0;
     struct timespec _ts0; clock_gettime(CLOCK_MONOTONIC, &_ts0);
-    for (size_t i = 0; i < sizeof(tensors) / sizeof(tensors[0]); i++) {
+    for (size_t i = 0; i < n_tensors; i++) {
         /* With the batched attention path enabled, wo_a goes up as fp8-bf16
          * (fmt 9): the batched attention-output DeepGEMM needs the per-group
          * scale packing that format carries. Off by default so the decode
@@ -11844,6 +12023,7 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
             continue;
         }
     }
+    if (!dense) goto done;
     /* Compressor / indexer-compressor projection mirrors for the batched
      * attention path (COLI_CUDA_ATTN_BATCH=1). Missing tensors (layers
      * without compression) simply leave the mirror NULL. */
@@ -11919,6 +12099,7 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
         dsv4_cuda_tensor_free((Dsv4CudaTensor *)bias);
         bias = NULL;
     }
+done:
     engine->gpu.layer_ready[layer] = 1;
     engine->gpu.uploaded_bytes += bytes;
     struct timespec _ts1; clock_gettime(CLOCK_MONOTONIC, &_ts1);
@@ -11927,6 +12108,135 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
     fprintf(stderr, "v4_gpu layer=%d uploaded=%.3fMiB in %.3fs wall=%.0f\n", layer,
             bytes / 1048576.0, _dt, _wall);
     return 0;
+}
+
+/* ---- phase placement -------------------------------------------------
+ * The plan has a decode and a prefill shape. On 8 GB they cannot both be
+ * resident: prefill wants dense+attention on the card, decode wants the
+ * VRAM for expert mirrors. The session tells us which phase starts; this
+ * releases one side before loading the other. A prefill shorter than the
+ * threshold stays on the decode plan (dense in RAM): the 6.2 GiB upload
+ * would cost more than the tokens save. */
+static void v4_gpu_dense_release(ColiV4Engine *engine) {
+    if (!engine) return;
+    for (int layer = 0; layer < COLI_V4_RESIDENT_MAX_LAYERS; layer++) {
+        if (!engine->gpu.layer_ready[layer]) continue;
+        ColiDeepSeekV4LayerWeights *weights =
+            &engine->dense_resident.layers[layer];
+        for (size_t i = 0; i < weights->plan.tensor_count; i++) {
+            if (weights->gpu[i]) {
+                dsv4_cuda_tensor_free((Dsv4CudaTensor *)weights->gpu[i]);
+                weights->gpu[i] = NULL;
+            }
+        }
+        engine->gpu.layer_ready[layer] = 0;
+    }
+    engine->gpu.uploaded_bytes = 0;
+}
+
+static void v4_gpu_dense_upload(ColiV4Engine *engine) {
+    if (!engine || !engine->runtime.dense_resident) return;
+    for (int layer = 0; layer < COLI_V4_RESIDENT_MAX_LAYERS; layer++) {
+        if (layer >= engine->config.num_hidden_layers) break;
+        if (!engine->dense_resident.ready[layer]) {
+            /* Load now, before the first forward: layer_load uploads the
+             * mirrors itself when the active plan asks for them. Deferring
+             * this to target_batch interleaves a 100-150 MiB H2D copy with
+             * every layer's compute. */
+            ColiDeepSeekV4LayerWeights loaded;
+            char error[256] = {0};
+            if (coli_v4_layer_load(engine, &loaded, &engine->config,
+                                   engine->target_index, layer, error,
+                                   sizeof(error)))
+                continue;
+        }
+        if (!engine->gpu.layer_ready[layer])
+            coli_v4_gpu_layer_upload(engine, layer,
+                                     &engine->dense_resident.layers[layer]);
+    }
+}
+
+static void v4_gpu_apply_plan(ColiV4Engine *engine, const V4GpuPlan *plan) {
+    if (!engine || !plan) return;
+    engine->gpu.plan_dense = plan->dense;
+    engine->gpu.plan_shared = plan->shared;
+    engine->gpu.plan_bank = plan->bank;
+    engine->gpu.plan_attn = plan->attn;
+    engine->gpu.plan_mirror_slots = plan->mirror_slots;
+    engine->gpu.plan_reserve_bytes = plan->reserve_bytes;
+    g_v4_gpu_plan_bank = plan->bank;
+    g_v4_gpu_plan_hybrid = plan->hybrid;
+    g_v4_gpu_plan_reserve_mb = plan->reserve_bytes >> 20;
+    if (!getenv("COLI_CUDA_ATTN_BATCH"))
+        coli_v4_gpu_attn_default = plan->attn;
+    if (engine->experts && engine->experts->gpu)
+        v4_gpu_expert_mirrors_set_limit(
+            (V4GpuExpertMirrorCache *)engine->experts->gpu,
+            plan->mirror_slots);
+}
+
+void coli_v4_gpu_phase_begin(ColiV4Engine *engine, int prefill,
+                             int fresh_tokens) {
+    struct timespec phase_t0, phase_t1;
+    if (!engine || !engine->gpu.enabled || !engine->gpu.plan_valid) return;
+    if (engine->gpu.request_workload_set) {
+        if (prefill &&
+            engine->gpu.request_workload == V4_GPU_WORKLOAD_DECODE)
+            return;
+        if (!prefill &&
+            engine->gpu.request_workload == V4_GPU_WORKLOAD_PREFILL)
+            return;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &phase_t0);
+    if (prefill) {
+        if (fresh_tokens < V4_GPU_PLAN_PREFILL_MIN_TOKENS) return;
+        if (engine->gpu.plan_dense) {
+            v4_gpu_dense_upload(engine);
+            clock_gettime(CLOCK_MONOTONIC, &phase_t1);
+            fprintf(stderr,
+                    "v4_gpu phase=prefill tokens=%d dense=1 active "
+                    "used=%lldMiB switch=%.3fs\n",
+                    fresh_tokens,
+                    dsv4_cuda_budget_used(engine->gpu.device) >> 20,
+                    (phase_t1.tv_sec - phase_t0.tv_sec) +
+                        (phase_t1.tv_nsec - phase_t0.tv_nsec) * 1e-9);
+            return;
+        }
+        if (!engine->gpu.plan_prefill.dense &&
+            !engine->gpu.plan_prefill.shared)
+            return;
+        /* Dense upload needs the mirror VRAM; the decode set refills on
+         * demand after the prefill. */
+        coli_v4_gpu_moe_batch_release();
+        if (engine->experts && engine->experts->gpu)
+            v4_gpu_expert_mirrors_clear(
+                (V4GpuExpertMirrorCache *)engine->experts->gpu);
+        v4_gpu_apply_plan(engine, &engine->gpu.plan_prefill);
+        v4_gpu_dense_upload(engine);
+        clock_gettime(CLOCK_MONOTONIC, &phase_t1);
+        fprintf(stderr,
+                "v4_gpu phase=prefill tokens=%d dense=%d attn=%d bank=%d "
+                "mirrors=%d used=%lldMiB switch=%.3fs\n",
+                fresh_tokens, engine->gpu.plan_dense,
+                engine->gpu.plan_attn, engine->gpu.plan_bank,
+                engine->gpu.plan_mirror_slots,
+                dsv4_cuda_budget_used(engine->gpu.device) >> 20,
+                (phase_t1.tv_sec - phase_t0.tv_sec) +
+                    (phase_t1.tv_nsec - phase_t0.tv_nsec) * 1e-9);
+    } else {
+        coli_v4_gpu_moe_batch_release();
+        if (engine->gpu.plan_dense || engine->gpu.plan_shared) {
+            v4_gpu_dense_release(engine);
+            clock_gettime(CLOCK_MONOTONIC, &phase_t1);
+            fprintf(stderr,
+                    "v4_gpu phase=decode released dense used=%lldMiB "
+                    "switch=%.3fs\n",
+                    dsv4_cuda_budget_used(engine->gpu.device) >> 20,
+                    (phase_t1.tv_sec - phase_t0.tv_sec) +
+                        (phase_t1.tv_nsec - phase_t0.tv_nsec) * 1e-9);
+        }
+        v4_gpu_apply_plan(engine, &engine->gpu.plan_decode);
+    }
 }
 
 int coli_v4_gpu_fp8_matvec(const ColiTensorView *w, float *output,
@@ -12019,7 +12329,7 @@ int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
  * The 256-expert bank is fp4 in the same packed-nibble + per-row UE8M0
  * layout the backend dsv4_cuda_matvec_grouped expects, so an expert's gate /
  * up / down views can be uploaded byte-for-byte on first use and reused for
- * every token that routes to it. A small LRU cache keyed by (layer, expert)
+ * every token that routes to it. An SLRU cache keyed by (layer, expert)
  * hangs off ColiExpertStore.gpu, created at engine open and torn down in
  * engine close (before the store itself is destroyed). Only block_rows==1
  * views are attached; rows16-packed slots stay on the CPU kernel. */
@@ -12035,10 +12345,25 @@ typedef struct {
 struct V4GpuExpertMirrorCache {
     V4GpuExpertMirror *entries;
     int capacity;
+    int limit;      /* active plan's mirror count; capacity is the array size */
     int count;
     uint64_t clock;
     int device;
     pthread_mutex_t mutex;
+    /* SLRU over slots. slot_map is [n_layers][n_experts] -> slot; the two
+     * segments are probation (0) and protected (1), as in llama.cpp's
+     * llama-moe-cache.cpp. seen/seen_gen keep the current request's experts
+     * out of victim selection. NULL when dims were not set: linear fallback. */
+    int n_layers, n_experts;
+    int *slot_map;
+    int *key_of;
+    int *prev, *next;
+    int head[2], tail[2];
+    unsigned char *is_protected;
+    int n_protected;
+    uint32_t *seen;
+    uint32_t seen_gen;
+    int last_layer;
 };
 
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
@@ -12051,6 +12376,7 @@ static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
         return NULL;
     }
     cache->capacity = capacity;
+    cache->limit = capacity;
     cache->device = device;
     pthread_mutex_init(&cache->mutex, NULL);
     return cache;
@@ -12062,6 +12388,127 @@ static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create(int device,
     int capacity = setting ? atoi(setting) : suggested;
     if (capacity < 1) capacity = 1;
     return v4_gpu_expert_mirrors_create_capacity(device, capacity);
+}
+
+static void v4_gpu_expert_mirrors_slru_reset(
+        V4GpuExpertMirrorCache *cache) {
+    cache->count = 0;
+    cache->clock = 0;
+    cache->last_layer = -1;
+    cache->n_protected = 0;
+    cache->seen_gen = 1;
+    if (!cache->slot_map) return;
+    for (int i = 0; i < cache->n_layers * cache->n_experts; i++)
+        cache->slot_map[i] = -1;
+    for (int s = 0; s < cache->capacity; s++) {
+        cache->key_of[s] = -1;
+        cache->prev[s] = s - 1;
+        cache->next[s] = s + 1 < cache->capacity ? s + 1 : -1;
+        cache->is_protected[s] = 0;
+    }
+    cache->head[0] = cache->capacity > 0 ? 0 : -1;
+    cache->tail[0] = cache->capacity > 0 ? cache->capacity - 1 : -1;
+    cache->head[1] = cache->tail[1] = -1;
+    memset(cache->seen, 0, (size_t)cache->n_experts * sizeof(*cache->seen));
+}
+
+static void v4_gpu_expert_mirrors_set_dims(V4GpuExpertMirrorCache *cache,
+                                           int n_layers, int n_experts) {
+    if (!cache || n_layers < 1 || n_experts < 1) return;
+    free(cache->slot_map); free(cache->key_of);
+    free(cache->prev); free(cache->next);
+    free(cache->is_protected); free(cache->seen);
+    cache->slot_map = NULL; cache->key_of = NULL;
+    cache->prev = cache->next = NULL;
+    cache->is_protected = NULL; cache->seen = NULL;
+    cache->n_layers = n_layers; cache->n_experts = n_experts;
+    cache->slot_map = malloc((size_t)n_layers * n_experts *
+                             sizeof(*cache->slot_map));
+    cache->key_of = malloc((size_t)cache->capacity * sizeof(*cache->key_of));
+    cache->prev = malloc((size_t)cache->capacity * sizeof(*cache->prev));
+    cache->next = malloc((size_t)cache->capacity * sizeof(*cache->next));
+    cache->is_protected = malloc((size_t)cache->capacity *
+                                 sizeof(*cache->is_protected));
+    cache->seen = calloc((size_t)n_experts, sizeof(*cache->seen));
+    if (!cache->slot_map || !cache->key_of || !cache->prev || !cache->next ||
+        !cache->is_protected || !cache->seen) {
+        free(cache->slot_map); free(cache->key_of);
+        free(cache->prev); free(cache->next);
+        free(cache->is_protected); free(cache->seen);
+        cache->slot_map = NULL; cache->key_of = NULL;
+        cache->prev = cache->next = NULL;
+        cache->is_protected = NULL; cache->seen = NULL;
+        return;
+    }
+    v4_gpu_expert_mirrors_slru_reset(cache);
+}
+
+static void v4_gpu_expert_mirrors_slru_move(
+        V4GpuExpertMirrorCache *cache, int slot, int protect) {
+    int from = cache->is_protected[slot];
+    if (from == protect && slot == cache->tail[from]) return;
+    if (cache->prev[slot] >= 0)
+        cache->next[cache->prev[slot]] = cache->next[slot];
+    else
+        cache->head[from] = cache->next[slot];
+    if (cache->next[slot] >= 0)
+        cache->prev[cache->next[slot]] = cache->prev[slot];
+    else
+        cache->tail[from] = cache->prev[slot];
+    cache->prev[slot] = cache->tail[protect];
+    cache->next[slot] = -1;
+    if (cache->tail[protect] >= 0)
+        cache->next[cache->tail[protect]] = slot;
+    else
+        cache->head[protect] = slot;
+    cache->tail[protect] = slot;
+    cache->is_protected[slot] = (unsigned char)protect;
+    cache->n_protected += protect - from;
+}
+
+static void v4_gpu_expert_mirrors_slru_touch(
+        V4GpuExpertMirrorCache *cache, int slot) {
+    v4_gpu_expert_mirrors_slru_move(cache, slot, 1);
+    if (cache->n_protected > cache->limit / 2 && cache->head[1] >= 0)
+        v4_gpu_expert_mirrors_slru_move(cache, cache->head[1], 0);
+}
+
+static void v4_gpu_expert_mirrors_slru_note_layer(
+        V4GpuExpertMirrorCache *cache, int layer) {
+    if (!cache->seen) return;
+    if (cache->last_layer >= 0 && layer < cache->last_layer) {
+        if (++cache->seen_gen == 0) {
+            memset(cache->seen, 0,
+                   (size_t)cache->n_experts * sizeof(*cache->seen));
+            cache->seen_gen = 1;
+        }
+    }
+    cache->last_layer = layer;
+}
+
+static int v4_gpu_expert_mirrors_slru_victim(
+        V4GpuExpertMirrorCache *cache, int layer) {
+    for (int segment = 0; segment < 2; segment++) {
+        for (int slot = cache->head[segment]; slot >= 0;
+             slot = cache->next[slot]) {
+            if (slot >= cache->limit || slot >= cache->count) continue;
+            int key = cache->key_of[slot];
+            if (key < 0) return slot;
+            if (key / cache->n_experts == layer) continue;
+            if (cache->seen[key % cache->n_experts] == cache->seen_gen)
+                continue;
+            return slot;
+        }
+    }
+    return -1;
+}
+
+static void v4_gpu_expert_mirrors_slru_clear_slot(
+        V4GpuExpertMirrorCache *cache, int slot) {
+    int key = cache->key_of[slot];
+    if (key >= 0 && cache->slot_map)
+        cache->slot_map[key] = -1;
+    cache->key_of[slot] = -1;
 }
 
 static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache) {
@@ -12076,7 +12523,38 @@ static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache) {
     }
     pthread_mutex_destroy(&cache->mutex);
     free(cache->entries);
+    free(cache->slot_map); free(cache->key_of);
+    free(cache->prev); free(cache->next);
+    free(cache->is_protected); free(cache->seen);
     free(cache);
+}
+
+/* Drop every mirror but keep the array: a phase switch needs the VRAM now,
+ * and the next decode refills the slots on demand. */
+static void v4_gpu_expert_mirrors_clear(V4GpuExpertMirrorCache *cache) {
+    if (!cache) return;
+    pthread_mutex_lock(&cache->mutex);
+    for (int i = 0; i < cache->count; i++) {
+        if (cache->entries[i].gate)
+            dsv4_cuda_tensor_free(cache->entries[i].gate);
+        if (cache->entries[i].up)
+            dsv4_cuda_tensor_free(cache->entries[i].up);
+        if (cache->entries[i].down)
+            dsv4_cuda_tensor_free(cache->entries[i].down);
+        memset(&cache->entries[i], 0, sizeof(cache->entries[i]));
+    }
+    v4_gpu_expert_mirrors_slru_reset(cache);
+    pthread_mutex_unlock(&cache->mutex);
+}
+
+static void v4_gpu_expert_mirrors_set_limit(V4GpuExpertMirrorCache *cache,
+                                            int limit) {
+    if (!cache) return;
+    if (limit < 0) limit = 0;
+    if (limit > cache->capacity) limit = cache->capacity;
+    pthread_mutex_lock(&cache->mutex);
+    cache->limit = limit;
+    pthread_mutex_unlock(&cache->mutex);
 }
 
 static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
@@ -12092,16 +12570,49 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
      * smaller than that would recycle a slot still referenced by an earlier
      * view of the same token (measured: DSV4_CUDA_EXPERT_MIRRORS=1 produces
      * garbage). Below 8 entries, stay on the CPU. */
-    if (cache->capacity < 8) return -1;
+    if (cache->limit < 8) return -1;
     pthread_mutex_lock(&cache->mutex);
-    int found = -1;
+    int key = -1, found = -1;
+    int layer = view->key.layer, expert = view->key.expert;
+    if (cache->slot_map && layer >= 0 && layer < cache->n_layers &&
+        expert >= 0 && expert < cache->n_experts) {
+        key = layer * cache->n_experts + expert;
+        v4_gpu_expert_mirrors_slru_note_layer(cache, layer);
+        cache->seen[expert] = cache->seen_gen;
+        found = cache->slot_map[key];
+        if (found >= 0 && found < cache->capacity &&
+            cache->entries[found].layer == layer &&
+            cache->entries[found].expert == expert &&
+            cache->entries[found].gate && cache->entries[found].up &&
+            cache->entries[found].down) {
+            v4_gpu_expert_mirrors_slru_touch(cache, found);
+            cache->entries[found].clock = ++cache->clock;
+            view->gate.gpu = cache->entries[found].gate;
+            view->up.gpu = cache->entries[found].up;
+            view->down.gpu = cache->entries[found].down;
+            pthread_mutex_unlock(&cache->mutex);
+            return 0;
+        }
+        found = -1;
+    }
+    /* Dimension-less caches (or a stale map) fall back to the old scan. */
     for (int i = 0; i < cache->count; i++) {
-        if (cache->entries[i].layer == view->key.layer &&
-            cache->entries[i].expert == view->key.expert &&
+        if (cache->entries[i].layer == layer &&
+            cache->entries[i].expert == expert &&
             cache->entries[i].gate && cache->entries[i].up &&
             cache->entries[i].down) {
             found = i;
-            break;
+            if (cache->slot_map && key >= 0) {
+                cache->key_of[found] = key;
+                cache->slot_map[key] = found;
+                v4_gpu_expert_mirrors_slru_touch(cache, found);
+            }
+            cache->entries[found].clock = ++cache->clock;
+            view->gate.gpu = cache->entries[found].gate;
+            view->up.gpu = cache->entries[found].up;
+            view->down.gpu = cache->entries[found].down;
+            pthread_mutex_unlock(&cache->mutex);
+            return 0;
         }
     }
     if (found < 0) {
@@ -12110,7 +12621,7 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
          * bank(s) + attention buffers). Below the reserve, recycle the LRU
          * slot instead of growing — decode keeps its hottest experts and
          * the next large prefill still fits. */
-        int grow = cache->count < cache->capacity;
+        int grow = cache->count < cache->limit;
         /* fp4 nibbles plus one UE8M0 scale per 32, as uploaded */
         long long elements = (long long)view->gate.rows * view->gate.columns +
                              (long long)view->up.rows * view->up.columns +
@@ -12197,11 +12708,20 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
             return -1;
         }
         int appended = 0;   /* a new slot, not a recycled one (grown_bytes) */
-        if (!grow || cache->count >= cache->capacity) {
-            found = 0;
-            for (int i = 1; i < cache->count; i++)
-                if (cache->entries[i].clock < cache->entries[found].clock)
-                    found = i;
+        if (!grow || cache->count >= cache->limit) {
+            if (cache->slot_map) {
+                found = v4_gpu_expert_mirrors_slru_victim(cache, layer);
+                if (found < 0) {
+                    pthread_mutex_unlock(&cache->mutex);
+                    return -1;
+                }
+                v4_gpu_expert_mirrors_slru_clear_slot(cache, found);
+            } else {
+                found = 0;
+                for (int i = 1; i < cache->count; i++)
+                    if (cache->entries[i].clock < cache->entries[found].clock)
+                        found = i;
+            }
             /* RECYCLE IN PLACE: every routed expert has the same shape, so
              * refill the victim's device buffers (pinned DMA) instead of
              * cudaFree + cudaMalloc + pageable copy x3 — at long context
@@ -12227,6 +12747,12 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                 cache->entries[found].layer = view->key.layer;
                 cache->entries[found].expert = view->key.expert;
                 cache->entries[found].clock = ++cache->clock;
+                if (cache->slot_map && key >= 0) {
+                    cache->key_of[found] = key;
+                    cache->slot_map[key] = found;
+                    cache->seen[expert] = cache->seen_gen;
+                    v4_gpu_expert_mirrors_slru_move(cache, found, 0);
+                }
                 view->gate.gpu = cache->entries[found].gate;
                 view->up.gpu = cache->entries[found].up;
                 view->down.gpu = cache->entries[found].down;
@@ -12283,10 +12809,14 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
              * uploaded again), or win the LRU pick and make the recycle
              * allocate on the full card again. The card counts as full
              * until the next probe. */
-            if (found == cache->count - 1)
+            if (cache->slot_map) {
+                v4_gpu_expert_mirrors_slru_clear_slot(cache, found);
+                if (appended) cache->count--;
+            } else if (found == cache->count - 1) {
                 cache->count--;
-            else
+            } else {
                 cache->entries[found] = cache->entries[--cache->count];
+            }
             last_free_mb = 0;
             upload_failed = 1;
             grown_bytes = 0;
@@ -12297,6 +12827,12 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
         cache->entries[found].gate = gate;
         cache->entries[found].up = up;
         cache->entries[found].down = down;
+        if (cache->slot_map && key >= 0) {
+            cache->key_of[found] = key;
+            cache->slot_map[key] = found;
+            cache->seen[expert] = cache->seen_gen;
+            v4_gpu_expert_mirrors_slru_move(cache, found, 0);
+        }
     }
     cache->entries[found].clock = ++cache->clock;
     view->gate.gpu = cache->entries[found].gate;
@@ -12332,7 +12868,7 @@ int coli_v4_gpu_expert_drain(ColiExpertStore *store) {
 }
 
 /* Lookup-only twin of attach: report whether {layer, expert} is already
- * mirrored, touching its LRU stamp, but NEVER uploading on a miss. The
+ * mirrored, touching its SLRU stamp, but NEVER uploading on a miss. The
  * hybrid decode split peeks the whole token first and decides its uploads
  * afterwards with the q* policy, instead of paying a blocking PCIe copy per
  * miss the moment it is discovered. */
@@ -12375,6 +12911,9 @@ int coli_v4_gpu_dspark_mirrors_ensure(ColiV4Engine *engine) {
     engine->gpu.dspark_mirrors =
         v4_gpu_expert_mirrors_create_capacity(engine->gpu.device, capacity);
     if (!engine->gpu.dspark_mirrors) return -1;
+    v4_gpu_expert_mirrors_set_dims(
+        (V4GpuExpertMirrorCache *)engine->gpu.dspark_mirrors,
+        engine->config.num_hidden_layers, engine->config.n_routed_experts);
     fprintf(stderr, "v4_gpu dspark-mirrors device=%d cap=%d\n",
             engine->gpu.device, capacity);
     return 0;
@@ -12398,11 +12937,11 @@ int coli_v4_gpu_dspark_mirrors_ensure(ColiV4Engine *engine) {
  * mirror, backend stub — falls back to the CPU union for the whole
  * generation. */
 int coli_v4_gpu_moe_batch_wanted(void) {
+    const char *setting = getenv("COLI_CUDA_MOE_BATCH");
+    if (setting) return atoi(setting) != 0;   /* debug override */
+    if (g_v4_gpu_plan_bank >= 0) return g_v4_gpu_plan_bank;
     static int wanted = -1;
-    if (wanted < 0) {
-        const char *setting = getenv("COLI_CUDA_MOE_BATCH");
-        wanted = setting && atoi(setting) != 0;
-    }
+    if (wanted < 0) wanted = 0;
     return wanted;
 }
 
@@ -12537,6 +13076,7 @@ static long long v4_gpu_mirror_reserve_explicit_mb(void) {
 static long long v4_gpu_mirror_reserve_mb(int live) {
     long long explicit_mb = v4_gpu_mirror_reserve_explicit_mb();
     if (explicit_mb >= 0) return explicit_mb;
+    if (g_v4_gpu_plan_reserve_mb >= 0) return g_v4_gpu_plan_reserve_mb;
     return coli_v4_mirror_reserve_mb(
         v4_reserve_bank_bytes,
         v4_bank_double_usable() ? 2 : 1,
@@ -14546,6 +15086,7 @@ static void v4_cu_close(void) {
 
 static void v4_vk_open(const ColiV4Engine *engine) {
 #ifdef COLI_VULKAN
+    if (engine->gpu.request_off) return;
     v4_vk_device_open(engine);      /* opened already when the RAM plan asked */
     g_v4_vk_engine = engine;
     ColiV4Engine *mut = (ColiV4Engine *)engine;
@@ -15455,6 +15996,13 @@ typedef struct {
     int stop_sentence;
     int no_dspark;
     double memory_gib;
+    int gpu_off;
+    int gpu_device;
+    int gpu_device_set;
+    double vram_gib;
+    int workload;
+    int workload_set;
+    int backend;
     ColiDeepSeekV4PromptMode prompt_mode;
 } V4CliOptions;
 
@@ -15465,6 +16013,10 @@ static void v4_cli_usage(FILE *stream, const char *program) {
         "       %s MODEL --oracle FILE [--teacher-forcing N] [--greedy N] [options]\n"
         "  --max-tokens N       maximum generated tokens (default: 128)\n"
         "  --memory-gb GiB      cap this process; otherwise use available RAM\n"
+        "  --gpu auto|none|N    device tier: auto (default), none, or ordinal\n"
+        "  --vram GiB           total VRAM budget for dense, bank and mirrors\n"
+        "  --workload MODE      auto|decode|prefill (default: auto; decode/prefill pin the phase)\n"
+        "  --backend MODE       auto|hip|vulkan|cpu (default: auto; HIP first, Vulkan fallback)\n"
         "  --prompt-file PATH   read UTF-8 prompt from file (avoids argv encoding issues)\n"
         "  --system TEXT        optional system message\n"
         "  --thinking           enable the official V4 thinking prefix\n"
@@ -15553,6 +16105,50 @@ static int v4_cli_parse(int argc, char **argv, V4CliOptions *options) {
         } else if (!strcmp(option, "--memory-gb")) {
             if (++i == argc || v4_cli_memory(argv[i], &options->memory_gib))
                 return -1;
+        } else if (!strcmp(option, "--gpu")) {
+            if (++i == argc || !argv[i][0]) return -1;
+            if (!strcmp(argv[i], "none")) {
+                options->gpu_off = 1;
+                options->gpu_device_set = 0;
+            } else if (!strcmp(argv[i], "auto")) {
+                options->gpu_off = 0;
+                options->gpu_device_set = 0;
+            } else {
+                char *end = NULL;
+                long value = strtol(argv[i], &end, 10);
+                if (end == argv[i] || *end || value < 0 || value > 64)
+                    return -1;
+                options->gpu_off = 0;
+                options->gpu_device = (int)value;
+                options->gpu_device_set = 1;
+            }
+        } else if (!strcmp(option, "--vram")) {
+            char *end = NULL;
+            double value;
+            if (++i == argc) return -1;
+            value = strtod(argv[i], &end);
+            if (!argv[i][0] || end == argv[i] || *end ||
+                value < 0.0 || value > 1048576.0)
+                return -1;
+            options->vram_gib = value;
+        } else if (!strcmp(option, "--workload")) {
+            if (++i == argc) return -1;
+            if (!strcmp(argv[i], "auto")) options->workload = 0;
+            else if (!strcmp(argv[i], "decode")) options->workload = 1;
+            else if (!strcmp(argv[i], "prefill")) options->workload = 2;
+            else return -1;
+            options->workload_set = 1;
+        } else if (!strcmp(option, "--backend")) {
+            if (++i == argc) return -1;
+            if (!strcmp(argv[i], "auto")) options->backend = COLI_V4_GPU_BACKEND_AUTO;
+            else if (!strcmp(argv[i], "hip")) options->backend = COLI_V4_GPU_BACKEND_HIP;
+            else if (!strcmp(argv[i], "vulkan")) options->backend = COLI_V4_GPU_BACKEND_VULKAN;
+            else if (!strcmp(argv[i], "cpu")) options->backend = COLI_V4_GPU_BACKEND_CPU;
+            else return -1;
+            if (options->backend == COLI_V4_GPU_BACKEND_CPU)
+                options->gpu_off = 1;
+            else if (!options->gpu_off)
+                options->gpu_off = 0;
         } else if (!strcmp(option, "--prompt-file")) {
             if (++i == argc || !argv[i][0]) return -1;
             options->prompt_file = argv[i];
@@ -16401,6 +16997,12 @@ static int session_generate_impl(ColiV4Session *session,
     }
     int tail_rows = fresh;
     int done_upto = reuse;
+#ifdef COLI_V4_GPU_TIER
+    /* The 8 GB plan is phase-shaped: long prefill wants dense+attention on
+     * the card, decode wants the VRAM for mirrors. A short prompt keeps the
+     * decode plan. */
+    coli_v4_gpu_phase_begin(engine, 1, fresh);
+#endif
     while (done_upto < prompt_count) {
         int seg = prompt_count - done_upto;
         if (seg > v4_prefill_segment) seg = v4_prefill_segment;
@@ -16472,10 +17074,9 @@ static int session_generate_impl(ColiV4Session *session,
         !v4_ckpt_have(session->prompt_ids, prompt_count))
         v4_ckpt_store(session, prompt_count, 1);
 #ifdef COLI_V4_GPU_TIER
-    /* Decode never touches the expert bank; free it (up to 3.4 GiB) so the
-     * decode expert mirrors get the VRAM instead (bank re-creates on the next
-     * large prefill). */
-    coli_v4_gpu_moe_batch_release();
+    /* Decode never touches the expert bank; free it and put the decode
+     * shape back (dense in RAM on 8 GB, mirrors for the tokens). */
+    coli_v4_gpu_phase_begin(engine, 0, 0);
 #endif
     session->state = state;
     session->next = next;
@@ -17906,7 +18507,66 @@ static void v4_serve_mux(ColiV4Engine *engine, ColiV4Session **sessions, int n) 
     free(row_slot); free(rows); free(requests);
 }
 
-static int v4_serve_main(void) {
+/* Serve mode keeps the model from SNAP and the cap as argv[1]; the placement
+ * flags are the same four the text CLI accepts. They are parsed here rather
+ * than read from the environment so `coli serve --vram/--gpu/--workload/
+ * --backend` reaches the native engine instead of being a silent no-op. */
+static int v4_serve_options(int argc, char **argv, ColiV4EngineOpenOptions *options) {
+    for (int i = 2; i < argc; i++) {
+        const char *option = argv[i];
+        if (!strcmp(option, "--gpu")) {
+            if (++i == argc || !argv[i][0]) return -1;
+            if (!strcmp(argv[i], "none")) {
+                options->gpu_off = 1;
+                options->gpu_device_set = 0;
+            } else if (!strcmp(argv[i], "auto")) {
+                options->gpu_off = 0;
+                options->gpu_device_set = 0;
+            } else {
+                char *end = NULL;
+                long device = strtol(argv[i], &end, 10);
+                if (end == argv[i] || *end || device < 0 || device > 64)
+                    return -1;
+                options->gpu_off = 0;
+                options->gpu_device = (int)device;
+                options->gpu_device_set = 1;
+            }
+        } else if (!strcmp(option, "--vram")) {
+            char *end = NULL;
+            double gib;
+            if (++i == argc) return -1;
+            gib = strtod(argv[i], &end);
+            if (!argv[i][0] || end == argv[i] || *end ||
+                gib < 0.0 || gib > 1048576.0)
+                return -1;
+            options->gpu_budget_bytes =
+                gib > 0.0 ? (uint64_t)(gib * 1073741824.0) : 0;
+        } else if (!strcmp(option, "--workload")) {
+            if (++i == argc) return -1;
+            if (!strcmp(argv[i], "auto")) options->gpu_workload = 0;
+            else if (!strcmp(argv[i], "decode")) options->gpu_workload = 1;
+            else if (!strcmp(argv[i], "prefill")) options->gpu_workload = 2;
+            else return -1;
+            options->gpu_workload_set = 1;
+        } else if (!strcmp(option, "--backend")) {
+            if (++i == argc) return -1;
+            if (!strcmp(argv[i], "auto")) options->gpu_backend = COLI_V4_GPU_BACKEND_AUTO;
+            else if (!strcmp(argv[i], "hip")) options->gpu_backend = COLI_V4_GPU_BACKEND_HIP;
+            else if (!strcmp(argv[i], "vulkan")) options->gpu_backend = COLI_V4_GPU_BACKEND_VULKAN;
+            else if (!strcmp(argv[i], "cpu")) options->gpu_backend = COLI_V4_GPU_BACKEND_CPU;
+            else return -1;
+            if (options->gpu_backend == COLI_V4_GPU_BACKEND_CPU)
+                options->gpu_off = 1;
+            else if (!options->gpu_off)
+                options->gpu_off = 0;
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int v4_serve_main(int argc, char **argv) {
     const char *model_dir = getenv("SNAP");
     if (!model_dir || !*model_dir) {
         fprintf(stderr, "set SNAP=<DeepSeek V4 model directory>\n");
@@ -17936,6 +18596,13 @@ static int v4_serve_main(void) {
         .pin_slots_per_layer = -1,
         .no_dspark = n > 1,   /* several conversations: nothing drafts */
     };
+    if (v4_serve_options(argc, argv, &open_options)) {
+        fprintf(stderr, "usage: %s CAP [--gpu auto|none|N] [--vram GiB] "
+                        "[--workload auto|decode|prefill] "
+                        "[--backend auto|hip|vulkan|cpu]\n",
+                argc ? argv[0] : "deepseek-v4");
+        return 2;
+    }
     const char *ram = getenv("RAM_GB");
     if (ram && atof(ram) > 0.0)
         open_options.memory_limit_bytes =
@@ -18132,7 +18799,7 @@ int main(int argc, char **argv) {
                 omp_get_max_threads());
 #endif
     if (getenv("SERVE") && getenv("SERVE")[0] == '1')
-        return v4_serve_main();
+        return v4_serve_main(argc, argv);
     double process_started = spec_now();
     int result = 1;
     V4CliOptions cli;
@@ -18178,6 +18845,20 @@ int main(int argc, char **argv) {
             /* Same contract as v4_serve_main: CTX sets the session plan;
              * unset or invalid falls back to the engine default (4096). */
             .context_tokens = getenv("CTX") ? atoi(getenv("CTX")) : 0,
+            .gpu_off = cli.gpu_off,
+            .gpu_device = cli.gpu_device,
+            .gpu_device_set = cli.gpu_device_set,
+            .gpu_budget_bytes = cli.vram_gib > 0.0
+                                    ? (uint64_t)(cli.vram_gib * 1073741824.0)
+                                    : 0,
+            /* One generated token means the prompt is the workload; the
+             * default generation is decode-first. An explicit --workload
+             * always wins. */
+            .gpu_workload = cli.workload
+                                ? cli.workload
+                                : (cli.max_new_tokens <= 1 ? 2 : 1),
+            .gpu_workload_set = cli.workload_set,
+            .gpu_backend = cli.backend,
         };
         if (cli.memory_gib > 0.0)
             open_opts.memory_limit_bytes =

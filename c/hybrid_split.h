@@ -3,7 +3,7 @@
  * test the decisions on machines with no GPU at all; each engine's wiring
  * stays in its own file behind its own opt-in switch.
  *
- * DSV4 hybrid decode split (DSV4_HYBRID=1): of m experts missing from the
+ * DSV4 hybrid decode split (V4GpuPlan.hybrid): of m experts missing from the
  * VRAM mirrors, upload-and-run q* = m * B_P / B_H on the GPU and compute the
  * rest on the host, so the transfer branch and the host branch finish
  * together (derivation in the function comment below).

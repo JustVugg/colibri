@@ -64,6 +64,10 @@ int dsv4_cuda_fp8_ref_matmul(int device,const uint8_t *w,const float *bscale,
 int dsv4_cuda_backend_arch_ok(int device);
 const char *dsv4_cuda_backend_name(void);
 long long dsv4_cuda_mem_free_mb(int device);
+/* Plan budget for long-lived device objects (weights, bank, KV, activations).
+ * 0 disables the check. dsv4_cuda_budget_used is the charged total. */
+void dsv4_cuda_budget_set(int device,long long bytes);
+long long dsv4_cuda_budget_used(int device);
 /* 1 on unified-memory devices (integrated GPU, or pageable access through the
  * host page tables), where mem_free_mb is the system's free memory rather
  * than headroom on a card. 0 when unknown. */

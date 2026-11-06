@@ -1,23 +1,17 @@
-/* backend_loader_dsv4.c — Windows runtime loader for the DeepSeek V4 CUDA backend DLL.
+/* backend_loader_dsv4.c — runtime loader for the DeepSeek V4 GPU tier.
  *
- * Why this exists: deepseek-v4.exe is built with MinGW-w64 (gcc), but the
- * DeepSeek V4 CUDA kernels in backend_cuda_dsv4.cu must be compiled with
- * MSVC + nvcc. The MSVC/MinGW ABI split means we cannot link a CUDA .o into a
- * gcc binary, so the kernels are built into a standalone coli_cuda_dsv4.dll
- * (nvcc + MSVC, symbols exported via dsv4.def) and resolved here at runtime
- * through LoadLibrary/GetProcAddress. The host never links cudart directly.
+ * Windows: the engine is MinGW-built (gcc) while the kernels need MSVC +
+ * nvcc, so backend_cuda_dsv4.cu becomes coli_cuda_dsv4.dll and is resolved
+ * through LoadLibrary/GetProcAddress. POSIX HIP: the same source becomes
+ * coli_gpu_dsv4.so, loaded with dlopen; the host links neither cudart nor
+ * amdhip64, so a machine without ROCm still starts on the CPU.
  *
- * This mirrors backend_loader.c, which does the same for the GLM engine's
- * coli_cuda.dll. The two loaders are separate files on purpose: the dsv4 ABI
- * (dsv4_cuda_*) is entirely different from the GLM ABI (coli_cuda_*), and the
- * dsv4 host is a different executable that must be able to load the V4 backend
- * even when the GLM backend is absent.
+ * The two loaders (this and backend_loader.c for the GLM ABI) stay separate:
+ * the dsv4 ABI is different, and the dsv4 host must be able to load its
+ * backend even when the GLM one is absent.
  *
- * On non-Windows builds this file is not compiled (the Makefile.deepseek-v4
- * links backend_cuda_dsv4.o directly). If the DLL is absent, every wrapper
- * safely returns the "not initialized" sentinel and the engine falls back to
- * CPU — the same contract the raw backend_cuda_dsv4.h functions have when no
- * CUDA device is present.
+ * If the library is absent, every wrapper returns the "not initialized"
+ * sentinel the engine already handles, and the engine falls back to CPU.
  *
  * ABI note: Dsv4CudaTensor/Dsv4CudaActivation/Dsv4CudaKvCache/Dsv4CudaExpertSet/
  * Dsv4CudaGraph are opaque to the host (it stores the pointer, never dereferences
@@ -25,6 +19,8 @@
  * scalar types (int, float, pointers, long long) agree between MSVC and
  * MinGW-w64 on x86-64.
  */
+#if defined(_WIN32) || defined(COLI_DSV4_DLOPEN)
+
 #ifdef _WIN32
 
 #include <stdio.h>
@@ -34,6 +30,54 @@
 
 #include <windows.h>
 
+#else  /* COLI_DSV4_DLOPEN */
+
+#include <stdio.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include <dlfcn.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include <limits.h>
+
+/* The same loader body the Windows build uses, over the POSIX equivalents.
+ * The host still stores opaque Dsv4Cuda* pointers, so the ABI is unchanged. */
+typedef void *HMODULE;
+typedef unsigned long DWORD;
+#ifndef MAX_PATH
+#define MAX_PATH PATH_MAX
+#endif
+#define INVALID_FILE_ATTRIBUTES ((DWORD)-1)
+#define LOAD_WITH_ALTERED_SEARCH_PATH 0
+#define LOAD_LIBRARY_SEARCH_APPLICATION_DIR 0
+#define LOAD_LIBRARY_SEARCH_SYSTEM32 0
+#define ERROR_MOD_NOT_FOUND 126
+#define ERROR_BAD_EXE_FORMAT 193
+static HMODULE LoadLibraryExA(const char *name, void *reserved, unsigned long flags) {
+    (void)reserved; (void)flags;
+    return (HMODULE)dlopen(name, RTLD_NOW | RTLD_LOCAL);
+}
+#define GetProcAddress dlsym
+#define FreeLibrary dlclose
+static DWORD GetLastError(void) { return (DWORD)errno; }
+static DWORD GetModuleFileNameA(void *module, char *buffer, DWORD size) {
+    (void)module;
+    if (!buffer || size < 2) return 0;
+    ssize_t n = readlink("/proc/self/exe", buffer, (size_t)size - 1);
+    if (n < 0) return 0;
+    buffer[n] = '\0';
+    return (DWORD)n;
+}
+static DWORD GetFileAttributesA(const char *path) {
+    struct stat st;
+    return path && stat(path, &st) == 0 ? 0 : INVALID_FILE_ATTRIBUTES;
+}
+#define DSV4_PATH_SEP '/'
+
+#endif
+
 #include "backend_cuda_dsv4.h"
 
 /* Two builds of the same source ship side by side: coli_cuda_dsv4_dg.dll
@@ -42,9 +86,29 @@
  * it whether the device fits (dsv4_cuda_backend_arch_ok); on refusal it
  * unloads and takes the generic one, so one install adapts to whatever GPU
  * is present. COLI_DSV4_DLL=<file name> forces a specific DLL. */
+#ifdef _WIN32
 #define DSV4_BACKEND_DLL "coli_cuda_dsv4.dll"
 #define DSV4_BACKEND_DLL_DG "coli_cuda_dsv4_dg.dll"
 #define DSV4_VENDOR_TAG  "[DSV4 CUDA]"
+#define DSV4_PATH_SEP    '\\'
+#define DSV4_ERR_LABEL   "Windows error"
+#define DSV4_NOT_PRESENT "not in the engine's folder (the Windows CUDA package carries it)"
+#define DSV4_NEEDS       "present, but a DLL it needs is missing (cudart64_12.dll beside it, or the NVIDIA driver's nvcuda.dll)"
+#define DSV4_NO_USABLE   "no usable backend DLL"
+#define DSV4_GPU_HINT    "The DLLs need an sm_80+ GPU (Ampere or newer); Pascal and Turing take a build with CUDA_ARCH=portable-pre-ampere NO_TC=1 (docs/deepseek-v4.md)."
+#else
+#define DSV4_BACKEND_DLL "coli_gpu_dsv4.so"
+#define DSV4_BACKEND_DLL_DG "coli_gpu_dsv4_dg.so"
+#define DSV4_VENDOR_TAG  "[DSV4 HIP]"
+#define DSV4_ERR_LABEL   "errno"
+#define DSV4_NOT_PRESENT "not beside the engine (build the native tier with make -C c deepseek-v4 HIP=1)"
+#define DSV4_NEEDS       "present, but a shared library it needs is missing"
+#define DSV4_NO_USABLE   "no usable backend .so"
+#define DSV4_GPU_HINT    "The native HIP tier needs a gfx target the .so was built for (HIP_ARCH), and the CPU path remains active without it."
+#ifndef DSV4_PATH_SEP
+#define DSV4_PATH_SEP '/'
+#endif
+#endif
 
 /* Function-pointer typedefs matching each exported symbol in dsv4.def. */
 typedef int             (*fn_init)(const int *devices, int count);
@@ -170,6 +234,8 @@ typedef int             (*fn_fp8_ref_matmul)(int device, const uint8_t *w, const
 typedef int             (*fn_tensor_refill_fp4)(Dsv4CudaTensor *t, const uint8_t *w, const uint8_t *scale,
                                                 int O, int I, int sync);
 typedef int             (*fn_backend_arch_ok)(int device);
+typedef void            (*fn_budget_set)(int device, long long bytes);
+typedef long long       (*fn_budget_used)(int device);
 typedef const char     *(*fn_backend_name)(void);
 typedef long long       (*fn_mem_free_mb)(int device);
 typedef int             (*fn_device_unified)(int device);
@@ -312,6 +378,8 @@ static struct {
     fn_fp8_ref_matmul fp8_ref_matmul;
     fn_tensor_refill_fp4 tensor_refill_fp4;
     fn_backend_arch_ok backend_arch_ok;   /* optional */
+    fn_budget_set budget_set;             /* optional: older DLLs do not charge */
+    fn_budget_used budget_used;           /* optional */
     fn_backend_name backend_name;         /* optional */
     char loaded_name[64];
     fn_mem_free_mb mem_free_mb;
@@ -361,7 +429,7 @@ static HMODULE dsv4_load_one(const char *name, int *present){
     *present = 0;
     DWORD mn = GetModuleFileNameA(NULL, dllpath, (DWORD)sizeof(dllpath));
     if(mn > 0 && mn < sizeof(dllpath)){
-        char *slash = strrchr(dllpath, '\\');
+        char *slash = strrchr(dllpath, DSV4_PATH_SEP);
         if(slash && (size_t)(slash + 1 - dllpath) + strlen(name) + 1 <= sizeof(dllpath)){
             strcpy(slash + 1, name);
             *present = GetFileAttributesA(dllpath) != INVALID_FILE_ATTRIBUTES;
@@ -392,10 +460,11 @@ static int dsv4_cuda_load(void){
         g_dsv4.dll = dsv4_load_one(candidates[i], &present);
         if(!g_dsv4.dll){
             DWORD err = GetLastError();
-            int w = snprintf(why + wn, sizeof(why) - wn, "%s%s: %s (Windows error %lu)", wn ? "; " : "", candidates[i],
-                             !present ? "not in the engine's folder (the Windows CUDA package carries it)"
-                             : err == ERROR_MOD_NOT_FOUND ? "present, but a DLL it needs is missing (cudart64_12.dll beside it, or the NVIDIA driver's nvcuda.dll)"
-                             : err == ERROR_BAD_EXE_FORMAT ? "not a 64-bit DLL" : "not loadable", (unsigned long)err);
+            int w = snprintf(why + wn, sizeof(why) - wn, "%s%s: %s (%s %lu)", wn ? "; " : "", candidates[i],
+                             !present ? DSV4_NOT_PRESENT
+                             : err == ERROR_MOD_NOT_FOUND ? DSV4_NEEDS
+                             : err == ERROR_BAD_EXE_FORMAT ? "wrong ELF/DLL class" : "not loadable",
+                             DSV4_ERR_LABEL, (unsigned long)err);
             if(w > 0 && (size_t)w < sizeof(why) - wn) wn += (size_t)w;
             continue;
         }
@@ -421,9 +490,8 @@ static int dsv4_cuda_load(void){
         g_dsv4.available = 1;
         return 1;
     }
-    fprintf(stderr, DSV4_VENDOR_TAG " no usable backend DLL (%s); GPU tier disabled (CPU path remains active). "
-                    "The DLLs need an sm_80+ GPU (Ampere or newer); Pascal and Turing take a build with "
-                    "CUDA_ARCH=portable-pre-ampere NO_TC=1 (docs/deepseek-v4.md).\n",
+    fprintf(stderr, DSV4_VENDOR_TAG " " DSV4_NO_USABLE " (%s); GPU tier disabled (CPU path remains active). "
+                    DSV4_GPU_HINT "\n",
             wn ? why : DSV4_BACKEND_DLL_DG " / " DSV4_BACKEND_DLL);
     return 0;
 }
@@ -523,6 +591,8 @@ static int dsv4_cuda_resolve(const char *dllname){
     _Pragma("GCC diagnostic ignored \"-Wcast-function-type\"")
     g_dsv4.backend_arch_ok = (fn_backend_arch_ok)GetProcAddress(g_dsv4.dll, "dsv4_cuda_backend_arch_ok");
     g_dsv4.device_unified = (fn_device_unified)GetProcAddress(g_dsv4.dll, "dsv4_cuda_device_unified");
+    g_dsv4.budget_set = (fn_budget_set)GetProcAddress(g_dsv4.dll, "dsv4_cuda_budget_set");
+    g_dsv4.budget_used = (fn_budget_used)GetProcAddress(g_dsv4.dll, "dsv4_cuda_budget_used");
     /* optional: an older DLL without the export keeps the whole tier alive;
      * the engine probes this and simply stays on synchronous attaches. */
     g_dsv4.stream_drain = (fn_stream_drain)GetProcAddress(g_dsv4.dll, "dsv4_cuda_stream_drain");
@@ -881,6 +951,15 @@ int dsv4_cuda_device_unified(int device){
     return g_dsv4.device_unified(device);
 }
 
+void dsv4_cuda_budget_set(int device, long long bytes){
+    if(g_dsv4.available && g_dsv4.budget_set) g_dsv4.budget_set(device, bytes);
+}
+
+long long dsv4_cuda_budget_used(int device){
+    if(!g_dsv4.available || !g_dsv4.budget_used) return 0;
+    return g_dsv4.budget_used(device);
+}
+
 int dsv4_cuda_stream_drain(int device){
     /* Without the DLL there is never in-flight DMA to wait for, so a drain
      * trivially succeeds. With an older DLL that lacks the export, report
@@ -1091,4 +1170,4 @@ int dsv4_cuda_tensor_device(const Dsv4CudaTensor *t){
     return g_dsv4.tensor_device(t);
 }
 
-#endif /* _WIN32 */
+#endif /* _WIN32 || COLI_DSV4_DLOPEN */

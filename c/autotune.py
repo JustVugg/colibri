@@ -415,7 +415,8 @@ def run_tune(engine: str, cap: int, base_env: dict, plan: dict, model: str,
              tokens: int = 16, repeats: int = 2, timeout: int = 900,
              min_gain: float = 0.03, profile_dir: str | None = None,
              progress=None, family=None, engine_cls=None,
-             prompts=None, explicit_resources=()) -> tuple[dict, Path]:
+             prompts=None, explicit_resources=(),
+             engine_args=None) -> tuple[dict, Path]:
     """Coordinate-descent tuning with a reverse-order confirmation gate."""
     progress = progress or (lambda _message: None)
     if cap is None:
@@ -488,7 +489,8 @@ def run_tune(engine: str, cap: int, base_env: dict, plan: dict, model: str,
                 env = dict(base_env)
                 env.update(overlay)
                 env["COLI_TEMP"] = "0"
-                served = engine_cls(engine, model, launch_cap, tokens, env, 1, family)
+                served = engine_cls(engine, model, launch_cap, tokens, env, 1, family,
+                                    engine_args=engine_args)
                 samples = []
                 try:
                     # Keep this engine alive for the whole candidate. `repeats`

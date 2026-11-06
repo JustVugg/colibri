@@ -540,7 +540,36 @@ def operator_cap(a, arch):
         cap=0
     return cap if cap else None
 
+def dsv4_engine_args(a, arch):
+    """Placement flags for the native DeepSeek V4 engine.
+
+    The GGUF launcher turns --vram into CUDA_EXPERT_GB, which the native V4
+    engine does not read; serve/chat used to lose both --gpu and --vram the
+    same way. The native engine takes them as its own argv, so hand them over
+    explicitly. Only the first device is meaningful: the native tier is
+    single-device.
+    """
+    if arch != "deepseek_v4":
+        return []
+    args = []
+    gpu = getattr(a, "gpu", None)
+    if gpu is not None:
+        value = gpu if gpu in ("none", "auto") else gpu.split(",")[0]
+        args += ["--gpu", value]
+    if getattr(a, "vram", 0):
+        args += ["--vram", str(a.vram)]
+    if getattr(a, "workload", None):
+        args += ["--workload", a.workload]
+    if getattr(a, "backend", None):
+        args += ["--backend", a.backend]
+    return args
+
+def reject_foreign_workload(a, arch):
+    if (getattr(a, "workload", None) or getattr(a, "backend", None)) and arch != "deepseek_v4":
+        sys.exit(f"{C.yel}--workload/--backend apply to the native deepseek_v4 engine only{C.r}")
+
 def env_for_engine(a, arch, plan=None):
+    reject_foreign_workload(a, arch)
     if arch == "glm":
         return env_for(a)
     explicit_env = set(os.environ)
@@ -685,7 +714,8 @@ def env_for_engine(a, arch, plan=None):
         elif not cuda_binary(engine_for_gpu_check(a)):
             sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} the engine binary is CPU-only")
         env["COLI_CUDA"] = "1"
-        env["CUDA_EXPERT_GB"] = str(vram)
+        if arch != "deepseek_v4":
+            env["CUDA_EXPERT_GB"] = str(vram)
     if getattr(a, "auto_tier", False) and family.modality in ("image", "decision"):
         # The tier plan places experts and KV state; an image or decision model
         # has neither, and build_plan would stop on "no safetensors shards".
@@ -743,11 +773,9 @@ def env_for_engine(a, arch, plan=None):
 
 def dsv4_cuda_available(model=None):
     # Windows loads the tier as a runtime DLL next to the engine; Linux links
-    # it straight into the binary (nvcc, -lcudart), so the DLL check there
-    # rejected every valid `make deepseek-v4 CUDA=1` build (#1219). Detect the
-    # Linux build through the dynamic libcudart entry added by the in-tree
-    # CUDA=1 target. DeepSeek V4 has no HIP backend, so libamdhip64 alone must
-    # not make a CPU engine look GPU-capable.
+    # it straight into the binary (nvcc + libcudart, or hipcc + libamdhip64),
+    # so a DLL check there rejected every valid build (#1219). Detect the
+    # Linux build through the runtime library added by the in-tree target.
     eng = engine_for(model) if model else GLM
     if sys.platform == "win32":
         # backend_loader_dsv4.c tries the DeepGEMM build first and the generic
@@ -756,9 +784,21 @@ def dsv4_cuda_available(model=None):
         return any(os.path.exists(os.path.join(os.path.dirname(eng), name))
                    for name in ("coli_cuda_dsv4_dg.dll", "coli_cuda_dsv4.dll"))
     if sys.platform == "linux" and os.path.exists(eng):
+        # S4 POSIX loader: the engine no longer links the runtime directly,
+        # so ldd alone reports a valid HIP build as CPU-only. The backend
+        # shared object next to the engine is the build marker; keep the ldd
+        # fallback for direct-linked builds.
+        engine_dir = os.path.dirname(eng)
+        if any(os.path.exists(os.path.join(engine_dir, name))
+               for name in ("coli_gpu_dsv4.so", "coli_gpu_dsv4_dg.so")):
+            return True
         try:
             linked = subprocess.run(["ldd", eng], capture_output=True, text=True, timeout=3)
-            return any("libcudart" in line and "not found" not in line
+            # The native V4 tier links libcudart on NVIDIA and libamdhip64 on
+            # HIP. The old libcudart-only probe rejected every valid HIP build
+            # (#1219 named the CUDA case; AMD is the same contract).
+            return any(("libcudart" in line or "libamdhip64" in line) and
+                       "not found" not in line
                        for line in linked.stdout.splitlines())
         except (OSError, subprocess.SubprocessError):
             return False
@@ -1673,6 +1713,7 @@ def cmd_tune(a):
             profile_dir=a.profile_dir,
             prompts=prompts,
             explicit_resources=explicit_resources,
+            engine_args=dsv4_engine_args(a,arch),
             progress=lambda message: print(f"  {C.dim}· {message}{C.r}",flush=True),
         )
     except (OSError,ValueError,RuntimeError,subprocess.SubprocessError) as error:
@@ -1707,6 +1748,7 @@ def run_via_gateway(a, family, engine, prompt):
     cmd=[sys.executable,openai_server.__file__,"--model",a.model,"--engine",engine,"--arch",arch,
          "--model-id",model_id,"--host","127.0.0.1","--port",str(port),"--max-tokens",str(serve_max_tokens(a))]
     if a.cap is not None: cmd+=["--cap",str(a.cap)]
+    cmd += dsv4_engine_args(a,arch)
     p=subprocess.Popen(cmd,env=env_for_engine(a,arch))
     try:
         sp=Spinner(f"loading {model_id}…"); sp.start()
@@ -1763,6 +1805,7 @@ def cmd_run(a):
     need_model(a.model)
     family=resolve_model(a.model).descriptor
     arch=family.id
+    reject_foreign_workload(a, arch)
     engine=engine_for(a.model)
     need_model(a.model,engine)
     prompt=" ".join(a.prompt) if a.prompt else sys.exit('usage: coli run "your prompt"')
@@ -1791,6 +1834,7 @@ def cmd_run(a):
             else:
                 cmd.append(prompt)
             cmd += ["--max-tokens",str(ngen_for(a,interactive=True,family=family))]
+            cmd += dsv4_engine_args(a, arch)
             try: memory_gb=float(e.get("RAM_GB","0"))
             except (TypeError,ValueError): memory_gb=0.0
             if memory_gb>0: cmd += ["--memory-gb",str(e["RAM_GB"])]
@@ -3141,6 +3185,7 @@ def cmd_chat(a):
     need_model(a.model)
     resolved=resolve_model(a.model); family=resolved.descriptor
     arch=family.id
+    reject_foreign_workload(a, arch)
     if not family.has_gateway_adapter:
         sys.exit(f"{family.display_name}: gateway adapter is not wired")
     if family.modality=="decision":
@@ -3176,6 +3221,7 @@ def cmd_chat(a):
              str(serve_max_tokens(a))]
         if a.cap is not None: cmd+=["--cap",str(a.cap)]
         if a.api_key: cmd+=["--api-key",a.api_key]
+        cmd += dsv4_engine_args(a,arch)
         p=subprocess.Popen(cmd,env=env_for_engine(a,arch))
         try:
             sp=Spinner(f"loading {model_id}…"); sp.start()
@@ -3549,7 +3595,7 @@ def cmd_serve(a):
               a.cap,serve_max_tokens(a),engine,
               env,a.cors_origin,
               a.max_queue,a.queue_timeout,a.kv_slots,allowed_hosts=a.allowed_host,
-              family=family)
+              family=family, engine_args=dsv4_engine_args(a,arch))
     finally:
         served.set()
         try:
@@ -4113,6 +4159,10 @@ def main():
     common.add_argument("--ctx",type=int,default=0)
     common.add_argument("--gpu",default=None,help="auto, none, or a device list such as 0,1")
     common.add_argument("--vram",type=float,default=0,help="total VRAM budget in GB (0=auto)")
+    common.add_argument("--workload",choices=("auto","decode","prefill"),default=None,
+                        help="deepseek_v4: placement phase (default: auto by request)")
+    common.add_argument("--backend",choices=("auto","hip","vulkan","cpu"),default=None,
+                        help="deepseek_v4: device backend (default: auto; HIP first, Vulkan fallback)")
     common.add_argument("--policy",choices=("quality","balanced","experimental-fast"),
                         default=os.environ.get("COLI_POLICY","quality"),
                         help="resource policy (explicit --topk/--topp overrides warn and proceed)")

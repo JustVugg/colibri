@@ -826,7 +826,7 @@ kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
 		--fixture ./kimi_k3_tiny
 
 .PHONY: deepseek-v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
-	deepseek-v4-tiny-check deepseek-v4-clean
+	deepseek-v4-tiny-check deepseek-v4-gpu-plan-check deepseek-v4-clean
 ifeq ($(COLI_V4_SUPPORTED),1)
 # Every shader the other engines build (VK_SPV, empty without VK=1): backend_vulkan.c
 # looks for them at run time and goes without one that is not there, and
@@ -835,6 +835,9 @@ ifeq ($(COLI_V4_SUPPORTED),1)
 # chain and the tier of DeepSeek V4 Flash UD-IQ1_S stayed off, 0 matmuls on the GPU.
 # CUDA=1 on Linux: the routed-expert tier on the CUDA device too (cu_tier.h), from this
 # Makefile's CUDA objects, which Makefile.deepseek-v4 links (V4_CUT_OBJS).
+# On Linux HIP the native V4 tier is loaded from coli_gpu_dsv4.so; the
+# generic CUDA objects would otherwise put libamdhip64 in the host's DT_NEEDED
+# and make the CPU path depend on ROCm. Keep them for CUDA=1 and Windows.
 V4_CUT_OBJS = $(if $(filter 1,$(CUDA)),$(if $(IS_WIN),,$(CUDA_OBJ)))
 deepseek-v4: $(VK_SPV) $(V4_CUT_OBJS)
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) V4_CUT_OBJS="$(V4_CUT_OBJS)" deepseek-v4
@@ -846,7 +849,13 @@ deepseek-v4-tiny-generate:
 	$(PYTHON) tools/make_deepseek_v4_tiny.py \
 		--output ./deepseek_v4_tiny --force
 
-deepseek-v4-tiny-check: deepseek-v4-tiny-generate
+# Pure placement table: no GPU, no model, no env. Runs on every supported host.
+deepseek-v4-gpu-plan-check:
+	$(CC) -std=c11 -O2 -Wall -Wextra -I. tests/test_v4_gpu_plan.c \
+		-o tests/test_v4_gpu_plan
+	./tests/test_v4_gpu_plan
+
+deepseek-v4-tiny-check: deepseek-v4-tiny-generate deepseek-v4-gpu-plan-check
 	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(if $(strip $(ARCH)),$(ARCH),$(PORTABLE_ARCH)) deepseek-v4
 	$(PYTHON) tests/test_deepseek_v4_tiny.py \

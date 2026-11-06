@@ -6,6 +6,7 @@
  * External callers should use deepseek_v4.h (engine / config / prompt).
  */
 #include "deepseek_v4.h"
+#include "deepseek_v4_gpu_plan.h"
 
 #include <stdio.h>
 #include "tensor.h"
@@ -1031,6 +1032,8 @@ int coli_v4_gpu_sparse_attention_batch_cached_idx(
     int comp_limit, int heads, int head_dim, int batch);
 int coli_v4_gpu_moe_batch_wanted(void);
 void coli_v4_gpu_moe_batch_release(void);
+void coli_v4_gpu_phase_begin(ColiV4Engine *engine, int prefill,
+                             int fresh_tokens);
 void coli_v4_gpu_moe_batch_hint(int total_fresh_tokens);
 void coli_v4_gpu_moe_batch_prefill(int prefill);
 int coli_v4_gpu_moe_batch_union(float *outputs,
@@ -1090,8 +1093,10 @@ int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
 int coli_v4_gpu_expert_attach(ColiExpertStore *store, ColiExpertView *view);
 /* lookup-only twin: reports residency, never uploads (hybrid q* split) */
 int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view);
-/* DSV4_HYBRID=1 gate plus its cross-unit counters/EMAs: defined in the block
- * unit, read by the serve unit's per-turn stderr line. */
+/* The plan's decode split (V4GpuPlan.hybrid) plus its cross-unit
+ * counters/EMAs: defined in the block unit, read by the serve unit's
+ * per-turn stderr line. */
+extern int g_v4_gpu_plan_hybrid;
 int coli_v4_hybrid_enabled(void);
 /* async attach (enqueue only; drain closes the pipeline before compute) */
 int coli_v4_gpu_expert_attach_async(ColiExpertStore *store,
@@ -1144,6 +1149,28 @@ struct ColiV4Engine {
         int device;
         unsigned char layer_ready[COLI_V4_RESIDENT_MAX_LAYERS];
         long long uploaded_bytes;
+        /* Placement request copied from ColiV4EngineOpenOptions; the plan
+         * below is the single decision every tier reads. */
+        int request_off;
+        int request_device_set;
+        int request_device;
+        int request_workload;
+        int request_workload_set;
+        int request_backend;
+        long long request_budget_bytes;
+        int plan_valid;
+        int plan_dense;
+        int plan_shared;
+        int plan_bank;
+        int plan_attn;
+        int plan_mirror_slots;
+        long long plan_reserve_bytes;
+        /* Both phases, decided once at open; phase_begin moves the active
+         * fields between them. */
+        V4GpuPlan plan_decode;
+        V4GpuPlan plan_prefill;
+        long long plan_budget_bytes;
+        long long plan_free_bytes;
         /* Optional opaque V4GpuExpertMirrorCache* for the dspark/MTP draft
          * experts (separate bounded LRU; see dspark_mirrors_ensure). NULL
          * unless V4_MTP_GPU=1 and the tier opened successfully. */
