@@ -4037,6 +4037,7 @@ static void q38_tier_warm(Model *m,int hist) {
 }
 #ifdef COLI_CUDA
 static size_t q38cc_reserve_bytes(Model *m);   /* qwen38_cuda_chain.h */
+static size_t q38cc_stage_mb_env(void); static size_t q38cc_prompt_stage_bytes(Model *m); static size_t q38cc_gguf_stride(Model *m);
 static int q38cc_env_on(void);
 #endif
 static void q38_tier_start(Model *m,int cap) {
@@ -4064,9 +4065,17 @@ static void q38_tier_start(Model *m,int cap) {
         if(ok&&q38cc_env_on()){
             size_t rb=q38cc_reserve_bytes(m);
             qt_trunk_offer("chain",0,rb);
+            if(!q38cc_stage_mb_env())qt_reserve_stage(q38cc_prompt_stage_bytes(m),(size_t)c->experts*q38cc_gguf_stride(m));
             fprintf(stderr,"[qtier] qwen38: %.2f GiB kept for the CUDA chain (its mirrors at %d positions, its scratch and own matrices)\n",
                     rb/1073741824.0,m->kv_cap>0?m->kv_cap:m->max_t>0?m->max_t:qwen38_max_ctx());
         }
+        /* each expert in a slot of its own layer's size (one device), the chain's promotions too
+         * (qt_chain_arena_exact): unsloth's UD-IQ2_XS mixes layers of 1.45 to 2.09 MB experts, and
+         * slots of the largest held a fifth fewer. With the chain only: the tier on its own swaps an
+         * expert only for one of its size, and on UD-IQ2_XS its decode came 5-12% slower (8.5-9.3
+         * against 8.9-10.0 tok/s) with 11424 experts on the card against 9029.
+         * COLI_CUDA_EXACT_SLOTS=1: there too, =0: the largest's for all */
+        { const char *xs=getenv("COLI_CUDA_EXACT_SLOTS"); qt_gguf_exact_slots(xs&&*xs ? *xs!='0' : q38cc_env_on()); }
         if(ok&&qt_init_gguf(L,c->experts,c->hidden,c->inter,cap,c->topk,tg,td,bg,bd,1)){
             atexit(qt_shutdown); g_q38_gguf_tier=1;
             fprintf(stderr,"[qtier] qwen38: the GGUF's experts on the CUDA tier as the file has them (RAM LRU %d/layer; experts go to VRAM as they get hot)\n",cap);

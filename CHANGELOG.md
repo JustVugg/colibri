@@ -37,6 +37,47 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **Qwen3.8 on the CUDA chain: a short prompt after a long one keeps its two lanes.** A chunk of 384
+  rows or more with the host pool on the CPU runs as two lanes, and the second lane's buffers came
+  from the rows the chain's reserve counted or, past them, where the card had their bytes and a GiB
+  besides. After a long prompt the chain's own buffers hold all 2048 rows of its reserve, and the
+  card had 1.1-1.4 GB free, so the second lane was refused, and the prompt, which had chosen the CPU
+  for its pooled experts on the lanes' account, ran in one lane with every pooled slot on the CPU.
+  The second lane now needs half a GiB besides its bytes (the tier's allowance keeps a GiB of the
+  card out of its own), and the choice of the CPU asks whether the lanes fit. unsloth's UD-Q2_0 on
+  an RTX PRO 4000, a 545-token prompt after a 4180-token one, two serves a side: 334-359 -> 582-593
+  tok/s (UD-IQ2_XS 337-361 -> 371-485, where the CPU's time a slot varied from serve to serve); the
+  decode the same.
+- **Qwen3.8 on the CUDA chain: a long prompt's layer in two passes.** Run layer by layer, a
+  layer's experts that are off the card are copied to the prompt's staging while the layers before
+  it run, but the copy could start only once the layer before had read its own, so it ran beside
+  the first chunk's attention alone. Each layer now runs every chunk's attention (or DeltaNet)
+  first and every chunk's experts after it, the same ops on the same values, so the copy runs beside
+  the whole first pass. UD-IQ2_XS on an RTX PRO 4000, two serves a side: a 4220-token prompt
+  737.8-744.8 -> 810.4 tok/s, the answer the same, the other prompts and the decode the same.
+- **Qwen3.8 on the CUDA chain: each expert at its own layer's size, on the card and in the host
+  pool.** unsloth's Dynamic V3.1 GGUFs mix expert types by layer (UD-IQ2_XS: five sizes from 1.26
+  to 2.09 MB), and the chain kept every expert in a slot of the largest, on the card and in the
+  page-locked pool. Qwen3.8 now asks the tier for slots of each layer's own size, as Qwen3.6
+  does, and the chain takes that arena over (`qt_chain_arena_exact`): its promotions draw within
+  the layer's size class and carve new slots from the arena's room before they evict anyone. The
+  host pool packs each layer's experts at their own size, and a prompt's staging counts its places
+  per layer. UD-IQ2_XS on an RTX PRO 4000, two serves a side: 6845 -> 8647 experts on the card,
+  the pool 49.8 -> 39.4 GiB, a 4220-token prompt 126 -> 370 tok/s, a 585-token one 190-210 ->
+  361-365, the decode after them 53-55 -> 60-61 and 62.7 -> 74.1-74.6 tok/s; Qwen3.8-Flash-Next
+  IQ2_XS (three sizes) 10807 -> 11328 experts and its decode the same or faster. With the chain
+  only: the tier on its own (`COLI_CUDA_CHAIN=0`) swaps an expert only for one of its size, and its
+  decode came 5-12% slower, so it keeps one size there unless `COLI_CUDA_EXACT_SLOTS=1`.
+  `COLI_CUDA_EXACT_SLOTS=0` and `COLI_CUDA_CHAIN_POOL_EXACT=0` restore the largest layer's slot.
+- **Qwen3.8 on the CUDA chain: a prompt's staging sized by the expert budget.** A long prompt's
+  layer copies its experts that are off the card into a staging buffer of 512 MiB, which held 246
+  to 411 of a UD-IQ2_XS layer's on a 24 GB card; the rest the kernels read over the bus at a third
+  of its rate. Where the tier sizes the expert budget it now gives the staging what the largest
+  layer's experts off the card would take, a fifth more, at most a sixteenth of the budget and
+  never under the 512 MiB (`qt_reserve_stage`; `COLI_CUDA_CHAIN_PROMPT_STAGE_MB` sets it by hand).
+  UD-IQ2_XS on an RTX PRO 4000 with the exact slots, a 4220-token prompt: 318-371 tok/s with 512
+  MiB, 719-729 with 800 (826 the rule's), 726-728 with 1100; the decode the same with 800 and 2-4
+  tok/s down with 1100.
 - **Qwen3.8: a long prompt layer by layer with the MTP head too** (CUDA and Vulkan chains). A prompt of
   several chunks runs layer by layer, each layer's host pool experts staged once for all its chunks, but
   not when the caller wanted the rows' final streams back, and the MTP head's prefill always does: with
