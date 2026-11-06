@@ -1,0 +1,173 @@
+#version 450
+// A prompt chunk's sparse attention of DeepSeek V4.1 Flash and DeepSeek V4 (vk_chain.c,
+// vkc_dsv4_attn) in three passes over a slice of rows, with chain_dsv4.comp's mode 0 bits:
+// mode 0 gives each (head, row) a workgroup that reads every listed row from memory, so the
+// 64 heads of a row (MQA: one list a row, one KV row a position) read each of its rows 64
+// times, a thread a row of 512 floats. Here a row's heads share each listed row's tile:
+//
+// mode 0, the scores: one workgroup per (row s, 64 heads). The list's entries in tiles of
+//   64, each tile's KV rows and the heads' queries in chunks of 32 floats; every (head h,
+//   entry j) sums q . k over i = 0, 1, ... from 0 (mode 0's order), times scale. An entry
+//   e < 0 scores -inf. Into sc[sc_off + (s*H + h)*n + j].
+// mode 1, the weights: one workgroup per (row s, head h): best = the largest score (-1e30
+//   when none: mode 0's), w = exp(score - best) (0 for -inf) in place, and the denominator
+//   exp(sink[h] - best) + the w of the entries e >= 0 in list order, on one thread, into
+//   den[den_off + s*H + h].
+// mode 2, the output: one workgroup per (row s, 64 dims, 64 heads). Every (head, dim) adds
+//   w * k over the entries e >= 0 in list order from 0 (w to bf16 first with flags 1),
+//   then divides by the denominator (the output to bf16 with flags 1).
+//
+// The fields as VkcDsAttn (v[1..16]): S, H, hd, cnt, l_off, l_row, nwin, w_off, c_off,
+// q_off, q_row, o_off, o_row, sink_off, flags, scale; then v[17] sc_off, v[18] den_off.
+// Offsets and strides in floats (ints for the list). hd a multiple of 64.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer B0 { float b0[]; };   // q (mode 0)
+layout(std430, binding = 1) readonly buffer B1 { float b1[]; };   // the window ring
+layout(std430, binding = 2) readonly buffer B2 { float b2[]; };   // the compressed rows
+layout(std430, binding = 3) readonly buffer L3 { int l3[]; };     // the list
+layout(std430, binding = 4) readonly buffer B4 { float b4[]; };   // the sinks
+layout(std430, binding = 5) buffer Y5 { float y5[]; };            // the output (mode 2)
+layout(std430, binding = 6) buffer S6 { float sc[]; };            // the scores, then the weights
+layout(std430, binding = 7) buffer D7 { float den[]; };           // the denominators
+
+layout(push_constant) uniform P { int v[32]; } p;
+#define MODE p.v[0]
+#define NEG_INF uintBitsToFloat(0xff800000u)
+
+float bf16r(float f) {   // round to nearest even, as coli_bf16_round
+    uint u = floatBitsToUint(f);
+    if ((u & 0x7f800000u) != 0x7f800000u) u += 0x7fffu + ((u >> 16) & 1u);
+    return uintBitsToFloat(u & 0xffff0000u);
+}
+
+shared float sq[64 * 32];    // mode 0: 64 heads x 32 floats of the queries
+shared float sk[64 * 65];    // mode 0: 64 entries x 32 floats (row 33); mode 2: 32 entries x 64 dims (row 65)
+shared float sw[64 * 33];    // mode 2: 64 heads x 32 weights
+shared int se[64];
+shared float red[256];
+
+float kv(int e, int nwin, int woff, int coff, int hd, int i) {
+    return e < nwin ? b1[woff + e * hd + i] : b2[coff + (e - nwin) * hd + i];
+}
+
+void scores() {
+    int s = int(gl_WorkGroupID.x), hg = int(gl_WorkGroupID.y) * 64, tid = int(gl_LocalInvocationID.x);
+    int H = p.v[2], hd = p.v[3], n = p.v[4];
+    int lb = p.v[5] + s * p.v[6], nwin = p.v[7], woff = p.v[8], coff = p.v[9];
+    int qb = p.v[10] + s * p.v[11];
+    float scale = intBitsToFloat(p.v[16]);
+    int sco = p.v[17];
+    int hb = tid >> 4, jb = tid & 15;
+    for (int t0 = 0; t0 < n; t0 += 64) {
+        barrier();
+        if (tid < 64) se[tid] = t0 + tid < n ? l3[lb + t0 + tid] : -1;
+        float acc[4][4];
+        for (int a = 0; a < 4; a++) for (int b = 0; b < 4; b++) acc[a][b] = 0.0;
+        for (int c0 = 0; c0 < hd; c0 += 32) {
+            barrier();
+            for (int k = tid; k < 64 * 32; k += 256) {
+                int hh = k >> 5, ii = k & 31, h = hg + hh;
+                sq[k] = h < H ? b0[qb + h * hd + c0 + ii] : 0.0;
+                int e = se[hh];
+                sk[hh * 33 + ii] = e >= 0 ? kv(e, nwin, woff, coff, hd, c0 + ii) : 0.0;
+            }
+            barrier();
+            for (int ii = 0; ii < 32; ii++) {
+                float kk[4];
+                for (int b = 0; b < 4; b++) kk[b] = sk[(jb + 16 * b) * 33 + ii];
+                for (int a = 0; a < 4; a++) {
+                    float qa = sq[(hb + 16 * a) * 32 + ii];
+                    for (int b = 0; b < 4; b++) acc[a][b] += qa * kk[b];
+                }
+            }
+        }
+        for (int a = 0; a < 4; a++) {
+            int h = hg + hb + 16 * a;
+            if (h >= H) continue;
+            for (int b = 0; b < 4; b++) {
+                int j = t0 + jb + 16 * b;
+                if (j >= n) continue;
+                sc[sco + (s * H + h) * n + j] = se[jb + 16 * b] >= 0 ? acc[a][b] * scale : NEG_INF;
+            }
+        }
+    }
+}
+
+void weights() {
+    int s = int(gl_WorkGroupID.x), h = int(gl_WorkGroupID.y), tid = int(gl_LocalInvocationID.x);
+    int H = p.v[2], n = p.v[4];
+    int lb = p.v[5] + s * p.v[6];
+    int base = p.v[17] + (s * H + h) * n;
+    float best = -1.0e30;
+    for (int j = tid; j < n; j += 256) { float v = sc[base + j]; if (v > best) best = v; }
+    red[tid] = best;
+    barrier();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off && red[tid + off] > red[tid]) red[tid] = red[tid + off];
+        barrier();
+    }
+    best = red[0];
+    barrier();
+    for (int j = tid; j < n; j += 256) {   // staged in sk too (n <= 3072): the sum reads them there
+        float v = sc[base + j], w = v > NEG_INF ? exp(v - best) : 0.0;
+        sc[base + j] = w; sk[j] = w;
+    }
+    barrier();
+    if (tid == 0) {                 // the denominator in list order, from the sink
+        float d = exp(b4[p.v[14] + h] - best);
+        for (int j = 0; j < n; j++) if (l3[lb + j] >= 0) d += sk[j];
+        den[p.v[18] + s * H + h] = d;
+    }
+}
+
+void outputs() {
+    int s = int(gl_WorkGroupID.x), d0 = int(gl_WorkGroupID.y) * 64, hg = int(gl_WorkGroupID.z) * 64;
+    int tid = int(gl_LocalInvocationID.x);
+    int H = p.v[2], hd = p.v[3], n = p.v[4];
+    int lb = p.v[5] + s * p.v[6], nwin = p.v[7], woff = p.v[8], coff = p.v[9];
+    int flags = p.v[15], sco = p.v[17];
+    int hb = tid >> 4, ib = tid & 15;
+    float acc[4][4];
+    for (int a = 0; a < 4; a++) for (int b = 0; b < 4; b++) acc[a][b] = 0.0;
+    for (int t0 = 0; t0 < n; t0 += 32) {
+        barrier();
+        if (tid < 32) se[tid] = t0 + tid < n ? l3[lb + t0 + tid] : -1;
+        barrier();
+        for (int k = tid; k < 32 * 64; k += 256) {
+            int jj = k >> 6, ii = k & 63, e = se[jj];
+            sk[jj * 65 + ii] = e >= 0 ? kv(e, nwin, woff, coff, hd, d0 + ii) : 0.0;
+            int hh = k >> 5, j2 = k & 31, h = hg + hh;
+            float w = h < H && t0 + j2 < n ? sc[sco + (s * H + h) * n + t0 + j2] : 0.0;
+            sw[hh * 33 + j2] = (flags & 1) != 0 ? bf16r(w) : w;
+        }
+        barrier();
+        int m = n - t0 < 32 ? n - t0 : 32;
+        for (int jj = 0; jj < m; jj++) {
+            if (se[jj] < 0) continue;
+            float kk[4];
+            for (int b = 0; b < 4; b++) kk[b] = sk[jj * 65 + ib + 16 * b];
+            for (int a = 0; a < 4; a++) {
+                float w = sw[(hb + 16 * a) * 33 + jj];
+                for (int b = 0; b < 4; b++) acc[a][b] += w * kk[b];
+            }
+        }
+    }
+    for (int a = 0; a < 4; a++) {
+        int h = hg + hb + 16 * a;
+        if (h >= H) continue;
+        float dn = den[p.v[18] + s * H + h];
+        int ob = p.v[12] + s * p.v[13] + h * hd + d0;
+        for (int b = 0; b < 4; b++) {
+            float o = acc[a][b] / dn;
+            y5[ob + ib + 16 * b] = (flags & 1) != 0 ? bf16r(o) : o;
+        }
+    }
+}
+
+void main() {
+    int m = MODE;
+    if (m == 0) scores();
+    else if (m == 1) weights();
+    else if (m == 2) outputs();
+}

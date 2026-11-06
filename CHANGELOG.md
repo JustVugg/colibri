@@ -37,6 +37,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **DeepSeek V4.1 and V4 on the Vulkan chain: a prompt chunk's sparse attention in three
+  passes, the same bits** (`chain_dsv4_pa.comp`). The attention gave each (head, row) a
+  workgroup that read every listed row from memory, a thread a row, so the 64 heads of a row
+  (one KV row a position) read each of its 640 rows 64 times. From 8 rows a chunk's rows go
+  through the scores of a row's heads on tiles of its listed rows, the weights and
+  denominators, and the output, each sum in the old kernel's order (`COLI_VK_DSV4_PA=0`: the
+  old kernel). unsloth's V4.1-Flash UD-IQ1_S on an RTX PRO 4000, a 4104-token prompt: the
+  attention's device time 31.5 -> 4.4 s; the text the same with it on and off.
 - **DeepSeek V4.1 on the Vulkan chain: a GGUF's wo_a as its output groups' GEMMs.** The
   chain multiplied a GGUF's wo_a with the per-head reader, which has no block form: the matrix
   went to the device as floats (8192 x 4096 a layer of V4.1-Flash, 128 MiB, 5 GiB over its 40

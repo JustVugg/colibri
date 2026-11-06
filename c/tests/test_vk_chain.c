@@ -2026,6 +2026,18 @@ static void test_ds_attn(int S, int H, int hd, int nwin, int ncmp, int cnt, int 
         CHECK(z, "dsv4 attn: a row with no entry is not zero");
     }
     printf("  dsv4 attn S %d H %d hd %d cnt %d flags %d: rel err %.2e\n", S, H, hd, cnt, flags, e);
+    if (S >= 8 && hd % 64 == 0) {   /* a prompt chunk's passes (chain_dsv4_pa.comp) against mode 0, bit for bit */
+        VkcBuf *o0 = vkc_buf((size_t)S * orow * 4, VKC_DEV);
+        setenv("COLI_VK_DSV4_PA", "0", 1);
+        vkc_begin(); int ok0 = vkc_dsv4_attn(qb, wb, cb, lb, sb, o0, &p); vkc_submit(1);
+        unsetenv("COLI_VK_DSV4_PA");
+        float *g0 = down(o0, 0, (size_t)S * orow);
+        int same = 1;
+        for (int s = 0; s < S; s++) same &= !memcmp(got + (size_t)s * orow + 2, g0 + (size_t)s * orow + 2, (size_t)H * hd * 4);
+        CHECK(ok0 && same, "dsv4 attn S %d H %d hd %d cnt %d flags %d: the prompt passes are not mode 0's bits", S, H, hd, cnt, flags);
+        printf("  dsv4 attn S %d H %d hd %d cnt %d flags %d: the prompt passes give mode 0's bits\n", S, H, hd, cnt, flags);
+        vkc_free(o0); free(g0);
+    }
     vkc_free(qb); vkc_free(wb); vkc_free(cb); vkc_free(sb); vkc_free(ob); vkc_free(lb);
     free(q); free(win); free(cmp); free(sink); free(ref); free(sc); free(list); free(kvall); free(got);
 }
@@ -4523,6 +4535,10 @@ int main(int argc, char **argv) {
     else {
         test_ds_attn(1, 4, 64, 8, 5, 13, 0); test_ds_attn(3, 2, 512, 128, 40, 300, 0); test_ds_attn(2, 3, 100, 6, 9, 20, 0);
         test_ds_attn(2, 2, 64, 8, 12, 2900, 0); test_ds_attn(3, 4, 64, 8, 5, 13, 1);
+        /* a prompt chunk's rows (chain_dsv4_pa.comp): V4.1-Flash's 64 heads of 512, a window and
+         * 512 selected; heads past a group of 64, a list longer than a tile, bf16 roundings */
+        test_ds_attn(40, 64, 512, 128, 700, 640, 0); test_ds_attn(9, 70, 128, 8, 90, 200, 0);
+        test_ds_attn(12, 8, 64, 8, 40, 2900, 0); test_ds_attn(40, 64, 512, 128, 700, 640, 1);
         test_ds_rope(0); test_ds_rope(1);
         test_ds_compress(2, 0, 0); test_ds_compress(1, 0, 0); test_ds_compress(4, 0, 0); test_ds_compress(4, 1, 1);
         test_ds_compress(3, 0, 1);
