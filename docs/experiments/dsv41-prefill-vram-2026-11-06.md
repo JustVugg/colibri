@@ -151,7 +151,8 @@ does not compile the CUDA build of `vk_tier.c`.
 MTP stages never go on the tier *by default*, which is only true where the device's memory
 is the host's (Lavapipe). On a discrete card `COLI_VK_TIER_MTP`'s default puts them on the
 tier, so the assertion fired on every DSpark case before any of them could be judged. It
-now keys on the engine's own ", shared RAM," line.
+now keys on the engine's own tier "on" line (any "shared RAM" wording vs "device
+memory").
 
 ## 6. The packed candidate mask (`12b2908a`) — 1.94× the rows for the same 256 MiB
 
@@ -164,15 +165,15 @@ costs `4E + E/8` and the chunk's quadratic cap keeps the same 256 MiB pair for 1
 rows: `256 MiB / (4E + 4·ceil(E/32))` instead of `32M / E`. The arithmetic reproduces
 both quoted cases exactly:
 
-| prompt positions `E` | cap before | cap now | row cost of the pair |
+| prompt positions `E` | cap before | cap now | whole-row cost (the pair's share) |
 |---|---|---|---|
-| 20 000 (tiny fixture) | 1 677 rows | **3 253 rows** | 181 → 105 KiB |
+| 20 000 (tiny fixture) | 1 677 rows | **3 253 rows** | 181 → 105 KiB (156.25 → 80.6 KiB) |
 | 131 072 | 256 rows | 496 rows | — |
 
 Measured: the tiny fixture at 20 000 positions prints "a prompt of 20000 positions caps a
 chunk at 3253 rows (80.6 KiB a row of scores and packed candidate mask, 256 MiB of 256)";
 on the released checkpoint the row cost goes **1317 → 1305 KiB** at `E`=3107 (the mask is
-12.4 KiB of that, one bit a column 0.4), and a later run at `E`=1300 measured 1303 → 1298
+12.1 KiB of that, one bit a column 0.4), and a later run at `E`=1300 measured 1303 → 1298
 (41 words a row).
 
 No row of arithmetic changes. The same blocks are picked and kept whole, and

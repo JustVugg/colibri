@@ -1003,10 +1003,10 @@ family_deepseek() {
   # the device too
   for force in 1 2 3 4 5; do
     v41_tier "DSpark spec=$force" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=$force ./deepseek_v41 1 dsv41_tiny/ref.json
-    # on a device that shares the RAM the default keeps them on the CPU; on a discrete one
-    # COLI_VK_TIER_MTP puts them on the tier (which this file runs on where no CPU Vulkan
-    # device loads: VK_ICD_FILENAMES)
-    if grep -aq ', shared RAM,' v41-vk.err; then
+    # on a device that shares the RAM the default keeps them on the CPU; on a discrete
+    # one they go on the tier. The tier's "on" line says which it is: some form of
+    # "shared RAM" vs "device memory"
+    if grep -aq 'shared RAM' v41-vk.err; then
       ! grep -aq 'extra layers' v41-vk.err || { grep -a '\[VK\] tier' v41-vk.err; fail "deepseek_v41 DSpark spec=$force: the stages went on the tier by default on shared RAM"; }
     fi
   done

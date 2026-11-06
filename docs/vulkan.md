@@ -2940,8 +2940,10 @@ engine has them. For a step of at least `COLI_VK_TIER_GEMM_ROWS` rows (16),
   `cpu_row` is the time the CPU spent per (row, expert) pair it computed in the prefill
   steps so far, its share of a step between issue and join, loads included. Below R the
   CPU keeps the expert: its rows cost the CPU less than the upload. Until both are
-  measured, R = G. `COLI_VK_TIER_STREAM_ROWS=n` fixes R at n. One line per forward says
-  what the rule gave:
+  measured, R = G. R is never below `COLI_VK_TIER_STREAM_MIN` (2): under the tiled
+  GEMM's 16 rows the per-row GEMV is the device's faster route, and measured against
+  the CPU it wins from 2 rows up. `COLI_VK_TIER_STREAM_ROWS=n` fixes R at n. One line
+  per forward says what the rule gave:
 
   ```
   [VK] tier qwen36 stream: a step of 2560 rows; cold experts with 16 rows or more go to the device (an upload of 1.7 MiB at 8.2 GB/s takes 0.217 ms, the CPU 0.2280 ms a row; the GEMM from 16 rows); layer 0: 245 resident, 11 streamed, 0 kept on the CPU (0 rows)
@@ -2961,7 +2963,7 @@ engine has them. For a step of at least `COLI_VK_TIER_GEMM_ROWS` rows (16),
   thread loads and uploads the experts of the next (double buffering), and a batch's
   outputs are copied out when it is joined. The recording is the single batch's,
   through the same `xb_record_submit`.
-- **The staging slots.** `COLI_VK_TIER_STREAM_SLOTS` (64) experts' worth of tensors, made
+- **The staging slots.** `COLI_VK_TIER_STREAM_SLOTS` (48) experts' worth of tensors, made
   at the first step that streams and filled again for each expert they carry
   (`coli_vk_tensor_refill`). On mapped memory that is the tensor's own mapping. With
   staged uploads it is a host image that `coli_vk_tensor_commit` copies over. The slots
@@ -3086,7 +3088,8 @@ experts came from the host pool (`135 streamed (135 of them copied from the host
 | `COLI_VK_GRP_WIDE` | `32` | A prompt chunk's GGUF experts on `qmatmul_grp_bdcw.comp` (64 rows by 128 decoded rows an item) when the chunk's rows give each expert this many on average, both passes on the matrix units. One layer of Qwen3.6's Q4_K experts: 1024 rows 4.40 -> 3.69 ms, 512 rows 2.90 -> 3.28 (so the threshold); its prompt at 4K tokens 2366-2371 -> 2621-2637 tok/s. `0`: never. |
 | `COLI_VK_ATTN_SLICE` | `4294967296` | Rows x positions x heads x head dim past which an attention is cut over several submissions; `0` never. The matrix units' attention (`chain_attn_flash.comp`) counts a unit as a sixteenth: it runs one 8.5 to 13 times faster than `chain_attnb`. |
 | `COLI_VK_TIER_STREAM` | on | `0`: no streaming; the tier takes a prompt step in the engine's usual blocks and leaves the cold experts to the CPU, as before. |
-| `COLI_VK_TIER_STREAM_SLOTS` | `64` | Staging slots (experts) for streaming, out of the tier's budget. |
+| `COLI_VK_TIER_STREAM_SLOTS` | `48` | Staging slots (experts) for streaming, reserved before the chunk is sized. |
+| `COLI_VK_TIER_STREAM_MIN` | `2` | The least rows a cold expert streams at; under the tiled GEMM's 16 rows the per-row GEMV runs and beats the CPU from 2 rows up. |
 | `COLI_VK_TIER_STREAM_ROWS` | the rule | Fix R, the rows from which a cold expert streams (tests). |
 | `COLI_VK_TIER_STREAM_HALF` | x rows within 32 MiB | Rows of a sub-batch (tests: small ones cut experts into parts). |
 | `COLI_VK_TIER_STREAM_PAR` | on | `0`: a streamed expert's conversion on the engine thread alone. |

@@ -351,4 +351,12 @@ Harness summary (vram-c2.out):
   are quoted from those two commit messages and the arithmetic behind them is given in
   the record (section 6). `bash c/tests/vulkan_engines.sh prefill-deepseek` and
   `make -C c vk-chain-check VK=1` exercise the same code path.
+- The upload-attribution run (every first-use device upload printed: `head.w` the
+  1262.5 MiB `O=129280 I=5120` upload, `embed.w` absent, the routers 40 x 3932160 B,
+  the DSpark stages 673 MiB) and the drain-halves run (160 drains, 319 frames in
+  flight, 28095.1 ms the newest frame vs 0.5 ms the rest at chunk 1280) were made with
+  temporary instrumentation that was reverted the same session; their stdout was not
+  kept, and the numbers are quoted from the wave-2b report in the record (sections 5
+  and 7). The cross-check that closes without them: 7523.0 + 1262.5 + 150 + 673 =
+  9608.5 against the ledger's 9608.2 MiB of rows.
 
