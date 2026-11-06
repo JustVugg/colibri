@@ -2563,6 +2563,9 @@ tests/test_stop_ids$(EXE): tests/test_stop_ids.c
 tests/test_sparse_attn$(EXE): tests/test_sparse_attn.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_index_topk$(EXE): tests/test_index_topk.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_expert_ffn$(EXE): tests/test_expert_ffn.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # int4-g64 rows interleaved by 16 (expert_ffn.h xf16_*) against their reference.
