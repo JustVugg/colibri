@@ -83,3 +83,29 @@ Before the fix, a 32-cycle synthetic resident-cache fixture leaked 640 bytes in
 test calls the production session/store/engine callbacks, checks independent KV
 buffers, and covers partial layer ranges and engines that never acquire an
 expert. These are resident synthetic fixtures, not checkpoint-based inference.
+
+## Checkpoint-based public adapter gate
+
+A focused target reuses `test_segment_adapters_real.c` with only the OLMoE
+registrar and object linked. The default all-family test remains unchanged.
+Generate a new fixture directory (the generator refuses existing paths):
+
+```sh
+python3 c/tests/make_olmoe_segment_fixture.py --output /tmp/olmoe-segment-fixture
+make -C c tests/test_olmoe_segment_real -j4
+OMP_NUM_THREADS=2 c/tests/test_olmoe_segment_real olmoe /tmp/olmoe-segment-fixture 0 2 4 8
+OMP_NUM_THREADS=2 c/tests/test_olmoe_segment_real olmoe /tmp/olmoe-segment-fixture 1 2 4 8
+```
+
+This standard-library-only generator writes deterministic synthetic merged-int8
+weights and config, consumed by the production loader. The public runtime opens
+full and partial layer ranges, creates sessions, performs prefill/continuation,
+compares chained results with a full range, and restores snapshots. Corrupt and
+truncated snapshots must fail without changing live state. The checkpoint is
+synthetic: this is actual loader/adapter execution, not a trained-model accuracy
+oracle or GPU acceptance.
+
+Unlike the resident-cache lifecycle fixture, this path exercises config parsing.
+LeakSanitizer exposed the missing `json_free` in `load_cfg`; releasing the input
+buffer and string arena alone did not release the JSON tree. The loader now frees
+the tree after copying its numeric configuration.

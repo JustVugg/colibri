@@ -670,7 +670,7 @@ static void load_cfg(Cfg *c, const char *snap) {
     jval *th = json_get(r,"rope_theta");  c->theta = th ? (float)th->num : 10000.f;
     jval *ep = json_get(r,"rms_norm_eps"); c->eps   = ep ? (float)ep->num : 1e-5f;
     jval *nt = json_get(r,"norm_topk_prob"); c->norm_topk = (nt && nt->t==J_BOOL) ? nt->boolean : 0;
-    free(buf); free(arena);
+    json_free(r); free(buf); free(arena);
 }
 
 /* The parameters of an automatic cache size (cap <= 0), for olm_dho_grow_cap: with the
