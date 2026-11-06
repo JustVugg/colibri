@@ -1267,7 +1267,26 @@ __device__ static int cc_scan128(int x, int *buf, int *tot) {
     __syncthreads();
     return incl - x;
 }
-/* chain_qsa.comp: mode 0 one block of 128 per block key; mode 1 one block per query row */
+/* mode 1's scores, cc_qsa's first launch: a thread a block of keys of a row, over a grid of the rows' blocks
+ * (x) and the rows (y), the dot over d in the CPU's order. One block of 128 threads a row scored its 1100 blocks
+ * of 4400 positions in 197 us (Qwen3.8-Flash-Next on an RTX PRO 4000, a decode step's 1-4 rows: as many SMs) */
+__global__ static void __launch_bounds__(128) cc_qsa_score_k(const float *__restrict__ src, const float *__restrict__ pk,
+                                                             float *__restrict__ sc, CcQsa p) {
+    COLI_PDL_WAIT();
+    const int s = blockIdx.y, b = blockIdx.x * 128 + threadIdx.x;
+    const int visible = p.pos_base + s + 1, blocks = visible / p.R, take = min(blocks, p.budget / p.R);
+    if (take >= blocks || b >= blocks) return;
+    const int qb = p.q_off + s * p.q_row;
+    float score = 0.f;
+    for (int h = 0; h < p.IQ; h++) {
+        float a = 0.f;
+        for (int d = 0; d < p.ID; d++) a += src[qb + h * p.ID + d] * pk[p.pk_off + b * p.ID + d];
+        if (a > 0.f) score += a;
+    }
+    sc[s * 2 * p.nbmax + b] = score / sqrtf((float)p.ID);
+}
+/* chain_qsa.comp: mode 0 one block of 128 per block key; mode 1 one block per query row (its scores
+ * cc_qsa_score_k's) */
 __global__ static void __launch_bounds__(128) cc_qsa_k(const float *__restrict__ src, const float *__restrict__ w,
         float *__restrict__ pk, const float *__restrict__ cs, float *__restrict__ sc, int *__restrict__ sel, CcQsa p) {
     COLI_PDL_WAIT();
@@ -1317,18 +1336,6 @@ __global__ static void __launch_bounds__(128) cc_qsa_k(const float *__restrict__
         return;
     }
     int sb = s * 2 * p.nbmax;
-    int qb = p.q_off + s * p.q_row;
-    for (int b = tid; b < blocks; b += 128) {
-        float score = 0.f;
-        for (int h = 0; h < p.IQ; h++) {
-            float a = 0.f;
-            for (int d = 0; d < p.ID; d++) a += src[qb + h * p.ID + d] * pk[p.pk_off + b * p.ID + d];
-            if (a > 0.f) score += a;
-        }
-        sc[sb + b] = score / sqrtf((float)p.ID);
-    }
-    __threadfence_block();
-    __syncthreads();
     /* The blocks of rank < take (a higher score first, of equal ones the lower block), as the CPU
      * ranks them. Each block counted its rank against every other and one thread wrote the list:
      * O(blocks^2) on 128 threads, 298 us a call at 4400 positions (1100 blocks, Qwen3.8-Flash-Next
@@ -2613,6 +2620,8 @@ static int cc_qsa(CcBuf *src, CcBuf *w, CcBuf *pk, CcBuf *cs, CcBuf *sc, CcBuf *
         coli_launch(cc_qsa_k, (unsigned)p->nb, 128, 0, c->stream, fp(src), fp(w), fpw(pk), fp(cs), nullptr, nullptr, *p);
     } else if (p->mode == 1) {
         if (!sc || !sel || p->S < 1 || p->IQ < 1 || p->nbmax < 1 || p->sel_row < 1) return 0;
+        const int mb = (p->pos_base + p->S) / p->R;   /* the last row's blocks, the most */
+        coli_launch(cc_qsa_score_k, dim3((unsigned)(((mb > 0 ? mb : 1) + 127) / 128), (unsigned)p->S), 128, 0, c->stream, fp(src), fp(pk), fpw(sc), *p);
         coli_launch(cc_qsa_k, (unsigned)p->S, 128, 0, c->stream, fp(src), nullptr, fpw(pk), nullptr, fpw(sc), (int *)sel->d, *p);
     } else return 0;
     return launched(c, "qsa");
