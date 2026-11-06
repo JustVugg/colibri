@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react"
-import { Activity, Gauge, HardDrive, Timer } from "lucide-react"
+import { Activity, Gauge, HardDrive, Timer, Zap } from "lucide-react"
 
-import { getProfile, type ProfileTurn } from "@/lib/api"
+import { getPower, getProfile, powerByKind, type PowerResponse, type ProfileTurn } from "@/lib/api"
 import { useLocale } from "./i18n"
 
 const PHASES = [
@@ -94,6 +94,27 @@ export function Profiling({ baseUrl, apiKey, connected }: { baseUrl: string; api
     return () => { disposed = true; window.clearInterval(timer) }
   }, [baseUrl, apiKey, connected])
 
+  /* The power tile: only when the UI server reads this machine's power (ui/power.py,
+     with joules installed); the first answer without it stops the polling. */
+  const [power, setPower] = useState<PowerResponse | null>(null)
+  useEffect(() => {
+    if (!connected) return
+    let disposed = false
+    let timer = 0
+    const poll = async () => {
+      if (document.visibilityState === "hidden") return
+      try {
+        const result = await getPower(baseUrl, apiKey)
+        if (disposed) return
+        setPower(result)
+        if (!result.available) window.clearInterval(timer)
+      } catch { /* the UI server restarting — keep the last reading */ }
+    }
+    void poll()
+    timer = window.setInterval(() => void poll(), 2000)
+    return () => { disposed = true; window.clearInterval(timer) }
+  }, [baseUrl, apiKey, connected])
+
   const latest = turns[turns.length - 1]
   const recent = turns.slice(-40)
   const diskService = turns.reduce((sum, turn) => sum + turn.expert_disk_s, 0)
@@ -116,6 +137,18 @@ export function Profiling({ baseUrl, apiKey, connected }: { baseUrl: string; api
             <div><span><Timer className="size-3" /> {t("profile.wallTime")}</span><strong>{seconds(latest.wall_s)}</strong><small>{latest.prompt_tokens} → {latest.completion_tokens} tokens</small></div>
             <div><span><Activity className="size-3" /> {t("profile.batching")}</span><strong>{latest.forwards > 0 ? (latest.completion_tokens / latest.forwards).toFixed(2) : "—"}</strong><small>{t("profile.tokensPerForward")}</small></div>
             <div><span><HardDrive className="size-3" /> {t("profile.diskService")}</span><strong>{seconds(latest.expert_disk_s)}</strong><small>{t("profile.overlapped")}</small></div>
+            {power?.available && power.watts != null ? (
+              <div title={(power.devices ?? []).map((device) => `${device.name}: ${device.watts ?? "—"} W`).join("\n")}>
+                <span><Zap className="size-3" /> {t("profile.power")}</span><strong>{Math.round(power.watts)}</strong>
+                <small>W · {powerByKind(power)}{power.simulated ? ` · ${t("profile.simulated")}` : ""}</small>
+              </div>
+            ) : null}
+            {latest.energy_j != null && latest.completion_tokens > 0 ? (
+              <div>
+                <span><Zap className="size-3" /> {t("profile.energyPerToken")}</span><strong>{(latest.energy_j / latest.completion_tokens).toFixed(2)}</strong>
+                <small>J/token · {t("profile.turnEnergy", { wh: (latest.energy_j / 3600).toFixed(2) })}</small>
+              </div>
+            ) : null}
           </div>
 
           <div className="prof-shares">

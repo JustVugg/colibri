@@ -6697,7 +6697,7 @@ static int q36_cuda_tier_drafts(Model *m) {
 /* The forward: ids[0..S) at pos_base through every layer, the final norm and
  * lm_head on the last `nlogits` rows (one for a step, every row of a speculative
  * verify), each row's logits computed as a decode step computes them. */
-static void q36_prefill_abort(Model *m);
+static void q36_prefill_abort(Model *m, int pos_base, int S);
 
 static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int nlogits,
                               Q36StepControl *control) {
@@ -6786,7 +6786,7 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
                                                            c->n_layers, 1, lf, control))) {
         /* Some layers (or a chain's first chunks) may have advanced, others not. Neither
          * the previous prefix nor a partially processed prompt describes this state. */
-        q36_prefill_abort(m);
+        q36_prefill_abort(m, pos_base, S);
         free(x);
         if (lf) fclose(lf);
         return NULL;
@@ -7268,9 +7268,10 @@ static void reset_recurrent(Model *m){
     dn_gpu_invalidate(m);   /* zero on the host is the truth now; the card re-loads it before its next step */
 }
 
-static void q36_prefill_abort(Model *m) {
-    reset_recurrent(m);
-    m->kv_len = 0;
+static int q36_pes_after_abort(Model *m, int pos_base, int S);
+static void q36_prefill_abort(Model *m, int pos_base, int S) {
+    /* back to the prompt-end snapshot when its rows lie before the stopped read; else nothing */
+    if (!q36_pes_after_abort(m, pos_base, S)) { reset_recurrent(m); m->kv_len = 0; }
     pin_drop();   /* the prefix record no longer certifies the pins' KV rows */
     m->resident_collecting = 0;
     m->first_step = 1;
@@ -7412,6 +7413,107 @@ static void q36_unpark(Model *m) {
 #endif
     if (getenv("COLI_PREFIX_LOG")) fprintf(stderr, "[PREFIX] the %d-token conversation is back\n", g_q36_park.len);
     q36_park_free(m);
+}
+
+/* The prompt-end snapshot (#2589), qwen38's g_q38_prefix in qwen36's terms: the DeltaNet
+ * state, the ids and the first token's logits as the last prompt read to its end left them.
+ * A client that retries a reply it cancelled sends a prompt SHORTER than the state (the
+ * prompt and the reply's first tokens), one that edits or re-renders the last answer sends
+ * one that leaves it after the last prompt's end; the recurrences cannot step back, so both
+ * read the whole conversation again. The K/V rows are not copied: they stay where they are,
+ * as a pin's do, and kv_prefix_holds says whether they still stand. One conversation at a
+ * time (KV_SLOTS=1) and chat turns only: a scoring request (logprobs) and a pin=1 keep the
+ * pins' pool, a parked conversation's short request takes nothing. COLI_PROMPT_SNAPSHOT=0
+ * (or COLI_KV_PREFIX=0) turns it off. */
+static struct { int *ids; int len, cap; float *logit; Q36PinState *st; } g_q36_pes;
+
+static int q36_pes_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_PROMPT_SNAPSHOT"); on = !(e && *e == '0'); }
+    return on && g_q36_mux_slots == 1 && !kv_prefix_off();
+}
+
+/* After a prompt read to its end: its ids and its first token's logits now, the state once
+ * the first token is out (q36_pes_commit). Copying the DeltaNet state from a device costs a
+ * frame's worth (66 MB on Qwen3.6-35B: 13 ms on CUDA, 20 ms on Vulkan, 6 ms on the CPU),
+ * which the time to the first token would pay; before the decode's first step the state is
+ * still the prompt's end. A cancel at the first token still finds it. */
+static int g_q36_pes_due;   /* the prompt's length whose state is still to copy, 0 none */
+static void q36_pes_take(Model *m, const int *ids, int np, const float *logit) {
+    g_q36_pes_due = 0;
+    if (!q36_pes_on() || !logit || np < 1 || m->kvp.tainted || g_q36_park.on || m->kv_len != np) return;
+    if (g_q36_pes.len == np && !memcmp(g_q36_pes.ids, ids, (size_t)np * sizeof(int))) return;   /* the snapshot that served it */
+    g_q36_pes.len = 0;
+    if (g_q36_pes.cap < np) {
+        int *grown = (int *)realloc(g_q36_pes.ids, (size_t)np * sizeof(int));
+        if (!grown) return;
+        g_q36_pes.ids = grown; g_q36_pes.cap = np;
+    }
+    if (!g_q36_pes.logit && !(g_q36_pes.logit = (float *)malloc((size_t)m->c.vocab * sizeof(float)))) return;
+    memcpy(g_q36_pes.ids, ids, (size_t)np * sizeof(int));
+    memcpy(g_q36_pes.logit, logit, (size_t)m->c.vocab * sizeof(float));
+    g_q36_pes_due = np;
+}
+static void q36_pes_commit(Model *m) {
+    const int np = g_q36_pes_due;
+    g_q36_pes_due = 0;
+    if (!np || m->kv_len != np) return;   /* the state moved past the prompt's end: no snapshot */
+    const double t0 = now_s();
+    g_q36_pes.st = q36_pin_state_save(m, g_q36_pes.st);   /* NULL: none, and the old one is gone */
+    if (!g_q36_pes.st) return;
+    g_q36_pes.len = np;
+    if (getenv("COLI_PREFIX_LOG")) {
+        fprintf(stderr, "[PREFIX] prompt-end snapshot at %d tokens, %.1f ms\n", np, (now_s() - t0) * 1e3);
+        fflush(stderr);
+    }
+}
+
+/* the snapshot's state into the Model, its n positions the record; the devices' rows past them
+ * are the abandoned turn's (the chains' watermarks come down to n) */
+static void q36_pes_put(Model *m, int n) {
+    q36_pin_state_put(m, g_q36_pes.st);
+    m->kv_len = n;
+    kv_prefix_clear(&m->kvp);
+    kv_prefix_record(&m->kvp, g_q36_pes.ids, 0, n);
+#ifdef COLI_VULKAN
+    q36c_rollback(m, -1, n);
+#endif
+#ifdef COLI_CUDA
+    q36cc_rollback(m, -1, n);
+#endif
+}
+
+/* The snapshot back when it begins this prompt and its rows still stand: its length, the
+ * prompt's first fresh position, or 0. A prompt that IS the snapshot (a retry) reads nothing:
+ * *logit is its first token's. */
+static int q36_pes_restore(Model *m, const int *ids, int np, const float **logit) {
+    const int n = g_q36_pes.len;
+    *logit = NULL;
+    if (!q36_pes_on() || n < 1 || n > np || !g_q36_pes.st ||
+        memcmp(g_q36_pes.ids, ids, (size_t)n * sizeof(int)) != 0) return 0;
+    if (!kv_prefix_holds(&m->kvp, g_q36_pes.ids, n) ||
+        !q36_ring_holds(m->ring_pos, m->kv_ring, n - m->c.window + 1, n)) { g_q36_pes.len = 0; return 0; }
+    q36_pes_put(m, n);
+    if (n == np) *logit = g_q36_pes.logit;
+    return n;
+}
+
+/* A read stopped part way (a client gone mid-prompt): some layers advanced, others not, and
+ * the record still says what came before the read. The rows before pos_base are untouched, so
+ * a snapshot that lies before it is the state again at once (the next turn reads only what is
+ * new), with the ring slots the read may have written forgotten, whatever order the layers
+ * wrote them in. */
+static int q36_pes_after_abort(Model *m, int pos_base, int S) {
+    const int n = g_q36_pes.len;
+    if (!q36_pes_on() || n < 1 || n > pos_base || !g_q36_pes.st ||
+        !kv_prefix_holds(&m->kvp, g_q36_pes.ids, n)) return 0;
+    if (m->ring_pos && m->kv_ring)
+        for (int t = pos_base; t < pos_base + S && t < pos_base + m->kv_ring; t++) m->ring_pos[t % m->kv_ring] = -1;
+    if (!q36_ring_holds(m->ring_pos, m->kv_ring, n - m->c.window + 1, n)) return 0;
+    q36_pes_put(m, n);
+    if (getenv("COLI_PREFIX_LOG"))
+        fprintf(stderr, "[PREFIX] the read stopped at %d: back to the prompt-end snapshot, %d tokens\n", pos_base, n);
+    return 1;
 }
 
 /* Allocate (once) or reuse the KV cache across requests. Grows only when a
@@ -8164,8 +8266,19 @@ static int serve_control_pending(const char *id){
     return control;
 }
 
+/* A served prompt's checks for its STOP or CANCEL: the one before its forward, then one before
+ * each layer or chunk. COLI_PROMPT_BREAK_AFTER=n (tests, as prompt_break.h has it): stdin is
+ * read from the (n+1)-th check of the request on, so a CANCEL written with its SUBMIT stops
+ * the forward after n-1 layers, in the middle of the state it changes. */
+static int g_q36_prompt_checks;
+static int q36_prompt_check(const char *id) {
+    static int after = -1;
+    if (after < 0) { const char *e = getenv("COLI_PROMPT_BREAK_AFTER"); after = e && atoi(e) > 0 ? atoi(e) : 0; }
+    if (g_q36_prompt_checks++ < after) return Q36_CONTROL_NONE;
+    return serve_control_pending(id);
+}
 static int serve_prefill_poll(void *id) {
-    return serve_control_pending((const char *)id);
+    return q36_prompt_check((const char *)id);
 }
 
 /* --- Dashboard: Brain e Profile ------------------------------------------
@@ -8231,6 +8344,34 @@ static double q36_turn_hit(const Model *m, const Q36ReqClock *c) {
     return n > 0 ? 100.0 * h / n : 0.0;
 }
 
+/* A model whose state is attention alone: every layer full attention, no sliding window,
+ * no MTP head, no picture rows. Its rows depend on their prefix and nothing later, so a
+ * prompt that leaves the held state in the middle can resume there (kv_prefix_common), as
+ * olmoe.c does. Qwen3-Coder (qwen3_moe) and the dense Qwen3 are this; the hybrid Qwen3.6
+ * and Qwen3.8 carry a DeltaNet recurrence, which cannot be cut back, and keep the
+ * all-or-nothing reuse. One sequence only: the multiplexed slots keep their own. */
+static int q36_attention_only(const Model *m) {
+    const Cfg *c = &m->c;
+    if (c->win_layer || c->window > 0 || g_q36_mtp.on || m->vis_rows_n > 0 || g_q36_mux_slots > 1)
+        return 0;
+    for (int i = 0; i < c->n_layers; i++) if (!c->is_attn[i]) return 0;
+    return 1;
+}
+
+/* Back to the first `len` positions of the held state: what q36_spec_rollback does for
+ * a verify, without the recurrence there is none of. The device mirrors keep their rows
+ * up to `len` and take the rest again from the host. */
+static void q36_rewind(Model *m, int len) {
+#ifdef COLI_VULKAN
+    q36c_rollback(m, -1, len);
+#endif
+#ifdef COLI_CUDA
+    q36cc_rollback(m, -1, len);
+#endif
+    m->kv_len = len;
+    if (m->kvp.len > len) m->kvp.len = len;
+}
+
 /* A request's prompt into the conversation the Model holds: its tokens and image,
  * the budget, ACCEPT, the prefix reuse and the pins, the prefill and its read-out.
  * 1 with the prompt's ids and the logits after it; 0 when the request ended here,
@@ -8285,15 +8426,25 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     int reuse = kv_prefix_off() ? 0 : kv_prefix_reuse(&m->kvp, ids, np);
     /* the sliding layers' rings must still hold the window before the first fresh token */
     if (reuse && !q36_ring_holds(m->ring_pos, m->kv_ring, reuse - m->c.window + 1, reuse)) reuse = 0;
+    /* Attention alone resumes where the prompt leaves the held state: a client that starts
+     * a new task on the same system prompt and tools, or changes a turn, reads only what
+     * follows the shared positions. A read-out asks a frame for every position, so it
+     * reads the whole prompt. */
+    int rewind = 0;
+    if (!reuse && !kv_prefix_off() && q->logprobs == 0 && q36_attention_only(m))
+        rewind = kv_prefix_common(&m->kvp, ids, np);
     if (getenv("COLI_PREFIX_LOG")) {
         if (reuse)
             fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens (%.0f%%)\n",
                     reuse, np, 100.0 * reuse / np);
+        else if (rewind)
+            fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens (%.0f%%), up to where it leaves the held state\n",
+                    rewind, np, 100.0 * rewind / np);
         else
             fprintf(stderr, "[PREFIX] no reuse: held=%d cap=%d prompt=%d%s%s\n",
                     m->kvp.len, m->kvp.cap, np, m->kvp.tainted ? " tainted" : "",
                     (m->kvp.len > 0 && m->kvp.len < np) ? " (diverged)" : "");
-        if (!reuse) kv_prefix_miss_log(&m->kvp, ids, np, decode_id_to_bytes);
+        if (!reuse && !rewind) kv_prefix_miss_log(&m->kvp, ids, np, decode_id_to_bytes);
         fflush(stderr);
     }
     /* Con la lettura accesa il riuso arretra di un token: il predittore del
@@ -8310,6 +8461,15 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         int pinned = pin_restore(m, ids, np);
         if (pinned) { reuse = pinned; g_pin_use_logit = 1; }
     }
+    /* a retry, an edited or re-rendered last answer: back to where the last prompt ended */
+    const float *pes_logit = NULL;
+    if (!reuse && q->logprobs == 0 && !q->pin) {
+        reuse = q36_pes_restore(m, ids, np, &pes_logit);
+        if (reuse && getenv("COLI_PREFIX_LOG")) {
+            fprintf(stderr, "[PREFIX] resuming from the prompt-end snapshot: %d of %d prompt tokens\n", reuse, np);
+            fflush(stderr);
+        }
+    }
     g_echo_k = q->logprobs; g_echo_id = q->id;
     /* The read-out promises a frame for EVERY prompt position, starting at 0. A live
      * prefix is not recomputed, so its positions would carry no frame at all -- the hole
@@ -8321,7 +8481,12 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     if (g_echo_k > 0 && !g_pin_use_logit) reuse = 0;
     if (!reuse) {
         q36_park(m, np, q->max_tok);   /* a short request keeps the conversation (q36_unpark) */
-        reset_recurrent(m); m->kv_len = 0;
+        if (rewind > 0 && !g_pin_use_logit) {
+            q36_rewind(m, rewind);     /* parked first: the copy holds the whole conversation */
+            reuse = rewind;
+        } else {
+            reset_recurrent(m); m->kv_len = 0;
+        }
     }
     /* Per-REQUEST state, not per-process: without this the server keeps the
      * first request's prefill flag and expert-collection set forever, so
@@ -8345,9 +8510,13 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
                        && !getenv("DUMP_LAYERS") && !m->vis_rows
                        && !qq_active();
     Q36StepControl control = {serve_prefill_poll, q->id, Q36_CONTROL_NONE};
-    int prefill_control = g_q36_mux_slots == 1 ? serve_control_pending(q->id) : Q36_CONTROL_NONE;
+    g_q36_prompt_checks = 0;
+    int prefill_control = g_q36_mux_slots == 1 ? q36_prompt_check(q->id) : Q36_CONTROL_NONE;
     float *lo = NULL;
-    if (!prefill_control) {
+    if (!prefill_control && pes_logit) {   /* the prompt is the snapshot: nothing to read */
+        lo = falloc(m->c.vocab);
+        memcpy(lo, pes_logit, (size_t)m->c.vocab * sizeof(float));
+    } else if (!prefill_control) {
         lo = step_ex_control(m, ids + reuse, np - reuse, reuse, 1,
                              interruptible ? &control : NULL);
         prefill_control = control.result;
@@ -8356,8 +8525,16 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
      * In that case the fully completed prefix is still safe to reuse. */
     if(g_q36_mux_slots == 1 && !prefill_control) prefill_control = serve_control_pending(q->id);
     if(prefill_control){
+        /* a STOP or CANCEL seen once the prompt was read whole: the state is its end, the
+         * snapshot a client that sends the same prompt again resumes from */
+        if(lo && !q->pin && q->logprobs == 0){ q36_pes_take(m, ids, np, lo); q36_pes_commit(m); }
         free(lo);
         g_echo_k = 0; g_echo_id = NULL;
+        if(getenv("COLI_PREFIX_LOG")){   /* what the next request finds (prompt_break.h's line) */
+            fprintf(stderr,"[PREFIX] %s while reading the prompt: %d of %d prompt tokens held\n",
+                    prefill_control == Q36_CONTROL_CANCEL ? "cancelled" : "stopped", m->kv_len, np);
+            fflush(stderr);
+        }
         if(prefill_control == Q36_CONTROL_CANCEL) printf("ERROR %s CANCELLED\n",q->id);
         else printf("DONE %s STAT 0 0.000 0.0 %.2f %d 0\n",q->id,rss_gb(),np);
         fflush(stdout);
@@ -8366,6 +8543,7 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     }
     qt_stats_mark();
     if (q->pin) pin_save(m, ids, np, lo);
+    else if (q->logprobs == 0) q36_pes_take(m, ids, np, lo);   /* its state after the first token: q36_pes_commit */
     clk->s_disk=m->t_disk; clk->s_attn=tm_sum(0)+tm_sum(1); clk->s_moe=tm_sum(2); clk->s_head=tm_sum(5);
     clk->hits=m->hits; clk->miss=m->miss;
     clk->t0=now_s();
@@ -8400,6 +8578,7 @@ static void serve_one_turn(Model *m, ServeReq *q){
             if(cn>0) serve_data(q->id,(char*)chunk,cn);
         }
         gen++;
+        if(s == 0) q36_pes_commit(m);   /* the first token is out; the state is still the prompt's end */
         /* #1332: una guardata a stdin per token. Il costo e' una select con
          * timeout zero; il guadagno e' che il gateway smette di aspettare un
          * turno che nessuno vuole piu'. */
@@ -8419,6 +8598,7 @@ static void serve_one_turn(Model *m, ServeReq *q){
         if(s == q->max_tok - 1) break;
         lo = q36_spec_step(m, &spec, tk, np+s, q->max_tok-1-s);
     }
+    q36_pes_commit(m);   /* a turn that ended on its first token (an EOS) */
     q36_spec_end(m, &spec);
     forwards += (int)spec.forwards;
     if(sbn>0) serve_data(q->id,(char*)sbuf,sbn);   /* flush trailing partial UTF-8 */

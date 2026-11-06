@@ -21,6 +21,11 @@
 /* The size of the list when Q38_MTP_VOCAB is unset. On replays of recorded drafts, 1,000 tokens
  * lost speed on short chats and 16,000 gained. */
 #define DRAFT_VOCAB_DEFAULT_TOP 16000
+/* The size beside the CUDA chain's card head (q38cc_head_card), which scores the list on the card:
+ * 64,000 of Qwen3.8's 151,936 tokens held 92-95 % of the picks against 81-84 % at 16,000, and
+ * 512-token answers gained 70.3-70.6 -> 74.1-74.8 tok/s (the whole vocabulary 69.9-71.2: its rows
+ * cost more than the picks they add) */
+#define DRAFT_VOCAB_CARD_TOP 64000
 
 /* A token whose count is at least NUM/DEN of the count of the last listed one is almost as
  * frequent, so the list includes it instead of ending exactly at the N-th token. */
