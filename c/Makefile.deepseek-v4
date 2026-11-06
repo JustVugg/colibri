@@ -348,7 +348,7 @@ $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
 	deepseek_v4_internal.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h fp8_format.h sse41_kernels.h \
 	route_trace.h vk_tier.h deepseek_v4_chain.h vk_chain.h \
 	native_quant.h native_quant_batch.h native_quant_dual.h \
-	native_quant_fp4_rows16.h expert_store_registry.h $(V4_FLAGS_STAMP)
+	native_quant_fp4_rows16.h expert_store_registry.h v4_np_route.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -D$* -c deepseek_v4.c -o $@
 
 $(V4_HOT_TEST_OBJ): deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h \
@@ -393,6 +393,15 @@ deepseek-v4-test-registry: test_expert_store_registry
 test_expert_store_registry: test_expert_store_registry.c expert_store_registry.c \
 	expert_store_registry.h expert_store.h compat.h
 	$(CC) -O2 -Wall -Wextra -D_FILE_OFFSET_BITS=64 test_expert_store_registry.c expert_store_registry.c -o $@
+
+# The AVX2 router (v4_np_route.h, V4_ROUTER_AVX2) against the scalar route of the
+# ROUTE_BF16 unit: tests/test_v4_np_route (random, near-tie, exact-tie, odd shapes).
+V4_NP_ROUTE_TEST := tests/test_v4_np_route$(if $(IS_WIN),.exe,)
+$(V4_NP_ROUTE_TEST): tests/test_v4_np_route.c v4_np_route.h COLI_V4_UNIT_ROUTE_BF16.o
+	$(CC) $(CFLAGS) $< COLI_V4_UNIT_ROUTE_BF16.o -o $@ $(LDFLAGS)
+.PHONY: deepseek-v4-test-np-route
+deepseek-v4-test-np-route: $(V4_NP_ROUTE_TEST)
+	./$(V4_NP_ROUTE_TEST)
 
 deepseek-v4-clean:
 	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_HOT_TEST_OBJ) \

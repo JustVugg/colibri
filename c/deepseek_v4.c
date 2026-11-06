@@ -10975,6 +10975,7 @@ int coli_v4_expert_forward_batch_ref(float *outputs,
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include "v4_np_route.h"   /* V4_ROUTER_AVX2: the exact vector router */
 #ifdef COLI_VULKAN
 #include "native_quant.h"   /* coli_v4_vk_matmul */
 #endif
@@ -11067,12 +11068,33 @@ static int route_bf16_impl(float *weights, int *indices, const float *hidden,
     return 0;
 }
 
+int coli_v4_route_bf16_scalar(float *weights, int *indices, const float *hidden,
+                              const uint16_t *gate, const float *bias,
+                              const int *forced_indices, int experts, int dimension,
+                              int topk, float route_scale) {
+    return route_bf16_impl(weights, indices, hidden, gate, bias, forced_indices,
+                           experts, dimension, topk, route_scale, NULL);
+}
+/* V4_ROUTER_AVX2=1 (v4_np_route.h): the same route bit for bit, the gate GEMV
+ * vectorized; forced routes and the scalar fallbacks stay on the scalar loop. */
 int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
                        const uint16_t *gate, const float *bias,
                        const int *forced_indices, int experts, int dimension,
                        int topk, float route_scale) {
-    return route_bf16_impl(weights, indices, hidden, gate, bias, forced_indices,
-                           experts, dimension, topk, route_scale, NULL);
+#ifdef V4_NP_ROUTE_AVX2
+    if (!forced_indices && v4_exact_router_enabled(experts, dimension, topk)) {
+        float *scratch = malloc((size_t)dimension * sizeof(*scratch));
+        if (scratch) {
+            int result = v4_np_route_bf16_avx2(weights, indices, hidden, gate, bias,
+                                               experts, dimension, topk, route_scale,
+                                               scratch, NULL);
+            free(scratch);
+            return result;
+        }
+    }
+#endif
+    return coli_v4_route_bf16_scalar(weights, indices, hidden, gate, bias,
+                                     forced_indices, experts, dimension, topk, route_scale);
 }
 int coli_v4_route_bf16_logits(float *weights, int *indices, const float *hidden,
                               const uint16_t *gate, const float *bias,
@@ -11080,6 +11102,19 @@ int coli_v4_route_bf16_logits(float *weights, int *indices, const float *hidden,
                               int topk, float route_scale, const float *logits) {
     return route_bf16_impl(weights, indices, hidden, gate, bias, forced_indices,
                            experts, dimension, topk, route_scale, logits);
+}
+/* The gate logits of the listed rows by route_bf16_impl's own loop (same unit,
+ * same flags, same order of operations): the experts the AVX2 router cannot
+ * place from its vector logits are recomputed here, bit-identical to the scalar route. */
+void coli_v4_route_bf16_rows(float *logits, const uint16_t *gate, const float *hidden,
+                             const int *rows, int count, int dimension) {
+    for (int i = 0; i < count; i++) {
+        float sum = 0.0f;
+        const uint16_t *row = gate + (size_t)rows[i] * dimension;
+        for (int column = 0; column < dimension; column++)
+            sum += route_bf16_decode(row[column]) * hidden[column];
+        logits[i] = sum;
+    }
 }
 #endif /* COLI_V4_UNIT_ROUTE_BF16 */
 
