@@ -30,7 +30,11 @@ same kind of sequence state.
    shared codec. Preserve numeric IDs through ULLONG_MAX, UTF-8, newlines,
    zero-byte tokens, opt-in logprob tails and ECHO position zero. The test runs
    the production mux emitters with a synthetic tokenizer and no model weights.
-2. Freeze SUBMIT/STOP/CANCEL transcripts before moving input framing. Cover
+2. Freeze SUBMIT/STOP/CANCEL transcripts before moving input framing. The next
+   committed baseline covers the real GLM admission/rejection path; shared body
+   reads now consume prompt, grammar and the delimiter for both GLM and the
+   general command reader. Keep the existing numeric header parser: the general
+   reader does not preserve all GLM field combinations or expose `ids=1`. Cover
    six/seven-field headers, numeric request IDs, grammar bytes, pin/logprobs/ids
    extensions, partial payloads, malformed framing and interleaved active slots.
    Keep `ColiSubmit` semantics and queue ownership unchanged.
@@ -69,9 +73,19 @@ Engine owns weights and stores; sessions own family-specific state and must be
 destroyed first. Unsupported prefix/snapshot operations must be explicit.
 Test two families with different state layouts before adding another abstraction.
 
-## This first slice
+## Delivered slices
 
-Only GLM DATA/ECHO emission moves. Input parsing, ACCEPT/ERROR/DONE, scheduler,
-KV ownership, token decoding and logprob arithmetic remain in their existing
-implementations. The baseline test is committed before the refactor so reviewers
-can run the same transcript assertions on both revisions.
+GLM DATA/ECHO emission and SUBMIT body reads use the shared codec. Numeric header
+parsing, malformed-header draining, mid-generation control polling, IMAGE,
+ACCEPT/ERROR/DONE, scheduling, KV ownership, token decoding and logprob arithmetic
+remain family-owned. Each production framing baseline is committed before its
+refactor so reviewers can run the same assertions on both revisions.
+
+The intake baseline covers legacy headers, grammar with embedded newlines,
+`pin`/`logprobs`/`ids` together, maximum numeric IDs, busy/duplicate/out-of-range
+slots, NUL rejection, malformed headers, unknown and malformed control requests,
+truncated prompt/grammar, and missing/non-LF delimiters. Rejections that can
+continue are followed by another control frame to verify stream alignment.
+These synthetic tests do not exercise active-request STOP/CANCEL effects or
+model inference. Full header/control migration and hardware acceptance remain
+open; this is not a completed GLM migration.

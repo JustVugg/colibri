@@ -172,6 +172,22 @@ static inline void coli_serve_classify_line(
     }
 }
 
+/* Read an already-sized SUBMIT body into caller-owned buffers. Header dialect,
+ * allocation and NUL termination remain with the caller. EOF means a short
+ * payload/extension read; BAD_FRAME means a missing or invalid delimiter. */
+static inline ColiServeReadResult coli_serve_read_submit_body(
+    FILE *input, void *payload, size_t payload_bytes,
+    void *extension, size_t extension_bytes, int require_exact_lf)
+{
+    if ((payload_bytes && fread(payload, 1, payload_bytes, input) != payload_bytes) ||
+        (extension_bytes && fread(extension, 1, extension_bytes, input) != extension_bytes))
+        return COLI_SERVE_READ_EOF;
+    int terminator = fgetc(input);
+    if (terminator == EOF || (require_exact_lf && terminator != '\n'))
+        return COLI_SERVE_READ_BAD_FRAME;
+    return COLI_SERVE_READ_OK;
+}
+
 static inline ColiServeReadResult coli_serve_read_command_alloc(
     FILE *input, const ColiServeWireProfile *profile, ColiServeCommand *command,
     void *(*allocate)(size_t))
@@ -376,19 +392,13 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
     size_t extension_bytes = (size_t)command->extension_bytes;
     command->payload = allocate(payload_bytes + 1 + extension_bytes);
     if (!command->payload) return COLI_SERVE_READ_NOMEM;
-    if (fread(command->payload, 1, payload_bytes, input) != payload_bytes ||
-        (extension_bytes &&
-         fread(command->payload + payload_bytes + 1, 1, extension_bytes, input) !=
-             extension_bytes)) {
+    if (coli_serve_read_submit_body(input, command->payload, payload_bytes,
+            command->payload + payload_bytes + 1, extension_bytes,
+            profile->require_exact_lf) != COLI_SERVE_READ_OK) {
         coli_serve_command_dispose(command);
         return COLI_SERVE_READ_BAD_FRAME;
     }
     command->payload[payload_bytes] = 0;
-    int terminator = fgetc(input);
-    if (terminator == EOF || (profile->require_exact_lf && terminator != '\n')) {
-        coli_serve_command_dispose(command);
-        return COLI_SERVE_READ_BAD_FRAME;
-    }
     return COLI_SERVE_READ_OK;
 }
 
