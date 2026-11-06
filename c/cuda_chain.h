@@ -336,6 +336,17 @@ typedef struct ColiCudaChainOps {
     /* preload: the chain's and the backend's kernels loaded on the chain's device (the runtime
      * loads a module at the first launch of one of its kernels otherwise); 1 done */
     int  (*preload)(void);
+    /* moe_cols: moe's parts 3 for a prompt's rows (more than CC_MOE_FRAME_ROWS) with down and the
+     * rows' sums a slice of cols outputs at a time (cols a multiple of 128), hid of
+     * cc_moe_hid_floats(S, K, cols, I, E) floats: a layer's rows in one call where a chunk's hid
+     * would not hold them. A GGUF's types the f16 tiles take, no host rows (h_off < 0); each row of
+     * y the bits moe gives it. 1 done, -1 not taken (the caller's chunks), 0 a failure */
+    int  (*moe_cols)(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *y, const CcMoe *p, int cols);
+    /* matmul_hcmix: a hyper-connection read's up projection of n rows of x (from float x_off) and its
+     * mix in one pass: y (n rows of H) = sum over the C (4) streams b of sigmoid((x t^T)[b H + d]) times
+     * hn's row at b H + d, over fc; matmul then ew's CC_EW_HC_MIX with the same bits, the product never
+     * written. 1 done, -1 not taken (the caller's two ops), 0 a failure */
+    int  (*matmul_hcmix)(ColiCudaTensor *t, CcBuf *x, size_t x_off, CcBuf *hn, CcBuf *y, int n, int H, int C, float fc);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -404,6 +415,18 @@ static inline int cc_host_up_many(void *const *dst, const void *const *src, cons
     if (t && t->size >= offsetof(ColiCudaChainOps, host_up_n) + sizeof t->host_up_n && t->host_up_n) return t->host_up_n(dst, src, bytes, n, ticket);
     for (int i = 0; i < n; i++) if (!cc_host_up(dst[i], src[i], bytes[i], ticket)) return 0;
     return 1;
+}
+static inline int cc_moe_cols_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, moe_cols) + sizeof t->moe_cols && t->moe_cols;
+}
+static inline int cc_moe_cols(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *y, const CcMoe *p, int cols) {
+    return cc_moe_cols_ready() ? cc_ops()->moe_cols(tab, x, ids, w, hid, y, p, cols) : -1;
+}
+static inline int cc_matmul_hcmix(ColiCudaTensor *t, CcBuf *x, size_t x_off, CcBuf *hn, CcBuf *y, int n, int H, int C, float fc) {
+    const ColiCudaChainOps *o = cc_ops();
+    return o && o->size >= offsetof(ColiCudaChainOps, matmul_hcmix) + sizeof o->matmul_hcmix && o->matmul_hcmix
+           ? o->matmul_hcmix(t, x, x_off, hn, y, n, H, C, fc) : -1;
 }
 /* the chain's and the backend's kernels loaded now where the backend can (an older one loads them
  * at their first launch) */
