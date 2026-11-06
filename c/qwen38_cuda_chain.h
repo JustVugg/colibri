@@ -2784,8 +2784,10 @@ static int q38cc_frame_begin(Q38CChain *ch) {
 /* ---- a long prompt layer by layer (qwen38_chain.h's q38c_forward_lm, on CUDA) ----------
  * A prompt of more chunks than one staged every layer's host pool experts once a chunk.
  * Where every layer runs its experts in the frame (no hybrid layer) and a chunk stages them,
- * the prompt runs layer by layer: each layer's chunks in order, its experts' copy waited for
- * at its first chunk and the next staged layer's copy started after its last, every row's
+ * the prompt runs layer by layer: each layer's chunks in order, twice (the attention or
+ * DeltaNet of every chunk, then the experts of every chunk), its experts' copy waited for at
+ * the second pass's first chunk and the next staged layer's copy started after its last, so
+ * that copy runs beside the next layer's whole first pass; every row's
  * streams on the device between layers (hyper_all), each layer's chunk a frame waited for
  * (the host's tables it writes and its K/V rows down are a chunk's, each chunk the bits it
  * gets chunk by chunk). The promotions' heat counts each layer's chunks as they run, and their
@@ -2842,6 +2844,11 @@ static int q38cc_forward_lm(Model *m, Q38CChain *ch, const int *ids, int S, int 
              * declines the step and q38_serve_prefill puts back the state it copied */
             if (coli_prompt_break()) { cc_finish(); free(cs_all); return 2; }
             Layer *l = &m->L[i];
+            /* the layer's attention (or DeltaNet) for every chunk first, then its experts for every
+             * chunk: a chunk's experts read only its own rows, and the layer's copy over the bus runs
+             * beside all of the first pass instead of the first chunk's attention alone (the
+             * staging is free once the layer before read its weights). Each chunk takes the ops it
+             * took, on the same values: the streams after the attention wait in hyper_all */
             for (int c0 = g0; c0 < g0 + gn; c0 += rows) {
                 int n = g0 + gn - c0 < rows ? g0 + gn - c0 : rows, pb = pos_base + c0;
                 if (!q38cc_frame_begin(ch)) { free(cs_all); return -1; }
@@ -2851,6 +2858,18 @@ static int q38cc_forward_lm(Model *m, Q38CChain *ch, const int *ids, int S, int 
                 ok = ok && q38cc_gr_read(ch, m, &l->attn_gr, ch->o_an[i], n, ch->inj_a);
                 ok = ok && (c->is_attn[i] ? q38cc_attention(ch, m, l, i, n, pb) : q38cc_deltanet(ch, m, l, i, n, c0, 0));
                 ok = ok && q38cc_gr_apply(ch, m, ch->inj_a, n);
+                ok = ok && cc_copy(ch->hyper_all, (size_t)(c0 - g0) * W, ch->hyper, 0, (size_t)n * W);
+                double t0 = now_s();
+                ok = ok && cc_submit(1);
+                m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0; ch->wait_ms += (now_s() - t0) * 1e3;
+                if (!ok) { free(cs_all); return -1; }
+                q38cc_kv_down(ch, m, i, n, pb);
+                if (c->is_attn[i]) ch->kv_valid[i] = pb + n;
+            }
+            for (int c0 = g0; c0 < g0 + gn; c0 += rows) {
+                int n = g0 + gn - c0 < rows ? g0 + gn - c0 : rows;
+                if (!q38cc_frame_begin(ch)) { free(cs_all); return -1; }
+                int ok = cc_copy(ch->hyper, 0, ch->hyper_all, (size_t)(c0 - g0) * W, (size_t)n * W);
                 ok = ok && q38cc_gr_read(ch, m, &l->mlp_gr, ch->o_mn[i], n, ch->inj_m);
                 ok = ok && q38cc_dm_layer_lm(ch, m, l, i, n, c0 == g0, c0 + n >= g0 + gn) && q38cc_moe_apply(ch, m, n, ch->dm_y);
                 ok = ok && cc_copy(ch->hyper_all, (size_t)(c0 - g0) * W, ch->hyper, 0, (size_t)n * W);
@@ -2866,8 +2885,7 @@ static int q38cc_forward_lm(Model *m, Q38CChain *ch, const int *ids, int S, int 
                 m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0; ch->wait_ms += (now_s() - t0) * 1e3;
                 if (!ok) { free(cs_all); return -1; }
                 if (want_streams && i == L - 1) memcpy(hyper_h + (size_t)c0 * W, cc_ptr(ch->hypd), (size_t)n * W * 4);   /* the frame is done */
-                /* layer i's books for these rows (q38cc_dm_books' for one layer) */
-                q38cc_kv_down(ch, m, i, n, pb);
+                /* layer i's books for these rows (q38cc_dm_books' for one layer; its K/V rows went down after the first pass) */
                 const int *idv = (const int *)cc_ptr(ch->dm_idsd) + (size_t)i * ch->rows * K;
                 for (int s = 0; s < n; s++) { rt_count(i, idv + s * K, K); if (!ch->own) qt_chain_count(i, idv + s * K, K); }
                 for (int j = 0; j < n * K; j++) if (idv[j] >= 0) {
@@ -2877,7 +2895,6 @@ static int q38cc_forward_lm(Model *m, Q38CChain *ch, const int *ids, int S, int 
                 }
                 if (ch->own && ch->promo_rate > 0) { q38cc_heat_layer(ch, m, i, n); if (i == L - 1) q38cc_heat_tick(ch, m, n); }
                 if (i == L - 1) nlast = n;
-                if (c->is_attn[i]) ch->kv_valid[i] = pb + n;
                 ch->dn_where = Q38CC_DEV; ch->host_zero = 0;
             }
         }

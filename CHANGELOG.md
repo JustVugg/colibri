@@ -37,6 +37,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **Qwen3.8 on the CUDA chain: a long prompt's layer in two passes.** Run layer by layer, a
+  layer's experts that are off the card are copied to the prompt's staging while the layers before
+  it run, but the copy could start only once the layer before had read its own, so it ran beside
+  the first chunk's attention alone. Each layer now runs every chunk's attention (or DeltaNet)
+  first and every chunk's experts after it, the same ops on the same values, so the copy runs beside
+  the whole first pass. UD-IQ2_XS on an RTX PRO 4000, two serves a side: a 4220-token prompt
+  737.8-744.8 -> 810.4 tok/s, the answer the same, the other prompts and the decode the same.
 - **Qwen3.8 on the CUDA chain: each expert at its own layer's size, on the card and in the host
   pool.** unsloth's Dynamic V3.1 GGUFs mix expert types by layer (UD-IQ2_XS: five sizes from 1.26
   to 2.09 MB), and the chain kept every expert in a slot of the largest, on the card and in the
