@@ -615,7 +615,7 @@ static int pick_memtype_sys(VkPhysicalDevice phys) {
 static int place_plain(VkMemoryPropertyFlags f) {
     return !(f & (VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT | 0xC0u));
 }
-static int place_decide(VkPhysicalDevice phys, int mt_host, VkUp *u, int may_later) {   /* may_later: device 0 only */
+static int place_decide(VkPhysicalDevice phys, int mt_host, VkUp *u) {
     VkPhysicalDeviceMemoryProperties m;
     vkGetPhysicalDeviceMemoryProperties(phys, &m);
     VkDeviceSize dl_max = 0, hv = 0;
@@ -656,7 +656,7 @@ static int place_decide(VkPhysicalDevice phys, int mt_host, VkUp *u, int may_lat
     VkPhysicalDeviceProperties pp;
     vkGetPhysicalDeviceProperties(phys, &pp);
     const char *kn = getenv("COLI_VK_WINDOW_PROBE_MB"), *ka = getenv("COLI_VK_WINDOW_ASK_MB");
-    u->later = may_later && !on && !(e && *e) && dev >= 0 && st >= 0 && mt_host >= 0 &&
+    u->later = !on && !(e && *e) && dev >= 0 && st >= 0 && mt_host >= 0 &&
                (m.memoryTypes[mt_host].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
                (pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU || (kn && *kn) || (ka && *ka));
     if (on || u->later) { u->mt_dev = (uint32_t)dev; u->mt_stage = (uint32_t)st; }
@@ -675,11 +675,11 @@ static void vk_window_mapped(VkUp *u) {
  * when the small allocation for the block list fails: mapped, no line).
  * The blocks go through vk_mem_alloc like every allocation here: the books count them until they are freed, and
  * COLI_VK_DEVICE_CAP_MB limits them (a capped device reads as a small window). */
-static void vk_window_decide(VkUp *u) {
+static void vk_window_decide(VkUp *u, VkPhysicalDevice phys, uint32_t memtype, int has_budget, const char *tag) {
     u->later = 0;   /* decided from here on */
     VkPhysicalDeviceMemoryProperties m;
-    vkGetPhysicalDeviceMemoryProperties(G.phys, &m);
-    const uint32_t hi = m.memoryTypes[G.memtype].heapIndex;
+    vkGetPhysicalDeviceMemoryProperties(phys, &m);
+    const uint32_t hi = m.memoryTypes[memtype].heapIndex;
     int want = (int)(m.memoryHeaps[hi].size >> 30) * 9 / 10;   /* GiB */
     const char *kn = getenv("COLI_VK_WINDOW_PROBE_MB"), *ka = getenv("COLI_VK_WINDOW_ASK_MB");
     const char *by = kn && *kn ? " (COLI_VK_WINDOW_PROBE_MB)" : ka && *ka ? " (COLI_VK_WINDOW_ASK_MB)" : "";
@@ -688,10 +688,10 @@ static void vk_window_decide(VkUp *u) {
         if (a < want) want = a > 0 ? a : 1;
     }
 #ifdef VK_EXT_memory_budget
-    if (!(kn && *kn) && G.has_budget) {
+    if (!(kn && *kn) && has_budget) {
         VkPhysicalDeviceMemoryBudgetPropertiesEXT bud = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
         VkPhysicalDeviceMemoryProperties2 mp2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bud};
-        vkGetPhysicalDeviceMemoryProperties2(G.phys, &mp2);
+        vkGetPhysicalDeviceMemoryProperties2(phys, &mp2);
         if (bud.heapBudget[hi]) {
             const int room = bud.heapBudget[hi] > bud.heapUsage[hi] ? (int)((bud.heapBudget[hi] - bud.heapUsage[hi]) >> 30) : 0;
             if (room < want) want = room;
@@ -707,16 +707,16 @@ static void vk_window_decide(VkUp *u) {
         double t0 = vk_now();
         for (; got < want; got++) {
             VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-                .allocationSize = (VkDeviceSize)1 << 30, .memoryTypeIndex = G.memtype};
-            if (vkAllocateMemory(G.dev, &ai, NULL, &blk[got]) != VK_SUCCESS) break;
+                .allocationSize = (VkDeviceSize)1 << 30, .memoryTypeIndex = memtype};
+            if (vkAllocateMemory(u->dev, &ai, NULL, &blk[got]) != VK_SUCCESS) break;
         }
-        for (int i = 0; i < got; i++) vkFreeMemory(G.dev, blk[i], NULL);
+        for (int i = 0; i < got; i++) vkFreeMemory(u->dev, blk[i], NULL);
         ms = vk_now() - t0;
     }
     free(blk);
     if (got >= want) {
-        fprintf(stderr, "[VK] memory: mapped weights, the host-visible device-local memory gave the %d GiB asked (9/10 of "
-                "its heap, less if its budget leaves less), found in %.1f s%s\n", got, ms / 1000.0, by);
+        fprintf(stderr, "[VK] %smemory: mapped weights, the host-visible device-local memory gave the %d GiB asked (9/10 of "
+                "its heap, less if its budget leaves less), found in %.1f s%s\n", tag, got, ms / 1000.0, by);
         vk_window_mapped(u);
         return;
     }
@@ -1204,7 +1204,7 @@ int coli_vk_init(const char *spv_path) {
      * its queues: a transfer-only family (a copy engine), else a spare queue of a family
      * already asked for, else the main queue, shared under g_qmx[0]. */
     uint32_t up_fam = G.qfam, up_idx = 0; int up_shared = 1;
-    if (place_decide(G.phys, pick_memtype(G.phys, COLI_VK_MEM_CPU_WRITES), &g_up[0], 1) || g_up[0].later) {
+    if (place_decide(G.phys, pick_memtype(G.phys, COLI_VK_MEM_CPU_WRITES), &g_up[0]) || g_up[0].later) {
         uint32_t t = UINT32_MAX;
         for (uint32_t i = 0; i < nq && t == UINT32_MAX; i++)
             if ((qf[i].queueFlags & VK_QUEUE_TRANSFER_BIT) && qf[i].queueCount &&
@@ -1513,7 +1513,7 @@ int coli_vk_init(const char *spv_path) {
         VkMemoryPropertyFlags cf = mp.memoryTypes[G.memtype].propertyFlags;
         VkDeviceSize hv_dl = mp.memoryHeaps[mp.memoryTypes[G.memtype].heapIndex].size;
         const int integrated = vk_integrated(G.phys);   /* an integrated GPU has no BAR window and uses system memory */
-        if (g_up[0].later) vk_window_decide(&g_up[0]);
+        if (g_up[0].later) vk_window_decide(&g_up[0], G.phys, G.memtype, G.has_budget, "");
         if (g_up[0].on && !up_init(&g_up[0])) {
             fprintf(stderr, "[VK] staged uploads unavailable (no staging buffer): resident data stays in mapped memory\n");
             up_destroy(&g_up[0]);
@@ -3229,14 +3229,16 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
         }
     }
     /* its experts as device 0's: staged uploads by the same rule, on its one queue */
-    if (place_decide(G2.phys, mt, &g_up[1], 0)) {
+    place_decide(G2.phys, mt, &g_up[1]);
+    if (g_up[1].on || g_up[1].later) {
         VkUp *u = &g_up[1];
         u->dev = G2.dev; u->q = G2.queue; u->fam = G2.qfam; u->shared = 1;
         u->fams[0] = G2.qfam; u->nfams = 1;
-        if (!up_init(u)) {
+        if (u->later) vk_window_decide(u, G2.phys, G2.memtype, G2.has_budget, "dev2 ");
+        if (u->on && !up_init(u)) {
             fprintf(stderr, "[VK] dev2: staged uploads unavailable (no staging buffer): its experts stay in mapped memory\n");
             up_destroy(u); u->on = u->shared = 0;
-        } else fprintf(stderr, "[VK] dev2 memory: staged uploads, experts in device-local memory (type %u) copied from "
+        } else if (u->on) fprintf(stderr, "[VK] dev2 memory: staged uploads, experts in device-local memory (type %u) copied from "
                        "host staging memory (type %u) (%s)\n", u->mt_dev, u->mt_stage, u->why);
         up_import_init(u, G2.phys, G2.has_hostmem, "dev2 ");
     }
