@@ -3805,6 +3805,87 @@ static void bench_xb(void) {
     free(t); free(ex); free(x); free(xr); free(yr); free(ones); free(sel);
 }
 
+/* COLI_VK_CHAIN_BENCH=xbrows: the row count at which streaming a cold expert to the
+ * device beats leaving it to the CPU, measured rather than assumed (vk_tier.c's
+ * stream_min_rows took the GEMM route's 16 rows for it until this bench).
+ *
+ * One routed expert of a DeepSeek V4.1 prefill step (D 5120, I 2304, gate/up and down in
+ * MXFP4 with a ue8m0 scale per 32 inputs: 21.1 MiB) and the device time of a batch that is
+ * that expert alone at 1..64 rows, the route the tier would give it (COLI_VK_TIER_GEMM_ROWS,
+ * 16: the tiled GEMM from there, the per-row GEMV below). The upload is not in these
+ * numbers: the engine measures it (its "an upload of 21.1 MiB at N GB/s" line, about 2.2 ms
+ * on a PCIe 4.0 x16 card) and the CPU's own time per (row, expert) pair beside it (2.05-2.52
+ * ms a row on this box's i9-12900K). Streaming wins when  upload + device(r) < r * cpu_row.
+ * COLI_VK_BENCH_ROWS "r1 r2 ..." overrides the row list. */
+static void bench_xbrows(void) {
+    int D = 5120, I = 2304, fmt = 7, gs = 32, act = COLI_VK_ACT_SWIGLU_V4;
+    const char *sh = getenv("COLI_VK_BENCH_MOE");
+    if (sh && *sh) sscanf(sh, "%d %d", &D, &I);
+    const char *fe = getenv("COLI_VK_BENCH_FMTS");
+    if (fe && *fe) sscanf(fe, "%d", &fmt);
+    const char *ge = getenv("COLI_VK_BENCH_GS");
+    if (ge && *ge) gs = atoi(ge);
+    if (!coli_vk_xb_init(D, I, act, 0, 4.f, 25.f)) { printf("bench xbrows: no expert batch here\n"); return; }
+    coli_vk_tier_pool_limit((size_t)1 << 40);
+    ColiVkTensor *t[3] = {NULL, NULL, NULL};
+    int ok = 1;
+    for (int m = 0; m < 3 && ok; m++) {
+        int in = m < 2 ? D : I, out = m < 2 ? I : D, g = fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13 ? gs : 0;
+        uint8_t *rows; size_t stride; float *sc;
+        if (!(ok = coli_vk_tier_tensor(&t[m], fmt, in, out, g, &rows, &stride, &sc))) break;
+        size_t rb = coli_vk_tensor_row_bytes(fmt, in), ns = coli_vk_tensor_scale_count(fmt, in, out, g);
+        for (int o = 0; o < out; o++)
+            for (size_t b = 0; b < rb; b++) rows[(size_t)o * stride + b] = (uint8_t)(rnd() % 0x70);
+        for (size_t i = 0; i < ns; i++) sc[i] = 0.002f;
+        ok = coli_vk_tensor_commit(&t[m], 1);
+    }
+    ColiVkExpert *ex = ok ? coli_vk_xb_expert(t[0], t[1], t[2]) : NULL;
+    if (!ex) { printf("bench xbrows: the expert did not go up (fmt %d gs %d)\n", fmt, gs); return; }
+    double mb = (double)(coli_vk_tensor_payload(fmt, D, I, gs) * 2 + coli_vk_tensor_payload(fmt, I, D, gs)) / 1048576.0;
+    int R[16], nR = 0;
+    const char *re = getenv("COLI_VK_BENCH_ROWS");
+    if (re && *re) { char *c = (char *)re; while (nR < 16 && *c) { int v = atoi(c); if (v > 0 && v <= 512) R[nR++] = v; while (*c && *c != ' ') c++; while (*c == ' ') c++; } }
+    else { static const int d[] = {1, 2, 4, 8, 16, 32, 64}; for (size_t i = 0; i < sizeof d / sizeof *d; i++) R[nR++] = d[i]; }
+    int maxr = 0;
+    for (int i = 0; i < nR; i++) if (R[i] > maxr) maxr = R[i];
+    float *x = fvec((size_t)maxr * D, 1.f), *y = malloc((size_t)maxr * D * sizeof *y);
+    const float *xr[512], *yr[512];
+    for (int i = 0; i < maxr; i++) { xr[i] = x + (size_t)i * D; yr[i] = y + (size_t)i * D; }
+    double ms[16];
+    ColiVkXbStats xs;
+    coli_vk_xb_stats(&xs);
+    printf("bench xbrows: one expert, %.1f MiB (fmt %d gs %d), D %d I %d, act %d, the GEMM from %d rows:\n",
+           mb, fmt, gs, D, I, act, xs.gemm_rows);
+    for (int i = 0; i < nR && ok; i++) {
+        int r = R[i];
+        int rows[1] = {r};
+        double best = 1e9, bestw = 1e9;
+        for (int it = 0; it < 5 && ok; it++) {
+            double dms = 0, t0 = bnow();
+            ok = coli_vk_xb_issue_w(&ex, rows, 1, xr, NULL) && coli_vk_xb_join(yr, &dms);
+            double w = bnow() - t0;
+            if (ok && dms > 0 && dms < best) best = dms;
+            if (ok && w < bestw) bestw = w;
+        }
+        ms[i] = ok ? (best < 1e8 ? best : bestw * 1e3) : 0;   /* no timestamps: the wall */
+        if (!ok) break;
+        printf("  %3d rows: %.3f ms a step = %.3f ms a row (%s)\n", r, ms[i], ms[i] / r,
+               xs.gemm_rows && r >= xs.gemm_rows ? "the tiled GEMM" : "the per-row GEMV");
+    }
+    if (ok) {   /* the verdict, on this box's measured upload and CPU pair times */
+        double up = 2.2, cpu = 2.3;
+        printf("  the tier's rule: upload %.2f ms + the device's step against the CPU's %.2f ms a row; "
+               "the device is the cheaper side from ", up, cpu);
+        int br = 0;
+        for (int i = 0; i < nR; i++)
+            if (!br && up + ms[i] < R[i] * cpu) br = R[i];
+        if (br) printf("%d row%s\n", br, br == 1 ? "" : "s");
+        else printf("past %d rows (none of these)\n", R[nR - 1]);
+    }
+    if (ex) coli_vk_xb_expert_free(ex);   /* the tensors go with the pool, as bench_xb's do */
+    free(x); free(y);
+}
+
 /* COLI_VK_CHAIN_BENCH=rows: a prompt chunk's routed experts (vkc_route + vkc_moe_rows) at
  * Qwen3.6's shapes in our int4-g64 (D 2048, I 512, 256 experts, top 8), S rows
  * (COLI_VK_BENCH_ROWS, 467), L layers of experts of their own (COLI_VK_BENCH_L, 4) each
@@ -4075,6 +4156,7 @@ int main(int argc, char **argv) {
         if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "small")) bench_small();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "moe")) bench_moe();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "xb")) bench_xb();
+        else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "xbrows")) bench_xbrows();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "dn")) bench_dn();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "dsa")) bench_dsa();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "mla")) bench_mla();

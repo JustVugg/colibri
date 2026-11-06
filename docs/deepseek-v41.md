@@ -533,9 +533,62 @@ What that leaves the tier is smaller than the window itself. On the 16 GiB card 
 was measured on, the driver's budget exposes about 90% of the heap (13.3 of 14.4 GiB),
 the trunk holds 7.62 GiB once placed, and the window asks the remaining 5 GiB; the
 tier's own sizing then sets aside its 1 GiB reserve, the ~1.4 GiB of bf16 dense tail
-still to be uploaded lazily, and the 64 streaming slots (~1.35 GiB), leaving a 3.31 GiB
-resident budget — 84 experts of 21.1 MiB — beside a trunk the whole prompt pays for on
-every token. `COLI_VK_TIER_RESERVE_GB=0` and `COLI_VK_TIER_HOST` trade that back.
+still to be uploaded lazily, and the streaming slots (48, ~1 GiB: measured, each one's
+saving goes back to the residents), leaving a ~3.4 GiB budget — 107 experts of 21.1 MiB —
+beside a trunk the whole prompt pays for on every token. `COLI_VK_TIER_RESERVE_GB=0` and
+`COLI_VK_TIER_HOST` trade that back. The ledger below shows where it ends up, and the
+2.1 GiB the trunk still uploads after that fit (embedding, routers, the DSpark stages).
+
+### Where the VRAM goes at a turn's end
+
+`V41_STATS=1` (or `COLI_VK_LEDGER=1`) ends every serve turn with one ledger line
+(`v41c_ledger`, `c/deepseek_v41_chain.h`), because nothing else printed the pieces
+that decide whether a prompt fits:
+
+```
+[VK] deepseek_v41 vram: weights 9710.5 MiB in 34 blocks (9608.2 MiB of rows in 521 tensors) |
+  chain 2060.0 MiB (dev 900.0 in 11 blocks, down 208.0 in 3, up 1024.0 in 10) | tier resident
+  2257.0 MiB + 48 slots 1012.5 MiB = 3269.5 of 3310.9 in 13 blocks | extra layers 232.0 in 1
+  blocks | kv mirror 115.0 MiB | process 15.31 GiB of 15.02 GiB in pools (290.5 MiB outside) |
+  device 15.91 GiB used of 15.98 (card2)
+```
+
+`weights` is the weight pool's blocks (the trunk's matrices *and* the ones the first
+forward still uploads: see below), `chain` the dense chain's live buffers and the three
+pools it allocates from, `tier` the expert pool — residents and streaming slots together,
+which is what its budget buys — `process` this engine's device bytes from
+`backend_vulkan.c`'s books, and `device` the card's live `mem_info_vram_used`.
+
+What it showed on the 16 GiB card, a 2-turn run with a 2600-word prompt:
+
+- **The audit's unattributed 2.14 GiB on a short-prompt run is not the tier.** On that
+  arm the tier's pools do not move after the warm start: the growth from the post-load
+  line (`device memory held 8187281408 B`, 7.63 GiB) to the turn's end is 1262.5 MiB of
+  token embedding (129280 x 5120 bf16) + 150 MiB of the 40 routers + 673 MiB of the
+  DSpark stages' matrices, all uploaded by the *first forward* and counted by neither the
+  chain's `dev_bytes` nor the tier's budget; 52 MiB is the KV mirrors. The weight pool
+  holds 9608.2 MiB of rows at the turn's end against the 7523.0 MiB the setup places.
+- **The streaming slots cost one 256 MiB block, not 1.35 GiB.** The tier splits its
+  budget between residents and slots (`fit = fit_raw - slots`), so shrinking the slot
+  set does not by itself free anything: 64 slots and 91 residents fill the same 13 pool
+  blocks as 48 and 107. The slots are now 48 by default (`COLI_VK_TIER_STREAM_SLOTS`;
+  the measured runs used 44 of 64 at most), and the chunk's sizing reserves them before
+  it reads the free memory (`vkt_slot_reserve`), so a 1280-row chunk becomes 1024 at
+  default settings. Together that took the engine's own hold at the turn boundary from
+  15.53 to 15.26 GiB (chain 2133.7 -> 2060.0 MiB) with the prefill wall +2%.
+- **The card's sysfs peak does not measure the engine here.** It is pinned at the card's
+  ceiling because the desktop yields: with the tier forced to 2.0 GiB the engine held
+  1.46 GiB less and the sysfs peak fell 0.19 GiB, the compositor taking 1.27 GiB of what
+  was freed. Read `process` for the engine, not the card. (On a prompt small enough not
+  to press on the ceiling — the 11-token one — the two agree: peak = `process` + 2.49
+  GiB of desktop.)
+- **Streaming a cold expert pays from two rows, not sixteen.** `COLI_VK_TIER_STREAM_MIN`
+  is 2 now, from a measurement of one 21.1 MiB expert (`COLI_VK_CHAIN_BENCH=xbrows`): a
+  device step costs 0.12 ms at 1 row, 0.40 at 4 and 0.76 at 16 (the tiled GEMM from
+  there) against a 2.2 ms upload and the CPU's 2.05-2.52 ms a row. On the chunk-256
+  workload the CPU's share of expert-rows fell from 34.5% to 1.6% and the prefill from
+  226.7 to 175.9 ms a row; the device reads 2 TB of experts to do it, so it pays in disk
+  bandwidth, not in time.
 
 ## Reusing a turn, and why it is asked for rather than assumed
 

@@ -3364,6 +3364,17 @@ int vkc_enc_rel(VkcBuf *x, VkcBuf *pt, VkcBuf *y, const VkcEncRel *p) {
 }
 
 void vkc_stats(VkcStats *st) { *st = KC.st; }
+int vkc_pool_bytes(int kind, VkcPoolBytes *o) {
+    if (!o || kind < 0 || kind > 2) return 0;
+    memset(o, 0, sizeof *o);
+    const VkcPool *P = &KC.pool[kind];
+    for (int k = 0; k < P->p.nb; k++) {
+        const VkaBlock *b = &P->p.b[k];
+        if (!b->present) continue;
+        o->blocks++; o->total += b->cap; o->used += b->used;
+    }
+    return 1;
+}
 
 /* ---- big prefill chunks ------------------------------------------------------------
  * The rows of a prompt chunk (vk_chain.h, vkc_chunk_rows). The free device memory is
@@ -3392,9 +3403,18 @@ int vkc_chunk_rows(const char *engine, size_t row_bytes) {
      * discrete device. Bound both memories, including Windows commit headroom. */
     double avail = compat_mem_available_gb() * 1e9;
     if (avail > 0 && avail < free_b) free_b = avail;
-    /* the room the tier's budget left for a chunk's host pool experts (vk_dmoe.h), not
-     * for rows: Qwen3.8's chunks took it and every prompt after the first read the pool */
-    if (g_kd == 0) free_b -= (double)vkt_stage_room();
+    /* The tier's own commitments, made after this chunk is sized, come out first: what its
+     * budget left for a chunk's host pool experts (vk_dmoe.h, not for rows: Qwen3.8's
+     * chunks took it and every prompt after the first read the pool), and the streaming
+     * slots the first streaming step will allocate (vkt_slot_reserve). Without them the
+     * chunk spends headroom the tier still needs, and the two fight over it at the turn
+     * boundary (the audit's ordering hazard: 1.35 GiB of slots made after a chunk sized
+     * from the same free memory). */
+    size_t reserved = 0;
+    if (g_kd == 0) {
+        reserved = vkt_stage_room() + vkt_slot_reserve();
+        free_b -= (double)reserved;
+    }
     if (free_b < 0) free_b = 0;
     double fit = row_bytes ? free_b / 2 / (double)row_bytes : cap;
     int rows = fit >= cap ? cap : (int)fit;
@@ -3404,9 +3424,10 @@ int vkc_chunk_rows(const char *engine, size_t row_bytes) {
         snprintf(said[nsaid], sizeof said[nsaid], "%s", engine ? engine : "");
         said_d[nsaid] = g_kd; rows_said[nsaid++] = rows;
         fprintf(stderr, "[VK] %s chain: prompt chunks of up to %d rows (%.0f KiB a row; %.2f GiB free on the device%s, "
-                "half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at %d)\n",
-                engine ? engine : "engine", rows, row_bytes / 1024.0, free_b / 1073741824.0,
-                avail > 0 ? " or in RAM" : "", cap);
+                "%.2f GiB of it the tier's slots and staging, half of the rest at most; COLI_VK_CHAIN_ROWS sets it, "
+                "COLI_VK_CHAIN_ROWS_MAX caps it at %d)\n",
+                engine ? engine : "engine", rows, row_bytes / 1024.0, (free_b + (double)reserved) / 1073741824.0,
+                avail > 0 ? " or in RAM" : "", (double)reserved / 1073741824.0, cap);
     }
     return rows;
 }

@@ -893,6 +893,12 @@ typedef struct {
     unsigned long long grp_wide;       /* of the grouped expert GEMMs, those at the wider item (qmatmul_grp*_bdcw.comp) */
 } VkcStats;
 void vkc_stats(VkcStats *st);
+/* One of the chain's three pools (VKC_DEV, VKC_UP, VKC_DOWN): the blocks it holds on the
+ * device, their bytes together, and the bytes handed out of them. VKC_DEV's blocks are the
+ * chain's whole device footprint (them, not `dev_bytes`, is what the device has allocated).
+ * For the engines' VRAM ledger; 0 on a kind that is not a pool. */
+typedef struct { int blocks; size_t total, used; } VkcPoolBytes;
+int vkc_pool_bytes(int kind, VkcPoolBytes *o);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */
 void vkc_prof_print(void);
 

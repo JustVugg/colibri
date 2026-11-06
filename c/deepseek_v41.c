@@ -66,6 +66,7 @@
 #if defined(COLI_VULKAN) && !defined(_WIN32)
 #include <sys/mman.h>
 #include <unistd.h>
+#include <dirent.h>   /* v41_vram_sysfs: the card's live VRAM, for the turn-end ledger */
 #endif
 #ifdef _OPENMP
 #include <omp.h>
@@ -338,6 +339,51 @@ static int v41_stats(void) {
     if (on < 0) on = getenv("V41_STATS") ? atoi(getenv("V41_STATS")) : 0;
     return on;
 }
+
+/* V41_STATS' turn accounting ends with the VRAM ledger (v41c_ledger): the chain's buffers
+ * and pools, the tier's residents and streaming slots, the extra layers' pool, the KV
+ * mirrors, this process's device bytes and the card's live usage, on one line.
+ * COLI_VK_LEDGER=1 turns the line on without V41_STATS, =0 keeps it out of a V41_STATS
+ * run. The ledger is what closes an unattributed VRAM gap by reading, not by sampling. */
+static int v41_ledger(void) {
+    const char *e = getenv("COLI_VK_LEDGER");
+    return e && *e ? atoi(e) : v41_stats();
+}
+
+#ifdef COLI_VULKAN
+#if !defined(_WIN32)
+/* The card's live VRAM from sysfs, for the ledger's last field: of /sys/class/drm's cards,
+ * the one with the most memory (a display output's or an integrated GPU's is smaller), its
+ * used and total bytes and its name ("card2"). 0 = no such file (a container without sysfs,
+ * a driver that does not export it, Windows): the ledger prints 0 there and says nothing
+ * about the card. The device's own accounting is `process` (backend_vulkan.c's books). */
+static int v41_vram_sysfs(unsigned long long *used, unsigned long long *total, char *card, size_t n) {
+    *used = *total = 0;
+    if (n) card[0] = 0;
+    DIR *d = opendir("/sys/class/drm");
+    if (!d) return 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        char name[32], path[128];
+        unsigned long long u = 0, t = 0;
+        if (strncmp(e->d_name, "card", 4) != 0 || !e->d_name[4] || strlen(e->d_name) >= sizeof name) continue;
+        snprintf(name, sizeof name, "%s", e->d_name);
+        snprintf(path, sizeof path, "/sys/class/drm/%s/device/mem_info_vram_total", name);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        if (fscanf(f, "%llu", &t) != 1) t = 0;
+        fclose(f);
+        snprintf(path, sizeof path, "/sys/class/drm/%s/device/mem_info_vram_used", name);
+        if (!(f = fopen(path, "r"))) continue;
+        if (fscanf(f, "%llu", &u) != 1) u = 0;
+        fclose(f);
+        if (t > *total) { *total = t; *used = u; if (n) snprintf(card, n, "%s", name); }
+    }
+    closedir(d);
+    return *total > 0;
+}
+#endif
+#endif
 
 /* GGUF_CHECK=1 ./deepseek_v41 on a gguf_import folder of a header only (tools/gguf_header.py):
  * every tensor the engine loads checked for its name, type and bytes, none read and nothing
@@ -5937,6 +5983,16 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
 #endif
 #ifdef COLI_VULKAN
         v41c_report();   /* the dense chain's line, when it ran */
+        if (v41_ledger()) {
+            unsigned long long vu = 0, vt = 0;
+            char card[32];
+#if !defined(_WIN32)
+            v41_vram_sysfs(&vu, &vt, card, sizeof card);
+#else
+            card[0] = 0;
+#endif
+            v41c_ledger(vu, vt, card);
+        }
 #endif
         serve_hits(m);
         serve_emap(m);
