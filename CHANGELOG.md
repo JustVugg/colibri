@@ -37,6 +37,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **Qwen3.8 on the CUDA chain: a server's first long prompt as fast as the next one.** The first
+  long prompt after a start grew the chain's buffers to a chunk's 2048 rows on its way, in
+  page-locked host memory at 0.2 ms a MB (the K/V rows down, the streams down, a prompt-end
+  snapshot of the state), and a growth frees the buffer it replaces, which waits for the stream;
+  the runtime loaded the chain's kernels and the backend's at their first launch (40 and 17 ms).
+  They are reserved and loaded before the first request now, at the sizes that prompt left (110-120
+  ms of the start), and the recurrent state's pages are touched there too. A prompt read from its
+  first token no longer copies the DeltaNet state for a stop to put back (it is the empty state, and
+  a stop resets it again), and a prompt's embedding rows go into the streams on the CPU's threads.
+  unsloth's UD-Q2_0 on an RTX PRO 4000, three serves a side: a 4180-token prompt as the server's
+  first request 954-978 -> 992-1002 tok/s, another as long after it 1012-1025 -> 1025-1033; the
+  545-token prompt, the one-line one and the decode the same.
 - **Qwen3.8 on the CUDA chain: a short prompt after a long one keeps its two lanes.** A chunk of 384
   rows or more with the host pool on the CPU runs as two lanes, and the second lane's buffers came
   from the rows the chain's reserve counted or, past them, where the card had their bytes and a GiB

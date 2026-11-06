@@ -33,6 +33,7 @@ extern "C" int coli_cuda_tensor_glu_async(ColiCudaTensor *tg, ColiCudaTensor *tu
 extern "C" int coli_cuda_tensor_gemv_rows_async(ColiCudaTensor *t, const int *ids_dev, float *y_dev, const float *x_dev, int n, void *stream);
 /* and the routed experts' kernels (cc_moe), on the same terms, and a resident tensor's device copy */
 extern "C" int coli_cuda_tensor_dev(const ColiCudaTensor *t, const void **w, const float **sc, int *gs);
+extern "C" int coli_cuda_load_module(void);
 extern "C" int coli_cuda_moe_stage(int device, void *stage, size_t slot_bytes, int slots);
 extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float *x, const int *ids, const float *w,
                                    float *hid, float *y, const float *hy, const CcMoe *p, void *stream);
@@ -3242,6 +3243,21 @@ static int cc_enc_rel(CcBuf *x, CcBuf *pt, CcBuf *y, const CcEncRel *p) {
     coli_launch(cc_enc_rel_k, g, 256, 0, c->stream, fp(x), fp(pt), fpw(y), *p);
     return launched(c, "encoder relative products");
 }
+/* this file's kernels and the backend's loaded on the chain's device now: the runtime loads a
+ * module at the first launch of one of its kernels (lazy loading), this one's at a prompt's first
+ * norm (its code read from the binary then, 40 ms of a server's first long prompt on an RTX PRO
+ * 4000), the backend's at the first tile (17 ms) */
+static int cc_preload(void) {
+    if (!live()) return 0;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+    return 1;
+#else
+    cudaFuncAttributes fa;
+    const int own = cudaFuncGetAttributes(&fa, (const void *)cc_norm_k) == cudaSuccess;
+    (void)cudaGetLastError();
+    return own && coli_cuda_load_module();
+#endif
+}
 static const ColiCudaChainOps g_cc_ops = {
     sizeof(ColiCudaChainOps),
     cc_init, cc_ready, cc_lost_, cc_shutdown, cc_device, cc_device_now,
@@ -3271,5 +3287,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_addnorm,
     cc_pick_rows,
     cc_host_up_n,
+    cc_preload,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }
