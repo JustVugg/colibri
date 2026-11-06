@@ -4158,12 +4158,18 @@ void coli_vk_pool_stats(int which, ColiVkPoolStats *st) {
 }
 static void tier_pool_limit(VkWPool *P, size_t bytes) {
     pthread_mutex_lock(&P->mx);
-    P->p.limit = bytes;
+    /* The limit is page-granular, as the blocks below are (0: no limit): a budget that is not a
+     * page multiple sizes a block past its own limit, which the pool can then never grow, and
+     * pool_suballoc falls back to the limit floored to a page. A three-expert tier's budget of
+     * exactly one extra-layer expert (15360 B) bought a 12288 B block, refused the 15360 B expert
+     * and counted it an upload failed (vk_tier.c's pool 4). Rounding up costs at most a page and
+     * a budget of N expert bytes holds N expert bytes. */
+    P->p.limit = bytes ? (bytes + 4095) & ~(size_t)4095 : 0;
     /* blocks no larger than the budget, so a small budget is not one refused block; the host
      * pool's are system RAM, which COLI_VK_DEVICE_CAP_MB does not shrink (under the cap its
      * 2 MiB blocks held one expert each: Flint's 18.5 GB took 24.5 GiB) */
     size_t bb = P->host ? VK_WBLOCK : coli_vk_block_bytes_dev(P->dev, VK_WBLOCK);
-    P->p.block_bytes = bytes && bytes < bb ? ((bytes + 4095) & ~(size_t)4095) : bb;
+    P->p.block_bytes = P->p.limit && P->p.limit < bb ? P->p.limit : bb;
     /* the empty block the pool keeps as a spare (vka_free) goes too: a tier started
      * again after a shutdown would otherwise fill it past its new, smaller budget */
     for (int k = 0; k < P->p.nb; k++)

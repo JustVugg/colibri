@@ -2767,9 +2767,14 @@ int vkt_host_pool_on(void) { return T.on && T.dmax[2] > 0; }
 size_t vkt_stage_room(void) { return vkt_host_pool_on() ? T.stage_room : 0; }
 size_t vkt_slot_reserve(void) {
     /* VKC_DEV's pool is the tier's on the primary device (pool 1); the slots are made into it
-     * at the first streaming step, after the chain has sized its chunk */
-    if (!T.on || !T.st_ok) return 0;
-    return (size_t)T.st_slots * T.exp_bytes;
+     * at the first streaming step, after the chain has sized its chunk. The reservation is an
+     * optimisation of the chunk's size, never a claim on room the residents need: it is what the
+     * budget holds beside them, and nothing when the budget cannot hold the slots at all. */
+    if (!T.on || !T.st_ok || T.st_slots < 1) return 0;
+    size_t held = (size_t)T.dmax[0] * T.exp_bytes;   /* the residents the budget holds */
+    size_t spare = T.budget > held ? T.budget - held : 0;
+    size_t slots = (size_t)T.st_slots * T.exp_bytes;
+    return slots < spare ? slots : spare;
 }
 void vkt_vram(VktVram *o) {
     memset(o, 0, sizeof *o);
