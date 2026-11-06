@@ -2294,6 +2294,9 @@ tests/test_tile16$(EXE): tests/test_tile16.c
 tests/test_idot_r16$(EXE): tests/test_idot_r16.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_glm_serve_framing$(EXE): tests/test_glm_serve_framing.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
 tests/test_logprob_status$(EXE): tests/test_logprob_status.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
