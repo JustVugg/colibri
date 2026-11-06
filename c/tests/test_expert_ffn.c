@@ -217,10 +217,15 @@ int main(void) {
 #else
         " (maddubs)");
 #endif
+#elif defined(XF_HAVE_NEON_DOT)
+    printf("path: NEON dotprod\n");
 #elif defined(XF_HAVE_SSE2_INT16)
     printf("path: SSE2 int16 (PMADDWD)\n");
 #else
     printf("path: scalar\n");
+#endif
+#if defined(__ARM_NEON) && defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD) && !defined(XF_HAVE_NEON_DOT)
+    CHECK(0, "i8: an AArch64 dotprod build that does not compile the NEON path");
 #endif
     test_row(64, 8); test_row(128, 3); test_row(512, 2048); test_row(2048, 512); test_row(4096, 16);
     /* an unreachable routing (all -1) must zero the output */
