@@ -1906,6 +1906,7 @@ static void q38cc_dm_end(Q38CChain *ch) { if (ch->dm_held) { qt_chain_hold(0); c
 static int q38cc_lanes_on(void);
 static int q38cc_lanes_min(void);
 static int q38cc_lane_stage_cap(void);
+static int q38cc_lane_fits(Q38CChain *ch, Model *m, int n);
 static int q38cc_pc_take(Q38CChain *ch, Model *m, int S) {
     if (S <= Q38CC_DM_ROWS || S > q38cc_pc_rows() || !ch->pool_cpu || !ch->pool_of) return 0;
     if (!ch->dm_stage || ch->pc_bus_gbs <= 0 || ch->pc_slot_us <= 0) return 1;   /* nothing stages: the GEMMs would read them in place */
@@ -1913,7 +1914,7 @@ static int q38cc_pc_take(Q38CChain *ch, Model *m, int S) {
      * the bus and the CPU's slots run beside the card's work, where the chunk's copy of every
      * pooled expert costs its whole time (a 452-token prompt the history's estimate staged:
      * 218 tok/s on an RTX PRO 4000) */
-    if (q38cc_lanes_on() && q38cc_lane_stage_cap() > 0 && S >= q38cc_lanes_min() && S <= q38cc_rows_env()) return 1;
+    if (q38cc_lanes_on() && q38cc_lane_stage_cap() > 0 && S >= q38cc_lanes_min() && S <= q38cc_rows_env() && q38cc_lane_fits(ch, m, S)) return 1;
     const Cfg *c = &m->c;
     const double frac = ch->routes >= 100000 ? (double)ch->pool_reads / (double)ch->routes : ch->pc_frac0;
     const double us = ch->pg_pairs >= 2000 ? ch->pg_ms * 1e3 / (double)ch->pg_pairs : ch->pc_slot_us;
@@ -2945,18 +2946,26 @@ static void q38cc_lane_use(Q38CChain *ch, int k) {
 }
 /* the first lane's rows of a chunk of n: half, on a multiple of 16 */
 static int q38cc_lane_split(int n) { int a = (n / 2 + 15) / 16 * 16; return a < n ? a : n / 2; }
-/* the second lane's buffers for its rows of a chunk of n (the first lane's are the chain's own):
- * within the rows the chain's reserve counted (q38cc_reserve_bytes, COLI_CUDA_CHAIN_ROWS of
- * them), else where the card has their bytes and a GiB besides */
+/* whether a chunk of n rows can have its second lane's buffers (the first lane's are the chain's
+ * own): they are there, or within the rows the chain's reserve counted (q38cc_reserve_bytes,
+ * COLI_CUDA_CHAIN_ROWS of them), else where the card has their bytes and half a GiB besides (the
+ * tier's allowance keeps a GiB of the card out of its own). With a GiB besides, after a long prompt
+ * had the chain's rows at 2048, a 585-token prompt found 1.1-1.4 GB free (unsloth's UD-IQ2_XS on an
+ * RTX PRO 4000) and ran in one lane with every pooled slot on the CPU: 320-353 tok/s against
+ * 541 in two (UD-Q2_0: 376-392 against 681) */
+static int q38cc_lane_fits(Q38CChain *ch, Model *m, int n) {
+    Cfg *c = &m->c; int H = c->hidden;
+    const int nb = n - q38cc_lane_split(n), rb = ch->lane2.rows > nb ? ch->lane2.rows : nb;
+    if ((long long)ch->rows + rb <= q38cc_rows_env() || rb <= ch->lane2.rows) return 1;
+    const size_t K = (size_t)c->topk, cap = (size_t)(m->kv_cap > 0 ? m->kv_cap : 1);
+    const size_t per = (q38cc_row_floats(c, cap) + K * ((size_t)c->inter + (size_t)H) + (size_t)H + 2 * (size_t)c->layers * K) * 4;
+    size_t fr = 0, tot = 0;
+    return coli_cuda_mem_info(ch->dev, &fr, &tot) && fr >= (size_t)(rb - ch->lane2.rows) * per + ((size_t)1 << 29);
+}
 static int q38cc_lane_ready(Q38CChain *ch, Model *m, int n) {
     Cfg *c = &m->c; int H = c->hidden, Ep = c->ngram_heads * c->ngram_head_dim; if (Ep < 1) Ep = 1;
     const int nb = n - q38cc_lane_split(n), rb = ch->lane2.rows > nb ? ch->lane2.rows : nb;
-    if ((long long)ch->rows + rb > q38cc_rows_env() && rb > ch->lane2.rows) {
-        const size_t K = (size_t)c->topk, cap = (size_t)(m->kv_cap > 0 ? m->kv_cap : 1);
-        const size_t per = (q38cc_row_floats(c, cap) + K * ((size_t)c->inter + (size_t)H) + (size_t)H + 2 * (size_t)c->layers * K) * 4;
-        size_t fr = 0, tot = 0;
-        if (!coli_cuda_mem_info(ch->dev, &fr, &tot) || fr < (size_t)(rb - ch->lane2.rows) * per + ((size_t)1 << 30)) return 0;
-    }
+    if (!q38cc_lane_fits(ch, m, n)) return 0;
     q38cc_lane_use(ch, 1);
     ch->rows = rb;
     int ok = q38cc_bufs(ch, m, rb) && q38cc_dm_begin(ch, m, nb);
