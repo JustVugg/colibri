@@ -1416,6 +1416,20 @@ jobs:
             SNAP=dsv41_long ./deepseek_v41 "$cap" dsv41_long/ref.json
             echo "::endgroup::"
           done
+      - name: "The release's index layout: layers that read the source's index list"
+        run: |
+          cd c
+          # On the release, layers 21-23, 25-27, ... have no indexer and read the list
+          # layer 20 publishes. The default fixture gives layer 4 its own indexer, so the
+          # prompt tail never had to carry that list across the cut; this one leaves
+          # layer 4 reading layer 3's, token-exact against its reference and with the
+          # tail giving every row's bits.
+          python3 tools/make_dsv41_tiny.py --out dsv41_reuse --emit-ref dsv41_reuse/ref.json \
+            --index-sources 1,3
+          for cap in 1 8; do
+            SNAP=dsv41_reuse ./deepseek_v41 "$cap" dsv41_reuse/ref.json
+          done
+          DSV41_TINY=dsv41_reuse python3 -m unittest -v tests.test_dsv41_prefill_tail
       - name: The published index cache is the vendor's, not the tidy one
         run: |
           cd c

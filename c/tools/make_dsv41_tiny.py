@@ -534,8 +534,13 @@ def main() -> int:
     ap.add_argument("--emit-ref", type=Path, default=None)
     ap.add_argument("--max-new", type=int, default=8)
     ap.add_argument("--prompt-len", type=int, default=12)
+    ap.add_argument("--index-sources", default=None,
+                    help="comma-separated index source layers instead of 1,3,4: 1,3 leaves layer 4 "
+                         "reading layer 3's index list, as 21-23 read layer 20's on the release")
     args = ap.parse_args()
     cfg = tiny_config()
+    if args.index_sources:
+        cfg["index_source_layers"] = [int(x) for x in args.index_sources.split(",")]
     build(args.out, cfg, args.emit_ref, args.max_new, args.prompt_len)
     total = sum(p.stat().st_size for p in args.out.iterdir() if p.is_file())
     print(f"container -> {args.out}  ({total/1e6:.2f} MB)")

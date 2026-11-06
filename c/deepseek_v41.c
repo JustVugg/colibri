@@ -4531,6 +4531,22 @@ static void v41_take_tail(Model *m, float *h, float *pre_mix, int *n, int *start
         memmove(m->candidates, m->candidates + (size_t)r0 * m->candidate_width, (size_t)tail * m->candidate_width);
         m->candidate_rows = tail;
     }
+    /* The index list the source layer published, for the layers after it that run no
+     * indexer of their own (21-23, 25-27, ... on the release): its rows are the whole
+     * prompt's and its columns point past the window half of the source's kv_all, which
+     * during a prefill from position 0 is every row of the chunk. Past the cut the rows
+     * are the tail's and the window half is the ring, `window` rows: keep the tail's rows
+     * and move the columns, or those layers read other rows' lists at offsets past the
+     * end of their own kv_all. */
+    if (m->shared_topk && m->shared_topk_rows == *n && m->shared_topk_width > 0) {
+        const int w = m->shared_topk_width, from = *start_pos == 0 ? *n : c->window;
+        for (int t = 0; t < tail; t++) {
+            int *dst = m->shared_topk + (size_t)t * w;
+            const int *src = m->shared_topk + (size_t)(r0 + t) * w;   /* r0 > 0: read before written */
+            for (int k = 0; k < w; k++) dst[k] = src[k] < 0 ? -1 : src[k] - from + c->window;
+        }
+        m->shared_topk_rows = tail;
+    }
     *n = tail; *start_pos += r0;
     if (*trace_row >= tail) *trace_row = tail - 1;
     m->prefill_tail_rows += (unsigned long long)r0;
