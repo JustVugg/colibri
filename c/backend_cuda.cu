@@ -3856,11 +3856,17 @@ struct HcmArgs {
     int m0, M, n0, kb0, nk;
     const bd_u32 *w, *wu; int rw, O;
     const bd_u32 *tab;   /* the decoders' table (bd_table): IQ2_S's grid */
+    const float *hn; float fc;   /* MIX: the hyper-connection read's normalized streams (rows of 4 O) and its divisor */
 };
-template<int T, int BM, int BN, bool GLU>
+/* MIX (BN 128): Qwen3.8's hyper-connection read's up projection and its mix in one pass. The block's
+ * weight rows are four streams' 32 outputs from n0 (row b O + n0 + i, output i of stream b, O the
+ * stream's width), and the epilogue gives y (rows of O) = sum over b of sigmoid(the product) times
+ * hn's stream b at the output, divided by fc: cuda_chain.cu's CC_EW_HC_MIX of the products, in its order */
+template<int T, int BM, int BN, bool GLU, bool MIX = false>
 __device__ __forceinline__ void hcm_body(const HcmArgs &A) {
 #if HCM_BODY
     using TL = HcmTile<BM, BN>;
+    static_assert(!MIX || (BN == 128 && !GLU), "the mix takes four streams of 32 outputs a block");
     constexpr int XS = TL::XS, XB = TL::XB, WB = TL::WB, NJ = TL::NJ, NW = TL::NW, NX = TL::NX, WN = TL::WN, WR = TL::WR;
     extern __shared__ __align__(128) unsigned char hcm_sm[];
     unsigned char *Wsm = hcm_sm + XS * XB;
@@ -3877,6 +3883,9 @@ __device__ __forceinline__ void hcm_body(const HcmArgs &A) {
             const int orow = (n0 >> 1) + ((c >> 4) << 3) + (c & 7);
             live_w[q] = orow < O;
             Wr[q] = ((c >> 3) & 1 ? wu : w) + (size_t)(live_w[q] ? orow : 0) * rw;
+        } else if (MIX) {   /* stream c >> 5's output n0 + (c & 31) */
+            live_w[q] = n0 + (c & 31) < O;
+            Wr[q] = w + (size_t)(live_w[q] ? (c >> 5) * O + n0 + (c & 31) : 0) * rw;
         } else { live_w[q] = n0 + c < O; Wr[q] = w + (size_t)(live_w[q] ? n0 + c : 0) * rw; }
     }
     /* the thread's NX of a step's 4 BM input chunks: rows (t >> 2) + 64 q, chunk t & 3 */
@@ -3971,6 +3980,38 @@ __device__ __forceinline__ void hcm_body(const HcmArgs &A) {
                 }
         return;
     }
+    if (MIX) {   /* the products' sigmoids through shared memory, 128 rows at a time, then each output's four streams in order */
+        asm volatile("cp.async.wait_all;\n");
+        float (*sg)[129] = reinterpret_cast<float (*)[129]>(hcm_sm);
+        #pragma unroll
+        for (int pass = 0; pass < (BM + 127) / 128; pass++) {
+            __syncthreads();   /* the main loop's stages, or the pass before, read */
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                #pragma unroll
+                for (int j = 0; j < NJ; j++)
+                    #pragma unroll
+                    for (int e = 0; e < 4; e += 2) {
+                        const int r = wr * 64 + i * 16 + g + (e < 2 ? 0 : 8) - 128 * pass, cl = wc * WN + j * 8 + tig * 2;
+                        if (r < 0 || r >= 128) continue;
+                        sg[r][cl] = 1.f / (1.f + expf(-acc[i][j][e]));
+                        sg[r][cl + 1] = 1.f / (1.f + expf(-acc[i][j][e + 1]));
+                    }
+            __syncthreads();
+            const int dd = t & 31;
+            for (int k = 0; k < 16; k++) {
+                const int rl = (t >> 5) + 8 * k, r = 128 * pass + rl;
+                if (r >= M || n0 + dd >= O) continue;
+                const size_t row = (size_t)(A.yrows ? A.yrows[r] : m0 + r);
+                const float *hr = A.hn + row * (size_t)(4 * O) + n0 + dd;
+                float v = 0.f;
+                #pragma unroll
+                for (int b = 0; b < 4; b++) v += sg[rl][b * 32 + dd] * hr[(size_t)b * O];
+                A.y[row * A.ldy + n0 + dd] = v / A.fc;
+            }
+        }
+        return;
+    }
     #pragma unroll
     for (int i = 0; i < 4; i++)
         #pragma unroll
@@ -3996,6 +4037,16 @@ __global__ static void __launch_bounds__(256, (HcmTile<BM, BN>::MINB)) hcm_dense
     HcmArgs A = {y + (size_t)blockIdx.z * S * O, O, nullptr, xh, I, nullptr, m0, S - m0 < BM ? S - m0 : BM, (int)blockIdx.x * BN, kb0,
                  (I - kb0 < kc ? I - kb0 : kc) / HCM_BK, w, wu, rw, O, tab};
     hcm_body<T, BM, BN, GLU>(A);
+}
+/* hcm_body's MIX: a hyper-connection read's up projection of S rows and its mix (rows of O = H outputs); grid
+ * x = H / 32, y = S / BM */
+template<int T, int BM>
+__global__ static void __launch_bounds__(256, (HcmTile<BM, 128>::MINB)) hcm_mix_k(float *__restrict__ y, const __half *__restrict__ xh,
+        const bd_u32 *__restrict__ w, int rw, int S, int I, int H, const float *__restrict__ hn, float fc, const bd_u32 *__restrict__ tab) {
+    COLI_PDL_WAIT();
+    const int m0 = blockIdx.y * BM;
+    HcmArgs A = {y, H, nullptr, xh, I, nullptr, m0, S - m0 < BM ? S - m0 : BM, (int)blockIdx.x * 32, 0, I / HCM_BK, w, nullptr, rw, H, tab, hn, fc};
+    hcm_body<T, BM, 128, false, true>(A);
 }
 /* a split K's partial sums, in the order of the splits */
 __global__ static void hcm_sum_k(float *__restrict__ y, const float *__restrict__ p, long long n, int ns) {
@@ -4138,6 +4189,60 @@ static int hcm_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float
     cudaError_t le = cudaGetLastError();
     (void)cudaFreeAsync(scr, st);
     return cuda_ok(le, "f16 block gemm launch");
+#endif
+}
+/* A hyper-connection read's up projection and mix in one pass (hcm_mix_k): mixed (S rows of H) =
+ * sum over the 4 streams b of sigmoid(x t^T at output b H + d) times hn (S rows of 4 H) there, divided
+ * by fc, cuda_chain.cu's matmul then CC_EW_HC_MIX with the same bits. The product's rows (t: 4 H
+ * outputs of a block type hcm_dense_k takes) are never written: 84 MB a 2048-row chunk of Qwen3.8,
+ * then read again. 1 done, -1 not taken (another type, few rows, a K the tiles would split), 0 a failure */
+extern "C" int coli_cuda_tensor_gemm_hcmix_async(ColiCudaTensor *t, float *mixed, const float *x, const float *hn, int S, int H, int C,
+                                                 float fc, void *stream) {
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+    (void)t; (void)mixed; (void)x; (void)hn; (void)S; (void)H; (void)C; (void)fc; (void)stream; return -1;
+#else
+    if (fault_injected()) return 0;
+    if (!t || !mixed || !x || !hn || C != 4 || H < 32 || H % 32 || t->O != C * H || ((uintptr_t)x & 15)) return -1;
+    static int on = -1;   /* COLI_CUDA_HCMIX=0: the matmul and the mix apart */
+    if (on < 0) { const char *e = getenv("COLI_CUDA_HCMIX"); on = !(e && *e == '0'); }
+    DeviceContext *ctx = find_ctx(t->device);
+    if (!on || !select_ctx(ctx) || t->fmt < 100) return -1;
+    int tt = hcm_type(t->fmt, t->I);
+    if (tt == 22 || tt == 42 || tt == 16 || tt == 17 || tt == 18 || tt == 6 || tt == 7) tt = 0;   /* hcm_gemm's dense types alone */
+    if (tt == 21 && !bd_table(ctx)) tt = 0;
+    if (!tt || ctx->compute_major < 8 || S <= BD_GEMV_MAX_S || t->I % HCM_BK) return -1;
+    /* hcm_gemm's tile (256 rows past 128) and no K split: that is when it would split K, a block's
+     * sums are the whole K */
+    const int big = S > 128 && ctx->smem_optin >= (size_t)HcmTile<256, 128>::SMEM, BMt = big ? 256 : 128;
+    const long long blocks = (long long)(C * H / 128) * ((S + BMt - 1) / BMt), slots = (long long)ctx->sms * (big ? 1 : 2);
+    if (blocks < slots && t->I / 512 >= 2) return -1;
+    cudaStream_t st = (cudaStream_t)stream;
+    const size_t n = (size_t)S * t->I;
+    void *scr = NULL;
+    if (cudaMallocAsync(&scr, n * 2 + 256, st) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    long long n4 = (long long)(n / 4);
+    hcm_half_k<<<(unsigned)((n4 + 255) / 256), 256, 0, st>>>(reinterpret_cast<const float4 *>(x), reinterpret_cast<uint2 *>(scr), n4);
+    dim3 g((unsigned)(H / 32), (unsigned)((S + BMt - 1) / BMt));
+    const bd_u32 *wv = (const bd_u32 *)t->weights, *tab = bd_table(ctx);
+    const __half *xh = (const __half *)scr;
+    #define HCMIX_GO(T_, BM_) do { \
+        constexpr size_t sm_ = HcmTile<BM_, 128>::SMEM > (size_t)128 * 129 * 4 ? HcmTile<BM_, 128>::SMEM : (size_t)128 * 129 * 4; \
+        static unsigned set_ = 0; int dev_ = 0; (void)cudaGetDevice(&dev_); \
+        if (dev_ < 32 && !(set_ & (1u << dev_))) { \
+            cudaFuncSetAttribute(hcm_mix_k<T_, BM_>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_); \
+            cudaFuncSetAttribute(hcm_mix_k<T_, BM_>, cudaFuncAttributePreferredSharedMemoryCarveout, 100); \
+            (void)cudaGetLastError(); set_ |= 1u << dev_; } \
+        hcm_mix_k<T_, BM_><<<g, 256, sm_, st>>>(mixed, xh, wv, t->row_words, S, t->I, H, hn, fc, tab); } while (0)
+    #define HCMIX_T(BM_) do { switch (tt) { \
+        case 1: HCMIX_GO(1, BM_); break;   case 30: HCMIX_GO(30, BM_); break; case 8: HCMIX_GO(8, BM_); break; \
+        case 12: HCMIX_GO(12, BM_); break; case 13: HCMIX_GO(13, BM_); break; case 23: HCMIX_GO(23, BM_); break; \
+        case 20: HCMIX_GO(20, BM_); break; case 21: HCMIX_GO(21, BM_); break; default: HCMIX_GO(14, BM_); break; } } while (0)
+    if (big) HCMIX_T(256); else HCMIX_T(128);
+    #undef HCMIX_T
+    #undef HCMIX_GO
+    cudaError_t le = cudaGetLastError();
+    (void)cudaFreeAsync(scr, st);
+    return cuda_ok(le, "f16 block gemm and mix launch") ? 1 : 0;
 #endif
 }
 static int hcg_ok(const DeviceContext *ctx);

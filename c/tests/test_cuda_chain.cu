@@ -1760,10 +1760,39 @@ int main(void) {
             T->free(xb); T->free(pb); T->free(yb);
         }
     }
+    printf("hyper-connection mix\n");
+    {   /* a hyper-connection read's up projection and mix in one pass (matmul_hcmix): Q8_0 rows of 320 inputs, four
+         * streams of 256, 300 rows (tiles of 256 rows) and 100 (of 128); against matmul then CC_EW_HC_MIX, to the bit */
+        const int I = 320, H = 256, C = 4, O = C * H;
+        unsigned sd = 31;
+        std::vector<uint8_t> q8((size_t)O * (I / 32) * 34);
+        for (int o = 0; o < O; o++)
+            for (int b = 0; b < I / 32; b++) {
+                uint8_t *blk = q8.data() + ((size_t)o * (I / 32) + b) * 34;
+                const uint16_t dh = (uint16_t)(0x2000u + (unsigned)(frand(&sd) * 2048.f + 2048.f));   /* a small positive half */
+                memcpy(blk, &dh, 2);
+                for (int k = 0; k < 32; k++) blk[2 + k] = (uint8_t)(int8_t)(frand(&sd) * 120.f);
+            }
+        ColiCudaTensor *tq = NULL;
+        ck(coli_cuda_tensor_upload(&tq, q8.data(), NULL, 108, I, O, 0), "a Q8_0 tensor of 320 inputs and 4 x 256 outputs resident");
+        for (int S : {300, 100}) {
+            std::vector<float> x = rnd((size_t)S * I, 41), hn = rnd((size_t)S * O, 42);
+            CcBuf *xb = up(x), *hb = up(hn), *mb = T->buf((size_t)S * O * 4, CC_DEV), *ya = T->buf((size_t)S * H * 4, CC_DEV), *yb = T->buf((size_t)S * H * 4, CC_DEV);
+            CcEw mx = {CC_EW_HC_MIX, S * H, H, C, 0, 1, 0, 0, 0, 0, 0, (float)C};
+            int ok = T->begin() && T->matmul(tq, xb, 0, mb, 0, S) && T->ew(ya, mb, hb, NULL, NULL, &mx) && T->submit(1);
+            int r = ok && T->matmul_hcmix ? T->matmul_hcmix(tq, xb, 0, hb, yb, S, H, C, (float)C) : 0;
+            ok = ok && r == 1 && T->submit(1);
+            std::vector<float> a = down(ya, (size_t)S * H), b = down(yb, (size_t)S * H);
+            char what[128]; snprintf(what, sizeof what, "%d rows: the up projection and the mix in one pass, those of the two ops to the bit", S);
+            ck(ok && !memcmp(a.data(), b.data(), a.size() * 4), what);
+            T->free(xb); T->free(hb); T->free(mb); T->free(ya); T->free(yb);
+        }
+        coli_cuda_tensor_free(tq);
+    }
     printf("lost\n");
     {
         CcStats st; T->stats(&st);
-        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 46, "the counters saw the frames, ops and matmuls");
+        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 50, "the counters saw the frames, ops and matmuls");
         setenv("COLI_GPU_FAIL_AFTER", "0", 1);
         std::vector<float> w = rnd(64, 81), ones(8, 1.f);
         ColiCudaTensor *t = NULL;

@@ -34,6 +34,8 @@ extern "C" int coli_cuda_tensor_gemv_rows_async(ColiCudaTensor *t, const int *id
 /* and the routed experts' kernels (cc_moe), on the same terms, and a resident tensor's device copy */
 extern "C" int coli_cuda_tensor_dev(const ColiCudaTensor *t, const void **w, const float **sc, int *gs);
 extern "C" int coli_cuda_load_module(void);
+extern "C" int coli_cuda_tensor_gemm_hcmix_async(ColiCudaTensor *t, float *mixed, const float *x, const float *hn, int S, int H, int C,
+                                                 float fc, void *stream);
 extern "C" int coli_cuda_moe_cols_async(int device, const CcExpert *tab, const float *x, const int *ids, const float *w,
                                         float *hid, float *y, const CcMoe *p, int cols, void *stream);
 extern "C" int coli_cuda_moe_stage(int device, void *stage, size_t slot_bytes, int slots);
@@ -2831,6 +2833,18 @@ static int cc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf 
                              (void *)c->stream)) { c->lost = 1; return 0; }
     return 1;
 }
+/* a hyper-connection read's up projection and mix (coli_cuda_tensor_gemm_hcmix_async): -1 not taken */
+static int cc_matmul_hcmix(ColiCudaTensor *t, CcBuf *x, size_t x_off, CcBuf *hn, CcBuf *y, int n, int H, int C, float fc) {
+    CcCtx *c = live();
+    if (!c || !t || !x || !hn || !y || n < 1 || H < 1 || C < 1) return -1;
+    int fmt = 0, I = 0, O = 0;
+    if (!coli_cuda_tensor_shape(t, &fmt, &I, &O) || coli_cuda_tensor_device(t) != c->device || O != C * H ||
+        (x_off + (size_t)n * I) * 4 > x->bytes || (size_t)n * O * 4 > hn->bytes || (size_t)n * H * 4 > y->bytes) return -1;
+    const int r = coli_cuda_tensor_gemm_hcmix_async(t, fpw(y), fp(x) + x_off, fp(hn), n, H, C, fc, (void *)c->stream);
+    if (r > 0) { g_st.ops++; g_st.matmuls++; return 1; }
+    if (r == 0) c->lost = 1;
+    return r;
+}
 /* moe's parts 3 with down and the sums by slices of cols outputs (coli_cuda_moe_cols_async): -1 not
  * taken, the device as it was */
 static int cc_moe_cols(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *y, const CcMoe *p, int cols) {
@@ -3482,5 +3496,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_host_up_n,
     cc_preload,
     cc_moe_cols,
+    cc_matmul_hcmix,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

@@ -942,8 +942,12 @@ static int q38cc_gr_read(Q38CChain *ch, Model *m, GatedResidual *g, size_t norm_
     CcEw lo = {CC_EW_HC_LOW, n * R, R, C, 0, 1, 0, 0, 0, 0, 0, (float)C};
     CcEw mx = {CC_EW_HC_MIX, n * H, H, C, 0, 1, 0, 0, 0, 0, 0, (float)C};
     int ok = cc_norm(q38cc_hb(ch), ch->prm, ch->hn, &np) &&
-             cc_matmul(q38cc_t(ch, &g->down), ch->hn, 0, ch->low, 0, n) && cc_ew(ch->low, ch->low, NULL, NULL, NULL, &lo) &&
-             cc_matmul(q38cc_t(ch, &g->up), ch->low, 0, ch->mix, 0, n) && cc_ew(ch->mixed, ch->mix, ch->hn, NULL, NULL, &mx);
+             cc_matmul(q38cc_t(ch, &g->down), ch->hn, 0, ch->low, 0, n) && cc_ew(ch->low, ch->low, NULL, NULL, NULL, &lo);
+    /* the up projection and the mix in one pass where the backend takes them (cc_matmul_hcmix: the same
+     * bits, the product's n rows of W never written), else the two ops */
+    const int fused = ok ? cc_matmul_hcmix(q38cc_t(ch, &g->up), ch->low, 0, ch->hn, ch->mixed, n, H, C, (float)C) : 0;
+    if (fused == 0) ok = 0;
+    else if (fused < 0) ok = cc_matmul(q38cc_t(ch, &g->up), ch->low, 0, ch->mix, 0, n) && cc_ew(ch->mixed, ch->mix, ch->hn, NULL, NULL, &mx);
     if (ok && inj) {
         CcEw ij = {CC_EW_HC_INJ, n * C, C, C, 0, 1, 0, 0, 0, 0, 0, (float)C};
         ok = cc_matmul(q38cc_t(ch, &g->inject), ch->hn, 0, inj, 0, n) && cc_ew(inj, inj, NULL, NULL, NULL, &ij);

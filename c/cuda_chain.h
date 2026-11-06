@@ -342,6 +342,11 @@ typedef struct ColiCudaChainOps {
      * would not hold them. A GGUF's types the f16 tiles take, no host rows (h_off < 0); each row of
      * y the bits moe gives it. 1 done, -1 not taken (the caller's chunks), 0 a failure */
     int  (*moe_cols)(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *y, const CcMoe *p, int cols);
+    /* matmul_hcmix: a hyper-connection read's up projection of n rows of x (from float x_off) and its
+     * mix in one pass: y (n rows of H) = sum over the C (4) streams b of sigmoid((x t^T)[b H + d]) times
+     * hn's row at b H + d, over fc; matmul then ew's CC_EW_HC_MIX with the same bits, the product never
+     * written. 1 done, -1 not taken (the caller's two ops), 0 a failure */
+    int  (*matmul_hcmix)(ColiCudaTensor *t, CcBuf *x, size_t x_off, CcBuf *hn, CcBuf *y, int n, int H, int C, float fc);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -417,6 +422,11 @@ static inline int cc_moe_cols_ready(void) {
 }
 static inline int cc_moe_cols(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *y, const CcMoe *p, int cols) {
     return cc_moe_cols_ready() ? cc_ops()->moe_cols(tab, x, ids, w, hid, y, p, cols) : -1;
+}
+static inline int cc_matmul_hcmix(ColiCudaTensor *t, CcBuf *x, size_t x_off, CcBuf *hn, CcBuf *y, int n, int H, int C, float fc) {
+    const ColiCudaChainOps *o = cc_ops();
+    return o && o->size >= offsetof(ColiCudaChainOps, matmul_hcmix) + sizeof o->matmul_hcmix && o->matmul_hcmix
+           ? o->matmul_hcmix(t, x, x_off, hn, y, n, H, C, fc) : -1;
 }
 /* the chain's and the backend's kernels loaded now where the backend can (an older one loads them
  * at their first launch) */

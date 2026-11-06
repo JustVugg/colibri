@@ -37,6 +37,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **CUDA chain: a hyper-connection read's up projection and mix in one pass.** Qwen3.8's gated
+  residuals read the four streams through a low-rank mix: the up projection's products (four times
+  the hidden size a row, 84 MB a 2048-row chunk) went to memory and the mix read them back with the
+  normalized streams. `matmul_hcmix` (`coli_cuda_tensor_gemm_hcmix_async`, a new chain op) computes
+  the projection on the f16 tiles with a block's weight rows four streams' 32 outputs, and its
+  epilogue gives each output the four streams' sigmoids times the normalized streams in the mix's
+  order, so the same bits; the products are never written. `COLI_CUDA_HCMIX=0`: the two ops.
+  unsloth's UD-Q2_0 on an RTX PRO 4000, two serves a side, a 4180-token prompt 1364-1386 -> 1396-1398
+  tok/s, a second one 1446-1455 -> 1475-1476; the answers the same.
 - **CUDA chain: a long prompt's QSA attention on the tensor cores.** A prompt chunk's rows with a
   selection list (Qwen3.8's QSA) ran `cc_attn_gk` on the CUDA cores, 15.9 ms of a 2048-row chunk
   a layer on an RTX PRO 4000. `cc_attn_f2` (f16 operands, one pass) now takes them too: each
