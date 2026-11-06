@@ -37,6 +37,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **CUDA chain: a prompt's selected keys staged in shared memory** (`cc_attn_gk`). Each thread read
+  its own key's elements in turn, so a warp's loads fell 32 lines apart and the kernel was bound by
+  L1 (82% of it under Nsight Compute, the multiprocessors at 43%). A tile's selected keys now come in
+  32 elements at a time by 16-byte loads, four threads a key, and each position's dot runs over d in
+  the order it did: each row the bits of that row alone. Qwen3.8-Flash-Next IQ2_XS on an RTX PRO 4000,
+  a 4180-token prompt: the attention 628 -> 424 ms, the prompt 892-893 -> 920-934 tok/s (unsloth's
+  UD-Q2_0 875-883 -> 924-925).
 - **Qwen3.8: a long prompt layer by layer with the MTP head too** (CUDA and Vulkan chains). A prompt of
   several chunks runs layer by layer, each layer's host pool experts staged once for all its chunks, but
   not when the caller wanted the rows' final streams back, and the MTP head's prefill always does: with
