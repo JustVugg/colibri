@@ -4753,6 +4753,21 @@ extern "C" int coli_cuda_tensor_dev(const ColiCudaTensor *t, const void **w, con
     return 1;
 }
 
+/* This file's kernels are one module, which the runtime loads at the first launch of any of
+ * them (lazy loading, CUDA 11.7 on): for the dense chain that is a prompt's first tile, 17 ms
+ * inside a server's first long prompt on an RTX PRO 4000. A kernel's attributes asked for on the
+ * current device load the module there now (cuda_chain.cu's cc_preload, before the first request). */
+extern "C" int coli_cuda_load_module(void) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+    return 1;
+#else
+    cudaFuncAttributes fa;
+    const int ok = cudaFuncGetAttributes(&fa, (const void *)hcm_half_k) == cudaSuccess;
+    (void)cudaGetLastError();
+    return ok;
+#endif
+}
+
 /* The dense chain's routed experts (cuda_chain.cu: cc_moe; cuda_chain.h: CcMoe): every
  * (row, slot) pair of a decode step whose expert the table holds, gate and up, then down,
  * each a warp per output row (MOE_RPW rows a warp, eight warps a block, the pair's input
@@ -4900,12 +4915,12 @@ __global__ static void moe_sum_k(const CcExpert *__restrict__ tab, const int *__
 /* A prompt chunk's slots by expert (S > CC_MOE_FRAME_ROWS): counts, offsets and the
  * GEMMs' tiles (64 rows of one expert each), each slot's place. The integers sit in hid
  * after the floats: cnt[E] base[E + 1] cur[E] ntile[1] te[T] tr[T] order[A] posof[A]. */
-struct MoeSort { int *cnt, *base, *cur, *ntile, *te, *tr, *order, *posof; int T; };
+struct MoeSort { int *cnt, *base, *cur, *ntile, *te, *tr, *order, *posof; int T, TR; };   /* TR: a tile's rows, 64 or 128 (hcm_moe's) */
 static MoeSort moe_sort_of(float *hid, const CcMoe *p) {
     size_t A = (size_t)(p->lay_S > 0 ? p->lay_S : p->S) * p->K;
     int *q = reinterpret_cast<int *>(hid + A * (size_t)(p->I + p->D));
     MoeSort m;
-    m.T = (int)((A + 63) / 64 + (size_t)(p->E < (int)A ? p->E : (int)A));
+    m.T = (int)((A + 63) / 64 + (size_t)(p->E < (int)A ? p->E : (int)A)); m.TR = 64;
     m.cnt = q; m.base = q + p->E; m.cur = m.base + p->E + 1; m.ntile = m.cur + p->E;
     m.te = m.ntile + 1; m.tr = m.te + m.T; m.order = m.tr + m.T; m.posof = m.order + A;
     return m;
@@ -4927,7 +4942,7 @@ __global__ static void moe_sort_scan_k(MoeSort m, CcMoe p) {
     int b = 0, t = 0;
     for (int e = 0; e < p.E; e++) {
         m.base[e] = b; m.cur[e] = 0;
-        for (int r = 0; r < m.cnt[e] && t < m.T; r += 64) { m.te[t] = e; m.tr[t] = r; t++; }
+        for (int r = 0; r < m.cnt[e] && t < m.T; r += m.TR) { m.te[t] = e; m.tr[t] = r; t++; }
         b += m.cnt[e];
     }
     m.base[p.E] = b; *m.ntile = t;
@@ -4941,11 +4956,11 @@ __global__ static void moe_sort_place_k(const CcExpert *__restrict__ tab, const 
     int pos = m.base[e] + atomicAdd(&m.cur[e], 1);
     m.order[pos] = a; m.posof[a] = pos;
 }
-/* a tile's 64 rows: x rows (the slots' tokens) and places, the expert's rows left */
+/* a tile's m.TR rows (xr and pr that many): x rows (the slots' tokens) and places, the expert's rows left */
 __device__ __forceinline__ int moe_tile_rows(const MoeSort &m, const CcMoe &p, int t, int *xr, int *pr, int *e_out, int down) {
     int e = m.te[t], r0 = m.tr[t], M = m.cnt[e] - r0;
-    if (M > 64) M = 64;
-    if (threadIdx.x < 64) {
+    if (M > m.TR) M = m.TR;
+    if ((int)threadIdx.x < m.TR) {
         int pos = m.base[e] + r0 + (threadIdx.x < M ? threadIdx.x : 0);
         pr[threadIdx.x] = pos;
         xr[threadIdx.x] = down ? pos : m.order[pos] / p.K;
@@ -5045,31 +5060,31 @@ __global__ static void __launch_bounds__(256) hcg_moe_dn_bd_k(const CcExpert *__
  * rows of one expert (moe_tile_rows), the gate and up in one pass (GLU) into hid's places, then the
  * down of the places' rows into hid's second part. The inputs in f16 (hcg_h's rounding): xh the
  * tokens' rows, hh hid's. */
-template<int T>
-__global__ static void __launch_bounds__(256, (HcmTile<64, 128>::MINB)) hcm_moe_gu_k(const CcExpert *__restrict__ tab,
+template<int T, int BM = 64>
+__global__ static void __launch_bounds__(256, (HcmTile<BM, 128>::MINB)) hcm_moe_gu_k(const CcExpert *__restrict__ tab,
         const __half *__restrict__ xh, float *__restrict__ hid, MoeSort m, CcMoe p, int rw, const bd_u32 *__restrict__ btab) {
     COLI_PDL_WAIT();
-    __shared__ int xr[64], pr[64];
+    __shared__ int xr[BM], pr[BM];
     if ((int)blockIdx.y >= *m.ntile) return;
     int e, M = moe_tile_rows(m, p, blockIdx.y, xr, pr, &e, 0);
     __syncthreads();
     const CcExpert ex = tab[p.t_off + e];
     HcmArgs A = {hid, p.I, pr, xh, p.D, xr, 0, M, (int)blockIdx.x * 128, 0, p.D / HCM_BK,
                  (const bd_u32 *)ex.g, (const bd_u32 *)ex.u, rw, p.I, btab};
-    hcm_body<T, 64, 128, true>(A);
+    hcm_body<T, BM, 128, true>(A);
 }
-template<int T>
-__global__ static void __launch_bounds__(256, (HcmTile<64, 128>::MINB)) hcm_moe_dn_k(const CcExpert *__restrict__ tab,
+template<int T, int BM = 64>
+__global__ static void __launch_bounds__(256, (HcmTile<BM, 128>::MINB)) hcm_moe_dn_k(const CcExpert *__restrict__ tab,
         const __half *__restrict__ hh, float *__restrict__ hid, MoeSort m, CcMoe p, int rw, const bd_u32 *__restrict__ btab) {
     COLI_PDL_WAIT();
-    __shared__ int xr[64], pr[64];
+    __shared__ int xr[BM], pr[BM];
     if ((int)blockIdx.y >= *m.ntile) return;
     int e, M = moe_tile_rows(m, p, blockIdx.y, xr, pr, &e, 1);
     __syncthreads();
     const CcExpert ex = tab[p.t_off + e];
     HcmArgs A = {hid + (size_t)p.S * p.K * p.I, p.D, pr, hh, p.I, xr, 0, M, (int)blockIdx.x * 128, 0, p.I / HCM_BK,
                  (const bd_u32 *)ex.d, nullptr, rw, p.D, btab};
-    hcm_body<T, 64, 128, false>(A);
+    hcm_body<T, BM, 128, false>(A);
 }
 /* rows of x (x_row floats apart) into f16, hcm_half_k's rounding */
 __global__ static void hcm_half_rows_k(const float *__restrict__ x, int x_row, uint2 *__restrict__ xh, int S, int D) {
@@ -5085,10 +5100,10 @@ __global__ static void hcm_half_rows_k(const float *__restrict__ x, int x_row, u
 #endif
 }
 /* the experts through hcm_moe_*_k where their types and rows let them; 0: not taken (hcg_tile's) */
-static int hcm_moe(DeviceContext *ctx, const CcExpert *tab, const float *x, float *hid, MoeSort m, const CcMoe *p, cudaStream_t st,
-                   const bd_u32 *btab) {
+/* whether hcm_moe takes this call's experts (their types and rows), before any allocation */
+static int hcm_moe_able(DeviceContext *ctx, const CcMoe *p, const bd_u32 *btab) {
 #if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
-    (void)ctx; (void)tab; (void)x; (void)hid; (void)m; (void)p; (void)st; (void)btab; return 0;
+    (void)ctx; (void)p; (void)btab; return 0;
 #else
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_CUDA_MOE_HCM"); on = !(e && *e == '0'); }
@@ -5098,7 +5113,17 @@ static int hcm_moe(DeviceContext *ctx, const CcExpert *tab, const float *x, floa
     if ((tg == 22 || td == 22 || tg == 21 || td == 21 || tg == 16 || td == 16 || tg == 17 || td == 17 || tg == 18 || td == 18) && !btab)
         return 0;   /* IQ2_S, IQ3_S, IQ2_XXS, IQ2_XS and IQ3_XXS read their grids (and ksigns) from the decoders' table */
     const size_t rbg = bd_file_row_bytes(p->fmt, p->D), rbd = bd_file_row_bytes(fd, p->I);
-    if (!rbg || !rbd || rbg % 4 || rbd % 4) return 0;
+    return rbg && rbd && rbg % 4 == 0 && rbd % 4 == 0;
+#endif
+}
+static int hcm_moe(DeviceContext *ctx, const CcExpert *tab, const float *x, float *hid, MoeSort m, const CcMoe *p, cudaStream_t st,
+                   const bd_u32 *btab) {
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+    (void)ctx; (void)tab; (void)x; (void)hid; (void)m; (void)p; (void)st; (void)btab; return 0;
+#else
+    if (!hcm_moe_able(ctx, p, btab)) return 0;
+    const int fd = p->fmt_d ? p->fmt_d : p->fmt, tg = hcm_type(p->fmt, p->D), td = hcm_type(fd, p->I);
+    const size_t rbg = bd_file_row_bytes(p->fmt, p->D), rbd = bd_file_row_bytes(fd, p->I);
     const size_t A = (size_t)p->S * p->K, nx = (size_t)p->S * p->D, nh = A * p->I;
     void *scr = NULL;
     if (cudaMallocAsync(&scr, (nx + nh) * sizeof(__half) + 256, st) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
@@ -5107,18 +5132,24 @@ static int hcm_moe(DeviceContext *ctx, const CcExpert *tab, const float *x, floa
     coli_launch(hcm_half_rows_k, (unsigned)((n4 + 255) / 256), 256, 0, st, x + p->x_off, p->x_row, reinterpret_cast<uint2 *>(xh), p->S, p->D);
     dim3 gg((unsigned)((2 * p->I + 127) / 128), (unsigned)m.T), gd((unsigned)((p->D + 127) / 128), (unsigned)m.T);
     const int rwg = (int)(rbg / 4), rwd = (int)(rbd / 4);
-    #define HCM_MOE(K_, T_, ...) do { switch (T_) { \
-        case 8: coli_launch(K_<8>, __VA_ARGS__); break;   case 12: coli_launch(K_<12>, __VA_ARGS__); break; \
-        case 13: coli_launch(K_<13>, __VA_ARGS__); break; case 22: coli_launch(K_<22>, __VA_ARGS__); break; \
-        case 23: coli_launch(K_<23>, __VA_ARGS__); break; case 20: coli_launch(K_<20>, __VA_ARGS__); break; \
-        case 21: coli_launch(K_<21>, __VA_ARGS__); break; case 16: coli_launch(K_<16>, __VA_ARGS__); break; \
-        case 17: coli_launch(K_<17>, __VA_ARGS__); break; case 6: coli_launch(K_<6>, __VA_ARGS__); break; \
-        case 7: coli_launch(K_<7>, __VA_ARGS__); break; case 18: coli_launch(K_<18>, __VA_ARGS__); break; \
-        case 42: coli_launch(K_<42>, __VA_ARGS__); break; default: coli_launch(K_<14>, __VA_ARGS__); break; } } while (0)
-    HCM_MOE(hcm_moe_gu_k, tg, gg, 256, HcmTile<64, 128>::SMEM, st, tab, (const __half *)xh, hid, m, *p, rwg, btab);
+    #define HCM_MOE(K_, BM_, T_, ...) do { switch (T_) { \
+        case 8: coli_launch(K_<8, BM_>, __VA_ARGS__); break;   case 12: coli_launch(K_<12, BM_>, __VA_ARGS__); break; \
+        case 13: coli_launch(K_<13, BM_>, __VA_ARGS__); break; case 22: coli_launch(K_<22, BM_>, __VA_ARGS__); break; \
+        case 23: coli_launch(K_<23, BM_>, __VA_ARGS__); break; case 20: coli_launch(K_<20, BM_>, __VA_ARGS__); break; \
+        case 21: coli_launch(K_<21, BM_>, __VA_ARGS__); break; case 16: coli_launch(K_<16, BM_>, __VA_ARGS__); break; \
+        case 17: coli_launch(K_<17, BM_>, __VA_ARGS__); break; case 6: coli_launch(K_<6, BM_>, __VA_ARGS__); break; \
+        case 7: coli_launch(K_<7, BM_>, __VA_ARGS__); break; case 18: coli_launch(K_<18, BM_>, __VA_ARGS__); break; \
+        case 42: coli_launch(K_<42, BM_>, __VA_ARGS__); break; default: coli_launch(K_<14, BM_>, __VA_ARGS__); break; } } while (0)
     long long h4 = (long long)(nh / 4);
-    coli_launch(hcm_half_k, (unsigned)((h4 + 255) / 256), 256, 0, st, reinterpret_cast<const float4 *>(hid), reinterpret_cast<uint2 *>(hh), h4);
-    HCM_MOE(hcm_moe_dn_k, td, gd, 256, HcmTile<64, 128>::SMEM, st, tab, (const __half *)hh, hid, m, *p, rwd, btab);
+    if (m.TR == 128) {   /* tiles of 128 rows (moe_rows_bd_launch's choice): an expert's weights decoded once for twice the rows */
+        HCM_MOE(hcm_moe_gu_k, 128, tg, gg, 256, HcmTile<128, 128>::SMEM, st, tab, (const __half *)xh, hid, m, *p, rwg, btab);
+        coli_launch(hcm_half_k, (unsigned)((h4 + 255) / 256), 256, 0, st, reinterpret_cast<const float4 *>(hid), reinterpret_cast<uint2 *>(hh), h4);
+        HCM_MOE(hcm_moe_dn_k, 128, td, gd, 256, HcmTile<128, 128>::SMEM, st, tab, (const __half *)hh, hid, m, *p, rwd, btab);
+    } else {
+        HCM_MOE(hcm_moe_gu_k, 64, tg, gg, 256, HcmTile<64, 128>::SMEM, st, tab, (const __half *)xh, hid, m, *p, rwg, btab);
+        coli_launch(hcm_half_k, (unsigned)((h4 + 255) / 256), 256, 0, st, reinterpret_cast<const float4 *>(hid), reinterpret_cast<uint2 *>(hh), h4);
+        HCM_MOE(hcm_moe_dn_k, 64, td, gd, 256, HcmTile<64, 128>::SMEM, st, tab, (const __half *)hh, hid, m, *p, rwd, btab);
+    }
     #undef HCM_MOE
     cudaError_t le = cudaGetLastError();
     (void)cudaFreeAsync(scr, st);
@@ -5129,11 +5160,21 @@ static int moe_rows_bd_launch(DeviceContext *ctx, const CcExpert *tab, const flo
                               const bd_u32 *btab, cudaStream_t st) {
     size_t A = (size_t)p->S * p->K;
     unsigned ga = (unsigned)((A + 255) / 256);
+    /* tiles of 128 rows where the f16 tiles take the call and an expert has 32 rows or more on average
+     * (COLI_CUDA_MOE_TILE128: 1 always there, 0 never). A tile decodes its expert's weights once for
+     * its rows, which is most of its time: 64-row tiles left an expert of more rows decoding them
+     * again (Qwen3.8's 512 experts, 10 a row: 4096 rows 26.5 -> 16.2 ms a call on an RTX PRO 4000,
+     * and a 2048-row chunk's hot experts past 64 of its routes); at fewer rows the larger tile's
+     * products go to empty rows (a 545-token prompt 5% slower with them) */
+    static int t128 = -2;
+    if (t128 == -2) { const char *e = getenv("COLI_CUDA_MOE_TILE128"); t128 = e && *e ? atoi(e) : -1; }
+    m.TR = t128 != 0 && (t128 == 1 || A >= (size_t)32 * (size_t)p->E) && hcm_moe_able(ctx, p, btab) ? 128 : 64;
     if (!cuda_ok(cudaMemsetAsync(m.cnt, 0, (size_t)p->E * sizeof(int), st), "chain moe sort")) return 0;
     coli_launch(moe_sort_count_k, ga, 256, 0, st, tab, ids, m, *p);
     coli_launch(moe_sort_scan_k, 1, 32, 0, st, m, *p);
     coli_launch(moe_sort_place_k, ga, 256, 0, st, tab, ids, m, *p);
     if (hcm_moe(ctx, tab, x, hid, m, p, st, btab)) return 1;
+    if (m.TR != 64) { m.TR = 64; coli_launch(moe_sort_scan_k, 1, 32, 0, st, m, *p); }   /* hcg's tiles are of 64 rows */
     dim3 gg((unsigned)((p->I + TCG_BN - 1) / TCG_BN), (unsigned)m.T), gd((unsigned)((p->D + TCG_BN - 1) / TCG_BN), (unsigned)m.T);
     HCG_BT_LAUNCH(hcg_moe_gu_bd_k, p->fmt, gg, st, tab, x, hid, m, *p, btab);
     HCG_BT_LAUNCH(hcg_moe_dn_bd_k, p->fmt_d ? p->fmt_d : p->fmt, gd, st, tab, hid, m, *p, btab);

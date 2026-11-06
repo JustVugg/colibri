@@ -33,6 +33,7 @@ extern "C" int coli_cuda_tensor_glu_async(ColiCudaTensor *tg, ColiCudaTensor *tu
 extern "C" int coli_cuda_tensor_gemv_rows_async(ColiCudaTensor *t, const int *ids_dev, float *y_dev, const float *x_dev, int n, void *stream);
 /* and the routed experts' kernels (cc_moe), on the same terms, and a resident tensor's device copy */
 extern "C" int coli_cuda_tensor_dev(const ColiCudaTensor *t, const void **w, const float **sc, int *gs);
+extern "C" int coli_cuda_load_module(void);
 extern "C" int coli_cuda_moe_stage(int device, void *stage, size_t slot_bytes, int slots);
 extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float *x, const int *ids, const float *w,
                                    float *hid, float *y, const float *hy, const CcMoe *p, void *stream);
@@ -374,7 +375,13 @@ __global__ static void __launch_bounds__(128) cc_attn_gk(const float *__restrict
     __shared__ float qs[G][256];
     __shared__ float pe[G][128];
     __shared__ int   pt[128];
-    __shared__ float red[G][128];
+    /* a tile's 128 selected keys, 32 of their elements at a time, in the cache's type with a pad word
+     * (a thread's row reads no bank another of its warp reads); the reductions' red after them */
+    constexpr int KS = sizeof(KT) == 2 ? 34 : 33;
+    constexpr size_t KSB = (size_t)128 * KS * sizeof(KT), RDB = (size_t)G * 128 * sizeof(float);
+    __shared__ __align__(16) unsigned char ksm[KSB > RDB ? KSB : RDB];
+    KT (*Ks)[KS] = reinterpret_cast<KT (*)[KS]>(ksm);
+    float (*red)[128] = reinterpret_cast<float (*)[128]>(ksm);
     const int kvh = blockIdx.x, s = blockIdx.y, tid = threadIdx.x, h0 = kvh * G;
     #pragma unroll
     for (int g = 0; g < G; g++) {
@@ -399,18 +406,47 @@ __global__ static void __launch_bounds__(128) cc_attn_gk(const float *__restrict
         float sv[G];
         #pragma unroll
         for (int g = 0; g < G; g++) sv[g] = -3.0e38f;
-        if (i < n) {
-            const int t = list ? sel[lb + 1 + i] : i;
-            pt[tid] = t;
-            const int kb = p.k_off + (kbase + t) * p.hd;
-            float a[G];
+        if (i < n) pt[tid] = list ? sel[lb + 1 + i] : i;
+        __syncthreads();
+        /* each thread its position's dot over d in order (cc_attn_k's), the keys staged in Ks: a thread
+         * reading its own key's 256 elements in turn left the warps' loads 32 lines apart, the kernel
+         * bound by L1 (82% of it, the multiprocessors at 43%: Qwen3.8's prompt on an RTX PRO 4000) */
+        const int cnt = min(128, n - t0), vec = (p.hd & 7) == 0 && (p.k_off & 7) == 0;
+        float a[G];
+        #pragma unroll
+        for (int g = 0; g < G; g++) a[g] = 0.f;
+        for (int d0 = 0; d0 < p.hd; d0 += 32) {
             #pragma unroll
-            for (int g = 0; g < G; g++) a[g] = 0.f;
-            for (int d = 0; d < p.hd; d++) {
-                const float kv = cc_kvf(kc, kb + d);
-                #pragma unroll
-                for (int g = 0; g < G; g++) a[g] += qs[g][d] * kv;
+            for (int pass = 0; pass < 4; pass++) {   /* four threads a key, eight elements each */
+                const int r = (tid >> 2) + 32 * pass, e0 = 8 * (tid & 3);
+                if (r >= cnt) continue;
+                const size_t kb = (size_t)p.k_off + (size_t)(kbase + pt[r]) * p.hd + d0 + e0;
+                if (vec && d0 + e0 + 8 <= p.hd) {
+                    if (sizeof(KT) == 2) {
+                        const uint4 v = *reinterpret_cast<const uint4 *>(kc + kb);
+                        unsigned *dst = reinterpret_cast<unsigned *>(&Ks[r][e0]);
+                        dst[0] = v.x; dst[1] = v.y; dst[2] = v.z; dst[3] = v.w;
+                    } else {
+                        const float4 v0 = *reinterpret_cast<const float4 *>(kc + kb), v1 = *reinterpret_cast<const float4 *>(kc + kb + 4);
+                        float *dst = reinterpret_cast<float *>(&Ks[r][e0]);
+                        dst[0] = v0.x; dst[1] = v0.y; dst[2] = v0.z; dst[3] = v0.w; dst[4] = v1.x; dst[5] = v1.y; dst[6] = v1.z; dst[7] = v1.w;
+                    }
+                } else {
+                    for (int e = 0; e < 8 && d0 + e0 + e < p.hd; e++) Ks[r][e0 + e] = kc[kb + e];
+                }
             }
+            __syncthreads();
+            if (i < n) {
+                const int dn = p.hd - d0 < 32 ? p.hd - d0 : 32;
+                for (int d = 0; d < dn; d++) {
+                    const float kv = cc_kvf(Ks[tid], d);
+                    #pragma unroll
+                    for (int g = 0; g < G; g++) a[g] += qs[g][d0 + d] * kv;
+                }
+            }
+            __syncthreads();
+        }
+        if (i < n) {
             #pragma unroll
             for (int g = 0; g < G; g++) sv[g] = a[g] * p.scale;
         }
@@ -440,7 +476,7 @@ __global__ static void __launch_bounds__(128) cc_attn_gk(const float *__restrict
         }
         #pragma unroll
         for (int g = 0; g < G; g++) { const float corr = expf(m[g] - mn[g]); l[g] = l[g] * corr + red[g][0]; acc0[g] *= corr; acc1[g] *= corr; }
-        const int cnt = min(128, n - t0), d0 = tid, d1 = tid + 128;
+        const int d0 = tid, d1 = tid + 128;   /* cnt: the tile's positions, above */
         for (int j = 0; j < cnt; j++) {
             const int vb = p.v_off + (kbase + pt[j]) * p.hd;
             const float v0 = d0 < p.hd ? cc_kvf(vc, vb + d0) : 0.f, v1 = d1 < p.hd ? cc_kvf(vc, vb + d1) : 0.f;
@@ -1267,7 +1303,26 @@ __device__ static int cc_scan128(int x, int *buf, int *tot) {
     __syncthreads();
     return incl - x;
 }
-/* chain_qsa.comp: mode 0 one block of 128 per block key; mode 1 one block per query row */
+/* mode 1's scores, cc_qsa's first launch: a thread a block of keys of a row, over a grid of the rows' blocks
+ * (x) and the rows (y), the dot over d in the CPU's order. One block of 128 threads a row scored its 1100 blocks
+ * of 4400 positions in 197 us (Qwen3.8-Flash-Next on an RTX PRO 4000, a decode step's 1-4 rows: as many SMs) */
+__global__ static void __launch_bounds__(128) cc_qsa_score_k(const float *__restrict__ src, const float *__restrict__ pk,
+                                                             float *__restrict__ sc, CcQsa p) {
+    COLI_PDL_WAIT();
+    const int s = blockIdx.y, b = blockIdx.x * 128 + threadIdx.x;
+    const int visible = p.pos_base + s + 1, blocks = visible / p.R, take = min(blocks, p.budget / p.R);
+    if (take >= blocks || b >= blocks) return;
+    const int qb = p.q_off + s * p.q_row;
+    float score = 0.f;
+    for (int h = 0; h < p.IQ; h++) {
+        float a = 0.f;
+        for (int d = 0; d < p.ID; d++) a += src[qb + h * p.ID + d] * pk[p.pk_off + b * p.ID + d];
+        if (a > 0.f) score += a;
+    }
+    sc[s * 2 * p.nbmax + b] = score / sqrtf((float)p.ID);
+}
+/* chain_qsa.comp: mode 0 one block of 128 per block key; mode 1 one block per query row (its scores
+ * cc_qsa_score_k's) */
 __global__ static void __launch_bounds__(128) cc_qsa_k(const float *__restrict__ src, const float *__restrict__ w,
         float *__restrict__ pk, const float *__restrict__ cs, float *__restrict__ sc, int *__restrict__ sel, CcQsa p) {
     COLI_PDL_WAIT();
@@ -1317,18 +1372,6 @@ __global__ static void __launch_bounds__(128) cc_qsa_k(const float *__restrict__
         return;
     }
     int sb = s * 2 * p.nbmax;
-    int qb = p.q_off + s * p.q_row;
-    for (int b = tid; b < blocks; b += 128) {
-        float score = 0.f;
-        for (int h = 0; h < p.IQ; h++) {
-            float a = 0.f;
-            for (int d = 0; d < p.ID; d++) a += src[qb + h * p.ID + d] * pk[p.pk_off + b * p.ID + d];
-            if (a > 0.f) score += a;
-        }
-        sc[sb + b] = score / sqrtf((float)p.ID);
-    }
-    __threadfence_block();
-    __syncthreads();
     /* The blocks of rank < take (a higher score first, of equal ones the lower block), as the CPU
      * ranks them. Each block counted its rank against every other and one thread wrote the list:
      * O(blocks^2) on 128 threads, 298 us a call at 4400 positions (1100 blocks, Qwen3.8-Flash-Next
@@ -2613,6 +2656,8 @@ static int cc_qsa(CcBuf *src, CcBuf *w, CcBuf *pk, CcBuf *cs, CcBuf *sc, CcBuf *
         coli_launch(cc_qsa_k, (unsigned)p->nb, 128, 0, c->stream, fp(src), fp(w), fpw(pk), fp(cs), nullptr, nullptr, *p);
     } else if (p->mode == 1) {
         if (!sc || !sel || p->S < 1 || p->IQ < 1 || p->nbmax < 1 || p->sel_row < 1) return 0;
+        const int mb = (p->pos_base + p->S) / p->R;   /* the last row's blocks, the most */
+        coli_launch(cc_qsa_score_k, dim3((unsigned)(((mb > 0 ? mb : 1) + 127) / 128), (unsigned)p->S), 128, 0, c->stream, fp(src), fp(pk), fpw(sc), *p);
         coli_launch(cc_qsa_k, (unsigned)p->S, 128, 0, c->stream, fp(src), nullptr, fpw(pk), nullptr, fpw(sc), (int *)sel->d, *p);
     } else return 0;
     return launched(c, "qsa");
@@ -3242,6 +3287,21 @@ static int cc_enc_rel(CcBuf *x, CcBuf *pt, CcBuf *y, const CcEncRel *p) {
     coli_launch(cc_enc_rel_k, g, 256, 0, c->stream, fp(x), fp(pt), fpw(y), *p);
     return launched(c, "encoder relative products");
 }
+/* this file's kernels and the backend's loaded on the chain's device now: the runtime loads a
+ * module at the first launch of one of its kernels (lazy loading), this one's at a prompt's first
+ * norm (its code read from the binary then, 40 ms of a server's first long prompt on an RTX PRO
+ * 4000), the backend's at the first tile (17 ms) */
+static int cc_preload(void) {
+    if (!live()) return 0;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+    return 1;
+#else
+    cudaFuncAttributes fa;
+    const int own = cudaFuncGetAttributes(&fa, (const void *)cc_norm_k) == cudaSuccess;
+    (void)cudaGetLastError();
+    return own && coli_cuda_load_module();
+#endif
+}
 static const ColiCudaChainOps g_cc_ops = {
     sizeof(ColiCudaChainOps),
     cc_init, cc_ready, cc_lost_, cc_shutdown, cc_device, cc_device_now,
@@ -3271,5 +3331,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_addnorm,
     cc_pick_rows,
     cc_host_up_n,
+    cc_preload,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

@@ -522,6 +522,7 @@ int main(void) {
     if (!T) return 1;
     ck(T->init(0), "a context on device 0");
     ck(T->ready() && !T->lost(), "ready, not lost");
+    ck(T->preload && T->preload() && T->ready() && !T->lost(), "the chain's and the backend's kernels loaded before their first launch");
     const char *be = getenv("COLI_CUDA_CHAIN_BENCH");
     if (be && !strcmp(be, "adec")) { bench_adec(); return 0; }
     if (be && !strcmp(be, "route")) { bench_route(); return 0; }

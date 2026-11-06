@@ -333,6 +333,9 @@ typedef struct ColiCudaChainOps {
      * so far are done, in one call (cudaMemcpyBatchAsync where the runtime has it) with one ticket
      * for them all: a frame's promotions, where host_up took five calls of the runtime a copy */
     int  (*host_up_n)(void *const *dst, const void *const *src, const size_t *bytes, int n, unsigned *ticket);
+    /* preload: the chain's and the backend's kernels loaded on the chain's device (the runtime
+     * loads a module at the first launch of one of its kernels otherwise); 1 done */
+    int  (*preload)(void);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -401,6 +404,12 @@ static inline int cc_host_up_many(void *const *dst, const void *const *src, cons
     if (t && t->size >= offsetof(ColiCudaChainOps, host_up_n) + sizeof t->host_up_n && t->host_up_n) return t->host_up_n(dst, src, bytes, n, ticket);
     for (int i = 0; i < n; i++) if (!cc_host_up(dst[i], src[i], bytes[i], ticket)) return 0;
     return 1;
+}
+/* the chain's and the backend's kernels loaded now where the backend can (an older one loads them
+ * at their first launch) */
+static inline int cc_preload(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, preload) + sizeof t->preload && t->preload ? t->preload() : 0;
 }
 static inline int cc_moe_stage_ready(void) { const ColiCudaChainOps *t = cc_ops(); return t && t->size >= offsetof(ColiCudaChainOps, moe_stage) + sizeof t->moe_stage; }
 static inline int cc_moe_stage(CcBuf *b, size_t slot_bytes, int slots) { return cc_moe_stage_ready() ? cc_ops()->moe_stage(b, slot_bytes, slots) : 0; }
