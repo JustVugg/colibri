@@ -1354,6 +1354,18 @@ dsv4-cuda-test: tests/test_dsv4_dense_batch_cuda.c tests/test_dsv4_attention_bat
 	$(CC) $(CFLAGS) tests/test_dsv4_generic_bitwise_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_generic_bitwise_cuda_test$(EXE) $(LDFLAGS)
 	./dsv4_generic_bitwise_cuda_test$(EXE)
 
+# DSV4_CUDA_MOE_FUSED6 gate: the decode MoE's launch sequence and the fused cooperative
+# kernel on the same inputs, bit for bit (needs a GPU with cooperative launch). The test
+# is linked with backend_cuda_dsv4.cu itself, so it and the backend share one C runtime:
+# the switch is read with getenv on every call. Windows: run from a vcvars64 shell.
+.PHONY: dsv4-fused6-test
+dsv4-fused6-test: tests/test_dsv4_fused6_cuda.cu backend_cuda_dsv4.cu backend_cuda_dsv4.h
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) $(DSV4_DLL_TC) --expt-relaxed-constexpr --expt-extended-lambda \
+		$(if $(IS_WIN),-Xcompiler=/Zc:preprocessor -L"$(CUDA_HOME)/lib/x64") \
+		tests/test_dsv4_fused6_cuda.cu backend_cuda_dsv4.cu -o dsv4_fused6_cuda_test$(EXE) $(DSV4_DLL_LIBS)
+	./dsv4_fused6_cuda_test$(EXE)
+
 # Pure-CPU unit tests for the two headers the kernels consume. No GPU, no model.
 tests/test_dsv4_mhc$(EXE): tests/test_dsv4_mhc.c
 	$(CC) $(CFLAGS) tests/test_dsv4_mhc.c -o tests/test_dsv4_mhc$(EXE) $(LDFLAGS)

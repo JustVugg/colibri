@@ -62,6 +62,7 @@ struct Dev { int id,sms; cudaStream_t stream,aux; cudaEvent_t ready,fork,join;fl
     MvDesc *mvdesc;size_t mvdesccap;float *expert_weights;size_t expert_weightscap;int *expert_ids;size_t expert_idcap;
     int *emaj;size_t emajcap;float *emv1,*emv2,*emv4;size_t emv1cap,emv2cap,emv4cap;unsigned long long *emcount; /* expert-major MoE */
     float *mmv;size_t mmvcap;unsigned long long *mmvcount; /* DSV4_MM_WARP_VERIFY */
+    float *v4fact,*v4fparts;unsigned char *v4fbar; /* fused decode MoE (DSV4_CUDA_MOE_FUSED6) */
 #if COLI_DSV4_TC
     cublasLtHandle_t lt;TcPlan plans[2];
 #endif
@@ -1404,7 +1405,7 @@ extern "C" void dsv4_cuda_shutdown(void){
 #endif
     }
     for(int i=0;i<ng;i++){cudaSetDevice(g[i].id);if(g[i].dx)cudaFree(g[i].dx);if(g[i].dy)cudaFree(g[i].dy);if(g[i].p1)cudaFree(g[i].p1);if(g[i].p2)cudaFree(g[i].p2);if(g[i].p3)cudaFree(g[i].p3);if(g[i].p4)cudaFree(g[i].p4);if(g[i].aux1)cudaFree(g[i].aux1);if(g[i].aux2)cudaFree(g[i].aux2);if(g[i].aux3)cudaFree(g[i].aux3);if(g[i].mvdesc)cudaFree(g[i].mvdesc);if(g[i].expert_weights)cudaFree(g[i].expert_weights);if(g[i].expert_ids)cudaFree(g[i].expert_ids);if(g[i].tcw)cudaFree(g[i].tcw);if(g[i].tcs)cudaFree(g[i].tcs);if(g[i].tcx)cudaFree(g[i].tcx);if(g[i].tcxs)cudaFree(g[i].tcxs);if(g[i].tc_workspace)cudaFree(g[i].tc_workspace);
-        if(g[i].emaj)cudaFree(g[i].emaj);if(g[i].emv1)cudaFree(g[i].emv1);if(g[i].emv2)cudaFree(g[i].emv2);if(g[i].emv4)cudaFree(g[i].emv4);if(g[i].emcount)cudaFree(g[i].emcount);if(g[i].mmv)cudaFree(g[i].mmv);if(g[i].mmvcount)cudaFree(g[i].mmvcount);
+        if(g[i].emaj)cudaFree(g[i].emaj);if(g[i].emv1)cudaFree(g[i].emv1);if(g[i].emv2)cudaFree(g[i].emv2);if(g[i].emv4)cudaFree(g[i].emv4);if(g[i].emcount)cudaFree(g[i].emcount);if(g[i].mmv)cudaFree(g[i].mmv);if(g[i].mmvcount)cudaFree(g[i].mmvcount);if(g[i].v4fact)cudaFree(g[i].v4fact);if(g[i].v4fparts)cudaFree(g[i].v4fparts);if(g[i].v4fbar)cudaFree(g[i].v4fbar);
 #ifdef COLI_DSV4_DEEPGEMM
         if(g[i].dga1)cudaFree(g[i].dga1);if(g[i].dga2)cudaFree(g[i].dga2);if(g[i].dgsfa1)cudaFree(g[i].dgsfa1);if(g[i].dgsfa2)cudaFree(g[i].dgsfa2);if(g[i].dglayout)cudaFree(g[i].dglayout);if(g[i].dgrowmap)cudaFree(g[i].dgrowmap);if(g[i].dgmm1)cudaFree(g[i].dgmm1);if(g[i].dgmm2)cudaFree(g[i].dgmm2);if(g[i].dgref)cudaFree(g[i].dgref);if(g[i].dgdensews)cudaFree(g[i].dgdensews);
 #endif
@@ -1956,6 +1957,127 @@ extern "C" int dsv4_cuda_expert_fp8(Dsv4CudaTensor *gate,Dsv4CudaTensor *up,Dsv4
     expert_reduce<<<(H+255)/256,256,0,c->stream>>>(c->dy,c->p4,1,H);
     return ok(cudaGetLastError(),"shared-expert launch")&&ok(cudaMemcpyAsync(y,c->dy,hb,cudaMemcpyDeviceToHost,c->stream),"shared-expert result download")&&ok(cudaStreamSynchronize(c->stream),"shared-expert sync");
 }
+/* Fused decode MoE (DSV4_CUDA_MOE_FUSED6=1, opt-in): when the six routed FP4 experts
+ * and the FP8 shared expert of a layer are device mirrors of the decode shape
+ * (6 experts, H=4096, I=2048), one cooperative launch over every SM does gate/up,
+ * SwiGLU with the clamp, the fp8 activation round trip, down and the combine, with
+ * two grid barriers between the phases, instead of dsv4_cuda_moe's launch sequence.
+ * Each output keeps the launch sequence's arithmetic and order (tests/
+ * test_dsv4_fused6_cuda.cu compares the two bit for bit). Any other shape, or a
+ * device without cooperative launch, takes the launch sequence. */
+struct V4FBar { unsigned arrive; unsigned pad0[31]; unsigned gen; unsigned pad1[31]; };
+/* Grid barrier for a cooperative launch: the last block to arrive bumps the generation. */
+__device__ __forceinline__ void v4f_bar_sync(V4FBar* b,unsigned n){
+    __syncthreads();
+    if(threadIdx.x==0){ volatile unsigned* vg=&b->gen; unsigned g=*vg; __threadfence();
+        if(atomicAdd(&b->arrive,1u)==n-1u){ atomicExch(&b->arrive,0u); __threadfence(); atomicAdd(&b->gen,1u); }
+        else { while(*vg==g){} }
+        __threadfence(); }
+    __syncthreads();
+}
+__device__ __forceinline__ float v4f_bfr(float v){ return __bfloat162float(__float2bfloat16(v)); }
+__device__ __forceinline__ float v4f_act_fn(float g,float u,float w,float limit){ float gg=fminf(v4f_bfr(g),limit); float uu=fmaxf(-limit,fminf(v4f_bfr(u),limit));
+    return v4f_bfr(w*(gg/(1.f+expf(-gg)))*uu); }
+__device__ __forceinline__ float v4f_e8f(unsigned b){ return b? __uint_as_float(b<<23) : __uint_as_float(0x00400000u); }
+/* A warp's row dot in the order of the launch sequence's 256-thread matvecs
+ * (mv_fp4_grouped for the routed experts, mv<8> for the shared one): partial j sums
+ * i = j, j+256, ... in order, then the shared-memory tree s[j] += s[j+n] for
+ * n = 128, 64, ..., 1. Lane l holds the partials j = 8l .. 8l+7, so each step m reads
+ * the eight contiguous weights m + 8l .. m + 8l + 7 with one vector load. The tree's
+ * steps 128..8 pair the same register of lanes l and l + n/8 (shuffles), 4, 2, 1 pair
+ * registers inside lane 0. Every output gets the same operands in the same order. */
+__device__ __forceinline__ float v4f_tree(float p[8]){
+    #pragma unroll
+    for(int k=16;k;k>>=1){
+        #pragma unroll
+        for(int r=0;r<8;r++)p[r]=__fadd_rn(p[r],__shfl_down_sync(0xffffffffu,p[r],k));}
+    p[0]=__fadd_rn(p[0],p[4]);p[1]=__fadd_rn(p[1],p[5]);p[2]=__fadd_rn(p[2],p[6]);p[3]=__fadd_rn(p[3],p[7]);
+    p[0]=__fadd_rn(p[0],p[2]);p[1]=__fadd_rn(p[1],p[3]);
+    return __fadd_rn(p[0],p[1]);}
+/* The decodes give the same values as e4m3() and e8_table: the hardware e4m3
+ * conversion is exact, and the scale is 2^(b-127) (2^-127 for b = 0) from its bits. */
+__device__ __forceinline__ float v4f_e4m3(unsigned b){
+    __half_raw r=__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)(b&0xFFu),__NV_E4M3);return __half2float(__half(r));}
+/* fp8 e4m3 row, 128x128 UE8M0 blocks (srow: the row's block-row of scales): mv<8>'s
+ * sum += x * (e4m3 * e8), which nvcc contracts to one fma. */
+__device__ __forceinline__ float v4f_dot_fp8(const uint8_t* __restrict__ w,const uint8_t* __restrict__ srow,const float* xs,int I,int lane){
+    float p[8]={0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    for(int m=0;m<I;m+=256){
+        int i=m+8*lane;
+        uint2 u=__ldcs((const uint2*)(w+i));
+        float sc=v4f_e8f(__ldg(srow+(i>>7)));
+        const float4 *xp=(const float4*)(xs+i); float4 xa=xp[0],xb=xp[1];
+        const float xv[8]={xa.x,xa.y,xa.z,xa.w,xb.x,xb.y,xb.z,xb.w};
+        #pragma unroll
+        for(int r=0;r<8;r++){unsigned byte=(r<4?u.x:u.y)>>(8*(r&3));
+            p[r]=__fmaf_rn(xv[r],__fmul_rn(v4f_e4m3(byte),sc),p[r]);}}
+    return v4f_tree(p);}
+/* fp4 row, a UE8M0 scale per 32 weights (srow: the row's scales): mv_fp4_grouped's
+ * sum += x * f4 * e8, i.e. (x * f4) rounded, then times the power of two (exact).
+ * lut holds f4()'s sixteen values (code 8 is -0) in shared memory. */
+__device__ __forceinline__ float v4f_dot_fp4(const uint8_t* __restrict__ w,const uint8_t* __restrict__ srow,const float* xs,const float* lut,int I,int lane){
+    float p[8]={0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    for(int m=0;m<I;m+=256){
+        int i=m+8*lane;
+        unsigned u=__ldcs((const unsigned*)(w+(i>>1)));
+        float sc=v4f_e8f(__ldg(srow+(i>>5)));
+        const float4 *xp=(const float4*)(xs+i); float4 xa=xp[0],xb=xp[1];
+        const float xv[8]={xa.x,xa.y,xa.z,xa.w,xb.x,xb.y,xb.z,xb.w};
+        #pragma unroll
+        for(int r=0;r<8;r++)p[r]=__fadd_rn(p[r],__fmul_rn(__fmul_rn(xv[r],lut[(u>>(4*r))&15]),sc));}
+    return v4f_tree(p);}
+/* one block's quantization of a 2048-row like fp8_sim (RNE e4m3 incl. ties, == e4m3_round) */
+__device__ void v4f_block_fp8_sim(const float* src,float* dst,float* scl){
+    const int lane=threadIdx.x&31, wid=threadIdx.x>>5;
+    for(int i=threadIdx.x;i<2048;i+=blockDim.x) dst[i]=__ldcg(src+i);
+    __syncthreads();
+    if(wid<16){ float m=0.f; for(int j=lane;j<128;j+=32) m=fmaxf(m,fabsf(dst[wid*128+j]));
+        #pragma unroll
+        for(int o=16;o;o>>=1) m=fmaxf(m,__shfl_xor_sync(0xffffffffu,m,o));
+        if(!lane){ m=fmaxf(m,1e-4f); float raw=m/448.f; int e; frexpf(raw,&e); float sc=ldexpf(1.f,e-1); if(sc<raw) sc*=2.f; scl[wid]=sc; } }
+    __syncthreads();
+    for(int i=threadIdx.x;i<2048;i+=blockDim.x){ float sc=scl[i>>7]; float q=fmaxf(-448.f,fminf(448.f,dst[i]/sc));
+        __nv_fp8_storage_t c=__nv_cvt_float_to_fp8(q,__NV_SATFINITE,__NV_E4M3); __half_raw hr=__nv_cvt_fp8_to_halfraw(c,__NV_E4M3); __half h(hr);
+        dst[i]=v4f_bfr(__half2float(h)*sc); }
+    __syncthreads();
+}
+struct V4FMoeExp { const uint8_t *w1,*s1,*w3,*s3,*w2,*s2; float weight; int fp8; };
+struct V4FMoeArgs { V4FMoeExp e[7]; const float* x; float* act; float* parts; float* y; V4FBar* bar; float limit; };
+/* e[0..5]: routed FP4 experts, e[6]: the FP8 shared expert. Work is split evenly over
+ * every warp of the grid; a shared-expert row counts twice (an fp8 row reads twice the
+ * bytes of an fp4 row), so the odd units of its range are skipped. */
+__global__ void __launch_bounds__(1024,1) v4f_moe_kernel(V4FMoeArgs a){
+    __shared__ __align__(16) float xs[4096]; __shared__ __align__(16) float aq[2][2048]; __shared__ float lut[16]; __shared__ float scl[16];
+    const int lane=threadIdx.x&31, wid=threadIdx.x>>5, nw=1024/32; const int nb=gridDim.x, b=blockIdx.x;
+    if(threadIdx.x<16){ const float t[16]={0,.5f,1,1.5f,2,3,4,6,-0.f,-.5f,-1,-1.5f,-2,-3,-4,-6}; lut[threadIdx.x]=t[threadIdx.x]; }
+    for(int i=threadIdx.x*4;i<4096;i+=1024*4) *(float4*)(xs+i)=__ldg((const float4*)(a.x+i));
+    __syncthreads();
+    auto gate_up=[&](int k,int o){ const V4FMoeExp& E=a.e[k]; float g,u;
+        if(E.fp8){ g=v4f_dot_fp8(E.w1+(size_t)o*4096,E.s1+(o/128)*32,xs,4096,lane); u=v4f_dot_fp8(E.w3+(size_t)o*4096,E.s3+(o/128)*32,xs,4096,lane); }
+        else { g=v4f_dot_fp4(E.w1+(size_t)o*2048,E.s1+(size_t)o*128,xs,lut,4096,lane); u=v4f_dot_fp4(E.w3+(size_t)o*2048,E.s3+(size_t)o*128,xs,lut,4096,lane); }
+        if(!lane) a.act[k*2048+o]=v4f_act_fn(g,u,E.weight,a.limit); };
+    auto down=[&](int k,int o,const float* aqk){ const V4FMoeExp& E=a.e[k]; float p;
+        if(E.fp8) p=v4f_dot_fp8(E.w2+(size_t)o*2048,E.s2+(o/128)*16,aqk,2048,lane);
+        else p=v4f_dot_fp4(E.w2+(size_t)o*1024,E.s2+(size_t)o*64,aqk,lut,2048,lane);
+        if(!lane) a.parts[k*4096+o]=p; };
+    const int W=nb*nw, gw=b*nw+wid;
+    { const int C=8*2048; const int u0=(int)((long long)C*gw/W), u1=(int)((long long)C*(gw+1)/W);
+      for(int u=u0;u<u1;u++){ if(u<12288) gate_up(u>>11,u&2047); else { int v=u-12288; if(!(v&1)) gate_up(6,v>>1); } } }
+    v4f_bar_sync(a.bar,(unsigned)nb);
+    /* A block's warps span at most two experts' down rows: quantize those activations once. */
+    { const int C=8*4096; const int bu0=(int)((long long)C*(b*nw)/W), bu1=(int)((long long)C*((b+1)*nw)/W);
+      auto kof=[](int u){ return u<24576? (u>>12) : 6; };
+      const int k0=kof(bu0), k1=kof(bu1>bu0? bu1-1 : bu0);
+      v4f_block_fp8_sim(a.act+k0*2048,aq[0],scl); if(k1!=k0) v4f_block_fp8_sim(a.act+k1*2048,aq[1],scl);
+      const int u0=(int)((long long)C*gw/W), u1=(int)((long long)C*(gw+1)/W);
+      for(int u=u0;u<u1;u++){ int k,o; if(u<24576){ k=u>>12; o=u&4095; } else { int v=u-24576; if(v&1) continue; o=v>>1; k=6; }
+        down(k,o,k==k0? aq[0] : aq[1]); } }
+    v4f_bar_sync(a.bar,(unsigned)nb);
+    for(int o=b*1024+threadIdx.x;o<4096;o+=nb*1024){ float v=0.f;
+        #pragma unroll
+        for(int k=0;k<6;k++) v+=v4f_bfr(__ldcg(a.parts+k*4096+o));
+        a.y[o]=v4f_bfr(v+v4f_bfr(__ldcg(a.parts+6*4096+o))); }
+}
 extern "C" int dsv4_cuda_moe(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,Dsv4CudaTensor *const *down,
         const float *weights,int count,Dsv4CudaTensor *sg,Dsv4CudaTensor *su,Dsv4CudaTensor *sd,float limit,float *y,const float *x){
     if(count<1||count>16||!gate||!up||!down||!sg||!su||!sd)return 0;Dsv4CudaTensor*t=gate[0];Dev*c=t?ctx(t->device):nullptr;
@@ -1966,6 +2088,37 @@ extern "C" int dsv4_cuda_moe(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *
     if(!buf((void**)&c->dx,&c->xcap,hb)||!buf((void**)&c->dy,&c->ycap,hb)||!buf((void**)&c->p1,&c->p1cap,ib)||
        !buf((void**)&c->p2,&c->p2cap,ib)||!buf((void**)&c->p3,&c->p3cap,ib)||!buf((void**)&c->p4,&c->p4cap,parts)||
        !ok(cudaMemcpyAsync(c->dx,x,hb,cudaMemcpyHostToDevice,c->stream),"MoE activation upload"))return 0;
+    /* DSV4_CUDA_MOE_FUSED6=1 (opt-in, read on every call): the decode shape as one
+     * cooperative v4f_moe_kernel launch. fnb = co-resident blocks per SM, probed once;
+     * 0 once the device has no cooperative launch, a buffer failed or a launch was
+     * refused: from then on the launch sequence below. The grid needs >= 8 blocks so
+     * that one block's down rows span at most two experts (the kernel's aq[2]). */
+    static int fnb=-1;
+    const char*fused_env=getenv("DSV4_CUDA_MOE_FUSED6");
+    if(fused_env&&atoi(fused_env)&&fnb<0){int coop=0;cudaDeviceGetAttribute(&coop,cudaDevAttrCooperativeLaunch,t->device);
+        if(!coop){fnb=0;fprintf(stderr,"[DSV4 CUDA] cooperative launch unsupported: fused MoE stays off\n");}
+        else{int nbb=0;if(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nbb,v4f_moe_kernel,1024,0)!=cudaSuccess){cudaGetLastError();nbb=0;}fnb=nbb;}}
+    if(fused_env&&atoi(fused_env)&&count==6&&H==4096&&I==2048&&fnb>0&&c->sms*fnb>=8){
+        if((!c->v4fact&&!alloc_ok(cudaMalloc(&c->v4fact,7*2048*sizeof(float)),"fused act"))||
+           (!c->v4fparts&&!alloc_ok(cudaMalloc(&c->v4fparts,7*4096*sizeof(float)),"fused parts"))||
+           (!c->v4fbar&&!alloc_ok(cudaMalloc(&c->v4fbar,sizeof(V4FBar)),"fused barrier"))){
+            fnb=0;fprintf(stderr,"[DSV4 CUDA] fused MoE buffers unavailable: launch sequence from now on\n");
+        }else{
+            V4FMoeArgs ma{};
+            for(int k=0;k<6;k++)ma.e[k]={(uint8_t*)gate[k]->w,gate[k]->scale,(uint8_t*)up[k]->w,up[k]->scale,
+                                          (uint8_t*)down[k]->w,down[k]->scale,weights[k],0};
+            ma.e[6]={(uint8_t*)sg->w,sg->scale,(uint8_t*)su->w,su->scale,(uint8_t*)sd->w,sd->scale,1.f,1};
+            ma.x=c->dx;ma.act=c->v4fact;ma.parts=c->v4fparts;ma.y=c->dy;ma.bar=(V4FBar*)c->v4fbar;ma.limit=limit;
+            if(!ok(cudaMemsetAsync(c->v4fbar,0,sizeof(V4FBar),c->stream),"fused barrier clear"))return 0;
+            void* kargs[]={&ma};
+            cudaError_t rco=cudaLaunchCooperativeKernel((void*)v4f_moe_kernel,dim3(c->sms*fnb),dim3(1024),kargs,0,c->stream);
+            if(rco!=cudaSuccess){cudaGetLastError();fnb=0;
+                fprintf(stderr,"[DSV4 CUDA] fused MoE cooperative launch refused (code %d): launch sequence from now on\n",(int)rco);}
+            else return ok(cudaGetLastError(),"fused MoE")&&
+                   ok(cudaMemcpyAsync(y,c->dy,hb,cudaMemcpyDeviceToHost,c->stream),"MoE result download")&&
+                   ok(cudaStreamSynchronize(c->stream),"MoE sync");
+        }
+    }
     static int batched=-1;if(batched<0)batched=getenv("DSV4_CUDA_BATCHED")?atoi(getenv("DSV4_CUDA_BATCHED")):1;
     if(batched){MvDesc hd[32];for(int e=0;e<count;e++){hd[2*e]={(uint8_t*)gate[e]->w,gate[e]->scale,c->dx,c->p1+(long long)e*I};hd[2*e+1]={(uint8_t*)up[e]->w,up[e]->scale,c->dx,c->p2+(long long)e*I};}
         if(!buf((void**)&c->mvdesc,&c->mvdesccap,(size_t)2*count*sizeof(*hd))||!buf((void**)&c->expert_weights,&c->expert_weightscap,(size_t)count*sizeof(float))||
