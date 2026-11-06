@@ -77,6 +77,34 @@ class ExperimentManifestTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sample median"):
             validate(record)
 
+    def test_rejects_unrepresentable_sample_and_median(self):
+        for field in ("samples", "median"):
+            with self.subTest(field=field):
+                record = manifest()
+                if field == "samples":
+                    record["baseline"]["samples"]["tok_s"][0] = 10 ** 400
+                    message = "baseline.samples.tok_s"
+                else:
+                    record["baseline"]["median_tok_s"] = 10 ** 400
+                    message = "baseline.median_tok_s"
+                with self.assertRaisesRegex(ValueError, message):
+                    validate(record)
+
+    def test_cli_continues_after_unrepresentable_sample(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bad = Path(directory) / "bad.json"
+            good = Path(directory) / "good.json"
+            record = manifest()
+            record["baseline"]["samples"]["tok_s"][0] = 10 ** 400
+            bad.write_text(json.dumps(record), encoding="utf-8")
+            good.write_text(json.dumps(manifest()), encoding="utf-8")
+            result = subprocess.run([sys.executable, "-B", str(Path(__file__).resolve().parent.parent / "experiment_manifest.py"),
+                                     str(bad), str(good)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"{bad}: baseline.samples.tok_s", result.stdout)
+        self.assertIn(f"{good}: ok", result.stdout)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_rejects_missing_quality_gate(self):
         record = manifest()
         record["trial"]["quality"]["passed"] = False
