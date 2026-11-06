@@ -1,5 +1,6 @@
 """Exercise the shell harness's actual counters without requiring a GPU."""
 from pathlib import Path
+import os
 import re
 import shutil
 import subprocess
@@ -7,9 +8,18 @@ import tempfile
 import unittest
 
 
-# Use the resolved executable: Windows can otherwise launch System32's WSL
-# shim instead of the MSYS2 Bash found on PATH.
-BASH = shutil.which("bash")
+# Windows: shutil.which("bash") can return System32's WSL shim, which has no
+# sed/tail. Prefer the bash of the Git for Windows that provides `git`
+# (<root>\cmd\git.exe next to <root>\bin\bash.exe); never take a System32 one.
+def _find_bash():
+    git = shutil.which("git")
+    candidates = [str(Path(git).parents[1] / "bin" / "bash.exe") if git else None,
+                  shutil.which("bash")]
+    return next((c for c in candidates
+                 if c and os.path.exists(c) and "system32" not in c.lower()), None)
+
+
+BASH = _find_bash()
 SCRIPT = Path(__file__).with_name("vulkan_engines.sh").read_text()
 # Load only these production helpers: sourcing the full script runs a family.
 HELPERS = re.search(r"^fail\(\).*?$", SCRIPT, re.M).group() + "\n"
