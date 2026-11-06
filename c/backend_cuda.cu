@@ -4655,6 +4655,36 @@ extern "C" int coli_cuda_tensor_gemv_rows_async(ColiCudaTensor *t, const int *id
                                      ctx->smem_optin, (cudaStream_t)stream)) return 0;
     return cuda_ok(cudaGetLastError(), "block rows gemv launch");
 }
+/* f32 rows with few outputs for a prompt chunk's rows (Qwen3.8's gated residuals: inject, 4
+ * outputs of 10,240 inputs): quant_matmul's grid read a row once for every output, 105 ms of a
+ * 4180-token prompt on an RTX PRO 4000. A block a row reads it once for all of them, each output's
+ * per-thread sum and tree quant_matmul's (fmt 0), so the same bits. */
+#define F32_FEW_MAX 8
+__global__ static void f32_few_k(float *__restrict__ y, const float *__restrict__ x, const float *__restrict__ w, int I, int O) {
+    COLI_PDL_WAIT();
+    const int s = blockIdx.x;
+    const float *xs = x + (size_t)s * I;
+    float sum[F32_FEW_MAX];
+    #pragma unroll
+    for (int o = 0; o < F32_FEW_MAX; o++) sum[o] = 0.0f;
+    for (int i = threadIdx.x; i < I; i += blockDim.x) {
+        const float xv = xs[i];
+        #pragma unroll
+        for (int o = 0; o < F32_FEW_MAX; o++) if (o < O) sum[o] += xv * w[(size_t)o * I + i];
+    }
+    __shared__ float partial[F32_FEW_MAX][256];
+    #pragma unroll
+    for (int o = 0; o < F32_FEW_MAX; o++) if (o < O) partial[o][threadIdx.x] = sum[o];
+    __syncthreads();
+    for (int n = blockDim.x >> 1; n; n >>= 1) {
+        if (threadIdx.x < n)
+            #pragma unroll
+            for (int o = 0; o < F32_FEW_MAX; o++) if (o < O) partial[o][threadIdx.x] += partial[o][threadIdx.x + n];
+        __syncthreads();
+    }
+    if ((int)threadIdx.x < O) y[(size_t)s * O + threadIdx.x] = partial[threadIdx.x][0];
+}
+
 extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream) {
     if (fault_injected()) return 0;
     if (!t || !y_dev || !x_dev || S < 1) return 0;
@@ -4733,6 +4763,10 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, cons
     if (t->fmt == 0 && S <= GEMV_I8_MAX_S && t->O <= 512 && t->I >= 1024) {   /* few outputs, long rows: quant_matmul's bits */
         coli_launch(f32_gemv_k, dim3((unsigned)t->O, (unsigned)S), 256, 0, st, y_dev, x_dev, (const float *)t->weights, t->I, t->O);
         return cuda_ok(cudaGetLastError(), "chain f32 gemv launch");
+    }
+    if (t->fmt == 0 && S > GEMV_I8_MAX_S && t->O <= F32_FEW_MAX) {   /* few outputs, a chunk's rows: a block a row */
+        coli_launch(f32_few_k, dim3((unsigned)S), 256, 0, st, y_dev, x_dev, (const float *)t->weights, t->I, t->O);
+        return cuda_ok(cudaGetLastError(), "chain f32 few-outputs launch");
     }
     dim3 grid((unsigned)t->O, (unsigned)S);
     if (t->fmt == 8 && f8_warp_mode())

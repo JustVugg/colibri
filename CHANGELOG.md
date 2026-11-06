@@ -37,6 +37,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **CUDA: a prompt chunk's f32 matrices of few outputs a row at a time.** Qwen3.8's gated
+  residuals take four outputs of 10,240 inputs (`inject`), which ran on `quant_matmul`'s grid of a
+  block an output and a row, each block reading the row again: 105 ms of a 4180-token prompt under
+  nsys on an RTX PRO 4000. `f32_few_k` takes a row a block for up to eight outputs, each output's
+  sums in `quant_matmul`'s order, so the same bits. unsloth's UD-IQ2_XS, a 4180-token prompt
+  1167-1170 -> 1181 tok/s, UD-Q2_0 1215-1221 -> 1219-1229.
 - **Qwen3.8 on the CUDA chain: a long prompt's next layer copied while this layer's experts run.**
   A long prompt run layer by layer copies each layer's experts that are off the card to a staging
   on it, and every layer's places started at the staging's start, so the next layer's copy waited

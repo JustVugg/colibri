@@ -737,6 +737,17 @@ int main(void) {
                 same = T->begin() && T->matmul(t4, xb4, (size_t)s * I4, yb1, 0, 1) && T->submit(1) &&
                        !memcmp(T->ptr(yb1), (const float *)T->ptr(yb4) + (size_t)s * O4, (size_t)O4 * 4);
             ck(same, "and each of its three rows the one-row call's bits");
+            {   /* a prompt chunk's 100 rows of it (f32_few_k, a block a row): each row the one-row call's bits */
+                const int S8 = 100;
+                std::vector<float> x8 = rnd((size_t)S8 * I4, 16);
+                CcBuf *xb8 = T->buf((size_t)S8 * I4 * 4, CC_DEV), *yb8 = T->buf((size_t)S8 * O4 * 4, CC_DOWN);
+                int ok8 = xb8 && yb8 && T->begin() && T->write(xb8, 0, x8.data(), x8.size() * 4) && T->matmul(t4, xb8, 0, yb8, 0, S8) && T->submit(1);
+                for (int r = 0; r < S8 && ok8; r += 11)   /* ten of them */
+                    ok8 = T->begin() && T->matmul(t4, xb8, (size_t)r * I4, yb1, 0, 1) && T->submit(1) &&
+                          !memcmp(T->ptr(yb1), (const float *)T->ptr(yb8) + (size_t)r * O4, (size_t)O4 * 4);
+                ck(ok8, "f32 rows, 4 outputs of 10240, a prompt chunk's 100 rows: each the one-row call's bits");   /* 11 matmuls */
+                T->free(xb8); T->free(yb8);
+            }
             coli_cuda_tensor_free(t4); T->free(xb4); T->free(yb4); T->free(yb1);
         }
         {   /* BF16 rows (a GGUF's type 30, fmt 130): a decode step's and a verify's rows (bd_gemv_bf16_k, each row
@@ -1702,7 +1713,7 @@ int main(void) {
     printf("lost\n");
     {
         CcStats st; T->stats(&st);
-        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 35, "the counters saw the frames, ops and matmuls");
+        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 46, "the counters saw the frames, ops and matmuls");
         setenv("COLI_GPU_FAIL_AFTER", "0", 1);
         std::vector<float> w = rnd(64, 81), ones(8, 1.f);
         ColiCudaTensor *t = NULL;
