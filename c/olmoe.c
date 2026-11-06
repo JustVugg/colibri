@@ -9,6 +9,7 @@
  * Matmul multi-thread con OpenMP (niente BLAS).
  *
  * ENV VARS:
+ *   COLI_MODEL_DIRS=<dir;dir>: extra shard directories (distinct shards, see st.h); config and tokenizer stay in SNAP
  *   PILOT=0/1/2/3 : 0=no prefetch, 1=1-layer lookahead, 2=2-layer, 3=3-layer lookahead
  *   HOT=N         : pin top-N hot experts per layer permanently (never evict)
  *   WARMUP=N      : tokens before hot pinning activates (default 5)
@@ -840,7 +841,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     memset(m, 0, sizeof(*m));
     m->quant_bits = bits;
     load_cfg(&m->c, snap);
-    st_init(&m->S, snap);
+    st_init_multi(&m->S, snap, getenv("COLI_MODEL_DIRS"));
     Cfg *c = &m->c;
     if (layer_end == 0) layer_end = c->n_layers;
     if (layer_begin < 0 || layer_end > c->n_layers ||
@@ -3943,7 +3944,7 @@ static int olmoe_edge_engine_open(
         return coli_edge_adapter_error(error, error_size,
                                        "out of memory opening OLMoE Edge");
     load_cfg(&engine->model.c, options->model_dir);
-    st_init(&engine->model.S, options->model_dir);
+    st_init_multi(&engine->model.S, options->model_dir, getenv("COLI_MODEL_DIRS"));
     const Cfg *ec = &engine->model.c;
     engine->model.embed = load_t(&engine->model, "model.embed_tokens.weight", ec->vocab, ec->hidden);
 #ifdef OLM_DENSE_F16
