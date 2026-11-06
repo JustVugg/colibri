@@ -400,5 +400,7 @@ deepseek-v4-clean:
 		$(V4_SERVE_TEST) test_expert_store_registry $(V4_FLAGS_STAMP) \
 		$(V4_CUDA_FLAGS_STAMP) backend_cuda_dsv4.d backend_vulkan_v4.o vk_tier_v4.o vk_chain_v4.o
 
-# Track transitive CUDA and DeepGEMM headers after the first compilation.
--include backend_cuda_dsv4.d
+# Bootstrap dependency tracking for old objects and regenerate deleted depfiles.
+backend_cuda_dsv4.o: backend_cuda_dsv4.d
+backend_cuda_dsv4.d: ;
+-include $(wildcard backend_cuda_dsv4.d)
