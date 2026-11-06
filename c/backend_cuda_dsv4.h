@@ -64,6 +64,8 @@ int dsv4_cuda_fp8_ref_matmul(int device,const uint8_t *w,const float *bscale,
 int dsv4_cuda_backend_arch_ok(int device);
 const char *dsv4_cuda_backend_name(void);
 long long dsv4_cuda_mem_free_mb(int device);
+/* 1 when the device has a live context opened by dsv4_cuda_init. */
+int dsv4_cuda_device_active(int device);
 /* 1 on unified-memory devices (integrated GPU, or pageable access through the
  * host page tables), where mem_free_mb is the system's free memory rather
  * than headroom on a card. 0 when unknown. */
@@ -231,6 +233,12 @@ int dsv4_cuda_route_top6_batch(const Dsv4CudaActivation *input,Dsv4CudaTensor *g
 int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation *input,const int *ids,
                                   const float *weights,int count,Dsv4CudaExpertSet *experts,
                                   float limit,Dsv4CudaActivation *output);
+/* EP-N slice: only routes with expert id in [lo,hi) contribute; the rest
+ * are skipped. Bank shared experts still land on top of the routed sum.
+ * Each device in an expert-parallel set calls this once for its own band. */
+int dsv4_cuda_route_moe_ids_batch_masked(const Dsv4CudaActivation *input,const int *ids,
+                                         const float *weights,int count,Dsv4CudaExpertSet *experts,
+                                         float limit,Dsv4CudaActivation *output,int lo,int hi);
 int dsv4_cuda_route_moe_ep2(const Dsv4CudaActivation *input,Dsv4CudaTensor *gate,Dsv4CudaTensor *bias,
                             const Dsv4CudaActivation *peer_input,Dsv4CudaTensor *peer_gate,Dsv4CudaTensor *peer_bias,
                             int token,float routed_scale,Dsv4CudaExpertSet *local,Dsv4CudaExpertSet *peer,

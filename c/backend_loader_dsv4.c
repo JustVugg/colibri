@@ -173,6 +173,7 @@ typedef int             (*fn_backend_arch_ok)(int device);
 typedef const char     *(*fn_backend_name)(void);
 typedef long long       (*fn_mem_free_mb)(int device);
 typedef int             (*fn_device_unified)(int device);
+typedef int             (*fn_device_active)(int device);   /* optional: older DLLs always answer 0 */
 typedef int             (*fn_stream_drain)(int device);
 typedef int             (*fn_kv_ring_append)(int device, int layer, const float *rows,
                                              int start_pos, int count, int window, int dim);
@@ -243,6 +244,10 @@ typedef int             (*fn_route_moe_ids_batch)(const Dsv4CudaActivation *inpu
                                                   const float *weights, int count,
                                                   Dsv4CudaExpertSet *experts, float limit,
                                                   Dsv4CudaActivation *output);
+typedef int             (*fn_route_moe_ids_batch_masked)(const Dsv4CudaActivation *input, const int *ids,
+                                                        const float *weights, int count,
+                                                        Dsv4CudaExpertSet *experts, float limit,
+                                                        Dsv4CudaActivation *output, int lo, int hi);
 typedef int             (*fn_route_moe_ep2)(const Dsv4CudaActivation *input, Dsv4CudaTensor *gate,
                                             Dsv4CudaTensor *bias, const Dsv4CudaActivation *peer_input,
                                             Dsv4CudaTensor *peer_gate, Dsv4CudaTensor *peer_bias, int token,
@@ -316,6 +321,7 @@ static struct {
     char loaded_name[64];
     fn_mem_free_mb mem_free_mb;
     fn_device_unified device_unified;     /* optional: older DLLs answer 0 (discrete) */
+    fn_device_active device_active;       /* optional: older DLLs answer 0 (no live context) */
     fn_stream_drain stream_drain;                /* optional (older DLLs) */
     fn_kv_ring_append kv_ring_append;
     fn_kv_comp_append kv_comp_append;
@@ -340,6 +346,8 @@ static struct {
     fn_route_moe_batch route_moe_batch;
     fn_route_top6_batch route_top6_batch;
     fn_route_moe_ids_batch route_moe_ids_batch;
+    fn_route_moe_ids_batch_masked route_moe_ids_batch_masked;
+                                                          /* optional: older DLLs take the unmasked call */
     fn_route_moe_ep2   route_moe_ep2;
     fn_qkv             qkv;
     fn_wo              wo;
@@ -523,10 +531,12 @@ static int dsv4_cuda_resolve(const char *dllname){
     _Pragma("GCC diagnostic ignored \"-Wcast-function-type\"")
     g_dsv4.backend_arch_ok = (fn_backend_arch_ok)GetProcAddress(g_dsv4.dll, "dsv4_cuda_backend_arch_ok");
     g_dsv4.device_unified = (fn_device_unified)GetProcAddress(g_dsv4.dll, "dsv4_cuda_device_unified");
+    g_dsv4.device_active = (fn_device_active)GetProcAddress(g_dsv4.dll, "dsv4_cuda_device_active");
     /* optional: an older DLL without the export keeps the whole tier alive;
      * the engine probes this and simply stays on synchronous attaches. */
     g_dsv4.stream_drain = (fn_stream_drain)GetProcAddress(g_dsv4.dll, "dsv4_cuda_stream_drain");
     g_dsv4.expert_bank_upload_aux = (fn_expert_bank_upload_aux)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_upload_aux");
+    g_dsv4.route_moe_ids_batch_masked = (fn_route_moe_ids_batch_masked)GetProcAddress(g_dsv4.dll, "dsv4_cuda_route_moe_ids_batch_masked");
     g_dsv4.expert_bank_slots = (fn_expert_bank_slots)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_slots");
     g_dsv4.expert_bank_slot_bytes = (fn_expert_bank_slot_bytes)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_slot_bytes");
     g_dsv4.backend_name = (fn_backend_name)GetProcAddress(g_dsv4.dll, "dsv4_cuda_backend_name");
@@ -881,6 +891,11 @@ int dsv4_cuda_device_unified(int device){
     return g_dsv4.device_unified(device);
 }
 
+int dsv4_cuda_device_active(int device){
+    if(!g_dsv4.available || !g_dsv4.device_active) return 0;
+    return g_dsv4.device_active(device);
+}
+
 int dsv4_cuda_stream_drain(int device){
     /* Without the DLL there is never in-flight DMA to wait for, so a drain
      * trivially succeeds. With an older DLL that lacks the export, report
@@ -1054,6 +1069,15 @@ int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation *input, const int *id
                                   Dsv4CudaActivation *output){
     if(!g_dsv4.available) return 0;
     return g_dsv4.route_moe_ids_batch(input, ids, weights, count, experts, limit, output);
+}
+
+int dsv4_cuda_route_moe_ids_batch_masked(const Dsv4CudaActivation *input, const int *ids, const float *weights,
+                                         int count, Dsv4CudaExpertSet *experts, float limit,
+                                         Dsv4CudaActivation *output, int lo, int hi){
+    /* Optional: an older DLL takes the unmasked batch call per band from the
+     * engine side; without it the launch reports failure. */
+    if(!g_dsv4.available || !g_dsv4.route_moe_ids_batch_masked) return 0;
+    return g_dsv4.route_moe_ids_batch_masked(input, ids, weights, count, experts, limit, output, lo, hi);
 }
 
 int dsv4_cuda_route_moe_ep2(const Dsv4CudaActivation *input, Dsv4CudaTensor *gate, Dsv4CudaTensor *bias,

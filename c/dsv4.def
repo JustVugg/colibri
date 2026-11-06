@@ -77,9 +77,11 @@ EXPORTS
     dsv4_cuda_route_moe_batch
     dsv4_cuda_route_top6_batch
     dsv4_cuda_route_moe_ids_batch
+    dsv4_cuda_route_moe_ids_batch_masked
     dsv4_cuda_route_moe_ep2
     dsv4_cuda_qkv
     dsv4_cuda_wo
     dsv4_cuda_tensor_free
     dsv4_cuda_tensor_bytes
     dsv4_cuda_tensor_device
+    dsv4_cuda_device_active

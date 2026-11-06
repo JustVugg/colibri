@@ -1142,12 +1142,21 @@ struct ColiV4Engine {
     struct {
         int enabled;
         int device;
+        /* EP-N expert-parallel devices: each carries a band of the routed
+         * experts (bands computed from the device count, remainder on the
+         * primary). peers[0..npeers-1] hold the CUDA device indices; -1
+         * padding when unused. */
+        int peers[15];
+        int npeers;
         unsigned char layer_ready[COLI_V4_RESIDENT_MAX_LAYERS];
         long long uploaded_bytes;
         /* Optional opaque V4GpuExpertMirrorCache* for the dspark/MTP draft
          * experts (separate bounded LRU; see dspark_mirrors_ensure). NULL
          * unless V4_MTP_GPU=1 and the tier opened successfully. */
         void *dspark_mirrors;
+        /* EP-N fp4 mirror caches, one per peer device (decode split; the
+         * primary cache still hangs off the expert store). */
+        void *peer_mirrors[15];
     } gpu;
     struct {
         uint16_t *markov_w1;
