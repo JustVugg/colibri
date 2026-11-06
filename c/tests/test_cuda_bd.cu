@@ -463,6 +463,63 @@ static void check_moe(int tg, int td, int S, int K, int E, int D, int I) {
     free(tt); free(tab); free(G); free(U); free(Dn); free(x); free(w); free(y); free(ids);
 }
 
+/* BENCH_MOE: a prompt chunk's routed experts through the f16 tiles, timed: E experts of tg/tg/td with
+ * random blocks, S rows of K distinct routes, parts 1 and 2 (the tiles and the sum), ms a call */
+static void bench_moe(int tg, int td, int S, int K, int E, int D, int I, int reps) {
+    long rg = ref_row_bytes(tg, D), rd = ref_row_bytes(td, I);
+    if (rg <= 0 || rd <= 0) return;
+    int bg = ref_block_bytes(tg), bdb = ref_block_bytes(td);
+    size_t gb = (size_t)rg * I, db = (size_t)rd * D;
+    uint8_t *G = (uint8_t *)malloc(gb), *U = (uint8_t *)malloc(gb), *Dn = (uint8_t *)malloc(db);
+    ColiCudaTensor **tt = (ColiCudaTensor **)calloc((size_t)3 * E, sizeof *tt);
+    CcExpert *tab = (CcExpert *)calloc((size_t)E, sizeof *tab);
+    int ok = 1;
+    for (int e = 0; e < E && ok; e++) {   /* each expert its own random blocks */
+        for (size_t i = 0; i < gb; i++) { G[i] = (uint8_t)rnd(); U[i] = (uint8_t)rnd(); }
+        for (size_t i = 0; i < db; i++) Dn[i] = (uint8_t)rnd();
+        for (int o = 0; o < I; o++) for (long b = 0; b + bg <= rg; b += bg) { bd_fix(tg, G + o * rg + b); bd_fix(tg, U + o * rg + b); }
+        for (int o = 0; o < D; o++) for (long b = 0; b + bdb <= rd; b += bdb) bd_fix(td, Dn + o * rd + b);
+        ok = coli_cuda_tensor_upload(&tt[3 * e], G, NULL, 100 + tg, D, I, 0) && coli_cuda_tensor_upload(&tt[3 * e + 1], U, NULL, 100 + tg, D, I, 0) &&
+             coli_cuda_tensor_upload(&tt[3 * e + 2], Dn, NULL, 100 + td, I, D, 0);
+        const float *sc; int gsz;
+        ok = ok && coli_cuda_tensor_dev(tt[3 * e], &tab[e].g, &sc, &gsz) && coli_cuda_tensor_dev(tt[3 * e + 1], &tab[e].u, &sc, &gsz) &&
+             coli_cuda_tensor_dev(tt[3 * e + 2], &tab[e].d, &sc, &gsz);
+    }
+    float *x = (float *)malloc((size_t)S * D * 4), *w = (float *)malloc((size_t)S * K * 4);
+    int *ids = (int *)malloc((size_t)S * K * 4);
+    for (size_t i = 0; i < (size_t)S * D; i++) x[i] = ((int)(rnd() % 20001) - 10000) * 1e-5f;
+    for (int s = 0; s < S; s++)
+        for (int k = 0; k < K; k++) {
+            int e;
+            do { e = (int)(rnd() % E); int dup = 0; for (int j = 0; j < k; j++) dup |= ids[s * K + j] == e; if (!dup) break; } while (1);
+            ids[s * K + k] = e; w[s * K + k] = (float)(1 + rnd() % 100) / 100.f;
+        }
+    CcExpert *dtab; float *dx_, *dw, *dy, *dh; int *di;
+    size_t hf = cc_moe_hid_floats(S, K, D, I, E);
+    cudaMalloc(&dtab, (size_t)E * sizeof *tab); cudaMalloc(&dx_, (size_t)S * D * 4); cudaMalloc(&dw, (size_t)S * K * 4);
+    cudaMalloc(&dy, (size_t)S * D * 4); cudaMalloc(&dh, hf * 4); cudaMalloc(&di, (size_t)S * K * 4);
+    cudaMemcpy(dtab, tab, (size_t)E * sizeof *tab, cudaMemcpyHostToDevice); cudaMemcpy(dx_, x, (size_t)S * D * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(dw, w, (size_t)S * K * 4, cudaMemcpyHostToDevice); cudaMemcpy(di, ids, (size_t)S * K * 4, cudaMemcpyHostToDevice);
+    CcMoe mp = {};
+    mp.S = S; mp.K = K; mp.D = D; mp.I = I; mp.fmt = 100 + tg; mp.fmt_d = 100 + td; mp.parts = 3; mp.E = E;
+    mp.x_row = D; mp.i_row = K; mp.w_row = K; mp.y_row = D; mp.h_off = -1;
+    cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+    for (int r = 0; r < 2 && ok; r++) ok = coli_cuda_moe_async(0, dtab, dx_, di, dw, dh, dy, NULL, &mp, NULL);
+    ok = ok && cudaDeviceSynchronize() == cudaSuccess;
+    cudaEventRecord(e0);
+    for (int r = 0; r < reps && ok; r++) ok = coli_cuda_moe_async(0, dtab, dx_, di, dw, dh, dy, NULL, &mp, NULL);
+    cudaEventRecord(e1); cudaEventSynchronize(e1);
+    float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
+    const double per = ms / reps, wbytes = (double)E * (2 * gb + db), flop = 2.0 * S * K * (3.0 * D * I);
+    if (!ok) { printf("FAIL bench moe %s/%s: the call failed\n", ref_name(tg), ref_name(td)); fails++; }
+    else printf("BENCH moe %-7s/%-7s S %d K %d E %d [%d x %d]: %.3f ms a call, %.1f TFLOP/s, the experts %.0f MB\n",
+                ref_name(tg), ref_name(td), S, K, E, D, I, per, flop / per / 1e9, wbytes / 1e6);
+    cudaEventDestroy(e0); cudaEventDestroy(e1);
+    cudaFree(dtab); cudaFree(dx_); cudaFree(dw); cudaFree(dy); cudaFree(dh); cudaFree(di);
+    for (int i = 0; i < 3 * E; i++) if (tt[i]) coli_cuda_tensor_free(tt[i]);
+    free(tt); free(tab); free(G); free(U); free(Dn); free(x); free(w); free(ids);
+}
+
 int main(void) {
     int devs[1] = {0};
     if (!coli_cuda_init(devs, 1)) { printf("SKIP: no CUDA device\n"); return 0; }
@@ -477,6 +534,18 @@ int main(void) {
     free(tab);
     const int types[] = {8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 42, 2, 3, 6, 7, 34, 35, 39, 40, 41, 1, 30};
     const int shapes[][2] = {{2048, 300}, {4096, 70}, {768, 1000}, {12288, 40}, {2816, 33}};
+    /* BENCH_MOE="tg:td:S,...": a prompt chunk's routed experts of Qwen3.8's shape (10 of 512 a row,
+     * 2560 x 640) through the f16 tiles, timed */
+    if (getenv("BENCH_MOE")) {
+        char *spec = strdup(getenv("BENCH_MOE")), *save = NULL;
+        for (char *tok = strtok_r(spec, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+            int tg = 0, td = 0, S = 0;
+            if (sscanf(tok, "%d:%d:%d", &tg, &td, &S) == 3) bench_moe(tg, td, S, 10, 512, 2560, 640, 10);
+        }
+        free(spec); cudaFree(g_tab);
+        printf(fails ? "FAILED: %d\n" : "OK\n", fails);
+        return fails != 0;
+    }
     /* BENCH_ONLY="t:I:O,...": time those (and check them) only, e.g. LFM3's decode matrices */
     if (getenv("BENCH_ONLY")) {
         char *spec = strdup(getenv("BENCH_ONLY")), *save = NULL;

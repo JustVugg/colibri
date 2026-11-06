@@ -37,6 +37,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **CUDA: a prompt chunk's routed experts in tiles of 128 rows** where the f16 tiles take them and an
+  expert has 32 rows or more on average (`COLI_CUDA_MOE_TILE128`: 1 always, 0 never). A tile decodes
+  its expert's weights once for its rows, which is most of its time, and 64-row tiles left an expert of
+  more rows decoding them again. Qwen3.8's 512 experts on an RTX PRO 4000 (`test_cuda_bd`'s new
+  `BENCH_MOE`): 4096 rows 26.5 -> 16.2 ms a call; a 4180-token prompt of IQ2_XS 935 -> 966-977 tok/s,
+  of unsloth's UD-Q2_0 927-929 -> 960-962, a 545-token one the same.
 - **CUDA: a prompt's IQ2_XXS, IQ2_XS, IQ3_XXS, Q5_0 and Q5_1 routed experts on the mma.sync
   tiles.** A layer whose gate or down type had no decoder in the f16 tiles fell back to hcg_tile's
   for its prompt chunks. unsloth's Dynamic V3.1 Qwen3.8 files put IQ2_XXS or IQ2_XS gates on up to
