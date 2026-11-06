@@ -83,6 +83,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   for its prompt chunks. unsloth's Dynamic V3.1 Qwen3.8 files put IQ2_XXS or IQ2_XS gates on up to
   36 of their 48 layers (UD-IQ1_S), IQ3_XXS gates on up to 38 (UD-Q3_K_XL) and Q5_0 downs on up to
   33 (UD-IQ4_XS). UD-IQ1_M on an RTX PRO 4000: a 4220-token prompt 756-769 -> 837-839 tok/s.
+- **CUDA chain: a QSA row's scores over a grid of the device** (`cc_qsa_score_k`). A query row's
+  scores of its blocks of keys took one block of 128 threads, so a decode step's 1-4 rows used as many
+  of the card's multiprocessors: 197 us a call at 4400 positions on an RTX PRO 4000 after the radix
+  select. A thread a block of keys over a grid of the rows' blocks, the dot in the CPU's order, the
+  same scores: 41 us, and the select's 20. Qwen3.8-Flash-Next IQ2_XS, the decode after a 4180-token
+  prompt 68.7-68.9 -> 76.1-76.7 tok/s (unsloth's UD-Q2_0 59.4-59.9 -> 64.8-65.6).
 - **CUDA chain: a QSA row's selection by a radix select** (`cc_qsa_k`). Picking a query row's
   blocks of positions counted each block's rank against every other on one block of 128 threads, then
   one thread wrote the list: 298 us a call at 4400 positions on an RTX PRO 4000, 7 ms of a 31 ms
