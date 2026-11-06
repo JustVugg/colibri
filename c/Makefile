@@ -3216,7 +3216,7 @@ tests/test_v4_hybrid_policy$(EXE): tests/test_v4_hybrid_policy.c
 tests/test_k3_fill_budget$(EXE): tests/test_k3_fill_budget.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_v4_gpu_devices$(EXE): tests/test_v4_gpu_devices.c deepseek_v4_gpu_devices.h
+tests/test_v4_gpu_devices$(EXE): tests/test_v4_gpu_devices.c
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_v4_bank_pair$(EXE): tests/test_v4_bank_pair.c deepseek_v4_bank_pair.h
