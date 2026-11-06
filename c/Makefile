@@ -1779,7 +1779,7 @@ qwen36-tiny-mtp-check: qwen36-tiny-mtp-generate qwen36$(EXE)
 # vocabulary (--vocab 128), so a reply resent as text reads back as the ids the
 # engine generated. SPEC_ENV passes more settings to every run (the Vulkan family
 # in tests/vulkan_engines.sh runs the same gates in the dense chain).
-.PHONY: qwen36-tiny-v128-generate spec-drafts-check spec-drafts-run
+.PHONY: qwen36-tiny-v128-generate spec-drafts-check spec-drafts-run qwen36-phase2-stats-check
 qwen36-tiny-v128-generate:
 	$(PYTHON) tools/make_qwen36_tiny.py --out ./qwen36_tiny_v128 --ref-mode full --vocab 128 \
 		--emit-ref ./qwen36_tiny_v128/ref_full.json
@@ -1880,6 +1880,13 @@ tests/test_qwen36_eos$(EXE): tests/test_qwen36_eos.c qwen36.c $(QWEN36_TIER_OBJ)
 # The MTP head's depth: the plain step that keeps T(1) measured, only where the trim reads it.
 tests/test_qwen36_mtp_depth$(EXE): tests/test_qwen36_mtp_depth.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# Opt-in Qwen3.6 MTP and IQ2_XXS phase counters.
+tests/test_qwen36_phase2_stats$(EXE): tests/test_qwen36_phase2_stats.c qwen36.c qwen36_mtp.h $(QWEN36_TIER_OBJ) $(QWEN36_QPACK_OBJ) $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(QWEN36_QPACK_OBJ) $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+qwen36-phase2-stats-check: tests/test_qwen36_phase2_stats$(EXE)
+	./tests/test_qwen36_phase2_stats$(EXE)
 
 # A byte-counted serving payload may end mid-character; the pre-tokenizer must
 # not read past it.  qwen38 already gates this (tests/test_qwen38_tokenizer.c).

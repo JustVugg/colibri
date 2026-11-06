@@ -50,6 +50,34 @@
 #define Q36_SPEC_SNAPS (Q36_SPEC_ROWS - 1)
 static int g_q36_rowwise;   /* set for a speculative verify: its rows must get a decode step's bits (q36_spec_step) */
 
+#define Q36_PERF_PHASES 5
+enum {
+    Q36_PERF_DECODE,
+    Q36_PERF_MTP_FEED,
+    Q36_PERF_MTP_DRAFT,
+    Q36_PERF_VERIFY,
+    Q36_PERF_OTHER
+};
+static int g_q36_perf_enabled;
+static int g_q36_perf_initialized;
+static int g_q36_perf_phase = Q36_PERF_OTHER;
+static unsigned long long g_q36_iq2_metal[Q36_PERF_PHASES];
+static unsigned long long g_q36_iq2_fallback[Q36_PERF_PHASES];
+static void q36_perf_init(void) {
+    if (g_q36_perf_initialized) return;
+    const char *e = getenv("Q36_PERF_STATS");
+    g_q36_perf_enabled = e && *e && *e != '0';
+    g_q36_perf_initialized = 1;
+}
+static void q36_perf_phase(int phase) {
+    if (g_q36_perf_enabled) g_q36_perf_phase = phase;
+}
+static void q36_perf_iq2(int metal) {
+    if (!g_q36_perf_enabled) return;
+    unsigned long long *n = metal ? &g_q36_iq2_metal[g_q36_perf_phase]
+                                  : &g_q36_iq2_fallback[g_q36_perf_phase];
+    __sync_fetch_and_add(n, 1ULL);
+}
 /* Effective ceiling: Q36_MAXT if set and sane, the conservative default
  * otherwise; never above the hard limit. */
 /* A Clef checkpoint raises the default to its own input budget, 16384 (clef_head.h):
@@ -2211,6 +2239,9 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
 }
 
 #ifdef COLI_METAL
+static void q36_perf_iq2_fallback(int type) {
+    if (type == GQ_IQ2_XXS) q36_perf_iq2(0);
+}
 static int q36_iq2_xxs_metal_try(float *y, const float *x, const uint8_t *W,
                                  int t, int S, int I, int O, ColiMetalTensor **tensor) {
     if (t!=GQ_IQ2_XXS || S!=1 || !q36_iq2_metal_enabled() || !gq_int_ok(t,I)) return 0;
@@ -2218,13 +2249,16 @@ static int q36_iq2_xxs_metal_try(float *y, const float *x, const uint8_t *W,
     if (gq_act_set(&a,x,S,I)) { gq_act_free(&a); return 0; }
     int done=coli_metal_iq2_xxs_gemv(tensor,y,a.q,a.d,W,I,O);
     gq_act_free(&a);
+    if (done) q36_perf_iq2(1);
     return done;
 }
 static int q36_iq2_xxs_metal_try_act(float *y, const uint8_t *W, int t,
                                      const gq_act *a, int O) {
-    return t==GQ_IQ2_XXS && a && a->S==1 && q36_iq2_metal_enabled() &&
-           gq_int_ok(t,a->I) &&
-           coli_metal_iq2_xxs_gemv(NULL,y,a->q,a->d,W,a->I,O);
+    int done = t==GQ_IQ2_XXS && a && a->S==1 && q36_iq2_metal_enabled() &&
+               gq_int_ok(t,a->I) &&
+               coli_metal_iq2_xxs_gemv(NULL,y,a->q,a->d,W,a->I,O);
+    if (done) q36_perf_iq2(1);
+    return done;
 }
 static int q36_iq2_xxs_metal_try2_act(float *y1, const uint8_t *W1, int t1,
                                       float *y2, const uint8_t *W2, int t2,
@@ -2233,7 +2267,10 @@ static int q36_iq2_xxs_metal_try2_act(float *y1, const uint8_t *W1, int t1,
         !q36_iq2_metal_enabled() || !gq_int_ok(t1,a->I) || !gq_int_ok(t2,a->I))
         return 0;
     if (!coli_metal_iq2_xxs_gemv(NULL,y1,a->q,a->d,W1,a->I,O)) return 0;
-    return coli_metal_iq2_xxs_gemv(NULL,y2,a->q,a->d,W2,a->I,O);
+    q36_perf_iq2(1);
+    int done = coli_metal_iq2_xxs_gemv(NULL,y2,a->q,a->d,W2,a->I,O);
+    if (done) q36_perf_iq2(1);
+    return done;
 }
 #endif
 
@@ -2248,6 +2285,7 @@ static void matmul_d(float *y, const float *x, QW *w, int S, int I, int O){
             return;
         }
 #endif
+        if (w->gq_type == GQ_IQ2_XXS) q36_perf_iq2(0);
         if (gq_matmul(y, x, w->gq, w->gq_type, S, I, O)) {
             fprintf(stderr, "qwen36: GGUF matrix of type %s is not supported\n", gq_type_name(w->gq_type)); exit(1);
         }
@@ -5563,19 +5601,31 @@ static void moe_vk_gq_cpu(Model *m, int layer, const float *x, int S, const int 
         const float *xs = x + (int64_t)(i / K) * D; float *y = ctb + (int64_t)i * D;
         Slot *e = expert_hold(m, layer, idx[i]);
 #ifdef COLI_METAL
-        if (!q36_iq2_xxs_metal_try(G,xs,e->gqe,gx->hg,1,D,I,NULL))
-#endif
+        if (!q36_iq2_xxs_metal_try(G,xs,e->gqe,gx->hg,1,D,I,NULL)) {
+            q36_perf_iq2_fallback(gx->hg);
             gq_matmul(G, xs, e->gqe, gx->hg, 1, D, I);
-#ifdef COLI_METAL
-        if (!q36_iq2_xxs_metal_try(U,xs,e->gqe + gx->hb_g,gx->hu,1,D,I,NULL))
+        }
+#else
+        gq_matmul(G, xs, e->gqe, gx->hg, 1, D, I);
 #endif
+#ifdef COLI_METAL
+        if (!q36_iq2_xxs_metal_try(U,xs,e->gqe + gx->hb_g,gx->hu,1,D,I,NULL)) {
+            q36_perf_iq2_fallback(gx->hu);
             gq_matmul(U, xs, e->gqe + gx->hb_g, gx->hu, 1, D, I);
+        }
+#else
+        gq_matmul(U, xs, e->gqe + gx->hb_g, gx->hu, 1, D, I);
+#endif
         float sg = gx->sg ? gx->sg[idx[i]] : 1.f, su = gx->su ? gx->su[idx[i]] : 1.f;
         for (int j = 0; j < I; j++) { float gv = G[j] * sg; G[j] = (gv / (1.f + expf(-gv))) * (U[j] * su); }
 #ifdef COLI_METAL
-        if (!q36_iq2_xxs_metal_try(y,G,e->gqe + gx->hb_g + gx->hb_u,gx->hd,1,I,D,NULL))
-#endif
+        if (!q36_iq2_xxs_metal_try(y,G,e->gqe + gx->hb_g + gx->hb_u,gx->hd,1,I,D,NULL)) {
+            q36_perf_iq2_fallback(gx->hd);
             gq_matmul(y, G, e->gqe + gx->hb_g + gx->hb_u, gx->hd, 1, I, D);
+        }
+#else
+        gq_matmul(y, G, e->gqe + gx->hb_g + gx->hb_u, gx->hd, 1, I, D);
+#endif
         if (gx->sd) for (int d = 0; d < D; d++) y[d] *= gx->sd[idx[i]];
         if (vkt_wants(layer, idx[i])) { VktExpertSrc vs = vk_slot_src(m, layer, e); vkt_note(layer, idx[i], &vs); }
         slot_release(e);
@@ -7723,6 +7773,11 @@ typedef struct {
     int mtp_pstep;               /* Q36_MTP_PSTEP: the verify's depth from the drafts' own probabilities */
     float ahead_p[Q36_SPEC_ROWS];/* those probabilities, for the gate once the verify is judged */
     uint64_t mtp_drafts, mtp_accepted;
+    uint64_t mtp_proposed, mtp_verified_drafts, mtp_verifies, ordinary_forwards, verify_rows;
+    double mtp_draft_s, verify_s;
+    unsigned long long iq2_metal_start[Q36_PERF_PHASES], iq2_fallback_start[Q36_PERF_PHASES];
+    unsigned long long mtp_rows_start, mtp_kv_rows_start;
+    double mtp_ms_start, mtp_kv_ms_start;
     int force, force_row;        /* COLI_LOOKUP_FORCE (tests): the oracle's tokens as the proposal */
     int *hist, hist_n, hist_cap; /* the tokens fed so far and the one about to be: what lookup searches */
     SpecGate gate;
@@ -7748,6 +7803,14 @@ static int q36_spec_force_mode(const char *v, int *row) {
 
 static void q36_spec_begin(Model *m, Q36Spec *sp, const int *prompt, int np) {
     memset(sp, 0, sizeof *sp);
+    q36_perf_init();
+    q36_perf_phase(Q36_PERF_DECODE);
+    for (int i = 0; i < Q36_PERF_PHASES; i++) {
+        sp->iq2_metal_start[i] = __sync_fetch_and_add(&g_q36_iq2_metal[i], 0ULL);
+        sp->iq2_fallback_start[i] = __sync_fetch_and_add(&g_q36_iq2_fallback[i], 0ULL);
+    }
+    sp->mtp_rows_start = g_q36_mtp.rows; sp->mtp_ms_start = g_q36_mtp.ms;
+    sp->mtp_kv_rows_start = g_q36_mtp.kv_rows; sp->mtp_kv_ms_start = g_q36_mtp.kv_ms;
     const char *e = getenv("COLI_LOOKUP");
     /* on by default, always gated (docs/speculative.md): COLI_LOOKUP=0 turns it off */
     int asked = e && *e == '1';
@@ -7887,6 +7950,7 @@ static int q36_mtp_depth(Q36Spec *sp, int room, double *value) {
  * returned buffer is the caller's (it may hold more rows past the first vocab). */
 static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
     Cfg *c = &m->c; int V = c->vocab;
+    q36_perf_phase(Q36_PERF_DECODE);
     sp->tokens++;
     q36_spec_hist_push(sp, tok, pos);
     if (sp->mtp) q36_mtp_vocab_step(tok);
@@ -7927,7 +7991,10 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
         if (k) {
             float *hd = falloc(c->hidden);
             t_verify = now_s();
+            double draft_start = now_s();
+            q36_perf_phase(Q36_PERF_MTP_DRAFT);
             d[0] = q36_mtp_draft(m, tok, pos, hd);
+            sp->mtp_proposed++;
             sp->ahead_p[0] = g_q36_mtp.last_p;
             double t_first = now_s();
             static float pmin = -1.f;
@@ -7940,6 +8007,7 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
                      !spec_gate_deeper_p(&sp->gate, SPEC_SRC_MTP, j, sp->ahead_p))) { k = j; break; }
                 double t1 = now_s();
                 d[j] = q36_mtp_draft_more(m, hd, d[j - 1], pos + j);
+                sp->mtp_proposed++;
                 sp->ahead_p[j] = g_q36_mtp.last_p;
                 spec_gate_draft_cost(&sp->gate, SPEC_SRC_MTP, now_s() - t1);
             }
@@ -7961,11 +8029,14 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
                     if (t >= 0) d[j - 1] = t;
                 }
             }
+            sp->mtp_draft_s += now_s() - draft_start;
+            q36_perf_phase(Q36_PERF_DECODE);
             src = SPEC_SRC_MTP;
         }
     }
     if (!k) {
         sp->forwards++;
+        sp->ordinary_forwards++;
         double t0 = now_s();
         float *logit = step(m, &tok, 1, pos);
         spec_gate_forward(&sp->gate, 1, now_s() - t0);
@@ -7975,11 +8046,20 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
     sp->ids[0] = tok; memcpy(sp->ids + 1, d, (size_t)k * sizeof(int));
     m->snap_rows = k; g_q36_rowwise = 1;
     double t0 = t_verify ? t_verify : now_s();
+    double verify_start = now_s();
+    q36_perf_phase(Q36_PERF_VERIFY);
     float *logit = step_ex(m, sp->ids, S, pos, S);
+    sp->verify_s += now_s() - verify_start;
+    sp->verify_rows += (uint64_t)S;
     spec_gate_forward(&sp->gate, S, now_s() - t0);
     m->snap_rows = 0; g_q36_rowwise = 0;
     sp->forwards++; sp->verifies++;
-    if (src == SPEC_SRC_MTP) sp->mtp_drafts += (uint64_t)k; else sp->drafts += (uint64_t)k;
+    if (src == SPEC_SRC_MTP) {
+        sp->mtp_drafts += (uint64_t)k;
+        sp->mtp_verified_drafts += (uint64_t)k;
+        sp->mtp_verifies++;
+    } else sp->drafts += (uint64_t)k;
+    q36_perf_phase(Q36_PERF_DECODE);
     sp->ahead_n = S; sp->ahead_i = 1; sp->ahead_pos = pos; sp->ahead_src = src;
     sp->ahead_logit = falloc((int64_t)k * V);
     memcpy(sp->ahead_logit, logit + V, (size_t)k * V * sizeof(float));
@@ -7993,12 +8073,49 @@ static void q36_spec_end(Model *m, Q36Spec *sp) {
 }
 
 static void q36_spec_report(const Q36Spec *sp, const char *scope) {
-    if (sp->mtp_drafts) {
+    if (g_q36_perf_enabled) {
+        const uint64_t verified = sp->mtp_verified_drafts;
+        const double accepted_pct = verified ? 100.0 * (double)sp->mtp_accepted / (double)verified : 0.0;
+        const double accepted_per_verify = sp->mtp_verifies
+            ? (double)sp->mtp_accepted / (double)sp->mtp_verifies : 0.0;
+        fprintf(stderr,
+                "[qwen36 phase2] %s: MTP proposed %llu, verified %llu, accepted %llu "
+                "(%.1f%% of verified; %.2f accepted/MTP verify) | "
+                "verify forwards %llu (%llu rows, %.2f target rows/s), "
+                "MTP verifies %llu, ordinary decode forwards %llu | "
+                "draft %.3f s (%.2f proposed/s), verify %.3f s\n",
+                scope, (unsigned long long)sp->mtp_proposed, (unsigned long long)verified,
+                (unsigned long long)sp->mtp_accepted, accepted_pct, accepted_per_verify,
+                (unsigned long long)sp->verifies, (unsigned long long)sp->verify_rows,
+                sp->verify_s > 0.0 ? (double)sp->verify_rows / sp->verify_s : 0.0,
+                (unsigned long long)sp->mtp_verifies,
+                (unsigned long long)sp->ordinary_forwards, sp->mtp_draft_s,
+                sp->mtp_draft_s > 0.0 ? (double)sp->mtp_proposed / sp->mtp_draft_s : 0.0,
+                sp->verify_s);
+        fprintf(stderr,
+                "[qwen36 phase2] %s: MTP head %.3f s/%llu rows, feed K/V %.3f s/%llu rows\n",
+                scope, g_q36_mtp.ms - sp->mtp_ms_start,
+                (unsigned long long)(g_q36_mtp.rows - sp->mtp_rows_start),
+                g_q36_mtp.kv_ms - sp->mtp_kv_ms_start,
+                (unsigned long long)(g_q36_mtp.kv_rows - sp->mtp_kv_rows_start));
+        fprintf(stderr, "[qwen36 phase2] %s: IQ2_XXS GEMV Metal/CPU fallback by phase",
+                scope);
+        for (int i = 0; i < Q36_PERF_PHASES; i++) {
+            unsigned long long metal = __sync_fetch_and_add(&g_q36_iq2_metal[i], 0ULL) -
+                                       sp->iq2_metal_start[i];
+            unsigned long long fallback = __sync_fetch_and_add(&g_q36_iq2_fallback[i], 0ULL) -
+                                          sp->iq2_fallback_start[i];
+            if (metal || fallback)
+                fprintf(stderr, " %d:%llu/%llu", i, metal, fallback);
+        }
+        fprintf(stderr, " (phase index: decode=0 feed=1 draft=2 verify=3 other=4)\n");
+    }
+    if (sp->mtp_proposed || sp->mtp_drafts) {
         char g[384]; spec_gate_describe(&sp->gate, SPEC_SRC_MTP, g, sizeof g);
         fprintf(stderr, "[qwen36 mtp] %s: %.2f tokens/forward (%llu forwards per %llu tokens) | acceptance %.1f%% (%llu/%llu drafts) | gate %s\n", scope,
                 sp->forwards ? (double)sp->tokens / sp->forwards : 0.0,
                 (unsigned long long)sp->forwards, (unsigned long long)sp->tokens,
-                100.0 * sp->mtp_accepted / sp->mtp_drafts, (unsigned long long)sp->mtp_accepted,
+                sp->mtp_drafts ? 100.0 * sp->mtp_accepted / sp->mtp_drafts : 0.0, (unsigned long long)sp->mtp_accepted,
                 (unsigned long long)sp->mtp_drafts, g);
         q36_mtp_report();
     }
