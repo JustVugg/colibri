@@ -1082,6 +1082,13 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
 int coli_v4_gpu_experts_init(ColiV4Engine *engine, char *error, size_t error_size);
 int coli_v4_gpu_experts_preload(ColiV4Engine *engine, char *error, size_t size);
 int coli_v4_gpu_experts_resident(ColiExpertStore *store, int layer);
+int coli_v4_gpu_moe_resident(ColiExpertStore *store, int layer,
+    const int *ids, const float *weights, int count,
+    void *shared_gate, void *shared_up, void *shared_down,
+    float limit, float *output, const float *input);
+int coli_v4_gpu_resident_route(float *output,
+    const ColiDeepSeekV4LayerWeights *weights, const ColiDeepSeekV4Config *config,
+    ColiExpertStore *store, const float *input, int token);
 void coli_v4_gpu_head_upload(ColiV4Engine *engine);
 int coli_v4_gpu_head_scores(ColiV4Engine *engine,const float *input,float *scores);
 int coli_v4_gpu_head_batch(ColiV4Engine *engine,const float *input,int batch,
