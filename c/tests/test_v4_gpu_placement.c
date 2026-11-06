@@ -26,6 +26,7 @@ void dsv4_cuda_expert_set_free(Dsv4CudaExpertSet *set) { (void)set; }
 long long dsv4_cuda_mem_free_mb(int device) { free_queries[device]++; return 32000; }
 int dsv4_cuda_stream_drain(int device) { drained[device]++; return device != 3; }
 void dsv4_cuda_tensor_free(Dsv4CudaTensor *t) { if (t) { live_tensors--; free(t); } }
+void dsv4_cuda_proj_batch_release(void) {}
 int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t, const uint8_t *w,
                           const uint8_t *scale, int rows, int cols, int device) {
     (void)w; (void)scale; (void)rows; (void)cols;
