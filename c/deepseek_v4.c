@@ -2246,6 +2246,16 @@ static int decode_bf16(float *output, const void *data, size_t count) {
     return 0;
 }
 
+/* V4_ATTN_BATCH_PROJ (opt-in, default 0): wq_a and wkv in one device round trip. */
+static int v4_attn_batch_proj_on(void) {
+    static int wanted = -1;
+    if (wanted < 0) {
+        const char *env = getenv("V4_ATTN_BATCH_PROJ");
+        wanted = env && *env == '1';
+    }
+    return wanted;
+}
+
 static int attention_token_impl(float *output,
                                 ColiDeepSeekV4WindowAttentionState *state,
                                 const ColiDeepSeekV4LayerWeights *weights,
@@ -2300,7 +2310,19 @@ static int attention_token_impl(float *output,
     int result = (!input_act || !input_act_scales ||
                   coli_fp8_activation_qdq_ref(input_act, input_act_scales, input,
                                               (size_t)wq_a.columns, 128)) ? -1 : 0;
-    if (!result) result = coli_fp8_matvec_pre(qa, &wq_a, input, input_act);
+    /* V4_ATTN_BATCH_PROJ: wq_a and wkv read the raw input on the GPU (the same
+     * matvec as coli_fp8_matvec_pre's GPU path), so one round trip writes both. */
+    int pj_done = 0;
+#ifdef COLI_V4_GPU_TIER
+    if (!result && v4_attn_batch_proj_on() && coli_v4_gpu_attn_batch_wanted() &&
+        wq_a.gpu && wkv.gpu) {
+        void *tens[2] = {wq_a.gpu, wkv.gpu};
+        int rows[2] = {q_rank, head_dim};
+        float *outs[2] = {qa, kv};
+        pj_done = coli_v4_gpu_proj_batch(tens, rows, outs, 2, input) == 0;
+    }
+#endif
+    if (!result && !pj_done) result = coli_fp8_matvec_pre(qa, &wq_a, input, input_act);
     coli_bf16_round_array(qa, (size_t)q_rank);
     const void *q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
     if (!result && (!q_norm || decode_bf16(norm_weight, q_norm, (size_t)q_rank) ||
@@ -2350,7 +2372,7 @@ static int attention_token_impl(float *output,
         for (int i = 0; i < head_dim; i++) values[i] = coli_bf16_round(values[i] * scale);
     }
 
-    if (!result) result = coli_fp8_matvec_pre(kv, &wkv, input, input_act);
+    if (!result && !pj_done) result = coli_fp8_matvec_pre(kv, &wkv, input, input_act);
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
     const void *kv_norm = layer_data(weights, "attn.kv_norm.weight", NULL);
     if (!result && (!kv_norm || decode_bf16(norm_weight, kv_norm, (size_t)head_dim) ||
@@ -11709,6 +11731,7 @@ void coli_v4_gpu_engine_close(ColiV4Engine *engine) {
      * banks. Callers outside generate() (oracle, teacher forcing, Segment
      * runs) never release them themselves. */
     coli_v4_gpu_moe_batch_release();
+    dsv4_cuda_proj_batch_release();
     for (int layer = 0; layer < COLI_V4_RESIDENT_MAX_LAYERS; layer++) {
         if (!engine->gpu.layer_ready[layer]) continue;
         ColiDeepSeekV4LayerWeights *weights =
@@ -12049,6 +12072,33 @@ int coli_v4_gpu_fp8_matvec(const ColiTensorView *w, float *output,
     Dsv4CudaTensor *tensor = (Dsv4CudaTensor *)w->gpu;
     if (!tensor) return -1;
     return dsv4_cuda_matvec(tensor, output, (float *)input) ? 0 : -1;
+}
+
+/* V4_ATTN_BATCH_PROJ (opt-in): the decode input projections of one token in one device
+ * round trip (dsv4_cuda_proj_batch). The host stage is kept for the process lifetime
+ * (a few KB to a few hundred KB).
+ * shortcut: stage is never freed, its size is bounded by 6 projections, upgrade: free it on engine close. */
+int coli_v4_gpu_proj_batch(void *const *tensors, const int *rows, float **outs,
+                           int n, const float *input) {
+    static float *stage;
+    static size_t stage_floats;
+    if (n < 1 || n > 6 || !tensors || !rows || !outs || !input) return -1;
+    size_t total = 0;
+    for (int i = 0; i < n; i++) total += (size_t)rows[i];
+    if (total > stage_floats) {
+        float *grown = realloc(stage, total * sizeof(*grown));
+        if (!grown) return -1;
+        stage = grown;
+        stage_floats = total;
+    }
+    if (dsv4_cuda_proj_batch(n, (Dsv4CudaTensor *const *)tensors, rows, input, stage) != 1)
+        return -1;
+    size_t off = 0;
+    for (int i = 0; i < n; i++) {
+        memcpy(outs[i], stage + off, (size_t)rows[i] * sizeof(float));
+        off += (size_t)rows[i];
+    }
+    return 0;
 }
 
 int coli_v4_gpu_matvec_grouped(const ColiTensorView *w, float *output,
