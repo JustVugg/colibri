@@ -374,7 +374,13 @@ __global__ static void __launch_bounds__(128) cc_attn_gk(const float *__restrict
     __shared__ float qs[G][256];
     __shared__ float pe[G][128];
     __shared__ int   pt[128];
-    __shared__ float red[G][128];
+    /* a tile's 128 selected keys, 32 of their elements at a time, in the cache's type with a pad word
+     * (a thread's row reads no bank another of its warp reads); the reductions' red after them */
+    constexpr int KS = sizeof(KT) == 2 ? 34 : 33;
+    constexpr size_t KSB = (size_t)128 * KS * sizeof(KT), RDB = (size_t)G * 128 * sizeof(float);
+    __shared__ __align__(16) unsigned char ksm[KSB > RDB ? KSB : RDB];
+    KT (*Ks)[KS] = reinterpret_cast<KT (*)[KS]>(ksm);
+    float (*red)[128] = reinterpret_cast<float (*)[128]>(ksm);
     const int kvh = blockIdx.x, s = blockIdx.y, tid = threadIdx.x, h0 = kvh * G;
     #pragma unroll
     for (int g = 0; g < G; g++) {
@@ -399,18 +405,47 @@ __global__ static void __launch_bounds__(128) cc_attn_gk(const float *__restrict
         float sv[G];
         #pragma unroll
         for (int g = 0; g < G; g++) sv[g] = -3.0e38f;
-        if (i < n) {
-            const int t = list ? sel[lb + 1 + i] : i;
-            pt[tid] = t;
-            const int kb = p.k_off + (kbase + t) * p.hd;
-            float a[G];
+        if (i < n) pt[tid] = list ? sel[lb + 1 + i] : i;
+        __syncthreads();
+        /* each thread its position's dot over d in order (cc_attn_k's), the keys staged in Ks: a thread
+         * reading its own key's 256 elements in turn left the warps' loads 32 lines apart, the kernel
+         * bound by L1 (82% of it, the multiprocessors at 43%: Qwen3.8's prompt on an RTX PRO 4000) */
+        const int cnt = min(128, n - t0), vec = (p.hd & 7) == 0 && (p.k_off & 7) == 0;
+        float a[G];
+        #pragma unroll
+        for (int g = 0; g < G; g++) a[g] = 0.f;
+        for (int d0 = 0; d0 < p.hd; d0 += 32) {
             #pragma unroll
-            for (int g = 0; g < G; g++) a[g] = 0.f;
-            for (int d = 0; d < p.hd; d++) {
-                const float kv = cc_kvf(kc, kb + d);
-                #pragma unroll
-                for (int g = 0; g < G; g++) a[g] += qs[g][d] * kv;
+            for (int pass = 0; pass < 4; pass++) {   /* four threads a key, eight elements each */
+                const int r = (tid >> 2) + 32 * pass, e0 = 8 * (tid & 3);
+                if (r >= cnt) continue;
+                const size_t kb = (size_t)p.k_off + (size_t)(kbase + pt[r]) * p.hd + d0 + e0;
+                if (vec && d0 + e0 + 8 <= p.hd) {
+                    if (sizeof(KT) == 2) {
+                        const uint4 v = *reinterpret_cast<const uint4 *>(kc + kb);
+                        unsigned *dst = reinterpret_cast<unsigned *>(&Ks[r][e0]);
+                        dst[0] = v.x; dst[1] = v.y; dst[2] = v.z; dst[3] = v.w;
+                    } else {
+                        const float4 v0 = *reinterpret_cast<const float4 *>(kc + kb), v1 = *reinterpret_cast<const float4 *>(kc + kb + 4);
+                        float *dst = reinterpret_cast<float *>(&Ks[r][e0]);
+                        dst[0] = v0.x; dst[1] = v0.y; dst[2] = v0.z; dst[3] = v0.w; dst[4] = v1.x; dst[5] = v1.y; dst[6] = v1.z; dst[7] = v1.w;
+                    }
+                } else {
+                    for (int e = 0; e < 8 && d0 + e0 + e < p.hd; e++) Ks[r][e0 + e] = kc[kb + e];
+                }
             }
+            __syncthreads();
+            if (i < n) {
+                const int dn = p.hd - d0 < 32 ? p.hd - d0 : 32;
+                for (int d = 0; d < dn; d++) {
+                    const float kv = cc_kvf(Ks[tid], d);
+                    #pragma unroll
+                    for (int g = 0; g < G; g++) a[g] += qs[g][d0 + d] * kv;
+                }
+            }
+            __syncthreads();
+        }
+        if (i < n) {
             #pragma unroll
             for (int g = 0; g < G; g++) sv[g] = a[g] * p.scale;
         }
@@ -440,7 +475,7 @@ __global__ static void __launch_bounds__(128) cc_attn_gk(const float *__restrict
         }
         #pragma unroll
         for (int g = 0; g < G; g++) { const float corr = expf(m[g] - mn[g]); l[g] = l[g] * corr + red[g][0]; acc0[g] *= corr; acc1[g] *= corr; }
-        const int cnt = min(128, n - t0), d0 = tid, d1 = tid + 128;
+        const int d0 = tid, d1 = tid + 128;   /* cnt: the tile's positions, above */
         for (int j = 0; j < cnt; j++) {
             const int vb = p.v_off + (kbase + pt[j]) * p.hd;
             const float v0 = d0 < p.hd ? cc_kvf(vc, vb + d0) : 0.f, v1 = d1 < p.hd ? cc_kvf(vc, vb + d1) : 0.f;
