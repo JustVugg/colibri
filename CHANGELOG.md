@@ -37,6 +37,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **Qwen3.8 on the CUDA chain: a long prompt's routed experts in one call a layer.** Run layer by
+  layer, a prompt's chunks each ran a layer's routed experts on their own, and a chunk's tiles
+  decode each expert's weights for its rows: a 4180-token prompt's chunks of 2048, 2048 and 84
+  rows decoded every layer's experts three times. The chunks of a segment now route first and then
+  run their experts in one call (`cc_moe_cols`, a new chain op), down's outputs a slice at a time so
+  that the chunk's scratch holds every row's gate and up, and each slice's sums go out before the
+  next; every row has the bits one call of all the outputs gives it. As many chunks as leave a slice
+  of 512 outputs (a 4180-token prompt's three, 896 a slice); `COLI_CUDA_CHAIN_MOE_GROUP=0` runs them
+  chunk by chunk. unsloth's sets on an RTX PRO 4000, with their start profiles, two serves a side:
+  a 4180-token prompt UD-Q2_0 1007-1017 -> 1138-1141 tok/s, UD-IQ2_XS 914-917 -> 1045-1051, UD-IQ1_M
+  1041-1050 -> 1155-1161; the 545-token and one-line prompts the same, a decode step's time the
+  same.
 - **Qwen3.8 on the CUDA chain: a server's first long prompt as fast as the next one.** The first
   long prompt after a start grew the chain's buffers to a chunk's 2048 rows on its way, in
   page-locked host memory at 0.2 ms a MB (the K/V rows down, the streams down, a prompt-end

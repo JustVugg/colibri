@@ -34,6 +34,8 @@ extern "C" int coli_cuda_tensor_gemv_rows_async(ColiCudaTensor *t, const int *id
 /* and the routed experts' kernels (cc_moe), on the same terms, and a resident tensor's device copy */
 extern "C" int coli_cuda_tensor_dev(const ColiCudaTensor *t, const void **w, const float **sc, int *gs);
 extern "C" int coli_cuda_load_module(void);
+extern "C" int coli_cuda_moe_cols_async(int device, const CcExpert *tab, const float *x, const int *ids, const float *w,
+                                        float *hid, float *y, const CcMoe *p, int cols, void *stream);
 extern "C" int coli_cuda_moe_stage(int device, void *stage, size_t slot_bytes, int slots);
 extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float *x, const int *ids, const float *w,
                                    float *hid, float *y, const float *hy, const CcMoe *p, void *stream);
@@ -2697,6 +2699,21 @@ static int cc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf 
                              (void *)c->stream)) { c->lost = 1; return 0; }
     return 1;
 }
+/* moe's parts 3 with down and the sums by slices of cols outputs (coli_cuda_moe_cols_async): -1 not
+ * taken, the device as it was */
+static int cc_moe_cols(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *y, const CcMoe *p, int cols) {
+    CcCtx *c = live();
+    if (!c || !tab || !x || !ids || !w || !hid || !y || !p || p->parts != 3 || p->S < 1 || p->K < 1 || p->lay_S || p->lay_s0 ||
+        p->h_off >= 0 || cols < 128 || cols % 128) return -1;
+    if (cc_moe_hid_floats(p->S, p->K, cols < p->D ? cols : p->D, p->I, p->E) * 4 > hid->bytes ||
+        (size_t)(p->x_off + (size_t)(p->S - 1) * p->x_row + p->D) * 4 > x->bytes ||
+        (size_t)(p->y_off + (size_t)(p->S - 1) * p->y_row + p->D) * 4 > y->bytes) return -1;
+    const int r = coli_cuda_moe_cols_async(c->device, (const CcExpert *)tab->d, fp(x), (const int *)ids->d, fp(w), fpw(hid), fpw(y), p,
+                                           cols, (void *)c->stream);
+    if (r > 0) { g_st.ops++; return 1; }
+    if (r == 0) c->lost = 1;
+    return r;
+}
 static int cc_signal(CcBuf *flag, size_t word, unsigned v) {
     CcCtx *c = live();
     if (!c || !flag || flag->kind != CC_DOWN || (word + 1) * 4 > flag->bytes) return 0;
@@ -3332,5 +3349,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_pick_rows,
     cc_host_up_n,
     cc_preload,
+    cc_moe_cols,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }
