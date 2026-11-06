@@ -32,8 +32,9 @@ Vulkan expert tier and its upload/cache policy retain their existing paths.
 Build and run from the repository root:
 
 ```sh
-make -C c olmoe tests/test_olmoe_expert_store tests/test_olmoe_moe_by_expert tests/test_olmoe_cache_index tests/test_expert_store_ops tests/test_olmoe_serve_framing -j4
+make -C c olmoe tests/test_olmoe_expert_store tests/test_olmoe_segment_lifecycle tests/test_olmoe_moe_by_expert tests/test_olmoe_cache_index tests/test_expert_store_ops tests/test_olmoe_serve_framing -j4
 OMP_NUM_THREADS=2 ./c/tests/test_olmoe_expert_store
+OMP_NUM_THREADS=2 ./c/tests/test_olmoe_segment_lifecycle
 OMP_NUM_THREADS=2 ./c/tests/test_olmoe_moe_by_expert
 ./c/tests/test_olmoe_cache_index
 ./c/tests/test_expert_store_ops
@@ -75,3 +76,10 @@ The focused store test also passed ASan/UBSan with leak detection enabled.
 One isolated resident microbenchmark measured 23.8 ns for slot lookup/release
 and 31.9 ns for the view API. These host-specific measurements do not substitute
 for end-to-end model throughput or GPU acceptance.
+
+The production Segment teardown also releases the model-wide `ehit` matrix.
+Before the fix, a 32-cycle synthetic resident-cache fixture leaked 640 bytes in
+96 allocations, with LeakSanitizer stacks pointing to `ehit_mark`. The lifecycle
+test calls the production session/store/engine callbacks, checks independent KV
+buffers, and covers partial layer ranges and engines that never acquire an
+expert. These are resident synthetic fixtures, not checkpoint-based inference.

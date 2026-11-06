@@ -3652,6 +3652,10 @@ static void olmoe_segment_model_destroy(OlmoeSegmentEngine *engine) {
         free(cache->slot_by_expert);
         free(cache->slots);
     }
+    if (model->ehit)
+        for (int layer = 0; layer < model->c.n_layers; layer++)
+            free(model->ehit[layer]);
+    free(model->ehit);
     free(model->last_access); free(model->is_queued); free(model->is_pinned);
     free(model->freq);
     free(model->momentum_logits);
