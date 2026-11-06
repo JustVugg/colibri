@@ -183,6 +183,29 @@ def apply_think_default(body, default):
     return body
 
 
+def apply_think_default_openai(body, default):
+    """The same `think` default for an OpenAI request through /v1/chat/completions: set as
+    enable_thinking / reasoning_effort when the request carries neither."""
+    if default is None or not isinstance(body, dict) or "reasoning_effort" in body or "enable_thinking" in body:
+        return body
+    if default not in THINK_VALUES:
+        raise GatewayError(500, f"gateway.json: think must be true, false, \"low\", \"medium\" or \"high\", not {default!r}")
+    body = dict(body)
+    if default is False:
+        body["enable_thinking"] = False
+        body["reasoning_effort"] = "none"
+    else:
+        body["enable_thinking"] = True
+        if default is not True:
+            body["reasoning_effort"] = default
+    return body
+
+
+# the /v1 routes whose body names a model: the gateway resolves the name (aliases, :latest),
+# loads that model, and hands the engine the id it serves
+OPENAI_MODEL_ROUTES = ("/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/responses", "/v1/systemone")
+
+
 def ollama_chat_to_openai(body, model_id):
     """POST /api/chat's body as POST /v1/chat/completions' body. `model_id` is the id the
     child serves (the request's name may be an alias). Returns (openai_body, dropped_options)."""
@@ -1238,16 +1261,58 @@ class GatewayHandler(BaseHTTPRequestHandler):
         return f"{(conv.usage or {}).get('completion_tokens', '?')} tokens"
 
     # ---- pass-through
+    def _openai_error(self, status, message, code, param="model"):
+        self._send(status, {"error": {"message": message, "type": "invalid_request_error", "param": param, "code": code}})
+
+    def _openai_models(self):
+        """GET /v1/models: every model this gateway has, in OpenAI's list (the engine knows one)."""
+        self.server.registry.refresh()
+        data = []
+        for entry in self.server.registry.entries.values():
+            created = 0
+            try:
+                created = int(time.mktime(time.strptime(entry.get("modified_at", "")[:19], "%Y-%m-%dT%H:%M:%S")))
+            except (ValueError, TypeError):
+                pass
+            data.append({"id": entry["name"], "object": "model", "created": created, "owned_by": "colibri"})
+        return {"object": "list", "data": data}
+
     def _proxy(self):
-        """/v1/*, /health, the dashboard: to the child, streaming bodies as they come."""
+        """/v1/*, /health, the dashboard: to the child, streaming bodies as they come. The OpenAI
+        routes name a model: it is resolved and loaded here, the way /api/chat does it, so an
+        OpenAI client switches models by the name too; /v1/models lists them all."""
         m = self.server.manager
+        path = urlsplit(self.path).path
+        if self.command == "GET" and path == "/v1/models":
+            return self._send(200, self._openai_models())
+        if self.command == "GET" and path.startswith("/v1/models/"):
+            entry = self.server.registry.resolve(path[len("/v1/models/"):])
+            if entry is None:
+                return self._openai_error(404, f"The model `{path[len('/v1/models/'):]}` does not exist.", "model_not_found")
+            return self._send(200, {"id": entry["name"], "object": "model", "created": 0, "owned_by": "colibri"})
+        n = int(self.headers.get("Content-Length") or 0)
+        data = self.rfile.read(n) if n else None
+        if self.command == "POST" and path in OPENAI_MODEL_ROUTES and data:
+            try:
+                body = json.loads(data)
+            except ValueError:
+                body = None
+            if isinstance(body, dict):
+                try:
+                    entry = self._model_entry(body)
+                    m.ensure(entry)
+                except GatewayError as error:
+                    code = "model_not_found" if error.status == 404 else "model_not_loaded"
+                    return self._openai_error(error.status, error.message, code)
+                body["model"] = m.current
+                if path == "/v1/chat/completions":
+                    body = apply_think_default_openai(body, entry.get("think"))
+                data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         if m.state != "ready":
-            if urlsplit(self.path).path == "/health":
+            if path == "/health":
                 return self._send(503, {"status": "no model loaded" if m.state == "stopped" else m.state},
                                   headers={"Retry-After": "5"})
             return self._error(503, f"no model loaded (gateway state {m.state}); POST /api/chat loads one")
-        n = int(self.headers.get("Content-Length") or 0)
-        data = self.rfile.read(n) if n else None
         headers = {k: v for k, v in self.headers.items()
                    if k.lower() not in ("host", "content-length", "connection", "transfer-encoding", "accept-encoding")}
         if self.server.manager.api_key and "Authorization" not in headers:
