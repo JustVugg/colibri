@@ -19,8 +19,16 @@ int main(void) {
         "glm", "glm53", "inkling", "kimi", "olmoe", "qwen36", "qwen38",
         "deepseek_v4"
     };
-    for (size_t item = 0; item < sizeof(expected) / sizeof(expected[0]); item++)
-        assert(coli_edge_adapter_lookup(expected[item]) != NULL);
+    for (size_t item = 0; item < sizeof(expected) / sizeof(expected[0]); item++) {
+        const ColiEdgeAdapter *adapter =
+            coli_edge_adapter_lookup(expected[item]);
+        assert(adapter != NULL);
+        /* ABI v2: every family exposes the model head both as greedy
+         * selection and as full logits; a new adapter that ships only one
+         * of the two fails the real edge gate. */
+        assert(adapter->select != NULL);
+        assert(adapter->logits != NULL);
+    }
     puts("every real Edge adapter registers: ok");
     return 0;
 }

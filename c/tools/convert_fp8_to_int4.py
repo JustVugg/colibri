@@ -217,6 +217,18 @@ def _save_file_atomic(save_file, tensors, destination, **kwargs):
             pass
 
 
+def _hf_request(url, headers):
+    """A request to the hub with HF_TOKEN as an unredirected header: the redirect the hub answers
+    a file with (its CDN) does not carry it, as in setup_download._request. A plain header
+    follows urllib's redirects."""
+    import urllib.request
+    request = urllib.request.Request(url, headers=headers)
+    token = os.environ.get("HF_TOKEN")
+    if token:
+        request.add_unredirected_header("Authorization", f"Bearer {token}")
+    return request
+
+
 def _positioned_write(fd, data, offset):
     remaining = memoryview(data)
     pwrite = getattr(os, "pwrite", None)
@@ -1084,9 +1096,7 @@ def main():
             s0, s1 = segs[t]
             while done[t] < s1 - s0 and not stopfail:
                 pos = s0 + done[t]
-                _hdrs = {"User-Agent": "colibri-convert", "Range": f"bytes={pos}-{s1-1}"}
-                if os.environ.get("HF_TOKEN"): _hdrs["Authorization"] = f"Bearer {os.environ['HF_TOKEN']}"
-                req = urllib.request.Request(url, headers=_hdrs)
+                req = _hf_request(url, {"User-Agent": "colibri-convert", "Range": f"bytes={pos}-{s1-1}"})
                 try:
                     with urllib.request.urlopen(req, timeout=8) as r:
                         if r.status != 206:               # Range ignorato: multi-stream impossibile
@@ -1147,9 +1157,8 @@ def main():
             have = os.path.getsize(part) if os.path.exists(part) else 0
             if expected is not None and have >= expected: break
             have0 = have
-            req = urllib.request.Request(url, headers={"User-Agent": "colibri-convert"})
+            req = _hf_request(url, {"User-Agent": "colibri-convert"})
             if have: req.add_header("Range", f"bytes={have}-")
-            if os.environ.get("HF_TOKEN"): req.add_header("Authorization", f"Bearer {os.environ['HF_TOKEN']}")
             try:
                 with urllib.request.urlopen(req, timeout=8) as r:
                     if have and r.status == 200:          # server ha ignorato il Range: riparti pulito

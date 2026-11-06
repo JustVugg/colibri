@@ -956,20 +956,29 @@ static int64_t q38_telemetry_init(const char *snap, const Model *m) {
 
 /* Creates the draft list (draft_vocab.h) when the head can use one: Q38_MTP_VOCAB is above 0,
  * Q38_MTP_DUMP is unset (the dump contains the logits of the whole vocabulary), Q38_DRAFT_HEAD
- * has built no int4 copy of the lm_head, the lm_head has int8 rows on the host and the counts
+ * has built no int4 copy of the lm_head, the lm_head has int8 rows on the host (or the CUDA
+ * chain, which scores the list from the lm_head on the card, may run the head) and the counts
  * file is not the file of the expert history, which the counts would replace. It runs after the
  * trunk is int8 and before COLI_VK_DENSE_HOST releases host copies, so the lm_head rows can stay
  * on the host. */
 static void q38_vocab_decide(Model *m, const char *snap) {
     if (!m->mtp) return;
-    int top = q38_env_int_in_range("Q38_MTP_VOCAB", DRAFT_VOCAB_DEFAULT_TOP, 0, m->c.vocab);
+    int top0 = DRAFT_VOCAB_DEFAULT_TOP;
+#ifdef COLI_CUDA
+    if (q38cc_head_on_card(m)) top0 = DRAFT_VOCAB_CARD_TOP;   /* the list scored on the card: a longer one costs little there */
+#endif
+    int top = q38_env_int_in_range("Q38_MTP_VOCAB", top0 < m->c.vocab ? top0 : m->c.vocab, 0, m->c.vocab);
     if (!top || g_q38_mtp_dump) return;
     if (m->draft_codes) {
         fprintf(stderr, "[qwen38 MTP] draft vocabulary off: Q38_DRAFT_HEAD=int4 scores the whole "
                         "vocabulary from its own copy of the lm_head\n");
         return;
     }
-    if (!m->lm_head.q8) {
+    int card = 0;   /* the CUDA chain scores the list from the lm_head on the card (q38cc_mtp_rows) */
+#ifdef COLI_CUDA
+    card = q38cc_env_on();
+#endif
+    if (!m->lm_head.q8 && !card) {
         fprintf(stderr, "[qwen38 MTP] draft vocabulary: the lm_head has no int8 rows on the host, "
                         "so the head scores the whole vocabulary (Q38_MTP_VOCAB=0 silences this)\n");
         return;
@@ -1000,9 +1009,18 @@ static void q38_vocab_init(const char *snap, Model *m) {
         draft_vocab_totals(v, &tokens, &distinct);
         fprintf(stderr, "counts from %s (%.0f tokens, %d distinct)\n", v->path, tokens, distinct);
         break;
-    case DRAFT_VOCAB_NO_FILE:
-        fprintf(stderr, "no counts file at %s yet\n", v->path);
+    case DRAFT_VOCAB_NO_FILE: {   /* the model's start profile's counts, if it ships one; the counts go to v->path */
+        char *start = q38_state_path(snap, "COLI_VOCAB_START", ".coli_vocab.start"), *own = v->path;
+        v->path = start;
+        DraftVocabLoad r = draft_vocab_read(v);
+        v->path = own; v->records = 0;
+        if (r == DRAFT_VOCAB_LOADED || r == DRAFT_VOCAB_DAMAGED) {
+            draft_vocab_totals(v, &tokens, &distinct);
+            fprintf(stderr, "no counts file at %s yet: the start profile's (%s, %.0f tokens, %d distinct)\n", own, start, tokens, distinct);
+        } else fprintf(stderr, "no counts file at %s yet\n", own);
+        free(start);
         break;
+    }
     case DRAFT_VOCAB_NOT_COUNTS:
         fprintf(stderr, "%s cannot be read as a counts file\n", v->path);
         break;
@@ -1109,7 +1127,7 @@ static Q38Spec q38_spec_begin(Model *m, const int *prompt, int np) {
     sp.lk_force = q38_spec_force_mode("COLI_LOOKUP_FORCE", getenv("COLI_LOOKUP_FORCE"), Q38_SPEC_ROWS - 1, 1,
                                       &sp.lk_force_row);
     spec_gate_init(&sp.gate, !q38_env_bool("COLI_SPEC_GATE", 1));
-    sp.pstep = q38_env_bool("Q38_MTP_PSTEP", 0);   /* opt-in: measured 1-5% slower on the Vulkan chain at depth 2 */
+    sp.pstep = q38_env_bool("Q38_MTP_PSTEP", m->mtp_pstep);   /* off by default: measured 1-5% slower on the Vulkan chain at depth 2; on beside the CUDA chain's card head (q38_mtp_card_defaults) */
     if (sp.lookup && prompt && np > 0) {
         sp.hist_cap = np + 256;
         sp.hist = (int *)malloc((size_t)sp.hist_cap * sizeof(int));
@@ -1181,10 +1199,13 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     Q38Spec *sp = &g_q38_run_spec;
     if (m->draft_vocab) draft_vocab_begin(m->draft_vocab, prompt, np, 0);
     *sp = q38_spec_begin(m, prompt, np);   /* Q38_MTP=1, COLI_LOOKUP=1: drafts, every token still the argmax below */
-    int len = np;
+    int len = np, picked = -1;
     for (int s = 0; s < n_new; s++) {
-        int best = 0; float bv = logit[0];
-        for (int i = 1; i < c->vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
+        int best = picked;   /* the step's own pick (greedy), else the scan */
+        if (best < 0) {
+            best = 0; float bv = logit[0];
+            for (int i = 1; i < c->vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
+        }
         if (s == 0 && g_ttft < 0) g_ttft = now_s() - g_gen_t0;   /* record TTFT */
         if (g_stream) { stream_token(best); fflush(stdout); }
         if (s == n_new - 1) {
@@ -1199,7 +1220,10 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
         }
         free(logit); out[len++] = best;
         if (m->draft_vocab) draft_vocab_count_token(m->draft_vocab, best);
+        /* the steps' own picks (greedy), the last token's logits kept: a verify that reaches it has them */
+        sp->greedy = !g_capture_last_logit || n_new - 1 - s > Q38_SPEC_ROWS;
         logit = q38_spec_step(m, sp, best, len - 1, n_new - 1 - s);
+        picked = logit ? sp->next_tok : -1;
     }
     q38_spec_end(m, sp);
 }
@@ -1533,6 +1557,7 @@ typedef struct {
      * streams still waiting for their next token (Model.mtp_*) */
     float *mtp_pend;
     int mtp_len, mtp_pend_n, mtp_pend_tok[Q38_SPEC_ROWS];
+    int dev;   /* dn_rec, dn_conv and ple_conv still in the CUDA chain's copy (q38cc_snap_down): q38_prefix_settle */
 } Q38PrefixCache;
 
 static Q38PrefixCache g_q38_prefix;
@@ -1744,7 +1769,26 @@ static int q38_prefix_ids_reserve(int len){
     free(g_q38_prefix.ids);g_q38_prefix.ids=ids;g_q38_prefix.id_cap=len;return 1;
 }
 
+/* the snapshot's arrays filled where the CUDA chain still holds them (Q38PrefixCache.dev); a
+ * snapshot the device lost is no snapshot */
+static void q38_prefix_settle(Model *m){
+#ifdef COLI_CUDA
+    if(g_q38_prefix.dev&&g_q38_prefix.owner==m&&
+       !q38cc_snap_take(m,g_q38_prefix.dn_rec,g_q38_prefix.dn_conv,g_q38_prefix.ple_conv))g_q38_prefix.valid=0;
+#else
+    (void)m;
+#endif
+    g_q38_prefix.dev=0;
+}
+
 static void q38_prefix_copy_state(Model *m,int to_cache){
+    int dev=0;   /* the CUDA chain's frame copies the device's state down (q38cc_snap_down) */
+    if(!to_cache)q38_prefix_settle(m);
+#ifdef COLI_CUDA
+    if(to_cache)dev=q38cc_snap_down(m);
+#endif
+    g_q38_prefix.dev=dev;
+    if(!dev){
     if(to_cache)q38_dn_gpu_pull_all(m); else q38_dn_gpu_invalidate(m);
 #ifdef COLI_VULKAN
     if(to_cache)q38c_sync_host(m);
@@ -1754,7 +1798,8 @@ static void q38_prefix_copy_state(Model *m,int to_cache){
     if(to_cache)q38cc_sync_host(m);
     else q38cc_host_wrote(m,0);
 #endif
-    for(int i=0;i<m->c.layers;i++)if(!m->c.is_attn[i]){
+    }
+    for(int i=0;i<m->c.layers&&!dev;i++)if(!m->c.is_attn[i]){
         float *rec=to_cache?g_q38_prefix.dn_rec[i]:m->DN_rec[i];
         float *conv=to_cache?g_q38_prefix.dn_conv[i]:m->DN_conv[i];
         const float *src_rec=to_cache?m->DN_rec[i]:g_q38_prefix.dn_rec[i];
@@ -1764,8 +1809,8 @@ static void q38_prefix_copy_state(Model *m,int to_cache){
     }
     if(g_q38_prefix.ple_cells){
         if(to_cache){
-            memcpy(g_q38_prefix.ple_conv,m->PLE_conv_state,
-                   g_q38_prefix.ple_cells*sizeof(float));
+            if(!dev)memcpy(g_q38_prefix.ple_conv,m->PLE_conv_state,
+                           g_q38_prefix.ple_cells*sizeof(float));
             g_q38_prefix.ple_history_len=m->ple_history_len;
             memcpy(g_q38_prefix.ple_history,m->ple_history,sizeof(g_q38_prefix.ple_history));
         }else{
@@ -1879,6 +1924,30 @@ static void serve_hits(Model *m){
     printf("HITS %d %d %s\n",rows,E,hex); fflush(stdout); free(hex); free(bm);
 }
 
+/* HITL: the experts routed since the previous frame, written after every token the decode
+ * loop emits, so the chat page and the dashboard light them up while the answer is being
+ * written (openai_server.py's /experts?since=N). Each index is layer*experts+expert as four
+ * hex digits; nothing is written when nothing was routed (the later tokens of an MTP step
+ * share its forward). The per-turn HITS frame is unaffected. COLI_HITS_LIVE=0 turns it off. */
+static void serve_hits_live(Model *m){
+    static int enabled=-1;
+    if(enabled<0){const char *e=getenv("COLI_HITS_LIVE");enabled=!(e&&*e&&atoi(e)==0);}
+    uint8_t *es=m->estep;
+    if(!enabled||!es)return;
+    const Cfg *c=&m->c; size_t n=(size_t)c->layers*c->experts, k=0;
+    for(size_t i=0;i<n;i++)k+=es[i]!=0;
+    if(!k||n>65536)return;
+    char *line=(char*)malloc(k*4+8); size_t w=0;
+    if(!line)return;
+    memcpy(line,"HITL ",5); w=5;
+    for(size_t i=0;i<n;i++)if(es[i]){
+        es[i]=0;
+        for(int s=12;s>=0;s-=4)line[w++]="0123456789abcdef"[(i>>s)&15];
+    }
+    line[w++]=10;
+    fwrite(line,1,w,stdout); fflush(stdout); free(line);
+}
+
 /* The generation budget a request gets. max_tokens is a CEILING, not a
  * target (#260/#382, the rule GLM and DeepSeek V4 already apply): the prompt
  * must fit with room for one token (none for a read-only logprobs request,
@@ -1960,11 +2029,24 @@ static float *q38_serve_prefill(Model *m,const int *ids,int from,int np,ColiProm
         if(coli_prompt_poll(ctl)){free(lo);lo=NULL;break;}
         int n=np-at<seg?np-at:seg;
         /* the state at the segment's start (from the device too, for a chain), so a stop inside
-         * the segment can put it back */
-        if(q38_pin_state_copy(m,&st,1))g_coli_prompt_break=ctl;
+         * the segment can put it back; none where the CUDA chain takes it in one chunk, which a
+         * stop finds before it starts or not at all (a 470-token prompt's copy of the DeltaNet
+         * state from the card took 10 ms before its first layer). At the prompt's start it is the
+         * empty state both callers reset to, which a stop puts back by resetting again: no copy
+         * (Qwen3.8-Flash-Next's 118 MB into fresh pages, 30 ms of a 4180-token prompt) */
+        int one=0;
+#ifdef COLI_CUDA
+        one=q38cc_one_chunk(m,n);
+#endif
+        const int empty=!one&&at==0;
+        if(!one&&(empty||q38_pin_state_copy(m,&st,1)))g_coli_prompt_break=ctl;
         float *next=step(m,ids+at,n,at);
         g_coli_prompt_break=NULL;
-        if(!next){q38_pin_state_copy(m,&st,0);free(lo);lo=NULL;break;}
+        if(!next){
+            if(empty)reset_recurrent(m);
+            else q38_pin_state_copy(m,&st,0);
+            free(lo);lo=NULL;break;
+        }
         free(lo);lo=next;at+=n;
     }
     q38_pin_state_free(st);
@@ -2031,6 +2113,7 @@ static void q38_park(Model *m,int np,int max_tok){
     if(!ok){q38_park_free_rows();return;}
     memcpy(g_q38_park.fed,m->kvp.fed,(size_t)H*sizeof(int));
     g_q38_park.len=H;g_q38_park.kv_len=m->kv_len;g_q38_park.rows=n;g_q38_park.on=1;
+    q38_prefix_settle(m);   /* the request's snapshot will take the chain's copy */
     g_q38_park.snap=g_q38_prefix;memset(&g_q38_prefix,0,sizeof g_q38_prefix);   /* the request takes a snapshot of its own */
     if(getenv("COLI_PREFIX_LOG"))
         fprintf(stderr,"[PREFIX] the %d-token conversation parked for a %d-token request (%d rows kept apart)\n",H,np,n);
@@ -2074,6 +2157,55 @@ static int q38_answer_start(const int *ids,int np){
         if(!memcmp(ids+j,seq,(size_t)n*sizeof(int)))return j+n<np?j+n:-1;
     return -1;
 }
+/* An agent's conversations begin with the same long system prompt (Hermes: 14,500 tokens of
+ * instructions and tools) and part right after its end. The live state and the prompt-end
+ * snapshot run past that point, so every new conversation read the whole system prompt again
+ * (25-30 s on Qwen3.8-Flash-Next IQ2_XS). A prompt whose first message is a system prompt of
+ * COLI_HEAD_PIN_MIN tokens or more (1024 unset, 0 none) leaves a pin where it ends, in the pool
+ * the client's pins use: the next prompt with that system prompt restores the deepest pin it
+ * extends (coli_pin_best, the rows checked by kv_prefix_holds) and reads only what follows.
+ * Q38_HEAD_PIN_MARKS="open|close" sets the message's markers (a byte tokenizer's tests). */
+static int q38_head_pin_min(void){
+    static int n=-2;
+    if(n==-2){const char *e=getenv("COLI_HEAD_PIN_MIN");n=e&&*e?atoi(e):1024;if(n<0)n=0;}
+    return n;
+}
+/* where the first message ends when it is such a system prompt and something follows it; -1 otherwise */
+static int q38_head_end(const int *ids,int np){
+    static int *op=NULL,*cl=NULL,no=-1,nc=-1;
+    if(no<0){
+        no=nc=0;
+        const char *o="<|im_start|>system\n",*c="<|im_end|>\n",*e=getenv("Q38_HEAD_PIN_MARKS"),*bar=e?strchr(e,'|'):NULL;
+        char ob[64],cb[64];
+        if(bar&&bar>e&&bar[1]&&(size_t)(bar-e)<sizeof ob&&strlen(bar+1)<sizeof cb){
+            memcpy(ob,e,(size_t)(bar-e));ob[bar-e]=0;snprintf(cb,sizeof cb,"%s",bar+1);o=ob;c=cb;
+        }
+        if(g_tok){encode_text_n(o,strlen(o),&op,&no);encode_text_n(c,strlen(c),&cl,&nc);}
+    }
+    const int least=q38_head_pin_min();
+    if(least<=0||no<=0||nc<=0||!ids||np<no+nc||memcmp(ids,op,(size_t)no*sizeof(int)))return -1;
+    for(int j=no;j+nc<=np;j++)
+        if(!memcmp(ids+j,cl,(size_t)nc*sizeof(int)))return j+nc>=least&&j+nc<np?j+nc:-1;
+    return -1;
+}
+static int q38_head_pinned(const int *ids,int h){
+    for(int s=0;s<g_q38_pins.n;s++){
+        const ColiPin *k=&g_q38_pins.slot[s];
+        if(k->len==h&&k->ids&&k->state&&!memcmp(k->ids,ids,(size_t)h*sizeof(int)))return 1;
+    }
+    return 0;
+}
+static void q38_head_pin(Model *m,const int *ids,int h,const float *lo){
+    coli_pin_pool_init(&g_q38_pins,m->c.vocab);
+    ColiPin *k=coli_pin_store(&g_q38_pins,ids,h,lo);
+    if(!k)return;
+    Q38PinState *st=(Q38PinState*)k->state;
+    if(q38_pin_state_copy(m,&st,1)){
+        k->state=st;
+        if(getenv("COLI_PREFIX_LOG"))fprintf(stderr,"[PREFIX] the %d-token system prompt pinned\n",h);
+    }else k->len=0;   /* no state, no pin */
+}
+
 /* The prompt [from, np) in two stretches when the answer's opening follows its last turn: the
  * prompt-end snapshot is taken where the answer starts, not after the opening. A client that
  * sends an answer back without its reasoning renders "<think>" with what follows otherwise
@@ -2081,6 +2213,14 @@ static int q38_answer_start(const int *ids,int np){
  * 14,809 tokens again. *snapped: 1 when the snapshot was taken here. */
 static float *q38_serve_prefill_at(Model *m,const int *ids,int from,int np,ColiPromptBreak *ctl,int snap_ok,int *snapped){
     *snapped=0;
+    const int h=snap_ok?q38_head_end(ids,np):-1;
+    if(h>from&&!q38_head_pinned(ids,h)){   /* the system prompt first, its pin, then the rest */
+        float *lo=q38_serve_prefill(m,ids,from,h,ctl);
+        if(!lo)return NULL;
+        q38_head_pin(m,ids,h,lo);
+        free(lo);
+        from=h;
+    }
     const int a=snap_ok?q38_answer_start(ids,np):-1;
     if(a<=from)return q38_serve_prefill(m,ids,from,np,ctl);
     float *lo=q38_serve_prefill(m,ids,from,a,ctl);
@@ -2309,6 +2449,8 @@ static int serve_one_turn(Model *m, ServeReq *q){
     /* Q38_MTP=1: the head drafts and a verify forward checks it; every token
      * is still sampled from the exact logits below, greedy or not. */
     Q38Spec spec=q38_spec_begin(m,ids,np);
+    spec.greedy=q->temp<=0.f&&q->logprobs<=0;   /* every pick the argmax and nothing else read: a step's pick may come without its logits */
+    int picked=-1;
     double first_token_at=0.0,last_token_at=0.0;
     unsigned char sbuf[16]; int sbn=0;
     for(int s=0;s<q->max_tok;s++){
@@ -2319,7 +2461,7 @@ static int serve_one_turn(Model *m, ServeReq *q){
             if(control==3)cancelled=1;
         }
         if(cancelled||stopped)break;
-        int tk = serve_sample(lo, m->c.vocab, q->temp, q->top_p);
+        int tk = picked>=0 ? picked : serve_sample(lo, m->c.vocab, q->temp, q->top_p);
         char lptail[1024]; lptail[0]=0;
         if(q->logprobs>0) coli_logprob_tail(lptail,sizeof lptail,lo,m->c.vocab,tk,q->logprobs);
         free(lo); lo=NULL;
@@ -2339,6 +2481,7 @@ static int serve_one_turn(Model *m, ServeReq *q){
         if(q->logprobs>0) serve_data_lp(q->id,(char*)chunk,chunk_n,lptail);
         else if(chunk_n>0) serve_data(q->id,(char*)chunk,chunk_n);
         free(chunk);free(token);
+        serve_hits_live(m);
         gen++;
         while(!input_eof&&coli_stdin_readable()){
             int control=serve_read_req(stdin,stdout,NULL,q->id);
@@ -2354,6 +2497,7 @@ static int serve_one_turn(Model *m, ServeReq *q){
         if(s == q->max_tok - 1) break;
         if(m->draft_vocab)draft_vocab_count_token(m->draft_vocab,tk);
         lo = q38_spec_step(m, &spec, tk, np+s, q->max_tok-1-s);
+        picked = lo ? spec.next_tok : -1;
     }
     q38_spec_end(m, &spec);
     /* I vettori dell'immagine valgono per QUESTO turno soltanto: lasciarli
@@ -2435,6 +2579,7 @@ typedef struct {
 
 static void q38_mux_bind(Model *m,int slot){
     if(g_q38_mux_cur==slot)return;
+    q38_prefix_settle(m);   /* another sequence's snapshot will take the chain's copy */
     for(int k=0;k<2;k++){   /* the held one back to its place, then the asked one in */
         int x=k?slot:g_q38_mux_cur;
         if(x<0)continue;
@@ -2511,6 +2656,7 @@ static int q38_mux_pick(Model *m,Q38MuxReq *r,const int *eos_ids,int n_eos,int *
     if(r->q.logprobs>0)serve_data_lp(r->q.id,(char*)chunk,chunk_n,lptail);
     else if(chunk_n>0)serve_data(r->q.id,(char*)chunk,chunk_n);
     free(chunk);free(token);
+    serve_hits_live(m);
     r->gen++;
     /* the next logits are not needed after the last requested token (serve_one) */
     if(r->gen>=r->q.max_tok){q38_mux_finish(m,r);return 0;}
@@ -2621,6 +2767,12 @@ static void serve_loop(Model *m){
     if(g_q38_mux_slots>1&&!q38_mux_alloc(m)){
         fprintf(stderr,"[serve] unable to allocate the state of %d conversations (KV_SLOTS)\n",g_q38_mux_slots);return;
     }
+    /* the recurrent state's first zeros here: a first prompt's reset otherwise touched 118 MB of
+     * Qwen3.8-Flash-Next's DeltaNet state for the first time, 25 ms of page faults against 10 */
+    reset_recurrent(m);
+#ifdef COLI_CUDA
+    q38cc_prewarm(m);   /* the CUDA chain's buffers for a chunk, before the first request */
+#endif
     fputs("\x01\x01READY\x01\x01\n",stdout);
     /* between READY and STAT: the gateway reads it in the handshake, so it knows
      * the served modalities before the first request (docs/serve_protocol.md) */
@@ -2901,10 +3053,11 @@ int main(int argc, char **argv) {
      * save there (an RTX PRO 4000, Qwen3.8-Flash-Next IQ2_XS with the host pool: plain decode
      * 46-48 tok/s, the head's drafts 42.5-44.7, the prompt 180 against 150 tok/s as the head
      * reads every prompt row): unset, Q38_MTP leaves it off as beside the Vulkan chain. */
-    if (g_cuda_chain && m.mtp && !(getenv("Q38_MTP") && *getenv("Q38_MTP"))) {
+    if (g_cuda_chain && m.mtp && q38cc_head_on_card(&m)) q38_mtp_card_defaults(&m);
+    else if (g_cuda_chain && m.mtp && !(getenv("Q38_MTP") && *getenv("Q38_MTP"))) {
         m.mtp = 0;
-        fprintf(stderr, "[qwen38] speculative decoding with the MTP head: off (the CUDA chain runs every layer on the device, "
-                        "the head would run on the CPU; Q38_MTP=1 drafts)\n");
+        fprintf(stderr, "[qwen38] speculative decoding with the MTP head: off (its routed experts did not reach the card; "
+                        "Q38_MTP=1 drafts anyway)\n");
     }
 #endif
     if(m.mtp&&getenv("Q38_MTP_DUMP")&&*getenv("Q38_MTP_DUMP")){
@@ -4042,7 +4195,8 @@ static int qwen38_edge_engine_open(
     capabilities->struct_size=sizeof(*capabilities);
     capabilities->abi_version=COLI_EDGE_ABI_VERSION;
     capabilities->flags=COLI_EDGE_CAP_TOKENIZE|COLI_EDGE_CAP_DETOKENIZE|
-                        COLI_EDGE_CAP_GREEDY|COLI_EDGE_CAP_CPU;
+                        COLI_EDGE_CAP_GREEDY|COLI_EDGE_CAP_LOGITS|
+                        COLI_EDGE_CAP_CPU;
     coli_edge_capability_string(capabilities->engine_id,
                                 sizeof(capabilities->engine_id),"qwen38");
     coli_edge_capability_string(
@@ -4200,6 +4354,32 @@ static int qwen38_edge_select(void *engine_impl,
     return 0;
 }
 
+static int qwen38_edge_logits(void *engine_impl,
+                              const ColiEdgeLogitsRequest *request,
+                              char *error,size_t error_size) {
+    Qwen38EdgeEngine *engine=(Qwen38EdgeEngine*)engine_impl;
+    Cfg *config=&engine->model.c;
+    float *hidden=(float*)malloc((size_t)config->hidden*sizeof(*hidden));
+    if(!hidden)
+        return coli_edge_adapter_error(error,error_size,
+                                       "out of memory running Qwen3.8 head");
+    const float *input=(const float*)request->input;
+    for(uint32_t row=0;row<request->rows;row++) {
+        if(request->should_cancel&&
+           request->should_cancel(request->cancel_user_data)) {
+            free(hidden);
+            return coli_edge_adapter_error(error,error_size,
+                                           "Qwen3.8 Edge logits cancelled");
+        }
+        q38_gr_read(&engine->model,&engine->model.final_gr,
+                    input+(size_t)row*config->hc_width,1,hidden,NULL);
+        q38_weight_matmul(request->logits+(size_t)row*config->vocab,hidden,
+                          &engine->model.lm_head,1,config->hidden,config->vocab);
+    }
+    free(hidden);
+    return 0;
+}
+
 static const ColiEdgeAdapter qwen38_edge_adapter={
     .struct_size = sizeof(ColiEdgeAdapter),
     .abi_version = COLI_EDGE_ABI_VERSION,
@@ -4210,6 +4390,7 @@ static const ColiEdgeAdapter qwen38_edge_adapter={
     .detokenize = qwen38_edge_detokenize,
     .embed = qwen38_edge_embed,
     .select = qwen38_edge_select,
+    .logits = qwen38_edge_logits,
     .reserved_fn = {0}
 };
 

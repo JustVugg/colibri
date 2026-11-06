@@ -615,7 +615,9 @@ static int fcc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf
     fake_chain_ops++;
     const CcExpert *tb = (const CcExpert *)tab->d + p->t_off;
     const int *id = (const int *)ids->d;
-    float *hd = hid->d + (size_t)p->S * p->K * p->I;
+    const int LS = p->lay_S > 0 ? p->lay_S : p->S;   /* hid's layout's rows (CcMoe.lay_S) */
+    if (p->lay_s0 < 0 || p->lay_s0 > LS - p->S || ((p->parts & 1) && (LS != p->S || p->lay_s0))) return 0;
+    float *hd = hid->d + (size_t)LS * p->K * p->I;
     if (p->parts & 1) {
         if (!x) return 0;
         for (int s = 0; s < p->S; s++) {
@@ -646,7 +648,7 @@ static int fcc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf
                 int e = id[p->i_off + s * p->i_row + k];
                 if (e < 0 || e >= p->E || !tb[e].g) continue;
                 float wk = w->d[p->w_off + s * p->w_row + k];
-                const float *dn = hd + ((size_t)s * p->K + k) * p->D;
+                const float *dn = hd + ((size_t)(p->lay_s0 + s) * p->K + k) * p->D;
                 for (int d = 0; d < p->D; d++) yr[d] += wk * dn[d];
             }
         }
@@ -677,6 +679,23 @@ static int fcc_pick(CcBuf *logits, CcBuf *out, int n) {
     for (int i = 0; i < n; i++) if (lg[i] - mx > -20.f) z += expf(lg[i] - mx);
     ((int *)out->d)[0] = best;
     out->d[1] = z > 0.f ? 1.f / z : 0.f;
+    return 1;
+}
+static int fake_pick_rows;   /* rows pick_rows answered */
+static int fcc_pick_rows(CcBuf *logits, size_t off, CcBuf *out, int n, int rows) {
+    if (!fcc_ready() || !logits || !out || n < 1 || rows < 1 || (off + (size_t)rows * n) * 4 > logits->bytes ||
+        out->bytes < (size_t)rows * 8) return 0;
+    fake_chain_ops++;
+    for (int r = 0; r < rows; r++) {
+        const float *lg = logits->d + off + (size_t)r * n;
+        int best = 0;
+        for (int i = 1; i < n; i++) if (lg[i] > lg[best]) best = i;
+        float z = 0.f, mx = lg[best];
+        for (int i = 0; i < n; i++) if (lg[i] - mx > -20.f) z += expf(lg[i] - mx);
+        ((int *)out->d)[2 * r] = best;
+        out->d[2 * r + 1] = z > 0.f ? 1.f / z : 0.f;
+    }
+    fake_pick_rows += rows;
     return 1;
 }
 static int fcc_matmul_rows(ColiCudaTensor *t, CcBuf *ids, CcBuf *x, CcBuf *y, int n) {
@@ -710,6 +729,10 @@ static ColiCudaChainOps fake_chain_table = {
     fcc_route, fcc_moe, fcc_signal, fcc_wait_host, fcc_tensor_dev,   /* past CC_OPS_BASE_SIZE unless a test raises size */
     NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     fcc_pick, fcc_matmul_rows,
+    NULL, NULL, NULL, NULL,                          /* kvh .. copy_regions_h */
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL,        /* the encoders' */
+    NULL, NULL, NULL,                                /* lfm3, matmul_glu, addnorm */
+    fcc_pick_rows,
 };
 static int fake_chain_absent;   /* 1: a backend without the chain (an older DLL) */
 const ColiCudaChainOps *coli_cuda_chain_ops(void) { return fake_chain_absent ? NULL : &fake_chain_table; }

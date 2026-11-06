@@ -365,6 +365,17 @@ static int gguf_read(const gguf_ctx *g, const gguf_tensor *t, void *dst, int64_t
     return 0;
 }
 
+/* Ask the OS to read n bytes at byte `off` inside tensor t ahead (POSIX_FADV_WILLNEED), so a
+ * gguf_read of them later finds them in the page cache; nothing where there is no fadvise. */
+static void gguf_advise(const gguf_ctx *g, const gguf_tensor *t, int64_t off, int64_t n) {
+#if defined(POSIX_FADV_WILLNEED) && !defined(_WIN32)
+    if (off < 0 || n <= 0 || off > t->nbytes || n > t->nbytes - off) return;
+    (void)posix_fadvise(g->fds[t->file], (off_t)(t->off + (uint64_t)off), (off_t)n, POSIX_FADV_WILLNEED);
+#else
+    (void)g; (void)t; (void)off; (void)n;
+#endif
+}
+
 /* Whole tensor to float32 (any supported type). dst holds numel floats. */
 static int gguf_read_f32(const gguf_ctx *g, const gguf_tensor *t, float *dst) {
     int64_t numel = t->ne[0] * t->ne[1] * t->ne[2] * t->ne[3];

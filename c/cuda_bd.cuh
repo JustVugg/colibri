@@ -7,18 +7,19 @@
  *     and code sums: IEEE division, rounding to nearest even), each 32-weight step decoded
  *     to int8 once and dotted with up to NR rows of x in packed 4 x 8 products (dp4a), per
  *     group dx * (sw * sum(w8 * xq) - mw * xs). The same integers and scales as the CPU's:
- *     the two differ only in the order of the float sums. Types 8 Q8_0, 10 Q2_K, 11 Q3_K,
- *     12 Q4_K, 13 Q5_K, 14 Q6_K, 16 IQ2_XXS, 17 IQ2_XS, 18 IQ3_XXS, 19 IQ1_S, 20 IQ4_NL,
- *     21 IQ3_S, 22 IQ2_S, 23 IQ4_XS, 29 IQ1_M, 42 Q2_0 (bdi_has).
+ *     the two differ only in the order of the float sums. Types 6 Q5_0, 7 Q5_1, 8 Q8_0,
+ *     10 Q2_K, 11 Q3_K, 12 Q4_K, 13 Q5_K, 14 Q6_K, 16 IQ2_XXS, 17 IQ2_XS, 18 IQ3_XXS,
+ *     19 IQ1_S, 20 IQ4_NL, 21 IQ3_S, 22 IQ2_S, 23 IQ4_XS, 29 IQ1_M, 42 Q2_0 (bdi_has).
  *   - bdf_decode: shaders/blockdec.glsl's general path, every block type, a 32-weight unit
  *     as int weights with a scale and a min per 16, in floats (the other types: Q4_0, Q4_1,
- *     Q5_0, Q5_1, TQ1_0, TQ2_0, MXFP4, NVFP4, Q1_0).
+ *     TQ1_0, TQ2_0, MXFP4, NVFP4, Q1_0).
  *   - F16 (101) and BF16 (130): units of 32 values (64 bytes) read as floats by the float
  *     GEMV, bd_dec16h and bd_dec16 (blockdec_host.h's blocks of 32).
  * A row's words: W (32-bit, 16-byte aligned rows for Q4_K and Q5_K, whose 144- and 176-byte
  * blocks keep it); a field at any even byte comes from one word or two (bd_ldu). */
 #ifndef CUDA_BD_CUH
 #define CUDA_BD_CUH
+#include <mutex>   /* bd_xq_scratch's lock, under hipcc as well */
 #if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))
 #include <cuda_fp16.h>   /* HIP: hip_fp16.h, through backend_gpu_compat.h */
 #endif
@@ -50,7 +51,7 @@ __device__ __forceinline__ int bd_dp4a(int a, int b, int c) {
 
 /* 1 for the types with an integer step (bdi_step) */
 __host__ __device__ constexpr bool bdi_has(int t) {
-    return t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 18 || t == 19 || t == 20 ||
+    return t == 6 || t == 7 || t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 18 || t == 19 || t == 20 ||
            t == 21 || t == 22 || t == 23 || t == 29 || t == 42;
 }
 /* the type's tables in shared memory, in words: its grid, ksigns, kvalues */
@@ -59,7 +60,7 @@ __host__ __device__ constexpr int bd_grid_base(int t) {
     return t == 22 ? BDT_IQ2S : t == 21 ? BDT_IQ3S : t == 17 ? BDT_IQ2XS : t == 18 ? BDT_IQ3XXS : BDT_IQ2XXS;
 }
 __host__ __device__ constexpr int bd_ks_words(int t) { return t == 16 || t == 17 || t == 18 ? 128 : 0; }
-__host__ __device__ constexpr int bd_kv_words(int t) { return t == 20 || t == 23 ? 16 : 0; }
+__host__ __device__ constexpr int bd_kv_words(int t) { return 0; }   /* IQ4's values in registers (bdi_kv4) */
 __host__ __device__ constexpr int bd_tab_words(int t) { return (bd_grid_words(t) + bd_ks_words(t) + bd_kv_words(t) + 3) & ~3; }
 
 struct BdTabs { const bd_u32 *grid, *ks; const int *kvt; const bd_u32 *tab; };
@@ -86,13 +87,12 @@ __device__ __forceinline__ void bdx_u4(const BdX &X, int r, int k, int *w) {
     uint4 v = X.q[r * X.qr + bd_x4(k)];
     w[0] = (int)v.x; w[1] = (int)v.y; w[2] = (int)v.z; w[3] = (int)v.w;
 }
-/* rows s0 .. s0 + nrow - 1 of x (I inputs each) as gq_quant_act_ref quantizes them, a block
- * of 32 a thread, into the shared memory at q (BdX's layout); the block syncs after */
-__device__ __forceinline__ void bdx_quant(const float *__restrict__ x, int nrow, int I, uint4 *q, float *dx, int *xs) {
+/* block b (32 inputs) of a row of I inputs at xr as gq_quant_act_ref quantizes it, into BdX's
+ * layout at q, dx and xs (shared or global memory) as row r */
+__device__ __forceinline__ void bdx_quant_block(const float *__restrict__ xr, int I, int r, int b, uint4 *q, float *dx, int *xs) {
     int nb = I / 32, qr = bd_xq_row(I);
-    for (int k = threadIdx.x; k < nrow * nb; k += blockDim.x) {
-        int r = k / nb, b = k - r * nb;
-        const float4 *src = reinterpret_cast<const float4 *>(x + (size_t)r * I + 32 * b);
+    {
+        const float4 *src = reinterpret_cast<const float4 *>(xr + 32 * b);
         float v[32], amax = 0.f;
         #pragma unroll
         for (int j = 0; j < 8; j++) {
@@ -122,14 +122,47 @@ __device__ __forceinline__ void bdx_quant(const float *__restrict__ x, int nrow,
         xs[r * 2 * nb + 2 * b] = s0; xs[r * 2 * nb + 2 * b + 1] = s1;
     }
 }
+/* rows s0 .. s0 + nrow - 1 of x (I inputs each), a block of 32 a thread, into the shared memory
+ * at q (BdX's layout); the block syncs after */
+__device__ __forceinline__ void bdx_quant(const float *__restrict__ x, int nrow, int I, uint4 *q, float *dx, int *xs) {
+    int nb = I / 32;
+    for (int k = threadIdx.x; k < nrow * nb; k += blockDim.x) bdx_quant_block(x + (size_t)(k / nb) * I, I, k / nb, k % nb, q, dx, xs);
+}
+/* every row of x (S rows of I inputs) quantized once, into global memory in BdX's layout, for the
+ * GEMV's blocks to read (bd_gemv_i8_k with gq): each block quantized the rows itself, which for
+ * a wide row cost more than its weights (an IQ4_XS 2048 x 8192 at two rows: 44 against 28 us
+ * for 8192 x 2048). The same quantization, the same bits. */
+__global__ static void __launch_bounds__(256) bdx_quant_k(const float *__restrict__ x, int S, int I, uint4 *q, float *dx, int *xs, int xr) {
+    COLI_PDL_WAIT();   /* xr: x's row stride in floats (I: its rows packed) */
+    int nb = I / 32, k = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (k < S * nb) bdx_quant_block(x + (size_t)(k / nb) * xr, I, k / nb, k % nb, q, dx, xs);
+}
+/* bdx_quant_k's launch: S rows of I inputs (row stride xr) into the global form at gq (bd_x_bytes(I, S)) */
+static inline void bdx_quant_launch(const float *x, int S, int I, int xr, uint4 *gq, cudaStream_t st) {
+    const int nq = S * (I / 32);
+    float *dx = (float *)(gq + (size_t)S * bd_xq_row(I));
+    coli_launch(bdx_quant_k, dim3((unsigned)((nq + 255) / 256)), 256, 0, st, x, S, I, gq, dx, (int *)(dx + (size_t)S * (I / 32)), xr);
+}
 
 /* 0xFF in each byte whose bit (of the low four) is set: those bytes are negated */
 __device__ __forceinline__ bd_u32 bdi_smask(bd_u32 b4) { return ((b4 * 0x00204081u) & 0x01010101u) * 0xFFu; }
 __device__ __forceinline__ bd_u32 bdi_neg(bd_u32 g, bd_u32 b4) { bd_u32 m = bdi_smask(b4 & 15u); return (g ^ m) + (m & 0x01010101u); }
-/* four kvalues (IQ4) of the nibbles at bit sh of each byte of w, as packed int8 */
-__device__ __forceinline__ int bdi_kv4(const int *kvt, bd_u32 w, int sh) {
-    return (int)(((bd_u32)kvt[(w >> sh) & 15u] & 255u) | (((bd_u32)kvt[(w >> (sh + 8)) & 15u] & 255u) << 8) |
-                 (((bd_u32)kvt[(w >> (sh + 16)) & 15u] & 255u) << 16) | (((bd_u32)kvt[(w >> (sh + 24)) & 15u] & 255u) << 24));
+/* IQ4's sixteen values (GGML_KVALUES_IQ4NL) as int8, four a word, values 0..3 in the first */
+#define BD_KV4_0 0xBFAD9881u   /* -127 -104 -83 -65 */
+#define BD_KV4_1 0xF6EADDCFu   /*  -49  -35 -22 -10 */
+#define BD_KV4_2 0x26190D01u   /*    1   13  25  38 */
+#define BD_KV4_3 0x71594535u   /*   53   69  89 113 */
+/* four kvalues (IQ4) of the nibbles at bit sh of each byte of w, as packed int8: each nibble's
+ * low three bits pick its value among the lower eight and among the upper eight (__byte_perm on
+ * the words above, no table in memory), its fourth bit which of the two. The kernel spent its
+ * time on the four table reads a word (an IQ4_XS GEMV at 54-83 % of the SM's issue, 26-44 % of
+ * the DRAM's bandwidth, an RTX PRO 4000); the values are the table's. */
+__device__ __forceinline__ int bdi_kv4(bd_u32 w, int sh) {
+    const bd_u32 v = (w >> sh) & 0x0F0F0F0Fu, x = v & 0x07070707u, y = x | (x >> 4);
+    const bd_u32 sel = __byte_perm(y, 0u, 0x0020u);   /* nibble i: index i's low three bits */
+    const bd_u32 lo = __byte_perm(BD_KV4_0, BD_KV4_1, sel), hi = __byte_perm(BD_KV4_2, BD_KV4_3, sel);
+    const bd_u32 m = ((v >> 3) & 0x01010101u) * 0xFFu;   /* 0xFF in each byte whose index is 8 or more */
+    return (int)((lo & ~m) | (hi & m));
 }
 /* Q4_K / Q5_K: byte j of the block's 12 scale bytes (words 1..3), the 6-bit scale and min of group g */
 __device__ __forceinline__ bd_u32 bdi_kb(uint4 hd, bd_u32 j) { bd_u32 w = j < 4u ? hd.y : j < 8u ? hd.z : hd.w; return (w >> (8u * (j & 3u))) & 255u; }
@@ -318,9 +351,24 @@ __device__ __forceinline__ void bdi_step(const bd_u32 *__restrict__ W, bd_u32 q,
         }
         return;
     }
-    /* the types with one scale a step: the codes' dot (less a sum of x for Q2_0) times it */
-    int sub = 0;   /* Q2_0: the codes' offset of 1 */
-    if (T == 8) {   /* Q8_0: the step is the block */
+    /* the types with one scale a step: the codes' dot (less a sum of x for Q2_0 and Q5_0) times
+     * it, plus Q5_1's min times the sum of x */
+    int sub = 0;   /* the codes' offset: Q2_0's 1, Q5_0's 16 */
+    float mq = 0.f;   /* Q5_1's min */
+    if (T == 6 || T == 7) {   /* Q5_0 / Q5_1 (the step is the block): codes 0..31, four bits in qs (weights j and
+                               * 16 + j in byte j), the fifth in qh; Q5_0's weight is code - 16, Q5_1's d * code + m */
+        bd_u32 base = q * (T == 6 ? 22u : 24u), at = T == 6 ? 2u : 4u;
+        bd_u32 qh = bd_ldu(W, base + at);
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            bd_u32 qs = bd_ldu(W, base + at + 4u + 4u * k);
+            bd_u32 hl = qh >> (4u * k), hh = qh >> (16u + 4u * k);
+            w[k] = (int)((qs & 0x0F0F0F0Fu) | ((hl & 1u) << 4) | ((hl & 2u) << 11) | ((hl & 4u) << 18) | ((hl & 8u) << 25));
+            w[k + 4] = (int)(((qs >> 4) & 0x0F0F0F0Fu) | ((hh & 1u) << 4) | ((hh & 2u) << 11) | ((hh & 4u) << 18) | ((hh & 8u) << 25));
+        }
+        dq = bd_f16at(W, base);
+        if (T == 6) sub = 16; else mq = bd_f16at(W, base + 2u);
+    } else if (T == 8) {   /* Q8_0: the step is the block */
         bd_u32 base = q * 34u;
         #pragma unroll
         for (int k = 0; k < 8; k++) w[k] = (int)bd_ldu(W, base + 2u + 4u * k);
@@ -337,7 +385,7 @@ __device__ __forceinline__ void bdi_step(const bd_u32 *__restrict__ W, bd_u32 q,
         #pragma unroll
         for (int k = 0; k < 4; k++) {
             bd_u32 wd = T == 20 ? bd_ldu(W, qa + 4u * k) : bd_w(W, (qa >> 2) + (bd_u32)k);
-            w[k] = bdi_kv4(tb.kvt, wd, 0); w[k + 4] = bdi_kv4(tb.kvt, wd, 4);
+            w[k] = bdi_kv4(wd, 0); w[k + 4] = bdi_kv4(wd, 4);
         }
     } else if (T == 21) {   /* IQ3_S: 8 chunks of 4 weights, a grid row each, its signs */
         bd_u32 b = q >> 3, ib = q & 7u, base = b * 110u;
@@ -387,7 +435,11 @@ __device__ __forceinline__ void bdi_step(const bd_u32 *__restrict__ W, bd_u32 q,
         int s = 0;
         #pragma unroll
         for (int k = 0; k < 8; k++) s = bd_dp4a(w[k], xw[k], s);
-        if (sub) { const int *xs = X.xs + r * 2 * X.nb; s -= xs[2u * q] + xs[2u * q + 1u]; }
+        if (sub || T == 7) {
+            const int *xs = X.xs + r * 2 * X.nb; int sx = xs[2u * q] + xs[2u * q + 1u];
+            s -= sub * sx;
+            if (T == 7) { acc[r] += X.dx[r * X.nb + q] * (dq * (float)s + mq * (float)sx); continue; }
+        }
         acc[r] += X.dx[r * X.nb + q] * dq * (float)s;
     }
 }
@@ -866,21 +918,45 @@ __host__ __device__ inline int bd_lpr(int I) { int steps = I / 32, l = 1; while 
 /* the integer form's shared bytes for type T and nr rows of I inputs */
 __host__ __device__ inline size_t bd_gemv_i8_smem(int T, int I, int nr) { return (size_t)bd_tab_words(T) * 4 + bd_x_bytes(I, nr); }
 
-template <int T, int NR>
+/* GQ: x quantized once in global memory at gq (bdx_quant_k); XS: the block's rows of it copied into shared
+ * memory first, so the steps read x there and not beside the weights (bd_gemv_xs).
+ * GLU: a SwiGLU's gate and up in one pass, y = silu(x W^T) * (x Wu^T) for Wu of W's type and shape:
+ * each sum the bits of its own GEMV, the product CC_EW_SWIGLU's (a decode step's shared expert) */
+template <int T, int NR, bool GQ = false, bool XS = false, bool GLU = false>
 __global__ static void __launch_bounds__(256) bd_gemv_i8_k(float *__restrict__ y, const float *__restrict__ x, const bd_u32 *__restrict__ W,
-        const bd_u32 *__restrict__ tab, int I, int O, int rowWords, int S, int nr, int lpr) {
+        const bd_u32 *__restrict__ tab, int I, int O, int rowWords, int S, int nr, int lpr, const uint4 *__restrict__ gq,
+        const bd_u32 *__restrict__ Wu) {
     COLI_PDL_WAIT();
     extern __shared__ uint4 bd_sm4[];
     constexpr int TW = bd_tab_words(T);
     BdTabs tb = bd_tables_fill<T>(reinterpret_cast<bd_u32 *>(bd_sm4), tab);
     int s0 = (int)blockIdx.y * nr, nrow = min(nr, S - s0);
     int nb = I / 32, qr = bd_xq_row(I);
-    uint4 *xq = bd_sm4 + TW / 4;   /* nr rows: what the launch sized (bd_gemv_i8_smem) */
-    float *dx = reinterpret_cast<float *>(xq + nr * qr);
-    int *xs = reinterpret_cast<int *>(dx + nr * nb);
-    bdx_quant(x + (size_t)s0 * I, nrow, I, xq, dx, xs);
-    __syncthreads();
-    BdX X = {xq, dx, xs, qr, nb};
+    BdX X;
+    if (GQ && XS) {
+        const float *gdx = reinterpret_cast<const float *>(gq + (size_t)S * qr);
+        const int *gxs = reinterpret_cast<const int *>(gdx + (size_t)S * nb);
+        uint4 *xq = bd_sm4 + TW / 4;   /* bdx_quant's layout for nr rows (bd_gemv_i8_smem) */
+        float *dx = reinterpret_cast<float *>(xq + nr * qr);
+        int *xs = reinterpret_cast<int *>(dx + nr * nb);
+        for (int i = (int)threadIdx.x; i < nrow * qr; i += 256) xq[i] = gq[(size_t)s0 * qr + i];
+        for (int i = (int)threadIdx.x; i < nrow * nb; i += 256) dx[i] = gdx[(size_t)s0 * nb + i];
+        for (int i = (int)threadIdx.x; i < nrow * 2 * nb; i += 256) xs[i] = gxs[(size_t)s0 * 2 * nb + i];
+        __syncthreads();
+        X = {xq, dx, xs, qr, nb};
+    } else if (GQ) {   /* x quantized once for every block (bdx_quant_k): S rows, then their scales, then their sums */
+        const float *gdx = reinterpret_cast<const float *>(gq + (size_t)S * qr);
+        const int *gxs = reinterpret_cast<const int *>(gdx + (size_t)S * nb);
+        X = {gq + (size_t)s0 * qr, gdx + (size_t)s0 * nb, gxs + (size_t)s0 * 2 * nb, qr, nb};
+        __syncthreads();   /* the tables */
+    } else {
+        uint4 *xq = bd_sm4 + TW / 4;   /* nr rows: what the launch sized (bd_gemv_i8_smem) */
+        float *dx = reinterpret_cast<float *>(xq + nr * qr);
+        int *xs = reinterpret_cast<int *>(dx + nr * nb);
+        bdx_quant(x + (size_t)s0 * I, nrow, I, xq, dx, xs);
+        __syncthreads();
+        X = {xq, dx, xs, qr, nb};
+    }
     int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     int rps = 32 / lpr, sub = lane / lpr, ln = lane % lpr;
     int stride = (int)gridDim.x * 8 * rps;
@@ -888,17 +964,53 @@ __global__ static void __launch_bounds__(256) bd_gemv_i8_k(float *__restrict__ y
     for (int o0 = ((int)blockIdx.x * 8 + warp) * rps; o0 < O; o0 += stride) {
         int o = o0 + sub;
         bool live = o < O;
-        const bd_u32 *Wr = W + (size_t)(live ? o : O - 1) * rowWords;
-        float acc[NR];
+        const size_t ro = (size_t)(live ? o : O - 1) * rowWords;
+        float acc[NR], au[NR];
         #pragma unroll
-        for (int r = 0; r < NR; r++) acc[r] = 0.f;
-        if (live) for (int q = ln; q < steps; q += lpr) bdi_step<T, NR>(Wr, (bd_u32)q, X, nrow, tb, acc);
+        for (int r = 0; r < NR; r++) { acc[r] = 0.f; au[r] = 0.f; }
+        if (live)
+            for (int q = ln; q < steps; q += lpr) {
+                bdi_step<T, NR>(W + ro, (bd_u32)q, X, nrow, tb, acc);
+                if (GLU) bdi_step<T, NR>(Wu + ro, (bd_u32)q, X, nrow, tb, au);
+            }
         #pragma unroll
         for (int r = 0; r < NR; r++) if (r < nrow) {
-            float v = acc[r];
-            for (int off = lpr / 2; off > 0; off >>= 1) v += bd_shfl_xor(v, off);
-            if (ln == 0 && live) y[(size_t)(s0 + r) * O + o] = v;
+            float v = acc[r], u = au[r];
+            for (int off = lpr / 2; off > 0; off >>= 1) { v += bd_shfl_xor(v, off); if (GLU) u += bd_shfl_xor(u, off); }
+            if (ln == 0 && live) y[(size_t)(s0 + r) * O + o] = GLU ? (v / (1.f + expf(-v))) * u : v;
         }
+    }
+}
+
+/* bd_gemv_i8_k's arithmetic for one row of x over a list of the matrix's rows (a draft's
+ * vocabulary): y[j] = row ids[j] . x, each sum the bits the whole GEMV gives that row (the same
+ * quantized x, lanes a row and steps); -inf for an id out of range */
+template <int T>
+__global__ static void __launch_bounds__(256) bd_gemv_rows_i8_k(float *__restrict__ y, const float *__restrict__ x, const bd_u32 *__restrict__ W,
+        const bd_u32 *__restrict__ tab, const int *__restrict__ ids, int I, int O, int rowWords, int n, int lpr) {
+    COLI_PDL_WAIT();
+    extern __shared__ uint4 bd_sm4[];
+    constexpr int TW = bd_tab_words(T);
+    BdTabs tb = bd_tables_fill<T>(reinterpret_cast<bd_u32 *>(bd_sm4), tab);
+    int nb = I / 32, qr = bd_xq_row(I);
+    uint4 *xq = bd_sm4 + TW / 4;
+    float *dx = reinterpret_cast<float *>(xq + qr);
+    int *xs = reinterpret_cast<int *>(dx + nb);
+    bdx_quant(x, 1, I, xq, dx, xs);
+    __syncthreads();
+    BdX X = {xq, dx, xs, qr, nb};
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    int rps = 32 / lpr, sub = lane / lpr, ln = lane % lpr;
+    int stride = (int)gridDim.x * 8 * rps, steps = I / 32;
+    for (int j0 = ((int)blockIdx.x * 8 + warp) * rps; j0 < n; j0 += stride) {   /* uniform in the warp */
+        int j = j0 + sub, o = j < n ? ids[j] : -1;
+        bool live = o >= 0 && o < O;
+        const bd_u32 *Wr = W + (size_t)(live ? o : 0) * rowWords;
+        float acc[1] = {0.f};
+        if (live) for (int q = ln; q < steps; q += lpr) bdi_step<T, 1>(Wr, (bd_u32)q, X, 1, tb, acc);
+        float v = acc[0];
+        for (int off = lpr / 2; off > 0; off >>= 1) v += bd_shfl_xor(v, off);
+        if (ln == 0 && j < n) y[j] = live ? v : -INFINITY;
     }
 }
 
@@ -1029,9 +1141,73 @@ static inline void bd_smem_raise(const void *k, size_t sm, size_t smem_max, unsi
     cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_max);
     *raised |= 1u << dev;
 }
+/* The global scratch x is quantized into once (bdx_quant_k), a buffer a stream and device: a
+ * stream's kernels run in order and the next quantization waits for the GEMV before it (its PDL
+ * wait), so one buffer serves every GEMV of the stream. NULL: none (the blocks quantize x). */
+static void *bd_xq_scratch(cudaStream_t st, size_t bytes) {
+    static std::mutex mu;
+    static struct { cudaStream_t st; int dev; void *p; size_t cap; } c[16];
+    static int n;
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess) { (void)cudaGetLastError(); return nullptr; }
+    std::lock_guard<std::mutex> lk(mu);
+    int i = 0;
+    while (i < n && !(c[i].st == st && c[i].dev == dev)) i++;
+    if (i == n) { if (n == 16) return nullptr; c[n++] = {st, dev, nullptr, 0}; }
+    if (c[i].cap < bytes) {
+        size_t cap = bytes < ((size_t)1 << 20) ? ((size_t)1 << 20) : bytes;   /* grown seldom: freeing waits for the device */
+        if (c[i].p && cudaStreamSynchronize(st) == cudaSuccess) cudaFree(c[i].p);
+        c[i].p = nullptr; c[i].cap = 0;
+        if (cudaMalloc(&c[i].p, cap) != cudaSuccess) { (void)cudaGetLastError(); c[i].p = nullptr; return nullptr; }
+        c[i].cap = cap;
+    }
+    return c[i].p;
+}
+/* x quantized once for the GEMV's blocks (bdx_quant_k) where the rows' floats a block reads are
+ * at least half its weights and 64 blocks or more would each quantize them: an RTX PRO 4000,
+ * tests/test_cuda_bd.cu with BENCH=1, Q4_K 2048 x 8192 at 1 / 2 / 4 rows 32.4 / 42.6 / 58.9 ->
+ * 28.3 / 28.7 / 32.4 us, 8192 x 2048 at 4 rows 37.3 -> 32.7; below that the launch costs more
+ * than it saves (512 x 2048: 4.9 -> 6.5 us at 2 rows), and a matrix of many rows a block reads
+ * x from global memory as often as from shared memory (an lm_head: 727 -> 760 us at 2 rows).
+ * COLI_CUDA_BD_PREQ=1 always, 0 never. */
+static int g_bd_preq_force = -1;   /* tests: 0 or 1 over the environment */
+static int bd_gemv_preq(int I, int nr, int bx, size_t block_bytes) {
+    static int mode = -2;
+    if (mode == -2) { const char *e = getenv("COLI_CUDA_BD_PREQ"); mode = e && *e ? atoi(e) : -1; }
+    if (g_bd_preq_force >= 0) return g_bd_preq_force;
+    if (mode >= 0) return mode;
+    return bx >= 64 && (size_t)nr * I * 4 * 2 >= block_bytes;
+}
+/* a verify's rows of x quantized once (bd_gemv_preq) and copied into each block's shared memory: three
+ * rows or more, of at most 16 KiB. The steps read x from global memory beside the weights otherwise, and
+ * a lane waited for both (an RTX PRO 4000, tests/test_cuda_bd.cu with BENCH=1, four rows: IQ4_XS
+ * 10240 x 2560 306 -> 323 GB/s, IQ3_S 245 -> 278, Q6_K 2560 x 2560 215 -> 245; two rows as before;
+ * IQ4_XS 2560 x 6144, 34 KiB of x, 249 -> 239, so not there; Q4_K and Q5_K, whose steps read x their
+ * own way, 1-2 % slower, so not them). The bits are the same. COLI_CUDA_BD_XSM=0 never. */
+static int g_bd_xs_force = -1;   /* tests: 0 never, 1 wherever x fits, over the environment */
+static int bd_gemv_xs(int I, int nr) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_BD_XSM"); on = !(e && *e == '0'); }
+    if (g_bd_xs_force >= 0) return g_bd_xs_force && nr > 1;
+    return on && nr >= 3 && bd_x_bytes(I, nr) <= 16384;
+}
+/* one launch of bd_gemv_i8_k's form <T, NR, GQ, XS>, the GLU form where there is an up matrix (Wu) */
+template <int T, int NR, bool GQ, bool XS>
+static void bd_gemv_i8_go(dim3 g, size_t sm, size_t smem_max, cudaStream_t st, float *y, const float *x, const bd_u32 *W,
+                          const bd_u32 *tab, int I, int O, int rowWords, int S, int nr, int lpr, const uint4 *gq, const bd_u32 *Wu) {
+    if (Wu) {
+        static unsigned raised;   /* past 48 KiB a kernel asks for it, once a device */
+        bd_smem_raise((const void *)bd_gemv_i8_k<T, NR, GQ, XS, true>, sm, smem_max, &raised);
+        coli_launch(bd_gemv_i8_k<T, NR, GQ, XS, true>, g, 256, sm, st, y, x, W, tab, I, O, rowWords, S, nr, lpr, gq, Wu);
+    } else {
+        static unsigned raised;
+        bd_smem_raise((const void *)bd_gemv_i8_k<T, NR, GQ, XS>, sm, smem_max, &raised);
+        coli_launch(bd_gemv_i8_k<T, NR, GQ, XS>, g, 256, sm, st, y, x, W, tab, I, O, rowWords, S, nr, lpr, gq, (const bd_u32 *)nullptr);
+    }
+}
 template <int T>
 static int bd_gemv_i8_launch(float *y, const float *x, const bd_u32 *W, const bd_u32 *tab, int I, int O, int rowWords, int S,
-                             size_t smem_max, cudaStream_t st) {
+                             size_t smem_max, cudaStream_t st, const bd_u32 *Wu = nullptr) {
     int nr = S < BD_GEMV_NR ? S : BD_GEMV_NR;
     while (nr > 1 && bd_gemv_i8_smem(T, I, nr) > smem_max) nr--;
     size_t sm = bd_gemv_i8_smem(T, I, nr);
@@ -1039,15 +1215,35 @@ static int bd_gemv_i8_launch(float *y, const float *x, const bd_u32 *W, const bd
     int lpr = bd_lpr(I), rows_b = 256 / lpr, bx = (O + rows_b - 1) / rows_b;
     if (bx > BD_GEMV_BLOCKS) bx = BD_GEMV_BLOCKS;
     dim3 g((unsigned)bx, (unsigned)((S + nr - 1) / nr));
-    if (nr > 1) {
-        static unsigned raised;   /* past 48 KiB a kernel asks for it, once a device */
-        bd_smem_raise((const void *)bd_gemv_i8_k<T, BD_GEMV_NR>, sm, smem_max, &raised);
-        coli_launch(bd_gemv_i8_k<T, BD_GEMV_NR>, g, 256, sm, st, y, x, W, tab, I, O, rowWords, S, nr, lpr);
-    } else {
-        static unsigned raised;
-        bd_smem_raise((const void *)bd_gemv_i8_k<T, 1>, sm, smem_max, &raised);
-        coli_launch(bd_gemv_i8_k<T, 1>, g, 256, sm, st, y, x, W, tab, I, O, rowWords, S, 1, lpr);
+    const uint4 *gq = nullptr;
+    const size_t block_bytes = (size_t)((O + bx - 1) / bx) * rowWords * 4;
+    if (bd_gemv_preq(I, nr, bx, block_bytes)) {
+        gq = (const uint4 *)bd_xq_scratch(st, bd_x_bytes(I, S));
+        if (gq) {
+            bdx_quant_launch(x, S, I, I, (uint4 *)gq, st);
+            sm = (size_t)bd_tab_words(T) * 4;   /* the tables alone */
+        }
     }
+    if (gq && nr > 1 && T != 12 && T != 13 && bd_gemv_xs(I, nr) && bd_gemv_i8_smem(T, I, nr) <= smem_max)   /* Q4_K, Q5_K: no gain */
+        bd_gemv_i8_go<T, BD_GEMV_NR, true, true>(g, bd_gemv_i8_smem(T, I, nr), smem_max, st, y, x, W, tab, I, O, rowWords, S, nr, lpr, gq, Wu);
+    else if (gq && nr > 1) bd_gemv_i8_go<T, BD_GEMV_NR, true, false>(g, sm, smem_max, st, y, x, W, tab, I, O, rowWords, S, nr, lpr, gq, Wu);
+    else if (gq) bd_gemv_i8_go<T, 1, true, false>(g, sm, smem_max, st, y, x, W, tab, I, O, rowWords, S, 1, lpr, gq, Wu);
+    else if (nr > 1) bd_gemv_i8_go<T, BD_GEMV_NR, false, false>(g, sm, smem_max, st, y, x, W, tab, I, O, rowWords, S, nr, lpr, gq, Wu);
+    else {
+        bd_gemv_i8_go<T, 1, false, false>(g, sm, smem_max, st, y, x, W, tab, I, O, rowWords, S, 1, lpr, gq, Wu);
+    }
+    return 1;
+}
+template <int T>
+static int bd_gemv_rows_i8_launch(float *y, const float *x, const bd_u32 *W, const bd_u32 *tab, const int *ids, int I, int O, int rowWords,
+                                  int n, size_t smem_max, cudaStream_t st) {
+    size_t sm = bd_gemv_i8_smem(T, I, 1);
+    if (sm > smem_max) return 0;
+    int lpr = bd_lpr(I), rows_b = 256 / lpr, bx = (n + rows_b - 1) / rows_b;
+    if (bx > BD_GEMV_BLOCKS) bx = BD_GEMV_BLOCKS;
+    static unsigned raised;
+    bd_smem_raise((const void *)bd_gemv_rows_i8_k<T>, sm, smem_max, &raised);
+    coli_launch(bd_gemv_rows_i8_k<T>, dim3((unsigned)bx), 256, sm, st, y, x, W, tab, ids, I, O, rowWords, n, lpr);
     return 1;
 }
 static int bd_gemv_f_launch(float *y, const float *x, const bd_u32 *W, const bd_u32 *tab, int fmt, int I, int O, int rowWords, int S,
@@ -1076,12 +1272,38 @@ static inline int bd_fmt_ok(int fmt) {
     int t = fmt - 100;
     return BD_BLK[t] >= 32;
 }
+/* the rows ids[0..n) of a block-format matrix against one row of x (bd_gemv_rows_i8_k): the types
+ * with the integer form; 0 for the others */
+static int bd_gemv_rows_launch(float *y, const float *x, const bd_u32 *W, const bd_u32 *tab, const int *ids, int fmt, int I, int O,
+                               int rowWords, int n, size_t smem_max, cudaStream_t st) {
+    if (!bd_fmt_ok(fmt) || I % 32 || I % BD_BLK[fmt - 100]) return 0;
+    switch (fmt - 100) {
+#define BD_R8_CASE(t) case t: return bd_gemv_rows_i8_launch<t>(y, x, W, tab, ids, I, O, rowWords, n, smem_max, st);
+        BD_R8_CASE(6) BD_R8_CASE(7) BD_R8_CASE(8) BD_R8_CASE(10) BD_R8_CASE(11) BD_R8_CASE(12) BD_R8_CASE(13) BD_R8_CASE(14) BD_R8_CASE(16) BD_R8_CASE(17)
+        BD_R8_CASE(18) BD_R8_CASE(19) BD_R8_CASE(20) BD_R8_CASE(21) BD_R8_CASE(22) BD_R8_CASE(23) BD_R8_CASE(29) BD_R8_CASE(42)
+#undef BD_R8_CASE
+        default: return 0;
+    }
+}
+/* y = silu(x Wg^T) * (x Wu^T) for up to BD_GEMV_MAX_S rows, Wg and Wu of one type and shape (bd_gemv_i8_k's
+ * GLU): the types with the integer form; 0 for the others (the caller's two GEMVs and its SwiGLU then) */
+static int bd_glu_launch(float *y, const float *x, const bd_u32 *Wg, const bd_u32 *Wu, const bd_u32 *tab, int fmt, int I, int O,
+                         int rowWords, int S, size_t smem_max, cudaStream_t st) {
+    if (!bd_fmt_ok(fmt) || I % 32 || I % BD_BLK[fmt - 100] || !Wu) return 0;
+    switch (fmt - 100) {
+#define BD_G8_CASE(t) case t: return bd_gemv_i8_launch<t>(y, x, Wg, tab, I, O, rowWords, S, smem_max, st, Wu);
+        BD_G8_CASE(6) BD_G8_CASE(7) BD_G8_CASE(8) BD_G8_CASE(10) BD_G8_CASE(11) BD_G8_CASE(12) BD_G8_CASE(13) BD_G8_CASE(14) BD_G8_CASE(16) BD_G8_CASE(17)
+        BD_G8_CASE(18) BD_G8_CASE(19) BD_G8_CASE(20) BD_G8_CASE(21) BD_G8_CASE(22) BD_G8_CASE(23) BD_G8_CASE(29) BD_G8_CASE(42)
+#undef BD_G8_CASE
+        default: return 0;
+    }
+}
 static int bd_gemv_launch(float *y, const float *x, const bd_u32 *W, const bd_u32 *tab, int fmt, int I, int O, int rowWords, int S,
                           size_t smem_max, int force_float, cudaStream_t st) {
     if (!bd_fmt_ok(fmt) || I % 32 || I % BD_BLK[fmt - 100]) return 0;
     if (!force_float) switch (fmt - 100) {
 #define BD_I8_CASE(t) case t: return bd_gemv_i8_launch<t>(y, x, W, tab, I, O, rowWords, S, smem_max, st);
-        BD_I8_CASE(8) BD_I8_CASE(10) BD_I8_CASE(11) BD_I8_CASE(12) BD_I8_CASE(13) BD_I8_CASE(14) BD_I8_CASE(16) BD_I8_CASE(17)
+        BD_I8_CASE(6) BD_I8_CASE(7) BD_I8_CASE(8) BD_I8_CASE(10) BD_I8_CASE(11) BD_I8_CASE(12) BD_I8_CASE(13) BD_I8_CASE(14) BD_I8_CASE(16) BD_I8_CASE(17)
         BD_I8_CASE(18) BD_I8_CASE(19) BD_I8_CASE(20) BD_I8_CASE(21) BD_I8_CASE(22) BD_I8_CASE(23) BD_I8_CASE(29) BD_I8_CASE(42)
 #undef BD_I8_CASE
         default: break;

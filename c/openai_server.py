@@ -25,6 +25,7 @@ import uuid
 import v4_dsml                      # vendored DeepSeek V4 DSML reference primitives
 import v41_dsml                     # ...and V4.1's, whose tag names differ by a space
 import image_engine                 # the qwenimage serve protocol, PNG and request rules
+import power                        # the machine's watts and each turn's joules, when joules is installed
 from family_registry import (FamilyConfigError, UnknownFamilyError, family_by_id,
                              display_for, family_ids, resolve_model)
 from family_registry import default_model_id as registry_default_model_id
@@ -2610,7 +2611,12 @@ def _muse_value(raw, schema):
         # the template writes None as `null`, and every string as is
         return None if raw == "null" and "null" in kinds else raw
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        # Python accepts NaN, Infinity and overflowing JSON exponents, also
+        # inside containers. Tool arguments must remain JSON; use the same
+        # text fallback as any other value that cannot be read as JSON.
+        json.dumps(parsed, allow_nan=False)
+        return parsed
     except ValueError:
         return raw
 
@@ -2834,6 +2840,17 @@ def render_chat_qwen3_coder(messages, tools=None, tool_choice=None, add_generati
             parts.append("<|im_start|>assistant")
             if text.strip():
                 parts.append("\n" + text.strip() + "\n")
+            # The template puts a blank line between the text and the first call, but the
+            # model does not always write one: Qwen3-Coder-30B-A3B often ends its text with a
+            # single newline and opens <tool_call> straight after. The reply's content keeps
+            # that newline, so a client that sends it back untrimmed is sending the turn as
+            # generated. Rendering the template's blank line instead makes the history differ
+            # from the engine's state by one token, and prefix reuse -- all or nothing --
+            # misses: the whole conversation is read again, every such turn (measured with
+            # COLI_PREFIX_LOG=1: held ".\n<tool_call>", rendered ".\n\n<tool_call>"; a
+            # 2,400-token agent turn went from ~5 s to ~100 s). A trimmed or blank-line content
+            # renders as the template does.
+            single = text.strip() and text.endswith("\n") and not text.endswith("\n\n")
             for position, call in enumerate(calls):
                 where = f"messages.{index}.tool_calls.{position}"
                 fn = call.get("function", call) if isinstance(call, dict) else None
@@ -2849,7 +2866,8 @@ def render_chat_qwen3_coder(messages, tools=None, tool_choice=None, add_generati
                 if not isinstance(args, dict):
                     raise APIError(400, "`function.arguments` must be a JSON object.",
                                    f"{where}.function.arguments")
-                parts.append(f"\n<tool_call>\n<function={fn['name']}>\n")
+                lead = "" if position == 0 and single else "\n"
+                parts.append(f"{lead}<tool_call>\n<function={fn['name']}>\n")
                 for key, value in args.items():
                     shown = (json.dumps(value, ensure_ascii=False)
                              if isinstance(value, (dict, list, tuple)) else _jinja_string(value))
@@ -4766,6 +4784,60 @@ def resolve_generation_prompt(messages, body):
                        "than the ones sent. Put the space at the start of what you expect "
                        "back instead.", f"{where}.content", "invalid_value")
     return False
+
+
+CHAT_TEMPLATE_KWARGS = ("enable_thinking", "preserve_thinking", "reasoning_effort")
+
+
+def lift_chat_template_kwargs(body):
+    """A chat request's `chat_template_kwargs` (the template's own arguments, as several
+    OpenAI-compatible servers take them: {"enable_thinking": false} is how many clients turn a
+    Qwen model's thinking off) for the keys this gateway reads at the top of the body, where the
+    body does not set them itself. Before, they were ignored: a Qwen3.8 request that asked for no
+    thinking this way reasoned at xhigh. Their values go through the same checks there."""
+    kwargs = body.get("chat_template_kwargs")
+    if kwargs is None:
+        return body
+    if not isinstance(kwargs, dict):
+        raise APIError(400, "`chat_template_kwargs` must be an object.", "chat_template_kwargs")
+    lifted = {k: kwargs[k] for k in CHAT_TEMPLATE_KWARGS if k in kwargs and k not in body}
+    return dict(body, **lifted) if lifted else body
+
+
+def default_reasoning_effort():
+    """The reasoning_effort of a chat request that names neither reasoning_effort nor
+    enable_thinking: Qwen3.8's and Muse Spark's templates think at xhigh unless told,
+    MiMo-V2.6's and LFM3's think too; the other families keep the older opt-in default
+    (none), which COLI_THINK=1 turns on for all of them."""
+    if chat_flavor() in ("qwen38", "muse"):
+        return "xhigh"
+    if ARCH == "mimo" or chat_flavor() == "lfm3" or os.environ.get("COLI_THINK", "0") == "1":
+        return "high"
+    return None
+
+
+def template_thinks():
+    """False for the templates with no thinking mode at all: Qwen3-Coder's (no <think>
+    anywhere) and OLMoE's (enable_thinking accepted but unused)."""
+    return not (ARCH == "olmoe" or chat_flavor() == "qwen3_coder")
+
+
+def tune_chat_prompt(model, text):
+    """TEXT as one user message, rendered as this gateway renders a chat request for MODEL
+    that sets nothing else: the checkpoint's own template (detect_chat_flavor) and its
+    default reasoning. `coli tune` measures with it, so the request it times is the one
+    `coli serve` is sent. A family-wide template opened <think> for every qwen36
+    checkpoint, and Qwen3-Coder, which has no thinking mode, ended its turn on the first
+    token there: no decode speed, and the tune failed (#2590). Qwen3.6 with thinking off
+    gets the template's pre-closed block, a state it was trained on (the bare
+    `assistant\n` is not, render_chat_qwen). Sets ARCH and CHAT_FLAVOR as a server does."""
+    global ARCH, CHAT_FLAVOR
+    family = resolve_model(model).descriptor
+    ARCH = family.id
+    CHAT_FLAVOR = detect_chat_flavor(family.id, model)
+    effort = default_reasoning_effort()
+    thinking = effort not in (None, "none") and template_thinks()
+    return render_chat_for_arch([{"role": "user", "content": text}], thinking, effort)
 
 
 def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None, tools=None,
@@ -7320,6 +7392,12 @@ class Engine:
                         turn["cluster_transfer_s"] = float(fields[10])
                         turn["cluster_tx_bytes"] = int(fields[11])
                         turn["cluster_rx_bytes"] = int(fields[12])
+                    try:   # what the devices used over the turn, once a page has asked for /power
+                        energy = power.energy_since(turn["wall_s"])
+                    except Exception:   # noqa: BLE001 - a meter that failed: the turn keeps its timings
+                        energy = None
+                    if energy is not None:
+                        turn["energy_j"] = round(energy, 1)
                     self.profile.append(turn)
                     self.profile_seq += 1
                 elif kind == "TIERS" and len(fields) >= 6:
@@ -8491,6 +8569,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     payload["turns"] = list(getattr(eng, "profile", ()) or ())
                 self.send_json(200, payload, request_id)
                 return
+            if path == "/power":
+                # this machine's watts from joules, when it is installed (c/power.py); the
+                # first request starts the meters. Gated like /profile: it says how busy the box is.
+                payload = power.reading() if self._is_authed() else power._unavailable("unauthorized")
+                self.send_json(200, payload, request_id)
+                return
             if self.serve_static(path):
                 return
             self.require_auth()
@@ -9654,6 +9738,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 "total_tokens": prompt + completion}
 
     def chat_completion(self, body, request_id):
+        body = lift_chat_template_kwargs(body)
         strict_tools = body.get("strict_tool_calls", False)
         if not isinstance(strict_tools, bool):
             raise APIError(400, "`strict_tool_calls` must be a boolean.", "strict_tool_calls")
@@ -9675,17 +9760,11 @@ class APIHandler(BaseHTTPRequestHandler):
         # nor enable_thinking (a global switch, like the old server's --think). An explicit
         # client value always wins. Default off => exact OpenAI-standard behavior.
         if reasoning_effort is None and "enable_thinking" not in body:
-            # Qwen3.8's official template defaults to enabled xhigh thinking;
-            # preserve the older opt-in default for the other families.
-            if chat_flavor() in ("qwen38", "muse"):   # Muse Spark's template: xhigh unless told
-                reasoning_effort = "xhigh"
-            elif ARCH == "mimo" or chat_flavor() == "lfm3" or os.environ.get("COLI_THINK", "0") == "1":
-                # MiMo-V2.6's and LFM3's templates think unless told not to (enable_thinking false)
-                reasoning_effort = "high"
+            reasoning_effort = default_reasoning_effort()
         enable_thinking = body.get("enable_thinking", reasoning_effort not in (None, "none"))
         if not isinstance(enable_thinking, bool):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
-        if (ARCH == "olmoe" or chat_flavor() == "qwen3_coder") and enable_thinking:
+        if not template_thinks() and enable_thinking:
             # Qwen3-Coder's template has no thinking mode either (no <think> anywhere).
             # OLMoE's template has no thinking mode (render_chat_olmoe: "accepted
             # but unused"), so the engine never emits <think>/</think>. Left on,

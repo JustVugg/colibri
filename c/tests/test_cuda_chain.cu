@@ -522,6 +522,7 @@ int main(void) {
     if (!T) return 1;
     ck(T->init(0), "a context on device 0");
     ck(T->ready() && !T->lost(), "ready, not lost");
+    ck(T->preload && T->preload() && T->ready() && !T->lost(), "the chain's and the backend's kernels loaded before their first launch");
     const char *be = getenv("COLI_CUDA_CHAIN_BENCH");
     if (be && !strcmp(be, "adec")) { bench_adec(); return 0; }
     if (be && !strcmp(be, "route")) { bench_route(); return 0; }
@@ -544,6 +545,25 @@ int main(void) {
         CcBuf *r = NULL;
         ck(T->reserve(&r, 64, CC_DEV) && T->bytes(r) >= 64 && T->reserve(&r, 32, CC_DEV) && T->bytes(r) >= 64 && T->reserve(&r, 4096, CC_DEV) && T->bytes(r) >= 4096, "reserve grows, never shrinks");
         T->free(d); T->free(u); T->free(dn); T->free(d2); T->free(r);
+    }
+    {   /* copies of up to 1 MiB by a kernel (cc_copy_k: no copy engine), past it by the engine, at
+         * offsets 16-byte aligned or not; scattered regions out of mapped memory by a kernel too */
+        const size_t N = ((size_t)1 << 18) + 1000;
+        std::vector<float> a = rnd(N, 71);
+        CcBuf *u = T->buf(N * 4, CC_UP), *d = T->buf(N * 4, CC_DEV), *dn = T->buf(N * 4, CC_DOWN), *d3 = T->buf(4096 * 4, CC_DEV);
+        int ok = u && d && dn && d3;
+        if (ok) memcpy(T->ptr(u), a.data(), N * 4);
+        ok = ok && T->begin() && T->copy(d, 0, u, 0, N) && T->copy(dn, 3, d, 5, 777) && T->copy(dn, 1000, d, 1000, (size_t)1 << 18) && T->submit(1);
+        int same = ok;
+        for (size_t i = 0; i < 777 && same; i++) same = ((const float *)T->ptr(dn))[3 + i] == a[5 + i];
+        for (size_t i = 0; i < ((size_t)1 << 18) && same; i++) same = ((const float *)T->ptr(dn))[1000 + i] == a[1000 + i];
+        ck(same, "1 MiB + 4000 bytes by the engine, 777 floats unaligned and 1 MiB by the kernel");
+        CcRegion rg[3] = {{7, 33, 5}, {200, 1, 13}, {50, 900, 3}};
+        std::vector<float> want(4096, 0.f);
+        for (auto &x : rg) memcpy(want.data() + x.dst, a.data() + x.src, x.n * 4);
+        ck(ok && T->begin() && T->zero(d3, 0, 4096) && T->copy_regions(d3, u, rg, 3) && T->submit(1) &&
+           maxdiff(down(d3, 4096).data(), want.data(), 4096) == 0, "scattered regions out of mapped memory");
+        T->free(u); T->free(d); T->free(dn); T->free(d3);
     }
     {   /* K rows into a head-major cache: a region per row and head, one kernel for the grid
          * (two regions or more, from a decode step's KV heads up to a prompt chunk); off the
@@ -590,6 +610,32 @@ int main(void) {
         ck(ok && maxdiff(down(db, n).data(), b.data(), n) == 0, "host_up: the bytes where they were sent");
         T->free(db); T->free(hb2);
     }
+    if (T->size >= offsetof(ColiCudaChainOps, host_up_n) + sizeof T->host_up_n && T->host_up_n) {
+        /* host_up_n: 96 pieces of a page-locked buffer, sizes 4 bytes to 11 KiB and apart, to places of a device
+         * buffer in another order, one call and one ticket; after a zero the frame recorded first */
+        const int np = 96; const size_t n = 1 << 18;
+        std::vector<float> b = rnd(n, 43);
+        CcBuf *db = T->buf(n * 4, CC_DEV), *hb2 = T->buf(n * 4, CC_UP);
+        int ok = db && hb2;
+        if (ok) memcpy(T->ptr(hb2), b.data(), n * 4);
+        float *dd = ok ? (float *)T->dev_addr(db) : NULL;
+        void *dst[np]; const void *src[np]; size_t by[np];
+        std::vector<float> want(n, 0.f);
+        for (int i = 0; i < np && ok; i++) {   /* piece i: floats [2730 i, +len) of the host buffer to the place of piece np-1-i */
+            const size_t len = 1 + (size_t)(i * 97) % 2730, from = (size_t)i * 2730, to = (size_t)(np - 1 - i) * 2730;
+            dst[i] = dd + to; src[i] = (const float *)T->ptr(hb2) + from; by[i] = len * 4;
+            for (size_t j = 0; j < len; j++) want[to + j] = b[from + j];
+        }
+        unsigned t = 0;
+        ok = ok && T->begin() && T->zero(db, 0, n) && T->host_up_n(dst, src, by, np, &t) && T->submit(1);
+        int landed = 0;
+        auto t0 = std::chrono::steady_clock::now();
+        while (ok && !landed && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) landed = T->host_up_done(t);
+        ck(ok && landed, "host_up_n: 96 copies in one call, their one ticket landed");
+        ck(ok && landed && maxdiff(down(db, n).data(), want.data(), n) == 0, "host_up_n: each piece where it was sent, after the frame's zero");
+        ck(!T->host_up_n(dst, src, by, 0, &t) && !T->host_up_n(NULL, src, by, 1, &t), "host_up_n: no copies, or none to, refused");
+        T->free(db); T->free(hb2);
+    }
     printf("matmul\n");
     {
         const int I = 96, O = 40, S = 3; unsigned s = 5;
@@ -608,6 +654,30 @@ int main(void) {
             std::vector<float> one((size_t)S * O);
             for (int r = 0; r < S; r++) { T->begin(); T->matmul(t, xb, 7 + (size_t)r * I, yb, 0, 1); T->submit(1); std::vector<float> yr = down(yb, O); memcpy(&one[(size_t)r * O], yr.data(), O * 4); }
             ck(maxdiff(y.data() + 3, one.data(), (size_t)S * O) == 0, "three rows at once are bit for bit the three one-row calls");
+        }
+        {   /* few outputs of long int8 rows (Qwen3.8's hyper-connection read, 10240 x 320): the inputs split
+             * (gemv_i8_sk), a verify's four rows each the bits of its one-row call, and the CPU's dot */
+            const int I5 = 10240, O5 = 320, S5 = 4;
+            std::vector<int8_t> q5((size_t)I5 * O5); for (auto &v : q5) v = (int8_t)(frand(&s) * 60);
+            std::vector<float> sc5(O5), x5 = rnd((size_t)S5 * I5, 19), r5((size_t)S5 * O5);
+            for (int o = 0; o < O5; o++) sc5[o] = 0.01f + 0.001f * (o % 7);
+            for (int r = 0; r < S5; r++) for (int o = 0; o < O5; o++) {
+                double a = 0; for (int i = 0; i < I5; i++) a += (double)x5[(size_t)r * I5 + i] * q5[(size_t)o * I5 + i]; r5[(size_t)r * O5 + o] = (float)(a * sc5[o]);
+            }
+            ColiCudaTensor *t5 = NULL;
+            CcBuf *x5b = up(x5), *y5b = T->buf((size_t)S5 * O5 * 4, CC_DEV), *y1b = T->buf((size_t)O5 * 4, CC_DEV);
+            int ok5 = coli_cuda_tensor_upload(&t5, q5.data(), sc5.data(), 1, I5, O5, 0) && T->begin() && T->matmul(t5, x5b, 0, y5b, 0, S5) && T->submit(1);
+            std::vector<float> all5 = ok5 ? down(y5b, (size_t)S5 * O5) : std::vector<float>();
+            double mx5 = 0; for (float v : r5) mx5 = fmax(mx5, fabs(v));
+            ck(ok5 && maxdiff(all5.data(), r5.data(), r5.size()) < 1e-4 * mx5, "few outputs of long int8 rows, four rows: the CPU's dot");
+            int same5 = ok5;
+            for (int r = 0; r < S5 && same5; r++) {
+                same5 = T->begin() && T->matmul(t5, x5b, (size_t)r * I5, y1b, 0, 1) && T->submit(1);
+                if (same5) same5 = !memcmp(down(y1b, O5).data(), all5.data() + (size_t)r * O5, (size_t)O5 * 4);
+            }
+            ck(same5, "and each row the bits of its one-row call");
+            if (t5) coli_cuda_tensor_free(t5);
+            T->free(x5b); T->free(y5b); T->free(y1b);
         }
         {   /* a width the warp GEMV does not take (not a multiple of 16): the block kernel */
             const int I2 = 100; std::vector<int8_t> q2((size_t)I2 * O); for (auto &v : q2) v = (int8_t)(frand(&s) * 60);
@@ -831,13 +901,29 @@ int main(void) {
         ck(ok && maxdiff(all.data(), ref.data(), o.size()) < 1e-4, "40 rows with selection lists, a block per kv head, against the reference");
         CcBuf *o1 = T->buf((size_t)H * hd * 4, CC_DEV);
         int same = 1;
+        setenv("COLI_CUDA_ATTN_DEC_SEL", "0", 1);   /* a row alone through cc_attn_k */
         for (int r = 0; r < S && same; r++) {
             CcAttn p1 = p; p1.S = 1; p1.pos_base = pos_base + r; p1.q_off = r * p.q_row; p1.g_off = p.g_off + r * p.g_row; p1.o_off = 0; p1.sel_off = r * SR;
             std::vector<float> one;
             same = T->begin() && T->attn(qb, kb, vb, o1, qb, sb, &p1) && T->submit(1);
             if (same) { one = down(o1, (size_t)H * hd); same = !memcmp(one.data(), all.data() + (size_t)r * H * hd, (size_t)H * hd * 4); }
         }
-        ck(same, "each row the bits of that row alone (a block per query head)");
+        unsetenv("COLI_CUDA_ATTN_DEC_SEL");
+        ck(same, "each row the bits of that row alone (a block per query head, COLI_CUDA_ATTN_DEC_SEL=0)");
+        /* a verify's rows with their lists in blocks of positions (cc_attn_dec_k): 1 to 4 rows from row 3 on
+         * (row 3 without a list: its causal positions; row 5's list 97 long, the others 400), against the reference */
+        double worst = 0;
+        int okd = 1;
+        for (int S2 = 1; S2 <= 4 && okd; S2++) {
+            CcAttn p2 = p; p2.S = S2; p2.pos_base = pos_base + 3; p2.q_off = 3 * p.q_row; p2.g_off = p.g_off + 3 * p.g_row; p2.o_off = 0;
+            p2.sel_off = 3 * SR;
+            CcBuf *o2 = T->buf((size_t)S2 * H * hd * 4, CC_DEV);
+            okd = o2 && T->begin() && T->attn(qb, kb, vb, o2, qb, sb, &p2) && T->submit(1);
+            std::vector<float> got = okd ? down(o2, (size_t)S2 * H * hd) : std::vector<float>();
+            if (okd) { double d = maxdiff(got.data(), ref.data() + (size_t)3 * H * hd, (size_t)S2 * H * hd); if (d > worst) worst = d; }
+            T->free(o2);
+        }
+        ck(okd && worst < 1e-4, "a verify's rows with selection lists in blocks of positions, against the reference");
         T->free(qb); T->free(kb); T->free(vb); T->free(ob); T->free(sb); T->free(o1);
     }
     {   /* a decode's or a verify's rows over many positions: in blocks of positions (cc_attn_dec_k) */
@@ -1103,6 +1189,21 @@ int main(void) {
         ref_qsa(iq.data(), NULL, rpk.data(), NULL, rsc.data(), rsel.data(), &p2);
         ok = T->begin() && T->qsa(qb, NULL, pb, NULL, sb, lb, &p2) && T->submit(1) && T->read(lb, 0, got.data(), got.size() * 4);
         ck(ok && got[0] == -1 && got[selrow] == -1 && got[2 * selrow] == -1, "few positions: every row attends to all of them (-1)");
+        {   /* 1100 blocks (Qwen3.8's 4400 positions, budget 2048): of 37 keys and some zero ones, so many
+             * scores tie, the take-th among them; the device's select against the CPU's ranking */
+            const int NB = 1100, S3 = 2, B3 = 2048, nbm3 = NB + 4, sr3 = 1 + B3 + R - 1;
+            std::vector<float> kk = rnd((size_t)37 * ID, 94), pk3((size_t)nbm3 * ID, 0.f);
+            for (int b = 0; b < NB; b++) if (b % 11) for (int d = 0; d < ID; d++) pk3[(size_t)b * ID + d] = kk[(size_t)(b % 37) * ID + d];
+            std::vector<float> iq3 = rnd((size_t)S3 * (IQ + 1) * ID, 95), sc3((size_t)S3 * 2 * nbm3), rsc3 = sc3;
+            std::vector<int> sel3((size_t)S3 * sr3), rsel3 = sel3, got3(sel3.size());
+            CcQsa p3 = {1, ID, R, 0, 0, S3, NB * R + 1, B3, IQ, 0, (IQ + 1) * ID, nbm3, sr3, 1e-6f, 0, 0, 0, 0};
+            ref_qsa(iq3.data(), NULL, pk3.data(), NULL, rsc3.data(), rsel3.data(), &p3);
+            CcBuf *pb3 = up(pk3), *qb3 = up(iq3), *sb3 = T->buf(sc3.size() * 4, CC_DEV), *lb3 = T->buf(sel3.size() * 4, CC_DEV);
+            ok = T->begin() && T->qsa(qb3, NULL, pb3, NULL, sb3, lb3, &p3) && T->submit(1) && T->read(lb3, 0, got3.data(), got3.size() * 4);
+            same = 1; for (size_t i = 0; i < got3.size(); i++) if (got3[i] != rsel3[i]) same = 0;
+            ck(ok && same && rsel3[0] == B3 + 2 && rsel3[sr3] == B3 + 3, "1100 blocks of tied scores: the take-th key's blocks by index, then the tail, as the CPU ranks them");
+            T->free(pb3); T->free(qb3); T->free(sb3); T->free(lb3);
+        }
         T->free(ib); T->free(wb); T->free(cb); T->free(pb); T->free(qb); T->free(sb); T->free(lb);
     }
     printf("ple\n");
@@ -1202,7 +1303,7 @@ int main(void) {
             CcBuf *yb = T->buf(((size_t)S * D + 8) * 4, CC_DEV), *hyb = up(hy, CC_UP);
             int ok = tb && pb && T->begin() && T->write(tb, 0, tab.data(), tab.size() * sizeof(CcExpert)) && T->write(pb, 0, part.data(), part.size() * sizeof(CcExpert)) &&
                      T->write(ib, 0, ids.data(), ids.size() * 4) && T->submit(1);
-            CcMoe m = {S, K, D, I, fmt, gs, 0, 3, 2, 4, D, 0, K, 0, K, 8, D, -1, E, 0};
+            CcMoe m = {S, K, D, I, fmt, gs, 0, 3, 2, 4, D, 0, K, 0, K, 8, D, -1, E, 0, 0, 0, 0};
             ok = ok && T->begin() && T->moe(tb, xb, ib, wb, hb, yb, NULL, &m) && T->submit(1);
             std::vector<float> y = down(yb, (size_t)S * D + 8);
             double scale = 0; for (float v : ref_full) scale = fmax(scale, fabs(v));
@@ -1228,7 +1329,7 @@ int main(void) {
                 double sc2 = 0; for (float v : rf) sc2 = fmax(sc2, fabs(v));
                 CcBuf *x2b = up(x2), *i2b = T->buf(ids2.size() * 4, CC_DEV), *w2b = up(w2), *h2b = T->buf(cc_moe_hid_floats(S2, K, D, I, E) * 4, CC_DEV);
                 CcBuf *y2b = T->buf((size_t)S2 * D * 4, CC_DEV), *hy2b = up(hy2, CC_UP);
-                CcMoe m2 = {S2, K, D, I, fmt, gs, 0, 3, 2, 0, D, 0, K, 0, K, 0, D, -1, E, 0};
+                CcMoe m2 = {S2, K, D, I, fmt, gs, 0, 3, 2, 0, D, 0, K, 0, K, 0, D, -1, E, 0, 0, 0, 0};
                 int ok2 = T->begin() && T->write(i2b, 0, ids2.data(), ids2.size() * 4) && T->moe(tb, x2b, i2b, w2b, h2b, y2b, NULL, &m2) && T->submit(1);
                 double ef = ok2 ? maxdiff(down(y2b, (size_t)S2 * D).data(), rf.data(), (size_t)S2 * D) / sc2 : 1;
                 CcMoe a2 = m2, b2 = m2; a2.parts = 1; b2.parts = 2; b2.h_off = 0;
@@ -1237,6 +1338,22 @@ int main(void) {
                 if (ef >= 2e-3 || ep >= 2e-3) printf("  (prompt rows fmt %d: relative errors %.3g, %.3g)\n", fmt, ef, ep);
                 ck(ok2 && ef < 2e-3, "forty rows: the slots sorted by expert, their GEMMs, the sum in rank order");
                 ck(okp && ep < 2e-3, "forty rows, two experts the host's: its rows plus the device's slots");
+                {   /* a prompt chunk's two lanes (CcMoe.lay_S): the forty rows' parts 1 above, then the sums of
+                     * rows 0..15 and 16..39 apart over that layout, each with its own rows' offsets */
+                    std::vector<float> yall = down(y2b, (size_t)S2 * D);
+                    const int r0 = 16;
+                    CcMoe la = b2, lb = b2;
+                    la.S = r0; la.lay_S = S2;
+                    lb.S = S2 - r0; lb.lay_S = S2; lb.lay_s0 = r0; lb.i_off = r0 * K; lb.w_off = r0 * K; lb.y_off = r0 * D; lb.h_off = r0 * D;
+                    CcBuf *y3b = T->buf((size_t)S2 * D * 4, CC_DEV);
+                    int okl = okp && y3b && T->begin() && T->moe(pb, x2b, i2b, w2b, h2b, y3b, hy2b, &la) && T->moe(pb, x2b, i2b, w2b, h2b, y3b, hy2b, &lb) && T->submit(1);
+                    std::vector<float> yl = okl ? down(y3b, (size_t)S2 * D) : std::vector<float>();
+                    ck(okl && !memcmp(yl.data(), yall.data(), (size_t)S2 * D * 4), "a chunk's two lanes' sums over one parts 1 of its rows: the chunk's sum's bits");
+                    CcMoe bad = a2; bad.lay_S = S2 + 8;   /* a parts 1 has its own layout */
+                    CcMoe past = lb; past.lay_s0 = r0 + 1;   /* rows past the layout's */
+                    int refused = T->begin() && !T->moe(pb, x2b, i2b, w2b, h2b, y3b, hy2b, &bad) && !T->moe(pb, x2b, i2b, w2b, h2b, y3b, hy2b, &past) && T->submit(1);
+                    ck(refused, "a parts 1 over another layout, and rows past the layout's, refused");
+                }
                 if (fmt == 4) {   /* experts 1 and 5 in planar blocks in host memory (the tier's RAM cache), read over the bus */
                     std::vector<CcExpert> tp = tab;
                     std::vector<void *> hosts;
@@ -1374,6 +1491,33 @@ int main(void) {
         ck(!T->pick(lb, small, V) && !T->pick(lb, pb, V + 1), "pick past its buffers refused");
         T->free(lb); T->free(pb); T->free(small);
     }
+    printf("pick_rows\n");
+    {
+        const int V = 248320, R = 4, off = 3;   /* rows from float off: a buffer's rows past the first */
+        std::vector<float> lg = rnd((size_t)(off + R * V), 93, 10.f);
+        lg[off + 173421] = 22.f; lg[off + V + 9] = 30.f; lg[off + 2 * V + 248319] = 25.f;
+        lg[off + 3 * V + 5000] = 28.f; lg[off + 3 * V + 4000] = 28.f;   /* a tie: the lower place */
+        int ids_ref[R]; float p_ref[R];
+        for (int r = 0; r < R; r++) {
+            const float *x = lg.data() + off + (size_t)r * V;
+            int best = 0;
+            for (int i = 1; i < V; i++) if (x[i] > x[best]) best = i;
+            double z = 0.0;
+            for (int i = 0; i < V; i++) if (x[i] - x[best] > -20.f) z += expf(x[i] - x[best]);
+            ids_ref[r] = best; p_ref[r] = (float)(1.0 / z);
+        }
+        CcBuf *lb = up(lg), *pb = T->buf(8 * R, CC_DOWN), *small = T->buf(8 * R - 8, CC_DOWN);
+        int ok = T->size >= offsetof(ColiCudaChainOps, pick_rows) + sizeof T->pick_rows && T->pick_rows &&
+                 T->begin() && T->pick_rows(lb, off, pb, V, R) && T->submit(1);
+        const void *pk = T->ptr(pb);
+        int same = ok && pk;
+        for (int r = 0; same && r < R; r++)
+            same = ((const int *)pk)[2 * r] == ids_ref[r] && fabsf(((const float *)pk)[2 * r + 1] - p_ref[r]) <= 1e-5f * p_ref[r];
+        ck(same, "four rows of 248320 logits from an offset: each row's argmax (the lower place on a tie) and probability, pick's");
+        ck(ok && ids_ref[3] == 4000, "the tie row's reference is the lower place");
+        ck(ok && !T->pick_rows(lb, off, small, V, R) && !T->pick_rows(lb, off + 1, pb, V, R), "pick_rows past its buffers refused");
+        T->free(lb); T->free(pb); T->free(small);
+    }
     printf("matmul_rows\n");
     {
         for (int c = 0; c < 3; c++) {
@@ -1404,6 +1548,35 @@ int main(void) {
             if (t) coli_cuda_tensor_free(t);
             T->free(ib); T->free(xb); T->free(yb);
         }
+    }
+    {   /* a GGUF's blocks (Q8_0, fmt 108): each listed row the bits the whole GEMV gives it, an id past
+         * the matrix -inf (an MTP head's draft list scored from a block lm_head) */
+        const int I = 2560, O = 3000, n = 211, rb = I / 32 * 34;
+        std::vector<uint8_t> w8((size_t)O * rb);
+        unsigned sq = 7;
+        static const uint16_t scl[3] = {0x2400, 0x2800, 0x2C00};   /* 1/64, 1/32, 1/16 as float16 */
+        for (int o = 0; o < O; o++)
+            for (int b = 0; b < I / 32; b++) {
+                uint8_t *blk = w8.data() + (size_t)o * rb + (size_t)b * 34;
+                memcpy(blk, &scl[(o + b) % 3], 2);
+                for (int k = 0; k < 32; k++) blk[2 + k] = (uint8_t)(int8_t)(frand(&sq) * 120);
+            }
+        std::vector<float> x = rnd((size_t)I, 150);
+        std::vector<int> ids((size_t)n);
+        for (int j = 0; j < n; j++) ids[j] = j == 17 ? O + 5 : (j * 13 + 3) % O;
+        ColiCudaTensor *t = NULL;
+        CcBuf *ib = T->buf((size_t)n * 4, CC_DEV), *xb = up(x), *yb = T->buf((size_t)n * 4, CC_DEV), *fb = T->buf((size_t)O * 4, CC_DEV);
+        int ok = T->matmul_rows && coli_cuda_tensor_upload(&t, w8.data(), NULL, 108, I, O, 0) && ib && xb && yb && fb && T->begin() &&
+                 T->write(ib, 0, ids.data(), (size_t)n * 4) && T->matmul_rows(t, ib, xb, yb, n) && T->matmul(t, xb, 0, fb, 0, 1) && T->submit(1);
+        std::vector<float> got = down(yb, (size_t)n), full = down(fb, (size_t)O);
+        int same = ok;
+        for (int j = 0; j < n && same; j++) {
+            const float wnt = ids[j] < O ? full[ids[j]] : -INFINITY;
+            same = !memcmp(&got[j], &wnt, 4);
+        }
+        ck(same, "matmul_rows fmt 108 (Q8_0 blocks): each listed row the whole GEMV's bits, an id past the matrix -inf");
+        if (t) coli_cuda_tensor_free(t);
+        T->free(ib); T->free(xb); T->free(yb); T->free(fb);
     }
     printf("the decision engines' encoders\n");
     if (!T->enc_rel || T->size < offsetof(ColiCudaChainOps, enc_rel) + sizeof T->enc_rel) ck(0, "the table has the encoder ops");
@@ -1529,7 +1702,7 @@ int main(void) {
     printf("lost\n");
     {
         CcStats st; T->stats(&st);
-        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 28, "the counters saw the frames, ops and matmuls");
+        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 35, "the counters saw the frames, ops and matmuls");
         setenv("COLI_GPU_FAIL_AFTER", "0", 1);
         std::vector<float> w = rnd(64, 81), ones(8, 1.f);
         ColiCudaTensor *t = NULL;
