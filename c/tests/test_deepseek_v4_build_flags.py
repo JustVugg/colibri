@@ -32,12 +32,25 @@ MAKE = shutil.which("make")
 UNIT = "COLI_V4_UNIT_MATH.o"
 
 FAKE_CC = """#!/bin/sh
-# Stand-in compiler: creates the -o target and compiles nothing.
+output=
+depfile=
 while [ "$#" -gt 0 ]; do
-    if [ "$1" = -o ]; then : > "$2"; exit 0; fi
+    case "$1" in
+        -o) output="$2"; shift ;;
+        -MF) depfile="$2"; shift ;;
+    esac
     shift
 done
-exit 1
+[ -n "$output" ] || exit 1
+if [ -n "$depfile" ]; then
+    header=deepseek_v4.h
+    case "$output" in
+        COLI_V4_UNIT_MATH.o) header=hyper_connections.h ;;
+        backend_vulkan_v4.o) header=vk_memtype.h ;;
+    esac
+    printf '%s: %s\\n%s:\\n' "$output" "$header" "$header" > "$depfile"
+fi
+: > "$output"
 """
 
 
@@ -46,9 +59,10 @@ class DeepseekV4BuildFlagsTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self._tmp.name)
-        for pattern in ("Makefile.deepseek-v4*", "deepseek_v4.c", "*.h", "*.inc"):
+        for pattern in ("Makefile.deepseek-v4*", "*.c", "*.h", "*.inc"):
             for src in C_DIR.glob(pattern):
                 shutil.copy(src, self.dir / src.name)
+        shutil.copytree(C_DIR / "shaders", self.dir / "shaders")
         fake = self.dir / "fakecc.sh"
         fake.write_text(FAKE_CC, encoding="utf-8")
         self.cc = f"sh {fake}"
@@ -86,6 +100,58 @@ class DeepseekV4BuildFlagsTest(unittest.TestCase):
             if before.get(f) != f.stat().st_mtime:
                 os.utime(f, (aged, aged))
         return "-c deepseek_v4.c" in result.stdout
+
+    def test_math_header_rebuilds(self):
+        self.assertTrue(self.build())
+        os.utime(self.dir / "hyper_connections.h", (time.time() - 400,) * 2)
+        self.assertTrue(self.build())
+        os.utime(self.dir / "hyper_connections.h", (time.time() - 1000,) * 2)
+        self.assertFalse(self.build())
+
+    def test_missing_depfile_rebuilds(self):
+        self.assertTrue(self.build())
+        depfile = self.dir / UNIT.replace(".o", ".d")
+        depfile.unlink(missing_ok=True)
+        self.assertTrue(self.build())
+        self.assertTrue(depfile.exists())
+        self.assertFalse(self.build())
+
+    def test_vulkan_header_rebuilds(self):
+        target = "backend_vulkan_v4.o"
+        first = self.make(target)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        past = time.time() - 100
+        for name in (target, "deepseek_v4.cflags", "backend_vulkan_v4.d"):
+            path = self.dir / name
+            if path.exists():
+                os.utime(path, (past, past))
+        os.utime(self.dir / "vk_memtype.h", None)
+        result = self.make(target)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-c backend_vulkan.c", result.stdout)
+
+    def test_link_flags_relink_without_recompiling(self):
+        first = self.make("deepseek-v4")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        result = self.make("deepseek-v4", "EXTRA_LDFLAGS=-Wl,--as-needed")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-Wl,--as-needed", result.stdout)
+        self.assertNotIn(" -c ", result.stdout)
+        unchanged = self.make("deepseek-v4", "EXTRA_LDFLAGS=-Wl,--as-needed")
+        self.assertEqual(unchanged.returncode, 0, unchanged.stderr)
+        self.assertNotIn(" -o ", unchanged.stdout)
+
+    def test_clean_removes_disabled_backend_artifacts(self):
+        artifacts = ("backend_cuda_dsv4.o", "backend_cuda_dsv4.d",
+                     "backend_loader_dsv4.o", "backend_loader_dsv4.d",
+                     "backend_vulkan_v4.o", "backend_vulkan_v4.d",
+                     "deepseek_v4.ldflags", "deepseek_v4.exe")
+        for name in artifacts:
+            (self.dir / name).touch()
+        result = self.make("deepseek-v4-clean")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in artifacts:
+            self.assertFalse((self.dir / name).exists(), name)
 
     def test_same_flags_do_not_rebuild(self):
         """The guard: a fix that always recompiles would pass the tests below."""
