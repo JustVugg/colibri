@@ -43,9 +43,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   pool's experts and read 98.9 GB from disk. Now each layer runs its chunks in order through
   the attention, the FFN's mix and the shared expert, with every row's streams on the device,
   then its routed experts for all the rows in one step, then each chunk's FFN sum
-  (`COLI_VK_V41_LAYERWISE=0`: chunk by chunk). unsloth's UD-IQ1_S on an RTX PRO 4000, the
-  4104-token prompt: 34.9 GiB copied, 44.3 GB read, the tier's device time 81.7 -> 33.6 s, the
-  prompt 39.1 -> 66.9 tok/s.
+  (`COLI_VK_V41_LAYERWISE=0`: chunk by chunk). Each row keeps from one layer to the next the
+  selection its last index source made and the candidate source's mask, as a chunk keeps them
+  through its layers chunk by chunk. unsloth's UD-IQ1_S on an RTX PRO 4000, the 4104-token
+  prompt: 34.9 GiB copied, 44.3 GB read, the tier's device time 81.7 -> 33.6 s, the prompt
+  39.1 -> 65.1 tok/s.
 - **DeepSeek V4.1 and V4 on the Vulkan chain: a prompt chunk's sparse attention in three
   passes, the same bits** (`chain_dsv4_pa.comp`). The attention gave each (head, row) a
   workgroup that read every listed row from memory, a thread a row, so the 64 heads of a row
