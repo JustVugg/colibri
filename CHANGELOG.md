@@ -41,11 +41,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   selection list (Qwen3.8's QSA) ran `cc_attn_gk` on the CUDA cores, 15.9 ms of a 2048-row chunk
   a layer on an RTX PRO 4000. `cc_attn_f2` (f16 operands, one pass) now takes them too: each
   token's ascending list of positions gives it a mask a block of keys, a block no token selects
-  from is not read, and three warps a block take Qwen3.8's 12 query heads a kv head.
-  `COLI_CUDA_ATTN_SEL_TC=0` keeps `cc_attn_gk`; the rows' bits are not those of `cc_attn_gk`
-  (against the reference within 8e-5 in `test_cuda_chain`). unsloth's sets with their start
-  profiles, two serves a side, a 4180-token prompt: UD-Q2_0 1231-1235 -> 1305-1310 tok/s, UD-IQ2_XS
-  1164-1179 -> 1244-1252; the shorter prompts and the decode the same.
+  from is not read, and six warps a block take eight tokens of Qwen3.8's 12 query heads a kv head
+  (`COLI_CUDA_ATTN_F2_WARPS=3`: three warps, four tokens). `COLI_CUDA_ATTN_SEL_TC=0` keeps
+  `cc_attn_gk`; the rows' bits are not those of `cc_attn_gk` (against the reference within 8e-5 in
+  `test_cuda_chain`). unsloth's sets with their start profiles, two serves a side, a 4180-token
+  prompt: UD-Q2_0 1231-1235 -> 1357-1364 tok/s, UD-IQ2_XS 1164-1179 -> 1271-1294; the shorter
+  prompts and the decode the same.
+- **CUDA chain: a long prompt's QSA scores in tiles.** `cc_qsa_score_k` gave each (row, block of
+  keys) a thread that read its block's 128 dims alone, 2 ms of a 2048-row chunk a layer.
+  `cc_qsa_score_t` takes 64 rows by 64 blocks a block of 256 threads, each thread 4 by 4, the
+  index queries and keys staged in shared memory; each score's sums are in the old order, so the
+  same bits and the same selections (`COLI_CUDA_QSA_TILES=0`: the old kernel). UD-Q2_0, a 4180-token
+  prompt 1357-1361 -> 1387-1392 tok/s, UD-IQ2_XS 1277-1294 -> 1315-1316; the answers the same.
 - **CUDA: a prompt chunk's f32 matrices of few outputs a row at a time.** Qwen3.8's gated
   residuals take four outputs of 10,240 inputs (`inject`), which ran on `quant_matmul`'s grid of a
   block an output and a row, each block reading the row again: 105 ms of a 4180-token prompt under

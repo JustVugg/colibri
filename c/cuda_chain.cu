@@ -50,7 +50,7 @@ struct CcCtx {
     int f2_big;  /* cc_attn_f2's head dim 256 (66 KiB of shared memory): 1 allowed, -1 refused, 0 not asked */
     int f2_big_h;   /* the same for its float16 cache's kernel */
     int f2_mid, f2_mid_h;   /* the same for head dim 256's blocks of 16 keys (49.5 KiB: a T4 gives 64) */
-    int f2_b3[2], f2_m3[2];   /* the same for its three-warp kernels (12 query heads a kv head), [float16 cache] */
+    int f2_b3[2], f2_m3[2], f2_b6[2];   /* the same for its three- and six-warp kernels (12 query heads a kv head), [float16 cache] */
     cudaStream_t stream;
     cudaEvent_t ev; int ev_ok, ev_pending;
     /* staging (cc_fetch): the copy stream, its copies' event and the buffer's last reader's */
@@ -913,8 +913,15 @@ static int cc_attn_f2_go(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcB
     if (!on || c->major * 10 + c->minor < 75 || (p->hd != 64 && p->hd != 128 && p->hd != 256) ||
         (p->q_off | p->q_row | p->q_seg | p->k_off | p->v_off) % 4) return 0;
     if (p->hd == 256 && 64 % G && 48 % G == 0 && sel) {   /* three warps: 48 rows, 48 / G tokens a block (a selection list's) */
-        dim3 f3((unsigned)((p->S + 48 / G - 1) / (48 / G)), (unsigned)p->KVH);
+        static int w6 = -1;   /* COLI_CUDA_ATTN_F2_WARPS=3: three warps a block */
+        if (w6 < 0) { const char *e = getenv("COLI_CUDA_ATTN_F2_WARPS"); w6 = !(e && atoi(e) == 3); }
         const int h = sizeof(KT) == 2;
+        if (w6 && 96 % G == 0) {   /* six: 96 rows, each block of keys read once for twice the tokens (Qwen3.8's prompt
+                                    * 2-3% faster than three on an RTX PRO 4000) */
+            dim3 f6((unsigned)((p->S + 96 / G - 1) / (96 / G)), (unsigned)p->KVH);
+            if (cc_f2_256<32, KT, 6>(c, c->f2_b6[h], f6, q, kc, vc, o, gate, p, G, win, sk, so, ring, sel)) return 1;
+        }
+        dim3 f3((unsigned)((p->S + 48 / G - 1) / (48 / G)), (unsigned)p->KVH);
         return cc_f2_256<32, KT, 3>(c, c->f2_b3[h], f3, q, kc, vc, o, gate, p, G, win, sk, so, ring, sel) ||
                cc_f2_256<16, KT, 3>(c, c->f2_m3[h], f3, q, kc, vc, o, gate, p, G, win, sk, so, ring, sel);
     }
@@ -1375,6 +1382,61 @@ __global__ static void __launch_bounds__(128) cc_qsa_score_k(const float *__rest
         if (a > 0.f) score += a;
     }
     sc[s * 2 * p.nbmax + b] = score / sqrtf((float)p.ID);
+}
+/* cc_qsa_score_k's scores for a prompt chunk's rows in tiles: 64 rows by 64 blocks of keys a block
+ * of 256 threads, each thread 4 rows by 4 blocks, the rows' index queries and the blocks' keys staged
+ * 32 dims at a time. Each score is cc_qsa_score_k's: a head's dot over d in order from 0, its
+ * positive part added head by head, so the same bits and the same selections. cc_qsa_score_k's
+ * thread a (row, block) read its block's 128 dims alone, a chunk of 2048 rows 2 ms a layer on an
+ * RTX PRO 4000. Grid: x = the rows' most blocks / 64, y = rows / 64. */
+#define CC_QST 64
+__global__ static void __launch_bounds__(256) cc_qsa_score_t(const float *__restrict__ src, const float *__restrict__ pk,
+                                                             float *__restrict__ sc, CcQsa p) {
+    COLI_PDL_WAIT();
+    __shared__ float qs[32][CC_QST + 1], ks[32][CC_QST + 1];   /* d by row, d by block */
+    const int tid = threadIdx.x, tr = tid >> 4, tb = tid & 15;   /* the thread's rows tr + 16 i, blocks tb + 16 j */
+    const int s0 = blockIdx.y * CC_QST, b0 = blockIdx.x * CC_QST;
+    float score[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) score[i][j] = 0.f;
+    for (int h = 0; h < p.IQ; h++) {
+        float a[4][4];
+        #pragma unroll
+        for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) a[i][j] = 0.f;
+        for (int d0 = 0; d0 < p.ID; d0 += 32) {
+            for (int e = tid; e < 32 * CC_QST; e += 256) {
+                const int r = e >> 5, d = e & 31, s = s0 + r, b = b0 + r, dd = d0 + d;
+                qs[d][r] = s < p.S && dd < p.ID ? src[p.q_off + s * p.q_row + h * p.ID + dd] : 0.f;
+                ks[d][r] = dd < p.ID ? pk[p.pk_off + (size_t)b * p.ID + dd] : 0.f;
+            }
+            __syncthreads();
+            const int dn = p.ID - d0 < 32 ? p.ID - d0 : 32;
+            for (int d = 0; d < dn; d++) {
+                float qv[4], kv[4];
+                #pragma unroll
+                for (int i = 0; i < 4; i++) { qv[i] = qs[d][tr + 16 * i]; kv[i] = ks[d][tb + 16 * i]; }
+                #pragma unroll
+                for (int i = 0; i < 4; i++)
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++) a[i][j] += qv[i] * kv[j];
+            }
+            __syncthreads();
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) if (a[i][j] > 0.f) score[i][j] += a[i][j];
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int s = s0 + tr + 16 * i;
+        if (s >= p.S) continue;
+        const int visible = p.pos_base + s + 1, blocks = visible / p.R, take = min(blocks, p.budget / p.R);
+        if (take >= blocks) continue;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const int b = b0 + tb + 16 * j;
+            if (b < blocks) sc[s * 2 * p.nbmax + b] = score[i][j] / sqrtf((float)p.ID);
+        }
+    }
 }
 /* chain_qsa.comp: mode 0 one block of 128 per block key; mode 1 one block per query row (its scores
  * cc_qsa_score_k's) */
@@ -2722,7 +2784,14 @@ static int cc_qsa(CcBuf *src, CcBuf *w, CcBuf *pk, CcBuf *cs, CcBuf *sc, CcBuf *
     } else if (p->mode == 1) {
         if (!sc || !sel || p->S < 1 || p->IQ < 1 || p->nbmax < 1 || p->sel_row < 1) return 0;
         const int mb = (p->pos_base + p->S) / p->R;   /* the last row's blocks, the most */
-        coli_launch(cc_qsa_score_k, dim3((unsigned)(((mb > 0 ? mb : 1) + 127) / 128), (unsigned)p->S), 128, 0, c->stream, fp(src), fp(pk), fpw(sc), *p);
+        int st = 1;   /* COLI_CUDA_QSA_TILES=0: a thread a (row, block) for every chunk (read each call) */
+        { const char *e = getenv("COLI_CUDA_QSA_TILES"); st = !(e && *e == '0'); }
+        /* the pooled keys the tiles read past the last row's blocks are the buffer's (nbmax of them) */
+        if (st && p->S >= 32 && mb > 0 && (size_t)((mb + CC_QST - 1) / CC_QST * CC_QST) * p->ID * 4 <= pk->bytes - (size_t)p->pk_off * 4)
+            coli_launch(cc_qsa_score_t, dim3((unsigned)((mb + CC_QST - 1) / CC_QST), (unsigned)((p->S + CC_QST - 1) / CC_QST)), 256, 0, c->stream,
+                        fp(src), fp(pk), fpw(sc), *p);
+        else
+            coli_launch(cc_qsa_score_k, dim3((unsigned)(((mb > 0 ? mb : 1) + 127) / 128), (unsigned)p->S), 128, 0, c->stream, fp(src), fp(pk), fpw(sc), *p);
         coli_launch(cc_qsa_k, (unsigned)p->S, 128, 0, c->stream, fp(src), nullptr, fpw(pk), nullptr, fpw(sc), (int *)sel->d, *p);
     } else return 0;
     return launched(c, "qsa");

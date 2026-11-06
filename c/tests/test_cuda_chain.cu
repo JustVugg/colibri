@@ -1246,6 +1246,25 @@ int main(void) {
             ck(ok && same && rsel3[0] == B3 + 2 && rsel3[sr3] == B3 + 3, "1100 blocks of tied scores: the take-th key's blocks by index, then the tail, as the CPU ranks them");
             T->free(pb3); T->free(qb3); T->free(sb3); T->free(lb3);
         }
+        {   /* a prompt chunk's 70 rows (cc_qsa_score_t, tiles of 64 rows by 64 blocks), Qwen3.8's index heads (4 of 128):
+             * the same selections as a thread a (row, block) (COLI_CUDA_QSA_TILES=0) and as the CPU ranks them */
+            const int ID4 = 128, IQ4 = 4, S4 = 70, PB4 = 2000, B4 = 512, nbm4 = 600, sr4 = 1 + B4 + R - 1, NB4 = (PB4 + S4) / R;
+            std::vector<float> pk4 = rnd((size_t)nbm4 * ID4, 96), iq4 = rnd((size_t)S4 * (IQ4 + 1) * ID4, 97);
+            for (int b = NB4; b < nbm4; b++) for (int d = 0; d < ID4; d++) pk4[(size_t)b * ID4 + d] = 0.f;
+            std::vector<float> rsc4((size_t)S4 * 2 * nbm4);
+            std::vector<int> rsel4((size_t)S4 * sr4), t4(rsel4.size()), k4(rsel4.size());
+            CcQsa p4 = {1, ID4, R, 0, 0, S4, PB4, B4, IQ4, 0, (IQ4 + 1) * ID4, nbm4, sr4, 1e-6f, 0, 0, 0, 0};
+            ref_qsa(iq4.data(), NULL, pk4.data(), NULL, rsc4.data(), rsel4.data(), &p4);
+            CcBuf *pb4 = up(pk4), *qb4 = up(iq4), *sb4 = T->buf(rsc4.size() * 4, CC_DEV), *lb4 = T->buf(rsel4.size() * 4, CC_DEV);
+            ok = T->begin() && T->qsa(qb4, NULL, pb4, NULL, sb4, lb4, &p4) && T->submit(1) && T->read(lb4, 0, t4.data(), t4.size() * 4);
+            setenv("COLI_CUDA_QSA_TILES", "0", 1);
+            ok = ok && T->begin() && T->qsa(qb4, NULL, pb4, NULL, sb4, lb4, &p4) && T->submit(1) && T->read(lb4, 0, k4.data(), k4.size() * 4);
+            unsetenv("COLI_CUDA_QSA_TILES");
+            ck(ok && !memcmp(t4.data(), k4.data(), t4.size() * 4), "70 rows' selections in tiles: those of a thread a (row, block), to the bit");
+            same = 1; for (size_t i = 0; i < t4.size(); i++) if (t4[i] != rsel4[i]) same = 0;
+            ck(ok && same, "and as the CPU ranks them");
+            T->free(pb4); T->free(qb4); T->free(sb4); T->free(lb4);
+        }
         T->free(ib); T->free(wb); T->free(cb); T->free(pb); T->free(qb); T->free(sb); T->free(lb);
     }
     printf("ple\n");
