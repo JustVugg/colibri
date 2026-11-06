@@ -44,6 +44,7 @@
 #define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
 #include "st.h"
 #include "ggml_view.h"
+#include "expert_store.h"
 #ifdef _OPENMP
 #include <omp.h>   /* omp_set_num_threads/omp_get_max_threads per omp_tune.h */
 #endif
@@ -1443,6 +1444,61 @@ static void expert_put(Slot *s) {
     pthread_mutex_unlock(&g_pilot_mx);
 }
 
+/* Borrowed ExpertStore facade: the Model owns the cache and outlives every
+ * facade and lease. Lookup/release use the cache's existing lock and busy count;
+ * PILOT policy, allocation and model teardown remain with OLMoE. */
+static ColiTensorView olmoe_expert_tensor(const Model *m, const void *data,
+                                        const float *scales, int type, int rows, int cols) {
+    ColiTensorView v = {.data=data, .rows=rows, .columns=cols};
+    if (m->gx) {
+        v.format = COLI_TENSOR_GGML;
+        v.block_columns = (uint32_t)type;   /* held type, including GQ_*_R16 */
+        v.data_bytes = (size_t)rows * (size_t)gq_row_bytes(type, cols);
+    } else {
+        v.format = COLI_TENSOR_Q8_ROW;
+        v.scale_format = COLI_SCALE_F32;
+        v.scales = scales;
+        v.data_bytes = (size_t)rows * (size_t)cols;
+        v.scale_bytes = (size_t)rows * sizeof(float);
+        v.block_rows = 1;
+        v.block_columns = (uint32_t)cols;
+    }
+    return v;
+}
+static int olmoe_store_lookup(ColiExpertStore *store, ColiExpertKey key, ColiExpertView *view) {
+    Model *m = store->state;
+    if (!view) return -1;
+    memset(view, 0, sizeof(*view));
+    if (!m || !m->cache || key.layer < 0 || key.layer >= m->c.n_layers ||
+        key.expert < 0 || key.expert >= m->c.n_experts) return -1;
+    Slot *s;
+    expert_get(m, key.layer, key.expert, &s);
+    view->key = key;
+    view->lease = s;
+    view->gate = olmoe_expert_tensor(m, s->g, s->gs, s->gt[0], m->c.inter, m->c.hidden);
+    view->up = olmoe_expert_tensor(m, s->u, s->us, s->gt[1], m->c.inter, m->c.hidden);
+    view->down = olmoe_expert_tensor(m, s->d, s->ds, s->gt[2], m->c.hidden, m->c.inter);
+    return 0;
+}
+static void olmoe_store_release(ColiExpertStore *store, ColiExpertView *view) {
+    (void)store;
+    if (view && view->lease) expert_put(view->lease);
+    if (view) memset(view, 0, sizeof(*view));
+}
+static ColiExpertStore olmoe_expert_store(Model *m) {
+    static const ColiExpertStoreOps ops = {
+        .lookup = olmoe_store_lookup, .release = olmoe_store_release,
+    };
+    return (ColiExpertStore){.ops=&ops, .state=m};
+}
+static void olmoe_expert_acquire(ColiExpertStore *store, int layer, int expert,
+                                ColiExpertView *view) {
+    if (coli_expert_lookup(store, (ColiExpertKey){layer, expert}, view)) {
+        fprintf(stderr, "olmoe: invalid expert key %d/%d\n", layer, expert);
+        exit(1);
+    }
+}
+
 /* The bytes the KV's pages reach once `positions` are written: K and V of
  * every layer hold n_heads rows of max_t * head_dim floats, each written from
  * its start, and a row's first B bytes touch at most B / 4096 + 2 pages. */
@@ -1721,39 +1777,35 @@ static int moe_fused3(int D, int I) {
  * scratch of I floats. */
 /* A GGUF expert on n rows (x[t] for t < n, contiguous when n > 1 through the caller's copy):
  * gate and up on one quantization of the rows, then down, on ggml_quants.h's kernels. */
-static void moe_expert_rows_gx(const Model *m, const Slot *e, const float *x, int n, float *g, float *u, float *hh) {
-    const int D = m->c.hidden, I = m->c.inter;
-    ColiTensorView vg = {.format = COLI_TENSOR_GGML, .data = e->g, .rows = I, .columns = D, .block_columns = (uint32_t)e->gt[0]};
-    ColiTensorView vu = vg, vd = vg;
-    vu.data = e->u; vu.block_columns = (uint32_t)e->gt[1];
-    vd.data = e->d; vd.rows = D; vd.columns = I; vd.block_columns = (uint32_t)e->gt[2];
-    if (coli_ggml_matmul2(g, &vg, u, &vu, x, n)) { fprintf(stderr, "olmoe: no kernel for a GGUF expert of type %s\n", gq_type_name(e->gt[0])); exit(1); }
+static void moe_expert_rows_gx(const Model *m, const ColiExpertView *e, const float *x, int n, float *g, float *u, float *hh) {
+    const int I = m->c.inter;
+    if (coli_ggml_matmul2(g, &e->gate, u, &e->up, x, n)) { fprintf(stderr, "olmoe: no kernel for a GGUF expert of type %s\n", gq_type_name((int)e->gate.block_columns)); exit(1); }
     for (int64_t i = 0; i < (int64_t)n * I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
-    if (coli_ggml_matmul(hh, &vd, g, n)) { fprintf(stderr, "olmoe: no kernel for a GGUF expert of type %s\n", gq_type_name(e->gt[2])); exit(1); }
+    if (coli_ggml_matmul(hh, &e->down, g, n)) { fprintf(stderr, "olmoe: no kernel for a GGUF expert of type %s\n", gq_type_name((int)e->down.block_columns)); exit(1); }
 }
-static void moe_expert_row(const Model *m, const Slot *e, const float *xs, float *g, float *u, float *hh) {
+static void moe_expert_row(const Model *m, const ColiExpertView *e, const float *xs, float *g, float *u, float *hh) {
     const Cfg *c = &m->c; int D = c->hidden, I = c->inter;
-    if (m->gx) { moe_expert_rows_gx(m, e, xs, 1, g, u, hh); return; }   /* the model's, not the slot's: a zeroed slot reads as F32 */
+    if (e->gate.format == COLI_TENSOR_GGML) { moe_expert_rows_gx(m, e, xs, 1, g, u, hh); return; }
 #if defined(__AVX2__)
     if (moe_fused3(D, I)) {
-        matmul_q_idot_pair_v3(g, u, xs, e->g, e->gs, e->u, e->us, D, I);   /* gate+up share one quant of xs */
+        matmul_q_idot_pair_v3(g, u, xs, e->gate.data, e->gate.scales, e->up.data, e->up.scales, D, I);   /* gate+up share one quant of xs */
         for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
-        matmul_q_idot_v3(hh, g, e->d, e->ds, I, D);                        /* down_proj [D,I] */
+        matmul_q_idot_v3(hh, g, e->down.data, e->down.scales, I, D);                        /* down_proj [D,I] */
     } else
 #endif
     {
-    matmul_q(g, xs, e->g, e->gs, D, I);     /* gate_proj [I,D] */
-    matmul_q(u, xs, e->u, e->us, D, I);     /* up_proj   [I,D] */
+    matmul_q(g, xs, e->gate.data, e->gate.scales, D, I);     /* gate_proj [I,D] */
+    matmul_q(u, xs, e->up.data, e->up.scales, D, I);     /* up_proj   [I,D] */
     for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
-    matmul_q(hh, g, e->d, e->ds, I, D);     /* down_proj [D,I] */
+    matmul_q(hh, g, e->down.data, e->down.scales, I, D);     /* down_proj [D,I] */
     }
 }
 /* moe_expert_row on n rows of one expert: hh[t] = expert(xs[t]), the same bits;
  * g[t], u[t] are scratch of I floats each. */
-static void moe_expert_rows(const Model *m, const Slot *e, const float *const *xs, int n,
+static void moe_expert_rows(const Model *m, const ColiExpertView *e, const float *const *xs, int n,
                             float *const *g, float *const *u, float *const *hh) {
     const Cfg *c = &m->c; int D = c->hidden, I = c->inter;
-    if (m->gx) {   /* a GGUF's: the rows gathered, one call each, then scattered */
+    if (e->gate.format == COLI_TENSOR_GGML) {   /* GGML rows gathered, then scattered */
         float *xb = calloc((size_t)n * (2 * D + 2 * I), sizeof(float));   /* zeroed: gcc cannot see the gather write every row */
         if (!xb) { fprintf(stderr, "OOM gathering an expert's rows\n"); exit(1); }
         float *hb = xb + (int64_t)n * D, *gb = hb + (int64_t)n * D, *ub = gb + (int64_t)n * I;
@@ -1769,13 +1821,13 @@ static void moe_expert_rows(const Model *m, const Slot *e, const float *const *x
         return;
     }
 #endif
-    matmul_q_rows(g, xs, n, e->g, e->gs, D, I);     /* gate_proj [I,D] */
-    matmul_q_rows(u, xs, n, e->u, e->us, D, I);     /* up_proj   [I,D] */
+    matmul_q_rows(g, xs, n, e->gate.data, e->gate.scales, D, I);     /* gate_proj [I,D] */
+    matmul_q_rows(u, xs, n, e->up.data, e->up.scales, D, I);     /* up_proj   [I,D] */
     for (int t = 0; t < n; t++) {
         float *gt = g[t]; const float *ut = u[t];
         for (int i = 0; i < I; i++) { float gv = gt[i]; gt[i] = (gv / (1.f + expf(-gv))) * ut[i]; }
     }
-    matmul_q_rows(hh, (const float *const *)g, n, e->d, e->ds, I, D);   /* down_proj [D,I] */
+    matmul_q_rows(hh, (const float *const *)g, n, e->down.data, e->down.scales, I, D);   /* down_proj [D,I] */
 }
 
 /* A prompt's MoE, expert by expert (S > 1). Per block of OLMOE_PREFILL_ROWS rows:
@@ -1789,6 +1841,7 @@ static void moe_expert_rows(const Model *m, const Slot *e, const float *const *x
 #define OLMOE_PREFILL_ROWS 128
 static void moe_by_expert(Model *m, int layer, const float *x, int S, float *logits, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
+    ColiExpertStore store = olmoe_expert_store(m);
     int B = S < OLMOE_PREFILL_ROWS ? S : OLMOE_PREFILL_ROWS, P = B * K;
     int *idx = malloc((size_t)P * sizeof(int)), *pair = malloc((size_t)P * sizeof(int));
     int *at = malloc(((size_t)E + 1) * sizeof(int));
@@ -1815,9 +1868,10 @@ static void moe_by_expert(Model *m, int layer, const float *x, int S, float *log
                 xs[t] = x + (int64_t)(s0 + i / K) * D;
                 hp[t] = ctb + (int64_t)i * D;
             }
-            Slot *sl; expert_get(m, layer, e, &sl);
-            moe_expert_rows(m, sl, xs, cnt, gp, up, hp);
-            expert_put(sl);
+            ColiExpertView view;
+            olmoe_expert_acquire(&store, layer, e, &view);
+            moe_expert_rows(m, &view, xs, cnt, gp, up, hp);
+            coli_expert_release(&store, &view);
             if (cnt > 1) { pthread_mutex_lock(&g_pilot_mx); m->hits += cnt - 1; pthread_mutex_unlock(&g_pilot_mx); }
         }
         for (int s = 0; s < rows; s++) {
@@ -1915,15 +1969,17 @@ static void moe_routed(Model *m, int layer, float *x, int S, float *logits, floa
         rt_trace_end();
         return;
     }
+    ColiExpertStore store = olmoe_expert_store(m);
     float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
     for (int s = 0; s < S; s++) {
         int idx[64]; float val[64];
         moe_route_row(m, layer, s, logits + (int64_t)s*E, idx, val);
         const float *xs = x + (int64_t)s*D;
         for (int kk = 0; kk < K; kk++) {
-            Slot *e; expert_get(m, layer, idx[kk], &e);
-            moe_expert_row(m, e, xs, g, u, hh);
-            expert_put(e);
+            ColiExpertView view;
+            olmoe_expert_acquire(&store, layer, idx[kk], &view);
+            moe_expert_row(m, &view, xs, g, u, hh);
+            coli_expert_release(&store, &view);
             float w = val[kk];
             float *os = out + (int64_t)s*D;
             for (int d = 0; d < D; d++) os[d] += w * hh[d];
