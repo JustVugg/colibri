@@ -95,6 +95,20 @@ class DeepseekV4CudaArchFlagsTest(unittest.TestCase):
                 os.utime(f, (aged, aged))
         return calls
 
+    def test_transitive_header_dependency_rebuilds(self):
+        self.assertEqual(self.build("CUDA=1", "CUDA_ARCH=sm_86"), 1)
+        self.assertIn("-MMD -MP -MF backend_cuda_dsv4.d", self.log.read_text())
+        # Simulate nvcc's depfile for a transitively included library header.
+        header = self.dir / "library_detail.cuh"
+        header.write_text("/* library implementation */\n")
+        (self.dir / "backend_cuda_dsv4.d").write_text(
+            OBJ + ": library_detail.cuh\nlibrary_detail.cuh:\n")
+        self.assertEqual(self.build("CUDA=1", "CUDA_ARCH=sm_86"), 1)
+        self.assertEqual(self.build("CUDA=1", "CUDA_ARCH=sm_86"), 0)
+        clean = self.make("deepseek-v4-clean")
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+        self.assertFalse((self.dir / "backend_cuda_dsv4.d").exists())
+
     def test_same_arch_does_not_rebuild(self):
         """The guard: a fix that always recompiles would pass the tests below."""
         self.assertEqual(self.build("CUDA=1", "CUDA_ARCH=sm_86"), 1)
