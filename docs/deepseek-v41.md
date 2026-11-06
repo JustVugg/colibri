@@ -604,8 +604,10 @@ What it showed on the 16 GiB card, a 2-turn run with a 2600-word prompt:
   `4E` bytes of scores plus `E/8` of mask instead of `8E`, and the chunk's quadratic cap
   (`v41c_forward_seg`) keeps the same 256 MiB pair budget for 1.94x the rows: at a
   20000-position prompt a chunk was 1677 rows and is 3253, and the row cost the chunk
-  sizing prints fell from 181 to 105 KiB on the tiny fixture (the real checkpoint at
-  E=3107: 1293 to 1281 KiB a row). Nothing selects differently: the picked blocks are
+  sizing prints fell from 181 to 105 KiB on the tiny fixture. On the released checkpoint,
+  where the mask was 4 bytes of every one of a row's E columns: 1303 -> 1298 KiB a row at
+  E=1300 (measured) and 1317 -> 1305 at E=3107 (the 1317 the audit prints; the mask's
+  12.1 KiB of it becomes 0.4). Nothing selects differently: the picked blocks are
   still kept whole, and the same bits come out (`tests/test_vk_chain.c`'s indexer case
   compares the mask column for column, through the single-row and the grid kernels).
 - **The per-layer drain is not what the chain waits for.** The audit's R4 asked for the
