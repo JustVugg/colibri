@@ -152,6 +152,8 @@ typedef struct {
     CcBuf *pool_stage;               /* a decode step's pooled experts copied here first (cc_moe_stage) */
     /* a prompt chunk's: a layer's pooled experts copied to dm_stage (cc_fetch) while the layers before it run */
     CcBuf *dm_stage, *dm_tabb; CcExpert *dm_hostb; CcFetch *dm_fr; int *dm_fro, *dm_frn, dm_stage_cap;
+    size_t *dm_iv;                       /* layer i's places in dm_stage: bytes [iv[4i], iv[4i+1]) and [iv[4i+2], iv[4i+3]) (q38cc_stage_table) */
+    unsigned long long dm_early, dm_early_bytes;   /* the copies started beside the layer before's experts (q38cc_stage_part) */
     size_t dm_stage_size;                /* dm_stage's bytes */
     unsigned long long dm_staged; double dm_stage_bytes;
     unsigned long long lm_forwards;            /* prompts run layer by layer */
@@ -1876,31 +1878,52 @@ static int q38cc_dm_begin(Q38CChain *ch, Model *m, int n) {
 /* A prompt chunk's table: each layer's pooled experts (up to dm_stage_cap) at their places in
  * dm_stage, and the copies that put them there (dm_fr, dm_fro[i] and dm_frn[i] a layer's, the
  * runs of the pool's places a layer has side by side merged) */
+/* COLI_CUDA_CHAIN_STAGE_RING=0: every staged layer's places from the staging's start, its copy after the
+ * layer before read its own */
+static int q38cc_ring_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_CHAIN_STAGE_RING"); on = !(e && *e == '0'); }
+    return on;
+}
 static int q38cc_stage_table(Q38CChain *ch, Model *m) {
     Cfg *c = &m->c; int L = c->layers, E = c->experts;
     size_t ne = (size_t)L * E;
     if (!ch->dm_hostb) {
         ch->dm_hostb = malloc(ne * sizeof(CcExpert)); ch->dm_fro = calloc(L, sizeof(int)); ch->dm_frn = calloc(L, sizeof(int));
-        ch->dm_fr = malloc(ne * sizeof(CcFetch));
-        if (!ch->dm_hostb || !ch->dm_fro || !ch->dm_frn || !ch->dm_fr) return 0;
+        ch->dm_fr = malloc(ne * sizeof(CcFetch)); ch->dm_iv = calloc((size_t)4 * L, sizeof(size_t));
+        if (!ch->dm_hostb || !ch->dm_fro || !ch->dm_frn || !ch->dm_fr || !ch->dm_iv) return 0;
     }
     if (!cc_reserve(&ch->dm_tabb, ne * sizeof(CcExpert), CC_DEV)) return 0;
     const char *base = (const char *)cc_dev_addr(ch->dm_stage);
     if (!base) return 0;
     int k = 0;
+    /* a ring: each layer's places after the last staged layer's, on from the start where the next
+     * would pass the end, never over its own first place; so the next layer's copy has the part of
+     * the staging this layer leaves to start in before this layer's experts are read
+     * (q38cc_stage_part). COLI_CUDA_CHAIN_STAGE_RING=0: every layer from the staging's start */
+    const size_t S = ch->dm_stage_size;
+    size_t pos = 0;
     for (int i = 0; i < L; i++) {
         int h = 0; int64_t gb = 0, db = 0;
         ch->dm_fro[i] = k;
         int typed = q38cc_pool_types(m, i, &gb, &db);
         const size_t st = q38cc_lstride(ch, i); const int cap = q38cc_stage_cap(ch, i);   /* places at the layer's size */
+        if (!q38cc_ring_on()) pos = 0;
+        size_t a0 = pos, end1 = 0, lim = S; int wrapped = 0;
         for (int e = 0; e < E; e++) {
             size_t j = (size_t)i * E + e;
             CcExpert *x = &ch->dm_hostb[j];
             *x = ch->dm_host[j];
             if (ch->dm_res[j] < 2 || h >= cap || !typed) continue;
+            if (pos + st > lim) {   /* past the end */
+                if (!h) a0 = pos = 0;                                                 /* the layer from the staging's start */
+                else if (!wrapped) { wrapped = 1; end1 = pos; pos = 0; lim = a0; }    /* on from the start, up to its first place */
+                if (pos + st > lim) continue;                                         /* no room: the rest are read where they are */
+            }
             int ps = ch->pool_of[j];
             const char *src = q38cc_pool_hptr(ch, ps);
-            size_t dst = (size_t)h * st, span = 2 * Q38CC_PAD(gb) + (size_t)db;
+            size_t dst = pos, span = 2 * Q38CC_PAD(gb) + (size_t)db;
+            pos += st;
             const char *g = base + dst;
             memset(x, 0, sizeof *x);
             x->g = g; x->u = g + Q38CC_PAD(gb); x->d = g + 2 * Q38CC_PAD(gb);
@@ -1910,6 +1933,9 @@ static int q38cc_stage_table(Q38CChain *ch, Model *m) {
             h++;
         }
         ch->dm_frn[i] = k - ch->dm_fro[i];
+        size_t *iv = ch->dm_iv + 4 * (size_t)i;
+        if (!h) { iv[0] = iv[1] = iv[2] = iv[3] = 0; continue; }
+        iv[0] = a0; iv[1] = wrapped ? end1 : pos; iv[2] = 0; iv[3] = wrapped ? pos : 0;
     }
     return cc_begin() && cc_write(ch->dm_tabb, 0, ch->dm_hostb, ne * sizeof(CcExpert)) && cc_submit(1);
 }
@@ -1922,6 +1948,44 @@ static int q38cc_stage_from(Q38CChain *ch, Model *m, int i) {
         return cc_fetch(ch->dm_stage, ch->dm_fr + ch->dm_fro[i], ch->dm_frn[i]);
     }
     return 1;
+}
+/* The first layer from i on that stages its experts, a part of its copy: part 1 the bytes clear of
+ * layer prev's places, which may start while prev's experts are read (the copy waits for the reads
+ * of the layer before prev, which are done), part 2 the rest, once cc_fetch_done marked prev's read;
+ * part 0 all of it after that (q38cc_stage_from). Layer prev is the last staged layer before it. */
+static int q38cc_stage_part(Q38CChain *ch, Model *m, int i, int prev, int part) {
+    for (; i < m->c.layers && ch->dm_frn[i] <= 0; i++) {}
+    if (i >= m->c.layers) return 1;
+    if (!part || prev < 0 || prev >= i || ch->dm_frn[prev] <= 0) return part == 1 ? 1 : q38cc_stage_from(ch, m, i);
+    const size_t *iv = ch->dm_iv + 4 * (size_t)prev;
+    CcFetch *out = malloc((size_t)5 * ch->dm_frn[i] * sizeof *out);
+    if (!out) return 0;
+    int n = 0;
+    for (int k = 0; k < ch->dm_frn[i]; k++) {
+        const CcFetch f = ch->dm_fr[ch->dm_fro[i] + k];
+        const size_t a = f.dst, b = f.dst + f.bytes;
+        size_t cut[6]; int nc = 0;
+        cut[nc++] = a;
+        for (int q = 0; q < 4; q++) if (iv[q] > a && iv[q] < b) cut[nc++] = iv[q];
+        cut[nc++] = b;
+        for (int x = 1; x < nc; x++) for (int y = x; y > 0 && cut[y - 1] > cut[y]; y--) { size_t t = cut[y]; cut[y] = cut[y - 1]; cut[y - 1] = t; }
+        for (int q = 0; q + 1 < nc; q++) {
+            const size_t x = cut[q], y = cut[q + 1];
+            if (y <= x) continue;
+            const int in = (x >= iv[0] && x < iv[1]) || (x >= iv[2] && x < iv[3]);
+            if ((part == 2) != in) continue;
+            out[n++] = (CcFetch){(const char *)f.src + (x - a), x, y - x};
+        }
+    }
+    if (part == 1) {
+        ch->dm_staged++;
+        for (int k = 0; k < ch->dm_frn[i]; k++) ch->dm_stage_bytes += (double)ch->dm_fr[ch->dm_fro[i] + k].bytes;
+        for (int k = 0; k < n; k++) ch->dm_early_bytes += out[k].bytes;
+        if (n) ch->dm_early++;
+    }
+    const int ok = cc_fetch(ch->dm_stage, out, n);
+    free(out);
+    return ok;
 }
 static void q38cc_dm_end(Q38CChain *ch) { if (ch->dm_held) { qt_chain_hold(0); ch->dm_held = 0; } }
 /* layer i's router, routing, shared expert and the device's experts; *v: the host's word
@@ -2904,6 +2968,9 @@ static int q38cc_moe_group(Q38CChain *ch, Model *m, Layer *l, int i, int c0, int
     if (ch->dm_fmt >= 100) qt_chain_layer_format(i, &mp.fmt, &mp.fmt_d);
     const int stg = ch->dm_frn[i] > 0;
     if (!q38cc_frame_begin(ch) || (stg && first && !cc_fetch_wait())) return 0;
+    /* the next staged layer's copy where it does not cover this layer's places, beside these experts */
+    const int early = stg && last && q38cc_ring_on();
+    if (early && !q38cc_stage_part(ch, m, i + 1, i, 1)) return 0;
     int r = cc_moe_cols(ch->dm_tabb, ch->mg_x, ch->mg_ids, ch->mg_w, ch->dm_hid, ch->mg_y, &mp, q38cc_group_cols(ch, m, G));
     if (r < 0) {   /* not taken: each chunk's rows as their own call, the same ops as q38cc_dm_layer_lm's */
         ch->mg_declined++;
@@ -2913,7 +2980,7 @@ static int q38cc_moe_group(Q38CChain *ch, Model *m, Layer *l, int i, int c0, int
             r = cc_moe(ch->dm_tabb, ch->mg_x, ch->mg_ids, ch->mg_w, ch->dm_hid, ch->mg_y, NULL, &q);
         }
     }
-    if (!r || (stg && last && !(cc_fetch_done() && q38cc_stage_from(ch, m, i + 1))) || !cc_submit(0)) return 0;
+    if (!r || (stg && last && !(cc_fetch_done() && q38cc_stage_part(ch, m, i + 1, i, early ? 2 : 0))) || !cc_submit(0)) return 0;
     ch->mg_groups++;
     return 1;
 }
@@ -3638,6 +3705,9 @@ static void q38cc_report(Model *m) {
     if (ch->lm_forwards)
         fprintf(stderr, "[chain] qwen38: %llu prompts layer by layer, each layer's host pool experts staged once "
                         "(COLI_CUDA_CHAIN_LAYERWISE=0: chunk by chunk)\n", ch->lm_forwards);
+    if (ch->dm_early)
+        fprintf(stderr, "[chain] qwen38: %llu prompt layer steps' copies started beside the layer before's experts (%.2f GB of them; "
+                        "COLI_CUDA_CHAIN_STAGE_RING=0: after them)\n", ch->dm_early, ch->dm_early_bytes / 1073741824.0);
     if (ch->mg_groups)
         fprintf(stderr, "[chain] qwen38: %llu prompt layer steps' routed experts in one call for %llu chunks (%llu of them chunk by chunk "
                         "after all; COLI_CUDA_CHAIN_MOE_GROUP=0: each chunk's)\n", ch->mg_groups, ch->mg_chunks, ch->mg_declined);

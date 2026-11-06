@@ -37,6 +37,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **Qwen3.8 on the CUDA chain: a long prompt's next layer copied while this layer's experts run.**
+  A long prompt run layer by layer copies each layer's experts that are off the card to a staging
+  on it, and every layer's places started at the staging's start, so the next layer's copy waited
+  until this layer's experts had read theirs: on a PCIe 4.0 x8 card the bus then ran alone for 321
+  ms of a 4180-token prompt. The places now run on as a ring, each layer's after the last one's, and
+  the part of the next layer's copy that falls outside this layer's places starts beside its
+  experts (11.2 of UD-Q2_0's 20.8 GB). `COLI_CUDA_CHAIN_STAGE_RING=0`: every layer from the
+  staging's start, after the layer before. unsloth's sets on an RTX PRO 4000, two serves a side, a
+  4180-token prompt: UD-Q2_0 1176-1179 -> 1222-1225 tok/s, UD-IQ2_XS 1066-1069 -> 1167-1168; the
+  answers the same, the shorter prompts the same.
 - **Qwen3.8 on the CUDA chain: a long prompt's streams read and written where they wait.** Run layer
   by layer, every chunk copied its rows' streams from the segment's (`hyper_all`) into the chain's
   own and back after each pass, 80 MiB a 2048-row chunk each way: 204 ms of a 4180-token prompt's
