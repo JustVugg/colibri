@@ -369,6 +369,9 @@ class Server:
             self.error(None, PARSE_ERROR, "parse error")
             return
         if isinstance(message, list):
+            if not message:
+                self.error(None, INVALID_REQUEST, "invalid request")
+                return
             for item in message:
                 self.handle(item)
             return

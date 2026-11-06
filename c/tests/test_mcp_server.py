@@ -115,6 +115,13 @@ class Protocol(unittest.TestCase):
         self.x.server.handle_line(json.dumps([request(1, "ping"), request(2, "ping")]))
         self.assertEqual({m["id"] for m in self.x.messages()}, {1, 2})
 
+    def test_empty_batch_is_an_invalid_request(self):
+        self.x.server.handle_line("[]")
+        self.assertEqual(self.x.messages(), [{
+            "jsonrpc": "2.0", "id": None,
+            "error": {"code": mcp_server.INVALID_REQUEST, "message": "invalid request"},
+        }])
+
     def test_tools_list(self):
         self.x.send(request(1, "tools/list"))
         tools = self.x.reply(1)["result"]["tools"]
