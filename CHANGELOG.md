@@ -37,6 +37,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **Qwen3.8 on the CUDA chain: a long prompt's streams read and written where they wait.** Run layer
+  by layer, every chunk copied its rows' streams from the segment's (`hyper_all`) into the chain's
+  own and back after each pass, 80 MiB a 2048-row chunk each way: 204 ms of a 4180-token prompt's
+  4.1 s under nsys with no kernel beside them. The hyper-connections' reads and writes and the PLE
+  now take the chunk's rows of the segment's streams in place. unsloth's sets on an RTX PRO 4000,
+  two serves a side, a 4180-token prompt: UD-Q2_0 1132-1137 -> 1178-1180 tok/s, UD-IQ2_XS
+  1041-1043 -> 1068-1073; the answers the same, the shorter prompts the same.
 - **Qwen3.8 on the CUDA chain: a long prompt's routed experts in one call a layer.** Run layer by
   layer, a prompt's chunks each ran a layer's routed experts on their own, and a chunk's tiles
   decode each expert's weights for its rows: a 4180-token prompt's chunks of 2048, 2048 and 84

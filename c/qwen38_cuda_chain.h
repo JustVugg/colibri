@@ -81,6 +81,9 @@ typedef struct {
     int dn_where, host_zero, snap_valid;
     CcBuf *hyper, *hn, *low, *mix, *mixed, *inj_a, *inj_m, *blk, *q, *k, *v, *ip, *ctx, *qsc, *sel;
     CcBuf *hyper_all;                          /* every row's streams through a prompt run layer by layer (q38cc_forward_lm) */
+    /* the streams the hyper-connections read and write (q38cc_gr_read, q38cc_gr_apply, q38cc_ple):
+     * hyper, or (hyp) a prompt chunk's rows of hyper_all from row hoff, in place */
+    CcBuf *hyp; int hoff;
     /* a group of a segment's chunks whose routed experts run in one call (q38cc_moe_group): their mixed
      * rows, injections, routes and weights, the experts' sums; the groups, their chunks, those that
      * went chunk by chunk after all */
@@ -929,12 +932,14 @@ static int q38cc_push_state(Q38CChain *ch, Model *m, int pos_base) {
 }
 
 /* ---- pieces ---------------------------------------------------------------------- */
+static CcBuf *q38cc_hb(const Q38CChain *ch) { return ch->hyp ? ch->hyp : ch->hyper; }
+static int q38cc_ho(const Q38CChain *ch, int W) { return ch->hyp ? ch->hoff * W : 0; }
 static int q38cc_gr_read(Q38CChain *ch, Model *m, GatedResidual *g, size_t norm_off, int n, CcBuf *inj) {
     Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, C = c->hc_count, R = c->hc_rank;
-    CcNorm np = {n * C, H, C, 0, W, H, 0, W, H, (int)norm_off, C, CC_NORM_ADD1, c->eps, 1.f};
+    CcNorm np = {n * C, H, C, q38cc_ho(ch, W), W, H, 0, W, H, (int)norm_off, C, CC_NORM_ADD1, c->eps, 1.f};
     CcEw lo = {CC_EW_HC_LOW, n * R, R, C, 0, 1, 0, 0, 0, 0, 0, (float)C};
     CcEw mx = {CC_EW_HC_MIX, n * H, H, C, 0, 1, 0, 0, 0, 0, 0, (float)C};
-    int ok = cc_norm(ch->hyper, ch->prm, ch->hn, &np) &&
+    int ok = cc_norm(q38cc_hb(ch), ch->prm, ch->hn, &np) &&
              cc_matmul(q38cc_t(ch, &g->down), ch->hn, 0, ch->low, 0, n) && cc_ew(ch->low, ch->low, NULL, NULL, NULL, &lo) &&
              cc_matmul(q38cc_t(ch, &g->up), ch->low, 0, ch->mix, 0, n) && cc_ew(ch->mixed, ch->mix, ch->hn, NULL, NULL, &mx);
     if (ok && inj) {
@@ -945,8 +950,8 @@ static int q38cc_gr_read(Q38CChain *ch, Model *m, GatedResidual *g, size_t norm_
 }
 static int q38cc_gr_apply(Q38CChain *ch, Model *m, CcBuf *inj, int n) {
     Cfg *c = &m->c;
-    CcEw ap = {CC_EW_HC_APPLY, n * c->hc_width, c->hidden, c->hc_count, 0, 1, 0, 0, 0, 0, 0, 1.f};
-    return cc_ew(ch->hyper, inj, ch->blk, NULL, NULL, &ap);
+    CcEw ap = {CC_EW_HC_APPLY, n * c->hc_width, c->hidden, c->hc_count, 0, 1, q38cc_ho(ch, c->hc_width), 0, 0, 0, 0, 1.f};
+    return cc_ew(q38cc_hb(ch), inj, ch->blk, NULL, NULL, &ap);
 }
 static int q38cc_attention(Q38CChain *ch, Model *m, Layer *l, int i, int n, int pb) {
     Cfg *c = &m->c;
@@ -1082,13 +1087,13 @@ static int q38cc_ple(Q38CChain *ch, Model *m, int n, int c0, int ns) {
     int ok = cc_write(ch->emb, 0, ch->host_emb, (size_t)n * E * 4) && cc_copy(ch->embd, 0, ch->emb, 0, (size_t)n * E) &&
              cc_matmul(q38cc_tb(ch, &l->ple_key), ch->embd, 0, ch->keys, 0, n) &&
              cc_matmul(q38cc_tb(ch, &l->ple_value), ch->embd, 0, ch->val, 0, n);
-    CcPle g = {0, n, c->hc_count, H, c->ple_convk, c->ngram_size, 0, 0, 0, -1, 0, c->eps, (int)ch->o_ple, 0, 0};
-    ok = ok && cc_ple(ch->keys, ch->hyper, ch->val, ch->prm, ch->gated, ch->normv, NULL, NULL, &g);
+    CcPle g = {0, n, c->hc_count, H, c->ple_convk, c->ngram_size, 0, q38cc_ho(ch, W), 0, -1, 0, c->eps, (int)ch->o_ple, 0, 0};
+    ok = ok && cc_ple(ch->keys, q38cc_hb(ch), ch->val, ch->prm, ch->gated, ch->normv, NULL, NULL, &g);
     if (ns <= 1) {
         int snap = ns ? ch->ple_slot[1 + c0] : ch->ple_slot[1];
-        CcPle cv = {1, n, c->hc_count, H, c->ple_convk, c->ngram_size, 0, 0, 0, ns ? 0 : -1,
+        CcPle cv = {1, n, c->hc_count, H, c->ple_convk, c->ngram_size, 0, q38cc_ho(ch, W), 0, ns ? 0 : -1,
                     (int)((size_t)snap * pc), c->eps, 0, (int)ch->o_pconv, (int)((size_t)ch->ple_slot[0] * pc)};
-        return ok && cc_ple(NULL, ch->hyper, NULL, NULL, ch->gated, ch->normv, ch->prm, ch->ple_ring, &cv);
+        return ok && cc_ple(NULL, q38cc_hb(ch), NULL, NULL, ch->gated, ch->normv, ch->prm, ch->ple_ring, &cv);
     }
     ok = ok && cc_reserve(&ch->gseg, (size_t)n * W * 4, CC_DEV) && cc_reserve(&ch->nseg, (size_t)n * W * 4, CC_DEV);
     for (int r = 0; r < ns && ok; r++) {
@@ -2884,13 +2889,13 @@ static int q38cc_moe_group_rows(Q38CChain *ch, Model *m, int c0, int end, int ro
  * next staged layer's started after (last), as q38cc_dm_layer_lm does around its chunk's. Where
  * moe_cols does not take the layer each chunk's call on the same rows, as before. 1 done, 0 failed */
 static int q38cc_moe_group(Q38CChain *ch, Model *m, Layer *l, int i, int c0, int g0, int G, int rows, int first, int last) {
-    Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, C = c->hc_count, E = c->experts, K = c->topk;
+    Cfg *c = &m->c; int H = c->hidden, C = c->hc_count, E = c->experts, K = c->topk;
     for (int r = 0; r < G; r += rows) {
         const int n = G - r < rows ? G - r : rows;
         CcRoute rp = {n, E, K, 0, 0, E, 0, 0, r * K, K, r * K, K, 1, 1, c->norm_topk ? 1 : 0, 1.f, 1.f, 0.f};
         if (!q38cc_frame_begin(ch)) return 0;
-        int ok = cc_copy(ch->hyper, 0, ch->hyper_all, (size_t)(c0 + r - g0) * W, (size_t)n * W) &&
-                 q38cc_gr_read(ch, m, &l->mlp_gr, ch->o_mn[i], n, ch->inj_m) &&
+        ch->hyp = ch->hyper_all; ch->hoff = c0 + r - g0;
+        int ok = q38cc_gr_read(ch, m, &l->mlp_gr, ch->o_mn[i], n, ch->inj_m) &&
                  cc_copy(ch->mg_x, (size_t)r * H, ch->mixed, 0, (size_t)n * H) && cc_copy(ch->mg_inj, (size_t)r * C, ch->inj_m, 0, (size_t)n * C) &&
                  cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->mg_ids, ch->mg_w, &rp);
         if (!ok || !cc_submit(0)) return 0;
@@ -2927,6 +2932,7 @@ static int q38cc_forward_lm(Model *m, Q38CChain *ch, const int *ids, int S, int 
                             float *hyper_h, int want_streams, float *logit, int rows) {
     Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, L = c->layers, E = c->experts, V = c->vocab, K = c->topk;
     int half = c->rotary_dim / 2;
+    ch->hyp = NULL; ch->hoff = 0;
     if (!q38cc_dm_begin(ch, m, rows)) return cc_lost() ? -1 : 0;
     if (q38cc_dm_tab(ch, rows) != ch->dm_tabb) return 0;   /* nothing stages: the chunks read it either way */
     for (int i = 0; i < L; i++) if (ch->dm_part[i]) return 0;   /* a hybrid layer: the chunks' host steps */
@@ -2957,12 +2963,12 @@ static int q38cc_forward_lm(Model *m, Q38CChain *ch, const int *ids, int S, int 
                 int n = g0 + gn - c0 < rows ? g0 + gn - c0 : rows, pb = pos_base + c0;
                 if (!q38cc_frame_begin(ch)) { free(cs_all); return -1; }
                 if (half) memcpy(cc_ptr(ch->cs), cs_all + (size_t)c0 * half * 2, (size_t)n * half * 2 * sizeof(float));
-                int ok = cc_copy(ch->hyper, 0, ch->hyper_all, (size_t)(c0 - g0) * W, (size_t)n * W);
+                ch->hyp = ch->hyper_all; ch->hoff = c0 - g0;   /* the chunk's streams where they wait, in place */
+                int ok = 1;
                 if (ok && i == c->ple_layer) { q38cc_ple_rows(m, ids, c0, n, ch->host_emb); ok = q38cc_ple(ch, m, n, c0, 0); }
                 ok = ok && q38cc_gr_read(ch, m, &l->attn_gr, ch->o_an[i], n, ch->inj_a);
                 ok = ok && (c->is_attn[i] ? q38cc_attention(ch, m, l, i, n, pb) : q38cc_deltanet(ch, m, l, i, n, c0, 0));
                 ok = ok && q38cc_gr_apply(ch, m, ch->inj_a, n);
-                ok = ok && cc_copy(ch->hyper_all, (size_t)(c0 - g0) * W, ch->hyper, 0, (size_t)n * W);
                 double t0 = now_s();
                 ok = ok && cc_submit(1);
                 m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0; ch->wait_ms += (now_s() - t0) * 1e3;
@@ -2978,13 +2984,13 @@ static int q38cc_forward_lm(Model *m, Q38CChain *ch, const int *ids, int S, int 
                     if (G > 0 && !q38cc_moe_group(ch, m, l, i, c0, g0, G, rows, c0 == g0, c0 + G >= g0 + gn)) { free(cs_all); return -1; }
                 }
                 if (!q38cc_frame_begin(ch)) { free(cs_all); return -1; }
-                int ok = cc_copy(ch->hyper, 0, ch->hyper_all, (size_t)(c0 - g0) * W, (size_t)n * W);
+                ch->hyp = ch->hyper_all; ch->hoff = c0 - g0;
+                int ok = 1;
                 if (c0 < ge) ok = ok && q38cc_moe_group_take(ch, m, l, i, c0 - gs, n);
                 else ok = ok && q38cc_gr_read(ch, m, &l->mlp_gr, ch->o_mn[i], n, ch->inj_m) &&
                           q38cc_dm_layer_lm(ch, m, l, i, n, c0 == g0, c0 + n >= g0 + gn);
                 ok = ok && q38cc_moe_apply(ch, m, n, ch->dm_y);
-                ok = ok && cc_copy(ch->hyper_all, (size_t)(c0 - g0) * W, ch->hyper, 0, (size_t)n * W);
-                if (ok && want_streams && i == L - 1) ok = cc_copy(ch->hypd, 0, ch->hyper, 0, (size_t)n * W);   /* q38cc_forward reserved it */
+                if (ok && want_streams && i == L - 1) ok = cc_copy(ch->hypd, 0, ch->hyper_all, (size_t)(c0 - g0) * W, (size_t)n * W);   /* q38cc_forward reserved it */
                 int lo0 = S - nlogits > c0 ? S - nlogits - c0 : 0, lo_n = n - lo0;
                 if (ok && i == L - 1 && lo0 < n && c0 + n > S - nlogits) {
                     int dst = c0 + lo0 - (S - nlogits);
@@ -3310,6 +3316,7 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
     if (S > rows && rows > Q38CC_DM_ROWS && E > 0 && ch->dm_on && q38cc_layer_major() && !mixed_h &&
         m->snap_rows <= 0) {
         int r = q38cc_forward_lm(m, ch, ids, S, pos_base, nlogits, hyper_h, want_streams, logit, rows);
+        ch->hyp = NULL; ch->hoff = 0;   /* the streams' ops back on hyper, however it ended */
         if (r < 0) goto lost;
         if (r == 2) { q38cc_dm_end(ch); return 0; }   /* stopped: not taken */
         if (r > 0) { q38cc_dm_end(ch); ch->snap_valid = 0; ch->forwards++; return 1; }
