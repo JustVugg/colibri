@@ -31,3 +31,9 @@ Dead ends, for the record: Debian's `nvidia-cuda-toolkit` hard-depends on Debian
 userland (version-clashes a `.run`/dkms driver — and its `nvidia-installer-cleanup`
 postinst will try to delete your hand-installed userland); pip's `nvidia-cuda-nvcc-cu12`
 wheel ships only `ptxas`, not the compiler frontend.
+
+The main Makefile enables `glibc_c23_math_compat.h` by default on Linux CUDA
+builds. If your toolchain already handles these declarations, omit only this
+forced include with `make -C c colibri CUDA=1 CUDA_GLIBC_MATH_COMPAT=0`.
+The switch preserves the other CUDA flags and triggers a rebuild when changed.
+It does not affect Windows or macOS builds.

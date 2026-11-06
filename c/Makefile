@@ -340,8 +340,11 @@ NVCCFLAGS ?= -O3 -std=$(NVCC_STD) -ftz=false $(CUDA_GENCODE) -Xcompiler=-Wall,-W
 # under C++17 (noexcept is part of the function type since C++17). Force-include
 # a compat header that strips __THROW from the host pass; see
 # glibc_c23_math_compat.h. MSVC never sees glibc headers, so Linux-only.
+CUDA_GLIBC_MATH_COMPAT ?= 1
 ifneq ($(LINUX),)
+ifeq ($(CUDA_GLIBC_MATH_COMPAT),1)
 NVCCFLAGS += -Xcompiler=-include,$(CURDIR)/glibc_c23_math_compat.h
+endif
 endif
 endif
 # CUDA 13.1 host_config.h accepts only Visual Studio 2019-2022 and refuses
@@ -898,7 +901,7 @@ glm: colibri$(EXE)
 # rewrite it ONLY when they change (evaluated here at parse time, so the file's
 # timestamp moves exactly when the config moves). The binary and CUDA/loader objects depend
 # on it, so they relink on a config change and stay put otherwise. (#306)
-BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)|XDNA=$(XDNA)
+BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|CUDA_GLIBC_MATH_COMPAT=$(CUDA_GLIBC_MATH_COMPAT)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)|XDNA=$(XDNA)
 BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
 ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
 # $(file ...) writes via make's own primitive (GNU Make >= 4.0, 2013), NOT by
