@@ -1188,6 +1188,21 @@ int main(void) {
         ref_qsa(iq.data(), NULL, rpk.data(), NULL, rsc.data(), rsel.data(), &p2);
         ok = T->begin() && T->qsa(qb, NULL, pb, NULL, sb, lb, &p2) && T->submit(1) && T->read(lb, 0, got.data(), got.size() * 4);
         ck(ok && got[0] == -1 && got[selrow] == -1 && got[2 * selrow] == -1, "few positions: every row attends to all of them (-1)");
+        {   /* 1100 blocks (Qwen3.8's 4400 positions, budget 2048): of 37 keys and some zero ones, so many
+             * scores tie, the take-th among them; the device's select against the CPU's ranking */
+            const int NB = 1100, S3 = 2, B3 = 2048, nbm3 = NB + 4, sr3 = 1 + B3 + R - 1;
+            std::vector<float> kk = rnd((size_t)37 * ID, 94), pk3((size_t)nbm3 * ID, 0.f);
+            for (int b = 0; b < NB; b++) if (b % 11) for (int d = 0; d < ID; d++) pk3[(size_t)b * ID + d] = kk[(size_t)(b % 37) * ID + d];
+            std::vector<float> iq3 = rnd((size_t)S3 * (IQ + 1) * ID, 95), sc3((size_t)S3 * 2 * nbm3), rsc3 = sc3;
+            std::vector<int> sel3((size_t)S3 * sr3), rsel3 = sel3, got3(sel3.size());
+            CcQsa p3 = {1, ID, R, 0, 0, S3, NB * R + 1, B3, IQ, 0, (IQ + 1) * ID, nbm3, sr3, 1e-6f, 0, 0, 0, 0};
+            ref_qsa(iq3.data(), NULL, pk3.data(), NULL, rsc3.data(), rsel3.data(), &p3);
+            CcBuf *pb3 = up(pk3), *qb3 = up(iq3), *sb3 = T->buf(sc3.size() * 4, CC_DEV), *lb3 = T->buf(sel3.size() * 4, CC_DEV);
+            ok = T->begin() && T->qsa(qb3, NULL, pb3, NULL, sb3, lb3, &p3) && T->submit(1) && T->read(lb3, 0, got3.data(), got3.size() * 4);
+            same = 1; for (size_t i = 0; i < got3.size(); i++) if (got3[i] != rsel3[i]) same = 0;
+            ck(ok && same && rsel3[0] == B3 + 2 && rsel3[sr3] == B3 + 3, "1100 blocks of tied scores: the take-th key's blocks by index, then the tail, as the CPU ranks them");
+            T->free(pb3); T->free(qb3); T->free(sb3); T->free(lb3);
+        }
         T->free(ib); T->free(wb); T->free(cb); T->free(pb); T->free(qb); T->free(sb); T->free(lb);
     }
     printf("ple\n");

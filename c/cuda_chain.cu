@@ -1248,6 +1248,25 @@ __global__ static void __launch_bounds__(128) cc_dnnorm_k(const float *__restric
     }
 }
 __device__ static float cc_sig(float x) { return 1.f / (1.f + expf(-x)); }
+/* a score's order as an unsigned key: a larger float, a larger key (equal floats, equal keys but
+ * for -0 and +0, and a selection's scores are sums of positive products: never -0) */
+__device__ static inline unsigned cc_qsa_key(float v) { unsigned u = __float_as_uint(v); return (u & 0x80000000u) ? ~u : (u | 0x80000000u); }
+/* x's exclusive prefix over a block of 128 threads in buf (128 ints), *tot their sum */
+__device__ static int cc_scan128(int x, int *buf, int *tot) {
+    const int tid = threadIdx.x;
+    buf[tid] = x;
+    __syncthreads();
+    for (int o = 1; o < 128; o <<= 1) {
+        const int v = tid >= o ? buf[tid - o] : 0;
+        __syncthreads();
+        buf[tid] += v;
+        __syncthreads();
+    }
+    const int incl = buf[tid];
+    *tot = buf[127];
+    __syncthreads();
+    return incl - x;
+}
 /* chain_qsa.comp: mode 0 one block of 128 per block key; mode 1 one block per query row */
 __global__ static void __launch_bounds__(128) cc_qsa_k(const float *__restrict__ src, const float *__restrict__ w,
         float *__restrict__ pk, const float *__restrict__ cs, float *__restrict__ sc, int *__restrict__ sel, CcQsa p) {
@@ -1310,25 +1329,54 @@ __global__ static void __launch_bounds__(128) cc_qsa_k(const float *__restrict__
     }
     __threadfence_block();
     __syncthreads();
-    for (int b = tid; b < blocks; b += 128) {
-        float v = sc[sb + b];
-        int rank = 0;
-        for (int b2 = 0; b2 < blocks; b2++) {
-            float v2 = sc[sb + b2];
-            if (v2 > v || (v2 == v && b2 < b)) rank++;
+    /* The blocks of rank < take (a higher score first, of equal ones the lower block), as the CPU
+     * ranks them. Each block counted its rank against every other and one thread wrote the list:
+     * O(blocks^2) on 128 threads, 298 us a call at 4400 positions (1100 blocks, Qwen3.8-Flash-Next
+     * on an RTX PRO 4000), 7 ms of a 31 ms decode step over its 13 QSA layers, and four times
+     * that a doubling of the context. Here the take-th score's key by a radix select over its
+     * four bytes, then, in the blocks' order, every block above it and of those equal to it the
+     * first by index, their positions written by prefix sums: the same list. */
+    __shared__ unsigned hist[256];
+    __shared__ unsigned s_pre;
+    __shared__ int s_rem, s_eq, s_out, sbuf[128];
+    unsigned pre = 0u, msk = 0u;
+    int rem = take;
+    for (int sh = 24; sh >= 0; sh -= 8) {
+        for (int i = tid; i < 256; i += 128) hist[i] = 0u;
+        __syncthreads();
+        for (int b = tid; b < blocks; b += 128) {
+            const unsigned k = cc_qsa_key(sc[sb + b]);
+            if ((k & msk) == pre) atomicAdd(&hist[(k >> sh) & 255u], 1u);
         }
-        sc[sb + p.nbmax + b] = rank < take ? 1.f : 0.f;
+        __syncthreads();
+        if (tid == 0) {   /* the byte where the count from the top reaches rem */
+            int acc = 0, d = 255;
+            for (; d > 0 && acc + (int)hist[d] < rem; d--) acc += (int)hist[d];
+            s_pre = pre | ((unsigned)d << sh); s_rem = rem - acc;
+        }
+        __syncthreads();
+        pre = s_pre; rem = s_rem; msk |= 255u << sh;
+        __syncthreads();
     }
-    __threadfence_block();
+    if (tid == 0) { s_eq = 0; s_out = 0; }   /* pre: the take-th key; rem: how many of that key to take */
     __syncthreads();
-    if (tid == 0) {
-        int n = 0;
-        for (int b = 0; b < blocks; b++)
-            if (sc[sb + p.nbmax + b] != 0.f)
-                for (int r = 0; r < p.R; r++) sel[lb + 1 + n++] = b * p.R + r;
-        for (int t = blocks * p.R; t < visible; t++) sel[lb + 1 + n++] = t;
-        sel[lb] = n;
+    for (int base = 0; base < blocks; base += 128) {
+        const int b = base + tid;
+        const unsigned k = b < blocks ? cc_qsa_key(sc[sb + b]) : 0u;
+        const int eq = b < blocks && k == pre;
+        int te, to;
+        const int eb = cc_scan128(eq, sbuf, &te);
+        const int tk = b < blocks && (k > pre || (eq && s_eq + eb < rem));
+        const int ob = cc_scan128(tk, sbuf, &to);
+        const int o0 = s_out;
+        if (tk) for (int r = 0; r < p.R; r++) sel[lb + 1 + o0 + ob * p.R + r] = b * p.R + r;
+        __syncthreads();
+        if (tid == 0) { s_eq += te; s_out += to * p.R; }
+        __syncthreads();
     }
+    const int n0 = s_out, t0 = blocks * p.R;
+    for (int t = t0 + tid; t < visible; t += 128) sel[lb + 1 + n0 + t - t0] = t;
+    if (tid == 0) sel[lb] = n0 + visible - t0;
 }
 /* chain_ple.comp: mode 0 one block of 256 per (row, stream); mode 1 one thread per channel */
 __device__ static void cc_ple_reduce2(float *r1, float *r2, int tid) {

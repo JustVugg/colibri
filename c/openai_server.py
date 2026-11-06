@@ -4786,6 +4786,24 @@ def resolve_generation_prompt(messages, body):
     return False
 
 
+CHAT_TEMPLATE_KWARGS = ("enable_thinking", "preserve_thinking", "reasoning_effort")
+
+
+def lift_chat_template_kwargs(body):
+    """A chat request's `chat_template_kwargs` (the template's own arguments, as several
+    OpenAI-compatible servers take them: {"enable_thinking": false} is how many clients turn a
+    Qwen model's thinking off) for the keys this gateway reads at the top of the body, where the
+    body does not set them itself. Before, they were ignored: a Qwen3.8 request that asked for no
+    thinking this way reasoned at xhigh. Their values go through the same checks there."""
+    kwargs = body.get("chat_template_kwargs")
+    if kwargs is None:
+        return body
+    if not isinstance(kwargs, dict):
+        raise APIError(400, "`chat_template_kwargs` must be an object.", "chat_template_kwargs")
+    lifted = {k: kwargs[k] for k in CHAT_TEMPLATE_KWARGS if k in kwargs and k not in body}
+    return dict(body, **lifted) if lifted else body
+
+
 def default_reasoning_effort():
     """The reasoning_effort of a chat request that names neither reasoning_effort nor
     enable_thinking: Qwen3.8's and Muse Spark's templates think at xhigh unless told,
@@ -9720,6 +9738,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 "total_tokens": prompt + completion}
 
     def chat_completion(self, body, request_id):
+        body = lift_chat_template_kwargs(body)
         strict_tools = body.get("strict_tool_calls", False)
         if not isinstance(strict_tools, bool):
             raise APIError(400, "`strict_tool_calls` must be a boolean.", "strict_tool_calls")

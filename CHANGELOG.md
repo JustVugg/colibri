@@ -37,6 +37,67 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **Qwen3.8 on the CUDA chain: a short prompt after a long one keeps its two lanes.** A chunk of 384
+  rows or more with the host pool on the CPU runs as two lanes, and the second lane's buffers came
+  from the rows the chain's reserve counted or, past them, where the card had their bytes and a GiB
+  besides. After a long prompt the chain's own buffers hold all 2048 rows of its reserve, and the
+  card had 1.1-1.4 GB free, so the second lane was refused, and the prompt, which had chosen the CPU
+  for its pooled experts on the lanes' account, ran in one lane with every pooled slot on the CPU.
+  The second lane now needs half a GiB besides its bytes (the tier's allowance keeps a GiB of the
+  card out of its own), and the choice of the CPU asks whether the lanes fit. unsloth's UD-Q2_0 on
+  an RTX PRO 4000, a 545-token prompt after a 4180-token one, two serves a side: 334-359 -> 582-593
+  tok/s (UD-IQ2_XS 337-361 -> 371-485, where the CPU's time a slot varied from serve to serve); the
+  decode the same.
+- **Qwen3.8 on the CUDA chain: a long prompt's layer in two passes.** Run layer by layer, a
+  layer's experts that are off the card are copied to the prompt's staging while the layers before
+  it run, but the copy could start only once the layer before had read its own, so it ran beside
+  the first chunk's attention alone. Each layer now runs every chunk's attention (or DeltaNet)
+  first and every chunk's experts after it, the same ops on the same values, so the copy runs beside
+  the whole first pass. UD-IQ2_XS on an RTX PRO 4000, two serves a side: a 4220-token prompt
+  737.8-744.8 -> 810.4 tok/s, the answer the same, the other prompts and the decode the same.
+- **Qwen3.8 on the CUDA chain: each expert at its own layer's size, on the card and in the host
+  pool.** unsloth's Dynamic V3.1 GGUFs mix expert types by layer (UD-IQ2_XS: five sizes from 1.26
+  to 2.09 MB), and the chain kept every expert in a slot of the largest, on the card and in the
+  page-locked pool. Qwen3.8 now asks the tier for slots of each layer's own size, as Qwen3.6
+  does, and the chain takes that arena over (`qt_chain_arena_exact`): its promotions draw within
+  the layer's size class and carve new slots from the arena's room before they evict anyone. The
+  host pool packs each layer's experts at their own size, and a prompt's staging counts its places
+  per layer. UD-IQ2_XS on an RTX PRO 4000, two serves a side: 6845 -> 8647 experts on the card,
+  the pool 49.8 -> 39.4 GiB, a 4220-token prompt 126 -> 370 tok/s, a 585-token one 190-210 ->
+  361-365, the decode after them 53-55 -> 60-61 and 62.7 -> 74.1-74.6 tok/s; Qwen3.8-Flash-Next
+  IQ2_XS (three sizes) 10807 -> 11328 experts and its decode the same or faster. With the chain
+  only: the tier on its own (`COLI_CUDA_CHAIN=0`) swaps an expert only for one of its size, and its
+  decode came 5-12% slower, so it keeps one size there unless `COLI_CUDA_EXACT_SLOTS=1`.
+  `COLI_CUDA_EXACT_SLOTS=0` and `COLI_CUDA_CHAIN_POOL_EXACT=0` restore the largest layer's slot.
+- **Qwen3.8 on the CUDA chain: a prompt's staging sized by the expert budget.** A long prompt's
+  layer copies its experts that are off the card into a staging buffer of 512 MiB, which held 246
+  to 411 of a UD-IQ2_XS layer's on a 24 GB card; the rest the kernels read over the bus at a third
+  of its rate. Where the tier sizes the expert budget it now gives the staging what the largest
+  layer's experts off the card would take, a fifth more, at most a sixteenth of the budget and
+  never under the 512 MiB (`qt_reserve_stage`; `COLI_CUDA_CHAIN_PROMPT_STAGE_MB` sets it by hand).
+  UD-IQ2_XS on an RTX PRO 4000 with the exact slots, a 4220-token prompt: 318-371 tok/s with 512
+  MiB, 719-729 with 800 (826 the rule's), 726-728 with 1100; the decode the same with 800 and 2-4
+  tok/s down with 1100.
+- **CUDA: a prompt's IQ2_XXS, IQ2_XS, IQ3_XXS, Q5_0 and Q5_1 routed experts on the mma.sync
+  tiles.** A layer whose gate or down type had no decoder in the f16 tiles fell back to hcg_tile's
+  for its prompt chunks. unsloth's Dynamic V3.1 Qwen3.8 files put IQ2_XXS or IQ2_XS gates on up to
+  36 of their 48 layers (UD-IQ1_S), IQ3_XXS gates on up to 38 (UD-Q3_K_XL) and Q5_0 downs on up to
+  33 (UD-IQ4_XS). UD-IQ1_M on an RTX PRO 4000: a 4220-token prompt 756-769 -> 837-839 tok/s.
+- **CUDA chain: a QSA row's selection by a radix select** (`cc_qsa_k`). Picking a query row's
+  blocks of positions counted each block's rank against every other on one block of 128 threads, then
+  one thread wrote the list: 298 us a call at 4400 positions on an RTX PRO 4000, 7 ms of a 31 ms
+  Qwen3.8 decode step, and four times that a doubling of the context. A radix select over the
+  scores' bytes and prefix sums give the same list. Qwen3.8-Flash-Next IQ2_XS, the decode after a
+  4180-token prompt: 58.3-60.8 -> 66.6-70.3 tok/s (unsloth's UD-IQ2_XS 58.4-59.0 -> 61.4-61.5).
+- **CPU: Q2_0, IQ4_NL, Q5_0 and Q5_1 matrices eight rows at a time** (`gq_rows_f8`, ggml_quants.h).
+  The kernels that take a GGUF matrix's file rows by eight, each block decoded once for four
+  activation rows, had none of the four, and those went row by row. They are the down matrices of
+  every unsloth Dynamic V3.1 Qwen3.8 file (Q5_1 UD-Q4_K_XL's, Q5_0 most of UD-IQ4_XS's), where the
+  CPU computes the experts the card does not hold. One core of an i7-1355U (AVX-VNNI), 512 x 2048
+  rows in cache, one activation row: Q2_0 4.8 -> 7.1 GB/s, IQ4_NL 13.8 -> 23.6, Q5_0 13.9 -> 19.5,
+  Q5_1 10.2 -> 18.0. The same bits as the scalar reference and the R16 kernels (`test_rows_f8`, with
+  and without VNNI). UD-Q2_0 on an RTX PRO 4000 and an i5-13500: a 545-token prompt 588 -> 640-648
+  tok/s.
 - **Qwen3.8: a long prompt layer by layer with the MTP head too** (CUDA and Vulkan chains). A prompt of
   several chunks runs layer by layer, each layer's host pool experts staged once for all its chunks, but
   not when the caller wanted the rows' final streams back, and the MTP head's prefill always does: with
@@ -174,6 +235,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **`chat_template_kwargs` reaches the chat template** (`coli serve`). Many OpenAI-compatible
+  clients turn a Qwen model's thinking off with `"chat_template_kwargs": {"enable_thinking":
+  false}`, and the gateway ignored the field: a Qwen3.8 request that asked for no thinking this
+  way reasoned at xhigh, its prompt 40 tokens longer. `enable_thinking`, `preserve_thinking` and
+  `reasoning_effort` there now count as they do at the top of the request, where the request
+  does not set them itself, with the same checks; a `chat_template_kwargs` that is not an object
+  gets a 400.
 - **CUDA: unsloth's Dynamic GGUFs with Q5_0 or Q5_1 experts kept every expert on the CPU.**
   The tier's integer step had neither type, and one such tensor left the whole tier off:
   Qwen3.8-Flash-Next UD-IQ2_XS has one Q5_0 down, UD-Q2_K_XL one, UD-Q3_K_XL 20, UD-IQ4_XS 33,
