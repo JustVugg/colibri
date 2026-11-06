@@ -3912,6 +3912,10 @@ int coli_v4_compressor_view(ColiDeepSeekV4CompressorState *state,
 #ifdef COLI_V4_UNIT_INDEXER
 /* ######## deepseek_v4_indexer.c ######## */
 #include "deepseek_v4_internal.h"
+#include "v4_topk.h"
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include <math.h>
 #include <stdarg.h>
@@ -4100,6 +4104,20 @@ static int indexer_identity_wanted(void) {
     return wanted;
 }
 
+/* V4_IDX_FAST (default 0, opt-in): the selection's top-k runs v4_topk_desc (exact
+ * radix sort, same indices in the same order as the qsort, which stays for NaN rows),
+ * in parallel across the scored tokens of a chunk, and a decode step prepares its
+ * query heads in parallel. 1 = on; 0 = the sequential qsort path. CPU only: the
+ * GPU scoring and projection paths are untouched. */
+static int indexer_fast_wanted(void) {
+    static int wanted = -1;
+    if (wanted < 0) {
+        const char *env = getenv("V4_IDX_FAST");
+        wanted = env && *env == '1';
+    }
+    return wanted;
+}
+
 /* Advance the indexer's compressor by one position (no scoring). Returns the
  * candidate count visible to this position, or -1. */
 static int indexer_advance(ColiDeepSeekV4Indexer *state, const float *input,
@@ -4147,23 +4165,40 @@ int coli_v4_indexer_advance(ColiDeepSeekV4Indexer *state, const float *input,
 /* Prepare one token's scoring queries in place: bf16 round, RoPE, per-head
  * hadamard + fp4 round trip. queries holds heads*dimension floats fresh from
  * the wq_b projection. */
+/* One head's share of the prep: hadamard + fp4 round trip, in place. Heads are
+ * independent, so the decode path runs them on the team (V4_IDX_FAST). */
+static int indexer_prepare_query_head(float *query, uint8_t *scales, float *qdq,
+                                      int dimension) {
+    int result = coli_hadamard_bf16_ref(query, (size_t)dimension);
+    if (!result) result = coli_fp4_activation_qdq_ref(
+        qdq, scales, query, (size_t)dimension, 32);
+    if (!result) {
+        memcpy(query, qdq, (size_t)dimension * sizeof(*query));
+        coli_bf16_round_array(query, (size_t)dimension);
+    }
+    return result;
+}
+
 static int indexer_prepare_queries(float *queries, uint8_t *scales, float *qdq,
                                    const ColiDeepSeekV4Config *config,
                                    int position) {
     int dimension = config->index_head_dim, heads = config->index_n_heads;
     coli_bf16_round_array(queries, (size_t)heads * dimension);
     int result = apply_position_rope(queries, config, position);
-    for (int head = 0; !result && head < heads; head++) {
-        float *query = queries + (size_t)head * dimension;
-        result = coli_hadamard_bf16_ref(query, (size_t)dimension);
-        if (!result) result = coli_fp4_activation_qdq_ref(
-            qdq, scales, query, (size_t)dimension, 32);
-        if (!result) {
-            memcpy(query, qdq, (size_t)dimension * sizeof(*query));
-            coli_bf16_round_array(query, (size_t)dimension);
-        }
-    }
+    for (int head = 0; !result && head < heads; head++)
+        result = indexer_prepare_query_head(
+            queries + (size_t)head * dimension, scales, qdq, dimension);
     return result;
+}
+
+/* One head's weight: a sequential sum over the hidden columns. The serial loop
+ * and the decode path's head-parallel loop both call it (same order, same bits). */
+static float indexer_head_weight(const uint16_t *row, const float *input,
+                                 int hidden, float weight_scale) {
+    float sum = 0.0f;
+    for (int column = 0; column < hidden; column++)
+        sum += coli_bf16_decode(row[column]) * input[column];
+    return sum * weight_scale;
 }
 
 static void indexer_head_weights(float *head_weights, const uint16_t *raw,
@@ -4171,13 +4206,10 @@ static void indexer_head_weights(float *head_weights, const uint16_t *raw,
                                  const ColiDeepSeekV4Config *config) {
     int heads = config->index_n_heads, dimension = config->index_head_dim;
     float weight_scale = 1.0f / sqrtf((float)(dimension * heads));
-    for (int head = 0; head < heads; head++) {
-        float sum = 0.0f;
-        const uint16_t *row = raw + (size_t)head * config->hidden_size;
-        for (int column = 0; column < config->hidden_size; column++)
-            sum += coli_bf16_decode(row[column]) * input[column];
-        head_weights[head] = sum * weight_scale;
-    }
+    for (int head = 0; head < heads; head++)
+        head_weights[head] = indexer_head_weight(
+            raw + (size_t)head * config->hidden_size, input,
+            config->hidden_size, weight_scale);
 }
 
 static float indexer_score_one(const float *q, const float *key,
@@ -4256,7 +4288,15 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     size_t sz_scounts = ALIGN32((size_t)need * sizeof(int));
     size_t sz_stoken = ALIGN32((size_t)need * sizeof(int));
     size_t sz_scores = ALIGN32((size_t)need * max_count * sizeof(float));
-    size_t sz_ranked = ALIGN32((size_t)max_count * sizeof(IndexScore));
+    /* One sort workspace per thread: v4_topk_desc needs 2*max_count uint64 keys;
+     * the qsort fallback (NaN rows, V4_IDX_FAST=0) uses max_count IndexScore. */
+    int sort_threads = 1;
+#ifdef _OPENMP
+    if (need > 1 && indexer_fast_wanted()) sort_threads = omp_get_max_threads();
+    if (sort_threads < 1) sort_threads = 1;
+#endif
+    size_t sort_stride = (size_t)max_count * 2 * sizeof(uint64_t);
+    size_t sz_ranked = ALIGN32((size_t)sort_threads * sort_stride);
 #ifdef COLI_V4_GPU_TIER
     size_t sz_xq = (need <= 1024) ? ALIGN32((size_t)need * cols * sizeof(float)) : 0;
     size_t sz_yq = (need <= 1024) ? ALIGN32((size_t)need * qn * sizeof(float)) : 0;
@@ -4282,6 +4322,7 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     int *scounts = (int *)scratch_ptr; scratch_ptr += sz_scounts;
     int *stoken = (int *)scratch_ptr; scratch_ptr += sz_stoken;
     float *scores = (float *)scratch_ptr; scratch_ptr += sz_scores;
+    char *sort_work = scratch_ptr;
     IndexScore *ranked = (IndexScore *)scratch_ptr; scratch_ptr += sz_ranked;
     int result = 0;
 
@@ -4399,7 +4440,38 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
         stoken[s] = t;
         s++;
     }
-    if (!result) {
+    if (!result && need == 1 && indexer_fast_wanted()) {
+        /* A decode step scores one token: its per-head work (hadamard + fp4 per
+         * head, one weight sum per head) ran on one thread. RoPE stays on this
+         * thread, the heads go to the team; each head keeps its own order. */
+        int t = stoken[0];
+        float *q = queries + (size_t)t * qn;
+        const float *input = inputs + (size_t)t * config->hidden_size;
+        int hidden = config->hidden_size;
+        float weight_scale = 1.0f / sqrtf((float)(dimension * heads));
+        coli_bf16_round_array(q, qn);
+        if (dimension > 512 || apply_position_rope(q, config, start_position + t))
+            result = set_error(error, error_size, "indexer query prep failed");
+        int head_failed = 0;
+        if (!result) {
+            #pragma omp parallel for schedule(static)
+            for (int head = 0; head < heads; head++) {
+                float tqdq[512];
+                uint8_t tscales[16];
+                if (indexer_prepare_query_head(q + (size_t)head * dimension,
+                                               tscales, tqdq, dimension)) {
+                    #pragma omp atomic write
+                    head_failed = 1;
+                }
+                head_weights[head] = indexer_head_weight(
+                    raw_weights + (size_t)head * hidden, input, hidden,
+                    weight_scale);
+            }
+            if (head_failed)
+                result = set_error(error, error_size, "indexer query prep failed");
+        }
+        if (!result) memcpy(sq, q, qn * sizeof(*sq));
+    } else if (!result) {
         int prep_failed = 0;
         #pragma omp parallel for schedule(dynamic, 1)
         for (int i = 0; i < need; i++) {
@@ -4456,7 +4528,33 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
         fprintf(stderr, "idxverify layer=%d start=%d scored=%d mismatches=%lld max=%g\n",
                 state->layer, start_position, need, bad, worst);
     }
-    for (int i = 0; !result && i < need; i++) {
+    if (!result && indexer_fast_wanted()) {
+        /* v4_topk_desc: exact radix top-k, indices and order equal to the qsort
+         * below; a NaN row (refused with -1) takes the qsort. */
+        int limit = topk < index_capacity ? topk : index_capacity;
+        #pragma omp parallel for schedule(dynamic, 1) num_threads(sort_threads) if (sort_threads > 1)
+        for (int i = 0; i < need; i++) {
+            int thread = 0;
+#ifdef _OPENMP
+            thread = omp_get_thread_num();
+#endif
+            char *work = sort_work + (size_t)thread * sort_stride;
+            int t = stoken[i];
+            const float *row = scores + (size_t)i * max_count;
+            int *out = indices + (size_t)t * index_capacity;
+            int n = v4_topk_desc(out, row, scounts[i], limit, (uint64_t *)work);
+            if (n < 0) {
+                IndexScore *own = (IndexScore *)work;
+                for (int candidate = 0; candidate < scounts[i]; candidate++)
+                    own[candidate] = (IndexScore){row[candidate], candidate};
+                qsort(own, (size_t)scounts[i], sizeof(*own), descending_score);
+                n = scounts[i] < limit ? scounts[i] : limit;
+                for (int k = 0; k < n; k++) out[k] = own[k].index;
+            }
+            selected[t] = n;
+        }
+    }
+    for (int i = 0; !result && !indexer_fast_wanted() && i < need; i++) {
         int t = stoken[i];
         const float *row = scores + (size_t)i * max_count;
         for (int candidate = 0; candidate < scounts[i]; candidate++)

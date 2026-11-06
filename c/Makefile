@@ -3158,6 +3158,10 @@ tests/test_k3_fill_budget$(EXE): tests/test_k3_fill_budget.c
 tests/test_v4_bank_pair$(EXE): tests/test_v4_bank_pair.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# v4_topk_desc (indexer top-k, V4_IDX_FAST) against the qsort ranking. Pure CPU.
+tests/test_v4_topk$(EXE): tests/test_v4_topk.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_ram_clamp$(EXE): tests/test_ram_clamp.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
