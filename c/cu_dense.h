@@ -42,6 +42,7 @@ typedef struct {
     pthread_t thread;
 } CuDense;
 static CuDense g_cud;
+#define CUD_ROWS 512   /* a call's rows at most (cud_mm) */
 
 /* the bytes a matrix takes on the device, 0 for a format it does not take */
 static size_t cud_bytes(int fmt, int O, int I, int gs) {
@@ -98,6 +99,15 @@ static int cud_mm(void **h, int *no, float *y, const float *x, int S, int fmt, c
 #endif
     const int held = fmt >= 100 && gq_r16_base(fmt - 100) >= 0 ? fmt : 0;   /* 16 rows interleaved */
     if (held) fmt = 100 + gq_r16_base(fmt - 100);
+    /* A prompt's rows CUD_ROWS at a time: the backend's scratch holds a call's x and y, and
+     * a 4104-token prompt's whole wq_b output (32768 floats a row) was 538 MB of the card's
+     * memory the expert tier holds, refused, and the matrix the CPU's for good. */
+    if (S > CUD_ROWS) {
+        for (int r0 = 0; r0 < S; r0 += CUD_ROWS)   /* a part refused: the CPU computes every row */
+            if (!cud_mm(h, no, y + (size_t)r0 * O, x + (size_t)r0 * I, S - r0 < CUD_ROWS ? S - r0 : CUD_ROWS, held ? held : fmt,
+                        w, s, O, I, gs)) return 0;
+        return 1;
+    }
     if (!*h) {
         const size_t b = cud_bytes(fmt, O, I, gs);
         const int room = b && g_cud.used + b <= g_cud.budget;

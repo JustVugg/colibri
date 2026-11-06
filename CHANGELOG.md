@@ -37,6 +37,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **The CUDA expert tier streams a prompt's cold experts, and the CUDA dense matrices take a
+  prompt 512 rows a call.** The CUDA tier (`cu_xb.cu`) declined the Vulkan tier's streaming, so
+  a long prompt's cold experts ran on the CPU 32 rows at a time and came from the disk again for
+  each block: a 4104-token prompt of DeepSeek V4.1-Flash UD-IQ1_S read 333 GB of experts. Its
+  sub-batches now run on two halves with their own streams, the host pool's experts copied into
+  the streaming slots ahead of each, an expert's rows from 16 on the dense matrices' f16 tiles
+  (`coli_cuda_bd_gemm_raw`) and the GEMV below (`COLI_CUDA_TIER_STREAM=0`: none). The dense
+  matrices (`cu_dense.h`) took a prompt's rows in one call, whose scratch (538 MB for wq_b's
+  output at 4104 rows) the card did not have: 51 matrices stayed on the CPU. unsloth's UD-IQ1_S
+  on an RTX PRO 4000: 21 GB of experts read, none left to the CPU, the 4104-token prompt
+  5.75 -> 7.42-7.57 tok/s, the 523-token prompt 23.2 tok/s, the decode 5.97-6.03 tok/s.
 - **CUDA chain: a hyper-connection read's up projection and mix in one pass.** Qwen3.8's gated
   residuals read the four streams through a low-rank mix: the up projection's products (four times
   the hidden size a row, 84 MB a 2048-row chunk) went to memory and the mix read them back with the
