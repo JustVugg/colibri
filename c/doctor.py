@@ -884,9 +884,9 @@ def run_image_doctor(model, engine_path, available_memory=None):
     checks.append(_check("engine.binary", "pass" if engine_ok else "fail",
                          "engine executable is ready" if engine_ok else "engine is not built",
                          path=str(engine)))
-    available_memory = memory_available() if available_memory is None else available_memory
     plan = None
     try:
+        available_memory = memory_available() if available_memory is None else available_memory
         plan = plan_image_model(model, available_memory or None)
         on_demand = plan["modes"]["text_encoder_on_demand"]
         resident = plan["modes"]["resident"]
@@ -903,6 +903,8 @@ def run_image_doctor(model, engine_path, available_memory=None):
                              on_demand_peak_bytes=on_demand["peak_bytes"]))
         for warning in plan["warnings"]:
             checks.append(_check("model.weights", "warn", warning))
+    except CgroupError as error:
+        checks.append(_check("memory.ram", "fail", str(error)))
     except (OSError, ValueError, KeyError) as error:
         checks.append(_check("model.weights", "fail", str(error)))
     statuses = {item["status"] for item in checks}
@@ -967,6 +969,8 @@ def run_decision_doctor(model, engine_path, available_memory=None):
             status, summary = "fail", f"{needed / 1e9:.1f} GB of f32 weights do not fit in RAM"
         checks.append(_check("memory.ram", status, summary, available_bytes=available_memory,
                              weight_bytes=needed, params=params))
+    except CgroupError as error:
+        checks.append(_check("memory.ram", "fail", str(error)))
     except (OSError, ValueError, struct.error) as error:
         checks.append(_check("model.weights", "fail", f"model.safetensors: {error}"))
     statuses = {item["status"] for item in checks}
