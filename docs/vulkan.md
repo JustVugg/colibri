@@ -3474,6 +3474,18 @@ Lavapipe has one type for everything); the staging type is host-visible and cohe
 not device-local where one exists, so staging never takes the window. Vendor types
 (AMD's uncached and device-coherent ones) are passed over.
 
+**`COLI_VK_STAGED=0` on such a card.** The resident data then lives in the window, and
+nothing past it spills: a discrete card refuses the block (only an integrated GPU's
+allocations are retried in another type). The window is the device's memory from then on
+(`vk_mem_window`): the books count that heap's types against it as a
+`COLI_VK_DEVICE_CAP_MB` cap would, the pools' blocks fit in it, the engines plan with the
+free bytes it leaves, and what does not fit stays on the CPU. A line on each device says
+so. Before, every planner read the whole card and nothing reached it, while the warm start
+counted the tier's experts as placed: on an RTX PRO 4000 (246 of 24467 MiB host-visible),
+Qwen3.6 Q4_K_M read 5048 experts from the disk in its first turn and answered at 12.9
+tok/s; now it plans with the 246 MiB, keeps its reserves, runs on the CPU and answers at
+13.1, as with `COLI_VULKAN=0` (13.1). Left unset, the same card stages and answers at 90.
+
 **A window smaller than the card.** A card whose host-visible device-local type is as big as its
 heap can still be given less of it. On a Colab A100 80 GB (NVIDIA's 580 driver) the engine's device is
 given 39.75 GiB of it, mapped or not, and then a block is refused with `VK_ERROR_OUT_OF_DEVICE_MEMORY`,

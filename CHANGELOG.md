@@ -420,6 +420,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Vulkan: `COLI_VK_STAGED=0` on a card without Resizable BAR planned with the whole card.**
+  The resident data stays in the host-visible window there (246 of 24467 MiB on an RTX PRO
+  4000), and nothing past it spills. The dense chain placed 40 of 40 layers and had its first
+  upload refused, the expert tier warmed 10240 experts into a budget of 22.6 GiB and held
+  none, and the pools' 256 MiB blocks did not fit, so no tensor reached either device, while
+  the CPU read the experts the warm start had counted as placed from the disk: Qwen3.6 Q4_K_M
+  answered at 12.9 tok/s. The window is now the device's memory for the engines and the pools,
+  what does not fit stays on the CPU, and the answer comes at 13.1, the CPU's own speed. Left
+  unset, the card stages its uploads as before (90 tok/s).
 - **DeepSeek V4.1: a long prompt's answer could start with `<｜begin▁of▁sentence｜>`.** Past
   layer 20, the first with compress ratio 1, a prompt of 2478 tokens or more runs the later
   layers on its last 2414 rows (`v41_prefill_tail`). Layers 21 to 23 run no indexer: they read
