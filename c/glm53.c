@@ -784,6 +784,16 @@ typedef struct {
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
 static void glm53_vk_report(const GModel *m, const char *scope);   /* the tier's lines of a run or turn */
 #endif
+#ifdef COLI_CUDA
+/* the CUDA chain (glm53_cuchain.h): the session's KDA state between the host and the device */
+static void g53u_sync_host(const GModel *m, const GSession *s);
+static void g53u_host_wrote(const GSession *s);
+static void g53u_session_gone(const GSession *s);
+static int g53u_prefill_rows(GModel *m);
+static void g53u_report(void);
+static size_t g53u_plan_bytes(const GModel *m, int ctx);
+static int g53u_wanted(const GModel *m);
+#endif
 #ifdef COLI_VULKAN
 /* the dense chain (glm53_chain.h): the session's KDA state between the host and the device */
 static void g53c_sync_host(const GModel *m, const GSession *s);
@@ -3871,6 +3881,9 @@ static GSession *session_open(const GModel *m, int cap) {
 
 static void session_close(const GModel *m, GSession *s) {
     if (!s) return;
+#ifdef COLI_CUDA
+    g53u_session_gone(s);   /* the CUDA chain's copy of its state goes with it */
+#endif
 #ifdef COLI_VULKAN
     g53c_session_gone(s);   /* the dense chain's copy of its state goes with it */
 #endif
@@ -3895,6 +3908,10 @@ static void session_close(const GModel *m, GSession *s) {
 static int g53c_forward(GModel *m, GSession *s, float *streams, int n, int start);
 static void g53c_cpu_step(const GModel *m, const GSession *s, int start);
 static int g_vk_chain;
+#endif
+#ifdef COLI_CUDA
+static int g53u_forward(GModel *m, GSession *s, float *streams, int n, int start);
+static void g53u_cpu_step(const GModel *m, const GSession *s, int start);
 #endif
 /* la ricorrenza KDA di uno scatto: stato e finestra di ogni strato lineare */
 typedef struct { float **state, **window; int n_layers; } Glm53PinState;
@@ -3934,6 +3951,16 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
         if (done >= c->n_layers) return streams;
         if (!done) g53c_cpu_step(m, s, start);
         begin = done;
+    }
+#endif
+#ifdef COLI_CUDA
+    /* every layer on the CUDA chain (glm53_cuchain.h); 0: the CPU below, its state current first;
+     * -1: g_layer_halt stopped it between layers */
+    if (begin == 0 && end == c->n_layers && g53u_wanted(m)) {
+        const int done = g53u_forward(m, s, streams, n, start);
+        if (done < 0) return NULL;
+        if (done >= c->n_layers) return streams;
+        if (!done) g53u_cpu_step(m, s, start);
     }
 #endif
     float *collapsed = malloc((size_t)n * D * sizeof(float));
@@ -3991,6 +4018,9 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
 }
 #ifdef COLI_VULKAN
 #include "glm53_chain.h"   /* COLI_VK_CHAIN: every layer's dense chain on the device */
+#endif
+#ifdef COLI_CUDA
+#include "glm53_cuchain.h"   /* COLI_CUDA_CHAIN: every layer on the CUDA chain, the experts on the CUDA tier */
 #endif
 
 /* Rilascio completo del modello.
@@ -4199,8 +4229,8 @@ static float *forward_span_rows(GModel *m, GSession *s, const int *tokens, int n
     if (need < 1 || need > n) need = n;
     mm(logits + (size_t)(n - need) * c->vocab, &m->head, normed + (size_t)(n - need) * D, need);
     m->t_head += now_s() - t_head0;
-#ifdef COLI_VULKAN
-    {   /* DUMP=<path> (VK=1 builds): every logits row computed, raw f32, for the Vulkan gates */
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+    {   /* DUMP=<path> (VK=1 and CUDA=1 builds): every logits row computed, raw f32, for the chains' gates */
         static FILE *dump; static int said;
         if (!said) { said = 1; const char *p = getenv("DUMP"); if (p && *p) dump = fopen(p, "wb"); }
         if (dump) { fwrite(logits + (size_t)(n - need) * c->vocab, sizeof(float), (size_t)need * c->vocab, dump); fflush(dump); }
@@ -4249,6 +4279,10 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
     /* the dense chain with a chunk from the budget: blocks of its chunk, so a long
      * prompt's MoE steps are big ones the tier can stream */
     if (!setting && !(g_echo_k > 0 && g_echo_id)) { int r = g53c_prefill_rows(m, s, n); if (r > 0) chunk = r; }
+#endif
+#ifdef COLI_CUDA
+    /* the CUDA chain's chunk: a long prompt's MoE steps big ones the tier can stream */
+    if (!setting && !(g_echo_k > 0 && g_echo_id)) { int r = g53u_prefill_rows(m); if (r > 0) chunk = r; }
 #endif
     if (chunk < 1) chunk = 1;
 #if !defined(_WIN32)
@@ -4582,6 +4616,9 @@ static int slot_pin_save(const GModel *m, KVSlot *slot, const int *tokens, int n
     /* Sessione nuova: gli scatti vecchi parlano di righe DSA che non esistono
      * piu, e rimetterli risponderebbe da posizioni inventate, in silenzio. */
     if (slot->pin_session != slot->session) slot_pin_drop(m, slot);
+#ifdef COLI_CUDA
+    g53u_sync_host(m, slot->session);   /* the CUDA chain may hold the newest state */
+#endif
 #ifdef COLI_VULKAN
     g53c_sync_host(m, slot->session);   /* the dense chain may hold the newest state */
 #endif
@@ -4648,6 +4685,9 @@ static int slot_pin_restore(const GModel *m, KVSlot *slot, const int *tokens, in
                 memcpy(ls->kda_state,  st->state[i],  ns * sizeof(float));
                 memcpy(ls->kda_window, st->window[i], nw * sizeof(float));
             }
+#ifdef COLI_CUDA
+            g53u_host_wrote(slot->session);   /* the CUDA chain's copy goes up again */
+#endif
 #ifdef COLI_VULKAN
             g53c_host_wrote(slot->session);   /* the dense chain's copy goes up again */
 #endif
@@ -4676,6 +4716,9 @@ static int slot_pin_for_request(const GModel *m, KVSlot *slot, const int *tokens
  * 64x128x128 piu' la finestra della convoluzione. */
 static int glm53_state_capture(const GModel *m, Glm53PinState **into, const GSession *s) {
     const Cfg *c = &m->c;
+#ifdef COLI_CUDA
+    g53u_sync_host(m, s);   /* the CUDA chain may hold the newest state */
+#endif
 #ifdef COLI_VULKAN
     g53c_sync_host(m, s);   /* the dense chain may hold the newest state */
 #endif
@@ -4707,6 +4750,9 @@ static int glm53_state_capture(const GModel *m, Glm53PinState **into, const GSes
 
 static void glm53_state_restore(const GModel *m, const Glm53PinState *st, GSession *s) {
     const Cfg *c = &m->c;
+#ifdef COLI_CUDA
+    g53u_host_wrote(s);   /* the CUDA chain's copy goes up again */
+#endif
 #ifdef COLI_VULKAN
     g53c_host_wrote(s);   /* the dense chain's copy goes up again */
 #endif
@@ -5353,6 +5399,9 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
     glm53_vk_report(m, "turn");
 #endif
+#ifdef COLI_CUDA
+    g53u_report();
+#endif
 #ifdef COLI_VULKAN
     g53c_report();   /* the dense chain's line, when it ran */
 #endif
@@ -5625,6 +5674,10 @@ static void glm53_vk_tier_start(GModel *m) {
                         /* a partial chain: nothing more of the trunk goes up, but the chain's first
                          * forward allocates its scratch and the N layers' MLA caches */
                         .dense_bytes = g53_tier_dense_bytes(m),
+#ifdef COLI_CUDA
+                        /* the CUDA chain's own room past the dense matrices (glm53_cuchain.h) */
+                        .chain_bytes = xt_cuda() && g53u_wanted(m) ? g53u_plan_bytes(m, getenv("GLM53_MAXT") ? atoi(getenv("GLM53_MAXT")) : 8192) : 0,
+#endif
                         .in_ram = glm53_in_ram, .ram_ctx = m,
                         .load = glm53_vk_load, .release = glm53_vk_unhold, .load_ctx = m,
                         .load_batch = glm53_vk_load_batch};
@@ -5987,6 +6040,9 @@ int main(int argc, char **argv) {
                model.hits, model.miss, (unsigned long long)model.ebytes);
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
     glm53_vk_report(&model, "run");
+#endif
+#ifdef COLI_CUDA
+    g53u_report();
 #endif
 #ifdef COLI_VULKAN
     g53c_report();

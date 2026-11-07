@@ -12,6 +12,9 @@
  *            the device: the CPU computes the pool's pairs of small steps in place (the
  *            hybrid), the card reads the rest; with COLI_VK_HYBRID=0 the card reads them all;
  *            every row the reference's.
+ *   stream   big prefill steps through cu_xb.cu's sub-batches (test_vk_tier.c's section): cold
+ *            experts streamed into the slots, several sub-batches a step, the resident set kept,
+ *            every device row the reference's.
  *   make tests/test_cu_tier CUDA=1 && ./tests/test_cu_tier */
 #include <stdio.h>
 #include <stdlib.h>
@@ -637,6 +640,135 @@ static void hybrid_case(VktFmt gu, VktFmt dn, const char *nm) {
 }
 
 
+/* ---- streaming (tests/test_vk_tier.c's section on cu_xb.cu's sub-batches) ---------------
+ * The engine's load hook: the expert's bytes as its RAM holds them. */
+static int g_loads, g_batch_left, g_partial_serial;
+static int load_cb(void *ctx, int layer, int eid, VktExpertSrc *src, void **h) {
+    if (g_batch_left >= 2) g_partial_serial++;
+    if (g_batch_left) g_batch_left--;
+    (void)ctx; *src = src_of(&ex[layer][eid]); *h = &ex[layer][eid]; g_loads++; return 1;
+}
+static void release_cb(void *ctx, void *h) { (void)ctx; (void)h; }
+/* An engine with two RAM slots: a device upload group needs several batches. */
+static int g_batches;
+static int load_batch_cb(void *ctx, int layer, const int *eids, int n, VktExpertSrc *srcs, void **h) {
+    (void)ctx; g_batches++;
+    int got = n < 2 ? n : 2;
+    g_batch_left = n - got;
+    for (int i = 0; i < got; i++) { srcs[i] = src_of(&ex[layer][eids[i]]); h[i] = &ex[layer][eids[i]]; g_loads++; }
+    return got;
+}
+/* One big step (vk_tier.h step 3, with the prefetch while "attention" runs); the device
+ * rows of cold experts counted apart. */
+static double stream_step(int layer, int S, const int *idx, const float *w, int v4, Books *bk,
+                          unsigned long long *streamed, unsigned long long *kept, int prefetch) {
+    float *x = calloc((size_t)S * H, sizeof(float)), *xq = calloc((size_t)S * H, sizeof(float));
+    float *cpu = calloc((size_t)S * K * H, sizeof(float)), *out = calloc((size_t)S * H, sizeof(float));
+    float *ref = calloc((size_t)S * H, sizeof(float)), *y = malloc(sizeof(float) * H);
+    uint8_t *taken = malloc((size_t)S * K); const float **dev = malloc(sizeof(*dev) * S * K);
+    uint8_t *res = malloc((size_t)S * K);
+    for (int i = 0; i < S * H; i++) x[i] = frnd() * (v4 ? 4.0f : 1.0f);
+    memcpy(xq, x, sizeof(float) * S * H);
+    if (v4) for (int s = 0; s < S; s++) qdq128(xq + (size_t)s * H, H);
+    for (int i = 0; i < S * K; i++) res[i] = (uint8_t)cut_resident(layer, idx[i]);
+    if (prefetch) cut_stream_prefetch(layer, S);
+    int n = v4 ? cut_issue_w(layer, xq, S, K, idx, w, taken) : cut_issue(layer, xq, S, K, idx, taken);
+    for (int i = 0; i < S * K; i++) {
+        if (taken[i]) continue;
+        if (v4) expert_v4(&ex[layer][idx[i]], xq + (size_t)(i / K) * H, w[i], 10.0f, cpu + (size_t)i * H);
+        else expert_ref(&ex[layer][idx[i]], xq + (size_t)(i / K) * H, cpu + (size_t)i * H);
+        VktExpertSrc s = src_of(&ex[layer][idx[i]]); cut_note(layer, idx[i], &s);
+        (*kept)++;
+    }
+    int joined = n ? cut_join(dev) : 1;
+    CHECK(joined, "stream: join failed");
+    double worst = 0;
+    for (int s = 0; s < S; s++)
+        for (int k = 0; k < K; k++) {
+            int i = s * K + k;
+            if (v4) expert_v4(&ex[layer][idx[i]], xq + (size_t)s * H, w[i], 10.0f, y);
+            else expert_ref(&ex[layer][idx[i]], xq + (size_t)s * H, y);
+            float dr[HF_MAX];
+            const float *c = cpu + (size_t)i * H;
+            if (taken[i] && joined) {
+                for (int d = 0; d < H; d++) dr[d] = v4 ? bf16r(dev[i][d]) : dev[i][d];
+                c = dr;
+                double r = rel(c, y, H); if (r > worst) worst = r;
+                if (!res[i]) (*streamed)++;
+            }
+            for (int d = 0; d < H; d++) { ref[(size_t)s * H + d] += (v4 ? 1.0f : w[i]) * y[d]; out[(size_t)s * H + d] += (v4 ? 1.0f : w[i]) * c[d]; }
+            bk->routed++; bk->dev += taken[i] != 0;
+        }
+    double r = rel(out, ref, S * H);
+    if (!(r <= worst)) worst = r;
+    if (getenv("VKT_TEST_DUMP") && n) fprintf(stderr, "dump: ref %g %g dev %g %g\n", ref[0], ref[1], out[0], out[1]);
+    free(x); free(xq); free(cpu); free(out); free(ref); free(y); free(taken); free(dev); free(res);
+    return worst;
+}
+static void stream(void) {
+    setenv("COLI_VK_TIER_HOST", "0", 1);
+    struct { VktFmt gu, dn; int act; const char *name; } cs[] = {
+        {{VKT_SRC_I4U_PLANAR64, 64}, {VKT_SRC_I4U_PLANAR64, 64}, VKT_ACT_SWIGLU, "planar int4-g64"},
+        {{VKT_SRC_I8_AS_I4_GS, 64}, {VKT_SRC_I8_GS, 32}, VKT_ACT_SWIGLU, "unpacked int4 gs64, int8 down"},
+        {{VKT_SRC_FP8_BLOCK, 128}, {VKT_SRC_FP8_BLOCK, 128}, VKT_ACT_SWIGLU, "fp8 128x128 blocks"},
+        {{VKT_SRC_MXFP4_E8M0, 32}, {VKT_SRC_MXFP4_E8M0, 32}, VKT_ACT_SITU, "MXFP4 ue8m0, SiTU-GLU"},
+        {{VKT_SRC_BF16, 0}, {VKT_SRC_BF16, 0}, VKT_ACT_SWIGLU, "bf16"},
+        {{VKT_SRC_MXFP4_E8M0, 32}, {VKT_SRC_MXFP4_E8M0, 32}, VKT_ACT_SWIGLU_V4, "MXFP4, DeepSeek V4 roundings"},
+    };
+    for (size_t c = 0; c < sizeof cs / sizeof *cs; c++) {
+        int v4 = cs[c].act == VKT_ACT_SWIGLU_V4;
+        model_make(cs[c].gu, cs[c].dn); g_act = cs[c].act; g_limit = 0;
+        /* Eight residents at most, four warm; batch cases have eight upload slots
+         * but only two RAM slots, so a group must continue after a partial load. */
+        set_budget(c % 2 ? 16 : 12, cs[c].gu, cs[c].dn);
+        setenv("COLI_VK_TIER_RATE", "0", 1);
+        setenv("COLI_VK_TIER_STREAM_SLOTS", c % 2 ? "8" : "4", 1);
+        setenv("COLI_VK_TIER_STREAM_ROWS", "3", 1);    /* a cold expert with 3 rows or more streams */
+        setenv("COLI_VK_TIER_FILL", "0", 1);           /* four warm, the rest cold: what streams */
+        setenv("COLI_VK_TIER_STREAM_HALF", "40", 1);   /* sub-batches of 40 rows: several a step, experts in parts */
+        VktConfig vc = cfg_of(cs[c].gu, cs[c].dn, cs[c].act, v4 ? 10.0f : 0.f);
+        vc.load = load_cb; vc.release = release_cb;
+        if (c % 2) vc.load_batch = load_batch_cb;   /* half the cases: the batch hook too */
+        g_batches = g_batch_left = g_partial_serial = 0;
+        uint32_t hist[L][E], *rows[L];
+        for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = e < 2 ? 100 - e : 0; }
+        int on = cut_init(&vc, rows);
+        unsetenv("COLI_VK_TIER_STREAM_HALF");
+        CHECK(on, "stream %s: the tier did not start", cs[c].name);
+        if (!on) { model_free(); continue; }
+        int pl[L * E], pe[L * E], np = cut_plan(pl, pe, L * E);
+        for (int i = 0; i < np; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); cut_put(pl[i], pe[i], &s); }
+        cut_put_done();
+        uint8_t before[L][E];
+        for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) before[l][e] = (uint8_t)cut_resident(l, e);
+        Books bk = {0, 0}; unsigned long long streamed = 0, kept = 0; double worst = 0;
+        g_loads = 0;
+        static const int Ss[] = {48, 33, 1, 64, 2, 40};
+        for (int t = 0; t < 6; t++)
+            for (int l = 0; l < L; l++) {
+                int S = Ss[t], idx[64 * K]; float w[64 * K];
+                route(S, 0, E, idx, w);
+                cut_begin_forward();
+                double r = stream_step(l, S, idx, w, v4, &bk, &streamed, &kept, t >= 3);
+                if (r > worst) worst = r;
+            }
+        int same = 1;
+        for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) same &= before[l][e] == (uint8_t)cut_resident(l, e);
+        printf("  %-34s device %3llu of %3llu assignments (%llu streamed), %llu on the CPU, %d loads (%d batches), %d warm, worst %.2e\n",
+               cs[c].name, bk.dev, bk.routed, streamed, kept, g_loads, g_batches, np, worst);
+        cut_report("test", 0, 0);
+        CHECK(np == 4, "stream %s: %d warm experts", cs[c].name, np);
+        CHECK(!(c % 2) || g_batches > 0, "stream %s: the batch hook was never called", cs[c].name);
+        CHECK(g_partial_serial == 0, "stream %s: %d reads serialized after a partial batch", cs[c].name, g_partial_serial);
+        CHECK(streamed > 0, "stream %s: nothing streamed", cs[c].name);
+        CHECK(kept > 0, "stream %s: no cold expert stayed on the CPU", cs[c].name);
+        CHECK(same, "stream %s: the resident set moved", cs[c].name);
+        CHECK(worst < (v4 ? 2e-2 : 2e-3), "stream %s: device rows off the reference (%.3g)", cs[c].name, worst);
+        cut_shutdown(); model_free();
+        unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_ROWS"); unsetenv("COLI_VK_TIER_FILL");
+    }
+}
+
 int main(void) {
     /* the float form throughout: the tier's CPU pairs and the card's block GEMVs read GQ_EXACT
      * once, at their start */
@@ -653,6 +785,7 @@ int main(void) {
     v4_gguf((VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_IQ1_S), 0}, (VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_IQ3_XXS), 0}, 512, 256, "IQ1_S/IQ3_XXS 512x256, V4");
     v4_gguf((VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_IQ1_S), 0}, (VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_IQ2_XXS), 0}, 4096, 2048, "IQ1_S/IQ2_XXS 4096x2048, V4");
     v4_gguf((VktFmt){VKT_SRC_MXFP4_E8M0, 32}, (VktFmt){VKT_SRC_MXFP4_E8M0, 32}, 4096, 2048, "MXFP4 4096x2048, V4");
+    printf("stream:\n"); stream();
     printf("host pool:\n");
     hybrid_case((VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_Q4_K), 0}, (VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_Q6_K), 0}, "Q4_K/Q6_K");
     hybrid_case((VktFmt){VKT_SRC_I4U_PAIRS_GS, 64}, (VktFmt){VKT_SRC_I4U_PAIRS_GS, 64}, "int4-g64");
