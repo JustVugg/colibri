@@ -4519,7 +4519,8 @@ static int v41_prefill_tail(const Cfg *c, int n, int spec_batch, int keep_rows, 
 
 /* Past the source layer: the rows of the tail to the front of every per-row buffer the
  * later layers read (the streams and their mix, the DSpark input a target layer at or
- * before the source wrote, the candidate mask), the forward's rows and start the tail's. */
+ * before the source wrote, the candidate mask, the index list the last index source
+ * published), the forward's rows and start the tail's. */
 static void v41_take_tail(Model *m, float *h, float *pre_mix, int *n, int *start_pos, int tail, int targets, int *trace_row) {
     const Cfg *c = &m->c;
     int dim = c->dim, hc = c->hc_mult, r0 = *n - tail;
@@ -4530,6 +4531,19 @@ static void v41_take_tail(Model *m, float *h, float *pre_mix, int *n, int *start
     if (m->candidates && m->candidate_rows == *n) {
         memmove(m->candidates, m->candidates + (size_t)r0 * m->candidate_width, (size_t)tail * m->candidate_width);
         m->candidate_rows = tail;
+    }
+    /* The layers past the source that run no indexer of their own read this list. Its
+     * entries count past the rows of kv_all's window half: every row of a prompt read from
+     * position 0, the window ring's otherwise (attention_run). The tail starts past 0 and
+     * reads the ring: each row's list to the front, its entries moved onto the ring's
+     * rows. Kept as it was, the tail's rows read the first rows' lists, shifted past the
+     * compressed rows the attention holds. */
+    if (m->shared_topk && m->shared_topk_rows == *n && m->shared_topk_width > 0) {
+        const int w = m->shared_topk_width, shift = c->window - (*start_pos == 0 ? *n : c->window);
+        int *list = m->shared_topk;
+        memmove(list, list + (size_t)r0 * w, (size_t)tail * w * sizeof(int));
+        for (size_t i = 0; i < (size_t)tail * w; i++) if (list[i] >= 0) list[i] += shift;
+        m->shared_topk_rows = tail;
     }
     *n = tail; *start_pos += r0;
     if (*trace_row >= tail) *trace_row = tail - 1;
