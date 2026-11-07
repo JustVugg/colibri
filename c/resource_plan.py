@@ -132,8 +132,9 @@ def _vk_device(env, vulkan):
     if vulkan is not None or not _vk_flag(env, "COLI_VULKAN"):
         return vulkan
     try:
-        from setup_hw import best_vulkan_device, detect_vulkan
-        return best_vulkan_device(detect_vulkan().get("devices", []))
+        # COLI_VK_DEV's device when it names one, as the engine opens it (#2127)
+        from setup_hw import detect_vulkan, engine_vulkan_device
+        return engine_vulkan_device(detect_vulkan().get("devices", []), env)
     except Exception:
         return None
 
