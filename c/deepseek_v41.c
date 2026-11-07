@@ -78,6 +78,7 @@
 #define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
 #include "st.h"
 #include "ggml_view.h"
+#include "coli_env.h"
 #include "quant.h"
 #include "sparse_attn.h"
 #include "omp_tune.h"
@@ -6299,6 +6300,8 @@ int main(int argc, char **argv) {
         }
     }
 #endif
+    coli_env_check(CE_DSV41, "deepseek-v41");
+    coli_env_dump(CE_DSV41, "deepseek-v41");
     /* Size the team to PHYSICAL cores before anything else touches the model.
      * This engine issues ~720 OpenMP regions per decoded token -- three per
      * expert application, 240 applications a token -- and every one of them is

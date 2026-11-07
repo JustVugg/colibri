@@ -53,6 +53,7 @@
 #include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
 #include "cli_args.h"
 #include "compat.h"
+#include "coli_env.h"
 #include "json.h"
 #define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
 #include "st.h"
@@ -2980,6 +2981,8 @@ int main(int argc, char **argv) {
     }
 #endif
     coli_omp_tune_threads("mimo");
+    coli_env_check(CE_MIMO, "mimo");
+    coli_env_dump(CE_MIMO, "mimo");
     /* Two ways in. The gateway: SNAP=<dir> mimo <cap>, SERVE=1. By hand and in
      * the tests: mimo <dir> [--ids "..." | --prompt "..."] [--ngen N] [--cap N]. */
     const char *dir = getenv("SNAP");

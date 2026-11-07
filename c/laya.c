@@ -53,6 +53,7 @@
 
 #include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
 #include "compat.h"
+#include "coli_env.h"
 #include "json.h"
 #include "st.h"
 #include "tok.h"
@@ -1575,6 +1576,8 @@ static int run_tokenize(Laya *M, const char *path)
 
 int main(int argc, char **argv)
 {
+    coli_env_check(CE_LAYA, "laya");
+    coli_env_dump(CE_LAYA, "laya");
     const char *model = NULL, *records = NULL, *tokenize = NULL;
     int dump_ids = 0;
     for (int i = 1; i < argc; i++) {

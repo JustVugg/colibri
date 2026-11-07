@@ -80,6 +80,7 @@ static int qwen36_max_ctx(void) {
 #include "tok_unicode_o200k.h"  /* is_U/is_X: the case classes of o200k's letter rules (Flint) */
 #include "tok_unicode_flint.h"  /* is_PS: [\p{P}\p{S}] (Flint) */
 #include "qwen38_nfc.h"         /* NFC, the tokenizer.json normalizer (Clef) */
+#include "coli_env.h"
 #include "qwen36_tier.h"   /* optional CUDA VRAM expert tier */
 #include "vk_tier.h"       /* optional Vulkan routed-expert tier (COLI_VULKAN=1; stubs without VK=1) */
 #include "route_trace.h"   /* the tier's expert history (.coli_usage), kept only while the tier is on */
@@ -9521,6 +9522,8 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
 #endif
 
 int main(int argc, char **argv) {
+    coli_env_check(CE_QWEN, "qwen36");
+    coli_env_dump(CE_QWEN, "qwen36");
     /* Physical-core team sizing, as colibri/inkling/kimi_k3/olmoe/deepseek-v41
      * do. Without it this engine takes one thread per logical CPU, which on an
      * SMT host doubles the team for no arithmetic and pays a barrier per tiny

@@ -107,6 +107,7 @@ static int g_g53_cu = 0;    /* COLI_CUDA=1 and the device opened for the tier */
 static size_t g_g53_cud;    /* the room the dense matrices take there (cud_open) */
 #endif
 #include "compat.h"
+#include "coli_env.h"
 #include "serve_poll.h"          /* CANCEL a meta' turno (#1332) */
 #include "route_trace.h"
 #include "decode_batch.h"   /* coli_submit_ext, coli_logprob_tail: canale logprobs */
@@ -5764,6 +5765,8 @@ int main(int argc, char **argv) {
         }
     }
 #endif
+    coli_env_check(CE_GLM53, "glm53");
+    coli_env_dump(CE_GLM53, "glm53");
     /* Physical-core team sizing, the same shared helper colibri/inkling/
      * kimi_k3/olmoe/deepseek-v41 call. This engine has no OpenMP sizing of its
      * own, so on an SMT host it ran one thread per logical CPU; #718 measured
