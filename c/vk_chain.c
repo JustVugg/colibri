@@ -1652,22 +1652,50 @@ static void kab_shutdown(void) {
  * frame it is in (submitted, not waited for) and the next opening a frame of its own: the
  * next frame's first barrier orders it after the slice. A slice starts at a multiple of
  * `align` (the blocked attention's rows per workgroup), so its blocks are the ones the
- * whole dispatch would have made, and no row's arithmetic changes. */
+ * whole dispatch would have made, and no row's arithmetic changes.
+ * The budget alone starves a big GPU: chain_attnb makes a workgroup of a KV head and 32 / G
+ * rows, so Qwen3.6's 16K prompt went in slices of 64 rows, 32 workgroups, to an Arc Pro B60
+ * that keeps 80 resident (20 Xe-cores x 4) and runs 2 to 40 of them in the same 90 ms; raising
+ * the budget to 2^36 took its 16K prompt from 118.5 to 74.4-75.7 s and its 32K one from 741.6
+ * to 262.7. So a slice is cut to keep COLI_VK_ATTN_SLICE_WG workgroups (64,
+ * most of the B60's 80; 0 = the budget alone), `wg` of them a block of `align` rows, as far as
+ * 4x the budget's work (up to 7x the budget's own slice where that one rounds down to one
+ * block), and a chunk's rows then go in slices of one size on the blocks, not full ones and a
+ * last of a few blocks (so some, and the last, may keep fewer). One layer of that prompt
+ * replayed on the B60 (4096-row chunks, this chain_attnb): 16K 9.31 -> 6.04 s, 161 -> 112
+ * submissions, the longest 90 -> 94 ms; 32K 69.0 -> 24.2 s, 592 -> 240, 180 -> 188 ms. An
+ * integrated GPU keeps the budget alone (0) until one is measured: the budget is there for
+ * the slow GPUs a driver's timeout catches (the 780M above; Windows' TDR at 2 s). */
 static long long attn_slice_budget(void) {
     const char *e = getenv("COLI_VK_ATTN_SLICE");
     long long v = e && *e ? atoll(e) : (1LL << 32);
     return v < 0 ? 0 : v;
 }
 long long vkc_attn_slice_budget(void) { return attn_slice_budget(); }
-static int attn_slice_rows(int S, int pos_base, double width, int align) {
+static int attn_slice_wg(void) {
+    const char *e = getenv("COLI_VK_ATTN_SLICE_WG");
+    int v = e && *e ? atoi(e) : KC.core.integrated ? 0 : 64;
+    return v < 0 ? 0 : v;
+}
+static int attn_slice_rows(int S, int pos_base, double width, int align, int wg) {
     long long b = attn_slice_budget();
     if (align < 1) align = 1;
+    if (wg < 1) wg = 1;
     if (!b || S <= align) return S;
     double per_row = (double)(pos_base + S) * (width > 1 ? width : 1);
-    long long rr = (long long)((double)b / per_row);
+    long long rr = (long long)((double)b / per_row), mw = attn_slice_wg();
     rr = rr / align * align;
     if (rr < align) rr = align;
-    return rr >= S ? S : (int)rr;
+    if (!mw) return rr >= S ? S : (int)rr;
+    long long fl = (mw + wg - 1) / wg * align;   /* the floor's rows */
+    if (rr < fl) {   /* up to the floor, as far as 4x the budget's rows */
+        long long cap = (long long)(4.0 * (double)b / per_row) / align * align;
+        if (cap > fl) cap = fl;
+        if (cap > rr) rr = cap;
+    }
+    if (rr >= S) return S;
+    long long k = (S + rr - 1) / rr;   /* that many slices, of one size on the blocks */
+    return (int)(((S + k - 1) / k + align - 1) / align * align);
 }
 static int attn_slice_next(void) {   /* the open frame out, a new one in */
     KC.st.attn_slices++;
@@ -1860,7 +1888,7 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
      * chain_attnb's time a submission. At the budget's own size Qwen3.6's 16K prompt was cut
      * into slices of 64 rows, 16 workgroups and a submission each: 5.9 s of attention */
     int S = w.a.S, rr = attn_slice_rows(S, w.a.pos_base, (double)w.a.H * (w.a.hd > w.vd ? w.a.hd : w.vd) / (fp ? VKC_FA_SLICE : 1),
-                                        fp ? VKC_FA_ROWS / G : blocked ? br : 1);
+                                        fp ? VKC_FA_ROWS / G : blocked ? br : 1, fp || blocked ? w.a.KVH : w.a.H);
     int ok = 1;
     for (int r0 = 0; ok && r0 < S; r0 += rr) {
         VkcAttnW x = w;
@@ -1893,7 +1921,8 @@ static int attn_part_rec(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, const Vkc
         anchor < 0 || ch < 0 || (ch > 0 && (ch % 16 || nz < 1 || nz > 65535)) || !kab_pipe()) return 0;
     w.a.has_gate = 0; w.a.g_off = ch; w.a.g_row = o_z; w.a.g_seg = st_z;   /* the chunks (unused by part otherwise) */
     VkcBind bd[7] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(NULL, 0), B(NULL, 0), B(NULL, 0)};
-    int br = 32 / G, S = w.a.S, rr = attn_slice_rows(S, w.a.pos_base, (double)w.a.H * (w.a.hd > w.vd ? w.a.hd : w.vd), br);
+    int br = 32 / G, S = w.a.S, rr = attn_slice_rows(S, w.a.pos_base, (double)w.a.H * (w.a.hd > w.vd ? w.a.hd : w.vd), br,
+                                                     w.a.KVH * (ch > 0 ? nz : 1));
     int ok = 1;
     for (int r0 = 0; ok && r0 < S; r0 += rr) {
         VkcAttnW x = w;
@@ -2236,7 +2265,7 @@ int vkc_mla_core(VkcBuf *qabs, VkcBuf *qr, VkcBuf *lat, VkcBuf *rope, VkcBuf *se
     VkcBind bd[6] = {B(qabs, 0), B(qr, 0), B(lat, 0), B(p->R > 0 ? rope : NULL, 0), B(pc.b.sel_row > 0 ? sel : NULL, 0),
                      B(clat, 1)};
     /* a long prompt chunk in slices of rows, a submission each (attn_slice_rows) */
-    int S = p->S, rr = attn_slice_rows(S, p->pos_base, (double)p->H * (p->K + p->R), 1), ok = 1;
+    int S = p->S, rr = attn_slice_rows(S, p->pos_base, (double)p->H * (p->K + p->R), 1, p->H), ok = 1;
     for (int r0 = 0; ok && r0 < S; r0 += rr) {
         CorePC x = pc;
         x.b.S = S - r0 < rr ? S - r0 : rr; x.b.pos_base = p->pos_base + r0;
@@ -3174,7 +3203,7 @@ int vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBu
     VkcBind bd[8] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(kvs, 0), B(r, 0), B(relp, 0), B(tau, 0)};
     /* a long prompt chunk in slices of rows, a submission each (attn_slice_rows): the
      * shader's s0 is the slice's first row, pos_base stays the step's */
-    int S = p->S, rr = attn_slice_rows(S, p->pos_base, (double)p->H * p->hd, 1), ok = 1;
+    int S = p->S, rr = attn_slice_rows(S, p->pos_base, (double)p->H * p->hd, 1, p->H), ok = 1;
     for (int r0 = 0; ok && r0 < S; r0 += rr) {
         struct { VkcRelAttn a; int s0; } x = {*p, r0};
         x.a.S = S - r0 < rr ? S - r0 : rr;
