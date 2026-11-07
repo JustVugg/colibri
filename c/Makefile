@@ -547,7 +547,7 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract test_idot_ssse3 \
 	test_ggml_quants test_gguf_c test_gq_dot
-TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32
+TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32 test_vk_dev2_window
 # needs a CUDA device and the CUDA objects: make tests/test_cu_tier CUDA=1
 TEST_EXCLUDE += test_cu_tier
 # takes a fixture and the CPU build's logits on its command line (ci.yml, the int4 gs64 A/B step)
@@ -2622,6 +2622,11 @@ tests/test_vk_alloc$(EXE): tests/test_vk_alloc.c
 tests/test_cu_tier$(EXE): tests/test_cu_tier.c $(CUDA_OBJ)
 	@case "$(CUDA_OBJ)" in *cu_tier.o*) ;; *) echo "tests/test_cu_tier needs CUDA=1 (or HIP=1)" >&2; exit 1 ;; esac
 	$(CC) $(CFLAGS) $< $(CUDA_OBJ) -o $@ $(LDFLAGS)
+# A second logical device exercises its own window probe (Lavapipe suffices).
+tests/test_vk_dev2_window$(EXE): tests/test_vk_dev2_window.c backend_vulkan.c shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/rmsnorm.spv shaders/attention_absorb.spv
+	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_dev2_window needs VK=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_vk_tier$(EXE): tests/test_vk_tier.c $(VK_OBJ) $(VK_SPV)
 	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_tier needs VK=1" >&2; exit 1; }
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
@@ -2630,7 +2635,8 @@ tests/bench_host_pairs$(EXE): tests/bench_host_pairs.c $(VK_OBJ)
 	@[ "$(VK)" = 1 ] || { echo "tests/bench_host_pairs needs VK=1" >&2; exit 1; }
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 .PHONY: vk-tier-check
-vk-tier-check: tests/test_vk_tier$(EXE)
+vk-tier-check: tests/test_vk_tier$(EXE) tests/test_vk_dev2_window$(EXE)
+	./tests/test_vk_dev2_window$(EXE) shaders/qmatmul.spv
 	./tests/test_vk_tier$(EXE) shaders/qmatmul.spv
 	./tests/test_vk_tier$(EXE) shaders/qmatmul.spv host-pairs
 

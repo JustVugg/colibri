@@ -810,6 +810,18 @@ one of each.
 
 ### A second device (`COLI_VK_DEV2`)
 
+Both devices independently probe the host-visible device-local allocation window
+before choosing mapped or staged expert uploads. A driver can report a large heap
+while refusing mapped allocations well below that size; the secondary now uses
+the same probe as the primary. `COLI_VK_STAGED=0` or `1` still overrides the
+automatic decision on both devices. The secondary's startup log identifies its
+choice with `dev2 memory`.
+
+This addresses the missing secondary-device probe investigated in #2556. It does
+not guarantee a dual-GPU speedup: the secondary's execution path and host/device
+placement still need measurements on the actual pair of cards.
+
+
 The dense chain can put layers there too: [Layers on two devices](#layers-on-two-devices).
 
 A machine with two GPUs (a V100 beside a GTX 1070, an RX 9070 beside an RX 580) can
