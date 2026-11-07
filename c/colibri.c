@@ -14943,6 +14943,12 @@ int main(int argc, char **argv){
      * OMP-parallel pin warmup already streams from both drives. */
     mirror_setup(&m);
     gguf_experts_random(&m);
+    /* The expert-usage history: COLI_USAGE names it, as in the sibling engines (glm53.c,
+     * qwen36.c), default <SNAP>/.coli_usage. Resolved before PIN=auto, which seeds from it;
+     * the load, AUTOPIN and every usage_save() below use the same path (#1078). */
+    { const char *up=getenv("COLI_USAGE");
+      if(up&&*up) snprintf(g_usage_path,sizeof(g_usage_path),"%s",up);
+      else        snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage",snap); }
     /* HOT-STORE: PIN=<statsfile> [PIN_GB=g] -> top expert per frequenza fissi in RAM.
      * Va PRIMA di cap_for_ram: i pinnati contano nel residente. */
     if(getenv("PIN")){
@@ -14955,14 +14961,14 @@ int main(int argc, char **argv){
              * nessuno dei due -> nessun pin (AUTOPIN piu' sotto resta escluso: PIN e' settato).
              * EN: prefer the live usage history over the frozen one-shot profile, so each
              * reload's pin placement follows the accumulated real workload. */
-            snprintf(pauto,sizeof(pauto),"%s/.coli_usage",snap);
+            snprintf(pauto,sizeof(pauto),"%s",g_usage_path);
             FILE *pf=fopen(pauto,"rb"); long psz=0;
             if(pf){ fseek(pf,0,SEEK_END); psz=ftell(pf); fclose(pf); }
             if(psz<=0){ snprintf(pauto,sizeof(pauto),"%s/stats.txt",snap);
                 pf=fopen(pauto,"rb"); psz=0;
                 if(pf){ fseek(pf,0,SEEK_END); psz=ftell(pf); fclose(pf); } }
             if(psz>0){ pin=pauto; fprintf(stderr,"[PIN] auto: seeding from %s\n",pauto); }
-            else { pin=NULL; fprintf(stderr,"[PIN] auto: no .coli_usage or stats.txt in %s yet (no pin this run)\n",snap); }
+            else { pin=NULL; fprintf(stderr,"[PIN] auto: no %s or stats.txt in %s yet (no pin this run)\n",g_usage_path,snap); }
         }
         if(pin){
             const char *pin_gb=getenv("PIN_GB");
@@ -14988,7 +14994,6 @@ int main(int argc, char **argv){
      * conosce la TUA storia, la LRU si adatta alla sessione). AUTOPIN=0 disattiva. */
     { double ram_env = getenv("RAM_GB")?atof(getenv("RAM_GB")):0.0;
       int est_ctx = getenv("CTX")?atoi(getenv("CTX")):4096;   /* stesso default di run_serve */
-      snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage",snap);
       /* An integrated GPU's expert tier is RAM too. It is not reserved here: the shared
        * tier (vk_tier_start, at the end of init) sizes itself from what MemAvailable has
        * left once this LRU has grown to its cap (VktConfig.ram_reserve). */
@@ -15022,17 +15027,25 @@ int main(int argc, char **argv){
            * plan    = 0.5 * budget * confidence(history), the autopin quota
            * reserve = cap * per-row width, held back for the adaptive LRU (#815)
            * max_pin = budget - reserve, the ceiling the plan is clamped to
+           * pinning = the RAM pin quota pin_load() gets below: min(plan, max_pin),
+           *           or 0 under the 0.5 GB floor (#1078: it printed the unfloored one)
            *
            * A reserve near the budget means the pin is being starved by a
            * reservation the LRU may never claim, since the LRU is demand-filled
            * and only allocates on a miss. That is visible here at a glance. */
+          double pin_gb=pin_bytes/1e9;
+          /* whole MB, rounded down: a 0.499 GB pin must not read as the 0.5 GB floor itself */
+          char under_floor[96]="";
+          if(pin_bytes>0.0&&pin_gb<0.5)
+            snprintf(under_floor,sizeof under_floor,"  [a %.0f MB pin is under the 0.5 GB floor: no RAM pin]",
+                     floor(pin_bytes/1e6));
           fprintf(stderr,"[PIN] auto: budget %.1f GB | plan %.1f GB (conf %.2f, %lld selections) | "
-              "LRU reserve %.1f GB (cap %d/layer x %.1f MB/row-set) | max_pin %.1f GB -> pinning %.1f GB%s\n",
+              "LRU reserve %.1f GB (cap %d/layer x %.1f MB/row-set) | max_pin %.1f GB -> pinning %.1f GB%s%s\n",
               expert_available/1e9, planned_pin/1e9, conf, (long long)hist,
               lru_reserve/1e9, preserved_cap, expert_cache_bytes_per_slot(&m,ebits)/1e6,
-              (expert_available-lru_reserve)/1e9, pin_bytes/1e9,
-              pin_bytes+1.0<planned_pin ? "  [CAPPED by the LRU reserve]" : "");
-          double pin_gb=pin_bytes/1e9;
+              (expert_available-lru_reserve)/1e9, pin_gb>=0.5 ? pin_gb : 0.0,
+              pin_bytes+1.0<planned_pin ? "  [CAPPED by the LRU reserve]" : "",
+              under_floor);
           /* #1409: the VRAM prefix is loaded by the same pin_load, priced against
            * the VRAM budget (CUDA_RELEASE_HOST). A RAM pin under the 0.5 GB floor
            * used to skip the call, and with it the whole VRAM tier. */
