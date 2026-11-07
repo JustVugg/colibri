@@ -393,9 +393,9 @@ dan Qwen3.6 dengan model yang dijalankannya; OLMoE dan engine keputusan dibangun
 dengan `make <engine> CUDA=1`. Di Windows, engine CUDA adalah DLL terpisah
 ([windows.md](docs/windows.md)), dan setiap rilis menyertakannya dalam bentuk
 siap pakai: `colibri-<versi>-windows-x86_64-cuda.zip` berisi `coli_cuda.dll`
-(kartu dengan compute capability 8.0 ke atas) dan engine colibri, qwen36, dan
-kimi_k3 yang memuatnya, beserta DLL CUDA milik DeepSeek V4. Ekstrak di atas arsip
-utama, dan setup akan memilih CUDA.
+(kartu dengan compute capability 8.0 ke atas) dan engine colibri, glm53, qwen36,
+dan kimi_k3 yang memuatnya, beserta DLL CUDA milik DeepSeek V4. Ekstrak di atas
+arsip utama, dan setup akan memilih CUDA.
 
 - **Setiap layer di kartu** untuk Qwen3.6, Qwen3.8, dan OLMoE: layer dense,
   attention, dan pakar yang dipegang kartu berjalan sebagai satu chain, dan pakar
