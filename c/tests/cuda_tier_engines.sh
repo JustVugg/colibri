@@ -44,6 +44,16 @@ write_glmdsa("glm_gguf_tiny.gguf", np.random.default_rng(9))
 PY
   $PY tools/gguf_import.py glm_gguf_tiny.gguf glm_gguf_tiny > /dev/null || exit 1
 fi
+if [ ! -d glm_gguf_sh ]; then   # the same with layers 2 and 3 holding layer 1's indexer: shared layers, as unsloth's GLM-5.3
+  $PY - <<'PY' || exit 1
+import sys
+sys.path.insert(0, "tests")
+import numpy as np
+from test_gguf_import import write_glmdsa
+write_glmdsa("glm_gguf_sh.gguf", np.random.default_rng(9), copies=(2, 3))
+PY
+  $PY tools/gguf_import.py glm_gguf_sh.gguf glm_gguf_sh > /dev/null || exit 1
+fi
 fails=0
 ok() { echo "OK $*"; }
 bad() { echo "FAIL $*"; fails=$((fails + 1)); }
@@ -127,6 +137,7 @@ rm -f tier.usage
 # the index scores, and four picks out of forty follow), no drafts (DRAFT=0: the two sides verify the same steps).
 echo '{"prompt_ids": [5, 6, 7, 8, 20, 21, 22, 23], "full_ids": [5, 6, 7, 8, 20, 21, 22, 23, 1, 2, 3, 4, 5, 6, 7, 8]}' > glm_gguf_tiny/ref.json
 $PY -c "import json; p=[(i*37+5)%290+2 for i in range(40)]; print(json.dumps({'prompt_ids': p, 'full_ids': p + [1, 2, 3, 4, 5, 6, 7, 8]}))" > glm_gguf_tiny/ref40.json
+cp glm_gguf_tiny/ref.json glm_gguf_tiny/ref40.json glm_gguf_sh/
 gltok() { grep -aE '^GLM C engine|^PREFILL|^\[ORACLE\] mismatch' "$1" | sed 's/ | [0-9.]* pos\/s//'; }
 for v in "chain decode|1e-4|COLI_CUDA_TC_GEMM=0|64 16 16|ref" \
          "chain decode, cap=1|1e-4|COLI_CUDA_TC_GEMM=0|1 16 16|ref" \
@@ -136,9 +147,12 @@ for v in "chain decode|1e-4|COLI_CUDA_TC_GEMM=0|64 16 16|ref" \
          "chain DSA top-4|1e-4|COLI_CUDA_TC_GEMM=0 DSA_TOPK=4|64 16 16|ref" \
          "chain DSA top-4, 40-token prompt in chunks of 5|1e-4|COLI_CUDA_TC_GEMM=0 DSA_TOPK=4 COLI_CUDA_GLM_ROWS=5|64 16 16|ref40" \
          "chain DSA_FORCE|1e-4|COLI_CUDA_TC_GEMM=0 DSA_FORCE=1|64 16 16|ref40" \
-         "chain 40-token prompt, tensor cores|1e-3|DSA_TOPK=4|64 16 16|ref40"; do
-  IFS='|' read -r tag tol envs cap ref <<< "$v"
-  G="SNAP=glm_gguf_tiny REF=glm_gguf_tiny/$ref.json GQ_EXACT=1 KV16=0 COLI_SPEC_GATE=0 USAGE_SAVE=0"
+         "chain 40-token prompt, tensor cores|1e-3|DSA_TOPK=4|64 16 16|ref40" \
+         "chain DSA top-4 over shared indexer layers (layers 2 and 3 reuse layer 1's selection)|1e-4|COLI_CUDA_TC_GEMM=0 DSA_TOPK=4|64 16 16|ref|glm_gguf_sh" \
+         "chain DSA top-4 over shared indexer layers, 40-token prompt in chunks of 5|1e-4|COLI_CUDA_TC_GEMM=0 DSA_TOPK=4 COLI_CUDA_GLM_ROWS=5|64 16 16|ref40|glm_gguf_sh"; do
+  IFS='|' read -r tag tol envs cap ref snap <<< "$v"
+  snap=${snap:-glm_gguf_tiny}
+  G="SNAP=$snap REF=$snap/$ref.json GQ_EXACT=1 KV16=0 COLI_SPEC_GATE=0 USAGE_SAVE=0"
   rm -f gl.usage gl-cpu.f32 gl-cu.f32
   env $G $envs COLI_USAGE=gl.usage DUMP=gl-cpu.f32 ./colibri $cap > gl-cpu.log 2>&1
   rm -f gl.usage
