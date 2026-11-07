@@ -3,7 +3,14 @@
  *   kda  glm53.c's KDA layer around delta_attention.h's coli_kda_step (the decay, beta and
  *        output gate as glm53.c makes them), S rows over two calls (the state and the window
  *        carried on the device between them); the block of rows kernel (CC_KDA_ROWS rows and
- *        more in one call) against calls of fewer rows, bit for bit, GLM's form and Kimi K3's.
+ *        more in one call) against calls of fewer rows, bit for bit, GLM's form and Kimi K3's;
+ *   mla  the attention core against a double reference over a causal range and over row lists
+ *        with a skipped entry; RoPE in both styles in place and elsewhere; LayerNorm with and
+ *        without the bias; the per-head matmuls of a float matrix, rows with the gate and
+ *        transposed;
+ *   kpool sparse_index.h's k-pooled selection slot for slot (exact inputs, ties among equal
+ *        pools), with and without the tail, below and past CC_DSA_GRID pools; the pooled keys
+ *        with real gates and bias against its arithmetic.
  * The kernels round the CPU's steps in its order and contract nothing into an FMA (the reference is
  * built without contraction too): with an exp correctly rounded in their place the outputs are the
  * CPU's within 5e-7. CUDA's expf, within 2 ulp, gives 2-5e-5 on the outputs once the recurrence and
@@ -20,6 +27,9 @@ extern "C" {   /* tests/cuda_glm53c_ref.c */
 int glm53c_ref_kda_scratch(int H, int KD, int VD);
 int glm53c_ref_kda_step(float *out, float *state, float *window, const float *qkv, const float *conv_w, const float *gate,
                         const float *beta, int H, int KD, int VD, int K, float neps, float *scratch);
+int glm53c_ref_width(int topk, int pool, int tail);
+int glm53c_ref_kpool(int *out, const float *q, const float *keys, const float *gates, const float *hw, const float *ape,
+                     const unsigned char *valid, int T, int IH, int ID, int pool, int topk, int tail, int q_from, int q_to);
 }
 
 static const ColiCudaChainOps *T;
@@ -48,6 +58,14 @@ static double relerr(const float *a, const float *b, size_t n, double floor_) {
         if (!(d <= w)) w = d;
     }
     return w;
+}
+/* the largest difference against the largest reference value: outputs that are sums of terms of
+ * both signs (an average of keys, a softmax mixture), whose small values carry the rounding of
+ * the large ones */
+static double relmax(const float *a, const float *b, size_t n) {
+    double d = 0, m = 0;
+    for (size_t i = 0; i < n; i++) { const double e = fabs((double)a[i] - b[i]); if (!(e <= d)) d = e; if (fabs((double)b[i]) > m) m = fabs((double)b[i]); }
+    return m > 0 ? d / m : d;
 }
 static int bad(const float *a, size_t n) { for (size_t i = 0; i < n; i++) if (!std::isfinite(a[i])) return 1; return 0; }
 static float sigm(float v) { if (v >= 0) { float d = expf(-v); return 1.f / (1.f + d); } float g = expf(v); return g / (1.f + g); }
@@ -130,15 +148,204 @@ static void test_kda_rows(int H, int KD, int S, int flags) {
     ck(same, what);
 }
 
+/* the attention core over random caches: a causal range from kv_start, or every other row a list
+ * of every other position newest first with a skipped entry */
+static void test_mla_core(int H, int K, int R, int S, int pb, int kv_start, int list) {
+    const int cap = pb + S + 3, qseg = K + 5, qrow = H * qseg + 2, rseg = R + 3, rrow = H * rseg + 1, oseg = K + 1, orow = H * oseg;
+    const float scale = 0.07f;
+    std::vector<float> qa = fvec((size_t)S * qrow + 4, 1.f), qr = fvec((size_t)S * rrow + 4, 1.f);
+    std::vector<float> lat = fvec((size_t)cap * K + 2, 1.f), rope = fvec((size_t)cap * (R ? R : 1) + 2, 1.f);
+    const int selrow = 2 + cap;
+    std::vector<int> sel((size_t)S * selrow, 0);
+    for (int s = 0; s < S; s++) {
+        const int vis = pb + s + 1; int n = 0;
+        if (!list || s % 2) { sel[(size_t)s * selrow] = -1; continue; }
+        for (int t = vis - 1; t >= kv_start; t -= 2) sel[(size_t)s * selrow + 1 + n++] = t;
+        sel[(size_t)s * selrow + 1 + n++] = -1;
+        sel[(size_t)s * selrow] = n;
+    }
+    std::vector<float> ref((size_t)S * orow, 0.f);
+    for (int s = 0; s < S; s++) for (int h = 0; h < H; h++) {
+        const float *q = &qa[4 + (size_t)s * qrow + h * qseg], *qrr = &qr[4 + (size_t)s * rrow + h * rseg];
+        const int *ls = &sel[(size_t)s * selrow];
+        const int n = ls[0] >= 0 ? ls[0] : pb + s + 1 - kv_start;
+        std::vector<int> pos; std::vector<double> sc;
+        for (int j = 0; j < n; j++) { const int t = ls[0] >= 0 ? ls[1 + j] : kv_start + j; if (t >= 0) pos.push_back(t); }
+        double mx = -1e300, sum = 0;
+        for (int t : pos) {
+            double a = 0;
+            for (int i = 0; i < K; i++) a += (double)q[i] * lat[2 + (size_t)t * K + i];
+            for (int i = 0; i < R; i++) a += (double)qrr[i] * rope[2 + (size_t)t * R + i];
+            sc.push_back(a * scale); if (a * scale > mx) mx = a * scale;
+        }
+        for (double &v : sc) { v = exp(v - mx); sum += v; }
+        for (int i = 0; i < K; i++) {
+            double a = 0;
+            for (size_t j = 0; j < pos.size(); j++) a += sc[j] / sum * lat[2 + (size_t)pos[j] * K + i];
+            ref[(size_t)s * orow + h * oseg + i] = (float)a;
+        }
+    }
+    CcBuf *qb = upf(qa), *rb = upf(qr), *lb = upf(lat), *pb2 = upf(rope), *sb = up(sel.data(), sel.size() * 4);
+    CcBuf *ob = T->buf((size_t)S * orow * 4, CC_DEV);
+    CcMlaCore cp = {S, H, K, R, pb, kv_start, 4, qrow, qseg, 4, rrow, rseg, 2, K, 2, R, 0, list ? selrow : 0, 0, orow, oseg, scale};
+    const int ok = T->begin() && T->zero(ob, 0, (size_t)S * orow) && T->mla_core(qb, rb, lb, R ? pb2 : NULL, list ? sb : NULL, ob, &cp) && T->submit(1);
+    std::vector<float> y = down<float>(ob, (size_t)S * orow);
+    const double e = relmax(y.data(), ref.data(), y.size());
+    char what[160];
+    snprintf(what, sizeof what, "mla core H %d K %d R %d S %d pos %d kv_start %d list %d: err %.2e", H, K, R, S, pb, kv_start, list, e);
+    ck(ok && e < 2e-6 && !bad(y.data(), y.size()), what);
+    CcBuf *all[] = {qb, rb, lb, pb2, sb, ob};
+    for (CcBuf *x : all) T->free(x);
+}
+/* interleaved and rotate-half RoPE, in place and elsewhere; LayerNorm with and without the bias */
+static void test_mla_rows(void) {
+    const int rows = 4, per = 3, seg = 20, rd = 12, xrow = per * seg + 5, yrow = per * (seg + 2), half = rd / 2;
+    std::vector<float> x = fvec((size_t)rows * xrow, 1.f), cs((size_t)rows * rd);
+    for (int r = 0; r < rows; r++) for (int j = 0; j < half; j++) {
+        const float ang = (float)(500 + 91 * r) * powf(10000.f, -2.f * j / rd);
+        cs[r * rd + 2 * j] = cosf(ang); cs[r * rd + 2 * j + 1] = sinf(ang);
+    }
+    CcBuf *cb = upf(cs);
+    for (int style = 0; style < 2; style++) for (int inplace = 0; inplace < 2; inplace++) {
+        const int yr = inplace ? xrow : yrow, ys = inplace ? seg : seg + 2;
+        std::vector<float> ref((size_t)rows * yr, 0.f);
+        if (inplace) ref = x;
+        for (int r = 0; r < rows; r++) for (int j = 0; j < per; j++) {
+            const float *v = &x[(size_t)r * xrow + j * seg]; float *o = &ref[(size_t)r * yr + j * ys];
+            float tmp[256]; for (int i = 0; i < seg; i++) tmp[i] = v[i];
+            for (int i = 0; i < half; i++) {
+                const float a = style ? tmp[2 * i] : tmp[i], b = style ? tmp[2 * i + 1] : tmp[i + half];
+                const float c = cs[r * rd + 2 * i], sn = cs[r * rd + 2 * i + 1];
+                o[i] = a * c - b * sn; o[i + half] = b * c + a * sn;
+            }
+            for (int i = rd; i < seg; i++) o[i] = tmp[i];
+        }
+        CcBuf *xb = upf(x), *yb = inplace ? xb : T->buf((size_t)rows * yr * 4, CC_DEV);
+        CcMlaRow p = {rows * per, per, rd, seg, style, 0, xrow, seg, 0, yr, ys, 0, rd, 0, 0, 0, 0.f};
+        const int ok = T->begin() && (inplace || T->zero(yb, 0, (size_t)rows * yr)) && T->mla_rope(xb, cb, yb, &p) && T->submit(1);
+        std::vector<float> y = down<float>(yb, (size_t)rows * yr);
+        const double e = relerr(y.data(), ref.data(), y.size(), 1e-3);
+        char what[120];
+        snprintf(what, sizeof what, "mla rope style %d in place %d: err %.2e", style, inplace, e);
+        ck(ok && e < 1e-6, what);
+        if (!inplace) T->free(yb);
+        T->free(xb);
+    }
+    std::vector<float> prm = fvec(2 * seg, 1.f);
+    CcBuf *pb = upf(prm);
+    for (int hb = 0; hb < 2; hb++) {
+        std::vector<float> ref((size_t)rows * yrow, 0.f);
+        for (int r = 0; r < rows; r++) for (int j = 0; j < per; j++) {
+            const float *v = &x[(size_t)r * xrow + j * seg]; float *o = &ref[(size_t)r * yrow + j * (seg + 2)];
+            double mu = 0, var = 0; for (int i = 0; i < seg; i++) mu += v[i]; mu /= seg;
+            for (int i = 0; i < seg; i++) var += (v[i] - mu) * (v[i] - mu); var /= seg;
+            const float rr = 1.f / sqrtf((float)var + 1e-6f);
+            for (int i = 0; i < seg; i++) o[i] = (float)(v[i] - mu) * rr * prm[i] + (hb ? prm[seg + i] : 0.f);
+        }
+        CcBuf *xb = upf(x), *yb = T->buf((size_t)rows * yrow * 4, CC_DEV);
+        CcMlaRow p = {rows * per, per, 0, seg, 0, 0, xrow, seg, 0, yrow, seg + 2, 0, 0, 0, seg, hb, 1e-6f};
+        const int ok = T->begin() && T->zero(yb, 0, (size_t)rows * yrow) && T->mla_lnorm(xb, pb, yb, &p) && T->submit(1);
+        std::vector<float> y = down<float>(yb, (size_t)rows * yrow);
+        const double e = relerr(y.data(), ref.data(), y.size(), 1e-3);
+        char what[120];
+        snprintf(what, sizeof what, "mla layernorm bias %d: err %.2e", hb, e);
+        ck(ok && e < 2e-6, what);
+        T->free(xb); T->free(yb);
+    }
+    T->free(pb); T->free(cb);
+}
+/* the per-head block matmuls of a float matrix, rows (the gate) and transposed */
+static void test_hgemv(int trans) {
+    const int S = 3, H = 3, n = trans ? 24 : 20, I = 128, hstride = n + 9, hoff = 5, O = (H - 1) * hstride + hoff + n + 2, woff = 6;
+    std::vector<float> W = fvec((size_t)O * I + woff, 0.1f);
+    const int xin = trans ? n : I, xseg = xin + 3, xrow = H * xseg + 1, yout = trans ? I : n, yseg = yout + 2, yrow = H * yseg;
+    std::vector<float> x = fvec((size_t)S * xrow + 7, 1.f), g = fvec((size_t)S * H * n, 2.f), ref((size_t)S * yrow, 0.f);
+    for (int s = 0; s < S; s++) for (int h = 0; h < H; h++) {
+        const float *xs = &x[7 + (size_t)s * xrow + h * xseg]; float *ys = &ref[(size_t)s * yrow + h * yseg];
+        if (trans) for (int i = 0; i < I; i++) {
+            double a = 0; for (int d = 0; d < n; d++) a += (double)W[woff + (size_t)(h * hstride + hoff + d) * I + i] * xs[d];
+            ys[i] = (float)a;
+        } else for (int o = 0; o < n; o++) {
+            double a = 0; for (int i = 0; i < I; i++) a += (double)W[woff + (size_t)(h * hstride + hoff + o) * I + i] * xs[i];
+            ys[o] = (float)a * sigm(g[(size_t)s * H * n + h * n + o]);
+        }
+    }
+    CcBuf *wb = upf(W), *xb = upf(x), *gb = upf(g), *yb = T->buf((size_t)S * yrow * 4, CC_DEV);
+    CcHgemv p = {trans, S, H, n, hstride, hoff, 7, xrow, xseg, 0, yrow, yseg, 0, H * n, !trans, I, woff};
+    const int ok = T->begin() && T->zero(yb, 0, (size_t)S * yrow) && T->mla_hgemv(wb, xb, yb, trans ? NULL : gb, &p) && T->submit(1);
+    std::vector<float> y = down<float>(yb, (size_t)S * yrow);
+    const double e = relmax(y.data(), ref.data(), y.size());
+    char what[120];
+    snprintf(what, sizeof what, "hgemv float trans %d: err %.2e", trans, e);
+    ck(ok && e < 2e-6, what);
+    CcBuf *all[] = {wb, xb, gb, yb};
+    for (CcBuf *b : all) T->free(b);
+}
+/* the k-pooled selection slot for slot against sparse_index.h, then the pooled keys */
+static void test_kpool(int S, int pb, int IH, int ID, int pool, int topk, int tail) {
+    const int Tn = pb + S, width = glm53c_ref_width(topk, pool, tail), selrow = width + 1, npool = Tn / pool, scrow = npool + 1;
+    std::vector<float> keys((size_t)Tn * ID), gates((size_t)Tn * ID, 0.f), ape((size_t)pool * ID, 0.f), q((size_t)S * IH * ID), hw((size_t)S * IH);
+    for (auto &v : keys) v = ((int)(rnd() % 17) - 8) * 0.25f;
+    for (auto &v : q) v = ((int)(rnd() % 17) - 8) * 0.25f;
+    for (auto &v : hw) v = ((int)(rnd() % 9) - 4) * 0.5f * sqrtf((float)IH);
+    for (int t = 0; t < Tn; t += 7) for (int i = 0; i < ID; i++) keys[(size_t)t * ID + i] = keys[(size_t)(t % 3) * ID + i];   /* equal pools: ties */
+    std::vector<unsigned char> valid((size_t)Tn, 1);
+    std::vector<int> ref((size_t)S * width);
+    std::vector<float> hwd((size_t)S * IH);
+    for (int i = 0; i < S * IH; i++) hwd[i] = hw[i] / sqrtf((float)IH);
+    glm53c_ref_kpool(ref.data(), q.data(), keys.data(), gates.data(), hwd.data(), ape.data(), valid.data(), Tn, IH, ID, pool, topk, tail, pb, Tn);
+    CcBuf *kb = upf(keys), *gb = upf(gates), *ab = upf(ape), *qb = upf(q), *wb = upf(hw);
+    CcBuf *pk = T->buf((size_t)(npool + 1) * ID * 4, CC_DEV), *scb = T->buf((size_t)S * scrow * 4, CC_DEV), *sb = T->buf((size_t)S * selrow * 4, CC_DEV);
+    CcDsaPool kp = {npool, pool, 0, ID, 0, ID, 0, 0, 0, ID};
+    CcDsaPick sp = {S, pb, IH, ID, topk, pool, 0, IH * ID, 0, IH, 0, tail, scrow, selrow, sqrtf((float)IH), 1.f / sqrtf((float)ID)};
+    int ok = T->begin() && T->dsa_pool_keys(kb, gb, ab, pk, &kp) && T->dsa_pool_select(qb, wb, pk, scb, sb, &sp) && T->submit(1);
+    std::vector<int> got = down<int>(sb, (size_t)S * selrow);
+    int same = ok;
+    for (int s = 0; same && s < S; s++) {
+        same = got[(size_t)s * selrow] == width;
+        for (int i = 0; same && i < width; i++) same = got[(size_t)s * selrow + 1 + i] == ref[(size_t)s * width + i];
+    }
+    char what[160];
+    snprintf(what, sizeof what, "kpool S %d pos %d IH %d ID %d pool %d topk %d tail %d: the selection", S, pb, IH, ID, pool, topk, tail);
+    ck(same, what);
+    for (auto &v : gates) v = frnd() * 2.f;
+    for (auto &v : ape) v = frnd() * 0.5f;
+    std::vector<float> rk((size_t)npool * ID);
+    for (int pp = 0; pp < npool; pp++) for (int d = 0; d < ID; d++) {
+        float mx = -3.402823466e38f, tot = 0, mix = 0;
+        for (int j = 0; j < pool; j++) { const float l = gates[(size_t)(pp * pool + j) * ID + d] + ape[(size_t)j * ID + d]; if (l > mx) mx = l; }
+        for (int j = 0; j < pool; j++) tot += expf(gates[(size_t)(pp * pool + j) * ID + d] + ape[(size_t)j * ID + d] - mx);
+        for (int j = 0; j < pool; j++) mix += expf(gates[(size_t)(pp * pool + j) * ID + d] + ape[(size_t)j * ID + d] - mx) / tot * keys[(size_t)(pp * pool + j) * ID + d];
+        rk[(size_t)pp * ID + d] = mix;
+    }
+    ok = T->begin() && T->write(gb, 0, gates.data(), gates.size() * 4) && T->write(ab, 0, ape.data(), ape.size() * 4) &&
+         T->dsa_pool_keys(kb, gb, ab, pk, &kp) && T->submit(1);
+    std::vector<float> gk = down<float>(pk, (size_t)npool * ID);
+    const double e = relmax(gk.data(), rk.data(), gk.size());
+    snprintf(what, sizeof what, "kpool keys pool %d ID %d: err %.2e", pool, ID, e);
+    ck(ok && e < 2e-6, what);
+    CcBuf *all[] = {kb, gb, ab, qb, wb, pk, scb, sb};
+    for (CcBuf *b : all) T->free(b);
+}
+
 int main(void) {
     int dev = 0;
     if (!coli_cuda_init(&dev, 1)) { printf("no CUDA device: skipped\n"); return 0; }
     T = coli_cuda_chain_ops();
-    if (!T || T->size < offsetof(ColiCudaChainOps, kda_rec) + sizeof T->kda_rec || !T->kda_rec) { printf("FAIL: the backend has no GLM-5.3 ops\n"); return 1; }
+    if (!T || T->size < offsetof(ColiCudaChainOps, dsa_pool_select) + sizeof T->dsa_pool_select || !T->dsa_pool_select) {
+        printf("FAIL: the backend has no GLM-5.3 ops\n"); return 1; }
     if (!T->init(0) || !T->ready()) { printf("FAIL: no chain context\n"); return 1; }
     printf("kda\n");
     test_kda(2, 64, 4, 1.f); test_kda(3, 128, 4, 1.f); test_kda(2, 128, 4, 0.01f); test_kda(4, 64, 3, 0.05f);
     test_kda_rows(3, 128, 21, 0); test_kda_rows(2, 64, 8, 0); test_kda_rows(3, 128, 19, 2); test_kda_rows(2, 64, 30, 3);
+    printf("mla\n");
+    test_mla_core(3, 64, 0, 3, 20, 0, 0); test_mla_core(2, 512, 0, 4, 300, 0, 1); test_mla_core(4, 512, 64, 2, 900, 100, 1);
+    test_mla_core(64, 512, 0, 1, 2100, 0, 1); test_mla_core(1, 1000, 32, 5, 70, 7, 0);
+    test_mla_rows(); test_hgemv(0); test_hgemv(1);
+    printf("kpool\n");
+    test_kpool(3, 20, 4, 16, 2, 8, 1); test_kpool(2, 9, 1, 16, 4, 8, 1); test_kpool(4, 300, 4, 64, 4, 64, 1);
+    test_kpool(1, 2, 4, 16, 2, 4, 0); test_kpool(2, 30, 16, 16, 2, 6, 1); test_kpool(2, 1000, 4, 32, 4, 128, 1);
+    test_kpool(2, 5000, 32, 128, 4, 2048, 1);
     T->shutdown();
     printf(fails ? "FAIL (%d)\n" : "PASS\n", fails);
     return fails != 0;

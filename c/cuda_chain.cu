@@ -3501,5 +3501,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_matmul_hcmix,
     cc_mhc, cc_ds_attn, cc_ds_rope, cc_ds_compress, cc_ds_score, cc_ds_cand, cc_ds_topk, cc_ds_engram,
     cc_kda_conv, cc_kda_rec,
+    cc_mla_core, cc_mla_rope, cc_mla_lnorm, cc_mla_hgemv, cc_dsa_pool_keys, cc_dsa_pool_select,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

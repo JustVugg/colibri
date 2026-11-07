@@ -239,6 +239,18 @@ typedef struct { int S, H, D, kv_off, kv_row, x_off, x_row, qw_off, kw_off; floa
 typedef struct { int S, C, K, P, in_off, in_row, in_part, out_off, out_row, w_off, win_off; } CcKdaConv;
 typedef struct { int S, H, VD, P, m_off, m_row, f_off, f_row, b_off, b_row, g_off, g_row, y_off, y_row, st_off, prm_off;
                  float lb, neps, eps; } CcKdaRec;
+/* GLM-5.3's multi-head latent attention and k-pooled indexer (cuda_glm53c.cuh), the Vulkan chain's
+ * vkc_mla_core, vkc_mla_rope, vkc_mla_lnorm, vkc_dsa_pool_keys and vkc_dsa_pool_select with the same
+ * fields in the same order (vk_chain.h), and vkc_mla_hgemv on a float matrix: w's rows of I floats
+ * from float w_off (a GGUF's k_b and v_b go to the chain as floats). */
+typedef struct { int S, H, K, R, pos_base, kv_start, qa_off, qa_row, qa_seg, qr_off, qr_row, qr_seg,
+                 lat_off, lat_row, rope_off, rope_row, sel_off, sel_row, o_off, o_row, o_seg; float scale; } CcMlaCore;
+typedef struct { int nseg, per_row, rd, seg_len, style, x_off, x_row, x_seg, y_off, y_row, y_seg,
+                 cs_off, cs_row, w_off, b_off, has_b; float eps; } CcMlaRow;
+typedef struct { int trans, S, H, n, hstride, hoff, x_off, x_row, x_seg, y_off, y_row, y_seg, g_off, g_row, has_gate, I, w_off; } CcHgemv;
+typedef struct { int np, pool, p0, ID, g_off, g_row, ape_off, pk_off, k_off, k_row; } CcDsaPool;
+typedef struct { int S, pos_base, IH, ID, topk, pool, q_off, q_row, w_off, w_row, pk_off, tail, sc_row, sel_row;
+                 float wdiv, scale; } CcDsaPick;
 
 typedef struct ColiCudaChainOps {
     size_t size;
@@ -393,6 +405,12 @@ typedef struct ColiCudaChainOps {
     /* GLM-5.3's layer ops (cuda_glm53c.cuh) */
     int  (*kda_conv)(CcBuf *in, CcBuf *w, CcBuf *win, CcBuf *out, const CcKdaConv *p);
     int  (*kda_rec)(int KD, CcBuf *m, CcBuf *f, CcBuf *b, CcBuf *g, CcBuf *prm, CcBuf *st, CcBuf *y, const CcKdaRec *p, int flags);
+    int  (*mla_core)(CcBuf *qabs, CcBuf *qr, CcBuf *lat, CcBuf *rope, CcBuf *sel, CcBuf *clat, const CcMlaCore *p);
+    int  (*mla_rope)(CcBuf *x, CcBuf *cs, CcBuf *y, const CcMlaRow *p);
+    int  (*mla_lnorm)(CcBuf *x, CcBuf *prm, CcBuf *y, const CcMlaRow *p);
+    int  (*mla_hgemv)(CcBuf *w, CcBuf *x, CcBuf *y, CcBuf *gate, const CcHgemv *p);
+    int  (*dsa_pool_keys)(CcBuf *keys, CcBuf *gates, CcBuf *prm, CcBuf *pk, const CcDsaPool *p);
+    int  (*dsa_pool_select)(CcBuf *iq, CcBuf *hw, CcBuf *pk, CcBuf *sc, CcBuf *sel, const CcDsaPick *p);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -500,13 +518,27 @@ static inline int cc_ds_engram(CcBuf *kv, CcBuf *prm, CcBuf *x, const CcDsEngram
 /* GLM-5.3's layer ops: the module has them */
 static inline int cc_glm53_ready(void) {
     const ColiCudaChainOps *t = cc_ops();
-    return t && t->size >= offsetof(ColiCudaChainOps, kda_rec) + sizeof t->kda_rec && t->kda_rec;
+    return t && t->size >= offsetof(ColiCudaChainOps, dsa_pool_select) + sizeof t->dsa_pool_select && t->dsa_pool_select;
 }
 static inline int cc_kda_conv(CcBuf *in, CcBuf *w, CcBuf *win, CcBuf *out, const CcKdaConv *p) {
     return cc_glm53_ready() ? cc_ops()->kda_conv(in, w, win, out, p) : 0;
 }
 static inline int cc_kda_rec(int KD, CcBuf *m, CcBuf *f, CcBuf *b, CcBuf *g, CcBuf *prm, CcBuf *st, CcBuf *y, const CcKdaRec *p, int flags) {
     return cc_glm53_ready() ? cc_ops()->kda_rec(KD, m, f, b, g, prm, st, y, p, flags) : 0;
+}
+static inline int cc_mla_core(CcBuf *qabs, CcBuf *qr, CcBuf *lat, CcBuf *rope, CcBuf *sel, CcBuf *clat, const CcMlaCore *p) {
+    return cc_glm53_ready() ? cc_ops()->mla_core(qabs, qr, lat, rope, sel, clat, p) : 0;
+}
+static inline int cc_mla_rope(CcBuf *x, CcBuf *cs, CcBuf *y, const CcMlaRow *p) { return cc_glm53_ready() ? cc_ops()->mla_rope(x, cs, y, p) : 0; }
+static inline int cc_mla_lnorm(CcBuf *x, CcBuf *prm, CcBuf *y, const CcMlaRow *p) { return cc_glm53_ready() ? cc_ops()->mla_lnorm(x, prm, y, p) : 0; }
+static inline int cc_mla_hgemv(CcBuf *w, CcBuf *x, CcBuf *y, CcBuf *gate, const CcHgemv *p) {
+    return cc_glm53_ready() ? cc_ops()->mla_hgemv(w, x, y, gate, p) : 0;
+}
+static inline int cc_dsa_pool_keys(CcBuf *keys, CcBuf *gates, CcBuf *prm, CcBuf *pk, const CcDsaPool *p) {
+    return cc_glm53_ready() ? cc_ops()->dsa_pool_keys(keys, gates, prm, pk, p) : 0;
+}
+static inline int cc_dsa_pool_select(CcBuf *iq, CcBuf *hw, CcBuf *pk, CcBuf *sc, CcBuf *sel, const CcDsaPick *p) {
+    return cc_glm53_ready() ? cc_ops()->dsa_pool_select(iq, hw, pk, sc, sel, p) : 0;
 }
 /* the chain's and the backend's kernels loaded now where the backend can (an older one loads them
  * at their first launch) */
