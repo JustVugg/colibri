@@ -1904,14 +1904,17 @@ static void moe_by_expert(Model *m, int layer, const float *x, int S, float *log
 static void moe_vk_cpu(Model *m, int layer, const float *x, int n, const int *ib,
                        const uint8_t *want, float *ctb, float *g, float *u) {
     int D = m->c.hidden, K = m->c.topk;
+    ColiExpertStore store = olmoe_expert_store(m);
     for (int i = 0; i < n; i++) {
         if (!want[i]) continue;
-        Slot *e; expert_get(m, layer, ib[i], &e);
-        moe_expert_row(m, e, x + (int64_t)(i / K) * D, g, u, ctb + (int64_t)i * D);
+        ColiExpertView view;
+        olmoe_expert_acquire(&store, layer, ib[i], &view);
+        Slot *e = view.lease;
+        moe_expert_row(m, &view, x + (int64_t)(i / K) * D, g, u, ctb + (int64_t)i * D);
         pthread_mutex_lock(&g_pilot_mx);
         if (e->eid == ib[i]) { VktExpertSrc vs = olmoe_vk_src(e); vkt_note(layer, ib[i], &vs); }
-        e->busy--;   /* expert_put, under the lock already held */
         pthread_mutex_unlock(&g_pilot_mx);
+        coli_expert_release(&store, &view);
     }
 }
 static void moe_vk_run(Model *m, int layer, const float *x, int S, float *logits, float *out) {

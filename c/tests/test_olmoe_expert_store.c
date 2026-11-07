@@ -122,6 +122,16 @@ static void check_store(int ggml, int packed) {
         assert(!memcmp(&v, &empty, sizeof(v)) && !slot.busy && m.hits==2);
     }
     assert(coli_expert_lookup(&store, (ColiExpertKey){0,0}, NULL)!=0);
+#ifdef COLI_VULKAN
+    m.c.topk = 1;
+    const int ids[] = {0, 0};
+    const uint8_t want[] = {1, 0};
+    float fallback[2 * TD] = {0};
+    for (int i = TD; i < 2 * TD; i++) fallback[i] = 123.f;
+    moe_vk_cpu(&m, 0, x, 2, ids, want, fallback, g, u);
+    assert(!memcmp(fallback, expected, sizeof(expected)) && !slot.busy);
+    for (int i = TD; i < 2 * TD; i++) assert(fallback[i] == 123.f);
+#endif
     if (!ggml && getenv("OLMOE_STORE_BENCH")) bench_store(&m, &store);
     for (int k=0; k<3; k++) { free(*weights[k]); free(*scales[k]); }
     if (m.ehit) { free(m.ehit[0]); free(m.ehit); }
