@@ -52,7 +52,7 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `--topk` | `0` | `TOPK` | Top-k filter. |
 | `--repin` | `0` | `REPIN` | Re-pin experts every N tokens. |
 | `--policy` | `quality` | `COLI_POLICY` | `quality` \| `balanced` \| `experimental-fast`. |
-| `--gpu` | `None` | `COLI_GPU(S)` | `auto`, `none`, or a device list like `0,1`. |
+| `--gpu` | `None` | `COLI_GPU(S)` | `auto`, `none`, or a device list like `0,1`. On a Vulkan build without CUDA: `COLI_VULKAN=1` and `COLI_VK_DEV` (a second index: `COLI_VK_DEV2`), at most two devices; `none` also sets `COLI_VULKAN=0`. |
 | `--vram` | `0` (auto) | CUDA plan | Total VRAM budget in GB. |
 | `--auto-tier` | off | resource plan | Automatically apply the RAM/VRAM placement plan. |
 | `--no-tune-profile` | off | profile loader | Ignore a saved measured profile. |

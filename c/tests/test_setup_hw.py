@@ -434,6 +434,26 @@ class VulkanParsing(unittest.TestCase):
         self.assertIsNone(summary["vulkan"])
         self.assertFalse(summary["has_gpu"])
 
+    def test_engine_device_follows_coli_vk_dev(self):
+        """#2127: backend_vulkan.c takes COLI_VK_DEV's entry of the enumeration (strtol,
+        base 10, the whole string) and ranks otherwise; the plan sized the ranking's."""
+        first = device("RTX 3050", "discrete")
+        second = device("RTX 5060 Ti", "discrete")
+        devices = [first, second]
+        pick = setup_hw.engine_vulkan_device
+        self.assertIs(pick(devices, {}), first)                         # unset: the ranking
+        self.assertIs(pick(devices, {"COLI_VK_DEV": "1"}), second)
+        self.assertIs(pick(devices, {"COLI_VK_DEV": " +1"}), second)    # strtol's own forms
+        self.assertIs(pick(devices, {"COLI_VK_DEV": "0"}), first)
+        for ignored in ("2", "-1", "1 ", "1,0", "x", ""):               # the engine's "ignored" line
+            with self.subTest(value=ignored):
+                self.assertIs(pick(devices, {"COLI_VK_DEV": ignored}), first)
+        cpu = device("llvmpipe", "cpu")
+        self.assertIs(pick([cpu, first], {"COLI_VK_DEV": "0"}), cpu)    # forced, even a CPU device
+        self.assertIs(pick([cpu] * 8 + [first], {"COLI_VK_DEV": "8"}), cpu)   # it reads eight
+        with mock.patch.dict(os.environ, {"COLI_VK_DEV": "1"}):
+            self.assertIs(pick(devices), second)                        # default: the process's
+
     def test_user_driver_manifests(self):
         with tempfile.TemporaryDirectory() as home:
             manifest = Path(home, "mesa-dzn", "install", "share", "vulkan", "icd.d",

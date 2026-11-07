@@ -815,7 +815,8 @@ The dense chain can put layers there too: [Layers on two devices](#layers-on-two
 A machine with two GPUs (a V100 beside a GTX 1070, an RX 9070 beside an RX 580) can
 give the tier the memory of both. `COLI_VK_DEV2=auto` takes the best GPU that is not the
 primary device (a discrete card before an integrated one); `COLI_VK_DEV2=<index>` takes
-that entry of the Vulkan enumeration (`COLI_VK_DEV` picks the primary one the same way).
+that entry of the Vulkan enumeration (`COLI_VK_DEV` picks the primary one the same way;
+on a Vulkan build without CUDA, `coli chat --gpu 1,0` sets both).
 Every engine on the tier gets it, with nothing else to set:
 
 - **What goes where.** The primary device keeps its budget as before. The second
