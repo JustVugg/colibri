@@ -352,7 +352,7 @@ $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
 	deepseek_v4_internal.h deepseek_v4_gpu_devices.h deepseek_v4_dspark.inc deepseek_v4_device_draft.inc deepseek_v4_device_target.inc deepseek_v4_attention_trial.inc st.h json.h compat.h tensor.h quant.h fp8_format.h sse41_kernels.h \
 	route_trace.h vk_tier.h deepseek_v4_chain.h vk_chain.h \
 	native_quant.h native_quant_batch.h native_quant_dual.h \
-	native_quant_fp4_rows16.h expert_store_registry.h $(V4_FLAGS_STAMP)
+	native_quant_fp4_rows16.h expert_store_registry.h v4_topk.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -D$* -c deepseek_v4.c -o $@
 
 $(V4_HOT_TEST_OBJ): deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h \
@@ -365,6 +365,10 @@ $(V4_BATCH_TEST_OBJ): deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h \
 		tensor.h quant.h fp8_format.h native_quant.h native_quant_batch.h $(V4_FLAGS_STAMP) sse41_kernels.h
 	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS \
 		-DCOLI_V4_UNIT_NATIVE_QUANT_BATCH -c deepseek_v4.c -o $@
+
+# The GPU unit with the router test hooks (tests/test_v4_route_scratch_cuda.c).
+COLI_V4_UNIT_GPU_HOOK.o: deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h compat.h $(V4_FLAGS_STAMP)
+	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS -DCOLI_V4_UNIT_GPU -c deepseek_v4.c -o $@
 
 COLI_V4_UNIT_GENERATE_STATS.o: serve_codec.h
 
