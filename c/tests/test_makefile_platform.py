@@ -31,10 +31,11 @@ class MakefilePlatformTests(unittest.TestCase):
 
     def test_cuda_glibc_compat_opt_out_preserves_other_flags(self):
         default = self._dry_run("backend_cuda.o", "x86_64-unknown-linux-gnu",
-                                CUDA=1, CUDA_ARCH="sm_86")
+                                CUDA=1, CUDA_ARCH="sm_86", CURDIR=C_DIR.as_posix())
         disabled = self._dry_run("backend_cuda.o", "x86_64-unknown-linux-gnu",
-                                 CUDA=1, CUDA_ARCH="sm_86", CUDA_GLIBC_MATH_COMPAT=0)
-        flag = f"-Xcompiler=-include,{C_DIR}/glibc_c23_math_compat.h"
+                                 CUDA=1, CUDA_ARCH="sm_86", CUDA_GLIBC_MATH_COMPAT=0,
+                                 CURDIR=C_DIR.as_posix())
+        flag = f"-Xcompiler=-include,{C_DIR.as_posix()}/glibc_c23_math_compat.h"
         before = next(line for line in default.stdout.splitlines()
                       if "-c backend_cuda.cu" in line)
         after = next(line for line in disabled.stdout.splitlines()
