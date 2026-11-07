@@ -4281,6 +4281,22 @@ static int bd_tensor_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const
     hcg_part_sum(h, y, S, t->O, st);
     return cuda_ok(cudaGetLastError(), "block gemm launch");
 }
+/* A prompt's rows of a GGUF block matrix outside this backend's tensors (the CUDA expert
+ * tier's, cu_xb.cu, in the same layout: each row the file's blocks in row_words 32-bit
+ * words) on bd_tensor_gemm's f16 tiles, on `stream` of `device`'s context; 0 where they do
+ * not take it (no context, a format or width they decline, no f16 fragments), and the
+ * caller's GEMV does. */
+extern "C" int coli_cuda_bd_gemm_raw(int device, const void *w, int fmt, int I, int O, int row_words,
+                                     const float *x, float *y, int S, void *stream) {   /* cu_xb.cu's, not exported */
+    if (fmt < 100 || !w || !x || !y || S < 2 || I < 1 || O < 1) return 0;
+    DeviceContext *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    static ColiCudaTensor *t = nullptr;   /* the tier's thread only */
+    if (!t && !(t = (ColiCudaTensor *)calloc(1, sizeof *t))) return 0;
+    t->weights = const_cast<void *>(w); t->scales = nullptr; t->fmt = fmt; t->I = I; t->O = O; t->device = device;
+    t->row_words = row_words; t->weight_bytes = (size_t)row_words * 4 * (size_t)O;
+    return bd_tensor_gemm(ctx, t, y, x, S, (cudaStream_t)stream);
+}
 extern "C" int coli_cuda_host_register(void *p, size_t bytes) {
     if (!p || !bytes) return 0;
     if (cudaHostRegister(p, bytes, cudaHostRegisterPortable) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
