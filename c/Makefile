@@ -545,7 +545,7 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_xdna_execution test_xdna_failure \
 	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine test_qwen38_dn_gpu test_qwen38_cuda_chain \
 	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
-	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract test_idot_ssse3 \
+	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract test_idot_ssse3 test_int_kernel_exact_ssse3 \
 	test_ggml_quants test_gguf_c test_gq_dot
 TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32 test_vk_dev2_window
 # needs a CUDA device and the CUDA objects: make tests/test_cu_tier CUDA=1
@@ -564,7 +564,7 @@ TEST_BINS += tests/test_gsgemv_sse41$(EXE) tests/test_qgemv_sse41$(EXE) \
 	tests/test_olmoe_dot_i8_16_sse41$(EXE) tests/test_st_f16_bf16_simd_sse41$(EXE) \
 	tests/test_i4_grouped_sse41$(EXE) \
 	tests/test_i4_grouped_sse41_o1$(EXE) tests/test_i4_grouped_sse41_no_contract$(EXE) \
-	tests/test_idot_ssse3$(EXE)
+	tests/test_idot_ssse3$(EXE) tests/test_int_kernel_exact_ssse3$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
 TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) \
@@ -2493,6 +2493,12 @@ tests/test_idot$(EXE): tests/test_idot.c colibri.c $(VK_OBJ)
 # this branch instead of scalar, so it must remain a gate, not dead code.
 tests/test_idot_ssse3$(EXE): tests/test_idot.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -mssse3 -mno-avx2 -mno-fma $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# The integer kernels' SSSE3 arms against their pure-C references, as a pre-AVX2 build
+# (Sandy/Ivy Bridge) takes them: K1b's grouped planar IDOT among them, which such a build
+# runs under IDOT_GS=1. The native build of the same test runs in ci.yml's oracle job.
+tests/test_int_kernel_exact_ssse3$(EXE): tests/test_int_kernel_exact.c
+	$(CC) $(CFLAGS) -mssse3 -mno-avx2 -mno-fma $< -o $@ $(LDFLAGS)
 
 tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_HAVE_GROUPED_PAIR $< $(VK_OBJ) -o $@ $(LDFLAGS)
