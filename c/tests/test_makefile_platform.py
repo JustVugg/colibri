@@ -29,6 +29,23 @@ class MakefilePlatformTests(unittest.TestCase):
             check=True,
         )
 
+    def test_cuda_glibc_compat_opt_out_preserves_other_flags(self):
+        default = self._dry_run("backend_cuda.o", "x86_64-unknown-linux-gnu",
+                                CUDA=1, CUDA_ARCH="sm_86", CURDIR=C_DIR.as_posix())
+        disabled = self._dry_run("backend_cuda.o", "x86_64-unknown-linux-gnu",
+                                 CUDA=1, CUDA_ARCH="sm_86", CUDA_GLIBC_MATH_COMPAT=0,
+                                 CURDIR=C_DIR.as_posix())
+        flag = f"-Xcompiler=-include,{C_DIR.as_posix()}/glibc_c23_math_compat.h"
+        before = next(line for line in default.stdout.splitlines()
+                      if "-c backend_cuda.cu" in line)
+        after = next(line for line in disabled.stdout.splitlines()
+                     if "-c backend_cuda.cu" in line)
+        self.assertIn(flag, before)
+        self.assertNotIn(flag, after)
+        self.assertEqual(before.replace(flag, "").split(), after.split())
+        stamp = (C_DIR / ".build-config").read_text()
+        self.assertIn("CUDA_GLIBC_MATH_COMPAT=0", stamp)
+
     def test_windows_nt_without_uname_selects_mingw_build(self):
         env = os.environ.copy()
         env["OS"] = "Windows_NT"
