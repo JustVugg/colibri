@@ -99,7 +99,7 @@ typedef struct {
     int rows;                                  /* scratch capacity in rows */
     int cap;                                   /* positions the mirrors hold (q36c_mirror: grown with the context, at most kv_cap) */
     int host_cap;                              /* the host's kv_cap when they were planned (its sliding layers' form) */
-    size_t keep;                               /* the device memory a mirror of Q36C_KV_START positions leaves free (q36c_mirror) */
+    size_t keep;                               /* what the KV mirror leaves free before the prompt scratch exists (q36c_mirror) */
     int dev_rows;                              /* device KV rows a layer: cap, or the split's */
     int kvh, kvh_set;                          /* the mirrors in float16 (q36c_kvh_want), decided at the first */
     VkcKvSplit ks;                             /* the split past the device's budget (ks.on) */
@@ -718,7 +718,8 @@ static size_t q36c_late_bytes(Model *m, int ctx) {
         if (c->is_attn[i]) kv += row * (size_t)(R && c->win_layer && c->win_layer[i] ? R : ctx);
     return kv > half ? half : kv;
 }
-/* Plan and allocate the KV mirror before sizing a prompt chunk: positions [0, need) of the one
+/* Plan and allocate the KV mirror before sizing a prompt chunk (a first mirror past Q36C_KV_START
+ * sizes the first chunk itself, before it: keep, below): positions [0, need) of the one
  * conversation the chain holds. The mirror grows with the context to what the step needs and
  * an eighth more (1024 at least), rounded to 1024, at most the context, its rows again from
  * the host. Doubling gave the tier's experts back for positions no step reached: to 32768
@@ -760,13 +761,38 @@ static int q36c_mirror(Q36Chain *ch, Model *m, int need) {
     /* the full layers' rows past Q36C_KV_START come out of the tier where the device lacks
      * them, so a long conversation's prompt chunks are the size a short one's are: once the
      * prompt scratch exists, what it lacks for a chunk of the most rows stays free (and a
-     * margin); before that, the memory free beside a mirror of that start (keep, measured at
-     * the first). Keeping all of it took 512 MiB of Qwen3.6's experts for 240 MiB of mirror at
-     * 4K on an RTX PRO 4000 whose budget left 2.36 GiB unused (1805 against 773 tok/s) */
+     * margin); before that, the memory free beside a mirror of that start, or only the first
+     * chunk's beside a longer first mirror (keep, decided at the first). Keeping all of it took
+     * 512 MiB of Qwen3.6's experts for 240 MiB of mirror at 4K on an RTX PRO 4000 whose budget
+     * left 2.36 GiB unused (1805 against 773 tok/s) */
     size_t want = (size_t)nf * cap * row, more = want > held ? want - held : 0;
     if (!ch->keep) {
         const size_t start = (size_t)nf * (top < Q36C_KV_START ? top : Q36C_KV_START) * row, av = vkc_dev_avail() + held;
         ch->keep = av > start + Q36C_KV_MARGIN ? av - start : Q36C_KV_MARGIN;
+        /* a first mirror past the start keeps free only the first chunk's scratch, the room the tier leaves on
+         * the primary for staging host pool experts, and the margin, never more than before. Keeping all the
+         * room past the start took the rows past Q36C_KV_START from the expert tier for the rest of the process
+         * (the tier lowers its maximum): an Arc Pro B60 with Qwen3.6's 18 GiB tier, a 16K-token first prompt,
+         * 78 experts out, that prompt 74.4 -> 88.6 s, decode 35 -> 24-30 tok/s after it. The chunk's rows are
+         * decided here, before the mirror (vkc_chunk_rows decides them once; or COLI_VK_CHAIN_ROWS): a chunk's
+         * room kept with its rows decided after that mirror took no expert (74.2 s, decode 35.1-35.4 tok/s),
+         * but the process's chunks came out 4608 rows against 4864. A short first request decides them after
+         * its own mirror, as before, so a long one's can come out up to half that mirror bigger (at most one
+         * 256-row step on the B60). Only where the device reports its budget (without it vkc_dev_avail counts
+         * the tier's blocks as free) and the whole mirror and the margin fit in the half of the free memory a
+         * chunk leaves (that memory as vkc_chunk_rows reads it: at most what RAM has, which holds the mirror too
+         * on a device that shares it); past that all the room stays, as before: a chunk decided before the
+         * mirror would not fit beside it where the tier gives nothing back (no tier; the second device, whose
+         * vkt_give_back empties the primary's blocks) */
+        double used = 0, bud = 0;
+        if (want > start && coli_vk_mem_budget_dev(vkc_device_now(), &used, &bud)) {
+            const double ram = compat_mem_available_gb() * 1e9;
+            const size_t stage = ch->d ? 0 : vkt_stage_room(), fb = ram > 0 && ram < (double)av ? (size_t)ram : av;
+            if (fb > stage && (size_t)leq * cap * row + Q36C_KV_MARGIN <= (fb - stage) / 2) {
+                const size_t first = (size_t)q36c_chunk_rows(ch, m) * q36c_chunk_row_bytes(ch, m) + stage + Q36C_KV_MARGIN;
+                if (first < ch->keep) ch->keep = first;
+            }
+        }
     }
     size_t keep = ch->keep;
     if (ch->rows > 0) {

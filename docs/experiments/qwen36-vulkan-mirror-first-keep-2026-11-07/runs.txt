@@ -1,0 +1,236 @@
+# a long first prompt's KV mirror no longer takes experts from the tier: dev against dev + this change (2026-11-07)
+# Question (written at 2026-11-07T08:20:29Z, while the campaign's first engine was still loading, before any result existed): xe2/mirror-first-keep: a fresh engine whose first request is a 16K prompt (D K K D D K): experts given back to the dense chain, decode of the next two 128-token answers, the prompt chunk, the first token; dev against dev + the PR. With a short first request, is K's chunk the same as dev's (dev's short-first chunk is read from the prompt block's D arms)?
+# Hardware: Proxmox VE 9.2 VM on an HP Z6 G4: 32 vCPUs of an Intel Xeon Gold 6254 @ 3.10GHz (1 socket, 1 thread per core in the guest); GPU 0 = an Intel Arc Pro B60 (Xe2, BMG G21, 24 GB) as an SR-IOV VF (0000:01:00.0), factory clocks, nothing else running on it; 247 GiB in the guest; Ubuntu 26.04.1 LTS guest, kernel 7.0.0-42-generic, xe kernel driver (SR-IOV VF: a GPU job is killed after 5 s); engine image Ubuntu 26.04 with Mesa ANV 26.0.8 (mesa-vulkan-drivers 26.0.8-1ubuntu0.3); engine compiled with gcc 15.2.0 (Ubuntu 15.2.0-16ubuntu1) in the colibri-builder:xe2 container (ubuntu:26.04): -O3 -march=x86-64-v3, VK=1.
+# Model: Qwen/Qwen3.6-35B-A3B in colibri's int4-gs64 container (expert_gs=64, ~22 GB; base_model Qwen/Qwen3.6-35B-A3B in its README), at /models/qwen36-35b-a3b (config.json sha256 7606939241b64e82308369b308af8abe85d24e70846704c41ed4e0b59687a674).
+# Engines, built from two trees in the same toolchain container and copied over the same base image (Ubuntu 26.04, Mesa 26.0.8, main 0a5504a1's Python gateway), so only the engine binaries and shaders differ:
+#   dev     upstream dev e24cd51afd44b480c1e41ba82e20a28bac76c34f, image colibri-vulkan:dev-base, qwen36 sha256 1d8f712d518d7fec7300846e811ca0476e97cc83e88986d0eff2d872239a1951
+#   change  the same tree with this change, image colibri-vulkan:pr-mirror-keep, qwen36 sha256 8cfb74b13f84eb47afbaea97df45c4acab6cf04ec11d21fc58ee00345abd79a9
+# Engine config, every arm: coli serve --model /models/qwen36-35b-a3b --ram 32, COLI_VK_TIER_GB=18, COLI_VK_DEV2= (GPU 0 only), OMP_NUM_THREADS=16; the chain on as dev needs it on Xe2: anv_enable_buffer_comp=true, COLI_VK_SUBGROUP=16; COLI_VK_ATTN_SLICE unset.
+# Command: Build, both trees: docker run --rm -v <tree>:/src -w /src colibri-builder:xe2 nice -n 19 make -C c colibri qwen36 VK=1 ARCH=x86-64-v3 -j8 (0 warnings); c/colibri, c/qwen36 and c/shaders/ copied over colibri-vulkan:ubuntu26-qwen (Mesa 26.0.8, main 0a5504a1's Python gateway). Engine: docker compose up -d with the measuring host's compose.yaml (coli serve --model /models/qwen36-35b-a3b --ram 32; COLI_VK_TIER_GB=18, COLI_VK_DEV2= (GPU 0 only), OMP_NUM_THREADS=16) and an override with the arm's image and variables. Measured with colibench: python3 experiments/pr_manifests.py firstlong (streamed OpenAI API requests to the engine, temperature 0); this folder made by experiments/make_manifests.py from its records.
+# Arms in the order they ran: firstlong-D-16000-1 (09:44:57 UTC), firstlong-K-16000-1 (09:51:16 UTC), firstlong-K-16000-2 (09:57:35 UTC), firstlong-D-16000-2 (10:04:12 UTC), firstlong-D-16000-3 (10:10:48 UTC), firstlong-K-16000-3 (10:17:09 UTC), firstlong-K-short-1 (10:23:28 UTC), kvanswers-K-1 (10:32:10 UTC).
+# Prompt set sha256 (sha256 of the sorted sha256s of the measured prompts, one per line): aeb5b994d4eae4bd80a0f021d91af048483815cd27c2296b984dc383bec2a0de.
+# Read: tok/s = the first of two 128-token answers ('Write a long story about a lighthouse keeper. Keep going.') after a fresh engine's FIRST request, a 16K-token prompt with a one-token answer. Experts given back = the sum of '<n> out of the tier' in the engine's 'back for the dense chain' lines.
+# Logs: logs.txt beside this file (sha256 f8673255b5fe606b9512c47b2047ddc69e92016ef4adcc4bfe0fffb335ef4dd4) holds every engine's whole log.
+
+# Samples
+firstlong-D-16000-1  fresh engine, first request = 16K prompt (seed 7417, sha256 50f85829e7431bed): experts given back 76; prompt chunk 4864 rows (3.67 GiB free); first token 132.44 s; then 128-token answers at 27.13 and 32.52 tok/s
+firstlong-D-16000-2  fresh engine, first request = 16K prompt (seed 7418, sha256 aa8645cb9d87c0eb): experts given back 77; prompt chunk 4864 rows (3.67 GiB free); first token 132.42 s; then 128-token answers at 26.16 and 32.35 tok/s
+firstlong-D-16000-3  fresh engine, first request = 16K prompt (seed 7419, sha256 854260dbd599d27a): experts given back 77; prompt chunk 4864 rows (3.67 GiB free); first token 132.56 s; then 128-token answers at 26.73 and 32.25 tok/s
+firstlong-K-16000-1  fresh engine, first request = 16K prompt (seed 7417, sha256 50f85829e7431bed): experts given back 0; prompt chunk 4864 rows (3.78 GiB free); first token 118.43 s; then 128-token answers at 37.83 and 38.0 tok/s
+firstlong-K-16000-2  fresh engine, first request = 16K prompt (seed 7418, sha256 aa8645cb9d87c0eb): experts given back 0; prompt chunk 4864 rows (3.78 GiB free); first token 118.57 s; then 128-token answers at 37.88 and 38.0 tok/s
+firstlong-K-16000-3  fresh engine, first request = 16K prompt (seed 7419, sha256 854260dbd599d27a): experts given back 0; prompt chunk 4864 rows (3.78 GiB free); first token 118.4 s; then 128-token answers at 37.85 and 38.06 tok/s
+
+# Answers (greedy, 3 prompts, 160 tokens)
+baseline: reference build
+trial:    3/3 identical
+
+===== firstlong-D-16000-1: image colibri-vulkan:dev-base, Mesa 26.0.8-1ubuntu0.3, qwen36 sha256 1d8f712d518d7fec7300846e811ca0476e97cc83e88986d0eff2d872239a1951, engine ready after 243 s
+# record: {}
+# the engine's whole log: logs.txt, section 'firstlong-D-16000-1.log' (sha256 b9dc4cc23400439aefc84d434c51f8720e8024b6871ac39e84c0be18b6d4763b); its key lines:
+  ATTENTION: default value of option anv_enable_buffer_comp overridden by environment.
+  [VK] memory: mapped weights, the host-visible device-local memory gave the 20 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.2 s
+  [VK] ready: Intel(R) Arc(tm) Pro B60 Graphics (BMG G21), compute qfam 0, memtype 3, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096
+  [VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 21.34 GiB, reserve 1.00 GiB)
+  [VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+  [VK] chain: this driver does not hold a frame at an event the host sets while it runs (the probe: started 0, after 20 ms 0, at the end 2); the hybrid steps run on the timelines
+  [VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1811939328 B
+  [VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+  [VK] chain: 17 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+  [VK] tier qwen36: on, Intel(R) Arc(tm) Pro B60 Graphics (BMG G21), budget 18.00 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+  [VK] tier qwen36: warm start, 10240 experts in 194.4s (0 from the history, 10240 more to fill the device: every expert of the model)
+  [VK] tier qwen36: 256.0 MiB of device memory back for the dense chain (0 experts to the host pool, 76 out of the tier; the tier's pool now 16.75 GiB in 67 blocks)
+  [VK] qwen36 chain: prompt chunks of up to 4864 rows (389 KiB a row; 3.67 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+  [VK] qwen36 chain: 1 forwards, 2116 frames (4599 ops, 1441 matmuls, 1400 tiled GEMM), 104288.2 ms waiting for the device, 27582.3 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 0 in the integer form), 1844.6 MiB on the device
+  [VK] tier qwen36 turn: device 5145121 of 5145280 routed experts (100.0%; this turn 5145121 of 5145280) | CPU RAM hits 238, disk loads 60 | resident 10164 (budget 10164, 16.86 GiB of 17.75 GiB, 68 blocks, frag 0.02) | uploads 10253 (15.02 GiB, 10240 warm), evictions 89, skipped 0 queue + 0 rate, fail
+  [VK] qwen36 chain: 129 forwards, 10039 frames (101260 ops, 47649 matmuls, 1690 tiled GEMM), 107032.1 ms waiting for the device, 28961.1 ms of routed experts on the host, 1373 layer steps with the routed experts in the frame (1 of them a prompt chunk's, 0 in the integer form), 1957.1 MiB on the devic
+  [VK] qwen36 chain: the hybrid steps measured 1 time(s): a decode forward 43.0 ms with them, 49.5 ms with the device reading the host pool itself; kept (COLI_VK_HYBRID_GATE=0 keeps them on)
+  [VK] tier qwen36 turn: device 5193796 of 5194240 routed experts (100.0%; this turn 48675 of 48960) | CPU RAM hits 490, disk loads 93 | resident 10164 (budget 10164, 16.86 GiB of 17.75 GiB, 68 blocks, frag 0.02) | uploads 10297 (15.08 GiB, 10240 warm), evictions 133, skipped 0 queue + 0 rate, failed 
+  [VK] qwen36 chain: 257 forwards, 17404 frames (199234 ops, 93857 matmuls, 1980 tiled GEMM), 109862.7 ms waiting for the device, 29802.0 ms of routed experts on the host, 3066 layer steps with the routed experts in the frame (13 of them a prompt chunk's, 0 in the integer form), 1957.1 MiB on the devi
+  [VK] qwen36 chain: the hybrid steps measured 1 time(s): a decode forward 43.0 ms with them, 49.5 ms with the device reading the host pool itself; kept (COLI_VK_HYBRID_GATE=0 keeps them on)
+  [VK] tier qwen36 turn: device 5242555 of 5243200 routed experts (100.0%; this turn 48759 of 48960) | CPU RAM hits 691, disk loads 93 | resident 10164 (budget 10164, 16.86 GiB of 17.75 GiB, 68 blocks, frag 0.02) | uploads 10304 (15.09 GiB, 10240 warm), evictions 140, skipped 0 queue + 0 rate, failed 
+
+===== firstlong-K-16000-1: image colibri-vulkan:pr-mirror-keep, Mesa 26.0.8-1ubuntu0.3, qwen36 sha256 8cfb74b13f84eb47afbaea97df45c4acab6cf04ec11d21fc58ee00345abd79a9, engine ready after 242 s
+# record: {}
+# the engine's whole log: logs.txt, section 'firstlong-K-16000-1.log' (sha256 42f37803c6e0c1a41fdae06b5088299a6abff489eb2ec6818941506bd74dce17); its key lines:
+  ATTENTION: default value of option anv_enable_buffer_comp overridden by environment.
+  [VK] memory: mapped weights, the host-visible device-local memory gave the 20 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.2 s
+  [VK] ready: Intel(R) Arc(tm) Pro B60 Graphics (BMG G21), compute qfam 0, memtype 3, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096
+  [VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 21.34 GiB, reserve 1.00 GiB)
+  [VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+  [VK] chain: this driver does not hold a frame at an event the host sets while it runs (the probe: started 0, after 20 ms 0, at the end 2); the hybrid steps run on the timelines
+  [VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1811939328 B
+  [VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+  [VK] chain: 17 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+  [VK] tier qwen36: on, Intel(R) Arc(tm) Pro B60 Graphics (BMG G21), budget 18.00 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+  [VK] tier qwen36: warm start, 10240 experts in 193.0s (0 from the history, 10240 more to fill the device: every expert of the model)
+  [VK] qwen36 chain: prompt chunks of up to 4864 rows (389 KiB a row; 3.78 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+  [VK] qwen36 chain: 1 forwards, 1836 frames (5719 ops, 1441 matmuls, 1400 tiled GEMM), 117887.6 ms waiting for the device, 0.0 ms of routed experts on the host, 160 layer steps with the routed experts in the frame (160 of them a prompt chunk's, 0 in the integer form), 2257.5 MiB on the device
+  [VK] tier qwen36 turn: device 5145280 of 5145280 routed experts (100.0%; this turn 5145280 of 5145280) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.00 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0
+  [VK] qwen36 chain: 129 forwards, 3177 frames (117485 ops, 47649 matmuls, 1690 tiled GEMM), 121225.6 ms waiting for the device, 0.0 ms of routed experts on the host, 5280 layer steps with the routed experts in the frame (200 of them a prompt chunk's, 0 in the integer form), 2332.3 MiB on the device
+  [VK] qwen36 chain: the hybrid steps measured 1 time(s): a decode forward 25.6 ms with them, 25.7 ms with the device reading the host pool itself; kept (COLI_VK_HYBRID_GATE=0 keeps them on)
+  [VK] tier qwen36 turn: device 5194240 of 5194240 routed experts (100.0%; this turn 48960 of 48960) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.00 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | d
+  [VK] qwen36 chain: 257 forwards, 4457 frames (229251 ops, 93857 matmuls, 1980 tiled GEMM), 124558.6 ms waiting for the device, 0.0 ms of routed experts on the host, 10400 layer steps with the routed experts in the frame (240 of them a prompt chunk's, 0 in the integer form), 2338.3 MiB on the device
+  [VK] qwen36 chain: the hybrid steps measured 1 time(s): a decode forward 25.6 ms with them, 25.7 ms with the device reading the host pool itself; kept (COLI_VK_HYBRID_GATE=0 keeps them on)
+  [VK] tier qwen36 turn: device 5243200 of 5243200 routed experts (100.0%; this turn 48960 of 48960) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.00 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | d
+
+===== firstlong-K-16000-2: image colibri-vulkan:pr-mirror-keep, Mesa 26.0.8-1ubuntu0.3, qwen36 sha256 8cfb74b13f84eb47afbaea97df45c4acab6cf04ec11d21fc58ee00345abd79a9, engine ready after 240 s
+# record: {}
+# the engine's whole log: logs.txt, section 'firstlong-K-16000-2.log' (sha256 ab0a9e73e5b3ee7c8aea91f2e408685bdbe0aed742c1e76232b2905fd063b0c0); its key lines:
+  ATTENTION: default value of option anv_enable_buffer_comp overridden by environment.
+  [VK] memory: mapped weights, the host-visible device-local memory gave the 20 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.2 s
+  [VK] ready: Intel(R) Arc(tm) Pro B60 Graphics (BMG G21), compute qfam 0, memtype 3, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096
+  [VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 21.34 GiB, reserve 1.00 GiB)
+  [VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+  [VK] chain: this driver does not hold a frame at an event the host sets while it runs (the probe: started 0, after 20 ms 0, at the end 2); the hybrid steps run on the timelines
+  [VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1811939328 B
+  [VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+  [VK] chain: 17 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+  [VK] tier qwen36: on, Intel(R) Arc(tm) Pro B60 Graphics (BMG G21), budget 18.00 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+  [VK] tier qwen36: warm start, 10240 experts in 190.8s (0 from the history, 10240 more to fill the device: every expert of the model)
+  [VK] qwen36 chain: prompt chunks of up to 4864 rows (389 KiB a row; 3.78 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+  [VK] qwen36 chain: 1 forwards, 1836 frames (5719 ops, 1441 matmuls, 1400 tiled GEMM), 118010.8 ms waiting for the device, 0.0 ms of routed experts on the host, 160 layer steps with the routed experts in the frame (160 of them a prompt chunk's, 0 in the integer form), 2257.5 MiB on the device
+  [VK] tier qwen36 turn: device 5151360 of 5151360 routed experts (100.0%; this turn 5151360 of 5151360) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.00 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0
+  [VK] qwen36 chain: 129 forwards, 3177 frames (117485 ops, 47649 matmuls, 1690 tiled GEMM), 121344.5 ms waiting for the device, 0.0 ms of routed experts on the host, 5280 layer steps with the routed experts in the frame (200 of them a prompt chunk's, 0 in the integer form), 2332.3 MiB on the device
+  [VK] qwen36 chain: the hybrid steps measured 1 time(s): a decode forward 25.5 ms with them, 25.7 ms with the device reading the host pool itself; kept (COLI_VK_HYBRID_GATE=0 keeps them on)
+  [VK] tier qwen36 turn: device 5200320 of 5200320 routed experts (100.0%; this turn 48960 of 48960) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.00 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | d
+  [VK] qwen36 chain: 257 forwards, 4457 frames (229251 ops, 93857 matmuls, 1980 tiled GEMM), 124677.2 ms waiting for the device, 0.0 ms of routed experts on the host, 10400 layer steps with the routed experts in the frame (240 of them a prompt chunk's, 0 in the integer form), 2338.3 MiB on the device
+  [VK] qwen36 chain: the hybrid steps measured 1 time(s): a decode forward 25.5 ms with them, 25.7 ms with the device reading the host pool itself; kept (COLI_VK_HYBRID_GATE=0 keeps them on)
+  [VK] tier qwen36 turn: device 5249280 of 5249280 routed experts (100.0%; this turn 48960 of 48960) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.00 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | d
+
+===== firstlong-D-16000-2: image colibri-vulkan:dev-base, Mesa 26.0.8-1ubuntu0.3, qwen36 sha256 1d8f712d518d7fec7300846e811ca0476e97cc83e88986d0eff2d872239a1951, engine ready after 243 s
+# record: {}
+# the engine's whole log: logs.txt, section 'firstlong-D-16000-2.log' (sha256 98b1e62546de14845f97c9ff75c7f123ef962b8d1fe548d246e728158cbc568a); its key lines:
+  ATTENTION: default value of option anv_enable_buffer_comp overridden by environment.
+  [VK] memory: mapped weights, the host-visible device-local memory gave the 20 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.2 s
+  [VK] ready: Intel(R) Arc(tm) Pro B60 Graphics (BMG G21), compute qfam 0, memtype 3, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096
+  [VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 21.34 GiB, reserve 1.00 GiB)
+  [VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+  [VK] chain: this driver does not hold a frame at an event the host sets while it runs (the probe: started 0, after 20 ms 0, at the end 2); the hybrid steps run on the timelines
+  [VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1811939328 B
+  [VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+  [VK] chain: 17 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+  [VK] tier qwen36: on, Intel(R) Arc(tm) Pro B60 Graphics (BMG G21), budget 18.00 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+  [VK] tier qwen36: warm start, 10240 experts in 193.4s (0 from the history, 10240 more to fill the device: every expert of the model)
+  [VK] tier qwen36: 256.0 MiB of device memory back for the dense chain (0 experts to the host pool, 77 out of the tier; the tier's pool now 16.75 GiB in 67 blocks)
+  [VK] qwen36 chain: prompt chunks of up to 4864 rows (389 KiB a row; 3.67 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+  [VK] qwen36 chain: 1 forwards, 2116 frames (4599 ops, 1441 matmuls, 1400 tiled GEMM), 104147.2 ms waiting for the device, 27689.5 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 0 in the integer form), 1844.6 MiB on the device
+  [VK] tier qwen36 turn: device 5151208 of 5151360 routed experts (100.0%; this turn 5151208 of 5151360) | CPU RAM hits 229, disk loads 58 | resident 10163 (budget 10163, 16.85 GiB of 17.75 GiB, 68 blocks, frag 0.02) | uploads 10249 (15.01 GiB, 10240 warm), evictions 86, skipped 0 queue + 0 rate, fail
+  [VK] qwen36 chain: 129 forwards, 10609 frames (100085 ops, 47649 matmuls, 1690 tiled GEMM), 106834.3 ms waiting for the device, 29259.2 ms of routed experts on the host, 1080 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 0 in the integer form), 1954.7 MiB on the devic
+  [VK] qwen36 chain: the hybrid steps measured 1 time(s): a decode forward 54.3 ms with them, 53.1 ms with the device reading the host pool itself; kept (COLI_VK_HYBRID_GATE=0 keeps them on)
+  [VK] tier qwen36 turn: device 5199872 of 5200320 routed experts (100.0%; this turn 48664 of 48960) | CPU RAM hits 489, disk loads 94 | resident 10163 (budget 10163, 16.85 GiB of 17.75 GiB, 68 blocks, frag 0.02) | uploads 10294 (15.08 GiB, 10240 warm), evictions 131, skipped 0 queue + 0 rate, failed 
+  [VK] qwen36 chain: 257 forwards, 18136 frames (197537 ops, 93857 matmuls, 1980 tiled GEMM), 109636.3 ms waiting for the device, 30122.9 ms of routed experts on the host, 2644 layer steps with the routed experts in the frame (10 of them a prompt chunk's, 0 in the integer form), 1957.1 MiB on the devi
+  [VK] qwen36 chain: the hybrid steps measured 1 time(s): a decode forward 54.3 ms with them, 53.1 ms with the device reading the host pool itself; kept (COLI_VK_HYBRID_GATE=0 keeps them on)
+  [VK] tier qwen36 turn: device 5248621 of 5249280 routed experts (100.0%; this turn 48749 of 48960) | CPU RAM hits 700, disk loads 94 | resident 10163 (budget 10163, 16.85 GiB of 17.75 GiB, 68 blocks, frag 0.02) | uploads 10304 (15.09 GiB, 10240 warm), evictions 141, skipped 0 queue + 0 rate, failed 
+
+===== firstlong-D-16000-3: image colibri-vulkan:dev-base, Mesa 26.0.8-1ubuntu0.3, qwen36 sha256 1d8f712d518d7fec7300846e811ca0476e97cc83e88986d0eff2d872239a1951, engine ready after 243 s
+# record: {}
+# the engine's whole log: logs.txt, section 'firstlong-D-16000-3.log' (sha256 3cd6f185396b1cd821f5eec8e05386ebbd9b95f429bb90714f439d3b397c9ddd); its key lines:
+  ATTENTION: default value of option anv_enable_buffer_comp overridden by environment.
+  [VK] memory: mapped weights, the host-visible device-local memory gave the 20 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.2 s
+  [VK] ready: Intel(R) Arc(tm) Pro B60 Graphics (BMG G21), compute qfam 0, memtype 3, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096
+  [VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 21.34 GiB, reserve 1.00 GiB)
+  [VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+  [VK] chain: this driver does not hold a frame at an event the host sets while it runs (the probe: started 0, after 20 ms 0, at the end 2); the hybrid steps run on the timelines
+  [VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1811939328 B
+  [VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+  [VK] chain: 17 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+  [VK] tier qwen36: on, Intel(R) Arc(tm) Pro B60 Graphics (BMG G21), budget 18.00 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+  [VK] tier qwen36: warm start, 10240 experts in 192.7s (0 from the history, 10240 more to fill the device: every expert of the model)
+  [VK] tier qwen36: 256.0 MiB of device memory back for the dense chain (0 experts to the host pool, 77 out of the tier; the tier's pool now 16.75 GiB in 67 blocks)
+  [VK] qwen36 chain: prompt chunks of up to 4864 rows (389 KiB a row; 3.67 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+  [VK] qwen36 chain: 1 forwards, 2116 frames (4599 ops, 1441 matmuls, 1400 tiled GEMM), 104167.8 ms waiting for the device, 27808.9 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 0 in the integer form), 1844.6 MiB on the device
+  [VK] tier qwen36 turn: device 5157275 of 5157440 routed experts (100.0%; this turn 5157275 of 5157440) | CPU RAM hits 243, disk loads 62 | resident 10163 (budget 10163, 16.85 GiB of 17.75 GiB, 68 blocks, frag 0.03) | uploads 10253 (15.02 GiB, 10240 warm), evictions 90, skipped 0 queue + 0 rate, fail
+  [VK] qwen36 chain: 129 forwards, 10037 frames (101267 ops, 47649 matmuls, 1690 tiled GEMM), 106917.3 ms waiting for the device, 29295.5 ms of routed experts on the host, 1374 layer steps with the routed experts in the frame (2 of them a prompt chunk's, 0 in the integer form), 1957.1 MiB on the devic
+  [VK] qwen36 chain: the hybrid steps measured 1 time(s): a decode forward 42.8 ms with them, 43.9 ms with the device reading the host pool itself; kept (COLI_VK_HYBRID_GATE=0 keeps them on)
+  [VK] tier qwen36 turn: device 5205950 of 5206400 routed experts (100.0%; this turn 48675 of 48960) | CPU RAM hits 491, disk loads 99 | resident 10163 (budget 10163, 16.85 GiB of 17.75 GiB, 68 blocks, frag 0.03) | uploads 10301 (15.09 GiB, 10240 warm), evictions 138, skipped 0 queue + 0 rate, failed 
+  [VK] qwen36 chain: 257 forwards, 17402 frames (199241 ops, 93857 matmuls, 1980 tiled GEMM), 109755.4 ms waiting for the device, 30127.6 ms of routed experts on the host, 3067 layer steps with the routed experts in the frame (14 of them a prompt chunk's, 0 in the integer form), 1957.1 MiB on the devi
+  [VK] qwen36 chain: the hybrid steps measured 1 time(s): a decode forward 42.8 ms with them, 43.9 ms with the device reading the host pool itself; kept (COLI_VK_HYBRID_GATE=0 keeps them on)
+  [VK] tier qwen36 turn: device 5254729 of 5255360 routed experts (100.0%; this turn 48779 of 48960) | CPU RAM hits 672, disk loads 99 | resident 10163 (budget 10163, 16.85 GiB of 17.75 GiB, 68 blocks, frag 0.03) | uploads 10311 (15.10 GiB, 10240 warm), evictions 148, skipped 0 queue + 0 rate, failed 
+
+===== firstlong-K-16000-3: image colibri-vulkan:pr-mirror-keep, Mesa 26.0.8-1ubuntu0.3, qwen36 sha256 8cfb74b13f84eb47afbaea97df45c4acab6cf04ec11d21fc58ee00345abd79a9, engine ready after 243 s
+# record: {}
+# the engine's whole log: logs.txt, section 'firstlong-K-16000-3.log' (sha256 2db1ab43376bde2e8cf3aaffd6948f8a1d5b864d83d9b49e26a2b7a2b95d2500); its key lines:
+  ATTENTION: default value of option anv_enable_buffer_comp overridden by environment.
+  [VK] memory: mapped weights, the host-visible device-local memory gave the 20 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.2 s
+  [VK] ready: Intel(R) Arc(tm) Pro B60 Graphics (BMG G21), compute qfam 0, memtype 3, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096
+  [VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 21.34 GiB, reserve 1.00 GiB)
+  [VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+  [VK] chain: this driver does not hold a frame at an event the host sets while it runs (the probe: started 0, after 20 ms 0, at the end 2); the hybrid steps run on the timelines
+  [VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1811939328 B
+  [VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+  [VK] chain: 17 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+  [VK] tier qwen36: on, Intel(R) Arc(tm) Pro B60 Graphics (BMG G21), budget 18.00 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+  [VK] tier qwen36: warm start, 10240 experts in 193.7s (0 from the history, 10240 more to fill the device: every expert of the model)
+  [VK] qwen36 chain: prompt chunks of up to 4864 rows (389 KiB a row; 3.78 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+  [VK] qwen36 chain: 1 forwards, 1836 frames (5719 ops, 1441 matmuls, 1400 tiled GEMM), 117829.5 ms waiting for the device, 0.0 ms of routed experts on the host, 160 layer steps with the routed experts in the frame (160 of them a prompt chunk's, 0 in the integer form), 2257.5 MiB on the device
+  [VK] tier qwen36 turn: device 5157440 of 5157440 routed experts (100.0%; this turn 5157440 of 5157440) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.00 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0
+  [VK] qwen36 chain: 129 forwards, 3177 frames (117485 ops, 47649 matmuls, 1690 tiled GEMM), 121160.0 ms waiting for the device, 0.0 ms of routed experts on the host, 5280 layer steps with the routed experts in the frame (200 of them a prompt chunk's, 0 in the integer form), 2332.3 MiB on the device
+  [VK] qwen36 chain: the hybrid steps measured 1 time(s): a decode forward 25.6 ms with them, 25.8 ms with the device reading the host pool itself; kept (COLI_VK_HYBRID_GATE=0 keeps them on)
+  [VK] tier qwen36 turn: device 5206400 of 5206400 routed experts (100.0%; this turn 48960 of 48960) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.00 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | d
+  [VK] qwen36 chain: 257 forwards, 4457 frames (229251 ops, 93857 matmuls, 1980 tiled GEMM), 124466.5 ms waiting for the device, 0.0 ms of routed experts on the host, 10400 layer steps with the routed experts in the frame (240 of them a prompt chunk's, 0 in the integer form), 2338.3 MiB on the device
+  [VK] qwen36 chain: the hybrid steps measured 1 time(s): a decode forward 25.6 ms with them, 25.8 ms with the device reading the host pool itself; kept (COLI_VK_HYBRID_GATE=0 keeps them on)
+  [VK] tier qwen36 turn: device 5255360 of 5255360 routed experts (100.0%; this turn 48960 of 48960) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.00 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | d
+
+===== firstlong-K-short-1: image colibri-vulkan:pr-mirror-keep, Mesa 26.0.8-1ubuntu0.3, qwen36 sha256 8cfb74b13f84eb47afbaea97df45c4acab6cf04ec11d21fc58ee00345abd79a9, engine ready after 242 s
+# record: {}
+# the engine's whole log: logs.txt, section 'firstlong-K-short-1.log' (sha256 32a5ac5d7fe77cc9a404f5ac6419f124df96cb3706a68b71c9c3182d8f46714b); its key lines:
+  ATTENTION: default value of option anv_enable_buffer_comp overridden by environment.
+  [VK] memory: mapped weights, the host-visible device-local memory gave the 20 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.2 s
+  [VK] ready: Intel(R) Arc(tm) Pro B60 Graphics (BMG G21), compute qfam 0, memtype 3, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096
+  [VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 21.34 GiB, reserve 1.00 GiB)
+  [VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+  [VK] chain: this driver does not hold a frame at an event the host sets while it runs (the probe: started 0, after 20 ms 0, at the end 2); the hybrid steps run on the timelines
+  [VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1811939328 B
+  [VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+  [VK] chain: 17 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+  [VK] tier qwen36: on, Intel(R) Arc(tm) Pro B60 Graphics (BMG G21), budget 18.00 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+  [VK] tier qwen36: warm start, 10240 experts in 192.5s (0 from the history, 10240 more to fill the device: every expert of the model)
+  [VK] qwen36 chain: prompt chunks of up to 4864 rows (389 KiB a row; 3.78 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+  [VK] qwen36 chain: 4 forwards, 216 frames (3655 ops, 1444 matmuls, 250 tiled GEMM), 286.5 ms waiting for the device, 0.0 ms of routed experts on the host, 160 layer steps with the routed experts in the frame (40 of them a prompt chunk's, 0 in the integer form), 146.6 MiB on the device
+  [VK] tier qwen36 turn: device 5120 of 5120 routed experts (100.0%; this turn 5120 of 5120) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.00 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 0.
+  [VK] qwen36 chain: the KV mirror grows from 2048 to 18432 positions (320.0 MiB more, 0.0 MiB of them from the expert tier)
+  [VK] qwen36 chain: 5 forwards, 1976 frames (9357 ops, 2885 matmuls, 1650 tiled GEMM), 118079.4 ms waiting for the device, 0.0 ms of routed experts on the host, 320 layer steps with the routed experts in the frame (200 of them a prompt chunk's, 0 in the integer form), 2266.5 MiB on the device
+  [VK] tier qwen36 turn: device 5158080 of 5158080 routed experts (100.0%; this turn 5152960 of 5152960) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.00 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0
+  [VK] qwen36 chain: 133 forwards, 3317 frames (121123 ops, 49093 matmuls, 1940 tiled GEMM), 121420.0 ms waiting for the device, 0.0 ms of routed experts on the host, 5440 layer steps with the routed experts in the frame (240 of them a prompt chunk's, 0 in the integer form), 2337.3 MiB on the device
+  [VK] qwen36 chain: the hybrid steps measured 1 time(s): a decode forward 25.6 ms with them, 29.6 ms with the device reading the host pool itself; kept (COLI_VK_HYBRID_GATE=0 keeps them on)
+  [VK] tier qwen36 turn: device 5207040 of 5207040 routed experts (100.0%; this turn 48960 of 48960) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.00 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | d
+  [VK] qwen36 chain: 261 forwards, 4597 frames (232889 ops, 95301 matmuls, 2230 tiled GEMM), 124755.9 ms waiting for the device, 0.0 ms of routed experts on the host, 10560 layer steps with the routed experts in the frame (280 of them a prompt chunk's, 0 in the integer form), 2347.3 MiB on the device
+  [VK] qwen36 chain: the hybrid steps measured 1 time(s): a decode forward 25.6 ms with them, 29.6 ms with the device reading the host pool itself; kept (COLI_VK_HYBRID_GATE=0 keeps them on)
+  [VK] tier qwen36 turn: device 5256000 of 5256000 routed experts (100.0%; this turn 48960 of 48960) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.00 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | d
+
+===== kvanswers-K-1: image colibri-vulkan:pr-mirror-keep, Mesa 26.0.8-1ubuntu0.3, qwen36 sha256 8cfb74b13f84eb47afbaea97df45c4acab6cf04ec11d21fc58ee00345abd79a9, engine ready after 253 s
+# record: {}
+# the engine's whole log: logs.txt, section 'kvanswers-K-1.log' (sha256 8c244699959a1c7e0dbdf23c52a17d4deda0ae332f4eb065baecc6c11fdf12c0); its key lines:
+  ATTENTION: default value of option anv_enable_buffer_comp overridden by environment.
+  [VK] memory: mapped weights, the host-visible device-local memory gave the 20 GiB asked (9/10 of its heap, less if its budget leaves less), found in 0.2 s
+  [VK] ready: Intel(R) Arc(tm) Pro B60 Graphics (BMG G21), compute qfam 0, memtype 3, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096
+  [VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 21.34 GiB, reserve 1.00 GiB)
+  [VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+  [VK] chain: this driver does not hold a frame at an event the host sets while it runs (the probe: started 0, after 20 ms 0, at the end 2); the hybrid steps run on the timelines
+  [VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1811939328 B
+  [VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+  [VK] chain: 17 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+  [VK] tier qwen36: on, Intel(R) Arc(tm) Pro B60 Graphics (BMG G21), budget 18.00 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+  [VK] tier qwen36: warm start, 10240 experts in 191.6s (0 from the history, 10240 more to fill the device: every expert of the model)
+  [VK] qwen36 chain: prompt chunks of up to 4864 rows (389 KiB a row; 3.78 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+  [VK] qwen36 chain: 4 forwards, 216 frames (3655 ops, 1444 matmuls, 250 tiled GEMM), 287.1 ms waiting for the device, 0.0 ms of routed experts on the host, 160 layer steps with the routed experts in the frame (40 of them a prompt chunk's, 0 in the integer form), 146.6 MiB on the device
+  [VK] tier qwen36 turn: device 5120 of 5120 routed experts (100.0%; this turn 5120 of 5120) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.00 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 0.
+  [VK] qwen36 chain: 74 forwards, 977 frames (64845 ops, 26714 matmuls, 540 tiled GEMM), 2192.1 ms waiting for the device, 0.0 ms of routed experts on the host, 2960 layer steps with the routed experts in the frame (80 of them a prompt chunk's, 0 in the integer form), 159.6 MiB on the device
+  [VK] qwen36 chain: the hybrid steps measured 1 time(s): a decode forward 25.6 ms with them, 28.5 ms with the device reading the host pool itself; kept (COLI_VK_HYBRID_GATE=0 keeps them on)
+  [VK] tier qwen36 turn: device 34560 of 34560 routed experts (100.0%; this turn 29440 of 29440) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.00 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | devic
+  [VK] qwen36 chain: 216 forwards, 2580 frames (189069 ops, 77976 matmuls, 830 tiled GEMM), 6335.0 ms waiting for the device, 0.0 ms of routed experts on the host, 8640 layer steps with the routed experts in the frame (120 of them a prompt chunk's, 0 in the integer form), 299.2 MiB on the device
+  [VK] qwen36 chain: the hybrid steps measured 1 time(s): a decode forward 25.6 ms with them, 28.5 ms with the device reading the host pool itself; kept (COLI_VK_HYBRID_GATE=0 keeps them on)
+  [VK] tier qwen36 turn: device 101120 of 101120 routed experts (100.0%; this turn 66560 of 66560) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.00 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | dev
+  [VK] qwen36 chain: 375 forwards, 4230 frames (327867 ops, 135375 matmuls, 1120 tiled GEMM), 10478.2 ms waiting for the device, 0.0 ms of routed experts on the host, 15000 layer steps with the routed experts in the frame (160 of them a prompt chunk's, 0 in the integer form), 299.2 MiB on the device
+  [VK] qwen36 chain: the hybrid steps measured 1 time(s): a decode forward 25.6 ms with them, 28.5 ms with the device reading the host pool itself; kept (COLI_VK_HYBRID_GATE=0 keeps them on)
+  [VK] tier qwen36 turn: device 160320 of 160320 routed experts (100.0%; this turn 59200 of 59200) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.00 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | dev
+  [VK] qwen36 chain: 445 forwards, 4990 frames (389057 ops, 160645 matmuls, 1410 tiled GEMM), 12390.5 ms waiting for the device, 0.0 ms of routed experts on the host, 17800 layer steps with the routed experts in the frame (200 of them a prompt chunk's, 0 in the integer form), 305.2 MiB on the device
+  [VK] qwen36 chain: the hybrid steps measured 1 time(s): a decode forward 25.6 ms with them, 28.5 ms with the device reading the host pool itself; kept (COLI_VK_HYBRID_GATE=0 keeps them on)
+  [VK] tier qwen36 turn: device 189760 of 189760 routed experts (100.0%; this turn 29440 of 29440) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.00 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | dev
+  [VK] qwen36 chain: 587 forwards, 6470 frames (513281 ops, 211907 matmuls, 1700 tiled GEMM), 16525.2 ms waiting for the device, 0.0 ms of routed experts on the host, 23480 layer steps with the routed experts in the frame (240 of them a prompt chunk's, 0 in the integer form), 308.2 MiB on the device
+  [VK] qwen36 chain: the hybrid steps measured 1 time(s): a decode forward 25.6 ms with them, 28.5 ms with the device reading the host pool itself; kept (COLI_VK_HYBRID_GATE=0 keeps them on)
+  [VK] tier qwen36 turn: device 256320 of 256320 routed experts (100.0%; this turn 66560 of 66560) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.00 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | dev
+  [VK] qwen36 chain: 746 forwards, 8120 frames (652079 ops, 269306 matmuls, 1990 tiled GEMM), 20669.1 ms waiting for the device, 0.0 ms of routed experts on the host, 29840 layer steps with the routed experts in the frame (280 of them a prompt chunk's, 0 in the integer form), 308.2 MiB on the device
+  [VK] qwen36 chain: the hybrid steps measured 1 time(s): a decode forward 25.6 ms with them, 28.5 ms with the device reading the host pool itself; kept (COLI_VK_HYBRID_GATE=0 keeps them on)
+  [VK] tier qwen36 turn: device 315520 of 315520 routed experts (100.0%; this turn 59200 of 59200) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.00 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | dev
+
