@@ -77,3 +77,6 @@ tests/xdna_fail_fixtures/
 tests/xdna_physical_probe
 tests/xdna_fake_helper*.so
 libcoli_xdna.so
+shaders/chain_dnconv_rows.spv
+shaders/qmatmul_bd.spv
+shaders/qmatmul_gate_up_bd.spv
