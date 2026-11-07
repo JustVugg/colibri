@@ -345,6 +345,10 @@ class GenerationScheduler:
                     lines.append(f'{name}_bucket{{le="{label}"}} {count}')
                 lines.extend((f'{name}_sum {timing["sum"]}',
                               f'{name}_count {timing["buckets"][-1]}'))
+        with _TOOL_ARGS_LOCK:
+            lines.extend(("# HELP colibri_tool_args_repaired_total Declared GLM array/object arguments repaired after JSON decoding failed.",
+                          "# TYPE colibri_tool_args_repaired_total counter",
+                          f"colibri_tool_args_repaired_total {_TOOL_ARGS_REPAIRED}"))
         return "\n".join(lines) + "\n"
 
     def close(self):
@@ -473,6 +477,12 @@ _PARTIAL_END_RE = re.compile(r"<(?:/(?:t(?:o(?:o(?:l(?:_(?:c(?:a(?:l)?)?)?)?)?)?
 # De-mangler: opt-in recovery for heavily-quantized models that drop the
 # <arg_key>K</arg_key><arg_value> structure. Default OFF (never rewrites well-formed output).
 _SALVAGE = os.environ.get("COLI_TOOL_SALVAGE", "0") == "1"
+
+# Only declared GLM arrays/objects, after strict JSON fails. Default OFF, independently
+# of the de-mangler; strict_tool_calls never uses this reader.
+_TOOL_LENIENT = os.environ.get("COLI_TOOL_LENIENT", "0") == "1"
+_TOOL_ARGS_REPAIRED = 0                  # process lifetime, arguments (not calls)
+_TOOL_ARGS_LOCK = threading.Lock()
 
 # Families whose chat template has no tool syntax at all (OLMoE) refuse
 # tools[] and role:"tool" rather than invent a format. COLI_TOOL_FALLBACK=1 opts
@@ -668,16 +678,108 @@ def _tool_param_types(tools):
     return out
 
 
-def _coerce_arg(value, declared):
+class _LenientToolJSON:
+    """Read complete values past comma/quote slips and missing container closers.
+
+    No invented scalar values: unfinished strings, missing values/colons, mismatched
+    brackets and trailing text fail. Work is bounded to 1,048,576 characters and
+    64 containers.
+    """
+
+    def __init__(self, text):
+        if len(text) > 1 << 20:
+            raise ValueError("tool argument exceeds the lenient reader's character limit")
+        self.text, self.index = text, 0
+        self.decoder = json.JSONDecoder()
+
+    def peek(self):
+        while self.index < len(self.text) and self.text[self.index] in " \t\r\n":
+            self.index += 1
+        return self.text[self.index:self.index + 1]
+
+    def string(self):
+        if self.peek() == '"':
+            value, self.index = self.decoder.raw_decode(self.text, self.index)
+            return value
+        if self.peek() != "'":
+            raise ValueError("tool argument object key must be quoted")
+        self.index += 1
+        quoted = ['"']
+        while self.index < len(self.text):
+            char = self.text[self.index]
+            self.index += 1
+            if char == "'":
+                return json.loads("".join(quoted) + '"')
+            if char == "\\":
+                escape = self.text[self.index:self.index + 1]
+                self.index += 1
+                quoted.append("'" if escape == "'" else "\\" + escape)
+            else:
+                quoted.append('\\"' if char == '"' else char)
+        raise ValueError("tool argument string is not closed")
+
+    def value(self, depth=0):
+        char = self.peek()
+        if char in ("[", "{"):
+            if depth >= 64:
+                raise ValueError("tool argument nesting exceeds 64 containers")
+            is_object = char == "{"
+            closer = "}" if is_object else "]"
+            result = {} if is_object else []
+            self.index += 1
+            while True:
+                char = self.peek()
+                if not char or char == closer:
+                    self.index += bool(char)
+                    return result
+                if char == ",":             # trailing, doubled (or leading) commas
+                    self.index += 1
+                    continue
+                if is_object:
+                    key = self.string()
+                    char = self.peek()
+                    if char == ":":
+                        self.index += 1
+                        result[key] = self.value(depth + 1)
+                    elif not result or char not in (",", closer, ""):
+                        raise ValueError("tool argument object member is missing a colon")
+                    # A bare quoted string between members carries no key/value pair.
+                else:
+                    result.append(self.value(depth + 1))
+                if self.peek() not in (",", closer, ""):
+                    raise ValueError("tool argument member is missing a comma")
+        if char in ('"', "'"):
+            return self.string()
+        value, self.index = self.decoder.raw_decode(self.text, self.index)
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("tool argument contains a non-finite number")
+        return value
+
+
+def _coerce_arg(value, declared, *, lenient=False, repaired=None):
     """Decode a raw <arg_value> according to the declared schema type.
 
     A string-typed parameter is kept verbatim -- never parsed as JSON. Everything else keeps
-    the previous permissive behaviour (parse if it parses, otherwise leave as text)."""
+    the previous permissive behaviour (parse if it parses, otherwise leave as text).
+    Lenient recovery is limited to declared arrays/objects after strict decoding fails."""
     if declared == "string":
         return value
     try:
         parsed = json.loads(value)
     except (json.JSONDecodeError, TypeError):
+        if lenient and declared in ("array", "object") and isinstance(value, str):
+            try:
+                reader = _LenientToolJSON(value)
+                if reader.peek() != ("[" if declared == "array" else "{"):
+                    return value
+                parsed = reader.value()
+                if reader.peek():
+                    return value
+            except (ValueError, RecursionError):
+                return value
+            if repaired is not None:
+                repaired.append(declared)
+            return parsed
         return value
     if declared in ("integer", "number") and isinstance(parsed, bool):
         return value                              # `true` is not a number
@@ -841,6 +943,7 @@ def parse_tool_calls_spans(reply, tools=None):
 def _parse_tool_calls(reply, tools, track_spans):
     """The parse itself: `(content, tool_calls, box_map, content_map)`. One implementation
     behind both spellings, so the maps cannot drift from the text they describe."""
+    global _TOOL_ARGS_REPAIRED
     param_order = _tool_param_order(tools)
     param_types = _tool_param_types(tools)
     calls, salvaged = [], []
@@ -856,10 +959,20 @@ def _parse_tool_calls(reply, tools, track_spans):
         name_match = _NAME_RE.match(inner)
         name = name_match.group(1) if name_match else inner.strip()
         args = {}
+        repaired, repaired_keys = [], []
         types = param_types.get(name, {})
         for arg in _ARG_RE.finditer(inner):
             key, value = arg.group(1), arg.group(2)
-            args[key] = _coerce_arg(value, types.get(key))
+            before = len(repaired)
+            args[key] = _coerce_arg(value, types.get(key), lenient=_TOOL_LENIENT,
+                                    repaired=repaired)
+            if len(repaired) != before:
+                repaired_keys.append(key)
+        if repaired:
+            with _TOOL_ARGS_LOCK:
+                _TOOL_ARGS_REPAIRED += len(repaired)
+            sys.stderr.write("[api] tool args repaired: %s (%s)\n" % (name, ", ".join(repaired_keys)))
+            sys.stderr.flush()
         if not args and _SALVAGE:
             rest = inner[name_match.end():] if name_match else ""
             payload = _TAG_RE.sub("", rest).strip()

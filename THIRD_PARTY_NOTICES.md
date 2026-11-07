@@ -1,5 +1,39 @@
 # Third-party notices
 
+## Strata tool-argument recovery corpus method
+
+The GLM tool-argument reader in `c/openai_server.py` is a new implementation.
+Its recovery cases and the corpus replay method in
+`c/tests/test_openai_server_lenient.py` are informed by Strata's
+`serve/frontend.py` and `serve/test_tool_corpus.py` at commit `d7113273`:
+https://github.com/niko1221/strata/commit/d7113273
+No reader lines or specimen text are copied. Strata is MIT licensed; its notice
+is included here to preserve the provenance of the corpus method and case list.
+
+MIT License
+
+Copyright (c) 2026 Niko1221 and the Strata contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## ds4 CUDA backend
+
 Portions of `backend_cuda_dsv4.cu`, including the DeepSeek-V4 GPU router
 selection algorithm, are adapted from `ds4_cuda.cu` in the ds4 project:
 https://github.com/antirez/ds4

@@ -269,6 +269,17 @@ Protocol support does not guarantee that every quantized model emits valid
 tool syntax; `COLI_TOOL_SALVAGE=1` is an opt-in recovery path for malformed GLM
 int4 tool calls. DeepSeek V4 uses its strict native DSML parser instead.
 
+`COLI_TOOL_LENIENT=1` separately opts into repairs inside declared GLM `array`
+and `object` arguments after strict JSON decoding fails. It accepts trailing or
+doubled commas, single quotes, container brackets left open, and a bare quoted
+string between object members. It leaves declared strings and valid JSON alone.
+Unfinished strings, missing values or colons, mismatched brackets, trailing text,
+and a repaired value of the wrong container type stay as the original text.
+The recovery reader is limited to 1,048,576 characters and 64 nested containers.
+The default is off; `COLI_TOOL_LENIENT=0` keeps the previous argument behavior.
+This switch does not add tool-call wire formats or change the permissive parser's
+handling of undeclared tool names.
+
 `tool_choice: "required"` is a prompt-level instruction, not a sampling
 constraint. Every renderer that offers a tool block appends the same one line to
 it, and no renderer filters tokens or forces the sampler, so a model that
@@ -355,7 +366,7 @@ API key is configured, supply the same `Authorization: Bearer ...` or
 401. Without an API key, the endpoint follows the server's usual unauthenticated
 access policy. Metrics contain no prompts, model paths, or request-ID labels.
 
-All names start with `colibri_scheduler_`:
+Scheduler names start with `colibri_scheduler_`:
 
 | Suffix | Type | Meaning |
 |---|---|---|
@@ -369,6 +380,12 @@ All names start with `colibri_scheduler_`:
 | `slot_duration_seconds` | histogram | Slot occupancy until completion, failure, or cancellation |
 | `first_output_seconds` | histogram | Engine-call start to first nonempty text or tool-output callback |
 | `engine_call_seconds` | histogram | Duration of each finished engine generation call, including failure/cancellation |
+
+`colibri_tool_args_repaired_total` counts declared GLM array/object arguments
+repaired by `COLI_TOOL_LENIENT`, over the lifetime of the gateway process. A call
+with two repaired arguments adds two; strict decoding, failed repairs and the
+off switch add zero. Each repaired call logs one repair line naming its tool and
+argument fields, without argument values. The counter has no labels.
 
 Histogram buckets are 0.001, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60, 300 seconds,
 and `+Inf`; each histogram exposes `_bucket`, `_sum`, and `_count`.
