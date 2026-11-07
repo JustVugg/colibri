@@ -4213,24 +4213,49 @@ int main(int argc, char **argv) {
         test_attn_win(4, 900, 8, 2, 128, 128, 0, 0, 1, 0); test_attn_win(1, 2000, 4, 2, 64, 64, 512, 512, 0, 1);
         test_attn_win(2, 3000, 16, 4, 64, 96, 0, 0, 0, 0);
         /* Flint's: full layers with a sink, a window with a sink, linear and in a ring; in blocks
-         * where the device has the matrix units */
+         * where the device has the matrix units, and on any device under COLI_VK_ATTN_DEC=2 set for
+         * the run (read as the engine reads it: a leading '0' is off, and COLI_VK_CHAIN_FLASH=0
+         * turns it off with the rest of attn_dec's rule) */
         VkcStats f0; vkc_stats(&f0);
         test_attn_win(1, 17000, 32, 4, 128, 128, 0, 0, 1, 0); test_attn_win(3, 5000, 32, 4, 128, 128, 128, 0, 1, 0);
         test_attn_win(1, 4000, 32, 4, 128, 128, 200, 236, 1, 0); test_attn_win(4, 2000, 16, 2, 256, 256, 0, 0, 1, 0);
         VkcStats f1; vkc_stats(&f1);
-        if (f1.attn_flash > 0) {
+        const char *adv = getenv("COLI_VK_ATTN_DEC");
+        const int optin = adv && *adv != '0' && atoi(adv) == 2 && vkc_attn_flash_rows() > 0;
+        const char *ge = getenv("COLI_VK_ATTN_DEC_GQA");
+        const int gqa = !(ge && *ge == '0');
+        if (f1.attn_flash > 0 || optin) {
             CHECK(f1.attn_dec >= f0.attn_dec + 4, "attn: a window's or a sink's decode in blocks (%llu of 4)", f1.attn_dec - f0.attn_dec);
-            const char *ge = getenv("COLI_VK_ATTN_DEC_GQA");
-            if (!(ge && *ge == '0'))
+            if (gqa)
                 CHECK(f1.attn_dec_gqa >= f0.attn_dec_gqa + 4, "attn: %llu of 4 decodes a KV head's query heads a workgroup",
                       f1.attn_dec_gqa - f0.attn_dec_gqa);
+        }
+        /* two of them again under COLI_VK_ATTN_DEC=2, which the chain reads on each call: in
+         * blocks on any device, one without the flash module too (the CI's Lavapipe, Xe2); the
+         * random stream and the variable as before them */
+        {
+            unsigned rng_dec = rng;
+            char was[32];
+            const int had = adv != NULL;
+            if (had) snprintf(was, sizeof was, "%s", adv);
+            setenv("COLI_VK_ATTN_DEC", "2", 1);
+            VkcStats d0; vkc_stats(&d0);
+            test_attn_win(1, 17000, 32, 4, 128, 128, 0, 0, 1, 0); test_attn_win(4, 2000, 16, 2, 256, 256, 0, 0, 1, 0);
+            VkcStats d1; vkc_stats(&d1);
+            if (had) setenv("COLI_VK_ATTN_DEC", was, 1);
+            else unsetenv("COLI_VK_ATTN_DEC");
+            CHECK(d1.attn_dec >= d0.attn_dec + 2, "attn: COLI_VK_ATTN_DEC=2: %llu of 2 decodes in blocks", d1.attn_dec - d0.attn_dec);
+            if (gqa)   /* the head dims of 128 at least: their grouped pipeline's 14.5 KiB of shared memory fits any device */
+                CHECK(d1.attn_dec_gqa >= d0.attn_dec_gqa + 1, "attn: COLI_VK_ATTN_DEC=2: %llu of 2 decodes a KV head's query heads a "
+                      "workgroup", d1.attn_dec_gqa - d0.attn_dec_gqa);
+            rng = rng_dec;
         }
         /* OLMoE's: one query head a KV head, by KV head too (mode 2 at a GQ of 1) */
         VkcStats o0; vkc_stats(&o0);
         test_attn_hk(1, 299, 16, 16, 128, 0); test_attn_hk(3, 250, 16, 16, 128, 0);
         test_attn_win(2, 3000, 16, 16, 128, 128, 0, 0, 0, 0);
         VkcStats o1; vkc_stats(&o1);
-        if (o1.attn_flash > 0 && !(getenv("COLI_VK_ATTN_DEC_GQA") && *getenv("COLI_VK_ATTN_DEC_GQA") == '0'))
+        if ((o1.attn_flash > 0 || optin) && !(getenv("COLI_VK_ATTN_DEC_GQA") && *getenv("COLI_VK_ATTN_DEC_GQA") == '0'))
             CHECK(o1.attn_dec_gqa >= o0.attn_dec_gqa + 3, "attn: %llu of 3 decodes of one query head a KV head by KV head",
                   o1.attn_dec_gqa - o0.attn_dec_gqa);
         test_attn_rows_bits(6, 700, 16, 16, 128);
