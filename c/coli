@@ -1204,6 +1204,8 @@ class MDStream:
             line,self.cur=self.cur.split("\n",1)
             self._line(line)
         st=self.cur.lstrip()             # riga parziale: possibile fence? aspetta il newline
+        if self.printed==0 and (not st or st in ("-", "*")):
+            return                        # indentation or a list marker may still follow
         if st and (st.startswith("```") or (len(st)<3 and "```".startswith(st))):
             return
         if st.startswith("#") and self.printed==0:
