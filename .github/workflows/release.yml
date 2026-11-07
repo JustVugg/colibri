@@ -20,9 +20,14 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             name: linux-x86_64
             ext: ""
+            # 24.04, not ubuntu-latest: a binary may need any glibc up to the one it was
+            # linked against, and built on 26.04 (glibc 2.43) the v2.1.0 archive did not
+            # start on Ubuntu 24.04 (#2556). glibc is 24.04's: the verify step holds every
+            # ELF file in the archive to it.
+            glibc: "2.39"
             # VK=1: every engine with its Vulkan backend, and shaders/ beside them. The
             # loader is opened at run time (vk_load.h), so the engines start and run on
             # the CPU where there is no Vulkan; COLI_VULKAN=1 (coli setup sets it for a
@@ -85,7 +90,7 @@ jobs:
 
       # libvulkan-dev for the headers, glslc for the shaders; mesa-vulkan-drivers is
       # Lavapipe, which the verify step runs the packaged engine on.
-      - if: matrix.os == 'ubuntu-latest'
+      - if: matrix.os == 'ubuntu-24.04'
         run: |
           # hard limits around apt: a stalled mirror held CI jobs for hours (2026-10-07)
           bash .github/scripts/apt-install.sh libvulkan-dev glslc mesa-vulkan-drivers
@@ -114,7 +119,7 @@ jobs:
       # server by itself. Rust is on every runner; Linux needs WebKitGTK to build it. pwsh on
       # Windows: the MSVC linker, not the link.exe of a POSIX shell's PATH. It needs a display
       # to run, so the verify step checks that it is in the archive.
-      - if: matrix.os == 'ubuntu-latest'
+      - if: matrix.os == 'ubuntu-24.04'
         run: bash .github/scripts/apt-install.sh libwebkit2gtk-4.1-dev
       - name: Build the desktop window
         if: matrix.os != 'windows-latest'
@@ -433,6 +438,42 @@ jobs:
             otool -L $e | grep -q Metal.framework || { echo "FAIL: $e is not a Metal build"; otool -L $e; exit 1; }
           done
           echo "OK: ${{ matrix.metal }} carry the Metal backend"
+
+      # An ELF file may need any GLIBC version up to the glibc it was linked against, and a
+      # system with an older one refuses to start it ("GLIBC_2.43 not found" on Ubuntu 24.04
+      # for v2.1.0, #2556). None in the archive (engines, TUI, desktop window) may need a
+      # version newer than matrix.glibc.
+      - name: Verify the archive's glibc floor
+        if: matrix.glibc != ''
+        run: |
+          cd verify
+          elfs=0; linked=0; newest=""; bad=""
+          while IFS= read -r f; do
+            # a static library (.a) is never loaded, and readelf prints nothing for an empty one
+            case $(head -c 7 "$f" | tr -d '\000') in '!<arch>') continue ;; esac
+            readelf -h "$f" > /dev/null 2>&1 || continue   # not an ELF file
+            elfs=$((elfs + 1))
+            # readelf -V: the file's version references, the list the loader checks at start
+            # ("0x0010:   Name: GLIBC_2.34"; a version the file itself defines reads "Cnt: 1
+            # Name: ..." and is not a need). Object files and static programs have none.
+            refs=$(readelf -V --wide "$f") || { echo "FAIL: readelf cannot read the versions of $f"; exit 1; }
+            # on a damaged file readelf still exits 0 but prints none of these: not checked
+            case $refs in
+              *"No version information found"*|*"Version needs section"*|*"Version definition section"*|*"Version symbols section"*) ;;
+              *) echo "FAIL: readelf cannot read the versions of $f"; exit 1 ;;
+            esac
+            need=$(printf '%s\n' "$refs" | grep -o ':   Name: GLIBC_[0-9][0-9.]*' | sed 's/^:   Name: GLIBC_//' | sort -uV | tail -1 || true)
+            test -n "$need" || continue
+            linked=$((linked + 1))
+            newest=$(printf '%s\n' "$newest" "$need" | sort -V | tail -1)
+            if [ "$(printf '%s\n' "${{ matrix.glibc }}" "$need" | sort -V | tail -1)" != "${{ matrix.glibc }}" ]; then
+              bad="$bad $f (GLIBC_$need)"
+            fi
+          done < <(find . -type f | sort)
+          # the engines link glibc: a check that found no version at all read nothing
+          test -n "$newest" || { echo "FAIL: no GLIBC version in the archive's $elfs ELF files"; exit 1; }
+          test -z "$bad" || { echo "FAIL: newer than glibc ${{ matrix.glibc }}:$bad"; exit 1; }
+          echo "OK: $linked of $elfs ELF files link glibc, the newest version they need is $newest (at most ${{ matrix.glibc }})"
 
       # Only the archives -- never the loose files. `dist/colibri-*.*` used to work by accident
       # (the engine was versioned, so it did not match); now that the engine is plainly named,
