@@ -2877,6 +2877,12 @@ took:
 [VK] qwen36 chain: prompt chunks of up to 8192 rows (325 KiB a row; 7.30 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
 ```
 
+qwen36's KV mirror grows with the context and takes what the device lacks from the expert
+tier, whole blocks of its device memory for the rest of the process (`vkt_give_back`); with
+`VK_EXT_memory_budget`, a first prompt's mirror past 8192 positions that fits in the half of
+the free memory a chunk leaves takes that memory instead, the chunk decided before it and only
+its scratch, the tier's staging room and 256 MiB kept free.
+
 On qwen38 the tier also leaves what the chain allocates at its first forward: the KV
 mirror whole at the context's capacity (at most a quarter of the device's free memory;
 past that `vk_kvsplit.h` splits it anyway) and a chunk of 512 rows. The tier's line says
