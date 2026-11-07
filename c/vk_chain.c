@@ -17,6 +17,7 @@
 #include "vk_alloc.h"
 #include "vk_load.h"
 #include "shaders/chain_qsa.h"
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -268,6 +269,8 @@ VkcBuf *vkc_buf(size_t bytes, int kind) {
     VkcBuf *b = calloc(1, sizeof *b);
     if (!b) return NULL;
     b->kind = kind; b->bytes = bytes; b->d = g_kd;
+    /* the pools' types come from a probe with these usages (backend_vulkan.c, vk_buffer_types):
+     * a usage added here goes there too */
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = bytes,
         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,   /* vkc_moe_rows' dispatches */
@@ -504,10 +507,23 @@ static uint32_t kc_shared_limit(void) {
 #ifndef VKC_SANITIZED
 #define VKC_SANITIZED 0
 #endif
+/* vkc_init's ways out, each said: an engine whose vkc_init fails takes its per-matrix path, and
+ * on an Arc Pro B60 (Mesa ANV) the chain stayed off at its first device buffer without a line,
+ * its memory type one the buffers do not take (backend_vulkan.c, pick_memtype). Returns 0. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((format(printf, 1, 2)))
+#endif
+static int init_off(const char *fmt, ...) {
+    char why[256];
+    va_list ap;
+    va_start(ap, fmt); vsnprintf(why, sizeof why, fmt, ap); va_end(ap);
+    fprintf(stderr, "[VK] %schain: %s, the chain stays off\n", g_kd ? "dev2 " : "", why);
+    return 0;
+}
 static void ev_setup(void);
 int vkc_init(void) {
     if (KC.ready) return !KC.lost;
-    if (!coli_vk_core_dev(g_kd, &KC.core)) return 0;
+    if (!coli_vk_core_dev(g_kd, &KC.core)) return init_off("no device ready (not started, or lost)");
     KC.dev = (VkDevice)KC.core.device; KC.queue = (VkQueue)KC.core.queue;
     /* 20 s tells a GPU that hangs. A software device (llvmpipe) generates a shader's code
      * at its first launch, inside the frame's wait, and caches it on disk: on a CI runner's
@@ -532,19 +548,19 @@ int vkc_init(void) {
     VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .bindingCount = VKC_BIND, .pBindings = b};
     VkPushConstantRange pr = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = 128};
-    if (vkCreateDescriptorSetLayout(KC.dev, &li, NULL, &KC.dsl) != VK_SUCCESS) return 0;
+    VkResult r;
+    if ((r = vkCreateDescriptorSetLayout(KC.dev, &li, NULL, &KC.dsl)) != VK_SUCCESS)
+        return init_off("its descriptor set layout was refused (%d)", (int)r);
     VkPipelineLayoutCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1, .pSetLayouts = &KC.dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
-    if (vkCreatePipelineLayout(KC.dev, &pi, NULL, &KC.pl) != VK_SUCCESS) return 0;
+    if ((r = vkCreatePipelineLayout(KC.dev, &pi, NULL, &KC.pl)) != VK_SUCCESS)
+        return init_off("its pipeline layout was refused (%d)", (int)r);
     for (int i = 0; i < P_NPIPE; i++) {
         KC.mod[i] = load_module(KC.core.spv_path, pipe_file[i]);
-        if (!KC.mod[i] || !(KC.pipe[i] = make_pipe(KC.mod[i], NULL))) {
-            fprintf(stderr, "[VK] chain: shader %s unavailable, the chain stays off\n", pipe_file[i]);
-            return 0;
-        }
+        if (!KC.mod[i] || !(KC.pipe[i] = make_pipe(KC.mod[i], NULL))) return init_off("shader %s unavailable", pipe_file[i]);
     }
     KC.mod_dnrec = load_module(KC.core.spv_path, "chain_dnrec.spv");
-    if (!KC.mod_dnrec) return 0;
+    if (!KC.mod_dnrec) return init_off("shader chain_dnrec.spv unavailable");
     /* the vectorized decode GEMV, its x staging as large as the device's shared memory
      * allows (16 KiB floats at most); COLI_VK_CHAIN_GEMV=0 keeps qmatmul.comp's */
     {
@@ -688,13 +704,15 @@ int vkc_init(void) {
     }
     VkCommandPoolCreateInfo cp = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = KC.core.qfam};
-    if (vkCreateCommandPool(KC.dev, &cp, NULL, &KC.cpool) != VK_SUCCESS) return 0;
+    if ((r = vkCreateCommandPool(KC.dev, &cp, NULL, &KC.cpool)) != VK_SUCCESS)
+        return init_off("its command pool was refused (%d)", (int)r);
     for (int i = 0; i < VKC_FRAMES; i++) {
         VkCommandBufferAllocateInfo ca = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
             .commandPool = KC.cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
         VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        if (vkAllocateCommandBuffers(KC.dev, &ca, &KC.fr[i].cmd) != VK_SUCCESS ||
-            vkCreateFence(KC.dev, &fi, NULL, &KC.fr[i].fence) != VK_SUCCESS) return 0;
+        if ((r = vkAllocateCommandBuffers(KC.dev, &ca, &KC.fr[i].cmd)) != VK_SUCCESS ||
+            (r = vkCreateFence(KC.dev, &fi, NULL, &KC.fr[i].fence)) != VK_SUCCESS)
+            return init_off("frame %d's command buffer or fence was refused (%d)", i, (int)r);
     }
     if (g_kd == 0 && coli_vk_timeline() && hyb_load(KC.dev)) {
         VkSemaphoreTypeCreateInfo st = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE};
@@ -727,10 +745,17 @@ int vkc_init(void) {
         KC.pool[k].mapped = memtype_host_visible(KC.pool[k].memtype);
         vka_pool_init(&KC.pool[k].p, coli_vk_block_bytes_dev(g_kd, VKC_BLOCK), 0);   /* smaller under COLI_VK_DEVICE_CAP_MB */
     }
-    if (!KC.pool[VKC_UP].mapped || !KC.pool[VKC_DOWN].mapped) return 0;
+    if (!KC.pool[VKC_UP].mapped || !KC.pool[VKC_DOWN].mapped)
+        return init_off("its upload or read-back memory type (%u, %u) is not host-visible",
+                        KC.pool[VKC_UP].memtype, KC.pool[VKC_DOWN].memtype);
     KC.ready = 1;
     KC.dummy = vkc_buf(256, VKC_DEV);
-    if (!KC.dummy) { KC.ready = 0; return 0; }
+    if (!KC.dummy) {   /* its first device buffer, and with it the device pool's first block */
+        KC.ready = 0;
+        return init_off("its first device buffer was refused (memory type %u: the buffer, its pool's first block of "
+                        "%llu KiB, or the binding)", KC.pool[VKC_DEV].memtype,
+                        (unsigned long long)(KC.pool[VKC_DEV].p.block_bytes >> 10));
+    }
     ev_setup();
     return 1;
 }

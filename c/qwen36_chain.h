@@ -529,7 +529,10 @@ static void q36c_start(Model *m) {
     int n = vkc_fit("qwen36", L, per, mat, fixed, tail, &g_q36c_fit);
     /* the chain's pipelines now, after the fit read the free memory: nothing of it was on
      * the device before (vkc_init's own buffer counts in the pools' share) */
-    if (n > 0 && !vkc_init()) { g_vk_chain = 0; free(per); free(mat); return; }   /* no chain after all: no fit, as before */
+    if (n > 0 && !vkc_init()) {   /* no chain after all: no fit, as before */
+        fprintf(stderr, "[VK] qwen36 chain: the primary device's pipelines did not come up; the dense chain stays off\n");
+        g_vk_chain = 0; free(per); free(mat); return;
+    }
     g_q36c_fit_on = 1;
     /* the layers the primary leaves, on COLI_VK_DEV2's device: a fit of its own from layer
      * n, with that device's free memory (the tier there sizes itself after the placement) */
