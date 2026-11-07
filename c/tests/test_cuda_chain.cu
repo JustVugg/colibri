@@ -737,6 +737,17 @@ int main(void) {
                 same = T->begin() && T->matmul(t4, xb4, (size_t)s * I4, yb1, 0, 1) && T->submit(1) &&
                        !memcmp(T->ptr(yb1), (const float *)T->ptr(yb4) + (size_t)s * O4, (size_t)O4 * 4);
             ck(same, "and each of its three rows the one-row call's bits");
+            {   /* a prompt chunk's 100 rows of it (f32_few_k, a block a row): each row the one-row call's bits */
+                const int S8 = 100;
+                std::vector<float> x8 = rnd((size_t)S8 * I4, 16);
+                CcBuf *xb8 = T->buf((size_t)S8 * I4 * 4, CC_DEV), *yb8 = T->buf((size_t)S8 * O4 * 4, CC_DOWN);
+                int ok8 = xb8 && yb8 && T->begin() && T->write(xb8, 0, x8.data(), x8.size() * 4) && T->matmul(t4, xb8, 0, yb8, 0, S8) && T->submit(1);
+                for (int r = 0; r < S8 && ok8; r += 11)   /* ten of them */
+                    ok8 = T->begin() && T->matmul(t4, xb8, (size_t)r * I4, yb1, 0, 1) && T->submit(1) &&
+                          !memcmp(T->ptr(yb1), (const float *)T->ptr(yb8) + (size_t)r * O4, (size_t)O4 * 4);
+                ck(ok8, "f32 rows, 4 outputs of 10240, a prompt chunk's 100 rows: each the one-row call's bits");   /* 11 matmuls */
+                T->free(xb8); T->free(yb8);
+            }
             coli_cuda_tensor_free(t4); T->free(xb4); T->free(yb4); T->free(yb1);
         }
         {   /* BF16 rows (a GGUF's type 30, fmt 130): a decode step's and a verify's rows (bd_gemv_bf16_k, each row
@@ -896,6 +907,7 @@ int main(void) {
         std::vector<float> o((size_t)S * H * hd), ref = o;
         ref_attn(q.data(), kc.data(), vc.data(), ref.data(), q.data(), sel.data(), &p);
         CcBuf *qb = up(q), *kb = up(kc), *vb = up(vc), *ob = T->buf(o.size() * 4, CC_DEV), *sb = T->buf(sel.size() * 4, CC_DEV);
+        setenv("COLI_CUDA_ATTN_SEL_TC", "0", 1);   /* cc_attn_gk: these lists are in no order, with repeats */
         int ok = T->begin() && T->write(sb, 0, sel.data(), sel.size() * 4) && T->attn(qb, kb, vb, ob, qb, sb, &p) && T->submit(1);
         std::vector<float> all = down(ob, o.size());
         ck(ok && maxdiff(all.data(), ref.data(), o.size()) < 1e-4, "40 rows with selection lists, a block per kv head, against the reference");
@@ -924,7 +936,37 @@ int main(void) {
             T->free(o2);
         }
         ck(okd && worst < 1e-4, "a verify's rows with selection lists in blocks of positions, against the reference");
+        unsetenv("COLI_CUDA_ATTN_SEL_TC");
         T->free(qb); T->free(kb); T->free(vb); T->free(ob); T->free(sb); T->free(o1);
+    }
+    {   /* a prompt chunk's rows with selection lists on the tensor cores (cc_attn_f2 with them, three warps
+         * for 12 query heads a kv head): lists in ascending order as cc_qsa writes them, blocks of four
+         * positions and the row's own last ones, a row without a list, short lists, key blocks no row of a
+         * block selects, 41 rows (a block of tokens cut short); against the reference, f16's error */
+        const int H = 24, KV = 2, hd = 256, qdim = 2 * hd, cap = 1600, pos_base = 1100, S = 41, NS = 520, SR = NS + 1;
+        std::vector<float> q = rnd((size_t)S * H * qdim, 71), kc = rnd((size_t)KV * cap * hd, 72), vc = rnd((size_t)KV * cap * hd, 73);
+        std::vector<int> sel((size_t)S * SR, 0);
+        for (int r = 0; r < S; r++) {
+            const int vis = pos_base + r + 1;
+            if (r == 5) { sel[(size_t)r * SR] = -1; continue; }   /* no list: every position up to the row's */
+            std::vector<int> pos;
+            const int want = r % 7 == 0 ? 37 : NS - 8;
+            for (int b = 0; b * 4 < vis - 4 && (int)pos.size() + 4 <= want; b++)   /* blocks of 4, two in five, more near the end */
+                if ((b * 2654435761u + (unsigned)r * 40503u) % 5 < 2 || b * 4 > vis - 200)
+                    for (int i = 0; i < 4; i++) pos.push_back(b * 4 + i);
+            for (int t = (vis - 4) / 4 * 4; t < vis && (int)pos.size() < want; t++) if (pos.empty() || t > pos.back()) pos.push_back(t);
+            sel[(size_t)r * SR] = (int)pos.size();
+            for (size_t i = 0; i < pos.size(); i++) sel[(size_t)r * SR + 1 + i] = pos[i];
+        }
+        CcAttn p = {S, H, KV, hd, pos_base, cap, 0, H * qdim, qdim, hd, H * qdim, qdim, 1, 0, H * hd, 0, SR, 1.f / sqrtf((float)hd), 0, 0};
+        std::vector<float> ref((size_t)S * H * hd);
+        ref_attn(q.data(), kc.data(), vc.data(), ref.data(), q.data(), sel.data(), &p);
+        CcBuf *qb = up(q), *kb = up(kc), *vb = up(vc), *ob = T->buf(ref.size() * 4, CC_DEV), *sb = T->buf(sel.size() * 4, CC_DEV);
+        int ok = qb && kb && vb && ob && sb && T->begin() && T->write(sb, 0, sel.data(), sel.size() * 4) && T->attn(qb, kb, vb, ob, qb, sb, &p) && T->submit(1);
+        const double d = ok ? maxdiff(down(ob, ref.size()).data(), ref.data(), ref.size()) : 1;
+        char what[160]; snprintf(what, sizeof what, "41 rows with ascending selection lists on the tensor cores, against the reference (|d| %.1e)", d);
+        ck(ok && d < 4e-3, what);
+        T->free(qb); T->free(kb); T->free(vb); T->free(ob); T->free(sb);
     }
     {   /* a decode's or a verify's rows over many positions: in blocks of positions (cc_attn_dec_k) */
         struct { int H, KV, hd, S, pos_base, cap, gate; } cs[] = {{16, 2, 256, 3, 2500, 3000, 1}, {4, 2, 32, 1, 140, 300, 1},
@@ -1203,6 +1245,25 @@ int main(void) {
             same = 1; for (size_t i = 0; i < got3.size(); i++) if (got3[i] != rsel3[i]) same = 0;
             ck(ok && same && rsel3[0] == B3 + 2 && rsel3[sr3] == B3 + 3, "1100 blocks of tied scores: the take-th key's blocks by index, then the tail, as the CPU ranks them");
             T->free(pb3); T->free(qb3); T->free(sb3); T->free(lb3);
+        }
+        {   /* a prompt chunk's 70 rows (cc_qsa_score_t, tiles of 64 rows by 64 blocks), Qwen3.8's index heads (4 of 128):
+             * the same selections as a thread a (row, block) (COLI_CUDA_QSA_TILES=0) and as the CPU ranks them */
+            const int ID4 = 128, IQ4 = 4, S4 = 70, PB4 = 2000, B4 = 512, nbm4 = 600, sr4 = 1 + B4 + R - 1, NB4 = (PB4 + S4) / R;
+            std::vector<float> pk4 = rnd((size_t)nbm4 * ID4, 96), iq4 = rnd((size_t)S4 * (IQ4 + 1) * ID4, 97);
+            for (int b = NB4; b < nbm4; b++) for (int d = 0; d < ID4; d++) pk4[(size_t)b * ID4 + d] = 0.f;
+            std::vector<float> rsc4((size_t)S4 * 2 * nbm4);
+            std::vector<int> rsel4((size_t)S4 * sr4), t4(rsel4.size()), k4(rsel4.size());
+            CcQsa p4 = {1, ID4, R, 0, 0, S4, PB4, B4, IQ4, 0, (IQ4 + 1) * ID4, nbm4, sr4, 1e-6f, 0, 0, 0, 0};
+            ref_qsa(iq4.data(), NULL, pk4.data(), NULL, rsc4.data(), rsel4.data(), &p4);
+            CcBuf *pb4 = up(pk4), *qb4 = up(iq4), *sb4 = T->buf(rsc4.size() * 4, CC_DEV), *lb4 = T->buf(rsel4.size() * 4, CC_DEV);
+            ok = T->begin() && T->qsa(qb4, NULL, pb4, NULL, sb4, lb4, &p4) && T->submit(1) && T->read(lb4, 0, t4.data(), t4.size() * 4);
+            setenv("COLI_CUDA_QSA_TILES", "0", 1);
+            ok = ok && T->begin() && T->qsa(qb4, NULL, pb4, NULL, sb4, lb4, &p4) && T->submit(1) && T->read(lb4, 0, k4.data(), k4.size() * 4);
+            unsetenv("COLI_CUDA_QSA_TILES");
+            ck(ok && !memcmp(t4.data(), k4.data(), t4.size() * 4), "70 rows' selections in tiles: those of a thread a (row, block), to the bit");
+            same = 1; for (size_t i = 0; i < t4.size(); i++) if (t4[i] != rsel4[i]) same = 0;
+            ck(ok && same, "and as the CPU ranks them");
+            T->free(pb4); T->free(qb4); T->free(sb4); T->free(lb4);
         }
         T->free(ib); T->free(wb); T->free(cb); T->free(pb); T->free(qb); T->free(sb); T->free(lb);
     }
@@ -1699,10 +1760,39 @@ int main(void) {
             T->free(xb); T->free(pb); T->free(yb);
         }
     }
+    printf("hyper-connection mix\n");
+    {   /* a hyper-connection read's up projection and mix in one pass (matmul_hcmix): Q8_0 rows of 320 inputs, four
+         * streams of 256, 300 rows (tiles of 256 rows) and 100 (of 128); against matmul then CC_EW_HC_MIX, to the bit */
+        const int I = 320, H = 256, C = 4, O = C * H;
+        unsigned sd = 31;
+        std::vector<uint8_t> q8((size_t)O * (I / 32) * 34);
+        for (int o = 0; o < O; o++)
+            for (int b = 0; b < I / 32; b++) {
+                uint8_t *blk = q8.data() + ((size_t)o * (I / 32) + b) * 34;
+                const uint16_t dh = (uint16_t)(0x2000u + (unsigned)(frand(&sd) * 2048.f + 2048.f));   /* a small positive half */
+                memcpy(blk, &dh, 2);
+                for (int k = 0; k < 32; k++) blk[2 + k] = (uint8_t)(int8_t)(frand(&sd) * 120.f);
+            }
+        ColiCudaTensor *tq = NULL;
+        ck(coli_cuda_tensor_upload(&tq, q8.data(), NULL, 108, I, O, 0), "a Q8_0 tensor of 320 inputs and 4 x 256 outputs resident");
+        for (int S : {300, 100}) {
+            std::vector<float> x = rnd((size_t)S * I, 41), hn = rnd((size_t)S * O, 42);
+            CcBuf *xb = up(x), *hb = up(hn), *mb = T->buf((size_t)S * O * 4, CC_DEV), *ya = T->buf((size_t)S * H * 4, CC_DEV), *yb = T->buf((size_t)S * H * 4, CC_DEV);
+            CcEw mx = {CC_EW_HC_MIX, S * H, H, C, 0, 1, 0, 0, 0, 0, 0, (float)C};
+            int ok = T->begin() && T->matmul(tq, xb, 0, mb, 0, S) && T->ew(ya, mb, hb, NULL, NULL, &mx) && T->submit(1);
+            int r = ok && T->matmul_hcmix ? T->matmul_hcmix(tq, xb, 0, hb, yb, S, H, C, (float)C) : 0;
+            ok = ok && r == 1 && T->submit(1);
+            std::vector<float> a = down(ya, (size_t)S * H), b = down(yb, (size_t)S * H);
+            char what[128]; snprintf(what, sizeof what, "%d rows: the up projection and the mix in one pass, those of the two ops to the bit", S);
+            ck(ok && !memcmp(a.data(), b.data(), a.size() * 4), what);
+            T->free(xb); T->free(hb); T->free(mb); T->free(ya); T->free(yb);
+        }
+        coli_cuda_tensor_free(tq);
+    }
     printf("lost\n");
     {
         CcStats st; T->stats(&st);
-        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 35, "the counters saw the frames, ops and matmuls");
+        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 50, "the counters saw the frames, ops and matmuls");
         setenv("COLI_GPU_FAIL_AFTER", "0", 1);
         std::vector<float> w = rnd(64, 81), ones(8, 1.f);
         ColiCudaTensor *t = NULL;

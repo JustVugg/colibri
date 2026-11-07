@@ -1019,6 +1019,10 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
                              ColiDeepSeekV4LayerWeights *weights);
 int coli_v4_gpu_fp8_matvec(const ColiTensorView *w, float *output,
                            const float *input);
+/* V4_ATTN_BATCH_PROJ: n fp8 decode matvecs over one input in one round trip; outs[i]
+ * gets rows[i] floats, bit-identical to coli_v4_gpu_fp8_matvec per tensor. */
+int coli_v4_gpu_proj_batch(void *const *tensors, const int *rows, float **outs,
+                           int n, const float *input);
 int coli_v4_gpu_fp8_matmul_batch(const ColiTensorView *w, float *outputs,
                                  const float *inputs, int batch);
 int coli_v4_gpu_kv_ring_append(const ColiDeepSeekV4LayerWeights *weights,

@@ -69,6 +69,7 @@ int dsv4_cuda_init(const int *devices, int count) {
     return 1;
 }
 void dsv4_cuda_shutdown(void) { shutdowns++; }
+void dsv4_cuda_proj_batch_release(void) {}
 /* Backend entries dev gained after #1766's base (the bank-sized mirror reserve,
  * the prefill bank's activations): this test never reaches them. */
 int dsv4_cuda_expert_bank_slots(int experts) { (void)experts; return 0; }
