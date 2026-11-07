@@ -270,7 +270,13 @@ Speculative decoding requires that the draft and verify paths compute the same
 function — `SPEC_PIN=1` (default since [#294](https://github.com/JustVugg/colibri/pull/294))
 pins every forward issued while drafts are live to the platform's S=1 kernel
 family. For byte-exact reproducibility across runs: `DRAFT=0`, plus `IDOT=0
-COLI_CUDA=0` if you also want kernel-family/GPU independence. Acceptance
+COLI_CUDA=0` if you also want kernel-family/GPU independence. With GLM's
+CUDA/HIP expert tier on (`c/colibri.c`, `CUDA_EXPERT_GB`), also freeze the
+usage history it is filled from (`USAGE_SAVE=0`, or
+`PIN=<frozen copy of .coli_usage>`) and keep `REPIN=0`, so every run puts
+the same experts on the GPU; the Qwen3.6/3.8 tier and a GGUF's tier place
+experts at run time instead
+([GPU_BACKENDS.md](../GPU_BACKENDS.md#known-behavior-notes)). Acceptance
 percentages are not comparable across engine versions under `--topp`
 ([#163](https://github.com/JustVugg/colibri/issues/163) has the full story).
 
