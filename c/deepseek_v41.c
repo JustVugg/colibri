@@ -4482,6 +4482,9 @@ static void forward_batch(Model *m, const int *ids, int n, float *logits) {
 #ifdef COLI_VULKAN
 #include "deepseek_v41_chain.h"   /* the layers as a dense chain on the device (COLI_VK_CHAIN) */
 #endif
+#ifdef COLI_CUDA
+#include "deepseek_v41_cuchain.h" /* a prompt's layers on the CUDA chain (COLI_CUDA_CHAIN) */
+#endif
 
 /* The prompt's tail past the cross-layer source (DeepSeek's "decoder SWA bounded replay"
  * in its deployment notes). From the first layer with compress_ratio 1 on
@@ -4492,7 +4495,9 @@ static void forward_batch(Model *m, const int *ids, int n, float *logits) {
  * reaches the answer only through those windows, W - 1 rows back a layer: with D layers
  * after it, the last D * (W - 1) + 1 rows give the last row and every window the next step
  * reads exactly as all the rows do (2414 of a prompt in V4.1: 19 layers, a window of 128).
- * The layers after it run on that tail only, with the same bits.
+ * The layers after it run on that tail only, with the same bits (on the Vulkan chain chunk by chunk;
+ * layer by layer, COLI_VK_V41_LAYERWISE, its routed experts' step over the tail's rows rounds
+ * apart from every row's in the last bits, the text the same).
  *
  * V41_PREFILL_TAIL=<rows> sets the tail instead: 140 is what DeepSeek serves with
  * (a window and its backtracking), below the exact tail
@@ -4519,7 +4524,8 @@ static int v41_prefill_tail(const Cfg *c, int n, int spec_batch, int keep_rows, 
 
 /* Past the source layer: the rows of the tail to the front of every per-row buffer the
  * later layers read (the streams and their mix, the DSpark input a target layer at or
- * before the source wrote, the candidate mask), the forward's rows and start the tail's. */
+ * before the source wrote, the candidate mask, the index list the last index source
+ * published), the forward's rows and start the tail's. */
 static void v41_take_tail(Model *m, float *h, float *pre_mix, int *n, int *start_pos, int tail, int targets, int *trace_row) {
     const Cfg *c = &m->c;
     int dim = c->dim, hc = c->hc_mult, r0 = *n - tail;
@@ -4530,6 +4536,19 @@ static void v41_take_tail(Model *m, float *h, float *pre_mix, int *n, int *start
     if (m->candidates && m->candidate_rows == *n) {
         memmove(m->candidates, m->candidates + (size_t)r0 * m->candidate_width, (size_t)tail * m->candidate_width);
         m->candidate_rows = tail;
+    }
+    /* The layers past the source that run no indexer of their own read this list. Its
+     * entries count past the rows of kv_all's window half: every row of a prompt read from
+     * position 0, the window ring's otherwise (attention_run). The tail starts past 0 and
+     * reads the ring: each row's list to the front, its entries moved onto the ring's
+     * rows. Kept as it was, the tail's rows read the first rows' lists, shifted past the
+     * compressed rows the attention holds. */
+    if (m->shared_topk && m->shared_topk_rows == *n && m->shared_topk_width > 0) {
+        const int w = m->shared_topk_width, shift = c->window - (*start_pos == 0 ? *n : c->window);
+        int *list = m->shared_topk;
+        memmove(list, list + (size_t)r0 * w, (size_t)tail * w * sizeof(int));
+        for (size_t i = 0; i < (size_t)tail * w; i++) if (list[i] >= 0) list[i] += shift;
+        m->shared_topk_rows = tail;
     }
     *n = tail; *start_pos += r0;
     if (*trace_row >= tail) *trace_row = tail - 1;
@@ -4643,13 +4662,24 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int spe
 
     int rows_out = spec_batch || keep_rows;
     m->ptail_after = tail_after; m->ptail_rows = tail;
+    int chained = 0;
 #ifdef COLI_VULKAN
     /* the dense chain runs its layers on the device (every layer, or a partial chain's
      * first N, the streams of every row then back here); 0: the CPU runs them all */
-    int chained = v41c_forward(m, h, pre_mix, n, start_pos, spec_batch, rows_out);
-    if (!chained && !coli_prompt_broken()) v41c_cpu_step(m, start_pos);   /* stopped: no CPU redo */
-#else
-    int chained = 0;
+    chained = v41c_forward(m, h, pre_mix, n, start_pos, spec_batch, rows_out);
+    const int vk_chained = chained;
+#endif
+#ifdef COLI_CUDA
+    /* on the CUDA tier, a prompt's layers on the CUDA chain; the host's state it leaves as the
+     * CPU would, and a step it does not take makes its copies from start_pos stale */
+    if (!chained) {
+        int lost = 0;
+        chained = v41u_forward(m, h, pre_mix, n, start_pos, spec_batch, rows_out, &lost);
+        if (!chained) v41u_lower(m, start_pos);
+    }
+#endif
+#ifdef COLI_VULKAN
+    if (!vk_chained && !coli_prompt_broken()) v41c_cpu_step(m, start_pos);   /* stopped: no CPU redo */
 #endif
     if (tail > 0 && tail < n && chained > tail_after)   /* the chain took the tail past the source: its rows from here on */
         v41_take_tail(m, h, pre_mix, &n, &start_pos, tail, targets, &trace_row);
@@ -4985,6 +5015,9 @@ static void model_reset_rows(Model *m, int n) {
 #ifdef COLI_VULKAN
     v41c_reset(m);   /* nothing on the device describes the new sequence */
 #endif
+#ifdef COLI_CUDA
+    v41u_lower(m, 0);
+#endif
     /* Paired with the reset on purpose: whoever drops the state must also forget
      * what it was built from, or the two disagree in favour of the one nobody
      * can check. */
@@ -5087,6 +5120,9 @@ static void spec_rollback(Model *m, int start_pos, int committed, int rows) {
     m->last_rows = committed;
 #ifdef COLI_VULKAN
     v41c_rollback(m, m->pos);   /* the dense chain's copies of the rejected rows go stale */
+#endif
+#ifdef COLI_CUDA
+    v41u_lower(m, m->pos);
 #endif
     if (m->engram.active && m->engram.history_len > m->pos) m->engram.history_len = m->pos;
     /* The record follows the rollback for the same reason the engram history
@@ -5366,6 +5402,9 @@ static void v41_unpark(Model *m) {
         m->candidate_width = m->candidates ? g_v41_park_x.cand_width : 0; m->candidate_rows = m->candidates ? g_v41_park_x.cand_rows : 0;
 #ifdef COLI_VULKAN
         v41c_reset(m);   /* the host's rows from 0 are the conversation's again: the mirrors go up again */
+#endif
+#ifdef COLI_CUDA
+        v41u_lower(m, 0);
 #endif
     } else coli_park_free(&g_v41_park);
     free(g_v41_park_x.topk); free(g_v41_park_x.cand);
@@ -6024,8 +6063,20 @@ static int v41_tier_block_elems(int fmt) {
 }
 #ifdef COLI_CUDA
 /* a GGUF's dense matrices as the CUDA device would hold them (cu_dense.h): the head and the layers' */
-static size_t v41_cu_w8(const W8 *w) { return w->gx ? cud_bytes(100 + w->gt, w->O, w->I, 0) : 0; }
-static size_t v41_cu_wb(const WB *w) { return w->gx ? cud_bytes(100 + w->gt, w->O, w->I, 0) : 0; }
+/* a float matrix (a GGUF's F32, F16 or BF16 tensor, or the bf16 rows the loader keeps of one) the
+ * CUDA chain's, as f32 rows (deepseek_v41_cuchain.h, cu_dense.h's cud_tensor); COLI_CUDA_CHAIN=0: none */
+static size_t v41_cu_float(int O, int I) {
+    const char *e = getenv("COLI_CUDA_CHAIN");
+    return e && *e == '0' ? 0 : (size_t)O * I * 4;
+}
+static size_t v41_cu_w8(const W8 *w) {
+    if (!w->gx) return 0;
+    return cud_float(100 + w->gt) ? v41_cu_float(w->O, w->I) : cud_bytes(100 + w->gt, w->O, w->I, 0);
+}
+static size_t v41_cu_wb(const WB *w) {
+    if (w->gx) return cud_float(100 + w->gt) ? v41_cu_float(w->O, w->I) : cud_bytes(100 + w->gt, w->O, w->I, 0);
+    return w->w ? v41_cu_float(w->O, w->I) : 0;
+}
 static size_t v41_cu_dense_bytes(const Model *m) {
     size_t b = v41_cu_wb(&m->head);
     for (int i = 0; i < m->c.n_layers; i++) {
@@ -6038,6 +6089,16 @@ static size_t v41_cu_dense_bytes(const Model *m) {
     return b;
 }
 #endif
+/* what a prompt's chain allocates on the tier's device: the CUDA chain's at most (a GGUF on the
+ * CUDA tier, one conversation, COLI_CUDA_CHAIN not 0); the tier leaves it */
+static size_t v41_tier_chain_bytes(Model *m) {
+#ifdef COLI_CUDA
+    const char *e = getenv("COLI_CUDA_CHAIN");
+    if (xt_cuda() && m->gguf && !(e && *e == '0') && g_v41_mux_slots <= 1) return v41u_plan_bytes(m, m->c.max_positions);
+#endif
+    (void)m;
+    return 0;
+}
 static size_t v41_tier_dense_bytes(Model *m) {
 #ifdef COLI_CUDA
     if (xt_cuda()) return g_v41_cud;
@@ -6205,7 +6266,7 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
                     .ram_reserve = expert * (size_t)cap * (size_t)c->n_layers,
                     .ram_floor = expert * (size_t)c->n_activated * (size_t)c->n_layers, .ram_given = vk_ram_given,
                     .ram_later = v41_state_later(m),
-                    .dense_bytes = v41_tier_dense_bytes(m), .in_ram = vk_in_ram, .ram_ctx = m,
+                    .dense_bytes = v41_tier_dense_bytes(m), .chain_bytes = v41_tier_chain_bytes(m), .in_ram = vk_in_ram, .ram_ctx = m,
                     .load = vk_load, .release = vk_unhold, .load_ctx = m, .load_batch = vk_load_batch};
     rt_init("deepseek_v41", c->n_layers, c->n_routed);
     rt_drop_row(c->n_layers);   /* no MTP row: the history is the backbone's */
