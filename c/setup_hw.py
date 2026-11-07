@@ -755,6 +755,19 @@ def best_vulkan_device(devices):
     return best
 
 
+def engine_vulkan_device(devices, env=None):
+    """The device the engine opens (backend_vulkan.c coli_vk_init): COLI_VK_DEV=<index>
+    takes that entry of the enumeration, of the first eight it reads; unset, not a
+    number, or out of range, the ranking of best_vulkan_device."""
+    env = os.environ if env is None else env
+    devices = list(devices)[:8]
+    value = env.get("COLI_VK_DEV") or ""
+    # strtol(value, &end, 10) with nothing left after the number
+    if re.fullmatch(r"[ \t\n\v\f\r]*[+-]?[0-9]+", value) and 0 <= int(value) < len(devices):
+        return devices[int(value)]
+    return best_vulkan_device(devices)
+
+
 def find_user_icds(home=None):
     """Vulkan driver manifests installed under the home directory.
 
