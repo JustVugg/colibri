@@ -125,7 +125,7 @@ static int vk_integrated(VkPhysicalDevice phys) {
  * card. Host memory imported in place (coli_vk_tensor_import) is the host's and is not
  * counted. Under the cap the pools take small blocks (coli_vk_block_bytes) so that their
  * granularity does not decide what fits. */
-typedef struct { uint64_t key, bytes; int dev; } VkMemRec;
+typedef struct { uint64_t key, bytes; int dev; uint32_t type; } VkMemRec;
 static struct {
     pthread_mutex_t mx;
     VkDevice dev[2];
@@ -178,7 +178,7 @@ static VkResult vk_mem_alloc(VkDevice d, const VkMemoryAllocateInfo *ai, const V
             VkMemRec *nr = realloc(g_mem.rec, c * sizeof *nr);
             if (nr) { g_mem.rec = nr; g_mem.crec = c; }
         }
-        if (g_mem.nrec < g_mem.crec) g_mem.rec[g_mem.nrec++] = (VkMemRec){vk_mem_key(*m), n, k};
+        if (g_mem.nrec < g_mem.crec) g_mem.rec[g_mem.nrec++] = (VkMemRec){vk_mem_key(*m), n, k, ai->memoryTypeIndex};
     }
     pthread_mutex_unlock(&g_mem.mx);
     return r;
@@ -227,6 +227,61 @@ static void vk_mem_device(int k, VkPhysicalDevice phys, VkDevice d, uint32_t tak
         fprintf(stderr, "[VK] COLI_VK_DEVICE_CAP_MB=%s: %s takes at most %.3f MiB of device memory\n",
                 e, k ? "the second device" : "the device", (double)g_mem.cap[k] / 1048576.0);
 }
+/* A discrete device left on the mapped path (COLI_VK_STAGED=0, or no staging buffer) whose
+ * host-visible device-local heap, `memtype`'s, is under a quarter of its device memory (no
+ * Resizable BAR: 246 of 24467 MiB on an RTX PRO 4000) holds its resident data in that window,
+ * not in the card: past it a block is refused, nothing spills to system RAM (the retry type is
+ * an integrated GPU's), and a pool block of 256 MiB does not fit at all. The window becomes the
+ * device's cap, counted over the types of that heap only (a COLI_VK_DEVICE_CAP_MB cap keeps
+ * counting all device memory, at most the window), so the pools take blocks it holds and the
+ * engines plan with what fits; the rest stays on the CPU. place_decide's sizes, with
+ * COLI_VK_HOST_VISIBLE_CAP_MB. Returns the window in bytes, 0 when none applies. */
+static void vk_pool_blocks(int k);   /* the weight pools' block size, below */
+/* Does device k's cap count heap h: a type of it is among the counted ones. */
+static int vk_mem_counts_heap(int k, const VkPhysicalDeviceMemoryProperties *mp, uint32_t h) {
+    for (uint32_t i = 0; i < mp->memoryTypeCount && i < 32; i++)
+        if (mp->memoryTypes[i].heapIndex == h && (g_mem.device_types[k] >> i & 1u)) return 1;
+    return 0;
+}
+static uint64_t vk_mem_window(int k, VkPhysicalDevice phys, uint32_t memtype) {
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(phys, &mp);
+    if (memtype >= mp.memoryTypeCount || memtype >= 32 ||
+        !(mp.memoryTypes[memtype].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) return 0;
+    const uint32_t h = mp.memoryTypes[memtype].heapIndex;
+    VkDeviceSize dl = 0;
+    for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
+        if ((mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mp.memoryHeaps[i].size > dl)
+            dl = mp.memoryHeaps[i].size;
+    VkDeviceSize hv = vk_integrated(phys) ? dl : mp.memoryHeaps[h].size;
+    const char *cap = getenv("COLI_VK_HOST_VISIBLE_CAP_MB");
+    if (cap && *cap && (VkDeviceSize)atoll(cap) << 20 < hv) hv = (VkDeviceSize)atoll(cap) << 20;
+    if (!dl || !hv || hv * 4 >= dl) return 0;
+    uint32_t mask = 0;
+    for (uint32_t i = 0; i < mp.memoryTypeCount && i < 32; i++)
+        if (mp.memoryTypes[i].heapIndex == h) mask |= 1u << i;
+    pthread_mutex_lock(&g_mem.mx);
+    const int user = g_mem.cap[k] != 0;
+    if (!user) {   /* the window's types only: what this device already holds elsewhere is not in it */
+        g_mem.device_types[k] = mask;
+        uint64_t used = 0;
+        for (size_t i = g_mem.nrec; i-- > 0;) {
+            if (g_mem.rec[i].dev != k) continue;
+            if (g_mem.rec[i].type < 32 && (mask >> g_mem.rec[i].type & 1u)) used += g_mem.rec[i].bytes;
+            else g_mem.rec[i] = g_mem.rec[--g_mem.nrec];
+        }
+        g_mem.used[k] = used;
+        if (used > g_mem.peak[k]) g_mem.peak[k] = used;
+    }
+    if (!user || hv < g_mem.cap[k]) g_mem.cap[k] = hv;
+    pthread_mutex_unlock(&g_mem.mx);
+    vk_pool_blocks(k);
+    fprintf(stderr, "[VK] %smemory: uploads not staged, resident data in the %llu MiB host-visible window of %llu MiB "
+            "(type %u%s): what does not fit stays on the CPU (leave COLI_VK_STAGED unset to stage it into the whole card)\n",
+            k ? "dev2 " : "", (unsigned long long)(hv >> 20), (unsigned long long)(dl >> 20), memtype,
+            cap && *cap ? ", COLI_VK_HOST_VISIBLE_CAP_MB" : "");
+    return hv;
+}
 /* The device is gone (shutdown): its books go with it. */
 static void vk_mem_forget(int k) {
     pthread_mutex_lock(&g_mem.mx);
@@ -248,7 +303,6 @@ static size_t vk_device_memory_bytes(VkPhysicalDevice phys, int k) {
     if (g_mem.cap[k] && g_mem.cap[k] < m) m = g_mem.cap[k];   /* COLI_VK_DEVICE_CAP_MB */
     return (size_t)m;
 }
-static void vk_pool_blocks(int k);   /* the weight pools' block size, below */
 size_t coli_vk_device_cap(void) { return (size_t)g_mem.cap[0]; }
 size_t coli_vk_device_used(void) { return (size_t)__atomic_load_n(&g_mem.used[0], __ATOMIC_RELAXED); }
 size_t coli_vk_block_bytes_dev(int dev, size_t def) {
@@ -1603,6 +1657,7 @@ int coli_vk_init(const char *spv_path) {
             g_up[0].on = g_up[0].shared = 0;
         }
         up_import_init(&g_up[0], G.phys, G.has_hostmem, "");
+        const uint64_t window = g_up[0].on ? 0 : vk_mem_window(0, G.phys, G.memtype);
         if (g_up[0].on) {
             VkUp *u = &g_up[0];
             fprintf(stderr, "[VK] memory: staged uploads, resident data in device-local memory (type %u, %llu MiB heap) "
@@ -1615,13 +1670,11 @@ int coli_vk_init(const char *spv_path) {
                     "will live in system RAM and every access crosses PCIe (expect slower than "
                     "CPU-only). On a discrete card, enable Resizable BAR in the BIOS or leave "
                     "COLI_VK_STAGED unset.\n");
-        else if (dl_max && !integrated && hv_dl * 4 < dl_max)
+        else if (dl_max && !integrated && hv_dl * 4 < dl_max && !window)
             fprintf(stderr, "[VK] warning: only %llu of %llu MB VRAM is host-visible (Resizable BAR "
-                    "appears disabled) — allocations beyond the %llu MB window fall back to system "
-                    "RAM and will be slow. Enable Resizable BAR / Smart Access Memory in the BIOS, "
+                    "appears disabled). Enable Resizable BAR / Smart Access Memory in the BIOS, "
                     "or leave COLI_VK_STAGED unset.\n",
-                    (unsigned long long)(hv_dl >> 20), (unsigned long long)(dl_max >> 20),
-                    (unsigned long long)(hv_dl >> 20));
+                    (unsigned long long)(hv_dl >> 20), (unsigned long long)(dl_max >> 20));
     }
 
     G.shader = load_spv(G.dev, spv_path);
@@ -3330,6 +3383,7 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
                        "host staging memory (type %u) (%s)\n", u->mt_dev, u->mt_stage, u->why);
         up_import_init(u, G2.phys, G2.has_hostmem, "dev2 ");
     }
+    if (!g_up[1].on) vk_mem_window(1, G2.phys, G2.memtype);
     G2.sh_qmm = load_spv(G2.dev, spv_path);
     if (!G2.sh_qmm) return 0;
     char gu_path[512]; derive_sibling(spv_path, "_gate_up.spv", gu_path, sizeof(gu_path));
@@ -5737,8 +5791,8 @@ int coli_vk_xb_sub_fit(int rows, int experts, size_t extra_budget) {
     VkDeviceSize room[VK_MAX_MEMORY_HEAPS];
     vk_batch_room(&mp.memoryProperties, integrated, usage, budget, room);
     for (uint32_t h = 0; h < mp.memoryProperties.memoryHeapCount; h++)
-        if (g_mem.cap[0] && vk_heap_is_device_memory(&mp.memoryProperties, integrated, h) &&
-            room[h] > vk_mem_room(0) / 2) room[h] = (size_t)(vk_mem_room(0) / 2);   /* COLI_VK_DEVICE_CAP_MB */
+        if (g_mem.cap[0] && vk_heap_is_device_memory(&mp.memoryProperties, integrated, h) && vk_mem_counts_heap(0, &mp.memoryProperties, h) &&
+            room[h] > vk_mem_room(0) / 2) room[h] = (size_t)(vk_mem_room(0) / 2);   /* COLI_VK_DEVICE_CAP_MB, the mapped window */
     uint32_t xheap = vk_batch_slot(integrated, mp.memoryProperties.memoryTypes[X->mt_host].heapIndex);
     uint32_t iheap = vk_batch_slot(integrated, mp.memoryProperties.memoryTypes[X->mt_dev].heapIndex);
     uint32_t yheap = vk_batch_slot(integrated, mp.memoryProperties.memoryTypes[X->mt_cached].heapIndex);

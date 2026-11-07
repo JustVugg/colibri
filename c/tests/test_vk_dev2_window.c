@@ -65,13 +65,15 @@ int main(int argc, char **argv) {
         } else {
             assert(!g_up[1].dev && !g_up[1].shared && !g_up[1].nfams);
         }
-        if (!staged && heaps && window < VK_WBLOCK) {
-            /* mapped memory forced on a window smaller than one pool block: the block
-             * does not fit, on either device, so there is nothing to upload into */
-            printf("COLI_VK_STAGED=0: the %llu MiB window holds no %zu MiB pool block, no upload\n",
-                   (unsigned long long)(window >> 20), VK_WBLOCK >> 20);
-            coli_vk_shutdown();
-            continue;
+        if (!staged && heaps) {
+            /* mapped memory forced on a window under a quarter of the card: that window is
+             * each device's memory, and the pools' blocks fit in it (a 256 MiB block did not
+             * fit in 246 MiB, and no tensor was made on either device) */
+            assert(g_mem.cap[0] == window && g_mem.cap[1] == window);
+            assert(g_wpool.p.block_bytes <= window && g_tpool2.p.block_bytes <= window);
+            printf("COLI_VK_STAGED=0: both devices hold their resident data in the %llu MiB window, "
+                   "in blocks of %llu KiB\n", (unsigned long long)(window >> 20),
+                   (unsigned long long)(g_tpool2.p.block_bytes >> 10));
         }
         ColiVkTensor *t = NULL;
         uint8_t *rows; size_t stride; float *scales;
@@ -82,6 +84,35 @@ int main(int argc, char **argv) {
         coli_vk_tensor_free(t);
         coli_vk_shutdown();
     }
+    /* The same window on any device: COLI_VK_HOST_VISIBLE_CAP_MB makes the host-visible heap
+     * 64 MiB, less than a pool block, and COLI_VK_STAGED=0 keeps both devices mapped. Each
+     * then has that window for its memory: the engines' free bytes, blocks that fit in it,
+     * and a tensor past it refused by the books rather than handed out. */
+    unsetenv("COLI_VK_WINDOW_PROBE_MB");
+    setenv("COLI_VK_HOST_VISIBLE_CAP_MB", "64", 1);
+    setenv("COLI_VK_STAGED", "0", 1);
+    assert(coli_vk_init(spv));
+    assert(coli_vk_init_dev2(spv, 0));
+    assert(!g_up[0].on && !g_up[1].on);
+    const size_t win = (size_t)64 << 20;
+    for (int d = 0; d < 2; d++) {
+        assert(g_mem.cap[d] == win);
+        assert(coli_vk_free_bytes_dev(d) <= win);
+    }
+    assert(g_wpool.p.block_bytes <= win && g_tpool2.p.block_bytes <= win);
+    ColiVkTensor *t = NULL;
+    uint8_t *rows; size_t stride; float *scales;
+    assert(coli_vk_tier_tensor_dev(1, &t, 1, 32, 4, 0, &rows, &stride, &scales));
+    memset(rows, 1, stride * 4);
+    for (int j = 0; j < 4; j++) scales[j] = 1.f;
+    assert(coli_vk_tensor_commit(&t, 1));
+    ColiVkTensor *big = NULL;   /* 4096 x 32768 int8: 128 MiB, twice the window */
+    assert(!coli_vk_tier_tensor_dev(1, &big, 1, 4096, 32768, 0, &rows, &stride, &scales));
+    coli_vk_tensor_free(t);
+    coli_vk_shutdown();
+    unsetenv("COLI_VK_HOST_VISIBLE_CAP_MB");
+    unsetenv("COLI_VK_STAGED");
+    puts("a 64 MiB window on both devices: their memory, its blocks, a tensor past it refused");
     puts("dev2 mapped-window selection and uploads: PASS");
     return 0;
 }
