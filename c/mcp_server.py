@@ -259,8 +259,8 @@ def tool_install(args, notify):
         process, log, cmd = _launch_install(args)
     wait = int(args.get("wait_seconds") or 0)
     result = {"job": {"pid": process.pid, "log": log, "command": cmd}}
-    deadline = time.time() + wait
-    while wait and time.time() < deadline:
+    deadline = time.monotonic() + wait
+    while wait and time.monotonic() < deadline:
         code = process.poll()
         state = _current_install_state(process)
         if state.get("phase") == "download" and state.get("total"):
@@ -293,8 +293,8 @@ def tool_start(args, notify):
     status = setup_flow.start_server(cfg, background=True,
                                      open_browser=bool(args.get("open_browser")), out=_stderr_out)
     wait = int(args.get("wait_seconds") or 0)
-    deadline = time.time() + wait
-    while wait and time.time() < deadline and status.get("state") != "ready":
+    deadline = time.monotonic() + wait
+    while wait and time.monotonic() < deadline and status.get("state") != "ready":
         time.sleep(2.0)
         status = setup_flow.server_status(setup_flow.load_config() or cfg)
         notify(None, None, f"server: {status['state']}")
@@ -461,9 +461,9 @@ class Server:
             self.handle_line(line)
         # stdin closed: let the calls in flight answer (a stop drains its engine)
         # before exiting, within the minute a client gives a server to go.
-        deadline = time.time() + 60
+        deadline = time.monotonic() + 60
         for thread in self.threads:
-            thread.join(timeout=max(0.0, deadline - time.time()))
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
 
 def main():
