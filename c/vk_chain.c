@@ -1829,9 +1829,16 @@ static int attn_dec_len(int n, int H) {   /* chain_attn_dec.comp's dec_len, H th
     while (L < 256 && (int64_t)H * nb > 1024) { L *= 2; nb = (n + L - 1) / L; }
     return L;
 }
+/* COLI_VK_ATTN_DEC, the knob (not chain_attn_dec.comp's modes), read on each call as
+ * COLI_VK_ATTN_BLOCK is (test_vk_chain switches it): 0 keeps chain_attn; unset (1) takes
+ * chain_attn_dec where attn_dec's rule allows; 2 also on a device without the flash module
+ * (attn_dec) */
+static int adec_knob(void) {
+    const char *e = getenv("COLI_VK_ATTN_DEC");
+    return e && *e == '0' ? 0 : e && atoi(e) == 2 ? 2 : 1;
+}
 static VkPipeline adec_pipe(void) {
-    static int on = -1;
-    if (on < 0) { const char *e = getenv("COLI_VK_ATTN_DEC"); on = !(e && *e == '0'); }
+    int on = adec_knob() > 0;
     if (on && !KC.adec && !KC.adec_tried) {
         KC.adec_tried = 1;
         if ((KC.mod_adec = load_module(KC.core.spv_path, "chain_attn_dec.spv"))) KC.adec = make_pipe(KC.mod_adec, NULL);
@@ -1842,7 +1849,8 @@ static VkPipeline adec_pipe(void) {
 }
 /* chain_attn_dec's grouped pipeline (mode 2) for gq query heads a KV head of head dim hd, made
  * on first use; NULL where the shared memory it takes (the heads' q rows, scores and sums) is
- * past the device's, or COLI_VK_ATTN_DEC_GQA=0 */
+ * past the device's, or COLI_VK_ATTN_DEC_GQA=0, or where it failed (kept as a pipeline is:
+ * attn_dec asks on every call, and the build is not tried again) */
 static VkPipeline adg_pipe(int hd, int gq) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_VK_ATTN_DEC_GQA"); on = !(e && *e == '0'); }
@@ -1860,8 +1868,7 @@ static VkPipeline adg_pipe(int hd, int gq) {
     int32_t sv[4] = {gq, hd, g_kvh, tpp};
     VkSpecializationMapEntry me[4] = {{0, 0, 4}, {1, 4, 4}, {7, 8, 4}, {2, 12, 4}};
     VkSpecializationInfo si = {4, me, sizeof sv, sv};
-    VkPipeline p = make_pipe(KC.mod_adec, &si);
-    if (!p) return VK_NULL_HANDLE;
+    VkPipeline p = make_pipe(KC.mod_adec, &si);   /* VK_NULL_HANDLE too: mode 0 from then on */
     KC.adg[KC.nadg] = p; KC.adg_hd[KC.nadg] = hd; KC.adg_kv[KC.nadg] = g_kvh; KC.adg_gq[KC.nadg++] = gq;
     return p;
 }
@@ -1893,11 +1900,17 @@ static int attn_dec(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, 
      * answer to the last digit as the prompt recomputed does (tests/test_brio_serve.py).
      * Windows, rings and sinks too, since the flash shader takes them: Flint's decode after a
      * 17K prompt read its full layers' positions a workgroup a head, 15.4 tok/s on an
-     * RTX PRO 4000 */
+     * RTX PRO 4000. COLI_VK_ATTN_DEC=2 (opt-in) gives those bits up on a device without the
+     * flash module, as if it had it: the rest of the rule holds (the grouped pipeline, adg_pipe,
+     * counts on its head dims and float16 offsets), and chain_attn_dec takes no matrix units. An
+     * Arc Pro B60 (Xe2, its cooperative matrices 8 rows tall: no flash module; an SR-IOV VF, Mesa
+     * ANV 26.0.8, the chain on at subgroups of 16) decoded Qwen3.6 after a 16K prompt at 5.03
+     * tok/s, chain_attn's 16 workgroups walking every position, and at 35.52 with =2 (32K: 2.71
+     * -> 33.88; after a short prompt 37.21 -> 38.00), its prompts as fast, the same answers */
     int G = w->a.H / w->a.KVH;
-    if (!(KC.mod_fa && vkc_attn_flash_rows() > 0 && !w->kv_pm && w->vd == w->a.hd &&
+    if (!((KC.mod_fa || adec_knob() == 2) && vkc_attn_flash_rows() > 0 && !w->kv_pm && w->vd == w->a.hd &&
           w->a.hd % 64 == 0 && VKC_FA_ROWS % G == 0 && (!g_kvh || (w->a.k_off % 8 == 0 && w->a.v_off % 8 == 0)) &&
-          fa_pipe(w->a.hd, G))) return 0;
+          (!KC.mod_fa || fa_pipe(w->a.hd, G)))) return 0;
     if (S < 1 || S > VKC_ATTN_DEC_ROWS || n < VKC_ATTN_DEC_MIN || w->a.pos_base + 1 < VKC_ATTN_DEC_MIN || !adec_pipe()) return 0;
     /* a KV head's query heads in one workgroup a block (mode 2), each K and V row read once
      * for them, four floats a load (the offsets whole vec4s). Its blocks' rule counts four
@@ -1923,6 +1936,14 @@ static int attn_dec(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, 
     bd[7].written = 0;
     ok = ok && record(KC.adec, bd, 8, &pc, sizeof pc, (uint32_t)w->a.H, (uint32_t)S, 1);
     KC.st.attn_dec += ok;
+    static int said[2];   /* the opt-in, said where it first takes effect (the split KV cache, say, never does) */
+    if (ok && !KC.mod_fa && !said[g_kd]) {
+        said[g_kd] = 1;
+        fprintf(stderr, "[VK] %schain: COLI_VK_ATTN_DEC=2: attention of up to %d rows (decode, verify, a short prompt "
+                "chunk) over %d positions or more in blocks (chain_attn_dec) with no chain_attn_flash on this device; a "
+                "resumed prefix or a snapshot's scoring may differ in the last digits from a cold recompute (unset: "
+                "chain_attn, the prompt's bits)\n", g_kd ? "dev2 " : "", VKC_ATTN_DEC_ROWS, VKC_ATTN_DEC_MIN);
+    }
     return ok;
 }
 int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, VkcBuf *snk,
