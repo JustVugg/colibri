@@ -194,6 +194,29 @@ unsloth's UD-IQ1_S, thinking off, an RTX PRO 4000 (PCIe 4.0 x8), an i5-13500 and
 
 The chain's room leaves the tier 1930 experts instead of 2116 (15.11 against 16.52 GiB), which the decode, a CPU and tier step, may pay: its range starts lower. The decode reads most of the experts the card does not hold from the disk (the host pool takes the RAM the CPU's cache would have, six slots a layer), and its pace follows the disk.
 
+### GLM-5.3 on CUDA: every layer on the CUDA chain (`glm53_cuchain.h`)
+
+On the CUDA tier the CPU ran GLM-5.3's layers and `cu_dense.h` multiplied each dense matrix on the card a call at a time: about 530 synchronous calls a decoded token of GLM-5.3-Flash, the attention, the hyper-connections and the router on the CPU. With the routed experts on the CUDA tier, every layer now runs on the card, a prompt chunk and a decode step alike, the Vulkan chain's layout (`glm53_chain.h`) on `cuda_chain.cu`'s ops and GLM-5.3's (`cuda_glm53c.cuh`):
+
+- **A layer:** mHC's mix, split and collapse, the input norm, then the KDA layer (its projections, the short convolution with its window, the delta rule with its state, the output norm and gate) or the MLA layer (the query and kv latents with their norms into the latent cache, the k-pooled indexer's keys, pool gates, pooled keys and every row's pools, the absorbed query, the attention core over the selection, the values), the write back; the FFN site's split and norm, then the host's routed experts (the tier's batch and the CPU's share) while the card computes the shared expert, and the sum written back. The final streams come back for the head.
+- **The matrices:** `cu_dense.h`'s copies (`Mat.cu`, the CPU path's own), any format it holds (f32, int8 rows, int4 groups, a GGUF's blocks); the MLA's per-head `k_b` and `v_b` as floats; the mixers in f32.
+- **The state:** the KDA states and windows stay on the card while the chain runs and come back to the host before anything reads them there (a pin, a state capture, a CPU forward, another conversation); the host's MLA caches stay canonical and the card mirrors them. A device lost while it held the newest state: the state is rebuilt on the CPU from the input rows since the host's copy was current, and the CPU runs from there.
+- **The memory:** the tier leaves the chain its room (`g53u_plan_bytes`: the per-head floats, the mixers, the states, the MLA caches at `GLM53_MAXT` positions and a chunk's scratch at `COLI_CUDA_G53_ROWS` rows).
+- **Not here:** a layer range, a model the CUDA tier does not take (resident experts open no CUDA device), a matrix with no CUDA form: the CPU runs the layers. `COLI_CUDA_CHAIN=0`: never.
+
+A prompt chunk's matmuls run on the tensor cores (f16 or TF32 tiles): against the CPU a 4-bit trunk's logits move by 3e-4 of the largest, 6e-7 with `COLI_CUDA_TC_GEMM=0`. `tests/cuda_tier_engines.sh` holds the chain to the CPU's tokens and its logits.
+
+unsloth's GLM-5.3-Flash UD-IQ2_XXS (95 GB), an RTX PRO 4000 (24 GB, PCIe 4.0 x8), an i5-13500 and 62 GB of RAM, tokens a second with the thinking counted, two serves a side alternated:
+
+| | the CPU's layers | the CUDA chain | Vulkan (its chain) |
+|---|---|---|---|
+| a story, first turn (128 tokens) | 2.93-2.95 | 3.57-3.65 | 3.44 |
+| the same, second turn | 3.85-4.11 | 4.50-4.68 | 4.38 |
+| 523-token prompt | 5.92-6.57 | 10.92-15.16 | 10.30 |
+| its 16 tokens of decode | 2.57-2.75 | 3.83-3.98 | 3.64 |
+
+The chain's room leaves the tier 1987 experts instead of 2209 (15.08 against 16.71 GiB). The decode is the CPU's: the experts neither the card nor the host pool holds come from the disk, and the host pool's pairs run on the CPU.
+
 ## OLMoE on the card (`olmoe_cuda_chain.h`)
 
 OLMoE-1B-7B is small enough to hold whole on a card (Q4_K_M: 3.9 GiB of experts and 0.6 GiB of

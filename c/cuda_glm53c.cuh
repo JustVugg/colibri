@@ -6,7 +6,7 @@
  *   cc_kda_conv  the short convolution: a thread a channel, the rows in order, the window
  *                ([C][K], oldest first) carried across calls;
  *   cc_kda_rec   the recurrence and the output norm: a block a head, a thread a column of the
- *                state in registers (KD 64 or 128, VD <= 128); from CC_KDA_ROWS rows a block
+ *                state in registers (KD 16, 32, 64 or 128, VD <= 128); from CC_KDA_ROWS rows a block
  *                of rows at a time with every value the row by row kernel makes;
  * and of chain_mla.comp and chain_dsa.comp's k-pooling (with chain_hgemv.comp on float rows):
  *   cc_mla_core  the attention core over the latent and rope caches, a block a (head, row), the
@@ -229,16 +229,14 @@ static int cc_kda_rows_on(void) {
 static int cc_kda_rec(int KD, CcBuf *m, CcBuf *f, CcBuf *b, CcBuf *g, CcBuf *prm, CcBuf *st, CcBuf *y, const CcKdaRec *p, int flags) {
     CcCtx *c = live();
     if (!c || !p || !m || !f || !b || !g || !prm || !st || !y || p->S < 1 || p->H < 1 || p->VD < 1 || p->VD > 128 ||
-        (KD != 64 && KD != 128)) return 0;
+        (KD != 16 && KD != 32 && KD != 64 && KD != 128)) return 0;
     const int rows = p->S >= CC_KDA_ROWS && cc_kda_rows_on();
     const dim3 grid((unsigned)p->H);
-    if (KD == 128) {
-        if (rows) coli_launch(ccg_kda_rows_k<128>, grid, 128, 0, c->stream, fp(m), fp(f), fp(b), fp(g), fp(prm), fpw(st), fpw(y), *p, flags);
-        else coli_launch(ccg_kda_rec_k<128>, grid, 128, 0, c->stream, fp(m), fp(f), fp(b), fp(g), fp(prm), fpw(st), fpw(y), *p, flags);
-    } else {
-        if (rows) coli_launch(ccg_kda_rows_k<64>, grid, 128, 0, c->stream, fp(m), fp(f), fp(b), fp(g), fp(prm), fpw(st), fpw(y), *p, flags);
-        else coli_launch(ccg_kda_rec_k<64>, grid, 128, 0, c->stream, fp(m), fp(f), fp(b), fp(g), fp(prm), fpw(st), fpw(y), *p, flags);
-    }
+#define CG_KDA(KD_) if (KD == KD_) { \
+        if (rows) coli_launch(ccg_kda_rows_k<KD_>, grid, 128, 0, c->stream, fp(m), fp(f), fp(b), fp(g), fp(prm), fpw(st), fpw(y), *p, flags); \
+        else coli_launch(ccg_kda_rec_k<KD_>, grid, 128, 0, c->stream, fp(m), fp(f), fp(b), fp(g), fp(prm), fpw(st), fpw(y), *p, flags); }
+    CG_KDA(128) CG_KDA(64) CG_KDA(32) CG_KDA(16)
+#undef CG_KDA
     return launched(c, "kda rec");
 }
 /* ---- MLA (chain_mla.comp, chain_hgemv.comp's float rows) --------------------------------- */

@@ -37,6 +37,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **GLM-5.3 on CUDA: every layer on the card.** On the CUDA tier the CPU ran GLM-5.3's layers
+  and multiplied each dense matrix on the card a call at a time, about 530 synchronous calls a
+  decoded token of GLM-5.3-Flash. With the routed experts on the CUDA tier, a prompt chunk's and
+  a decode step's layers now run on the CUDA chain (`glm53_cuchain.h`), the Vulkan chain's
+  layout on new ops (`cuda_glm53c.cuh`: the KDA convolution and recurrence, the MLA core, RoPE,
+  LayerNorm and per-head matmuls, the k-pooled indexer): the KDA state on the card while the
+  chain runs, the host's MLA caches mirrored, the routed experts on the host between two frames
+  while the card computes the shared expert. unsloth's GLM-5.3-Flash UD-IQ2_XXS on an RTX PRO
+  4000: decode 2.93-2.95 -> 3.57-3.65 tok/s on a first turn and 3.85-4.11 -> 4.50-4.68 on a
+  second, a 523-token prompt 5.92-6.57 -> 10.92-15.16 tok/s. `COLI_CUDA_CHAIN=0`: the CPU's
+  layers.
 - **DeepSeek V4.1 with a GGUF on CUDA: a prompt's layers on the card.** On the CUDA tier the CPU
   ran a prompt's layers, the sparse attention, the hyper-connections and the router three fifths
   of a 4104-token prompt. A prompt of more than one chunk now runs layer by layer on the CUDA

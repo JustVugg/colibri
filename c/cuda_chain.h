@@ -233,8 +233,8 @@ typedef struct { int S, H, D, kv_off, kv_row, x_off, x_row, qw_off, kw_off; floa
 /* GLM-5.3's (and Kimi K3's) linear attention (cuda_glm53c.cuh), the Vulkan chain's vkc_kda_conv
  * and vkc_kda_rec_flags with the same fields in the same order (vk_chain.h has their contract):
  * the short convolution's window and the recurrence's state on the device across calls; from
- * CC_KDA_ROWS rows the recurrence takes a block of rows at a time with the same bits. KD 64 or
- * 128, VD <= 128; flags as VKC_KDA_EXP_A (1) and VKC_KDA_K3 (2). */
+ * CC_KDA_ROWS rows the recurrence takes a block of rows at a time with the same bits. KD 16, 32,
+ * 64 or 128, VD <= 128; flags as VKC_KDA_EXP_A (1) and VKC_KDA_K3 (2). */
 #define CC_KDA_ROWS 8
 typedef struct { int S, C, K, P, in_off, in_row, in_part, out_off, out_row, w_off, win_off; } CcKdaConv;
 typedef struct { int S, H, VD, P, m_off, m_row, f_off, f_row, b_off, b_row, g_off, g_row, y_off, y_row, st_off, prm_off;

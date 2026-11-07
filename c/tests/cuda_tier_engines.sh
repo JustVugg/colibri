@@ -50,6 +50,40 @@ for v in "decode:GLM53_BITS=32:5,7,9,11,13,17,19,23:20" "evict:GLM53_BITS=32 COL
   if [ -s a.tok ] && cmp -s a.tok b.tok && [ "$d" -gt 0 ]; then ok "glm53 $tag: tokens = CPU, device $d"; else bad "glm53 $tag (device $d)"; diff a.tok b.tok | head -4; tail -3 g53-cu.log; fi
 done
 
+# glm53 on the CUDA chain (glm53_cuchain.h): every layer on the card, the greedy and teacher-forced lines the
+# CPU's and the logits within 1e-4 of the largest with the exact GEMMs (COLI_CUDA_TC_GEMM=0), 1e-3 on the tensor cores
+lclose() {  # <cpu.f32> <cu.f32> <tolerance>: max |diff| within tolerance of the largest |logit|
+  $PY - "$1" "$2" "$3" <<'PY'
+import array, sys
+try:
+    a = array.array("f", open(sys.argv[1], "rb").read()); b = array.array("f", open(sys.argv[2], "rb").read())
+except OSError:
+    print("no logits"); sys.exit(1)
+d = max(abs(x - y) for x, y in zip(a, b)) if a and len(a) == len(b) else float("inf")
+m = max(abs(x) for x in a) if a else 0.0
+print(f"max |logit diff| {d:.2e} of {m:.2e}")
+sys.exit(0 if d <= float(sys.argv[3]) * m else 1)
+PY
+}
+g53ids=$($PY -c "print(','.join(str((i*37+5)%120+2) for i in range(100)))")
+for v in "chain decode|1e-4|GLM53_BITS=32|5,7,9,11,13,17,19,23|8" \
+         "chain 100-token prompt, 32-bit trunk|1e-4|GLM53_BITS=32|$g53ids|4" \
+         "chain 100-token prompt, 4-bit trunk, exact GEMMs|1e-4|GLM53_BITS=4 COLI_CUDA_TC_GEMM=0|$g53ids|4" \
+         "chain 100-token prompt, 4-bit trunk, tensor cores|1e-3|GLM53_BITS=4|$g53ids|4" \
+         "chain prefill chunks of 7, one cache slot|1e-4|GLM53_BITS=4 COLI_CUDA_TC_GEMM=0 GLM53_PREFILL_CHUNK=7 GLM53_EXPERT_GB=0.000001|$g53ids|4" \
+         "chain chunks of 3|1e-4|GLM53_BITS=32 COLI_CUDA_G53_ROWS=3|$g53ids|4"; do
+  IFS='|' read -r tag tol envs ids n <<< "$v"
+  rm -f g53.usage g53-cpu.f32 g53-cu.f32
+  env $envs COLI_SPEC_GATE=0 USAGE_SAVE=0 COLI_USAGE=g53.usage DUMP=g53-cpu.f32 ./glm53 --model glm53_stream-i4 --ids $ids --greedy $n > g53-cpu.log 2>&1
+  rm -f g53.usage
+  env $envs $X COLI_SPEC_GATE=0 USAGE_SAVE=0 COLI_USAGE=g53.usage DUMP=g53-cu.f32 ./glm53 --model glm53_stream-i4 --ids $ids --greedy $n > g53-cu.log 2>&1
+  grep -aE '^teacher_forcing|^greedy' g53-cpu.log > a.tok; grep -aE '^teacher_forcing|^greedy' g53-cu.log > b.tok
+  fw=$(sed -n 's/^\[CUDA\] glm53 chain: \([0-9][0-9]*\) forwards.*/\1/p' g53-cu.log | tail -1)
+  lg=$(lclose g53-cpu.f32 g53-cu.f32 "$tol"); lok=$?
+  if [ -s a.tok ] && cmp -s a.tok b.tok && [ "${fw:-0}" -gt 0 ] && [ $lok = 0 ]; then ok "glm53 $tag: tokens = CPU, $lg, $fw chain forwards"
+  else bad "glm53 $tag (${fw:-0} chain forwards, $lg)"; diff a.tok b.tok | head -4; tail -3 g53-cu.log; fi
+done
+
 # deepseek_v41: the oracle passes and the output is the CPU's
 for cap in 1 2 8; do
   env SNAP=dsv41_tiny ./deepseek_v41 $cap dsv41_tiny/ref.json > v41-cpu.txt 2> v41-cpu.err; rc0=$?
