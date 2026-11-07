@@ -33,6 +33,10 @@ OBJ = "backend_cuda_dsv4.o"
 STAMP = "deepseek_v4.cudaflags"
 
 FAKE_NVCC = """#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo "Cuda compilation tools, release ${FAKE_NVCC_RELEASE:-12.8}, V0.0.0"
+    exit 0
+fi
 # Stand-in nvcc: records the command line, creates the -o target, compiles nothing.
 printf '%s\\n' "$*" >> "$FAKE_NVCC_LOG"
 depfile=
@@ -77,7 +81,8 @@ class DeepseekV4CudaArchFlagsTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def make(self, *args):
-        env = dict(os.environ, FAKE_NVCC_LOG=str(self.log))
+        env = dict(os.environ, FAKE_NVCC_LOG=str(self.log),
+                   FAKE_NVCC_RELEASE=getattr(self, "release", "12.8"))
         return subprocess.run(
             [MAKE, "-f", "Makefile.deepseek-v4", f"NVCC={self.nvcc}", *args],
             cwd=self.dir, text=True, capture_output=True, check=False,
@@ -124,6 +129,26 @@ class DeepseekV4CudaArchFlagsTest(unittest.TestCase):
         self.assertEqual(self.build("CUDA=1", "CUDA_ARCH=sm_86"), 1)
         self.assertTrue(depfile.exists())
         self.assertEqual(self.build("CUDA=1", "CUDA_ARCH=sm_86"), 0)
+
+    def test_old_or_unknown_toolkit_rejected_before_compilation(self):
+        for release in ("11.8", "12.7", "unknown"):
+            with self.subTest(release=release):
+                self.release = release
+                result = self.make(OBJ, "CUDA=1", "CUDA_ARCH=sm_86")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("requires CUDA toolkit >= 12.8", result.stderr)
+                self.assertIn("NO_TC=1", result.stderr)
+                self.assertFalse((self.dir / OBJ).exists())
+                self.assertEqual(self.nvcc_calls(), 0)
+
+    def test_new_toolkit_accepted(self):
+        self.release = "13.0"
+        self.assertEqual(self.build("CUDA=1", "CUDA_ARCH=sm_86"), 1)
+
+    def test_no_tc_skips_toolkit_requirement(self):
+        self.release = "unknown"
+        self.assertEqual(self.build("CUDA=1", "CUDA_ARCH=sm_86", "NO_TC=1"), 1)
+        self.assertIn("-DCOLI_DSV4_NO_TC", self.log.read_text())
 
     def test_same_arch_does_not_rebuild(self):
         """The guard: a fix that always recompiles would pass the tests below."""

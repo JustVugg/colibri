@@ -397,6 +397,13 @@ backend_loader_dsv4.o: backend_loader_dsv4.c backend_cuda_dsv4.h $(V4_FLAGS_STAM
 # Linux/macOS CUDA=1: the tier compiled straight into the engine.
 backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h $(V4_DEEPGEMM_DEP) \
 	$(V4_CUDA_FLAGS_STAMP)
+ifneq ($(NO_TC),1)
+	@release=$$("$(NVCC)" --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p'); \
+	if ! printf '%s\n' "$$release" | awk -F. 'NF == 2 && ($$1 > 12 || ($$1 == 12 && $$2 >= 8)) { ok=1 } END { exit !ok }'; then \
+		echo "DeepSeek V4: cuBLASLt block scaling requires CUDA toolkit >= 12.8 (detected: $${release:-unknown}). Select a compatible NVCC or use NO_TC=1." >&2; \
+		exit 1; \
+	fi
+endif
 	"$(NVCC)" $(V4_NVCCFLAGS) -MMD -MP -MF backend_cuda_dsv4.d -c backend_cuda_dsv4.cu -o $@
 
 ifneq ($(DEEPGEMM_STAMP),)
