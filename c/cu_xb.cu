@@ -97,6 +97,12 @@ static struct {
     ColiVkXbStats st;
 } C;
 
+#define CU_GEMM_ROWS 16          /* an expert's rows from which a sub-batch takes the tiles (streaming) */
+/* backend_cuda.cu: a block matrix in this file's layout on the dense matrices' f16 tiles (0: not taken) */
+extern "C" int coli_cuda_bd_gemm_raw(int device, const void *w, int fmt, int I, int O, int row_words,
+                                     const float *x, float *y, int S, void *stream);
+static int cu_sub_any(void);     /* a streaming sub-batch in flight (below) */
+static int cu_stream_on(void);   /* COLI_CUDA_TIER_STREAM */
 static int cu_set(void) { return C.ready && cudaSetDevice(C.dev) == cudaSuccess; }
 static int cu_open(void) {
     if (C.tried) return C.ready;
@@ -344,7 +350,7 @@ static int cu_tensor_copy(ColiVkTensor *const *dst, ColiVkTensor *const *src, in
 static void cu_tensor_free(ColiVkTensor *t) {
     if (!t) return;
     std::lock_guard<std::mutex> lk(C.mx);
-    if (C.inflight) { C.pending.push_back(t); return; }
+    if (C.inflight || cu_sub_any()) { C.pending.push_back(t); return; }
     cudaSetDevice(C.dev);
     tensor_release(t);
 }
@@ -598,7 +604,7 @@ static int cu_grow(int rows) {
     return 1;
 }
 static int cu_xb_issue_w(ColiVkExpert *const *ex, const int *rows, int count, const float *const *xrows, const float *wrows) {
-    if (!C.xb || C.inflight || count < 1 || !cu_set()) return 0;
+    if (!C.xb || C.inflight || cu_sub_any() || count < 1 || !cu_set()) return 0;
     int tot = 0;
     for (int c = 0; c < count; c++) tot += rows[c];
     if (tot < 1 || !cu_grow(tot)) return 0;
@@ -666,25 +672,186 @@ static int cu_xb_join_dev(int dev, const float **yrows, double *device_ms) { ret
 static int cu_xb_busy_dev(int dev) { return dev == 0 && C.inflight; }
 static void cu_xb_stats(ColiVkXbStats *st) {
     *st = C.st;
-    st->timestamps = 1; st->queue_shared = 0; st->gemm_rows = 0;   /* no streaming yet */
+    st->timestamps = 1; st->queue_shared = 0;
+    st->gemm_rows = cu_stream_on() ? CU_GEMM_ROWS : 0;   /* streaming's sub-batches: below */
 }
 
-/* streaming's sub-batches and the grouped step: not here yet (gemm_rows 0 keeps the tier off them) */
+/* ---------------------------------------------------------------- streaming's sub-batches */
+/* A prefill step too big for one batch (vk_tier.c's streaming): batch k of the step in half
+ * k % 2, each half with its own scratch, stream and events, so the host packs one while the
+ * card runs the other; the host pool's experts copied into the streaming slots on the half's
+ * stream ahead of its next batch (sub_copy). An expert's rows from CU_GEMM_ROWS on the f16
+ * tiles where its blocks take them (coli_cuda_bd_gemm_raw: the dense matrices' prompt tiles,
+ * each weight decoded once a tile of rows), the GEMV otherwise. The single batch and the
+ * sub-batches do not overlap (cu_xb_issue_w and cu_xb_sub_issue refuse while the other is in
+ * flight). COLI_CUDA_TIER_STREAM=0: no sub-batches (gemm_rows 0), the tier streams nothing. */
+struct CuCopy { void *d; const void *s; size_t n; };
+static struct CuSub {
+    cudaStream_t st; cudaEvent_t e0, e1, ecp; int made, ecp_set;   /* ecp: after its copies into the slots */
+    size_t cap; float *dX, *dG, *dU, *dY, *dW, *hX, *hY, *hW;
+    int inflight, nrows;
+    std::vector<CuCopy> cp;
+} g_sub[2];
+static int cu_stream_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_TIER_STREAM"); on = !(e && *e == '0'); }
+    return on;
+}
+static int cu_sub_any(void) { return g_sub[0].inflight || g_sub[1].inflight; }
+static size_t cu_sub_dev_row(void) { return ((size_t)2 * C.D + (size_t)2 * C.I + 1) * 4; }
+static size_t cu_sub_host_row(void) { return ((size_t)2 * C.D + 1) * 4; }
+static void cu_sub_free(CuSub *b) {
+    cudaFree(b->dX); cudaFree(b->dG); cudaFree(b->dU); cudaFree(b->dY); cudaFree(b->dW);
+    cudaFreeHost(b->hX); cudaFreeHost(b->hY); cudaFreeHost(b->hW);
+    b->dX = b->dG = b->dU = b->dY = b->dW = b->hX = b->hY = b->hW = NULL; b->cap = 0;
+}
+static int cu_sub_grow(CuSub *b, int rows) {
+    if (!b->made) {
+        if (cudaStreamCreateWithFlags(&b->st, cudaStreamNonBlocking) != cudaSuccess || cudaEventCreate(&b->e0) != cudaSuccess ||
+            cudaEventCreate(&b->e1) != cudaSuccess || cudaEventCreateWithFlags(&b->ecp, cudaEventDisableTiming) != cudaSuccess) {
+            cudaGetLastError(); return 0;
+        }
+        b->made = 1;
+    }
+    if ((size_t)rows <= b->cap) return 1;
+    cu_sub_free(b);
+    const size_t n = (size_t)rows, D = (size_t)C.D, I = (size_t)C.I;
+    if (cudaMalloc(&b->dX, n * D * 4) != cudaSuccess || cudaMalloc(&b->dG, n * I * 4) != cudaSuccess ||
+        cudaMalloc(&b->dU, n * I * 4) != cudaSuccess || cudaMalloc(&b->dY, n * D * 4) != cudaSuccess ||
+        cudaMalloc(&b->dW, n * 4) != cudaSuccess || cudaHostAlloc(&b->hX, n * D * 4, cudaHostAllocPortable) != cudaSuccess ||
+        cudaHostAlloc(&b->hY, n * D * 4, cudaHostAllocPortable) != cudaSuccess ||
+        cudaHostAlloc(&b->hW, n * 4, cudaHostAllocPortable) != cudaSuccess) {
+        cudaGetLastError();
+        cu_sub_free(b);
+        return 0;
+    }
+    b->cap = n;
+    return 1;
+}
+/* the largest sub-batch up to rows whose two halves fit half the card's free memory (what
+ * the halves hold already counts as free) and extra_budget of page-locked RAM */
+static int cu_xb_sub_fit(int rows, int experts, size_t extra) {
+    (void)experts;
+    if (!C.xb || !cu_stream_on() || rows < 1 || cu_sub_any() || C.inflight || !cu_set()) return 0;
+    if (rows > 65535) rows = 65535;
+    size_t fr = 0, tot = 0;
+    if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) { cudaGetLastError(); return 0; }
+    const size_t held = (g_sub[0].cap + g_sub[1].cap) * cu_sub_dev_row();
+    size_t by_dev = (fr / 2 + held) / (2 * cu_sub_dev_row()), by_host = extra / (2 * cu_sub_host_row());
+    size_t r = (size_t)rows;
+    if (r > by_dev) r = by_dev;
+    if (r > by_host) r = by_host;
+    return (int)r;
+}
+static int cu_xb_sub_reserve(int rows, int experts) {
+    (void)experts;
+    if (!C.xb || !cu_stream_on() || rows < 1 || cu_sub_any() || C.inflight || !cu_set()) return 0;
+    return cu_sub_grow(&g_sub[0], rows) && cu_sub_grow(&g_sub[1], rows);
+}
+/* the host pool's experts into the streaming slots, at the head of half h's next batch: each
+ * slot takes its source's format and shape (copy_as_prep's rule) */
+static int cu_xb_sub_copy(int h, ColiVkTensor *const *dst, ColiVkTensor *const *src, int n) {
+    if (h < 0 || h > 1 || !C.xb || n < 1) return 0;
+    for (int k = 0; k < n; k++) {
+        ColiVkTensor *t = dst[k]; const ColiVkTensor *f = src[k];
+        if (!t || !f || !f->w || f->pool != 5 || t->pool == 5 || f->wbytes > t->wcap || f->sbytes > t->scap) return 0;
+        if (cu_bd_fmt(f->fmt) != cu_bd_fmt(t->fmt)) return 0;
+    }
+    for (int k = 0; k < n; k++) {
+        ColiVkTensor *t = dst[k]; const ColiVkTensor *f = src[k];
+        t->fmt = f->fmt; t->I = f->I; t->O = f->O; t->gs = f->gs; t->rowWords = f->rowWords;
+        t->wbytes = f->wbytes; t->sbytes = f->sbytes;
+        g_sub[h].cp.push_back({t->w, f->w, f->wbytes});
+        if (f->sbytes && f->s && t->s) g_sub[h].cp.push_back({t->s, f->s, f->sbytes});
+    }
+    return 1;
+}
+static void cu_xb_sub_copy_drop(void) { g_sub[0].cp.clear(); g_sub[1].cp.clear(); }
+/* one expert's n rows of x: its weights' tiles where they take the rows, else the GEMV */
+static int cu_mm(float *y, const float *x, const ColiVkTensor *t, int n, cudaStream_t st) {
+    if (n >= CU_GEMM_ROWS && cu_bd_fmt(t->fmt) && !g_exact &&
+        coli_cuda_bd_gemm_raw(C.dev, t->w, t->fmt, t->I, t->O, t->rowWords, x, y, n, (void *)st)) return 1;
+    return cu_gemv(y, x, t, n, st);
+}
+static int cu_xb_sub_issue(int h, ColiVkExpert *const *ex, const int *rows, int count, const float *const *xrows, const float *wrows) {
+    if (h < 0 || h > 1 || !C.xb || C.inflight || g_sub[h].inflight || count < 1 || !cu_set()) return 0;
+    CuSub *b = &g_sub[h];
+    int tot = 0;
+    for (int c = 0; c < count; c++) tot += rows[c];
+    if (tot < 1 || (size_t)tot > b->cap) return 0;
+    const size_t D = (size_t)C.D, I = (size_t)C.I;
+    for (int j = 0; j < tot; j++) {
+        memcpy(b->hX + (size_t)j * D, xrows[j], D * 4);
+        b->hW[j] = wrows ? wrows[j] : 1.f;
+    }
+    cudaStream_t st = b->st;
+    /* A slot the other half's copies filled can serve this half first: the step adds an
+     * expert's rows to a new sub-batch when the one its group's copies went with is full.
+     * Those copies ran on the other half's stream, so this one waits for them. */
+    const CuSub *o = &g_sub[!h];
+    int ok = (!o->ecp_set || cudaStreamWaitEvent(st, o->ecp, 0) == cudaSuccess) && cudaEventRecord(b->e0, st) == cudaSuccess;
+    for (size_t k = 0; k < b->cp.size() && ok; k++)   /* the host pool's experts into their slots first */
+        ok = cudaMemcpyAsync(b->cp[k].d, b->cp[k].s, b->cp[k].n, cudaMemcpyDefault, st) == cudaSuccess;
+    b->cp.clear();
+    ok = ok && cudaEventRecord(b->ecp, st) == cudaSuccess;
+    if (ok) b->ecp_set = 1;
+    ok = ok && cudaMemcpyAsync(b->dX, b->hX, (size_t)tot * D * 4, cudaMemcpyHostToDevice, st) == cudaSuccess &&
+         (C.act != 2 || cudaMemcpyAsync(b->dW, b->hW, (size_t)tot * 4, cudaMemcpyHostToDevice, st) == cudaSuccess);
+    int gemm = 0;
+    for (int c = 0, r0 = 0; c < count && ok; r0 += rows[c], c++) {
+        const int n = rows[c];
+        if (!n) continue;
+        const ColiVkExpert *e = ex[c];
+        float *g = b->dG + (size_t)r0 * I, *u = b->dU + (size_t)r0 * I;
+        gemm += n >= CU_GEMM_ROWS;
+        ok = cu_mm(g, b->dX + (size_t)r0 * D, e->g, n, st) && cu_mm(u, b->dX + (size_t)r0 * D, e->u, n, st);
+        if (!ok) break;
+        const long ne = (long)n * (long)I;
+        cu_act_k<<<(unsigned)((ne + 255) / 256), 256, 0, st>>>(g, u, ne, C.act, C.limit, C.a, C.b);
+        if (C.act == 2) cu_act_v4_k<<<dim3((unsigned)((I + 127) / 128), (unsigned)n), 128, 0, st>>>(g, b->dW + r0, n, (int)I);
+        ok = cudaPeekAtLastError() == cudaSuccess && cu_mm(b->dY + (size_t)r0 * D, g, e->d, n, st);
+    }
+    ok = ok && cudaMemcpyAsync(b->hY, b->dY, (size_t)tot * D * 4, cudaMemcpyDeviceToHost, st) == cudaSuccess &&
+         cudaEventRecord(b->e1, st) == cudaSuccess;
+    if (!ok) {   /* nothing to join: the caller computes these experts */
+        cudaStreamSynchronize(st);
+        cudaGetLastError();
+        return 0;
+    }
+    b->inflight = 1; b->nrows = tot;
+    C.st.sub_batches++; C.st.sub_experts += (unsigned long long)count; C.st.sub_rows += (unsigned long long)tot;
+    C.st.sub_gemm += (unsigned long long)gemm;
+    return 1;
+}
+static int cu_xb_sub_issue_step(int h, ColiVkExpert *const *ex, const int *rows, int count, const int *assign, const float *wrows) {
+    (void)h; (void)ex; (void)rows; (void)count; (void)assign; (void)wrows; return 0;   /* no grouped step here */
+}
+static int cu_xb_sub_join(int h, float *const *yout, double *ms) {
+    if (h < 0 || h > 1 || !g_sub[h].inflight) return 0;
+    CuSub *b = &g_sub[h];
+    cudaSetDevice(C.dev);
+    cudaError_t e = cudaEventSynchronize(b->e1);
+    float t = 0.f;
+    if (e == cudaSuccess) cudaEventElapsedTime(&t, b->e0, b->e1);
+    else cudaGetLastError();
+    b->inflight = 0;
+    if (!cu_sub_any() && !C.inflight) {   /* the tensors freed meanwhile */
+        std::lock_guard<std::mutex> lk(C.mx);
+        for (ColiVkTensor *x : C.pending) tensor_release(x);
+        C.pending.clear();
+    }
+    if (e != cudaSuccess) return 0;
+    for (int j = 0; j < b->nrows; j++) memcpy(yout[j], b->hY + (size_t)j * C.D, (size_t)C.D * 4);
+    if (ms) *ms = t;
+    C.st.sub_ms += t;
+    return 1;
+}
+static int cu_xb_sub_busy(int h) { return h >= 0 && h <= 1 && g_sub[h].inflight; }
+
+/* the grouped step: not here (the tier then packs each sub-batch's rows) */
 static float *cu_xb_step_begin(int S, int K, const float *x) { (void)S; (void)K; (void)x; return NULL; }
 static const float *cu_xb_step_sum(const float *w, const uint8_t *use, double *ms) { (void)w; (void)use; (void)ms; return NULL; }
 static void cu_xb_step_end(void) {}
-static int cu_xb_sub_fit(int rows, int experts, size_t extra) { (void)rows; (void)experts; (void)extra; return 0; }
-static int cu_xb_sub_reserve(int rows, int experts) { (void)rows; (void)experts; return 0; }
-static int cu_xb_sub_issue(int h, ColiVkExpert *const *ex, const int *rows, int count, const float *const *xrows, const float *wrows) {
-    (void)h; (void)ex; (void)rows; (void)count; (void)xrows; (void)wrows; return 0;
-}
-static int cu_xb_sub_issue_step(int h, ColiVkExpert *const *ex, const int *rows, int count, const int *assign, const float *wrows) {
-    (void)h; (void)ex; (void)rows; (void)count; (void)assign; (void)wrows; return 0;
-}
-static int cu_xb_sub_join(int h, float *const *yout, double *ms) { (void)h; (void)yout; (void)ms; return 0; }
-static int cu_xb_sub_busy(int h) { (void)h; return 0; }
-static int cu_xb_sub_copy(int h, ColiVkTensor *const *dst, ColiVkTensor *const *src, int n) { (void)h; (void)dst; (void)src; (void)n; return 0; }
-static void cu_xb_sub_copy_drop(void) {}
 
 /* ---------------------------------------------------------------- the table */
 static const CuTierOps g_ops = {
