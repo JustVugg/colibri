@@ -2449,6 +2449,17 @@ computes the ones it holds:
   (1.4 pool pairs a step) a step took 789 us with 12 threads and 328 with 2, the same
   pairs alone 50 us.
 
+A release's FP8 experts (fmt 12: e4m3 with a float scale per 128 columns,
+Qwen3.8-Flash-Next-FP8's) have no integer form there. Their pairs decode the codes through
+binary16 with F16C (from a table of the 256 values without it), multiply the float rows
+with FMA, and scale each group's sum once (`vk_tier.c`'s `fp8_rows` and, for a decode
+step's one row, `fp8_rows4_s1`): within 3e-7 of a double-precision sum. `GQ_EXACT=1` keeps
+the float reference, which decoded every weight through `ldexpf`. On a Xeon Gold 6254 with
+16 threads, a pair of Qwen3.8's experts (2560 x 640) went from 4.4 ms to 133-145 us.
+Beside an Arc Pro B60 with every routed expert in the host pool, decode went from 0.7 to
+7.4 tok/s, with greedy answers identical ([the
+experiment](experiments/vulkan-fp8-host-pairs-2026-11-07/manifest.json)).
+
 Where the device has events (every device), a step stays inside its frame, as the CUDA
 chain's does with its host flags: `vkCmdSetEvent` once the route and the rows are down
 (the host polls `vkGetEventStatus`), the device's experts, `vkCmdWaitEvents` on the event
