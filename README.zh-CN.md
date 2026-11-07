@@ -237,7 +237,7 @@ CI 在软件驱动上将每个引擎的 Vulkan 路径与 CPU 的 token 对照检
 
 ### CUDA：NVIDIA 显卡
 
-安装了 CUDA 工具包时，安装程序会在 Linux 上为有 CUDA 路径的引擎构建 CUDA：GLM-5.2/5.3 和 Mistral-Large-4、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、DeepSeek V4.1 Flash、MiMo-V2.6、Qwen3.8-Flash-Next，以及 Qwen3.6 和它运行的模型；OLMoE 和决策引擎用 `make <引擎> CUDA=1` 构建。在 Windows 上，CUDA 引擎是一个单独的 DLL（[windows.md](docs/windows.md)），每个版本都附带编译好的版本：`colibri-<version>-windows-x86_64-cuda.zip` 包含 `coli_cuda.dll`（compute capability 8.0 及以上的显卡）以及加载它的 colibri、qwen36 和 kimi_k3 引擎，还有 DeepSeek V4 的 CUDA DLL。把它解压到主压缩包之上，安装程序就会选择 CUDA。
+安装了 CUDA 工具包时，安装程序会在 Linux 上为有 CUDA 路径的引擎构建 CUDA：GLM-5.2/5.3 和 Mistral-Large-4、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、DeepSeek V4.1 Flash、MiMo-V2.6、Qwen3.8-Flash-Next，以及 Qwen3.6 和它运行的模型；OLMoE 和决策引擎用 `make <引擎> CUDA=1` 构建。在 Windows 上，CUDA 引擎是一个单独的 DLL（[windows.md](docs/windows.md)），每个版本都附带编译好的版本：`colibri-<version>-windows-x86_64-cuda.zip` 包含 `coli_cuda.dll`（compute capability 8.0 及以上的显卡）以及加载它的 colibri、glm53、qwen36 和 kimi_k3 引擎，还有 DeepSeek V4 的 CUDA DLL。把它解压到主压缩包之上，安装程序就会选择 CUDA。
 
 - **所有层都在显卡上**（Qwen3.6、Qwen3.8 和 OLMoE）：稠密层、注意力以及显卡持有的路由专家作为一条链运行，显卡不持有的专家在 CPU 上运行。在 RTX PRO 4000 上，Qwen3.6-35B-A3B UD-Q4_K_M 的解码速度为 104.8 tok/s，读取提示词为 3,491，OLMoE 为 354.6 和 10,418（[表格](#three-backends-on-one-machine)）。
 - **每个引擎都有显卡上的路由专家层级**（`cu_tier.h`），DeepSeek V4、V4.1、Kimi K3、GLM-5.3 和 MiMo 的稠密矩阵也放在显卡上（`cu_dense.h`）。
