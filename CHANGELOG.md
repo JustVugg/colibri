@@ -48,6 +48,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   4000: decode 2.93-2.95 -> 3.57-3.65 tok/s on a first turn and 3.85-4.11 -> 4.50-4.68 on a
   second, a 523-token prompt 5.92-6.57 -> 10.92-15.16 tok/s. `COLI_CUDA_CHAIN=0`: the CPU's
   layers.
+- **GLM-5.2 and GLM-5.3 on CUDA: every layer on the card.** A glm-dsa GGUF under `COLI_CUDA=1`
+  put its routed experts on the CUDA tier and left the attention to the CPU, and its dense
+  matrices too where half of the card's free memory did not hold them (GLM-5.3 UD-IQ1_S's 13
+  GiB): the CPU read every dense matrix every token. Every layer now runs on the CUDA chain
+  (`colibri_cuchain.h`), the Vulkan chain's layout on the CUDA chain's ops, with two new ones:
+  the DSA selection (`cc_dsa_select`, colibri.c's position for position, up to top-2048) and the
+  per-head matmul on a GGUF's Q8_0 rows (`k_b` and `v_b` as the file has them). Every dense
+  matrix goes to the card when it fits beside the chain, as Vulkan's chain takes it, and the
+  routed experts keep the rest; a CUDA build also runs a GGUF's dense matrices on the card where
+  the chain does not (the head among them), as only a build with Vulkan did. unsloth's GLM-5.3
+  UD-IQ1_S on an RTX PRO 4000: decode 0.66-0.68 -> 0.77-0.79 tok/s on a first turn and
+  0.76 -> 0.88-0.98 on a second, a 528-token prompt 2.23-2.24 -> 4.40-4.51 tok/s (Vulkan's chain
+  0.77-0.78, 0.85-0.90, 3.68-4.29). `COLI_CUDA_CHAIN=0`: the CPU's attention.
 - **DeepSeek V4.1 with a GGUF on CUDA: a prompt's layers on the card.** On the CUDA tier the CPU
   ran a prompt's layers, the sparse attention, the hyper-connections and the router three fifths
   of a 4104-token prompt. A prompt of more than one chunk now runs layer by layer on the CUDA
