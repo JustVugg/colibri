@@ -206,6 +206,56 @@ typedef struct {
 
 /* The table the backend exports. `size` is the backend's sizeof: a field past it is
  * not there (an older DLL), and the engine must not call it. */
+/* DeepSeek V4.1's (and V4's) layer ops (cuda_dsv4c.cuh), the Vulkan chain's vkc_mhc and
+ * vkc_dsv4_* with the same fields in the same order (vk_chain.h has their contracts):
+ *   mhc        CC_MHC_SPLIT (the mix's pre, post and Sinkhorn comb), CC_MHC_COLLAPSE,
+ *              CC_MHC_POST (write back), CC_MHC_MEAN, CC_SWIGLU_CLAMP;
+ *   ds_attn    sparse attention with a sink over a per-row list (a prompt chunk's rows from
+ *              8 in three passes, COLI_CUDA_DSV4_PA=0: a block a head and row);
+ *   ds_rope, ds_compress, ds_score, ds_cand, ds_topk, ds_engram. */
+#define CC_MHC_SPLIT    0
+#define CC_MHC_COLLAPSE 1
+#define CC_MHC_POST     2
+#define CC_MHC_MEAN     3
+#define CC_SWIGLU_CLAMP 4
+typedef struct { int S, H, D, iters, x_off, x_row, m_off, m_row, hp_off, hp_row, y_off, y_row, prm_off, n;
+                 float eps, hc_eps, lim; } CcMhc;
+typedef struct { int S, H, hd, cnt, l_off, l_row, nwin, w_off, c_off, q_off, q_row, o_off, o_row, sink_off, flags;
+                 float scale; } CcDsAttn;
+typedef struct { int nseg, per_row, rd, x_off, x_row, x_seg, cs_off, cs_row, inverse, flags; } CcDsRope;
+typedef struct { int S, pos_base, ratio, P, D, overlap, kv_off, kv_row, sc_off, sc_row, ape_off, out_off, out_row,
+                 ring_off; } CcDsComp;
+typedef struct { int S, pos_base, ratio, IH, ID, width, q_off, q_row, w_off, w_row, k_off, k_row, mask_row, sc_row;
+                 float wscale; int sc_off, mask_off; } CcDsScore;
+typedef struct { int S, pos_base, ratio, width, block, topb, sc_row, mask_row, mask_off; } CcDsCand;   /* the mask a byte an entry */
+typedef struct { int S, width, topk, sc_row, l_off, l_row, base, order; } CcDsTopk;
+typedef struct { int S, H, D, kv_off, kv_row, x_off, x_row, qw_off, kw_off; float eps; } CcDsEngram;
+/* GLM-5.3's (and Kimi K3's) linear attention (cuda_glm53c.cuh), the Vulkan chain's vkc_kda_conv
+ * and vkc_kda_rec_flags with the same fields in the same order (vk_chain.h has their contract):
+ * the short convolution's window and the recurrence's state on the device across calls; from
+ * CC_KDA_ROWS rows the recurrence takes a block of rows at a time with the same bits. KD 16, 32,
+ * 64 or 128, VD <= 128; flags as VKC_KDA_EXP_A (1) and VKC_KDA_K3 (2). */
+#define CC_KDA_ROWS 8
+typedef struct { int S, C, K, P, in_off, in_row, in_part, out_off, out_row, w_off, win_off; } CcKdaConv;
+typedef struct { int S, H, VD, P, m_off, m_row, f_off, f_row, b_off, b_row, g_off, g_row, y_off, y_row, st_off, prm_off;
+                 float lb, neps, eps; } CcKdaRec;
+/* GLM-5.3's multi-head latent attention and k-pooled indexer (cuda_glm53c.cuh), the Vulkan chain's
+ * vkc_mla_core, vkc_mla_rope, vkc_mla_lnorm, vkc_dsa_pool_keys and vkc_dsa_pool_select with the same
+ * fields in the same order (vk_chain.h), and vkc_mla_hgemv on a float matrix: w's rows of I floats
+ * from float w_off (a GGUF's k_b and v_b go to the chain as floats). */
+typedef struct { int S, H, K, R, pos_base, kv_start, qa_off, qa_row, qa_seg, qr_off, qr_row, qr_seg,
+                 lat_off, lat_row, rope_off, rope_row, sel_off, sel_row, o_off, o_row, o_seg; float scale; } CcMlaCore;
+typedef struct { int nseg, per_row, rd, seg_len, style, x_off, x_row, x_seg, y_off, y_row, y_seg,
+                 cs_off, cs_row, w_off, b_off, has_b; float eps; } CcMlaRow;
+typedef struct { int trans, S, H, n, hstride, hoff, x_off, x_row, x_seg, y_off, y_row, y_seg, g_off, g_row, has_gate, I, w_off; } CcHgemv;
+typedef struct { int np, pool, p0, ID, g_off, g_row, ape_off, pk_off, k_off, k_row; } CcDsaPool;
+typedef struct { int S, pos_base, IH, ID, topk, pool, q_off, q_row, w_off, w_row, pk_off, tail, sc_row, sel_row;
+                 float wdiv, scale; } CcDsaPick;
+/* GLM-5.2 and GLM-5.3's indexer, not pooled (cuda_glm53c.cuh): every row's top keys over the index
+ * key cache (k_off, ID floats a position) in position order, colibri.c's selection; sel's row is a
+ * count then the positions, -1 for a row whose context is not past topk (force: always a list) */
+typedef struct { int S, pos_base, IH, ID, topk, force, q_off, q_row, w_off, w_row, k_off, sc_row, sel_row; float rs, wsc; } CcDsaSel;
+
 typedef struct ColiCudaChainOps {
     size_t size;
     /* after coli_cuda_init, for a configured device; 1 = the chain is up on it. Each
@@ -347,6 +397,28 @@ typedef struct ColiCudaChainOps {
      * hn's row at b H + d, over fc; matmul then ew's CC_EW_HC_MIX with the same bits, the product never
      * written. 1 done, -1 not taken (the caller's two ops), 0 a failure */
     int  (*matmul_hcmix)(ColiCudaTensor *t, CcBuf *x, size_t x_off, CcBuf *hn, CcBuf *y, int n, int H, int C, float fc);
+    /* DeepSeek V4.1's layer ops (cuda_dsv4c.cuh) */
+    int  (*mhc)(int mode, CcBuf *x, CcBuf *m, CcBuf *hp, CcBuf *prm, CcBuf *y, const CcMhc *p);
+    int  (*ds_attn)(CcBuf *q, CcBuf *win, CcBuf *cmp, CcBuf *list, CcBuf *prm, CcBuf *out, const CcDsAttn *p);
+    int  (*ds_rope)(CcBuf *x, CcBuf *cs, const CcDsRope *p);
+    int  (*ds_compress)(CcBuf *kv, CcBuf *sc, CcBuf *ring, CcBuf *prm, CcBuf *out, const CcDsComp *p);
+    int  (*ds_score)(CcBuf *iq, CcBuf *hw, CcBuf *keys, CcBuf *mask, CcBuf *sc, const CcDsScore *p);
+    int  (*ds_cand)(CcBuf *sc, CcBuf *mask, const CcDsCand *p);
+    int  (*ds_topk)(CcBuf *sc, CcBuf *list, const CcDsTopk *p);
+    int  (*ds_engram)(CcBuf *kv, CcBuf *prm, CcBuf *x, const CcDsEngram *p);
+    /* GLM-5.3's layer ops (cuda_glm53c.cuh) */
+    int  (*kda_conv)(CcBuf *in, CcBuf *w, CcBuf *win, CcBuf *out, const CcKdaConv *p);
+    int  (*kda_rec)(int KD, CcBuf *m, CcBuf *f, CcBuf *b, CcBuf *g, CcBuf *prm, CcBuf *st, CcBuf *y, const CcKdaRec *p, int flags);
+    int  (*mla_core)(CcBuf *qabs, CcBuf *qr, CcBuf *lat, CcBuf *rope, CcBuf *sel, CcBuf *clat, const CcMlaCore *p);
+    int  (*mla_rope)(CcBuf *x, CcBuf *cs, CcBuf *y, const CcMlaRow *p);
+    int  (*mla_lnorm)(CcBuf *x, CcBuf *prm, CcBuf *y, const CcMlaRow *p);
+    int  (*mla_hgemv)(CcBuf *w, CcBuf *x, CcBuf *y, CcBuf *gate, const CcHgemv *p);
+    int  (*dsa_pool_keys)(CcBuf *keys, CcBuf *gates, CcBuf *prm, CcBuf *pk, const CcDsaPool *p);
+    int  (*dsa_pool_select)(CcBuf *iq, CcBuf *hw, CcBuf *pk, CcBuf *sc, CcBuf *sel, const CcDsaPick *p);
+    /* GLM-5.2 and GLM-5.3's indexer (cuda_glm53c.cuh) */
+    int  (*dsa_select)(CcBuf *iq, CcBuf *hw, CcBuf *keys, CcBuf *sc, CcBuf *sel, const CcDsaSel *p);
+    /* mla_hgemv's rows on a GGUF's Q8_0 rows as the file has them, w_off in bytes */
+    int  (*mla_hgemv_q8)(CcBuf *w, CcBuf *x, CcBuf *y, const CcHgemv *p);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -427,6 +499,66 @@ static inline int cc_matmul_hcmix(ColiCudaTensor *t, CcBuf *x, size_t x_off, CcB
     const ColiCudaChainOps *o = cc_ops();
     return o && o->size >= offsetof(ColiCudaChainOps, matmul_hcmix) + sizeof o->matmul_hcmix && o->matmul_hcmix
            ? o->matmul_hcmix(t, x, x_off, hn, y, n, H, C, fc) : -1;
+}
+/* DeepSeek V4.1's layer ops: the module has them (an older one does not) */
+static inline int cc_dsv4_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, ds_engram) + sizeof t->ds_engram && t->ds_engram;
+}
+static inline int cc_mhc(int mode, CcBuf *x, CcBuf *m, CcBuf *hp, CcBuf *prm, CcBuf *y, const CcMhc *p) {
+    return cc_dsv4_ready() ? cc_ops()->mhc(mode, x, m, hp, prm, y, p) : 0;
+}
+static inline int cc_ds_attn(CcBuf *q, CcBuf *win, CcBuf *cmp, CcBuf *list, CcBuf *prm, CcBuf *out, const CcDsAttn *p) {
+    return cc_dsv4_ready() ? cc_ops()->ds_attn(q, win, cmp, list, prm, out, p) : 0;
+}
+static inline int cc_ds_rope(CcBuf *x, CcBuf *cs, const CcDsRope *p) { return cc_dsv4_ready() ? cc_ops()->ds_rope(x, cs, p) : 0; }
+static inline int cc_ds_compress(CcBuf *kv, CcBuf *sc, CcBuf *ring, CcBuf *prm, CcBuf *out, const CcDsComp *p) {
+    return cc_dsv4_ready() ? cc_ops()->ds_compress(kv, sc, ring, prm, out, p) : 0;
+}
+static inline int cc_ds_score(CcBuf *iq, CcBuf *hw, CcBuf *keys, CcBuf *mask, CcBuf *sc, const CcDsScore *p) {
+    return cc_dsv4_ready() ? cc_ops()->ds_score(iq, hw, keys, mask, sc, p) : 0;
+}
+static inline int cc_ds_cand(CcBuf *sc, CcBuf *mask, const CcDsCand *p) { return cc_dsv4_ready() ? cc_ops()->ds_cand(sc, mask, p) : 0; }
+static inline int cc_ds_topk(CcBuf *sc, CcBuf *list, const CcDsTopk *p) { return cc_dsv4_ready() ? cc_ops()->ds_topk(sc, list, p) : 0; }
+static inline int cc_ds_engram(CcBuf *kv, CcBuf *prm, CcBuf *x, const CcDsEngram *p) {
+    return cc_dsv4_ready() ? cc_ops()->ds_engram(kv, prm, x, p) : 0;
+}
+/* GLM-5.3's layer ops: the module has them */
+static inline int cc_glm53_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, dsa_pool_select) + sizeof t->dsa_pool_select && t->dsa_pool_select;
+}
+static inline int cc_kda_conv(CcBuf *in, CcBuf *w, CcBuf *win, CcBuf *out, const CcKdaConv *p) {
+    return cc_glm53_ready() ? cc_ops()->kda_conv(in, w, win, out, p) : 0;
+}
+static inline int cc_kda_rec(int KD, CcBuf *m, CcBuf *f, CcBuf *b, CcBuf *g, CcBuf *prm, CcBuf *st, CcBuf *y, const CcKdaRec *p, int flags) {
+    return cc_glm53_ready() ? cc_ops()->kda_rec(KD, m, f, b, g, prm, st, y, p, flags) : 0;
+}
+static inline int cc_mla_core(CcBuf *qabs, CcBuf *qr, CcBuf *lat, CcBuf *rope, CcBuf *sel, CcBuf *clat, const CcMlaCore *p) {
+    return cc_glm53_ready() ? cc_ops()->mla_core(qabs, qr, lat, rope, sel, clat, p) : 0;
+}
+static inline int cc_mla_rope(CcBuf *x, CcBuf *cs, CcBuf *y, const CcMlaRow *p) { return cc_glm53_ready() ? cc_ops()->mla_rope(x, cs, y, p) : 0; }
+static inline int cc_mla_lnorm(CcBuf *x, CcBuf *prm, CcBuf *y, const CcMlaRow *p) { return cc_glm53_ready() ? cc_ops()->mla_lnorm(x, prm, y, p) : 0; }
+static inline int cc_mla_hgemv(CcBuf *w, CcBuf *x, CcBuf *y, CcBuf *gate, const CcHgemv *p) {
+    return cc_glm53_ready() ? cc_ops()->mla_hgemv(w, x, y, gate, p) : 0;
+}
+static inline int cc_dsa_pool_keys(CcBuf *keys, CcBuf *gates, CcBuf *prm, CcBuf *pk, const CcDsaPool *p) {
+    return cc_glm53_ready() ? cc_ops()->dsa_pool_keys(keys, gates, prm, pk, p) : 0;
+}
+static inline int cc_dsa_pool_select(CcBuf *iq, CcBuf *hw, CcBuf *pk, CcBuf *sc, CcBuf *sel, const CcDsaPick *p) {
+    return cc_glm53_ready() ? cc_ops()->dsa_pool_select(iq, hw, pk, sc, sel, p) : 0;
+}
+/* GLM-5.2 and GLM-5.3's ops: the module has them (and GLM-5.3 Flash's MLA ops, which they run with) */
+static inline int cc_glmdsa_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return cc_glm53_ready() && t->size >= offsetof(ColiCudaChainOps, mla_hgemv_q8) + sizeof t->mla_hgemv_q8 && t->dsa_select &&
+           t->mla_hgemv_q8;
+}
+static inline int cc_dsa_select(CcBuf *iq, CcBuf *hw, CcBuf *keys, CcBuf *sc, CcBuf *sel, const CcDsaSel *p) {
+    return cc_glmdsa_ready() ? cc_ops()->dsa_select(iq, hw, keys, sc, sel, p) : 0;
+}
+static inline int cc_mla_hgemv_q8(CcBuf *w, CcBuf *x, CcBuf *y, const CcHgemv *p) {
+    return cc_glmdsa_ready() ? cc_ops()->mla_hgemv_q8(w, x, y, p) : 0;
 }
 /* the chain's and the backend's kernels loaded now where the backend can (an older one loads them
  * at their first launch) */

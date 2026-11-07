@@ -37,6 +37,100 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **DeepSeek V4.1 on the Vulkan chain: a prompt of more than one chunk layer by layer.** Each
+  chunk went through every layer before the next, so the expert tier streamed each layer's
+  cold experts once a chunk: a 4104-token prompt at 512-row chunks copied 150 GiB of the host
+  pool's experts and read 98.9 GB from disk. Now each layer runs its chunks in order through
+  the attention, the FFN's mix and the shared expert, with every row's streams on the device,
+  then its routed experts for all the rows in one step, then each chunk's FFN sum
+  (`COLI_VK_V41_LAYERWISE=0`: chunk by chunk). Each row keeps from one layer to the next the
+  selection its last index source made and the candidate source's mask, as a chunk keeps them
+  through its layers chunk by chunk. unsloth's UD-IQ1_S on an RTX PRO 4000, the 4104-token
+  prompt: 34.9 GiB copied, 44.3 GB read, the tier's device time 81.7 -> 33.6 s, the prompt
+  39.1 -> 65.1 tok/s.
+- **DeepSeek V4.1 and V4 on the Vulkan chain: a prompt chunk's sparse attention in three
+  passes, the same bits** (`chain_dsv4_pa.comp`). The attention gave each (head, row) a
+  workgroup that read every listed row from memory, a thread a row, so the 64 heads of a row
+  (one KV row a position) read each of its 640 rows 64 times. From 8 rows a chunk's rows go
+  through the scores of a row's heads on tiles of its listed rows, the weights and
+  denominators, and the output, each sum in the old kernel's order (`COLI_VK_DSV4_PA=0`: the
+  old kernel). unsloth's V4.1-Flash UD-IQ1_S on an RTX PRO 4000, a 4104-token prompt: the
+  attention's device time 31.5 -> 4.4 s; the text the same with it on and off.
+- **DeepSeek V4.1 on the Vulkan chain: a GGUF's wo_a as its output groups' GEMMs.** The
+  chain multiplied a GGUF's wo_a with the per-head reader, which has no block form: the matrix
+  went to the device as floats (8192 x 4096 a layer of V4.1-Flash, 128 MiB, 5 GiB over its 40
+  layers) and each row of a prompt chunk read all of it again. Its eight output groups now go
+  up as matrices of their own in the file's blocks, as wo_b does: a chunk's rows go to
+  group-major order on the device, a GEMM a group, and back; a decode row multiplies its
+  groups' slices in place (`COLI_VK_V41_WOA=0`: the reader). unsloth's UD-IQ1_S on an RTX PRO
+  4000: the chain's matrices 9.45 -> 5.42 GiB, the room going to resident experts; a 4104-token
+  prompt's 44.9 s of device time in wo_a gone, the prompt 27.8 -> 39.3 tok/s; the decode
+  5.40-5.42 -> 5.96-6.10 tok/s.
+- **GLM-5.3 on CUDA: every layer on the card.** On the CUDA tier the CPU ran GLM-5.3's layers
+  and multiplied each dense matrix on the card a call at a time, about 530 synchronous calls a
+  decoded token of GLM-5.3-Flash. With the routed experts on the CUDA tier, a prompt chunk's and
+  a decode step's layers now run on the CUDA chain (`glm53_cuchain.h`), the Vulkan chain's
+  layout on new ops (`cuda_glm53c.cuh`: the KDA convolution and recurrence, the MLA core, RoPE,
+  LayerNorm and per-head matmuls, the k-pooled indexer): the KDA state on the card while the
+  chain runs, the host's MLA caches mirrored, the routed experts on the host between two frames
+  while the card computes the shared expert. unsloth's GLM-5.3-Flash UD-IQ2_XXS on an RTX PRO
+  4000: decode 2.93-2.95 -> 3.57-3.65 tok/s on a first turn and 3.85-4.11 -> 4.50-4.68 on a
+  second, a 523-token prompt 5.92-6.57 -> 10.92-15.16 tok/s. `COLI_CUDA_CHAIN=0`: the CPU's
+  layers.
+- **The CUDA expert tier on two cards** (`COLI_VK_DEV2`, as on Vulkan). The CUDA tier kept every
+  expert on one card: a machine with two (two V100s, #2608) gave the routed experts one card's
+  memory. The second card now holds the experts after the primary's, in its own memory with its
+  own block table, scratch, streams and events, and runs the batch of its residents beside the
+  primary's at every step; a batch that fails there gives its experts back to the CPU and the
+  tier goes on with the primary. `COLI_VK_DEV2=auto` takes the first CUDA device that is not the
+  primary; its index takes that one (the primary's own: the same card twice, the test mode).
+  Tested with the same card twice against the CPU (glm53 and DeepSeek V4.1's tiny fixtures:
+  decode, eviction, a failing batch); not measured on two real cards.
+- **GLM-5.2 and GLM-5.3 on CUDA: every layer on the card.** A glm-dsa GGUF under `COLI_CUDA=1`
+  put its routed experts on the CUDA tier and left the attention to the CPU, and its dense
+  matrices too where half of the card's free memory did not hold them (GLM-5.3 UD-IQ1_S's 13
+  GiB): the CPU read every dense matrix every token. Every layer now runs on the CUDA chain
+  (`colibri_cuchain.h`), the Vulkan chain's layout on the CUDA chain's ops, with two new ones:
+  the DSA selection (`cc_dsa_select`, colibri.c's position for position, up to top-2048) and the
+  per-head matmul on a GGUF's Q8_0 rows (`k_b` and `v_b` as the file has them). Every dense
+  matrix goes to the card when it fits beside the chain, as Vulkan's chain takes it, and the
+  routed experts keep the rest; a CUDA build also runs a GGUF's dense matrices on the card where
+  the chain does not (the head among them), as only a build with Vulkan did. unsloth's GLM-5.3
+  UD-IQ1_S on an RTX PRO 4000: decode 0.66-0.68 -> 0.77-0.79 tok/s on a first turn and
+  0.76 -> 0.88-0.98 on a second, a 528-token prompt 2.23-2.24 -> 4.40-4.51 tok/s (Vulkan's chain
+  0.77-0.78, 0.85-0.90, 3.68-4.29). `COLI_CUDA_CHAIN=0`: the CPU's attention.
+- **DeepSeek V4.1 with a GGUF on CUDA: a prompt's layers on the card.** On the CUDA tier the CPU
+  ran a prompt's layers, the sparse attention, the hyper-connections and the router three fifths
+  of a 4104-token prompt. A prompt of more than one chunk now runs layer by layer on the CUDA
+  chain (`deepseek_v41_cuchain.h`), op for op the Vulkan chain's: each layer's chunks through the
+  attention, the FFN's mix and the shared expert with every row's streams, list and candidate
+  mask on the card, then the layer's routed experts in one step of the tier, then each chunk's
+  FFN sum. The host's state comes back as the CPU would leave it, for the decode and the next
+  prompt. Up to 4096 rows go through the layers at once (`COLI_CUDA_V41_SEG`), and the tier
+  leaves the chain that room. unsloth's UD-IQ1_S on an RTX PRO 4000: the 4104-token prompt
+  7.42-7.57 -> 91.3-97.0 tok/s, the 523-token one 23.2 -> 58.3-59.8 tok/s, the decode
+  5.97-6.03 -> 5.65-5.98 tok/s. `COLI_CUDA_CHAIN=0`: the CPU's layers.
+- **The CUDA expert tier streams a prompt's cold experts, and the CUDA dense matrices take a
+  prompt 512 rows a call.** The CUDA tier (`cu_xb.cu`) declined the Vulkan tier's streaming, so
+  a long prompt's cold experts ran on the CPU 32 rows at a time and came from the disk again for
+  each block: a 4104-token prompt of DeepSeek V4.1-Flash UD-IQ1_S read 333 GB of experts. Its
+  sub-batches now run on two halves with their own streams, the host pool's experts copied into
+  the streaming slots ahead of each, an expert's rows from 16 on the dense matrices' f16 tiles
+  (`coli_cuda_bd_gemm_raw`) and the GEMV below (`COLI_CUDA_TIER_STREAM=0`: none). The dense
+  matrices (`cu_dense.h`) took a prompt's rows in one call, whose scratch (538 MB for wq_b's
+  output at 4104 rows) the card did not have: 51 matrices stayed on the CPU. unsloth's UD-IQ1_S
+  on an RTX PRO 4000: 21 GB of experts read, none left to the CPU, the 4104-token prompt
+  5.75 -> 7.42-7.57 tok/s, the 523-token prompt 23.2 tok/s, the decode 5.97-6.03 tok/s.
+- **GLM-5.3: the routed experts read from the disk with `O_DIRECT`** (`G53_DIRECT`, on by
+  default; `0` reads them through the page cache as before). An expert read from the disk is
+  wanted once, and the expert tier's host pool leaves the page cache no room to keep it:
+  unsloth's GLM-5.3-Flash UD-IQ2_XXS on an RTX PRO 4000 with 62 GB of RAM, two 128-token
+  turns refaulted 54-55 GiB, and the compaction kswapd's reclaim kept up migrated the engine's
+  pages under its threads, a TLB shootdown on every core each time. The reads now land in the
+  slots straight from the drive. The same machine on the CUDA tier, two serves a side: decode
+  3.11-3.18 -> 3.54-3.71 tok/s on the first turn and 2.87-3.17 -> 4.40-4.55 on the second, the
+  523-token prompt 5.35-5.64 -> 5.89-6.14 tok/s, the host pool's pairs on the CPU 556-584 ->
+  439-450 us each, the warm start 23-30 -> 18 s.
 - **CUDA chain: a hyper-connection read's up projection and mix in one pass.** Qwen3.8's gated
   residuals read the four streams through a low-rank mix: the up projection's products (four times
   the hidden size a row, 84 MB a 2048-row chunk) went to memory and the mix read them back with the
@@ -325,6 +419,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   (`POSIX_FADV_WILLNEED`), and the verify finds them read.
 
 ### Fixed
+
+- **DeepSeek V4.1: a long prompt's answer could start with `<｜begin▁of▁sentence｜>`.** Past
+  layer 20, the first with compress ratio 1, a prompt of 2478 tokens or more runs the later
+  layers on its last 2414 rows (`v41_prefill_tail`). Layers 21 to 23 run no indexer: they read
+  the list layer 20 published for every row, whose entries count past the window half of a
+  prompt read from position 0, all its rows, while the tail starts past position 0 and reads the
+  window ring. `v41_take_tail` moved the streams, their mix and the candidate mask but not that
+  list: each of the tail's rows read the list of a row from the start of the prompt, its entries
+  off the rows the attention holds, and the last row could turn to NaN at layer 21. The list now
+  moves with the tail, its entries onto the ring's rows. Wherever the CPU runs a prompt's
+  layers (without a GPU, on the CUDA tier, on Vulkan with the chain off): unsloth's UD-IQ1_S on
+  the CUDA tier answered a 4104-token prompt with `<｜begin▁of▁sentence｜>` and the document's
+  title in 4 fresh serves of 9, and answers it in 3 of 3 now. The Vulkan chain kept the lists
+  right.
+- **GLM-5.3 from unsloth's GGUF: the shared indexer layers reuse the full layer's selection, as
+  the model has them.** GLM-5.3 computes the DSA indexer's top-k on 21 of its 78 layers (zai-org's
+  config.json: `indexer_types`, one full layer every `index_topk_freq`) and the shared layers
+  between them reuse its selection. unsloth's files hold a shared layer's indexer weights as a
+  copy of the full layer's, and `tools/gguf_import.py` read every layer whose weights are in the
+  file as full: past `index_topk` (2048) context tokens each layer selected again from its own
+  rows. The import now reads a layer whose indexer is the layer before's byte for byte as shared,
+  and the engine finds such copies in a folder imported before, which needs no new import
+  (`[DSA] N layers hold the indexer of the layer before as a copy`). The 57 copies are no longer
+  loaded either.
 
 - **`chat_template_kwargs` reaches the chat template** (`coli serve`). Many OpenAI-compatible
   clients turn a Qwen model's thinking off with `"chat_template_kwargs": {"enable_thinking":
