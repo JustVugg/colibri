@@ -241,7 +241,7 @@ static int cc_kda_rec(int KD, CcBuf *m, CcBuf *f, CcBuf *b, CcBuf *g, CcBuf *prm
 }
 /* ---- MLA (chain_mla.comp, chain_hgemv.comp's float rows) --------------------------------- */
 __device__ __forceinline__ float cg_warp_sum(float v) {
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    for (int o = 16; o > 0; o >>= 1) v += cc_shfl_xor(v, o);   /* cuda_chain.cu's: HIP has no __shfl_xor_sync */
     return v;
 }
 /* mode 0, the core: a block a (head, row), the softmax online over tiles of 64 positions */
