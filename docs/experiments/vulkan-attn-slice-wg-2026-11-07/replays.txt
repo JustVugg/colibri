@@ -1,0 +1,102 @@
+# One-layer replays of a Qwen3.6 prompt's attention on the B60's second GPU (GPU 1 of the VM), Mesa ANV 26.0.8, 2026-11-06: 4096-row chunks, the stock chain_attnb (dev e24cd51a's), float16 cache, subgroup 16, the budget alone (COLI_VK_ATTN_SLICE_WG=0), the rule (WG unset: 64) and the budget at 2^36. The replay harness was written for this work and is not part of the PR. GPU 1 was shared with other jobs, so times are indicative. Quoted in the PR: replay1 (16K, three runs within 1% with replay3) and replay4 (32K). replay2 overlapped other GPU-1 work (wall time far above GPU time) and is not quoted. Files, as written by the runs:
+
+===== replay1.log
+== COLI_VK_ATTN_SLICE_WG=0
+  chunk at 0, 4096 rows to position 4096: slices of 256 rows (128 workgroups), 0.384 s
+  chunk at 4096, 4096 rows to position 8192: slices of 128 rows (64 workgroups), 1.134 s
+  chunk at 8192, 4096 rows to position 12288: slices of 84 rows (42 workgroups), 2.752 s
+  chunk at 12288, 4096 rows to position 16384: slices of 64 rows (32 workgroups), 5.038 s
+PROMPT T=16384 chunks of 4096 budget=default WG=0: one layer's attention 9.308 s GPU (9.350 s wall), 161 submissions, longest 89.9 ms
+== COLI_VK_ATTN_SLICE_WG=
+  chunk at 0, 4096 rows to position 4096: slices of 256 rows (128 workgroups), 0.384 s
+  chunk at 4096, 4096 rows to position 8192: slices of 128 rows (64 workgroups), 1.134 s
+  chunk at 8192, 4096 rows to position 12288: slices of 128 rows (64 workgroups), 1.886 s
+  chunk at 12288, 4096 rows to position 16384: slices of 128 rows (64 workgroups), 2.643 s
+PROMPT T=16384 chunks of 4096 budget=default WG=: one layer's attention 6.046 s GPU (6.075 s wall), 112 submissions, longest 94.0 ms
+== COLI_VK_ATTN_SLICE=68719476736 COLI_VK_ATTN_SLICE_WG=0
+  chunk at 0, 4096 rows to position 4096: slices of 4096 rows (2048 workgroups), 0.323 s
+  chunk at 4096, 4096 rows to position 8192: slices of 2048 rows (1024 workgroups), 0.917 s
+  chunk at 8192, 4096 rows to position 12288: slices of 1364 rows (682 workgroups), 1.649 s
+  chunk at 12288, 4096 rows to position 16384: slices of 1024 rows (512 workgroups), 2.316 s
+PROMPT T=16384 chunks of 4096 budget=68719476736 WG=0: one layer's attention 5.204 s GPU (5.208 s wall), 11 submissions, longest 641.3 ms
+== COLI_VK_ATTN_SLICE_WG=0
+  chunk at 28672, 4096 rows to position 32768: slices of 32 rows (16 workgroups), 21.599 s
+PROMPT T=32768 chunks of 4096 budget=default WG=0: one layer's attention 21.599 s GPU (21.630 s wall), 128 submissions, longest 179.8 ms
+== COLI_VK_ATTN_SLICE_WG=
+  chunk at 28672, 4096 rows to position 32768: slices of 128 rows (64 workgroups), 5.679 s
+PROMPT T=32768 chunks of 4096 budget=default WG=: one layer's attention 5.679 s GPU (5.687 s wall), 32 submissions, longest 188.3 ms
+== COLI_VK_ATTN_SLICE=68719476736 COLI_VK_ATTN_SLICE_WG=0
+  chunk at 28672, 4096 rows to position 32768: slices of 512 rows (256 workgroups), 10.308 s
+PROMPT T=32768 chunks of 4096 budget=68719476736 WG=0: one layer's attention 10.308 s GPU (11.373 s wall), 8 submissions, longest 1393.1 ms
+
+===== replay2.log
+== COLI_VK_ATTN_SLICE=68719476736 COLI_VK_ATTN_SLICE_WG=0
+  chunk at 28672, 4096 rows to position 32768: slices of 512 rows (256 workgroups), 13.171 s
+PROMPT T=32768 chunks of 4096 budget=68719476736 WG=0: one layer's attention 13.171 s GPU (15.021 s wall), 8 submissions, longest 1826.6 ms
+== COLI_VK_ATTN_SLICE_WG=
+  chunk at 28672, 4096 rows to position 32768: slices of 128 rows (64 workgroups), 11.095 s
+PROMPT T=32768 chunks of 4096 budget=default WG=: one layer's attention 11.095 s GPU (16.890 s wall), 32 submissions, longest 539.5 ms
+== COLI_VK_ATTN_SLICE_WG=0
+  chunk at 28672, 4096 rows to position 32768: slices of 32 rows (16 workgroups), 23.348 s
+PROMPT T=32768 chunks of 4096 budget=default WG=0: one layer's attention 23.348 s GPU (24.748 s wall), 128 submissions, longest 525.9 ms
+== COLI_VK_ATTN_SLICE=68719476736 COLI_VK_ATTN_SLICE_WG=0
+  chunk at 28672, 4096 rows to position 32768: slices of 512 rows (256 workgroups), 7.739 s
+PROMPT T=32768 chunks of 4096 budget=68719476736 WG=0: one layer's attention 7.739 s GPU (7.930 s wall), 8 submissions, longest 1047.2 ms
+
+===== replay3.log
+== COLI_VK_ATTN_SLICE_WG=0
+PROMPT T=16384 chunks of 4096 budget=default WG=0: one layer's attention 9.308 s GPU (9.344 s wall), 161 submissions, longest 89.9 ms
+== COLI_VK_ATTN_SLICE_WG=
+PROMPT T=16384 chunks of 4096 budget=default WG=: one layer's attention 6.043 s GPU (6.067 s wall), 112 submissions, longest 94.0 ms
+== COLI_VK_ATTN_SLICE=68719476736 COLI_VK_ATTN_SLICE_WG=0
+PROMPT T=16384 chunks of 4096 budget=68719476736 WG=0: one layer's attention 5.198 s GPU (5.201 s wall), 11 submissions, longest 642.6 ms
+== COLI_VK_ATTN_SLICE_WG=0
+PROMPT T=32768 chunks of 4096 budget=default WG=0: one layer's attention 21.606 s GPU (21.635 s wall), 128 submissions, longest 179.8 ms
+== COLI_VK_ATTN_SLICE_WG=
+PROMPT T=32768 chunks of 4096 budget=default WG=: one layer's attention 5.665 s GPU (5.672 s wall), 32 submissions, longest 188.1 ms
+== COLI_VK_ATTN_SLICE=68719476736 COLI_VK_ATTN_SLICE_WG=0
+PROMPT T=32768 chunks of 4096 budget=68719476736 WG=0: one layer's attention 7.009 s GPU (7.011 s wall), 8 submissions, longest 925.2 ms
+== COLI_VK_ATTN_SLICE_WG=0
+PROMPT T=16384 chunks of 4096 budget=default WG=0: one layer's attention 9.338 s GPU (9.389 s wall), 161 submissions, longest 89.8 ms
+== COLI_VK_ATTN_SLICE_WG=
+PROMPT T=16384 chunks of 4096 budget=default WG=: one layer's attention 6.091 s GPU (6.136 s wall), 112 submissions, longest 94.0 ms
+== COLI_VK_ATTN_SLICE=68719476736 COLI_VK_ATTN_SLICE_WG=0
+PROMPT T=16384 chunks of 4096 budget=68719476736 WG=0: one layer's attention 7.299 s GPU (7.301 s wall), 11 submissions, longest 990.6 ms
+== COLI_VK_ATTN_SLICE_WG=0
+PROMPT T=32768 chunks of 4096 budget=default WG=0: one layer's attention 21.649 s GPU (21.691 s wall), 128 submissions, longest 182.3 ms
+== COLI_VK_ATTN_SLICE_WG=
+PROMPT T=32768 chunks of 4096 budget=default WG=: one layer's attention 5.681 s GPU (5.688 s wall), 32 submissions, longest 192.0 ms
+== COLI_VK_ATTN_SLICE=68719476736 COLI_VK_ATTN_SLICE_WG=0
+PROMPT T=32768 chunks of 4096 budget=68719476736 WG=0: one layer's attention 7.014 s GPU (7.016 s wall), 8 submissions, longest 925.4 ms
+
+===== replay4.log
+== COLI_VK_ATTN_SLICE_WG=
+  chunk at 0, 4096 rows to position 4096: slices of 256 rows (128 workgroups), 0.384 s
+  chunk at 4096, 4096 rows to position 8192: slices of 128 rows (64 workgroups), 1.135 s
+  chunk at 8192, 4096 rows to position 12288: slices of 128 rows (64 workgroups), 1.889 s
+  chunk at 12288, 4096 rows to position 16384: slices of 128 rows (64 workgroups), 2.645 s
+  chunk at 16384, 4096 rows to position 20480: slices of 128 rows (64 workgroups), 3.399 s
+  chunk at 20480, 4096 rows to position 24576: slices of 128 rows (64 workgroups), 4.152 s
+  chunk at 24576, 4096 rows to position 28672: slices of 128 rows (64 workgroups), 4.905 s
+  chunk at 28672, 4096 rows to position 32768: slices of 128 rows (64 workgroups), 5.658 s
+PROMPT T=32768 chunks of 4096 budget=default WG=: one layer's attention 24.167 s GPU (24.225 s wall), 240 submissions, longest 188.2 ms
+== COLI_VK_ATTN_SLICE=68719476736 COLI_VK_ATTN_SLICE_WG=0
+  chunk at 0, 4096 rows to position 4096: slices of 4096 rows (2048 workgroups), 0.305 s
+  chunk at 4096, 4096 rows to position 8192: slices of 2048 rows (1024 workgroups), 0.918 s
+  chunk at 8192, 4096 rows to position 12288: slices of 1364 rows (682 workgroups), 1.652 s
+  chunk at 12288, 4096 rows to position 16384: slices of 1024 rows (512 workgroups), 2.317 s
+  chunk at 16384, 4096 rows to position 20480: slices of 816 rows (408 workgroups), 3.306 s
+  chunk at 20480, 4096 rows to position 24576: slices of 680 rows (340 workgroups), 4.035 s
+  chunk at 24576, 4096 rows to position 28672: slices of 584 rows (292 workgroups), 4.780 s
+  chunk at 28672, 4096 rows to position 32768: slices of 512 rows (256 workgroups), 6.999 s
+PROMPT T=32768 chunks of 4096 budget=68719476736 WG=0: one layer's attention 24.312 s GPU (24.322 s wall), 40 submissions, longest 966.3 ms
+== COLI_VK_ATTN_SLICE_WG=0
+  chunk at 0, 4096 rows to position 4096: slices of 256 rows (128 workgroups), 0.377 s
+  chunk at 4096, 4096 rows to position 8192: slices of 128 rows (64 workgroups), 1.134 s
+  chunk at 8192, 4096 rows to position 12288: slices of 84 rows (42 workgroups), 2.751 s
+  chunk at 12288, 4096 rows to position 16384: slices of 64 rows (32 workgroups), 5.038 s
+  chunk at 16384, 4096 rows to position 20480: slices of 48 rows (24 workgroups), 8.713 s
+  chunk at 20480, 4096 rows to position 24576: slices of 40 rows (20 workgroups), 12.752 s
+  chunk at 24576, 4096 rows to position 28672: slices of 36 rows (18 workgroups), 16.672 s
+  chunk at 28672, 4096 rows to position 32768: slices of 32 rows (16 workgroups), 21.596 s
+PROMPT T=32768 chunks of 4096 budget=default WG=0: one layer's attention 69.033 s GPU (69.167 s wall), 592 submissions, longest 179.8 ms

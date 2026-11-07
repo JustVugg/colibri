@@ -179,7 +179,10 @@ long long vkc_attn_slice_budget(void);   /* COLI_VK_ATTN_SLICE below: rows x pos
  * x heads x head dim pass COLI_VK_ATTN_SLICE (2^32; 0 = never) record their rows in slices,
  * each ending its frame (submitted, not waited for) and the next in a new one: no single
  * submission of a big prompt chunk runs for seconds (a driver resets a job past its
- * timeout: amdgpu 10 s, Windows 2 s). The rows' arithmetic does not change. */
+ * timeout: amdgpu 10 s, Windows 2 s). A slice is cut to keep COLI_VK_ATTN_SLICE_WG workgroups
+ * (64; 0, the budget alone, on an integrated GPU) as far as 4x the budget's work, then a
+ * chunk's slices are made one size on the blocks, so some, and the last, may keep fewer. The
+ * rows' arithmetic does not change. */
 /* chain_dnconv.comp (order 0, 1: Gated DeltaNet's, the sum's two orders; 2: LFM3's gated
  * convolution, input rows B | C | x of CD channels, out = C * conv(B * x), no activation) */
 typedef struct { int S, CD, CK, in_off, in_row, out_off, out_row, snap_row, order, w_off, ring_off, snap_off; } VkcDnConv;
