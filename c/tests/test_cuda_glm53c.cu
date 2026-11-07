@@ -24,7 +24,6 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
-#include <cuda_fp16.h>
 #include "../backend_cuda.h"
 #include "../cuda_chain.h"
 extern "C" {   /* tests/cuda_glm53c_ref.c */
@@ -296,11 +295,12 @@ static void test_hgemv_q8(int H, int n, int I, int hstride, int hoff) {
     std::vector<float> W((size_t)O * I);
     for (int r = 0; r < O; r++) for (int b = 0; b < nb; b++) {
         unsigned char *blk = &raw[((size_t)r * nb + b) * 34];
-        const float d = (frnd() + 1.5f) * 0.01f;
-        __half hd = __float2half(d);
-        unsigned short u; memcpy(&u, &hd, 2);
+        /* a scale a half holds exactly (k / 4096, k < 2048), its bits made by hand: no half type */
+        const int k = 20 + (int)(rnd() % 80);
+        const float df = (float)k / 4096.0f;
+        unsigned fb; memcpy(&fb, &df, 4);
+        const unsigned short u = (unsigned short)(((fb >> 16) & 0x8000u) | ((((fb >> 23) & 255u) - 112u) << 10) | ((fb >> 13) & 1023u));
         blk[0] = (unsigned char)(u & 255); blk[1] = (unsigned char)(u >> 8);
-        const float df = __half2float(hd);
         for (int j = 0; j < 32; j++) {
             const signed char q = (signed char)((int)(rnd() % 255) - 127);
             blk[2 + j] = (unsigned char)q;

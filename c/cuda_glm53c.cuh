@@ -649,6 +649,15 @@ static int cc_dsa_select(CcBuf *iq, CcBuf *hw, CcBuf *keys, CcBuf *sc, CcBuf *se
 /* chain_hgemv's rows mode on a GGUF's Q8_0 rows as the file has them (k_b and v_b in unsloth's GLM files): each
  * value d * q in f32, then the products and the warp's sum as ccg_hgemv_rows_k's on the dequantized floats: the
  * same bits from a quarter of the bytes. w_off in bytes, a row I / 32 blocks of 34 (an f16 scale, 32 int8). */
+/* an IEEE half's bits as the float they are, exactly (ggml_quants.h's gq_f16): no half type, which HIP maps to
+ * rocWMMA's (backend_gpu_compat.h) */
+__device__ __forceinline__ float cg_f16(unsigned h) {
+    const unsigned s = (h & 0x8000u) << 16, e = (h >> 10) & 31u, m = h & 1023u;
+    if (e == 31u) return __uint_as_float(s | 0x7f800000u | (m << 13));
+    if (e) return __uint_as_float(s | ((e + 112u) << 23) | (m << 13));
+    const float v = (float)m * 5.9604644775390625e-08f;   /* a subnormal: m * 2^-24, exact */
+    return s ? -v : v;
+}
 __global__ void __launch_bounds__(256) ccg_hgemv_q8_k(const float *x, const unsigned char *w, float *y, CcHgemv p) {
     const int s = blockIdx.y, lane = threadIdx.x & 31, nsg = 8, total = p.H * p.n, stride = (int)gridDim.x * nsg;
     const long rb = (long)(p.I / 32) * 34;
@@ -660,7 +669,7 @@ __global__ void __launch_bounds__(256) ccg_hgemv_q8_k(const float *x, const unsi
         float a = 0.f;
         for (int i = lane; i < p.I; i += 32) {
             const unsigned char *blk = wr + (long)(i >> 5) * 34;
-            const float d = __half2float(__ushort_as_half((unsigned short)(blk[0] | (blk[1] << 8))));
+            const float d = cg_f16((unsigned)blk[0] | ((unsigned)blk[1] << 8));
             const float v = __fmul_rn(d, (float)(signed char)blk[2 + (i & 31)]);
             a += v * x[xb + i];
         }
