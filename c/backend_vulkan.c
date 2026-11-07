@@ -202,8 +202,9 @@ static void vk_mem_free(VkDevice d, VkDeviceMemory m, const VkAllocationCallback
 #undef vkFreeMemory
 #define vkAllocateMemory vk_mem_alloc
 #define vkFreeMemory vk_mem_free
-/* A device just created: which of its memory types count, and the cap. */
-static void vk_mem_device(int k, VkPhysicalDevice phys, VkDevice d) {
+/* A device just created: which of its memory types count, and the cap; its retries among
+ * `take`, the types its buffers take (vk_buffer_types). */
+static void vk_mem_device(int k, VkPhysicalDevice phys, VkDevice d, uint32_t take) {
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(phys, &mp);
     const int integrated = vk_integrated(phys);
@@ -212,7 +213,7 @@ static void vk_mem_device(int k, VkPhysicalDevice phys, VkDevice d) {
     memset(retry, -1, sizeof retry);
     for (uint32_t i = 0; i < mp.memoryTypeCount && i < 32; i++) {
         if (vk_heap_is_device_memory(&mp, integrated, mp.memoryTypes[i].heapIndex)) mask |= 1u << i;
-        retry[i] = (int8_t)vk_retry_memtype(&mp, integrated, i);
+        retry[i] = (int8_t)vk_retry_memtype(&mp, take, integrated, i);
     }
     const char *e = getenv("COLI_VK_DEVICE_CAP_MB");
     double mb = e && *e ? atof(e) : 0.0;
@@ -510,7 +511,14 @@ struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; i
  * COLI_VK_SUBGROUP=n pins n instead (every pipeline that takes this size: the chain's,
  * build_pipeline's and the expert batch's), a power of two the device allows: Mesa's ANV
  * (Intel Meteor Lake, Mesa 26.2) took over 38 minutes to compile chain_moe.spv at the
- * reported 32 and 72-195 s at 16, where test_vk_chain passes. */
+ * reported 32 and 72-195 s at 16, where test_vk_chain passes. Unset on Intel's Xe2 (Battlemage,
+ * Lunar Lake: no SIMD8, so 16 is its smallest subgroup) it pins 16, not the reported 32: at 32 an
+ * Arc Pro B60 (Mesa ANV 26.0.8, an SR-IOV VF, the chain started by anv_enable_buffer_comp=true)
+ * failed 44 of test_vk_chain's routed-expert checks (chain_moe and chain_moe_gv off by relative
+ * errors of 0.86 to 1.0, frames that failed) and Qwen3.6's chain answered otherwise than the CPU,
+ * at 13.1 tok/s; at 16 the test passes and the chain gives the CPU's answers at 37.1 tok/s, a
+ * 3,000-token prompt in 7.2 s against 37.7 and a 16K one in 118 s against 407. pick_memtype,
+ * which starts the chain there, counts on this default. */
 static int vk_pin_sg(VkPhysicalDevice phys, int has_ext) {
 #ifdef VK_EXT_subgroup_size_control
     const char *e = getenv("COLI_VK_SUBGROUP");
@@ -527,6 +535,7 @@ static int vk_pin_sg(VkPhysicalDevice phys, int has_ext) {
     VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sg};
     vkGetPhysicalDeviceProperties2(phys, &p2);
     uint32_t n = sg.subgroupSize;
+    if (!(e && *e) && pp.vendorID == 0x8086 && sp.minSubgroupSize == 16 && sp.maxSubgroupSize > 16) n = 16;   /* Xe2 */
     if (e && *e) {
         long want = strtol(e, NULL, 10);
         if (want >= (long)sp.minSubgroupSize && want <= (long)sp.maxSubgroupSize && !(want & (want - 1)))
@@ -563,10 +572,72 @@ static int vk_create_device_pinned(VkPhysicalDevice phys, const VkDeviceCreateIn
     return 0;
 }
 
-static int pick_memtype(VkPhysicalDevice phys, ColiVkMemUse use) {
+/* The memory type for `use` among `take`, the types the device's buffers take (vk_buffer_types;
+ * ~0u before the device exists). On an Arc Pro B60 (Mesa ANV 26.0.8) the first device-local type
+ * is for images alone: chosen from the properties it was the GPU-only type, the dense chain's
+ * first buffer was refused and qwen36 decoded at 19.6 tok/s without the chain. With the driconf
+ * anv_enable_buffer_comp=true, which lets buffers have that type, and COLI_VK_SUBGROUP=16 the
+ * chain ran at 37.1 tok/s with the same answers (an SR-IOV VF; 13.1 and other answers at the
+ * reported subgroup of 32). Among `take` the GPU-only type there is type 1, the next
+ * device-local one. */
+static int pick_memtype(VkPhysicalDevice phys, ColiVkMemUse use, uint32_t take) {
     VkPhysicalDeviceMemoryProperties m;
     vkGetPhysicalDeviceMemoryProperties(phys, &m);
-    return vk_pick_memtype(&m, vk_integrated(phys), use);
+    return vk_pick_memtype(&m, take, vk_integrated(phys), use);
+}
+/* The memory types the device's buffers can be bound to: the memoryTypeBits of a probe made with
+ * every usage the backend's and the chain's buffers are made with (storage, both ends of a copy,
+ * an indirect dispatch's arguments, an address where bufferDeviceAddress is on). The spec makes
+ * the types of a buffer with more usage a subset of those of one with less, so a type taken from
+ * these takes each of them. ~0u (every type, as before) when the probe cannot be made. */
+static uint32_t vk_buffer_types(VkDevice dev, int bda) {
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 4096,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | (bda ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0),
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VkBuffer probe;
+    if (vkCreateBuffer(dev, &bi, NULL, &probe) != VK_SUCCESS) return ~0u;
+    VkMemoryRequirements req; vkGetBufferMemoryRequirements(dev, probe, &req);
+    vkDestroyBuffer(dev, probe, NULL);
+    return req.memoryTypeBits ? req.memoryTypeBits : ~0u;
+}
+/* Said for each use whose type moved off the one the properties alone choose, as device k's
+ * buffers do not take that one (the B60's GPU-only type, above); silent everywhere else. */
+static void vk_say_moved(int k, VkPhysicalDevice phys, uint32_t take, uint32_t gpu_only, uint32_t cpu_writes,
+                         uint32_t cpu_reads) {
+    static const char *const what[3] = {"GPU-only buffers", "buffers the CPU writes", "buffers the CPU reads"};
+    const uint32_t got[3] = {gpu_only, cpu_writes, cpu_reads};   /* the enum's order */
+    for (int u = COLI_VK_MEM_GPU_ONLY; u <= COLI_VK_MEM_CPU_READS; u++) {
+        const int any = pick_memtype(phys, (ColiVkMemUse)u, ~0u);
+        if (any >= 0 && (uint32_t)any != got[u])
+            fprintf(stderr, "[VK] %smemory: %s in type %u, as buffers do not take type %d, the one the properties alone "
+                    "choose (they take types 0x%x)\n", k ? "dev2 " : "", what[u], got[u], any, take);
+    }
+}
+/* The type to bind a buffer of device k to, asked for in `memtype`: that type where the buffer
+ * takes it (`take`, its memoryTypeBits), else the first it takes with the same properties
+ * (vk_allowed_memtype, in its heap first), said once per device and type (with its heap where
+ * that is another: callers count the asked type's); -1, said, when it takes none. The expert
+ * batch's scratch was bound to the B60's image-only type unchecked, which ANV let pass. */
+static int vk_bind_type(int k, VkPhysicalDevice phys, uint32_t take, uint32_t memtype) {
+    if (memtype < 32 && (take >> memtype & 1u)) return (int)memtype;
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(phys, &mp);
+    const int t = vk_allowed_memtype(&mp, take, memtype);
+    static uint32_t said[2];
+    const uint32_t bit = 1u << (memtype & 31);
+    if (!(__atomic_fetch_or(&said[k ? 1 : 0], bit, __ATOMIC_RELAXED) & bit)) {
+        char heap[48] = "";
+        if (t >= 0 && mp.memoryTypes[t].heapIndex != mp.memoryTypes[memtype].heapIndex)
+            snprintf(heap, sizeof heap, " (heap %u, not %u)", mp.memoryTypes[t].heapIndex, mp.memoryTypes[memtype].heapIndex);
+        if (t >= 0)
+            fprintf(stderr, "[VK] %smemory: a buffer does not take memory type %u (it takes types 0x%x): type %d%s, with "
+                    "its properties, instead\n", k ? "dev2 " : "", memtype, take, t, heap);
+        else
+            fprintf(stderr, "[VK] %smemory: a buffer takes neither memory type %u nor a type with its properties (it "
+                    "takes types 0x%x): the allocation fails\n", k ? "dev2 " : "", memtype, take);
+    }
+    return t;
 }
 
 /* System RAM the device reads over PCIe (HOST_VISIBLE|HOST_COHERENT, not DEVICE_LOCAL,
@@ -574,14 +645,15 @@ static int pick_memtype(VkPhysicalDevice phys, ColiVkMemUse use) {
  * place (vk_dmoe.h's hybrid steps), which write-combined memory made 25 times slower
  * (6.7 ms an expert of Qwen3.8 against 0.16); an RTX PRO 4000 reads both at the same
  * 9.7 to 10.9 GB/s over PCIe 4.0 x8. -1 when every host-visible type is device-local (an integrated GPU,
- * a CPU device: their tier pool is that memory already). */
-static int pick_memtype_sys(VkPhysicalDevice phys) {
+ * a CPU device: their tier pool is that memory already). Among `take`, as pick_memtype: the pool's
+ * buffers refuse the others (pool_suballoc). */
+static int pick_memtype_sys(VkPhysicalDevice phys, uint32_t take) {
     VkPhysicalDeviceMemoryProperties m;
     vkGetPhysicalDeviceMemoryProperties(phys, &m);
     int best = -1;
     for (uint32_t i = 0; i < m.memoryTypeCount; i++) {
         VkMemoryPropertyFlags f = m.memoryTypes[i].propertyFlags;
-        if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) || !(f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ||
+        if (!(take >> i & 1u) || !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) || !(f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ||
             (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) || (m.memoryHeaps[m.memoryTypes[i].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT))
             continue;
         if (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) return (int)i;
@@ -602,7 +674,9 @@ static int pick_memtype_sys(VkPhysicalDevice phys) {
  * device-local heap (the host never maps it), else that heap's device-local type
  * (Lavapipe has one type for everything); vendor-specific types (uncached, coherent)
  * are passed over. The staging type: host-visible and coherent, not device-local
- * where there is one, so staging never takes the window.
+ * where there is one, so staging never takes the window. Both among `take`, the types
+ * the device's buffers take: device 0 decides before its device exists (~0u, every
+ * type) and chooses its two types again once it does (see pick_memtype).
  * A discrete card whose host-visible device-local type is as big as its heap may still be given less of
  * it: on an A100 80 GB (NVIDIA's 580 driver) the engine's device is given 39.75 GiB of it, mapped or not,
  * and refused the next block while the heap says 80 GiB and VK_EXT_memory_budget 79.21. The mapped path
@@ -615,7 +689,7 @@ static int pick_memtype_sys(VkPhysicalDevice phys) {
 static int place_plain(VkMemoryPropertyFlags f) {
     return !(f & (VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT | 0xC0u));
 }
-static int place_decide(VkPhysicalDevice phys, int mt_host, VkUp *u, int may_later) {   /* may_later: device 0 only */
+static int place_decide(VkPhysicalDevice phys, int mt_host, VkUp *u, int may_later, uint32_t take) {   /* may_later: device 0 only */
     VkPhysicalDeviceMemoryProperties m;
     vkGetPhysicalDeviceMemoryProperties(phys, &m);
     VkDeviceSize dl_max = 0, hv = 0;
@@ -630,7 +704,7 @@ static int place_decide(VkPhysicalDevice phys, int mt_host, VkUp *u, int may_lat
     int dev = -1, any = -1, st = -1;
     for (uint32_t i = 0; i < m.memoryTypeCount; i++) {
         VkMemoryPropertyFlags f = m.memoryTypes[i].propertyFlags;
-        if (!place_plain(f)) continue;
+        if (!place_plain(f) || !(take >> i & 1u)) continue;
         int big = (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && m.memoryHeaps[m.memoryTypes[i].heapIndex].size == dl_max;
         if (big && any < 0) any = (int)i;
         if (big && !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && dev < 0) dev = (int)i;
@@ -827,8 +901,10 @@ static int alloc_buf_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void *
     VKCHECK(vkCreateBuffer(G.dev, &bi, NULL, buf), "vkCreateBuffer");
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(G.dev, *buf, &req);
+    const int mt = vk_bind_type(0, G.phys, req.memoryTypeBits, memtype);
+    if (mt < 0) { vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; *mem = VK_NULL_HANDLE; return 0; }
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize = req.size, .memoryTypeIndex = memtype};
+        .allocationSize = req.size, .memoryTypeIndex = (uint32_t)mt};
 #ifdef VK_EXT_memory_priority
     VkMemoryPriorityAllocateInfoEXT pri = {.sType = VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT,
         .priority = G.prio};
@@ -1204,7 +1280,7 @@ int coli_vk_init(const char *spv_path) {
      * its queues: a transfer-only family (a copy engine), else a spare queue of a family
      * already asked for, else the main queue, shared under g_qmx[0]. */
     uint32_t up_fam = G.qfam, up_idx = 0; int up_shared = 1;
-    if (place_decide(G.phys, pick_memtype(G.phys, COLI_VK_MEM_CPU_WRITES), &g_up[0], 1) || g_up[0].later) {
+    if (place_decide(G.phys, pick_memtype(G.phys, COLI_VK_MEM_CPU_WRITES, ~0u), &g_up[0], 1, ~0u) || g_up[0].later) {
         uint32_t t = UINT32_MAX;
         for (uint32_t i = 0; i < nq && t == UINT32_MAX; i++)
             if ((qf[i].queueFlags & VK_QUEUE_TRANSFER_BIT) && qf[i].queueCount &&
@@ -1448,11 +1524,17 @@ int coli_vk_init(const char *spv_path) {
     }
     if (!G.dev)
     VKCHECK(vkCreateDevice(G.phys, &di, NULL, &G.dev), "vkCreateDevice");
-    vk_mem_device(0, G.phys, G.dev);   /* the device memory books, and COLI_VK_DEVICE_CAP_MB */
+    /* the types the device's buffers take: every memory type below is one of them (the
+     * retries' too), and the uploader's two, chosen before the device existed, are chosen
+     * again among them */
+    const uint32_t take = vk_buffer_types(G.dev, G.has_bda);
+    vk_mem_device(0, G.phys, G.dev, take);   /* the device memory books, and COLI_VK_DEVICE_CAP_MB */
     vk_pool_blocks(0);
     vkGetDeviceQueue(G.dev, G.qfam, 0, &G.queue);
     vkGetDeviceQueue(G.dev, G.tq_fam, G.tq_idx, &G.tqueue);
     G.tq_shared = G.tqueue == G.queue;
+    if (g_up[0].on || g_up[0].later)
+        place_decide(G.phys, pick_memtype(G.phys, COLI_VK_MEM_CPU_WRITES, take), &g_up[0], 1, take);
     if (g_up[0].on || g_up[0].later) {
         VkUp *u = &g_up[0];
         u->dev = G.dev; u->fam = up_fam; u->shared = up_shared;
@@ -1484,12 +1566,13 @@ int coli_vk_init(const char *spv_path) {
         fprintf(stderr, "[VK] VRAM pressure-proofing: memory_priority %s, memory_budget %s\n",
                 G.has_prio ? "on" : "absent", G.has_budget ? "on" : "absent");
 
-    int mt = pick_memtype(G.phys, COLI_VK_MEM_CPU_WRITES);
+    int mt = pick_memtype(G.phys, COLI_VK_MEM_CPU_WRITES, take);
     if (mt < 0) { fprintf(stderr, "[VK] no host-visible memory\n"); return 0; }
     G.memtype = (uint32_t)mt;
-    G.memtype_cached = (uint32_t)pick_memtype(G.phys, COLI_VK_MEM_CPU_READS);
-    G.memtype_dev = (uint32_t)pick_memtype(G.phys, COLI_VK_MEM_GPU_ONLY);
-    G.memtype_sys = pick_memtype_sys(G.phys);
+    G.memtype_cached = (uint32_t)pick_memtype(G.phys, COLI_VK_MEM_CPU_READS, take);
+    G.memtype_dev = (uint32_t)pick_memtype(G.phys, COLI_VK_MEM_GPU_ONLY, take);
+    vk_say_moved(0, G.phys, take, G.memtype_dev, G.memtype, G.memtype_cached);
+    G.memtype_sys = pick_memtype_sys(G.phys, take);
     {   /* COLI_VK_TIER_HOST=1 on a device that shares the host's RAM (tests): the host pool in
          * its host-visible type, the same memory as the tier's pool, the same paths as on a card */
         const char *e = getenv("COLI_VK_TIER_HOST");
@@ -1651,6 +1734,7 @@ int coli_vk_init(const char *spv_path) {
     if (G.gemm_min_s) fprintf(stderr, ", tiled GEMM from S=%d%s%s", G.gemm_min_s,
                               G.gemm_min_so ? " and S*O>=4096" : "", G.pipe_coop[0] ? " (cooperative matrix)" : "");
     if (g_up[0].on) fprintf(stderr, ", staged uploads");
+    if (G.pin_sg) fprintf(stderr, ", subgroups of %d", G.pin_sg);   /* vk_pin_sg: pinned, not the compiler's pick */
     fprintf(stderr, "\n");
     return 1;
 }
@@ -3094,8 +3178,10 @@ static int alloc_hostvis_d2(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, vo
     VKCHECK(vkCreateBuffer(G2.dev, &bi, NULL, buf), "d2 vkCreateBuffer");
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(G2.dev, *buf, &req);
+    const int mt = vk_bind_type(1, G2.phys, req.memoryTypeBits, memtype);
+    if (mt < 0) { vkDestroyBuffer(G2.dev, *buf, NULL); *buf = VK_NULL_HANDLE; *mem = VK_NULL_HANDLE; return 0; }
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize = req.size, .memoryTypeIndex = memtype};
+        .allocationSize = req.size, .memoryTypeIndex = (uint32_t)mt};
     VKCHECK(vkAllocateMemory(G2.dev, &ai, NULL, mem), "d2 vkAllocateMemory");
     VKCHECK(vkBindBufferMemory(G2.dev, *buf, *mem, 0), "d2 vkBindBufferMemory");
     if (ptr) VKCHECK(vkMapMemory(G2.dev, *mem, 0, bytes, 0, ptr), "d2 vkMapMemory");
@@ -3201,14 +3287,16 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
     if (G2.pin_sg && !vk_create_device_pinned(G2.phys, &di, &G2.dev)) G2.pin_sg = 0;
     if (!G2.dev)
     VKCHECK(vkCreateDevice(G2.phys, &di, NULL, &G2.dev), "d2 vkCreateDevice");
-    vk_mem_device(1, G2.phys, G2.dev);
+    const uint32_t take = vk_buffer_types(G2.dev, 0);   /* the types its buffers take: no addresses on this device */
+    vk_mem_device(1, G2.phys, G2.dev, take);
     vk_pool_blocks(1);
     vkGetDeviceQueue(G2.dev, G2.qfam, 0, &G2.queue);
-    int mt = pick_memtype(G2.phys, COLI_VK_MEM_CPU_WRITES);
+    int mt = pick_memtype(G2.phys, COLI_VK_MEM_CPU_WRITES, take);
     if (mt < 0) { fprintf(stderr, "[VK] dev2: no host-visible memory\n"); return 0; }
     G2.memtype = (uint32_t)mt;
-    G2.memtype_cached = (uint32_t)pick_memtype(G2.phys, COLI_VK_MEM_CPU_READS);
-    G2.memtype_dev = (uint32_t)pick_memtype(G2.phys, COLI_VK_MEM_GPU_ONLY);
+    G2.memtype_cached = (uint32_t)pick_memtype(G2.phys, COLI_VK_MEM_CPU_READS, take);
+    G2.memtype_dev = (uint32_t)pick_memtype(G2.phys, COLI_VK_MEM_GPU_ONLY, take);
+    vk_say_moved(1, G2.phys, take, G2.memtype_dev, G2.memtype, G2.memtype_cached);
     {   /* the expert batch's limits on this device, as coli_vk_init reads them for G */
         VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(G2.phys, &pp);
         G2.ssbo_align = (size_t)pp.limits.minStorageBufferOffsetAlignment;
@@ -3229,7 +3317,7 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
         }
     }
     /* its experts as device 0's: staged uploads by the same rule, on its one queue */
-    if (place_decide(G2.phys, mt, &g_up[1], 0)) {
+    if (place_decide(G2.phys, mt, &g_up[1], 0, take)) {
         VkUp *u = &g_up[1];
         u->dev = G2.dev; u->q = G2.queue; u->fam = G2.qfam; u->shared = 1;
         u->fams[0] = G2.qfam; u->nfams = 1;
