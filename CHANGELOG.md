@@ -355,6 +355,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **DeepSeek V4.1: a long prompt's answer could start with `<｜begin▁of▁sentence｜>`.** Past
+  layer 20, the first with compress ratio 1, a prompt of 2478 tokens or more runs the later
+  layers on its last 2414 rows (`v41_prefill_tail`). Layers 21 to 23 run no indexer: they read
+  the list layer 20 published for every row, whose entries count past the window half of a
+  prompt read from position 0, all its rows, while the tail starts past position 0 and reads the
+  window ring. `v41_take_tail` moved the streams, their mix and the candidate mask but not that
+  list: each of the tail's rows read the list of a row from the start of the prompt, its entries
+  off the rows the attention holds, and the last row could turn to NaN at layer 21. The list now
+  moves with the tail, its entries onto the ring's rows. Wherever the CPU runs a prompt's
+  layers (without a GPU, on the CUDA tier, on Vulkan with the chain off): unsloth's UD-IQ1_S on
+  the CUDA tier answered a 4104-token prompt with `<｜begin▁of▁sentence｜>` and the document's
+  title in 4 fresh serves of 9, and answers it in 3 of 3 now. The Vulkan chain kept the lists
+  right.
 - **`chat_template_kwargs` reaches the chat template** (`coli serve`). Many OpenAI-compatible
   clients turn a Qwen model's thinking off with `"chat_template_kwargs": {"enable_thinking":
   false}`, and the gateway ignored the field: a Qwen3.8 request that asked for no thinking this
