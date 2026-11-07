@@ -37,6 +37,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **The CUDA expert tier on two cards** (`COLI_VK_DEV2`, as on Vulkan). The CUDA tier kept every
+  expert on one card: a machine with two (two V100s, #2608) gave the routed experts one card's
+  memory. The second card now holds the experts after the primary's, in its own memory with its
+  own block table, scratch, streams and events, and runs the batch of its residents beside the
+  primary's at every step; a batch that fails there gives its experts back to the CPU and the
+  tier goes on with the primary. `COLI_VK_DEV2=auto` takes the first CUDA device that is not the
+  primary; its index takes that one (the primary's own: the same card twice, the test mode).
+  Tested with the same card twice against the CPU (glm53 and DeepSeek V4.1's tiny fixtures:
+  decode, eviction, a failing batch); not measured on two real cards.
 - **DeepSeek V4.1 with a GGUF on CUDA: a prompt's layers on the card.** On the CUDA tier the CPU
   ran a prompt's layers, the sparse attention, the hyper-connections and the router three fifths
   of a 4104-token prompt. A prompt of more than one chunk now runs layer by layer on the CUDA
