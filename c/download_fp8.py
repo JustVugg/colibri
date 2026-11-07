@@ -71,13 +71,12 @@ def download_file_hf(fn):
     from huggingface_hub import hf_hub_download
     hf_hub_download(REPO_HF, fn, local_dir=DEST, revision=os.environ.get("GLM_HF_REVISION", "main"))
 
-def download_file_curl(fn, base_url, expected_size):
+def download_file_curl(fn, url, expected_size):
     """Fallback: download with curl to a .part file with resume."""
     outpath = os.path.join(DEST, fn)
     partpath = outpath + ".part"
     if os.path.exists(outpath) and os.path.getsize(outpath) == expected_size:
         return True
-    url = f"{base_url}/{fn}"
     cmd = ["curl", "--fail", "-L", "-C", "-", "--retry", "999", "--retry-delay", "5",
            "--connect-timeout", "15", "--speed-time", "30", "--speed-limit", "1000",
            "-o", partpath, "-H", "User-Agent: colibri-download/1.0", url]
@@ -215,11 +214,13 @@ def main():
                     # Retry with curl fallback
                     if use_ms:
                         revision = quote(os.environ.get("GLM_MS_REVISION", "master"), safe="")
-                        base = f"https://modelscope.cn/api/v1/models/{REPO_MS}/repo?Revision={revision}&FilePath="
+                        url = (f"https://modelscope.cn/api/v1/models/{REPO_MS}/repo"
+                               f"?Revision={revision}&FilePath={quote(fn, safe='')}")
                     else:
                         revision = quote(os.environ.get("GLM_HF_REVISION", "main"), safe="")
-                        base = f"https://huggingface.co/{REPO_HF}/resolve/{revision}"
-                    if download_file_curl(fn, base, expected):
+                        url = (f"https://huggingface.co/{REPO_HF}/resolve/{revision}/"
+                               f"{quote(fn, safe='/')}")
+                    if download_file_curl(fn, url, expected):
                         success = True; break
                 except Exception as e:
                     if attempt < 2:
