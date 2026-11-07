@@ -8,7 +8,7 @@
 # Command: Build, both trees: docker run --rm -v <tree>:/src -w /src colibri-builder:xe2 nice -n 19 make -C c colibri qwen36 VK=1 ARCH=x86-64-v3 -j8 (0 warnings); c/colibri, c/qwen36 and c/shaders/ copied over colibri-vulkan:ubuntu26-qwen (Mesa 26.0.8, main 0a5504a1's Python gateway). Engine: docker compose up -d with the measuring host's compose.yaml (coli serve --model /models/qwen36-35b-a3b --ram 32; COLI_VK_TIER_GB=18, COLI_VK_DEV2= (GPU 0 only), OMP_NUM_THREADS=16) and an override with the arm's image and variables. Measured with colibench: python3 experiments/pr_manifests.py attndec (streamed OpenAI API requests to the engine, temperature 0); this folder made by experiments/make_manifests.py from its records.
 # Arms in the order they ran: attndec-E0-1 (09:19:31 UTC), attndec-E2-1 (09:31:05 UTC).
 # Prompt set sha256 (sha256 of the sorted sha256s of the measured prompts, one per line): 884fd1648c49f708645744b230c8a9736bc98826d98966bb3dab9da15b8a9fec.
-# Read: tok/s = decode of the 128-token answer to a 16K-token prompt (long_context.py's filler text for a seed and its question), (tokens - 1) / (last - first token time). The same seeds in both arms.
+# Read: tok/s = decode of the answer to a 16K-token prompt (long_context.py's filler text for a seed, then its one-line question: 'In one sentence: which word above appears most often?'), (tokens - 1) / (last - first token time), capped at 128 tokens; the model answered in one sentence, 11 tokens in every sample (completion_tokens in the records below), so each rate covers 10 decode steps at 16K positions. The same seeds in both arms.
 # Logs: logs.txt beside this file (sha256 a23199a3e610259b658b0af92da3b24b35b553b18dd12117ead02c6a56518ed6) holds every engine's whole log.
 
 # Samples

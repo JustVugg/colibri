@@ -61,7 +61,7 @@
     },
     "evidence": {
       "uri": "docs/experiments/vulkan-attn-dec-optin-2026-11-07/runs.txt",
-      "sha256": "584aab525baaec0d374c070839e9dddfe25b97e5dd5ba67dbf4f2c4d2964cff5"
+      "sha256": "66cc12b9636ccc711658b9e99c36edee54c2f29a5d11cd05bbcabdd5090c137d"
     }
   },
   "trial": {
@@ -110,7 +110,7 @@
     },
     "evidence": {
       "uri": "docs/experiments/vulkan-attn-dec-optin-2026-11-07/runs.txt",
-      "sha256": "584aab525baaec0d374c070839e9dddfe25b97e5dd5ba67dbf4f2c4d2964cff5"
+      "sha256": "66cc12b9636ccc711658b9e99c36edee54c2f29a5d11cd05bbcabdd5090c137d"
     }
   },
   "outcome": "improvement"
