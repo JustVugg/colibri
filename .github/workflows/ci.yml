@@ -2225,7 +2225,12 @@ jobs:
       - name: Install torch (CPU) + transformers
         run: pip install -r c/tools/oracle-requirements.txt
       - name: Build every engine (NEON branches must compile)
-        run: make -C c colibri inkling kimi_k3 olmoe
+        run: make -C c colibri inkling kimi_k3 olmoe qwen36
+      - name: "Expert FFN: NEON dots bit-exact against the scalar reference"
+        run: |
+          cd c
+          make tests/test_expert_ffn
+          OMP_NUM_THREADS=2 ./tests/test_expert_ffn
       - name: "DeepSeek V4 FP4 expert kernels: NEON arm bit-exact against the scalar arm (#1696)"
         run: |
           cd c
