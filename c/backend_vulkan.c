@@ -132,6 +132,7 @@ static struct {
     uint32_t device_types[2];      /* memory types whose heap is device memory */
     int8_t retry_type[2][32];      /* vk_retry_memtype of each memory type */
     uint64_t cap[2], used[2], peak[2];
+    uint64_t win[2];               /* the cap is the mapped window (vk_mem_window), not COLI_VK_DEVICE_CAP_MB */
     unsigned long long refused[2];
     VkMemRec *rec; size_t nrec, crec;
 } g_mem = {.mx = PTHREAD_MUTEX_INITIALIZER};
@@ -221,6 +222,7 @@ static void vk_mem_device(int k, VkPhysicalDevice phys, VkDevice d, uint32_t tak
     g_mem.dev[k] = d; g_mem.device_types[k] = mask;
     memcpy(g_mem.retry_type[k], retry, sizeof retry);
     g_mem.cap[k] = mb > 0 ? (uint64_t)(mb * 1048576.0) : 0;
+    g_mem.win[k] = 0;
     g_mem.used[k] = g_mem.peak[k] = 0; g_mem.refused[k] = 0;
     pthread_mutex_unlock(&g_mem.mx);
     if (g_mem.cap[k])
@@ -273,7 +275,7 @@ static uint64_t vk_mem_window(int k, VkPhysicalDevice phys, uint32_t memtype) {
         g_mem.used[k] = used;
         if (used > g_mem.peak[k]) g_mem.peak[k] = used;
     }
-    if (!user || hv < g_mem.cap[k]) g_mem.cap[k] = hv;
+    if (!user || hv < g_mem.cap[k]) g_mem.cap[k] = g_mem.win[k] = hv;
     pthread_mutex_unlock(&g_mem.mx);
     vk_pool_blocks(k);
     fprintf(stderr, "[VK] %smemory: uploads not staged, resident data in the %llu MiB host-visible window of %llu MiB "
@@ -305,13 +307,18 @@ static size_t vk_device_memory_bytes(VkPhysicalDevice phys, int k) {
 }
 size_t coli_vk_device_cap(void) { return (size_t)g_mem.cap[0]; }
 size_t coli_vk_device_used(void) { return (size_t)__atomic_load_n(&g_mem.used[0], __ATOMIC_RELAXED); }
-size_t coli_vk_block_bytes_dev(int dev, size_t def) {
-    int k = dev == 1 ? 1 : 0;
-    if (!g_mem.cap[k]) return def;
-    size_t b = (size_t)64 << 10;   /* at most about 4096 blocks fill the cap */
-    while ((uint64_t)b < g_mem.cap[k] / 4096) b <<= 1;
+/* Under a cap the pools' blocks: about 4096 fill COLI_VK_DEVICE_CAP_MB, so their granularity does not
+ * decide what fits; the mapped window takes the largest power of two 16 of which fit, so that it is
+ * filled in a few dozen allocations (a driver may allow 4096 in all: NVIDIA's on Windows). */
+static size_t vk_cap_block(int k, size_t def) {
+    const uint64_t c = g_mem.cap[k];
+    if (!c) return def;
+    size_t b = (size_t)64 << 10;
+    if (g_mem.win[k] && g_mem.win[k] == c) while ((uint64_t)b * 32 <= c) b <<= 1;
+    else while ((uint64_t)b < c / 4096) b <<= 1;
     return b < def ? b : def;
 }
+size_t coli_vk_block_bytes_dev(int dev, size_t def) { return vk_cap_block(dev == 1 ? 1 : 0, def); }
 size_t coli_vk_block_bytes(size_t def) { return coli_vk_block_bytes_dev(0, def); }
 int coli_vk_mem_alloc(void *device, const void *info, void *memory) {
     return (int)vk_mem_alloc((VkDevice)device, (const VkMemoryAllocateInfo *)info, NULL, (VkDeviceMemory *)memory);
@@ -1839,8 +1846,7 @@ static VkWPool g_hpool  = {.p = {.block_bytes = VK_WBLOCK}, .mx = PTHREAD_MUTEX_
 static int pool_staged(const VkWPool *P);
 /* Device k's pools take VK_WBLOCK blocks, smaller ones under COLI_VK_DEVICE_CAP_MB. */
 static void vk_pool_blocks(int k) {
-    size_t bb = VK_WBLOCK;
-    if (g_mem.cap[k]) { bb = (size_t)64 << 10; while ((uint64_t)bb < g_mem.cap[k] / 4096 && bb < VK_WBLOCK) bb <<= 1; }
+    size_t bb = vk_cap_block(k, VK_WBLOCK);
     if (k == 0) { g_wpool.p.block_bytes = bb; g_tpool.p.block_bytes = bb; g_xpool.p.block_bytes = bb; }
     else { g_wpool2.p.block_bytes = bb; g_tpool2.p.block_bytes = bb; }
 }
