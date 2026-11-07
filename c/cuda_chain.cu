@@ -3465,6 +3465,7 @@ static int cc_preload(void) {
     return own && coli_cuda_load_module();
 #endif
 }
+#include "cuda_dsv4c.cuh"   /* DeepSeek V4.1's layer ops */
 static const ColiCudaChainOps g_cc_ops = {
     sizeof(ColiCudaChainOps),
     cc_init, cc_ready, cc_lost_, cc_shutdown, cc_device, cc_device_now,
@@ -3497,5 +3498,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_preload,
     cc_moe_cols,
     cc_matmul_hcmix,
+    cc_mhc, cc_ds_attn, cc_ds_rope, cc_ds_compress, cc_ds_score, cc_ds_cand, cc_ds_topk, cc_ds_engram,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }
