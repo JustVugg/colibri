@@ -364,7 +364,7 @@ class Server:
         if not line:
             return
         try:
-            message = json.loads(line)
+            message = json.loads(line.decode("utf-8") if isinstance(line, bytes) else line)
         except (ValueError, RecursionError):
             self.error(None, PARSE_ERROR, "parse error")
             return
@@ -456,7 +456,9 @@ class Server:
                                  "isError": True})
 
     def serve(self, stream=None):
-        stream = stream or sys.stdin
+        # Decode each complete frame in handle_line. A TextIO decoder can fail
+        # before yielding a line and terminate the session on one malformed byte.
+        stream = stream or getattr(sys.stdin, "buffer", sys.stdin)
         for line in stream:
             self.handle_line(line)
         # stdin closed: let the calls in flight answer (a stop drains its engine)
