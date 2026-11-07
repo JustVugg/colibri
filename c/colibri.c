@@ -1413,8 +1413,10 @@ static void qt_kvb_absorb(const QT *w, int h, const float *q_nope, float *q_lat)
     qt_ggml_rows_f32(&w->kvb->kb,h*w->kvb->L,w->kvb->L,q_nope,q_lat);
 }
 static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot){
-#if defined(COLI_CUDA) && defined(COLI_VULKAN)
-    /* a GGUF's resident dense matrix on the CUDA tier's device, once it took it (cu_dense.h) */
+#ifdef COLI_CUDA
+    /* a GGUF's resident dense matrix on the CUDA tier's device, once it took it (cu_dense.h): a
+     * CUDA build's too, which reserved the budget for it (colibri_cu_tier_start) and ran it on
+     * the CPU */
     if(w->fmt==QT_GGML && w->cud_dense && xt_cuda() &&
        cud_mm((void **)&w->cuda,&w->cud_no,y,x,S,100+w->gt,w->q4,NULL,w->O,w->I,0)) return;
 #endif
@@ -2882,6 +2884,10 @@ static void model_init_range(Model *m, const char *snap, int cap,
     int io_bits = dbits>=8 ? 16 : dbits;
     if(load_boundaries){
         m->embed   = qt_load(m,"model.embed_tokens.weight", c->vocab, D, io_bits);
+#ifdef COLI_CUDA
+        /* the embedding is read a row at a time, never multiplied: no device copy, none of cud_open's ask */
+        if(m->embed.cud_dense){ m->embed.cud_dense=0; g_cud_dense_bytes-=(size_t)qt_bytes(&m->embed); }
+#endif
         m->lm_head = qt_load(m,"lm_head.weight", c->vocab, D, io_bits);
         m->final_norm = ld(m,"model.norm.weight");
     }
@@ -5300,6 +5306,9 @@ static void kv_lc_rows_f32(Model *m, int layer, int64_t t0, int64_t n, float *ds
 #ifdef COLI_VULKAN
 static void glmc_cpu_rows(Model *m, int layer, KVState *const *kvs, const int *positions, int pos_base, int S);
 #endif
+#ifdef COLI_CUDA
+static void glmu_cpu_rows(Model *m, int layer, KVState *const *kvs, const int *positions, int pos_base, int S);
+#endif
 /* Mistral-Large-4's attention (model_type mistral_large4), on the CPU: GLM-5.2's MLA without the
  * query LoRA (q_proj straight from the input), the layer's own key width (a NoPE layer's whole
  * key unrotated, no rotary cache row), the queries times SSMax (s * log(pos + 1) + b per head)
@@ -5457,6 +5466,9 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     double ta0=now_s();
 #ifdef COLI_VULKAN
     glmc_cpu_rows(m,layer,kvs,positions,pos_base,S);   /* the dense chain's KV mirror: these rows change here */
+#endif
+#ifdef COLI_CUDA
+    glmu_cpu_rows(m,layer,kvs,positions,pos_base,S);   /* the CUDA chain's too */
 #endif
 #ifdef COLI_METAL
     /* Fused decode attention on GPU: whole layer in one command buffer (keeps the GPU hot).
@@ -8569,11 +8581,25 @@ static void glm_dho_drop_layer(Model *m, int i);
 static void glm_dho_finish(Model *m);
 #include "glm_chain.h"   /* COLI_VK_CHAIN: every layer's dense chain on the device */
 #endif
+#ifdef COLI_CUDA
+#include "colibri_cuchain.h"   /* COLI_CUDA_CHAIN: a GGUF's every layer on the CUDA chain */
+#endif
 static void layers_forward_rows_range(Model *m, float *x, int S, int pos_base,
                                       KVState *const *kvs,
                                       const int *positions,
                                       int layer_begin, int layer_end){
     Cfg *c=&m->c; int D=c->hidden;
+#ifdef COLI_CUDA
+    /* a GGUF on the CUDA device: the whole forward on the CUDA chain (colibri_cuchain.h), for the
+     * bound KV state's rows (a single-slot serve's decode batch of one row included); 0: the CPU
+     * path below, as before */
+    if(layer_begin==0 && layer_end==c->n_layers && glmu_wanted(m)){
+        int done=0;
+        if(!kvs && !positions) done=glmu_forward(m,x,S,pos_base);
+        else if(kvs && S==1 && kvs[0]==m->kv) done=glmu_forward(m,x,1,positions?positions[0]:pos_base);
+        if(done>=c->n_layers) return;
+    }
+#endif
 #ifdef COLI_VULKAN
     /* the whole forward on the device (glm_chain.h); 0: the CPU path below, as before.
      * A decode batch of one row of the bound KV state (a single-slot serve) is a step
@@ -8703,6 +8729,9 @@ static void kv_alloc(Model *m, int max_t){
         for(int i=0;i<c->n_layers+1;i++) m->vk_kv_valid[i]=0;
     }
     glmc_kv_reset(m);                                    /* the dense chain's mirror too */
+#endif
+#ifdef COLI_CUDA
+    glmu_kv_reset(m);                                    /* the CUDA chain's */
 #endif
     if(k->Lc){ for(int i=0;i<c->n_layers+1;i++){
 #ifdef COLI_METAL
@@ -11483,6 +11512,9 @@ static void glm_unpark(Model *m, ServeCtx *sc, int maxctx){
         if(m->kv==&sc->kv && m->vk_kv_valid) for(int i=0;i<m->c.n_layers+1;i++) m->vk_kv_valid[i]=0;
         glmc_host_rows(m,&sc->kv,0);
 #endif
+#ifdef COLI_CUDA
+        glmu_host_rows(m,&sc->kv,0);
+#endif
         kv_disk_truncate(m,g_glm_park_from);   /* the next append writes the conversation's rows past it */
     }
     free(p);
@@ -11725,6 +11757,9 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
             coli_kv_share_adopt_rows(cc,&sc->kv,&dn->kv,sc->hist,tmp,from,n);
 #ifdef COLI_VULKAN
             glmc_host_rows(m,&sc->kv,from);   /* the dense chain's mirror of this slot, from `from` on */
+#endif
+#ifdef COLI_CUDA
+            glmu_host_rows(m,&sc->kv,from);
 #endif
             sc->len=blen;
             if(m->has_mtp) m->kv_start[cc->n_layers]=-1;   /* MTP rows are per-slot decode state */
@@ -12369,7 +12404,7 @@ static void vk_tmp_slot_free(ESlot *t,int rtq){
 }
 static Model *g_vk_model;                    /* the run's report at exit */
 #ifdef COLI_CUDA
-static void colibri_cu_report(void){ cud_report("colibri"); }
+static void colibri_cu_report(void){ cud_report("colibri"); glmu_report(); }
 #endif
 static void vk_tier_report_run(void){
     if(g_vk_model) XT(report)("run",g_vk_model->hit_pin+g_vk_model->hit_ecache,g_vk_model->miss);
@@ -12395,7 +12430,14 @@ static void colibri_cu_tier_start(Model *m){
         st_tensor *g0=st_find(&m->S,gn); gguf = g0 && st_is_ggml(g0->dtype); break; }
     if(!gguf) return;
     xt_use_cuda(1);
-    g_cl_cud=cud_open("colibri",coli_cuda_device_at(0),g_cud_dense_bytes);   /* the tier leaves it room */
+    /* the CUDA chain (colibri_cuchain.h) runs every layer on the card: every dense matrix goes
+     * there when it fits beside the chain's own bytes, as the Vulkan chain's fit has it; else
+     * cu_dense.h's rule, and the chain, without the matrices, stays off */
+    if(glmu_planned(m)){
+        int ctx=getenv("CTX")?atoi(getenv("CTX")):4096; if(ctx<1) ctx=4096;
+        g_cl_cud=cud_open_whole("colibri",coli_cuda_device_at(0),g_cud_dense_bytes,glmu_plan_bytes(m,ctx));
+    }
+    if(!g_cud.on) g_cl_cud=cud_open("colibri",coli_cuda_device_at(0),g_cud_dense_bytes);   /* the tier leaves it room */
     vk_tier_start(m);
     if(!cut_ready()){ xt_use_cuda(0); g_cud.on=0; return; }
     atexit(colibri_cu_report);
@@ -12491,6 +12533,10 @@ static void vk_tier_start(Model *m){
     double dense=0;
 #ifdef COLI_CUDA
     if(xt_cuda()) dense+=(double)g_cl_cud;   /* cu_dense.h's budget, taken before the tier's */
+    if(xt_cuda() && glmu_wanted(m)){   /* the CUDA chain's own (colibri_cuchain.h): kv_b's floats, the KV mirror, a chunk */
+        int ctx=getenv("CTX")?atoi(getenv("CTX")):4096; if(ctx<1) ctx=4096;
+        dense+=(double)glmu_plan_bytes(m,ctx);
+    }
 #endif
 #ifdef COLI_VULKAN   /* the absorb core's KV mirror, and a partial dense chain: Vulkan's */
     if(g_vk_attn){ int ctx=getenv("CTX")?atoi(getenv("CTX")):4096; if(ctx<1) ctx=4096;
@@ -14215,11 +14261,11 @@ int main(int argc, char **argv){
     const char *snap=getenv("SNAP");
     if(!snap){ coli_print_launcher_help("GLM-5.2", "SNAP=<model directory> ./colibri ..."); return 1; }
 #ifdef COLI_CUDA
-    {   /* A GGUF (a gguf_import folder, its gguf.json) under CUDA kept every matrix and routed
-         * expert on the CPU (QT_GGML: the CUDA backend takes no ggml block types, see
-         * qt_cuda_upload); Vulkan's tier and chain take them. A build with both backends
-         * runs a GGUF on Vulkan, the same card, when CUDA was asked for and COLI_VULKAN was not
-         * set (qwen38.c's way); COLI_VULKAN=0 keeps CUDA. */
+    {   /* A GGUF (a gguf_import folder, its gguf.json) under CUDA: its routed experts on the
+         * CUDA tier, its dense matrices on the card (cu_dense.h) and every layer on the CUDA
+         * chain (colibri_cuchain.h), colibri_cu_tier_start's. A build with both backends runs a
+         * GGUF on Vulkan, the same card, when CUDA was asked for and COLI_VULKAN was not set
+         * (qwen38.c's way); COLI_VULKAN=0 keeps CUDA. */
         char gj[4096]; snprintf(gj,sizeof gj,"%s/gguf.json",snap);
         const char *cu=getenv("COLI_CUDA"), *vk=getenv("COLI_VULKAN");
         FILE *gf=fopen(gj,"rb");
@@ -14229,11 +14275,8 @@ int main(int argc, char **argv){
 #ifdef COLI_VULKAN
                 setenv("COLI_VULKAN","1",1); setenv("COLI_CUDA","0",1);
                 fprintf(stderr,"[gguf] this GGUF runs on Vulkan, the same card, its attention in the dense chain "
-                               "(COLI_VULKAN=0 keeps CUDA: the routed experts on the CUDA tier, the dense matrices "
-                               "on the card, the attention on the CPU)\n");
-#else
-                fprintf(stderr,"[gguf] the CUDA backend has no ggml block types: this GGUF's matrices and experts run on the CPU "
-                               "(a VK=1 build runs them on the card through Vulkan)\n");
+                               "(COLI_VULKAN=0 keeps CUDA: the routed experts on the CUDA tier, every layer on the CUDA "
+                               "chain)\n");
 #endif
             }
         }
@@ -15013,6 +15056,9 @@ int main(int argc, char **argv){
 #endif
 #ifdef COLI_CUDA
     colibri_cu_tier_start(&m);   /* COLI_CUDA=1 with no Vulkan device and a GGUF: the same tier on CUDA */
+    /* the CUDA chain's matrices and parameters up now, after the tier took its room, rather than in
+     * the first request's time (13 GiB of GLM-5.3 UD-IQ1_S's and its k_b and v_b as floats) */
+    if(glmu_wanted(&m)) glmu_setup(&m);
 #endif
     const char *stats=getenv("STATS");   /* STATS=<file> -> istogramma uso expert a fine run */
 

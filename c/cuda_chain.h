@@ -251,6 +251,10 @@ typedef struct { int trans, S, H, n, hstride, hoff, x_off, x_row, x_seg, y_off, 
 typedef struct { int np, pool, p0, ID, g_off, g_row, ape_off, pk_off, k_off, k_row; } CcDsaPool;
 typedef struct { int S, pos_base, IH, ID, topk, pool, q_off, q_row, w_off, w_row, pk_off, tail, sc_row, sel_row;
                  float wdiv, scale; } CcDsaPick;
+/* GLM-5.2 and GLM-5.3's indexer, not pooled (cuda_glm53c.cuh): every row's top keys over the index
+ * key cache (k_off, ID floats a position) in position order, colibri.c's selection; sel's row is a
+ * count then the positions, -1 for a row whose context is not past topk (force: always a list) */
+typedef struct { int S, pos_base, IH, ID, topk, force, q_off, q_row, w_off, w_row, k_off, sc_row, sel_row; float rs, wsc; } CcDsaSel;
 
 typedef struct ColiCudaChainOps {
     size_t size;
@@ -411,6 +415,10 @@ typedef struct ColiCudaChainOps {
     int  (*mla_hgemv)(CcBuf *w, CcBuf *x, CcBuf *y, CcBuf *gate, const CcHgemv *p);
     int  (*dsa_pool_keys)(CcBuf *keys, CcBuf *gates, CcBuf *prm, CcBuf *pk, const CcDsaPool *p);
     int  (*dsa_pool_select)(CcBuf *iq, CcBuf *hw, CcBuf *pk, CcBuf *sc, CcBuf *sel, const CcDsaPick *p);
+    /* GLM-5.2 and GLM-5.3's indexer (cuda_glm53c.cuh) */
+    int  (*dsa_select)(CcBuf *iq, CcBuf *hw, CcBuf *keys, CcBuf *sc, CcBuf *sel, const CcDsaSel *p);
+    /* mla_hgemv's rows on a GGUF's Q8_0 rows as the file has them, w_off in bytes */
+    int  (*mla_hgemv_q8)(CcBuf *w, CcBuf *x, CcBuf *y, const CcHgemv *p);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -539,6 +547,18 @@ static inline int cc_dsa_pool_keys(CcBuf *keys, CcBuf *gates, CcBuf *prm, CcBuf 
 }
 static inline int cc_dsa_pool_select(CcBuf *iq, CcBuf *hw, CcBuf *pk, CcBuf *sc, CcBuf *sel, const CcDsaPick *p) {
     return cc_glm53_ready() ? cc_ops()->dsa_pool_select(iq, hw, pk, sc, sel, p) : 0;
+}
+/* GLM-5.2 and GLM-5.3's ops: the module has them (and GLM-5.3 Flash's MLA ops, which they run with) */
+static inline int cc_glmdsa_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return cc_glm53_ready() && t->size >= offsetof(ColiCudaChainOps, mla_hgemv_q8) + sizeof t->mla_hgemv_q8 && t->dsa_select &&
+           t->mla_hgemv_q8;
+}
+static inline int cc_dsa_select(CcBuf *iq, CcBuf *hw, CcBuf *keys, CcBuf *sc, CcBuf *sel, const CcDsaSel *p) {
+    return cc_glmdsa_ready() ? cc_ops()->dsa_select(iq, hw, keys, sc, sel, p) : 0;
+}
+static inline int cc_mla_hgemv_q8(CcBuf *w, CcBuf *x, CcBuf *y, const CcHgemv *p) {
+    return cc_glmdsa_ready() ? cc_ops()->mla_hgemv_q8(w, x, y, p) : 0;
 }
 /* the chain's and the backend's kernels loaded now where the backend can (an older one loads them
  * at their first launch) */

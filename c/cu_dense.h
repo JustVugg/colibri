@@ -93,6 +93,33 @@ static size_t cud_open(const char *engine, int dev, size_t dense) {
     return g_cud.budget;
 }
 
+/* The dense part for an engine's CUDA chain, which runs every layer on the device and needs every
+ * matrix there: all of it when it and the chain's own bytes (`extra`) fit in what the device has
+ * free less the tier's reserve, as the Vulkan chain's fit takes a discrete GPU's; the routed
+ * experts keep the rest. Returns the budget as cud_open does, 0 when it does not fit (the caller
+ * then asks cud_open). COLI_CUDA_DENSE=0 and COLI_CUDA_DENSE_GB keep their meaning: cud_open's. */
+static size_t cud_open_whole(const char *engine, int dev, size_t dense, size_t extra) {
+    const char *e = getenv("COLI_CUDA_DENSE"), *g = getenv("COLI_CUDA_DENSE_GB"), *r = getenv("COLI_VK_TIER_RESERVE_GB");
+    const double GiB = 1073741824.0;
+    g_cud = (CuDense){0};
+    if ((e && *e && atoi(e) == 0) || (g && *g) || !dense) return 0;
+    size_t free_b = 0, total = 0;
+    if (!coli_cuda_mem_info(dev, &free_b, &total)) return 0;
+    const double reserve = (r && *r ? atof(r) : 1.0) * GiB;
+    if ((double)dense + (double)extra + reserve > (double)free_b) {
+        fprintf(stderr, "[CUDA] %s: the dense matrices (%.2f GiB) and the chain's %.2f GiB do not fit in the device's %.2f GiB free "
+                        "less the reserve\n", engine, dense / GiB, extra / GiB, free_b / GiB);
+        return 0;
+    }
+    g_cud.on = 1;
+    g_cud.dev = dev;
+    g_cud.budget = dense;
+    g_cud.thread = pthread_self();
+    fprintf(stderr, "[CUDA] %s: every dense matrix on the device for the chain, %.2f GiB, and %.2f GiB of its own; the routed experts "
+                    "keep the rest (COLI_CUDA_CHAIN=0: cu_dense.h's half of the free memory)\n", engine, dense / GiB, extra / GiB);
+    return g_cud.budget;
+}
+
 /* y[S][O] = x[S][I] W^T on the device: 1 done there, 0 the CPU's. *h is the matrix's
  * handle (NULL before its first use), *no set once it stays the CPU's. */
 static int cud_mm(void **h, int *no, float *y, const float *x, int S, int fmt, const void *w, const float *s,

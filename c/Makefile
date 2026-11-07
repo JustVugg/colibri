@@ -1091,7 +1091,7 @@ backend_cuda.o: backend_cuda.cu backend_cuda.h cuda_bd.cuh cuda_chain.h fp8_form
 
 # The dense chain on a CUDA device (cuda_chain.h): the backend's twin of vk_chain.c,
 # built into the same backend (one table export, coli_cuda_chain_ops).
-cuda_chain.o: cuda_chain.cu cuda_chain.h cuda_dsv4c.cuh backend_cuda.h backend_gpu_compat.h .build-config
+cuda_chain.o: cuda_chain.cu cuda_chain.h cuda_dsv4c.cuh cuda_glm53c.cuh backend_cuda.h backend_gpu_compat.h .build-config
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) -c cuda_chain.cu -o $@
 
@@ -1423,7 +1423,7 @@ hip-test:
 # host code. An ARM host with a card (DGX Spark, GH200, Jetson) builds it without the x86
 # SIMD kernels, so a name those alone define breaks only there; CI runs this at
 # ARCH=x86-64 (no AVX2) to see it on an x86 runner.
-CUDA_HOST_SRC = qwen38.c qwen36.c olmoe.c qwen36_tier.c backend_loader.c glm53.c deepseek_v41.c
+CUDA_HOST_SRC = qwen38.c qwen36.c olmoe.c qwen36_tier.c backend_loader.c glm53.c deepseek_v41.c colibri.c
 cuda-host-syntax:
 	for f in $(CUDA_HOST_SRC); do $(CC) $(filter-out -MMD -MP,$(CFLAGS)) -fsyntax-only -DCOLI_CUDA $$f || exit 1; done
 
