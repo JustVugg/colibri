@@ -97,6 +97,10 @@ typedef struct {
     int lo, d;                                 /* its layers start at lo, on device d (vkc_device) */
     int n;                                     /* the layers on the device: lo..lo+n-1 (a partial chain) */
     VkcBuf *cmd, *ld;                          /* the handoff: the candidate mask and the index list, down */
+    VkcBuf *lw_xs, *lw_hp, *lw_ds;             /* a prompt layer by layer: every row's streams, FFN mix, shared expert, */
+    VkcBuf *lw_list, *lw_mask;                 /* list (the selection an index source left for the layers after it) and candidate mask */
+    float *lw_in, *lw_out;                     /* and the routed experts' rows, in and out (host) */
+    size_t lw_cap;
 } V41Chain;
 
 static V41Chain *g_v41c;
@@ -280,6 +284,31 @@ static ColiVkTensor *v41c_wb(const WB *w) {
 
 /* wo_a for the per-head reader (vkc_mla_hgemv): a GGUF's in the reader's form */
 static ColiVkTensor *v41c_w8h(const W8 *w) { return w->gx ? v41c_gq(w->q, w->gt, w->O, w->I, 1) : v41c_w8(w); }
+/* A GGUF's wo_a as its output groups' GEMMs, each group's rows in the file's blocks (as wo_b
+ * goes up), not the per-head reader's floats: the reader takes every row of a prompt chunk
+ * through the whole matrix again (8192 x 4096 floats a layer of V4.1-Flash, 128 MiB, 40
+ * layers 5 GiB of the device), a GEMM reads each tile once for all the chunk's rows.
+ * COLI_VK_V41_WOA=0: the per-head reader. */
+#define V41C_OG_MAX 64
+static int v41c_woa_groups(const W8 *w, int og, int ol) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_V41_WOA"); on = !(e && *e == '0'); }
+    return on && w->gx && w->q && og >= 1 && og <= V41C_OG_MAX && ol % 16 == 0 && w->O == og * ol &&
+           v41c_gq_fmt(w->gt, w->I, 0) >= 0;
+}
+static const uint8_t *v41c_woa_rows(const W8 *w, int g, int ol) {   /* group g's first row (16-row interleave kept) */
+    const int64_t rb = gq_row_bytes(w->gt, w->I);   /* an interleaved type's: 16 of them step a group */
+    return rb > 0 ? w->q + (size_t)g * ol * (size_t)rb : NULL;
+}
+static ColiVkTensor *v41c_woa_group(const W8 *w, int g, int ol) {
+    const uint8_t *q = v41c_woa_rows(w, g, ol);
+    return q ? v41c_gq(q, w->gt, ol, w->I, 0) : NULL;
+}
+static int v41c_woa_up(const W8 *w, int og, int ol) {
+    if (!v41c_woa_groups(w, og, ol)) return v41c_w8h(w) != NULL;
+    for (int g = 0; g < og; g++) if (!v41c_woa_group(w, g, ol)) return 0;
+    return 1;
+}
 
 /* ---- the host's writes: the device's copies follow ------------------------------------- */
 static void v41c_lower_one(Model *m, V41Chain *ch, int pos) {
@@ -392,7 +421,10 @@ static size_t v41c_layer_bytes(const Model *m, int i, int rows, int dho, int vie
     const Layer *l = m->gguf && m->L ? &m->L[i] : NULL;
     T(10, H * D, nm, 0); T(10, H * D, nm, 0);                          /* the mHC mix matrices */
     T8(&l->wq_a, D, QL, 0); T8(&l->wq_b, QL, nh * hd, 0); T8(&l->wkv, D, hd, 0);
-    T8(&l->wo_a, nh * hd / og, og * ol, 1);                            /* wo_a whole, the chain's */
+    if (l && v41c_woa_groups(&l->wo_a, og, ol)) {                     /* wo_a's groups in the file's blocks */
+        int f_ = v41c_gq_fmt(l->wo_a.gt, nh * hd / og, 0);
+        for (int g = 0; g < og; g++) T(f_, nh * hd / og, ol, 0);
+    } else T8(&l->wo_a, nh * hd / og, og * ol, 1);                     /* wo_a whole, the chain's */
     for (int g = 0; views && g < og; g++) T(12, nh * hd / og, ol, FP8_TILE);   /* and per group, the per-matrix path's */
     T8(&l->wo_b, og * ol, D, 0);
     T8(&l->sh_w1, D, c->moe_inter, 0); T8(&l->sh_w3, D, c->moe_inter, 0); T8(&l->sh_w2, c->moe_inter, D, 0);
@@ -518,7 +550,7 @@ static int v41c_layer_up(V41Chain *ch, Model *m, int i, const char **why) {
     Cfg *c = &m->c; Layer *l = &m->L[i];
     int r = c->compress_ratio[i];
     *why = "a matrix the device refused";
-    int ok = v41c_w8(&l->wq_a) && v41c_w8(&l->wq_b) && v41c_w8(&l->wkv) && v41c_w8h(&l->wo_a) && v41c_w8(&l->wo_b) &&
+    int ok = v41c_w8(&l->wq_a) && v41c_w8(&l->wq_b) && v41c_w8(&l->wkv) && v41c_woa_up(&l->wo_a, c->o_groups, c->o_lora) && v41c_w8(&l->wo_b) &&
              v41c_w8(&l->sh_w1) && v41c_w8(&l->sh_w3) && v41c_w8(&l->sh_w2);
     if (ok && c->kv_source[i]) ok = v41c_wb(&l->comp_wkv) && (r <= 1 || v41c_wb(&l->comp_wgate)) && v41c_wb(&l->idx_wk);
     if (ok && c->index_source[i] && r > 0) ok = v41c_w8(&l->idx_wq_b) && v41c_wb(&l->idx_wproj);
@@ -539,6 +571,8 @@ static void v41c_layer_free(V41Chain *ch, Model *m, int i) {
     const WB *wb[] = {&l->comp_wkv, &l->comp_wgate, &l->idx_wk, &l->idx_wproj};
     if (ch->d) {   /* the second device's own copies */
         for (size_t k = 0; k < sizeof w8 / sizeof *w8; k++) v41c_d2_forget(w8[k]->q);
+        for (int g = 1; g < m->c.o_groups && v41c_woa_groups(&l->wo_a, m->c.o_groups, m->c.o_lora); g++)
+            v41c_d2_forget(v41c_woa_rows(&l->wo_a, g, m->c.o_lora));
         for (size_t k = 0; k < sizeof wb / sizeof *wb; k++) v41c_d2_forget(wb[k]->gx ? (const void *)wb[k]->g : (const void *)wb[k]->w);
         return;
     }
@@ -852,6 +886,37 @@ typedef struct {
 
 /* attention_run for nr rows on the device: the projections, the window ring, the
  * compressor, the indexer, the sparse attention and the output projection, into ch->br */
+/* wo_a: heads [nr][og x pg] -> grp [nr][og x ol]. Its groups' GEMMs (v41c_woa_groups): one
+ * row reads its groups' slices in place; more rows go to group-major order first (q, free
+ * after the attention), each group's GEMM writes [nr][ol] into heads, and the rows come back
+ * in grp's order. Else the per-head reader. */
+static int v41c_wo_a(V41Chain *ch, Model *m, Layer *l, int nr, const VkcHgemv *g) {
+    const Cfg *c = &m->c; const W8 *w = &l->wo_a;
+    const int og = c->o_groups, ol = c->o_lora, pg = w->I;
+    if (!v41c_woa_groups(w, og, ol) || og * pg != c->n_heads * c->head_dim)
+        return vkc_mla_hgemv(v41c_w8h(w), ch->heads, ch->grp, NULL, g);
+    ColiVkTensor *t[V41C_OG_MAX];
+    for (int k = 0; k < og; k++) if (!(t[k] = v41c_woa_group(w, k, ol))) return 0;
+    int ok = 1;
+    if (nr == 1) {
+        for (int k = 0; ok && k < og; k++) ok = vkc_matmul(t[k], ch->heads, (size_t)k * pg, ch->grp, (size_t)k * ol, 1);
+        return ok;
+    }
+    static VkcRegion *rg; static int crg;
+    const int n = nr * og;
+    if (n > crg) {
+        VkcRegion *nrg = realloc(rg, (size_t)n * sizeof *rg);
+        if (!nrg) return 0;
+        rg = nrg; crg = n;
+    }
+    for (int s = 0; s < nr; s++)
+        for (int k = 0; k < og; k++) rg[s * og + k] = (VkcRegion){(size_t)k * nr * pg + (size_t)s * pg, (size_t)s * og * pg + (size_t)k * pg, (size_t)pg};
+    ok = vkc_copy_regions(ch->q, ch->heads, rg, n);
+    for (int k = 0; ok && k < og; k++) ok = vkc_matmul(t[k], ch->q, (size_t)k * nr * pg, ch->heads, (size_t)k * nr * ol, nr);
+    for (int s = 0; s < nr; s++)
+        for (int k = 0; k < og; k++) rg[s * og + k] = (VkcRegion){(size_t)s * og * ol + (size_t)k * ol, (size_t)k * nr * ol + (size_t)s * ol, (size_t)ol};
+    return ok && vkc_copy_regions(ch->grp, ch->heads, rg, n);
+}
 static int v41c_attention(V41Chain *ch, Model *m, int i, const V41Fwd *f) {
     Cfg *c = &m->c; Layer *l = &m->L[i];
     int hd = c->head_dim, nh = c->n_heads, rd = c->rope_dim, QL = c->q_lora, r = c->compress_ratio[i];
@@ -936,7 +1001,7 @@ static int v41c_attention(V41Chain *ch, Model *m, int i, const V41Fwd *f) {
     } else ok = vkc_dsv4_attn(ch->q, ch->win[i], r > 0 ? ch->ckv[c->index_owner[i]] : NULL, ch->list, ch->prm, ch->heads, &a);
     return ok &&
            v41c_rope(ch, m, ch->heads, nr * nh, nh, hd - rd, qrow, hd, tcs, rd, 1) &&
-           vkc_mla_hgemv(v41c_w8h(&l->wo_a), ch->heads, ch->grp, NULL, &g) &&
+           v41c_wo_a(ch, m, l, nr, &g) &&
            vkc_matmul(v41c_w8(&l->wo_b), ch->grp, 0, ch->br, 0, nr);
 }
 
@@ -975,6 +1040,203 @@ static int v41c_engram(V41Chain *ch, Model *m, int i, int nr, int pb, float *row
  * (*lost = 1: a frame failed, the device marked lost; else declined, or memory refused:
  * the chain off). */
 static void v41c_off(V41Chain *ch) { ch->failed = 1; if (!ch->d) g_vk_chain = 0; }
+/* A chunk's tables (rows pb.. of a forward from start): its RoPE rows (the CPU's own
+ * tables), window ones at 0 and compress ones at csB from position pb - rmax + 1; and the
+ * window half of each row's list (window_idxs): the positions of the last `window` the row
+ * reaches, oldest first, as device ring rows; -1 where the CPU's ring does not hold the
+ * position (window_pos: the chain's first layer's, which holds what every layer held when
+ * the forward began; the layers before it have written theirs by now). The selection half
+ * starts empty. */
+static void v41c_chunk_tables(const V41Chain *ch, const Model *m, int start, int pb, int nr, int csB, float *cs_, int *wl) {
+    const Cfg *c = &m->c;
+    int rd = c->rope_dim, W = ch->W, LR = W + ch->K;
+    for (int s = 0; s < nr; s++) memcpy(cs_ + (size_t)s * rd, m->rope_window + (size_t)(pb + s) * rd, rd * sizeof(float));
+    for (int s = 0; s < nr + ch->rmax - 1; s++) {
+        int p = pb - ch->rmax + 1 + s;
+        float *dst = cs_ + csB + (size_t)s * rd;
+        if (p < 0) memset(dst, 0, rd * sizeof(float));
+        else memcpy(dst, m->rope_compress + (size_t)p * rd, rd * sizeof(float));
+    }
+    const Layer *l0 = &m->L[ch->lo];
+    for (int s = 0; s < nr; s++) {
+        int p = pb + s;
+        for (int k = 0; k < W; k++) {
+            int q = p - W + 1 + k, e = -1;
+            if (q >= 0 && (q >= start || l0->window_pos[q % W] == q)) e = q % ch->Wd;
+            wl[(size_t)s * LR + k] = e;
+        }
+        for (int k = W; k < LR; k++) wl[(size_t)s * LR + k] = -1;
+    }
+}
+/* The device's copies made the host's, as a forward from start needs them: the window rows
+ * since the device last had them, each kv_source layer's compressed rows and keys up to
+ * need[], its compressor's group. In the open frame. */
+static int v41c_state_up(V41Chain *ch, Model *m, int start, const int *need) {
+    const Cfg *c = &m->c;
+    int L = c->n_layers, lo = ch->lo, hi = lo + ch->n, W = ch->W, hd = c->head_dim, ok = 1;
+    for (int q = ch->win_valid > start - W + 1 ? ch->win_valid : start - W + 1; q < start && ok; q++) {
+        if (q < 0) continue;
+        for (int i = lo; i < hi && ok; i++) {
+            const Layer *l = &m->L[i];
+            if (l->window_pos[q % W] != q) continue;
+            ok = vkc_write(ch->win[i], (size_t)(q % ch->Wd) * hd, l->window + (size_t)(q % W) * hd, (size_t)hd * sizeof(float));
+        }
+    }
+    for (int i = 0; i < L && ok; i++) {
+        int own = v41c_own(ch, i);
+        if (!c->kv_source[i] || (!own && !ch->ikey[i])) continue;
+        const Layer *l = &m->L[i];
+        int r = c->compress_ratio[i], ihd = c->index_head_dim, t0 = ch->kv_valid[i], t1 = need[i];
+        if (t1 > t0) ok = (!own || ch->ks.on || vkc_write(ch->ckv[i], (size_t)t0 * hd, l->ckv + (size_t)t0 * hd, (size_t)(t1 - t0) * hd * sizeof(float))) &&
+                          vkc_write(ch->ikey[i], (size_t)t0 * ihd, l->ikey + (size_t)t0 * ihd, (size_t)(t1 - t0) * ihd * sizeof(float));
+        if (!own) { if (ok && t1 > t0) ch->kv_valid[i] = t1; continue; }
+        if (ok && r > 1) ok = vkc_write(ch->ring[i], 0, l->cstate_kv, (size_t)r * hd * sizeof(float)) &&
+                              vkc_write(ch->ring[i], (size_t)r * hd, l->cstate_score, (size_t)r * hd * sizeof(float));
+    }
+    return ok;
+}
+/* What the host's state gets back after a forward from start to E, into pull at pc[] (each
+ * layer's window rows, pw floats, then its compressed rows, keys and group). In the open frame. */
+static int v41c_state_pull(V41Chain *ch, Model *m, int start, int E, const size_t *pc, size_t pw) {
+    const Cfg *c = &m->c;
+    int lo = ch->lo, hi = lo + ch->n, W = ch->W, hd = c->head_dim, ok = 1;
+    for (int i = lo; i < hi && ok; i++) {
+        int q0 = E - W > start ? E - W : start, nq = E - q0;
+        VkcRegion *rg = malloc((size_t)nq * sizeof *rg);
+        if (!rg) return 0;
+        for (int q = q0; q < E; q++) rg[q - q0] = (VkcRegion){pc[i] + (size_t)(q - q0) * hd, (size_t)(q % ch->Wd) * hd, (size_t)hd};
+        ok = vkc_copy_regions(ch->pull, ch->win[i], rg, nq);
+        free(rg);
+        if (!ok || !c->kv_source[i]) continue;
+        int r = c->compress_ratio[i], g0 = start / r, np = E / r - g0, ihd = c->index_head_dim, cw = ch->ks.on ? 0 : hd;
+        size_t at = pc[i] + pw;
+        ok = (cw == 0 || vkc_copy(ch->pull, at, ch->ckv[i], (size_t)g0 * hd, (size_t)np * hd)) &&
+             vkc_copy(ch->pull, at + (size_t)np * cw, ch->ikey[i], (size_t)g0 * ihd, (size_t)np * ihd) &&
+             (r <= 1 || vkc_copy(ch->pull, at + (size_t)np * (cw + ihd), ch->ring[i], 0, (size_t)2 * r * hd));
+    }
+    return ok;
+}
+/* A prompt of more than one chunk layer by layer: each layer's chunks in order through the
+ * attention, the FFN's mix and the shared expert, every row's streams and mixes kept on the
+ * device between layers, then the layer's routed experts for all its rows in one step, so
+ * the tier copies each streamed expert once a layer, not once a chunk (a 4104-token prompt
+ * of V4.1-Flash UD-IQ1_S at 512-row chunks copied 150 GiB of the host pool's experts), and
+ * then each chunk's FFN sum into its streams. The same ops on the same rows as chunk by
+ * chunk, in another order. Only a whole chain's plain prompt (no verify, no DSpark targets,
+ * no split compressed rows). COLI_VK_V41_LAYERWISE=0: chunk by chunk. 1 done, 0 not taken
+ * (nothing recorded), -1 a frame failed, -2 the prompt was stopped. */
+static int v41c_prompt_lw(Model *m, V41Chain *ch, const float *h, int n, int start, int all, int rows, V41Fwd *f,
+                          const int *need, const size_t *pc, size_t pw, float *cs_, int *wl, float *er, float *outs, float *pres) {
+    const Cfg *c = &m->c;
+    const int L = c->n_layers, D = c->dim, H = c->hc_mult, HD = H * D, hr = 2 * H + H * H, rd = c->rope_dim;
+    const int LR = ch->W + ch->K, E = start + n, T = m->spec.active ? c->n_spec_targets : 0;
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_V41_LAYERWISE"); on = !(e && *e == '0'); }
+    if (!on || f->spec || T || ch->lo != 0 || ch->n != L || ch->ks.on || n <= rows) return 0;
+    if (ch->lw_cap < (size_t)n) {
+        float *a = realloc(ch->lw_in, (size_t)n * D * sizeof(float)), *b = a ? realloc(ch->lw_out, (size_t)n * D * sizeof(float)) : NULL;
+        if (a) ch->lw_in = a;
+        if (b) ch->lw_out = b;
+        if (!a || !b) return 0;
+        ch->lw_cap = (size_t)n;
+    }
+    const int cand = v41c_cand_on(c), cs = c->candidate_source;
+    if (!v41c_res(&ch->lw_xs, (size_t)n * HD, VKC_DEV) || !v41c_res(&ch->lw_hp, (size_t)n * hr, VKC_DEV) ||
+        !v41c_res(&ch->lw_ds, (size_t)n * D, VKC_DEV) || !v41c_res(&ch->lw_list, (size_t)n * LR, VKC_DEV) ||
+        (cand && !v41c_res(&ch->lw_mask, (size_t)n * ch->wcap, VKC_DEV))) {
+        static int said;
+        if (!said++) fprintf(stderr, "[VK] %s chain: no device memory for a prompt of %d rows layer by layer; chunk by chunk\n", v41c_name(ch), n);
+        return 0;
+    }
+    float *hp0 = calloc((size_t)rows * hr, sizeof(float));
+    if (!hp0) return 0;
+    for (int s = 0; s < rows; s++) hp0[(size_t)s * hr] = 1.0f;   /* the first site collapses with [1, 0, ...] */
+    int ok = vkc_begin() && v41c_state_up(ch, m, start, need) && vkc_submit(1);
+    for (int c0 = 0; ok && c0 < n; c0 += rows) {   /* the rows' streams and their lists' window halves a chunk at a time */
+        int nr = n - c0 < rows ? n - c0 : rows;
+        v41c_chunk_tables(ch, m, start, start + c0, nr, f->csB, cs_, wl);
+        ok = vkc_begin() && vkc_write(ch->lw_xs, (size_t)c0 * HD, h + (size_t)c0 * HD, (size_t)nr * HD * sizeof(float)) &&
+             vkc_write(ch->lw_hp, (size_t)c0 * hr, hp0, (size_t)nr * hr * sizeof(float)) &&
+             vkc_write(ch->lw_list, (size_t)c0 * LR, wl, (size_t)nr * LR * sizeof(int)) && vkc_submit(1);
+    }
+    free(hp0);
+    if (!ok) return -1;
+    static int said_lw;
+    if (!said_lw++) fprintf(stderr, "[VK] %s chain: a prompt of more than one chunk layer by layer, each layer's routed experts in one step "
+                                    "(COLI_VK_V41_LAYERWISE=0: chunk by chunk)\n", v41c_name(ch));
+    for (int i = 0; i < L; i++) {
+        Layer *l = &m->L[i];
+        /* past the cross-layer source only the chunks of the prompt's tail (v41_prefill_tail) */
+        int first = 0;
+        if (m->ptail_rows > 0 && m->ptail_after < L - 1 && i > m->ptail_after)
+            while (first < n && first + (n - first < rows ? n - first : rows) <= n - m->ptail_rows) first += rows;
+        if (first >= n) continue;
+        double ta = now_s();
+        vkt_stream_prefetch(i, n - first);
+        for (int c0 = first; c0 < n; c0 += rows) {
+            if (coli_prompt_break()) return -2;
+            int nr = n - c0 < rows ? n - c0 : rows, pb = start + c0;
+            f->pb = pb; f->nr = nr;
+            v41c_chunk_tables(ch, m, start, pb, nr, f->csB, cs_, wl);
+            /* a chunk's rows keep, from one layer to the next, the selection the last index source made
+             * for them (the compressed layers after it attend to it) and the candidate source's mask:
+             * the chunk-by-chunk chain holds both for its chunk across the layers, here every chunk of a
+             * layer runs before the next layer */
+            const int sel = c->compress_ratio[i] > 0 && c->index_source[i];
+            ok = vkc_begin() && vkc_copy(ch->list, 0, ch->lw_list, (size_t)c0 * LR, (size_t)nr * LR) &&
+                 (!cand || !sel || cs >= i || vkc_copy(ch->mask, 0, ch->lw_mask, (size_t)c0 * ch->wcap, (size_t)nr * ch->wcap)) &&
+                 vkc_write(ch->cs, 0, cs_, (size_t)(f->csB + (nr + ch->rmax - 1) * rd) * sizeof(float)) &&
+                 vkc_copy(ch->xs, 0, ch->lw_xs, (size_t)c0 * HD, (size_t)nr * HD) &&
+                 vkc_copy(ch->hpf, 0, ch->lw_hp, (size_t)c0 * hr, (size_t)nr * hr);
+            if (ok && l->engram_index >= 0) ok = v41c_engram(ch, m, i, nr, pb, er);
+            ok = ok && v41c_pre(ch, m, ch->fna[i], ch->o_hca[i], ch->hpa, ch->hpf, ch->o_an[i], nr) &&
+                 v41c_attention(ch, m, i, f) &&
+                 (!sel || vkc_copy(ch->lw_list, (size_t)c0 * LR, ch->list, 0, (size_t)nr * LR)) &&
+                 (!cand || i != cs || vkc_copy(ch->lw_mask, (size_t)c0 * ch->wcap, ch->mask, 0, (size_t)nr * ch->wcap)) &&
+                 v41c_post(ch, m, ch->hpa, nr) &&
+                 v41c_pre(ch, m, ch->fnf[i], ch->o_hcf[i], ch->hpf, ch->hpa, ch->o_fn[i], nr) &&
+                 vkc_copy(ch->h2d, 0, ch->nrm, 0, (size_t)nr * D) && v41c_shared(ch, m, l, nr) &&
+                 vkc_copy(ch->lw_xs, (size_t)c0 * HD, ch->xs, 0, (size_t)nr * HD) &&
+                 vkc_copy(ch->lw_hp, (size_t)c0 * hr, ch->hpf, 0, (size_t)nr * hr) &&
+                 vkc_copy(ch->lw_ds, (size_t)c0 * D, ch->ds, 0, (size_t)nr * D) && vkc_submit(1);
+            if (!ok) return -1;
+            memcpy(ch->lw_in + (size_t)c0 * D, vkc_ptr(ch->h2d), (size_t)nr * D * sizeof(float));
+        }
+        m->t_attn += now_s() - ta;
+        double t1 = now_s();
+        moe_run_at(m, l, &m->cache[i], "layers", i, c->n_routed, c->n_activated, ch->lw_in + (size_t)first * D, n - first,
+                   ch->lw_out + (size_t)first * D, 0);
+        ch->host_ms += (now_s() - t1) * 1e3;
+        for (int c0 = first; c0 < n; c0 += rows) {   /* each chunk's FFN branch into its streams */
+            int nr = n - c0 < rows ? n - c0 : rows;
+            memcpy(vkc_ptr(ch->routed), ch->lw_out + (size_t)c0 * D, (size_t)nr * D * sizeof(float));
+            VkcEw add = {VKC_EW_ADD, nr * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
+            ok = vkc_begin() && vkc_copy(ch->xs, 0, ch->lw_xs, (size_t)c0 * HD, (size_t)nr * HD) &&
+                 vkc_copy(ch->hpf, 0, ch->lw_hp, (size_t)c0 * hr, (size_t)nr * hr) &&
+                 vkc_copy(ch->ds, 0, ch->lw_ds, (size_t)c0 * D, (size_t)nr * D) &&
+                 vkc_ew(ch->br, ch->routed, ch->ds, NULL, NULL, &add) && v41c_post(ch, m, ch->hpf, nr) &&
+                 vkc_copy(ch->lw_xs, (size_t)c0 * HD, ch->xs, 0, (size_t)nr * HD) && vkc_submit(1);
+            if (!ok) return -1;
+        }
+    }
+    /* the rows' streams and mixes (every row's, or the last's) and what the host's state gets back */
+    for (int c0 = 0; c0 < n; c0 += rows) {
+        int nr = n - c0 < rows ? n - c0 : rows, last = c0 + nr == n;
+        if (!all && !last) continue;
+        ok = vkc_begin() && vkc_copy(ch->xd, 0, ch->lw_xs, (size_t)c0 * HD, (size_t)nr * HD) &&
+             vkc_copy(ch->hpd, 0, ch->lw_hp, (size_t)c0 * hr, (size_t)nr * hr) &&
+             (!last || v41c_state_pull(ch, m, start, E, pc, pw)) && vkc_submit(1);
+        if (!ok) return -1;
+        const float *xd = (const float *)vkc_ptr(ch->xd), *hpd = (const float *)vkc_ptr(ch->hpd);
+        for (int s = 0; s < nr; s++) {
+            int t = c0 + s;
+            if (!all && t != n - 1) continue;
+            memcpy(outs + (size_t)(all ? t : 0) * HD, xd + (size_t)s * HD, (size_t)HD * sizeof(float));
+            memcpy(pres + (size_t)(all ? t : 0) * H, hpd + (size_t)s * hr, (size_t)H * sizeof(float));
+        }
+    }
+    return 1;
+}
 static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, int n, int start, int spec, int all, int *lost) {
     *lost = 0;
     Cfg *c = &m->c;
@@ -1104,7 +1366,13 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
         m->shared_topk_rows = n; m->shared_topk_width = list_w;
     }
     vkc_gemm_rows(spec ? 0 : -1);                          /* a verify's rows get a decode step's bits */
-    for (int c0 = 0; c0 < n; c0 += rows) {
+    const int lwr = v41c_prompt_lw(m, ch, h, n, start, all, rows, &f, need, pc, pw, cs_, wl, er, outs, pres);
+    if (lwr == -1) goto lost;
+    if (lwr == -2) {   /* stopped between two chunks (prompt_break.h), as below */
+        free(f.keyl); free(f.praw); free(need); free(outs); free(pres); free(wl); free(cs_); free(er); free(pc);
+        return 0;
+    }
+    for (int c0 = 0; lwr == 0 && c0 < n; c0 += rows) {
         /* a served prompt's STOP or CANCEL between two chunks (prompt_break.h): the caller
          * starts the state over, on the host and on the device (model_reset, v41c_reset) */
         if (coli_prompt_break()) {
@@ -1113,30 +1381,7 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
         }
         int nr = n - c0 < rows ? n - c0 : rows, pb = start + c0, last = c0 + nr == n;
         f.pb = pb; f.nr = nr;
-        /* this chunk's RoPE rows (the CPU's own tables): window ones at 0, compress ones at
-         * csB from position pb - rmax + 1 */
-        for (int s = 0; s < nr; s++) memcpy(cs_ + (size_t)s * rd, m->rope_window + (size_t)(pb + s) * rd, rd * sizeof(float));
-        for (int s = 0; s < nr + ch->rmax - 1; s++) {
-            int p = pb - ch->rmax + 1 + s;
-            float *dst = cs_ + f.csB + (size_t)s * rd;
-            if (p < 0) memset(dst, 0, rd * sizeof(float));
-            else memcpy(dst, m->rope_compress + (size_t)p * rd, rd * sizeof(float));
-        }
-        /* the window half of each row's list (window_idxs): the positions of the last
-         * `window` the row reaches, oldest first, as device ring rows; -1 where the CPU's
-         * ring does not hold the position (window_pos: the chain's first layer's, which
-         * holds what every layer held when the forward began; the layers before it have
-         * written theirs by now). The selection half starts empty. */
-        const Layer *l0 = &m->L[lo];
-        for (int s = 0; s < nr; s++) {
-            int p = pb + s;
-            for (int k = 0; k < W; k++) {
-                int q = p - W + 1 + k, e = -1;
-                if (q >= 0 && (q >= start || l0->window_pos[q % W] == q)) e = q % ch->Wd;
-                wl[(size_t)s * LR + k] = e;
-            }
-            for (int k = W; k < LR; k++) wl[(size_t)s * LR + k] = -1;
-        }
+        v41c_chunk_tables(ch, m, start, pb, nr, f.csB, cs_, wl);
         if (!vkc_begin() || !vkc_write(ch->xs, 0, h + (size_t)c0 * HD, (size_t)nr * HD * sizeof(float)) ||
             !vkc_write(ch->list, 0, wl, (size_t)nr * LR * sizeof(int)) ||
             !vkc_write(ch->cs, 0, cs_, (size_t)(f.csB + (nr + ch->rmax - 1) * rd) * sizeof(float))) goto lost;
@@ -1152,28 +1397,7 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
             free(hp0);
             if (!ok) goto lost;
         }
-        if (c0 == 0) {   /* the device's copies made the host's, as the forward needs them */
-            for (int q = ch->win_valid > start - W + 1 ? ch->win_valid : start - W + 1; q < start && ok; q++) {
-                if (q < 0) continue;
-                for (int i = lo; i < hi && ok; i++) {
-                    const Layer *l = &m->L[i];
-                    if (l->window_pos[q % W] != q) continue;
-                    ok = vkc_write(ch->win[i], (size_t)(q % ch->Wd) * hd, l->window + (size_t)(q % W) * hd, (size_t)hd * sizeof(float));
-                }
-            }
-            for (int i = 0; i < L && ok; i++) {
-                int own = v41c_own(ch, i);
-                if (!c->kv_source[i] || (!own && !ch->ikey[i])) continue;
-                const Layer *l = &m->L[i];
-                int r = c->compress_ratio[i], ihd = c->index_head_dim, t0 = ch->kv_valid[i], t1 = need[i];
-                if (t1 > t0) ok = (!own || ch->ks.on || vkc_write(ch->ckv[i], (size_t)t0 * hd, l->ckv + (size_t)t0 * hd, (size_t)(t1 - t0) * hd * sizeof(float))) &&
-                                  vkc_write(ch->ikey[i], (size_t)t0 * ihd, l->ikey + (size_t)t0 * ihd, (size_t)(t1 - t0) * ihd * sizeof(float));
-                if (!own) { if (ok && t1 > t0) ch->kv_valid[i] = t1; continue; }
-                if (ok && r > 1) ok = vkc_write(ch->ring[i], 0, l->cstate_kv, (size_t)r * hd * sizeof(float)) &&
-                                      vkc_write(ch->ring[i], (size_t)r * hd, l->cstate_score, (size_t)r * hd * sizeof(float));
-            }
-            if (!ok) goto lost;
-        }
+        if (c0 == 0 && !v41c_state_up(ch, m, start, need)) goto lost;   /* the device's copies made the host's */
         for (int i = 0; ch->ks.on && i < L && ok; i++) {   /* the split: each table's window over this chunk's new rows */
             if (ch->sli[i] < 0) continue;
             int r = c->compress_ratio[i], g0 = pb / r;
@@ -1241,22 +1465,7 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
         }
         ok = ok && vkc_copy(ch->xd, 0, ch->xs, 0, (size_t)nr * HD) && vkc_copy(ch->hpd, 0, ch->hpf, 0, (size_t)nr * hr) &&
              (list_out < 0 || vkc_copy(ch->ld, 0, ch->list, 0, (size_t)nr * LR));
-        if (ok && last) {                                  /* what the host's state gets back */
-            for (int i = lo; i < hi && ok; i++) {
-                int q0 = E - W > start ? E - W : start, nq = E - q0;
-                VkcRegion *rg = malloc((size_t)nq * sizeof *rg);
-                if (!rg) { ok = 0; break; }
-                for (int q = q0; q < E; q++) rg[q - q0] = (VkcRegion){pc[i] + (size_t)(q - q0) * hd, (size_t)(q % ch->Wd) * hd, (size_t)hd};
-                ok = vkc_copy_regions(ch->pull, ch->win[i], rg, nq);
-                free(rg);
-                if (!ok || !c->kv_source[i]) continue;
-                int r = c->compress_ratio[i], g0 = start / r, np = E / r - g0, ihd = c->index_head_dim, cw = ch->ks.on ? 0 : hd;
-                size_t at = pc[i] + pw;
-                ok = (cw == 0 || vkc_copy(ch->pull, at, ch->ckv[i], (size_t)g0 * hd, (size_t)np * hd)) &&
-                     vkc_copy(ch->pull, at + (size_t)np * cw, ch->ikey[i], (size_t)g0 * ihd, (size_t)np * ihd) &&
-                     (r <= 1 || vkc_copy(ch->pull, at + (size_t)np * (cw + ihd), ch->ring[i], 0, (size_t)2 * r * hd));
-            }
-        }
+        if (ok && last) ok = v41c_state_pull(ch, m, start, E, pc, pw);   /* what the host's state gets back */
         ok = ok && vkc_submit(1);
         if (!ok) goto lost;
         const float *xd = (const float *)vkc_ptr(ch->xd), *hpd = (const float *)vkc_ptr(ch->hpd);

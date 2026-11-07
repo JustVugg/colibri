@@ -2026,6 +2026,18 @@ static void test_ds_attn(int S, int H, int hd, int nwin, int ncmp, int cnt, int 
         CHECK(z, "dsv4 attn: a row with no entry is not zero");
     }
     printf("  dsv4 attn S %d H %d hd %d cnt %d flags %d: rel err %.2e\n", S, H, hd, cnt, flags, e);
+    if (S >= 8 && hd % 64 == 0) {   /* a prompt chunk's passes (chain_dsv4_pa.comp) against mode 0, bit for bit */
+        VkcBuf *o0 = vkc_buf((size_t)S * orow * 4, VKC_DEV);
+        setenv("COLI_VK_DSV4_PA", "0", 1);
+        vkc_begin(); int ok0 = vkc_dsv4_attn(qb, wb, cb, lb, sb, o0, &p); vkc_submit(1);
+        unsetenv("COLI_VK_DSV4_PA");
+        float *g0 = down(o0, 0, (size_t)S * orow);
+        int same = 1;
+        for (int s = 0; s < S; s++) same &= !memcmp(got + (size_t)s * orow + 2, g0 + (size_t)s * orow + 2, (size_t)H * hd * 4);
+        CHECK(ok0 && same, "dsv4 attn S %d H %d hd %d cnt %d flags %d: the prompt passes are not mode 0's bits", S, H, hd, cnt, flags);
+        printf("  dsv4 attn S %d H %d hd %d cnt %d flags %d: the prompt passes give mode 0's bits\n", S, H, hd, cnt, flags);
+        vkc_free(o0); free(g0);
+    }
     vkc_free(qb); vkc_free(wb); vkc_free(cb); vkc_free(sb); vkc_free(ob); vkc_free(lb);
     free(q); free(win); free(cmp); free(sink); free(ref); free(sc); free(list); free(kvall); free(got);
 }
@@ -3381,6 +3393,52 @@ static void test_matmul_bd(int t, int S, int I, int O) {
     coli_vk_tensor_free(tt); vkc_free(xb); vkc_free(yb);
     free(w); free(W); free(x); free(y); free(ref);
 }
+/* DeepSeek V4.1's wo_a as deepseek_v41_chain.h runs a GGUF's (v41c_wo_a): og groups of ol
+ * rows, each group's rows a matrix of its own in the file's blocks. One row multiplies its
+ * groups' slices in place; more rows go to group-major order (vkc_copy_regions), a GEMM a
+ * group, and back to [nr][og x ol]. Against the CPU's dequantized rows. */
+static void test_woa_groups(int t, int nr, int og, int ol, int I) {
+    int fmt = 100 + t, bl = GQ_TYPES[t].blck, by = GQ_TYPES[t].bytes, O = og * ol;
+    size_t rb = (size_t)gq_row_bytes(t, I);
+    uint8_t *w = malloc(rb * O); float *W = malloc((size_t)O * I * sizeof(float));
+    for (size_t i = 0; i < rb * O; i++) w[i] = (uint8_t)rnd();
+    for (int o = 0; o < O; o++) {
+        for (int b = 0; b < I / bl; b++) bd_fix(t, w + (size_t)o * rb + (size_t)b * by);
+        gq_dequant_row(t, w + (size_t)o * rb, W + (size_t)o * I, I);
+    }
+    float *x = fvec((size_t)nr * og * I, 1.f);
+    ColiVkTensor *tg[16] = {0};
+    int ok = og <= 16;
+    for (int g = 0; ok && g < og; g++) ok = coli_vk_tensor_ensure(&tg[g], w + (size_t)g * ol * rb, NULL, fmt, I, ol, 0);
+    VkcBuf *heads = up(x, (size_t)nr * og * I), *q = vkc_buf((size_t)nr * og * I * 4, VKC_DEV), *grp = vkc_buf((size_t)nr * O * 4, VKC_DEV);
+    VkcRegion *rg = malloc((size_t)nr * og * sizeof *rg);
+    vkc_moe_set_idot(0);   /* the float form, against the float dequantization */
+    ok = ok && vkc_begin();
+    if (ok && nr == 1) for (int g = 0; ok && g < og; g++) ok = vkc_matmul(tg[g], heads, (size_t)g * I, grp, (size_t)g * ol, 1);
+    else if (ok) {
+        for (int r = 0; r < nr; r++) for (int g = 0; g < og; g++)
+            rg[r * og + g] = (VkcRegion){(size_t)g * nr * I + (size_t)r * I, (size_t)r * og * I + (size_t)g * I, (size_t)I};
+        ok = vkc_copy_regions(q, heads, rg, nr * og);
+        for (int g = 0; ok && g < og; g++) ok = vkc_matmul(tg[g], q, (size_t)g * nr * I, heads, (size_t)g * nr * ol, nr);
+        for (int r = 0; r < nr; r++) for (int g = 0; g < og; g++)
+            rg[r * og + g] = (VkcRegion){(size_t)r * O + (size_t)g * ol, (size_t)g * nr * ol + (size_t)r * ol, (size_t)ol};
+        ok = ok && vkc_copy_regions(grp, heads, rg, nr * og);
+    }
+    ok = vkc_submit(1) && ok;
+    vkc_moe_set_idot(-1);
+    float *y = down(grp, 0, (size_t)nr * O), *ref = malloc((size_t)nr * O * sizeof *ref);
+    for (int r = 0; r < nr; r++) for (int o = 0; o < O; o++) {
+        int g = o / ol;
+        double a = 0; for (int i = 0; i < I; i++) a += (double)x[(size_t)r * og * I + (size_t)g * I + i] * W[(size_t)o * I + i];
+        ref[(size_t)r * O + o] = (float)a;
+    }
+    double e = relerr(y, ref, (size_t)nr * O, 1e-6);
+    CHECK(ok && !bad(y, (size_t)nr * O) && e < 3e-3, "wo_a groups %s rows %d, %d groups of %d x %d: err %.2e", gq_type_name(t), nr, og, ol, I, e);
+    printf("  wo_a groups %s rows %d, %d groups of %d x %d: err %.2e\n", gq_type_name(t), nr, og, ol, I, e);
+    for (int g = 0; g < og && g < 16; g++) coli_vk_tensor_free(tg[g]);
+    vkc_free(heads); vkc_free(q); vkc_free(grp);
+    free(w); free(W); free(x); free(y); free(ref); free(rg);
+}
 /* The dense GEMV in the CPU's integer form (chain_gemv_bd_i8: vkc_moe_set_idot(1)) against
  * gq_matmul's integer path (gq_quant_act's int8 rows, gq_dot's integer sums) */
 static void test_matmul_bd_i8(int t, int S, int I, int O) {
@@ -3431,6 +3489,10 @@ static void test_bd(void) {
         if ((int)k < nstep) { test_matmul_bd_i8(t, 1, 2560, 130); test_matmul_bd_i8(t, 3, 1280, 33); test_matmul_bd_i8(t, 4, 256, 70); }
     }
     printf("matmul_bd: %zu block types\n", sizeof types / sizeof *types);
+    /* DeepSeek V4.1's wo_a (Q6_K in unsloth's GGUFs): its groups' shape, one row and a chunk's */
+    test_matmul_bd(GQ_Q6_K, 1, 4096, 1024); test_matmul_bd(GQ_Q6_K, 40, 4096, 1024);
+    test_woa_groups(GQ_Q6_K, 1, 8, 1024, 4096); test_woa_groups(GQ_Q6_K, 24, 8, 1024, 4096);
+    test_woa_groups(GQ_Q6_K, 300, 4, 128, 512); test_woa_groups(GQ_Q4_K, 70, 8, 64, 256);
 }
 
 /* COLI_VK_CHAIN_BENCH=mla: the MLA attention core (vkc_mla_core: GLM-5.2/5.3's, Kimi K3's,
@@ -4473,6 +4535,10 @@ int main(int argc, char **argv) {
     else {
         test_ds_attn(1, 4, 64, 8, 5, 13, 0); test_ds_attn(3, 2, 512, 128, 40, 300, 0); test_ds_attn(2, 3, 100, 6, 9, 20, 0);
         test_ds_attn(2, 2, 64, 8, 12, 2900, 0); test_ds_attn(3, 4, 64, 8, 5, 13, 1);
+        /* a prompt chunk's rows (chain_dsv4_pa.comp): V4.1-Flash's 64 heads of 512, a window and
+         * 512 selected; heads past a group of 64, a list longer than a tile, bf16 roundings */
+        test_ds_attn(40, 64, 512, 128, 700, 640, 0); test_ds_attn(9, 70, 128, 8, 90, 200, 0);
+        test_ds_attn(12, 8, 64, 8, 40, 2900, 0); test_ds_attn(40, 64, 512, 128, 700, 640, 1);
         test_ds_rope(0); test_ds_rope(1);
         test_ds_compress(2, 0, 0); test_ds_compress(1, 0, 0); test_ds_compress(4, 0, 0); test_ds_compress(4, 1, 1);
         test_ds_compress(3, 0, 1);
