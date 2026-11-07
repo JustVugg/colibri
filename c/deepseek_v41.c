@@ -4495,7 +4495,9 @@ static void forward_batch(Model *m, const int *ids, int n, float *logits) {
  * reaches the answer only through those windows, W - 1 rows back a layer: with D layers
  * after it, the last D * (W - 1) + 1 rows give the last row and every window the next step
  * reads exactly as all the rows do (2414 of a prompt in V4.1: 19 layers, a window of 128).
- * The layers after it run on that tail only, with the same bits.
+ * The layers after it run on that tail only, with the same bits (on the Vulkan chain chunk by chunk;
+ * layer by layer, COLI_VK_V41_LAYERWISE, its routed experts' step over the tail's rows rounds
+ * apart from every row's in the last bits, the text the same).
  *
  * V41_PREFILL_TAIL=<rows> sets the tail instead: 140 is what DeepSeek serves with
  * (a window and its backtracking), below the exact tail

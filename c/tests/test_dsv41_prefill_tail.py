@@ -14,8 +14,14 @@ reads the list layer 3 published for every row of the prompt, as V4.1-Flash's la
 read layer 20's: the tail's rows must find their own lists in it, on the window ring's rows.
 
 On the Vulkan chain (DSV41_CHAIN=1, a VK=1 build: the deepseek-chain family runs it on
-Lavapipe) the same comparison runs with the chain on and chunks of 16 rows.
+Lavapipe) the same comparison runs with the chain on and chunks of 16 rows, chunk by chunk
+(COLI_VK_V41_LAYERWISE=0): the same bits. A prompt of more than one chunk runs layer by layer
+by default, each layer's routed experts for all its rows in one step of the tier, whose
+kernels follow the rows an expert gets (from 16 on the device's GEMM): the tail's 15 rows and
+every row's 200 then round apart in the last bits (2e-7 of the largest logit on an RTX PRO
+4000), the text the same. There the comparison is the text and the logits within 1e-5.
 """
+import array
 import json
 import os
 import shutil
@@ -54,12 +60,13 @@ def run(tail, dspark="0", snap=FIXTURE):
     return text, data, err
 
 
-def run_chain(tail, dspark="0", snap=FIXTURE):
+def run_chain(tail, dspark="0", snap=FIXTURE, layerwise="0"):
     with tempfile.TemporaryDirectory() as d:
         dump = os.path.join(d, "logits.bin")
         env = {"SNAP": str(snap), "SERVE": "1", "CTX": "256", "OMP_NUM_THREADS": "2",
                "V41_DSPARK": dspark, "COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "DUMP": dump, "V41_DSPARK_GATE": "0",
-               "COLI_VK_CHAIN_ROWS": "16"}   # chunks of 16 rows: the ones before the tail stop at layer 3
+               "COLI_VK_CHAIN_ROWS": "16",   # chunks of 16 rows: the ones before the tail stop at layer 3
+               "COLI_VK_V41_LAYERWISE": layerwise}
         if tail is not None:
             env["V41_PREFILL_TAIL"] = tail
         engine = ServeEngine(ENGINE, ["8"], env, reuse=False)
@@ -158,6 +165,22 @@ class PrefillTailChainTest(unittest.TestCase):
         self.assertGreater(len(dump), 0, err[-2000:])
         self.assertEqual(dump, dump_all)
         self.assertEqual(text, text_all)
+
+    def test_the_tail_on_the_layerwise_chain(self):
+        """layer by layer (the default): the text, and the logits within 1e-5 of the largest"""
+        for snap_of in (lambda d: FIXTURE, reused_list_fixture):
+            with tempfile.TemporaryDirectory() as d:
+                snap = snap_of(d)
+                text_all, dump_all, _ = run_chain("0", snap=snap, layerwise="1")
+                text, dump, err = run_chain(None, snap=snap, layerwise="1")
+            with self.subTest(snap=snap.name):
+                self.assertIn("[v41] prefill: the layers after layer 3 run on a prompt's last 15 rows", err)
+                self.assertEqual(text, text_all)
+                a, b = array.array("f", dump_all), array.array("f", dump)
+                self.assertGreater(len(a), 0, err[-2000:])
+                self.assertEqual(len(a), len(b))
+                largest = max(abs(v) for v in a)
+                self.assertLessEqual(max(abs(x - y) for x, y in zip(a, b)), 1e-5 * largest)
 
     def test_the_tail_on_the_chain_with_dspark(self):
         text_all, dump_all, _ = run_chain("0", dspark="1")
