@@ -88,6 +88,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   output at 4104 rows) the card did not have: 51 matrices stayed on the CPU. unsloth's UD-IQ1_S
   on an RTX PRO 4000: 21 GB of experts read, none left to the CPU, the 4104-token prompt
   5.75 -> 7.42-7.57 tok/s, the 523-token prompt 23.2 tok/s, the decode 5.97-6.03 tok/s.
+- **GLM-5.3: the routed experts read from the disk with `O_DIRECT`** (`G53_DIRECT`, on by
+  default; `0` reads them through the page cache as before). An expert read from the disk is
+  wanted once, and the expert tier's host pool leaves the page cache no room to keep it:
+  unsloth's GLM-5.3-Flash UD-IQ2_XXS on an RTX PRO 4000 with 62 GB of RAM, two 128-token
+  turns refaulted 54-55 GiB, and the compaction kswapd's reclaim kept up migrated the engine's
+  pages under its threads, a TLB shootdown on every core each time. The reads now land in the
+  slots straight from the drive. The same machine on the CUDA tier, two serves a side: decode
+  3.11-3.18 -> 3.54-3.71 tok/s on the first turn and 2.87-3.17 -> 4.40-4.55 on the second, the
+  523-token prompt 5.35-5.64 -> 5.89-6.14 tok/s, the host pool's pairs on the CPU 556-584 ->
+  439-450 us each, the warm start 23-30 -> 18 s.
 - **CUDA chain: a hyper-connection read's up projection and mix in one pass.** Qwen3.8's gated
   residuals read the four streams through a low-rank mix: the up projection's products (four times
   the hidden size a row, 84 MB a 2048-row chunk) went to memory and the mix read them back with the
