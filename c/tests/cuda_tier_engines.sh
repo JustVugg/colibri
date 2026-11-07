@@ -9,7 +9,7 @@
 set -u
 cd "$(dirname "$0")/.."
 PY=${PY:-python3}
-make -j"$(nproc)" glm53 deepseek_v41 mimo kimi_k3 CUDA=1 > cuda_tier_build.log 2>&1 || { tail cuda_tier_build.log; exit 1; }
+make -j"$(nproc)" glm53 deepseek_v41 mimo kimi_k3 colibri CUDA=1 > cuda_tier_build.log 2>&1 || { tail cuda_tier_build.log; exit 1; }
 [ -d glm53_stream-i4 ] || { $PY tools/make_glm53_tiny.py --output glm53_tiny --force > /dev/null &&
                              $PY tools/make_glm53_streaming_pair.py --fixture glm53_tiny --output glm53_stream > /dev/null; } || exit 1
 [ -d dsv41_tiny ] || $PY tools/make_dsv41_tiny.py --out dsv41_tiny --emit-ref dsv41_tiny/ref.json > /dev/null || exit 1
@@ -33,6 +33,16 @@ from test_gguf_import import write_deepseek41
 write_deepseek41("ds41_gguf_tiny.gguf", np.random.default_rng(3))
 PY
   $PY tools/gguf_import.py ds41_gguf_tiny.gguf ds41_gguf_tiny > /dev/null || exit 1
+fi
+if [ ! -d glm_gguf_tiny ]; then   # llama.cpp's glm-dsa (GLM-5.2, GLM-5.3), small (tests/test_gguf_import.py)
+  $PY - <<'PY' || exit 1
+import sys
+sys.path.insert(0, "tests")
+import numpy as np
+from test_gguf_import import write_glmdsa
+write_glmdsa("glm_gguf_tiny.gguf", np.random.default_rng(9))
+PY
+  $PY tools/gguf_import.py glm_gguf_tiny.gguf glm_gguf_tiny > /dev/null || exit 1
 fi
 fails=0
 ok() { echo "OK $*"; }
@@ -106,6 +116,42 @@ if [ -s v41g-cpu.txt ] && cmp -s v41g-cpu.txt v41g-cu.txt && [ "$d" -gt 0 ] && [
   ok "deepseek_v41 GGUF: tokens = CPU, device $d, $mats dense matrices on the card"
 else bad "deepseek_v41 GGUF (device $d, dense ${mats:-0})"; diff v41g-cpu.txt v41g-cu.txt | head -4; tail -3 v41g-cu.err; fi
 rm -f tier.usage
+
+# colibri (GLM-5.2, GLM-5.3) from a GGUF on the CUDA chain (colibri_cuchain.h): every layer on the card, the
+# experts on the tier as the file has them; the oracle's lines and the prompt's the CPU's, the logits within 1e-4
+# of the largest with the exact GEMMs (COLI_CUDA_TC_GEMM=0), 1e-3 on the tensor cores. The CPU's float form of the
+# file's blocks (GQ_EXACT=1) and a float32 KV cache on both sides (KV16=0: CUDA's own). The refs' tokens are none
+# the model makes: the gate compares the chain with the CPU. An 8-token prompt and a 40-token one, in one chunk or in
+# chunks of 3 and 5 (COLI_CUDA_GLM_ROWS); DSA_TOPK=4 turns the indexer's selection on from the fifth position,
+# DSA_FORCE=1 at every position. The dense part at 8 bits: the CPU's exact int8 kernel (IDOT=0: the integer one moves
+# the index scores, and four picks out of forty follow), no drafts (DRAFT=0: the two sides verify the same steps).
+echo '{"prompt_ids": [5, 6, 7, 8, 20, 21, 22, 23], "full_ids": [5, 6, 7, 8, 20, 21, 22, 23, 1, 2, 3, 4, 5, 6, 7, 8]}' > glm_gguf_tiny/ref.json
+$PY -c "import json; p=[(i*37+5)%290+2 for i in range(40)]; print(json.dumps({'prompt_ids': p, 'full_ids': p + [1, 2, 3, 4, 5, 6, 7, 8]}))" > glm_gguf_tiny/ref40.json
+gltok() { grep -aE '^GLM C engine|^PREFILL|^\[ORACLE\] mismatch' "$1" | sed 's/ | [0-9.]* pos\/s//'; }
+for v in "chain decode|1e-4|COLI_CUDA_TC_GEMM=0|64 16 16|ref" \
+         "chain decode, cap=1|1e-4|COLI_CUDA_TC_GEMM=0|1 16 16|ref" \
+         "chain DSA top-4, the dense part at 8 bits (the serve's: the indexer's F32 head weights in int8)|1e-4|COLI_CUDA_TC_GEMM=0 DSA_TOPK=4 DRAFT=0 IDOT=0|64 16 8|ref40" \
+         "chain 40-token prompt|1e-4|COLI_CUDA_TC_GEMM=0|64 16 16|ref40" \
+         "chain 40-token prompt in chunks of 3|1e-4|COLI_CUDA_TC_GEMM=0 COLI_CUDA_GLM_ROWS=3|64 16 16|ref40" \
+         "chain DSA top-4|1e-4|COLI_CUDA_TC_GEMM=0 DSA_TOPK=4|64 16 16|ref" \
+         "chain DSA top-4, 40-token prompt in chunks of 5|1e-4|COLI_CUDA_TC_GEMM=0 DSA_TOPK=4 COLI_CUDA_GLM_ROWS=5|64 16 16|ref40" \
+         "chain DSA_FORCE|1e-4|COLI_CUDA_TC_GEMM=0 DSA_FORCE=1|64 16 16|ref40" \
+         "chain 40-token prompt, tensor cores|1e-3|DSA_TOPK=4|64 16 16|ref40"; do
+  IFS='|' read -r tag tol envs cap ref <<< "$v"
+  G="SNAP=glm_gguf_tiny REF=glm_gguf_tiny/$ref.json GQ_EXACT=1 KV16=0 COLI_SPEC_GATE=0 USAGE_SAVE=0"
+  rm -f gl.usage gl-cpu.f32 gl-cu.f32
+  env $G $envs COLI_USAGE=gl.usage DUMP=gl-cpu.f32 ./colibri $cap > gl-cpu.log 2>&1
+  rm -f gl.usage
+  env $G $envs $X COLI_USAGE=gl.usage DUMP=gl-cu.f32 ./colibri $cap > gl-cu.log 2>&1
+  gltok gl-cpu.log > a.tok; gltok gl-cu.log > b.tok
+  fw=$(sed -n 's/^\[CUDA\] colibri chain: \([0-9][0-9]*\) forwards.*/\1/p' gl-cu.log | tail -1)
+  d=$(dev_count colibri gl-cu.log)
+  lg=$(lclose gl-cpu.f32 gl-cu.f32 "$tol"); lok=$?
+  if [ -s a.tok ] && cmp -s a.tok b.tok && [ "${fw:-0}" -gt 0 ] && [ "$d" -gt 0 ] && [ $lok = 0 ]; then
+    ok "colibri GGUF $tag: tokens = CPU, $lg, $fw chain forwards, device $d"
+  else bad "colibri GGUF $tag (${fw:-0} chain forwards, device $d, $lg)"; diff a.tok b.tok | head -4; tail -3 gl-cu.log; fi
+done
+rm -f gl.usage
 
 # mimo: the greedy tokens, MXFP4 experts with an f32 trunk and with the release's
 for bits in 32 0; do
