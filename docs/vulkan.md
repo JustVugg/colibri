@@ -2799,6 +2799,21 @@ DeepSeek V4/V4.1's indexer scores (`chain_dsv4`, modes 3 and 9) take the same gr
 (mode 10, the queries in shared memory or read where they are as modes 3 and 9 do): its 64
 heads of 128 over 2000 compressed columns 8.1 ms -> 141 us, over 8000 31.6 ms -> 470 us.
 `COLI_VK_DSA_GRID=0` keeps every row's scores in its own workgroup.
+A prompt chunk's scores are not one row but hundreds, and there the grid reads a row's keys
+once a row: mode 11 (`chain_dsv4_idx.comp`, `vkc_dsv4_score` from 16 rows, 32 columns, 128
+dims and an even head count) takes a tile of 16 rows x 32 compressed columns a workgroup,
+stages the tile's keys in shared memory once and each head pair's queries (2 x 16 x 128
+floats) after them, 32 KB in all. It is a module of its own because Vulkan sizes a module's
+workgroup memory: those 32 KB inside `chain_dsv4.comp` would leave every mode of it two
+workgroups a compute unit, and a device offering less than 32 KiB a workgroup keeps mode
+10's grid. The sums are in mode 10's order (i ascending, the heads ascending, the relu and
+the weight in order), so the two paths' scores are equal bit for bit and a selection cannot
+differ (`tests/test_vk_chain.c` holds it to memcmp). On an RX 6900 XT at V4.1 Flash's 32
+heads of 128: a 256-row chunk over 8192 unmasked 46.70 -> 3.56 ms (13.10x), 256 rows over
+65536 unmasked 445.42 -> 31.93 ms (13.95x), 2048 rows over 65536 with a candidate mask
+1633.09 -> 212.61 ms (7.68x); a tile of 16 rows over 65536 columns 23.31 -> 1.76 ms (13.26x). Below 16 rows (decode, a verify's few)
+the grid keeps its one-workgroup-a-row columns: at one row the tile costs more than it
+saves. `COLI_VK_DSA_TILED=0` keeps the grid for every row count.
 
 `make vk-chain-check VK=1` runs them against double-precision references of colibri.c's
 absorbed attention: every weight format both ways through the per-head blocks, RoPE in
@@ -2827,7 +2842,7 @@ of their own (`chain_dsv4.comp`), optional like the MLA ones:
 | `vkc_dsv4_attn` | the sparse attention of `sparse_attn.h`: per row a list of window rows, compressed rows and skipped entries; the sink in the denominator only, the value sum and the denominator in list order; optionally DeepSeek V4's roundings (the weights and the output to bf16) |
 | `vkc_dsv4_rope` | RoPE on interleaved pairs in place from a host table, forward or inverse (the attention output's un-rotation) |
 | `vkc_dsv4_compress` | the compressor's rolling group: each row's kv and score rows into the ring slot of its position, the per-channel softmax pooling when a group completes; DeepSeek V4's overlapping form (two halves, a position bias per slot) too |
-| `vkc_dsv4_score` | the indexer's scores: the relu-gated, head-weighted dot of each reachable compressed row, a candidate mask, -inf past the row's reach |
+| `vkc_dsv4_score` | the indexer's scores: the relu-gated, head-weighted dot of each reachable compressed row, a candidate mask, -inf past the row's reach; a chunk's rows in tiles of 16 x 32 (`chain_dsv4_idx`, mode 11) with the tile's keys staged once |
 | `vkc_dsv4_cand` | DeepSeek V4.1's candidate blocks: each block's best score, the newest block pinned, the best blocks kept whole |
 | `vkc_dsv4_topk` | the top-k of the CPU's selection (ties to the lower column), in column order (V4.1) or by rank (V4), padded with skipped entries |
 | `vkc_dsv4_engram` | DeepSeek V4.1's engram gate on the residual streams |
@@ -2838,7 +2853,11 @@ compressed rows with skipped entries and a row with none (within 1.1e-6 of the l
 output on Lavapipe), RoPE both ways, the compressor over three calls with its ring
 carried (ratios 1 to 4, the overlapping form with its bias, within 2e-6), the scores,
 the candidate mask and the top-k list slot for slot on scores exact in float on both
-sides, ties included, with and without a mask, and the engram gate (within 2e-6).
+sides, ties included, with and without a mask, and the engram gate (within 2e-6). The
+scores' two paths run on random floats at a tile's shapes (a tile, partial row and column
+tiles, V4's 64 heads, the fallbacks below 16 rows or 32 columns) and their buffers are
+`memcmp` for equal: the selection compares their bits, so a tolerance there would be a
+wrong pick.
 
 ## Big prompt chunks and expert streaming
 

@@ -323,6 +323,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   its rows of the PLE table (a GGUF's, on the disk) at its start, 0.75 ms a verify on the main
   thread. Each row's token is known one draft before: its rows are now asked of the OS then
   (`POSIX_FADV_WILLNEED`), and the verify finds them read.
+- **Vulkan: DeepSeek V4.1 Flash's and DeepSeek V4's indexer scores in tiles of rows**
+  (`chain_dsv4_idx.comp`, `COLI_VK_DSA_TILED`). A prompt chunk's scores went through mode 10's
+  column grid, a workgroup a row and eight columns: every row staged its own queries and walked
+  its own copy of the keys. A workgroup now holds a tile of 16 rows x 32 compressed columns,
+  stages the tile's keys in shared memory once (and a head pair's queries after it, 32 KB in
+  all, which is why it is a shader of its own), and every thread keeps two rows' dots in
+  registers. The sums are in mode 10's order and the scores are equal bit for bit
+  (`tests/test_vk_chain.c` holds the two paths to `memcmp`, the selection comparing raw bits),
+  so answers do not change. RX 6900 XT, 32 heads of 128: a 256-row chunk over 8192 unmasked
+  46.70 -> 3.56 ms (13.10x), 256 over 65536 unmasked 445.42 -> 31.93 ms (13.95x), 2048 over
+  65536 with a candidate mask 1633.09 -> 212.61 ms (7.68x). Below 16 rows, or on a device with
+  under 32 KiB of workgroup memory, the
+  grid keeps the work. `COLI_VK_DSA_TILED=0` keeps it everywhere ([docs/vulkan.md](docs/vulkan.md),
+  [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md)).
 
 ### Fixed
 
