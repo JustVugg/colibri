@@ -44,6 +44,27 @@ int main(void) {
     CHECK(root && root->t == J_STR);
     json_free(root);
 
+    /* Raw UTF-8 must represent shortest-form Unicode scalars. Truncated
+     * sequences at the document's terminator exercise the read boundary too. */
+    static const char *bad_utf8[] = {
+        "\"\x80\"", "\"\xc0\xaf\"", "\"\xe0\x80\xaf\"",
+        "\"\xed\xa0\x80\"", "\"\xf0\x80\x80\xaf\"",
+        "\"\xf4\x90\x80\x80\"", "\"\xf5\x80\x80\x80\"",
+        "\"\xff\"", "\"\xc2", "\"\xe2\x82", "\"\xf0\x90\x80"
+    };
+    for (size_t i = 0; i < sizeof(bad_utf8) / sizeof(bad_utf8[0]); i++)
+        CHECK(json_parse_checked(bad_utf8[i]) == NULL);
+    const char valid_utf8[] = "\"\xc2\x80\xdf\xbf\xe0\xa0\x80\xed\x9f\xbf"
+                              "\xee\x80\x80\xef\xbf\xbf\xf0\x90\x80\x80\xf4\x8f\xbf\xbf\"";
+    root = json_parse_checked(valid_utf8);
+    CHECK(root && root->t == J_STR);
+    CHECK(strlen(root->str) == sizeof(valid_utf8)-3);
+    CHECK(memcmp(root->str, valid_utf8+1, sizeof(valid_utf8)-3) == 0);
+    json_free(root);
+    root = json_parse("\"\xff\"", NULL);
+    CHECK(root && root->t == J_STR && (unsigned char)root->str[0] == 0xFF);
+    json_free(root);
+
     /* Checked key lookup must not alias a name through a decoded NUL. The
      * legacy API still returns its original permissive representation. */
     const char *nul_key="{\"x\\u0000ignored\":1}";
