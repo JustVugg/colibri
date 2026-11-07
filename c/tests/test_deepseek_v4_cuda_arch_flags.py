@@ -48,7 +48,7 @@ class DeepseekV4CudaArchFlagsTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self._tmp.name)
-        for pattern in ("Makefile.deepseek-v4*", "deepseek_v4.c", "*.h", "*.inc", "*.cu"):
+        for pattern in ("Makefile.deepseek-v4*", "deepseek_v4.c", "*.h", "*.inc", "*.cu", "*.cuh"):
             for src in C_DIR.glob(pattern):
                 shutil.copy(src, self.dir / src.name)
         self.nvcc = self.dir / "fake-nvcc.sh"

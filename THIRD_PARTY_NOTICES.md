@@ -85,3 +85,18 @@ not copy Swiftlet or huggingface_hub source code.
 emitted by Swiftlet's `scripts/verify_container.py`. They are new Python
 implementations with stricter path, transport, credential, resume, and digest
 validation; no Swiftlet source code is copied.
+
+## Naruto execution-kernel provenance
+
+The FP8 MMA lane mapping, 16-byte loads and deterministic split-K arrangement
+in `c/backend_cuda_dsv4_target.inc` are adapted from Naruto's
+`backend/cuda/cuda_quantized_mma.cuh`. Its vectorized FP4 expert GEMV also follows
+the loading layout in Naruto's `backend/cuda/cuda_quantized_gemm.cu`.
+
+Naruto (https://github.com/GeetoRinku/naruto) is a private repository without a
+published license. Those two files were written by SpringKill
+(https://github.com/springkill) and 0Chencc (https://github.com/0Chencc), who
+agreed to the adapted parts being contributed to colibri under the Apache
+License 2.0. The reference was Naruto's `2f63c38b` snapshot. Colibri supplies
+its own prepared-state ownership, activation interfaces, graph invalidation,
+speculative-prefix visibility and numerical tests.

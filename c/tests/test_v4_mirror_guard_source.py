@@ -43,14 +43,15 @@ class V4MirrorGuardSourceTest(unittest.TestCase):
         self.assertIn("grown_bytes = 0;", self.body[probe:close])
 
     def test_grown_mirrors_count_against_the_reserve(self):
-        self.assertRegex(self.body, r"grown_mb = \(grown_bytes \+ mirror_bytes")
+        # samebase M: #1766 keeps the guard state per cache (one per device)
+        self.assertRegex(self.body, r"grown_mb =\s*\(cache->grown_bytes \+ mirror_bytes")
         self.assertRegex(
             self.body,
-            r"cache->count >= 8 && last_free_mb - grown_mb < reserve_mb - margin_mb")
+            r"cache->count >= 8 &&\s*cache->last_free_mb - grown_mb < reserve_mb - margin_mb")
 
     def test_only_appended_slots_add_and_failures_clear(self):
         self.assertIn("found = cache->count++;\n            appended = 1;", self.body)
-        self.assertIn("if (appended) grown_bytes += mirror_bytes;", self.body)
+        self.assertIn("if (appended) cache->grown_bytes += mirror_bytes;", self.body)
         fail = find(self.body, "upload_failed = 1;")
         self.assertIn("grown_bytes = 0;", self.body[fail:fail + 80])
 
