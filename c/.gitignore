@@ -37,6 +37,8 @@ absorb_determinism_test
 cuda_fmt_trap_test
 cuda_dsv4c_test
 cuda_dsv4c_test.exe
+cuda_glm53c_test
+cuda_glm53c_test.exe
 tests/*.dSYM/
 tests/test_dsa_select
 tests/test_i4_grouped

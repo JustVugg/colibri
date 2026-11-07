@@ -1404,11 +1404,17 @@ cuda-chain-check: backend_cuda.o cuda_chain.o
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_chain.cu -o cuda_chain_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./cuda_chain_test$(EXE)
 	$(MAKE) cuda-dsv4c-check
+	$(MAKE) cuda-glm53c-check
 # DeepSeek V4.1's layer ops on the CUDA chain (cuda_dsv4c.cuh) against the CPU's references.
 cuda-dsv4c-check: backend_cuda.o cuda_chain.o
 	$(CC) $(filter-out -MMD -MP -fopenmp,$(CFLAGS)) -c tests/cuda_dsv4c_ref.c -o tests/cuda_dsv4c_ref.o
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_dsv4c.cu tests/cuda_dsv4c_ref.o -o cuda_dsv4c_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./cuda_dsv4c_test$(EXE)
+# GLM-5.3's layer ops on the CUDA chain (cuda_glm53c.cuh) against the CPU's references.
+cuda-glm53c-check: backend_cuda.o cuda_chain.o
+	$(CC) $(filter-out -MMD -MP -fopenmp,$(CFLAGS)) -ffp-contract=off -c tests/cuda_glm53c_ref.c -o tests/cuda_glm53c_ref.o
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_glm53c.cu tests/cuda_glm53c_ref.o -o cuda_glm53c_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	./cuda_glm53c_test$(EXE)
 
 hip-test:
 	$(MAKE) cuda-test HIP=1
@@ -1417,7 +1423,7 @@ hip-test:
 # host code. An ARM host with a card (DGX Spark, GH200, Jetson) builds it without the x86
 # SIMD kernels, so a name those alone define breaks only there; CI runs this at
 # ARCH=x86-64 (no AVX2) to see it on an x86 runner.
-CUDA_HOST_SRC = qwen38.c qwen36.c olmoe.c qwen36_tier.c backend_loader.c
+CUDA_HOST_SRC = qwen38.c qwen36.c olmoe.c qwen36_tier.c backend_loader.c glm53.c deepseek_v41.c
 cuda-host-syntax:
 	for f in $(CUDA_HOST_SRC); do $(CC) $(filter-out -MMD -MP,$(CFLAGS)) -fsyntax-only -DCOLI_CUDA $$f || exit 1; done
 
@@ -1427,6 +1433,8 @@ gpu-compile: backend_cuda.o cuda_chain.o
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_chain.cu -o cuda_chain_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	$(CC) $(filter-out -MMD -MP -fopenmp,$(CFLAGS)) -c tests/cuda_dsv4c_ref.c -o tests/cuda_dsv4c_ref.o
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_dsv4c.cu tests/cuda_dsv4c_ref.o -o cuda_dsv4c_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	$(CC) $(filter-out -MMD -MP -fopenmp,$(CFLAGS)) -ffp-contract=off -c tests/cuda_glm53c_ref.c -o tests/cuda_glm53c_ref.o
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_glm53c.cu tests/cuda_glm53c_ref.o -o cuda_glm53c_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_absorb_determinism.cu -o absorb_determinism_test$(EXE) $(GPU_TEST_LIBS)
