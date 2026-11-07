@@ -21,18 +21,30 @@ def _object(value, field):
     return value
 
 
+def _finite_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def _run(record, name):
     run = _object(record.get(name), name)
     config = _object(run.get("config"), f"{name}.config")
     samples = _object(run.get("samples"), f"{name}.samples")
     speeds = samples.get("tok_s")
     if (not isinstance(speeds, list) or len(speeds) < 3 or
-            any(isinstance(v, bool) or not isinstance(v, (int, float)) or
-                not math.isfinite(v) or v <= 0 for v in speeds)):
+            any(not _finite_number(v) or v <= 0 for v in speeds)):
         raise ValueError(f"{name}.samples.tok_s must contain at least 3 positive finite values")
     median = run.get("median_tok_s")
-    if (isinstance(median, bool) or not isinstance(median, (int, float)) or
-            not math.isclose(float(median), statistics.median(speeds), rel_tol=1e-6)):
+    try:
+        matches_median = (_finite_number(median) and
+                          math.isclose(median, statistics.median(speeds), rel_tol=1e-6))
+    except OverflowError:
+        matches_median = False
+    if not matches_median:
         raise ValueError(f"{name}.median_tok_s must equal the sample median")
     evidence = _object(run.get("evidence"), f"{name}.evidence")
     _text(evidence.get("uri"), f"{name}.evidence.uri")
