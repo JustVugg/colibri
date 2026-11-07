@@ -230,6 +230,15 @@ typedef struct { int S, pos_base, ratio, IH, ID, width, q_off, q_row, w_off, w_r
 typedef struct { int S, pos_base, ratio, width, block, topb, sc_row, mask_row, mask_off; } CcDsCand;   /* the mask a byte an entry */
 typedef struct { int S, width, topk, sc_row, l_off, l_row, base, order; } CcDsTopk;
 typedef struct { int S, H, D, kv_off, kv_row, x_off, x_row, qw_off, kw_off; float eps; } CcDsEngram;
+/* GLM-5.3's (and Kimi K3's) linear attention (cuda_glm53c.cuh), the Vulkan chain's vkc_kda_conv
+ * and vkc_kda_rec_flags with the same fields in the same order (vk_chain.h has their contract):
+ * the short convolution's window and the recurrence's state on the device across calls; from
+ * CC_KDA_ROWS rows the recurrence takes a block of rows at a time with the same bits. KD 64 or
+ * 128, VD <= 128; flags as VKC_KDA_EXP_A (1) and VKC_KDA_K3 (2). */
+#define CC_KDA_ROWS 8
+typedef struct { int S, C, K, P, in_off, in_row, in_part, out_off, out_row, w_off, win_off; } CcKdaConv;
+typedef struct { int S, H, VD, P, m_off, m_row, f_off, f_row, b_off, b_row, g_off, g_row, y_off, y_row, st_off, prm_off;
+                 float lb, neps, eps; } CcKdaRec;
 
 typedef struct ColiCudaChainOps {
     size_t size;
@@ -381,6 +390,9 @@ typedef struct ColiCudaChainOps {
     int  (*ds_cand)(CcBuf *sc, CcBuf *mask, const CcDsCand *p);
     int  (*ds_topk)(CcBuf *sc, CcBuf *list, const CcDsTopk *p);
     int  (*ds_engram)(CcBuf *kv, CcBuf *prm, CcBuf *x, const CcDsEngram *p);
+    /* GLM-5.3's layer ops (cuda_glm53c.cuh) */
+    int  (*kda_conv)(CcBuf *in, CcBuf *w, CcBuf *win, CcBuf *out, const CcKdaConv *p);
+    int  (*kda_rec)(int KD, CcBuf *m, CcBuf *f, CcBuf *b, CcBuf *g, CcBuf *prm, CcBuf *st, CcBuf *y, const CcKdaRec *p, int flags);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -484,6 +496,17 @@ static inline int cc_ds_cand(CcBuf *sc, CcBuf *mask, const CcDsCand *p) { return
 static inline int cc_ds_topk(CcBuf *sc, CcBuf *list, const CcDsTopk *p) { return cc_dsv4_ready() ? cc_ops()->ds_topk(sc, list, p) : 0; }
 static inline int cc_ds_engram(CcBuf *kv, CcBuf *prm, CcBuf *x, const CcDsEngram *p) {
     return cc_dsv4_ready() ? cc_ops()->ds_engram(kv, prm, x, p) : 0;
+}
+/* GLM-5.3's layer ops: the module has them */
+static inline int cc_glm53_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, kda_rec) + sizeof t->kda_rec && t->kda_rec;
+}
+static inline int cc_kda_conv(CcBuf *in, CcBuf *w, CcBuf *win, CcBuf *out, const CcKdaConv *p) {
+    return cc_glm53_ready() ? cc_ops()->kda_conv(in, w, win, out, p) : 0;
+}
+static inline int cc_kda_rec(int KD, CcBuf *m, CcBuf *f, CcBuf *b, CcBuf *g, CcBuf *prm, CcBuf *st, CcBuf *y, const CcKdaRec *p, int flags) {
+    return cc_glm53_ready() ? cc_ops()->kda_rec(KD, m, f, b, g, prm, st, y, p, flags) : 0;
 }
 /* the chain's and the backend's kernels loaded now where the backend can (an older one loads them
  * at their first launch) */
