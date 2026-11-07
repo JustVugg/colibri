@@ -581,6 +581,9 @@ int vkc_situ(VkcBuf *g, VkcBuf *u, VkcBuf *y, const VkcSitu *p);
  *                     key[j]; every other j < width scores -inf; into sc[sc_off + s*sc_row
  *                     + j]. IH <= 4096; IH <= 64 and IH*ID <= 4096 stage the queries in
  *                     shared memory, larger ones read them from memory (the same sums).
+ *                     Rows from 16 (chain_dsv4_idx.comp, mode 11) take tiles of 16 rows x
+ *                     32 columns when ID is 128 and IH is even: the tile's keys staged
+ *                     once, the same bits (tests/test_vk_chain.c compares them).
  *   vkc_dsv4_cand     the candidate blocks: per row, each block's best score, the block of
  *                     column lens - 1 pinned, then the best min(topb, blocks) blocks (the
  *                     lower on a tie), mask 1 on their columns. At most 4096 blocks.
@@ -891,6 +894,7 @@ typedef struct {
     unsigned long long moe_gv;         /* routed-expert decode steps in our formats on chain_moe_gv.comp */
     unsigned long long tile_wide;      /* of the tile GEMMs, a GGUF's on 128 x 128 tiles (qmatmul_gemm_bdcw.comp) */
     unsigned long long grp_wide;       /* of the grouped expert GEMMs, those at the wider item (qmatmul_grp*_bdcw.comp) */
+    unsigned long long dsa_tiled;      /* DeepSeek V4's indexer scores in tiles of rows (chain_dsv4_idx.comp, mode 11) */
 } VkcStats;
 void vkc_stats(VkcStats *st);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */

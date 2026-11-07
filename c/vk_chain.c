@@ -2286,6 +2286,13 @@ static int dsa_grid_on(void) {   /* COLI_VK_DSA_GRID=0: every row's scores in it
     if (on < 0) { const char *e = getenv("COLI_VK_DSA_GRID"); on = !(e && *e == '0'); }
     return on;
 }
+/* COLI_VK_DSA_TILED=0: DeepSeek V4.1 Flash's and DeepSeek V4's indexer scores on mode
+ * 10's column grid instead of chain_dsv4_idx.comp's tiles. Read a call so a test can take
+ * both paths in one process. */
+static int dsa_tiled_on(void) {
+    const char *e = getenv("COLI_VK_DSA_TILED");
+    return !(e && *e == '0');
+}
 int vkc_dsa_select(VkcBuf *iq, VkcBuf *hw, VkcBuf *keys, VkcBuf *sc, VkcBuf *sel, const VkcDsa *p) {
     KC.kind = PK_DSA;
     if (!KC.mla_ok || p->S < 1 || p->S > 65535 || p->IH < 1 || p->IH > 64 || p->ID < 1 || p->IH * p->ID > 4096 ||
@@ -3707,6 +3714,12 @@ void vkc_shutdown(void) {
  * Its own optional pipeline: without the shader only these ops decline. */
 static struct { VkShaderModule mod; VkPipeline pipe; } g_d4[2];
 #define D4 (g_d4[g_kd])
+/* And the indexer's tiles (chain_dsv4_idx.comp, mode 11) on a pipeline of their own: a
+ * workgroup's shared memory is sized a module, and its 32 KB would leave every mode of
+ * chain_dsv4.spv two workgroups a compute unit. Optional as D4 is: without it, mode 10. */
+static struct { VkShaderModule mod; VkPipeline pipe; } g_d4i[2];
+#define D4I (g_d4i[g_kd])
+#define DSV4_IDX_SHARED 32768u   /* its key tile (32 x 128 floats) and query pair (2 x 16 x 128) */
 static void dsv4_init(void) {
     char path[1200];
     size_t pre = dir_prefix(KC.core.spv_path);
@@ -3717,8 +3730,14 @@ static void dsv4_init(void) {
     if (!f) return;
     fclose(f);
     if ((D4.mod = load_module(KC.core.spv_path, file))) D4.pipe = make_pipe(D4.mod, NULL);
+    if (kc_shared_limit() >= DSV4_IDX_SHARED &&
+        (D4I.mod = load_module(KC.core.spv_path, "chain_dsv4_idx.spv")))
+        D4I.pipe = make_pipe(D4I.mod, NULL);
 }
 static void dsv4_shutdown(void) {
+    if (D4I.pipe) vkDestroyPipeline(KC.dev, D4I.pipe, NULL);
+    if (D4I.mod) vkDestroyShaderModule(KC.dev, D4I.mod, NULL);
+    memset(&D4I, 0, sizeof D4I);
     if (D4.pipe) vkDestroyPipeline(KC.dev, D4.pipe, NULL);
     if (D4.mod) vkDestroyShaderModule(KC.dev, D4.mod, NULL);
     memset(&D4, 0, sizeof D4);
@@ -3727,12 +3746,16 @@ int vkc_dsv4_ready(void) { return vkc_ready() && D4.pipe; }
 
 /* the shader reads one block of 32 words: the mode, then the op's fields */
 typedef struct { int mode; int w[31]; } Dsv4PC;
-static int dsv4_rec(int kind, int mode, const void *b, size_t bytes, VkcBind *bd, int nb, uint32_t gx, uint32_t gy) {
-    if (!D4.pipe || !open_frame() || KC.lost || bytes > sizeof(int) * 31) return 0;
+static int dsv4_rec_on(VkPipeline pipe, int kind, int mode, const void *b, size_t bytes, VkcBind *bd, int nb,
+                       uint32_t gx, uint32_t gy) {
+    if (!pipe || !open_frame() || KC.lost || bytes > sizeof(int) * 31) return 0;
     Dsv4PC pc; memset(&pc, 0, sizeof pc);
     pc.mode = mode; memcpy(pc.w, b, bytes);
     KC.kind = kind;
-    return record(D4.pipe, bd, nb, &pc, sizeof pc, gx, gy, 1);
+    return record(pipe, bd, nb, &pc, sizeof pc, gx, gy, 1);
+}
+static int dsv4_rec(int kind, int mode, const void *b, size_t bytes, VkcBind *bd, int nb, uint32_t gx, uint32_t gy) {
+    return dsv4_rec_on(D4.pipe, kind, mode, b, bytes, bd, nb, gx, gy);
 }
 int vkc_dsv4_attn(VkcBuf *q, VkcBuf *win, VkcBuf *cmp, VkcBuf *list, VkcBuf *prm, VkcBuf *out, const VkcDsAttn *p) {
     if (p->S < 1 || p->S > 65535 || p->H < 1 || p->H > 65535 || p->hd < 1 || p->hd > 1024 || p->cnt < 0 || p->cnt > 3072)
@@ -3762,6 +3785,15 @@ int vkc_dsv4_score(VkcBuf *iq, VkcBuf *hw, VkcBuf *keys, VkcBuf *mask, VkcBuf *s
         p->width < 0 || p->sc_row < p->width || (p->mask_row > 0 && !mask)) return 0;
     if (p->width == 0) return open_frame() && !KC.lost;
     VkcBind bd[6] = {B(iq, 0), B(hw, 0), B(keys, 0), B(p->mask_row > 0 ? mask : NULL, 0), B(NULL, 0), B(sc, 1)};
+    /* rows to make a tile: the scores in tiles of 16 rows x 32 candidates (mode 11, the
+     * same bits as mode 10's grid), the keys staged once a tile instead of once a row */
+    if (dsa_grid_on() && dsa_tiled_on() && D4I.pipe && p->ID == 128 && !(p->IH & 1) && p->S >= 16 &&
+        p->width >= VKC_DSA_GRID) {
+        int ok = dsv4_rec_on(D4I.pipe, PK_DSA, 11, p, sizeof *p, bd, 6, (uint32_t)((p->width + 31) / 32),
+                             (uint32_t)((p->S + 15) / 16));
+        if (ok) KC.st.dsa_tiled++;
+        return ok;
+    }
     /* many columns: on a grid of 256 / IH columns a workgroup (mode 10, the same bits) */
     if (dsa_grid_on() && p->IH <= 256 && p->width >= VKC_DSA_GRID) {
         int P = 256 / p->IH;
