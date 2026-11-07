@@ -326,6 +326,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **GLM-5.3 from unsloth's GGUF: the shared indexer layers reuse the full layer's selection, as
+  the model has them.** GLM-5.3 computes the DSA indexer's top-k on 21 of its 78 layers (zai-org's
+  config.json: `indexer_types`, one full layer every `index_topk_freq`) and the shared layers
+  between them reuse its selection. unsloth's files hold a shared layer's indexer weights as a
+  copy of the full layer's, and `tools/gguf_import.py` read every layer whose weights are in the
+  file as full: past `index_topk` (2048) context tokens each layer selected again from its own
+  rows. The import now reads a layer whose indexer is the layer before's byte for byte as shared,
+  and the engine finds such copies in a folder imported before, which needs no new import
+  (`[DSA] N layers hold the indexer of the layer before as a copy`). The 57 copies are no longer
+  loaded either.
+
 - **`chat_template_kwargs` reaches the chat template** (`coli serve`). Many OpenAI-compatible
   clients turn a Qwen model's thinking off with `"chat_template_kwargs": {"enable_thinking":
   false}`, and the gateway ignored the field: a Qwen3.8 request that asked for no thinking this

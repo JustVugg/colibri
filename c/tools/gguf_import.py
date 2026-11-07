@@ -548,11 +548,38 @@ def glm5next_config(meta, tensors, overrides=None):
     return {"architectures": ["Glm5NextForConditionalGeneration"], "model_type": "glm5_next", "text_config": text}, layers
 
 
+def glmdsa_shared(tensors, readers, layers):
+    """Each layer's indexer as the model has it: its own ("full") where its weights are in the
+    file and not the layer before's byte for byte. unsloth's GLM-5.3 files hold a shared layer's
+    weights as a copy of the full layer's it reuses (zai-org's config: indexer_types, the full
+    layers every index_topk_freq), and such a layer reuses that layer's selection ("shared")."""
+    full = [f"blk.{i}.indexer.attn_q_b.weight" in tensors for i in range(layers)]
+    if not readers:
+        return full
+
+    def blob(i):
+        out = []
+        for k in ("attn_k.weight", "proj.weight", "k_norm.weight"):
+            t = tensors.get(f"blk.{i}.indexer.{k}")
+            if t is None:
+                return None
+            out.append(readers[t["part"]].read_tensor(t))
+        return out
+    prev = blob(0) if full[0] else None
+    for i in range(1, layers):
+        cur = blob(i) if full[i] else None
+        if cur is not None and cur == prev:
+            full[i] = False
+        prev = cur
+    return full
+
+
 def glmdsa_config(meta, tensors, overrides=None):
     """GLM-5.2 / GLM-5.3 (llama.cpp's glm-dsa) as the colibri engine's config.json, the shape
     of zai-org's (GlmMoeDsaForCausalLM). The NextN block counts in block_count only where the
-    file holds it; a layer whose indexer weights are in the file indexes on its own ("full"),
-    one without reuses the previous selection ("shared")."""
+    file holds it; a layer whose indexer weights are in the file, and not a copy of the layer
+    before's (overrides["readers"] reads them: glmdsa_shared), indexes on its own ("full"), one
+    without reuses the previous selection ("shared")."""
     p = "glm-dsa."
     need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
     blocks = int(need("block_count"))
@@ -585,7 +612,7 @@ def glmdsa_config(meta, tensors, overrides=None):
         "max_position_embeddings": int(meta.get(p + "context_length", 202752)),
         "index_topk": int(need("attention.indexer.top_k")), "index_n_heads": int(need("attention.indexer.head_count")),
         "index_head_dim": int(need("attention.indexer.key_length")),
-        "indexer_types": ["full" if f"blk.{i}.indexer.attn_q_b.weight" in tensors else "shared" for i in range(layers)],
+        "indexer_types": ["full" if f else "shared" for f in glmdsa_shared(tensors, (overrides or {}).get("readers"), layers)],
         "num_nextn_predict_layers": nextn if has_mtp else 0,
         "tie_word_embeddings": "output.weight" not in tensors,
         "bos_token_id": meta.get("tokenizer.ggml.bos_token_id"), "eos_token_id": meta.get("tokenizer.ggml.eos_token_id"),
@@ -1428,7 +1455,8 @@ def main():
         sys.exit(f"architecture {arch!r} is not supported yet (supported: {', '.join(ARCHES)})")
     if args.mode == "copy" and arch in COPY_UNREAD:
         sys.exit(f"--mode copy: the {arch} engine reads its GGUF in place only; --mode link (lossless, no copy) is the way")
-    cfg, layers = ARCHES[arch](meta, tensors, {"indexer_compress_ratio": args.indexer_compress_ratio})
+    cfg, layers = ARCHES[arch](meta, tensors, {"indexer_compress_ratio": args.indexer_compress_ratio,
+                                               "readers": None if os.environ.get("GGUF_CHECK") else readers})
     mtp_file, mtp_where = None, None
     if arch == "qwen4exp" and not args.no_mtp:
         if f"blk.{layers}.nextn.eh_proj.weight" in tensors:
