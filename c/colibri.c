@@ -2570,6 +2570,27 @@ static int qt_load_mmap(Model *m, const char *name, int O, int I, QT *t){
  * its bytes in what cud_open is asked for */
 static void qt_cud_mark(QT *t){ if(t->fmt==QT_GGML){ t->cud_dense=1; g_cud_dense_bytes+=(size_t)qt_bytes(t); } }
 #endif
+/* layers a and b of a GGUF hold the same DSA indexer, its key projection, head weights and key
+ * norm byte for byte (a GGUF only: a checkpoint's are its own) */
+static int dsa_same_indexer(Model *m, int a, int b){
+    static const char *const part[3]={"wk.weight","weights_proj.weight","k_norm.weight"};
+    for(int k=0;k<3;k++){
+        char na[300], nb[300];
+        snprintf(na,sizeof na,"model.layers.%d.self_attn.indexer.%s",a,part[k]);
+        snprintf(nb,sizeof nb,"model.layers.%d.self_attn.indexer.%s",b,part[k]);
+        st_tensor *ta=st_find(&m->S,na), *tb=st_find(&m->S,nb);
+        if(!ta || !tb || ta->dtype!=tb->dtype || ta->nbytes!=tb->nbytes || ta->nbytes<1) return 0;
+        if(k==0 && !st_is_ggml(ta->dtype)) return 0;
+        if(ta->fd==tb->fd && ta->off==tb->off) continue;
+        char *x=malloc((size_t)ta->nbytes), *y=malloc((size_t)tb->nbytes);
+        if(!x || !y){ free(x); free(y); return 0; }
+        st_pread_full(ta->fd,x,ta->nbytes,ta->off,na); st_pread_full(tb->fd,y,tb->nbytes,tb->off,nb);
+        const int same=!memcmp(x,y,(size_t)ta->nbytes);
+        free(x); free(y);
+        if(!same) return 0;
+    }
+    return 1;
+}
 static QT qt_load(Model *m, const char *name, int O, int I, int bits){
     QT t; memset(&t,0,sizeof(t)); qt_from_disk(m,name,O,I,bits,0,&t);
 #ifdef COLI_VULKAN
@@ -3046,6 +3067,18 @@ static void model_init_range(Model *m, const char *snap, int cap,
             if(!st_has(&m->S,inm)) m->has_dsa=0;
         }
         if(getenv("DSA") && atoi(getenv("DSA"))==0) m->has_dsa=0;
+        /* unsloth's GLM-5.3 GGUFs hold a shared indexer layer's weights as a copy of the full
+         * layer's it reuses (the model's config.json: indexer_types, index_topk_freq), and a
+         * folder imported before tools/gguf_import.py told the two apart reads every layer as
+         * full: each would select again from its own rows where the model reuses the full
+         * layer's selection. A layer whose indexer is the layer before's byte for byte reuses
+         * its selection, as the model has it. */
+        if(m->has_dsa && !c->ml4){
+            int dup=0;
+            for(int i=layer_begin+1;i<layer_end;i++) if(c->idx_type[i] && dsa_same_indexer(m,i-1,i)){ c->idx_type[i]=0; dup++; }
+            if(dup) fprintf(stderr,"[DSA] %d layers hold the indexer of the layer before as a copy: they reuse its selection, "
+                                   "as the model's indexer_types has them\n",dup);
+        }
         if(m->has_dsa){
             m->ix_wq=calloc(c->n_layers,sizeof(QT)); m->ix_wk=calloc(c->n_layers,sizeof(QT));
             m->ix_wp=calloc(c->n_layers,sizeof(QT));
