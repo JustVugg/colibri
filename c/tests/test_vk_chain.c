@@ -249,6 +249,23 @@ static void test_chunk_rows(void) {
 }
 
 /* ---- attention ---------------------------------------------------------------------- */
+/* chain_attnb's pipelines with the head dims fixed (by default with Xe2 under ANV and on
+ * Lavapipe, anywhere with COLI_VK_ATTN_BLOCK_FIXED=1) give its generic pipeline's bits:
+ * fixed_off() switches to the generic one for a rerun (0 when the variable keeps them off:
+ * nothing to compare), and fixed_back() restores the setting. */
+static int g_fixed_set;
+static int fixed_off(void) {
+    const char *e = getenv("COLI_VK_ATTN_BLOCK_FIXED");
+    if (e && *e && strcmp(e, "1")) return 0;
+    g_fixed_set = e && *e;
+    setenv("COLI_VK_ATTN_BLOCK_FIXED", "0", 1);
+    return 1;
+}
+static void fixed_back(void) {
+    if (g_fixed_set) setenv("COLI_VK_ATTN_BLOCK_FIXED", "1", 1);
+    else unsetenv("COLI_VK_ATTN_BLOCK_FIXED");
+}
+
 /* a verify's S rows: each the bits of a decode step of that row alone (chain_attn_dec.comp's
  * blocks from each row's own positions, the rows before VKC_ATTN_DEC_MIN as theirs run) */
 static void test_attn_rows_bits(int S, int pos_base, int H, int KVH, int hd) {
@@ -317,6 +334,16 @@ static void test_attn_hk(int S, int pos_base, int H, int KVH, int hd, int use_li
     double tol = fl > 0 && S >= fl && !use_list && hd % 64 == 0 && 64 % (H / KVH) == 0 ? 2e-3 : 2e-5;
     CHECK(ok && e < tol, "attn S %d pos %d H %d/%d hd %d list %d (block from %d, flash from %d): err %.2e", S, pos_base, H, KVH, hd,
           use_list, vkc_attn_block_rows(), fl, e);
+    if (S >= 16 && fixed_off()) {
+        size_t bytes = (size_t)S * H * hd * sizeof(float);
+        float *was = malloc(bytes); memcpy(was, o, bytes);
+        vkc_begin(); ok = vkc_attn(qb, kb, vb, ob, qb, lb, &p);
+        ok = vkc_submit(1) && ok;
+        fixed_back();
+        CHECK(ok && memcmp(was, vkc_ptr(ob), bytes) == 0, "attn S %d pos %d H %d/%d hd %d list %d: the generic blocked pipeline "
+              "changed bytes", S, pos_base, H, KVH, hd, use_list);
+        free(was);
+    }
     vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(ob); vkc_free(lb);
     free(q); free(kc); free(vc); free(sel); free(ref);
 }
@@ -457,33 +484,49 @@ static void test_attn_win(int S, int pos_base, int H, int KVH, int hd, int vd, i
         ok = vkc_submit(1) && ok;
         CHECK(ok && memcmp(whole, vkc_ptr(ob), bytes) == 0,
               "attention slices changed bytes S %d H %d/%d win %d sink %d", S, H, KVH, win, sink);
-        unsetenv("COLI_VK_ATTN_SLICE"); free(whole);
+        unsetenv("COLI_VK_ATTN_SLICE");
+        if (fixed_off()) {
+            vkc_begin(); ok = vkc_attn_w(qb, kb, vb, ob, NULL, NULL, sink ? sb : NULL, &p);
+            ok = vkc_submit(1) && ok;
+            fixed_back();
+            CHECK(ok && memcmp(whole, vkc_ptr(ob), bytes) == 0, "attention's generic blocked pipeline changed bytes S %d hd %d vd %d "
+                  "win %d ring %d sink %d pm %d", S, hd, vd, win, ring, sink, kv_pm);
+        }
+        free(whole);
     }
     vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(sb); vkc_free(ob);
     free(q); free(kc); free(vc); free(snk); free(ref);
 }
 
 /* A float16 KV cache (vkc_attn_wh): K and V of float16 values in halves give the bits of a
- * float32 cache of the same values, on the path the call takes (the counters say which) */
-static void test_attn_kvh(int S, int pos_base, int H, int KVH, int hd, int win, int ring, int sink) {
+ * float32 cache of the same values, on the path the call takes (the counters say which); V's
+ * head dim vd (the output's too) */
+static void test_attn_kvh(int S, int pos_base, int H, int KVH, int hd, int vd, int win, int ring, int sink) {
     int rows = ring ? ring : pos_base + S + 3, koff = 32, voff = 16;
-    size_t kn = (size_t)koff + (size_t)rows * KVH * hd, vn = (size_t)voff + (size_t)rows * KVH * hd;
+    size_t kn = (size_t)koff + (size_t)rows * KVH * hd, vn = (size_t)voff + (size_t)rows * KVH * vd;
     float *q = fvec((size_t)S * H * hd, 1.f), *kc = fvec(kn, 1.f), *vc = fvec(vn, 1.f), *snk = fvec(H + 5, 2.f);
     kv16_round(kc, (int64_t)kn); kv16_round(vc, (int64_t)vn);
     uint16_t *kh = malloc(kn * 2), *vh = malloc(vn * 2);
     kv16_pack(kh, kc, (int64_t)kn); kv16_pack(vh, vc, (int64_t)vn);
     VkcBuf *qb = up(q, (size_t)S * H * hd), *kb = up(kc, kn), *vb = up(vc, vn), *sb = up(snk, H + 5);
     VkcBuf *khb = vkc_buf(kn * 2, VKC_DEV), *vhb = vkc_buf(vn * 2, VKC_DEV);
-    VkcBuf *o32 = vkc_buf((size_t)S * H * hd * 4, VKC_DOWN), *o16 = vkc_buf((size_t)S * H * hd * 4, VKC_DOWN);
+    VkcBuf *o32 = vkc_buf((size_t)S * H * vd * 4, VKC_DOWN), *o16 = vkc_buf((size_t)S * H * vd * 4, VKC_DOWN);
     vkc_begin(); vkc_write(khb, 0, kh, kn * 2); vkc_write(vhb, 0, vh, vn * 2); vkc_submit(1);
-    VkcAttnW p = {{S, H, KVH, hd, pos_base, rows, 0, H * hd, hd, 0, 0, 0, 0, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), koff, voff},
-                  win, ring, hd, 0, sink, 5};
+    VkcAttnW p = {{S, H, KVH, hd, pos_base, rows, 0, H * hd, hd, 0, 0, 0, 0, 0, H * vd, 0, 0, 1.f / sqrtf((float)hd), koff, voff},
+                  win, ring, vd, 0, sink, 5};
     vkc_begin();
     int ok = vkc_attn_w(qb, kb, vb, o32, NULL, NULL, sink ? sb : NULL, &p) && vkc_attn_wh(qb, khb, vhb, o16, NULL, NULL, sink ? sb : NULL, &p);
     ok = vkc_submit(1) && ok;
-    size_t bytes = (size_t)S * H * hd * 4;
-    CHECK(ok && memcmp(vkc_ptr(o32), vkc_ptr(o16), bytes) == 0, "attn float16 cache S %d pos %d H %d/%d hd %d win %d ring %d sink %d: "
-          "a float32 cache's bits", S, pos_base, H, KVH, hd, win, ring, sink);
+    size_t bytes = (size_t)S * H * vd * 4;
+    CHECK(ok && memcmp(vkc_ptr(o32), vkc_ptr(o16), bytes) == 0, "attn float16 cache S %d pos %d H %d/%d hd %d vd %d win %d ring %d "
+          "sink %d: a float32 cache's bits", S, pos_base, H, KVH, hd, vd, win, ring, sink);
+    if (S >= 16 && fixed_off()) {   /* and the generic blocked pipeline's, a half a load */
+        vkc_begin(); ok = vkc_attn_wh(qb, khb, vhb, o32, NULL, NULL, sink ? sb : NULL, &p);
+        ok = vkc_submit(1) && ok;
+        fixed_back();
+        CHECK(ok && memcmp(vkc_ptr(o32), vkc_ptr(o16), bytes) == 0, "attn float16 cache S %d pos %d H %d/%d hd %d vd %d win %d "
+              "ring %d sink %d: the generic blocked pipeline's bits", S, pos_base, H, KVH, hd, vd, win, ring, sink);
+    }
     vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(sb); vkc_free(khb); vkc_free(vhb); vkc_free(o32); vkc_free(o16);
     free(q); free(kc); free(vc); free(snk); free(kh); free(vh);
 }
@@ -2934,6 +2977,26 @@ static void test_kvs_cold(void) {
     test_kvs_gqa(50, 2, 4, 2, 256, 256, 4, 16, 0, 0, 0, 1, 1, 1);
     test_kvs_gqa(60, 2, 4, 2, 32, 24, 4, 16, 20, 1, 1, 0, 0, 0);
     test_kvs_gqa(48, 12, 4, 2, 32, 32, 4, 40, 0, 0, 0, 1, 0, 0);
+    {   /* the host's part through chain_attnb's part mode (attn_part_rec), with V's head dim apart:
+         * its pipeline with the head dims fixed (where that is the default) gives the generic
+         * one's bytes */
+        const int Tp = 70, Hp = 4, vdp = 32;
+        size_t n = (size_t)Tp * Hp * vdp;
+        float *fx = calloc(n, sizeof(float)), *gn = calloc(n, sizeof(float));
+        kvs_keep_row = (size_t)Hp * vdp;
+        VkcStats p0, p1, p2; vkc_stats(&p0);
+        kvs_keep = fx; test_kvs_gqa(Tp, 7, Hp, 2, 48, vdp, 8, 32, 0, 1, 1, 0, 0, 0);
+        vkc_stats(&p1);
+        if (fixed_off()) {
+            kvs_keep = gn; test_kvs_gqa(Tp, 7, Hp, 2, 48, vdp, 8, 32, 0, 1, 1, 0, 0, 0);
+            fixed_back();
+            vkc_stats(&p2);
+            CHECK(p1.attn_blocked > p0.attn_blocked && p2.attn_blocked > p1.attn_blocked && !memcmp(fx, gn, n * sizeof(float)),
+                  "kvs cold: the part mode's generic pipeline changed bytes (%llu and %llu calls in blocks)",
+                  p1.attn_blocked - p0.attn_blocked, p2.attn_blocked - p1.attn_blocked);
+        }
+        kvs_keep = NULL; free(fx); free(gn);
+    }
     /* T step H K R B rows kv_start lists */
     test_kvs_mla(40, 1, 4, 32, 8, 4, 12, 0, 0);
     test_kvs_mla(90, 5, 2, 64, 16, 8, 40, 0, 1);
@@ -4242,16 +4305,18 @@ int main(int argc, char **argv) {
     }
     /* a float16 KV cache on every path: chain_attn (a few rows over few positions), the decode's
      * blocks a head and by KV head, the matrix units and the blocked shader for a prompt chunk,
-     * a window and sinks, linear and in a ring */
+     * a window and sinks, linear and in a ring, and V's head dim apart from K's */
     if (vkc_kvh_ready()) {
         unsigned rng_was = rng;
         VkcStats k0; vkc_stats(&k0);
-        test_attn_kvh(2, 50, 16, 2, 256, 0, 0, 0); test_attn_kvh(3, 2500, 16, 2, 256, 0, 0, 0); test_attn_kvh(2, 700, 8, 8, 128, 0, 0, 0);
-        test_attn_kvh(70, 33, 16, 2, 256, 0, 0, 0); test_attn_kvh(40, 300, 32, 4, 128, 129, 0, 1); test_attn_kvh(1, 4000, 32, 4, 128, 200, 236, 1);
-        test_attn_kvh(90, 900, 32, 4, 128, 129, 230, 1);
+        test_attn_kvh(2, 50, 16, 2, 256, 256, 0, 0, 0); test_attn_kvh(3, 2500, 16, 2, 256, 256, 0, 0, 0);
+        test_attn_kvh(2, 700, 8, 8, 128, 128, 0, 0, 0); test_attn_kvh(70, 33, 16, 2, 256, 256, 0, 0, 0);
+        test_attn_kvh(40, 300, 32, 4, 128, 128, 129, 0, 1); test_attn_kvh(1, 4000, 32, 4, 128, 128, 200, 236, 1);
+        test_attn_kvh(90, 900, 32, 4, 128, 128, 129, 230, 1);
         setenv("COLI_VK_CHAIN_FLASH", "0", 1);
-        test_attn_kvh(40, 300, 16, 2, 256, 0, 0, 0); test_attn_kvh(33, 20, 32, 4, 128, 16, 0, 1);
+        test_attn_kvh(40, 300, 16, 2, 256, 256, 0, 0, 0); test_attn_kvh(33, 20, 32, 4, 128, 128, 16, 0, 1);
         unsetenv("COLI_VK_CHAIN_FLASH");
+        test_attn_kvh(40, 100, 8, 2, 64, 48, 0, 0, 0);   /* the blocked shader's uvec4 loads with V's head dim apart */
         test_copy_regions_h();
         VkcStats k1; vkc_stats(&k1);
         printf("  a float16 cache: %llu on the matrix units, %llu blocked, %llu decodes in blocks\n", k1.attn_flash - k0.attn_flash,

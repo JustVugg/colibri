@@ -1610,36 +1610,78 @@ static VkPipeline attn_h_pipe(void) {
  * KV cache S * H times, which held a 2048-row chunk of Qwen3.6 at 1.2 s a layer on a
  * Radeon 780M. From COLI_VK_ATTN_BLOCK rows (16; 0 = never) a call takes chain_attnb,
  * one workgroup per KV head and block of rows: each K and V row read once per block.
- * Below it, and for decode and an MTP verify, chain_attn's bits as before. */
-static struct { VkShaderModule mod; VkPipeline pipe, pipe_h; int tried, tried_h, bc; } g_kab[2];
+ * Below it, and for decode and an MTP verify, chain_attn's bits as before.
+ * The head dims fixed in the pipeline (the shader's HDC and VDC), one a (head dim, V's head
+ * dim, cache type, vec): no test of each dim against the push constants, and with vec a
+ * float16 cache's K and V a uvec4 a load. An Arc Pro B60 at subgroups of 16, Qwen3.6 over
+ * 16K positions with a float16 cache: a 255-row chunk 185.1 -> 25.7 ms (in 2^32 slices at the
+ * reported 32: 485.4 -> 130.0 ms), 4096 rows in 2^36 slices 2.32 -> 0.32 s (32K: 5.66 -> 0.78 s); a float32
+ * cache about 3 times faster. Their q.k sums are the fused multiply-adds in order, what the
+ * generic pipeline's compile to where the driver fuses a*b + c, and not one output bit moved:
+ * on the B60 (Mesa ANV 26.0.8, tiles of 8 positions) in every form the shader takes
+ * (test_vk_chain's blocked cases) and in those chunks of 255 to 4096 rows at 16K and 32K
+ * positions, either cache, at subgroups of 16 and 32; on Lavapipe (tiles of 8) in every form.
+ * So they are the default there only: ANV on Xe2 (its smallest subgroup 16) and Lavapipe, at
+ * tiles of 8 or 4. Other Intel GPUs under ANV, tiles of 16 (64 KiB of shared memory) and
+ * other drivers keep the generic pipeline, one a cache type, unless
+ * COLI_VK_ATTN_BLOCK_FIXED=1 (0: the generic one everywhere). VKC_KAB_MAX shapes: a model
+ * takes one or two head-dim pairs a cache type, with and without vec; the last two places are
+ * the generic pipelines', which a shape past the others takes, as one whose fixed pipeline
+ * failed does (the same bits where the fixed ones are the default). */
+#define VKC_KAB_MAX 32
+static struct {
+    VkShaderModule mod; int tried, bc, fixed, n;
+    VkPipeline p[VKC_KAB_MAX]; int hd[VKC_KAB_MAX], vd[VKC_KAB_MAX], kv[VKC_KAB_MAX], vec[VKC_KAB_MAX];
+} g_kab[2];
 #define KAB (g_kab[g_kd])
-static VkPipeline kab_pipe(void) {
-    if (g_kvh && KAB.pipe && !KAB.pipe_h && !KAB.tried_h) {   /* a float16 cache's twin */
-        KAB.tried_h = 1;
-        int32_t v[2] = {KAB.bc, 1};
-        VkSpecializationMapEntry me[2] = {{0, 0, 4}, {7, 4, 4}};
-        VkSpecializationInfo si = {2, me, sizeof v, v};
-        KAB.pipe_h = make_pipe(KAB.mod, &si);
+static VkPipeline kab_pipe(int hd, int vd, int kv16, int vec) {
+    if (!KAB.mod) {
+        if (KAB.tried || !vkc_ready()) return VK_NULL_HANDLE;
+        KAB.tried = 1;
+        /* the tile of positions as the device's shared memory allows: K and V rows of 256
+         * floats, the partial dots and the scores, about 3.2 KiB a position */
+        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
+        int bc = 16;
+        while (bc >= 4 && (size_t)bc * (2 * 256 + 32 * 8 + 32 + 1) * 4 > pp.limits.maxComputeSharedMemorySize) bc /= 2;
+        if (bc < 4 || !(KAB.mod = load_module(KC.core.spv_path, "chain_attnb.spv"))) return VK_NULL_HANDLE;
+        KAB.bc = bc;
+        VkPhysicalDeviceDriverProperties dp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &dp};
+        if (pp.apiVersion >= VK_API_VERSION_1_2) vkGetPhysicalDeviceProperties2((VkPhysicalDevice)KC.core.phys, &p2);
+        uint32_t min_sg = 0;
+        if (dp.driverID == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) {   /* ANV has subgroup size control on every GPU it drives */
+            VkPhysicalDeviceSubgroupSizeControlPropertiesEXT sp = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT};
+            VkPhysicalDeviceProperties2 s2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sp};
+            vkGetPhysicalDeviceProperties2((VkPhysicalDevice)KC.core.phys, &s2);
+            min_sg = sp.minSubgroupSize;
+        }
+        KAB.fixed = bc <= 8 && (dp.driverID == VK_DRIVER_ID_MESA_LLVMPIPE ||
+                                (dp.driverID == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA && min_sg == 16));   /* measured: Xe2, Lavapipe */
     }
-    if (KAB.pipe || KAB.tried || !vkc_ready()) return g_kvh ? KAB.pipe_h : KAB.pipe;
-    KAB.tried = 1;
-    /* the tile of positions as the device's shared memory allows: K and V rows of 256
-     * floats, the partial dots and the scores, about 3.2 KiB a position */
-    VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
-    int bc = 16;
-    while (bc >= 4 && (size_t)bc * (2 * 256 + 32 * 8 + 32 + 1) * 4 > pp.limits.maxComputeSharedMemorySize) bc /= 2;
-    if (bc < 4) return VK_NULL_HANDLE;
-    if ((KAB.mod = load_module(KC.core.spv_path, "chain_attnb.spv"))) {
-        int32_t v = bc;
-        VkSpecializationMapEntry me = {0, 0, 4};
-        VkSpecializationInfo si = {1, &me, 4, &v};
-        if ((KAB.pipe = make_pipe(KAB.mod, &si))) KAB.bc = bc;
-    }
-    return g_kvh && KAB.pipe ? kab_pipe() : KAB.pipe;
+    const char *e = getenv("COLI_VK_ATTN_BLOCK_FIXED");   /* each call, as COLI_VK_ATTN_BLOCK (tests switch it) */
+    if (!(e && *e ? *e == '1' : KAB.fixed)) hd = vd = vec = 0;
+    const int fixed = hd || vd || vec;
+    for (int i = 0; i < KAB.n; i++)
+        if (KAB.hd[i] == hd && KAB.vd[i] == vd && KAB.kv[i] == kv16 && KAB.vec[i] == vec)
+            return KAB.p[i] || !fixed ? KAB.p[i] : kab_pipe(0, 0, kv16, 0);
+    if (fixed && KAB.n >= VKC_KAB_MAX - 2) return kab_pipe(0, 0, kv16, 0);   /* the last two places: the generic ones' */
+    if (KAB.n == VKC_KAB_MAX) return VK_NULL_HANDLE;
+    int32_t sv[5] = {KAB.bc, hd, vd, vec, kv16};
+    VkSpecializationMapEntry me[5] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}, {7, 16, 4}};
+    VkSpecializationInfo si = {5, me, sizeof sv, sv};
+    VkPipeline p = make_pipe(KAB.mod, &si);   /* kept when it fails too: not tried again */
+    KAB.p[KAB.n] = p; KAB.hd[KAB.n] = hd; KAB.vd[KAB.n] = vd; KAB.kv[KAB.n] = kv16; KAB.vec[KAB.n++] = vec;
+    if (!p && fixed)
+        fprintf(stderr, "[VK] %schain: chain_attnb's pipeline for head dims %d/%d (a %s cache%s) failed: its generic one "
+                "instead\n", g_kd ? "dev2 " : "", hd, vd, kv16 ? "float16" : "float32", vec ? ", uvec4 loads" : "");
+    else if (!p)
+        fprintf(stderr, "[VK] %schain: chain_attnb's pipeline (a %s cache) failed: no blocked attention\n", g_kd ? "dev2 " : "",
+                kv16 ? "float16" : "float32");
+    return p || !fixed ? p : kab_pipe(0, 0, kv16, 0);
 }
 static void kab_shutdown(void) {
-    if (KAB.pipe) vkDestroyPipeline(KC.dev, KAB.pipe, NULL);
-    if (KAB.pipe_h) vkDestroyPipeline(KC.dev, KAB.pipe_h, NULL);
+    for (int i = 0; i < KAB.n; i++) if (KAB.p[i]) vkDestroyPipeline(KC.dev, KAB.p[i], NULL);
     if (KAB.mod) vkDestroyShaderModule(KC.dev, KAB.mod, NULL);
     memset(&KAB, 0, sizeof KAB);
 }
@@ -1842,7 +1884,12 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
     VkPipeline fp = KC.mod_fa && fl > 0 && w.a.S >= fl && !(sel && w.a.sel_row > 0) && !w.kv_pm &&
                     w.vd == w.a.hd && w.a.hd % 64 == 0 && VKC_FA_ROWS % G == 0 && (!g_kvh || (w.a.k_off % 8 == 0 && w.a.v_off % 8 == 0))
                     ? fa_pipe(w.a.hd, G) : VK_NULL_HANDLE;
-    int blocked = !fp && blk > 0 && w.a.S >= blk && G <= 32 && kab_pipe(), br = w.a.sel_row > 0 ? 1 : 32 / G;
+    /* the blocked shader's K and V a uvec4 a load: a float16 cache's rows of whole uvec4s,
+     * head-major, a tile's positions consecutive (no ring, no list) */
+    int vec = g_kvh && !w.kv_pm && !w.ring && w.a.sel_row <= 0 && w.a.hd % 8 == 0 && w.vd % 8 == 0 &&
+              w.a.k_off % 8 == 0 && w.a.v_off % 8 == 0;
+    VkPipeline kp = !fp && blk > 0 && w.a.S >= blk && G <= 32 ? kab_pipe(w.a.hd, w.vd, g_kvh, vec) : VK_NULL_HANDLE;
+    int blocked = kp != VK_NULL_HANDLE, br = w.a.sel_row > 0 ? 1 : 32 / G;
     /* a decode's or a verify's rows over many positions: split over them; a verify across
      * VKC_ATTN_DEC_MIN positions in two calls, its rows before it as their decode steps run */
     if (!fp && !blocked && !(sel && w.a.sel_row > 0) && w.a.S > 1 && w.a.S <= VKC_ATTN_DEC_ROWS &&
@@ -1874,7 +1921,7 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
             KC.st.attn_flash += ok;
         } else if (blocked) {
             struct { VkcAttnW w; int br, B, anchor, part, st_off; } pc = {x, br, 0, 0, 0, 0};
-            ok = record(kab_pipe(), bd, 7, &pc, sizeof pc, (uint32_t)x.a.KVH, (uint32_t)((x.a.S + br - 1) / br), 1);
+            ok = record(kp, bd, 7, &pc, sizeof pc, (uint32_t)x.a.KVH, (uint32_t)((x.a.S + br - 1) / br), 1);
             KC.st.attn_blocked += ok;
         } else {
             VkPipeline ap = g_kvh ? attn_h_pipe() : KC.pipe[P_ATTN];
@@ -1890,7 +1937,9 @@ static int attn_part_rec(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, const Vkc
     if (w.vd <= 0) w.vd = w.a.hd;
     int G = w.a.KVH > 0 ? w.a.H / w.a.KVH : 0;
     if (w.a.hd > 256 || w.vd > 256 || G < 1 || G > 32 || w.a.H % w.a.KVH || w.a.sel_row > 0 || w.sink || w.ring || blk < 1 ||
-        anchor < 0 || ch < 0 || (ch > 0 && (ch % 16 || nz < 1 || nz > 65535)) || !kab_pipe()) return 0;
+        anchor < 0 || ch < 0 || (ch > 0 && (ch % 16 || nz < 1 || nz > 65535))) return 0;
+    VkPipeline kp = kab_pipe(w.a.hd, w.vd, 0, 0);   /* the shadow's rows are float32 */
+    if (!kp) return 0;
     w.a.has_gate = 0; w.a.g_off = ch; w.a.g_row = o_z; w.a.g_seg = st_z;   /* the chunks (unused by part otherwise) */
     VkcBind bd[7] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(NULL, 0), B(NULL, 0), B(NULL, 0)};
     int br = 32 / G, S = w.a.S, rr = attn_slice_rows(S, w.a.pos_base, (double)w.a.H * (w.a.hd > w.vd ? w.a.hd : w.vd), br);
@@ -1902,7 +1951,7 @@ static int attn_part_rec(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, const Vkc
         x.a.q_off += r0 * w.a.q_row; x.a.o_off += r0 * w.a.o_row;
         if (r0 && !attn_slice_next()) return 0;
         struct { VkcAttnW w; int br, B, anchor, part, st_off; } pc = {x, br, blk, anchor, 1, st_off + r0 * w.a.H * 2};
-        ok = record(KAB.pipe, bd, 7, &pc, sizeof pc, (uint32_t)x.a.KVH, (uint32_t)((x.a.S + br - 1) / br), (uint32_t)(ch > 0 ? nz : 1));
+        ok = record(kp, bd, 7, &pc, sizeof pc, (uint32_t)x.a.KVH, (uint32_t)((x.a.S + br - 1) / br), (uint32_t)(ch > 0 ? nz : 1));
         KC.st.attn_blocked += ok;
     }
     return ok;
