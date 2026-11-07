@@ -463,6 +463,26 @@ class TemplateTest(unittest.TestCase):
         self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
                          {"city": "Rome", "days": 3})
 
+    def test_qwen_streamed_tool_call_separator_in_history(self):
+        tool = {"type": "function", "function": {"name": "weather", "parameters": {}}}
+        block = "<tool_call>\n<function=weather>\n</function>\n</tool_call>"
+        for render in (render_chat_qwen, render_chat_qwen38):
+            for tail, count, expected in (("", 1, "\n\n"), ("\n", 1, "\n"),
+                                          ("\n\n", 1, "\n\n"), ("", 2, "\n\n")):
+                with self.subTest(renderer=render.__name__, tail=tail, count=count):
+                    chunks = []
+                    stream = openai_server.QwenToolStream(chunks.append, [tool])
+                    stream.feed("Checking." + tail + "<tool_")
+                    call_text = "\n".join([block] * count)
+                    stream.feed(call_text[len("<tool_"):])
+                    calls = stream.finish()
+                    history = [{"role": "user", "content": "Weather?"},
+                               {"role": "assistant", "content": "".join(chunks),
+                                "tool_calls": calls}]
+                    history.extend({"role": "tool", "content": "sunny"} for _ in calls)
+                    prompt = render(history, tools=[tool])
+                    self.assertIn("Checking." + expected + call_text, prompt)
+
     def test_qwen38_tool_choice_none_suppresses_the_declaration(self):
         tool = {"type": "function", "function": {"name": "f", "description": "d"}}
         prompt = render_chat_qwen38([{"role": "user", "content": "Hi"}],
