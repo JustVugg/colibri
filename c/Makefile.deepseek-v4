@@ -397,7 +397,7 @@ backend_loader_dsv4.o: backend_loader_dsv4.c backend_cuda_dsv4.h $(V4_FLAGS_STAM
 # Linux/macOS CUDA=1: the tier compiled straight into the engine.
 backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h $(V4_DEEPGEMM_DEP) \
 	$(V4_CUDA_FLAGS_STAMP)
-	"$(NVCC)" $(V4_NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
+	"$(NVCC)" $(V4_NVCCFLAGS) -MMD -MP -MF backend_cuda_dsv4.d -c backend_cuda_dsv4.cu -o $@
 
 ifneq ($(DEEPGEMM_STAMP),)
 $(DEEPGEMM_STAMP):
@@ -424,3 +424,8 @@ deepseek-v4-clean:
 $(foreach obj,$(V4_C_DEP_OBJS),$(eval $(obj): $(obj:.o=.d)))
 $(V4_C_DEPS): ;
 -include $(wildcard $(V4_C_DEPS))
+# The CUDA object's, written by nvcc (-MMD -MP -MF backend_cuda_dsv4.d): bootstrapped and
+# regenerated the same way.
+backend_cuda_dsv4.o: backend_cuda_dsv4.d
+backend_cuda_dsv4.d: ;
+-include $(wildcard backend_cuda_dsv4.d)

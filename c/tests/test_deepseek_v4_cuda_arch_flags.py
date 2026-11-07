@@ -35,11 +35,19 @@ STAMP = "deepseek_v4.cudaflags"
 FAKE_NVCC = """#!/bin/sh
 # Stand-in nvcc: records the command line, creates the -o target, compiles nothing.
 printf '%s\\n' "$*" >> "$FAKE_NVCC_LOG"
+depfile=
+output=
 while [ "$#" -gt 0 ]; do
-    if [ "$1" = "-o" ]; then : > "$2"; exit 0; fi
+    case "$1" in
+        -MF) depfile="$2"; shift ;;
+        -o) output="$2"; shift ;;
+    esac
     shift
 done
-exit 1
+[ -n "$output" ] || exit 1
+: > "$output"
+if [ -n "$depfile" ]; then printf '%s: backend_cuda_dsv4.cu\\n' "$output" > "$depfile"; fi
+exit 0
 """
 
 
@@ -94,6 +102,28 @@ class DeepseekV4CudaArchFlagsTest(unittest.TestCase):
             if f.stat().st_mtime > aged + 400:
                 os.utime(f, (aged, aged))
         return calls
+
+    def test_transitive_header_dependency_rebuilds(self):
+        self.assertEqual(self.build("CUDA=1", "CUDA_ARCH=sm_86"), 1)
+        self.assertIn("-MMD -MP -MF backend_cuda_dsv4.d", self.log.read_text())
+        # Simulate nvcc's depfile for a transitively included library header.
+        header = self.dir / "library_detail.cuh"
+        header.write_text("/* library implementation */\n")
+        (self.dir / "backend_cuda_dsv4.d").write_text(
+            OBJ + ": library_detail.cuh\nlibrary_detail.cuh:\n")
+        self.assertEqual(self.build("CUDA=1", "CUDA_ARCH=sm_86"), 1)
+        self.assertEqual(self.build("CUDA=1", "CUDA_ARCH=sm_86"), 0)
+        clean = self.make("deepseek-v4-clean")
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+        self.assertFalse((self.dir / "backend_cuda_dsv4.d").exists())
+
+    def test_missing_depfile_rebuilds_existing_object(self):
+        self.assertEqual(self.build("CUDA=1", "CUDA_ARCH=sm_86"), 1)
+        depfile = self.dir / "backend_cuda_dsv4.d"
+        depfile.unlink()
+        self.assertEqual(self.build("CUDA=1", "CUDA_ARCH=sm_86"), 1)
+        self.assertTrue(depfile.exists())
+        self.assertEqual(self.build("CUDA=1", "CUDA_ARCH=sm_86"), 0)
 
     def test_same_arch_does_not_rebuild(self):
         """The guard: a fix that always recompiles would pass the tests below."""
