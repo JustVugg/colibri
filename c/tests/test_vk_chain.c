@@ -462,6 +462,43 @@ static void test_attn_win(int S, int pos_base, int H, int KVH, int hd, int vd, i
     vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(sb); vkc_free(ob);
     free(q); free(kc); free(vc); free(snk); free(ref);
 }
+/* COLI_VK_ATTN_SLICE_WG as the run has it (NULL: unset), saved by a case that sets it and
+ * given back after, so the slice cases after it run as the run asked */
+static char *slice_wg_save(void) { const char *e = getenv("COLI_VK_ATTN_SLICE_WG"); return e ? strdup(e) : NULL; }
+static void slice_wg_back(char *was) {
+    if (was) setenv("COLI_VK_ATTN_SLICE_WG", was, 1);
+    else unsetenv("COLI_VK_ATTN_SLICE_WG");
+    free(was);
+}
+/* The slice rule (COLI_VK_ATTN_SLICE_WG, `wg`; NULL: the default): a slice of the blocked
+ * attention is cut to keep that many workgroups, as far as 4x the budget, a chunk's rows in
+ * slices of one size; the bytes of one dispatch every time. Qwen3.6's heads (16 over 2, hd 256:
+ * a workgroup a KV head and 4 rows), 72 rows after 7 positions, the budget `per` rows' work. */
+static void test_attn_slice_wg(int per, const char *wg, unsigned long long want) {
+    char *wg_was = slice_wg_save();
+    const int S = 72, pb = 7, H = 16, KVH = 2, hd = 256, T = pb + S;
+    size_t qn = (size_t)S * H * hd, kn = (size_t)KVH * T * hd, bytes = qn * 4;
+    float *q = fvec(qn, 1.f), *kc = fvec(kn, 1.f), *vc = fvec(kn, 1.f);
+    VkcBuf *qb = up(q, qn), *kb = up(kc, kn), *vb = up(vc, kn), *o1 = vkc_buf(bytes, VKC_DOWN), *o2 = vkc_buf(bytes, VKC_DOWN);
+    VkcAttn p = {S, H, KVH, hd, pb, T, 0, H * hd, hd, 0, 0, 0, 0, 0, H * hd, 0, 0, 1.f / 16, 0, 0};
+    char b[32];
+    snprintf(b, sizeof b, "%lld", (long long)per * T * H * hd);
+    setenv("COLI_VK_ATTN_SLICE", "0", 1);
+    vkc_begin(); int ok = vkc_attn(qb, kb, vb, o1, NULL, NULL, &p); ok = vkc_submit(1) && ok;
+    setenv("COLI_VK_ATTN_SLICE", b, 1);
+    if (wg) setenv("COLI_VK_ATTN_SLICE_WG", wg, 1);
+    else unsetenv("COLI_VK_ATTN_SLICE_WG");
+    VkcStats s0, s1; vkc_stats(&s0);
+    vkc_begin(); ok = vkc_attn(qb, kb, vb, o2, NULL, NULL, &p) && ok; ok = vkc_submit(1) && ok;
+    vkc_stats(&s1);
+    int same = !memcmp(vkc_ptr(o1), vkc_ptr(o2), bytes);
+    CHECK(ok && same && s1.attn_slices - s0.attn_slices == want && s1.attn_blocked > s0.attn_blocked,
+          "attn slices: a budget of %d rows, COLI_VK_ATTN_SLICE_WG %s: %llu extra submissions (%llu wanted), the bytes of one dispatch %d",
+          per, wg ? wg : "unset", s1.attn_slices - s0.attn_slices, want, same);
+    unsetenv("COLI_VK_ATTN_SLICE"); slice_wg_back(wg_was);
+    vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(o1); vkc_free(o2);
+    free(q); free(kc); free(vc);
+}
 
 /* A float16 KV cache (vkc_attn_wh): K and V of float16 values in halves give the bits of a
  * float32 cache of the same values, on the path the call takes (the counters say which) */
@@ -4188,10 +4225,12 @@ int main(int argc, char **argv) {
     { VkcStats st; vkc_stats(&st); CHECK(st.attn_blocked >= 9, "attn: %llu calls took the blocked attention", st.attn_blocked);
       printf("  blocked attention: %llu calls\n", st.attn_blocked); }
     /* a long attention cut over several submissions (COLI_VK_ATTN_SLICE): the same cases,
-     * the blocked attention and chain_attn, slices of a few rows each */
+     * the blocked attention and chain_attn, slices of a few rows each (the budget alone) */
     {
         VkcStats s0; vkc_stats(&s0);
+        char *wg_was = slice_wg_save();
         setenv("COLI_VK_ATTN_SLICE", "60000", 1);
+        setenv("COLI_VK_ATTN_SLICE_WG", "0", 1);
         for (int pass = 0; pass < 2; pass++) {
             setenv("COLI_VK_ATTN_BLOCK", pass ? "0" : "16", 1);
             test_attn_hk(40, 7, 16, 2, 256, 0); test_attn_hk(37, 5, 16, 2, 128, 1); test_attn_hk(64, 100, 4, 4, 32, 0);
@@ -4201,7 +4240,16 @@ int main(int argc, char **argv) {
         VkcStats s1; vkc_stats(&s1);
         CHECK(s1.attn_slices > s0.attn_slices + 10, "attn: %llu slices", s1.attn_slices - s0.attn_slices);
         printf("  attention in slices: %llu extra submissions\n", s1.attn_slices - s0.attn_slices);
-        unsetenv("COLI_VK_ATTN_SLICE");
+        unsetenv("COLI_VK_ATTN_SLICE"); slice_wg_back(wg_was);
+    }
+    {   /* the slice rule's floor (COLI_VK_ATTN_SLICE_WG; the random stream as before it) */
+        unsigned rng_was = rng;
+        test_attn_slice_wg(7, "0", 17);   /* the budget alone: 18 slices of 4 rows */
+        test_attn_slice_wg(7, "64", 2);   /* 64 workgroups as far as 4x the budget, 28 rows: 3 slices of 24 */
+        test_attn_slice_wg(7, NULL, coli_vk_device_integrated() ? 17 : 2);   /* the default: 64, 0 on an integrated GPU */
+        test_attn_slice_wg(7, "8", 4);    /* 8 workgroups, 16 rows: 5 slices */
+        test_attn_slice_wg(20, "64", 0);  /* 4x the budget, 80 rows, takes the 72 whole */
+        rng = rng_was;
     }
     unsetenv("COLI_VK_CHAIN_FLASH");
     /* a decode's or a verify's rows over many positions (chain_attn_dec.comp's blocks, where a prompt of

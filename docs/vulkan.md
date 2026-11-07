@@ -2922,7 +2922,14 @@ dispatches over rows stay within the device limits at 8192. Two things did not s
   dim), `vkc_attn`, `vkc_attn_w`, `vkc_mla_core` and `vkc_relattn` record their rows in
   slices. Each slice ends its frame, submitted and not waited for, and the next starts a
   new one, which its first barrier orders after the slice. A slice starts on a multiple
-  of the blocked attention's rows, so no row's arithmetic changes.
+  of the blocked attention's rows, so no row's arithmetic changes. The budget alone
+  starved a big GPU: Qwen3.6's 16K prompt ran in slices of 64 rows, 32 workgroups of
+  `chain_attnb`, on an Arc Pro B60 that keeps 80 resident and runs 2 to 40 of them in
+  the same time (raising the budget to 2^36 took its first token from 118.5 to 74.4-75.7 s).
+  So a slice is cut to keep `COLI_VK_ATTN_SLICE_WG` workgroups (64; 0, the budget alone,
+  on an integrated GPU) as far as 4x the budget's work, then a chunk's slices are made
+  one size on the blocks, so some, and the last, may keep fewer. One layer of that
+  prompt replayed on the B60: 16K 9.31 -> 6.04 s of attention, 32K 69.0 -> 24.2 s.
 
 ### Streaming (`vk_tier.c`)
 
@@ -3085,6 +3092,7 @@ experts came from the host pool (`135 streamed (135 of them copied from the host
 | `COLI_VK_GEMM_WIDE` | on where supported | A GGUF's dense prompt matmuls from 128 rows on `qmatmul_gemm_bdcw.comp` (128 outputs x 128 rows a workgroup) instead of `qmatmul_gemm_bdc.comp`'s 64, for the types with no IQ grid in shared memory. RTX PRO 4000: a 4096 x 2048 Q4_K matrix against 4096 rows 3.30 -> 1.97 ms; Qwen3.6 UD-Q4_K_M's prompt at 4K tokens 1960-1979 -> 2344-2358 tok/s. `0`: the 64 tile. |
 | `COLI_VK_GRP_WIDE` | `32` | A prompt chunk's GGUF experts on `qmatmul_grp_bdcw.comp` (64 rows by 128 decoded rows an item) when the chunk's rows give each expert this many on average, both passes on the matrix units. One layer of Qwen3.6's Q4_K experts: 1024 rows 4.40 -> 3.69 ms, 512 rows 2.90 -> 3.28 (so the threshold); its prompt at 4K tokens 2366-2371 -> 2621-2637 tok/s. `0`: never. |
 | `COLI_VK_ATTN_SLICE` | `4294967296` | Rows x positions x heads x head dim past which an attention is cut over several submissions; `0` never. The matrix units' attention (`chain_attn_flash.comp`) counts a unit as a sixteenth: it runs one 8.5 to 13 times faster than `chain_attnb`. |
+| `COLI_VK_ATTN_SLICE_WG` | `64`; `0` on an integrated GPU | The workgroups a slice is cut to keep, as far as 4x `COLI_VK_ATTN_SLICE`'s work (up to 7x the budget-only slice where that one rounds down to one block); a chunk's slices are then made one size on the blocked attention's blocks (the same bits), so some, and the last, may keep fewer. `0`: the budget alone. |
 | `COLI_VK_TIER_STREAM` | on | `0`: no streaming; the tier takes a prompt step in the engine's usual blocks and leaves the cold experts to the CPU, as before. |
 | `COLI_VK_TIER_STREAM_SLOTS` | `64` | Staging slots (experts) for streaming, out of the tier's budget. |
 | `COLI_VK_TIER_STREAM_ROWS` | the rule | Fix R, the rows from which a cold expert streams (tests). |
