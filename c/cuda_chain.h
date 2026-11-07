@@ -206,6 +206,31 @@ typedef struct {
 
 /* The table the backend exports. `size` is the backend's sizeof: a field past it is
  * not there (an older DLL), and the engine must not call it. */
+/* DeepSeek V4.1's (and V4's) layer ops (cuda_dsv4c.cuh), the Vulkan chain's vkc_mhc and
+ * vkc_dsv4_* with the same fields in the same order (vk_chain.h has their contracts):
+ *   mhc        CC_MHC_SPLIT (the mix's pre, post and Sinkhorn comb), CC_MHC_COLLAPSE,
+ *              CC_MHC_POST (write back), CC_MHC_MEAN, CC_SWIGLU_CLAMP;
+ *   ds_attn    sparse attention with a sink over a per-row list (a prompt chunk's rows from
+ *              8 in three passes, COLI_CUDA_DSV4_PA=0: a block a head and row);
+ *   ds_rope, ds_compress, ds_score, ds_cand, ds_topk, ds_engram. */
+#define CC_MHC_SPLIT    0
+#define CC_MHC_COLLAPSE 1
+#define CC_MHC_POST     2
+#define CC_MHC_MEAN     3
+#define CC_SWIGLU_CLAMP 4
+typedef struct { int S, H, D, iters, x_off, x_row, m_off, m_row, hp_off, hp_row, y_off, y_row, prm_off, n;
+                 float eps, hc_eps, lim; } CcMhc;
+typedef struct { int S, H, hd, cnt, l_off, l_row, nwin, w_off, c_off, q_off, q_row, o_off, o_row, sink_off, flags;
+                 float scale; } CcDsAttn;
+typedef struct { int nseg, per_row, rd, x_off, x_row, x_seg, cs_off, cs_row, inverse, flags; } CcDsRope;
+typedef struct { int S, pos_base, ratio, P, D, overlap, kv_off, kv_row, sc_off, sc_row, ape_off, out_off, out_row,
+                 ring_off; } CcDsComp;
+typedef struct { int S, pos_base, ratio, IH, ID, width, q_off, q_row, w_off, w_row, k_off, k_row, mask_row, sc_row;
+                 float wscale; int sc_off, mask_off; } CcDsScore;
+typedef struct { int S, pos_base, ratio, width, block, topb, sc_row, mask_row, mask_off; } CcDsCand;   /* the mask a byte an entry */
+typedef struct { int S, width, topk, sc_row, l_off, l_row, base, order; } CcDsTopk;
+typedef struct { int S, H, D, kv_off, kv_row, x_off, x_row, qw_off, kw_off; float eps; } CcDsEngram;
+
 typedef struct ColiCudaChainOps {
     size_t size;
     /* after coli_cuda_init, for a configured device; 1 = the chain is up on it. Each
@@ -347,6 +372,15 @@ typedef struct ColiCudaChainOps {
      * hn's row at b H + d, over fc; matmul then ew's CC_EW_HC_MIX with the same bits, the product never
      * written. 1 done, -1 not taken (the caller's two ops), 0 a failure */
     int  (*matmul_hcmix)(ColiCudaTensor *t, CcBuf *x, size_t x_off, CcBuf *hn, CcBuf *y, int n, int H, int C, float fc);
+    /* DeepSeek V4.1's layer ops (cuda_dsv4c.cuh) */
+    int  (*mhc)(int mode, CcBuf *x, CcBuf *m, CcBuf *hp, CcBuf *prm, CcBuf *y, const CcMhc *p);
+    int  (*ds_attn)(CcBuf *q, CcBuf *win, CcBuf *cmp, CcBuf *list, CcBuf *prm, CcBuf *out, const CcDsAttn *p);
+    int  (*ds_rope)(CcBuf *x, CcBuf *cs, const CcDsRope *p);
+    int  (*ds_compress)(CcBuf *kv, CcBuf *sc, CcBuf *ring, CcBuf *prm, CcBuf *out, const CcDsComp *p);
+    int  (*ds_score)(CcBuf *iq, CcBuf *hw, CcBuf *keys, CcBuf *mask, CcBuf *sc, const CcDsScore *p);
+    int  (*ds_cand)(CcBuf *sc, CcBuf *mask, const CcDsCand *p);
+    int  (*ds_topk)(CcBuf *sc, CcBuf *list, const CcDsTopk *p);
+    int  (*ds_engram)(CcBuf *kv, CcBuf *prm, CcBuf *x, const CcDsEngram *p);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -427,6 +461,29 @@ static inline int cc_matmul_hcmix(ColiCudaTensor *t, CcBuf *x, size_t x_off, CcB
     const ColiCudaChainOps *o = cc_ops();
     return o && o->size >= offsetof(ColiCudaChainOps, matmul_hcmix) + sizeof o->matmul_hcmix && o->matmul_hcmix
            ? o->matmul_hcmix(t, x, x_off, hn, y, n, H, C, fc) : -1;
+}
+/* DeepSeek V4.1's layer ops: the module has them (an older one does not) */
+static inline int cc_dsv4_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, ds_engram) + sizeof t->ds_engram && t->ds_engram;
+}
+static inline int cc_mhc(int mode, CcBuf *x, CcBuf *m, CcBuf *hp, CcBuf *prm, CcBuf *y, const CcMhc *p) {
+    return cc_dsv4_ready() ? cc_ops()->mhc(mode, x, m, hp, prm, y, p) : 0;
+}
+static inline int cc_ds_attn(CcBuf *q, CcBuf *win, CcBuf *cmp, CcBuf *list, CcBuf *prm, CcBuf *out, const CcDsAttn *p) {
+    return cc_dsv4_ready() ? cc_ops()->ds_attn(q, win, cmp, list, prm, out, p) : 0;
+}
+static inline int cc_ds_rope(CcBuf *x, CcBuf *cs, const CcDsRope *p) { return cc_dsv4_ready() ? cc_ops()->ds_rope(x, cs, p) : 0; }
+static inline int cc_ds_compress(CcBuf *kv, CcBuf *sc, CcBuf *ring, CcBuf *prm, CcBuf *out, const CcDsComp *p) {
+    return cc_dsv4_ready() ? cc_ops()->ds_compress(kv, sc, ring, prm, out, p) : 0;
+}
+static inline int cc_ds_score(CcBuf *iq, CcBuf *hw, CcBuf *keys, CcBuf *mask, CcBuf *sc, const CcDsScore *p) {
+    return cc_dsv4_ready() ? cc_ops()->ds_score(iq, hw, keys, mask, sc, p) : 0;
+}
+static inline int cc_ds_cand(CcBuf *sc, CcBuf *mask, const CcDsCand *p) { return cc_dsv4_ready() ? cc_ops()->ds_cand(sc, mask, p) : 0; }
+static inline int cc_ds_topk(CcBuf *sc, CcBuf *list, const CcDsTopk *p) { return cc_dsv4_ready() ? cc_ops()->ds_topk(sc, list, p) : 0; }
+static inline int cc_ds_engram(CcBuf *kv, CcBuf *prm, CcBuf *x, const CcDsEngram *p) {
+    return cc_dsv4_ready() ? cc_ops()->ds_engram(kv, prm, x, p) : 0;
 }
 /* the chain's and the backend's kernels loaded now where the backend can (an older one loads them
  * at their first launch) */

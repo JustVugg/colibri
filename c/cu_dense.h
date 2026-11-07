@@ -42,7 +42,12 @@ typedef struct {
     pthread_t thread;
 } CuDense;
 static CuDense g_cud;
+#define CUD_ROWS 512   /* a call's rows at most (cud_mm) */
 
+/* a GGUF's float matrix (F32, F16, BF16: no block form on the card): a chain's copy goes up as f32
+ * rows (cud_tensor, fmt 0), the values exact, and cud_mm runs on it where one is there (DeepSeek
+ * V4.1's indexer and compressor matrices in unsloth's files); cud_bytes takes none */
+static int cud_float(int fmt) { const int t = fmt - 100; return fmt >= 100 && (t == GQ_F32 || t == GQ_F16 || t == GQ_BF16); }
 /* the bytes a matrix takes on the device, 0 for a format it does not take */
 static size_t cud_bytes(int fmt, int O, int I, int gs) {
     if (O < 1 || I < 1) return 0;
@@ -98,6 +103,22 @@ static int cud_mm(void **h, int *no, float *y, const float *x, int S, int fmt, c
 #endif
     const int held = fmt >= 100 && gq_r16_base(fmt - 100) >= 0 ? fmt : 0;   /* 16 rows interleaved */
     if (held) fmt = 100 + gq_r16_base(fmt - 100);
+    /* A prompt's rows CUD_ROWS at a time: the backend's scratch holds a call's x and y, and
+     * a 4104-token prompt's whole wq_b output (32768 floats a row) was 538 MB of the card's
+     * memory the expert tier holds, refused, and the matrix the CPU's for good. */
+    if (S > CUD_ROWS) {
+        for (int r0 = 0; r0 < S; r0 += CUD_ROWS)   /* a part refused: the CPU computes every row */
+            if (!cud_mm(h, no, y + (size_t)r0 * O, x + (size_t)r0 * I, S - r0 < CUD_ROWS ? S - r0 : CUD_ROWS, held ? held : fmt,
+                        w, s, O, I, gs)) return 0;
+        return 1;
+    }
+    if (cud_float(fmt)) {   /* the f32 copy a chain made (cud_tensor, a cud_entry's handle), else the CPU's for good */
+        if (!*h) { *no = 1; g_cud.left++; return 0; }
+        if (!coli_cuda_matmul((ColiCudaTensor **)h, y, x, NULL, NULL, 0, S, I, O, g_cud.dev, 0)) return 0;
+        g_cud.calls++;
+        g_cud.rows += (unsigned long long)S;
+        return 1;
+    }
     if (!*h) {
         const size_t b = cud_bytes(fmt, O, I, gs);
         const int room = b && g_cud.used + b <= g_cud.budget;
@@ -162,6 +183,41 @@ static CudEntry *cud_entry(const void *data, int fmt, int O, int I) {
     g_cud_map[at] = (CudEntry){data, fmt, O, I, 0, NULL};
     g_cud_used++;
     return &g_cud_map[at];
+}
+/* A dense matrix's device copy for an engine's CUDA chain (found by its host address, as
+ * cud_mm finds it): uploaded now if it is not there yet and the budget holds it, the rows a
+ * matrix the CPU holds 16 interleaved going up as the file's. NULL: the device does not
+ * take it (and the matrix stays the CPU's, as cud_mm leaves one). */
+static ColiCudaTensor *cud_tensor(const void *data, int fmt, int O, int I) {
+    if (!g_cud.on || !data) return NULL;
+    CudEntry *e = cud_entry(data, fmt, O, I);
+    if (!e || e->no) return NULL;
+    if (e->h) return (ColiCudaTensor *)e->h;
+    int held = fmt >= 100 && gq_r16_base(fmt - 100) >= 0 ? fmt : 0, f = held ? 100 + gq_r16_base(fmt - 100) : fmt;
+    const size_t b = cud_float(f) ? (size_t)O * I * 4 : cud_bytes(f, O, I, 0);
+    if (!b || g_cud.used + b > g_cud.budget) { e->no = 1; g_cud.left++; return NULL; }
+    if (cud_float(f)) {   /* the rows as floats */
+        const int t = f - 100;
+        const int64_t rb = gq_row_bytes(t, I);
+        float *fl = rb > 0 ? (float *)malloc((size_t)O * I * sizeof(float)) : NULL;
+        int okc = fl != NULL;
+        for (int r = 0; okc && r < O; r++) okc = !gq_dequant_row(t, (const uint8_t *)data + (size_t)r * rb, fl + (size_t)r * I, I);
+        ColiCudaTensor *ft = NULL;
+        const int up = okc && coli_cuda_tensor_upload(&ft, fl, NULL, 0, I, O, g_cud.dev);
+        free(fl);
+        if (!up || !ft) { if (ft) coli_cuda_tensor_free(ft); e->no = 1; g_cud.left++; return NULL; }
+        e->h = ft; g_cud.used += b; g_cud.mats++;
+        return ft;
+    }
+    uint8_t *rows = NULL;
+    if (held && (O % 16 || !(rows = (uint8_t *)malloc((size_t)gq_row_bytes(f - 100, I) * O)))) { e->no = 1; g_cud.left++; return NULL; }
+    if (rows) gq_r16_unpack(held - 100, rows, (const uint8_t *)data, O, I);
+    ColiCudaTensor *t = NULL;
+    const int up = coli_cuda_tensor_upload(&t, rows ? (const void *)rows : data, NULL, f, I, O, g_cud.dev);
+    free(rows);
+    if (!up || !t) { if (t) coli_cuda_tensor_free(t); e->no = 1; g_cud.left++; return NULL; }
+    e->h = t; g_cud.used += b; g_cud.mats++;
+    return t;
 }
 /* the map's device copies freed and the map with them */
 static void cud_map_free(void) {
