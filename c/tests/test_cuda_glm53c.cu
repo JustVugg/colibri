@@ -10,7 +10,9 @@
  *        transposed;
  *   kpool sparse_index.h's k-pooled selection slot for slot (exact inputs, ties among equal
  *        pools), with and without the tail, below and past CC_DSA_GRID pools; the pooled keys
- *        with real gates and bias against its arithmetic.
+ *        with real gates and bias against its arithmetic;
+ *   dsa  colibri.c's selection (GLM-5.2 and GLM-5.3, not pooled) position for position (exact
+ *        inputs, ties at the threshold), rows below topk reading every position, DSA_FORCE's.
  * The kernels round the CPU's steps in its order and contract nothing into an FMA (the reference is
  * built without contraction too): with an exp correctly rounded in their place the outputs are the
  * CPU's within 5e-7. CUDA's expf, within 2 ulp, gives 2-5e-5 on the outputs once the recurrence and
@@ -30,6 +32,8 @@ int glm53c_ref_kda_step(float *out, float *state, float *window, const float *qk
 int glm53c_ref_width(int topk, int pool, int tail);
 int glm53c_ref_kpool(int *out, const float *q, const float *keys, const float *gates, const float *hw, const float *ape,
                      const unsigned char *valid, int T, int IH, int ID, int pool, int topk, int tail, int q_from, int q_to);
+void glmdsa_ref_select(int *sel, int *nsel, const float *q, const float *hw, const float *keys, int S, int pb, int IH, int ID,
+                       int topk, int force);
 }
 
 static const ColiCudaChainOps *T;
@@ -328,6 +332,36 @@ static void test_kpool(int S, int pb, int IH, int ID, int pool, int topk, int ta
     for (CcBuf *b : all) T->free(b);
 }
 
+static void test_dsa_select(int S, int pb, int IH, int ID, int topk, int force) {
+    const int Tn = pb + S, selrow = topk + 1;
+    std::vector<float> keys((size_t)Tn * ID), q((size_t)S * IH * ID), hw((size_t)S * IH);
+    for (auto &v : keys) v = ((int)(rnd() % 17) - 8) * 0.25f;
+    for (auto &v : q) v = ((int)(rnd() % 17) - 8) * 0.25f;
+    for (auto &v : hw) v = ((int)(rnd() % 9) - 4) * 0.5f;
+    for (int t = 0; t < Tn; t += 5) for (int i = 0; i < ID; i++) keys[(size_t)t * ID + i] = keys[(size_t)(t % 3) * ID + i];   /* equal keys: ties */
+    std::vector<int> ref((size_t)S * topk), nref((size_t)S);
+    glmdsa_ref_select(ref.data(), nref.data(), q.data(), hw.data(), keys.data(), S, pb, IH, ID, topk, force);
+    CcBuf *kb = upf(keys), *qb = upf(q), *wb = upf(hw);
+    CcBuf *scb = T->buf((size_t)S * Tn * 4, CC_DEV), *sb = T->buf((size_t)S * selrow * 4, CC_DEV);
+    CcDsaSel ds = {S, pb, IH, ID, topk, force, 0, IH * ID, 0, IH, 0, Tn, selrow, 1.f / sqrtf((float)ID), 1.f / sqrtf((float)IH)};
+    const int ok = T->begin() && T->dsa_select(qb, wb, kb, scb, sb, &ds) && T->submit(1);
+    std::vector<int> got = down<int>(sb, (size_t)S * selrow);
+    int same = ok, lists = 0;
+    for (int s = 0; same && s < S; s++) {
+        const int c = got[(size_t)s * selrow];
+        if (nref[s] == 0) { same = c == -1; continue; }
+        lists++;
+        same = c == nref[s];
+        for (int i = 0; same && i < c; i++) same = got[(size_t)s * selrow + 1 + i] == ref[(size_t)s * topk + i];
+    }
+    char what[160];
+    snprintf(what, sizeof what, "dsa S %d pos %d IH %d ID %d topk %d%s: %d rows' lists position for position", S, pb, IH, ID, topk,
+             force ? " force" : "", lists);
+    ck(same, what);
+    CcBuf *all[] = {kb, qb, wb, scb, sb};
+    for (CcBuf *b : all) T->free(b);
+}
+
 int main(void) {
     int dev = 0;
     if (!coli_cuda_init(&dev, 1)) { printf("no CUDA device: skipped\n"); return 0; }
@@ -346,6 +380,13 @@ int main(void) {
     test_kpool(3, 20, 4, 16, 2, 8, 1); test_kpool(2, 9, 1, 16, 4, 8, 1); test_kpool(4, 300, 4, 64, 4, 64, 1);
     test_kpool(1, 2, 4, 16, 2, 4, 0); test_kpool(2, 30, 16, 16, 2, 6, 1); test_kpool(2, 1000, 4, 32, 4, 128, 1);
     test_kpool(2, 5000, 32, 128, 4, 2048, 1);
+    printf("dsa\n");
+    if (T->size < offsetof(ColiCudaChainOps, dsa_select) + sizeof T->dsa_select || !T->dsa_select) { printf("FAIL: the backend has no DSA select\n"); fails++; }
+    else {
+        test_dsa_select(3, 6, 2, 16, 4, 0); test_dsa_select(4, 2, 2, 16, 4, 0); test_dsa_select(2, 3, 2, 16, 8, 1);
+        test_dsa_select(3, 300, 4, 64, 64, 0); test_dsa_select(2, 2100, 32, 128, 2048, 0); test_dsa_select(5, 4000, 32, 128, 2048, 0);
+        test_dsa_select(1, 9000, 32, 128, 2048, 0); test_dsa_select(2, 30, 64, 64, 2048, 1);
+    }
     T->shutdown();
     printf(fails ? "FAIL (%d)\n" : "PASS\n", fails);
     return fails != 0;

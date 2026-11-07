@@ -578,4 +578,71 @@ static int cc_dsa_pool_select(CcBuf *iq, CcBuf *hw, CcBuf *pk, CcBuf *sc, CcBuf 
     coli_launch(ccg_dsa_pool_select_k, dim3((unsigned)p->S), 256, 0, c->stream, fp(iq), fp(hw), fp(pk), fpw(sc), (int *)fpw(sel), *p, scored);
     return launched(c, "dsa pool select");
 }
+
+/* ---- the plain DSA indexer (GLM-5.2 / GLM-5.3: no pooling) ------------------------------- */
+/* each row's score of every visible index key, colibri.c's steps in its order with nothing
+ * contracted into an FMA: per head the dot over the key, scaled by 1/sqrt(ID), its ReLU times
+ * the head's weight summed over the heads in order, the sum scaled by 1/sqrt(IH). A thread a
+ * (position, head) for the dots, then a thread a position joining the heads. */
+__global__ void __launch_bounds__(256) ccg_dsa_scores_k(const float *iq, const float *hw, const float *kc, float *sc, CcDsaSel p) {
+    __shared__ float qs[4096], ws[64], dh[256];
+    const int s = blockIdx.y, tid = threadIdx.x, P = 256 / p.IH > 0 ? 256 / p.IH : 1;
+    const int nk = p.pos_base + s + 1, t0 = (int)blockIdx.x * P;
+    if (t0 >= nk) return;
+    const int nq = p.IH * p.ID, qb = p.q_off + s * p.q_row;
+    for (int i = tid; i < nq; i += 256) qs[i] = iq[qb + i];
+    for (int h = tid; h < p.IH; h += 256) ws[h] = hw[p.w_off + s * p.w_row + h];
+    __syncthreads();
+    const int j = tid / p.IH, h = tid - j * p.IH, t = t0 + j;
+    if (j < P && t < nk) {
+        float dot = 0.f;
+        for (int d = 0; d < p.ID; d++) dot = CG_ADD(dot, CG_MUL(qs[h * p.ID + d], kc[p.k_off + t * p.ID + d]));
+        dh[tid] = CG_MUL(dot, p.rs);
+    }
+    __syncthreads();
+    if (tid < P && t0 + tid < nk) {
+        float a = 0.f;
+        for (int g = 0; g < p.IH; g++) { const float d0 = dh[tid * p.IH + g]; if (d0 > 0.f) a = CG_ADD(a, CG_MUL(ws[g], d0)); }
+        sc[s * p.sc_row + t0 + tid] = CG_MUL(a, p.wsc);
+    }
+}
+/* a block a row: the keep-th largest score bit by bit, then the positions above it and those
+ * equal to it, each in position order, as colibri.c's partial select and its two scans leave
+ * them; a row whose context is not past topk (and no force) reads every position (-1) */
+__global__ void __launch_bounds__(256) ccg_dsa_select_k(const float *sc, int *sel, CcDsaSel p) {
+    __shared__ unsigned cnt[256];
+    const int s = blockIdx.x, tid = threadIdx.x, nk = p.pos_base + s + 1;
+    const int lb = s * p.sel_row, sb = s * p.sc_row;
+    if (nk <= p.topk && !p.force) { if (tid == 0) sel[lb] = -1; return; }
+    const int keep = nk < p.topk ? nk : p.topk;
+    unsigned K = 0u;
+    for (int b = 31; b >= 0; b--) {
+        const unsigned cand = K | (1u << (unsigned)b);
+        unsigned c = 0u;
+        for (int t = tid; t < nk; t += 256) if (ccd_okey(sc[sb + t]) >= cand) c++;
+        if (ccd_wsum(c, cnt, tid) >= (unsigned)keep) K = cand;
+    }
+    const int chunk = (nk + 255) / 256, c0 = tid * chunk, c1 = nk < c0 + chunk ? nk : c0 + chunk;
+    unsigned above = 0u, at = 0u;
+    for (int t = c0; t < c1; t++) { const unsigned k = ccd_okey(sc[sb + t]); above += k > K ? 1u : 0u; at += k == K ? 1u : 0u; }
+    const unsigned n1 = ccd_wsum(above, cnt, tid);
+    unsigned o = ccd_wscan(above, cnt, tid);
+    for (int t = c0; t < c1; t++) if (ccd_okey(sc[sb + t]) > K) sel[lb + 1 + o++] = t;
+    o = n1 + ccd_wscan(at, cnt, tid);
+    for (int t = c0; t < c1 && o < (unsigned)keep; t++) if (ccd_okey(sc[sb + t]) == K) sel[lb + 1 + o++] = t;
+    if (tid == 0) sel[lb] = keep;
+}
+static int cc_dsa_select(CcBuf *iq, CcBuf *hw, CcBuf *keys, CcBuf *sc, CcBuf *sel, const CcDsaSel *p) {
+    CcCtx *c = live();
+    if (!c || !p || !iq || !hw || !keys || !sc || !sel || p->S < 1 || p->S > 65535 || p->IH < 1 || p->IH > 64 || p->ID < 1 ||
+        p->IH * p->ID > 4096 || p->topk < 1 || p->pos_base < 0 || p->sc_row < p->pos_base + p->S || p->sel_row < 1 + p->topk) return 0;
+    const int nk = p->pos_base + p->S, P = 256 / p->IH > 0 ? 256 / p->IH : 1;
+    if (nk > p->topk || p->force) {
+        coli_launch(ccg_dsa_scores_k, dim3((unsigned)((nk + P - 1) / P), (unsigned)p->S), 256, 0, c->stream, fp(iq), fp(hw), fp(keys),
+                    fpw(sc), *p);
+        if (!launched(c, "dsa scores")) return 0;
+    }
+    coli_launch(ccg_dsa_select_k, dim3((unsigned)p->S), 256, 0, c->stream, (const float *)fp(sc), (int *)fpw(sel), *p);
+    return launched(c, "dsa select");
+}
 #endif
