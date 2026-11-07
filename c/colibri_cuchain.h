@@ -39,8 +39,9 @@ typedef struct {
     KVState *owner;                           /* the state the mirror holds */
     CcBuf *prm;
     size_t *o_in, *o_post, *o_qn, *o_kn, *o_ixw, *o_ixb;
-    CcBuf **kbt, **kbv;                       /* each layer's k_b ([H*K x Q]) and v_b ([H*V x K]) as floats */
+    CcBuf **kbt, **kbv;                       /* each layer's k_b ([H*K x Q]) and v_b ([H*V x K]): floats, or Q8_0 rows */
     int *trans;                               /* kv_b as one f32 matrix [H*(Q+V) x K]: k read transposed */
+    int *q8;                                  /* k_b and v_b as a GGUF's Q8_0 rows (cc_mla_hgemv_q8) */
     CcBuf **lat, **rope, **ik;
     int *kv_valid;
     CcBuf *x, *nrm, *tmp, *h2, *gs, *us, *hs, *ds, *qa, *q, *kvs, *qabs, *clat, *ctx;
@@ -165,6 +166,28 @@ static int glmu_kvb_ok(const Model *m, const Layer *l) {
     }
     return l->kv_b.fmt == 0 && l->kv_b.qf && l->kv_b.O == c->n_heads * (c->qk_nope + c->v_head) && l->kv_b.I == c->kv_lora;
 }
+/* k_b and v_b both Q8_0 (the rows the file has, or the CPU's held by 16): the chain keeps their blocks, a quarter of
+ * the floats' bytes, and cc_mla_hgemv_q8 reads them with the floats' bits */
+static int glmu_kvb_q8(const Model *m, const Layer *l) {
+    if (l->kv_b.fmt != QT_KVB || !l->kv_b.kvb) return 0;
+    const QT *t[2] = {&l->kv_b.kvb->kb, &l->kv_b.kvb->vb};
+    for (int k = 0; k < 2; k++) {
+        const int b = gq_r16_base(t[k]->gt);
+        if (t[k]->fmt != QT_GGML || !t[k]->q4 || (b >= 0 ? b : t[k]->gt) != GQ_Q8_0 || t[k]->I % 32 || (b >= 0 && t[k]->O % 16)) return 0;
+    }
+    (void)m;
+    return 1;
+}
+/* a Q8_0 matrix's file rows, held by 16 or not: a malloc'd copy (NULL: no memory) */
+static uint8_t *glmu_q8_rows(const QT *t, size_t *bytes) {
+    const int64_t rb = gq_row_bytes(GQ_Q8_0, t->I);
+    *bytes = (size_t)rb * t->O;
+    uint8_t *r = (uint8_t *)malloc(*bytes);
+    if (!r) return NULL;
+    if (gq_r16_base(t->gt) >= 0) gq_r16_unpack(t->gt, r, t->q4, t->O, t->I);
+    else memcpy(r, t->q4, *bytes);
+    return r;
+}
 /* what the chain does not take (NULL: nothing), from the shapes alone */
 static const char *glmu_check(Model *m) {
     const Cfg *c = &m->c;
@@ -198,7 +221,8 @@ static size_t glmu_plan_bytes(const Model *m, int ctx) {
     const size_t SI = (size_t)c->moe_inter * (c->n_shared > 0 ? c->n_shared : 1), MI = SI > (size_t)c->dense_inter ? SI : (size_t)c->dense_inter;
     size_t b = 0;
     for (size_t i = 0; i < L; i++) {
-        b += NH * (Q + V) * K * 4 + (2 * D + c->q_lora + K) * 4 + (size_t)ctx * (K + R) * 4;
+        b += (glmu_kvb_q8(m, &m->L[i]) ? (NH * K * (Q / 32) + NH * V * (K / 32)) * 34 : NH * (Q + V) * K * 4) +
+             (2 * D + c->q_lora + K) * 4 + (size_t)ctx * (K + R) * 4;
         if (glmu_full(m, (int)i)) b += 2 * ID * 4 + (size_t)ctx * ID * 4;
         QT *q[16]; const int n = glmu_layer_qts((Model *)m, (int)i, q);   /* the f32 matrices, outside the dense budget */
         for (int k = 0; k < n; k++) if (q[k]->fmt != QT_GGML) b += glmu_bytes(q[k]);
@@ -265,7 +289,8 @@ static int glmu_setup(Model *m) {
     for (size_t k = 0; !why && k < sizeof offs / sizeof *offs; k++) if (!(*offs[k] = (size_t *)calloc((size_t)L, sizeof(size_t)))) why = "memory";
     CcBuf ***bufs[] = {&ch->kbt, &ch->kbv, &ch->lat, &ch->rope, &ch->ik};
     for (size_t k = 0; !why && k < sizeof bufs / sizeof *bufs; k++) if (!(*bufs[k] = (CcBuf **)calloc((size_t)L, sizeof(CcBuf *)))) why = "memory";
-    if (!why && (!(ch->kv_valid = (int *)calloc((size_t)L, sizeof(int))) || !(ch->trans = (int *)calloc((size_t)L, sizeof(int)))))
+    if (!why && (!(ch->kv_valid = (int *)calloc((size_t)L, sizeof(int))) || !(ch->trans = (int *)calloc((size_t)L, sizeof(int))) ||
+                 !(ch->q8 = (int *)calloc((size_t)L, sizeof(int)))))
         why = "memory";
     /* the parameter arena: in_ln, post_ln, the q and kv latent norms, the index key's LayerNorm */
     size_t n = 0;
@@ -298,22 +323,24 @@ static int glmu_setup(Model *m) {
         const QT *hm[2] = {NULL, NULL};
         if (l->kv_b.fmt == QT_KVB) { hm[0] = &l->kv_b.kvb->kb; hm[1] = &l->kv_b.kvb->vb; }
         else { hm[0] = &l->kv_b; ch->trans[i] = 1; }
+        ch->q8[i] = glmu_kvb_q8(m, l);
         CcBuf **hb[2] = {&ch->kbt[i], &ch->kbv[i]};
         for (int k = 0; k < 2 && !why && hm[k]; k++) {
-            float *fl = glmu_floats(hm[k]);
-            const size_t bytes = (size_t)hm[k]->O * hm[k]->I * sizeof(float);
-            if (!fl) { why = "memory"; break; }
-            if (!(*hb[k] = cc_buf(bytes, CC_DEV)) || !(cc_begin() && cc_write(*hb[k], 0, fl, bytes) && cc_submit(1)))
-                why = "an MLA matrix's floats the device refused";
-            free(fl);
+            size_t bytes = (size_t)hm[k]->O * hm[k]->I * sizeof(float);
+            void *src = ch->q8[i] ? (void *)glmu_q8_rows(hm[k], &bytes) : (void *)glmu_floats(hm[k]);
+            if (!src) { why = "memory"; break; }
+            if (!(*hb[k] = cc_buf((bytes + 3) & ~(size_t)3, CC_DEV)) || !(cc_begin() && cc_write(*hb[k], 0, src, bytes) && cc_submit(1)))
+                why = "an MLA matrix the device refused";
+            free(src);
         }
     }
     if (why) { glmu_decline(why); return 0; }
     ch->ok = 1;
-    int full = 0, dense = 0;
-    for (int i = 0; i < L; i++) { full += glmu_full(m, i); dense += !m->L[i].sparse; }
-    fprintf(stderr, "[CUDA] colibri chain: %d layers on the card (%d dense, %d with the DSA indexer), %.1f MiB of parameters "
-                    "(COLI_CUDA_CHAIN=0: the CPU's attention)\n", L, dense, full, n * 4 / 1048576.0);
+    int full = 0, dense = 0, q8 = 0;
+    for (int i = 0; i < L; i++) { full += glmu_full(m, i); dense += !m->L[i].sparse; q8 += ch->q8[i]; }
+    fprintf(stderr, "[CUDA] colibri chain: %d layers on the card (%d dense, %d with the DSA indexer), k_b and v_b as %s, "
+                    "%.1f MiB of parameters (COLI_CUDA_CHAIN=0: the CPU's attention)\n", L, dense, full,
+            q8 == L ? "the file's Q8_0 rows" : q8 ? "Q8_0 rows or floats" : "floats", n * 4 / 1048576.0);
     return 1;
 }
 
@@ -443,9 +470,10 @@ static int glmu_attn(GlmU *ch, Model *m, int i, int n, int pb, int *sel_on) {
     CcHgemv va = ch->trans[i] ? (CcHgemv){0, n, NH, V, Q + V, Q, 0, HK, K, 0, HV, V, 0, HV, 0, K, 0}
                               : (CcHgemv){0, n, NH, V, V, 0, 0, HK, K, 0, HV, V, 0, HV, 0, K, 0};
     CcMlaCore cp = {n, NH, K, R, pb, 0, 0, HK, K, Q, NH * QR, QR, 0, K, 0, R, 0, *sel_on ? 1 + TK : 0, 0, HK, K, c->attn_scale};
-    return ok && cc_mla_hgemv(ch->kbt[i], ch->q, ch->qabs, NULL, &qa) &&
+    return ok && (ch->q8[i] ? cc_mla_hgemv_q8(ch->kbt[i], ch->q, ch->qabs, &qa) : cc_mla_hgemv(ch->kbt[i], ch->q, ch->qabs, NULL, &qa)) &&
            cc_mla_core(ch->qabs, ch->q, ch->lat[i], ch->rope[i], *sel_on ? ch->sel : NULL, ch->clat, &cp) &&
-           cc_mla_hgemv(ch->trans[i] ? ch->kbt[i] : ch->kbv[i], ch->clat, ch->ctx, NULL, &va) &&
+           (ch->q8[i] ? cc_mla_hgemv_q8(ch->kbv[i], ch->clat, ch->ctx, &va)
+                      : cc_mla_hgemv(ch->trans[i] ? ch->kbt[i] : ch->kbv[i], ch->clat, ch->ctx, NULL, &va)) &&
            cc_matmul(glmu_tensor(&l->o), ch->ctx, 0, ch->tmp, 0, n);
 }
 

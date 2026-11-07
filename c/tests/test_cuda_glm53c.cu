@@ -12,7 +12,8 @@
  *        pools), with and without the tail, below and past CC_DSA_GRID pools; the pooled keys
  *        with real gates and bias against its arithmetic;
  *   dsa  colibri.c's selection (GLM-5.2 and GLM-5.3, not pooled) position for position (exact
- *        inputs, ties at the threshold), rows below topk reading every position, DSA_FORCE's.
+ *        inputs, ties at the threshold), rows below topk reading every position, DSA_FORCE's; the
+ *        per-head matmul on a GGUF's Q8_0 rows against the float one on the same rows, bit for bit.
  * The kernels round the CPU's steps in its order and contract nothing into an FMA (the reference is
  * built without contraction too): with an exp correctly rounded in their place the outputs are the
  * CPU's within 5e-7. CUDA's expf, within 2 ulp, gives 2-5e-5 on the outputs once the recurrence and
@@ -23,6 +24,7 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
+#include <cuda_fp16.h>
 #include "../backend_cuda.h"
 #include "../cuda_chain.h"
 extern "C" {   /* tests/cuda_glm53c_ref.c */
@@ -286,6 +288,39 @@ static void test_hgemv(int trans) {
     for (CcBuf *b : all) T->free(b);
 }
 /* the k-pooled selection slot for slot against sparse_index.h, then the pooled keys */
+/* the Q8_0 rows kernel against the float rows kernel on the same rows dequantized (d * q in f32, as
+ * ggml_quants.h): the same bits */
+static void test_hgemv_q8(int H, int n, int I, int hstride, int hoff) {
+    const int S = 3, O = (H - 1) * hstride + hoff + n, nb = I / 32, xseg = I + 3, xrow = H * xseg + 1, yseg = n + 2, yrow = H * yseg;
+    std::vector<unsigned char> raw((size_t)O * nb * 34);
+    std::vector<float> W((size_t)O * I);
+    for (int r = 0; r < O; r++) for (int b = 0; b < nb; b++) {
+        unsigned char *blk = &raw[((size_t)r * nb + b) * 34];
+        const float d = (frnd() + 1.5f) * 0.01f;
+        __half hd = __float2half(d);
+        unsigned short u; memcpy(&u, &hd, 2);
+        blk[0] = (unsigned char)(u & 255); blk[1] = (unsigned char)(u >> 8);
+        const float df = __half2float(hd);
+        for (int j = 0; j < 32; j++) {
+            const signed char q = (signed char)((int)(rnd() % 255) - 127);
+            blk[2 + j] = (unsigned char)q;
+            W[(size_t)r * I + b * 32 + j] = df * (float)q;
+        }
+    }
+    std::vector<float> x = fvec((size_t)S * xrow + 5, 1.f);
+    CcBuf *wf = upf(W), *wq = up(raw.data(), (raw.size() + 3) & ~(size_t)3), *xb = upf(x);
+    CcBuf *ya = T->buf((size_t)S * yrow * 4, CC_DEV), *yb = T->buf((size_t)S * yrow * 4, CC_DEV);
+    CcHgemv p = {0, S, H, n, hstride, hoff, 5, xrow, xseg, 0, yrow, yseg, 0, 0, 0, I, 0};
+    const int ok = T->begin() && T->zero(ya, 0, (size_t)S * yrow) && T->zero(yb, 0, (size_t)S * yrow) &&
+                   T->mla_hgemv(wf, xb, ya, NULL, &p) && T->mla_hgemv_q8(wq, xb, yb, &p) && T->submit(1);
+    std::vector<float> a = down<float>(ya, (size_t)S * yrow), b = down<float>(yb, (size_t)S * yrow);
+    char what[120];
+    snprintf(what, sizeof what, "hgemv q8 H %d n %d I %d: the float kernel's bits", H, n, I);
+    ck(ok && !memcmp(a.data(), b.data(), a.size() * 4) && !bad(a.data(), a.size()), what);
+    CcBuf *all[] = {wf, wq, xb, ya, yb};
+    for (CcBuf *c : all) T->free(c);
+}
+
 static void test_kpool(int S, int pb, int IH, int ID, int pool, int topk, int tail) {
     const int Tn = pb + S, width = glm53c_ref_width(topk, pool, tail), selrow = width + 1, npool = Tn / pool, scrow = npool + 1;
     std::vector<float> keys((size_t)Tn * ID), gates((size_t)Tn * ID, 0.f), ape((size_t)pool * ID, 0.f), q((size_t)S * IH * ID), hw((size_t)S * IH);
@@ -381,11 +416,13 @@ int main(void) {
     test_kpool(1, 2, 4, 16, 2, 4, 0); test_kpool(2, 30, 16, 16, 2, 6, 1); test_kpool(2, 1000, 4, 32, 4, 128, 1);
     test_kpool(2, 5000, 32, 128, 4, 2048, 1);
     printf("dsa\n");
-    if (T->size < offsetof(ColiCudaChainOps, dsa_select) + sizeof T->dsa_select || !T->dsa_select) { printf("FAIL: the backend has no DSA select\n"); fails++; }
+    if (T->size < offsetof(ColiCudaChainOps, mla_hgemv_q8) + sizeof T->mla_hgemv_q8 || !T->dsa_select || !T->mla_hgemv_q8) {
+        printf("FAIL: the backend has no GLM-5.2 / GLM-5.3 ops\n"); fails++; }
     else {
         test_dsa_select(3, 6, 2, 16, 4, 0); test_dsa_select(4, 2, 2, 16, 4, 0); test_dsa_select(2, 3, 2, 16, 8, 1);
         test_dsa_select(3, 300, 4, 64, 64, 0); test_dsa_select(2, 2100, 32, 128, 2048, 0); test_dsa_select(5, 4000, 32, 128, 2048, 0);
         test_dsa_select(1, 9000, 32, 128, 2048, 0); test_dsa_select(2, 30, 64, 64, 2048, 1);
+        test_hgemv_q8(4, 32, 192, 32, 0); test_hgemv_q8(64, 256, 512, 256, 0); test_hgemv_q8(3, 20, 64, 29, 5);
     }
     T->shutdown();
     printf(fails ? "FAIL (%d)\n" : "PASS\n", fails);

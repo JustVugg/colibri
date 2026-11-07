@@ -645,4 +645,36 @@ static int cc_dsa_select(CcBuf *iq, CcBuf *hw, CcBuf *keys, CcBuf *sc, CcBuf *se
     coli_launch(ccg_dsa_select_k, dim3((unsigned)p->S), 256, 0, c->stream, (const float *)fp(sc), (int *)fpw(sel), *p);
     return launched(c, "dsa select");
 }
+
+/* chain_hgemv's rows mode on a GGUF's Q8_0 rows as the file has them (k_b and v_b in unsloth's GLM files): each
+ * value d * q in f32, then the products and the warp's sum as ccg_hgemv_rows_k's on the dequantized floats: the
+ * same bits from a quarter of the bytes. w_off in bytes, a row I / 32 blocks of 34 (an f16 scale, 32 int8). */
+__global__ void __launch_bounds__(256) ccg_hgemv_q8_k(const float *x, const unsigned char *w, float *y, CcHgemv p) {
+    const int s = blockIdx.y, lane = threadIdx.x & 31, nsg = 8, total = p.H * p.n, stride = (int)gridDim.x * nsg;
+    const long rb = (long)(p.I / 32) * 34;
+    for (int og = (int)blockIdx.x * nsg + (int)(threadIdx.x >> 5); og < total; og += stride) {
+        const int h = og / p.n, o = og - h * p.n;
+        const long row = (long)h * p.hstride + p.hoff + o;
+        const int xb = p.x_off + s * p.x_row + h * p.x_seg;
+        const unsigned char *wr = w + p.w_off + row * rb;
+        float a = 0.f;
+        for (int i = lane; i < p.I; i += 32) {
+            const unsigned char *blk = wr + (long)(i >> 5) * 34;
+            const float d = __half2float(__ushort_as_half((unsigned short)(blk[0] | (blk[1] << 8))));
+            const float v = __fmul_rn(d, (float)(signed char)blk[2 + (i & 31)]);
+            a += v * x[xb + i];
+        }
+        const float tot = cg_warp_sum(a);
+        if (lane == 0) y[p.y_off + s * p.y_row + h * p.y_seg + o] = tot;
+    }
+}
+static int cc_mla_hgemv_q8(CcBuf *w, CcBuf *x, CcBuf *y, const CcHgemv *p) {
+    CcCtx *c = live();
+    if (!c || !p || !w || !x || !y || p->trans || p->has_gate || p->S < 1 || p->S > 65535 || p->H < 1 || p->n < 1 || p->I < 32 ||
+        p->I % 32 || p->w_off < 0) return 0;
+    long rows = (long)p->H * p->n, wg = (rows + 7) / 8;
+    if (wg > 4096) wg = 4096;
+    coli_launch(ccg_hgemv_q8_k, dim3((unsigned)wg, (unsigned)p->S), 256, 0, c->stream, fp(x), (const unsigned char *)fp(w), fpw(y), *p);
+    return launched(c, "mla hgemv q8");
+}
 #endif
