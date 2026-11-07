@@ -1753,6 +1753,108 @@ static float dev_fp8(uint8_t b) {   /* e4m3 as the backend decodes it */
     const float v = e == 0 ? m / 512.0f : ldexpf(1.0f + m / 8.0f, e - 7);
     return (b & 0x80) ? -v : v;
 }
+/* dev_fp8 of every code, written out (exact: three mantissa bits). The hybrid steps' FP8 rows read
+ * their weights from it instead of an ldexpf and a division for the scale per weight. As in
+ * dev_fp8, the two NaN codes of e4m3 (0x7f, 0xff) are finite here (+-480) where the shaders and
+ * quant.h give NaN; a well-formed checkpoint saturates at +-448 and never holds them. */
+static const float fp8_e4m3[256] __attribute__((aligned(64))) = {
+    0.0f, 0x1p-9f, 0x1p-8f, 0x1.8p-8f, 0x1p-7f, 0x1.4p-7f, 0x1.8p-7f, 0x1.cp-7f,
+    0x1p-6f, 0x1.2p-6f, 0x1.4p-6f, 0x1.6p-6f, 0x1.8p-6f, 0x1.ap-6f, 0x1.cp-6f, 0x1.ep-6f,
+    0x1p-5f, 0x1.2p-5f, 0x1.4p-5f, 0x1.6p-5f, 0x1.8p-5f, 0x1.ap-5f, 0x1.cp-5f, 0x1.ep-5f,
+    0x1p-4f, 0x1.2p-4f, 0x1.4p-4f, 0x1.6p-4f, 0x1.8p-4f, 0x1.ap-4f, 0x1.cp-4f, 0x1.ep-4f,
+    0x1p-3f, 0x1.2p-3f, 0x1.4p-3f, 0x1.6p-3f, 0x1.8p-3f, 0x1.ap-3f, 0x1.cp-3f, 0x1.ep-3f,
+    0x1p-2f, 0x1.2p-2f, 0x1.4p-2f, 0x1.6p-2f, 0x1.8p-2f, 0x1.ap-2f, 0x1.cp-2f, 0x1.ep-2f,
+    0x1p-1f, 0x1.2p-1f, 0x1.4p-1f, 0x1.6p-1f, 0x1.8p-1f, 0x1.ap-1f, 0x1.cp-1f, 0x1.ep-1f,
+    0x1p+0f, 0x1.2p+0f, 0x1.4p+0f, 0x1.6p+0f, 0x1.8p+0f, 0x1.ap+0f, 0x1.cp+0f, 0x1.ep+0f,
+    0x1p+1f, 0x1.2p+1f, 0x1.4p+1f, 0x1.6p+1f, 0x1.8p+1f, 0x1.ap+1f, 0x1.cp+1f, 0x1.ep+1f,
+    0x1p+2f, 0x1.2p+2f, 0x1.4p+2f, 0x1.6p+2f, 0x1.8p+2f, 0x1.ap+2f, 0x1.cp+2f, 0x1.ep+2f,
+    0x1p+3f, 0x1.2p+3f, 0x1.4p+3f, 0x1.6p+3f, 0x1.8p+3f, 0x1.ap+3f, 0x1.cp+3f, 0x1.ep+3f,
+    0x1p+4f, 0x1.2p+4f, 0x1.4p+4f, 0x1.6p+4f, 0x1.8p+4f, 0x1.ap+4f, 0x1.cp+4f, 0x1.ep+4f,
+    0x1p+5f, 0x1.2p+5f, 0x1.4p+5f, 0x1.6p+5f, 0x1.8p+5f, 0x1.ap+5f, 0x1.cp+5f, 0x1.ep+5f,
+    0x1p+6f, 0x1.2p+6f, 0x1.4p+6f, 0x1.6p+6f, 0x1.8p+6f, 0x1.ap+6f, 0x1.cp+6f, 0x1.ep+6f,
+    0x1p+7f, 0x1.2p+7f, 0x1.4p+7f, 0x1.6p+7f, 0x1.8p+7f, 0x1.ap+7f, 0x1.cp+7f, 0x1.ep+7f,
+    0x1p+8f, 0x1.2p+8f, 0x1.4p+8f, 0x1.6p+8f, 0x1.8p+8f, 0x1.ap+8f, 0x1.cp+8f, 0x1.ep+8f,
+    -0.0f, -0x1p-9f, -0x1p-8f, -0x1.8p-8f, -0x1p-7f, -0x1.4p-7f, -0x1.8p-7f, -0x1.cp-7f,
+    -0x1p-6f, -0x1.2p-6f, -0x1.4p-6f, -0x1.6p-6f, -0x1.8p-6f, -0x1.ap-6f, -0x1.cp-6f, -0x1.ep-6f,
+    -0x1p-5f, -0x1.2p-5f, -0x1.4p-5f, -0x1.6p-5f, -0x1.8p-5f, -0x1.ap-5f, -0x1.cp-5f, -0x1.ep-5f,
+    -0x1p-4f, -0x1.2p-4f, -0x1.4p-4f, -0x1.6p-4f, -0x1.8p-4f, -0x1.ap-4f, -0x1.cp-4f, -0x1.ep-4f,
+    -0x1p-3f, -0x1.2p-3f, -0x1.4p-3f, -0x1.6p-3f, -0x1.8p-3f, -0x1.ap-3f, -0x1.cp-3f, -0x1.ep-3f,
+    -0x1p-2f, -0x1.2p-2f, -0x1.4p-2f, -0x1.6p-2f, -0x1.8p-2f, -0x1.ap-2f, -0x1.cp-2f, -0x1.ep-2f,
+    -0x1p-1f, -0x1.2p-1f, -0x1.4p-1f, -0x1.6p-1f, -0x1.8p-1f, -0x1.ap-1f, -0x1.cp-1f, -0x1.ep-1f,
+    -0x1p+0f, -0x1.2p+0f, -0x1.4p+0f, -0x1.6p+0f, -0x1.8p+0f, -0x1.ap+0f, -0x1.cp+0f, -0x1.ep+0f,
+    -0x1p+1f, -0x1.2p+1f, -0x1.4p+1f, -0x1.6p+1f, -0x1.8p+1f, -0x1.ap+1f, -0x1.cp+1f, -0x1.ep+1f,
+    -0x1p+2f, -0x1.2p+2f, -0x1.4p+2f, -0x1.6p+2f, -0x1.8p+2f, -0x1.ap+2f, -0x1.cp+2f, -0x1.ep+2f,
+    -0x1p+3f, -0x1.2p+3f, -0x1.4p+3f, -0x1.6p+3f, -0x1.8p+3f, -0x1.ap+3f, -0x1.cp+3f, -0x1.ep+3f,
+    -0x1p+4f, -0x1.2p+4f, -0x1.4p+4f, -0x1.6p+4f, -0x1.8p+4f, -0x1.ap+4f, -0x1.cp+4f, -0x1.ep+4f,
+    -0x1p+5f, -0x1.2p+5f, -0x1.4p+5f, -0x1.6p+5f, -0x1.8p+5f, -0x1.ap+5f, -0x1.cp+5f, -0x1.ep+5f,
+    -0x1p+6f, -0x1.2p+6f, -0x1.4p+6f, -0x1.6p+6f, -0x1.8p+6f, -0x1.ap+6f, -0x1.cp+6f, -0x1.ep+6f,
+    -0x1p+7f, -0x1.2p+7f, -0x1.4p+7f, -0x1.6p+7f, -0x1.8p+7f, -0x1.ap+7f, -0x1.cp+7f, -0x1.ep+7f,
+    -0x1p+8f, -0x1.2p+8f, -0x1.4p+8f, -0x1.6p+8f, -0x1.8p+8f, -0x1.ap+8f, -0x1.cp+8f, -0x1.ep+8f,
+};
+#if defined(__AVX2__) && defined(__FMA__)
+static inline float fp8_hsum(__m256 v) {
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    return _mm_cvtss_f32(_mm_add_ss(s, _mm_movehdup_ps(s)));
+}
+#endif
+/* An FP8 e4m3 row (fmt 12, a scale per gs columns; gs 0: one for the row) against n float rows, n
+ * a constant where it is inlined: eight columns a step, the codes' values gathered from fp8_e4m3,
+ * a group's sums times its scale once. The float reference (dev_dequant, then a scalar sum per
+ * row) took an ldexpf and a division per weight: on a Xeon Gold 6254, 16 threads, Qwen3.8-Flash-
+ * Next's host pool pairs took 41 ms a layer step (6.4 pairs, 0.75 GB/s). Same weights; each
+ * group's sum times its scale instead of each weight times it, and the sums in another order
+ * (eight lanes): within 4.1e-7 of a double-precision reference (tests/test_vk_tier host-pairs). */
+static inline __attribute__((always_inline)) void fp8_rows_n(float *y, int ys, const float *const *xf, const uint8_t *row,
+                                                              int I, const float *rs, int gs, const int n) {
+    if (gs <= 0) gs = I;
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256 tot[4], grp[4];
+    float tail[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int k = 0; k < n; k++) tot[k] = _mm256_setzero_ps();
+    for (int g0 = 0; g0 < I; g0 += gs) {
+        const int g1 = g0 + gs < I ? g0 + gs : I;
+        const float sc = rs[g0 / gs];
+        for (int k = 0; k < n; k++) grp[k] = _mm256_setzero_ps();
+        int i = g0;
+        for (; i + 8 <= g1; i += 8) {
+            const __m256 w = _mm256_i32gather_ps(fp8_e4m3, _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(row + i))), 4);
+            for (int k = 0; k < n; k++) grp[k] = _mm256_fmadd_ps(w, _mm256_loadu_ps(xf[k] + i), grp[k]);
+        }
+        const __m256 scv = _mm256_set1_ps(sc);
+        for (int k = 0; k < n; k++) tot[k] = _mm256_fmadd_ps(grp[k], scv, tot[k]);
+        for (; i < g1; i++) {
+            const float w = fp8_e4m3[row[i]] * sc;
+            for (int k = 0; k < n; k++) tail[k] += w * xf[k][i];
+        }
+    }
+    for (int k = 0; k < n; k++) y[(size_t)k * ys] = fp8_hsum(tot[k]) + tail[k];
+#else
+    float tot[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int g0 = 0; g0 < I; g0 += gs) {
+        const int g1 = g0 + gs < I ? g0 + gs : I;
+        float grp[4] = {0.f, 0.f, 0.f, 0.f};
+        for (int i = g0; i < g1; i++) {
+            const float w = fp8_e4m3[row[i]];
+            for (int k = 0; k < n; k++) grp[k] += w * xf[k][i];
+        }
+        for (int k = 0; k < n; k++) tot[k] += grp[k] * rs[g0 / gs];
+    }
+    for (int k = 0; k < n; k++) y[(size_t)k * ys] = tot[k];
+#endif
+}
+/* fp8_rows_n for any count of rows, four at a time (a step of the hybrid has one to eight) */
+static void fp8_rows(float *y, int ys, int S, const float *const *xf, const uint8_t *row, int I, const float *rs, int gs) {
+    for (int s = 0; s < S; s += 4) {
+        float *ys0 = y + (size_t)s * ys;
+        switch (S - s) {
+        case 1: fp8_rows_n(ys0, ys, xf + s, row, I, rs, gs, 1); break;
+        case 2: fp8_rows_n(ys0, ys, xf + s, row, I, rs, gs, 2); break;
+        case 3: fp8_rows_n(ys0, ys, xf + s, row, I, rs, gs, 3); break;
+        default: fp8_rows_n(ys0, ys, xf + s, row, I, rs, gs, 4); break;
+        }
+    }
+}
 /* Activation row q (int8 per 32, dx its scales, xs its sums per 16) against a row's codes:
  * int8 w8, or int4 u4 (0..15, the value + 8: the bias comes back with the activation's
  * sums). rs: the row's scale (gs 0) or its groups' of gs columns. Integer sums a block, then
@@ -1932,7 +2034,11 @@ static float hy_dot8(const int8_t *w8, const float *rs, int gs, const gq_act *a,
  * bits whatever rows share the call. tmp: I floats, and for an int4 row I bytes after them. */
 static inline void host_rows(float *y, int ys, const gq_act *a, const HyAct *hp, const float *const *xf, const uint8_t *row, int t, int I,
                              float *tmp, const float *rs, int gs) {
-    if (t < 0 && (-t == 12 || (-t == 7 && I / gs > 2048)) && !gq_exact_mode()) {   /* FP8 has no integer form: its floats against x's */
+    if (t == -12 && !gq_exact_mode()) {   /* FP8 has no integer form: its codes' floats, a scale a group (fp8_rows) */
+        fp8_rows(y, ys, a->S, xf, row, I, rs, gs);
+        return;
+    }
+    if (t == -7 && I / gs > 2048 && !gq_exact_mode()) {   /* MXFP4 rows of more than 2048 groups: their floats against x's */
         dev_dequant(tmp, row, -t, rs, gs, I);
         for (int s = 0; s < a->S; s++) {
             const float *x = xf[s];
