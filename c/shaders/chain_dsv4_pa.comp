@@ -42,7 +42,7 @@ float bf16r(float f) {   // round to nearest even, as coli_bf16_round
 }
 
 shared float sq[64 * 32];    // mode 0: 64 heads x 32 floats of the queries
-shared float sk[64 * 65];    // mode 0: 64 entries x 32 floats (row 33); mode 2: 32 entries x 64 dims (row 65)
+shared float sk[3072];       // mode 0: 64 entries x 32 floats (row 33); mode 1: the weights (cnt <= 3072); mode 2: 32 entries x 64 dims (row 65)
 shared float sw[64 * 33];    // mode 2: 64 heads x 32 weights
 shared int se[64];
 shared float red[256];
