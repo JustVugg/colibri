@@ -1575,12 +1575,28 @@ typedef struct {
     uint8_t *piece[GLM53_EXPERT_PIECES];
     uint8_t *own;
     size_t own_len;
+    int own_al;                           /* own came from posix_memalign: compat_aligned_free */
     int metal_registered;
     uint64_t used;
     uint8_t *vk_rows;                     /* a GGUF expert held interleaved: the file's rows for the
                                            * Vulkan tier while it reads them (glm53_slot_src) */
 } Slot;
 typedef struct LCache { Slot *s; int n, cap; } LCache;
+static void g53_slot_free(Slot *s) {
+    if (s->own_al) compat_aligned_free(s->own); else free(s->own);
+    s->own = NULL; s->own_al = 0;
+}
+/* O_DIRECT for the routed experts' reads (G53_DIRECT=0: through the page cache, as before).
+ * An expert read from the disk is wanted once, and a buffered read is copied into the page
+ * cache and out again. With the RAM given to the tier's host pool the cache has no room to
+ * keep it either: GLM-5.3-Flash UD-IQ2_XXS on 62 GB, a 128-token turn read 22.5 GB, kswapd
+ * reclaimed 23 GB of it and 21 GB came back as refaults, and the compaction this keeps up
+ * migrated the engine's pages under its threads (a TLB shootdown on every core each time). */
+static int g53_direct(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("G53_DIRECT"); on = e && *e ? atoi(e) != 0 : 1; }
+    return on;
+}
 
 /* Lunghezze e posizioni dei sei pezzi dentro allo slot. Gate e up sono
  * [moe_inter, hidden], down e' [hidden, moe_inter]: stessi byte, forme
@@ -2086,12 +2102,20 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
 
     /* Fallback/Metal path: write into memory owned by the slot. Metal requires
      * page alignment and a page-multiple registration length. The base stays
-     * stable across LRU reuse, so registration happens only on first allocation. */
+     * stable across LRU reuse, so registration happens only on first allocation.
+     * The direct reads (g53_direct) put each piece on a window of its own that
+     * starts at an aligned address, ST_DIRECT_ALIGN slack before it and after. */
+    const int direct = !metal_slot && g53_direct();
     if (!slot->own) {
         size_t need = ((size_t)m->e_slot + 16383u) & ~(size_t)16383u;
         void *p = NULL;
         if (metal_slot) {
             if (posix_memalign(&p, 16384, need) != 0) p = NULL;
+            slot->own_al = 1;
+        } else if (direct) {
+            need = (size_t)m->e_slot + 2u * GLM53_EXPERT_PIECES * ST_DIRECT_ALIGN;
+            if (posix_memalign(&p, ST_DIRECT_ALIGN, need) != 0) p = NULL;
+            slot->own_al = 1;
         } else {
             p = malloc((size_t)m->e_slot);
             need = (size_t)m->e_slot;
@@ -2112,12 +2136,29 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
 #endif
     }
 
-    for (int p = 0; p < GLM53_EXPERT_PIECES; p++)
-        slot->piece[p] = slot->own + m->e_at[p];
+    if (!direct)
+        for (int p = 0; p < GLM53_EXPERT_PIECES; p++)
+            slot->piece[p] = slot->own + m->e_at[p];
+    else if (ref->contig) {   /* one window: the six pieces after the first one's offset in its block */
+        const int64_t pad = ref->off[0] % ST_DIRECT_ALIGN;
+        for (int p = 0; p < GLM53_EXPERT_PIECES; p++) slot->piece[p] = slot->own + pad + m->e_at[p];
+    } else {   /* a window a piece, each at an aligned address plus its offset's remainder */
+        int64_t at = 0;
+        for (int p = 0; p < GLM53_EXPERT_PIECES; p++) {
+            const int64_t w = (at + ST_DIRECT_ALIGN - 1) & ~(int64_t)(ST_DIRECT_ALIGN - 1);
+            const int64_t pad = e_len_at(m, layer, p) ? ref->off[p] % ST_DIRECT_ALIGN : 0;
+            slot->piece[p] = slot->own + w + pad;
+            at = w + pad + m->e_len[p];   /* the slot's room for the piece, the file's or the interleaved form */
+        }
+    }
 
     if (ref->contig) {
-        int fd = rep > 0 ? st_fd_rep(&m->S, ref->fd[0], rep) : ref->fd[0];
-        st_pread_full(fd, slot->own, m->e_slot, ref->off[0], "expert");
+        if (direct)
+            st_read_range_rep(&m->S, ref->fd[0], rep, ref->off[0], m->e_slot, slot->piece[0], m->e_slot, 0, 1, "expert");
+        else {
+            int fd = rep > 0 ? st_fd_rep(&m->S, ref->fd[0], rep) : ref->fd[0];
+            st_pread_full(fd, slot->own, m->e_slot, ref->off[0], "expert");
+        }
     } else {
         for (int p = 0; p < GLM53_EXPERT_PIECES; p++) {
             if (!e_len_at(m, layer, p)) continue;
@@ -2125,22 +2166,29 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
             const int k = p / 2;
             if (m->gx && m->gx_h[3 * layer + k] != m->gx_t[3 * layer + k]) {   /* through a copy, interleaved */
                 static __thread uint8_t *raw; static __thread int64_t raw_n;
-                const int64_t n = e_len_at(m, layer, p);
-                if (raw_n < n) {
-                    free(raw); raw = malloc((size_t)n); raw_n = raw ? n : 0;
-                    if (!raw) { fprintf(stderr, "OOM reading a GGUF expert\n"); exit(1); }
+                const int64_t n = e_len_at(m, layer, p), pad = direct ? ref->off[p] % ST_DIRECT_ALIGN : 0;
+                if (raw_n < n + 2 * ST_DIRECT_ALIGN) {   /* aligned, with the direct read's slack */
+                    compat_aligned_free(raw); raw = NULL; raw_n = 0;
+                    if (posix_memalign((void **)&raw, ST_DIRECT_ALIGN, (size_t)(n + 2 * ST_DIRECT_ALIGN)) != 0 || !raw) {
+                        fprintf(stderr, "OOM reading a GGUF expert\n"); exit(1); }
+                    raw_n = n + 2 * ST_DIRECT_ALIGN;
                 }
-                st_pread_full(fd, raw, n, ref->off[p], "expert piece");
+                if (direct) st_read_range_rep(&m->S, ref->fd[p], rep, ref->off[p], n, raw + pad, n, 0, 1, "expert piece");
+                else st_pread_full(fd, raw, n, ref->off[p], "expert piece");
                 const int rows = k == 2 ? m->c.hidden : m->c.moe_inter, cols = k == 2 ? m->c.moe_inter : m->c.hidden;
-                gq_r16_pack(m->gx_h[3 * layer + k], slot->own + m->e_at[p], raw, rows, cols);
+                gq_r16_pack(m->gx_h[3 * layer + k], slot->piece[p], raw + pad, rows, cols);
                 continue;
             }
 
-            st_pread_full(fd,
-                          slot->own + m->e_at[p],
-                          e_len_at(m, layer, p),
-                          ref->off[p],
-                          "expert piece");
+            if (direct)
+                st_read_range_rep(&m->S, ref->fd[p], rep, ref->off[p], e_len_at(m, layer, p), slot->piece[p],
+                                  e_len_at(m, layer, p), 0, 1, "expert piece");
+            else
+                st_pread_full(fd,
+                              slot->own + m->e_at[p],
+                              e_len_at(m, layer, p),
+                              ref->off[p],
+                              "expert piece");
         }
     }
 
@@ -4043,7 +4091,7 @@ static void model_release(GModel *m) {
     if (m->ecache) {
         for (int i = 0; i < m->c.n_layers; i++) {
             LCache *cache = &m->ecache[i];
-            for (int j = 0; j < cache->cap; j++) free(cache->s[j].own);
+            for (int j = 0; j < cache->cap; j++) g53_slot_free(&cache->s[j]);
             free(cache->s);
         }
         free(m->ecache);
@@ -5651,7 +5699,7 @@ static void glm53_vk_tier_start(GModel *m) {
                     expert_read(m, pl[i], pe[i], &tmp);
                     VktExpertSrc src = glm53_slot_src(m, pl[i], &tmp);
                     XT(put)(pl[i], pe[i], &src);
-                    free(tmp.own); free(tmp.vk_rows);
+                    g53_slot_free(&tmp); free(tmp.vk_rows);
                 }
                 XT(put_done)();
                 m->hits = hits; m->miss = miss; m->ebytes = eb;
