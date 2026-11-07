@@ -381,7 +381,7 @@ backend_loader_dsv4.o: backend_loader_dsv4.c backend_cuda_dsv4.h $(V4_FLAGS_STAM
 # Linux/macOS CUDA=1: the tier compiled straight into the engine.
 backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h $(V4_DEEPGEMM_DEP) \
 	$(V4_CUDA_FLAGS_STAMP)
-	"$(NVCC)" $(V4_NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
+	"$(NVCC)" $(V4_NVCCFLAGS) -MMD -MP -MF backend_cuda_dsv4.d -c backend_cuda_dsv4.cu -o $@
 
 ifneq ($(DEEPGEMM_STAMP),)
 $(DEEPGEMM_STAMP):
@@ -402,4 +402,9 @@ deepseek-v4-clean:
 	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_HOT_TEST_OBJ) \
 		$(V4_BATCH_TEST_OBJ) \
 		$(V4_SERVE_TEST) test_expert_store_registry $(V4_FLAGS_STAMP) \
-		$(V4_CUDA_FLAGS_STAMP) backend_vulkan_v4.o vk_tier_v4.o vk_chain_v4.o
+		$(V4_CUDA_FLAGS_STAMP) backend_cuda_dsv4.d backend_vulkan_v4.o vk_tier_v4.o vk_chain_v4.o
+
+# Bootstrap dependency tracking for old objects and regenerate deleted depfiles.
+backend_cuda_dsv4.o: backend_cuda_dsv4.d
+backend_cuda_dsv4.d: ;
+-include $(wildcard backend_cuda_dsv4.d)
