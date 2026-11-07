@@ -342,12 +342,12 @@ Every engine on the routed-expert tier. A second GPU holds the experts after the
 
 | Variable | Default | Effect |
 |---|---|---|
-| `COLI_VK_DEV2` | unset (off) | A second GPU for the routed-expert tier, every engine on it: the experts after the primary device's ([vulkan.md](vulkan.md#a-second-device-coli_vk_dev2)). A number selects that device index; `auto` picks a distinct real GPU, a discrete one first. A second *logical* device on the same physical GPU is accepted only when forced by index: that is the test mode. With `COLI_VK_TIER=0`, colibri keeps its own fixed registry there. |
+| `COLI_VK_DEV2` | unset (off) | A second GPU for the routed-expert tier, every engine on it: the experts after the primary device's ([vulkan.md](vulkan.md#a-second-device-coli_vk_dev2)). A number selects that device index; `auto` picks a distinct real GPU, a discrete one first. A second *logical* device on the same physical GPU is accepted only when forced by index: that is the test mode. With `COLI_VK_TIER=0`, colibri keeps its own fixed registry there. On the CUDA tier the same with CUDA's device indices: `auto` the first CUDA device that is not the primary ([cuda.md](cuda.md#the-engines-routed-expert-tier-on-cuda-cu_tier)). |
 | `COLI_VK_EXPERTS2` | tier: unset (the budget decides); colibri's registry: `512` | Expert count cap on the second device. |
 | `COLI_VK_RESERVE2_GB` | `0.5` | Device memory (GiB) held back on the second device, as `COLI_VK_TIER_RESERVE_GB` is for the primary one. |
 | `COLI_VK_TIER_EXCLUSIVE` | on | Exclusive RAM/VRAM: an engine's RAM expert cache that must evict gives up first a slot whose expert the Vulkan tier holds, and the prefetchers that read experts into RAM skip such an expert, so the two caches hold different experts when RAM is short. `0` keeps the copies ([vulkan.md](vulkan.md#ram-and-vram-without-the-same-experts-coli_vk_tier_exclusive)). |
 | `COLI_V4_EXPERT_SLOTS` | unset | Tests: DeepSeek V4's RAM expert cache holds at most this many experts a layer (never below its minimum of 6, or every expert of a smaller layer). |
-| `COLI_VK_DEV2_FAULT` | unset | Tests: the n-th batch joined on the second device fails there, as a lost device's does; the tier gives its experts back to the CPU and goes on with the primary device. |
+| `COLI_VK_DEV2_FAULT` | unset | Tests: the n-th batch joined on the second device fails there, as a lost device's does (the CUDA tier: the n-th batch sent there); the tier gives its experts back to the CPU and goes on with the primary device. |
 | `COLI_VK_WAIT_FAULT` | unset | Tests: the n-th expert batch joined on the primary device (counted from the tier's start) gives up waiting at once, as a wait that times out does, while the batch may still run; the tier stops and its experts keep their device memory until the device is idle at shutdown. |
 
 See [docs/vulkan.md](vulkan.md). On multi-core boxes also set `COLI_NO_OMP_TUNE=1` (see that doc for why).

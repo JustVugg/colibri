@@ -135,5 +135,35 @@ print(len(a)==len(b) and max(abs(p-q) for p,q in zip(x,y))/max(abs(v) for v in x
   if [ -s k3-cpu.tok ] && cmp -s k3-cpu.tok k3-cu.tok && [ "${lg%% *}" = True ] && [ "$d" -gt 0 ]; then ok "kimi_k3 GGUF $tag: tokens = CPU, logits within ${lg#* } of the largest, device $d"
   else bad "kimi_k3 GGUF $tag (device $d, logits $lg)"; tail -3 k3-cu.err; fi
 done
+# the tier's second device (COLI_VK_DEV2=0: the same card as a second logical device, the test mode of
+# tests/vulkan_dev2.sh), the primary held to a few experts so the second one holds the rest, against the CPU:
+# decode and evict (COLI_VK_EXPERTS2=1) the CPU's tokens, the second device took experts and served rows; fault
+# (COLI_VK_DEV2_FAULT=2: its second batch fails) the CPU's tokens, the second device stopped, the tier went on
+d2_line() { sed -n "s/^\[CUDA\] tier $1 run: .* | second device \(.*\)/\1/p" "$2" | tail -1; }
+d2_ok() {   # <engine> <log> <case>
+  local l n; l=$(d2_line "$1" "$2"); n=$(echo "$l" | sed -n 's/.*), \([0-9][0-9]*\) rows in .*/\1/p')
+  grep -qaE "^\[CUDA\] tier $1: second device .*, budget .* = [1-9][0-9]* experts" "$2" || return 1
+  if [ "$3" = fault ]; then
+    grep -qa "^\[CUDA\] tier $1: the second device's batch failed, its experts go back to the CPU" "$2" && echo "$l" | grep -q '(stopped)$'
+  else [ "${n:-0}" -gt 0 ]; fi
+}
+d2ids=$($PY -c "print(','.join(str((i*37+5)%120+2) for i in range(100)))")
+for k in decode evict fault; do
+  x="COLI_VK_DEV2=0"; case $k in evict) x="$x COLI_VK_EXPERTS2=1";; fault) x="$x COLI_VK_DEV2_FAULT=2";; esac
+  rm -f d2.usage; env GLM53_BITS=32 USAGE_SAVE=0 COLI_USAGE=d2.usage ./glm53 --model glm53_stream-i4 --ids $d2ids --greedy 6 > d2-cpu.log 2>&1
+  rm -f d2.usage; env GLM53_BITS=32 USAGE_SAVE=0 COLI_USAGE=d2.usage $X COLI_VK_TIER_GB=0.00006 $x ./glm53 --model glm53_stream-i4 --ids $d2ids --greedy 6 > d2-cu.log 2>&1
+  grep -aE '^teacher_forcing|^greedy' d2-cpu.log > a.tok; grep -aE '^teacher_forcing|^greedy' d2-cu.log > b.tok
+  if [ -s a.tok ] && cmp -s a.tok b.tok && d2_ok glm53 d2-cu.log $k; then ok "glm53 dev2 $k: tokens = CPU, second device $(d2_line glm53 d2-cu.log)"
+  else bad "glm53 dev2 $k"; diff a.tok b.tok | head -4; grep -a "tier glm53" d2-cu.log | tail -3; fi
+done
+for k in decode fault; do
+  x="COLI_VK_DEV2=0"; [ $k = fault ] && x="$x COLI_VK_DEV2_FAULT=2"
+  env SNAP=dsv41_tiny ./deepseek_v41 8 dsv41_tiny/ref.json > d2-v41-cpu.txt 2> d2-v41-cpu.err; rc0=$?
+  rm -f d2.usage; env $X $x COLI_USAGE=d2.usage COLI_VK_TIER_GB=0.00005 SNAP=dsv41_tiny ./deepseek_v41 8 dsv41_tiny/ref.json > d2-v41-cu.txt 2> d2-v41-cu.err; rc=$?
+  if [ $rc0 = 0 ] && [ $rc = 0 ] && cmp -s d2-v41-cpu.txt d2-v41-cu.txt && d2_ok deepseek_v41 d2-v41-cu.err $k; then
+    ok "deepseek_v41 dev2 $k: output = CPU, oracle passed, second device $(d2_line deepseek_v41 d2-v41-cu.err)"
+  else bad "deepseek_v41 dev2 $k (rc $rc0/$rc)"; diff d2-v41-cpu.txt d2-v41-cu.txt | head -4; grep -a "tier deepseek_v41" d2-v41-cu.err | tail -3; fi
+done
+
 echo "fails: $fails"
 [ "$fails" = 0 ]
