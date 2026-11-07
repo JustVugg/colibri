@@ -92,14 +92,21 @@ class DeepseekV4BuildFlagsTest(unittest.TestCase):
         finds a real reason to, never because two writes landed in the same
         clock tick.
         """
-        before = {f: f.stat().st_mtime for f in self.dir.iterdir()}
-        result = self.make(UNIT, *variables)
+        result = self.make_aged(UNIT, *variables)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return "-c deepseek_v4.c" in result.stdout
+
+    def make_aged(self, *args):
+        """make, then age every file it wrote, as build() needs. A make whose
+        clock has whole seconds (macOS's 3.81) sees a stamp written by the next
+        call in the same second as no newer than what this call linked."""
+        before = {f: f.stat().st_mtime for f in self.dir.iterdir()}
+        result = self.make(*args)
         aged = time.time() - 500
         for f in self.dir.iterdir():
             if before.get(f) != f.stat().st_mtime:
                 os.utime(f, (aged, aged))
-        return "-c deepseek_v4.c" in result.stdout
+        return result
 
     def test_math_header_rebuilds(self):
         self.assertTrue(self.build())
@@ -131,9 +138,9 @@ class DeepseekV4BuildFlagsTest(unittest.TestCase):
         self.assertIn("-c backend_vulkan.c", result.stdout)
 
     def test_link_flags_relink_without_recompiling(self):
-        first = self.make("deepseek-v4")
+        first = self.make_aged("deepseek-v4")
         self.assertEqual(first.returncode, 0, first.stderr)
-        result = self.make("deepseek-v4", "EXTRA_LDFLAGS=-Wl,--as-needed")
+        result = self.make_aged("deepseek-v4", "EXTRA_LDFLAGS=-Wl,--as-needed")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("-Wl,--as-needed", result.stdout)
         self.assertNotIn(" -c ", result.stdout)
