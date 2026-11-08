@@ -7,6 +7,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **K1b's grouped planar IDOT on pre-AVX2 x86 CPUs** (`IDOT_GS=1`, #2694): a build with SSSE3 and
+  without AVX2 (Sandy and Ivy Bridge) now planarizes gs64 `fmt=4` tensors and takes the integer
+  kernel's SSSE3 arms; `fmt=2` keeps the pair layout there, and with `IDOT_GS` unset nothing
+  changes. Such a CPU has no FMA, and libm's software fmaf took 85 ns a call with glibc 2.39: the
+  per-group step is now computed with fmaf's bits in double, rounded to odd. A 4096 x 512 gs64
+  matrix on a Sandy Bridge build, two threads: 0.087 ms against the float grouped kernel's 0.22
+  (S=1), 0.60 against 1.86 (S=8), the same bits as an AVX2 build's.
 - **A start profile for a model's first answers** (`tools/usage_start_profile.py`): forty
   ordinary prompts through `coli serve`, their expert history and draft counts written beside
   the model as `.coli_usage.start` and `.coli_vocab.start`. Every engine with an expert history
