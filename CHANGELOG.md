@@ -55,6 +55,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **CPU: qwen36 holds a GGUF's dense IQ3_S matrices as 4-bit codes** (#2704). IQ3_S packs four
+  values into a 9-bit index of a 512-row grid, and the CPU gathered a grid row for every four
+  values: those matrices read at a third of the RAM's speed on a Zen 4, about half of a token's
+  time for Qwen3.8-27B UD-Q3_K_XL (27% of its bytes IQ3_S). qwen36 now holds them as one code a
+  value (sign and level) in IQ4_XS's 16-row interleaved layout (`GQ_IQ3_S_R16`), read by its
+  kernels with the codes' values for the IQ4 table: a quarter more bytes for those matrices, the
+  same integer products. On a Ryzen 7 PRO 8700GE's CPU the 27B decodes at 2.82 tok/s instead of
+  2.35 with the release's x86-64-v3 build (3.04 instead of 2.38 built native), RSS 12.3 -> 13.1 GB;
+  an i5-13500, whose P-cores read the file's rows near their RAM's speed already, 2.4 -> 2.5. Only
+  dense matrices, each at its first product on the CPU (a matrix a device holds keeps the file's
+  rows: the 27B on a card that holds it all starts and takes RAM as before), only when the RAM free
+  then holds that quarter and 2 GB to spare (the engine says which), `Q36_IQ3S_CODES=0` to keep the
+  file's rows; experts and every other engine keep theirs. `tests/test_gq_r16` checks the form
+  (round trip exact, the kernels to the bit against their reference), and
+  `tests/test_qwen36_iq3s_codes.py` a small qwen35 GGUF with IQ3_S matrices: the same tokens, the
+  layers' residuals within 1e-4.
 - **CPU: the grid IQ types' dot product with the signs on the activation.** IQ2_XXS, IQ2_XS,
   IQ2_S, IQ3_XXS and IQ3_S applied their sign bits to the decoded weights, and the integer dot
   product took them off again to multiply by the activation. The grid rows now go in as they are

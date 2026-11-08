@@ -707,6 +707,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"Q36_EOS",                          CE_STR   , CE_QWEN                                         , 0             , NULL},
     {"Q36_GGUF_ROPE_PERM", CE_INT, CE_QWEN, 0, NULL},
     {"Q36_ILV16", CE_STR, CE_QWEN, 0, NULL},
+    {"Q36_IQ3S_CODES", CE_BOOL, CE_QWEN, 0, NULL},
     {"Q36_KV", CE_STR, CE_QWEN, 0, NULL},
     {"Q36_KV_RING", CE_STR, CE_QWEN, 0, NULL},
     {"Q36_KV_RING_SPARE", CE_INT, CE_QWEN, 0, NULL},

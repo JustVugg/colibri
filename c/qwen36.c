@@ -2156,11 +2156,14 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
     }
 }
 
+static int g_q36_codes;          /* q36_codes_now: a dense IQ3_S matrix's codes at its first product here */
+static void q36_codes_now(QW *w);
 static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O){
 #ifdef COLI_QWEN_BATCH_TEST
     g_qwen_matmul_d_calls++;
 #endif
     if (w->gq) {
+        if (w->gq_type == GQ_IQ3_S && __atomic_load_n(&g_q36_codes, __ATOMIC_ACQUIRE) != 0) q36_codes_now((QW *)w);
         if (gq_matmul(y, x, w->gq, w->gq_type, S, I, O)) {
             fprintf(stderr, "qwen36: GGUF matrix of type %s is not supported\n", gq_type_name(w->gq_type)); exit(1);
         }
@@ -3016,6 +3019,63 @@ static int q36_gq_held(int type, int rows, int cols) {
 #endif
     return type;
 }
+/* A dense matrix the CPU computes, in a form that takes more bytes than its rows (ggml_quants.h
+ * gq_r16_of_grown): IQ3_S as one 4-bit code a value, a quarter more bytes, read by IQ4_XS's
+ * interleaved kernels instead of a grid gather per four values (#2704). On a Ryzen 7 PRO 8700GE, six
+ * threads, the release's x86-64-v3: a 2560 x 2560 IQ3_S matrix 0.128 -> 0.059 ms (22 -> 60 GB/s);
+ * Qwen3.8-27B UD-Q3_K_XL (27% of its bytes IQ3_S) on its CPU 2.35 -> 2.82 tok/s, 2.38 -> 3.04 built
+ * native, 12.3 -> 13.1 GB of RSS. An i5-13500's six P-cores read the file's rows near their RAM's
+ * speed already: 2.4 -> 2.5. Made at a matrix's first product on the CPU (matmul_d), so a matrix a
+ * device holds keeps the file's rows: made at load, the 27B on a card whose VRAM held it all took
+ * 0.83 GB more RAM and 42 s instead of 9 to start (every matrix unpacked again for its upload).
+ * Decided once for the model, at the first: when the RAM free then holds every dense IQ3_S matrix's
+ * quarter more and 2 GB. Q36_IQ3S_CODES=0 (or Q36_ILV16=0) keeps the file's rows; never for experts
+ * (gguf_expert_held): the RAM slots would hold fewer of them. */
+static int g_q36_codes = -1;   /* -1 undecided, 0 the file's rows, 1 codes */
+static pthread_mutex_t g_q36_codes_mx = PTHREAD_MUTEX_INITIALIZER;
+static int q36_codes_decide(void) {
+#ifdef GQ_R16_ON
+    const char *e = getenv("Q36_IQ3S_CODES"), *i16 = getenv("Q36_ILV16");
+    if ((e && *e == '0') || (i16 && !strcmp(i16, "0")) || gq_exact_mode()) return 0;
+    double extra = 0;
+    for (int k = 0; k < g_gg.n_tensors; k++) {
+        const gguf_tensor *t = &g_gg.t[k];
+        if (t->type == GQ_IQ3_S && !strstr(t->name, "_exps"))   /* a block's 110 bytes -> its share of a group block, 2208 / 16 */
+            extra += (double)t->nbytes * (gq_r16_group_bytes(GQ_IQ3_S_R16) / 16.0 - GQ_TYPES[GQ_IQ3_S].bytes) / GQ_TYPES[GQ_IQ3_S].bytes;
+    }
+    const double avail = mem_available_gb() * 1e9;
+    if (avail > 0 && avail < extra + 2e9) {
+        fprintf(stderr, "[qwen36] IQ3_S matrices kept in the file's rows: %.1f GB free, their codes want up to %.2f GB more\n",
+                avail / 1e9, extra / 1e9);
+        return 0;
+    }
+    fprintf(stderr, "[qwen36] IQ3_S matrices the CPU computes held as codes: up to %.2f GB more RAM, no grid lookups "
+                    "(Q36_IQ3S_CODES=0 keeps the file's rows)\n", extra / 1e9);
+    return 1;
+#else
+    return 0;
+#endif
+}
+/* matmul_d's first product of a dense IQ3_S matrix: its codes from here on (the file's rows freed) */
+static void q36_codes_now(QW *w) {
+#ifdef GQ_R16_ON
+    pthread_mutex_lock(&g_q36_codes_mx);
+    if (g_q36_codes < 0) __atomic_store_n(&g_q36_codes, q36_codes_decide(), __ATOMIC_RELEASE);
+    if (g_q36_codes && w->gq_type == GQ_IQ3_S && w->O % 16 == 0 && w->I % GQ_TYPES[GQ_IQ3_S].blck == 0) {
+        const int ht = gq_r16_of_grown(GQ_IQ3_S);
+        const int64_t rb = gq_row_bytes(GQ_IQ3_S, w->I), hb = gq_row_bytes(ht, w->I);
+        uint8_t *h = malloc((size_t)(hb * w->O));
+        if (h) {
+            #pragma omp parallel for schedule(static)
+            for (int g = 0; g < w->O / 16; g++) gq_r16_pack(ht, h + (int64_t)g * 16 * hb, w->gq + (int64_t)g * 16 * rb, 16, w->I);
+            free(w->gq); w->gq = h; w->gq_type = ht;
+        }
+    }
+    pthread_mutex_unlock(&g_q36_codes_mx);
+#else
+    (void)w;
+#endif
+}
 /* ---- canonical.qc: the INT8 dense matrices converted once (qwen36-canonical)
  * and read from the file at start instead of converted again. */
 typedef struct { int count; QdfSpec *spec; char (*name)[QDF_NAME]; } QwenDenseList;
@@ -3216,7 +3276,7 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
         out->gq = malloc((size_t)t->nbytes); out->gq_type = t->type;
         if (!out->gq || gguf_read(&g_gg, t, out->gq, 0, t->nbytes)) { fprintf(stderr, "GGUF %s: read failed\n", t->name); exit(1); }
         if (rheads) q36_rope_unpermute(out->gq, (size_t)gq_row_bytes(t->type, I), rheads, O / rheads);
-        const int ht = q36_gq_held(t->type, O, I);
+        const int ht = q36_gq_held(t->type, O, I);   /* IQ3_S: its codes at its first product on the CPU (q36_codes_now) */
         if (ht != t->type) {   /* interleaved by 16 for the CPU's kernels */
             const int64_t rb = gq_row_bytes(t->type, I), hb = gq_row_bytes(ht, I);
             uint8_t *h = malloc((size_t)(hb * O));
