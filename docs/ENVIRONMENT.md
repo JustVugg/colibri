@@ -56,6 +56,13 @@ produced a plausible number for a configuration you did not set. That is the
 mistake this check exists to catch, and it is why the engine-ownership table
 above matters.
 
+What the user did not set for the engine is left out. `coli serve` and its
+gateway give every engine they start the same few variables (`NGEN`,
+`SERVE_BATCH`, `KV_SLOTS`, `COLI_SERVE_PORT`, ...), and Windows' cmd keeps its
+own prompt in `PROMPT` and its temporary folder in `TEMP`: an engine that does
+not read one of them says nothing, and `TEMP` is reported as the deprecated
+temperature only when it holds a number.
+
 It warns rather than exits, so nothing that works today stops working. Two
 knobs:
 

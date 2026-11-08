@@ -82,6 +82,10 @@ typedef enum { CE_BOOL, CE_INT, CE_FLOAT, CE_STR, CE_PATH } ColiEnvType;
  * no engine warns about it. */
 
 #define CE_DEPRECATED 0x1   /* still read; `replacement` names what to use */
+/* set for whichever engine runs, by coli or its gateway (NGEN, SERVE_BATCH, ...) or by the
+ * system (Windows' cmd keeps its own prompt in PROMPT): an engine that does not read it says
+ * nothing, the user did not set it for that engine */
+#define CE_LAUNCHER   0x2
 
 typedef struct {
     const char *name;
@@ -104,13 +108,13 @@ static const ColiEnvVar coli_env_table[] = {
     {"CACHE_ROUTE",                      CE_INT   , CE_COLIBRI | CE_QWEN, 0             , NULL},
     {"CAP",                              CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"CAP_RAISE",                        CE_INT   , CE_COLIBRI                                      , 0             , NULL},
-    {"CHAT",                             CE_STR   , CE_OLMOE                                        , 0             , NULL},
+    {"CHAT",                             CE_STR   , CE_OLMOE                                        , CE_LAUNCHER             , NULL},
     {"CHAT_TEMPLATE",                    CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"CLEF_IDS", CE_STR, CE_QWEN, 0, NULL},
     {"CLEF_RECORDS", CE_STR, CE_QWEN, 0, NULL},
     {"CLEF_TOKENIZE", CE_STR, CE_QWEN, 0, NULL},
     {"CLUSTER_SHARED", CE_INT, CE_COLIBRI, 0, NULL},
-    {"CLUSTER_WORKERS", CE_STR, CE_COLIBRI | CE_GLM53 | CE_DSV41, 0, NULL},
+    {"CLUSTER_WORKERS", CE_STR, CE_COLIBRI | CE_GLM53 | CE_DSV41, CE_LAUNCHER, NULL},
     {"CLUSTER_WORKER_BIND", CE_STR, CE_GLM53, 0, NULL},
     {"CLUSTER_WORKER_CACHE", CE_INT, CE_DSV41, 0, NULL},
     {"CLUSTER_WORKER_PORT", CE_STR, CE_COLIBRI | CE_GLM53 | CE_DSV41, 0, NULL},
@@ -127,7 +131,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_CORPUS_MINACC",               CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_CPU_CHECK", CE_STR, CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CPU_MISSING", CE_STR, CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
-    {"COLI_CUDA", CE_INT, CE_COLIBRI | CE_QWEN | CE_QWEN38 | CE_OLMOE | CE_DSV4 | CE_GLM53 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
+    {"COLI_CUDA", CE_INT, CE_COLIBRI | CE_QWEN | CE_QWEN38 | CE_OLMOE | CE_DSV4 | CE_GLM53 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, CE_LAUNCHER, NULL},
     {"COLI_CUDA_ADDNORM", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_ASYNC", CE_INT, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_ATTN",                   CE_INT   , CE_COLIBRI                                      , 0             , NULL},
@@ -229,7 +233,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_CUDA_V41_ROWS", CE_INT, CE_DSV41, 0, NULL},
     {"COLI_CUDA_V41_SEG", CE_INT, CE_DSV41, 0, NULL},
     {"COLI_CUDA_W4_PACKED", CE_INT, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
-    {"COLI_DENSE_BITS", CE_INT, CE_QWEN, 0, NULL},
+    {"COLI_DENSE_BITS", CE_INT, CE_QWEN, CE_LAUNCHER, NULL},
     {"COLI_DENSE_F16", CE_INT, CE_OLMOE, 0, NULL},
     {"COLI_DENSE_I8",                    CE_STR   , CE_QWEN                                         , 0             , NULL},
     {"COLI_DENSE_IDOT", CE_BOOL, CE_QWEN, 0, NULL},
@@ -248,7 +252,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_GEMM_CHUNK",                  CE_STR   , CE_ALL                                          , 0             , NULL},
     {"COLI_GLINER_MAX_LEN", CE_INT, CE_GLINER, 0, NULL},
     {"COLI_GPU", CE_STR, CE_COLIBRI | CE_QWEN | CE_QWEN38 | CE_OLMOE | CE_LAYA | CE_GLINER, 0, NULL},
-    {"COLI_GPUS", CE_STR, CE_COLIBRI | CE_QWEN | CE_QWEN38 | CE_OLMOE | CE_LAYA | CE_GLINER, 0, NULL},
+    {"COLI_GPUS", CE_STR, CE_COLIBRI | CE_QWEN | CE_QWEN38 | CE_OLMOE | CE_LAYA | CE_GLINER, CE_LAUNCHER, NULL},
     {"COLI_GPU_FAIL_AFTER", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_GROUP_ASYNC",                 CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_HEAD_PIN_MIN", CE_STR, CE_QWEN38, 0, NULL},
@@ -310,7 +314,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_SLAB_SHRINK",                 CE_BOOL  , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_SPEC_GATE", CE_INT, CE_COLIBRI | CE_QWEN | CE_QWEN38, 0, NULL},
     {"COLI_SSD_FAST_GBS",                CE_FLOAT , CE_COLIBRI                                      , 0             , NULL},
-    {"COLI_TEMP", CE_FLOAT, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_MIMO, 0, NULL},
+    {"COLI_TEMP", CE_FLOAT, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_MIMO, CE_LAUNCHER, NULL},
     {"COLI_TIMERS",                      CE_STR   , CE_QWEN | CE_QWEN38                             , 0             , NULL},
     {"COLI_TRAIN_METAL_MIN", CE_INT, 0, 0, NULL},
     {"COLI_TRUNK_PROBE", CE_BOOL, CE_QWEN, 0, NULL},
@@ -471,7 +475,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_VK_XB_GROUPED_ROWS", CE_INT, CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_VK_XB_STEP", CE_STR, CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_VOCAB_USAGE", CE_STR, CE_QWEN, 0, NULL},
-    {"COLI_VULKAN", CE_INT, CE_COLIBRI | CE_GLM53 | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
+    {"COLI_VULKAN", CE_INT, CE_COLIBRI | CE_GLM53 | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE | CE_MIMO | CE_LAYA | CE_GLINER, CE_LAUNCHER, NULL},
     {"COLI_WORKER_WEIGHT", CE_INT, CE_GLM53, 0, NULL},
     {"COLI_XDNA",                        CE_BOOL  , CE_COLIBRI                                      , 0             , NULL},
     {"CONF_LIMIT",                       CE_FLOAT , CE_OLMOE | CE_QWEN                              , 0             , NULL},
@@ -484,7 +488,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"CTX", CE_INT, CE_COLIBRI | CE_DSV4 | CE_DSV41 | CE_OLMOE | CE_MIMO, 0, NULL},
     {"CTX_MAX",                          CE_STR   , CE_INKLING                                      , 0             , NULL},
     {"CUDA_DENSE",                       CE_INT   , CE_COLIBRI                                      , 0             , NULL},
-    {"CUDA_EXPERT_GB",                   CE_FLOAT , CE_COLIBRI | CE_QWEN | CE_QWEN38, 0             , NULL},
+    {"CUDA_EXPERT_GB",                   CE_FLOAT , CE_COLIBRI | CE_QWEN | CE_QWEN38, CE_LAUNCHER             , NULL},
     {"CUDA_EXPERT_LOAD_BALANCE",         CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"CUDA_RAW_EXPERTS", CE_INT, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"CUDA_RELEASE_HOST",                CE_INT   , CE_COLIBRI                                      , 0             , NULL},
@@ -598,7 +602,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"K3_BITS",                          CE_INT   , CE_KIMI                                         , 0             , NULL},
     {"K3_CHAT_IDS",                      CE_STR   , CE_KIMI                                         , 0             , NULL},
     {"K3_CHUNK",                         CE_INT   , CE_KIMI                                         , 0             , NULL},
-    {"K3_CUDA",                          CE_INT   , CE_KIMI                                         , 0             , NULL},
+    {"K3_CUDA",                          CE_INT   , CE_KIMI                                         , CE_LAUNCHER             , NULL},
     {"K3_DEBUG_OUT",                     CE_STR   , CE_KIMI                                         , 0             , NULL},
     {"K3_DIRECT",                        CE_INT   , CE_KIMI                                         , 0             , NULL},
     {"K3_DIRS",                          CE_PATH  , CE_KIMI                                         , 0             , NULL},
@@ -634,14 +638,14 @@ static const ColiEnvVar coli_env_table[] = {
     {"KVB_FLASH_MB",                     CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"KVB_TILE_MB",                      CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"KVSAVE",                           CE_INT   , CE_COLIBRI                                      , 0             , NULL},
-    {"KV_SLOTS", CE_INT, CE_COLIBRI | CE_GLM53 | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
+    {"KV_SLOTS", CE_INT, CE_COLIBRI | CE_GLM53 | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, CE_LAUNCHER, NULL},
     {"KV_TQ",                            CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"KV_TQ_POLAR",                      CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"LANG", CE_STR, 0, 0, NULL},
     {"LC_ALL", CE_STR, 0, 0, NULL},
     {"LOOKA",                            CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"LORA_UNSAFE", CE_STR, CE_COLIBRI, 0, NULL},
-    {"MAX_NEW",                          CE_INT   , CE_OLMOE                                        , 0             , NULL},
+    {"MAX_NEW",                          CE_INT   , CE_OLMOE                                        , CE_LAUNCHER             , NULL},
     {"MIMO_CAP", CE_INT, CE_MIMO, 0, NULL},
     {"MIMO_CHUNK", CE_INT, CE_MIMO, 0, NULL},
     {"MIMO_CTX", CE_INT, CE_MIMO, 0, NULL},
@@ -667,7 +671,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"MTP_PRENORM",                      CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"MTP_PSTEP", CE_INT, CE_COLIBRI, 0, NULL},
     {"MTP_SWAP",                         CE_STR   , CE_COLIBRI                                      , 0             , NULL},
-    {"NGEN",                             CE_INT   , CE_COLIBRI | CE_DSV4                            , 0             , NULL},
+    {"NGEN",                             CE_INT   , CE_COLIBRI | CE_DSV4                            , CE_LAUNCHER             , NULL},
     {"NOGPU",                            CE_STR   , CE_INKLING                                      , 0             , NULL},
     {"NOPACK",                           CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"NOSTREAM",                         CE_STR   , CE_QWEN | CE_QWEN38                             , 0             , NULL},
@@ -693,7 +697,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"PPL",                              CE_INT   , CE_OLMOE | CE_QWEN | CE_QWEN38                 , 0             , NULL},
     {"PREFETCH",                         CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"PROF",                             CE_INT   , CE_COLIBRI                                      , 0             , NULL},
-    {"PROMPT",                           CE_STR   , CE_ALL | CE_COLIBRI, 0             , NULL},
+    {"PROMPT",                           CE_STR   , CE_ALL | CE_COLIBRI, CE_LAUNCHER             , NULL},
     {"Q36_DN_GPU", CE_STR, CE_QWEN, 0, NULL},
     {"Q36_EOS",                          CE_STR   , CE_QWEN                                         , 0             , NULL},
     {"Q36_GGUF_ROPE_PERM", CE_INT, CE_QWEN, 0, NULL},
@@ -779,7 +783,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"QWEN_EXPERT_ACT", CE_STR, CE_QWEN, 0, NULL},
     {"QWEN_EXPERT_KERNEL", CE_BOOL, CE_QWEN, 0, NULL},
     {"QWEN_SHARED_BATCH",                CE_STR   , CE_QWEN                                         , 0             , NULL},
-    {"RAM_GB", CE_FLOAT, CE_COLIBRI | CE_DSV4 | CE_KIMI | CE_OLMOE | CE_QWEN, 0, NULL},
+    {"RAM_GB", CE_FLOAT, CE_COLIBRI | CE_DSV4 | CE_KIMI | CE_OLMOE | CE_QWEN, CE_LAUNCHER, NULL},
     {"RANS_AVX512",                      CE_STR   , CE_ALL                                          , 0             , NULL},
     {"RANS_NEON",                        CE_STR   , CE_ALL                                          , 0             , NULL},
     {"RANS_PATH",                        CE_PATH  , CE_ALL                                          , 0             , NULL},
@@ -801,10 +805,10 @@ static const ColiEnvVar coli_env_table[] = {
     {"SCORE",                            CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"SCORE_PREFIX",                     CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"SEED", CE_INT, CE_COLIBRI | CE_DSV41 | CE_INKLING | CE_MIMO, 0, NULL},
-    {"SERVE", CE_INT, CE_COLIBRI | CE_DSV4 | CE_DSV41 | CE_GLM53 | CE_INKLING | CE_KIMI | CE_OLMOE | CE_QWEN | CE_QWEN38 | CE_QWENIMAGE | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
-    {"SERVE_BATCH",                      CE_INT   , CE_COLIBRI | CE_GLM53 | CE_OLMOE, 0             , NULL},
+    {"SERVE", CE_INT, CE_COLIBRI | CE_DSV4 | CE_DSV41 | CE_GLM53 | CE_INKLING | CE_KIMI | CE_OLMOE | CE_QWEN | CE_QWEN38 | CE_QWENIMAGE | CE_MIMO | CE_LAYA | CE_GLINER, CE_LAUNCHER, NULL},
+    {"SERVE_BATCH",                      CE_INT   , CE_COLIBRI | CE_GLM53 | CE_OLMOE, CE_LAUNCHER             , NULL},
     {"SMOOTH",                           CE_FLOAT , CE_OLMOE | CE_QWEN                              , 0             , NULL},
-    {"SNAP", CE_STR, CE_COLIBRI | CE_DSV4 | CE_DSV41 | CE_GLM53 | CE_INKLING | CE_KIMI | CE_OLMOE | CE_QWEN | CE_QWEN38 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
+    {"SNAP", CE_STR, CE_COLIBRI | CE_DSV4 | CE_DSV41 | CE_GLM53 | CE_INKLING | CE_KIMI | CE_OLMOE | CE_QWEN | CE_QWEN38 | CE_MIMO | CE_LAYA | CE_GLINER, CE_LAUNCHER, NULL},
     {"SNAP_MIRROR",                      CE_STR   , CE_COLIBRI | CE_DSV4 | CE_DSV41 | CE_GLM53, 0             , NULL},
     {"SPEC",                             CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"SPEC_PIN",                         CE_INT   , CE_COLIBRI                                      , 0             , NULL},
@@ -922,6 +926,12 @@ static const char *coli_env_suggest(const char *name) {
 
 /* Names we own. An unknown FOO=1 in the environment is not our business, but an
  * unknown COLI_FOO=1 almost certainly is. */
+/* Set by `coli serve` on the engine it starts and read back by coli, which finds a port's engine
+ * by its environment, never by an engine: not an unknown variable. */
+static int coli_env_launcher_only(const char *n) {
+    return !strcmp(n, "COLI_SERVE_PORT");
+}
+
 static int coli_env_is_ours(const char *n) {
     static const char *const prefixes[] = {
         "COLI_", "COLIBRI_", "K3_", "KIMI_", "INK_", "GLM53_",
@@ -930,6 +940,16 @@ static int coli_env_is_ours(const char *n) {
     for (unsigned i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); ++i)
         if (!strncmp(n, prefixes[i], strlen(prefixes[i]))) return 1;
     return 0;
+}
+
+/* A numeric variable's value is meant for it when it reads as a number: Windows sets TEMP to its
+ * temporary folder in every process, which is not the old temperature knob (the engines ignore a
+ * TEMP that is not a number too), so it says nothing. */
+static int coli_env_meant(const ColiEnvVar *v, const char *value) {
+    if (v->type != CE_INT && v->type != CE_FLOAT) return 1;
+    char *end;
+    strtod(value, &end);
+    return end != value && !*end;
 }
 
 /* Compare the process environment against the table. `self` is the calling
@@ -954,7 +974,7 @@ static int coli_env_check(unsigned short self, const char *name) {
         key[n] = 0;
         const ColiEnvVar *v = coli_env_find(key);
         if (!v) {
-            if (!coli_env_is_ours(key)) continue;   /* not ours, not our problem */
+            if (!coli_env_is_ours(key) || coli_env_launcher_only(key)) continue;   /* not ours, or coli's own */
             const char *s = coli_env_suggest(key);
             fprintf(stderr, "[env] unknown variable %s", key);
             if (s) fprintf(stderr, " -- did you mean %s?", s);
@@ -962,7 +982,7 @@ static int coli_env_check(unsigned short self, const char *name) {
             bad++;
             continue;
         }
-        if (v->engines && !(v->engines & self)) {
+        if (v->engines && !(v->engines & self) && !(v->flags & CE_LAUNCHER)) {
             static const struct { unsigned short bit; const char *name; } owners[] = {
                 {CE_COLIBRI, "colibri"}, {CE_KIMI, "kimi_k3"}, {CE_INKLING, "inkling"},
                 {CE_OLMOE, "olmoe"}, {CE_DSV4, "deepseek-v4"}, {CE_QWEN, "qwen36"},
@@ -976,7 +996,7 @@ static int coli_env_check(unsigned short self, const char *name) {
             bad++;
             continue;
         }
-        if (v->flags & CE_DEPRECATED)
+        if ((v->flags & CE_DEPRECATED) && coli_env_meant(v, eq + 1))
             fprintf(stderr, "[env] %s is deprecated -- use %s\n", key, v->replacement ? v->replacement : "(nothing)");
     }
     if (bad && strict) {

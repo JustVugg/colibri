@@ -1,4 +1,8 @@
 #include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "../compat.h"   /* setenv and unsetenv on Windows too */
 #include "../coli_env.h"
 
 int main(void) {
@@ -35,6 +39,26 @@ int main(void) {
     for (unsigned i = 0; i < sizeof(unrelated) / sizeof(unrelated[0]); ++i)
         assert(!coli_env_is_ours(unrelated[i]));
     assert(!strcmp(coli_env_suggest("QWEN_EXPERT_KERNL"), "QWEN_EXPERT_KERNEL"));
+    /* what coli serve sets on every engine it starts is no warning on one that does not read it
+     * (qwen36 reads neither NGEN nor SERVE_BATCH; COLI_SERVE_PORT is coli's own), and a user's
+     * wrong-engine variable still is */
+    assert(coli_env_find("NGEN")->flags & CE_LAUNCHER);
+    assert(!(coli_env_find("NGEN")->engines & CE_QWEN) && !(coli_env_find("SERVE_BATCH")->engines & CE_QWEN));
+    assert(!coli_env_find("COLI_SERVE_PORT") && coli_env_launcher_only("COLI_SERVE_PORT"));
+    unsetenv("COLI_ENV_STRICT");
+    const int base = coli_env_check(CE_QWEN, "qwen36");   /* whatever the runner's environment holds */
+    setenv("NGEN", "512", 1); setenv("SERVE_BATCH", "1", 1); setenv("COLI_SERVE_PORT", "8000", 1);
+    assert(coli_env_check(CE_QWEN, "qwen36") == base);
+    setenv("K3_BITS", "8", 1);
+    assert(!(coli_env_find("K3_BITS")->engines & CE_QWEN));
+    assert(coli_env_check(CE_QWEN, "qwen36") == base + 1);
+    unsetenv("K3_BITS"); setenv("COLI_SERVE_PORTT", "1", 1);
+    assert(coli_env_check(CE_QWEN, "qwen36") == base + 1);
+    assert(coli_env_find("PROMPT")->flags & CE_LAUNCHER);   /* cmd's own prompt on Windows */
+    /* Windows' TEMP, its temporary folder, is not the deprecated temperature: no line for it */
+    assert(coli_env_find("TEMP")->flags & CE_DEPRECATED);
+    assert(!coli_env_meant(coli_env_find("TEMP"), "C:\\Users\\me\\AppData\\Local\\Temp"));
+    assert(coli_env_meant(coli_env_find("TEMP"), "0.7"));
     puts("test_env_registry: ok");
     return 0;
 }
