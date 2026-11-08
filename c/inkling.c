@@ -3487,10 +3487,11 @@ static int ink_prompt_poll(ColiPromptBreak *b) {
 }
 
 /* A short request between two turns of the conversation the lone serve holds (park.h): every
- * layer's first K/V rows (a sliding layer's ring rows) and its four convolution states, back
- * when the next request arrives. A reset clears only the convolution states, and a query reads
- * the rows of its own positions, so the conversation's further rows wait untouched. The host's
- * state stays canonical: the chain uploads the rows that came back, and the states. */
+ * layer's first K/V rows (a sliding layer's ring rows) and its four convolution states; the
+ * next request brings them back, keeps them parked or drops them (ink_park_decide). A reset
+ * clears only the convolution states, and a query reads the rows of its own positions, so the
+ * conversation's further rows wait untouched. The host's state stays canonical: the chain
+ * uploads the rows that came back, and the states. */
 static ColiPark g_ink_park;
 static ColiParkPart *ink_park_parts(Model *m, int *n_out) {
     Cfg *c = &m->c; int n = 0;
@@ -3527,6 +3528,13 @@ static void ink_unpark(Model *m) {
     } else coli_park_free(&g_ink_park);
     free(p);
 }
+/* the next request decides a conversation the last one parked (park.h, #2703): back, kept or
+ * dropped; a request with audio takes the state from its start, so it drops it */
+static void ink_park_decide(Model *m, const int *ids, int np, int max_tok, int audio) {
+    int d = audio ? (g_ink_park.on ? -1 : 0) : coli_park_decide(&g_ink_park, &m->kvp, ids, np, max_tok, 16);
+    if (d > 0) ink_unpark(m);
+    else if (d < 0) coli_park_free(&g_ink_park);
+}
 
 static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out, float **logit_out,
                            InkReqClock *clk, int lone) {
@@ -3558,6 +3566,9 @@ static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out
                  m->audio_norm?"":" — snapshot has no audio tensors");
         coli_serve_write_error(stdout,q->id,message); free(ids); return 0;
     }
+    /* a conversation the last request parked: back, kept or dropped, before kv_alloc grows the cache */
+    if (lone) ink_park_decide(m, ids, np, q->max_tok, naud > 0);
+    else coli_park_free(&g_ink_park);
     /* KV PREFIX REUSE (#639 for GLM; this engine re-prefilled every turn).
      * A chat client resends the whole transcript each turn, so turn N used to
      * re-process turns 1..N-1 from scratch — the cost of a message grew with
@@ -3619,7 +3630,7 @@ static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out
                     (m->kvp.len > 0 && m->kvp.len < np) ? " (diverged)" : "");
         fflush(stderr);
     }
-    if (!reuse && lone && naud == 0) ink_park(m, np, q->max_tok);   /* a short request keeps the conversation (ink_unpark) */
+    if (!reuse && lone && naud == 0) ink_park(m, np, q->max_tok);   /* a short request keeps the conversation (ink_park_decide) */
     if (!reuse) state_reset(m);
     clk->t0 = now_s();
     clk->h0 = m->hits; clk->m0 = m->miss;
@@ -3683,7 +3694,6 @@ static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out
 static int serve_one(Model *m, Tok *T, SReq *q) {
     Cfg *c = &m->c;
     int *ids = NULL, np = 0; float *logit = NULL; InkReqClock clk;
-    ink_unpark(m);   /* a conversation the last request parked: back first */
     if (!ink_serve_start(m, T, q, &ids, &np, &logit, &clk, 1)) return 0;
     double t0 = clk.t0;
     uint64_t h0 = clk.h0, m0 = clk.m0;

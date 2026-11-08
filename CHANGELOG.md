@@ -503,6 +503,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   signal now sends the frame recorded so far at once (a stream query), on Windows without the TCC
   driver and in WSL2 (`COLI_CUDA_FLUSH`, the engine says so at start), in qwen36's and qwen38's
   chains. On Linux nothing changes; forced on there, the tokens and the speed are the same.
+- **A new conversation shorter than the last read its whole history at every turn** (#2703).
+  With one slot, a request that does not continue the held conversation and fits below it parks
+  that conversation (park.h), and the conversation came back when the request ended or first
+  thing at the next one. An agent running one task after another sends a new conversation
+  shorter than the last: the old one took the state back after every turn, and each of the new
+  one's turns read everything again (115 s a turn instead of 8 in the report). The next request
+  now decides: a prompt that follows the parked conversation further than the state held now
+  brings it back, one whose rows fit the rows kept apart leaves it parked, any other drops it.
+  qwen36 and qwen38 came first; olmoe, MiMo, DeepSeek V4.1, Inkling, Kimi K3 and K3.1, GLM-5.2
+  (colibri) and DeepSeek V4 decide the same way now, each with the scenario in its tests, and a
+  second short request beside a parked conversation resets only the rows kept apart (MiMo's and
+  V4.1's windows wider than them stopped on a lost ring position or answered otherwise).
+- **Vulkan: a turn stalled in `vkt_give_back` while the uploader waited for room** (#2705). A
+  give-back waited for the uploader's queue to empty, and an upload the pool refused for room
+  waited for a free only the engine thread makes, the thread waiting in the give-back. An upload
+  or promotion refused for room now gives up while a give-back waits: the expert stays where it
+  was, nothing is counted failed and the budget stands. The tier test's case: 0.00 s against
+  179.7 s and three failed uploads.
 - **Vulkan: `COLI_VK_STAGED=0` on a card without Resizable BAR planned with the whole card.**
   The resident data stays in the host-visible window there (246 of 24467 MiB on an RTX PRO
   4000), and nothing past it spills. The dense chain placed 40 of 40 layers and had its first

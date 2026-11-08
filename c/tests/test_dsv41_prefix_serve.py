@@ -17,8 +17,11 @@ model before a single one is written.
 Runs against the tiny random-init fixture the oracle job already builds
 (tools/make_dsv41_tiny.py): no checkpoint, no fast disk.
 """
+import json
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -89,6 +92,7 @@ class Dsv41PrefixServeTest(PrefixReuseContract, PromptCancelContract, unittest.T
 
     # a short request between two turns parks the conversation (park.h)
     PARKS = True
+    PARK_DECIDES_NEXT = True
 
     # This fixture's vocabulary is the byte range, so a reply survives the round
     # trip and the replay scenario can require reuse to fire. It is also the
@@ -97,12 +101,14 @@ class Dsv41PrefixServeTest(PrefixReuseContract, PromptCancelContract, unittest.T
     # positions back or the next turn finds a prefix the caches no longer hold.
     REPLAY_REUSES = True
 
+    SNAP = None   # the fixture; a subclass names another copy
+
     def spawn(self, log_prefix=True, reuse=True):
         # Reuse is opt-in on this engine (see the comment on kv_prefix_on), so
         # the arm that wants it has to ask. `reuse=False` still wins: the harness
         # sets COLI_KV_PREFIX=0 after this env is merged.
         return ServeEngine(ENGINE, ["8"],
-                           {"SNAP": str(FIXTURE), "SERVE": "1", "COLI_KV_PREFIX": "1"},
+                           {"SNAP": str(self.SNAP or FIXTURE), "SERVE": "1", "COLI_KV_PREFIX": "1"},
                            log_prefix=log_prefix, reuse=reuse)
 
     def test_a_turn_that_replays_the_reply_is_never_wrong(self):
@@ -183,3 +189,21 @@ class Dsv41PrefixServeTest(PrefixReuseContract, PromptCancelContract, unittest.T
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(ENGINE.exists() and (FIXTURE / "model.safetensors").exists(),
+                     "built V4.1 engine and tiny fixture required")
+class Dsv41WideWindowParkTest(Dsv41PrefixServeTest):
+    """The contract again with the window wider than the rows a short request keeps apart
+    (#2703): a second short request beside a parked conversation starts over on those rows
+    alone, the conversation's window rows past them stay where they are."""
+
+    @classmethod
+    def setUpClass(cls):
+        root = Path(tempfile.mkdtemp(prefix="dsv41-wide-"))
+        cls.addClassCleanup(shutil.rmtree, root, True)
+        cls.SNAP = root / "fixture"
+        shutil.copytree(FIXTURE, cls.SNAP)
+        config = json.loads((cls.SNAP / "config.json").read_text())
+        config["window_size"] = config["sliding_window"] = 64
+        (cls.SNAP / "config.json").write_text(json.dumps(config))

@@ -11473,10 +11473,10 @@ static void coli_kv_share_adopt_rows(Cfg *cc, KVState *sc, KVState *dn,
  * slot's from there on; the conversation's next turn then read it all again (minutes on the
  * largest models). The slot's first rows of every KV array (the latent and rope rows, the DSA
  * index keys, the coded rows and their scales, the MTP layer's), its tokens and its layers'
- * first rows go aside before the request reads its prompt; the next request finds them back,
- * and the devices' copies go up again from the host, whose rows stay the canonical ones. One
- * slot only (KV_SLOTS=1), never under a cluster (its workers hold their layers' rows), a
- * picture or a read-out. */
+ * first rows go aside before the request reads its prompt; the next request brings them back,
+ * keeps them parked or drops them (glm_park_decide), and the devices' copies go up again from
+ * the host, whose rows stay the canonical ones. One slot only (KV_SLOTS=1), never under a
+ * cluster (its workers hold their layers' rows), a picture or a read-out. */
 #define GLM_PARK_SPEC 16   /* the rows a speculative turn writes past the tokens that stand */
 static ColiPark g_glm_park;
 static int g_glm_park_from;   /* the request's shared prefix: the KV file's rows past it are the request's */
@@ -11530,6 +11530,15 @@ static void glm_unpark(Model *m, ServeCtx *sc, int maxctx){
         kv_disk_truncate(m,g_glm_park_from);   /* the next append writes the conversation's rows past it */
     }
     free(p);
+}
+/* the next request decides a conversation the last one parked (park.h, #2703): back, kept or
+ * dropped; a picture's request and a cluster's take the slot as they always did, so they drop it */
+static void glm_park_decide(Model *m, ServeCtx *sc, const int *ids, int nt, int max_tokens, int maxctx, int take){
+    if(!g_glm_park.on) return;
+    kv_prefix v={sc->hist,sc->len,maxctx,0};
+    int d=take ? -1 : coli_park_decide(&g_glm_park,&v,ids,nt,max_tokens,GLM_PARK_SPEC);
+    if(d>0) glm_unpark(m,sc,maxctx);
+    else if(d<0) coli_park_free(&g_glm_park);
 }
 
 /* Read and prefill one request. Returns -1 on EOF, 0 for a rejected frame and
@@ -11655,7 +11664,6 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
         }
     }
     ServeCtx *sc=&ctx[sub.slot]; kv_bind(m,&sc->kv);
-    if(nctx==1) glm_unpark(m,sc,maxctx);   /* a conversation the last request parked: back first */
     int *tmp=malloc(maxctx*sizeof(int));
     if(!tmp){ fprintf(stderr,"OOM mux_submit tmp\n"); free(raw); free(line); exit(1); }
     /* Encode with one token of headroom (maxctx-1, buffer is maxctx) purely to DETECT overflow:
@@ -11701,6 +11709,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
      * first with an ERROR, so a request yields exactly one of ACCEPT or an early ERROR -- which
      * lets a CONTEXT_EXCEEDED become a clean HTTP 400 instead of a broken already-200 stream. */
     printf("ACCEPT %llu %d\n",sub.id,nt); fflush(stdout);
+    if(nctx==1) glm_park_decide(m,sc,tmp,nt,sub.max_tokens,maxctx,vis_first>=0||g_cluster_n);   /* back, kept or dropped */
     /* Echo read-out (U7a): needs logits at EVERY prompt position, so the whole
      * prompt re-prefills from position 0 -- no cached-prefix skip and no
      * cross-slot adoption below (either would leave positions with no logits). */
@@ -11742,8 +11751,11 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     if(vis_first>=0 && prefix>vis_first) prefix=vis_first;
     if(sc->vis_end>0 && prefix>sc->vis_end-1) prefix=sc->vis_end-1;
     if(nctx==1 && !echo && vis_first<0 && sc->vis_end==0 && !g_cluster_n && prefix<sc->len)
-        glm_park(m,sc,nt,sub.max_tokens,prefix,maxctx);   /* a short request keeps the conversation (glm_unpark) */
+        glm_park(m,sc,nt,sub.max_tokens,prefix,maxctx);   /* a short request keeps the conversation (glm_park_decide) */
     if(prefix<sc->len){ sc->len=prefix; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
+        /* kept parked from the last request: the disk's rows past this prefix are no longer the
+         * conversation's either, so its return truncates from here */
+        if(g_glm_park.on && prefix<g_glm_park_from) g_glm_park_from=prefix;
         kv_disk_truncate(m,sc->len); }
     /* Cross-slot prefix adoption (COLI_KV_SHARE=1): if another slot's history
      * shares a longer prefix with this prompt, copy its KV rows instead of
