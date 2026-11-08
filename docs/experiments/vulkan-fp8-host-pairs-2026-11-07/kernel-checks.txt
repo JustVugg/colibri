@@ -1,0 +1,60 @@
+# CPU only: tests/bench_host_pairs 12 2560 640 (Qwen3.8-Flash-Next's expert), dev's vk_tier.c against this change's
+
+## fp8-host-bench.txt
+# tests/bench_host_pairs 12 2560 640 <threads> <calls>: Qwen3.8-Flash-Next's expert (D 2560, I 640, FP8 e4m3, groups of 128)
+# docker colibri-builder:xe2 --cpuset-cpus 16-31; colibri-q38 idle (no request) during the runs; 2026-11-07T14:25Z
+## old kernel (dev e24cd51a vk_tier.c: dev_dequant + scalar sums), 16 threads
+fmt 12 D 2560 I 640, 4.92 MB a pair
+np 1 nt 16:  4488.1 us a call, 4488.1 us a pair (best; mean 4725.7),   1.1 GB/s
+np 2 nt 16:  8823.0 us a call, 4411.5 us a pair (best; mean 4717.7),   1.1 GB/s
+np 8 nt 16: 35854.4 us a call, 4481.8 us a pair (best; mean 4538.3),   1.1 GB/s
+## new kernel (fp8_rows: table, AVX2 gather + FMA, a scale a group), 16 threads
+fmt 12 D 2560 I 640, 4.92 MB a pair
+np 1 nt 16:   151.8 us a call,  151.8 us a pair (best; mean  158.9),  32.4 GB/s
+np 2 nt 16:   287.9 us a call,  144.0 us a pair (best; mean  149.2),  34.1 GB/s
+np 8 nt 16:  1210.9 us a call,  151.4 us a pair (best; mean  152.4),  32.5 GB/s
+## old kernel (dev e24cd51a vk_tier.c: dev_dequant + scalar sums), 1 threads
+fmt 12 D 2560 I 640, 4.92 MB a pair
+np 1 nt  1: 68224.3 us a call, 68224.3 us a pair (best; mean 68333.1),   0.1 GB/s
+np 2 nt  1: 136730.3 us a call, 68365.2 us a pair (best; mean 68470.4),   0.1 GB/s
+np 8 nt  1: 543877.4 us a call, 67984.7 us a pair (best; mean 68104.0),   0.1 GB/s
+## new kernel (fp8_rows: table, AVX2 gather + FMA, a scale a group), 1 threads
+fmt 12 D 2560 I 640, 4.92 MB a pair
+np 1 nt  1:  1516.3 us a call, 1516.3 us a pair (best; mean 1541.8),   3.2 GB/s
+np 2 nt  1:  3015.6 us a call, 1507.8 us a pair (best; mean 1542.3),   3.3 GB/s
+np 8 nt  1: 11648.6 us a call, 1456.1 us a pair (best; mean 1469.9),   3.4 GB/s
+
+## fp8-host-bench-f16c.txt
+# tests/bench_host_pairs 12 2560 640 <threads> <calls>, CPUs 16-31, colibri-q38 idle, the int4 converter paused (SIGSTOP); 2026-11-07T20:01Z
+## gather kernel (commit e28a900d), 16 threads
+np 1 nt 16:   158.1 us a call,  158.1 us a pair (best; mean  161.6),  31.1 GB/s
+np 2 nt 16:   300.6 us a call,  150.3 us a pair (best; mean  154.5),  32.7 GB/s
+np 8 nt 16:  1230.0 us a call,  153.8 us a pair (best; mean  160.8),  32.0 GB/s
+## F16C kernel (+ four-row S=1, decode-once, no int8 prep), 16 threads
+np 1 nt 16:   145.1 us a call,  145.1 us a pair (best; mean  145.6),  33.9 GB/s
+np 2 nt 16:   274.4 us a call,  137.2 us a pair (best; mean  137.9),  35.8 GB/s
+np 8 nt 16:  1066.9 us a call,  133.4 us a pair (best; mean  134.5),  36.9 GB/s
+## gather kernel (commit e28a900d), 8 threads
+np 1 nt  8:   223.2 us a call,  223.2 us a pair (best; mean  224.4),  22.0 GB/s
+np 2 nt  8:   448.6 us a call,  224.3 us a pair (best; mean  226.7),  21.9 GB/s
+np 8 nt  8:  1769.5 us a call,  221.2 us a pair (best; mean  222.1),  22.2 GB/s
+## F16C kernel (+ four-row S=1, decode-once, no int8 prep), 8 threads
+np 1 nt  8:   170.7 us a call,  170.7 us a pair (best; mean  172.2),  28.8 GB/s
+np 2 nt  8:   325.6 us a call,  162.8 us a pair (best; mean  163.5),  30.2 GB/s
+np 8 nt  8:  1240.7 us a call,  155.1 us a pair (best; mean  156.6),  31.7 GB/s
+## gather kernel (commit e28a900d), 4 threads
+np 1 nt  4:   419.5 us a call,  419.5 us a pair (best; mean  420.8),  11.7 GB/s
+np 2 nt  4:   829.7 us a call,  414.9 us a pair (best; mean  433.5),  11.8 GB/s
+np 8 nt  4:  3210.4 us a call,  401.3 us a pair (best; mean  402.2),  12.2 GB/s
+## F16C kernel (+ four-row S=1, decode-once, no int8 prep), 4 threads
+np 1 nt  4:   274.4 us a call,  274.4 us a pair (best; mean  285.7),  17.9 GB/s
+np 2 nt  4:   540.3 us a call,  270.1 us a pair (best; mean  271.8),  18.2 GB/s
+np 8 nt  4:  2113.0 us a call,  264.1 us a pair (best; mean  266.8),  18.6 GB/s
+## gather kernel (commit e28a900d), 1 threads
+np 1 nt  1:  1486.4 us a call, 1486.4 us a pair (best; mean 1498.6),   3.3 GB/s
+np 2 nt  1:  2933.9 us a call, 1467.0 us a pair (best; mean 1500.5),   3.4 GB/s
+np 8 nt  1: 11567.9 us a call, 1446.0 us a pair (best; mean 1457.0),   3.4 GB/s
+## F16C kernel (+ four-row S=1, decode-once, no int8 prep), 1 threads
+np 1 nt  1:   921.5 us a call,  921.5 us a pair (best; mean  935.4),   5.3 GB/s
+np 2 nt  1:  1850.7 us a call,  925.3 us a pair (best; mean  933.6),   5.3 GB/s
+np 8 nt  1:  7330.3 us a call,  916.3 us a pair (best; mean  925.9),   5.4 GB/s
