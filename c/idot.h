@@ -925,6 +925,27 @@ static void matmul_i4p_gidot_amx(float *y, const int8_t *xq, const float *sx,
  * brought to the grouped family — the prefill batch-union and the serve mux
  * deliver exactly these multi-row calls). Integer group dots in any lane
  * order are exact, and each row keeps its own ascending-g fmaf chain. */
+/* K1b's per-group step, fmaf(d, scale, a), on a CPU without FMA: libm's software fmaf took 85 ns
+ * a call with glibc 2.39 (1.8 ns with 2.43), and a gs64 matrix calls it I/64 times an output, past
+ * the whole gain of the integer dot on a Sandy Bridge. The same bits without it: the product of two
+ * floats is exact in double, their sum with the third is rounded to odd in double (Knuth's TwoSum,
+ * then the even neighbour moved one ulp toward the error), and that rounds to the float fmaf gives,
+ * as 53 >= 2 * 24 + 2 bits. With FMA (x86-64-v3, ARM) it is fmaf, one instruction. */
+static inline float i4p_fmaf(float x, float y, float z){
+#if defined(__FMA__) || defined(__FMA4__) || defined(__ARM_FEATURE_FMA) || defined(__aarch64__) || !(defined(__x86_64__) || defined(_M_X64))
+    return fmaf(x,y,z);
+#else
+    const double a=(double)x*(double)y, b=(double)z, s=a+b;
+    const double a1=s-b, b1=s-a1, err=(a-a1)+(b-b1);   /* s + err == a + b exactly */
+    double r=s;
+    if(err!=0.0 && isfinite(s)){
+        uint64_t u; memcpy(&u,&r,sizeof u);
+        if(!(u&1)) u+=((err>0.0)==(s>0.0)) ? 1u : (uint64_t)-1;
+        memcpy(&r,&u,sizeof r);
+    }
+    return (float)r;
+#endif
+}
 static void i4p_gidot_rows(float *y, const int8_t *xq, const float *sx,
                            const int32_t *xsg, const uint8_t *q4,
                            const float *scale, int S, int I, int O, int gs,
@@ -1034,10 +1055,10 @@ static void i4p_gidot_rows(float *y, const int8_t *xq, const float *sx,
                     }
                 }
 #endif
-                a0=fmaf((float)(d0-8*g0[g]),scl[g],a0);
-                a1=fmaf((float)(d1-8*g1[g]),scl[g],a1);
-                a2=fmaf((float)(d2-8*g2[g]),scl[g],a2);
-                a3=fmaf((float)(d3-8*g3[g]),scl[g],a3);
+                a0=i4p_fmaf((float)(d0-8*g0[g]),scl[g],a0);
+                a1=i4p_fmaf((float)(d1-8*g1[g]),scl[g],a1);
+                a2=i4p_fmaf((float)(d2-8*g2[g]),scl[g],a2);
+                a3=i4p_fmaf((float)(d3-8*g3[g]),scl[g],a3);
             }
             if(g*gs<I){                                  /* coda: gruppo parziale, nibble a coppie */
                 int32_t d0=0,d1=0,d2=0,d3=0;
@@ -1046,10 +1067,10 @@ static void i4p_gidot_rows(float *y, const int8_t *xq, const float *sx,
                     int32_t u=(int32_t)((i&1)?(byte>>4):(byte&0xF));
                     d0+=u*x0[i]; d1+=u*x1[i]; d2+=u*x2[i]; d3+=u*x3[i];
                 }
-                a0=fmaf((float)(d0-8*g0[g]),scl[g],a0);
-                a1=fmaf((float)(d1-8*g1[g]),scl[g],a1);
-                a2=fmaf((float)(d2-8*g2[g]),scl[g],a2);
-                a3=fmaf((float)(d3-8*g3[g]),scl[g],a3);
+                a0=i4p_fmaf((float)(d0-8*g0[g]),scl[g],a0);
+                a1=i4p_fmaf((float)(d1-8*g1[g]),scl[g],a1);
+                a2=i4p_fmaf((float)(d2-8*g2[g]),scl[g],a2);
+                a3=i4p_fmaf((float)(d3-8*g3[g]),scl[g],a3);
             }
             y[(int64_t)s*O+o]    =a0*sx[s];
             y[(int64_t)(s+1)*O+o]=a1*sx[s+1];
@@ -1109,7 +1130,7 @@ static void i4p_gidot_rows(float *y, const int8_t *xq, const float *sx,
 #endif
                 }
 #endif
-                a=fmaf((float)(d-8*xg[g]),scl[g],a);
+                a=i4p_fmaf((float)(d-8*xg[g]),scl[g],a);
             }
             if(g*gs<I){                                  /* coda: gruppo parziale, nibble a coppie */
                 int32_t d=0;
@@ -1117,7 +1138,7 @@ static void i4p_gidot_rows(float *y, const int8_t *xq, const float *sx,
                     uint8_t byte=w[i>>1];
                     d+=(int32_t)((i&1)?(byte>>4):(byte&0xF))*xr[i];
                 }
-                a=fmaf((float)(d-8*xg[g]),scl[g],a);
+                a=i4p_fmaf((float)(d-8*xg[g]),scl[g],a);
             }
             y[(int64_t)s*O+o]=a*sx[s];
         }
