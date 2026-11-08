@@ -6410,10 +6410,12 @@ static size_t v41_state_later(const Model *m) {
     const Cfg *c = &m->c;
     size_t b = 0;
     for (int i = 0; i < c->n_layers; i++) {
-        b += (size_t)c->window * c->head_dim * sizeof(float);
+        b += (size_t)c->window * v41_row_win(c);
         if (c->kv_source[i]) {
             int ratio = c->compress_ratio[i];
-            b += (size_t)(c->max_positions / (ratio > 0 ? ratio : 1)) * (size_t)(c->head_dim + c->index_head_dim) * sizeof(float);
+            /* COLI_VK_KV_QUANT=2: a parked conversation's sets hold the code rows too
+             * (the arrays are the Model's own, swapped whole) */
+            b += (size_t)(c->max_positions / (ratio > 0 ? ratio : 1)) * (v41_row_ckv(c) + v41_row_ikey(c));
         }
     }
     return b * (size_t)(g_v41_mux_slots > 1 ? g_v41_mux_slots - 1 : 0);
