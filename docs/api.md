@@ -820,10 +820,16 @@ pipe submission counts. A slow engine that keeps producing is never retired,
 however long the whole request runs. It is off by default (`0`), because most
 engines send nothing while they read the prompt: a model streamed from disk can
 spend fifteen minutes in a 4096-token prefill before its first token. Set it above
-the longest prefill you expect. Queue waiting is governed separately by
+the longest prefill you expect.
+
+Once a request's first DATA frame arrives, the prompt is read and every token
+sends one, a second or two apart on the slowest models. From then on
+`COLI_ENGINE_DECODE_STALL_TIMEOUT` applies instead (default `300` seconds, `0`
+turns it off), so an engine that freezes mid-answer while `/health` keeps
+answering is retired without any setting. Queue waiting is governed separately by
 `--queue-timeout`. `COLI_ENGINE_CANCEL_TIMEOUT` bounds the wait for a terminal frame
-after CANCEL or STOP (default `30` seconds, must be positive). Both settings must be
-finite.
+after CANCEL or STOP (default `30` seconds, must be positive). All three settings
+must be finite.
 
 On expiry, admission pauses and the old process is killed and reaped before a
 replacement is loaded. All requests on that process fail; they are not replayed.

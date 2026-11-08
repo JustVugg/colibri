@@ -3353,22 +3353,40 @@ class EngineRestartTest(unittest.TestCase):
         finally:
             engine.close()
 
-    def test_stall_timeout_is_off_unless_set(self):
-        process = FakeProcess(lambda process, frame: None)
-        env = {k: v for k, v in os.environ.items() if k != "COLI_ENGINE_STALL_TIMEOUT"}
-        with patch("openai_server.subprocess.Popen", return_value=process):
-            engine = Engine("olmoe", "model", env=env)
-        entry = openai_server._Pending()
-        entry.progress_at -= 86400
-        with engine.pending_lock:
-            engine.pending["7"] = entry
-        try:
-            self.assertIsNone(engine.stalled_reason())
-        finally:
-            engine.close()
+    def test_default_stall_deadline_waits_out_the_prompt_and_bounds_decoding(self):
+        for decode, expected in ((None, "while decoding"), ("0", None)):
+            with self.subTest(decode=decode):
+                process = FakeProcess(lambda process, frame: None)
+                env = {k: v for k, v in os.environ.items()
+                       if k not in ("COLI_ENGINE_STALL_TIMEOUT", "COLI_ENGINE_DECODE_STALL_TIMEOUT")}
+                if decode is not None:
+                    env["COLI_ENGINE_DECODE_STALL_TIMEOUT"] = decode
+                with patch("openai_server.subprocess.Popen", return_value=process):
+                    engine = Engine("olmoe", "model", env=env)
+                entry = openai_server._Pending()
+                entry.progress_at -= 86400   # a day reading the prompt is not a stall
+                with engine.pending_lock:
+                    engine.pending["7"] = entry
+                try:
+                    self.assertIsNone(engine.stalled_reason())
+                    process.stdout.feed(b"DATA 7 1\nA\n")
+                    deadline = time.monotonic() + 2
+                    while not entry.decoding and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(entry.decoding)
+                    self.assertIsNone(engine.stalled_reason())
+                    entry.progress_at -= 301   # past the default 300 s between tokens
+                    reason = engine.stalled_reason()
+                    if expected is None:
+                        self.assertIsNone(reason)
+                    else:
+                        self.assertIn(expected, reason)
+                finally:
+                    engine.close()
 
     def test_engine_timeout_settings_reject_unbounded_values(self):
         for name, values in (("COLI_ENGINE_STALL_TIMEOUT", ("-1", "nan", "inf")),
+                             ("COLI_ENGINE_DECODE_STALL_TIMEOUT", ("-1", "nan", "inf")),
                              ("COLI_ENGINE_CANCEL_TIMEOUT", ("0", "-1", "nan", "inf"))):
             for value in values:
                 with self.subTest(name=name, value=value), \
