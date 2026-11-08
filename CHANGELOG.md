@@ -494,6 +494,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **CUDA on Windows: the answer stopped a few tokens in with the card at 100%** (#2696). Windows'
+  WDDM driver model, which WSL2 drives the card through too, holds CUDA launches back and sends
+  them in batches. A hybrid step (a layer whose experts are partly in RAM) has the card signal the
+  host and wait for the host's rows; the host spun on the signal with no CUDA call that would send
+  the batch, so the signal never left it. After 60 s the host gave up and synchronised, which sent
+  the batch, and the card then spun on the wait for rows that would not come. A hybrid step's
+  signal now sends the frame recorded so far at once (a stream query), on Windows without the TCC
+  driver and in WSL2 (`COLI_CUDA_FLUSH`, the engine says so at start), in qwen36's and qwen38's
+  chains. On Linux nothing changes; forced on there, the tokens and the speed are the same.
 - **Vulkan: `COLI_VK_STAGED=0` on a card without Resizable BAR planned with the whole card.**
   The resident data stays in the host-visible window there (246 of 24467 MiB on an RTX PRO
   4000), and nothing past it spills. The dense chain placed 40 of 40 layers and had its first

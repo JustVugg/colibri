@@ -22,6 +22,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#ifndef _WIN32
+#include <unistd.h>   /* access: WSL2's /dev/dxg (cc_flush_on) */
+#endif
 
 /* Two of backend_cuda.cu's, for this file alone (the same DLL / object set, never the
  * host's: not in backend_cuda.h, not in the loader): a resident tensor's format and
@@ -2898,11 +2901,42 @@ static int cc_moe_cols(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, C
     if (r == 0) c->lost = 1;
     return r;
 }
+/* COLI_CUDA_FLUSH: whether the frame recorded up to a signal goes to the device at once. On
+ * Windows' WDDM driver model, and in WSL2 (which drives the card through it), CUDA holds launches
+ * back and sends them in batches. The host's spin on a signal's word then waited for a kernel
+ * still in the batch, nothing on the device to run it; at 60 s the host gave up and synchronised,
+ * which sent the batch, and the device spun on the wait for the host's rows that came next, at
+ * 100% with the answer stopped (#2696). A stream query sends the batch. 1 always, 0 never; by
+ * default Windows without the TCC driver and a Linux with /dev/dxg (WSL2), nowhere else. */
+static int cc_flush_on(int dev) {
+    static int on = -1;
+    if (on >= 0) return on;
+    const char *e = getenv("COLI_CUDA_FLUSH");
+    if (e && *e) on = atoi(e) != 0;
+    else {
+#ifdef _WIN32
+        int tcc = 0;
+        on = cudaDeviceGetAttribute(&tcc, cudaDevAttrTccDriver, dev) != cudaSuccess || !tcc;
+#else
+        (void)dev;
+        on = access("/dev/dxg", F_OK) == 0;
+#endif
+    }
+    if (on) fprintf(stderr, "[chain] a signal for the host goes to the device at once (%s; COLI_CUDA_FLUSH=0 leaves it to the "
+                            "driver's batches)\n", e && *e ? "COLI_CUDA_FLUSH" : "a driver that batches launches");
+    return on;
+}
 static int cc_signal(CcBuf *flag, size_t word, unsigned v) {
     CcCtx *c = live();
     if (!c || !flag || flag->kind != CC_DOWN || (word + 1) * 4 > flag->bytes) return 0;
     cc_signal_k<<<1, 1, 0, c->stream>>>((volatile unsigned *)flag->d + word, v);
-    return launched(c, "signal");
+    if (!launched(c, "signal")) return 0;
+    if (cc_flush_on(c->device)) {
+        const cudaError_t r = cudaStreamQuery(c->stream);
+        if (r == cudaErrorNotReady) (void)cudaGetLastError();   /* the frame still runs: no error to keep */
+        else if (!cc_ok(c, r, "signal flush")) return 0;
+    }
+    return 1;
 }
 /* COLI_CUDA_HOST_WAIT_S: how long the device waits for the host's word (30 s; the word after it
  * says the device stopped waiting) */
