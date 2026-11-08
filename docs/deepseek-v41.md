@@ -461,7 +461,7 @@ and costs the contention. Anything that tries again has to start from that.
 | `V41_DSPARK_MAX` | the checkpoint's `dspark_block_size` | how many of the drafted tokens are put in front of the main model. Fewer means a cheaper rejected round and a lower ceiling on the win. |
 | `V41_DSPARK_MINACC` | 60 | percent of the drafts written that must be accepted over a window of ten for drafting to continue (a draft the gate left unverified counts as not accepted); below it, drafts pause for 64 tokens. 60 is the measured break-even, not a guess. |
 | `V41_DSPARK_GATE` | on | how many of a round's drafts are verified, from the head's confidence in each (see above). `0` verifies every draft. |
-| `V41_PREFILL_TAIL` | the exact tail (2414 rows on V4.1) | how many of a prompt's last rows the layers after layer 20 run on (see "The prompt's tail"). Unset: the exact tail, the same bits as every row. `0` runs every row; a smaller number (DeepSeek serves with 140) is faster and approximate. |
+| `V41_PREFILL_TAIL` | the exact tail (2414 rows on V4.1) | how many of a prompt's last rows the layers after layer 20 run on (see "The prompt's tail"). Unset: the exact tail, the same bits as every row (on the Vulkan chain chunk by chunk; layer by layer, `COLI_VK_V41_LAYERWISE`, the routed experts' step rounds apart in the last bits, the text the same). `0` runs every row; a smaller number (DeepSeek serves with 140) is faster and approximate. |
 | `V41_SPEC_FORCE` | unset | oracle mode only: draft the reference's tokens (`1`), corrupt the last one (`2`), use the head's own (`3`), corrupt the first one (`4`) or a different one each round (`5`), to exercise the verification path on a fixture whose draft head is random. |
 
 ## Vulkan (`VK=1`)

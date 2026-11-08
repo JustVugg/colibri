@@ -47,6 +47,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <math.h>
+#include "fma_compat.h"
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
 #include <immintrin.h>
@@ -154,7 +155,12 @@ static inline float xf_act_i8(const float *x, int I, int8_t *xq, float *xsum) {
 /* f32: per block, 8 lanes l=0..7 accumulate elements l, l+8, ..., l+56 in
  * order with fma; the 8 lane sums are scaled by the block scale into 8 lane
  * accumulators; the row ends with the fixed 8->1 tree of xf_hsum8. The SIMD
- * paths reproduce exactly this. */
+ * paths reproduce exactly this. The fma is coli_fmaf (fma_compat.h): fmaf where
+ * the CPU fuses, the build every SIMD path needs; without FMA this is the only
+ * f32 path (QWEN_EXPERT_ACT=f32, Qwen3.8's int4 experts), and there fmaf is
+ * glibc's software emulation, one call an element, where coli_fmaf rounds the
+ * exact double sum (#2606): Qwen3.6 with QWEN_EXPERT_ACT=f32 built for Sandy
+ * Bridge, glibc's fmaf in software, 0.59 -> 2.9 tok/s. */
 static inline float xf_hsum8_scalar(const float *l) {
     float a0 = l[0] + l[4], a1 = l[1] + l[5], a2 = l[2] + l[6], a3 = l[3] + l[7];
     float b0 = a0 + a2, b1 = a1 + a3;
@@ -168,9 +174,9 @@ static inline float xf_dot_f32_ref(const uint8_t *w, const float *sc, const floa
         float lane[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         for (int i = 0; i < XF_BLOCK; i++) {
             int v = (i < 32 ? (blk[i] & 0xF) : (blk[i - 32] >> 4)) - 8;
-            lane[i & 7] = fmaf((float)v, xb[i], lane[i & 7]);
+            lane[i & 7] = coli_fmaf((float)v, xb[i], lane[i & 7]);
         }
-        for (int l = 0; l < 8; l++) acc[l] = fmaf(lane[l], sc[g], acc[l]);
+        for (int l = 0; l < 8; l++) acc[l] = coli_fmaf(lane[l], sc[g], acc[l]);
     }
     return xf_hsum8_scalar(acc);
 }

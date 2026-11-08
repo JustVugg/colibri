@@ -2246,6 +2246,16 @@ static int decode_bf16(float *output, const void *data, size_t count) {
     return 0;
 }
 
+/* V4_ATTN_BATCH_PROJ (opt-in, default 0): wq_a and wkv in one device round trip. */
+static int v4_attn_batch_proj_on(void) {
+    static int wanted = -1;
+    if (wanted < 0) {
+        const char *env = getenv("V4_ATTN_BATCH_PROJ");
+        wanted = env && *env == '1';
+    }
+    return wanted;
+}
+
 static int attention_token_impl(float *output,
                                 ColiDeepSeekV4WindowAttentionState *state,
                                 const ColiDeepSeekV4LayerWeights *weights,
@@ -2300,7 +2310,19 @@ static int attention_token_impl(float *output,
     int result = (!input_act || !input_act_scales ||
                   coli_fp8_activation_qdq_ref(input_act, input_act_scales, input,
                                               (size_t)wq_a.columns, 128)) ? -1 : 0;
-    if (!result) result = coli_fp8_matvec_pre(qa, &wq_a, input, input_act);
+    /* V4_ATTN_BATCH_PROJ: wq_a and wkv read the raw input on the GPU (the same
+     * matvec as coli_fp8_matvec_pre's GPU path), so one round trip writes both. */
+    int pj_done = 0;
+#ifdef COLI_V4_GPU_TIER
+    if (!result && v4_attn_batch_proj_on() && coli_v4_gpu_attn_batch_wanted() &&
+        wq_a.gpu && wkv.gpu) {
+        void *tens[2] = {wq_a.gpu, wkv.gpu};
+        int rows[2] = {q_rank, head_dim};
+        float *outs[2] = {qa, kv};
+        pj_done = coli_v4_gpu_proj_batch(tens, rows, outs, 2, input) == 0;
+    }
+#endif
+    if (!result && !pj_done) result = coli_fp8_matvec_pre(qa, &wq_a, input, input_act);
     coli_bf16_round_array(qa, (size_t)q_rank);
     const void *q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
     if (!result && (!q_norm || decode_bf16(norm_weight, q_norm, (size_t)q_rank) ||
@@ -2350,7 +2372,7 @@ static int attention_token_impl(float *output,
         for (int i = 0; i < head_dim; i++) values[i] = coli_bf16_round(values[i] * scale);
     }
 
-    if (!result) result = coli_fp8_matvec_pre(kv, &wkv, input, input_act);
+    if (!result && !pj_done) result = coli_fp8_matvec_pre(kv, &wkv, input, input_act);
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
     const void *kv_norm = layer_data(weights, "attn.kv_norm.weight", NULL);
     if (!result && (!kv_norm || decode_bf16(norm_weight, kv_norm, (size_t)head_dim) ||
@@ -3912,6 +3934,10 @@ int coli_v4_compressor_view(ColiDeepSeekV4CompressorState *state,
 #ifdef COLI_V4_UNIT_INDEXER
 /* ######## deepseek_v4_indexer.c ######## */
 #include "deepseek_v4_internal.h"
+#include "v4_topk.h"
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include <math.h>
 #include <stdarg.h>
@@ -4100,6 +4126,20 @@ static int indexer_identity_wanted(void) {
     return wanted;
 }
 
+/* V4_IDX_FAST (default 0, opt-in): the selection's top-k runs v4_topk_desc (exact
+ * radix sort, same indices in the same order as the qsort, which stays for NaN rows),
+ * in parallel across the scored tokens of a chunk, and a decode step prepares its
+ * query heads in parallel. 1 = on; 0 = the sequential qsort path. CPU only: the
+ * GPU scoring and projection paths are untouched. */
+static int indexer_fast_wanted(void) {
+    static int wanted = -1;
+    if (wanted < 0) {
+        const char *env = getenv("V4_IDX_FAST");
+        wanted = env && *env == '1';
+    }
+    return wanted;
+}
+
 /* Advance the indexer's compressor by one position (no scoring). Returns the
  * candidate count visible to this position, or -1. */
 static int indexer_advance(ColiDeepSeekV4Indexer *state, const float *input,
@@ -4147,23 +4187,40 @@ int coli_v4_indexer_advance(ColiDeepSeekV4Indexer *state, const float *input,
 /* Prepare one token's scoring queries in place: bf16 round, RoPE, per-head
  * hadamard + fp4 round trip. queries holds heads*dimension floats fresh from
  * the wq_b projection. */
+/* One head's share of the prep: hadamard + fp4 round trip, in place. Heads are
+ * independent, so the decode path runs them on the team (V4_IDX_FAST). */
+static int indexer_prepare_query_head(float *query, uint8_t *scales, float *qdq,
+                                      int dimension) {
+    int result = coli_hadamard_bf16_ref(query, (size_t)dimension);
+    if (!result) result = coli_fp4_activation_qdq_ref(
+        qdq, scales, query, (size_t)dimension, 32);
+    if (!result) {
+        memcpy(query, qdq, (size_t)dimension * sizeof(*query));
+        coli_bf16_round_array(query, (size_t)dimension);
+    }
+    return result;
+}
+
 static int indexer_prepare_queries(float *queries, uint8_t *scales, float *qdq,
                                    const ColiDeepSeekV4Config *config,
                                    int position) {
     int dimension = config->index_head_dim, heads = config->index_n_heads;
     coli_bf16_round_array(queries, (size_t)heads * dimension);
     int result = apply_position_rope(queries, config, position);
-    for (int head = 0; !result && head < heads; head++) {
-        float *query = queries + (size_t)head * dimension;
-        result = coli_hadamard_bf16_ref(query, (size_t)dimension);
-        if (!result) result = coli_fp4_activation_qdq_ref(
-            qdq, scales, query, (size_t)dimension, 32);
-        if (!result) {
-            memcpy(query, qdq, (size_t)dimension * sizeof(*query));
-            coli_bf16_round_array(query, (size_t)dimension);
-        }
-    }
+    for (int head = 0; !result && head < heads; head++)
+        result = indexer_prepare_query_head(
+            queries + (size_t)head * dimension, scales, qdq, dimension);
     return result;
+}
+
+/* One head's weight: a sequential sum over the hidden columns. The serial loop
+ * and the decode path's head-parallel loop both call it (same order, same bits). */
+static float indexer_head_weight(const uint16_t *row, const float *input,
+                                 int hidden, float weight_scale) {
+    float sum = 0.0f;
+    for (int column = 0; column < hidden; column++)
+        sum += coli_bf16_decode(row[column]) * input[column];
+    return sum * weight_scale;
 }
 
 static void indexer_head_weights(float *head_weights, const uint16_t *raw,
@@ -4171,13 +4228,10 @@ static void indexer_head_weights(float *head_weights, const uint16_t *raw,
                                  const ColiDeepSeekV4Config *config) {
     int heads = config->index_n_heads, dimension = config->index_head_dim;
     float weight_scale = 1.0f / sqrtf((float)(dimension * heads));
-    for (int head = 0; head < heads; head++) {
-        float sum = 0.0f;
-        const uint16_t *row = raw + (size_t)head * config->hidden_size;
-        for (int column = 0; column < config->hidden_size; column++)
-            sum += coli_bf16_decode(row[column]) * input[column];
-        head_weights[head] = sum * weight_scale;
-    }
+    for (int head = 0; head < heads; head++)
+        head_weights[head] = indexer_head_weight(
+            raw + (size_t)head * config->hidden_size, input,
+            config->hidden_size, weight_scale);
 }
 
 static float indexer_score_one(const float *q, const float *key,
@@ -4256,7 +4310,15 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     size_t sz_scounts = ALIGN32((size_t)need * sizeof(int));
     size_t sz_stoken = ALIGN32((size_t)need * sizeof(int));
     size_t sz_scores = ALIGN32((size_t)need * max_count * sizeof(float));
-    size_t sz_ranked = ALIGN32((size_t)max_count * sizeof(IndexScore));
+    /* One sort workspace per thread: v4_topk_desc needs 2*max_count uint64 keys;
+     * the qsort fallback (NaN rows, V4_IDX_FAST=0) uses max_count IndexScore. */
+    int sort_threads = 1;
+#ifdef _OPENMP
+    if (need > 1 && indexer_fast_wanted()) sort_threads = omp_get_max_threads();
+    if (sort_threads < 1) sort_threads = 1;
+#endif
+    size_t sort_stride = (size_t)max_count * 2 * sizeof(uint64_t);
+    size_t sz_ranked = ALIGN32((size_t)sort_threads * sort_stride);
 #ifdef COLI_V4_GPU_TIER
     size_t sz_xq = (need <= 1024) ? ALIGN32((size_t)need * cols * sizeof(float)) : 0;
     size_t sz_yq = (need <= 1024) ? ALIGN32((size_t)need * qn * sizeof(float)) : 0;
@@ -4282,6 +4344,7 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     int *scounts = (int *)scratch_ptr; scratch_ptr += sz_scounts;
     int *stoken = (int *)scratch_ptr; scratch_ptr += sz_stoken;
     float *scores = (float *)scratch_ptr; scratch_ptr += sz_scores;
+    char *sort_work = scratch_ptr;
     IndexScore *ranked = (IndexScore *)scratch_ptr; scratch_ptr += sz_ranked;
     int result = 0;
 
@@ -4399,7 +4462,38 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
         stoken[s] = t;
         s++;
     }
-    if (!result) {
+    if (!result && need == 1 && indexer_fast_wanted()) {
+        /* A decode step scores one token: its per-head work (hadamard + fp4 per
+         * head, one weight sum per head) ran on one thread. RoPE stays on this
+         * thread, the heads go to the team; each head keeps its own order. */
+        int t = stoken[0];
+        float *q = queries + (size_t)t * qn;
+        const float *input = inputs + (size_t)t * config->hidden_size;
+        int hidden = config->hidden_size;
+        float weight_scale = 1.0f / sqrtf((float)(dimension * heads));
+        coli_bf16_round_array(q, qn);
+        if (dimension > 512 || apply_position_rope(q, config, start_position + t))
+            result = set_error(error, error_size, "indexer query prep failed");
+        int head_failed = 0;
+        if (!result) {
+            #pragma omp parallel for schedule(static)
+            for (int head = 0; head < heads; head++) {
+                float tqdq[512];
+                uint8_t tscales[16];
+                if (indexer_prepare_query_head(q + (size_t)head * dimension,
+                                               tscales, tqdq, dimension)) {
+                    #pragma omp atomic write
+                    head_failed = 1;
+                }
+                head_weights[head] = indexer_head_weight(
+                    raw_weights + (size_t)head * hidden, input, hidden,
+                    weight_scale);
+            }
+            if (head_failed)
+                result = set_error(error, error_size, "indexer query prep failed");
+        }
+        if (!result) memcpy(sq, q, qn * sizeof(*sq));
+    } else if (!result) {
         int prep_failed = 0;
         #pragma omp parallel for schedule(dynamic, 1)
         for (int i = 0; i < need; i++) {
@@ -4456,7 +4550,33 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
         fprintf(stderr, "idxverify layer=%d start=%d scored=%d mismatches=%lld max=%g\n",
                 state->layer, start_position, need, bad, worst);
     }
-    for (int i = 0; !result && i < need; i++) {
+    if (!result && indexer_fast_wanted()) {
+        /* v4_topk_desc: exact radix top-k, indices and order equal to the qsort
+         * below; a NaN row (refused with -1) takes the qsort. */
+        int limit = topk < index_capacity ? topk : index_capacity;
+        #pragma omp parallel for schedule(dynamic, 1) num_threads(sort_threads) if (sort_threads > 1)
+        for (int i = 0; i < need; i++) {
+            int thread = 0;
+#ifdef _OPENMP
+            thread = omp_get_thread_num();
+#endif
+            char *work = sort_work + (size_t)thread * sort_stride;
+            int t = stoken[i];
+            const float *row = scores + (size_t)i * max_count;
+            int *out = indices + (size_t)t * index_capacity;
+            int n = v4_topk_desc(out, row, scounts[i], limit, (uint64_t *)work);
+            if (n < 0) {
+                IndexScore *own = (IndexScore *)work;
+                for (int candidate = 0; candidate < scounts[i]; candidate++)
+                    own[candidate] = (IndexScore){row[candidate], candidate};
+                qsort(own, (size_t)scounts[i], sizeof(*own), descending_score);
+                n = scounts[i] < limit ? scounts[i] : limit;
+                for (int k = 0; k < n; k++) out[k] = own[k].index;
+            }
+            selected[t] = n;
+        }
+    }
+    for (int i = 0; !result && !indexer_fast_wanted() && i < need; i++) {
         int t = stoken[i];
         const float *row = scores + (size_t)i * max_count;
         for (int candidate = 0; candidate < scounts[i]; candidate++)
@@ -11521,6 +11641,22 @@ static void v4_gpu_mirror_reserve_size(const ColiDeepSeekV4Config *config,
 static long long v4_gpu_mirror_reserve_mb(int live);
 static long long v4_gpu_mirror_reserve_margin_mb(int live);
 
+/* Retained router input per device (V4_GPU_ROUTE_REUSE=1). Single generation
+ * thread, matching the backend's per-device scratch contract. */
+#define V4_GPU_ROUTE_MAX_DEV 16
+static struct V4GpuRouteScratch {
+    Dsv4CudaActivation *input;
+    long long capacity;
+} v4_gpu_route_scratch[V4_GPU_ROUTE_MAX_DEV];
+
+static void v4_gpu_route_scratch_clear(void) {
+    for (int device = 0; device < V4_GPU_ROUTE_MAX_DEV; device++) {
+        if (v4_gpu_route_scratch[device].input)
+            dsv4_cuda_activation_free(v4_gpu_route_scratch[device].input);
+        v4_gpu_route_scratch[device] = (struct V4GpuRouteScratch){0};
+    }
+}
+
 int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     if (!engine) return -1;
     engine->gpu.enabled = 0;
@@ -11595,6 +11731,7 @@ void coli_v4_gpu_engine_close(ColiV4Engine *engine) {
      * banks. Callers outside generate() (oracle, teacher forcing, Segment
      * runs) never release them themselves. */
     coli_v4_gpu_moe_batch_release();
+    dsv4_cuda_proj_batch_release();
     for (int layer = 0; layer < COLI_V4_RESIDENT_MAX_LAYERS; layer++) {
         if (!engine->gpu.layer_ready[layer]) continue;
         ColiDeepSeekV4LayerWeights *weights =
@@ -11617,6 +11754,7 @@ void coli_v4_gpu_engine_close(ColiV4Engine *engine) {
             (V4GpuExpertMirrorCache *)engine->gpu.dspark_mirrors);
         engine->gpu.dspark_mirrors = NULL;
     }
+    v4_gpu_route_scratch_clear();
     dsv4_cuda_shutdown();
     engine->gpu.enabled = 0;
     engine->gpu.uploaded_bytes = 0;
@@ -11936,6 +12074,33 @@ int coli_v4_gpu_fp8_matvec(const ColiTensorView *w, float *output,
     return dsv4_cuda_matvec(tensor, output, (float *)input) ? 0 : -1;
 }
 
+/* V4_ATTN_BATCH_PROJ (opt-in): the decode input projections of one token in one device
+ * round trip (dsv4_cuda_proj_batch). The host stage is kept for the process lifetime
+ * (a few KB to a few hundred KB).
+ * shortcut: stage is never freed, its size is bounded by 6 projections, upgrade: free it on engine close. */
+int coli_v4_gpu_proj_batch(void *const *tensors, const int *rows, float **outs,
+                           int n, const float *input) {
+    static float *stage;
+    static size_t stage_floats;
+    if (n < 1 || n > 6 || !tensors || !rows || !outs || !input) return -1;
+    size_t total = 0;
+    for (int i = 0; i < n; i++) total += (size_t)rows[i];
+    if (total > stage_floats) {
+        float *grown = realloc(stage, total * sizeof(*grown));
+        if (!grown) return -1;
+        stage = grown;
+        stage_floats = total;
+    }
+    if (dsv4_cuda_proj_batch(n, (Dsv4CudaTensor *const *)tensors, rows, input, stage) != 1)
+        return -1;
+    size_t off = 0;
+    for (int i = 0; i < n; i++) {
+        memcpy(outs[i], stage + off, (size_t)rows[i] * sizeof(float));
+        off += (size_t)rows[i];
+    }
+    return 0;
+}
+
 int coli_v4_gpu_matvec_grouped(const ColiTensorView *w, float *output,
                                const float *input, int groups) {
     Dsv4CudaTensor *tensor = (Dsv4CudaTensor *)w->gpu;
@@ -11987,6 +12152,52 @@ int coli_v4_gpu_fp8_matmul_batch(const ColiTensorView *w, float *outputs,
     return 0;
 }
 
+/* The route on resolved gate / bias tensors (bias may be NULL). Shared by
+ * coli_v4_gpu_route and the test hooks, so the test drives the same code. */
+static int v4_gpu_route_mirrors(float *route_weights, int *indices, const float *input,
+                                Dsv4CudaTensor *gate, Dsv4CudaTensor *bias_t,
+                                const int *forced_indices, int dimension, float route_scale) {
+    int device = dsv4_cuda_tensor_device(gate);
+    if (device < 0) return -1;
+    /* V4_GPU_ROUTE_REUSE=1: one retained input buffer per device, grown on demand,
+     * instead of a cudaMalloc/cudaFree pair per call. Opt-in: default is the old path. */
+    const char *reuse_env = getenv("V4_GPU_ROUTE_REUSE");
+    int reuse = reuse_env && atoi(reuse_env) != 0 && device < V4_GPU_ROUTE_MAX_DEV;
+    Dsv4CudaActivation *act = NULL;
+    if (reuse) {
+        /* the retained capacity may exceed this call's logical input: refuse a gate
+         * wider than the input, or the backend would read past what was uploaded */
+        if (dsv4_cuda_tensor_bytes(gate) > (long long)256 * dimension * (long long)sizeof(float))
+            return -1;
+        struct V4GpuRouteScratch *scratch = v4_gpu_route_scratch + device;
+        if (scratch->capacity < dimension) {
+            if (scratch->input) dsv4_cuda_activation_free(scratch->input);
+            scratch->input = dsv4_cuda_activation_create(device, dimension);
+            scratch->capacity = scratch->input ? dimension : 0;
+        }
+        act = scratch->input;
+    } else {
+        act = dsv4_cuda_activation_create(device, dimension);
+    }
+    if (!act) return -1;
+    int ok = dsv4_cuda_activation_upload(act, input, dimension);
+    int ids[6];
+    float wts[6];
+    if (ok) ok = dsv4_cuda_route(act, gate, bias_t,
+                                 forced_indices, route_scale, ids, wts);
+    if (!reuse) {
+        dsv4_cuda_activation_free(act);
+    } else if (!ok) {
+        dsv4_cuda_activation_sync(act);   /* drain queued work before the next reuse */
+    }
+    if (!ok) return -1;
+    for (int k = 0; k < 6; k++) {
+        indices[k] = ids[k];
+        route_weights[k] = wts[k];
+    }
+    return 0;
+}
+
 int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
                       const ColiDeepSeekV4LayerWeights *weights,
                       const float *bias, const int *forced_indices,
@@ -11997,23 +12208,22 @@ int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
     Dsv4CudaTensor *gate = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn.gate");
     Dsv4CudaTensor *bias_t = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn.gate.bias");
     if (!gate || (bias && !bias_t)) return -1;
-    int device = dsv4_cuda_tensor_device(gate);
-    if (device < 0) return -1;
-    Dsv4CudaActivation *act = dsv4_cuda_activation_create(device, dimension);
-    if (!act) return -1;
-    int ok = dsv4_cuda_activation_upload(act, input, dimension);
-    int ids[6];
-    float wts[6];
-    if (ok) ok = dsv4_cuda_route(act, gate, bias ? bias_t : NULL,
-                                 forced_indices, route_scale, ids, wts);
-    dsv4_cuda_activation_free(act);
-    if (!ok) return -1;
-    for (int k = 0; k < topk; k++) {
-        indices[k] = ids[k];
-        route_weights[k] = wts[k];
-    }
-    return 0;
+    return v4_gpu_route_mirrors(route_weights, indices, input, gate,
+                                bias ? bias_t : NULL, forced_indices, dimension, route_scale);
 }
+
+#ifdef COLI_V4_TEST_HOOKS
+int coli_v4_test_gpu_route_mirrors(float *route_weights, int *indices, const float *input,
+                                   void *gate, void *bias, const int *forced_indices,
+                                   int dimension, float route_scale) {
+    return v4_gpu_route_mirrors(route_weights, indices, input, (Dsv4CudaTensor *)gate,
+                                (Dsv4CudaTensor *)bias, forced_indices, dimension, route_scale);
+}
+void coli_v4_test_gpu_route_scratch_clear(void) { v4_gpu_route_scratch_clear(); }
+long long coli_v4_test_gpu_route_scratch_capacity(int device) {
+    return device >= 0 && device < V4_GPU_ROUTE_MAX_DEV ? v4_gpu_route_scratch[device].capacity : 0;
+}
+#endif
 
 /* ---- routed-expert fp4 mirrors ---------------------------------------
  * The 256-expert bank is fp4 in the same packed-nibble + per-row UE8M0

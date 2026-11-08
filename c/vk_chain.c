@@ -150,6 +150,7 @@ typedef struct {
     VkPipeline gemv4x;                /* chain_gemv.comp with x read from its buffer (a row past the staging) */
     VkPipeline gemv4n, gemv4xn;       /* the same taking up to 4 rows of x a workgroup (a verify's), NR 4 */
     VkShaderModule mod_adec; VkPipeline adec; int adec_tried; VkcBuf *adec_x;   /* chain_attn_dec.comp and its scratch */
+    VkcBuf *dpa_sc, *dpa_den;   /* chain_dsv4_pa.comp's scores and denominators */
     VkPipeline adg[VKC_ADG_MAX]; int adg_hd[VKC_ADG_MAX], adg_gq[VKC_ADG_MAX], adg_kv[VKC_ADG_MAX], nadg;   /* its grouped mode's */
     VkPipeline attn_h, adec_h; int attn_h_tried, adec_h_tried;   /* chain_attn and chain_attn_dec over a float16 cache (KV16) */
     VkShaderModule mod_mdec; VkPipeline mdec; int mdec_tried;   /* chain_mla_dec.comp (the same scratch) */
@@ -3712,7 +3713,7 @@ void vkc_shutdown(void) {
 
 /* ---- DeepSeek V4.1 Flash and DeepSeek V4 attention (chain_dsv4.comp) ------------------
  * Its own optional pipeline: without the shader only these ops decline. */
-static struct { VkShaderModule mod; VkPipeline pipe; } g_d4[2];
+static struct { VkShaderModule mod, pamod; VkPipeline pipe, pa; } g_d4[2];
 #define D4 (g_d4[g_kd])
 /* And the indexer's tiles (chain_dsv4_idx.comp, mode 11) on a pipeline of their own: a
  * workgroup's shared memory is sized a module, and its 32 KB would leave every mode of
@@ -3720,16 +3721,20 @@ static struct { VkShaderModule mod; VkPipeline pipe; } g_d4[2];
 static struct { VkShaderModule mod; VkPipeline pipe; } g_d4i[2];
 #define D4I (g_d4i[g_kd])
 #define DSV4_IDX_SHARED 32768u   /* its key tile (32 x 128 floats) and query pair (2 x 16 x 128) */
-static void dsv4_init(void) {
+static int spv_there(const char *file) {
     char path[1200];
     size_t pre = dir_prefix(KC.core.spv_path);
-    const char *file = "chain_dsv4.spv";
-    if (pre + strlen(file) + 1 >= sizeof path) return;
+    if (pre + strlen(file) + 1 >= sizeof path) return 0;
     memcpy(path, KC.core.spv_path, pre); strcpy(path + pre, file);
     FILE *f = fopen(path, "rb");
-    if (!f) return;
+    if (!f) return 0;
     fclose(f);
-    if ((D4.mod = load_module(KC.core.spv_path, file))) D4.pipe = make_pipe(D4.mod, NULL);
+    return 1;
+}
+static void dsv4_init(void) {
+    if (spv_there("chain_dsv4.spv") && (D4.mod = load_module(KC.core.spv_path, "chain_dsv4.spv"))) D4.pipe = make_pipe(D4.mod, NULL);
+    /* a prompt chunk's attention in three passes (chain_dsv4_pa.comp): optional, mode 0 without it */
+    if (spv_there("chain_dsv4_pa.spv") && (D4.pamod = load_module(KC.core.spv_path, "chain_dsv4_pa.spv"))) D4.pa = make_pipe(D4.pamod, NULL);
     if (kc_shared_limit() >= DSV4_IDX_SHARED &&
         (D4I.mod = load_module(KC.core.spv_path, "chain_dsv4_idx.spv")))
         D4I.pipe = make_pipe(D4I.mod, NULL);
@@ -3740,6 +3745,8 @@ static void dsv4_shutdown(void) {
     memset(&D4I, 0, sizeof D4I);
     if (D4.pipe) vkDestroyPipeline(KC.dev, D4.pipe, NULL);
     if (D4.mod) vkDestroyShaderModule(KC.dev, D4.mod, NULL);
+    if (D4.pa) vkDestroyPipeline(KC.dev, D4.pa, NULL);
+    if (D4.pamod) vkDestroyShaderModule(KC.dev, D4.pamod, NULL);
     memset(&D4, 0, sizeof D4);
 }
 int vkc_dsv4_ready(void) { return vkc_ready() && D4.pipe; }
@@ -3757,10 +3764,66 @@ static int dsv4_rec_on(VkPipeline pipe, int kind, int mode, const void *b, size_
 static int dsv4_rec(int kind, int mode, const void *b, size_t bytes, VkcBind *bd, int nb, uint32_t gx, uint32_t gy) {
     return dsv4_rec_on(D4.pipe, kind, mode, b, bytes, bd, nb, gx, gy);
 }
+/* A scratch of the device's that grows: the one it replaces lives as long as the frame. */
+static VkcBuf *grow_scratch(VkcBuf **slot, size_t bytes) {
+    if (*slot && (*slot)->bytes >= bytes) return *slot;
+    VkcFrame *f = open_frame();
+    if (!f) return NULL;
+    VkcBuf *nb = vkc_buf(bytes + bytes / 4, VKC_DEV);
+    if (!nb) return NULL;
+    if (*slot) {
+        if (f->ntmp == f->ctmp) {
+            int c = f->ctmp ? 2 * f->ctmp : 8;
+            VkcBuf **t = realloc(f->tmp, (size_t)c * sizeof *t);
+            if (!t) { buf_release(nb); return NULL; }
+            f->tmp = t; f->ctmp = c;
+        }
+        f->tmp[f->ntmp++] = *slot;
+    }
+    return *slot = nb;
+}
+/* A prompt chunk's rows from VKC_DSV4_PA_MIN on (chain_dsv4_pa.comp, mode 0's bits): the
+ * scores of a row's heads on the tiles of its listed rows, the weights and denominators, the
+ * output; in slices of rows whose scores fit VKC_DSV4_PA_MB. Mode 0 gives each (head, row) a
+ * workgroup that reads every listed row from memory: a 4104-token prompt of V4.1-Flash
+ * (UD-IQ1_S) spent 28.4 s of an RTX PRO 4000's time there. COLI_VK_DSV4_PA=0: mode 0. */
+#define VKC_DSV4_PA_MIN 8
+#define VKC_DSV4_PA_MB 64
+static int dsv4_pa(VkcBuf *q, VkcBuf *win, VkcBuf *cmp, VkcBuf *list, VkcBuf *prm, VkcBuf *out, const VkcDsAttn *p) {
+    const char *e = getenv("COLI_VK_DSV4_PA");
+    if ((e && *e == '0') || !D4.pa || p->S < VKC_DSV4_PA_MIN || p->hd % 64 || p->H > 65535 * 64) return 0;
+    const size_t per = (size_t)p->H * p->cnt * sizeof(float);
+    int R = (int)(((size_t)VKC_DSV4_PA_MB << 20) / per);
+    if (R < 1) R = 1;
+    if (R > p->S) R = p->S;
+    VkcBuf *sc = grow_scratch(&KC.dpa_sc, (size_t)R * per), *dn = grow_scratch(&KC.dpa_den, (size_t)R * p->H * sizeof(float));
+    if (!sc || !dn || !open_frame() || KC.lost) return 0;
+    KC.kind = PK_ATTN;
+    int ok = 1;
+    for (int r0 = 0; ok && r0 < p->S; r0 += R) {
+        VkcDsAttn x = *p;
+        x.S = p->S - r0 < R ? p->S - r0 : R;
+        x.l_off += r0 * p->l_row; x.q_off += r0 * p->q_row; x.o_off += r0 * p->o_row;
+        Dsv4PC pc; memset(&pc, 0, sizeof pc);
+        memcpy(pc.w, &x, sizeof x);   /* v[1..16]; v[17] the scores' offset, v[18] the denominators' */
+        const uint32_t hg = (uint32_t)((p->H + 63) / 64);
+        pc.mode = 0;
+        VkcBind b0[8] = {B(q, 0), B(win, 0), B(cmp ? cmp : win, 0), B(list, 0), B(NULL, 0), B(NULL, 0), B(sc, 1), B(NULL, 0)};
+        ok = record(D4.pa, b0, 8, &pc, sizeof pc, (uint32_t)x.S, hg, 1);
+        pc.mode = 1;
+        VkcBind b1[8] = {B(NULL, 0), B(NULL, 0), B(NULL, 0), B(list, 0), B(prm, 0), B(NULL, 0), B(sc, 1), B(dn, 1)};
+        ok = ok && record(D4.pa, b1, 8, &pc, sizeof pc, (uint32_t)x.S, (uint32_t)p->H, 1);
+        pc.mode = 2;
+        VkcBind b2[8] = {B(NULL, 0), B(win, 0), B(cmp ? cmp : win, 0), B(list, 0), B(NULL, 0), B(out, 1), B(sc, 0), B(dn, 0)};
+        ok = ok && record(D4.pa, b2, 8, &pc, sizeof pc, (uint32_t)x.S, (uint32_t)(p->hd / 64), hg);
+    }
+    return ok;
+}
 int vkc_dsv4_attn(VkcBuf *q, VkcBuf *win, VkcBuf *cmp, VkcBuf *list, VkcBuf *prm, VkcBuf *out, const VkcDsAttn *p) {
     if (p->S < 1 || p->S > 65535 || p->H < 1 || p->H > 65535 || p->hd < 1 || p->hd > 1024 || p->cnt < 0 || p->cnt > 3072)
         return 0;
     if (p->cnt == 0) return 0;
+    if (dsv4_pa(q, win, cmp, list, prm, out, p)) return 1;
     VkcBind bd[6] = {B(q, 0), B(win, 0), B(cmp ? cmp : win, 0), B(list, 0), B(prm, 0), B(out, 1)};
     return dsv4_rec(PK_ATTN, 0, p, sizeof *p, bd, 6, (uint32_t)p->H, (uint32_t)p->S);
 }

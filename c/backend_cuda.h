@@ -253,8 +253,9 @@ COLI_CUDA_DLLEXPORT int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate, ColiCud
  * consecutive [D] rows in call order. */
 /* Async issue/take split of the group call below (Inc.4): issue launches on the
  * device stream and returns; take syncs and returns the pinned result rows (valid
- * until the next issue on that device). Small totals only (<=8 rows); one
- * outstanding issue per device. */
+ * until the next issue on that device). Decode-scale totals only (<=32 rows, the
+ * same numeric family as coli_cuda_expert_group_pinned); one outstanding issue
+ * per device. */
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
                                ColiCudaTensor *const *ups,
                                ColiCudaTensor *const *downs,
