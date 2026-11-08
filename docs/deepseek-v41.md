@@ -540,6 +540,49 @@ beside a trunk the whole prompt pays for on every token. `COLI_VK_TIER_RESERVE_G
 2.1 GiB the trunk still uploads after that fit (the lm head, the 40 routers, the DSpark
 stages: the token embedding is never on the device, see below).
 
+### Quantized KV mirrors (`COLI_VK_KV_QUANT`)
+
+The only VRAM item that grows with the conversation is the chain's KV mirrors, and the
+checkpoint's own cache already stores that state quantized. `COLI_VK_KV_QUANT=1` keeps
+the mirrors in those formats — the same layouts DeepInfer's paged cache defines
+(`c/dsv41_kvq.h`):
+
+| mirror | format | bytes a row | was (fp32) |
+|---|---|---|---|
+| window ring (`win`) | e4m3, a ue8m0 scale a group of 32, `[data \| scales]` a token | **528 B** | 2048 B |
+| compressed rows (`ckv`) | e2m1 nibbles, an e4m3 scale a group of 16 (the scale as stored scales the group) | **288 B** | 2048 B |
+| index keys (`ikey`) | e2m1, a ue8m0 scale a group of 32, block-wide sections (a block of 32 tokens: 2048 B of data, then 128 B of scales — a token's 4 scale bytes one packed int32) | **68 B** | 512 B |
+
+The compressor's `ring` stays fp32 (it is the pooling accumulator, not a mirror), as do
+`isc`, the masks and the engram buffers. A row is quantized once, after its last fp32
+reader (`chain_dsv4.comp` mode 13), and dequantized where it is read — the attention and
+the indexer's scores decode inline (modes 0, 3, 9, 10) — and on the write-back that ends
+a forward (mode 14), so the host's state stays fp32 holding the dequantized values and
+rollback, prefix reuse and a lost device still rebuild nothing.
+
+The arithmetic at the released geometry, per token across the layers: about **6,400 B
+of mirror a position today against about 890 B quantized** (528 for the window plus the
+compressed rows' and index keys' 288 and 68 over each layer's compression ratio) — the
+figures of the prefill-VRAM analysis
+([dsv41-prefill-vram-2026-11-06](experiments/dsv41-prefill-vram-2026-11-06.md), whose
+§10 parked this as the lever that scales with context: 0.31 GiB of mirrors at 64K
+tokens, 0.62 at 128K, 4.7 at the 1M ceiling). Quantized, those become roughly **0.11 GiB
+at 128K — about 690 MiB saved — and 5.38 GiB of the 4.7 GiB peak at 1M**; the same math
+the kv-quant test family pins on the ledger line, which reports `(quantized)` when the
+mirrors are (a second device's mirrors are not in that line — the pre-existing gap).
+
+It is an **approximate mode**, off by default, and the flag-off path is byte for byte
+what it was (the flag branches only at the mirrors' widths and stores; a run's mirrors
+are summed against the flag's widths at the first forward, so a missed branch fails
+loudly). The FP4 index keys can move a top-k pick, so the logits drift a little — the
+`kv-quant-deepseek` family gates a documented tolerance instead of bit-identity, the
+way `V41_PREFILL_TAIL`'s tests accept the tail's own approximation — and the pull's
+write-back returns dequantized rows (a quantize→dequant hop the pack's idempotence
+bounds: re-packing a dequantized row reproduces its bytes, which the unit test pins).
+The flag needs `head_dim` 512 and `index_head_dim` 128, and it does not re-price the
+planner: the KV split decides exactly as before, and when it arms the mirrors go back to
+fp32 whole (`v41c_kvq_give_way`), re-mirrored from the host.
+
 ### Where the VRAM goes at a turn's end
 
 `V41_STATS=1` (or `COLI_VK_LEDGER=1`) ends every serve turn with one ledger line
@@ -693,6 +736,15 @@ needed.
 The gateway is tested against the checkpoint's own encoding fixtures
 (`tests/test_openai_tools_v41_e2e.py`), and an image is followed all the way from an
 OpenAI request to a different answer in `tests/test_dsv41_image_serve.py`.
+
+The quantized mirrors have their own family: `tests/test_vk_kv_quant.c` holds the
+device's pack to `c/dsv41_kvq.h`'s reference bit for bit (the edge rows of the scale
+math included), the unpack, a re-upload's lanes and the pack's idempotence, and the
+index scores over quantized keys to the decoded rows' bits with the original rows'
+top-k overlap reported; `tests/vulkan_engines.sh kv-quant-deepseek` runs the tiny
+fixture at the released KV geometry under the flag against a documented logits
+tolerance (the approximate mode cannot be bit-exact; the flag-off run is the exactness
+proof) and checks the ledger's mirror math.
 
 ## Where this engine is not the vendor
 
