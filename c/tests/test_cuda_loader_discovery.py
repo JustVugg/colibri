@@ -9,9 +9,9 @@ import tempfile
 import unittest
 
 try:
-    from .test_backend_loader import _StubFixture, _fixture_toolchain_skip
+    from .test_backend_loader import _AVAILABLE_PROBE, _DEVICE_COUNT_PROBE, _StubFixture, _fixture_toolchain_skip
 except ImportError:  # direct execution / unittest discover -s tests
-    from test_backend_loader import _StubFixture, _fixture_toolchain_skip
+    from test_backend_loader import _AVAILABLE_PROBE, _DEVICE_COUNT_PROBE, _StubFixture, _fixture_toolchain_skip
 
 
 class _DiscoveryFixture(_StubFixture):
@@ -97,9 +97,11 @@ int main(int argc, char **argv) {
             "device_count": "__declspec(dllexport) int coli_cuda_device_count(void) { return context_count; }",
             "available_device_count": "__declspec(dllexport) int coli_cuda_available_device_count(void) { discovery_calls++; return visible_count(); }",
         }
+        # the base fixture's bodies: the two device counts return its probe values
+        probed = {"device_count": _DEVICE_COUNT_PROBE, "available_device_count": _AVAILABLE_PROBE}
         for name, body in bodies.items():
             old = original_init if name == "init" else (
-                "__declspec(dllexport) int coli_cuda_%s(void) { return 0; }" % name)
+                "__declspec(dllexport) int coli_cuda_%s(void) { return %d; }" % (name, probed.get(name, 0)))
             if source.count(old) != 1:
                 raise AssertionError("fixture definition changed: " + name)
             source = source.replace(old, "" if name in omit else body)
