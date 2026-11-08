@@ -44,6 +44,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **CPU: the grid IQ types' dot product with the signs on the activation.** IQ2_XXS, IQ2_XS,
+  IQ2_S, IQ3_XXS and IQ3_S applied their sign bits to the decoded weights, and the integer dot
+  product took them off again to multiply by the activation. The grid rows now go in as they are
+  and the signs onto the activation: the same two operands for every product, so the same bits
+  (`tests/test_gq_signs` against the kernels it replaced). The indices of a sub-block come from
+  one load, and IQ1_M's decoder reads its scales and index bits a word at a time. One Zen 4
+  core, x86-64-v3, a 27B gate matrix: IQ2_XXS 3.58 -> 4.37 GB/s, IQ3_XXS 3.45 -> 5.22, IQ2_XS
+  3.08 -> 3.53, IQ1_M 1.16 -> 1.90; sixteen threads IQ2_XXS 20.7 -> 25.5. Qwen3.8-27B UD-IQ2_XXS
+  on the CPU, the same greedy answers: a Ryzen 7 8700GE prompt / decode 2.7 / 2.4 -> 2.8 / 2.8
+  tok/s, a Core i5-13500 1.9 / 1.9 -> 2.0 / 2.2.
 - **Qwen3.8-27B on Vulkan: its attention on the matrix units.** `chain_attn_flash` takes 64 query
   rows a workgroup of one kv head's heads, so it ran where the heads a kv head divide 64; the 27B's
   six took the blocked shader, and its decode, which follows the prompt's path, read every
