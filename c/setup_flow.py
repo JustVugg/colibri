@@ -291,6 +291,22 @@ def _cc_finds_vulkan_h(cc):
         return False
 
 
+def _cc_lacks_static_openmp(cc):
+    """True when `cc` is a gcc that has no libgomp.a to link -fopenmp -static with.
+
+    MSYS2's gcc 16 no longer pulls its OpenMP runtime in (#1900): the archive lives in
+    mingw-w64-ucrt-x86_64-libgomp, and without it the Windows link stops on a bare
+    "cannot find -lgomp" (#2612). gcc answers -print-file-name with the bare name when it
+    cannot find the file. Any other outcome (no gcc, a timeout, an odd answer) says
+    nothing, so it counts as "not missing" and never blocks a build that might work."""
+    try:
+        r = subprocess.run([cc, "-print-file-name=libgomp.a"], capture_output=True,
+                           text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0 and r.stdout.strip() == "libgomp.a"
+
+
 def toolchain(here=None):
     """What can be built here, and with what."""
     here = here or HERE
@@ -334,6 +350,11 @@ def toolchain(here=None):
         tc["vulkan_headers"] = any(os.path.isfile(os.path.join(p, "vulkan", "vulkan.h"))
                                    for p in ("/usr/include", "/usr/local/include")) or _cc_finds_vulkan_h(tc["cc"])
     tc["can_build"] = bool(tc["source_checkout"] and tc["make"] and tc["cc"])
+    # A Windows gcc without libgomp.a cannot link the engine, so say "needs the build
+    # packages" and let package_hint print the libgomp one (#2612).
+    if tc["can_build"] and sys.platform == "win32" and _cc_lacks_static_openmp(tc["cc"]):
+        tc["can_build"] = False
+        tc["libgomp_missing"] = True
     tc["can_build_vulkan"] = bool(tc["can_build"] and tc["glslc"] and tc["vulkan_headers"])
     tc["can_build_cuda"] = bool(tc["can_build"] and tc["nvcc"] and sys.platform.startswith("linux"))
     # A toolkit is not enough: CUDA 13 cannot build for a V100 (#1852).

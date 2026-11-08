@@ -44,6 +44,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **CPU: the grid IQ types' dot product with the signs on the activation.** IQ2_XXS, IQ2_XS,
+  IQ2_S, IQ3_XXS and IQ3_S applied their sign bits to the decoded weights, and the integer dot
+  product took them off again to multiply by the activation. The grid rows now go in as they are
+  and the signs onto the activation: the same two operands for every product, so the same bits
+  (`tests/test_gq_signs` against the kernels it replaced). The indices of a sub-block come from
+  one load, and IQ1_M's decoder reads its scales and index bits a word at a time. One Zen 4
+  core, x86-64-v3, a 27B gate matrix: IQ2_XXS 3.58 -> 4.37 GB/s, IQ3_XXS 3.45 -> 5.22, IQ2_XS
+  3.08 -> 3.53, IQ1_M 1.16 -> 1.90; sixteen threads IQ2_XXS 20.7 -> 25.5. Qwen3.8-27B UD-IQ2_XXS
+  on the CPU, the same greedy answers: a Ryzen 7 8700GE prompt / decode 2.7 / 2.4 -> 2.8 / 2.8
+  tok/s, a Core i5-13500 1.9 / 1.9 -> 2.0 / 2.2.
 - **Qwen3.8-27B on Vulkan: its attention on the matrix units.** `chain_attn_flash` takes 64 query
   rows a workgroup of one kv head's heads, so it ran where the heads a kv head divide 64; the 27B's
   six took the blocked shader, and its decode, which follows the prompt's path, read every
@@ -552,6 +562,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   vectorizes. Built for Sandy Bridge with glibc's software `fmaf`, Qwen3.8 IQ2_XS: the recurrence
   208 -> 52 ms a forward, the same perplexity (2.2402 nats a token over 258 tokens); the planar
   expert kernel's f32 mode (`QWEN_EXPERT_ACT=f32`) on Qwen3.6 0.59 -> 2.9 tok/s.
+- `make install` ships the chat UI and `coli ui` finds it in libexec. The
+  Models page resolves the installed support modules and the launcher in bin,
+  so it can import GGUFs and start a gateway outside a source checkout.
+- `make install` includes `tools/iq3xxs_grid.json`, required by the IQ3/E8
+  codec when a conversion uses the published lattice table.
 - **Qwen3.8: memory that grew with every answer** (#2592). The expert loader reads a batch of
   missing experts in parallel (on by default) with a team as large as the batch, and libgomp
   ends the threads a smaller team leaves out and starts new ones for a larger. Each read
@@ -612,6 +627,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 - Qwen3.8-Flash-Next's long-context table measured again on 2.1.0: 65,536 tokens 208 / 52.2
   tok/s, 131,072 190 / 51.9, 262,144 151 / 42.9 (prompt / decode).
+### Fixed
+
+- **#2612**: on MSYS2 UCRT64 with gcc 16, the static OpenMP library (`libgomp.a`)
+  now comes from its own package, so a fresh install failed at the link with
+  `cannot find -lgomp`. `make` warns up front and names
+  `mingw-w64-ucrt-x86_64-libgomp`; `setup.sh` probes the way the Makefile links
+  (`-static`) and names the right package; `coli setup` treats a gcc without
+  `libgomp.a` as "build packages missing"; the Windows and quickstart docs and the
+  CI/release MSYS2 install lists now include the package.
 
 ## [2.1.0] - 2026-10-31
 

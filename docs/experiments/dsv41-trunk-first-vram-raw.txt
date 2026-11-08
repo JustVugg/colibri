@@ -1,0 +1,63 @@
+Trunk-first VRAM placement — raw benchmark evidence
+====================================================
+
+Arms
+----
+baseline: origin/dev @ 1d10bbf1 (window-first placement, upstream default), built in
+          a separate tree (/tmp/colibri-dev) with `make -C c deepseek_v41 VK=1`
+trial:    perf/vram-trunk-first @ 9cfa502f (same tree plus the placement commit),
+          built identically. The trial commit's engine code is identical to the PR
+          tip; only this experiment record was added afterwards.
+
+Protocol
+--------
+Server:  COLI_VULKAN=1 ./c/coli serve --model /root/Models/DeepSeek-V4.1-Flash-1017 \
+             --ram 28 --ctx 8192 --host 127.0.0.1 --port 8010
+Prompt:  "Describe the nature of a transformer."  (one user message, resent per turn)
+Request: POST /v1/chat/completions, stream, max_tokens 96, temperature 0.6
+Per arm: 1 warmup turn (discarded), then 3 measured turns. Arms did not overlap;
+         the previous arm's serve was stopped and port 8010 confirmed free first.
+Metric:  decode tok/s = (streamed tokens - 1) / (last chunk time - first chunk time)
+         (TTFT excluded). Wall clock is per request. Same .coli_usage history for
+         both arms (warm start), same page-cache state (each arm's turns ran back
+         to back after its own warmup).
+Model:   deepseek-ai/DeepSeek-V4.1-Flash-1017, 48 shards, 510.3 GB, fp8 dense +
+         fp4 experts, no conversion.
+
+Turn records (JSON per turn: completion_tokens, TTFT, decode rate, end-to-end rate,
+wall, sha of generated text)
+
+baseline (/tmp/turns_baseline.txt, arm run 2026-11-06 14:12-14:27):
+{"turn": "warmup1", "completion_tokens": 96, "streamed": 96, "ttft_s": 13.62, "decode_tok_s": 0.506, "end_to_end_tok_s": 0.477, "wall_s": 201.37, "text_sha": "0e1868561f856455", "text_len": 572}
+{"turn": "meas1", "completion_tokens": 96, "streamed": 96, "ttft_s": 13.0, "decode_tok_s": 0.505, "end_to_end_tok_s": 0.477, "wall_s": 201.12, "text_sha": "578bc756e4c15764", "text_len": 557}
+{"turn": "meas2", "completion_tokens": 96, "streamed": 96, "ttft_s": 12.81, "decode_tok_s": 0.485, "end_to_end_tok_s": 0.46, "wall_s": 208.63, "text_sha": "0a14c754c1bb6b3b", "text_len": 533}
+{"turn": "meas3", "completion_tokens": 96, "streamed": 96, "ttft_s": 13.1, "decode_tok_s": 0.48, "end_to_end_tok_s": 0.455, "wall_s": 211.05, "text_sha": "2fb7ece21e936a25", "text_len": 513}
+
+trial (/tmp/turns_trial.txt, arm run 2026-11-06 14:29-14:39):
+{"turn": "warmup1", "completion_tokens": 96, "streamed": 96, "ttft_s": 14.36, "decode_tok_s": 0.802, "end_to_end_tok_s": 0.722, "wall_s": 132.88, "text_sha": "4c8cb5f0343e089d", "text_len": 535}
+{"turn": "meas1", "completion_tokens": 96, "streamed": 96, "ttft_s": 13.27, "decode_tok_s": 0.787, "end_to_end_tok_s": 0.716, "wall_s": 133.98, "text_sha": "2f50718a6017bfd1", "text_len": 459}
+{"turn": "meas2", "completion_tokens": 96, "streamed": 96, "ttft_s": 13.31, "decode_tok_s": 0.773, "end_to_end_tok_s": 0.704, "wall_s": 136.27, "text_sha": "47589bc920bf21cc", "text_len": 514}
+{"turn": "meas3", "completion_tokens": 96, "streamed": 96, "ttft_s": 13.03, "decode_tok_s": 0.786, "end_to_end_tok_s": 0.717, "wall_s": 133.95, "text_sha": "7f15b155f4dc6d49", "text_len": 458}
+
+Medians (measured turns only)
+-----------------------------
+baseline decode tok/s: median 0.485  (samples 0.505, 0.485, 0.480)
+trial   decode tok/s: median 0.786  (samples 0.787, 0.773, 0.786)  -> +62 %
+
+Placement state per arm (from the serve logs of these runs)
+-----------------------------------------------------------
+baseline: chain 0 of 40 layers on the device (the window's 13 GiB ask starves the
+          fit to ~0.5 GiB free); tier in the window, budget 12.65 GiB, host pool on
+          (11.5 GiB of system RAM imported through the GTT).
+trial:    chain 40 of 40 layers on the device (7.41 GiB of matrices, 7.62 GiB held
+          with buffers); window asked 5 GiB (heap less trunk less 1 GiB reserve);
+          tier 3.31 GiB / 84 resident experts, host pool off; GTT ~0.27 GiB.
+
+One-shot 48-token run on the trial arm, cold-ish (first run after boot, same prompt):
+[v41] expert I/O: 5733 misses, 107784.1 MB in 40.75s (2.64 GB/s); prefill 27148.1 MB,
+disk 10.13s, matmul 3.00s, wall 14.18s — prefill wall 13.0-14.4 s across all trial
+turns vs 12.8-13.6 s baseline TTFT (prefill is the same read either way; the win is
+decode, where the trunk no longer takes the CPU's threads).
+
+Environment note: both arms saw identical CPU affinity (18 logical CPUs of the host
+i9-12900K), 38 GiB RAM, one NVMe, and the same model directory.

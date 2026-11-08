@@ -89,6 +89,27 @@ sequences. The extension
 `enable_thinking: true` enables GLM-5.2's reasoning block; the standard
 `reasoning_effort` field also enables it unless set to `none`.
 
+The full GLM-5.3 also runs on the `colibri` engine and shares GLM-5.2's model
+architecture identifier. When its official `chat_template.jinja` (or that template
+inside `tokenizer_config.json`) is present, the gateway selects GLM-5.3's always-open
+reasoning contract: maximum effort by default; `enable_thinking: false` or
+`reasoning_effort: "none"` requests its minimum supported effort, Low, rather than
+closing a thinking block the model cannot disable. Reasoning remains separate
+from answer content. GLM-5.2's existing opt-in behavior is unchanged.
+
+The FP8 converter preserves `chat_template.jinja` alongside the tokenizer metadata.
+For an older converted GLM-5.3 folder missing that metadata, copy the template from
+the original checkpoint into the converted folder before restarting the gateway.
+The folder name alone does not select this contract; a folder without the template
+keeps the existing GLM behavior. This is separate from the GLM-5.3-Flash engine.
+
+The optional template check needs Jinja2 and the original checkpoint's template,
+not its weights:
+
+```sh
+python3 c/tests/glm53_chat_template_harness.py --full-model --template /path/to/GLM-5.3/chat_template.jinja
+```
+
 On Qwen3.6 the extension `preserve_thinking` is the official template's kwarg of
 the same name: past assistant turns keep their `<think>` block, with the
 `reasoning_content` the client sends back, empty when it sends none. It

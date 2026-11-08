@@ -142,6 +142,20 @@ CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-
 # (warns), so link psapi explicitly or the build fails undefined-reference on
 # modern GCC (e.g. 16.x under UCRT). Harmless where the pragma also resolves it.
 LDFLAGS = -lm -fopenmp -static -lpsapi $(EXTRA_LDFLAGS)
+# The -static link needs libgomp.a. Since gcc 16 MSYS2 ships it in its own package
+# (mingw-w64-ucrt-x86_64-libgomp) instead of pulling it in with gcc, so a fresh
+# install has -fopenmp but no archive, and the link stops with a bare
+# "cannot find -lgomp" (#1900, #2612). Ask the compiler where the archive is: when
+# it is missing, -print-file-name just echoes "libgomp.a" back. Warn up front and
+# name the package; the build still goes on, so goals that never link OpenMP are
+# not blocked. LIBGOMP_CHECK=0 silences it.
+ifneq ($(LIBGOMP_CHECK),0)
+ifneq ($(filter-out clean%,$(or $(MAKECMDGOALS),all)),)
+ifeq ($(shell $(DETECT_CC) -print-file-name=libgomp.a 2>/dev/null),libgomp.a)
+$(warning $(DETECT_CC) has no libgomp.a, so the -static -fopenmp link will fail with "cannot find -lgomp". In the "MSYS2 UCRT64" shell run: pacman -S --needed mingw-w64-ucrt-x86_64-libgomp (docs/windows.md))
+endif
+endif
+endif
 ifeq ($(LTO),1)
 CFLAGS  += -flto
 LDFLAGS += -flto
@@ -567,6 +581,8 @@ TEST_BINS += tests/test_gsgemv_sse41$(EXE) tests/test_qgemv_sse41$(EXE) \
 	tests/test_idot_ssse3$(EXE) tests/test_int_kernel_exact_ssse3$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
+TEST_BINS += tests/test_v4_gpu_devices$(EXE)
+TEST_BINS += tests/test_v4_hybrid_policy$(EXE) tests/test_k3_fill_budget$(EXE) tests/test_v4_bank_pair$(EXE)
 TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) \
 	tests/test_v4_serve_framing$(EXE) \
 	tests/test_segment_adapters_registration$(EXE) \
@@ -1109,7 +1125,7 @@ cu_tier.o: cu_tier.c vk_tier.c vk_tier.h cu_tier.h cu_tier_ops.h .build-config
 	$(CC) $(CFLAGS) -c cu_tier.c -o $@
 
 
-backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h .build-config $(DSV4_DEEPGEMM_DEP)
+backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h backend_cuda_dsv4_quant.cuh .build-config $(DSV4_DEEPGEMM_DEP)
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
 
@@ -1144,7 +1160,7 @@ else
 DSV4_DLL_TC =
 DSV4_DLL_LIBS = -lcublasLt -lcudart -lcuda
 endif
-cuda-dsv4-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def
+cuda-dsv4-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h backend_cuda_dsv4_quant.cuh dsv4.def
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	@cl 2>&1 | grep -qE "x64|AMD64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
@@ -1157,7 +1173,7 @@ cuda-dsv4-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def
 # checkout into $(DEEPGEMM_HOME), see the DEEPGEMM block above); this target
 # fetches them on first use.
 DEEPGEMM_INC = -I"$(DEEPGEMM_HOME)/deep_gemm/include" -I"$(DEEPGEMM_HOME)/cutlass/include" -I"$(DEEPGEMM_HOME)/third-party/cutlass/include"
-cuda-dsv4-dg-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def $(DEEPGEMM_STAMP)
+cuda-dsv4-dg-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h backend_cuda_dsv4_quant.cuh dsv4.def $(DEEPGEMM_STAMP)
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	@cl 2>&1 | grep -qE "x64|AMD64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
@@ -1346,8 +1362,18 @@ cuda-test: tests/test_mxfp4_expert_cuda.cu backend_cuda.cu backend_cuda.h fp8_fo
 # against the CPU reference in each test, then the generic build's kernel
 # variants (expert-major vs per-route MoE, warp vs block dense batch) against
 # each other bit for bit. Needs a GPU, so CI runs none of it; it does not
-# build these tests either, only backend_cuda_dsv4.cu itself.
-dsv4-cuda-test: tests/test_dsv4_dense_batch_cuda.c tests/test_dsv4_attention_batch_cuda.c tests/test_dsv4_moe_batch_cuda.c tests/test_dsv4_generic_bitwise_cuda.c tests/test_dsv4_bank_bytes_cuda.c backend_cuda_dsv4.h $(DSV4_CUDA_OBJ)
+# build these tests either, only backend_cuda_dsv4.cu itself. First, the
+# two-GPU start-up (peer probe, init rollback; it includes backend_cuda_dsv4.cu
+# with shims, so it links what the backend needs -- cuBLASLt for the default
+# tensor-core path, NCCL with NCCL=1 -- plus the driver API it asks whether a
+# context exists), then the decode MoE with experts on a peer GPU (peer
+# compute and in-place reads vs one GPU, and an injected peer failure; skips
+# without two peer-capable GPUs).
+dsv4-cuda-test: tests/test_dsv4_dense_batch_cuda.c tests/test_dsv4_attention_batch_cuda.c tests/test_dsv4_moe_batch_cuda.c tests/test_dsv4_generic_bitwise_cuda.c tests/test_dsv4_bank_bytes_cuda.c tests/test_dsv4_peer_init_cuda.cu tests/test_dsv4_peer_moe_cuda.c backend_cuda_dsv4.cu backend_cuda_dsv4.h $(DSV4_CUDA_OBJ)
+	"$(NVCC)" $(NVCCFLAGS) tests/test_dsv4_peer_init_cuda.cu -o dsv4_peer_init_cuda_test$(EXE) -lcuda -lcublasLt $(if $(filter 1,$(NCCL)),-lnccl)
+	./dsv4_peer_init_cuda_test$(EXE)
+	$(CC) $(CFLAGS) tests/test_dsv4_peer_moe_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_peer_moe_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_peer_moe_cuda_test$(EXE)
 	$(CC) $(CFLAGS) tests/test_dsv4_bank_bytes_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_bank_bytes_cuda_test$(EXE) $(LDFLAGS)
 	./dsv4_bank_bytes_cuda_test$(EXE)
 	$(CC) $(CFLAGS) tests/test_dsv4_dense_batch_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_cuda_test$(EXE) $(LDFLAGS)
@@ -2352,6 +2378,9 @@ tests/test_gq_dot$(EXE): tests/test_gq_dot.c
 # no-op on a build without AVX2. `tests/test_gq_r16 bench S` times them.
 tests/test_gq_r16$(EXE): tests/test_gq_r16.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# The grid types' dot product with the signs on the activation against the one it replaced
+tests/test_gq_signs$(EXE): tests/test_gq_signs.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # A matrix's file rows eight at a time (gq_rows_f8) against their scalar reference and the R16
 # forms' kernels, to the bit; a no-op on a build without AVX2. `tests/test_rows_f8 bench` times them.
 tests/test_rows_f8$(EXE): tests/test_rows_f8.c
@@ -3279,6 +3308,9 @@ tests/test_v4_hybrid_policy$(EXE): tests/test_v4_hybrid_policy.c
 tests/test_k3_fill_budget$(EXE): tests/test_k3_fill_budget.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_v4_gpu_devices$(EXE): tests/test_v4_gpu_devices.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_v4_bank_pair$(EXE): tests/test_v4_bank_pair.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -3367,6 +3399,9 @@ tests/test_moe_gs_guard$(EXE): tests/test_moe_gs_guard.c colibri.c $(VK_OBJ)
 
 tests/test_omp_tune$(EXE): tests/test_omp_tune.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_env_registry$(EXE): tests/test_env_registry.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_compat_env$(EXE): tests/test_compat_env.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -3528,8 +3563,18 @@ test-asan:
 	@$(ASAN_ENV) $(MAKE) test-c EXTRA_CFLAGS="$(ASAN_CFLAGS)" EXTRA_LDFLAGS="$(ASAN_LDFLAGS)"
 	@echo "test-asan: suite clean under ASan + UBSan"
 
+# --- environment-variable registry --------------------------------------
+# c/coli_env.h is the single list of every variable the engines read. This
+# target asserts it still matches the sources: a getenv() with no row, a row
+# nothing reads, an unsorted table (coli_env_find binary-searches it) or a
+# duplicate name all fail here. Needs no build, no model and no GPU.
+check-env:
+	@$(PYTHON) tools/check_env_registry.py
+.PHONY: check-env
+
 # Local validation: one portable CPU build and dependency-free tests.
 check:
+	$(MAKE) check-env
 	$(MAKE) clean
 	$(MAKE) portable
 	$(MAKE) test
@@ -3560,7 +3605,9 @@ install: colibri-tui$(EXE) colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE)
 		openai_server.py cluster.py v4_dsml.py v41_dsml.py version.py \
 		image_engine.py term_image.py setup_flow.py setup_hw.py setup_catalog.py \
 		setup_download.py mcp_server.py power.py $(DESTDIR)$(LIBEXECDIR)/
-	$(INSTALL) -m 644 tools/*.py $(DESTDIR)$(LIBEXECDIR)/tools/
+	$(INSTALL) -m 644 tools/*.py tools/iq3xxs_grid.json $(DESTDIR)$(LIBEXECDIR)/tools/
+	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/ui
+	$(INSTALL) -m 644 ../ui/*.py ../ui/index.html $(DESTDIR)$(LIBEXECDIR)/ui/
 	@# The dashboard is an optional build artifact (cd web && npm run build), so install
 	@# it only when it exists. It goes NEXT TO openai_server.py, which probes ./web/dist.
 	@if [ -f ../web/dist/index.html ]; then \

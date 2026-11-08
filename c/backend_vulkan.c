@@ -23,7 +23,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 #include <unistd.h>
 #endif
 #ifdef _WIN32
@@ -376,7 +376,7 @@ typedef struct {
     int lost;                         /* a fence wait failed: the device is gone, for good */
     VkResult err; const char *what;   /* the failure, for the message */
     unsigned long long bytes, copies, submits, blocks_filled;
-    char why[200];
+    char why[256];   /* vk_window_decide's reason: the ask's description (COLI_VK_FREE_RESERVE_GB, the trunk) fits beside the rest */
     /* copies straight from host memory (up_import, COLI_VK_UP_IMPORT): the source pages
      * imported as a transfer source (VK_EXT_external_memory_host), no copy into the staging
      * buffer. imp_align 0 = none on this device; each import lives until its slot is done */
@@ -804,18 +804,58 @@ static int place_decide(VkPhysicalDevice phys, int mt_host, VkUp *u, uint32_t ta
 static void vk_window_mapped(VkUp *u) {
     u->shared = 0; u->nfams = 0; u->dev = VK_NULL_HANDLE;
 }
+#ifdef VK_EXT_memory_budget
+/* What VK_EXT_memory_budget says device `phys`'s heap `heap` has free right now (bud and mp2 are
+ * the caller's, filled here). */
+static VkDeviceSize vk_heap_free_now(VkPhysicalDevice phys, VkPhysicalDeviceMemoryBudgetPropertiesEXT *bud,
+                                     VkPhysicalDeviceMemoryProperties2 *mp2, uint32_t heap) {
+    vkGetPhysicalDeviceMemoryProperties2(phys, mp2);
+    return bud->heapBudget[heap] > bud->heapUsage[heap] ? bud->heapBudget[heap] - bud->heapUsage[heap] : 0;
+}
+#endif
 /* The device exists: does the host-visible device-local type take 9/10 of its heap (see above), or what the
  * driver's budget still leaves if that is less (memory another process holds is not the type's limit)? If not,
  * the staged path, which place_decide would have taken. Said at every start it asks, with what it cost (but
  * when the small allocation for the block list fails: mapped, no line).
+ * Trunk first (an engine that called coli_vk_window_trunk_first, its dense trunk already placed): the ask is
+ * what the heap leaves beside the trunk -- its size less what the books say this process holds on the device,
+ * less COLI_VK_FREE_RESERVE_GB (1 GiB: the streaming slots, the expert batch's scratch, the driver) -- not
+ * 9/10 of the heap. The loop still runs for real: a driver that cannot give what is left of the heap beside
+ * the trunk (the A100 case above, a card fuller than its heap says) takes the staged path for what follows.
+ * Under the trunk and the reserve the heap leaves less than 1 GiB: a line says so and 1 GiB is asked anyway,
+ * so the loop decides something. COLI_VK_WINDOW_ASK_MB and COLI_VK_WINDOW_PROBE_MB answer as before.
  * The blocks go through vk_mem_alloc like every allocation here: the books count them until they are freed, and
  * COLI_VK_DEVICE_CAP_MB limits them (a capped device reads as a small window). */
-static void vk_window_decide(VkUp *u, VkPhysicalDevice phys, uint32_t memtype, int has_budget, const char *tag) {
+static void vk_window_decide(VkUp *u, VkPhysicalDevice phys, uint32_t memtype, int has_budget, const char *tag,
+                             int trunk_first) {
     u->later = 0;   /* decided from here on */
     VkPhysicalDeviceMemoryProperties m;
     vkGetPhysicalDeviceMemoryProperties(phys, &m);
     const uint32_t hi = m.memoryTypes[memtype].heapIndex;
-    int want = (int)(m.memoryHeaps[hi].size >> 30) * 9 / 10;   /* GiB */
+    int want;
+    char ask[80];    /* what was asked of the type, for the two lines below */
+    if (trunk_first) {
+        const char *fr = getenv("COLI_VK_FREE_RESERVE_GB");
+        double r = fr && *fr ? atof(fr) : 1.0;
+        if (r < 0) {
+            fprintf(stderr, "[VK] memory: COLI_VK_FREE_RESERVE_GB=%s is negative; 0 used\n", fr);
+            r = 0;
+        }
+        const double trunk = (double)coli_vk_device_used() / 1073741824.0;
+        const long long left = (long long)m.memoryHeaps[hi].size - (long long)coli_vk_device_used() -
+                               (long long)(r * 1073741824.0);
+        want = (int)(left >> 30);
+        snprintf(ask, sizeof ask, "its heap less the trunk's %.2f GiB and the %.2f GiB free reserve", trunk, r);
+        if (want < 1) {   /* the trunk and the reserve leave under a GiB: ask one anyway, so the loop below runs */
+            fprintf(stderr, "[VK] memory: the host-visible device-local heap (%.2f GiB) less the %.2f GiB the trunk placed "
+                    "and the %.2f GiB reserve leaves under 1 GiB; 1 GiB asked anyway (COLI_VK_FREE_RESERVE_GB sets the reserve)\n",
+                    (double)m.memoryHeaps[hi].size / 1073741824.0, trunk, r);
+            want = 1;
+        }
+    } else {
+        want = (int)(m.memoryHeaps[hi].size >> 30) * 9 / 10;   /* GiB */
+        snprintf(ask, sizeof ask, "9/10 of its heap");
+    }
     const char *kn = getenv("COLI_VK_WINDOW_PROBE_MB"), *ka = getenv("COLI_VK_WINDOW_ASK_MB");
     const char *by = kn && *kn ? " (COLI_VK_WINDOW_PROBE_MB)" : ka && *ka ? " (COLI_VK_WINDOW_ASK_MB)" : "";
     if (!(kn && *kn) && ka && *ka) {   /* tests: ask this much at most, so the loop below runs on any device */
@@ -833,6 +873,15 @@ static void vk_window_decide(VkUp *u, VkPhysicalDevice phys, uint32_t memtype, i
         }
     }
 #endif
+#ifdef VK_EXT_memory_budget
+    /* What VK_EXT_memory_budget says this heap has free. A driver reports the probe's freed
+     * blocks back only after a while (RADV about a second), so the trunk-first ask — which
+     * runs between the trunk and the tier, both of which size themselves from this — waits
+     * on it below. */
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT bud0 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 mp20 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bud0};
+    const VkDeviceSize free0 = has_budget ? vk_heap_free_now(phys, &bud0, &mp20, hi) : 0;
+#endif
     int got = 0;
     double ms = 0;
     VkDeviceMemory *blk = want > 0 ? calloc((size_t)want, sizeof *blk) : NULL;
@@ -846,19 +895,56 @@ static void vk_window_decide(VkUp *u, VkPhysicalDevice phys, uint32_t memtype, i
             if (vkAllocateMemory(u->dev, &ai, NULL, &blk[got]) != VK_SUCCESS) break;
         }
         for (int i = 0; i < got; i++) vkFreeMemory(u->dev, blk[i], NULL);
+#ifdef VK_EXT_memory_budget
+        /* Trunk first: the blocks are back, but a driver that reports the budget of the freed
+         * blocks only after a while would hand the tier that sizes itself next the hole they
+         * left (0 of 4.6 GiB free on a RADV 6900 XT, once). Wait, bounded, for the heap's free
+         * to come back to what it was before the loop asked — at most 3 s, then the tier takes
+         * what the driver says. The ask that runs at the start (not trunk first) needs none of
+         * this: seconds of loading sit between it and the first reader. */
+        if (trunk_first && has_budget && got > 0)
+            for (int i = 0; i < 150 && vk_heap_free_now(phys, &bud0, &mp20, hi) + ((VkDeviceSize)64 << 20) < free0; i++) {
+#ifdef _WIN32
+                Sleep(20);
+#else
+                usleep(20000);
+#endif
+            }
+#endif
         ms = vk_now() - t0;
     }
     free(blk);
     if (got >= want) {
-        fprintf(stderr, "[VK] %smemory: mapped weights, the host-visible device-local memory gave the %d GiB asked (9/10 of "
-                "its heap, less if its budget leaves less), found in %.1f s%s\n", tag, got, ms / 1000.0, by);
-        vk_window_mapped(u);
+        fprintf(stderr, "[VK] %smemory: mapped weights, the host-visible device-local memory gave the %d GiB asked (%s, "
+                "less if its budget leaves less), found in %.1f s%s\n", tag, got, ask, ms / 1000.0, by);        vk_window_mapped(u);
         return;
     }
     u->on = 1;
-    snprintf(u->why, sizeof u->why, "the driver gave %d of the %d GiB asked of the host-visible device-local memory (9/10 of "
-             "its heap, less if its budget leaves less), found in %.1f s%s", got, want, ms / 1000.0, by);
+    snprintf(u->why, sizeof u->why, "the driver gave %d of the %d GiB asked of the host-visible device-local memory (%s, "
+             "less if its budget leaves less), found in %.1f s%s", got, want, ask, ms / 1000.0, by);
 }
+/* Trunk-first placement (the deepseek_v41 engine): the engine's dense trunk is placed on the device BEFORE the
+ * mapped-weights window is asked. The chain fit that sizes the trunk then reads the device's real free memory —
+ * asking first, 9/10 of the heap in blocks that go back, left a driver that reports the budget only once they
+ * are back showing the fit a few hundred MiB, and the trunk stayed on the CPU while the tier filled the window
+ * — and the ask (vk_window_decide above, trunk_first) leaves what the heap has beside the trunk. The engine
+ * calls coli_vk_window_trunk_first before coli_vk_init (the deferral is decided there) and the ask,
+ * coli_vk_window_trunk_ask, once its trunk is placed; an engine that never asks it keeps the mapped path, as a
+ * probe that said yes does. Other engines are untouched: nothing of this runs without the opt-in. */
+static int g_win_trunk_first, g_win_trunk_deferred;   /* the engine asked; the ask was deferred (owed until it runs) */
+static void vk_window_up_decided(void);   /* after up_destroy, below */
+void coli_vk_window_trunk_first(void) { g_win_trunk_first = 1; }
+/* The ask a trunk-first engine owes once its trunk is placed (main, after the chain's setup and before the tier
+ * sizes itself). Nothing was deferred, or it already ran: a no-op. */
+void coli_vk_window_trunk_ask(void) {
+    if (!g_win_trunk_deferred || !g_up[0].later) return;
+    vk_window_decide(&g_up[0], G.phys, G.memtype, G.has_budget, "", 1);
+    vk_window_up_decided();
+}
+/* The tier's host pool asks (vk_tier.c, host_init): the window was deferred to a trunk-first card and the ask
+ * kept the mapped path — the tier runs inside the window beside the trunk, not out of it. An ask that never
+ * ran (later still set) answers 0, as a card that took the staged path does. */
+int coli_vk_window_trunk_first_on(void) { return g_win_trunk_deferred && !g_up[0].later && !g_up[0].on; }
 /* The uploader's command buffers, fences and staging slots (u->dev, u->fam set). */
 /* A slot's imports, once its copies are done (or it was never submitted). */
 static void up_imp_release(VkUp *u, int s) {
@@ -952,6 +1038,50 @@ static void up_destroy(VkUp *u) {
     u->sbuf = VK_NULL_HANDLE; u->smem = VK_NULL_HANDLE; u->sptr = NULL; u->cpool = VK_NULL_HANDLE;
     for (int s = 0; s < VK_UP_SLOTS; s++) { u->fence[s] = VK_NULL_HANDLE; u->cmd[s] = VK_NULL_HANDLE; u->pending[s] = 0; }
     u->open = 0; u->used = 0; u->cur = 0; u->failed = u->lost = 0; u->what = NULL;
+}
+/* The window's decision is made (vk_window_decide): the uploader's own pieces when it took the staged path, the
+ * host memory it can copy straight from, and — on a device that stayed mapped — the Resizable-BAR sanity
+ * warnings (#523: on discrete cards the weight tiers want HOST_VISIBLE|DEVICE_LOCAL; with ReBAR disabled that
+ * combination exists only in a ~256 MB BAR window (or not at all), so tier allocations silently land in system
+ * RAM and every access crosses PCIe — measurably slower than the CPU path while the resident-experts log still
+ * reports an apparently healthy VRAM tier; staged uploads (VkUp) are the answer, the warnings are for a device
+ * where they are off). Runs once at the device's start, and again from a trunk-first ask that ran after the
+ * engine placed its trunk (coli_vk_window_trunk_ask). */
+static void vk_window_up_decided(void) {
+    if (g_up[0].on && !up_init(&g_up[0])) {
+        fprintf(stderr, "[VK] staged uploads unavailable (no staging buffer): resident data stays in mapped memory\n");
+        up_destroy(&g_up[0]);
+        g_up[0].on = g_up[0].shared = 0;
+    }
+    up_import_init(&g_up[0], G.phys, G.has_hostmem, "");
+    /* a card left on the mapped path without Resizable BAR plans with its window (vk_mem_window) */
+    const uint64_t window = g_up[0].on ? 0 : vk_mem_window(0, G.phys, G.memtype);
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(G.phys, &mp);
+    VkDeviceSize dl_max = 0;
+    for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
+        if ((mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) &&
+            mp.memoryHeaps[i].size > dl_max) dl_max = mp.memoryHeaps[i].size;
+    VkMemoryPropertyFlags cf = mp.memoryTypes[G.memtype].propertyFlags;
+    VkDeviceSize hv_dl = mp.memoryHeaps[mp.memoryTypes[G.memtype].heapIndex].size;
+    const int integrated = vk_integrated(G.phys);   /* an integrated GPU has no BAR window and uses system memory */
+    if (g_up[0].on) {
+        VkUp *u = &g_up[0];
+        fprintf(stderr, "[VK] memory: staged uploads, resident data in device-local memory (type %u, %llu MiB heap) "
+                "copied from host staging memory (type %u) on %s (%s)\n", u->mt_dev,
+                (unsigned long long)(mp.memoryHeaps[mp.memoryTypes[u->mt_dev].heapIndex].size >> 20), u->mt_stage,
+                u->shared ? "the main queue" : u->fam != G.qfam && u->fam != G.tq_fam ? "a transfer queue" : "a queue of its own",
+                u->why);
+    } else if (dl_max && !integrated && !(cf & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+        fprintf(stderr, "[VK] warning: no host-visible+device-local memory type — weight tiers "
+                "will live in system RAM and every access crosses PCIe (expect slower than "
+                "CPU-only). On a discrete card, enable Resizable BAR in the BIOS or leave "
+                "COLI_VK_STAGED unset.\n");
+    else if (dl_max && !integrated && hv_dl * 4 < dl_max && !window)
+        fprintf(stderr, "[VK] warning: only %llu of %llu MB VRAM is host-visible (Resizable BAR "
+                "appears disabled). Enable Resizable BAR / Smart Access Memory in the BIOS, "
+                "or leave COLI_VK_STAGED unset.\n",
+                (unsigned long long)(hv_dl >> 20), (unsigned long long)(dl_max >> 20));
 }
 
 static int alloc_buf_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype,
@@ -1640,48 +1770,14 @@ int coli_vk_init(const char *spv_path) {
         if (G.memtype_sys < 0 && e && !strcmp(e, "1")) G.memtype_sys = (int)G.memtype;
     }
 
-    /* Resizable-BAR sanity (#523): on discrete cards the weight tiers want
-     * HOST_VISIBLE|DEVICE_LOCAL. With ReBAR disabled that combination exists only in a
-     * ~256 MB BAR window (or not at all), so tier allocations silently land in system
-     * RAM and every access crosses PCIe — measurably SLOWER than the CPU path, while
-     * the resident-experts log still reports an apparently healthy VRAM tier. Staged
-     * uploads (VkUp) are the answer: the warnings below are for a device where they are
-     * off (COLI_VK_STAGED=0, or no staging buffer). */
+    /* The window's decision (see vk_window_decide and vk_window_up_decided above): at the device's start,
+     * unless the engine asked trunk-first — then the ask waits for its trunk (coli_vk_window_trunk_ask). */
     {
-        VkPhysicalDeviceMemoryProperties mp;
-        vkGetPhysicalDeviceMemoryProperties(G.phys, &mp);
-        VkDeviceSize dl_max = 0;
-        for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
-            if ((mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) &&
-                mp.memoryHeaps[i].size > dl_max) dl_max = mp.memoryHeaps[i].size;
-        VkMemoryPropertyFlags cf = mp.memoryTypes[G.memtype].propertyFlags;
-        VkDeviceSize hv_dl = mp.memoryHeaps[mp.memoryTypes[G.memtype].heapIndex].size;
-        const int integrated = vk_integrated(G.phys);   /* an integrated GPU has no BAR window and uses system memory */
-        if (g_up[0].later) vk_window_decide(&g_up[0], G.phys, G.memtype, G.has_budget, "");
-        if (g_up[0].on && !up_init(&g_up[0])) {
-            fprintf(stderr, "[VK] staged uploads unavailable (no staging buffer): resident data stays in mapped memory\n");
-            up_destroy(&g_up[0]);
-            g_up[0].on = g_up[0].shared = 0;
+        if (g_up[0].later) {
+            if (g_win_trunk_first) g_win_trunk_deferred = 1;   /* the trunk first, the ask once it is placed */
+            else vk_window_decide(&g_up[0], G.phys, G.memtype, G.has_budget, "", 0);
         }
-        up_import_init(&g_up[0], G.phys, G.has_hostmem, "");
-        const uint64_t window = g_up[0].on ? 0 : vk_mem_window(0, G.phys, G.memtype);
-        if (g_up[0].on) {
-            VkUp *u = &g_up[0];
-            fprintf(stderr, "[VK] memory: staged uploads, resident data in device-local memory (type %u, %llu MiB heap) "
-                    "copied from host staging memory (type %u) on %s (%s)\n", u->mt_dev,
-                    (unsigned long long)(mp.memoryHeaps[mp.memoryTypes[u->mt_dev].heapIndex].size >> 20), u->mt_stage,
-                    u->shared ? "the main queue" : u->fam != G.qfam && u->fam != G.tq_fam ? "a transfer queue" : "a queue of its own",
-                    u->why);
-        } else if (dl_max && !integrated && !(cf & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
-            fprintf(stderr, "[VK] warning: no host-visible+device-local memory type — weight tiers "
-                    "will live in system RAM and every access crosses PCIe (expect slower than "
-                    "CPU-only). On a discrete card, enable Resizable BAR in the BIOS or leave "
-                    "COLI_VK_STAGED unset.\n");
-        else if (dl_max && !integrated && hv_dl * 4 < dl_max && !window)
-            fprintf(stderr, "[VK] warning: only %llu of %llu MB VRAM is host-visible (Resizable BAR "
-                    "appears disabled). Enable Resizable BAR / Smart Access Memory in the BIOS, "
-                    "or leave COLI_VK_STAGED unset.\n",
-                    (unsigned long long)(hv_dl >> 20), (unsigned long long)(dl_max >> 20));
+        vk_window_up_decided();
     }
 
     G.shader = load_spv(G.dev, spv_path);
@@ -3381,7 +3477,7 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
         VkUp *u = &g_up[1];
         u->dev = G2.dev; u->q = G2.queue; u->fam = G2.qfam; u->shared = 1;
         u->fams[0] = G2.qfam; u->nfams = 1;
-        if (u->later) vk_window_decide(u, G2.phys, G2.memtype, G2.has_budget, "dev2 ");
+        if (u->later) vk_window_decide(u, G2.phys, G2.memtype, G2.has_budget, "dev2 ", 0);
         if (u->on && !up_init(u)) {
             fprintf(stderr, "[VK] dev2: staged uploads unavailable (no staging buffer): its experts stay in mapped memory\n");
             up_destroy(u); u->on = u->shared = 0;
@@ -4213,12 +4309,18 @@ void coli_vk_pool_stats(int which, ColiVkPoolStats *st) {
 }
 static void tier_pool_limit(VkWPool *P, size_t bytes) {
     pthread_mutex_lock(&P->mx);
-    P->p.limit = bytes;
+    /* The limit is page-granular, as the blocks below are (0: no limit): a budget that is not a
+     * page multiple sizes a block past its own limit, which the pool can then never grow, and
+     * pool_suballoc falls back to the limit floored to a page. A three-expert tier's budget of
+     * exactly one extra-layer expert (15360 B) bought a 12288 B block, refused the 15360 B expert
+     * and counted it an upload failed (vk_tier.c's pool 4). Rounding up costs at most a page and
+     * a budget of N expert bytes holds N expert bytes. */
+    P->p.limit = bytes ? (bytes + 4095) & ~(size_t)4095 : 0;
     /* blocks no larger than the budget, so a small budget is not one refused block; the host
      * pool's are system RAM, which COLI_VK_DEVICE_CAP_MB does not shrink (under the cap its
      * 2 MiB blocks held one expert each: Flint's 18.5 GB took 24.5 GiB) */
     size_t bb = P->host ? VK_WBLOCK : coli_vk_block_bytes_dev(P->dev, VK_WBLOCK);
-    P->p.block_bytes = bytes && bytes < bb ? ((bytes + 4095) & ~(size_t)4095) : bb;
+    P->p.block_bytes = P->p.limit && P->p.limit < bb ? P->p.limit : bb;
     /* the empty block the pool keeps as a spare (vka_free) goes too: a tier started
      * again after a shutdown would otherwise fill it past its new, smaller budget */
     for (int k = 0; k < P->p.nb; k++)

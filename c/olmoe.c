@@ -50,6 +50,7 @@
 #include <omp.h>   /* omp_set_num_threads/omp_get_max_threads per omp_tune.h */
 #endif
 #include "omp_tune.h"
+#include "coli_env.h"
 #include "route_trace.h"                    /* shared routing telemetry (#700) */
 #include "kv_prefix.h"
 #include "park.h"      /* a short request keeps the conversation aside (COLI_PARK) */
@@ -3402,6 +3403,11 @@ static int ref_fits(const int *prompt, int np, const int *full, int nfull, int v
 int main(int argc, char **argv) {
     coli_omp_hot_team(argv, "olmoe", coli_omp_env_on("COLI_CUDA") || coli_omp_env_on("COLI_METAL"));   /* omp_tune.h */
     coli_omp_tune_threads("olmoe");   /* squadra sui core fisici: vedi omp_tune.h */
+    /* Registry check: an unknown or wrong-engine variable is silently ignored
+     * otherwise, and the run then reports a plausible number for the WRONG
+     * configuration. See coli_env.h. */
+    coli_env_check(CE_OLMOE, "olmoe");
+    coli_env_dump(CE_OLMOE, "olmoe");
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("OLMoE", "SNAP=<model directory> ./olmoe ..."); return 1; }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;

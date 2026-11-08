@@ -206,8 +206,13 @@ easy path.
 Install [MSYS2](https://www.msys2.org/), open the **UCRT64** shell, and run:
 
 ```bash
-pacman -S --needed mingw-w64-ucrt-x86_64-gcc make git python
+pacman -S --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-libgomp make git python
 ```
+
+`libgomp` is its own package since gcc 16; without it the link fails with
+`cannot find -lgomp`. An MSYS2 whose package list predates gcc 16 answers
+`target not found: mingw-w64-ucrt-x86_64-libgomp` and installs nothing: run
+`pacman -Syu` first, or leave that package out (its gcc still brings libgomp).
 
 ### macOS
 

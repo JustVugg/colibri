@@ -172,6 +172,14 @@ typedef int             (*fn_fp8_ref_matmul)(int device, const uint8_t *w, const
                                              int tokens, float *y);
 typedef int             (*fn_tensor_refill_fp4)(Dsv4CudaTensor *t, const uint8_t *w, const uint8_t *scale,
                                                 int O, int I, int sync);
+typedef int (*fn_head_scores_exact)(Dsv4CudaTensor*,const float*,float*);
+typedef int (*fn_head_scores_batch_exact)(Dsv4CudaTensor*,const float*,int,float*);
+typedef int (*fn_head_argmax_batch_exact)(Dsv4CudaTensor*,const float*,int,int*,float*);
+typedef int (*fn_indexer_prepare)(Dsv4CudaTensor*,const float*,float*,float*,int);
+typedef int (*fn_upload_compressor)(Dsv4CudaTensor**,const uint16_t*,int,int,int);
+typedef int (*fn_compressor_project)(Dsv4CudaTensor*,Dsv4CudaTensor*,const float*,float*,float*);
+typedef int (*fn_upload_fp8_ref)(Dsv4CudaTensor**,const uint8_t*,const float*,int,int,int,int);
+typedef int (*fn_fp8_ref_matmul_resident)(Dsv4CudaTensor*,const float*,int,float*);
 typedef int             (*fn_backend_arch_ok)(int device);
 typedef const char     *(*fn_backend_name)(void);
 typedef long long       (*fn_mem_free_mb)(int device);
@@ -211,6 +219,12 @@ typedef Dsv4CudaExpertSet *(*fn_expert_set_create)(Dsv4CudaTensor *const *gate, 
                                                    Dsv4CudaTensor *shared_down);
 typedef int             (*fn_expert_bank_slots)(int experts);
 typedef long long       (*fn_expert_bank_slot_bytes)(int hidden, int intermediate);
+typedef int             (*fn_peer_access)(int a, int b);
+typedef int             (*fn_peer_probe)(int device, int peer, char *why, int why_size);
+typedef int             (*fn_peer_compute)(int device, int peer);
+typedef void            (*fn_peer_best_effort)(int on);
+typedef int             (*fn_peer_healthy)(int device);
+typedef int             (*fn_lost)(void);
 typedef Dsv4CudaExpertSet *(*fn_expert_bank_create)(int count, int hidden, int intermediate, int device,
                                                     Dsv4CudaTensor *shared_gate, Dsv4CudaTensor *shared_up,
                                                     Dsv4CudaTensor *shared_down);
@@ -232,6 +246,8 @@ typedef int             (*fn_expert_bank_upload_tp2)(Dsv4CudaExpertSet *set, int
 typedef void            (*fn_expert_set_free)(Dsv4CudaExpertSet *set);
 typedef int             (*fn_expert_set_upload_hash)(Dsv4CudaExpertSet *set, const int64_t *map,
                                                     int vocab, int topk);
+typedef int (*fn_resident_route_moe)(Dsv4CudaExpertSet*,Dsv4CudaTensor*,Dsv4CudaTensor*,
+                                      const int*,float,float,float*,const float*);
 typedef int             (*fn_route_moe)(const Dsv4CudaActivation *input, Dsv4CudaTensor *gate, Dsv4CudaTensor *bias,
                                         int token, float routed_scale, Dsv4CudaExpertSet *experts,
                                         float limit, Dsv4CudaActivation *output);
@@ -315,6 +331,15 @@ static struct {
     fn_proj_batch proj_batch;                       /* optional (V4_ATTN_BATCH_PROJ, older DLLs: 0) */
     fn_proj_batch_release proj_batch_release;       /* optional */
     fn_fp8_ref_matmul fp8_ref_matmul;
+    fn_indexer_prepare indexer_prepare;
+    fn_upload_compressor upload_compressor;
+    fn_upload_compressor upload_head_exact;
+    fn_head_scores_exact head_scores_exact;
+    fn_head_scores_batch_exact head_scores_batch_exact;
+    fn_head_argmax_batch_exact head_argmax_batch_exact;
+    fn_compressor_project compressor_project;
+    fn_upload_fp8_ref upload_fp8_ref;
+    fn_fp8_ref_matmul_resident fp8_ref_matmul_resident;
     fn_tensor_refill_fp4 tensor_refill_fp4;
     fn_backend_arch_ok backend_arch_ok;   /* optional */
     fn_backend_name backend_name;         /* optional */
@@ -335,12 +360,19 @@ static struct {
     fn_expert_bank_create expert_bank_create;
     fn_expert_bank_slots expert_bank_slots; /* optional (older DLLs: 256 only) */
     fn_expert_bank_slot_bytes expert_bank_slot_bytes; /* optional (older DLLs) */
+    fn_peer_access peer_access; /* optional (older DLLs: no peer mirror pool) */
+    fn_peer_probe peer_probe;   /* optional (older DLLs: no peer mirror pool) */
+    fn_peer_compute peer_compute; /* optional (older DLLs: reported as in-place reads) */
+    fn_peer_best_effort set_peer_best_effort; /* optional (older DLLs: strict) */
+    fn_peer_healthy peer_healthy; /* optional (older DLLs: never latch a peer off) */
+    fn_lost lost;                 /* optional (older DLLs: never latch CUDA off) */
     fn_expert_bank_upload expert_bank_upload;
     fn_expert_bank_set_shared expert_bank_set_shared;
     fn_expert_bank_upload_tp2 expert_bank_upload_tp2;
     fn_expert_bank_upload_aux expert_bank_upload_aux; /* optional (older DLLs) */
     fn_expert_set_free expert_set_free;
     fn_expert_set_upload_hash expert_set_upload_hash;
+    fn_resident_route_moe resident_route_moe;
     fn_route_moe       route_moe;
     fn_route_moe_batch route_moe_batch;
     fn_route_top6_batch route_top6_batch;
@@ -348,6 +380,7 @@ static struct {
     fn_route_moe_ep2   route_moe_ep2;
     fn_qkv             qkv;
     fn_wo              wo;
+    fn_wo              wo_decode;
     fn_tensor_free     tensor_free;
     fn_tensor_bytes    tensor_bytes;
     fn_tensor_device   tensor_device;
@@ -494,6 +527,15 @@ static int dsv4_cuda_resolve(const char *dllname){
     RESOLVE(sparse_attn_batch_cached_idx, fn_sparse_attn_batch_cached_idx);
     RESOLVE(indexer_score_batch, fn_indexer_score_batch);
     RESOLVE(fp8_ref_matmul, fn_fp8_ref_matmul);
+    g_dsv4.upload_head_exact = (fn_upload_compressor)GetProcAddress(g_dsv4.dll, "dsv4_cuda_upload_head_exact");
+    g_dsv4.head_scores_exact = (fn_head_scores_exact)GetProcAddress(g_dsv4.dll, "dsv4_cuda_head_scores_exact");
+    g_dsv4.head_scores_batch_exact = (fn_head_scores_batch_exact)GetProcAddress(g_dsv4.dll, "dsv4_cuda_head_scores_batch_exact");
+    g_dsv4.head_argmax_batch_exact = (fn_head_argmax_batch_exact)GetProcAddress(g_dsv4.dll, "dsv4_cuda_head_argmax_batch_exact");
+    g_dsv4.indexer_prepare = (fn_indexer_prepare)GetProcAddress(g_dsv4.dll, "dsv4_cuda_indexer_prepare");
+    g_dsv4.upload_compressor = (fn_upload_compressor)GetProcAddress(g_dsv4.dll, "dsv4_cuda_upload_compressor");
+    g_dsv4.compressor_project = (fn_compressor_project)GetProcAddress(g_dsv4.dll, "dsv4_cuda_compressor_project");
+    g_dsv4.upload_fp8_ref = (fn_upload_fp8_ref)GetProcAddress(g_dsv4.dll, "dsv4_cuda_upload_fp8_ref");
+    g_dsv4.fp8_ref_matmul_resident = (fn_fp8_ref_matmul_resident)GetProcAddress(g_dsv4.dll, "dsv4_cuda_fp8_ref_matmul_resident");
     RESOLVE(tensor_refill_fp4, fn_tensor_refill_fp4);
     RESOLVE(mem_free_mb, fn_mem_free_mb);
     RESOLVE(kv_ring_append, fn_kv_ring_append);
@@ -512,6 +554,7 @@ static int dsv4_cuda_resolve(const char *dllname){
     RESOLVE(expert_bank_upload_tp2, fn_expert_bank_upload_tp2);
     RESOLVE(expert_set_free, fn_expert_set_free);
     RESOLVE(expert_set_upload_hash, fn_expert_set_upload_hash);
+    g_dsv4.resident_route_moe = (fn_resident_route_moe)GetProcAddress(g_dsv4.dll, "dsv4_cuda_resident_route_moe");
     RESOLVE(route_moe, fn_route_moe);
     RESOLVE(route_moe_batch, fn_route_moe_batch);
     RESOLVE(route_top6_batch, fn_route_top6_batch);
@@ -519,6 +562,7 @@ static int dsv4_cuda_resolve(const char *dllname){
     RESOLVE(route_moe_ep2, fn_route_moe_ep2);
     RESOLVE(qkv, fn_qkv);
     RESOLVE(wo, fn_wo);
+    g_dsv4.wo_decode = (fn_wo)GetProcAddress(g_dsv4.dll, "dsv4_cuda_wo_decode");
     RESOLVE(tensor_free, fn_tensor_free);
     RESOLVE(tensor_bytes, fn_tensor_bytes);
     RESOLVE(tensor_device, fn_tensor_device);
@@ -534,6 +578,12 @@ static int dsv4_cuda_resolve(const char *dllname){
     g_dsv4.expert_bank_upload_aux = (fn_expert_bank_upload_aux)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_upload_aux");
     g_dsv4.expert_bank_slots = (fn_expert_bank_slots)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_slots");
     g_dsv4.expert_bank_slot_bytes = (fn_expert_bank_slot_bytes)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_slot_bytes");
+    g_dsv4.peer_access = (fn_peer_access)GetProcAddress(g_dsv4.dll, "dsv4_cuda_peer_access");
+    g_dsv4.peer_probe = (fn_peer_probe)GetProcAddress(g_dsv4.dll, "dsv4_cuda_peer_probe");
+    g_dsv4.peer_compute = (fn_peer_compute)GetProcAddress(g_dsv4.dll, "dsv4_cuda_peer_compute");
+    g_dsv4.set_peer_best_effort = (fn_peer_best_effort)GetProcAddress(g_dsv4.dll, "dsv4_cuda_set_peer_best_effort");
+    g_dsv4.peer_healthy = (fn_peer_healthy)GetProcAddress(g_dsv4.dll, "dsv4_cuda_peer_healthy");
+    g_dsv4.lost = (fn_lost)GetProcAddress(g_dsv4.dll, "dsv4_cuda_lost");
     g_dsv4.backend_name = (fn_backend_name)GetProcAddress(g_dsv4.dll, "dsv4_cuda_backend_name");
     g_dsv4.proj_batch = (fn_proj_batch)GetProcAddress(g_dsv4.dll, "dsv4_cuda_proj_batch");
     g_dsv4.proj_batch_release = (fn_proj_batch_release)GetProcAddress(g_dsv4.dll, "dsv4_cuda_proj_batch_release");
@@ -877,6 +927,41 @@ int dsv4_cuda_fp8_ref_matmul(int device, const uint8_t *w, const float *bscale,
     return g_dsv4.fp8_ref_matmul(device, w, bscale, rows, cols, packed_rows8, x, tokens, y);
 }
 
+int dsv4_cuda_upload_head_exact(Dsv4CudaTensor **t,const uint16_t *w,int rows,int cols,int device){
+    return g_dsv4.available && g_dsv4.upload_head_exact && g_dsv4.head_scores_exact
+        ? g_dsv4.upload_head_exact(t,w,rows,cols,device) : 0;
+}
+int dsv4_cuda_head_scores_exact(Dsv4CudaTensor *t,const float *input,float *scores){
+    return g_dsv4.available && g_dsv4.head_scores_exact ? g_dsv4.head_scores_exact(t,input,scores) : 0;
+}
+int dsv4_cuda_head_scores_batch_exact(Dsv4CudaTensor *t,const float *input,int batch,float *scores){
+    return g_dsv4.available && g_dsv4.head_scores_batch_exact ? g_dsv4.head_scores_batch_exact(t,input,batch,scores) : 0;
+}
+int dsv4_cuda_head_argmax_batch_exact(Dsv4CudaTensor *t,const float *input,int batch,int *ids,float *values){
+    return g_dsv4.available && g_dsv4.head_argmax_batch_exact ? g_dsv4.head_argmax_batch_exact(t,input,batch,ids,values) : 0;
+}
+int dsv4_cuda_indexer_prepare(Dsv4CudaTensor *w,const float *x,float *q,float *h,int dim){
+    return g_dsv4.available && g_dsv4.indexer_prepare ? g_dsv4.indexer_prepare(w,x,q,h,dim) : 0;
+}
+int dsv4_cuda_upload_compressor(Dsv4CudaTensor **t,const uint16_t *w,int rows,int cols,int device){
+    return g_dsv4.available && g_dsv4.upload_compressor && g_dsv4.compressor_project
+        ? g_dsv4.upload_compressor(t,w,rows,cols,device) : 0;
+}
+int dsv4_cuda_compressor_project(Dsv4CudaTensor *kv,Dsv4CudaTensor *gate,const float *x,float *v,float *scores){
+    return g_dsv4.available && g_dsv4.compressor_project
+        ? g_dsv4.compressor_project(kv,gate,x,v,scores) : 0;
+}
+
+int dsv4_cuda_upload_fp8_ref(Dsv4CudaTensor **t,const uint8_t *w,const float *s,int rows,int cols,int packed,int device){
+    return g_dsv4.available && g_dsv4.upload_fp8_ref && g_dsv4.fp8_ref_matmul_resident
+        ? g_dsv4.upload_fp8_ref(t,w,s,rows,cols,packed,device) : 0;
+}
+
+int dsv4_cuda_fp8_ref_matmul_resident(Dsv4CudaTensor *t,const float *x,int tokens,float *y){
+    return g_dsv4.available && g_dsv4.fp8_ref_matmul_resident
+        ? g_dsv4.fp8_ref_matmul_resident(t,x,tokens,y) : 0;
+}
+
 int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t, const uint8_t *w, const uint8_t *scale, int O, int I, int sync){
     if(!g_dsv4.available) return 0;
     return g_dsv4.tensor_refill_fp4(t, w, scale, O, I, sync);
@@ -980,6 +1065,42 @@ Dsv4CudaExpertSet *dsv4_cuda_expert_set_create(Dsv4CudaTensor *const *gate, Dsv4
     return g_dsv4.expert_set_create(gate, up, down, count, shared_gate, shared_up, shared_down);
 }
 
+int dsv4_cuda_peer_access(int a, int b){
+    return g_dsv4.available && g_dsv4.peer_access ? g_dsv4.peer_access(a, b) : 0;
+}
+
+/* Asked before dsv4_cuda_init, so it loads the DLL itself (idempotent; init
+ * then reuses it). An older DLL without the export: no peer mirror pool. */
+int dsv4_cuda_peer_probe(int device, int peer, char *why, int why_size){
+    if(why && why_size > 0) why[0] = 0;
+    if(!dsv4_cuda_load()){
+        if(why && why_size > 0) snprintf(why, (size_t)why_size, "no usable CUDA backend DLL");
+        return 0;
+    }
+    if(!g_dsv4.peer_probe){
+        if(why && why_size > 0)
+            snprintf(why, (size_t)why_size, "%s predates the peer probe (an older build)", g_dsv4.loaded_name);
+        return 0;
+    }
+    return g_dsv4.peer_probe(device, peer, why, why_size);
+}
+
+int dsv4_cuda_peer_compute(int device, int peer){
+    return g_dsv4.available && g_dsv4.peer_compute ? g_dsv4.peer_compute(device, peer) : 0;
+}
+
+void dsv4_cuda_set_peer_best_effort(int on){
+    if(g_dsv4.available && g_dsv4.set_peer_best_effort) g_dsv4.set_peer_best_effort(on);
+}
+
+int dsv4_cuda_peer_healthy(int device){
+    return g_dsv4.available && g_dsv4.peer_healthy ? g_dsv4.peer_healthy(device) : 1;
+}
+
+int dsv4_cuda_lost(void){
+    return g_dsv4.available && g_dsv4.lost ? g_dsv4.lost() : 0;
+}
+
 int dsv4_cuda_expert_bank_slots(int experts){
     if(g_dsv4.available && g_dsv4.expert_bank_slots) return g_dsv4.expert_bank_slots(experts);
     return experts >= 1 && experts <= 256 ? 256 : 0;
@@ -1050,6 +1171,12 @@ int dsv4_cuda_expert_set_upload_hash(Dsv4CudaExpertSet *set, const int64_t *map,
     return g_dsv4.expert_set_upload_hash(set, map, vocab, topk);
 }
 
+int dsv4_cuda_resident_route_moe(Dsv4CudaExpertSet *set,Dsv4CudaTensor *gate,
+    Dsv4CudaTensor *bias,const int *fixed,float scale,float limit,float *out,const float *in){
+    return g_dsv4.available && g_dsv4.resident_route_moe
+        ? g_dsv4.resident_route_moe(set,gate,bias,fixed,scale,limit,out,in) : 0;
+}
+
 int dsv4_cuda_route_moe(const Dsv4CudaActivation *input, Dsv4CudaTensor *gate, Dsv4CudaTensor *bias,
                         int token, float routed_scale, Dsv4CudaExpertSet *experts, float limit,
                         Dsv4CudaActivation *output){
@@ -1093,6 +1220,9 @@ int dsv4_cuda_qkv(Dsv4CudaTensor *q_a, Dsv4CudaTensor *q_norm, Dsv4CudaTensor *q
     return g_dsv4.qkv(q_a, q_norm, q_b, kv, eps, q_out, kv_out, x);
 }
 
+int dsv4_cuda_wo_decode(Dsv4CudaTensor *a,Dsv4CudaTensor *b,int groups,float *out,const float *context){
+    return g_dsv4.available && g_dsv4.wo_decode ? g_dsv4.wo_decode(a,b,groups,out,context) : 0;
+}
 int dsv4_cuda_wo(Dsv4CudaTensor *wo_a, Dsv4CudaTensor *wo_b, int groups, float *out, const float *context){
     if(!g_dsv4.available) return 0;
     return g_dsv4.wo(wo_a, wo_b, groups, out, context);
