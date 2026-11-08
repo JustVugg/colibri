@@ -1,0 +1,340 @@
+{
+  "measured_base_commit": "e24cd51afd44b480c1e41ba82e20a28bac76c34f",
+  "publication_base_commit": "f5d65566de468c8e7ac285a5e8c7257bf4d06856",
+  "runtime_base_patch_sha256": "08a76a38c78e5a841608d6969dcf5152d879ce1002e1f5e3cf0e3e1772baf2d1",
+  "arms": {
+    "A1": {
+      "source": "/opt/colibri/xe2-models",
+      "image_id": "sha256:415894a2f61eb73279b6c0c3a1cf70aa12067857e475bb53a4e5c1535a9c16af",
+      "engine_sha256": "8fc2bb3d5fba2bd48ca83450a5796eb579d283f31817b2fafaf121b4191c2420",
+      "knobs": {
+        "COLI_VK_TIER_SYNC": "1",
+        "COLI_VK_TIER_BALANCE": "0"
+      },
+      "vk_tier_sha256": "b2f64c067b1791dac04fb568fd99dcd35901485706553324766e1ead94be97c8",
+      "compose_service": {
+        "restart": "no",
+        "container_name": "colibri-model-test",
+        "cpuset": "16-31",
+        "command": [
+          "serve",
+          "--host",
+          "0.0.0.0",
+          "--port",
+          "5000",
+          "--model",
+          "/models/current",
+          "--model-id",
+          "deepseek-v4-flash-reap"
+        ],
+        "devices": [
+          {
+            "source": "/dev/dri/renderD129",
+            "target": "/dev/dri/renderD129",
+            "permissions": "rwm"
+          },
+          {
+            "source": "/dev/dri/card2",
+            "target": "/dev/dri/card2",
+            "permissions": "rwm"
+          }
+        ],
+        "entrypoint": null,
+        "environment": {
+          "COLI_ALLOWED_HOSTS": "*",
+          "COLI_ALLOW_INSECURE_BIND": "1",
+          "COLI_ENGINE": "/app/deepseek_v4",
+          "COLI_MODEL": "/models/current",
+          "COLI_VK_CHAIN_ROWS": "auto",
+          "COLI_VK_DEV": "0",
+          "COLI_VK_DEV2": "",
+          "COLI_VK_HYBRID_BIG_ROWS": "2",
+          "COLI_VK_TIER_BALANCE": "0",
+          "COLI_VK_TIER_SYNC": "1",
+          "COLI_VULKAN": "1",
+          "CTX": "65536",
+          "HOME": "/cache",
+          "OMP_NUM_THREADS": "16",
+          "RAM_GB": "128",
+          "USAGE_SAVE": "0",
+          "V4_PREFIX_CKPT_DISK": "0",
+          "VK_DRIVER_FILES": "/usr/share/vulkan/icd.d/intel_icd.json",
+          "XDG_CACHE_HOME": "/cache"
+        },
+        "group_add": [
+          "991",
+          "44"
+        ],
+        "image": "colibri-vulkan:xe2-models-mesa26.2.6",
+        "logging": {
+          "driver": "json-file",
+          "options": {
+            "max-file": "3",
+            "max-size": "50m"
+          }
+        },
+        "mem_limit": "193273528320",
+        "memswap_limit": "193273528320",
+        "networks": {
+          "default": null
+        },
+        "security_opt": [
+          "no-new-privileges:true"
+        ],
+        "shm_size": "8589934592",
+        "stop_grace_period": "2m0s",
+        "user": "1001:1001",
+        "volumes": [
+          {
+            "type": "bind",
+            "source": "/srv/models/deepseek-v4-flash-reap",
+            "target": "/models/current",
+            "read_only": true,
+            "bind": {
+              "create_host_path": false
+            }
+          },
+          {
+            "type": "bind",
+            "source": "/var/cache/colibri-models/deepseek-v4-flash-reap",
+            "target": "/cache",
+            "bind": {
+              "create_host_path": false
+            }
+          }
+        ],
+        "ports": [
+          {
+            "mode": "ingress",
+            "host_ip": "127.0.0.1",
+            "target": 5000,
+            "published": "8002",
+            "protocol": "tcp"
+          }
+        ]
+      }
+    },
+    "B": {
+      "source": "/opt/colibri/xe2-models-fp4",
+      "image_id": "sha256:b7c5f8e192d5195d442f62a96a022471923d9a74763a9fe0f8fe0e7fe7369589",
+      "engine_sha256": "c3fca3a2c8d62e5573a2f122827e52fd4dccbba70a9cf99a9fb041a1e3e38a79",
+      "knobs": {
+        "COLI_VK_TIER_SYNC": "1",
+        "COLI_VK_TIER_BALANCE": "0"
+      },
+      "vk_tier_sha256": "b2720941ceb73591197c7e0942c8be01cfaa9eeeacab2654b96b5bb4db443cb2",
+      "compose_service": {
+        "restart": "no",
+        "container_name": "colibri-model-test",
+        "cpuset": "16-31",
+        "command": [
+          "serve",
+          "--host",
+          "0.0.0.0",
+          "--port",
+          "5000",
+          "--model",
+          "/models/current",
+          "--model-id",
+          "deepseek-v4-flash-reap"
+        ],
+        "devices": [
+          {
+            "source": "/dev/dri/renderD129",
+            "target": "/dev/dri/renderD129",
+            "permissions": "rwm"
+          },
+          {
+            "source": "/dev/dri/card2",
+            "target": "/dev/dri/card2",
+            "permissions": "rwm"
+          }
+        ],
+        "entrypoint": null,
+        "environment": {
+          "COLI_ALLOWED_HOSTS": "*",
+          "COLI_ALLOW_INSECURE_BIND": "1",
+          "COLI_ENGINE": "/app/deepseek_v4",
+          "COLI_MODEL": "/models/current",
+          "COLI_VK_CHAIN_ROWS": "auto",
+          "COLI_VK_DEV": "0",
+          "COLI_VK_DEV2": "",
+          "COLI_VK_HYBRID_BIG_ROWS": "2",
+          "COLI_VK_TIER_BALANCE": "0",
+          "COLI_VK_TIER_SYNC": "1",
+          "COLI_VULKAN": "1",
+          "CTX": "65536",
+          "HOME": "/cache",
+          "OMP_NUM_THREADS": "16",
+          "RAM_GB": "128",
+          "USAGE_SAVE": "0",
+          "V4_PREFIX_CKPT_DISK": "0",
+          "VK_DRIVER_FILES": "/usr/share/vulkan/icd.d/intel_icd.json",
+          "XDG_CACHE_HOME": "/cache"
+        },
+        "group_add": [
+          "991",
+          "44"
+        ],
+        "image": "colibri-vulkan:xe2-models-fp4-mesa26.2.6",
+        "logging": {
+          "driver": "json-file",
+          "options": {
+            "max-file": "3",
+            "max-size": "50m"
+          }
+        },
+        "mem_limit": "193273528320",
+        "memswap_limit": "193273528320",
+        "networks": {
+          "default": null
+        },
+        "security_opt": [
+          "no-new-privileges:true"
+        ],
+        "shm_size": "8589934592",
+        "stop_grace_period": "2m0s",
+        "user": "1001:1001",
+        "volumes": [
+          {
+            "type": "bind",
+            "source": "/srv/models/deepseek-v4-flash-reap",
+            "target": "/models/current",
+            "read_only": true,
+            "bind": {
+              "create_host_path": false
+            }
+          },
+          {
+            "type": "bind",
+            "source": "/var/cache/colibri-models/deepseek-v4-flash-reap",
+            "target": "/cache",
+            "bind": {
+              "create_host_path": false
+            }
+          }
+        ],
+        "ports": [
+          {
+            "mode": "ingress",
+            "host_ip": "127.0.0.1",
+            "target": 5000,
+            "published": "8002",
+            "protocol": "tcp"
+          }
+        ]
+      }
+    },
+    "A2": {
+      "source": "/opt/colibri/xe2-models",
+      "image_id": "sha256:415894a2f61eb73279b6c0c3a1cf70aa12067857e475bb53a4e5c1535a9c16af",
+      "engine_sha256": "8fc2bb3d5fba2bd48ca83450a5796eb579d283f31817b2fafaf121b4191c2420",
+      "knobs": {
+        "COLI_VK_TIER_SYNC": "1",
+        "COLI_VK_TIER_BALANCE": "0"
+      },
+      "vk_tier_sha256": "b2f64c067b1791dac04fb568fd99dcd35901485706553324766e1ead94be97c8",
+      "compose_service": {
+        "restart": "no",
+        "container_name": "colibri-model-test",
+        "cpuset": "16-31",
+        "command": [
+          "serve",
+          "--host",
+          "0.0.0.0",
+          "--port",
+          "5000",
+          "--model",
+          "/models/current",
+          "--model-id",
+          "deepseek-v4-flash-reap"
+        ],
+        "devices": [
+          {
+            "source": "/dev/dri/renderD129",
+            "target": "/dev/dri/renderD129",
+            "permissions": "rwm"
+          },
+          {
+            "source": "/dev/dri/card2",
+            "target": "/dev/dri/card2",
+            "permissions": "rwm"
+          }
+        ],
+        "entrypoint": null,
+        "environment": {
+          "COLI_ALLOWED_HOSTS": "*",
+          "COLI_ALLOW_INSECURE_BIND": "1",
+          "COLI_ENGINE": "/app/deepseek_v4",
+          "COLI_MODEL": "/models/current",
+          "COLI_VK_CHAIN_ROWS": "auto",
+          "COLI_VK_DEV": "0",
+          "COLI_VK_DEV2": "",
+          "COLI_VK_HYBRID_BIG_ROWS": "2",
+          "COLI_VK_TIER_BALANCE": "0",
+          "COLI_VK_TIER_SYNC": "1",
+          "COLI_VULKAN": "1",
+          "CTX": "65536",
+          "HOME": "/cache",
+          "OMP_NUM_THREADS": "16",
+          "RAM_GB": "128",
+          "USAGE_SAVE": "0",
+          "V4_PREFIX_CKPT_DISK": "0",
+          "VK_DRIVER_FILES": "/usr/share/vulkan/icd.d/intel_icd.json",
+          "XDG_CACHE_HOME": "/cache"
+        },
+        "group_add": [
+          "991",
+          "44"
+        ],
+        "image": "colibri-vulkan:xe2-models-mesa26.2.6",
+        "logging": {
+          "driver": "json-file",
+          "options": {
+            "max-file": "3",
+            "max-size": "50m"
+          }
+        },
+        "mem_limit": "193273528320",
+        "memswap_limit": "193273528320",
+        "networks": {
+          "default": null
+        },
+        "security_opt": [
+          "no-new-privileges:true"
+        ],
+        "shm_size": "8589934592",
+        "stop_grace_period": "2m0s",
+        "user": "1001:1001",
+        "volumes": [
+          {
+            "type": "bind",
+            "source": "/srv/models/deepseek-v4-flash-reap",
+            "target": "/models/current",
+            "read_only": true,
+            "bind": {
+              "create_host_path": false
+            }
+          },
+          {
+            "type": "bind",
+            "source": "/var/cache/colibri-models/deepseek-v4-flash-reap",
+            "target": "/cache",
+            "bind": {
+              "create_host_path": false
+            }
+          }
+        ],
+        "ports": [
+          {
+            "mode": "ingress",
+            "host_ip": "127.0.0.1",
+            "target": 5000,
+            "published": "8002",
+            "protocol": "tcp"
+          }
+        ]
+      }
+    }
+  }
+}

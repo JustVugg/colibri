@@ -1,0 +1,2480 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 471732d6..d45eb006 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -326,6 +326,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
+ 
+ ### Fixed
+ 
++- **Vulkan, qwen36: a long first prompt took experts out of the tier for the rest of the
++  process.** Before its first prompt chunk's scratch exists, the chain kept free all the memory
++  beside an 8192-position KV mirror, so a longer first prompt's mirror took its rows past 8192
++  positions from the expert tier, which lowers its maximum and does not take them back. An Arc
++  Pro B60 with Qwen3.6-35B-A3B's 18 GiB tier, a 16K-token prompt as the first request: 78
++  experts out, that prompt 74.4 -> 88.6 s, decode 35 -> 24-30 tok/s after it (a short first
++  request kept every expert). Such a mirror now keeps free only the first chunk's scratch, the
++  tier's staging room and 256 MiB, the chunk decided before it (`q36c_mirror`), where the device
++  reports its budget (`VK_EXT_memory_budget`) and the mirror fits in the half of the free memory
++  a chunk leaves; a first mirror within 8192 positions, or one past that half, goes as before. A
++  short first request still decides its chunk after its own mirror, so a long one's can come
++  out one 256-row step bigger on the B60.
+ - **`chat_template_kwargs` reaches the chat template** (`coli serve`). Many OpenAI-compatible
+   clients turn a Qwen model's thinking off with `"chat_template_kwargs": {"enable_thinking":
+   false}`, and the gateway ignored the field: a Qwen3.8 request that asked for no thinking this
+diff --git a/c/backend_vulkan.c b/c/backend_vulkan.c
+index 07a60844..1bef7f71 100644
+--- a/c/backend_vulkan.c
++++ b/c/backend_vulkan.c
+@@ -202,8 +202,9 @@ static void vk_mem_free(VkDevice d, VkDeviceMemory m, const VkAllocationCallback
+ #undef vkFreeMemory
+ #define vkAllocateMemory vk_mem_alloc
+ #define vkFreeMemory vk_mem_free
+-/* A device just created: which of its memory types count, and the cap. */
+-static void vk_mem_device(int k, VkPhysicalDevice phys, VkDevice d) {
++/* A device just created: which of its memory types count, and the cap; its retries among
++ * `take`, the types its buffers take (vk_buffer_types). */
++static void vk_mem_device(int k, VkPhysicalDevice phys, VkDevice d, uint32_t take) {
+     VkPhysicalDeviceMemoryProperties mp;
+     vkGetPhysicalDeviceMemoryProperties(phys, &mp);
+     const int integrated = vk_integrated(phys);
+@@ -212,7 +213,7 @@ static void vk_mem_device(int k, VkPhysicalDevice phys, VkDevice d) {
+     memset(retry, -1, sizeof retry);
+     for (uint32_t i = 0; i < mp.memoryTypeCount && i < 32; i++) {
+         if (vk_heap_is_device_memory(&mp, integrated, mp.memoryTypes[i].heapIndex)) mask |= 1u << i;
+-        retry[i] = (int8_t)vk_retry_memtype(&mp, integrated, i);
++        retry[i] = (int8_t)vk_retry_memtype(&mp, take, integrated, i);
+     }
+     const char *e = getenv("COLI_VK_DEVICE_CAP_MB");
+     double mb = e && *e ? atof(e) : 0.0;
+@@ -510,7 +511,14 @@ struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; i
+  * COLI_VK_SUBGROUP=n pins n instead (every pipeline that takes this size: the chain's,
+  * build_pipeline's and the expert batch's), a power of two the device allows: Mesa's ANV
+  * (Intel Meteor Lake, Mesa 26.2) took over 38 minutes to compile chain_moe.spv at the
+- * reported 32 and 72-195 s at 16, where test_vk_chain passes. */
++ * reported 32 and 72-195 s at 16, where test_vk_chain passes. Unset on Intel's Xe2 (Battlemage,
++ * Lunar Lake: no SIMD8, so 16 is its smallest subgroup) it pins 16, not the reported 32: at 32 an
++ * Arc Pro B60 (Mesa ANV 26.0.8, an SR-IOV VF, the chain started by anv_enable_buffer_comp=true)
++ * failed 44 of test_vk_chain's routed-expert checks (chain_moe and chain_moe_gv off by relative
++ * errors of 0.86 to 1.0, frames that failed) and Qwen3.6's chain answered otherwise than the CPU,
++ * at 13.1 tok/s; at 16 the test passes and the chain gives the CPU's answers at 37.1 tok/s, a
++ * 3,000-token prompt in 7.2 s against 37.7 and a 16K one in 118 s against 407. pick_memtype,
++ * which starts the chain there, counts on this default. */
+ static int vk_pin_sg(VkPhysicalDevice phys, int has_ext) {
+ #ifdef VK_EXT_subgroup_size_control
+     const char *e = getenv("COLI_VK_SUBGROUP");
+@@ -527,6 +535,7 @@ static int vk_pin_sg(VkPhysicalDevice phys, int has_ext) {
+     VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sg};
+     vkGetPhysicalDeviceProperties2(phys, &p2);
+     uint32_t n = sg.subgroupSize;
++    if (!(e && *e) && pp.vendorID == 0x8086 && sp.minSubgroupSize == 16 && sp.maxSubgroupSize > 16) n = 16;   /* Xe2 */
+     if (e && *e) {
+         long want = strtol(e, NULL, 10);
+         if (want >= (long)sp.minSubgroupSize && want <= (long)sp.maxSubgroupSize && !(want & (want - 1)))
+@@ -563,10 +572,72 @@ static int vk_create_device_pinned(VkPhysicalDevice phys, const VkDeviceCreateIn
+     return 0;
+ }
+ 
+-static int pick_memtype(VkPhysicalDevice phys, ColiVkMemUse use) {
++/* The memory type for `use` among `take`, the types the device's buffers take (vk_buffer_types;
++ * ~0u before the device exists). On an Arc Pro B60 (Mesa ANV 26.0.8) the first device-local type
++ * is for images alone: chosen from the properties it was the GPU-only type, the dense chain's
++ * first buffer was refused and qwen36 decoded at 19.6 tok/s without the chain. With the driconf
++ * anv_enable_buffer_comp=true, which lets buffers have that type, and COLI_VK_SUBGROUP=16 the
++ * chain ran at 37.1 tok/s with the same answers (an SR-IOV VF; 13.1 and other answers at the
++ * reported subgroup of 32). Among `take` the GPU-only type there is type 1, the next
++ * device-local one. */
++static int pick_memtype(VkPhysicalDevice phys, ColiVkMemUse use, uint32_t take) {
+     VkPhysicalDeviceMemoryProperties m;
+     vkGetPhysicalDeviceMemoryProperties(phys, &m);
+-    return vk_pick_memtype(&m, vk_integrated(phys), use);
++    return vk_pick_memtype(&m, take, vk_integrated(phys), use);
++}
++/* The memory types the device's buffers can be bound to: the memoryTypeBits of a probe made with
++ * every usage the backend's and the chain's buffers are made with (storage, both ends of a copy,
++ * an indirect dispatch's arguments, an address where bufferDeviceAddress is on). The spec makes
++ * the types of a buffer with more usage a subset of those of one with less, so a type taken from
++ * these takes each of them. ~0u (every type, as before) when the probe cannot be made. */
++static uint32_t vk_buffer_types(VkDevice dev, int bda) {
++    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 4096,
++        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
++                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | (bda ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0),
++        .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
++    VkBuffer probe;
++    if (vkCreateBuffer(dev, &bi, NULL, &probe) != VK_SUCCESS) return ~0u;
++    VkMemoryRequirements req; vkGetBufferMemoryRequirements(dev, probe, &req);
++    vkDestroyBuffer(dev, probe, NULL);
++    return req.memoryTypeBits ? req.memoryTypeBits : ~0u;
++}
++/* Said for each use whose type moved off the one the properties alone choose, as device k's
++ * buffers do not take that one (the B60's GPU-only type, above); silent everywhere else. */
++static void vk_say_moved(int k, VkPhysicalDevice phys, uint32_t take, uint32_t gpu_only, uint32_t cpu_writes,
++                         uint32_t cpu_reads) {
++    static const char *const what[3] = {"GPU-only buffers", "buffers the CPU writes", "buffers the CPU reads"};
++    const uint32_t got[3] = {gpu_only, cpu_writes, cpu_reads};   /* the enum's order */
++    for (int u = COLI_VK_MEM_GPU_ONLY; u <= COLI_VK_MEM_CPU_READS; u++) {
++        const int any = pick_memtype(phys, (ColiVkMemUse)u, ~0u);
++        if (any >= 0 && (uint32_t)any != got[u])
++            fprintf(stderr, "[VK] %smemory: %s in type %u, as buffers do not take type %d, the one the properties alone "
++                    "choose (they take types 0x%x)\n", k ? "dev2 " : "", what[u], got[u], any, take);
++    }
++}
++/* The type to bind a buffer of device k to, asked for in `memtype`: that type where the buffer
++ * takes it (`take`, its memoryTypeBits), else the first it takes with the same properties
++ * (vk_allowed_memtype, in its heap first), said once per device and type (with its heap where
++ * that is another: callers count the asked type's); -1, said, when it takes none. The expert
++ * batch's scratch was bound to the B60's image-only type unchecked, which ANV let pass. */
++static int vk_bind_type(int k, VkPhysicalDevice phys, uint32_t take, uint32_t memtype) {
++    if (memtype < 32 && (take >> memtype & 1u)) return (int)memtype;
++    VkPhysicalDeviceMemoryProperties mp;
++    vkGetPhysicalDeviceMemoryProperties(phys, &mp);
++    const int t = vk_allowed_memtype(&mp, take, memtype);
++    static uint32_t said[2];
++    const uint32_t bit = 1u << (memtype & 31);
++    if (!(__atomic_fetch_or(&said[k ? 1 : 0], bit, __ATOMIC_RELAXED) & bit)) {
++        char heap[48] = "";
++        if (t >= 0 && mp.memoryTypes[t].heapIndex != mp.memoryTypes[memtype].heapIndex)
++            snprintf(heap, sizeof heap, " (heap %u, not %u)", mp.memoryTypes[t].heapIndex, mp.memoryTypes[memtype].heapIndex);
++        if (t >= 0)
++            fprintf(stderr, "[VK] %smemory: a buffer does not take memory type %u (it takes types 0x%x): type %d%s, with "
++                    "its properties, instead\n", k ? "dev2 " : "", memtype, take, t, heap);
++        else
++            fprintf(stderr, "[VK] %smemory: a buffer takes neither memory type %u nor a type with its properties (it "
++                    "takes types 0x%x): the allocation fails\n", k ? "dev2 " : "", memtype, take);
++    }
++    return t;
+ }
+ 
+ /* System RAM the device reads over PCIe (HOST_VISIBLE|HOST_COHERENT, not DEVICE_LOCAL,
+@@ -574,14 +645,15 @@ static int pick_memtype(VkPhysicalDevice phys, ColiVkMemUse use) {
+  * place (vk_dmoe.h's hybrid steps), which write-combined memory made 25 times slower
+  * (6.7 ms an expert of Qwen3.8 against 0.16); an RTX PRO 4000 reads both at the same
+  * 9.7 to 10.9 GB/s over PCIe 4.0 x8. -1 when every host-visible type is device-local (an integrated GPU,
+- * a CPU device: their tier pool is that memory already). */
+-static int pick_memtype_sys(VkPhysicalDevice phys) {
++ * a CPU device: their tier pool is that memory already). Among `take`, as pick_memtype: the pool's
++ * buffers refuse the others (pool_suballoc). */
++static int pick_memtype_sys(VkPhysicalDevice phys, uint32_t take) {
+     VkPhysicalDeviceMemoryProperties m;
+     vkGetPhysicalDeviceMemoryProperties(phys, &m);
+     int best = -1;
+     for (uint32_t i = 0; i < m.memoryTypeCount; i++) {
+         VkMemoryPropertyFlags f = m.memoryTypes[i].propertyFlags;
+-        if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) || !(f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ||
++        if (!(take >> i & 1u) || !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) || !(f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ||
+             (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) || (m.memoryHeaps[m.memoryTypes[i].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT))
+             continue;
+         if (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) return (int)i;
+@@ -602,7 +674,9 @@ static int pick_memtype_sys(VkPhysicalDevice phys) {
+  * device-local heap (the host never maps it), else that heap's device-local type
+  * (Lavapipe has one type for everything); vendor-specific types (uncached, coherent)
+  * are passed over. The staging type: host-visible and coherent, not device-local
+- * where there is one, so staging never takes the window.
++ * where there is one, so staging never takes the window. Both among `take`, the types
++ * the device's buffers take: device 0 decides before its device exists (~0u, every
++ * type) and chooses its two types again once it does (see pick_memtype).
+  * A discrete card whose host-visible device-local type is as big as its heap may still be given less of
+  * it: on an A100 80 GB (NVIDIA's 580 driver) the engine's device is given 39.75 GiB of it, mapped or not,
+  * and refused the next block while the heap says 80 GiB and VK_EXT_memory_budget 79.21. The mapped path
+@@ -615,7 +689,7 @@ static int pick_memtype_sys(VkPhysicalDevice phys) {
+ static int place_plain(VkMemoryPropertyFlags f) {
+     return !(f & (VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT | 0xC0u));
+ }
+-static int place_decide(VkPhysicalDevice phys, int mt_host, VkUp *u, int may_later) {   /* may_later: device 0 only */
++static int place_decide(VkPhysicalDevice phys, int mt_host, VkUp *u, int may_later, uint32_t take) {   /* may_later: device 0 only */
+     VkPhysicalDeviceMemoryProperties m;
+     vkGetPhysicalDeviceMemoryProperties(phys, &m);
+     VkDeviceSize dl_max = 0, hv = 0;
+@@ -630,7 +704,7 @@ static int place_decide(VkPhysicalDevice phys, int mt_host, VkUp *u, int may_lat
+     int dev = -1, any = -1, st = -1;
+     for (uint32_t i = 0; i < m.memoryTypeCount; i++) {
+         VkMemoryPropertyFlags f = m.memoryTypes[i].propertyFlags;
+-        if (!place_plain(f)) continue;
++        if (!place_plain(f) || !(take >> i & 1u)) continue;
+         int big = (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && m.memoryHeaps[m.memoryTypes[i].heapIndex].size == dl_max;
+         if (big && any < 0) any = (int)i;
+         if (big && !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && dev < 0) dev = (int)i;
+@@ -827,8 +901,10 @@ static int alloc_buf_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void *
+     VKCHECK(vkCreateBuffer(G.dev, &bi, NULL, buf), "vkCreateBuffer");
+     VkMemoryRequirements req;
+     vkGetBufferMemoryRequirements(G.dev, *buf, &req);
++    const int mt = vk_bind_type(0, G.phys, req.memoryTypeBits, memtype);
++    if (mt < 0) { vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; *mem = VK_NULL_HANDLE; return 0; }
+     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+-        .allocationSize = req.size, .memoryTypeIndex = memtype};
++        .allocationSize = req.size, .memoryTypeIndex = (uint32_t)mt};
+ #ifdef VK_EXT_memory_priority
+     VkMemoryPriorityAllocateInfoEXT pri = {.sType = VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT,
+         .priority = G.prio};
+@@ -1204,7 +1280,7 @@ int coli_vk_init(const char *spv_path) {
+      * its queues: a transfer-only family (a copy engine), else a spare queue of a family
+      * already asked for, else the main queue, shared under g_qmx[0]. */
+     uint32_t up_fam = G.qfam, up_idx = 0; int up_shared = 1;
+-    if (place_decide(G.phys, pick_memtype(G.phys, COLI_VK_MEM_CPU_WRITES), &g_up[0], 1) || g_up[0].later) {
++    if (place_decide(G.phys, pick_memtype(G.phys, COLI_VK_MEM_CPU_WRITES, ~0u), &g_up[0], 1, ~0u) || g_up[0].later) {
+         uint32_t t = UINT32_MAX;
+         for (uint32_t i = 0; i < nq && t == UINT32_MAX; i++)
+             if ((qf[i].queueFlags & VK_QUEUE_TRANSFER_BIT) && qf[i].queueCount &&
+@@ -1448,11 +1524,17 @@ int coli_vk_init(const char *spv_path) {
+     }
+     if (!G.dev)
+     VKCHECK(vkCreateDevice(G.phys, &di, NULL, &G.dev), "vkCreateDevice");
+-    vk_mem_device(0, G.phys, G.dev);   /* the device memory books, and COLI_VK_DEVICE_CAP_MB */
++    /* the types the device's buffers take: every memory type below is one of them (the
++     * retries' too), and the uploader's two, chosen before the device existed, are chosen
++     * again among them */
++    const uint32_t take = vk_buffer_types(G.dev, G.has_bda);
++    vk_mem_device(0, G.phys, G.dev, take);   /* the device memory books, and COLI_VK_DEVICE_CAP_MB */
+     vk_pool_blocks(0);
+     vkGetDeviceQueue(G.dev, G.qfam, 0, &G.queue);
+     vkGetDeviceQueue(G.dev, G.tq_fam, G.tq_idx, &G.tqueue);
+     G.tq_shared = G.tqueue == G.queue;
++    if (g_up[0].on || g_up[0].later)
++        place_decide(G.phys, pick_memtype(G.phys, COLI_VK_MEM_CPU_WRITES, take), &g_up[0], 1, take);
+     if (g_up[0].on || g_up[0].later) {
+         VkUp *u = &g_up[0];
+         u->dev = G.dev; u->fam = up_fam; u->shared = up_shared;
+@@ -1484,12 +1566,13 @@ int coli_vk_init(const char *spv_path) {
+         fprintf(stderr, "[VK] VRAM pressure-proofing: memory_priority %s, memory_budget %s\n",
+                 G.has_prio ? "on" : "absent", G.has_budget ? "on" : "absent");
+ 
+-    int mt = pick_memtype(G.phys, COLI_VK_MEM_CPU_WRITES);
++    int mt = pick_memtype(G.phys, COLI_VK_MEM_CPU_WRITES, take);
+     if (mt < 0) { fprintf(stderr, "[VK] no host-visible memory\n"); return 0; }
+     G.memtype = (uint32_t)mt;
+-    G.memtype_cached = (uint32_t)pick_memtype(G.phys, COLI_VK_MEM_CPU_READS);
+-    G.memtype_dev = (uint32_t)pick_memtype(G.phys, COLI_VK_MEM_GPU_ONLY);
+-    G.memtype_sys = pick_memtype_sys(G.phys);
++    G.memtype_cached = (uint32_t)pick_memtype(G.phys, COLI_VK_MEM_CPU_READS, take);
++    G.memtype_dev = (uint32_t)pick_memtype(G.phys, COLI_VK_MEM_GPU_ONLY, take);
++    vk_say_moved(0, G.phys, take, G.memtype_dev, G.memtype, G.memtype_cached);
++    G.memtype_sys = pick_memtype_sys(G.phys, take);
+     {   /* COLI_VK_TIER_HOST=1 on a device that shares the host's RAM (tests): the host pool in
+          * its host-visible type, the same memory as the tier's pool, the same paths as on a card */
+         const char *e = getenv("COLI_VK_TIER_HOST");
+@@ -1651,6 +1734,7 @@ int coli_vk_init(const char *spv_path) {
+     if (G.gemm_min_s) fprintf(stderr, ", tiled GEMM from S=%d%s%s", G.gemm_min_s,
+                               G.gemm_min_so ? " and S*O>=4096" : "", G.pipe_coop[0] ? " (cooperative matrix)" : "");
+     if (g_up[0].on) fprintf(stderr, ", staged uploads");
++    if (G.pin_sg) fprintf(stderr, ", subgroups of %d", G.pin_sg);   /* vk_pin_sg: pinned, not the compiler's pick */
+     fprintf(stderr, "\n");
+     return 1;
+ }
+@@ -3094,8 +3178,10 @@ static int alloc_hostvis_d2(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, vo
+     VKCHECK(vkCreateBuffer(G2.dev, &bi, NULL, buf), "d2 vkCreateBuffer");
+     VkMemoryRequirements req;
+     vkGetBufferMemoryRequirements(G2.dev, *buf, &req);
++    const int mt = vk_bind_type(1, G2.phys, req.memoryTypeBits, memtype);
++    if (mt < 0) { vkDestroyBuffer(G2.dev, *buf, NULL); *buf = VK_NULL_HANDLE; *mem = VK_NULL_HANDLE; return 0; }
+     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+-        .allocationSize = req.size, .memoryTypeIndex = memtype};
++        .allocationSize = req.size, .memoryTypeIndex = (uint32_t)mt};
+     VKCHECK(vkAllocateMemory(G2.dev, &ai, NULL, mem), "d2 vkAllocateMemory");
+     VKCHECK(vkBindBufferMemory(G2.dev, *buf, *mem, 0), "d2 vkBindBufferMemory");
+     if (ptr) VKCHECK(vkMapMemory(G2.dev, *mem, 0, bytes, 0, ptr), "d2 vkMapMemory");
+@@ -3201,14 +3287,16 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
+     if (G2.pin_sg && !vk_create_device_pinned(G2.phys, &di, &G2.dev)) G2.pin_sg = 0;
+     if (!G2.dev)
+     VKCHECK(vkCreateDevice(G2.phys, &di, NULL, &G2.dev), "d2 vkCreateDevice");
+-    vk_mem_device(1, G2.phys, G2.dev);
++    const uint32_t take = vk_buffer_types(G2.dev, 0);   /* the types its buffers take: no addresses on this device */
++    vk_mem_device(1, G2.phys, G2.dev, take);
+     vk_pool_blocks(1);
+     vkGetDeviceQueue(G2.dev, G2.qfam, 0, &G2.queue);
+-    int mt = pick_memtype(G2.phys, COLI_VK_MEM_CPU_WRITES);
++    int mt = pick_memtype(G2.phys, COLI_VK_MEM_CPU_WRITES, take);
+     if (mt < 0) { fprintf(stderr, "[VK] dev2: no host-visible memory\n"); return 0; }
+     G2.memtype = (uint32_t)mt;
+-    G2.memtype_cached = (uint32_t)pick_memtype(G2.phys, COLI_VK_MEM_CPU_READS);
+-    G2.memtype_dev = (uint32_t)pick_memtype(G2.phys, COLI_VK_MEM_GPU_ONLY);
++    G2.memtype_cached = (uint32_t)pick_memtype(G2.phys, COLI_VK_MEM_CPU_READS, take);
++    G2.memtype_dev = (uint32_t)pick_memtype(G2.phys, COLI_VK_MEM_GPU_ONLY, take);
++    vk_say_moved(1, G2.phys, take, G2.memtype_dev, G2.memtype, G2.memtype_cached);
+     {   /* the expert batch's limits on this device, as coli_vk_init reads them for G */
+         VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(G2.phys, &pp);
+         G2.ssbo_align = (size_t)pp.limits.minStorageBufferOffsetAlignment;
+@@ -3229,7 +3317,7 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
+         }
+     }
+     /* its experts as device 0's: staged uploads by the same rule, on its one queue */
+-    if (place_decide(G2.phys, mt, &g_up[1], 0)) {
++    if (place_decide(G2.phys, mt, &g_up[1], 0, take)) {
+         VkUp *u = &g_up[1];
+         u->dev = G2.dev; u->q = G2.queue; u->fam = G2.qfam; u->shared = 1;
+         u->fams[0] = G2.qfam; u->nfams = 1;
+diff --git a/c/qwen36_chain.h b/c/qwen36_chain.h
+index de86056f..d0e11153 100644
+--- a/c/qwen36_chain.h
++++ b/c/qwen36_chain.h
+@@ -99,7 +99,7 @@ typedef struct {
+     int rows;                                  /* scratch capacity in rows */
+     int cap;                                   /* positions the mirrors hold (q36c_mirror: grown with the context, at most kv_cap) */
+     int host_cap;                              /* the host's kv_cap when they were planned (its sliding layers' form) */
+-    size_t keep;                               /* the device memory a mirror of Q36C_KV_START positions leaves free (q36c_mirror) */
++    size_t keep;                               /* what the KV mirror leaves free before the prompt scratch exists (q36c_mirror) */
+     int dev_rows;                              /* device KV rows a layer: cap, or the split's */
+     int kvh, kvh_set;                          /* the mirrors in float16 (q36c_kvh_want), decided at the first */
+     VkcKvSplit ks;                             /* the split past the device's budget (ks.on) */
+@@ -529,7 +529,10 @@ static void q36c_start(Model *m) {
+     int n = vkc_fit("qwen36", L, per, mat, fixed, tail, &g_q36c_fit);
+     /* the chain's pipelines now, after the fit read the free memory: nothing of it was on
+      * the device before (vkc_init's own buffer counts in the pools' share) */
+-    if (n > 0 && !vkc_init()) { g_vk_chain = 0; free(per); free(mat); return; }   /* no chain after all: no fit, as before */
++    if (n > 0 && !vkc_init()) {   /* no chain after all: no fit, as before */
++        fprintf(stderr, "[VK] qwen36 chain: the primary device's pipelines did not come up; the dense chain stays off\n");
++        g_vk_chain = 0; free(per); free(mat); return;
++    }
+     g_q36c_fit_on = 1;
+     /* the layers the primary leaves, on COLI_VK_DEV2's device: a fit of its own from layer
+      * n, with that device's free memory (the tier there sizes itself after the placement) */
+@@ -718,7 +721,8 @@ static size_t q36c_late_bytes(Model *m, int ctx) {
+         if (c->is_attn[i]) kv += row * (size_t)(R && c->win_layer && c->win_layer[i] ? R : ctx);
+     return kv > half ? half : kv;
+ }
+-/* Plan and allocate the KV mirror before sizing a prompt chunk: positions [0, need) of the one
++/* Plan and allocate the KV mirror before sizing a prompt chunk (a first mirror past Q36C_KV_START
++ * sizes the first chunk itself, before it: keep, below): positions [0, need) of the one
+  * conversation the chain holds. The mirror grows with the context to what the step needs and
+  * an eighth more (1024 at least), rounded to 1024, at most the context, its rows again from
+  * the host. Doubling gave the tier's experts back for positions no step reached: to 32768
+@@ -760,13 +764,38 @@ static int q36c_mirror(Q36Chain *ch, Model *m, int need) {
+     /* the full layers' rows past Q36C_KV_START come out of the tier where the device lacks
+      * them, so a long conversation's prompt chunks are the size a short one's are: once the
+      * prompt scratch exists, what it lacks for a chunk of the most rows stays free (and a
+-     * margin); before that, the memory free beside a mirror of that start (keep, measured at
+-     * the first). Keeping all of it took 512 MiB of Qwen3.6's experts for 240 MiB of mirror at
+-     * 4K on an RTX PRO 4000 whose budget left 2.36 GiB unused (1805 against 773 tok/s) */
++     * margin); before that, the memory free beside a mirror of that start, or only the first
++     * chunk's beside a longer first mirror (keep, decided at the first). Keeping all of it took
++     * 512 MiB of Qwen3.6's experts for 240 MiB of mirror at 4K on an RTX PRO 4000 whose budget
++     * left 2.36 GiB unused (1805 against 773 tok/s) */
+     size_t want = (size_t)nf * cap * row, more = want > held ? want - held : 0;
+     if (!ch->keep) {
+         const size_t start = (size_t)nf * (top < Q36C_KV_START ? top : Q36C_KV_START) * row, av = vkc_dev_avail() + held;
+         ch->keep = av > start + Q36C_KV_MARGIN ? av - start : Q36C_KV_MARGIN;
++        /* a first mirror past the start keeps free only the first chunk's scratch, the room the tier leaves on
++         * the primary for staging host pool experts, and the margin, never more than before. Keeping all the
++         * room past the start took the rows past Q36C_KV_START from the expert tier for the rest of the process
++         * (the tier lowers its maximum): an Arc Pro B60 with Qwen3.6's 18 GiB tier, a 16K-token first prompt,
++         * 78 experts out, that prompt 74.4 -> 88.6 s, decode 35 -> 24-30 tok/s after it. The chunk's rows are
++         * decided here, before the mirror (vkc_chunk_rows decides them once; or COLI_VK_CHAIN_ROWS): a chunk's
++         * room kept with its rows decided after that mirror took no expert (74.2 s, decode 35.1-35.4 tok/s),
++         * but the process's chunks came out 4608 rows against 4864. A short first request decides them after
++         * its own mirror, as before, so a long one's can come out up to half that mirror bigger (at most one
++         * 256-row step on the B60). Only where the device reports its budget (without it vkc_dev_avail counts
++         * the tier's blocks as free) and the whole mirror and the margin fit in the half of the free memory a
++         * chunk leaves (that memory as vkc_chunk_rows reads it: at most what RAM has, which holds the mirror too
++         * on a device that shares it); past that all the room stays, as before: a chunk decided before the
++         * mirror would not fit beside it where the tier gives nothing back (no tier; the second device, whose
++         * vkt_give_back empties the primary's blocks) */
++        double used = 0, bud = 0;
++        if (want > start && coli_vk_mem_budget_dev(vkc_device_now(), &used, &bud)) {
++            const double ram = compat_mem_available_gb() * 1e9;
++            const size_t stage = ch->d ? 0 : vkt_stage_room(), fb = ram > 0 && ram < (double)av ? (size_t)ram : av;
++            if (fb > stage && (size_t)leq * cap * row + Q36C_KV_MARGIN <= (fb - stage) / 2) {
++                const size_t first = (size_t)q36c_chunk_rows(ch, m) * q36c_chunk_row_bytes(ch, m) + stage + Q36C_KV_MARGIN;
++                if (first < ch->keep) ch->keep = first;
++            }
++        }
+     }
+     size_t keep = ch->keep;
+     if (ch->rows > 0) {
+diff --git a/c/shaders/chain_attnb.comp b/c/shaders/chain_attnb.comp
+index 4ff4b171..0469dcbf 100644
+--- a/c/shaders/chain_attnb.comp
++++ b/c/shaders/chain_attnb.comp
+@@ -33,8 +33,21 @@
+ // decode row's thousands of positions over many workgroups; the chunks are fixed by
+ // position, so the bits still are the row's own).
+ // Limits: hd, vd <= 256.
++// HDC and VDC (constants 1 and 2; 0: the push constants') fix K's and V's head dims in the
++// pipeline (vk_chain.c's kab_pipe, a pipeline a shape): a lane's loops over its dims then
++// stop where its dims do, without testing each dim against p.hd (on an Arc Pro B60 each
++// tested term was a shared-memory read of its own: 45 spills, and a 255-row chunk of
++// Qwen3.6 at 16K positions took 185.1 ms; fixed, 3 spills and 25.7 ms). The q.k partial is
++// then summed as fused multiply-adds in order (precise), the arithmetic the tested sum
++// compiles to on ANV and Lavapipe: left to the compiler, the untested sum rounded otherwise
++// on ANV (825,758 of 1,044,480 outputs differed in their last bits). VEC (constant 3)
++// stages K and V a uvec4 (8 halves) a load, every load of a tile before its stores: a
++// float16 cache, head-major, no ring and no list, k_off, v_off, HDC and VDC multiples of 8.
+ layout(local_size_x = 256) in;
+ layout(constant_id = 0) const int BC = 8;
++layout(constant_id = 1) const int HDC = 0;
++layout(constant_id = 2) const int VDC = 0;
++layout(constant_id = 3) const bool VEC = false;
+ 
+ layout(std430, binding = 0) readonly buffer QB { float q[]; };
+ layout(std430, binding = 1) readonly buffer KB { float kc[]; };
+@@ -42,6 +55,8 @@ layout(std430, binding = 2) readonly buffer VB { float vc[]; };
+ layout(constant_id = 7) const bool KV16 = false;   // K and V float16, two a word (vk_chain.c's vkc_attn_h)
+ layout(std430, binding = 1) readonly buffer KBH { uint kch[]; };
+ layout(std430, binding = 2) readonly buffer VBH { uint vch[]; };
++layout(std430, binding = 1) readonly buffer KB4 { uvec4 kc4[]; };   // VEC
++layout(std430, binding = 2) readonly buffer VB4 { uvec4 vc4[]; };
+ float kf(int i) { return KV16 ? unpackHalf2x16(kch[i >> 1])[i & 1] : kc[i]; }
+ float vf(int i) { return KV16 ? unpackHalf2x16(vch[i >> 1])[i & 1] : vc[i]; }
+ layout(std430, binding = 3) buffer OB { float o[]; };
+@@ -71,6 +86,7 @@ shared int   tpos[BC];            // the tile's positions (-1: none)
+ void main() {
+     int tid = int(gl_LocalInvocationID.x);
+     int pair = tid >> 3, lane = tid & 7;
++    int HD = HDC > 0 ? HDC : p.hd, VD = VDC > 0 ? VDC : p.vd;
+     int kvh = int(gl_WorkGroupID.x);
+     int G = p.H / p.KVH;
+     int s0 = int(gl_WorkGroupID.y) * p.br;
+@@ -82,7 +98,7 @@ void main() {
+     int qb = p.q_off + s * p.q_row + h * p.q_seg;
+     for (int i = 0; i < 32; i++) {
+         int d = lane + 8 * i;
+-        qv[i] = live && d < p.hd ? q[qb + d] : 0.0;
++        qv[i] = live && d < HD ? q[qb + d] : 0.0;
+         av[i] = 0.0;
+     }
+     // the block's positions: the union of its rows' ranges, or the one row's list
+@@ -119,32 +135,69 @@ void main() {
+         }
+         barrier();
+         // the tile's keys and values into shared memory, once for every pair
+-        for (int x = tid; x < BC * p.hd; x += 256) {
+-            int j = x / p.hd, d = x - j * p.hd, t = tpos[j];
+-            float kv = 0.0;
+-            if (t >= 0) {
+-                int rr = p.ring > 0 ? t % p.ring : t;
+-                kv = kf(p.k_off + (p.kv_pm != 0 ? rr * p.KVH + kvh : kbase + rr) * p.hd + d);
++        if (VEC) {   // the tile's positions are bfirst + t0 + j, its rows whole uvec4s
++            const int NW = (BC * 32 + 255) / 256;
++            int K8 = HD / 8, V8 = VD / 8;
++            uvec4 kw[NW], vw[NW];
++            for (int c = 0; c < NW; c++) {
++                int x = tid + 256 * c, j = x / K8, d8 = x - j * K8;
++                kw[c] = uvec4(0);
++                if (x < BC * K8 && t0 + j < n) kw[c] = kc4[(p.k_off + (kbase + bfirst + t0 + j) * HD) / 8 + d8];
++                j = x / V8; d8 = x - j * V8;
++                vw[c] = uvec4(0);
++                if (x < BC * V8 && t0 + j < n) vw[c] = vc4[(p.v_off + (kbase + bfirst + t0 + j) * VD) / 8 + d8];
+             }
+-            ks[j * 256 + d] = kv;
+-        }
+-        for (int x = tid; x < BC * p.vd; x += 256) {
+-            int j = x / p.vd, d = x - j * p.vd, t = tpos[j];
+-            float vv = 0.0;
+-            if (t >= 0) {
+-                int rr = p.ring > 0 ? t % p.ring : t;
+-                vv = vf(p.v_off + (p.kv_pm != 0 ? rr * p.KVH + kvh : kbase + rr) * p.vd + d);
++            for (int c = 0; c < NW; c++) {
++                int x = tid + 256 * c, j = x / K8, d8 = x - j * K8;
++                if (x < BC * K8) {
++                    int o = j * 256 + d8 * 8;
++                    vec2 a0 = unpackHalf2x16(kw[c].x), a1 = unpackHalf2x16(kw[c].y), a2 = unpackHalf2x16(kw[c].z), a3 = unpackHalf2x16(kw[c].w);
++                    ks[o] = a0.x; ks[o + 1] = a0.y; ks[o + 2] = a1.x; ks[o + 3] = a1.y;
++                    ks[o + 4] = a2.x; ks[o + 5] = a2.y; ks[o + 6] = a3.x; ks[o + 7] = a3.y;
++                }
++                j = x / V8; d8 = x - j * V8;
++                if (x < BC * V8) {
++                    int o = j * 256 + d8 * 8;
++                    vec2 a0 = unpackHalf2x16(vw[c].x), a1 = unpackHalf2x16(vw[c].y), a2 = unpackHalf2x16(vw[c].z), a3 = unpackHalf2x16(vw[c].w);
++                    vs[o] = a0.x; vs[o + 1] = a0.y; vs[o + 2] = a1.x; vs[o + 3] = a1.y;
++                    vs[o + 4] = a2.x; vs[o + 5] = a2.y; vs[o + 6] = a3.x; vs[o + 7] = a3.y;
++                }
++            }
++        } else {
++            for (int x = tid; x < BC * HD; x += 256) {
++                int j = x / HD, d = x - j * HD, t = tpos[j];
++                float kv = 0.0;
++                if (t >= 0) {
++                    int rr = p.ring > 0 ? t % p.ring : t;
++                    kv = kf(p.k_off + (p.kv_pm != 0 ? rr * p.KVH + kvh : kbase + rr) * HD + d);
++                }
++                ks[j * 256 + d] = kv;
++            }
++            for (int x = tid; x < BC * VD; x += 256) {
++                int j = x / VD, d = x - j * VD, t = tpos[j];
++                float vv = 0.0;
++                if (t >= 0) {
++                    int rr = p.ring > 0 ? t % p.ring : t;
++                    vv = vf(p.v_off + (p.kv_pm != 0 ? rr * p.KVH + kvh : kbase + rr) * VD + d);
++                }
++                vs[j * 256 + d] = vv;
+             }
+-            vs[j * 256 + d] = vv;
+         }
+         barrier();
+-        // the partial dot products of this lane's query dims with the tile's keys
++        // the partial dot products of this lane's query dims with the tile's keys (HDC: in
++        // order, a fused multiply-add a term, as the tested sum compiles on ANV)
+         for (int j = 0; j < BC; j++) {
+             float a = 0.0;
+-            for (int i = 0; i < 32; i++) {
+-                int d = lane + 8 * i;
+-                if (d < p.hd) a += qv[i] * ks[j * 256 + d];
+-            }
++            if (HDC > 0) {
++                precise float f = 0.0;
++                for (int i = 0; i < 32; i++)
++                    if (HDC % 8 == 0 ? 8 * i < HDC : lane + 8 * i < HDC) f = fma(qv[i], ks[j * 256 + lane + 8 * i], f);
++                a = f;
++            } else
++                for (int i = 0; i < 32; i++) {
++                    int d = lane + 8 * i;
++                    if (d < p.hd) a += qv[i] * ks[j * 256 + d];
++                }
+             part[(pair * 8 + lane) * BC + j] = a;
+         }
+         barrier();
+@@ -172,7 +225,7 @@ void main() {
+             sum += w;
+             for (int i = 0; i < 32; i++) {
+                 int d = lane + 8 * i;
+-                if (d < p.vd) av[i] += w * vs[j * 256 + d];
++                if (VDC % 8 == 0 && VDC > 0 ? 8 * i < VDC : d < VD) av[i] += w * vs[j * 256 + d];
+             }
+         }
+         l = l * corr + sum;
+@@ -180,13 +233,13 @@ void main() {
+         barrier();
+     }
+     if (!live) return;
+-    int ob = p.o_off + s * p.o_row + h * p.vd;
++    int ob = p.o_off + s * p.o_row + h * VD;
+     if (p.part != 0) {   // the part (a chunk's, with g_off), for the merge (or the join)
+         int z = p.g_off > 0 ? int(gl_WorkGroupID.z) : 0;
+         int obz = ob + z * p.g_row, sb = p.st_off + z * p.g_seg + (s * p.H + h) * 2;
+         for (int i = 0; i < 32; i++) {
+             int d = lane + 8 * i;
+-            if (d >= p.vd) break;
++            if (d >= VD) break;
+             o[obz + d] = av[i];
+         }
+         if (lane == 0) { o[sb] = m; o[sb + 1] = l; }
+@@ -196,7 +249,7 @@ void main() {
+     int gb = p.g_off + s * p.g_row + h * p.g_seg;
+     for (int i = 0; i < 32; i++) {
+         int d = lane + 8 * i;
+-        if (d >= p.vd) break;
++        if (d >= VD) break;
+         float v = av[i] * inv;
+         if (p.has_gate != 0) v *= 1.0 / (1.0 + exp(-gt[gb + d]));
+         o[ob + d] = v;
+diff --git a/c/shaders/chain_attnb.spv b/c/shaders/chain_attnb.spv
+index d44043853f85a3eba7dfb95ec7f0f66132ed79b2..ca949b8824056a5e8da479f571157ca75541f145 100644
+GIT binary patch
+literal 34132
+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
+F{69J{14RG;
+
+literal 25624
+zcmbuHcbrz$wT3@nKokptVnYRcuh?R5fQqpOjcpu;HZlS-IQD`CYhv#j6?-o!8cQ_x
+zsL{j}lb9$b25W4Iz1`>ezVqVF_q%`Hdu0FCyWX|-T5FfH&zZwWub#`#Q|sNM)~~ie
+zZT*&7{aU!zv(^LDuhyq7M~vEI)LLEB$F4POgLQORu-2>Yr_VyQLABmUyB^%uF<HZs
+zwAE>w(1z1?rM1$=)1IPDrQ@lzyJ<su)@n!4?x1}|dyde{5UfABjkz$*BKT8py~vGQ
+z?GcEU+I+PUqgqGovdf53+qbq)o!Z(p{fN$St(_f{$F+{_m^Q9`dPny-{rVPu9h2KT
+z4;@=N^v0vCU%ekWCXHXEW8F<_jIS4&YPAlUwgr*hg>8YtX1zO&UUx%8z2D;M+l;J_
+zM(j1IePZ3_Jb4*^Rpd_F)arg>uSx9<n{(-<-$uyMRXnj*cNNe1_R?=V<mf7%*sHsW
+z=bCuww=;5j$5?RR`Z`VMY#lYFy{&VH$=!(Q9aARnQ19-zN8>xStz%lFZ%b_-Kxf-z
+zX1EdS0OX`@$JVF5-o)B#%Ct!%rcF6?s!_~G3AGWG|5&7Z!<80$?Lmv~nvX1W*L|na
+zjk(mHtx}r^=)-^NEwrgqx?0Dyb=7N19QS8?+f=-I*ZumSAJRHyy!$cSJaul`l*0<H
+zZ=LHJH=*F>1y5+|>)x2q`rm!sKNDKhw^85xa1-0QS|_wkuj*^m<Nle_6w^I6r77k@
+za9!g%>z=8*f5n+SoO`f~H8e@M0pLkZIR?UY&*d6xun62?+{Wp*DEhRH$xZ=W!)Fk<
+zyFTxY`WHi=)ZIGu;JQzPbFX)GOrC_GUt|1BR9uyEZanXUG3=_uUkaVAi{6Me7~D3w
+zed3h5PlH<;Zfe`K>4>?0%YeJ4H=?`OT;HiQu?JJvIt}a^yNTtGLOM9{3}jawx721L
+zJL{)M!*(wE#Ja6l?PBC1V;cMo;KsSot9B>YeQ2zE_33WlC&0T^_oCSA5So6ThhE|r
+zkZtuoEwvZHU7c-R4p7@{Bzqg&Qkw%F-!ZMSwbVXFA5#(f_T|QLyyE`gag)8jTWTwU
+z$EZ}cVd&dz+wj{0++NMkaPhkGEwz2YogMX5^?3WMS7YzguZlGpJgOR_*o(bd@8fyz
+zWj#lM-6!Ii;6187Vy`Z?j5ePSUgGn>opsz&y97L`y1}(wi9Wrm`&MvcEn4c&mg!Dd
+z72|nqhgbL|@Ie)x4bGaq4$geP4W3l3-}~TcY#8Tb$)5Fn*OoE({F+1-YgrAP92<d?
+zV>57aYzt0~5#a7B$0%@eOb4^K=jQPF*j?o~0i3v}gWIZcoB_^0JP+K+*HVA3=035;
+z`-}dMfm6#<;4T(ZpO?Xj`wG~bSl;JzSNpU&?!)1GFoTuv3vSfJ{D9l1IFg2KS@f<$
+z53c(S0jI`w=Jx4T+gP9WhW~b8?@!~70>^((aOUtB@RTtPpL4)RR{mGi`6KInuLE~g
+zKKFnV=OJ+7JPY1so5r~#_L@R7x9=fd;@7|(le_EqUGRh|?iccvPp_75<1PedS?m6T
+z!6T|1Vy_8Ix^aEa@fyLt^2}zN)#j;m&(uCNT}I%$II<^gB#hWgIg&`xm#?!8f6r8T
+zV~dB<j30eDu$THO$THWe=*cDaO0MW-F5gd*OI+qsFLP~(Ugp{eJ-NhQ$rZiK<vUJt
+ziOpqy$Dv;4+7`XcwO!@w9E!b?D|(r0cx5-XxXh(q=Gqm#AI)c%{=V<3JNK^NSY%_I
+zjpr9?ExBAn?XHhp3oV>|<a`$i*Q?@up9p6k{rVT2?>%yh6rA%RmvNidJtyaLHu20S
+zH>BX^t+*8mZoZ0h52df;w(lARXRUG^)pPxP?~xl;aK87*ZCr4^_sDHlaE?=MtAg_$
+zlH0D}22|Y0f*V+IqYBPBvajoyaro{dw`ai(s<^!i&U;nA{R+<cl{>KDeE*Si&XdFa
+zAvdw$+(UAm1?SqxO)WUzf#jwaobNz#htu4Lk0V|4mb%`n_5`xA4_oROb?#o!=4F2`
+z_w7?i$6_q8_kdUQ<r->T_kF@W?4|u+lrp#P1<9Rv1Y<iF(aYSvHzc=sD8BA#W2=|B
+zPew0u`96_cdACTe=w&Y7H<C*{lsv{WmwK7&nO^^$%V$R;SMOS$Bj3husXt4Mhg&_K
+z&z3UYQY=ncyU&T#o@YjCkN$1^#&aaK`%E!cW4&AI&zLgTdKkPv-HQXsVxFN?W^Lj{
+z>1i!PXbc<KQa>L&Bjg9+*|*NyuchXhpssxpB6we}i;vR#(f;0p+VwNO_s|fU*V6cU
+z|Hv%^b{y*VvqsMixlJqG`$cYbbnEe6@rv#}(Sv6HWs&+Cdogt9!5SQ=c~_})^ZHy<
+zx8G_=`^lMCef5gdzGj7uWt<I>so!Uox_%oYjU#6qb)Qjk_S+U|4D)Y?RJY&uNPXn&
+zr#`&m9LIOT=5x*T-v!x&Ca=G`=a`)HqVH}rFa38%YLm~r?F}|wbk8!^Eb)Av*=HG6
+zeJs+s|Nl0}{(p(#7{<}py=N`fs6M{pv`?t8@iQjhQC<7YiSK%uBmMkg!Tn|blaY?!
+zeVqQ6fXjHZ&>chUw}XdNx^w%}N*_$TpMmvla4ofaz{Zz%FFcOSUU&kmZXHh|-3xM#
+zQ~jxmGp~J~r+KB0SHUfX{yNy_TkHdSnDbkGNp$a{*q1@~d9xl-9IxlPd1Buf-MLqH
+zoLizhud6W*=W9Ro_#OZ*=Ws0gLijl5JRjWup8x8Oc?!}o%Q<Fs&wDxT(<*Fjt5!LW
+zgiFq&!JZlB@VStA_1srC#wkeS$(cjlb6zfSPDA$$Qa8pq=yUFB`zHED=(XDMTgLw~
+z^xiP8_nqL(o%!xUcTMEYr|$R9a-E(=|AtHdXDgdAjPE=@2iKRDd>?>)M~VIox@T?l
+zo-B%IY4pJ^5<bJI%(zRVpM-RMwORKvNXM$pI+jIRqr7#i52-lqD^<AMAM3$cZ}RSg
+z?mJiVcB41vJq*qm+KhWR(!BEKRrlv$xx~2@-8j}>9|P9gz{b&LoZFH1kvERI-<su8
+z-$&?qR(%Y1ZyO_dK8G`p_jmGq0jG~P^L&Xkro4I7{du{}b1Vm}@4U%-0{Vi5eigd!
+z)3INV?)zNyo6&uCyRUr*F~9eY?;PsZ@oS`eSk5}secvee^`aD|ZXDk|632H7b>l2u
+z`N$bZ-FJ(`aedcCul4Xfzfb+y<GY2N=c;W(?gplS-i?bgYM;V*j~LVQZ)ch^`sgNo
+zpC<i)CcV8$pWLJ$)}$ZRq|Yeylfg3!-MY?g(l2h(Z)no*EOgKKdkfur^N~W={z9Rf
+z@5Ls4c9TA*Nq@UZ|F}v2yh-=`DCfI>lkPXd((ZS`QXgLE&X?Z@OS|6(OWkjT(H+0v
+z|4RLYCf#p+u`B)FSL%N6D|Ns5mHItR`u$D1-vLYimzwn1O}gI%<8S?b7mTiaze)e7
+zN$<lAQ2P7*u+;r#Sn7T^EcMNrbiW_QZascOjIQ)MVyW-iq#xL%`>nC`_xoaW<NJ*<
+zy3+5ArS7-JQuq5}sr!vFy7BzZSn7UjjIQ*1V|4xf&KO<kx5nt&{oYvWes7Gf9MYuw
+z-7$9i`|YvR{r(tTIjTwbJ7j71TV$#GJ+jm<Xwv;gS=#+hS?YePEOozEMz>zSMV9*O
+zg)Z;+$=H>Cqb&7a9LCX&=eJ7rtvQu<NA5w}mFCY2n{!5c&inmC{%CaH8@^X@Tk!nw
+z{8raj+g>!eM~SEY{fhJF3;jLc<>J3DSpO$0|NX&o{`{f8=f7O)I}q&8B4vGT=<=y=
+z3|P+oJ}=bmKLI(BHlF7DZ))hM`1nk!eEfMKKAm9sQ>r=-2HQ{GJncxi)HxMwojwPR
+z;XEEflTV$~DlU2bj$>{99Fn|;g5^)D@^*vmCvRS#cXIJR9PAuNKLTuRsryK<KJxZI
+z3@I1?qrqkWW6<@9{aCQ^QqOT<edJH5YCIln9Bt<CnR`4fF-`zmck~m%<~Y9Ue-c<9
+zdHc^m%EkW_u>P61Q^C#ib{d@gUBv8<Je_7g`A>*>CerJ3)<)YIG&$c-#L4vou=$hg
+zhhTFpMT^f_VEN=a8*D%M&xn_}%8$6)tmhn>d3_hs-<*zhCQ@5sp9gjiM?W82&i@7I
+z`pC!ULU3cw8~5Nv==#Z<<6NX%#&jvzF<nASjLX3C(Ju#=^Kb>aeY{WO^CPf)_QsW9
+z`^jf*uL2ueTl!rMwx-l`4cOSTXz{rgET7odf$b-s*w=%vqG@xS7bE4wHy~Xz*W*T{
+z>#Y2k^}iW;3(ZUWtw`<4<i8DUjI8k;V7c3A?jiM?XvVUyIDPK|?^Eb^gN>E3{21(5
+z<ujI_fbFNv`tL-_CFak;#!z=Z-A9{Ab8kO@^s+Ab`)P94B~FY7!N$$J{{rm1dsfHi
+zA+UVL{V>>m^3GM_DzmqL2{x~D@G#As*7X?D%ewS=l=d9Wy2Q!(E3j)9{b{guW^SGV
+z>m$E4Pnk85&(fZvxyIV<+ZXw3nl|U~kxI92Yca3+V|yN4+Vn}B-+=A!Tn#|}mUb`A
+zb+Es>KB@V4VAm)9zX!iSlh<E8`P_TfqD=okfbE|#{}C*=G|m3n<g7RQ*}a$ke*#aY
+zWo`cqc5S<8@%al_J~>_j+fP3I{tC9A^O}Bt1Iy3PS=I;nGOY(~WtuUx=UMOySbOSz
+z5iFPZe+L`?Ra)Zz11ul?HSi2t>ij2IA9?3uHc~Dz-vAr)by{M)36{UDdLFz5mUCS0
+z&3_@i+?(3oq5X&Ex`-3!UGQvLa=iy`&h<W=eCFT-u>IsSh7ZB=&P(R;-(cr)HJWwl
+z<M`f2YICiv)0(U;HhoK*KB@O3u>JL&gH%uLpMaZd{}fI>^Yj^5F7xyy*vom+_64mE
+zMO%|NvA+TvyIj|=(dARyH(>W@=ETA4BcC`u;F@df2`8WV?FF{4d}6hL<;(f)jn1FB
+z^Q({Z@;RI~=g{#v7RMA@<~KHF#xM_l_Sg4gq<U(f7u-At^TElde?PGIMCzU&T_5>y
+z3xMSvOZqK{ZobUHLg@O*TZ=#E%f)|T@a!Vb0CYKH>hE^|xzxT0*xLP8oEVFO<!`C(
+zp+R7|?2X02UhWNTi_zqqPjTWb0iKOtaxH~!F26&^XE0bk@2yLN?I)jp%YyCa_v-W;
+z0+!Fb3<cX)KK+&hH|JX(PCn1%6~OkD&-}<G#!6sgyh=;%mEq*0uL3UDc2#tJ<P&E#
+zaC0rI!^vmtYk=)5pMGnCo5#KuoP5T<HrT%M>9-EJIp4Z)@)`SjVEf8DcE1V9WnAln
+z-Fs)S5BeZCK$r8|XnZ!Td{WCs=yLiR)BbX)YZI__`F9J6@g1;y&Z14ha@lX2gT35u
+z+BT!fx!=Ub-W~f^;8x_8+TEMrt-<p7S!^4yT<X~t++5FgaPpa_?ZNhwcT9dOlS}<0
+z<Y|dH65Jef2RQlM>pOz&CvVK*NV&w^3GCcOAEh5H&ybzL{HdRD`qu5$d}~X;?}A;|
+z=(~W;l{mYC`BQ(U>#IF`L0kIm2A)&Yv%7w@#MuMPpL#v|*6q||A8m=VC%Av1e-B*N
+zGa8*g^?LNxZawzV=GmRKS0?UW;BuUMqdR}um)}R%M?N+01Ln`%=Y&4y>WkE7uAFO1
+zZTlkktML9v_h{C=72S0|0GYZD1j}b{w}Iudx7)#9?rm*jXmajtabk}H8+$A=vB!hu
+zqfY>r?}8K2o9pR-lh58h2y8$3?9EAFV{3EFj#Dmq4gt&gPCgCUMVm@<Oxof%y|Njj
+z6RaNFp<uZ?s%K0$ST6H&IM~a1(RLV3&Uq0h&JkeaWZl%WPDg@W!}L?CXMUBL-($ee
+z)zQerJ{ByW=iqT*IcwCXKk|6=naCTeam+y1Pu};<laOAHL)(e8vuTb)ocyPQ&3_s)
+z`Og5$M?VvME<RbOAE4_apP!F@2tJi&joR(&&qrs0wK+E@Al01<>$4VXitU^xn?8wi
+zF4+G19)(oT7|sVb&*24d@|nX6!E)Aj6Z^;7E=HHXi002q#y$@$pRr#GJ^)*CU5;+9
+z%L<<>!1CGKKLXoN-k6sl<-}Jat-(3C3hW#x{Z23oc@51=`?Zx_nR>1R8zcJlV9$;G
+z{CopgA9>ea{c4)A%_UCX8^Jr1D}8T5mm5ZN58Z<FGLE*JX>!I9C(do)vZmY7jhp>)
+z2f9A;&cUrnx%B@rSpVohLDwhxPr>CFe}=A)ymkH@>1CbT?xp>TW}RZ=c+cDi_8hg(
+zgGev?$Ui`PjAkEka{mInKP_W<2rO5=D?f~Gz47@aSU>rkRgZvkR%uWCN5R^hm-~_G
+zuD$hHi#5gfad7!;egeJB`y{$P@`)!`#xri>Jq0$WzV{&2^>seY?HtDTbdyb=#CZm6
+zfA5iJk-w(hO><rCuda`=vwxJcnfon~w&!Sx_ZzVL!M@Lf)$RLRq;)C1Uw()DJ<Ut|
+zA1b>tvHl1)M(*Di!QQ`n)8g|dIQiVae+GLG$mibp3)ooN+%xJg(5%6l#EJJ;aGCRO
+z=*>A_hLg`b_$y%h$vf_skaCInD%hCO{|?qC<N61<Imc^o@)_4Z!S<8S`^g-zv9+0Z
+zHc~Em-T)_$Yx^e6wUv+0TNQ8r*TL%Iw~?N!@p}hdd!D`j0?T<GdQZLw_Hur;y-SmG
+ze#IH<hhWG00Wz`w4VKUQ&VRsiiTw%K%h=jJrhQ2>wm5M<1zTfseFkpM^*Nk;em?mE
+zY(II&{Si{mJ!xKZm@7HH0-Gbg>ZPxJ;`=q&c>2DNR8MV$t=IMqT>N{$$;YQx<>T+_
+z#HR%;pJ!uluw3S<FWAeu(l!rmA)4b5C(gWJYf7&9(4DJ;Xz}R>C!akyKiGcq@mT=u
+zGdAbvg6R6mJ8u7uTh2MMHtVpS^zRS8q?m(+(XA`-2B7OBpLlX*JmV(bK(IM8u0_Dj
+z_tv6t@)_44u>ItdcQLT*p)Ii&2YZjjX9;xu<gLxWzn9yDv($H#rNI4=^4h(p<g7jS
+zhBEPoV)K4YUCW`%`8!PUSsq;0umZY%^7@!}MX<S?gO$K5(}vLWwGMTCtiv<dHBlzV
+zD%hS!&p1~_m$MH0Ym>8o&UMey^j{rYo&o+2gSx(JAkC%p8L$>|ZJL+%bt=0uvDO6}
+zBkQ?7*!A@H$l@~$ET4JX06dI(<ns*J5Ns@M-W%#`(yYOn#EG{txXif;dUMY2z{%$s
+zuqoJn^3IXJt09+|n}dxReG9NY8P}HJ<{VqW$!A<!gY74uXTUaKW7lou^>;$*9AoUm
+zJZ*=bJU#=qNB0>ZpIU~4<*j>Lq`G(nvU~=NMAx2Yzz$%!oIN{%y_{cdJJRHwUvb8|
+zGuW|~&w%g3$>$lc3s^3(cL#eJTib55y=cZ3XDoYwtueXw1UKjU9-Mrh0i(h8lXu*^
+zBIVqZ<~4`8l4EbMIpV8c`r0SH-v=8{-%&{Q)V43!+V(-le?PE%eD<$=dKNwhfaUWH
+zXa&n<uEv19oGWc@v<{l%5GPkV*qV}SEZBO=XTUf(`Ru{*VEf4@&IEAz448<npS<Hf
+z5Gm&zS(|lOPx>DOE}sFD(5)-yPbXL(`NWee;~6*c4hEYu<C+Y1T;-WD1x`NWnhLg`
+zeDWRwc0IHu_B62fSbVy``pH|{bfjFK0f&MYB)7bF?<qNJ&%L2c{3F5Muc_-Ou-sr;
+ze2xZ}H5`MkpS(Uk1C9lo%Q;vHc^vHsn!eVdu8(!BjdV?v$#Fb*HCo0wLrk*{`)iZ4
+z{~Ad9uZ3*>xj^3&;N6@0o>=)ReFmJ2oJsT2eoAFmrj}E|#>iQI8d%OV-aW2<63tlF
+zAvW*n$b1_(1DqPpto)SL@I&NTwA65RWml$#bHK((4d;U8Zl{wqsQ-XwENc*_@A=?;
+z@QZ!{y0Nmx7lLPDm(P4(1h$_x$8sK0E-@|!%Vm#W0(Os=KO0>NC!d-x1KUsDclIlg
+zUe>Sea+;j=i<9d|VCyy40Q|26-;0#j$NhE{SU!EO2D@e%<1Db8`zJovfE`1|d@Wc%
+z`Rv>4z(Z)-lIwb~{K?c~?i;}7mygelVAp>}<#Q8QPT%YeIrm(~tW<X|I0wqqdNbHL
+zNUgVk<??rA+T`q?{pDUr|2x5>sWtO)7rNXmxcJ<S?mkJ5AEWChpMF09%e(i}@2BX_
+zb^84bte?C-&e1(!=OgoaFZd3czRribKGyI3==hb%@pEvQ<34n`j9;6a{d13>jNW`6
+zB;Etq9ILtS2dmrnL8Q5r-kT30AEtR}|7B%YCe|ZhV`QH{3YN?Hp#BS*v5YNF-^aoB
+zbzXcwdIIeGk$ilf1j}3NV@P%JQ^<3wb?_V2uh3^A)9-0?{qw%`3|P){DBpgcMYo?e
+z@5$$oUfz@1eod3JZn3e=^*nfAa^G0#zd@HX#tTR<W61xOCT9$B>iZqo`lA0HJcoX%
+z_Ydg$$j9f8;Ihw)=>4f9bN?rFedII7KZA{>%{5Fd%KTo?U%=My81=VKeKU4td|v`P
+zH?E`ojN`cfhV*jW`uvq9=eWhL*~`d06J7!5nJ~NZQ@Zc|j{FDB%Q{}G?8?l=Kf%Vx
+z*yn)dX3@tQ)L*3;%NoS#`#QKh58gnRn?>LFyoql7+}Ce`^^?ze@HSY!JP+PMcTcC^
+zzrgy*=l*{e?ESCJe4Y{Sf#svW4|cwChJFB+(=T%==lnQVj!~KVKLnTc{~KK{XNER8
+z`_D$&-?>Wu|A5VJ%^xE_q4|va2pOMGD?ZPH&(Q5BpL<l!9N7!X)c7^HT!(Ma<;wYF
+z+x*vj_CVK9K6Ug2dmdzdd!c`YuCH~d>th`c!#h@G>S)1Mu32w%xml#KzcxAhKUnpD
+z2>HLAudd}h_#VZ5Y2W(q$)k(?9r^6}dBN79bkFxg&QJ3)&jOWQnK~B)8zXyuA+TJ|
+zTJ`y8#xk}zbJQPfEs3=-xSaa|=yK)U4@5U#_VOZN{p2&(i-MhNZOJtVEbrgjIv<OH
+znU4DZ$7>zhGdJ2CuVc4nWold;T;^W_T`qfAo1FbKpN>6sECqHQq7O!Q4o<AzOO^)f
+zBR_xjcU#MVt<`nXZk_(W4Dw?CKZcxPL%><jp<wG*x}M7;SD<-W--?x8nenXzHb&NS
+zWw2b{Yt@&d8Ozw>^j!sP-;8ZluywjFz9+5*egUapd{zg`=YCxSEN9>JTN9jqj#phj
+z$KZIZLzz0(0$WG+$l74JtdTZ3`)7_EkFouKJ~Dsnf{m?o{?<nhqj}kPgUYT<?hV1l
+z$oy>tmdpL1z8=k3#ulgVCg5`ae+ONz-2a=R8$V;)46L7g_W$N!_rJEx^A=*7WAy)H
+zsq2i%dtpm-xd&J$-zByJ%lR(jb95W9m(MV5ThrvMU+i2sFY5Bixjopp(T9V}y*>h6
+zANlO{k>Kog?bf>;Qa*8Z0Lw++5$ruMqq>K70?X-Ve{FK&QOK<C&R}a+y1u(0ccpnb
+zrrj#L(p-JucLy6I>$?Y7F87D}cWK5lwm5yi2QGi^8;x$PJiGS-&mxC>)^~5P{j^#C
+zo=CaG{61LDwVy!WeZW2w*JJ(TvoD-{YTgfQKY7>p0Hl}et8IUpob`(nrxk3y>h7BZ
+z!C43ArVZV_nemJP%MC7SX-Bu-jBhMhKl$w6ao{89qb<3{gXMEhOaPl--hQ4h6TzMn
+z)|q}CVEOEggTQk3Prpgv^mC5Y^>Yto9+c|t59dXhdFcc@FB#LpV7Z((+T`q?J?H*V
+z&wZmzyvbnaG4ZB=<q}Vuoc(h~d7fm<Q^DsI&zM8dm!xIxrh)a5PoFMuc@IrT*H7L#
+zF`iuf4+VQKYx8-g-u&)ieb-=fzLXhXH@;V*XMBgD%X!WjPn(?muL9eD7SjHnPlsch
+ziOkPBN1)5OmybevxtHaSq{$gW{1vB*SkCqLo;eQeJ##EFH69O^k3IuD1E2Ic5#2r~
+z6h0?`<+J}!2HQ_QW1T6cX-n)=z~>gRPenI&c@LikC!g4-gY74u*k^!^ug!Tp1}T@C
+z&jcHHU^SP0z(0VK&$r_rg5^9TozJtuUe2esvuJY8p*XS61si+gBKCQ3^7)2;K3FcX
+zF9LfRTib=S%V@?H8+&)`7lWIBC-V|G`TS1irC>S7eF0M4{bLT}88^0^|FJ2v7MFwV
+zukSfX_1Jy{c21*T3Dzfba5dODxT^4(1(wgcT?4kCeAew+u(7q7_X?z3;@$u@?)Avz
+zz7Z@R{U&f(%Pr{kxw-JU6)c}xZUfs-KDFEqHnz6Jz5`tD{X5Z(?RgZRyWr##`);uP
+z<m2;Wu=_l@euA!_eER(qEbrer#P4V5)}_t)xeh5Oz6Y80ycg_RD}A2dhrFNW<z9H8
+zvMW>5gJ5Ii+4u{vT%PCZKc^YX*y8kk7+gNje~E6ajO7uq&vW^V<x#Nxv|0Z{NV&v(
+z3@n$me;n*wmuJBfaPs*s^CZ}Q^4_z*LV9^$X?uz$XZ>R5BIA)y?&rboz39IITT5#H
+zEm$A<_`Cpi%+@=AoWBFVfRxwA_k`br<@5W6e*iy6bKQ*TJjm&1ZLXQMDwF4rVDqGw
+z7r}CQCTf$jfA)c6O#eTDU8|d^(`U$^(dBX$y#)4h&b0l7CTAVu#Q7`O{g<)*4eawT
+zV|y7rW7F5M$?2CEuYiq_vCIa`<$iL`UPbqro49{RPh9<tE2p1hPOZv3<IV=B&VPc9
+zcV9LBIp}i!+~}Tp6YS;qwY@=mhvxXjiSriNIHwZFI^RaW2wmQqUPsDVlQHdYoY>4)
+z+Vn~6e}V0<?`uf)+z0Q0y${Og%lmNhnb!}%Gw?~D534>`6+Zt4%jX{b57>V4S&xsv
+z#@3eDAA>!+68jVM=JWMaIQhi>3~WF7#Qq#?d~J^NU8J1&3uMl+FTu{8(zEPq<To@g
+z=MSoGSEj}uU}NMg>xnLxvrPRf?8Y*-IDK2Nm1kLRbYo>Keb7D2<TI9e!1mK-{q=t@
+z0Gyb8!E%|idBM$R*?e&FIm`Ni?I-WPTmb3izSK59P0sqo&PB!}pWOYy)^BdlrG?Qw
+zm*n+v?+yUVM;{1w-{n1d5p;dz9iRXHfn3Hj2<&+LH*%79F|d5zrxpjx<(yd(?B#g0
+zEkToWJmSPz7VO@LJ_Oyl%-jzJ>m#2tVmYw??vA;%XI#sJwH-%J$GrkrE<bax2<8^9
+z_tQ3`y0=#Xdv9yc{l0R=X-oW7z|KwPZB?+GzL_^U*D7OGW^Aj0k158wI(j+QHPH2u
+zPtG;L=FHgF0_S|x-@J1Anb&*AIaVg`+SuG9nbUR9<?>9?CTIWLkM1?k*NtiZn?=s2
+zztiP4FKr|8&V!tfR^OvY|Ggsj;6R!-_w}MkFZaR1$VF%?)9fQojf26)%D<7Z3|P(@
+z9s9D#A+#lFuDf>o4nhv44WYTt%ORJiv7F3J!<HN?pqt}K#?uG6B2CU5J7+I|?XS(b
+zbu25<oEyht-PWI&Yk-Y8cYVOC)2vaOe$L(6w6$o7sb0o3c6`?XoA+ySiOV%u5Z$X>
+zg9Xs7YawLTV101bU<0sM)?gTT8=8H@8OwLT#>yIO3YII^U^DbhXpT?2eO-giY1*;|
+z&VANETXJj(Hb>TAE3jO-23w=sf2+FeRdXzI&X;4cZtG9X5ny9x4Mu{8)2vaOey+g|
+XG;OYdG1beM#*XifV0~Nzv1{-@wy3A|
+
+diff --git a/c/tests/bench_host_pairs.c b/c/tests/bench_host_pairs.c
+index 5abf3614..e14156af 100644
+--- a/c/tests/bench_host_pairs.c
++++ b/c/tests/bench_host_pairs.c
+@@ -1,6 +1,8 @@
+ /* bench_host_pairs: vkt_host_pairs (the hybrid steps' CPU pairs) alone, on colibri's int4 rows
+- * (fmt 2 a row's scale, fmt 4 groups of 64) and int8 (fmt 1), the shapes of Qwen3.6-35B-A3B's
+- * expert (D 2048, I 512). No device: the host pool's rows are malloc'd here. */
++ * (fmt 2 a row's scale, fmt 4 groups of 64), int8 (fmt 1) and FP8 e4m3 (fmt 12, groups of 128),
++ * the shapes of Qwen3.6-35B-A3B's expert (D 2048, I 512) or those given (Qwen3.8-Flash-Next:
++ * 12 2560 640). No device: the host pool's rows are malloc'd here.
++ *   ./tests/bench_host_pairs [fmt] [D] [I] */
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -10,31 +12,35 @@
+ static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
+ static float frnd(void) { return (float)rand() / RAND_MAX * 2.f - 1.f; }
+ typedef struct { uint8_t *g, *u, *d; float *sg, *su, *sd; } Ex;
+-/* rows of O x I in fmt (1 int8, 2 int4 pairs v+8, 4 int4 pairs gs 64); scales per row or per group */
++/* rows of O x I in fmt (1 int8, 2 int4 pairs v+8, 4 int4 pairs gs 64, 12 FP8 e4m3 gs 128); scales per row or per group */
+ static uint8_t *mk(int fmt, int O, int I, int gs, float **sc) {
+-    size_t rb = fmt == 1 ? (size_t)I : (size_t)I / 2, ns = gs ? (size_t)O * (I / gs) : (size_t)O;
++    size_t rb = fmt == 1 || fmt == 12 ? (size_t)I : (size_t)I / 2, ns = gs ? (size_t)O * (((size_t)I + gs - 1) / gs) : (size_t)O;   /* a row's last group may be partial */
+     uint8_t *r = malloc(rb * O); *sc = malloc(ns * sizeof(float));
+     for (size_t i = 0; i < ns; i++) (*sc)[i] = 0.01f + 0.02f * (float)rand() / RAND_MAX;
+     for (size_t i = 0; i < rb * O; i++) r[i] = fmt == 1 ? (uint8_t)(int8_t)(rand() % 255 - 127) : (uint8_t)(rand() & 0xff);
+     return r;
+ }
+ int main(int argc, char **argv) {
+-    int D = 2048, I = 512, NE = 64, fmt = argc > 1 ? atoi(argv[1]) : 2, gs = fmt == 4 ? 64 : 0;
+-    int nps[] = {1, 2, 8}; int nts[] = {1, 2, 4, 12, 24};
++    int fmt = argc > 1 ? atoi(argv[1]) : 2, D = argc > 2 ? atoi(argv[2]) : 2048, I = argc > 3 ? atoi(argv[3]) : 512, NE = 64;
++    int gs = fmt == 4 ? 64 : fmt == 12 ? 128 : 0;
++    const int byte_rows = fmt == 1 || fmt == 12;   /* a byte a weight */
++    int nps[] = {1, 2, 8}; int nts[] = {1, 2, 4, 12, 24}, nnt = 5;
++    if (argc > 4) { nts[0] = atoi(argv[4]); nnt = 1; }   /* one thread count: [fmt] [D] [I] [threads] [calls] */
++    const int calls = argc > 5 ? atoi(argv[5]) : 400;
+     Ex *ex = malloc((size_t)NE * sizeof *ex); VktHostExpert *hv = malloc((size_t)NE * sizeof *hv);
+     for (int e = 0; e < NE; e++) {
+         ex[e].g = mk(fmt, I, D, gs, &ex[e].sg); ex[e].u = mk(fmt, I, D, gs, &ex[e].su); ex[e].d = mk(fmt, D, I, gs, &ex[e].sd);
+-        hv[e] = (VktHostExpert){ex[e].g, ex[e].u, ex[e].d, -fmt, -fmt, fmt == 1 ? (size_t)D : (size_t)D / 2, fmt == 1 ? (size_t)I : (size_t)I / 2,
++        hv[e] = (VktHostExpert){ex[e].g, ex[e].u, ex[e].d, -fmt, -fmt, byte_rows ? (size_t)D : (size_t)D / 2, byte_rows ? (size_t)I : (size_t)I / 2,
+                                 ex[e].sg, ex[e].su, ex[e].sd, gs, gs};
+     }
+     float *x = malloc((size_t)8 * D * sizeof(float)); for (int i = 0; i < 8 * D; i++) x[i] = frnd();
+     float *gu = malloc((size_t)8 * 2 * I * sizeof(float)), *hh = malloc((size_t)8 * I * sizeof(float)), *dn = malloc((size_t)8 * D * sizeof(float));
+-    double bytes = fmt == 1 ? 3.0 * D * I : 1.5 * D * I;
++    double bytes = byte_rows ? 3.0 * D * I : 1.5 * D * I;
+     printf("fmt %d D %d I %d, %.2f MB a pair\n", fmt, D, I, bytes / 1e6);
+-    for (int a = 0; a < 3; a++) for (int b = 0; b < 5; b++) {
++    for (int a = 0; a < 3; a++) for (int b = 0; b < nnt; b++) {
+         int np = nps[a], nt = nts[b];
+         const VktHostExpert *hp[8]; const float *xp[8];
+-        int reps = 400 / np, e0 = 0; double best = 1e9, tot = 0;
++        int reps = calls / np > 0 ? calls / np : 1, e0 = 0; double best = 1e9, tot = 0;
+         for (int r = -2; r < 5; r++) {
+             double t0 = now();
+             for (int k = 0; k < reps; k++) {
+diff --git a/c/tests/test_vk_chain.c b/c/tests/test_vk_chain.c
+index 3e5fac0c..04568dc1 100644
+--- a/c/tests/test_vk_chain.c
++++ b/c/tests/test_vk_chain.c
+@@ -249,6 +249,23 @@ static void test_chunk_rows(void) {
+ }
+ 
+ /* ---- attention ---------------------------------------------------------------------- */
++/* chain_attnb's pipelines with the head dims fixed (by default with Xe2 under ANV and on
++ * Lavapipe, anywhere with COLI_VK_ATTN_BLOCK_FIXED=1) give its generic pipeline's bits:
++ * fixed_off() switches to the generic one for a rerun (0 when the variable keeps them off:
++ * nothing to compare), and fixed_back() restores the setting. */
++static int g_fixed_set;
++static int fixed_off(void) {
++    const char *e = getenv("COLI_VK_ATTN_BLOCK_FIXED");
++    if (e && *e && strcmp(e, "1")) return 0;
++    g_fixed_set = e && *e;
++    setenv("COLI_VK_ATTN_BLOCK_FIXED", "0", 1);
++    return 1;
++}
++static void fixed_back(void) {
++    if (g_fixed_set) setenv("COLI_VK_ATTN_BLOCK_FIXED", "1", 1);
++    else unsetenv("COLI_VK_ATTN_BLOCK_FIXED");
++}
++
+ /* a verify's S rows: each the bits of a decode step of that row alone (chain_attn_dec.comp's
+  * blocks from each row's own positions, the rows before VKC_ATTN_DEC_MIN as theirs run) */
+ static void test_attn_rows_bits(int S, int pos_base, int H, int KVH, int hd) {
+@@ -317,6 +334,16 @@ static void test_attn_hk(int S, int pos_base, int H, int KVH, int hd, int use_li
+     double tol = fl > 0 && S >= fl && !use_list && hd % 64 == 0 && 64 % (H / KVH) == 0 ? 2e-3 : 2e-5;
+     CHECK(ok && e < tol, "attn S %d pos %d H %d/%d hd %d list %d (block from %d, flash from %d): err %.2e", S, pos_base, H, KVH, hd,
+           use_list, vkc_attn_block_rows(), fl, e);
++    if (S >= 16 && fixed_off()) {
++        size_t bytes = (size_t)S * H * hd * sizeof(float);
++        float *was = malloc(bytes); memcpy(was, o, bytes);
++        vkc_begin(); ok = vkc_attn(qb, kb, vb, ob, qb, lb, &p);
++        ok = vkc_submit(1) && ok;
++        fixed_back();
++        CHECK(ok && memcmp(was, vkc_ptr(ob), bytes) == 0, "attn S %d pos %d H %d/%d hd %d list %d: the generic blocked pipeline "
++              "changed bytes", S, pos_base, H, KVH, hd, use_list);
++        free(was);
++    }
+     vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(ob); vkc_free(lb);
+     free(q); free(kc); free(vc); free(sel); free(ref);
+ }
+@@ -457,33 +484,86 @@ static void test_attn_win(int S, int pos_base, int H, int KVH, int hd, int vd, i
+         ok = vkc_submit(1) && ok;
+         CHECK(ok && memcmp(whole, vkc_ptr(ob), bytes) == 0,
+               "attention slices changed bytes S %d H %d/%d win %d sink %d", S, H, KVH, win, sink);
+-        unsetenv("COLI_VK_ATTN_SLICE"); free(whole);
++        unsetenv("COLI_VK_ATTN_SLICE");
++        if (fixed_off()) {
++            vkc_begin(); ok = vkc_attn_w(qb, kb, vb, ob, NULL, NULL, sink ? sb : NULL, &p);
++            ok = vkc_submit(1) && ok;
++            fixed_back();
++            CHECK(ok && memcmp(whole, vkc_ptr(ob), bytes) == 0, "attention's generic blocked pipeline changed bytes S %d hd %d vd %d "
++                  "win %d ring %d sink %d pm %d", S, hd, vd, win, ring, sink, kv_pm);
++        }
++        free(whole);
+     }
+     vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(sb); vkc_free(ob);
+     free(q); free(kc); free(vc); free(snk); free(ref);
+ }
++/* COLI_VK_ATTN_SLICE_WG as the run has it (NULL: unset), saved by a case that sets it and
++ * given back after, so the slice cases after it run as the run asked */
++static char *slice_wg_save(void) { const char *e = getenv("COLI_VK_ATTN_SLICE_WG"); return e ? strdup(e) : NULL; }
++static void slice_wg_back(char *was) {
++    if (was) setenv("COLI_VK_ATTN_SLICE_WG", was, 1);
++    else unsetenv("COLI_VK_ATTN_SLICE_WG");
++    free(was);
++}
++/* The slice rule (COLI_VK_ATTN_SLICE_WG, `wg`; NULL: the default): a slice of the blocked
++ * attention is cut to keep that many workgroups, as far as 4x the budget, a chunk's rows in
++ * slices of one size; the bytes of one dispatch every time. Qwen3.6's heads (16 over 2, hd 256:
++ * a workgroup a KV head and 4 rows), 72 rows after 7 positions, the budget `per` rows' work. */
++static void test_attn_slice_wg(int per, const char *wg, unsigned long long want) {
++    char *wg_was = slice_wg_save();
++    const int S = 72, pb = 7, H = 16, KVH = 2, hd = 256, T = pb + S;
++    size_t qn = (size_t)S * H * hd, kn = (size_t)KVH * T * hd, bytes = qn * 4;
++    float *q = fvec(qn, 1.f), *kc = fvec(kn, 1.f), *vc = fvec(kn, 1.f);
++    VkcBuf *qb = up(q, qn), *kb = up(kc, kn), *vb = up(vc, kn), *o1 = vkc_buf(bytes, VKC_DOWN), *o2 = vkc_buf(bytes, VKC_DOWN);
++    VkcAttn p = {S, H, KVH, hd, pb, T, 0, H * hd, hd, 0, 0, 0, 0, 0, H * hd, 0, 0, 1.f / 16, 0, 0};
++    char b[32];
++    snprintf(b, sizeof b, "%lld", (long long)per * T * H * hd);
++    setenv("COLI_VK_ATTN_SLICE", "0", 1);
++    vkc_begin(); int ok = vkc_attn(qb, kb, vb, o1, NULL, NULL, &p); ok = vkc_submit(1) && ok;
++    setenv("COLI_VK_ATTN_SLICE", b, 1);
++    if (wg) setenv("COLI_VK_ATTN_SLICE_WG", wg, 1);
++    else unsetenv("COLI_VK_ATTN_SLICE_WG");
++    VkcStats s0, s1; vkc_stats(&s0);
++    vkc_begin(); ok = vkc_attn(qb, kb, vb, o2, NULL, NULL, &p) && ok; ok = vkc_submit(1) && ok;
++    vkc_stats(&s1);
++    int same = !memcmp(vkc_ptr(o1), vkc_ptr(o2), bytes);
++    CHECK(ok && same && s1.attn_slices - s0.attn_slices == want && s1.attn_blocked > s0.attn_blocked,
++          "attn slices: a budget of %d rows, COLI_VK_ATTN_SLICE_WG %s: %llu extra submissions (%llu wanted), the bytes of one dispatch %d",
++          per, wg ? wg : "unset", s1.attn_slices - s0.attn_slices, want, same);
++    unsetenv("COLI_VK_ATTN_SLICE"); slice_wg_back(wg_was);
++    vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(o1); vkc_free(o2);
++    free(q); free(kc); free(vc);
++}
+ 
+ /* A float16 KV cache (vkc_attn_wh): K and V of float16 values in halves give the bits of a
+- * float32 cache of the same values, on the path the call takes (the counters say which) */
+-static void test_attn_kvh(int S, int pos_base, int H, int KVH, int hd, int win, int ring, int sink) {
++ * float32 cache of the same values, on the path the call takes (the counters say which); V's
++ * head dim vd (the output's too) */
++static void test_attn_kvh(int S, int pos_base, int H, int KVH, int hd, int vd, int win, int ring, int sink) {
+     int rows = ring ? ring : pos_base + S + 3, koff = 32, voff = 16;
+-    size_t kn = (size_t)koff + (size_t)rows * KVH * hd, vn = (size_t)voff + (size_t)rows * KVH * hd;
++    size_t kn = (size_t)koff + (size_t)rows * KVH * hd, vn = (size_t)voff + (size_t)rows * KVH * vd;
+     float *q = fvec((size_t)S * H * hd, 1.f), *kc = fvec(kn, 1.f), *vc = fvec(vn, 1.f), *snk = fvec(H + 5, 2.f);
+     kv16_round(kc, (int64_t)kn); kv16_round(vc, (int64_t)vn);
+     uint16_t *kh = malloc(kn * 2), *vh = malloc(vn * 2);
+     kv16_pack(kh, kc, (int64_t)kn); kv16_pack(vh, vc, (int64_t)vn);
+     VkcBuf *qb = up(q, (size_t)S * H * hd), *kb = up(kc, kn), *vb = up(vc, vn), *sb = up(snk, H + 5);
+     VkcBuf *khb = vkc_buf(kn * 2, VKC_DEV), *vhb = vkc_buf(vn * 2, VKC_DEV);
+-    VkcBuf *o32 = vkc_buf((size_t)S * H * hd * 4, VKC_DOWN), *o16 = vkc_buf((size_t)S * H * hd * 4, VKC_DOWN);
++    VkcBuf *o32 = vkc_buf((size_t)S * H * vd * 4, VKC_DOWN), *o16 = vkc_buf((size_t)S * H * vd * 4, VKC_DOWN);
+     vkc_begin(); vkc_write(khb, 0, kh, kn * 2); vkc_write(vhb, 0, vh, vn * 2); vkc_submit(1);
+-    VkcAttnW p = {{S, H, KVH, hd, pos_base, rows, 0, H * hd, hd, 0, 0, 0, 0, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), koff, voff},
+-                  win, ring, hd, 0, sink, 5};
++    VkcAttnW p = {{S, H, KVH, hd, pos_base, rows, 0, H * hd, hd, 0, 0, 0, 0, 0, H * vd, 0, 0, 1.f / sqrtf((float)hd), koff, voff},
++                  win, ring, vd, 0, sink, 5};
+     vkc_begin();
+     int ok = vkc_attn_w(qb, kb, vb, o32, NULL, NULL, sink ? sb : NULL, &p) && vkc_attn_wh(qb, khb, vhb, o16, NULL, NULL, sink ? sb : NULL, &p);
+     ok = vkc_submit(1) && ok;
+-    size_t bytes = (size_t)S * H * hd * 4;
+-    CHECK(ok && memcmp(vkc_ptr(o32), vkc_ptr(o16), bytes) == 0, "attn float16 cache S %d pos %d H %d/%d hd %d win %d ring %d sink %d: "
+-          "a float32 cache's bits", S, pos_base, H, KVH, hd, win, ring, sink);
++    size_t bytes = (size_t)S * H * vd * 4;
++    CHECK(ok && memcmp(vkc_ptr(o32), vkc_ptr(o16), bytes) == 0, "attn float16 cache S %d pos %d H %d/%d hd %d vd %d win %d ring %d "
++          "sink %d: a float32 cache's bits", S, pos_base, H, KVH, hd, vd, win, ring, sink);
++    if (S >= 16 && fixed_off()) {   /* and the generic blocked pipeline's, a half a load */
++        vkc_begin(); ok = vkc_attn_wh(qb, khb, vhb, o32, NULL, NULL, sink ? sb : NULL, &p);
++        ok = vkc_submit(1) && ok;
++        fixed_back();
++        CHECK(ok && memcmp(vkc_ptr(o32), vkc_ptr(o16), bytes) == 0, "attn float16 cache S %d pos %d H %d/%d hd %d vd %d win %d "
++              "ring %d sink %d: the generic blocked pipeline's bits", S, pos_base, H, KVH, hd, vd, win, ring, sink);
++    }
+     vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(sb); vkc_free(khb); vkc_free(vhb); vkc_free(o32); vkc_free(o16);
+     free(q); free(kc); free(vc); free(snk); free(kh); free(vh);
+ }
+@@ -2934,6 +3014,26 @@ static void test_kvs_cold(void) {
+     test_kvs_gqa(50, 2, 4, 2, 256, 256, 4, 16, 0, 0, 0, 1, 1, 1);
+     test_kvs_gqa(60, 2, 4, 2, 32, 24, 4, 16, 20, 1, 1, 0, 0, 0);
+     test_kvs_gqa(48, 12, 4, 2, 32, 32, 4, 40, 0, 0, 0, 1, 0, 0);
++    {   /* the host's part through chain_attnb's part mode (attn_part_rec), with V's head dim apart:
++         * its pipeline with the head dims fixed (where that is the default) gives the generic
++         * one's bytes */
++        const int Tp = 70, Hp = 4, vdp = 32;
++        size_t n = (size_t)Tp * Hp * vdp;
++        float *fx = calloc(n, sizeof(float)), *gn = calloc(n, sizeof(float));
++        kvs_keep_row = (size_t)Hp * vdp;
++        VkcStats p0, p1, p2; vkc_stats(&p0);
++        kvs_keep = fx; test_kvs_gqa(Tp, 7, Hp, 2, 48, vdp, 8, 32, 0, 1, 1, 0, 0, 0);
++        vkc_stats(&p1);
++        if (fixed_off()) {
++            kvs_keep = gn; test_kvs_gqa(Tp, 7, Hp, 2, 48, vdp, 8, 32, 0, 1, 1, 0, 0, 0);
++            fixed_back();
++            vkc_stats(&p2);
++            CHECK(p1.attn_blocked > p0.attn_blocked && p2.attn_blocked > p1.attn_blocked && !memcmp(fx, gn, n * sizeof(float)),
++                  "kvs cold: the part mode's generic pipeline changed bytes (%llu and %llu calls in blocks)",
++                  p1.attn_blocked - p0.attn_blocked, p2.attn_blocked - p1.attn_blocked);
++        }
++        kvs_keep = NULL; free(fx); free(gn);
++    }
+     /* T step H K R B rows kv_start lists */
+     test_kvs_mla(40, 1, 4, 32, 8, 4, 12, 0, 0);
+     test_kvs_mla(90, 5, 2, 64, 16, 8, 40, 0, 1);
+@@ -4188,10 +4288,12 @@ int main(int argc, char **argv) {
+     { VkcStats st; vkc_stats(&st); CHECK(st.attn_blocked >= 9, "attn: %llu calls took the blocked attention", st.attn_blocked);
+       printf("  blocked attention: %llu calls\n", st.attn_blocked); }
+     /* a long attention cut over several submissions (COLI_VK_ATTN_SLICE): the same cases,
+-     * the blocked attention and chain_attn, slices of a few rows each */
++     * the blocked attention and chain_attn, slices of a few rows each (the budget alone) */
+     {
+         VkcStats s0; vkc_stats(&s0);
++        char *wg_was = slice_wg_save();
+         setenv("COLI_VK_ATTN_SLICE", "60000", 1);
++        setenv("COLI_VK_ATTN_SLICE_WG", "0", 1);
+         for (int pass = 0; pass < 2; pass++) {
+             setenv("COLI_VK_ATTN_BLOCK", pass ? "0" : "16", 1);
+             test_attn_hk(40, 7, 16, 2, 256, 0); test_attn_hk(37, 5, 16, 2, 128, 1); test_attn_hk(64, 100, 4, 4, 32, 0);
+@@ -4201,7 +4303,16 @@ int main(int argc, char **argv) {
+         VkcStats s1; vkc_stats(&s1);
+         CHECK(s1.attn_slices > s0.attn_slices + 10, "attn: %llu slices", s1.attn_slices - s0.attn_slices);
+         printf("  attention in slices: %llu extra submissions\n", s1.attn_slices - s0.attn_slices);
+-        unsetenv("COLI_VK_ATTN_SLICE");
++        unsetenv("COLI_VK_ATTN_SLICE"); slice_wg_back(wg_was);
++    }
++    {   /* the slice rule's floor (COLI_VK_ATTN_SLICE_WG; the random stream as before it) */
++        unsigned rng_was = rng;
++        test_attn_slice_wg(7, "0", 17);   /* the budget alone: 18 slices of 4 rows */
++        test_attn_slice_wg(7, "64", 2);   /* 64 workgroups as far as 4x the budget, 28 rows: 3 slices of 24 */
++        test_attn_slice_wg(7, NULL, coli_vk_device_integrated() ? 17 : 2);   /* the default: 64, 0 on an integrated GPU */
++        test_attn_slice_wg(7, "8", 4);    /* 8 workgroups, 16 rows: 5 slices */
++        test_attn_slice_wg(20, "64", 0);  /* 4x the budget, 80 rows, takes the 72 whole */
++        rng = rng_was;
+     }
+     unsetenv("COLI_VK_CHAIN_FLASH");
+     /* a decode's or a verify's rows over many positions (chain_attn_dec.comp's blocks, where a prompt of
+@@ -4213,24 +4324,49 @@ int main(int argc, char **argv) {
+         test_attn_win(4, 900, 8, 2, 128, 128, 0, 0, 1, 0); test_attn_win(1, 2000, 4, 2, 64, 64, 512, 512, 0, 1);
+         test_attn_win(2, 3000, 16, 4, 64, 96, 0, 0, 0, 0);
+         /* Flint's: full layers with a sink, a window with a sink, linear and in a ring; in blocks
+-         * where the device has the matrix units */
++         * where the device has the matrix units, and on any device under COLI_VK_ATTN_DEC=2 set for
++         * the run (read as the engine reads it: a leading '0' is off, and COLI_VK_CHAIN_FLASH=0
++         * turns it off with the rest of attn_dec's rule) */
+         VkcStats f0; vkc_stats(&f0);
+         test_attn_win(1, 17000, 32, 4, 128, 128, 0, 0, 1, 0); test_attn_win(3, 5000, 32, 4, 128, 128, 128, 0, 1, 0);
+         test_attn_win(1, 4000, 32, 4, 128, 128, 200, 236, 1, 0); test_attn_win(4, 2000, 16, 2, 256, 256, 0, 0, 1, 0);
+         VkcStats f1; vkc_stats(&f1);
+-        if (f1.attn_flash > 0) {
++        const char *adv = getenv("COLI_VK_ATTN_DEC");
++        const int optin = adv && *adv != '0' && atoi(adv) == 2 && vkc_attn_flash_rows() > 0;
++        const char *ge = getenv("COLI_VK_ATTN_DEC_GQA");
++        const int gqa = !(ge && *ge == '0');
++        if (f1.attn_flash > 0 || optin) {
+             CHECK(f1.attn_dec >= f0.attn_dec + 4, "attn: a window's or a sink's decode in blocks (%llu of 4)", f1.attn_dec - f0.attn_dec);
+-            const char *ge = getenv("COLI_VK_ATTN_DEC_GQA");
+-            if (!(ge && *ge == '0'))
++            if (gqa)
+                 CHECK(f1.attn_dec_gqa >= f0.attn_dec_gqa + 4, "attn: %llu of 4 decodes a KV head's query heads a workgroup",
+                       f1.attn_dec_gqa - f0.attn_dec_gqa);
+         }
++        /* two of them again under COLI_VK_ATTN_DEC=2, which the chain reads on each call: in
++         * blocks on any device, one without the flash module too (the CI's Lavapipe, Xe2); the
++         * random stream and the variable as before them */
++        {
++            unsigned rng_dec = rng;
++            char was[32];
++            const int had = adv != NULL;
++            if (had) snprintf(was, sizeof was, "%s", adv);
++            setenv("COLI_VK_ATTN_DEC", "2", 1);
++            VkcStats d0; vkc_stats(&d0);
++            test_attn_win(1, 17000, 32, 4, 128, 128, 0, 0, 1, 0); test_attn_win(4, 2000, 16, 2, 256, 256, 0, 0, 1, 0);
++            VkcStats d1; vkc_stats(&d1);
++            if (had) setenv("COLI_VK_ATTN_DEC", was, 1);
++            else unsetenv("COLI_VK_ATTN_DEC");
++            CHECK(d1.attn_dec >= d0.attn_dec + 2, "attn: COLI_VK_ATTN_DEC=2: %llu of 2 decodes in blocks", d1.attn_dec - d0.attn_dec);
++            if (gqa)   /* the head dims of 128 at least: their grouped pipeline's 14.5 KiB of shared memory fits any device */
++                CHECK(d1.attn_dec_gqa >= d0.attn_dec_gqa + 1, "attn: COLI_VK_ATTN_DEC=2: %llu of 2 decodes a KV head's query heads a "
++                      "workgroup", d1.attn_dec_gqa - d0.attn_dec_gqa);
++            rng = rng_dec;
++        }
+         /* OLMoE's: one query head a KV head, by KV head too (mode 2 at a GQ of 1) */
+         VkcStats o0; vkc_stats(&o0);
+         test_attn_hk(1, 299, 16, 16, 128, 0); test_attn_hk(3, 250, 16, 16, 128, 0);
+         test_attn_win(2, 3000, 16, 16, 128, 128, 0, 0, 0, 0);
+         VkcStats o1; vkc_stats(&o1);
+-        if (o1.attn_flash > 0 && !(getenv("COLI_VK_ATTN_DEC_GQA") && *getenv("COLI_VK_ATTN_DEC_GQA") == '0'))
++        if ((o1.attn_flash > 0 || optin) && !(getenv("COLI_VK_ATTN_DEC_GQA") && *getenv("COLI_VK_ATTN_DEC_GQA") == '0'))
+             CHECK(o1.attn_dec_gqa >= o0.attn_dec_gqa + 3, "attn: %llu of 3 decodes of one query head a KV head by KV head",
+                   o1.attn_dec_gqa - o0.attn_dec_gqa);
+         test_attn_rows_bits(6, 700, 16, 16, 128);
+@@ -4242,16 +4378,18 @@ int main(int argc, char **argv) {
+     }
+     /* a float16 KV cache on every path: chain_attn (a few rows over few positions), the decode's
+      * blocks a head and by KV head, the matrix units and the blocked shader for a prompt chunk,
+-     * a window and sinks, linear and in a ring */
++     * a window and sinks, linear and in a ring, and V's head dim apart from K's */
+     if (vkc_kvh_ready()) {
+         unsigned rng_was = rng;
+         VkcStats k0; vkc_stats(&k0);
+-        test_attn_kvh(2, 50, 16, 2, 256, 0, 0, 0); test_attn_kvh(3, 2500, 16, 2, 256, 0, 0, 0); test_attn_kvh(2, 700, 8, 8, 128, 0, 0, 0);
+-        test_attn_kvh(70, 33, 16, 2, 256, 0, 0, 0); test_attn_kvh(40, 300, 32, 4, 128, 129, 0, 1); test_attn_kvh(1, 4000, 32, 4, 128, 200, 236, 1);
+-        test_attn_kvh(90, 900, 32, 4, 128, 129, 230, 1);
++        test_attn_kvh(2, 50, 16, 2, 256, 256, 0, 0, 0); test_attn_kvh(3, 2500, 16, 2, 256, 256, 0, 0, 0);
++        test_attn_kvh(2, 700, 8, 8, 128, 128, 0, 0, 0); test_attn_kvh(70, 33, 16, 2, 256, 256, 0, 0, 0);
++        test_attn_kvh(40, 300, 32, 4, 128, 128, 129, 0, 1); test_attn_kvh(1, 4000, 32, 4, 128, 128, 200, 236, 1);
++        test_attn_kvh(90, 900, 32, 4, 128, 128, 129, 230, 1);
+         setenv("COLI_VK_CHAIN_FLASH", "0", 1);
+-        test_attn_kvh(40, 300, 16, 2, 256, 0, 0, 0); test_attn_kvh(33, 20, 32, 4, 128, 16, 0, 1);
++        test_attn_kvh(40, 300, 16, 2, 256, 256, 0, 0, 0); test_attn_kvh(33, 20, 32, 4, 128, 128, 16, 0, 1);
+         unsetenv("COLI_VK_CHAIN_FLASH");
++        test_attn_kvh(40, 100, 8, 2, 64, 48, 0, 0, 0);   /* the blocked shader's uvec4 loads with V's head dim apart */
+         test_copy_regions_h();
+         VkcStats k1; vkc_stats(&k1);
+         printf("  a float16 cache: %llu on the matrix units, %llu blocked, %llu decodes in blocks\n", k1.attn_flash - k0.attn_flash,
+diff --git a/c/tests/test_vk_memtype.c b/c/tests/test_vk_memtype.c
+index 7d4ae730..b317eedf 100644
+--- a/c/tests/test_vk_memtype.c
++++ b/c/tests/test_vk_memtype.c
+@@ -6,6 +6,10 @@
+  *   - an integrated GPU without such a heap, a discrete GPU with and without Resizable BAR
+  *     and a CPU device get the types chosen for a discrete GPU;
+  *   - an allocation of system memory is retried in a device-local type on an integrated GPU only;
++ *   - a type is chosen among those the buffers take: on the table of an Arc Pro B60 (Mesa ANV),
++ *     whose first device-local type is for images alone, the GPU-only type is the next one, and
++ *     a buffer asked for a type it does not take gets the first it takes with its properties,
++ *     in that type's heap first;
+  *   - the size, budget and room of the device memory count every heap of an integrated GPU and
+  *     the device-local heaps of the others.
+  *
+@@ -36,16 +40,22 @@ static VkPhysicalDeviceMemoryProperties table(const Heap *h, uint32_t nh, const
+     return m;
+ }
+ 
+-/* The types picked for the three uses, in the order of the enum. */
+-static void expect(const char *name, const VkPhysicalDeviceMemoryProperties *m, int integrated, int gpu_only,
+-                   int cpu_writes, int cpu_reads) {
++/* The types picked for the three uses, in the order of the enum, among the types the buffers
++ * take (`take`, their memoryTypeBits). */
++static void expect_in(const char *name, const VkPhysicalDeviceMemoryProperties *m, int integrated, uint32_t take,
++                      int gpu_only, int cpu_writes, int cpu_reads) {
+     const int want[] = {gpu_only, cpu_writes, cpu_reads};
+     const char *use[] = {"GPU only", "CPU writes", "CPU reads"};
+     for (int u = COLI_VK_MEM_GPU_ONLY; u <= COLI_VK_MEM_CPU_READS; u++) {
+-        const int got = vk_pick_memtype(m, integrated, (ColiVkMemUse)u);
++        const int got = vk_pick_memtype(m, take, integrated, (ColiVkMemUse)u);
+         CHECK(got == want[u], "%s, %s: type %d, expected %d", name, use[u], got, want[u]);
+     }
+ }
++/* the same where the buffers take every type */
++static void expect(const char *name, const VkPhysicalDeviceMemoryProperties *m, int integrated, int gpu_only,
++                   int cpu_writes, int cpu_reads) {
++    expect_in(name, m, integrated, ~0u, gpu_only, cpu_writes, cpu_reads);
++}
+ 
+ int main(void) {
+     /* A Radeon 8060S under RADV: a system heap and a device-local heap that is twice as large,
+@@ -107,6 +117,44 @@ int main(void) {
+     const VkPhysicalDeviceMemoryProperties big = table(big_h, 2, apu_t, 6);
+     expect("integrated, large device-local heap", &big, 1, 3, 1, 3);
+ 
++    /* An Arc Pro B60 (Battlemage) under Mesa ANV 26.0.8, its heaps as the driver reports them:
++     * type 0 is the CCS-only (compressed) device-local type, which ANV keeps for images unless
++     * the driconf anv_enable_buffer_comp is on, and types 4 to 6 repeat 1 to 3. Its buffers'
++     * memoryTypeBits leave type 0 out: the GPU-only type is type 1, where it was type 0 (the
++     * dense chain's buffers refused it, and the chain stayed off). On the card (an SR-IOV VF)
++     * the backend's probe buffer takes types 1 to 3 ("they take types 0xe"), not 0 or 4 to 6;
++     * 0x7e gives the same choice. */
++    const Heap xe2_h[] = {{25490882560ull, LOCAL_HEAP}, {199211848704ull, 0}};
++    const Type xe2_t[] = {{DL, 0}, {DL, 0}, {HV | COH | CACHED, 1}, {DL | HV | COH, 0},
++                          {DL, 0}, {HV | COH | CACHED, 1}, {DL | HV | COH, 0}};
++    const VkPhysicalDeviceMemoryProperties xe2 = table(xe2_h, 2, xe2_t, 7);
++    expect_in("Xe2, buffers take every type but 0", &xe2, 0, 0x7e, 1, 3, 2);
++    expect_in("Xe2, buffers take types 1 to 3", &xe2, 0, 0x0e, 1, 3, 2);
++    /* anv_enable_buffer_comp=true: type 0 takes buffers, and the choice is the one before */
++    expect_in("Xe2 with anv_enable_buffer_comp", &xe2, 0, 0x7f, 0, 3, 2);
++    expect("Xe2 from the properties alone", &xe2, 0, 0, 3, 2);
++
++    /* where every type takes buffers, their bits change nothing (the other tables above) */
++    expect_in("APU, integrated, every type's bit", &apu, 1, 0x3f, 3, 1, 3);
++    expect_in("discrete with Resizable BAR, every type's bit", &bar, 0, 0x0f, 0, 1, 3);
++    expect_in("discrete without Resizable BAR, every type's bit", &win, 0, 0x0f, 0, 2, 3);
++    /* an integrated GPU whose buffers refuse its cached system type (3): every use falls to the
++     * write-combined one */
++    expect_in("APU, buffers refuse the cached system type", &apu, 1, 0x37, 1, 1, 1);
++
++    /* a buffer asked for a type it does not take: that type where it takes it, else the first
++     * it takes with every property of it (in that type's heap first), else none */
++    CHECK(vk_allowed_memtype(&xe2, 0x7e, 0) == 1, "Xe2: type 0 refused, type 1 instead (device-local as well)");
++    CHECK(vk_allowed_memtype(&xe2, 0x7f, 0) == 0 && vk_allowed_memtype(&xe2, 0x7e, 3) == 3 &&
++          vk_allowed_memtype(&xe2, 0x7e, 2) == 2, "a type the buffer takes stays");
++    CHECK(vk_allowed_memtype(&xe2, 0x08, 0) == 3, "device-local asked, only a host-visible device-local type taken: that one");
++    CHECK(vk_allowed_memtype(&xe2, 0x03, 3) == -1, "host-visible asked, no host-visible type taken: none");
++    CHECK(vk_allowed_memtype(&xe2, 0x7e, 7) == -1, "a type past the table: none");
++    CHECK(vk_allowed_memtype(&apu, 0x38, 1) == 3 && vk_allowed_memtype(&apu, 0x30, 1) == -1,
++          "an AMD-specific type is never the stand-in for a plain one");
++    CHECK(vk_allowed_memtype(&win, 0x0c, 1) == 3, "no Resizable BAR, system memory asked: the other system type, not the window");
++    CHECK(vk_allowed_memtype(&win, 0x0e, 0) == 2, "no Resizable BAR, device-local asked, none left in its heap: the window");
++
+     /* the device memory */
+     CHECK(vk_heap_is_device_memory(&apu, 1, 0) && vk_heap_is_device_memory(&apu, 1, 1),
+           "every heap of an integrated GPU is device memory");
+@@ -116,13 +164,15 @@ int main(void) {
+     CHECK(vk_device_memory_size(&apu, 0) == 69 * GIB, "another GPU: the device-local heap");
+     CHECK(vk_device_memory_size(&win, 0) == 8 * GIB, "another GPU: the largest device-local heap");
+ 
+-    /* the retry of an allocation that is out of memory: system memory types only, integrated only */
+-    CHECK(vk_retry_memtype(&apu, 1, 1) == 2 && vk_retry_memtype(&apu, 1, 3) == 2 &&
+-          vk_retry_memtype(&big, 1, 1) == 2, "system memory retries in the device-local host-visible type");
+-    CHECK(vk_retry_memtype(&apu, 1, 0) == -1 && vk_retry_memtype(&apu, 1, 2) == -1,
++    /* the retry of an allocation that is out of memory: system memory types only, integrated only,
++     * among the types the buffers take */
++    CHECK(vk_retry_memtype(&apu, ~0u, 1, 1) == 2 && vk_retry_memtype(&apu, ~0u, 1, 3) == 2 &&
++          vk_retry_memtype(&big, ~0u, 1, 1) == 2, "system memory retries in the device-local host-visible type");
++    CHECK(vk_retry_memtype(&apu, ~0u, 1, 0) == -1 && vk_retry_memtype(&apu, ~0u, 1, 2) == -1,
+           "a device-local type has no retry");
+-    CHECK(vk_retry_memtype(&apu, 0, 1) == -1, "another GPU has no retry");
+-    CHECK(vk_retry_memtype(&uncached_only, 1, 1) == -1, "no host-visible device-local type to retry in");
++    CHECK(vk_retry_memtype(&apu, ~0u, 0, 1) == -1, "another GPU has no retry");
++    CHECK(vk_retry_memtype(&uncached_only, ~0u, 1, 1) == -1, "no host-visible device-local type to retry in");
++    CHECK(vk_retry_memtype(&apu, 0x1b, 1, 1) == -1, "no host-visible device-local type the buffers take: no retry");
+ 
+     /* budget and room: the usage of the system heap exceeds the budget reported for it, as on
+      * RADV once a tier is larger than the heap, and the device-local heap has room. */
+diff --git a/c/tests/test_vk_tier.c b/c/tests/test_vk_tier.c
+index f2c693e9..d8e0f73b 100644
+--- a/c/tests/test_vk_tier.c
++++ b/c/tests/test_vk_tier.c
+@@ -1333,12 +1333,14 @@ static unsigned long long hy_pairs(const char *line) {
+     p = strstr(p, "steps, ");
+     return p ? strtoull(p + 7, NULL, 10) : ~0ull;
+ }
+-/* vkt_host_pairs alone: 12 pairs of three experts over five rows, all at once (an expert's
+- * pairs grouped, its rows read once) and one by one; the same bits, and the float reference
+- * within tol (the float form's or the integer form's error, whichever vk_tier.c computes) */
++/* vkt_host_pairs alone: 12 pairs of three experts over eight rows, all at once (an expert's
++ * pairs grouped, its rows read once: 7, 3 and 2 rows, so a kernel's paths for one to four rows
++ * and past four run) and one by one; the same bits, and the float reference within tol (the
++ * float form's or the integer form's error, whichever vk_tier.c computes; FP8 has only the float
++ * form, so 1e-5 for it) */
+ static void host_pairs_case(double tol) {
+-    enum { HP = 512, FP = 256, NE = 3, NR = 5, NP = 12 };
+-    static const int pe[NP] = {0, 1, 2, 0, 1, 0, 2, 1, 0, 2, 2, 1}, pr[NP] = {0, 0, 0, 1, 1, 2, 2, 3, 3, 3, 4, 4};
++    enum { HP = 512, FP = 256, NE = 3, NR = 8, NP = 12 };
++    static const int pe[NP] = {0, 1, 2, 0, 1, 0, 2, 0, 0, 1, 0, 0}, pr[NP] = {0, 0, 1, 1, 2, 2, 3, 3, 4, 5, 6, 7};
+     /* a GGUF's block types, and colibri's int4-g64 pairs (fmt 4) and int8 a row (fmt 1), the
+      * host pool's layouts of VKT_SRC_I4U_PAIRS_GS and VKT_SRC_I8_ROW */
+     static const int ty[7][2] = {{GQ_Q4_K, GQ_Q6_K}, {GQ_IQ2_XXS, GQ_IQ3_XXS}, {-4, -4}, {-1, -1}, {-5, -5}, {-7, -7}, {-12, -12}};
+@@ -1388,7 +1390,7 @@ static void host_pairs_case(double tol) {
+         printf("  %-16s %d pairs of %d experts: grouped %s one by one, worst relative error %.2e against the float reference\n",
+                nm[c], NP, NE, diff ? "DIFFERS from" : "the same bits as", worst);
+         CHECK(!diff, "host pairs %s: the grouped pairs are not the bits of each on its own", nm[c]);
+-        CHECK(worst < tol, "host pairs %s: relative error %.3g", nm[c], worst);
++        CHECK(worst < (ty[c][0] == -12 && tol > 1e-5 ? 1e-5 : tol), "host pairs %s: relative error %.3g", nm[c], worst);
+         free(x); free(gs); free(hs); free(all); free(one); free(hr);
+         for (int e = 0; e < NE; e++) { mat_free(&xe[e].g); mat_free(&xe[e].u); mat_free(&xe[e].d); }
+     }
+diff --git a/c/vk_chain.c b/c/vk_chain.c
+index c23a4c0b..037ed414 100644
+--- a/c/vk_chain.c
++++ b/c/vk_chain.c
+@@ -17,6 +17,7 @@
+ #include "vk_alloc.h"
+ #include "vk_load.h"
+ #include "shaders/chain_qsa.h"
++#include <stdarg.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -268,6 +269,8 @@ VkcBuf *vkc_buf(size_t bytes, int kind) {
+     VkcBuf *b = calloc(1, sizeof *b);
+     if (!b) return NULL;
+     b->kind = kind; b->bytes = bytes; b->d = g_kd;
++    /* the pools' types come from a probe with these usages (backend_vulkan.c, vk_buffer_types):
++     * a usage added here goes there too */
+     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = bytes,
+         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                  VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,   /* vkc_moe_rows' dispatches */
+@@ -504,10 +507,23 @@ static uint32_t kc_shared_limit(void) {
+ #ifndef VKC_SANITIZED
+ #define VKC_SANITIZED 0
+ #endif
++/* vkc_init's ways out, each said: an engine whose vkc_init fails takes its per-matrix path, and
++ * on an Arc Pro B60 (Mesa ANV) the chain stayed off at its first device buffer without a line,
++ * its memory type one the buffers do not take (backend_vulkan.c, pick_memtype). Returns 0. */
++#if defined(__GNUC__) || defined(__clang__)
++__attribute__((format(printf, 1, 2)))
++#endif
++static int init_off(const char *fmt, ...) {
++    char why[256];
++    va_list ap;
++    va_start(ap, fmt); vsnprintf(why, sizeof why, fmt, ap); va_end(ap);
++    fprintf(stderr, "[VK] %schain: %s, the chain stays off\n", g_kd ? "dev2 " : "", why);
++    return 0;
++}
+ static void ev_setup(void);
+ int vkc_init(void) {
+     if (KC.ready) return !KC.lost;
+-    if (!coli_vk_core_dev(g_kd, &KC.core)) return 0;
++    if (!coli_vk_core_dev(g_kd, &KC.core)) return init_off("no device ready (not started, or lost)");
+     KC.dev = (VkDevice)KC.core.device; KC.queue = (VkQueue)KC.core.queue;
+     /* 20 s tells a GPU that hangs. A software device (llvmpipe) generates a shader's code
+      * at its first launch, inside the frame's wait, and caches it on disk: on a CI runner's
+@@ -532,19 +548,19 @@ int vkc_init(void) {
+     VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+         .bindingCount = VKC_BIND, .pBindings = b};
+     VkPushConstantRange pr = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = 128};
+-    if (vkCreateDescriptorSetLayout(KC.dev, &li, NULL, &KC.dsl) != VK_SUCCESS) return 0;
++    VkResult r;
++    if ((r = vkCreateDescriptorSetLayout(KC.dev, &li, NULL, &KC.dsl)) != VK_SUCCESS)
++        return init_off("its descriptor set layout was refused (%d)", (int)r);
+     VkPipelineLayoutCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+         .setLayoutCount = 1, .pSetLayouts = &KC.dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
+-    if (vkCreatePipelineLayout(KC.dev, &pi, NULL, &KC.pl) != VK_SUCCESS) return 0;
++    if ((r = vkCreatePipelineLayout(KC.dev, &pi, NULL, &KC.pl)) != VK_SUCCESS)
++        return init_off("its pipeline layout was refused (%d)", (int)r);
+     for (int i = 0; i < P_NPIPE; i++) {
+         KC.mod[i] = load_module(KC.core.spv_path, pipe_file[i]);
+-        if (!KC.mod[i] || !(KC.pipe[i] = make_pipe(KC.mod[i], NULL))) {
+-            fprintf(stderr, "[VK] chain: shader %s unavailable, the chain stays off\n", pipe_file[i]);
+-            return 0;
+-        }
++        if (!KC.mod[i] || !(KC.pipe[i] = make_pipe(KC.mod[i], NULL))) return init_off("shader %s unavailable", pipe_file[i]);
+     }
+     KC.mod_dnrec = load_module(KC.core.spv_path, "chain_dnrec.spv");
+-    if (!KC.mod_dnrec) return 0;
++    if (!KC.mod_dnrec) return init_off("shader chain_dnrec.spv unavailable");
+     /* the vectorized decode GEMV, its x staging as large as the device's shared memory
+      * allows (16 KiB floats at most); COLI_VK_CHAIN_GEMV=0 keeps qmatmul.comp's */
+     {
+@@ -688,13 +704,15 @@ int vkc_init(void) {
+     }
+     VkCommandPoolCreateInfo cp = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = KC.core.qfam};
+-    if (vkCreateCommandPool(KC.dev, &cp, NULL, &KC.cpool) != VK_SUCCESS) return 0;
++    if ((r = vkCreateCommandPool(KC.dev, &cp, NULL, &KC.cpool)) != VK_SUCCESS)
++        return init_off("its command pool was refused (%d)", (int)r);
+     for (int i = 0; i < VKC_FRAMES; i++) {
+         VkCommandBufferAllocateInfo ca = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+             .commandPool = KC.cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+         VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+-        if (vkAllocateCommandBuffers(KC.dev, &ca, &KC.fr[i].cmd) != VK_SUCCESS ||
+-            vkCreateFence(KC.dev, &fi, NULL, &KC.fr[i].fence) != VK_SUCCESS) return 0;
++        if ((r = vkAllocateCommandBuffers(KC.dev, &ca, &KC.fr[i].cmd)) != VK_SUCCESS ||
++            (r = vkCreateFence(KC.dev, &fi, NULL, &KC.fr[i].fence)) != VK_SUCCESS)
++            return init_off("frame %d's command buffer or fence was refused (%d)", i, (int)r);
+     }
+     if (g_kd == 0 && coli_vk_timeline() && hyb_load(KC.dev)) {
+         VkSemaphoreTypeCreateInfo st = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE};
+@@ -727,10 +745,17 @@ int vkc_init(void) {
+         KC.pool[k].mapped = memtype_host_visible(KC.pool[k].memtype);
+         vka_pool_init(&KC.pool[k].p, coli_vk_block_bytes_dev(g_kd, VKC_BLOCK), 0);   /* smaller under COLI_VK_DEVICE_CAP_MB */
+     }
+-    if (!KC.pool[VKC_UP].mapped || !KC.pool[VKC_DOWN].mapped) return 0;
++    if (!KC.pool[VKC_UP].mapped || !KC.pool[VKC_DOWN].mapped)
++        return init_off("its upload or read-back memory type (%u, %u) is not host-visible",
++                        KC.pool[VKC_UP].memtype, KC.pool[VKC_DOWN].memtype);
+     KC.ready = 1;
+     KC.dummy = vkc_buf(256, VKC_DEV);
+-    if (!KC.dummy) { KC.ready = 0; return 0; }
++    if (!KC.dummy) {   /* its first device buffer, and with it the device pool's first block */
++        KC.ready = 0;
++        return init_off("its first device buffer was refused (memory type %u: the buffer, its pool's first block of "
++                        "%llu KiB, or the binding)", KC.pool[VKC_DEV].memtype,
++                        (unsigned long long)(KC.pool[VKC_DEV].p.block_bytes >> 10));
++    }
+     ev_setup();
+     return 1;
+ }
+@@ -762,9 +787,13 @@ static long chain_spin_us(void) {
+ }
+ static int frame_wait(VkcFrame *f) {
+     if (!f->inflight) return 1;
+-    if (g_hyb_flush) g_hyb_flush();   /* a hybrid step's host part the frame may wait for */
++    /* A hybrid step's host part, which a frame still running may wait for. Only then: vkc_begin
++     * waits here for the ring slot it recycles, a frame long done, and flushing there ran the
++     * newest step's pairs before its frame B was even recorded, the device idle through them
++     * (Qwen3.8-Flash-Next-FP8 on an Arc Pro B60: 1.4 ms of pairs, then frame B, a layer). */
++    VkResult r = vkGetFenceStatus(KC.dev, f->fence);
++    if (r == VK_NOT_READY && g_hyb_flush) g_hyb_flush();
+     double t0 = vkc_now_ms();
+-    VkResult r = VK_NOT_READY;
+     for (long spin = chain_spin_us(); spin > 0 && r == VK_NOT_READY && (vkc_now_ms() - t0) * 1000.0 < spin; )
+         r = vkGetFenceStatus(KC.dev, f->fence);
+     if (r == VK_NOT_READY) r = vkWaitForFences(KC.dev, 1, &f->fence, VK_TRUE, KC.fence_ns);
+@@ -854,6 +883,10 @@ int vkc_begin(void) {
+ int vkc_submit(int wait) {
+     if (KC.cur < 0) return vkc_ready();
+     VkcFrame *f = &KC.fr[KC.cur];
++    /* a frame that waits for the host's value goes off once the host has signalled it: its pairs
++     * now (they run while the frame B before computes the device's experts), never a frame
++     * submitted before the value it waits for */
++    if (f->wait_h && g_hyb_flush) g_hyb_flush();
+     barrier_now(f->cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+     vkEndCommandBuffer(f->cmd);
+     f->open = 0; KC.cur = -1;
+@@ -921,6 +954,7 @@ int vkc_split_layers(void) {
+ int vkc_layer_recorded(int *layers) {
+     const int every = vkc_split_layers();
+     if (every < 1 || ++*layers < every) return 1;
++    if (KC.cur >= 0 && KC.fr[KC.cur].wait_h) return 1;   /* a frame C goes off with the next layer's step */
+     *layers = 0;
+     return vkc_submit(0) && vkc_begin();
+ }
+@@ -1610,36 +1644,78 @@ static VkPipeline attn_h_pipe(void) {
+  * KV cache S * H times, which held a 2048-row chunk of Qwen3.6 at 1.2 s a layer on a
+  * Radeon 780M. From COLI_VK_ATTN_BLOCK rows (16; 0 = never) a call takes chain_attnb,
+  * one workgroup per KV head and block of rows: each K and V row read once per block.
+- * Below it, and for decode and an MTP verify, chain_attn's bits as before. */
+-static struct { VkShaderModule mod; VkPipeline pipe, pipe_h; int tried, tried_h, bc; } g_kab[2];
++ * Below it, and for decode and an MTP verify, chain_attn's bits as before.
++ * The head dims fixed in the pipeline (the shader's HDC and VDC), one a (head dim, V's head
++ * dim, cache type, vec): no test of each dim against the push constants, and with vec a
++ * float16 cache's K and V a uvec4 a load. An Arc Pro B60 at subgroups of 16, Qwen3.6 over
++ * 16K positions with a float16 cache: a 255-row chunk 185.1 -> 25.7 ms (485.4 -> 130.0 ms at
++ * the reported 32), 4096 rows in 2^36 slices 2.32 -> 0.32 s (32K: 5.66 -> 0.78 s); a float32
++ * cache about 3 times faster. Their q.k sums are the fused multiply-adds in order, what the
++ * generic pipeline's compile to where the driver fuses a*b + c, and not one output bit moved:
++ * on the B60 (Mesa ANV 26.0.8, tiles of 8 positions) in every form the shader takes
++ * (test_vk_chain's blocked cases) and in those chunks of 255 to 4096 rows at 16K and 32K
++ * positions, either cache, at subgroups of 16 and 32; on Lavapipe (tiles of 8) in every form.
++ * So they are the default there only: ANV on Xe2 (its smallest subgroup 16) and Lavapipe, at
++ * tiles of 8 or 4. Other Intel GPUs under ANV, tiles of 16 (64 KiB of shared memory) and
++ * other drivers keep the generic pipeline, one a cache type, unless
++ * COLI_VK_ATTN_BLOCK_FIXED=1 (0: the generic one everywhere). VKC_KAB_MAX shapes: a model
++ * takes one or two head-dim pairs a cache type, with and without vec; the last two places are
++ * the generic pipelines', which a shape past the others takes, as one whose fixed pipeline
++ * failed does (the same bits where the fixed ones are the default). */
++#define VKC_KAB_MAX 32
++static struct {
++    VkShaderModule mod; int tried, bc, fixed, n;
++    VkPipeline p[VKC_KAB_MAX]; int hd[VKC_KAB_MAX], vd[VKC_KAB_MAX], kv[VKC_KAB_MAX], vec[VKC_KAB_MAX];
++} g_kab[2];
+ #define KAB (g_kab[g_kd])
+-static VkPipeline kab_pipe(void) {
+-    if (g_kvh && KAB.pipe && !KAB.pipe_h && !KAB.tried_h) {   /* a float16 cache's twin */
+-        KAB.tried_h = 1;
+-        int32_t v[2] = {KAB.bc, 1};
+-        VkSpecializationMapEntry me[2] = {{0, 0, 4}, {7, 4, 4}};
+-        VkSpecializationInfo si = {2, me, sizeof v, v};
+-        KAB.pipe_h = make_pipe(KAB.mod, &si);
+-    }
+-    if (KAB.pipe || KAB.tried || !vkc_ready()) return g_kvh ? KAB.pipe_h : KAB.pipe;
+-    KAB.tried = 1;
+-    /* the tile of positions as the device's shared memory allows: K and V rows of 256
+-     * floats, the partial dots and the scores, about 3.2 KiB a position */
+-    VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
+-    int bc = 16;
+-    while (bc >= 4 && (size_t)bc * (2 * 256 + 32 * 8 + 32 + 1) * 4 > pp.limits.maxComputeSharedMemorySize) bc /= 2;
+-    if (bc < 4) return VK_NULL_HANDLE;
+-    if ((KAB.mod = load_module(KC.core.spv_path, "chain_attnb.spv"))) {
+-        int32_t v = bc;
+-        VkSpecializationMapEntry me = {0, 0, 4};
+-        VkSpecializationInfo si = {1, &me, 4, &v};
+-        if ((KAB.pipe = make_pipe(KAB.mod, &si))) KAB.bc = bc;
+-    }
+-    return g_kvh && KAB.pipe ? kab_pipe() : KAB.pipe;
++static VkPipeline kab_pipe(int hd, int vd, int kv16, int vec) {
++    if (!KAB.mod) {
++        if (KAB.tried || !vkc_ready()) return VK_NULL_HANDLE;
++        KAB.tried = 1;
++        /* the tile of positions as the device's shared memory allows: K and V rows of 256
++         * floats, the partial dots and the scores, about 3.2 KiB a position */
++        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
++        int bc = 16;
++        while (bc >= 4 && (size_t)bc * (2 * 256 + 32 * 8 + 32 + 1) * 4 > pp.limits.maxComputeSharedMemorySize) bc /= 2;
++        if (bc < 4 || !(KAB.mod = load_module(KC.core.spv_path, "chain_attnb.spv"))) return VK_NULL_HANDLE;
++        KAB.bc = bc;
++        VkPhysicalDeviceDriverProperties dp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
++        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &dp};
++        if (pp.apiVersion >= VK_API_VERSION_1_2) vkGetPhysicalDeviceProperties2((VkPhysicalDevice)KC.core.phys, &p2);
++        uint32_t min_sg = 0;
++        if (dp.driverID == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) {   /* ANV has subgroup size control on every GPU it drives */
++            VkPhysicalDeviceSubgroupSizeControlPropertiesEXT sp = {
++                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT};
++            VkPhysicalDeviceProperties2 s2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sp};
++            vkGetPhysicalDeviceProperties2((VkPhysicalDevice)KC.core.phys, &s2);
++            min_sg = sp.minSubgroupSize;
++        }
++        KAB.fixed = bc <= 8 && (dp.driverID == VK_DRIVER_ID_MESA_LLVMPIPE ||
++                                (dp.driverID == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA && min_sg == 16));   /* measured: Xe2, Lavapipe */
++    }
++    const char *e = getenv("COLI_VK_ATTN_BLOCK_FIXED");   /* each call, as COLI_VK_ATTN_BLOCK (tests switch it) */
++    if (!(e && *e ? *e == '1' : KAB.fixed)) hd = vd = vec = 0;
++    const int fixed = hd || vd || vec;
++    for (int i = 0; i < KAB.n; i++)
++        if (KAB.hd[i] == hd && KAB.vd[i] == vd && KAB.kv[i] == kv16 && KAB.vec[i] == vec)
++            return KAB.p[i] || !fixed ? KAB.p[i] : kab_pipe(0, 0, kv16, 0);
++    if (fixed && KAB.n >= VKC_KAB_MAX - 2) return kab_pipe(0, 0, kv16, 0);   /* the last two places: the generic ones' */
++    if (KAB.n == VKC_KAB_MAX) return VK_NULL_HANDLE;
++    int32_t sv[5] = {KAB.bc, hd, vd, vec, kv16};
++    VkSpecializationMapEntry me[5] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}, {7, 16, 4}};
++    VkSpecializationInfo si = {5, me, sizeof sv, sv};
++    VkPipeline p = make_pipe(KAB.mod, &si);   /* kept when it fails too: not tried again */
++    KAB.p[KAB.n] = p; KAB.hd[KAB.n] = hd; KAB.vd[KAB.n] = vd; KAB.kv[KAB.n] = kv16; KAB.vec[KAB.n++] = vec;
++    if (!p && fixed)
++        fprintf(stderr, "[VK] %schain: chain_attnb's pipeline for head dims %d/%d (a %s cache%s) failed: its generic one "
++                "instead\n", g_kd ? "dev2 " : "", hd, vd, kv16 ? "float16" : "float32", vec ? ", uvec4 loads" : "");
++    else if (!p)
++        fprintf(stderr, "[VK] %schain: chain_attnb's pipeline (a %s cache) failed: no blocked attention\n", g_kd ? "dev2 " : "",
++                kv16 ? "float16" : "float32");
++    return p || !fixed ? p : kab_pipe(0, 0, kv16, 0);
+ }
+ static void kab_shutdown(void) {
+-    if (KAB.pipe) vkDestroyPipeline(KC.dev, KAB.pipe, NULL);
+-    if (KAB.pipe_h) vkDestroyPipeline(KC.dev, KAB.pipe_h, NULL);
++    for (int i = 0; i < KAB.n; i++) if (KAB.p[i]) vkDestroyPipeline(KC.dev, KAB.p[i], NULL);
+     if (KAB.mod) vkDestroyShaderModule(KC.dev, KAB.mod, NULL);
+     memset(&KAB, 0, sizeof KAB);
+ }
+@@ -1652,22 +1728,50 @@ static void kab_shutdown(void) {
+  * frame it is in (submitted, not waited for) and the next opening a frame of its own: the
+  * next frame's first barrier orders it after the slice. A slice starts at a multiple of
+  * `align` (the blocked attention's rows per workgroup), so its blocks are the ones the
+- * whole dispatch would have made, and no row's arithmetic changes. */
++ * whole dispatch would have made, and no row's arithmetic changes.
++ * The budget alone starves a big GPU: chain_attnb makes a workgroup of a KV head and 32 / G
++ * rows, so Qwen3.6's 16K prompt went in slices of 64 rows, 32 workgroups, to an Arc Pro B60
++ * that keeps 80 resident (20 Xe-cores x 4) and runs 2 to 40 of them in the same 90 ms; raising
++ * the budget to 2^36 took its 16K prompt from 118.5 to 90.0 s and its 32K one from 741.6 to
++ * 281.5, the same answers. So a slice is cut to keep COLI_VK_ATTN_SLICE_WG workgroups (64,
++ * most of the B60's 80; 0 = the budget alone), `wg` of them a block of `align` rows, as far as
++ * 4x the budget's work (up to 7x the budget's own slice where that one rounds down to one
++ * block), and a chunk's rows then go in slices of one size on the blocks, not full ones and a
++ * last of a few blocks (so some, and the last, may keep fewer). One layer of that prompt
++ * replayed on the B60 (4096-row chunks, this chain_attnb): 16K 9.31 -> 6.04 s, 161 -> 112
++ * submissions, the longest 90 -> 94 ms; 32K 69.0 -> 24.2 s, 592 -> 240, 180 -> 188 ms. An
++ * integrated GPU keeps the budget alone (0) until one is measured: the budget is there for
++ * the slow GPUs a driver's timeout catches (the 780M above; Windows' TDR at 2 s). */
+ static long long attn_slice_budget(void) {
+     const char *e = getenv("COLI_VK_ATTN_SLICE");
+     long long v = e && *e ? atoll(e) : (1LL << 32);
+     return v < 0 ? 0 : v;
+ }
+ long long vkc_attn_slice_budget(void) { return attn_slice_budget(); }
+-static int attn_slice_rows(int S, int pos_base, double width, int align) {
++static int attn_slice_wg(void) {
++    const char *e = getenv("COLI_VK_ATTN_SLICE_WG");
++    int v = e && *e ? atoi(e) : KC.core.integrated ? 0 : 64;
++    return v < 0 ? 0 : v;
++}
++static int attn_slice_rows(int S, int pos_base, double width, int align, int wg) {
+     long long b = attn_slice_budget();
+     if (align < 1) align = 1;
++    if (wg < 1) wg = 1;
+     if (!b || S <= align) return S;
+     double per_row = (double)(pos_base + S) * (width > 1 ? width : 1);
+-    long long rr = (long long)((double)b / per_row);
++    long long rr = (long long)((double)b / per_row), mw = attn_slice_wg();
+     rr = rr / align * align;
+     if (rr < align) rr = align;
+-    return rr >= S ? S : (int)rr;
++    if (!mw) return rr >= S ? S : (int)rr;
++    long long fl = (mw + wg - 1) / wg * align;   /* the floor's rows */
++    if (rr < fl) {   /* up to the floor, as far as 4x the budget's rows */
++        long long cap = (long long)(4.0 * (double)b / per_row) / align * align;
++        if (cap > fl) cap = fl;
++        if (cap > rr) rr = cap;
++    }
++    if (rr >= S) return S;
++    long long k = (S + rr - 1) / rr;   /* that many slices, of one size on the blocks */
++    return (int)(((S + k - 1) / k + align - 1) / align * align);
+ }
+ static int attn_slice_next(void) {   /* the open frame out, a new one in */
+     KC.st.attn_slices++;
+@@ -1733,9 +1837,16 @@ static int attn_dec_len(int n, int H) {   /* chain_attn_dec.comp's dec_len, H th
+     while (L < 256 && (int64_t)H * nb > 1024) { L *= 2; nb = (n + L - 1) / L; }
+     return L;
+ }
++/* COLI_VK_ATTN_DEC, the knob (not chain_attn_dec.comp's modes), read on each call as
++ * COLI_VK_ATTN_BLOCK is (test_vk_chain switches it): 0 keeps chain_attn; unset (1) takes
++ * chain_attn_dec where attn_dec's rule allows; 2 also on a device without the flash module
++ * (attn_dec) */
++static int adec_knob(void) {
++    const char *e = getenv("COLI_VK_ATTN_DEC");
++    return e && *e == '0' ? 0 : e && atoi(e) == 2 ? 2 : 1;
++}
+ static VkPipeline adec_pipe(void) {
+-    static int on = -1;
+-    if (on < 0) { const char *e = getenv("COLI_VK_ATTN_DEC"); on = !(e && *e == '0'); }
++    int on = adec_knob() > 0;
+     if (on && !KC.adec && !KC.adec_tried) {
+         KC.adec_tried = 1;
+         if ((KC.mod_adec = load_module(KC.core.spv_path, "chain_attn_dec.spv"))) KC.adec = make_pipe(KC.mod_adec, NULL);
+@@ -1746,7 +1857,8 @@ static VkPipeline adec_pipe(void) {
+ }
+ /* chain_attn_dec's grouped pipeline (mode 2) for gq query heads a KV head of head dim hd, made
+  * on first use; NULL where the shared memory it takes (the heads' q rows, scores and sums) is
+- * past the device's, or COLI_VK_ATTN_DEC_GQA=0 */
++ * past the device's, or COLI_VK_ATTN_DEC_GQA=0, or where it failed (kept as a pipeline is:
++ * attn_dec asks on every call, and the build is not tried again) */
+ static VkPipeline adg_pipe(int hd, int gq) {
+     static int on = -1;
+     if (on < 0) { const char *e = getenv("COLI_VK_ATTN_DEC_GQA"); on = !(e && *e == '0'); }
+@@ -1764,8 +1876,7 @@ static VkPipeline adg_pipe(int hd, int gq) {
+     int32_t sv[4] = {gq, hd, g_kvh, tpp};
+     VkSpecializationMapEntry me[4] = {{0, 0, 4}, {1, 4, 4}, {7, 8, 4}, {2, 12, 4}};
+     VkSpecializationInfo si = {4, me, sizeof sv, sv};
+-    VkPipeline p = make_pipe(KC.mod_adec, &si);
+-    if (!p) return VK_NULL_HANDLE;
++    VkPipeline p = make_pipe(KC.mod_adec, &si);   /* VK_NULL_HANDLE too: mode 0 from then on */
+     KC.adg[KC.nadg] = p; KC.adg_hd[KC.nadg] = hd; KC.adg_kv[KC.nadg] = g_kvh; KC.adg_gq[KC.nadg++] = gq;
+     return p;
+ }
+@@ -1797,11 +1908,17 @@ static int attn_dec(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate,
+      * answer to the last digit as the prompt recomputed does (tests/test_brio_serve.py).
+      * Windows, rings and sinks too, since the flash shader takes them: Flint's decode after a
+      * 17K prompt read its full layers' positions a workgroup a head, 15.4 tok/s on an
+-     * RTX PRO 4000 */
++     * RTX PRO 4000. COLI_VK_ATTN_DEC=2 (opt-in) gives those bits up on a device without the
++     * flash module, as if it had it: the rest of the rule holds (the grouped pipeline, adg_pipe,
++     * counts on its head dims and float16 offsets), and chain_attn_dec takes no matrix units. An
++     * Arc Pro B60 (Xe2, its cooperative matrices 8 rows tall: no flash module; an SR-IOV VF, Mesa
++     * ANV 26.0.8, the chain on at subgroups of 16) decoded Qwen3.6 after a 16K prompt at 5.03
++     * tok/s, chain_attn's 16 workgroups walking every position, and at 35.52 with =2 (32K: 2.71
++     * -> 33.88; after a short prompt 37.21 -> 38.00), its prompts as fast, the same answers */
+     int G = w->a.H / w->a.KVH;
+-    if (!(KC.mod_fa && vkc_attn_flash_rows() > 0 && !w->kv_pm && w->vd == w->a.hd &&
++    if (!((KC.mod_fa || adec_knob() == 2) && vkc_attn_flash_rows() > 0 && !w->kv_pm && w->vd == w->a.hd &&
+           w->a.hd % 64 == 0 && VKC_FA_ROWS % G == 0 && (!g_kvh || (w->a.k_off % 8 == 0 && w->a.v_off % 8 == 0)) &&
+-          fa_pipe(w->a.hd, G))) return 0;
++          (!KC.mod_fa || fa_pipe(w->a.hd, G)))) return 0;
+     if (S < 1 || S > VKC_ATTN_DEC_ROWS || n < VKC_ATTN_DEC_MIN || w->a.pos_base + 1 < VKC_ATTN_DEC_MIN || !adec_pipe()) return 0;
+     /* a KV head's query heads in one workgroup a block (mode 2), each K and V row read once
+      * for them, four floats a load (the offsets whole vec4s). Its blocks' rule counts four
+@@ -1827,6 +1944,14 @@ static int attn_dec(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate,
+     bd[7].written = 0;
+     ok = ok && record(KC.adec, bd, 8, &pc, sizeof pc, (uint32_t)w->a.H, (uint32_t)S, 1);
+     KC.st.attn_dec += ok;
++    static int said[2];   /* the opt-in, said where it first takes effect (the split KV cache, say, never does) */
++    if (ok && !KC.mod_fa && !said[g_kd]) {
++        said[g_kd] = 1;
++        fprintf(stderr, "[VK] %schain: COLI_VK_ATTN_DEC=2: attention of up to %d rows (decode, verify, a short prompt "
++                "chunk) over %d positions or more in blocks (chain_attn_dec) with no chain_attn_flash on this device; a "
++                "resumed prefix or a snapshot's scoring may differ in the last digits from a cold recompute (unset: "
++                "chain_attn, the prompt's bits)\n", g_kd ? "dev2 " : "", VKC_ATTN_DEC_ROWS, VKC_ATTN_DEC_MIN);
++    }
+     return ok;
+ }
+ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, VkcBuf *snk,
+@@ -1842,7 +1967,12 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
+     VkPipeline fp = KC.mod_fa && fl > 0 && w.a.S >= fl && !(sel && w.a.sel_row > 0) && !w.kv_pm &&
+                     w.vd == w.a.hd && w.a.hd % 64 == 0 && VKC_FA_ROWS % G == 0 && (!g_kvh || (w.a.k_off % 8 == 0 && w.a.v_off % 8 == 0))
+                     ? fa_pipe(w.a.hd, G) : VK_NULL_HANDLE;
+-    int blocked = !fp && blk > 0 && w.a.S >= blk && G <= 32 && kab_pipe(), br = w.a.sel_row > 0 ? 1 : 32 / G;
++    /* the blocked shader's K and V a uvec4 a load: a float16 cache's rows of whole uvec4s,
++     * head-major, a tile's positions consecutive (no ring, no list) */
++    int vec = g_kvh && !w.kv_pm && !w.ring && w.a.sel_row <= 0 && w.a.hd % 8 == 0 && w.vd % 8 == 0 &&
++              w.a.k_off % 8 == 0 && w.a.v_off % 8 == 0;
++    VkPipeline kp = !fp && blk > 0 && w.a.S >= blk && G <= 32 ? kab_pipe(w.a.hd, w.vd, g_kvh, vec) : VK_NULL_HANDLE;
++    int blocked = kp != VK_NULL_HANDLE, br = w.a.sel_row > 0 ? 1 : 32 / G;
+     /* a decode's or a verify's rows over many positions: split over them; a verify across
+      * VKC_ATTN_DEC_MIN positions in two calls, its rows before it as their decode steps run */
+     if (!fp && !blocked && !(sel && w.a.sel_row > 0) && w.a.S > 1 && w.a.S <= VKC_ATTN_DEC_ROWS &&
+@@ -1860,7 +1990,7 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
+      * chain_attnb's time a submission. At the budget's own size Qwen3.6's 16K prompt was cut
+      * into slices of 64 rows, 16 workgroups and a submission each: 5.9 s of attention */
+     int S = w.a.S, rr = attn_slice_rows(S, w.a.pos_base, (double)w.a.H * (w.a.hd > w.vd ? w.a.hd : w.vd) / (fp ? VKC_FA_SLICE : 1),
+-                                        fp ? VKC_FA_ROWS / G : blocked ? br : 1);
++                                        fp ? VKC_FA_ROWS / G : blocked ? br : 1, fp || blocked ? w.a.KVH : w.a.H);
+     int ok = 1;
+     for (int r0 = 0; ok && r0 < S; r0 += rr) {
+         VkcAttnW x = w;
+@@ -1874,7 +2004,7 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
+             KC.st.attn_flash += ok;
+         } else if (blocked) {
+             struct { VkcAttnW w; int br, B, anchor, part, st_off; } pc = {x, br, 0, 0, 0, 0};
+-            ok = record(kab_pipe(), bd, 7, &pc, sizeof pc, (uint32_t)x.a.KVH, (uint32_t)((x.a.S + br - 1) / br), 1);
++            ok = record(kp, bd, 7, &pc, sizeof pc, (uint32_t)x.a.KVH, (uint32_t)((x.a.S + br - 1) / br), 1);
+             KC.st.attn_blocked += ok;
+         } else {
+             VkPipeline ap = g_kvh ? attn_h_pipe() : KC.pipe[P_ATTN];
+@@ -1890,10 +2020,13 @@ static int attn_part_rec(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, const Vkc
+     if (w.vd <= 0) w.vd = w.a.hd;
+     int G = w.a.KVH > 0 ? w.a.H / w.a.KVH : 0;
+     if (w.a.hd > 256 || w.vd > 256 || G < 1 || G > 32 || w.a.H % w.a.KVH || w.a.sel_row > 0 || w.sink || w.ring || blk < 1 ||
+-        anchor < 0 || ch < 0 || (ch > 0 && (ch % 16 || nz < 1 || nz > 65535)) || !kab_pipe()) return 0;
++        anchor < 0 || ch < 0 || (ch > 0 && (ch % 16 || nz < 1 || nz > 65535))) return 0;
++    VkPipeline kp = kab_pipe(w.a.hd, w.vd, 0, 0);   /* the shadow's rows are float32 */
++    if (!kp) return 0;
+     w.a.has_gate = 0; w.a.g_off = ch; w.a.g_row = o_z; w.a.g_seg = st_z;   /* the chunks (unused by part otherwise) */
+     VkcBind bd[7] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(NULL, 0), B(NULL, 0), B(NULL, 0)};
+-    int br = 32 / G, S = w.a.S, rr = attn_slice_rows(S, w.a.pos_base, (double)w.a.H * (w.a.hd > w.vd ? w.a.hd : w.vd), br);
++    int br = 32 / G, S = w.a.S, rr = attn_slice_rows(S, w.a.pos_base, (double)w.a.H * (w.a.hd > w.vd ? w.a.hd : w.vd), br,
++                                                     w.a.KVH * (ch > 0 ? nz : 1));
+     int ok = 1;
+     for (int r0 = 0; ok && r0 < S; r0 += rr) {
+         VkcAttnW x = w;
+@@ -1902,7 +2035,7 @@ static int attn_part_rec(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, const Vkc
+         x.a.q_off += r0 * w.a.q_row; x.a.o_off += r0 * w.a.o_row;
+         if (r0 && !attn_slice_next()) return 0;
+         struct { VkcAttnW w; int br, B, anchor, part, st_off; } pc = {x, br, blk, anchor, 1, st_off + r0 * w.a.H * 2};
+-        ok = record(KAB.pipe, bd, 7, &pc, sizeof pc, (uint32_t)x.a.KVH, (uint32_t)((x.a.S + br - 1) / br), (uint32_t)(ch > 0 ? nz : 1));
++        ok = record(kp, bd, 7, &pc, sizeof pc, (uint32_t)x.a.KVH, (uint32_t)((x.a.S + br - 1) / br), (uint32_t)(ch > 0 ? nz : 1));
+         KC.st.attn_blocked += ok;
+     }
+     return ok;
+@@ -2236,7 +2369,7 @@ int vkc_mla_core(VkcBuf *qabs, VkcBuf *qr, VkcBuf *lat, VkcBuf *rope, VkcBuf *se
+     VkcBind bd[6] = {B(qabs, 0), B(qr, 0), B(lat, 0), B(p->R > 0 ? rope : NULL, 0), B(pc.b.sel_row > 0 ? sel : NULL, 0),
+                      B(clat, 1)};
+     /* a long prompt chunk in slices of rows, a submission each (attn_slice_rows) */
+-    int S = p->S, rr = attn_slice_rows(S, p->pos_base, (double)p->H * (p->K + p->R), 1), ok = 1;
++    int S = p->S, rr = attn_slice_rows(S, p->pos_base, (double)p->H * (p->K + p->R), 1, p->H), ok = 1;
+     for (int r0 = 0; ok && r0 < S; r0 += rr) {
+         CorePC x = pc;
+         x.b.S = S - r0 < rr ? S - r0 : rr; x.b.pos_base = p->pos_base + r0;
+@@ -3174,7 +3307,7 @@ int vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBu
+     VkcBind bd[8] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(kvs, 0), B(r, 0), B(relp, 0), B(tau, 0)};
+     /* a long prompt chunk in slices of rows, a submission each (attn_slice_rows): the
+      * shader's s0 is the slice's first row, pos_base stays the step's */
+-    int S = p->S, rr = attn_slice_rows(S, p->pos_base, (double)p->H * p->hd, 1), ok = 1;
++    int S = p->S, rr = attn_slice_rows(S, p->pos_base, (double)p->H * p->hd, 1, p->H), ok = 1;
+     for (int r0 = 0; ok && r0 < S; r0 += rr) {
+         struct { VkcRelAttn a; int s0; } x = {*p, r0};
+         x.a.S = S - r0 < rr ? S - r0 : rr;
+diff --git a/c/vk_chain.h b/c/vk_chain.h
+index 8141c503..754e9abb 100644
+--- a/c/vk_chain.h
++++ b/c/vk_chain.h
+@@ -179,7 +179,10 @@ long long vkc_attn_slice_budget(void);   /* COLI_VK_ATTN_SLICE below: rows x pos
+  * x heads x head dim pass COLI_VK_ATTN_SLICE (2^32; 0 = never) record their rows in slices,
+  * each ending its frame (submitted, not waited for) and the next in a new one: no single
+  * submission of a big prompt chunk runs for seconds (a driver resets a job past its
+- * timeout: amdgpu 10 s, Windows 2 s). The rows' arithmetic does not change. */
++ * timeout: amdgpu 10 s, Windows 2 s). A slice is cut to keep COLI_VK_ATTN_SLICE_WG workgroups
++ * (64; 0, the budget alone, on an integrated GPU) as far as 4x the budget's work, then a
++ * chunk's slices are made one size on the blocks, so some, and the last, may keep fewer. The
++ * rows' arithmetic does not change. */
+ /* chain_dnconv.comp (order 0, 1: Gated DeltaNet's, the sum's two orders; 2: LFM3's gated
+  * convolution, input rows B | C | x of CD channels, out = C * conv(B * x), no activation) */
+ typedef struct { int S, CD, CK, in_off, in_row, out_off, out_row, snap_row, order, w_off, ring_off, snap_off; } VkcDnConv;
+diff --git a/c/vk_memtype.h b/c/vk_memtype.h
+index a2f538fc..17d7444e 100644
+--- a/c/vk_memtype.h
++++ b/c/vk_memtype.h
+@@ -1,10 +1,16 @@
+ /* vk_memtype.h -- the memory type of a Vulkan buffer, chosen by what the buffer is used for,
+  * and the size, budget and room of the device memory (backend_vulkan.c). The functions depend
+- * on the memory properties of the device only, so tests/test_vk_memtype.c checks them on tables.
++ * on the memory properties of the device and on the types its buffers take (a buffer's
++ * memoryTypeBits) only, so tests/test_vk_memtype.c checks them on tables.
+  *
+  * An integrated GPU with a heap of system memory gets host-visible, coherent system memory
+  * instead of the BIOS-reserved VRAM (the carve-out), which also contains the GPU page tables.
+- * A system memory allocation that runs out of memory is retried in a device-local type. */
++ * A system memory allocation that runs out of memory is retried in a device-local type.
++ *
++ * A type is chosen among those the buffers take: Mesa's ANV lists first, on an Arc Pro B60
++ * (Battlemage, Mesa 26.0.8), a device-local type it keeps for images (its CCS-only compressed
++ * type; the driconf anv_enable_buffer_comp=true lets buffers have it). Chosen from the
++ * properties alone, that type was the GPU-only one and the dense chain's buffers were refused. */
+ #ifndef COLI_VK_MEMTYPE_H
+ #define COLI_VK_MEMTYPE_H
+ 
+@@ -24,12 +30,13 @@ static inline int vk_heap_is_device_memory(const VkPhysicalDeviceMemoryPropertie
+     return integrated || (m->memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT);
+ }
+ 
+-/* The first type with every flag of `want` and none of `avoid`, or -1. */
+-static inline int vk_first_type(const VkPhysicalDeviceMemoryProperties *m, VkMemoryPropertyFlags want,
++/* The first type among `take` (a buffer's memoryTypeBits, ~0u for any type) with every flag of
++ * `want` and none of `avoid`, or -1. */
++static inline int vk_first_type(const VkPhysicalDeviceMemoryProperties *m, uint32_t take, VkMemoryPropertyFlags want,
+                                 VkMemoryPropertyFlags avoid) {
+     for (uint32_t i = 0; i < m->memoryTypeCount; i++) {
+         const VkMemoryPropertyFlags f = m->memoryTypes[i].propertyFlags;
+-        if ((f & want) == want && !(f & avoid)) return (int)i;
++        if ((take >> i & 1u) && (f & want) == want && !(f & avoid)) return (int)i;
+     }
+     return -1;
+ }
+@@ -37,24 +44,27 @@ static inline int vk_first_type(const VkPhysicalDeviceMemoryProperties *m, VkMem
+ /* A host-visible, coherent type outside the device-local heaps, cached or write-combined, else
+  * the other kind. Lazily allocated, protected and AMD-specific types (device-coherent,
+  * device-uncached) are skipped. */
+-static inline int vk_system_memtype(const VkPhysicalDeviceMemoryProperties *m, int cached) {
++static inline int vk_system_memtype(const VkPhysicalDeviceMemoryProperties *m, uint32_t take, int cached) {
+     const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+     const VkMemoryPropertyFlags avoid =
+         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT |
+         VK_MEMORY_PROPERTY_PROTECTED_BIT | VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD |
+         VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD;
+-    const int t = cached ? vk_first_type(m, want | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, avoid)
+-                         : vk_first_type(m, want, avoid | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+-    return t >= 0 ? t : vk_first_type(m, want, avoid);
++    const int t = cached ? vk_first_type(m, take, want | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, avoid)
++                         : vk_first_type(m, take, want, avoid | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
++    return t >= 0 ? t : vk_first_type(m, take, want, avoid);
+ }
+ 
+-/* The memory type for a buffer used as `use`, or -1 when the device has none. */
+-static inline int vk_pick_memtype(const VkPhysicalDeviceMemoryProperties *m, int integrated, ColiVkMemUse use) {
++/* The memory type for a buffer used as `use`, among `take` (the types the device's buffers take,
++ * ~0u for any type), or -1 when the device has none. Where every type takes buffers it is the
++ * type chosen from the properties alone. */
++static inline int vk_pick_memtype(const VkPhysicalDeviceMemoryProperties *m, uint32_t take, int integrated,
++                                  ColiVkMemUse use) {
+     if (integrated) {
+         /* Write-combined memory is enough for what the CPU writes and never reads back. The dense
+          * chain also maps buffers used by the GPU alone and may read them on the CPU, so those
+          * get cached memory. */
+-        const int t = vk_system_memtype(m, use != COLI_VK_MEM_CPU_WRITES);
++        const int t = vk_system_memtype(m, take, use != COLI_VK_MEM_CPU_WRITES);
+         if (t >= 0) return t;
+     }
+     /* The CPU writes through a host-visible, device-local type where there is one. On a discrete
+@@ -64,24 +74,47 @@ static inline int vk_pick_memtype(const VkPhysicalDeviceMemoryProperties *m, int
+     int t = -1;
+     switch (use) {
+     case COLI_VK_MEM_GPU_ONLY:
+-        t = vk_first_type(m, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
++        t = vk_first_type(m, take, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+         break;
+     case COLI_VK_MEM_CPU_READS:
+-        t = vk_first_type(m, visible | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0);
++        t = vk_first_type(m, take, visible | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0);
+         break;
+     case COLI_VK_MEM_CPU_WRITES:
+         break;
+     }
+-    if (t < 0) t = vk_first_type(m, visible | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+-    return t >= 0 ? t : vk_first_type(m, visible, 0);
++    if (t < 0) t = vk_first_type(m, take, visible | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
++    return t >= 0 ? t : vk_first_type(m, take, visible, 0);
++}
++
++/* The type to bind a buffer to that was asked for in `type`: `type` where the buffer takes it
++ * (`take`, its memoryTypeBits), else the first type it takes with every property flag of
++ * `type`, passing over the lazily allocated, protected and AMD-specific ones, in `type`'s heap
++ * first (the heap its callers count the allocation in: on a card without Resizable BAR a refused
++ * system memory type would otherwise get the 256 MiB window); -1 when it takes none.
++ * Binding a type a buffer does not take is invalid usage, whatever a driver lets pass. */
++static inline int vk_allowed_memtype(const VkPhysicalDeviceMemoryProperties *m, uint32_t take, uint32_t type) {
++    if (type >= m->memoryTypeCount) return -1;
++    if (take >> type & 1u) return (int)type;
++    const VkMemoryPropertyFlags f = m->memoryTypes[type].propertyFlags;
++    const VkMemoryPropertyFlags odd = VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT |
++                                      VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD | VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD;
++    for (uint32_t i = 0; i < m->memoryTypeCount; i++) {
++        const VkMemoryPropertyFlags g = m->memoryTypes[i].propertyFlags;
++        if ((take >> i & 1u) && m->memoryTypes[i].heapIndex == m->memoryTypes[type].heapIndex && (g & f) == f &&
++            !(g & odd & ~f))
++            return (int)i;
++    }
++    return vk_first_type(m, take, f, odd & ~f);
+ }
+ 
+ /* The type to retry an allocation in when `type`, a system memory type picked for an integrated
+- * GPU, is out of memory: the first host-visible, coherent, device-local type, or -1. */
+-static inline int vk_retry_memtype(const VkPhysicalDeviceMemoryProperties *m, int integrated, uint32_t type) {
++ * GPU, is out of memory: the first host-visible, coherent, device-local type among `take` (the
++ * types the device's buffers take, as for the types above), or -1. */
++static inline int vk_retry_memtype(const VkPhysicalDeviceMemoryProperties *m, uint32_t take, int integrated,
++                                   uint32_t type) {
+     if (!integrated || (m->memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) return -1;
+-    return vk_first_type(m, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+-                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
++    return vk_first_type(m, take, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
++                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+ }
+ 
+ /* The size of the device memory: the largest device-local heap, or all heaps of an integrated GPU
+diff --git a/c/vk_tier.c b/c/vk_tier.c
+index 5e2afe46..c39aea77 100644
+--- a/c/vk_tier.c
++++ b/c/vk_tier.c
+@@ -1753,6 +1753,199 @@ static float dev_fp8(uint8_t b) {   /* e4m3 as the backend decodes it */
+     const float v = e == 0 ? m / 512.0f : ldexpf(1.0f + m / 8.0f, e - 7);
+     return (b & 0x80) ? -v : v;
+ }
++/* dev_fp8 of every code, written out (exact: three mantissa bits). The hybrid steps' FP8 rows read
++ * their weights from it instead of an ldexpf and a division for the scale per weight. As in
++ * dev_fp8, the two NaN codes of e4m3 (0x7f, 0xff) are finite here (+-480) where the shaders and
++ * quant.h give NaN; a well-formed checkpoint saturates at +-448 and never holds them. */
++static const float fp8_e4m3[256] __attribute__((aligned(64))) = {
++    0.0f, 0x1p-9f, 0x1p-8f, 0x1.8p-8f, 0x1p-7f, 0x1.4p-7f, 0x1.8p-7f, 0x1.cp-7f,
++    0x1p-6f, 0x1.2p-6f, 0x1.4p-6f, 0x1.6p-6f, 0x1.8p-6f, 0x1.ap-6f, 0x1.cp-6f, 0x1.ep-6f,
++    0x1p-5f, 0x1.2p-5f, 0x1.4p-5f, 0x1.6p-5f, 0x1.8p-5f, 0x1.ap-5f, 0x1.cp-5f, 0x1.ep-5f,
++    0x1p-4f, 0x1.2p-4f, 0x1.4p-4f, 0x1.6p-4f, 0x1.8p-4f, 0x1.ap-4f, 0x1.cp-4f, 0x1.ep-4f,
++    0x1p-3f, 0x1.2p-3f, 0x1.4p-3f, 0x1.6p-3f, 0x1.8p-3f, 0x1.ap-3f, 0x1.cp-3f, 0x1.ep-3f,
++    0x1p-2f, 0x1.2p-2f, 0x1.4p-2f, 0x1.6p-2f, 0x1.8p-2f, 0x1.ap-2f, 0x1.cp-2f, 0x1.ep-2f,
++    0x1p-1f, 0x1.2p-1f, 0x1.4p-1f, 0x1.6p-1f, 0x1.8p-1f, 0x1.ap-1f, 0x1.cp-1f, 0x1.ep-1f,
++    0x1p+0f, 0x1.2p+0f, 0x1.4p+0f, 0x1.6p+0f, 0x1.8p+0f, 0x1.ap+0f, 0x1.cp+0f, 0x1.ep+0f,
++    0x1p+1f, 0x1.2p+1f, 0x1.4p+1f, 0x1.6p+1f, 0x1.8p+1f, 0x1.ap+1f, 0x1.cp+1f, 0x1.ep+1f,
++    0x1p+2f, 0x1.2p+2f, 0x1.4p+2f, 0x1.6p+2f, 0x1.8p+2f, 0x1.ap+2f, 0x1.cp+2f, 0x1.ep+2f,
++    0x1p+3f, 0x1.2p+3f, 0x1.4p+3f, 0x1.6p+3f, 0x1.8p+3f, 0x1.ap+3f, 0x1.cp+3f, 0x1.ep+3f,
++    0x1p+4f, 0x1.2p+4f, 0x1.4p+4f, 0x1.6p+4f, 0x1.8p+4f, 0x1.ap+4f, 0x1.cp+4f, 0x1.ep+4f,
++    0x1p+5f, 0x1.2p+5f, 0x1.4p+5f, 0x1.6p+5f, 0x1.8p+5f, 0x1.ap+5f, 0x1.cp+5f, 0x1.ep+5f,
++    0x1p+6f, 0x1.2p+6f, 0x1.4p+6f, 0x1.6p+6f, 0x1.8p+6f, 0x1.ap+6f, 0x1.cp+6f, 0x1.ep+6f,
++    0x1p+7f, 0x1.2p+7f, 0x1.4p+7f, 0x1.6p+7f, 0x1.8p+7f, 0x1.ap+7f, 0x1.cp+7f, 0x1.ep+7f,
++    0x1p+8f, 0x1.2p+8f, 0x1.4p+8f, 0x1.6p+8f, 0x1.8p+8f, 0x1.ap+8f, 0x1.cp+8f, 0x1.ep+8f,
++    -0.0f, -0x1p-9f, -0x1p-8f, -0x1.8p-8f, -0x1p-7f, -0x1.4p-7f, -0x1.8p-7f, -0x1.cp-7f,
++    -0x1p-6f, -0x1.2p-6f, -0x1.4p-6f, -0x1.6p-6f, -0x1.8p-6f, -0x1.ap-6f, -0x1.cp-6f, -0x1.ep-6f,
++    -0x1p-5f, -0x1.2p-5f, -0x1.4p-5f, -0x1.6p-5f, -0x1.8p-5f, -0x1.ap-5f, -0x1.cp-5f, -0x1.ep-5f,
++    -0x1p-4f, -0x1.2p-4f, -0x1.4p-4f, -0x1.6p-4f, -0x1.8p-4f, -0x1.ap-4f, -0x1.cp-4f, -0x1.ep-4f,
++    -0x1p-3f, -0x1.2p-3f, -0x1.4p-3f, -0x1.6p-3f, -0x1.8p-3f, -0x1.ap-3f, -0x1.cp-3f, -0x1.ep-3f,
++    -0x1p-2f, -0x1.2p-2f, -0x1.4p-2f, -0x1.6p-2f, -0x1.8p-2f, -0x1.ap-2f, -0x1.cp-2f, -0x1.ep-2f,
++    -0x1p-1f, -0x1.2p-1f, -0x1.4p-1f, -0x1.6p-1f, -0x1.8p-1f, -0x1.ap-1f, -0x1.cp-1f, -0x1.ep-1f,
++    -0x1p+0f, -0x1.2p+0f, -0x1.4p+0f, -0x1.6p+0f, -0x1.8p+0f, -0x1.ap+0f, -0x1.cp+0f, -0x1.ep+0f,
++    -0x1p+1f, -0x1.2p+1f, -0x1.4p+1f, -0x1.6p+1f, -0x1.8p+1f, -0x1.ap+1f, -0x1.cp+1f, -0x1.ep+1f,
++    -0x1p+2f, -0x1.2p+2f, -0x1.4p+2f, -0x1.6p+2f, -0x1.8p+2f, -0x1.ap+2f, -0x1.cp+2f, -0x1.ep+2f,
++    -0x1p+3f, -0x1.2p+3f, -0x1.4p+3f, -0x1.6p+3f, -0x1.8p+3f, -0x1.ap+3f, -0x1.cp+3f, -0x1.ep+3f,
++    -0x1p+4f, -0x1.2p+4f, -0x1.4p+4f, -0x1.6p+4f, -0x1.8p+4f, -0x1.ap+4f, -0x1.cp+4f, -0x1.ep+4f,
++    -0x1p+5f, -0x1.2p+5f, -0x1.4p+5f, -0x1.6p+5f, -0x1.8p+5f, -0x1.ap+5f, -0x1.cp+5f, -0x1.ep+5f,
++    -0x1p+6f, -0x1.2p+6f, -0x1.4p+6f, -0x1.6p+6f, -0x1.8p+6f, -0x1.ap+6f, -0x1.cp+6f, -0x1.ep+6f,
++    -0x1p+7f, -0x1.2p+7f, -0x1.4p+7f, -0x1.6p+7f, -0x1.8p+7f, -0x1.ap+7f, -0x1.cp+7f, -0x1.ep+7f,
++    -0x1p+8f, -0x1.2p+8f, -0x1.4p+8f, -0x1.6p+8f, -0x1.8p+8f, -0x1.ap+8f, -0x1.cp+8f, -0x1.ep+8f,
++};
++#if defined(__AVX2__) && defined(__FMA__)
++static inline float fp8_hsum(__m256 v) {
++    __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
++    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
++    return _mm_cvtss_f32(_mm_add_ss(s, _mm_movehdup_ps(s)));
++}
++#endif
++#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
++/* fp8_e4m3[] of eight codes without the table (vgatherdps bound the rows at 6-9 cycles per eight
++ * weights on a Xeon Gold 6254): each code in the high byte of a 16-bit lane, shifted right by one
++ * with its sign (bit 15 stays; bit 14 takes a copy that the mask 0xBF80 clears) is binary16 with
++ * exponent field e (0..15, never 31) and fraction m << 7, exactly 2^-8 of the code's value; F16C
++ * widens it exactly, and * 256 is exact. All 256 codes give fp8_e4m3[]'s bits, -0.0 and the two
++ * NaN codes' +-480 included, with or without FTZ/DAZ. */
++static inline __m256 fp8_half8(__m128i hb) {
++    const __m128i h = _mm_and_si128(_mm_srai_epi16(hb, 1), _mm_set1_epi16((short)0xBF80));
++    return _mm256_mul_ps(_mm256_cvtph_ps(h), _mm256_set1_ps(256.0f));
++}
++static inline __m256 fp8_lo8(__m128i b) { return fp8_half8(_mm_unpacklo_epi8(_mm_setzero_si128(), b)); }
++static inline __m256 fp8_hi8(__m128i b) { return fp8_half8(_mm_unpackhi_epi8(_mm_setzero_si128(), b)); }
++#define FP8_F16C 1
++#endif
++/* An FP8 e4m3 row (fmt 12, a scale per gs columns; gs 0: one for the row) against n float rows, n
++ * a constant where it is inlined: eight columns a step, the codes' values gathered from fp8_e4m3,
++ * a group's sums times its scale once. The float reference (dev_dequant, then a scalar sum per
++ * row) took an ldexpf and a division per weight: on a Xeon Gold 6254, 16 threads, Qwen3.8-Flash-
++ * Next's host pool pairs took 41 ms a layer step (6.4 pairs, 0.75 GB/s). Same weights; each
++ * group's sum times its scale instead of each weight times it, and the sums in another order
++ * (eight lanes): within 4.1e-7 of a double-precision reference (tests/test_vk_tier host-pairs). */
++static inline __attribute__((always_inline)) void fp8_rows_n(float *y, int ys, const float *const *xf, const uint8_t *row,
++                                                              int I, const float *rs, int gs, const int n) {
++    if (gs <= 0) gs = I;
++#if defined(__AVX2__) && defined(__FMA__)
++    __m256 tot[4], grp[4];
++    float tail[4] = {0.f, 0.f, 0.f, 0.f};
++    for (int k = 0; k < n; k++) tot[k] = _mm256_setzero_ps();
++    for (int g0 = 0; g0 < I; g0 += gs) {
++        const int g1 = g0 + gs < I ? g0 + gs : I;
++        const float sc = rs[g0 / gs];
++        for (int k = 0; k < n; k++) grp[k] = _mm256_setzero_ps();
++        int i = g0;
++#ifdef FP8_F16C
++        for (; i + 16 <= g1; i += 16) {
++            const __m128i b = _mm_loadu_si128((const __m128i *)(row + i));
++            const __m256 w0 = fp8_lo8(b), w1 = fp8_hi8(b);
++            for (int k = 0; k < n; k++) grp[k] = _mm256_fmadd_ps(w0, _mm256_loadu_ps(xf[k] + i), grp[k]);
++            for (int k = 0; k < n; k++) grp[k] = _mm256_fmadd_ps(w1, _mm256_loadu_ps(xf[k] + i + 8), grp[k]);
++        }
++        for (; i + 8 <= g1; i += 8) {
++            const __m256 w = fp8_lo8(_mm_loadl_epi64((const __m128i *)(row + i)));
++            for (int k = 0; k < n; k++) grp[k] = _mm256_fmadd_ps(w, _mm256_loadu_ps(xf[k] + i), grp[k]);
++        }
++#else
++        for (; i + 8 <= g1; i += 8) {
++            const __m256 w = _mm256_i32gather_ps(fp8_e4m3, _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(row + i))), 4);
++            for (int k = 0; k < n; k++) grp[k] = _mm256_fmadd_ps(w, _mm256_loadu_ps(xf[k] + i), grp[k]);
++        }
++#endif
++        const __m256 scv = _mm256_set1_ps(sc);
++        for (int k = 0; k < n; k++) tot[k] = _mm256_fmadd_ps(grp[k], scv, tot[k]);
++        for (; i < g1; i++) {
++            const float w = fp8_e4m3[row[i]] * sc;
++            for (int k = 0; k < n; k++) tail[k] += w * xf[k][i];
++        }
++    }
++    for (int k = 0; k < n; k++) y[(size_t)k * ys] = fp8_hsum(tot[k]) + tail[k];
++#else
++    float tot[4] = {0.f, 0.f, 0.f, 0.f};
++    for (int g0 = 0; g0 < I; g0 += gs) {
++        const int g1 = g0 + gs < I ? g0 + gs : I;
++        float grp[4] = {0.f, 0.f, 0.f, 0.f};
++        for (int i = g0; i < g1; i++) {
++            const float w = fp8_e4m3[row[i]];
++            for (int k = 0; k < n; k++) grp[k] += w * xf[k][i];
++        }
++        for (int k = 0; k < n; k++) tot[k] += grp[k] * rs[g0 / gs];
++    }
++    for (int k = 0; k < n; k++) y[(size_t)k * ys] = tot[k];
++#endif
++}
++/* fp8_rows_n for any count of rows, four at a time (a step of the hybrid has one to eight) */
++/* fp8_rows_n on a row already decoded to floats (w: fp8_e4m3 of its codes), the same FMA sequence
++ * for each activation row, so the same bits */
++static inline __attribute__((always_inline)) void fp8_rows_nf(float *y, int ys, const float *const *xf, const float *w,
++                                                               int I, const float *rs, int gs, const int n) {
++    if (gs <= 0) gs = I;
++#if defined(__AVX2__) && defined(__FMA__)
++    __m256 tot[4], grp[4];
++    float tail[4] = {0.f, 0.f, 0.f, 0.f};
++    for (int k = 0; k < n; k++) tot[k] = _mm256_setzero_ps();
++    for (int g0 = 0; g0 < I; g0 += gs) {
++        const int g1 = g0 + gs < I ? g0 + gs : I;
++        const float sc = rs[g0 / gs];
++        for (int k = 0; k < n; k++) grp[k] = _mm256_setzero_ps();
++        int i = g0;
++        for (; i + 8 <= g1; i += 8) {
++            const __m256 wv = _mm256_loadu_ps(w + i);
++            for (int k = 0; k < n; k++) grp[k] = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xf[k] + i), grp[k]);
++        }
++        const __m256 scv = _mm256_set1_ps(sc);
++        for (int k = 0; k < n; k++) tot[k] = _mm256_fmadd_ps(grp[k], scv, tot[k]);
++        for (; i < g1; i++) {
++            const float wi = w[i] * sc;
++            for (int k = 0; k < n; k++) tail[k] += wi * xf[k][i];
++        }
++    }
++    for (int k = 0; k < n; k++) y[(size_t)k * ys] = fp8_hsum(tot[k]) + tail[k];
++#else
++    float tot[4] = {0.f, 0.f, 0.f, 0.f};
++    for (int g0 = 0; g0 < I; g0 += gs) {
++        const int g1 = g0 + gs < I ? g0 + gs : I;
++        float grp[4] = {0.f, 0.f, 0.f, 0.f};
++        for (int i = g0; i < g1; i++)
++            for (int k = 0; k < n; k++) grp[k] += w[i] * xf[k][i];
++        for (int k = 0; k < n; k++) tot[k] += grp[k] * rs[g0 / gs];
++    }
++    for (int k = 0; k < n; k++) y[(size_t)k * ys] = tot[k];
++#endif
++}
++/* fp8_rows_n for any count of rows, four at a time (a decode step has one to eight). Past four (a
++ * prompt step's expert of up to COLI_VK_HYBRID_BIG_ROWS rows) the row is decoded once into wtmp (I
++ * floats) and every pass of four reads it there. */
++static void fp8_rows(float *y, int ys, int S, const float *const *xf, const uint8_t *row, int I, const float *rs, int gs,
++                     float *wtmp) {
++    if (S > 4 && wtmp) {
++        int i = 0;
++#ifdef FP8_F16C
++        for (; i + 16 <= I; i += 16) {
++            const __m128i b = _mm_loadu_si128((const __m128i *)(row + i));
++            _mm256_storeu_ps(wtmp + i, fp8_lo8(b));
++            _mm256_storeu_ps(wtmp + i + 8, fp8_hi8(b));
++        }
++#endif
++        for (; i < I; i++) wtmp[i] = fp8_e4m3[row[i]];
++        for (int s = 0; s < S; s += 4) {
++            float *ys0 = y + (size_t)s * ys;
++            switch (S - s) {
++            case 1: fp8_rows_nf(ys0, ys, xf + s, wtmp, I, rs, gs, 1); break;
++            case 2: fp8_rows_nf(ys0, ys, xf + s, wtmp, I, rs, gs, 2); break;
++            case 3: fp8_rows_nf(ys0, ys, xf + s, wtmp, I, rs, gs, 3); break;
++            default: fp8_rows_nf(ys0, ys, xf + s, wtmp, I, rs, gs, 4); break;
++            }
++        }
++        return;
++    }
++    for (int s = 0; s < S; s += 4) {
++        float *ys0 = y + (size_t)s * ys;
++        switch (S - s) {
++        case 1: fp8_rows_n(ys0, ys, xf + s, row, I, rs, gs, 1); break;
++        case 2: fp8_rows_n(ys0, ys, xf + s, row, I, rs, gs, 2); break;
++        case 3: fp8_rows_n(ys0, ys, xf + s, row, I, rs, gs, 3); break;
++        default: fp8_rows_n(ys0, ys, xf + s, row, I, rs, gs, 4); break;
++        }
++    }
++}
+ /* Activation row q (int8 per 32, dx its scales, xs its sums per 16) against a row's codes:
+  * int8 w8, or int4 u4 (0..15, the value + 8: the bias comes back with the activation's
+  * sums). rs: the row's scale (gs 0) or its groups' of gs columns. Integer sums a block, then
+@@ -1932,7 +2125,11 @@ static float hy_dot8(const int8_t *w8, const float *rs, int gs, const gq_act *a,
+  * bits whatever rows share the call. tmp: I floats, and for an int4 row I bytes after them. */
+ static inline void host_rows(float *y, int ys, const gq_act *a, const HyAct *hp, const float *const *xf, const uint8_t *row, int t, int I,
+                              float *tmp, const float *rs, int gs) {
+-    if (t < 0 && (-t == 12 || (-t == 7 && I / gs > 2048)) && !gq_exact_mode()) {   /* FP8 has no integer form: its floats against x's */
++    if (t == -12 && !gq_exact_mode()) {   /* FP8 has no integer form: its codes' floats, a scale a group (fp8_rows) */
++        fp8_rows(y, ys, a->S, xf, row, I, rs, gs, tmp);
++        return;
++    }
++    if (t == -7 && I / gs > 2048 && !gq_exact_mode()) {   /* MXFP4 rows of more than 2048 groups: their floats against x's */
+         dev_dequant(tmp, row, -t, rs, gs, I);
+         for (int s = 0; s < a->S; s++) {
+             const float *x = xf[s];
+@@ -1979,8 +2176,50 @@ static inline void host_rows(float *y, int ys, const gq_act *a, const HyAct *hp,
+  * at y + r * ystep: one check for the four. Four rows sharing one pass over the activation
+  * (a sum in flight per row) was tried and lost to hy_dot4's four sums per row: 183 against
+  * 129 us a pair on one core, 36 against 34 on twelve. */
++#ifdef FP8_F16C
++/* host_rows4's FP8 rows against one activation row (every decode step's pair): each row follows
++ * fp8_rows_n(n=1) step for step, so the same bits as one by one, with four FMA chains instead of
++ * one (a single chain is bound by the FMA's latency) and x loaded once for the four */
++#define FP8_R16(a, r) do { const __m128i b_ = _mm_loadu_si128((const __m128i *)((r) + i)); \
++        (a) = _mm256_fmadd_ps(fp8_lo8(b_), xl, (a)); (a) = _mm256_fmadd_ps(fp8_hi8(b_), xh, (a)); } while (0)
++#define FP8_R8(a, r) ((a) = _mm256_fmadd_ps(fp8_lo8(_mm_loadl_epi64((const __m128i *)((r) + i))), xl, (a)))
++static inline void fp8_rows4_s1(float *y, int ystep, const float *x, const uint8_t *row, size_t rb, int I,
++                                const float *rs, size_t nsc, int gs) {
++    if (gs <= 0) gs = I;
++    const uint8_t *r0 = row, *r1 = row + rb, *r2 = row + 2 * rb, *r3 = row + 3 * rb;
++    const float *s0 = rs, *s1 = rs + nsc, *s2 = rs + 2 * nsc, *s3 = rs + 3 * nsc;
++    __m256 t0 = _mm256_setzero_ps(), t1 = t0, t2 = t0, t3 = t0;
++    float l0 = 0.f, l1 = 0.f, l2 = 0.f, l3 = 0.f;
++    for (int g0 = 0; g0 < I; g0 += gs) {
++        const int g1 = g0 + gs < I ? g0 + gs : I, g = g0 / gs;
++        __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
++        int i = g0;
++        for (; i + 16 <= g1; i += 16) {
++            const __m256 xl = _mm256_loadu_ps(x + i), xh = _mm256_loadu_ps(x + i + 8);
++            FP8_R16(a0, r0); FP8_R16(a1, r1); FP8_R16(a2, r2); FP8_R16(a3, r3);
++        }
++        for (; i + 8 <= g1; i += 8) {
++            const __m256 xl = _mm256_loadu_ps(x + i);
++            FP8_R8(a0, r0); FP8_R8(a1, r1); FP8_R8(a2, r2); FP8_R8(a3, r3);
++        }
++        t0 = _mm256_fmadd_ps(a0, _mm256_set1_ps(s0[g]), t0); t1 = _mm256_fmadd_ps(a1, _mm256_set1_ps(s1[g]), t1);
++        t2 = _mm256_fmadd_ps(a2, _mm256_set1_ps(s2[g]), t2); t3 = _mm256_fmadd_ps(a3, _mm256_set1_ps(s3[g]), t3);
++        for (; i < g1; i++) {   /* fp8_rows_n's tail: the weight times its scale, then times x */
++            const float w0 = fp8_e4m3[r0[i]] * s0[g], w1 = fp8_e4m3[r1[i]] * s1[g], w2 = fp8_e4m3[r2[i]] * s2[g], w3 = fp8_e4m3[r3[i]] * s3[g];
++            l0 += w0 * x[i]; l1 += w1 * x[i]; l2 += w2 * x[i]; l3 += w3 * x[i];
++        }
++    }
++    y[0] = fp8_hsum(t0) + l0; y[ystep] = fp8_hsum(t1) + l1;
++    y[(size_t)2 * ystep] = fp8_hsum(t2) + l2; y[(size_t)3 * ystep] = fp8_hsum(t3) + l3;
++}
++#undef FP8_R16
++#undef FP8_R8
++#endif
+ static inline void host_rows4(float *y, int ys, int ystep, const gq_act *a, const HyAct *hp, const float *const *xf, const uint8_t *row,
+                               size_t rb, int t, int I, float *tmp, const float *rs, size_t nsc, int gs) {
++#ifdef FP8_F16C
++    if (t == -12 && a->S == 1 && rs && !gq_exact_mode()) { fp8_rows4_s1(y, ystep, xf[0], row, rb, I, rs, nsc, gs); return; }
++#endif
+     if (t < 0 && (-t == 2 || -t == 4) && hp && hp->S == a->S && !gq_exact_mode()) {
+         for (int s = 0; s < a->S; s++) {
+             for (int r = 0; r < 4; r++) y[(size_t)s * ys + (size_t)r * ystep] = hy_dot4(row + (size_t)r * rb, rs ? rs + (size_t)r * nsc : NULL, gs, hp, s);
+@@ -2076,14 +2315,23 @@ static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, in
+         while (r < p && xr[r] != xr[p]) r++;
+         xa[p] = r < p ? xa[r] : nx++;
+     }
+-    if (!(xb = malloc((size_t)nx * D * sizeof(float))) || (!ident && !(dq = malloc((size_t)np * D * sizeof(float))))) { err = 2; goto out; }
+-    for (int p = 0; p < np; p++) memcpy(xb + (size_t)xa[p] * D, xr[p], (size_t)D * sizeof(float));
+-    if (gq_act_set(&ax, xb, nx, D)) { err = 1; goto out; }
+-    for (int g = 0; g < ng && !err; g++) {   /* each group's rows of ax */
+-        for (int q = gs[g]; q < gs[g + 1]; q++) gx[q - gs[g]] = xa[ord[q]];
+-        if (gq_act_gather(&ag[g], &ax, gx, gs[g + 1] - gs[g]) || hy_act_prep(&pg[g], &ag[g])) err = 2;
++    /* FP8 pairs (fp8_rows, fp8_rows4_s1) read only the float rows and each group's row count: no
++     * int8 forms of the activations for them, which were serial work before the team starts */
++    int f8 = !gq_exact_mode();
++    for (int p = 0; p < np && f8; p++) f8 = hx[p]->tg == -12 && hx[p]->td == -12;
++    if (!ident && !(dq = malloc((size_t)np * D * sizeof(float)))) { err = 2; goto out; }
++    if (f8) {
++        for (int g = 0; g < ng; g++) ag[g].S = ah[g].S = gs[g + 1] - gs[g];
++    } else {
++        if (!(xb = malloc((size_t)nx * D * sizeof(float)))) { err = 2; goto out; }
++        for (int p = 0; p < np; p++) memcpy(xb + (size_t)xa[p] * D, xr[p], (size_t)D * sizeof(float));
++        if (gq_act_set(&ax, xb, nx, D)) { err = 1; goto out; }
++        for (int g = 0; g < ng && !err; g++) {   /* each group's rows of ax */
++            for (int q = gs[g]; q < gs[g + 1]; q++) gx[q - gs[g]] = xa[ord[q]];
++            if (gq_act_gather(&ag[g], &ax, gx, gs[g + 1] - gs[g]) || hy_act_prep(&pg[g], &ag[g])) err = 2;
++        }
++        if (err) goto out;
+     }
+-    if (err) goto out;
+     float *dy = dq ? dq : dn;
+     /* gate and up of every group, the activation, then down: one parallel region, the
+      * rows handed out in chunks (the cores of a hybrid CPU do not run at one speed) */
+@@ -2137,12 +2385,14 @@ static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, in
+                 h[o] = gv / (1.f + expf(-gv)) * uv;
+             }
+         }
+-        #pragma omp for schedule(static)
+-        for (int g = 0; g < ng; g++)
+-            if (gq_act_set(&ah[g], hh + (size_t)gs[g] * I, gs[g + 1] - gs[g], I) || hy_act_prep(&ph[g], &ah[g])) {
+-                #pragma omp atomic write
+-                err = 1;
+-            }
++        if (!f8) {   /* f8 is the team's, so every thread takes the same branch */
++            #pragma omp for schedule(static)
++            for (int g = 0; g < ng; g++)
++                if (gq_act_set(&ah[g], hh + (size_t)gs[g] * I, gs[g + 1] - gs[g], I) || hy_act_prep(&ph[g], &ah[g])) {
++                    #pragma omp atomic write
++                    err = 1;
++                }
++        }
+         #pragma omp for schedule(runtime)
+         for (int64_t c = 0; c < (int64_t)ng * cd; c++) {
+             if (!tmp) continue;
+diff --git a/docs/ENVIRONMENT.md b/docs/ENVIRONMENT.md
+index 84390b4d..3c877f97 100644
+--- a/docs/ENVIRONMENT.md
++++ b/docs/ENVIRONMENT.md
+@@ -290,13 +290,15 @@ With `COLI_VULKAN=1` every MoE engine (qwen36, qwen38, inkling, olmoe, kimi_k3,
+ | `COLI_VK_CHAIN_MUX` | colibri `16`; qwen36 every slot the device's free memory takes | colibri and qwen36: how many conversations' state (KV mirrors; qwen36's DeltaNet state too) the chain keeps on the device beside its own for `KV_SLOTS`' batched decode ([vulkan.md](vulkan.md#glm-52-and-glm-53-flash-on-the-chain)); colibri up to 16, qwen36 as many as fit after the expert tier's budget with 512 MiB left. Past that the one used longest ago gives way. `0`: colibri's steps run on the CPU, as before; qwen36's steps of several conversations take the host's path. |
+ | `COLI_VK_DEVICE_CAP_MB` | unset | Tests: the device holds at most this many MiB of device-local memory (a fraction is taken). An allocation past it fails as out of device memory, and every budget the engines read (`VK_EXT_memory_budget`'s, the expert tier's, the chunk's, the partial chain's fit) reports the cap and this process's bytes, so Lavapipe behaves like a small card. The second device (`COLI_VK_DEV2`) gets the same cap. A `[VK] COLI_VK_DEVICE_CAP_MB=...` line says it is on. |
+ | `COLI_VK_ATTN_BLOCK` | `16` | Rows from which the chain's attention takes the blocked shader (`chain_attnb.comp`: K and V read once per block of rows); `0` never. Below it, and at decode, `chain_attn.comp` as before. |
++| `COLI_VK_ATTN_BLOCK_FIXED` | on with Xe2 under ANV, and Lavapipe | The blocked shader with the head dims fixed in its pipeline, one a shape (no test of each dim; a float16 cache's K and V 8 halves a load): the generic pipeline's bits where it is on (measured on an Arc Pro B60 and on Lavapipe, tiles of 8 positions), a 255-row chunk of Qwen3.6 at 16K positions 185.1 -> 25.7 ms on the B60 at subgroups of 16 (485.4 -> 130.0 at the reported 32; [vulkan.md](vulkan.md)). `1`: on any driver (compare its bits with `0` there first: `COLI_VK_ATTN_BLOCK_FIXED=1 ./tests/test_vk_chain shaders/qmatmul.spv` reruns its blocked cases on the generic pipeline, which must match byte for byte); `0`: the generic pipeline. |
+ | `COLI_VK_COPY_GRID` | on | `0`: the chain's copies of many regions (a prompt chunk's K and V rows into the head-major cache, a region per row and head) stay one copy command with a region each. On: regions that lie on a grid (one length, fixed steps along two indices) take one dispatch of `chain_copy2d.comp`, a list of 64 or more grid by grid and a shorter one when it is a grid whole: a decode step's K or V rows of OLMoE's 16 heads took 8.3 us as a copy command, 1.5 us as a dispatch. |
+-| `COLI_VK_ATTN_SLICE` | `4294967296` | Rows x positions x heads x head dim past which the chain's attention ops are recorded in slices of rows, a submission each, so no submission of a big prompt chunk runs past a driver's job timeout; `0` never. On the matrix units (`chain_attn_flash.comp`) a unit counts a sixteenth: at the budget's own size Qwen3.6's 16K prompt was cut into slices of 64 rows (5.9 s of attention on an RTX PRO 4000, 2.0 s now). |
++| `COLI_VK_ATTN_SLICE` | `4294967296` | Rows x positions x heads x head dim past which the chain's attention ops are recorded in slices of rows, a submission each, so no submission of a big prompt chunk runs past a driver's job timeout; `0` never. On the matrix units (`chain_attn_flash.comp`) a unit counts a sixteenth: at the budget's own size Qwen3.6's 16K prompt was cut into slices of 64 rows (5.9 s of attention on an RTX PRO 4000, 2.0 s now). A slice is cut to keep `COLI_VK_ATTN_SLICE_WG` workgroups (below). |
++| `COLI_VK_ATTN_SLICE_WG` | `64`; `0` on an integrated GPU | The workgroups a slice of `COLI_VK_ATTN_SLICE` is cut to keep, as far as 4x the budget's work (up to 7x the budget-only slice where that one rounds down to one block); a chunk's slices are then made one size on the blocks of the blocked attention, so some, and the last, may keep fewer, and the bits do not change. The budget alone cut Qwen3.6's 16K prompt into slices of 64 rows, 32 `chain_attnb` workgroups, on an Arc Pro B60 that keeps 80 resident and runs 2 to 40 of them in the same time (raising the budget to 2^36 took its first token from 118.5 to 90.0 s, at 32K from 741.6 to 281.5, the same answers). With the floor its 4096-row chunks take slices of 128 rows (64 workgroups) from 8K to 32K positions, then 112 down to 64 rows at 64K, where 4x the budget stops them; the budget alone gave 64 rows at 16K, 32 at 32K and 16 at 64K. One layer of that prompt replayed on the B60: 16K 9.31 -> 6.04 s of attention (161 -> 112 submissions, the longest 90 -> 94 ms), 32K 69.0 -> 24.2 s (592 -> 240, 180 -> 188 ms). An integrated GPU, the kind a driver's timeout catches, keeps the budget alone until one is measured. `0`: the budget alone, as before. |
+ | `COLI_VK_CHAIN` (laya, gliner_decide) | on for a GPU, discrete or integrated; off on a CPU device | The decision engines' encoder forward (and Laya's head layers) recorded as one submission on the device, the activations staying there (`decide_vk.h`, [vulkan.md](vulkan.md#the-decision-engines)). `0`: matrix by matrix through the device (`COLI_VK_DENSE` decides, as above), the rest on the CPU; `1`: on. The `[VK] <engine>: forward on the device ...` line says which and why. Clef's is qwen36's chain, as above. |
+ | `COLI_VK_IMPORT` | on for a model without routed experts on a device sharing the CPU's RAM; off otherwise | qwen36: the device reads the int8 and f16 dense rows where the host keeps them (`VK_EXT_external_memory_host`, `coli_vk_tensor_import`) instead of holding a copy of each. `1` requests import, `0` copies. On an integrated GPU, imported rows remain shared even with `COLI_VK_DENSE_HOST=0`: they already have one physical copy, and their pages stay alive while Vulkan reads them. `COLI_VK_IMPORT=0` forces an independent device copy whose host pages can be released; only those released pages count as RAM given back. On other devices, `COLI_VK_DENSE_HOST=0` disables import. Unset, on for the dense 27B family (Qwen3.8-27B, Clef) on an integrated GPU or Lavapipe, whose trunk is the whole model and would be held twice (Clef's f16 trunk, 54 GB, twice past a 61 GB box); a copy elsewhere. Where the device cannot import (no extension, staged uploads) the rows are copied. See [vulkan.md](vulkan.md#the-decision-engines). |
+ | `COLI_VK_CHAIN_FLASH` | `16` | Rows of a forward from which the chain's causal attention (no selection list or position-major rows, head dim a multiple of 64; a sliding window, a ring and sinks included) runs on the matrix units (`chain_attn_flash.comp`, f16 operands) on a device with cooperative matrices at subgroup size 64 or 32 (NVIDIA). Ahead of `COLI_VK_ATTN_BLOCK`'s blocked shader. Flint (windows and sinks) took the blocked shader before: on an RTX PRO 4000 its prompt went from 794/474/133 to 1556/1703/1164 tok/s at 1K/4K/16K tokens. `0` never. |
+ | `COLI_VK_DNREC_ROWS` | on | `0` keeps a prompt chunk's DeltaNet recurrence on `chain_dnrec.comp` (four barriers a row) instead of `chain_dnrec_rows.comp` (three a block of up to 16 rows); see [vulkan.md](vulkan.md). |
+-| `COLI_VK_ATTN_DEC` | on | A decode's or a verify's attention (up to 4 rows, no selection list) over 128 positions or more split into blocks of 64 to 256 positions (`chain_attn_dec.comp`: a workgroup a head, block and row, then the blocks joined) instead of `chain_attn.comp`'s one workgroup a head walking every position, where a prompt chunk of that attention takes `chain_attn_flash.comp` (f16: a row's bits already depend on how a forward is cut into steps); elsewhere a prefix resumed keeps the prompt's bits to the last digit (`tests/test_brio_serve.py`). RTX PRO 4000, Qwen3.6 int4-g64, decode 76.5-77.6 -> 85.3-86.3 tok/s. `0` keeps `chain_attn.comp`. |
++| `COLI_VK_ATTN_DEC` | on | A decode's or a verify's attention (up to 8 rows, no selection list) over 128 positions or more split into blocks of 64 to 256 positions (`chain_attn_dec.comp`: a workgroup a head, block and row, then the blocks joined) instead of `chain_attn.comp`'s one workgroup a head walking every position, where a prompt chunk of that attention takes `chain_attn_flash.comp` (f16: a row's bits already depend on how a forward is cut into steps); elsewhere a prefix resumed keeps the prompt's bits to the last digit (`tests/test_brio_serve.py`). RTX PRO 4000, Qwen3.6 int4-g64, decode 76.5-77.6 -> 85.3-86.3 tok/s. `2` (opt-in; this variable's value, not `chain_attn_dec.comp`'s mode 2) also on a device without `chain_attn_flash.comp` (no 16x16x16 float16 cooperative matrices at subgroup size 64 or 32: Intel's Xe2 has 8-row shapes only), for the attentions it would take there: every call of up to 8 rows over 128 positions or more (a decode step, a verify, or a prompt chunk that short, such as an option scored after a `pin=1` snapshot) then has `chain_attn_dec.comp`'s bits while longer chunks keep `chain_attnb.comp`'s, so a resumed prefix and snapshot scoring (`logprobs` after `pin=1`) may differ in the last digits from a cold recompute. `COLI_VK_CHAIN_FLASH=0` turns it off with the rest of the rule, and a split KV cache (`chain_kvs.comp`) never takes it; a `[VK] chain: COLI_VK_ATTN_DEC=2 ...` line at its first use says so. An Arc Pro B60 (an SR-IOV VF, Mesa ANV 26.0.8, the chain on at subgroups of 16) decoded Qwen3.6 after a 16K-token prompt at 5.03 tok/s, `chain_attn.comp` giving each of its 16 heads one workgroup that walks every position a row, and at 35.52 with `2` (32K: 2.71 -> 33.88; after a short prompt 37.21 -> 38.00), its prompts as fast, the same greedy answers. `0` keeps `chain_attn.comp`. |
+ | `COLI_VK_ATTN_DEC_GQA` | on | `chain_attn_dec.comp`'s blocks for the query heads of a KV head at once, one to 16 (mode 2, a pipeline a head dim and grouping): each K and V row read once for them instead of once a head, the scores a thread or two a position, eight values a load; the join takes each block's weight once. RTX PRO 4000, one layer of Qwen3.6's attention after 18K positions 713 -> 122 us in float16 (Flint's, 32/4 heads of 128: 894 -> 131; a Radeon 780M 2700 -> 1025). Decode after an 18K-token prompt: Qwen3.6 UD-Q4_K_M 45.8 -> 79.3-79.8 tok/s, Flint UD-Q3_K_XL 15.4 -> 80.5-80.8 (with windows and sinks in blocks, float16 mirrors and the fence's polling). `0`: a workgroup a head. |
+ | `COLI_VK_ATTN_DEC_TPP` | `2` at head dims of 256, `1` below | Threads a position for those blocks' scores. A Radeon 780M at one thread a position read 64 rows of 512 bytes a subgroup and overflowed its cache (Qwen3.6's layer 1216-1303 us before, 1463-1627 at one, 1025-1094 at two); its heads of 128 keep one ([docs/vulkan.md](vulkan.md)). |
+ | `COLI_VK_KV16` | on | qwen36's and olmoe's Vulkan chains keep their KV mirrors in float16 where the host's values are float16's (the default, `Q36_KV` and `KV16`): the host's numbers in half the memory and half the reads, every attention path giving a float32 mirror's bits; one conversation's chain whose mirror does not split. RTX PRO 4000, after an 18K-token prompt: Qwen3.6 UD-Q4_K_M decode 60.0 -> 63.1 tok/s, Flint UD-Q3_K_XL 64.2 -> 67.0, the same greedy answers. OLMoE-1B-7B Q4_K_M decode after 1K / 2.7K tokens 244.9-245.0 / 175.6-175.9 -> 273.7-275.2 / 220.8-222.1. `0`: float32 ([docs/vulkan.md](vulkan.md)). |
+@@ -309,7 +311,7 @@ With `COLI_VULKAN=1` every MoE engine (qwen36, qwen38, inkling, olmoe, kimi_k3,
+ | `COLI_VK_MOE_GV` | on | Vulkan chain: a decode step's routed experts in our formats (int8 rows, int4 rows, int4 per group) whose D and I are multiples of 32 run their gate/up and down passes on `chain_moe_gv.comp`, the dense decode GEMV's layout (x staged once a workgroup, about eight 16-byte steps a lane). Qwen3.6-35B int4-g64 on an RTX PRO 4000: decode 67.3-68.4 -> 76.5-78.3 tok/s. `0`: `chain_moe.comp`'s passes ([vulkan.md](vulkan.md#the-routed-experts-in-the-frame-vk_dmoeh)). |
+ | `COLI_VK_MOE_GV_HQ` | on | Vulkan chain: `chain_moe_gv.comp`'s int4-per-group rows that are a whole number of 16-byte steps a lane (Qwen3.6's 2048 and 512 inputs) load a lane's steps and scales ahead of the sums, the loop's bits. Radeon 8060S, Qwen3.6-35B int4-g64: a layer 160 -> 100 us, decode 45.0 -> 50.3 tok/s. `0`: the loop ([vulkan.md](vulkan.md#the-routed-experts-in-the-frame-vk_dmoeh)). |
+ | `COLI_VK_CHAIN_MOE` | on where supported | olmoe, qwen36 and qwen38: a decode step's (or a short verify's) MoE layer whose experts the tier holds all of runs its routing and its experts in the dense chain's frame (`chain_route.comp`, `chain_moe.comp`), with no host step; a token is one frame when the model fits the device. Needs `bufferDeviceAddress` and clustered subgroup adds; off with PILOT, `ROUTE_TRACE`, qwen36's cache routing, the CUDA tier and on the second device. On a Radeon 780M (OLMoE-1B-7B) decode went from 28 to 30 tok/s to 33.2 ([vulkan.md](vulkan.md#the-routed-experts-in-the-frame-vk_dmoeh)). `0`: the host routes every layer as before. |
+-| `COLI_VK_SUBGROUP` | on where the size varies | The dense chain's pipelines require the subgroup size the device reports, on a device that compiles compute shaders at more than one size and lets a pipeline choose (an Intel GPU: 8 to 32; a Radeon: 32 or 64). The chain's shaders size their work by the subgroup; an Intel Iris Xe compiled `chain_gemv.comp` and `chain_gemv2.comp` at another size than they read and decoded garbage. `0`: the driver's choice, as before. `n` (a power of two the device allows): pin `n` instead, on every pipeline the size pins (the chain's, the GEMVs' and the expert batch's, on both devices); on Intel Meteor Lake with Mesa 26.2, `16` brings `chain_moe.spv`'s compile from over 38 minutes (at the reported 32) to 72-195 s. |
++| `COLI_VK_SUBGROUP` | on where the size varies | The dense chain's pipelines require the subgroup size the device reports, on a device that compiles compute shaders at more than one size and lets a pipeline choose (an Intel GPU: 8 to 32; a Radeon: 32 or 64). The chain's shaders size their work by the subgroup; an Intel Iris Xe compiled `chain_gemv.comp` and `chain_gemv2.comp` at another size than they read and decoded garbage. `0`: the driver's choice, as before. `n` (a power of two the device allows): pin `n` instead, on every pipeline the size pins (the chain's, the GEMVs' and the expert batch's, on both devices); on Intel Meteor Lake with Mesa 26.2, `16` brings `chain_moe.spv`'s compile from over 38 minutes (at the reported 32) to 72-195 s. Unset on Intel's Xe2 (Battlemage, Lunar Lake: 16 is its smallest subgroup) the default is `16`, not the reported 32: at 32 an Arc Pro B60 (Mesa ANV 26.0.8, an SR-IOV VF) failed 44 of `test_vk_chain`'s routed-expert checks (relative errors up to 1.0) and ran Qwen3.6's chain at 13.1 tok/s with other answers than the CPU's; at 16 the test passes and the chain gives the CPU's answers at 37.1 tok/s, a 3,000-token prompt in 7.2 s against 37.7. |
+ | `COLI_VK_CHAIN_GEMV2` | on where supported | The chain's int8 decode matrices on `chain_gemv2.comp`: rows a workgroup from the matrix's length (16 up to 1024 outputs, 32 up to 4096, else 64), a row's 16-byte words over a power-of-two lane group with clustered adds, up to four rows of x (a verify's) sharing each weight load with a decode step's bits. Needs clustered subgroup operations. `0` keeps `chain_gemv.comp`. On NVIDIA, unset, it takes only a matrix of few long rows and `chain_gemv.comp` the rest (measured faster there); `1` gives it every int8 matrix. Its staging of x takes the device's shared memory up to 64 KiB (48 KiB on NVIDIA's Pascal and Turing, where a fixed 64 KiB lost the device, #1998); a matrix whose rows of x do not fit takes `chain_gemv.comp`. |
+ | `COLI_VK_HYBRID` | on where the device has timeline semaphores; on in the tier's steps | `0`: a decode step's routed experts of the tier's host pool are read by the device over PCIe again. Unset: the CPU computes them in place while the device computes the ones it holds ([vulkan.md](vulkan.md#the-routed-experts-in-the-frame-vk_dmoeh)), in the dense chain's frame and in the tier's own steps of up to 8 rows (a model that does not fit the card whole: GLM-5.3 Flash UD-IQ2_XXS decode 3.2 to 5.0-5.2 tok/s, Inkling-Small 10.5-11.1 to 15.1-15.8); a GGUF's block types and SwiGLU experts only.  Measured against the device's own reads, per run (`COLI_VK_HYBRID_GATE`): a decode forward timed with the device reading the host pool for three forwards, then with the hybrid steps for three, the faster kept and measured again after 1024 forwards. On an RTX 3070 at PCIe 4.0 x16 with Qwen3.6 int4 (about 1.4 host pool pairs a step) the device's reads won, 18.5 ms a token against 33 to 50 with the hybrid steps (the CPU's pair 300 to 500 us, the three frames a step); on an RTX PRO 4000 at x8 the hybrid won. |
+ | `COLI_VK_HYBRID_THREADS` | OpenMP's | The hybrid steps' CPU team. |
+diff --git a/docs/vulkan.md b/docs/vulkan.md
+index e71884c3..b36c77a6 100644
+--- a/docs/vulkan.md
++++ b/docs/vulkan.md
+@@ -1303,13 +1303,13 @@ f32 throughout, as the CPU's f32 path.
+ | `COLI_VK_CHAIN_GEMV` | on | `0`: the decode matrices take `qmatmul.comp`'s GEMV instead of `chain_gemv.comp`'s. |
+ | `COLI_VK_CHAIN_GEMV_NR` | on | `1`: a speculative verify's rows take `chain_gemv.comp` a workgroup a row, each reading every weight, instead of up to four sharing every weight load ([the dense chain](#the-dense-chain-vk_chainc)). |
+ | `COLI_VK_DNREC_ROWS` | on | A prompt chunk's DeltaNet recurrence (from 8 rows) on `chain_dnrec_rows.comp`: per block of up to 16 rows the q and k norms, beta and decay in parallel, then the rows in order with no barrier (the column's parts joined by shuffles), then the outputs' gated norm in parallel: three barriers a block where `chain_dnrec.comp` takes four a row. On an RTX PRO 4000 (Qwen3.6 int4-g64, 467-token prompt) the prefill went from 1501-1579 to 1758-1873 tok/s, the decode unchanged (76.4-77.3); Qwen3.8 IQ2_S/Q2_0 with 19 GiB in the host pool 143.7-144.9 to 147.1-148.5. `0`: `chain_dnrec.comp` for every row count. |
+-| `COLI_VK_ATTN_DEC` | on | A decode step's or a verify's attention (up to 4 rows, no selection list) over 128 positions or more on `chain_attn_dec.comp`: the positions in blocks of 64 (more while the blocks would pass 1024 workgroups), a workgroup a (head, block, row) for the block's scores (a subgroup a position), max, sum and weighted values, then a pass that joins the blocks (the sink's logit with them) and applies the gate. `chain_attn.comp` gives a head one workgroup that walks every position: Qwen3.6's 16 heads left an RTX PRO 4000 all but idle, about 160 us a layer at 700 positions. Decode Qwen3.6 int4-g64 76.5-77.6 -> 85.3-86.3 tok/s; Qwen3.8's QSA layers (a selection list) keep `chain_attn.comp`. Only where a prompt chunk of the same attention takes `chain_attn_flash.comp` (f16, so a row's bits already depend on how a forward is cut into steps; windows, rings and sinks too since it takes them: Flint's decode after a 17K-token prompt read its sink layers a workgroup a head, 15.4 tok/s): elsewhere (a position-major cache, a device without the matrix units) `chain_attnb.comp` gives a prompt's row the bits `chain_attn.comp` gives it alone, and a prefix resumed must answer to the last digit as the prompt recomputed does (`tests/test_brio_serve.py`, OLMoE and MiMo on Lavapipe). `0`: `chain_attn.comp` always. |
++| `COLI_VK_ATTN_DEC` | on | A decode step's or a verify's attention (up to 8 rows, no selection list) over 128 positions or more on `chain_attn_dec.comp`: the positions in blocks of 64 (more while the blocks would pass 1024 workgroups), a workgroup a (head, block, row) for the block's scores (a subgroup a position), max, sum and weighted values, then a pass that joins the blocks (the sink's logit with them) and applies the gate. `chain_attn.comp` gives a head one workgroup that walks every position: Qwen3.6's 16 heads left an RTX PRO 4000 all but idle, about 160 us a layer at 700 positions. Decode Qwen3.6 int4-g64 76.5-77.6 -> 85.3-86.3 tok/s; Qwen3.8's QSA layers (a selection list) keep `chain_attn.comp`. Only where a prompt chunk of the same attention takes `chain_attn_flash.comp` (f16, so a row's bits already depend on how a forward is cut into steps; windows, rings and sinks too since it takes them: Flint's decode after a 17K-token prompt read its sink layers a workgroup a head, 15.4 tok/s): elsewhere (a position-major cache, a device without the matrix units) `chain_attnb.comp` gives a prompt's row the bits `chain_attn.comp` gives it alone, and a prefix resumed must answer to the last digit as the prompt recomputed does (`tests/test_brio_serve.py`, OLMoE and MiMo on Lavapipe). `2` (opt-in; this variable's value, not `chain_attn_dec.comp`'s mode 2) gives that up on a device without the flash module, as if it had it (the same attentions; `chain_attn_dec.comp` takes no matrix units): every call of up to 8 rows over 128 positions or more (a decode step, a verify, or a prompt chunk that short, such as an option scored after a `pin=1` snapshot) then has `chain_attn_dec.comp`'s bits while longer chunks keep `chain_attnb.comp`'s, so a resumed prefix and snapshot scoring (`logprobs` after `pin=1`) may differ in the last digits from a cold recompute. `COLI_VK_CHAIN_FLASH=0` turns it off with the rest of the rule, and a split KV cache (`chain_kvs.comp`) never takes it. An Arc Pro B60 (Xe2; an SR-IOV VF, Mesa ANV 26.0.8, the chain on at subgroups of 16) decoded Qwen3.6 after a 16K-token prompt at 5.03 tok/s and at 35.52 with `2` (32K: 2.71 -> 33.88; after a short prompt 37.21 -> 38.00), its prompts as fast, the same greedy answers; a `[VK] chain: COLI_VK_ATTN_DEC=2 ...` line at its first use says it took effect. `0`: `chain_attn.comp` always. |
+ | `COLI_VK_ATTN_DEC_GQA` | on | `chain_attn_dec.comp`'s mode 2: a workgroup a (KV head, block, row) for all of its query heads, 1 to 16 (a pipeline a head dim and grouping, spec constants GQ, HDQ and TPP), each K and V row read once for them. OLMoE's one query head a KV head took mode 0 before: its decode after 2.7K tokens 148.6-148.9 -> 161.1-161.3 tok/s. The scores a thread a position (two at head dims of 256: `COLI_VK_ATTN_DEC_TPP`), eight values a load against the q rows in shared memory, the max on the way; V a column of eight values a thread with the positions over groups of threads, the same groups for a float16 or a float32 cache. The join (mode 1) takes each block's weight once into shared memory, not once a value. The blocks' rule counts four workgroups a KV head. One layer after 18K positions in float16 on an RTX PRO 4000: Qwen3.6's 181 -> 122 us (a K row over a subgroup's lanes, five shuffles a head a position, before), Flint's 32/4 heads of 128 229 -> 131; after 60K 573 -> 372. Decode after an 18K-token prompt: Qwen3.6 UD-Q4_K_M 74.5-75.7 -> 79.3-79.8 tok/s, Flint UD-Q3_K_XL 70.7-71.0 -> 80.5-80.8 (92.1-92.2 after 1K, from 88.6-88.9). `0`: mode 0, a workgroup a head. |
+ | `COLI_VK_ATTN_DEC_TPP` | `2` at head dims of 256, `1` below | Threads a position for mode 2's scores, adjacent lanes taking a K row's loads in turn, their sums joined by a shuffle. A Radeon 780M's 64 lanes reading 64 rows of 512 bytes at once overflowed its cache: one layer of Qwen3.6 after 18K positions 1216-1303 us before, 1463-1627 at one thread a position, 1025-1094 at two; Flint's heads of 128 1241-1406 at one, 1452-1495 at two. RTX PRO 4000: 125.5 -> 121.8 us at two (heads of 256). |
+ | `COLI_VK_KV16` | on | qwen36's chain keeps its KV mirrors in float16 where the host's cache is float16 (the default; `Q36_KV=f32` keeps both float32), and olmoe's where its host's values are float16's (`KV16`, [OLMoE and Inkling](#olmoe-and-inkling)): every attention shader (`chain_attn`, `chain_attnb`, `chain_attn_flash`, `chain_attn_dec`) has a twin with its specialization constant 7 (KV16) that reads K and V two halves a word (`vkc_attn_h`, `vkc_attn_wh`), and a step's rows go in through `chain_copy2d.comp`'s H16 twin (`vkc_copy_regions_h`), which rounds by kv16.h's integer arithmetic before it packs: `packHalf2x16` rounds toward zero on RADV (a Radeon 780M), where the copy's halves differed from the host's. The values are the host's, so every path gives a float32 mirror's bits (`tests/test_vk_chain.c`), in half the memory and half the reads. One conversation's chain only (`KV_SLOTS` places share buffers with it) and while the mirror does not split (`chain_kvs.comp` reads float32: a plan that splits takes the mirrors back to float32). RTX PRO 4000, after an 18K-token prompt: Qwen3.6 UD-Q4_K_M decode 60.0 -> 63.1 tok/s, prompt 1706 -> 1774; Flint UD-Q3_K_XL decode 64.2 -> 67.0, prompt 1735 -> 1874; the same greedy answers. `0`: float32 mirrors. |
+ | `COLI_VK_MLA_DEC` | on | The same for the MLA core (`vkc_mla_core`: GLM-5.2/5.3, Kimi K3, DeepSeek V4.1): a decode's or a verify's rows (up to 4) over 128 positions or more on `chain_mla_dec.comp`, the positions (or a selection list's entries) in blocks of 64 (more while the blocks would pass 4096 workgroups), then joined. `chain_mla.comp`'s core walks every position in a workgroup a head with about twenty barriers a tile, and its time did not change from 64 heads to 128: at 2000 positions 1747 -> 323 us a layer, at 8000 11058 -> 1758 (RTX PRO 4000, a 512-float latent and a 64-float rope). A decode row's bits then differ in the last digits from the same row inside a prompt chunk (the prompt keeps `chain_mla.comp`'s core). `0`: `chain_mla.comp` always. |
+ | `COLI_VK_CHAIN_MOE` | on where supported | A decode step's (or a short verify's) MoE layer whose experts the tier holds all of runs its routing and experts in the frame, with no host step, and a GGUF's prompt chunk too on qwen36 and qwen38 ([below](#the-routed-experts-in-the-frame-vk_dmoeh)); `0`: the host routes as before. |
+-| `COLI_VK_SUBGROUP` | on where the size varies | Every chain pipeline requires the subgroup size the device reports (`VK_EXT_subgroup_size_control`), where the device has more than one. Without it an Intel Iris Xe (Windows driver 101.7076) compiled the chain's GEMVs at another size than the shaders read: Qwen3.6 answered garbage with the chain on and correctly with it off. `0`: the driver's choice. `n` (a power of two the device allows): pin `n` instead, here and on the GEMV and expert-batch pipelines that take the same size; on Intel Meteor Lake (Mesa 26.2) the reported 32 left `chain_moe.spv` compiling for over 38 minutes, 16 takes 72-195 s and `test_vk_chain` passes. |
++| `COLI_VK_SUBGROUP` | on where the size varies | Every chain pipeline requires the subgroup size the device reports (`VK_EXT_subgroup_size_control`), where the device has more than one. Without it an Intel Iris Xe (Windows driver 101.7076) compiled the chain's GEMVs at another size than the shaders read: Qwen3.6 answered garbage with the chain on and correctly with it off. `0`: the driver's choice. `n` (a power of two the device allows): pin `n` instead, here and on the GEMV and expert-batch pipelines that take the same size; on Intel Meteor Lake (Mesa 26.2) the reported 32 left `chain_moe.spv` compiling for over 38 minutes, 16 takes 72-195 s and `test_vk_chain` passes. Unset on Intel's Xe2 (16 is its smallest subgroup: Battlemage, Lunar Lake) it pins 16: at the reported 32 an Arc Pro B60 failed 44 of `test_vk_chain`'s routed-expert checks (relative errors up to 1.0) and ran Qwen3.6's chain at 13.1 tok/s with other answers than the CPU's; at 16 the test passes, and the chain runs at 37.1 tok/s with the CPU's answers. |
+ | `COLI_VK_CHAIN_GEMV2` | on where supported | `0`: the int8 decode matrices keep `chain_gemv.comp` instead of `chain_gemv2.comp` (rows a workgroup by the matrix's length). On a Radeon 8060S (Qwen3.6, a 256-token answer, int8 trunk) decode went from 36.8 to 39.0 tok/s; at int4 (`COLI_DENSE_BITS=4`) it measured slower, so it takes int8 only. It stages x in the device's shared memory, up to 64 KiB (#1998). On NVIDIA it takes only a matrix of few long rows (Qwen3.8's 320 x 10240 hyper-connection mixer) and `chain_gemv.comp` the rest, which an RTX PRO 4000 ran faster (decode Qwen3.8 IQ2_XS 39.5/44.4 to 45.5/45.6 tok/s, Qwen3.6's int8 trunk 62.2/61.9 to 65.2/65.0); `1` gives it every int8 matrix there too. |
+ | `COLI_VK_CHAIN_SPIN_US` | `50000` on a discrete card, `2000` elsewhere | How long a wait on a chain frame polls the fence before blocking (whose wake-up costs 50 to 150 us). At 2 ms a decode step's host slept through its last frames and woke after the device had run dry, about 1 ms a token: Qwen3.6 UD-Q4_K_M on an RTX PRO 4000 decoded 76.5 tok/s, 83.7 at 5 ms, 90.6 from 10 ms (a step's time) on; Flint UD-Q3_K_XL 86 -> 89.6. An integrated GPU shares the package's power with the cores and keeps 2 ms. |
+ | `COLI_VK_CHAIN_PROF` | off | `1`: one `[VK] chain profile` line of device time per kind of op (timestamps). |
+@@ -2877,6 +2877,12 @@ took:
+ [VK] qwen36 chain: prompt chunks of up to 8192 rows (325 KiB a row; 7.30 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+ ```
+ 
++qwen36's KV mirror grows with the context and takes what the device lacks from the expert
++tier, whole blocks of its device memory for the rest of the process (`vkt_give_back`); with
++`VK_EXT_memory_budget`, a first prompt's mirror past 8192 positions that fits in the half of
++the free memory a chunk leaves takes that memory instead, the chunk decided before it and only
++its scratch, the tier's staging room and 256 MiB kept free.
++
+ On qwen38 the tier also leaves what the chain allocates at its first forward: the KV
+ mirror whole at the context's capacity (at most a quarter of the device's free memory;
+ past that `vk_kvsplit.h` splits it anyway) and a chunk of 512 rows. The tier's line says
+@@ -2922,7 +2928,14 @@ dispatches over rows stay within the device limits at 8192. Two things did not s
+   dim), `vkc_attn`, `vkc_attn_w`, `vkc_mla_core` and `vkc_relattn` record their rows in
+   slices. Each slice ends its frame, submitted and not waited for, and the next starts a
+   new one, which its first barrier orders after the slice. A slice starts on a multiple
+-  of the blocked attention's rows, so no row's arithmetic changes.
++  of the blocked attention's rows, so no row's arithmetic changes. The budget alone
++  starved a big GPU: Qwen3.6's 16K prompt ran in slices of 64 rows, 32 workgroups of
++  `chain_attnb`, on an Arc Pro B60 that keeps 80 resident and runs 2 to 40 of them in
++  the same time (raising the budget to 2^36 took its first token from 118.5 to 90.0 s).
++  So a slice is cut to keep `COLI_VK_ATTN_SLICE_WG` workgroups (64; 0, the budget alone,
++  on an integrated GPU) as far as 4x the budget's work, then a chunk's slices are made
++  one size on the blocks, so some, and the last, may keep fewer. One layer of that
++  prompt replayed on the B60: 16K 9.31 -> 6.04 s of attention, 32K 69.0 -> 24.2 s.
+ 
+ ### Streaming (`vk_tier.c`)
+ 
+@@ -3081,10 +3094,12 @@ experts came from the host pool (`135 streamed (135 of them copied from the host
+ | `COLI_VK_CHAIN_ROWS` | from the budget, up to 8192 | Prompt rows per chain chunk; `auto` as unset. Set, it also keeps the engines' own prompt blocks (above). |
+ | `COLI_VK_CHAIN_ROWS_MAX` | `8192` | The most rows the budget's chunk takes. |
+ | `COLI_VK_ATTN_BLOCK` | `16` | Rows from which the chain's attention takes `chain_attnb.comp`; `0` never. |
++| `COLI_VK_ATTN_BLOCK_FIXED` | on with Xe2 under ANV, and Lavapipe | `chain_attnb.comp` with the head dims fixed in its pipeline, one a head dim, V's head dim and cache type: no test of each dim against the push constants, and a float16 cache's K and V staged 8 halves a load. Its q.k sums are the fused multiply-adds in order, what the generic pipeline's compile to on those drivers, and not one output bit moved there (an Arc Pro B60 with Mesa ANV 26.0.8, and Lavapipe, at tiles of 8 positions; `tests/test_vk_chain.c` reruns the blocked cases on the generic pipeline and compares the bytes). Other Intel GPUs under ANV, and tiles of 16 (64 KiB of shared memory), were not measured and keep the generic pipeline. Arc Pro B60 at subgroups of 16, Qwen3.6 over 16K positions with a float16 cache: a 255-row chunk 185.1 -> 25.7 ms (485.4 -> 130.0 at the reported 32), 4096 rows 2.32 -> 0.32 s (32K: 5.66 -> 0.78 s); a float32 cache about 3 times faster. `1`: on any driver (check its bits against `0` there first: `COLI_VK_ATTN_BLOCK_FIXED=1 ./tests/test_vk_chain shaders/qmatmul.spv` reruns its blocked cases on the generic pipeline, which must match byte for byte); `0`: the generic pipeline. |
+ | `COLI_VK_CHAIN_GEMM` | on where supported | The chain's int8/int4 prompt matmuls (`I % 64`, `O % 128`) on `chain_gemm.comp` (cooperative matrices at subgroup size 64 or 32, x rounded to f16 once, 128 outputs x 64 rows a workgroup); `0` keeps the fp32 GEMM. On a Radeon 8060S (Qwen3.6, 1011-token prompt): 517-546 -> 282-287 ms of tiled GEMM, the first token 2.08 -> 1.85 s, perplexity unchanged (7.65). On an RTX PRO 4000 (Qwen3.6 int4-g64, 467-token prompt): an 8192 x 2048 GEMM of 1024 rows 3.64 -> 1.53 ms, the prefill 734-756 -> 865-889 tok/s. |
+ | `COLI_VK_GEMM_WIDE` | on where supported | A GGUF's dense prompt matmuls from 128 rows on `qmatmul_gemm_bdcw.comp` (128 outputs x 128 rows a workgroup) instead of `qmatmul_gemm_bdc.comp`'s 64, for the types with no IQ grid in shared memory. RTX PRO 4000: a 4096 x 2048 Q4_K matrix against 4096 rows 3.30 -> 1.97 ms; Qwen3.6 UD-Q4_K_M's prompt at 4K tokens 1960-1979 -> 2344-2358 tok/s. `0`: the 64 tile. |
+ | `COLI_VK_GRP_WIDE` | `32` | A prompt chunk's GGUF experts on `qmatmul_grp_bdcw.comp` (64 rows by 128 decoded rows an item) when the chunk's rows give each expert this many on average, both passes on the matrix units. One layer of Qwen3.6's Q4_K experts: 1024 rows 4.40 -> 3.69 ms, 512 rows 2.90 -> 3.28 (so the threshold); its prompt at 4K tokens 2366-2371 -> 2621-2637 tok/s. `0`: never. |
+ | `COLI_VK_ATTN_SLICE` | `4294967296` | Rows x positions x heads x head dim past which an attention is cut over several submissions; `0` never. The matrix units' attention (`chain_attn_flash.comp`) counts a unit as a sixteenth: it runs one 8.5 to 13 times faster than `chain_attnb`. |
++| `COLI_VK_ATTN_SLICE_WG` | `64`; `0` on an integrated GPU | The workgroups a slice is cut to keep, as far as 4x `COLI_VK_ATTN_SLICE`'s work (up to 7x the budget-only slice where that one rounds down to one block); a chunk's slices are then made one size on the blocked attention's blocks (the same bits), so some, and the last, may keep fewer. `0`: the budget alone. |
+ | `COLI_VK_TIER_STREAM` | on | `0`: no streaming; the tier takes a prompt step in the engine's usual blocks and leaves the cold experts to the CPU, as before. |
+ | `COLI_VK_TIER_STREAM_SLOTS` | `64` | Staging slots (experts) for streaming, out of the tier's budget. |
+ | `COLI_VK_TIER_STREAM_ROWS` | the rule | Fix R, the rows from which a cold expert streams (tests). |
+@@ -3402,7 +3417,17 @@ for what the CPU reads back. An integrated GPU with a heap of system memory gets
+ host-visible system memory for all three uses, so no buffer is placed in the VRAM
+ carve-out reserved by the BIOS. An allocation that runs out of memory there is retried in a
+ device-local type. `COLI_VK_DEVICE_CAP_MB`, the budget and the expert batch count the
+-device memory: the device-local heaps, and every heap of an integrated GPU.
++device memory: the device-local heaps, and every heap of an integrated GPU. Each type is
++chosen among those the device's buffers take (the memoryTypeBits of a probe buffer with every
++usage the backend's and the chain's buffers have), the tier's host pool and an integrated
++GPU's retry type too: on an Arc Pro B60, Mesa's ANV (26.0.8) lists first a device-local type
++it keeps for images (CCS-compressed; the driconf `anv_enable_buffer_comp=true` lets buffers
++have it). Chosen from the properties alone it was the GPU-only type, the chain's buffers
++refused it, and the chain stayed off without a line.
++`[VK] memory: GPU-only buffers in type N ...` says where a choice moved; a buffer given a
++type it does not take is bound to the first it takes with that type's properties, in that
++type's heap first (`[VK] memory: a buffer does not take memory type ...`); and every way out
++of the chain's setup prints `[VK] chain: <reason>, the chain stays off`.
+ 
+ **Staged uploads** put resident data in a DEVICE_LOCAL memory type the host does not map
+ and copy it there from a host staging buffer with `vkCmdCopyBuffer`.

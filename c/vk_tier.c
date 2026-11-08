@@ -1746,7 +1746,21 @@ static void dev_codes3(uint8_t *u, const uint8_t *row, int I) {
 /* an MXFP4 row's values times 2, as int8 (e2m1: 0, 0.5, 1, 1.5, 2, 3, 4, 6 and the sign) */
 static void dev_codes_fp4(int8_t *w, const uint8_t *row, int I) {
     static const int8_t v2[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
-    for (int j = 0; j < I / 2; j++) { w[2 * j] = v2[row[j] & 15]; w[2 * j + 1] = v2[row[j] >> 4]; }
+    int j = 0;
+#if defined(__AVX2__)
+    /* The scalar table lookup, 16 packed bytes at a time. The two shuffles
+     * produce exactly the same signed int8 codes; arithmetic is unchanged. */
+    const __m128i lut = _mm_loadu_si128((const __m128i *)v2);
+    const __m128i mask = _mm_set1_epi8(15);
+    for (; j + 16 <= I / 2; j += 16) {
+        const __m128i b = _mm_loadu_si128((const __m128i *)(row + j));
+        const __m128i lo = _mm_shuffle_epi8(lut, _mm_and_si128(b, mask));
+        const __m128i hi = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(b, 4), mask));
+        _mm_storeu_si128((__m128i *)(w + 2 * j), _mm_unpacklo_epi8(lo, hi));
+        _mm_storeu_si128((__m128i *)(w + 2 * j + 16), _mm_unpackhi_epi8(lo, hi));
+    }
+#endif
+    for (; j < I / 2; j++) { w[2 * j] = v2[row[j] & 15]; w[2 * j + 1] = v2[row[j] >> 4]; }
 }
 static float dev_fp8(uint8_t b) {   /* e4m3 as the backend decodes it */
     const int e = (b >> 3) & 15, m = b & 7;

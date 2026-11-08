@@ -1,0 +1,233 @@
+Current upstream base f5d65566de468c8e7ac285a5e8c7257bf4d06856. CPU-only validation, no GPU devices.
+Commands:
+
+{"name": "base-unpack-x86-64-v3", "command": ["docker", "run", "--rm", "--name", "colibri-fp4-validation", "--user", "1001:1001", "--label", "colibench.validation=20261108-130337", "--cpuset-cpus", "16-31", "-e", "HOME=/tmp", "-e", "OMP_NUM_THREADS=16", "-e", "OMP_PROC_BIND=close", "-e", "OMP_PLACES=cores", "-v", "/opt/colibri/pr-mxfp4host-base:/src", "-v", "/opt/colibri/colibench/experiments:/helpers:ro", "-v", "/opt/colibri/colibench/data-dsv4-reap/experiments/fp4-current-validation-20261108-130337:/evidence", "-w", "/src/c", "colibri-builder:xe2", "python3", "/helpers/fp4_unpack_probe.py", "/src/c/vk_tier.c", "/evidence/base-unpack-x86-64-v3", "--arch", "x86-64-v3"], "exit_code": 0}
+{"name": "base-unpack-x86-64", "command": ["docker", "run", "--rm", "--name", "colibri-fp4-validation", "--user", "1001:1001", "--label", "colibench.validation=20261108-130337", "--cpuset-cpus", "16-31", "-e", "HOME=/tmp", "-e", "OMP_NUM_THREADS=16", "-e", "OMP_PROC_BIND=close", "-e", "OMP_PLACES=cores", "-v", "/opt/colibri/pr-mxfp4host-base:/src", "-v", "/opt/colibri/colibench/experiments:/helpers:ro", "-v", "/opt/colibri/colibench/data-dsv4-reap/experiments/fp4-current-validation-20261108-130337:/evidence", "-w", "/src/c", "colibri-builder:xe2", "python3", "/helpers/fp4_unpack_probe.py", "/src/c/vk_tier.c", "/evidence/base-unpack-x86-64", "--arch", "x86-64"], "exit_code": 0}
+{"name": "base-build", "command": ["docker", "run", "--rm", "--name", "colibri-fp4-validation", "--user", "1001:1001", "--label", "colibench.validation=20261108-130337", "--cpuset-cpus", "16-31", "-e", "HOME=/tmp", "-e", "OMP_NUM_THREADS=16", "-e", "OMP_PROC_BIND=close", "-e", "OMP_PLACES=cores", "-v", "/opt/colibri/pr-mxfp4host-base:/src", "-v", "/opt/colibri/colibench/experiments:/helpers:ro", "-v", "/opt/colibri/colibench/data-dsv4-reap/experiments/fp4-current-validation-20261108-130337:/evidence", "-w", "/src/c", "colibri-builder:xe2", "make", "tests/bench_host_pairs", "tests/test_vk_tier", "VK=1", "ARCH=x86-64-v3", "-j8"], "exit_code": 0}
+{"name": "base-host-pairs", "command": ["docker", "run", "--rm", "--name", "colibri-fp4-validation", "--user", "1001:1001", "--label", "colibench.validation=20261108-130337", "--cpuset-cpus", "16-31", "-e", "HOME=/tmp", "-e", "OMP_NUM_THREADS=16", "-e", "OMP_PROC_BIND=close", "-e", "OMP_PLACES=cores", "-v", "/opt/colibri/pr-mxfp4host-base:/src", "-v", "/opt/colibri/colibench/experiments:/helpers:ro", "-v", "/opt/colibri/colibench/data-dsv4-reap/experiments/fp4-current-validation-20261108-130337:/evidence", "-w", "/src/c", "colibri-builder:xe2", "./tests/test_vk_tier", "shaders/qmatmul.spv", "host-pairs"], "exit_code": 0}
+{"name": "candidate-unpack-x86-64-v3", "command": ["docker", "run", "--rm", "--name", "colibri-fp4-validation", "--user", "1001:1001", "--label", "colibench.validation=20261108-130337", "--cpuset-cpus", "16-31", "-e", "HOME=/tmp", "-e", "OMP_NUM_THREADS=16", "-e", "OMP_PROC_BIND=close", "-e", "OMP_PLACES=cores", "-v", "/opt/colibri/pr-mxfp4host:/src", "-v", "/opt/colibri/colibench/experiments:/helpers:ro", "-v", "/opt/colibri/colibench/data-dsv4-reap/experiments/fp4-current-validation-20261108-130337:/evidence", "-w", "/src/c", "colibri-builder:xe2", "python3", "/helpers/fp4_unpack_probe.py", "/src/c/vk_tier.c", "/evidence/candidate-unpack-x86-64-v3", "--arch", "x86-64-v3"], "exit_code": 0}
+{"name": "candidate-unpack-x86-64", "command": ["docker", "run", "--rm", "--name", "colibri-fp4-validation", "--user", "1001:1001", "--label", "colibench.validation=20261108-130337", "--cpuset-cpus", "16-31", "-e", "HOME=/tmp", "-e", "OMP_NUM_THREADS=16", "-e", "OMP_PROC_BIND=close", "-e", "OMP_PLACES=cores", "-v", "/opt/colibri/pr-mxfp4host:/src", "-v", "/opt/colibri/colibench/experiments:/helpers:ro", "-v", "/opt/colibri/colibench/data-dsv4-reap/experiments/fp4-current-validation-20261108-130337:/evidence", "-w", "/src/c", "colibri-builder:xe2", "python3", "/helpers/fp4_unpack_probe.py", "/src/c/vk_tier.c", "/evidence/candidate-unpack-x86-64", "--arch", "x86-64"], "exit_code": 0}
+{"name": "candidate-build", "command": ["docker", "run", "--rm", "--name", "colibri-fp4-validation", "--user", "1001:1001", "--label", "colibench.validation=20261108-130337", "--cpuset-cpus", "16-31", "-e", "HOME=/tmp", "-e", "OMP_NUM_THREADS=16", "-e", "OMP_PROC_BIND=close", "-e", "OMP_PLACES=cores", "-v", "/opt/colibri/pr-mxfp4host:/src", "-v", "/opt/colibri/colibench/experiments:/helpers:ro", "-v", "/opt/colibri/colibench/data-dsv4-reap/experiments/fp4-current-validation-20261108-130337:/evidence", "-w", "/src/c", "colibri-builder:xe2", "make", "tests/bench_host_pairs", "tests/test_vk_tier", "VK=1", "ARCH=x86-64-v3", "-j8"], "exit_code": 0}
+{"name": "candidate-host-pairs", "command": ["docker", "run", "--rm", "--name", "colibri-fp4-validation", "--user", "1001:1001", "--label", "colibench.validation=20261108-130337", "--cpuset-cpus", "16-31", "-e", "HOME=/tmp", "-e", "OMP_NUM_THREADS=16", "-e", "OMP_PROC_BIND=close", "-e", "OMP_PLACES=cores", "-v", "/opt/colibri/pr-mxfp4host:/src", "-v", "/opt/colibri/colibench/experiments:/helpers:ro", "-v", "/opt/colibri/colibench/data-dsv4-reap/experiments/fp4-current-validation-20261108-130337:/evidence", "-w", "/src/c", "colibri-builder:xe2", "./tests/test_vk_tier", "shaders/qmatmul.spv", "host-pairs"], "exit_code": 0}
+{"name": "base1-micro-nt16", "command": ["docker", "run", "--rm", "--name", "colibri-fp4-validation", "--user", "1001:1001", "--label", "colibench.validation=20261108-130337", "--cpuset-cpus", "16-31", "-e", "HOME=/tmp", "-e", "OMP_NUM_THREADS=16", "-e", "OMP_PROC_BIND=close", "-e", "OMP_PLACES=cores", "-v", "/opt/colibri/pr-mxfp4host-base:/src", "-v", "/opt/colibri/colibench/experiments:/helpers:ro", "-v", "/opt/colibri/colibench/data-dsv4-reap/experiments/fp4-current-validation-20261108-130337:/evidence", "-w", "/src/c", "colibri-builder:xe2", "./tests/bench_host_pairs", "7", "4096", "2048", "16", "160"], "exit_code": 0}
+{"name": "candidate-micro-nt16", "command": ["docker", "run", "--rm", "--name", "colibri-fp4-validation", "--user", "1001:1001", "--label", "colibench.validation=20261108-130337", "--cpuset-cpus", "16-31", "-e", "HOME=/tmp", "-e", "OMP_NUM_THREADS=16", "-e", "OMP_PROC_BIND=close", "-e", "OMP_PLACES=cores", "-v", "/opt/colibri/pr-mxfp4host:/src", "-v", "/opt/colibri/colibench/experiments:/helpers:ro", "-v", "/opt/colibri/colibench/data-dsv4-reap/experiments/fp4-current-validation-20261108-130337:/evidence", "-w", "/src/c", "colibri-builder:xe2", "./tests/bench_host_pairs", "7", "4096", "2048", "16", "160"], "exit_code": 0}
+{"name": "base2-micro-nt16", "command": ["docker", "run", "--rm", "--name", "colibri-fp4-validation", "--user", "1001:1001", "--label", "colibench.validation=20261108-130337", "--cpuset-cpus", "16-31", "-e", "HOME=/tmp", "-e", "OMP_NUM_THREADS=16", "-e", "OMP_PROC_BIND=close", "-e", "OMP_PLACES=cores", "-v", "/opt/colibri/pr-mxfp4host-base:/src", "-v", "/opt/colibri/colibench/experiments:/helpers:ro", "-v", "/opt/colibri/colibench/data-dsv4-reap/experiments/fp4-current-validation-20261108-130337:/evidence", "-w", "/src/c", "colibri-builder:xe2", "./tests/bench_host_pairs", "7", "4096", "2048", "16", "160"], "exit_code": 0}
+{"name": "candidate-make-check", "command": ["docker", "run", "--rm", "--name", "colibri-fp4-validation", "--user", "1001:1001", "--label", "colibench.validation=20261108-130337", "--cpuset-cpus", "16-31", "-e", "HOME=/tmp", "-v", "/opt/colibri/pr-mxfp4host:/src", "-v", "/opt/colibri/colibench/experiments:/helpers:ro", "-v", "/opt/colibri/colibench/data-dsv4-reap/experiments/fp4-current-validation-20261108-130337:/evidence", "-w", "/src/c", "colibri-builder:xe2", "env", "-u", "OMP_NUM_THREADS", "-u", "OMP_PROC_BIND", "-u", "OMP_PLACES", "make", "check", "-j16"], "exit_code": 0}
+
+
+base-unpack-x86-64-v3.log
+PASS 147712 cases, 10272768 exact E2M1 values; unaligned input/output, signed zero, all codes, vector/tail boundaries, guards and input preservation
+
+
+base-unpack-x86-64.log
+PASS 147712 cases, 10272768 exact E2M1 values; unaligned input/output, signed zero, all codes, vector/tail boundaries, guards and input preservation
+
+
+candidate-unpack-x86-64-v3.log
+PASS 147712 cases, 10272768 exact E2M1 values; unaligned input/output, signed zero, all codes, vector/tail boundaries, guards and input preservation
+
+
+candidate-unpack-x86-64.log
+PASS 147712 cases, 10272768 exact E2M1 values; unaligned input/output, signed zero, all codes, vector/tail boundaries, guards and input preservation
+
+
+base-host-pairs.log
+host pairs, the integer form:
+  Q4_K/Q6_K        12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.20e-02 against the float reference
+  IQ2_XXS/IQ3_XXS  12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.35e-02 against the float reference
+  int4-g64 pairs   12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.48e-02 against the float reference
+  int8 a row       12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.81e-02 against the float reference
+  int3-g64         12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.29e-02 against the float reference
+  MXFP4 g32        12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.46e-02 against the float reference
+  FP8 g128         12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 2.93e-07 against the float reference
+PASS
+
+
+candidate-host-pairs.log
+host pairs, the integer form:
+  Q4_K/Q6_K        12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.20e-02 against the float reference
+  IQ2_XXS/IQ3_XXS  12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.35e-02 against the float reference
+  int4-g64 pairs   12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.48e-02 against the float reference
+  int8 a row       12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.81e-02 against the float reference
+  int3-g64         12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.29e-02 against the float reference
+  MXFP4 g32        12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.46e-02 against the float reference
+  FP8 g128         12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 2.93e-07 against the float reference
+PASS
+
+
+base1-micro-nt16.log
+fmt 7 D 4096 I 2048, 12.58 MB a pair
+sample np 1 nt 16 rep 1 warmup 1: 1592.548281 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 16 rep 2 warmup 1: 1058.884444 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 16 rep 3 warmup 0: 1036.519769 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 16 rep 4 warmup 0: 1021.199875 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 16 rep 5 warmup 0: 1088.277112 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 16 rep 6 warmup 0: 1182.021188 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 16 rep 7 warmup 0: 1053.289812 us a pair (160 calls), output 362bf110c83924eb
+np 1 nt 16:  1021.2 us a call, 1021.2 us a pair (best; mean 1076.3),  12.3 GB/s
+sample np 2 nt 16 rep 1 warmup 1: 1024.374819 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 16 rep 2 warmup 1: 1040.139587 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 16 rep 3 warmup 0: 1019.454056 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 16 rep 4 warmup 0: 1029.724475 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 16 rep 5 warmup 0: 1021.566425 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 16 rep 6 warmup 0: 1026.086356 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 16 rep 7 warmup 0: 1067.352187 us a pair (80 calls), output 279fb3632842d57c
+np 2 nt 16:  2038.9 us a call, 1019.5 us a pair (best; mean 1032.8),  12.3 GB/s
+sample np 8 nt 16 rep 1 warmup 1: 1016.651713 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 16 rep 2 warmup 1: 1019.138919 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 16 rep 3 warmup 0: 1014.470925 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 16 rep 4 warmup 0: 1010.843262 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 16 rep 5 warmup 0: 1010.596744 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 16 rep 6 warmup 0: 1014.493844 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 16 rep 7 warmup 0: 1010.699425 us a pair (20 calls), output 96a6e8d90351032a
+np 8 nt 16:  8084.8 us a call, 1010.6 us a pair (best; mean 1012.2),  12.5 GB/s
+
+
+candidate-micro-nt16.log
+fmt 7 D 4096 I 2048, 12.58 MB a pair
+sample np 1 nt 16 rep 1 warmup 1: 530.210062 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 16 rep 2 warmup 1: 391.929463 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 16 rep 3 warmup 0: 390.541244 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 16 rep 4 warmup 0: 389.106931 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 16 rep 5 warmup 0: 390.792894 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 16 rep 6 warmup 0: 391.378556 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 16 rep 7 warmup 0: 391.196606 us a pair (160 calls), output 362bf110c83924eb
+np 1 nt 16:   389.1 us a call,  389.1 us a pair (best; mean  390.6),  32.3 GB/s
+sample np 2 nt 16 rep 1 warmup 1: 374.032994 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 16 rep 2 warmup 1: 383.036525 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 16 rep 3 warmup 0: 377.523250 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 16 rep 4 warmup 0: 379.594800 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 16 rep 5 warmup 0: 375.879256 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 16 rep 6 warmup 0: 378.252444 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 16 rep 7 warmup 0: 377.269788 us a pair (80 calls), output 279fb3632842d57c
+np 2 nt 16:   751.8 us a call,  375.9 us a pair (best; mean  377.7),  33.5 GB/s
+sample np 8 nt 16 rep 1 warmup 1: 384.070269 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 16 rep 2 warmup 1: 383.447475 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 16 rep 3 warmup 0: 383.224519 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 16 rep 4 warmup 0: 383.215250 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 16 rep 5 warmup 0: 379.097706 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 16 rep 6 warmup 0: 382.397063 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 16 rep 7 warmup 0: 382.745056 us a pair (20 calls), output 96a6e8d90351032a
+np 8 nt 16:  3032.8 us a call,  379.1 us a pair (best; mean  382.1),  33.2 GB/s
+
+
+base2-micro-nt16.log
+fmt 7 D 4096 I 2048, 12.58 MB a pair
+sample np 1 nt 16 rep 1 warmup 1: 1232.529906 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 16 rep 2 warmup 1: 1023.542025 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 16 rep 3 warmup 0: 1028.368306 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 16 rep 4 warmup 0: 1028.145756 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 16 rep 5 warmup 0: 1203.307800 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 16 rep 6 warmup 0: 1126.834750 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 16 rep 7 warmup 0: 1031.362794 us a pair (160 calls), output 362bf110c83924eb
+np 1 nt 16:  1028.1 us a call, 1028.1 us a pair (best; mean 1083.6),  12.2 GB/s
+sample np 2 nt 16 rep 1 warmup 1: 1125.535181 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 16 rep 2 warmup 1: 1023.964900 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 16 rep 3 warmup 0: 1137.535800 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 16 rep 4 warmup 0: 1049.856037 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 16 rep 5 warmup 0: 1039.260838 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 16 rep 6 warmup 0: 1052.464356 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 16 rep 7 warmup 0: 1055.980231 us a pair (80 calls), output 279fb3632842d57c
+np 2 nt 16:  2078.5 us a call, 1039.3 us a pair (best; mean 1067.0),  12.1 GB/s
+sample np 8 nt 16 rep 1 warmup 1: 1019.973694 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 16 rep 2 warmup 1: 1026.099675 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 16 rep 3 warmup 0: 1026.411881 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 16 rep 4 warmup 0: 1036.718062 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 16 rep 5 warmup 0: 996.667256 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 16 rep 6 warmup 0: 995.774912 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 16 rep 7 warmup 0: 1007.570719 us a pair (20 calls), output 96a6e8d90351032a
+np 8 nt 16:  7966.2 us a call,  995.8 us a pair (best; mean 1012.6),  12.6 GB/s
+
+
+Full make check: exit 0; Ran 3089 tests in 316.962s; OK (skipped=397).
+Full local log SHA256: 4ae60d0ec446b440facdd0ffe8550c72e256b8795e295628712a76b9598125b9
+Build diagnostics: 66 warnings, in unchanged source/test paths; no warning-free build claim.
+Diagnostics:
+tests/../qwen36.c:1224:12: warning: 'g_q36_mux_cur' defined but not used [-Wunused-variable]
+tests/../qwen36.c:1223:16: warning: 'g_q36_mux_seq' defined but not used [-Wunused-variable]
+tests/../ggml_quants.h:1565:57: warning: array subscript 512 is outside array bounds of 'float[512]' [-Warray-bounds=]
+tests/../ggml_quants.h:1565:57: warning: array subscript [1024, 1536] is outside array bounds of 'float[512]' [-Warray-bounds=]
+tests/../ggml_quants.h:1565:57: warning: array subscript 512 is outside array bounds of 'float[512]' [-Warray-bounds=]
+tests/../ggml_quants.h:1565:57: warning: array subscript 512 is outside array bounds of 'float[512]' [-Warray-bounds=]
+tests/../ggml_quants.h:1565:57: warning: array subscript [1024, 1536] is outside array bounds of 'float[512]' [-Warray-bounds=]
+tests/../ggml_quants.h:1565:57: warning: array subscript [1536, 2048] is outside array bounds of 'float[512]' [-Warray-bounds=]
+tests/test_lora.c:158:65: warning: ignoring return value of 'system' declared with attribute 'warn_unused_result' [-Wunused-result]
+tests/test_train_resume.c:180:65: warning: ignoring return value of 'system' declared with attribute 'warn_unused_result' [-Wunused-result]
+tests/../rans.h:389:63: warning: writing 1 byte into a region of size 0 [-Wstringop-overflow=]
+tests/../rans.h:389:63: warning: writing 1 byte into a region of size 0 [-Wstringop-overflow=]
+tests/test_train_resume.c:47:29: warning: '/train.bin' directive output may be truncated writing 10 bytes into a region of size between 1 and 1024 [-Wformat-truncation=]
+tests/test_train_resume.c:48:29: warning: '/train.msk' directive output may be truncated writing 10 bytes into a region of size between 1 and 1024 [-Wformat-truncation=]
+tests/test_train_resume.c:49:29: warning: '/train.idx' directive output may be truncated writing 10 bytes into a region of size between 1 and 1024 [-Wformat-truncation=]
+tests/test_route_trace.c:345:22: warning: ignoring return value of 'fread' declared with attribute 'warn_unused_result' [-Wunused-result]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+tests/qwen36_fake_cuda.h:736:1: warning: missing initializer for field 'host_up_n' of 'ColiCudaChainOps' [-Wmissing-field-initializers]
+qwen36.c:1224:12: warning: 'g_q36_mux_cur' defined but not used [-Wunused-variable]
+qwen36.c:1223:16: warning: 'g_q36_mux_seq' defined but not used [-Wunused-variable]
+[SAMPLE] warning: non-finite logits (NaN/Inf) — falling back to argmax; output may be degraded. This usually means a numerical blow-up upstream.
+[SAMPLE] warning: non-finite logits (NaN/Inf) — falling back to argmax; output may be degraded. This usually means a numerical blow-up upstream.
+[datapoint] warning: engine teardown did not complete cleanly, results are still valid: Command 'engine' timed out after 5 seconds
+/src/c/ggml_quants.h:545: warning: ignoring ‘#pragma omp parallel’ [-Wunknown-pragmas]
+/src/c/ggml_quants.h:548: warning: ignoring ‘#pragma omp for’ [-Wunknown-pragmas]
+/src/c/ggml_quants.h:605: warning: ignoring ‘#pragma omp parallel’ [-Wunknown-pragmas]
+/src/c/ggml_quants.h:608: warning: ignoring ‘#pragma omp for’ [-Wunknown-pragmas]
+/src/c/ggml_quants.h:3132: warning: ignoring ‘#pragma omp parallel’ [-Wunknown-pragmas]
+/src/c/ggml_quants.h:3144: warning: ignoring ‘#pragma omp parallel’ [-Wunknown-pragmas]
+/src/c/ggml_quants.h:545: warning: ignoring ‘#pragma omp parallel’ [-Wunknown-pragmas]
+/src/c/ggml_quants.h:548: warning: ignoring ‘#pragma omp for’ [-Wunknown-pragmas]
+/src/c/ggml_quants.h:605: warning: ignoring ‘#pragma omp parallel’ [-Wunknown-pragmas]
+/src/c/ggml_quants.h:608: warning: ignoring ‘#pragma omp for’ [-Wunknown-pragmas]
+/src/c/ggml_quants.h:3132: warning: ignoring ‘#pragma omp parallel’ [-Wunknown-pragmas]
+/src/c/ggml_quants.h:3144: warning: ignoring ‘#pragma omp parallel’ [-Wunknown-pragmas]
+/src/c/ggml_quants.h:545: warning: ignoring ‘#pragma omp parallel’ [-Wunknown-pragmas]
+/src/c/ggml_quants.h:548: warning: ignoring ‘#pragma omp for’ [-Wunknown-pragmas]
+/src/c/ggml_quants.h:605: warning: ignoring ‘#pragma omp parallel’ [-Wunknown-pragmas]
+/src/c/ggml_quants.h:608: warning: ignoring ‘#pragma omp for’ [-Wunknown-pragmas]
+/src/c/ggml_quants.h:3132: warning: ignoring ‘#pragma omp parallel’ [-Wunknown-pragmas]
+/src/c/ggml_quants.h:3144: warning: ignoring ‘#pragma omp parallel’ [-Wunknown-pragmas]
+
+Full-check final output:
+............/src/c/tests/test_ui_owned_gateway_process.py:30: ResourceWarning: unclosed file <_io.BufferedWriter name='/tmp/coli-owned-gateway-go4e8nnb/gateway.log'>
+  process = models.launch(
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/usr/lib/python3.14/subprocess.py:1139: ResourceWarning: subprocess 29009 is still running
+  _warn("subprocess %s is still running" % self.pid,
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+  nothing running — no serve on port 9123, no SERVE engines
+OWNED_GATEWAY_WITNESS {"elapsed_seconds": 1.0016648220189381, "errors": [], "pid": 29009, "signals": [15], "state": null, "stop_completed": true}
+OWNED_GATEWAY_CLEANUP complete
+.REAL_GRACE_WITNESS {"seconds": 60.01678075300879, "signal": 9}
+.....................  [TUNE] applied measured profile · +20.0% calibration throughput
+  [TUNE] applied measured profile · +20.0% calibration throughput
+  [TUNE] applied measured profile · +20.0% calibration throughput
+..........................................................s.......................
+----------------------------------------------------------------------
+Ran 3089 tests in 316.962s
+
+OK (skipped=397)
+make[2]: Leaving directory '/src/c'
+make[1]: Leaving directory '/src/c'
