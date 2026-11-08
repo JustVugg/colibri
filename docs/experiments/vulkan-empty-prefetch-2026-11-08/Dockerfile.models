@@ -1,0 +1,5 @@
+# Same retained Mesa/gateway/runtime as Q38, with the V4 engine from the isolated
+# xe2-models tree. Base and local patch snapshot are recorded with the first run.
+FROM colibri-vulkan:q38-fp8host3
+COPY c/deepseek_v4 /app/deepseek_v4
+COPY c/shaders/ /app/shaders/

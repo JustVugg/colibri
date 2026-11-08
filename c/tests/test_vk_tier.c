@@ -942,6 +942,42 @@ static void stream(void) {
     }
 }
 
+/* An empty prefetch must not allocate the reserved streaming slots. The
+ * resident count/budget stays unchanged; stream() above covers real cold work. */
+static void empty_prefetch(void) {
+    VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    set_budget(L * E + 4, f, f);
+    setenv("COLI_VK_TIER_STREAM", "1", 1);
+    setenv("COLI_VK_TIER_STREAM_SLOTS", "4", 1);
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+    vc.load = load_cb; vc.release = release_cb;
+    int on = vkt_init(&vc, NULL);
+    CHECK(on, "empty prefetch: the tier did not start");
+    if (on) {
+        for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) {
+            VktExpertSrc src = src_of(&ex[l][e]); vkt_put(l, e, &src);
+        }
+        vkt_put_done();
+        int resident = 0;
+        for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) resident += vkt_resident(l, e) != 0;
+        CHECK(resident == L * E, "empty prefetch: only %d of %d experts resident", resident, L * E);
+        ColiVkXbStats xs; coli_vk_xb_stats(&xs);
+        CHECK(xs.gemm_rows > 0 && xs.gemm_rows <= 64, "empty prefetch: streaming guard would skip the call (%d rows)", xs.gemm_rows);
+        ColiVkPoolStats before, after; coli_vk_pool_stats(1, &before);
+        for (int l = 0; l < L; l++) CHECK(vkt_stream_prefetch(l, 64) == 0, "empty prefetch: unexpected cold expert");
+        coli_vk_pool_stats(1, &after);
+        CHECK(before.used == after.used && before.allocs == after.allocs && before.live == after.live,
+              "empty prefetch allocated slots: used %zu -> %zu, allocations %llu -> %llu, live %d -> %d",
+              before.used, after.used, (unsigned long long)before.allocs, (unsigned long long)after.allocs, before.live, after.live);
+        printf("  all %d experts resident: empty prefetch %zu -> %zu bytes, %llu extra tier allocations\n",
+               resident, before.used, after.used, (unsigned long long)(after.allocs - before.allocs));
+        vkt_shutdown();
+    }
+    model_free();
+    unsetenv("COLI_VK_TIER_STREAM"); unsetenv("COLI_VK_TIER_STREAM_SLOTS");
+}
+
 /* formats by layer: layer 0 Q4_K gate/up and Q5_K down (the main form), layer 1 the
  * bigger Q5_K and Q6_K, as a published GGUF gives a few layers */
 static void layers(void) {
@@ -1671,6 +1707,7 @@ int main(int argc, char **argv) {
     printf("fill:\n"); fill();   /* after extra: its exact pool capacities assume no tier came before with more experts */
     printf("DeepSeek V4:\n"); v4_act();
     printf("stream:\n"); stream();
+    printf("empty prefetch:\n"); empty_prefetch();
     printf("layers:\n"); layers();
     printf("promote:\n"); promote_case();
     printf("hybrid:\n");

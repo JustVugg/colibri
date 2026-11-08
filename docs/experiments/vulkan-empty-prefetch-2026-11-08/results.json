@@ -1,0 +1,13 @@
+{
+  "baseline": {
+    "exit_code": 1,
+    "failures": [
+      "empty prefetch allocated slots: used 921600 -> 1105920, allocations 8422 -> 8446, live 120 -> 144"
+    ]
+  },
+  "candidate": {
+    "exit_code": 0,
+    "failures": []
+  },
+  "verdict": "regression reproduced on original; full Vulkan tier suite passed with candidate on CPU Lavapipe"
+}
