@@ -7,7 +7,13 @@
 #include <assert.h>
 
 struct Dsv4CudaTensor { int device; };
+struct Dsv4CudaExpertSet { int device; };
+static int sets_created, sets_freed;
+void dsv4_cuda_expert_set_free(Dsv4CudaExpertSet *set) {
+    if (set) { sets_freed++; free(set); }
+}
 static int initialized, shutdowns, live_tensors, free_queries[16], drained[16];
+static int upload_fail_after = -1, low_memory_device = -1;
 int dsv4_cuda_backend_arch_ok(int device) { return device >= 0 && device < 6; }
 const char *dsv4_cuda_backend_name(void) { return "test"; }
 int dsv4_cuda_init(const int *devices, int count) {
@@ -22,14 +28,15 @@ int dsv4_cuda_device_unified(int device) { (void)device; return 0; }
 int dsv4_cuda_expert_bank_slots(int experts) { (void)experts; return 0; }
 long long dsv4_cuda_expert_bank_slot_bytes(int hidden, int intermediate) { (void)hidden; (void)intermediate; return 0; }
 void dsv4_cuda_activation_free(Dsv4CudaActivation *a) { (void)a; }
-void dsv4_cuda_expert_set_free(Dsv4CudaExpertSet *set) { (void)set; }
-long long dsv4_cuda_mem_free_mb(int device) { free_queries[device]++; return 32000; }
+long long dsv4_cuda_mem_free_mb(int device) { free_queries[device]++; return device == low_memory_device ? 0 : 32000; }
 int dsv4_cuda_stream_drain(int device) { drained[device]++; return device != 3; }
 void dsv4_cuda_tensor_free(Dsv4CudaTensor *t) { if (t) { live_tensors--; free(t); } }
 void dsv4_cuda_proj_batch_release(void) {}
 int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t, const uint8_t *w,
                           const uint8_t *scale, int rows, int cols, int device) {
     (void)w; (void)scale; (void)rows; (void)cols;
+    if (upload_fail_after == 0) return 0;
+    if (upload_fail_after > 0) upload_fail_after--;
     *t = malloc(sizeof(**t));
     assert(*t);
     (*t)->device = device;
@@ -40,6 +47,242 @@ int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t, const uint8_t *w,
                                  const uint8_t *scale, int rows, int cols, int sync) {
     (void)t; (void)w; (void)scale; (void)rows; (void)cols; (void)sync;
     return 1;
+}
+
+static int moe_calls, moe_ok = 1;
+static V4GpuExpertMirrorCache *locked_cache;
+int dsv4_cuda_moe(Dsv4CudaTensor *const *gate, Dsv4CudaTensor *const *up,
+    Dsv4CudaTensor *const *down, const float *weights, int count,
+    Dsv4CudaTensor *sg, Dsv4CudaTensor *su, Dsv4CudaTensor *sd,
+    float limit, float *y, const float *x) {
+    (void)limit;
+    assert(count == 2 && weights[0] == 0.25f && weights[1] == 0.75f);
+    assert(sg == su && su == sd && sg->device == gate[0]->device);
+    assert(pthread_mutex_trylock(&locked_cache->mutex) != 0);
+    for (int i = 0; i < count; i++) {
+        assert(gate[i]->device == sg->device);
+        assert(up[i]->device == sg->device && down[i]->device == sg->device);
+    }
+    moe_calls++;
+    if (moe_ok) y[0] = x[0];
+    return moe_ok;
+}
+
+static void check_resident(ColiExpertStore *store, int layer, int device) {
+    locked_cache = v4_gpu_expert_cache(store, layer);
+    struct Dsv4CudaTensor shared = {device};
+    int ids[] = {0, 1};
+    float weights[] = {0.25f, 0.75f}, input = 7, output = -1;
+    int before = moe_calls;
+    assert(coli_v4_gpu_moe_resident(store, layer, ids, weights, 2,
+        &shared, &shared, &shared, 0, &output, &input) == 1);
+    assert(output == input && moe_calls == before + 1);
+    ids[1] = 255;
+    output = -1;
+    assert(coli_v4_gpu_moe_resident(store, layer, ids, weights, 2,
+        &shared, &shared, &shared, 0, &output, &input) == 0);
+    assert(output == -1 && moe_calls == before + 1);
+    ids[1] = 1;
+    assert(coli_v4_gpu_moe_resident(store, layer, ids, weights, 2,
+        NULL, &shared, &shared, 0, &output, &input) == 0);
+    V4GpuExpertMirror *incomplete = NULL;
+    for (int i = 0; i < locked_cache->count; i++)
+        if (locked_cache->entries[i].layer == layer && locked_cache->entries[i].expert == 1)
+            incomplete = &locked_cache->entries[i];
+    assert(incomplete);
+    Dsv4CudaTensor *saved = incomplete->down;
+    incomplete->down = NULL;
+    assert(coli_v4_gpu_moe_resident(store, layer, ids, weights, 2,
+        &shared, &shared, &shared, 0, &output, &input) == 0);
+    incomplete->down = saved;
+    assert(moe_calls == before + 1);
+    moe_ok = 0;
+    assert(coli_v4_gpu_moe_resident(store, layer, ids, weights, 2,
+        &shared, &shared, &shared, 0, &output, &input) == 0);
+    assert(output == -1 && moe_calls == before + 2);
+    moe_ok = 1;
+    assert(pthread_mutex_trylock(&locked_cache->mutex) == 0);
+    pthread_mutex_unlock(&locked_cache->mutex);
+}
+
+static int lookups, releases, active_leases, lookup_fail_after = -1;
+static int mock_lookup(ColiExpertStore *store, ColiExpertKey key, ColiExpertView *view) {
+    (void)store;
+    if (lookup_fail_after == 0) return -1;
+    if (lookup_fail_after > 0) lookup_fail_after--;
+    static uint8_t bytes[512];
+    memset(view, 0, sizeof(*view));
+    view->key = key;
+    view->lease = bytes;
+    view->gate.data = view->up.data = view->down.data = bytes;
+    view->gate.scales = view->up.scales = view->down.scales = bytes;
+    view->gate.rows = view->up.rows = view->down.rows = 32;
+    view->gate.columns = view->up.columns = view->down.columns = 32;
+    view->gate.block_rows = view->up.block_rows = view->down.block_rows = 1;
+    lookups++; active_leases++;
+    return 0;
+}
+static void mock_release(ColiExpertStore *store, ColiExpertView *view) {
+    (void)store;
+    assert(view->lease && active_leases == 1);
+    releases++; active_leases--;
+}
+int coli_v4_layer_load(ColiV4Engine *engine, ColiDeepSeekV4LayerWeights *weights,
+    const ColiDeepSeekV4Config *config, const ColiSafetensorsIndex *index,
+    int layer, char *error, size_t size) {
+    (void)engine; (void)config; (void)index; (void)error; (void)size;
+    memset(weights, 0, sizeof(*weights));
+    weights->plan.layer = layer;
+    return 0;
+}
+static int shared_missing;
+void *coli_v4_layer_gpu(const ColiDeepSeekV4LayerWeights *weights, const char *prefix) {
+    (void)weights; (void)prefix;
+    static Dsv4CudaTensor shared;
+    return shared_missing ? NULL : &shared;
+}
+static void test_preload(void) {
+    ColiV4Engine *engine = calloc(1, sizeof(*engine));
+    const ColiExpertStoreOps ops = {.lookup = mock_lookup, .release = mock_release};
+    ColiExpertStore store = {.ops = &ops};
+    engine->experts = &store;
+    engine->runtime.dense_resident = 1;
+    engine->config.num_hidden_layers = 6;
+    engine->config.n_routed_experts = 2;
+    engine->config.hidden_size = engine->config.moe_intermediate_size = 32;
+    engine->gpu.enabled = 1;
+    engine->gpu.device_count = 2;
+    engine->gpu.devices[0] = 5; engine->gpu.devices[1] = 3;
+    store.gpu = v4_gpu_expert_mirrors_create_devices(engine->gpu.devices, 2, 6);
+    void *original = store.gpu;
+    char error[256];
+    shared_missing = 1;
+    unsetenv("DSV4_CUDA_RESIDENT_EXPERTS");
+    assert(coli_v4_gpu_experts_init(engine, error, sizeof(error)) == -1);
+    assert(store.gpu == original && !live_tensors && error[0]);
+    setenv("DSV4_CUDA_RESIDENT_EXPERTS", "1", 1);
+    assert(coli_v4_gpu_experts_init(engine, error, sizeof(error)) == -1);
+    assert(store.gpu == original && !live_tensors && error[0]);
+    setenv("DSV4_CUDA_RESIDENT_EXPERTS", "0", 1);
+    int calls = lookups;
+    assert(coli_v4_gpu_experts_init(engine, error, sizeof(error)) == 0);
+    assert(lookups == calls && store.gpu == original);
+    unsetenv("DSV4_CUDA_RESIDENT_EXPERTS");
+    shared_missing = 0;
+    low_memory_device = 3;
+    assert(coli_v4_gpu_experts_preload(engine, error, sizeof(error)) == 1);
+    assert(store.gpu == original && lookups == 0 && !live_tensors);
+    low_memory_device = -1;
+    upload_fail_after = 20; /* fail on the second device after publishing none */
+    setenv("DSV4_CUDA_RESIDENT_EXPERTS", "auto", 1);
+    assert(coli_v4_gpu_experts_init(engine, error, sizeof(error)) == -1);
+    assert(store.gpu == original && !active_leases && !live_tensors && releases == lookups && error[0]);
+    setenv("DSV4_CUDA_RESIDENT_EXPERTS", "1", 1);
+    upload_fail_after = 20;
+    assert(coli_v4_gpu_experts_init(engine, error, sizeof(error)) == -1);
+    assert(store.gpu == original && !live_tensors && error[0]);
+    unsetenv("DSV4_CUDA_RESIDENT_EXPERTS");
+    upload_fail_after = 20;
+    assert(coli_v4_gpu_experts_init(engine, error, sizeof(error)) == -1);
+    assert(store.gpu == original && !live_tensors && error[0]);
+    upload_fail_after = -1;
+    lookup_fail_after = 7;
+    assert(coli_v4_gpu_experts_preload(engine, error, sizeof(error)) == -1);
+    assert(store.gpu == original && !active_leases && !live_tensors && releases == lookups);
+    lookup_fail_after = -1;
+    int before = lookups;
+    assert(coli_v4_gpu_experts_preload(engine, error, sizeof(error)) == 0);
+    assert(store.gpu != original && lookups == before + 12 && releases == lookups);
+    assert(live_tensors == 36 && !active_leases);
+    for (int layer = 0; layer < 6; layer++) {
+        locked_cache = v4_gpu_expert_cache(&store, layer);
+        assert(coli_v4_gpu_experts_resident(&store, layer));
+        assert(v4_gpu_expert_find(locked_cache, layer, -1) == NULL);
+        assert(v4_gpu_expert_find(locked_cache, layer, 2) == NULL);
+        assert(v4_gpu_expert_find(locked_cache, 6, 0) == NULL);
+        for (int expert = 0; expert < 2; expert++) {
+            V4GpuExpertMirror *entry = v4_gpu_expert_find(locked_cache, layer, expert);
+            assert(entry->layer == layer && entry->expert == expert);
+            assert(entry->gate->device == (layer < 3 ? 5 : 3));
+        }
+        int ids[] = {1, 0}; float w[] = {.25f, .75f}, x = 7, y = 0;
+        Dsv4CudaTensor shared = {layer < 3 ? 5 : 3};
+        assert(coli_v4_gpu_moe_resident(&store, layer, ids, w, 2,
+            &shared, &shared, &shared, 0, &y, &x) == 1 && y == x);
+        moe_ok = 0;
+        assert(coli_v4_gpu_moe_resident(&store, layer, ids, w, 2,
+            &shared, &shared, &shared, 0, &y, &x) == -1);
+        moe_ok = 1;
+        ids[1] = 2;
+        assert(coli_v4_gpu_moe_resident(&store, layer, ids, w, 2,
+            &shared, &shared, &shared, 0, &y, &x) == -1);
+    }
+    assert(lookups == before + 12); /* compute never reacquired host weights */
+    v4_gpu_expert_mirrors_free(store.gpu);
+    assert(!live_tensors);
+    free(engine);
+}
+
+Dsv4CudaExpertSet *dsv4_cuda_expert_set_create(Dsv4CudaTensor *const *g,
+    Dsv4CudaTensor *const *u,Dsv4CudaTensor *const *d,int count,
+    Dsv4CudaTensor *sg,Dsv4CudaTensor *su,Dsv4CudaTensor *sd) {
+    (void)sg; (void)su; (void)sd;
+    assert(count == 256);
+    for (int i=0;i<count;i++) assert(g[i] && u[i] && d[i]);
+    Dsv4CudaExpertSet *set = malloc(sizeof(*set));
+    assert(set); set->device = g[0]->device; sets_created++;
+    return set;
+}
+static int bad_hash, route_ok=1, route_calls;
+const void *coli_v4_layer_data(const ColiDeepSeekV4LayerWeights *weights,
+    const char *name, const ColiDeepSeekV4TensorSpec **spec) {
+    (void)weights; (void)name; (void)spec;
+    static int64_t map[12];
+    for(int i=0;i<12;i++)map[i]=i%6;
+    if(bad_hash)map[0]=256;
+    return map;
+}
+int dsv4_cuda_resident_route_moe(Dsv4CudaExpertSet *set,Dsv4CudaTensor *gate,
+    Dsv4CudaTensor *bias,const int *fixed,float scale,float limit,float *out,const float *in) {
+    (void)gate; (void)bias; (void)scale; (void)limit;
+    assert(set->device==0);
+    if(fixed)for(int k=0;k<6;k++)assert(fixed[k]==k);
+    route_calls++;
+    if(route_ok)*out=*in;
+    return route_ok;
+}
+static void test_resident_route(void) {
+    V4GpuExpertMirrorCache *cache=v4_gpu_expert_mirrors_create_capacity(0,256);
+    cache->first_layer=7; cache->end_layer=8; cache->experts_per_layer=256;
+    ColiExpertStore store={.gpu=cache};
+    ColiDeepSeekV4LayerWeights weights={0}; weights.plan.layer=7;
+    ColiDeepSeekV4Config config={0}; config.num_experts_per_tok=6; config.vocab_size=2;
+    for(int e=0;e<256;e++) {
+        V4GpuExpertMirror *entry=&cache->entries[cache->count++];
+        entry->layer=7; entry->expert=e;
+        entry->gate=calloc(1,sizeof(Dsv4CudaTensor));
+        entry->up=calloc(1,sizeof(Dsv4CudaTensor));
+        entry->down=calloc(1,sizeof(Dsv4CudaTensor));
+        assert(entry->gate&&entry->up&&entry->down); live_tensors+=3;
+    }
+    float in=7,out=0;
+    setenv("DSV4_CUDA_RESIDENT_ROUTE","0",1);
+    assert(!coli_v4_gpu_resident_route(&out,&weights,&config,&store,&in,0));
+    assert(!sets_created && !route_calls);
+    unsetenv("DSV4_CUDA_RESIDENT_ROUTE"); /* resident routing defaults on */
+    assert(coli_v4_gpu_resident_route(&out,&weights,&config,&store,&in,0)==1 && out==in);
+    weights.plan.uses_hash_router=1;
+    assert(coli_v4_gpu_resident_route(&out,&weights,&config,&store,&in,1)==1);
+    assert(sets_created==1 && route_calls==2);
+    bad_hash=1;
+    assert(coli_v4_gpu_resident_route(&out,&weights,&config,&store,&in,0)==-1);
+    bad_hash=0;
+    assert(coli_v4_gpu_resident_route(&out,&weights,&config,&store,&in,2)==-1);
+    route_ok=0;
+    assert(coli_v4_gpu_resident_route(&out,&weights,&config,&store,&in,0)==0);
+    v4_gpu_expert_mirrors_free(cache);
+    assert(sets_created==sets_freed && !live_tensors);
+    unsetenv("DSV4_CUDA_RESIDENT_ROUTE");
 }
 
 int main(void) {
@@ -73,6 +316,7 @@ int main(void) {
             assert(((Dsv4CudaTensor *)view.gate.gpu)->device == engine->gpu.devices[owner]);
             assert(coli_v4_gpu_expert_peek(&store, &view) == 0);
         }
+        check_resident(&store, layer, engine->gpu.devices[owner]);
     }
     assert(coli_v4_gpu_expert_drain(&store) == -1);
     int probed = 0;
@@ -91,6 +335,8 @@ int main(void) {
     assert(coli_v4_gpu_engine_open(engine) == -1);
     assert(!store.gpu && shutdowns == 1);
     free(engine);
+    test_preload();
+    test_resident_route();
     puts("test_v4_gpu_placement: ok");
     return 0;
 }
