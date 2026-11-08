@@ -84,6 +84,7 @@
 #include "omp_tune.h"
 #include "kv_prefix.h"
 #include "park.h"   /* a short request keeps the conversation aside (COLI_PARK) */
+#include "dsv41_kvq.h"   /* COLI_VK_KV_QUANT=2: the host's KV rows in the cache formats */
 #include "prompt_break.h"   /* a served prompt that a STOP or CANCEL stops between two layers */
 #include "pin_pool.h"   /* riuso del prefisso tra turni (shared) */
 #include "spec_draft.h" /* the verify depth from DSpark's confidence (SpecGate) */
@@ -1313,24 +1314,29 @@ typedef struct {
     WF eng_q, eng_k;
     int engram_index;           /* which table, -1 when this layer has none */
     /* per-layer state */
-    float *window;              /* [window_size, head_dim] ring of raw KV */
+    uint8_t *window;            /* [window_size, head_dim] ring of raw KV -- fp32 rows, or COLI_VK_KV_QUANT=2's 528 B code rows */
     /* Which position each ring slot holds, -1 when it holds nothing yet. A single
      * decode step needs only "slot i is position i until the ring wraps", but a
      * speculative step writes several positions at once and then keeps only some of
      * them: the slots of the rejected drafts still hold their keys, and the only thing
      * that makes them unreadable is knowing which position they came from. */
     int *window_pos;
-    float *ckv;                 /* [max_pos/ratio, head_dim] compressed KV (owners) */
-    float *ikey;                /* [max_pos/ratio, index_head_dim] index keys (owners) */
-    float *cstate_kv, *cstate_score;   /* compressor group still filling */
+    uint8_t *ckv;               /* [max_pos/ratio, head_dim] compressed KV (owners): fp32, or 288 B code rows */
+    uint8_t *ikey;              /* [max_pos/ratio, index_head_dim] index keys (owners): fp32, or 68 B rows in block-wide sections */
+    float *cstate_kv, *cstate_score;   /* compressor group still filling (fp32: the pooling softmax reads raw values) */
     /* What a speculative step displaced, one entry per row of the batch: the ring slot
      * it overwrote and the compressor slot it overwrote. Both are addressed modulo
      * something (the window, the compression ratio), so a draft several positions ahead
      * lands on a slot a committed position still needs -- the key one window back, or
      * the earlier half of a group that has not closed yet. Rejected rows put these
      * back. */
-    float *ring_save, *cstate_save_kv, *cstate_save_score;
+    uint8_t *ring_save;         /* a displaced ring row: fp32, or a 528 B code row (a boundary: whole rows only) */
+    float *cstate_save_kv, *cstate_save_score;
     int *ring_save_pos, *cstate_save_slot;
+    /* what model_load/v41_seq_alloc gave the arrays above, in bytes -- the host-side
+     * byte-sum guard (v41_host_kv_check, mirroring the chain's v41c_kvq_check) reads
+     * them back against the flag's widths, so an allocation a branch missed fails loudly */
+    size_t win_b, rs_b, ckv_b, ik_b;
 } Layer;
 
 /* DSpark: the MTP draft head, under `mtp.*` in the checkpoint.
@@ -1417,7 +1423,7 @@ typedef struct {
      * oracle in tools/dsv41_ref.py encodes. V41_INDEX_OWNER=1 selects the reading the
      * architecture implies instead -- each layer against its own owner's keys -- which
      * is a different model, not a bug fix, and is why it is not the default. */
-    const float *published_index_k;
+    const uint8_t *published_index_k;
     int published_index_layer;
     /* A speculative step runs several positions in one pass, and the slot above is
      * per-STEP state in the vendor: to stay equal to the same positions decoded one at
@@ -1427,7 +1433,7 @@ typedef struct {
      * one's later rows -- and the pointer the step began with. */
     int *pub_layer;
     int pub_rows;
-    const float *pub_before;
+    const uint8_t *pub_before;
     int pub_before_layer;
     uint8_t **ehit;             /* experts routed this turn (dashboard HITS) */
     struct Vision *vision;      /* the VL tower, NULL on a text-only container */
@@ -1466,16 +1472,93 @@ typedef struct {
  * the per-layer arrays it owns and the cross-layer state attention_run reads from the
  * Model (v41_seq_swap trades the two sets). */
 typedef struct {
-    float **window, **ckv, **ikey, **cstate_kv, **cstate_score;
+    uint8_t **window, **ckv, **ikey;
+    float **cstate_kv, **cstate_score;
     int **window_pos;
+    size_t *win_b, *ckv_b, *ik_b;   /* the arrays' bytes, as allocated (the byte-sum guard's) */
     int pos;
     kv_prefix kvp;
     int32_t *history; int history_len, history_cap;
-    const float *published_index_k; int published_index_layer;
+    const uint8_t *published_index_k; int published_index_layer;
     int *shared_topk; int shared_topk_rows, shared_topk_width;
     uint8_t *candidates; int candidate_width, candidate_rows;
 } V41Seq;
 static int g_v41_mux_slots = 1;   /* KV_SLOTS: the conversations a serve decodes at once */
+
+/* COLI_VK_KV_QUANT=2: the host's own KV arrays (the window rings, the compressed rows,
+ * the index keys) held in the checkpoint's cache formats too -- c/dsv41_kvq.h's 528/288/
+ * 68-byte rows where today they hold dequantized fp32 rows. Parsed once here, before
+ * model_load allocates a byte; the same geometry guard as the device flag's (the formats
+ * are defined at head_dim 512 and index_head_dim 128), and with the geometry wrong the
+ * flag falls back to today's fp32 host and says so once. The device side parses its own
+ * copy in deepseek_v41_chain.h (flag 1 = the device mirrors only, 2 = both).
+ *
+ * THE INVARIANT THE PLANNER AND THE SPLIT RELY ON: once this returns 1 the HOST layout
+ * is packed and stays packed for the process's life -- the KV split's give-way
+ * (v41c_kvq_give_way) reverts the DEVICE mirrors to fp32 whole, never the host, so the
+ * split's paths read the codes (dequant on read) instead of the host reverting. */
+static int g_v41_host_kvq = -1;
+static int v41_host_kvq(const Cfg *c) {
+    if (g_v41_host_kvq < 0) {
+        const char *e = getenv("COLI_VK_KV_QUANT");
+        g_v41_host_kvq = e && *e == '2' && c->head_dim == 512 && c->index_head_dim == 128;
+        if (e && *e == '2' && !g_v41_host_kvq)
+            fprintf(stderr, "[v41] COLI_VK_KV_QUANT=2 wants head_dim 512 and index_head_dim 128; "
+                            "the host's KV state stays fp32\n");
+    }
+    return g_v41_host_kvq;
+}
+/* the host row widths, in BYTES: the flag's code widths, or today's fp32 ones. The
+ * arrays are uint8_t* now, so every offset into them is byte arithmetic through these --
+ * a stride of `head_dim` on such a pointer would scale by bytes and silently land at a
+ * quarter of a row. Anything that reads or writes VALUES branches on v41_host_kvq and
+ * goes through dsv41_kvq.h. */
+static size_t v41_row_win(const Cfg *c) { return v41_host_kvq(c) ? KVQ_WIN_BYTES : (size_t)c->head_dim * sizeof(float); }
+static size_t v41_row_ckv(const Cfg *c) { return v41_host_kvq(c) ? KVQ_CKV_BYTES : (size_t)c->head_dim * sizeof(float); }
+/* an index-key row's LINEAR staging width (a pull's write-back); the mirror itself is
+ * block-wide sections, addressed only through kvq_ikey_* -- no linear byte op on it but
+ * a whole-buffer or whole-block one */
+static size_t v41_row_ikey(const Cfg *c) { return v41_host_kvq(c) ? KVQ_IKEY_BYTES : (size_t)c->index_head_dim * sizeof(float); }
+static size_t v41_ikey_bytes(const Cfg *c, int slots) {   /* the mirror's allocation */
+    return v41_host_kvq(c) ? kvq_ikey_mirror_bytes((size_t)slots) : (size_t)slots * c->index_head_dim * sizeof(float);
+}
+/* what the host's KV arrays hold, in bytes -- the ledger's host-kv term (v41c_ledger)
+ * and the byte-sum guard below both read it */
+static size_t v41_host_kv_bytes(const Model *m) {
+    const Cfg *c = &m->c;
+    size_t b = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        const Layer *l = &m->L[i];
+        b += l->win_b + l->rs_b;
+        if (c->kv_source[i]) b += l->ckv_b + l->ik_b;
+    }
+    for (int i = 0; m->spec.active && i < c->n_mtp; i++) b += m->spec.stage[i].win_b;
+    return b;
+}
+/* The host-side byte-sum guard, the twin of the chain's v41c_kvq_check: every array the
+ * engine allocated (model_load, spec_load, v41_seq_alloc record their bytes), summed
+ * against the widths the flag says, once after the allocations. An allocation a branch
+ * missed shows up as bytes that do not add up, before any row is written through it. */
+static void v41_host_kv_check(const Model *m, const char *where) {
+    const Cfg *c = &m->c;
+    size_t exp = 0;
+    int rows = c->spec_block > 0 ? c->spec_block + 1 : 1;
+    for (int i = 0; i < c->n_layers; i++) {
+        exp += (size_t)c->window * v41_row_win(c) + (size_t)rows * v41_row_win(c);
+        if (c->kv_source[i]) {
+            int slots = c->max_positions / (c->compress_ratio[i] > 0 ? c->compress_ratio[i] : 1);
+            exp += (size_t)slots * v41_row_ckv(c) + v41_ikey_bytes(c, slots);
+        }
+    }
+    exp += (size_t)(m->spec.active ? c->n_mtp : 0) * (size_t)c->window * v41_row_win(c);
+    size_t act = v41_host_kv_bytes(m);
+    if (act != exp) {
+        fprintf(stderr, "[v41] %s: COLI_VK_KV_QUANT=%d assertion failed: the host's KV arrays hold %zu B where the "
+                        "flag's widths say %zu B -- a width a branch missed\n",
+                where, v41_host_kvq(c), act, exp);
+        abort();
+    }
+}
 
 /* ------------------------------------------------------------ rope --------- */
 
@@ -2474,8 +2557,9 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
         V41_DHO(w8_load(&m->S, &l->sh_w3, NAME("layers.%d.ffn.shared_experts.w3.weight", i), c->moe_inter, dim));
         V41_DHO(w8_load(&m->S, &l->sh_w2, NAME("layers.%d.ffn.shared_experts.w2.weight", i), dim, c->moe_inter));
 
-        l->window = xmalloc((size_t)c->window * hd * sizeof(float), "window ring");
-        memset(l->window, 0, (size_t)c->window * hd * sizeof(float));
+        l->win_b = (size_t)c->window * v41_row_win(c);
+        l->window = xmalloc(l->win_b, "window ring");
+        memset(l->window, 0, l->win_b);   /* zero codes are +-0.0 values in every format */
         l->window_pos = xmalloc((size_t)c->window * sizeof(int), "window positions");
         for (int k = 0; k < c->window; k++) l->window_pos[k] = -1;
         /* Sized from spec_block, NOT from n_mtp: the released config.json
@@ -2486,7 +2570,8 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
          * could not show, because the config this repository writes for it
          * does declare n_mtp_layers. The block size is what bounds a batch. */
         int rows = c->spec_block > 0 ? c->spec_block + 1 : 1;
-        l->ring_save = xmalloc((size_t)rows * hd * sizeof(float), "displaced ring keys");
+        l->rs_b = (size_t)rows * v41_row_win(c);
+        l->ring_save = xmalloc(l->rs_b, "displaced ring keys");
         l->ring_save_pos = xmalloc((size_t)rows * sizeof(int), "displaced ring positions");
         int ratio = c->compress_ratio[i];
         if (c->kv_source[i]) {
@@ -2503,10 +2588,12 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
                 for (int k = 0; k < ratio * hd; k++) l->cstate_score[k] = -INFINITY;
             }
             int slots = c->max_positions / (ratio > 0 ? ratio : 1);
-            l->ckv = xmalloc((size_t)slots * hd * sizeof(float), "compressed kv");
-            memset(l->ckv, 0, (size_t)slots * hd * sizeof(float));
-            l->ikey = xmalloc((size_t)slots * c->index_head_dim * sizeof(float), "index keys");
-            memset(l->ikey, 0, (size_t)slots * c->index_head_dim * sizeof(float));
+            l->ckv_b = (size_t)slots * v41_row_ckv(c);
+            l->ckv = xmalloc(l->ckv_b, "compressed kv");
+            memset(l->ckv, 0, l->ckv_b);
+            l->ik_b = v41_ikey_bytes(c, slots);
+            l->ikey = xmalloc(l->ik_b, "index keys");
+            memset(l->ikey, 0, l->ik_b);
             V41_DHO(wb_load(&m->S, &l->idx_wk, NAME("layers.%d.attn.indexer.wk.weight", i),
                     c->index_head_dim, hd));
             wf_load(&m->S, &l->idx_knorm, NAME("layers.%d.attn.indexer.k_norm.weight", i),
@@ -2577,6 +2664,7 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
                                   c->compress_rope_theta, c->rope_factor,
                                   c->beta_fast, c->beta_slow);
     m->pos = 0;
+    v41_host_kv_check(m, "model_load");   /* the widths the flag says, before a row is written */
 }
 
 static const float *rope_for(const Model *m, int layer) {
@@ -2792,6 +2880,14 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
     float *qblk = xmalloc((size_t)block * nh * ihd * sizeof(float), "indexer queries");
     float *wblk = xmalloc((size_t)block * nh * sizeof(float), "indexer weights");
     float *score = xmalloc((size_t)compress_len * sizeof(float), "indexer scores");
+    /* the keys this call reads, decoded: under the flag the mirrors hold codes, and the
+     * base a row reads is resolved PER ROW (published_owner is position-dependent, and
+     * the pub_before/published aliases may address another conversation's mirror), so
+     * the scratch is keyed on the resolved base -- one fill while it holds, a refill
+     * when it moves (a decode step's single row fills it once) */
+    int hostq = v41_host_kvq(c);
+    float *ikd = hostq ? xmalloc((size_t)compress_len * ihd * sizeof(float), "index keys decoded") : NULL;
+    const uint8_t *ikd_of = NULL;
     float scale = (1.0f / sqrtf((float)ihd)) * (1.0f / sqrtf((float)nh));
 
     for (int t = 0; t < n; t++) {
@@ -2801,7 +2897,7 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
             mvb_rows(wblk, nh, &l->idx_wproj, x + (size_t)t * c->dim, c->dim, rows);
         }
         float *q = qblk + (size_t)(t % block) * nh * ihd, *weights = wblk + (size_t)(t % block) * nh;
-        const float *ikey = m->L[owner].ikey;
+        const uint8_t *ikey = m->L[owner].ikey;
         if (!tidy) {
             int published = published_owner(m, layer, start_pos, t);
             if (published >= 0) ikey = m->L[published].ikey;
@@ -2813,6 +2909,15 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
              * it here would make the same position read different keys than it
              * read when prefilled cold. */
             else if (n == 1 && m->published_index_k) ikey = m->published_index_k;
+        }
+        const float *keys;   /* the rows this query scores against, as floats either way */
+        if (!hostq) keys = (const float *)(const void *)ikey;
+        else {
+            if (ikey != ikd_of) {   /* a refill only when the resolved base moved */
+                for (int j = 0; j < compress_len; j++) kvq_unpack_ikey(ikd + (size_t)j * ihd, ikey, j);
+                ikd_of = ikey;
+            }
+            keys = ikd;
         }
         for (int h = 0; h < nh; h++)
             rope_apply(q + (size_t)h * ihd + ihd - c->rope_dim, rope, start_pos + t, c->rope_dim, 0);
@@ -2826,7 +2931,7 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
             float total = 0.0f;
             for (int h = 0; h < nh; h++) {
                 const float *qh = q + (size_t)h * ihd;
-                const float *k = ikey + (size_t)j * ihd;
+                const float *k = keys + (size_t)j * ihd;
                 float dot = 0.0f;
                 for (int i = 0; i < ihd; i++) dot += qh[i] * k[i];
                 if (dot > 0.0f) total += dot * weights[h];    /* relu, then the head weight */
@@ -2870,7 +2975,7 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
         for (int k = 0; k < topk; k++)
             row[k] = (k < taken && row[k] < lens) ? row[k] + offset : -1;
     }
-    free(qblk); free(wblk); free(score);
+    free(qblk); free(wblk); free(score); free(ikd);
 }
 
 /* wo_a is block diagonal over o_groups: each group projects only its own heads, and
@@ -2949,17 +3054,26 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
     }
 
     /* the window half: prefill reads the chunk, decode reads the ring */
+    int hostq = v41_host_kvq(c);
+    size_t roww = v41_row_win(c);
+    float *win_dec = NULL;   /* the ring's rows as floats, under the flag (dequant on read) */
     const float *window_kv;
     int window_rows;
     if (start_pos == 0) {
         int win = c->window;
-        if (n <= win) {
+        /* position p lands in slot p % win either way: under the flag each row is packed
+         * from the (already roped) scratch row, and the fp32 path keeps its two memcpy
+         * arms -- whole rows, so only the row width differs */
+        if (hostq)
+            for (int p = n > win ? n - win : 0; p < n; p++)
+                kvq_pack_win(l->window + (size_t)(p % win) * roww, kv + (size_t)p * hd);
+        else if (n <= win) {
             memcpy(l->window, kv, (size_t)n * hd * sizeof(float));
         } else {
             int cut = n % win;
             const float *tail = kv + (size_t)(n - win) * hd;
-            memcpy(l->window + (size_t)cut * hd, tail, (size_t)(win - cut) * hd * sizeof(float));
-            memcpy(l->window, tail + (size_t)(win - cut) * hd, (size_t)cut * hd * sizeof(float));
+            memcpy(l->window + (size_t)cut * roww, tail, (size_t)(win - cut) * hd * sizeof(float));
+            memcpy(l->window, tail + (size_t)(win - cut) * hd, (size_t)cut * roww);
         }
         /* both branches above leave position p in slot p % win */
         for (int p = n > win ? n - win : 0; p < n; p++) l->window_pos[p % win] = p;
@@ -2970,7 +3084,12 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
          * oldest slot before the first row has read it. The window a query sees has to
          * be the window it would have seen alone, which means writing its key, reading,
          * and only then writing the next one. */
-        window_kv = l->window; window_rows = c->window;
+        if (hostq) {   /* the ring holds codes: the whole ring decodes once, per forward */
+            win_dec = xmalloc((size_t)c->window * hd * sizeof(float), "window decoded");
+            for (int t = 0; t < c->window; t++) kvq_unpack_win(win_dec + (size_t)t * hd, l->window + (size_t)t * roww);
+            window_kv = win_dec;
+        } else window_kv = (const float *)(const void *)l->window;
+        window_rows = c->window;
     }
 
     int window_width = start_pos == 0 ? (n < c->window ? n : c->window) : c->window;
@@ -3008,10 +3127,14 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
                 float *keys = xmalloc((size_t)produced * c->index_head_dim * sizeof(float), "index keys");
                 mvb_rows(keys, c->index_head_dim, &l->idx_wk, latent, hd, produced);
                 for (int g = 0; g < produced; g++) {
-                    float *dest = l->ikey + (size_t)latent_row[g] * c->index_head_dim;
-                    rms_into(dest, keys + (size_t)g * c->index_head_dim, l->idx_knorm.w,
-                             c->index_head_dim, c->norm_eps);
-                    rope_apply(dest + c->index_head_dim - rd, rope, latent_row[g] * ratio, rd, 0);
+                    /* staged in the scratch row (never roped in place inside a code row):
+                     * rms, the rope tail, then the store -- a pack under the flag */
+                    float *row = keys + (size_t)g * c->index_head_dim;
+                    rms_into(row, row, l->idx_knorm.w, c->index_head_dim, c->norm_eps);
+                    rope_apply(row + c->index_head_dim - rd, rope, latent_row[g] * ratio, rd, 0);
+                    if (hostq) kvq_pack_ikey(l->ikey, latent_row[g], row);
+                    else memcpy(l->ikey + (size_t)latent_row[g] * v41_row_ikey(c), row,
+                                (size_t)c->index_head_dim * sizeof(float));
                 }
                 free(keys);
                 /* publish, as model.py does, only when a group completed */
@@ -3054,16 +3177,23 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
         }
         if (produced) {
             for (int g = 0; g < produced; g++) {
-                float *dest = l->ckv + (size_t)latent_row[g] * hd;
-                memcpy(dest, latent + (size_t)g * hd, (size_t)hd * sizeof(float));
-                rope_apply(dest + hd - rd, rope, latent_row[g] * ratio, rd, 0);
+                /* staged in the latent row (the last reader of it): the rope tail lands
+                 * here, then the store packs or copies the row out */
+                float *row = latent + (size_t)g * hd;
+                rope_apply(row + hd - rd, rope, latent_row[g] * ratio, rd, 0);
+                if (hostq) kvq_pack_ckv(l->ckv + (size_t)latent_row[g] * v41_row_ckv(c), row);
+                else memcpy(l->ckv + (size_t)latent_row[g] * v41_row_ckv(c), row, (size_t)hd * sizeof(float));
             }
         }
         free(latent); free(latent_row);
         kv_all = xmalloc((size_t)(window_rows + compress_len) * hd * sizeof(float), "kv all");
         memcpy(kv_all, window_kv, (size_t)window_rows * hd * sizeof(float));
-        memcpy(kv_all + (size_t)window_rows * hd, m->L[owner].ckv,
-               (size_t)compress_len * hd * sizeof(float));
+        if (hostq) {   /* the owner's compressed rows dequantize into kv_all, per forward */
+            for (int j = 0; j < compress_len; j++)
+                kvq_unpack_ckv(kv_all + (size_t)(window_rows + j) * hd,
+                               m->L[owner].ckv + (size_t)j * v41_row_ckv(c));
+        } else memcpy(kv_all + (size_t)window_rows * hd, m->L[owner].ckv,
+                      (size_t)compress_len * hd * sizeof(float));
     }
 
     const float *kv_read = ratio ? kv_all : window_kv;
@@ -3078,14 +3208,15 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
     for (int t = 0; t < n; t++) {
         if (start_pos > 0) {
             int pos = start_pos + t, slot = pos % c->window;
-            if (n > 1 && m->rollback_save) {
-                memcpy(l->ring_save + (size_t)t * hd, l->window + (size_t)slot * hd,
-                       (size_t)hd * sizeof(float));
+            if (n > 1 && m->rollback_save) {   /* the displaced row aside, whole bytes either way */
+                memcpy(l->ring_save + (size_t)t * roww, l->window + (size_t)slot * roww, roww);
                 l->ring_save_pos[t] = l->window_pos[slot];
             }
-            memcpy(l->window + (size_t)slot * hd, kv + (size_t)t * hd, (size_t)hd * sizeof(float));
+            if (hostq) kvq_pack_win(l->window + (size_t)slot * roww, kv + (size_t)t * hd);
+            else memcpy(l->window + (size_t)slot * roww, kv + (size_t)t * hd, (size_t)hd * sizeof(float));
             l->window_pos[slot] = pos;
-            /* kv_all holds a copy of the ring, so it takes the same write */
+            /* kv_all holds a copy of the ring, so it takes the same write -- from the
+             * scratch row, which is the floats either way */
             if (kv_all) memcpy(kv_all + (size_t)slot * hd, kv + (size_t)t * hd,
                                (size_t)hd * sizeof(float));
             int count = 0;
@@ -3109,7 +3240,7 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
         }
     }
     m->t_attn += now_s() - started;
-    free(head_score); free(kv_raw);
+    free(head_score); free(kv_raw); free(win_dec);
     free(heads); free(kv_all); free(idx); free(scratch); free(kv); free(q); free(qr);
 }
 
@@ -4231,8 +4362,9 @@ static void spec_load(Model *m, int ecap) {
         w8_load(&m->S, &l->sh_w1, MNAME("mtp.%d.ffn.shared_experts.w1.weight", i), c->moe_inter, dim);
         w8_load(&m->S, &l->sh_w3, MNAME("mtp.%d.ffn.shared_experts.w3.weight", i), c->moe_inter, dim);
         w8_load(&m->S, &l->sh_w2, MNAME("mtp.%d.ffn.shared_experts.w2.weight", i), dim, c->moe_inter);
-        l->window = xmalloc((size_t)c->window * hd * sizeof(float), "DSpark window ring");
-        memset(l->window, 0, (size_t)c->window * hd * sizeof(float));
+        l->win_b = (size_t)c->window * v41_row_win(c);
+        l->window = xmalloc(l->win_b, "DSpark window ring");
+        memset(l->window, 0, l->win_b);
         l->window_pos = xmalloc((size_t)c->window * sizeof(int), "DSpark window positions");
         for (int k = 0; k < c->window; k++) l->window_pos[k] = -1;
         cache_init(m, &sp->cache[i], ecap, 1);
@@ -4277,9 +4409,13 @@ static void spec_attention(Model *m, int stage, const float *x, int block, int s
     mv8_rows(scratch, hd, &l->wkv, main_x, dim, main_rows);
     for (int t = 0; t < main_rows; t++) {
         int pos = start_pos + t;
-        float *slot = l->window + (size_t)(pos % win) * hd;
-        rms_into(slot, scratch + (size_t)t * hd, l->kv_norm.w, hd, c->norm_eps);
-        rope_apply(slot + hd - rd, rope, pos, rd, 0);
+        /* staged in the scratch row (never roped in place inside a code row): rms, the
+         * rope tail, then the store -- a pack under the flag */
+        float *row = scratch + (size_t)t * hd;
+        rms_into(row, row, l->kv_norm.w, hd, c->norm_eps);
+        rope_apply(row + hd - rd, rope, pos, rd, 0);
+        if (v41_host_kvq(c)) kvq_pack_win(l->window + (size_t)(pos % win) * v41_row_win(c), row);
+        else memcpy(l->window + (size_t)(pos % win) * v41_row_win(c), row, (size_t)hd * sizeof(float));
         l->window_pos[pos % win] = pos;
     }
     if (!out) { free(scratch); m->t_attn += now_s() - started; return; }
@@ -4308,7 +4444,9 @@ static void spec_attention(Model *m, int stage, const float *x, int block, int s
     for (int j = 0; j < reach; j++) idx[j] = j;
     for (int j = 0; j < block; j++) idx[reach + j] = win + j;
     float *kv_all = xmalloc((size_t)(win + block) * hd * sizeof(float), "spec kv all");
-    memcpy(kv_all, l->window, (size_t)win * hd * sizeof(float));
+    if (v41_host_kvq(c)) {   /* the stage ring holds codes: dequantize the whole ring */
+        for (int t = 0; t < win; t++) kvq_unpack_win(kv_all + (size_t)t * hd, l->window + (size_t)t * v41_row_win(c));
+    } else memcpy(kv_all, (const float *)(const void *)l->window, (size_t)win * hd * sizeof(float));
     memcpy(kv_all + (size_t)win * hd, kv, (size_t)block * hd * sizeof(float));
 
     float *heads = xmalloc((size_t)block * nh * hd * sizeof(float), "spec heads");
@@ -4817,6 +4955,23 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int spe
      * round adds nothing here until spec_verify commits through forward_batch. */
     if (image_rows || image_mask) kv_prefix_taint(&m->kvp);
     kv_prefix_record(&m->kvp, ids, start_all, n_all);
+
+    if (image_rows || image_mask) kv_prefix_taint(&m->kvp);
+    kv_prefix_record(&m->kvp, ids, start_all, n_all);
+
+    if (getenv("V41_STATE_PROBE")) {   /* TEMPORARY probe: the state a turn left */
+        unsigned long long sw = 0, sc = 0, si = 0;
+        for (int i = 0; i < m->c.n_layers; i++) {
+            Layer *l = &m->L[i];
+            for (size_t k = 0; k < (size_t)m->c.window * m->c.head_dim; k++) sw += (unsigned long long)(((const float *)(const void *)l->window)[k] * 1000003.0) + k;
+            if (m->c.kv_source[i]) {
+                for (size_t k = 0; k < (size_t)(m->c.max_positions / m->c.compress_ratio[i]) * m->c.head_dim; k++) sc += (unsigned long long)(((const float *)(const void *)l->ckv)[k] * 999983.0) + k;
+                for (size_t k = 0; k < (size_t)(m->c.max_positions / m->c.compress_ratio[i]) * m->c.index_head_dim; k++) si += (unsigned long long)(((const float *)(const void *)l->ikey)[k] * 999331.0) + k;
+            }
+        }
+        fprintf(stderr, "STATEPROBE pos=%d win=%llu ckv=%llu ikey=%llu wpos=%d\n", m->pos, sw, sc, si, m->L[0].window_pos[0]);
+    }
+
     /* the rows main_hidden holds, which DSpark's stages are seeded from: the tail when the
      * prompt took one (their window is within it) */
     m->last_start = start_pos;
@@ -4852,14 +5007,15 @@ static void v41_seq_swap(Model *m, V41Seq *q) {
 #define V41_SWAP(T,a,b) do { T t_ = (a); (a) = (b); (b) = t_; } while (0)
     for (int i = 0; i < m->c.n_layers; i++) {
         Layer *l = &m->L[i];
-        V41_SWAP(float *, l->window, q->window[i]); V41_SWAP(int *, l->window_pos, q->window_pos[i]);
-        V41_SWAP(float *, l->ckv, q->ckv[i]); V41_SWAP(float *, l->ikey, q->ikey[i]);
+        V41_SWAP(uint8_t *, l->window, q->window[i]); V41_SWAP(int *, l->window_pos, q->window_pos[i]);
+        V41_SWAP(uint8_t *, l->ckv, q->ckv[i]); V41_SWAP(uint8_t *, l->ikey, q->ikey[i]);
+        V41_SWAP(size_t, l->win_b, q->win_b[i]); V41_SWAP(size_t, l->ckv_b, q->ckv_b[i]); V41_SWAP(size_t, l->ik_b, q->ik_b[i]);
         V41_SWAP(float *, l->cstate_kv, q->cstate_kv[i]); V41_SWAP(float *, l->cstate_score, q->cstate_score[i]);
     }
     V41_SWAP(int, m->pos, q->pos); V41_SWAP(kv_prefix, m->kvp, q->kvp);
     V41_SWAP(int32_t *, m->engram.history, q->history);
     V41_SWAP(int, m->engram.history_len, q->history_len); V41_SWAP(int, m->engram.history_cap, q->history_cap);
-    V41_SWAP(const float *, m->published_index_k, q->published_index_k);
+    V41_SWAP(const uint8_t *, m->published_index_k, q->published_index_k);
     V41_SWAP(int, m->published_index_layer, q->published_index_layer);
     V41_SWAP(int *, m->shared_topk, q->shared_topk);
     V41_SWAP(int, m->shared_topk_rows, q->shared_topk_rows); V41_SWAP(int, m->shared_topk_width, q->shared_topk_width);
@@ -4878,17 +5034,21 @@ static void v41_mux_bind(Model *m, int slot) {
 static void v41_seq_alloc(Model *m, V41Seq *q, int with_state) {
     Cfg *c = &m->c; int hd = c->head_dim;
     memset(q, 0, sizeof *q);
-    q->window = xcalloc((size_t)c->n_layers, sizeof(float *), "seq windows");
+    q->window = xcalloc((size_t)c->n_layers, sizeof(uint8_t *), "seq windows");
     q->window_pos = xcalloc((size_t)c->n_layers, sizeof(int *), "seq window positions");
-    q->ckv = xcalloc((size_t)c->n_layers, sizeof(float *), "seq compressed kv");
-    q->ikey = xcalloc((size_t)c->n_layers, sizeof(float *), "seq index keys");
+    q->ckv = xcalloc((size_t)c->n_layers, sizeof(uint8_t *), "seq compressed kv");
+    q->ikey = xcalloc((size_t)c->n_layers, sizeof(uint8_t *), "seq index keys");
+    q->win_b = xcalloc((size_t)c->n_layers, sizeof(size_t), "seq window bytes");
+    q->ckv_b = xcalloc((size_t)c->n_layers, sizeof(size_t), "seq ckv bytes");
+    q->ik_b = xcalloc((size_t)c->n_layers, sizeof(size_t), "seq ikey bytes");
     q->cstate_kv = xcalloc((size_t)c->n_layers, sizeof(float *), "seq compressor groups");
     q->cstate_score = xcalloc((size_t)c->n_layers, sizeof(float *), "seq compressor scores");
     q->published_index_layer = m->published_index_layer;
     if (!with_state) return;
     kv_prefix_alloc(&q->kvp, c->max_positions);
     for (int i = 0; i < c->n_layers; i++) {
-        q->window[i] = xcalloc((size_t)c->window * hd, sizeof(float), "window ring");
+        q->window[i] = xcalloc((size_t)c->window * v41_row_win(c), 1, "window ring");
+        q->win_b[i] = (size_t)c->window * v41_row_win(c);
         q->window_pos[i] = xmalloc((size_t)c->window * sizeof(int), "window positions");
         for (int k = 0; k < c->window; k++) q->window_pos[i][k] = -1;
         int ratio = c->compress_ratio[i];
@@ -4899,9 +5059,17 @@ static void v41_seq_alloc(Model *m, V41Seq *q, int with_state) {
                 for (int k = 0; k < ratio * hd; k++) q->cstate_score[i][k] = -INFINITY;
             }
             int slots = c->max_positions / (ratio > 0 ? ratio : 1);
-            q->ckv[i] = xcalloc((size_t)slots * hd, sizeof(float), "compressed kv");
-            q->ikey[i] = xcalloc((size_t)slots * c->index_head_dim, sizeof(float), "index keys");
+            q->ckv_b[i] = (size_t)slots * v41_row_ckv(c);
+            q->ckv[i] = xcalloc(q->ckv_b[i], 1, "compressed kv");
+            q->ik_b[i] = v41_ikey_bytes(c, slots);
+            q->ikey[i] = xcalloc(q->ik_b[i], 1, "index keys");
         }
+    }
+    {   /* the byte-sum guard over THIS set: swap it in, check, swap back (the sizes swap
+         * with the arrays, so the guard reads the set that was just allocated) */
+        v41_seq_swap(m, q);
+        v41_host_kv_check(m, "v41_seq_alloc");
+        v41_seq_swap(m, q);
     }
 }
 
@@ -5015,17 +5183,20 @@ static void forward_rows(Model *m, const int *slots, const int *ids, int n, floa
  * the request reads (window_slot_ok, and a query reaches only the groups closed before it). */
 static void model_reset_rows(Model *m, int n) {
     Cfg *c = &m->c;
+    int hostq = v41_host_kvq(c);
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
         int w = n >= 0 && n < c->window ? n : c->window;
-        memset(l->window, 0, (size_t)w * c->head_dim * sizeof(float));
+        memset(l->window, 0, (size_t)w * v41_row_win(c));   /* zero codes are +-0.0 values */
         for (int k = 0; k < w; k++) l->window_pos[k] = -1;
         int ratio = c->compress_ratio[i];
         if (c->kv_source[i]) {
             int slots = c->max_positions / (ratio > 0 ? ratio : 1);
             if (n >= 0) { int reach = (n + (ratio > 0 ? ratio : 1) - 1) / (ratio > 0 ? ratio : 1); if (reach < slots) slots = reach; }
-            memset(l->ckv, 0, (size_t)slots * c->head_dim * sizeof(float));
-            memset(l->ikey, 0, (size_t)slots * c->index_head_dim * sizeof(float));
+            memset(l->ckv, 0, (size_t)slots * v41_row_ckv(c));
+            if (hostq)   /* the index keys' blocks are whole: the reach rounds up to them */
+                memset(l->ikey, 0, kvq_ikey_mirror_bytes((size_t)slots));
+            else memset(l->ikey, 0, (size_t)slots * c->index_head_dim * sizeof(float));
             if (ratio > 1) {
                 memset(l->cstate_kv, 0, (size_t)ratio * c->head_dim * sizeof(float));
                 for (int k = 0; k < ratio * c->head_dim; k++) l->cstate_score[k] = -INFINITY;
@@ -5126,8 +5297,8 @@ static void spec_rollback(Model *m, int start_pos, int committed, int rows) {
         Layer *l = &m->L[layer];
         for (int t = rows - 1; t >= committed; t--) {
             int slot = (start_pos + t) % c->window;
-            memcpy(l->window + (size_t)slot * hd, l->ring_save + (size_t)t * hd,
-                   (size_t)hd * sizeof(float));
+            memcpy(l->window + (size_t)slot * v41_row_win(c), l->ring_save + (size_t)t * v41_row_win(c),
+                   v41_row_win(c));   /* a boundary: whole rows, bytes either way */
             l->window_pos[slot] = l->ring_save_pos[t];
             if (!l->cstate_save_kv) continue;
             int group = l->cstate_save_slot[t];
@@ -5149,7 +5320,7 @@ static void spec_rollback(Model *m, int start_pos, int committed, int rows) {
      * ids below m->pos are the committed ones, so truncating is enough. */
     if (m->kvp.len > m->pos) m->kvp.len = m->pos;
     if (m->pub_rows > 0) {
-        const float *published = m->pub_before;
+        const uint8_t *published = m->pub_before;
         int layer = m->pub_before_layer;
         for (int t = committed - 1; t >= 0; t--)
             if (m->pub_layer[t] >= 0) {
@@ -5359,24 +5530,27 @@ static int v41_prompt_poll(ColiPromptBreak *b) {
 #define V41_PARK_SPEC 16   /* the rows a verify writes past the tokens that stand */
 static ColiPark g_v41_park;
 static struct { int history_len, published_layer, topk_rows, topk_width, cand_width, cand_rows;
-                const float *published; int *topk; uint8_t *cand; } g_v41_park_x;
+                const uint8_t *published; int *topk; uint8_t *cand; } g_v41_park_x;
 static Tok *g_v41_log_tok;   /* the request's tokenizer, for COLI_PREFIX_LOG */
 static void v41_decode_one(int id, unsigned char *out, int *n) {
     *n = g_v41_log_tok ? tok_decode(g_v41_log_tok, &id, 1, (char *)out, 255) : 0;
     if (*n < 0) *n = 0;
 }
 static ColiParkPart *v41_park_parts(Model *m, int *n_out) {
-    Cfg *c = &m->c; int L = c->n_layers, n = 0;
+    Cfg *c = &m->c; int L = c->n_layers, n = 0, hostq = v41_host_kvq(c);
     ColiParkPart *p = malloc(sizeof *p * ((size_t)L * 6 + 1));
     if (!p) { *n_out = 0; return NULL; }
     for (int i = 0; i < L; i++) {
         Layer *l = &m->L[i]; int r = c->compress_ratio[i];
-        p[n++] = coli_park_rows(l->window, (size_t)c->head_dim * sizeof(float), c->window);
+        p[n++] = coli_park_rows(l->window, v41_row_win(c), c->window);
         p[n++] = coli_park_rows(l->window_pos, sizeof(int), c->window);
         if (c->kv_source[i]) {
             int slots = c->max_positions / (r > 0 ? r : 1);
-            p[n++] = coli_park_per(l->ckv, (size_t)c->head_dim * sizeof(float), slots, r);
-            p[n++] = coli_park_per(l->ikey, (size_t)c->index_head_dim * sizeof(float), slots, r);
+            p[n++] = coli_park_per(l->ckv, v41_row_ckv(c), slots, r);
+            if (hostq)   /* the index keys' blocks are whole, so the rows kept must be too */
+                p[n++] = coli_park_per_blocks(l->ikey, KVQ_IKEY_BYTES,
+                                              (int)(kvq_ikey_mirror_bytes((size_t)slots) / KVQ_IKEY_BYTES), r, KVQ_IKEY_BLOCK);
+            else p[n++] = coli_park_per(l->ikey, (size_t)c->index_head_dim * sizeof(float), slots, r);
             if (r > 1) {
                 p[n++] = coli_park_whole(l->cstate_kv, (size_t)r * c->head_dim * sizeof(float));
                 p[n++] = coli_park_whole(l->cstate_score, (size_t)r * c->head_dim * sizeof(float));

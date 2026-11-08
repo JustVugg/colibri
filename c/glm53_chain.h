@@ -622,7 +622,7 @@ static int g53c_push(G53Chain *ch, const GModel *m, const GSession *s, int start
         int t0 = ch->kv_valid[i], n = start - t0;
         if (ch->pool_valid[i] > start / c->index_kpool) ch->pool_valid[i] = start / c->index_kpool;   /* rows from start change */
         if (ch->ks.on) {      /* the split: the window placed, its latent rows below start uploaded */
-            VkcKvPart pl = {1, K, ls->latent, 0, ch->kv[i].lat, 0, 0};
+            VkcKvPart pl = {1, K, ls->latent, 0, ch->kv[i].lat, 0, 0, 0};
             vkc_kv_place(&ch->ks, ch->mla_ord[i], start, n_rows);
             ok = vkc_kv_push(&ch->ks, ch->mla_ord[i], &pl, 1, start);
         }

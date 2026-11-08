@@ -1298,7 +1298,7 @@ static void test_mla(MlaCase c) {
         if (plan == 2) {
             VkcMlaCache dc = {vkc_buf((size_t)ks.rows * K * 4, VKC_DEV), R ? vkc_buf((size_t)ks.rows * R * 4, VKC_DEV) : NULL, ks.rows};
             VkcMlaCache tc = {vkc_buf((size_t)S * K * 4, VKC_DEV), R ? vkc_buf((size_t)S * R * 4, VKC_DEV) : NULL, S};
-            VkcKvPart pt[2] = {{1, K, lat, 0, dc.lat, 0, 0}, {1, R ? R : 1, rope, 0, dc.rope, 0, 0}};
+            VkcKvPart pt[2] = {{1, K, lat, 0, dc.lat, 0, 0, 0}, {1, R ? R : 1, rope, 0, dc.rope, 0, 0, 0}};
             VkcBuf *ob2 = vkc_buf((size_t)S * D * 4, VKC_DEV), *dn2 = vkc_buf((size_t)S * KR * 4, VKC_DOWN);
             vkc_kv_place(&ks, 0, pb, S);
             unsigned long long sp = ks.splits;
@@ -2543,8 +2543,8 @@ static void test_kvs_gqa(int T, int step, int H, int KVH, int hd, int vd, int B,
             free(sc);
         }
         /* the engine's order: the window placed, the rows below uploaded, the new rows stored */
-        VkcKvPart pk = {kv_pm ? 1 : KVH, kv_pm ? KVH * hd : hd, Kx, (size_t)T * hd, kc, 0, 0};
-        VkcKvPart pv = {kv_pm ? 1 : KVH, kv_pm ? KVH * vd : vd, Vx, (size_t)T * vd, vc, 0, 0};
+        VkcKvPart pk = {kv_pm ? 1 : KVH, kv_pm ? KVH * hd : hd, Kx, (size_t)T * hd, kc, 0, 0, 0};
+        VkcKvPart pv = {kv_pm ? 1 : KVH, kv_pm ? KVH * vd : vd, Vx, (size_t)T * vd, vc, 0, 0, 0};
         VkcKvPart parts[2] = {pk, pv};
         vkc_kv_place(&ks, 0, pb, S);
         ok = vkc_begin() && vkc_kv_push(&ks, 0, parts, 2, pb) &&
@@ -2637,7 +2637,7 @@ static void test_kvs_mla(int T, int step, int H, int K, int R, int B, int rows, 
             }
             free(sc);
         }
-        VkcKvPart pl = {1, K, Lx, 0, lat, 0, 0}, pr = {1, R ? R : 1, Rx, 0, rope, 0, 0};
+        VkcKvPart pl = {1, K, Lx, 0, lat, 0, 0, 0}, pr = {1, R ? R : 1, Rx, 0, rope, 0, 0, 0};
         VkcKvPart parts[2] = {pl, pr};
         vkc_kv_place(&ks, li, pb, S);
         ok = vkc_begin() && vkc_kv_push(&ks, li, parts, R ? 2 : 1, pb) && vkc_write(qab, 0, q, (size_t)S * H * (K + R) * 4) &&
@@ -2721,7 +2721,7 @@ static void test_kvs_rel(int T, int step, int H, int KVH, int hd, int ext, int d
             }
             free(sc);
         }
-        VkcKvPart pk = {KVH, hd, Kx, (size_t)T * hd, kc, 0, 0}, pv = {KVH, hd, Vx, (size_t)T * hd, vc, 0, 0};
+        VkcKvPart pk = {KVH, hd, Kx, (size_t)T * hd, kc, 0, 0, 0}, pv = {KVH, hd, Vx, (size_t)T * hd, vc, 0, 0, 0};
         VkcKvPart parts[2] = {pk, pv};
         vkc_kv_place(&ks, 0, pb, S);
         memcpy(vkc_ptr(tb), tau, (size_t)(S + 2) * 4);
@@ -2809,7 +2809,7 @@ static void test_kvs_ds(int S, int H, int hd, int nwin, int ncmp, int cnt, int v
         if (r != 2) { vkc_kv_free(&ks); continue; }
         if (pass) { ks.nw = ks.ns; ks.np = 0; }        /* every block in the window */
         VkcBuf *dc = vkc_buf((size_t)ks.rows * hd * 4, VKC_DEV);
-        VkcKvPart pc = {1, hd, cmp, 0, dc, 0, 0};
+        VkcKvPart pc = {1, hd, cmp, 0, dc, 0, 0, 0};
         vkc_kv_place(&ks, 0, ncmp - 1, 1);
         unsigned long long sp = ks.splits;
         ok = vkc_kv_parts(&ks, (size_t)S * H * (hd + 2)) && vkc_begin() && vkc_kv_push(&ks, 0, &pc, 1, ncmp);
@@ -2819,7 +2819,7 @@ static void test_kvs_ds(int S, int H, int hd, int nwin, int ncmp, int cnt, int v
         memcpy(hostcmp, cmp, (size_t)ncmp * hd * sizeof(float));
         for (int j = 0; j < ncmp; j++) if (ks.t[0].bt[j / B] >= 0)
             for (int d = 0; d < hd; d++) hostcmp[(size_t)j * hd + d] = NAN;
-        VkcKvDs a = {&ks, 0, qb, wb, dc, sb, lb, os, S, H, hd, cnt, 1, lrow, nwin, 0, 1, qrow, 1, v4, 2, orow, ncmp, scale, hostcmp};
+        VkcKvDs a = {&ks, 0, qb, wb, dc, sb, lb, os, S, H, hd, cnt, 1, lrow, nwin, 0, 1, qrow, 1, v4, 2, orow, ncmp, scale, (const uint8_t *)(const void *)hostcmp, 0};
         ok = ok && vkc_kv_ds(&a) && vkc_submit(1);
         float *got = down(os, 0, (size_t)S * orow);
         double e = 0, ew = 0;
