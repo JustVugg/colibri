@@ -2339,7 +2339,7 @@ static int q38cc_dm_serve(Q38CChain *ch, Model *m, int i, int n, unsigned v) {
     }
     memcpy(cc_ptr(ch->dm_hy), ch->host_routed, (size_t)n * H * sizeof(float));
     __sync_synchronize();   /* the rows (write-combined memory) before the word */
-    ((volatile unsigned *)cc_ptr(ch->dm_hfl))[0] = v;
+    if (!cc_host_word_skip(v, "qwen38")) ((volatile unsigned *)cc_ptr(ch->dm_hfl))[0] = v;
     __sync_synchronize();
     double t2 = now_s();
     ch->dm_hyb++; ch->dm_spin_ms += (t1 - t0) * 1e3; ch->dm_host_ms += (t2 - t1) * 1e3; ch->host_ms += (t2 - t1) * 1e3;
@@ -2551,7 +2551,7 @@ static void q38cc_srv_job(Q38CCSrv *sv, Q38CCJob *J) {
         }
         __sync_synchronize();   /* the rows (write-combined memory) out before they count */
         if (Q38CC_ADD(&J->dnd, c1 - c0) + (c1 - c0) == cdn) {   /* the last: the host's word */
-            *sv->hfl = J->v;
+            if (!cc_host_word_skip(J->v, "qwen38")) *sv->hfl = J->v;
             __sync_synchronize();
             Q38CC_ADD(&sv->jobs, 1ULL);
             if (np) {
@@ -3435,6 +3435,7 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
         if (dm && (sv = q38cc_srv_of(ch, m, n)))
             q38cc_srv_open(sv, (const volatile unsigned *)cc_ptr(ch->dm_dfl), (volatile unsigned *)cc_ptr(ch->dm_hfl),
                            (const float *)cc_ptr(ch->mixd), (float *)cc_ptr(ch->dm_hy));
+        if (dm) cc_host_wait_arm(ch->dm_hfl);
         if (!q38cc_frame_begin(ch) || !q38cc_hyper_in(ch, hyper_h + (size_t)c0 * W, n, W) ||
             !q38cc_push_state(ch, m, pb)) goto lost;
         if (dm && q38cc_dm_tab(ch, n) == ch->dm_tabb && !q38cc_stage_from(ch, m, 0)) goto lost;   /* the first staged layer's copy */
@@ -3500,7 +3501,7 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
         ok = ok && (n > Q38CC_DM_ROWS ? cc_finish() : cc_submit(1));
         if (sv) { ok = q38cc_srv_close(sv, ok, ch->dm_seq) && ok; q38cc_srv_books(ch); sv = NULL; }
         m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0; ch->wait_ms += (now_s() - t0) * 1e3;
-        if (!ok) goto lost;
+        if (!ok || (dm && cc_host_wait_gave_up(ch->dm_hfl, "qwen38"))) goto lost;
         if (dm) q38cc_dm_books(ch, m, n, pb);
         if (want_streams) memcpy(hyper_h + (size_t)c0 * W, cc_ptr(ch->hypd), (size_t)n * W * 4);
         if (mixed_h) memcpy(mixed_h + (size_t)c0 * H, cc_ptr(ch->find), (size_t)n * H * 4);
@@ -3621,6 +3622,7 @@ static int q38cc_mtp_rows(Model *m, const float *streams, const int *next, int S
             const unsigned v = ++ch->dm_seq;
             const size_t nk = (size_t)n * c->topk;
             sv = ch->srv;
+            cc_host_wait_arm(ch->dm_hfl);
             q38cc_srv_open(sv, (const volatile unsigned *)cc_ptr(ch->dm_dfl), (volatile unsigned *)cc_ptr(ch->dm_hfl),
                            (const float *)cc_ptr(ch->mixd), (float *)cc_ptr(ch->dm_hy));
             ok = ok && cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->hd_ids, ch->hd_w, &rp) &&
@@ -3651,7 +3653,7 @@ static int q38cc_mtp_rows(Model *m, const float *streams, const int *next, int S
                       : cc_matmul(q38cc_t(ch, &m->lm_head), ch->mixed, (size_t)(n - 1) * H, ch->outd, 0, 1));
         ok = ok && cc_submit(1);
         if (sv) { ok = q38cc_srv_close(sv, ok, ch->dm_seq) && ok; q38cc_srv_books(ch); sv = NULL; }
-        if (!ok) goto lost;
+        if (!ok || (hyb && cc_host_wait_gave_up(ch->dm_hfl, "qwen38"))) goto lost;
         if (hyb || card) q38cc_kv_down(ch, m, L, n, pb);
         if (settle) { ch->kv_valid[L] = pb + n; m->mtp_len = pb + n; }
         if (last && hidden) memcpy(hidden, cc_ptr(ch->hypd), (size_t)W * sizeof(float));

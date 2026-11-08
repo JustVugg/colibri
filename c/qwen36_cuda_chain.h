@@ -1739,7 +1739,7 @@ static int q36cc_dm_serve(Q36CChain *ch, Model *m, int i, int n, unsigned v) {
     }
     memcpy(cc_ptr(ch->dm_hy), ch->host_routed, (size_t)n * D * sizeof(float));
     __sync_synchronize();   /* the rows (write-combined memory) before the word */
-    ((volatile unsigned *)cc_ptr(ch->dm_hfl))[0] = v;
+    if (!cc_host_word_skip((unsigned long long)ch->dm_hyb + 1, "qwen36")) ((volatile unsigned *)cc_ptr(ch->dm_hfl))[0] = v;
     __sync_synchronize();
     double t2 = tm_now();
     ch->dm_hyb++; ch->dm_spin_ms += t1 - t0; ch->dm_host_ms += t2 - t1; ch->host_ms += t2 - t1;
@@ -1886,6 +1886,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
             q36cc_dm_end(ch); ch->dm_on = dm = 0;
         }
         if (dm) memset(ch->dm_ran, 0, (size_t)L);
+        if (dm) cc_host_wait_arm(ch->dm_hfl);
         if (!q36cc_frame_begin(ch) || !cc_write(ch->x, 0, xh + (size_t)c0 * D, (size_t)n * D * sizeof(float)) ||
             !(ch->mx_rows ? q36cc_mux_push(ch, m, c0, n) : q36cc_push_state(ch, m, pb))) goto lost;
         /* the angles to the device once a step: a RoPE that read them where the host wrote them
@@ -2013,6 +2014,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         ok = ok && cc_finish();
         ch->wait_ms += tm_now() - t0;
         if (!ok) goto lost;
+        if (dm && cc_host_wait_gave_up(ch->dm_hfl, "qwen36")) goto lost;
         if (dm) q36cc_dm_books(ch, m, n, pb);
         if (dm && n <= Q36CC_DM_ROWS) q36cc_promote(ch, m, n);
         else if (dm) { ch->pr_steps0 = ch->dm_steps; ch->pr_pairs0 = ch->dm_pairs; }   /* a prompt chunk's misses are not the brake's */

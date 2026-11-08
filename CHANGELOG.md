@@ -468,6 +468,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   answered at 12.9 tok/s. The window is now the device's memory for the engines and the pools,
   what does not fit stays on the CPU, and the answer comes at 13.1, the CPU's own speed. Left
   unset, the card stages its uploads as before (90 tok/s).
+
+- **CUDA: a hybrid step's wait for the host has a bound** (#2696). Where the card holds only part
+  of the experts, a decode layer's experts split between the card and the CPU, and the card waited
+  for the CPU's rows in a loop with no end: rows that never came left the GPU at 100% and the answer
+  stopped. The wait now ends after `COLI_CUDA_HOST_WAIT_S` (30 s): the engine says so and the CPU
+  computes from there, in qwen36's and qwen38's chains. With the host's word of one step withheld on
+  purpose (`COLI_CUDA_HOST_WAIT_FAULT`), Qwen3.6-35B int4 at `--vram 11` and Qwen3.8-Flash-Next
+  UD-IQ2_XS at `--vram 8` on an RTX PRO 4000 finished their answers; with the bound out of reach the
+  process hung until killed. `tests/cuda_tier_engines.sh` runs a small qwen35moe GGUF's hybrid steps
+  and the lost word against the CPU's tokens.
+
 - **DeepSeek V4.1: a long prompt's answer could start with `<｜begin▁of▁sentence｜>`.** Past
   layer 20, the first with compress ratio 1, a prompt of 2478 tokens or more runs the later
   layers on its last 2414 rows (`v41_prefill_tail`). Layers 21 to 23 run no indexer: they read

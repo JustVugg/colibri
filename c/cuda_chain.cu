@@ -1782,9 +1782,27 @@ __global__ static void __launch_bounds__(256) cc_route_k(const float *__restrict
 }
 /* the hybrid steps' flags: the device's word in host memory once the stream gets here
  * (a system-wide fence first: the step's rows the host reads are there before it), and
- * the stream held until the host's word reaches v */
+ * the stream held until the host's word reaches v, for ns nanoseconds of the device's clock at
+ * most (CUDA's %globaltimer): past them the device stops waiting, writes v into the word after
+ * it and goes on, and the host finds the frame lost (qwen36_cuda_chain.h) rather than the card
+ * spinning on a word that never comes (#2696: a card at 100%, the answer stopped, the server up).
+ * HIP waits as before. */
 __global__ static void cc_signal_k(volatile unsigned *f, unsigned v) { __threadfence_system(); *f = v; __threadfence_system(); }
-__global__ static void cc_wait_k(volatile unsigned *f, unsigned v) { while (*f < v) { } __threadfence_system(); }
+__global__ static void cc_wait_k(volatile unsigned *f, unsigned v, unsigned long long ns) {
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+    unsigned long long t0, t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    for (unsigned k = 1; *f < v; k++) {
+        if (k & 1023u) continue;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        if (t - t0 > ns) { f[1] = v; break; }
+    }
+#else
+    (void)ns;
+    while (*f < v) { }
+#endif
+    __threadfence_system();
+}
 /* one block of 256, two passes: the argmax of n logits (lowest index on a tie) into word 0
  * of out and its softmax probability (terms within 20 of the maximum) into word 1; a block a
  * row, the row's n logits and two words past the block before's (cc_pick_rows) */
@@ -2886,10 +2904,18 @@ static int cc_signal(CcBuf *flag, size_t word, unsigned v) {
     cc_signal_k<<<1, 1, 0, c->stream>>>((volatile unsigned *)flag->d + word, v);
     return launched(c, "signal");
 }
+/* COLI_CUDA_HOST_WAIT_S: how long the device waits for the host's word (30 s; the word after it
+ * says the device stopped waiting) */
 static int cc_wait_host(CcBuf *flag, size_t word, unsigned v) {
     CcCtx *c = live();
-    if (!c || !flag || flag->kind != CC_UP || (word + 1) * 4 > flag->bytes) return 0;
-    cc_wait_k<<<1, 1, 0, c->stream>>>((volatile unsigned *)flag->d + word, v);
+    if (!c || !flag || flag->kind != CC_UP || (word + 2) * 4 > flag->bytes) return 0;
+    static unsigned long long ns;
+    if (!ns) {
+        const char *e = getenv("COLI_CUDA_HOST_WAIT_S");
+        const double s = e && *e && atof(e) > 0 ? atof(e) : 30.0;
+        ns = (unsigned long long)(s * 1e9);
+    }
+    cc_wait_k<<<1, 1, 0, c->stream>>>((volatile unsigned *)flag->d + word, v, ns);
     return launched(c, "wait host");
 }
 static int cc_moe_stage_op(CcBuf *b, size_t slot_bytes, int slots) {
