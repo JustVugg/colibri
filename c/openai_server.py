@@ -7064,6 +7064,10 @@ def engine_chats(engine):
     return getattr(engine, "chats", True) is not False
 
 
+# Request-scoped frames that show the engine is still working on that request.
+_PROGRESS_FRAMES = frozenset(("ACCEPT", "DATA", "ECHO", "TOOL", "DECISION"))
+
+
 class _Pending:
     """One in-flight engine request: the queue its frames are delivered on, whether it asked
     for the per-token numeric channel, and any fault the dispatcher has recorded against it.
@@ -7078,10 +7082,10 @@ class _Pending:
     keeps holding it until the engine says the turn is over. Dropping the entry instead
     would free the admission while the engine is still generating, and the next request
     would submit into a pipe nobody is reading."""
-    __slots__ = ("events", "logprob_channel", "failed", "started_at", "cancel_at")
+    __slots__ = ("events", "logprob_channel", "failed", "progress_at", "cancel_at")
 
     def __init__(self, logprob_channel=False):
-        self.started_at = time.monotonic()
+        self.progress_at = time.monotonic()
         self.cancel_at = None
         self.events = queue.Queue()
         self.logprob_channel = logprob_channel
@@ -7132,11 +7136,13 @@ class Engine:
         self.supports_tok_ids = (arch == "glm")
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
-        self.request_timeout = float(child_env.get("COLI_ENGINE_REQUEST_TIMEOUT", "1800"))
+        # 0 = off: an engine streaming from disk can prefill silently for many minutes
+        self.stall_timeout = float(child_env.get("COLI_ENGINE_STALL_TIMEOUT", "0"))
         self.cancel_timeout = float(child_env.get("COLI_ENGINE_CANCEL_TIMEOUT", "30"))
-        if any(not math.isfinite(value) or value <= 0
-               for value in (self.request_timeout, self.cancel_timeout)):
-            raise ValueError("engine request and cancel timeouts must be finite and positive")
+        if not (math.isfinite(self.stall_timeout) and self.stall_timeout >= 0):
+            raise ValueError("COLI_ENGINE_STALL_TIMEOUT must be finite and not negative")
+        if not (math.isfinite(self.cancel_timeout) and self.cancel_timeout > 0):
+            raise ValueError("COLI_ENGINE_CANCEL_TIMEOUT must be finite and positive")
         self._stall_error = None
         tune_child_env(child_env, arch)
         decision_head_env(child_env, model)
@@ -7245,7 +7251,8 @@ class Engine:
         return not self.closed and self.dispatcher_error is None and self.process.poll() is None
 
     def stalled_reason(self):
-        """Hard request limits, independent of stdout and potentially blocked pipe writes."""
+        """A request with no frame for stall_timeout, or no terminal frame cancel_timeout
+        after CANCEL/STOP. Timed here, not on stdout, so a blocked pipe write counts too."""
         with self.pending_lock:
             if self._stall_error is not None:
                 return self._stall_error
@@ -7253,8 +7260,9 @@ class Engine:
             for request_id, entry in self.pending.items():
                 if entry.cancel_at is not None and now - entry.cancel_at >= self.cancel_timeout:
                     self._stall_error = f"engine cancellation timed out for request {request_id}"
-                elif now - entry.started_at >= self.request_timeout:
-                    self._stall_error = f"engine execution timed out for request {request_id}"
+                elif self.stall_timeout and now - entry.progress_at >= self.stall_timeout:
+                    self._stall_error = (f"engine sent nothing for request {request_id} "
+                                         f"in {self.stall_timeout:g} s")
                 if self._stall_error is not None:
                     return self._stall_error
         return None
@@ -7389,6 +7397,12 @@ class Engine:
         if entry.failed is None:
             entry.failed = error
 
+    def _progressed(self, request_id):
+        with self.pending_lock:
+            entry = self.pending.get(request_id)
+            if entry is not None:
+                entry.progress_at = time.monotonic()
+
     def _dispatch_stdout(self):
         try:
             while True:
@@ -7399,6 +7413,8 @@ class Engine:
                 if not fields:
                     continue
                 kind = fields[0]
+                if kind in _PROGRESS_FRAMES and len(fields) >= 2:
+                    self._progressed(fields[1])
                 if kind == "DATA" and len(fields) >= 3:
                     # 3 fields: the legacy frame. More: the U7a per-token
                     # numeric channel ("DATA <id> <n> <lp> <k> [tid tlp]*k"),

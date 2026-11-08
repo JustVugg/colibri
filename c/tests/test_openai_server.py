@@ -3253,7 +3253,7 @@ class EngineRestartTest(unittest.TestCase):
         for cancel in (False, True):
             with self.subTest(cancel=cancel):
                 process = FakeProcess(lambda process, frame: None)
-                env = dict(os.environ, COLI_ENGINE_REQUEST_TIMEOUT="0.1" if not cancel else "10",
+                env = dict(os.environ, COLI_ENGINE_STALL_TIMEOUT="0.1" if not cancel else "10",
                            COLI_ENGINE_CANCEL_TIMEOUT="0.1")
                 with patch("openai_server.subprocess.Popen", return_value=process):
                     engine = Engine("olmoe", "model", env=env)
@@ -3292,7 +3292,7 @@ class EngineRestartTest(unittest.TestCase):
                     self.assertEqual(len(errors), 1)
                     self.assertEqual(server.scheduler.active, 0)
                     self.assertFalse(engine.pending)
-                    self.assertIn("cancellation" if cancel else "execution", engine._stall_error)
+                    self.assertIn("cancellation" if cancel else "sent nothing", engine._stall_error)
                     with server.scheduler.admit():
                         output = []
                         server.engine.generate("next request", 8, 0.7, 0.9, output.append)
@@ -3332,9 +3332,45 @@ class EngineRestartTest(unittest.TestCase):
             process.kill()
             engine.close()
 
+    def test_stall_timeout_counts_from_the_requests_last_frame(self):
+        process = FakeProcess(lambda process, frame: None)
+        env = dict(os.environ, COLI_ENGINE_STALL_TIMEOUT="60")
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("olmoe", "model", env=env)
+        entry = openai_server._Pending()
+        entry.progress_at -= 120   # a long silent prefill, or a long run before this frame
+        stale = entry.progress_at
+        with engine.pending_lock:
+            engine.pending["7"] = entry
+        try:
+            process.stdout.feed(b"ACCEPT 7 4\n")
+            deadline = time.monotonic() + 2
+            while entry.progress_at == stale and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertIsNone(engine.stalled_reason())
+            entry.progress_at -= 120
+            self.assertIn("sent nothing for request 7", engine.stalled_reason())
+        finally:
+            engine.close()
+
+    def test_stall_timeout_is_off_unless_set(self):
+        process = FakeProcess(lambda process, frame: None)
+        env = {k: v for k, v in os.environ.items() if k != "COLI_ENGINE_STALL_TIMEOUT"}
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("olmoe", "model", env=env)
+        entry = openai_server._Pending()
+        entry.progress_at -= 86400
+        with engine.pending_lock:
+            engine.pending["7"] = entry
+        try:
+            self.assertIsNone(engine.stalled_reason())
+        finally:
+            engine.close()
+
     def test_engine_timeout_settings_reject_unbounded_values(self):
-        for name in ("COLI_ENGINE_REQUEST_TIMEOUT", "COLI_ENGINE_CANCEL_TIMEOUT"):
-            for value in ("0", "-1", "nan", "inf"):
+        for name, values in (("COLI_ENGINE_STALL_TIMEOUT", ("-1", "nan", "inf")),
+                             ("COLI_ENGINE_CANCEL_TIMEOUT", ("0", "-1", "nan", "inf"))):
+            for value in values:
                 with self.subTest(name=name, value=value), \
                      patch("openai_server.subprocess.Popen") as popen:
                     with self.assertRaises(ValueError):

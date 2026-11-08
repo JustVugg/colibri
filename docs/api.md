@@ -813,12 +813,17 @@ the tok/s trend live on the Profiling page:
 ### Unresponsive text engines
 
 The gateway watchdog also bounds requests handled by the text/decision engine
-protocol. `COLI_ENGINE_REQUEST_TIMEOUT` is a hard execution deadline in seconds
-(default `1800`), measured from registration with the engine, including pipe
-submission and prefill. It is not an idle-output timer: long, healthy generations
-must use a larger value. Queue waiting is governed separately by `--queue-timeout`.
-`COLI_ENGINE_CANCEL_TIMEOUT` bounds the wait for a terminal frame after CANCEL or
-STOP (default `30` seconds). Both settings must be finite positive numbers.
+protocol. `COLI_ENGINE_STALL_TIMEOUT` is a progress deadline in seconds: a request
+that receives no ACCEPT, DATA, ECHO, TOOL or DECISION frame for that long counts as
+stalled. The clock starts when the request registers with the engine, so a blocked
+pipe submission counts. A slow engine that keeps producing is never retired,
+however long the whole request runs. It is off by default (`0`), because most
+engines send nothing while they read the prompt: a model streamed from disk can
+spend fifteen minutes in a 4096-token prefill before its first token. Set it above
+the longest prefill you expect. Queue waiting is governed separately by
+`--queue-timeout`. `COLI_ENGINE_CANCEL_TIMEOUT` bounds the wait for a terminal frame
+after CANCEL or STOP (default `30` seconds, must be positive). Both settings must be
+finite.
 
 On expiry, admission pauses and the old process is killed and reaped before a
 replacement is loaded. All requests on that process fail; they are not replayed.
