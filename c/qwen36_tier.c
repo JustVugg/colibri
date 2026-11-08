@@ -540,7 +540,8 @@ static int qt_place_named(const char *component){
 /* One fused qkv++z tensor per DeltaNet layer. Indexed by model layer index,
  * so the array is n_layers wide and the attention slots stay empty. */
 #define QT_DN_MAX_LAYERS 128
-static struct { ColiCudaTensor *t; int dev, on, fmt; } G_dnp[QT_DN_MAX_LAYERS];
+static struct { ColiCudaTensor *t; int dev, on, fmt, O; } G_dnp[QT_DN_MAX_LAYERS],
+    G_dnz[QT_DN_MAX_LAYERS];   /* z's rows when a GGUF gives them another type than qkv's (qt_dnproj_z_init_fmt) */
 static int G_home_layer;                          /* QT_HOME=layer */
 static uint8_t G_layer_dev[QT_DN_MAX_LAYERS];     /* device INDEX per layer in that mode */
 static int home(int eid){ return eid % G.ndev; }   /* the expert-index mapping (tests read it too) */
@@ -1302,8 +1303,23 @@ int qt_dnproj_init_fmt(int layer, const void *w, const float *sc, int fmt,
         fprintf(stderr,"[dnp] layer %d upload failed -> stays on CPU\n", layer);
         return 0;
     }
-    G_dnp[layer].dev = device; G_dnp[layer].on = 1; G_dnp[layer].fmt = fmt;
+    G_dnp[layer].dev = device; G_dnp[layer].on = 1; G_dnp[layer].fmt = fmt; G_dnp[layer].O = O;
     return 1;
+}
+int qt_dnproj_z_init_fmt(int layer, const void *w, int fmt, int I, int O, int device){
+    if(layer < 0 || layer >= QT_DN_MAX_LAYERS || !G_dnp[layer].on || G_dnp[layer].dev != device || !w || fmt < 100) return 0;
+    if(!coli_cuda_tensor_upload(&G_dnz[layer].t, w, NULL, fmt, I, O, device)){
+        fprintf(stderr,"[dnp] layer %d: z's upload failed -> the in_proj stays on CPU\n", layer);
+        coli_cuda_tensor_free(G_dnp[layer].t); G_dnp[layer].t = NULL; G_dnp[layer].on = 0;
+        return 0;
+    }
+    G_dnz[layer].dev = device; G_dnz[layer].on = 1; G_dnz[layer].fmt = fmt; G_dnz[layer].O = O;
+    return 1;
+}
+ColiCudaTensor *qt_dnproj_z_tensor(int layer, int *dev){
+    if(layer < 0 || layer >= QT_DN_MAX_LAYERS || !G_dnp[layer].on || !G_dnz[layer].on || !G_dnz[layer].t) return NULL;
+    if(dev) *dev = G_dnz[layer].dev;
+    return G_dnz[layer].t;
 }
 int qt_dnproj_init(int layer, const int8_t *q, const float *sc,
                    int I, int O, int device){ return qt_dnproj_init_fmt(layer, q, sc, 1, I, O, device); }
@@ -1362,6 +1378,25 @@ int qt_dnproj_ready(int layer){
 }
 int qt_dnproj_matmul_batch(int layer, float *y, const float *x, int S, int I, int O){
     if(!qt_dnproj_ready(layer) || S <= 0) return 0;
+    if(G_dnz[layer].on){   /* two tensors: qkv's rows then z's, each row of y qkv ++ z as one tensor gives it */
+        const int Oq = G_dnp[layer].O, Oz = G_dnz[layer].O;
+        if(Oq + Oz != O) return 0;
+        float *yq = S == 1 ? y : malloc((size_t)S * Oq * sizeof(float)), *yz = S == 1 ? y + Oq : malloc((size_t)S * Oz * sizeof(float));
+        int ok = yq && yz &&
+                 coli_cuda_matmul(&G_dnp[layer].t,yq,x,NULL,NULL,G_dnp[layer].fmt,S,I,Oq,G_dnp[layer].dev,0) &&
+                 coli_cuda_matmul(&G_dnz[layer].t,yz,x,NULL,NULL,G_dnz[layer].fmt,S,I,Oz,G_dnz[layer].dev,0);
+        if(ok && S > 1)
+            for(int s = 0; s < S; s++){
+                memcpy(y + (size_t)s * O, yq + (size_t)s * Oq, (size_t)Oq * sizeof(float));
+                memcpy(y + (size_t)s * O + Oq, yz + (size_t)s * Oz, (size_t)Oz * sizeof(float));
+            }
+        if(S > 1){ free(yq); free(yz); }
+        if(ok) return 1;
+        if(!yq || !yz) return 0;   /* no host memory: this call on the CPU, the tensors stay */
+        fprintf(stderr,"[dnp] layer %d GPU matmul failed; CPU from here on\n", layer);
+        G_dnp[layer].on = 0; G_dnz[layer].on = 0;
+        return 0;
+    }
     if(coli_cuda_matmul(&G_dnp[layer].t,y,x,NULL,NULL,G_dnp[layer].fmt,S,I,O,G_dnp[layer].dev,0))
         return 1;
     fprintf(stderr,"[dnp] layer %d GPU matmul failed; CPU from here on\n", layer);
@@ -1382,7 +1417,7 @@ int qt_dn_gpu_init(int layer, int vh, int vk, int kdim, int vdim, int conv_dim, 
     ColiCudaDn *d = coli_cuda_dn_create(G_dnp[layer].dev, vh, vk, kdim, vdim, conv_dim, convk, hidden, conv_w, norm_w, eps, 0);
     if(!d) return 0;                                                    /* older backend or no memory: CPU path stands */
     G_dn[layer].d = d; G_dn[layer].dev = G_dnp[layer].dev; G_dn[layer].on = 1;
-    G_dn[layer].proj = G_dnp[layer].t; G_dn[layer].projz = NULL; G_dn[layer].outp = G_dense[h].t;
+    G_dn[layer].proj = G_dnp[layer].t; G_dn[layer].projz = G_dnz[layer].on ? G_dnz[layer].t : NULL; G_dn[layer].outp = G_dense[h].t;
     return 1;
 }
 /* The same layer from three dense handles (qwen38: dnqkv, dnz, dnout as the

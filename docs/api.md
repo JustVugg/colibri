@@ -269,6 +269,17 @@ Protocol support does not guarantee that every quantized model emits valid
 tool syntax; `COLI_TOOL_SALVAGE=1` is an opt-in recovery path for malformed GLM
 int4 tool calls. DeepSeek V4 uses its strict native DSML parser instead.
 
+A parameter the schema declares as an `array` or an `object` is sometimes written
+the way Python prints it rather than as JSON: `[7, 'x,y', None]`, a trailing comma.
+Every call form reads such text as a Python literal, with JSON's `null`, `true` and
+`false` accepted too, and passes it on as that list or dict when every part of it is a
+JSON value (Kimi K3 goes by the type its argument tag names; DeepSeek V4 and V4.1 read a
+call's whole arguments this way when they are not JSON). The text is parsed, never run.
+Anything else keeps the form's previous answer: tuples, sets, non-string keys,
+non-finite numbers and cut-off text are not read, and `strict_tool_calls` accepts
+JSON only. The gateway logs `[api] tool call: an array argument written as a Python
+literal, read as one` for each such value.
+
 `tool_choice: "required"` is a prompt-level instruction, not a sampling
 constraint. Every renderer that offers a tool block appends the same one line to
 it, and no renderer filters tokens or forces the sampler, so a model that

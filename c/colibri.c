@@ -1269,13 +1269,17 @@ static int planar_on(void){
     if(g_planar<0){
 #if defined(COLI_CUDA)||defined(COLI_METAL)||defined(COLI_VULKAN)
         g_planar=0;
-#elif !defined(__AVX2__)
+#elif !defined(__AVX2__) && !defined(__SSSE3__)
         g_planar=0;   /* matmul_i4p non ha (ancora) un ramo NEON: su ARM il path
                        * f32 planare degraderebbe a scalare E cambierebbe l'ordine
                        * di accumulo rispetto al gemello NEON a coppie — il claim
                        * bit-identico vale solo dove i gemelli esistono entrambi.
                        * EN: no NEON arm in matmul_i4p yet — planar stays off on
-                       * non-AVX2 builds until one lands with matching order. */
+                       * ARM and pre-SSSE3 builds until one lands with matching order.
+                       * An SSSE3 build without AVX2 (Sandy/Ivy Bridge) has the K1b
+                       * integer dot (dot_i4p_u's SSSE3 arm: integer sums, exact at any
+                       * width) and planarizes fmt=4 under IDOT_GS=1; its fmt=2 keeps the
+                       * pair layout (qt_planarize), as matmul_i4p's f32 arm is AVX2's. */
 #else
         const char *e=getenv("PLANAR"); g_planar=!(e&&*e=='0');
         const char *xe=getenv("XEXP"); if(xe&&*xe=='1') g_planar=0;
@@ -1301,6 +1305,11 @@ static void qt_planarize(QT *t){
         planarize_i4(t->q4,t->O,t->I); t->planar=1; return;
     }
     if(t->fmt!=2) return;
+#if !defined(__AVX2__)
+    /* fmt=2's planar arm is matmul_i4p's f32 one, AVX2's: an SSSE3 build keeps the pairs.
+     * EN: planar_on() is on there for fmt=4's integer K1b only. */
+    return;
+#endif
 #if defined(__AVX512F__)&&defined(__AVX512BW__)
     /* fmt=2 stays a coppie qui: il gemello f32 planare replica l'ordine di
      * accumulo AVX2, non quello del ramo dot_i4f_avx512 a 512 bit — il claim

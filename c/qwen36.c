@@ -1125,7 +1125,8 @@ typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; fl
                  void *vk; int vk_off; uint16_t *h;
                  char *vk_name; const char *vk_tag; int vk_quant, vk_fmt, vk_gone, vk_imported;
                  uint8_t *gq; int gq_type; float gs; int wf16;
-                 int q8r16; } QW;   /* q8r16: q's rows interleaved by 16 (idot.h i8r16_*, q36_trunk_q8_interleave) */
+                 int q8r16, q4r16; } QW;   /* q8r16: q's rows interleaved by 16 (idot.h i8r16_*, q36_trunk_q8_interleave);
+                                             * q4r16: q4's and sg's likewise (idot.h i4r16_*, q36_q4_interleave_one) */
 static void qw_free(QW *w) {
 #ifdef COLI_VULKAN
     if (w->vk) coli_vk_tensor_free((ColiVkTensor *)w->vk);
@@ -2182,6 +2183,10 @@ static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O)
             if (xq && sx && (!w->q4 || xsg)) {
                 for (int s = 0; s < S; s++)
                     sx[s] = dense_act_i8(x + (int64_t)s * I, I, xq + (int64_t)s * I, xsg ? xsg + (int64_t)s * ng : NULL);
+#ifdef IDOT_I4R16
+                if (w->q4r16) matmul_i4p_gidot_r16(y, xq, sx, xsg, w->q4, w->sg, S, I, O);
+                else
+#endif
                 if (w->q4) matmul_i4p_grouped_idot(y, xq, sx, xsg, w->q4, w->sg, S, I, O, 64);
 #ifdef IDOT_R16
                 else if (w->q8r16) {   /* interleaved rows: 128 * each activation row's sum comes off */
@@ -2233,18 +2238,59 @@ static int q36_q8_interleave_one(QW *w) {
     return 1;
 }
 #endif
+/* The trunk's int4 groups (COLI_DENSE_BITS=4) interleaved by 16 for the CPU's kernel (idot.h
+ * matmul_i4p_gidot_r16): the K1b kernel's bits without its horizontal sum a group and row.
+ * Qwen3.8-27B, every matrix in int4, a 1000-token prompt on a Ryzen 7 8700GE: see the
+ * CHANGELOG. In place, a set of 16 rows at a time; matrices the CPU alone reads (main skips it
+ * under a device), not where the AMX kernel takes the K1b matrices. */
+#ifdef IDOT_I4R16
+static int q36_q4_interleave_one(QW *w) {
+    if (!w->q4 || !w->sg || w->q4r16 || w->h || w->gq || w->O % 16 || w->I % 64) return 0;
+#if defined(COLI_HAVE_AMX_I4P)
+    if (coli_amx_ok()) return 0;
+#endif
+    const int I = w->I, rb = I / 2, ng = I / 64;
+    int bad = 0;
+    #pragma omp parallel reduction(|:bad)
+    {
+        uint8_t *t = malloc((size_t)16 * rb); float *ts = malloc((size_t)16 * ng * sizeof(float));
+        if (!t || !ts) bad = 1;
+        else {
+            #pragma omp for schedule(static)
+            for (int g = 0; g < w->O / 16; g++) i4r16_pack_set(w->q4 + (size_t)g * 16 * rb, w->sg + (size_t)g * 16 * ng, I, t, ts);
+        }
+        free(t); free(ts);
+    }
+    if (bad) { fprintf(stderr, "OOM trunk interleave\n"); exit(1); }
+    w->q4r16 = 1;
+    return 1;
+}
+#endif
 static void q36_trunk_q8_interleave(Model *m) {
     (void)m;
-#ifdef IDOT_R16
-    const char *e = getenv("Q36_ILV16"); if ((e && !strcmp(e, "0")) || !dense_idot_on()) return;
+#if defined(IDOT_R16) || defined(IDOT_I4R16)
+    const char *e = getenv("Q36_ILV16"); if (e && !strcmp(e, "0")) return;
     double t0 = now_s();
-    int n = q36_q8_interleave_one(&m->lm_head);
-    for (int i = 0; i < m->c.n_layers; i++) {
-        Layer *l = &m->L[i];
-        QW *ws[] = {&l->q, &l->k, &l->v, &l->o, &l->gate, &l->sh_g, &l->sh_u, &l->sh_d, &l->dn_qkv, &l->dn_z, &l->dn_out};
-        for (size_t k = 0; k < sizeof ws / sizeof ws[0]; k++) n += q36_q8_interleave_one(ws[k]);
+    int n = 0, n4 = 0;
+    QW *top[] = {&m->lm_head};
+    for (int i = -1; i < m->c.n_layers; i++) {
+        Layer *l = i >= 0 ? &m->L[i] : NULL;
+        QW *lw[] = {l ? &l->q : NULL, l ? &l->k : NULL, l ? &l->v : NULL, l ? &l->o : NULL, l ? &l->gate : NULL,
+                    l ? &l->sh_g : NULL, l ? &l->sh_u : NULL, l ? &l->sh_d : NULL, l ? &l->dn_qkv : NULL,
+                    l ? &l->dn_z : NULL, l ? &l->dn_out : NULL};
+        QW **ws = l ? lw : top;
+        const size_t nw = l ? sizeof lw / sizeof lw[0] : 1;
+        for (size_t k = 0; k < nw; k++) {
+#ifdef IDOT_I4R16
+            n4 += q36_q4_interleave_one(ws[k]);   /* the int4 copy is the one matmul_d reads */
+#endif
+#ifdef IDOT_R16
+            if (dense_idot_on()) n += q36_q8_interleave_one(ws[k]);
+#endif
+        }
     }
     if (n) fprintf(stderr, "[qwen36] trunk: %d int8 matrices interleaved by 16 for the CPU in %.2fs (Q36_ILV16=0 keeps the rows)\n", n, now_s() - t0);
+    if (n4) fprintf(stderr, "[qwen36] trunk: %d int4 matrices interleaved by 16 for the CPU in %.2fs (Q36_ILV16=0 keeps the groups)\n", n4, now_s() - t0);
 #endif
 }
 /* A dense matrix the tier placed in VRAM (handle+1 kept in the Layer, 0 = CPU):
@@ -9884,7 +9930,7 @@ int main(int argc, char **argv) {
             if (m.c.is_attn[i]) continue;
             if (m.L[i].dn_qkv.q && m.L[i].dn_z.q)
                 qt_trunk_offer("dnproj", i, (size_t)(O_qkv + O_z) * m.c.hidden + (size_t)(O_qkv + O_z) * sizeof(float));
-            else if (qdw_gq_fmt(&m.L[i].dn_qkv) && qdw_gq_fmt(&m.L[i].dn_qkv) == qdw_gq_fmt(&m.L[i].dn_z))   /* one type: one fused matrix */
+            else if (qdw_gq_fmt(&m.L[i].dn_qkv) && qdw_gq_fmt(&m.L[i].dn_z))   /* a GGUF's: one fused matrix, or two of two types */
                 qt_trunk_offer("dnproj", i, qdw_gq_bytes(&m.L[i].dn_qkv) + qdw_gq_bytes(&m.L[i].dn_z));
         }
         trunk_offer_dense(&m);   /* dnout, attnproj, shexp: the rest of the per-token dense work */
@@ -9968,7 +10014,7 @@ int main(int argc, char **argv) {
          * memcpys, no requantization, and the GPU sees one GEMV per layer
          * instead of two. The host copy is freed right after the upload. */
         {
-            int placed = 0, O_qkv = m.c.dn_conv_dim, O_z = m.c.dn_vheads * m.c.dn_vdim;
+            int placed = 0, split = 0, O_qkv = m.c.dn_conv_dim, O_z = m.c.dn_vheads * m.c.dn_vdim;
             int Of = O_qkv + O_z, Hd = m.c.hidden;
             double vram = 0;
             for (int i = 0; i < m.c.n_layers; i++) {
@@ -9977,8 +10023,8 @@ int main(int argc, char **argv) {
                 if (dev == QT_PLACE_CPU) continue;
                 const int8_t *q1 = m.L[i].dn_qkv.q, *q2 = m.L[i].dn_z.q;
                 const float *s1 = m.L[i].dn_qkv.sc, *s2 = m.L[i].dn_z.sc;
-                const int gf = qdw_gq_fmt(&m.L[i].dn_qkv);
-                if (!q1 && gf && gf == qdw_gq_fmt(&m.L[i].dn_z)) {   /* a GGUF's blocks: qkv's rows, then z's */
+                const int gf = qdw_gq_fmt(&m.L[i].dn_qkv), gz = qdw_gq_fmt(&m.L[i].dn_z);
+                if (!q1 && gf && gf == gz) {   /* a GGUF's blocks: qkv's rows, then z's */
                     const size_t rb = (size_t)gq_row_bytes(gf - 100, Hd);
                     uint8_t *ra, *rz, *cat = malloc(rb * Of);
                     const void *a = qdw_gq_rows(&m.L[i].dn_qkv, gf, &ra), *z = qdw_gq_rows(&m.L[i].dn_z, gf, &rz);
@@ -9987,6 +10033,15 @@ int main(int argc, char **argv) {
                         if (qt_dnproj_init_fmt(i, cat, NULL, gf, Hd, Of, dev)) { placed++; vram += (double)rb * Of; }
                     }
                     free(ra); free(rz); free(cat);
+                    continue;
+                }
+                if (!q1 && gf && gz) {   /* two types (unsloth's mixes): two tensors, each the file's blocks */
+                    const size_t rq = (size_t)gq_row_bytes(gf - 100, Hd), rzb = (size_t)gq_row_bytes(gz - 100, Hd);
+                    uint8_t *ra, *rz;
+                    const void *a = qdw_gq_rows(&m.L[i].dn_qkv, gf, &ra), *z = qdw_gq_rows(&m.L[i].dn_z, gz, &rz);
+                    if (a && z && qt_dnproj_init_fmt(i, a, NULL, gf, Hd, O_qkv, dev) &&
+                        qt_dnproj_z_init_fmt(i, z, gz, Hd, O_z, dev)) { placed++; split++; vram += (double)rq * O_qkv + (double)rzb * O_z; }
+                    free(ra); free(rz);
                     continue;
                 }
                 if (!q1 || !q2) continue;      /* dense-i8 off: CPU path stands */
@@ -10005,6 +10060,8 @@ int main(int argc, char **argv) {
             if (placed)
                 fprintf(stderr, "[dnp] %d DeltaNet-Projektionen auf GPU (%.2f GB VRAM)\n",
                         placed, vram / 1073741824.0);
+            if (split)
+                fprintf(stderr, "[dnp] %d of them as two tensors, qkv and z in the file's two types\n", split);
         }
         /* The rest of the trunk, wherever the placer put it: out_proj,
          * attention projections, shared expert. Handles live in the Layer. */

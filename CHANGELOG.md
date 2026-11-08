@@ -7,6 +7,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **K1b's grouped planar IDOT on pre-AVX2 x86 CPUs** (`IDOT_GS=1`, #2694): a build with SSSE3 and
+  without AVX2 (Sandy and Ivy Bridge) now planarizes gs64 `fmt=4` tensors and takes the integer
+  kernel's SSSE3 arms; `fmt=2` keeps the pair layout there, and with `IDOT_GS` unset nothing
+  changes. Such a CPU has no FMA, and libm's software fmaf took 85 ns a call with glibc 2.39: the
+  per-group step is now computed with fmaf's bits in double, rounded to odd. A 4096 x 512 gs64
+  matrix on a Sandy Bridge build, two threads: 0.087 ms against the float grouped kernel's 0.22
+  (S=1), 0.60 against 1.86 (S=8), the same bits as an AVX2 build's.
 - **A start profile for a model's first answers** (`tools/usage_start_profile.py`): forty
   ordinary prompts through `coli serve`, their expert history and draft counts written beside
   the model as `.coli_usage.start` and `.coli_vocab.start`. Every engine with an expert history
@@ -37,6 +44,38 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **Qwen3.8-27B on Vulkan: its attention on the matrix units.** `chain_attn_flash` takes 64 query
+  rows a workgroup of one kv head's heads, so it ran where the heads a kv head divide 64; the 27B's
+  six took the blocked shader, and its decode, which follows the prompt's path, read every
+  position a workgroup a head. A kv head's heads now split over several workgroups (`fa_group`:
+  three pairs for the 27B), each staging its kv head's keys. RTX PRO 4000, served: UD-IQ2_XXS
+  prompt 1K / 4K / 8K 404 / 292 / 205 -> 436 / 423 / 425 tok/s, decode 16.6 -> 17.8; UD-Q4_K_XL
+  431 / 308 / 203 -> 488 / 474 / 471, decode 14.0 -> 14.8.
+- **Qwen3.8-27B on CUDA: its attention on the tensor cores and in blocks of positions.** Its 24
+  query heads over 4 kv heads (six a kv head) fell outside the groupings the chain's prompt
+  attention took on the tensor cores (dividing 64), so its prompt rows ran on the CUDA cores and
+  its decode read every position a block a head. `cc_attn_f2`'s three- and six-warp blocks now
+  take six and twelve heads a kv head without a selection list, and the decode in blocks of
+  positions takes them too, a kv head's heads a block. RTX PRO 4000, served: UD-Q4_K_XL prompt
+  1K / 4K / 8K 556 / 290 / 160 -> 762 / 804 / 810 tok/s, decode after 8K 12.1 -> 19.8; UD-IQ2_XXS
+  411 / 244 / 144 -> 494 / 495 / 492, decode after 8K 14.7 -> 28.3
+  ([docs/qwen36.md](docs/qwen36.md#from-a-gguf-on-a-cuda-card)).
+- **Qwen3.8-27B with its trunk in int4 on the CPU: the prompt 2.4x to 4.5x faster.** The grouped
+  kernel (`COLI_DENSE_BITS=4`) summed every group of 64 inputs across the vector for every row and
+  every prompt row, more work than the products themselves. The matrices now load interleaved by 16
+  rows (`idot.h` `matmul_i4p_gidot_r16`): one integer dot product advances sixteen rows, and a
+  group's scale goes into each row's sum with the fused multiply-add the kernel had, so the same
+  bits (`tests/test_i4r16.c`; `make i4r16-check` adds the AVX-512 VNNI and AVX-VNNI kernels). Ryzen
+  7 8700GE, a 1000-token prompt: 9.5 -> 22.4 tok/s at the release's x86-64-v3, 9.2 -> 41.1 built
+  native; decode 3.8 -> 4.0, the same answers. `Q36_ILV16=0` keeps the grouped layout.
+- **Qwen3.8-27B from unsloth's GGUFs on CUDA: the chain runs the trunk.** The CUDA placement
+  fused a DeltaNet layer's qkv and z rows into one tensor of one type, and these mixes give the
+  two different types in about half the layers, so those layers' in_proj stayed on the CPU and
+  the dense chain stayed off. Such a layer now holds two tensors in the file's two types
+  (`qt_dnproj_z_init_fmt`), and the chain reads them with their own strides. RTX PRO 4000,
+  served, prompt 1K / 4K tokens and decode: UD-IQ2_XXS 19.5 / 18.2 and 10.0 -> 408.0 / 242.6
+  and 29.5 tok/s, UD-Q4_K_XL 18.9 / 17.4 and 9.6 -> 580.7 / 300.0 and 19.5 tok/s
+  ([docs/qwen36.md](docs/qwen36.md#from-a-gguf-on-a-cuda-card)).
 - **DeepSeek V4.1 on the Vulkan chain: a prompt of more than one chunk layer by layer.** Each
   chunk went through every layer before the next, so the expert tier streamed each layer's
   cold experts once a chunk: a 4104-token prompt at 512-row chunks copied 150 GiB of the host
@@ -417,8 +456,55 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   its rows of the PLE table (a GGUF's, on the disk) at its start, 0.75 ms a verify on the main
   thread. Each row's token is known one draft before: its rows are now asked of the OS then
   (`POSIX_FADV_WILLNEED`), and the verify finds them read.
+- **Vulkan: DeepSeek V4.1 Flash's and DeepSeek V4's indexer scores in tiles of rows**
+  (`chain_dsv4_idx.comp`, `COLI_VK_DSA_TILED`). A prompt chunk's scores went through mode 10's
+  column grid, a workgroup a row and eight columns: every row staged its own queries and walked
+  its own copy of the keys. A workgroup now holds a tile of 16 rows x 32 compressed columns,
+  stages the tile's keys in shared memory once (and a head pair's queries after it, 32 KB in
+  all, which is why it is a shader of its own), and every thread keeps two rows' dots in
+  registers. The sums are in mode 10's order and the scores are equal bit for bit
+  (`tests/test_vk_chain.c` holds the two paths to `memcmp`, the selection comparing raw bits),
+  so answers do not change. RX 6900 XT, 32 heads of 128: a 256-row chunk over 8192 unmasked
+  46.70 -> 3.56 ms (13.10x), 256 over 65536 unmasked 445.42 -> 31.93 ms (13.95x), 2048 over
+  65536 with a candidate mask 1633.09 -> 212.61 ms (7.68x). Below 16 rows, or on a device with
+  under 32 KiB of workgroup memory, the
+  grid keeps the work. `COLI_VK_DSA_TILED=0` keeps it everywhere ([docs/vulkan.md](docs/vulkan.md),
+  [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md)).
 
 ### Fixed
+
+- **Vulkan: `COLI_VK_STAGED=0` on a card without Resizable BAR planned with the whole card.**
+  The resident data stays in the host-visible window there (246 of 24467 MiB on an RTX PRO
+  4000), and nothing past it spills. The dense chain placed 40 of 40 layers and had its first
+  upload refused, the expert tier warmed 10240 experts into a budget of 22.6 GiB and held
+  none, and the pools' 256 MiB blocks did not fit, so no tensor reached either device, while
+  the CPU read the experts the warm start had counted as placed from the disk: Qwen3.6 Q4_K_M
+  answered at 12.9 tok/s. The window is now the device's memory for the engines and the pools,
+  what does not fit stays on the CPU, and the answer comes at 13.1, the CPU's own speed. Left
+  unset, the card stages its uploads as before (90 tok/s).
+
+- **CUDA: a hybrid step's wait for the host has a bound** (#2696). Where the card holds only part
+  of the experts, a decode layer's experts split between the card and the CPU, and the card waited
+  for the CPU's rows in a loop with no end: rows that never came left the GPU at 100% and the answer
+  stopped. The wait now ends after `COLI_CUDA_HOST_WAIT_S` (30 s): the engine says so and the CPU
+  computes from there, in qwen36's and qwen38's chains. With the host's word of one step withheld on
+  purpose (`COLI_CUDA_HOST_WAIT_FAULT`), Qwen3.6-35B int4 at `--vram 11` and Qwen3.8-Flash-Next
+  UD-IQ2_XS at `--vram 8` on an RTX PRO 4000 finished their answers; with the bound out of reach the
+  process hung until killed. `tests/cuda_tier_engines.sh` runs a small qwen35moe GGUF's hybrid steps
+  and the lost word against the CPU's tokens.
+
+- **A list or a dict written the way Python prints it reaches the client as one.** Asked to
+  run a query with the parameters 7, 'x,y', null and true, Flint wrote `[7, 'x,y', null, true]`
+  for the declared array, two calls in 24 of a tool-call bench over seven models. The GLM call
+  form (GLM, Flint) passed that on as a string, the Qwen form (Qwen3.6, Qwen3.8, LFM3, MiMo)
+  dropped such a call, Muse and Kimi K3 kept the text, and the DeepSeek V4 and V4.1 decoders put
+  it into `arguments` as written, so the client got arguments that were not JSON. A declared
+  `array` or `object` parameter whose text is not JSON is now read as a Python literal, JSON's
+  `null`/`true`/`false` accepted too (`_literal_container`), and kept only when it is that
+  container of JSON values throughout; DeepSeek's arguments are read the same way when they are
+  not JSON. The text is parsed, never run. Tuples, sets, non-string keys, non-finite numbers and
+  cut-off text are not read, and `strict_tool_calls` reads JSON only, as before
+  (`tests/test_tool_args_literal.py`).
 
 - **DeepSeek V4.1: a long prompt's answer could start with `<｜begin▁of▁sentence｜>`.** Past
   layer 20, the first with compress ratio 1, a prompt of 2478 tokens or more runs the later

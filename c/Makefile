@@ -540,12 +540,12 @@ TEST_RULES  := $(patsubst tests/%,%,$(filter tests/test_%,$(RULE_NAMES)))
 # (qwen38_tiny_fp8, gitignored); it runs from qwen38-tier-engine-check. test_qwen38_dn_gpu does the same from
 # qwen38-dn-gpu-check.
 TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_framing \
-	test_segment_adapters_registration test_segment_adapters_real \
+	test_segment_adapters_registration test_segment_adapters_real test_olmoe_segment_real \
 	test_edge_adapters_registration test_edge_adapters_real \
 	test_xdna_execution test_xdna_failure \
 	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine test_qwen38_dn_gpu test_qwen38_cuda_chain \
 	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
-	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract test_idot_ssse3 \
+	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract test_idot_ssse3 test_int_kernel_exact_ssse3 \
 	test_ggml_quants test_gguf_c test_gq_dot
 TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32 test_vk_dev2_window
 # needs a CUDA device and the CUDA objects: make tests/test_cu_tier CUDA=1
@@ -564,7 +564,7 @@ TEST_BINS += tests/test_gsgemv_sse41$(EXE) tests/test_qgemv_sse41$(EXE) \
 	tests/test_olmoe_dot_i8_16_sse41$(EXE) tests/test_st_f16_bf16_simd_sse41$(EXE) \
 	tests/test_i4_grouped_sse41$(EXE) \
 	tests/test_i4_grouped_sse41_o1$(EXE) tests/test_i4_grouped_sse41_no_contract$(EXE) \
-	tests/test_idot_ssse3$(EXE)
+	tests/test_idot_ssse3$(EXE) tests/test_int_kernel_exact_ssse3$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
 TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) \
@@ -740,8 +740,10 @@ VK_SPV   += shaders/chain_mla.spv shaders/chain_hgemv.spv shaders/chain_dsa.spv
 VK_SPV   += shaders/chain_kda.spv shaders/chain_kda_rows.spv shaders/chain_mhc.spv
 # the int8 decode GEMV with per-matrix rows per workgroup (optional at run time)
 VK_SPV   += shaders/chain_gemv2.spv
-# DeepSeek V4.1 Flash and DeepSeek V4 attention (vk_chain.h: vkc_dsv4_*)
-VK_SPV   += shaders/chain_dsv4.spv shaders/chain_dsv4_pa.spv
+# DeepSeek V4.1 Flash and DeepSeek V4 attention (vk_chain.h: vkc_dsv4_*), its
+# indexer's scores in tiles of rows on a module of their own (workgroup memory is
+# sized a module), and a prompt chunk's attention in three passes
+VK_SPV   += shaders/chain_dsv4.spv shaders/chain_dsv4_idx.spv shaders/chain_dsv4_pa.spv
 # Kimi K3's attention residuals and SiTU-GLU (vk_chain.h)
 VK_SPV   += shaders/chain_ares.spv
 # the router's pick on the device, every MoE engine's kind (vk_chain.h: vkc_route)
@@ -2455,6 +2457,12 @@ tests/test_olmoe_moe_by_expert$(EXE): tests/test_olmoe_moe_by_expert.c olmoe.c $
 tests/test_olmoe_serve_framing$(EXE): tests/test_olmoe_serve_framing.c olmoe.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+tests/test_olmoe_expert_store$(EXE): tests/test_olmoe_expert_store.c olmoe.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_olmoe_segment_lifecycle$(EXE): tests/test_olmoe_segment_lifecycle.c olmoe.c tests/segment_runtime_nocuda.o $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< tests/segment_runtime_nocuda.o $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_olmoe_cache_index$(EXE): tests/test_olmoe_cache_index.c olmoe.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
@@ -2488,11 +2496,31 @@ qwen36-canonical$(EXE): tools/qwen36_canonical.c qwen36.c qwen36_dense_file.h $(
 tests/test_idot$(EXE): tests/test_idot.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
+# The int4 sets of 16 (idot.h matmul_i4p_gidot_r16) against the K1b kernel, with the build's
+# flags (a gate); i4r16-check also runs the AVX-512 VNNI and AVX-VNNI kernels, on a CPU that
+# has them (not gates: CI's runners may lack them, and a binary built for them stops there).
+tests/test_i4r16$(EXE): tests/test_i4r16.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+tests/i4r16_avx512$(EXE): tests/test_i4r16.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -mavx512f -mavx512bw -mavx512vl -mavx512vnni $< $(VK_OBJ) -o $@ $(LDFLAGS)
+tests/i4r16_avxvnni$(EXE): tests/test_i4r16.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -mavxvnni $< $(VK_OBJ) -o $@ $(LDFLAGS)
+i4r16-check: tests/test_i4r16$(EXE) tests/i4r16_avx512$(EXE) tests/i4r16_avxvnni$(EXE)
+	./tests/test_i4r16$(EXE)
+	@if grep -qw avx512_vnni /proc/cpuinfo 2>/dev/null; then ./tests/i4r16_avx512$(EXE); else echo "i4r16-check: no AVX-512 VNNI here"; fi
+	@if grep -qw avx_vnni /proc/cpuinfo 2>/dev/null; then ./tests/i4r16_avxvnni$(EXE); else echo "i4r16-check: no AVX-VNNI here"; fi
+
 # Force the idot integer-dot kernels onto the SSSE3 tier even on an AVX2 host
 # (mirrors the forced-SSE4.1 grouped-int4 gates): pre-AVX2 x86-64 CPUs take
 # this branch instead of scalar, so it must remain a gate, not dead code.
 tests/test_idot_ssse3$(EXE): tests/test_idot.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -mssse3 -mno-avx2 -mno-fma $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# The integer kernels' SSSE3 arms against their pure-C references, as a pre-AVX2 build
+# (Sandy/Ivy Bridge) takes them: K1b's grouped planar IDOT among them, which such a build
+# runs under IDOT_GS=1. The native build of the same test runs in ci.yml's oracle job.
+tests/test_int_kernel_exact_ssse3$(EXE): tests/test_int_kernel_exact.c
+	$(CC) $(CFLAGS) -mssse3 -mno-avx2 -mno-fma $< -o $@ $(LDFLAGS)
 
 tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_HAVE_GROUPED_PAIR $< $(VK_OBJ) -o $@ $(LDFLAGS)
@@ -2870,6 +2898,12 @@ tests/test_segment_adapters_real$(EXE): tests/test_segment_adapters_real.c \
 		segment_adapters.h edge_adapters.h $(SEGMENT_ALL_OBJS)
 	$(CC) $(SEGMENT_CPU_CFLAGS) tests/test_segment_adapters_real.c \
 		segment_runtime.c edge_runtime.c $(SEGMENT_ALL_OBJS) -o $@ $(NOCUDA_LDFLAGS)
+
+# Focused public-runtime gate: the same production adapter suite, without
+# requiring unrelated families' objects or their checkpoint dependencies.
+tests/test_olmoe_segment_real$(EXE): tests/test_segment_adapters_real.c $(SEGMENT_BUILD_DIR)/olmoe.o $(SEGMENT_RUNTIME_OBJS)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -DCOLI_SEGMENT_TEST_REGISTER=coli_olmoe_segment_adapter_register \
+		tests/test_segment_adapters_real.c $(SEGMENT_BUILD_DIR)/olmoe.o $(SEGMENT_RUNTIME_OBJS) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_edge_adapters_registration$(EXE): \
 		tests/test_edge_adapters_registration.c edge_runtime.c segment_runtime.c \

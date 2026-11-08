@@ -136,6 +136,11 @@ int  qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device);
 int  qt_dense_init_fmt(const void *w, const float *sc, int fmt, int I, int O, int device);
 int  qt_lmhead_init_fmt(const void *w, const float *sc, int fmt, int I, int O);
 int  qt_dnproj_init_fmt(int layer, const void *w, const float *sc, int fmt, int I, int O, int device);
+/* A GGUF whose qkv and z rows have different ggml types (unsloth's dynamic mixes, in about
+ * half of a Qwen3.8-27B's DeltaNet layers): qt_dnproj_init_fmt takes qkv's rows alone and this
+ * z's, each in its own type, on the same device; qt_dnproj_matmul_batch still answers qkv ++ z.
+ * A failure takes the layer's qkv off the device too: one without the other is no projection. */
+int  qt_dnproj_z_init_fmt(int layer, const void *w, int fmt, int I, int O, int device);
 int  qt_dense_matmul(int handle, float *y, const float *x, int I, int O);
 /* Row-major x[S,I] -> y[S,O], using the same resident int8 tensor. */
 int  qt_dense_matmul_batch(int handle, float *y, const float *x, int S, int I, int O);
@@ -144,6 +149,8 @@ int  qt_dense_count(void);
  * the backend's object and the CUDA ordinal it lives on; NULL when nothing is placed. */
 struct ColiCudaTensor *qt_dense_tensor(int handle, int *dev);
 struct ColiCudaTensor *qt_dnproj_tensor(int layer, int *dev);
+/* z's tensor of a layer whose in_proj is two (qt_dnproj_z_init_fmt); NULL when it is one */
+struct ColiCudaTensor *qt_dnproj_z_tensor(int layer, int *dev);
 struct ColiCudaTensor *qt_lmhead_tensor(int *dev);
 
 /* fp8 streaming mode (Qwen3.8): experts arrive as e4m3 bytes with 128x128
@@ -336,11 +343,13 @@ static inline int  qt_dense_init(const int8_t*a,const float*b,int c,int d,int e)
 static inline int  qt_dense_init_fmt(const void*a,const float*b,int c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return -1;}
 static inline int  qt_lmhead_init_fmt(const void*a,const float*b,int c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dnproj_init_fmt(int a,const void*b,const float*c,int d,int e,int f,int g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
+static inline int  qt_dnproj_z_init_fmt(int a,const void*b,int c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dense_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dense_matmul_batch(int a,float*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dense_count(void){return 0;}
 static inline void *qt_dense_tensor(int a,int*b){(void)a;(void)b;return NULL;}
 static inline void *qt_dnproj_tensor(int a,int*b){(void)a;(void)b;return NULL;}
+static inline void *qt_dnproj_z_tensor(int a,int*b){(void)a;(void)b;return NULL;}
 static inline void *qt_lmhead_tensor(int*b){(void)b;return NULL;}
 static inline int  qt_ready(void){return 0;}
 static inline unsigned qt_chain_epoch(void){return 0;}

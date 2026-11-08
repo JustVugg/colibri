@@ -23,9 +23,11 @@
 //    each row's softmax at m = sink, l = 1 (one more term of the denominator, no value).
 // Q is scaled before its f16 rounding; P = exp(s - m) is in (0, 1]. Not bit-identical
 // to chain_attn.comp (f16 operands); the CPU's order differs from both anyway.
-// Grid: x = ceil(S / (64/GQ)) token groups, y = kv heads. HD, GQ, BC and SPLIT are
-// specialization constants (HD a multiple of 64 up to 256, GQ dividing 64, BC 64 or 32,
-// 256 / subgroup size / 4 for SPLIT).
+// Grid: x = ceil(S / (64/GQ)) token groups, y = kv heads x SUB. HD, GQ, BC, SPLIT and SUB
+// are specialization constants (HD a multiple of 64 up to 256, GQ dividing 64, BC 64 or 32,
+// 256 / subgroup size / 4 for SPLIT; SUB the workgroups a kv head, each GQ of its query heads:
+// a kv head's G heads where 64 / G is no whole number of tokens, Qwen3.8-27B's 6 as three pairs,
+// each pair's workgroup staging the kv head's keys).
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -37,6 +39,7 @@ layout(constant_id = 0) const uint HD = 256;   // head dim, multiple of 64
 layout(constant_id = 1) const uint GQ = 8;     // query heads per kv head, divides 64
 layout(constant_id = 2) const uint BC = 32;    // keys per block: 64, or 32 at head dim 256
 layout(constant_id = 3) const uint SPLIT = 1;  // subgroups a row tile (8 subgroups of 32: 2)
+layout(constant_id = 8) const uint SUB = 1;    // workgroups a kv head (its query heads GQ * SUB)
 #define R 64u                                  // query rows a workgroup
 #define TPW (R / GQ)                           // tokens a workgroup
 #define NDT (HD / 16u)                         // 16-wide head-dim tiles
@@ -108,7 +111,7 @@ void stage(uint g, uint k0, uint nt, uint tid, bool isv) {
 
 void main() {
     uint tid = gl_LocalInvocationID.x, sgi = gl_SubgroupID, lane = gl_SubgroupInvocationID;
-    uint S = uint(p.S), g = gl_WorkGroupID.y;
+    uint S = uint(p.S), g = gl_WorkGroupID.y, kvh = g / SUB;   // g: the GQ query heads g * GQ .., of kv head kvh
     uint t0 = gl_WorkGroupID.x * TPW;
     uint nt = uint(p.pos_base) + S;
     uint tlast = min(t0 + TPW, S) - 1u;
@@ -149,7 +152,7 @@ void main() {
 
     // pass 1: row max and sum
     for (uint kb = kb_lo; kb < nkb; kb++) {
-        stage(g, kb * BC, nt, tid, false);
+        stage(kvh, kb * BC, nt, tid, false);
         barrier();
         [[unroll]] for (uint i = 0u; i < KTS; i++) {
             uint kt = part * KTS + i;
@@ -184,7 +187,7 @@ void main() {
     [[unroll]] for (uint u = 0u; u < NDS; u++) Oa[u] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> PA;
     for (uint kb = kb_lo; kb < nkb; kb++) {
-        stage(g, kb * BC, nt, tid, false);
+        stage(kvh, kb * BC, nt, tid, false);
         barrier();
         [[unroll]] for (uint i = 0u; i < KTS; i++) {
             uint kt = part * KTS + i;
@@ -201,7 +204,7 @@ void main() {
             uint at = ((row >> 4u) * KT + (kl >> 4u)) * 256u + (row & 15u) * 16u + (kl & 15u);
             sp[at] = float16_t(key <= qpos && (win == 0u || key + win > qpos) ? exp(ss[at] - m) : 0.0);
         }
-        stage(g, kb * BC, nt, tid, true);
+        stage(kvh, kb * BC, nt, tid, true);
         barrier();
         [[unroll]] for (uint kt = 0u; kt < KT; kt++) {
             coopMatLoad(PA, sp, (rt * KT + kt) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);

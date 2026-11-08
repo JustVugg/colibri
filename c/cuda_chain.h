@@ -43,6 +43,8 @@
 #ifndef COLI_CUDA_CHAIN_H
 #define COLI_CUDA_CHAIN_H
 #include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "backend_cuda.h"
 
@@ -296,9 +298,11 @@ typedef struct ColiCudaChainOps {
      * tab: CcExpert entries (written with write, offsets in floats as ever: an entry is
      * sizeof(CcExpert) / 4 of them). signal: once the frame's earlier ops are done, word
      * `word` of a DOWN buffer holds v (the host polls it); wait_host: the frame's later
-     * ops wait until word `word` of an UP buffer is at least v (the host writes it). A
-     * hybrid step: route, signal, the device's experts, wait_host, the sum with the
-     * host's rows; the host computes its experts between the two. */
+     * ops wait until word `word` of an UP buffer is at least v (the host writes it), for
+     * COLI_CUDA_HOST_WAIT_S seconds at most on CUDA: past them word `word` + 1 holds v and
+     * the frame is lost (the buffer takes two words). A hybrid step: route, signal, the
+     * device's experts, wait_host, the sum with the host's rows; the host computes its
+     * experts between the two. */
     int  (*route)(CcBuf *logits, CcBuf *bias, CcBuf *ids, CcBuf *w, const CcRoute *p);
     int  (*moe)(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *y, CcBuf *hy, const CcMoe *p);
     int  (*signal)(CcBuf *flag, size_t word, unsigned v);
@@ -470,6 +474,29 @@ static inline int cc_route(CcBuf *l, CcBuf *b, CcBuf *ids, CcBuf *w, const CcRou
 static inline int cc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *y, CcBuf *hy, const CcMoe *p) { return cc_moe_ready() ? cc_ops()->moe(tab, x, ids, w, hid, y, hy, p) : 0; }
 static inline int cc_signal(CcBuf *flag, size_t word, unsigned v) { return cc_moe_ready() ? cc_ops()->signal(flag, word, v) : 0; }
 static inline int cc_wait_host(CcBuf *flag, size_t word, unsigned v) { return cc_moe_ready() ? cc_ops()->wait_host(flag, word, v) : 0; }
+/* A hybrid step's wait (cc_wait_host on word 0) has a bound: the device that stopped waiting
+ * wrote the step into word 1. A frame zeroes it before it records (cc_host_wait_arm) and,
+ * done, is lost when it is set (cc_host_wait_gave_up: the device went on without the host's
+ * rows, #2696). COLI_CUDA_HOST_WAIT_FAULT=n (tests): the n-th hybrid step's word is not
+ * written (cc_host_word_skip). */
+static inline void cc_host_wait_arm(CcBuf *flag) { ((volatile unsigned *)cc_ptr(flag))[1] = 0; }
+static inline int cc_host_wait_gave_up(CcBuf *flag, const char *engine) {
+    const unsigned step = ((volatile unsigned *)cc_ptr(flag))[1];
+    if (!step) return 0;
+    const char *ws = getenv("COLI_CUDA_HOST_WAIT_S");
+    fprintf(stderr, "[chain] %s: the device waited %s s for the host's share of hybrid step %u and went on without it: "
+                    "the chain stops and the CPU computes from here (COLI_CUDA_HOST_WAIT_S sets the wait; "
+                    "COLI_CUDA_CHAIN_MOE=0 runs those layers on the host's step instead)\n",
+            engine, ws && *ws ? ws : "30", step);
+    return 1;
+}
+static inline int cc_host_word_skip(unsigned long long step, const char *engine) {
+    static long fault = -1;
+    if (fault < 0) { const char *e = getenv("COLI_CUDA_HOST_WAIT_FAULT"); fault = e && *e ? atol(e) : 0; }
+    if (fault <= 0 || step != (unsigned long long)fault) return 0;
+    fprintf(stderr, "[chain] %s: COLI_CUDA_HOST_WAIT_FAULT: hybrid step %ld's word not written\n", engine, fault);
+    return 1;
+}
 static inline int cc_tensor_dev(const ColiCudaTensor *w, const void **p, const float **sc, int *gs) { return cc_moe_ready() ? cc_ops()->tensor_dev(w, p, sc, gs) : 0; }
 static inline int cc_fetch_ready(void) { const ColiCudaChainOps *t = cc_ops(); return t && t->size >= offsetof(ColiCudaChainOps, dev_addr) + sizeof t->dev_addr; }
 static inline int cc_fetch(CcBuf *dst, const CcFetch *r, int n) { return cc_fetch_ready() ? cc_ops()->fetch(dst, r, n) : 0; }
