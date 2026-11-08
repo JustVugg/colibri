@@ -2,6 +2,7 @@
 """Dependency-free OpenAI-compatible HTTP gateway for the colibri engine."""
 
 import argparse
+import ast
 import codecs
 import collections
 import contextlib
@@ -21,6 +22,7 @@ import sys
 import threading
 import time
 import uuid
+import warnings
 
 import v4_dsml                      # vendored DeepSeek V4 DSML reference primitives
 import v41_dsml                     # ...and V4.1's, whose tag names differ by a space
@@ -668,17 +670,72 @@ def _tool_param_types(tools):
     return out
 
 
-def _coerce_arg(value, declared):
+# A model can write a list or a dict the way Python prints one rather than as JSON:
+# [7, 'x,y', None], a trailing comma. Where the schema declares an array or an object, such
+# text is read as a Python literal, JSON's null/true/false taken too, and kept only when it
+# is that container made of JSON values throughout (str keys; str, finite number, bool, None,
+# list, dict). The text is parsed, never run, and only below _LITERAL_MAX characters.
+_LITERAL_MAX = 1 << 18
+_LITERAL_NAMES = {"null": None, "true": True, "false": False}
+
+
+class _JsonNames(ast.NodeTransformer):
+    def visit_Name(self, node):
+        if node.id in _LITERAL_NAMES:
+            return ast.copy_location(ast.Constant(_LITERAL_NAMES[node.id]), node)
+        return node
+
+
+def _json_shaped(value):
+    if value is None or isinstance(value, (str, int)):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, list):
+        return all(_json_shaped(v) for v in value)
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and _json_shaped(v) for k, v in value.items())
+    return False
+
+
+def _literal_container(raw, kinds):
+    """The list (when `kinds` has "array") or dict (when it has "object") that a parameter's
+    text spells as a Python literal, or None."""
+    want = tuple(t for k, t in (("array", list), ("object", dict)) if k in kinds)
+    if not want or not isinstance(raw, str) or len(raw) > _LITERAL_MAX:
+        return None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")      # an escape Python does not know is a warning
+            tree = _JsonNames().visit(ast.parse(raw.strip(), mode="eval"))
+            value = ast.literal_eval(tree)
+    except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
+        return None
+    try:
+        if not isinstance(value, want) or not _json_shaped(value):
+            return None
+    except RecursionError:
+        return None
+    sys.stderr.write("[api] tool call: an %s argument written as a Python literal, read as one\n"
+                     % ("array" if isinstance(value, list) else "object"))
+    sys.stderr.flush()
+    return value
+
+
+def _coerce_arg(value, declared, literal=True):
     """Decode a raw <arg_value> according to the declared schema type.
 
     A string-typed parameter is kept verbatim -- never parsed as JSON. Everything else keeps
-    the previous permissive behaviour (parse if it parses, otherwise leave as text)."""
+    the previous permissive behaviour (parse if it parses, otherwise leave as text), except
+    that a declared array or object written as a Python literal is read as one unless
+    `literal` is False (the strict parser)."""
     if declared == "string":
         return value
     try:
         parsed = json.loads(value)
     except (json.JSONDecodeError, TypeError):
-        return value
+        container = _literal_container(value, (declared,)) if literal else None
+        return value if container is None else container
     if declared in ("integer", "number") and isinstance(parsed, bool):
         return value                              # `true` is not a number
     if declared and declared not in ("integer", "number", "boolean", "object", "array"):
@@ -810,7 +867,7 @@ def parse_glm_tool_calls_strict(reply, tools):
             declared_type = spec.get("type")
             if isinstance(declared_type, list):
                 declared_type = next((item for item in declared_type if item != "null"), None)
-            parsed = _coerce_arg(value, declared_type)
+            parsed = _coerce_arg(value, declared_type, literal=False)
             valid = (declared_type in (None, "string") or
                      (declared_type == "integer" and type(parsed) is int) or
                      (declared_type == "number" and type(parsed) in (int, float)) or
@@ -942,6 +999,26 @@ def _dsv4_tool_calls(tool_calls):
     return v4_dsml.render_tool_calls(tool_calls)
 
 
+def _dsml_arguments(calls):
+    """The vendored DSML decoders put a parameter marked string="false" into `arguments` as
+    the model wrote it, so a list in single quotes made the call's arguments text that is
+    not JSON. Such arguments are read as a Python literal dict of JSON values and carried as
+    JSON; arguments that are JSON already, or that read as nothing, stay as they were."""
+    for call in calls:
+        fn = call.get("function") if isinstance(call, dict) else None
+        if not isinstance(fn, dict) or not isinstance(fn.get("arguments"), str):
+            continue
+        try:
+            json.loads(fn["arguments"])
+            continue
+        except ValueError:
+            pass
+        container = _literal_container(fn["arguments"], ("object",))
+        if container is not None:
+            fn["arguments"] = json.dumps(container, ensure_ascii=False)
+    return calls
+
+
 def parse_dsv4_tool_calls(reply):
     """Parse DeepSeek V4 DSML tool calls out of one assistant reply.
 
@@ -952,6 +1029,7 @@ def parse_dsv4_tool_calls(reply):
     and any thinking/eos markers around the block are scrubbed.
     """
     content, calls = v4_dsml.parse_completion_text(reply)
+    calls = _dsml_arguments(calls)
     if not calls:
         cut = len(content)
         for marker in ("<" + DSV4_DSML + "tool_calls", "<" + DSV4_DSML + "invoke"):
@@ -1013,7 +1091,8 @@ def parse_k3_tool_calls(reply, tools=None):
                         try:
                             args[key] = json.loads(val)
                         except (json.JSONDecodeError, ValueError):
-                            args[key] = val
+                            container = _literal_container(val, (typ,))
+                            args[key] = val if container is None else container
                 arguments = json.dumps(args, ensure_ascii=False)
             calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
                           "function": {"name": name, "arguments": arguments}})
@@ -1039,6 +1118,7 @@ def parse_dsv41_tool_calls(reply):
     its token budget.
     """
     content, calls = v41_dsml.parse_completion_text(reply)
+    calls = _dsml_arguments(calls)
     if not calls:
         cut = len(content)
         for marker in (v41_dsml.TOOL_CALLS_PREFIX, v41_dsml.TOOL_CALL_PREFIX):
@@ -2618,7 +2698,8 @@ def _muse_value(raw, schema):
         json.dumps(parsed, allow_nan=False)
         return parsed
     except ValueError:
-        return raw
+        container = _literal_container(raw, kinds)
+        return raw if container is None else container
 
 
 def parse_muse_tool_calls(reply, tools):
@@ -2912,7 +2993,12 @@ def _qwen_argument(raw, declared):
         return raw
     if "boolean" in kinds and value.lower() in ("true", "false"):
         return value.lower() == "true"
-    parsed = json.loads(raw)
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        parsed = _literal_container(raw, kinds)
+        if parsed is None:
+            raise
     numeric = type(parsed) in (int, float)
     finite = numeric and (type(parsed) is int or math.isfinite(parsed))
     if (("array" in kinds and isinstance(parsed, list)) or

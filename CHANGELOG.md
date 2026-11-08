@@ -479,6 +479,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   process hung until killed. `tests/cuda_tier_engines.sh` runs a small qwen35moe GGUF's hybrid steps
   and the lost word against the CPU's tokens.
 
+- **A list or a dict written the way Python prints it reaches the client as one.** Asked to
+  run a query with the parameters 7, 'x,y', null and true, Flint wrote `[7, 'x,y', null, true]`
+  for the declared array, two calls in 24 of a tool-call bench over seven models. The GLM call
+  form (GLM, Flint) passed that on as a string, the Qwen form (Qwen3.6, Qwen3.8, LFM3, MiMo)
+  dropped such a call, Muse and Kimi K3 kept the text, and the DeepSeek V4 and V4.1 decoders put
+  it into `arguments` as written, so the client got arguments that were not JSON. A declared
+  `array` or `object` parameter whose text is not JSON is now read as a Python literal, JSON's
+  `null`/`true`/`false` accepted too (`_literal_container`), and kept only when it is that
+  container of JSON values throughout; DeepSeek's arguments are read the same way when they are
+  not JSON. The text is parsed, never run. Tuples, sets, non-string keys, non-finite numbers and
+  cut-off text are not read, and `strict_tool_calls` reads JSON only, as before
+  (`tests/test_tool_args_literal.py`).
+
 - **DeepSeek V4.1: a long prompt's answer could start with `<｜begin▁of▁sentence｜>`.** Past
   layer 20, the first with compress ratio 1, a prompt of 2478 tokens or more runs the later
   layers on its last 2414 rows (`v41_prefill_tail`). Layers 21 to 23 run no indexer: they read
