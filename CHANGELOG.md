@@ -562,6 +562,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   vectorizes. Built for Sandy Bridge with glibc's software `fmaf`, Qwen3.8 IQ2_XS: the recurrence
   208 -> 52 ms a forward, the same perplexity (2.2402 nats a token over 258 tokens); the planar
   expert kernel's f32 mode (`QWEN_EXPERT_ACT=f32`) on Qwen3.6 0.59 -> 2.9 tok/s.
+- `make install` ships the chat UI and `coli ui` finds it in libexec. The
+  Models page resolves the installed support modules and the launcher in bin,
+  so it can import GGUFs and start a gateway outside a source checkout.
+- `make install` includes `tools/iq3xxs_grid.json`, required by the IQ3/E8
+  codec when a conversion uses the published lattice table.
 - **Qwen3.8: memory that grew with every answer** (#2592). The expert loader reads a batch of
   missing experts in parallel (on by default) with a team as large as the batch, and libgomp
   ends the threads a smaller team leaves out and starts new ones for a larger. Each read

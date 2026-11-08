@@ -3874,10 +3874,11 @@ def cmd_ui(a):
     """the chat UI (ui/server.py) against a running gateway (`coli serve`), the browser
     opened on it once it answers"""
     cands = [os.path.join(HERE, "ui", "server.py"),
-             os.path.join(os.path.dirname(os.path.abspath(HERE)), "ui", "server.py")]
+             os.path.join(os.path.dirname(os.path.abspath(HERE)), "ui", "server.py"),
+             os.path.join(_LIBEXEC, "ui", "server.py")]
     server = next((c for c in cands if os.path.exists(c)), None)
     if server is None:
-        sys.exit(f"{C.yel}the chat UI is not in this tree{C.r} (ui/server.py next to coli or one level up)")
+        sys.exit(f"{C.yel}the chat UI is not in this tree{C.r} (ui/server.py next to coli, one level up, or in libexec)")
     shown = "127.0.0.1" if a.host in ("0.0.0.0", "") else a.host
     url = f"http://{shown}:{a.port}/"
     print(f"  {C.dim}the chat UI on {url}, the gateway at {a.backend} "
