@@ -915,7 +915,7 @@ static int e8_warp_kernels(void){
 }
 
 __device__ __forceinline__ float e8_warp_fold(float v){
-    for(int off=16;off;off>>=1) v+=__shfl_down_sync(0xffffffffu,v,off);
+    for(int off=16;off;off>>=1) v+=f8_shfl_down(v,off);   /* CUDA: __shfl_down_sync, HIP: __shfl_down */
     return v;
 }
 /* Stage one activation row into padded shared memory; zero-fill the tail. */
@@ -1052,7 +1052,9 @@ static size_t e8_warp_smem(int width){
  * not of either kernel. */
 static int e8_group_launch(DeviceContext *ctx,GroupDesc *dev,int I,int D,
                            int max_rows,int count,int total){
-    if(e8_warp_kernels()){
+    /* the warp kernels stage a whole row in shared memory: past the 48 KB a block gets without
+     * an opt-in (a width over 10 912) they would not launch, so such a group keeps the block ones */
+    if(e8_warp_kernels() && e8_warp_smem(D) <= 48u*1024u && e8_warp_smem(I) <= 48u*1024u){
         unsigned hb=(unsigned)((I+COLI_E8_WARPS_PER_BLOCK-1)/COLI_E8_WARPS_PER_BLOCK);
         unsigned ob=(unsigned)((D+COLI_E8_WARPS_PER_BLOCK-1)/COLI_E8_WARPS_PER_BLOCK);
         dim3 hg(hb,(unsigned)max_rows,(unsigned)count),og(ob,(unsigned)max_rows,(unsigned)count);
