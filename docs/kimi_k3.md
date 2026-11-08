@@ -44,9 +44,14 @@ carries `text_config.dsa_config` (32 heads of 128, top 2048, no rotary part).
   photos and the parked conversation. The indexer's names, dtypes and shapes
   were read from the real checkpoint's shard headers; the whole model has not
   run here yet (no host of ours holds 1.6 TB).
-- **On the GPU.** The routed experts run on the Vulkan tier or with
-  `K3_CUDA=1` as K3's. The Vulkan chain stays off for K3.1: its attention, the
-  indexer's included, runs on the CPU.
+- **On the GPU.** The Vulkan chain runs K3.1's layers as K3's, the indexer
+  included: each DSA layer keeps its index keys on the device (whole, also when
+  the latent cache is split between the device and the host), and past 2048
+  positions a row's selection (`vkc_dsa_select`, the CPU's order) is the list
+  its attention core reads. `make` `kimi-chain` in `tests/vulkan_engines.sh`
+  checks the chain's tokens against the CPU's on the tiny K3.1, whole, partial,
+  in small chunks, quantized and split. The routed experts run on the Vulkan
+  tier or with `K3_CUDA=1` as K3's.
 
 ## Architecture notes
 

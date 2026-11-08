@@ -2955,6 +2955,30 @@ family_kimi_chain() {
   # in chain chunks of 5 rows (seven chunks a 32-row forward), the loss in the third
   # chunk of the second forward: the state its first chunks advanced is not used
   K3C_CASES=long FAULT_BACK=124 REBUILD=1 k3c_gate "chain kimi_k3 device lost inside a chunked forward" $O COLI_VK_CHAIN_ROWS=5
+  # Kimi K3.1: the DSA indexer on the chain (a top 4, so a 30-token prompt selects in every
+  # MLA layer): its test with the chain on, then the chain's tokens against the CPU's in
+  # chunks of 3 rows, a token at a time, a partial chain, quantized trunks and the KV split
+  $PY tools/make_kimi_k3_tiny.py --output ./kimi_k31_tiny --force --k31
+  COLI_USAGE=$PWD/k3c.usage USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 \
+    $PY tests/test_kimi_k31_tiny.py --binary ./kimi_k3 --fixture ./kimi_k31_tiny
+  local k31ids="5 7 9 11 13 17 19 23 29 31 37 41 43 47 53 59 61 67 71 73 79 83 89 97 101 103 107 109 113 127" k31cpu k31vk v q
+  for q in "$O" "K3_BITS=8 K3_MLA_BITS=8 K3_HEAD_BITS=8 K3_IDOT=0 COLI_TEMP=0" "K3_BITS=4 K3_IDOT=0 COLI_TEMP=0"; do
+    # shellcheck disable=SC2086
+    k31cpu=$(env $q USAGE_SAVE=0 ./kimi_k3 kimi_k31_tiny --ids "$k31ids" --ngen 12 2>/dev/null | sed 's/ *TUNE.*//')
+    for v in COLI_VK_CHAIN_ROWS=32 COLI_VK_CHAIN_ROWS=3 K3_CHUNK=1 COLI_VK_CHAIN_LAYERS=3 \
+             "COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 COLI_VK_CHAIN_ROWS=3"; do
+      # shellcheck disable=SC2086
+      k31vk=$(env $q $v USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 \
+              ./kimi_k3 kimi_k31_tiny --ids "$k31ids" --ngen 12 2> vk.log | sed 's/ *TUNE.*//')
+      grep -q 'kimi_k3: dense chain on' vk.log || { cat vk.log; fail "chain kimi_k3.1 ($q, $v): the chain did not run"; }
+      [ "$k31vk" = "$k31cpu" ] || fail "chain kimi_k3.1 ($q, $v): $k31vk, the CPU $k31cpu"
+    done
+  done
+  # shellcheck disable=SC2086
+  [ "$(env $O KIMI_DSA_INDEXER=0 USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 ./kimi_k3 kimi_k31_tiny --ids "$k31ids" --ngen 12 \
+       2>/dev/null | sed 's/ *TUNE.*//')" != "$(env $O USAGE_SAVE=0 ./kimi_k3 kimi_k31_tiny --ids "$k31ids" --ngen 12 \
+       2>/dev/null | sed 's/ *TUNE.*//')" ] || fail "chain kimi_k3.1: the dense attention gives the selection's tokens"
+  echo "OK chain kimi_k3.1: the indexer's selection on the device, the CPU's tokens"
   # a GGUF's blocks: the trunk on the chain, the experts in the tier, as the file has them
   k3_gguf_tiny
   local G="GQ_EXACT=1 COLI_VK_IDOT=0 COLI_VK_CHAIN_GEMM=0 K3_MLA_BITS=32 COLI_TEMP=0"

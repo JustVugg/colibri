@@ -918,7 +918,7 @@ static size_t k3_dho_f32_bytes(const Model *m){
 static int k3c_fit_now(Model *m, int tier_on, int cuda_on);   /* kimi_k3_chain.h */
 static void k3_dho_decide(Model *m, int tier_on, int cuda_on){
     if(!g_k3_vk) return;
-    int chain=!cuda_on&&!(m->c.index_hd>0)&&coli_vk_chain_decide(NULL,tier_on,COLI_VK_CHAIN_UNMEASURED)!=COLI_VK_CHAIN_OFF;
+    int chain=!cuda_on&&coli_vk_chain_decide(NULL,tier_on,COLI_VK_CHAIN_UNMEASURED)!=COLI_VK_CHAIN_OFF;
     int dense_on=coli_vk_dense()||chain;
     if(k3c_fit_now(m,tier_on,cuda_on)){   /* a partial chain: its layers, and the head with the tail */
         g_k3_dho_layers=g_k3_fit.n; g_k3_dho_head=g_k3_fit.n==m->c.n_layers&&g_k3_fit.tail;
