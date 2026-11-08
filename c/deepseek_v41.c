@@ -357,15 +357,15 @@ static int v41_ledger(void) {
  * used and total bytes and its name ("card2"). 0 = no such file (a container without sysfs,
  * a driver that does not export it, Windows): the ledger prints 0 there and says nothing
  * about the card. The device's own accounting is `process` (backend_vulkan.c's books). */
-static int v41_vram_sysfs(unsigned long long *used, unsigned long long *total, char *card, size_t n) {
-    *used = *total = 0;
+static int v41_vram_sysfs(unsigned long long *used, unsigned long long *total, unsigned long long *gtt, char *card, size_t n) {
+    *used = *total = *gtt = 0;
     if (n) card[0] = 0;
     DIR *d = opendir("/sys/class/drm");
     if (!d) return 0;
     struct dirent *e;
     while ((e = readdir(d)) != NULL) {
         char name[32], path[128];
-        unsigned long long u = 0, t = 0;
+        unsigned long long u = 0, t = 0, gu = 0;
         if (strncmp(e->d_name, "card", 4) != 0 || !e->d_name[4] || strlen(e->d_name) >= sizeof name) continue;
         snprintf(name, sizeof name, "%s", e->d_name);
         snprintf(path, sizeof path, "/sys/class/drm/%s/device/mem_info_vram_total", name);
@@ -377,7 +377,9 @@ static int v41_vram_sysfs(unsigned long long *used, unsigned long long *total, c
         if (!(f = fopen(path, "r"))) continue;
         if (fscanf(f, "%llu", &u) != 1) u = 0;
         fclose(f);
-        if (t > *total) { *total = t; *used = u; if (n) snprintf(card, n, "%s", name); }
+        snprintf(path, sizeof path, "/sys/class/drm/%s/device/mem_info_gtt_used", name);
+        if ((f = fopen(path, "r"))) { if (fscanf(f, "%llu", &gu) != 1) gu = 0; fclose(f); }
+        if (t > *total) { *total = t; *used = u; *gtt = gu; if (n) snprintf(card, n, "%s", name); }
     }
     closedir(d);
     return *total > 0;
@@ -5984,14 +5986,14 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
 #ifdef COLI_VULKAN
         v41c_report();   /* the dense chain's line, when it ran */
         if (v41_ledger()) {
-            unsigned long long vu = 0, vt = 0;
+            unsigned long long vu = 0, vt = 0, vg = 0;
             char card[32];
 #if !defined(_WIN32)
-            v41_vram_sysfs(&vu, &vt, card, sizeof card);
+            v41_vram_sysfs(&vu, &vt, &vg, card, sizeof card);
 #else
             card[0] = 0;
 #endif
-            v41c_ledger(vu, vt, card);
+            v41c_ledger(vu, vt, vg, card);
         }
 #endif
         serve_hits(m);
