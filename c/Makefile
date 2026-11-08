@@ -823,7 +823,8 @@ endif
 
 all: colibri$(EXE)
 
-# Tiny Kimi K3 fixture + vendor oracle.  The generator is numpy-only and
+# Tiny Kimi K3 fixture + vendor oracle (and K3.1's, the same weights plus the DSA
+# indexer, checked against tools/k3_ref.py: Moonshot ships no K3.1 modeling code).  The generator is numpy-only and
 # deterministic; ref.json is committed and comes from Moonshot's own modeling
 # code (tools/make_kimi_k3_ref.py, maintainer-run, SHA-256-pinned), so CI
 # needs neither torch nor network.  kimi_k3 builds on every platform, so
@@ -831,6 +832,7 @@ all: colibri$(EXE)
 .PHONY: kimi-k3-tiny-generate kimi-k3-tiny-check
 kimi-k3-tiny-generate:
 	$(PYTHON) tools/make_kimi_k3_tiny.py --output ./kimi_k3_tiny --force
+	$(PYTHON) tools/make_kimi_k3_tiny.py --output ./kimi_k31_tiny --force --k31
 
 kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
 	$(PYTHON) tests/test_kimi_k3_tiny.py \
@@ -845,6 +847,15 @@ kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
 	$(PYTHON) tests/test_kimi_k3_dashboard.py \
 		--binary ./kimi_k3$(EXE) \
 		--fixture ./kimi_k3_tiny
+	$(PYTHON) tests/test_kimi_k31_tiny.py \
+		--binary ./kimi_k3$(EXE) \
+		--fixture ./kimi_k31_tiny
+	$(PYTHON) tests/test_kimi_k3_ckpt.py \
+		--binary ./kimi_k3$(EXE) \
+		--fixture ./kimi_k31_tiny
+	$(PYTHON) tests/kimi_k3_park_harness.py \
+		--binary ./kimi_k3$(EXE) \
+		--fixture ./kimi_k31_tiny
 
 .PHONY: deepseek-v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
 	deepseek-v4-tiny-check deepseek-v4-clean

@@ -571,6 +571,7 @@ Read **only** by `c/kimi_k3.c`. The K3 engine has its own loader, cache and quan
 | `K3_TRACE` | unset | Write a routing trace to `K3_TRACE=<file>`. |
 | `K3_LOGITS` | unset | Write per-step logits to `K3_LOGITS=<file>`. |
 | `K3_X0` | unset | Read input rows `[T, hidden]` as f32 from this file, bypassing the embedding — for feeding activations captured elsewhere. |
+| `KIMI_DSA_INDEXER` | on | Kimi K3.1 Pro: `0` keeps its 24 DSA layers' attention dense past `index_topk` (2048) instead of the indexer's selection. A comparison, not the model; K3 has no indexer. |
 
 ## Inkling engine (`inkling`)
 

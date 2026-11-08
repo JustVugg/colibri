@@ -141,6 +141,15 @@ CATALOG = (
         post_install=(("k3_tokenizer", "tokenizer.json"),),
         doc="docs/kimi_k3.md"),
     CatalogModel(
+        id="kimi-k3.1-pro", family="kimi", name="Kimi K3.1 Pro",
+        repo="moonshotai/Kimi-K3.1-Pro", disk_gb=1561.3,
+        # K3's weights plus the DSA indexer (120 BF16 tensors, 0.36 GB)
+        ram_min_gb=32, ram_good_gb=64, dense_gb=20.2, rank=11, size_class="large",
+        summary="2.8T, K3 with sparse attention past 2048 tokens, native MXFP4 experts",
+        # the same tiktoken.model as K3 (one sha256): the same tokenizer.json
+        post_install=(("k3_tokenizer", "tokenizer.json"),),
+        prebuilt_since="2.1.1", doc="docs/kimi_k3.md#kimi-k31-pro"),
+    CatalogModel(
         id="qwen-image-2.1", family="qwen_image", name="Qwen-Image-2.1",
         repo="Qwen/Qwen-Image-2.1", disk_gb=33.1,
         # docs/qwen-image.md: 9.0 GB peak for one 768x512 image with the text

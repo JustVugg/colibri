@@ -20,7 +20,7 @@ that part in RAM and reads the rest, the experts, from the disk when the model
 asks for them. Pure C, one file per model family, no GPU required.
 
 Thirteen engines run today. Ten are for language models: **GLM-5.2/5.3** (which
-also runs **Mistral-Large-4**), **GLM-5.3-Flash**, **Inkling**, **Kimi K3**,
+also runs **Mistral-Large-4**), **GLM-5.3-Flash**, **Inkling**, **Kimi K3** (and K3.1 Pro),
 **DeepSeek V4 Flash**, **DeepSeek V4.1 Flash**, **MiMo-V2.6 Flash** (and Pro),
 **Qwen3.8-Flash-Next**, **Qwen3.6** (which also runs Qwen3-Coder, the dense
 Qwen3.8-27B, **Flint**, **Muse Spark Open** and **LFM3-VL**) and **OLMoE**. One
@@ -223,6 +223,7 @@ a fast NVMe drive helps most)
 | **Inkling** (975B): int4 experts, bf16 dense weights | `inkling` | 514 GB | 120 / 128 GB as downloaded; 25 GB after a [dense conversion](docs/inkling.md) | CUDA, Vulkan | 0.25 tok/s (Ryzen 9 7900, 187 GB, RTX A6000) |
 | MiMo-V2.6 Pro (1.02T): vision and tools | `mimo-v2.6-pro` | 564 GB | 54 / 64 GB | Vulkan | 0.66-0.79 tok/s (A, CPU) |
 | **Kimi K3** (2.8T): the largest | `kimi-k3` | 1.56 TB | 32 / 64 GB | CUDA, Vulkan | about 9.4 s per token, experts read at 6.3 GB/s |
+| **Kimi K3.1 Pro** (2.8T): K3 with sparse attention past 2048 tokens | `kimi-k3.1-pro` | 1.56 TB | 32 / 64 GB | CUDA, Vulkan | |
 
 <a id="other-supported-models"></a>
 

@@ -398,7 +398,7 @@ static size_t k3c_fixed_bytes(Model *m, int rows) {
 static int k3c_fit_now(Model *m, int tier_on, int cuda_on) {
     if (g_k3_fit_done) return g_k3_fit.L > 0;
     g_k3_fit_done = 1;
-    if (!g_k3_vk || cuda_on || k3_dsa_indexer_on() || k3c_unsupported(m)) return 0;
+    if (!g_k3_vk || cuda_on || m->c.index_hd > 0 || k3c_unsupported(m)) return 0;
     if (coli_vk_chain_decide(NULL, tier_on, COLI_VK_CHAIN_UNMEASURED) == COLI_VK_CHAIN_OFF) return 0;
     const Cfg *c = &m->c;
     int L = c->n_layers, rows = vkc_fit_rows(256);
@@ -1060,7 +1060,7 @@ static void k3c_start(Model *m, int tier_on) {
 #ifdef COLI_CUDA
         if (g_k3_cuda) no = "the CUDA expert tier is on and keeps its priority";
 #endif
-        if (!no && k3_dsa_indexer_on()) no = "KIMI_DSA_INDEXER=1 fills its index cache on the CPU";
+        if (!no && m->c.index_hd > 0) no = "the DSA indexer (Kimi K3.1) fills its index cache on the CPU";
         if (!no && g_k3_mux_slots > 1) no = "several conversations at once (KV_SLOTS): it keeps one conversation's state on the device";
         if (!no && g_k3_fit.L > 0 && g_k3_fit.n < 1) {   /* the fit's line said so: nothing of the chain on the device */
             vkc_fit_placed("kimi_k3", &g_k3_fit);
