@@ -44,6 +44,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **Qwen3.8-27B on Vulkan: its attention on the matrix units.** `chain_attn_flash` takes 64 query
+  rows a workgroup of one kv head's heads, so it ran where the heads a kv head divide 64; the 27B's
+  six took the blocked shader, and its decode, which follows the prompt's path, read every
+  position a workgroup a head. A kv head's heads now split over several workgroups (`fa_group`:
+  three pairs for the 27B), each staging its kv head's keys. RTX PRO 4000, served: UD-IQ2_XXS
+  prompt 1K / 4K / 8K 404 / 292 / 205 -> 436 / 423 / 425 tok/s, decode 16.6 -> 17.8; UD-Q4_K_XL
+  431 / 308 / 203 -> 488 / 474 / 471, decode 14.0 -> 14.8.
 - **Qwen3.8-27B on CUDA: its attention on the tensor cores and in blocks of positions.** Its 24
   query heads over 4 kv heads (six a kv head) fell outside the groupings the chain's prompt
   attention took on the tensor cores (dividing 64), so its prompt rows ran on the CUDA cores and

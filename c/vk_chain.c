@@ -160,7 +160,7 @@ typedef struct {
     VkShaderModule mmod[PM_N]; VkPipeline mpipe[PM_N]; int mla_ok;   /* chain_mla, chain_hgemv, chain_dsa */
     /* chain_attn_flash.comp: the attention core on the matrix units for prompt chunks,
      * one pipeline per (head dim, query heads per kv head) */
-    VkShaderModule mod_fa; VkPipeline fa[VKC_FA_MAX]; int fa_hd[VKC_FA_MAX], fa_gq[VKC_FA_MAX], fa_kv[VKC_FA_MAX], nfa;
+    VkShaderModule mod_fa; VkPipeline fa[VKC_FA_MAX]; int fa_hd[VKC_FA_MAX], fa_gq[VKC_FA_MAX], fa_sub[VKC_FA_MAX], fa_kv[VKC_FA_MAX], nfa;
     VkPipeline kdarec[VKC_KDA_MAX]; int kdarec_kd[VKC_KDA_MAX], nkdarec;   /* chain_kda's recurrence per key dim */
     VkShaderModule mod_kdar; int kdar_tried;   /* chain_kda_rows.spv: a prompt chunk's rows, made on first use */
     VkPipeline kdar[VKC_KDA_MAX]; int kdar_kd[VKC_KDA_MAX], nkdar;
@@ -1769,17 +1769,28 @@ static int attn_slice_next(void) {   /* the open frame out, a new one in */
     KC.st.attn_slices++;
     return vkc_submit(0) && vkc_begin();
 }
-/* chain_attn_flash.comp's pipeline for this head dim and grouping, made on first use;
- * NULL when the shader is missing or the pipeline fails */
-static VkPipeline fa_pipe(int hd, int gq) {
-    for (int i = 0; i < KC.nfa; i++) if (KC.fa_hd[i] == hd && KC.fa_gq[i] == gq && KC.fa_kv[i] == g_kvh) return KC.fa[i];
+/* chain_attn_flash's grouping of a kv head's G query heads: GQ of them a workgroup's rows
+ * (VKC_FA_ROWS / GQ tokens), the largest divisor of G that divides VKC_FA_ROWS, and *sub = G / GQ
+ * workgroups a kv head. Qwen3.8-27B's 6 (24 query heads, 4 kv): three pairs a kv head, 32 tokens
+ * a workgroup; its prompt took chain_attnb (64 % 6) */
+static int fa_group(int G, int *sub) {
+    int gq = G > 0 ? G : 1;
+    while (gq > 1 && (VKC_FA_ROWS % gq || G % gq)) gq--;
+    *sub = G > 0 ? G / gq : 1;
+    return gq;
+}
+/* chain_attn_flash.comp's pipeline for this head dim and grouping (sub workgroups a kv head),
+ * made on first use; NULL when the shader is missing or the pipeline fails */
+static VkPipeline fa_pipe(int hd, int gq, int sub) {
+    for (int i = 0; i < KC.nfa; i++)
+        if (KC.fa_hd[i] == hd && KC.fa_gq[i] == gq && KC.fa_sub[i] == sub && KC.fa_kv[i] == g_kvh) return KC.fa[i];
     if (!KC.mod_fa || KC.nfa == VKC_FA_MAX) return VK_NULL_HANDLE;
     /* keys a block (64, 32 at head dim 256: its scores, P and K/V tiles in 28 KiB of shared
      * memory) and the subgroups that share a row tile's work (256 invocations, 4 row tiles);
      * a float16 cache's twin (KV16) */
-    int32_t sv[5] = {hd, gq, hd > 128 ? 32 : 64, 256 / KC.core.coop_sg / 4, g_kvh};
-    VkSpecializationMapEntry me[5] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}, {7, 16, 4}};
-    VkSpecializationInfo si = {5, me, sizeof sv, sv};
+    int32_t sv[6] = {hd, gq, hd > 128 ? 32 : 64, 256 / KC.core.coop_sg / 4, g_kvh, sub};
+    VkSpecializationMapEntry me[6] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}, {7, 16, 4}, {8, 20, 4}};
+    VkSpecializationInfo si = {6, me, sizeof sv, sv};
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
         .requiredSubgroupSize = (uint32_t)KC.core.coop_sg};
@@ -1794,7 +1805,7 @@ static VkPipeline fa_pipe(int hd, int gq) {
         vkDestroyShaderModule(KC.dev, KC.mod_fa, NULL); KC.mod_fa = VK_NULL_HANDLE;   /* not again */
         return VK_NULL_HANDLE;
     }
-    KC.fa[KC.nfa] = p; KC.fa_hd[KC.nfa] = hd; KC.fa_kv[KC.nfa] = g_kvh; KC.fa_gq[KC.nfa++] = gq;
+    KC.fa[KC.nfa] = p; KC.fa_hd[KC.nfa] = hd; KC.fa_kv[KC.nfa] = g_kvh; KC.fa_sub[KC.nfa] = sub; KC.fa_gq[KC.nfa++] = gq;
     return p;
 }
 /* From COLI_VK_CHAIN_FLASH rows (16; 0 = never) a causal attention without a selection
@@ -1907,10 +1918,10 @@ static int attn_dec(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, 
      * ANV 26.0.8, the chain on at subgroups of 16) decoded Qwen3.6 after a 16K prompt at 5.03
      * tok/s, chain_attn's 16 workgroups walking every position, and at 35.52 with =2 (32K: 2.71
      * -> 33.88; after a short prompt 37.21 -> 38.00), its prompts as fast, the same answers */
-    int G = w->a.H / w->a.KVH;
+    int G = w->a.H / w->a.KVH, fsub = 1, fgq = fa_group(G, &fsub);
     if (!((KC.mod_fa || adec_knob() == 2) && vkc_attn_flash_rows() > 0 && !w->kv_pm && w->vd == w->a.hd &&
-          w->a.hd % 64 == 0 && VKC_FA_ROWS % G == 0 && (!g_kvh || (w->a.k_off % 8 == 0 && w->a.v_off % 8 == 0)) &&
-          (!KC.mod_fa || fa_pipe(w->a.hd, G)))) return 0;
+          w->a.hd % 64 == 0 && (!g_kvh || (w->a.k_off % 8 == 0 && w->a.v_off % 8 == 0)) &&
+          (!KC.mod_fa || fa_pipe(w->a.hd, fgq, fsub)))) return 0;
     if (S < 1 || S > VKC_ATTN_DEC_ROWS || n < VKC_ATTN_DEC_MIN || w->a.pos_base + 1 < VKC_ATTN_DEC_MIN || !adec_pipe()) return 0;
     /* a KV head's query heads in one workgroup a block (mode 2), each K and V row read once
      * for them, four floats a load (the offsets whole vec4s). Its blocks' rule counts four
@@ -1953,12 +1964,12 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
     if (w.vd <= 0) w.vd = w.a.hd;
     if (w.a.hd > 256 || w.vd > 256 || w.a.H % w.a.KVH || w.win < 0 || w.ring < 0 || (w.sink && !snk)) return 0;
     VkcBind bd[7] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(gate, 0), B(sel, 0), B(snk, 0)};
-    int G = w.a.H / w.a.KVH, blk = vkc_attn_block_rows(), fl = vkc_attn_flash_rows();
-    /* a prompt chunk's causal attention on the matrix units (chain_attn_flash), VKC_FA_ROWS / G
-     * tokens a workgroup; else the blocked shader, else chain_attn */
+    int G = w.a.H / w.a.KVH, blk = vkc_attn_block_rows(), fl = vkc_attn_flash_rows(), fsub = 1, fgq = fa_group(G, &fsub);
+    /* a prompt chunk's causal attention on the matrix units (chain_attn_flash), VKC_FA_ROWS / fgq
+     * tokens a workgroup, fsub workgroups a kv head (fa_group); else the blocked shader, else chain_attn */
     VkPipeline fp = KC.mod_fa && fl > 0 && w.a.S >= fl && !(sel && w.a.sel_row > 0) && !w.kv_pm &&
-                    w.vd == w.a.hd && w.a.hd % 64 == 0 && VKC_FA_ROWS % G == 0 && (!g_kvh || (w.a.k_off % 8 == 0 && w.a.v_off % 8 == 0))
-                    ? fa_pipe(w.a.hd, G) : VK_NULL_HANDLE;
+                    w.vd == w.a.hd && w.a.hd % 64 == 0 && (!g_kvh || (w.a.k_off % 8 == 0 && w.a.v_off % 8 == 0))
+                    ? fa_pipe(w.a.hd, fgq, fsub) : VK_NULL_HANDLE;
     /* the blocked shader's K and V a uvec4 a load: a float16 cache's rows of whole uvec4s,
      * head-major, a tile's positions consecutive (no ring, no list) */
     int vec = g_kvh && !w.kv_pm && !w.ring && w.a.sel_row <= 0 && w.a.hd % 8 == 0 && w.vd % 8 == 0 &&
@@ -1982,7 +1993,7 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
      * chain_attnb's time a submission. At the budget's own size Qwen3.6's 16K prompt was cut
      * into slices of 64 rows, 16 workgroups and a submission each: 5.9 s of attention */
     int S = w.a.S, rr = attn_slice_rows(S, w.a.pos_base, (double)w.a.H * (w.a.hd > w.vd ? w.a.hd : w.vd) / (fp ? VKC_FA_SLICE : 1),
-                                        fp ? VKC_FA_ROWS / G : blocked ? br : 1, fp || blocked ? w.a.KVH : w.a.H);
+                                        fp ? VKC_FA_ROWS / fgq : blocked ? br : 1, fp ? w.a.KVH * fsub : blocked ? w.a.KVH : w.a.H);
     int ok = 1;
     for (int r0 = 0; ok && r0 < S; r0 += rr) {
         VkcAttnW x = w;
@@ -1992,7 +2003,8 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
         if (w.a.sel_row > 0) x.a.sel_off += r0 * w.a.sel_row;
         if (r0 && !attn_slice_next()) return 0;
         if (fp) {
-            ok = record(fp, bd, 7, &x, sizeof x, (uint32_t)((x.a.S + VKC_FA_ROWS / G - 1) / (VKC_FA_ROWS / G)), (uint32_t)x.a.KVH, 1);
+            ok = record(fp, bd, 7, &x, sizeof x, (uint32_t)((x.a.S + VKC_FA_ROWS / fgq - 1) / (VKC_FA_ROWS / fgq)),
+                        (uint32_t)(x.a.KVH * fsub), 1);
             KC.st.attn_flash += ok;
         } else if (blocked) {
             struct { VkcAttnW w; int br, B, anchor, part, st_off; } pc = {x, br, 0, 0, 0, 0};
@@ -2791,8 +2803,9 @@ int vkc_prewarm(const VkcPrewarm *pw) {
         }
     }
     /* a prompt chunk's attention on the matrix units (chain_attn_flash), launched on one row */
-    if (ok && KC.mod_fa && pw->attn_hd > 0 && pw->attn_hd <= 256 && pw->attn_hd % 64 == 0 && pw->attn_gq > 0 && 16 % pw->attn_gq == 0) {
-        VkPipeline fp = fa_pipe(pw->attn_hd, pw->attn_gq);
+    int wsub = 1, wgq = pw->attn_gq > 0 ? fa_group(pw->attn_gq, &wsub) : 0;
+    if (ok && KC.mod_fa && pw->attn_hd > 0 && pw->attn_hd <= 256 && pw->attn_hd % 64 == 0 && pw->attn_gq > 0 && pw->attn_gq <= 16) {
+        VkPipeline fp = fa_pipe(pw->attn_hd, wgq, wsub);
         if (fp) fo = vkc_buf((size_t)16 * 256 * 4, VKC_DEV);
         if (fo) {
             int hd = pw->attn_hd, G = pw->attn_gq;
@@ -2801,7 +2814,7 @@ int vkc_prewarm(const VkcPrewarm *pw) {
             a.vd = hd;
             VkcBind ab[7] = {B(x, 0), B(x, 0), B(x, 0), B(fo, 1), B(NULL, 0), B(NULL, 0), B(NULL, 0)};
             KC.kind = PK_ATTN;
-            ok = record(fp, ab, 7, &a, sizeof a, 1, 1, 1); n += ok;
+            ok = record(fp, ab, 7, &a, sizeof a, 1, (uint32_t)wsub, 1); n += ok;
         }
     }
     /* a decode's attention over its positions' blocks (chain_attn_dec), its join launched on

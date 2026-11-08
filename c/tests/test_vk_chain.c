@@ -331,7 +331,7 @@ static void test_attn_hk(int S, int pos_base, int H, int KVH, int hd, int use_li
     /* chain_attn_flash's operands are f16: its bound where it may have run */
     int fl = vkc_attn_flash_rows();
     double e = relerr(o, ref, (size_t)S * H * hd, 1e-3);
-    double tol = fl > 0 && S >= fl && !use_list && hd % 64 == 0 && 64 % (H / KVH) == 0 ? 2e-3 : 2e-5;
+    double tol = fl > 0 && S >= fl && !use_list && hd % 64 == 0 ? 2e-3 : 2e-5;   /* any grouping: fa_group */
     CHECK(ok && e < tol, "attn S %d pos %d H %d/%d hd %d list %d (block from %d, flash from %d): err %.2e", S, pos_base, H, KVH, hd,
           use_list, vkc_attn_block_rows(), fl, e);
     if (S >= 16 && fixed_off()) {
@@ -473,7 +473,7 @@ static void test_attn_win(int S, int pos_base, int H, int KVH, int hd, int vd, i
     double e = relerr(o, ref, (size_t)S * H * vd, 1e-3);
     /* chain_attn_flash's operands are f16: its bound where it may have run */
     int fl = vkc_attn_flash_rows();
-    double tol = fl > 0 && S >= fl && !kv_pm && vd == hd && hd % 64 == 0 && 64 % (H / KVH) == 0 ? 2e-3 : 2e-5;
+    double tol = fl > 0 && S >= fl && !kv_pm && vd == hd && hd % 64 == 0 ? 2e-3 : 2e-5;   /* any grouping: fa_group */
     CHECK(ok && e < tol, "attn window S %d pos %d hd %d vd %d win %d ring %d sink %d pm %d: err %.2e",
           S, pos_base, hd, vd, win, ring, sink, kv_pm, e);
     if (S >= 16 && !getenv("COLI_VK_ATTN_SLICE")) {
@@ -4325,6 +4325,15 @@ int main(int argc, char **argv) {
         test_attn_win(200, 0, 32, 4, 128, 128, 513, 0, 1, 0); test_attn_win(48, 260, 32, 4, 128, 128, 0, 0, 1, 0);
         VkcStats s1; vkc_stats(&s1);
         printf("  attention on the matrix units: %llu calls\n", s1.attn_flash - s0.attn_flash);
+        /* a kv head's query heads in several workgroups (fa_group): Qwen3.8-27B's 24 over 4 (three pairs
+         * a kv head), twelve (three of four), three (three of one), and the 27B's with a window and sinks;
+         * where the cases above ran on the matrix units these must too (they took chain_attnb) */
+        test_attn_hk(40, 0, 24, 4, 256, 0); test_attn_hk(70, 33, 24, 4, 256, 0); test_attn_hk(37, 5, 48, 4, 256, 0);
+        test_attn_hk(50, 10, 6, 2, 128, 0); test_attn_win(70, 120, 24, 4, 256, 256, 100, 0, 1, 0);
+        VkcStats s2; vkc_stats(&s2);
+        CHECK(s1.attn_flash == s0.attn_flash || s2.attn_flash - s1.attn_flash >= 5,
+              "six, twelve and three query heads a kv head on the matrix units: %llu of 5 calls", s2.attn_flash - s1.attn_flash);
+        printf("  six, twelve and three query heads a kv head: %llu calls on the matrix units\n", s2.attn_flash - s1.attn_flash);
     }
     setenv("COLI_VK_CHAIN_FLASH", "0", 1);   /* the blocked and plain cases below: their own shaders */
     /* MiMo: a prompt's rows through a window (from position 0, and past it), a decode row
