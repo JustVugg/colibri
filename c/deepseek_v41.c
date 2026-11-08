@@ -2240,6 +2240,12 @@ static void v41_dho_open(Model *m) {
     if (!on || !atoi(on) || (keep && *keep && atoi(keep) != 0)) return;
     g_vk_opened = 1;
     g_vk_thread = pthread_self();
+    /* The trunk goes up before the mapped-weights window is asked: the fit below reads the
+     * device's real free memory (a 9/10-of-the-heap probe first left it a few hundred MiB on
+     * this box), and the ask — main, once v41c_start has placed the trunk — sizes the window
+     * around it (the heap less the trunk and COLI_VK_FREE_RESERVE_GB) instead of taking
+     * 9/10 of the heap the tier then has to fit inside. */
+    coli_vk_window_trunk_first();
     g_vk_ready = coli_vk_init_env_tier("deepseek_v41", vkt_wanted() && m->c.n_routed > 0);
     if (!g_vk_ready) return;
     int chain = v41c_decide(m);
@@ -6414,6 +6420,7 @@ int main(int argc, char **argv) {
      * The matrices go up on their first multiply (see vk_mul), from this thread. */
     if (!g_vk_opened) {          /* opened while the weights loaded when they may live on the device only */
         g_vk_thread = pthread_self();
+        coli_vk_window_trunk_first();   /* the trunk first here too (a GGUF's, or host copies kept): the window asked around it below */
         g_vk_ready = coli_vk_init_env_tier("deepseek_v41", vkt_wanted() && c->n_routed > 0);
         if (g_vk_ready) v41c_fit_now(&m);   /* how many layers the chain places, before any upload */
         const char *keep = getenv("COLI_VK_DENSE_HOST");
@@ -6427,6 +6434,7 @@ int main(int argc, char **argv) {
             ? "the embedding, the head, the router, norms and mixers, DSpark's stages, the vision tower; and matrices the device refused"
             : "the embedding, the head, the router, norms and mixers, DSpark's stages, the vision tower");
     v41c_start(&m);              /* COLI_VK_CHAIN: the trunk on the device, before the tier sizes itself */
+    coli_vk_window_trunk_ask();  /* trunk-first: the mapped-weights window asked around the trunk, before the tier sizes itself */
     vk_tier_start(&m, snap, cap);
     v41c_atexit();               /* after the tier's: the chain goes before the device */
     if (g_vk_ready && !vkt_ready() && !coli_vk_dense())

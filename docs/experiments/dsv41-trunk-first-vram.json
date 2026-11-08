@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "commit": "9cfa502f8f0c485769a4f529fc9ee423611c2e63",
+  "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017, released checkpoint, 48 shards, 510.3 GB, fp8 dense + fp4 experts, no conversion",
+  "command": "per arm: make -C c deepseek_v41 VK=1, then COLI_VULKAN=1 ./c/coli serve --model <checkpoint> --ram 28 --ctx 8192 --host 127.0.0.1 --port 8010; one warmup turn discarded, then 3 measured turns of POST /v1/chat/completions (stream, max_tokens 96, temperature 0.6, prompt 'Describe the nature of a transformer.'), decode tok/s = (tokens-1)/(last-first chunk time); the arms ran in separate trees from identical builds one commit apart (baseline 1d10bbf1 = origin/dev, trial 9cfa502f), serve stopped between arms",
+  "prompt_hash": "63e632b695d1e9e6631962d61eac07ecf5b0dabff115175f26170bd6ce21e7e8",
+  "hardware": {
+    "cpu": "Intel Core i9-12900K, container cpuset of 18 logical CPUs visible to the engine",
+    "ram": "38 GiB",
+    "storage": "single NVMe (nvme0n1), f2fs, the only drive the checkpoint streams from; expert reads measured at 2.6-2.7 GB/s in both arms",
+    "os": "Arch Linux, kernel 7.1.11-arch1-1, gcc 16.2.1, -O3 -march=native -fopenmp, RADV (Vulkan 1.4.354) on AMD Radeon RX 6900 XT 16 GiB with Resizable BAR"
+  },
+  "warmup_runs": 1,
+  "hypothesis": "Placing the dense trunk on the device before the mapped-weights window is asked — instead of after a 9/10-heap window ask that starves the chain fit — and dropping the tier's GTT host-pool mirror beside it raises decode throughput on a single-NVME ReBAR card, because the trunk stops taking the CPU's threads for its matmuls and the RAM the mirror held returns to the expert cache.",
+  "changed_variables": [
+    "COLI_VK_PLACEMENT"
+  ],
+  "baseline": {
+    "config": {
+      "COLI_VK_PLACEMENT": "window-first, tier host pool on (origin/dev default)",
+      "COLI_VULKAN": "1",
+      "RAM_GB": "28",
+      "CTX": "8192"
+    },
+    "samples": {
+      "tok_s": [
+        0.505,
+        0.485,
+        0.48
+      ]
+    },
+    "median_tok_s": 0.485,
+    "quality": {
+      "method": "make check: 3018 tests, 0 failures (392 skipped); every benchmark turn completed with coherent text at temperature 0.6 (text hashes recorded per turn in the raw evidence); placement state verified in the serve log: chain 0 of 40 layers on the device, tier host pool on",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/dsv41-trunk-first-vram-raw.txt, section 'baseline'",
+      "sha256": "bdb8a0866abe9b8b2d8c7d079988a3a20a718d8f6d3f8639414c990f14db2b63"
+    }
+  },
+  "trial": {
+    "config": {
+      "COLI_VK_PLACEMENT": "trunk-first, tier host pool off beside the trunk (this PR)",
+      "COLI_VULKAN": "1",
+      "RAM_GB": "28",
+      "CTX": "8192"
+    },
+    "samples": {
+      "tok_s": [
+        0.787,
+        0.773,
+        0.786
+      ]
+    },
+    "median_tok_s": 0.786,
+    "quality": {
+      "method": "make check: 3018 tests, 0 failures (392 skipped); every benchmark turn completed with coherent text at temperature 0.6 (text hashes recorded per turn in the raw evidence); placement state verified in the serve log: chain 40 of 40 layers on the device, window asked 5 GiB (heap less trunk less 1 GiB reserve), host pool off, no staged path",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/dsv41-trunk-first-vram-raw.txt, section 'trial'",
+      "sha256": "bdb8a0866abe9b8b2d8c7d079988a3a20a718d8f6d3f8639414c990f14db2b63"
+    }
+  },
+  "outcome": "improvement"
+}
