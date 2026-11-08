@@ -67,6 +67,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <math.h>
 #include <unistd.h>
 #include "../backend_vulkan.h"
@@ -612,6 +613,45 @@ static void sync_evict(void) {
     CHECK(vkt_resident(0, 5) && !vkt_resident(0, 1) && res == 2,
           "sync: expert 5 did not displace expert 1 (resident 1 %d, 5 %d, all %d of a budget of 2)", vkt_resident(0, 1), vkt_resident(0, 5), res);
     CHECK(worst < 2e-3, "sync: relative error %.3g", worst);
+    vkt_shutdown(); model_free();
+}
+
+/* #2705: vkt_give_back waits for the uploader's queue first. An upload the pool refused for
+ * room waited (a minute an entry) for a free that only the engine thread makes at a quiescent
+ * point, and the engine thread was the one waiting in vkt_give_back: a turn stalled in it. A
+ * budget of six experts and the pool's limit cut to three before any upload: a step routes six,
+ * three go up and three meet the full pool; the give-back that follows returns at once, the
+ * three given up and back on the CPU, none counted failed, the budget standing. */
+static double mono_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+static void give_back_wait(void) {
+    VktFmt f = {VKT_SRC_I8_ROW, 0};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    set_budget(6, f, f);
+    setenv("COLI_VK_TIER_RATE", "64", 1);
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+    int on = vkt_init(&vc, NULL);
+    CHECK(on, "give back: the tier did not start");
+    if (!on) { model_free(); return; }
+    const size_t eb = vkt_expert_bytes(H, F, f, f);
+    coli_vk_tier_pool_limit(3 * eb);
+    Books bk = {0, 0};
+    int idx[2 * K] = {0, 1, 2, 3, 4, 5}; float w[2 * K] = {0.5f, 0.3f, 0.2f, 0.5f, 0.3f, 0.2f};
+    vkt_begin_forward(); step(0, 2, idx, w, &bk);
+    for (int k = 0; k < 50; k++) {   /* the uploader at work: three in, a refused one waiting for room */
+        int res = 0; for (int e = 0; e < 6; e++) res += vkt_resident(0, e);
+        if (res >= 3) break;
+        struct timespec ts = {0, 20 * 1000000L}; nanosleep(&ts, NULL);
+        vkt_begin_forward();
+    }
+    const double t0 = mono_s();
+    vkt_give_back(eb);
+    const double dt = mono_s() - t0;
+    unsigned long long ev, failed;
+    report_counts(&ev, &failed);
+    int res = 0; for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) res += vkt_resident(l, e);
+    printf("  give back: %.2f s with refused uploads queued, resident %d, failed %llu\n", dt, res, failed);
+    CHECK(dt < 10.0, "give back: %.1f s with refused uploads queued (the uploader waited for room only this thread makes)", dt);
+    CHECK(failed == 0, "give back: %llu uploads counted failed (a give-back's are given up, the budget stands)", failed);
     vkt_shutdown(); model_free();
 }
 
@@ -1667,6 +1707,7 @@ int main(int argc, char **argv) {
     printf("adapt:\n"); adapt();
     printf("partial:\n"); partial();
     printf("sync:\n"); sync_evict();
+    printf("give back:\n"); give_back_wait();
     printf("extra:\n"); extra();
     printf("fill:\n"); fill();   /* after extra: its exact pool capacities assume no tier came before with more experts */
     printf("DeepSeek V4:\n"); v4_act();

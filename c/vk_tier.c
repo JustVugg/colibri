@@ -138,6 +138,9 @@ static struct {
     pthread_t th; int th_on, stop;
     pthread_mutex_t mx; pthread_cond_t cv, cv_room, cv_done;
     int busy;                          /* the uploader is between taking an entry and push_done */
+    int giving;                        /* vkt_give_back waits for the queue: an upload refused for room gives up
+                                        * at once (the room it waits for only the engine thread makes, and that
+                                        * thread is the one waiting, #2705) */
     int sync;                          /* COLI_VK_TIER_SYNC=1: quiescent points wait for the uploader */
     int evict_pending;                 /* victims chosen and not freed yet (a batch is in flight) */
     VQ q[VKT_QCAP]; int qh, qn;
@@ -185,6 +188,7 @@ static struct {
     /* failed, by what: the pool refused the expert (no room as it is laid out), the copy
      * to the device failed, or the batch could not take the uploaded expert's sets */
     unsigned long long f_pool, f_copy, f_sets;
+    unsigned long long gave_up;          /* uploads given up for a give-back (#2705): back on the CPU, not failed */
     int plan_hist;                        /* the last plan's experts from the history (vkt_plan) */
     double dev_ms, cpu_ms, wait_ms;
     unsigned long long rep_routed, rep_served;
@@ -430,14 +434,15 @@ static void promote_copy(const VQ *e) {
         if (!src[k] || frees >= 3 || waited >= 600 || T.sync) break;
         pthread_mutex_lock(&T.mx);
         unsigned long gen = T.room_gen;
-        while (T.room_gen == gen && !T.stop && waited < 600) {
+        while (T.room_gen == gen && !T.stop && !T.giving && waited < 600) {
             struct timespec until; clock_gettime(CLOCK_REALTIME, &until);
             until.tv_nsec += 100 * 1000000L; if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
             if (pthread_cond_timedwait(&T.cv_room, &T.mx, &until) == ETIMEDOUT) waited++;
         }
         if (T.room_gen != gen) frees++;
-        int stop = T.stop;
+        int stop = T.stop, gave = T.giving;
         pthread_mutex_unlock(&T.mx);
+        if (gave) { copy_failed = 2; break; }   /* given up for a give-back: no question of the budget */
         if (stop) break;
     }
     if (ok && !coli_vk_tensor_copy(t, src, 3)) {
@@ -484,7 +489,7 @@ static void *uploader(void *arg) {
         const uint8_t *g = b, *u = g + guc, *d = u + guc;
         const uint8_t *gs = d + dc, *us = gs + gus, *ds = us + gus;
         ColiVkTensor *t[3];
-        int ok = 0, r = 0;
+        int ok = 0, r = 0, gave = 0;
         /* Refused: the pool is at its budget until the engine thread frees the victim
          * this promotion displaced, at its next quiescent point (a join: every layer
          * in decode, after a chunk's CPU work in prefill). Wait for room to be made
@@ -499,19 +504,20 @@ static void *uploader(void *arg) {
             if (ok || r < 0 || frees >= 3 || waited >= 600 || T.sync) break;
             pthread_mutex_lock(&T.mx);
             unsigned long gen = T.room_gen;
-            while (T.room_gen == gen && !T.stop && waited < 600) {
+            while (T.room_gen == gen && !T.stop && !T.giving && waited < 600) {
                 struct timespec until; clock_gettime(CLOCK_REALTIME, &until);
                 until.tv_nsec += 100 * 1000000L; if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
                 if (pthread_cond_timedwait(&T.cv_room, &T.mx, &until) == ETIMEDOUT) waited++;
             }
             if (T.room_gen != gen) frees++;
             int stop = T.stop;
+            gave = T.giving;
             pthread_mutex_unlock(&T.mx);
-            if (stop) break;
+            if (stop || gave) break;
         }
         free(e.buf);
         if (!ok) t[0] = t[1] = t[2] = NULL;
-        push_done(e.layer, e.eid, ok, r < 0, t, NULL);
+        push_done(e.layer, e.eid, ok, gave && !ok ? 2 : r < 0, t, NULL);   /* 2: given up for a give-back */
     }
 }
 
@@ -606,6 +612,7 @@ static void quiesce(void) {
                 continue;
             }
             for (int k = 0; k < 3; k++) { ColiVkTensor *t = k == 0 ? d[i].g : k == 1 ? d[i].u : d[i].d; if (t) coli_vk_tensor_free(t); }
+            if (d[i].copy_failed == 2) { T.gave_up++; continue; }   /* for a give-back: it may come again, the budget stands */
             T.failed++;
             if (d[i].ok) T.f_sets++; else if (d[i].copy_failed) T.f_copy++; else T.f_pool++;
             if (!d[i].ok && !d[i].copy_failed && T.dmax[0] > T.dres[0] + T.dque[0]) {
@@ -630,6 +637,7 @@ static void quiesce(void) {
             for (int k = 0; k < 3; k++) { ColiVkTensor *t = k == 0 ? d[i].g : k == 1 ? d[i].u : d[i].d; if (t) coli_vk_tensor_free(t); }
             v->state = VS_NONE; set_place(v, 0);
             if (dv && !T.d2) continue;
+            if (d[i].copy_failed == 2) { T.gave_up++; continue; }   /* for a give-back: it may come again, the budget stands */
             T.failed++;
             if (d[i].ok) T.f_sets++; else if (d[i].copy_failed) T.f_copy++; else T.f_pool++;
             /* refused: the budget holds fewer than the count said (fragmentation, or the
@@ -3030,8 +3038,13 @@ size_t vkt_give_back(size_t bytes) {
     (void)bytes; return 0;
 #else
     if (!T.on || !bytes || T.inflight) return 0;
+    /* the uploader's queue drains first; an upload refused for room would wait (a minute an
+     * entry) for a free only this thread makes, at a quiescent point it cannot reach while it
+     * waits here (#2705): told so, it gives such an upload up at once, its expert back on the CPU */
     pthread_mutex_lock(&T.mx);
+    T.giving = 1; pthread_cond_broadcast(&T.cv_room);
     while ((T.qn || T.busy) && T.th_on && !T.stop) pthread_cond_wait(&T.cv_done, &T.mx);
+    T.giving = 0;
     pthread_mutex_unlock(&T.mx);
     quiesce();
     if (T.inflight || T.nevict || T.ndfree) return 0;
@@ -3398,6 +3411,7 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
     if (T.failed)
         fprintf(stderr, " | failed: %llu refused by the pool, %llu copies to the device, %llu not taken by the batch",
                 T.f_pool, T.f_copy, T.f_sets);
+    if (T.gave_up) fprintf(stderr, " | %llu uploads given up for room the engine gave back", T.gave_up);
     if (T.balance) fprintf(stderr, " | balance: device share %.2f, %llu rows handed to the CPU", T.share, T.handed);
     if (T.chain_served) fprintf(stderr, " | in the dense chain: %llu routed experts with no host step", T.chain_served);
     if (T.hy_steps || T.hyb_steps) {
