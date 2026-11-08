@@ -15840,6 +15840,7 @@ static int v4_dho_place(ColiV4Engine *engine, int layer) {
 #endif
 
 #ifdef COLI_CUDA
+#include "deepseek_v4_gpu_devices.h"   /* DSV4_CUDA_DEVICES's parser, for v4_cu_open's line about a GGUF (its own unit's copy) */
 /* ---- the routed-expert tier on a CUDA device (cu_tier.h: vk_tier.c over the CUDA backend) ----
  * COLI_CUDA=1 with no Vulkan tier running: the CUDA device opens for the experts the tier
  * holds, and the tier is the Vulkan one's code (XT): the same history, warm start, promotions
