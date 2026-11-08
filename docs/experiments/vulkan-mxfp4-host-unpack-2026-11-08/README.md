@@ -66,7 +66,7 @@ the two measured builds (`runtime-artifacts.json`).
 ## Source identity and reproduction
 
 The end-to-end runtime base is
-`e24cd51afd44b480c1e41ba82e20a28bac76c34f` plus `runtime-base.patch`, the common
+`e24cd51afd44b480c1e41ba82e20a28bac76c34f` plus `runtime-base.patch.gz` (decompress before applying), the common
 Xe2 patches already used by the experiment engine. The trial adds only this
 PR's `dev_codes_fp4` change. The publication branch is based on upstream
 `f5d65566de468c8e7ac285a5e8c7257bf4d06856`; its complete `vk_tier.c` matches
@@ -151,3 +151,7 @@ made its full Python rerun pass. Both the failure and rerun are retained in
 Compiler versions are in `compiler.json`; the exact local model file identities
 are in `local-model-manifest.json`. `perf-report.txt`, `host-rows-annotate.txt`
 and `trace-stats.txt` support the sampled CPU finding.
+
+The shared runtime patch is stored as deterministic gzip to preserve its exact
+patch-format whitespace. `perf-report.txt` has trailing display whitespace
+removed; its numbers and symbols are unchanged.

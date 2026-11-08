@@ -6,7 +6,7 @@
 # Samples: 81K of event 'cpu-clock'
 # Event count (approx.): 408979848375
 #
-# Overhead  Command      Shared Object         Symbol                                             
+# Overhead  Command      Shared Object         Symbol
 # ........  ...........  ....................  ...................................................
 #
     60.79%  deepseek_v4  deepseek_v4           [.] host_rows

@@ -336,5 +336,7 @@
         ]
       }
     }
-  }
+  },
+  "runtime_base_patch_archive": "runtime-base.patch.gz",
+  "runtime_base_patch_archive_sha256": "16040a6b9902f9992c2ba42b440db0a31757214e48ff823048b169e34782663c"
 }
