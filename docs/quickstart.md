@@ -37,8 +37,8 @@ Both run `coli setup`, which does the rest:
    in your RAM, and the download fits on your disk.
 3. **Gets the engine**: it builds it for your machine when a compiler is
    there, with Vulkan or CUDA when your GPU can use it, or downloads the
-   prebuilt one when there is no compiler (CPU, and on Linux and Windows
-   Vulkan too). If a package is missing for
+   prebuilt one when there is no compiler (CPU, and on x86-64 Linux and
+   Windows Vulkan too). If a package is missing for
    your GPU it prints the exact command to install it and carries on with the
    CPU; nothing is installed system-wide without you. Run the setup again once
    you have installed it, and it rebuilds the engine for the GPU. CUDA is used
@@ -143,9 +143,12 @@ CPU-only by default.
 > (`ARCH=native` unlocks the vector instructions your chip actually has), or if
 > you plan to hack on the engine.
 >
-> **On ARM64 Linux (AWS Graviton, Ampere, Raspberry Pi, aarch64 VMs) there is no
-> shortcut**: the published Linux archive is x86_64 only. Build from source —
-> sections 1 and 2 work unchanged, and the engine needs no ARM-specific flags.
+> **On ARM64 Linux (AWS Graviton, Ampere, Raspberry Pi, aarch64 VMs)** take
+> `colibri-<version>-linux-aarch64.tar.gz`. It is built for plain armv8-a, so it
+> starts on a Raspberry Pi 4 as well, and runs on the CPU only. A core with the
+> dot-product instructions (Raspberry Pi 5, Graviton, Ampere) runs the SDOT/SMMLA
+> int8/int4 kernels only in an engine built on it: build from source for that —
+> sections 1 and 2 work unchanged.
 
 ### Linux (Ubuntu / Debian)
 

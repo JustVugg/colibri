@@ -964,7 +964,8 @@ class Releases(HomeTestCase):
         self.assertEqual(suffix("linux", "x86_64"), "linux-x86_64.tar.gz")
         self.assertEqual(suffix("win32", "AMD64"), "windows-x86_64.zip")
         self.assertEqual(suffix("darwin", "arm64"), "macos-arm64.tar.gz")
-        self.assertIsNone(suffix("linux", "aarch64"))
+        self.assertEqual(suffix("linux", "aarch64"), "linux-aarch64.tar.gz")
+        self.assertIsNone(suffix("linux", "armv7l"))
 
     def test_find_release_falls_back_to_latest(self):
         seen = []

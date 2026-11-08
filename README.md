@@ -87,8 +87,8 @@ the setup:
    RAM, plus a minimum cache of experts, must fit in your RAM, and the download
    on your disk;
 3. **gets the engine**: it builds it for your machine when a compiler is there,
-   otherwise it downloads the prebuilt one, which runs on the CPU and, on Linux
-   and Windows, on a Vulkan GPU too. It builds
+   otherwise it downloads the prebuilt one, which runs on the CPU and, on x86-64
+   Linux and Windows, on a Vulkan GPU too. It builds
    for your GPU when that pays: CUDA for an NVIDIA card on Linux when the CUDA toolkit is installed,
    otherwise Vulkan. On a discrete GPU it always does; on an integrated GPU,
    which shares the CPU's RAM, only for the models measured faster there
