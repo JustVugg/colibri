@@ -142,6 +142,20 @@ CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-
 # (warns), so link psapi explicitly or the build fails undefined-reference on
 # modern GCC (e.g. 16.x under UCRT). Harmless where the pragma also resolves it.
 LDFLAGS = -lm -fopenmp -static -lpsapi $(EXTRA_LDFLAGS)
+# The -static link needs libgomp.a. Since gcc 16 MSYS2 ships it in its own package
+# (mingw-w64-ucrt-x86_64-libgomp) instead of pulling it in with gcc, so a fresh
+# install has -fopenmp but no archive, and the link stops with a bare
+# "cannot find -lgomp" (#1900, #2612). Ask the compiler where the archive is: when
+# it is missing, -print-file-name just echoes "libgomp.a" back. Warn up front and
+# name the package; the build still goes on, so goals that never link OpenMP are
+# not blocked. LIBGOMP_CHECK=0 silences it.
+ifneq ($(LIBGOMP_CHECK),0)
+ifneq ($(filter-out clean%,$(or $(MAKECMDGOALS),all)),)
+ifeq ($(shell $(DETECT_CC) -print-file-name=libgomp.a 2>/dev/null),libgomp.a)
+$(warning $(DETECT_CC) has no libgomp.a, so the -static -fopenmp link will fail with "cannot find -lgomp". In the "MSYS2 UCRT64" shell run: pacman -S --needed mingw-w64-ucrt-x86_64-libgomp (docs/windows.md))
+endif
+endif
+endif
 ifeq ($(LTO),1)
 CFLAGS  += -flto
 LDFLAGS += -flto

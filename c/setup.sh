@@ -22,9 +22,14 @@ Darwin)
     else echo "libomp is missing -> single-threaded build (recommended: brew install libomp)"; fi
     ;;
 MINGW*|MSYS*)
-    command -v gcc  >/dev/null || { echo "gcc is missing (MinGW-w64). Install: pacman -S mingw-w64-x86_64-gcc make"; exit 1; }
+    # MINGW_PACKAGE_PREFIX is set by the MSYS2 shell (mingw-w64-ucrt-x86_64 in UCRT64,
+    # mingw-w64-x86_64 in MINGW64); fall back to UCRT64, which is what the docs use.
+    MSYS_PKG="${MINGW_PACKAGE_PREFIX:-mingw-w64-ucrt-x86_64}"
+    command -v gcc  >/dev/null || { echo "gcc is missing (MinGW-w64). Install: pacman -S --needed $MSYS_PKG-gcc $MSYS_PKG-libgomp make"; exit 1; }
     echo "  gcc: $(gcc -dumpversion) · MinGW-w64"
-    echo -n "  OpenMP: "; echo 'int main(){return 0;}' | gcc -fopenmp -xc - -o "$OMP_PROBE" 2>/dev/null && echo ok || { echo "libgomp is missing (pacman -S mingw-w64-x86_64-gcc)"; exit 1; }
+    # Probe with -static, the way the Makefile links: gcc 16 moved libgomp out of the
+    # gcc package, and the static archive is what goes missing first (#2612).
+    echo -n "  OpenMP: "; echo 'int main(){return 0;}' | gcc -fopenmp -static -xc - -o "$OMP_PROBE" 2>/dev/null && echo ok || { echo "libgomp is missing. Install: pacman -S --needed $MSYS_PKG-libgomp"; exit 1; }
     ;;
 *)
     command -v gcc  >/dev/null || { echo "gcc is missing (for example: sudo apt install build-essential)"; exit 1; }

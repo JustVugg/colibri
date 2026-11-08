@@ -69,7 +69,8 @@ Its executables tools `sh`, `bash`, `make`, `sed` etc go in `c:\msys64\usr\bin`.
 From within `mingw64` we need to install compiler and make. \
 \
 `C:\msys64\mingw64.exe`\
-`pacman -S --needed mingw-w64-x86_64-gcc make`\
+`pacman -S --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-libgomp make`\
+(in the UCRT64 shell, which the rest of this page and `coli setup` use, the packages are `mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-libgomp`; gcc 16 no longer brings libgomp along, so ask for it by name)\
 \
 To see which AI oriented instructions your processor has, run CPU-Z from `https://www.cpuid.com/softwares/cpu-z.html` \
 or use the following command from msys2: `cat /proc/cpuinfo | grep ^flags | head -n 1`\
@@ -224,7 +225,7 @@ Size `CUDA_EXPERT_GB` so dense (~10 GB) + experts + working set stays under your
 | `An Application Control policy has blocked this file` | Smart App Control | §2 — turn SAC off + **reboot** |
 | `cannot execute 'collect2.exe': CreateProcess: No such file or directory` | Smart App Control blocked the freshly installed compiler (#1900) | §2: SAC off and a reboot, or wait for SAC's verdict |
 | `storage size of 'r' isn't known` / `implicit declaration of function 'getrusage'`, or `make` stops with "builds for x86_64-pc-msys" (or cygwin) | the gcc that ran is MSYS2's own (the plain `gcc` package, or the "MSYS2 MSYS" shell): it targets the MSYS runtime, not Windows, and does not define `_WIN32` (#1979) | open "MSYS2 UCRT64", `pacman -S --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-libgomp`, check that `gcc -dumpmachine` says `x86_64-w64-mingw32` |
-| `cannot find -lgomp` at the link | MSYS2's gcc 16 no longer pulls libgomp (#1900) | `pacman -S mingw-w64-ucrt-x86_64-libgomp` (`coli setup` lists it) |
+| `cannot find -lgomp` / "have you installed the static version of the gomp library?" at the link | MSYS2's gcc 16 no longer pulls libgomp (#1900): `-fopenmp -static` needs `libgomp.a`, which now ships in its own package (#2612). `gcc -print-file-name=libgomp.a` printing just `libgomp.a` confirms it | `pacman -S --needed mingw-w64-ucrt-x86_64-libgomp` (`make`, `setup.sh` and `coli setup` all point at it) |
 | `make qwen38` (or glm53, inkling, kimi_k3, olmoe, deepseek_v41) ends in `undefined reference to ...` | older tree: no bare target for that engine, make compiled the `.c` alone (#1945) | update, or name the binary: `make qwen38.exe ...` |
 | `coli setup` does not find MSYS2 installed by scoop, or uses another gcc on the PATH without Vulkan | older tree (#1900) | update, or set `MSYS2_ROOT` to the MSYS2 folder |
 | `cuda-dll ... Error 1` immediately | old tree: spaced CUDA_HOME / MSVC rejects `-Wextra` | update to current `dev` (#314) |

@@ -561,6 +561,7 @@ jobs:
           install: >-
             make
             mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-libgomp
             mingw-w64-ucrt-x86_64-binutils
       - if: matrix.os == 'macos-latest'
         run: brew install libomp
@@ -2020,6 +2021,7 @@ jobs:
             make
             git
             mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-libgomp
       # The DeepSeek V4 DeepGEMM flavour compiles against a pinned checkout
       # that tools/fetch_deepgemm.sh makes on first use (nothing vendored):
       # the fetch -- pin verification + MSVC patch -- is cached on the pin, so
