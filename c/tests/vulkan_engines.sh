@@ -18,6 +18,8 @@
 #   bash tests/vulkan_engines.sh kv-split | kv-split-sanitize   # the KV cache split between the device and
 #                                                  # the host past the device's budget, every chain engine
 #   bash tests/vulkan_engines.sh kv-split-deepseek | kv-split-deepseek-sanitize   # the same for DeepSeek's
+#   bash tests/vulkan_engines.sh kv-quant-deepseek   # COLI_VK_KV_QUANT: the KV mirrors in the
+#                                                  # checkpoint's quantized formats, approximate
 #   bash tests/vulkan_engines.sh staged    # staged uploads: the same bits as mapped memory, the decision
 #   bash tests/vulkan_engines.sh <family>-staged   # a family with COLI_VK_STAGED=1 (qwen-staged: and
 #                                                  # an engine under an emulated small window)
@@ -1732,6 +1734,25 @@ d = max(abs(x - y) for x, y in zip(a, b)) if a and len(a) == len(b) else float("
 m = max(abs(x) for x in a) if a else 0.0
 print(f"max |logit diff| {d:.2e} of {m:.2e}")
 sys.exit(0 if d <= 1e-4 * m else 1)
+PY
+}
+logits_tol() {  # <a.f32> <b.f32> <rel>: logits_close at a documented tolerance
+  $PY - "$1" "$2" "$3" <<'PY'
+import array, sys
+a = array.array("f", open(sys.argv[1], "rb").read()); b = array.array("f", open(sys.argv[2], "rb").read())
+d = max(abs(x - y) for x, y in zip(a, b)) if a and len(a) == len(b) else float("inf")
+m = max(abs(x) for x in a) if a else 0.0
+print(f"max |logit diff| {d:.2e} of {m:.2e} (tolerance {float(sys.argv[3]):.0e} of the largest)")
+sys.exit(0 if d <= float(sys.argv[3]) * m else 1)
+PY
+}
+token_diff() {  # <a.txt> <b.txt>: how many tokens of the two streams differ (visibility, not a gate)
+  $PY - "$1" "$2" <<'PY'
+import sys
+a = open(sys.argv[1]).read().split(); b = open(sys.argv[2]).read().split()
+n = max(len(a), len(b))
+d = sum(1 for i in range(n) if i >= len(a) or i >= len(b) or a[i] != b[i])
+print(f"{d} of {n} tokens differ")
 PY
 }
 chain_gate() {  # <engine> <tag> <tol 0|1> <env...> -- <argv...>   (CPUENV: the CPU arm's own settings)
@@ -4750,6 +4771,73 @@ family_kv_split_deepseek_sanitize() {
   make clean >/dev/null 2>&1 || true
 }
 
+# COLI_VK_KV_QUANT (docs/deepseek-v41.md): DeepSeek V4.1's device KV mirrors in the
+# checkpoint's cache formats -- the window ring MXFP8 (528 B a row), the compressed rows
+# FP4 (288 B), the index keys FP4 in block-wide sections (68 B). An approximate mode, so
+# its gate is not the bit-exact oracle the other families use: the flag-off run is the
+# exactness proof (the deepseek-chain family keeps it byte for byte), and under the flag
+# the logits stay within a DOCUMENTED tolerance (max |diff| <= 5e-2 of the largest
+# |logit|: the FP4 index keys move the top-k selection, a few percent of the logits is the
+# mode's own cost), the token stream is reported (a drift count, not a gate -- a greedy
+# pick may legitimately flip), and the ledger's kv-mirror line must be the quantized
+# widths' math (derived in v41_kvq_ledger below). The codec itself IS exact and gated bit
+# for bit by tests/test_vk_kv_quant first. The fixture is the tiny one at the released KV
+# geometry (--kv-quant-dims: head_dim 512, index_head_dim 128), because the formats are
+# defined at those widths; at the stock tiny geometry (64/32) the flag stays off by its
+# own dimension check.
+family_kv_quant_deepseek() {
+  export OMP_NUM_THREADS=2
+  make deepseek_v41 tests/test_vk_kv_quant VK=1
+  ./tests/test_vk_kv_quant | tee vk_kv_quant.log
+  tail -1 vk_kv_quant.log | grep -qx PASS || { cat vk_kv_quant.log; fail "kv-quant: the codec"; }
+  [ -d dsv41_kvq_tiny ] || $PY tools/make_dsv41_tiny.py --out dsv41_kvq_tiny --kv-quant-dims --emit-ref dsv41_kvq_tiny/ref.json
+  [ -d dsv41_kvq_long ] || $PY tools/make_dsv41_tiny.py --out dsv41_kvq_long --kv-quant-dims --emit-ref dsv41_kvq_long/ref.json --prompt-len 40 --max-new 6
+  v41_kvq "cap=2" SNAP=dsv41_kvq_tiny -- 2 dsv41_kvq_tiny/ref.json
+  v41_kvq "cap=8" SNAP=dsv41_kvq_tiny -- 8 dsv41_kvq_tiny/ref.json
+  v41_kvq "40-token prompt cap=8" SNAP=dsv41_kvq_long -- 8 dsv41_kvq_long/ref.json
+  v41_kvq "prompt in chunks of 3" SNAP=dsv41_kvq_long COLI_VK_CHAIN_ROWS=3 -- 8 dsv41_kvq_long/ref.json
+  v41_kvq "the per-row GEMV" SNAP=dsv41_kvq_tiny COLI_VK_CHAIN_GEMV=0 -- 8 dsv41_kvq_tiny/ref.json
+  unset OMP_NUM_THREADS
+}
+# <tag> <env...> -- <argv...>: the same Vulkan chain run with COLI_VK_KV_QUANT off (the
+# exactness side) and on. The off run must keep the reference's own oracle (exit 0, the
+# chain's tokens = the reference's); the on run may drift a token (exit 1 with a
+# [mismatch] line is accepted, the count printed) but must quantize (its own log line),
+# run the chain, keep the logits within the documented tolerance and the ledger's math.
+v41_kvq() {
+  local tag=$1; shift
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  local rc=0 rcq=0
+  rm -f off.f32 on.f32
+  env "${envs[@]}" COLI_VK_LEDGER=1 DUMP=off.f32 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 \
+      COLI_VK_CHAIN=1 ./deepseek_v41 "$@" > off.txt 2> off.log || rc=$?
+  [ "$rc" = 0 ] || { tail -20 off.log; fail "kv-quant $tag: the flag-off run left the oracle (exit $rc)"; }
+  env "${envs[@]}" COLI_VK_KV_QUANT=1 COLI_VK_LEDGER=1 DUMP=on.f32 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 \
+      COLI_VULKAN=1 COLI_VK_CHAIN=1 ./deepseek_v41 "$@" > on.txt 2> on.log || rcq=$?
+  { [ "$rcq" = 0 ] || grep -q '\[mismatch\]' on.log; } || { tail -20 on.log; fail "kv-quant $tag: exit $rcq without a token drift to show for it"; }
+  grep -q 'COLI_VK_KV_QUANT=1' on.log || { cat on.log; fail "kv-quant $tag: the mirrors did not quantize"; }
+  [ "$(chain_count deepseek_v41 on.log)" -gt 0 ] || { cat on.log; fail "kv-quant $tag: the chain never ran"; }
+  local lg; lg=$(logits_tol off.f32 on.f32 5e-2) || { echo "$lg"; fail "kv-quant $tag: logits beyond the documented tolerance"; }
+  echo "OK kv-quant $tag: $lg, $(chain_count deepseek_v41 on.log) chain forwards, $(token_diff off.txt on.txt)$(grep -q 'Matching tokens:' on.log && grep -a -o 'Matching tokens: [0-9]*/[0-9]*' on.log | tail -1 | sed 's/^/, the reference: /')"
+  v41_kvq_ledger "$tag"
+}
+# the ledger's kv mirror at the flag's widths. The fixture: 6 chain layers, a window of 8
+# plus the ring's 512 spare rows (Wd 520), the compressed rows and index keys of layers 1
+# and 3 (ratios 2 and 1) capped at 64 tokens, layer 1's ratio-2 compressor ring 8192 B of
+# fp32 either way. So:
+#   off: 6*520*2048 + 8192 + 2*64*2048 + 2*64*512 = 6 725 632 B = 6.41 MiB
+#   on:  6*520*528  + 8192 + 2*64*288  + 2*64*68  = 1 701 120 B = 1.62 MiB
+v41_kvq_ledger() {
+  local off on
+  off=$(sed -n 's/.*kv mirror \([0-9.]*\) MiB.*/\1/p' off.log | tail -1)
+  on=$(sed -n 's/.*kv mirror \([0-9.]*\) MiB.*/\1/p' on.log | tail -1)
+  [ -n "$off" ] && [ -n "$on" ] || { grep -a 'kv mirror' off.log on.log; fail "kv-quant $1: no kv-mirror line"; }
+  awk -v v="$off" 'BEGIN{exit !(v > 6.36 && v < 6.46)}' || fail "kv-quant $1: the flag-off mirrors $off MiB, not the fp32 math's 6.41"
+  awk -v v="$on" 'BEGIN{exit !(v > 1.57 && v < 1.67)}' || fail "kv-quant $1: the quantized mirrors $on MiB, not the 528/288/68 math's 1.62"
+  grep -q "kv mirror ${on} MiB (quantized" on.log || { grep -a 'kv mirror' on.log; fail "kv-quant $1: no (quantized) annotation"; }
+  echo "OK kv-quant $1 ledger: kv mirror $off -> $on MiB (quantized), the 528/288/68 B math"
+}
+
 # The decision engines (docs/vulkan.md, "The decision engines"): laya and gliner_decide
 # with their forward on the device (COLI_VK_CHAIN=1, chain_enc.comp) and matrix by matrix
 # (COLI_VK_CHAIN=0), Clef's DECIDE on qwen36's per-matrix path and its chain, in f32, int8
@@ -4957,6 +5045,7 @@ case "${1:-}" in
                   OMP_NUM_THREADS=2 "ld2_$e" ;;
   kv-split-deepseek) family_kv_split_deepseek ;;
   kv-split-deepseek-sanitize) family_kv_split_deepseek_sanitize ;;
+  kv-quant-deepseek) family_kv_quant_deepseek ;;
   staged)         family_staged ;;
   *-staged)       # COLI_VK_STAGED unset for the window's run, then the whole family staged
                   if [ "$1" = qwen-staged ]; then env -u COLI_VK_STAGED bash tests/vulkan_engines.sh staged-window; fi
@@ -4979,5 +5068,5 @@ case "${1:-}" in
   partial-*)      g=${1#partial-}; fn=ptl_family_${g//-/_}
                   declare -F "$fn" >/dev/null || { echo "no partial-chain group ${g}" >&2; exit 2; }
                   "$fn" ;;
-  *) echo "usage: $0 mux|mux-sanitize|mux-deepseek|mux-deepseek-sanitize|decide|decide-sanitize|staged|<family>-staged|shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|qwen-spec|qwen-spec-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize|kimi-chain|kimi-chain-sanitize|deepseek-chain|deepseek-chain-sanitize|dense-only-<group>[-sanitize]|partial-<group>[-sanitize]|prefill-qwen|prefill-qwen-sanitize|prefill-inkling-olmoe|prefill-mimo-kimi|prefill-glm|prefill-deepseek|kv-split|kv-split-sanitize|kv-split-cold|kv-split-cold-sanitize|layers-dev2[-mla|-deepseek][-sanitize]|layers-dev2-<engine>|kv-split-deepseek|kv-split-deepseek-sanitize|dev2|dev2-deepseek-kimi-mimo|dev2-sanitize" >&2; exit 2 ;;
+  *) echo "usage: $0 mux|mux-sanitize|mux-deepseek|mux-deepseek-sanitize|decide|decide-sanitize|staged|<family>-staged|shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|qwen-spec|qwen-spec-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize|kimi-chain|kimi-chain-sanitize|deepseek-chain|deepseek-chain-sanitize|dense-only-<group>[-sanitize]|partial-<group>[-sanitize]|prefill-qwen|prefill-qwen-sanitize|prefill-inkling-olmoe|prefill-mimo-kimi|prefill-glm|prefill-deepseek|kv-split|kv-split-sanitize|kv-split-cold|kv-split-cold-sanitize|layers-dev2[-mla|-deepseek][-sanitize]|layers-dev2-<engine>|kv-split-deepseek|kv-split-deepseek-sanitize|kv-quant-deepseek|dev2|dev2-deepseek-kimi-mimo|dev2-sanitize" >&2; exit 2 ;;
 esac

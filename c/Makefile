@@ -544,7 +544,7 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract test_idot_ssse3 \
 	test_ggml_quants test_gguf_c test_gq_dot
-TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32
+TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32 test_vk_kv_quant
 # needs a CUDA device and the CUDA objects: make tests/test_cu_tier CUDA=1
 TEST_EXCLUDE += test_cu_tier
 # takes a fixture and the CPU build's logits on its command line (ci.yml, the int4 gs64 A/B step)
@@ -2572,6 +2572,19 @@ tests/test_vk_chain$(EXE): tests/test_vk_chain.c $(VK_OBJ) $(VK_SPV)
 .PHONY: vk-chain-check
 vk-chain-check: tests/test_vk_chain$(EXE)
 	./tests/test_vk_chain$(EXE) shaders/qmatmul.spv
+
+# COLI_VK_KV_QUANT's codec (needs VK=1): the chain's quantized KV mirrors
+# (chain_dsv4.comp modes 13/14 and the quant readers) against c/dsv41_kvq.h's reference,
+# DeepInfer's cache formats -- the device's pack bit for bit, its unpack, a re-upload's
+# lanes, the pack's idempotence and the index scores' top-k overlap. Like the chain test
+# it is kept out of `check`/`test` (which run without a device), reachable from its own
+# target and the kv-quant-deepseek family of tests/vulkan_engines.sh.
+tests/test_vk_kv_quant$(EXE): tests/test_vk_kv_quant.c $(VK_OBJ) $(VK_SPV)
+	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_kv_quant needs VK=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+.PHONY: vk-kv-quant-check
+vk-kv-quant-check: tests/test_vk_kv_quant$(EXE)
+	./tests/test_vk_kv_quant$(EXE)
 
 # Checks the choice of memory type and the size, budget and room of the device memory
 # (vk_memtype.h) on memory-property tables written by the test. It needs the Vulkan headers

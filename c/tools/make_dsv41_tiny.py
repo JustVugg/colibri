@@ -534,8 +534,15 @@ def main() -> int:
     ap.add_argument("--emit-ref", type=Path, default=None)
     ap.add_argument("--max-new", type=int, default=8)
     ap.add_argument("--prompt-len", type=int, default=12)
+    ap.add_argument("--kv-quant-dims", action="store_true",
+                    help="the released KV geometry (head_dim 512, index_head_dim 128): "
+                         "COLI_VK_KV_QUANT's mirror formats (528/288/68 B a row) are "
+                         "defined at those widths, so the kv-quant tests' fixture uses them")
     args = ap.parse_args()
     cfg = tiny_config()
+    if args.kv_quant_dims:
+        cfg["head_dim"] = 512
+        cfg["index_head_dim"] = 128
     build(args.out, cfg, args.emit_ref, args.max_new, args.prompt_len)
     total = sum(p.stat().st_size for p in args.out.iterdir() if p.is_file())
     print(f"container -> {args.out}  ({total/1e6:.2f} MB)")
