@@ -1396,6 +1396,7 @@ typedef struct {
     int ecap;                   /* expert slots per layer */
     uint64_t clock, hits, miss;
     double t_disk, t_expert, t_attn, t_engram, t_spec;
+    double t_kvall;              /* the KV read side's own share: the ring decode and the kv_all build (the indexer's decode inside t_attn) */
     uint64_t forwards, expert_bytes;
     /* rope tables: [max_pos, rope_dim/2] cos/sin pairs, one per theta in use */
     float *rope_window, *rope_compress;
@@ -3089,8 +3090,10 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
          * be the window it would have seen alone, which means writing its key, reading,
          * and only then writing the next one. */
         if (hostq) {   /* the ring holds codes: the whole ring decodes once, per forward */
+            double d0 = now_s();
             win_dec = xmalloc((size_t)c->window * hd * sizeof(float), "window decoded");
             for (int t = 0; t < c->window; t++) kvq_unpack_win(win_dec + (size_t)t * hd, l->window + (size_t)t * roww);
+            m->t_kvall += now_s() - d0;
             window_kv = win_dec;
         } else window_kv = (const float *)(const void *)l->window;
         window_rows = c->window;
@@ -3193,9 +3196,11 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
         kv_all = xmalloc((size_t)(window_rows + compress_len) * hd * sizeof(float), "kv all");
         memcpy(kv_all, window_kv, (size_t)window_rows * hd * sizeof(float));
         if (hostq) {   /* the owner's compressed rows dequantize into kv_all, per forward */
+            double d0 = now_s();
             for (int j = 0; j < compress_len; j++)
                 kvq_unpack_ckv(kv_all + (size_t)(window_rows + j) * hd,
                                m->L[owner].ckv + (size_t)j * v41_row_ckv(c));
+            m->t_kvall += now_s() - d0;
         } else memcpy(kv_all + (size_t)window_rows * hd, m->L[owner].ckv,
                       (size_t)compress_len * hd * sizeof(float));
     }
@@ -5500,6 +5505,7 @@ static int serve_budget(int prompt, int requested, int context, int logprobs) {
 typedef struct {
     double turn_started, disk0, expert0, attn0, engram0;
     uint64_t forwards0, hits0, miss0, ebytes0;
+    double kvall0;               /* t_kvall at the turn's start (the kv-read line's share) */
     uint64_t mir_bytes0[V41_MIR_REPS], mir_reads0[V41_MIR_REPS];
     int n_prompt, budget;
 } V41Req;
@@ -5775,6 +5781,7 @@ static int v41_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int 
     rq->turn_started = turn_started; rq->disk0 = disk0; rq->expert0 = expert0; rq->attn0 = attn0;
     rq->engram0 = engram0; rq->forwards0 = forwards0; rq->hits0 = hits0; rq->miss0 = miss0;
     rq->ebytes0 = ebytes0; rq->n_prompt = n_prompt; rq->budget = budget;
+    rq->kvall0 = m->t_kvall;
     memcpy(rq->mir_bytes0, mir_bytes0, sizeof mir_bytes0); memcpy(rq->mir_reads0, mir_reads0, sizeof mir_reads0);
     return 1;
 }
@@ -6175,6 +6182,9 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
         }
 #endif
         serve_hits(m);
+        if (m->t_kvall > rq.kvall0)   /* COLI_VK_KV_QUANT=2's read side, its own line */
+            fprintf(stderr, "[v41] kv read: %.2fs decoding the host's code rows into kv_all (turn)\n",
+                    m->t_kvall - rq.kvall0);
         serve_emap(m);
         coli_serve_command_dispose(&command);
     }
@@ -6825,6 +6835,11 @@ int main(int argc, char **argv) {
                     "expert matmul %.2fs, attention %.2fs, engram %.2fs\n",
             (unsigned long long)m.hits, (unsigned long long)m.miss,
             m.expert_bytes / 1e6, m.t_disk, m.t_expert, m.t_attn, m.t_engram);
+    /* COLI_VK_KV_QUANT=2's read side: the ring decode and the kv_all build, broken out of
+     * t_attn so the dequantize-on-read cost is a lookup and not a subtraction (the
+     * indexer's decode stays inside attention -- it is not the dominator) */
+    if (m.t_kvall > 0.0)
+        fprintf(stderr, "[v41] kv read: %.2fs decoding the host's code rows into kv_all\n", m.t_kvall);
     mirror_report(NULL, NULL);
     if (m.engram.active)
         for (int t = 0; t < m.engram.n_layers; t++)
