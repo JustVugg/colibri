@@ -159,4 +159,23 @@ static inline void kvq_unpack_ikey(float *x, const uint8_t *mirror, int t) {
         x[i] = kvq_e2m1((i & 1) ? (uint8_t)(b >> 4) : (uint8_t)(b & 15)) * kvq_ue8m0(sb[i >> 5]);
     }
 }
+
+/* The host's own block rules (COLI_VK_KV_QUANT=2, the host arrays held in these
+ * formats): a mirror's blocks are whole and pack from byte 0, so the whole blocks
+ * covering rows [0, rows) are exactly the linear prefix kvq_ikey_mirror_bytes(rows)
+ * long -- a park, a reset or a zero-fill that rounds its row count up to whole blocks
+ * may copy that prefix as bytes, and NOTHING else may go linear: a row's data and its
+ * scales sit 2048 B apart inside its block, so a prefix cut at a row boundary strands
+ * the tail rows' scales. These two move ONE row between a mirror and the 68-byte
+ * linear staging a boundary writes through (a pull's write-back, a raw upload). */
+static inline void kvq_ikey_row_gather(uint8_t row[KVQ_IKEY_BYTES], const uint8_t *mirror, int t) {
+    size_t blk = (size_t)(t / KVQ_IKEY_BLOCK) * (KVQ_IKEY_BLOCK * KVQ_IKEY_BYTES);
+    memcpy(row, mirror + blk + (size_t)(t % KVQ_IKEY_BLOCK) * 64, 64);
+    memcpy(row + 64, mirror + blk + 2048 + (size_t)(t % KVQ_IKEY_BLOCK) * 4, 4);
+}
+static inline void kvq_ikey_row_scatter(uint8_t *mirror, int t, const uint8_t row[KVQ_IKEY_BYTES]) {
+    size_t blk = (size_t)(t / KVQ_IKEY_BLOCK) * (KVQ_IKEY_BLOCK * KVQ_IKEY_BYTES);
+    memcpy(mirror + blk + (size_t)(t % KVQ_IKEY_BLOCK) * 64, row, 64);
+    memcpy(mirror + blk + 2048 + (size_t)(t % KVQ_IKEY_BLOCK) * 4, row + 64, 4);
+}
 #endif

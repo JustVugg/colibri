@@ -26,6 +26,7 @@
 #include "../backend_vulkan.h"
 #include "../vk_chain.h"
 #include "../dsv41_kvq.h"
+#include "../park.h"
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL: " __VA_ARGS__); putchar('\n'); } } while (0)
@@ -273,8 +274,83 @@ done:
     free(q); free(w); free(k); free(kd); free(km); free(ref); free(ref0); free(refc); free(ref0c); free(top1); free(top0);
 }
 
+/* The host-side block rules, no device needed (COLI_VK_KV_QUANT=2, the host arrays in
+ * these formats):
+ *   staging  a mirror's rows through 68-byte linear staging and back, bit for bit --
+ *            the pull's write-back and a raw index-key upload go through these
+ *   prefix   the whole blocks covering rows [0, n) are the linear prefix
+ *            kvq_ikey_mirror_bytes(n) -- park/reset/zero keep whole blocks
+ *   slide    a window ring's two-arm slide (the prefill chunk copy) is the same bytes
+ *            at 528-byte rows: the ring stays linear, only its row changed width */
+static void host_block_tests(void) {
+    enum { R = 70, BLK = KVQ_IKEY_BLOCK, IKB = BLK * KVQ_IKEY_BYTES };   /* 3 blocks, a partial last */
+    const size_t mb = kvq_ikey_mirror_bytes(R);
+    float x[R * 128], a[128], b[128];
+    uint8_t *m1 = malloc(mb), *m2 = malloc(mb), row[KVQ_IKEY_BYTES], row2[KVQ_IKEY_BYTES];
+    CHECK(m1 && m2, "staging: no memory");
+    if (m1 && m2) {
+        memset(m1, 0, mb); memset(m2, 0, mb);
+        srand(29);
+        for (int i = 0; i < R * 128; i++) x[i] = (float)((rand() % 2001) - 1000) / 500.0f * ldexpf(1.0f, rand() % 5 - 2);
+        for (int t = 0; t < R; t++) kvq_pack_ikey(m1, t, x + (size_t)t * 128);
+        for (int t = 0; t < R; t++) {   /* every row through the staging, blocks apart */
+            kvq_ikey_row_gather(row, m1, t);
+            kvq_ikey_row_scatter(m2, t, row);
+            kvq_unpack_ikey(a, m1, t); kvq_unpack_ikey(b, m2, t);
+            CHECK(memcmp(a, b, sizeof a) == 0, "staging: row %d decodes differently after gather/scatter", t);
+        }
+        CHECK(memcmp(m1, m2, mb) == 0, "staging: the scattered mirror is not the packed one");
+        int over = 0;   /* a partial row cut at 2048 strands scales: the prefix must round */
+        for (int rows = 1; rows <= R + BLK; rows++) {
+            size_t want = (size_t)((rows + BLK - 1) / BLK) * IKB;
+            if (kvq_ikey_mirror_bytes((size_t)rows) != want) over++;
+        }
+        CHECK(over == 0, "prefix: kvq_ikey_mirror_bytes is not whole blocks from byte 0");
+        memset(m2, 0, mb);   /* the block-rounded prefix copy is a plain memcpy */
+        memcpy(m2, m1, kvq_ikey_mirror_bytes((size_t)33));   /* keep rows [0,33): blocks 0..1, rows 0..63, whole */
+        int moved = 0;
+        for (int t = 0; t < 64; t++) {
+            kvq_unpack_ikey(a, m1, t); kvq_unpack_ikey(b, m2, t);
+            if (memcmp(a, b, sizeof a)) moved++;
+        }
+        CHECK(moved == 0, "prefix: %d of the 64 rows a 33-row keep covers moved", moved);
+        kvq_ikey_row_gather(row, m1, 33); kvq_ikey_row_scatter(m2, 33, row);   /* a write inside the kept blocks */
+        kvq_ikey_row_gather(row2, m2, 33);
+        CHECK(memcmp(row, row2, KVQ_IKEY_BYTES) == 0, "prefix: a staged write inside the kept blocks did not land");
+    }
+    free(m1); free(m2);
+    /* park's block rounding: a row a `per` positions, whole blocks kept */
+    static const struct { int n, rows; size_t want; } pk[] = {
+        {1, 96, (size_t)32 * KVQ_IKEY_BYTES}, {63, 96, (size_t)32 * KVQ_IKEY_BYTES},
+        {64, 96, (size_t)32 * KVQ_IKEY_BYTES}, {65, 96, (size_t)64 * KVQ_IKEY_BYTES},
+        {193, 96, (size_t)96 * KVQ_IKEY_BYTES}, {10000, 96, (size_t)96 * KVQ_IKEY_BYTES},
+    };
+    for (size_t i = 0; i < sizeof pk / sizeof *pk; i++) {
+        ColiParkPart p = coli_park_per_blocks((void *)1, KVQ_IKEY_BYTES, pk[i].rows, 2, KVQ_IKEY_BLOCK);
+        CHECK(coli_park_part_bytes(&p, pk[i].n) == pk[i].want,
+              "park: %d positions keep %zu B, not the whole-block %zu", pk[i].n,
+              coli_park_part_bytes(&p, pk[i].n), pk[i].want);
+    }
+    /* the window ring's slide: the last W of N rows in, position p to slot p % win.
+     * The fp32 code's two memcpy arms land there; the packed writer (a pack a row from
+     * the fp32 scratch) must land on the same slots -- the ring stays linear, only its
+     * row changed width, so a raw two-arm byte slide would agree too */
+    enum { W = 8, N = 11 };
+    float kv[N * 512];
+    uint8_t ring[W * KVQ_WIN_BYTES], ref[W * KVQ_WIN_BYTES];
+    srand(31);
+    for (int i = 0; i < N * 512; i++) kv[i] = (float)((rand() % 2001) - 1000) / 500.0f;
+    memset(ref, 0, sizeof ref);
+    for (int p = 0; p < N; p++) kvq_pack_win(ref + (size_t)(p % W) * KVQ_WIN_BYTES, kv + (size_t)p * 512);
+    memset(ring, 0, sizeof ring);
+    for (int p = N - W; p < N; p++) kvq_pack_win(ring + (size_t)(p % W) * KVQ_WIN_BYTES, kv + (size_t)p * 512);
+    CHECK(memcmp(ring, ref, sizeof ring) == 0, "slide: the packed tail is not the per-position pack");
+    printf("OK kv-quant host blocks: staging bit for bit, the prefix whole, park rounded, the slide linear\n");
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);   /* a crash's prints must not sit in the buffer */
+    host_block_tests();   /* no device needed */
     if (!coli_vk_init("shaders/chain_dsv4.spv") || !coli_vk_available()) {
         fprintf(stderr, "vk-kv-quant: no Vulkan device -- skipped\n"); return 0;
     }
