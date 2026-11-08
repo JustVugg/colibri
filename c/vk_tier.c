@@ -64,7 +64,9 @@ typedef struct {
 } VSlot;
 /* dev: the place (place_of); src: a promotion's host pool copy, copied up instead of buf */
 typedef struct { int layer, eid, dev; uint8_t *buf; ColiVkExpert *src; } VQ;
-/* hg, hu, hd: vkt_put's copy in the host pool beside a device's (T.full) */
+/* hg, hu, hd: vkt_put's copy in the host pool beside a device's (T.full); copy_failed: 1 the
+ * copy failed, 2 refused and vkt_give_back would not wait (T.drain): counted as refused,
+ * but the budget stands in both */
 typedef struct { int layer, eid, ok, copy_failed; ColiVkTensor *g, *u, *d, *hg, *hu, *hd; } VDone;
 /* streaming: a staging slot (an expert's three tensors on the device, filled again for
  * every expert it carries) and a sub-batch in flight */
@@ -143,6 +145,7 @@ static struct {
     VQ q[VKT_QCAP]; int qh, qn;
     VDone *done; int ndone, cdone;
     unsigned long room_gen;
+    int drain;   /* vkt_give_back waits for the queue: an upload refused for room fails at once, nobody will make room */
     /* evicted, freed at the next quiescent point */
     int *evict; int nevict, cevict;
     /* the coldest residents, refreshed once per forward */
@@ -430,13 +433,14 @@ static void promote_copy(const VQ *e) {
         if (!src[k] || frees >= 3 || waited >= 600 || T.sync) break;
         pthread_mutex_lock(&T.mx);
         unsigned long gen = T.room_gen;
-        while (T.room_gen == gen && !T.stop && waited < 600) {
+        while (T.room_gen == gen && !T.stop && !T.drain && waited < 600) {
             struct timespec until; clock_gettime(CLOCK_REALTIME, &until);
             until.tv_nsec += 100 * 1000000L; if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
             if (pthread_cond_timedwait(&T.cv_room, &T.mx, &until) == ETIMEDOUT) waited++;
         }
         if (T.room_gen != gen) frees++;
-        int stop = T.stop;
+        int stop = T.stop || T.drain;
+        if (T.drain) copy_failed = 2;
         pthread_mutex_unlock(&T.mx);
         if (stop) break;
     }
@@ -484,7 +488,7 @@ static void *uploader(void *arg) {
         const uint8_t *g = b, *u = g + guc, *d = u + guc;
         const uint8_t *gs = d + dc, *us = gs + gus, *ds = us + gus;
         ColiVkTensor *t[3];
-        int ok = 0, r = 0;
+        int ok = 0, r = 0, drained = 0;
         /* Refused: the pool is at its budget until the engine thread frees the victim
          * this promotion displaced, at its next quiescent point (a join: every layer
          * in decode, after a chunk's CPU work in prefill). Wait for room to be made
@@ -499,19 +503,20 @@ static void *uploader(void *arg) {
             if (ok || r < 0 || frees >= 3 || waited >= 600 || T.sync) break;
             pthread_mutex_lock(&T.mx);
             unsigned long gen = T.room_gen;
-            while (T.room_gen == gen && !T.stop && waited < 600) {
+            while (T.room_gen == gen && !T.stop && !T.drain && waited < 600) {
                 struct timespec until; clock_gettime(CLOCK_REALTIME, &until);
                 until.tv_nsec += 100 * 1000000L; if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
                 if (pthread_cond_timedwait(&T.cv_room, &T.mx, &until) == ETIMEDOUT) waited++;
             }
             if (T.room_gen != gen) frees++;
-            int stop = T.stop;
+            int stop = T.stop || T.drain;
+            if (T.drain) drained = 1;
             pthread_mutex_unlock(&T.mx);
             if (stop) break;
         }
         free(e.buf);
         if (!ok) t[0] = t[1] = t[2] = NULL;
-        push_done(e.layer, e.eid, ok, r < 0, t, NULL);
+        push_done(e.layer, e.eid, ok, r < 0 ? 1 : drained ? 2 : 0, t, NULL);
     }
 }
 
@@ -607,7 +612,7 @@ static void quiesce(void) {
             }
             for (int k = 0; k < 3; k++) { ColiVkTensor *t = k == 0 ? d[i].g : k == 1 ? d[i].u : d[i].d; if (t) coli_vk_tensor_free(t); }
             T.failed++;
-            if (d[i].ok) T.f_sets++; else if (d[i].copy_failed) T.f_copy++; else T.f_pool++;
+            if (d[i].ok) T.f_sets++; else if (d[i].copy_failed == 1) T.f_copy++; else T.f_pool++;
             if (!d[i].ok && !d[i].copy_failed && T.dmax[0] > T.dres[0] + T.dque[0]) {
                 T.max_resident -= T.dmax[0] - (T.dres[0] + T.dque[0]);
                 T.dmax[0] = T.dres[0] + T.dque[0];
@@ -631,10 +636,11 @@ static void quiesce(void) {
             v->state = VS_NONE; set_place(v, 0);
             if (dv && !T.d2) continue;
             T.failed++;
-            if (d[i].ok) T.f_sets++; else if (d[i].copy_failed) T.f_copy++; else T.f_pool++;
+            if (d[i].ok) T.f_sets++; else if (d[i].copy_failed == 1) T.f_copy++; else T.f_pool++;
             /* refused: the budget holds fewer than the count said (fragmentation, or the
              * device ran out first): stop planning past what is there. A failed copy gave
-             * its room back: the budget stands, the expert may come again. */
+             * its room back, and a refusal vkt_give_back cut short says nothing of the pool:
+             * the budget stands, the expert may come again. */
             if (!d[i].copy_failed && kd && T.xmax > T.xres + T.xque) T.xmax = T.xres + T.xque;
             if (!d[i].copy_failed && !kd && T.dmax[pl] > T.dres[pl] + T.dque[pl]) {
                 T.max_resident -= T.dmax[pl] - (T.dres[pl] + T.dque[pl]);
@@ -3004,7 +3010,9 @@ size_t vkt_stage_room(void) { return vkt_host_pool_on() ? T.stage_room : 0; }
  * `bytes`. Their residents go back to their host pool copies (T.full: the hybrid steps compute
  * them on the CPU, as promote's victims) or out of the tier; then dmax and the pool's limit
  * drop by what left, which releases the emptied blocks to the driver. The uploader is let
- * finish first, so no copy is landing in a block being emptied. */
+ * finish first, so no copy is landing in a block being emptied: what is freed so far goes
+ * first, and an upload still refused then fails at once (T.drain), since the room it would
+ * wait for can only come from this thread. */
 #ifndef VKT_NO_GIVE_BACK
 static int gb_cmp_heat(const void *a, const void *b) {
     const double *h = (const double *)a, *k = (const double *)b;   /* {heat, index} pairs */
@@ -3016,8 +3024,11 @@ size_t vkt_give_back(size_t bytes) {
     (void)bytes; return 0;
 #else
     if (!T.on || !bytes || T.inflight) return 0;
+    quiesce();
     pthread_mutex_lock(&T.mx);
+    T.drain = 1; pthread_cond_broadcast(&T.cv_room);
     while ((T.qn || T.busy) && T.th_on && !T.stop) pthread_cond_wait(&T.cv_done, &T.mx);
+    T.drain = 0;
     pthread_mutex_unlock(&T.mx);
     quiesce();
     if (T.inflight || T.nevict || T.ndfree) return 0;

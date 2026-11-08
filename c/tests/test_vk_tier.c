@@ -15,6 +15,9 @@
  *   sync     COLI_VK_TIER_SYNC=1 and a budget of two experts: a promotion that
  *            displaces a resident while a batch is in flight finds its room at
  *            the join (no failed upload, the budget holds);
+ *   give back an upload the pool refuses waits for room only the engine thread makes:
+ *            vkt_give_back, on that thread, does not wait with it, and the budget
+ *            stands: the experts come once the pool has room;
  *   books    device + CPU = routed, resident <= budget, no failed upload;
  *   v4       DeepSeek V4's activation (route weight on the device, its bf16 and E4M3
  *            roundings): device rows against the engine's CPU arithmetic;
@@ -68,6 +71,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 #include <unistd.h>
 #include "../backend_vulkan.h"
 #include "../vk_tier.h"
@@ -612,6 +616,47 @@ static void sync_evict(void) {
     CHECK(vkt_resident(0, 5) && !vkt_resident(0, 1) && res == 2,
           "sync: expert 5 did not displace expert 1 (resident 1 %d, 5 %d, all %d of a budget of 2)", vkt_resident(0, 1), vkt_resident(0, 5), res);
     CHECK(worst < 2e-3, "sync: relative error %.3g", worst);
+    vkt_shutdown(); model_free();
+}
+
+/* The pool at a limit that refuses every block: the promotions' uploads are refused and
+ * wait for room that nothing frees, up to a minute each. vkt_give_back, on the engine
+ * thread, used to wait for them all. Now it returns at once; a refusal it cut short says
+ * nothing of the pool, so with the limit back the same experts become resident. */
+static void give_back_refused(void) {
+    VktFmt f = {VKT_SRC_I8_ROW, 0};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    set_budget(8, f, f);
+    setenv("COLI_VK_TIER_RATE", "64", 1);
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+    int on = vkt_init(&vc, NULL);
+    CHECK(on, "give back: the tier did not start");
+    if (!on) { model_free(); return; }
+    ColiVkPoolStats st; coli_vk_pool_stats(1, &st);
+    coli_vk_tier_pool_limit(4096);
+    Books bk = {0, 0}; double worst = 0;
+    int idx[K] = {0, 1, 2}; float w[K] = {0.5f, 0.3f, 0.2f};
+    for (int t = 0; t < 4; t++) { vkt_begin_forward(); double r = step(0, 1, idx, w, &bk); if (r > worst) worst = r; }
+    usleep(300 * 1000);   /* the uploader meets the limit and waits */
+    struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
+    vkt_give_back(1);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    const double took = (double)(b.tv_sec - a.tv_sec) + (double)(b.tv_nsec - a.tv_nsec) / 1e9;
+    unsigned long long ev, failed;
+    report_counts(&ev, &failed);
+    coli_vk_tier_pool_limit(st.limit);
+    int res = 0;
+    for (int t = 0; t < 500 && res < K; t++) {   /* the uploader's thread: not at once */
+        vkt_begin_forward();
+        double r = step(0, 1, idx, w, &bk); if (r > worst) worst = r;
+        res = vkt_resident(0, 0) + vkt_resident(0, 1) + vkt_resident(0, 2);
+        if (res < K) usleep(10 * 1000);
+    }
+    printf("  give back: returned in %.3f s, %llu refused; with room, %d of %d resident\n", took, failed, res, K);
+    CHECK(took < 10, "give back: waited %.1f s for uploads refused for room", took);
+    CHECK(failed >= 1 && failed != ~0ull, "give back: no upload was refused (%llu), the case tested nothing", failed);
+    CHECK(res == K, "give back: %d of %d experts resident with room back (the budget shrank)", res, K);
+    CHECK(worst < 2e-3, "give back: relative error %.3g", worst);
     vkt_shutdown(); model_free();
 }
 
@@ -1680,6 +1725,7 @@ int main(int argc, char **argv) {
     v4_hybrid_case();
     printf("pool copy:\n"); pool_copy_case();
     printf("host pairs:\n"); host_pairs_case(2e-3);
+    printf("give back:\n"); give_back_refused();   /* last: its steps' count depends on the uploader's timing, and the routes above on the generator's state */
     ColiVkPoolStats ps, px; coli_vk_pool_stats(1, &ps); coli_vk_pool_stats(4, &px);
     CHECK(ps.live == 0 && px.live == 0, "%d + %d tier ranges still live after every shutdown", ps.live, px.live);
     coli_vk_shutdown();   /* with staged uploads: where the experts were ("[VK] memory at exit") */
