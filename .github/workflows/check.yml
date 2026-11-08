@@ -51,6 +51,11 @@ jobs:
     # 2026-10-20: reached again. The job took 45 to 57 minutes when it passed
     # (#2265 twice, #2266), and was cancelled at 60 twice, once 5 seconds after
     # its 2695 tests had passed (#2267). 90.
+    # 2026-11-07: 87.3 minutes on #2693, then cancelled at 90 on #2695 with the
+    # Python suite running, after 81 minutes of building: make check built one
+    # file at a time here while the Linux job builds on every core (ae39ec4c).
+    # It builds on every core now; make test still runs the C and the Python
+    # suites one after the other.
     timeout-minutes: 90
     defaults:
       run:
@@ -66,7 +71,7 @@ jobs:
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-python
       - name: make check
-        run: make -C c check
+        run: make -C c -j"$(nproc)" check
 
       # The Windows engine as this branch builds it. Small, and it makes an
       # antivirus false-positive report (#527) verifiable on a PR instead of

@@ -2063,17 +2063,20 @@ jobs:
           make colibri CUDA_DLL=1
           test -f colibri.exe || { echo "colibri CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
           echo "colibri.exe built against the DLL loader"
-          # qwen36.exe, not qwen36: only colibri has a phony alias; the bare
-          # name falls into make's builtin rule and links qwen36.c alone.
+          # qwen36.exe: the real target of c/Makefile (on Windows the bare engine
+          # names are phony aliases of these .exe targets).
           make qwen36.exe CUDA_DLL=1
           test -f qwen36.exe || { echo "qwen36 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
           echo "qwen36.exe built against the DLL loader"
-          # kimi_k3 links the same loader: three engines share coli_cuda.dll.
+          # kimi_k3 and glm53 link the same loader: four engines share coli_cuda.dll.
           # deepseek_v4 has its own DLL (coli_cuda_dsv4.dll, Makefile.deepseek-v4)
           # and joins in a later step; inkling's CUDA object has no Windows loader.
           make kimi_k3.exe CUDA_DLL=1
           test -f kimi_k3.exe || { echo "kimi_k3 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
           echo "kimi_k3.exe built against the DLL loader"
+          make glm53.exe CUDA_DLL=1
+          test -f glm53.exe || { echo "glm53 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
+          echo "glm53.exe built against the DLL loader"
       - name: make cuda-dsv4-dll and cuda-dsv4-dg-dll (DeepSeek V4, as the release ships them)
         shell: msys2 {0}
         run: |
@@ -2118,6 +2121,7 @@ jobs:
             c/colibri.exe
             c/qwen36.exe
             c/kimi_k3.exe
+            c/glm53.exe
 
   web:
     name: Web UI
@@ -2221,7 +2225,12 @@ jobs:
       - name: Install torch (CPU) + transformers
         run: pip install -r c/tools/oracle-requirements.txt
       - name: Build every engine (NEON branches must compile)
-        run: make -C c colibri inkling kimi_k3 olmoe
+        run: make -C c colibri inkling kimi_k3 olmoe qwen36
+      - name: "Expert FFN: NEON dots bit-exact against the scalar reference"
+        run: |
+          cd c
+          make tests/test_expert_ffn
+          OMP_NUM_THREADS=2 ./tests/test_expert_ffn
       - name: "DeepSeek V4 FP4 expert kernels: NEON arm bit-exact against the scalar arm (#1696)"
         run: |
           cd c

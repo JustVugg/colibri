@@ -17,6 +17,7 @@
 #include "vk_alloc.h"
 #include "vk_load.h"
 #include "shaders/chain_qsa.h"
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -269,6 +270,8 @@ VkcBuf *vkc_buf(size_t bytes, int kind) {
     VkcBuf *b = calloc(1, sizeof *b);
     if (!b) return NULL;
     b->kind = kind; b->bytes = bytes; b->d = g_kd;
+    /* the pools' types come from a probe with these usages (backend_vulkan.c, vk_buffer_types):
+     * a usage added here goes there too */
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = bytes,
         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,   /* vkc_moe_rows' dispatches */
@@ -505,10 +508,23 @@ static uint32_t kc_shared_limit(void) {
 #ifndef VKC_SANITIZED
 #define VKC_SANITIZED 0
 #endif
+/* vkc_init's ways out, each said: an engine whose vkc_init fails takes its per-matrix path, and
+ * on an Arc Pro B60 (Mesa ANV) the chain stayed off at its first device buffer without a line,
+ * its memory type one the buffers do not take (backend_vulkan.c, pick_memtype). Returns 0. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((format(printf, 1, 2)))
+#endif
+static int init_off(const char *fmt, ...) {
+    char why[256];
+    va_list ap;
+    va_start(ap, fmt); vsnprintf(why, sizeof why, fmt, ap); va_end(ap);
+    fprintf(stderr, "[VK] %schain: %s, the chain stays off\n", g_kd ? "dev2 " : "", why);
+    return 0;
+}
 static void ev_setup(void);
 int vkc_init(void) {
     if (KC.ready) return !KC.lost;
-    if (!coli_vk_core_dev(g_kd, &KC.core)) return 0;
+    if (!coli_vk_core_dev(g_kd, &KC.core)) return init_off("no device ready (not started, or lost)");
     KC.dev = (VkDevice)KC.core.device; KC.queue = (VkQueue)KC.core.queue;
     /* 20 s tells a GPU that hangs. A software device (llvmpipe) generates a shader's code
      * at its first launch, inside the frame's wait, and caches it on disk: on a CI runner's
@@ -533,19 +549,19 @@ int vkc_init(void) {
     VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .bindingCount = VKC_BIND, .pBindings = b};
     VkPushConstantRange pr = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = 128};
-    if (vkCreateDescriptorSetLayout(KC.dev, &li, NULL, &KC.dsl) != VK_SUCCESS) return 0;
+    VkResult r;
+    if ((r = vkCreateDescriptorSetLayout(KC.dev, &li, NULL, &KC.dsl)) != VK_SUCCESS)
+        return init_off("its descriptor set layout was refused (%d)", (int)r);
     VkPipelineLayoutCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1, .pSetLayouts = &KC.dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
-    if (vkCreatePipelineLayout(KC.dev, &pi, NULL, &KC.pl) != VK_SUCCESS) return 0;
+    if ((r = vkCreatePipelineLayout(KC.dev, &pi, NULL, &KC.pl)) != VK_SUCCESS)
+        return init_off("its pipeline layout was refused (%d)", (int)r);
     for (int i = 0; i < P_NPIPE; i++) {
         KC.mod[i] = load_module(KC.core.spv_path, pipe_file[i]);
-        if (!KC.mod[i] || !(KC.pipe[i] = make_pipe(KC.mod[i], NULL))) {
-            fprintf(stderr, "[VK] chain: shader %s unavailable, the chain stays off\n", pipe_file[i]);
-            return 0;
-        }
+        if (!KC.mod[i] || !(KC.pipe[i] = make_pipe(KC.mod[i], NULL))) return init_off("shader %s unavailable", pipe_file[i]);
     }
     KC.mod_dnrec = load_module(KC.core.spv_path, "chain_dnrec.spv");
-    if (!KC.mod_dnrec) return 0;
+    if (!KC.mod_dnrec) return init_off("shader chain_dnrec.spv unavailable");
     /* the vectorized decode GEMV, its x staging as large as the device's shared memory
      * allows (16 KiB floats at most); COLI_VK_CHAIN_GEMV=0 keeps qmatmul.comp's */
     {
@@ -689,13 +705,15 @@ int vkc_init(void) {
     }
     VkCommandPoolCreateInfo cp = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = KC.core.qfam};
-    if (vkCreateCommandPool(KC.dev, &cp, NULL, &KC.cpool) != VK_SUCCESS) return 0;
+    if ((r = vkCreateCommandPool(KC.dev, &cp, NULL, &KC.cpool)) != VK_SUCCESS)
+        return init_off("its command pool was refused (%d)", (int)r);
     for (int i = 0; i < VKC_FRAMES; i++) {
         VkCommandBufferAllocateInfo ca = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
             .commandPool = KC.cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
         VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        if (vkAllocateCommandBuffers(KC.dev, &ca, &KC.fr[i].cmd) != VK_SUCCESS ||
-            vkCreateFence(KC.dev, &fi, NULL, &KC.fr[i].fence) != VK_SUCCESS) return 0;
+        if ((r = vkAllocateCommandBuffers(KC.dev, &ca, &KC.fr[i].cmd)) != VK_SUCCESS ||
+            (r = vkCreateFence(KC.dev, &fi, NULL, &KC.fr[i].fence)) != VK_SUCCESS)
+            return init_off("frame %d's command buffer or fence was refused (%d)", i, (int)r);
     }
     if (g_kd == 0 && coli_vk_timeline() && hyb_load(KC.dev)) {
         VkSemaphoreTypeCreateInfo st = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE};
@@ -728,10 +746,17 @@ int vkc_init(void) {
         KC.pool[k].mapped = memtype_host_visible(KC.pool[k].memtype);
         vka_pool_init(&KC.pool[k].p, coli_vk_block_bytes_dev(g_kd, VKC_BLOCK), 0);   /* smaller under COLI_VK_DEVICE_CAP_MB */
     }
-    if (!KC.pool[VKC_UP].mapped || !KC.pool[VKC_DOWN].mapped) return 0;
+    if (!KC.pool[VKC_UP].mapped || !KC.pool[VKC_DOWN].mapped)
+        return init_off("its upload or read-back memory type (%u, %u) is not host-visible",
+                        KC.pool[VKC_UP].memtype, KC.pool[VKC_DOWN].memtype);
     KC.ready = 1;
     KC.dummy = vkc_buf(256, VKC_DEV);
-    if (!KC.dummy) { KC.ready = 0; return 0; }
+    if (!KC.dummy) {   /* its first device buffer, and with it the device pool's first block */
+        KC.ready = 0;
+        return init_off("its first device buffer was refused (memory type %u: the buffer, its pool's first block of "
+                        "%llu KiB, or the binding)", KC.pool[VKC_DEV].memtype,
+                        (unsigned long long)(KC.pool[VKC_DEV].p.block_bytes >> 10));
+    }
     ev_setup();
     return 1;
 }
@@ -1611,36 +1636,78 @@ static VkPipeline attn_h_pipe(void) {
  * KV cache S * H times, which held a 2048-row chunk of Qwen3.6 at 1.2 s a layer on a
  * Radeon 780M. From COLI_VK_ATTN_BLOCK rows (16; 0 = never) a call takes chain_attnb,
  * one workgroup per KV head and block of rows: each K and V row read once per block.
- * Below it, and for decode and an MTP verify, chain_attn's bits as before. */
-static struct { VkShaderModule mod; VkPipeline pipe, pipe_h; int tried, tried_h, bc; } g_kab[2];
+ * Below it, and for decode and an MTP verify, chain_attn's bits as before.
+ * The head dims fixed in the pipeline (the shader's HDC and VDC), one a (head dim, V's head
+ * dim, cache type, vec): no test of each dim against the push constants, and with vec a
+ * float16 cache's K and V a uvec4 a load. An Arc Pro B60 at subgroups of 16, Qwen3.6 over
+ * 16K positions with a float16 cache: a 255-row chunk 185.1 -> 25.7 ms (in 2^32 slices at the
+ * reported 32: 485.4 -> 130.0 ms), 4096 rows in 2^36 slices 2.32 -> 0.32 s (32K: 5.66 -> 0.78 s); a float32
+ * cache about 3 times faster. Their q.k sums are the fused multiply-adds in order, what the
+ * generic pipeline's compile to where the driver fuses a*b + c, and not one output bit moved:
+ * on the B60 (Mesa ANV 26.0.8, tiles of 8 positions) in every form the shader takes
+ * (test_vk_chain's blocked cases) and in those chunks of 255 to 4096 rows at 16K and 32K
+ * positions, either cache, at subgroups of 16 and 32; on Lavapipe (tiles of 8) in every form.
+ * So they are the default there only: ANV on Xe2 (its smallest subgroup 16) and Lavapipe, at
+ * tiles of 8 or 4. Other Intel GPUs under ANV, tiles of 16 (64 KiB of shared memory) and
+ * other drivers keep the generic pipeline, one a cache type, unless
+ * COLI_VK_ATTN_BLOCK_FIXED=1 (0: the generic one everywhere). VKC_KAB_MAX shapes: a model
+ * takes one or two head-dim pairs a cache type, with and without vec; the last two places are
+ * the generic pipelines', which a shape past the others takes, as one whose fixed pipeline
+ * failed does (the same bits where the fixed ones are the default). */
+#define VKC_KAB_MAX 32
+static struct {
+    VkShaderModule mod; int tried, bc, fixed, n;
+    VkPipeline p[VKC_KAB_MAX]; int hd[VKC_KAB_MAX], vd[VKC_KAB_MAX], kv[VKC_KAB_MAX], vec[VKC_KAB_MAX];
+} g_kab[2];
 #define KAB (g_kab[g_kd])
-static VkPipeline kab_pipe(void) {
-    if (g_kvh && KAB.pipe && !KAB.pipe_h && !KAB.tried_h) {   /* a float16 cache's twin */
-        KAB.tried_h = 1;
-        int32_t v[2] = {KAB.bc, 1};
-        VkSpecializationMapEntry me[2] = {{0, 0, 4}, {7, 4, 4}};
-        VkSpecializationInfo si = {2, me, sizeof v, v};
-        KAB.pipe_h = make_pipe(KAB.mod, &si);
+static VkPipeline kab_pipe(int hd, int vd, int kv16, int vec) {
+    if (!KAB.mod) {
+        if (KAB.tried || !vkc_ready()) return VK_NULL_HANDLE;
+        KAB.tried = 1;
+        /* the tile of positions as the device's shared memory allows: K and V rows of 256
+         * floats, the partial dots and the scores, about 3.2 KiB a position */
+        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
+        int bc = 16;
+        while (bc >= 4 && (size_t)bc * (2 * 256 + 32 * 8 + 32 + 1) * 4 > pp.limits.maxComputeSharedMemorySize) bc /= 2;
+        if (bc < 4 || !(KAB.mod = load_module(KC.core.spv_path, "chain_attnb.spv"))) return VK_NULL_HANDLE;
+        KAB.bc = bc;
+        VkPhysicalDeviceDriverProperties dp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &dp};
+        if (pp.apiVersion >= VK_API_VERSION_1_2) vkGetPhysicalDeviceProperties2((VkPhysicalDevice)KC.core.phys, &p2);
+        uint32_t min_sg = 0;
+        if (dp.driverID == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) {   /* ANV has subgroup size control on every GPU it drives */
+            VkPhysicalDeviceSubgroupSizeControlPropertiesEXT sp = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT};
+            VkPhysicalDeviceProperties2 s2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sp};
+            vkGetPhysicalDeviceProperties2((VkPhysicalDevice)KC.core.phys, &s2);
+            min_sg = sp.minSubgroupSize;
+        }
+        KAB.fixed = bc <= 8 && (dp.driverID == VK_DRIVER_ID_MESA_LLVMPIPE ||
+                                (dp.driverID == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA && min_sg == 16));   /* measured: Xe2, Lavapipe */
     }
-    if (KAB.pipe || KAB.tried || !vkc_ready()) return g_kvh ? KAB.pipe_h : KAB.pipe;
-    KAB.tried = 1;
-    /* the tile of positions as the device's shared memory allows: K and V rows of 256
-     * floats, the partial dots and the scores, about 3.2 KiB a position */
-    VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
-    int bc = 16;
-    while (bc >= 4 && (size_t)bc * (2 * 256 + 32 * 8 + 32 + 1) * 4 > pp.limits.maxComputeSharedMemorySize) bc /= 2;
-    if (bc < 4) return VK_NULL_HANDLE;
-    if ((KAB.mod = load_module(KC.core.spv_path, "chain_attnb.spv"))) {
-        int32_t v = bc;
-        VkSpecializationMapEntry me = {0, 0, 4};
-        VkSpecializationInfo si = {1, &me, 4, &v};
-        if ((KAB.pipe = make_pipe(KAB.mod, &si))) KAB.bc = bc;
-    }
-    return g_kvh && KAB.pipe ? kab_pipe() : KAB.pipe;
+    const char *e = getenv("COLI_VK_ATTN_BLOCK_FIXED");   /* each call, as COLI_VK_ATTN_BLOCK (tests switch it) */
+    if (!(e && *e ? *e == '1' : KAB.fixed)) hd = vd = vec = 0;
+    const int fixed = hd || vd || vec;
+    for (int i = 0; i < KAB.n; i++)
+        if (KAB.hd[i] == hd && KAB.vd[i] == vd && KAB.kv[i] == kv16 && KAB.vec[i] == vec)
+            return KAB.p[i] || !fixed ? KAB.p[i] : kab_pipe(0, 0, kv16, 0);
+    if (fixed && KAB.n >= VKC_KAB_MAX - 2) return kab_pipe(0, 0, kv16, 0);   /* the last two places: the generic ones' */
+    if (KAB.n == VKC_KAB_MAX) return VK_NULL_HANDLE;
+    int32_t sv[5] = {KAB.bc, hd, vd, vec, kv16};
+    VkSpecializationMapEntry me[5] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}, {7, 16, 4}};
+    VkSpecializationInfo si = {5, me, sizeof sv, sv};
+    VkPipeline p = make_pipe(KAB.mod, &si);   /* kept when it fails too: not tried again */
+    KAB.p[KAB.n] = p; KAB.hd[KAB.n] = hd; KAB.vd[KAB.n] = vd; KAB.kv[KAB.n] = kv16; KAB.vec[KAB.n++] = vec;
+    if (!p && fixed)
+        fprintf(stderr, "[VK] %schain: chain_attnb's pipeline for head dims %d/%d (a %s cache%s) failed: its generic one "
+                "instead\n", g_kd ? "dev2 " : "", hd, vd, kv16 ? "float16" : "float32", vec ? ", uvec4 loads" : "");
+    else if (!p)
+        fprintf(stderr, "[VK] %schain: chain_attnb's pipeline (a %s cache) failed: no blocked attention\n", g_kd ? "dev2 " : "",
+                kv16 ? "float16" : "float32");
+    return p || !fixed ? p : kab_pipe(0, 0, kv16, 0);
 }
 static void kab_shutdown(void) {
-    if (KAB.pipe) vkDestroyPipeline(KC.dev, KAB.pipe, NULL);
-    if (KAB.pipe_h) vkDestroyPipeline(KC.dev, KAB.pipe_h, NULL);
+    for (int i = 0; i < KAB.n; i++) if (KAB.p[i]) vkDestroyPipeline(KC.dev, KAB.p[i], NULL);
     if (KAB.mod) vkDestroyShaderModule(KC.dev, KAB.mod, NULL);
     memset(&KAB, 0, sizeof KAB);
 }
@@ -1653,22 +1720,50 @@ static void kab_shutdown(void) {
  * frame it is in (submitted, not waited for) and the next opening a frame of its own: the
  * next frame's first barrier orders it after the slice. A slice starts at a multiple of
  * `align` (the blocked attention's rows per workgroup), so its blocks are the ones the
- * whole dispatch would have made, and no row's arithmetic changes. */
+ * whole dispatch would have made, and no row's arithmetic changes.
+ * The budget alone starves a big GPU: chain_attnb makes a workgroup of a KV head and 32 / G
+ * rows, so Qwen3.6's 16K prompt went in slices of 64 rows, 32 workgroups, to an Arc Pro B60
+ * that keeps 80 resident (20 Xe-cores x 4) and runs 2 to 40 of them in the same 90 ms; raising
+ * the budget to 2^36 took its 16K prompt from 118.5 to 74.4-75.7 s and its 32K one from 741.6
+ * to 262.7. So a slice is cut to keep COLI_VK_ATTN_SLICE_WG workgroups (64,
+ * most of the B60's 80; 0 = the budget alone), `wg` of them a block of `align` rows, as far as
+ * 4x the budget's work (up to 7x the budget's own slice where that one rounds down to one
+ * block), and a chunk's rows then go in slices of one size on the blocks, not full ones and a
+ * last of a few blocks (so some, and the last, may keep fewer). One layer of that prompt
+ * replayed on the B60 (4096-row chunks, this chain_attnb): 16K 9.31 -> 6.04 s, 161 -> 112
+ * submissions, the longest 90 -> 94 ms; 32K 69.0 -> 24.2 s, 592 -> 240, 180 -> 188 ms. An
+ * integrated GPU keeps the budget alone (0) until one is measured: the budget is there for
+ * the slow GPUs a driver's timeout catches (the 780M above; Windows' TDR at 2 s). */
 static long long attn_slice_budget(void) {
     const char *e = getenv("COLI_VK_ATTN_SLICE");
     long long v = e && *e ? atoll(e) : (1LL << 32);
     return v < 0 ? 0 : v;
 }
 long long vkc_attn_slice_budget(void) { return attn_slice_budget(); }
-static int attn_slice_rows(int S, int pos_base, double width, int align) {
+static int attn_slice_wg(void) {
+    const char *e = getenv("COLI_VK_ATTN_SLICE_WG");
+    int v = e && *e ? atoi(e) : KC.core.integrated ? 0 : 64;
+    return v < 0 ? 0 : v;
+}
+static int attn_slice_rows(int S, int pos_base, double width, int align, int wg) {
     long long b = attn_slice_budget();
     if (align < 1) align = 1;
+    if (wg < 1) wg = 1;
     if (!b || S <= align) return S;
     double per_row = (double)(pos_base + S) * (width > 1 ? width : 1);
-    long long rr = (long long)((double)b / per_row);
+    long long rr = (long long)((double)b / per_row), mw = attn_slice_wg();
     rr = rr / align * align;
     if (rr < align) rr = align;
-    return rr >= S ? S : (int)rr;
+    if (!mw) return rr >= S ? S : (int)rr;
+    long long fl = (mw + wg - 1) / wg * align;   /* the floor's rows */
+    if (rr < fl) {   /* up to the floor, as far as 4x the budget's rows */
+        long long cap = (long long)(4.0 * (double)b / per_row) / align * align;
+        if (cap > fl) cap = fl;
+        if (cap > rr) rr = cap;
+    }
+    if (rr >= S) return S;
+    long long k = (S + rr - 1) / rr;   /* that many slices, of one size on the blocks */
+    return (int)(((S + k - 1) / k + align - 1) / align * align);
 }
 static int attn_slice_next(void) {   /* the open frame out, a new one in */
     KC.st.attn_slices++;
@@ -1734,9 +1829,16 @@ static int attn_dec_len(int n, int H) {   /* chain_attn_dec.comp's dec_len, H th
     while (L < 256 && (int64_t)H * nb > 1024) { L *= 2; nb = (n + L - 1) / L; }
     return L;
 }
+/* COLI_VK_ATTN_DEC, the knob (not chain_attn_dec.comp's modes), read on each call as
+ * COLI_VK_ATTN_BLOCK is (test_vk_chain switches it): 0 keeps chain_attn; unset (1) takes
+ * chain_attn_dec where attn_dec's rule allows; 2 also on a device without the flash module
+ * (attn_dec) */
+static int adec_knob(void) {
+    const char *e = getenv("COLI_VK_ATTN_DEC");
+    return e && *e == '0' ? 0 : e && atoi(e) == 2 ? 2 : 1;
+}
 static VkPipeline adec_pipe(void) {
-    static int on = -1;
-    if (on < 0) { const char *e = getenv("COLI_VK_ATTN_DEC"); on = !(e && *e == '0'); }
+    int on = adec_knob() > 0;
     if (on && !KC.adec && !KC.adec_tried) {
         KC.adec_tried = 1;
         if ((KC.mod_adec = load_module(KC.core.spv_path, "chain_attn_dec.spv"))) KC.adec = make_pipe(KC.mod_adec, NULL);
@@ -1747,7 +1849,8 @@ static VkPipeline adec_pipe(void) {
 }
 /* chain_attn_dec's grouped pipeline (mode 2) for gq query heads a KV head of head dim hd, made
  * on first use; NULL where the shared memory it takes (the heads' q rows, scores and sums) is
- * past the device's, or COLI_VK_ATTN_DEC_GQA=0 */
+ * past the device's, or COLI_VK_ATTN_DEC_GQA=0, or where it failed (kept as a pipeline is:
+ * attn_dec asks on every call, and the build is not tried again) */
 static VkPipeline adg_pipe(int hd, int gq) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_VK_ATTN_DEC_GQA"); on = !(e && *e == '0'); }
@@ -1765,8 +1868,7 @@ static VkPipeline adg_pipe(int hd, int gq) {
     int32_t sv[4] = {gq, hd, g_kvh, tpp};
     VkSpecializationMapEntry me[4] = {{0, 0, 4}, {1, 4, 4}, {7, 8, 4}, {2, 12, 4}};
     VkSpecializationInfo si = {4, me, sizeof sv, sv};
-    VkPipeline p = make_pipe(KC.mod_adec, &si);
-    if (!p) return VK_NULL_HANDLE;
+    VkPipeline p = make_pipe(KC.mod_adec, &si);   /* VK_NULL_HANDLE too: mode 0 from then on */
     KC.adg[KC.nadg] = p; KC.adg_hd[KC.nadg] = hd; KC.adg_kv[KC.nadg] = g_kvh; KC.adg_gq[KC.nadg++] = gq;
     return p;
 }
@@ -1798,11 +1900,17 @@ static int attn_dec(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, 
      * answer to the last digit as the prompt recomputed does (tests/test_brio_serve.py).
      * Windows, rings and sinks too, since the flash shader takes them: Flint's decode after a
      * 17K prompt read its full layers' positions a workgroup a head, 15.4 tok/s on an
-     * RTX PRO 4000 */
+     * RTX PRO 4000. COLI_VK_ATTN_DEC=2 (opt-in) gives those bits up on a device without the
+     * flash module, as if it had it: the rest of the rule holds (the grouped pipeline, adg_pipe,
+     * counts on its head dims and float16 offsets), and chain_attn_dec takes no matrix units. An
+     * Arc Pro B60 (Xe2, its cooperative matrices 8 rows tall: no flash module; an SR-IOV VF, Mesa
+     * ANV 26.0.8, the chain on at subgroups of 16) decoded Qwen3.6 after a 16K prompt at 5.03
+     * tok/s, chain_attn's 16 workgroups walking every position, and at 35.52 with =2 (32K: 2.71
+     * -> 33.88; after a short prompt 37.21 -> 38.00), its prompts as fast, the same answers */
     int G = w->a.H / w->a.KVH;
-    if (!(KC.mod_fa && vkc_attn_flash_rows() > 0 && !w->kv_pm && w->vd == w->a.hd &&
+    if (!((KC.mod_fa || adec_knob() == 2) && vkc_attn_flash_rows() > 0 && !w->kv_pm && w->vd == w->a.hd &&
           w->a.hd % 64 == 0 && VKC_FA_ROWS % G == 0 && (!g_kvh || (w->a.k_off % 8 == 0 && w->a.v_off % 8 == 0)) &&
-          fa_pipe(w->a.hd, G))) return 0;
+          (!KC.mod_fa || fa_pipe(w->a.hd, G)))) return 0;
     if (S < 1 || S > VKC_ATTN_DEC_ROWS || n < VKC_ATTN_DEC_MIN || w->a.pos_base + 1 < VKC_ATTN_DEC_MIN || !adec_pipe()) return 0;
     /* a KV head's query heads in one workgroup a block (mode 2), each K and V row read once
      * for them, four floats a load (the offsets whole vec4s). Its blocks' rule counts four
@@ -1828,6 +1936,14 @@ static int attn_dec(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, 
     bd[7].written = 0;
     ok = ok && record(KC.adec, bd, 8, &pc, sizeof pc, (uint32_t)w->a.H, (uint32_t)S, 1);
     KC.st.attn_dec += ok;
+    static int said[2];   /* the opt-in, said where it first takes effect (the split KV cache, say, never does) */
+    if (ok && !KC.mod_fa && !said[g_kd]) {
+        said[g_kd] = 1;
+        fprintf(stderr, "[VK] %schain: COLI_VK_ATTN_DEC=2: attention of up to %d rows (decode, verify, a short prompt "
+                "chunk) over %d positions or more in blocks (chain_attn_dec) with no chain_attn_flash on this device; a "
+                "resumed prefix or a snapshot's scoring may differ in the last digits from a cold recompute (unset: "
+                "chain_attn, the prompt's bits)\n", g_kd ? "dev2 " : "", VKC_ATTN_DEC_ROWS, VKC_ATTN_DEC_MIN);
+    }
     return ok;
 }
 int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, VkcBuf *snk,
@@ -1843,7 +1959,12 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
     VkPipeline fp = KC.mod_fa && fl > 0 && w.a.S >= fl && !(sel && w.a.sel_row > 0) && !w.kv_pm &&
                     w.vd == w.a.hd && w.a.hd % 64 == 0 && VKC_FA_ROWS % G == 0 && (!g_kvh || (w.a.k_off % 8 == 0 && w.a.v_off % 8 == 0))
                     ? fa_pipe(w.a.hd, G) : VK_NULL_HANDLE;
-    int blocked = !fp && blk > 0 && w.a.S >= blk && G <= 32 && kab_pipe(), br = w.a.sel_row > 0 ? 1 : 32 / G;
+    /* the blocked shader's K and V a uvec4 a load: a float16 cache's rows of whole uvec4s,
+     * head-major, a tile's positions consecutive (no ring, no list) */
+    int vec = g_kvh && !w.kv_pm && !w.ring && w.a.sel_row <= 0 && w.a.hd % 8 == 0 && w.vd % 8 == 0 &&
+              w.a.k_off % 8 == 0 && w.a.v_off % 8 == 0;
+    VkPipeline kp = !fp && blk > 0 && w.a.S >= blk && G <= 32 ? kab_pipe(w.a.hd, w.vd, g_kvh, vec) : VK_NULL_HANDLE;
+    int blocked = kp != VK_NULL_HANDLE, br = w.a.sel_row > 0 ? 1 : 32 / G;
     /* a decode's or a verify's rows over many positions: split over them; a verify across
      * VKC_ATTN_DEC_MIN positions in two calls, its rows before it as their decode steps run */
     if (!fp && !blocked && !(sel && w.a.sel_row > 0) && w.a.S > 1 && w.a.S <= VKC_ATTN_DEC_ROWS &&
@@ -1861,7 +1982,7 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
      * chain_attnb's time a submission. At the budget's own size Qwen3.6's 16K prompt was cut
      * into slices of 64 rows, 16 workgroups and a submission each: 5.9 s of attention */
     int S = w.a.S, rr = attn_slice_rows(S, w.a.pos_base, (double)w.a.H * (w.a.hd > w.vd ? w.a.hd : w.vd) / (fp ? VKC_FA_SLICE : 1),
-                                        fp ? VKC_FA_ROWS / G : blocked ? br : 1);
+                                        fp ? VKC_FA_ROWS / G : blocked ? br : 1, fp || blocked ? w.a.KVH : w.a.H);
     int ok = 1;
     for (int r0 = 0; ok && r0 < S; r0 += rr) {
         VkcAttnW x = w;
@@ -1875,7 +1996,7 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
             KC.st.attn_flash += ok;
         } else if (blocked) {
             struct { VkcAttnW w; int br, B, anchor, part, st_off; } pc = {x, br, 0, 0, 0, 0};
-            ok = record(kab_pipe(), bd, 7, &pc, sizeof pc, (uint32_t)x.a.KVH, (uint32_t)((x.a.S + br - 1) / br), 1);
+            ok = record(kp, bd, 7, &pc, sizeof pc, (uint32_t)x.a.KVH, (uint32_t)((x.a.S + br - 1) / br), 1);
             KC.st.attn_blocked += ok;
         } else {
             VkPipeline ap = g_kvh ? attn_h_pipe() : KC.pipe[P_ATTN];
@@ -1891,10 +2012,13 @@ static int attn_part_rec(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, const Vkc
     if (w.vd <= 0) w.vd = w.a.hd;
     int G = w.a.KVH > 0 ? w.a.H / w.a.KVH : 0;
     if (w.a.hd > 256 || w.vd > 256 || G < 1 || G > 32 || w.a.H % w.a.KVH || w.a.sel_row > 0 || w.sink || w.ring || blk < 1 ||
-        anchor < 0 || ch < 0 || (ch > 0 && (ch % 16 || nz < 1 || nz > 65535)) || !kab_pipe()) return 0;
+        anchor < 0 || ch < 0 || (ch > 0 && (ch % 16 || nz < 1 || nz > 65535))) return 0;
+    VkPipeline kp = kab_pipe(w.a.hd, w.vd, 0, 0);   /* the shadow's rows are float32 */
+    if (!kp) return 0;
     w.a.has_gate = 0; w.a.g_off = ch; w.a.g_row = o_z; w.a.g_seg = st_z;   /* the chunks (unused by part otherwise) */
     VkcBind bd[7] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(NULL, 0), B(NULL, 0), B(NULL, 0)};
-    int br = 32 / G, S = w.a.S, rr = attn_slice_rows(S, w.a.pos_base, (double)w.a.H * (w.a.hd > w.vd ? w.a.hd : w.vd), br);
+    int br = 32 / G, S = w.a.S, rr = attn_slice_rows(S, w.a.pos_base, (double)w.a.H * (w.a.hd > w.vd ? w.a.hd : w.vd), br,
+                                                     w.a.KVH * (ch > 0 ? nz : 1));
     int ok = 1;
     for (int r0 = 0; ok && r0 < S; r0 += rr) {
         VkcAttnW x = w;
@@ -1903,7 +2027,7 @@ static int attn_part_rec(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, const Vkc
         x.a.q_off += r0 * w.a.q_row; x.a.o_off += r0 * w.a.o_row;
         if (r0 && !attn_slice_next()) return 0;
         struct { VkcAttnW w; int br, B, anchor, part, st_off; } pc = {x, br, blk, anchor, 1, st_off + r0 * w.a.H * 2};
-        ok = record(KAB.pipe, bd, 7, &pc, sizeof pc, (uint32_t)x.a.KVH, (uint32_t)((x.a.S + br - 1) / br), (uint32_t)(ch > 0 ? nz : 1));
+        ok = record(kp, bd, 7, &pc, sizeof pc, (uint32_t)x.a.KVH, (uint32_t)((x.a.S + br - 1) / br), (uint32_t)(ch > 0 ? nz : 1));
         KC.st.attn_blocked += ok;
     }
     return ok;
@@ -2237,7 +2361,7 @@ int vkc_mla_core(VkcBuf *qabs, VkcBuf *qr, VkcBuf *lat, VkcBuf *rope, VkcBuf *se
     VkcBind bd[6] = {B(qabs, 0), B(qr, 0), B(lat, 0), B(p->R > 0 ? rope : NULL, 0), B(pc.b.sel_row > 0 ? sel : NULL, 0),
                      B(clat, 1)};
     /* a long prompt chunk in slices of rows, a submission each (attn_slice_rows) */
-    int S = p->S, rr = attn_slice_rows(S, p->pos_base, (double)p->H * (p->K + p->R), 1), ok = 1;
+    int S = p->S, rr = attn_slice_rows(S, p->pos_base, (double)p->H * (p->K + p->R), 1, p->H), ok = 1;
     for (int r0 = 0; ok && r0 < S; r0 += rr) {
         CorePC x = pc;
         x.b.S = S - r0 < rr ? S - r0 : rr; x.b.pos_base = p->pos_base + r0;
@@ -3175,7 +3299,7 @@ int vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBu
     VkcBind bd[8] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(kvs, 0), B(r, 0), B(relp, 0), B(tau, 0)};
     /* a long prompt chunk in slices of rows, a submission each (attn_slice_rows): the
      * shader's s0 is the slice's first row, pos_base stays the step's */
-    int S = p->S, rr = attn_slice_rows(S, p->pos_base, (double)p->H * p->hd, 1), ok = 1;
+    int S = p->S, rr = attn_slice_rows(S, p->pos_base, (double)p->H * p->hd, 1, p->H), ok = 1;
     for (int r0 = 0; ok && r0 < S; r0 += rr) {
         struct { VkcRelAttn a; int s0; } x = {*p, r0};
         x.a.S = S - r0 < rr ? S - r0 : rr;

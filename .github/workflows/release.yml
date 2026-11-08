@@ -20,9 +20,14 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             name: linux-x86_64
             ext: ""
+            # 24.04, not ubuntu-latest: a binary may need any glibc up to the one it was
+            # linked against, and built on 26.04 (glibc 2.43) the v2.1.0 archive did not
+            # start on Ubuntu 24.04 (#2556). glibc is 24.04's: the verify step holds every
+            # ELF file in the archive to it.
+            glibc: "2.39"
             # VK=1: every engine with its Vulkan backend, and shaders/ beside them. The
             # loader is opened at run time (vk_load.h), so the engines start and run on
             # the CPU where there is no Vulkan; COLI_VULKAN=1 (coli setup sets it for a
@@ -85,7 +90,7 @@ jobs:
 
       # libvulkan-dev for the headers, glslc for the shaders; mesa-vulkan-drivers is
       # Lavapipe, which the verify step runs the packaged engine on.
-      - if: matrix.os == 'ubuntu-latest'
+      - if: matrix.os == 'ubuntu-24.04'
         run: |
           # hard limits around apt: a stalled mirror held CI jobs for hours (2026-10-07)
           bash .github/scripts/apt-install.sh libvulkan-dev glslc mesa-vulkan-drivers
@@ -114,7 +119,7 @@ jobs:
       # server by itself. Rust is on every runner; Linux needs WebKitGTK to build it. pwsh on
       # Windows: the MSVC linker, not the link.exe of a POSIX shell's PATH. It needs a display
       # to run, so the verify step checks that it is in the archive.
-      - if: matrix.os == 'ubuntu-latest'
+      - if: matrix.os == 'ubuntu-24.04'
         run: bash .github/scripts/apt-install.sh libwebkit2gtk-4.1-dev
       - name: Build the desktop window
         if: matrix.os != 'windows-latest'
@@ -434,6 +439,42 @@ jobs:
           done
           echo "OK: ${{ matrix.metal }} carry the Metal backend"
 
+      # An ELF file may need any GLIBC version up to the glibc it was linked against, and a
+      # system with an older one refuses to start it ("GLIBC_2.43 not found" on Ubuntu 24.04
+      # for v2.1.0, #2556). None in the archive (engines, TUI, desktop window) may need a
+      # version newer than matrix.glibc.
+      - name: Verify the archive's glibc floor
+        if: matrix.glibc != ''
+        run: |
+          cd verify
+          elfs=0; linked=0; newest=""; bad=""
+          while IFS= read -r f; do
+            # a static library (.a) is never loaded, and readelf prints nothing for an empty one
+            case $(head -c 7 "$f" | tr -d '\000') in '!<arch>') continue ;; esac
+            readelf -h "$f" > /dev/null 2>&1 || continue   # not an ELF file
+            elfs=$((elfs + 1))
+            # readelf -V: the file's version references, the list the loader checks at start
+            # ("0x0010:   Name: GLIBC_2.34"; a version the file itself defines reads "Cnt: 1
+            # Name: ..." and is not a need). Object files and static programs have none.
+            refs=$(readelf -V --wide "$f") || { echo "FAIL: readelf cannot read the versions of $f"; exit 1; }
+            # on a damaged file readelf still exits 0 but prints none of these: not checked
+            case $refs in
+              *"No version information found"*|*"Version needs section"*|*"Version definition section"*|*"Version symbols section"*) ;;
+              *) echo "FAIL: readelf cannot read the versions of $f"; exit 1 ;;
+            esac
+            need=$(printf '%s\n' "$refs" | grep -o ':   Name: GLIBC_[0-9][0-9.]*' | sed 's/^:   Name: GLIBC_//' | sort -uV | tail -1 || true)
+            test -n "$need" || continue
+            linked=$((linked + 1))
+            newest=$(printf '%s\n' "$newest" "$need" | sort -V | tail -1)
+            if [ "$(printf '%s\n' "${{ matrix.glibc }}" "$need" | sort -V | tail -1)" != "${{ matrix.glibc }}" ]; then
+              bad="$bad $f (GLIBC_$need)"
+            fi
+          done < <(find . -type f | sort)
+          # the engines link glibc: a check that found no version at all read nothing
+          test -n "$newest" || { echo "FAIL: no GLIBC version in the archive's $elfs ELF files"; exit 1; }
+          test -z "$bad" || { echo "FAIL: newer than glibc ${{ matrix.glibc }}:$bad"; exit 1; }
+          echo "OK: $linked of $elfs ELF files link glibc, the newest version they need is $newest (at most ${{ matrix.glibc }})"
+
       # Only the archives -- never the loose files. `dist/colibri-*.*` used to work by accident
       # (the engine was versioned, so it did not match); now that the engine is plainly named,
       # be explicit about what gets published.
@@ -446,13 +487,15 @@ jobs:
 
   # The Windows CUDA package, an archive of its own: coli_cuda.dll (CUDA_ARCH=portable:
   # SASS for sm_80/86/89/90/120 plus compute_120 PTX, so RTX 30, 40 and 50 cards and
-  # their datacenter peers), the CUDA runtime it links, and the three engines that load
-  # it (colibri, qwen36, kimi_k3; CUDA_DLL=1, with Vulkan and the NPU lane as in the
-  # main archive); and DeepSeek V4's own two, coli_cuda_dsv4_dg.dll (DeepGEMM, RTX 50)
-  # and coli_cuda_dsv4.dll (portable), which the main archive's deepseek_v4.exe loads
-  # at run time (#2047; DSV4_TC=0: no cuBLASLt, so cudart64_12.dll is all they need). Unpacked next to windows-x86_64.zip's engines it replaces those three,
-  # and coli setup / coli chat turn CUDA on for an NVIDIA card it runs on. A separate
-  # archive because the DLL is large and only an NVIDIA card can use it.
+  # their datacenter peers), the CUDA runtime it links, and the four engines that load
+  # it (colibri, glm53, qwen36, kimi_k3; CUDA_DLL=1 and Vulkan as in the main archive,
+  # colibri also with its NPU lane); and DeepSeek V4's own two, coli_cuda_dsv4_dg.dll
+  # (DeepGEMM, RTX 50) and coli_cuda_dsv4.dll (portable), which the main archive's
+  # deepseek_v4.exe loads at run time (#2047; DSV4_TC=0: no cuBLASLt, so
+  # cudart64_12.dll is all they need). Unpacked next to windows-x86_64.zip's engines
+  # it replaces those four, and coli setup / coli chat turn CUDA on for an NVIDIA card
+  # it runs on. A separate archive because the DLL is large and only an NVIDIA card
+  # can use it.
   # windows-2022 and CUDA 12.8.1: the pins of ci.yml's windows-cuda-build, which builds
   # the same files on every commit (the toolkit refuses windows-latest's MSVC).
   cuda-windows:
@@ -483,23 +526,23 @@ jobs:
         run: |
           cd c
           make cuda-dll CUDA_ARCH=portable
-          # .exe names: only colibri has a phony alias (ci.yml, windows-cuda-build)
-          for t in colibri.exe qwen36.exe kimi_k3.exe; do make $t CUDA_DLL=1 VK=1 XDNA=1; done
+          # the real <engine>.exe targets of c/Makefile (as ci.yml's windows-cuda-build)
+          for t in colibri.exe glm53.exe qwen36.exe kimi_k3.exe; do make $t CUDA_DLL=1 VK=1 XDNA=1; done
           make cuda-dsv4-dll CUDA_ARCH=portable DSV4_TC=0
           make cuda-dsv4-dg-dll DSV4_TC=0
-          ls -l coli_cuda.dll coli_cuda_dsv4.dll coli_cuda_dsv4_dg.dll colibri.exe qwen36.exe kimi_k3.exe
+          ls -l coli_cuda.dll coli_cuda_dsv4.dll coli_cuda_dsv4_dg.dll colibri.exe glm53.exe qwen36.exe kimi_k3.exe
       - name: Package
         shell: bash
         run: |
           mkdir -p dist/pkg
-          cp c/coli_cuda.dll c/coli_cuda_dsv4.dll c/coli_cuda_dsv4_dg.dll c/colibri.exe c/qwen36.exe c/kimi_k3.exe dist/pkg/
+          cp c/coli_cuda.dll c/coli_cuda_dsv4.dll c/coli_cuda_dsv4_dg.dll c/colibri.exe c/glm53.exe c/qwen36.exe c/kimi_k3.exe dist/pkg/
           cp "$CUDA_PATH"/bin/cudart64_*.dll dist/pkg/
           printf '%s\r\n' \
             "colibri ${TAG}: the CUDA backend for Windows" \
             "" \
             "Unpack these files into the folder of colibri-${TAG}-windows-x86_64.zip, next to" \
-            "coli.cmd, replacing colibri.exe, qwen36.exe and kimi_k3.exe. They are the same" \
-            "engines with CUDA added; coli setup then picks CUDA for an NVIDIA card." \
+            "coli.cmd, replacing colibri.exe, glm53.exe, qwen36.exe and kimi_k3.exe. They are" \
+            "the same engines with CUDA added; coli setup then picks CUDA for an NVIDIA card." \
             "" \
             "coli_cuda.dll runs on compute capability 8.0 and newer (RTX 30, 40, 50 series," \
             "A100, H100 and later) with an NVIDIA driver for CUDA 12. Older cards keep" \
@@ -517,7 +560,7 @@ jobs:
           mkdir -p verify && cd verify
           7z x ../dist/colibri-${TAG}-windows-x86_64-cuda.zip > /dev/null
           ls -l
-          for f in coli_cuda.dll coli_cuda_dsv4.dll coli_cuda_dsv4_dg.dll colibri.exe qwen36.exe kimi_k3.exe README-CUDA.txt; do
+          for f in coli_cuda.dll coli_cuda_dsv4.dll coli_cuda_dsv4_dg.dll colibri.exe glm53.exe qwen36.exe kimi_k3.exe README-CUDA.txt; do
             test -f $f || { echo "FAIL: $f missing from the CUDA package"; exit 1; }
           done
           # the DLL links the runtime that is beside it, and the engines neither CUDA
@@ -531,7 +574,7 @@ jobs:
           if objdump -p coli_cuda_dsv4.dll coli_cuda_dsv4_dg.dll | grep -qi 'DLL Name: cublas'; then
             echo "FAIL: a DeepSeek V4 DLL links cuBLAS, which the package does not carry"; exit 1
           fi
-          for e in colibri qwen36 kimi_k3; do
+          for e in colibri glm53 qwen36 kimi_k3; do
             deps=$(objdump -p $e.exe | grep 'DLL Name')
             if echo "$deps" | grep -qiE 'cudart|vulkan|coli_cuda'; then echo "FAIL: $e.exe links $deps"; exit 1; fi
           done
@@ -540,11 +583,11 @@ jobs:
           sys.path.insert(0, "../c")
           from doctor import windows_backend_dll
           from setup_flow import binary_backends
-          for e in ("colibri", "qwen36", "kimi_k3"):
+          for e in ("colibri", "glm53", "qwen36", "kimi_k3"):
               image = open(e + ".exe", "rb").read()
               if windows_backend_dll(image) != "coli_cuda.dll" or binary_backends(e + ".exe") != {"cuda", "vulkan"}:
                   sys.exit(f"FAIL: {e}.exe is not a CUDA_DLL + Vulkan build")
-          print("OK: colibri, qwen36 and kimi_k3 load coli_cuda.dll and carry Vulkan")
+          print("OK: colibri, glm53, qwen36 and kimi_k3 load coli_cuda.dll and carry Vulkan")
           PYCHK
       - uses: actions/upload-artifact@v4
         with:

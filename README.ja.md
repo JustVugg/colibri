@@ -242,7 +242,7 @@ CI は、ソフトウェアドライバ上で、すべてのエンジンの Vulk
 
 ### CUDA：NVIDIA カード
 
-CUDA ツールキットがインストールされていれば、セットアップは Linux で CUDA の経路を持つエンジンを CUDA 付きでビルドします：GLM-5.2/5.3 と Mistral-Large-4、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、DeepSeek V4.1 Flash、MiMo-V2.6、Qwen3.8-Flash-Next、そして Qwen3.6 とそれが動かすモデル。OLMoE と判定エンジンは `make <エンジン> CUDA=1` でビルドします。Windows では CUDA エンジンは別の DLL です（[windows.md](docs/windows.md)）。各リリースにはビルド済みのものが含まれます：`colibri-<version>-windows-x86_64-cuda.zip` には `coli_cuda.dll`（compute capability 8.0 以上のカード）と、それを読み込む colibri、qwen36、kimi_k3 の各エンジン、DeepSeek V4 用の CUDA DLL が入っています。メインのアーカイブの上に展開すると、セットアップが CUDA を選びます。
+CUDA ツールキットがインストールされていれば、セットアップは Linux で CUDA の経路を持つエンジンを CUDA 付きでビルドします：GLM-5.2/5.3 と Mistral-Large-4、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、DeepSeek V4.1 Flash、MiMo-V2.6、Qwen3.8-Flash-Next、そして Qwen3.6 とそれが動かすモデル。OLMoE と判定エンジンは `make <エンジン> CUDA=1` でビルドします。Windows では CUDA エンジンは別の DLL です（[windows.md](docs/windows.md)）。各リリースにはビルド済みのものが含まれます：`colibri-<version>-windows-x86_64-cuda.zip` には `coli_cuda.dll`（compute capability 8.0 以上のカード）と、それを読み込む colibri、glm53、qwen36、kimi_k3 の各エンジン、DeepSeek V4 用の CUDA DLL が入っています。メインのアーカイブの上に展開すると、セットアップが CUDA を選びます。
 
 - **すべてのレイヤーをカード上で**（Qwen3.6、Qwen3.8、OLMoE）：密レイヤー、アテンション、カードが持つルーティングエキスパートを 1 本のチェーンとして実行し、カードにないエキスパートは CPU で実行します。RTX PRO 4000 では Qwen3.6-35B-A3B UD-Q4_K_M のデコードが 104.8 tok/s、プロンプト読み込みが 3,491、OLMoE は 354.6 と 10,418 です（[表](#three-backends-on-one-machine)）。
 - **すべてのエンジンでカード上のエキスパートティア**（`cu_tier.h`）。DeepSeek V4、V4.1、Kimi K3、GLM-5.3、MiMo では密行列もカード上に置きます（`cu_dense.h`）。

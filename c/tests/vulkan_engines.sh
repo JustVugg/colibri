@@ -81,6 +81,13 @@ vk_count() {
 need_gpu() {  # <engine> <log> <tag>
   [ "$(vk_count "$1" "$2")" -gt 0 ] || { cat "$2"; fail "$3: no matmul ran on the device"; }
 }
+# need_int8 <engine> <log> <tag>: need_gpu, and the engine's report placed int8 rows on the
+# device ("placed int8 N", N > 0). qwen36's dense chain uploads through the same counter
+# (vk_qw_tensor), so this holds with the chain on, where the per-matrix count stays 0.
+need_int8() {
+  need_gpu "$1" "$2" "$3"
+  grep -qaE "^\[VK\] $1: [0-9]+ matmuls on the GPU.*placed int8 [1-9]" "$2" || { cat "$2"; fail "$3: no int8 matrix placed"; }
+}
 same_tokens() {  # <cpu log> <vk log> <tag>: the engines' "C engine" token lines
   grep -a '^C engine' "$1" > cpu.tok || true
   grep -a '^C engine' "$2" > vk.tok || true
@@ -390,7 +397,7 @@ vk_gate() {
   same_tokens cpu.log vk.log "$tag"
   need_gpu "$eng" vk.log "$tag"
   grep -qE "\[VK\] $eng: .*placed .*$placed" vk.log || { grep '\[VK\]' vk.log; fail "$tag: expected placement '$placed'"; }
-  echo "OK $tag: $(grep -a -o 'Matching tokens: [0-9/]*' vk.log), tokens = CPU, $(grep -o '[0-9]* matmuls on the GPU.*' vk.log | tail -1)"
+  echo "OK $tag: $(grep -a -o 'Matching tokens: [0-9/]*' vk.log), tokens = CPU, $(vk_count "$eng" vk.log) matmuls on the GPU $(sed -n "s/^\[VK\] $eng: [0-9]* matmuls on the GPU //p" vk.log | tail -1)"
 }
 
 family_qwen() {
@@ -420,8 +427,8 @@ family_qwen() {
     COLI_DENSE_IDOT=0 SNAP=${fx}_c ./qwen36 8 8 $fx/ref_full.json > cpu.log 2>&1 || true
     COLI_DENSE_IDOT=0 COLI_VK_DENSE=1 COLI_VULKAN=1 SNAP=${fx}_c ./qwen36 8 8 $fx/ref_full.json > vk.log 2>&1 || true
     same_tokens cpu.log vk.log "qwen36 $fx int8"
-    grep -qE '\[VK\] qwen36: [1-9][0-9]* matmuls on the GPU.*placed int8 [1-9]' vk.log || { cat vk.log; fail "qwen36 $fx int8: nothing placed"; }
-    echo "OK qwen36 $fx int8: tokens = CPU, $(grep -o '[0-9]* matmuls on the GPU.*' vk.log | tail -1)"
+    need_int8 qwen36 vk.log "qwen36 $fx int8"
+    echo "OK qwen36 $fx int8: tokens = CPU, $(vk_count qwen36 vk.log) matmuls on the GPU $(sed -n 's/^\[VK\] qwen36: [0-9]* matmuls on the GPU //p' vk.log | tail -1)"
   done
 
   # The routed-expert tier on every expert container qwen36 reads (COLI_VULKAN=1 turns
@@ -455,7 +462,7 @@ family_qwen() {
   same_tokens cpu.log vk.log "qwen36 COLI_VK_TIER=0"
   ! grep -q '^\[VK\] tier' vk.log || { cat vk.log; fail "qwen36 COLI_VK_TIER=0: the tier started"; }
   need_gpu qwen36 vk.log "qwen36 COLI_VK_TIER=0"
-  echo "OK qwen36 COLI_VK_TIER=0: tokens = CPU, no tier, $(grep -o '[0-9]* matmuls on the GPU' vk.log | tail -1)"
+  echo "OK qwen36 COLI_VK_TIER=0: tokens = CPU, no tier, $(vk_count qwen36 vk.log) matmuls on the GPU"
 
   # qwen38: one fixture, every resident format, with and without prefill batching
   $PY tools/make_qwen38_tiny.py --out qwen38_tiny
