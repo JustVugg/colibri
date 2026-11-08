@@ -1,0 +1,650 @@
+# The pool that remembers a refused block: its tests and the checks (2026-10-27)
+#
+# The change (docs/vulkan.md, "A refused block"): VkWPool.refused holds the size of the block the driver refused, and pool_suballoc does not
+# ask for a block of that size or larger until the mark is cleared. Four lines of c/backend_vulkan.c touch the mark:
+#   1 pool_suballoc       sets it when the driver refuses a block       "if (ask && !bk) P->refused = cap;"
+#   2 pool_release_block  clears it: a block went back to the driver    "P->refused = 0;   /* memory goes back to the driver */"
+#   3 tier_pool_limit     clears it: the limit is set again             "P->p.limit = bytes; P->refused = 0;"
+#   4 pool_destroy        clears it: the pool is destroyed              "P->bytes = P->tensors = 0; P->refused = 0;"
+#
+# Questions, written before the runs:
+#   Q1 the harness CI runs (vk_test built with -DVK_TEST from c/backend_vulkan.c, COLI_VK_TEST_MATMUL_ONLY=1 ./vk_test shaders/qmatmul.spv) passes
+#      with the change, on Lavapipe and on the driver of an RTX 4090, with two tests added to it.
+#      run_pool_refused: an empty pool whose allocator refuses every block is asked for 8 tensors: the refusal is made by the device-memory books
+#        (vk_mem_alloc, the layer in front of vkAllocateMemory, capped at what is used), not by a driver, and the harness lines that say "the driver
+#        was asked" count those refusals (g_mem.refused[0]). The books must be asked once; with the room back a tensor must still not be asked for
+#        (the mark holds), then fit after the limit is set again, and (on a pool destroyed after a new refusal) after the pool is destroyed.
+#        A refusal by a real driver is exercised only by the engine runs of l4.txt, a100.txt and runs-4090*.txt.
+#      run_pool_released: room for two blocks and a refusal for the third; every tensor freed (the second block goes back to the driver): the pool
+#        must take as many tensors again.
+#   Q2 each of the four lines has a check that goes red without it: cnt41..cnt44 are the tree with line 1..4 removed.
+#   Q3 origin/dev's vk_test (no such tests) passes the rest of the harness.
+#   Q4 built with -fsanitize=address,undefined the harness runs clean on Lavapipe (the tests keep arrays of 256 pointers).
+#   Q5 warnings in c/backend_vulkan.c: none. The harness is built as c/tests/vulkan_engines.sh builds it (default warnings, no -Wall):
+#        cc -O2 -pthread -DVK_TEST backend_vulkan.c -o vk_test -ldl -lm
+#      and the sanitizer build as cc -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -pthread -DVK_TEST backend_vulkan.c -o vk_test_asan -ldl -lm.
+#      The engine builds on the L4 and the A100 (l3-build.log, l2-build.log below) use the Makefile's flags (-O3 -Wall -Wextra ...).
+#
+# Trees, on the rented RTX 4090 instance (a Vast.ai container, NVIDIA driver 595.91.07; Lavapipe is Mesa's CPU Vulkan): dev2 = origin/dev c1c06ac6fcb32157e4da130fd96775a32a757052;
+#   fin4 = dev2 + the committed diff (lat4.patch, sha256 a81023d1e3f79c6c1626e08133fc4bda695b9a4ba7dcec0aa7cadf13f70c0e2a). t4-git.log shows that c/backend_vulkan.c in it has sha256 1ef77a6062cada5a34ad69bbcafea49b5f8349593c76b315cd85e5c77dc74737,
+#   which is the file that is committed; cnt41..cnt44 = fin4 with line 1..4 removed (t4-git.log shows each diff).
+#   vk_test built from each: cnt41 c9e874f1b190e18d2029ce86a6914815368cff7d04d80c32fed8e9f80d537a7b, cnt42 9c75b7f38df8a1002bc418d659904dfcfa81666aa2dc2b740dd9796012285b07, cnt43 368f610d24e4002ebab03e204c421693eba57bf211dd8c1871720c082f878f7a, cnt44 2daa0777352834fd1ec4c7ed8d75b50fcdc8bb07524355ba026a1c1ac703b563, fin4 88a6bc14f96f39a524364070ea64d9c0beb6df5c076f67a0474b9f092467ca68; the ASan build of fin4: 1cd3061565e680f777ae8ecb399906e96a2e70f242f005e1b16aeb705fd42c29; dev2's: d8650dcf8cee73f101c0682265073adccad7ad07a1270a20f40ed2f149144d7f.
+#   Warnings in the six builds of t4-build.log: none; in dev2's build (t3-build.log): none.
+# The committed diff of c/backend_vulkan.c: 84 insertions, 4 deletions, sha256 a81023d1e3f79c6c1626e08133fc4bda695b9a4ba7dcec0aa7cadf13f70c0e2a: byte-identical to lat4.patch, the patch tested here.
+# The engine code of the runs of l4.txt, a100.txt and runs-4090*.txt was built from lat.patch (sha256 fd852f317a40e990eea47a072a995beb41ba301139245fe7ad724cd2707f687c). It is the committed file's
+#   but for two comments, completed after those runs (the field's and the one above pool_suballoc: they now name the three events that clear the
+#   mark): the engine part of the file (everything before the `#ifdef VK_TEST` harness) is 6234 lines after lat.patch and 6235 after lat4.patch, and
+#   the block engine-part.diff below is the whole difference between the two. What else changed is the harness: lat.patch had run_pool_refused only
+#   (run on the L4 and the A100: the blocks "first version" below); lat2.patch added run_pool_released and changed the order of run_pool_refused (one
+#   run on the 4090 instance, not kept here: there cnt3 still passed, because the test called the new limit while the cap was still low, which made
+#   the block size smaller, and a smaller block is asked for again by design, so line 3 was not needed to pass); lat3.patch brought the room back
+#   before the new limit and asks for the same block size, so only line 3 lets it through; lat4.patch is lat3.patch with the two comments. The
+#   matrix of lat3.patch ran first; the same ten runs gave the same pool lines, rc and verdict on lat4.patch (compared by the script that wrote this file), and only lat4.patch's are kept
+#   (dev2's, origin/dev being the same, is the one of t3-*). The final tests ran on the 4090 instance and on Lavapipe only.
+# make check on macOS arm64 does not build c/backend_vulkan.c (a Mac has no Vulkan headers): it shows that the rest of the suite is as it was, not
+#   that this change works. It was run four times: the first run stopped making progress and was killed (tests/test_cluster_protocol was seen waiting
+#   on a socket in the process list; there is no log of that, and this change does not touch it); the second, the third and the fourth finished with
+#   rc=0 (Ran 2763 tests, OK (skipped=390) in each). The fourth is on the final code and docs; the second and the third ran on earlier states of the
+#   tree (the note of each block below says which).
+
+===== engine-part.diff: the lines of c/backend_vulkan.c before the `#ifdef VK_TEST` harness, after lat.patch against after lat4.patch (computed by the script that wrote this file; it is the whole difference)
+--- after lat.patch
++++ after the committed diff
+@@ -1599 +1599 @@
+-    uint64_t refused;        /* the least block the driver refused (0: none yet): not asked for again until a block goes back or the pool is destroyed */
++    uint64_t refused;        /* the least block the driver refused (0: none yet), see pool_suballoc */
+@@ -1873,2 +1873,3 @@
+- * not asked for again (P->refused): the lock is held across vkAllocateMemory, and on an L4
+- * a refusal took 0.6 s, once per tensor. */
++ * not asked for again, nor a larger one (P->refused), until a block goes back to the driver,
++ * the limit is set again or the pool is destroyed: the lock is held across vkAllocateMemory,
++ * and on an L4 a refusal took 0.6 s, once per tensor. */
+
+===== lat.patch (sha256 fd852f317a40e990eea47a072a995beb41ba301139245fe7ad724cd2707f687c): the patch that the engine runs and the first tests were built from: c/backend_vulkan.c only (whole file)
+diff --git a/c/backend_vulkan.c b/c/backend_vulkan.c
+index ca42a031..3ad1cca3 100644
+--- a/c/backend_vulkan.c
++++ b/c/backend_vulkan.c
+@@ -1596,6 +1596,7 @@ struct VkWPool {
+     float prio;              /* eviction priority of its blocks; < 0 = G.prio at creation */
+     int counted;             /* 1 = its tensors are coli_vk_mem_info's (the resident weights) */
+     size_t bytes, tensors;   /* payload of its live tensors (rows + scales) */
++    uint64_t refused;        /* the least block the driver refused (0: none yet): not asked for again until a block goes back or the pool is destroyed */
+ };
+ #define VK_WBLOCK ((size_t)256 << 20)
+ static VkWPool g_wpool  = {.p = {.block_bytes = VK_WBLOCK}, .mx = PTHREAD_MUTEX_INITIALIZER, .dev = 0, .prio = -1.f, .counted = 1};
+@@ -1862,12 +1863,15 @@ static VkBlk *pool_new_block(VkWPool *P, uint64_t cap) {
+ static void pool_release_block(VkWPool *P, int k) {   /* lock held, block empty */
+     VkBlk *bk = P->p.b[k].user;
+     VkDevice dev = pool_device(P);
++    P->refused = 0;   /* memory goes back to the driver */
+     if (bk) { if (bk->base) vkUnmapMemory(dev, bk->mem); vkFreeMemory(dev, bk->mem, NULL); free(bk); }
+     vka_pool_drop_block(&P->p, k);
+ }
+ 
+ /* A buffer of `bytes` bound inside one of the pool's blocks; *ptr is its mapping.
+- * 0 when the device has no room or the pool is at its limit. */
++ * 0 when the device has no room or the pool is at its limit. A block the driver refuses is
++ * not asked for again (P->refused): the lock is held across vkAllocateMemory, and on an L4
++ * a refusal took 0.6 s, once per tensor. */
+ static int pool_suballoc(VkWPool *P, size_t bytes, VkBuffer *buf, void **ptr, VkaRange *r) {
+     VkDevice dev = pool_device(P);
+     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+@@ -1891,7 +1895,9 @@ static int pool_suballoc(VkWPool *P, size_t bytes, VkBuffer *buf, void **ptr, Vk
+         if (P->p.limit && P->p.total + cap > P->p.limit && P->p.limit > P->p.total &&
+             P->p.limit - P->p.total >= req.size + align)
+             cap = (P->p.limit - P->p.total) & ~(uint64_t)4095;
+-        VkBlk *bk = vka_pool_can_grow(&P->p, cap) && cap >= req.size ? pool_new_block(P, cap) : NULL;
++        int ask = vka_pool_can_grow(&P->p, cap) && cap >= req.size && !(P->refused && cap >= P->refused);
++        VkBlk *bk = ask ? pool_new_block(P, cap) : NULL;
++        if (ask && !bk) P->refused = cap;
+         if (bk) {
+             if (vka_pool_add_block(&P->p, cap, bk) < 0) {
+                 if (bk->base) vkUnmapMemory(dev, bk->mem);
+@@ -1929,7 +1935,7 @@ static void pool_destroy(VkWPool *P) {
+     uint64_t bb = P->p.block_bytes, lim = P->p.limit;
+     vka_pool_destroy(&P->p);
+     P->p.block_bytes = bb ? bb : VK_WBLOCK; P->p.limit = lim;
+-    P->bytes = P->tensors = 0;
++    P->bytes = P->tensors = 0; P->refused = 0;
+     pthread_mutex_unlock(&P->mx);
+ }
+ 
+@@ -3894,7 +3900,7 @@ void coli_vk_pool_stats(int which, ColiVkPoolStats *st) {
+ }
+ static void tier_pool_limit(VkWPool *P, size_t bytes) {
+     pthread_mutex_lock(&P->mx);
+-    P->p.limit = bytes;
++    P->p.limit = bytes; P->refused = 0;
+     /* blocks no larger than the budget, so a small budget is not one refused block */
+     size_t bb = coli_vk_block_bytes_dev(P->dev, VK_WBLOCK);
+     P->p.block_bytes = bytes && bytes < bb ? ((bytes + 4095) & ~(size_t)4095) : bb;
+@@ -7180,6 +7186,33 @@ static int run_tier_pool(void) {
+     return bad;
+ }
+ 
++/* A block the driver refuses is asked for once, not once per tensor: the device memory books
++ * refuse every block past COLI_VK_DEVICE_CAP_MB, as a full card does. A destroyed pool asks again. */
++static int run_pool_refused(void) {
++    int bad = 0, D = g_xb[0].D, I = g_xb[0].I;
++    coli_vk_tier_pool_limit(0);
++    pool_destroy(&g_tpool);
++    uint64_t cap = g_mem.cap[0];
++    g_mem.cap[0] = g_mem.used[0] + 1;   /* no room for any block */
++    unsigned long long r0 = g_mem.refused[0];
++    enum { N = 8 };
++    void *w, *sc; int got = 0;
++    for (int k = 0; k < N; k++) {
++        ColiVkTensor *t = tensor_alloc(&g_tpool, 4, D, I, 64, &w, &sc);
++        if (t) { got++; coli_vk_tensor_free(t); }
++    }
++    unsigned long long asked = g_mem.refused[0] - r0;
++    g_mem.cap[0] = cap;
++    pool_destroy(&g_tpool);
++    ColiVkTensor *again = tensor_alloc(&g_tpool, 4, D, I, 64, &w, &sc);
++    printf("tier pool: %d tensors with no room for a block: the driver was asked %llu time(s); after the pool is destroyed a tensor %s\n",
++           N, asked, again ? "fits" : "does not fit");
++    if (got || asked != 1 || !again) { printf("  ^ a refused block was asked for again, or the pool did not ask again once destroyed\n"); bad = 1; }
++    if (again) coli_vk_tensor_free(again);
++    pool_destroy(&g_tpool);
++    return bad;
++}
++
+ /* COLI_VK_ACT_SWIGLU_V4 bit for bit. Experts whose sums are exact in f32 (f32 weights,
+  * one input that is a power of two, the others zero) and whose gate is at least 24, so
+  * that its sigmoid is exactly 1 on both sides: the device and the reference below then
+@@ -7307,6 +7340,7 @@ static int run_xbatch_all(void) {
+     printf("xbatch: tier queue %s, GEMM route from %d rows, timestamps %s\n",
+            G.tq_shared ? "shared with the main queue" : "of its own", g_xb[0].gemm_rows, g_xb[0].has_ts ? "on" : "off");
+     bad |= run_tier_pool();   /* first: the tier pool is still empty, its budget is exact */
++    bad |= run_pool_refused();
+     static const int fm[9] = {1, 2, 4, 5, 7, 10, 11, 12, 13};
+     for (int f = 0; f < 9; f++) {
+         int gs = fm[f] == 7 ? 32 : 64;
+
+===== manifest validation: `python3 c/experiment_manifest.py manifest.json manifest-1024.json`, rc 0; sha256 of manifest.json 12acc15781d7af2d6e0b52a72ce668d34798b9f1fa93ac99ce6ddf47252d976b, of manifest-1024.json 5467556f3e95b6bd427a7b4de0b66823d1b5d1b20382d92b8b8f6752bb961345
+manifest.json: ok (engine_build, regression)
+manifest-1024.json: ok (engine_build, regression)
+
+===== sommario-test4.txt (sha256 af8eb460e18d76da5fdbc5b227a94bd41860854fea3b45e871906f3821f9658e): the chain: each step with its time (a run step's exit code is that of the last command in it; the harness's own rc is in the run's block below)
+[10:48:45] t4-git rc=0 2 s
+[10:49:09] t4-build rc=0 24 s
+[10:49:28] t4-1-fin4-lvp rc=0 19 s
+[10:49:39] t4-2-fin4-gpu rc=0 11 s
+[10:49:57] t4-3-cnt41-lvp rc=0 18 s
+[10:50:08] t4-4-cnt41-gpu rc=0 11 s
+[10:50:27] t4-5-cnt42-lvp rc=0 19 s
+[10:50:38] t4-6-cnt42-gpu rc=0 11 s
+[10:50:56] t4-7-cnt43-lvp rc=0 18 s
+[10:51:08] t4-8-cnt43-gpu rc=0 12 s
+[10:51:26] t4-9-cnt44-lvp rc=0 18 s
+[10:51:37] t4-10-cnt44-gpu rc=0 11 s
+[10:52:25] t4-asan rc=0 48 s
+
+===== t4-git.log (sha256 8ee49ebc114f8ce000c1747a7cf923b820807d6d51a2bd0a18721f77e8f2983d): excerpt, the lines matching /^[0-9a-f]{64}  |^== |^[0-9,]+[acd][0-9,]+$|^[<>] |is the file of the worktree/. the patch hash, the hash of the file, then the diff of each counter-test against fin4
+a81023d1e3f79c6c1626e08133fc4bda695b9a4ba7dcec0aa7cadf13f70c0e2a  /workspace/lat4.patch
+1ef77a6062cada5a34ad69bbcafea49b5f8349593c76b315cd85e5c77dc74737  /workspace/fin4/c/backend_vulkan.c
+fin4/c/backend_vulkan.c is the file of the worktree
+== cnt41 against fin4:
+1901c1901
+<         if (ask && !bk) P->refused = cap;
+> 
+== cnt42 against fin4:
+1866d1865
+<     P->refused = 0;   /* memory goes back to the driver */
+== cnt43 against fin4:
+3904c3904
+<     P->p.limit = bytes; P->refused = 0;
+>     P->p.limit = bytes;
+== cnt44 against fin4:
+1939c1939
+<     P->bytes = P->tensors = 0; P->refused = 0;
+>     P->bytes = P->tensors = 0;
+
+===== t4-build.log (sha256 b005801155d24f56c58a972efb5d9f127930318c2437a471f54eaadd762d7e03): warnings counted per build, then the binaries sha256 (whole log)
+/workspace/logs/build-vk_test4-asan.txt:0
+/workspace/logs/build-vk_test4-cnt41.txt:0
+/workspace/logs/build-vk_test4-cnt42.txt:0
+/workspace/logs/build-vk_test4-cnt43.txt:0
+/workspace/logs/build-vk_test4-cnt44.txt:0
+/workspace/logs/build-vk_test4-fin4.txt:0
+88a6bc14f96f39a524364070ea64d9c0beb6df5c076f67a0474b9f092467ca68  /workspace/fin4/c/vk_test
+c9e874f1b190e18d2029ce86a6914815368cff7d04d80c32fed8e9f80d537a7b  /workspace/cnt41/c/vk_test
+9c75b7f38df8a1002bc418d659904dfcfa81666aa2dc2b740dd9796012285b07  /workspace/cnt42/c/vk_test
+368f610d24e4002ebab03e204c421693eba57bf211dd8c1871720c082f878f7a  /workspace/cnt43/c/vk_test
+2daa0777352834fd1ec4c7ed8d75b50fcdc8bb07524355ba026a1c1ac703b563  /workspace/cnt44/c/vk_test
+1cd3061565e680f777ae8ecb399906e96a2e70f242f005e1b16aeb705fd42c29  /workspace/fin4/c/vk_test_asan
+
+===== vk_test4-fin4-lvp.txt (sha256 8c719f8d2f224b13cf66d6f15b64e62f1e69f0ad9596b2d9d2cbc1d6b6cec9e2): excerpt, the lines matching /tier pool|\^ |^(PASS|FAIL)$/. fin4 on Lavapipe; rc 0, verdict PASS
+tier pool: 10 experts fit a budget of 10.5 (87040 bytes each), refusals 1, 1 block(s), frag 0.000
+tier pool: frees during a batch held 870400 -> 870400 bytes, after the join 609280
+tier pool: 3 of 3 experts uploaded again into the freed room, 1 blocks, 870400 of 913408 bytes used
+tier pool: all freed, 0 bytes used, 0 live ranges, 1 block(s) kept
+tier pool: 8 tensors with no room for a block: the driver was asked 1 time(s); with the room back a tensor fits no while the mark holds, yes after a new limit, yes after the pool is destroyed
+tier pool: two blocks hold 72 tensors; after both are freed the pool takes 72 again
+PASS
+
+===== vk_test4-fin4-gpu.txt (sha256 777a2430da505f88ac923b1f11fe7a1ea173dc4cd4f17411675567339ffea262): fin4 on the RTX 4090's driver: the whole output; rc 0, the last line is the verdict (PASS)
+memory: mapped
+fmt=1 S=1 I=6144 O=1536 gemv | maxerr=4.196e-05 maxrel=0.0004273 | gpu=0.044 ms  cpu_ref=29.976 ms
+fmt=2 S=1 I=6144 O=1536 gemv | maxerr=2.742e-06 maxrel=6.327e-05 | gpu=0.032 ms  cpu_ref=29.972 ms
+fmt=1 S=1 I=1536 O=6144 gemv | maxerr=1.526e-05 maxrel=0.0001639 | gpu=0.086 ms  cpu_ref=29.850 ms
+fmt=2 S=8 I=6144 O=1536 gemv | maxerr=4.768e-06 maxrel=0.0001407 | gpu=0.168 ms  cpu_ref=239.616 ms
+fmt=1 S=1 I=512 O=512 gemv | maxerr=7.629e-06 maxrel=1.206e-05 | gpu=0.015 ms  cpu_ref=0.817 ms
+fmt=2 S=1 I=16384 O=6144 gemv | maxerr=9.537e-06 maxrel=0.000194 | gpu=0.137 ms  cpu_ref=320.015 ms
+fmt=5 S=1 I=6144 O=2048 gemv | maxerr=7.153e-07 maxrel=2.103e-05 | gpu=0.049 ms  cpu_ref=38.574 ms
+fmt=5 S=1 I=2048 O=6144 gemv | maxerr=4.768e-07 maxrel=1.566e-05 | gpu=0.063 ms  cpu_ref=38.575 ms
+fmt=5 S=8 I=6144 O=2048 gemv | maxerr=9.537e-07 maxrel=2.819e-05 | gpu=0.223 ms  cpu_ref=309.092 ms
+fmt=5 S=1 I=100 O=64 gemv | maxerr=5.96e-08 maxrel=1.69e-06 | gpu=0.012 ms  cpu_ref=0.020 ms
+fmt=5 S=1 I=16384 O=6144 gemv | maxerr=1.431e-06 maxrel=7.47e-05 | gpu=0.225 ms  cpu_ref=309.754 ms
+fmt=10 S=1 I=6144 O=1536 gemv | maxerr=2.384e-05 maxrel=0.0002415 | gpu=0.037 ms  cpu_ref=30.413 ms
+fmt=10 S=8 I=2048 O=512 gemv | maxerr=9.537e-06 maxrel=0.0001659 | gpu=0.046 ms  cpu_ref=26.873 ms
+fmt=10 S=1 I=16384 O=512 gemv | maxerr=6.199e-05 maxrel=0.0001057 | gpu=0.049 ms  cpu_ref=27.022 ms
+fmt=10 S=3 I=37 O=5 gemv | maxerr=1.788e-07 maxrel=8.65e-06 | gpu=0.014 ms  cpu_ref=0.002 ms
+fmt=11 S=1 I=6144 O=1536 gemv | maxerr=2.289e-05 maxrel=5.483e-05 | gpu=0.046 ms  cpu_ref=29.985 ms
+fmt=11 S=8 I=2048 O=512 gemv | maxerr=8.106e-06 maxrel=0.0001324 | gpu=0.060 ms  cpu_ref=26.646 ms
+fmt=11 S=1 I=16384 O=512 gemv | maxerr=5.341e-05 maxrel=0.0001181 | gpu=0.068 ms  cpu_ref=26.752 ms
+fmt=11 S=3 I=37 O=5 gemv | maxerr=4.768e-07 maxrel=2.086e-07 | gpu=0.012 ms  cpu_ref=0.002 ms
+fmt=12 gs=64 S=1 I=6144 O=1536 gemv | maxerr=3.815e-05 maxrel=7.396e-05 | gpu=0.071 ms  cpu_ref=81.484 ms
+fmt=12 gs=64 S=8 I=2048 O=512 gemv | maxerr=1.526e-05 maxrel=0.000363 | gpu=0.065 ms  cpu_ref=72.424 ms
+fmt=12 gs=64 S=1 I=16384 O=512 gemv | maxerr=9.155e-05 maxrel=4.002e-05 | gpu=0.107 ms  cpu_ref=72.385 ms
+fmt=12 gs=64 S=3 I=100 O=5 gemv | maxerr=1.907e-06 maxrel=5.17e-07 | gpu=0.012 ms  cpu_ref=0.011 ms
+fmt=12 gs=32 S=2 I=4096 O=256 gemv | maxerr=3.052e-05 maxrel=2.417e-05 | gpu=0.045 ms  cpu_ref=18.289 ms
+fmt=12 gs=128 S=2 I=4096 O=256 gemv | maxerr=3.052e-05 maxrel=3.037e-05 | gpu=0.043 ms  cpu_ref=18.002 ms
+fmt=13 gs=64 S=1 I=6144 O=1536 gemv | maxerr=2.289e-05 maxrel=0.0004261 | gpu=0.097 ms  cpu_ref=26.196 ms
+fmt=13 gs=64 S=8 I=2048 O=512 gemv | maxerr=1.526e-05 maxrel=0.0001256 | gpu=0.098 ms  cpu_ref=23.282 ms
+fmt=13 gs=64 S=1 I=16384 O=512 gemv | maxerr=5.341e-05 maxrel=0.0002466 | gpu=0.223 ms  cpu_ref=23.287 ms
+fmt=13 gs=64 S=3 I=100 O=5 gemv | maxerr=9.537e-07 maxrel=3.438e-07 | gpu=0.022 ms  cpu_ref=0.004 ms
+fmt=13 gs=128 S=2 I=4096 O=256 gemv | maxerr=1.717e-05 maxrel=3.078e-05 | gpu=0.067 ms  cpu_ref=6.245 ms
+fmt=1 S=16 I=1001 O=193 gemm | maxerr=2.289e-05 maxrel=8.375e-05 | gpu=0.243 ms  cpu_ref=9.740 ms
+fmt=1 S=16 I=1001 O=193 coop | maxerr=3.052e-05 maxrel=0.0005316 | gpu=0.304 ms  cpu_ref=9.742 ms
+fmt=1 S=64 I=1536 O=97 gemm | maxerr=3.052e-05 maxrel=0.0004326 | gpu=0.477 ms  cpu_ref=30.133 ms
+fmt=1 S=64 I=1536 O=97 coop | maxerr=4.578e-05 maxrel=0.0002032 | gpu=0.600 ms  cpu_ref=30.133 ms
+fmt=1 S=512 I=520 O=131 gemm | maxerr=1.144e-05 maxrel=0.0003599 | gpu=0.787 ms  cpu_ref=109.174 ms
+fmt=1 S=512 I=520 O=131 coop | maxerr=3.052e-05 maxrel=0.0004696 | gpu=0.930 ms  cpu_ref=109.148 ms
+fmt=2 S=16 I=1001 O=193 gemm | maxerr=1.192e-06 maxrel=1.152e-05 | gpu=0.269 ms  cpu_ref=9.766 ms
+fmt=2 S=16 I=1001 O=193 coop | maxerr=1.907e-06 maxrel=3.857e-05 | gpu=0.285 ms  cpu_ref=9.780 ms
+fmt=2 S=64 I=1536 O=97 gemm | maxerr=1.431e-06 maxrel=6.221e-05 | gpu=0.709 ms  cpu_ref=30.408 ms
+fmt=2 S=64 I=1536 O=97 coop | maxerr=2.384e-06 maxrel=4.416e-05 | gpu=0.832 ms  cpu_ref=30.457 ms
+fmt=2 S=512 I=520 O=131 gemm | maxerr=9.537e-07 maxrel=3.405e-05 | gpu=0.962 ms  cpu_ref=109.939 ms
+fmt=2 S=512 I=520 O=131 coop | maxerr=1.431e-06 maxrel=4.992e-05 | gpu=1.142 ms  cpu_ref=110.049 ms
+fmt=4 gs=64 S=16 I=1001 O=193 gemm | maxerr=1.431e-06 maxrel=4.905e-05 | gpu=0.492 ms  cpu_ref=8.923 ms
+fmt=4 gs=64 S=16 I=1001 O=193 coop | maxerr=1.669e-06 maxrel=3.771e-05 | gpu=0.523 ms  cpu_ref=8.923 ms
+fmt=4 gs=64 S=64 I=1536 O=97 gemm | maxerr=1.431e-06 maxrel=4.539e-05 | gpu=0.782 ms  cpu_ref=27.575 ms
+fmt=4 gs=64 S=64 I=1536 O=97 coop | maxerr=2.384e-06 maxrel=2.976e-05 | gpu=0.922 ms  cpu_ref=27.590 ms
+fmt=4 gs=64 S=512 I=520 O=131 gemm | maxerr=9.537e-07 maxrel=3.294e-05 | gpu=1.013 ms  cpu_ref=101.334 ms
+fmt=4 gs=64 S=512 I=520 O=131 coop | maxerr=1.431e-06 maxrel=3.077e-05 | gpu=1.713 ms  cpu_ref=101.296 ms
+fmt=5 S=16 I=1001 O=193 gemm | maxerr=4.768e-07 maxrel=1.332e-05 | gpu=0.580 ms  cpu_ref=9.478 ms
+fmt=5 S=16 I=1001 O=193 coop | maxerr=7.153e-07 maxrel=1.307e-05 | gpu=0.684 ms  cpu_ref=9.482 ms
+fmt=5 S=64 I=1536 O=97 gemm | maxerr=7.153e-07 maxrel=3.006e-05 | gpu=1.097 ms  cpu_ref=29.241 ms
+fmt=5 S=64 I=1536 O=97 coop | maxerr=1.192e-06 maxrel=2.106e-05 | gpu=1.298 ms  cpu_ref=29.241 ms
+fmt=5 S=512 I=520 O=131 gemm | maxerr=3.576e-07 maxrel=1.233e-05 | gpu=1.555 ms  cpu_ref=107.085 ms
+fmt=5 S=512 I=520 O=131 coop | maxerr=7.153e-07 maxrel=2.052e-05 | gpu=1.819 ms  cpu_ref=107.055 ms
+fmt=7 gs=32 S=16 I=1001 O=193 gemm | maxerr=7.153e-07 maxrel=1.524e-05 | gpu=0.822 ms  cpu_ref=18.007 ms
+fmt=7 gs=32 S=16 I=1001 O=193 coop | maxerr=1.192e-06 maxrel=1.529e-05 | gpu=0.820 ms  cpu_ref=18.056 ms
+fmt=7 gs=32 S=64 I=1536 O=97 gemm | maxerr=9.537e-07 maxrel=3.452e-05 | gpu=1.418 ms  cpu_ref=54.695 ms
+fmt=7 gs=32 S=64 I=1536 O=97 coop | maxerr=1.55e-06 maxrel=2.503e-05 | gpu=1.665 ms  cpu_ref=55.849 ms
+fmt=7 gs=32 S=512 I=520 O=131 gemm | maxerr=4.768e-07 maxrel=2.092e-05 | gpu=1.663 ms  cpu_ref=174.220 ms
+fmt=7 gs=32 S=512 I=520 O=131 coop | maxerr=5.96e-07 maxrel=1.929e-05 | gpu=2.075 ms  cpu_ref=174.704 ms
+fmt=10 S=16 I=1001 O=193 gemm | maxerr=7.629e-06 maxrel=0.000122 | gpu=0.731 ms  cpu_ref=9.850 ms
+fmt=10 S=64 I=1536 O=97 gemm | maxerr=1.144e-05 maxrel=0.0001952 | gpu=1.235 ms  cpu_ref=30.504 ms
+fmt=10 S=512 I=520 O=131 gemm | maxerr=5.722e-06 maxrel=0.0002361 | gpu=1.674 ms  cpu_ref=110.177 ms
+fmt=11 S=16 I=1001 O=193 gemm | maxerr=9.537e-06 maxrel=9.278e-05 | gpu=0.775 ms  cpu_ref=9.748 ms
+fmt=11 S=64 I=1536 O=97 gemm | maxerr=1.144e-05 maxrel=8.842e-05 | gpu=1.460 ms  cpu_ref=30.122 ms
+fmt=11 S=512 I=520 O=131 gemm | maxerr=7.629e-06 maxrel=0.000204 | gpu=1.691 ms  cpu_ref=109.145 ms
+fmt=12 gs=64 S=16 I=1001 O=193 gemm | maxerr=2.289e-05 maxrel=8.603e-05 | gpu=1.454 ms  cpu_ref=29.681 ms
+fmt=12 gs=64 S=16 I=1001 O=193 coop | maxerr=3.815e-05 maxrel=0.0001388 | gpu=2.126 ms  cpu_ref=29.679 ms
+fmt=12 gs=64 S=64 I=1536 O=97 gemm | maxerr=3.815e-05 maxrel=0.0004324 | gpu=1.955 ms  cpu_ref=91.313 ms
+fmt=12 gs=64 S=64 I=1536 O=97 coop | maxerr=6.104e-05 maxrel=0.0004027 | gpu=2.767 ms  cpu_ref=91.245 ms
+fmt=12 gs=64 S=512 I=520 O=131 gemm | maxerr=2.289e-05 maxrel=0.000446 | gpu=1.921 ms  cpu_ref=325.890 ms
+fmt=12 gs=64 S=512 I=520 O=131 coop | maxerr=3.815e-05 maxrel=0.0007303 | gpu=2.455 ms  cpu_ref=326.143 ms
+fmt=13 gs=64 S=16 I=1001 O=193 gemm | maxerr=1.526e-05 maxrel=0.0003534 | gpu=0.944 ms  cpu_ref=8.550 ms
+fmt=13 gs=64 S=64 I=1536 O=97 gemm | maxerr=2.289e-05 maxrel=0.0003495 | gpu=1.647 ms  cpu_ref=26.470 ms
+fmt=13 gs=64 S=512 I=520 O=131 gemm | maxerr=1.144e-05 maxrel=0.0002411 | gpu=1.764 ms  cpu_ref=97.314 ms
+fmt=1 S=37 I=999 O=65 gemm | maxerr=1.526e-05 maxrel=9.773e-05 | gpu=0.940 ms  cpu_ref=7.568 ms
+fmt=1 S=37 I=999 O=65 coop | maxerr=3.433e-05 maxrel=5.926e-05 | gpu=1.078 ms  cpu_ref=7.570 ms
+fmt=4 gs=8 S=33 I=1001 O=70 gemm | maxerr=7.153e-07 maxrel=1.042e-05 | gpu=0.977 ms  cpu_ref=6.818 ms
+fmt=4 gs=24 S=33 I=1001 O=70 gemm | maxerr=9.537e-07 maxrel=2.267e-05 | gpu=0.994 ms  cpu_ref=6.843 ms
+fmt=12 gs=12 S=33 I=1001 O=70 gemm | maxerr=2.289e-05 maxrel=0.000233 | gpu=1.266 ms  cpu_ref=22.598 ms
+fmt=12 gs=128 S=33 I=1001 O=70 gemm | maxerr=2.289e-05 maxrel=7.482e-05 | gpu=1.262 ms  cpu_ref=21.748 ms
+fmt=12 gs=128 S=33 I=1001 O=70 coop | maxerr=3.815e-05 maxrel=0.0001042 | gpu=1.662 ms  cpu_ref=21.713 ms
+fmt=13 gs=12 S=33 I=1001 O=70 gemm | maxerr=1.526e-05 maxrel=9.695e-05 | gpu=0.981 ms  cpu_ref=6.192 ms
+xbatch: tier queue of its own, GEMM route from 16 rows, timestamps on
+tier pool: 10 experts fit a budget of 10.5 (87040 bytes each), refusals 1, 1 block(s), frag 0.000
+tier pool: frees during a batch held 870400 -> 870400 bytes, after the join 609280
+tier pool: 3 of 3 experts uploaded again into the freed room, 1 blocks, 870400 of 913408 bytes used
+tier pool: all freed, 0 bytes used, 0 live ranges, 1 block(s) kept
+tier pool: 8 tensors with no room for a block: the driver was asked 1 time(s); with the room back a tensor fits no while the mark holds, yes after a new limit, yes after the pool is destroyed
+tier pool: two blocks hold 72 tensors; after both are freed the pool takes 72 again
+xbatch fmt=1/1 gs=64 D=320 I=160 swiglu, rows 1/3/2/20/1 (GEMM from 16, 0 cooperative matmuls, 3 on chain_moe_gv) | maxrel=2.39e-05 | row bits independent of the batch: yes | device 0.396 ms
+xbatch fmt=2/2 gs=64 D=320 I=160 swiglu, rows 1/3/2/20/1 (GEMM from 16, 0 cooperative matmuls, 3 on chain_moe_gv) | maxrel=2.5e-05 | row bits independent of the batch: yes | device 0.361 ms
+xbatch fmt=4/4 gs=64 D=320 I=160 swiglu, rows 1/3/2/20/1 (GEMM from 16, 0 cooperative matmuls, 3 on chain_moe_gv) | maxrel=1.97e-05 | row bits independent of the batch: yes | device 0.407 ms
+xbatch fmt=5/5 gs=64 D=320 I=160 swiglu, rows 1/3/2/20/1 (GEMM from 16, 0 cooperative matmuls, 0 on chain_moe_gv) | maxrel=2.46e-05 | row bits independent of the batch: yes | device 0.345 ms
+xbatch fmt=7/7 gs=32 D=320 I=160 swiglu, rows 1/3/2/20/1 (GEMM from 16, 0 cooperative matmuls, 3 on chain_moe_gv) | maxrel=1.92e-05 | row bits independent of the batch: yes | device 0.578 ms
+xbatch fmt=10/10 gs=64 D=320 I=160 swiglu, rows 1/3/2/20/1 (GEMM from 16, 0 cooperative matmuls, 0 on chain_moe_gv) | maxrel=2.12e-05 | row bits independent of the batch: yes | device 0.314 ms
+xbatch fmt=11/11 gs=64 D=320 I=160 swiglu, rows 1/3/2/20/1 (GEMM from 16, 0 cooperative matmuls, 0 on chain_moe_gv) | maxrel=2e-05 | row bits independent of the batch: yes | device 0.296 ms
+xbatch fmt=12/12 gs=64 D=320 I=160 swiglu, rows 1/3/2/20/1 (GEMM from 16, 0 cooperative matmuls, 0 on chain_moe_gv) | maxrel=1.89e-05 | row bits independent of the batch: yes | device 0.664 ms
+xbatch fmt=13/13 gs=64 D=320 I=160 swiglu, rows 1/3/2/20/1 (GEMM from 16, 0 cooperative matmuls, 0 on chain_moe_gv) | maxrel=1.62e-05 | row bits independent of the batch: yes | device 0.372 ms
+xbatch fmt=4/1 gs=64 D=320 I=160 swiglu, rows 1/3/2/20/1 (GEMM from 16, 0 cooperative matmuls, 3 on chain_moe_gv) | maxrel=2.26e-05 | row bits independent of the batch: yes | device 0.402 ms
+xbatch fmt=4/10 gs=64 D=320 I=160 swiglu, rows 1/3/2/20/1 (GEMM from 16, 0 cooperative matmuls, 0 on chain_moe_gv) | maxrel=2.9e-05 | row bits independent of the batch: yes | device 0.332 ms
+xbatch fmt=10/1 gs=64 D=320 I=160 swiglu, rows 1/3/2/20/1 (GEMM from 16, 0 cooperative matmuls, 0 on chain_moe_gv) | maxrel=2.06e-05 | row bits independent of the batch: yes | device 0.315 ms
+xbatch fmt=4/4 gs=64 D=320 I=160 swiglu-limit, rows 1/3/2/20/1 (GEMM from 16, 0 cooperative matmuls, 3 on chain_moe_gv) | maxrel=1.9e-05 | row bits independent of the batch: yes | device 0.409 ms
+xbatch fmt=7/7 gs=32 D=320 I=160 situ, rows 1/3/2/20/1 (GEMM from 16, 0 cooperative matmuls, 3 on chain_moe_gv) | maxrel=2.2e-05 | row bits independent of the batch: yes | device 0.580 ms
+xbatch fmt=12/12 gs=8 D=200 I=72 swiglu, rows 1/3/2/20/1 (GEMM from 16, 0 cooperative matmuls, 0 on chain_moe_gv) | maxrel=1.64e-05 | row bits independent of the batch: yes | device 0.433 ms
+xbatch fmt=2/2 gs=0 D=200 I=72 swiglu, rows 1/3/2/20/1 (GEMM from 16, 0 cooperative matmuls, 0 on chain_moe_gv) | maxrel=1.65e-05 | row bits independent of the batch: yes | device 0.220 ms
+xbatch fmt=4/4 gs=64 D=6400 I=64 swiglu, rows 1/3/2/20/1 (GEMM from 16, 0 cooperative matmuls, 3 on chain_moe_gv) | maxrel=4.02e-05 | row bits independent of the batch: yes | device 3.716 ms
+xbatch v4 D=160 I=160, rows 1/3/20 (GEMM from 16) | 0 of 3840 values differ from the CPU's arithmetic | device 0.231 ms
+absorb fmt=2 S=1 H=64 Q=192 R=64 V=256 K=512 st0=0 T=1500 | maxerr=2.552e-07 maxrel=2.091e-05 | 3.273 ms/call
+absorb+project fused                  | maxrel=1.384e-06 | 3.504 ms/call (unfused absorb was 3.273)
+outputs digest 08458bfc13f56c4b
+fmt=14 S=1 I=6144 O=1536 gemv | maxerr=3.242e-05 maxrel=0.0001969 | gpu=0.152 ms  cpu_ref=87.329 ms
+fmt=14 S=8 I=2048 O=512 gemv | maxerr=8.821e-06 maxrel=0.0002588 | gpu=0.201 ms  cpu_ref=77.575 ms
+fmt=14 S=1 I=16384 O=512 gemv | maxerr=6.104e-05 maxrel=0.0005615 | gpu=0.407 ms  cpu_ref=77.601 ms
+fmt=14 S=3 I=37 O=5 gemv | maxerr=2.384e-07 maxrel=1.985e-06 | gpu=0.030 ms  cpu_ref=0.004 ms
+fmt=14 S=16 I=1001 O=193 gemm | maxerr=1.144e-05 maxrel=0.0001631 | gpu=0.565 ms  cpu_ref=28.574 ms
+fmt=14 S=64 I=1536 O=97 gemm | maxerr=1.335e-05 maxrel=0.00011 | gpu=1.113 ms  cpu_ref=87.998 ms
+fmt=14 S=512 I=520 O=131 gemm | maxerr=7.629e-06 maxrel=0.0001797 | gpu=1.516 ms  cpu_ref=314.420 ms
+import fmt=1 S=1 I=2048 O=384 gemv | maxrel=2.262e-05 | the copy's bits: same
+import fmt=1 S=64 I=2048 O=384 gemm | maxrel=0.0007619 | the copy's bits: same
+import fmt=10 S=3 I=1024 O=100 gemm | maxrel=1.777e-05 | the copy's bits: same
+import fmt=14 S=1 I=4096 O=257 gemv | maxrel=2.334e-05 | the copy's bits: same
+import fmt=14 S=96 I=4096 O=257 gemm | maxrel=0.00025 | the copy's bits: same
+f16 and import digest e0d6c59fa2465a23
+PASS
+
+===== vk_test4-cnt41-lvp.txt (sha256 bddc631eedc997f68ed57a78ca6e7d521406f18084f9e0ef304b977084bf9ed2): excerpt, the lines matching /tier pool|\^ |^(PASS|FAIL)$/. cnt41 on Lavapipe; rc 1, verdict FAIL
+tier pool: 10 experts fit a budget of 10.5 (87040 bytes each), refusals 1, 1 block(s), frag 0.000
+tier pool: frees during a batch held 870400 -> 870400 bytes, after the join 609280
+tier pool: 3 of 3 experts uploaded again into the freed room, 1 blocks, 870400 of 913408 bytes used
+tier pool: all freed, 0 bytes used, 0 live ranges, 1 block(s) kept
+tier pool: 8 tensors with no room for a block: the driver was asked 8 time(s); with the room back a tensor fits yes while the mark holds, yes after a new limit, yes after the pool is destroyed
+  ^ a refused block was asked for again, or its mark was not cleared by a new limit or by the pool being destroyed
+tier pool: two blocks hold 72 tensors; after both are freed the pool takes 72 again
+FAIL
+
+===== vk_test4-cnt41-gpu.txt (sha256 8ba119152cd50ab3bda1934f002d4960c604286223ffebb06def0257d43e068a): excerpt, the lines matching /tier pool|\^ |^(PASS|FAIL)$/. cnt41 on the RTX 4090's driver; rc 1, verdict FAIL
+tier pool: 10 experts fit a budget of 10.5 (87040 bytes each), refusals 1, 1 block(s), frag 0.000
+tier pool: frees during a batch held 870400 -> 870400 bytes, after the join 609280
+tier pool: 3 of 3 experts uploaded again into the freed room, 1 blocks, 870400 of 913408 bytes used
+tier pool: all freed, 0 bytes used, 0 live ranges, 1 block(s) kept
+tier pool: 8 tensors with no room for a block: the driver was asked 8 time(s); with the room back a tensor fits yes while the mark holds, yes after a new limit, yes after the pool is destroyed
+  ^ a refused block was asked for again, or its mark was not cleared by a new limit or by the pool being destroyed
+tier pool: two blocks hold 72 tensors; after both are freed the pool takes 72 again
+FAIL
+
+===== vk_test4-cnt42-lvp.txt (sha256 010e7c14e086d074d2d13f6e443c37e2e7f1b89016407149e78861b3c0f6bdb5): excerpt, the lines matching /tier pool|\^ |^(PASS|FAIL)$/. cnt42 on Lavapipe; rc 1, verdict FAIL
+tier pool: 10 experts fit a budget of 10.5 (87040 bytes each), refusals 1, 1 block(s), frag 0.000
+tier pool: frees during a batch held 870400 -> 870400 bytes, after the join 609280
+tier pool: 3 of 3 experts uploaded again into the freed room, 1 blocks, 870400 of 913408 bytes used
+tier pool: all freed, 0 bytes used, 0 live ranges, 1 block(s) kept
+tier pool: 8 tensors with no room for a block: the driver was asked 1 time(s); with the room back a tensor fits no while the mark holds, yes after a new limit, yes after the pool is destroyed
+tier pool: two blocks hold 72 tensors; after both are freed the pool takes 36 again
+  ^ a block that went back to the driver did not clear the refused mark
+FAIL
+
+===== vk_test4-cnt42-gpu.txt (sha256 1ab0e54bb1c9ec8239901082587911389fffd098c5332391f513d7656e9a2898): excerpt, the lines matching /tier pool|\^ |^(PASS|FAIL)$/. cnt42 on the RTX 4090's driver; rc 1, verdict FAIL
+tier pool: 10 experts fit a budget of 10.5 (87040 bytes each), refusals 1, 1 block(s), frag 0.000
+tier pool: frees during a batch held 870400 -> 870400 bytes, after the join 609280
+tier pool: 3 of 3 experts uploaded again into the freed room, 1 blocks, 870400 of 913408 bytes used
+tier pool: all freed, 0 bytes used, 0 live ranges, 1 block(s) kept
+tier pool: 8 tensors with no room for a block: the driver was asked 1 time(s); with the room back a tensor fits no while the mark holds, yes after a new limit, yes after the pool is destroyed
+tier pool: two blocks hold 72 tensors; after both are freed the pool takes 36 again
+  ^ a block that went back to the driver did not clear the refused mark
+FAIL
+
+===== vk_test4-cnt43-lvp.txt (sha256 ecbef44472710b96008180eff2e58ce4b1b6062c5cfd9696abc04964ce464974): excerpt, the lines matching /tier pool|\^ |^(PASS|FAIL)$/. cnt43 on Lavapipe; rc 1, verdict FAIL
+tier pool: 10 experts fit a budget of 10.5 (87040 bytes each), refusals 1, 1 block(s), frag 0.000
+tier pool: frees during a batch held 870400 -> 870400 bytes, after the join 609280
+tier pool: 3 of 3 experts uploaded again into the freed room, 1 blocks, 870400 of 913408 bytes used
+tier pool: all freed, 0 bytes used, 0 live ranges, 1 block(s) kept
+tier pool: 8 tensors with no room for a block: the driver was asked 1 time(s); with the room back a tensor fits no while the mark holds, no after a new limit, yes after the pool is destroyed
+  ^ a refused block was asked for again, or its mark was not cleared by a new limit or by the pool being destroyed
+tier pool: two blocks hold 72 tensors; after both are freed the pool takes 72 again
+FAIL
+
+===== vk_test4-cnt43-gpu.txt (sha256 6184431ff4a6bc353c5c2f7d4c3d6f30b5bddb8f6e035d69554307bbc3461d8c): excerpt, the lines matching /tier pool|\^ |^(PASS|FAIL)$/. cnt43 on the RTX 4090's driver; rc 1, verdict FAIL
+tier pool: 10 experts fit a budget of 10.5 (87040 bytes each), refusals 1, 1 block(s), frag 0.000
+tier pool: frees during a batch held 870400 -> 870400 bytes, after the join 609280
+tier pool: 3 of 3 experts uploaded again into the freed room, 1 blocks, 870400 of 913408 bytes used
+tier pool: all freed, 0 bytes used, 0 live ranges, 1 block(s) kept
+tier pool: 8 tensors with no room for a block: the driver was asked 1 time(s); with the room back a tensor fits no while the mark holds, no after a new limit, yes after the pool is destroyed
+  ^ a refused block was asked for again, or its mark was not cleared by a new limit or by the pool being destroyed
+tier pool: two blocks hold 72 tensors; after both are freed the pool takes 72 again
+FAIL
+
+===== vk_test4-cnt44-lvp.txt (sha256 004dd1fd9b977a647e4b156e9dcd9eeb4ed3689b50dfcafd86a81dab9e0aaefd): excerpt, the lines matching /tier pool|\^ |^(PASS|FAIL)$/. cnt44 on Lavapipe; rc 1, verdict FAIL
+tier pool: 10 experts fit a budget of 10.5 (87040 bytes each), refusals 1, 1 block(s), frag 0.000
+tier pool: frees during a batch held 870400 -> 870400 bytes, after the join 609280
+tier pool: 3 of 3 experts uploaded again into the freed room, 1 blocks, 870400 of 913408 bytes used
+tier pool: all freed, 0 bytes used, 0 live ranges, 1 block(s) kept
+tier pool: 8 tensors with no room for a block: the driver was asked 1 time(s); with the room back a tensor fits no while the mark holds, yes after a new limit, no after the pool is destroyed
+  ^ a refused block was asked for again, or its mark was not cleared by a new limit or by the pool being destroyed
+tier pool: two blocks hold 72 tensors; after both are freed the pool takes 72 again
+FAIL
+
+===== vk_test4-cnt44-gpu.txt (sha256 31abceda979c5d3909b18f75bd8787e020189afc8fcdc1570bfc0d7c0825a9a9): excerpt, the lines matching /tier pool|\^ |^(PASS|FAIL)$/. cnt44 on the RTX 4090's driver; rc 1, verdict FAIL
+tier pool: 10 experts fit a budget of 10.5 (87040 bytes each), refusals 1, 1 block(s), frag 0.000
+tier pool: frees during a batch held 870400 -> 870400 bytes, after the join 609280
+tier pool: 3 of 3 experts uploaded again into the freed room, 1 blocks, 870400 of 913408 bytes used
+tier pool: all freed, 0 bytes used, 0 live ranges, 1 block(s) kept
+tier pool: 8 tensors with no room for a block: the driver was asked 1 time(s); with the room back a tensor fits no while the mark holds, yes after a new limit, no after the pool is destroyed
+  ^ a refused block was asked for again, or its mark was not cleared by a new limit or by the pool being destroyed
+tier pool: two blocks hold 72 tensors; after both are freed the pool takes 72 again
+FAIL
+
+===== t4-asan.log (sha256 759ebd80d64caa1a6c9e147e37389f4dc3f6f6a113b96c2ea6cd6654144b9686): fin4 built with -fsanitize=address,undefined on Lavapipe: rc, the pool lines, the number of sanitizer reports (whole log)
+== fin4 asan rc=0
+tier pool: 10 experts fit a budget of 10.5 (87040 bytes each), refusals 1, 1 block(s), frag 0.000
+tier pool: frees during a batch held 870400 -> 870400 bytes, after the join 609280
+tier pool: 3 of 3 experts uploaded again into the freed room, 1 blocks, 870400 of 913408 bytes used
+tier pool: all freed, 0 bytes used, 0 live ranges, 1 block(s) kept
+tier pool: 8 tensors with no room for a block: the driver was asked 1 time(s); with the room back a tensor fits no while the mark holds, yes after a new limit, yes after the pool is destroyed
+tier pool: two blocks hold 72 tensors; after both are freed the pool takes 72 again
+PASS
+asan/ubsan reports: 0
+
+===== sommario-test3.txt (sha256 2a1d083adeb6eaa35816385a44b617ca6a129a2f133c42bd2995d71e7ab69c9c): excerpt, the lines matching /\] t3-(build|1-dev2|2-dev2)/. the steps of the earlier chain that built and ran origin/dev's vk_test (dev2)
+[10:25:51] t3-build rc=0 27 s
+[10:26:09] t3-1-dev2-lvp rc=0 18 s
+[10:26:20] t3-2-dev2-gpu rc=0 11 s
+
+===== t3-build.log (sha256 09a3f40fdd63f86b259bf5ea42cca02ef584f07fb593947c98c637961b447985): excerpt, the lines matching /build-vk_test3-dev2\.txt|/dev2/c/vk_test$/. the warnings of dev2's build and its binary's sha256
+/workspace/logs/build-vk_test3-dev2.txt:0
+d8650dcf8cee73f101c0682265073adccad7ad07a1270a20f40ed2f149144d7f  /workspace/dev2/c/vk_test
+
+===== vk_test3-dev2-lvp.txt (sha256 728877e0d9be1e9fce6e49b65d6abadf3d058773ae34a77336968c32e1932902): excerpt, the lines matching /tier pool|\^ |^(PASS|FAIL)$/. dev2 (origin/dev, no such tests) on Lavapipe; rc 0, verdict PASS
+tier pool: 10 experts fit a budget of 10.5 (87040 bytes each), refusals 1, 1 block(s), frag 0.000
+tier pool: frees during a batch held 870400 -> 870400 bytes, after the join 609280
+tier pool: 3 of 3 experts uploaded again into the freed room, 1 blocks, 870400 of 913408 bytes used
+tier pool: all freed, 0 bytes used, 0 live ranges, 1 block(s) kept
+PASS
+
+===== vk_test3-dev2-gpu.txt (sha256 a09c1aca2a8a154f5591103b48ce005d635647745db2d6ab391f5df32e5c8de0): excerpt, the lines matching /tier pool|\^ |^(PASS|FAIL)$/. dev2 (origin/dev, no such tests) on the RTX 4090's driver; rc 0, verdict PASS
+tier pool: 10 experts fit a budget of 10.5 (87040 bytes each), refusals 1, 1 block(s), frag 0.000
+tier pool: frees during a batch held 870400 -> 870400 bytes, after the join 609280
+tier pool: 3 of 3 experts uploaded again into the freed room, 1 blocks, 870400 of 913408 bytes used
+tier pool: all freed, 0 bytes used, 0 live ranges, 1 block(s) kept
+PASS
+
+===== first version: vk_test-lat-lvp.txt (sha256 423c5b14c507dd6a4bfda44f1c61c260cef1a813cd6d3843d510470412e0bbfa): excerpt, the lines matching /tier pool|^(PASS|FAIL)$|\^ a refused/. lat on Lavapipe (lat.patch, the first version of the test); verdict PASS
+tier pool: 10 experts fit a budget of 10.5 (87040 bytes each), refusals 1, 1 block(s), frag 0.000
+tier pool: frees during a batch held 870400 -> 870400 bytes, after the join 609280
+tier pool: 3 of 3 experts uploaded again into the freed room, 1 blocks, 870400 of 913408 bytes used
+tier pool: all freed, 0 bytes used, 0 live ranges, 1 block(s) kept
+tier pool: 8 tensors with no room for a block: the driver was asked 1 time(s); after the pool is destroyed a tensor fits
+PASS
+
+===== first version: vk_test-lat-l4.txt (sha256 1831ceb9949199769820b45eae31f774f5eff18017340d94b3dd9db67f341e19): excerpt, the lines matching /tier pool|^(PASS|FAIL)$|\^ a refused/. lat on the L4 (lat.patch, the first version of the test); verdict PASS
+tier pool: 10 experts fit a budget of 10.5 (87040 bytes each), refusals 1, 1 block(s), frag 0.000
+tier pool: frees during a batch held 870400 -> 870400 bytes, after the join 609280
+tier pool: 3 of 3 experts uploaded again into the freed room, 1 blocks, 870400 of 913408 bytes used
+tier pool: all freed, 0 bytes used, 0 live ranges, 1 block(s) kept
+tier pool: 8 tensors with no room for a block: the driver was asked 1 time(s); after the pool is destroyed a tensor fits
+PASS
+
+===== first version: vk_test-cnt-lvp.txt (sha256 4434a13636681cf1c61d7524c5340c62becd197ab1b8703c3194b508a8bbdeed): excerpt, the lines matching /tier pool|^(PASS|FAIL)$|\^ a refused/. cnt on Lavapipe (lat.patch, the first version of the test); verdict FAIL
+tier pool: 10 experts fit a budget of 10.5 (87040 bytes each), refusals 1, 1 block(s), frag 0.000
+tier pool: frees during a batch held 870400 -> 870400 bytes, after the join 609280
+tier pool: 3 of 3 experts uploaded again into the freed room, 1 blocks, 870400 of 913408 bytes used
+tier pool: all freed, 0 bytes used, 0 live ranges, 1 block(s) kept
+tier pool: 8 tensors with no room for a block: the driver was asked 8 time(s); after the pool is destroyed a tensor fits
+  ^ a refused block was asked for again, or the pool did not ask again once destroyed
+FAIL
+
+===== first version: vk_test-cnt-l4.txt (sha256 5add2962a0a4f94c651bacf56dfed829176c4eba0aba015c24f540491bb0949c): excerpt, the lines matching /tier pool|^(PASS|FAIL)$|\^ a refused/. cnt on the L4 (lat.patch, the first version of the test); verdict FAIL
+tier pool: 10 experts fit a budget of 10.5 (87040 bytes each), refusals 1, 1 block(s), frag 0.000
+tier pool: frees during a batch held 870400 -> 870400 bytes, after the join 609280
+tier pool: 3 of 3 experts uploaded again into the freed room, 1 blocks, 870400 of 913408 bytes used
+tier pool: all freed, 0 bytes used, 0 live ranges, 1 block(s) kept
+tier pool: 8 tensors with no room for a block: the driver was asked 8 time(s); after the pool is destroyed a tensor fits
+  ^ a refused block was asked for again, or the pool did not ask again once destroyed
+FAIL
+
+===== first version: vk_test-dev2-lvp.txt (sha256 6dc5abc8f0092302130a112d4e8744bc54186a2e2ea3815fdc3358aff20160cc): excerpt, the lines matching /tier pool|^(PASS|FAIL)$|\^ a refused/. dev2 on Lavapipe (lat.patch, the first version of the test); verdict PASS
+tier pool: 10 experts fit a budget of 10.5 (87040 bytes each), refusals 1, 1 block(s), frag 0.000
+tier pool: frees during a batch held 870400 -> 870400 bytes, after the join 609280
+tier pool: 3 of 3 experts uploaded again into the freed room, 1 blocks, 870400 of 913408 bytes used
+tier pool: all freed, 0 bytes used, 0 live ranges, 1 block(s) kept
+PASS
+
+===== first version: vk_test-dev2-l4.txt (sha256 a55529913c0474a82dd1316db90e9d08dc249a2cd5ee782f187ec8cad9ed229a): excerpt, the lines matching /tier pool|^(PASS|FAIL)$|\^ a refused/. dev2 on the L4 (lat.patch, the first version of the test); verdict PASS
+tier pool: 10 experts fit a budget of 10.5 (87040 bytes each), refusals 1, 1 block(s), frag 0.000
+tier pool: frees during a batch held 870400 -> 870400 bytes, after the join 609280
+tier pool: 3 of 3 experts uploaded again into the freed room, 1 blocks, 870400 of 913408 bytes used
+tier pool: all freed, 0 bytes used, 0 live ranges, 1 block(s) kept
+PASS
+
+===== first version: t1-build.log (L4 VM) (sha256 e77f280cece799ba5446df566883ac681691ade86dc9e680c5030b8670782ec4): the three vk_test builds on the L4 VM: warnings counted per build, then the binaries sha256 (whole log)
+/content/logs/build-vk_test-cnt.txt:0
+/content/logs/build-vk_test-dev2.txt:0
+/content/logs/build-vk_test-lat.txt:0
+bd10060bd2c45ec67f4c0d82fd64ab3b0f84a82c567722fe2a99f882a02212e3  /content/cnt/c/vk_test
+67a7f6b4e4ceded58e6baa6b483d3657d864f2469c1d51f7c836be2a012bf366  /content/dev2/c/vk_test
+d9cc3bbca2abf0405858d01db4429504afb36ad07ae193d39a4fb48e9b06fc3d  /content/lat/c/vk_test
+
+===== l3-build.log (L4 VM) (sha256 aa0d866c6e0abcca1b6db46b5fe75221da28aafc5558d230c17802acfbcf98ac): qwen36 built from dev2 and lat; warnings in the changed file; binaries sha256 (whole log)
+warnings in the changed file: 0
+eb657effa4d8e3f84acfdca5f4582d125f1af708170c216178bd9f279eeb7344  /content/dev2/c/qwen36
+9ba2ab1ed5d02b188020938aee15385eb313dee496139452c821369e4861e832  /content/lat/c/qwen36
+
+===== l2-build.log (A100 VM) (sha256 d7ab86d2fdf385aad1b567cc8b323ca85fcf7eee7315cf06bdcd5ce23eac76a4): qwen38 built from lat; warnings in the changed file; binaries sha256 (whole log)
+warnings in the changed file: 0
+263f979c0c7e5b9dbf6c726ea1ae174bca6ff8f63a70b6afac94df23eafcc4b5  /content/dev2/c/qwen38
+8393201da901d3ee2ec635d9b6ea066d904ae22bcb1db72582fae07cc3317125  /content/lat/c/qwen38
+
+===== first version: l3-test.log (A100 VM) (sha256 b5ab7bead3451334cc49b7b7a5016432cd1afdbf09a10913895f7a7c2cf10667): lat on the A100 (vk_test built on that VM, lat.patch): rc and the pool lines (whole log)
+== lat on the A100 rc=0
+tier pool: 10 experts fit a budget of 10.5 (87040 bytes each), refusals 1, 1 block(s), frag 0.000
+tier pool: frees during a batch held 870400 -> 870400 bytes, after the join 609280
+tier pool: 3 of 3 experts uploaded again into the freed room, 1 blocks, 870400 of 913408 bytes used
+tier pool: all freed, 0 bytes used, 0 live ranges, 1 block(s) kept
+tier pool: 8 tensors with no room for a block: the driver was asked 1 time(s); after the pool is destroyed a tensor fits
+PASS
+
+===== first version: vk_test-lat-a100.txt (sha256 801d83b08dad3510d84deb09a8094237c3bf3c31d31a43adc9c54150b2cd066e): excerpt, the lines matching /tier pool|^(PASS|FAIL)$|\^ a refused/. lat on the A100 (lat.patch)
+tier pool: 10 experts fit a budget of 10.5 (87040 bytes each), refusals 1, 1 block(s), frag 0.000
+tier pool: frees during a batch held 870400 -> 870400 bytes, after the join 609280
+tier pool: 3 of 3 experts uploaded again into the freed room, 1 blocks, 870400 of 913408 bytes used
+tier pool: all freed, 0 bytes used, 0 live ranges, 1 block(s) kept
+tier pool: 8 tensors with no room for a block: the driver was asked 1 time(s); after the pool is destroyed a tensor fits
+PASS
+
+===== build-lat.txt (L4 VM) (sha256 00edf05e8e14166e5e37b7fff580be94e4bde4d9d08f9dd110030ff4b8ce1758): excerpt, the lines matching /warning/. the build of the tree with lat.patch; no line means no warning
+
+
+===== vk-tier-check-lat.txt (L4 VM) (sha256 ba6f0905bdfb70b8bc767936655a19f3974d777d48f292b125c97fe01528a8e9): excerpt, the lines matching /PASS|FAIL|passed|failed|ok$/. make -C c vk-tier-check VK=1 on Lavapipe, the tree with lat.patch
+[VK] tier test test: device 6765 of 12000 routed experts (56.4%; this test 6765 of 12000) | CPU RAM hits 0, disk loads 0 | resident 6 (budget 6, 486.0 KiB of 526.5 KiB, 1 blocks, frag 0.37) | uploads 13 (936.0 KiB, 0 warm), evictions 7, skipped 0 queue + 0 rate, failed 0 | device 1446.0 ms, CPU share 345.1 ms, waited 1306.1 ms (10% of device time hidden) | exclusive: 0 RAM copies of device experts given up first
+[VK] tier test test: device 82 of 156 routed experts (52.6%; this test 82 of 156) | CPU RAM hits 0, disk loads 0 | resident 2 (budget 2, 147.5 KiB of 184.4 KiB, 1 blocks, frag 0.00) | uploads 3 (216.0 KiB, 0 warm), evictions 1, skipped 0 queue + 0 rate, failed 0 | device 23.1 ms, CPU share 6.1 ms, waited 26.2 ms (0% of device time hidden) | exclusive: 0 RAM copies of device experts given up first
+[VK] tier test test: device 1973 of 3360 routed experts (58.7%; this test 1973 of 3360) | CPU RAM hits 0, disk loads 0 | resident 10 (budget 10, 405.0 KiB of 830.2 KiB, 1 blocks, frag 0.00) | uploads 12 (936.0 KiB, 0 warm), evictions 1, skipped 0 queue + 0 rate, failed 0 | device 170.2 ms, CPU share 67.2 ms, waited 152.8 ms (10% of device time hidden) | extra layers (1): 320 of 1680 routed experts on the device, resident 1 (budget 1) | exclusive: 0 RAM copies of device experts given up first
+[VK] tier test test: device 993 of 1920 routed experts (51.7%; this test 993 of 1920) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 4, 162.0 KiB of 506.2 KiB, 1 blocks, frag 0.08) | uploads 6 (468.0 KiB, 0 warm), evictions 1, skipped 0 queue + 3 rate, failed 0 | device 104.8 ms, CPU share 81.0 ms, waited 56.7 ms (46% of device time hidden) | extra layers (1): 214 of 720 routed experts on the device, resident 1 (budget 1) | exclusive: 0 RAM copies of device experts given up first
+[VK] tier test test: device 1118 of 1128 routed experts (99.1%; this test 1118 of 1128) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 8, 324.0 KiB of 506.2 KiB, 1 blocks, frag 0.00) | uploads 4 (144.0 KiB, 4 warm), evictions 0, skipped 0 queue + 10 rate, failed 0 | device 183.9 ms, CPU share 0.9 ms, waited 197.9 ms (0% of device time hidden) | exclusive: 0 RAM copies of device experts given up first | stream: 8 steps, 62 cold experts (2.5 MiB, 0.01 GB/s) and 505 rows streamed in 49 sub-batches, prefetched 16 (16 used), 2 cold experts (4 rows) kept on the CPU
+[VK] tier test test: device 1120 of 1128 routed experts (99.3%; this test 1120 of 1128) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 8, 648.0 KiB of 891.0 KiB, 1 blocks, frag 0.00) | uploads 4 (192.0 KiB, 4 warm), evictions 0, skipped 0 queue + 8 rate, failed 0 | device 151.7 ms, CPU share 0.7 ms, waited 157.5 ms (0% of device time hidden) | exclusive: 0 RAM copies of device experts given up first | stream: 8 steps, 63 cold experts (3.3 MiB, 0.12 GB/s) and 502 rows streamed in 36 sub-batches, prefetched 32 (32 used), 1 cold experts (2 rows) kept on the CPU
+[VK] tier test test: device 1117 of 1128 routed experts (99.0%; this test 1117 of 1128) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 8, 598.0 KiB of 934.4 KiB, 1 blocks, frag 0.00) | uploads 4 (288.0 KiB, 4 warm), evictions 0, skipped 0 queue + 11 rate, failed 0 | device 220.1 ms, CPU share 1.0 ms, waited 257.2 ms (0% of device time hidden) | exclusive: 0 RAM copies of device experts given up first | stream: 8 steps, 63 cold experts (4.6 MiB, 0.06 GB/s) and 497 rows streamed in 49 sub-batches, prefetched 16 (16 used), 1 cold experts (2 rows) kept on the CPU
+[VK] tier test test: device 1113 of 1128 routed experts (98.7%; this test 1113 of 1128) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 8, 540.0 KiB of 742.5 KiB, 1 blocks, frag 0.00) | uploads 4 (144.0 KiB, 4 warm), evictions 0, skipped 0 queue + 15 rate, failed 0 | device 139.9 ms, CPU share 1.6 ms, waited 133.3 ms (5% of device time hidden) | exclusive: 0 RAM copies of device experts given up first | stream: 8 steps, 61 cold experts (2.7 MiB, 0.08 GB/s) and 506 rows streamed in 36 sub-batches, prefetched 32 (31 used), 3 cold experts (6 rows) kept on the CPU
+[VK] tier test test: device 1118 of 1128 routed experts (99.1%; this test 1118 of 1128) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 8, 1.1 MiB of 1.8 MiB, 1 blocks, frag 0.00) | uploads 4 (576.0 KiB, 4 warm), evictions 0, skipped 0 queue + 10 rate, failed 0 | device 183.2 ms, CPU share 0.9 ms, waited 236.1 ms (0% of device time hidden) | exclusive: 0 RAM copies of device experts given up first | stream: 8 steps, 63 cold experts (8.9 MiB, 0.17 GB/s) and 518 rows streamed in 48 sub-batches, prefetched 16 (16 used), 1 cold experts (2 rows) kept on the CPU
+[VK] tier test test: device 1119 of 1128 routed experts (99.2%; this test 1119 of 1128) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 8, 540.0 KiB of 742.5 KiB, 1 blocks, frag 0.00) | uploads 4 (144.0 KiB, 4 warm), evictions 0, skipped 0 queue + 9 rate, failed 0 | device 178.5 ms, CPU share 0.9 ms, waited 175.7 ms (2% of device time hidden) | exclusive: 0 RAM copies of device experts given up first | stream: 8 steps, 63 cold experts (2.8 MiB, 0.08 GB/s) and 499 rows streamed in 36 sub-batches, prefetched 32 (32 used), 1 cold experts (2 rows) kept on the CPU
+[VK] tier test test: device 256 of 306 routed experts (83.7%; this test 256 of 306) | CPU RAM hits 0, disk loads 0 | resident 20 (budget 20, 5.0 MiB of 5.7 MiB, 1 blocks, frag 0.01) | uploads 20 (5.0 MiB, 0 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 178.1 ms, CPU share 21.5 ms, waited 159.7 ms (10% of device time hidden) | exclusive: 0 RAM copies of device experts given up first
+[VK] tier test test: device 2961 of 4320 routed experts (68.5%; this test 2961 of 4320) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 4, 928.0 KiB of 1.2 MiB, 1 blocks, frag 0.29) | uploads 8 (2.0 MiB, 0 warm), evictions 4, skipped 0 queue + 0 rate, failed 0 | device 659.4 ms, CPU share 528.4 ms, waited 318.2 ms (52% of device time hidden) | exclusive: 0 RAM copies of device experts given up first
+[VK] tier test test: device 1114 of 1128 routed experts (98.8%; this test 1114 of 1128) | CPU RAM hits 0, disk loads 0 | resident 2 (budget 2, 1.0 MiB of 1.2 MiB, 1 blocks, frag 0.00) | uploads 2 (464.0 KiB, 2 warm), evictions 0, skipped 0 queue + 14 rate, failed 0 | device 959.9 ms, CPU share 2.3 ms, waited 1073.5 ms (0% of device time hidden) | exclusive: 0 RAM copies of device experts given up first | stream: 8 steps, 71 cold experts (17.9 MiB, 0.14 GB/s) and 797 rows streamed in 80 sub-batches, prefetched 0 (0 used), 1 cold experts (2 rows) kept on the CPU
+[VK] tier test test: device 2647 of 2880 routed experts (91.9%; this test 2647 of 2880) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 4, 295.0 KiB of 331.9 KiB, 1 blocks, frag 0.27) | uploads 28 (2.0 MiB, 20 warm), evictions 8, skipped 0 queue + 0 rate, failed 0 | device 201.1 ms, CPU share 110.3 ms, waited 168.6 ms (16% of device time hidden) | in the dense chain: 1920 routed experts with no host step | hybrid: 76 steps, 233 host pool pairs computed by the CPU in place (110.3 ms, 473 us a pair) | exclusive: 0 RAM copies of device experts given up first | host pool: every expert (1.4 MiB of 1.4 MiB), 16 read from it, 8 moved up to the device (8 residents gave way); of the chain's routed experts 34.2% in the device's memory, 34.2% of a decode step's
+[VK] tier test test: device 2549 of 2880 routed experts (88.5%; this test 2549 of 2880) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 4, 295.0 KiB of 331.9 KiB, 1 blocks, frag 0.00) | uploads 20 (1.4 MiB, 20 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 146.8 ms, CPU share 121.5 ms, waited 116.5 ms (21% of device time hidden) | in the dense chain: 1920 routed experts with no host step | hybrid: 79 steps, 331 host pool pairs computed by the CPU in place (121.5 ms, 367 us a pair) | exclusive: 0 RAM copies of device experts given up first | host pool: resident 16 (budget 16, 1.2 MiB of 1.2 MiB); of the chain's routed experts 0.0% in the device's memory, 0.0% of a decode step's
+[VK] tier test test: device 103 of 138 routed experts (74.6%; this test 103 of 138) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 4, 1000.0 KiB of 1.1 MiB, 1 blocks, frag 0.01) | uploads 20 (4.9 MiB, 20 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 135.4 ms, CPU share 72.3 ms, waited 73.5 ms (46% of device time hidden) | hybrid: 10 steps, 35 host pool pairs computed by the CPU in place (72.3 ms, 2065 us a pair) | exclusive: 0 RAM copies of device experts given up first | host pool: resident 16 (budget 16, 3.9 MiB of 3.9 MiB)
+[VK] tier test test: device 223 of 258 routed experts (86.4%; this test 120 of 120) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 4, 1000.0 KiB of 1.1 MiB, 1 blocks, frag 0.01) | uploads 20 (4.9 MiB, 20 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 228.6 ms, CPU share 72.3 ms, waited 167.4 ms (27% of device time hidden) | hybrid: 10 steps, 35 host pool pairs computed by the CPU in place (72.3 ms, 2065 us a pair) | exclusive: 0 RAM copies of device experts given up first | host pool: resident 16 (budget 16, 3.9 MiB of 3.9 MiB)
+[VK] tier test test: device 138 of 138 routed experts (100.0%; this test 138 of 138) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 4, 1000.0 KiB of 1.1 MiB, 1 blocks, frag 0.01) | uploads 20 (4.9 MiB, 20 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 95.6 ms, CPU share 0.0 ms, waited 99.1 ms (0% of device time hidden) | exclusive: 0 RAM copies of device experts given up first | host pool: resident 16 (budget 16, 3.9 MiB of 3.9 MiB)
+[VK] tier test test: device 258 of 258 routed experts (100.0%; this test 120 of 120) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 4, 1000.0 KiB of 1.1 MiB, 1 blocks, frag 0.01) | uploads 20 (4.9 MiB, 20 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 184.9 ms, CPU share 0.0 ms, waited 189.2 ms (0% of device time hidden) | exclusive: 0 RAM copies of device experts given up first | host pool: resident 16 (budget 16, 3.9 MiB of 3.9 MiB)
+[VK] tier test test: device 102 of 138 routed experts (73.9%; this test 102 of 138) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 4, 864.0 KiB of 972.0 KiB, 1 blocks, frag 0.00) | uploads 20 (3.8 MiB, 20 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 62.3 ms, CPU share 95.7 ms, waited 21.8 ms (65% of device time hidden) | hybrid: 11 steps, 36 host pool pairs computed by the CPU in place (95.7 ms, 2659 us a pair) | exclusive: 0 RAM copies of device experts given up first | host pool: resident 16 (budget 16, 3.4 MiB of 3.4 MiB)
+[VK] tier test test: device 222 of 258 routed experts (86.0%; this test 120 of 120) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 4, 864.0 KiB of 972.0 KiB, 1 blocks, frag 0.00) | uploads 20 (3.8 MiB, 20 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 93.5 ms, CPU share 95.7 ms, waited 53.7 ms (43% of device time hidden) | hybrid: 11 steps, 36 host pool pairs computed by the CPU in place (95.7 ms, 2659 us a pair) | exclusive: 0 RAM copies of device experts given up first | host pool: resident 16 (budget 16, 3.4 MiB of 3.4 MiB)
+[VK] tier test test: device 138 of 138 routed experts (100.0%; this test 138 of 138) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 4, 864.0 KiB of 972.0 KiB, 1 blocks, frag 0.00) | uploads 20 (3.8 MiB, 20 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 24.9 ms, CPU share 0.0 ms, waited 27.9 ms (0% of device time hidden) | exclusive: 0 RAM copies of device experts given up first | host pool: resident 16 (budget 16, 3.4 MiB of 3.4 MiB)
+[VK] tier test test: device 258 of 258 routed experts (100.0%; this test 120 of 120) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 4, 864.0 KiB of 972.0 KiB, 1 blocks, frag 0.00) | uploads 20 (3.8 MiB, 20 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 54.1 ms, CPU share 0.0 ms, waited 57.6 ms (0% of device time hidden) | exclusive: 0 RAM copies of device experts given up first | host pool: resident 16 (budget 16, 3.4 MiB of 3.4 MiB)
+  sync: phase A resident 2 of 2; phase B device 60 of 120, resident 0 1, 1 0, 5 1, all 2 (budget 2), evictions 1, failed 0
+  extra: an f32 expert is 8 int4 ones; device main 1653 of 1680, extra 320 of 1680; resident main 10, extra 1 (its pool 294924 of 331776 bytes), evictions 1, failed 0, worst relative error 3.01e-07
+  extra, full tier: main resident 4 after the first phase; then main 4 + extra 1, extra device 214 of 720, evictions 1, failed 0, worst 2.88e-07
+  promote, every expert in the pool: device sets 0x3 / 0x3 after the warm start, 0x60 / 0x60 after batch steps on 5..9 (device 960 of 960 routed, relative error 3.25e-07), 0x1c / 0x4 after the chain's books on 2..4; 8 moved up, failed 0, resident 20
+  promote, a pool short of one expert: device sets 0x3 / 0x3 after the warm start, 0x3 / 0x3 after batch steps on 5..9 (device 960 of 960 routed, relative error 3.77e-07), 0x3 / 0x3 after the chain's books on 2..4; 0 moved up, failed 0, resident 20
+[VK] tier test test: device 111 of 138 routed experts (80.4%; this test 111 of 138) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 4, 1.5 MiB of 1.7 MiB, 1 blocks, frag 0.00) | uploads 20 (7.5 MiB, 20 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 72.2 ms, CPU share 76.9 ms, waited 31.1 ms (57% of device time hidden) | hybrid: 10 steps, 27 host pool pairs computed by the CPU in place (76.9 ms, 2849 us a pair) | exclusive: 0 RAM copies of device experts given up first | host pool: resident 16 (budget 16, 6.1 MiB of 6.1 MiB)
+[VK] tier test test: device 231 of 258 routed experts (89.5%; this test 120 of 120) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 4, 1.5 MiB of 1.7 MiB, 1 blocks, frag 0.00) | uploads 20 (7.5 MiB, 20 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 102.2 ms, CPU share 76.9 ms, waited 61.7 ms (40% of device time hidden) | hybrid: 10 steps, 27 host pool pairs computed by the CPU in place (76.9 ms, 2849 us a pair) | exclusive: 0 RAM copies of device experts given up first | host pool: resident 16 (budget 16, 6.1 MiB of 6.1 MiB)
+[VK] tier test test: device 138 of 138 routed experts (100.0%; this test 138 of 138) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 4, 1.5 MiB of 1.7 MiB, 1 blocks, frag 0.00) | uploads 20 (7.5 MiB, 20 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 23.4 ms, CPU share 0.0 ms, waited 26.5 ms (0% of device time hidden) | exclusive: 0 RAM copies of device experts given up first | host pool: resident 16 (budget 16, 6.1 MiB of 6.1 MiB)
+[VK] tier test test: device 258 of 258 routed experts (100.0%; this test 120 of 120) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 4, 1.5 MiB of 1.7 MiB, 1 blocks, frag 0.00) | uploads 20 (7.5 MiB, 20 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 57.4 ms, CPU share 0.0 ms, waited 61.2 ms (0% of device time hidden) | exclusive: 0 RAM copies of device experts given up first | host pool: resident 16 (budget 16, 6.1 MiB of 6.1 MiB)
+[VK] tier test test: device 108 of 138 routed experts (78.3%; this test 108 of 138) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 4, 180.0 KiB of 202.5 KiB, 1 blocks, frag 0.00) | uploads 20 (720.0 KiB, 20 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 136.0 ms, CPU share 82.5 ms, waited 65.1 ms (52% of device time hidden) | hybrid: 11 steps, 30 host pool pairs computed by the CPU in place (82.5 ms, 2749 us a pair) | exclusive: 0 RAM copies of device experts given up first | host pool: resident 16 (budget 16, 720.0 KiB of 724.0 KiB)
+[VK] tier test test: device 138 of 138 routed experts (100.0%; this test 138 of 138) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 4, 180.0 KiB of 202.5 KiB, 1 blocks, frag 0.00) | uploads 20 (720.0 KiB, 20 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 33.6 ms, CPU share 0.0 ms, waited 37.0 ms (0% of device time hidden) | exclusive: 0 RAM copies of device experts given up first | host pool: resident 16 (budget 16, 720.0 KiB of 724.0 KiB)
+[VK] tier test test: device 709 of 726 routed experts (97.7%; this test 709 of 726) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 4, 2.0 MiB of 2.1 MiB, 1 blocks, frag 0.01) | uploads 20 (4.9 MiB, 20 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 551.4 ms, CPU share 58.4 ms, waited 514.9 ms (7% of device time hidden) | hybrid: 0 steps, 0 host pool pairs computed by the CPU in place (58.4 ms, 3435 us a pair), and 5 prompt steps' 17 pairs | exclusive: 0 RAM copies of device experts given up first | stream: 8 steps, 0 cold experts (0.0 KiB, 0.00 GB/s) and 0 rows streamed in 37 sub-batches, prefetched 0 (0 used), 0 cold experts (0 rows) kept on the CPU, 53 host pool experts copied into the slots (12.9 MiB) | host pool: resident 16 (budget 16, 3.9 MiB of 3.9 MiB)
+[VK] tier test test: device 726 of 726 routed experts (100.0%; this test 726 of 726) | CPU RAM hits 0, disk loads 0 | resident 4 (budget 4, 1000.0 KiB of 2.1 MiB, 1 blocks, frag 0.00) | uploads 20 (4.9 MiB, 20 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 532.9 ms, CPU share 0.0 ms, waited 539.9 ms (0% of device time hidden) | exclusive: 0 RAM copies of device experts given up first | stream: 8 steps, 0 cold experts (0.0 KiB, 0.00 GB/s) and 0 rows streamed in 23 sub-batches, prefetched 0 (0 used), 0 cold experts (0 rows) kept on the CPU | host pool: resident 16 (budget 16, 3.9 MiB of 3.9 MiB)
+[VK] staged upload failed (commit: -2): the tensors are not resident
+[VK] expert batch: fence wait failed (2), the tier stops
+[VK] tier test: a batch failed, its experts are recomputed on the CPU and the tier stops
+PASS
+PASS
+
+===== make-check-1-bloccato.txt (sha256 e97b1db3a3382b86492fb911d0985ae399811784eca8835ec4647ad4accfddee of the whole log, not kept): excerpt, the last 9 lines of `env -u OMP_NUM_THREADS -u OMP_DYNAMIC make -C c check PYTHON=python3.12` on macOS arm64; the first run, killed when it stopped making progress
+  ok   STAT line follows the sentinel
+  ok   output ends with a bare LF
+test_serve_sentinel: ok
+make[2]: *** wait: No child processes.  Stop.
+make[2]: *** Waiting for unfinished jobs....
+make[2]: *** wait: No child processes.  Stop.
+make[1]: *** [test] Error 2
+make: *** [check] Terminated: 15
+rc=143
+
+===== make-check.txt (sha256 3508bfc4881b155891662128f197d118f770544573774f3218038b2447c1dad4 of the whole log, not kept): excerpt, the last 12 lines of `env -u OMP_NUM_THREADS -u OMP_DYNAMIC make -C c check PYTHON=python3.12` on macOS arm64; the second run, before the last two comments of c/backend_vulkan.c and the last words of docs/vulkan.md were written
+  [TUNE] applied measured profile · +20.0% calibration throughput
+  [TUNE] applied measured profile · +20.0% calibration throughput
+...............[plan] warning: sysctl core probe failed: [Errno 2] No such file or directory: 'sysctl'
+[plan] warning: lscpu core probe failed: [Errno 2] No such file or directory: 'lscpu'
+[plan] warning: physical-core probes unavailable; using 8 logical CPUs (SMT may over-subscribe). Set OMP_NUM_THREADS to physical cores if slow.
+........................................s.....................
+----------------------------------------------------------------------
+Ran 2763 tests in 194.027s
+
+OK (skipped=390)
+  nothing running — no serve on port 9123, no SERVE engines
+rc=0
+
+===== make-check-finale.txt (sha256 3dbd455783a8f756dcc4f58de7bdd6ae5ff1cfcb3c64f7ca6ae2c39158cd49f1 of the whole log, not kept): excerpt, the last 12 lines of `env -u OMP_NUM_THREADS -u OMP_DYNAMIC make -C c check PYTHON=python3.12` on macOS arm64; the third run, before the numbers in the paragraph of docs/vulkan.md were corrected (it said three tensors per expert)
+  [TUNE] applied measured profile · +20.0% calibration throughput
+...............[plan] warning: sysctl core probe failed: [Errno 2] No such file or directory: 'sysctl'
+[plan] warning: lscpu core probe failed: [Errno 2] No such file or directory: 'lscpu'
+[plan] warning: physical-core probes unavailable; using 8 logical CPUs (SMT may over-subscribe). Set OMP_NUM_THREADS to physical cores if slow.
+........................................s.....................
+----------------------------------------------------------------------
+Ran 2763 tests in 193.149s
+
+OK (skipped=390)
+  nothing running — no serve on port 9123, no SERVE engines
+
+# rc=0 after 803 s
+
+===== make-check-ultimo.txt (sha256 380f13eb3c9c630dc222e13cb92ebb334c6512f8485e23d56154f2c598f7cbfd of the whole log, not kept): excerpt, the last 12 lines of `env -u OMP_NUM_THREADS -u OMP_DYNAMIC make -C c check PYTHON=python3.12` on macOS arm64; the fourth run, on the final code and docs
+  [TUNE] applied measured profile · +20.0% calibration throughput
+...............[plan] warning: sysctl core probe failed: [Errno 2] No such file or directory: 'sysctl'
+[plan] warning: lscpu core probe failed: [Errno 2] No such file or directory: 'lscpu'
+[plan] warning: physical-core probes unavailable; using 8 logical CPUs (SMT may over-subscribe). Set OMP_NUM_THREADS to physical cores if slow.
+........................................s.....................
+----------------------------------------------------------------------
+Ran 2763 tests in 194.959s
+
+OK (skipped=390)
+  nothing running — no serve on port 9123, no SERVE engines
+
+# rc=0 after 805 s
+

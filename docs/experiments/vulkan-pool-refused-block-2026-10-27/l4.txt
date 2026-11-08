@@ -1,0 +1,1018 @@
+# Qwen3.6 on a Colab L4, mapped path: origin/dev against the change that remembers a refused block (2026-10-27)
+#
+# Question (written before the runs): on a card whose host-visible device-local type gives only part of its heap, origin/dev's
+#   tier start-up did not finish in 900 s (four earlier runs, not in this record). With the pool that remembers the refused block, does the
+#   mapped path start, how fast, with how many experts on the card, and does the staged path (which never meets a refusal) stay
+#   as it was? The mapped runs of dev are one run under a 300 s timeout and a backtrace taken at 150 s; the staged runs are
+#   dev2 lat lat dev2 (A B B A), 60 s of rest between all runs.
+# Hardware: a Colab L4 high-mem VM: NVIDIA L4 (23034 MiB, driver 580.82.07, BAR1 32768 MiB, nvidia-smi -q -d MEMORY), Vulkan
+#   through the driver's EGL library (an ICD json on libEGL_nvidia.so.0), 12 threads, 52 GiB of RAM, the model on /content/q36.
+# Model: Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64 (Hugging Face), Qwen3.6 35B-A3B, experts int4-g64.
+# Engines, cloned and built on the VM with make -C c qwen36 VK=1 (no CUDA). "dev2" in the names is the origin/dev tree
+#   (not COLI_VK_DEV2); "lat" is the same tree with the change:
+#   A (dev2)  origin/dev c1c06ac6fcb32157e4da130fd96775a32a757052, qwen36 sha256 eb657effa4d8e3f84acfdca5f4582d125f1af708170c216178bd9f279eeb7344
+#   B (lat)   the same tree with lat.patch (sha256 fd852f317a40e990eea47a072a995beb41ba301139245fe7ad724cd2707f687c), qwen36 sha256 9ba2ab1ed5d02b188020938aee15385eb313dee496139452c821369e4861e832
+#   lat.patch is c/backend_vulkan.c only (38 insertions, 4 deletions). The committed diff is another patch (checks.txt): the
+#   same engine code but for two comments completed after the runs, and more tests; docs/vulkan.md got a paragraph after the runs.
+# Each run, a new process from the tree's root:
+#   cp /content/storia.coli <model>/.coli_usage          (sha256 e0840c587a9c4f696b5504b25a816d3f27ae54dc266ea95289018e8726940796; written by the warm-up w; not kept here)
+#   env [COLI_VK_STAGED=1] COLI_VULKAN=1 COLI_NO_OMP_TUNE=1 OMP_NUM_THREADS=6 SNAP=/content/q36 N_NEW=32 \
+#     /usr/bin/time -v ./c/qwen36 256 4 <prompt>
+#   under timeout 600 (300 for m4), with nvidia-smi every 2 s beside it and, for the mapped runs, gdb -p <pid> -batch -ex 'thread apply all bt'
+#   150 s after the start (m4's is kept below). Prompts: plain-text prompts of 64 and 512 tokens ("[enc] prompt tokens" in the logs);
+#   their hashes were not recorded on the L4. 32 new tokens, free generation: the tok/s is of 32 tokens, only to see that a run works.
+# Read from each log: TTFT and Speed (the whole run); the tier's warm start line; the "tier qwen36 run" line (resident = experts on the
+#   card, failed = uploads that found no room). dev's mapped run never reached a generation, so there is no speed of dev on this card.
+# d0-sonda5.log (below, from an L4 VM of the same kind earlier the same day; its driver version was not recorded): sonda5.c (below too, not in the repository)
+#   fills the host-visible device-local type with 256 MiB blocks until the driver refuses and then times eight more asks of 256 MiB and eight of 1 GiB: each
+#   refusal took 592 to 600 ms (256 MiB) and 651 to 655 ms (1 GiB). This is the cost that origin/dev pays for each upload that finds no room, one refusal per refused expert (read in the code,
+#   not counted in a stuck start-up). The backtrace of m4-dev2-mapped-gdb.txt, taken 150 s into that start-up, shows one thread inside the driver
+#   (libnvidia-eglcore.so.580.82.07) called from vk_mem_alloc and pool_suballoc, and the other threads waiting for the pool's mutex.
+# run                  tree  env               input ended                              warm start (experts)           experts on the card / uploads refused   first token   speed
+# w                    dev2  COLI_VK_STAGED=1  p64   finished                           28.1 s (10240 experts)       10240 / 0                              0.896 s       22.31 tok/s
+# m1-lat-mapped        lat   -                 p64   finished                           23.2 s (10240 experts)       4702 / 5538                            0.526 s       15.22 tok/s
+# m2-lat-mapped        lat   -                 p64   finished                           19.5 s (10240 experts)       4702 / 5538                            0.602 s       22.35 tok/s
+# m3-lat-mapped-p512   lat   -                 p512  finished                           18.1 s (10240 experts)       4669 / 5538                            6.991 s       3.84 tok/s
+# m4-dev2-mapped       dev2  -                 p64   stopped by timeout 300 s (rc 124), still in the tier start-up not reached                  -                                      -             -
+# s1-dev2-staged       dev2  COLI_VK_STAGED=1  p64   finished                           20.6 s (10240 experts)       10240 / 0                              0.325 s       37.28 tok/s
+# s2-lat-staged        lat   COLI_VK_STAGED=1  p64   finished                           20.6 s (10240 experts)       10240 / 0                              0.335 s       36.82 tok/s
+# s3-lat-staged        lat   COLI_VK_STAGED=1  p64   finished                           20.8 s (10240 experts)       10240 / 0                              0.335 s       36.81 tok/s
+# s4-dev2-staged       dev2  COLI_VK_STAGED=1  p64   finished                           20.6 s (10240 experts)       10240 / 0                              0.410 s       33.91 tok/s
+
+===== w.log (sha256 85f90ff3da90d0d5d9b4695662b51c195eedc751de599fa76762d7662b862a2f): dev2 p64, COLI_VK_STAGED=1, warm-up, empty history (whole log)
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[enc] prompt tokens: 64 | generating 32 new tokens
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 10.5s | RSS after load: 4.83 GB
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] staged uploads: copied straight from host memory where its pages import (4 KiB pages; COLI_VK_UP_IMPORT=0 stages every copy)
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 23034 MiB heap) copied from host staging memory (type 2) on a transfer queue (COLI_VK_STAGED=1)
+[VK] ready: NVIDIA L4, compute qfam 0, memtype 4, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix), staged uploads
+[VK] qwen36: device ready, dense matrices on the device (default)
+[VK] qwen36: dense chain on (a discrete GPU, beside the expert tier)
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[VK] qwen36 chain fit: free 23603052544 B, reserve 1073741824 B, fixed 555838720 B (the engine's 69299456 B, the pools' 486539264 B), tail 509552640 B, layers 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 B, matrices 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 B
+[VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 21.98 GiB, reserve 1.00 GiB)
+[VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+[VK] qwen36: dense weights on the device only (a discrete GPU with room for them: 1.81 of 20.91 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1744830464 B
+[VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+[VK] chain: chain_moe.spv took 8.8 s to build
+[VK] chain: 20 pipelines made before the expert tier, in 20.8 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+[VK] qwen36: 291 dense matrices on the device only, 1.81 GiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the DeltaNet's a/b rows and the shared expert's gate vector, norms, the vision tower, any imported pages; RSS now 2.958 GiB
+[VK] tier qwen36: on, NVIDIA L4, budget 18.86 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[qwen36] int4 packed weights detected — kept int4, rows interleaved by 16 for expert_ffn.h (Q36_ILV16=0 keeps the rows)
+[VK] tier qwen36: warm start, 10240 experts in 28.1s (0 from the history, 10240 more to fill the device: every expert of the model)
+Generated (32 new tokens):
+Text : [qwen36] KV cache: float16, 0.00 GiB at 96 positions (half of float32; Q36_KV=f32 keeps float32)
+[VK] qwen36 chain: prompt chunks of up to 3840 rows (389 KiB a row; 2.85 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+, e li fa comparire innanzi a'
+nostri occhi, come se fossero presenti.
+
+  _A. MARIANI._
+
+Il Manz
+TTFT: 0.896 s (time to first token)
+[qwen36 spec gate] run: T(1) 16.6 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] run: 1.00 tokens/forward (31 forwards per 31 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 0 declined, 0 probes
+
+PEAK RSS: 4.83 GB
+Expert cache hit rate: 0.0% (hit=0 miss=0)
+Speed: 22.31 tok/s (1.4s for 32 tokens)
+[VK] qwen36: 0 matmuls on the GPU (362 matrices resident, 1863.9 MiB; placed int8 291, int4 0, f32 0)
+[VK] qwen36 chain: 32 forwards, 435 frames (27424 ops, 11552 matmuls, 320 tiled GEMM), 815.4 ms waiting for the device, 0.0 ms of routed experts on the host, 1280 layer steps with the routed experts in the frame (40 of them a prompt chunk's, 0 in the integer form), 119.9 MiB on the device
+[VK] tier qwen36 run: device 30400 of 30400 routed experts (100.0%; this run 30400 of 30400) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.86 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 0.0 ms, CPU share 0.0 ms, waited 0.0 ms (0% of device time hidden) | balance: device share 1.00, 0 rows handed to the CPU | in the dense chain: 30400 routed experts with no host step | exclusive: 0 RAM copies of device experts given up first
+[VK] memory at exit: weights 1863.9 MiB, expert tier 17280.0 MiB (peaks), KV mirror 0.0 MiB in memory type 1 (device-local, not host-visible); the dense chain's state in type 1 (device-local); 19143.9 MiB staged in 62164 copies (10677 submits), 19140.3 MiB of them straight from host memory in 61802 copies (0 not imported), 75 blocks zero-filled; resident data in host memory: 0.0 MiB
+[VK] qwen36: dense weights at exit: 291 matrices on the device only (1.81 GiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 2.887 GiB
+	Command being timed: "./c/qwen36 256 4 /content/prompt/p64.txt"
+	User time (seconds): 97.20
+	System time (seconds): 35.93
+	Percent of CPU this job got: 163%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:21.50
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 5063644
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 184
+	Minor (reclaiming a frame) page faults: 3620753
+	Voluntary context switches: 35983
+	Involuntary context switches: 436
+	Swaps: 0
+	File system inputs: 2205504
+	File system outputs: 7512
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+===== m1-lat-mapped.log (sha256 7c4b4ec6a0deac0198608a9290a5c19e01317d35e70ee7ea5ae45b2706429c2e): lat p64 (whole log)
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[enc] prompt tokens: 64 | generating 32 new tokens
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 10.2s | RSS after load: 4.83 GB
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] ready: NVIDIA L4, compute qfam 0, memtype 4, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix)
+[VK] qwen36: device ready, dense matrices on the device (default)
+[VK] qwen36: dense chain on (a discrete GPU, beside the expert tier)
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[VK] qwen36 chain fit: free 23603249152 B, reserve 1073741824 B, fixed 555838720 B (the engine's 69299456 B, the pools' 486539264 B), tail 509552640 B, layers 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 B, matrices 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 B
+[VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 21.98 GiB, reserve 1.00 GiB)
+[VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+[VK] qwen36: dense weights on the device only (a discrete GPU with room for them: 1.81 of 20.91 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1811939328 B
+[VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+[VK] chain: 20 pipelines made before the expert tier, in 0.2 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+[VK] qwen36: 291 dense matrices on the device only, 1.81 GiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the DeltaNet's a/b rows and the shared expert's gate vector, norms, the vision tower, any imported pages; RSS now 2.846 GiB
+[USAGE] expert history: 30400 selections (/content/q36/.coli_usage)
+[VK] tier qwen36: on, NVIDIA L4, budget 18.79 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[qwen36] int4 packed weights detected — kept int4, rows interleaved by 16 for expert_ffn.h (Q36_ILV16=0 keeps the rows)
+[VK] tier qwen36: warm start, 10240 experts in 23.2s (3882 from the history, 6358 more to fill the device: every expert of the model)
+Generated (32 new tokens):
+Text : [qwen36] KV cache: float16, 0.00 GiB at 96 positions (half of float32; Q36_KV=f32 keeps float32)
+[VK] qwen36 chain: prompt chunks of up to 8192 rows (389 KiB a row; 12.04 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[VK] tier qwen36: no device memory for the streaming slots, cold experts stay on the CPU
+, e li fa comparire innanzi a'
+nostri occhi, come se fossero presenti.
+
+  _A. MARIANI._
+
+Il Manz
+TTFT: 0.526 s (time to first token)
+[qwen36 spec gate] run: T(1) 30.6 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] run: 1.00 tokens/forward (31 forwards per 31 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 0 declined, 0 probes
+
+PEAK RSS: 4.83 GB
+Expert cache hit rate: 0.0% (hit=0 miss=38)
+Speed: 15.22 tok/s (2.1s for 32 tokens)
+[VK] qwen36: 0 matmuls on the GPU (362 matrices resident, 1863.9 MiB; placed int8 291, int4 0, f32 0)
+[VK] qwen36 chain: 32 forwards, 2703 frames (22184 ops, 11552 matmuls, 320 tiled GEMM), 520.8 ms waiting for the device, 1298.5 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 0 in the integer form), 110.7 MiB on the device
+[VK] tier qwen36 run: device 30362 of 30400 routed experts (99.9%; this run 30362 of 30400) | CPU RAM hits 0, disk loads 38 | resident 4702 (budget 4702, 7.75 GiB of 18.79 GiB, 31 blocks, frag 0.59) | uploads 4702 (6.89 GiB, 4702 warm), evictions 0, skipped 0 queue + 0 rate, failed 5538 | device 272.1 ms, CPU share 90.7 ms, waited 366.9 ms (0% of device time hidden) | failed: 5538 refused by the pool, 0 copies to the device, 0 not taken by the batch | balance: device share 1.00, 0 rows handed to the CPU | exclusive: 0 RAM copies of device experts given up first
+[VK] qwen36: dense weights at exit: 291 matrices on the device only (1.81 GiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 2.851 GiB
+	Command being timed: "./c/qwen36 256 4 /content/prompt/p64.txt"
+	User time (seconds): 141.04
+	System time (seconds): 16.48
+	Percent of CPU this job got: 400%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:39.31
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 5063632
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 3595257
+	Voluntary context switches: 12648
+	Involuntary context switches: 878
+	Swaps: 0
+	File system inputs: 38564112
+	File system outputs: 400
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+===== m2-lat-mapped.log (sha256 3fb0df4822d378b00462c3bca5494b7dc6489f63dec53a8e200f79fd7d17c504): lat p64 (whole log)
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[enc] prompt tokens: 64 | generating 32 new tokens
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 9.8s | RSS after load: 4.83 GB
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] ready: NVIDIA L4, compute qfam 0, memtype 4, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix)
+[VK] qwen36: device ready, dense matrices on the device (default)
+[VK] qwen36: dense chain on (a discrete GPU, beside the expert tier)
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[VK] qwen36 chain fit: free 23603249152 B, reserve 1073741824 B, fixed 555838720 B (the engine's 69299456 B, the pools' 486539264 B), tail 509552640 B, layers 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 B, matrices 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 B
+[VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 21.98 GiB, reserve 1.00 GiB)
+[VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+[VK] qwen36: dense weights on the device only (a discrete GPU with room for them: 1.81 of 20.91 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1811939328 B
+[VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+[VK] chain: 20 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+[VK] qwen36: 291 dense matrices on the device only, 1.81 GiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the DeltaNet's a/b rows and the shared expert's gate vector, norms, the vision tower, any imported pages; RSS now 2.821 GiB
+[USAGE] expert history: 30400 selections (/content/q36/.coli_usage)
+[VK] tier qwen36: on, NVIDIA L4, budget 18.79 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[qwen36] int4 packed weights detected — kept int4, rows interleaved by 16 for expert_ffn.h (Q36_ILV16=0 keeps the rows)
+[VK] tier qwen36: warm start, 10240 experts in 19.5s (3882 from the history, 6358 more to fill the device: every expert of the model)
+Generated (32 new tokens):
+Text : [qwen36] KV cache: float16, 0.00 GiB at 96 positions (half of float32; Q36_KV=f32 keeps float32)
+[VK] qwen36 chain: prompt chunks of up to 8192 rows (389 KiB a row; 12.04 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[VK] tier qwen36: no device memory for the streaming slots, cold experts stay on the CPU
+, e li fa comparire innanzi a'
+nostri occhi, come se fossero presenti.
+
+  _A. MARIANI._
+
+Il Manz
+TTFT: 0.602 s (time to first token)
+[qwen36 spec gate] run: T(1) 26.1 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] run: 1.00 tokens/forward (31 forwards per 31 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 0 declined, 0 probes
+
+PEAK RSS: 4.83 GB
+Expert cache hit rate: 0.0% (hit=0 miss=38)
+Speed: 22.35 tok/s (1.4s for 32 tokens)
+[VK] qwen36: 0 matmuls on the GPU (362 matrices resident, 1863.9 MiB; placed int8 291, int4 0, f32 0)
+[VK] qwen36 chain: 32 forwards, 2703 frames (22184 ops, 11552 matmuls, 320 tiled GEMM), 542.7 ms waiting for the device, 630.7 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 0 in the integer form), 110.7 MiB on the device
+[VK] tier qwen36 run: device 30362 of 30400 routed experts (99.9%; this run 30362 of 30400) | CPU RAM hits 0, disk loads 38 | resident 4702 (budget 4702, 7.75 GiB of 18.79 GiB, 31 blocks, frag 0.59) | uploads 4702 (6.89 GiB, 4702 warm), evictions 0, skipped 0 queue + 0 rate, failed 5538 | device 323.1 ms, CPU share 93.0 ms, waited 419.8 ms (0% of device time hidden) | failed: 5538 refused by the pool, 0 copies to the device, 0 not taken by the batch | balance: device share 1.00, 0 rows handed to the CPU | exclusive: 0 RAM copies of device experts given up first
+[VK] qwen36: dense weights at exit: 291 matrices on the device only (1.81 GiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 2.839 GiB
+	Command being timed: "./c/qwen36 256 4 /content/prompt/p64.txt"
+	User time (seconds): 116.14
+	System time (seconds): 15.63
+	Percent of CPU this job got: 407%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:32.37
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 5063688
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 3591717
+	Voluntary context switches: 9514
+	Involuntary context switches: 665
+	Swaps: 0
+	File system inputs: 32529664
+	File system outputs: 112
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+===== m3-lat-mapped-p512.log (sha256 1e70538bc1ac3ce84f749fef7b83652321638278c601f9ccf66c112b4cb9f30c): lat p512 (whole log)
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[enc] prompt tokens: 512 | generating 32 new tokens
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 9.7s | RSS after load: 4.83 GB
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] ready: NVIDIA L4, compute qfam 0, memtype 4, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix)
+[VK] qwen36: device ready, dense matrices on the device (default)
+[VK] qwen36: dense chain on (a discrete GPU, beside the expert tier)
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[VK] qwen36 chain fit: free 23603249152 B, reserve 1073741824 B, fixed 555838720 B (the engine's 69299456 B, the pools' 486539264 B), tail 509552640 B, layers 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 B, matrices 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 B
+[VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 21.98 GiB, reserve 1.00 GiB)
+[VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+[VK] qwen36: dense weights on the device only (a discrete GPU with room for them: 1.81 of 20.91 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1811939328 B
+[VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+[VK] chain: 20 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+[VK] qwen36: 291 dense matrices on the device only, 1.81 GiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the DeltaNet's a/b rows and the shared expert's gate vector, norms, the vision tower, any imported pages; RSS now 2.822 GiB
+[USAGE] expert history: 30400 selections (/content/q36/.coli_usage)
+[VK] tier qwen36: on, NVIDIA L4, budget 18.79 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[qwen36] int4 packed weights detected — kept int4, rows interleaved by 16 for expert_ffn.h (Q36_ILV16=0 keeps the rows)
+[VK] tier qwen36: warm start, 10240 experts in 18.1s (3882 from the history, 6358 more to fill the device: every expert of the model)
+Generated (32 new tokens):
+Text : [qwen36] KV cache: float16, 0.01 GiB at 544 positions (half of float32; Q36_KV=f32 keeps float32)
+[VK] qwen36 chain: prompt chunks of up to 8192 rows (389 KiB a row; 12.04 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[VK] tier qwen36: no device memory for the streaming slots, cold experts stay on the CPU
+
+ragione non mi può muovere a narrare, che il solo desiderio di
+soddisfare a chi mi ha pregato di farne la
+TTFT: 6.991 s (time to first token)
+[qwen36 spec gate] run: T(1) 37.3 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] run: 1.00 tokens/forward (31 forwards per 31 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 3 declined, 0 probes
+
+PEAK RSS: 8.80 GB
+Expert cache hit rate: 83.7% (hit=9955 miss=1939)
+Speed: 3.84 tok/s (8.3s for 32 tokens)
+[VK] qwen36: 0 matmuls on the GPU (362 matrices resident, 1863.9 MiB; placed int8 291, int4 0, f32 0)
+[VK] qwen36 chain: 32 forwards, 2703 frames (22494 ops, 11552 matmuls, 320 tiled GEMM), 1028.5 ms waiting for the device, 6944.4 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 0 in the integer form), 241.9 MiB on the device
+[VK] tier qwen36 run: device 161866 of 173760 routed experts (93.2%; this run 161866 of 173760) | CPU RAM hits 9955, disk loads 1939 | resident 4669 (budget 4702, 7.70 GiB of 18.79 GiB, 31 blocks, frag 0.98) | uploads 4904 (7.18 GiB, 4702 warm), evictions 235, skipped 61 queue + 29 rate, failed 5538 | device 927.6 ms, CPU share 6161.4 ms, waited 379.8 ms (59% of device time hidden) | failed: 5538 refused by the pool, 0 copies to the device, 0 not taken by the batch | balance: device share 0.07, 347 rows handed to the CPU | exclusive: 0 RAM copies of device experts given up first
+[VK] qwen36: dense weights at exit: 291 matrices on the device only (1.81 GiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 8.653 GiB
+	Command being timed: "./c/qwen36 256 4 /content/prompt/p512.txt"
+	User time (seconds): 151.74
+	System time (seconds): 20.21
+	Percent of CPU this job got: 449%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:38.23
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 9229320
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 5115890
+	Voluntary context switches: 12707
+	Involuntary context switches: 786
+	Swaps: 0
+	File system inputs: 41089272
+	File system outputs: 152
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+===== m4-dev2-mapped.log (sha256 e9b00b8aba15f4de8469eb5392e36f1128124148d0a90e7d1716e61d8c239851): dev2 p64, stopped by timeout 300 (whole log)
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[enc] prompt tokens: 64 | generating 32 new tokens
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 9.8s | RSS after load: 4.83 GB
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] ready: NVIDIA L4, compute qfam 0, memtype 4, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix)
+[VK] qwen36: device ready, dense matrices on the device (default)
+[VK] qwen36: dense chain on (a discrete GPU, beside the expert tier)
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[VK] qwen36 chain fit: free 23603249152 B, reserve 1073741824 B, fixed 555838720 B (the engine's 69299456 B, the pools' 486539264 B), tail 509552640 B, layers 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 B, matrices 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 B
+[VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 21.98 GiB, reserve 1.00 GiB)
+[VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+[VK] qwen36: dense weights on the device only (a discrete GPU with room for them: 1.81 of 20.91 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1811939328 B
+[VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+[VK] chain: 20 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+[VK] qwen36: 291 dense matrices on the device only, 1.81 GiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the DeltaNet's a/b rows and the shared expert's gate vector, norms, the vision tower, any imported pages; RSS now 2.821 GiB
+[USAGE] expert history: 30400 selections (/content/q36/.coli_usage)
+[VK] tier qwen36: on, NVIDIA L4, budget 18.79 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[qwen36] int4 packed weights detected — kept int4, rows interleaved by 16 for expert_ffn.h (Q36_ILV16=0 keeps the rows)
+[qwen36] int4 packed weights detected — kept int4, rows interleaved by 16 for expert_ffn.h (Q36_ILV16=0 keeps the rows)
+
+===== s1-dev2-staged.log (sha256 b3d284af003859f8f2617d01c3c08981d5b18976695cccd7ca2a85d0ba9b0afb): dev2 p64, COLI_VK_STAGED=1 (whole log)
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[enc] prompt tokens: 64 | generating 32 new tokens
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 9.8s | RSS after load: 4.83 GB
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] staged uploads: copied straight from host memory where its pages import (4 KiB pages; COLI_VK_UP_IMPORT=0 stages every copy)
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 23034 MiB heap) copied from host staging memory (type 2) on a transfer queue (COLI_VK_STAGED=1)
+[VK] ready: NVIDIA L4, compute qfam 0, memtype 4, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix), staged uploads
+[VK] qwen36: device ready, dense matrices on the device (default)
+[VK] qwen36: dense chain on (a discrete GPU, beside the expert tier)
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[VK] qwen36 chain fit: free 23603052544 B, reserve 1073741824 B, fixed 555838720 B (the engine's 69299456 B, the pools' 486539264 B), tail 509552640 B, layers 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 B, matrices 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 B
+[VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 21.98 GiB, reserve 1.00 GiB)
+[VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+[VK] qwen36: dense weights on the device only (a discrete GPU with room for them: 1.81 of 20.91 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1744830464 B
+[VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+[VK] chain: 20 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+[VK] qwen36: 291 dense matrices on the device only, 1.81 GiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the DeltaNet's a/b rows and the shared expert's gate vector, norms, the vision tower, any imported pages; RSS now 2.916 GiB
+[USAGE] expert history: 30400 selections (/content/q36/.coli_usage)
+[VK] tier qwen36: on, NVIDIA L4, budget 18.86 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[qwen36] int4 packed weights detected — kept int4, rows interleaved by 16 for expert_ffn.h (Q36_ILV16=0 keeps the rows)
+[VK] tier qwen36: warm start, 10240 experts in 20.6s (3882 from the history, 6358 more to fill the device: every expert of the model)
+Generated (32 new tokens):
+Text : [qwen36] KV cache: float16, 0.00 GiB at 96 positions (half of float32; Q36_KV=f32 keeps float32)
+[VK] qwen36 chain: prompt chunks of up to 3840 rows (389 KiB a row; 2.85 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+, e li fa comparire innanzi a'
+nostri occhi, come se fossero presenti.
+
+  _A. MARIANI._
+
+Il Manz
+TTFT: 0.325 s (time to first token)
+[qwen36 spec gate] run: T(1) 16.5 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] run: 1.00 tokens/forward (31 forwards per 31 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 0 declined, 0 probes
+
+PEAK RSS: 4.83 GB
+Expert cache hit rate: 0.0% (hit=0 miss=0)
+Speed: 37.28 tok/s (0.9s for 32 tokens)
+[VK] qwen36: 0 matmuls on the GPU (362 matrices resident, 1863.9 MiB; placed int8 291, int4 0, f32 0)
+[VK] qwen36 chain: 32 forwards, 435 frames (27424 ops, 11552 matmuls, 320 tiled GEMM), 700.5 ms waiting for the device, 0.0 ms of routed experts on the host, 1280 layer steps with the routed experts in the frame (40 of them a prompt chunk's, 0 in the integer form), 119.9 MiB on the device
+[VK] tier qwen36 run: device 30400 of 30400 routed experts (100.0%; this run 30400 of 30400) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.86 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 0.0 ms, CPU share 0.0 ms, waited 0.0 ms (0% of device time hidden) | balance: device share 1.00, 0 rows handed to the CPU | in the dense chain: 30400 routed experts with no host step | exclusive: 0 RAM copies of device experts given up first
+[VK] memory at exit: weights 1863.9 MiB, expert tier 17280.0 MiB (peaks), KV mirror 0.0 MiB in memory type 1 (device-local, not host-visible); the dense chain's state in type 1 (device-local); 19143.9 MiB staged in 62164 copies (10677 submits), 19140.3 MiB of them straight from host memory in 61802 copies (0 not imported), 75 blocks zero-filled; resident data in host memory: 0.0 MiB
+[VK] qwen36: dense weights at exit: 291 matrices on the device only (1.81 GiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 2.862 GiB
+	Command being timed: "./c/qwen36 256 4 /content/prompt/p64.txt"
+	User time (seconds): 55.71
+	System time (seconds): 33.91
+	Percent of CPU this job got: 270%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:33.08
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 5063764
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 3597772
+	Voluntary context switches: 22734
+	Involuntary context switches: 340
+	Swaps: 0
+	File system inputs: 28771904
+	File system outputs: 112
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+===== s2-lat-staged.log (sha256 93a4ee0cd2d2135d003c7146ed4d0e46535d530188925a230c144534524b9c54): lat p64, COLI_VK_STAGED=1 (whole log)
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[enc] prompt tokens: 64 | generating 32 new tokens
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 10.0s | RSS after load: 4.83 GB
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] staged uploads: copied straight from host memory where its pages import (4 KiB pages; COLI_VK_UP_IMPORT=0 stages every copy)
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 23034 MiB heap) copied from host staging memory (type 2) on a transfer queue (COLI_VK_STAGED=1)
+[VK] ready: NVIDIA L4, compute qfam 0, memtype 4, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix), staged uploads
+[VK] qwen36: device ready, dense matrices on the device (default)
+[VK] qwen36: dense chain on (a discrete GPU, beside the expert tier)
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[VK] qwen36 chain fit: free 23603052544 B, reserve 1073741824 B, fixed 555838720 B (the engine's 69299456 B, the pools' 486539264 B), tail 509552640 B, layers 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 B, matrices 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 B
+[VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 21.98 GiB, reserve 1.00 GiB)
+[VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+[VK] qwen36: dense weights on the device only (a discrete GPU with room for them: 1.81 of 20.91 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1744830464 B
+[VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+[VK] chain: 20 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+[VK] qwen36: 291 dense matrices on the device only, 1.81 GiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the DeltaNet's a/b rows and the shared expert's gate vector, norms, the vision tower, any imported pages; RSS now 2.916 GiB
+[USAGE] expert history: 30400 selections (/content/q36/.coli_usage)
+[VK] tier qwen36: on, NVIDIA L4, budget 18.86 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[qwen36] int4 packed weights detected — kept int4, rows interleaved by 16 for expert_ffn.h (Q36_ILV16=0 keeps the rows)
+[VK] tier qwen36: warm start, 10240 experts in 20.6s (3882 from the history, 6358 more to fill the device: every expert of the model)
+Generated (32 new tokens):
+Text : [qwen36] KV cache: float16, 0.00 GiB at 96 positions (half of float32; Q36_KV=f32 keeps float32)
+[VK] qwen36 chain: prompt chunks of up to 3840 rows (389 KiB a row; 2.85 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+, e li fa comparire innanzi a'
+nostri occhi, come se fossero presenti.
+
+  _A. MARIANI._
+
+Il Manz
+TTFT: 0.335 s (time to first token)
+[qwen36 spec gate] run: T(1) 16.5 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] run: 1.00 tokens/forward (31 forwards per 31 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 0 declined, 0 probes
+
+PEAK RSS: 4.83 GB
+Expert cache hit rate: 0.0% (hit=0 miss=0)
+Speed: 36.82 tok/s (0.9s for 32 tokens)
+[VK] qwen36: 0 matmuls on the GPU (362 matrices resident, 1863.9 MiB; placed int8 291, int4 0, f32 0)
+[VK] qwen36 chain: 32 forwards, 435 frames (27424 ops, 11552 matmuls, 320 tiled GEMM), 711.6 ms waiting for the device, 0.0 ms of routed experts on the host, 1280 layer steps with the routed experts in the frame (40 of them a prompt chunk's, 0 in the integer form), 119.9 MiB on the device
+[VK] tier qwen36 run: device 30400 of 30400 routed experts (100.0%; this run 30400 of 30400) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.86 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 0.0 ms, CPU share 0.0 ms, waited 0.0 ms (0% of device time hidden) | balance: device share 1.00, 0 rows handed to the CPU | in the dense chain: 30400 routed experts with no host step | exclusive: 0 RAM copies of device experts given up first
+[VK] memory at exit: weights 1863.9 MiB, expert tier 17280.0 MiB (peaks), KV mirror 0.0 MiB in memory type 1 (device-local, not host-visible); the dense chain's state in type 1 (device-local); 19143.9 MiB staged in 62164 copies (10677 submits), 19140.3 MiB of them straight from host memory in 61802 copies (0 not imported), 75 blocks zero-filled; resident data in host memory: 0.0 MiB
+[VK] qwen36: dense weights at exit: 291 matrices on the device only (1.81 GiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 2.862 GiB
+	Command being timed: "./c/qwen36 256 4 /content/prompt/p64.txt"
+	User time (seconds): 59.22
+	System time (seconds): 34.38
+	Percent of CPU this job got: 280%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:33.34
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 5063632
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 3597741
+	Voluntary context switches: 21503
+	Involuntary context switches: 419
+	Swaps: 0
+	File system inputs: 33022224
+	File system outputs: 120
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+===== s3-lat-staged.log (sha256 0d40cfdf14b6e42d849da9a12c16a146dba34fbe957eae914600b301251244e3): lat p64, COLI_VK_STAGED=1 (whole log)
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[enc] prompt tokens: 64 | generating 32 new tokens
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 9.8s | RSS after load: 4.83 GB
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] staged uploads: copied straight from host memory where its pages import (4 KiB pages; COLI_VK_UP_IMPORT=0 stages every copy)
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 23034 MiB heap) copied from host staging memory (type 2) on a transfer queue (COLI_VK_STAGED=1)
+[VK] ready: NVIDIA L4, compute qfam 0, memtype 4, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix), staged uploads
+[VK] qwen36: device ready, dense matrices on the device (default)
+[VK] qwen36: dense chain on (a discrete GPU, beside the expert tier)
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[VK] qwen36 chain fit: free 23603052544 B, reserve 1073741824 B, fixed 555838720 B (the engine's 69299456 B, the pools' 486539264 B), tail 509552640 B, layers 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 B, matrices 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 B
+[VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 21.98 GiB, reserve 1.00 GiB)
+[VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+[VK] qwen36: dense weights on the device only (a discrete GPU with room for them: 1.81 of 20.91 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1744830464 B
+[VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+[VK] chain: 20 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+[VK] qwen36: 291 dense matrices on the device only, 1.81 GiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the DeltaNet's a/b rows and the shared expert's gate vector, norms, the vision tower, any imported pages; RSS now 2.916 GiB
+[USAGE] expert history: 30400 selections (/content/q36/.coli_usage)
+[VK] tier qwen36: on, NVIDIA L4, budget 18.86 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[qwen36] int4 packed weights detected — kept int4, rows interleaved by 16 for expert_ffn.h (Q36_ILV16=0 keeps the rows)
+[VK] tier qwen36: warm start, 10240 experts in 20.8s (3882 from the history, 6358 more to fill the device: every expert of the model)
+Generated (32 new tokens):
+Text : [qwen36] KV cache: float16, 0.00 GiB at 96 positions (half of float32; Q36_KV=f32 keeps float32)
+[VK] qwen36 chain: prompt chunks of up to 3840 rows (389 KiB a row; 2.85 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+, e li fa comparire innanzi a'
+nostri occhi, come se fossero presenti.
+
+  _A. MARIANI._
+
+Il Manz
+TTFT: 0.335 s (time to first token)
+[qwen36 spec gate] run: T(1) 16.6 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] run: 1.00 tokens/forward (31 forwards per 31 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 0 declined, 0 probes
+
+PEAK RSS: 4.83 GB
+Expert cache hit rate: 0.0% (hit=0 miss=0)
+Speed: 36.81 tok/s (0.9s for 32 tokens)
+[VK] qwen36: 0 matmuls on the GPU (362 matrices resident, 1863.9 MiB; placed int8 291, int4 0, f32 0)
+[VK] qwen36 chain: 32 forwards, 435 frames (27424 ops, 11552 matmuls, 320 tiled GEMM), 710.8 ms waiting for the device, 0.0 ms of routed experts on the host, 1280 layer steps with the routed experts in the frame (40 of them a prompt chunk's, 0 in the integer form), 119.9 MiB on the device
+[VK] tier qwen36 run: device 30400 of 30400 routed experts (100.0%; this run 30400 of 30400) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.86 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 0.0 ms, CPU share 0.0 ms, waited 0.0 ms (0% of device time hidden) | balance: device share 1.00, 0 rows handed to the CPU | in the dense chain: 30400 routed experts with no host step | exclusive: 0 RAM copies of device experts given up first
+[VK] memory at exit: weights 1863.9 MiB, expert tier 17280.0 MiB (peaks), KV mirror 0.0 MiB in memory type 1 (device-local, not host-visible); the dense chain's state in type 1 (device-local); 19143.9 MiB staged in 62164 copies (10677 submits), 19140.3 MiB of them straight from host memory in 61802 copies (0 not imported), 75 blocks zero-filled; resident data in host memory: 0.0 MiB
+[VK] qwen36: dense weights at exit: 291 matrices on the device only (1.81 GiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 2.863 GiB
+	Command being timed: "./c/qwen36 256 4 /content/prompt/p64.txt"
+	User time (seconds): 58.67
+	System time (seconds): 34.41
+	Percent of CPU this job got: 279%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:33.33
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 5063632
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 3597885
+	Voluntary context switches: 20583
+	Involuntary context switches: 376
+	Swaps: 0
+	File system inputs: 31350336
+	File system outputs: 104
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+===== s4-dev2-staged.log (sha256 a31faa46f952db87dedfa08cb6b33ffa1aa0de9ec492426f913602888c2d5ad9): dev2 p64, COLI_VK_STAGED=1 (whole log)
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /content/q36/tokenizer.json
+[enc] prompt tokens: 64 | generating 32 new tokens
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 9.8s | RSS after load: 4.83 GB
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] staged uploads: copied straight from host memory where its pages import (4 KiB pages; COLI_VK_UP_IMPORT=0 stages every copy)
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 23034 MiB heap) copied from host staging memory (type 2) on a transfer queue (COLI_VK_STAGED=1)
+[VK] ready: NVIDIA L4, compute qfam 0, memtype 4, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix), staged uploads
+[VK] qwen36: device ready, dense matrices on the device (default)
+[VK] qwen36: dense chain on (a discrete GPU, beside the expert tier)
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[VK] qwen36 chain fit: free 23603052544 B, reserve 1073741824 B, fixed 555838720 B (the engine's 69299456 B, the pools' 486539264 B), tail 509552640 B, layers 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 40171776 40171776 40171776 31804672 B, matrices 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 37827592 37827592 37827592 30999556 B
+[VK] qwen36 chain: 40 of 40 layers on the device (1.42 GiB), 0 on the CPU (free 21.98 GiB, reserve 1.00 GiB)
+[VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+[VK] qwen36: dense weights on the device only (a discrete GPU with room for them: 1.81 of 20.91 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[VK] qwen36 chain: 40 of 40 layers placed: 1444823320 B of matrices on the device (the fit counted 1444823320 B for these layers), chain buffers 78891776 B, device memory held 1744830464 B
+[VK] qwen36 chain: 40 layers on the device (10 attention), 4.4 MiB of parameters
+[VK] chain: 20 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+[VK] qwen36: 291 dense matrices on the device only, 1.81 GiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the DeltaNet's a/b rows and the shared expert's gate vector, norms, the vision tower, any imported pages; RSS now 2.916 GiB
+[USAGE] expert history: 30400 selections (/content/q36/.coli_usage)
+[VK] tier qwen36: on, NVIDIA L4, budget 18.86 GiB = 10240 experts of 1.7 MiB (fmt 4 gs 64, down fmt 4 gs 64), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[qwen36] int4 packed weights detected — kept int4, rows interleaved by 16 for expert_ffn.h (Q36_ILV16=0 keeps the rows)
+[VK] tier qwen36: warm start, 10240 experts in 20.6s (3882 from the history, 6358 more to fill the device: every expert of the model)
+Generated (32 new tokens):
+Text : [qwen36] KV cache: float16, 0.00 GiB at 96 positions (half of float32; Q36_KV=f32 keeps float32)
+[VK] qwen36 chain: prompt chunks of up to 3840 rows (389 KiB a row; 2.85 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+, e li fa comparire innanzi a'
+nostri occhi, come se fossero presenti.
+
+  _A. MARIANI._
+
+Il Manz
+TTFT: 0.410 s (time to first token)
+[qwen36 spec gate] run: T(1) 16.6 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] run: 1.00 tokens/forward (31 forwards per 31 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 0 declined, 0 probes
+
+PEAK RSS: 4.83 GB
+Expert cache hit rate: 0.0% (hit=0 miss=0)
+Speed: 33.91 tok/s (0.9s for 32 tokens)
+[VK] qwen36: 0 matmuls on the GPU (362 matrices resident, 1863.9 MiB; placed int8 291, int4 0, f32 0)
+[VK] qwen36 chain: 32 forwards, 435 frames (27424 ops, 11552 matmuls, 320 tiled GEMM), 787.9 ms waiting for the device, 0.0 ms of routed experts on the host, 1280 layer steps with the routed experts in the frame (40 of them a prompt chunk's, 0 in the integer form), 119.9 MiB on the device
+[VK] tier qwen36 run: device 30400 of 30400 routed experts (100.0%; this run 30400 of 30400) | CPU RAM hits 0, disk loads 0 | resident 10240 (budget 10240, 16.88 GiB of 18.86 GiB, 68 blocks, frag 0.00) | uploads 10240 (15.00 GiB, 10240 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 0.0 ms, CPU share 0.0 ms, waited 0.0 ms (0% of device time hidden) | balance: device share 1.00, 0 rows handed to the CPU | in the dense chain: 30400 routed experts with no host step | exclusive: 0 RAM copies of device experts given up first
+[VK] memory at exit: weights 1863.9 MiB, expert tier 17280.0 MiB (peaks), KV mirror 0.0 MiB in memory type 1 (device-local, not host-visible); the dense chain's state in type 1 (device-local); 19143.9 MiB staged in 62164 copies (10677 submits), 19140.3 MiB of them straight from host memory in 61802 copies (0 not imported), 75 blocks zero-filled; resident data in host memory: 0.0 MiB
+[VK] qwen36: dense weights at exit: 291 matrices on the device only (1.81 GiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 2.863 GiB
+	Command being timed: "./c/qwen36 256 4 /content/prompt/p64.txt"
+	User time (seconds): 55.61
+	System time (seconds): 34.32
+	Percent of CPU this job got: 271%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:33.10
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 5063636
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 3597862
+	Voluntary context switches: 20533
+	Involuntary context switches: 310
+	Swaps: 0
+	File system inputs: 31481656
+	File system outputs: 112
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+===== l1-apt.log (sha256 315b3e2c341e70b82cdfe2b5ab943195a7f270aa8d61e03fb4b6e4a4c9b7052e): the VM: nvidia-smi (name, driver, memory), nproc, free -g, the disk, and the heaps and types of vulkaninfo (whole log)
+W: Skipping acquire of configured file 'main/source/Sources' as repository 'https://r2u.stat.illinois.edu/ubuntu noble InRelease' does not seem to provide it (sources.list entry misspelt?)
+name, driver_version, memory.total [MiB], memory.used [MiB]
+NVIDIA L4, 580.82.07, 23034 MiB, 0 MiB
+12
+               total        used        free      shared  buff/cache   available
+Mem:              52           1          47           0           4          51
+Swap:              0           0           0
+overlay         236G   43G  193G  19% /
+	deviceName        = NVIDIA L4
+	VK_KHR_format_feature_flags2                  : extension revision 2
+memoryHeaps: count = 2
+	memoryHeaps[0]:
+		size   = 24152899584 (0x59fa00000) (22.49 GiB)
+		flags: count = 1
+	memoryHeaps[1]:
+		size   = 42647491584 (0x9edfd1400) (39.72 GiB)
+		flags:
+			MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+			MEMORY_PROPERTY_HOST_VISIBLE_BIT
+			MEMORY_PROPERTY_HOST_COHERENT_BIT
+			MEMORY_PROPERTY_HOST_VISIBLE_BIT
+			MEMORY_PROPERTY_HOST_COHERENT_BIT
+			MEMORY_PROPERTY_HOST_CACHED_BIT
+			MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+			MEMORY_PROPERTY_HOST_VISIBLE_BIT
+			MEMORY_PROPERTY_HOST_COHERENT_BIT
+
+===== bar1.txt (sha256 f0a36f349a48019b60561a4eb8606ef1dd1d59111c3177dc830a8d711e6a2957): nvidia-smi -q -d MEMORY on the VM (whole file)
+
+==============NVSMI LOG==============
+
+Timestamp                                 : Tue Oct 27 08:56:20 2026
+Driver Version                            : 580.82.07
+CUDA Version                              : 13.0
+
+Attached GPUs                             : 1
+GPU 00000000:00:03.0
+    FB Memory Usage
+        Total                             : 23034 MiB
+        Reserved                          : 471 MiB
+        Used                              : 0 MiB
+        Free                              : 22564 MiB
+    BAR1 Memory Usage
+        Total                             : 32768 MiB
+        Used                              : 1 MiB
+        Free                              : 32767 MiB
+    Conf Compute Protected Memory Usage
+        Total                             : 0 MiB
+        Used                              : 0 MiB
+        Free                              : 0 MiB
+
+
+===== d0-sonda5.log (sha256 9f3fc1aee362758f63b533314c812ca0d57e6609df78059ba1aad43bd872bfe9): what a refused block costs on an L4: the output of sonda5.c (whole output)
+device: NVIDIA L4
+type 4 filled with 256 MiB blocks: 39 blocks = 9.75 GiB in 820 ms (the last call was the refusal)
+  8 more blocks of 256 MiB, ms each: 593 593 594 592 593 597 598 600
+  8 more blocks of 1024 MiB, ms each: 653 654 651 654 651 655 651 654
+
+===== sonda5.c (sha256 7d0468e031058e20765766b6358b3ece6d9f0cc6ebf09cfb015ba6ced12e79cd): the program that wrote d0-sonda5.log, built on the VM with gcc -O1 -Wall -o sonda5 sonda5.c -lvulkan (whole file)
+/* sonda5.c (from sonda2.c): what one refused allocation costs once the host-visible device-local type is full, as the weight
+ * pool meets it (backend_vulkan.c pool_new_block: a block of 256 MiB or 1 GiB with the device-address flag, tried again for every
+ * tensor that does not fit): fill the type with 256 MiB blocks until the driver refuses, then ask NTRY more blocks of 256 MiB
+ * and NTRY of 1 GiB and print the milliseconds of each refusal; then free everything.
+ *   gcc -O1 -Wall -o sonda5 sonda5.c -lvulkan && VK_DRIVER_FILES=<icd> ./sonda5 */
+#include <vulkan/vulkan.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#define MAXB 2048
+#define NTRY 8
+
+static VkDevice dev;
+static VkDeviceMemory mem[MAXB];
+
+static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
+static VkResult alloc(uint32_t type, VkDeviceSize bytes, VkDeviceMemory *m) {
+    VkMemoryAllocateFlagsInfo fl = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &fl, .allocationSize = bytes, .memoryTypeIndex = type};
+    return vkAllocateMemory(dev, &ai, NULL, m);
+}
+static void tries(uint32_t type, int mib) {
+    printf("  %d more blocks of %d MiB, ms each:", NTRY, mib);
+    for (int i = 0; i < NTRY; i++) {
+        VkDeviceMemory m; double t0 = now();
+        VkResult r = alloc(type, (VkDeviceSize)mib << 20, &m);
+        printf(" %.0f%s", now() - t0, r == VK_SUCCESS ? "(taken)" : "");
+        if (r == VK_SUCCESS) vkFreeMemory(dev, m, NULL);
+    }
+    printf("\n"); fflush(stdout);
+}
+int main(void) {
+    VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_2};
+    VkInstanceCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
+    VkInstance inst; VkPhysicalDevice phys = NULL;
+    if (vkCreateInstance(&ii, NULL, &inst) != VK_SUCCESS) { puts("no instance"); return 1; }
+    uint32_t nd = 8; VkPhysicalDevice pd[8];
+    vkEnumeratePhysicalDevices(inst, &nd, pd);
+    for (uint32_t i = 0; i < nd && !phys; i++) {
+        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(pd[i], &pp);
+        if (pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) { phys = pd[i]; printf("device: %s\n", pp.deviceName); }
+    }
+    if (!phys) { puts("no discrete GPU"); return 1; }
+    VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(phys, &mp);
+    VkDeviceSize dl_max = 0;
+    for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
+        if ((mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mp.memoryHeaps[i].size > dl_max) dl_max = mp.memoryHeaps[i].size;
+    int hv = -1;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
+        int big = (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && mp.memoryHeaps[mp.memoryTypes[i].heapIndex].size == dl_max;
+        if (f & 0xC0u) continue;
+        if (big && (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) && hv < 0) hv = (int)i;
+    }
+    if (hv < 0) { puts("no host-visible device-local type"); return 1; }
+    float prio = 1.0f;
+    VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = 0, .queueCount = 1, .pQueuePriorities = &prio};
+    VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .bufferDeviceAddress = VK_TRUE};
+    VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f12, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi};
+    if (vkCreateDevice(phys, &di, NULL, &dev) != VK_SUCCESS) { puts("no device"); return 1; }
+    int n = 0; double t0 = now();
+    for (; n < MAXB; n++) if (alloc((uint32_t)hv, (VkDeviceSize)256 << 20, &mem[n]) != VK_SUCCESS) break;
+    printf("type %d filled with 256 MiB blocks: %d blocks = %.2f GiB in %.0f ms (the last call was the refusal)\n", hv, n, n / 4.0, now() - t0);
+    tries((uint32_t)hv, 256);
+    tries((uint32_t)hv, 1024);
+    for (int i = 0; i < n; i++) vkFreeMemory(dev, mem[i], NULL);
+    vkDestroyDevice(dev, NULL); vkDestroyInstance(inst, NULL);
+    return 0;
+}
+
+===== m4-dev2-mapped-gdb.txt (sha256 4d1eac297b0c439881f24a9af0047e003d798a6725324e2fc0069b85e0587b12): dev2, mapped path, gdb -p 150 s into the start-up: thread apply all bt (whole file)
+[New LWP 10213]
+[New LWP 10208]
+[New LWP 10207]
+[New LWP 10206]
+[New LWP 10205]
+[New LWP 10204]
+[New LWP 10203]
+[New LWP 10178]
+[New LWP 10177]
+[New LWP 10176]
+[New LWP 10175]
+[New LWP 10174]
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+futex_wait (private=0, expected=2, futex_word=0x5b4751a1f3a8 <g_tpool+72>) at ../sysdeps/nptl/futex-internal.h:146
+
+warning: 146	../sysdeps/nptl/futex-internal.h: No such file or directory
+
+Thread 13 (Thread 0x7ae68e89b6c0 (LWP 10174) "qwen36"):
+#0  __GI___ioctl (fd=92, request=3224913486) at ../sysdeps/unix/sysv/linux/ioctl.c:36
+#1  0x00007ae611aec3e9 in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#2  0x00007ae611aeda50 in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#3  0x00007ae611aecced in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#4  0x00007ae611af11d3 in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#5  0x00007ae6116d631e in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#6  0x00007ae6116322a8 in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#7  0x00007ae611633f04 in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#8  0x00007ae6116344f1 in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#9  0x00007ae61168d8dc in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#10 0x00007ae611688a93 in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#11 0x00007ae61196e780 in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#12 0x00007ae61196f60f in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#13 0x00007ae6119707df in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#14 0x00007ae61186c94c in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#15 0x00005b4751901222 in vk_mem_alloc.constprop ()
+#16 0x00005b4751906459 in pool_suballoc.constprop ()
+#17 0x00005b475190984d in tensor_alloc_pad ()
+#18 0x00005b475192e073 in coli_vk_tier_tensor_pad ()
+#19 0x00005b47519451e7 in upload ()
+#20 0x00005b475195a7a9 in vkt_put ()
+#21 0x00005b47518be461 in vk_tier_start._omp_fn ()
+#22 0x00007ae68ead379f in ?? () from /lib/x86_64-linux-gnu/libgomp.so.1
+#23 0x00007ae68e93ab84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#24 0x00007ae68e9c7ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 12 (Thread 0x7ae57b56b6c0 (LWP 10175) "qwen36"):
+#0  futex_wait (private=0, expected=2, futex_word=0x5b4751a1f3a8 <g_tpool+72>) at ../sysdeps/nptl/futex-internal.h:146
+#1  __GI___lll_lock_wait (futex=futex@entry=0x5b4751a1f3a8 <g_tpool+72>, private=0) at ./nptl/lowlevellock.c:49
+#2  0x00007ae68e93e1e1 in lll_mutex_lock_optimized (mutex=0x5b4751a1f3a8 <g_tpool+72>) at ./nptl/pthread_mutex_lock.c:48
+#3  ___pthread_mutex_lock (mutex=0x5b4751a1f3a8 <g_tpool+72>) at ./nptl/pthread_mutex_lock.c:93
+#4  0x00005b4751905a80 in pool_suballoc.constprop ()
+#5  0x00005b475190984d in tensor_alloc_pad ()
+#6  0x00005b475192e073 in coli_vk_tier_tensor_pad ()
+#7  0x00005b47519451e7 in upload ()
+#8  0x00005b475195a7a9 in vkt_put ()
+#9  0x00005b47518be461 in vk_tier_start._omp_fn ()
+#10 0x00007ae68ead379f in ?? () from /lib/x86_64-linux-gnu/libgomp.so.1
+#11 0x00007ae68e93ab84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#12 0x00007ae68e9c7ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 11 (Thread 0x7ae57ad6a6c0 (LWP 10176) "qwen36"):
+#0  futex_wait (private=0, expected=2, futex_word=0x5b4751a1f3a8 <g_tpool+72>) at ../sysdeps/nptl/futex-internal.h:146
+#1  __GI___lll_lock_wait (futex=futex@entry=0x5b4751a1f3a8 <g_tpool+72>, private=0) at ./nptl/lowlevellock.c:49
+#2  0x00007ae68e93e1e1 in lll_mutex_lock_optimized (mutex=0x5b4751a1f3a8 <g_tpool+72>) at ./nptl/pthread_mutex_lock.c:48
+#3  ___pthread_mutex_lock (mutex=0x5b4751a1f3a8 <g_tpool+72>) at ./nptl/pthread_mutex_lock.c:93
+#4  0x00005b4751905a80 in pool_suballoc.constprop ()
+#5  0x00005b475190984d in tensor_alloc_pad ()
+#6  0x00005b475192e073 in coli_vk_tier_tensor_pad ()
+#7  0x00005b47519451e7 in upload ()
+#8  0x00005b475195a7a9 in vkt_put ()
+#9  0x00005b47518be461 in vk_tier_start._omp_fn ()
+#10 0x00007ae68ead379f in ?? () from /lib/x86_64-linux-gnu/libgomp.so.1
+#11 0x00007ae68e93ab84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#12 0x00007ae68e9c7ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 10 (Thread 0x7ae57a5696c0 (LWP 10177) "qwen36"):
+#0  futex_wait (private=0, expected=2, futex_word=0x5b4751a1f3a8 <g_tpool+72>) at ../sysdeps/nptl/futex-internal.h:146
+#1  __GI___lll_lock_wait (futex=futex@entry=0x5b4751a1f3a8 <g_tpool+72>, private=0) at ./nptl/lowlevellock.c:49
+#2  0x00007ae68e93e1e1 in lll_mutex_lock_optimized (mutex=0x5b4751a1f3a8 <g_tpool+72>) at ./nptl/pthread_mutex_lock.c:48
+#3  ___pthread_mutex_lock (mutex=0x5b4751a1f3a8 <g_tpool+72>) at ./nptl/pthread_mutex_lock.c:93
+#4  0x00005b4751905a80 in pool_suballoc.constprop ()
+#5  0x00005b475190984d in tensor_alloc_pad ()
+#6  0x00005b475192e073 in coli_vk_tier_tensor_pad ()
+#7  0x00005b47519451e7 in upload ()
+#8  0x00005b475195a7a9 in vkt_put ()
+#9  0x00005b47518be461 in vk_tier_start._omp_fn ()
+#10 0x00007ae68ead379f in ?? () from /lib/x86_64-linux-gnu/libgomp.so.1
+#11 0x00007ae68e93ab84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#12 0x00007ae68e9c7ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 9 (Thread 0x7ae579d686c0 (LWP 10178) "qwen36"):
+#0  futex_wait (private=0, expected=2, futex_word=0x5b4751a1f3a8 <g_tpool+72>) at ../sysdeps/nptl/futex-internal.h:146
+#1  __GI___lll_lock_wait (futex=futex@entry=0x5b4751a1f3a8 <g_tpool+72>, private=0) at ./nptl/lowlevellock.c:49
+#2  0x00007ae68e93e1e1 in lll_mutex_lock_optimized (mutex=0x5b4751a1f3a8 <g_tpool+72>) at ./nptl/pthread_mutex_lock.c:48
+#3  ___pthread_mutex_lock (mutex=0x5b4751a1f3a8 <g_tpool+72>) at ./nptl/pthread_mutex_lock.c:93
+#4  0x00005b4751905a80 in pool_suballoc.constprop ()
+#5  0x00005b475190984d in tensor_alloc_pad ()
+#6  0x00005b475192e073 in coli_vk_tier_tensor_pad ()
+#7  0x00005b47519451e7 in upload ()
+#8  0x00005b475195a7a9 in vkt_put ()
+#9  0x00005b47518be461 in vk_tier_start._omp_fn ()
+#10 0x00007ae68ead379f in ?? () from /lib/x86_64-linux-gnu/libgomp.so.1
+#11 0x00007ae68e93ab84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#12 0x00007ae68e9c7ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 8 (Thread 0x7ae60fc6c6c0 (LWP 10203) "qwen36"):
+#0  0x00007ae68e936e51 in __futex_abstimed_wait_common64 (private=31462, cancel=true, abstime=0x7ae60fc6bce0, op=393, expected=0, futex_word=0x7ae5d4000d48) at ./nptl/futex-internal.c:57
+#1  __futex_abstimed_wait_common (cancel=true, private=31462, abstime=0x7ae60fc6bce0, clockid=31462, expected=0, futex_word=0x7ae5d4000d48) at ./nptl/futex-internal.c:87
+#2  __GI___futex_abstimed_wait_cancelable64 (futex_word=futex_word@entry=0x7ae5d4000d48, expected=expected@entry=0, clockid=clockid@entry=0, abstime=abstime@entry=0x7ae60fc6bce0, private=private@entry=0) at ./nptl/futex-internal.c:139
+#3  0x00007ae68e939d6e in __pthread_cond_wait_common (abstime=0x7ae60fc6bce0, clockid=0, mutex=0x5b47968ac600, cond=0x7ae5d4000d20) at ./nptl/pthread_cond_wait.c:503
+#4  ___pthread_cond_timedwait64 (cond=0x7ae5d4000d20, mutex=0x5b47968ac600, abstime=0x7ae60fc6bce0) at ./nptl/pthread_cond_wait.c:652
+#5  0x00007ae61160e8c0 in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#6  0x00007ae61197f38a in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#7  0x00007ae61161216a in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#8  0x00007ae68e93ab84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#9  0x00007ae68e9c7ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 7 (Thread 0x7ae5dc1ff6c0 (LWP 10204) "[vkcf] Analysis"):
+#0  0x00007ae68e936e51 in __futex_abstimed_wait_common64 (private=31461, cancel=true, abstime=0x0, op=393, expected=0, futex_word=0x7ae5cc000d48) at ./nptl/futex-internal.c:57
+#1  __futex_abstimed_wait_common (cancel=true, private=31461, abstime=0x0, clockid=0, expected=0, futex_word=0x7ae5cc000d48) at ./nptl/futex-internal.c:87
+#2  __GI___futex_abstimed_wait_cancelable64 (futex_word=futex_word@entry=0x7ae5cc000d48, expected=expected@entry=0, clockid=clockid@entry=0, abstime=abstime@entry=0x0, private=private@entry=0) at ./nptl/futex-internal.c:139
+#3  0x00007ae68e9398cd in __pthread_cond_wait_common (abstime=0x0, clockid=0, mutex=0x5b479fcce640, cond=0x7ae5cc000d20) at ./nptl/pthread_cond_wait.c:503
+#4  ___pthread_cond_wait (cond=0x7ae5cc000d20, mutex=0x5b479fcce640) at ./nptl/pthread_cond_wait.c:627
+#5  0x00007ae61160e85f in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#6  0x00007ae61199f378 in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#7  0x00007ae61161216a in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#8  0x00007ae68e93ab84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#9  0x00007ae68e9c7ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 6 (Thread 0x7ae5db9fe6c0 (LWP 10205) "[vkrt] Analysis"):
+#0  0x00007ae68e936e51 in __futex_abstimed_wait_common64 (private=32767, cancel=true, abstime=0x7ae5db9fdd20, op=393, expected=0, futex_word=0x7ae5d0000d48) at ./nptl/futex-internal.c:57
+#1  __futex_abstimed_wait_common (cancel=true, private=32767, abstime=0x7ae5db9fdd20, clockid=31461, expected=0, futex_word=0x7ae5d0000d48) at ./nptl/futex-internal.c:87
+#2  __GI___futex_abstimed_wait_cancelable64 (futex_word=futex_word@entry=0x7ae5d0000d48, expected=expected@entry=0, clockid=clockid@entry=0, abstime=abstime@entry=0x7ae5db9fdd20, private=private@entry=0) at ./nptl/futex-internal.c:139
+#3  0x00007ae68e939d6e in __pthread_cond_wait_common (abstime=0x7ae5db9fdd20, clockid=0, mutex=0x5b47b2775bf0, cond=0x7ae5d0000d20) at ./nptl/pthread_cond_wait.c:503
+#4  ___pthread_cond_timedwait64 (cond=0x7ae5d0000d20, mutex=0x5b47b2775bf0, abstime=0x7ae5db9fdd20) at ./nptl/pthread_cond_wait.c:652
+#5  0x00007ae61160e8c0 in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#6  0x00007ae6119ae5d9 in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#7  0x00007ae61161216a in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#8  0x00007ae68e93ab84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#9  0x00007ae68e9c7ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 5 (Thread 0x7ae5db1fd6c0 (LWP 10206) "[vkps] Update"):
+#0  __GI___ioctl (fd=92, request=3223340586) at ../sysdeps/unix/sysv/linux/ioctl.c:36
+#1  0x00007ae611aec3e9 in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#2  0x00007ae611aeda50 in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#3  0x00007ae611aef631 in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#4  0x00007ae61196a563 in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#5  0x00007ae61197be5b in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#6  0x00007ae61161216a in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#7  0x00007ae68e93ab84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#8  0x00007ae68e9c7ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 4 (Thread 0x7ae5da39c6c0 (LWP 10207) "qwen36"):
+#0  0x00007ae68e936e51 in __futex_abstimed_wait_common64 (private=31462, cancel=true, abstime=0x0, op=393, expected=0, futex_word=0x7ae5c8010d58) at ./nptl/futex-internal.c:57
+#1  __futex_abstimed_wait_common (cancel=true, private=31462, abstime=0x0, clockid=0, expected=0, futex_word=0x7ae5c8010d58) at ./nptl/futex-internal.c:87
+#2  __GI___futex_abstimed_wait_cancelable64 (futex_word=futex_word@entry=0x7ae5c8010d58, expected=expected@entry=0, clockid=clockid@entry=0, abstime=abstime@entry=0x0, private=private@entry=0) at ./nptl/futex-internal.c:139
+#3  0x00007ae68e9398cd in __pthread_cond_wait_common (abstime=0x0, clockid=0, mutex=0x5b47b2bc8b40, cond=0x7ae5c8010d30) at ./nptl/pthread_cond_wait.c:503
+#4  ___pthread_cond_wait (cond=0x7ae5c8010d30, mutex=0x5b47b2bc8b40) at ./nptl/pthread_cond_wait.c:627
+#5  0x00007ae61160e85f in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#6  0x00007ae61180ce4b in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#7  0x00007ae61161216a in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#8  0x00007ae68e93ab84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#9  0x00007ae68e9c7ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 3 (Thread 0x7ae5d9b1b6c0 (LWP 10208) "qwen36"):
+#0  0x00007ae68e936e51 in __futex_abstimed_wait_common64 (private=-803737974, cancel=true, abstime=0x7ae5d9b1acf0, op=393, expected=0, futex_word=0x7ae5bc000d48) at ./nptl/futex-internal.c:57
+#1  __futex_abstimed_wait_common (cancel=true, private=-803737974, abstime=0x7ae5d9b1acf0, clockid=0, expected=0, futex_word=0x7ae5bc000d48) at ./nptl/futex-internal.c:87
+#2  __GI___futex_abstimed_wait_cancelable64 (futex_word=futex_word@entry=0x7ae5bc000d48, expected=expected@entry=0, clockid=clockid@entry=0, abstime=abstime@entry=0x7ae5d9b1acf0, private=private@entry=0) at ./nptl/futex-internal.c:139
+#3  0x00007ae68e939d6e in __pthread_cond_wait_common (abstime=0x7ae5d9b1acf0, clockid=0, mutex=0x5b47b274e1b0, cond=0x7ae5bc000d20) at ./nptl/pthread_cond_wait.c:503
+#4  ___pthread_cond_timedwait64 (cond=0x7ae5bc000d20, mutex=0x5b47b274e1b0, abstime=0x7ae5d9b1acf0) at ./nptl/pthread_cond_wait.c:652
+#5  0x00007ae61160e8c0 in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#6  0x00007ae611ae4711 in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#7  0x00007ae611ad6d5e in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#8  0x00007ae61161216a in ?? () from /usr/lib64-nvidia/libnvidia-eglcore.so.580.82.07
+#9  0x00007ae68e93ab84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#10 0x00007ae68e9c7ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 2 (Thread 0x7ae5ee7556c0 (LWP 10213) "qwen36"):
+#0  0x00007ae68e936e51 in __futex_abstimed_wait_common64 (private=31461, cancel=true, abstime=0x0, op=393, expected=0, futex_word=0x5b4751afcb70 <T+3120>) at ./nptl/futex-internal.c:57
+#1  __futex_abstimed_wait_common (cancel=true, private=31461, abstime=0x0, clockid=0, expected=0, futex_word=0x5b4751afcb70 <T+3120>) at ./nptl/futex-internal.c:87
+#2  __GI___futex_abstimed_wait_cancelable64 (futex_word=futex_word@entry=0x5b4751afcb70 <T+3120>, expected=expected@entry=0, clockid=clockid@entry=0, abstime=abstime@entry=0x0, private=private@entry=0) at ./nptl/futex-internal.c:139
+#3  0x00007ae68e9398cd in __pthread_cond_wait_common (abstime=0x0, clockid=0, mutex=0x5b4751afcb20 <T+3040>, cond=0x5b4751afcb48 <T+3080>) at ./nptl/pthread_cond_wait.c:503
+#4  ___pthread_cond_wait (cond=0x5b4751afcb48 <T+3080>, mutex=0x5b4751afcb20 <T+3040>) at ./nptl/pthread_cond_wait.c:627
+#5  0x00005b475194556b in uploader ()
+#6  0x00007ae68e93ab84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#7  0x00007ae68e9c7ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 1 (Thread 0x7ae68e89cd40 (LWP 10156) "qwen36"):
+#0  futex_wait (private=0, expected=2, futex_word=0x5b4751a1f3a8 <g_tpool+72>) at ../sysdeps/nptl/futex-internal.h:146
+#1  __GI___lll_lock_wait (futex=futex@entry=0x5b4751a1f3a8 <g_tpool+72>, private=0) at ./nptl/lowlevellock.c:49
+#2  0x00007ae68e93e1e1 in lll_mutex_lock_optimized (mutex=0x5b4751a1f3a8 <g_tpool+72>) at ./nptl/pthread_mutex_lock.c:48
+#3  ___pthread_mutex_lock (mutex=0x5b4751a1f3a8 <g_tpool+72>) at ./nptl/pthread_mutex_lock.c:93
+#4  0x00005b4751905a80 in pool_suballoc.constprop ()
+#5  0x00005b475190984d in tensor_alloc_pad ()
+#6  0x00005b475192e073 in coli_vk_tier_tensor_pad ()
+#7  0x00005b47519451e7 in upload ()
+#8  0x00005b475195a7a9 in vkt_put ()
+#9  0x00005b47518be461 in vk_tier_start._omp_fn ()
+#10 0x00007ae68eac9977 in GOMP_parallel () from /lib/x86_64-linux-gnu/libgomp.so.1
+#11 0x00005b4751882420 in vk_tier_start.constprop ()
+#12 0x00005b475183cfda in main ()
+[Inferior 1 (process 10156) detached]
+
+===== lat.log (sha256 6e9f6de5911b6e8ef1b129adca6fc2506a03965efecac1ca0dfc9bab190f668f): the chain: each step with its time and exit code (whole log)
+[08:56:01] l1-apt
+[08:56:20] l1-apt rc=0 19 s
+[08:56:20] l6-model
+[08:56:20] l2-git
+[08:57:15] l2-git rc=0 55 s
+[08:57:15] l3-build
+[08:57:29] l6-model rc=0 69 s
+[08:58:55] l3-build rc=0 100 s
+[08:58:55] l4-test
+[09:06:30] l4-test rc=0 455 s
+[09:06:30] w
+[09:07:52] w rc=0 82 s
+[09:08:52] m1-lat-mapped
+[09:09:31] m1-lat-mapped rc=0 39 s
+[09:10:31] m2-lat-mapped
+[09:11:03] m2-lat-mapped rc=0 32 s
+[09:12:03] m3-lat-mapped-p512
+[09:12:42] m3-lat-mapped-p512 rc=0 39 s
+[09:13:42] m4-dev2-mapped
+[09:18:42] m4-dev2-mapped rc=124 300 s
+[09:19:42] s1-dev2-staged
+[09:20:15] s1-dev2-staged rc=0 33 s
+[09:21:15] s2-lat-staged
+[09:21:48] s2-lat-staged rc=0 33 s
+[09:22:48] s3-lat-staged
+[09:23:21] s3-lat-staged rc=0 33 s
+[09:24:21] s4-dev2-staged
+[09:24:55] s4-dev2-staged rc=0 34 s
+

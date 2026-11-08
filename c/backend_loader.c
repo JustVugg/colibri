@@ -1289,16 +1289,15 @@ static int coli_cuda_load(void){
 
 #ifdef COLI_HIP_DLL
     /* No synchronisation here, and that is a traced conclusion rather than an
-     * assumption: coli_cuda_load has exactly three callers -- coli_cuda_init,
-     * coli_cuda_attention_project_ragged, and (via the wrapper of #1577)
-     * coli_cuda_available_device_count, which qwen36_tier.c calls while it is
-     * still choosing the devices to hand to init. colibri.c calls init on the
-     * main thread before model initialisation and therefore before any worker
-     * thread exists; the ragged path is reachable only after that init
-     * succeeded; and the tier's count is asked on that same main thread during
-     * start-up, before the tier has created any thread of its own. If a caller
-     * outside that start-up window ever appears, or the guard in colibri.c
-     * moves, this needs an explicit lock instead. */
+     * assumption: coli_cuda_load has three callers: coli_cuda_init,
+     * coli_cuda_available_device_count and coli_cuda_attention_project_ragged.
+     * colibri.c calls init on the main thread before model initialisation and
+     * before any worker thread exists. qwen36_tier.c's qt_init asks for the
+     * available count on that main thread during model load, while choosing
+     * the devices to pass to init and before creating the tier's workers.
+     * The ragged path is reachable only after init succeeded. If a concurrent
+     * caller ever appears, or either start-up path moves outside this window,
+     * this needs an explicit lock instead. */
     if(!coli_hip_configure(&cfg)) return 0;
     runtime = coli_hip_acquire_runtime(&cfg);
     if(!runtime){
@@ -1475,7 +1474,7 @@ static int coli_cuda_load(void){
      * to CPU" result, so an older DLL still serves GLM and Qwen3.6 (#1405). */
     RESOLVE_OPT(matmul_mxfp4,   fn_matmul_mxfp4)
     RESOLVE_OPT(expert_mxfp4,   fn_expert_mxfp4)
-    RESOLVE_OPT(available_device_count, fn_available_device_count)   /* qwen36 tier (#1533); older DLLs fall back to device_count */
+    RESOLVE_OPT(available_device_count, fn_available_device_count)   /* older DLLs still support explicit device selection */
     RESOLVE(tensor_free,    fn_tensor_free)
     RESOLVE(tensor_bytes,   fn_tensor_bytes)
     /* Optional, same reasoning as e8_set_grid above: a DLL predating #687
@@ -1564,16 +1563,21 @@ int coli_cuda_device_count(void){
 
 /* qwen36_tier.c's device selection asks for the usable count; the loader had
  * no wrapper for it, so the first CUDA_DLL build of qwen36 that compiled the
- * tier in failed to link (#1533). It asks BEFORE coli_cuda_init -- the count
- * decides which devices init is given -- so this wrapper has to load the DLL
- * itself, exactly as coli_cuda_attention_project_ragged does: gating on
- * g_cuda.available alone answered 0 on every Windows host and the tier fell
- * back to the CPU path unless COLI_GPUS was set (#1577). Optional export:
- * a DLL predating it leaves the pointer NULL and the count falls back to
- * device_count(). */
+ * tier in failed to link (#1533). Device selection precedes coli_cuda_init,
+ * so this wrapper must load the DLL itself, as the ragged-attention wrapper
+ * does. Merely checking g_cuda.available silently returned zero before init.
+ * An older DLL without this export cannot discover visible devices through
+ * device_count: that function counts contexts created by init. */
 int coli_cuda_available_device_count(void){
+    /* The tier probes before init when no device list was supplied. */
     if(!coli_cuda_load()) return 0;
-    if(!g_cuda.available_device_count) return g_cuda.device_count();   /* a DLL from before the export */
+    if(!g_cuda.available_device_count){
+        /* device_count reports initialized contexts, not visible devices. */
+        fprintf(stderr, COLI_VENDOR_TAG " " COLI_BACKEND_DLL
+                " missing symbol coli_cuda_available_device_count; "
+                "rebuild the backend DLL or select devices with COLI_GPUS\n");
+        return 0;
+    }
     return g_cuda.available_device_count();
 }
 
