@@ -2427,7 +2427,8 @@ static const char *k3_vk_gguf_forms(const Model *m, VktFmt *gu, VktFmt *dn, VktF
 /* The routed-expert tier's start on its device (XT: Vulkan's, or CUDA's after xt_use_cuda):
  * the experts' forms, the RAM the cache may still take, the hooks, and the warm start from
  * the history. lgu/ldn are freed here. 1 = the tier is on. */
-static int k3_tier_open(Model *m, VktFmt gu, VktFmt dn, VktFmt *lgu, VktFmt *ldn, int cap, int nmoe, size_t dense_bytes){
+static int k3_tier_open(Model *m, VktFmt gu, VktFmt dn, VktFmt *lgu, VktFmt *ldn, int cap, int nmoe, size_t dense_bytes,
+                        size_t chain_bytes){
     Cfg *c=&m->c;
     g_k3_vk_slot_bytes=(size_t)(m->e_slot+8192);
     VktConfig vc={.engine="kimi_k3",.layers=c->n_layers,.experts=c->n_experts,
@@ -2438,7 +2439,7 @@ static int k3_tier_open(Model *m, VktFmt gu, VktFmt dn, VktFmt *lgu, VktFmt *ldn
                   .ram_reserve=(size_t)(m->e_slot+8192)*(size_t)cap*(size_t)nmoe,
                   .ram_floor=(size_t)(m->e_slot+8192)*(size_t)c->topk*(size_t)nmoe,.ram_given=k3_vk_ram_given,
                   .ram_later=(size_t)g_k3_ram_later,
-                  .dense_bytes=dense_bytes,
+                  .dense_bytes=dense_bytes,.chain_bytes=chain_bytes,
                   .in_ram=k3_vk_in_ram,.ram_ctx=m,
                   .load=k3_vk_load,.release=k3_vk_unhold,.load_ctx=m,.load_batch=k3_vk_load_batch};
     const int tier_on=XT(init)(&vc,rt_counts_all());
@@ -2488,6 +2489,12 @@ static size_t k3_cu_dense_bytes(const Model *m){
  * matrices on the same device as far as its budget goes (cu_dense.h), which the tier's budget
  * leaves them. Once it is on, the per-call path (cuda_expert_apply, which uploads every routed
  * MXFP4 expert at every call) stays off: the experts the tier has not taken run on the CPU. */
+/* the CUDA chain (kimi_k3_cuchain.h, included before step_chunk_ex) */
+static int k3u_wanted(const Model *m);
+static size_t k3u_plan_bytes(const Model *m, int ctx);
+static void k3u_start(Model *m);
+static void k3u_report(void);
+static int g_k3u_on;
 static void k3_cu_tier_start(Model *m){
     Cfg *c=&m->c;
     int nmoe=0, cap=0;
@@ -2498,13 +2505,21 @@ static void k3_cu_tier_start(Model *m){
     VktFmt gu={VKT_SRC_MXFP4_E8M0,32}, dn=gu, *lgu=NULL, *ldn=NULL;
     const char *gno=m->gx?k3_vk_gguf_forms(m,&gu,&dn,&lgu,&ldn):NULL;
     if(gno){ fprintf(stderr,"[CUDA] tier kimi_k3: the GGUF's experts: %s; the tier stays off\n",gno); xt_use_cuda(0); return; }
-    const size_t dense=cud_open("kimi_k3",coli_cuda_device_at(0),k3_cu_dense_bytes(m));
-    if(k3_tier_open(m,gu,dn,lgu,ldn,cap,nmoe,dense)) g_k3_cuda=0;
+    /* the chain's layers want every dense matrix on the card: all of it with the chain's own
+     * bytes where they fit, else cu_dense.h's half of the free memory, which the chain's first
+     * layers take (kimi_k3_cuchain.h); the tier leaves the room for both */
+    const int dev=coli_cuda_device_at(0), want=k3u_wanted(m);
+    const size_t cb=want?k3u_plan_bytes(m,m->max_t>0?m->max_t:4096):0;
+    size_t dense=want?cud_open_whole("kimi_k3",dev,k3_cu_dense_bytes(m),cb):0;
+    if(!dense) dense=cud_open("kimi_k3",dev,k3_cu_dense_bytes(m));
+    if(want&&dense) k3u_start(m);
+    if(k3_tier_open(m,gu,dn,lgu,ldn,cap,nmoe,dense,g_k3u_on?cb:0)) g_k3_cuda=0;
     else { xt_use_cuda(0); g_cud.on=0; }
 }
 static void k3_cu_report(const Model *m, const char *scope){
     if(xt_cuda()) cut_report(scope,m->hits,m->miss);
     cud_report("kimi_k3");
+    k3u_report();              /* the CUDA chain's line, when it ran */
 }
 #endif
 #endif
@@ -2616,7 +2631,7 @@ static void k3_vk_tier_start(Model *m){
     else if(nmoe&&vkt_wanted()){
         atexit(coli_vk_shutdown);   /* before the tier's start, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
         k3_tier_open(m,gu,dn,lgu,ldn,cap,nmoe,
-                     coli_vk_dense()&&!g_k3c_on&&!g_k3_dho&&!g_k3_partial?k3_vk_dense_bytes(m):0);   /* the chain's are there already; a partial chain: nothing more goes up */
+                     coli_vk_dense()&&!g_k3c_on&&!g_k3_dho&&!g_k3_partial?k3_vk_dense_bytes(m):0,0);   /* the chain's are there already; a partial chain: nothing more goes up */
     }
     if(!vkt_ready()&&!coli_vk_dense()) coli_vk_dense_decide("kimi_k3",0,1);   /* no tier after all */
     if(coli_vk_dense()){
@@ -3096,6 +3111,9 @@ static void k3_embed(Model *m, const int *ids, int pos0, int C, float *hidden){
 #ifdef COLI_VULKAN
 #include "kimi_k3_chain.h"   /* COLI_VK_CHAIN: every layer's dense chain on the device */
 #endif
+#ifdef COLI_CUDA
+#include "kimi_k3_cuchain.h" /* COLI_CUDA_CHAIN: the first layers on the CUDA device */
+#endif
 
 static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
                             K3CancelPoll poll_cancel, void *cancel_context,
@@ -3123,6 +3141,14 @@ static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
         if(!chain) k3c_cpu_step(m,pos0);
     }
     from=chain;
+#endif
+#ifdef COLI_CUDA
+    /* the CUDA chain's first layers (kimi_k3_cuchain.h): each row's AttnRes state after them
+     * comes back in hidden, bres and nb, and the CPU runs the rest and the head from there */
+    if(!from&&g_k3u_on){
+        from=k3u_forward(m,hidden,bres,&nb,pos0,C,poll_cancel,cancel_context,cancelled);
+        if(!from) k3u_cpu_step(m,pos0);
+    }
 #endif
     if(from<c->n_layers&&!(cancelled&&*cancelled))
         k3_layers_forward_range(m,hidden,bres,&nb,pos0,C,from,c->n_layers,
@@ -3599,6 +3625,9 @@ static void model_state_reset(Model *m){
 #ifdef COLI_VULKAN
     k3c_host_wrote(m,1);        /* the dense chain's copy is zeros too, its MLA rows gone */
 #endif
+#ifdef COLI_CUDA
+    k3u_host_wrote(m,1);        /* the CUDA chain's too */
+#endif
     for(int i=0;i<c->n_layers;i++){
         if(m->L[i].kda){
             memset(m->kstate[i],0,(size_t)c->kda_heads*c->kda_hd*c->kda_hd*sizeof(float));
@@ -3697,6 +3726,9 @@ static void k3_ckpt_copy(float *blob, Model *m, int to_blob){
     Cfg *c=&m->c; size_t o=0;
 #ifdef COLI_VULKAN
     if(to_blob) k3c_sync_host(m);   /* the dense chain may hold the newest state */
+#endif
+#ifdef COLI_CUDA
+    if(to_blob) k3u_sync_host(m);   /* the CUDA chain may */
 #endif
     size_t ks=(size_t)c->kda_heads*c->kda_hd*c->kda_hd;
     size_t cw=(size_t)c->kda_proj*c->conv_k;
@@ -3861,6 +3893,9 @@ static int k3_ckpt_restore_best(Model *m, const int *ids, int np){
 #ifdef COLI_VULKAN
     k3c_host_wrote(m,0);      /* the dense chain's copy goes up again */
 #endif
+#ifdef COLI_CUDA
+    k3u_host_wrote(m,0);
+#endif
     g_k3_restored_logit=k->logit;
     k->used=++g_k3_ckpt_clock;
     if(getenv("K3_PREFIX_LOG"))
@@ -3904,6 +3939,9 @@ static int k3_park(Model *m, int np, int max_t){
 #ifdef COLI_VULKAN
     k3c_sync_host(m);    /* the dense chain may hold the newest recurrent state */
 #endif
+#ifdef COLI_CUDA
+    k3u_sync_host(m);
+#endif
     ColiParkPart *p=k3_park_parts(m,&k);
     int ok=p&&coli_park_save(&g_k3_park,&m->kvp,m->kvp.len,p,k,n);
     free(p);
@@ -3912,6 +3950,9 @@ static int k3_park(Model *m, int np, int max_t){
     kv_prefix_clear(&m->kvp);
 #ifdef COLI_VULKAN
     k3c_host_wrote(m,1);
+#endif
+#ifdef COLI_CUDA
+    k3u_host_wrote(m,1);
 #endif
     for(int i=0;i<c->n_layers;i++) if(m->L[i].kda){
         memset(m->kstate[i],0,(size_t)c->kda_heads*c->kda_hd*c->kda_hd*sizeof(float));
@@ -3928,6 +3969,9 @@ static void k3_unpark(Model *m){
     if(p&&coli_park_restore(&g_k3_park,&m->kvp,&len,m->kvp.len,K3_PARK_SPEC,p,k)){
 #ifdef COLI_VULKAN
         k3c_host_rewrote(m);
+#endif
+#ifdef COLI_CUDA
+        k3u_host_rewrote(m);
 #endif
     } else coli_park_free(&g_k3_park);
     free(p);
@@ -4190,6 +4234,9 @@ static int k3_serve_start(Model *m, Tok *T, ServeReq *q, int **ids_out, int *np_
     if(chunk<1) chunk=1; if(chunk>512) chunk=512;
 #ifdef COLI_VULKAN
     { int r=k3c_prefill_rows(m); if(r>0 && !g_lfp) chunk=r; }   /* the chain's chunk from the budget: big MoE steps */
+#endif
+#ifdef COLI_CUDA
+    { int r=k3u_prefill_rows(m); if(r>0 && !g_lfp) chunk=r; }   /* the CUDA chain's */
 #endif
     clk->t0=now_s(); clk->a0=m->t_attn; clk->e0=m->t_moe; clk->d0=m->t_eload; clk->h0=m->t_head;
     clk->hit0=m->hits; clk->miss0=m->miss;
@@ -4661,6 +4708,9 @@ int main(int argc, char **argv){
     if(chunk>512) chunk=512;
 #ifdef COLI_VULKAN
     { int r=k3c_prefill_rows(&m); if(r>0 && !g_lfp) chunk=r; }   /* the chain's chunk from the budget: big MoE steps */
+#endif
+#ifdef COLI_CUDA
+    { int r=k3u_prefill_rows(&m); if(r>0 && !g_lfp) chunk=r; }   /* the CUDA chain's */
 #endif
     if(m.trace && chunk>1){
         chunk=1;                       /* trace rows are token-major by contract */

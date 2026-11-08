@@ -3513,6 +3513,7 @@ static int cc_preload(void) {
 }
 #include "cuda_dsv4c.cuh"   /* DeepSeek V4.1's layer ops */
 #include "cuda_glm53c.cuh"  /* GLM-5.3's layer ops */
+#include "cuda_k3c.cuh"     /* Kimi K3's residual mix and activation */
 static const ColiCudaChainOps g_cc_ops = {
     sizeof(ColiCudaChainOps),
     cc_init, cc_ready, cc_lost_, cc_shutdown, cc_device, cc_device_now,
@@ -3548,5 +3549,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_mhc, cc_ds_attn, cc_ds_rope, cc_ds_compress, cc_ds_score, cc_ds_cand, cc_ds_topk, cc_ds_engram,
     cc_kda_conv, cc_kda_rec,
     cc_mla_core, cc_mla_rope, cc_mla_lnorm, cc_mla_hgemv, cc_dsa_pool_keys, cc_dsa_pool_select, cc_dsa_select, cc_mla_hgemv_q8,
+    cc_ares_mix, cc_situ,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

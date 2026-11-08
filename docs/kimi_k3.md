@@ -50,8 +50,33 @@ carries `text_config.dsa_config` (32 heads of 128, top 2048, no rotary part).
   positions a row's selection (`vkc_dsa_select`, the CPU's order) is the list
   its attention core reads. `make` `kimi-chain` in `tests/vulkan_engines.sh`
   checks the chain's tokens against the CPU's on the tiny K3.1, whole, partial,
-  in small chunks, quantized and split. The routed experts run on the Vulkan
-  tier or with `K3_CUDA=1` as K3's.
+  in small chunks, quantized and split. With `K3_CUDA=1` the CUDA chain does
+  the same (`kimi_k3_cuchain.h`, below).
+
+## CUDA (`make CUDA=1 kimi_k3`, `K3_CUDA=1`)
+
+The routed experts run in the CUDA expert tier (`cu_tier.h`) and the dense
+matrices on the same card (`cu_dense.h`). The first layers run there as one
+chain (`kimi_k3_cuchain.h`), the Vulkan chain's layout on the CUDA chain's ops:
+GLM-5.3's KDA (K3's form) and MLA pieces, GLM-5.2's indexer selection for
+K3.1's DSA layers, and K3's residual mix and SiTU-GLU (`cuda_k3c.cuh`). Per
+sparse layer the host gets the router logits and the latent rows, runs the
+routed experts and sends their sum back; after the chain's last layer each
+row's AttnRes state comes back and the CPU runs the rest and the head. The
+layers on the card are the first ones the dense budget holds (every dense
+matrix where they fit with the chain's own bytes), or `COLI_CUDA_CHAIN_LAYERS`
+of them; `COLI_CUDA_CHAIN=0` keeps the CPU's layers.
+
+A prompt chunk's matrices go through the tensor cores (TF32 or f16 inputs,
+about 1e-3 relative, as every CUDA chain's); `COLI_CUDA_TC_GEMM=0` keeps them on
+the exact kernel. `make CUDA=1 kimi-k3-cuda-chain-check` checks, on the tiny K3
+and K3.1, every trunk (f32, int8, int4) and placement (every layer, chunks of 3
+rows, a token at a time, the first 3 layers, the first one) against the CPU's
+tokens with the exact kernel, the first token with the tensor cores, then K3.1's
+test and K3's vendor oracle with the chain on; `make CUDA=1 cuda-k3c-check` the
+two ops against `kimi_k3.c`'s arithmetic. The chain declines for the validation
+dumps, several conversations at once (`KV_SLOTS`) and a GGUF's blocks, which the
+Vulkan chain runs.
 
 ## Architecture notes
 
@@ -348,7 +373,8 @@ short-term reuse (temporal locality), not with marginal expert heat.
 - Decode is single-token (no speculative decoding — K3 has no MTP head).
 - Tool declarations/calls and image content are not exposed through the shared
   gateway yet; unsupported requests fail explicitly.
-- CPU + optional Vulkan (the shared expert tier; no CUDA/Metal).
+- CPU, Vulkan (the shared expert tier and the dense chain) and CUDA (the expert
+  tier, the dense matrices and the chain's first layers); no Metal.
 - The protocol, tokenizer, gateway, TUI, and Web client paths are locally
   testable without the 1.5 TB checkpoint. A release claim still requires one
   full-model multi-turn TUI/Web run on a host that owns the complete snapshot.

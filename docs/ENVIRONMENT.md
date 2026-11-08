@@ -571,6 +571,9 @@ Read **only** by `c/kimi_k3.c`. The K3 engine has its own loader, cache and quan
 | `K3_TRACE` | unset | Write a routing trace to `K3_TRACE=<file>`. |
 | `K3_LOGITS` | unset | Write per-step logits to `K3_LOGITS=<file>`. |
 | `K3_X0` | unset | Read input rows `[T, hidden]` as f32 from this file, bypassing the embedding — for feeding activations captured elsewhere. |
+| `COLI_CUDA_CHAIN` | on | kimi_k3, CUDA build with the CUDA expert tier (`K3_CUDA=1`): the first layers run on the card as one chain (kimi_k3_cuchain.h: the KDA and MLA layers with their state on the device, Kimi K3.1's indexer, the residual mix, the router logits, the latent projections and the shared experts; the host runs the routed experts and gets each row's state back after the chain's last layer). `0`: the CPU's layers. |
+| `COLI_CUDA_CHAIN_LAYERS` | every layer the dense budget holds | kimi_k3's CUDA chain: at most this many layers on the card, the first ones (the rest and the head on the CPU). |
+| `COLI_CUDA_K3_ROWS` | `64` | kimi_k3's CUDA chain: a prompt chunk's rows (its scratch is sized for one chunk). |
 | `KIMI_DSA_INDEXER` | on | Kimi K3.1 Pro: `0` keeps its 24 DSA layers' attention dense past `index_topk` (2048) instead of the indexer's selection. A comparison, not the model; K3 has no indexer. |
 
 ## Inkling engine (`inkling`)
