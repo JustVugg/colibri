@@ -284,7 +284,9 @@ int main(void) {
     codec("win (the ring scattered)", 0, 1, 16, 512, KVQ_WIN_BYTES, 16, 13, kvq_pack_win, kvq_unpack_win);
     codec("ckv (from token 7)", 1, 0, 16, 512, KVQ_CKV_BYTES, 23, 7, kvq_pack_ckv, kvq_unpack_ckv);
     codec_ikey();
-    score_case(3, 512, 8);    /* a wide table: the grid's mode 10 */
+    score_case(3, 512, 8);    /* a wide table: mode 10's grid arm (dsa_grid default-on
+                              * takes IH<=256 there; mode 9's quantized reader is the
+                              * same expression, exercised through mode 10 here) */
     score_case(2, 64, 8);     /* a narrow one: mode 3 */
     score_case(2, 512, 65);   /* the wide queries: mode 9 */
     if (fails) { printf("FAIL: kv-quant (%d)\n", fails); coli_vk_shutdown(); return 1; }

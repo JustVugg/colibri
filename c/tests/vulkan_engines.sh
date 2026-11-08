@@ -4790,9 +4790,9 @@ family_kv_split_deepseek_sanitize() {
 # FP4 (288 B), the index keys FP4 in block-wide sections (68 B). An approximate mode, so
 # its gate is not the bit-exact oracle the other families use: the flag-off run is the
 # exactness proof (the deepseek-chain family keeps it byte for byte), and under the flag
-# the logits stay within a DOCUMENTED tolerance (max |diff| <= 5e-2 of the largest
-# |logit|: the FP4 index keys move the top-k selection, a few percent of the logits is the
-# mode's own cost), the token stream is reported (a drift count, not a gate -- a greedy
+# the first decode row -- the one input the two runs share -- keeps its argmax with drift
+# within that row's own largest |logit| (the FP4 index keys move the top-k selection; past
+# that row a flipped pick feeds the model its own choice, so only the shared row gates), the token stream is reported (a drift count, not a gate -- a greedy
 # pick may legitimately flip), and the ledger's kv-mirror line must be the quantized
 # widths' math (derived in v41_kvq_ledger below). The codec itself IS exact and gated bit
 # for bit by tests/test_vk_kv_quant first. The fixture is the tiny one at the released KV

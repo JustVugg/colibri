@@ -566,8 +566,10 @@ compressed rows' and index keys' 288 and 68 over each layer's compression ratio)
 figures of the prefill-VRAM analysis
 ([dsv41-prefill-vram-2026-11-06](experiments/dsv41-prefill-vram-2026-11-06.md), whose
 §10 parked this as the lever that scales with context: 0.31 GiB of mirrors at 64K
-tokens, 0.62 at 128K, 4.7 at the 1M ceiling). Quantized, those become roughly **0.11 GiB
-at 128K — about 690 MiB saved — and 5.38 GiB of the 4.7 GiB peak at 1M**; the same math
+tokens, 0.62 at 128K, 4.7 at the 1M ceiling). Quantized, the mirrors' ~6,400 B a position
+become ~890: **0.78 → ~0.11 GiB at 128K (~690 MiB saved) and 6.25 → ~0.87 GiB at the 1M
+ceiling (~5.4 GiB saved)** — §10's 0.62/4.7 GiB figures were the audit's savings mislabeled
+as totals; the corrected basis is 6,400/890 B a position — the same math
 the kv-quant test family pins on the ledger line, which reports `(quantized)` when the
 mirrors are (a second device's mirrors are not in that line — the pre-existing gap).
 
@@ -578,7 +580,7 @@ loudly). The FP4 index keys can move a top-k pick, so the logits drift a little 
 `kv-quant-deepseek` family gates a documented tolerance instead of bit-identity, the
 way `V41_PREFILL_TAIL`'s tests accept the tail's own approximation — and the pull's
 write-back returns dequantized rows (a quantize→dequant hop the pack's idempotence
-bounds: re-packing a dequantized row reproduces its bytes, which the unit test pins).
+bounds: re-packing a dequantized row reproduces its values, which the unit test pins).
 The flag needs `head_dim` 512 and `index_head_dim` 128, and it does not re-price the
 planner: the KV split decides exactly as before, and when it arms the mirrors go back to
 fp32 whole (`v41c_kvq_give_way`), re-mirrored from the host.

@@ -203,3 +203,7 @@ c/qwen36_tiny_mtp*/
 # VRAM audit scratch (docs/experiments/dsv41-prefill-vram-2026-11-06)
 /vram-*
 c/*.err
+
+# kv-quant run artifacts and fixtures
+c/dsv41_kvq_*/
+kvq-*.csv
