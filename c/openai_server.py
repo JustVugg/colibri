@@ -1228,6 +1228,18 @@ def detect_chat_flavor(family_id, model_dir):
             config = {}
         if isinstance(config, dict) and config.get("model_type") == "mistral_large4":
             return "mistral_large4"
+        # GLM-5.2 and the full GLM-5.3 share glm_moe_dsa. Their trained
+        # template, not the folder name or weight architecture, distinguishes
+        # the always-open GLM-5.3 reasoning contract (#2540).
+        for name in ("chat_template.jinja", "tokenizer_config.json"):
+            try:
+                text = (Path(model_dir) / name).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            if ("[gMASK]<sop>" in text and
+                    "effective_reasoning_effort = reasoning_effort if reasoning_effort is defined" in text and
+                    "enable_thinking" not in text):
+                return "glm53_full"
         return None
     if family_id != "qwen36" or not model_dir:
         return None
@@ -4107,9 +4119,38 @@ def _glm53_tool_calls(calls):
     return "\n" + "".join(out) + "\n" if out else ""
 
 
+def _glm53_full_order_tool_results(messages):
+    """The full model's template orders an unambiguous tool run by call ID."""
+    result, i = list(messages), 0
+    while i < len(messages):
+        if not isinstance(messages[i], dict) or messages[i].get("role") != "tool":
+            i += 1
+            continue
+        end = i
+        while end < len(messages) and isinstance(messages[end], dict) and messages[end].get("role") == "tool":
+            end += 1
+        previous = messages[i - 1] if i else {}
+        calls = previous.get("tool_calls") if isinstance(previous, dict) and previous.get("role") == "assistant" else None
+        if isinstance(calls, list):
+            ids = [(call.get("tool_call_id") or call.get("id")) if isinstance(call, dict) else None for call in calls]
+            run = messages[i:end]
+            replies = [message.get("tool_call_id") or message.get("id") for message in run]
+            if (all(isinstance(value, str) and value for value in ids + replies)
+                    and len(set(ids)) == len(ids) and len(set(replies)) == len(replies)
+                    and all(value in ids for value in replies)):
+                order = {value: pos for pos, value in enumerate(ids)}
+                result[i:end] = sorted(run, key=lambda message: order[message.get("tool_call_id") or message.get("id")])
+        i = end
+    return result
+
+
 def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, tools=None,
-                      tool_choice=None, add_generation_prompt=True):
+                      tool_choice=None, add_generation_prompt=True, *, full_model=False):
     """Render the text-only subset of the official GLM-5.3-Flash chat template.
+
+    The full GLM-5.3 uses this text/tool subset too (`full_model=True`),
+    retaining its template's leading tool-call newline and grouped, ID-ordered
+    tool results. The Flash-only cache optimization below stays Flash-only.
 
     Not a variant of the GLM-5.2 renderer above, and the differences are not
     cosmetic. GLM-5.3 emits the reasoning-effort system line ALWAYS, because its
@@ -4128,6 +4169,9 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
     """
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
+
+    if full_model:
+        messages = _glm53_full_order_tool_results(messages)
 
     forced = None
     if isinstance(tool_choice, dict):
@@ -4198,7 +4242,8 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
         elif role == "system":
             prompt.append(f"<|system|>{content}")
         elif role == "tool":
-            prompt.append(f"<|observation|><tool_response>{content}</tool_response>")
+            prefix = "" if full_model and index > 0 and messages[index - 1].get("role") == "tool" else "<|observation|>"
+            prompt.append(f"{prefix}<tool_response>{content}</tool_response>")
         elif role == "assistant":
             reasoning = message.get("reasoning_content")
             if not isinstance(reasoning, str) and "</think>" in content:
@@ -4218,7 +4263,7 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
             # model's own trailing newline is stripped by .strip() and put back
             # by the renderer, so the tokens already line up, and changing that
             # case would break the one that works today.
-            if calls and not body:
+            if calls and not body and not full_model:
                 calls = calls.lstrip("\n")
             prompt.append(f"<|assistant|>{opened}{body}{calls}")
         else:
@@ -4892,10 +4937,10 @@ def lift_chat_template_kwargs(body):
 
 def default_reasoning_effort():
     """The reasoning_effort of a chat request that names neither reasoning_effort nor
-    enable_thinking: Qwen3.8's and Muse Spark's templates think at xhigh unless told,
-    MiMo-V2.6's and LFM3's think too; the other families keep the older opt-in default
-    (none), which COLI_THINK=1 turns on for all of them."""
-    if chat_flavor() in ("qwen38", "muse"):
+    enable_thinking: Qwen3.8's, Muse Spark's and the full GLM-5.3's templates think at their
+    maximum unless told, MiMo-V2.6's and LFM3's think too; the other families keep the older
+    opt-in default (none), which COLI_THINK=1 turns on for all of them."""
+    if chat_flavor() in ("qwen38", "muse", "glm53_full"):
         return "xhigh"
     if ARCH == "mimo" or chat_flavor() == "lfm3" or os.environ.get("COLI_THINK", "0") == "1":
         return "high"
@@ -4962,6 +5007,10 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
     if ARCH == "qwen36":
         return render_chat_qwen(messages, enable_thinking, reasoning_effort, tools,
                                 tool_choice, add_generation_prompt, preserve_thinking)
+    if chat_flavor() == "glm53_full":
+        effort = {"minimal": "low", "low": "low", "medium": "high", "high": "high", "xhigh": "xhigh"}.get(
+            reasoning_effort, "xhigh" if enable_thinking else "low")
+        return render_chat_glm53(messages, True, effort, tools, tool_choice, add_generation_prompt, full_model=True)
     if chat_flavor() == "mistral_large4":
         return render_chat_mistral_large4(messages, enable_thinking, reasoning_effort, tools,
                                           tool_choice, add_generation_prompt)
@@ -5027,7 +5076,7 @@ def starts_in_reasoning(enable_thinking, add_generation_prompt=True):
         return False
     if chat_flavor() == "mistral_large4":   # its answer opens [THINK] itself (read as <think>)
         return False
-    return (enable_thinking or ARCH == "glm53") and add_generation_prompt
+    return (enable_thinking or ARCH == "glm53" or chat_flavor() == "glm53_full") and add_generation_prompt
 
 
 class ThinkingStreamSplit:
