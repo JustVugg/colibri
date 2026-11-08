@@ -657,9 +657,12 @@ static int v41c_setup_dev(Model *m, int d) {
     const char *nmc = v41c_name(ch);
     int N = ch->n, lo = ch->lo;
     if (N < 1) return 0;
-    if (ch->kvq) fprintf(stderr, "[VK] %s chain: COLI_VK_KV_QUANT=1: the KV mirrors quantized as the checkpoint's cache "
+    if (ch->kvq) fprintf(stderr, "[VK] %s chain: COLI_VK_KV_QUANT=%s: the KV mirrors quantized as the checkpoint's cache "
                                  "(a window row 528 B, a compressed row 288 B, an index key 68 B) -- approximate, and it "
-                                 "gives way once the KV split arms\n", nmc);
+                                 "gives way once the KV split arms%s\n", nmc,
+                         g_v41c_kvq == 2 && v41_host_kvq(&m->c) ? "2" : "1",
+                         g_v41c_kvq == 2 && v41_host_kvq(&m->c)
+                             ? "; =2: the host's own KV rows are the cache's codes too (dequantized on read)" : "");
     /* the parameter arena, the chain's layers' */
     size_t n = 0;
     for (int i = lo; i < lo + N; i++) {
@@ -1238,19 +1241,22 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
     if (ok && ch->kvq && !ch->kvq_checked) { v41c_kvq_check(ch, m); ch->kvq_checked = 1; }   /* the mirrors' widths, once */
     /* what comes back at the end: the window rows, the compressed rows and keys, the groups,
      * a verify's raw compressor rows. Offsets in floats, as every pull command's: fp32
-     * rows where the host holds floats, and under COLI_VK_KV_QUANT=2 (v41_host_kvq) the
-     * code rows themselves -- the window's 528 B and the compressed rows' 288 B a row,
-     * the index keys as whole blocks of 2176 B (their data and scale sections never
-     * travel as one linear row span). The groups and a verify's raw rows stay fp32
-     * either way: the pooling reads raw values. */
-    int hostq = v41_host_kvq(c);
-    size_t pw = (size_t)(n < W ? n : W) * (hostq ? KVQ_WIN_BYTES / 4 : (size_t)hd), pn = 0, *pc = calloc((size_t)L, sizeof(size_t));
+     * rows where the host holds floats, and under COLI_VK_KV_QUANT=2 with the mirrors
+     * quantized the code rows themselves -- the window's 528 B and the compressed rows'
+     * 288 B a row, the index keys as whole blocks of 2176 B (their data and scale
+     * sections never travel as one linear row span). The give-way's fp32 mirrors (the
+     * split armed, ch->kvq 0) pull FLOATS even under the flag and pack at the write-back,
+     * so the staging's widths follow what the pull carries, not the host layout alone.
+     * The groups and a verify's raw rows stay fp32 either way: the pooling reads raw
+     * values. */
+    int hostq = v41_host_kvq(c), pullq = hostq && ch->kvq;
+    size_t pw = (size_t)(n < W ? n : W) * (pullq ? KVQ_WIN_BYTES / 4 : (size_t)hd), pn = 0, *pc = calloc((size_t)L, sizeof(size_t));
     for (int i = lo; ok && pc && i < hi; i++) {
         pc[i] = pn; pn += pw;
         int r = c->compress_ratio[i];
         if (!c->kv_source[i]) continue;
         int nr2 = E / r - start / r;
-        if (hostq) {
+        if (pullq) {
             if (!ch->ks.on) pn += (size_t)nr2 * (KVQ_CKV_BYTES / 4);
             pn += (size_t)(((start / r + nr2 + KVQ_IKEY_BLOCK - 1) / KVQ_IKEY_BLOCK) - (start / r) / KVQ_IKEY_BLOCK)
                   * (KVQ_IKEY_BLOCK * KVQ_IKEY_BYTES / 4);
@@ -1481,11 +1487,12 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
                 size_t at = pc[i] + pw;
                 if (ch->kvq && hostq) {   /* raw: the compressed rows contiguous, the index keys whole blocks */
                     size_t ik_at = at + (cw ? (size_t)np * (KVQ_CKV_BYTES / 4) : 0);
-                    if (cw) ok = vkc_copy(ch->pull, at, ch->ckv[i], (size_t)g0 * (KVQ_CKV_BYTES / 4), (size_t)np * KVQ_CKV_BYTES);
+                    if (cw) ok = vkc_copy(ch->pull, at, ch->ckv[i], (size_t)g0 * (KVQ_CKV_BYTES / 4),
+                                         (size_t)np * (KVQ_CKV_BYTES / 4));
                     for (int b = g0 / KVQ_IKEY_BLOCK, be = (g0 + np - 1) / KVQ_IKEY_BLOCK; ok && b <= be; b++)
                         ok = vkc_copy(ch->pull, ik_at + (size_t)(b - g0 / KVQ_IKEY_BLOCK) * (KVQ_IKEY_BLOCK * KVQ_IKEY_BYTES / 4),
                                       ch->ikey[i], (size_t)b * (KVQ_IKEY_BLOCK * KVQ_IKEY_BYTES / 4),
-                                      KVQ_IKEY_BLOCK * KVQ_IKEY_BYTES);
+                                      KVQ_IKEY_BLOCK * KVQ_IKEY_BYTES / 4);   /* vkc_copy counts floats, as ever */
                     if (ok && r > 1)
                         ok = vkc_copy(ch->pull, ik_at + (size_t)(((g0 + np + KVQ_IKEY_BLOCK - 1) / KVQ_IKEY_BLOCK) - g0 / KVQ_IKEY_BLOCK)
                                                    * (KVQ_IKEY_BLOCK * KVQ_IKEY_BYTES / 4),

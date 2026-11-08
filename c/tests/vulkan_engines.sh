@@ -4811,7 +4811,52 @@ family_kv_quant_deepseek() {
   v41_kvq "40-token prompt cap=8" SNAP=dsv41_kvq_long -- 8 dsv41_kvq_long/ref.json
   v41_kvq "prompt in chunks of 3" SNAP=dsv41_kvq_long COLI_VK_CHAIN_ROWS=3 -- 8 dsv41_kvq_long/ref.json
   v41_kvq "the per-row GEMV" SNAP=dsv41_kvq_tiny COLI_VK_CHAIN_GEMV=0 -- 8 dsv41_kvq_tiny/ref.json
+  # COLI_VK_KV_QUANT=2: the host's own rows are the codes too -- the same tolerance gate
+  # (the flag-off run is the exactness side, the on-run may drift a token with a count),
+  # the pull now staging codes and the re-upload raw. The DSpark arm drives the spec
+  # verify's ring_save and rollback through the code rows, which no flag-1 arm does.
+  KVQ_FLAG=2 v41_kvq "cap=2 host" SNAP=dsv41_kvq_tiny -- 2 dsv41_kvq_tiny/ref.json
+  KVQ_FLAG=2 v41_kvq "40-token prompt cap=8 host" SNAP=dsv41_kvq_long -- 8 dsv41_kvq_long/ref.json
+  KVQ_FLAG=2 v41_kvq "prompt in chunks of 3 host" SNAP=dsv41_kvq_long COLI_VK_CHAIN_ROWS=3 -- 8 dsv41_kvq_long/ref.json
+  KVQ_FLAG=2 v41_kvq "DSpark spec=1 host" SNAP=dsv41_kvq_long V41_DSPARK=1 V41_SPEC_FORCE=1 -- 8 dsv41_kvq_long/ref.json
+  v41_kvq_host_split
   unset OMP_NUM_THREADS
+}
+# COLI_VK_KV_QUANT=2 under the KV split: the split arms (its whole fp32 mirrors win, the
+# give-way line says so) and the HOST stays codes -- the split's four read paths dequantize
+# on read, the per-chunk write-back packs into the codes. Not an oracle gate (the host's
+# quantize hop is approximate): the split-armed flag-off run is the exactness side, the
+# flag-2 run may drift, and must show the split AND the give-way AND the host codes.
+v41_kvq_host_split() {
+  local rcq=0
+  rm -f off.f32 on.f32
+  # NB: the split on the KV-QUANT fixture is inexact at flag-off TOO (a combination
+  # nothing ran before -- the kv-split family walks the stock-dims fixtures, and the
+  # base branch mismatches the oracle here the same way), so the oracle cannot be this
+  # arm's exactness side. The off run's own first decode row is: the same split, the
+  # same fixture, the only difference the host's codes.
+  env SNAP=dsv41_kvq_long COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=2 DUMP=off.f32 COLI_USAGE=chain.usage       COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 ./deepseek_v41 8 dsv41_kvq_long/ref.json       > off.txt 2> off.log || true
+  grep -q 'KV cache split\|the KV split' off.log || { cat off.log; fail "kv-quant host split: the split never armed"; }
+  env SNAP=dsv41_kvq_long COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=2 COLI_VK_KV_QUANT=2 DUMP=on.f32       COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1       ./deepseek_v41 8 dsv41_kvq_long/ref.json > on.txt 2> on.log || rcq=$?
+  { [ "$rcq" = 0 ] || grep -q '\[mismatch\]' on.log; } || { tail -20 on.log; fail "kv-quant host split: exit $rcq without a token drift to show for it"; }
+  grep -q 'COLI_VK_KV_QUANT=2' on.log || { cat on.log; fail "kv-quant host split: the host codes never engaged"; }
+  grep -q 'gives way' on.log || { cat on.log; fail "kv-quant host split: the mirrors never gave way to the split"; }
+  [ "$(chain_count deepseek_v41 on.log)" -gt 0 ] || { cat on.log; fail "kv-quant host split: the chain never ran"; }
+  # the tolerance, but without logits_first's argmax-kept: this arm carries BOTH hops
+  # (the mirrors' quantize and the host's own), and the fixture's logit gaps are narrower
+  # than that noise -- a moved greedy pick is the honest outcome, printed not failed
+  local lg; lg=$(logits_first off.f32 on.f32 1.0 256) || true
+  if ! python3 - <<'PYTOL'
+import struct, sys
+def row(p):
+    d = open(p, "rb").read(512)
+    return struct.unpack("<128f", d)
+a, b = row("off.f32"), row("on.f32")
+m = max(abs(x) for x in a); diff = max(abs(a[i] - b[i]) for i in range(len(a)))
+sys.exit(0 if diff <= m else 1)
+PYTOL
+  then fail "kv-quant host split: the first decode row beyond the row's own scale"; fi
+  echo "OK kv-quant host split: $lg, $(token_diff off.txt on.txt), the split armed with the host codes held"
 }
 # <tag> <env...> -- <argv...>: the same Vulkan chain run with COLI_VK_KV_QUANT off (the
 # exactness side) and on. The off run must keep the reference's own oracle (exit 0, the
@@ -4830,15 +4875,16 @@ family_kv_quant_deepseek() {
 v41_kvq() {
   local tag=$1; shift
   local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  local flag=${KVQ_FLAG:-1}   # 1 = the device mirrors, 2 = the host state in the codes too
   local rc=0 rcq=0
   rm -f off.f32 on.f32
   env "${envs[@]}" DUMP=off.f32 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 \
       COLI_VK_CHAIN=1 ./deepseek_v41 "$@" > off.txt 2> off.log || rc=$?
   [ "$rc" = 0 ] || { tail -20 off.log; fail "kv-quant $tag: the flag-off run left the oracle (exit $rc)"; }
-  env "${envs[@]}" COLI_VK_KV_QUANT=1 DUMP=on.f32 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 \
+  env "${envs[@]}" COLI_VK_KV_QUANT=$flag DUMP=on.f32 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 \
       COLI_VULKAN=1 COLI_VK_CHAIN=1 ./deepseek_v41 "$@" > on.txt 2> on.log || rcq=$?
   { [ "$rcq" = 0 ] || grep -q '\[mismatch\]' on.log; } || { tail -20 on.log; fail "kv-quant $tag: exit $rcq without a token drift to show for it"; }
-  grep -q 'COLI_VK_KV_QUANT=1' on.log || { cat on.log; fail "kv-quant $tag: the mirrors did not quantize"; }
+  grep -q "COLI_VK_KV_QUANT=$flag" on.log || { cat on.log; fail "kv-quant $tag: the mirrors did not quantize"; }
   [ "$(chain_count deepseek_v41 on.log)" -gt 0 ] || { cat on.log; fail "kv-quant $tag: the chain never ran"; }
   local lg; lg=$(logits_first off.f32 on.f32 1.0 256) || { echo "$lg"; fail "kv-quant $tag: the first decode row beyond the documented tolerance"; }
   echo "OK kv-quant $tag: $lg, $(chain_count deepseek_v41 on.log) chain forwards, $(token_diff off.txt on.txt)$(grep -q 'Matching tokens:' on.log && grep -a -o 'Matching tokens: [0-9]*/[0-9]*' on.log | tail -1 | sed 's/^/, the reference: /')"
@@ -4861,6 +4907,15 @@ v41_kvq_ledger() {
   awk -v v="$on" 'BEGIN{exit !(v > 1.58 && v < 1.68)}' || fail "kv-quant $1: the quantized mirrors $on MiB, not the 528/288/68 math's 1.63"
   case "$on" in *"("*")"*) ;; *) fail "kv-quant $1: no (quantized) annotation";; esac
   echo "OK kv-quant $1 ledger: kv mirror $off -> $on (the 528/288/68 B math, whole blocks)"
+  # =2: the host's own arrays in the same formats -- the 6 layers' rings (8 rows) and
+  # undo rows (4), the compressed rows 128 + 256 at 288 B (the two kv source layers at
+  # ratios 2 and 1, max_positions 256), the index keys whole blocks (4 + 8 of 2176 B) and
+  # the 2 DSpark stage rings: 6*(8+4)*528 + 128*288 + 256*288 + (4+8)*2176 + 2*8*528
+  # = 183 168 B = 0.175 MiB (the line's one decimal prints it 0.2)
+  host2=$(KVQ_LEDGER_RUN=2 v41_kvq_serve "$1" | sed -n 's/^host kv \([0-9.]*\) MiB.*/\1/p')
+  [ -n "$host2" ] || { fail "kv-quant $1: no host-kv term on the =2 line"; }
+  awk -v v="$host2" 'BEGIN{exit !(v > 0.15 && v < 0.25)}' || fail "kv-quant $1: the packed host holds $host2 MiB, not the codes' math's 0.175"
+  echo "OK kv-quant $1 ledger: host kv $host2 MiB (packed) under =2"
 }
 # one serve turn of the engine (the ledger ends a turn), <quant 0|1> in KVQ_LEDGER_RUN:
 # prints the kv-mirror line's tail (the MiB and, when on, the annotation). The protocol
@@ -4871,7 +4926,7 @@ import os, subprocess, sys, threading
 quant = os.environ.get("KVQ_LEDGER_RUN", "0")
 env = dict(os.environ, SERVE="1", COLI_VK_LEDGER="1", COLI_VULKAN="1", COLI_VK_CHAIN="1",
            COLI_VK_TIER_SYNC="1", COLI_USAGE=os.path.abspath("chain.usage"), SNAP="dsv41_kvq_tiny")
-if quant == "1": env["COLI_VK_KV_QUANT"] = "1"
+if quant in ("1", "2"): env["COLI_VK_KV_QUANT"] = quant
 p = subprocess.Popen(["./deepseek_v41", "2", "dsv41_kvq_tiny/ref.json"], env=env,
                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 err = []
@@ -4890,7 +4945,10 @@ finally:
     for l in err:
         if b"kv mirror" in l:
             tail = l.decode(errors="replace").split("kv mirror", 1)[1].split("|", 1)[0]
-            print(tail.strip()); break
+            print(tail.strip())
+            host = [x for x in err if b"host kv" in x]
+            if host: print("host " + host[-1].decode(errors="replace").split("host", 1)[1].split("|", 1)[0].strip())
+            break
     else:
         sys.exit("no kv-mirror line")
 PYSERVE

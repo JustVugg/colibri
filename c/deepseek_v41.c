@@ -1502,6 +1502,10 @@ static int v41_host_kvq(const Cfg *c) {
     if (g_v41_host_kvq < 0) {
         const char *e = getenv("COLI_VK_KV_QUANT");
         g_v41_host_kvq = e && *e == '2' && c->head_dim == 512 && c->index_head_dim == 128;
+        if (e && *e == '2' && g_v41_host_kvq)
+            fprintf(stderr, "[v41] COLI_VK_KV_QUANT=2: the host's KV state in the cache formats too -- a window row "
+                            "528 B, a compressed row 288 B, an index key 68 B in block-wide sections, dequantized on read "
+                            "(approximate like the mirrors, and it does NOT give way to the KV split: the split reads the codes)\n");
         if (e && *e == '2' && !g_v41_host_kvq)
             fprintf(stderr, "[v41] COLI_VK_KV_QUANT=2 wants head_dim 512 and index_head_dim 128; "
                             "the host's KV state stays fp32\n");
