@@ -37,6 +37,261 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **DeepSeek V4.1 on the Vulkan chain: a prompt of more than one chunk layer by layer.** Each
+  chunk went through every layer before the next, so the expert tier streamed each layer's
+  cold experts once a chunk: a 4104-token prompt at 512-row chunks copied 150 GiB of the host
+  pool's experts and read 98.9 GB from disk. Now each layer runs its chunks in order through
+  the attention, the FFN's mix and the shared expert, with every row's streams on the device,
+  then its routed experts for all the rows in one step, then each chunk's FFN sum
+  (`COLI_VK_V41_LAYERWISE=0`: chunk by chunk). Each row keeps from one layer to the next the
+  selection its last index source made and the candidate source's mask, as a chunk keeps them
+  through its layers chunk by chunk. unsloth's UD-IQ1_S on an RTX PRO 4000, the 4104-token
+  prompt: 34.9 GiB copied, 44.3 GB read, the tier's device time 81.7 -> 33.6 s, the prompt
+  39.1 -> 65.1 tok/s.
+- **DeepSeek V4.1 and V4 on the Vulkan chain: a prompt chunk's sparse attention in three
+  passes, the same bits** (`chain_dsv4_pa.comp`). The attention gave each (head, row) a
+  workgroup that read every listed row from memory, a thread a row, so the 64 heads of a row
+  (one KV row a position) read each of its 640 rows 64 times. From 8 rows a chunk's rows go
+  through the scores of a row's heads on tiles of its listed rows, the weights and
+  denominators, and the output, each sum in the old kernel's order (`COLI_VK_DSV4_PA=0`: the
+  old kernel). unsloth's V4.1-Flash UD-IQ1_S on an RTX PRO 4000, a 4104-token prompt: the
+  attention's device time 31.5 -> 4.4 s; the text the same with it on and off.
+- **DeepSeek V4.1 on the Vulkan chain: a GGUF's wo_a as its output groups' GEMMs.** The
+  chain multiplied a GGUF's wo_a with the per-head reader, which has no block form: the matrix
+  went to the device as floats (8192 x 4096 a layer of V4.1-Flash, 128 MiB, 5 GiB over its 40
+  layers) and each row of a prompt chunk read all of it again. Its eight output groups now go
+  up as matrices of their own in the file's blocks, as wo_b does: a chunk's rows go to
+  group-major order on the device, a GEMM a group, and back; a decode row multiplies its
+  groups' slices in place (`COLI_VK_V41_WOA=0`: the reader). unsloth's UD-IQ1_S on an RTX PRO
+  4000: the chain's matrices 9.45 -> 5.42 GiB, the room going to resident experts; a 4104-token
+  prompt's 44.9 s of device time in wo_a gone, the prompt 27.8 -> 39.3 tok/s; the decode
+  5.40-5.42 -> 5.96-6.10 tok/s.
+- **GLM-5.3 on CUDA: every layer on the card.** On the CUDA tier the CPU ran GLM-5.3's layers
+  and multiplied each dense matrix on the card a call at a time, about 530 synchronous calls a
+  decoded token of GLM-5.3-Flash. With the routed experts on the CUDA tier, a prompt chunk's and
+  a decode step's layers now run on the CUDA chain (`glm53_cuchain.h`), the Vulkan chain's
+  layout on new ops (`cuda_glm53c.cuh`: the KDA convolution and recurrence, the MLA core, RoPE,
+  LayerNorm and per-head matmuls, the k-pooled indexer): the KDA state on the card while the
+  chain runs, the host's MLA caches mirrored, the routed experts on the host between two frames
+  while the card computes the shared expert. unsloth's GLM-5.3-Flash UD-IQ2_XXS on an RTX PRO
+  4000: decode 2.93-2.95 -> 3.57-3.65 tok/s on a first turn and 3.85-4.11 -> 4.50-4.68 on a
+  second, a 523-token prompt 5.92-6.57 -> 10.92-15.16 tok/s. `COLI_CUDA_CHAIN=0`: the CPU's
+  layers.
+- **The CUDA expert tier on two cards** (`COLI_VK_DEV2`, as on Vulkan). The CUDA tier kept every
+  expert on one card: a machine with two (two V100s, #2608) gave the routed experts one card's
+  memory. The second card now holds the experts after the primary's, in its own memory with its
+  own block table, scratch, streams and events, and runs the batch of its residents beside the
+  primary's at every step; a batch that fails there gives its experts back to the CPU and the
+  tier goes on with the primary. `COLI_VK_DEV2=auto` takes the first CUDA device that is not the
+  primary; its index takes that one (the primary's own: the same card twice, the test mode).
+  Tested with the same card twice against the CPU (glm53 and DeepSeek V4.1's tiny fixtures:
+  decode, eviction, a failing batch); not measured on two real cards.
+- **GLM-5.2 and GLM-5.3 on CUDA: every layer on the card.** A glm-dsa GGUF under `COLI_CUDA=1`
+  put its routed experts on the CUDA tier and left the attention to the CPU, and its dense
+  matrices too where half of the card's free memory did not hold them (GLM-5.3 UD-IQ1_S's 13
+  GiB): the CPU read every dense matrix every token. Every layer now runs on the CUDA chain
+  (`colibri_cuchain.h`), the Vulkan chain's layout on the CUDA chain's ops, with two new ones:
+  the DSA selection (`cc_dsa_select`, colibri.c's position for position, up to top-2048) and the
+  per-head matmul on a GGUF's Q8_0 rows (`k_b` and `v_b` as the file has them). Every dense
+  matrix goes to the card when it fits beside the chain, as Vulkan's chain takes it, and the
+  routed experts keep the rest; a CUDA build also runs a GGUF's dense matrices on the card where
+  the chain does not (the head among them), as only a build with Vulkan did. unsloth's GLM-5.3
+  UD-IQ1_S on an RTX PRO 4000: decode 0.66-0.68 -> 0.77-0.79 tok/s on a first turn and
+  0.76 -> 0.88-0.98 on a second, a 528-token prompt 2.23-2.24 -> 4.40-4.51 tok/s (Vulkan's chain
+  0.77-0.78, 0.85-0.90, 3.68-4.29). `COLI_CUDA_CHAIN=0`: the CPU's attention.
+- **DeepSeek V4.1 with a GGUF on CUDA: a prompt's layers on the card.** On the CUDA tier the CPU
+  ran a prompt's layers, the sparse attention, the hyper-connections and the router three fifths
+  of a 4104-token prompt. A prompt of more than one chunk now runs layer by layer on the CUDA
+  chain (`deepseek_v41_cuchain.h`), op for op the Vulkan chain's: each layer's chunks through the
+  attention, the FFN's mix and the shared expert with every row's streams, list and candidate
+  mask on the card, then the layer's routed experts in one step of the tier, then each chunk's
+  FFN sum. The host's state comes back as the CPU would leave it, for the decode and the next
+  prompt. Up to 4096 rows go through the layers at once (`COLI_CUDA_V41_SEG`), and the tier
+  leaves the chain that room. unsloth's UD-IQ1_S on an RTX PRO 4000: the 4104-token prompt
+  7.42-7.57 -> 91.3-97.0 tok/s, the 523-token one 23.2 -> 58.3-59.8 tok/s, the decode
+  5.97-6.03 -> 5.65-5.98 tok/s. `COLI_CUDA_CHAIN=0`: the CPU's layers.
+- **The CUDA expert tier streams a prompt's cold experts, and the CUDA dense matrices take a
+  prompt 512 rows a call.** The CUDA tier (`cu_xb.cu`) declined the Vulkan tier's streaming, so
+  a long prompt's cold experts ran on the CPU 32 rows at a time and came from the disk again for
+  each block: a 4104-token prompt of DeepSeek V4.1-Flash UD-IQ1_S read 333 GB of experts. Its
+  sub-batches now run on two halves with their own streams, the host pool's experts copied into
+  the streaming slots ahead of each, an expert's rows from 16 on the dense matrices' f16 tiles
+  (`coli_cuda_bd_gemm_raw`) and the GEMV below (`COLI_CUDA_TIER_STREAM=0`: none). The dense
+  matrices (`cu_dense.h`) took a prompt's rows in one call, whose scratch (538 MB for wq_b's
+  output at 4104 rows) the card did not have: 51 matrices stayed on the CPU. unsloth's UD-IQ1_S
+  on an RTX PRO 4000: 21 GB of experts read, none left to the CPU, the 4104-token prompt
+  5.75 -> 7.42-7.57 tok/s, the 523-token prompt 23.2 tok/s, the decode 5.97-6.03 tok/s.
+- **GLM-5.3: the routed experts read from the disk with `O_DIRECT`** (`G53_DIRECT`, on by
+  default; `0` reads them through the page cache as before). An expert read from the disk is
+  wanted once, and the expert tier's host pool leaves the page cache no room to keep it:
+  unsloth's GLM-5.3-Flash UD-IQ2_XXS on an RTX PRO 4000 with 62 GB of RAM, two 128-token
+  turns refaulted 54-55 GiB, and the compaction kswapd's reclaim kept up migrated the engine's
+  pages under its threads, a TLB shootdown on every core each time. The reads now land in the
+  slots straight from the drive. The same machine on the CUDA tier, two serves a side: decode
+  3.11-3.18 -> 3.54-3.71 tok/s on the first turn and 2.87-3.17 -> 4.40-4.55 on the second, the
+  523-token prompt 5.35-5.64 -> 5.89-6.14 tok/s, the host pool's pairs on the CPU 556-584 ->
+  439-450 us each, the warm start 23-30 -> 18 s.
+- **CUDA chain: a hyper-connection read's up projection and mix in one pass.** Qwen3.8's gated
+  residuals read the four streams through a low-rank mix: the up projection's products (four times
+  the hidden size a row, 84 MB a 2048-row chunk) went to memory and the mix read them back with the
+  normalized streams. `matmul_hcmix` (`coli_cuda_tensor_gemm_hcmix_async`, a new chain op) computes
+  the projection on the f16 tiles with a block's weight rows four streams' 32 outputs, and its
+  epilogue gives each output the four streams' sigmoids times the normalized streams in the mix's
+  order, so the same bits; the products are never written. `COLI_CUDA_HCMIX=0`: the two ops.
+  unsloth's UD-Q2_0 on an RTX PRO 4000, two serves a side, a 4180-token prompt 1364-1386 -> 1396-1398
+  tok/s, a second one 1446-1455 -> 1475-1476; the answers the same.
+- **CUDA chain: a long prompt's QSA attention on the tensor cores.** A prompt chunk's rows with a
+  selection list (Qwen3.8's QSA) ran `cc_attn_gk` on the CUDA cores, 15.9 ms of a 2048-row chunk
+  a layer on an RTX PRO 4000. `cc_attn_f2` (f16 operands, one pass) now takes them too: each
+  token's ascending list of positions gives it a mask a block of keys, a block no token selects
+  from is not read, and six warps a block take eight tokens of Qwen3.8's 12 query heads a kv head
+  (`COLI_CUDA_ATTN_F2_WARPS=3`: three warps, four tokens). `COLI_CUDA_ATTN_SEL_TC=0` keeps
+  `cc_attn_gk`; the rows' bits are not those of `cc_attn_gk` (against the reference within 8e-5 in
+  `test_cuda_chain`). unsloth's sets with their start profiles, two serves a side, a 4180-token
+  prompt: UD-Q2_0 1231-1235 -> 1357-1364 tok/s, UD-IQ2_XS 1164-1179 -> 1271-1294; the shorter
+  prompts and the decode the same.
+- **CUDA chain: a long prompt's QSA scores in tiles.** `cc_qsa_score_k` gave each (row, block of
+  keys) a thread that read its block's 128 dims alone, 2 ms of a 2048-row chunk a layer.
+  `cc_qsa_score_t` takes 64 rows by 64 blocks a block of 256 threads, each thread 4 by 4, the
+  index queries and keys staged in shared memory; each score's sums are in the old order, so the
+  same bits and the same selections (`COLI_CUDA_QSA_TILES=0`: the old kernel). UD-Q2_0, a 4180-token
+  prompt 1357-1361 -> 1387-1392 tok/s, UD-IQ2_XS 1277-1294 -> 1315-1316; the answers the same.
+- **CUDA: a prompt chunk's f32 matrices of few outputs a row at a time.** Qwen3.8's gated
+  residuals take four outputs of 10,240 inputs (`inject`), which ran on `quant_matmul`'s grid of a
+  block an output and a row, each block reading the row again: 105 ms of a 4180-token prompt under
+  nsys on an RTX PRO 4000. `f32_few_k` takes a row a block for up to eight outputs, each output's
+  sums in `quant_matmul`'s order, so the same bits. unsloth's UD-IQ2_XS, a 4180-token prompt
+  1167-1170 -> 1181 tok/s, UD-Q2_0 1215-1221 -> 1219-1229.
+- **Qwen3.8 on the CUDA chain: a long prompt's next layer copied while this layer's experts run.**
+  A long prompt run layer by layer copies each layer's experts that are off the card to a staging
+  on it, and every layer's places started at the staging's start, so the next layer's copy waited
+  until this layer's experts had read theirs: on a PCIe 4.0 x8 card the bus then ran alone for 321
+  ms of a 4180-token prompt. The places now run on as a ring, each layer's after the last one's, and
+  the part of the next layer's copy that falls outside this layer's places starts beside its
+  experts (11.2 of UD-Q2_0's 20.8 GB). `COLI_CUDA_CHAIN_STAGE_RING=0`: every layer from the
+  staging's start, after the layer before. unsloth's sets on an RTX PRO 4000, two serves a side, a
+  4180-token prompt: UD-Q2_0 1176-1179 -> 1222-1225 tok/s, UD-IQ2_XS 1066-1069 -> 1167-1168; the
+  answers the same, the shorter prompts the same.
+- **Qwen3.8 on the CUDA chain: a long prompt's streams read and written where they wait.** Run layer
+  by layer, every chunk copied its rows' streams from the segment's (`hyper_all`) into the chain's
+  own and back after each pass, 80 MiB a 2048-row chunk each way: 204 ms of a 4180-token prompt's
+  4.1 s under nsys with no kernel beside them. The hyper-connections' reads and writes and the PLE
+  now take the chunk's rows of the segment's streams in place. unsloth's sets on an RTX PRO 4000,
+  two serves a side, a 4180-token prompt: UD-Q2_0 1132-1137 -> 1178-1180 tok/s, UD-IQ2_XS
+  1041-1043 -> 1068-1073; the answers the same, the shorter prompts the same.
+- **Qwen3.8 on the CUDA chain: a long prompt's routed experts in one call a layer.** Run layer by
+  layer, a prompt's chunks each ran a layer's routed experts on their own, and a chunk's tiles
+  decode each expert's weights for its rows: a 4180-token prompt's chunks of 2048, 2048 and 84
+  rows decoded every layer's experts three times. The chunks of a segment now route first and then
+  run their experts in one call (`cc_moe_cols`, a new chain op), down's outputs a slice at a time so
+  that the chunk's scratch holds every row's gate and up, and each slice's sums go out before the
+  next; every row has the bits one call of all the outputs gives it. As many chunks as leave a slice
+  of 512 outputs (a 4180-token prompt's three, 896 a slice); `COLI_CUDA_CHAIN_MOE_GROUP=0` runs them
+  chunk by chunk. unsloth's sets on an RTX PRO 4000, with their start profiles, two serves a side:
+  a 4180-token prompt UD-Q2_0 1007-1017 -> 1138-1141 tok/s, UD-IQ2_XS 914-917 -> 1045-1051, UD-IQ1_M
+  1041-1050 -> 1155-1161; the 545-token and one-line prompts the same, a decode step's time the
+  same.
+- **Qwen3.8 on the CUDA chain: a server's first long prompt as fast as the next one.** The first
+  long prompt after a start grew the chain's buffers to a chunk's 2048 rows on its way, in
+  page-locked host memory at 0.2 ms a MB (the K/V rows down, the streams down, a prompt-end
+  snapshot of the state), and a growth frees the buffer it replaces, which waits for the stream;
+  the runtime loaded the chain's kernels and the backend's at their first launch (40 and 17 ms).
+  They are reserved and loaded before the first request now, at the sizes that prompt left (110-120
+  ms of the start), and the recurrent state's pages are touched there too. A prompt read from its
+  first token no longer copies the DeltaNet state for a stop to put back (it is the empty state, and
+  a stop resets it again), and a prompt's embedding rows go into the streams on the CPU's threads.
+  unsloth's UD-Q2_0 on an RTX PRO 4000, three serves a side: a 4180-token prompt as the server's
+  first request 954-978 -> 992-1002 tok/s, another as long after it 1012-1025 -> 1025-1033; the
+  545-token prompt, the one-line one and the decode the same.
+- **Qwen3.8 on the CUDA chain: a short prompt after a long one keeps its two lanes.** A chunk of 384
+  rows or more with the host pool on the CPU runs as two lanes, and the second lane's buffers came
+  from the rows the chain's reserve counted or, past them, where the card had their bytes and a GiB
+  besides. After a long prompt the chain's own buffers hold all 2048 rows of its reserve, and the
+  card had 1.1-1.4 GB free, so the second lane was refused, and the prompt, which had chosen the CPU
+  for its pooled experts on the lanes' account, ran in one lane with every pooled slot on the CPU.
+  The second lane now needs half a GiB besides its bytes (the tier's allowance keeps a GiB of the
+  card out of its own), and the choice of the CPU asks whether the lanes fit. unsloth's UD-Q2_0 on
+  an RTX PRO 4000, a 545-token prompt after a 4180-token one, two serves a side: 334-359 -> 582-593
+  tok/s (UD-IQ2_XS 337-361 -> 371-485, where the CPU's time a slot varied from serve to serve); the
+  decode the same.
+- **Qwen3.8 on the CUDA chain: a long prompt's layer in two passes.** Run layer by layer, a
+  layer's experts that are off the card are copied to the prompt's staging while the layers before
+  it run, but the copy could start only once the layer before had read its own, so it ran beside
+  the first chunk's attention alone. Each layer now runs every chunk's attention (or DeltaNet)
+  first and every chunk's experts after it, the same ops on the same values, so the copy runs beside
+  the whole first pass. UD-IQ2_XS on an RTX PRO 4000, two serves a side: a 4220-token prompt
+  737.8-744.8 -> 810.4 tok/s, the answer the same, the other prompts and the decode the same.
+- **Qwen3.8 on the CUDA chain: each expert at its own layer's size, on the card and in the host
+  pool.** unsloth's Dynamic V3.1 GGUFs mix expert types by layer (UD-IQ2_XS: five sizes from 1.26
+  to 2.09 MB), and the chain kept every expert in a slot of the largest, on the card and in the
+  page-locked pool. Qwen3.8 now asks the tier for slots of each layer's own size, as Qwen3.6
+  does, and the chain takes that arena over (`qt_chain_arena_exact`): its promotions draw within
+  the layer's size class and carve new slots from the arena's room before they evict anyone. The
+  host pool packs each layer's experts at their own size, and a prompt's staging counts its places
+  per layer. UD-IQ2_XS on an RTX PRO 4000, two serves a side: 6845 -> 8647 experts on the card,
+  the pool 49.8 -> 39.4 GiB, a 4220-token prompt 126 -> 370 tok/s, a 585-token one 190-210 ->
+  361-365, the decode after them 53-55 -> 60-61 and 62.7 -> 74.1-74.6 tok/s; Qwen3.8-Flash-Next
+  IQ2_XS (three sizes) 10807 -> 11328 experts and its decode the same or faster. With the chain
+  only: the tier on its own (`COLI_CUDA_CHAIN=0`) swaps an expert only for one of its size, and its
+  decode came 5-12% slower, so it keeps one size there unless `COLI_CUDA_EXACT_SLOTS=1`.
+  `COLI_CUDA_EXACT_SLOTS=0` and `COLI_CUDA_CHAIN_POOL_EXACT=0` restore the largest layer's slot.
+- **Qwen3.8 on the CUDA chain: a prompt's staging sized by the expert budget.** A long prompt's
+  layer copies its experts that are off the card into a staging buffer of 512 MiB, which held 246
+  to 411 of a UD-IQ2_XS layer's on a 24 GB card; the rest the kernels read over the bus at a third
+  of its rate. Where the tier sizes the expert budget it now gives the staging what the largest
+  layer's experts off the card would take, a fifth more, at most a sixteenth of the budget and
+  never under the 512 MiB (`qt_reserve_stage`; `COLI_CUDA_CHAIN_PROMPT_STAGE_MB` sets it by hand).
+  UD-IQ2_XS on an RTX PRO 4000 with the exact slots, a 4220-token prompt: 318-371 tok/s with 512
+  MiB, 719-729 with 800 (826 the rule's), 726-728 with 1100; the decode the same with 800 and 2-4
+  tok/s down with 1100.
+- **CUDA: a prompt chunk's routed experts in tiles of 128 rows** where the f16 tiles take them and an
+  expert has 32 rows or more on average (`COLI_CUDA_MOE_TILE128`: 1 always, 0 never). A tile decodes
+  its expert's weights once for its rows, which is most of its time, and 64-row tiles left an expert of
+  more rows decoding them again. Qwen3.8's 512 experts on an RTX PRO 4000 (`test_cuda_bd`'s new
+  `BENCH_MOE`): 4096 rows 26.5 -> 16.2 ms a call; a 4180-token prompt of IQ2_XS 935 -> 966-977 tok/s,
+  of unsloth's UD-Q2_0 927-929 -> 960-962, a 545-token one the same.
+- **CUDA: a prompt's IQ2_XXS, IQ2_XS, IQ3_XXS, Q5_0 and Q5_1 routed experts on the mma.sync
+  tiles.** A layer whose gate or down type had no decoder in the f16 tiles fell back to hcg_tile's
+  for its prompt chunks. unsloth's Dynamic V3.1 Qwen3.8 files put IQ2_XXS or IQ2_XS gates on up to
+  36 of their 48 layers (UD-IQ1_S), IQ3_XXS gates on up to 38 (UD-Q3_K_XL) and Q5_0 downs on up to
+  33 (UD-IQ4_XS). UD-IQ1_M on an RTX PRO 4000: a 4220-token prompt 756-769 -> 837-839 tok/s.
+- **CUDA chain: a QSA row's scores over a grid of the device** (`cc_qsa_score_k`). A query row's
+  scores of its blocks of keys took one block of 128 threads, so a decode step's 1-4 rows used as many
+  of the card's multiprocessors: 197 us a call at 4400 positions on an RTX PRO 4000 after the radix
+  select. A thread a block of keys over a grid of the rows' blocks, the dot in the CPU's order, the
+  same scores: 41 us, and the select's 20. Qwen3.8-Flash-Next IQ2_XS, the decode after a 4180-token
+  prompt 68.7-68.9 -> 76.1-76.7 tok/s (unsloth's UD-Q2_0 59.4-59.9 -> 64.8-65.6).
+- **CUDA chain: a QSA row's selection by a radix select** (`cc_qsa_k`). Picking a query row's
+  blocks of positions counted each block's rank against every other on one block of 128 threads, then
+  one thread wrote the list: 298 us a call at 4400 positions on an RTX PRO 4000, 7 ms of a 31 ms
+  Qwen3.8 decode step, and four times that a doubling of the context. A radix select over the
+  scores' bytes and prefix sums give the same list. Qwen3.8-Flash-Next IQ2_XS, the decode after a
+  4180-token prompt: 58.3-60.8 -> 66.6-70.3 tok/s (unsloth's UD-IQ2_XS 58.4-59.0 -> 61.4-61.5).
+- **CPU: Q2_0, IQ4_NL, Q5_0 and Q5_1 matrices eight rows at a time** (`gq_rows_f8`, ggml_quants.h).
+  The kernels that take a GGUF matrix's file rows by eight, each block decoded once for four
+  activation rows, had none of the four, and those went row by row. They are the down matrices of
+  every unsloth Dynamic V3.1 Qwen3.8 file (Q5_1 UD-Q4_K_XL's, Q5_0 most of UD-IQ4_XS's), where the
+  CPU computes the experts the card does not hold. One core of an i7-1355U (AVX-VNNI), 512 x 2048
+  rows in cache, one activation row: Q2_0 4.8 -> 7.1 GB/s, IQ4_NL 13.8 -> 23.6, Q5_0 13.9 -> 19.5,
+  Q5_1 10.2 -> 18.0. The same bits as the scalar reference and the R16 kernels (`test_rows_f8`, with
+  and without VNNI). UD-Q2_0 on an RTX PRO 4000 and an i5-13500: a 545-token prompt 588 -> 640-648
+  tok/s.
+- **CUDA chain: a prompt's selected keys staged in shared memory** (`cc_attn_gk`). Each thread read
+  its own key's elements in turn, so a warp's loads fell 32 lines apart and the kernel was bound by
+  L1 (82% of it under Nsight Compute, the multiprocessors at 43%). A tile's selected keys now come in
+  32 elements at a time by 16-byte loads, four threads a key, and each position's dot runs over d in
+  the order it did: each row the bits of that row alone. Qwen3.8-Flash-Next IQ2_XS on an RTX PRO 4000,
+  a 4180-token prompt: the attention 628 -> 424 ms, the prompt 892-893 -> 920-934 tok/s (unsloth's
+  UD-Q2_0 875-883 -> 924-925).
+- **Qwen3.8: a long prompt layer by layer with the MTP head too** (CUDA and Vulkan chains). A prompt of
+  several chunks runs layer by layer, each layer's host pool experts staged once for all its chunks, but
+  not when the caller wanted the rows' final streams back, and the MTP head's prefill always does: with
+  the head (on by default where the file has it) every chunk staged every layer again. The layer-by-layer
+  path now gives the streams back as the chunks do, and picks the promotions at the prompt's end as the
+  chunks did after each one. Qwen3.8-Flash-Next IQ2_XS with its MTP head on an RTX PRO 4000, two serves a
+  side: a 4220-token prompt 580-583 -> 798-807 tok/s on CUDA (56 GB -> 19 GB over the bus), 154-173 ->
+  305-308 on Vulkan, a 585-token one 115-134 -> 193-196 on Vulkan; the same text, the decode after it
+  and in the turns after the same.
 - **The CUDA chains' promotions in one call a frame.** An expert promoted to the card went over the
   bus in three copies (Qwen3.6's six), each `cc_host_up` five calls of the runtime (a mark's wait,
   the frame's event, the copy stream's wait on it, the copy, its mark): 20-30 experts after a
@@ -165,6 +420,52 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **DeepSeek V4.1: a long prompt's answer could start with `<｜begin▁of▁sentence｜>`.** Past
+  layer 20, the first with compress ratio 1, a prompt of 2478 tokens or more runs the later
+  layers on its last 2414 rows (`v41_prefill_tail`). Layers 21 to 23 run no indexer: they read
+  the list layer 20 published for every row, whose entries count past the window half of a
+  prompt read from position 0, all its rows, while the tail starts past position 0 and reads the
+  window ring. `v41_take_tail` moved the streams, their mix and the candidate mask but not that
+  list: each of the tail's rows read the list of a row from the start of the prompt, its entries
+  off the rows the attention holds, and the last row could turn to NaN at layer 21. The list now
+  moves with the tail, its entries onto the ring's rows. Wherever the CPU runs a prompt's
+  layers (without a GPU, on the CUDA tier, on Vulkan with the chain off): unsloth's UD-IQ1_S on
+  the CUDA tier answered a 4104-token prompt with `<｜begin▁of▁sentence｜>` and the document's
+  title in 4 fresh serves of 9, and answers it in 3 of 3 now. The Vulkan chain kept the lists
+  right.
+- **GLM-5.3 from unsloth's GGUF: the shared indexer layers reuse the full layer's selection, as
+  the model has them.** GLM-5.3 computes the DSA indexer's top-k on 21 of its 78 layers (zai-org's
+  config.json: `indexer_types`, one full layer every `index_topk_freq`) and the shared layers
+  between them reuse its selection. unsloth's files hold a shared layer's indexer weights as a
+  copy of the full layer's, and `tools/gguf_import.py` read every layer whose weights are in the
+  file as full: past `index_topk` (2048) context tokens each layer selected again from its own
+  rows. The import now reads a layer whose indexer is the layer before's byte for byte as shared,
+  and the engine finds such copies in a folder imported before, which needs no new import
+  (`[DSA] N layers hold the indexer of the layer before as a copy`). The 57 copies are no longer
+  loaded either.
+
+- **`chat_template_kwargs` reaches the chat template** (`coli serve`). Many OpenAI-compatible
+  clients turn a Qwen model's thinking off with `"chat_template_kwargs": {"enable_thinking":
+  false}`, and the gateway ignored the field: a Qwen3.8 request that asked for no thinking this
+  way reasoned at xhigh, its prompt 40 tokens longer. `enable_thinking`, `preserve_thinking` and
+  `reasoning_effort` there now count as they do at the top of the request, where the request
+  does not set them itself, with the same checks; a `chat_template_kwargs` that is not an object
+  gets a 400.
+- **CUDA: unsloth's Dynamic GGUFs with Q5_0 or Q5_1 experts kept every expert on the CPU.**
+  The tier's integer step had neither type, and one such tensor left the whole tier off:
+  Qwen3.8-Flash-Next UD-IQ2_XS has one Q5_0 down, UD-Q2_K_XL one, UD-Q3_K_XL 20, UD-IQ4_XS 33,
+  UD-Q4_K_XL 43 Q5_1. Both are now on the card as the CPU's integer form computes them.
+  UD-IQ2_XS on an RTX PRO 4000: decode 8.3-8.6 -> 51.7-68.2 tok/s, a 585-token prompt
+  24.6-25.1 -> 206-325 tok/s.
+- **Qwen3.8 on a CPU without FMA: the DeltaNet recurrence 4x faster** (#2606). Its fused
+  multiply-adds (`fmaf`) are one instruction where the CPU fuses (FMA3, arm64) and a call into
+  libm for every element where it does not (Sandy and Ivy Bridge, the x86-64 baseline), which
+  no loop vectorizes and glibc computes in software: a Xeon E5-2690 v1 spent 898 ms of a 1248 ms
+  forward there. `coli_fmaf` (`fma_compat.h`) is `fmaf` where the CPU fuses, the same
+  instructions, and elsewhere the product in double and the sum rounded to float, which AVX
+  vectorizes. Built for Sandy Bridge with glibc's software `fmaf`, Qwen3.8 IQ2_XS: the recurrence
+  208 -> 52 ms a forward, the same perplexity (2.2402 nats a token over 258 tokens); the planar
+  expert kernel's f32 mode (`QWEN_EXPERT_ACT=f32`) on Qwen3.6 0.59 -> 2.9 tok/s.
 - **Qwen3.8: memory that grew with every answer** (#2592). The expert loader reads a batch of
   missing experts in parallel (on by default) with a team as large as the batch, and libgomp
   ends the threads a smaller team leaves out and starts new ones for a larger. Each read
