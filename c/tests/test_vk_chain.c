@@ -2309,6 +2309,52 @@ static void test_ds_index(int S, int pos_base, int ratio, int IH, int ID, int to
     free(q); free(k); free(w); free(ref); free(refm); free(keep); free(lst); free(lstm); free(gs); free(gm); free(gl); free(gl2);
 }
 
+/* vkc_dsv4_score's two paths on the same inputs: mode 10's column grid (COLI_VK_DSA_TILED=0)
+ * and mode 11's tiles of 16 rows x 32 columns (chain_dsv4_idx.comp). The score buffers must
+ * be equal bit for bit: the selection compares their raw bits (mode 5's topk), so a choice
+ * of path can never change a pick, and there is no tolerance here. The inputs are random
+ * floats, not the 0.25 grid above (exact on both sides whatever a compiler fuses): a
+ * compiler that contracts one kernel's dot product and not the other's shows up as a
+ * mismatch. Ties are equal key rows (equal scores, which the selection breaks by column);
+ * past a row's reach, and the mask's zero words, are the -inf columns; S below 16, a width
+ * below 32 and an odd head count stay on mode 10. */
+static void test_ds_index_tiled(int S, int pos_base, int ratio, int IH, int width, int masked) {
+    int ID = 128, qrow = IH * ID + 1, krow = ID + 3, wrow = IH + 2, scrow = width + 3;
+    size_t nn = (size_t)S * qrow, kn = (size_t)width * krow, wn = (size_t)S * wrow, sn = (size_t)S * scrow;
+    float *q = malloc(nn * 4), *k = malloc(kn * 4), *w = malloc(wn * 4);
+    for (size_t i = 0; i < nn; i++) q[i] = (float)(int)(rnd() % 2001) * 1e-3f - 1.0f;
+    for (size_t i = 0; i < kn; i++) k[i] = (float)(int)(rnd() % 2001) * 1e-3f - 1.0f;
+    for (size_t i = 0; i < wn; i++) w[i] = (float)(int)(rnd() % 401) * 1e-3f - 0.2f;
+    for (int t = 4; t < width; t += 5) for (int i = 0; i < ID; i++) k[3 + (size_t)t * krow + i] = k[3 + (size_t)(t - 1) * krow + i];   /* ties */
+    /* the mask's words: nonzero keeps a column (the shader reads them as ints) */
+    float *mk = calloc(sn, 4);
+    for (size_t i = 0; i < sn; i++) mk[i] = (rnd() & 1u) ? 1.f : 0.f;
+    VkcBuf *qb = up(q, nn), *kb = up(k, kn), *wb = up(w, wn), *mbb = masked ? up(mk, sn) : NULL;
+    VkcBuf *s10 = vkc_buf(sn * 4, VKC_DEV), *s11 = vkc_buf(sn * 4, VKC_DEV);
+    VkcDsScore sp = {S, pos_base, ratio, IH, ID, width, 1, qrow, 2, wrow, 3, krow, masked ? scrow : 0, scrow, 0.375f, 0, 0};
+    float *zero = calloc(sn, 4);   /* the padding of a row's stride too: a whole-buffer compare */
+    VkcStats c0, c1;
+    vkc_stats(&c0);
+    vkc_begin(); vkc_write(s10, 0, zero, sn * 4); vkc_write(s11, 0, zero, sn * 4);
+    int ok = vkc_submit(1);
+    setenv("COLI_VK_DSA_TILED", "0", 1);
+    ok = ok && vkc_begin() && vkc_dsv4_score(qb, wb, kb, mbb, s10, &sp);
+    unsetenv("COLI_VK_DSA_TILED");
+    ok = vkc_dsv4_score(qb, wb, kb, mbb, s11, &sp) && ok;
+    ok = vkc_submit(1) && ok;
+    vkc_stats(&c1);
+    float *g10 = down(s10, 0, sn), *g11 = down(s11, 0, sn);
+    int want = S >= 16 && width >= 32 && !(IH & 1);   /* ID is 128 here */
+    int tiles = (int)(c1.dsa_tiled - c0.dsa_tiled), same = !memcmp(g10, g11, sn * 4), finite = 0, dead = 0;
+    for (size_t i = 0; i < sn; i++) { finite += g10[i] > -INFINITY; dead += g10[i] == -INFINITY; }
+    CHECK(ok && same && tiles == want && finite > 0 && dead > 0,
+          "dsv4 index S %d pos %d ratio %d IH %d width %d%s: %s, %d tiles (want %d), %d finite %d -inf", S, pos_base, ratio, IH,
+          width, masked ? " masked" : "", same ? "same bits" : "DIFFERS", tiles, want, finite, dead);
+    vkc_free(qb); vkc_free(kb); vkc_free(wb); if (mbb) vkc_free(mbb);
+    vkc_free(s10); vkc_free(s11);
+    free(q); free(k); free(w); free(mk); free(zero); free(g10); free(g11);
+}
+
 /* deepseek_v41.c's engram_run gate, in place on the streams */
 static void test_ds_engram(int S, int H, int D) {
     int kvrow = (H + 1) * D + 2, xrow = H * D + 3;
@@ -3684,6 +3730,54 @@ static void bench_dsa(void) {
     vkc_free(qb); vkc_free(wb); vkc_free(kb); vkc_free(scb); vkc_free(sb); free(q); free(w); free(k);
 }
 
+/* COLI_VK_CHAIN_BENCH=dsv4: a prompt chunk's indexer scores (vkc_dsv4_score) at DeepSeek
+ * V4.1 Flash's shape, S rows (COLI_VK_BENCH_S, 256) over W compressed columns
+ * (COLI_VK_BENCH_WIDTH, 8192), IH index heads (COLI_VK_BENCH_VH, 32) of ID 128, masked or
+ * not (COLI_VK_BENCH_MASK=1). Both paths on the same inputs: mode 10's column grid
+ * (COLI_VK_DSA_TILED=0) and mode 11's tiles, the buffers then compared bit for bit. */
+static void bench_dsv4(void) {
+    int S = 256, W = 8192, IH = 32, ID = 128, mask = 0;
+    const char *se = getenv("COLI_VK_BENCH_S"), *we = getenv("COLI_VK_BENCH_WIDTH");
+    const char *he = getenv("COLI_VK_BENCH_VH"), *me = getenv("COLI_VK_BENCH_MASK");
+    if (se && atoi(se) > 0) S = atoi(se);
+    if (we && atoi(we) > 0) W = atoi(we);
+    if (he && atoi(he) > 0) IH = atoi(he);
+    if (me && *me == '1') mask = 1;
+    size_t nn = (size_t)S * IH * ID, wn = (size_t)S * IH, kn = (size_t)W * ID, sn = (size_t)S * W;
+    float *q = fvec(nn, 1.f), *w = fvec(wn, 1.f), *k = fvec(kn, 1.f), *mk = mask ? fvec(sn, 1.f) : NULL;
+    for (size_t i = 0; mask && i < sn; i++) mk[i] = (rnd() & 1u) ? 1.f : 0.f;
+    VkcBuf *qb = up(q, nn), *wb = up(w, wn), *kb = up(k, kn), *mbb = mask ? up(mk, sn) : NULL;
+    VkcBuf *sc[2] = {vkc_buf(sn * 4, VKC_DEV), vkc_buf(sn * 4, VKC_DEV)};
+    int ok = qb && wb && kb && sc[0] && sc[1] && (!mask || mbb);
+    VkcDsScore sp = {S, W, 1, IH, ID, W, 0, IH * ID, 0, IH, 0, ID, mask ? W : 0, W, 0.5f, 0, 0};
+    double best[2] = {1e9, 1e9};
+    int used[2] = {0, 0};
+    double macs = (double)S * W * IH * ID;
+    for (int m = 0; m < 2 && ok; m++) {
+        if (m == 0) setenv("COLI_VK_DSA_TILED", "0", 1); else unsetenv("COLI_VK_DSA_TILED");
+        for (int r = 0; r < 4 && ok; r++) {
+            VkcStats s0, s1; vkc_stats(&s0);
+            ok = vkc_begin() && vkc_dsv4_score(qb, wb, kb, mbb, sc[m], &sp);
+            double t0 = bnow(); ok = vkc_submit(1) && ok; double dt = bnow() - t0;
+            vkc_stats(&s1);
+            used[m] += (int)(s1.dsa_tiled - s0.dsa_tiled);
+            if (r && dt < best[m]) best[m] = dt;
+        }
+    }
+    unsetenv("COLI_VK_DSA_TILED");
+    float *g0 = down(sc[0], 0, sn), *g1 = down(sc[1], 0, sn);
+    int same = ok && !memcmp(g0, g1, sn * 4);
+    if (same)
+        printf("bench dsv4 score S %d W %d IH %d ID %d%s: mode 10 grid %.2f ms (%.0f GMAC/s), %d tiles %.2f ms "
+               "(%.0f GMAC/s), %.2fx, same bits\n", S, W, IH, ID, mask ? " masked" : "", best[0] * 1e3,
+               macs / best[0] / 1e9, used[1], best[1] * 1e3, macs / best[1] / 1e9, best[0] / best[1]);
+    else printf("bench dsv4 score S %d W %d IH %d ID %d: failed %s (modes used %d/%d)\n", S, W, IH, ID, ok ? "DIFFERS" : "",
+                used[0], used[1]);
+    vkc_free(qb); vkc_free(wb); vkc_free(kb); if (mbb) vkc_free(mbb);
+    vkc_free(sc[0]); vkc_free(sc[1]);
+    free(q); free(w); free(k); free(mk); free(g0); free(g1);
+}
+
 /* COLI_VK_CHAIN_BENCH=dn: the DeltaNet recurrence at Qwen3.6's decode shape (32 value heads,
  * 16 key heads, KD = VD = 128, one row), 30 layers' worth in one frame, each its own state */
 static void bench_dn(void) {
@@ -4251,6 +4345,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "xb")) bench_xb();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "dn")) bench_dn();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "dsa")) bench_dsa();
+        else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "dsv4")) bench_dsv4();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "mla")) bench_mla();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "rows")) bench_rows();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "kda")) bench_kda();
@@ -4709,6 +4804,16 @@ int main(int argc, char **argv) {
             unsigned rng_was = rng;
             test_ds_index(2, 600, 4, 64, 128, 16, 2, 2, 1); test_ds_index(1, 2000, 4, 96, 64, 64, 4, 4, 0);
             test_ds_index(3, 500, 2, 16, 64, 32, 2, 3, 0);
+            rng = rng_was;
+        }
+        {   /* the two score paths on the same inputs, bit for bit: a tile, partial row and
+             * column tiles, DeepSeek V4's 64 heads, the S < 16, width < 32 and odd-head
+             * fallbacks (mode 10 both ways) */
+            unsigned rng_was = rng;
+            test_ds_index_tiled(16, 0, 4, 32, 32, 0); test_ds_index_tiled(40, 1005, 2, 32, 131, 1);
+            test_ds_index_tiled(17, 30, 1, 64, 100, 1); test_ds_index_tiled(33, 7, 2, 2, 96, 0);
+            test_ds_index_tiled(1, 30, 1, 32, 100, 0); test_ds_index_tiled(32, 0, 1, 16, 31, 0);
+            test_ds_index_tiled(17, 30, 1, 3, 96, 0);
             rng = rng_was;
         }
         printf("dsv4 done\n");
