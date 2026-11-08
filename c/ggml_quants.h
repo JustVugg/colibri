@@ -1819,6 +1819,72 @@ GQ_EXACT_FN static int gq_row_512(float *y, int ystride, const gq_act *a, const 
     }
 }
 #endif
+/* ---- fused ARM grid dots (IQ2_XXS, IQ3_XXS): the AVX2 GQ_DOT_SB256 family lower ----
+ * The non-AVX tail was: one unpack of a weight row per call (w8 + per-16 scales through a
+ * thread buffer) and then gq_dot_i8 through that buffer, a store and a reload of 2056
+ * floats-and-bytes per weight row and one type switch. Here the same sub-block decoder the
+ * unpack's NEON cases run (identical gathers, sign rows and scale expressions) produces its
+ * 32 int8 in registers, and they join the dot at once, without any store or reload. The
+ * float steps are gq_dot_i8's, in its order: two vdot lanes per sub-block, each converted
+ * and fma'd with its group scale times the block's scale, the accumulator finally
+ * vaddvq'd. So the result is the unpack path's bits, less roughly half the inner work
+ * (the routed experts' MoE block, the C10b trial's and the profile's wall). */
+#if defined(__ARM_NEON) && defined(__aarch64__)
+#define GQ_SB_ARM static inline __attribute__((always_inline))
+GQ_SB_ARM void gq_arm_sb_iq2_xxs(const uint8_t *b, float d, int ib, float *s, int8x16_t *w0, int8x16_t *w1) {
+    const uint8_t *qs = b + 2;
+    const uint32_t a0 = gq_rd32(qs + 8 * ib), a1 = gq_rd32(qs + 8 * ib + 4);
+    s[0] = s[1] = d * (0.5f + (float)(a1 >> 28)) * 0.25f;
+    int8x8_t g[4];
+    for (int l = 0; l < 4; l++)   /* gq_ublk's NEON case, register to register */
+        g[l] = vmul_s8(vreinterpret_s8_u8(vld1_u8(GGML_IQ2XXS_GRID + 8 * ((a0 >> (8 * l)) & 0xFF))),
+                       vld1_s8(GQ_SIGN8(GGML_KSIGNS_IQ2XS[(a1 >> (7 * l)) & 127])));
+    *w0 = vcombine_s8(g[0], g[1]); *w1 = vcombine_s8(g[2], g[3]);
+}
+GQ_SB_ARM void gq_arm_sb_iq3_xxs(const uint8_t *b, float d, int ib, float *s, int8x16_t *w0, int8x16_t *w1) {
+    const uint8_t *qs = b + 2, *ss = b + 66;
+    const uint32_t a = gq_rd32(ss + 4 * ib);
+    s[0] = s[1] = d * (0.5f + (float)(a >> 28)) * 0.5f;
+    int8x8_t g[4];
+    for (int l = 0; l < 4; l++) {
+        uint8_t gb[8];
+        memcpy(gb, GGML_IQ3XXS_GRID + 4 * qs[8 * ib + 2 * l], 4);
+        memcpy(gb + 4, GGML_IQ3XXS_GRID + 4 * qs[8 * ib + 2 * l + 1], 4);
+        g[l] = vmul_s8(vreinterpret_s8_u8(vld1_u8(gb)), vld1_s8(GQ_SIGN8(GGML_KSIGNS_IQ2XS[(a >> (7 * l)) & 127])));
+    }
+    *w0 = vcombine_s8(g[0], g[1]); *w1 = vcombine_s8(g[2], g[3]);
+}
+GQ_SB_ARM void gq_arm_dot2(const int8x16_t w0, const int8x16_t w1, const int8x16_t x0, const int8x16_t x1,
+                           int32x4_t *p0, int32x4_t *p1) {   /* gq_dot_i8's lines, its two builds */
+#if defined(__ARM_FEATURE_DOTPROD)
+    *p0 = vdotq_s32(vdupq_n_s32(0), w0, x0); *p1 = vdotq_s32(vdupq_n_s32(0), w1, x1);
+#else
+    *p0 = vpaddlq_s16(vmlal_s8(vmull_s8(vget_low_s8(w0), vget_low_s8(x0)), vget_high_s8(w0), vget_high_s8(x0)));
+    *p1 = vpaddlq_s16(vmlal_s8(vmull_s8(vget_low_s8(w1), vget_low_s8(x1)), vget_high_s8(w1), vget_high_s8(x1)));
+#endif
+}
+#define GQ_DOT_GRID_ARM(NAME, BYTES, SB) \
+static void NAME(float *y, int ystride, const uint8_t *row, const int8_t *xq, const float *dx, int I, const int S) { \
+    for (int s = 0; s < S; s++) { \
+        float32x4_t vacc = vdupq_n_f32(0.f); \
+        const int8_t *xs8 = xq + (int64_t)s * I; const float *dxs = dx + (int64_t)s * (I / 32); \
+        int64_t xb = 0; \
+        for (int64_t blk = 0; blk < I / 256; blk++) { \
+            const uint8_t *b = row + blk * (BYTES); const float d = gq_f16(gq_rd16(b)); \
+            for (int ib = 0; ib < 8; ib++, xb++) { \
+                float s2[2]; int8x16_t w0, w1; SB(b, d, ib, s2, &w0, &w1); \
+                int32x4_t p0, p1; \
+                gq_arm_dot2(w0, w1, vld1q_s8(xs8 + 32 * xb), vld1q_s8(xs8 + 32 * xb + 16), &p0, &p1); \
+                vacc = vmlaq_n_f32(vacc, vcvtq_f32_s32(p0), s2[0] * dxs[xb]); \
+                vacc = vmlaq_n_f32(vacc, vcvtq_f32_s32(p1), s2[1] * dxs[xb]); \
+            } \
+        } \
+        y[(int64_t)s * ystride] = vaddvq_f32(vacc); \
+    } \
+}
+GQ_DOT_GRID_ARM(gq_dot_arm_iq2_xxs, 66, gq_arm_sb_iq2_xxs)
+GQ_DOT_GRID_ARM(gq_dot_arm_iq3_xxs, 98, gq_arm_sb_iq3_xxs)
+#endif
 static inline void gq_row_all(float *y, int ystride, const gq_act *a, const uint8_t *row, int t, int I) {
 #ifdef GQ_VNNI512
     if (t == GQ_Q2_0 && I % 64 == 0 && a->l4) { gq_dot_q2_0_512(y, ystride, row, a, I); return; }
@@ -1845,6 +1911,14 @@ static inline void gq_row_all(float *y, int ystride, const gq_act *a, const uint
         if (t == GQ_Q3_K) { gq_dot_q3_k(y, ystride, row, a->q, a->d, a->s, I, a->S); return; }
     }
 #else
+#if defined(__ARM_NEON) && defined(__aarch64__) && !defined(__AVX2__)
+    /* the fused grid dots: a weight row's registers, no unpack buffer */
+    if ((t == GQ_IQ2_XXS || t == GQ_IQ3_XXS) && I % 256 == 0) {
+        if (t == GQ_IQ2_XXS) gq_dot_arm_iq2_xxs(y, ystride, row, a->q, a->d, I, a->S);
+        else                 gq_dot_arm_iq3_xxs(y, ystride, row, a->q, a->d, I, a->S);
+        return;
+    }
+#endif
     if (t == GQ_Q8_0) {
         for (int s = 0; s < a->S; s++) y[(int64_t)s * ystride] = gq_dot_q8_0(row, a->q + (int64_t)s * I, a->d + (int64_t)s * (I / 32), I);
         return;

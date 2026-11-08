@@ -1761,6 +1761,13 @@ static void *qalloc(size_t n){
     if(n>=(size_t)1<<20) numa_slab_bind(p,n);      /* resident dense weights too (#82: attention/shared stream from RAM every token) */
     return p;
 }
+static void qfree(void *p){
+    if(!p) return;
+#ifdef COLI_METAL
+    if(g_metal_enabled) coli_metal_unregister(p);
+#endif
+    free(p);
+}
 static float *qsalloc(int O){ return (float*)qalloc((size_t)O*sizeof(float)); }
 static int g_pilot_real=0;/* PILOT_REAL=1: il pilota fa LOAD VERI cross-layer dentro ecache[L+1]
                           * (non il semplice WILLNEED). Implica PILOT=1. Default OFF: hint-only. */
@@ -1806,6 +1813,11 @@ static void qt_fill(QT *t, const float *w, int bits){
     else if(t->fmt==3) pack_int2(w, t->q4, t->s, t->O, t->I, bits);
     else if(t->fmt==5) pack_int3_g64(w, t->q4, t->s, t->O, t->I);
     else pack_int4(w, t->q4, t->s, t->O, t->I, bits);
+}
+static void qt_release_owned(QT *t){
+    if(!t || t->mmap_view) return;
+    qfree(t->qf); qfree(t->q8); qfree(t->q4); qfree(t->s);
+    t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL; t->gcap=0;
 }
 
 static void rmsnorm(float *out, const float *x, const float *w, int D, float eps){
@@ -2450,8 +2462,8 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
             fprintf(stderr,"%s: %lld bytes of %s, not [%d x %d] of it\n",name,(long long)gg->nbytes,gq_type_name(type),O,I); exit(1); }
         const int held=coli_ggml_held_type(type,O,I,"GLM_ILV16");
         const int64_t hb=gq_row_bytes(held,I)*O;
-        if(t->fmt!=QT_GGML || t->gcap<hb){
-            if(t->fmt==QT_GGML) free(t->q4);
+        if(t->fmt!=QT_GGML || t->gcap<hb || t->O!=O || t->I!=I){
+            qt_release_owned(t);
             if(!(t->q4=qalloc((size_t)hb))){ fprintf(stderr,"OOM %s\n",name); exit(1); }
             t->gcap=hb;
         }
@@ -2478,7 +2490,9 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
         const char *stamped = st_fmt_stamp(&m->S,name);   /* NULL if unstamped */
         int fmt = qt_resolve_fmt(name,O,I,nb,ns,&gs,stamped);
         qt_verify_fmt_stamp(name,stamped,fmt);   /* TRUST-VERIFY-REFUSE: no-op if unstamped */
-        if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->gs=0; t->q8=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
+        if(fmt==1){ if(t->fmt!=1||t->O!=O||t->I!=I||!t->q8||!t->s){
+                qt_release_owned(t); t->fmt=1; t->O=O; t->I=I; t->gs=0; t->q8=qalloc(nb); t->s=qsalloc(O);
+            } st_read_raw(&m->S,name,t->q8,drop); }
         else if(fmt==4){ int ng=(I+gs-1)/gs;
             /* METAL: t->s must be page-aligned + coli_metal_register'd like every other
              * fmt's scale buffer (qsalloc, used by fmt 1/2/3 just below/above), or
@@ -2493,21 +2507,31 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
              * not a new class; noted rather than silent. fmt=5's group scales (just
              * below) still use falloc and so remain Metal-inert -- pre-existing,
              * inconsistent after this change, a candidate for whoever wires fmt=5. */
-            if(t->fmt!=4||!t->q4){ t->fmt=4; t->O=O; t->I=I; t->gs=gs; t->q4=qalloc(nb); t->s=(float*)qalloc((size_t)O*(size_t)ng*sizeof(float)); }
+            if(t->fmt!=4||t->O!=O||t->I!=I||t->gs!=gs||!t->q4||!t->s){
+                qt_release_owned(t); t->fmt=4; t->O=O; t->I=I; t->gs=gs; t->q4=qalloc(nb); t->s=(float*)qalloc((size_t)O*(size_t)ng*sizeof(float));
+            }
             st_read_raw(&m->S,name,t->q4,drop); }
         else if(fmt==5){ int64_t ng=i3_groups(I);   /* int3-g64: 24B/group weights + O*ng group scales */
-            if(t->fmt!=5||!t->q4){ t->fmt=5; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=falloc((int64_t)O*ng); }
+            if(t->fmt!=5||t->O!=O||t->I!=I||!t->q4||!t->s){
+                qt_release_owned(t); t->fmt=5; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=falloc((int64_t)O*ng);
+            }
             st_read_raw(&m->S,name,t->q4,drop); }
         else if(fmt==6){   /* E8/IQ3: everything in-block, .qs is the 4-byte tag */
-            if(t->fmt!=6||!t->q4){ t->fmt=6; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=qsalloc(1); }
+            if(t->fmt!=6||t->O!=O||t->I!=I||!t->q4||!t->s){
+                qt_release_owned(t); t->fmt=6; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=qsalloc(1);
+            }
             st_read_raw(&m->S,name,t->q4,drop); }
         else if(fmt==8){ int64_t nblk=fp8_nblk(O)*fp8_nblk(I);   /* fp8-e4m3: raw bytes (q8, like fmt=1)
             * + one f32 scale per 128x128 block. BOTH weights and scale via qalloc, not falloc,
             * from day one -- the GPU-visibility lesson fmt=4 and fmt=5 each had to learn
             * separately (see review round 1 audit history in the report). */
-            if(t->fmt!=8||!t->q8){ t->fmt=8; t->O=O; t->I=I; t->gs=0; t->q8=qalloc(nb); t->s=(float*)qalloc((size_t)nblk*sizeof(float)); }
+            if(t->fmt!=8||t->O!=O||t->I!=I||!t->q8||!t->s){
+                qt_release_owned(t); t->fmt=8; t->O=O; t->I=I; t->gs=0; t->q8=qalloc(nb); t->s=(float*)qalloc((size_t)nblk*sizeof(float));
+            }
             st_read_raw(&m->S,name,t->q8,drop); }
-        else      { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q4,drop); }
+        else      { if(t->fmt!=fmt||t->O!=O||t->I!=I||!t->q4||!t->s){
+                qt_release_owned(t); t->fmt=fmt; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=qsalloc(O);
+            } st_read_raw(&m->S,name,t->q4,drop); }
         /* cap MUST match the scale cardinality qt_resolve_fmt already validated and
          * the falloc above actually reserved, per format: grouped-int4 (fmt=4) keeps
          * O*ceil(I/gs) scales, int3-g64 (fmt=5) keeps O*i3_groups(I), E8/IQ3 (fmt=6)
@@ -12401,7 +12425,7 @@ static int vk_experts_rtq(Model *m,int layer){
 static void vk_tmp_slot_free(ESlot *t,int rtq){
     if(t->slab){ compat_aligned_free(t->slab); free(t->fslab); }
     else if(rtq){ QT *q[3]={&t->g,&t->u,&t->d};
-        for(int k=0;k<3;k++){ free(q[k]->qf); free(q[k]->q8); free(q[k]->q4); free(q[k]->s); } }
+        for(int k=0;k<3;k++){ qfree(q[k]->qf); qfree(q[k]->q8); qfree(q[k]->q4); qfree(q[k]->s); } }
     memset(t,0,sizeof(*t)); t->eid=-1;
 }
 static Model *g_vk_model;                    /* the run's report at exit */
@@ -13998,7 +14022,7 @@ static void qt_dho_visit(QT *t, int keep, int drop, DhoPass *p){
     const void *w=t->fmt==0?(const void*)t->qf:t->fmt==1?(const void*)t->q8:(const void*)t->q4;
     if(!coli_vk_tensor_ensure(&t->vk,w,t->fmt==0?NULL:t->s,qt_vk_fmt(t),t->I,t->O,t->fmt==4?t->gs:0)) return;
     int64_t b=qt_bytes(t);
-    free(t->qf); free(t->q8); free(t->q4); free(t->s);
+    qfree(t->qf); qfree(t->q8); qfree(t->q4); qfree(t->s);
     t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
     __atomic_store_n(&t->vk_gone,1,__ATOMIC_RELEASE);
     coli_vk_dense_host_dropped((size_t)b);
@@ -15262,7 +15286,7 @@ static void glm_segment_qt_destroy(QT *tensor) {
      * shard mapping; free() on q8/q4/s would abort. Segment loads are gated to the
      * resident path, but keep this guard so the mmap_view contract holds here too. */
     if (tensor->mmap_view) return;
-    free(tensor->qf); free(tensor->q8); free(tensor->q4); free(tensor->s);
+    qfree(tensor->qf); qfree(tensor->q8); qfree(tensor->q4); qfree(tensor->s);
     memset(tensor, 0, sizeof(*tensor));
 }
 
@@ -15709,7 +15733,7 @@ static void glm_edge_qt_destroy(QT *tensor) {
      * mapping). Edge loads embed/lm_head via the resident path today; this guard
      * keeps the mmap_view contract true if that ever changes. */
     if (tensor->mmap_view) return;
-    free(tensor->qf); free(tensor->q8); free(tensor->q4); free(tensor->s);
+    qfree(tensor->qf); qfree(tensor->q8); qfree(tensor->q4); qfree(tensor->s);
     memset(tensor, 0, sizeof(*tensor));
 }
 

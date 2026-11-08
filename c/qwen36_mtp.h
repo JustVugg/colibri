@@ -21,6 +21,13 @@ typedef struct {
     float last_p;                    /* the newest draft's probability under the head */
     int pick_id, pick_ok;            /* q36_mg_row / q36_mc_row compact pick */
     int *vid;                        /* Q36_MTP_VOCAB_IDS: row j of dvoc scores id vid[j] (NULL: id j) */
+    int gguf_head, dmoe;             /* GGUF-native head (blk.<n_layers>.nextn.*); dmoe: 0 sidecar int8,
+                                      * 1 GGUF-native routed experts, 2 qwen35 dense FFN */
+    uint8_t *slab_g, *slab_u, *slab_d;   /* dmoe 1: the head block's ffn_*_exps bytes, one tensor each */
+    int stg, stu, std;               /* their ggml types */
+    int64_t eb_g, eb_u, eb_d;        /* one expert's bytes in each tensor */
+    float *esg, *esu, *esd;          /* the file's per-expert ".scale" factors (NULL: 1) */
+    QW dg, du, dd;                   /* dmoe 2: the dense FFN */
     void *Kc, *Vc; int stride;       /* the head's KV rows [KV][stride][hd], q36_kv_es() bytes an element */
     void **Kp, **Vp;                 /* the model's per-layer pointers and the head's after them */
     /* where the head is: rows up to `len` read; `pend` the model's row at len (before the
@@ -60,8 +67,145 @@ static void q36_mtp_expert_qw(QW *w, const int8_t *q, const float *sc,
         w->w = f;
     }
 }
+/* GGUF-native MTP head (unsloth "-MTP" GGUFs of the qwen35 / qwen35moe families, and any
+ * export with the same shape): the engine's block c->n_layers IS the MTP layer -- its
+ * blk.<L>.* tensors are a complete gated-attention + FFN layer and blk.<L>.nextn.*
+ * completes the head (eh_proj, enorm, hnorm, shared_head_norm). Everything reuses the
+ * trunk's own GGUF loaders: load_tq / load_t_n / load_norm_n read the file in place and
+ * the file's ggml types are served by the same matmul_d / gq_matmul the model runs. */
+static int q36_mtp_load_gguf(Model *m) {
+    Cfg *c = &m->c; Q36Mtp *p = &g_q36_mtp;
+    const int D = c->hidden, Lx = c->n_layers;
+    char nm[128];
+    /* HF-style names, translated to the file's by gg_name exactly as every layer's
+     * loading is (the rope-permute detection in load_tq/load_norm_n keys on the
+     * HF suffixes, so these must go through the table). */
+    snprintf(nm, sizeof nm, "blk.%d.nextn.enorm.weight", Lx);
+    if (!gguf_find(&g_gg, nm)) return 0;   /* a plain checkpoint: mtp.* sidecar (or none) */
+    p->E = c->n_experts; p->K = c->topk; p->I = c->inter; p->ish = c->shared_inter;
+    snprintf(nm, sizeof nm, "model.layers.%d.nextn.eh_proj.weight", Lx);
+    load_tq(m, nm, 2 * D, D, 1, "mtp", &p->eh);
+    #define MN(field, hfs, n)                                                               \
+        do {                                                                                \
+            snprintf(nm, sizeof nm, "model.layers.%d." hfs, Lx);                            \
+            if (!(p->field = load_norm_n(m, nm, n))) return 0;                              \
+        } while (0)
+    MN(enorm,     "nextn.enorm.weight", D);
+    MN(hnorm,     "nextn.hnorm.weight", D);
+    MN(head_norm, "nextn.shared_head_norm.weight", D);
+    MN(L.in_ln,   "input_layernorm.weight", D);
+    MN(L.post_ln, "post_attention_layernorm.weight", D);
+    snprintf(nm, sizeof nm, "blk.%d.attn_q_norm.weight", Lx);
+    if (gguf_find(&g_gg, nm)) {
+        MN(L.qn, "self_attn.q_norm.weight", c->head_dim);
+        MN(L.kn, "self_attn.k_norm.weight", c->k_head_dim);
+    }
+    #undef MN
+    #define MW(field, hfs, ni, no)                                                          \
+        do {                                                                                \
+            snprintf(nm, sizeof nm, "model.layers.%d." hfs, Lx);                            \
+            load_tq(m, nm, ni, no, 1, "mtp", &p->field);                                    \
+        } while (0)
+    MW(L.q, "self_attn.q_proj.weight", D, c->q_heads * c->q_head_dim);
+    MW(L.k, "self_attn.k_proj.weight", D, c->kv_heads * c->k_head_dim);
+    MW(L.v, "self_attn.v_proj.weight", D, c->kv_heads * c->v_head_dim);
+    MW(L.o, "self_attn.o_proj.weight", c->q_heads * c->head_dim, D);
+    if (c->n_experts > 0) {   /* qwen35moe: routed experts + the gated shared expert */
+        if (c->topk < 1 || c->topk > 16) { fprintf(stderr, "[mtp] GGUF head: top-%d unsupported (1..16)\n", c->topk); return 0; }
+        if (c->shared_inter <= 0) { fprintf(stderr, "[mtp] GGUF head: a qwen35moe MTP layer without a shared expert\n"); return 0; }
+        MW(sh_g, "mlp.shared_expert.gate_proj.weight", D, c->shared_inter);
+        MW(sh_u, "mlp.shared_expert.up_proj.weight", D, c->shared_inter);
+        MW(sh_d, "mlp.shared_expert.down_proj.weight", c->shared_inter, D);
+        snprintf(nm, sizeof nm, "model.layers.%d.mlp.shared_expert_gate.weight", Lx);
+        p->sh_gate = load_t_n(m, nm, D);
+        snprintf(nm, sizeof nm, "model.layers.%d.mlp.gate.weight", Lx);
+        p->router = load_t_n(m, nm, (int64_t)p->E * D);
+        const gguf_tensor *g = NULL, *u = NULL, *d = NULL;
+        const gguf_tensor **dst[3] = { &g, &u, &d };
+        const char *kind[3] = { "gate", "up", "down" };
+        const int64_t want_ne[2][3] = { { (int64_t)q36_eh(c), (int64_t)c->inter, (int64_t)p->E },
+                                        { (int64_t)c->inter, (int64_t)q36_eh(c), (int64_t)p->E } };
+        for (int k = 0; k < 3; k++) {
+            snprintf(nm, sizeof nm, "blk.%d.ffn_%s_exps.weight", Lx, kind[k]);
+            const gguf_tensor *t = gguf_mark(&g_gg, nm);
+            if (!t || t->n_dims != 3 || t->ne[0] != want_ne[k / 2][0] || t->ne[1] != want_ne[k / 2][1] || t->ne[2] != (int64_t)p->E) {
+                fprintf(stderr, "[mtp] GGUF %s: missing or not [%lld x %lld x %d]\n", nm,
+                        (long long)(k == 2 ? c->inter : q36_eh(c)), (long long)(k == 2 ? q36_eh(c) : c->inter), p->E);
+                exit(1);
+            }
+            if (!gq_blk_decoder(t->type) && t->type != GQ_F32 && t->type != GQ_F16 && t->type != GQ_BF16) {
+                fprintf(stderr, "[mtp] GGUF %s: type %s is not supported\n", nm, gq_type_name(t->type)); exit(1);
+            }
+            *dst[k] = t;
+        }
+        /* the tensor's bytes are [E] contiguous expert slabs each (exactly what the model's
+         * streamed-expert path holds); the head layer stays resident: the whole file read here */
+        p->stg = g->type; p->stu = u->type; p->std = d->type;
+        p->eb_g = g->nbytes / p->E; p->eb_u = u->nbytes / p->E; p->eb_d = d->nbytes / p->E;
+        char tag[80]; snprintf(tag, sizeof tag, "[mtp] GGUF-native head (blk.%d.nextn)", Lx);
+        const int64_t slab_all = g->nbytes + u->nbytes + d->nbytes;
+        /* C6 (ledger): the head's expert slab is the file's own t-separated slabs -- the
+         * same ggml blocks, the same tensor entries the trunk's zero-copy slots serve -- so
+         * a pointing view works: with C3's maps up (Q36_GQ_ZC) the three pointers land in
+         * the mapped file's bytes and q36_mtp_moe_gguf's gq_matmul reads them exactly as
+         * the copy path did, 278 MB never copied. Measured (6 alternating pairs, MTP on,
+         * 128 tok): zero-copy 8.11 tok/s avg against the copy's 8.27 (5/6 pairs the copy
+         * wins, and its single outlier carried most of the gap) -- the slab's private copy
+         * is never evicted by the trunk's expert traffic, while the mapped pages are
+         * reclaimable page cache and a draft eats the fault. The copy stays the default;
+         * Q36_MTP_ZC=1 opts the slab into the C3 regime (shorter start, evictable, ~130 MB
+         * less peak RSS measured where faulted pages count in it). One F_RDADVISE kick per
+         * tensor warms the mapped range asynchronously (the sync WILLNEED trap C3 measured). */
+        gguf_zc_init();
+        int mzc = g_zc;
+        { const char *mz = getenv("Q36_MTP_ZC");
+          if (mzc > 0 && (!mz || *mz != '1')) mzc = 0;   /* Q36_MTP_ZC=1 maps it; without the C3 regime (Q36_GQ_ZC=0) the copy is the only path */ }
+        if (mzc > 0) {
+            p->slab_g = (uint8_t *)g_zc_base[g->file] + g->off;
+            p->slab_u = (uint8_t *)g_zc_base[u->file] + u->off;
+            p->slab_d = (uint8_t *)g_zc_base[d->file] + d->off;
+            posix_fadvise(g_gg.fds[g->file], (off_t)g->off, (off_t)g->nbytes, POSIX_FADV_WILLNEED);
+            posix_fadvise(g_gg.fds[u->file], (off_t)u->off, (off_t)u->nbytes, POSIX_FADV_WILLNEED);
+            posix_fadvise(g_gg.fds[d->file], (off_t)d->off, (off_t)d->nbytes, POSIX_FADV_WILLNEED);
+            fprintf(stderr, "%s: %d experts top-%d, one expert %.2f MB, %.2f MB mapped zero-copy, no slab read (Q36_MTP_ZC=0 copies it)\n",
+                    tag, p->E, p->K, (p->eb_g + p->eb_u + p->eb_d) / 1048576.0, slab_all / 1048576.0);
+        } else {
+            fprintf(stderr, "%s: %d experts top-%d, one expert %.2f MB, slab read of %.2f MB starting\n",
+                    tag, p->E, p->K, (p->eb_g + p->eb_u + p->eb_d) / 1048576.0, slab_all / 1048576.0);
+            if (!(p->slab_g = malloc((size_t)g->nbytes)) || !(p->slab_u = malloc((size_t)u->nbytes)) ||
+                !(p->slab_d = malloc((size_t)d->nbytes)) ||
+                gguf_read(&g_gg, g, p->slab_g, 0, g->nbytes) || gguf_read(&g_gg, u, p->slab_u, 0, u->nbytes) ||
+                gguf_read(&g_gg, d, p->slab_d, 0, d->nbytes)) { fprintf(stderr, "OOM/read of the MTP head's expert slab\n"); exit(1); }
+        }
+        /* the file's per-expert ".scale" factors, by the trunk's own lookup */
+        float **es[3] = { &p->esg, &p->esu, &p->esd };
+        for (int k = 0; k < 3; k++) {
+            snprintf(nm, sizeof nm, "blk.%d.ffn_%s_exps.weight", Lx, kind[k]);
+            gguf_tensor fake; memset(&fake, 0, sizeof fake); fake.name = nm;   /* only the name matters to gg_scale */
+            float *v = falloc(p->E);
+            if (gg_scale(&fake, p->E, v)) *es[k] = v; else { free(v); *es[k] = NULL; }
+        }
+        p->dmoe = 1;
+        fprintf(stderr, "%s: %.2f MB of routed experts %s; the drafts run (Q36_MTP=0 turns it off)\n", tag,
+                slab_all / 1048576.0,
+                mzc > 0 ? "in the file's mapped pages (zero-copy)" : "resident");
+    } else {   /* qwen35 dense: the head's FFN is one matrix set, as every layer's is */
+        if (c->shared_inter <= 0) { fprintf(stderr, "[mtp] GGUF head: no MLP width\n"); return 0; }
+        MW(dg, "mlp.gate_proj.weight", D, c->shared_inter);
+        MW(du, "mlp.up_proj.weight", D, c->shared_inter);
+        MW(dd, "mlp.down_proj.weight", c->shared_inter, D);
+        p->dmoe = 2;
+        fprintf(stderr, "[mtp] GGUF-native head (blk.%d.nextn): dense FFN %d, the drafts run (Q36_MTP=0 turns it off)\n", Lx, c->shared_inter);
+    }
+    #undef MW
+    p->gguf_head = 1;
+    p->pend = falloc(D); p->on = 1;
+    return 1;
+}
+
 static int q36_mtp_load(Model *m) {
     Cfg *c = &m->c; Q36Mtp *p = &g_q36_mtp;
+    if (g_gguf) return q36_mtp_load_gguf(m);
     int D = c->hidden, E = c->n_experts, I = c->inter, Ish = c->shared_inter;
     if (!st_find(&m->S, "mtp.fc.weight")) return 0;
     if (E <= 0 || E > 1024 || c->topk > 16 || Ish <= 0) {
@@ -126,15 +270,32 @@ static int q36_mtp_load(Model *m) {
         if (!feof(f) || !n) { fprintf(stderr, "invalid/empty MTP vocabulary\n"); exit(1); }
         fclose(f); free(seen);
         /* Read the shared checkpoint matrix, not a separately trained output head. */
-        char resolved[QW_DENSE_NAME_MAX];
-        const char *lm = dense_resolve(m, "lm_head.weight", resolved, sizeof resolved);
-        st_tensor *weight = st_find(&m->S, lm);
-        if (!weight || weight->numel != (int64_t)c->vocab * D || weight->dtype > 2) {
-            fprintf(stderr, "MTP vocabulary needs a float shared lm_head\n"); exit(1);
-        }
         float *rows = falloc((int64_t)n * D);
-        for (int j = 0; j < n; j++)
-            st_read_slice_f32(&m->S, lm, (int64_t)ids[j]*D, D, rows + (int64_t)j*D, 0);
+        if (g_gguf) {   /* the file's lm_head rows, whatever the engine loaded them as */
+            const QW *w = &m->lm_head;
+            if (!w->w && !w->gq) {
+                fprintf(stderr, "MTP vocabulary needs a float shared lm_head\n"); exit(1);
+            }
+            if (w->w) {
+                for (int j = 0; j < n; j++)
+                    memcpy(rows + (int64_t)j * D, w->w + (int64_t)ids[j] * D, sizeof(float) * D);
+            } else {
+                int rb = gq_row_bytes(w->gq_type, D);
+                for (int j = 0; j < n; j++) {
+                    gq_dequant_row(w->gq_type, w->gq + (int64_t)ids[j] * rb, rows + (int64_t)j * D, D);
+                    if (w->gs != 1.f) for (int d = 0; d < D; d++) rows[(int64_t)j * D + d] *= w->gs;
+                }
+            }
+        } else {
+            char resolved[QW_DENSE_NAME_MAX];
+            const char *lm = dense_resolve(m, "lm_head.weight", resolved, sizeof resolved);
+            st_tensor *weight = st_find(&m->S, lm);
+            if (!weight || weight->numel != (int64_t)c->vocab * D || weight->dtype > 2) {
+                fprintf(stderr, "MTP vocabulary needs a float shared lm_head\n"); exit(1);
+            }
+            for (int j = 0; j < n; j++)
+                st_read_slice_f32(&m->S, lm, (int64_t)ids[j]*D, D, rows + (int64_t)j*D, 0);
+        }
         p->dvoc.I = D; p->dvoc.O = n; p->dvoc.w = rows;
         if (dense_i8_on()) { qw_quantize(rows, D, n, "lm_head", &p->dvoc); free(rows); p->dvoc.w = NULL; }
         p->nvoc = n; p->vid = ids;
@@ -143,7 +304,7 @@ static int q36_mtp_load(Model *m) {
          * Unset, a list of DRAFT_VOCAB_DEFAULT_TOP where the head drafts on the CUDA chain (measured
          * there), the whole vocabulary elsewhere; 0 is always the whole vocabulary. */
         const char *ve = getenv("Q36_MTP_VOCAB"), *dmp = getenv("Q36_MTP_DUMP");
-        int top = q36_cuda_tier_drafts(m) ? DRAFT_VOCAB_DEFAULT_TOP : 0;
+        int top = q36_cuda_tier_drafts(m) || p->gguf_head ? DRAFT_VOCAB_DEFAULT_TOP : 0;
         if (ve && *ve) {
             char *end = NULL; long parsed = strtol(ve, &end, 10);
             if (end == ve || *end || parsed < 0 || parsed > (long)c->vocab) {
@@ -151,7 +312,7 @@ static int q36_mtp_load(Model *m) {
             }
             top = (int)parsed;
         }
-        int can = !(dmp && *dmp) && 0 < top && top < c->vocab && (m->lm_head.q || m->lm_head.w || q36_cuda_tier_drafts(m));
+        int can = !(dmp && *dmp) && 0 < top && top < c->vocab && (m->lm_head.q || m->lm_head.w || (m->lm_head.gq && g_gguf) || q36_cuda_tier_drafts(m));
 #ifdef COLI_VULKAN
         if (g_vk_chain || m->lm_head.vk_gone) can = 0;
 #endif
@@ -311,6 +472,65 @@ static void q36_mtp_moe(const float *x, int R, int D, float *out) {
         }
     }
     free(idx); free(val); free(lg); free(rows); free(xe); free(ge); free(ue); free(ye);
+}
+
+/* The GGUF-native head's routed experts: the same routing math as q36_mtp_moe, the experts
+ * straight from the head block's ffn_*_exps bytes (the file's ggml types, served by
+ * gq_matmul) and its per-expert ".scale" factors. A draft's rows are few, so every
+ * (row, expert) pair is one call, as the head's own sidecar path does at R*K <= 64. */
+static void q36_mtp_moe_gguf(const float *x, int R, int D, float *out) {
+    Q36Mtp *p = &g_q36_mtp; int E = p->E, K = p->K, I = p->I, Ish = p->ish;
+    int *idx = malloc(sizeof(int) * (size_t)R * K); float *val = falloc((int64_t)R * K), *lg = falloc((int64_t)R * E);
+    for (int j = 0; j < R * E; j++) {
+        const float *xr = x + (int64_t)(j / E) * D, *w = p->router + (int64_t)(j % E) * D;
+        float a = 0; for (int i = 0; i < D; i++) a += xr[i] * w[i];
+        lg[j] = a;
+    }
+    #pragma omp parallel for schedule(static) if (R > 1)
+    for (int r = 0; r < R; r++) q36_mtp_route(lg + (int64_t)r * E, E, K, idx + r * K, val + r * K);
+    memset(out, 0, sizeof(float) * (size_t)R * D);
+    {   /* the shared expert, every row (the shared expert's QWs came off load_tq's GGUF path) */
+        float *g = falloc((int64_t)R * Ish), *u = falloc((int64_t)R * Ish), *y = falloc((int64_t)R * D);
+        matmul_d(g, x, &p->sh_g, R, D, Ish); matmul_d(u, x, &p->sh_u, R, D, Ish);
+        for (int64_t i = 0; i < (int64_t)R * Ish; i++) g[i] = g[i] / (1.f + expf(-g[i])) * u[i];
+        matmul_d(y, g, &p->sh_d, R, Ish, D);
+        for (int r = 0; r < R; r++) {
+            const float *xr = x + (int64_t)r * D; float a = 0; for (int i = 0; i < D; i++) a += xr[i] * p->sh_gate[i];
+            float sg = 1.f / (1.f + expf(-a));
+            for (int i = 0; i < D; i++) out[(int64_t)r * D + i] += sg * y[(int64_t)r * D + i];
+        }
+        free(g); free(u); free(y);
+    }
+    float *ye = falloc((int64_t)R * K * D);
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int j = 0; j < R * K; j++) {
+        int e = idx[j];
+        float *g = falloc(I), *u = falloc(I);
+        const float *xr = x + (int64_t)(j / K) * D;
+        gq_matmul(g, xr, p->slab_g + e * p->eb_g, p->stg, 1, D, I);
+        gq_matmul(u, xr, p->slab_u + e * p->eb_u, p->stu, 1, D, I);
+        if (p->esg) for (int i = 0; i < I; i++) g[i] *= p->esg[e];
+        if (p->esu) for (int i = 0; i < I; i++) u[i] *= p->esu[e];
+        for (int i = 0; i < I; i++) g[i] = g[i] / (1.f + expf(-g[i])) * u[i];
+        gq_matmul(ye + (int64_t)j * D, g, p->slab_d + e * p->eb_d, p->std, 1, I, D);
+        if (p->esd) for (int i = 0; i < D; i++) ye[(int64_t)j * D + i] *= p->esd[e];
+        free(g); free(u);
+    }
+    for (int j = 0; j < R * K; j++) {   /* rank order */
+        float w = val[j], *o = out + (int64_t)(j / K) * D; const float *yr = ye + (int64_t)j * D;
+        for (int i = 0; i < D; i++) o[i] += w * yr[i];
+    }
+    free(ye); free(idx); free(val); free(lg);
+}
+
+/* The dense qwen35 head's FFN: gate, up, swiglu, down (no routing, no shared expert). */
+static void q36_mtp_moe_dense(const float *x, int R, int D, float *out) {
+    Q36Mtp *p = &g_q36_mtp; int I = p->I;
+    float *a = falloc((int64_t)R * I), *u = falloc((int64_t)R * I);
+    matmul_d(a, x, &p->dg, R, D, I); matmul_d(u, x, &p->du, R, D, I);
+    for (int64_t i = 0; i < (int64_t)R * I; i++) a[i] = a[i] / (1.f + expf(-a[i])) * u[i];
+    matmul_d(out, a, &p->dd, R, I, D);
+    free(a); free(u);
 }
 
 /* The model's lm_head on one normed row: on the device when the chain holds it */
@@ -642,7 +862,9 @@ static void q36_mtp_rows(Model *m, const int *tok, const float *hid, int R, int 
     m->K = K0; m->V = V0;
     for (int64_t i = 0; i < (int64_t)R * D; i++) x[i] += tmp[i];
     for (int r = 0; r < R; r++) rmsnorm_row(nrm + (int64_t)r * D, x + (int64_t)r * D, p->L.post_ln, D, c->eps);
-    q36_mtp_moe(nrm, R, D, tmp);
+    if (p->dmoe == 2) q36_mtp_moe_dense(nrm, R, D, tmp);
+    else if (p->dmoe == 1) q36_mtp_moe_gguf(nrm, R, D, tmp);
+    else q36_mtp_moe(nrm, R, D, tmp);
     for (int64_t i = 0; i < (int64_t)R * D; i++) x[i] += tmp[i];
     if (logits) {
         float *last = falloc(D);
@@ -678,12 +900,16 @@ static void q36_mtp_rows(Model *m, const int *tok, const float *hid, int R, int 
 static void q36_mtp_feed_rows(Model *m, const int *ids, int S, int pos_base, const float *hid);
 static void q36_mtp_feed(Model *m, const int *ids, int S, int pos_base, const float *res) {
     Q36Mtp *p = &g_q36_mtp; int D = m->c.hidden;
-    if (!p->on || S < 1 || !q36_mtp_kv(m)) return;
+    if (!p->on || S < 1) return;
+    int previous_phase = g_q36_perf_phase;
+    q36_perf_phase(Q36_PERF_MTP_FEED);
+    if (!q36_mtp_kv(m)) { q36_perf_phase(previous_phase); return; }
     float *hid = falloc((int64_t)S * D);   /* h_p: the model's output, after its final norm */
     #pragma omp parallel for schedule(static) if(S > 8)
     for (int s = 0; s < S; s++) rmsnorm_row(hid + (int64_t)s * D, res + (int64_t)s * D, m->final_norm, D, m->c.eps);
     q36_mtp_feed_rows(m, ids, S, pos_base, hid);
     free(hid);
+    q36_perf_phase(previous_phase);
 }
 static void q36_mtp_feed_rows(Model *m, const int *ids, int S, int pos_base, const float *hid) {
     Q36Mtp *p = &g_q36_mtp; int D = m->c.hidden;

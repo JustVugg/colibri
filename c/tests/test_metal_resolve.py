@@ -20,8 +20,9 @@ PRELUDE = r"""
 #include <stdint.h>
 @protocol MTLBuffer
 - (uint64_t)gpuAddress;
+- (size_t)length;
 @end
-struct Slab { const void *base; size_t len; id<MTLBuffer> buf; };
+struct Slab { void *base; size_t len; id<MTLBuffer> buf; };
 static std::mutex g_slab_mtx;
 static std::vector<Slab> g_slabs;
 static std::atomic<bool> unlocked{false};
@@ -40,6 +41,7 @@ static std::atomic<int> destroyed{0};
     worker.join();
     return 0xabc000;
 }
+- (size_t)length { return 0x1000; }
 - (void)dealloc { destroyed++; }
 @end
 """
@@ -48,14 +50,16 @@ int main() {
     @autoreleasepool {
         g_slabs.push_back({(void*)0x10000,0x1000,[MockBuffer new]});
         uint64_t address=123;
-        if (resolve((void*)0xffff,&address)!=nil || address!=123) return 1;
-        if (resolve((void*)0x11000,&address)!=nil || address!=123) return 2;
-        id<MTLBuffer> result=resolve((void*)0x10080,&address);
-        if (!unlocked || !result || address!=0xabc080 || !g_slabs.empty()) return 3;
-        if (destroyed!=0) return 4;
+        if (resolve((void*)0xffff,1,&address)!=nil || address!=123) return 1;
+        if (resolve((void*)0x11000,1,&address)!=nil || address!=123) return 2;
+        if (resolve((void*)0x10ff0,17,&address)!=nil || address!=123) return 3;
+        if (resolve((void*)0x10080,0,&address)!=nil || address!=123) return 4;
+        id<MTLBuffer> result=resolve((void*)0x10080,0x100,&address);
+        if (!unlocked || !result || address!=0xabc080 || !g_slabs.empty()) return 5;
+        if (destroyed!=0) return 6;
         (void)[result gpuAddress];  // keep result alive through the lifetime check
     }
-    if (destroyed!=1) return 5;
+    if (destroyed!=1) return 7;
     return 0;
 }
 """
