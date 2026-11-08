@@ -7460,6 +7460,32 @@ static void q36_unpark(Model *m) {
     if (getenv("COLI_PREFIX_LOG")) fprintf(stderr, "[PREFIX] the %d-token conversation is back\n", g_q36_park.len);
     q36_park_free(m);
 }
+/* A parked conversation's fate is decided by the next request, not when the request that parked
+ * it ends (#2703): an agent that runs one task after another on one slot sends a new
+ * conversation shorter than the last, which parked the old one at every turn and got it back
+ * after every turn, so its own state never stayed and each of its turns read everything again.
+ * A prompt that follows the parked conversation further than the state held now brings it back;
+ * one whose rows (the prompt, its answer budget and a verify's) stay within the rows kept apart
+ * keeps it parked; any other drops it. Before the cache grows (ensure_kv), so the rows come back
+ * in the layout they were kept in. */
+static void q36_park_decide(Model *m, const int *ids, int np, int max_tok) {
+    if (!g_q36_park.on) return;
+    int a = 0; const int top = g_q36_park.len < np - 1 ? g_q36_park.len : np - 1;
+    while (a < top && g_q36_park.fed[a] == ids[a]) a++;
+    const int b = kv_prefix_common(&m->kvp, ids, np);
+    if (a > b) { q36_unpark(m); return; }
+    const int gen = max_tok < Q36_PARK_GEN ? max_tok : Q36_PARK_GEN, n = np + gen + Q36_PARK_SPEC;
+    if (n <= g_q36_park.rows && m->kv_cap == g_q36_park.kv_cap && m->kv_ring == g_q36_park.kv_ring) {
+        if (getenv("COLI_PREFIX_LOG"))
+            fprintf(stderr, "[PREFIX] the %d-token conversation stays parked: this request's %d rows fit the %d kept apart\n",
+                    g_q36_park.len, n, g_q36_park.rows);
+        return;
+    }
+    if (getenv("COLI_PREFIX_LOG"))
+        fprintf(stderr, "[PREFIX] the parked %d-token conversation is dropped: this request follows the state held now "
+                        "(%d of its tokens against the parked one's %d)\n", g_q36_park.len, b, a);
+    q36_park_free(m);
+}
 
 /* The prompt-end snapshot (#2589), qwen38's g_q38_prefix in qwen36's terms: the DeltaNet
  * state, the ids and the first token's logits as the last prompt read to its end left them.
@@ -8457,6 +8483,7 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         q->max_tok = budget;
     }
     printf("ACCEPT %s %d\n",q->id,np); fflush(stdout);
+    q36_park_decide(m, ids, np, q->max_tok);   /* a conversation parked by the last request: back, kept or dropped */
     m->max_t = np + q->max_tok;
     /* Grow the cache BEFORE deciding, so the decision sees the state that will
      * actually be there: ensure_kv preserves both the rows and the record. */
@@ -8675,10 +8702,9 @@ static void serve_one_turn(Model *m, ServeReq *q){
     vk_tier_turn(m, "turn");
 #endif
 }
-/* one request on its own; a conversation it parked comes back when its turn ends */
+/* one request on its own; a conversation it parked waits for the next request (q36_park_decide) */
 static void serve_one(Model *m, ServeReq *q){
     serve_one_turn(m, q);
-    q36_unpark(m);
 }
 
 /* ======================= Clef: DECIDE on the same engine ======================= *
