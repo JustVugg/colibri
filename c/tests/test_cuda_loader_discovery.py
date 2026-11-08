@@ -74,6 +74,9 @@ int main(int argc, char **argv) {
 '''
 
     def _backend_source(self, with_dep=False, omit=()):
+        # the base fixture names an export in full (coli_cuda_available_device_count), this
+        # subclass by its suffix (available_device_count): either is the same export
+        omit = tuple(n[len("coli_cuda_"):] if n.startswith("coli_cuda_") else n for n in omit)
         source = super()._backend_source(with_dep=with_dep)
         original_init = (
             "__declspec(dllexport) int coli_cuda_init(const int *devices, int count)\n"
