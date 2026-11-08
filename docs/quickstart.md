@@ -210,7 +210,9 @@ pacman -S --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-libgomp make 
 ```
 
 `libgomp` is its own package since gcc 16; without it the link fails with
-`cannot find -lgomp`.
+`cannot find -lgomp`. An MSYS2 whose package list predates gcc 16 answers
+`target not found: mingw-w64-ucrt-x86_64-libgomp` and installs nothing: run
+`pacman -Syu` first, or leave that package out (its gcc still brings libgomp).
 
 ### macOS
 
