@@ -73,6 +73,7 @@
  * rebuild), and both chains go off. */
 #include "vk_chain.h"
 #include "vk_kvsplit.h"
+#include "dsv41_kvq.h"
 
 typedef struct {
     int ok, failed;
@@ -94,6 +95,8 @@ typedef struct {
     VkcKvSplit ks;                             /* the compressed rows split past the device's budget (ks.on) */
     int *sli, nsl, rmin, planned;              /* per layer its table (-1 none), tables, the least ratio */
     VkcBuf *cnew, *cdn;                        /* a chunk's new compressed rows, and their copy for the host */
+    VkcBuf *qck, *qik;                         /* COLI_VK_KV_QUANT: a chunk's new rows staged fp32 before their pack */
+    int kvq, kvq_checked;                      /* the mirrors quantized (COLI_VK_KV_QUANT), the widths checked once */
     int lo, d;                                 /* its layers start at lo, on device d (vkc_device) */
     int n;                                     /* the layers on the device: lo..lo+n-1 (a partial chain) */
     VkcBuf *cmd, *ld;                          /* the handoff: the candidate mask and the index list, down */
@@ -110,6 +113,28 @@ static V41Chain *v41c_of(int d) { return d ? g_v41c2 : g_v41c; }
 static const char *v41c_name(const V41Chain *ch) { return ch && ch->d ? "deepseek_v41 dev2" : "deepseek_v41"; }
 static int v41c_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 static int v41c_own(const V41Chain *ch, int i) { return i >= ch->lo && i < ch->lo + ch->n; }
+
+/* COLI_VK_KV_QUANT (0/unset = off, parsed once here at the setup's start): the device KV
+ * mirrors in the checkpoint's quantized formats (c/dsv41_kvq.h, DeepInfer's cache) instead
+ * of fp32 -- approximate (a row quantized at its store, dequantized where read and on the
+ * pull's write-back, the host's state fp32 holding the dequantized values), and it gives
+ * way to the KV split: when the split arms the mirrors are fp32 again. The three row
+ * widths below are the ONLY widths the mirrors are ever allocated at, so a missed branch
+ * shows up as bytes that do not add up (v41c_kvq_check, once a forward). */
+static int g_v41c_kvq = -1;
+static int v41c_kvq_on(const Cfg *c) {
+    if (g_v41c_kvq < 0) {
+        const char *e = getenv("COLI_VK_KV_QUANT");
+        g_v41c_kvq = e && *e == '1' && c->head_dim == 512 && c->index_head_dim == 128;
+        if (e && *e == '1' && !g_v41c_kvq)
+            fprintf(stderr, "[VK] deepseek_v41 chain: COLI_VK_KV_QUANT wants head_dim 512 and index_head_dim 128; "
+                            "the mirrors stay fp32\n");
+    }
+    return g_v41c_kvq;
+}
+static size_t v41c_win_row(const V41Chain *ch, const Cfg *c) { return ch->kvq ? KVQ_WIN_BYTES : (size_t)c->head_dim * sizeof(float); }
+static size_t v41c_ckv_row(const V41Chain *ch, const Cfg *c) { return ch->kvq ? KVQ_CKV_BYTES : (size_t)c->head_dim * sizeof(float); }
+static size_t v41c_ikey_row(const V41Chain *ch, const Cfg *c) { return ch->kvq ? KVQ_IKEY_BYTES : (size_t)c->index_head_dim * sizeof(float); }
 
 /* The window ring's extra rows at setup: COLI_VK_CHAIN_ROWS when set, else 512; a forward
  * whose chunk is bigger grows the rings first (v41c_grow_win). */
@@ -514,7 +539,7 @@ static int v41c_layer_state(V41Chain *ch, Model *m, int i, const char **why) {
               : !coli_vk_tensor_ensure(&ch->fna[i], l->hc_attn_fn.w, NULL, 10, H * D, nm, 0) ||
                 !coli_vk_tensor_ensure(&ch->fnf[i], l->hc_ffn_fn.w, NULL, 10, H * D, nm, 0)) return 0;
     *why = "device memory for its state refused";
-    if (!ch->win[i] && !(ch->win[i] = vkc_buf((size_t)ch->Wd * c->head_dim * sizeof(float), VKC_DEV))) return 0;
+    if (!ch->win[i] && !(ch->win[i] = vkc_buf((size_t)ch->Wd * v41c_win_row(ch, c), VKC_DEV))) return 0;
     if (c->kv_source[i] && r > 1 && !ch->ring[i] && !(ch->ring[i] = vkc_buf((size_t)2 * r * c->head_dim * sizeof(float), VKC_DEV)))
         return 0;
     return 1;
@@ -583,6 +608,7 @@ static V41Chain *v41c_alloc_dev(Model *m, int d) {
     ch->kv_valid = calloc(L, sizeof(int)); ch->ccap = calloc(L, sizeof(int)); ch->sli = malloc(L * sizeof(int));
     if (!ch->fna || !ch->fnf || !ch->win || !ch->ckv || !ch->ikey || !ch->ring || !ch->kv_valid || !ch->ccap || !ch->sli) return NULL;
     ch->n = d ? g_v41c_fit2.n : g_v41_fit.L > 0 ? g_v41_fit.n : L;
+    ch->kvq = v41c_kvq_on(c);
     ch->W = c->window; ch->K = c->index_topk > 0 ? c->index_topk : 0; ch->rmax = 1;
     for (int i = 0; i < L; i++) if (c->kv_source[i] && c->compress_ratio[i] > ch->rmax) ch->rmax = c->compress_ratio[i];
     ch->Wd = ch->W + v41c_rows();
@@ -629,6 +655,9 @@ static int v41c_setup_dev(Model *m, int d) {
     const char *nmc = v41c_name(ch);
     int N = ch->n, lo = ch->lo;
     if (N < 1) return 0;
+    if (ch->kvq) fprintf(stderr, "[VK] %s chain: COLI_VK_KV_QUANT=1: the KV mirrors quantized as the checkpoint's cache "
+                                 "(a window row 528 B, a compressed row 288 B, an index key 68 B) -- approximate, and it "
+                                 "gives way once the KV split arms\n", nmc);
     /* the parameter arena, the chain's layers' */
     size_t n = 0;
     for (int i = lo; i < lo + N; i++) {
@@ -707,6 +736,28 @@ static int v41c_setup(Model *m) { return v41c_setup_dev(m, 0); }
 /* The compressed rows of the kv_source layers, whole or split: planned when the whole
  * mirrors would grow (and at the first forward); once split, the split stays. ctx: the
  * positions the forward reaches. 0 = the device refused the split's rows. */
+/* the split armed under COLI_VK_KV_QUANT: the split stages whole fp32 rows, so the
+ * quantized mirrors give way -- freed and re-mirrored fp32 from the host at the next
+ * forward (the watermarks drop). The host's rows by then hold the dequantized values
+ * (one quantize->dequant hop, bounded by the pack's idempotence the kv-quant test pins):
+ * the approximation stays, which an approximate mode accepts. 0 = memory refused. */
+static int v41c_kvq_give_way(V41Chain *ch, Model *m) {
+    Cfg *c = &m->c;
+    fprintf(stderr, "[VK] %s chain: the KV split armed: COLI_VK_KV_QUANT gives way to it -- the whole mirrors fp32 "
+                    "again, re-mirrored from the host (whose rows hold the dequantized values)\n", v41c_name(ch));
+    ch->kvq = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        vkc_free(ch->ckv[i]); ch->ckv[i] = NULL;
+        vkc_free(ch->ikey[i]); ch->ikey[i] = NULL;
+        ch->kv_valid[i] = ch->ccap[i] = 0;
+    }
+    for (int i = ch->lo; i < ch->lo + ch->n; i++) {
+        vkc_free(ch->win[i]); ch->win[i] = NULL;
+        if (!(ch->win[i] = vkc_buf((size_t)ch->Wd * v41c_win_row(ch, c), VKC_DEV))) return 0;
+    }
+    ch->win_valid = 0;
+    return 1;
+}
 static int v41c_plan(V41Chain *ch, Model *m, int ctx) {
     Cfg *c = &m->c;
     if (!ch->nsl || ch->ks.on) return 1;
@@ -724,6 +775,7 @@ static int v41c_plan(V41Chain *ch, Model *m, int ctx) {
     /* a window of half the slots, the rest pinned by the indexer's picks; the forward's
      * chunks shrink to what the window takes (v41c_forward) */
     if (vkc_kv_plan_need(&ch->ks, v41c_name(ch), ch->nsl, (size_t)hd * sizeof(float), tcap, 1, 1, held, need) != 2) return 1;
+    if (ch->kvq && !v41c_kvq_give_way(ch, m)) return 0;
     for (int i = 0; i < L; i++) {
         if (ch->sli[i] < 0) continue;
         vkc_free(ch->ckv[i]);
@@ -743,10 +795,10 @@ static int v41c_cache(V41Chain *ch, Model *m, int i, int rows) {
     if (cap < rows) return 0;
     if (own && !ch->ks.on) {   /* under the split the compressed rows keep their ks.rows */
         vkc_free(ch->ckv[i]);
-        ch->ckv[i] = vkc_buf((size_t)cap * c->head_dim * sizeof(float), VKC_DEV);
+        ch->ckv[i] = vkc_buf((size_t)cap * v41c_ckv_row(ch, c), VKC_DEV);
     }
     vkc_free(ch->ikey[i]);
-    ch->ikey[i] = vkc_buf((size_t)cap * c->index_head_dim * sizeof(float), VKC_DEV);
+    ch->ikey[i] = vkc_buf(ch->kvq ? kvq_ikey_mirror_bytes((size_t)cap) : (size_t)cap * v41c_ikey_row(ch, c), VKC_DEV);
     ch->kv_valid[i] = 0; ch->ccap[i] = 0;
     if ((own && !ch->ckv[i]) || !ch->ikey[i]) return 0;
     ch->ccap[i] = cap;
@@ -779,7 +831,7 @@ static int v41c_grow_win(V41Chain *ch, Model *m, int rows) {
     int Wd = ch->W + rows;
     for (int i = ch->lo; i < ch->lo + ch->n; i++) {
         vkc_free(ch->win[i]);
-        if (!(ch->win[i] = vkc_buf((size_t)Wd * c->head_dim * sizeof(float), VKC_DEV))) return 0;
+        if (!(ch->win[i] = vkc_buf((size_t)Wd * v41c_win_row(ch, c), VKC_DEV))) return 0;
     }
     ch->Wd = Wd; ch->win_valid = 0;
     return 1;
@@ -810,6 +862,12 @@ static int v41c_scratch(V41Chain *ch, Model *m, int rows, int ctx) {
         if (g_v41c_count >= 0)
             g_v41c_count += (long long)((2 * r * hd * sizeof(float) + ch->rmin - 1) / ch->rmin);
         else ok = v41c_res(&ch->cnew, nc * hd, VKC_DEV) && v41c_res(&ch->cdn, nc * hd, VKC_DOWN);
+    }
+    if (ok && ch->kvq) {       /* COLI_VK_KV_QUANT: a chunk's new compressed and index rows, fp32 until their pack */
+        size_t nq = r + 2;   /* the rows span at most rows/ratio + 1 groups (a ratio-1 layer: the chunk's rows) */
+        if (g_v41c_count >= 0)
+            g_v41c_count += (long long)(nq * (size_t)hd * sizeof(float)) + (long long)(nq * (size_t)IH * sizeof(float));
+        else ok = v41c_res(&ch->qck, nq * hd, VKC_DEV) && v41c_res(&ch->qik, nq * IH, VKC_DEV);
     }
     if (!ok || g_v41c_count >= 0) return ok;   /* counting: the buffers only */
     if (ch->rows < rows) {
@@ -872,19 +930,25 @@ static int v41c_attention(V41Chain *ch, Model *m, int i, const V41Fwd *f) {
              v41c_rope(ch, m, ch->q, nr * nh, nh, hd - rd, qrow, hd, tcs, rd, 0) &&
              v41c_rope(ch, m, ch->kv, nr, 1, hd - rd, hd, 0, tcs, rd, 0);
     if (!ok) return 0;
-    VkcRegion *rg = malloc((size_t)nr * sizeof *rg);   /* the new rows into the window ring */
-    if (!rg) return 0;
-    for (int s = 0; s < nr; s++) rg[s] = (VkcRegion){(size_t)((pb + s) % ch->Wd) * hd, (size_t)s * hd, (size_t)hd};
-    ok = vkc_copy_regions(ch->win[i], ch->kv, rg, nr);
-    free(rg);
+    if (ch->kvq) {   /* COLI_VK_KV_QUANT: the new rows packed into the ring (dsv41_kvq.h's win format) */
+        ok = vkc_dsv4_quant(ch->win[i], ch->kv, &(VkcDsQuant){0, nr, hd, 0, hd, pb, ch->Wd});
+    } else {
+        VkcRegion *rg = malloc((size_t)nr * sizeof *rg);   /* the new rows into the window ring */
+        if (!rg) return 0;
+        for (int s = 0; s < nr; s++) rg[s] = (VkcRegion){(size_t)((pb + s) % ch->Wd) * hd, (size_t)s * hd, (size_t)hd};
+        ok = vkc_copy_regions(ch->win[i], ch->kv, rg, nr);
+        free(rg);
+    }
     if (ok && r > 0 && c->kv_source[i]) {                           /* the compressor, its latents, the index keys */
-        int g0 = pb / r, np = (pb + nr) / r - g0, ihd = c->index_head_dim, sp = ch->ks.on;
-        VkcBuf *cb = sp ? ch->cnew : ch->ckv[i];                     /* the split: the new rows through a scratch */
-        size_t co = sp ? 0 : (size_t)g0 * hd;
+        int g0 = pb / r, np = (pb + nr) / r - g0, ihd = c->index_head_dim, sp = ch->ks.on, q = ch->kvq;
+        VkcBuf *cb = sp ? ch->cnew : q ? ch->qck : ch->ckv[i];       /* the split, and the pack: the new rows through a scratch */
+        size_t co = (sp || q) ? 0 : (size_t)g0 * hd;
+        VkcBuf *kb = q ? ch->qik : ch->ikey[i];                     /* a quantized mirror cannot hold the fp32 rows */
+        size_t ko = q ? 0 : (size_t)g0 * ihd;
         ok = vkc_matmul(v41c_wb(&l->comp_wkv), ch->nrm, 0, ch->craw, 0, nr);
         if (ok && r == 1) ok = v41c_norm(ch, ch->craw, 0, hd, ch->o_cn[i], cb, co, hd, nr, hd, c->norm_eps);
         else if (ok) {
-            VkcDsComp cp = {nr, pb, r, hd, hd, 0, 0, hd, 0, hd, -1, sp ? -g0 * hd : 0, hd, 0};
+            VkcDsComp cp = {nr, pb, r, hd, hd, 0, 0, hd, 0, hd, -1, (sp || q) ? -g0 * hd : 0, hd, 0};
             ok = vkc_matmul(v41c_wb(&l->comp_wgate), ch->nrm, 0, ch->cscr, 0, nr) &&
                  vkc_dsv4_compress(ch->craw, ch->cscr, ch->ring[i], NULL, cb, &cp) &&
                  (np == 0 || v41c_norm(ch, cb, co, hd, ch->o_cn[i], cb, co, hd, np, hd, c->norm_eps));
@@ -894,10 +958,13 @@ static int v41c_attention(V41Chain *ch, Model *m, int i, const V41Fwd *f) {
         }
         if (ok && np > 0) {
             int bc = f->csB + (g0 * r - (pb - ch->rmax + 1)) * rd;   /* a latent rotates at its group's first position */
-            ok = vkc_matmul(v41c_wb(&l->idx_wk), cb, co, ch->ikey[i], (size_t)g0 * ihd, np) &&
-                 v41c_norm(ch, ch->ikey[i], (size_t)g0 * ihd, ihd, ch->o_ikn[i], ch->ikey[i], (size_t)g0 * ihd, ihd, np, ihd, c->norm_eps) &&
-                 v41c_rope(ch, m, ch->ikey[i], np, 1, g0 * ihd + ihd - rd, ihd, 0, bc, r * rd, 0) &&
+            ok = vkc_matmul(v41c_wb(&l->idx_wk), cb, co, kb, ko, np) &&
+                 v41c_norm(ch, kb, ko, ihd, ch->o_ikn[i], kb, ko, ihd, np, ihd, c->norm_eps) &&
+                 v41c_rope(ch, m, kb, np, 1, (int)ko + ihd - rd, ihd, 0, bc, r * rd, 0) &&
                  v41c_rope(ch, m, cb, np, 1, (int)co + hd - rd, hd, 0, bc, r * rd, 0);
+            if (ok && q)   /* the packed rows into their mirrors, after their last fp32 reader */
+                ok = vkc_dsv4_quant(ch->ckv[i], cb, &(VkcDsQuant){1, np, hd, 0, hd, g0, 0}) &&
+                     vkc_dsv4_quant(ch->ikey[i], kb, &(VkcDsQuant){2, np, ihd, 0, ihd, g0, 0});
             if (ok && sp) {   /* into their slots, and down for the host's ckv once the frame is through */
                 VkcKvPart pt = {1, hd, l->ckv, 0, ch->ckv[i], 0, 0};
                 ok = vkc_kv_store(&ch->ks, ch->sli[i], &pt, cb, 0, (size_t)hd, 0, g0, np) &&
@@ -918,7 +985,7 @@ static int v41c_attention(V41Chain *ch, Model *m, int i, const V41Fwd *f) {
         for (int s = 1; s < nr; s++) same &= kl[s] == kl[0];
         for (int s = 0; ok && s < nr; s += same ? nr : 1) {
             VkcDsScore sp = {same ? nr : 1, pb + s, r, IH, ID, width, s * IH * ID, IH * ID, s * IH, IH, 0, ID, mrow,
-                             (int)ch->wcap, wscale, s * (int)ch->wcap, s * mrow};   /* mrow: mask words a row */
+                             (int)ch->wcap, wscale, s * (int)ch->wcap, s * mrow, ch->kvq};   /* mrow: mask words a row */
             ok = vkc_dsv4_score(ch->iq, ch->ihw, ch->ikey[kl[s]], ch->mask, ch->isc, &sp);
         }
         if (ok && cand && cs == i) {
@@ -930,8 +997,8 @@ static int v41c_attention(V41Chain *ch, Model *m, int i, const V41Fwd *f) {
         ok = ok && vkc_dsv4_topk(ch->isc, ch->list, &tp);
     }
     if (!ok) return 0;
-    VkcDsAttn a = {nr, nh, hd, ch->W + (r > 0 ? ch->K : 0), 0, LR, ch->Wd, 0, 0, 0, qrow, 0, qrow, (int)ch->o_sink[i], 0,
-                   1.0f / sqrtf((float)hd)};
+    VkcDsAttn a = {nr, nh, hd, ch->W + (r > 0 ? ch->K : 0), 0, LR, ch->Wd, 0, 0, 0, qrow, 0, qrow, (int)ch->o_sink[i],
+                   ch->kvq ? 2 : 0, 1.0f / sqrtf((float)hd)};   /* flags 2: the quantized mirrors (COLI_VK_KV_QUANT) */
     int og = c->o_groups, ol = c->o_lora, pg = qrow / og;
     VkcHgemv g = {0, nr, og, ol, ol, 0, 0, qrow, pg, 0, og * ol, ol, 0, 0, 0};
     if (ch->ks.on && r > 0) {   /* stage selected cold rows, preserving the original sparse attention order */
@@ -983,6 +1050,55 @@ static int v41c_engram(V41Chain *ch, Model *m, int i, int nr, int pb, float *row
  * (*lost = 1: a frame failed, the device marked lost; else declined, or memory refused:
  * the chain off). */
 static void v41c_off(V41Chain *ch) { ch->failed = 1; if (!ch->d) g_vk_chain = 0; }
+/* COLI_VK_KV_QUANT's own guard, once a forward: the mirrors' bytes summed against the
+ * flag's widths, so a width a branch missed fails loudly instead of corrupting quietly.
+ * The split cannot be on beside the quantized mirrors (v41c_kvq_give_way); each chain
+ * (each device's) checks its own. */
+static void v41c_kvq_check(const V41Chain *ch, const Model *m) {
+    const Cfg *c = &m->c;
+    size_t act = 0, exp = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        if (ch->win[i]) { act += vkc_bytes(ch->win[i]); exp += (size_t)ch->Wd * v41c_win_row(ch, c); }
+        if (ch->ckv[i]) { act += vkc_bytes(ch->ckv[i]); exp += (size_t)ch->ccap[i] * v41c_ckv_row(ch, c); }
+        if (ch->ikey[i]) { act += vkc_bytes(ch->ikey[i]); exp += ch->kvq ? kvq_ikey_mirror_bytes((size_t)ch->ccap[i])
+                                                                        : (size_t)ch->ccap[i] * v41c_ikey_row(ch, c); }
+    }
+    if (act != exp || ch->ks.on)
+        fprintf(stderr, "[VK] %s chain: COLI_VK_KV_QUANT assertion failed: the KV mirrors hold %zu B where the flag's "
+                        "widths say %zu B (the split %d) -- a width a branch missed\n", v41c_name(ch), act, exp, ch->ks.on),
+        abort();
+}
+/* the host's rows packed up into the quantized mirrors (a re-upload, dsv41_kvq.h): a
+ * window row (528 B, its ring slot), a run of compressed rows (288 B each, contiguous)
+ * and a run of index keys (68 B each in block-wide sections: each block's touched data
+ * bytes and scale bytes written apart). */
+static int v41c_win_up(V41Chain *ch, const Layer *l, int i, int q, int W, int hd) {
+    uint8_t row[KVQ_WIN_BYTES];
+    kvq_pack_win(row, l->window + (size_t)(q % W) * hd);
+    return vkc_write(ch->win[i], (size_t)(q % ch->Wd) * KVQ_WIN_BYTES, row, KVQ_WIN_BYTES);
+}
+static int v41c_ckv_up(V41Chain *ch, const Layer *l, int i, int t0, int t1, int hd) {
+    uint8_t *pk = malloc((size_t)(t1 - t0) * KVQ_CKV_BYTES);
+    if (!pk) return 0;
+    for (int t = t0; t < t1; t++) kvq_pack_ckv(pk + (size_t)(t - t0) * KVQ_CKV_BYTES, l->ckv + (size_t)t * hd);
+    int ok = vkc_write(ch->ckv[i], (size_t)t0 * KVQ_CKV_BYTES, pk, (size_t)(t1 - t0) * KVQ_CKV_BYTES);
+    free(pk);
+    return ok;
+}
+static int v41c_ikey_up(V41Chain *ch, const Layer *l, int i, int t0, int t1, int ihd) {
+    uint8_t blk[KVQ_IKEY_BLOCK * KVQ_IKEY_BYTES];
+    for (int b = t0 / KVQ_IKEY_BLOCK, be = (t1 - 1) / KVQ_IKEY_BLOCK; b <= be; b++) {
+        int lo = t0 > b * KVQ_IKEY_BLOCK ? t0 : b * KVQ_IKEY_BLOCK;
+        int hi = t1 < (b + 1) * KVQ_IKEY_BLOCK ? t1 : (b + 1) * KVQ_IKEY_BLOCK;
+        for (int t = lo; t < hi; t++) kvq_pack_ikey(blk, t - b * KVQ_IKEY_BLOCK, l->ikey + (size_t)t * ihd);
+        size_t w = (size_t)b * (KVQ_IKEY_BLOCK * KVQ_IKEY_BYTES), n = (size_t)(hi - lo);
+        if (!vkc_write(ch->ikey[i], w + (size_t)(lo - b * KVQ_IKEY_BLOCK) * 64,
+                       blk + (size_t)(lo - b * KVQ_IKEY_BLOCK) * 64, n * 64)) return 0;
+        if (!vkc_write(ch->ikey[i], w + 2048 + (size_t)(lo - b * KVQ_IKEY_BLOCK) * 4,
+                       blk + 2048 + (size_t)(lo - b * KVQ_IKEY_BLOCK) * 4, n * 4)) return 0;
+    }
+    return 1;
+}
 static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, int n, int start, int spec, int all, int *lost) {
     *lost = 0;
     Cfg *c = &m->c;
@@ -1095,6 +1211,7 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
         int want = need[i] > E / r ? need[i] : E / r;
         ok = v41c_cache(ch, m, i, want > 0 ? want : 1);
     }
+    if (ok && ch->kvq && !ch->kvq_checked) { v41c_kvq_check(ch, m); ch->kvq_checked = 1; }   /* the mirrors' widths, once */
     /* what comes back at the end: the window rows, the compressed rows and keys, the groups,
      * a verify's raw compressor rows */
     size_t pw = (size_t)(n < W ? n : W) * hd, pn = 0, *pc = calloc((size_t)L, sizeof(size_t));
@@ -1182,7 +1299,9 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
                 for (int i = lo; i < hi && ok; i++) {
                     const Layer *l = &m->L[i];
                     if (l->window_pos[q % W] != q) continue;
-                    ok = vkc_write(ch->win[i], (size_t)(q % ch->Wd) * hd, l->window + (size_t)(q % W) * hd, (size_t)hd * sizeof(float));
+                    ok = ch->kvq ? v41c_win_up(ch, l, i, q, W, hd)
+                                 : vkc_write(ch->win[i], (size_t)(q % ch->Wd) * hd, l->window + (size_t)(q % W) * hd,
+                                             (size_t)hd * sizeof(float));
                 }
             }
             for (int i = 0; i < L && ok; i++) {
@@ -1190,8 +1309,11 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
                 if (!c->kv_source[i] || (!own && !ch->ikey[i])) continue;
                 const Layer *l = &m->L[i];
                 int r = c->compress_ratio[i], ihd = c->index_head_dim, t0 = ch->kv_valid[i], t1 = need[i];
-                if (t1 > t0) ok = (!own || ch->ks.on || vkc_write(ch->ckv[i], (size_t)t0 * hd, l->ckv + (size_t)t0 * hd, (size_t)(t1 - t0) * hd * sizeof(float))) &&
-                                  vkc_write(ch->ikey[i], (size_t)t0 * ihd, l->ikey + (size_t)t0 * ihd, (size_t)(t1 - t0) * ihd * sizeof(float));
+                if (t1 > t0) ok = ch->kvq
+                    ? (!own || v41c_ckv_up(ch, l, i, t0, t1, hd)) && v41c_ikey_up(ch, l, i, t0, t1, ihd)
+                    : (!own || ch->ks.on || vkc_write(ch->ckv[i], (size_t)t0 * hd, l->ckv + (size_t)t0 * hd,
+                                                      (size_t)(t1 - t0) * hd * sizeof(float))) &&
+                      vkc_write(ch->ikey[i], (size_t)t0 * ihd, l->ikey + (size_t)t0 * ihd, (size_t)(t1 - t0) * ihd * sizeof(float));
                 if (!own) { if (ok && t1 > t0) ch->kv_valid[i] = t1; continue; }
                 if (ok && r > 1) ok = vkc_write(ch->ring[i], 0, l->cstate_kv, (size_t)r * hd * sizeof(float)) &&
                                       vkc_write(ch->ring[i], (size_t)r * hd, l->cstate_score, (size_t)r * hd * sizeof(float));
@@ -1271,17 +1393,25 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
         if (ok && last) {                                  /* what the host's state gets back */
             for (int i = lo; i < hi && ok; i++) {
                 int q0 = E - W > start ? E - W : start, nq = E - q0;
-                VkcRegion *rg = malloc((size_t)nq * sizeof *rg);
-                if (!rg) { ok = 0; break; }
-                for (int q = q0; q < E; q++) rg[q - q0] = (VkcRegion){pc[i] + (size_t)(q - q0) * hd, (size_t)(q % ch->Wd) * hd, (size_t)hd};
-                ok = vkc_copy_regions(ch->pull, ch->win[i], rg, nq);
-                free(rg);
+                if (ch->kvq)   /* COLI_VK_KV_QUANT: the rows dequantized on their way back */
+                    ok = vkc_dsv4_dequant(ch->pull, ch->win[i], &(VkcDsDequant){0, nq, hd, q0, ch->Wd, pc[i], hd});
+                else {
+                    VkcRegion *rg = malloc((size_t)nq * sizeof *rg);
+                    if (!rg) { ok = 0; break; }
+                    for (int q = q0; q < E; q++) rg[q - q0] = (VkcRegion){pc[i] + (size_t)(q - q0) * hd, (size_t)(q % ch->Wd) * hd, (size_t)hd};
+                    ok = vkc_copy_regions(ch->pull, ch->win[i], rg, nq);
+                    free(rg);
+                }
                 if (!ok || !c->kv_source[i]) continue;
                 int r = c->compress_ratio[i], g0 = start / r, np = E / r - g0, ihd = c->index_head_dim, cw = ch->ks.on ? 0 : hd;
                 size_t at = pc[i] + pw;
-                ok = (cw == 0 || vkc_copy(ch->pull, at, ch->ckv[i], (size_t)g0 * hd, (size_t)np * hd)) &&
-                     vkc_copy(ch->pull, at + (size_t)np * cw, ch->ikey[i], (size_t)g0 * ihd, (size_t)np * ihd) &&
-                     (r <= 1 || vkc_copy(ch->pull, at + (size_t)np * (cw + ihd), ch->ring[i], 0, (size_t)2 * r * hd));
+                ok = ch->kvq
+                    ? vkc_dsv4_dequant(ch->pull, ch->ckv[i], &(VkcDsDequant){1, np, hd, g0, 0, at, hd}) &&
+                      vkc_dsv4_dequant(ch->pull, ch->ikey[i], &(VkcDsDequant){2, np, ihd, g0, 0, at + (size_t)np * cw, ihd}) &&
+                      (r <= 1 || vkc_copy(ch->pull, at + (size_t)np * (cw + ihd), ch->ring[i], 0, (size_t)2 * r * hd))
+                    : (cw == 0 || vkc_copy(ch->pull, at, ch->ckv[i], (size_t)g0 * hd, (size_t)np * hd)) &&
+                      vkc_copy(ch->pull, at + (size_t)np * cw, ch->ikey[i], (size_t)g0 * ihd, (size_t)np * ihd) &&
+                      (r <= 1 || vkc_copy(ch->pull, at + (size_t)np * (cw + ihd), ch->ring[i], 0, (size_t)2 * r * hd));
             }
         }
         ok = ok && vkc_submit(1);
@@ -1460,17 +1590,20 @@ static void v41c_ledger(unsigned long long sys_used, unsigned long long sys_tota
     size_t kv = 0;   /* the mirrors are VKC_DEV buffers: a part of the chain's dev_bytes */
     for (int i = ch->lo; i < ch->lo + ch->n; i++)
         kv += vkc_bytes(ch->win[i]) + vkc_bytes(ch->ring[i]) + vkc_bytes(ch->ckv[i]) + vkc_bytes(ch->ikey[i]);
+    /* COLI_VK_KV_QUANT: the line walks this chain (device 0) only; a second device's
+     * mirrors are as quantized but not counted here (the pre-existing gap, noted) */
+    const char *qa = ch->kvq ? " (quantized; a second device's mirrors, when there are two, are not in this line)" : "";
     ColiVkPoolStats w; coli_vk_pool_stats(0, &w);
     VktVram tv; vkt_vram(&tv);
     size_t pools = w.total + dev.total + dn.total + up.total + tv.res_total + tv.x_total;
     size_t proc = coli_vk_device_used();
     fprintf(stderr, "[VK] deepseek_v41 vram: weights %.1f MiB in %d blocks (%.1f MiB of rows in %zu tensors) | chain %.1f MiB (dev %.1f in %d "
                     "blocks, down %.1f in %d, up %.1f in %d) | tier resident %.1f MiB + %d slots %.1f MiB = %.1f of %.1f in %d "
-                    "blocks | extra layers %.1f in %d blocks | kv mirror %.1f MiB | process %.2f GiB of %.2f GiB in pools "
+                    "blocks | extra layers %.1f in %d blocks | kv mirror %.1f MiB%s | process %.2f GiB of %.2f GiB in pools "
                     "(%.1f MiB outside) | device %.2f GiB used of %.2f, gtt %.2f GiB%s%s%s\n",
             w.total / M, w.blocks, w.used / M, w.tensors, st.dev_bytes / M, dev.total / M, dev.blocks, dn.total / M, dn.blocks,
             up.total / M, up.blocks, (double)(tv.res_used - tv.slot_bytes) / M, tv.slots, (double)tv.slot_bytes / M,
-            (double)tv.res_used / M, (double)tv.res_total / M, tv.res_blocks, tv.x_total / M, tv.x_blocks, kv / M,
+            (double)tv.res_used / M, (double)tv.res_total / M, tv.res_blocks, tv.x_total / M, tv.x_blocks, kv / M, qa,
             (double)proc / G, (double)pools / G, proc > pools ? (double)(proc - pools) / M : 0.0,
             (double)sys_used / G, (double)sys_total / G, (double)sys_gtt / G, *card ? " (" : "", *card ? card : "", *card ? ")" : "");
 }

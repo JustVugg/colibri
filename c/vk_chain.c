@@ -3758,6 +3758,7 @@ static int dsv4_rec(int kind, int mode, const void *b, size_t bytes, VkcBind *bd
 int vkc_dsv4_attn(VkcBuf *q, VkcBuf *win, VkcBuf *cmp, VkcBuf *list, VkcBuf *prm, VkcBuf *out, const VkcDsAttn *p) {
     if (p->S < 1 || p->S > 65535 || p->H < 1 || p->H > 65535 || p->hd < 1 || p->hd > 1024 || p->cnt < 0 || p->cnt > 3072)
         return 0;
+    if ((p->flags & 2) && p->hd != 512) return 0;   /* the quantized row widths are the format's (528/288 B) */
     if (p->cnt == 0) return 0;
     VkcBind bd[6] = {B(q, 0), B(win, 0), B(cmp ? cmp : win, 0), B(list, 0), B(prm, 0), B(out, 1)};
     return dsv4_rec(PK_ATTN, 0, p, sizeof *p, bd, 6, (uint32_t)p->H, (uint32_t)p->S);
@@ -3781,6 +3782,7 @@ int vkc_dsv4_score(VkcBuf *iq, VkcBuf *hw, VkcBuf *keys, VkcBuf *mask, VkcBuf *s
     int wide = p->IH > 64 || p->IH * p->ID > 4096;
     if (p->S < 1 || p->S > 65535 || p->IH < 1 || p->IH > 4096 || p->ID < 1 || p->ratio < 1 ||
         p->width < 0 || p->sc_row < p->width || (p->mask_row > 0 && !mask)) return 0;
+    if (p->quant && p->ID != 128) return 0;   /* the quantized index keys are the format's 68 B rows */
     if (p->width == 0) return open_frame() && !KC.lost;
     VkcBind bd[6] = {B(iq, 0), B(hw, 0), B(keys, 0), B(p->mask_row > 0 ? mask : NULL, 0), B(NULL, 0), B(sc, 1)};
     /* many columns: on a grid of 256 / IH columns a workgroup (mode 10, the same bits) */
@@ -3832,6 +3834,26 @@ int vkc_dsv4_swiglu(VkcBuf *a, VkcBuf *b, VkcBuf *y, const VkcDsSwiglu *p) {
     uint32_t gx, gy; grid(((uint64_t)p->n + 255) / 256, &gx, &gy);
     VkcBind bd[6] = {B(a, 0), B(b, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(y, 1)};
     return dsv4_rec(PK_EW, 8, p, sizeof *p, bd, 6, gx, gy);
+}
+/* COLI_VK_KV_QUANT's pack/unpack (chain_dsv4.comp modes 13/14; c/dsv41_kvq.h the
+ * reference). The quantized rows are written as whole 32-bit words, so a pack never
+ * races; the formats' widths (528/288/68 B) are what the kinds below hardcode. */
+int vkc_dsv4_quant(VkcBuf *dst, VkcBuf *src, const VkcDsQuant *p) {
+    if (p->kind < 0 || p->kind > 2 || p->S < 0 || (p->kind == 0 && p->Wd < 1) || !dst || !src) return 0;
+    if (p->kind == 0 && (p->hd != 512 || p->Wd < 1)) return 0;
+    if (p->kind == 1 && p->hd != 512) return 0;
+    if (p->kind == 2 && p->hd != 128) return 0;
+    if (p->S == 0) return open_frame() && !KC.lost;
+    VkcBind bd[7] = {B(src, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(dst, 1)};
+    return dsv4_rec(PK_DSA, 13, p, sizeof *p, bd, 7, (uint32_t)p->S, 1);
+}
+int vkc_dsv4_dequant(VkcBuf *dst, VkcBuf *src, const VkcDsDequant *p) {
+    if (p->kind < 0 || p->kind > 2 || p->S < 0 || (p->kind == 0 && p->Wd < 1) || !dst || !src) return 0;
+    if ((p->kind == 0 || p->kind == 1) && p->n != 512) return 0;
+    if (p->kind == 2 && p->n != 128) return 0;
+    if (p->S == 0) return open_frame() && !KC.lost;
+    VkcBind bd[6] = {B(src, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(dst, 1)};
+    return dsv4_rec(PK_DSA, 14, p, sizeof *p, bd, 6, (uint32_t)p->S, 1);
 }
 
 /* ---- a KV cache split between the device and the host (chain_kvs.comp) ------------
