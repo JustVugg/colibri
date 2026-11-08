@@ -540,7 +540,7 @@ TEST_RULES  := $(patsubst tests/%,%,$(filter tests/test_%,$(RULE_NAMES)))
 # (qwen38_tiny_fp8, gitignored); it runs from qwen38-tier-engine-check. test_qwen38_dn_gpu does the same from
 # qwen38-dn-gpu-check.
 TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_framing \
-	test_segment_adapters_registration test_segment_adapters_real \
+	test_segment_adapters_registration test_segment_adapters_real test_olmoe_segment_real \
 	test_edge_adapters_registration test_edge_adapters_real \
 	test_xdna_execution test_xdna_failure \
 	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine test_qwen38_dn_gpu test_qwen38_cuda_chain \
@@ -2457,6 +2457,12 @@ tests/test_olmoe_moe_by_expert$(EXE): tests/test_olmoe_moe_by_expert.c olmoe.c $
 tests/test_olmoe_serve_framing$(EXE): tests/test_olmoe_serve_framing.c olmoe.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+tests/test_olmoe_expert_store$(EXE): tests/test_olmoe_expert_store.c olmoe.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_olmoe_segment_lifecycle$(EXE): tests/test_olmoe_segment_lifecycle.c olmoe.c tests/segment_runtime_nocuda.o $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< tests/segment_runtime_nocuda.o $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_olmoe_cache_index$(EXE): tests/test_olmoe_cache_index.c olmoe.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
@@ -2892,6 +2898,12 @@ tests/test_segment_adapters_real$(EXE): tests/test_segment_adapters_real.c \
 		segment_adapters.h edge_adapters.h $(SEGMENT_ALL_OBJS)
 	$(CC) $(SEGMENT_CPU_CFLAGS) tests/test_segment_adapters_real.c \
 		segment_runtime.c edge_runtime.c $(SEGMENT_ALL_OBJS) -o $@ $(NOCUDA_LDFLAGS)
+
+# Focused public-runtime gate: the same production adapter suite, without
+# requiring unrelated families' objects or their checkpoint dependencies.
+tests/test_olmoe_segment_real$(EXE): tests/test_segment_adapters_real.c $(SEGMENT_BUILD_DIR)/olmoe.o $(SEGMENT_RUNTIME_OBJS)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -DCOLI_SEGMENT_TEST_REGISTER=coli_olmoe_segment_adapter_register \
+		tests/test_segment_adapters_real.c $(SEGMENT_BUILD_DIR)/olmoe.o $(SEGMENT_RUNTIME_OBJS) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_edge_adapters_registration$(EXE): \
 		tests/test_edge_adapters_registration.c edge_runtime.c segment_runtime.c \
