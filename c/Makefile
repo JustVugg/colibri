@@ -3400,6 +3400,9 @@ tests/test_moe_gs_guard$(EXE): tests/test_moe_gs_guard.c colibri.c $(VK_OBJ)
 tests/test_omp_tune$(EXE): tests/test_omp_tune.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_env_registry$(EXE): tests/test_env_registry.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_compat_env$(EXE): tests/test_compat_env.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -3560,8 +3563,18 @@ test-asan:
 	@$(ASAN_ENV) $(MAKE) test-c EXTRA_CFLAGS="$(ASAN_CFLAGS)" EXTRA_LDFLAGS="$(ASAN_LDFLAGS)"
 	@echo "test-asan: suite clean under ASan + UBSan"
 
+# --- environment-variable registry --------------------------------------
+# c/coli_env.h is the single list of every variable the engines read. This
+# target asserts it still matches the sources: a getenv() with no row, a row
+# nothing reads, an unsorted table (coli_env_find binary-searches it) or a
+# duplicate name all fail here. Needs no build, no model and no GPU.
+check-env:
+	@$(PYTHON) tools/check_env_registry.py
+.PHONY: check-env
+
 # Local validation: one portable CPU build and dependency-free tests.
 check:
+	$(MAKE) check-env
 	$(MAKE) clean
 	$(MAKE) portable
 	$(MAKE) test

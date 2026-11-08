@@ -12,6 +12,8 @@
  * anything larger falls back to malloc exactly like before this change. */
 #define COLI_V4_ROUTE_STACK_EXPERTS 512
 
+#include "coli_env.h"
+
 #ifdef COLI_V4_UNIT_ST
 /* Shared st.h adapter and V4 tensor materialization helpers. */
 #include "deepseek_v4_internal.h"
@@ -16381,6 +16383,8 @@ static int has_sentence_end(const char *text, int length) {
 }
 
 int main(int argc, char **argv) {
+    coli_env_check(CE_DSV4, "deepseek-v4");
+    coli_env_dump(CE_DSV4, "deepseek-v4");
     if (argc < 3 || argc > 6) {
         fprintf(stderr, "usage: %s MODEL_DIR INPUT_TOKEN_ID [TOKEN_COUNT]\n"
                         "       %s MODEL_DIR --prompt TEXT [MAX_NEW_TOKENS] [--stop-sentence]\n",
@@ -19600,6 +19604,8 @@ static int v4_gguf_check(const char *dir) {
 
 int main(int argc, char **argv) {
     if (getenv("GGUF_CHECK") && argc >= 2) return v4_gguf_check(argv[1]);
+    coli_env_check(CE_DSV4, "deepseek-v4");
+    coli_env_dump(CE_DSV4, "deepseek-v4");
 #ifdef _OPENMP
     if (!v4_omp_reserve_loader_cpus())
         fprintf(stderr, "[OMP] deepseek-v4: effective team size %d\n",

@@ -38,6 +38,7 @@
 #include <omp.h>
 #endif
 #include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
+#include "coli_env.h"
 #include "st.h"
 #include "json.h"
 #include "tok.h"
@@ -1475,6 +1476,8 @@ static void usage(void){
 }
 
 int main(int argc, char **argv){
+    coli_env_check(CE_QWENIMAGE, "qwenimage");
+    coli_env_dump(CE_QWENIMAGE, "qwenimage");
     /* Windows: the IMAGE and PREVIEW frames carry raw bytes; a text-mode stdout
      * would turn every 0x0A inside them into 0x0D 0x0A (#748) */
     coli_serve_binary_mode();
