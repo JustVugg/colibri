@@ -44,6 +44,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **Qwen3.8-27B on CUDA: its attention on the tensor cores and in blocks of positions.** Its 24
+  query heads over 4 kv heads (six a kv head) fell outside the groupings the chain's prompt
+  attention took on the tensor cores (dividing 64), so its prompt rows ran on the CUDA cores and
+  its decode read every position a block a head. `cc_attn_f2`'s three- and six-warp blocks now
+  take six and twelve heads a kv head without a selection list, and the decode in blocks of
+  positions takes them too, a kv head's heads a block. RTX PRO 4000, served: UD-Q4_K_XL prompt
+  1K / 4K / 8K 556 / 290 / 160 -> 762 / 804 / 810 tok/s, decode after 8K 12.1 -> 19.8; UD-IQ2_XXS
+  411 / 244 / 144 -> 494 / 495 / 492, decode after 8K 14.7 -> 28.3
+  ([docs/qwen36.md](docs/qwen36.md#from-a-gguf-on-a-cuda-card)).
 - **Qwen3.8-27B with its trunk in int4 on the CPU: the prompt 2.4x to 4.5x faster.** The grouped
   kernel (`COLI_DENSE_BITS=4`) summed every group of 64 inputs across the vector for every row and
   every prompt row, more work than the products themselves. The matrices now load interleaved by 16

@@ -902,10 +902,24 @@ static int cc_f2_256(CcCtx *c, int &ok, dim3 fg, CcBuf *q, CcBuf *kc, CcBuf *vc,
     return 1;
 }
 #endif
+/* whether cc_attn_f2_go takes a prompt chunk of this attention (no selection list): its gate
+ * without the launch */
+static int cc_attn_f2_fits(const CcCtx *c, const CcAttn *p, int G) {
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_CHAIN_FLASH2"); on = !(e && *e == '0'); }
+    if (!on || c->major * 10 + c->minor < 75 || (p->hd != 64 && p->hd != 128 && p->hd != 256) ||
+        (p->q_off | p->q_row | p->q_seg | p->k_off | p->v_off) % 4) return 0;
+    return 64 % G == 0 || (p->hd == 256 && 48 % G == 0);
+#else
+    (void)c; (void)p; (void)G;
+    return 0;
+#endif
+}
 /* cc_attn_f2 for a prompt chunk where it applies (1: launched): sm_75 and later, head dim 64,
- * 128 or 256, the query heads of a kv head dividing 64 (head dim 256: or 48, three warps a block:
- * Qwen3.8's 12), rows and caches at float4 offsets; sel, a selection list a row (QSA; NULL none,
- * head dim 256 only). COLI_CUDA_CHAIN_FLASH2=0 keeps cc_attn_fk */
+ * 128 or 256, the query heads of a kv head dividing 64 (head dim 256: or 48, three or six warps a
+ * block: Qwen3.8's 12, Qwen3.8-27B's 6), rows and caches at float4 offsets; sel, a selection list a
+ * row (QSA; NULL none, head dim 256 only). COLI_CUDA_CHAIN_FLASH2=0 keeps cc_attn_fk */
 template <typename KT>
 static int cc_attn_f2_go(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, const CcAttn *p, int G,
                          int win, const float *sk, int so, int ring, const int *sel = nullptr) {
@@ -914,7 +928,9 @@ static int cc_attn_f2_go(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcB
     if (on < 0) { const char *e = getenv("COLI_CUDA_CHAIN_FLASH2"); on = !(e && *e == '0'); }
     if (!on || c->major * 10 + c->minor < 75 || (p->hd != 64 && p->hd != 128 && p->hd != 256) ||
         (p->q_off | p->q_row | p->q_seg | p->k_off | p->v_off) % 4) return 0;
-    if (p->hd == 256 && 64 % G && 48 % G == 0 && sel) {   /* three warps: 48 rows, 48 / G tokens a block (a selection list's) */
+    /* three warps: 48 rows, 48 / G tokens a block, with a selection list or without (the 27B's six
+     * query heads a kv head: their prompt rows took cc_attn_k, a block a (head, row) on the CUDA cores) */
+    if (p->hd == 256 && 64 % G && 48 % G == 0) {
         static int w6 = -1;   /* COLI_CUDA_ATTN_F2_WARPS=3: three warps a block */
         if (w6 < 0) { const char *e = getenv("COLI_CUDA_ATTN_F2_WARPS"); w6 = !(e && atoi(e) == 3); }
         const int h = sizeof(KT) == 2;
@@ -2538,7 +2554,7 @@ __global__ static void __launch_bounds__(256) cc_attn_decg_k(const float *__rest
 static int cc_decg_heads(int G, int hd) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_CUDA_ATTN_DEC_GQA"); on = !(e && *e == '0'); }
-    return on && hd >= 4 && hd <= 256 && hd % 4 == 0 && (G == 2 || G == 4 || G == 8 || G == 16) ? G : 0;
+    return on && hd >= 4 && hd <= 256 && hd % 4 == 0 && (G == 2 || G == 4 || G == 6 || G == 8 || G == 12 || G == 16) ? G : 0;
 }
 /* cc_attn_decg_k's scores: two threads a position, COLI_CUDA_ATTN_DEC_TPP (0, 1, 2 or 4) sets it.
  * One layer after 18K positions in float16 on an RTX PRO 4000 (tests/test_cuda_chain.cu's
@@ -2558,7 +2574,9 @@ static void cc_decg_launch(CcCtx *c, int G, const float *q, const KT *kc, const 
     switch (G) {
     case 2: coli_launch(cc_attn_decg_k<2, KT>, g, 256, sm, c->stream, q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
     case 4: coli_launch(cc_attn_decg_k<4, KT>, g, 256, sm, c->stream, q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
+    case 6: coli_launch(cc_attn_decg_k<6, KT>, g, 256, sm, c->stream, q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
     case 8: coli_launch(cc_attn_decg_k<8, KT>, g, 256, sm, c->stream, q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
+    case 12: coli_launch(cc_attn_decg_k<12, KT>, g, 256, sm, c->stream, q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
     default: coli_launch(cc_attn_decg_k<16, KT>, g, 256, sm, c->stream, q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
     }
 }
@@ -2595,7 +2613,9 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
      * the prompt recomputed does */
     int fk = 0;
 #if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
-    fk = fl > 0 && c->major >= 7 && 16 % G == 0 && (p->hd == 64 || p->hd == 128 || p->hd == 256);
+    /* or cc_attn_f2 (Qwen3.8-27B's six query heads a kv head: its decode read every position a
+     * block a head, cc_attn_k) */
+    fk = fl > 0 && ((c->major >= 7 && 16 % G == 0 && (p->hd == 64 || p->hd == 128 || p->hd == 256)) || cc_attn_f2_fits(c, p, G));
 #endif
     /* a selection list's rows too (Qwen3.8's QSA: 24 heads of a verify's rows, cc_attn_k's block
      * a (head, row) walking up to its budget's positions, 104-144 us a layer on an RTX PRO 4000);

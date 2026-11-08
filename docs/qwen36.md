@@ -507,6 +507,21 @@ decode:
 Before, a layer with two types kept its in_proj on the CPU and the chain
 stayed off (`the DeltaNet in_proj of layer 1 is not on a device`).
 
+The 27B's attention has six query heads a kv head (24 over 4). The chain's
+prompt attention on the tensor cores took groupings that divide 64, so its
+prompt rows went to a kernel on the CUDA cores, and its decode, which follows
+the prompt's path for its bits, read every position a block a head. Both now
+run as for the other models (`cc_attn_f2` three or six warps a block, a kv
+head's heads a block in the decode); the same card, prompts of 1000, 4000 and
+8000 tokens, the decode after 1000 and after 8000:
+
+| file | prompt 1K / 4K / 8K | decode after 1K / 8K |
+|---|---|---|
+| UD-IQ2_XXS, before | 411 / 244 / 144 tok/s | 30.3 / 14.7 tok/s |
+| UD-IQ2_XXS, now | 494 / 495 / 492 tok/s | 31.9 / 28.3 tok/s |
+| UD-Q4_K_XL, before | 556 / 290 / 160 tok/s | 19.2 / 12.1 tok/s |
+| UD-Q4_K_XL, now | 762 / 804 / 810 tok/s | 21.0 / 19.8 tok/s |
+
 #### Images
 
 Qwen3.8-27B reads images. Its vision tower is the ViT of the whole family
