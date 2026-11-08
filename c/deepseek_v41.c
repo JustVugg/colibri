@@ -6167,7 +6167,7 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
 #else
             card[0] = 0;
 #endif
-            v41c_ledger(vu, vt, vg, card);
+            v41c_ledger(vu, vt, vg, card, v41_host_kvq(&m->c) ? v41_host_kv_bytes(m) : 0);
         }
 #endif
         serve_hits(m);

@@ -1684,6 +1684,11 @@ static void v41c_report(void) {
  *             slots' own bytes, then the extra layers' (DSpark's) pool
  *   kv        the chain's KV mirrors: the window rings, the compressed rows, the index keys
  *             and the compressor rings (all of them VKC_DEV buffers, so a part of `chain`)
+ *   host kv   the HOST's own KV arrays (the same state on the CPU side): today's fp32 rows
+ *             or, under COLI_VK_KV_QUANT=2, the packed code rows -- the line that makes
+ *             the flag's host savings visible at all (printed only when they are packed;
+ *             a second device's mirrors, when there are two, are not in this line -- the
+ *             pre-existing gap)
  *   process   the engine's own device allocations (backend_vulkan.c's books)
  *   device    the card's live mem_info_vram_used, the whole card
  *   gtt       the card's mem_info_gtt_used: system RAM behind the aperture, where the
@@ -1693,7 +1698,8 @@ static void v41c_report(void) {
  * scratch, the imported host buffers -- what no pool holds.
  * sys_used/sys_total/card: the device's live usage from sysfs (v41_ledger in the engine);
  * sys_gtt: the same card's mem_info_gtt_used. */
-static void v41c_ledger(unsigned long long sys_used, unsigned long long sys_total, unsigned long long sys_gtt, const char *card) {
+static void v41c_ledger(unsigned long long sys_used, unsigned long long sys_total, unsigned long long sys_gtt, const char *card,
+                        size_t host_kv) {
     const double M = 1048576.0, G = 1073741824.0;
     V41Chain *ch = v41c_of(0);
     if (!ch || !ch->ok) return;
@@ -1706,17 +1712,19 @@ static void v41c_ledger(unsigned long long sys_used, unsigned long long sys_tota
     /* COLI_VK_KV_QUANT: the line walks this chain (device 0) only; a second device's
      * mirrors are as quantized but not counted here (the pre-existing gap, noted) */
     const char *qa = ch->kvq ? " (quantized; a second device's mirrors, when there are two, are not in this line)" : "";
+    char hk[96] = "";   /* the host's own arrays, only when they are packed (the savings) */
+    if (host_kv) snprintf(hk, sizeof hk, " | host kv %.1f MiB (packed)", host_kv / M);
     ColiVkPoolStats w; coli_vk_pool_stats(0, &w);
     VktVram tv; vkt_vram(&tv);
     size_t pools = w.total + dev.total + dn.total + up.total + tv.res_total + tv.x_total;
     size_t proc = coli_vk_device_used();
     fprintf(stderr, "[VK] deepseek_v41 vram: weights %.1f MiB in %d blocks (%.1f MiB of rows in %zu tensors) | chain %.1f MiB (dev %.1f in %d "
                     "blocks, down %.1f in %d, up %.1f in %d) | tier resident %.1f MiB + %d slots %.1f MiB = %.1f of %.1f in %d "
-                    "blocks | extra layers %.1f in %d blocks | kv mirror %.1f MiB%s | process %.2f GiB of %.2f GiB in pools "
+                    "blocks | extra layers %.1f in %d blocks | kv mirror %.1f MiB%s%s | process %.2f GiB of %.2f GiB in pools "
                     "(%.1f MiB outside) | device %.2f GiB used of %.2f, gtt %.2f GiB%s%s%s\n",
             w.total / M, w.blocks, w.used / M, w.tensors, st.dev_bytes / M, dev.total / M, dev.blocks, dn.total / M, dn.blocks,
             up.total / M, up.blocks, (double)(tv.res_used - tv.slot_bytes) / M, tv.slots, (double)tv.slot_bytes / M,
-            (double)tv.res_used / M, (double)tv.res_total / M, tv.res_blocks, tv.x_total / M, tv.x_blocks, kv / M, qa,
+            (double)tv.res_used / M, (double)tv.res_total / M, tv.res_blocks, tv.x_total / M, tv.x_blocks, kv / M, qa, hk,
             (double)proc / G, (double)pools / G, proc > pools ? (double)(proc - pools) / M : 0.0,
             (double)sys_used / G, (double)sys_total / G, (double)sys_gtt / G, *card ? " (" : "", *card ? card : "", *card ? ")" : "");
 }
