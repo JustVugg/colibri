@@ -65,7 +65,7 @@ def main():
             print(f"{'OK  ' if off is None else 'FAIL'} {Path(fx).name} {tn} COLI_CUDA_CHAIN=0: no layer on the card")
             fails += off is not None
     env = dict(os.environ, **CUDA)
-    for cmd in ([sys.executable, str(HERE / "test_kimi_k31_tiny.py"), "--binary", a.binary, "--fixture", a.k31],
+    for cmd in ([sys.executable, str(HERE / "kimi_k31_tiny_harness.py"), "--binary", a.binary, "--fixture", a.k31],
                 [sys.executable, str(HERE / "test_kimi_k3_tiny.py"), "--binary", a.binary, "--fixture", a.k3]):
         r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=1800)
         print(f"{'OK  ' if r.returncode == 0 else 'FAIL'} {Path(cmd[1]).name} with the chain on")

@@ -2960,7 +2960,7 @@ family_kimi_chain() {
   # chunks of 3 rows, a token at a time, a partial chain, quantized trunks and the KV split
   $PY tools/make_kimi_k3_tiny.py --output ./kimi_k31_tiny --force --k31
   COLI_USAGE=$PWD/k3c.usage USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 \
-    $PY tests/test_kimi_k31_tiny.py --binary ./kimi_k3 --fixture ./kimi_k31_tiny
+    $PY tests/kimi_k31_tiny_harness.py --binary ./kimi_k3 --fixture ./kimi_k31_tiny
   local k31ids="5 7 9 11 13 17 19 23 29 31 37 41 43 47 53 59 61 67 71 73 79 83 89 97 101 103 107 109 113 127" k31cpu k31vk v q
   for q in "$O" "K3_BITS=8 K3_MLA_BITS=8 K3_HEAD_BITS=8 K3_IDOT=0 COLI_TEMP=0" "K3_BITS=4 K3_IDOT=0 COLI_TEMP=0"; do
     # shellcheck disable=SC2086

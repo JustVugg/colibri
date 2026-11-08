@@ -847,7 +847,7 @@ kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
 	$(PYTHON) tests/test_kimi_k3_dashboard.py \
 		--binary ./kimi_k3$(EXE) \
 		--fixture ./kimi_k3_tiny
-	$(PYTHON) tests/test_kimi_k31_tiny.py \
+	$(PYTHON) tests/kimi_k31_tiny_harness.py \
 		--binary ./kimi_k3$(EXE) \
 		--fixture ./kimi_k31_tiny
 	$(PYTHON) tests/test_kimi_k3_ckpt.py \
@@ -861,7 +861,7 @@ kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
 # with a card: make CUDA=1 kimi-k3-cuda-chain-check
 .PHONY: kimi-k3-cuda-chain-check
 kimi-k3-cuda-chain-check: kimi-k3-tiny-generate kimi_k3$(EXE)
-	$(PYTHON) tests/test_kimi_k3_cuda_chain.py --binary ./kimi_k3$(EXE) \
+	$(PYTHON) tests/kimi_k3_cuda_chain_harness.py --binary ./kimi_k3$(EXE) \
 		--k3 ./kimi_k3_tiny --k31 ./kimi_k31_tiny
 
 .PHONY: deepseek-v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
