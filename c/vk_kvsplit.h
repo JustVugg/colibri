@@ -1213,7 +1213,7 @@ static int vkc_kv_ds_stage(VkcKvDs *a) {
             if (t->bt[b] >= 0) continue;
             if (n == limit) { ok = 0; break; }
             if (a->kvq) kvq_unpack_ckv(cold + n * a->hd, a->Ch + (size_t)r * KVQ_CKV_BYTES);
-            else memcpy(cold + n * a->hd, a->Ch + (size_t)r * a->hd, (size_t)a->hd * sizeof(float));
+            else memcpy(cold + n * a->hd, a->Ch + (size_t)r * a->hd * sizeof(float), (size_t)a->hd * sizeof(float));
             mapped[j] = -2 - (int)n++;
         }
         ks->host_ms += vkc_kv_now() - start;

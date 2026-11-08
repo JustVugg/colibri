@@ -1053,7 +1053,8 @@ static int v4c_attention(V4Chain *ch, int i, const V4cFwd *f) {
         ColiV4AttentionView v;
         ok = !coli_v4_attention_view(ch->attn[i], &v);
         VkcKvDs d = {&ch->ks, li, ch->q, ly->win, ly->ckv, ch->prm, ch->list, ch->heads, nr, nh, hd, cnt, a.l_off, a.l_row,
-                     ch->Wd, 0, 0, qrow, (int)ly->o_sink, 1, 0, qrow, (pb + nr) / ly->ratio, a.scale, ok ? v.compressed : NULL, 0};
+                     ch->Wd, 0, 0, qrow, (int)ly->o_sink, 1, 0, qrow, (pb + nr) / ly->ratio, a.scale,
+                     (const uint8_t *)(const void *)(ok ? v.compressed : NULL), 0};   /* v4's host rows stay fp32 */
         ok = ok && vkc_kv_ds(&d);
     } else ok = ok && vkc_dsv4_attn(ch->q, ly->win, ly->ratio > 0 ? ly->ckv : NULL, ch->list, ch->prm, ch->heads, &a);
     ok = ok && v4c_rope(ch, ch->heads, nr * nh, nh, hd - rd, qrow, hd, tcs, rd, 1) &&
