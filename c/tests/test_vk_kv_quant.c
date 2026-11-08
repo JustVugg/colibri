@@ -288,7 +288,7 @@ int main(void) {
     score_case(2, 64, 8);     /* a narrow one: mode 3 */
     score_case(2, 512, 65);   /* the wide queries: mode 9 */
     if (fails) { printf("FAIL: kv-quant (%d)\n", fails); coli_vk_shutdown(); return 1; }
-    printf("PASS: kv-quant\n");
+    printf("PASS\n");   /* the plain word, as the gates grep for */
     coli_vk_shutdown();
     return 0;
 }

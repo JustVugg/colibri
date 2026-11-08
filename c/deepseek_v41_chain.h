@@ -866,8 +866,8 @@ static int v41c_scratch(V41Chain *ch, Model *m, int rows, int ctx) {
     if (ok && ch->kvq) {       /* COLI_VK_KV_QUANT: a chunk's new compressed and index rows, fp32 until their pack */
         size_t nq = r + 2;   /* the rows span at most rows/ratio + 1 groups (a ratio-1 layer: the chunk's rows) */
         if (g_v41c_count >= 0)
-            g_v41c_count += (long long)(nq * (size_t)hd * sizeof(float)) + (long long)(nq * (size_t)IH * sizeof(float));
-        else ok = v41c_res(&ch->qck, nq * hd, VKC_DEV) && v41c_res(&ch->qik, nq * IH, VKC_DEV);
+            g_v41c_count += (long long)(nq * (size_t)hd * sizeof(float)) + (long long)(nq * (size_t)ID * sizeof(float));
+        else ok = v41c_res(&ch->qck, nq * hd, VKC_DEV) && v41c_res(&ch->qik, nq * ID, VKC_DEV);   /* an index row is ID floats */
     }
     if (!ok || g_v41c_count >= 0) return ok;   /* counting: the buffers only */
     if (ch->rows < rows) {
@@ -1075,13 +1075,13 @@ static void v41c_kvq_check(const V41Chain *ch, const Model *m) {
 static int v41c_win_up(V41Chain *ch, const Layer *l, int i, int q, int W, int hd) {
     uint8_t row[KVQ_WIN_BYTES];
     kvq_pack_win(row, l->window + (size_t)(q % W) * hd);
-    return vkc_write(ch->win[i], (size_t)(q % ch->Wd) * KVQ_WIN_BYTES, row, KVQ_WIN_BYTES);
+    return vkc_write(ch->win[i], (size_t)(q % ch->Wd) * KVQ_WIN_BYTES / 4, row, KVQ_WIN_BYTES);   /* off in floats, as every vkc_write's */
 }
 static int v41c_ckv_up(V41Chain *ch, const Layer *l, int i, int t0, int t1, int hd) {
     uint8_t *pk = malloc((size_t)(t1 - t0) * KVQ_CKV_BYTES);
     if (!pk) return 0;
     for (int t = t0; t < t1; t++) kvq_pack_ckv(pk + (size_t)(t - t0) * KVQ_CKV_BYTES, l->ckv + (size_t)t * hd);
-    int ok = vkc_write(ch->ckv[i], (size_t)t0 * KVQ_CKV_BYTES, pk, (size_t)(t1 - t0) * KVQ_CKV_BYTES);
+    int ok = vkc_write(ch->ckv[i], (size_t)t0 * KVQ_CKV_BYTES / 4, pk, (size_t)(t1 - t0) * KVQ_CKV_BYTES);
     free(pk);
     return ok;
 }
@@ -1092,9 +1092,9 @@ static int v41c_ikey_up(V41Chain *ch, const Layer *l, int i, int t0, int t1, int
         int hi = t1 < (b + 1) * KVQ_IKEY_BLOCK ? t1 : (b + 1) * KVQ_IKEY_BLOCK;
         for (int t = lo; t < hi; t++) kvq_pack_ikey(blk, t - b * KVQ_IKEY_BLOCK, l->ikey + (size_t)t * ihd);
         size_t w = (size_t)b * (KVQ_IKEY_BLOCK * KVQ_IKEY_BYTES), n = (size_t)(hi - lo);
-        if (!vkc_write(ch->ikey[i], w + (size_t)(lo - b * KVQ_IKEY_BLOCK) * 64,
+        if (!vkc_write(ch->ikey[i], (w + (size_t)(lo - b * KVQ_IKEY_BLOCK) * 64) / 4,
                        blk + (size_t)(lo - b * KVQ_IKEY_BLOCK) * 64, n * 64)) return 0;
-        if (!vkc_write(ch->ikey[i], w + 2048 + (size_t)(lo - b * KVQ_IKEY_BLOCK) * 4,
+        if (!vkc_write(ch->ikey[i], (w + 2048 + (size_t)(lo - b * KVQ_IKEY_BLOCK) * 4) / 4,
                        blk + 2048 + (size_t)(lo - b * KVQ_IKEY_BLOCK) * 4, n * 4)) return 0;
     }
     return 1;
