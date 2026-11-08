@@ -585,6 +585,44 @@ The flag needs `head_dim` 512 and `index_head_dim` 128, and it does not re-price
 planner: the KV split decides exactly as before, and when it arms the mirrors go back to
 fp32 whole (`v41c_kvq_give_way`), re-mirrored from the host.
 
+### The host's state in the same formats (`COLI_VK_KV_QUANT=2`)
+
+`COLI_VK_KV_QUANT=2` holds the HOST's own KV arrays -- the window rings, the compressed
+rows, the index keys -- in the same cache formats the mirrors use, where the flag-off
+engine keeps dequantized fp32 rows: the host state drops from 6,400 B to 890 B a
+position at the released geometry (86.1% less). Writers pack at their stores (rms and
+the rope tail stage in a scratch row, never in place inside a code row), the read paths
+dequantize on read -- the kv_all build and the indexer decode into per-forward scratch,
+`V41_STATS` breaks that cost out as its own `kv read` line -- and the boundaries (the
+pull, park, reset, rollback, the swap between conversations) move code rows as bytes,
+with the index keys' block-wide sections never touched by a linear copy but a
+whole-buffer or whole-block one. The planner re-prices the state under the flag (the
+host layout never gives way to the KV split -- only the device mirrors do, and the
+split's paths read the codes), and the turn-end ledger gains a `host kv` term so the
+savings are visible at all.
+
+What it buys, honestly measured (the memory ladder, --ram 28, kv_slots 1; every
+projection tagged by the audit's regime):
+
+| ctx | freed host RAM | +expert slots | effective --ram | prefill | decode |
+|---|---|---|---|---|---|
+| 16K | 86 MiB | 0 | +0.09 | ~0 | ~0 |
+| 64K | 344 MiB | +1 | +0.34 | guard margin (not throughput) | ≤+2% |
+| 128K | 689 MiB | +1 | +0.67 | guard margin, the split stays unarmed ~4x longer | ≤+2% (+3-8% only with a `COLI_VK_TIER_GB` raise) |
+| 256K | 1,377 MiB | +2 | +1.34 | ≤2% | ≤+4% |
+| 1M | 5.4 GiB | +7 | +5.51 | unmeasured | up to +50% capacity, unmeasured |
+
+The honest ceiling, from the ladder's completed arm: in the measured 16K regime
+nothing moves -- prefill is disk-bound and decode is CPU/disk-bound -- and the past-32K
+walls (the MemAvailable guard, an unattributed end-of-prefill spike) are not KV-sized,
+so `=2` does not rescue them. The defensible wins are the guard margin at ≥64K, the
+`--ram` equivalence growing linearly with context, the KV split staying unarmed about
+4x longer (the quantized mirror crosses the ~1 GiB reserve near 640K of ckv/ikey
+against fp32's 160K), and -- only through an explicit `COLI_VK_TIER_GB` raise, since
+the tier's budget is fixed before the mirrors exist -- more device experts (at 128K:
++35 of 167). The 34-touchpoint map of every site that moved is in the implementation
+notes for #2701's follow-up (`track_D-A_host_kv_map.md` in the session artifacts).
+
 ### Where the VRAM goes at a turn's end
 
 `V41_STATS=1` (or `COLI_VK_LEDGER=1`) ends every serve turn with one ledger line
