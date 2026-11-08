@@ -44,6 +44,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **Qwen3.8-27B from unsloth's GGUFs on CUDA: the chain runs the trunk.** The CUDA placement
+  fused a DeltaNet layer's qkv and z rows into one tensor of one type, and these mixes give the
+  two different types in about half the layers, so those layers' in_proj stayed on the CPU and
+  the dense chain stayed off. Such a layer now holds two tensors in the file's two types
+  (`qt_dnproj_z_init_fmt`), and the chain reads them with their own strides. RTX PRO 4000,
+  served, prompt 1K / 4K tokens and decode: UD-IQ2_XXS 19.5 / 18.2 and 10.0 -> 408.0 / 242.6
+  and 29.5 tok/s, UD-Q4_K_XL 18.9 / 17.4 and 9.6 -> 580.7 / 300.0 and 19.5 tok/s
+  ([docs/qwen36.md](docs/qwen36.md#from-a-gguf-on-a-cuda-card)).
 - **DeepSeek V4.1 on the Vulkan chain: a prompt of more than one chunk layer by layer.** Each
   chunk went through every layer before the next, so the expert tier streamed each layer's
   cold experts once a chunk: a 4104-token prompt at 512-row chunks copied 150 GiB of the host

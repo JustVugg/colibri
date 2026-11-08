@@ -9884,7 +9884,7 @@ int main(int argc, char **argv) {
             if (m.c.is_attn[i]) continue;
             if (m.L[i].dn_qkv.q && m.L[i].dn_z.q)
                 qt_trunk_offer("dnproj", i, (size_t)(O_qkv + O_z) * m.c.hidden + (size_t)(O_qkv + O_z) * sizeof(float));
-            else if (qdw_gq_fmt(&m.L[i].dn_qkv) && qdw_gq_fmt(&m.L[i].dn_qkv) == qdw_gq_fmt(&m.L[i].dn_z))   /* one type: one fused matrix */
+            else if (qdw_gq_fmt(&m.L[i].dn_qkv) && qdw_gq_fmt(&m.L[i].dn_z))   /* a GGUF's: one fused matrix, or two of two types */
                 qt_trunk_offer("dnproj", i, qdw_gq_bytes(&m.L[i].dn_qkv) + qdw_gq_bytes(&m.L[i].dn_z));
         }
         trunk_offer_dense(&m);   /* dnout, attnproj, shexp: the rest of the per-token dense work */
@@ -9968,7 +9968,7 @@ int main(int argc, char **argv) {
          * memcpys, no requantization, and the GPU sees one GEMV per layer
          * instead of two. The host copy is freed right after the upload. */
         {
-            int placed = 0, O_qkv = m.c.dn_conv_dim, O_z = m.c.dn_vheads * m.c.dn_vdim;
+            int placed = 0, split = 0, O_qkv = m.c.dn_conv_dim, O_z = m.c.dn_vheads * m.c.dn_vdim;
             int Of = O_qkv + O_z, Hd = m.c.hidden;
             double vram = 0;
             for (int i = 0; i < m.c.n_layers; i++) {
@@ -9977,8 +9977,8 @@ int main(int argc, char **argv) {
                 if (dev == QT_PLACE_CPU) continue;
                 const int8_t *q1 = m.L[i].dn_qkv.q, *q2 = m.L[i].dn_z.q;
                 const float *s1 = m.L[i].dn_qkv.sc, *s2 = m.L[i].dn_z.sc;
-                const int gf = qdw_gq_fmt(&m.L[i].dn_qkv);
-                if (!q1 && gf && gf == qdw_gq_fmt(&m.L[i].dn_z)) {   /* a GGUF's blocks: qkv's rows, then z's */
+                const int gf = qdw_gq_fmt(&m.L[i].dn_qkv), gz = qdw_gq_fmt(&m.L[i].dn_z);
+                if (!q1 && gf && gf == gz) {   /* a GGUF's blocks: qkv's rows, then z's */
                     const size_t rb = (size_t)gq_row_bytes(gf - 100, Hd);
                     uint8_t *ra, *rz, *cat = malloc(rb * Of);
                     const void *a = qdw_gq_rows(&m.L[i].dn_qkv, gf, &ra), *z = qdw_gq_rows(&m.L[i].dn_z, gf, &rz);
@@ -9987,6 +9987,15 @@ int main(int argc, char **argv) {
                         if (qt_dnproj_init_fmt(i, cat, NULL, gf, Hd, Of, dev)) { placed++; vram += (double)rb * Of; }
                     }
                     free(ra); free(rz); free(cat);
+                    continue;
+                }
+                if (!q1 && gf && gz) {   /* two types (unsloth's mixes): two tensors, each the file's blocks */
+                    const size_t rq = (size_t)gq_row_bytes(gf - 100, Hd), rzb = (size_t)gq_row_bytes(gz - 100, Hd);
+                    uint8_t *ra, *rz;
+                    const void *a = qdw_gq_rows(&m.L[i].dn_qkv, gf, &ra), *z = qdw_gq_rows(&m.L[i].dn_z, gz, &rz);
+                    if (a && z && qt_dnproj_init_fmt(i, a, NULL, gf, Hd, O_qkv, dev) &&
+                        qt_dnproj_z_init_fmt(i, z, gz, Hd, O_z, dev)) { placed++; split++; vram += (double)rq * O_qkv + (double)rzb * O_z; }
+                    free(ra); free(rz);
                     continue;
                 }
                 if (!q1 || !q2) continue;      /* dense-i8 off: CPU path stands */
@@ -10005,6 +10014,8 @@ int main(int argc, char **argv) {
             if (placed)
                 fprintf(stderr, "[dnp] %d DeltaNet-Projektionen auf GPU (%.2f GB VRAM)\n",
                         placed, vram / 1073741824.0);
+            if (split)
+                fprintf(stderr, "[dnp] %d of them as two tensors, qkv and z in the file's two types\n", split);
         }
         /* The rest of the trunk, wherever the placer put it: out_proj,
          * attention projections, shared expert. Handles live in the Layer. */

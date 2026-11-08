@@ -84,6 +84,7 @@ typedef struct {
  * sums in another order, so a chunk keeps the separate row (t_sg) and the prompt its bits */
 #define Q36CC_RG_ROWS 8
     ColiCudaTensor **t_q, **t_k, **t_v, **t_o, **t_dnp, **t_dno, **t_shg, **t_shu, **t_shd, *t_lm;   /* the tier's */
+    ColiCudaTensor **t_dnz;   /* z's rows where a GGUF gives them another type than qkv's (NULL: one in_proj) */
     CcBuf **rec, **ring, **kc, **vc;           /* per layer state */
     CcBuf **rec_snap[Q36_SPEC_SNAPS], **ring_snap[Q36_SPEC_SNAPS];   /* a verify's copies, slot r after row r */
     int snap_slots, snap_valid;
@@ -379,7 +380,7 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
     ch->t_ab = calloc(L, sizeof(void *)); ch->t_sg = calloc(L, sizeof(void *)); ch->t_gate = calloc(L, sizeof(void *));
     ch->rgf = calloc(L, 1);
     ch->t_q = calloc(L, sizeof(void *)); ch->t_k = calloc(L, sizeof(void *)); ch->t_v = calloc(L, sizeof(void *));
-    ch->t_o = calloc(L, sizeof(void *)); ch->t_dnp = calloc(L, sizeof(void *)); ch->t_dno = calloc(L, sizeof(void *));
+    ch->t_o = calloc(L, sizeof(void *)); ch->t_dnp = calloc(L, sizeof(void *)); ch->t_dno = calloc(L, sizeof(void *)); ch->t_dnz = calloc(L, sizeof(void *));
     ch->t_shg = calloc(L, sizeof(void *)); ch->t_shu = calloc(L, sizeof(void *)); ch->t_shd = calloc(L, sizeof(void *));
     ch->rec = calloc(L, sizeof(void *)); ch->ring = calloc(L, sizeof(void *));
     ch->kc = calloc(L, sizeof(void *)); ch->vc = calloc(L, sizeof(void *));
@@ -387,7 +388,7 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
     if (!ch->o_in || !ch->o_post || !ch->o_qn || !ch->o_kn || !ch->o_conv || !ch->o_dn || !ch->o_snk || !ch->t_ab || !ch->t_sg || !ch->t_gate || !ch->rgf ||
         !ch->o_ra || !ch->o_rf || !ch->o_pre || !ch->o_pf || !ch->t_ag || !ch->t_ld || !ch->t_lu ||
         !ch->t_sci || !ch->t_sco || !ch->o_po || !ch->o_pff ||
-        !ch->t_q || !ch->t_k || !ch->t_v || !ch->t_o || !ch->t_dnp || !ch->t_dno || !ch->t_shg || !ch->t_shu || !ch->t_shd ||
+        !ch->t_q || !ch->t_k || !ch->t_v || !ch->t_o || !ch->t_dnp || !ch->t_dno || !ch->t_dnz || !ch->t_shg || !ch->t_shu || !ch->t_shd ||
         !ch->rec || !ch->ring || !ch->kc || !ch->vc || !ch->kv_valid || !ch->attn_ord || !ch->kv_rows) return NULL;
     /* the tier's matrices, every one on one device */
     /* (the accessor fills `d` before q36cc_take reads it: two statements, not one call) */
@@ -405,6 +406,9 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
             Q36CC_TAKE(&ch->t_sco[i], qt_dense_tensor(l->qth_scout - 1, &d_), "the conv's out_proj");
         } else {
             Q36CC_TAKE(&ch->t_dnp[i], qt_dnproj_tensor(i, &d_), "the DeltaNet in_proj");
+            int dz_ = -1;
+            ColiCudaTensor *z_ = qt_dnproj_z_tensor(i, &dz_);
+            if (z_ && !q36cc_take(ch, &ch->t_dnz[i], z_, dz_, "the DeltaNet in_proj's z", i)) return NULL;
             Q36CC_TAKE(&ch->t_dno[i], qt_dense_tensor(l->qth_dnout - 1, &d_), "the DeltaNet out_proj");
         }
         if (l->sh_I > 0) {   /* shared_inter, or a Flint dense layer's MLP */
@@ -1086,15 +1090,19 @@ static int q36cc_shortconv_mx(Q36CChain *ch, Model *m, int i, int n, int c0) {
 static int q36cc_deltanet(Q36CChain *ch, Model *m, Layer *l, int i, int n, int c0, int ns) {
     Cfg *c = &m->c; (void)l;
     int vh = c->dn_vheads, CD = c->dn_conv_dim, vd = vh * c->dn_vdim, PD = CD + vd;
+    /* one in_proj: rows of qkv ++ z, PD wide; two (q36cc_dnp): n rows of qkv, then n of z */
+    const int two = ch->t_dnz[i] != NULL, qr = two ? CD : PD, zr = two ? vd : PD;
+    const size_t z0 = two ? (size_t)n * CD : (size_t)CD;
     int ok = cc_matmul(ch->t_dnp[i], ch->nrm, 0, ch->qkvz, 0, n) &&
+             (!two || cc_matmul(ch->t_dnz[i], ch->nrm, 0, ch->qkvz, z0, n)) &&
              cc_matmul(ch->t_ab[i], ch->nrm, 0, ch->ab, 0, n);
     int segs = ns > 1 ? ns : 1;
     for (int r = 0; r < segs && ok; r++) {
         int s0 = ns > 1 ? r : 0, len = ns > 1 && r < ns - 1 ? 1 : n - s0, snap_row = ns ? 0 : -1;
         CcBuf *rs = ns ? ch->rec_snap[c0 + r][i] : NULL, *cs = ns ? ch->ring_snap[c0 + r][i] : NULL;
-        CcDnConv cp = {len, CD, c->dn_convk, s0 * PD, PD, s0 * CD, CD, snap_row, 0, (int)ch->o_conv[i], 0, 0};
+        CcDnConv cp = {len, CD, c->dn_convk, s0 * qr, qr, s0 * CD, CD, snap_row, 0, (int)ch->o_conv[i], 0, 0};
         CcDnRec rp = {len, vh, c->dn_kheads, c->dn_vdim, c->dn_kheads * c->dn_kdim, s0 * CD, CD, s0 * 2 * vh, 2 * vh,
-                      vh + s0 * 2 * vh, 2 * vh, CD + s0 * PD, PD, s0 * vd, vd, snap_row,
+                      vh + s0 * 2 * vh, 2 * vh, (int)z0 + s0 * zr, zr, s0 * vd, vd, snap_row,
                       (g_ssm_a_direct ? 2 : 0) | (g_dn_tiled ? 4 : 0), c->eps,   /* a GGUF's layout (qwen36.c) */
                       1.f / sqrtf((float)c->dn_kdim), 0, 0, (int)ch->o_dn[i]};
         ok = cc_dnconv(ch->qkvz, ch->prm, ch->ring[i], ch->cv, cs, &cp) &&
@@ -1132,13 +1140,16 @@ static int q36cc_attention_mx(Q36CChain *ch, Model *m, Layer *l, int i, int n, i
 static int q36cc_deltanet_mx(Q36CChain *ch, Model *m, Layer *l, int i, int n, int c0) {
     Cfg *c = &m->c; (void)l;
     int vh = c->dn_vheads, CD = c->dn_conv_dim, vd = vh * c->dn_vdim, PD = CD + vd;
+    const int two = ch->t_dnz[i] != NULL, qr = two ? CD : PD, zr = two ? vd : PD;   /* as q36cc_deltanet */
+    const size_t z0 = two ? (size_t)n * CD : (size_t)CD;
     int ok = cc_matmul(ch->t_dnp[i], ch->nrm, 0, ch->qkvz, 0, n) &&
+             (!two || cc_matmul(ch->t_dnz[i], ch->nrm, 0, ch->qkvz, z0, n)) &&
              cc_matmul(ch->t_ab[i], ch->nrm, 0, ch->ab, 0, n);
     for (int s = 0; s < n && ok; s++) {
         Q36ccConv *v = ch->mx_conv[c0 + s];
-        CcDnConv cp = {1, CD, c->dn_convk, s * PD, PD, s * CD, CD, -1, 0, (int)ch->o_conv[i], 0, 0};
+        CcDnConv cp = {1, CD, c->dn_convk, s * qr, qr, s * CD, CD, -1, 0, (int)ch->o_conv[i], 0, 0};
         CcDnRec rp = {1, vh, c->dn_kheads, c->dn_vdim, c->dn_kheads * c->dn_kdim, s * CD, CD, s * 2 * vh, 2 * vh,
-                      vh + s * 2 * vh, 2 * vh, CD + s * PD, PD, s * vd, vd, -1,
+                      vh + s * 2 * vh, 2 * vh, (int)z0 + s * zr, zr, s * vd, vd, -1,
                       (g_ssm_a_direct ? 2 : 0) | (g_dn_tiled ? 4 : 0), c->eps,
                       1.f / sqrtf((float)c->dn_kdim), 0, 0, (int)ch->o_dn[i]};
         ok = cc_dnconv(ch->qkvz, ch->prm, v->ring[i], ch->cv, NULL, &cp) &&

@@ -50,7 +50,7 @@ def blocks(name, shape, rng, std=0.02):
     return raw.reshape(*shape[:-1], nb * size)
 
 
-def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=False):
+def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=False, dn_types=None):
     """dense: llama.cpp's qwen35 (a dense model of the family): an MLP per layer instead of the
     experts, and no output.weight (the head tied to token_embd), as the small checkpoints ship.
     same_gate_up: every layer's expert up in its gate's type (layer 0 IQ2_XXS, the others
@@ -59,7 +59,9 @@ def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=F
     an array per layer (0 on the DeltaNet layers), rope.dimension_sections of three, the flags
     ssm.v_head_reordered and rope.mrope_interleaved, the DeltaNet's dt bias named ssm_dt, the
     shared expert's gate as F16 of shape [H, 1], and the MTP head (mtp.*) and the vision tower
-    (v.*) in the model's file. The same weights as without."""
+    (v.*) in the model's file. The same weights as without.
+    dn_types: {layer: (qkv's type, the gate's)} for DeltaNet layers, Q8_0 for both elsewhere: a
+    layer of two types is how unsloth's dynamic mixes ship about half of Qwen3.8-27B's."""
     arch = "qwen35" if dense else "qwen35moe"
     w = gguf.GGUFWriter(str(path), arch)
     p = arch + "."
@@ -114,7 +116,8 @@ def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=F
             q(b + "attn_v.weight", (KVH * HD, H), "Q8_0"); q(b + "attn_output.weight", (H, QH * HD), "Q8_0")
             w.add_tensor(b + "attn_q_norm.weight", np.ones(HD, np.float32)); w.add_tensor(b + "attn_k_norm.weight", np.ones(HD, np.float32))
         else:
-            q(b + "attn_qkv.weight", (conv, H), "Q8_0"); q(b + "attn_gate.weight", (VH * KD, H), "Q8_0")
+            qkv_t, gate_t = (dn_types or {}).get(L, ("Q8_0", "Q8_0"))
+            q(b + "attn_qkv.weight", (conv, H), qkv_t); q(b + "attn_gate.weight", (VH * KD, H), gate_t)
             w.add_tensor(b + "ssm_a", -np.exp(rng.standard_normal(VH).astype(np.float32) * 0.1))
             f32(b + "ssm_alpha.weight", (VH, H)); f32(b + "ssm_beta.weight", (VH, H))
             f32(b + "ssm_conv1d.weight", (conv, 4)); w.add_tensor(b + ("ssm_dt" if ollama else "ssm_dt.bias"), np.zeros(VH, np.float32))

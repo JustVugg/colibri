@@ -475,6 +475,24 @@ keeps most of the saving at half the loss. With a matrix in int4 the engine
 no longer keeps its int8 copy (`COLI_DENSE_KEEP_I8=1` does); that is what
 brings the full int4 run from 42.4 to 18.8 GB.
 
+#### From a GGUF on a CUDA card
+
+unsloth's dynamic mixes give a DeltaNet layer's `attn_qkv` and `attn_gate` two
+ggml types in about half the layers (UD-IQ2_XXS: IQ1_M or IQ1_S beside IQ2_XXS in
+25 of 48; UD-Q4_K_XL: Q4_K beside Q5_K in 26). Such a layer's in_proj sits on the
+card as two tensors in the file's two types (`[dnp] N of them as two tensors`), so
+every layer is on the device and the CUDA chain runs the trunk. On an RTX PRO 4000
+(24 GB), through `coli serve`, prompts of 1000 and 4000 tokens, then 128 tokens of
+decode:
+
+| file | before: prompt 1K / 4K, decode | now: prompt 1K / 4K, decode |
+|---|---|---|
+| UD-IQ2_XXS | 19.5 / 18.2, 10.0 tok/s | 408.0 / 242.6, 29.5 tok/s |
+| UD-Q4_K_XL | 18.9 / 17.4, 9.6 tok/s | 580.7 / 300.0, 19.5 tok/s |
+
+Before, a layer with two types kept its in_proj on the CPU and the chain
+stayed off (`the DeltaNet in_proj of layer 1 is not on a device`).
+
 #### Images
 
 Qwen3.8-27B reads images. Its vision tower is the ViT of the whole family

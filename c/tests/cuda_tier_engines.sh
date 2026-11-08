@@ -9,7 +9,7 @@
 set -u
 cd "$(dirname "$0")/.."
 PY=${PY:-python3}
-make -j"$(nproc)" glm53 deepseek_v41 mimo kimi_k3 colibri CUDA=1 > cuda_tier_build.log 2>&1 || { tail cuda_tier_build.log; exit 1; }
+make -j"$(nproc)" glm53 deepseek_v41 mimo kimi_k3 colibri qwen36 CUDA=1 > cuda_tier_build.log 2>&1 || { tail cuda_tier_build.log; exit 1; }
 [ -d glm53_stream-i4 ] || { $PY tools/make_glm53_tiny.py --output glm53_tiny --force > /dev/null &&
                              $PY tools/make_glm53_streaming_pair.py --fixture glm53_tiny --output glm53_stream > /dev/null; } || exit 1
 [ -d dsv41_tiny ] || $PY tools/make_dsv41_tiny.py --out dsv41_tiny --emit-ref dsv41_tiny/ref.json > /dev/null || exit 1
@@ -102,6 +102,35 @@ for v in "chain decode|1e-4|GLM53_BITS=32|5,7,9,11,13,17,19,23|8" \
   lg=$(lclose g53-cpu.f32 g53-cu.f32 "$tol"); lok=$?
   if [ -s a.tok ] && cmp -s a.tok b.tok && [ "${fw:-0}" -gt 0 ] && [ $lok = 0 ]; then ok "glm53 $tag: tokens = CPU, $lg, $fw chain forwards"
   else bad "glm53 $tag (${fw:-0} chain forwards, $lg)"; diff a.tok b.tok | head -4; tail -3 g53-cu.log; fi
+done
+
+# qwen36 on the CUDA chain from a dense GGUF (architecture qwen35) whose DeltaNet layers give qkv and the gate
+# two types, as unsloth's dynamic mixes of Qwen3.8-27B do in about half of them: layer 0 Q8_0 and Q4_K, layer 1
+# the other way, layer 2 Q8_0 twice. The two-type layers' in_proj is two tensors (qt_dnproj_z_init_fmt); before,
+# they stayed on the CPU and the chain with them. A 12-token prompt (one step of 12 rows, or chunks of 5) and
+# four decode steps: the tokens are the CPU's, the last logits within 1e-2 of the largest, the chain ran.
+if [ ! -d q35d_gguf_tiny ]; then
+  $PY - <<'PY' || exit 1
+import sys, numpy as np
+sys.path.insert(0, "tests")
+from test_gguf_import import write_model
+write_model("q35d_gguf_tiny.gguf", np.random.default_rng(12), dense=True,
+            dn_types={0: ("Q8_0", "Q4_K"), 1: ("Q4_K", "Q8_0"), 2: ("Q8_0", "Q8_0")})
+PY
+  $PY tools/gguf_import.py q35d_gguf_tiny.gguf q35d_gguf_tiny > /dev/null || exit 1
+  printf '{"prompt_ids": [5, 6, 7, 8, 9, 31, 17, 2, 44, 12, 3, 29], "full_ids": [5, 6, 7, 8, 9, 31, 17, 2, 44, 12, 3, 29, 0, 0, 0, 0]}' > q35d_gguf_tiny/ref.json
+fi
+q36tok() { grep -a '^C engine' "$1" | tail -1 | cut -d: -f2 | sed 's/Text.*//'; }
+for v in "a 12-row step|" "chunks of 5|COLI_CUDA_CHAIN_ROWS=5"; do
+  IFS='|' read -r tag envs <<< "$v"
+  rm -f q35-cpu.f32 q35-cu.f32
+  env $envs DUMP=q35-cpu.f32 SNAP=q35d_gguf_tiny OMP_NUM_THREADS=2 COLI_NO_OMP_TUNE=1 USAGE_SAVE=0 ./qwen36 2 8 q35d_gguf_tiny/ref.json > q35-cpu.log 2>&1
+  env $envs $X DUMP=q35-cu.f32 SNAP=q35d_gguf_tiny OMP_NUM_THREADS=2 COLI_NO_OMP_TUNE=1 USAGE_SAVE=0 ./qwen36 2 8 q35d_gguf_tiny/ref.json > q35-cu.log 2>&1
+  a=$(q36tok q35-cpu.log); b=$(q36tok q35-cu.log); lg=$(lclose q35-cpu.f32 q35-cu.f32 1e-2); lok=$?
+  two=$(sed -n 's/^\[dnp\] \([0-9]*\) of them as two tensors.*/\1/p' q35-cu.log | tail -1)
+  if [ -n "$a" ] && [ "$a" = "$b" ] && [ $lok = 0 ] && [ "${two:-0}" = 2 ] && ! grep -qa "the chain stays off" q35-cu.log; then
+    ok "qwen36 GGUF dense, DeltaNet qkv and gate in two types, $tag: tokens = CPU, $lg, $two in_proj as two tensors, the chain on"
+  else bad "qwen36 GGUF dense two types, $tag (two tensors: ${two:-none}, $lg)"; echo "cpu:$a"; echo "cu: $b"; grep -aE '^\[(chain|dnp|dense)\]' q35-cu.log | head -6; fi
 done
 
 # deepseek_v41: the oracle passes and the output is the CPU's
